@@ -1199,8 +1199,13 @@ impl Optimizer {
 
         // RawBuffer: AbstractRawPtrInfo inherits base force_box() default.
         // info.py:159-160: _force_at_the_end_of_preamble → force_box()
+        // optimizer.py:311-312: optforce = self.optearlyforce
         if matches!(info, crate::optimizeopt::info::PtrInfo::VirtualRawBuffer(_)) {
-            return self.force_box(resolved, ctx);
+            let saved = ctx.current_pass_idx;
+            ctx.current_pass_idx = ctx.optearlyforce_idx;
+            let result = self.force_box(resolved, ctx);
+            ctx.current_pass_idx = saved;
+            return result;
         }
 
         resolved
@@ -1506,6 +1511,16 @@ impl Optimizer {
             pass.setup();
         }
 
+        // earlyforce.py:32: self.optimizer.optearlyforce = self
+        // Find the EarlyForce pass index so force paths can route
+        // emitted operations starting from earlyforce.next (= heap).
+        for (idx, pass) in self.passes.iter().enumerate() {
+            if pass.name() == "earlyforce" {
+                ctx.optearlyforce_idx = idx;
+                break;
+            }
+        }
+
         // bridgeopt.py:124-185: apply pending bridge knowledge AFTER setup.
         // RPython calls deserialize_optimizer_knowledge before propagate_all_forward
         // but after the optimizer is constructed (setup already done at __init__).
@@ -1657,10 +1672,12 @@ impl Optimizer {
             ctx.pre_force_jump_args = Some(args.clone());
         }
 
-        // Process JUMP/FINISH through passes to force virtual args.
-        // RPython doesn't send Phase 1 JUMP through passes (flush=False),
-        // but majit's virtual forcing relies on OptVirtualize's JUMP handler.
-        // VirtualState was already captured above in pre_jump_virtual_state.
+        // RPython optimizer.py:536-538 / unroll.py:101-103:
+        // JUMP/FINISH handling. RPython Phase 1 uses flush=False (JUMP not
+        // sent through passes). In majit, Phase 1 JUMP goes through passes
+        // for heap flush and resume data. Phase 2 stores JUMP as terminal_op.
+        // TODO: implement flush=False for Phase 1 when export_state handles
+        // virtual JUMP args (requires rd_virtuals encoding).
         if let Some(mut terminal_op) = last_op {
             if self.skip_flush {
                 // RPython: Phase 2 JUMP is NOT sent through optimization

@@ -1,13 +1,13 @@
-/// Early force pass: ensure virtual refs are forced before CALL_MAY_FORCE.
+/// earlyforce.py: OptEarlyForce — force virtual args before escaping.
 ///
-/// Translated from rpython/jit/metainterp/optimizeopt/earlyforce.py.
+/// RPython earlyforce.py forces ALL arguments of most operations to ensure
+/// virtual objects are materialized before they can escape. Exempt ops:
+/// SETFIELD_GC, SETARRAYITEM_GC, SETARRAYITEM_RAW, QUASIIMMUT_FIELD,
+/// SAME_AS_*, raw_free calls.
 ///
-/// CALL_MAY_FORCE and CALL_ASSEMBLER can force virtual refs. If a virtual
-/// ref argument to such a call hasn't been forced yet, we must force it
-/// before the call to ensure correct ordering of side effects.
-///
-/// This pass must run BEFORE the main optimizer pipeline so that all
-/// forcing happens in the correct order.
+/// earlyforce.py:32: self.optimizer.optearlyforce = self
+/// The pass registers itself so force_box_for_end_of_preamble can route
+/// forced operations starting from earlyforce.next (= heap).
 use majit_ir::{Op, OpCode};
 
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
@@ -18,6 +18,36 @@ impl OptEarlyForce {
     pub fn new() -> Self {
         OptEarlyForce
     }
+
+    /// earlyforce.py:7-11: is_raw_free check.
+    /// Raw free calls should not force their arguments.
+    fn is_raw_free(op: &Op) -> bool {
+        if !op.opcode.is_call() {
+            return false;
+        }
+        if let Some(ref descr) = op.descr {
+            if let Some(cd) = descr.as_call_descr() {
+                let ei = cd.effect_info();
+                return ei.oopspec_index == majit_ir::OopSpecIndex::RawFree;
+            }
+        }
+        false
+    }
+
+    /// earlyforce.py:15-29: should we force args for this op?
+    fn should_force_args(op: &Op) -> bool {
+        !matches!(
+            op.opcode,
+            OpCode::SetfieldGc
+                | OpCode::SetfieldRaw
+                | OpCode::SetarrayitemGc
+                | OpCode::SetarrayitemRaw
+                | OpCode::QuasiimmutField
+                | OpCode::SameAsI
+                | OpCode::SameAsR
+                | OpCode::SameAsF
+        ) && !Self::is_raw_free(op)
+    }
 }
 
 impl Default for OptEarlyForce {
@@ -27,41 +57,35 @@ impl Default for OptEarlyForce {
 }
 
 impl Optimization for OptEarlyForce {
+    /// earlyforce.py:15-29: propagate_forward.
+    /// Force all virtual args of non-exempt operations, then emit.
     fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        match op.opcode {
-            // CALL_MAY_FORCE / CALL_ASSEMBLER can force virtual references.
-            // Ensure all VirtualRef arguments are forced (resolved) before
-            // these operations execute.
-            OpCode::CallMayForceI
-            | OpCode::CallMayForceR
-            | OpCode::CallMayForceF
-            | OpCode::CallMayForceN
-            | OpCode::CallAssemblerI
-            | OpCode::CallAssemblerR
-            | OpCode::CallAssemblerF
-            | OpCode::CallAssemblerN => {
-                // Resolve all arguments through forwarding. This ensures
-                // that any virtual ref that has been forced by a previous
-                // pass has its forwarding pointer followed.
-                let mut new_op = op.clone();
-                for arg in &mut new_op.args {
-                    *arg = ctx.get_box_replacement(*arg);
-                }
-                OptimizationResult::Emit(new_op)
-            }
-            // earlyforce.py: GUARD_NOT_FORCED needs to resolve fail_args
-            // through forwarding too, so forced virtual refs are properly tracked.
-            OpCode::GuardNotForced | OpCode::GuardNotForced2 => {
-                let mut new_op = op.clone();
-                if let Some(ref mut fa) = new_op.fail_args {
-                    for arg in fa.iter_mut() {
-                        *arg = ctx.get_box_replacement(*arg);
+        if Self::should_force_args(op) {
+            // earlyforce.py:28: self.optimizer.force_box(arg, self)
+            // In Rust, we can't call Optimizer.force_box (borrow conflict).
+            // Instead, force directly through PtrInfo.force_box_impl,
+            // which uses ctx.current_pass_idx (== earlyforce_idx) for
+            // emit_extra routing. This matches RPython's optforce=self.
+            for i in 0..op.num_args() {
+                let arg = ctx.get_box_replacement(op.arg(i));
+                if ctx.get_ptr_info(arg).is_some_and(|info| info.is_virtual()) {
+                    // optimizer.py:345-364: force_box path.
+                    // potential_extra_ops are handled by Optimizer.force_box,
+                    // but earlyforce only needs the virtual materialization.
+                    if let Some(tracked) = ctx.take_potential_extra_op(arg) {
+                        if let Some(builder) = ctx.active_short_preamble_producer_mut() {
+                            builder.add_preamble_op_from_pop(&tracked, arg);
+                        } else if let Some(builder) = ctx.imported_short_preamble_builder.as_mut() {
+                            builder.add_preamble_op_from_pop(&tracked, arg);
+                        }
                     }
+                    let mut info = ctx.take_ptr_info(arg).unwrap();
+                    let _forced = info.force_box(arg, ctx);
                 }
-                OptimizationResult::Emit(new_op)
             }
-            _ => OptimizationResult::PassOn,
         }
+        // earlyforce.py:29: return self.emit(op)
+        OptimizationResult::PassOn
     }
 
     fn name(&self) -> &'static str {
@@ -173,5 +197,23 @@ mod tests {
             );
             assert_eq!(result.len(), 1, "{opcode:?} should be handled");
         }
+    }
+
+    #[test]
+    fn test_earlyforce_exempt_setfield() {
+        // SETFIELD_GC should NOT force args (earlyforce.py:18)
+        let mut ops = vec![Op::new(OpCode::SetfieldGc, &[OpRef(100), OpRef(101)])];
+        assign_positions(&mut ops);
+
+        let mut opt = Optimizer::new();
+        opt.add_pass(Box::new(OptEarlyForce::new()));
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut std::collections::HashMap::new(),
+            1024,
+        );
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].opcode, OpCode::SetfieldGc);
     }
 }
