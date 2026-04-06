@@ -1488,20 +1488,22 @@ fn call_descr_release_gil_n(idx: u32, arg_types: Vec<Type>) -> DescrRef {
 #[test]
 fn test_call_release_gil_i_compiles_and_executes() {
     // Parity with test_fficall._run: CallReleaseGilI compiles and calls an
-    // extern "C" fn, returning the correct result through the GIL-release path.
+    // extern "C" fn, returning the correct result through the release-gil path.
+    // RPython: CallReleaseGilI must be followed by GuardNotForced.
     //
-    // Trace: input(a, b) -> result = call_release_gil_i(ffi_add, a, b) -> finish(result)
+    // Trace: input(a, b) -> result = call_release_gil_i(ffi_add, a, b)
+    //        -> guard_not_forced(fail_args=[a, b, result]) -> finish(result)
     let cd = call_descr_release_gil_i(60, vec![Type::Int, Type::Int]);
 
     let mut rec = Trace::new();
     let a = rec.record_input_arg(Type::Int);
     let b = rec.record_input_arg(Type::Int);
 
-    // The function pointer is a constant
     let fn_ptr = OpRef(1000);
 
     let result = rec.record_op_with_descr(OpCode::CallReleaseGilI, &[fn_ptr, a, b], cd);
-    rec.finish(&[result], make_descr(0));
+    rec.record_guard_with_fail_args(OpCode::GuardNotForced, &[], make_descr(0), &[a, b, result]);
+    rec.finish(&[result], make_descr(1));
     let trace = rec.get_trace();
 
     let mut backend = CraneliftBackend::new();
@@ -1534,14 +1536,16 @@ fn test_call_release_gil_i_compiles_and_executes() {
 #[test]
 fn test_call_release_gil_i_no_args() {
     // CallReleaseGilI with no arguments (like ffi_constant() -> 42).
+    // RPython: CallReleaseGilI must be followed by GuardNotForced.
     let cd = call_descr_release_gil_i(61, vec![]);
 
     let mut rec = Trace::new();
-    let _dummy = rec.record_input_arg(Type::Int); // need at least one input
+    let dummy = rec.record_input_arg(Type::Int); // need at least one input
     let fn_ptr = OpRef(1000);
 
     let result = rec.record_op_with_descr(OpCode::CallReleaseGilI, &[fn_ptr], cd);
-    rec.finish(&[result], make_descr(0));
+    rec.record_guard_with_fail_args(OpCode::GuardNotForced, &[], make_descr(0), &[dummy, result]);
+    rec.finish(&[result], make_descr(1));
     let trace = rec.get_trace();
 
     let mut backend = CraneliftBackend::new();
@@ -1572,6 +1576,7 @@ extern "C" fn ffi_sink(val: i64) {
 #[test]
 fn test_call_release_gil_n_void_return() {
     // Parity with test_fficall: CallReleaseGilN for void-returning FFI calls.
+    // RPython: CallReleaseGilN must be followed by GuardNotForced.
     let cd = call_descr_release_gil_n(62, vec![Type::Int]);
 
     let mut rec = Trace::new();
@@ -1579,7 +1584,8 @@ fn test_call_release_gil_n_void_return() {
     let fn_ptr = OpRef(1000);
 
     rec.record_op_with_descr(OpCode::CallReleaseGilN, &[fn_ptr, input], cd);
-    rec.finish(&[input], make_descr(0));
+    rec.record_guard_with_fail_args(OpCode::GuardNotForced, &[], make_descr(0), &[input]);
+    rec.finish(&[input], make_descr(1));
     let trace = rec.get_trace();
 
     let mut backend = CraneliftBackend::new();
@@ -1604,7 +1610,9 @@ fn test_call_release_gil_n_void_return() {
 #[test]
 fn test_call_release_gil_result_flows_through_trace() {
     // Verify that the result of CallReleaseGilI can be used by subsequent ops.
-    // Trace: input(x) -> tmp = ffi_add(x, CONST_10) -> result = int_add(tmp, CONST_5) -> finish
+    // RPython: CallReleaseGilI must be followed by GuardNotForced.
+    // Trace: input(x) -> tmp = call_release_gil_i(ffi_add, x, 10)
+    //        -> guard_not_forced -> result = int_add(tmp, 5) -> finish(result)
     let cd = call_descr_release_gil_i(63, vec![Type::Int, Type::Int]);
 
     let mut rec = Trace::new();
@@ -1614,8 +1622,9 @@ fn test_call_release_gil_result_flows_through_trace() {
     let const_5 = OpRef(1002);
 
     let tmp = rec.record_op_with_descr(OpCode::CallReleaseGilI, &[fn_ptr, x, const_10], cd);
+    rec.record_guard_with_fail_args(OpCode::GuardNotForced, &[], make_descr(0), &[x, tmp]);
     let result = rec.record_op(OpCode::IntAdd, &[tmp, const_5]);
-    rec.finish(&[result], make_descr(0));
+    rec.finish(&[result], make_descr(1));
     let trace = rec.get_trace();
 
     let mut backend = CraneliftBackend::new();
@@ -1937,11 +1946,11 @@ struct FakeExcObject {
 }
 
 /// FFI function that sets a pending exception via jit_exc_raise.
-/// Allocates a fake OBJECTPTR so grab_exc_class can derive typeptr.
+/// Allocates a fake OBJECTPTR so typeptr dereference works.
 extern "C" fn ffi_raise_exception(val: i64) -> i64 {
     if val != 0 {
         let obj = Box::leak(Box::new(FakeExcObject { typeptr: 0xEE }));
-        jit_exc_raise(obj as *const FakeExcObject as usize as i64, 0xEE);
+        jit_exc_raise(obj as *const FakeExcObject as usize as i64);
     }
     val
 }
@@ -2074,8 +2083,10 @@ fn test_call_may_force_with_forcing_semantics() {
 #[test]
 fn test_ffi_call_exception_propagation() {
     // Parity with test_fficall exception semantics.
+    // RPython: CallReleaseGilI -> GuardNotForced -> GuardNoException
     //
     // Trace: input(val) -> result = call_release_gil_i(ffi_raise_exception, val)
+    //        -> guard_not_forced(fail_args=[val, result])
     //        -> guard_no_exception(fail_args=[result]) -> finish(result)
     //
     // When val != 0, ffi_raise_exception sets a pending exception via
@@ -2088,6 +2099,8 @@ fn test_ffi_call_exception_propagation() {
     let fn_ptr = OpRef(1000);
     let result = rec.record_op_with_descr(OpCode::CallReleaseGilI, &[fn_ptr, val], cd);
 
+    // GuardNotForced: required immediately after CallReleaseGil
+    rec.record_guard_with_fail_args(OpCode::GuardNotForced, &[], make_descr(2), &[val, result]);
     // GuardNoException: exits if jit_exc_get_value() != 0
     rec.record_guard_with_fail_args(OpCode::GuardNoException, &[], make_descr(0), &[result]);
 
@@ -2102,23 +2115,24 @@ fn test_ffi_call_exception_propagation() {
     let mut token = JitCellToken::new(702);
     backend
         .compile_loop(&trace.inputargs, &trace.ops, &mut token)
-        .expect("CallReleaseGilI + GuardNoException should compile");
+        .expect("CallReleaseGilI + GuardNotForced + GuardNoException should compile");
 
+    // collect_guards: GuardNotForced=0, GuardNoException=1, Finish=2
     // val=0 -> no exception -> reaches Finish
     let frame = backend.execute_token(&token, &[Value::Int(0)]);
     assert_eq!(
         backend.get_latest_descr(&frame).fail_index(),
-        1,
-        "val=0: should reach Finish (descr 1)"
+        2,
+        "val=0: should reach Finish (fail_index=2)"
     );
     assert_eq!(backend.get_int_value(&frame, 0), 0, "val=0: result = 0");
 
-    // val=99 -> exception raised -> exits via GuardNoException (descr 0)
+    // val=99 -> exception raised -> exits via GuardNoException (fail_index=1)
     let frame = backend.execute_token(&token, &[Value::Int(99)]);
     assert_eq!(
         backend.get_latest_descr(&frame).fail_index(),
-        0,
-        "val=99: should exit via GuardNoException (descr 0)"
+        1,
+        "val=99: should exit via GuardNoException (fail_index=1)"
     );
     assert_eq!(
         backend.get_int_value(&frame, 0),
@@ -2602,6 +2616,8 @@ fn test_ffi_exchange_buffer_pattern() {
 
     // Step 2: Call the FFI function with buffer pointer
     let _call_result = rec.record_op_with_descr(OpCode::CallReleaseGilI, &[fn_ptr, r0], cd);
+    // RPython: CallReleaseGilI must be followed by GuardNotForced
+    rec.record_guard_with_fail_args(OpCode::GuardNotForced, &[], make_descr(1), &[r0, i0]);
 
     // Step 3: Load result from buffer at offset 32 (exchange_result)
     let loaded = rec.record_op_with_descr(OpCode::RawLoadI, &[r0, off_result], ad);
