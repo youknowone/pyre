@@ -31,17 +31,25 @@ pub fn encode_varint(buf: &mut Vec<u8>, value: i32) {
 
 /// resumecode.py: numb_next_item(numb, index)
 pub fn decode_varint(buf: &[u8], index: usize) -> (i32, usize) {
+    if index >= buf.len() {
+        // rd_numb truncated — upstream contract: never happens.
+        return (0, index);
+    }
     let mut value = buf[index] as i64;
     let mut index = index + 1;
 
     if value & (1 << 7) != 0 {
         value &= (1 << 7) - 1;
-        value |= (buf[index] as i64) << 7;
-        index += 1;
-        if value & (1 << 14) != 0 {
-            value &= (1 << 14) - 1;
-            value |= (buf[index] as i64) << 14;
+        if index < buf.len() {
+            value |= (buf[index] as i64) << 7;
             index += 1;
+            if value & (1 << 14) != 0 {
+                value &= (1 << 14) - 1;
+                if index < buf.len() {
+                    value |= (buf[index] as i64) << 14;
+                    index += 1;
+                }
+            }
         }
     }
 
