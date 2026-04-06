@@ -5875,12 +5875,12 @@ impl<'a> ResumeDataDirectReader<'a> {
         // resume.py:1406
         let expected = vinfo.get_total_size(virtualizable) as i32;
         // resume.py:1406: assert vinfo.get_total_size(virtualizable) == vable_size - 1
-        assert_eq!(
+        assert!(
+            expected == vable_size - 1,
+            "consume_vable_info: vinfo.get_total_size(0x{:x}) = {} != vable_size - 1 = {}",
+            virtualizable,
             expected,
-            vable_size - 1,
-            "consume_vable_info: vable size mismatch: expected={} actual={}",
-            expected,
-            vable_size - 1,
+            vable_size - 1
         );
         // resume.py:1407
         vinfo.reset_token_gcref(virtualizable);
