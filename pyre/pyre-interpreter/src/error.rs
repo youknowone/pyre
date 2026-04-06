@@ -116,6 +116,14 @@ impl PyError {
         }
     }
 
+    pub fn overflow_error(msg: impl Into<String>) -> Self {
+        PyError {
+            kind: PyErrorKind::OverflowError,
+            message: msg.into(),
+            exc_object: std::ptr::null_mut(),
+        }
+    }
+
     pub fn runtime_error(msg: impl Into<String>) -> Self {
         PyError {
             kind: PyErrorKind::RuntimeError,

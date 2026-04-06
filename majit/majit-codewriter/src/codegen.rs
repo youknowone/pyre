@@ -229,20 +229,23 @@ pub fn int_binop_lookup(op: BinaryOperator) -> Option<(majit_ir::OpCode, bool, b
 }
 
 /// Float binary operator dispatch: `(base_op, inplace_op, opcode)`.
-/// Power is excluded — it uses call_elidable_float_typed(pow).
+///
+/// resoperation.py:959-962: only FLOAT_ADD, FLOAT_SUB, FLOAT_MUL, FLOAT_TRUEDIV.
+/// lloperation.py:260-261: no float_floordiv, no float_mod, no float_pow.
+/// FloorDivide → _divmod_w() residual call (floatobject.py:508).
+/// Remainder → math_fmod residual call (floatobject.py:520).
+/// Power → ll_math_pow residual call (ll_math.py:260).
 pub const FLOAT_BINOP_TABLE: &[(
     BinaryOperator, BinaryOperator, majit_ir::OpCode,
 )] = &[
     (BinaryOperator::Add, BinaryOperator::InplaceAdd, majit_ir::OpCode::FloatAdd),
     (BinaryOperator::Subtract, BinaryOperator::InplaceSubtract, majit_ir::OpCode::FloatSub),
     (BinaryOperator::Multiply, BinaryOperator::InplaceMultiply, majit_ir::OpCode::FloatMul),
-    (BinaryOperator::FloorDivide, BinaryOperator::InplaceFloorDivide, majit_ir::OpCode::FloatFloorDiv),
-    (BinaryOperator::Remainder, BinaryOperator::InplaceRemainder, majit_ir::OpCode::FloatMod),
     (BinaryOperator::TrueDivide, BinaryOperator::InplaceTrueDivide, majit_ir::OpCode::FloatTrueDiv),
 ];
 
 /// Look up float binary operator dispatch entry.
-/// Returns None for Power (handled separately) and unsupported ops.
+/// Returns None for FloorDivide, Remainder, Power and unsupported ops.
 pub fn float_binop_lookup(op: BinaryOperator) -> Option<majit_ir::OpCode> {
     FLOAT_BINOP_TABLE
         .iter()
@@ -404,12 +407,16 @@ pub fn concrete_int_binop(op: BinaryOperator, lhs: i64, rhs: i64) -> Option<i64>
         BinaryOperator::Or | BinaryOperator::InplaceOr => Some(lhs | rhs),
         BinaryOperator::Xor | BinaryOperator::InplaceXor => Some(lhs ^ rhs),
         BinaryOperator::Lshift | BinaryOperator::InplaceLshift => {
+            // intobject.py:205: negative shift → ValueError
+            if rhs < 0 { return None; }
             let shift = rhs as u32;
             if shift >= 64 { return None; }
             let r = lhs.wrapping_shl(shift);
             if r.wrapping_shr(shift) != lhs { None } else { Some(r) }
         }
         BinaryOperator::Rshift | BinaryOperator::InplaceRshift => {
+            // intobject.py:224: negative shift → ValueError("negative shift count")
+            if rhs < 0 { return None; }
             let shift = rhs as u32;
             if shift >= 64 {
                 Some(if lhs < 0 { -1 } else { 0 })
