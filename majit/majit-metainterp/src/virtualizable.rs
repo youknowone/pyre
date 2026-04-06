@@ -663,11 +663,11 @@ impl VirtualizableInfo {
             .collect()
     }
 
-    /// RPython parity surface: write static boxes only.
+    /// Write static fields only (no array items).
     ///
     /// # Safety
     /// `obj_ptr` must point to a valid virtualizable object.
-    pub unsafe fn write_boxes(&self, obj_ptr: *mut u8, boxes: &[i64]) {
+    pub unsafe fn write_static_boxes(&self, obj_ptr: *mut u8, boxes: &[i64]) {
         for (index, &value) in boxes.iter().enumerate() {
             if index >= self.static_fields.len() {
                 break;
@@ -708,7 +708,7 @@ impl VirtualizableInfo {
         static_boxes: &[i64],
         array_boxes: &[Vec<i64>],
     ) {
-        self.write_boxes(obj_ptr, static_boxes);
+        self.write_static_boxes(obj_ptr, static_boxes);
         for (array_index, values) in array_boxes.iter().enumerate() {
             for (item_index, &value) in values.iter().enumerate() {
                 self.write_array_item(obj_ptr, array_index, item_index, value);
@@ -727,7 +727,7 @@ impl VirtualizableInfo {
     ///
     /// # Safety
     /// `obj_ptr` must point to a valid virtualizable object.
-    pub unsafe fn write_boxes_to_heap(&self, obj_ptr: *mut u8, boxes: &[i64]) {
+    pub unsafe fn write_boxes(&self, obj_ptr: *mut u8, boxes: &[i64]) {
         let mut i = 0;
         // Static fields
         for fi in 0..self.static_fields.len() {
@@ -746,7 +746,7 @@ impl VirtualizableInfo {
         assert_eq!(
             boxes.len(),
             i + 1,
-            "write_boxes_to_heap: boxes count mismatch (expected {}, got {})",
+            "write_boxes: boxes count mismatch (expected {}, got {})",
             i + 1,
             boxes.len()
         );
@@ -776,7 +776,7 @@ impl VirtualizableInfo {
     /// # Safety
     /// `obj_ptr` must point to a valid virtualizable object.
     pub unsafe fn force_from_boxes(&self, obj_ptr: *mut u8, boxes: &[i64]) {
-        self.write_boxes_to_heap(obj_ptr, boxes);
+        self.write_boxes(obj_ptr, boxes);
         self.reset_vable_token(obj_ptr);
     }
 }

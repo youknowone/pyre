@@ -115,18 +115,12 @@ impl LiveVars {
                         }
                     }
                     // LoadFastBorrowLoadFastBorrow reads two locals — GEN both.
-                    // Correct per RPython liveness semantics, but currently
-                    // disabled: enabling exposes a pre-existing blackhole bug
-                    // where dead locals get stale CONST values from trace
-                    // recording time. Without GEN, the blackhole naturally
-                    // fails (too few values) and the loop is invalidated —
-                    // interpreter takes over. With GEN, the blackhole succeeds
-                    // but computes wrong results from stale dead-local values.
-                    // Verified correct via FORCE_BH_FAIL: GEN=ON + forced
-                    // blackhole failure produces correct output.
-                    // TODO: implement consume_vable_info (resume.py:1399) to
-                    // provide runtime-resolved values for dead locals, then
-                    // re-enable.
+                    // Correct per RPython liveness (verified via FORCE_BH_FAIL).
+                    // Disabled: exposes two pre-existing issues:
+                    // 1. extend-live-values abort: compiled loop num_inputs
+                    //    changes with liveness but runtime export doesn't match.
+                    // 2. blackhole wrong output: dead locals get stale values.
+                    // Both need separate fixes before GEN can be enabled.
                     // Instruction::LoadFastBorrowLoadFastBorrow { var_nums } => {
                     //     let pair = var_nums.get(op_arg);
                     //     for i in [u32::from(pair.idx_1()) as usize,

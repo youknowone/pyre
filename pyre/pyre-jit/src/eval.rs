@@ -2948,14 +2948,11 @@ fn build_resumed_frames(
         (std::ptr::null_mut(), 0, 0)
     };
 
-    // TODO: resume.py:1399 consume_vable_info writes ALL vable fields
-    // back to the virtualizable frame BEFORE the blackhole runs.
-    // Blocked: when GEN is enabled for LoadFastBorrowLoadFastBorrow,
-    // more locals are live and the blackhole succeeds, but dead locals
-    // get stale CONST values from trace recording time (not guard failure
-    // time). The blackhole then reads these stale values, producing wrong
-    // output. Fix: implement full consume_vable_info with runtime-resolved
-    // vable array values pre-filling blackhole registers.
+    // TODO resume.py:1399 consume_vable_info → virtualizable.py:126
+    // write_from_resume_data_partial: write ALL vable fields to the frame
+    // BEFORE the blackhole runs. Blocked on GC-safe Ref constant handling
+    // in rd_consts (RPython uses GC-traced ConstPtr objects; pyre stores
+    // raw i64 that may dangle after GC).
 
     let mut result = Vec::with_capacity(frames.len());
     for (idx, (frame, values)) in frames.iter().zip(all_values.into_iter()).enumerate() {
