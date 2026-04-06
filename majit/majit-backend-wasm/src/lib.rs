@@ -105,6 +105,53 @@ impl WasmBackend {
         table
     }
 
+    /// Pre-fetch `GuardGcTypeInfo` from the installed `gc_ll_descr`.
+    ///
+    /// Mirrors the `self.cpu.gc_ll_descr.get_translated_info_*` /
+    /// `cpu.subclassrange_min_offset` lookups that RPython's
+    /// `genop_guard_guard_is_object` (x86/assembler.py:1924-1943) and
+    /// `genop_guard_guard_subclass` (x86/assembler.py:1945-1980) do at
+    /// codegen time. The returned struct is handed to
+    /// `codegen::build_wasm_module`; the codegen arms assert
+    /// `supports_guard_gc_type` before reading any other field.
+    ///
+    /// Also pre-computes `(subclassrange_min, subclassrange_max)` for
+    /// every constant classptr argument of a `GuardSubclass` op
+    /// (assembler.py:1971-1974 reads these bounds at codegen time).
+    fn collect_guard_gc_type_info(&self, ops: &[Op]) -> codegen::GuardGcTypeInfo {
+        let mut info = codegen::GuardGcTypeInfo::default();
+        let gc = match self.gc_ll_descr.as_ref() {
+            Some(gc) => gc,
+            None => return info,
+        };
+        info.supports_guard_gc_type = gc.supports_guard_gc_type();
+        if !info.supports_guard_gc_type {
+            return info;
+        }
+        // assembler.py:1934-1937: gc_ll_descr lookups.
+        let (base, shift, sizeof_ti) = gc.get_translated_info_for_typeinfo();
+        info.base_type_info = base;
+        info.shift_by = shift;
+        info.sizeof_ti = sizeof_ti;
+        let (infobits_off, is_object_flag) = gc.get_translated_info_for_guard_is_object();
+        info.infobits_offset = infobits_off;
+        info.is_object_flag = is_object_flag;
+        // assembler.py:1951: cpu.subclassrange_min_offset.
+        info.subclassrange_min_offset = gc.subclassrange_min_offset();
+        // assembler.py:1971-1974: (subclassrange_min, subclassrange_max)
+        // for every constant GuardSubclass arg1.
+        for op in ops {
+            if op.opcode == majit_ir::OpCode::GuardSubclass && op.args.len() >= 2 {
+                if let Some(&classptr) = self.constants.get(&op.args[1].0) {
+                    if let Some(range) = gc.subclass_range(classptr as usize) {
+                        info.subclass_ranges.insert(classptr, range);
+                    }
+                }
+            }
+        }
+        info
+    }
+
     /// Collect constants from ops (constant OpRefs that appear as args).
     fn collect_constants_from_ops(&mut self, ops: &[Op]) {
         for op in ops {
@@ -139,12 +186,14 @@ impl majit_backend::Backend for WasmBackend {
         self.trace_counter += 1;
 
         let typeid_table = self.collect_classptr_typeid_table(ops);
+        let guard_gc_type_info = self.collect_guard_gc_type_info(ops);
         let (wasm_bytes, guard_exits) = codegen::build_wasm_module(
             inputargs,
             ops,
             &self.constants,
             self.vtable_offset,
             &typeid_table,
+            &guard_gc_type_info,
         )?;
 
         // Build fail descriptors

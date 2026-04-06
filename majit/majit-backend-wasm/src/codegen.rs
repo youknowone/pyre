@@ -62,6 +62,47 @@ pub struct GuardExit {
     pub is_finish: bool,
 }
 
+/// Pre-fetched GC-type-guard metadata for the wasm codegen.
+///
+/// RPython's `genop_guard_guard_*` methods call into
+/// `self.cpu.gc_ll_descr` at codegen time to obtain the TYPE_INFO
+/// table base, the `infobits` offset / byte mask, the subclassrange
+/// field offset, and the `(subclassrange_min, subclassrange_max)`
+/// bounds for the constant expected-class pointer. The wasm backend
+/// has no direct handle on a `GcAllocator` at this layer, so the
+/// caller (`WasmBackend::compile_loop`) pre-fetches each of those
+/// values and bundles them here.
+///
+/// Parity references:
+///  * `llsupport/gc.py:162` / `gc.py:318` — `supports_guard_gc_type`
+///  * `llsupport/gc.py:592` — `get_translated_info_for_typeinfo`
+///  * `llsupport/gc.py:619` — `get_translated_info_for_guard_is_object`
+///  * `x86/assembler.py:1951` — `cpu.subclassrange_min_offset`
+///  * `x86/assembler.py:1971-1974` — constant-time
+///    `(vtable_ptr.subclassrange_min, vtable_ptr.subclassrange_max)`
+///
+/// The default sets `supports_guard_gc_type = false`, matching
+/// `AbstractCPU.supports_guard_gc_type` in `backend/model.py:21`; the
+/// codegen arms assert this flag before reading any other field.
+#[derive(Default)]
+pub struct GuardGcTypeInfo {
+    pub supports_guard_gc_type: bool,
+    /// `get_translated_info_for_typeinfo()` = (base, shift, sizeof_ti).
+    pub base_type_info: usize,
+    pub shift_by: u8,
+    pub sizeof_ti: usize,
+    /// `get_translated_info_for_guard_is_object()`
+    ///     = (infobits_offset, T_IS_RPYTHON_INSTANCE_BYTE).
+    pub infobits_offset: usize,
+    pub is_object_flag: u8,
+    /// `cpu.subclassrange_min_offset` (x86/assembler.py:1951).
+    pub subclassrange_min_offset: usize,
+    /// `(vtable_ptr.subclassrange_min, vtable_ptr.subclassrange_max)`
+    /// looked up by constant classptr. Empty when
+    /// `supports_guard_gc_type == false`.
+    pub subclass_ranges: HashMap<i64, (i64, i64)>,
+}
+
 /// Check if any op in the trace is a CALL variant.
 fn has_call_ops(ops: &[Op]) -> bool {
     ops.iter().any(|op| op.opcode.is_call())
@@ -122,6 +163,7 @@ pub fn build_wasm_module(
     constants: &HashMap<u32, i64>,
     vtable_offset: Option<usize>,
     classptr_to_typeid: &HashMap<i64, u32>,
+    guard_gc_type_info: &GuardGcTypeInfo,
 ) -> Result<(Vec<u8>, Vec<GuardExit>), BackendError> {
     let (guards, num_vars) = collect_guards_and_vars(inputargs, ops);
     let needs_call = has_call_ops(ops);
@@ -179,6 +221,7 @@ pub fn build_wasm_module(
         jit_call_idx,
         vtable_offset,
         classptr_to_typeid,
+        guard_gc_type_info,
     )?;
     codes.function(&func);
     module.section(&codes);
@@ -194,6 +237,7 @@ fn build_function(
     jit_call_idx: Option<u32>,
     vtable_offset: Option<usize>,
     classptr_to_typeid: &HashMap<i64, u32>,
+    guard_gc_type_info: &GuardGcTypeInfo,
 ) -> Result<Function, BackendError> {
     let mut func = Function::new(vec![(num_vars, ValType::I64)]);
     let mut sink = func.instructions();
@@ -767,38 +811,180 @@ fn build_function(
                 }
                 guard_idx += 1;
             }
-            // GUARD_IS_OBJECT: RPython's `genop_guard_guard_is_object`
-            // (x86/assembler.py:1924-1943) loads the typeid from the GC
-            // header, indexes the translator-side TYPE_INFO table, and
-            // tests `T_IS_RPYTHON_INSTANCE` in the `infobits` word.
-            // pyre's runtime has not installed that TYPE_INFO layout on
-            // the wasm backend, so there is no faithful lowering here.
-            // Reject at compile time rather than silently pass — a
-            // silent pass would diverge from RPython semantics on any
-            // non-instance box that reaches this guard.
+            // x86/assembler.py:1924-1943 genop_guard_guard_is_object.
+            //     assert self.cpu.supports_guard_gc_type
+            //     [loc_object, loc_typeid] = locs
+            //     if IS_X86_32:
+            //         self.mc.MOVZX16(loc_typeid, mem(loc_object, 0))
+            //     else:
+            //         self.mc.MOV32(loc_typeid, mem(loc_object, 0))
+            //     base_type_info, shift_by, sizeof_ti = (
+            //         self.cpu.gc_ll_descr
+            //             .get_translated_info_for_typeinfo())
+            //     infobits_offset, IS_OBJECT_FLAG = (
+            //         self.cpu.gc_ll_descr
+            //             .get_translated_info_for_guard_is_object())
+            //     loc_infobits = addr_add(imm(base_type_info),
+            //                             loc_typeid,
+            //                             scale=shift_by,
+            //                             offset=infobits_offset)
+            //     self.mc.TEST8(loc_infobits, imm(IS_OBJECT_FLAG))
+            //     self.guard_success_cc = rx86.Conditions['NZ']
+            //     self.implement_guard(guard_token)
             OpCode::GuardIsObject => {
-                return Err(BackendError::CompilationFailed(
-                    "GUARD_IS_OBJECT lowering requires the \
-                     gc_ll_descr TYPE_INFO/infobits layout \
-                     (x86/assembler.py:1924-1943); wasm backend has \
-                     no faithful lowering installed"
-                        .into(),
-                ));
+                // assembler.py:1925 assert self.cpu.supports_guard_gc_type
+                assert!(
+                    guard_gc_type_info.supports_guard_gc_type,
+                    "x86/assembler.py:1925: assert self.cpu.\
+                     supports_guard_gc_type (GcAllocator has not \
+                     installed a TYPE_INFO layout)"
+                );
+                // assembler.py:1931-1932 MOV32 loc_typeid, mem(loc_object, 0).
+                // majit's GC header sits at obj - GcHeader::SIZE; the
+                // typeid occupies the lower TYPE_ID_BITS of that word.
+                emit_resolve(&mut sink, constants, op.arg(0));
+                sink.i64_const(GcHeader::SIZE as i64);
+                sink.i64_sub();
+                sink.i32_wrap_i64();
+                sink.i64_load(mem64(0));
+                sink.i64_const(TYPE_ID_MASK as i64);
+                sink.i64_and();
+                // Stack: [..., loc_typeid]
+
+                // assembler.py:1938-1939 addr_add(imm(base_type_info),
+                //     loc_typeid, scale=shift_by, offset=infobits_offset)
+                if guard_gc_type_info.shift_by > 0 {
+                    sink.i64_const(guard_gc_type_info.shift_by as i64);
+                    sink.i64_shl();
+                }
+                sink.i64_const(guard_gc_type_info.base_type_info as i64);
+                sink.i64_add();
+                sink.i64_const(guard_gc_type_info.infobits_offset as i64);
+                sink.i64_add();
+                sink.i32_wrap_i64();
+                // Stack: [..., loc_infobits(i32 addr)]
+
+                // assembler.py:1940 TEST8 [loc_infobits], IS_OBJECT_FLAG
+                sink.i32_load8_u(MemArg {
+                    offset: 0,
+                    align: 0,
+                    memory_index: 0,
+                });
+                sink.i32_const(guard_gc_type_info.is_object_flag as i32);
+                sink.i32_and();
+                // assembler.py:1942 guard_success_cc = Conditions['NZ']:
+                // guard passes when byte & flag != 0; fail when == 0.
+                sink.i32_eqz();
+                emit_guard_if_exit(&mut sink, constants, guard_idx, op, has_loop);
+                guard_idx += 1;
             }
-            // GUARD_SUBCLASS: RPython's `genop_guard_guard_subclass`
-            // (x86/assembler.py:1945-1980) runs an unsigned range check
-            // on `subclassrange_min`/`subclassrange_max` fields of
-            // `rclass.CLASSTYPE`. pyre's PyType carries no such fields
-            // on the wasm backend. Reject at compile time rather than
-            // inventing equality semantics or silently passing.
+            // x86/assembler.py:1945-1980 genop_guard_guard_subclass.
+            //     assert self.cpu.supports_guard_gc_type
+            //     [loc_object, loc_check_against_class, loc_tmp] = locs
+            //     offset = self.cpu.vtable_offset
+            //     offset2 = self.cpu.subclassrange_min_offset
+            //     if offset is not None:
+            //         self.mc.MOV_rm(loc_tmp, (loc_object, offset))
+            //         self.mc.MOV_rm(loc_tmp, (loc_tmp, offset2))
+            //     else:
+            //         self.mc.MOV32(loc_tmp, mem(loc_object, 0))
+            //         base_type_info, shift_by, sizeof_ti = (
+            //             gc_ll_descr.get_translated_info_for_typeinfo())
+            //         self.mc.MOV(loc_tmp, addr_add(
+            //             imm(base_type_info), loc_tmp,
+            //             scale=shift_by,
+            //             offset=sizeof_ti + offset2))
+            //     vtable_ptr = loc_check_against_class.getint()
+            //     vtable_ptr = rffi.cast(rclass.CLASSTYPE, vtable_ptr)
+            //     check_min = vtable_ptr.subclassrange_min
+            //     check_max = vtable_ptr.subclassrange_max
+            //     self.mc.SUB_ri(loc_tmp, check_min)
+            //     self.mc.CMP_ri(loc_tmp, check_max - check_min)
+            //     self.guard_success_cc = Conditions['B']
+            //     self.implement_guard(guard_token)
             OpCode::GuardSubclass => {
-                return Err(BackendError::CompilationFailed(
-                    "GUARD_SUBCLASS lowering requires the gc_ll_descr \
-                     subclassrange layout (x86/assembler.py:\
-                     1945-1980); wasm backend has no faithful lowering \
-                     installed"
-                        .into(),
-                ));
+                // assembler.py:1946 assert self.cpu.supports_guard_gc_type
+                assert!(
+                    guard_gc_type_info.supports_guard_gc_type,
+                    "x86/assembler.py:1946: assert self.cpu.\
+                     supports_guard_gc_type (GcAllocator has not \
+                     installed a TYPE_INFO / rclass.CLASSTYPE layout)"
+                );
+
+                // assembler.py:1971 vtable_ptr = loc_check_against_class
+                //   .getint(): the bounds are resolved at codegen time,
+                //   so arg1 must be an immediate class pointer.
+                let loc_check_against_class =
+                    constants.get(&op.arg(1).0).copied().unwrap_or_else(|| {
+                        panic!(
+                            "x86/assembler.py:1971 vtable_ptr = \
+                             loc_check_against_class.getint(): \
+                             GUARD_SUBCLASS requires arg1 to be an \
+                             immediate class pointer"
+                        )
+                    });
+                // assembler.py:1973-1974: vtable_ptr.subclassrange_{min,max}
+                let (check_min, check_max) = guard_gc_type_info
+                    .subclass_ranges
+                    .get(&loc_check_against_class)
+                    .copied()
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "x86/assembler.py:1973-1974 vtable_ptr.\
+                             subclassrange_min/max: GcAllocator has no \
+                             rclass.CLASSTYPE entry for classptr {:#x}",
+                            loc_check_against_class
+                        )
+                    });
+
+                // assembler.py:1950-1951 offset / offset2.
+                let offset2 = guard_gc_type_info.subclassrange_min_offset;
+                if let Some(vtable_off) = vtable_offset {
+                    // assembler.py:1953-1956
+                    //     MOV_rm(loc_tmp, (loc_object, offset))
+                    //     MOV_rm(loc_tmp, (loc_tmp, offset2))
+                    emit_resolve(&mut sink, constants, op.arg(0));
+                    sink.i32_wrap_i64();
+                    sink.i64_load(mem64(vtable_off as u64));
+                    sink.i32_wrap_i64();
+                    sink.i64_load(mem64(offset2 as u64));
+                } else {
+                    // assembler.py:1957-1969 gcremovetypeptr path.
+                    //     MOV32 loc_tmp, mem(loc_object, 0)
+                    //     base_type_info, shift_by, sizeof_ti = ...
+                    //     MOV loc_tmp, [base_type_info
+                    //         + (loc_tmp << shift_by)
+                    //         + sizeof_ti + offset2]
+                    emit_resolve(&mut sink, constants, op.arg(0));
+                    sink.i64_const(GcHeader::SIZE as i64);
+                    sink.i64_sub();
+                    sink.i32_wrap_i64();
+                    sink.i64_load(mem64(0));
+                    sink.i64_const(TYPE_ID_MASK as i64);
+                    sink.i64_and();
+                    if guard_gc_type_info.shift_by > 0 {
+                        sink.i64_const(guard_gc_type_info.shift_by as i64);
+                        sink.i64_shl();
+                    }
+                    sink.i64_const(guard_gc_type_info.base_type_info as i64);
+                    sink.i64_add();
+                    sink.i64_const((guard_gc_type_info.sizeof_ti + offset2) as i64);
+                    sink.i64_add();
+                    sink.i32_wrap_i64();
+                    sink.i64_load(mem64(0));
+                }
+                // Stack: [..., loc_tmp (i64)]
+
+                // assembler.py:1976-1978 unsigned comparison:
+                //     (loc_tmp - check_min) <u (check_max - check_min)
+                sink.i64_const(check_min);
+                sink.i64_sub();
+                sink.i64_const(check_max - check_min);
+                // assembler.py:1979 guard_success_cc = Conditions['B']:
+                // guard passes when sub <u limit; fail when sub >=u limit.
+                sink.i64_ge_u();
+                emit_guard_if_exit(&mut sink, constants, guard_idx, op, has_loop);
+                guard_idx += 1;
             }
             OpCode::GuardFutureCondition | OpCode::GuardAlwaysFails => {
                 // GuardAlwaysFails always exits.

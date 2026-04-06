@@ -40,9 +40,15 @@ fn test_empty_trace() {
         op
     }];
     let constants = HashMap::new();
-    let (bytes, guards) =
-        codegen::build_wasm_module(&inputargs, &ops, &constants, Some(0), &HashMap::new())
-            .expect("wasm codegen should succeed");
+    let (bytes, guards) = codegen::build_wasm_module(
+        &inputargs,
+        &ops,
+        &constants,
+        Some(0),
+        &HashMap::new(),
+        &codegen::GuardGcTypeInfo::default(),
+    )
+    .expect("wasm codegen should succeed");
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 1);
     assert!(guards[0].is_finish);
@@ -78,9 +84,15 @@ fn test_int_add_loop() {
         Op::new(OpCode::Jump, &[OpRef(3), OpRef(2)]),
     ];
 
-    let (bytes, guards) =
-        codegen::build_wasm_module(&inputargs, &ops, &constants, Some(0), &HashMap::new())
-            .expect("wasm codegen should succeed");
+    let (bytes, guards) = codegen::build_wasm_module(
+        &inputargs,
+        &ops,
+        &constants,
+        Some(0),
+        &HashMap::new(),
+        &codegen::GuardGcTypeInfo::default(),
+    )
+    .expect("wasm codegen should succeed");
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 1); // one guard
     assert!(!guards[0].is_finish);
@@ -115,9 +127,15 @@ fn test_float_ops() {
     ];
 
     let constants = HashMap::new();
-    let (bytes, guards) =
-        codegen::build_wasm_module(&inputargs, &ops, &constants, Some(0), &HashMap::new())
-            .expect("wasm codegen should succeed");
+    let (bytes, guards) = codegen::build_wasm_module(
+        &inputargs,
+        &ops,
+        &constants,
+        Some(0),
+        &HashMap::new(),
+        &codegen::GuardGcTypeInfo::default(),
+    )
+    .expect("wasm codegen should succeed");
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 1);
 }
@@ -139,9 +157,15 @@ fn test_call_generates_import() {
         op
     }];
 
-    let (bytes, guards) =
-        codegen::build_wasm_module(&inputargs, &ops, &constants, Some(0), &HashMap::new())
-            .expect("wasm codegen should succeed");
+    let (bytes, guards) = codegen::build_wasm_module(
+        &inputargs,
+        &ops,
+        &constants,
+        Some(0),
+        &HashMap::new(),
+        &codegen::GuardGcTypeInfo::default(),
+    )
+    .expect("wasm codegen should succeed");
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 1);
 
@@ -203,9 +227,15 @@ fn test_guard_types() {
     ];
 
     let constants = HashMap::new();
-    let (bytes, guards) =
-        codegen::build_wasm_module(&inputargs, &ops, &constants, Some(0), &HashMap::new())
-            .expect("wasm codegen should succeed");
+    let (bytes, guards) = codegen::build_wasm_module(
+        &inputargs,
+        &ops,
+        &constants,
+        Some(0),
+        &HashMap::new(),
+        &codegen::GuardGcTypeInfo::default(),
+    )
+    .expect("wasm codegen should succeed");
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 7);
 }
@@ -233,23 +263,28 @@ fn test_guard_gc_type_uses_immediate_typeid() {
         Op::new(OpCode::Jump, &[OpRef(0)]),
     ];
 
-    let (bytes, guards) =
-        codegen::build_wasm_module(&inputargs, &ops, &constants, Some(0), &HashMap::new())
-            .expect("wasm codegen should succeed");
+    let (bytes, guards) = codegen::build_wasm_module(
+        &inputargs,
+        &ops,
+        &constants,
+        Some(0),
+        &HashMap::new(),
+        &codegen::GuardGcTypeInfo::default(),
+    )
+    .expect("wasm codegen should succeed");
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 1);
 }
 
-/// GUARD_IS_OBJECT and GUARD_SUBCLASS have defined RPython semantics
-/// (x86/assembler.py:1924-1943 and 1945-1980) that require the
-/// gc_ll_descr TYPE_INFO/infobits and subclassrange layouts. pyre's
-/// runtime does not install those layouts on the wasm backend, so
-/// lowering would silently diverge from RPython. The wasm backend must
-/// reject these opcodes at compile time rather than pass them through.
+/// x86/assembler.py:1925 `assert self.cpu.supports_guard_gc_type` —
+/// mirrored line-by-line as the first statement in the wasm codegen's
+/// GUARD_IS_OBJECT arm (codegen.rs). A default `GuardGcTypeInfo`
+/// matches `AbstractCPU.supports_guard_gc_type = False`
+/// (backend/model.py:21), so reaching this arm must panic rather than
+/// silently pass.
 #[test]
-fn test_guard_is_object_is_rejected() {
-    use majit_backend::BackendError;
-
+#[should_panic(expected = "supports_guard_gc_type")]
+fn test_guard_is_object_asserts_supports_guard_gc_type() {
     let inputargs = vec![InputArg {
         index: 0,
         tp: Type::Int,
@@ -262,19 +297,21 @@ fn test_guard_is_object_is_rejected() {
     ];
 
     let constants = HashMap::new();
-    match codegen::build_wasm_module(&inputargs, &ops, &constants, Some(0), &HashMap::new()) {
-        Err(BackendError::CompilationFailed(msg)) => {
-            assert!(msg.contains("GUARD_IS_OBJECT"), "unexpected error: {msg}");
-        }
-        Err(other) => panic!("expected CompilationFailed, got {other:?}"),
-        Ok(_) => panic!("GUARD_IS_OBJECT should be rejected"),
-    }
+    let _ = codegen::build_wasm_module(
+        &inputargs,
+        &ops,
+        &constants,
+        Some(0),
+        &HashMap::new(),
+        &codegen::GuardGcTypeInfo::default(),
+    );
 }
 
+/// x86/assembler.py:1946 `assert self.cpu.supports_guard_gc_type` — same
+/// contract as GUARD_IS_OBJECT above for the GUARD_SUBCLASS arm.
 #[test]
-fn test_guard_subclass_is_rejected() {
-    use majit_backend::BackendError;
-
+#[should_panic(expected = "supports_guard_gc_type")]
+fn test_guard_subclass_asserts_supports_guard_gc_type() {
     let inputargs = vec![InputArg {
         index: 0,
         tp: Type::Int,
@@ -287,13 +324,14 @@ fn test_guard_subclass_is_rejected() {
     ];
 
     let constants = HashMap::new();
-    match codegen::build_wasm_module(&inputargs, &ops, &constants, Some(0), &HashMap::new()) {
-        Err(BackendError::CompilationFailed(msg)) => {
-            assert!(msg.contains("GUARD_SUBCLASS"), "unexpected error: {msg}");
-        }
-        Err(other) => panic!("expected CompilationFailed, got {other:?}"),
-        Ok(_) => panic!("GUARD_SUBCLASS should be rejected"),
-    }
+    let _ = codegen::build_wasm_module(
+        &inputargs,
+        &ops,
+        &constants,
+        Some(0),
+        &HashMap::new(),
+        &codegen::GuardGcTypeInfo::default(),
+    );
 }
 
 #[test]
@@ -321,9 +359,15 @@ fn test_sameas_and_conversions() {
     ];
 
     let constants = HashMap::new();
-    let (bytes, _) =
-        codegen::build_wasm_module(&inputargs, &ops, &constants, Some(0), &HashMap::new())
-            .expect("wasm codegen should succeed");
+    let (bytes, _) = codegen::build_wasm_module(
+        &inputargs,
+        &ops,
+        &constants,
+        Some(0),
+        &HashMap::new(),
+        &codegen::GuardGcTypeInfo::default(),
+    )
+    .expect("wasm codegen should succeed");
     validate_wasm(&bytes);
 }
 
@@ -361,9 +405,15 @@ fn test_overflow_ops() {
     ];
 
     let constants = HashMap::new();
-    let (bytes, guards) =
-        codegen::build_wasm_module(&inputargs, &ops, &constants, Some(0), &HashMap::new())
-            .expect("wasm codegen should succeed");
+    let (bytes, guards) = codegen::build_wasm_module(
+        &inputargs,
+        &ops,
+        &constants,
+        Some(0),
+        &HashMap::new(),
+        &codegen::GuardGcTypeInfo::default(),
+    )
+    .expect("wasm codegen should succeed");
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 3); // 2 GuardNoOverflow + 1 Finish
 }

@@ -6062,43 +6062,245 @@ impl CraneliftBackend {
                 }
 
                 OpCode::GuardIsObject => {
-                    // x86/assembler.py:1924-1943 genop_guard_guard_is_object:
-                    //   typeid = mem32[obj + 0]
-                    //   addr = base_type_info + (typeid << shift_by)
-                    //        + infobits_offset
-                    //   TEST8 [addr], IS_OBJECT_FLAG
-                    //   passes if NZ
-                    // Requires cpu.gc_ll_descr.get_translated_info_for_typeinfo
-                    // and get_translated_info_for_guard_is_object to be
-                    // installed; pyre's TypeInfo has no infobits layout and
-                    // the tracer never emits GUARD_IS_OBJECT, so reject at
-                    // codegen time rather than silently emit a null check.
-                    return Err(BackendError::CompilationFailed(
-                        "GUARD_IS_OBJECT lowering requires gc_ll_descr \
-                         typeinfo/infobits layout (x86/assembler.py:\
-                         1924-1943); not installed for this backend"
-                            .into(),
-                    ));
+                    // x86/assembler.py:1924-1943 genop_guard_guard_is_object.
+                    //     assert self.cpu.supports_guard_gc_type
+                    //     [loc_object, loc_typeid] = locs
+                    //     if IS_X86_32:
+                    //         self.mc.MOVZX16(loc_typeid, mem(loc_object, 0))
+                    //     else:
+                    //         self.mc.MOV32(loc_typeid, mem(loc_object, 0))
+                    //     base_type_info, shift_by, sizeof_ti = (
+                    //         self.cpu.gc_ll_descr
+                    //             .get_translated_info_for_typeinfo())
+                    //     infobits_offset, IS_OBJECT_FLAG = (
+                    //         self.cpu.gc_ll_descr
+                    //             .get_translated_info_for_guard_is_object())
+                    //     loc_infobits = addr_add(imm(base_type_info),
+                    //                             loc_typeid,
+                    //                             scale=shift_by,
+                    //                             offset=infobits_offset)
+                    //     self.mc.TEST8(loc_infobits, imm(IS_OBJECT_FLAG))
+                    //     self.guard_success_cc = rx86.Conditions['NZ']
+                    //     self.implement_guard(guard_token)
+                    let info = &guard_infos[guard_idx];
+                    guard_idx += 1;
+
+                    let runtime_id = gc_runtime_id.ok_or_else(|| missing_gc_runtime(op.opcode))?;
+                    // assembler.py:1925 assert self.cpu.supports_guard_gc_type
+                    assert!(
+                        with_gc_runtime(runtime_id, |gc| gc.supports_guard_gc_type()),
+                        "x86/assembler.py:1925: assert self.cpu.\
+                         supports_guard_gc_type (GcAllocator has not \
+                         installed a TYPE_INFO layout)"
+                    );
+
+                    let loc_object = resolve_opref(&mut builder, &constants, op.args[0]);
+                    // assembler.py:1931-1932 MOV32 loc_typeid, mem(loc_object, 0).
+                    // majit's GC header sits at `obj - GcHeader::SIZE`
+                    // (see the GuardGcType arm above); the typeid occupies
+                    // the lower `TYPE_ID_BITS` of that header word.
+                    let hdr_addr = builder.ins().iadd_imm(loc_object, -(GcHeader::SIZE as i64));
+                    let hdr_word =
+                        builder
+                            .ins()
+                            .load(cl_types::I64, MemFlags::trusted(), hdr_addr, 0);
+                    let tid_mask = builder.ins().iconst(cl_types::I64, TYPE_ID_MASK as i64);
+                    let loc_typeid = builder.ins().band(hdr_word, tid_mask);
+
+                    // assembler.py:1934-1937 gc_ll_descr lookups.
+                    let (base_type_info, shift_by, _sizeof_ti) =
+                        with_gc_runtime(runtime_id, |gc| gc.get_translated_info_for_typeinfo());
+                    let (infobits_offset, is_object_flag) = with_gc_runtime(runtime_id, |gc| {
+                        gc.get_translated_info_for_guard_is_object()
+                    });
+
+                    // assembler.py:1938-1939 addr_add(imm(base_type_info),
+                    //     loc_typeid, scale=shift_by, offset=infobits_offset)
+                    let shifted_typeid = if shift_by > 0 {
+                        builder.ins().ishl_imm(loc_typeid, shift_by as i64)
+                    } else {
+                        loc_typeid
+                    };
+                    let base_val = builder.ins().iconst(cl_types::I64, base_type_info as i64);
+                    let addr_without_off = builder.ins().iadd(base_val, shifted_typeid);
+                    let loc_infobits = builder
+                        .ins()
+                        .iadd_imm(addr_without_off, infobits_offset as i64);
+
+                    // assembler.py:1940 TEST8 [loc_infobits], IS_OBJECT_FLAG.
+                    let byte =
+                        builder
+                            .ins()
+                            .load(cl_types::I8, MemFlags::trusted(), loc_infobits, 0);
+                    let mask = builder.ins().iconst(cl_types::I8, is_object_flag as i64);
+                    let masked = builder.ins().band(byte, mask);
+                    let zero_i8 = builder.ins().iconst(cl_types::I8, 0);
+                    // assembler.py:1942 guard_success_cc = Conditions['NZ']:
+                    // the guard passes when the AND result is non-zero;
+                    // the fail branch triggers when it is zero.
+                    let fail = builder.ins().icmp(IntCC::Equal, masked, zero_i8);
+
+                    let exit_block = builder.create_block();
+                    builder.set_cold_block(exit_block);
+                    let cont_block = builder.create_block();
+                    if preamble_phase {
+                        builder.set_cold_block(cont_block);
+                    }
+                    builder.ins().brif(fail, exit_block, &[], cont_block, &[]);
+
+                    builder.switch_to_block(exit_block);
+                    builder.seal_block(exit_block);
+                    emit_guard_exit(&mut builder, &constants, outputs_ptr, info);
+
+                    builder.switch_to_block(cont_block);
+                    builder.seal_block(cont_block);
                 }
 
                 OpCode::GuardSubclass => {
-                    // x86/assembler.py:1945-1980 genop_guard_guard_subclass:
-                    //   tmp = subclassrange_min of obj's class (via vtable
-                    //         or via TYPE_INFO table indexed by typeid)
-                    //   check_min = expected_class.subclassrange_min
-                    //   check_max = expected_class.subclassrange_max
-                    //   pass if (tmp - check_min) <u (check_max - check_min)
-                    // The lowering requires cpu.gc_ll_descr to surface the
-                    // subclassrange layout (typeinfo table + field offsets)
-                    // or a vtable layout with `subclassrange_min_offset`.
-                    // pyre's PyType has neither yet, and the tracer never
-                    // emits GUARD_SUBCLASS, so reject at codegen time.
-                    return Err(BackendError::CompilationFailed(
-                        "GUARD_SUBCLASS lowering requires gc_ll_descr \
-                         subclassrange layout (x86/assembler.py:1945-1980); \
-                         not installed for this backend"
-                            .into(),
-                    ));
+                    // x86/assembler.py:1945-1980 genop_guard_guard_subclass.
+                    //     assert self.cpu.supports_guard_gc_type
+                    //     [loc_object, loc_check_against_class, loc_tmp] = locs
+                    //     offset = self.cpu.vtable_offset
+                    //     offset2 = self.cpu.subclassrange_min_offset
+                    //     if offset is not None:
+                    //         self.mc.MOV_rm(loc_tmp, (loc_object, offset))
+                    //         self.mc.MOV_rm(loc_tmp, (loc_tmp, offset2))
+                    //     else:
+                    //         # read the typeid
+                    //         self.mc.MOV32(loc_tmp, mem(loc_object, 0))
+                    //         base_type_info, shift_by, sizeof_ti = (
+                    //             gc_ll_descr.get_translated_info_for_typeinfo())
+                    //         self.mc.MOV(loc_tmp, addr_add(
+                    //             imm(base_type_info), loc_tmp,
+                    //             scale=shift_by,
+                    //             offset=sizeof_ti + offset2))
+                    //     vtable_ptr = loc_check_against_class.getint()
+                    //     vtable_ptr = rffi.cast(rclass.CLASSTYPE, vtable_ptr)
+                    //     check_min = vtable_ptr.subclassrange_min
+                    //     check_max = vtable_ptr.subclassrange_max
+                    //     self.mc.SUB_ri(loc_tmp, check_min)
+                    //     self.mc.CMP_ri(loc_tmp, check_max - check_min)
+                    //     self.guard_success_cc = Conditions['B']
+                    //     self.implement_guard(guard_token)
+                    let info = &guard_infos[guard_idx];
+                    guard_idx += 1;
+
+                    let runtime_id = gc_runtime_id.ok_or_else(|| missing_gc_runtime(op.opcode))?;
+                    // assembler.py:1946 assert self.cpu.supports_guard_gc_type
+                    assert!(
+                        with_gc_runtime(runtime_id, |gc| gc.supports_guard_gc_type()),
+                        "x86/assembler.py:1946: assert self.cpu.\
+                         supports_guard_gc_type (GcAllocator has not \
+                         installed a TYPE_INFO / rclass.CLASSTYPE layout)"
+                    );
+
+                    let loc_object = resolve_opref(&mut builder, &constants, op.args[0]);
+                    // assembler.py:1971 vtable_ptr = loc_check_against_class
+                    //   .getint(): the bounds are resolved at codegen time,
+                    //   so arg1 must be an immediate class pointer.
+                    let loc_check_against_class =
+                        constants.get(&op.args[1].0).copied().unwrap_or_else(|| {
+                            panic!(
+                                "x86/assembler.py:1971 vtable_ptr = \
+                                 loc_check_against_class.getint(): \
+                                 GUARD_SUBCLASS requires arg1 to be an \
+                                 immediate class pointer"
+                            )
+                        });
+
+                    // assembler.py:1950-1951: cpu.vtable_offset /
+                    // cpu.subclassrange_min_offset.
+                    let offset_vtable = vtable_offset;
+                    let offset2 = with_gc_runtime(runtime_id, |gc| gc.subclassrange_min_offset());
+
+                    // loc_tmp: majit uses a cranelift value as the temp;
+                    // x86 allocates a register.
+                    let loc_tmp = if let Some(vtable_off) = offset_vtable {
+                        // assembler.py:1953-1956:
+                        //     self.mc.MOV_rm(loc_tmp, (loc_object, offset))
+                        //     self.mc.MOV_rm(loc_tmp, (loc_tmp, offset2))
+                        let vtable_ptr_val = builder.ins().load(
+                            cl_types::I64,
+                            MemFlags::trusted(),
+                            loc_object,
+                            vtable_off as i32,
+                        );
+                        builder.ins().load(
+                            cl_types::I64,
+                            MemFlags::trusted(),
+                            vtable_ptr_val,
+                            offset2 as i32,
+                        )
+                    } else {
+                        // assembler.py:1957-1969 gcremovetypeptr path.
+                        //     MOV32 loc_tmp, mem(loc_object, 0)
+                        //     base_type_info, shift_by, sizeof_ti = ...
+                        //     MOV loc_tmp, [base_type_info
+                        //         + (loc_tmp << shift_by)
+                        //         + sizeof_ti + offset2]
+                        let hdr_addr = builder.ins().iadd_imm(loc_object, -(GcHeader::SIZE as i64));
+                        let hdr_word =
+                            builder
+                                .ins()
+                                .load(cl_types::I64, MemFlags::trusted(), hdr_addr, 0);
+                        let tid_mask = builder.ins().iconst(cl_types::I64, TYPE_ID_MASK as i64);
+                        let typeid = builder.ins().band(hdr_word, tid_mask);
+                        let (base_type_info, shift_by, sizeof_ti) =
+                            with_gc_runtime(runtime_id, |gc| gc.get_translated_info_for_typeinfo());
+                        let shifted = if shift_by > 0 {
+                            builder.ins().ishl_imm(typeid, shift_by as i64)
+                        } else {
+                            typeid
+                        };
+                        let base_val = builder.ins().iconst(cl_types::I64, base_type_info as i64);
+                        let addr_base = builder.ins().iadd(base_val, shifted);
+                        let addr = builder
+                            .ins()
+                            .iadd_imm(addr_base, (sizeof_ti + offset2) as i64);
+                        builder
+                            .ins()
+                            .load(cl_types::I64, MemFlags::trusted(), addr, 0)
+                    };
+
+                    // assembler.py:1971-1974 read the bounds from the
+                    // expected class pointer at codegen time.
+                    let (check_min, check_max) = with_gc_runtime(runtime_id, |gc| {
+                        gc.subclass_range(loc_check_against_class as usize)
+                    })
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "x86/assembler.py:1973-1974 vtable_ptr.\
+                             subclassrange_min/max: GcAllocator has no \
+                             rclass.CLASSTYPE entry for classptr {:#x}",
+                            loc_check_against_class
+                        )
+                    });
+
+                    // assembler.py:1976-1978 unsigned comparison:
+                    //     (loc_tmp - check_min) <u (check_max - check_min)
+                    let sub = builder.ins().iadd_imm(loc_tmp, -check_min);
+                    let limit = builder.ins().iconst(cl_types::I64, check_max - check_min);
+                    // assembler.py:1979 guard_success_cc = Conditions['B']:
+                    // the guard passes when sub <u limit; the fail branch
+                    // triggers when sub >=u limit.
+                    let fail = builder
+                        .ins()
+                        .icmp(IntCC::UnsignedGreaterThanOrEqual, sub, limit);
+
+                    let exit_block = builder.create_block();
+                    builder.set_cold_block(exit_block);
+                    let cont_block = builder.create_block();
+                    if preamble_phase {
+                        builder.set_cold_block(cont_block);
+                    }
+                    builder.ins().brif(fail, exit_block, &[], cont_block, &[]);
+
+                    builder.switch_to_block(exit_block);
+                    builder.seal_block(exit_block);
+                    emit_guard_exit(&mut builder, &constants, outputs_ptr, info);
+
+                    builder.switch_to_block(cont_block);
+                    builder.seal_block(cont_block);
                 }
 
                 // ── Exception operations ──

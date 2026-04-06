@@ -226,6 +226,89 @@ pub trait GcAllocator: Send {
     /// how RPython's translator emits the vtable→typeid pair into the
     /// GC type_info_group.
     fn register_vtable_for_type(&mut self, _vtable: usize, _type_id: u32) {}
+
+    /// llsupport/gc.py:162 / gc.py:318 `supports_guard_gc_type` flag.
+    /// `GcLLDescr_boehm` sets it to `False`; `GcLLDescr_framework` sets
+    /// it to `True`. Relayed to `cpu.supports_guard_gc_type` via
+    /// `llmodel.py:63`. Gates the backend's `genop_guard_guard_gc_type`,
+    /// `genop_guard_guard_is_object`, and `genop_guard_guard_subclass`
+    /// (x86/assembler.py:1896, 1925, 1946 `assert`). The default
+    /// `false` matches `AbstractCPU.supports_guard_gc_type` in
+    /// `rpython/jit/backend/model.py:21` and keeps backends without an
+    /// installed TYPE_INFO table from emitting the guards.
+    fn supports_guard_gc_type(&self) -> bool {
+        false
+    }
+
+    /// llsupport/gc.py:592 `get_translated_info_for_typeinfo`.
+    /// Returns `(type_info_group_base, shift_by, sizeof_ti)`:
+    ///  * `type_info_group_base` — base address of the `TYPE_INFO` table
+    ///    (`llop.gc_get_type_info_group`).
+    ///  * `shift_by` — `2` on 32-bit, `0` on 64-bit (gc.py:596-599).
+    ///  * `sizeof_ti` — `rffi.sizeof(GCData.TYPE_INFO)`.
+    /// Called by `genop_guard_guard_is_object` (x86/assembler.py:1934)
+    /// and `genop_guard_guard_subclass` (x86/assembler.py:1965).
+    ///
+    /// Default panics to match RPython: `GcLLDescr_boehm` does not
+    /// define the method, and calling it when
+    /// `supports_guard_gc_type = False` is a precondition violation.
+    fn get_translated_info_for_typeinfo(&self) -> (usize, u8, usize) {
+        panic!(
+            "GcAllocator::get_translated_info_for_typeinfo called but the \
+             GC has not installed a TYPE_INFO layout (see llsupport/gc.py:\
+             592); callers must first check supports_guard_gc_type"
+        )
+    }
+
+    /// llsupport/gc.py:619 `get_translated_info_for_guard_is_object`.
+    /// Returns `(infobits_offset, T_IS_RPYTHON_INSTANCE_BYTE)` used by
+    /// `genop_guard_guard_is_object` to locate the `infobits` byte in
+    /// the `TYPE_INFO` entry and the bitmask for the
+    /// `T_IS_RPYTHON_INSTANCE` flag.
+    ///
+    /// Default panics — same rationale as
+    /// `get_translated_info_for_typeinfo`.
+    fn get_translated_info_for_guard_is_object(&self) -> (usize, u8) {
+        panic!(
+            "GcAllocator::get_translated_info_for_guard_is_object called \
+             but the GC has not installed a TYPE_INFO layout (see \
+             llsupport/gc.py:619); callers must first check \
+             supports_guard_gc_type"
+        )
+    }
+
+    /// x86/assembler.py:1951 `cpu.subclassrange_min_offset`.
+    /// Byte offset of the `subclassrange_min` field inside
+    /// `rclass.CLASSTYPE`. `genop_guard_guard_subclass` uses it twice:
+    /// once to read the subclassrange minimum from the object's
+    /// vtable (x86/assembler.py:1956) and once to locate the same
+    /// field inside a `TYPE_INFO` entry (x86/assembler.py:1968-1969).
+    ///
+    /// Default panics — same rationale as the other TYPE_INFO helpers.
+    fn subclassrange_min_offset(&self) -> usize {
+        panic!(
+            "GcAllocator::subclassrange_min_offset called but the GC has \
+             not installed an rclass.CLASSTYPE layout (see x86/\
+             assembler.py:1951); callers must first check \
+             supports_guard_gc_type"
+        )
+    }
+
+    /// x86/assembler.py:1971-1974 bounds lookup at codegen time:
+    ///     vtable_ptr = loc_check_against_class.getint()
+    ///     vtable_ptr = rffi.cast(rclass.CLASSTYPE, vtable_ptr)
+    ///     check_min = vtable_ptr.subclassrange_min
+    ///     check_max = vtable_ptr.subclassrange_max
+    /// Returns `(subclassrange_min, subclassrange_max)` for the class
+    /// whose pointer is given, or `None` if no entry exists.
+    ///
+    /// Default `None` keeps backends without an installed
+    /// `rclass.CLASSTYPE` layout from emitting a wrong bounds check;
+    /// `genop_guard_guard_subclass` callers panic loudly when the
+    /// lookup misses.
+    fn subclass_range(&self, _classptr: usize) -> Option<(i64, i64)> {
+        None
+    }
 }
 
 /// GC rewriter — transforms IR operations for GC integration.
