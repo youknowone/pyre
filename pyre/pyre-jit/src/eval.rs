@@ -2963,12 +2963,6 @@ fn build_resumed_frames(
 
     let mut result = Vec::with_capacity(frames.len());
     for (idx, (frame, values)) in frames.iter().zip(all_values.into_iter()).enumerate() {
-        // frame_ptr from vable for single-frame or outermost (caller).
-        let frame_ptr = if frames.len() == 1 || idx == frames.len() - 1 {
-            vable_frame_ptr
-        } else {
-            std::ptr::null_mut()
-        };
         // resume.py:1338 read_jitcode_pos_pc parity:
         // py_pc comes from rd_numb frame header (frame.pc = orgpc).
         // pc=0 is valid (function start). pc=-1 = no-snapshot sentinel.
@@ -2979,20 +2973,30 @@ fn build_resumed_frames(
             _vable_ni
         };
         // resume.py:1339 jitcodes[jitcode_pos]:
-        // Outermost frame: code from frame_ptr. Inner frames: code from
-        // jitcode_index registry (no live PyFrame for inlined calls).
+        // Outermost frame (last): code from PyFrame (the live caller).
+        // Inner frames: code from jitcode_index registry (inlined calls).
+        let is_outermost = frames.len() == 1 || idx == frames.len() - 1;
+        let code = if is_outermost && !vable_frame_ptr.is_null() {
+            unsafe { (*vable_frame_ptr).code }
+        } else {
+            pyre_jit_trace::state::code_for_jitcode_index(frame.jitcode_index)
+                .unwrap_or(std::ptr::null())
+        };
+        // resume.py:1095/1067 parity: virtualizable_ptr is the JIT driver's
+        // PyFrame, shared across the entire blackhole chain. RPython's
+        // newframe(jitcode) creates a fresh MIFrame for each inner section
+        // (inlined call) but the virtualizable on the JIT driver is the same.
+        // pyre's BlackholeInterpreter holds its own register state per
+        // section, so inner frames don't need a PyFrame — they only need
+        // virtualizable_ptr to write back to the outermost frame at the
+        // merge point. Use vable_frame_ptr for ALL sections.
+        let frame_ptr = vable_frame_ptr;
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
                 "[dynasm-debug] frame_ptr={:?} py_pc={} idx={}",
                 frame_ptr, py_pc, idx
             );
         }
-        let code = if !frame_ptr.is_null() {
-            unsafe { (*frame_ptr).code }
-        } else {
-            pyre_jit_trace::state::code_for_jitcode_index(frame.jitcode_index)
-                .unwrap_or(std::ptr::null())
-        };
         // Per-frame VSD: outermost uses vable_vsd, inner frames derive
         // from their code's nlocals + snapshot stack depth.
         let vsd = if frames.len() == 1 || idx == frames.len() - 1 {

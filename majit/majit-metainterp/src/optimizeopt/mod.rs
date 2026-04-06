@@ -379,7 +379,7 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
         }
         // RPython ConstPtr parity: check numbering type overrides first.
         let type_override = self.ctx.constant_types_for_numbering.get(&opref.0).copied();
-        let result = match self.ctx.get_constant(opref) {
+        match self.ctx.get_constant(opref) {
             Some(Value::Int(v)) => (*v, type_override.unwrap_or(majit_ir::Type::Int)),
             Some(Value::Float(f)) => (f.to_bits() as i64, majit_ir::Type::Float),
             Some(Value::Ref(r)) => (r.0 as i64, majit_ir::Type::Ref),
@@ -393,8 +393,7 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
                     (0, majit_ir::Type::Int)
                 }
             }
-        };
-        result
+        }
     }
 
     fn get_type(&self, opref: OpRef) -> majit_ir::Type {
