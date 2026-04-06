@@ -3691,15 +3691,30 @@ impl MIFrame {
             let stop = trace_gc_object_int_field(ctx, iter, range_iter_stop_descr());
             let step = trace_gc_object_int_field(ctx, iter, range_iter_step_descr());
             let zero = ctx.const_int(0);
+            // pyjitpl.py:1877 opimpl_goto_if_not: boolean guards use
+            // GuardTrue/GuardFalse, NOT GuardValue. GuardValue's replace_box
+            // propagates a constant substitution that unroll's body-peeling
+            // then drops because the peeled body recomputes the value from
+            // fresh field reads. GuardTrue only records the truth assertion
+            // without constant substitution, so the body's corresponding
+            // guard is preserved after unrolling.
             let step_positive = ctx.record_op(OpCode::IntGt, &[step, zero]);
-            this.guard_value(ctx, step_positive, concrete_step_positive as i64);
+            if concrete_step_positive {
+                this.record_guard(ctx, OpCode::GuardTrue, &[step_positive]);
+            } else {
+                this.record_guard(ctx, OpCode::GuardFalse, &[step_positive]);
+            }
 
             let continues = if concrete_step_positive {
                 ctx.record_op(OpCode::IntLt, &[current, stop])
             } else {
                 ctx.record_op(OpCode::IntGt, &[current, stop])
             };
-            this.guard_value(ctx, continues, concrete_continues as i64);
+            if concrete_continues {
+                this.record_guard(ctx, OpCode::GuardTrue, &[continues]);
+            } else {
+                this.record_guard(ctx, OpCode::GuardFalse, &[continues]);
+            }
 
             if !concrete_continues {
                 this.remember_value_type(zero, Type::Int);
