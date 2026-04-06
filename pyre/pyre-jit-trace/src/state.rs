@@ -367,6 +367,12 @@ pub use crate::liveness::{LiveVars, expand_compact_to_dense, liveness_for};
 pub struct PyreJitState {
     #[vable(frame)]
     pub frame: usize,
+    /// blackhole.py:337 parity: liveness PC from rd_numb (setposition PC).
+    /// When set, `restore_guard_failure_values` uses this instead of
+    /// next_instr for liveness lookup — matching RPython's pattern where
+    /// `blackholeinterp.setposition(jitcode, pc)` is called before
+    /// `consume_one_section`.
+    pub resume_pc: Option<usize>,
 }
 
 /// Meta information for a trace — describes the shape of the code being traced.
@@ -1064,7 +1070,7 @@ pub(crate) fn concrete_return_value(frame: usize) -> Option<PyObjectRef> {
 }
 
 /// Read a value from the unified `locals_cells_stack_w` at the given absolute index.
-pub(crate) fn concrete_stack_value(frame: usize, abs_idx: usize) -> Option<PyObjectRef> {
+pub fn concrete_stack_value(frame: usize, abs_idx: usize) -> Option<PyObjectRef> {
     let frame_ptr = (frame != 0).then_some(frame as *const u8)?;
     let arr =
         unsafe { &*(frame_ptr.add(PYFRAME_LOCALS_CELLS_STACK_OFFSET) as *const PyObjectArray) };
@@ -2344,8 +2350,10 @@ impl JitState for PyreJitState {
             None
         };
         // resume.py:1383: info = blackholeinterp.get_current_position_info()
-        // Use next_instr (already set from values[1]) as the liveness PC.
-        let live_pc = self.next_instr();
+        // blackhole.py:337: position was set by setposition(jitcode, pc) where
+        // pc comes from rd_numb — the same orgpc used by get_list_of_active_boxes.
+        // next_instr = orgpc + 1 + caches, which may have different liveness.
+        let live_pc = self.resume_pc.take().unwrap_or_else(|| self.next_instr());
         let mut idx = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
         for local_idx in 0..nlocals {
             // resume.py:1077: only live registers consume a value from the
@@ -2418,8 +2426,9 @@ impl JitState for PyreJitState {
         exception: &majit_metainterp::blackhole::ExceptionState,
     ) -> bool {
         // resume.py:1077 consume_boxes parity: write values to the frame.
-        // Delegates to restore_guard_failure_values which handles the
-        // [frame, ni, vsd, locals..., stack...] layout.
+        // blackhole.py:337: setposition(jitcode, pc) before consume_one_section —
+        // frame_pc from rd_numb is the liveness PC (orgpc).
+        self.resume_pc = Some(_frame_pc as usize);
         self.restore_guard_failure_values(meta, values, exception)
     }
 
@@ -2749,7 +2758,10 @@ mod tests {
     }
 
     fn empty_state() -> PyreJitState {
-        PyreJitState { frame: 0 }
+        PyreJitState {
+            frame: 0,
+            resume_pc: None,
+        }
     }
 
     #[test]
@@ -3045,7 +3057,10 @@ mod tests {
         frame.fix_array_ptrs();
         let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
 
-        let mut state = PyreJitState { frame: frame_ptr };
+        let mut state = PyreJitState {
+            frame: frame_ptr,
+            resume_pc: None,
+        };
         state.set_next_instr(0);
         state.set_valuestackdepth(4);
         let meta = PyreMeta {

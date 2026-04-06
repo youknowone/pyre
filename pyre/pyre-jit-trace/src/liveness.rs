@@ -114,17 +114,19 @@ impl LiveVars {
                             live[word] |= 1u64 << (i % 64);
                         }
                     }
-                    // LoadFastBorrowLoadFastBorrow reads two locals.
-                    // GEN for both is correct per RPython liveness semantics.
-                    // Currently disabled: enabling changes snapshot composition
-                    // and exposes a guard failure recovery bug where the
-                    // blackhole/bridge restore path misaligns values.
-                    // Root cause: get_list_of_active_boxes uses orgpc as
-                    // liveness PC, but some recovery paths use next_instr
-                    // (orgpc + 1 + caches). The disagreement causes compact
-                    // array misalignment when liveness differs between PCs.
-                    // TODO: fix recovery to use frame.pc from rd_numb
-                    // consistently, then re-enable.
+                    // LoadFastBorrowLoadFastBorrow reads two locals — GEN both.
+                    // Correct per RPython liveness semantics, but currently
+                    // disabled: enabling exposes a pre-existing blackhole bug
+                    // where dead locals get stale CONST values from trace
+                    // recording time. Without GEN, the blackhole naturally
+                    // fails (too few values) and the loop is invalidated —
+                    // interpreter takes over. With GEN, the blackhole succeeds
+                    // but computes wrong results from stale dead-local values.
+                    // Verified correct via FORCE_BH_FAIL: GEN=ON + forced
+                    // blackhole failure produces correct output.
+                    // TODO: implement consume_vable_info (resume.py:1399) to
+                    // provide runtime-resolved values for dead locals, then
+                    // re-enable.
                     // Instruction::LoadFastBorrowLoadFastBorrow { var_nums } => {
                     //     let pair = var_nums.get(op_arg);
                     //     for i in [u32::from(pair.idx_1()) as usize,
