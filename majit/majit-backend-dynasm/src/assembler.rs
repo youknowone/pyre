@@ -1129,34 +1129,81 @@ impl Assembler386 {
     ///   if offset is not None:
     ///       self.mc.CMP(mem(loc_ptr, offset), loc_classptr)
     ///   else:
-    ///       expected_typeid = gc_ll_descr.get_typeid_from_classptr_if_gcremovetypeptr(...)
+    ///       assert isinstance(loc_classptr, ImmedLoc)
+    ///       classptr = loc_classptr.value
+    ///       expected_typeid = gc_ll_descr.
+    ///           get_typeid_from_classptr_if_gcremovetypeptr(classptr)
     ///       self._cmp_guard_gc_type(loc_ptr, ImmedLoc(expected_typeid))
     ///
     /// Inputs are pre-loaded: rax = loc_ptr (object), rcx = loc_classptr.
     /// Sets ZF=1 on equal, ZF=0 on not-equal — caller branches via Jcc.
-    fn emit_cmp_guard_class_rax_rcx(&mut self) {
-        let off_usize = self.vtable_offset.expect(
-            "GuardClass requires vtable_offset; gcremovetypeptr \
-             (cmp_guard_gc_type) not yet implemented for dynasm",
-        );
-        #[cfg(target_arch = "x86_64")]
-        {
-            let off_i32 = off_usize as i32;
-            dynasm!(self.mc
-                ; .arch x64
-                ; mov rax, [rax + off_i32]
-                ; cmp rax, rcx
+    /// `expected_classptr_imm` is the immediate value of loc_classptr, used
+    /// only by the gcremovetypeptr branch (RPython requires this to be an
+    /// `ImmedLoc`).
+    fn emit_cmp_guard_class_rax_rcx(&mut self, expected_classptr_imm: Option<i64>) {
+        if let Some(off_usize) = self.vtable_offset {
+            // x86/assembler.py:1884-1885 vtable_offset path: full classptr CMP.
+            #[cfg(target_arch = "x86_64")]
+            {
+                let off_i32 = off_usize as i32;
+                dynasm!(self.mc
+                    ; .arch x64
+                    ; mov rax, [rax + off_i32]
+                    ; cmp rax, rcx
+                );
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                let off_u32 = off_usize as u32;
+                dynasm!(self.mc
+                    ; .arch aarch64
+                    ; ldr x0, [x0, #off_u32]
+                    ; cmp x0, x1
+                );
+            }
+        } else {
+            // x86/assembler.py:1886-1891 gcremovetypeptr fallback +
+            // x86/assembler.py:1893-1901 _cmp_guard_gc_type:
+            //   on x86_64 the typeid is a 32-bit half-word at offset 0.
+            let classptr = expected_classptr_imm.expect(
+                "_cmp_guard_class: gcremovetypeptr requires loc_classptr \
+                 to be an immediate (assert isinstance(loc_classptr, \
+                 ImmedLoc) in x86/assembler.py:1887)",
             );
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            let off_u32 = off_usize as u32;
-            dynasm!(self.mc
-                ; .arch aarch64
-                ; ldr x0, [x0, #off_u32]
-                ; cmp x0, x1
+            let expected_typeid = Self::lookup_typeid_from_classptr(classptr as usize).expect(
+                "GuardClass: vtable_offset is None but the dynasm \
+                     backend has no gc_ll_descr.get_typeid_from_classptr_if_\
+                     gcremovetypeptr",
             );
+            #[cfg(target_arch = "x86_64")]
+            {
+                let typeid_i32 = expected_typeid as i32;
+                dynasm!(self.mc
+                    ; .arch x64
+                    ; cmp DWORD [rax], typeid_i32
+                );
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                let typeid_w = expected_typeid as i32;
+                dynasm!(self.mc
+                    ; .arch aarch64
+                    ; ldr w0, [x0]
+                    ; movz w1, #(typeid_w as u32 & 0xffff)
+                    ; movk w1, #((typeid_w as u32 >> 16) & 0xffff), lsl #16
+                    ; cmp w0, w1
+                );
+            }
         }
+    }
+
+    /// llsupport/gc.py:563 GcLLDescr_framework
+    ///   .get_typeid_from_classptr_if_gcremovetypeptr(classptr)
+    /// Default `None` — pyre uses vtable_offset and never reaches the
+    /// gcremovetypeptr branch. A future GC layer that disables typeptr
+    /// can install a real resolver here.
+    fn lookup_typeid_from_classptr(_classptr: usize) -> Option<u32> {
+        None
     }
 
     fn emit_guard_jcc(&mut self, fail_cc: u8) -> DynamicLabel {
@@ -1301,9 +1348,14 @@ impl Assembler386 {
                     ; cmp x0, 0
                 );
                 let fail_label = self.emit_guard_jcc(CC_E);
+                // x86/assembler.py:1887 assert isinstance(loc_classptr, ImmedLoc)
+                let expected_classptr_imm = match self.resolve_opref(op.arg(1)) {
+                    ResolvedArg::Const(v) => Some(v),
+                    _ => None,
+                };
                 self.load_arg_to_rax(op.arg(0));
                 self.load_arg_to_rcx(op.arg(1));
-                self.emit_cmp_guard_class_rax_rcx();
+                self.emit_cmp_guard_class_rax_rcx(expected_classptr_imm);
                 #[cfg(target_arch = "x86_64")]
                 dynasm!(self.mc ; .arch x64 ; jne =>fail_label);
                 #[cfg(target_arch = "aarch64")]
@@ -1316,9 +1368,13 @@ impl Assembler386 {
                 //   if offset is not None:
                 //       CMP(mem(loc_ptr, offset), loc_classptr)
                 //   else: _cmp_guard_gc_type(...)
+                let expected_classptr_imm = match self.resolve_opref(op.arg(1)) {
+                    ResolvedArg::Const(v) => Some(v),
+                    _ => None,
+                };
                 self.load_arg_to_rax(op.arg(0));
                 self.load_arg_to_rcx(op.arg(1));
-                self.emit_cmp_guard_class_rax_rcx();
+                self.emit_cmp_guard_class_rax_rcx(expected_classptr_imm);
                 self.emit_guard_jcc(CC_NE)
             }
             OpCode::GuardNoException

@@ -1146,6 +1146,18 @@ pub trait Backend: Send {
     fn bh_new_with_vtable(&self, _sizedescr: &dyn majit_ir::SizeDescr) -> i64 {
         0
     }
+
+    /// llsupport/gc.py:563 GcLLDescr_framework
+    ///   .get_typeid_from_classptr_if_gcremovetypeptr(classptr)
+    /// Backend-side helper consulted only when `vtable_offset is None`
+    /// (i.e. translation with --gcremovetypeptr). Returns the typeid that
+    /// `_cmp_guard_gc_type` should compare against.
+    ///
+    /// Default `None` indicates the GC layer does not implement the
+    /// gcremovetypeptr lowering, matching pyre's configuration.
+    fn get_typeid_from_classptr_if_gcremovetypeptr(&self, _classptr: usize) -> Option<u32> {
+        None
+    }
     /// model.py: bh_new_array(length, descr)
     fn bh_new_array(&self, _length: i64, _item_size: usize, _type_id: u32) -> i64 {
         0

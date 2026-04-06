@@ -3796,12 +3796,20 @@ fn emit_indirect_call_from_parts(
 ///       self._cmp_guard_gc_type(loc_ptr, ImmedLoc(expected_typeid))
 ///
 /// Returns a 1-bit boolean: 1 = guard fails (not-equal), 0 = guard passes.
+///
+/// `expected_classptr_imm` is the immediate value of the classptr argument
+/// (RPython requires this to be an `ImmedLoc` in the gcremovetypeptr branch).
+/// `gc_remove_typeptr_lookup` is the gc_ll_descr-equivalent typeid resolver;
+/// when `vtable_offset is None` it must be set or the guard cannot be
+/// emitted.
 fn emit_cmp_guard_class(
     builder: &mut FunctionBuilder,
     ptr_type: cranelift_codegen::ir::Type,
     obj: CValue,
     expected_class: CValue,
+    expected_classptr_imm: Option<i64>,
     vtable_offset: Option<usize>,
+    gc_remove_typeptr_lookup: Option<&dyn Fn(usize) -> Option<u32>>,
 ) -> CValue {
     if let Some(off) = vtable_offset {
         // x86/assembler.py:1884-1885 vtable_offset path: full classptr CMP.
@@ -3813,23 +3821,40 @@ fn emit_cmp_guard_class(
             .icmp(IntCC::NotEqual, actual_class, expected_class)
     } else {
         // x86/assembler.py:1886-1891 gcremovetypeptr fallback:
-        //   classptr → expected_typeid via gc_ll_descr →
-        //   _cmp_guard_gc_type compares 16/32-bit typeid at offset 0.
-        // pyre never reaches this branch (vtable_offset is always Some).
-        // The structural code below mirrors _cmp_guard_gc_type so a future
-        // backend with gcremovetypeptr can replace the helper without
-        // touching the codegen call sites.
+        //   assert isinstance(loc_classptr, ImmedLoc)
+        //   classptr = loc_classptr.value
+        //   expected_typeid = gc_ll_descr.
+        //       get_typeid_from_classptr_if_gcremovetypeptr(classptr)
+        //   _cmp_guard_gc_type(loc_ptr, ImmedLoc(expected_typeid))
+        let classptr = expected_classptr_imm.unwrap_or_else(|| {
+            panic!(
+                "_cmp_guard_class: gcremovetypeptr requires loc_classptr to \
+                 be an immediate (assert isinstance(loc_classptr, ImmedLoc) \
+                 in x86/assembler.py:1887)"
+            )
+        });
+        let lookup = gc_remove_typeptr_lookup.unwrap_or_else(|| {
+            panic!(
+                "_cmp_guard_class: vtable_offset is None but the backend \
+                 has no gc_ll_descr.get_typeid_from_classptr_if_gcremovetypeptr"
+            )
+        });
+        let expected_typeid = lookup(classptr as usize).unwrap_or_else(|| {
+            panic!(
+                "get_typeid_from_classptr_if_gcremovetypeptr({:#x}) returned \
+                 None — classptr is not a registered vtable",
+                classptr
+            )
+        });
+        // _cmp_guard_gc_type (x86/assembler.py:1893-1901): on x86_64 the
+        // typeid is a 32-bit half-word at offset 0 of the object.
         let actual_typeid = builder
             .ins()
             .load(cl_types::I32, MemFlags::trusted(), obj, 0);
-        // RPython looks up expected_typeid via cpu.gc_ll_descr; pyre has
-        // no equivalent yet, so we treat the low 32 bits of expected_class
-        // as the typeid placeholder. This keeps the structural shape but
-        // is intentionally not wired to a real type-id table.
-        let expected_typeid = builder.ins().ireduce(cl_types::I32, expected_class);
+        let expected_typeid_val = builder.ins().iconst(cl_types::I32, expected_typeid as i64);
         builder
             .ins()
-            .icmp(IntCC::NotEqual, actual_typeid, expected_typeid)
+            .icmp(IntCC::NotEqual, actual_typeid, expected_typeid_val)
     }
 }
 
@@ -4530,6 +4555,15 @@ impl CraneliftBackend {
         self.vtable_offset = offset;
     }
 
+    /// llsupport/gc.py:563 GcLLDescr_framework
+    ///   .get_typeid_from_classptr_if_gcremovetypeptr(classptr)
+    /// Default: None (no gc_ll_descr installed). Future GC layers can
+    /// register a translator-side resolver that maps a vtable pointer
+    /// to its typeid for the gcremovetypeptr branch of `_cmp_guard_class`.
+    fn lookup_typeid_from_classptr(_classptr: usize) -> Option<u32> {
+        None
+    }
+
     pub fn with_gc_allocator(gc: Box<dyn GcAllocator>) -> Self {
         let mut backend = Self::new();
         backend.set_gc_allocator(gc);
@@ -4906,6 +4940,14 @@ impl CraneliftBackend {
         // llmodel.py:64-69 self.vtable_offset — backend property used by
         // bh_new_with_vtable. Capture for use in NEW_WITH_VTABLE codegen.
         let vtable_offset = self.vtable_offset;
+        // llsupport/gc.py:563 GcLLDescr_framework
+        //   .get_typeid_from_classptr_if_gcremovetypeptr — used by
+        // _cmp_guard_class when vtable_offset is None. Bind the closure
+        // here so emit_cmp_guard_class can resolve typeids without owning
+        // a reference to `self` (avoids borrow conflicts with func_ctx).
+        let gc_typeid_lookup = |classptr: usize| -> Option<u32> {
+            CraneliftBackend::lookup_typeid_from_classptr(classptr)
+        };
         let mut defined_ref_vars: HashSet<u32> = inputargs
             .iter()
             .filter(|input| input.tp == Type::Ref && !force_tokens.contains(&input.index))
@@ -5612,6 +5654,9 @@ impl CraneliftBackend {
                     guard_idx += 1;
 
                     let (obj, expected_class) = resolve_binop(&mut builder, &constants, op);
+                    // x86/assembler.py:1887 assert isinstance(loc_classptr, ImmedLoc)
+                    // — pre-fetch the classptr immediate from the constant pool.
+                    let expected_classptr_imm = constants.get(&op.arg(1).0).copied();
                     let exit_block = builder.create_block();
                     builder.set_cold_block(exit_block);
                     let cont_block = builder.create_block();
@@ -5624,7 +5669,9 @@ impl CraneliftBackend {
                         ptr_type,
                         obj,
                         expected_class,
+                        expected_classptr_imm,
                         vtable_offset,
+                        Some(&gc_typeid_lookup),
                     );
                     builder.ins().brif(neq, exit_block, &[], cont_block, &[]);
 
@@ -5641,6 +5688,7 @@ impl CraneliftBackend {
                     guard_idx += 1;
 
                     let (obj, expected_class) = resolve_binop(&mut builder, &constants, op);
+                    let expected_classptr_imm = constants.get(&op.arg(1).0).copied();
                     let zero = builder.ins().iconst(ptr_type, 0);
                     let exit_block = builder.create_block();
                     builder.set_cold_block(exit_block);
@@ -5663,7 +5711,9 @@ impl CraneliftBackend {
                         ptr_type,
                         obj,
                         expected_class,
+                        expected_classptr_imm,
                         vtable_offset,
+                        Some(&gc_typeid_lookup),
                     );
                     builder.ins().brif(neq, exit_block, &[], cont_block, &[]);
 
