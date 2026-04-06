@@ -9941,7 +9941,9 @@ impl majit_backend::Backend for CraneliftBackend {
     }
 
     fn get_savedata_ref(&self, frame: &DeadFrame) -> Option<GcRef> {
-        get_savedata_ref_from_deadframe(frame).ok()
+        get_savedata_ref_from_deadframe(frame)
+            .ok()
+            .filter(|r| !r.is_null())
     }
 
     fn grab_exc_value(&self, frame: &DeadFrame) -> GcRef {
