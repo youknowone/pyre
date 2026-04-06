@@ -2955,29 +2955,21 @@ fn build_resumed_frames(
         let vinfo = unsafe { &*crate::eval::get_virtualizable_info() };
         let frame_ptr = vable_frame_ptr as *mut u8;
 
-        // virtualizable.py:130-133: write static fields.
-        // field 0 = next_instr, field 2 = valuestackdepth.
-        // Skip code(1) and namespace(3) — immutable.
-        // RPython writes ALL static fields, resets token, and writes ALL
-        // array items here. In pyre, these writes conflict with the
-        // blackhole exit path (which re-syncs the frame independently).
-        // Each write individually causes a specific test failure:
-        //   write_field(0, ni) → fib_loop error (wrong resume PC)
-        //   write_field(2, vsd) → nbody crash (stack mismatch)
-        //   reset_vable_token → fannkuch timeout (re-entry issue)
-        //   write_array_item → nbody/spectral_norm crash (null overwrite)
-        // Blocked on: reconciling blackhole exit path with consume_vable_info.
-        // For now, the vable section is decoded but not written to frame.
-        let _ = (
-            vinfo,
-            frame_ptr,
-            &vable_values,
-            &dead_frame_typed,
-            exit_layout,
-            &mut virtuals_cache,
-            _vable_ni,
-            vable_vsd,
-        );
+        // virtualizable.py:130-133: skip ni/vsd/token writes.
+        // pyre's ContinueRunningNormally (call_jit.rs:1068-1097) writes
+        // the correct final ni/vsd to the frame. Writing snapshot values
+        // here would conflict with the blackhole exit path.
+
+        // virtualizable.py:134-137: write array elements.
+        // Disabled: writing ANY values to the frame conflicts with the
+        // blackhole exit path. After blackhole fails → loop invalidated →
+        // interpreter continues from pre-JIT frame state, but locals were
+        // already overwritten by consume_vable_info → inconsistent state.
+        // Full consume_vable_info requires writing ni+vsd+locals+token
+        // atomically AND having the blackhole handle them correctly.
+        // Blocked on: ContinueRunningNormally must NOT overwrite dead
+        // locals that consume_vable_info set (RPython uses exception-based
+        // handoff that doesn't have this problem).
     }
 
     let mut result = Vec::with_capacity(frames.len());
