@@ -8,7 +8,10 @@ use crate::state::PyreJitState;
 
 /// RPython green_key = (pycode, next_instr).
 /// Each (code, pc) pair has independent warmup counter and compiled loop.
-#[inline(always)]
+///
+/// rlib/jit.py:180 — @elidable_promote: promotes both arguments, then
+/// constant-folds the hash. The JIT specializes on (code, pc) pairs.
+#[majit_macros::elidable_promote]
 pub fn make_green_key(code_ptr: *const pyre_interpreter::CodeObject, pc: usize) -> u64 {
     (code_ptr as u64).wrapping_mul(1000003) ^ (pc as u64)
 }

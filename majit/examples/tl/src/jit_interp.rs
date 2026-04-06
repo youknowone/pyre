@@ -43,36 +43,43 @@ extern "C" fn storage_roll(stack_ptr: usize, stackpos: i64, r: i64) {
     }
 }
 
-/// Pure comparison — @elidable.
-/// The JIT can constant-fold this when both arguments are known.
-#[majit_macros::elidable]
+/// Pure comparison — @elidable_promote.
+/// rlib/jit.py:180 — promotes both arguments, then calls the elidable body.
+#[majit_macros::elidable_promote]
 fn tl_eq(b: i64, a: i64) -> i64 {
     if b == a { 1 } else { 0 }
 }
 
-#[majit_macros::elidable]
+#[majit_macros::elidable_promote]
 fn tl_ne(b: i64, a: i64) -> i64 {
     if b != a { 1 } else { 0 }
 }
 
-#[majit_macros::elidable]
+#[majit_macros::elidable_promote]
 fn tl_lt(b: i64, a: i64) -> i64 {
     if b < a { 1 } else { 0 }
 }
 
-#[majit_macros::elidable]
+#[majit_macros::elidable_promote]
 fn tl_le(b: i64, a: i64) -> i64 {
     if b <= a { 1 } else { 0 }
 }
 
-#[majit_macros::elidable]
+#[majit_macros::elidable_promote]
 fn tl_gt(b: i64, a: i64) -> i64 {
     if b > a { 1 } else { 0 }
 }
 
-#[majit_macros::elidable]
+#[majit_macros::elidable_promote]
 fn tl_ge(b: i64, a: i64) -> i64 {
     if b >= a { 1 } else { 0 }
+}
+
+/// Debug tracing — @not_in_trace.
+/// rlib/jit.py:260 — disappears from compiled traces.
+#[majit_macros::not_in_trace]
+fn tl_debug_opcode(_pc: usize, _opcode: usize) {
+    // Interpreter-only logging; the JIT elides this call.
 }
 
 // ── Storage pool types ──
@@ -296,12 +303,14 @@ pub fn mainloop(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 {
 
         let opcode = program[pc];
         pc += 1;
+        tl_debug_opcode(pc - 1, opcode as usize);
 
         match opcode {
             NOP => {}
             // tl.py:94-96
             PUSH => {
                 let value = program[pc] as i8 as i64;
+                let value = promote(value); // bytecode operand is trace-constant
                 pc += 1;
                 state.pool.get_mut(state.selected).push(value);
             }
@@ -391,6 +400,8 @@ pub fn mainloop(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 {
                 pc += 1;
                 let cond = state.pool.get_mut(state.selected).pop();
                 let jump = cond != 0;
+                // rlib/jit.py:1301 — conditional_call: bridge-free fallthrough
+                conditional_call!(!jump, tl_debug_opcode, pc, b'_' as usize);
                 if jump {
                     if target <= pc {
                         can_enter_jit!(driver, target, &mut state, program, || {});
