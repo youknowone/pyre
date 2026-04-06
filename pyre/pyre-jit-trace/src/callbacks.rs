@@ -4,6 +4,7 @@
 //! Instead, pyre-jit registers function pointers at init time, and
 //! pyre-jit-trace calls them through this table.
 
+use pyre_interpreter::CodeObject;
 use pyre_object::PyObjectRef;
 use std::cell::Cell;
 
@@ -27,6 +28,11 @@ pub struct CallJitCallbacks {
     pub jit_create_self_recursive_callee_frame_1_raw_int: *const (),
     // eval.rs driver access (opaque pointer to JitDriverPair)
     pub driver_pair: fn() -> *mut u8,
+    /// codewriter.py:make_jitcodes parity: build the majit JitCode for
+    /// `code` (with full liveness) so that get_list_of_active_boxes uses
+    /// the same liveness data as resume.py:1022 enumerate_vars at decode
+    /// time. Idempotent: no-op when already built.
+    pub ensure_majit_jitcode: fn(*const CodeObject),
 }
 
 // Safety: function pointers are 'static and never mutated after init
