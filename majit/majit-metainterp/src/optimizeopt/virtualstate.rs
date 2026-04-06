@@ -1683,7 +1683,7 @@ fn export_single_value(
     if let Some(info) = ctx.get_ptr_info(opref) {
         match info {
             PtrInfo::Virtual(vinfo) => {
-                let fields = vinfo
+                let mut fields: Vec<_> = vinfo
                     .fields
                     .iter()
                     .map(|(field_idx, field_ref)| {
@@ -1691,6 +1691,8 @@ fn export_single_value(
                         (*field_idx, Box::new(field_state))
                     })
                     .collect();
+                // RPython: _fields is indexed by integer, naturally sorted.
+                fields.sort_by_key(|(idx, _)| *idx);
                 return VirtualStateInfo::Virtual {
                     descr: vinfo.descr.clone(),
                     known_class: vinfo.known_class,
@@ -1914,16 +1916,6 @@ fn import_single_value(
                     .unwrap_or_else(|| imported_value_type(field_info));
                 let field_opref = import_child_placeholder(ctx, field_tp);
                 import_single_value(field_info, field_opref, ctx, ptr_info);
-                // ob_type (offset 0) is a GcRef pointer stored as Int.
-                // Register as Ref for correct fail_arg_types and decode_ref.
-                let offset = field_descrs
-                    .iter()
-                    .find(|(di, _)| *di == *field_idx)
-                    .and_then(|(_, d)| d.as_field_descr().map(|fd| fd.offset()));
-                if offset == Some(0) && known_class.is_some() {
-                    ctx.constant_types_for_numbering
-                        .insert(field_opref.0, majit_ir::Type::Ref);
-                }
                 vfields.push((*field_idx, field_opref));
             }
             ptr_info[idx] = Some(PtrInfo::Virtual(VirtualInfo {

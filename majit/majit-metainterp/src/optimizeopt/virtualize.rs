@@ -392,19 +392,14 @@ impl OptVirtualize {
             ctx.replace_op(opref, alloc_ref);
         }
 
-        // Emit ob_type SETFIELD_GC from known_class BEFORE data fields.
-        // pyre GC allocator doesn't set ob_type, so we emit it explicitly.
-        // ob_type is not in vinfo.fields (separated into known_class).
-        if let (Some(gc_ref), Some(descr)) = (vinfo.known_class, &vinfo.ob_type_descr) {
-            let class_val = gc_ref.as_usize() as i64;
-            let class_ref = self.emit_constant_int(ctx, class_val);
-            let mut set_op = Op::new(OpCode::SetfieldGc, &[alloc_ref, class_ref]);
-            set_op.descr = Some(descr.clone());
-            ctx.emit_extra(ctx.current_pass_idx, set_op);
-        }
-
-        // info.py:216-226 _force_elements: emit SETFIELD_GC for data fields.
-        for (field_idx, value_ref) in vinfo.fields {
+        // info.py:216-226 _force_elements: emit SETFIELD_GC for ALL fields.
+        // ob_type is stored in both known_class AND fields (RPython parity),
+        // so the generic field loop emits it alongside data fields.
+        // Sort by field_idx for deterministic emission order (RPython uses
+        // array indexing on _fields which is naturally ordered by index).
+        let mut fields = vinfo.fields;
+        fields.sort_by_key(|(idx, _)| *idx);
+        for (field_idx, value_ref) in fields {
             let value_ref = self.force_virtual(value_ref, ctx);
             let value_ref = ctx.get_box_replacement(value_ref);
             let mut set_op = Op::new(OpCode::SetfieldGc, &[alloc_ref, value_ref]);
@@ -734,26 +729,22 @@ impl OptVirtualize {
                 match info {
                     PtrInfo::Virtual(vinfo) => {
                         // info.py:203-206 setfield: _fields[fielddescr.get_index()] = op.
-                        // ob_type (offset 0) is NOT a regular field — it's the
-                        // vtable pointer stored as known_class (info.py:318).
+                        // RPython stores ob_type in BOTH _fields AND known_class.
                         let offset = extract_field_offset(field_idx);
                         if offset == Some(0) {
-                            // Capture ob_type as known_class + ob_type_descr.
+                            // info.py:318: known_class from vtable constant.
                             if vinfo.known_class.is_none() {
                                 if let Some(class_val) = value_as_constant {
                                     vinfo.known_class = Some(majit_ir::GcRef(class_val));
                                 }
                             }
                             vinfo.ob_type_descr = op.descr.clone();
-                            // ob_type constant is a GcRef pointer stored as
-                            // Value::Int. Register as Ref for fail_arg_types.
-                            ctx.constant_types_for_numbering
-                                .insert(value_ref.0, majit_ir::Type::Ref);
-                        } else {
-                            set_field(&mut vinfo.fields, field_idx, value_ref);
-                            if let Some(descr) = &op.descr {
-                                set_field_descr(&mut vinfo.field_descrs, field_idx, descr.clone());
-                            }
+                        }
+                        // RPython: _fields[fielddescr.get_index()] = op for ALL
+                        // fields including ob_type. known_class is additional.
+                        set_field(&mut vinfo.fields, field_idx, value_ref);
+                        if let Some(descr) = &op.descr {
+                            set_field_descr(&mut vinfo.field_descrs, field_idx, descr.clone());
                         }
                         return OptimizationResult::Remove;
                     }
