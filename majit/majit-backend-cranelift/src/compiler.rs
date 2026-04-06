@@ -2105,27 +2105,12 @@ pub fn get_savedata_ref_from_deadframe(frame: &DeadFrame) -> Result<GcRef, Backe
     Ok(jf.get_savedata_ref())
 }
 
-pub fn grab_savedata_ref_from_deadframe(frame: &DeadFrame) -> Option<GcRef> {
-    frame
-        .data
-        .downcast_ref::<JitFrameDeadFrame>()
-        .and_then(|jf| jf.try_get_savedata_ref())
-}
-
 pub fn grab_exc_value_from_deadframe(frame: &DeadFrame) -> Result<GcRef, BackendError> {
     let jf = frame
         .data
         .downcast_ref::<JitFrameDeadFrame>()
         .ok_or_else(|| BackendError::Unsupported("expected JitFrameDeadFrame".to_string()))?;
     Ok(jf.grab_exc_value())
-}
-
-pub fn grab_exc_class_from_deadframe(frame: &DeadFrame) -> Result<i64, BackendError> {
-    let jf = frame
-        .data
-        .downcast_ref::<JitFrameDeadFrame>()
-        .ok_or_else(|| BackendError::Unsupported("expected JitFrameDeadFrame".to_string()))?;
-    Ok(jf.grab_exc_class())
 }
 
 fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64]) -> DeadFrame {
@@ -9620,8 +9605,8 @@ impl majit_backend::Backend for CraneliftBackend {
             );
             let descr = self.get_latest_descr(&frame);
             let exit_layout = self.describe_deadframe(&frame);
-            let savedata = self.grab_savedata_ref(&frame);
-            let (exception_class, exception_value) = self.grab_exception_state(&frame);
+            let savedata = self.get_savedata_ref(&frame);
+            let exception_value = self.grab_exc_value(&frame);
             let exit_arity = descr.fail_arg_types().len();
             let mut result = Vec::with_capacity(exit_arity);
             let mut typed_result = Vec::with_capacity(exit_arity);
@@ -9654,7 +9639,6 @@ impl majit_backend::Backend for CraneliftBackend {
                 exit_layout,
                 force_token_slots: descr.force_token_slots().to_vec(),
                 savedata,
-                exception_class,
                 exception_value,
                 fail_index: descr.fail_index(),
                 trace_id: descr.trace_id(),
@@ -9722,7 +9706,6 @@ impl majit_backend::Backend for CraneliftBackend {
                 exit_layout: Some(descr.fail_descr.layout()),
                 force_token_slots: descr.fail_descr.force_token_slots().to_vec(),
                 savedata: descr.try_get_savedata_ref(),
-                exception_class: descr.grab_exc_class(),
                 exception_value: descr.grab_exc_value(),
                 fail_index: descr.fail_descr.fail_index(),
                 trace_id: descr.fail_descr.trace_id(),
@@ -9739,15 +9722,9 @@ impl majit_backend::Backend for CraneliftBackend {
             let raw = unsafe { *((exec.jf_gcref.0 + JF_SAVEDATA_OFS as usize) as *const usize) };
             if raw != 0 { Some(GcRef(raw)) } else { None }
         };
-        // jf_guard_exc written by emit_guard_exit; exc_class derived from typeptr.
+        // jf_guard_exc written by emit_guard_exit.
         let exc_raw = unsafe { *((exec.jf_gcref.0 + JF_GUARD_EXC_OFS as usize) as *const usize) };
         let exception = GcRef(exc_raw);
-        // pyjitpl.py:3119-3123: exc_class = ptr2int(exception_obj.typeptr)
-        let exception_class = if exc_raw == 0 {
-            0i64
-        } else {
-            unsafe { *(exc_raw as *const i64) }
-        };
 
         let exit_arity = fail_descr.fail_arg_types().len();
         outputs.truncate(exit_arity);
@@ -9767,7 +9744,6 @@ impl majit_backend::Backend for CraneliftBackend {
             exit_layout: Some(fail_descr.layout()),
             force_token_slots: fail_descr.force_token_slots().to_vec(),
             savedata,
-            exception_class,
             exception_value: exception,
             fail_index,
             trace_id: fail_descr.trace_id(),
@@ -10005,23 +9981,8 @@ impl majit_backend::Backend for CraneliftBackend {
         get_savedata_ref_from_deadframe(frame).ok()
     }
 
-    fn grab_savedata_ref(&self, frame: &DeadFrame) -> Option<GcRef> {
-        grab_savedata_ref_from_deadframe(frame)
-    }
-
-    fn grab_exception_state(&self, frame: &DeadFrame) -> (i64, GcRef) {
-        (
-            grab_exc_class_from_deadframe(frame).expect("grab_exc_class_from_deadframe failed"),
-            grab_exc_value_from_deadframe(frame).expect("grab_exc_value_from_deadframe failed"),
-        )
-    }
-
     fn grab_exc_value(&self, frame: &DeadFrame) -> GcRef {
         grab_exc_value_from_deadframe(frame).expect("grab_exc_value_from_deadframe failed")
-    }
-
-    fn grab_exc_class(&self, frame: &DeadFrame) -> i64 {
-        grab_exc_class_from_deadframe(frame).expect("grab_exc_class_from_deadframe failed")
     }
 
     fn invalidate_loop(&self, token: &JitCellToken) {
@@ -10437,6 +10398,16 @@ mod tests {
             typeptr: exc_type as usize,
         }));
         obj as *const FakeExcObject as usize as i64
+    }
+
+    /// pyjitpl.py:3119-3123: exc_class = ptr2int(exception_obj.typeptr)
+    fn exc_class_of(backend: &CraneliftBackend, frame: &DeadFrame) -> i64 {
+        let exc = backend.grab_exc_value(frame);
+        if exc.is_null() {
+            0
+        } else {
+            unsafe { *(exc.0 as *const i64) }
+        }
     }
 
     fn set_test_exception_state(value: i64, exc_type: i64) {
@@ -11901,14 +11872,14 @@ mod tests {
         let frame = backend.execute_token(&token, &[Value::Int(1)]);
         // GUARD_EXCEPTION matched — Finish returns the exception ref (fake object)
         assert!(!backend.get_ref_value(&frame, 0).is_null());
-        assert_eq!(backend.grab_exc_class(&frame), 0);
+        assert_eq!(exc_class_of(&backend, &frame), 0);
         assert_eq!(backend.grab_exc_value(&frame), GcRef::NULL);
         assert!(!jit_exc_is_pending());
 
         let frame = backend.execute_token(&token, &[Value::Int(0)]);
         assert_eq!(backend.get_latest_descr(&frame).fail_index(), 0);
         assert_eq!(backend.get_int_value(&frame, 0), 0);
-        assert_eq!(backend.grab_exc_class(&frame), 0);
+        assert_eq!(exc_class_of(&backend, &frame), 0);
         assert_eq!(backend.grab_exc_value(&frame), GcRef::NULL);
         assert!(!jit_exc_is_pending());
     }
@@ -11943,7 +11914,7 @@ mod tests {
         let frame = backend.execute_token(&token, &[Value::Int(1)]);
         assert_eq!(backend.get_latest_descr(&frame).fail_index(), 0);
         assert_eq!(backend.get_int_value(&frame, 0), 1);
-        assert_eq!(backend.grab_exc_class(&frame), 0x2222);
+        assert_eq!(exc_class_of(&backend, &frame), 0x2222);
         assert!(!backend.grab_exc_value(&frame).is_null());
         assert!(!jit_exc_is_pending());
     }
@@ -11977,14 +11948,14 @@ mod tests {
         let frame = backend.execute_token(&token, &[Value::Int(1)]);
         assert_eq!(backend.get_latest_descr(&frame).fail_index(), 0);
         assert_eq!(backend.get_int_value(&frame, 0), 1);
-        assert_eq!(backend.grab_exc_class(&frame), 0x1111);
+        assert_eq!(exc_class_of(&backend, &frame), 0x1111);
         assert!(!backend.grab_exc_value(&frame).is_null());
         assert!(!jit_exc_is_pending());
 
         let frame = backend.execute_token(&token, &[Value::Int(0)]);
         assert_eq!(backend.get_latest_descr(&frame).fail_index(), 1);
         assert_eq!(backend.get_int_value(&frame, 0), 0);
-        assert_eq!(backend.grab_exc_class(&frame), 0);
+        assert_eq!(exc_class_of(&backend, &frame), 0);
         assert_eq!(backend.grab_exc_value(&frame), GcRef::NULL);
         assert!(!jit_exc_is_pending());
     }
@@ -12021,8 +11992,9 @@ mod tests {
         assert_eq!(raw.outputs, vec![1]);
         assert_eq!(raw.typed_outputs, vec![Value::Int(1)]);
         assert_eq!(raw.savedata, None);
-        assert_eq!(raw.exception_class, 0x1111);
+        // pyjitpl.py:3119-3123: exc_class = ptr2int(exception_obj.typeptr)
         assert!(!raw.exception_value.is_null());
+        assert_eq!(unsafe { *(raw.exception_value.0 as *const i64) }, 0x1111);
         let layout = raw
             .exit_layout
             .expect("raw exit should expose backend layout");
@@ -12081,7 +12053,7 @@ mod tests {
         let frame = backend.execute_token(&token, &[Value::Int(1)]);
         // GUARD_EXCEPTION matched — Finish returns the exception ref (fake object)
         assert!(!backend.get_ref_value(&frame, 0).is_null());
-        assert_eq!(backend.grab_exc_class(&frame), 0);
+        assert_eq!(exc_class_of(&backend, &frame), 0);
         assert_eq!(backend.grab_exc_value(&frame), GcRef::NULL);
         assert_eq!(test_exception_call_log_snapshot(), vec![false, false]);
         assert!(!jit_exc_is_pending());
@@ -12134,7 +12106,7 @@ mod tests {
         let frame = backend.execute_token(&token, &[Value::Int(1)]);
         with_gc_runtime(runtime_id, |gc| gc.collect_nursery());
 
-        assert_eq!(backend.grab_exc_class(&frame), 0x4444);
+        assert_eq!(exc_class_of(&backend, &frame), 0x4444);
         let moved = backend.grab_exc_value(&frame);
         assert!(!moved.is_null());
         assert_ne!(moved, exception_ref);
@@ -13731,7 +13703,7 @@ mod tests {
         let frame = backend.execute_token(&token, &[Value::Int(1)]);
         assert_eq!(backend.get_latest_descr(&frame).fail_index(), 0);
         assert_eq!(backend.get_int_value(&frame, 0), 1);
-        assert_eq!(backend.grab_exc_class(&frame), 0x4545);
+        assert_eq!(exc_class_of(&backend, &frame), 0x4545);
         assert!(!backend.grab_exc_value(&frame).is_null());
 
         let bridge_inputargs = vec![InputArg::new_int(0)];
@@ -13754,7 +13726,7 @@ mod tests {
 
         let frame = backend.execute_token(&token, &[Value::Int(1)]);
         assert_eq!(backend.get_ref_value(&frame, 0), GcRef(0xE11Eusize));
-        assert_eq!(backend.grab_exc_class(&frame), 0);
+        assert_eq!(exc_class_of(&backend, &frame), 0);
         assert_eq!(backend.grab_exc_value(&frame), GcRef::NULL);
         assert!(!jit_exc_is_pending());
     }
@@ -14127,7 +14099,6 @@ mod tests {
         assert_eq!(raw.outputs, vec![1, 10]);
         assert_eq!(raw.typed_outputs, vec![Value::Int(1), Value::Int(10)]);
         assert_eq!(raw.savedata, Some(GcRef(0xDADA)));
-        assert_eq!(raw.exception_class, 0);
         assert_eq!(raw.exception_value, GcRef::NULL);
         let layout = raw
             .exit_layout

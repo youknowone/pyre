@@ -3958,8 +3958,14 @@ impl<M: Clone> MetaInterp<M> {
             }
         }
 
+        // pyjitpl.py:3119-3123: exc_class = ptr2int(exception_obj.typeptr)
+        let exc_class = if result.exception_value.is_null() {
+            0
+        } else {
+            unsafe { *(result.exception_value.0 as *const i64) }
+        };
         let exception = ExceptionState {
-            exc_class: result.exception_class,
+            exc_class,
             exc_value: result.exception_value.0 as i64,
             ovf_flag: false,
         };
@@ -4082,8 +4088,14 @@ impl<M: Clone> MetaInterp<M> {
                 hook(green_key, fail_index, 0);
             }
         }
+        // pyjitpl.py:3119-3123: exc_class = ptr2int(exception_obj.typeptr)
+        let exc_class = if result.exception_value.is_null() {
+            0
+        } else {
+            unsafe { *(result.exception_value.0 as *const i64) }
+        };
         let exception = ExceptionState {
-            exc_class: result.exception_class,
+            exc_class,
             exc_value: result.exception_value.0 as i64,
             ovf_flag: false,
         };
@@ -4194,10 +4206,17 @@ impl<M: Clone> MetaInterp<M> {
                 }
             }
         }
-        let savedata = self.backend.grab_savedata_ref(&frame);
+        let savedata = self.backend.get_savedata_ref(&frame);
+        // pyjitpl.py:3119-3123: exc_class = ptr2int(exception_obj.typeptr)
+        let exc_value_ref = self.backend.grab_exc_value(&frame);
+        let exc_class = if exc_value_ref.is_null() {
+            0
+        } else {
+            unsafe { *(exc_value_ref.0 as *const i64) }
+        };
         let exception = ExceptionState {
-            exc_class: self.backend.grab_exc_class(&frame),
-            exc_value: self.backend.grab_exc_value(&frame).0 as i64,
+            exc_class,
+            exc_value: exc_value_ref.0 as i64,
             ovf_flag: false,
         };
 
@@ -4364,10 +4383,17 @@ impl<M: Clone> MetaInterp<M> {
                 }
             }
         }
-        let savedata = self.backend.grab_savedata_ref(&frame);
+        let savedata = self.backend.get_savedata_ref(&frame);
+        // pyjitpl.py:3119-3123: exc_class = ptr2int(exception_obj.typeptr)
+        let exc_value_ref = self.backend.grab_exc_value(&frame);
+        let exc_class = if exc_value_ref.is_null() {
+            0
+        } else {
+            unsafe { *(exc_value_ref.0 as *const i64) }
+        };
         let exception = ExceptionState {
-            exc_class: self.backend.grab_exc_class(&frame),
-            exc_value: self.backend.grab_exc_value(&frame).0 as i64,
+            exc_class,
+            exc_value: exc_value_ref.0 as i64,
             ovf_flag: false,
         };
 
