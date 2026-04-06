@@ -397,6 +397,7 @@ impl OptVirtualize {
         // (heaptracker.py:66-67), so typeptr is NOT emitted from the
         // force path. The vtable is written by the GC rewriter's
         // handle_malloc_operation via fielddescr_vtable (rewrite.py:479-484).
+        debug_assert_no_typeptr_in_virtual_fields(&vinfo.fields, "force_virtual_instance");
         for (field_idx, value_ref) in vinfo.fields {
             let value_ref = self.force_virtual(value_ref, ctx);
             let value_ref = ctx.get_box_replacement(value_ref);
@@ -748,6 +749,10 @@ impl OptVirtualize {
                         if let Some(descr) = &op.descr {
                             set_field_descr(&mut vinfo.field_descrs, field_idx, descr.clone());
                         }
+                        debug_assert_no_typeptr_in_virtual_fields(
+                            &vinfo.fields,
+                            "optimize_setfield_gc::Virtual",
+                        );
                         return OptimizationResult::Remove;
                     }
                     PtrInfo::VirtualStruct(vinfo) => {
@@ -1704,6 +1709,33 @@ fn set_field(fields: &mut Vec<(u32, OpRef)>, field_idx: u32, value_ref: OpRef) {
         }
     }
     fields.push((field_idx, value_ref));
+}
+
+/// RPython parity assertion: `VirtualInfo.fields` must NEVER contain
+/// typeptr (offset 0). heaptracker.py:66-67 `all_fielddescrs()` skips
+/// typeptr, so `info.py:180 AbstractStructPtrInfo._fields` is sized to
+/// the non-typeptr field count and has no slot for offset 0.
+///
+/// This helper asserts the invariant at boundaries where `Virtual.fields`
+/// is constructed/populated/iterated: import (virtualstate), export
+/// (virtualstate), force path (force_virtual_instance), and the
+/// `optimize_setfield_gc` Virtual arm (before `set_field`).
+///
+/// Only `VirtualInfo.fields` is subject to this invariant;
+/// `VirtualStructInfo.fields` (OpCode::New without vtable) may contain
+/// any offset including 0.
+#[inline]
+pub(crate) fn debug_assert_no_typeptr_in_virtual_fields(
+    fields: &[(u32, OpRef)],
+    context: &'static str,
+) {
+    debug_assert!(
+        fields
+            .iter()
+            .all(|(idx, _)| extract_field_offset(*idx) != Some(0)),
+        "VirtualInfo.fields must exclude typeptr (offset 0) — RPython \
+         heaptracker.py:66-67 all_fielddescrs() parity violation at {context}",
+    );
 }
 
 fn set_field_descr(field_descrs: &mut Vec<(u32, DescrRef)>, field_idx: u32, descr: DescrRef) {
