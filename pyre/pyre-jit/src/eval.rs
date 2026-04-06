@@ -983,8 +983,8 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
     // Cannot call codewriter::is_portal() here as it triggers
     // lazy jitcode compilation which interferes with JIT state.
     let is_portal: bool = &*code.obj_name != "<module>";
-    // rlib/jit.py — promote is_portal so the JIT folds the portal-check branch.
-    let is_portal = majit_metainterp::jit::promote(is_portal);
+    // interp_jit.py:66 — next_instr, pycode are greens (managed by jit_merge_point).
+    // No explicit promote needed; the JitDriver green-key mechanism handles this.
 
     loop {
         if frame.next_instr >= code.instructions.len() {
@@ -992,10 +992,6 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
         }
 
         let pc = frame.next_instr;
-        // rlib/jit.py:271 — promote PC for per-bytecode specialization.
-        let pc = majit_metainterp::jit::promote(pc);
-        // pyframe.py:129 — promote pycode so the JIT specializes per code object.
-        majit_metainterp::jit::assert_green(code);
         let Some((instruction, op_arg)) = pyre_interpreter::decode_instruction_at(code, pc) else {
             return LoopResult::Done(Ok(w_none()));
         };
