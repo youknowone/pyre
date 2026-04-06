@@ -1,0 +1,10 @@
+[package]
+name = "calc"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+majit-ir = { workspace = true }
+majit-metainterp = { workspace = true }
+majit-macros = { workspace = true }
