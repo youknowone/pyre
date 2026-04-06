@@ -193,6 +193,11 @@ pub struct OptContext {
     pub imported_virtuals: Vec<crate::optimizeopt::optimizer::ImportedVirtual>,
     /// Phase 2 imported label args (OpRefs in Phase 2 namespace).
     pub imported_label_args: Option<Vec<OpRef>>,
+    /// Phase 2 virtual field remap: fresh Phase 2 position → original Phase 1
+    /// position. Populated by remap_field_ref in apply_exported_ptr_info.
+    /// The assembly reads this to emit SameAs ops connecting fresh label
+    /// positions to their original preamble sources.
+    pub imported_field_remap: HashMap<OpRef, OpRef>,
     /// RPython shortpreamble.py: active phase-2 short preamble builder.
     /// Tracks which imported short facts are actually consumed by the body.
     pub imported_short_preamble_builder:
@@ -683,6 +688,7 @@ impl OptContext {
             imported_virtual_heads: Vec::new(),
             imported_virtuals: Vec::new(),
             imported_label_args: None,
+            imported_field_remap: HashMap::new(),
             can_replace_guards: true,
             patchguardop: None,
             pre_force_virtual_state: None,
@@ -741,6 +747,7 @@ impl OptContext {
             imported_virtual_heads: Vec::new(),
             imported_virtuals: Vec::new(),
             imported_label_args: None,
+            imported_field_remap: HashMap::new(),
             can_replace_guards: true,
             patchguardop: None,
             pre_force_virtual_state: None,
