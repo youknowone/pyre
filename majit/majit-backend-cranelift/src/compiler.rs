@@ -6062,54 +6062,43 @@ impl CraneliftBackend {
                 }
 
                 OpCode::GuardIsObject => {
-                    // args[0] = ref value. Side-exit if null (0).
-                    let info = &guard_infos[guard_idx];
-                    guard_idx += 1;
-
-                    let obj_ptr = resolve_opref(&mut builder, &constants, op.args[0]);
-                    let zero = builder.ins().iconst(cl_types::I64, 0);
-                    let is_null = builder.ins().icmp(IntCC::Equal, obj_ptr, zero);
-                    let exit_block = builder.create_block();
-                    builder.set_cold_block(exit_block);
-                    let cont_block = builder.create_block();
-                    if preamble_phase {
-                        builder.set_cold_block(cont_block);
-                    }
-                    builder
-                        .ins()
-                        .brif(is_null, exit_block, &[], cont_block, &[]);
-
-                    builder.switch_to_block(exit_block);
-                    builder.seal_block(exit_block);
-                    emit_guard_exit(&mut builder, &constants, outputs_ptr, info);
-
-                    builder.switch_to_block(cont_block);
-                    builder.seal_block(cont_block);
+                    // x86/assembler.py:1924-1943 genop_guard_guard_is_object:
+                    //   typeid = mem32[obj + 0]
+                    //   addr = base_type_info + (typeid << shift_by)
+                    //        + infobits_offset
+                    //   TEST8 [addr], IS_OBJECT_FLAG
+                    //   passes if NZ
+                    // Requires cpu.gc_ll_descr.get_translated_info_for_typeinfo
+                    // and get_translated_info_for_guard_is_object to be
+                    // installed; pyre's TypeInfo has no infobits layout and
+                    // the tracer never emits GUARD_IS_OBJECT, so reject at
+                    // codegen time rather than silently emit a null check.
+                    return Err(BackendError::CompilationFailed(
+                        "GUARD_IS_OBJECT lowering requires gc_ll_descr \
+                         typeinfo/infobits layout (x86/assembler.py:\
+                         1924-1943); not installed for this backend"
+                            .into(),
+                    ));
                 }
 
-                OpCode::GuardSubclass | OpCode::GuardCompatible => {
-                    // GuardSubclass: args[0] = object ref, args[1] = expected parent class ref.
-                    // GuardCompatible: args[0] = object ref, args[1] = expected compatible value.
-                    // Both guard that two values are equal; fail otherwise.
-                    let info = &guard_infos[guard_idx];
-                    guard_idx += 1;
-
-                    let (a, b) = resolve_binop(&mut builder, &constants, op);
-                    let neq = builder.ins().icmp(IntCC::NotEqual, a, b);
-                    let exit_block = builder.create_block();
-                    builder.set_cold_block(exit_block);
-                    let cont_block = builder.create_block();
-                    if preamble_phase {
-                        builder.set_cold_block(cont_block);
-                    }
-                    builder.ins().brif(neq, exit_block, &[], cont_block, &[]);
-
-                    builder.switch_to_block(exit_block);
-                    builder.seal_block(exit_block);
-                    emit_guard_exit(&mut builder, &constants, outputs_ptr, info);
-
-                    builder.switch_to_block(cont_block);
-                    builder.seal_block(cont_block);
+                OpCode::GuardSubclass => {
+                    // x86/assembler.py:1945-1980 genop_guard_guard_subclass:
+                    //   tmp = subclassrange_min of obj's class (via vtable
+                    //         or via TYPE_INFO table indexed by typeid)
+                    //   check_min = expected_class.subclassrange_min
+                    //   check_max = expected_class.subclassrange_max
+                    //   pass if (tmp - check_min) <u (check_max - check_min)
+                    // The lowering requires cpu.gc_ll_descr to surface the
+                    // subclassrange layout (typeinfo table + field offsets)
+                    // or a vtable layout with `subclassrange_min_offset`.
+                    // pyre's PyType has neither yet, and the tracer never
+                    // emits GUARD_SUBCLASS, so reject at codegen time.
+                    return Err(BackendError::CompilationFailed(
+                        "GUARD_SUBCLASS lowering requires gc_ll_descr \
+                         subclassrange layout (x86/assembler.py:1945-1980); \
+                         not installed for this backend"
+                            .into(),
+                    ));
                 }
 
                 // ── Exception operations ──

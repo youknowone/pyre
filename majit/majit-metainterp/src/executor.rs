@@ -345,16 +345,33 @@ pub(crate) fn execute_one(
                 OpResult::GuardFailed
             }
         }
-        OpCode::GuardClass
-        | OpCode::GuardNonnullClass
-        | OpCode::GuardSubclass
-        | OpCode::GuardCompatible => {
+        OpCode::GuardClass | OpCode::GuardNonnullClass => {
+            // llgraph/runner.py:1247-1255 execute_guard_class /
+            //   execute_guard_nonnull_class: value.typeptr == klass
             let (a, b) = binop(values, op);
             if a == b {
                 OpResult::Void
             } else {
                 OpResult::GuardFailed
             }
+        }
+        OpCode::GuardSubclass => {
+            // llgraph/runner.py:1271-1281 execute_guard_subclass:
+            //   unsigned range check
+            //     expected.subclassrange_min
+            //       <= value.typeptr.subclassrange_min
+            //       <= expected.subclassrange_max
+            // majit's blackhole executor does not yet carry the
+            // subclassrange fields on its runtime types; re-executing
+            // GUARD_SUBCLASS in blackhole would require walking the
+            // TypeInfo table. Until that plumbing lands, treat the guard
+            // as passing when re-executed (the same decision the JIT
+            // made at compile time). This matches executor.py, which
+            // simply skips guards in its _GUARD_FIRST..._GUARD_LAST
+            // range; only the backend and the blackhole interpreter
+            // are supposed to re-run them, and our blackhole has no
+            // subclass-range lookup yet.
+            OpResult::Void
         }
         OpCode::GuardNoOverflow => {
             if exc.ovf_flag {

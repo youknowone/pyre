@@ -145,7 +145,7 @@ impl majit_backend::Backend for WasmBackend {
             &self.constants,
             self.vtable_offset,
             &typeid_table,
-        );
+        )?;
 
         // Build fail descriptors
         let fail_descrs: Vec<Arc<WasmFailDescr>> = guard_exits

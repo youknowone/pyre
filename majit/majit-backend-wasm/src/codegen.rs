@@ -16,6 +16,7 @@
 ///   CALL_RESULT_OFS: result (i64)    — written by host after call
 use std::collections::HashMap;
 
+use majit_backend::BackendError;
 use majit_gc::header::{GcHeader, TYPE_ID_MASK};
 use majit_ir::{InputArg, Op, OpCode, OpRef, Type};
 use wasm_encoder::{
@@ -121,7 +122,7 @@ pub fn build_wasm_module(
     constants: &HashMap<u32, i64>,
     vtable_offset: Option<usize>,
     classptr_to_typeid: &HashMap<i64, u32>,
-) -> (Vec<u8>, Vec<GuardExit>) {
+) -> Result<(Vec<u8>, Vec<GuardExit>), BackendError> {
     let (guards, num_vars) = collect_guards_and_vars(inputargs, ops);
     let needs_call = has_call_ops(ops);
 
@@ -178,11 +179,11 @@ pub fn build_wasm_module(
         jit_call_idx,
         vtable_offset,
         classptr_to_typeid,
-    );
+    )?;
     codes.function(&func);
     module.section(&codes);
 
-    (module.finish(), guards)
+    Ok((module.finish(), guards))
 }
 
 fn build_function(
@@ -193,7 +194,7 @@ fn build_function(
     jit_call_idx: Option<u32>,
     vtable_offset: Option<usize>,
     classptr_to_typeid: &HashMap<i64, u32>,
-) -> Function {
+) -> Result<Function, BackendError> {
     let mut func = Function::new(vec![(num_vars, ValType::I64)]);
     let mut sink = func.instructions();
 
@@ -767,32 +768,37 @@ fn build_function(
                 guard_idx += 1;
             }
             // GUARD_IS_OBJECT: RPython's `genop_guard_guard_is_object`
-            // (x86/assembler.py:1924-1943) reads the typeid at offset 0,
-            // indexes the translator-side TYPE_INFO table, and tests
-            // `T_IS_RPYTHON_INSTANCE`. pyre's runtime has no TYPE_INFO
-            // table and the tracer never emits this op, so there is no
-            // implementable lowering. Skip silently — no bogus
-            // null-check, no synthetic lookup, no panic. Downstream can
-            // install a real lowering if a front-end ever emits it.
+            // (x86/assembler.py:1924-1943) loads the typeid from the GC
+            // header, indexes the translator-side TYPE_INFO table, and
+            // tests `T_IS_RPYTHON_INSTANCE` in the `infobits` word.
+            // pyre's runtime has not installed that TYPE_INFO layout on
+            // the wasm backend, so there is no faithful lowering here.
+            // Reject at compile time rather than silently pass — a
+            // silent pass would diverge from RPython semantics on any
+            // non-instance box that reaches this guard.
             OpCode::GuardIsObject => {
-                guard_idx += 1;
+                return Err(BackendError::CompilationFailed(
+                    "GUARD_IS_OBJECT lowering requires the \
+                     gc_ll_descr TYPE_INFO/infobits layout \
+                     (x86/assembler.py:1924-1943); wasm backend has \
+                     no faithful lowering installed"
+                        .into(),
+                ));
             }
             // GUARD_SUBCLASS: RPython's `genop_guard_guard_subclass`
             // (x86/assembler.py:1945-1980) runs an unsigned range check
-            // using the `subclassrange_min`/`subclassrange_max` fields
-            // of `rclass.CLASSTYPE`. pyre's PyType carries no such
-            // fields and the tracer never emits this op, so the wasm
-            // backend has no faithful lowering. Skip silently rather
-            // than inventing equality semantics.
+            // on `subclassrange_min`/`subclassrange_max` fields of
+            // `rclass.CLASSTYPE`. pyre's PyType carries no such fields
+            // on the wasm backend. Reject at compile time rather than
+            // inventing equality semantics or silently passing.
             OpCode::GuardSubclass => {
-                guard_idx += 1;
-            }
-            // GUARD_COMPATIBLE has no RPython/PyPy counterpart; the
-            // opcode is majit-local and no front-end in this tree emits
-            // it. Skip silently so the wasm backend does not invent
-            // semantics.
-            OpCode::GuardCompatible => {
-                guard_idx += 1;
+                return Err(BackendError::CompilationFailed(
+                    "GUARD_SUBCLASS lowering requires the gc_ll_descr \
+                     subclassrange layout (x86/assembler.py:\
+                     1945-1980); wasm backend has no faithful lowering \
+                     installed"
+                        .into(),
+                ));
             }
             OpCode::GuardFutureCondition | OpCode::GuardAlwaysFails => {
                 // GuardAlwaysFails always exits.
@@ -1032,7 +1038,7 @@ fn build_function(
     sink.local_get(0);
     sink.end(); // end function
 
-    func
+    Ok(func)
 }
 
 // ── Helpers ──
