@@ -3081,7 +3081,7 @@ impl<M: Clone> MetaInterp<M> {
             result
         }));
         constant_types = updated_constant_types;
-        let mut optimized_ops = match optimize_result {
+        let optimized_ops = match optimize_result {
             Ok(ops) => ops,
             Err(payload) => {
                 if payload
@@ -3097,6 +3097,10 @@ impl<M: Clone> MetaInterp<M> {
                 std::panic::resume_unwind(payload);
             }
         };
+        // RPython optimizer.py:552-556 (flush=True): Finish/Jump is sent
+        // through passes inside propagate_all_forward and ends up in
+        // new_operations naturally — no restoration needed.
+        let mut optimized_ops = optimized_ops;
         let num_ops_after = optimized_ops.len();
         // RPython compile.py:234 parity: transfer quasi-immutable deps
         // from optimizer to MetaInterp for post-compile watcher registration.

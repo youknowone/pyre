@@ -277,11 +277,10 @@ impl UnrollOptimizer {
             opt_p1.snapshot_vable_boxes = self.snapshot_vable_boxes.clone();
             opt_p1.snapshot_frame_pcs = self.snapshot_frame_pcs.clone();
             opt_p1.snapshot_box_types = self.snapshot_box_types.clone();
-            // RPython optimize_preamble: flush=False — JUMP is NOT sent through
-            // the pass pipeline. In majit, skip_flush=true causes crashes because
-            // (1) OptHeap lazy sets are not flushed, and (2) emit_with_guard_check
-            // force_box is needed for guard resume data. Keep skip_flush=false
-            // until these dependencies are resolved.
+            // RPython optimize_preamble (unroll.py:101-103): flush=False.
+            // JUMP/FINISH is NOT sent through the pass pipeline; it's
+            // returned in info.jump_op for Phase 2 to consume.
+            opt_p1.skip_flush = true;
             let p1_ops = opt_p1.optimize_with_constants_and_inputs(ops, &mut consts_p1, num_inputs);
             // RPython parity: Phase 1 optimizer may discover new constants
             // via make_constant (e.g., constant-folded heap reads, guard
@@ -337,8 +336,16 @@ impl UnrollOptimizer {
                 }
                 None => {
                     *constants = consts_p1;
-                    let loop_arity = closing_loop_contract_arity(&p1_ops, p1_ni);
-                    return (p1_ops, loop_arity);
+                    // RPython: compile_loop uses flush=True — terminal op
+                    // (Finish/Jump) goes through the pass pipeline normally.
+                    // majit: flush=False stores it in terminal_op; restore it
+                    // here for non-peeled traces that return directly.
+                    let mut ops = p1_ops;
+                    if let Some(terminal) = opt_p1.terminal_op.take() {
+                        ops.push(terminal);
+                    }
+                    let loop_arity = closing_loop_contract_arity(&ops, p1_ni);
+                    return (ops, loop_arity);
                 }
             }
         };
@@ -3582,6 +3589,25 @@ fn assemble_peeled_trace_with_jump_args(
             max_pos = max_pos.max(la.0.saturating_add(1));
         }
     }
+    // Ensure fresh positions are above all body op positions to prevent
+    // namespace collisions between assembly-allocated SameAs and body OpRefs.
+    for op in p2_ops.iter() {
+        if !op.pos.is_none() && op.pos.0 < 10_000 {
+            max_pos = max_pos.max(op.pos.0.saturating_add(1));
+        }
+        for &arg in op.args.iter() {
+            if !arg.is_none() && arg.0 < 10_000 {
+                max_pos = max_pos.max(arg.0.saturating_add(1));
+            }
+        }
+        if let Some(ref fa) = op.fail_args {
+            for &arg in fa.iter() {
+                if !arg.is_none() && arg.0 < 10_000 {
+                    max_pos = max_pos.max(arg.0.saturating_add(1));
+                }
+            }
+        }
+    }
     let mut seen_body_defs = std::collections::HashSet::new();
     for op in p2_ops {
         let all_refs = op
@@ -3935,25 +3961,33 @@ fn assemble_peeled_trace_with_jump_args(
                             .copied()
                             .unwrap_or(target_label_args[jump_args.len()])
                     };
-                    let remapped = input_remap
-                        .get(&extra_arg)
-                        .copied()
-                        .or_else(|| alias_remap.get(&extra_arg).copied())
-                        .or_else(|| {
-                            body_result_remap
-                                .get(&extra_arg)
-                                .copied()
-                                .and_then(|mapped| {
-                                    if seen_body_defs.contains(&extra_arg)
-                                        || !visible_before_label.contains(&extra_arg)
-                                    {
-                                        Some(mapped)
-                                    } else {
-                                        None
-                                    }
-                                })
-                        })
-                        .unwrap_or(extra_arg);
+                    // Extra args from the label are assembly-allocated positions.
+                    // They must NOT be remapped through alias_remap, which maps
+                    // body-scoped OpRefs. Use the label arg directly.
+                    let remapped = if label_set.contains(&extra_arg) {
+                        // This is a label arg position — use as-is.
+                        extra_arg
+                    } else {
+                        input_remap
+                            .get(&extra_arg)
+                            .copied()
+                            .or_else(|| alias_remap.get(&extra_arg).copied())
+                            .or_else(|| {
+                                body_result_remap
+                                    .get(&extra_arg)
+                                    .copied()
+                                    .and_then(|mapped| {
+                                        if seen_body_defs.contains(&extra_arg)
+                                            || !visible_before_label.contains(&extra_arg)
+                                        {
+                                            Some(mapped)
+                                        } else {
+                                            None
+                                        }
+                                    })
+                            })
+                            .unwrap_or(extra_arg)
+                    };
                     jump_args.push(remapped);
                 }
             }
