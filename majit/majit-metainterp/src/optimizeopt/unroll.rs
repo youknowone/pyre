@@ -3026,7 +3026,13 @@ impl OptUnroll {
                     let Some(result_opref) = resolve_result(result) else {
                         continue;
                     };
-                    ctx.replace_op(source, result_opref);
+                    // RPython parity: shortpreamble.py:112-126 PureOp.produce_op
+                    // calls opt.pure(opnum, PreambleOp(op, preamble_op, invented))
+                    // which stores the PreambleOp in the CSE cache but does NOT
+                    // set forwarding on op/source. Forwarding (via replace_op)
+                    // would route body GuardTrue(v12) → GuardTrue(imported_v37),
+                    // reusing the Phase 1 stale boolean instead of letting the
+                    // body emit a fresh IntLt for the new iteration's current.
                     // Register type for the new OpRef (RPython Box.type parity).
                     ctx.value_types.insert(result_opref.0, opcode.result_type());
                     let args = args
@@ -3562,16 +3568,59 @@ fn assemble_peeled_trace_with_jump_args(
         .iter()
         .map(|s| (s.result, s.source))
         .collect();
+    // Advance max_pos past every position already in use before allocating
+    // fresh SameAs positions. In RPython, Box identity prevents collisions;
+    // in the flat OpRef model, the assembly-allocated SameAs position must
+    // not overlap base label_args, filtered_extra_label_args, p2_ops
+    // positions/args/fail_args, imported_short_sources.result fresh slots,
+    // or imported_field_remap fresh slots — each of those may be referenced
+    // by the body. A single colliding OpRef aliases two distinct values and
+    // corrupts the loop.
+    for &la in &full_label_args {
+        if is_trace_runtime_ref(la, constants) {
+            max_pos = max_pos.max(la.0.saturating_add(1));
+        }
+    }
+    for &la in &filtered_extra_label_args {
+        if is_trace_runtime_ref(la, constants) {
+            max_pos = max_pos.max(la.0.saturating_add(1));
+        }
+    }
+    for op in p2_ops.iter() {
+        if is_trace_runtime_ref(op.pos, constants) {
+            max_pos = max_pos.max(op.pos.0.saturating_add(1));
+        }
+        for &arg in op.args.iter() {
+            if is_trace_runtime_ref(arg, constants) {
+                max_pos = max_pos.max(arg.0.saturating_add(1));
+            }
+        }
+        if let Some(ref fa) = op.fail_args {
+            for &arg in fa.iter() {
+                if is_trace_runtime_ref(arg, constants) {
+                    max_pos = max_pos.max(arg.0.saturating_add(1));
+                }
+            }
+        }
+    }
+    for entry in imported_short_sources.iter() {
+        if is_trace_runtime_ref(entry.result, constants) {
+            max_pos = max_pos.max(entry.result.0.saturating_add(1));
+        }
+    }
+    for (&fresh, _) in imported_field_remap.iter() {
+        if is_trace_runtime_ref(fresh, constants) {
+            max_pos = max_pos.max(fresh.0.saturating_add(1));
+        }
+    }
+    max_pos = next_free_pos(max_pos);
+
     // Use a separate position counter for extra SameAs ops. Must start
-    // AFTER all preamble positions (including p1_ops SameAs) to avoid
-    // colliding with existing definitions.
-    let preamble_max = result
-        .iter()
-        .map(|op| op.pos.0)
-        .filter(|&p| p != u32::MAX)
-        .max()
-        .unwrap_or(0);
-    let mut extra_pos = next_free_pos(preamble_max.max(label_pos).saturating_add(1));
+    // AFTER all positions that may be referenced in the body, not just
+    // p1_ops positions — Phase 2 allocated fresh slots during import_state
+    // for heap imports, virtual fields and pure ops that live above
+    // preamble_max and would otherwise collide.
+    let mut extra_pos = max_pos;
     for &arg in &filtered_extra_label_args {
         let mapped = imported_alias_remap.get(&arg).copied().unwrap_or(arg);
         if !preamble_defs.contains(&mapped) {
@@ -3612,39 +3661,6 @@ fn assemble_peeled_trace_with_jump_args(
         };
     carried_source_slots.extend(filtered_extra_jump_args.iter().copied());
     let mut label_set: std::collections::HashSet<OpRef> = full_label_args.iter().copied().collect();
-    // Advance max_pos past all label_args positions to prevent SameAs ops
-    // from colliding with LABEL block parameters. In Cranelift, a SameAs at
-    // position v36 followed by LABEL(v36) would redefine v36 as a block
-    // param, but the body still uses the SameAs value — causing wrong results.
-    for &la in &full_label_args {
-        if is_trace_runtime_ref(la, constants) {
-            max_pos = max_pos.max(la.0.saturating_add(1));
-        }
-    }
-    for &la in &filtered_extra_label_args {
-        if is_trace_runtime_ref(la, constants) {
-            max_pos = max_pos.max(la.0.saturating_add(1));
-        }
-    }
-    // Ensure fresh positions are above all body op positions to prevent
-    // namespace collisions between assembly-allocated SameAs and body OpRefs.
-    for op in p2_ops.iter() {
-        if is_trace_runtime_ref(op.pos, constants) {
-            max_pos = max_pos.max(op.pos.0.saturating_add(1));
-        }
-        for &arg in op.args.iter() {
-            if is_trace_runtime_ref(arg, constants) {
-                max_pos = max_pos.max(arg.0.saturating_add(1));
-            }
-        }
-        if let Some(ref fa) = op.fail_args {
-            for &arg in fa.iter() {
-                if is_trace_runtime_ref(arg, constants) {
-                    max_pos = max_pos.max(arg.0.saturating_add(1));
-                }
-            }
-        }
-    }
     let mut seen_body_defs = std::collections::HashSet::new();
     for op in p2_ops {
         let all_refs = op

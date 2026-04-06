@@ -837,6 +837,23 @@ impl OptContext {
         } else if self.new_operations.iter().any(|e| e.pos == op.pos) {
             // RPython Box parity: reassign position to avoid collision.
             op.pos = self.reserve_pos();
+        } else if self.has_op_forwarding(op.pos) && op.result_type() != majit_ir::Type::Void {
+            // Phase 2 body emitting at a trace position that was forwarded
+            // by import_state (e.g. Phase 1 v14 → Phase 2 fresh v42 from
+            // heap import) would otherwise leave the fresh body op
+            // unreachable — downstream reads of v14 return v42 via the
+            // stale forwarding chain instead of the new body result.
+            // RPython Box identity isolates each Phase 2 op; the flat OpRef
+            // model must allocate a fresh position and redirect forwarding.
+            // Only Forwarded::Op triggers this — Info/Const/IntBound are
+            // terminal metadata, not positional redirects from import_state.
+            let old_pos = op.pos;
+            op.pos = self.reserve_pos();
+            // Redirect the trace position to the fresh body result so that
+            // downstream ops reading the old position pick up the freshly
+            // computed value (matching RPython where the new body Box
+            // replaces the imported one in all subsequent consumers).
+            self.replace_op(old_pos, op.pos);
         } else {
             self.next_pos = self.next_pos.max(op.pos.0.saturating_add(1));
         }
@@ -1573,6 +1590,19 @@ impl OptContext {
         !matches!(
             &self.forwarded[idx],
             crate::optimizeopt::info::Forwarded::None
+        )
+    }
+
+    /// True only when opref has a positional redirect (Forwarded::Op).
+    /// Info/Const/IntBound are terminal metadata, not import_state redirects.
+    pub fn has_op_forwarding(&self, opref: OpRef) -> bool {
+        let idx = opref.0 as usize;
+        if idx >= self.forwarded.len() {
+            return false;
+        }
+        matches!(
+            &self.forwarded[idx],
+            crate::optimizeopt::info::Forwarded::Op(_)
         )
     }
 
