@@ -548,17 +548,6 @@ impl JitFrameDeadFrame {
     pub fn grab_exc_value(&self) -> GcRef {
         GcRef(unsafe { *((self.jf_gcref.0 + JF_GUARD_EXC_BYTES) as *const usize) })
     }
-
-    /// pyjitpl.py:3119-3123: exc_class = ptr2int(exception_obj.typeptr)
-    #[inline]
-    pub fn grab_exc_class(&self) -> i64 {
-        let exc_ref = self.grab_exc_value();
-        if exc_ref.is_null() {
-            0
-        } else {
-            unsafe { *(exc_ref.0 as *const i64) }
-        }
-    }
 }
 
 impl Drop for JitFrameDeadFrame {

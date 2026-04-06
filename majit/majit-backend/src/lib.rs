@@ -24,8 +24,6 @@ pub struct RawExecResult {
     pub force_token_slots: Vec<usize>,
     /// Optional saved-data GC ref captured by this exit.
     pub savedata: Option<GcRef>,
-    /// Pending exception class captured by this exit (0 = none).
-    pub exception_class: i64,
     /// Pending exception value captured by this exit (`GcRef::NULL` = none).
     pub exception_value: GcRef,
     /// Backend fail-index for this exit.
@@ -881,8 +879,8 @@ pub trait Backend: Send {
         let frame = self.execute_token(token, args);
         let descr = self.get_latest_descr(&frame);
         let exit_layout = self.describe_deadframe(&frame);
-        let savedata = self.grab_savedata_ref(&frame);
-        let (exception_class, exception_value) = self.grab_exception_state(&frame);
+        let savedata = self.get_savedata_ref(&frame);
+        let exception_value = self.grab_exc_value(&frame);
         let exit_arity = descr.fail_arg_types().len();
         let mut outputs = Vec::with_capacity(exit_arity);
         let mut typed_outputs = Vec::with_capacity(exit_arity);
@@ -915,7 +913,6 @@ pub trait Backend: Send {
             exit_layout,
             force_token_slots: descr.force_token_slots().to_vec(),
             savedata,
-            exception_class,
             exception_value,
             fail_index: descr.fail_index(),
             trace_id: descr.trace_id(),
@@ -1072,24 +1069,9 @@ pub trait Backend: Send {
         None
     }
 
-    /// Read the optional saved-data GC ref from a dead frame.
-    fn grab_savedata_ref(&self, _frame: &DeadFrame) -> Option<GcRef> {
-        None
-    }
-
-    /// Read the pending exception state from a dead frame.
-    fn grab_exception_state(&self, _frame: &DeadFrame) -> (i64, GcRef) {
-        (0, GcRef::NULL)
-    }
-
     /// Read a pending exception GC ref from a dead frame.
     fn grab_exc_value(&self, _frame: &DeadFrame) -> GcRef {
         GcRef::NULL
-    }
-
-    /// Read the pending exception class from a dead frame.
-    fn grab_exc_class(&self, _frame: &DeadFrame) -> i64 {
-        0
     }
 
     /// Read the FailDescr from the last guard failure.
