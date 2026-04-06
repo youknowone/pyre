@@ -2080,63 +2080,21 @@ impl OptContext {
         // which handles register_box, visitor_walk_recursive, and tagging.
         let mut pending_slice = op.rd_pendingfields.take().unwrap_or_default();
 
-        let (rd_numb, rd_consts, rd_virtuals, liveboxes, _livebox_types) =
+        let (rd_numb, rd_consts, rd_virtuals, liveboxes, livebox_types) =
             memo.finish(numb_state, &env, &mut pending_slice, None);
 
-        // fail_arg_types — majit-specific (RPython Box.type is intrinsic).
-        // Full type resolution cascade: constants, value_types, ops, snapshots.
+        // RPython Box.type parity: types captured at numbering time via
+        // env.get_type(), equivalent to RPython's intrinsic Box.type.
         let new_types: Vec<majit_ir::Type> = liveboxes
             .iter()
             .map(|opref| {
                 if opref.is_none() {
                     return majit_ir::Type::Ref;
                 }
-                let resolved = self.get_box_replacement(*opref);
-                if let Some(&tp) = self.constant_types_for_numbering.get(&resolved.0) {
-                    return tp;
-                }
-                if resolved != *opref {
-                    if let Some(&tp) = self.constant_types_for_numbering.get(&opref.0) {
-                        return tp;
-                    }
-                }
-                if let Some(val) = self.get_constant(resolved) {
-                    return val.get_type();
-                }
-                if let Some(&tp) = self.value_types.get(&resolved.0) {
-                    return tp;
-                }
-                if *opref != resolved {
-                    if let Some(&tp) = self.value_types.get(&opref.0) {
-                        return tp;
-                    }
-                }
-                if let Some(tp) = self.get_op_result_type(resolved) {
-                    return tp;
-                }
-                if let Some(&tp) = self.snapshot_box_types.get(&resolved.0) {
-                    return tp;
-                }
-                if resolved != *opref {
-                    if let Some(&tp) = self.snapshot_box_types.get(&opref.0) {
-                        return tp;
-                    }
-                }
-                if self.get_ptr_info(resolved).is_some() {
-                    return majit_ir::Type::Ref;
-                }
-                for o in self.new_operations.iter() {
-                    if o.pos == resolved && o.result_type() != majit_ir::Type::Void {
-                        return o.result_type();
-                    }
-                    if o.pos == *opref && o.result_type() != majit_ir::Type::Void {
-                        return o.result_type();
-                    }
-                }
-                panic!(
-                    "fail_arg_types: unknown type for OpRef({}) resolved=OpRef({})",
-                    opref.0, resolved.0
-                )
+                livebox_types
+                    .get(&opref.0)
+                    .copied()
+                    .unwrap_or(majit_ir::Type::Ref)
             })
             .collect();
 
