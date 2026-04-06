@@ -62,7 +62,7 @@ impl MIFrame {
         None
     }
 
-    fn next_instruction_consumes_comparison_truth(&self) -> bool {
+    pub(crate) fn next_instruction_consumes_comparison_truth(&self) -> bool {
         let code = unsafe { &*(*self.sym().jitcode).code };
         // RPython optimize_goto_if_not works on the semantic successor,
         // not on bytecode trivia like EXTENDED_ARG/NOT_TAKEN/CACHE.
@@ -114,12 +114,12 @@ impl MIFrame {
     }
 
     #[inline]
-    fn sym(&self) -> &PyreSym {
+    pub(crate) fn sym(&self) -> &PyreSym {
         unsafe { &*self.sym }
     }
 
     #[inline]
-    fn sym_mut(&mut self) -> &mut PyreSym {
+    pub(crate) fn sym_mut(&mut self) -> &mut PyreSym {
         unsafe { &mut *self.sym }
     }
 
@@ -1460,7 +1460,12 @@ impl MIFrame {
         }
     }
 
-    fn guard_object_class(&mut self, ctx: &mut TraceCtx, obj: OpRef, expected_type: *const PyType) {
+    pub(crate) fn guard_object_class(
+        &mut self,
+        ctx: &mut TraceCtx,
+        obj: OpRef,
+        expected_type: *const PyType,
+    ) {
         // heapcache.py: skip guard if class already known for this object
         if ctx.heap_cache().is_class_known(obj) {
             return;
@@ -1472,7 +1477,11 @@ impl MIFrame {
             .class_now_known(obj, majit_ir::GcRef(expected_type as usize));
     }
 
-    fn trace_guarded_int_payload(&mut self, ctx: &mut TraceCtx, int_obj: OpRef) -> OpRef {
+    pub(crate) fn trace_guarded_int_payload(
+        &mut self,
+        ctx: &mut TraceCtx,
+        int_obj: OpRef,
+    ) -> OpRef {
         if self.value_type(int_obj) == Type::Int {
             return int_obj;
         }
@@ -1501,7 +1510,7 @@ impl MIFrame {
     /// runtime integer index; they do not specialize every list access to an
     /// exact constant key. We follow that model here and only guard the
     /// key's sign/bounds for the current trace.
-    fn trace_dynamic_list_index(
+    pub(crate) fn trace_dynamic_list_index(
         &mut self,
         ctx: &mut TraceCtx,
         key: OpRef,
@@ -1637,7 +1646,7 @@ impl MIFrame {
         raw
     }
 
-    fn trace_direct_float_list_getitem(
+    pub(crate) fn trace_direct_float_list_getitem(
         &mut self,
         ctx: &mut TraceCtx,
         obj: OpRef,
@@ -2485,7 +2494,7 @@ impl MIFrame {
         range_iter_continues(concrete_iter)
     }
 
-    fn trace_known_builtin_call(
+    pub(crate) fn trace_known_builtin_call(
         &mut self,
         callable: OpRef,
         args: &[OpRef],
@@ -2496,7 +2505,7 @@ impl MIFrame {
         })
     }
 
-    fn direct_len_value(
+    pub(crate) fn direct_len_value(
         &mut self,
         callable: OpRef,
         value: OpRef,
