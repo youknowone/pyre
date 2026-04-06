@@ -2080,7 +2080,7 @@ impl OptContext {
         // which handles register_box, visitor_walk_recursive, and tagging.
         let mut pending_slice = op.rd_pendingfields.take().unwrap_or_default();
 
-        let (rd_numb, rd_consts, rd_virtuals, liveboxes) =
+        let (rd_numb, rd_consts, rd_virtuals, liveboxes, _livebox_types) =
             memo.finish(numb_state, &env, &mut pending_slice, None);
 
         // fail_arg_types — majit-specific (RPython Box.type is intrinsic).
