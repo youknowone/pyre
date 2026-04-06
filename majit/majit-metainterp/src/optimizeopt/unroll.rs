@@ -3487,13 +3487,18 @@ fn assemble_peeled_trace_with_jump_args(
         .unwrap_or(0);
     let mut max_pos = result_max.max(p1_all_max).max(source_slot_max);
     max_pos = next_free_pos(max_pos.saturating_add(1));
-    let mut alias_remap: HashMap<OpRef, OpRef> = HashMap::new();
+    // Split alias_remap into 3 namespace-scoped maps to prevent cross-namespace
+    // chain collisions. RPython Box identity prevents this — flat OpRef model needs
+    // explicit separation. See assembly_remap_refactor.md.
+    let mut imported_alias_remap: HashMap<OpRef, OpRef> = HashMap::new();
+    let mut label_rescue_remap: HashMap<OpRef, OpRef> = HashMap::new();
+    let mut label_dedup_remap: HashMap<OpRef, OpRef> = HashMap::new();
     for alias in imported_short_aliases {
         let pos = OpRef(max_pos);
         max_pos = next_free_pos(max_pos.saturating_add(1));
         let mut op = Op::new(alias.same_as_opcode, &[alias.same_as_source]);
         op.pos = pos;
-        alias_remap.insert(alias.result, pos);
+        imported_alias_remap.insert(alias.result, pos);
         result.push(op);
     }
 
@@ -3516,7 +3521,7 @@ fn assemble_peeled_trace_with_jump_args(
             }
         }
         // Alias results are also defined in the preamble.
-        for (&_from, &to) in &alias_remap {
+        for (&_from, &to) in &imported_alias_remap {
             s.insert(to);
         }
         s
@@ -3544,7 +3549,7 @@ fn assemble_peeled_trace_with_jump_args(
         .unwrap_or(0);
     let mut extra_pos = next_free_pos(preamble_max.max(label_pos).saturating_add(1));
     for &arg in &filtered_extra_label_args {
-        let mapped = alias_remap.get(&arg).copied().unwrap_or(arg);
+        let mapped = imported_alias_remap.get(&arg).copied().unwrap_or(arg);
         if !preamble_defs.contains(&mapped) {
             if let Some(&source) = short_source_map.get(&arg) {
                 if preamble_defs.contains(&source) {
@@ -3552,7 +3557,7 @@ fn assemble_peeled_trace_with_jump_args(
                     extra_pos = next_free_pos(extra_pos.saturating_add(1));
                     let mut op = Op::new(OpCode::SameAsI, &[source]);
                     op.pos = pos;
-                    alias_remap.insert(arg, pos);
+                    label_rescue_remap.insert(arg, pos);
                     result.push(op);
                 }
             }
@@ -3562,11 +3567,13 @@ fn assemble_peeled_trace_with_jump_args(
     // positions don't collide with the extra SameAs ops allocated above.
     max_pos = max_pos.max(extra_pos);
     let extra_label_start_idx = full_label_args.len();
-    full_label_args.extend(
-        filtered_extra_label_args
-            .iter()
-            .map(|arg| alias_remap.get(arg).copied().unwrap_or(*arg)),
-    );
+    full_label_args.extend(filtered_extra_label_args.iter().map(|arg| {
+        imported_alias_remap
+            .get(arg)
+            .or_else(|| label_rescue_remap.get(arg))
+            .copied()
+            .unwrap_or(*arg)
+    }));
 
     // RPython compile.py parity: after the loop label, only the loop-header
     // contract is live. When majit's detached redirected tail still mentions
@@ -3626,7 +3633,9 @@ fn assemble_peeled_trace_with_jump_args(
             }
             if label_set.contains(&arg)
                 || carried_source_slots.contains(&arg)
-                || alias_remap.contains_key(&arg)
+                || imported_alias_remap.contains_key(&arg)
+                || label_rescue_remap.contains_key(&arg)
+                || label_dedup_remap.contains_key(&arg)
                 || seen_body_defs.contains(&arg)
             {
                 continue;
@@ -3642,13 +3651,17 @@ fn assemble_peeled_trace_with_jump_args(
             // in the preamble to make its source visible.
             if !full_label_args.contains(&arg) {
                 if let Some(&source) = short_source_map.get(&arg) {
-                    if preamble_defs.contains(&source) && !alias_remap.contains_key(&arg) {
+                    if preamble_defs.contains(&source)
+                        && !imported_alias_remap.contains_key(&arg)
+                        && !label_rescue_remap.contains_key(&arg)
+                        && !label_dedup_remap.contains_key(&arg)
+                    {
                         let pos = OpRef(max_pos);
                         max_pos = next_free_pos(max_pos.saturating_add(1));
                         let same_as_opcode = OpCode::SameAsI; // default to Int
                         let mut op = Op::new(same_as_opcode, &[source]);
                         op.pos = pos;
-                        alias_remap.insert(arg, pos);
+                        label_rescue_remap.insert(arg, pos);
                         // Insert before the label (which is at the end of result)
                         result.push(op);
                         full_label_args.push(pos);
@@ -3693,9 +3706,9 @@ fn assemble_peeled_trace_with_jump_args(
             }
         }
         // Also remap body ops that reference the original duplicate OpRefs
-        // to the fresh aliases. Store in alias_remap for remap_body_arg.
+        // to the fresh aliases. Store in label_dedup_remap for remap_body_arg.
         for (fresh, original) in &label_scope_dedup {
-            alias_remap.insert(*original, *fresh);
+            label_dedup_remap.insert(*original, *fresh);
         }
     }
 
@@ -3730,7 +3743,9 @@ fn assemble_peeled_trace_with_jump_args(
     let visible_before_label: std::collections::HashSet<OpRef> = full_label_args
         .iter()
         .copied()
-        .chain(alias_remap.values().copied())
+        .chain(imported_alias_remap.values().copied())
+        .chain(label_rescue_remap.values().copied())
+        .chain(label_dedup_remap.values().copied())
         .chain(preamble_defs.iter().copied())
         .collect();
 
@@ -3776,65 +3791,55 @@ fn assemble_peeled_trace_with_jump_args(
         if let Some(&mapped_pos) = body_result_remap.get(&op.pos) {
             new_op.pos = mapped_pos;
         }
-        // RPython parity: short_source_map is NOT part of the runtime arg
-        // remap chain. It's only for body-use-before-def detection (which
-        // adds extra Label args and SameAs ops in the preamble). The
-        // input_remap already maps body args to label args including any
-        // extra args added from the short preamble.
+        // Single-step priority lookup per map — no iterative chain following.
+        // Each map operates on a distinct namespace; chaining across maps
+        // caused OpRef collisions (see assembly_remap_refactor.md).
         let remap_body_arg = |arg: OpRef,
                               label_scope_remap: &HashMap<OpRef, OpRef>,
                               input_remap: &HashMap<OpRef, OpRef>,
-                              alias_remap: &HashMap<OpRef, OpRef>,
-                              _short_source_map: &HashMap<OpRef, OpRef>,
+                              imported_alias_remap: &HashMap<OpRef, OpRef>,
+                              label_rescue_remap: &HashMap<OpRef, OpRef>,
+                              label_dedup_remap: &HashMap<OpRef, OpRef>,
                               body_result_remap: &HashMap<OpRef, OpRef>,
                               seen_body_defs: &std::collections::HashSet<OpRef>,
                               visible_before_label: &std::collections::HashSet<OpRef>|
          -> OpRef {
-            let mut current = arg;
-            for _ in 0..8 {
-                if let Some(&mapped) = label_scope_remap.get(&current) {
-                    if mapped != current {
-                        current = mapped;
-                        continue;
-                    }
-                }
-                // Body-redefined values: body_result_remap takes priority
-                // over input_remap. When the body redefines an OpRef that
-                // also has an input_remap entry (e.g., short preamble
-                // used_boxes), the JUMP should carry the body's new
-                // definition, not the label-start value.
-                if let Some(&mapped) = body_result_remap.get(&current) {
-                    if (seen_body_defs.contains(&current)
-                        || !visible_before_label.contains(&current))
-                        && mapped != current
-                    {
-                        current = mapped;
-                        continue;
-                    }
-                }
-                if let Some(&mapped) = input_remap.get(&current) {
-                    if mapped != current {
-                        current = mapped;
-                        continue;
-                    }
-                }
-                if let Some(&mapped) = alias_remap.get(&current) {
-                    if mapped != current {
-                        current = mapped;
-                        continue;
-                    }
-                }
-                break;
+            // 1. Inner label scope (takes full priority)
+            if let Some(&mapped) = label_scope_remap.get(&arg) {
+                return mapped;
             }
-            current
+            // 2. Body-redefined values take priority over input_remap
+            if let Some(&mapped) = body_result_remap.get(&arg) {
+                if seen_body_defs.contains(&arg) || !visible_before_label.contains(&arg) {
+                    return mapped;
+                }
+            }
+            // 3. input_remap — body inputarg → label arg
+            if let Some(&mapped) = input_remap.get(&arg) {
+                return mapped;
+            }
+            // 4. label_rescue_remap — body use-before-def → preamble SameAs
+            if let Some(&mapped) = label_rescue_remap.get(&arg) {
+                return mapped;
+            }
+            // 5. imported_alias_remap — imported short alias → fresh pos
+            if let Some(&mapped) = imported_alias_remap.get(&arg) {
+                return mapped;
+            }
+            // 6. label_dedup_remap — duplicate label arg → fresh dedup pos
+            if let Some(&mapped) = label_dedup_remap.get(&arg) {
+                return mapped;
+            }
+            arg
         };
         for arg in &mut new_op.args {
             *arg = remap_body_arg(
                 *arg,
                 &label_scope_remap,
                 &input_remap,
-                &alias_remap,
-                &short_source_map,
+                &imported_alias_remap,
+                &label_rescue_remap,
+                &label_dedup_remap,
                 &body_result_remap,
                 &seen_body_defs,
                 &visible_before_label,
@@ -3868,7 +3873,9 @@ fn assemble_peeled_trace_with_jump_args(
                         || seen_body_defs.contains(&arg)
                         || short_source_map.contains_key(&arg)
                         || input_remap.contains_key(&arg)
-                        || alias_remap.contains_key(&arg);
+                        || imported_alias_remap.contains_key(&arg)
+                        || label_rescue_remap.contains_key(&arg)
+                        || label_dedup_remap.contains_key(&arg);
                     if available_before_label {
                         extra_inner_set.insert(arg);
                         extra_inner_sources.push(arg);
@@ -3883,8 +3890,9 @@ fn assemble_peeled_trace_with_jump_args(
                     source_arg,
                     &label_scope_remap,
                     &input_remap,
-                    &alias_remap,
-                    &short_source_map,
+                    &imported_alias_remap,
+                    &label_rescue_remap,
+                    &label_dedup_remap,
                     &body_result_remap,
                     &seen_body_defs,
                     &visible_before_label,
@@ -3906,7 +3914,12 @@ fn assemble_peeled_trace_with_jump_args(
                     {
                         label_scope_remap.insert(imported_result, mapped_arg);
                     }
-                    if let Some(&aliased_result) = alias_remap.get(&source_arg) {
+                    // Check all alias maps for source_arg
+                    let aliased = imported_alias_remap
+                        .get(&source_arg)
+                        .or_else(|| label_rescue_remap.get(&source_arg))
+                        .or_else(|| label_dedup_remap.get(&source_arg));
+                    if let Some(&aliased_result) = aliased {
                         label_scope_remap.insert(aliased_result, mapped_arg);
                     }
                 }
@@ -3968,16 +3981,16 @@ fn assemble_peeled_trace_with_jump_args(
                             .unwrap_or(target_label_args[jump_args.len()])
                     };
                     // Extra args from the label are assembly-allocated positions.
-                    // They must NOT be remapped through alias_remap, which maps
-                    // body-scoped OpRefs. Use the label arg directly.
+                    // They must NOT be remapped through body-scoped maps.
                     let remapped = if label_set.contains(&extra_arg) {
-                        // This is a label arg position — use as-is.
                         extra_arg
                     } else {
                         input_remap
                             .get(&extra_arg)
                             .copied()
-                            .or_else(|| alias_remap.get(&extra_arg).copied())
+                            .or_else(|| imported_alias_remap.get(&extra_arg).copied())
+                            .or_else(|| label_rescue_remap.get(&extra_arg).copied())
+                            .or_else(|| label_dedup_remap.get(&extra_arg).copied())
                             .or_else(|| {
                                 body_result_remap
                                     .get(&extra_arg)
@@ -4006,40 +4019,24 @@ fn assemble_peeled_trace_with_jump_args(
         // the guard point (or parent capture point), not the body's
         // final state.  Use body_result_remap only for values that
         // are body-defined AND not visible before the label.
+        // Single-step priority lookup for fail_args (no chain iteration).
+        // fail_args capture guard-point state — body_result_remap only for
+        // values that are body-defined AND not visible before the label.
         if let Some(ref mut fa) = new_op.fail_args {
             for a in fa.iter_mut() {
-                let mut current = *a;
-                for _ in 0..8 {
-                    if let Some(&mapped) = label_scope_remap.get(&current) {
-                        if mapped != current {
-                            current = mapped;
-                            continue;
-                        }
-                    }
-                    if let Some(&mapped) = input_remap.get(&current) {
-                        if mapped != current {
-                            current = mapped;
-                            continue;
-                        }
-                    }
-                    if let Some(&mapped) = alias_remap.get(&current) {
-                        if mapped != current {
-                            current = mapped;
-                            continue;
-                        }
-                    }
-                    if let Some(&mapped) = body_result_remap.get(&current) {
-                        if seen_body_defs.contains(&current)
-                            && !visible_before_label.contains(&current)
-                            && mapped != current
-                        {
-                            current = mapped;
-                            continue;
-                        }
-                    }
-                    break;
-                }
-                *a = current;
+                *a = label_scope_remap
+                    .get(a)
+                    .copied()
+                    .or_else(|| input_remap.get(a).copied())
+                    .or_else(|| imported_alias_remap.get(a).copied())
+                    .or_else(|| label_rescue_remap.get(a).copied())
+                    .or_else(|| label_dedup_remap.get(a).copied())
+                    .or_else(|| {
+                        body_result_remap.get(a).copied().filter(|_| {
+                            seen_body_defs.contains(a) && !visible_before_label.contains(a)
+                        })
+                    })
+                    .unwrap_or(*a);
             }
         }
         if let Some(label_idx) = current_inner_label_index {
