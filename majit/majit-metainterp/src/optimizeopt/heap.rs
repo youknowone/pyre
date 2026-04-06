@@ -1188,7 +1188,15 @@ impl OptHeap {
             let mut cmp_op = Op::new(OpCode::IntNe, &[op.pos, zero_ref]);
             cmp_op.pos = cmp_pos;
             ctx.emit(cmp_op);
-            let guard_op = Op::new(OpCode::GuardTrue, &[cmp_pos]);
+            // unroll.py:409 parity: synthetic guards inherit
+            // rd_resume_position from patchguardop (the optimizer's
+            // running GUARD_FUTURE_CONDITION). Without this, the guard
+            // arrives at store_final_boxes_in_guard with -1 and would
+            // be silently dropped under the patchguardop-only fallback.
+            let mut guard_op = Op::new(OpCode::GuardTrue, &[cmp_pos]);
+            if let Some(ref patch) = ctx.patchguardop {
+                guard_op.rd_resume_position = patch.rd_resume_position;
+            }
             ctx.emit(guard_op);
             return OptimizationResult::Remove;
         }

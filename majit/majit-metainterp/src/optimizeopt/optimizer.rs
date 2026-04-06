@@ -2500,6 +2500,24 @@ impl Optimizer {
                     return;
                 }
                 OptimizationResult::Replace(op) => {
+                    // resoperation.py:498-503 GuardResOp.copy_and_change
+                    // parity: when an optimization pass replaces a guard
+                    // with another guard, the new op MUST inherit
+                    // rd_resume_position (and the rest of the guard
+                    // metadata). Producers are required to call
+                    // Op::copy_and_change which performs this copy.
+                    // If both ops are guards but the source had a valid
+                    // resume_position and the replacement does not, that
+                    // is a copy_and_change-bypass bug at the producer.
+                    debug_assert!(
+                        !(current_op.opcode.is_guard()
+                            && op.opcode.is_guard()
+                            && current_op.rd_resume_position >= 0
+                            && op.rd_resume_position < 0),
+                        "Replace dropped rd_resume_position: {:?} -> {:?}",
+                        current_op.opcode,
+                        op.opcode,
+                    );
                     current_op = op;
                 }
                 OptimizationResult::Remove => {

@@ -1519,18 +1519,18 @@ impl OptRewrite {
                     if let Some(old_idx) =
                         ctx.get_ptr_info(obj).and_then(|i| i.get_last_guard_pos())
                     {
-                        // rewrite.py:335-338: copy_and_change with fresh descr.
-                        let mut replacement =
-                            Op::new(OpCode::GuardValue, &[old_guard.arg(0), arg1]);
-                        replacement.pos = old_guard.pos;
-                        replacement.fail_args = old_guard.fail_args.clone();
-                        replacement.fail_arg_types = old_guard.fail_arg_types.clone();
-                        replacement.rd_resume_position = old_guard.rd_resume_position;
-                        replacement.rd_numb = old_guard.rd_numb.clone();
-                        replacement.rd_consts = old_guard.rd_consts.clone();
-                        replacement.rd_virtuals = old_guard.rd_virtuals.clone();
-                        // descr is intentionally NOT copied — fresh descr
-                        // (rewrite.py:335: descr = compile.ResumeGuardDescr())
+                        // rewrite.py:335-338 + resoperation.py:498-503
+                        // GuardResOp.copy_and_change parity: shallow copy
+                        // with new opcode/args/descr; fail_args, fail_arg_types,
+                        // rd_resume_position, rd_numb, rd_consts, rd_virtuals,
+                        // and rd_pendingfields are all carried automatically.
+                        // descr is set to None (fresh) per rewrite.py:335:
+                        //   descr = compile.ResumeGuardDescr()
+                        let replacement = old_guard.copy_and_change(
+                            OpCode::GuardValue,
+                            Some(&[old_guard.arg(0), arg1]),
+                            Some(None),
+                        );
                         // rewrite.py:343: self.optimizer.replace_guard(op, info)
                         ctx.new_operations[old_idx] = replacement;
                         // rewrite.py:345-346: info.reset_last_guard_pos()
@@ -1544,14 +1544,16 @@ impl OptRewrite {
             }
         }
 
-        // rewrite.py: _maybe_replace_guard_value
-        // If the expected value is 0 or 1 (boolean), replace GUARD_VALUE
-        // with GUARD_FALSE(arg0) or GUARD_TRUE(arg0). This is better because
-        // GUARD_TRUE/FALSE are foldable and can be eliminated by guard
-        // strengthening, while GUARD_VALUE cannot.
+        // optimizer.py:754-778 _maybe_replace_guard_value parity:
+        // Hack: turn guard_value(bool) into guard_true/guard_false. This
+        // is done after the operation is emitted to let
+        // store_final_boxes_in_guard set the guard_opnum field of the
+        // descr to the original GUARD_VALUE.
         //
-        // RPython also makes arg0 a known constant here, so that
-        // export_state carries it to Phase 2 via setinfo_from_preamble.
+        // RPython calls self.replace_op_with(op, opnum, [op.getarg(0)],
+        // descr) → optimizer.py:400 → op.copy_and_change(newopnum, args, descr)
+        // → resoperation.py:498-503 GuardResOp.copy_and_change which
+        // automatically copies fail_args AND rd_resume_position.
         if let Some(expected) = ctx.get_constant_int(arg1) {
             // RPython: GuardValue makes arg0 a known constant in the
             // optimizer context. Also set on the resolved target so
@@ -1560,17 +1562,11 @@ impl OptRewrite {
             let resolved_arg0 = ctx.get_box_replacement(arg0);
             ctx.make_constant(resolved_arg0, majit_ir::Value::Int(expected));
             if expected == 0 {
-                let mut new_op = Op::new(OpCode::GuardFalse, &[arg0]);
-                new_op.pos = op.pos;
-                new_op.descr = op.descr.clone();
-                new_op.fail_args = op.fail_args.clone();
+                let new_op = op.copy_and_change(OpCode::GuardFalse, Some(&[arg0]), None);
                 return OptimizationResult::Replace(new_op);
             }
             if expected == 1 {
-                let mut new_op = Op::new(OpCode::GuardTrue, &[arg0]);
-                new_op.pos = op.pos;
-                new_op.descr = op.descr.clone();
-                new_op.fail_args = op.fail_args.clone();
+                let new_op = op.copy_and_change(OpCode::GuardTrue, Some(&[arg0]), None);
                 return OptimizationResult::Replace(new_op);
             }
         }
@@ -1628,12 +1624,19 @@ impl OptRewrite {
                 // last_guard_pos is a _newoperations index.
                 let old_guard_idx = ctx.get_ptr_info(obj).and_then(|i| i.get_last_guard_pos());
                 if let Some(old_idx) = old_guard_idx {
-                    let mut combined =
-                        Op::new(OpCode::GuardNonnullClass, &[old_guard.arg(0), op.arg(1)]);
-                    combined.pos = old_guard.pos;
-                    combined.descr = old_guard.descr.clone();
-                    combined.fail_args = old_guard.fail_args.clone();
-                    combined.rd_resume_position = old_guard.rd_resume_position;
+                    // rewrite.py:417-420 + resoperation.py:498-503
+                    // GuardResOp.copy_and_change parity: preserves descr,
+                    // fail_args, rd_resume_position, AND the rd_numb /
+                    // rd_consts / rd_virtuals / rd_pendingfields that
+                    // majit's inline `store_final_boxes_in_guard` already
+                    // populated on the old guard. A manual field-by-field
+                    // copy would drop those and leave the replacement
+                    // guard without resume data at runtime.
+                    let combined = old_guard.copy_and_change(
+                        OpCode::GuardNonnullClass,
+                        Some(&[old_guard.arg(0), op.arg(1)]),
+                        None,
+                    );
                     ctx.new_operations[old_idx] = combined;
                     // postprocess: record known class
                     if let Some(class_val) = ctx.get_constant_int(op.arg(1)).or_else(|| {
