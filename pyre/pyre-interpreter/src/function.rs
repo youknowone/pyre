@@ -93,6 +93,9 @@ pub fn function_new_with_closure(
 }
 
 /// PyPy `function._get_immutable_code`.
+/// rlib/jit.py:180 — `@elidable_promote()`: the code pointer is immutable
+/// once can_change_code is false, so the JIT can constant-fold this.
+#[majit_macros::elidable_promote]
 #[inline]
 pub unsafe fn _get_immutable_code(func: PyObjectRef) -> *const () {
     unsafe { function_get_code(func) }
@@ -116,6 +119,7 @@ pub unsafe fn getcode(obj: PyObjectRef) -> *const () {
 ///
 /// # Safety
 /// `obj` must point to a valid `Function`.
+#[majit_macros::elidable]
 #[inline]
 pub unsafe fn function_get_code(obj: PyObjectRef) -> *const () {
     unsafe { (*(obj as *const Function)).code }

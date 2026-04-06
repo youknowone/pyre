@@ -12,6 +12,8 @@ host_env = []
 
 [dependencies]
 pyre-object = { workspace = true }
+majit-macros = { workspace = true }
+majit-metainterp = { workspace = true }
 stacker = "0.1"
 rustpython-compiler = { workspace = true }
 rustpython-compiler-core = { workspace = true }
