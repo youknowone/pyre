@@ -295,7 +295,9 @@ pub fn function_get_doc(obj: PyObjectRef) -> PyObjectRef {
 #[inline]
 pub fn function_set_doc(obj: PyObjectRef, value: PyObjectRef) {
     // function.py:401
-    let _ = unsafe { _check_code_mutable(obj, "func_doc") };
+    if unsafe { _check_code_mutable(obj, "func_doc") }.is_err() {
+        return;
+    }
     let _ = crate::setattr(obj, "__doc__", value);
 }
 
@@ -303,7 +305,9 @@ pub fn function_set_doc(obj: PyObjectRef, value: PyObjectRef) {
 #[inline]
 pub fn function_del_doc(obj: PyObjectRef) {
     // function.py:405
-    let _ = unsafe { _check_code_mutable(obj, "func_doc") };
+    if unsafe { _check_code_mutable(obj, "func_doc") }.is_err() {
+        return;
+    }
     let _ = crate::delattr(obj, "__doc__");
 }
 
@@ -322,7 +326,9 @@ pub unsafe fn fget_func_defaults(obj: PyObjectRef) -> PyObjectRef {
 #[inline]
 pub unsafe fn fset_func_defaults(obj: PyObjectRef, value: PyObjectRef) {
     // function.py:382
-    let _ = _check_code_mutable(obj, "func_defaults");
+    if _check_code_mutable(obj, "func_defaults").is_err() {
+        return;
+    }
     if value.is_null() || unsafe { pyre_object::is_none(value) } {
         function_set_defaults(obj, pyre_object::PY_NULL);
     } else {
@@ -334,7 +340,9 @@ pub unsafe fn fset_func_defaults(obj: PyObjectRef, value: PyObjectRef) {
 #[inline]
 pub unsafe fn fdel_func_defaults(obj: PyObjectRef) {
     // function.py:392
-    let _ = _check_code_mutable(obj, "func_defaults");
+    if _check_code_mutable(obj, "func_defaults").is_err() {
+        return;
+    }
     function_set_defaults(obj, pyre_object::PY_NULL);
 }
 
@@ -352,7 +360,9 @@ pub unsafe fn fget_func_kwdefaults(obj: PyObjectRef) -> PyObjectRef {
 /// function.py — `fset_func_kwdefaults` mutator.
 #[inline]
 pub unsafe fn fset_func_kwdefaults(obj: PyObjectRef, value: PyObjectRef) {
-    let _ = _check_code_mutable(obj, "func_kwdefaults");
+    if _check_code_mutable(obj, "func_kwdefaults").is_err() {
+        return;
+    }
     if value.is_null() || unsafe { pyre_object::is_none(value) } {
         function_set_kwdefaults(obj, pyre_object::PY_NULL);
     } else {
@@ -360,9 +370,12 @@ pub unsafe fn fset_func_kwdefaults(obj: PyObjectRef, value: PyObjectRef) {
     }
 }
 
-/// PyPy `fdel_func_kwdefaults` deleter.
+/// function.py — `fdel_func_kwdefaults` deleter.
 #[inline]
 pub unsafe fn fdel_func_kwdefaults(obj: PyObjectRef) {
+    if _check_code_mutable(obj, "func_kwdefaults").is_err() {
+        return;
+    }
     function_set_kwdefaults(obj, pyre_object::PY_NULL);
 }
 
@@ -404,7 +417,9 @@ pub unsafe fn function_set_func_name(obj: PyObjectRef, name: PyObjectRef) {
 #[inline]
 pub unsafe fn fset_func_name(obj: PyObjectRef, name: PyObjectRef) {
     // function.py:412
-    let _ = _check_code_mutable(obj, "func_name");
+    if _check_code_mutable(obj, "func_name").is_err() {
+        return;
+    }
     function_set_func_name(obj, name)
 }
 
@@ -492,13 +507,34 @@ pub unsafe fn descr_function__new__(
     function_new_with_closure(code, name, w_globals, closure)
 }
 
-/// PyPy-compatible `__module__` setter.
+/// function.py:427 — `fset___module__` setter.
 #[inline]
-pub unsafe fn fset___module__(_obj: PyObjectRef, _value: PyObjectRef) {}
+pub unsafe fn fset___module__(obj: PyObjectRef, value: PyObjectRef) {
+    // function.py:428
+    if _check_code_mutable(obj, "func_name").is_err() {
+        return;
+    }
+    // function.py:429: self.w_module = w_module
+    // Store in the globals namespace under __module__ key.
+    let globals = function_get_globals(obj);
+    if !globals.is_null() {
+        (*globals).insert("__module__".to_string(), value);
+    }
+}
 
-/// PyPy-compatible `__module__` deleter.
+/// function.py:431 — `fdel___module__` deleter.
 #[inline]
-pub unsafe fn fdel___module__(_obj: PyObjectRef) {}
+pub unsafe fn fdel___module__(obj: PyObjectRef) {
+    // function.py:432
+    if _check_code_mutable(obj, "func_name").is_err() {
+        return;
+    }
+    // function.py:433: self.w_module = space.w_None
+    let globals = function_get_globals(obj);
+    if !globals.is_null() {
+        (*globals).insert("__module__".to_string(), pyre_object::w_none());
+    }
+}
 
 /// PyPy-compatible `descr_function__new__` overload.
 #[inline]
