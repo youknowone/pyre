@@ -780,10 +780,20 @@ pub trait Backend: Send {
         // Default no-op — backends that support bridge re-entry override this.
     }
 
-    /// Cranelift-specific: migrate existing bridges from old token to new
-    /// token after retrace. RPython doesn't need this because x86 patches
-    /// machine code in-place. Cranelift can't patch, so bridges must be
-    /// explicitly copied when the compiled loop is replaced.
+    /// Cranelift workaround — no RPython counterpart.
+    ///
+    /// RPython's x86/ARM backends patch guard failure jump targets in-place,
+    /// so bridges survive retrace automatically. Cranelift cannot patch
+    /// emitted machine code, so when a loop is retraced (producing a new
+    /// token), existing bridges from the old token must be explicitly copied
+    /// to matching guards in the new token.
+    ///
+    /// Called from metainterp after compile_loop, because only the metainterp
+    /// has access to both old_token (from compiled_loops.remove) and new_token
+    /// (from compile_loop). compile_loop itself only receives the new token.
+    ///
+    /// Backends that support in-place patching (e.g. dynasm) leave this as
+    /// no-op — bridges are attached to the guard's machine code directly.
     fn migrate_bridges(&self, _old_token: &JitCellToken, _new_token: &JitCellToken) {}
 
     /// compile.py:741-745: look up (status, descr_addr) for a guard.
@@ -817,28 +827,6 @@ pub trait Backend: Send {
     ) {
     }
 
-    /// compile.py:786-788: start_compiling — set ST_BUSY_FLAG on descriptor.
-    /// Returns true if descriptor was found in this token.
-    fn start_guard_compiling(
-        &self,
-        _token: &JitCellToken,
-        _trace_id: u64,
-        _fail_index: u32,
-    ) -> bool {
-        false
-    }
-
-    /// compile.py:790-795: done_compiling — clear ST_BUSY_FLAG on descriptor.
-    /// Returns true if descriptor was found in this token.
-    fn done_guard_compiling(
-        &self,
-        _token: &JitCellToken,
-        _trace_id: u64,
-        _fail_index: u32,
-    ) -> bool {
-        false
-    }
-
     /// compile.py:741: self.status — read status from the failed descriptor
     /// directly by its raw address (no re-lookup). RPython calls self.status
     /// on the same descriptor object; descr_addr IS that object's identity.
@@ -851,12 +839,17 @@ pub trait Backend: Send {
         0
     }
 
-    /// compile.py:786-788: self.start_compiling() — on the exact failed
-    /// descriptor. Sets ST_BUSY_FLAG via the raw address.
+    /// compile.py:786-788: `self.start_compiling()`.
+    ///
+    /// RPython calls `self.status |= ST_BUSY_FLAG` directly on the
+    /// descriptor. In Rust, the descriptor is behind a trait object and
+    /// Arc, so we pass `descr_addr` (the Arc's raw pointer from the guard
+    /// failure result) and let the backend cast it back. This is the Rust
+    /// equivalent of RPython's `self` — both identify the exact descriptor.
     fn start_compiling_descr(&self, _descr_addr: usize) {}
 
-    /// compile.py:790-795: self.done_compiling() — on the exact failed
-    /// descriptor. Clears ST_BUSY_FLAG via the raw address.
+    /// compile.py:790-795: `self.done_compiling()`.
+    /// Same pattern as start_compiling_descr — see above.
     fn done_compiling_descr(&self, _descr_addr: usize) {}
 
     /// Execute compiled code starting at the given token.

@@ -2285,7 +2285,9 @@ impl<M: Clone> MetaInterp<M> {
                 // external target_token JUMPs can redirect to them.
                 let mut previous_tokens: Vec<JitCellToken> = Vec::new();
                 if let Some(old_entry) = self.compiled_loops.remove(&green_key) {
-                    // Cranelift-specific: migrate existing bridges to new token.
+                    // Cranelift workaround (no RPython counterpart): copy
+                    // bridges from old token to new, since Cranelift cannot
+                    // patch machine code in-place. No-op for dynasm.
                     self.backend.migrate_bridges(&old_entry.token, &token);
                     previous_tokens.push(old_entry.token);
                     previous_tokens.extend(old_entry.previous_tokens);
@@ -2900,7 +2902,9 @@ impl<M: Clone> MetaInterp<M> {
 
                 let mut previous_tokens: Vec<JitCellToken> = Vec::new();
                 if let Some(old_entry) = self.compiled_loops.remove(&green_key) {
-                    // Cranelift-specific: migrate existing bridges to new token.
+                    // Cranelift workaround (no RPython counterpart): copy
+                    // bridges from old token to new, since Cranelift cannot
+                    // patch machine code in-place. No-op for dynasm.
                     self.backend.migrate_bridges(&old_entry.token, &token);
                     previous_tokens.push(old_entry.token);
                     previous_tokens.extend(old_entry.previous_tokens);

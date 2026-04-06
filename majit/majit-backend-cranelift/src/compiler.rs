@@ -9414,38 +9414,6 @@ impl majit_backend::Backend for CraneliftBackend {
         }
     }
 
-    fn start_guard_compiling(&self, token: &JitCellToken, trace_id: u64, fail_index: u32) -> bool {
-        let compiled = token
-            .compiled
-            .as_ref()
-            .and_then(|c| c.downcast_ref::<CompiledLoop>());
-        if let Some(compiled) = compiled {
-            if let Some(descr) =
-                find_fail_descr_in_fail_descrs(&compiled.fail_descrs, trace_id, fail_index)
-            {
-                descr.start_compiling();
-                return true;
-            }
-        }
-        false
-    }
-
-    fn done_guard_compiling(&self, token: &JitCellToken, trace_id: u64, fail_index: u32) -> bool {
-        let compiled = token
-            .compiled
-            .as_ref()
-            .and_then(|c| c.downcast_ref::<CompiledLoop>());
-        if let Some(compiled) = compiled {
-            if let Some(descr) =
-                find_fail_descr_in_fail_descrs(&compiled.fail_descrs, trace_id, fail_index)
-            {
-                descr.done_compiling();
-                return true;
-            }
-        }
-        false
-    }
-
     fn read_descr_status(&self, descr_addr: usize) -> u64 {
         if descr_addr == 0 {
             return 0;
