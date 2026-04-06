@@ -1,30 +1,32 @@
 /// The bytecode interpreter for the calc language.
-
 use crate::bytecode::ByteCode;
-use majit_metainterp::{conditional_call, record_known_result};
+use majit_metainterp::record_known_result;
 
-/// Pure comparison — @elidable_promote.
-/// rlib/jit.py:180 — promotes both arguments, then calls the elidable body.
-/// The JIT emits guard_value on both operands and constant-folds the result.
-#[majit_macros::elidable_promote]
-fn calc_lt(a: i64, b: i64) -> i64 { if a < b { 1 } else { 0 } }
-#[majit_macros::elidable_promote]
-fn calc_le(a: i64, b: i64) -> i64 { if a <= b { 1 } else { 0 } }
-#[majit_macros::elidable_promote]
-fn calc_eq(a: i64, b: i64) -> i64 { if a == b { 1 } else { 0 } }
-#[majit_macros::elidable_promote]
-fn calc_ne(a: i64, b: i64) -> i64 { if a != b { 1 } else { 0 } }
-#[majit_macros::elidable_promote]
-fn calc_gt(a: i64, b: i64) -> i64 { if a > b { 1 } else { 0 } }
-#[majit_macros::elidable_promote]
-fn calc_ge(a: i64, b: i64) -> i64 { if a >= b { 1 } else { 0 } }
-
-/// Debug logging — @not_in_trace.
-/// rlib/jit.py:260 — disappears from JIT traces, only called in interpreter mode.
-#[majit_macros::not_in_trace]
-fn debug_trace_opcode(_pc: usize, _name: &str) {
-    // In debug builds, this could log the executing opcode.
-    // The JIT skips this call entirely in compiled traces.
+/// Pure comparison — @elidable.
+/// The JIT can constant-fold this when both arguments are known.
+#[majit_macros::elidable]
+fn calc_lt(a: i64, b: i64) -> i64 {
+    if a < b { 1 } else { 0 }
+}
+#[majit_macros::elidable]
+fn calc_le(a: i64, b: i64) -> i64 {
+    if a <= b { 1 } else { 0 }
+}
+#[majit_macros::elidable]
+fn calc_eq(a: i64, b: i64) -> i64 {
+    if a == b { 1 } else { 0 }
+}
+#[majit_macros::elidable]
+fn calc_ne(a: i64, b: i64) -> i64 {
+    if a != b { 1 } else { 0 }
+}
+#[majit_macros::elidable]
+fn calc_gt(a: i64, b: i64) -> i64 {
+    if a > b { 1 } else { 0 }
+}
+#[majit_macros::elidable]
+fn calc_ge(a: i64, b: i64) -> i64 {
+    if a >= b { 1 } else { 0 }
 }
 
 pub struct CalcInterp {
@@ -55,7 +57,6 @@ impl CalcInterp {
     /// or 0 if the stack is empty.
     pub fn run(&mut self, bytecode: &[ByteCode]) -> i64 {
         loop {
-            debug_trace_opcode(self.pc, "calc_step");
             let instr = &bytecode[self.pc];
             self.pc += 1;
             match instr {
@@ -82,8 +83,6 @@ impl CalcInterp {
                 ByteCode::Ge => self.cmpop_elidable(calc_ge),
                 ByteCode::JumpIfFalse(target) => {
                     let val = self.stack.pop().expect("stack underflow on JumpIfFalse");
-                    // rlib/jit.py:1301 — conditional_call: bridge-free code
-                    conditional_call!(val != 0, debug_trace_opcode, self.pc, "branch_not_taken");
                     if val == 0 {
                         self.pc = *target as usize;
                     }

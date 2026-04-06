@@ -8,7 +8,6 @@
 /// Reds:   [inputarg, stack]
 /// Virtualizables: [stack]  — tl.py:14, tl.py:71
 use majit_metainterp::jit::promote;
-use majit_metainterp::{conditional_call, record_known_result};
 
 /// Stack rotation — @dont_look_inside in RPython (tl.py:43).
 ///
@@ -41,45 +40,6 @@ extern "C" fn storage_roll(stack_ptr: usize, stackpos: i64, r: i64) {
         let n = len - 1;
         stack[n] = elem;
     }
-}
-
-/// Pure comparison — @elidable_promote.
-/// rlib/jit.py:180 — promotes both arguments, then calls the elidable body.
-#[majit_macros::elidable_promote]
-fn tl_eq(b: i64, a: i64) -> i64 {
-    if b == a { 1 } else { 0 }
-}
-
-#[majit_macros::elidable_promote]
-fn tl_ne(b: i64, a: i64) -> i64 {
-    if b != a { 1 } else { 0 }
-}
-
-#[majit_macros::elidable_promote]
-fn tl_lt(b: i64, a: i64) -> i64 {
-    if b < a { 1 } else { 0 }
-}
-
-#[majit_macros::elidable_promote]
-fn tl_le(b: i64, a: i64) -> i64 {
-    if b <= a { 1 } else { 0 }
-}
-
-#[majit_macros::elidable_promote]
-fn tl_gt(b: i64, a: i64) -> i64 {
-    if b > a { 1 } else { 0 }
-}
-
-#[majit_macros::elidable_promote]
-fn tl_ge(b: i64, a: i64) -> i64 {
-    if b >= a { 1 } else { 0 }
-}
-
-/// Debug tracing — @not_in_trace.
-/// rlib/jit.py:260 — disappears from compiled traces.
-#[majit_macros::not_in_trace]
-fn tl_debug_opcode(_pc: usize, _opcode: usize) {
-    // Interpreter-only logging; the JIT elides this call.
 }
 
 // ── Storage pool types ──
@@ -303,14 +263,12 @@ pub fn mainloop(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 {
 
         let opcode = program[pc];
         pc += 1;
-        tl_debug_opcode(pc - 1, opcode as usize);
 
         match opcode {
             NOP => {}
             // tl.py:94-96
             PUSH => {
                 let value = program[pc] as i8 as i64;
-                let value = promote(value); // bytecode operand is trace-constant
                 pc += 1;
                 state.pool.get_mut(state.selected).push(value);
             }
@@ -349,49 +307,54 @@ pub fn mainloop(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 {
             MUL => state.pool.get_mut(state.selected).mul(),
             // tl.py:131-133
             DIV => state.pool.get_mut(state.selected).div(),
-            // tl.py:135-137 — comparison ops use @elidable helpers
-            // so the JIT can constant-fold when both operands are known.
+            // tl.py:135-157 — inline comparison, no helper functions
             EQ => {
                 let a = state.pool.get_mut(state.selected).pop();
                 let b = state.pool.get_mut(state.selected).pop();
-                let result = tl_eq(b, a);
-                record_known_result!(result, tl_eq, b, a);
-                state.pool.get_mut(state.selected).push(result);
+                state
+                    .pool
+                    .get_mut(state.selected)
+                    .push(if b == a { 1 } else { 0 });
             }
             NE => {
                 let a = state.pool.get_mut(state.selected).pop();
                 let b = state.pool.get_mut(state.selected).pop();
-                let result = tl_ne(b, a);
-                record_known_result!(result, tl_ne, b, a);
-                state.pool.get_mut(state.selected).push(result);
+                state
+                    .pool
+                    .get_mut(state.selected)
+                    .push(if b != a { 1 } else { 0 });
             }
             LT => {
                 let a = state.pool.get_mut(state.selected).pop();
                 let b = state.pool.get_mut(state.selected).pop();
-                let result = tl_lt(b, a);
-                record_known_result!(result, tl_lt, b, a);
-                state.pool.get_mut(state.selected).push(result);
+                state
+                    .pool
+                    .get_mut(state.selected)
+                    .push(if b < a { 1 } else { 0 });
             }
             LE => {
                 let a = state.pool.get_mut(state.selected).pop();
                 let b = state.pool.get_mut(state.selected).pop();
-                let result = tl_le(b, a);
-                record_known_result!(result, tl_le, b, a);
-                state.pool.get_mut(state.selected).push(result);
+                state
+                    .pool
+                    .get_mut(state.selected)
+                    .push(if b <= a { 1 } else { 0 });
             }
             GT => {
                 let a = state.pool.get_mut(state.selected).pop();
                 let b = state.pool.get_mut(state.selected).pop();
-                let result = tl_gt(b, a);
-                record_known_result!(result, tl_gt, b, a);
-                state.pool.get_mut(state.selected).push(result);
+                state
+                    .pool
+                    .get_mut(state.selected)
+                    .push(if b > a { 1 } else { 0 });
             }
             GE => {
                 let a = state.pool.get_mut(state.selected).pop();
                 let b = state.pool.get_mut(state.selected).pop();
-                let result = tl_ge(b, a);
-                record_known_result!(result, tl_ge, b, a);
-                state.pool.get_mut(state.selected).push(result);
+                state
+                    .pool
+                    .get_mut(state.selected)
+                    .push(if b >= a { 1 } else { 0 });
             }
             // tl.py:159-165
             BR_COND => {
@@ -400,8 +363,6 @@ pub fn mainloop(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 {
                 pc += 1;
                 let cond = state.pool.get_mut(state.selected).pop();
                 let jump = cond != 0;
-                // rlib/jit.py:1301 — conditional_call: bridge-free fallthrough
-                conditional_call!(!jump, tl_debug_opcode, pc, b'_' as usize);
                 if jump {
                     if target <= pc {
                         can_enter_jit!(driver, target, &mut state, program, || {});
