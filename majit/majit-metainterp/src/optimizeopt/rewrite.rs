@@ -1578,6 +1578,96 @@ impl OptRewrite {
         OptimizationResult::PassOn
     }
 
+    /// rewrite.py:397-436 optimize_GUARD_CLASS / postprocess_GUARD_CLASS.
+    ///
+    /// Shared by GuardClass and GuardNonnullClass — RPython
+    /// `optimize_GUARD_NONNULL_CLASS` (rewrite.py:438-444) delegates to
+    /// `optimize_GUARD_CLASS` after the null check, so both opcodes go
+    /// through the same known-class / strengthening / postprocess logic.
+    fn optimize_guard_class(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+        let obj = ctx.get_box_replacement(op.arg(0));
+        // rewrite.py:401-407: info.get_known_class(cpu); if mismatched,
+        // the guard is proven to always fail.
+        if let Some(known_class) = ctx
+            .get_ptr_info(obj)
+            .and_then(|i| i.get_known_class())
+            .cloned()
+        {
+            if op.num_args() >= 2 {
+                // Class pointer may be Value::Int or Value::Ref.
+                let expected = ctx.get_constant_int(op.arg(1)).or_else(|| {
+                    ctx.get_constant(op.arg(1)).and_then(|v| match v {
+                        majit_ir::Value::Ref(r) => Some(r.0 as i64),
+                        _ => None,
+                    })
+                });
+                if let Some(expected) = expected {
+                    if known_class.0 as i64 == expected {
+                        return OptimizationResult::Remove;
+                    }
+                    // rewrite.py:404-407: known class mismatch is a
+                    // proven-fail guard — abort the trace.
+                    raise_invalid_loop("GUARD_CLASS proven to always fail");
+                }
+            }
+        }
+        // rewrite.py:408-427: guard strengthening.
+        // If there was a previous GUARD_NONNULL on the same value,
+        // replace it with GUARD_NONNULL_CLASS (combining both checks).
+        if let Some(old_guard) = ctx.get_last_guard(obj) {
+            if old_guard.opcode == OpCode::GuardNonnull && op.num_args() >= 2 {
+                // last_guard_pos is a _newoperations index.
+                let old_guard_idx = ctx.get_ptr_info(obj).and_then(|i| i.get_last_guard_pos());
+                if let Some(old_idx) = old_guard_idx {
+                    let mut combined =
+                        Op::new(OpCode::GuardNonnullClass, &[old_guard.arg(0), op.arg(1)]);
+                    combined.pos = old_guard.pos;
+                    combined.descr = old_guard.descr.clone();
+                    combined.fail_args = old_guard.fail_args.clone();
+                    combined.rd_resume_position = old_guard.rd_resume_position;
+                    ctx.new_operations[old_idx] = combined;
+                    // postprocess: record known class
+                    if let Some(class_val) = ctx.get_constant_int(op.arg(1)).or_else(|| {
+                        ctx.get_constant(op.arg(1)).and_then(|v| match v {
+                            majit_ir::Value::Ref(r) => Some(r.0 as i64),
+                            _ => None,
+                        })
+                    }) {
+                        ctx.set_ptr_info(
+                            obj,
+                            crate::optimizeopt::info::PtrInfo::known_class(
+                                majit_ir::GcRef(class_val as usize),
+                                true,
+                            ),
+                        );
+                    }
+                    return OptimizationResult::Remove;
+                }
+            }
+        }
+        // rewrite.py:430-436 postprocess_GUARD_CLASS: runs AFTER emit.
+        // Register deferred postprocess — executed by emit_operation
+        // after the guard is added to new_operations.
+        if op.num_args() >= 2 {
+            if let Some(class_val) = ctx.get_constant_int(op.arg(1)).or_else(|| {
+                ctx.get_constant(op.arg(1)).and_then(|v| match v {
+                    majit_ir::Value::Ref(r) => Some(r.0 as i64),
+                    _ => None,
+                })
+            }) {
+                let is_virtual = ctx
+                    .get_ptr_info(obj)
+                    .map(|info| info.is_virtual())
+                    .unwrap_or(false);
+                if !is_virtual {
+                    ctx.pending_guard_class_postprocess =
+                        Some(crate::optimizeopt::PendingGuardClassPostprocess { obj, class_val });
+                }
+            }
+        }
+        OptimizationResult::PassOn
+    }
+
     // ── SAME_AS identity ──
 
     /// SAME_AS_I/R/F(x) -> x
@@ -2388,131 +2478,24 @@ impl Optimization for OptRewrite {
                 }
                 OptimizationResult::PassOn
             }
-            OpCode::GuardClass => {
-                // rewrite.py:397-428 optimize_GUARD_CLASS
-                let obj = ctx.get_box_replacement(op.arg(0));
-                if let Some(known_class) = ctx
-                    .get_ptr_info(obj)
-                    .and_then(|i| i.get_known_class())
-                    .cloned()
-                {
-                    if op.num_args() >= 2 {
-                        if let Some(expected) = ctx.get_constant_int(op.arg(1)) {
-                            if known_class.0 as i64 == expected {
-                                return OptimizationResult::Remove;
-                            }
-                            return OptimizationResult::PassOn;
-                        }
-                    }
-                }
-                // rewrite.py:408-427: guard strengthening.
-                // If there was a previous GUARD_NONNULL on the same value,
-                // replace it with GUARD_NONNULL_CLASS (combining both checks).
-                if let Some(old_guard) = ctx.get_last_guard(obj) {
-                    if old_guard.opcode == OpCode::GuardNonnull && op.num_args() >= 2 {
-                        // rewrite.py:408-427: replace GUARD_NONNULL with GUARD_NONNULL_CLASS.
-                        // last_guard_pos is _newoperations index.
-                        let old_guard_idx =
-                            ctx.get_ptr_info(obj).and_then(|i| i.get_last_guard_pos());
-                        if let Some(old_idx) = old_guard_idx {
-                            let mut combined =
-                                Op::new(OpCode::GuardNonnullClass, &[old_guard.arg(0), op.arg(1)]);
-                            combined.pos = old_guard.pos;
-                            combined.descr = old_guard.descr.clone();
-                            combined.fail_args = old_guard.fail_args.clone();
-                            combined.rd_resume_position = old_guard.rd_resume_position;
-                            ctx.new_operations[old_idx] = combined;
-                            // postprocess: record known class
-                            if let Some(class_val) = ctx.get_constant_int(op.arg(1)) {
-                                ctx.set_ptr_info(
-                                    obj,
-                                    crate::optimizeopt::info::PtrInfo::known_class(
-                                        majit_ir::GcRef(class_val as usize),
-                                        true,
-                                    ),
-                                );
-                            }
-                            return OptimizationResult::Remove;
-                        }
-                    }
-                }
-                // rewrite.py:430-436 postprocess_GUARD_CLASS: runs AFTER emit.
-                // Register deferred postprocess — executed by emit_operation
-                // after the guard is added to new_operations.
-                if op.num_args() >= 2 {
-                    if let Some(class_val) = ctx.get_constant_int(op.arg(1)) {
-                        let is_virtual = ctx
-                            .get_ptr_info(obj)
-                            .map(|info| info.is_virtual())
-                            .unwrap_or(false);
-                        if !is_virtual {
-                            ctx.pending_guard_class_postprocess =
-                                Some(crate::optimizeopt::PendingGuardClassPostprocess {
-                                    obj,
-                                    class_val,
-                                });
-                        }
-                    }
-                }
-                OptimizationResult::PassOn
-            }
+            OpCode::GuardClass => self.optimize_guard_class(op, ctx),
             OpCode::GuardNonnullClass => {
-                let obj = ctx.get_box_replacement(op.arg(0));
-                if let Some(known_class) = ctx
-                    .get_ptr_info(obj)
-                    .and_then(|i| i.get_known_class())
-                    .cloned()
-                {
-                    if op.num_args() >= 2 {
-                        // Class pointer may be stored as Value::Int or Value::Ref
-                        let expected = ctx.get_constant_int(op.arg(1)).or_else(|| {
-                            ctx.get_constant(op.arg(1)).and_then(|v| match v {
-                                majit_ir::Value::Ref(r) => Some(r.0 as i64),
-                                _ => None,
-                            })
-                        });
-                        if let Some(expected) = expected {
-                            if known_class.0 as i64 == expected {
-                                return OptimizationResult::Remove;
-                            }
-                        }
+                // rewrite.py:438-444 optimize_GUARD_NONNULL_CLASS:
+                //     info = getptrinfo(op.getarg(0))
+                //     if info and info.is_null():
+                //         raise InvalidLoop(...)
+                //     return self.optimize_GUARD_CLASS(op)
+                //
+                // RPython's `getptrinfo(ConstPtr)` synthesizes a
+                // `ConstPtrInfo` (info.py:888-889), so a null `ConstPtr`
+                // is also caught here. `OptContext::getptrinfo` mirrors
+                // that synthesis.
+                if let Some(info) = ctx.getptrinfo(op.arg(0)) {
+                    if info.is_null() {
+                        raise_invalid_loop("GUARD_NONNULL_CLASS proven to always fail");
                     }
                 }
-                // If obj is known non-null constant, downgrade to GUARD_CLASS.
-                if let Some(v) = ctx.get_constant_int(op.arg(0)) {
-                    if v != 0 {
-                        let mut new_op = Op::new(OpCode::GuardClass, &op.args);
-                        new_op.pos = op.pos;
-                        new_op.descr = op.descr.clone();
-                        new_op.fail_args = op.fail_args.clone();
-                        return OptimizationResult::Replace(new_op);
-                    }
-                }
-                // postprocess: record known class
-                if op.num_args() >= 2 {
-                    // Class pointer may be Value::Int or Value::Ref
-                    if let Some(class_val) = ctx.get_constant_int(op.arg(1)).or_else(|| {
-                        ctx.get_constant(op.arg(1)).and_then(|v| match v {
-                            majit_ir::Value::Ref(r) => Some(r.0 as i64),
-                            _ => None,
-                        })
-                    }) {
-                        let should_record = ctx
-                            .get_ptr_info(obj)
-                            .map(|info| !info.is_virtual())
-                            .unwrap_or(true);
-                        if should_record {
-                            ctx.set_ptr_info(
-                                obj,
-                                crate::optimizeopt::info::PtrInfo::known_class(
-                                    majit_ir::GcRef(class_val as usize),
-                                    true,
-                                ),
-                            );
-                        }
-                    }
-                }
-                OptimizationResult::PassOn
+                self.optimize_guard_class(op, ctx)
             }
             // rewrite.py: GUARD_IS_OBJECT — if arg is a known constant, the guard
             // was already checked at recording time and can be removed.

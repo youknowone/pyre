@@ -2316,7 +2316,10 @@ impl OptContext {
 
     // ── info.py: per-OpRef pointer info ──
 
-    /// info.py: getptrinfo(op) — get PtrInfo for an OpRef.
+    /// Read the forwarded `PtrInfo` slot for an OpRef without synthesizing
+    /// `ConstPtrInfo` for constant pointers. Callers that need the
+    /// RPython-faithful lookup (which also sees constants as
+    /// `ConstPtrInfo`) should use `getptrinfo` instead.
     pub fn get_ptr_info(&self, opref: OpRef) -> Option<&PtrInfo> {
         use crate::optimizeopt::info::Forwarded;
         let r = self.get_box_replacement(opref);
@@ -2324,6 +2327,36 @@ impl OptContext {
             Forwarded::Info(info) => Some(info),
             _ => None,
         }
+    }
+
+    /// info.py:880-894 `getptrinfo(op)` parity. RPython's `getptrinfo`
+    /// returns a freshly-constructed `ConstPtrInfo(op)` when `op` is a
+    /// `ConstPtr`, even when no info has been forwarded. majit mirrors
+    /// that here by synthesizing `PtrInfo::Constant(gcref)` for constant
+    /// Refs, otherwise borrowing the forwarded info. Returns a `Cow` so
+    /// callers can read the result without forcing an allocation in the
+    /// common forwarded case.
+    pub fn getptrinfo(&self, opref: OpRef) -> Option<std::borrow::Cow<'_, PtrInfo>> {
+        let resolved = self.get_box_replacement(opref);
+        // info.py:888-889: isinstance(op, ConstPtr) → ConstPtrInfo(op).
+        // majit constants may be stored as Value::Ref(gcref) or as
+        // Value::Int(0) (a NULL ref encoded as integer). Synthesize
+        // PtrInfo::Constant in both cases so `is_null` / `is_nonnull`
+        // behave like RPython's ConstPtrInfo.
+        if let Some(value) = self.get_constant(resolved) {
+            match value {
+                Value::Ref(gcref) => {
+                    return Some(std::borrow::Cow::Owned(PtrInfo::Constant(*gcref)));
+                }
+                Value::Int(0) => {
+                    return Some(std::borrow::Cow::Owned(PtrInfo::Constant(majit_ir::GcRef(
+                        0,
+                    ))));
+                }
+                _ => {}
+            }
+        }
+        self.get_ptr_info(resolved).map(std::borrow::Cow::Borrowed)
     }
 
     /// Extract known class from PtrInfo, if available.
