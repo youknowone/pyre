@@ -2011,6 +2011,41 @@ impl MIFrame {
     ) -> Result<OpRef, PyError> {
         // Power uses call_elidable_float_typed(pow), not a simple float op.
         let is_power = matches!(op, BinaryOperator::Power | BinaryOperator::InplacePower);
+
+        // floatobject.py:561,799: descr_pow/_pow can raise ZeroDivisionError
+        // (0.0 ** negative), ValueError (negative ** fractional), OverflowError.
+        // A pure elidable call has no exception channel, so detect these at
+        // trace time using concrete values and fall back to the interpreter.
+        if is_power && !concrete_lhs.is_null() && !concrete_rhs.is_null() {
+            let lhs_f = unsafe {
+                if is_float(concrete_lhs) {
+                    w_float_get_value(concrete_lhs)
+                } else if is_int(concrete_lhs) {
+                    w_int_get_value(concrete_lhs) as f64
+                } else {
+                    return self.trace_binary_value(a, b, op);
+                }
+            };
+            let rhs_f = unsafe {
+                if is_float(concrete_rhs) {
+                    w_float_get_value(concrete_rhs)
+                } else if is_int(concrete_rhs) {
+                    w_int_get_value(concrete_rhs) as f64
+                } else {
+                    return self.trace_binary_value(a, b, op);
+                }
+            };
+            // _pow raises for these concrete value patterns:
+            if lhs_f == 0.0 && rhs_f < 0.0 {
+                // floatobject.py:847: ZeroDivisionError
+                return self.trace_binary_value(a, b, op);
+            }
+            if lhs_f < 0.0 && rhs_f.floor() != rhs_f {
+                // floatobject.py:857: PowDomainError → ValueError
+                return self.trace_binary_value(a, b, op);
+            }
+        }
+
         // Table lookup: BinaryOperator → OpCode (Power excluded from table)
         let op_code = if is_power {
             OpCode::FloatMul // unused: is_power branch calls float_pow directly
