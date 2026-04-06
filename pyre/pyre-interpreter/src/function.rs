@@ -467,25 +467,32 @@ pub unsafe fn fset_func_closure(obj: PyObjectRef, closure: PyObjectRef) {
 }
 
 /// function.py:419-425 — `fget___module__`.
-/// Returns self.w_module if set; otherwise falls back to
-/// self.w_func_globals.get("__name__").
+/// Caches on first read: if w_module is PY_NULL (unset), computes from
+/// globals["__name__"] and stores into self.w_module. Always returns
+/// self.w_module afterwards.
+///
+/// PY_NULL = RPython None (unset sentinel), w_none() = space.w_None.
+/// After fdel___module__, w_module is w_none() (not PY_NULL), so
+/// subsequent gets return None without re-computing from globals.
 #[inline]
 pub unsafe fn fget___module__(obj: PyObjectRef) -> PyObjectRef {
+    let func = obj as *mut Function;
     // function.py:420: if self.w_module is None
-    let w_module = (*(obj as *const Function)).w_module;
-    if !w_module.is_null() && !pyre_object::is_none(w_module) {
-        return w_module;
+    if (*func).w_module.is_null() {
+        // function.py:421-422: compute and cache
+        let globals = (*func).w_func_globals;
+        if !globals.is_null() {
+            (*func).w_module = (*globals)
+                .get("__name__")
+                .copied()
+                .unwrap_or(pyre_object::w_none());
+        } else {
+            // function.py:424: self.w_module = space.w_None
+            (*func).w_module = pyre_object::w_none();
+        }
     }
-    // function.py:421-422: fallback to globals["__name__"]
-    let globals = function_get_globals(obj);
-    if globals.is_null() {
-        return pyre_object::w_none();
-    }
-    let namespace = &*globals;
-    namespace
-        .get("__name__")
-        .copied()
-        .unwrap_or(pyre_object::w_none())
+    // function.py:425: return self.w_module
+    (*func).w_module
 }
 
 /// PyPy-compatible `descr_function__new__` helper.
