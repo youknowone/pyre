@@ -369,13 +369,10 @@ impl GcRewriterImpl {
         // Initialize the tid header field.
         self.gen_initialize_tid(obj_ref, type_id, st);
 
-        // For NEW_WITH_VTABLE, also set the vtable pointer.
-        if op.opcode == OpCode::NewWithVtable {
-            let vtable = descr.vtable();
-            if vtable != 0 {
-                self.gen_initialize_vtable(obj_ref, vtable, st);
-            }
-        }
+        // rewrite.py:482-484: NEW_WITH_VTABLE vtable init is conditional on
+        // gc_ll_descr.fielddescr_vtable (non-None only for specific GCs).
+        // pyre GC uses tid for object identification; the vtable/ob_type
+        // field is written by the optimizer's SetfieldGc (in force path).
     }
 
     // ────────────────────────────────────────────────────────
