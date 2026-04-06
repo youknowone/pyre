@@ -497,20 +497,15 @@ extern "C" fn jit_exc_restore(value: i64, exc_type: i64) {
 
 /// llmodel.py:194-199 _store_exception parity: set exception state.
 ///
-/// `value` must be a valid OBJECTPTR whose typeptr (offset 0) equals
-/// `exc_type`.  This invariant mirrors RPython where pos_exception
-/// is always `ptr2int(pos_exc_value().typeptr)`.
-pub fn jit_exc_raise(value: i64, exc_type: i64) {
-    debug_assert!(
-        value == 0 || unsafe { *(value as *const i64) } == exc_type,
-        "jit_exc_raise: value.typeptr ({:#x}) != exc_type ({:#x})",
-        if value != 0 {
-            unsafe { *(value as *const i64) }
-        } else {
-            0
-        },
-        exc_type,
-    );
+/// `value` must be a valid OBJECTPTR (or 0). The exception class is
+/// derived from `value.typeptr` (offset 0), matching RPython's invariant
+/// that pos_exception() == ptr2int(pos_exc_value().typeptr).
+pub fn jit_exc_raise(value: i64) {
+    let exc_type = if value == 0 {
+        0
+    } else {
+        unsafe { *(value as *const i64) }
+    };
     JIT_EXC_VALUE.store(value, std::sync::atomic::Ordering::Relaxed);
     JIT_EXC_TYPE.store(exc_type, std::sync::atomic::Ordering::Relaxed);
 }
@@ -10380,7 +10375,6 @@ mod tests {
 
     thread_local! {
         static TEST_EXCEPTION_VALUE: Cell<i64> = const { Cell::new(0) };
-        static TEST_EXCEPTION_TYPE: Cell<i64> = const { Cell::new(0) };
         static TEST_EXCEPTION_CALL_LOG: std::cell::RefCell<Vec<bool>> =
             const { std::cell::RefCell::new(Vec::new()) };
     }
@@ -10410,9 +10404,8 @@ mod tests {
         }
     }
 
-    fn set_test_exception_state(value: i64, exc_type: i64) {
+    fn set_test_exception_state(value: i64) {
         TEST_EXCEPTION_VALUE.with(|cell| cell.set(value));
-        TEST_EXCEPTION_TYPE.with(|cell| cell.set(exc_type));
     }
 
     fn clear_test_exception_call_log() {
@@ -10427,8 +10420,7 @@ mod tests {
         TEST_EXCEPTION_CALL_LOG.with(|log| log.borrow_mut().push(jit_exc_is_pending()));
         if flag != 0 {
             let value = TEST_EXCEPTION_VALUE.with(Cell::get);
-            let exc_type = TEST_EXCEPTION_TYPE.with(Cell::get);
-            jit_exc_raise(value, exc_type);
+            jit_exc_raise(value);
         }
     }
 
@@ -11846,7 +11838,7 @@ mod tests {
     fn test_guard_exception_exact_match_returns_value_and_clears_deadframe_exception() {
         jit_exc_clear();
         clear_test_exception_call_log();
-        set_test_exception_state(make_fake_exc(0x1111), 0x1111);
+        set_test_exception_state(make_fake_exc(0x1111));
 
         let mut backend = CraneliftBackend::new();
         let descr = make_call_descr(vec![Type::Int], Type::Void);
@@ -11888,7 +11880,7 @@ mod tests {
     fn test_guard_exception_exact_mismatch_preserves_deadframe_exception() {
         jit_exc_clear();
         clear_test_exception_call_log();
-        set_test_exception_state(make_fake_exc(0x2222), 0x2222);
+        set_test_exception_state(make_fake_exc(0x2222));
 
         let mut backend = CraneliftBackend::new();
         let descr = make_call_descr(vec![Type::Int], Type::Void);
@@ -11923,7 +11915,7 @@ mod tests {
     fn test_guard_no_exception_failure_preserves_deadframe_exception() {
         jit_exc_clear();
         clear_test_exception_call_log();
-        set_test_exception_state(make_fake_exc(0x1111), 0x1111);
+        set_test_exception_state(make_fake_exc(0x1111));
 
         let mut backend = CraneliftBackend::new();
         let descr = make_call_descr(vec![Type::Int], Type::Void);
@@ -11964,7 +11956,7 @@ mod tests {
     fn test_execute_token_ints_raw_preserves_exception_and_layout_metadata() {
         jit_exc_clear();
         clear_test_exception_call_log();
-        set_test_exception_state(make_fake_exc(0x1111), 0x1111);
+        set_test_exception_state(make_fake_exc(0x1111));
 
         let mut backend = CraneliftBackend::new();
         let descr = make_call_descr(vec![Type::Int], Type::Void);
@@ -12008,7 +12000,7 @@ mod tests {
     fn test_save_restore_exception_roundtrip_matches_rpython_order() {
         jit_exc_clear();
         clear_test_exception_call_log();
-        set_test_exception_state(make_fake_exc(0x3333), 0x3333);
+        set_test_exception_state(make_fake_exc(0x3333));
 
         let mut backend = CraneliftBackend::new();
         let descr = make_call_descr(vec![Type::Int], Type::Void);
@@ -12077,7 +12069,7 @@ mod tests {
             *((exception_ref.0 + 8) as *mut u64) = 0xCAFEBABE;
         }
 
-        set_test_exception_state(exception_ref.0 as i64, 0x4444);
+        set_test_exception_state(exception_ref.0 as i64);
         clear_test_exception_call_log();
 
         let mut backend = CraneliftBackend::with_gc_allocator(Box::new(gc));
@@ -13678,7 +13670,7 @@ mod tests {
     fn test_bridge_from_guard_no_exception_can_consume_pending_exception() {
         jit_exc_clear();
         clear_test_exception_call_log();
-        set_test_exception_state(make_fake_exc(0x4545), 0x4545);
+        set_test_exception_state(make_fake_exc(0x4545));
 
         let mut backend = CraneliftBackend::new();
         let descr = make_call_descr(vec![Type::Int], Type::Void);
