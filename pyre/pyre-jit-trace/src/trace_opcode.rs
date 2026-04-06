@@ -185,24 +185,18 @@ impl MIFrame {
             None
         };
         if let Some(info) = liveness_info.filter(|i| !i.live_r_regs.is_empty()) {
-            // pyjitpl.py:216-233: iterate live registers via LivenessIterator.
-            // RPython dispatches _callback_i/_callback_r/_callback_f to
-            // typed register banks. pyre: all Python locals are PyObjectRef
-            // (GCREF) → only live_r_regs is populated. live_i_regs and
-            // live_f_regs are always empty.
-            let stack_base = info
-                .live_r_regs
-                .iter()
-                .find(|&&idx| idx as usize >= nlocals)
-                .map(|&idx| idx as usize)
-                .unwrap_or(nlocals);
+            // pyjitpl.py:222-226: iterate live_r_regs via LivenessIterator.
+            // RPython: `add_box_to_storage(self.registers_r[index])`
+            // index is the absolute register bank index. registers_r =
+            // [locals..., stack...], so index >= nlocals → stack slot
+            // at (index - nlocals). No rebase to "first live stack reg".
             let mut boxes = Vec::with_capacity(info.live_r_regs.len());
             for &reg_idx in &info.live_r_regs {
                 let idx = reg_idx as usize;
                 let val = if idx < nlocals {
                     local_values.get(idx).copied().unwrap_or(OpRef::NONE)
                 } else {
-                    let stack_idx = idx - stack_base;
+                    let stack_idx = idx - nlocals;
                     stack_values.get(stack_idx).copied().unwrap_or(OpRef::NONE)
                 };
                 boxes.push(val);
