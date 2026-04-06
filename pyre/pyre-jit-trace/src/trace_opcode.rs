@@ -2801,7 +2801,8 @@ impl MIFrame {
                 });
             }
             if is_function(concrete_callable) {
-                let callee_code_ptr = function_get_code(concrete_callable) as *const CodeObject;
+                let callee_code_ptr =
+                    pyre_interpreter::getcode(concrete_callable) as *const CodeObject;
                 let callee_key = crate::driver::make_green_key(callee_code_ptr, 0);
                 let callee_code = unsafe { &*callee_code_ptr };
                 let callee_has_loop = code_has_backward_jump(callee_code);
@@ -2981,7 +2982,8 @@ impl MIFrame {
                 }
                 if let Some(token_number) = driver.get_pending_token_number(callee_key) {
                     let callee_nlocals = {
-                        let code_ptr = function_get_code(concrete_callable) as *const CodeObject;
+                        let code_ptr =
+                            pyre_interpreter::getcode(concrete_callable) as *const CodeObject;
                         (&*code_ptr).varnames.len()
                     };
                     if nargs == 1 || (crate::callbacks::get().callee_frame_helper)(nargs).is_some()
@@ -3297,7 +3299,7 @@ impl MIFrame {
         let caller_code = unsafe { (*self.sym().jitcode).code };
         let caller_exec_ctx = self.sym().concrete_execution_context;
         let caller_namespace_ptr = self.sym().concrete_namespace;
-        let code_ptr = unsafe { function_get_code(concrete_callable) } as *const CodeObject;
+        let code_ptr = unsafe { pyre_interpreter::getcode(concrete_callable) } as *const CodeObject;
         let globals = unsafe { function_get_globals(concrete_callable) };
         let closure = unsafe { pyre_interpreter::function_get_closure(concrete_callable) };
         let is_self_recursive = crate::driver::make_green_key(caller_code, 0) == callee_key;
@@ -3516,7 +3518,7 @@ impl MIFrame {
                         let callee_frame =
                             ctx.call_ref_typed(helper, &[this.frame(), raw_arg], &helper_arg_types);
                         let callee_nlocals = unsafe {
-                            let code_ptr = function_get_code(concrete_callable)
+                            let code_ptr = pyre_interpreter::getcode(concrete_callable)
                                 as *const pyre_interpreter::CodeObject;
                             (&*code_ptr).varnames.len()
                         };

@@ -104,7 +104,7 @@ pub(crate) fn recursive_force_cache_safe(callable: PyObjectRef) -> bool {
         if !function_get_closure(callable).is_null() {
             return false;
         }
-        let code = &*(function_get_code(callable) as *const pyre_interpreter::CodeObject);
+        let code = &*(pyre_interpreter::getcode(callable) as *const pyre_interpreter::CodeObject);
         let func_name = function_get_name(callable);
         let mut arg_state = OpArgState::default();
         let mut saw_self_reference = false;
@@ -176,7 +176,7 @@ pub(crate) fn self_recursive_function_entry_candidate(frame: &PyFrame) -> bool {
         }
         let is_candidate = unsafe {
             is_function(value)
-                && function_get_code(value) == code_ptr
+                && pyre_interpreter::getcode(value) == code_ptr
                 && function_get_globals(value) == namespace_ptr
                 && function_get_closure(value).is_null()
         };
@@ -203,7 +203,7 @@ pub(crate) fn callable_prefers_function_entry(callable: PyObjectRef) -> bool {
         let Some(namespace) = (!globals.is_null()).then_some(&*globals) else {
             return false;
         };
-        let code_ptr = function_get_code(callable);
+        let code_ptr = pyre_interpreter::getcode(callable);
 
         for idx in 0..namespace.len() {
             let Some(value) = namespace.get_slot(idx) else {
@@ -213,7 +213,7 @@ pub(crate) fn callable_prefers_function_entry(callable: PyObjectRef) -> bool {
                 continue;
             }
             let is_candidate = is_function(value)
-                && function_get_code(value) == code_ptr
+                && pyre_interpreter::getcode(value) == code_ptr
                 && function_get_globals(value) == globals
                 && function_get_closure(value).is_null();
             if is_candidate && recursive_force_cache_safe(value) {
@@ -250,7 +250,7 @@ pub fn maybe_handle_inline_concrete_call(
     }
 
     let raw_arg = unsafe { w_int_get_value(arg0) };
-    let code_ptr = unsafe { function_get_code(callable) };
+    let code_ptr = unsafe { pyre_interpreter::getcode(callable) };
     let green_key = crate::eval::make_green_key(code_ptr as *const _, 0);
     // Inline concrete execution sometimes falls back to a helper-boundary
     // recursive call instead of a real frame switch. That helper must run as
@@ -1354,7 +1354,7 @@ pub extern "C" fn jit_force_recursive_call_1(
 ) -> i64 {
     let callable_ref = callable as PyObjectRef;
     let boxed_arg_ref = boxed_arg as PyObjectRef;
-    let code_ptr = unsafe { function_get_code(callable_ref) };
+    let code_ptr = unsafe { pyre_interpreter::getcode(callable_ref) };
     let green_key = crate::eval::make_green_key(code_ptr as *const _, 0);
     if matches!(finish_protocol(green_key), FinishProtocol::RawInt)
         && !boxed_arg_ref.is_null()
@@ -1420,7 +1420,7 @@ pub extern "C" fn jit_force_recursive_call_argraw_boxed_1(
 ) -> i64 {
     let _suspend_inline_result = pyre_interpreter::call::suspend_inline_handled_result();
     let callable_ref = callable as PyObjectRef;
-    let code_ptr = unsafe { function_get_code(callable_ref) };
+    let code_ptr = unsafe { pyre_interpreter::getcode(callable_ref) };
     let green_key = crate::eval::make_green_key(code_ptr as *const _, 0);
     if matches!(finish_protocol(green_key), FinishProtocol::RawInt) {
         let forced = jit_force_recursive_call_raw_1(caller_frame, callable, raw_int_arg);
@@ -1504,7 +1504,7 @@ pub extern "C" fn jit_force_recursive_call_raw_1(
 ) -> i64 {
     let _suspend_inline_result = pyre_interpreter::call::suspend_inline_handled_result();
     let callable_ref = callable as PyObjectRef;
-    let code_ptr = unsafe { function_get_code(callable_ref) };
+    let code_ptr = unsafe { pyre_interpreter::getcode(callable_ref) };
     let green_key = crate::eval::make_green_key(code_ptr as *const _, 0);
     let (protocol, _token_num, _memo_safe) = recursive_dispatch(callable_ref, green_key);
 
@@ -2237,7 +2237,7 @@ fn create_callee_frame_impl_1_boxed(
     callable: PyObjectRef,
     boxed_arg: PyObjectRef,
 ) -> i64 {
-    let code_ptr = unsafe { function_get_code(callable) };
+    let code_ptr = unsafe { pyre_interpreter::getcode(callable) };
     let caller = unsafe { &*(caller_frame as *const PyFrame) };
     let globals = unsafe { function_get_globals(callable) };
     let func_code = code_ptr as *const pyre_interpreter::CodeObject;
@@ -2345,7 +2345,7 @@ fn create_self_recursive_callee_frame_impl_1_boxed(
 
 fn create_callee_frame_impl(caller_frame: i64, callable: i64, args: &[PyObjectRef]) -> i64 {
     let callable = callable as PyObjectRef;
-    let code_ptr = unsafe { function_get_code(callable) };
+    let code_ptr = unsafe { pyre_interpreter::getcode(callable) };
     let caller = unsafe { &*(caller_frame as *const PyFrame) };
     let globals = unsafe { function_get_globals(callable) };
     let func_code = code_ptr as *const pyre_interpreter::CodeObject;
