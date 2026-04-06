@@ -2205,22 +2205,12 @@ fn materialize_virtual_from_rd(
             }
         }
         // resume.py:635: VStructInfo.allocate → allocate_struct(self.typedescr)
-        // RPython: VStructInfo always uses allocate_struct. If an object with
-        // vtable ended up here, the classification is wrong upstream.
-        // TODO: fix classification so vtable objects never reach VStructInfo.
         VirtualKind::Struct { typedescr, .. } => {
             if let Some(td) = typedescr {
                 let sd = td
                     .as_size_descr()
                     .expect("VStruct typedescr must be SizeDescr");
-                // Workaround: vtable objects misclassified as VStructInfo
-                // need allocate_with_vtable to avoid segfault. The real fix
-                // is in the classification (New vs NewWithVtable) path.
-                if sd.vtable() != 0 {
-                    allocate_with_vtable(sd)
-                } else {
-                    allocate_struct(sd)
-                }
+                allocate_struct(sd)
             } else if descr_size > 0 {
                 let fallback = majit_ir::make_size_descr_full(0, descr_size, 0);
                 let sd = fallback.as_size_descr().unwrap();
