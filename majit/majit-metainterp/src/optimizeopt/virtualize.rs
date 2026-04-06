@@ -1871,29 +1871,11 @@ impl Optimization for OptVirtualize {
             // Calls / escaping operations — force all virtual args
             _ if op.opcode.is_call() => self.optimize_escaping_op(op, ctx),
 
-            // JUMP — RPython virtualize.py has no optimize_JUMP.
-            // RPython: Phase 1 JUMP doesn't go through passes (flush=False).
-            // In majit, Phase 1 JUMP goes through passes for heap flush.
-            // When NEW_WITH_VTABLE→Virtual is active, JUMP handler must NOT
-            // force virtuals (use PassOn). For VirtualStruct path, force
-            // non-virtualizable args to materialize lazy sets.
-            OpCode::Jump if self.vable_config.is_some() => {
-                let frame_ref = ctx.get_box_replacement(OpRef(0));
-                let mut jump_op = op.clone();
-                for arg in &mut jump_op.args {
-                    let resolved = ctx.get_box_replacement(*arg);
-                    if resolved == frame_ref
-                        && matches!(ctx.get_ptr_info(resolved), Some(PtrInfo::Virtualizable(_)))
-                    {
-                        *arg = resolved;
-                        continue;
-                    }
-                    self.force_virtual(resolved, ctx);
-                    *arg = ctx.get_box_replacement(resolved);
-                }
-                OptimizationResult::Replace(jump_op)
-            }
-            OpCode::Jump => self.optimize_escaping_op(op, ctx),
+            // RPython virtualize.py has no optimize_JUMP. JUMP is held
+            // out of the pass pipeline (flush=False at optimizer.py:536-539)
+            // or sent through via send_extra_operation in flush=True, which
+            // dispatches to the standard emit path — no virtualize-specific
+            // handler. Falling through to the default PassOn matches RPython.
 
             // Escape ops (testing)
             OpCode::EscapeI | OpCode::EscapeR | OpCode::EscapeF | OpCode::EscapeN => {
