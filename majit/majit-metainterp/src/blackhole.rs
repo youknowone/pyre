@@ -887,6 +887,11 @@ pub struct BlackholeInterpreter {
     /// Pointer to the VirtualizableInfo describing field offsets.
     /// Used by vable bytecodes to compute memory offsets.
     pub virtualizable_info: *const crate::virtualizable::VirtualizableInfo,
+    /// blackhole.py:1095 get_portal_runner / bhimpl_recursive_call parity:
+    /// Optional callback to invoke the portal runner for recursive portal calls.
+    /// Receives the virtualizable_ptr (PyFrame) and returns the result as i64.
+    /// Set by the caller that builds the blackhole chain.
+    pub portal_runner_fn: Option<fn(i64) -> i64>,
 }
 
 /// blackhole.py: last exception value from a residual call.
@@ -932,6 +937,7 @@ impl BlackholeInterpreter {
             exception_last_value: 0,
             virtualizable_ptr: 0,
             virtualizable_info: std::ptr::null(),
+            portal_runner_fn: None,
         }
     }
 
@@ -1594,13 +1600,40 @@ impl BlackholeInterpreter {
                     return Err(DispatchError::LeaveFrame);
                 }
                 // blackhole.py:1074-1093: recursive portal level.
-                // RPython calls bhimpl_recursive_call_{v,i,r,f} which
-                // invokes portal_runner (enabling JIT re-entry), then
-                // dispatches bhimpl_{void,int,ref,float}_return.
-                // pyre: no-op — the blackhole continues executing the
-                // function body to RETURN_VALUE. Functionally correct
-                // but misses JIT re-entry opportunity at recursive depth.
-                // TODO: implement portal_runner callback for recursive case.
+                // bhimpl_recursive_call_{v,i,r,f} invokes portal_runner with
+                // the current register state as args. portal_runner enables
+                // JIT re-entry at recursive depth.
+                //
+                // pyre adaptation: write back blackhole registers to the
+                // virtualizable (PyFrame), set next_instr to the merge point
+                // PC, then call portal_runner_fn which runs eval_loop_jit.
+                // The result goes into tmpreg_r + ref_return (pyre functions
+                // return PyObjectRef).
+                if let Some(runner) = self.portal_runner_fn {
+                    if self.virtualizable_ptr != 0 && !self.virtualizable_info.is_null() {
+                        let py_pc =
+                            self.jitcode.jit_pc_to_py_pc(self.last_opcode_position) as usize;
+                        let frame_ptr = self.virtualizable_ptr as *mut u8;
+                        let info = unsafe { &*self.virtualizable_info };
+                        // Write blackhole state → frame via virtualizable.
+                        // Static field 0 = next_instr → merge point PC.
+                        unsafe { info.write_field(frame_ptr, 0, py_pc as i64) };
+                        // Array 0 = locals_cells_stack_w. Write ref registers
+                        // (locals) so portal_runner sees current values.
+                        let nlocals = self.registers_r.len();
+                        for i in 0..nlocals {
+                            unsafe {
+                                info.write_array_item(frame_ptr, 0, i, self.registers_r[i]);
+                            }
+                        }
+                        // bhimpl_recursive_call_r + bhimpl_ref_return
+                        let result = runner(self.virtualizable_ptr);
+                        self.tmpreg_r = result;
+                        self.return_type = BhReturnType::Ref;
+                        return Err(DispatchError::LeaveFrame);
+                    }
+                }
+                // Fallback: continue executing (no portal_runner or no frame).
             }
             BC_JUMP_TARGET => {
                 // Non-portal loop header marker (helper jitcodes only).
