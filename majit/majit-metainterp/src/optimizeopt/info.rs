@@ -399,26 +399,47 @@ impl PtrInfo {
         matches!(self, PtrInfo::Constant(_))
     }
 
-    /// Get the known class, if any.
-    /// info.py: get_known_class_or_none() / ConstPtrInfo.get_known_class(cpu)
-    pub fn get_known_class(&self) -> Option<&GcRef> {
+    /// info.py:763-772 `ConstPtrInfo.get_known_class(cpu)` +
+    /// the other PtrInfo subclasses' `_known_class` accessors:
+    ///
+    ///     def get_known_class(self, cpu):
+    ///         if not self._const.nonnull():
+    ///             return None
+    ///         if cpu.supports_guard_gc_type:
+    ///             if not cpu.check_is_object(self._const.getref_base()):
+    ///                 return None
+    ///         return cpu.cls_of_box(self._const)
+    ///
+    /// - `KnownClass`/`Instance`/`Virtual`: return the stored
+    ///   `known_class` field.
+    /// - `Constant`: null constants → `None`; otherwise gate on the
+    ///   thread-local backend shim (`majit_gc::supports_guard_gc_type`
+    ///   + `majit_gc::check_is_object`) and call `cls_of_box` (read
+    ///   typeptr at offset 0) only when both pass. This mirrors
+    ///   llmodel.py:541-561 exactly: non-object constant pointers are
+    ///   rejected by `check_is_object` and return `None` so the
+    ///   optimizer does not read garbage at offset 0.
+    /// - Everything else: `None`.
+    pub fn get_known_class(&self) -> Option<GcRef> {
         match self {
-            PtrInfo::KnownClass { class_ptr, .. } => Some(class_ptr),
-            PtrInfo::Instance(v) => v.known_class.as_ref(),
-            PtrInfo::Virtual(v) => v.known_class.as_ref(),
-            _ => None,
-        }
-    }
-
-    /// RPython ConstPtrInfo.get_known_class(cpu): read vtable from
-    /// constant GC object pointer (cls_of_box). Returns the vtable
-    /// pointer at offset 0 of the GC object.
-    pub fn get_known_class_from_constant(&self) -> Option<GcRef> {
-        match self {
+            PtrInfo::KnownClass { class_ptr, .. } => Some(*class_ptr),
+            PtrInfo::Instance(v) => v.known_class,
+            PtrInfo::Virtual(v) => v.known_class,
             PtrInfo::Constant(gcref) => {
+                // info.py:764: `if not self._const.nonnull(): return None`
                 if gcref.is_null() {
                     return None;
                 }
+                // info.py:765-767: gate `cls_of_box` on
+                // `supports_guard_gc_type` + `check_is_object`.
+                if !majit_gc::supports_guard_gc_type() {
+                    return None;
+                }
+                if !majit_gc::check_is_object(*gcref) {
+                    return None;
+                }
+                // info.py:768 / llmodel.py:556-561 `cls_of_box`: read
+                // the typeptr at offset 0 of the payload.
                 let vtable = unsafe { *(gcref.0 as *const usize) };
                 if vtable == 0 {
                     None

@@ -1409,6 +1409,55 @@ impl GcAllocator for MiniMarkGC {
     fn register_vtable_for_type(&mut self, vtable: usize, type_id: u32) {
         self.vtable_to_type_id.insert(vtable, type_id);
     }
+
+    /// gc.py:631-642 `check_is_object` parity.
+    ///
+    /// RPython reads the type_id from the GC header and consults the
+    /// `T_IS_RPYTHON_INSTANCE` flag in `TypeInfo`. MiniMarkGC's managed
+    /// objects have a `GcHeader` immediately before the payload; for
+    /// foreign pointers (e.g. frontend-allocated objects with no majit
+    /// GC header) the lookup falls back to the vtable→type_id table
+    /// populated via `register_vtable_for_type`. The fallback reads
+    /// offset 0 of the payload as a class pointer — this is safe under
+    /// the RPython `rclass.OBJECT` layout invariant and mirrors
+    /// `cpu.cls_of_box` (llmodel.py:556-561).
+    fn check_is_object(&self, gcref: GcRef) -> bool {
+        if gcref.is_null() {
+            return false;
+        }
+        // Managed path: header at `gcref - HEADER_SIZE` holds the
+        // type_id for objects allocated through this collector.
+        if self.is_managed_heap_object(gcref.0) {
+            let header_addr = gcref.0.wrapping_sub(crate::header::GcHeader::SIZE);
+            let header: crate::header::GcHeader = unsafe { *(header_addr as *const _) };
+            let type_id = header.type_id() as usize;
+            if type_id >= self.types.len() {
+                return false;
+            }
+            return self.types.get(type_id as u32).is_object;
+        }
+        // Foreign path: read offset 0 as the classptr and consult the
+        // vtable→type_id map. Only objects whose frontends registered
+        // their vtables pass this check; raw buffers / non-object
+        // foreign pointers whose offset 0 is not a known class return
+        // false.
+        let vtable = unsafe { *(gcref.0 as *const usize) };
+        let Some(type_id) = self.vtable_to_type_id.get(&vtable).copied() else {
+            return false;
+        };
+        let type_id = type_id as usize;
+        if type_id >= self.types.len() {
+            return false;
+        }
+        self.types.get(type_id as u32).is_object
+    }
+
+    /// llmodel.py:63 parity. MiniMarkGC carries a type registry rich
+    /// enough for `check_is_object`, so it behaves like a translated
+    /// real backend (`supports_guard_gc_type = True`).
+    fn supports_guard_gc_type(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

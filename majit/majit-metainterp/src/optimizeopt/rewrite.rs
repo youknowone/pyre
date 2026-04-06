@@ -1119,44 +1119,31 @@ impl OptRewrite {
     }
 
     /// Constant fold INT_IS_ZERO.
+    /// rewrite.py:512-513 `optimize_INT_IS_ZERO`:
+    ///     return self._optimize_nullness(op, op.getarg(0), False)
     fn optimize_int_is_zero(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let arg0 = op.arg(0);
-
-        if let Some(a) = ctx.get_constant_int(arg0) {
-            ctx.make_constant(op.pos, Value::Int(if a == 0 { 1 } else { 0 }));
-            return OptimizationResult::Remove;
-        }
-
-        // is_zero_true: int_is_zero(x) => 0 (if x known nonzero)
-        if let Some(bound) = ctx.get_int_bound(arg0) {
-            if bound.lower > 0 || bound.upper < 0 {
-                ctx.make_constant(op.pos, Value::Int(0));
-                return OptimizationResult::Remove;
-            }
-        }
-
-        OptimizationResult::PassOn
+        self.optimize_nullness(op, op.arg(0), false, ctx)
     }
 
-    /// Constant fold INT_IS_TRUE.
+    /// rewrite.py:505-510 `optimize_INT_IS_TRUE`:
+    ///     if (not self.is_raw_ptr(op.getarg(0)) and
+    ///         self.getintbound(op.getarg(0)).is_bool()):
+    ///         self.make_equal_to(op, op.getarg(0))
+    ///         return
+    ///     return self._optimize_nullness(op, op.getarg(0), True)
     fn optimize_int_is_true(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = op.arg(0);
 
-        if let Some(a) = ctx.get_constant_int(arg0) {
-            ctx.make_constant(op.pos, Value::Int(if a != 0 { 1 } else { 0 }));
-            return OptimizationResult::Remove;
-        }
-
-        // is_true_bool: int_is_true(x) => x (if x is bool)
-        if let Some(bound) = ctx.get_int_bound(arg0) {
-            if bound.is_bool() {
-                ctx.replace_op(op.pos, arg0);
-                return OptimizationResult::Remove;
-            }
-            // is_true_true: int_is_true(x) => 1 (if x known nonzero)
-            if bound.lower > 0 || bound.upper < 0 {
-                ctx.make_constant(op.pos, Value::Int(1));
-                return OptimizationResult::Remove;
+        // `is_raw_ptr(arg)` is only true for Ref-typed raw pointers; for
+        // those RPython skips the is_bool shortcut. Int-typed bools go
+        // through the intbound path.
+        if !self.is_ref_typed(arg0, ctx) {
+            if let Some(bound) = ctx.get_int_bound(arg0) {
+                if bound.is_bool() {
+                    // make_equal_to: replace INT_IS_TRUE result with arg0.
+                    ctx.replace_op(op.pos, arg0);
+                    return OptimizationResult::Remove;
+                }
             }
         }
 
@@ -1172,7 +1159,7 @@ impl OptRewrite {
             }
         }
 
-        OptimizationResult::PassOn
+        self.optimize_nullness(op, arg0, true, ctx)
     }
 
     /// rewrite.py:515-554: _optimize_oois_ooisnot(op, expect_isnot, instance)
@@ -1185,8 +1172,22 @@ impl OptRewrite {
         instance: bool,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
+        // rewrite.py:515-554 _optimize_oois_ooisnot:
+        //     arg0 = get_box_replacement(op.getarg(0))
+        //     arg1 = get_box_replacement(op.getarg(1))
+        //     info0 = getptrinfo(arg0)
+        //     info1 = getptrinfo(arg1)
+        // `getptrinfo` synthesizes `ConstPtrInfo` for constant Refs so
+        // null/known-class checks fire on constants too.
         let arg0 = ctx.get_box_replacement(op.arg(0));
         let arg1 = ctx.get_box_replacement(op.arg(1));
+        // rewrite.py:532 `elif arg0 is arg1:` relies on ConstPtr Box
+        // sharing in RPython — two ConstPtr boxes with the same value
+        // *are* the same Box. majit's constant pool does not share
+        // boxes, so same-value Ref constants still live at different
+        // OpRefs. Fold ConstPtr/ConstPtr pairs up front by comparing
+        // the stored Ref values so we match RPython's equality
+        // semantics without depending on Box interning.
         if let (Some(Value::Ref(left)), Some(Value::Ref(right))) =
             (ctx.get_constant(arg0), ctx.get_constant(arg1))
         {
@@ -1194,8 +1195,8 @@ impl OptRewrite {
             ctx.make_constant(op.pos, Value::Int((same ^ expect_isnot) as i64));
             return OptimizationResult::Remove;
         }
-        let info0 = ctx.get_ptr_info(arg0);
-        let info1 = ctx.get_ptr_info(arg1);
+        let info0 = ctx.getptrinfo(arg0);
+        let info1 = ctx.getptrinfo(arg1);
 
         let is_virtual0 = info0.as_ref().is_some_and(|i| i.is_virtual());
         let is_virtual1 = info1.as_ref().is_some_and(|i| i.is_virtual());
@@ -1233,8 +1234,8 @@ impl OptRewrite {
 
         // rewrite.py:535-553: instance comparison — different classes → not same
         if instance {
-            let cls0 = info0.and_then(|i| i.get_known_class()).cloned();
-            let cls1 = info1.and_then(|i| i.get_known_class()).cloned();
+            let cls0 = info0.as_ref().and_then(|i| i.get_known_class());
+            let cls1 = info1.as_ref().and_then(|i| i.get_known_class());
             if let (Some(c0), Some(c1)) = (cls0, cls1) {
                 if c0 != c1 {
                     ctx.make_constant(op.pos, Value::Int(expect_isnot as i64));
@@ -1245,11 +1246,10 @@ impl OptRewrite {
             // rewrite.py:550-553: non-instance array pointer comparison.
             // If both are ArrayPtrInfo with known-different length bounds,
             // they cannot be the same object.
-            if let (Some(lb0), Some(lb1)) = (
-                info0.and_then(|i| i.getlenbound()),
-                info1.and_then(|i| i.getlenbound()),
-            ) {
-                if lb0.known_ne(lb1) {
+            let lb0 = info0.as_ref().and_then(|i| i.getlenbound().cloned());
+            let lb1 = info1.as_ref().and_then(|i| i.getlenbound().cloned());
+            if let (Some(lb0), Some(lb1)) = (lb0, lb1) {
+                if lb0.known_ne(&lb1) {
                     ctx.make_constant(op.pos, Value::Int(expect_isnot as i64));
                     return OptimizationResult::Remove;
                 }
@@ -1259,7 +1259,11 @@ impl OptRewrite {
         OptimizationResult::PassOn
     }
 
-    /// rewrite.py:496-503: _optimize_nullness(op, box, expect_nonnull)
+    /// rewrite.py:496-503 `_optimize_nullness(op, box, expect_nonnull)`:
+    ///     info = self.getnullness(box)
+    ///     if info == INFO_NONNULL: self.make_constant_int(op, expect_nonnull)
+    ///     elif info == INFO_NULL: self.make_constant_int(op, not expect_nonnull)
+    ///     else: return self.emit(op)
     fn optimize_nullness(
         &self,
         op: &Op,
@@ -1267,17 +1271,17 @@ impl OptRewrite {
         expect_nonnull: bool,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
-        if let Some(info) = ctx.get_ptr_info(arg) {
-            if info.is_nonnull() {
+        match self.getnullness(arg, ctx) {
+            Nullness::Nonnull => {
                 ctx.make_constant(op.pos, Value::Int(expect_nonnull as i64));
-                return OptimizationResult::Remove;
+                OptimizationResult::Remove
             }
-            if info.is_null() {
+            Nullness::Null => {
                 ctx.make_constant(op.pos, Value::Int(!expect_nonnull as i64));
-                return OptimizationResult::Remove;
+                OptimizationResult::Remove
             }
+            Nullness::Unknown => OptimizationResult::PassOn,
         }
-        OptimizationResult::PassOn
     }
 
     /// Constant fold INT_FORCE_GE_ZERO.
@@ -1479,10 +1483,10 @@ impl OptRewrite {
         }
 
         // rewrite.py:284-301: optimize_GUARD_VALUE for Ref args.
-        // If there's a prior guard_nonnull or guard_class, replace it with
-        // guard_value (rewrite.py:307-347: replace_old_guard_with_guard_value).
+        // getptrinfo synthesizes ConstPtrInfo for constant Refs, matching
+        // `if info:` in RPython (which is True for ConstPtrInfo too).
         let obj = ctx.get_box_replacement(arg0);
-        if let Some(info) = ctx.get_ptr_info(obj) {
+        if let Some(info) = ctx.getptrinfo(obj) {
             if info.is_virtual() {
                 raise_invalid_loop("promote of a virtual");
             }
@@ -1494,12 +1498,10 @@ impl OptRewrite {
                             "GUARD_VALUE(..., NULL) follows a guard that it is not NULL",
                         );
                     }
-                    // rewrite.py:324-332: check class consistency
-                    if let Some(prev_cls) = ctx
-                        .get_ptr_info(obj)
-                        .and_then(|i| i.get_known_class())
-                        .cloned()
-                    {
+                    // rewrite.py:324-332: check class consistency via
+                    // `info.get_known_class(cpu)`; ConstPtrInfo's override
+                    // reads the constant's typeptr via cls_of_box.
+                    if let Some(prev_cls) = info.get_known_class() {
                         if let Some(known_cls) = ctx.get_known_class(arg1) {
                             if prev_cls != known_cls {
                                 raise_invalid_loop(
@@ -1593,13 +1595,13 @@ impl OptRewrite {
     /// through the same known-class / strengthening / postprocess logic.
     fn optimize_guard_class(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let obj = ctx.get_box_replacement(op.arg(0));
-        // rewrite.py:401-407: info.get_known_class(cpu); if mismatched,
-        // the guard is proven to always fail.
-        if let Some(known_class) = ctx
-            .get_ptr_info(obj)
-            .and_then(|i| i.get_known_class())
-            .cloned()
-        {
+        // rewrite.py:397-407: ensure_ptr_info_arg0 → info.py:880 getptrinfo.
+        // `getptrinfo(ConstPtr)` returns a synthesized ConstPtrInfo, so a
+        // constant Ref arg0 is handled uniformly with virtual / instance
+        // info: ConstPtrInfo.get_known_class(cpu) (info.py:763-772) reads
+        // the typeptr at offset 0 via cls_of_box and compares against
+        // expectedclassbox. Mismatch → proven-fail guard → InvalidLoop.
+        if let Some(known_class) = ctx.getptrinfo(obj).and_then(|i| i.get_known_class()) {
             if op.num_args() >= 2 {
                 // Class pointer may be Value::Int or Value::Ref.
                 let expected = ctx.get_constant_int(op.arg(1)).or_else(|| {
@@ -1678,19 +1680,21 @@ impl OptRewrite {
     // ── SAME_AS identity ──
 
     /// SAME_AS_I/R/F(x) -> x
-    /// optimizer.py:127-135: getnullness(op)
+    /// optimizer.py:127-135 `getnullness(op)`:
+    ///     if op.type == 'r' or self.is_raw_ptr(op):
+    ///         ptrinfo = getptrinfo(op)
+    ///         if ptrinfo is None: return INFO_UNKNOWN
+    ///         return ptrinfo.getnullness()
+    ///     elif op.type == 'i':
+    ///         return self.getintbound(op).getnullness()
     ///
-    /// RPython dispatches on `op.type`:
-    /// - 'r' (Ref): check PtrInfo only. If PtrInfo is None → INFO_UNKNOWN.
-    /// - 'i' (Int): check IntBound.getnullness() only.
-    /// Never mixes the two — a Ref must not be queried via IntBound.
+    /// Ref / raw-ptr path: `getptrinfo` synthesizes `ConstPtrInfo` for
+    /// constant Refs, so null / non-null constants are reported correctly
+    /// (info.py:64-69 `getnullness`).
     fn getnullness(&self, opref: OpRef, ctx: &mut OptContext) -> Nullness {
-        // optimizer.py:128: if op.type == 'r' or self.is_raw_ptr(op):
         let is_ref = self.is_ref_typed(opref, ctx);
         if is_ref {
-            // optimizer.py:129-132: ptrinfo = getptrinfo(op)
-            let info = ctx.get_ptr_info(opref);
-            match info {
+            match ctx.getptrinfo(opref) {
                 None => return Nullness::Unknown,
                 Some(info) => {
                     if info.is_null() {
@@ -1703,11 +1707,9 @@ impl OptRewrite {
                 }
             }
         }
-        // optimizer.py:133-134: elif op.type == 'i':
-        //   return self.getintbound(op).getnullness()
+        // intutils.py:1318-1329 IntBound.getnullness(): known_gt(0) or
+        // known_lt(0) or tvalue != 0.
         let b = ctx.getintbound(opref);
-        // intutils.py:1318-1329: IntBound.getnullness()
-        // known_gt(0) or known_lt(0) or tvalue != 0
         let nullness = b.getnullness();
         match nullness {
             1 => Nullness::Nonnull,
@@ -2430,20 +2432,18 @@ impl Optimization for OptRewrite {
             // the guard can be removed entirely.
             OpCode::GuardNonnull => {
                 // rewrite.py:269-278 optimize_GUARD_NONNULL
+                //     opinfo = getptrinfo(op.getarg(0))
+                //     if opinfo is not None:
+                //         if opinfo.is_nonnull(): return
+                //         elif opinfo.is_null(): raise InvalidLoop(...)
+                //     return self.emit(op)
                 let obj = ctx.get_box_replacement(op.arg(0));
-                if let Some(info) = ctx.get_ptr_info(obj) {
+                if let Some(info) = ctx.getptrinfo(obj) {
                     if info.is_nonnull() {
                         return OptimizationResult::Remove;
                     }
-                    // rewrite.py:274-277: proven null → always fails
                     if info.is_null() {
                         raise_invalid_loop("GUARD_NONNULL proven to always fail");
-                    }
-                }
-                // Constant-fold: non-zero constant is always nonnull.
-                if let Some(v) = ctx.get_constant_int(obj) {
-                    if v != 0 {
-                        return OptimizationResult::Remove;
                     }
                 }
                 // rewrite.py:280-282 postprocess_GUARD_NONNULL:
@@ -2457,9 +2457,14 @@ impl Optimization for OptRewrite {
                 OptimizationResult::PassOn
             }
             OpCode::GuardIsnull => {
-                // rewrite.py:186-195: optimize_GUARD_ISNULL
+                // rewrite.py:186-195 optimize_GUARD_ISNULL
+                //     info = getptrinfo(op.getarg(0))
+                //     if info is not None:
+                //         if info.is_null(): return
+                //         elif info.is_nonnull(): raise InvalidLoop(...)
+                //     return self.emit(op)
                 let obj = ctx.get_box_replacement(op.arg(0));
-                if let Some(info) = ctx.get_ptr_info(obj) {
+                if let Some(info) = ctx.getptrinfo(obj) {
                     if info.is_null() {
                         return OptimizationResult::Remove;
                     }
@@ -2467,17 +2472,9 @@ impl Optimization for OptRewrite {
                         raise_invalid_loop("GUARD_ISNULL proven to always fail");
                     }
                 }
-                // Constant-fold: null constant (int 0 or ref NULL).
-                if let Some(val) = ctx.get_constant(obj) {
-                    match val {
-                        Value::Int(0) => return OptimizationResult::Remove,
-                        Value::Ref(r) if r.0 == 0 => return OptimizationResult::Remove,
-                        _ => {}
-                    }
-                }
-                // rewrite.py postprocess_GUARD_ISNULL: after guard passes,
-                // arg(0) is known to be NULL.
-                // Use Ref(NULL) for ref-typed, Int(0) for int-typed.
+                // rewrite.py:197-198 postprocess_GUARD_ISNULL:
+                //     self.make_constant(op.getarg(0), CONST_NULL)
+                // Ref-typed → Value::Ref(NULL); Int-typed → Value::Int(0).
                 if self.is_ref_typed(obj, ctx) {
                     ctx.make_constant(op.arg(0), Value::Ref(majit_ir::GcRef(0)));
                 } else {
@@ -2774,12 +2771,20 @@ impl Optimization for OptRewrite {
                 OptimizationResult::Remove
             }
 
-            // rewrite.py:376-386: optimize_RECORD_EXACT_CLASS
+            // rewrite.py:376-386 optimize_RECORD_EXACT_CLASS:
+            //     opinfo = getptrinfo(op.getarg(0))
+            //     expectedclassbox = op.getarg(1)
+            //     if opinfo is not None:
+            //         realclassbox = opinfo.get_known_class(cpu)
+            //         if realclassbox is not None:
+            //             assert realclassbox.same_constant(expectedclassbox)
+            //             return
+            //     self.make_constant_class(op.getarg(0), expectedclassbox,
+            //                              update_last_guard=False)
             OpCode::RecordExactClass => {
                 let obj = ctx.get_box_replacement(op.arg(0));
                 if op.num_args() >= 2 {
                     // ConstClass is Value::Ref in majit (not Value::Int).
-                    // virtualize.rs:1832 also reads it as Value::Ref.
                     let expected_class: Option<i64> =
                         ctx.get_constant(op.arg(1)).and_then(|v| match v {
                             &Value::Ref(r) => Some(r.0 as i64),
@@ -2787,14 +2792,12 @@ impl Optimization for OptRewrite {
                             _ => None,
                         });
                     if let Some(expected_class) = expected_class {
-                        // rewrite.py:381-383: if realclassbox is not None: assert same
-                        if let Some(known) = ctx.get_ptr_info(obj).and_then(|i| i.get_known_class())
-                        {
+                        // getptrinfo synthesizes ConstPtrInfo for constant
+                        // Refs so `get_known_class` reads cls_of_box for them.
+                        if let Some(known) = ctx.getptrinfo(obj).and_then(|i| i.get_known_class()) {
                             debug_assert_eq!(known.0 as i64, expected_class);
                             return OptimizationResult::Remove;
                         }
-                        // rewrite.py:385-386: make_constant_class(op.getarg(0),
-                        //   expectedclassbox, update_last_guard=False)
                         crate::optimizeopt::optimizer::Optimizer::make_constant_class(
                             ctx,
                             obj,

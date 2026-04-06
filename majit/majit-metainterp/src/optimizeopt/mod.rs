@@ -2359,15 +2359,14 @@ impl OptContext {
         self.get_ptr_info(resolved).map(std::borrow::Cow::Borrowed)
     }
 
-    /// Extract known class from PtrInfo, if available.
-    /// RPython: preamble_info.get_known_class(cpu) — used by guard pass
-    /// to eliminate redundant GuardClass/GuardNonnullClass in Phase 2.
+    /// info.py:880 `getptrinfo(op).get_known_class(cpu)` parity.
+    ///
+    /// Delegates to `getptrinfo` (which synthesizes `ConstPtrInfo` for
+    /// constant Refs) and then `PtrInfo::get_known_class`, so constant
+    /// pointers are handled via `cls_of_box` the same way
+    /// `KnownClass`/`Instance`/`Virtual` read their stored `known_class`.
     pub fn get_known_class(&self, opref: OpRef) -> Option<majit_ir::GcRef> {
-        match self.get_ptr_info(opref)? {
-            PtrInfo::KnownClass { class_ptr, .. } => Some(*class_ptr),
-            PtrInfo::Instance(info) => info.known_class,
-            _ => None,
-        }
+        self.getptrinfo(opref)?.get_known_class()
     }
 
     /// info.py: getptrinfo(op) — mutable variant.

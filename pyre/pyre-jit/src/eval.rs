@@ -68,10 +68,15 @@ thread_local! {
         let mut d = JitDriver::new(JIT_THRESHOLD);
         d.set_virtualizable_info(info.clone());
         let mut gc = MiniMarkGC::new();
-        let w_int_tid = gc.register_type(TypeInfo::simple(std::mem::size_of::<W_IntObject>()));
+        // W_IntObject / W_FloatObject carry `PyObject.ob_type` at offset 0,
+        // matching RPython `rclass.OBJECT` layout (T_IS_RPYTHON_INSTANCE,
+        // gc.py:642). Register them with `TypeInfo::object` so
+        // `cpu.check_is_object(gcref)` returns true and the optimizer's
+        // `ConstPtrInfo.get_known_class(cpu)` path can call `cls_of_box`.
+        let w_int_tid = gc.register_type(TypeInfo::object(std::mem::size_of::<W_IntObject>()));
         debug_assert_eq!(w_int_tid, W_INT_GC_TYPE_ID);
         let w_float_tid =
-            gc.register_type(TypeInfo::simple(std::mem::size_of::<W_FloatObject>()));
+            gc.register_type(TypeInfo::object(std::mem::size_of::<W_FloatObject>()));
         debug_assert_eq!(w_float_tid, W_FLOAT_GC_TYPE_ID);
         // jitframe.py:49 — rgc.register_custom_trace_hook(JITFRAME, jitframe_trace)
         let jitframe_tid = gc.register_type(majit_metainterp::jitframe::jitframe_type_info());

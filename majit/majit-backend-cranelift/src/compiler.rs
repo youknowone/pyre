@@ -799,6 +799,23 @@ fn with_gc_runtime<R>(id: u64, f: impl FnOnce(&mut dyn GcAllocator) -> R) -> R {
     })
 }
 
+/// `majit_gc::CheckIsObjectFn` installed by `set_gc_allocator`. Dispatches
+/// `gc.py:631-642 check_is_object` through the thread-local
+/// `ACTIVE_GC_RUNTIME_ID` so backend-agnostic callers (optimizer) can
+/// reach the live GC allocator without taking a cranelift dependency.
+fn check_is_object_via_active_runtime(gcref: GcRef) -> bool {
+    let Some(id) = ACTIVE_GC_RUNTIME_ID.with(|c| c.get()) else {
+        return false;
+    };
+    GC_RUNTIMES.with(|r| {
+        let guard = r.borrow();
+        match guard.get(&id) {
+            Some(runtime) => runtime.check_is_object(gcref),
+            None => false,
+        }
+    })
+}
+
 pub(crate) fn register_gc_roots(runtime_id: u64, roots: &mut [GcRef]) {
     if roots.is_empty() {
         return;
@@ -4575,11 +4592,22 @@ impl CraneliftBackend {
 
     pub fn set_gc_allocator(&mut self, mut gc: Box<dyn GcAllocator>) {
         ensure_jitframe_type_registered(gc.as_mut());
+        let supports_guard_gc_type = gc.supports_guard_gc_type();
         if let Some(runtime_id) = self.gc_runtime_id {
             replace_gc_runtime(runtime_id, gc);
         } else {
             self.gc_runtime_id = Some(register_gc_runtime(gc));
         }
+        // Publish the backend's `check_is_object` implementation on a
+        // thread-local so the backend-agnostic optimizer (majit-metainterp)
+        // can consult it from `PtrInfo::get_known_class` on constant Refs
+        // without taking a cranelift dependency. Mirrors RPython's
+        // `self.optimizer.cpu.check_is_object(...)` access path.
+        ACTIVE_GC_RUNTIME_ID.with(|c| c.set(self.gc_runtime_id));
+        majit_gc::set_active_check_is_object(
+            Some(check_is_object_via_active_runtime),
+            supports_guard_gc_type,
+        );
     }
 
     /// Register constants available during the next `compile_loop` call.
