@@ -12,6 +12,7 @@ host_env = []
 
 [dependencies]
 pyre-object = { workspace = true }
+stacker = "0.1"
 rustpython-compiler = { workspace = true }
 rustpython-compiler-core = { workspace = true }
 malachite-bigint = { workspace = true }
