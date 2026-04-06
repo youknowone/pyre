@@ -3190,12 +3190,6 @@ impl ResumeDataLoopMemo {
         numb_state.append_int(0); // slot 1: number of failargs (patched by finish())
 
         // resume.py:234-241: virtualizable array
-        // TODO virtualizable.py:read_boxes parity: vable entries should
-        // get FRESH identity (RPython wrap() builds new FrontendOps each
-        // call). The _number_boxes_fresh helper exists but enabling it
-        // here triggers a downstream backend bug — likely related to
-        // duplicate OpRefs in fail_args interacting with gcmap or
-        // SSA-value reuse. Step 1 of the resume-data parity rework.
         numb_state.append_int(snapshot.vable_array.len() as i32);
         self._number_boxes(&snapshot.vable_array, &mut numb_state, env)?;
 
