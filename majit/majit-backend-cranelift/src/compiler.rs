@@ -2970,10 +2970,12 @@ fn build_value_type_map(
     let mut value_types = HashMap::new();
     let mut inputarg_types = HashMap::new();
     let mut op_def_positions = HashMap::new();
+    let mut runtime_refs = HashSet::new();
 
     for input in inputargs {
         value_types.insert(input.index, input.tp);
         inputarg_types.insert(input.index, input.tp);
+        runtime_refs.insert(input.index);
     }
 
     for (op_idx, op) in ops.iter().enumerate() {
@@ -2986,6 +2988,10 @@ fn build_value_type_map(
                 }
             }
             value_types.insert(var_idx, result_type);
+            runtime_refs.insert(var_idx);
+        }
+        if op.opcode == OpCode::Label {
+            runtime_refs.extend(op.args.iter().filter(|arg| !arg.is_none()).map(|arg| arg.0));
         }
         // Propagate optimizer-provided fail_arg_types to value_types.
         // This ensures constant OpRefs typed as Ref by the optimizer
@@ -2994,9 +3000,7 @@ fn build_value_type_map(
         if let Some(ref fat) = op.fail_arg_types {
             if let Some(ref fa) = op.fail_args {
                 for (i, &opref) in fa.iter().enumerate() {
-                    // Skip constant pool entries — their type is resolved
-                    // via constants map in resolve_opref, not value_types.
-                    if !opref.is_none() && opref.0 < 10_000 && !value_types.contains_key(&opref.0) {
+                    if runtime_refs.contains(&opref.0) && !value_types.contains_key(&opref.0) {
                         if let Some(&tp) = fat.get(i) {
                             value_types.insert(opref.0, tp);
                         }

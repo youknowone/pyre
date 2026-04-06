@@ -2184,7 +2184,7 @@ impl Optimization for OptHeap {
             let val = op.arg(1);
             if !val.is_none()
                 && val.0 >= ctx.num_inputs() as u32
-                && val.0 < 10_000
+                && !ctx.is_constant(val)
                 && !ctx
                     .new_operations
                     .iter()

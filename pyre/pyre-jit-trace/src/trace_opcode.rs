@@ -1155,7 +1155,7 @@ impl MIFrame {
     /// [static_fields..., array_items..., virtualizable_ptr].
     /// pyjitpl.py:2586: self.virtualizable_boxes → vable_array.
     /// opencoder.py:603 _encode parity: encode OpRef as SnapshotTagged.
-    /// Const OpRefs (>=10000) → Const(value, type) from pool.
+    /// Constant-pool OpRefs → Const(value, type) from pool.
     /// NONE → Const(0, Ref). Regular → Box.
     fn opref_to_snapshot_tagged(
         opref: OpRef,
@@ -1163,7 +1163,7 @@ impl MIFrame {
     ) -> majit_trace::recorder::SnapshotTagged {
         if opref.is_none() {
             majit_trace::recorder::SnapshotTagged::Const(0, majit_ir::Type::Ref)
-        } else if opref.0 >= 10_000 {
+        } else if ctx.constant_value(opref).is_some() {
             let val = ctx.constant_value(opref).unwrap_or(0);
             let tp = ctx.const_type(opref).unwrap_or(majit_ir::Type::Int);
             majit_trace::recorder::SnapshotTagged::Const(val, tp)
@@ -1291,7 +1291,7 @@ impl MIFrame {
             .map(|(i, &opref)| {
                 if opref.is_none() {
                     majit_trace::recorder::SnapshotTagged::Const(0, majit_ir::Type::Ref)
-                } else if opref.0 >= 10_000 {
+                } else if ctx.constant_value(opref).is_some() {
                     let val = ctx.constant_value(opref).unwrap_or(0);
                     let tp = ctx.const_type(opref).unwrap_or(majit_ir::Type::Int);
                     majit_trace::recorder::SnapshotTagged::Const(val, tp)

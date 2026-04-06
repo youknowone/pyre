@@ -24,6 +24,14 @@ use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Type, Value};
 
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
 
+fn is_trace_constant_ref(opref: OpRef, constants: &HashMap<u32, i64>) -> bool {
+    !opref.is_none() && constants.contains_key(&opref.0)
+}
+
+fn is_trace_runtime_ref(opref: OpRef, constants: &HashMap<u32, i64>) -> bool {
+    !opref.is_none() && !is_trace_constant_ref(opref, constants)
+}
+
 /// unroll.py: UnrollOptimizer — high-level loop optimization controller.
 ///
 /// Wraps the streaming OptUnroll pass with RPython's UnrollOptimizer API:
@@ -942,19 +950,13 @@ impl UnrollOptimizer {
 
     /// unroll.py: _map_args(mapping, arglist)
     /// Remap a list of OpRefs through a forwarding mapping.
-    /// Constants (OpRef >= 10000) are left unchanged.
+    /// Constant OpRefs are left unchanged because they are not remapped.
     pub fn map_args(
         mapping: &std::collections::HashMap<OpRef, OpRef>,
         args: &[OpRef],
     ) -> Vec<OpRef> {
         args.iter()
-            .map(|&arg| {
-                if arg.0 >= 10_000 {
-                    arg // constant, keep as-is
-                } else {
-                    mapping.get(&arg).copied().unwrap_or(arg)
-                }
-            })
+            .map(|&arg| mapping.get(&arg).copied().unwrap_or(arg))
             .collect()
     }
 
@@ -2478,11 +2480,10 @@ impl OptUnroll {
         // sign_obj), leading to InvalidLoop when the guard checks the
         // opposite branch.
         //
-        // Only import constant pool entries (OpRef >= 10000) that are
-        // truly invariant. All other constants are handled via PtrInfo
-        // below (known_class, instance, etc.).
+        // Only import values for targets already known to be constants in the
+        // Phase 2 context. Non-constant targets are handled via PtrInfo below.
         if let Some(value) = &info.constant {
-            if target.0 >= 10_000 {
+            if ctx.is_constant(target) {
                 ctx.make_constant(target, value.clone());
                 if let Value::Ref(ptr) = value {
                     ctx.set_ptr_info(target, crate::optimizeopt::info::PtrInfo::Constant(*ptr));
@@ -2568,7 +2569,12 @@ impl OptUnroll {
         exported_infos: &HashMap<OpRef, ExportedValueInfo>,
         ctx: &mut OptContext,
     ) -> OpRef {
-        if old.is_none() || old.0 >= 10_000 {
+        if old.is_none()
+            || ctx.is_constant(old)
+            || exported_infos
+                .get(&old)
+                .is_some_and(|info| info.constant.is_some())
+        {
             // Constants and NONE don't need remapping — they are globally
             // valid and won't be overwritten by Phase 2 trace processing.
             return old;
@@ -3425,7 +3431,7 @@ fn assemble_peeled_trace_with_jump_args(
     // to label_scope_dedup which assigns fresh OpRefs for each occurrence.
     for (idx, &label_arg) in extra_label_args.iter().enumerate() {
         let jump_arg = extra_jump_args.get(idx).copied().unwrap_or(label_arg);
-        if constants.contains_key(&label_arg.0) || label_args.contains(&label_arg) {
+        if is_trace_constant_ref(label_arg, constants) || label_args.contains(&label_arg) {
             continue;
         }
         filtered_extra_label_args.push(label_arg);
@@ -3496,7 +3502,7 @@ fn assemble_peeled_trace_with_jump_args(
     let mut full_label_args: Vec<OpRef> = label_args
         .iter()
         .copied()
-        .filter(|arg| !constants.contains_key(&arg.0))
+        .filter(|arg| !is_trace_constant_ref(*arg, constants))
         .collect();
 
     // Collect preamble-defined OpRefs BEFORE adding extra label args,
@@ -3580,29 +3586,29 @@ fn assemble_peeled_trace_with_jump_args(
     // position v36 followed by LABEL(v36) would redefine v36 as a block
     // param, but the body still uses the SameAs value — causing wrong results.
     for &la in &full_label_args {
-        if !la.is_none() && la.0 < 10_000 {
+        if is_trace_runtime_ref(la, constants) {
             max_pos = max_pos.max(la.0.saturating_add(1));
         }
     }
     for &la in &filtered_extra_label_args {
-        if !la.is_none() && la.0 < 10_000 {
+        if is_trace_runtime_ref(la, constants) {
             max_pos = max_pos.max(la.0.saturating_add(1));
         }
     }
     // Ensure fresh positions are above all body op positions to prevent
     // namespace collisions between assembly-allocated SameAs and body OpRefs.
     for op in p2_ops.iter() {
-        if !op.pos.is_none() && op.pos.0 < 10_000 {
+        if is_trace_runtime_ref(op.pos, constants) {
             max_pos = max_pos.max(op.pos.0.saturating_add(1));
         }
         for &arg in op.args.iter() {
-            if !arg.is_none() && arg.0 < 10_000 {
+            if is_trace_runtime_ref(arg, constants) {
                 max_pos = max_pos.max(arg.0.saturating_add(1));
             }
         }
         if let Some(ref fa) = op.fail_args {
             for &arg in fa.iter() {
-                if !arg.is_none() && arg.0 < 10_000 {
+                if is_trace_runtime_ref(arg, constants) {
                     max_pos = max_pos.max(arg.0.saturating_add(1));
                 }
             }
@@ -3615,7 +3621,7 @@ fn assemble_peeled_trace_with_jump_args(
             .iter()
             .chain(op.fail_args.as_ref().into_iter().flat_map(|fa| fa.iter()));
         for &arg in all_refs {
-            if arg.is_none() || arg.0 >= 10_000 {
+            if !is_trace_runtime_ref(arg, constants) {
                 continue; // skip NONE and constants
             }
             if label_set.contains(&arg)
