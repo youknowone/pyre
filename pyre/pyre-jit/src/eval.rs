@@ -949,9 +949,10 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
     let code = unsafe { &*frame.code };
     let env = PyreEnv;
     let (driver, info) = driver_pair();
-    // jitcode.py:18 parity: jitdriver_sd is not None for portals.
-    // Same criterion as codewriter.rs JitCode.is_portal: every named
-    // function is a potential portal. <module> runs once and is excluded.
+    // jitcode.py:18: jitdriver_sd is not None for portals.
+    // Inline check matches JitCode.is_portal set by codewriter.
+    // Cannot call codewriter::is_portal() here as it triggers
+    // lazy jitcode compilation which interferes with JIT state.
     let is_portal: bool = &*code.obj_name != "<module>";
 
     loop {

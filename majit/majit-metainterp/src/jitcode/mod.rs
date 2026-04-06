@@ -179,6 +179,10 @@ pub struct JitCode {
     /// to look up LivenessInfo at the current Python bytecode position.
     /// RPython: pc → offset into all_liveness (embedded in jitcode bytecodes).
     pub py_to_jit_pc: Vec<usize>,
+    /// Number of locals in the source function.
+    /// Used by bhimpl_jit_merge_point's recursive call to limit frame writeback
+    /// to merge-point args only (RPython greens + reds parity).
+    pub nlocals: usize,
     /// True if BC_ABORT was emitted (not BC_ABORT_PERMANENT).
     /// Set by JitCodeBuilder::abort(), not by raw byte scan.
     pub has_abort: bool,

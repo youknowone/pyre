@@ -241,19 +241,20 @@ impl CodeWriter {
         // are live at each PC.
         let mut depth_at_pc: Vec<u16> = vec![0; num_instrs];
 
-        // jitcode.py:14 jitdriver_sd: portal has a jitdriver.
+        // jitcode.py:18: jitdriver_sd is not None for portals.
         // RPython: jitdriver_sd is set on the portal jitcode by
         // call.py:148 grab_initial_jitcodes (exactly one per jitdriver).
-        // pyre: every named function is a potential portal (pyre's single
-        // jitdriver covers all functions). <module> is excluded because
-        // module-level code runs once — RPython never places
-        // jit_merge_point in module-level code.
+        // pyre: every named function is a potential portal. <module> is
+        // excluded — RPython never places jit_merge_point there.
         let is_portal = &*code.obj_name != "<module>";
-        // RPython: one jit_merge_point per jitcode (the first loop header).
-        // All other loop headers get loop_header (= BC_JUMP_TARGET, no-op
-        // in blackhole). The blackhole handler checks nextblackholeinterp
-        // to decide whether to exit (outermost) or no-op (inner helper).
-        let merge_point_pc = loop_header_pcs.iter().copied().min();
+        // jtransform.py:1690-1712: portal jitcodes get one jit_merge_point
+        // (the first loop header). Non-portal jitcodes only get loop_header
+        // (BC_JUMP_TARGET, no-op in blackhole).
+        let merge_point_pc = if is_portal {
+            loop_header_pcs.iter().copied().min()
+        } else {
+            None
+        };
         let mut emitted_merge_point = false;
 
         for py_pc in 0..num_instrs {
@@ -802,6 +803,7 @@ impl CodeWriter {
         jitcode.py_to_jit_pc = pc_map.clone();
 
         jitcode.is_portal = is_portal;
+        jitcode.nlocals = code.varnames.len();
 
         // blackhole.py handle_exception_in_frame: build exception handler table
         // from Python's code.exceptiontable. Maps Python PC ranges to JitCode PCs.
