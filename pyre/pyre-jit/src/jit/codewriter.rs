@@ -242,14 +242,13 @@ impl CodeWriter {
         let mut depth_at_pc: Vec<u16> = vec![0; num_instrs];
 
         // jitcode.py:18: jitdriver_sd is not None for portals.
-        // RPython: jitdriver_sd is set on the portal jitcode by
-        // call.py:148 grab_initial_jitcodes (exactly one per jitdriver).
+        // call.py:148 grab_initial_jitcodes: sets jitdriver_sd on portal.
         // pyre: every named function is a potential portal. <module> is
         // excluded — RPython never places jit_merge_point there.
         let is_portal = &*code.obj_name != "<module>";
-        // jtransform.py:1690-1712: portal jitcodes get one jit_merge_point
-        // (the first loop header). Non-portal jitcodes only get loop_header
-        // (BC_JUMP_TARGET, no-op in blackhole).
+        // RPython has one jit_merge_point per portal. pyre places
+        // jit_merge_point at the first loop header of portal jitcodes.
+        // Non-portal jitcodes get only loop_header (BC_JUMP_TARGET).
         let merge_point_pc = if is_portal {
             loop_header_pcs.iter().copied().min()
         } else {
@@ -268,8 +267,8 @@ impl CodeWriter {
             pc_map[py_pc] = assembler.current_pos();
             depth_at_pc[py_pc] = current_depth;
 
-            // jtransform.py: jit_merge_point at the portal's merge point;
-            // loop_header (BC_JUMP_TARGET) at all other backward jump targets.
+            // jtransform.py:1690/1714: jit_merge_point at the portal's
+            // merge point; loop_header at all other backward jump targets.
             if loop_header_pcs.contains(&py_pc) {
                 if merge_point_pc == Some(py_pc) && !emitted_merge_point {
                     assembler.jit_merge_point();
