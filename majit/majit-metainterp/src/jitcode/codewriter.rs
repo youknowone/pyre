@@ -953,6 +953,7 @@ impl JitCodeBuilder {
             exception_handlers: Vec::new(),
             jit_to_py_pc: Vec::new(),
             py_to_jit_pc: Vec::new(),
+            nlocals: 0,
             has_abort: self.has_abort,
             is_portal: false,
         }

@@ -1600,30 +1600,26 @@ impl BlackholeInterpreter {
                     return Err(DispatchError::LeaveFrame);
                 }
                 // blackhole.py:1074-1093: recursive portal level.
-                // bhimpl_recursive_call_{v,i,r,f} invokes portal_runner with
-                // the current register state as args. portal_runner enables
-                // JIT re-entry at recursive depth.
-                //
-                // pyre adaptation: write back blackhole registers to the
-                // virtualizable (PyFrame), set next_instr to the merge point
-                // PC, then call portal_runner_fn which runs eval_loop_jit.
-                // The result goes into tmpreg_r + ref_return (pyre functions
-                // return PyObjectRef).
+                // bhimpl_recursive_call_{v,i,r,f}(jdindex, *args) calls
+                // portal_runner with greens + reds as arguments.
                 if let Some(runner) = self.portal_runner_fn {
                     if self.virtualizable_ptr != 0 && !self.virtualizable_info.is_null() {
                         let py_pc =
                             self.jitcode.jit_pc_to_py_pc(self.last_opcode_position) as usize;
                         let frame_ptr = self.virtualizable_ptr as *mut u8;
                         let info = unsafe { &*self.virtualizable_info };
-                        // Write blackhole state → frame via virtualizable.
-                        // Static field 0 = next_instr → merge point PC.
+                        // Write merge-point args → frame via virtualizable.
+                        // Static field 0 = next_instr.
                         unsafe { info.write_field(frame_ptr, 0, py_pc as i64) };
-                        // Array 0 = locals_cells_stack_w. Write ref registers
-                        // (locals) so portal_runner sees current values.
-                        let nlocals = self.registers_r.len();
+                        // Array 0 = locals_cells_stack_w.
+                        // Write only locals (merge-point reds), not the
+                        // entire ref register bank.
+                        let nlocals = self.jitcode.nlocals;
                         for i in 0..nlocals {
-                            unsafe {
-                                info.write_array_item(frame_ptr, 0, i, self.registers_r[i]);
+                            if i < self.registers_r.len() {
+                                unsafe {
+                                    info.write_array_item(frame_ptr, 0, i, self.registers_r[i]);
+                                }
                             }
                         }
                         // bhimpl_recursive_call_r + bhimpl_ref_return
