@@ -16,6 +16,7 @@ cranelift-jit = "0.130"
 cranelift-module = "0.130"
 cranelift-native = "0.130"
 target-lexicon = "0.13"
+stacker = "0.1"
 
 [dev-dependencies]
 majit-trace = { workspace = true }

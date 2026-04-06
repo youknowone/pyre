@@ -247,7 +247,9 @@ where
     FBuiltin: FnOnce(PyObjectRef) -> Result<R, PyError>,
     FUser: FnOnce(PyObjectRef) -> Result<R, PyError>,
 {
-    unsafe {
+    // Grow stack for deep Python call recursion (fib(32+)).
+    // Red zone 512KB ensures growth before guard page hit.
+    stacker::maybe_grow(512 * 1024, 8 * 1024 * 1024, move || unsafe {
         if is_builtin_code(callable) {
             on_builtin(callable)
         } else if is_function(callable) {
@@ -258,7 +260,7 @@ where
                 (*(*callable).ob_type).tp_name
             )))
         }
-    }
+    }) // stacker::maybe_grow
 }
 
 pub fn binary_op_tag(op: BinaryOperator) -> Option<i64> {
