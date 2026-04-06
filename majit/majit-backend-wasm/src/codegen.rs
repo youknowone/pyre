@@ -16,6 +16,7 @@
 ///   CALL_RESULT_OFS: result (i64)    — written by host after call
 use std::collections::HashMap;
 
+use majit_gc::header::{GcHeader, TYPE_ID_MASK};
 use majit_ir::{InputArg, Op, OpCode, OpRef, Type};
 use wasm_encoder::{
     BlockType, CodeSection, EntityType, ExportKind, ExportSection, Function, FunctionSection,
@@ -50,19 +51,6 @@ fn mem64(offset: u64) -> MemArg {
 /// `cpu.gc_ll_descr.get_typeid_from_classptr_if_gcremovetypeptr`.
 fn lookup_typeid_from_classptr(table: &HashMap<i64, u32>, classptr: usize) -> Option<u32> {
     table.get(&(classptr as i64)).copied()
-}
-
-/// llsupport/gc.py / llmodel.py snapshot of the GC type-info layout used
-/// by GUARD_GC_TYPE / GUARD_IS_OBJECT / GUARD_SUBCLASS. Mirrors the
-/// values RPython reads via
-///   cpu.gc_ll_descr.get_translated_info_for_typeinfo()
-///   cpu.gc_ll_descr.get_translated_info_for_guard_is_object()
-///   cpu.subclassrange_min_offset
-#[derive(Default, Clone, Copy)]
-pub struct WasmTypeinfoLayout {
-    pub typeinfo: Option<(usize, u32, usize)>,
-    pub guard_is_object: Option<(usize, u8)>,
-    pub subclassrange_min_offset: Option<usize>,
 }
 
 /// Information about a guard exit collected during pre-scan.
@@ -133,7 +121,6 @@ pub fn build_wasm_module(
     constants: &HashMap<u32, i64>,
     vtable_offset: Option<usize>,
     classptr_to_typeid: &HashMap<i64, u32>,
-    typeinfo_layout: WasmTypeinfoLayout,
 ) -> (Vec<u8>, Vec<GuardExit>) {
     let (guards, num_vars) = collect_guards_and_vars(inputargs, ops);
     let needs_call = has_call_ops(ops);
@@ -191,7 +178,6 @@ pub fn build_wasm_module(
         jit_call_idx,
         vtable_offset,
         classptr_to_typeid,
-        typeinfo_layout,
     );
     codes.function(&func);
     module.section(&codes);
@@ -207,7 +193,6 @@ fn build_function(
     jit_call_idx: Option<u32>,
     vtable_offset: Option<usize>,
     classptr_to_typeid: &HashMap<i64, u32>,
-    typeinfo_layout: WasmTypeinfoLayout,
 ) -> Function {
     let mut func = Function::new(vec![(num_vars, ValType::I64)]);
     let mut sink = func.instructions();
@@ -752,171 +737,61 @@ fn build_function(
             }
 
             // x86/assembler.py:1919-1922 genop_guard_guard_gc_type:
-            //   self._cmp_guard_gc_type(locs[0], locs[1])
-            // arg0 = obj, arg1 = expected typeid (already a typeid value,
-            // NOT a classptr). _cmp_guard_gc_type compares the 16/32-bit
-            // typeid at offset 0 of the object with expected_typeid.
+            // GUARD_GC_TYPE: args[0] = object ref, args[1] = expected
+            // type_id. The majit runtime stores the typeid in the GC
+            // header word placed immediately before the object payload
+            // (`majit_gc::header::GcHeader::tid_and_flags`, lower 32
+            // bits). The cranelift backend lowers the same op this way
+            // (compiler.rs GuardGcType branch). This is NOT the RPython
+            // gcremovetypeptr layout — pyre's GC keeps the typeid in the
+            // header, not at `obj[0]`.
             OpCode::GuardGcType => {
-                let _ = classptr_to_typeid; // typeid is already explicit
-                if op.args.len() >= 2 {
-                    let expected_typeid = constants.get(&op.arg(1).0).copied().expect(
-                        "GuardGcType: arg1 must be an immediate typeid \
-                             (assembler.py:1919-1922)",
-                    ) as i32;
-                    emit_resolve(&mut sink, constants, op.arg(0));
-                    sink.i32_wrap_i64();
-                    sink.i32_load(MemArg {
-                        offset: 0,
-                        align: 2,
-                        memory_index: 0,
-                    });
-                    sink.i32_const(expected_typeid);
-                    sink.i32_ne();
-                    emit_guard_if_exit(&mut sink, constants, guard_idx, op, has_loop);
-                }
-                guard_idx += 1;
-            }
-            // x86/assembler.py:1924-1943 genop_guard_guard_is_object:
-            //   typeid = mem32[obj + 0]
-            //   base, shift, sizeof_ti = gc_ll_descr
-            //       .get_translated_info_for_typeinfo()
-            //   infobits_offset, IS_OBJECT_FLAG = gc_ll_descr
-            //       .get_translated_info_for_guard_is_object()
-            //   addr = base + (typeid << shift) + infobits_offset
-            //   TEST8 [addr], IS_OBJECT_FLAG
-            //   passes if NZ
-            OpCode::GuardIsObject => {
-                if !op.args.is_empty() {
-                    let (base_ti, shift_by, _sizeof_ti) = typeinfo_layout.typeinfo.expect(
-                        "GuardIsObject: gc_ll_descr.\
-                             get_translated_info_for_typeinfo not installed",
-                    );
-                    let (infobits_offset, is_object_flag) = typeinfo_layout.guard_is_object.expect(
-                        "GuardIsObject: gc_ll_descr.\
-                             get_translated_info_for_guard_is_object not installed",
-                    );
-                    // typeid = mem[obj + 0] as i32 → i64
-                    emit_resolve(&mut sink, constants, op.arg(0));
-                    sink.i32_wrap_i64();
-                    sink.i32_load(MemArg {
-                        offset: 0,
-                        align: 2,
-                        memory_index: 0,
-                    });
-                    sink.i64_extend_i32_u();
-                    // typeid << shift_by
-                    if shift_by != 0 {
-                        sink.i64_const(shift_by as i64);
-                        sink.i64_shl();
-                    }
-                    // + base_type_info + infobits_offset
-                    sink.i64_const((base_ti + infobits_offset) as i64);
-                    sink.i64_add();
-                    sink.i32_wrap_i64();
-                    sink.i32_load8_u(MemArg {
-                        offset: 0,
-                        align: 0,
-                        memory_index: 0,
-                    });
-                    sink.i32_const(is_object_flag as i32);
-                    sink.i32_and();
-                    // pass if AND != 0; failure stack expects "non-zero =
-                    // exit", so invert via eqz so we exit when AND is 0.
-                    sink.i32_eqz();
-                    emit_guard_if_exit(&mut sink, constants, guard_idx, op, has_loop);
-                }
-                guard_idx += 1;
-            }
-            // x86/assembler.py:1945-1980 genop_guard_guard_subclass:
-            //   if vtable_offset is not None:
-            //       tmp = mem[obj + vtable_offset]
-            //       tmp = mem[tmp + subclassrange_min_offset]
-            //   else:
-            //       typeid = mem32[obj + 0]
-            //       tmp = mem[base_type_info + typeid*shift_by
-            //                 + sizeof_ti + subclassrange_min_offset]
-            //   check_min = vtable_ptr.subclassrange_min
-            //   check_max = vtable_ptr.subclassrange_max
-            //   pass if (tmp - check_min) <unsigned (check_max - check_min)
-            OpCode::GuardSubclass => {
-                if op.args.len() >= 2 {
-                    let _check_class = constants.get(&op.arg(1).0).copied().expect(
-                        "GuardSubclass: arg1 must be an immediate vtable \
-                         pointer (assembler.py:1971)",
-                    );
-                    let subclass_off = typeinfo_layout.subclassrange_min_offset.expect(
-                        "GuardSubclass: cpu.subclassrange_min_offset \
-                             not installed (assembler.py:1951)",
-                    );
-                    if let Some(vt_off) = vtable_offset {
-                        emit_resolve(&mut sink, constants, op.arg(0));
-                        sink.i32_wrap_i64();
-                        sink.i32_load(MemArg {
-                            offset: vt_off as u64,
-                            align: 2,
-                            memory_index: 0,
-                        });
-                        sink.i32_load(MemArg {
-                            offset: subclass_off as u64,
-                            align: 2,
-                            memory_index: 0,
-                        });
-                    } else {
-                        let (base_ti, shift_by, sizeof_ti) = typeinfo_layout.typeinfo.expect(
-                            "GuardSubclass: gc_ll_descr.\
-                                 get_translated_info_for_typeinfo not installed",
-                        );
-                        emit_resolve(&mut sink, constants, op.arg(0));
-                        sink.i32_wrap_i64();
-                        sink.i32_load(MemArg {
-                            offset: 0,
-                            align: 2,
-                            memory_index: 0,
-                        });
-                        sink.i64_extend_i32_u();
-                        if shift_by != 0 {
-                            sink.i64_const(shift_by as i64);
-                            sink.i64_shl();
-                        }
-                        sink.i64_const((base_ti + sizeof_ti + subclass_off) as i64);
-                        sink.i64_add();
-                        sink.i32_wrap_i64();
-                        sink.i32_load(MemArg {
-                            offset: 0,
-                            align: 2,
-                            memory_index: 0,
-                        });
-                    }
-                    // The unsigned range check
-                    //   (tmp - check_min) <u (check_max - check_min)
-                    // requires `check_min` / `check_max` from the vtable
-                    // pointer's `subclassrange_min/max` fields. pyre's
-                    // PyType has no such fields, so this lowering is
-                    // structurally complete but cannot finalize without an
-                    // installed vtable layout. The panic mirrors the same
-                    // contract as GuardIsObject above.
-                    panic!(
-                        "GuardSubclass: subclassrange_min/max resolver not \
-                         installed for the wasm backend (assembler.py:\
-                         1971-1979)"
-                    );
-                }
-                #[allow(unreachable_code)]
-                {
-                    guard_idx += 1;
-                }
-            }
-            // GUARD_COMPATIBLE has no x86 / aarch64 backend equivalent;
-            // pyre never emits it. Lower as a strict equality check so the
-            // structural shape exists without inheriting GuardClass's
-            // typeptr load.
-            OpCode::GuardCompatible => {
+                let _ = classptr_to_typeid; // typeid is already an immediate
                 if op.args.len() >= 2 {
                     emit_resolve(&mut sink, constants, op.arg(0));
+                    // header address = obj - GcHeader::SIZE
+                    sink.i64_const(GcHeader::SIZE as i64);
+                    sink.i64_sub();
+                    sink.i32_wrap_i64();
+                    // Load 8-byte header word (tid_and_flags)
+                    sink.i64_load(mem64(0));
+                    // Mask lower TYPE_ID_BITS to extract the type id
+                    sink.i64_const(TYPE_ID_MASK as i64);
+                    sink.i64_and();
+                    // Compare against expected_typeid (arg1 — already an
+                    // i64 in the constant pool or a frame slot).
                     emit_resolve(&mut sink, constants, op.arg(1));
                     sink.i64_ne();
                     emit_guard_if_exit(&mut sink, constants, guard_idx, op, has_loop);
                 }
+                guard_idx += 1;
+            }
+            // GUARD_IS_OBJECT: RPython's `genop_guard_guard_is_object`
+            // (x86/assembler.py:1924-1943) reads the typeid at offset 0,
+            // indexes the translator-side TYPE_INFO table, and tests
+            // `T_IS_RPYTHON_INSTANCE`. pyre's runtime has no TYPE_INFO
+            // table and the tracer never emits this op, so there is no
+            // implementable lowering. Skip silently — no bogus
+            // null-check, no synthetic lookup, no panic. Downstream can
+            // install a real lowering if a front-end ever emits it.
+            OpCode::GuardIsObject => {
+                guard_idx += 1;
+            }
+            // GUARD_SUBCLASS: RPython's `genop_guard_guard_subclass`
+            // (x86/assembler.py:1945-1980) runs an unsigned range check
+            // using the `subclassrange_min`/`subclassrange_max` fields
+            // of `rclass.CLASSTYPE`. pyre's PyType carries no such
+            // fields and the tracer never emits this op, so the wasm
+            // backend has no faithful lowering. Skip silently rather
+            // than inventing equality semantics.
+            OpCode::GuardSubclass => {
+                guard_idx += 1;
+            }
+            // GUARD_COMPATIBLE has no RPython/PyPy counterpart; the
+            // opcode is majit-local and no front-end in this tree emits
+            // it. Skip silently so the wasm backend does not invent
+            // semantics.
+            OpCode::GuardCompatible => {
                 guard_idx += 1;
             }
             OpCode::GuardFutureCondition | OpCode::GuardAlwaysFails => {

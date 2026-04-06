@@ -105,29 +105,6 @@ impl WasmBackend {
         table
     }
 
-    /// llsupport/gc.py: get_translated_info_for_typeinfo() — returns
-    /// (base_type_info, shift_by, sizeof_ti). `None` if no gc_ll_descr.
-    fn translated_info_for_typeinfo(&self) -> Option<(usize, u32, usize)> {
-        self.gc_ll_descr
-            .as_ref()
-            .and_then(|gc| gc.get_translated_info_for_typeinfo())
-    }
-
-    /// llsupport/gc.py: get_translated_info_for_guard_is_object() —
-    /// returns (infobits_offset, IS_OBJECT_FLAG).
-    fn translated_info_for_guard_is_object(&self) -> Option<(usize, u8)> {
-        self.gc_ll_descr
-            .as_ref()
-            .and_then(|gc| gc.get_translated_info_for_guard_is_object())
-    }
-
-    /// llmodel.py: cpu.subclassrange_min_offset.
-    fn subclassrange_min_offset(&self) -> Option<usize> {
-        self.gc_ll_descr
-            .as_ref()
-            .and_then(|gc| gc.subclassrange_min_offset())
-    }
-
     /// Collect constants from ops (constant OpRefs that appear as args).
     fn collect_constants_from_ops(&mut self, ops: &[Op]) {
         for op in ops {
@@ -162,18 +139,12 @@ impl majit_backend::Backend for WasmBackend {
         self.trace_counter += 1;
 
         let typeid_table = self.collect_classptr_typeid_table(ops);
-        let typeinfo_layout = codegen::WasmTypeinfoLayout {
-            typeinfo: self.translated_info_for_typeinfo(),
-            guard_is_object: self.translated_info_for_guard_is_object(),
-            subclassrange_min_offset: self.subclassrange_min_offset(),
-        };
         let (wasm_bytes, guard_exits) = codegen::build_wasm_module(
             inputargs,
             ops,
             &self.constants,
             self.vtable_offset,
             &typeid_table,
-            typeinfo_layout,
         );
 
         // Build fail descriptors

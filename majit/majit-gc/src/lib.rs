@@ -226,43 +226,6 @@ pub trait GcAllocator: Send {
     /// how RPython's translator emits the vtable→typeid pair into the
     /// GC type_info_group.
     fn register_vtable_for_type(&mut self, _vtable: usize, _type_id: u32) {}
-
-    /// llsupport/gc.py: GcLLDescr_framework
-    ///   .get_translated_info_for_typeinfo()
-    /// Returns `(base_type_info, shift_by, sizeof_ti)`:
-    ///   - `base_type_info`: address of the GC `type_info_group` table
-    ///   - `shift_by`: scale applied to typeid before indexing (0 on
-    ///     64-bit, 2 on 32-bit per gc.py:597)
-    ///   - `sizeof_ti`: byte size of one `TYPE_INFO` entry
-    /// Used by `_cmp_guard_gc_type`-aware backends when computing the
-    /// address of typeinfo fields from a typeid loaded out of an object.
-    /// Default `None` indicates no installed translator-side typeinfo
-    /// table; the lowering for GUARD_IS_OBJECT/GUARD_SUBCLASS panics
-    /// rather than silently emitting bogus code.
-    fn get_translated_info_for_typeinfo(&self) -> Option<(usize, u32, usize)> {
-        None
-    }
-
-    /// llsupport/gc.py: GcLLDescr_framework
-    ///   .get_translated_info_for_guard_is_object()
-    /// Returns `(infobits_offset, IS_OBJECT_FLAG)`:
-    ///   - `infobits_offset`: byte offset of the `infobits` field inside
-    ///     a `TYPE_INFO` entry
-    ///   - `IS_OBJECT_FLAG`: bit mask of `T_IS_RPYTHON_INSTANCE`
-    /// Default `None` indicates no installed translator-side typeinfo
-    /// layout for GUARD_IS_OBJECT.
-    fn get_translated_info_for_guard_is_object(&self) -> Option<(usize, u8)> {
-        None
-    }
-
-    /// llmodel.py: AbstractLLCPU.subclassrange_min_offset.
-    /// Byte offset of `subclassrange_min` inside the vtable struct.
-    /// Used by GUARD_SUBCLASS to read the bound directly from the vtable
-    /// (assembler.py:1951-1956). Default `None` indicates no installed
-    /// vtable layout.
-    fn subclassrange_min_offset(&self) -> Option<usize> {
-        None
-    }
 }
 
 /// GC rewriter — transforms IR operations for GC integration.
