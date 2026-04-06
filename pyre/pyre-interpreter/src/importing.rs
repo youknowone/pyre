@@ -515,7 +515,7 @@ fn check_sys_modules(name: &str) -> Option<PyObjectRef> {
     SYS_MODULES.with(|m| m.borrow().get(name).copied())
 }
 
-fn set_sys_module(name: &str, module: PyObjectRef) {
+pub fn set_sys_module(name: &str, module: PyObjectRef) {
     SYS_MODULES.with(|m| {
         m.borrow_mut().insert(name.to_string(), module);
     });

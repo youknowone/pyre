@@ -159,6 +159,14 @@ fn run_source(source: &str, mode: Mode) {
     // Set execution context for __build_class__ to use
     call::set_build_class_exec_ctx(Rc::as_ptr(&execution_context));
     let mut frame = PyFrame::new_with_context(code, execution_context);
+
+    // Register __main__ module in sys.modules — PyPy: app_main sets
+    // sys.modules['__main__'] before executing user code so that
+    // enum.global_enum and similar introspection works.
+    let main_module =
+        pyre_object::moduleobject::w_module_new("__main__", frame.namespace as *mut u8);
+    importing::set_sys_module("__main__", main_module);
+
     match eval_with_jit(&mut frame) {
         Ok(result) => {
             if !result.is_null() && !unsafe { pyre_object::is_none(result) } {

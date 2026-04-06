@@ -726,6 +726,38 @@ pub fn str_method_expandtabs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     Ok(w_str_new(&result))
 }
 
+/// PyPy: unicodeobject.py descr_translate
+///
+/// str.translate(table) — table is a dict mapping ordinals (int) to
+/// ordinals (int), strings (str), or None (delete).
+pub fn str_method_translate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    assert!(args.len() >= 2, "translate() takes exactly one argument");
+    let s = unsafe { w_str_get_value(args[0]) };
+    let table = args[1];
+    let mut result = String::with_capacity(s.len());
+    unsafe {
+        for ch in s.chars() {
+            let key = w_int_new(ch as i64);
+            if let Some(val) = w_dict_lookup(table, key) {
+                if is_none(val) {
+                    // None → delete character
+                } else if is_int(val) {
+                    if let Some(c) = char::from_u32(w_int_get_value(val) as u32) {
+                        result.push(c);
+                    }
+                } else if is_str(val) {
+                    result.push_str(w_str_get_value(val));
+                } else {
+                    result.push(ch);
+                }
+            } else {
+                result.push(ch);
+            }
+        }
+    }
+    Ok(w_str_new(&result))
+}
+
 // ── Dict methods ─────────────────────────────────────────────────────
 
 /// Resolve the actual backing W_DictObject for either a plain dict or

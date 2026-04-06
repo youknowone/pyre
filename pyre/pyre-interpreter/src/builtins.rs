@@ -65,11 +65,62 @@ pub fn install_default_builtins(namespace: &mut PyNamespace) {
     });
     // Type stubs for missing builtin types
     namespace.get_or_insert_with("bytearray", || {
-        builtin_code_new("bytearray", |_| Ok(w_str_new("")))
+        builtin_code_new("bytearray", |args| {
+            if args.is_empty() {
+                return Ok(pyre_object::bytearrayobject::w_bytearray_new(0));
+            }
+            let arg = args[0];
+            unsafe {
+                if pyre_object::is_int(arg) {
+                    let n = pyre_object::w_int_get_value(arg) as usize;
+                    return Ok(pyre_object::bytearrayobject::w_bytearray_new(n));
+                }
+                if pyre_object::is_str(arg) {
+                    let s = pyre_object::w_str_get_value(arg);
+                    return Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(
+                        s.as_bytes(),
+                    ));
+                }
+            }
+            Ok(pyre_object::bytearrayobject::w_bytearray_new(0))
+        })
     });
-    namespace.get_or_insert_with("bytes", || builtin_code_new("bytes", |_| Ok(w_str_new(""))));
+    namespace.get_or_insert_with("bytes", || {
+        builtin_code_new("bytes", |args| {
+            if args.is_empty() {
+                return Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(&[]));
+            }
+            let arg = args[0];
+            unsafe {
+                if pyre_object::is_int(arg) {
+                    let n = pyre_object::w_int_get_value(arg) as usize;
+                    return Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(
+                        &vec![0u8; n],
+                    ));
+                }
+                if pyre_object::is_str(arg) {
+                    let s = pyre_object::w_str_get_value(arg);
+                    return Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(
+                        s.as_bytes(),
+                    ));
+                }
+            }
+            Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(&[]))
+        })
+    });
+    namespace.get_or_insert_with("slice", || {
+        // The slice type object, for isinstance(x, slice) checks.
+        crate::typedef::gettypefor(&pyre_object::sliceobject::SLICE_TYPE)
+            .unwrap_or(pyre_object::PY_NULL)
+    });
     namespace.get_or_insert_with("frozenset", || {
-        builtin_code_new("frozenset", |_| Ok(w_tuple_new(vec![])))
+        builtin_code_new("frozenset", |args| {
+            if args.is_empty() {
+                return Ok(w_tuple_new(vec![]));
+            }
+            let items = collect_iterable(args[0])?;
+            Ok(w_tuple_new(items))
+        })
     });
     namespace.get_or_insert_with("set", || {
         builtin_code_new("set", |args| {
@@ -833,6 +884,8 @@ pub(crate) fn builtin_int(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     }
     let obj = args[0];
     unsafe {
+        // int(int_value) → return as-is. base argument is meaningful only
+        // for string conversion; ignore it for int/float/bool inputs.
         if is_int(obj) {
             return Ok(obj);
         }
@@ -842,11 +895,73 @@ pub(crate) fn builtin_int(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         if is_bool(obj) {
             return Ok(w_int_new(if w_bool_get_value(obj) { 1 } else { 0 }));
         }
-        if is_str(obj) {
-            let s = w_str_get_value(obj);
-            if let Ok(v) = s.trim().parse::<i64>() {
+        // int(string, base) — parse string in given base.
+        let base: u32 = if args.len() > 1 && is_int(args[1]) {
+            w_int_get_value(args[1]) as u32
+        } else {
+            10
+        };
+        // bytearray/bytes input is treated like a string of ASCII digits.
+        if pyre_object::bytearrayobject::is_bytearray(obj) {
+            let data = pyre_object::bytearrayobject::w_bytearray_data(obj);
+            let s_owned = String::from_utf8_lossy(data).into_owned();
+            let s = s_owned.trim();
+            let cleaned: String = s.chars().filter(|&c| c != '_').collect();
+            if let Ok(v) = i64::from_str_radix(&cleaned, base) {
                 return Ok(w_int_new(v));
             }
+            return Err(crate::PyError::new(
+                crate::PyErrorKind::ValueError,
+                format!("invalid literal for int() with base {base}: '{s}'"),
+            ));
+        }
+        if is_str(obj) {
+            let s = w_str_get_value(obj).trim();
+            // Strip optional 0b/0o/0x prefix when base is 0 or matches.
+            let (sign, rest) = if let Some(r) = s.strip_prefix('-') {
+                (-1i64, r)
+            } else if let Some(r) = s.strip_prefix('+') {
+                (1i64, r)
+            } else {
+                (1i64, s)
+            };
+            let (radix, digits) = if base == 0 {
+                if let Some(r) = rest.strip_prefix("0x").or(rest.strip_prefix("0X")) {
+                    (16u32, r)
+                } else if let Some(r) = rest.strip_prefix("0b").or(rest.strip_prefix("0B")) {
+                    (2u32, r)
+                } else if let Some(r) = rest.strip_prefix("0o").or(rest.strip_prefix("0O")) {
+                    (8u32, r)
+                } else {
+                    (10u32, rest)
+                }
+            } else {
+                let stripped = match base {
+                    16 => rest
+                        .strip_prefix("0x")
+                        .or(rest.strip_prefix("0X"))
+                        .unwrap_or(rest),
+                    2 => rest
+                        .strip_prefix("0b")
+                        .or(rest.strip_prefix("0B"))
+                        .unwrap_or(rest),
+                    8 => rest
+                        .strip_prefix("0o")
+                        .or(rest.strip_prefix("0O"))
+                        .unwrap_or(rest),
+                    _ => rest,
+                };
+                (base, stripped)
+            };
+            // Skip underscores allowed in numeric literals.
+            let cleaned: String = digits.chars().filter(|&c| c != '_').collect();
+            if let Ok(v) = i64::from_str_radix(&cleaned, radix) {
+                return Ok(w_int_new(sign * v));
+            }
+            return Err(crate::PyError::new(
+                crate::PyErrorKind::ValueError,
+                format!("invalid literal for int() with base {base}: '{s}'"),
+            ));
         }
     }
     // __int__ protocol
@@ -1476,6 +1591,18 @@ fn builtin_chr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let obj = args[0];
     let val = if unsafe { is_int(obj) } {
         unsafe { w_int_get_value(obj) }
+    } else if unsafe { is_str(obj) } {
+        // pyre treats `b'...'` literals as str; iterating yields 1-char str.
+        // Accept single-char str and use its codepoint as the value.
+        let s = unsafe { w_str_get_value(obj) };
+        match s.chars().next() {
+            Some(c) => c as i64,
+            None => {
+                return Err(crate::PyError::type_error(
+                    "chr() arg must be a non-empty string",
+                ));
+            }
+        }
     } else {
         // int subclass instance — check __int_value__ via builtin_int
         match builtin_int(args) {

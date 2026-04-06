@@ -5,6 +5,14 @@
 use crate::{PyNamespace, builtin_code_new, namespace_store};
 use pyre_object::*;
 use sre_engine::engine::{Request, State, StrDrive};
+use std::cell::RefCell;
+
+thread_local! {
+    /// W_SRE_Pattern type object — PyPy: interp_sre.W_SRE_Pattern
+    static SRE_PATTERN_TYPE: RefCell<PyObjectRef> = const { RefCell::new(pyre_object::PY_NULL) };
+    /// W_SRE_Match type object — PyPy: interp_sre.W_SRE_Match
+    static SRE_MATCH_TYPE: RefCell<PyObjectRef> = const { RefCell::new(pyre_object::PY_NULL) };
+}
 
 pub fn init(ns: &mut PyNamespace) {
     namespace_store(ns, "MAGIC", w_int_new(20230612)); // SRE magic number
@@ -76,6 +84,12 @@ pub fn init(ns: &mut PyNamespace) {
             ) as i64))
         }),
     );
+    // Create SRE_Pattern and SRE_Match types.
+    // PyPy: interp_sre.py W_SRE_Pattern, W_SRE_Match
+    let pat_type = crate::typedef::make_builtin_type("re.Pattern", |_| {});
+    SRE_PATTERN_TYPE.with(|t| *t.borrow_mut() = pat_type);
+    let match_type = crate::typedef::make_builtin_type("re.Match", |_| {});
+    SRE_MATCH_TYPE.with(|t| *t.borrow_mut() = match_type);
 }
 
 /// _sre.compile(pattern, flags, code, groups, groupindex, indexgroup)
@@ -107,7 +121,8 @@ fn sre_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let code_vec = extract_code(code_list)?;
     let code_box = Box::leak(Box::new(code_vec));
 
-    let pat = w_instance_new(crate::typedef::w_object());
+    let pat_type = SRE_PATTERN_TYPE.with(|t| *t.borrow());
+    let pat = w_instance_new(pat_type);
     crate::baseobjspace::ATTR_TABLE.with(|t| {
         let mut t = t.borrow_mut();
         let d = t.entry(pat as usize).or_default();
@@ -213,7 +228,8 @@ fn do_match(
 }
 
 fn make_match(pat: PyObjectRef, string: PyObjectRef, state: &State<&str>, s: &str) -> PyObjectRef {
-    let m = w_instance_new(crate::typedef::w_object());
+    let match_type = SRE_MATCH_TYPE.with(|t| *t.borrow());
+    let m = w_instance_new(match_type);
     let start = state.start;
     let end = state.string_position;
 

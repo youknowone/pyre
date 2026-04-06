@@ -728,6 +728,17 @@ pub fn add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         if is_tuple(a) && is_tuple(b) {
             return tuple_concat(a, b);
         }
+        if pyre_object::bytearrayobject::is_bytearray(a)
+            && pyre_object::bytearrayobject::is_bytearray(b)
+        {
+            let a_data = pyre_object::bytearrayobject::w_bytearray_data(a);
+            let b_data = pyre_object::bytearrayobject::w_bytearray_data(b);
+            let mut result = a_data.to_vec();
+            result.extend_from_slice(b_data);
+            return Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(
+                &result,
+            ));
+        }
         // Instance dunder dispatch: __add__
         if let Some(result) = try_instance_binop(a, b, "__add__") {
             return result;
@@ -874,6 +885,26 @@ unsafe fn str_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> PyResult {
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 1 < bytes.len() {
             i += 1;
+            // Named format: %(name)s — look up key in dict
+            let named_arg = if i < bytes.len() && bytes[i] == b'(' {
+                i += 1; // skip '('
+                let mut key = String::new();
+                while i < bytes.len() && bytes[i] != b')' {
+                    key.push(bytes[i] as char);
+                    i += 1;
+                }
+                if i < bytes.len() {
+                    i += 1; // skip ')'
+                }
+                // args must be a dict
+                if is_dict(args) {
+                    w_dict_getitem_str(args, &key)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             // Parse optional width/flags
             let mut width = String::new();
             while i < bytes.len()
@@ -882,6 +913,7 @@ unsafe fn str_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> PyResult {
                     || bytes[i] == b'0'
                     || bytes[i] == b' '
                     || bytes[i].is_ascii_digit()
+                    || bytes[i] == b'*'
                     || bytes[i] == b'.')
             {
                 width.push(bytes[i] as char);
@@ -896,12 +928,15 @@ unsafe fn str_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> PyResult {
                 result.push('%');
                 continue;
             }
-            let arg = if arg_idx < arg_list.len() {
-                arg_list[arg_idx]
+            let arg = if let Some(na) = named_arg {
+                na
+            } else if arg_idx < arg_list.len() {
+                let a = arg_list[arg_idx];
+                arg_idx += 1;
+                a
             } else {
                 pyre_object::w_none()
             };
-            arg_idx += 1;
             match spec {
                 's' => {
                     result.push_str(&crate::py_str(arg));
@@ -1441,22 +1476,46 @@ pub fn getitem(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
                 let len = w_list_len(obj) as i64;
                 let start = w_slice_get_start(index);
                 let stop = w_slice_get_stop(index);
-                let s = if is_none(start) {
-                    0
+                let step = w_slice_get_step(index);
+                let step_val = if is_none(step) {
+                    1
                 } else {
-                    w_int_get_value(start)
+                    w_int_get_value(step)
+                };
+                let s = if is_none(start) {
+                    if step_val < 0 { len - 1 } else { 0 }
+                } else {
+                    let v = w_int_get_value(start);
+                    if v < 0 { (len + v).max(0) } else { v.min(len) }
                 };
                 let e = if is_none(stop) {
-                    len
+                    if step_val < 0 { -1 } else { len }
                 } else {
-                    w_int_get_value(stop)
+                    let v = w_int_get_value(stop);
+                    if v < 0 { (len + v).max(-1) } else { v.min(len) }
                 };
-                let s = if s < 0 { (len + s).max(0) } else { s.min(len) } as usize;
-                let e = if e < 0 { (len + e).max(0) } else { e.min(len) } as usize;
                 let mut items = Vec::new();
-                for i in s..e {
-                    if let Some(v) = w_list_getitem(obj, i as i64) {
-                        items.push(v);
+                if step_val == 1 {
+                    for i in s..e {
+                        if let Some(v) = w_list_getitem(obj, i) {
+                            items.push(v);
+                        }
+                    }
+                } else if step_val > 0 {
+                    let mut i = s;
+                    while i < e {
+                        if let Some(v) = w_list_getitem(obj, i) {
+                            items.push(v);
+                        }
+                        i += step_val;
+                    }
+                } else if step_val < 0 {
+                    let mut i = s;
+                    while i > e {
+                        if let Some(v) = w_list_getitem(obj, i) {
+                            items.push(v);
+                        }
+                        i += step_val;
                     }
                 }
                 return Ok(w_list_new(items));
@@ -1611,6 +1670,70 @@ pub fn getitem(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
             } else {
                 Err(PyError::type_error("string indices must be integers"))
             }
+        } else if pyre_object::bytearrayobject::is_bytearray(obj) {
+            if is_int(index) {
+                let idx = w_int_get_value(index);
+                let len = pyre_object::bytearrayobject::w_bytearray_len(obj) as i64;
+                let actual = if idx < 0 { len + idx } else { idx };
+                if actual >= 0 && actual < len {
+                    return Ok(w_int_new(
+                        pyre_object::bytearrayobject::w_bytearray_getitem(obj, actual as usize)
+                            as i64,
+                    ));
+                }
+                return Err(PyError::new(
+                    PyErrorKind::IndexError,
+                    "bytearray index out of range",
+                ));
+            }
+            if is_slice(index) {
+                let len = pyre_object::bytearrayobject::w_bytearray_len(obj) as i64;
+                let start = w_slice_get_start(index);
+                let stop = w_slice_get_stop(index);
+                let step = w_slice_get_step(index);
+                let step_val = if is_none(step) {
+                    1
+                } else {
+                    w_int_get_value(step)
+                };
+                let s_val = if is_none(start) {
+                    if step_val < 0 { len - 1 } else { 0 }
+                } else {
+                    let v = w_int_get_value(start);
+                    if v < 0 { (len + v).max(0) } else { v.min(len) }
+                };
+                let e_val = if is_none(stop) {
+                    if step_val < 0 { -1 } else { len }
+                } else {
+                    let v = w_int_get_value(stop);
+                    if v < 0 { (len + v).max(-1) } else { v.min(len) }
+                };
+                let mut result = Vec::new();
+                let mut i = s_val;
+                if step_val > 0 {
+                    while i < e_val {
+                        if i >= 0 && i < len {
+                            result.push(pyre_object::bytearrayobject::w_bytearray_getitem(
+                                obj, i as usize,
+                            ));
+                        }
+                        i += step_val;
+                    }
+                } else if step_val < 0 {
+                    while i > e_val {
+                        if i >= 0 && i < len {
+                            result.push(pyre_object::bytearrayobject::w_bytearray_getitem(
+                                obj, i as usize,
+                            ));
+                        }
+                        i += step_val;
+                    }
+                }
+                return Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(
+                    &result,
+                ));
+            }
+            return Err(PyError::type_error("bytearray indices must be integers"));
         } else if is_type(obj) {
             // Python 3.9+ generic subscript: type[X] → __class_getitem__(X)
             // PyPy: typeobject.py type.__class_getitem__
@@ -1761,6 +1884,22 @@ pub fn setitem(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef) -> PyRe
         } else if is_dict(obj) {
             w_dict_store(obj, index, value);
             Ok(w_none())
+        } else if pyre_object::bytearrayobject::is_bytearray(obj) {
+            if is_int(index) {
+                let idx = w_int_get_value(index);
+                let len = pyre_object::bytearrayobject::w_bytearray_len(obj) as i64;
+                let actual = if idx < 0 { len + idx } else { idx };
+                if actual >= 0 && actual < len {
+                    let val = w_int_get_value(value) as u8;
+                    pyre_object::bytearrayobject::w_bytearray_setitem(obj, actual as usize, val);
+                    return Ok(w_none());
+                }
+                return Err(PyError::new(
+                    PyErrorKind::IndexError,
+                    "bytearray index out of range",
+                ));
+            }
+            Err(PyError::type_error("bytearray indices must be integers"))
         } else if is_instance(obj) {
             // PyPy: descroperation.py __setitem__
             if let Some(method) = lookup_in_type_where(w_instance_get_type(obj), "__setitem__") {
@@ -1881,6 +2020,10 @@ pub fn len(obj: PyObjectRef) -> PyResult {
             Ok(w_int_new(w_dict_len(obj) as i64))
         } else if is_str(obj) {
             Ok(w_int_new(w_str_len(obj) as i64))
+        } else if pyre_object::bytearrayobject::is_bytearray(obj) {
+            Ok(w_int_new(
+                pyre_object::bytearrayobject::w_bytearray_len(obj) as i64,
+            ))
         } else if is_instance(obj) {
             // Instance __len__ — PyPy: descroperation.py len
             if let Some(method) = lookup_in_type_where(w_instance_get_type(obj), "__len__") {
@@ -1915,10 +2058,12 @@ thread_local! {
 }
 
 fn namespace_to_dict(ns_ptr: *const crate::PyNamespace) -> PyObjectRef {
-    let dict = pyre_object::w_dict_new();
     if ns_ptr.is_null() {
-        return dict;
+        return pyre_object::w_dict_new();
     }
+    // Create a dict backed by the namespace so that dict.update() etc.
+    // can sync changes back to the original namespace.
+    let dict = pyre_object::dictobject::w_dict_new_with_namespace(ns_ptr as *mut u8);
     unsafe {
         for (key, &value) in (*ns_ptr).entries() {
             if !value.is_null() {
@@ -2961,6 +3106,18 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
             let len = w_str_get_value(obj).len();
             return Ok(pyre_object::w_seq_iter_new(obj, len));
         }
+        if pyre_object::bytearrayobject::is_bytearray(obj) {
+            let len = pyre_object::bytearrayobject::w_bytearray_len(obj);
+            // Convert to list of ints for iteration
+            let mut items = Vec::with_capacity(len);
+            for i in 0..len {
+                items.push(w_int_new(
+                    pyre_object::bytearrayobject::w_bytearray_getitem(obj, i) as i64,
+                ));
+            }
+            let list = pyre_object::w_list_new(items);
+            return Ok(pyre_object::w_seq_iter_new(list, len));
+        }
         // dict → iterate over keys (dictobject.py __iter__)
         if is_dict(obj) {
             let d = &*(obj as *const pyre_object::dictobject::W_DictObject);
@@ -2977,8 +3134,54 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         }
         // Instance __iter__ — check type MRO and ATTR_TABLE
         if is_instance(obj) {
-            if let Ok(method) = getattr(obj, "__iter__") {
+            // Check type MRO first (PyPy: type(obj).__iter__)
+            let w_type = w_instance_get_type(obj);
+            if let Some(method) = lookup_in_type_where(w_type, "__iter__") {
                 return Ok(crate::call_function(method, &[obj]));
+            }
+            // Per-instance __iter__ in ATTR_TABLE
+            let inst_iter = ATTR_TABLE.with(|t| {
+                t.borrow()
+                    .get(&(obj as usize))
+                    .and_then(|d| d.get("__iter__").copied())
+            });
+            if let Some(method) = inst_iter {
+                return Ok(crate::call_function(method, &[obj]));
+            }
+            // Fallback: __getitem__ protocol — if object has __getitem__,
+            // iterate by calling __getitem__(0), __getitem__(1), ...
+            // until IndexError is raised. Use __len__ to determine bound.
+            let w_type = w_instance_get_type(obj);
+            if lookup_in_type_where(w_type, "__getitem__").is_some()
+                || getattr(obj, "__getitem__").is_ok()
+            {
+                // Try to use __len__ to bound the iteration.
+                let mut items = Vec::new();
+                if let Ok(len_result) = len(obj) {
+                    if is_int(len_result) {
+                        let n = w_int_get_value(len_result);
+                        for i in 0..n {
+                            match getitem(obj, w_int_new(i)) {
+                                Ok(item) => items.push(item),
+                                Err(_) => break,
+                            }
+                        }
+                        let count = items.len();
+                        let list = w_list_new(items);
+                        return Ok(pyre_object::w_seq_iter_new(list, count));
+                    }
+                }
+                // No __len__: iterate up to a reasonable bound, breaking on
+                // any error (PyPy: descroperation iter_via_getitem with sentinel).
+                for i in 0..1_000_000i64 {
+                    match getitem(obj, w_int_new(i)) {
+                        Ok(item) => items.push(item),
+                        Err(_) => break,
+                    }
+                }
+                let count = items.len();
+                let list = w_list_new(items);
+                return Ok(pyre_object::w_seq_iter_new(list, count));
             }
         }
         // Type object: check metaclass __iter__ (NOT the type's own MRO)
@@ -3047,7 +3250,14 @@ pub fn next(obj: PyObjectRef) -> PyResult {
         // Range iterator
         if is_range_iter(obj) {
             let iter = &mut *(obj as *mut pyre_object::rangeobject::W_RangeIterator);
-            if iter.current < iter.stop {
+            let has_next = if iter.step > 0 {
+                iter.current < iter.stop
+            } else if iter.step < 0 {
+                iter.current > iter.stop
+            } else {
+                false
+            };
+            if has_next {
                 let val = w_int_new(iter.current);
                 iter.current += iter.step;
                 return Ok(val);
