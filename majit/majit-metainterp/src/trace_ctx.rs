@@ -425,6 +425,12 @@ impl TraceCtx {
             .get_or_insert_typed(value, majit_ir::Type::Ref)
     }
 
+    /// Get or create a Float-typed constant OpRef.
+    pub fn const_float(&mut self, value: i64) -> OpRef {
+        self.constants
+            .get_or_insert_typed(value, majit_ir::Type::Float)
+    }
+
     /// Mark an existing constant OpRef with a specific type.
     /// Used when const_int() was called but the value is actually a Ref pointer
     /// (e.g., ob_type field). This preserves Cranelift's Int treatment while
@@ -678,6 +684,15 @@ impl TraceCtx {
     /// Record a ref-typed promote (GUARD_VALUE for GC references).
     pub fn promote_ref(&mut self, opref: OpRef, runtime_value: i64, num_live: usize) -> OpRef {
         let const_ref = self.const_ref(runtime_value);
+        self.record_guard(OpCode::GuardValue, &[opref, const_ref], num_live);
+        const_ref
+    }
+
+    /// Record a float-typed promote (GUARD_VALUE for floats).
+    ///
+    /// pyjitpl.py:1515 opimpl_float_guard_value = _opimpl_guard_value
+    pub fn promote_float(&mut self, opref: OpRef, runtime_value: i64, num_live: usize) -> OpRef {
+        let const_ref = self.const_float(runtime_value);
         self.record_guard(OpCode::GuardValue, &[opref, const_ref], num_live);
         const_ref
     }
@@ -1397,6 +1412,76 @@ impl TraceCtx {
 
     pub fn call_void_typed(&mut self, func_ptr: *const (), args: &[OpRef], arg_types: &[Type]) {
         let _ = self.call_typed(OpCode::CallN, func_ptr, args, arg_types, Type::Void);
+    }
+
+    // ── conditional_call / record_known_result (jtransform.py:1665, 292) ──
+
+    /// RPython pyjitpl.py opimpl_conditional_call_ir_v: emit CondCallN.
+    pub fn cond_call_void_typed(
+        &mut self,
+        condition: i64,
+        func_ptr: *const (),
+        args: &[OpRef],
+        arg_types: &[Type],
+    ) {
+        let cond_ref = self.constants.get_or_insert(condition);
+        let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
+        let descr = make_call_descr(arg_types, Type::Void);
+        let mut call_args = vec![cond_ref, func_ref];
+        call_args.extend_from_slice(args);
+        self.recorder
+            .record_op_with_descr(OpCode::CondCallN, &call_args, descr);
+    }
+
+    /// RPython pyjitpl.py opimpl_conditional_call_value_ir_i: emit CondCallValueI.
+    pub fn cond_call_value_int_typed(
+        &mut self,
+        value: i64,
+        func_ptr: *const (),
+        args: &[OpRef],
+        arg_types: &[Type],
+    ) -> OpRef {
+        let value_ref = self.constants.get_or_insert(value);
+        let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
+        let descr = make_call_descr(arg_types, Type::Int);
+        let mut call_args = vec![value_ref, func_ref];
+        call_args.extend_from_slice(args);
+        self.recorder
+            .record_op_with_descr(OpCode::CondCallValueI, &call_args, descr)
+    }
+
+    /// RPython pyjitpl.py opimpl_conditional_call_value_ir_r: emit CondCallValueR.
+    pub fn cond_call_value_ref_typed(
+        &mut self,
+        value: i64,
+        func_ptr: *const (),
+        args: &[OpRef],
+        arg_types: &[Type],
+    ) -> OpRef {
+        let value_ref = self.constants.get_or_insert(value);
+        let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
+        let descr = make_call_descr(arg_types, Type::Ref);
+        let mut call_args = vec![value_ref, func_ref];
+        call_args.extend_from_slice(args);
+        self.recorder
+            .record_op_with_descr(OpCode::CondCallValueR, &call_args, descr)
+    }
+
+    /// RPython pyjitpl.py opimpl_record_known_result_i / _r: emit RecordKnownResult.
+    pub fn record_known_result_typed(
+        &mut self,
+        result_value: i64,
+        func_ptr: *const (),
+        args: &[OpRef],
+        arg_types: &[Type],
+    ) {
+        let result_ref = self.constants.get_or_insert(result_value);
+        let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
+        let _descr = make_call_descr(arg_types, Type::Void);
+        let mut call_args = vec![result_ref, func_ref];
+        call_args.extend_from_slice(args);
+        self.recorder
+            .record_op(OpCode::RecordKnownResult, &call_args);
     }
 
     pub fn call_int_typed(

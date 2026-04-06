@@ -729,6 +729,20 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         OpKind::BinOp { op, .. } => format!("int_{op}"),
         OpKind::UnaryOp { op, .. } => format!("int_{op}"),
         OpKind::VableForce => "hint_force_virtualizable".into(),
+        // jtransform.py:1731-1743 — jit.* builtin ops
+        OpKind::JitDebug { .. } => "jit_debug".into(),
+        OpKind::AssertGreen { kind_char, .. } => format!("{kind_char}_assert_green"),
+        OpKind::CurrentTraceLength => "current_trace_length".into(),
+        OpKind::IsConstant { kind_char, .. } => format!("{kind_char}_isconstant"),
+        OpKind::IsVirtual { kind_char, .. } => format!("{kind_char}_isvirtual"),
+        OpKind::RecordKnownResult { result_kind, .. } => {
+            format!("record_known_result_{result_kind}")
+        }
+        // jtransform.py:1665-1688 — conditional_call ops
+        OpKind::ConditionalCall { .. } => "conditional_call".into(),
+        OpKind::ConditionalCallValue { result_kind, .. } => {
+            format!("conditional_call_value_{result_kind}")
+        }
         OpKind::Live => "live".into(),
         // Call variants are handled by encode_op directly, not here.
         OpKind::CallElidable { .. } => "call_elidable".into(),

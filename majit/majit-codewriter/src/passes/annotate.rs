@@ -151,12 +151,21 @@ fn infer_op_type(kind: &OpKind, state: &AnnotationState) -> ValueType {
                 ValueType::Int // Arithmetic defaults to Int
             }
         }
-        OpKind::VableForce | OpKind::Live | OpKind::GuardValue { .. } => ValueType::Void,
+        OpKind::VableForce
+        | OpKind::Live
+        | OpKind::GuardValue { .. }
+        | OpKind::JitDebug { .. }
+        | OpKind::AssertGreen { .. }
+        | OpKind::RecordKnownResult { .. } => ValueType::Void,
+        OpKind::CurrentTraceLength => ValueType::Int,
+        OpKind::IsConstant { .. } | OpKind::IsVirtual { .. } => ValueType::Int,
         OpKind::CallElidable { result_kind, .. }
         | OpKind::CallResidual { result_kind, .. }
         | OpKind::CallMayForce { result_kind, .. }
         | OpKind::InlineCall { result_kind, .. }
-        | OpKind::RecursiveCall { result_kind, .. } => kind_char_to_value_type(*result_kind),
+        | OpKind::RecursiveCall { result_kind, .. }
+        | OpKind::ConditionalCallValue { result_kind, .. } => kind_char_to_value_type(*result_kind),
+        OpKind::ConditionalCall { .. } => ValueType::Void,
         OpKind::Unknown { .. } => ValueType::Unknown,
     }
 }

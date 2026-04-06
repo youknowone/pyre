@@ -327,11 +327,20 @@ fn analyze_pipeline_from_parsed(
         }
         for hint in &func.hints {
             for p in &paths {
+                // rlib/jit.py:250 — `@oopspec(spec)` registers func.oopspec = spec.
+                if let Some(spec) = hint.strip_prefix("oopspec:") {
+                    call_control.mark_oopspec(p.clone(), spec.to_string());
+                    continue;
+                }
                 match hint.as_str() {
                     "elidable" => call_control.mark_elidable(p.clone()),
                     "loopinvariant" => call_control.mark_loopinvariant(p.clone()),
                     "close_stack" => call_control.mark_close_stack(p.clone()),
                     "cannot_collect" => call_control.mark_cannot_collect(p.clone()),
+                    // rlib/jit.py:260 — @not_in_trace sets func.oopspec = "jit.not_in_trace()"
+                    "not_in_trace" => {
+                        call_control.mark_oopspec(p.clone(), "jit.not_in_trace".to_string());
+                    }
                     // RPython: random_effects_on_gcobjs is on external funcobj only.
                     // Only register for paths WITHOUT a graph (external functions).
                     "gc_effects" => {
@@ -372,6 +381,29 @@ fn analyze_pipeline_from_parsed(
         let path = parse::CallPath::from_segments([*builtin_name]);
         if call_control.function_graphs().contains_key(&path) {
             call_control.mark_builtin(path);
+        }
+    }
+    // Register oopspecs for jit.* builtin functions.
+    // rlib/jit.py: these functions carry @oopspec("jit.*") decorators;
+    // the codewriter converts calls to them into dedicated opcodes.
+    for (func_name, spec) in &[
+        // rlib/jit.py:269-292 — @oopspec("jit.*") decorated functions
+        ("isconstant", "jit.isconstant"),
+        ("isvirtual", "jit.isvirtual"),
+        ("current_trace_length", "jit.current_trace_length"),
+        ("jit_debug", "jit.debug"),
+        ("assert_green", "jit.assert_green"),
+        // NOTE: conditional_call!/conditional_call_elidable!/record_known_result!
+        // are handled by jitcode_lower (proc-macro level), not here.
+        // They are macro_rules! that the codewriter AST parser does not expand.
+    ] {
+        // Register under common call-site path patterns.
+        for path in [
+            parse::CallPath::from_segments(["jit", func_name]),
+            parse::CallPath::from_segments(["crate", "jit", func_name]),
+            parse::CallPath::from_segments(["majit_metainterp", "jit", func_name]),
+        ] {
+            call_control.mark_oopspec(path, spec.to_string());
         }
     }
     call_control.find_all_graphs();

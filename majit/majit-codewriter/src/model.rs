@@ -311,6 +311,79 @@ pub enum OpKind {
         result_kind: char,
     },
 
+    // ── JIT builtin ops (jtransform.py:1731-1743) ────────────
+    //
+    // These correspond to RPython's `_handle_jit_call()` in jtransform.py.
+    // The codewriter converts calls to `jit.*` oopspec functions into
+    // dedicated opcodes instead of residual calls.
+    /// jtransform.py:1731 — `jit_debug(string, arg1, arg2, arg3, arg4)`.
+    /// Emits debug info into the trace (like debug_merge_point).
+    JitDebug {
+        args: Vec<ValueId>,
+    },
+    /// jtransform.py:1733 — `{kind}_assert_green(value)`.
+    /// Asserts the value is compile-time constant during tracing.
+    AssertGreen {
+        value: ValueId,
+        kind_char: char,
+    },
+    /// jtransform.py:1736 — `current_trace_length()`.
+    /// Returns the current length of the trace being compiled.
+    CurrentTraceLength,
+    /// jtransform.py:1738 — `{kind}_isconstant(value)`.
+    /// Returns whether the value is currently known to be constant.
+    IsConstant {
+        value: ValueId,
+        kind_char: char,
+    },
+    /// jtransform.py:1741 — `{kind}_isvirtual(value)`.
+    /// Returns whether the value is currently virtualized.
+    IsVirtual {
+        value: ValueId,
+        kind_char: char,
+    },
+
+    // ── Conditional call ops (jtransform.py:1665-1688) ──────
+    //
+    // RPython: `jit_conditional_call` / `jit_conditional_call_value` llops
+    // are rewritten to `conditional_call_{kinds}_{reskind}`.
+    /// jtransform.py:1685 — `conditional_call_{ir}_{v}`.
+    /// If condition is true, call the function. Always produces void.
+    /// RPython: `COND_CALL(condition, funcptr, calldescr, args...)`
+    ConditionalCall {
+        condition: ValueId,
+        descriptor: crate::call::CallDescriptor,
+        args_i: Vec<ValueId>,
+        args_r: Vec<ValueId>,
+        args_f: Vec<ValueId>,
+    },
+    /// jtransform.py:1687 — `conditional_call_value_{ir}_{reskind}`.
+    /// If value is falsy (0/NULL/None), call the function and return its result.
+    /// RPython: `COND_CALL_VALUE(value, funcptr, calldescr, args...)`
+    ConditionalCallValue {
+        value: ValueId,
+        descriptor: crate::call::CallDescriptor,
+        args_i: Vec<ValueId>,
+        args_r: Vec<ValueId>,
+        args_f: Vec<ValueId>,
+        result_kind: char,
+    },
+
+    /// jtransform.py:292-313 — `record_known_result_{i|r}_ir_v`.
+    /// Produced by `rewrite_op_jit_record_known_result`; pairs an elidable call
+    /// with its known result for constant folding by OptPure.
+    /// RPython layout: `record_known_result_{reskind}(result, funcptr, calldescr, [i], [r])`
+    RecordKnownResult {
+        /// The known result value (arg 0 of the jit_record_known_result llop).
+        result_value: ValueId,
+        descriptor: crate::call::CallDescriptor,
+        args_i: Vec<ValueId>,
+        args_r: Vec<ValueId>,
+        args_f: Vec<ValueId>,
+        /// 'i' or 'r' — kind of the known result (no float support).
+        result_kind: char,
+    },
+
     /// Liveness marker — RPython `-live-` operation.
     /// Inserted by jtransform after calls that may need guard resumption.
     /// Expanded by compute_liveness() to include all values alive at

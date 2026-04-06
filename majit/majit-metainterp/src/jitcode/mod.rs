@@ -90,12 +90,22 @@ pub(crate) const BC_REF_RETURN: u8 = 76;
 pub(crate) const BC_RAISE: u8 = 77;
 /// blackhole.py bhimpl_reraise: re-raise exception_last_value.
 pub(crate) const BC_RERAISE: u8 = 78;
+// RPython jtransform.py:1685 — conditional_call_ir_v
+pub(crate) const BC_COND_CALL_VOID: u8 = 79;
+// RPython jtransform.py:1687 — conditional_call_value_ir_i / conditional_call_value_ir_r
+pub(crate) const BC_COND_CALL_VALUE_INT: u8 = 80;
+pub(crate) const BC_COND_CALL_VALUE_REF: u8 = 81;
+// RPython jtransform.py:292 — record_known_result_i_ir_v / record_known_result_r_ir_v
+pub(crate) const BC_RECORD_KNOWN_RESULT_INT: u8 = 82;
+pub(crate) const BC_RECORD_KNOWN_RESULT_REF: u8 = 83;
 /// pyjitpl.py opimpl_int_guard_value: promote int to constant via GUARD_VALUE.
-pub(crate) const BC_INT_GUARD_VALUE: u8 = 79;
+pub(crate) const BC_INT_GUARD_VALUE: u8 = 84;
 /// pyjitpl.py opimpl_ref_guard_value: promote ref to constant via GUARD_VALUE.
-pub(crate) const BC_REF_GUARD_VALUE: u8 = 80;
+pub(crate) const BC_REF_GUARD_VALUE: u8 = 85;
+/// pyjitpl.py opimpl_float_guard_value: promote float to constant via GUARD_VALUE.
+pub(crate) const BC_FLOAT_GUARD_VALUE: u8 = 86;
 /// blackhole.py:1066 bhimpl_jit_merge_point: portal merge point marker.
-pub(crate) const BC_JIT_MERGE_POINT: u8 = 81;
+pub(crate) const BC_JIT_MERGE_POINT: u8 = 87;
 pub(crate) const MAX_HOST_CALL_ARITY: usize = 16;
 
 /// GC liveness metadata at a specific bytecode PC.

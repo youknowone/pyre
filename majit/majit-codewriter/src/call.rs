@@ -247,6 +247,11 @@ pub struct CallControl {
     /// External functions whose calls may have random effects on GC objects.
     /// analyze_can_collect returns True immediately for these.
     pub external_gc_effects: HashSet<CallPath>,
+
+    /// RPython: rlib/jit.py:250 `@oopspec(spec)` — `getattr(func, 'oopspec', None)`.
+    /// Maps call target → oopspec string (e.g. "jit.isconstant(value)").
+    /// codewriter/jtransform reads this to route calls through OopSpecIndex.
+    pub oopspec_targets: HashMap<CallPath, String>,
 }
 
 /// Heuristic struct layout — NOT equivalent to RPython's `symbolic.get_field_token()`.
@@ -489,6 +494,7 @@ impl CallControl {
             cannot_collect_targets: HashSet::new(),
             close_stack_targets: HashSet::new(),
             external_gc_effects: HashSet::new(),
+            oopspec_targets: HashMap::new(),
         }
     }
 
@@ -1057,6 +1063,18 @@ impl CallControl {
     /// Mark a target as known not to trigger GC collection.
     pub fn mark_cannot_collect(&mut self, path: CallPath) {
         self.cannot_collect_targets.insert(path);
+    }
+
+    /// RPython: rlib/jit.py:250 `@oopspec(spec)` — store `func.oopspec = spec`.
+    /// Mark a target as having an oopspec string for jtransform lowering.
+    pub fn mark_oopspec(&mut self, path: CallPath, spec: String) {
+        self.oopspec_targets.insert(path, spec);
+    }
+
+    /// RPython: `getattr(func, 'oopspec', None)` — look up oopspec for a target.
+    pub fn get_oopspec(&self, target: &CallTarget) -> Option<&str> {
+        self.target_to_path(target)
+            .and_then(|p| self.oopspec_targets.get(&p).map(|s| s.as_str()))
     }
 
     // ── Graph-based analyzers (call.py:282-303) ─────────────────────
@@ -2383,6 +2401,12 @@ fn op_can_raise(op: &OpKind, ignore_memoryerror: bool) -> bool {
         OpKind::GuardTrue { .. }
         | OpKind::GuardFalse { .. }
         | OpKind::GuardValue { .. }
+        | OpKind::JitDebug { .. }
+        | OpKind::AssertGreen { .. }
+        | OpKind::CurrentTraceLength
+        | OpKind::IsConstant { .. }
+        | OpKind::IsVirtual { .. }
+        | OpKind::RecordKnownResult { .. }
         | OpKind::Live => false,
         // Virtualizable field/array access (from boxes, no heap) → cannot raise
         OpKind::VableFieldRead { .. }
@@ -2396,7 +2420,9 @@ fn op_can_raise(op: &OpKind, ignore_memoryerror: bool) -> bool {
         | OpKind::CallElidable { .. }
         | OpKind::CallMayForce { .. }
         | OpKind::InlineCall { .. }
-        | OpKind::RecursiveCall { .. } => false,
+        | OpKind::RecursiveCall { .. }
+        | OpKind::ConditionalCall { .. }
+        | OpKind::ConditionalCallValue { .. } => false,
 
         // ── Known raising ops ─────────────────────────────────────
         // RPython LL: jit_force_virtualizable → canraise

@@ -666,6 +666,146 @@ impl<'c> Lowerer<'c> {
         }
     }
 
+    // ── conditional_call / record_known_result JIT op emission ──────
+
+    /// RPython jtransform.py:1685 — `rewrite_op_jit_conditional_call`.
+    ///
+    /// Recognizes `conditional_call!(condition, func, args...)` and emits
+    /// `__builder.conditional_call_void_args` which produces a BC_COND_CALL_VOID
+    /// JitCode bytecode. The meta-interpreter then emits CondCallN resop.
+    fn lower_conditional_call(&mut self, expr: &Expr) -> Option<()> {
+        let mac = match expr {
+            Expr::Macro(m) => m,
+            _ => return None,
+        };
+        let name = mac.mac.path.segments.last()?.ident.to_string();
+        if name != "conditional_call" {
+            return None;
+        }
+        let args: syn::punctuated::Punctuated<Expr, syn::Token![,]> = mac
+            .mac
+            .parse_body_with(syn::punctuated::Punctuated::parse_terminated)
+            .ok()?;
+        let args: Vec<&Expr> = args.iter().collect();
+        if args.len() < 2 {
+            return None;
+        }
+        // args[0] = condition, args[1] = func path, args[2..] = function arguments
+        let cond_binding = self.lower_value_expr(args[0])?;
+        let cond_reg = cond_binding.reg;
+        let mut arg_regs = Vec::new();
+        for arg in &args[2..] {
+            let b = self.lower_value_expr(arg)?;
+            arg_regs.push(b.reg);
+        }
+        let func_path = args[1];
+        let arg_reg_array: Vec<_> = arg_regs.iter().collect();
+        self.statements.push(quote! {
+            let __fn_idx = __builder.add_fn_ptr(#func_path as *const ());
+            __builder.conditional_call_void_args(__fn_idx, #cond_reg, &[#(#arg_reg_array),*]);
+        });
+        Some(())
+    }
+
+    /// RPython jtransform.py:1687 — `rewrite_op_jit_conditional_call_value`.
+    ///
+    /// Recognizes `conditional_call_elidable!(value, func, args...)` and emits
+    /// `__builder.conditional_call_value_int` producing BC_COND_CALL_VALUE_INT.
+    fn lower_conditional_call_elidable(&mut self, expr: &Expr) -> Option<Binding> {
+        let mac = match expr {
+            Expr::Macro(m) => m,
+            _ => return None,
+        };
+        let name = mac.mac.path.segments.last()?.ident.to_string();
+        if name != "conditional_call_elidable" {
+            return None;
+        }
+        let args: syn::punctuated::Punctuated<Expr, syn::Token![,]> = mac
+            .mac
+            .parse_body_with(syn::punctuated::Punctuated::parse_terminated)
+            .ok()?;
+        let args: Vec<&Expr> = args.iter().collect();
+        if args.len() < 2 {
+            return None;
+        }
+        let value_binding = self.lower_value_expr(args[0])?;
+        let value_reg = value_binding.reg;
+        let mut arg_regs = Vec::new();
+        for arg in &args[2..] {
+            let b = self.lower_value_expr(arg)?;
+            arg_regs.push(b.reg);
+        }
+        let func_path = args[1];
+        let result_reg = self.alloc_reg();
+        let arg_reg_array: Vec<_> = arg_regs.iter().collect();
+        // RPython jtransform.py:1687 — conditional_call_value_ir_{i|r}
+        // Split by result kind: int vs ref.
+        let builder_call = match value_binding.kind {
+            BindingKind::Ref => quote! {
+                __builder.conditional_call_value_ref(__fn_idx, #value_reg, &[#(#arg_reg_array),*], #result_reg);
+            },
+            _ => quote! {
+                __builder.conditional_call_value_int(__fn_idx, #value_reg, &[#(#arg_reg_array),*], #result_reg);
+            },
+        };
+        self.statements.push(quote! {
+            let __fn_idx = __builder.add_fn_ptr(#func_path as *const ());
+            #builder_call
+        });
+        Some(Binding {
+            reg: result_reg,
+            kind: value_binding.kind,
+            depends_on_stack: false,
+        })
+    }
+
+    /// RPython jtransform.py:292-313 — `rewrite_op_jit_record_known_result`.
+    ///
+    /// Recognizes `record_known_result!(result, func, args...)` and emits
+    /// `__builder.record_known_result_int` producing BC_RECORD_KNOWN_RESULT_INT.
+    fn lower_record_known_result(&mut self, expr: &Expr) -> Option<()> {
+        let mac = match expr {
+            Expr::Macro(m) => m,
+            _ => return None,
+        };
+        let name = mac.mac.path.segments.last()?.ident.to_string();
+        if name != "record_known_result" {
+            return None;
+        }
+        let args: syn::punctuated::Punctuated<Expr, syn::Token![,]> = mac
+            .mac
+            .parse_body_with(syn::punctuated::Punctuated::parse_terminated)
+            .ok()?;
+        let args: Vec<&Expr> = args.iter().collect();
+        if args.len() < 2 {
+            return None;
+        }
+        // args[0] = known result, args[1] = func path, args[2..] = function arguments
+        let result_binding = self.lower_value_expr(args[0])?;
+        let result_reg = result_binding.reg;
+        let mut arg_regs = Vec::new();
+        for arg in &args[2..] {
+            let b = self.lower_value_expr(arg)?;
+            arg_regs.push(b.reg);
+        }
+        let func_path = args[1];
+        let arg_reg_array: Vec<_> = arg_regs.iter().collect();
+        // RPython jtransform.py:302-307 — record_known_result_{i|r}
+        let builder_call = match result_binding.kind {
+            BindingKind::Ref => quote! {
+                __builder.record_known_result_ref(__fn_idx, #result_reg, &[#(#arg_reg_array),*]);
+            },
+            _ => quote! {
+                __builder.record_known_result_int(__fn_idx, #result_reg, &[#(#arg_reg_array),*]);
+            },
+        };
+        self.statements.push(quote! {
+            let __fn_idx = __builder.add_fn_ptr(#func_path as *const ());
+            #builder_call
+        });
+        Some(())
+    }
+
     fn lower_expr_stmt(&mut self, expr: &Expr) -> Option<()> {
         // State field writes (register/tape machines).
         if let Some(()) = self.lower_state_field_write(expr) {
@@ -688,6 +828,14 @@ impl<'c> Lowerer<'c> {
         }
         // RPython jtransform.py:655 — access_directly/fresh_virtualizable suppression.
         if let Some(()) = self.lower_vable_hint_suppress(expr) {
+            return Some(());
+        }
+        // RPython jtransform.py:1685 — conditional_call!(condition, func, args...)
+        if let Some(()) = self.lower_conditional_call(expr) {
+            return Some(());
+        }
+        // RPython jtransform.py:292 — record_known_result!(result, func, args...)
+        if let Some(()) = self.lower_record_known_result(expr) {
             return Some(());
         }
 
@@ -2073,6 +2221,10 @@ impl<'c> Lowerer<'c> {
         if let Some(binding) = self.lower_vable_hint_identity_call(expr) {
             return Some(binding);
         }
+        // RPython jtransform.py:1687 — conditional_call_elidable!(value, func, args...)
+        if let Some(binding) = self.lower_conditional_call_elidable(expr) {
+            return Some(binding);
+        }
 
         if is_pop_value(expr) {
             let reg = self.alloc_reg();
@@ -2168,8 +2320,9 @@ impl<'c> Lowerer<'c> {
                 });
             }
             BindingKind::Float => {
-                // float_guard_value not yet implemented
-                return None;
+                self.statements.push(quote! {
+                    __builder.float_guard_value(#reg);
+                });
             }
         }
         Some(binding)

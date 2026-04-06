@@ -14,18 +14,20 @@ use super::{
     BC_CALL_MAY_FORCE_INT, BC_CALL_MAY_FORCE_REF, BC_CALL_MAY_FORCE_VOID, BC_CALL_PURE_FLOAT,
     BC_CALL_PURE_INT, BC_CALL_PURE_REF, BC_CALL_REF, BC_CALL_RELEASE_GIL_FLOAT,
     BC_CALL_RELEASE_GIL_INT, BC_CALL_RELEASE_GIL_REF, BC_CALL_RELEASE_GIL_VOID,
-    BC_COPY_FROM_BOTTOM, BC_DUP_STACK, BC_GETARRAYITEM_VABLE_F, BC_GETARRAYITEM_VABLE_I,
+    BC_COND_CALL_VALUE_INT, BC_COND_CALL_VALUE_REF, BC_COND_CALL_VOID, BC_COPY_FROM_BOTTOM,
+    BC_DUP_STACK, BC_FLOAT_GUARD_VALUE, BC_GETARRAYITEM_VABLE_F, BC_GETARRAYITEM_VABLE_I,
     BC_GETARRAYITEM_VABLE_R, BC_GETFIELD_VABLE_F, BC_GETFIELD_VABLE_I, BC_GETFIELD_VABLE_R,
     BC_HINT_FORCE_VIRTUALIZABLE, BC_INLINE_CALL, BC_INT_GUARD_VALUE, BC_JIT_MERGE_POINT, BC_JUMP,
     BC_JUMP_TARGET, BC_LOAD_CONST_F, BC_LOAD_CONST_I, BC_LOAD_CONST_R, BC_LOAD_STATE_ARRAY,
     BC_LOAD_STATE_FIELD, BC_LOAD_STATE_VARRAY, BC_MOVE_F, BC_MOVE_I, BC_MOVE_R, BC_PEEK_I,
     BC_POP_DISCARD, BC_POP_F, BC_POP_I, BC_POP_R, BC_PUSH_F, BC_PUSH_I, BC_PUSH_R, BC_PUSH_TO,
-    BC_RAISE, BC_RECORD_BINOP_F, BC_RECORD_BINOP_I, BC_RECORD_UNARY_F, BC_RECORD_UNARY_I,
-    BC_REF_GUARD_VALUE, BC_REF_RETURN, BC_REQUIRE_STACK, BC_RERAISE, BC_RESIDUAL_CALL_VOID,
-    BC_SET_SELECTED, BC_SETARRAYITEM_VABLE_F, BC_SETARRAYITEM_VABLE_I, BC_SETARRAYITEM_VABLE_R,
-    BC_SETFIELD_VABLE_F, BC_SETFIELD_VABLE_I, BC_SETFIELD_VABLE_R, BC_STORE_DOWN,
-    BC_STORE_STATE_ARRAY, BC_STORE_STATE_FIELD, BC_STORE_STATE_VARRAY, BC_SWAP_STACK, JitArgKind,
-    JitCallArg, JitCallAssemblerTarget, JitCallTarget, JitCode,
+    BC_RAISE, BC_RECORD_BINOP_F, BC_RECORD_BINOP_I, BC_RECORD_KNOWN_RESULT_INT,
+    BC_RECORD_KNOWN_RESULT_REF, BC_RECORD_UNARY_F, BC_RECORD_UNARY_I, BC_REF_GUARD_VALUE,
+    BC_REF_RETURN, BC_REQUIRE_STACK, BC_RERAISE, BC_RESIDUAL_CALL_VOID, BC_SET_SELECTED,
+    BC_SETARRAYITEM_VABLE_F, BC_SETARRAYITEM_VABLE_I, BC_SETARRAYITEM_VABLE_R, BC_SETFIELD_VABLE_F,
+    BC_SETFIELD_VABLE_I, BC_SETFIELD_VABLE_R, BC_STORE_DOWN, BC_STORE_STATE_ARRAY,
+    BC_STORE_STATE_FIELD, BC_STORE_STATE_VARRAY, BC_SWAP_STACK, JitArgKind, JitCallArg,
+    JitCallAssemblerTarget, JitCallTarget, JitCode,
 };
 
 #[derive(Default)]
@@ -401,6 +403,12 @@ impl JitCodeBuilder {
         self.push_u16(src);
     }
 
+    /// pyjitpl.py opimpl_float_guard_value: promote float register to constant.
+    pub fn float_guard_value(&mut self, src: u16) {
+        self.push_u8(BC_FLOAT_GUARD_VALUE);
+        self.push_u16(src);
+    }
+
     pub fn inline_call(&mut self, sub_jitcode_idx: u16) {
         self.inline_call_i(sub_jitcode_idx, &[], None);
     }
@@ -629,6 +637,94 @@ impl JitCodeBuilder {
 
     pub fn call_pure_int_typed(&mut self, fn_ptr_idx: u16, arg_regs: &[JitCallArg], dst: u16) {
         self.call_int_like(BC_CALL_PURE_INT, fn_ptr_idx, arg_regs, dst);
+    }
+
+    // ── conditional_call / record_known_result (jtransform.py:1665-1688, 292-313) ──
+
+    /// RPython: `conditional_call_ir_v(condition, funcptr, calldescr, [i], [r])`
+    /// Condition in cond_reg; if nonzero, call func with args. Result void.
+    pub fn conditional_call_void_args(&mut self, fn_ptr_idx: u16, cond_reg: u16, arg_regs: &[u16]) {
+        let args: Vec<JitCallArg> = arg_regs.iter().copied().map(JitCallArg::int).collect();
+        // Encode: [BC] [cond_reg] [fn_ptr_idx] [n_args] [arg_types..] [arg_regs..]
+        self.touch_reg(cond_reg);
+        self.call_cond_like(BC_COND_CALL_VOID, fn_ptr_idx, cond_reg, &args);
+    }
+
+    /// RPython: `conditional_call_value_ir_i(value, funcptr, calldescr, [i], [r])`
+    /// If value is zero, call func and return result. Else return value.
+    pub fn conditional_call_value_int(
+        &mut self,
+        fn_ptr_idx: u16,
+        value_reg: u16,
+        arg_regs: &[u16],
+        dst: u16,
+    ) {
+        let args: Vec<JitCallArg> = arg_regs.iter().copied().map(JitCallArg::int).collect();
+        self.touch_reg(value_reg);
+        self.touch_reg(dst);
+        self.call_cond_value_like(BC_COND_CALL_VALUE_INT, fn_ptr_idx, value_reg, &args, dst);
+    }
+
+    /// RPython: `conditional_call_value_ir_r`
+    pub fn conditional_call_value_ref(
+        &mut self,
+        fn_ptr_idx: u16,
+        value_reg: u16,
+        arg_regs: &[u16],
+        dst: u16,
+    ) {
+        let args: Vec<JitCallArg> = arg_regs.iter().copied().map(JitCallArg::int).collect();
+        self.touch_reg(value_reg);
+        self.touch_reg(dst);
+        self.call_cond_value_like(BC_COND_CALL_VALUE_REF, fn_ptr_idx, value_reg, &args, dst);
+    }
+
+    /// RPython: `record_known_result_i_ir_v(result, funcptr, calldescr, [i], [r])`
+    pub fn record_known_result_int(&mut self, fn_ptr_idx: u16, result_reg: u16, arg_regs: &[u16]) {
+        let args: Vec<JitCallArg> = arg_regs.iter().copied().map(JitCallArg::int).collect();
+        self.touch_reg(result_reg);
+        self.call_cond_like(BC_RECORD_KNOWN_RESULT_INT, fn_ptr_idx, result_reg, &args);
+    }
+
+    /// RPython: `record_known_result_r_ir_v`
+    pub fn record_known_result_ref(&mut self, fn_ptr_idx: u16, result_reg: u16, arg_regs: &[u16]) {
+        let args: Vec<JitCallArg> = arg_regs.iter().copied().map(JitCallArg::int).collect();
+        self.touch_reg(result_reg);
+        self.call_cond_like(BC_RECORD_KNOWN_RESULT_REF, fn_ptr_idx, result_reg, &args);
+    }
+
+    fn call_cond_like(&mut self, bc: u8, fn_ptr_idx: u16, first_reg: u16, args: &[JitCallArg]) {
+        self.push_u8(bc);
+        self.push_u16(first_reg);
+        self.push_u16(fn_ptr_idx);
+        self.push_u8(args.len() as u8);
+        for arg in args {
+            self.push_u8(arg.kind as u8);
+        }
+        for arg in args {
+            self.push_u16(arg.reg);
+        }
+    }
+
+    fn call_cond_value_like(
+        &mut self,
+        bc: u8,
+        fn_ptr_idx: u16,
+        value_reg: u16,
+        args: &[JitCallArg],
+        dst: u16,
+    ) {
+        self.push_u8(bc);
+        self.push_u16(value_reg);
+        self.push_u16(fn_ptr_idx);
+        self.push_u8(args.len() as u8);
+        for arg in args {
+            self.push_u8(arg.kind as u8);
+        }
+        for arg in args {
+            self.push_u16(arg.reg);
+        }
+        self.push_u16(dst);
     }
 
     pub fn set_selected(&mut self, const_idx: u16) {

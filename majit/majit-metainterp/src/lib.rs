@@ -135,6 +135,65 @@ macro_rules! can_enter_jit {
     ($($tt:tt)*) => {};
 }
 
+/// Assure the JIT that `func(args...)` will produce `result`.
+/// `func` must be an elidable function.
+///
+/// rlib/jit.py:1224 — `record_known_result(result, func, *args)`
+///
+/// At runtime (non-JIT), verifies `func(args) == result` (debug builds).
+/// The jitcode_lower proc-macro intercepts this macro invocation and
+/// emits a `record_known_result_{i|r}` opcode with func and args visible
+/// as separate operands — matching RPython's rtyper decomposition.
+///
+/// Usage: `record_known_result!(result, my_elidable_fn, arg1, arg2)`
+#[macro_export]
+macro_rules! record_known_result {
+    ($result:expr, $func:path $(, $arg:expr)*) => {
+        // rlib/jit.py:1229-1232 — untranslated consistency check
+        debug_assert_eq!(
+            $func($($arg),*), $result,
+            "record_known_result: func(...) != result"
+        );
+    };
+}
+
+/// rlib/jit.py:1301 — `conditional_call(condition, function, *args)`
+///
+/// At runtime: `if condition { function(args...) }`.
+/// The jitcode_lower proc-macro intercepts this macro invocation and
+/// emits a `conditional_call_ir_v` opcode with func and args as
+/// separate operands — matching RPython's ConditionalCallEntry decomposition.
+///
+/// Usage: `conditional_call!(cond, my_func, arg1, arg2)`
+#[macro_export]
+macro_rules! conditional_call {
+    ($condition:expr, $func:path $(, $arg:expr)*) => {
+        if $condition {
+            $func($($arg),*);
+        }
+    };
+}
+
+/// rlib/jit.py:1322 — `conditional_call_elidable(value, function, *args)`
+///
+/// At runtime: `if value is falsy { value = function(args...) }; return value`.
+/// The jitcode_lower proc-macro intercepts this macro invocation and
+/// emits a `conditional_call_value_ir_{i|r}` opcode with func and args as
+/// separate operands.
+///
+/// Usage: `let v = conditional_call_elidable!(cached, compute_fn, arg1, arg2)`
+#[macro_export]
+macro_rules! conditional_call_elidable {
+    ($value:expr, $func:path $(, $arg:expr)*) => {{
+        let __val = $value;
+        if __val == 0 {
+            $func($($arg),*)
+        } else {
+            __val
+        }
+    }};
+}
+
 /// Hash a green key from i64 slice values.
 ///
 /// Uses the same algorithm as [`GreenKey::hash_u64`](majit_ir::GreenKey::hash_u64),
