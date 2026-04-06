@@ -232,11 +232,31 @@ pub trait GcAllocator: Send {
     /// it to `True`. Relayed to `cpu.supports_guard_gc_type` via
     /// `llmodel.py:63`. Gates the backend's `genop_guard_guard_gc_type`,
     /// `genop_guard_guard_is_object`, and `genop_guard_guard_subclass`
-    /// (x86/assembler.py:1896, 1925, 1946 `assert`). The default
+    /// (x86/assembler.py:1896, 1925, 1946 `assert`) and
+    /// `ConstPtrInfo.get_known_class(cpu)` at info.py:766. The default
     /// `false` matches `AbstractCPU.supports_guard_gc_type` in
     /// `rpython/jit/backend/model.py:21` and keeps backends without an
     /// installed TYPE_INFO table from emitting the guards.
     fn supports_guard_gc_type(&self) -> bool {
+        false
+    }
+
+    /// llsupport/gc.py:631-642 `check_is_object` parity. Reads the
+    /// typeid for `gcref` (gc.py:623-629 `get_actual_typeid`) and
+    /// returns whether that type has `rclass.OBJECT` layout — i.e.
+    /// whether `T_IS_RPYTHON_INSTANCE` is set in its infobits (gc.py:
+    /// 631-642 walks the TYPE_INFO table to test that bit).
+    ///
+    /// Exposed on `cpu.check_is_object(gcptr)` via llmodel.py:541-546,
+    /// which asserts `supports_guard_gc_type` before delegating. The
+    /// optimizer consults this through info.py:766 inside
+    /// `ConstPtrInfo.get_known_class(cpu)` to decide whether reading
+    /// offset 0 of a constant gcref is safe.
+    ///
+    /// Returns `false` for null pointers and for backends without a
+    /// type registry (matching `GcLLDescr_boehm`, which does not
+    /// define `check_is_object`).
+    fn check_is_object(&self, _gcref: GcRef) -> bool {
         false
     }
 
@@ -373,4 +393,56 @@ impl Default for GcMap {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Thread-local active GC allocator hook
+// ─────────────────────────────────────────────────────────────────────
+//
+// The metainterp / optimizer layer needs a backend-agnostic way to query
+// the current CPU's GC type registry (llmodel.py:541-546
+// `cpu.check_is_object(gcptr)`). In RPython the optimizer reaches it via
+// `self.optimizer.cpu`, which holds a reference to the backend-provided
+// CPU object. majit has no such field; instead the live backends register
+// a callback here that the metainterp can invoke without taking a
+// backend dependency.
+
+use std::cell::Cell;
+
+/// Thread-local callback that answers `cpu.check_is_object(gcptr)` for
+/// the currently active backend. Set by the backend when it installs a
+/// GC runtime for the executing thread; cleared when the runtime is
+/// unregistered.
+pub type CheckIsObjectFn = fn(GcRef) -> bool;
+
+thread_local! {
+    static ACTIVE_CHECK_IS_OBJECT: Cell<Option<CheckIsObjectFn>> = const { Cell::new(None) };
+    static ACTIVE_SUPPORTS_GUARD_GC_TYPE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Install the active backend's `check_is_object` callback on this
+/// thread. Called by backends when they enter a JIT region. Pass `None`
+/// to clear.
+pub fn set_active_check_is_object(check: Option<CheckIsObjectFn>, supports_guard_gc_type: bool) {
+    ACTIVE_CHECK_IS_OBJECT.with(|c| c.set(check));
+    ACTIVE_SUPPORTS_GUARD_GC_TYPE.with(|c| c.set(supports_guard_gc_type));
+}
+
+/// llmodel.py:541-546 `cpu.check_is_object(gcptr)` shim. Returns whether
+/// `gcref` is a `T_IS_RPYTHON_INSTANCE` (has `typeptr` at offset 0). When
+/// no backend has installed a callback on this thread, returns `false`.
+pub fn check_is_object(gcref: GcRef) -> bool {
+    if gcref.is_null() {
+        return false;
+    }
+    ACTIVE_CHECK_IS_OBJECT.with(|c| match c.get() {
+        Some(f) => f(gcref),
+        None => false,
+    })
+}
+
+/// llmodel.py:63 `supports_guard_gc_type` shim. Mirrors the active
+/// backend's capability flag. `false` when no backend has been installed.
+pub fn supports_guard_gc_type() -> bool {
+    ACTIVE_SUPPORTS_GUARD_GC_TYPE.with(|c| c.get())
 }

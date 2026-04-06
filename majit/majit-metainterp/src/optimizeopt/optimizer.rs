@@ -925,9 +925,7 @@ impl Optimizer {
         for (idx, fwd) in ctx.forwarded.iter().enumerate() {
             if let crate::optimizeopt::info::Forwarded::Info(info) = fwd {
                 if let Some(class_ptr) = info.get_known_class() {
-                    knowledge
-                        .known_classes
-                        .push((OpRef(idx as u32), *class_ptr));
+                    knowledge.known_classes.push((OpRef(idx as u32), class_ptr));
                 }
             }
         }
@@ -2654,7 +2652,7 @@ impl Optimizer {
                         let resolved = ctx.get_box_replacement(farg);
                         if let Some(info) = ctx.get_ptr_info(resolved) {
                             if let Some(class_ptr) = info.get_known_class() {
-                                known_classes.push((farg, *class_ptr));
+                                known_classes.push((farg, class_ptr));
                             }
                         }
                     }

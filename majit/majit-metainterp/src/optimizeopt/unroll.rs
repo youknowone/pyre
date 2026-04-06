@@ -2427,7 +2427,7 @@ impl OptUnroll {
                 Some(ptr) => (
                     ExportedPtrKind::None,
                     None,
-                    ptr.get_known_class().copied(),
+                    ptr.get_known_class(),
                     None,
                     ptr.is_nonnull(),
                 ),

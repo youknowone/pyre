@@ -787,14 +787,23 @@ impl OptHeap {
 
     /// heap.py:198-204: _cannot_alias_via_classes_or_lengths
     ///
-    /// If both have different known classes, they cannot alias.
+    /// heap.py:198-204 `_cannot_alias_via_classes_or_lengths`:
+    ///     constclass1 = opinfo1.get_known_class(optheap.optimizer.cpu)
+    ///     constclass2 = opinfo2.get_known_class(optheap.optimizer.cpu)
+    ///     if constclass1 is not None and constclass2 is not None and
+    ///        not constclass1.same_constant(constclass2):
+    ///         return CANNOT_ALIAS
+    ///     return UNKNOWN_ALIAS
+    ///
+    /// `getptrinfo` synthesizes `ConstPtrInfo` for constant Refs so two
+    /// constant ptrs with different typeptrs are detected as non-aliasing.
     fn _cannot_alias_via_classes_or_lengths(
         opref1: OpRef,
         opref2: OpRef,
         ctx: &OptContext,
     ) -> bool {
-        let class1 = ctx.get_ptr_info(opref1).and_then(|i| i.get_known_class());
-        let class2 = ctx.get_ptr_info(opref2).and_then(|i| i.get_known_class());
+        let class1 = ctx.getptrinfo(opref1).and_then(|i| i.get_known_class());
+        let class2 = ctx.getptrinfo(opref2).and_then(|i| i.get_known_class());
         matches!((class1, class2), (Some(c1), Some(c2)) if c1 != c2)
     }
 

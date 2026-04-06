@@ -1130,188 +1130,21 @@ impl OptVirtualize {
         OptimizationResult::PassOn
     }
 
-    fn optimize_guard_class(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let obj_ref = ctx.get_box_replacement(op.arg(0));
-        let expected_class = if op.num_args() >= 2 {
-            ctx.get_constant(op.arg(1)).and_then(|value| match value {
-                Value::Ref(class_ref) => Some(*class_ref),
-                Value::Int(raw) => Some(majit_ir::GcRef(*raw as usize)),
-                _ => None,
-            })
-        } else {
-            None
-        };
-
-        if let Some(info) = ctx.get_ptr_info(obj_ref) {
-            match info {
-                // Virtual objects have a known allocation type — guard is redundant.
-                // RPython info.py: only virtual objects can eliminate GUARD_CLASS
-                // in the virtualize pass. KnownClass is handled by OptRewrite
-                // (rewrite.py:397-428), NOT by the virtualize pass.
-                PtrInfo::Virtual(_)
-                | PtrInfo::VirtualStruct(_)
-                | PtrInfo::VirtualArrayStruct(_)
-                | PtrInfo::VirtualRawBuffer(_) => {
-                    return OptimizationResult::Remove;
-                }
-                _ => {}
-            }
-        }
-
-        // RPython info.py:763-772: ConstPtrInfo.get_known_class(cpu) reads
-        // vtable from the constant GC object (cls_of_box). If it matches
-        // expected_class, the guard is redundant and can be removed.
-        if let Some(const_ref_raw) = ctx.get_constant_int(obj_ref) {
-            let const_ptr = const_ref_raw as usize;
-            if const_ptr != 0 {
-                let vtable = unsafe { *(const_ptr as *const usize) };
-                if vtable != 0 {
-                    if let Some(expected) = expected_class {
-                        if vtable == expected.0 {
-                            return OptimizationResult::Remove;
-                        }
-                    }
-                }
-            }
-        }
-        // Constant-fold: if the guarded value is a compile-time constant,
-        // check the class at optimization time. If it matches, remove the guard.
-        // This handles Phase 2 where virtual typeptr fields resolve to constants.
-        if op.num_args() >= 2 {
-            if let Some(value) = ctx.get_constant_int(obj_ref) {
-                if let Some(expected) = ctx.get_constant_int(op.arg(1)) {
-                    if value == expected {
-                        return OptimizationResult::Remove;
-                    }
-                }
-            }
-        }
-
-        // rewrite.py:401-404: if known_class matches, remove the guard.
-        // RPython postprocess_GUARD_CLASS runs AFTER emit, so when
-        // virtualize sees a GUARD_CLASS, known_class was set by a PRIOR
-        // guard (not the current one). No is_same_guard check needed.
-        if let Some(info) = ctx.get_ptr_info(obj_ref) {
-            if let PtrInfo::KnownClass { class_ptr, .. } = info {
-                if expected_class
-                    .is_none_or(|expected| *class_ptr == expected || class_ptr.is_null())
-                {
-                    return OptimizationResult::Remove;
-                }
-            }
-        }
-
-        // Record the class for future lookups.
-        if let Some(class_ptr) = expected_class {
-            self.record_known_class(obj_ref, class_ptr, ctx);
-        }
-
-        self.force_guard_fail_args(op, ctx)
-    }
-
-    /// Encode virtual objects in guard fail_args as resume data instead
-    /// of forcing them.
+    /// Resolve a guard fail_arg, keeping virtual-struct-shaped infos intact
+    /// so `store_final_boxes_in_guard` can encode them as TAGVIRTUAL at
+    /// emit time. Other virtual-ish infos (raw buffers, array slices) that
+    /// the guard encoder does not handle are forced to concrete here.
     ///
-    /// optimizer.py: store_final_boxes_in_guard / ResumeDataVirtualAdder
-    ///
-    /// For each fail_arg that is virtual:
-    ///   - Record its shape (descr, known_class, fields) in rd_virtuals
-    ///   - Add the virtual's field values as extra fail_args at the end
-    ///   - Set the original fail_arg slot to OpRef::NONE (placeholder)
-    ///   - If a field value is itself virtual, force it (no recursive encoding yet)
-    ///
-    /// Non-virtual fail_args are resolved normally.
-    /// Resolve guard fail_args without forcing virtuals.
-    ///
-    /// RPython parity: virtualize.py does NOT force virtuals in fail_args.
-    /// Virtual encoding is handled by optimizer.rs store_final_boxes_in_guard
-    /// (store_final_boxes_in_guard equivalent) at emit time.
-    /// Force virtual references in guard fail_args and re-resolve all args.
-    ///
-    /// RPython parity: virtualize.py does NOT force fail_args (it uses
-    /// rd_virtuals for lazy reconstruction). majit currently forces because
-    /// pyre hasn't implemented materialize_virtual_ref yet. When it does,
-    /// this method should skip forcing and let store_final_boxes_in_guard handle it.
-    /// RPython parity: virtualize.py does NOT force fail_args.
-    /// store_final_boxes_in_guard in optimizer.rs handles virtual encoding at emit time.
-    fn force_guard_fail_args(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        // RPython parity: don't force fail_args.
-        // store_final_boxes_in_guard handles encoding at emit time.
-        let mut guard_op = op.clone();
-
-        // RPython parity: isinstance(box, Const) → skip forcing.
-        // In RPython, Const objects (ConstInt, ConstFloat) skip virtualization
-        // entirely because they're a different class from AbstractResOp.
-        // In majit, Int/Float-typed fail_args are scalar values (e.g.,
-        // next_instr, valuestackdepth) that must NOT be forced as virtual Ref
-        // objects even if their OpRef index collides with a virtual's position.
-        let fail_arg_types: Vec<majit_ir::Type> = guard_op
-            .descr
-            .as_ref()
-            .and_then(|d| d.as_fail_descr())
-            .map(|fd| fd.fail_arg_types().to_vec())
-            .unwrap_or_default();
-
-        if let Some(ref mut fa) = guard_op.fail_args {
-            for (i, arg) in fa.iter_mut().enumerate() {
-                let resolved = ctx.get_box_replacement(*arg);
-                // Int/Float fail_args are scalar constants, never virtual objects.
-                let is_scalar = fail_arg_types
-                    .get(i)
-                    .is_some_and(|t| matches!(t, majit_ir::Type::Int | majit_ir::Type::Float));
-                if is_scalar || ctx.is_constant(resolved) {
-                    // regalloc.py:1206: Const objects skip virtualization.
-                    // Constant OpRefs may collide with virtual positions —
-                    // looking up PtrInfo would find the virtual, not the constant.
-                    *arg = resolved;
-                } else {
-                    *arg = self.prepare_guard_fail_arg(resolved, ctx);
-                }
-            }
-        }
-        for arg in &mut guard_op.args {
-            *arg = ctx.get_box_replacement(*arg);
-        }
-        OptimizationResult::Replace(guard_op)
-    }
-
-    /// RPython info.py:228 _force_at_the_end_of_preamble parity:
-    /// Force field VALUES of a virtual to concrete (non-virtual), but keep
-    /// the virtual structure itself alive (no New + SetfieldGc emission).
-    /// This ensures compiled code doesn't modify heap objects for this virtual,
-    /// so guard failure can safely blackhole-resume without heap rollback.
-    fn force_virtual_fields_at_end_of_preamble(&mut self, opref: OpRef, ctx: &mut OptContext) {
-        let Some(info) = ctx.get_ptr_info(opref).cloned() else {
-            return;
-        };
-        let fields = match &info {
-            PtrInfo::Virtual(vi) => vi.fields.clone(),
-            PtrInfo::VirtualStruct(vi) => vi.fields.clone(),
-            _ => return,
-        };
-        for &(_field_idx, value_ref) in &fields {
-            let resolved = ctx.get_box_replacement(value_ref);
-            if Self::is_virtual(resolved, ctx) {
-                // Recursive: force nested virtual's fields too
-                self.force_virtual_fields_at_end_of_preamble(resolved, ctx);
-            }
-        }
-        // Virtual itself is NOT forced — no New/SetfieldGc emitted.
-    }
-
+    /// Called from the generic guard path in `propagate_forward`. RPython's
+    /// virtualize.py does not run a dedicated fail_args pre-pass; the
+    /// equivalent work happens inside `Optimizer.store_final_boxes_in_guard`
+    /// + `force_box` in `emit_operation` (optimizer.py:677-683).
     fn prepare_guard_fail_arg(&mut self, resolved: OpRef, ctx: &mut OptContext) -> OpRef {
-        // RPython parity: virtualize.py does NOT force virtuals in fail_args.
-        // Virtual fail_args stay as OpRef::NONE placeholders, and
-        // store_final_boxes_in_guard / number_guard_inline encodes them as
-        // TAGVIRTUAL for lazy materialization at guard failure time.
         let Some(info) = ctx.get_ptr_info(resolved).cloned() else {
             return resolved;
         };
         match info {
-            PtrInfo::Virtual(_) | PtrInfo::VirtualStruct(_) => {
-                // Keep as virtual — TAGVIRTUAL encoding at emit time.
-                resolved
-            }
+            PtrInfo::Virtual(_) | PtrInfo::VirtualStruct(_) => resolved,
             PtrInfo::Virtualizable(_) => resolved,
             other if other.is_virtual() => {
                 let forced = self.force_virtual(resolved, ctx);
@@ -1319,118 +1152,6 @@ impl OptVirtualize {
             }
             _ => resolved,
         }
-    }
-
-    fn guard_virtual_fields_require_concrete_fallback(
-        fields: &[(u32, OpRef)],
-        field_descrs: &[(u32, DescrRef)],
-        ctx: &OptContext,
-    ) -> bool {
-        fields.iter().any(|&(field_idx, value_ref)| {
-            let is_ref_field = field_descrs
-                .iter()
-                .find_map(|(idx, descr)| {
-                    (*idx == field_idx).then(|| {
-                        descr
-                            .as_field_descr()
-                            .map(|fd| fd.field_type() == Type::Ref)
-                            .unwrap_or(false)
-                    })
-                })
-                .unwrap_or(false);
-            if !is_ref_field {
-                return false;
-            }
-            let resolved = ctx.get_box_replacement(value_ref);
-            !Self::guard_resume_value_is_concrete(resolved, ctx)
-        })
-    }
-
-    fn guard_resume_value_is_concrete(resolved: OpRef, ctx: &OptContext) -> bool {
-        if resolved.is_none() {
-            return true;
-        }
-        if let Some(info) = ctx.get_ptr_info(resolved) {
-            if info.is_virtual() {
-                return false;
-            }
-        }
-        if ctx.get_constant(resolved).is_some() {
-            return true;
-        }
-        if (resolved.0 as usize) < ctx.num_inputs() {
-            return true;
-        }
-        ctx.new_operations.iter().any(|op| op.pos == resolved)
-    }
-
-    fn optimize_guard_nonnull(&mut self, _op: &Op, _ctx: &mut OptContext) -> OptimizationResult {
-        // RPython virtualize.py does NOT handle GUARD_NONNULL.
-        // It is handled exclusively by rewrite.py:optimize_GUARD_NONNULL.
-        OptimizationResult::PassOn
-    }
-
-    fn optimize_guard_nonnull_class(
-        &mut self,
-        op: &Op,
-        ctx: &mut OptContext,
-    ) -> OptimizationResult {
-        let obj_ref = ctx.get_box_replacement(op.arg(0));
-        let expected_class = if op.num_args() >= 2 {
-            ctx.get_constant(op.arg(1)).and_then(|value| match value {
-                Value::Ref(class_ref) => Some(*class_ref),
-                Value::Int(raw) => Some(majit_ir::GcRef(*raw as usize)),
-                _ => None,
-            })
-        } else {
-            None
-        };
-
-        if let Some(info) = ctx.get_ptr_info(obj_ref) {
-            match info {
-                PtrInfo::Virtual(_)
-                | PtrInfo::VirtualStruct(_)
-                | PtrInfo::VirtualArray(_)
-                | PtrInfo::VirtualArrayStruct(_)
-                | PtrInfo::VirtualRawBuffer(_) => {
-                    return OptimizationResult::Remove;
-                }
-                PtrInfo::KnownClass {
-                    class_ptr,
-                    is_nonnull: true,
-                    ..
-                } => {
-                    if expected_class
-                        .is_none_or(|expected| *class_ptr == expected || class_ptr.is_null())
-                    {
-                        return OptimizationResult::Remove;
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        if let Some(class_ptr) = expected_class {
-            self.record_known_class(obj_ref, class_ptr, ctx);
-        } else {
-            ctx.set_ptr_info(obj_ref, PtrInfo::nonnull());
-        }
-        self.force_guard_fail_args(op, ctx)
-    }
-
-    fn optimize_guard_value(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let obj_ref = ctx.get_box_replacement(op.arg(0));
-
-        // If the object is already a known constant matching the guard value, remove
-        if let Some(val) = ctx.get_constant(obj_ref) {
-            if let Some(expected) = ctx.get_constant(ctx.get_box_replacement(op.arg(1))) {
-                if val == expected {
-                    return OptimizationResult::Remove;
-                }
-            }
-        }
-
-        self.force_guard_fail_args(op, ctx)
     }
 
     /// Handle VirtualRefR / VirtualRefI.
@@ -1741,11 +1462,13 @@ impl Optimization for OptVirtualize {
             OpCode::RawLoadI | OpCode::RawLoadF => self.optimize_raw_load(op, ctx),
             OpCode::RawStore => self.optimize_raw_store(op, ctx),
 
-            // Guards that can be eliminated based on known info
-            OpCode::GuardClass => self.optimize_guard_class(op, ctx),
-            OpCode::GuardNonnull => self.optimize_guard_nonnull(op, ctx),
-            OpCode::GuardNonnullClass => self.optimize_guard_nonnull_class(op, ctx),
-            OpCode::GuardValue => self.optimize_guard_value(op, ctx),
+            // RPython virtualize.py does NOT define optimize_GUARD_CLASS,
+            // GUARD_NONNULL, GUARD_NONNULL_CLASS, or GUARD_VALUE — these
+            // are handled exclusively by rewrite.py. Flow the guards
+            // through to the next pass so OptRewrite sees them.
+            // emit_guard_operation (mod.rs) calls store_final_boxes_in_guard
+            // + force_box on fail_args at emit time, so virtualize does not
+            // need to pre-process guard fail_args here.
 
             // VirtualRef: replace with a virtual struct tracking token + forced fields
             OpCode::VirtualRefR | OpCode::VirtualRefI => self.optimize_virtual_ref(op, ctx),
@@ -2833,9 +2556,17 @@ mod tests {
 
     #[test]
     fn test_guard_class_on_virtual() {
-        // p0 = new_with_vtable(descr=size1)
-        // guard_class(p0, ConstClass)   <- should be removed, class is known
-        let sd = size_descr(1);
+        // p0 = new_with_vtable(descr=size_with_vtable(42))
+        // guard_class(p0, ConstClass(42))   <- removed, class matches
+        //
+        // rpython/jit/metainterp/optimizeopt/virtualize.py does not
+        // define `optimize_GUARD_CLASS`. rewrite.py:397
+        // `optimize_GUARD_CLASS` calls `info.get_known_class(cpu)` on
+        // the virtual's InstancePtrInfo and removes the guard when the
+        // stored class matches. Run the full default pipeline so
+        // OptRewrite sees the guard after OptVirtualize produced the
+        // virtual.
+        let sd: DescrRef = majit_ir::make_size_descr_with_vtable(1, 8, 0, 42);
 
         let mut ops = vec![
             Op::with_descr(OpCode::NewWithVtable, &[], sd.clone()),
@@ -2843,7 +2574,10 @@ mod tests {
         ];
         assign_positions(&mut ops);
 
-        let result = run_pass(&ops);
+        let mut opt = Optimizer::default_pipeline();
+        let mut constants = std::collections::HashMap::new();
+        constants.insert(200, 42i64); // expected class ptr matches vtable
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
         // Both NEW_WITH_VTABLE (virtual) and GuardClass (redundant) removed
         assert!(
             result.is_empty(),
@@ -3071,14 +2805,19 @@ mod tests {
     fn test_guard_class_twice() {
         // guard_class(p0, cls)   <- emitted (records known class)
         // guard_class(p0, cls)   <- removed (class already known)
+        //
+        // rewrite.py:430-436 `postprocess_GUARD_CLASS` records the
+        // class via `make_constant_class`, and the second
+        // `optimize_GUARD_CLASS` (rewrite.py:397) sees the recorded
+        // known class and removes itself. virtualize.py doesn't handle
+        // GUARD_CLASS at all; run the full default pipeline.
         let mut ops = vec![
             Op::new(OpCode::GuardClass, &[OpRef(0), OpRef(200)]),
             Op::new(OpCode::GuardClass, &[OpRef(0), OpRef(200)]),
         ];
         assign_positions(&mut ops);
 
-        let mut opt = Optimizer::new();
-        opt.add_pass(Box::new(OptVirtualize::new()));
+        let mut opt = Optimizer::default_pipeline();
         let mut constants = std::collections::HashMap::new();
         constants.insert(200, 42i64); // class ptr constant
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);

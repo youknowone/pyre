@@ -45,6 +45,12 @@ pub struct TypeInfo {
     /// RPython `rgc.register_custom_trace_hook` parity.
     /// When set, overrides offset-based tracing entirely.
     pub custom_trace: Option<CustomTraceFn>,
+    /// gc.py:642 `T_IS_RPYTHON_INSTANCE` parity. True when this type has
+    /// `rclass.OBJECT` layout — the first word of the payload is the
+    /// `typeptr` (ob_type) and `cls_of_box(gcref)` is valid. False for
+    /// raw GC structs / arrays whose first word is not a class pointer.
+    /// Consumed by `check_is_object(gcref)` (llmodel.py:541-546).
+    pub is_object: bool,
 }
 
 impl TypeInfo {
@@ -58,6 +64,25 @@ impl TypeInfo {
             length_offset: 0,
             items_have_gc_ptrs: false,
             custom_trace: None,
+            is_object: false,
+        }
+    }
+
+    /// Create a type info for a fixed-size `rclass.OBJECT`-layout
+    /// instance (gc.py:642 `T_IS_RPYTHON_INSTANCE`). The first word of
+    /// the payload is the `typeptr` (ob_type). `cls_of_box` and
+    /// `guard_class` rely on this invariant, and
+    /// `check_is_object(gcref)` returns true for such types.
+    pub fn object(size: usize) -> Self {
+        TypeInfo {
+            size,
+            has_gc_ptrs: false,
+            gc_ptr_offsets: Vec::new(),
+            item_size: 0,
+            length_offset: 0,
+            items_have_gc_ptrs: false,
+            custom_trace: None,
+            is_object: true,
         }
     }
 
@@ -73,6 +98,7 @@ impl TypeInfo {
             length_offset: 0,
             items_have_gc_ptrs: false,
             custom_trace: None,
+            is_object: false,
         }
     }
 
@@ -92,6 +118,7 @@ impl TypeInfo {
             length_offset,
             items_have_gc_ptrs,
             custom_trace: None,
+            is_object: false,
         }
     }
 
@@ -107,6 +134,7 @@ impl TypeInfo {
             length_offset: 0,
             items_have_gc_ptrs: false,
             custom_trace: Some(trace_fn),
+            is_object: false,
         }
     }
 
@@ -128,6 +156,7 @@ impl TypeInfo {
             length_offset,
             items_have_gc_ptrs: false, // custom_trace handles ref tracing
             custom_trace: Some(trace_fn),
+            is_object: false,
         }
     }
 
