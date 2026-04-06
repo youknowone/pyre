@@ -141,6 +141,15 @@ struct RewriteState {
     /// Tracks which array indices have been explicitly SET since the
     /// pending zero was recorded. Keyed by array OpRef index.
     initialized_indices: HashMap<u32, HashSet<usize>>,
+
+    // ── Pending vtable initializations ──
+    /// rewrite.py:479-484 handle_malloc_operation parity: for a batch of
+    /// NEW_WITH_VTABLE ops being coalesced into one nursery bump, defer
+    /// the vtable GcStore until after ALL allocations in the batch have
+    /// been emitted. This matches RPython's "all allocations first, then
+    /// all initializations" pattern and keeps gen_initialize_tid stores
+    /// contiguous for store-buffer friendliness.
+    pending_vtable_inits: Vec<(OpRef, usize)>,
 }
 
 impl RewriteState {
@@ -158,6 +167,7 @@ impl RewriteState {
             pending_array_wb: None,
             pending_zeros: Vec::new(),
             initialized_indices: HashMap::new(),
+            pending_vtable_inits: Vec::new(),
         }
     }
 
@@ -375,14 +385,33 @@ impl GcRewriterImpl {
         //       if self.gc_ll_descr.fielddescr_vtable is not None:
         //           self.emit_setfield(op, ConstInt(descr.get_vtable()),
         //                              descr=self.gc_ll_descr.fielddescr_vtable)
-        // The force path (info.py:216-226 _force_elements) iterates
-        // descr.get_all_fielddescrs() which excludes typeptr
-        // (heaptracker.py:66-67), so the vtable must be initialized here.
+        //
+        // The vtable setfield is defered to pending_vtable_inits so that a
+        // batch of consecutive NEW_WITH_VTABLE ops produces contiguous
+        // allocation+tid-init sequences followed by the vtable stores,
+        // matching RPython's "alloc1 tid1 alloc2 tid2 ... setfields..."
+        // output pattern (rewrite.py processes ops linearly, and the
+        // vtable emit_setfield happens at the end of handle_malloc_operation
+        // but batched allocations interleave only in the nursery merge).
         if op.opcode == OpCode::NewWithVtable {
             let vtable = descr.vtable();
             if vtable != 0 {
-                self.gen_initialize_vtable(obj_ref, vtable, st);
+                st.pending_vtable_inits.push((obj_ref, vtable));
             }
+        }
+    }
+
+    /// Flush pending vtable initializations for a batched nursery allocation.
+    /// Emits a GcStore for each (obj, vtable) pair accumulated during the
+    /// current batch of consecutive NEW_WITH_VTABLE ops. Called when the
+    /// batch terminates (next non-allocation op, or end of trace).
+    fn flush_pending_vtable_inits(&self, st: &mut RewriteState) {
+        if st.pending_vtable_inits.is_empty() {
+            return;
+        }
+        let pending = std::mem::take(&mut st.pending_vtable_inits);
+        for (obj, vtable) in pending {
+            self.gen_initialize_vtable(obj, vtable, st);
         }
     }
 
@@ -443,6 +472,19 @@ impl GcRewriterImpl {
     fn handle_setfield_gc(&self, op: &Op, st: &mut RewriteState) {
         let rewritten = st.rewrite_op(op);
         let obj = rewritten.arg(0);
+
+        // Flush only THIS obj's pending vtable init before its first
+        // user setfield. This matches RPython's linear trace processing
+        // where NEW_WITH_VTABLE's emit_setfield runs before any following
+        // user setfield on the same object. Other objects' vtable inits
+        // stay pending and are flushed either on their own first setfield
+        // or at the end of the trace.
+        if !st.pending_vtable_inits.is_empty() {
+            if let Some(pos) = st.pending_vtable_inits.iter().position(|(o, _)| *o == obj) {
+                let (o, vtable) = st.pending_vtable_inits.remove(pos);
+                self.gen_initialize_vtable(o, vtable, st);
+            }
+        }
 
         // Determine whether the stored value is a Ref type from the field descriptor.
         let is_ref_store = op
@@ -569,8 +611,14 @@ impl GcRewriterImpl {
     }
 
     /// Emit a GcStore to write the vtable pointer.
+    ///
+    /// The vtable is a 64-bit pointer that cannot fit in an OpRef (u32).
+    /// Store it in the constants pool and pass the const_ref as arg(2).
+    /// The backend's GcStore slot-1 lowering resolves this via the
+    /// constants map to emit the correct 64-bit immediate.
     fn gen_initialize_vtable(&self, obj: OpRef, vtable: usize, st: &mut RewriteState) {
-        let store = Op::new(OpCode::GcStore, &[obj, OpRef(1), OpRef(vtable as u32)]);
+        let vtable_ref = st.const_int(vtable as i64);
+        let store = Op::new(OpCode::GcStore, &[obj, OpRef(1), vtable_ref]);
         st.emit(store);
     }
 
@@ -704,6 +752,21 @@ impl GcRewriter for GcRewriterImpl {
                 st.pending_array_wb = None;
             }
 
+            // Flush pending vtable inits before final ops (Jump/Finish)
+            // and before any potentially-collecting / escaping op. User
+            // SetfieldGc stores are allowed to precede the vtable init
+            // because the object's ob_type slot is only observed by GC
+            // tracing (which needs tid, not ob_type) and by guard failures
+            // (which reconstruct via known_class). This matches RPython's
+            // ordering where trace op processing runs sequentially.
+            let is_allocation_or_setfield = matches!(
+                op.opcode,
+                OpCode::New | OpCode::NewWithVtable | OpCode::SetfieldGc | OpCode::DebugMergePoint
+            );
+            if !is_allocation_or_setfield && !st.pending_vtable_inits.is_empty() {
+                self.flush_pending_vtable_inits(&mut st);
+            }
+
             match op.opcode {
                 // Skip debug merge points (they carry no semantics).
                 OpCode::DebugMergePoint => continue,
@@ -794,7 +857,8 @@ impl GcRewriter for GcRewriterImpl {
             }
         }
 
-        // Flush any remaining pending zeros at end of trace.
+        // Flush any remaining pending zeros and vtable inits at end of trace.
+        self.flush_pending_vtable_inits(&mut st);
         st.flush_pending_zeros();
 
         (st.out, st.constants)

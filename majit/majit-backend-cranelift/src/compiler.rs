@@ -7112,9 +7112,20 @@ impl CraneliftBackend {
                                     .store(MemFlags::trusted(), new_hdr, hdr_addr, 0);
                             }
                             1 => {
+                                // GcStore slot 1 writes the vtable pointer to
+                                // obj[0]. arg(2) is a 64-bit constant pool key
+                                // (vtable is a full 64-bit pointer and cannot
+                                // fit in an OpRef u32). Resolve via constants
+                                // map to get the correct 64-bit immediate.
+                                // Match main's SetfieldGc lowering order
+                                // (iconst → iadd_imm → store) for stable
+                                // instruction scheduling across runs.
+                                let vtable_val = constants
+                                    .get(&op.arg(2).0)
+                                    .copied()
+                                    .unwrap_or(op.arg(2).0 as i64);
+                                let vtable = builder.ins().iconst(cl_types::I64, vtable_val);
                                 let addr = builder.ins().iadd_imm(base, 0);
-                                let vtable =
-                                    builder.ins().iconst(cl_types::I64, op.arg(2).0 as i64);
                                 builder.ins().store(MemFlags::trusted(), vtable, addr, 0);
                             }
                             2 => {
