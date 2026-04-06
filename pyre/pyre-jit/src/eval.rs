@@ -82,9 +82,6 @@ thread_local! {
         // pyre's PyObject.ob_type is the equivalent of RPython's typeptr.
         d.set_vtable_offset(Some(pyre_object::pyobject::OB_TYPE_OFFSET));
         d.register_raw_int_box_helper(pyre_object::intobject::jit_w_int_new as *const ());
-        d.set_intval_descr(pyre_jit_trace::descr::int_intval_descr());
-        d.register_raw_int_force_helper(crate::call_jit::jit_force_recursive_call_raw_1 as *const ());
-        d.register_raw_int_force_helper(crate::call_jit::jit_force_self_recursive_call_raw_1 as *const ());
         d.register_create_frame_raw(
             crate::call_jit::jit_create_callee_frame_1 as *const (),
             crate::call_jit::jit_create_callee_frame_1_raw_int as *const (),

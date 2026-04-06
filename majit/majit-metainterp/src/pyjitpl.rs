@@ -411,11 +411,6 @@ pub struct MetaInterp<M: Clone> {
     pub(crate) result_type: Type,
     /// Helper function pointers that box raw ints into interpreter objects.
     pub(crate) raw_int_box_helpers: HashSet<i64>,
-    /// W_IntObject.intval field descriptor for unboxing Ref→Int in FINISH.
-    pub(crate) intval_descr: Option<majit_ir::DescrRef>,
-    /// Helper function pointers that take a raw int argument and return a
-    /// raw-int result when the callee's Finish protocol is raw.
-    pub(crate) raw_int_force_helpers: HashSet<i64>,
     /// Mapping: create_frame_N_ptr → create_frame_N_raw_int_ptr.
     /// When a box helper feeds directly into create_frame, the box+create
     /// can be folded into a single create_frame_raw_int call.
@@ -778,8 +773,6 @@ impl<M: Clone> MetaInterp<M> {
             forced_virtualizable: None,
             result_type: Type::Ref,
             raw_int_box_helpers: HashSet::new(),
-            intval_descr: None,
-            raw_int_force_helpers: HashSet::new(),
             create_frame_raw_map: HashMap::new(),
             tracing_call_depth: None,
             max_unroll_recursion: 7, // RPython default from rlib/jit.py
@@ -2091,7 +2084,6 @@ impl<M: Clone> MetaInterp<M> {
         // `vable_*` operations keep the hot path on boxes instead of
         // re-materializing `GetfieldRaw*`/`GetarrayitemRaw*` entry ops.
         let (inputargs, optimized_ops) = (inputargs, optimized_ops);
-        let mut optimized_ops = compile::unbox_call_assembler_results(optimized_ops);
         let mut optimized_ops =
             compile::normalize_closing_jump_args(optimized_ops, &constants, final_num_inputs);
 
@@ -2773,7 +2765,6 @@ impl<M: Clone> MetaInterp<M> {
                 }
             };
 
-        let combined_ops = compile::unbox_call_assembler_results(combined_ops);
         let combined_ops =
             compile::normalize_closing_jump_args(combined_ops, &constants, final_num_inputs);
 
@@ -3141,20 +3132,6 @@ impl<M: Clone> MetaInterp<M> {
             }
         }
 
-        // unbox_finish_result: only when result_type == Int.
-        // When result_type == Ref, FINISH stays as Ref
-        // (matching DoneWithThisFrameDescrRef contract).
-        let (optimized_ops, finish_unboxed) = if self.result_type == Type::Int {
-            compile::unbox_finish_result(optimized_ops, &constants, &self.raw_int_box_helpers)
-        } else {
-            (optimized_ops, false)
-        };
-        let optimized_ops = compile::unbox_call_assembler_results(optimized_ops);
-        let optimized_ops = if finish_unboxed {
-            compile::unbox_raw_force_results(optimized_ops, &constants, &self.raw_int_force_helpers)
-        } else {
-            optimized_ops
-        };
         let mut optimized_ops = compile::strip_stray_overflow_guards(optimized_ops);
 
         if crate::majit_log_enabled() {
@@ -5492,19 +5469,6 @@ impl<M: Clone> MetaInterp<M> {
             return false;
         }
 
-        // RPython parity: unbox the Finish result in bridges too.
-        // Without this, bridges return boxed pointers while the caller
-        // (call_assembler_fast_path) expects raw ints for [Type::Int] Finish.
-        let (optimized_ops, bridge_finish_unboxed) = if self.result_type == Type::Int {
-            compile::unbox_finish_result(optimized_ops, &constants, &self.raw_int_box_helpers)
-        } else {
-            (optimized_ops, false)
-        };
-        let optimized_ops = if bridge_finish_unboxed {
-            compile::unbox_raw_force_results(optimized_ops, &constants, &self.raw_int_force_helpers)
-        } else {
-            optimized_ops
-        };
         let optimized_ops = compile::strip_stray_overflow_guards(optimized_ops);
 
         let num_optimized_ops = optimized_ops.len();
@@ -6819,18 +6783,6 @@ impl<M: Clone> MetaInterp<M> {
     /// that are safe to peel away for the raw-int call_assembler protocol.
     pub fn register_raw_int_box_helper(&mut self, helper: *const ()) {
         self.raw_int_box_helpers.insert(helper as i64);
-    }
-
-    /// Set the W_IntObject.intval field descriptor for Ref→Int unboxing in FINISH.
-    pub fn set_intval_descr(&mut self, descr: majit_ir::DescrRef) {
-        self.intval_descr = Some(descr);
-    }
-
-    /// Register a recursive force helper that takes a raw-int argument and
-    /// can return a raw-int result when the callee trace ends with a raw-int
-    /// Finish protocol.
-    pub fn register_raw_int_force_helper(&mut self, helper: *const ()) {
-        self.raw_int_force_helpers.insert(helper as i64);
     }
 
     /// Register a create_frame → create_frame_raw_int mapping.
@@ -10584,290 +10536,5 @@ mod tests {
             state.restored_frames[2].2,
             vec![Value::Int(10), Value::Int(20)]
         );
-    }
-}
-
-// ── Post-process: raw-int CallAssembler protocol ─────────────────────
-
-/// Strip boxing from Finish result: Finish(CallI(w_int_new, raw)) → Finish(raw).
-
-#[cfg(test)]
-mod raw_int_postprocess_tests {
-    use crate::compile::{
-        unbox_call_assembler_results, unbox_finish_result, unbox_raw_force_results,
-    };
-    use std::collections::{HashMap, HashSet};
-
-    use majit_ir::{Op, OpCode, OpRef, Type, make_field_descr};
-
-    fn mk_op(opcode: OpCode, args: &[OpRef], pos: u32) -> Op {
-        let mut op = Op::new(opcode, args);
-        op.pos = OpRef(pos);
-        op
-    }
-
-    fn mk_op_with_descr(opcode: OpCode, args: &[OpRef], pos: u32, descr: majit_ir::DescrRef) -> Op {
-        let mut op = Op::with_descr(opcode, args, descr);
-        op.pos = OpRef(pos);
-        op
-    }
-
-    extern "C" fn dummy_box_helper(_value: i64) -> i64 {
-        0
-    }
-
-    #[test]
-    fn unbox_finish_result_requires_jit_w_int_new_target() {
-        let func_const = OpRef(dummy_box_helper as *const () as usize as u32);
-        let raw = OpRef(0);
-        let call = mk_op_with_descr(
-            OpCode::CallI,
-            &[func_const, raw],
-            1,
-            crate::make_call_descr(&[Type::Int], Type::Int),
-        );
-        let finish = Op::with_descr(
-            OpCode::Finish,
-            &[OpRef(1)],
-            crate::make_fail_descr_typed(vec![Type::Int]),
-        );
-        let helpers = HashSet::new();
-        let mut constants = HashMap::new();
-        constants.insert(func_const.0, 0xDEAD_BEEF_i64);
-
-        let (ops, changed) = unbox_finish_result(vec![call, finish], &constants, &helpers);
-
-        assert!(!changed);
-        assert_eq!(ops.len(), 2);
-        assert_eq!(ops[0].opcode, OpCode::CallI);
-        assert_eq!(ops[1].opcode, OpCode::Finish);
-        assert_eq!(ops[1].args.as_slice(), &[OpRef(1)]);
-    }
-
-    #[test]
-    fn unbox_finish_result_rewrites_jit_w_int_new_finish() {
-        let func_const = OpRef(dummy_box_helper as *const () as usize as u32);
-        let raw = OpRef(0);
-        let call = mk_op_with_descr(
-            OpCode::CallI,
-            &[func_const, raw],
-            1,
-            crate::make_call_descr(&[Type::Int], Type::Int),
-        );
-        let finish = Op::with_descr(
-            OpCode::Finish,
-            &[OpRef(1)],
-            crate::make_fail_descr_typed(vec![Type::Int]),
-        );
-        let mut helpers = HashSet::new();
-        helpers.insert(dummy_box_helper as *const () as i64);
-        let mut constants = HashMap::new();
-        constants.insert(func_const.0, dummy_box_helper as *const () as i64);
-
-        let (ops, changed) = unbox_finish_result(vec![call, finish], &constants, &helpers);
-
-        assert!(changed);
-        assert_eq!(ops.len(), 1);
-        assert_eq!(ops[0].opcode, OpCode::Finish);
-        assert_eq!(ops[0].args.as_slice(), &[raw]);
-    }
-
-    #[test]
-    fn unbox_finish_result_rewrites_new_setfield_chain_even_if_new_is_last() {
-        let new_op = mk_op_with_descr(OpCode::New, &[], 25, majit_ir::descr::make_size_descr(16));
-        let set_type = mk_op_with_descr(
-            OpCode::SetfieldGc,
-            &[OpRef(25), OpRef(99)],
-            1,
-            make_field_descr(0, 8, Type::Int, false),
-        );
-        let raw = OpRef(13);
-        let set_payload = mk_op_with_descr(
-            OpCode::SetfieldGc,
-            &[OpRef(25), raw],
-            2,
-            make_field_descr(8, 8, Type::Int, true),
-        );
-        let finish = Op::with_descr(
-            OpCode::Finish,
-            &[OpRef(25)],
-            crate::make_fail_descr_typed(vec![Type::Ref]),
-        );
-
-        let (ops, changed) = unbox_finish_result(
-            vec![set_type, set_payload, new_op, finish],
-            &HashMap::new(),
-            &HashSet::new(),
-        );
-
-        assert!(changed);
-        assert_eq!(ops.len(), 1);
-        assert_eq!(ops[0].opcode, OpCode::Finish);
-        assert_eq!(ops[0].args.as_slice(), &[raw]);
-    }
-
-    #[test]
-    fn unbox_call_assembler_results_rewrites_only_int_payload_unboxing() {
-        let ca = mk_op_with_descr(
-            OpCode::CallAssemblerI,
-            &[OpRef(0)],
-            1,
-            crate::make_call_assembler_descr(1, &[Type::Int], Type::Int),
-        );
-        let get_type = mk_op_with_descr(
-            OpCode::GetfieldRawI,
-            &[OpRef(1)],
-            2,
-            make_field_descr(0, 8, Type::Int, false),
-        );
-        let guard = Op::new(OpCode::GuardClass, &[OpRef(2), OpRef(99_999)]);
-        let get_int = mk_op_with_descr(
-            OpCode::GetfieldRawI,
-            &[OpRef(1)],
-            3,
-            make_field_descr(8, 8, Type::Int, true),
-        );
-        let add = mk_op(OpCode::IntAdd, &[OpRef(3), OpRef(0)], 4);
-
-        let ops = unbox_call_assembler_results(vec![ca, get_type, guard, get_int, add]);
-
-        assert_eq!(ops.len(), 2);
-        assert_eq!(ops[0].opcode, OpCode::CallAssemblerI);
-        assert_eq!(ops[1].opcode, OpCode::IntAdd);
-        assert_eq!(ops[1].args[0], OpRef(1));
-    }
-
-    #[test]
-    fn unbox_call_assembler_results_preserves_bool_payload_unboxing() {
-        let ca = mk_op_with_descr(
-            OpCode::CallAssemblerI,
-            &[OpRef(0)],
-            1,
-            crate::make_call_assembler_descr(1, &[Type::Int], Type::Int),
-        );
-        let get_type = mk_op_with_descr(
-            OpCode::GetfieldRawI,
-            &[OpRef(1)],
-            2,
-            make_field_descr(0, 8, Type::Int, false),
-        );
-        let guard = Op::new(OpCode::GuardClass, &[OpRef(2), OpRef(99_999)]);
-        let get_bool = mk_op_with_descr(
-            OpCode::GetfieldRawI,
-            &[OpRef(1)],
-            3,
-            make_field_descr(8, 1, Type::Int, false),
-        );
-        let test = mk_op(OpCode::IntNe, &[OpRef(3), OpRef(0)], 4);
-
-        let ops = unbox_call_assembler_results(vec![ca, get_type, guard, get_bool, test]);
-
-        assert_eq!(ops.len(), 5);
-        assert_eq!(ops[3].opcode, OpCode::GetfieldRawI);
-        assert_eq!(ops[4].opcode, OpCode::IntNe);
-        assert_eq!(ops[4].args[0], OpRef(3));
-    }
-
-    #[test]
-    fn unbox_call_assembler_results_rewrites_gc_int_payload_unboxing() {
-        let ca = mk_op_with_descr(
-            OpCode::CallAssemblerI,
-            &[OpRef(0)],
-            1,
-            crate::make_call_assembler_descr(1, &[Type::Int], Type::Int),
-        );
-        let get_type = mk_op_with_descr(
-            OpCode::GetfieldGcI,
-            &[OpRef(1)],
-            2,
-            make_field_descr(0, 8, Type::Int, false),
-        );
-        let guard = Op::new(OpCode::GuardClass, &[OpRef(2), OpRef(99_999)]);
-        let get_int = mk_op_with_descr(
-            OpCode::GetfieldGcI,
-            &[OpRef(1)],
-            3,
-            make_field_descr(8, 8, Type::Int, true),
-        );
-        let add = mk_op(OpCode::IntAdd, &[OpRef(3), OpRef(0)], 4);
-
-        let ops = unbox_call_assembler_results(vec![ca, get_type, guard, get_int, add]);
-
-        assert_eq!(ops.len(), 2);
-        assert_eq!(ops[0].opcode, OpCode::CallAssemblerI);
-        assert_eq!(ops[1].opcode, OpCode::IntAdd);
-        assert_eq!(ops[1].args[0], OpRef(1));
-    }
-
-    #[test]
-    fn unbox_call_assembler_results_rewrites_gc_pure_int_payload_unboxing() {
-        let ca = mk_op_with_descr(
-            OpCode::CallAssemblerI,
-            &[OpRef(0)],
-            1,
-            crate::make_call_assembler_descr(1, &[Type::Int], Type::Int),
-        );
-        let get_type = mk_op_with_descr(
-            OpCode::GetfieldGcPureI,
-            &[OpRef(1)],
-            2,
-            make_field_descr(0, 8, Type::Int, false),
-        );
-        let guard = Op::new(OpCode::GuardClass, &[OpRef(2), OpRef(99_999)]);
-        let get_int = mk_op_with_descr(
-            OpCode::GetfieldGcPureI,
-            &[OpRef(1)],
-            3,
-            make_field_descr(8, 8, Type::Int, true),
-        );
-        let add = mk_op(OpCode::IntAdd, &[OpRef(3), OpRef(0)], 4);
-
-        let ops = unbox_call_assembler_results(vec![ca, get_type, guard, get_int, add]);
-
-        assert_eq!(ops.len(), 2);
-        assert_eq!(ops[0].opcode, OpCode::CallAssemblerI);
-        assert_eq!(ops[1].opcode, OpCode::IntAdd);
-        assert_eq!(ops[1].args[0], OpRef(1));
-    }
-
-    #[test]
-    fn unbox_raw_force_results_rewrites_only_int_payload_unboxing() {
-        let helper_const = OpRef(90_000);
-        let mut constants = HashMap::new();
-        constants.insert(helper_const.0, 0xfeed_beef);
-        let mut helpers = HashSet::new();
-        helpers.insert(0xfeed_beef);
-
-        let call = mk_op_with_descr(
-            OpCode::CallMayForceI,
-            &[helper_const, OpRef(0), OpRef(1), OpRef(2)],
-            3,
-            crate::make_call_descr(&[Type::Int, Type::Int, Type::Int], Type::Int),
-        );
-        let get_type = mk_op_with_descr(
-            OpCode::GetfieldGcI,
-            &[OpRef(3)],
-            4,
-            make_field_descr(0, 8, Type::Int, false),
-        );
-        let guard = Op::new(OpCode::GuardClass, &[OpRef(4), OpRef(99_999)]);
-        let get_int = mk_op_with_descr(
-            OpCode::GetfieldGcI,
-            &[OpRef(3)],
-            5,
-            make_field_descr(8, 8, Type::Int, true),
-        );
-        let add = mk_op(OpCode::IntAdd, &[OpRef(5), OpRef(0)], 6);
-
-        let ops = unbox_raw_force_results(
-            vec![call, get_type, guard, get_int, add],
-            &constants,
-            &helpers,
-        );
-
-        assert_eq!(ops.len(), 2);
-        assert_eq!(ops[0].opcode, OpCode::CallMayForceI);
-        assert_eq!(ops[1].opcode, OpCode::IntAdd);
-        assert_eq!(ops[1].args[0], OpRef(3));
     }
 }
