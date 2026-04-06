@@ -242,10 +242,13 @@ impl CodeWriter {
         let mut depth_at_pc: Vec<u16> = vec![0; num_instrs];
 
         // jitcode.py:14 jitdriver_sd: portal has a jitdriver.
-        // RPython: jitdriver_sd is not None for portal jitcodes.
-        // pyre: every jitcode with loop headers is a potential portal
-        // (any function's hot loop can be independently traced).
-        let is_portal = !loop_header_pcs.is_empty();
+        // RPython: jitdriver_sd is set on the portal jitcode by
+        // call.py:148 grab_initial_jitcodes (exactly one per jitdriver).
+        // pyre: every named function is a potential portal (pyre's single
+        // jitdriver covers all functions). <module> is excluded because
+        // module-level code runs once — RPython never places
+        // jit_merge_point in module-level code.
+        let is_portal = &*code.obj_name != "<module>";
         // RPython: one jit_merge_point per jitcode (the first loop header).
         // All other loop headers get loop_header (= BC_JUMP_TARGET, no-op
         // in blackhole). The blackhole handler checks nextblackholeinterp
@@ -966,4 +969,18 @@ pub fn ensure_jitcode_for(code: &pyre_interpreter::CodeObject) {
         crate::call_jit::bh_build_list_fn,
     );
     let _ = get_jitcode(code, &writer);
+}
+
+/// jitcode.py:18 parity: `jitcode.jitdriver_sd is not None`.
+/// Single source of truth for portal determination.
+pub fn is_portal(code: &pyre_interpreter::CodeObject) -> bool {
+    ensure_jitcode_for(code);
+    let key = code as *const pyre_interpreter::CodeObject as usize;
+    JITCODE_CACHE.with(|cell| {
+        let cache = unsafe { &*cell.get() };
+        cache
+            .get(&key)
+            .map(|pjc| pjc.jitcode.is_portal)
+            .unwrap_or(false)
+    })
 }

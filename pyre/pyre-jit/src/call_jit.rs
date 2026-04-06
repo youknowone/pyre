@@ -657,6 +657,18 @@ pub fn resume_in_blackhole_pub(frame: &mut PyFrame) -> pyre_object::PyObjectRef 
     blackhole_from_jit_frame(frame)
 }
 
+/// blackhole.py:1095 get_portal_runner / warmspot.py portal_runner parity:
+/// Callback for bhimpl_recursive_call. Receives a frame pointer, executes
+/// the frame through the JIT-enabled interpreter (eval_loop_jit), and
+/// returns the result. This enables JIT re-entry at recursive portal depth.
+fn bh_portal_runner(frame_ptr: i64) -> i64 {
+    if frame_ptr == 0 {
+        return pyre_object::PY_NULL as i64;
+    }
+    let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
+    crate::eval::portal_runner(frame) as i64
+}
+
 /// RPython: blackhole.py resume_in_blackhole()
 ///
 /// Compiles the frame's CodeObject to JitCode (via CodeWriter), creates
@@ -900,6 +912,9 @@ pub fn resume_in_blackhole(
 
         let mut bh = builder.acquire_interp();
         bh.setposition(pyjitcode.jitcode.clone(), jitcode_pc);
+        // blackhole.py:1095 get_portal_runner parity:
+        // Set portal_runner_fn for bhimpl_recursive_call.
+        bh.portal_runner_fn = Some(bh_portal_runner);
 
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
@@ -1258,6 +1273,7 @@ pub fn resume_in_blackhole_to_merge_point(frame: &mut PyFrame) -> bool {
     // blackhole.py bhimpl_getfield_vable_*: set virtualizable pointer.
     bh.virtualizable_ptr = frame as *mut PyFrame as i64;
     bh.virtualizable_info = crate::eval::get_virtualizable_info();
+    bh.portal_runner_fn = Some(bh_portal_runner);
 
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
@@ -1767,6 +1783,8 @@ pub fn blackhole_resume_via_rd_numb(
         bh.virtualizable_ptr = deadframe[0];
     }
     bh.virtualizable_info = crate::eval::get_virtualizable_info();
+    // blackhole.py:1095 get_portal_runner parity
+    bh.portal_runner_fn = Some(bh_portal_runner);
 
     if majit_metainterp::majit_log_enabled() {
         eprintln!("[blackhole-resume] rd_numb path, chain built, running _run_forever",);

@@ -930,16 +930,28 @@ fn debug_first_arg_int(frame: &PyFrame) -> Option<i64> {
 ///       jit_merge_point(...)      # thin inline check
 ///       next_instr = handle_bytecode(...)
 ///
+/// warmspot.py portal_runner parity: execute a frame through the JIT-enabled
+/// interpreter. Used by bhimpl_recursive_call (blackhole.py:1074-1093) for
+/// recursive portal depth. Returns PyObjectRef (NULL on void/exception).
+pub fn portal_runner(frame: &mut PyFrame) -> pyre_object::PyObjectRef {
+    match eval_loop_jit(frame) {
+        LoopResult::Done(Ok(result)) => result,
+        LoopResult::Done(Err(_)) => pyre_object::PY_NULL,
+        LoopResult::ContinueRunningNormally => {
+            // Re-enter: the compiled loop wants to restart the portal.
+            portal_runner(frame)
+        }
+    }
+}
+
 /// JIT hooks are thin inline checks; all heavy logic is in #[cold] helpers.
 fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
     let code = unsafe { &*frame.code };
     let env = PyreEnv;
     let (driver, info) = driver_pair();
-    // jitcode.py:14 parity: jitdriver_sd is not None for portals.
-    // RPython: only functions annotated with jit_merge_point are portals.
-    // pyre: every named function is a potential portal. Module-level code
-    // ("<module>") is excluded — it runs once and matches RPython's model
-    // where only repeatedly-called functions have jitdrivers.
+    // jitcode.py:18 parity: jitdriver_sd is not None for portals.
+    // Same criterion as codewriter.rs JitCode.is_portal: every named
+    // function is a potential portal. <module> runs once and is excluded.
     let is_portal: bool = &*code.obj_name != "<module>";
 
     loop {
