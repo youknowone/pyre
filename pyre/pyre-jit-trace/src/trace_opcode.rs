@@ -2009,49 +2009,11 @@ impl MIFrame {
         concrete_lhs: PyObjectRef,
         concrete_rhs: PyObjectRef,
     ) -> Result<OpRef, PyError> {
-        // Power uses call_elidable_float_typed(pow), not a simple float op.
-        let is_power = matches!(op, BinaryOperator::Power | BinaryOperator::InplacePower);
-
-        // floatobject.py:561,799: descr_pow/_pow can raise ZeroDivisionError
-        // (0.0 ** negative), ValueError (negative ** fractional), OverflowError.
-        // A pure elidable call has no exception channel, so detect these at
-        // trace time using concrete values and fall back to the interpreter.
-        if is_power && !concrete_lhs.is_null() && !concrete_rhs.is_null() {
-            let lhs_f = unsafe {
-                if is_float(concrete_lhs) {
-                    w_float_get_value(concrete_lhs)
-                } else if is_int(concrete_lhs) {
-                    w_int_get_value(concrete_lhs) as f64
-                } else {
-                    return self.trace_binary_value(a, b, op);
-                }
-            };
-            let rhs_f = unsafe {
-                if is_float(concrete_rhs) {
-                    w_float_get_value(concrete_rhs)
-                } else if is_int(concrete_rhs) {
-                    w_int_get_value(concrete_rhs) as f64
-                } else {
-                    return self.trace_binary_value(a, b, op);
-                }
-            };
-            // _pow raises for these concrete value patterns:
-            if lhs_f == 0.0 && rhs_f < 0.0 {
-                // floatobject.py:847: ZeroDivisionError
-                return self.trace_binary_value(a, b, op);
-            }
-            if lhs_f < 0.0 && rhs_f.floor() != rhs_f {
-                // floatobject.py:857: PowDomainError → ValueError
-                return self.trace_binary_value(a, b, op);
-            }
-        }
-
-        // Table lookup: BinaryOperator → OpCode (Power excluded from table)
-        let op_code = if is_power {
-            OpCode::FloatMul // unused: is_power branch calls float_pow directly
-        } else if let Some(opcode) = crate::float_binop_lookup(op) {
-            opcode
-        } else {
+        // lloperation.py:261: "don't implement float_pow, use math.pow instead"
+        // resoperation.py: no FLOAT_POW opcode.
+        // ll_math.py:260: ll_math_pow is NOT elidable, has EF_CAN_RAISE.
+        // Power goes through trace_binary_value (residual call), not inline.
+        let Some(op_code) = crate::float_binop_lookup(op) else {
             return self.trace_binary_value(a, b, op);
         };
 
@@ -2111,66 +2073,7 @@ impl MIFrame {
             } else {
                 unbox_float(this, ctx, b)
             };
-            let result = if is_power {
-                // floatobject.py:561 descr_pow → _pow().
-                // Emit CallPureF with Python-correct float power semantics.
-                extern "C" fn float_pow_python(x: f64, y: f64) -> f64 {
-                    // floatobject.py:799-881 _pow: special cases
-                    if y == 2.0 {
-                        return x * x;
-                    }
-                    if y == 0.0 {
-                        return 1.0;
-                    }
-                    if x.is_nan() {
-                        return x;
-                    }
-                    if y.is_nan() {
-                        return if x == 1.0 { 1.0 } else { y };
-                    }
-                    if y.is_infinite() {
-                        let ax = x.abs();
-                        if ax == 1.0 {
-                            return 1.0;
-                        }
-                        return if (y > 0.0) == (ax > 1.0) {
-                            f64::INFINITY
-                        } else {
-                            0.0
-                        };
-                    }
-                    if x.is_infinite() {
-                        let y_is_odd = y.abs() % 2.0 == 1.0;
-                        if y > 0.0 {
-                            return if y_is_odd { x } else { x.abs() };
-                        } else {
-                            return if y_is_odd { f64::copysign(0.0, x) } else { 0.0 };
-                        }
-                    }
-                    // Negative base: integer exponent only
-                    let mut bx = x;
-                    let mut negate = false;
-                    if bx < 0.0 {
-                        if y.floor() != y {
-                            return f64::NAN;
-                        } // PowDomainError
-                        bx = -bx;
-                        negate = y.abs() % 2.0 == 1.0;
-                    }
-                    if bx == 1.0 {
-                        return if negate { -1.0 } else { 1.0 };
-                    }
-                    let z = bx.powf(y);
-                    if negate { -z } else { z }
-                }
-                ctx.call_elidable_float_typed(
-                    float_pow_python as *const (),
-                    &[lhs_raw, rhs_raw],
-                    &[Type::Float, Type::Float],
-                )
-            } else {
-                ctx.record_op(op_code, &[lhs_raw, rhs_raw])
-            };
+            let result = ctx.record_op(op_code, &[lhs_raw, rhs_raw]);
             this.remember_value_type(result, Type::Float);
             // RPython parity: wrapfloat(space, z) re-boxes the raw float result.
             // pypy/objspace/std/floatobject.py
