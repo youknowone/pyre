@@ -15,8 +15,10 @@ pub static FUNCTION_TYPE: PyType = PyType {
 
 /// User-defined function object.
 ///
-/// Layout: `[ob_type | code | name_ptr | w_func_globals | closure]`
+/// Layout: `[ob_type | code | can_change_code | name_ptr | w_func_globals | closure]`
 /// - `code`: opaque pointer to the CodeObject
+/// - `can_change_code`: function.py:33 — True by default; False for
+///   `FunctionWithFixedCode` subclass (used by builtins).
 /// - `name_ptr`: leaked `Box<String>` containing the function name
 /// - `w_func_globals`: raw pointer to the module-level namespace (shared)
 /// - `closure`:  tuple of cell objects, or PY_NULL if no closure
@@ -24,7 +26,11 @@ pub static FUNCTION_TYPE: PyType = PyType {
 pub struct Function {
     pub ob: PyObject,
     /// Opaque pointer to the CodeObject (borrowed from constants).
+    /// function.py:47 — `_immutable_fields_ = ['code?', ...]`
     pub code: *const (),
+    /// function.py:33 — `can_change_code = True`
+    /// False for FunctionWithFixedCode subclass.
+    pub can_change_code: bool,
     /// Function name (leaked Box<String>).
     pub name: *const String,
     /// PyPy: W_Function.w_func_globals
@@ -83,6 +89,7 @@ pub fn function_new_with_closure(
             ob_type: &FUNCTION_TYPE as *const PyType,
         },
         code,
+        can_change_code: true, // function.py:33
         name: name_ptr,
         w_func_globals,
         closure,
@@ -92,13 +99,17 @@ pub fn function_new_with_closure(
     Box::into_raw(obj) as PyObjectRef
 }
 
-/// PyPy `function._get_immutable_code`.
-/// rlib/jit.py:180 — `@elidable_promote()`: the code pointer is immutable
-/// once can_change_code is false, so the JIT can constant-fold this.
+/// function.py:23 — `@jit.elidable_promote()`
+/// Only valid when `can_change_code == false`.
 #[majit_macros::elidable_promote]
 #[inline]
 pub unsafe fn _get_immutable_code(func: PyObjectRef) -> *const () {
-    unsafe { function_get_code(func) }
+    // function.py:25
+    debug_assert!(
+        !unsafe { (*(func as *const Function)).can_change_code },
+        "_get_immutable_code called on function with can_change_code=true"
+    );
+    unsafe { (*(func as *const Function)).code }
 }
 
 /// Check if an object is a user-defined function.
@@ -110,9 +121,23 @@ pub unsafe fn is_function(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &FUNCTION_TYPE) }
 }
 
+/// function.py:78-83 — `getcode(self)`: three-way dispatch.
+///   - JIT + immutable code → _get_immutable_code (elidable_promote)
+///   - JIT + mutable code  → promote(self.code)
+///   - interpreter         → self.code
 #[inline]
 pub unsafe fn getcode(obj: PyObjectRef) -> *const () {
-    function_get_code(obj)
+    let func = obj as *const Function;
+    if majit_metainterp::jit::we_are_jitted() {
+        if !(*func).can_change_code {
+            // function.py:80-81
+            return _get_immutable_code(obj);
+        }
+        // function.py:82
+        return majit_metainterp::jit::promote((*func).code as usize) as *const ();
+    }
+    // function.py:83
+    (*func).code
 }
 
 /// Get the opaque code pointer from a function object.

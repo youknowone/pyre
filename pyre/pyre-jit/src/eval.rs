@@ -441,6 +441,8 @@ pub fn should_unroll_one_iteration(
 /// Returns True if a jitcell exists for this green key, regardless of
 /// whether machine code has been compiled. A cell is created when the
 /// counter first ticks, so this returns True even before compilation.
+/// interp_jit.py:215 — `@dont_look_inside`
+#[majit_macros::dont_look_inside]
 pub fn get_jitcell_at_key(
     _space: pyre_object::PyObjectRef,
     next_instr: usize,
@@ -458,7 +460,8 @@ pub fn get_jitcell_at_key(
     }))
 }
 
-/// RPython interp_jit.py helper: dont_trace_here.
+/// interp_jit.py:222 — `@dont_look_inside`
+#[majit_macros::dont_look_inside]
 pub fn dont_trace_here(
     _space: pyre_object::PyObjectRef,
     next_instr: usize,
@@ -475,7 +478,8 @@ pub fn dont_trace_here(
         .disable_noninlinable_function(green_key);
 }
 
-/// RPython interp_jit.py helper: mark_as_being_traced.
+/// interp_jit.py:233 — `@dont_look_inside`
+#[majit_macros::dont_look_inside]
 pub fn mark_as_being_traced(
     _space: pyre_object::PyObjectRef,
     next_instr: usize,
@@ -492,7 +496,8 @@ pub fn mark_as_being_traced(
         .mark_as_being_traced(green_key);
 }
 
-/// RPython interp_jit.py helper: trace_next_iteration.
+/// interp_jit.py:245 — `@dont_look_inside`
+#[majit_macros::dont_look_inside]
 pub fn trace_next_iteration(
     _space: pyre_object::PyObjectRef,
     next_instr: usize,
@@ -509,7 +514,8 @@ pub fn trace_next_iteration(
         .trace_next_iteration(green_key);
 }
 
-/// RPython interp_jit.py helper: trace_next_iteration_hash.
+/// interp_jit.py:253 — `@dont_look_inside`
+#[majit_macros::dont_look_inside]
 pub fn trace_next_iteration_hash(_space: pyre_object::PyObjectRef, green_key_hash: usize) {
     let _ = _space;
     let (driver, _) = driver_pair();
@@ -519,7 +525,8 @@ pub fn trace_next_iteration_hash(_space: pyre_object::PyObjectRef, green_key_has
         .trace_next_iteration(green_key_hash as u64);
 }
 
-/// RPython interp_jit.py helper: residual_call.
+/// interp_jit.py:169 — `@dont_look_inside`
+#[majit_macros::dont_look_inside]
 pub fn residual_call(
     _space: pyre_object::PyObjectRef,
     callable: pyre_object::PyObjectRef,
@@ -679,13 +686,11 @@ fn split_kwargs(
     (args, None)
 }
 
-/// interp_jit.py:259 — releaseall(space).
+/// interp_jit.py:258 — `@dont_look_inside`
 ///
 /// Mark all current machine code objects as ready to release.
 /// They will be released at the next GC (unless in use on a thread stack).
-///
-/// RPython: jit_hooks.stats_memmgr_release_all(None) → memory manager
-/// marks loops for release, does NOT invalidate warm-state cells.
+#[majit_macros::dont_look_inside]
 pub fn releaseall(_space: pyre_object::PyObjectRef) {
     let _ = _space;
     let (driver, _) = driver_pair();
@@ -964,8 +969,8 @@ pub fn portal_runner(frame: &mut PyFrame) -> pyre_object::PyObjectRef {
     }
 }
 
-/// rlib/jit.py:260 — `@not_in_trace`: call disappears from the final assembler.
-/// Still called during interpretation and tracing, but not in compiled code.
+/// pyre-local debug instrumentation (no PyPy counterpart).
+/// `@not_in_trace` so that compiled code does not include this call.
 #[majit_macros::not_in_trace]
 fn trace_jit_bytecode(pc: usize, _instruction_name: &str) {
     if cfg!(debug_assertions) {
