@@ -141,9 +141,16 @@ impl ConstantPool {
 
     /// Release shadow stack roots.
     /// gcreftracer.py parity: release GC roots for this pool's constants.
+    /// XXX majit-only: in RPython, ConstantPool consumption is strictly
+    /// LIFO so pop_to always succeeds. In majit, ExportedState may pop
+    /// the shadow stack between this pool's creation and release. Until
+    /// the LIFO ordering is enforced structurally, guard against this.
     fn release_roots(&mut self) {
         if !self.rooted_refs.is_empty() {
-            shadow_stack::pop_to(self.shadow_stack_base);
+            let current = shadow_stack::depth();
+            if current >= self.shadow_stack_base {
+                shadow_stack::pop_to(self.shadow_stack_base);
+            }
             self.rooted_refs.clear();
         }
     }
