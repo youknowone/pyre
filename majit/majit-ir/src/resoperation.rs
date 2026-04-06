@@ -470,6 +470,64 @@ impl Op {
     pub fn result_type(&self) -> Type {
         self.opcode.result_type()
     }
+
+    /// resoperation.py:323-334 AbstractResOp.copy_and_change +
+    /// resoperation.py:498-503 GuardResOp.copy_and_change parity.
+    ///
+    /// "shallow copy: the returned operation is meant to be used in place
+    /// of self". For guard ops, copies fail_args AND rd_resume_position.
+    /// majit additionally carries fail_arg_types/rd_numb/rd_consts/
+    /// rd_virtuals/rd_pendingfields on Op (instead of on a separate
+    /// GuardDescr); they're propagated here too so that synthetic guard
+    /// rewrites do not strip resume metadata.
+    ///
+    /// `args=None` → reuse self.args (matches getarglist_copy()).
+    /// `descr=None` → reuse self.descr.
+    pub fn copy_and_change(
+        &self,
+        opcode: OpCode,
+        args: Option<&[OpRef]>,
+        descr: Option<Option<DescrRef>>,
+    ) -> Op {
+        let new_args: SmallVec<[OpRef; 3]> = match args {
+            Some(a) => SmallVec::from_slice(a),
+            None => self.args.clone(),
+        };
+        let new_descr = match descr {
+            Some(d) => d,
+            None => self.descr.clone(),
+        };
+        let mut newop = Op {
+            opcode,
+            args: new_args,
+            descr: new_descr,
+            pos: self.pos,
+            fail_args: None,
+            fail_arg_types: None,
+            rd_pendingfields: None,
+            rd_resume_position: -1,
+            rd_numb: None,
+            rd_consts: None,
+            rd_virtuals: None,
+            vecinfo: None,
+        };
+        // resoperation.py:498-503 GuardResOp.copy_and_change:
+        //   newop.setfailargs(self.getfailargs())
+        //   newop.rd_resume_position = self.rd_resume_position
+        // The check is on opcode.is_guard() because in RPython this lives
+        // on the GuardResOp class hierarchy. majit stores guard metadata
+        // on Op directly, but only guard opcodes ever populate them.
+        if opcode.is_guard() || self.opcode.is_guard() {
+            newop.fail_args = self.fail_args.clone();
+            newop.fail_arg_types = self.fail_arg_types.clone();
+            newop.rd_pendingfields = self.rd_pendingfields.clone();
+            newop.rd_resume_position = self.rd_resume_position;
+            newop.rd_numb = self.rd_numb.clone();
+            newop.rd_consts = self.rd_consts.clone();
+            newop.rd_virtuals = self.rd_virtuals.clone();
+        }
+        newop
+    }
     /// compile.py: ResumeGuardDescr.store_final_boxes(guard_op, boxes, metainterp_sd)
     ///   guard_op.setfailargs(boxes)
     /// compile.py:874-876 store_final_boxes
