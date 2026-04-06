@@ -35,11 +35,13 @@ impl OptEarlyForce {
     }
 
     /// earlyforce.py:15-29: should we force args for this op?
+    /// RPython exempt set: SETFIELD_GC, SETARRAYITEM_GC, SETARRAYITEM_RAW,
+    /// QUASIIMMUT_FIELD, SAME_AS_I/R/F, and raw_free. Note that
+    /// SETFIELD_RAW is NOT exempt in RPython.
     fn should_force_args(op: &Op) -> bool {
         !matches!(
             op.opcode,
             OpCode::SetfieldGc
-                | OpCode::SetfieldRaw
                 | OpCode::SetarrayitemGc
                 | OpCode::SetarrayitemRaw
                 | OpCode::QuasiimmutField
