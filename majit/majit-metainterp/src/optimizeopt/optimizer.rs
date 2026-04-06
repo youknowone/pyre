@@ -2514,6 +2514,12 @@ impl Optimizer {
                     return;
                 }
                 OptimizationResult::PassOn => {}
+                // rewrite.py:406 — guard proven to always fail
+                OptimizationResult::InvalidLoop => {
+                    std::panic::panic_any(crate::optimize::InvalidLoop(
+                        "guard proven to always fail",
+                    ));
+                }
             }
         }
 
