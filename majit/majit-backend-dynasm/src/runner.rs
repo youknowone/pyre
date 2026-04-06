@@ -24,6 +24,9 @@ pub struct DynasmBackend {
     next_header_pc: u64,
     /// Constants for the next compilation.
     constants: std::collections::HashMap<u32, i64>,
+    /// llmodel.py:64-69 self.vtable_offset — byte offset of the typeptr
+    /// field inside instance objects. None when gcremovetypeptr is enabled.
+    vtable_offset: Option<usize>,
 }
 
 impl DynasmBackend {
@@ -32,7 +35,13 @@ impl DynasmBackend {
             next_trace_id: 1,
             next_header_pc: 0,
             constants: std::collections::HashMap::new(),
+            vtable_offset: None,
         }
+    }
+
+    /// Active vtable_offset for the assembler to consume during codegen.
+    pub fn vtable_offset(&self) -> Option<usize> {
+        self.vtable_offset
     }
 
     /// Set constants for the next compile_loop/compile_bridge call.
@@ -59,8 +68,10 @@ impl DynasmBackend {
     /// Stub — GC allocator registration.
     pub fn set_gc_allocator(&mut self, _gc: Box<dyn majit_gc::GcAllocator>) {}
 
-    /// llmodel.py:64-69 self.vtable_offset — stub for the dynasm backend.
-    pub fn set_vtable_offset(&mut self, _offset: Option<usize>) {}
+    /// llmodel.py:64-69 self.vtable_offset configuration.
+    pub fn set_vtable_offset(&mut self, offset: Option<usize>) {
+        self.vtable_offset = offset;
+    }
 
     fn get_compiled(token: &JitCellToken) -> &CompiledCode {
         token
@@ -84,7 +95,7 @@ impl Backend for DynasmBackend {
         let header_pc = self.next_header_pc;
 
         let constants = std::mem::take(&mut self.constants);
-        let asm = Assembler386::new(trace_id, header_pc, constants);
+        let asm = Assembler386::new(trace_id, header_pc, constants, self.vtable_offset);
         let compiled = asm.assemble_loop(inputargs, ops)?;
 
         let code_addr = codebuf::buffer_ptr(&compiled.buffer) as usize;
@@ -109,7 +120,7 @@ impl Backend for DynasmBackend {
         self.next_trace_id += 1;
 
         let constants = std::mem::take(&mut self.constants);
-        let asm = Assembler386::new(trace_id, 0, constants);
+        let asm = Assembler386::new(trace_id, 0, constants, self.vtable_offset);
         let compiled = asm.assemble_bridge(fail_descr, inputargs, ops)?;
 
         let bridge_addr = codebuf::buffer_ptr(&compiled.buffer) as usize;

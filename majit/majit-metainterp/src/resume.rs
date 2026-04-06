@@ -5298,14 +5298,20 @@ pub struct ResumeDataDirectReader<'a> {
 /// ResumeDataDirectReader calls these methods when TAGVIRTUAL values
 /// need to be lazily allocated during decode_ref/decode_int.
 pub trait BlackholeAllocator {
-    /// resume.py:1437 allocate_with_vtable
-    fn allocate_with_vtable(&self, descr_index: u32) -> i64 {
-        let _ = descr_index;
+    /// resume.py:1437-1439 allocate_with_vtable →
+    ///   exec_new_with_vtable(self.cpu, descr) →
+    ///   llmodel.py:778 bh_new_with_vtable(sizedescr)
+    /// `descr_index` identifies the type, `descr_size` is the live
+    /// `sizedescr.size()` (RPython passes the full descr; pyre carries
+    /// only what blackhole resume needs).
+    fn allocate_with_vtable(&self, descr_index: u32, descr_size: usize) -> i64 {
+        let _ = (descr_index, descr_size);
         0
     }
-    /// resume.py:1441 allocate_struct
-    fn allocate_struct(&self, descr_index: u32) -> i64 {
-        let _ = descr_index;
+    /// resume.py:1441-1442 allocate_struct → cpu.bh_new(typedescr) →
+    /// llmodel.py:775 bh_new(sizedescr).
+    fn allocate_struct(&self, descr_index: u32, descr_size: usize) -> i64 {
+        let _ = (descr_index, descr_size);
         0
     }
     /// resume.py:1444 allocate_array
@@ -5395,9 +5401,13 @@ impl VirtualInfo {
     ) -> i64 {
         match self {
             VirtualInfo::VirtualObj {
-                type_id, fields, ..
+                type_id,
+                fields,
+                descr_size,
+                ..
             } => {
-                let obj = allocator.allocate_with_vtable(*type_id);
+                // resume.py:619 allocate_with_vtable(descr=self.descr)
+                let obj = allocator.allocate_with_vtable(*type_id, *descr_size);
                 decoder.virtuals_cache_ptr[index] = obj;
                 for (field_descr, source) in fields {
                     let value = decoder.decode_field_source(source);
@@ -5406,11 +5416,13 @@ impl VirtualInfo {
                 obj
             }
             VirtualInfo::VStruct {
-                type_id, fields, ..
+                type_id,
+                fields,
+                descr_size,
+                ..
             } => {
-                // resume.py:632 allocate_struct(descr)
-                // Use type_id for pyre's GC allocation dispatch.
-                let obj = allocator.allocate_struct(*type_id);
+                // resume.py:635 allocate_struct(self.typedescr)
+                let obj = allocator.allocate_struct(*type_id, *descr_size);
                 decoder.virtuals_cache_ptr[index] = obj;
                 for (field_descr, source) in fields {
                     let value = decoder.decode_field_source(source);

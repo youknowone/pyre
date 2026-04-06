@@ -3660,41 +3660,25 @@ fn sync_jit_state_to_frame(
 pub(crate) struct PyreBlackholeAllocator;
 
 impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
-    fn allocate_struct(&self, descr_index: u32) -> i64 {
+    fn allocate_struct(&self, descr_index: u32, descr_size: usize) -> i64 {
         // resume.py:1441-1442 allocate_struct → cpu.bh_new(typedescr)
-        // RPython's bh_new allocates a struct WITHOUT writing vtable
-        // (llmodel.py:775-776). The caller must initialize all fields
-        // including the type pointer via setfield_typed if needed.
-        use pyre_jit_trace::descr::{W_FLOAT_GC_TYPE_ID, W_INT_GC_TYPE_ID};
-        match descr_index {
-            W_INT_GC_TYPE_ID => {
-                // Allocate without setting ob_type — bh_new is the struct
-                // path. NULL ob_type makes downstream misuse visible.
-                let obj = Box::new(pyre_object::intobject::W_IntObject {
-                    ob_header: pyre_object::pyobject::PyObject {
-                        ob_type: std::ptr::null(),
-                    },
-                    intval: 0,
-                });
-                Box::into_raw(obj) as i64
-            }
-            W_FLOAT_GC_TYPE_ID => {
-                let obj = Box::new(pyre_object::floatobject::W_FloatObject {
-                    ob_header: pyre_object::pyobject::PyObject {
-                        ob_type: std::ptr::null(),
-                    },
-                    floatval: 0.0,
-                });
-                Box::into_raw(obj) as i64
-            }
-            _ => panic!("allocate_struct: unsupported gc type_id {}", descr_index),
-        }
+        // llmodel.py:775-776 bh_new(sizedescr): plain malloc, no vtable.
+        let descr = majit_ir::descr::make_size_descr_full(0, descr_size, descr_index);
+        let sd = descr
+            .as_size_descr()
+            .expect("synthesized SizeDescr must implement SizeDescr");
+        let (driver, _) = driver_pair();
+        driver.meta_interp().backend().bh_new(sd)
     }
 
-    fn allocate_with_vtable(&self, descr_index: u32) -> i64 {
+    fn allocate_with_vtable(&self, descr_index: u32, descr_size: usize) -> i64 {
         // resume.py:1437-1439 allocate_with_vtable →
         //   exec_new_with_vtable(self.cpu, descr)
         // llmodel.py:778-782 bh_new_with_vtable: allocate AND set vtable.
+        // pyre's W_IntObject/W_FloatObject objects use Rust struct layout
+        // and embed the type pointer directly via Box::leak. For other GC
+        // types we delegate to the backend's bh_new_with_vtable, mirroring
+        // RPython's cpu.bh_new_with_vtable contract.
         use pyre_jit_trace::descr::{W_FLOAT_GC_TYPE_ID, W_INT_GC_TYPE_ID};
         match descr_index {
             W_INT_GC_TYPE_ID => {
@@ -3715,10 +3699,14 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
                 });
                 Box::into_raw(obj) as i64
             }
-            _ => panic!(
-                "allocate_with_vtable: unsupported gc type_id {}",
-                descr_index
-            ),
+            _ => {
+                let descr = majit_ir::descr::make_size_descr_full(0, descr_size, descr_index);
+                let sd = descr
+                    .as_size_descr()
+                    .expect("synthesized SizeDescr must implement SizeDescr");
+                let (driver, _) = driver_pair();
+                driver.meta_interp().backend().bh_new_with_vtable(sd)
+            }
         }
     }
 
