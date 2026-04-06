@@ -515,7 +515,15 @@ impl ShortBoxes {
         for (idx, &arg) in label_args.iter().enumerate() {
             boxes.label_arg_positions.insert(arg, idx);
             boxes.short_inputargs.push(arg);
-            boxes.next_synthetic_pos = boxes.next_synthetic_pos.max(arg.0.saturating_add(1));
+            // Skip OpRef::NONE sentinels: they are placeholders for slots with
+            // no value (e.g. virtual fields the runtime PtrInfo did not yet
+            // populate at JUMP time). Including u32::MAX would saturate
+            // next_synthetic_pos and overflow on the first invented_name alloc.
+            // RPython Box identity sidesteps this — make_inputargs there returns
+            // only real Boxes.
+            if !arg.is_none() {
+                boxes.next_synthetic_pos = boxes.next_synthetic_pos.max(arg.0.saturating_add(1));
+            }
         }
         boxes
     }
