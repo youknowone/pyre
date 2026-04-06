@@ -8,45 +8,6 @@
 /// Reds:   [inputarg, stack]
 /// Virtualizables: [stack]  — tl.py:14, tl.py:71
 use majit_metainterp::jit::promote;
-use majit_metainterp::record_known_result;
-
-// ── @elidable comparison helpers (tl.py:135-157) ──
-// Pure functions whose results depend only on args — JIT constant-folds them.
-
-#[majit_macros::elidable]
-fn tl_eq(a: i64, b: i64) -> i64 {
-    if b == a { 1 } else { 0 }
-}
-#[majit_macros::elidable]
-fn tl_ne(a: i64, b: i64) -> i64 {
-    if b != a { 1 } else { 0 }
-}
-#[majit_macros::elidable]
-fn tl_lt(a: i64, b: i64) -> i64 {
-    if b < a { 1 } else { 0 }
-}
-#[majit_macros::elidable]
-fn tl_le(a: i64, b: i64) -> i64 {
-    if b <= a { 1 } else { 0 }
-}
-#[majit_macros::elidable]
-fn tl_gt(a: i64, b: i64) -> i64 {
-    if b > a { 1 } else { 0 }
-}
-#[majit_macros::elidable]
-fn tl_ge(a: i64, b: i64) -> i64 {
-    if b >= a { 1 } else { 0 }
-}
-
-// ── @not_in_trace debug helper ──
-// rlib/jit.py:260 — disappears from the final assembler.
-
-#[majit_macros::not_in_trace]
-fn trace_return(result: i64) {
-    if cfg!(debug_assertions) {
-        eprintln!("[tl] return {result}");
-    }
-}
 
 /// Stack rotation — @dont_look_inside in RPython (tl.py:43).
 ///
@@ -346,48 +307,42 @@ pub fn mainloop(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 {
             MUL => state.pool.get_mut(state.selected).mul(),
             // tl.py:131-133
             DIV => state.pool.get_mut(state.selected).div(),
-            // tl.py:135-157 — comparisons via @elidable helpers + record_known_result
+            // tl.py:135-157 — inline comparisons (no helper functions)
             EQ => {
-                let a = state.pool.get_mut(state.selected).pop();
-                let b = state.pool.get_mut(state.selected).pop();
-                let result = tl_eq(a, b);
-                record_known_result!(result, tl_eq, a, b);
-                state.pool.get_mut(state.selected).push(result);
+                let stk = state.pool.get_mut(state.selected);
+                let a = stk.pop();
+                let b = stk.pop();
+                stk.push(if b == a { 1 } else { 0 });
             }
             NE => {
-                let a = state.pool.get_mut(state.selected).pop();
-                let b = state.pool.get_mut(state.selected).pop();
-                let result = tl_ne(a, b);
-                record_known_result!(result, tl_ne, a, b);
-                state.pool.get_mut(state.selected).push(result);
+                let stk = state.pool.get_mut(state.selected);
+                let a = stk.pop();
+                let b = stk.pop();
+                stk.push(if b != a { 1 } else { 0 });
             }
             LT => {
-                let a = state.pool.get_mut(state.selected).pop();
-                let b = state.pool.get_mut(state.selected).pop();
-                let result = tl_lt(a, b);
-                record_known_result!(result, tl_lt, a, b);
-                state.pool.get_mut(state.selected).push(result);
+                let stk = state.pool.get_mut(state.selected);
+                let a = stk.pop();
+                let b = stk.pop();
+                stk.push(if b < a { 1 } else { 0 });
             }
             LE => {
-                let a = state.pool.get_mut(state.selected).pop();
-                let b = state.pool.get_mut(state.selected).pop();
-                let result = tl_le(a, b);
-                record_known_result!(result, tl_le, a, b);
-                state.pool.get_mut(state.selected).push(result);
+                let stk = state.pool.get_mut(state.selected);
+                let a = stk.pop();
+                let b = stk.pop();
+                stk.push(if b <= a { 1 } else { 0 });
             }
             GT => {
-                let a = state.pool.get_mut(state.selected).pop();
-                let b = state.pool.get_mut(state.selected).pop();
-                let result = tl_gt(a, b);
-                record_known_result!(result, tl_gt, a, b);
-                state.pool.get_mut(state.selected).push(result);
+                let stk = state.pool.get_mut(state.selected);
+                let a = stk.pop();
+                let b = stk.pop();
+                stk.push(if b > a { 1 } else { 0 });
             }
             GE => {
-                let a = state.pool.get_mut(state.selected).pop();
-                let b = state.pool.get_mut(state.selected).pop();
-                let result = tl_ge(a, b);
-                record_known_result!(result, tl_ge, a, b);
-                state.pool.get_mut(state.selected).push(result);
+                let stk = state.pool.get_mut(state.selected);
+                let a = stk.pop();
+                let b = stk.pop();
+                stk.push(if b >= a { 1 } else { 0 });
             }
             // tl.py:159-165
             BR_COND => {
@@ -451,9 +406,7 @@ impl JitTlInterp {
     }
 
     pub fn run(&mut self, bytecode: &[u8], inputarg: i64) -> i64 {
-        let result = mainloop(bytecode, inputarg, self.threshold);
-        trace_return(result);
-        result
+        mainloop(bytecode, inputarg, self.threshold)
     }
 }
 

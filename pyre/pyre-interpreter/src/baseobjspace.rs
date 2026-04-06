@@ -652,9 +652,7 @@ unsafe fn try_instance_binop(a: PyObjectRef, b: PyObjectRef, dunder: &str) -> Op
     None
 }
 
-/// typeobject.py:1355 `_pure_issubtype` — check subtype using cached MRO.
-/// Pure once MRO is frozen.
-#[majit_macros::elidable]
+/// Check if w_type is a subtype of cls using cached MRO.
 unsafe fn issubtype_cached(w_type: PyObjectRef, cls: PyObjectRef) -> bool {
     let mro_ptr = w_type_get_mro(w_type);
     if !mro_ptr.is_null() {
@@ -2564,9 +2562,10 @@ pub unsafe fn lookup_in_type(w_type: PyObjectRef, name: &str) -> Option<PyObject
     lookup_in_type_where(w_type, name)
 }
 
-/// typeobject.py:472 `_pure_lookup_where_with_method_cache` — linear search
-/// through `self.mro_w`. Pure once MRO is frozen, so elidable.
-#[majit_macros::elidable]
+/// typeobject.py `_lookup_where(self, key)` — linear search through `self.mro_w`.
+/// NOTE: PyPy's elidable wrapper (_pure_lookup_where_with_method_cache) takes
+/// a version_tag argument to invalidate on type mutation. Until pyre has
+/// version tags, this raw lookup must NOT be marked elidable.
 unsafe fn lookup_in_type_where(w_type: PyObjectRef, name: &str) -> Option<PyObjectRef> {
     if w_type.is_null() || !is_type(w_type) {
         return None;

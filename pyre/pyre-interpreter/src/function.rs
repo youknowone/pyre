@@ -119,7 +119,8 @@ pub unsafe fn getcode(obj: PyObjectRef) -> *const () {
 ///
 /// # Safety
 /// `obj` must point to a valid `Function`.
-#[majit_macros::elidable]
+/// NOTE: NOT elidable — code field can change (can_change_code).
+/// Use _get_immutable_code() for the elidable path.
 #[inline]
 pub unsafe fn function_get_code(obj: PyObjectRef) -> *const () {
     unsafe { (*(obj as *const Function)).code }
