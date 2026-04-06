@@ -5357,17 +5357,42 @@ impl<M: Clone> MetaInterp<M> {
         // classes that were known at the guard point are restored —
         // runtime class inspection is NOT used here.
         let loop_num_inputs = compiled.num_inputs;
-        let (optimized_ops, retrace_requested) = optimizer.optimize_bridge(
-            bridge_ops,
-            &mut constants,
-            bridge_inputargs.len(),
-            &mut compiled.front_target_tokens,
-            inline_short_preamble,
-            retraced_count,
-            retrace_limit,
-            bridge_knowledge.as_ref(),
-            Some(loop_num_inputs),
-        );
+        // compile.py:1077-1078 parity: optimize_bridge may raise InvalidLoop
+        // (e.g. rewrite.py:404-407 GUARD_CLASS proven to always fail).
+        // RPython catches it via the abstract jitexc handler and discards
+        // the bridge. Mirror that here so the trace abort doesn't unwind
+        // past compile_bridge.
+        let bridge_optimize_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            optimizer.optimize_bridge(
+                bridge_ops,
+                &mut constants,
+                bridge_inputargs.len(),
+                &mut compiled.front_target_tokens,
+                inline_short_preamble,
+                retraced_count,
+                retrace_limit,
+                bridge_knowledge.as_ref(),
+                Some(loop_num_inputs),
+            )
+        }));
+        let (optimized_ops, retrace_requested) = match bridge_optimize_result {
+            Ok(result) => result,
+            Err(payload) => {
+                if payload
+                    .downcast_ref::<crate::optimize::InvalidLoop>()
+                    .is_some()
+                {
+                    if crate::majit_log_enabled() {
+                        eprintln!(
+                            "[jit] compile_bridge: InvalidLoop at key={} fail_index={}",
+                            green_key, fail_index
+                        );
+                    }
+                    return false;
+                }
+                std::panic::resume_unwind(payload);
+            }
+        };
         // RPython parity: merge short preamble constants into bridge pool.
         // inline_short_preamble registered them in optimizer.bridge_preamble_constants.
         for (&idx, &(val, tp)) in &optimizer.bridge_preamble_constants {
