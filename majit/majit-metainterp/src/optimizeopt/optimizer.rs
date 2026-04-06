@@ -1500,7 +1500,7 @@ impl Optimizer {
         for (&idx, &val) in constants.iter() {
             ctx.seed_constant(
                 OpRef(idx),
-                value_from_backend_constant_bits(OpRef(idx), val, ops),
+                value_from_backend_constant_bits_typed(OpRef(idx), val, ops, &self.constant_types),
             );
         }
 
