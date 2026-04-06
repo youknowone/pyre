@@ -43,6 +43,14 @@ fn mem64(offset: u64) -> MemArg {
     }
 }
 
+/// llsupport/gc.py:563 GcLLDescr_framework
+///   .get_typeid_from_classptr_if_gcremovetypeptr(classptr)
+/// Default `None` — the wasm backend has no gc_ll_descr installed yet.
+/// pyre always sets `vtable_offset`, so this lookup is unreached at runtime.
+fn lookup_typeid_from_classptr(_classptr: usize) -> Option<u32> {
+    None
+}
+
 /// Information about a guard exit collected during pre-scan.
 pub struct GuardExit {
     pub fail_index: u32,
@@ -258,15 +266,41 @@ fn build_function(
                 // x86/assembler.py:1880-1891 _cmp_guard_class:
                 //   offset = self.cpu.vtable_offset
                 //   if offset is not None: CMP(mem(loc_ptr, offset), classptr)
-                //   else: _cmp_guard_gc_type(loc_ptr, expected_typeid)
-                let off = vtable_offset.expect(
-                    "GuardClass requires vtable_offset; gcremovetypeptr \
-                     (cmp_guard_gc_type) not yet implemented for wasm",
-                ) as u64;
-                emit_resolve(&mut sink, constants, op.arg(0)); // obj ptr
-                sink.i64_load(mem64(off)); // load typeptr at vtable_offset
-                emit_resolve(&mut sink, constants, op.arg(1)); // expected class
-                sink.i64_ne();
+                //   else:
+                //       assert isinstance(loc_classptr, ImmedLoc)
+                //       expected_typeid = gc_ll_descr.
+                //           get_typeid_from_classptr_if_gcremovetypeptr(...)
+                //       _cmp_guard_gc_type(loc_ptr, ImmedLoc(expected_typeid))
+                if let Some(off_usize) = vtable_offset {
+                    let off = off_usize as u64;
+                    emit_resolve(&mut sink, constants, op.arg(0));
+                    sink.i64_load(mem64(off));
+                    emit_resolve(&mut sink, constants, op.arg(1));
+                    sink.i64_ne();
+                } else {
+                    // gcremovetypeptr fallback (assembler.py:1893-1901):
+                    //   on x86_64 the typeid is a 32-bit value at offset 0.
+                    let classptr = constants.get(&op.arg(1).0).copied().expect(
+                        "_cmp_guard_class: gcremovetypeptr requires \
+                         loc_classptr to be an immediate (assert \
+                         isinstance(loc_classptr, ImmedLoc) in \
+                         x86/assembler.py:1887)",
+                    );
+                    let expected_typeid = lookup_typeid_from_classptr(classptr as usize).expect(
+                        "GuardClass: vtable_offset is None but the wasm \
+                             backend has no gc_ll_descr.\
+                             get_typeid_from_classptr_if_gcremovetypeptr",
+                    );
+                    emit_resolve(&mut sink, constants, op.arg(0));
+                    sink.i32_wrap_i64();
+                    sink.i32_load(MemArg {
+                        offset: 0,
+                        align: 2,
+                        memory_index: 0,
+                    });
+                    sink.i32_const(expected_typeid as i32);
+                    sink.i32_ne();
+                }
                 emit_guard_if_exit(&mut sink, constants, guard_idx, op, has_loop);
                 guard_idx += 1;
             }
@@ -704,16 +738,39 @@ fn build_function(
                 // x86/assembler.py:1880-1891 _cmp_guard_class equivalent
                 // (these all consult the type pointer or its derivatives).
                 if !op.args.is_empty() {
-                    emit_resolve(&mut sink, constants, op.arg(0));
                     if op.args.len() > 1 {
-                        let off = vtable_offset.expect(
-                            "Guard{GcType,IsObject,Subclass,Compatible} requires \
-                             vtable_offset; gcremovetypeptr not yet implemented for wasm",
-                        ) as u64;
-                        sink.i64_load(mem64(off));
-                        emit_resolve(&mut sink, constants, op.arg(1));
-                        sink.i64_ne();
+                        if let Some(off_usize) = vtable_offset {
+                            emit_resolve(&mut sink, constants, op.arg(0));
+                            let off = off_usize as u64;
+                            sink.i64_load(mem64(off));
+                            emit_resolve(&mut sink, constants, op.arg(1));
+                            sink.i64_ne();
+                        } else {
+                            // gcremovetypeptr fallback (assembler.py:1886-1901)
+                            let classptr = constants.get(&op.arg(1).0).copied().expect(
+                                "Guard{GcType,IsObject,Subclass,Compatible}: \
+                                     gcremovetypeptr requires loc_classptr to \
+                                     be an immediate",
+                            );
+                            let expected_typeid = lookup_typeid_from_classptr(classptr as usize)
+                                .expect(
+                                    "Guard{GcType,...}: vtable_offset is \
+                                         None but the wasm backend has no \
+                                         gc_ll_descr.get_typeid_from_classptr_\
+                                         if_gcremovetypeptr",
+                                );
+                            emit_resolve(&mut sink, constants, op.arg(0));
+                            sink.i32_wrap_i64();
+                            sink.i32_load(MemArg {
+                                offset: 0,
+                                align: 2,
+                                memory_index: 0,
+                            });
+                            sink.i32_const(expected_typeid as i32);
+                            sink.i32_ne();
+                        }
                     } else {
+                        emit_resolve(&mut sink, constants, op.arg(0));
                         sink.i64_eqz(); // just null check
                     }
                     emit_guard_if_exit(&mut sink, constants, guard_idx, op, has_loop);
