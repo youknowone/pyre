@@ -47,6 +47,9 @@ impl WasmBackend {
     /// Set GC allocator (CraneliftBackend parity — no-op for wasm).
     pub fn set_gc_allocator(&mut self, _gc: Box<dyn majit_gc::GcAllocator>) {}
 
+    /// llmodel.py:64-69 self.vtable_offset — stub for the wasm backend.
+    pub fn set_vtable_offset(&mut self, _offset: Option<usize>) {}
+
     /// Collect constants from ops (constant OpRefs that appear as args).
     fn collect_constants_from_ops(&mut self, ops: &[Op]) {
         for op in ops {
