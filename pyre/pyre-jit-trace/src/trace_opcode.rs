@@ -14,7 +14,7 @@ use pyre_interpreter::bytecode::{BinaryOperator, CodeObject, ComparisonOperator,
 /// lloperation.py:261 — "don't implement float_pow, use math.pow instead".
 /// ll_math_pow is a can-raise helper (EF_CAN_RAISE); NOT elidable.
 /// Extracted to module level for stable function pointer identity.
-extern "C" fn float_pow_elidable(x: f64, y: f64) -> f64 {
+extern "C" fn float_pow_helper(x: f64, y: f64) -> f64 {
     x.powf(y)
 }
 use pyre_interpreter::truth_value as objspace_truth_value;
@@ -2106,7 +2106,7 @@ impl MIFrame {
                 // ll_math.py:260: ll_math_pow has EF_CAN_RAISE → call_may_force, not elidable.
                 // Raw f64 powf — operates on unboxed floats, avoids Python object boxing.
                 ctx.call_may_force_float_typed(
-                    float_pow_elidable as *const (),
+                    float_pow_helper as *const (),
                     &[lhs_raw, rhs_raw],
                     &[Type::Float, Type::Float],
                 )
