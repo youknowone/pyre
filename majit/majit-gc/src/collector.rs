@@ -1381,6 +1381,14 @@ impl GcAllocator for MiniMarkGC {
     fn type_count(&self) -> usize {
         self.types.len()
     }
+
+    fn type_size(&self, type_id: u32) -> Option<usize> {
+        if (type_id as usize) < self.types.len() {
+            Some(self.types.get(type_id).size)
+        } else {
+            None
+        }
+    }
 }
 
 #[cfg(test)]

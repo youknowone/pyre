@@ -3782,6 +3782,57 @@ fn emit_indirect_call_from_parts(
 ///   2. POP [ebp + jf_descr]     — store fail_descr index to jf_descr
 ///   3. _call_footer              — mov eax, ebp; ret (return jitframe)
 ///
+/// x86/assembler.py:1880-1891 _cmp_guard_class:
+///   loc_ptr = locs[0]
+///   loc_classptr = locs[1]
+///   offset = self.cpu.vtable_offset
+///   if offset is not None:
+///       self.mc.CMP(mem(loc_ptr, offset), loc_classptr)
+///   else:
+///       assert isinstance(loc_classptr, ImmedLoc)
+///       classptr = loc_classptr.value
+///       expected_typeid = (self.cpu.gc_ll_descr
+///               .get_typeid_from_classptr_if_gcremovetypeptr(classptr))
+///       self._cmp_guard_gc_type(loc_ptr, ImmedLoc(expected_typeid))
+///
+/// Returns a 1-bit boolean: 1 = guard fails (not-equal), 0 = guard passes.
+fn emit_cmp_guard_class(
+    builder: &mut FunctionBuilder,
+    ptr_type: cranelift_codegen::ir::Type,
+    obj: CValue,
+    expected_class: CValue,
+    vtable_offset: Option<usize>,
+) -> CValue {
+    if let Some(off) = vtable_offset {
+        // x86/assembler.py:1884-1885 vtable_offset path: full classptr CMP.
+        let actual_class = builder
+            .ins()
+            .load(ptr_type, MemFlags::trusted(), obj, off as i32);
+        builder
+            .ins()
+            .icmp(IntCC::NotEqual, actual_class, expected_class)
+    } else {
+        // x86/assembler.py:1886-1891 gcremovetypeptr fallback:
+        //   classptr → expected_typeid via gc_ll_descr →
+        //   _cmp_guard_gc_type compares 16/32-bit typeid at offset 0.
+        // pyre never reaches this branch (vtable_offset is always Some).
+        // The structural code below mirrors _cmp_guard_gc_type so a future
+        // backend with gcremovetypeptr can replace the helper without
+        // touching the codegen call sites.
+        let actual_typeid = builder
+            .ins()
+            .load(cl_types::I32, MemFlags::trusted(), obj, 0);
+        // RPython looks up expected_typeid via cpu.gc_ll_descr; pyre has
+        // no equivalent yet, so we treat the low 32 bits of expected_class
+        // as the typeid placeholder. This keeps the structural shape but
+        // is intentionally not wired to a real type-id table.
+        let expected_typeid = builder.ins().ireduce(cl_types::I32, expected_class);
+        builder
+            .ins()
+            .icmp(IntCC::NotEqual, actual_typeid, expected_typeid)
+    }
+}
+
 /// genop_finish (assembler.py:2114-2155) parity:
 ///   1. save result to jf_frame[0]
 ///   2. MOV [ebp + jf_descr], faildescrindex
@@ -5568,17 +5619,13 @@ impl CraneliftBackend {
                         builder.set_cold_block(cont_block);
                     }
 
-                    let vtable_off_i32 = vtable_offset.expect(
-                        "GuardClass requires vtable_offset; gcremovetypeptr \
-                             (cmp_guard_gc_type) not yet implemented",
-                    ) as i32;
-                    let actual_class =
-                        builder
-                            .ins()
-                            .load(ptr_type, MemFlags::trusted(), obj, vtable_off_i32);
-                    let neq = builder
-                        .ins()
-                        .icmp(IntCC::NotEqual, actual_class, expected_class);
+                    let neq = emit_cmp_guard_class(
+                        &mut builder,
+                        ptr_type,
+                        obj,
+                        expected_class,
+                        vtable_offset,
+                    );
                     builder.ins().brif(neq, exit_block, &[], cont_block, &[]);
 
                     builder.switch_to_block(exit_block);
@@ -5611,17 +5658,13 @@ impl CraneliftBackend {
                     builder.switch_to_block(class_check_block);
                     builder.seal_block(class_check_block);
                     // x86/assembler.py:1880-1891 _cmp_guard_class via vtable_offset.
-                    let vtable_off_i32 = vtable_offset.expect(
-                        "GuardNonnullClass requires vtable_offset; \
-                             gcremovetypeptr not yet implemented",
-                    ) as i32;
-                    let actual_class =
-                        builder
-                            .ins()
-                            .load(ptr_type, MemFlags::trusted(), obj, vtable_off_i32);
-                    let neq = builder
-                        .ins()
-                        .icmp(IntCC::NotEqual, actual_class, expected_class);
+                    let neq = emit_cmp_guard_class(
+                        &mut builder,
+                        ptr_type,
+                        obj,
+                        expected_class,
+                        vtable_offset,
+                    );
                     builder.ins().brif(neq, exit_block, &[], cont_block, &[]);
 
                     builder.switch_to_block(exit_block);

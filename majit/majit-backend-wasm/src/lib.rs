@@ -21,6 +21,8 @@ pub struct WasmBackend {
     trace_counter: u64,
     /// Optimizer constant pool (OpRef >= CONST_BASE → i64 value).
     constants: HashMap<u32, i64>,
+    /// llmodel.py:64-69 self.vtable_offset.
+    vtable_offset: Option<usize>,
 }
 
 impl WasmBackend {
@@ -28,7 +30,13 @@ impl WasmBackend {
         WasmBackend {
             trace_counter: 0,
             constants: HashMap::new(),
+            vtable_offset: None,
         }
+    }
+
+    /// Active vtable_offset for wasm codegen.
+    pub fn vtable_offset(&self) -> Option<usize> {
+        self.vtable_offset
     }
 
     /// Set the constant pool (CraneliftBackend parity).
@@ -47,8 +55,10 @@ impl WasmBackend {
     /// Set GC allocator (CraneliftBackend parity — no-op for wasm).
     pub fn set_gc_allocator(&mut self, _gc: Box<dyn majit_gc::GcAllocator>) {}
 
-    /// llmodel.py:64-69 self.vtable_offset — stub for the wasm backend.
-    pub fn set_vtable_offset(&mut self, _offset: Option<usize>) {}
+    /// llmodel.py:64-69 self.vtable_offset configuration.
+    pub fn set_vtable_offset(&mut self, offset: Option<usize>) {
+        self.vtable_offset = offset;
+    }
 
     /// Collect constants from ops (constant OpRefs that appear as args).
     fn collect_constants_from_ops(&mut self, ops: &[Op]) {
@@ -83,7 +93,8 @@ impl majit_backend::Backend for WasmBackend {
         let trace_id = self.trace_counter;
         self.trace_counter += 1;
 
-        let (wasm_bytes, guard_exits) = codegen::build_wasm_module(inputargs, ops, &self.constants);
+        let (wasm_bytes, guard_exits) =
+            codegen::build_wasm_module(inputargs, ops, &self.constants, self.vtable_offset);
 
         // Build fail descriptors
         let fail_descrs: Vec<Arc<WasmFailDescr>> = guard_exits

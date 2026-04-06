@@ -196,6 +196,15 @@ pub trait GcAllocator: Send {
     fn type_count(&self) -> usize {
         0
     }
+
+    /// Look up the fixed-object size for a registered GC type.
+    ///
+    /// RPython parity: this matches `cpu.bh_new(typedescr)` reading
+    /// `typedescr.size` (llmodel.py / descr.py).  Default `None` keeps
+    /// stub allocators (e.g. wasm/dynasm) from claiming knowledge.
+    fn type_size(&self, _type_id: u32) -> Option<usize> {
+        None
+    }
 }
 
 /// GC rewriter — transforms IR operations for GC integration.

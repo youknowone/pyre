@@ -107,6 +107,9 @@ pub struct Assembler386 {
     guard_success_cc: Option<u8>,
     /// Dynamic label for the LABEL op (back-edge target for JUMP).
     loop_label: Option<DynamicLabel>,
+    /// llmodel.py:64-69 self.vtable_offset — typeptr field byte offset.
+    /// `None` corresponds to RPython's gcremovetypeptr config.
+    vtable_offset: Option<usize>,
 }
 
 /// assembler.py GuardToken — represents a pending guard needing
@@ -142,7 +145,12 @@ pub struct CompiledCode {
 
 impl Assembler386 {
     /// assembler.py:54 __init__
-    pub fn new(trace_id: u64, header_pc: u64, constants: HashMap<u32, i64>) -> Self {
+    pub fn new(
+        trace_id: u64,
+        header_pc: u64,
+        constants: HashMap<u32, i64>,
+        vtable_offset: Option<usize>,
+    ) -> Self {
         Assembler386 {
             mc: Assembler::new().unwrap(),
             pending_guard_tokens: Vec::new(),
@@ -156,6 +164,7 @@ impl Assembler386 {
             next_slot: 0,
             guard_success_cc: None,
             loop_label: None,
+            vtable_offset,
         }
     }
 
@@ -1114,6 +1123,42 @@ impl Assembler386 {
 
     /// Emit a conditional jump to a recovery stub for a guard op.
     /// The condition is inverted: we jump to the stub when the guard FAILS.
+    /// x86/assembler.py:1880-1891 _cmp_guard_class:
+    ///   loc_ptr = locs[0]; loc_classptr = locs[1]
+    ///   offset = self.cpu.vtable_offset
+    ///   if offset is not None:
+    ///       self.mc.CMP(mem(loc_ptr, offset), loc_classptr)
+    ///   else:
+    ///       expected_typeid = gc_ll_descr.get_typeid_from_classptr_if_gcremovetypeptr(...)
+    ///       self._cmp_guard_gc_type(loc_ptr, ImmedLoc(expected_typeid))
+    ///
+    /// Inputs are pre-loaded: rax = loc_ptr (object), rcx = loc_classptr.
+    /// Sets ZF=1 on equal, ZF=0 on not-equal — caller branches via Jcc.
+    fn emit_cmp_guard_class_rax_rcx(&mut self) {
+        let off_usize = self.vtable_offset.expect(
+            "GuardClass requires vtable_offset; gcremovetypeptr \
+             (cmp_guard_gc_type) not yet implemented for dynasm",
+        );
+        #[cfg(target_arch = "x86_64")]
+        {
+            let off_i32 = off_usize as i32;
+            dynasm!(self.mc
+                ; .arch x64
+                ; mov rax, [rax + off_i32]
+                ; cmp rax, rcx
+            );
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            let off_u32 = off_usize as u32;
+            dynasm!(self.mc
+                ; .arch aarch64
+                ; ldr x0, [x0, #off_u32]
+                ; cmp x0, x1
+            );
+        }
+    }
+
     fn emit_guard_jcc(&mut self, fail_cc: u8) -> DynamicLabel {
         let fail_label = self.mc.new_dynamic_label();
         #[cfg(target_arch = "x86_64")]
@@ -1244,7 +1289,7 @@ impl Assembler386 {
             }
             OpCode::GuardNonnullClass => {
                 // TEST arg0, arg0; JZ recovery
-                // Then CMP [arg0], arg1; JNE recovery
+                // Then _cmp_guard_class via vtable_offset; JNE recovery
                 self.load_arg_to_rax(op.arg(0));
                 #[cfg(target_arch = "x86_64")]
                 dynasm!(self.mc
@@ -1256,21 +1301,9 @@ impl Assembler386 {
                     ; cmp x0, 0
                 );
                 let fail_label = self.emit_guard_jcc(CC_E);
-                // Check class: load typeptr from [arg0], compare with expected.
                 self.load_arg_to_rax(op.arg(0));
                 self.load_arg_to_rcx(op.arg(1));
-                #[cfg(target_arch = "x86_64")]
-                dynasm!(self.mc
-                    ; .arch x64
-                    ; mov rax, [rax]
-                    ; cmp rax, rcx
-                );
-                #[cfg(target_arch = "aarch64")]
-                dynasm!(self.mc ; .arch aarch64
-                    ; ldr x0, [x0]
-                    ; cmp x0, x1
-                );
-                // Emit a second jump to the same label for the class check.
+                self.emit_cmp_guard_class_rax_rcx();
                 #[cfg(target_arch = "x86_64")]
                 dynasm!(self.mc ; .arch x64 ; jne =>fail_label);
                 #[cfg(target_arch = "aarch64")]
@@ -1278,20 +1311,14 @@ impl Assembler386 {
                 fail_label
             }
             OpCode::GuardClass => {
-                // Load typeptr from [arg0], CMP with expected class (arg1), JNE recovery
+                // x86/assembler.py:1880-1891 _cmp_guard_class:
+                //   offset = self.cpu.vtable_offset
+                //   if offset is not None:
+                //       CMP(mem(loc_ptr, offset), loc_classptr)
+                //   else: _cmp_guard_gc_type(...)
                 self.load_arg_to_rax(op.arg(0));
                 self.load_arg_to_rcx(op.arg(1));
-                #[cfg(target_arch = "x86_64")]
-                dynasm!(self.mc
-                    ; .arch x64
-                    ; mov rax, [rax] // load vtable/typeptr from object header
-                    ; cmp rax, rcx
-                );
-                #[cfg(target_arch = "aarch64")]
-                dynasm!(self.mc ; .arch aarch64
-                    ; ldr x0, [x0] // load vtable/typeptr from object header
-                    ; cmp x0, x1
-                );
+                self.emit_cmp_guard_class_rax_rcx();
                 self.emit_guard_jcc(CC_NE)
             }
             OpCode::GuardNoException

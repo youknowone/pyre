@@ -109,6 +109,7 @@ pub fn build_wasm_module(
     inputargs: &[InputArg],
     ops: &[Op],
     constants: &HashMap<u32, i64>,
+    vtable_offset: Option<usize>,
 ) -> (Vec<u8>, Vec<GuardExit>) {
     let (guards, num_vars) = collect_guards_and_vars(inputargs, ops);
     let needs_call = has_call_ops(ops);
@@ -158,7 +159,14 @@ pub fn build_wasm_module(
     // Code section
     let mut codes = CodeSection::new();
     let jit_call_idx = if needs_call { Some(0u32) } else { None };
-    let func = build_function(inputargs, ops, constants, num_vars, jit_call_idx);
+    let func = build_function(
+        inputargs,
+        ops,
+        constants,
+        num_vars,
+        jit_call_idx,
+        vtable_offset,
+    );
     codes.function(&func);
     module.section(&codes);
 
@@ -171,6 +179,7 @@ fn build_function(
     constants: &HashMap<u32, i64>,
     num_vars: u32,
     jit_call_idx: Option<u32>,
+    vtable_offset: Option<usize>,
 ) -> Function {
     let mut func = Function::new(vec![(num_vars, ValType::I64)]);
     let mut sink = func.instructions();
@@ -246,10 +255,16 @@ fn build_function(
                 guard_idx += 1;
             }
             OpCode::GuardClass | OpCode::GuardNonnullClass => {
-                // guard_class(obj, expected_class): fail if obj.class != expected_class
-                // For wasm MVP: read ob_type at offset 0, compare with expected
+                // x86/assembler.py:1880-1891 _cmp_guard_class:
+                //   offset = self.cpu.vtable_offset
+                //   if offset is not None: CMP(mem(loc_ptr, offset), classptr)
+                //   else: _cmp_guard_gc_type(loc_ptr, expected_typeid)
+                let off = vtable_offset.expect(
+                    "GuardClass requires vtable_offset; gcremovetypeptr \
+                     (cmp_guard_gc_type) not yet implemented for wasm",
+                ) as u64;
                 emit_resolve(&mut sink, constants, op.arg(0)); // obj ptr
-                sink.i64_load(mem64(0)); // load ob_type (first field)
+                sink.i64_load(mem64(off)); // load typeptr at vtable_offset
                 emit_resolve(&mut sink, constants, op.arg(1)); // expected class
                 sink.i64_ne();
                 emit_guard_if_exit(&mut sink, constants, guard_idx, op, has_loop);
@@ -686,12 +701,16 @@ fn build_function(
             | OpCode::GuardIsObject
             | OpCode::GuardSubclass
             | OpCode::GuardCompatible => {
-                // These need runtime type checks that mirror GuardClass.
-                // For MVP, treat like GuardClass: read ob_type, compare.
+                // x86/assembler.py:1880-1891 _cmp_guard_class equivalent
+                // (these all consult the type pointer or its derivatives).
                 if !op.args.is_empty() {
                     emit_resolve(&mut sink, constants, op.arg(0));
                     if op.args.len() > 1 {
-                        sink.i64_load(mem64(0)); // ob_type
+                        let off = vtable_offset.expect(
+                            "Guard{GcType,IsObject,Subclass,Compatible} requires \
+                             vtable_offset; gcremovetypeptr not yet implemented for wasm",
+                        ) as u64;
+                        sink.i64_load(mem64(off));
                         emit_resolve(&mut sink, constants, op.arg(1));
                         sink.i64_ne();
                     } else {
