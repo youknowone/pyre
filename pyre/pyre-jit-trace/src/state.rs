@@ -169,6 +169,11 @@ pub fn frame_value_count_at(jitcode_index: i32, pc: i32) -> usize {
             }
         }
         // Fallback: LiveVars from CodeObject (backward-compat).
+        // Mirror trace_opcode.rs:get_list_of_active_boxes LiveVars path:
+        // both iterate locals and stack values filtering by
+        // is_local_live / is_stack_live so the encoder box count and
+        // the decoder value count agree even for inlined-function
+        // frames whose majit_jitcode has not been built at trace time.
         if !jc.code.is_null() {
             let live = crate::liveness::liveness_for(jc.code);
             let code_ref = unsafe { &*jc.code };
@@ -177,7 +182,10 @@ pub fn frame_value_count_at(jitcode_index: i32, pc: i32) -> usize {
                 .filter(|&i| live.is_local_live(pc as usize, i))
                 .count();
             let stack_depth = live.stack_depth_at(pc as usize);
-            return live_locals + stack_depth;
+            let live_stack = (0..stack_depth)
+                .filter(|&i| live.is_stack_live(pc as usize, i))
+                .count();
+            return live_locals + live_stack;
         }
         0
     })
