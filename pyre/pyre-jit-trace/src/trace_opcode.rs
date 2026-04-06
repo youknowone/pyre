@@ -14,14 +14,20 @@ use pyre_interpreter::bytecode::{BinaryOperator, CodeObject, ComparisonOperator,
 ///
 /// `_pow` in floatobject.py:799-881 takes two raw floats and returns a
 /// raw float (can raise OverflowError / ValueError / ZeroDivisionError).
-/// The JIT trace records this as a `CallMayForceF(float_pow_jit, lhs, rhs)`
-/// with the same raw-float signature, followed by `GuardNoException` to
-/// propagate any raised exception back into the meta-interpreter.
+/// The JIT trace records this as `CALL_F(float_pow_jit, lhs, rhs)`
+/// (pyjitpl.py:2119-2121 CALL_F branch taken because
+/// `check_forces_virtual_or_virtualizable()` is False for ll_math_pow,
+/// and `exc=True` because EF_CAN_RAISE), followed by `GUARD_NO_EXCEPTION`
+/// via `handle_possible_exception` (pyjitpl.py:1950-1955, 3395).
 ///
 /// ll_math_pow (ll_math.py:260) is the can-raise helper (EF_CAN_RAISE),
-/// NOT elidable. Using Rust's native `x.powf(y)` would drop the Python
-/// exception semantics (negative base fractional exponent → ValueError,
-/// 0.0 raised to negative → ZeroDivisionError, overflow → OverflowError).
+/// NOT elidable and NOT force-virtual. Using Rust's native `x.powf(y)`
+/// would drop the Python exception semantics (negative base fractional
+/// exponent → ValueError, 0.0 raised to negative → ZeroDivisionError,
+/// overflow → OverflowError). Using CALL_MAY_FORCE_F would be wrong
+/// because the optimizer postpones that family until GUARD_NOT_FORCED
+/// arrives (heap.py CALL_MAY_FORCE branch), which is the virtualizable
+/// protocol — ll_math_pow does not touch virtualizables.
 ///
 /// Extracted to module level for stable function pointer identity.
 ///
@@ -2136,18 +2142,17 @@ impl MIFrame {
             };
             let result = if is_power {
                 // floatobject.py:561 descr_pow → _pow(space, x, y) parity.
-                // _pow takes raw floats and can raise OverflowError /
-                // ValueError / ZeroDivisionError. The trace records a
-                // CallMayForceF to float_pow_jit (which wraps the raw
-                // _pow implementation and signals exceptions via
-                // jit_exc_raise), followed by GuardNoException to
-                // propagate any raise into the meta-interpreter.
-                let call_result = ctx.call_may_force_float_typed(
+                // ll_math_pow (ll_math.py:260) is EF_CAN_RAISE, NOT
+                // force_virtual. pyjitpl.py:2084-2121 routes EF_CAN_RAISE
+                // calls to `execute_varargs(rop.CALL_F, ..., exc=True, pure=False)`
+                // which records CALL_F and then calls handle_possible_exception
+                // (pyjitpl.py:1950-1955, 3395) — that generates GUARD_NO_EXCEPTION.
+                let call_result = ctx.call_float_typed(
                     float_pow_jit as *const (),
                     &[lhs_raw, rhs_raw],
                     &[Type::Float, Type::Float],
                 );
-                // pyjitpl.py:3397 GUARD_NO_EXCEPTION after EF_CAN_RAISE call.
+                // pyjitpl.py:3395 GUARD_NO_EXCEPTION from handle_possible_exception.
                 this.record_guard(ctx, OpCode::GuardNoException, &[]);
                 call_result
             } else {
