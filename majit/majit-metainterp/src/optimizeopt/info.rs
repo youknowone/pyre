@@ -400,12 +400,32 @@ impl PtrInfo {
     }
 
     /// Get the known class, if any.
-    /// info.py: get_known_class_or_none()
+    /// info.py: get_known_class_or_none() / ConstPtrInfo.get_known_class(cpu)
     pub fn get_known_class(&self) -> Option<&GcRef> {
         match self {
             PtrInfo::KnownClass { class_ptr, .. } => Some(class_ptr),
             PtrInfo::Instance(v) => v.known_class.as_ref(),
             PtrInfo::Virtual(v) => v.known_class.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// RPython ConstPtrInfo.get_known_class(cpu): read vtable from
+    /// constant GC object pointer (cls_of_box). Returns the vtable
+    /// pointer at offset 0 of the GC object.
+    pub fn get_known_class_from_constant(&self) -> Option<GcRef> {
+        match self {
+            PtrInfo::Constant(gcref) => {
+                if gcref.is_null() {
+                    return None;
+                }
+                let vtable = unsafe { *(gcref.0 as *const usize) };
+                if vtable == 0 {
+                    None
+                } else {
+                    Some(GcRef(vtable))
+                }
+            }
             _ => None,
         }
     }
