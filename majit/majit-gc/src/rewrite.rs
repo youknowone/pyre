@@ -1289,17 +1289,26 @@ mod tests {
             vtable_descr(48, 3, 0xDEAD),
         )];
 
-        let result = rw.rewrite_for_gc(&ops);
+        let (result, constants) = rw.rewrite_for_gc_with_constants(&ops, &HashMap::new());
 
         // CallMallocNursery + GcStore(tid) + GcStore(vtable)
         assert_eq!(result.len(), 3);
         assert_eq!(result[0].opcode, OpCode::CallMallocNursery);
-        // tid init
+        // tid init: GcStore(obj, offset=0, imm=3). `3` is encoded as a
+        // literal immediate (see gen_initialize_tid).
         assert_eq!(result[1].opcode, OpCode::GcStore);
         assert_eq!(result[1].args[2].0, 3);
-        // vtable init
+        // vtable init: GcStore(obj, offset=1, const(0xDEAD)).
+        // `gen_initialize_vtable` uses `const_int(vtable)`, which returns
+        // a constant-pool OpRef (>= 10_000). Verify the OpRef resolves to
+        // the correct vtable value through the constant pool.
         assert_eq!(result[2].opcode, OpCode::GcStore);
-        assert_eq!(result[2].args[2].0, 0xDEAD_u32 as u32);
+        let vtable_ref = result[2].args[2];
+        assert!(
+            vtable_ref.0 >= 10_000,
+            "vtable must be a constant-pool OpRef"
+        );
+        assert_eq!(constants.get(&vtable_ref.0).copied(), Some(0xDEAD_i64));
     }
 
     // ── Test 11: SETARRAYITEM_GC with Ref triggers array WB ──

@@ -3486,25 +3486,16 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_minor_root_walk_skips_interior_nursery_pointers() {
-        let mut gc = test_gc(4096);
-        let tid = gc.register_type(TypeInfo::simple(16));
-
-        let obj = gc.alloc_with_type(tid, 16);
-        let mut exact_root = obj;
-        let mut interior_root = GcRef(obj.0 + 8);
-        unsafe {
-            gc.roots.add(&mut exact_root);
-            gc.roots.add(&mut interior_root);
-        }
-
-        gc.do_collect_nursery();
-
-        assert!(!exact_root.is_null());
-        assert!(gc.oldgen.contains(exact_root.0));
-        assert_eq!(interior_root.0, obj.0 + 8);
-
-        gc.roots.clear();
-    }
+    // Note: a `test_minor_root_walk_skips_interior_nursery_pointers`
+    // test used to live here. It was predicated on a majit-local
+    // extension where the nursery tracked exact object-start addresses
+    // and `is_nursery_object_start` filtered out interior pointers.
+    //
+    // incminimark.py:1208 is_in_nursery is a pure range check
+    //     return self.nursery <= addr < self.nursery + self.nursery_size
+    // RPython guarantees that GC roots are exact object pointers (the
+    // shadow stack only ever carries exact pointers produced by the
+    // compiler), so interior-pointer filtering is not part of the GC
+    // contract. The test disagreed with that contract and was removed
+    // to keep majit-gc structurally aligned with RPython.
 }
