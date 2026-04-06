@@ -132,16 +132,16 @@ impl TypeInfo {
     }
 
     /// Compute the total size of an instance (excluding GC header).
-    /// For varsize: base_size + length_field_size + item_size * length.
-    /// RPython: ofs_length + WORD + itemsize * length (lltypelayout.py).
+    /// RPython lltypelayout.py:93-100 sizeof(TYPE, i):
+    ///   fixedsize = get_fixed_size(TYPE)
+    ///   varsize = get_variable_size(TYPE)
+    ///   return fixedsize + i * varsize
+    ///
+    /// Both `get_fixed_size(lltype.Array)` and the `_size` field of a
+    /// `get_layout(Struct-with-array)` already account for the length
+    /// word, so no extra WORD is added here.
     pub fn total_instance_size(&self, length: usize) -> usize {
-        if self.item_size > 0 {
-            // base_size includes everything up to the length field.
-            // After the length field: items array.
-            self.size + std::mem::size_of::<usize>() + self.item_size * length
-        } else {
-            self.size
-        }
+        self.size + self.item_size * length
     }
 
     /// Iterate all GC pointer slot addresses for a given object.
