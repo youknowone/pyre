@@ -52,6 +52,8 @@ pub struct PyreFieldDescr {
     /// When read during tracing, emits QUASIIMMUT_FIELD + GUARD_NOT_INVALIDATED.
     /// If mutated at runtime, invalidates all compiled loops watching this field.
     quasi_immutable: bool,
+    /// RPython descr.py:227 — field name for heaptracker.py:66 filtering.
+    name: &'static str,
 }
 
 /// Concrete array descriptor for pointer-backed runtime arrays.
@@ -105,6 +107,9 @@ impl FieldDescr for PyreFieldDescr {
     fn is_field_signed(&self) -> bool {
         self.signed
     }
+    fn field_name(&self) -> &str {
+        self.name
+    }
 }
 
 impl ArrayDescr for PyreArrayDescr {
@@ -143,6 +148,7 @@ pub fn make_field_descr(
         signed,
         immutable: false,
         quasi_immutable: false,
+        name: "",
     })
 }
 
@@ -160,6 +166,7 @@ pub fn make_field_descr_full(
         signed: false,
         immutable,
         quasi_immutable: false,
+        name: "",
     })
 }
 
@@ -178,6 +185,7 @@ pub fn make_immutable_field_descr(
         signed,
         immutable: true,
         quasi_immutable: false,
+        name: "",
     })
 }
 
@@ -196,6 +204,7 @@ pub fn make_quasi_immutable_field_descr(
         signed,
         immutable: false,
         quasi_immutable: true,
+        name: "",
     })
 }
 
@@ -449,8 +458,17 @@ pub fn namespace_values_len_descr() -> DescrRef {
 // ── Object header & allocation descriptors ──────────────────────────
 
 /// Field descriptor for ob_type (PyObject.ob_type pointer) — immutable.
+/// heaptracker.py:66: `if name == 'typeptr': continue`
 pub fn ob_type_descr() -> DescrRef {
-    make_immutable_field_descr(OB_TYPE_OFFSET, 8, Type::Int, false)
+    Arc::new(PyreFieldDescr {
+        offset: OB_TYPE_OFFSET,
+        field_size: 8,
+        field_type: Type::Int,
+        signed: false,
+        immutable: true,
+        quasi_immutable: false,
+        name: "typeptr",
+    })
 }
 
 /// Size descriptor for W_IntObject allocation via NewWithVtable.

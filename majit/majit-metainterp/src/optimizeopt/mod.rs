@@ -296,27 +296,20 @@ pub struct OptContext {
 }
 
 /// heaptracker.py:66: `if name == 'typeptr': continue`
-/// Only offset 0 fields of structs WITH a vtable are typeptr.
-/// Structs without vtable may have legitimate offset-0 fields.
+/// Uses FieldDescr.is_typeptr() which checks `field_name() == "typeptr"`,
+/// matching RPython's name-based filtering.
 #[inline(always)]
 pub(crate) fn is_typeptr_field(
     field_idx: u32,
     field_descrs: &[(u32, majit_ir::DescrRef)],
-    descr: &majit_ir::DescrRef,
+    _descr: &majit_ir::DescrRef,
 ) -> bool {
-    // Only structs with a vtable have a typeptr field
-    let has_vtable = descr
-        .as_size_descr()
-        .map(|sd| sd.vtable() != 0)
-        .unwrap_or(false);
-    if !has_vtable {
-        return false;
-    }
     field_descrs
         .iter()
         .find(|(di, _)| *di == field_idx)
-        .and_then(|(_, d)| d.as_field_descr().map(|fd| fd.offset()))
-        == Some(0)
+        .and_then(|(_, d)| d.as_field_descr())
+        .map(|fd| fd.is_typeptr())
+        .unwrap_or(false)
 }
 
 /// resume.py:192-226 parity — BoxEnv for optimizer context.
