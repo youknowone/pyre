@@ -15,6 +15,7 @@ dynasm = ["jit", "majit-metainterp/dynasm"]
 pyre-object = { workspace = true }
 pyre-interpreter = { workspace = true }
 majit-ir = { workspace = true }
+majit-macros = { workspace = true }
 majit-metainterp = { workspace = true }
 majit-backend = { workspace = true }
 majit-trace = { workspace = true }
