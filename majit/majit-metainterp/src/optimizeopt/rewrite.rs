@@ -1474,9 +1474,12 @@ impl OptRewrite {
         let arg0 = op.arg(0);
         let arg1 = op.arg(1);
 
-        if let (Some(actual), Some(expected)) =
-            (ctx.get_constant_int(arg0), ctx.get_constant_int(arg1))
-        {
+        // rewrite.py:284-301 + executor.py:544-551 parity:
+        // GUARD_VALUE on a constant equal to the expected constant is
+        // redundant. Constants may be Int- or Ref-typed under typed
+        // seeding (raise_catch_loop, fib_recursive); compare via
+        // get_constant() which preserves Value semantics.
+        if let (Some(actual), Some(expected)) = (ctx.get_constant(arg0), ctx.get_constant(arg1)) {
             if actual == expected {
                 return OptimizationResult::Remove;
             }
