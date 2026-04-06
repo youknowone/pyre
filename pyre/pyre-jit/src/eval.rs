@@ -2481,8 +2481,12 @@ pub(crate) fn decode_and_restore_guard_failure(
         if rd_numb.is_empty() {
             decode_exit_layout_values(raw_values, exit_layout)
         } else {
-            let (t, _rd_numb_pc) =
+            let (t, rd_numb_pc) =
                 rebuild_typed_from_rd_numb(raw_values, rd_numb, rd_consts, exit_layout);
+            // blackhole.py:337 parity: setposition(jitcode, pc) before
+            // consume_one_section. rd_numb_pc = orgpc used by
+            // get_list_of_active_boxes during encoding.
+            jit_state.resume_pc = rd_numb_pc;
             t
         }
     };
@@ -2907,11 +2911,13 @@ fn build_resumed_frames(
     };
 
     // TODO: resume.py:1399 consume_vable_info writes ALL vable fields
-    // back to the virtualizable (= PyFrame in pyre) BEFORE the blackhole
-    // runs. This is not yet implemented — blocked by OpRef dedup aliasing
-    // between vable and frame sections (see KNOWN DEVIATION in
-    // resumedata.rs:225). Until resolved, blackhole resume may produce
-    // null locals when frame section has partial liveness.
+    // back to the virtualizable frame BEFORE the blackhole runs.
+    // Blocked: when GEN is enabled for LoadFastBorrowLoadFastBorrow,
+    // more locals are live and the blackhole succeeds, but dead locals
+    // get stale CONST values from trace recording time (not guard failure
+    // time). The blackhole then reads these stale values, producing wrong
+    // output. Fix: implement full consume_vable_info with runtime-resolved
+    // vable array values pre-filling blackhole registers.
 
     let mut result = Vec::with_capacity(frames.len());
     for (idx, (frame, values)) in frames.iter().zip(all_values.into_iter()).enumerate() {
@@ -3583,6 +3589,7 @@ pub(crate) fn build_jit_state(
 ) -> PyreJitState {
     let mut jit_state = PyreJitState {
         frame: frame as *const PyFrame as usize,
+        resume_pc: None,
     };
     assert!(
         jit_state.sync_from_virtualizable(virtualizable_info),
