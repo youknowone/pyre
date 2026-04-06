@@ -985,8 +985,9 @@ pub fn resume_in_blackhole(
             );
         }
         // resume.py:1017-1038 _prepare_next_section:
-        // _callback_r → write_a_ref. Override pre-filled values with
-        // liveness-filtered recovery data (current guard-failure values).
+        // _callback_r → write_a_ref. pyre: all Python locals are
+        // PyObjectRef → ref bank only (codewriter uses move_r).
+        // Override the pre-filled values with the liveness-filtered recovery data.
         if use_liveness {
             if let Some(info) = liveness_info {
                 for (val_idx, &reg_idx) in info.live_r_regs.iter().enumerate() {

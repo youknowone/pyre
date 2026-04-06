@@ -149,7 +149,8 @@ pub struct NumberingState {
     pub num_boxes: i32,
     pub num_virtuals: i32,
     /// RPython Box.type parity: type of each TAGBOX livebox, captured at
-    /// numbering time when env.get_type() is called.
+    /// numbering time when env.get_type() is called. Eliminates the need
+    /// for post-hoc type inference cascades in store_final_boxes_in_guard.
     pub livebox_types: std::collections::HashMap<u32, majit_ir::Type>,
 }
 
@@ -3067,6 +3068,9 @@ impl ResumeDataLoopMemo {
                 numb_state.num_virtuals += 1;
                 t
             } else {
+                // RPython Box.type parity: capture type alongside TAGBOX
+                // assignment. This is the equivalent of Box.type being
+                // intrinsic — the type is determined once at numbering time.
                 numb_state.livebox_types.insert(opref.0, box_type);
                 let t = tag(numb_state.num_boxes, TAGBOX)?;
                 numb_state.num_boxes += 1;
@@ -3164,6 +3168,8 @@ impl ResumeDataLoopMemo {
     ///   Heap field triples and known-class info for bridge compilation.
     ///
     /// Returns `(rd_numb, rd_consts, rd_virtuals, liveboxes, livebox_types)`.
+    /// `livebox_types` maps OpRef.0 �� Type, captured at numbering time
+    /// (RPython Box.type parity).
     pub fn finish(
         &mut self,
         mut numb_state: NumberingState,
