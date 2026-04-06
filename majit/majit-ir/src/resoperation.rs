@@ -337,9 +337,6 @@ pub struct Op {
     /// to replay on guard failure after virtual materialization.
     /// resume.py: rd_pendingfields
     pub rd_pendingfields: Option<Vec<GuardPendingFieldEntry>>,
-    /// Per-frame box counts for rd_numb multi-frame decode.
-    /// RPython uses jitcode liveness; majit passes sizes out-of-band.
-    pub rd_frame_sizes: Option<Vec<usize>>,
     /// resoperation.py: GuardResOp.rd_resume_position — index of the
     /// guard in the trace for resume data lookup. Set by unroll when
     /// creating extra guards from short preamble / virtual state.
@@ -434,7 +431,7 @@ impl Op {
             fail_arg_types: None,
 
             rd_pendingfields: None,
-            rd_frame_sizes: None,
+
             rd_resume_position: -1,
             rd_numb: None,
             rd_consts: None,
@@ -453,7 +450,7 @@ impl Op {
             fail_arg_types: None,
 
             rd_pendingfields: None,
-            rd_frame_sizes: None,
+
             rd_resume_position: -1,
             rd_numb: None,
             rd_consts: None,
@@ -3407,7 +3404,7 @@ mod tests {
                 fail_args: None,
 
                 fail_arg_types: None,
-                rd_pendingfields: None, rd_frame_sizes: None,
+                rd_pendingfields: None,
                 rd_resume_position: -1,
             },
             op! {
@@ -3418,7 +3415,7 @@ mod tests {
                 fail_args: None,
 
                 fail_arg_types: None,
-                rd_pendingfields: None, rd_frame_sizes: None,
+                rd_pendingfields: None,
                 rd_resume_position: -1,
             },
             op! {
@@ -3430,7 +3427,7 @@ mod tests {
 
 
                 fail_arg_types: None,
-                rd_pendingfields: None, rd_frame_sizes: None,
+                rd_pendingfields: None,
                 rd_resume_position: -1,
             },
         ];
@@ -3452,7 +3449,7 @@ mod tests {
             fail_args: None,
 
             fail_arg_types: None,
-            rd_pendingfields: None, rd_frame_sizes: None,
+            rd_pendingfields: None,
             rd_resume_position: -1,
         };
         let s = format!("{op}");
@@ -3469,7 +3466,7 @@ mod tests {
             fail_args: None,
 
             fail_arg_types: None,
-            rd_pendingfields: None, rd_frame_sizes: None,
+            rd_pendingfields: None,
             rd_resume_position: -1,
         };
         let s = format!("{op}");
@@ -3487,7 +3484,7 @@ mod tests {
 
 
             fail_arg_types: None,
-            rd_pendingfields: None, rd_frame_sizes: None,
+            rd_pendingfields: None,
             rd_resume_position: -1,
         };
         let s = format!("{op}");
@@ -3504,7 +3501,7 @@ mod tests {
             fail_args: None,
 
             fail_arg_types: None,
-            rd_pendingfields: None, rd_frame_sizes: None,
+            rd_pendingfields: None,
             rd_resume_position: -1,
         };
         let s = format!("{op}");
@@ -3521,7 +3518,7 @@ mod tests {
             fail_args: None,
 
             fail_arg_types: None,
-            rd_pendingfields: None, rd_frame_sizes: None,
+            rd_pendingfields: None,
             rd_resume_position: -1,
         }];
         let mut constants = std::collections::HashMap::new();
@@ -3542,7 +3539,7 @@ mod tests {
                 fail_args: None,
 
                 fail_arg_types: None,
-                rd_pendingfields: None, rd_frame_sizes: None,
+                rd_pendingfields: None,
                 rd_resume_position: -1,
             },
             op! {
@@ -3553,7 +3550,7 @@ mod tests {
                 fail_args: Some(smallvec::smallvec![OpRef(0), OpRef(1)]),
 
                 fail_arg_types: None,
-                rd_pendingfields: None, rd_frame_sizes: None,
+                rd_pendingfields: None,
                 rd_resume_position: -1,
             },
             op! {
@@ -3565,7 +3562,7 @@ mod tests {
 
 
                 fail_arg_types: None,
-                rd_pendingfields: None, rd_frame_sizes: None,
+                rd_pendingfields: None,
                 rd_resume_position: -1,
             },
         ];
@@ -3586,7 +3583,7 @@ mod tests {
 
 
             fail_arg_types: None,
-            rd_pendingfields: None, rd_frame_sizes: None,
+            rd_pendingfields: None,
             rd_resume_position: -1,
         }];
         let mut constants = std::collections::HashMap::new();
@@ -3618,7 +3615,7 @@ mod tests {
                 fail_args: None,
 
                 fail_arg_types: None,
-                rd_pendingfields: None, rd_frame_sizes: None,
+                rd_pendingfields: None,
                 rd_resume_position: -1,
             },
             op! {
@@ -3629,7 +3626,7 @@ mod tests {
                 fail_args: None,
 
                 fail_arg_types: None,
-                rd_pendingfields: None, rd_frame_sizes: None,
+                rd_pendingfields: None,
                 rd_resume_position: -1,
             },
             op! {
@@ -3640,7 +3637,7 @@ mod tests {
                 fail_args: None,
 
                 fail_arg_types: None,
-                rd_pendingfields: None, rd_frame_sizes: None,
+                rd_pendingfields: None,
                 rd_resume_position: -1,
             },
             op! {
@@ -3652,7 +3649,7 @@ mod tests {
 
 
                 fail_arg_types: None,
-                rd_pendingfields: None, rd_frame_sizes: None,
+                rd_pendingfields: None,
                 rd_resume_position: -1,
             },
         ];
@@ -3685,7 +3682,7 @@ mod tests {
                 fail_args: None,
 
                 fail_arg_types: None,
-                rd_pendingfields: None, rd_frame_sizes: None,
+                rd_pendingfields: None,
                 rd_resume_position: -1,
             },
             op! {
@@ -3696,7 +3693,7 @@ mod tests {
                 fail_args: None,
 
                 fail_arg_types: None,
-                rd_pendingfields: None, rd_frame_sizes: None,
+                rd_pendingfields: None,
                 rd_resume_position: -1,
             },
             op! {
@@ -3707,7 +3704,7 @@ mod tests {
                 fail_args: Some(smallvec::smallvec![OpRef(0), OpRef(1)]),
 
                 fail_arg_types: None,
-                rd_pendingfields: None, rd_frame_sizes: None,
+                rd_pendingfields: None,
                 rd_resume_position: -1,
             },
             op! {
@@ -3719,7 +3716,7 @@ mod tests {
 
 
                 fail_arg_types: None,
-                rd_pendingfields: None, rd_frame_sizes: None,
+                rd_pendingfields: None,
                 rd_resume_position: -1,
             },
         ];
@@ -3749,7 +3746,7 @@ mod tests {
             fail_args: None,
 
             fail_arg_types: None,
-            rd_pendingfields: None, rd_frame_sizes: None,
+            rd_pendingfields: None,
             rd_resume_position: -1,
         }];
         let constants = std::collections::HashMap::new();
@@ -3781,7 +3778,7 @@ mod tests {
                 fail_args: None,
 
                 fail_arg_types: None,
-                rd_pendingfields: None, rd_frame_sizes: None,
+                rd_pendingfields: None,
                 rd_resume_position: -1,
             },
             op! {
@@ -3792,7 +3789,7 @@ mod tests {
                 fail_args: None,
 
                 fail_arg_types: None,
-                rd_pendingfields: None, rd_frame_sizes: None,
+                rd_pendingfields: None,
                 rd_resume_position: -1,
             },
             op! {
@@ -3803,7 +3800,7 @@ mod tests {
                 fail_args: None,
 
                 fail_arg_types: None,
-                rd_pendingfields: None, rd_frame_sizes: None,
+                rd_pendingfields: None,
                 rd_resume_position: -1,
             },
             op! {
@@ -3814,7 +3811,7 @@ mod tests {
                 fail_args: Some(smallvec::smallvec![OpRef(0), OpRef(2)]),
 
                 fail_arg_types: None,
-                rd_pendingfields: None, rd_frame_sizes: None,
+                rd_pendingfields: None,
                 rd_resume_position: -1,
             },
             op! {
@@ -3825,7 +3822,7 @@ mod tests {
                 fail_args: None,
 
                 fail_arg_types: None,
-                rd_pendingfields: None, rd_frame_sizes: None,
+                rd_pendingfields: None,
                 rd_resume_position: -1,
             },
             op! {
@@ -3837,7 +3834,7 @@ mod tests {
 
 
                 fail_arg_types: None,
-                rd_pendingfields: None, rd_frame_sizes: None,
+                rd_pendingfields: None,
                 rd_resume_position: -1,
             },
         ];
@@ -3870,7 +3867,7 @@ mod tests {
                 fail_args: Some(smallvec::smallvec![OpRef(0)]),
 
                 fail_arg_types: None,
-                rd_pendingfields: None, rd_frame_sizes: None,
+                rd_pendingfields: None,
                 rd_resume_position: -1,
             },
             op! {
@@ -3882,7 +3879,7 @@ mod tests {
 
 
                 fail_arg_types: None,
-                rd_pendingfields: None, rd_frame_sizes: None,
+                rd_pendingfields: None,
                 rd_resume_position: -1,
             },
         ];

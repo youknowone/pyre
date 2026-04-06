@@ -531,26 +531,3 @@ pub fn rebuild_from_numbering(
     }
     (num_failargs, vable_values, vref_values, frames)
 }
-
-/// Convenience wrapper: decode with pre-computed frame_sizes slice.
-/// Each entry corresponds to one frame's box count (encode-time authoritative).
-/// resume.py:1054 parity: equivalent to f.get_current_position_info()
-/// returning liveness-derived counts.
-pub fn rebuild_from_numbering_with_sizes(
-    rd_numb: &[u8],
-    rd_consts: &[(i64, Type)],
-    frame_sizes: &[usize],
-) -> (i32, Vec<RebuiltValue>, Vec<RebuiltValue>, Vec<RebuiltFrame>) {
-    use std::cell::Cell;
-    let idx = Cell::new(0usize);
-    rebuild_from_numbering(
-        rd_numb,
-        rd_consts,
-        Some(&|_jitcode_index, _pc| {
-            let i = idx.get();
-            let result = frame_sizes.get(i).copied().unwrap_or(0);
-            idx.set(i + 1);
-            result
-        }),
-    )
-}

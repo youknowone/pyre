@@ -2118,13 +2118,11 @@ impl OptContext {
 
         op.rd_numb = Some(rd_numb);
         op.rd_consts = Some(rd_consts);
-        // Store frame_sizes for rd_numb decode (RPython uses jitcode
-        // liveness; majit passes sizes out-of-band). Always store when
-        // available — single-frame included, since frame_value_count_at
-        // may return a different count than the snapshot captured.
-        if let Some(sizes) = frame_sizes {
-            op.rd_frame_sizes = Some(sizes.clone());
-        }
+        // resume.py: RPython does NOT carry frame sizes out-of-band.
+        // The decoder reads jitcode liveness (jitcode.position_info) at
+        // each frame's resume pc. majit routes this through the global
+        // `frame_value_count_at` callback registered by pyre-jit-trace.
+        let _ = frame_sizes;
     }
 
     /// Get the IntBound for an OpRef, if known from imported bounds or constants.

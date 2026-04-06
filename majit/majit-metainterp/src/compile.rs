@@ -88,8 +88,6 @@ pub struct CompiledExitLayout {
     pub rd_virtuals: Option<Vec<majit_ir::RdVirtualInfo>>,
     /// resume.py:858 rd_pendingfields — deferred heap writes.
     pub rd_pendingfields: Option<Vec<majit_ir::GuardPendingFieldEntry>>,
-    /// Per-frame box counts for rd_numb multi-frame decode.
-    pub rd_frame_sizes: Option<Vec<usize>>,
 }
 
 /// Typed result from running compiled code.
@@ -706,7 +704,6 @@ pub(crate) fn build_guard_metadata(
                 rd_consts,
                 rd_virtuals,
                 rd_pendingfields,
-                rd_frame_sizes: op.rd_frame_sizes.clone(),
             },
         );
         fail_index += 1;
@@ -770,7 +767,6 @@ pub(crate) fn merge_backend_exit_layouts(
                     rd_consts: None,
                     rd_virtuals: None,
                     rd_pendingfields: None,
-                    rd_frame_sizes: None,
                 });
         entry.source_op_index = layout.source_op_index;
         // Preserve exit_types from build_guard_metadata (which reconciles
@@ -1022,7 +1018,6 @@ pub(crate) fn merge_backend_terminal_exit_layouts(
                 rd_consts: None,
                 rd_virtuals: None,
                 rd_pendingfields: None,
-                rd_frame_sizes: None,
             });
         entry.source_op_index = Some(layout.op_index);
         entry.exit_types = layout.exit_types.clone();
@@ -1177,7 +1172,6 @@ pub(crate) fn infer_terminal_exit_layout(
         rd_consts: None,
         rd_virtuals: None,
         rd_pendingfields: None,
-        rd_frame_sizes: None,
     })
 }
 
@@ -1205,7 +1199,6 @@ pub(crate) fn build_terminal_exit_layouts(
                     rd_consts: None,
                     rd_virtuals: None,
                     rd_pendingfields: None,
-                    rd_frame_sizes: None,
                 },
             );
         }
