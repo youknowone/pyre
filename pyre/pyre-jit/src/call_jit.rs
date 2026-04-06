@@ -900,8 +900,7 @@ pub fn resume_in_blackhole(
         let vsd = section.vsd;
         let stack_only = vsd.saturating_sub(nlocals);
 
-        // jitcode.py:14 parity: is_portal is fixed per CodeObject
-        // (determined by transform_graph_to_jitcode from code.obj_name).
+        // call.py:148: jitcode via get_jitcode (jitdriver_sd set on portal).
         let pyjitcode = crate::jit::codewriter::get_jitcode(code, &writer);
         let jitcode_pc = if py_pc < pyjitcode.pc_map.len() {
             pyjitcode.pc_map[py_pc]

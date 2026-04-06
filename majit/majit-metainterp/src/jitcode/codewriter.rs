@@ -955,7 +955,7 @@ impl JitCodeBuilder {
             py_to_jit_pc: Vec::new(),
             nlocals: 0,
             has_abort: self.has_abort,
-            is_portal: false,
+            jitdriver_sd: None,
         }
     }
 

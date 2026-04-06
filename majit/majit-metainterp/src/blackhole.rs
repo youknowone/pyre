@@ -887,10 +887,10 @@ pub struct BlackholeInterpreter {
     /// Pointer to the VirtualizableInfo describing field offsets.
     /// Used by vable bytecodes to compute memory offsets.
     pub virtualizable_info: *const crate::virtualizable::VirtualizableInfo,
-    /// blackhole.py:1095 get_portal_runner / bhimpl_recursive_call parity:
-    /// Optional callback to invoke the portal runner for recursive portal calls.
-    /// Receives the virtualizable_ptr (PyFrame) and returns the result as i64.
-    /// Set by the caller that builds the blackhole chain.
+    /// blackhole.py:1095 get_portal_runner(jdindex):
+    ///   jitdriver_sd = self.builder.metainterp_sd.jitdrivers_sd[jdindex]
+    ///   fnptr = adr2int(jitdriver_sd.portal_runner_adr)
+    /// pyre: single jitdriver, portal_runner receives virtualizable_ptr (frame).
     pub portal_runner_fn: Option<fn(i64) -> i64>,
 }
 
@@ -1600,20 +1600,23 @@ impl BlackholeInterpreter {
                     return Err(DispatchError::LeaveFrame);
                 }
                 // blackhole.py:1074-1093: recursive portal level.
-                // bhimpl_recursive_call_{v,i,r,f}(jdindex, *args) calls
-                // portal_runner with greens + reds as arguments.
-                if let Some(runner) = self.portal_runner_fn {
+                //   result_type = sd.jitdrivers_sd[jdindex].result_type
+                //   x = self.bhimpl_recursive_call_r(jdindex, *args)
+                //   self.bhimpl_ref_return(x)
+                // blackhole.py:1101 bhimpl_recursive_call_r:
+                //   fnptr, calldescr = self.get_portal_runner(jdindex)
+                //   return self.cpu.bh_call_r(fnptr, greens_i+reds_i, ...)
+                // pyre: portal_runner(frame_ptr) — greens = [next_instr],
+                //       reds = [frame]. Write next_instr + locals to frame.
+                if let Some(portal_runner) = self.portal_runner_fn {
                     if self.virtualizable_ptr != 0 && !self.virtualizable_info.is_null() {
                         let py_pc =
                             self.jitcode.jit_pc_to_py_pc(self.last_opcode_position) as usize;
                         let frame_ptr = self.virtualizable_ptr as *mut u8;
                         let info = unsafe { &*self.virtualizable_info };
-                        // Write merge-point args → frame via virtualizable.
-                        // Static field 0 = next_instr.
+                        // green arg: next_instr → static field 0
                         unsafe { info.write_field(frame_ptr, 0, py_pc as i64) };
-                        // Array 0 = locals_cells_stack_w.
-                        // Write only locals (merge-point reds), not the
-                        // entire ref register bank.
+                        // red args: locals → array 0 items [0..nlocals)
                         let nlocals = self.jitcode.nlocals;
                         for i in 0..nlocals {
                             if i < self.registers_r.len() {
@@ -1622,14 +1625,14 @@ impl BlackholeInterpreter {
                                 }
                             }
                         }
-                        // bhimpl_recursive_call_r + bhimpl_ref_return
-                        let result = runner(self.virtualizable_ptr);
+                        // bhimpl_recursive_call_r → bh_call_r(fnptr, args)
+                        let result = portal_runner(self.virtualizable_ptr);
                         self.tmpreg_r = result;
                         self.return_type = BhReturnType::Ref;
                         return Err(DispatchError::LeaveFrame);
                     }
                 }
-                // Fallback: continue executing (no portal_runner or no frame).
+                // No portal_runner: continue executing (non-portal jitcode).
             }
             BC_JUMP_TARGET => {
                 // Non-portal loop header marker (helper jitcodes only).
@@ -2208,8 +2211,8 @@ fn handle_jitexception(
     exc: JitException,
     portal_runner: Option<&dyn Fn(&JitException) -> Result<(BhReturnType, i64), JitException>>,
 ) -> Result<(BlackholeInterpreter, i64), JitException> {
-    // blackhole.py:1764-1766: skip non-portal frames
-    while !bh.jitcode.is_portal {
+    // blackhole.py:1764: while blackholeinterp.jitcode.jitdriver_sd is None
+    while bh.jitcode.jitdriver_sd.is_none() {
         let next = bh.nextblackholeinterp.take();
         builder.release_interp(bh);
         match next.map(|b| *b) {

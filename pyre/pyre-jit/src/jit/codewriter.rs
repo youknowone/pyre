@@ -242,13 +242,12 @@ impl CodeWriter {
         let mut depth_at_pc: Vec<u16> = vec![0; num_instrs];
 
         // jitcode.py:18: jitdriver_sd is not None for portals.
-        // call.py:148 grab_initial_jitcodes: sets jitdriver_sd on portal.
-        // pyre: every named function is a potential portal. <module> is
-        // excluded — RPython never places jit_merge_point there.
+        // call.py:148: jd.mainjitcode.jitdriver_sd = jd
+        // interp_jit.py:78: dispatch() has jit_merge_point — is the portal.
+        // <module> code is never a portal (no jit_merge_point).
         let is_portal = &*code.obj_name != "<module>";
-        // RPython has one jit_merge_point per portal. pyre places
-        // jit_merge_point at the first loop header of portal jitcodes.
-        // Non-portal jitcodes get only loop_header (BC_JUMP_TARGET).
+        // jtransform.py:1690-1712: portal jitcodes get jit_merge_point
+        // at the first loop header. Non-portal: loop_header only.
         let merge_point_pc = if is_portal {
             loop_header_pcs.iter().copied().min()
         } else {
@@ -801,7 +800,9 @@ impl CodeWriter {
         // get_list_of_active_boxes can look up LivenessInfo by Python PC.
         jitcode.py_to_jit_pc = pc_map.clone();
 
-        jitcode.is_portal = is_portal;
+        // call.py:148 grab_initial_jitcodes: jd.mainjitcode.jitdriver_sd = jd
+        // pyre uses index 0 (single jitdriver) for portal jitcodes.
+        jitcode.jitdriver_sd = if is_portal { Some(0) } else { None };
         jitcode.nlocals = code.varnames.len();
 
         // blackhole.py handle_exception_in_frame: build exception handler table
@@ -926,11 +927,9 @@ thread_local! {
 
 /// Get or compile JitCode for a CodeObject.
 ///
-/// jitcode.py:14 parity: is_portal is determined by the CodeObject itself
-/// (jitdriver_sd is not None for portal jitcodes). pyre determines this
-/// from code.obj_name inside transform_graph_to_jitcode, matching RPython's
-/// make_jitcodes() which sets jitdriver_sd on the main portal graph.
-/// The result is cached per CodeObject pointer — is_portal is fixed per code.
+/// jitcode.py:18: jitdriver_sd is not None for portal jitcodes.
+/// call.py:148 grab_initial_jitcodes: sets jitdriver_sd on the portal.
+/// Cached per CodeObject pointer — jitdriver_sd is fixed per jitcode.
 pub fn get_jitcode(code: &CodeObject, writer: &CodeWriter) -> &'static PyJitCode {
     let key = code as *const CodeObject as usize;
     JITCODE_CACHE.with(|cell| {
@@ -972,8 +971,7 @@ pub fn ensure_jitcode_for(code: &pyre_interpreter::CodeObject) {
     let _ = get_jitcode(code, &writer);
 }
 
-/// jitcode.py:18 parity: `jitcode.jitdriver_sd is not None`.
-/// Single source of truth for portal determination.
+/// jitcode.py:18: `jitcode.jitdriver_sd is not None`.
 pub fn is_portal(code: &pyre_interpreter::CodeObject) -> bool {
     ensure_jitcode_for(code);
     let key = code as *const pyre_interpreter::CodeObject as usize;
@@ -981,7 +979,7 @@ pub fn is_portal(code: &pyre_interpreter::CodeObject) -> bool {
         let cache = unsafe { &*cell.get() };
         cache
             .get(&key)
-            .map(|pjc| pjc.jitcode.is_portal)
+            .map(|pjc| pjc.jitcode.jitdriver_sd.is_some())
             .unwrap_or(false)
     })
 }
