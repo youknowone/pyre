@@ -304,7 +304,6 @@ impl Backend for DynasmBackend {
             exit_layout,
             force_token_slots: Vec::new(),
             savedata: None,
-            exception_class: 0,
             exception_value: GcRef::NULL,
             fail_index: descr.fail_index,
             trace_id: descr.trace_id,

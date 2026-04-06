@@ -17,6 +17,7 @@ fn untag(word: i64) -> (i64, i64) {
 fn resume_py_public_encoding_uses_tagged_numbering() {
     let large_const = (1_i64 << 62) + 9;
     let rd = ResumeData {
+        vable_array: Vec::new(),
         frames: vec![FrameInfo {
             pc: 123,
             slot_map: vec![
@@ -38,10 +39,12 @@ fn resume_py_public_encoding_uses_tagged_numbering() {
     let encoded = rd.encode();
     assert_eq!(encoded.rd_numb[0] as usize, encoded.rd_numb.len());
     assert_eq!(encoded.rd_consts, vec![large_const]);
+    // Header layout:
+    // [size, count, vable_array_len, vref_array_len, num_frames, pc, slot_count, ...slots]
     // rd_numb[1] = count: 1 livebox (FailArg(0) in frame slot)
     assert_eq!(encoded.rd_numb[1], 1);
 
-    let slot_words = &encoded.rd_numb[5..11];
+    let slot_words = &encoded.rd_numb[7..13];
     assert_eq!(untag(slot_words[0]), (0, TAG_BOX));
     assert_eq!(untag(slot_words[1]), (7, TAG_INT));
     assert_eq!(untag(slot_words[2]), (0, TAG_CONST));
@@ -53,6 +56,7 @@ fn resume_py_public_encoding_uses_tagged_numbering() {
 #[test]
 fn resume_py_public_roundtrip_recovers_virtualized_state() {
     let rd = ResumeData {
+        vable_array: Vec::new(),
         frames: vec![FrameInfo {
             pc: 77,
             slot_map: vec![
@@ -66,6 +70,7 @@ fn resume_py_public_roundtrip_recovers_virtualized_state() {
             descr: None,
             type_id: 1,
             descr_index: 3,
+            known_class: None,
             fields: vec![
                 (0, VirtualFieldSource::FailArg(1)),
                 (1, VirtualFieldSource::Constant(99)),
@@ -122,6 +127,7 @@ fn resume_py_count_includes_virtual_and_pending_field_failargs() {
     // FailArg(0) in frame slot, FailArg(1) only in virtual field,
     // FailArg(2) only in pending field — count must be 3.
     let rd = ResumeData {
+        vable_array: Vec::new(),
         frames: vec![FrameInfo {
             pc: 10,
             slot_map: vec![FrameSlotSource::FailArg(0), FrameSlotSource::Constant(42)],
@@ -130,6 +136,7 @@ fn resume_py_count_includes_virtual_and_pending_field_failargs() {
             descr: None,
             type_id: 1,
             descr_index: 0,
+            known_class: None,
             fields: vec![(0, VirtualFieldSource::FailArg(1))],
             fielddescrs: vec![],
             descr_size: 0,
@@ -151,6 +158,7 @@ fn resume_py_count_includes_virtual_and_pending_field_failargs() {
 #[test]
 fn resume_py_count_frame_only() {
     let rd = ResumeData {
+        vable_array: Vec::new(),
         frames: vec![FrameInfo {
             pc: 10,
             slot_map: vec![
@@ -172,6 +180,7 @@ fn resume_py_count_frame_only() {
 #[test]
 fn resume_py_compact_liveboxes_numbering() {
     let rd = ResumeData {
+        vable_array: Vec::new(),
         frames: vec![FrameInfo {
             pc: 10,
             slot_map: vec![
@@ -189,7 +198,7 @@ fn resume_py_compact_liveboxes_numbering() {
     // liveboxes[0] = 0, liveboxes[1] = 7
     assert_eq!(encoded.liveboxes, vec![0, 7]);
     // TAGBOX(0) for FailArg(0), TAGBOX(1) for FailArg(7)
-    let slot_words = &encoded.rd_numb[5..8];
+    let slot_words = &encoded.rd_numb[7..10];
     assert_eq!(untag(slot_words[0]), (0, TAG_BOX));
     assert_eq!(untag(slot_words[1]), (1, TAG_BOX));
     assert_eq!(untag(slot_words[2]), (42, TAG_INT));
@@ -204,6 +213,7 @@ fn resume_py_compact_liveboxes_numbering() {
 #[test]
 fn resume_py_dedup_same_box_same_number() {
     let rd = ResumeData {
+        vable_array: Vec::new(),
         frames: vec![FrameInfo {
             pc: 10,
             slot_map: vec![
@@ -220,7 +230,7 @@ fn resume_py_dedup_same_box_same_number() {
     assert_eq!(encoded.rd_numb[1], 2);
     assert_eq!(encoded.liveboxes, vec![5, 3]);
     // Both FailArg(5) slots get TAGBOX(0), FailArg(3) gets TAGBOX(1)
-    let slot_words = &encoded.rd_numb[5..8];
+    let slot_words = &encoded.rd_numb[7..10];
     assert_eq!(untag(slot_words[0]), (0, TAG_BOX));
     assert_eq!(untag(slot_words[1]), (0, TAG_BOX));
     assert_eq!(untag(slot_words[2]), (1, TAG_BOX));
