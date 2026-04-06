@@ -2009,13 +2009,15 @@ impl MIFrame {
         concrete_lhs: PyObjectRef,
         concrete_rhs: PyObjectRef,
     ) -> Result<OpRef, PyError> {
-        // lloperation.py:261: "don't implement float_pow, use math.pow instead"
-        // resoperation.py: no FLOAT_POW opcode.
-        // ll_math.py:260: ll_math_pow is NOT elidable, has EF_CAN_RAISE.
-        // Power goes through trace_binary_value (residual call), not inline.
-        let Some(op_code) = crate::float_binop_lookup(op) else {
+        let is_power = matches!(op, BinaryOperator::Power | BinaryOperator::InplacePower);
+        let op_code = crate::float_binop_lookup(op);
+
+        // resoperation.py: no FLOAT_POW / FLOAT_FLOORDIV / FLOAT_MOD opcodes.
+        // FloorDivide/Remainder → residual Python-level call.
+        // Power → raw-float call_may_force (ll_math_pow, EF_CAN_RAISE).
+        if op_code.is_none() && !is_power {
             return self.trace_binary_value(a, b, op);
-        };
+        }
 
         // Determine which operands are int (need int→float cast) vs float.
         // RPython: float_add etc. call space.float_w() which dispatches on
@@ -2073,7 +2075,21 @@ impl MIFrame {
             } else {
                 unbox_float(this, ctx, b)
             };
-            let result = ctx.record_op(op_code, &[lhs_raw, rhs_raw]);
+            let result = if is_power {
+                // lloperation.py:261: "don't implement float_pow"
+                // ll_math.py:260: ll_math_pow has EF_CAN_RAISE → call_may_force, not elidable.
+                // Raw f64 powf — operates on unboxed floats, avoids Python object boxing.
+                extern "C" fn float_pow(x: f64, y: f64) -> f64 {
+                    x.powf(y)
+                }
+                ctx.call_may_force_float_typed(
+                    float_pow as *const (),
+                    &[lhs_raw, rhs_raw],
+                    &[Type::Float, Type::Float],
+                )
+            } else {
+                ctx.record_op(op_code.unwrap(), &[lhs_raw, rhs_raw])
+            };
             this.remember_value_type(result, Type::Float);
             // RPython parity: wrapfloat(space, z) re-boxes the raw float result.
             // pypy/objspace/std/floatobject.py

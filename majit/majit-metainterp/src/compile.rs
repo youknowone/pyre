@@ -1287,15 +1287,14 @@ pub(crate) fn unbox_finish_result(
         }
     }
 
-    // Pattern 2: New() + SetfieldGc chain
+    // Pattern 2: New()/NewWithVtable() + SetfieldGc chain
     //
     // Optimizer passes may reorder the `New` relative to its `SetfieldGc`
     // users in the final op list, so do not assume the field stores appear
     // textually after the allocation. Match by producer/result identity only.
-    let new_idx = match ops[..finish_idx]
-        .iter()
-        .rposition(|op| op.pos == finish_arg && op.opcode == OpCode::New)
-    {
+    let new_idx = match ops[..finish_idx].iter().rposition(|op| {
+        op.pos == finish_arg && (op.opcode == OpCode::New || op.opcode == OpCode::NewWithVtable)
+    }) {
         Some(i) => i,
         None => return (ops, false),
     };
@@ -1663,8 +1662,8 @@ pub(crate) fn fold_box_into_create_frame(
                 break;
             }
 
-            // Pattern 2: New() + SetfieldGc(box, raw)
-            if box_op.opcode == OpCode::New {
+            // Pattern 2: New()/NewWithVtable() + SetfieldGc(box, raw)
+            if box_op.opcode == OpCode::New || box_op.opcode == OpCode::NewWithVtable {
                 let mut raw_val = None;
                 let mut removable_indices = vec![bi];
                 for (si, set_op) in ops[bi + 1..ci].iter().enumerate() {
