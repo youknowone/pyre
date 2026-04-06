@@ -1189,22 +1189,12 @@ impl MIFrame {
                     OpRef::NONE
                 }
             };
-            if !opref.is_none() {
-                boxes.push(Self::opref_to_snapshot_tagged(opref, ctx));
-            } else if let Some(frame) = concrete_frame {
-                let val = frame
-                    .locals_cells_stack_w
-                    .as_slice()
-                    .get(i)
-                    .copied()
-                    .unwrap_or(pyre_object::PY_NULL);
-                boxes.push(majit_trace::recorder::SnapshotTagged::Const(
-                    val as i64,
-                    Type::Ref,
-                ));
-            } else {
-                boxes.push(Self::opref_to_snapshot_tagged(OpRef::NONE, ctx));
-            }
+            // RPython pyjitpl.py:190: ALL registers contain proper Box
+            // objects. Dead/untracked registers have Const(NULL) or the
+            // last-assigned Box. Never capture concrete frame values as
+            // Const(raw_ptr, Ref) — these become stale trace-time constants
+            // that don't reflect the runtime state at guard failure.
+            boxes.push(Self::opref_to_snapshot_tagged(opref, ctx));
         }
         boxes
     }

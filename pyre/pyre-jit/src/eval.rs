@@ -2948,11 +2948,37 @@ fn build_resumed_frames(
         (std::ptr::null_mut(), 0, 0)
     };
 
-    // TODO resume.py:1399 consume_vable_info → virtualizable.py:126
+    // resume.py:1399 consume_vable_info → virtualizable.py:126
     // write_from_resume_data_partial: write ALL vable fields to the frame
-    // BEFORE the blackhole runs. Blocked on GC-safe Ref constant handling
-    // in rd_consts (RPython uses GC-traced ConstPtr objects; pyre stores
-    // raw i64 that may dangle after GC).
+    // BEFORE the blackhole runs.
+    if !vable_frame_ptr.is_null() {
+        let vinfo = unsafe { &*crate::eval::get_virtualizable_info() };
+        let frame_ptr = vable_frame_ptr as *mut u8;
+
+        // virtualizable.py:130-133: write static fields.
+        // field 0 = next_instr, field 2 = valuestackdepth.
+        // Skip code(1) and namespace(3) — immutable.
+        // RPython writes ALL static fields, resets token, and writes ALL
+        // array items here. In pyre, these writes conflict with the
+        // blackhole exit path (which re-syncs the frame independently).
+        // Each write individually causes a specific test failure:
+        //   write_field(0, ni) → fib_loop error (wrong resume PC)
+        //   write_field(2, vsd) → nbody crash (stack mismatch)
+        //   reset_vable_token → fannkuch timeout (re-entry issue)
+        //   write_array_item → nbody/spectral_norm crash (null overwrite)
+        // Blocked on: reconciling blackhole exit path with consume_vable_info.
+        // For now, the vable section is decoded but not written to frame.
+        let _ = (
+            vinfo,
+            frame_ptr,
+            &vable_values,
+            &dead_frame_typed,
+            exit_layout,
+            &mut virtuals_cache,
+            _vable_ni,
+            vable_vsd,
+        );
+    }
 
     let mut result = Vec::with_capacity(frames.len());
     for (idx, (frame, values)) in frames.iter().zip(all_values.into_iter()).enumerate() {
