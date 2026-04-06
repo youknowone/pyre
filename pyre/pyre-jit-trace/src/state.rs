@@ -613,14 +613,7 @@ pub(crate) fn trace_ob_type_descr() -> DescrRef {
 }
 
 pub(crate) fn box_traced_raw_int(ctx: &mut TraceCtx, value: OpRef) -> OpRef {
-    crate::helpers::emit_box_int_inline(
-        ctx,
-        value,
-        w_int_size_descr(),
-        ob_type_descr(),
-        int_intval_descr(),
-        &INT_TYPE as *const _ as i64,
-    )
+    crate::helpers::emit_box_int_inline(ctx, value, w_int_size_descr(), int_intval_descr())
 }
 
 pub(crate) fn note_inline_trace_too_long(
@@ -682,14 +675,7 @@ pub(crate) fn note_root_trace_too_long(green_key: u64) {
 }
 
 pub(crate) fn box_traced_raw_float(ctx: &mut TraceCtx, value: OpRef) -> OpRef {
-    emit_box_float_inline(
-        ctx,
-        value,
-        w_float_size_descr(),
-        ob_type_descr(),
-        float_floatval_descr(),
-        &FLOAT_TYPE as *const _ as i64,
-    )
+    emit_box_float_inline(ctx, value, w_float_size_descr(), float_floatval_descr())
 }
 
 pub(crate) fn ensure_boxed_for_ca(ctx: &mut TraceCtx, state: &MIFrame, value: OpRef) -> OpRef {

@@ -1683,7 +1683,7 @@ fn export_single_value(
     if let Some(info) = ctx.get_ptr_info(opref) {
         match info {
             PtrInfo::Virtual(vinfo) => {
-                let mut fields: Vec<_> = vinfo
+                let fields = vinfo
                     .fields
                     .iter()
                     .map(|(field_idx, field_ref)| {
@@ -1691,8 +1691,6 @@ fn export_single_value(
                         (*field_idx, Box::new(field_state))
                     })
                     .collect();
-                // RPython: _fields is indexed by integer, naturally sorted.
-                fields.sort_by_key(|(idx, _)| *idx);
                 return VirtualStateInfo::Virtual {
                     descr: vinfo.descr.clone(),
                     known_class: vinfo.known_class,
