@@ -9,6 +9,13 @@ use majit_ir::{DescrRef, GcRef, OpCode, OpRef, Type, Value};
 use majit_metainterp::{TraceAction, TraceCtx};
 
 use pyre_interpreter::bytecode::{BinaryOperator, CodeObject, ComparisonOperator, Instruction};
+
+/// lloperation.py:261 — "don't implement float_pow, use math.pow instead".
+/// ll_math_pow has EF_CAN_RAISE → call_may_force, not elidable.
+/// Extracted to module level for stable function pointer identity.
+extern "C" fn float_pow_elidable(x: f64, y: f64) -> f64 {
+    x.powf(y)
+}
 use pyre_interpreter::truth_value as objspace_truth_value;
 use pyre_interpreter::{
     ArithmeticOpcodeHandler, BranchOpcodeHandler, ConstantOpcodeHandler, ControlFlowOpcodeHandler,
@@ -2088,11 +2095,8 @@ impl MIFrame {
                 // lloperation.py:261: "don't implement float_pow"
                 // ll_math.py:260: ll_math_pow has EF_CAN_RAISE → call_may_force, not elidable.
                 // Raw f64 powf — operates on unboxed floats, avoids Python object boxing.
-                extern "C" fn float_pow(x: f64, y: f64) -> f64 {
-                    x.powf(y)
-                }
                 ctx.call_may_force_float_typed(
-                    float_pow as *const (),
+                    float_pow_elidable as *const (),
                     &[lhs_raw, rhs_raw],
                     &[Type::Float, Type::Float],
                 )

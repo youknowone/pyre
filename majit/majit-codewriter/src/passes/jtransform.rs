@@ -622,6 +622,28 @@ impl<'a> Transformer<'a> {
         //   self.callcontrol.callinfocollection.add(oopspecindex, calldescr, func)
 
         // Look up oopspec/effect info: config overrides first, then static table.
+        // rlib/jit.py:250 — user-level `@oopspec(spec)` is registered via
+        // `call_control.mark_oopspec(path, spec)`; look it up here before
+        // falling back to the static builtin table.
+        let user_oopspec: Option<String> = self
+            .callcontrol
+            .as_deref()
+            .and_then(|cc| cc.get_oopspec(target).map(|s| s.to_string()));
+
+        // jtransform.py:497-498 — oopspec dispatch by prefix.
+        if let Some(spec) = user_oopspec.as_deref() {
+            let base = spec.split('(').next().unwrap_or(spec).trim();
+            // jtransform.py:497 — jit.* oopspecs → _handle_jit_call
+            if base.starts_with("jit.") {
+                return self.handle_jit_call(base, op, target, args, result_ty, graph_name);
+            }
+            // NOTE: conditional_call!/conditional_call_elidable!/record_known_result!
+            // are handled by jitcode_lower (proc-macro level), NOT here.
+            // The codewriter AST parser does not expand macro_rules!, so these
+            // macros appear as Stmt::Macro → UnknownKind::MacroStmt.
+            // The jitcode_lower proc-macro intercepts the macros directly and
+            // emits BC_COND_CALL_* / BC_RECORD_KNOWN_RESULT_* bytecodes.
+        }
         let (oopspec_index, extra_effect_override) =
             if let Some((descriptor, _)) = classify_call(target, &self.config.call_effects) {
                 (
@@ -633,6 +655,11 @@ impl<'a> Transformer<'a> {
                     descriptor.effect_info.oopspec_index,
                     Some(descriptor.effect_info.extra_effect),
                 )
+            } else if let Some(spec) = user_oopspec.as_deref() {
+                // rlib/jit.py:250 — map user oopspec string to OopSpecIndex.
+                // jtransform.py:1731-1755 — jit.* oopspecs.
+                let idx = map_user_oopspec_to_index(spec);
+                (idx, None)
             } else {
                 // Unknown builtin — keep as unclassified Call.
                 return RewriteResult::Keep;
@@ -857,6 +884,356 @@ impl<'a> Transformer<'a> {
         self.get_value_kind(v)
     }
 
+    /// RPython: `Transformer._handle_jit_call(op, oopspec_name, args)` (jtransform.py:1730-1757).
+    /// Dispatches jit.* oopspec calls to dedicated opcodes or _handle_oopspec_call.
+    fn handle_jit_call(
+        &mut self,
+        oopspec_name: &str,
+        op: &SpaceOperation,
+        target: &CallTarget,
+        args: &[ValueId],
+        result_ty: &ValueType,
+        graph_name: &str,
+    ) -> RewriteResult {
+        match oopspec_name {
+            // jtransform.py:1731-1732
+            "jit.debug" => {
+                self.notes.push(GraphTransformNote {
+                    function: graph_name.to_string(),
+                    detail: "jit.debug → jit_debug".to_string(),
+                });
+                RewriteResult::Replace(vec![SpaceOperation {
+                    result: None,
+                    kind: OpKind::JitDebug {
+                        args: args.to_vec(),
+                    },
+                }])
+            }
+            // jtransform.py:1733-1735
+            "jit.assert_green" => {
+                let value = args[0];
+                let kind_char = self.get_value_kind(value);
+                self.notes.push(GraphTransformNote {
+                    function: graph_name.to_string(),
+                    detail: format!("jit.assert_green → {kind_char}_assert_green"),
+                });
+                RewriteResult::Replace(vec![SpaceOperation {
+                    result: None,
+                    kind: OpKind::AssertGreen { value, kind_char },
+                }])
+            }
+            // jtransform.py:1736-1737
+            "jit.current_trace_length" => {
+                self.notes.push(GraphTransformNote {
+                    function: graph_name.to_string(),
+                    detail: "jit.current_trace_length → current_trace_length".to_string(),
+                });
+                RewriteResult::Replace(vec![SpaceOperation {
+                    result: op.result,
+                    kind: OpKind::CurrentTraceLength,
+                }])
+            }
+            // jtransform.py:1738-1740
+            "jit.isconstant" => {
+                let value = args[0];
+                let kind_char = self.get_value_kind(value);
+                self.notes.push(GraphTransformNote {
+                    function: graph_name.to_string(),
+                    detail: format!("jit.isconstant → {kind_char}_isconstant"),
+                });
+                RewriteResult::Replace(vec![SpaceOperation {
+                    result: op.result,
+                    kind: OpKind::IsConstant { value, kind_char },
+                }])
+            }
+            // jtransform.py:1741-1743
+            "jit.isvirtual" => {
+                let value = args[0];
+                let kind_char = self.get_value_kind(value);
+                self.notes.push(GraphTransformNote {
+                    function: graph_name.to_string(),
+                    detail: format!("jit.isvirtual → {kind_char}_isvirtual"),
+                });
+                RewriteResult::Replace(vec![SpaceOperation {
+                    result: op.result,
+                    kind: OpKind::IsVirtual { value, kind_char },
+                }])
+            }
+            // jtransform.py:1744-1747
+            "jit.force_virtual" => self.handle_oopspec_call(
+                op,
+                target,
+                args,
+                result_ty,
+                graph_name,
+                OopSpecIndex::JitForceVirtual,
+                Some(majit_ir::descr::ExtraEffect::ForcesVirtualOrVirtualizable),
+            ),
+            // jtransform.py:1748-1755
+            "jit.not_in_trace" => {
+                // jtransform.py:1750-1753: not_in_trace must return void
+                assert!(
+                    *result_ty == ValueType::Void,
+                    "jit.not_in_trace() function must return None"
+                );
+                self.handle_oopspec_call(
+                    op,
+                    target,
+                    args,
+                    result_ty,
+                    graph_name,
+                    OopSpecIndex::NotInTrace,
+                    None,
+                )
+            }
+            // jtransform.py:1756-1757
+            _ => {
+                // jtransform.py:1757
+                panic!("missing support for jit.* oopspec: {oopspec_name}");
+                RewriteResult::Keep
+            }
+        }
+    }
+
+    /// RPython: `Transformer._handle_oopspec_call(op, args, oopspecindex, extraeffect)`
+    /// (jtransform.py:1988-2008).
+    /// Produces a residual_call with the given oopspecindex embedded in the calldescr,
+    /// and registers the function in the callinfocollection.
+    fn handle_oopspec_call(
+        &mut self,
+        op: &SpaceOperation,
+        target: &CallTarget,
+        args: &[ValueId],
+        result_ty: &ValueType,
+        graph_name: &str,
+        oopspecindex: OopSpecIndex,
+        extraeffect: Option<majit_ir::descr::ExtraEffect>,
+    ) -> RewriteResult {
+        // jtransform.py:1990-1993
+        let non_void_args = resolve_non_void_arg_types(args, self.type_state);
+        let result_ir_type = value_type_to_ir_type(result_ty);
+        let non_void_args_for_collection = non_void_args.clone();
+        let descriptor = {
+            let cc_ref: &crate::call::CallControl = self.callcontrol.as_deref().unwrap();
+            cc_ref.getcalldescr(
+                target,
+                non_void_args,
+                result_ir_type,
+                oopspecindex,
+                extraeffect,
+                &mut self.analysis_cache,
+            )
+        };
+        self.notes.push(GraphTransformNote {
+            function: graph_name.to_string(),
+            detail: format!("oopspec {oopspecindex:?} → residual_call"),
+        });
+        self.calls_classified += 1;
+        // jtransform.py:1999-2002: callinfocollection.add
+        if oopspecindex != OopSpecIndex::None {
+            if let Some(cc) = self.callcontrol.as_mut() {
+                let calldescr = majit_ir::descr::make_call_descr(
+                    non_void_args_for_collection,
+                    result_ir_type,
+                    descriptor.effect_info.clone(),
+                );
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                target.hash(&mut hasher);
+                let func_as_int = hasher.finish();
+                cc.callinfocollection
+                    .add(oopspecindex, calldescr, func_as_int);
+                cc.callinfocollection
+                    .register_func_name(func_as_int, format!("{target}"));
+            }
+        }
+        // jtransform.py:2003-2008: residual_call + optional -live-
+        self.handle_residual_call(op, descriptor, args, result_ty, graph_name)
+    }
+
+    // NOTE: rewrite_op_jit_conditional_call, _rewrite_op_cond_call, and
+    // rewrite_op_jit_record_known_result are handled by jitcode_lower
+    // (proc-macro level), not jtransform. The codewriter AST parser does
+    // not expand macro_rules!, so these macros never reach jtransform.
+    // See jitcode_lower.rs: lower_conditional_call, lower_conditional_call_elidable,
+    // lower_record_known_result.
+
+    #[allow(dead_code)]
+    /// RPython: `Transformer._rewrite_op_cond_call(op, rewritten_opname)`
+    /// (jtransform.py:1665-1683).
+    /// NOTE: This is dead code in the jtransform path because conditional_call!
+    /// is a macro that jitcode_lower intercepts. Kept for reference.
+    fn _rewrite_op_cond_call(
+        &mut self,
+        op: &SpaceOperation,
+        target: &CallTarget,
+        args: &[ValueId],
+        result_ty: &ValueType,
+        graph_name: &str,
+        is_value: bool,
+    ) -> RewriteResult {
+        // jtransform.py:1666-1672: validate no floats, ≤4+2 args
+        for &arg in args {
+            if self.get_value_kind(arg) == 'f' {
+                panic!("Conditional call does not support floats");
+                return RewriteResult::Keep;
+            }
+        }
+        if args.len() > 4 + 2 {
+            panic!("Conditional call does not support more than 4 arguments");
+            return RewriteResult::Keep;
+        }
+        // jtransform.py:1673-1676: calldescr from function call (args[1:] → result)
+        let condition_or_value = args[0];
+        let func_args = if args.len() > 1 { &args[1..] } else { &[] };
+        let non_void_args = resolve_non_void_arg_types(func_args, self.type_state);
+        let result_ir_type = value_type_to_ir_type(result_ty);
+        let descriptor = {
+            let cc_ref: &crate::call::CallControl = self.callcontrol.as_deref().unwrap();
+            cc_ref.getcalldescr(
+                target,
+                non_void_args,
+                result_ir_type,
+                OopSpecIndex::None,
+                None,
+                &mut self.analysis_cache,
+            )
+        };
+        // jtransform.py:1677: assert not forces_virtual_or_virtualizable
+        assert!(
+            !descriptor.effect_info.forces_virtual_or_virtualizable(),
+            "conditional_call target must not force virtualizable"
+        );
+        // jtransform.py:1678-1680: rewrite_call with force_ir=True
+        let (args_i, args_r, args_f) = self.make_three_lists(func_args);
+        assert!(
+            args_f.is_empty(),
+            "force_ir: no float args in conditional_call"
+        );
+        let result_kind = value_type_to_kind(result_ty);
+        let rewritten_opname = if is_value {
+            "conditional_call_value"
+        } else {
+            "conditional_call"
+        };
+        self.notes.push(GraphTransformNote {
+            function: graph_name.to_string(),
+            detail: format!("{rewritten_opname} → {rewritten_opname}_ir_{result_kind}"),
+        });
+        self.calls_classified += 1;
+        let call_kind = if is_value {
+            OpKind::ConditionalCallValue {
+                value: condition_or_value,
+                descriptor: descriptor.clone(),
+                args_i,
+                args_r,
+                args_f,
+                result_kind,
+            }
+        } else {
+            OpKind::ConditionalCall {
+                condition: condition_or_value,
+                descriptor: descriptor.clone(),
+                args_i,
+                args_r,
+                args_f,
+            }
+        };
+        // jtransform.py:1681-1682: -live- if calldescr_canraise
+        let mut ops = vec![SpaceOperation {
+            result: op.result,
+            kind: call_kind,
+        }];
+        if descriptor.effect_info.check_can_raise(false) {
+            ops.push(SpaceOperation {
+                result: None,
+                kind: OpKind::Live,
+            });
+        }
+        RewriteResult::Replace(ops)
+    }
+
+    /// RPython: `Transformer.rewrite_op_jit_record_known_result(op)`
+    /// (jtransform.py:292-313).
+    fn rewrite_op_jit_record_known_result(
+        &mut self,
+        op: &SpaceOperation,
+        target: &CallTarget,
+        args: &[ValueId],
+        _result_ty: &ValueType,
+        graph_name: &str,
+    ) -> RewriteResult {
+        // jtransform.py:293-295: validate no floats
+        for &arg in args {
+            if self.get_value_kind(arg) == 'f' {
+                panic!("record_known_result does not support floats");
+                return RewriteResult::Keep;
+            }
+        }
+        // jtransform.py:298-300: calldescr from function (args[1:] → args[0])
+        // args[0] = known result, args[1..] = function args
+        let result_value = args[0];
+        let func_args = if args.len() > 1 { &args[1..] } else { &[] };
+        let result_kind = self.get_value_kind(result_value);
+        let result_ir_type = match result_kind {
+            'i' => majit_ir::value::Type::Int,
+            'r' => majit_ir::value::Type::Ref,
+            _ => {
+                panic!("record_known_result: unsupported result kind '{result_kind}'");
+                return RewriteResult::Keep;
+            }
+        };
+        let non_void_args = resolve_non_void_arg_types(func_args, self.type_state);
+        let descriptor = {
+            let cc_ref: &crate::call::CallControl = self.callcontrol.as_deref().unwrap();
+            cc_ref.getcalldescr(
+                target,
+                non_void_args,
+                result_ir_type,
+                OopSpecIndex::None,
+                None,
+                &mut self.analysis_cache,
+            )
+        };
+        // jtransform.py:301: assert calldescr.get_extra_info().check_is_elidable()
+        assert!(
+            descriptor.effect_info.is_elidable(),
+            "record_known_result: function must be elidable"
+        );
+        // jtransform.py:302-307: record_known_result_{i|r}
+        let opname = format!("record_known_result_{result_kind}");
+        // jtransform.py:308-310: rewrite_call with force_ir=True
+        let (args_i, args_r, args_f) = self.make_three_lists(func_args);
+        assert!(
+            args_f.is_empty(),
+            "force_ir: no float args in record_known_result"
+        );
+        self.notes.push(GraphTransformNote {
+            function: graph_name.to_string(),
+            detail: format!("{opname} → {opname}_ir_v"),
+        });
+        self.calls_classified += 1;
+        // jtransform.py:311-313: -live- if calldescr_canraise
+        let mut ops = vec![SpaceOperation {
+            result: None, // record_known_result produces void
+            kind: OpKind::RecordKnownResult {
+                result_value,
+                descriptor: descriptor.clone(),
+                args_i,
+                args_r,
+                args_f,
+                result_kind,
+            },
+        }];
+        if descriptor.effect_info.check_can_raise(false) {
+            ops.push(SpaceOperation {
+                result: None,
+                kind: OpKind::Live,
+            });
+        }
+        RewriteResult::Replace(ops)
+    }
+
     /// RPython: `Transformer.handle_residual_call(op)` (jtransform.py:456-471).
     /// Call that the JIT should NOT look inside — emit residual_call_*.
     /// Args are split by kind via `rewrite_call()` → `make_three_lists()`.
@@ -1076,6 +1453,7 @@ fn remap_op(
         OpKind::Input { .. }
         | OpKind::ConstInt(_)
         | OpKind::VableForce
+        | OpKind::CurrentTraceLength
         | OpKind::Live
         | OpKind::GuardValue { .. }
         | OpKind::Unknown { .. } => op.kind.clone(),
@@ -1216,6 +1594,36 @@ fn remap_op(
             operand: remap_value(*operand, aliases),
             result_ty: result_ty.clone(),
         },
+        OpKind::JitDebug { args } => OpKind::JitDebug {
+            args: remap_list(args, aliases),
+        },
+        OpKind::RecordKnownResult {
+            result_value,
+            descriptor,
+            args_i,
+            args_r,
+            args_f,
+            result_kind,
+        } => OpKind::RecordKnownResult {
+            result_value: remap_value(*result_value, aliases),
+            descriptor: descriptor.clone(),
+            args_i: remap_list(args_i, aliases),
+            args_r: remap_list(args_r, aliases),
+            args_f: remap_list(args_f, aliases),
+            result_kind: *result_kind,
+        },
+        OpKind::AssertGreen { value, kind_char } => OpKind::AssertGreen {
+            value: remap_value(*value, aliases),
+            kind_char: *kind_char,
+        },
+        OpKind::IsConstant { value, kind_char } => OpKind::IsConstant {
+            value: remap_value(*value, aliases),
+            kind_char: *kind_char,
+        },
+        OpKind::IsVirtual { value, kind_char } => OpKind::IsVirtual {
+            value: remap_value(*value, aliases),
+            kind_char: *kind_char,
+        },
         OpKind::CallElidable {
             descriptor,
             args_i,
@@ -1323,6 +1731,34 @@ fn remap_op(
                 .collect(),
             result_kind: *result_kind,
         },
+        OpKind::ConditionalCall {
+            condition,
+            descriptor,
+            args_i,
+            args_r,
+            args_f,
+        } => OpKind::ConditionalCall {
+            condition: remap_value(*condition, aliases),
+            descriptor: descriptor.clone(),
+            args_i: remap_list(args_i, aliases),
+            args_r: remap_list(args_r, aliases),
+            args_f: remap_list(args_f, aliases),
+        },
+        OpKind::ConditionalCallValue {
+            value,
+            descriptor,
+            args_i,
+            args_r,
+            args_f,
+            result_kind,
+        } => OpKind::ConditionalCallValue {
+            value: remap_value(*value, aliases),
+            descriptor: descriptor.clone(),
+            args_i: remap_list(args_i, aliases),
+            args_r: remap_list(args_r, aliases),
+            args_f: remap_list(args_f, aliases),
+            result_kind: *result_kind,
+        },
     };
     SpaceOperation {
         result: op.result,
@@ -1428,6 +1864,27 @@ fn call_target_matches_loose(pattern: &CallTarget, target: &CallTarget) -> bool 
             }
         }
         _ => pattern == target,
+    }
+}
+
+/// Map a user-level oopspec string (from `@oopspec(...)`) to an `OopSpecIndex`.
+///
+/// rlib/jit.py:250 — `@oopspec(spec)` stores a spec string on the function.
+/// jtransform.py:1731-1755 `_handle_jit_call` patterns the spec name.
+///
+/// For the JIT-specific `jit.*` specs, RPython emits SpaceOperations with
+/// distinct names (e.g. `jit_debug`, `int_isconstant`); for list/dict/str
+/// specs RPython uses dedicated OS_* indices. This helper currently maps
+/// the cases that have a direct OopSpecIndex equivalent.
+fn map_user_oopspec_to_index(spec: &str) -> majit_ir::descr::OopSpecIndex {
+    use majit_ir::descr::OopSpecIndex;
+    // Normalize: `jit.isconstant(value)` → `jit.isconstant`
+    let base = spec.split('(').next().unwrap_or(spec).trim();
+    match base {
+        // All jit.* oopspecs are intercepted by handle_jit_call() before
+        // reaching this function. Remaining oopspecs map to OS_* indices.
+        "virtual_ref" | "virtual_ref_finish" => OopSpecIndex::JitForceVirtualizable,
+        _ => OopSpecIndex::None,
     }
 }
 

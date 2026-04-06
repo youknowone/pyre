@@ -885,15 +885,17 @@ pub fn not_in_trace(_attr: TokenStream, item: TokenStream) -> TokenStream {
     expanded.into()
 }
 
-/// Mark a function as elidable with automatic argument promotion.
+/// A decorator that promotes all arguments and then calls the supplied
+/// elidable function.
 ///
 /// rlib/jit.py:180 — `@elidable_promote(promote_args='all')`.
+///
+/// The decorated name **becomes** the promoting wrapper (RPython parity).
+/// The original elidable body is renamed to a hidden `_orig_<name>_unlikely_name`.
 ///
 /// Usage:
 ///   `#[elidable_promote]` — promote all arguments (default)
 ///   `#[elidable_promote(promote_args = "0,2")]` — promote args at indices 0, 2
-///
-/// Combines `#[elidable]` with automatic `promote()` on specified arguments.
 #[proc_macro_attribute]
 pub fn elidable_promote(attr: TokenStream, item: TokenStream) -> TokenStream {
     let func = parse_macro_input!(item as ItemFn);
@@ -906,7 +908,6 @@ pub fn elidable_promote(attr: TokenStream, item: TokenStream) -> TokenStream {
         config.promote_args
     };
 
-    // Determine which argument indices to promote
     let arg_count = func.sig.inputs.len();
     let promote_indices: Vec<usize> = if promote_args_str == "all" {
         (0..arg_count).collect()
@@ -917,58 +918,111 @@ pub fn elidable_promote(attr: TokenStream, item: TokenStream) -> TokenStream {
             .collect()
     };
 
-    // Build wrapper: promote specified args, then call original
     let attrs = &func.attrs;
     let vis = &func.vis;
     let sig = &func.sig;
     let block = &func.block;
     let fn_name = &sig.ident;
-    let wrapper_name = format_ident!("{}_promote", fn_name);
+    // rlib/jit.py:196 — _orig_func_unlikely_name
+    let orig_name = format_ident!("_orig_{}_unlikely_name", fn_name);
+    let output = &sig.output;
 
-    // Collect param names and types
-    let mut param_names = Vec::new();
-    let mut param_types = Vec::new();
+    // Collect param info (rlib/jit.py:186 _get_args — includes self if method)
+    let mut param_names: Vec<proc_macro2::TokenStream> = Vec::new();
+    let mut full_params: Vec<syn::FnArg> = Vec::new();
+    let mut named_args: Vec<Ident> = Vec::new();
+    let has_self = matches!(sig.inputs.first(), Some(FnArg::Receiver(_)));
     for arg in &sig.inputs {
-        if let FnArg::Typed(pat_type) = arg {
-            if let syn::Pat::Ident(pat_ident) = &*pat_type.pat {
-                param_names.push(pat_ident.ident.clone());
-                param_types.push((*pat_type.ty).clone());
+        full_params.push(arg.clone());
+        match arg {
+            FnArg::Receiver(_) => {
+                param_names.push(quote! { self });
+            }
+            FnArg::Typed(pat_type) => {
+                if let syn::Pat::Ident(pat_ident) = &*pat_type.pat {
+                    let name = pat_ident.ident.clone();
+                    param_names.push(quote! { #name });
+                    named_args.push(name);
+                }
             }
         }
     }
 
-    // Build promote calls for specified indices
+    // rlib/jit.py:191-194 — promote each selected arg with both hints.
+    // promote_indices index into full arg list (including self), matching _get_args.
     let promote_stmts: Vec<_> = promote_indices
         .iter()
-        .filter(|&&idx| idx < param_names.len())
-        .map(|&idx| {
-            let name = &param_names[idx];
-            quote! { let #name = majit_metainterp::jit::promote(#name); }
+        .filter_map(|&idx| {
+            if has_self && idx == 0 {
+                // rlib/jit.py:193 — promote self by identity (guard_value on pointer)
+                Some(quote! {
+                    let _ = majit_metainterp::jit::promote(self as *const _ as usize);
+                })
+            } else {
+                let named_idx = if has_self { idx - 1 } else { idx };
+                named_args.get(named_idx).map(|name| {
+                    quote! { let #name = majit_metainterp::jit::promote(#name); }
+                })
+            }
         })
         .collect();
 
-    let call_args: Vec<_> = param_names.iter().map(|n| quote! { #n }).collect();
-    let output = &sig.output;
+    let call_args: Vec<_> = param_names.clone();
+
+    // Build call_target/policy for the ORIGINAL elidable function
+    let orig_sig = syn::Signature {
+        ident: orig_name.clone(),
+        ..sig.clone()
+    };
+    let orig_func = syn::ItemFn {
+        sig: orig_sig,
+        ..func.clone()
+    };
+    let (trace_target_name, concrete_target_name, call_target_fn) =
+        match emit_helper_call_target_fn(&orig_func) {
+            Ok(Some((trace_name, concrete_name, tokens))) => {
+                (Some(trace_name), Some(concrete_name), Some(tokens))
+            }
+            Ok(None) => (None, None, None),
+            Err(err) => return err.to_compile_error().into(),
+        };
+    let policy_path = Path::from(orig_name.clone());
+    let policy_fn = match emit_helper_policy_fn(
+        &policy_path,
+        match helper_policy_tokens_for_fn(
+            &orig_func,
+            "elidable",
+            trace_target_name.as_ref(),
+            concrete_target_name.as_ref(),
+        ) {
+            Ok(tokens) => tokens,
+            Err(err) => return err.to_compile_error().into(),
+        },
+    ) {
+        Ok(tokens) => tokens,
+        Err(err) => return err.to_compile_error().into(),
+    };
 
     let expanded = quote! {
-        // Original function with #[elidable]
-        #(#attrs)*
+        // rlib/jit.py:184-185 — elidable(func); original body hidden
         #[inline(never)]
         #[doc(hidden)]
         #[allow(non_upper_case_globals)]
-        #vis #sig {
+        fn #orig_name(#(#full_params),*) #output {
             #[doc(hidden)]
             #[allow(dead_code)]
             const _MAJIT_ELIDABLE: bool = true;
             #block
         }
 
-        // Wrapper that promotes args then calls original
-        #[doc(hidden)]
-        #[allow(dead_code)]
-        #vis fn #wrapper_name(#(#param_names: #param_types),*) #output {
+        #call_target_fn
+        #policy_fn
+
+        // rlib/jit.py:188-200 — the decorated name IS the promoting wrapper
+        #(#attrs)*
+        #vis fn #fn_name(#(#full_params),*) #output {
             #(#promote_stmts)*
-            #fn_name(#(#call_args),*)
+            #orig_name(#(#call_args),*)
         }
     };
 
@@ -992,6 +1046,130 @@ impl Parse for ElidablePromoteArgs {
             promote_args: value.value(),
         })
     }
+}
+
+/// The JIT compiler won't look inside this decorated function,
+/// but instead during translation, rewrites it according to the handler in
+/// the codewriter/jtransform.
+///
+/// rlib/jit.py:250 — `@oopspec(spec)`.
+///
+/// Usage: `#[oopspec("jit.isconstant(value)")]`
+///
+/// The spec string is stored as a hidden constant for the codewriter to discover.
+#[proc_macro_attribute]
+pub fn oopspec(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let spec: syn::LitStr = parse_macro_input!(attr as syn::LitStr);
+    let func = parse_macro_input!(item as ItemFn);
+    let attrs = &func.attrs;
+    let vis = &func.vis;
+    let sig = &func.sig;
+    let block = &func.block;
+    let spec_value = spec.value();
+
+    let expanded = quote! {
+        #(#attrs)*
+        #[doc(hidden)]
+        #[allow(non_upper_case_globals)]
+        #vis #sig {
+            #[doc(hidden)]
+            #[allow(dead_code)]
+            const _MAJIT_OOPSPEC: &str = #spec_value;
+            #block
+        }
+    };
+
+    expanded.into()
+}
+
+/// Look inside (including unrolling loops) the target function, if and only if
+/// `predicate(args)` returns true.
+///
+/// rlib/jit.py:208 — `@look_inside_iff(predicate)`.
+///
+/// Generates three functions:
+/// 1. `_orig_<name>` — original body, marked `#[unroll_safe]` (hidden)
+/// 2. `<name>_trampoline` — `@dont_look_inside` wrapper calling _orig (hidden)
+/// 3. `<name>` — dispatch wrapper (the public name):
+///    `if !we_are_jitted() || predicate(args) { _orig(args) } else { trampoline(args) }`
+///
+/// Usage: `#[look_inside_iff(my_predicate)]`
+/// where `my_predicate` has the same signature as the decorated function returning bool.
+#[proc_macro_attribute]
+pub fn look_inside_iff(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let predicate_path: Path = parse_macro_input!(attr as Path);
+    let func = parse_macro_input!(item as ItemFn);
+
+    let attrs = &func.attrs;
+    let vis = &func.vis;
+    let sig = &func.sig;
+    let block = &func.block;
+    let fn_name = &sig.ident;
+    // rlib/jit.py:213 — func = unroll_safe(func)
+    let orig_name = format_ident!("_orig_{}", fn_name);
+    // rlib/jit.py:232 — trampoline.__name__ = func.__name__ + "_trampoline"
+    let trampoline_name = format_ident!("{}_trampoline", fn_name);
+    let output = &sig.output;
+
+    // Collect parameter patterns and call argument expressions.
+    // rlib/jit.py:221 args = _get_args(func) — includes `self` if method.
+    let mut full_params: Vec<syn::FnArg> = Vec::new();
+    let mut call_args: Vec<proc_macro2::TokenStream> = Vec::new();
+    for arg in &sig.inputs {
+        full_params.push(arg.clone());
+        match arg {
+            FnArg::Receiver(_) => {
+                // Forward `self` as-is (works for &self, &mut self, self, Box<Self>).
+                call_args.push(quote! { self });
+            }
+            FnArg::Typed(pat_type) => {
+                if let syn::Pat::Ident(pat_ident) = &*pat_type.pat {
+                    let name = &pat_ident.ident;
+                    call_args.push(quote! { #name });
+                }
+            }
+        }
+    }
+
+    let expanded = quote! {
+        // rlib/jit.py:213-214 — func = unroll_safe(func)
+        #[doc(hidden)]
+        #[allow(non_upper_case_globals)]
+        fn #orig_name(#(#full_params),*) #output {
+            #[doc(hidden)]
+            #[allow(dead_code)]
+            const _MAJIT_UNROLL_SAFE: bool = true;
+            #block
+        }
+
+        // rlib/jit.py:231-233 — @dont_look_inside def trampoline(...): return func(...)
+        #[inline(never)]
+        #[doc(hidden)]
+        #[allow(non_upper_case_globals)]
+        fn #trampoline_name(#(#full_params),*) #output {
+            #[doc(hidden)]
+            #[allow(dead_code)]
+            const _MAJIT_OPAQUE: bool = true;
+            #orig_name(#(#call_args),*)
+        }
+
+        // rlib/jit.py:240-244 — the decorated name becomes the dispatch wrapper
+        // def f(*args):
+        //     if not we_are_jitted() or predicate(*args):
+        //         return func(*args)
+        //     else:
+        //         return trampoline(*args)
+        #(#attrs)*
+        #vis fn #fn_name(#(#full_params),*) #output {
+            if !majit_metainterp::jit::we_are_jitted() || #predicate_path(#(#call_args),*) {
+                #orig_name(#(#call_args),*)
+            } else {
+                #trampoline_name(#(#call_args),*)
+            }
+        }
+    };
+
+    expanded.into()
 }
 
 /// Serialize a helper into a hidden `JitCode` builder.
@@ -1150,7 +1328,13 @@ pub fn jit_interp(attr: TokenStream, item: TokenStream) -> TokenStream {
 const JIT_HELPER_ATTRS: &[&str] = &[
     "jit_inline",
     "elidable",
+    "elidable_promote",
     "dont_look_inside",
+    "unroll_safe",
+    "loop_invariant",
+    "not_in_trace",
+    "look_inside_iff",
+    "oopspec",
     "jit_may_force",
     "jit_release_gil",
     "jit_loop_invariant",
@@ -1197,9 +1381,11 @@ fn discover_helpers(items: &[syn::Item]) -> Vec<DiscoveredHelper> {
 
 /// Module-level automatic helper discovery for JIT-annotated functions.
 ///
-/// Place `#[jit_module]` on a `mod` block containing `#[jit_inline]`,
-/// `#[elidable]`, `#[dont_look_inside]`, `#[jit_may_force]`,
-/// `#[jit_release_gil]`, or `#[jit_loop_invariant]` functions.
+/// Place `#[jit_module]` on a `mod` block containing JIT-annotated functions:
+/// `#[elidable]`, `#[elidable_promote]`, `#[dont_look_inside]`,
+/// `#[unroll_safe]`, `#[loop_invariant]`, `#[not_in_trace]`,
+/// `#[look_inside_iff]`, `#[oopspec]`, `#[jit_inline]`,
+/// `#[jit_may_force]`, `#[jit_release_gil]`, `#[jit_loop_invariant]`.
 /// The macro scans all items and generates a hidden registry constant
 /// listing discovered helpers and their attributes.
 ///

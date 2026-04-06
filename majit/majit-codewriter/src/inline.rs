@@ -418,6 +418,37 @@ fn remap_op_kind(kind: &OpKind, remap: &impl Fn(&ValueId) -> ValueId) -> OpKind 
             result_ty: result_ty.clone(),
         },
         OpKind::VableForce => OpKind::VableForce,
+        OpKind::JitDebug { args } => OpKind::JitDebug {
+            args: args.iter().map(remap).collect(),
+        },
+        OpKind::RecordKnownResult {
+            result_value,
+            descriptor,
+            args_i,
+            args_r,
+            args_f,
+            result_kind,
+        } => OpKind::RecordKnownResult {
+            result_value: remap(result_value),
+            descriptor: descriptor.clone(),
+            args_i: args_i.iter().map(remap).collect(),
+            args_r: args_r.iter().map(remap).collect(),
+            args_f: args_f.iter().map(remap).collect(),
+            result_kind: *result_kind,
+        },
+        OpKind::AssertGreen { value, kind_char } => OpKind::AssertGreen {
+            value: remap(value),
+            kind_char: *kind_char,
+        },
+        OpKind::CurrentTraceLength => OpKind::CurrentTraceLength,
+        OpKind::IsConstant { value, kind_char } => OpKind::IsConstant {
+            value: remap(value),
+            kind_char: *kind_char,
+        },
+        OpKind::IsVirtual { value, kind_char } => OpKind::IsVirtual {
+            value: remap(value),
+            kind_char: *kind_char,
+        },
         OpKind::Live => OpKind::Live,
         OpKind::CallElidable {
             descriptor,
@@ -490,6 +521,34 @@ fn remap_op_kind(kind: &OpKind, remap: &impl Fn(&ValueId) -> ValueId) -> OpKind 
             reds_f: reds_f.iter().map(remap).collect(),
             result_kind: *result_kind,
         },
+        OpKind::ConditionalCall {
+            condition,
+            descriptor,
+            args_i,
+            args_r,
+            args_f,
+        } => OpKind::ConditionalCall {
+            condition: remap(condition),
+            descriptor: descriptor.clone(),
+            args_i: args_i.iter().map(remap).collect(),
+            args_r: args_r.iter().map(remap).collect(),
+            args_f: args_f.iter().map(remap).collect(),
+        },
+        OpKind::ConditionalCallValue {
+            value,
+            descriptor,
+            args_i,
+            args_r,
+            args_f,
+            result_kind,
+        } => OpKind::ConditionalCallValue {
+            value: remap(value),
+            descriptor: descriptor.clone(),
+            args_i: args_i.iter().map(remap).collect(),
+            args_r: args_r.iter().map(remap).collect(),
+            args_f: args_f.iter().map(remap).collect(),
+            result_kind: *result_kind,
+        },
         OpKind::Unknown { kind } => OpKind::Unknown { kind: kind.clone() },
     }
 }
@@ -534,6 +593,7 @@ pub fn op_value_refs(kind: &OpKind) -> Vec<ValueId> {
         OpKind::Input { .. }
         | OpKind::ConstInt(_)
         | OpKind::VableForce
+        | OpKind::CurrentTraceLength
         | OpKind::Live
         | OpKind::Unknown { .. } => {
             vec![]
@@ -550,7 +610,11 @@ pub fn op_value_refs(kind: &OpKind) -> Vec<ValueId> {
         } => vec![*base, *index, *value],
         OpKind::Call { args, .. } => args.clone(),
         OpKind::GuardTrue { cond } | OpKind::GuardFalse { cond } => vec![*cond],
-        OpKind::GuardValue { value, .. } => vec![*value],
+        OpKind::GuardValue { value, .. }
+        | OpKind::AssertGreen { value, .. }
+        | OpKind::IsConstant { value, .. }
+        | OpKind::IsVirtual { value, .. } => vec![*value],
+        OpKind::JitDebug { args, .. } => args.clone(),
         OpKind::VableFieldRead { .. } => vec![],
         OpKind::VableFieldWrite { value, .. } => vec![*value],
         OpKind::VableArrayRead { elem_index, .. } => vec![*elem_index],
@@ -584,6 +648,39 @@ pub fn op_value_refs(kind: &OpKind) -> Vec<ValueId> {
             ..
         } => {
             let mut refs = args_i.clone();
+            refs.extend(args_r);
+            refs.extend(args_f);
+            refs
+        }
+        OpKind::ConditionalCall {
+            condition,
+            args_i,
+            args_r,
+            args_f,
+            ..
+        } => {
+            let mut refs = vec![*condition];
+            refs.extend(args_i);
+            refs.extend(args_r);
+            refs.extend(args_f);
+            refs
+        }
+        OpKind::ConditionalCallValue {
+            value,
+            args_i,
+            args_r,
+            args_f,
+            ..
+        }
+        | OpKind::RecordKnownResult {
+            result_value: value,
+            args_i,
+            args_r,
+            args_f,
+            ..
+        } => {
+            let mut refs = vec![*value];
+            refs.extend(args_i);
             refs.extend(args_r);
             refs.extend(args_f);
             refs

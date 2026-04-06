@@ -15,18 +15,20 @@ use super::{
     BC_CALL_MAY_FORCE_INT, BC_CALL_MAY_FORCE_REF, BC_CALL_MAY_FORCE_VOID, BC_CALL_PURE_FLOAT,
     BC_CALL_PURE_INT, BC_CALL_PURE_REF, BC_CALL_REF, BC_CALL_RELEASE_GIL_FLOAT,
     BC_CALL_RELEASE_GIL_INT, BC_CALL_RELEASE_GIL_REF, BC_CALL_RELEASE_GIL_VOID,
-    BC_COPY_FROM_BOTTOM, BC_DUP_STACK, BC_GETARRAYITEM_VABLE_F, BC_GETARRAYITEM_VABLE_I,
+    BC_COND_CALL_VALUE_INT, BC_COND_CALL_VALUE_REF, BC_COND_CALL_VOID, BC_COPY_FROM_BOTTOM,
+    BC_DUP_STACK, BC_FLOAT_GUARD_VALUE, BC_GETARRAYITEM_VABLE_F, BC_GETARRAYITEM_VABLE_I,
     BC_GETARRAYITEM_VABLE_R, BC_GETFIELD_VABLE_F, BC_GETFIELD_VABLE_I, BC_GETFIELD_VABLE_R,
     BC_HINT_FORCE_VIRTUALIZABLE, BC_INLINE_CALL, BC_INT_GUARD_VALUE, BC_JIT_MERGE_POINT, BC_JUMP,
     BC_JUMP_TARGET, BC_LOAD_CONST_F, BC_LOAD_CONST_I, BC_LOAD_CONST_R, BC_LOAD_STATE_ARRAY,
     BC_LOAD_STATE_FIELD, BC_LOAD_STATE_VARRAY, BC_MOVE_F, BC_MOVE_I, BC_MOVE_R, BC_PEEK_I,
     BC_POP_DISCARD, BC_POP_F, BC_POP_I, BC_POP_R, BC_PUSH_F, BC_PUSH_I, BC_PUSH_R, BC_PUSH_TO,
-    BC_RECORD_BINOP_F, BC_RECORD_BINOP_I, BC_RECORD_UNARY_F, BC_RECORD_UNARY_I, BC_REF_GUARD_VALUE,
-    BC_REQUIRE_STACK, BC_RESIDUAL_CALL_VOID, BC_SET_SELECTED, BC_SETARRAYITEM_VABLE_F,
-    BC_SETARRAYITEM_VABLE_I, BC_SETARRAYITEM_VABLE_R, BC_SETFIELD_VABLE_F, BC_SETFIELD_VABLE_I,
-    BC_SETFIELD_VABLE_R, BC_STORE_DOWN, BC_STORE_STATE_ARRAY, BC_STORE_STATE_FIELD,
-    BC_STORE_STATE_VARRAY, BC_SWAP_STACK, JitArgKind, JitCallArg, JitCallTarget, JitCode,
-    MAX_HOST_CALL_ARITY, MIFrame, MIFrameStack,
+    BC_RECORD_BINOP_F, BC_RECORD_BINOP_I, BC_RECORD_KNOWN_RESULT_INT, BC_RECORD_KNOWN_RESULT_REF,
+    BC_RECORD_UNARY_F, BC_RECORD_UNARY_I, BC_REF_GUARD_VALUE, BC_REQUIRE_STACK,
+    BC_RESIDUAL_CALL_VOID, BC_SET_SELECTED, BC_SETARRAYITEM_VABLE_F, BC_SETARRAYITEM_VABLE_I,
+    BC_SETARRAYITEM_VABLE_R, BC_SETFIELD_VABLE_F, BC_SETFIELD_VABLE_I, BC_SETFIELD_VABLE_R,
+    BC_STORE_DOWN, BC_STORE_STATE_ARRAY, BC_STORE_STATE_FIELD, BC_STORE_STATE_VARRAY,
+    BC_SWAP_STACK, JitArgKind, JitCallArg, JitCallTarget, JitCode, MAX_HOST_CALL_ARITY, MIFrame,
+    MIFrameStack,
 };
 use crate::{SymbolicStack, TraceAction, TraceCtx};
 
@@ -1893,6 +1895,113 @@ where
                     }
                 }
             }
+            // ── conditional_call / record_known_result (jtransform.py:1665, 292) ──
+            BC_COND_CALL_VOID
+            | BC_COND_CALL_VALUE_INT
+            | BC_COND_CALL_VALUE_REF
+            | BC_RECORD_KNOWN_RESULT_INT
+            | BC_RECORD_KNOWN_RESULT_REF => {
+                let (first_reg, fn_ptr_idx, arg_regs, dst) = {
+                    let frame = self.frames.current_mut();
+                    let first_reg = frame.next_u16();
+                    let fn_ptr_idx = frame.next_u16() as usize;
+                    let num_args = frame.next_u8() as usize;
+                    let mut arg_regs = Vec::with_capacity(num_args);
+                    for _ in 0..num_args {
+                        let kind = JitArgKind::decode(frame.next_u8());
+                        let reg = frame.next_u16();
+                        arg_regs.push(JitCallArg { kind, reg });
+                    }
+                    let dst = if matches!(bytecode, BC_COND_CALL_VALUE_INT | BC_COND_CALL_VALUE_REF)
+                    {
+                        Some(frame.next_u16())
+                    } else {
+                        None
+                    };
+                    (first_reg, fn_ptr_idx, arg_regs, dst)
+                };
+                let mut args = Vec::with_capacity(arg_regs.len());
+                let mut concrete_args = Vec::with_capacity(arg_regs.len());
+                let mut arg_types = Vec::with_capacity(arg_regs.len());
+                for arg_spec in &arg_regs {
+                    let (arg, concrete, arg_type) = self.read_call_arg(*arg_spec);
+                    args.push(arg);
+                    concrete_args.push(concrete);
+                    arg_types.push(arg_type);
+                }
+                let target = self.frames.current_mut().jitcode.fn_ptrs[fn_ptr_idx];
+                let trace_ptr = if target.trace_ptr.is_null() {
+                    target.concrete_ptr
+                } else {
+                    target.trace_ptr
+                };
+                let concrete_ptr = if target.concrete_ptr.is_null() {
+                    trace_ptr
+                } else {
+                    target.concrete_ptr
+                };
+                match bytecode {
+                    BC_COND_CALL_VOID => {
+                        // RPython pyjitpl.py opimpl_conditional_call_ir_v:
+                        //   if condition != 0: call func(args)
+                        let first_val =
+                            self.frames.current_mut().int_values[first_reg as usize].unwrap_or(0);
+                        ctx.cond_call_void_typed(first_val, trace_ptr, &args, &arg_types);
+                        if first_val != 0 {
+                            call_void_function(concrete_ptr, &concrete_args);
+                        }
+                    }
+                    BC_COND_CALL_VALUE_INT => {
+                        // RPython pyjitpl.py opimpl_conditional_call_value_ir_i
+                        let first_val =
+                            self.frames.current_mut().int_values[first_reg as usize].unwrap_or(0);
+                        let result =
+                            ctx.cond_call_value_int_typed(first_val, trace_ptr, &args, &arg_types);
+                        let concrete_result = if first_val == 0 {
+                            call_int_function(concrete_ptr, &concrete_args)
+                        } else {
+                            first_val
+                        };
+                        if let Some(dst) = dst {
+                            self.frames.current_mut().int_values[dst as usize] =
+                                Some(concrete_result);
+                        }
+                        let _ = result;
+                    }
+                    BC_COND_CALL_VALUE_REF => {
+                        // RPython pyjitpl.py opimpl_conditional_call_value_ir_r:
+                        // value is a ref (GC pointer stored as i64 in majit's flat register file).
+                        let first_val =
+                            self.frames.current_mut().int_values[first_reg as usize].unwrap_or(0);
+                        let result =
+                            ctx.cond_call_value_ref_typed(first_val, trace_ptr, &args, &arg_types);
+                        // Refs are stored as i64 addresses in majit — use call_int_function.
+                        let concrete_result = if first_val == 0 {
+                            call_int_function(concrete_ptr, &concrete_args)
+                        } else {
+                            first_val
+                        };
+                        if let Some(dst) = dst {
+                            self.frames.current_mut().int_values[dst as usize] =
+                                Some(concrete_result);
+                        }
+                        let _ = result;
+                    }
+                    BC_RECORD_KNOWN_RESULT_INT => {
+                        // RPython pyjitpl.py opimpl_record_known_result_i:
+                        let result_val =
+                            self.frames.current_mut().int_values[first_reg as usize].unwrap_or(0);
+                        ctx.record_known_result_typed(result_val, trace_ptr, &args, &arg_types);
+                    }
+                    BC_RECORD_KNOWN_RESULT_REF => {
+                        // RPython pyjitpl.py opimpl_record_known_result_r:
+                        let result_val =
+                            self.frames.current_mut().int_values[first_reg as usize].unwrap_or(0);
+                        ctx.record_known_result_typed(result_val, trace_ptr, &args, &arg_types);
+                    }
+                    _ => unreachable!(),
+                }
+            }
             BC_SET_SELECTED => {
                 let const_idx = {
                     let frame = self.frames.current_mut();
@@ -2356,6 +2465,13 @@ where
                 let (opref, concrete) = self.read_ref_reg(src);
                 let promoted = ctx.promote_ref(opref, concrete, 0);
                 self.set_ref_reg(src, Some(promoted), Some(concrete));
+            }
+            // pyjitpl.py:1515 opimpl_float_guard_value = _opimpl_guard_value
+            BC_FLOAT_GUARD_VALUE => {
+                let src = self.frames.current_mut().next_u16() as usize;
+                let (opref, concrete) = self.read_float_reg(src);
+                let promoted = ctx.promote_float(opref, concrete, 0);
+                self.set_float_reg(src, Some(promoted), Some(concrete));
             }
             BC_ABORT => return TraceAction::Abort,
             BC_ABORT_PERMANENT => return TraceAction::AbortPermanent,

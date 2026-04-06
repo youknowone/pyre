@@ -610,15 +610,36 @@ fn build_function_graph(
 }
 
 /// RPython: extract function-level JIT hints from attributes.
-/// Maps #[jit_elidable] → "elidable", #[jit_close_stack] → "close_stack", etc.
+/// Maps JIT hint attributes to effectinfo classification strings.
+///
+/// Recognizes both legacy `jit_*` and RPython-parity names.
+///
+/// For `#[oopspec("spec")]`, returns `"oopspec:spec_string"` so the hint
+/// consumer can extract the spec via `hint.strip_prefix("oopspec:")`.
 fn collect_jit_hints(attrs: &[syn::Attribute]) -> Vec<String> {
     let mut hints = Vec::new();
     for attr in attrs {
         if let Some(ident) = attr.path().get_ident() {
             let name = ident.to_string();
             match name.as_str() {
-                "jit_elidable" => hints.push("elidable".into()),
-                "jit_loop_invariant" => hints.push("loopinvariant".into()),
+                // RPython-parity names (rlib/jit.py)
+                "elidable" | "jit_elidable" => hints.push("elidable".into()),
+                "elidable_promote" => hints.push("elidable".into()),
+                "dont_look_inside" => hints.push("dont_look_inside".into()),
+                "unroll_safe" => hints.push("unroll_safe".into()),
+                "loop_invariant" | "jit_loop_invariant" => {
+                    hints.push("loopinvariant".into());
+                }
+                "not_in_trace" => hints.push("not_in_trace".into()),
+                // rlib/jit.py:250 — `@oopspec(spec)`: extract spec string.
+                "oopspec" => {
+                    if let Ok(lit) = attr.parse_args::<syn::LitStr>() {
+                        hints.push(format!("oopspec:{}", lit.value()));
+                    } else {
+                        hints.push("oopspec".into());
+                    }
+                }
+                // majit-specific
                 "jit_close_stack" => hints.push("close_stack".into()),
                 "jit_cannot_collect" => hints.push("cannot_collect".into()),
                 "jit_gc_effects" => hints.push("gc_effects".into()),
