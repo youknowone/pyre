@@ -1,9 +1,11 @@
 /// The bytecode interpreter for the calc language.
 use crate::bytecode::ByteCode;
+use majit_metainterp::jit;
 use majit_metainterp::record_known_result;
 
-/// Pure comparison — @elidable.
-/// The JIT can constant-fold this when both arguments are known.
+// ── @elidable comparison helpers ──
+// rlib/jit.py:118 — pure functions whose result depends only on args.
+
 #[majit_macros::elidable]
 fn calc_lt(a: i64, b: i64) -> i64 {
     if a < b { 1 } else { 0 }
@@ -29,10 +31,34 @@ fn calc_ge(a: i64, b: i64) -> i64 {
     if a >= b { 1 } else { 0 }
 }
 
+// ── @elidable_promote arithmetic helpers ──
+// rlib/jit.py:180 — promote all args, then call the elidable body.
+
+#[majit_macros::elidable_promote]
+fn calc_add(a: i64, b: i64) -> i64 {
+    a + b
+}
+#[majit_macros::elidable_promote]
+fn calc_sub(a: i64, b: i64) -> i64 {
+    a - b
+}
+
+// ── @not_in_trace debug logging ──
+// rlib/jit.py:260 — call disappears from the final assembler.
+
+#[majit_macros::not_in_trace]
+fn trace_halt(result: i64) {
+    if cfg!(debug_assertions) {
+        eprintln!("[calc] halt with result={result}");
+    }
+}
+
 pub struct CalcInterp {
     stack: Vec<i64>,
     vars: [i64; 26],
     pc: usize,
+    /// Cache of last computed comparison result (rlib/jit.py:1322 pattern).
+    last_cmp_cache: i64,
 }
 
 impl CalcInterp {
@@ -41,6 +67,7 @@ impl CalcInterp {
             stack: Vec::with_capacity(64),
             vars: [0; 26],
             pc: 0,
+            last_cmp_cache: 0,
         }
     }
 
@@ -49,6 +76,7 @@ impl CalcInterp {
         self.stack.clear();
         self.vars = [0; 26];
         self.pc = 0;
+        self.last_cmp_cache = 0;
     }
 
     /// Execute the bytecode program and return the final result.
@@ -70,8 +98,8 @@ impl CalcInterp {
                     let val = self.stack.pop().expect("stack underflow on StoreVar");
                     self.vars[*idx as usize] = val;
                 }
-                ByteCode::Add => self.binop(|a, b| a + b),
-                ByteCode::Sub => self.binop(|a, b| a - b),
+                ByteCode::Add => self.binop_elidable(calc_add),
+                ByteCode::Sub => self.binop_elidable(calc_sub),
                 ByteCode::Mul => self.binop(|a, b| a * b),
                 ByteCode::Div => self.binop(|a, b| a / b),
                 ByteCode::Mod => self.binop(|a, b| a % b),
@@ -95,7 +123,9 @@ impl CalcInterp {
                     println!("{val}");
                 }
                 ByteCode::Halt => {
-                    return self.stack.last().copied().unwrap_or(0);
+                    let result = self.stack.last().copied().unwrap_or(0);
+                    trace_halt(result);
+                    return result;
                 }
             }
         }
@@ -115,6 +145,16 @@ impl CalcInterp {
         self.stack.push(if op(a, b) { 1 } else { 0 });
     }
 
+    /// Arithmetic using @elidable_promote helper + record_known_result.
+    #[inline(always)]
+    fn binop_elidable(&mut self, op: fn(i64, i64) -> i64) {
+        let b = self.stack.pop().expect("stack underflow");
+        let a = self.stack.pop().expect("stack underflow");
+        let result = op(a, b);
+        record_known_result!(result, op, a, b);
+        self.stack.push(result);
+    }
+
     /// Comparison using @elidable helper + record_known_result.
     #[inline(always)]
     fn cmpop_elidable(&mut self, op: fn(i64, i64) -> i64) {
@@ -122,6 +162,9 @@ impl CalcInterp {
         let a = self.stack.pop().expect("stack underflow");
         let result = op(a, b);
         record_known_result!(result, op, a, b);
+        // rlib/jit.py:1322 — conditional_call_elidable: cache pattern.
+        // If the cache already has the right value, skip recomputation.
+        self.last_cmp_cache = jit::conditional_call_elidable(self.last_cmp_cache, || op(a, b));
         self.stack.push(result);
     }
 }

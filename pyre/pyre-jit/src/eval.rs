@@ -964,6 +964,15 @@ pub fn portal_runner(frame: &mut PyFrame) -> pyre_object::PyObjectRef {
     }
 }
 
+/// rlib/jit.py:260 — @not_in_trace: disappears from the final assembler.
+/// Debug aid for tracing which bytecodes are being JITted.
+#[majit_macros::not_in_trace]
+fn trace_jit_bytecode(pc: usize, _instruction_name: &str) {
+    if cfg!(debug_assertions) {
+        eprintln!("[pyre-jit] pc={pc}");
+    }
+}
+
 /// JIT hooks are thin inline checks; all heavy logic is in #[cold] helpers.
 fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
     let code = unsafe { &*frame.code };
@@ -981,6 +990,8 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
         }
 
         let pc = frame.next_instr;
+        // rlib/jit.py:271 — promote PC for per-bytecode specialization.
+        let pc = majit_metainterp::jit::promote(pc);
         let Some((instruction, op_arg)) = pyre_interpreter::decode_instruction_at(code, pc) else {
             return LoopResult::Done(Ok(w_none()));
         };
@@ -1030,6 +1041,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
         }
 
         // ── handle_bytecode (RPython interp_jit.py:90) ──
+        trace_jit_bytecode(pc, "");
         frame.next_instr += 1;
         let next_instr = frame.next_instr;
         if let pyre_interpreter::bytecode::Instruction::Call { argc } = instruction {
