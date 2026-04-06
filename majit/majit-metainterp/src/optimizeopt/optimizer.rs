@@ -550,7 +550,7 @@ impl Optimizer {
                     let field_idx = fields.len();
                     if ctx.skip_flush_mode
                         && !field_ref.is_none()
-                        && field_ref.0 < 10_000
+                        && !ctx.is_constant(field_ref)
                         && ctx
                             .get_ptr_info(field_ref)
                             .map_or(true, |info| !info.is_virtual())
@@ -582,7 +582,7 @@ impl Optimizer {
         // reserve_pos from returning a position that's already used
         // as a virtual head (allocated during import_state).
         for entry in &entries {
-            if !entry.head.is_none() && entry.head.0 < 10_000 {
+            if !entry.head.is_none() && !ctx.is_constant(entry.head) {
                 ctx.next_pos = ctx.next_pos.max(entry.head.0 + 1);
             }
         }
@@ -1570,8 +1570,8 @@ impl Optimizer {
                 .map(|i| {
                     let source = OpRef(i as u32);
                     let target = nia[i];
-                    // Constants (>= CONST_BASE) don't participate in forwarding.
-                    if target.0 >= majit_ir::OpRef::CONST_BASE {
+                    // Constants don't participate in forwarding.
+                    if ctx.is_constant(target) {
                         return source;
                     }
                     // Cross-slot collision: target is another slot's source.
@@ -1750,7 +1750,7 @@ impl Optimizer {
             {
                 let mut seen = std::collections::HashSet::new();
                 for arg in resolved_args.iter_mut() {
-                    if arg.0 >= 10_000 || *arg == OpRef::NONE {
+                    if ctx.is_constant(*arg) || *arg == OpRef::NONE {
                         continue;
                     }
                     if !seen.insert(*arg) {

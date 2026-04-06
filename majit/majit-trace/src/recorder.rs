@@ -1144,12 +1144,12 @@ mod tests {
 
     #[test]
     fn test_recorder_const_int_via_constant_oprefs() {
-        // Constants in majit use OpRef indices >= 10_000.
+        // Constants live in a dedicated pool and keep stable OpRefs.
         // Recording ops that reference constants should preserve them.
         let mut rec = Trace::new();
         let i0 = rec.record_input_arg(Type::Int);
 
-        // Simulate constant references: OpRef(10_000) is a const
+        // Simulate a pooled constant reference.
         let const_ref = OpRef(10_000);
         let add = rec.record_op(OpCode::IntAdd, &[i0, const_ref]);
 
@@ -1157,8 +1157,7 @@ mod tests {
         let trace = rec.get_trace();
 
         assert_eq!(trace.ops[0].args[1], const_ref);
-        // Constant OpRef is preserved through recording
-        assert!(trace.ops[0].args[1].0 >= 10_000);
+        assert!(trace.ops[0].args[1].is_constant());
     }
 
     #[test]

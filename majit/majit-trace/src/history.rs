@@ -27,6 +27,11 @@ pub struct TreeLoop {
 }
 
 impl TreeLoop {
+    #[inline]
+    fn is_runtime_opref(opref: OpRef) -> bool {
+        !opref.is_none() && !opref.is_constant()
+    }
+
     /// Create a new trace from input arguments and operations.
     pub fn new(inputargs: Vec<InputArg>, ops: Vec<Op>) -> Self {
         TreeLoop {
@@ -233,8 +238,7 @@ impl TreeLoop {
         // cut, not in original_boxes. Use BFS for transitive closure: an
         // escaped op's own args may also be escaped.
         let is_pre_cut_ref = |r: &OpRef| -> bool {
-            !r.is_none()
-                && r.0 < 10_000
+            Self::is_runtime_opref(*r)
                 && !original_set.contains(r)
                 && !defined_after_cut.contains(r)
         };
@@ -331,7 +335,7 @@ impl TreeLoop {
         }
 
         let remap_ref = |r: &OpRef| -> OpRef {
-            if r.is_none() || r.0 >= 10_000 {
+            if !Self::is_runtime_opref(*r) {
                 *r
             } else if let Some(&new_ref) = remap.get(r) {
                 new_ref
@@ -389,7 +393,7 @@ impl TreeLoop {
                                 let old_ref = OpRef(*n);
                                 if let Some(&new_ref) = remap.get(&old_ref) {
                                     crate::recorder::SnapshotTagged::Box(new_ref.0, *tp)
-                                } else if old_ref.is_none() || old_ref.0 >= 10_000 {
+                                } else if !Self::is_runtime_opref(old_ref) {
                                     // Constants and NONE pass through unchanged.
                                     t.clone()
                                 } else {
