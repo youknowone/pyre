@@ -1669,23 +1669,30 @@ impl Optimizer {
             ctx.pre_force_jump_args = Some(args.clone());
         }
 
-        // RPython optimizer.py:536-538 / unroll.py:101-103:
-        // JUMP/FINISH is NOT sent through passes (flush=False).
-        // RPython: _propagate_all_forward stores JUMP in last_op,
-        // then returns BasicLoopInfo(jump_op=last_op) without sending
-        // it through send_extra_operation. The caller (export_state)
-        // handles virtual args via force_box_for_end_of_preamble.
+        // RPython optimizer.py:552-556 (_propagate_all_forward):
+        //     if flush:
+        //         self.flush()
+        //         if last_op:
+        //             self.send_extra_operation(last_op)
+        //
+        // flush=False is used ONLY by optimize_preamble (Phase 1) and
+        // optimize_peeled_loop (Phase 2) — terminal_op is returned in
+        // BasicLoopInfo.jump_op for unroll.rs to handle.
+        //
+        // flush=True (default) is used by optimize_loop (compile_loop) and
+        // finish_and_compile — terminal op is sent through passes and ends
+        // up in new_operations naturally.
         if let Some(mut terminal_op) = last_op {
+            // Follow forwarding on terminal op args regardless of flush mode.
+            for arg in &mut terminal_op.args {
+                *arg = ctx.get_box_replacement(*arg);
+            }
             if self.skip_flush {
-                // Phase 2: JUMP not sent through passes.
-                for arg in &mut terminal_op.args {
-                    *arg = ctx.get_box_replacement(*arg);
-                }
+                // flush=False: store for caller to consume.
                 self.terminal_op = Some(terminal_op);
             } else {
-                // Phase 1: send through passes (forces virtual args).
-                // TODO: port RPython flush=False to keep virtuals alive.
-                self.propagate_one(&terminal_op, &mut ctx);
+                // flush=True: send through passes (optimizer.py:555-556).
+                self.send_extra_operation(&terminal_op, &mut ctx);
             }
         }
 
@@ -2206,16 +2213,18 @@ impl Optimizer {
         // unroll.py:193: info, ops = self.propagate_all_forward(trace, ...)
         let optimized_ops = self.optimize_with_constants_and_inputs(ops, constants, num_inputs);
 
-        // Check if trace ends with JUMP
-        let ends_with_jump = optimized_ops
-            .last()
+        // RPython flush=False: JUMP is in terminal_op, not in optimized_ops.
+        let terminal_jump = self.terminal_op.take();
+        let has_jump = terminal_jump
+            .as_ref()
             .map_or(false, |op| op.opcode == OpCode::Jump);
 
-        if !ends_with_jump {
+        if !has_jump {
             return (optimized_ops, false);
         }
 
-        let jump_args = optimized_ops.last().unwrap().args.to_vec();
+        let terminal_jump = terminal_jump.unwrap();
+        let jump_args = terminal_jump.args.to_vec();
 
         // unroll.py:198-200: not inline_short_preamble → jump_to_preamble
         // RPython calls send_extra_operation(jump_op) which forces virtuals
@@ -2227,10 +2236,10 @@ impl Optimizer {
                     OptContext::with_num_inputs(32, ni)
                 });
                 // unroll.py:240-242: jump_to_preamble → send_extra_operation
-                let mut jump_op = optimized_ops.last().unwrap().clone();
+                let mut jump_op = terminal_jump.clone();
                 jump_op.descr = Some(preamble_token.as_jump_target_descr());
                 self.send_extra_operation(&jump_op, &mut ctx);
-                let mut result = optimized_ops[..optimized_ops.len() - 1].to_vec();
+                let mut result = optimized_ops;
                 result.extend(ctx.new_operations.drain(..));
                 return (result, false);
             }
@@ -2289,10 +2298,10 @@ impl Optimizer {
             Err(()) => {
                 if let Some(preamble_token) = front_target_tokens.first() {
                     ctx.clear_newoperations();
-                    let mut jump_op = optimized_ops.last().unwrap().clone();
+                    let mut jump_op = terminal_jump.clone();
                     jump_op.descr = Some(preamble_token.as_jump_target_descr());
                     self.send_extra_operation(&jump_op, &mut ctx);
-                    let mut result = optimized_ops[..optimized_ops.len() - 1].to_vec();
+                    let mut result = optimized_ops;
                     result.extend(ctx.new_operations.drain(..));
                     return (result, false);
                 }
@@ -2302,7 +2311,7 @@ impl Optimizer {
 
         // unroll.py:212-213: vs is None → matched, JUMP redirected
         if vs.is_none() {
-            let mut result = optimized_ops[..optimized_ops.len() - 1].to_vec();
+            let mut result = optimized_ops;
             result.extend(ctx.new_operations.drain(..));
             return (result, false);
         }
@@ -2336,7 +2345,7 @@ impl Optimizer {
 
         // unroll.py:226-227: vs is None → matched with forced boxes
         if vs2.is_none() {
-            let mut result = optimized_ops[..optimized_ops.len() - 1].to_vec();
+            let mut result = optimized_ops;
             result.extend(ctx.new_operations.drain(..));
             return (result, false);
         }
@@ -2349,10 +2358,10 @@ impl Optimizer {
         }
         if let Some(preamble_token) = front_target_tokens.first() {
             ctx.clear_newoperations();
-            let mut jump_op = optimized_ops.last().unwrap().clone();
+            let mut jump_op = terminal_jump.clone();
             jump_op.descr = Some(preamble_token.as_jump_target_descr());
             self.send_extra_operation(&jump_op, &mut ctx);
-            let mut result = optimized_ops[..optimized_ops.len() - 1].to_vec();
+            let mut result = optimized_ops;
             result.extend(ctx.new_operations.drain(..));
             (result, false)
         } else {
