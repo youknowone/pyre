@@ -5,8 +5,10 @@ use majit_backend::{
     Backend, CompiledTraceInfo, ExitFrameLayout, ExitRecoveryLayout, FailDescrLayout, JitCellToken,
     TerminalExitLayout,
 };
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), not(feature = "dynasm")))]
 pub(crate) use majit_backend_cranelift::CraneliftBackend as BackendImpl;
+#[cfg(feature = "dynasm")]
+pub(crate) use majit_backend_dynasm::runner::DynasmBackend as BackendImpl;
 #[cfg(target_arch = "wasm32")]
 pub(crate) use majit_backend_wasm::WasmBackend as BackendImpl;
 use majit_ir::{FailDescr, GcRef, InputArg, Op, OpCode, OpRef, Type, Value};
@@ -4137,7 +4139,7 @@ impl<M: Clone> MetaInterp<M> {
         let exit_types = descr.fail_arg_types();
         let exit_arity = exit_types.len();
         let compiled = self.compiled_loops.get(&green_key).unwrap();
-        let exit_layout = Self::trace_for_exit(compiled, trace_id)
+        let mut exit_layout = Self::trace_for_exit(compiled, trace_id)
             .and_then(|(trace_id, trace)| {
                 Self::compiled_exit_layout_from_trace(trace, green_key, trace_id, fail_index)
             })
@@ -4161,6 +4163,12 @@ impl<M: Clone> MetaInterp<M> {
                 rd_virtuals: None,
                 rd_pendingfields: None,
             });
+        // RPython: deadframe has ALL jitframe slots accessible.
+        // If the backend's descr covers more slots than the trace layout,
+        // extend exit_layout.exit_types to match (conservative Int for extras).
+        if exit_types.len() > exit_layout.exit_types.len() {
+            exit_layout.exit_types.resize(exit_types.len(), Type::Int);
+        }
         let mut values = Vec::with_capacity(exit_arity);
         let mut typed_values = Vec::with_capacity(exit_arity);
         for (i, &tp) in exit_types.iter().enumerate() {
@@ -4301,7 +4309,7 @@ impl<M: Clone> MetaInterp<M> {
         let exit_types = descr.fail_arg_types();
         let exit_arity = exit_types.len();
         let compiled = self.compiled_loops.get(&green_key).unwrap();
-        let exit_layout = Self::trace_for_exit(compiled, trace_id)
+        let mut exit_layout = Self::trace_for_exit(compiled, trace_id)
             .and_then(|(trace_id, trace)| {
                 Self::compiled_exit_layout_from_trace(trace, green_key, trace_id, fail_index)
             })
@@ -4325,6 +4333,12 @@ impl<M: Clone> MetaInterp<M> {
                 rd_virtuals: None,
                 rd_pendingfields: None,
             });
+        // RPython: deadframe has ALL jitframe slots accessible.
+        // If the backend's descr covers more slots than the trace layout,
+        // extend exit_layout.exit_types to match (conservative Int for extras).
+        if exit_types.len() > exit_layout.exit_types.len() {
+            exit_layout.exit_types.resize(exit_types.len(), Type::Int);
+        }
         let mut values = Vec::with_capacity(exit_arity);
         let mut typed_values = Vec::with_capacity(exit_arity);
         for (i, &tp) in exit_types.iter().enumerate() {

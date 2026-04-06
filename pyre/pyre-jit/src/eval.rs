@@ -784,7 +784,7 @@ fn eval_with_jit_inner(frame: &mut PyFrame) -> PyResult {
     #[cfg(not(target_arch = "wasm32"))]
     crate::call_jit::install_jit_call_bridge();
     init_callbacks();
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(feature = "cranelift")]
     majit_backend_cranelift::register_rebuild_state_after_failure(rebuild_state_after_failure);
     frame.fix_array_ptrs();
     // Set CURRENT_FRAME so zero-arg super() can find __class__ in the caller.
@@ -1231,6 +1231,14 @@ fn resume_in_blackhole_from_exit_layout(
 ) -> crate::call_jit::BlackholeResult {
     use crate::call_jit::BlackholeResult;
 
+    if majit_metainterp::majit_log_enabled() {
+        eprintln!(
+            "[dynasm-debug] resume_in_blackhole: raw_values.len={} exit_types.len={} rd_numb={:?}",
+            raw_values.len(),
+            exit_layout.exit_types.len(),
+            exit_layout.rd_numb.as_ref().map(|n| n.len())
+        );
+    }
     build_blackhole_frames_from_deadframe(raw_values, exit_layout);
     let guard_frames = take_last_guard_frames();
     if let Some(ref frames) = guard_frames {
@@ -2844,8 +2852,16 @@ fn build_resumed_frames(
     // now encodes fail_args[0..3] as vable_array to maintain this invariant.
 
     let mut all_values: Vec<Vec<Value>> = Vec::with_capacity(frames.len());
-    for frame in &frames {
-        // RPython parity: no header prepend. Values = slot registers only.
+    for (fidx, frame) in frames.iter().enumerate() {
+        if majit_metainterp::majit_log_enabled() {
+            eprintln!(
+                "[dynasm-debug] _prepare_next_section frame={}/{} pc={} values_len={}",
+                fidx,
+                frames.len(),
+                frame.pc,
+                frame.values.len()
+            );
+        }
         let mut values = Vec::new();
         _prepare_next_section(
             frame,
@@ -2864,8 +2880,17 @@ fn build_resumed_frames(
     // stale values. Disabled for RPython parity.
     // resume.py:993 _prepare_pendingfields: apply ONCE for the whole reader.
     // No header — values = slot registers only.
+    if majit_metainterp::majit_log_enabled() {
+        eprintln!(
+            "[dynasm-debug] before replay_pending_fields, frames={}",
+            all_values.len()
+        );
+    }
     if let Some(first_values) = all_values.first() {
         replay_pending_fields(first_values, exit_layout);
+    }
+    if majit_metainterp::majit_log_enabled() {
+        eprintln!("[dynasm-debug] after replay_pending_fields");
     }
 
     // opencoder.py:722 _list_of_boxes_virtualizable: snapshot reorders
@@ -2939,6 +2964,12 @@ fn build_resumed_frames(
         // resume.py:1339 jitcodes[jitcode_pos]:
         // Outermost frame: code from frame_ptr. Inner frames: code from
         // jitcode_index registry (no live PyFrame for inlined calls).
+        if majit_metainterp::majit_log_enabled() {
+            eprintln!(
+                "[dynasm-debug] frame_ptr={:?} py_pc={} idx={}",
+                frame_ptr, py_pc, idx
+            );
+        }
         let code = if !frame_ptr.is_null() {
             unsafe { (*frame_ptr).code }
         } else {

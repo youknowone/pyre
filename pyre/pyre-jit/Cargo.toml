@@ -6,6 +6,11 @@ license.workspace = true
 repository.workspace = true
 description = "JIT compiler integration for pyre interpreter"
 
+[features]
+jit = []  # meta feature: enabled by cranelift or dynasm
+cranelift = ["jit", "majit-backend-cranelift"]
+dynasm = ["jit", "majit-metainterp/dynasm"]
+
 [dependencies]
 pyre-object = { workspace = true }
 pyre-interpreter = { workspace = true }
@@ -15,9 +20,7 @@ majit-backend = { workspace = true }
 majit-trace = { workspace = true }
 majit-gc = { workspace = true }
 pyre-jit-trace = { workspace = true }
-
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-majit-backend-cranelift = { workspace = true }
+majit-backend-cranelift = { workspace = true, optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 majit-backend-wasm = { workspace = true }
