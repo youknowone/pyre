@@ -1273,20 +1273,15 @@ impl MIFrame {
             .collect()
     }
 
+    /// pyjitpl.py:1916-1927 implement_guard_value parity.
+    /// executor.py:544-551 constant_from_op(box): dispatches on box.type.
     pub(crate) fn guard_value(&mut self, ctx: &mut TraceCtx, value: OpRef, expected: i64) {
-        let expected_ref = ctx.const_int(expected);
+        let expected_ref = match self.value_type(value) {
+            majit_ir::Type::Ref => ctx.const_ref(expected),
+            _ => ctx.const_int(expected),
+        };
         self.record_guard(ctx, OpCode::GuardValue, &[value, expected_ref]);
-        // pyjitpl.py:3512: replace_box — update heapcache to map old box
-        // to the constant, so subsequent field reads on this value use the
-        // constant directly.
-        ctx.heap_cache_mut().replace_box(value, expected_ref);
-    }
-
-    /// Guard value == expected Ref constant (heap pointer).
-    /// Uses const_ref so guard fail_args preserve the Ref type.
-    pub(crate) fn guard_value_ref(&mut self, ctx: &mut TraceCtx, value: OpRef, expected: i64) {
-        let expected_ref = ctx.const_ref(expected);
-        self.record_guard(ctx, OpCode::GuardValue, &[value, expected_ref]);
+        // pyjitpl.py:3512: replace_box
         ctx.heap_cache_mut().replace_box(value, expected_ref);
     }
 
@@ -2749,7 +2744,7 @@ impl MIFrame {
                 if args.len() == 1 {
                     let c_arg0 = concrete_args.first().copied().unwrap_or(PY_NULL);
                     self.with_ctx(|this, ctx| {
-                        this.guard_value_ref(ctx, callable, concrete_callable as i64)
+                        this.guard_value(ctx, callable, concrete_callable as i64)
                     });
                     if builtin_name == "type" {
                         return self.direct_type_value(callable, args[0], c_arg0);
@@ -2764,7 +2759,7 @@ impl MIFrame {
                     let c_arg0 = concrete_args.first().copied().unwrap_or(PY_NULL);
                     let c_arg1 = concrete_args.get(1).copied().unwrap_or(PY_NULL);
                     self.with_ctx(|this, ctx| {
-                        this.guard_value_ref(ctx, callable, concrete_callable as i64)
+                        this.guard_value(ctx, callable, concrete_callable as i64)
                     });
                     return self
                         .direct_isinstance_value(callable, args[0], args[1], c_arg0, c_arg1);
@@ -2772,7 +2767,7 @@ impl MIFrame {
                     let c_arg0 = concrete_args.first().copied().unwrap_or(PY_NULL);
                     let c_arg1 = concrete_args.get(1).copied().unwrap_or(PY_NULL);
                     self.with_ctx(|this, ctx| {
-                        this.guard_value_ref(ctx, callable, concrete_callable as i64)
+                        this.guard_value(ctx, callable, concrete_callable as i64)
                     });
                     return self
                         .direct_minmax_value(callable, args[0], args[1], false, c_arg0, c_arg1);
@@ -2780,13 +2775,13 @@ impl MIFrame {
                     let c_arg0 = concrete_args.first().copied().unwrap_or(PY_NULL);
                     let c_arg1 = concrete_args.get(1).copied().unwrap_or(PY_NULL);
                     self.with_ctx(|this, ctx| {
-                        this.guard_value_ref(ctx, callable, concrete_callable as i64)
+                        this.guard_value(ctx, callable, concrete_callable as i64)
                     });
                     return self
                         .direct_minmax_value(callable, args[0], args[1], true, c_arg0, c_arg1);
                 }
                 return self.with_ctx(|this, ctx| {
-                    this.guard_value_ref(ctx, callable, concrete_callable as i64);
+                    this.guard_value(ctx, callable, concrete_callable as i64);
                     let boxed_args = box_args_for_python_helper(this, ctx, args);
                     crate::helpers::emit_trace_call_known_builtin(ctx, callable, &boxed_args)
                 });
@@ -2880,7 +2875,7 @@ impl MIFrame {
                 if callee_prefers_function_entry && !is_self_recursive {
                     let call_pc = self.fallthrough_pc.saturating_sub(1);
                     return self.with_ctx(|this, ctx| {
-                        this.guard_value_ref(ctx, callable, concrete_callable as i64);
+                        this.guard_value(ctx, callable, concrete_callable as i64);
                         let boxed_args = box_args_for_python_helper(this, ctx, args);
                         let result = crate::helpers::emit_trace_call_known_function(
                             ctx,
@@ -2979,7 +2974,7 @@ impl MIFrame {
                     {
                         return self.with_ctx(|this, ctx| {
                             if !is_self_recursive {
-                                this.guard_value_ref(ctx, callable, concrete_callable as i64);
+                                this.guard_value(ctx, callable, concrete_callable as i64);
                             }
                             let self_recursive_raw_arg = if is_self_recursive
                                 && nargs == 1
@@ -3100,7 +3095,7 @@ impl MIFrame {
                         let Some(token_number) = driver.get_loop_token_number(callee_key) else {
                             let call_pc = self.fallthrough_pc.saturating_sub(1);
                             return self.with_ctx(|this, ctx| {
-                                this.guard_value_ref(ctx, callable, concrete_callable as i64);
+                                this.guard_value(ctx, callable, concrete_callable as i64);
                                 let result = crate::helpers::emit_trace_call_known_function(
                                     ctx,
                                     this.frame(),
@@ -3131,7 +3126,7 @@ impl MIFrame {
                                 // Self-recursive: no callable guard needed (same function).
                                 // Non-self-recursive: guard on callable value.
                                 if !is_self_recursive {
-                                    this.guard_value_ref(ctx, callable, concrete_callable as i64);
+                                    this.guard_value(ctx, callable, concrete_callable as i64);
                                 }
                                 let callee_frame = if args.len() == 1 {
                                     let (helper, helper_arg_types) = one_arg_callee_frame_helper(
@@ -3242,7 +3237,7 @@ impl MIFrame {
 
                 let call_pc = self.fallthrough_pc.saturating_sub(1);
                 return self.with_ctx(|this, ctx| {
-                    this.guard_value_ref(ctx, callable, concrete_callable as i64);
+                    this.guard_value(ctx, callable, concrete_callable as i64);
                     let boxed_args = box_args_for_python_helper(this, ctx, args);
                     let result = crate::helpers::emit_trace_call_known_function(
                         ctx,
@@ -3273,7 +3268,7 @@ impl MIFrame {
         use pyre_interpreter::pyframe::PyFrame;
 
         self.with_ctx(|this, ctx| {
-            this.guard_value_ref(ctx, callable, concrete_callable as i64);
+            this.guard_value(ctx, callable, concrete_callable as i64);
         });
 
         let concrete_args: Vec<PyObjectRef> = passed_concrete_args.to_vec();
@@ -3468,7 +3463,7 @@ impl MIFrame {
         let call_pc = self.fallthrough_pc.saturating_sub(1);
 
         let result = self.with_ctx(|this, ctx| {
-            this.guard_value_ref(ctx, callable, concrete_callable as i64);
+            this.guard_value(ctx, callable, concrete_callable as i64);
 
             if args.len() == 1 {
                 let result = if matches!(concrete_arg0, Some(arg) if unsafe { is_int(arg) }) {
