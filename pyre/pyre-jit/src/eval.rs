@@ -964,8 +964,8 @@ pub fn portal_runner(frame: &mut PyFrame) -> pyre_object::PyObjectRef {
     }
 }
 
-/// rlib/jit.py:260 — @not_in_trace: disappears from the final assembler.
-/// Debug aid for tracing which bytecodes are being JITted.
+/// rlib/jit.py:260 — `@not_in_trace`: call disappears from the final assembler.
+/// Still called during interpretation and tracing, but not in compiled code.
 #[majit_macros::not_in_trace]
 fn trace_jit_bytecode(pc: usize, _instruction_name: &str) {
     if cfg!(debug_assertions) {
@@ -983,6 +983,8 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
     // Cannot call codewriter::is_portal() here as it triggers
     // lazy jitcode compilation which interferes with JIT state.
     let is_portal: bool = &*code.obj_name != "<module>";
+    // rlib/jit.py — promote is_portal so the JIT folds the portal-check branch.
+    let is_portal = majit_metainterp::jit::promote(is_portal);
 
     loop {
         if frame.next_instr >= code.instructions.len() {
@@ -992,6 +994,8 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
         let pc = frame.next_instr;
         // rlib/jit.py:271 — promote PC for per-bytecode specialization.
         let pc = majit_metainterp::jit::promote(pc);
+        // pyframe.py:129 — promote pycode so the JIT specializes per code object.
+        majit_metainterp::jit::assert_green(code);
         let Some((instruction, op_arg)) = pyre_interpreter::decode_instruction_at(code, pc) else {
             return LoopResult::Done(Ok(w_none()));
         };
