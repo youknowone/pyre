@@ -282,6 +282,13 @@ pub fn emit_trace_unary_negative_value(ctx: &mut TraceCtx, value: OpRef) -> OpRe
     )
 }
 
+/// rlib/jit.py:260 — @not_in_trace: disappears from compiled traces.
+/// Interpreter-only debug callback; the JIT elides this entirely.
+#[majit_macros::not_in_trace]
+pub fn jit_trace_debug_marker(_pc: usize, _opcode_name: &str) {
+    // Called from interpreter path for debugging. Compiled traces skip this.
+}
+
 pub fn emit_trace_unary_invert_value(ctx: &mut TraceCtx, value: OpRef) -> OpRef {
     emit_trace_call_ref_typed(
         ctx,

@@ -11,8 +11,8 @@ use majit_metainterp::{TraceAction, TraceCtx};
 use pyre_interpreter::bytecode::{BinaryOperator, CodeObject, ComparisonOperator, Instruction};
 
 /// lloperation.py:261 — "don't implement float_pow, use math.pow instead".
-/// ll_math_pow has EF_CAN_RAISE → call_may_force, not elidable.
-/// Extracted to module level for stable function pointer identity.
+/// Pure math operation — elidable (constant-foldable when both args are known).
+#[majit_macros::elidable]
 extern "C" fn float_pow_elidable(x: f64, y: f64) -> f64 {
     x.powf(y)
 }
