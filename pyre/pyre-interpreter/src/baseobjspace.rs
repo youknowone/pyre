@@ -298,28 +298,66 @@ unsafe fn float_truediv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     Ok(w_float_new(as_float(a) / vb))
 }
 
+/// floatobject.py:508-512: descr_floordiv → _divmod_w()[0].
 unsafe fn float_floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    let vb = as_float(b);
-    if vb == 0.0 {
-        return Err(PyError::zero_division("float floor division by zero"));
-    }
-    Ok(w_float_new((as_float(a) / vb).floor()))
+    let (floordiv, _mod) = float_divmod_w(as_float(a), as_float(b))?;
+    Ok(w_float_new(floordiv))
 }
 
+/// floatobject.py:520-540: descr_mod with math_fmod + sign correction.
 unsafe fn float_mod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    let vb = as_float(b);
-    if vb == 0.0 {
+    let x = as_float(a);
+    let y = as_float(b);
+    if y == 0.0 {
+        // floatobject.py:526
         return Err(PyError::zero_division("float modulo"));
     }
-    let va = as_float(a);
-    // Python modulo: result has the sign of the divisor
-    let r = va % vb;
-    let result = if r != 0.0 && ((r > 0.0) != (vb > 0.0)) {
-        r + vb
+    let mut m = x % y; // fmod
+    if m != 0.0 {
+        // floatobject.py:529-531: ensure remainder has same sign as denominator
+        if (y < 0.0) != (m < 0.0) {
+            m += y;
+        }
     } else {
-        r
+        // floatobject.py:536-538: signed zero — copysign(0.0, y)
+        m = f64::copysign(0.0, y);
+    }
+    Ok(w_float_new(m))
+}
+
+/// floatobject.py:758-793: _divmod_w.
+fn float_divmod_w(x: f64, y: f64) -> Result<(f64, f64), PyError> {
+    if y == 0.0 {
+        // floatobject.py:761
+        return Err(PyError::zero_division("float modulo"));
+    }
+    let mut m = x % y; // fmod
+    // floatobject.py:767: div = (x - mod) / y
+    let mut div = (x - m) / y;
+    if m != 0.0 {
+        // floatobject.py:769-771: sign correction
+        if (y < 0.0) != (m < 0.0) {
+            m += y;
+            div -= 1.0;
+        }
+    } else {
+        // floatobject.py:776-778: signed zero
+        // "mod *= mod" hides "+0" from optimizer, then negate if y < 0
+        m = m * m; // hide from optimizer
+        if y < 0.0 {
+            m = -m;
+        }
+    }
+    // floatobject.py:784-790: snap quotient to nearest integral value
+    let floordiv = if div != 0.0 {
+        let f = div.floor();
+        if div - f > 0.5 { f + 1.0 } else { f }
+    } else {
+        // floatobject.py:789-790: zero with sign of true quotient
+        let d = div * div; // hide from optimizer
+        d * x / y
     };
-    Ok(w_float_new(result))
+    Ok((floordiv, m))
 }
 
 // ── Power ────────────────────────────────────────────────────────────

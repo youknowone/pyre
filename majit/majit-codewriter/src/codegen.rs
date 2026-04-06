@@ -304,10 +304,11 @@ pub fn concrete_float_binop(op: BinaryOperator, lhs: f64, rhs: f64) -> Option<f6
         BinaryOperator::TrueDivide | BinaryOperator::InplaceTrueDivide if rhs != 0.0 => {
             Some(lhs / rhs)
         }
+        // floatobject.py:508: descr_floordiv → _divmod_w()[0]
         BinaryOperator::FloorDivide | BinaryOperator::InplaceFloorDivide if rhs != 0.0 => {
-            Some((lhs / rhs).floor())
+            Some(float_divmod_w(lhs, rhs).0)
         }
-        // floatobject.py:520-540 descr_mod: math_fmod + sign correction + copysign
+        // floatobject.py:520-540: descr_mod → fmod + sign correction + copysign
         BinaryOperator::Remainder | BinaryOperator::InplaceRemainder if rhs != 0.0 => {
             Some(float_mod(lhs, rhs))
         }
@@ -331,6 +332,30 @@ fn float_mod(x: f64, y: f64) -> f64 {
         m = f64::copysign(0.0, y);
     }
     m
+}
+
+/// floatobject.py:758-793: _divmod_w — returns (floordiv, mod).
+fn float_divmod_w(x: f64, y: f64) -> (f64, f64) {
+    let mut m = x % y; // fmod
+    let mut div = (x - m) / y;
+    if m != 0.0 {
+        if (y < 0.0) != (m < 0.0) {
+            m += y;
+            div -= 1.0;
+        }
+    } else {
+        m = m * m; // hide from optimizer
+        if y < 0.0 { m = -m; }
+    }
+    // snap quotient to nearest integral value
+    let floordiv = if div != 0.0 {
+        let f = div.floor();
+        if div - f > 0.5 { f + 1.0 } else { f }
+    } else {
+        let d = div * div; // hide from optimizer
+        d * x / y
+    };
+    (floordiv, m)
 }
 
 /// floatobject.py:799-881: _pow with special-case handling.
