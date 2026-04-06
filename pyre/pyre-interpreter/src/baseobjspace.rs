@@ -967,7 +967,7 @@ pub fn pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
             return long_pow(a, b);
         }
         if is_float_pair(a, b) {
-            return Ok(w_float_new(as_float(a).powf(as_float(b))));
+            return float_pow_impl(as_float(a), as_float(b));
         }
         if let Some(result) = try_instance_binop(a, b, "__pow__") {
             return result;
@@ -978,6 +978,73 @@ pub fn pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
             (*(*b).ob_type).tp_name,
         )))
     }
+}
+
+/// floatobject.py:799-881: _pow with Python-correct float power semantics.
+/// Handles NaN/Inf edge cases and raises for domain errors.
+fn float_pow_impl(x: f64, y: f64) -> PyResult {
+    use pyre_object::{PyObjectRef as Obj, w_float_new};
+    // floatobject.py:800-801
+    if y == 2.0 {
+        return Ok(w_float_new(x * x));
+    }
+    if y == 0.0 {
+        return Ok(w_float_new(1.0));
+    }
+    if x.is_nan() {
+        return Ok(w_float_new(x));
+    }
+    if y.is_nan() {
+        return Ok(w_float_new(if x == 1.0 { 1.0 } else { y }));
+    }
+    if y.is_infinite() {
+        let ax = x.abs();
+        if ax == 1.0 {
+            return Ok(w_float_new(1.0));
+        }
+        return Ok(w_float_new(if (y > 0.0) == (ax > 1.0) {
+            f64::INFINITY
+        } else {
+            0.0
+        }));
+    }
+    if x.is_infinite() {
+        let y_is_odd = y.abs() % 2.0 == 1.0;
+        return Ok(w_float_new(if y > 0.0 {
+            if y_is_odd { x } else { x.abs() }
+        } else if y_is_odd {
+            f64::copysign(0.0, x)
+        } else {
+            0.0
+        }));
+    }
+    // floatobject.py:846-847
+    if x == 0.0 && y < 0.0 {
+        return Err(PyError::zero_division(
+            "0.0 cannot be raised to a negative power",
+        ));
+    }
+    let mut negate_result = false;
+    let mut bx = x;
+    if bx < 0.0 {
+        // floatobject.py:856-857
+        if y.floor() != y {
+            return Err(PyError::value_error(
+                "negative number cannot be raised to a fractional power",
+            ));
+        }
+        bx = -bx;
+        negate_result = y.abs() % 2.0 == 1.0;
+    }
+    if bx == 1.0 {
+        return Ok(w_float_new(if negate_result { -1.0 } else { 1.0 }));
+    }
+    let z = bx.powf(y);
+    // floatobject.py:873-876
+    if z.is_infinite() && !bx.is_infinite() {
+        return Err(PyError::overflow_error("float power"));
+    }
+    Ok(w_float_new(if negate_result { -z } else { z }))
 }
 
 /// Left shift dispatch (`<<` operator).
