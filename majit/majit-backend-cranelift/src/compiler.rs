@@ -5551,11 +5551,12 @@ impl CraneliftBackend {
                 }
 
                 OpCode::GuardClass => {
-                    // llgraph/runner.py:1245-1251 execute_guard_class:
-                    //   value = cast_opaque_ptr(OBJECTPTR, arg)
-                    //   if value.typeptr != expected_class: fail_guard
-                    // arg0 = object box, arg1 = expected class pointer.
-                    // Load typeptr from object (offset 0), compare.
+                    // x86/assembler.py:1880-1891 _cmp_guard_class:
+                    //   offset = self.cpu.vtable_offset
+                    //   if offset is not None:
+                    //       CMP(mem(loc_ptr, offset), loc_classptr)
+                    //   else:
+                    //       _cmp_guard_gc_type(loc_ptr, expected_typeid)
                     let info = &guard_infos[guard_idx];
                     guard_idx += 1;
 
@@ -5567,7 +5568,14 @@ impl CraneliftBackend {
                         builder.set_cold_block(cont_block);
                     }
 
-                    let actual_class = builder.ins().load(ptr_type, MemFlags::trusted(), obj, 0);
+                    let vtable_off_i32 = vtable_offset.expect(
+                        "GuardClass requires vtable_offset; gcremovetypeptr \
+                             (cmp_guard_gc_type) not yet implemented",
+                    ) as i32;
+                    let actual_class =
+                        builder
+                            .ins()
+                            .load(ptr_type, MemFlags::trusted(), obj, vtable_off_i32);
                     let neq = builder
                         .ins()
                         .icmp(IntCC::NotEqual, actual_class, expected_class);
@@ -5602,7 +5610,15 @@ impl CraneliftBackend {
 
                     builder.switch_to_block(class_check_block);
                     builder.seal_block(class_check_block);
-                    let actual_class = builder.ins().load(ptr_type, MemFlags::trusted(), obj, 0);
+                    // x86/assembler.py:1880-1891 _cmp_guard_class via vtable_offset.
+                    let vtable_off_i32 = vtable_offset.expect(
+                        "GuardNonnullClass requires vtable_offset; \
+                             gcremovetypeptr not yet implemented",
+                    ) as i32;
+                    let actual_class =
+                        builder
+                            .ins()
+                            .load(ptr_type, MemFlags::trusted(), obj, vtable_off_i32);
                     let neq = builder
                         .ins()
                         .icmp(IntCC::NotEqual, actual_class, expected_class);
