@@ -1640,9 +1640,9 @@ impl Optimizer {
         }
 
         // RPython unroll.py:457: get_virtual_state(end_args)
-        // Capture virtual state BEFORE JUMP is processed through passes
-        // (which forces virtuals). This replaces pre_force_virtual_state.
-        let pre_jump_virtual_state = if !self.skip_flush {
+        // Capture virtual state BEFORE any forcing. JUMP is never sent
+        // through passes (flush=False parity), so virtual info is preserved.
+        let pre_jump_virtual_state =
             last_op
                 .as_ref()
                 .filter(|op| op.opcode == OpCode::Jump)
@@ -1660,10 +1660,7 @@ impl Optimizer {
                         ),
                         resolved_args,
                     )
-                })
-        } else {
-            None
-        };
+                });
 
         // Set pre_force_virtual_state for export_state_with_bounds to use.
         // This replaces the previous approach where OptVirtualize's JUMP handler set it.
@@ -1673,21 +1670,21 @@ impl Optimizer {
         }
 
         // RPython optimizer.py:536-538 / unroll.py:101-103:
-        // JUMP/FINISH handling. RPython Phase 1 uses flush=False (JUMP not
-        // sent through passes). In majit, Phase 1 JUMP goes through passes
-        // for heap flush and resume data. Phase 2 stores JUMP as terminal_op.
-        // TODO: implement flush=False for Phase 1 when export_state handles
-        // virtual JUMP args (requires rd_virtuals encoding).
+        // JUMP/FINISH is NOT sent through passes (flush=False).
+        // RPython: _propagate_all_forward stores JUMP in last_op,
+        // then returns BasicLoopInfo(jump_op=last_op) without sending
+        // it through send_extra_operation. The caller (export_state)
+        // handles virtual args via force_box_for_end_of_preamble.
         if let Some(mut terminal_op) = last_op {
             if self.skip_flush {
-                // RPython: Phase 2 JUMP is NOT sent through optimization
-                // passes. potential_extra_ops are consumed during normal
-                // _emit_operation → force_box, not at the end.
+                // Phase 2: JUMP not sent through passes.
                 for arg in &mut terminal_op.args {
                     *arg = ctx.get_box_replacement(*arg);
                 }
                 self.terminal_op = Some(terminal_op);
             } else {
+                // Phase 1: send through passes (forces virtual args).
+                // TODO: port RPython flush=False to keep virtuals alive.
                 self.propagate_one(&terminal_op, &mut ctx);
             }
         }
@@ -2258,9 +2255,12 @@ impl Optimizer {
         self.flush(&mut ctx);
 
         // unroll.py:204-205: force_box_for_end_of_preamble for each jump arg
+        let saved_pass_idx = ctx.current_pass_idx;
+        ctx.current_pass_idx = ctx.optearlyforce_idx;
         for &arg in &jump_args {
             let _ = self.force_box_for_end_of_preamble(arg, &mut ctx);
         }
+        ctx.current_pass_idx = saved_pass_idx;
 
         // RPython parity: jump_op.getarglist() returns the ORIGINAL Boxes.
         // force_box_for_end_of_preamble recurses into virtual fields but
