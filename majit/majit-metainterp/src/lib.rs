@@ -23,6 +23,7 @@ pub(crate) mod executor;
 mod fail_descr;
 pub mod greenfield;
 pub mod io_buffer;
+pub mod jit;
 mod jit_state;
 pub mod jitcode;
 mod jitdriver;

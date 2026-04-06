@@ -307,7 +307,7 @@ fn find_match_in_expr(expr: &syn::Expr) -> Option<&syn::ExprMatch> {
     }
 }
 
-/// Detect whether the function body contains `hint_promote()` calls before
+/// Detect whether the function body contains `promote()` calls before
 /// the dispatch match.  Returns `true` as a literal for codegen.
 ///
 /// RPython: jtransform.py:596 — `hint(x, promote=True)` becomes
@@ -319,7 +319,7 @@ fn has_promote_before_match(block: &syn::Block) -> bool {
     !promotes.is_empty()
 }
 
-/// Collect variable names from `x = hint_promote(x)` patterns in statements.
+/// Collect variable names from `x = promote(x)` patterns in statements.
 fn collect_promote_stmts(stmts: &[syn::Stmt], promotes: &mut Vec<String>) {
     for stmt in stmts {
         match stmt {
@@ -339,20 +339,39 @@ fn collect_promote_stmts(stmts: &[syn::Stmt], promotes: &mut Vec<String>) {
     }
 }
 
-/// Check if `expr` is `x = hint_promote(x)` and return the variable name.
+/// Check if `expr` is `x = promote(x)` (or legacy `hint_promote(x)`) and return
+/// the variable name.
 fn extract_promote_assign(assign: &syn::ExprAssign) -> Option<String> {
     let syn::Expr::Call(call) = &*assign.right else {
         return None;
     };
-    let syn::Expr::Path(func_path) = &*call.func else {
-        return None;
-    };
-    let func_name = func_path.path.get_ident()?.to_string();
-    if func_name != "hint_promote" {
+    if !is_promote_call_path(&call.func) {
         return None;
     }
     let syn::Expr::Path(lhs_path) = &*assign.left else {
         return None;
     };
     Some(lhs_path.path.get_ident()?.to_string())
+}
+
+/// Check if a call expression's function path is a promote call.
+///
+/// Matches: `promote`, `hint_promote`, `jit::promote`,
+/// `majit_metainterp::jit::promote`.
+pub(crate) fn is_promote_call_path(func: &syn::Expr) -> bool {
+    let syn::Expr::Path(func_path) = func else {
+        return false;
+    };
+    let segments: Vec<_> = func_path
+        .path
+        .segments
+        .iter()
+        .map(|s| s.ident.to_string())
+        .collect();
+    match segments.as_slice() {
+        [name] => name == "promote" || name == "hint_promote",
+        [ns, name] => name == "promote" && ns == "jit",
+        [_, ns, name] => name == "promote" && ns == "jit",
+        _ => false,
+    }
 }
