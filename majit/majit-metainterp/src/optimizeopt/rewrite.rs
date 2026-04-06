@@ -1187,6 +1187,13 @@ impl OptRewrite {
     ) -> OptimizationResult {
         let arg0 = ctx.get_box_replacement(op.arg(0));
         let arg1 = ctx.get_box_replacement(op.arg(1));
+        if let (Some(Value::Ref(left)), Some(Value::Ref(right))) =
+            (ctx.get_constant(arg0), ctx.get_constant(arg1))
+        {
+            let same = left == right;
+            ctx.make_constant(op.pos, Value::Int((same ^ expect_isnot) as i64));
+            return OptimizationResult::Remove;
+        }
         let info0 = ctx.get_ptr_info(arg0);
         let info1 = ctx.get_ptr_info(arg1);
 
@@ -2907,6 +2914,7 @@ impl Default for OptRewrite {
 mod tests {
     use super::*;
     use crate::optimizeopt::optimizer::Optimizer;
+    use majit_ir::GcRef;
 
     /// Helper: assign positions to ops so the optimizer can track them.
     fn with_positions(ops: &mut [Op]) {
@@ -4024,7 +4032,7 @@ mod tests {
 
     #[test]
     fn test_cond_call_value_null_to_direct_call() {
-        // CondCallValueI(value=0, func, arg1) -> CallI(func, arg1)
+        // CondCallValueI(value=0, func, arg1) -> CallPureI(func, arg1)
         let mut ops = vec![
             Op::new(OpCode::SameAsI, &[]), // op0: value (const 0)
             Op::new(OpCode::SameAsI, &[]), // op1: func
@@ -4042,12 +4050,12 @@ mod tests {
         let result = pass.propagate_forward(&ops[3], &mut ctx);
         match result {
             OptimizationResult::Replace(op) => {
-                assert_eq!(op.opcode, OpCode::CallI);
+                assert_eq!(op.opcode, OpCode::CallPureI);
                 assert_eq!(op.args.len(), 2);
                 assert_eq!(op.arg(0), OpRef(1));
                 assert_eq!(op.arg(1), OpRef(2));
             }
-            other => panic!("expected Replace(CallI), got {:?}", other),
+            other => panic!("expected Replace(CallPureI), got {:?}", other),
         }
     }
 
@@ -4131,8 +4139,8 @@ mod tests {
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(3);
-        ctx.make_constant(OpRef(0), Value::Int(100));
-        ctx.make_constant(OpRef(1), Value::Int(200));
+        ctx.make_constant(OpRef(0), Value::Ref(GcRef(100)));
+        ctx.make_constant(OpRef(1), Value::Ref(GcRef(200)));
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
 

@@ -174,6 +174,13 @@ pub fn modulo_operations(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::optimizeopt::OptContext;
+
+    fn drain_extra_ops(ctx: &mut OptContext) {
+        while let Some((_, op)) = ctx.extra_operations_after.pop_front() {
+            ctx.new_operations.push(op);
+        }
+    }
 
     // ── magic_numbers tests ──
 
@@ -265,11 +272,11 @@ mod tests {
         let n_ref = ctx.emit(n_op);
 
         let result_ref = division_operations(n_ref, 7, false, 0, &mut ctx);
+        drain_extra_ops(&mut ctx);
 
-        // Should emit: const(k), const(i), const(63), IntRshift, IntXor,
-        //              UintMulHigh, UintRshift, IntXor
-        // Total: 3 constants + 5 operations = 8 ops after n
-        assert_eq!(ctx.new_operations.len(), 9); // 1 (n) + 8
+        // Constants live in the constant table, not new_operations.
+        // The helper emits five queued operations after the input.
+        assert_eq!(ctx.new_operations.len(), 6); // 1 input + 5 queued ops
 
         // Check the final op is IntXor (sign correction)
         let final_op = &ctx.new_operations[result_ref.0 as usize];
@@ -297,9 +304,10 @@ mod tests {
         let n_ref = ctx.emit(n_op);
 
         let result_ref = division_operations(n_ref, 7, true, 0, &mut ctx);
+        drain_extra_ops(&mut ctx);
 
-        // known_nonneg: const(k), const(i), UintMulHigh, UintRshift = 4 ops
-        assert_eq!(ctx.new_operations.len(), 5); // 1 (n) + 4
+        // known_nonneg emits two queued operations after the input.
+        assert_eq!(ctx.new_operations.len(), 3); // 1 input + 2 queued ops
 
         let final_op = &ctx.new_operations[result_ref.0 as usize];
         assert_eq!(final_op.opcode, OpCode::UintRshift);
@@ -314,9 +322,10 @@ mod tests {
         let n_ref = ctx.emit(n_op);
 
         let result_ref = modulo_operations(n_ref, 7, false, 0, &mut ctx);
+        drain_extra_ops(&mut ctx);
 
-        // Division (8 ops) + const(m) + IntMul + IntSub = 11 ops after n
-        assert_eq!(ctx.new_operations.len(), 12); // 1 (n) + 11
+        // Five queued division ops + IntMul + IntSub after the input.
+        assert_eq!(ctx.new_operations.len(), 8); // 1 input + 7 queued ops
 
         let final_op = &ctx.new_operations[result_ref.0 as usize];
         assert_eq!(final_op.opcode, OpCode::IntSub);
@@ -336,9 +345,10 @@ mod tests {
         let n_ref = ctx.emit(n_op);
 
         let result_ref = modulo_operations(n_ref, 7, true, 0, &mut ctx);
+        drain_extra_ops(&mut ctx);
 
-        // Division nonneg (4 ops) + const(m) + IntMul + IntSub = 7 ops after n
-        assert_eq!(ctx.new_operations.len(), 8); // 1 (n) + 7
+        // Two queued division ops + IntMul + IntSub after the input.
+        assert_eq!(ctx.new_operations.len(), 5); // 1 input + 4 queued ops
 
         let final_op = &ctx.new_operations[result_ref.0 as usize];
         assert_eq!(final_op.opcode, OpCode::IntSub);
@@ -358,15 +368,23 @@ mod tests {
             let n_ref = ctx.emit(n_op);
             division_operations(n_ref, m, false, 0, &mut ctx);
 
-            // First constant emitted should be k
-            let k_val = ctx.get_constant_int(OpRef(1)).unwrap();
+            let emitted_consts: Vec<i64> = ctx
+                .constants
+                .iter()
+                .filter_map(|value| match value {
+                    Some(Value::Int(v)) => Some(*v),
+                    _ => None,
+                })
+                .collect();
+
+            // The helper records `k`, `i`, then `63` in the constant table.
+            let k_val = emitted_consts[0];
             assert_eq!(
                 k_val as u64, expected_k,
                 "k mismatch for m={m}: got {k_val}, expected {expected_k}"
             );
 
-            // Second constant should be i
-            let i_val = ctx.get_constant_int(OpRef(2)).unwrap();
+            let i_val = emitted_consts[1];
             assert_eq!(
                 i_val as u32, expected_i,
                 "i mismatch for m={m}: got {i_val}, expected {expected_i}"

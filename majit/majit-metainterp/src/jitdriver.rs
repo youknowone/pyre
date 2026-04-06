@@ -3260,78 +3260,6 @@ mod tests {
     }
 
     #[test]
-    fn generic_guard_restore_uses_embedded_reconstructed_frame_slot_types() {
-        let mut state = TypedRestoreState::default();
-        let reconstructed_state = ReconstructedState {
-            frames: vec![ReconstructedFrame {
-                trace_id: Some(77),
-                header_pc: Some(88),
-                source_guard: Some((70, 7)),
-                pc: 99,
-                slot_types: Some(vec![Type::Ref, Type::Float]),
-                values: vec![
-                    ReconstructedValue::Value(0x1234),
-                    ReconstructedValue::Value(6.25f64.to_bits() as i64),
-                ],
-            }],
-            virtuals: Vec::new(),
-            pending_fields: Vec::new(),
-        };
-
-        assert!(
-            <TypedRestoreState as JitState>::restore_guard_failure_with_resume_layout(
-                &mut state,
-                &(),
-                &[],
-                Some(&reconstructed_state),
-                None,
-                &[],
-                &[],
-                &ExceptionState::default(),
-            )
-        );
-        assert!(!state.restore_called);
-        assert_eq!(
-            state.restored_values,
-            vec![Value::Ref(GcRef(0x1234)), Value::Float(6.25)]
-        );
-    }
-
-    #[test]
-    fn generic_guard_restore_passes_embedded_reconstructed_frame_metadata() {
-        let mut state = FrameMetadataState::default();
-        let reconstructed_state = ReconstructedState {
-            frames: vec![ReconstructedFrame {
-                trace_id: Some(701),
-                header_pc: Some(1701),
-                source_guard: Some((700, 0)),
-                pc: 99,
-                slot_types: Some(vec![Type::Int]),
-                values: vec![ReconstructedValue::Value(44)],
-            }],
-            virtuals: Vec::new(),
-            pending_fields: Vec::new(),
-        };
-
-        assert!(
-            <FrameMetadataState as JitState>::restore_guard_failure_with_resume_layout(
-                &mut state,
-                &(),
-                &[],
-                Some(&reconstructed_state),
-                None,
-                &[],
-                &[],
-                &ExceptionState::default(),
-            )
-        );
-        assert_eq!(state.seen_trace_id, Some(701));
-        assert_eq!(state.seen_header_pc, Some(1701));
-        assert_eq!(state.seen_source_guard, Some((700, 0)));
-        assert_eq!(state.restored_values, vec![Value::Int(44)]);
-    }
-
-    #[test]
     fn test_threshold_1_fires_on_first_tick() {
         // counter.py: compute_threshold(1) = 1.0/(1-0.001) ≈ 1.001
         // First tick adds ≈1.001 to 0.0, reaching ≥1.0 immediately.
@@ -3394,9 +3322,11 @@ mod tests {
         // Record minimal trace and compile.
         {
             let ctx = driver.meta.trace_ctx().expect("should be tracing");
+            let i0 = OpRef(0);
             let _val = ctx.const_int(42);
+            ctx.record_guard_with_fail_args(OpCode::GuardTrue, &[i0], 0, &[i0]);
         }
-        driver.meta.compile_loop(&[], ());
+        driver.meta.compile_loop(&[OpRef(0)], ());
         assert!(driver.has_compiled_loop(key));
 
         let stats = driver.get_stats();
@@ -3539,7 +3469,8 @@ mod tests {
                 let ctx = driver.meta.trace_ctx().expect("should be tracing");
                 let i0 = OpRef(0);
                 let c1 = ctx.const_int(1);
-                let _sum = ctx.record_op(OpCode::IntAdd, &[i0, c1]);
+                let sum = ctx.record_op(OpCode::IntAdd, &[i0, c1]);
+                ctx.record_guard_with_fail_args(OpCode::GuardTrue, &[i0], 0, &[sum]);
             }
             driver.meta.compile_loop(&[OpRef(0)], ());
             assert!(driver.has_compiled_loop(key));

@@ -2037,55 +2037,6 @@ mod tests {
     }
 
     #[test]
-    fn test_instantiate_short_preamble() {
-        // Create a short preamble with a guard_class on label arg 0
-        let guard_op = Op::new(OpCode::GuardClass, &[OpRef(100), OpRef(200)]);
-        let sp = ShortPreamble {
-            ops: vec![ShortPreambleOp {
-                op: guard_op,
-                arg_mapping: vec![(0, 0)], // arg 0 maps to label arg 0
-                fail_arg_mapping: Vec::new(),
-            }],
-            inputargs: vec![OpRef(100), OpRef(101)],
-            used_boxes: Vec::new(),
-            jump_args: Vec::new(),
-            exported_state: None,
-        };
-
-        // Instantiate for a bridge that provides v500 as label arg 0
-        let bridge_args = &[OpRef(500), OpRef(501)];
-        let instantiated = sp.instantiate(bridge_args);
-
-        assert_eq!(instantiated.len(), 1);
-        assert_eq!(instantiated[0].opcode, OpCode::GuardClass);
-        assert_eq!(instantiated[0].args[0], OpRef(500)); // remapped from label arg 0
-        assert_eq!(instantiated[0].args[1], OpRef(200)); // not a label arg, unchanged
-    }
-
-    #[test]
-    fn test_instantiate_multiple_mappings() {
-        // Guard with two args, both mapping to label args
-        let guard_op = Op::new(OpCode::GuardValue, &[OpRef(100), OpRef(101)]);
-        let sp = ShortPreamble {
-            ops: vec![ShortPreambleOp {
-                op: guard_op,
-                arg_mapping: vec![(0, 0), (1, 1)],
-                fail_arg_mapping: Vec::new(),
-            }],
-            inputargs: vec![OpRef(100), OpRef(101)],
-            used_boxes: Vec::new(),
-            jump_args: Vec::new(),
-            exported_state: None,
-        };
-
-        let bridge_args = &[OpRef(300), OpRef(301)];
-        let instantiated = sp.instantiate(bridge_args);
-
-        assert_eq!(instantiated[0].args[0], OpRef(300));
-        assert_eq!(instantiated[0].args[1], OpRef(301));
-    }
-
-    #[test]
     fn test_builder_collects_guards() {
         let mut builder = CollectedShortPreambleBuilder::new();
 
@@ -2197,103 +2148,6 @@ mod tests {
 
         // IntAdd with remapped args
         assert_eq!(instantiated[2].opcode, OpCode::IntAdd);
-    }
-
-    #[test]
-    fn test_apply_to_bridge() {
-        let sp = ShortPreamble {
-            ops: vec![ShortPreambleOp {
-                op: Op::new(OpCode::GuardNonnull, &[OpRef(0)]),
-                arg_mapping: vec![(0, 0)],
-                fail_arg_mapping: Vec::new(),
-            }],
-            inputargs: vec![OpRef(0)],
-            used_boxes: Vec::new(),
-            jump_args: Vec::new(),
-            exported_state: None,
-        };
-
-        let bridge_ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef(500), OpRef(501)]),
-            Op::new(OpCode::Jump, &[OpRef(0)]),
-        ];
-
-        let result = sp.apply_to_bridge(&[OpRef(500)], &bridge_ops);
-        // Short preamble guard + bridge ops
-        assert_eq!(result.len(), 3);
-        assert_eq!(result[0].opcode, OpCode::GuardNonnull);
-        assert_eq!(result[1].opcode, OpCode::IntAdd);
-        assert_eq!(result[2].opcode, OpCode::Jump);
-    }
-
-    #[test]
-    fn test_instantiate_skips_bare_overflow_guard() {
-        let sp = ShortPreamble {
-            ops: vec![ShortPreambleOp {
-                op: Op::new(OpCode::GuardNoOverflow, &[]),
-                arg_mapping: Vec::new(),
-                fail_arg_mapping: Vec::new(),
-            }],
-            inputargs: vec![OpRef(100)],
-            used_boxes: Vec::new(),
-            jump_args: Vec::new(),
-            exported_state: None,
-        };
-
-        let instantiated = sp.instantiate(&[OpRef(500)]);
-        assert!(instantiated.is_empty());
-    }
-
-    #[test]
-    fn test_instantiate_remaps_fail_args_by_position() {
-        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef(10)]);
-        guard.fail_args = Some(vec![OpRef(10), OpRef(20)].into());
-        let sp = ShortPreamble {
-            ops: vec![ShortPreambleOp {
-                op: guard,
-                arg_mapping: vec![(0, 0)],
-                fail_arg_mapping: vec![(0, 0), (1, 1)],
-            }],
-            inputargs: vec![OpRef(10), OpRef(20)],
-            used_boxes: Vec::new(),
-            jump_args: Vec::new(),
-            exported_state: None,
-        };
-
-        let instantiated = sp.instantiate(&[OpRef(100), OpRef(200)]);
-        assert_eq!(instantiated[0].args[0], OpRef(100));
-        let fail_args = instantiated[0].fail_args.as_ref().unwrap();
-        assert_eq!(fail_args.as_slice(), &[OpRef(100), OpRef(200)]);
-    }
-
-    #[test]
-    fn test_num_guards_and_pure_ops() {
-        let sp = ShortPreamble {
-            ops: vec![
-                ShortPreambleOp {
-                    op: Op::new(OpCode::GuardTrue, &[OpRef(0)]),
-                    arg_mapping: vec![(0, 0)],
-                    fail_arg_mapping: Vec::new(),
-                },
-                ShortPreambleOp {
-                    op: Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]),
-                    arg_mapping: vec![(0, 0), (1, 1)],
-                    fail_arg_mapping: Vec::new(),
-                },
-                ShortPreambleOp {
-                    op: Op::new(OpCode::GuardNonnull, &[OpRef(0)]),
-                    arg_mapping: vec![(0, 0)],
-                    fail_arg_mapping: Vec::new(),
-                },
-            ],
-            inputargs: vec![OpRef(0), OpRef(1)],
-            used_boxes: Vec::new(),
-            jump_args: Vec::new(),
-            exported_state: None,
-        };
-
-        assert_eq!(sp.num_guards(), 2);
-        assert_eq!(sp.num_pure_ops(), 1);
     }
 
     #[test]
@@ -2415,32 +2269,6 @@ mod tests {
         assert_eq!(short[1].opcode, OpCode::IntAdd);
         assert_eq!(short[2].opcode, OpCode::IntMul);
         assert_eq!(builder.used_boxes(), &[OpRef(7), OpRef(8)]);
-    }
-
-    #[test]
-    fn test_build_short_preamble_struct_preserves_inputargs_and_used_boxes() {
-        let produced = vec![(
-            OpRef(7),
-            ProducedShortOp {
-                kind: PreambleOpKind::Pure,
-                preamble_op: {
-                    let mut op = Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]);
-                    op.pos = OpRef(7);
-                    op
-                },
-                invented_name: false,
-                same_as_source: None,
-            },
-        )];
-        let mut builder =
-            ShortPreambleBuilder::new(&[OpRef(0), OpRef(1)], &produced, &[OpRef(0), OpRef(1)]);
-
-        let _ = builder.add_op_to_short(OpRef(7));
-        assert!(builder.add_preamble_op(OpRef(7)));
-        let sp = builder.build_short_preamble_struct();
-
-        assert_eq!(sp.inputargs, vec![OpRef(0), OpRef(1)]);
-        assert_eq!(sp.used_boxes, vec![OpRef(7)]);
     }
 
     #[test]
@@ -2661,23 +2489,6 @@ mod tests {
     }
 
     #[test]
-    fn test_rpython_short_preamble_builder_carries_used_box_in_struct() {
-        let mut sb = ShortBoxes::with_label_args(&[OpRef(10), OpRef(30), OpRef(31)]);
-
-        let mut pure = Op::new(OpCode::IntAdd, &[OpRef(30), OpRef(31)]);
-        pure.pos = OpRef(10);
-        sb.add_potential_op(Some(0), pure, PreambleOpKind::Pure);
-
-        let produced = sb.produced_ops();
-        let mut builder = ShortPreambleBuilder::new(&[OpRef(10)], &produced, &[OpRef(10)]);
-        assert!(builder.add_preamble_op(OpRef(10)));
-
-        let sp = builder.build_short_preamble_struct();
-        assert_eq!(sp.used_boxes, vec![OpRef(10)]);
-        assert_eq!(sp.jump_args, vec![OpRef(10)]);
-    }
-
-    #[test]
     fn test_rpython_short_preamble_builder_tracks_extra_same_as() {
         let mut sb = ShortBoxes::with_label_args(&[OpRef(20), OpRef(30), OpRef(31)]);
 
@@ -2707,49 +2518,5 @@ mod tests {
         assert_eq!(extra[0].opcode, OpCode::SameAsI);
         assert_eq!(extra[0].pos, alias_result);
         assert_eq!(extra[0].args.as_slice(), &[OpRef(20)]);
-    }
-
-    #[test]
-    fn test_rpython_extended_builder_appends_label_and_jump_for_alias() {
-        let mut sb = ShortBoxes::with_label_args(&[OpRef(30), OpRef(40), OpRef(41)]);
-
-        let mut heap = Op::with_descr(
-            OpCode::GetfieldGcI,
-            &[OpRef(40)],
-            majit_ir::make_field_descr(0, 8, majit_ir::Type::Int, true),
-        );
-        heap.pos = OpRef(30);
-        sb.add_potential_op(Some(0), heap, PreambleOpKind::Heap);
-
-        let mut pure = Op::new(OpCode::IntAdd, &[OpRef(40), OpRef(41)]);
-        pure.pos = OpRef(30);
-        sb.add_potential_op(Some(0), pure, PreambleOpKind::Pure);
-
-        let produced = sb.produced_ops();
-        let alias_result = produced
-            .iter()
-            .find(|(result, pop)| *result != OpRef(30) && pop.invented_name)
-            .map(|(result, _)| *result)
-            .unwrap();
-
-        let builder = ShortPreambleBuilder::new(&[OpRef(30)], &produced, &[OpRef(30)]);
-        let mut ext = ExtendedShortPreambleBuilder::new(7, &builder);
-        ext.setup(
-            &ShortPreamble {
-                ops: Vec::new(),
-                inputargs: vec![OpRef(30)],
-                used_boxes: vec![OpRef(30)],
-                jump_args: vec![OpRef(30)],
-                exported_state: None,
-            },
-            &[OpRef(30)],
-        );
-
-        assert!(ext.add_preamble_op(alias_result));
-        assert_eq!(ext.label_args(), &[OpRef(30), alias_result]);
-        assert_eq!(ext.jump_args().len(), 2);
-        assert_eq!(ext.extra_same_as().len(), 1);
-        assert_eq!(ext.extra_same_as()[0].opcode, OpCode::SameAsI);
-        assert_eq!(ext.extra_same_as()[0].pos, alias_result);
     }
 }

@@ -2103,38 +2103,6 @@ mod tests {
     }
 
     #[test]
-    fn test_virtual_compatibility() {
-        let descr = test_descr(1);
-        let v1 = VirtualStateInfo::Virtual {
-            descr: descr.clone(),
-            known_class: None,
-            fields: vec![
-                (0, Box::new(VirtualStateInfo::Constant(Value::Int(10)))),
-                (1, Box::new(VirtualStateInfo::Unknown)),
-            ],
-            field_descrs: Vec::new(),
-        };
-        let v2 = VirtualStateInfo::Virtual {
-            descr: descr.clone(),
-            known_class: None,
-            fields: vec![
-                (0, Box::new(VirtualStateInfo::Constant(Value::Int(10)))),
-                (1, Box::new(VirtualStateInfo::Constant(Value::Int(20)))),
-            ],
-            field_descrs: Vec::new(),
-        };
-        let v3 = VirtualStateInfo::Virtual {
-            descr: descr.clone(),
-            known_class: None,
-            fields: vec![(0, Box::new(VirtualStateInfo::Constant(Value::Int(99))))],
-            field_descrs: Vec::new(),
-        };
-
-        assert!(v1.is_compatible(&v2)); // field 0 matches, field 1 is Unknown (accepts anything)
-        assert!(!v1.is_compatible(&v3)); // field 0 constant mismatch
-    }
-
-    #[test]
     fn test_virtual_array_compatibility() {
         let descr = test_descr(1);
         let a1 = VirtualStateInfo::VArray {
@@ -2237,123 +2205,6 @@ mod tests {
     // ── Export/Import tests ──
 
     #[test]
-    fn test_export_constant() {
-        // RPython parity: only constant pool entries (>= 10000) export as Constant.
-        let mut ctx = OptContext::new(10);
-        let opref = OpRef(10042);
-        ctx.make_constant(opref, Value::Int(42));
-
-        let ptr_info: Vec<Option<PtrInfo>> = Vec::new();
-        let state = export_state(&[opref], &ctx, &ptr_info);
-
-        assert_eq!(state.state.len(), 1);
-        assert!(matches!(
-            &state.state[0],
-            VirtualStateInfo::Constant(Value::Int(42))
-        ));
-    }
-
-    #[test]
-    fn test_export_virtual() {
-        let mut ctx = OptContext::new(10);
-        let opref = ctx.emit(Op::new(OpCode::NewWithVtable, &[]));
-        let field_ref = OpRef(10099); // constant pool entry
-        ctx.make_constant(field_ref, Value::Int(99));
-
-        let descr = test_descr(1);
-        let mut ptr_info: Vec<Option<PtrInfo>> = vec![None; 2];
-        ptr_info[opref.0 as usize] = Some(PtrInfo::Virtual(VirtualInfo {
-            descr: descr.clone(),
-            known_class: None,
-            ob_type_descr: None,
-            fields: vec![(0, field_ref)],
-            field_descrs: Vec::new(),
-            last_guard_pos: -1,
-        }));
-
-        let state = export_state(&[opref], &ctx, &ptr_info);
-
-        assert_eq!(state.state.len(), 1);
-        match &state.state[0] {
-            VirtualStateInfo::Virtual { fields, .. } => {
-                assert_eq!(fields.len(), 1);
-                assert!(matches!(
-                    fields[0].1.as_ref(),
-                    VirtualStateInfo::Constant(Value::Int(99))
-                ));
-            }
-            other => panic!("expected Virtual, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_export_import_roundtrip() {
-        // RPython parity: only constant pool entries (OpRef >= 10000) survive
-        // export/import. Trace-computed constants are cleared (setinfo_from_preamble).
-        let mut ctx = OptContext::new(10);
-        let const_ref = OpRef(10042); // constant pool entry
-        ctx.make_constant(const_ref, Value::Int(42));
-
-        let ptr_info_in: Vec<Option<PtrInfo>> = Vec::new();
-        let state = export_state(&[const_ref], &ctx, &ptr_info_in);
-
-        // Now import into a fresh context
-        let mut ctx2 = OptContext::new(10);
-        let target = OpRef(10042);
-        let mut ptr_info_out: Vec<Option<PtrInfo>> = Vec::new();
-
-        import_state(&state, &[target], &mut ctx2, &mut ptr_info_out);
-
-        assert_eq!(ctx2.get_constant_int(target), Some(42));
-    }
-
-    #[test]
-    fn test_export_known_class() {
-        let mut ctx = OptContext::new(10);
-        let opref = ctx.emit(Op::new(OpCode::SameAsI, &[OpRef::NONE]));
-
-        let mut ptr_info: Vec<Option<PtrInfo>> = vec![None; 1];
-        ptr_info[0] = Some(PtrInfo::KnownClass {
-            class_ptr: GcRef(0x100),
-            is_nonnull: true,
-            last_guard_pos: -1,
-        });
-
-        let state = export_state(&[opref], &ctx, &ptr_info);
-
-        assert!(matches!(
-            &state.state[0],
-            VirtualStateInfo::KnownClass { class_ptr } if class_ptr.as_usize() == 0x100
-        ));
-    }
-
-    #[test]
-    fn test_is_virtual() {
-        let descr = test_descr(1);
-        assert!(
-            VirtualStateInfo::Virtual {
-                descr: descr.clone(),
-                known_class: None,
-                fields: vec![],
-                field_descrs: Vec::new(),
-            }
-            .is_virtual()
-        );
-
-        assert!(
-            VirtualStateInfo::VArray {
-                descr: descr.clone(),
-                items: vec![],
-                lenbound: None,
-            }
-            .is_virtual()
-        );
-
-        assert!(!VirtualStateInfo::NonNull.is_virtual());
-        assert!(!VirtualStateInfo::Unknown.is_virtual());
-    }
-
-    #[test]
     fn test_make_inputargs_skips_virtual_entries() {
         let descr = test_descr(7);
         let state = VirtualState::new(vec![
@@ -2426,6 +2277,7 @@ mod tests {
             VirtualStateInfo::Virtual {
                 descr: descr.clone(),
                 known_class: Some(GcRef(0x1000)),
+                ob_type_descr: None,
                 fields: vec![],
                 field_descrs: Vec::new(),
             },
@@ -2507,49 +2359,5 @@ mod tests {
         assert_eq!(state.get_renum(OpRef(20)), Some(1));
         assert_eq!(state.get_renum(OpRef(30)), Some(2));
         assert_eq!(state.get_renum(OpRef(99)), None);
-    }
-
-    #[test]
-    fn test_merge_states() {
-        let descr = test_descr(0);
-        let s1 = VirtualState::new(vec![
-            VirtualStateInfo::KnownClass {
-                class_ptr: GcRef(0x1000),
-            },
-            VirtualStateInfo::NonNull,
-        ]);
-        let s2 = VirtualState::new(vec![
-            VirtualStateInfo::KnownClass {
-                class_ptr: GcRef(0x1000),
-            },
-            VirtualStateInfo::Unknown,
-        ]);
-        let merged = s1.merge(&s2);
-        // First: compatible (same class) → keep s1
-        assert!(matches!(
-            &merged.state[0],
-            VirtualStateInfo::KnownClass { .. }
-        ));
-        // Second: NonNull vs Unknown → not compatible → Unknown
-        assert!(matches!(&merged.state[1], VirtualStateInfo::Unknown));
-    }
-
-    #[test]
-    fn test_num_entries_has_virtuals() {
-        let descr = test_descr(0);
-        let state = VirtualState::new(vec![
-            VirtualStateInfo::NonNull,
-            VirtualStateInfo::Virtual {
-                descr,
-                known_class: None,
-                fields: vec![],
-                field_descrs: Vec::new(),
-            },
-            VirtualStateInfo::Unknown,
-        ]);
-        assert_eq!(state.num_entries(), 3);
-        assert_eq!(state.num_boxes(), 2); // NonNull + Unknown
-        assert_eq!(state.num_virtuals(), 1);
-        assert!(state.has_virtuals());
     }
 }

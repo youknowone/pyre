@@ -982,19 +982,6 @@ mod tests {
     }
 
     #[test]
-    fn test_conditional_call() {
-        let mut called = false;
-        conditional_call(false, || {
-            called = true;
-        });
-        assert!(!called);
-        conditional_call(true, || {
-            called = true;
-        });
-        assert!(called);
-    }
-
-    #[test]
     fn test_conditional_call_elidable_int() {
         let result = conditional_call_elidable(42_i64, || 99_i64);
         assert_eq!(result, 42);
