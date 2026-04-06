@@ -140,6 +140,11 @@ pub struct NumberingState {
     /// RPython Box.type parity: type of each TAGBOX livebox, captured at
     /// numbering time. Equivalent to Box.type being intrinsic in RPython.
     pub livebox_types: HashMap<u32, Type>,
+    /// virtualizable.py:read_boxes parity: vable_array entries get FRESH
+    /// TAGBOX numbers (RPython wrap() builds new FrontendOps each call).
+    /// pyre's flat OpRef model needs a side table to bypass dedup.
+    /// Each entry is (TAGBOX index, OpRef).
+    pub fresh_tagbox_entries: Vec<(i32, OpRef)>,
 }
 
 impl NumberingState {
@@ -150,6 +155,7 @@ impl NumberingState {
             num_boxes: 0,
             num_virtuals: 0,
             livebox_types: HashMap::new(),
+            fresh_tagbox_entries: Vec::new(),
         }
     }
 
@@ -249,25 +255,53 @@ impl ResumeDataLoopMemo {
         }
     }
 
+    /// virtualizable.py:read_boxes parity helper: tag each entry with a
+    /// FRESH TAGBOX, bypassing the liveboxes dedup cache. RPython's wrap()
+    /// builds a new FrontendOp per call, so vable boxes can never collide
+    /// with frame register boxes that happen to wrap the same value.
+    ///
+    /// In majit's flat OpRef model, this requires a side table — each
+    /// (TAGBOX index, OpRef) pair is recorded in
+    /// `numb_state.fresh_tagbox_entries`, and `_finalize_liveboxes_vec`
+    /// (or the caller) uses it to populate the liveboxes vec.
+    pub fn _number_boxes_fresh(
+        &mut self,
+        boxes: &[OpRef],
+        numb_state: &mut NumberingState,
+        env: &dyn BoxEnv,
+    ) -> Result<(), TagOverflow> {
+        for &raw_opref in boxes {
+            // resume.py:561-562 _gettagged: box is None → UNINITIALIZED
+            if raw_opref.is_none() {
+                numb_state.append_short(UNINITIALIZED_TAG);
+                continue;
+            }
+            let opref = env.get_box_replacement(raw_opref);
+            if opref.is_none() {
+                numb_state.append_short(UNINITIALIZED_TAG);
+                continue;
+            }
+            // resume.py:204-205: isinstance(box, Const)
+            if env.is_const(opref) {
+                let (val, tp) = env.get_const(opref);
+                let tagged = self.getconst(val, tp);
+                numb_state.append_short(tagged);
+                continue;
+            }
+            // Non-const: allocate fresh TAGBOX, do NOT touch liveboxes cache.
+            // virtualizable.py:wrap creates a new FrontendOp here.
+            let box_type = env.get_type(opref);
+            let tagged = tag(numb_state.num_boxes, TAGBOX)?;
+            let tagbox_idx = numb_state.num_boxes;
+            numb_state.num_boxes += 1;
+            numb_state.livebox_types.insert(opref.0, box_type);
+            numb_state.fresh_tagbox_entries.push((tagbox_idx, opref));
+            numb_state.append_short(tagged);
+        }
+        Ok(())
+    }
+
     /// resume.py:196-223 _number_boxes — tag each box in the snapshot.
-    ///
-    /// KNOWN DEVIATION: RPython's read_boxes/wrap() (virtualizable.py:86)
-    /// creates fresh Box objects for virtualizable_boxes with separate
-    /// Python identity from frame register boxes. _number_boxes
-    /// (resume.py:207) keys by box identity after get_box_replacement(),
-    /// so fresh vable boxes MAY get separate TAGBOX indices if their
-    /// forwarding chains diverge from the frame register boxes.
-    ///
-    /// In pyre, OpRefs are integers shared between vable and frame sections.
-    /// Dedup always occurs. This is a CONFIRMED deviation: when two vable
-    /// slots share a TAGBOX with a frame register slot, recovery gives all
-    /// three the same deadframe value, corrupting distinct vable slots.
-    /// (Observed: fib_loop locals[1] and locals[2] get identical pointers.)
-    ///
-    /// Consequence: synchronize_virtualizable (vable→PyFrame writeback) is
-    /// BLOCKED — only frame-section recovery (liveness-based) is safe.
-    /// Fix requires fresh OpRef identity for vable (SameAs-based encoding
-    /// at trace recording time, with backend exit block recompilation).
     pub fn _number_boxes(
         &mut self,
         boxes: &[OpRef],

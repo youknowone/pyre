@@ -152,6 +152,13 @@ pub struct NumberingState {
     /// numbering time when env.get_type() is called. Eliminates the need
     /// for post-hoc type inference cascades in store_final_boxes_in_guard.
     pub livebox_types: std::collections::HashMap<u32, majit_ir::Type>,
+    /// virtualizable.py:read_boxes parity: each call to wrap() creates a
+    /// fresh FrontendOp with unique identity, so vable_array entries get
+    /// their own TAGBOX numbers even when they wrap the same value as a
+    /// frame box. In majit, OpRef u32 collisions force a side table:
+    /// (TAGBOX index, OpRef) pairs that bypass the liveboxes cache.
+    /// finish() uses these to populate the final liveboxes vec.
+    pub fresh_tagbox_entries: Vec<(i32, majit_ir::OpRef)>,
 }
 
 impl NumberingState {
@@ -162,6 +169,7 @@ impl NumberingState {
             num_boxes: 0,
             num_virtuals: 0,
             livebox_types: std::collections::HashMap::new(),
+            fresh_tagbox_entries: Vec::new(),
         }
     }
     pub fn append_short(&mut self, item: i16) {
@@ -3017,6 +3025,58 @@ impl ResumeDataLoopMemo {
         UNASSIGNED
     }
 
+    /// virtualizable.py:read_boxes parity: number a snapshot section where
+    /// each non-Const entry must get a FRESH TAGBOX, bypassing the liveboxes
+    /// cache. Used for vable_array.
+    ///
+    /// In RPython, vable boxes are produced by `wrap(cpu, value, startindex+i)`,
+    /// which constructs a NEW XxxFrontendOp object with unique identity.
+    /// `_number_boxes` uses object identity as the dedup key, so vable boxes
+    /// never collide with frame boxes that happen to wrap the same value.
+    ///
+    /// In majit, OpRef u32 collisions defeat that natural dedup. This helper
+    /// emulates fresh identity by allocating a new TAGBOX per entry and
+    /// recording (tagbox, opref) in `numb_state.fresh_tagbox_entries`. The
+    /// pair is consumed by `finish()` when populating the liveboxes vec.
+    pub fn _number_boxes_fresh(
+        &mut self,
+        boxes: &[majit_ir::OpRef],
+        numb_state: &mut NumberingState,
+        env: &dyn BoxEnv,
+    ) -> Result<(), TagOverflow> {
+        for &raw_opref in boxes {
+            // resume.py:561-562 _gettagged: box is None → UNINITIALIZED
+            if raw_opref.is_none() {
+                numb_state.append_short(UNINITIALIZED_TAG);
+                continue;
+            }
+            let opref = env.get_box_replacement(raw_opref);
+            if opref.is_none() {
+                numb_state.append_short(UNINITIALIZED_TAG);
+                continue;
+            }
+            // resume.py:204-205: isinstance(box, Const) → getconst
+            // Const wrap() in RPython returns ConstInt/ConstPtr/ConstFloat,
+            // which DON'T have fresh identity — they go through getconst.
+            if env.is_const(opref) {
+                let (val, tp) = env.get_const(opref);
+                let tagged = self.getconst(val, tp);
+                numb_state.append_short(tagged);
+                continue;
+            }
+            // Non-const: allocate FRESH TAGBOX, do NOT touch liveboxes cache.
+            // virtualizable.py:wrap creates a new FrontendOp here.
+            let box_type = env.get_type(opref);
+            let tagged = tag(numb_state.num_boxes, TAGBOX)?;
+            let tagbox_idx = numb_state.num_boxes;
+            numb_state.num_boxes += 1;
+            numb_state.livebox_types.insert(opref.0, box_type);
+            numb_state.fresh_tagbox_entries.push((tagbox_idx, opref));
+            numb_state.append_short(tagged);
+        }
+        Ok(())
+    }
+
     /// resume.py:192-226 _number_boxes — tag each box in a snapshot section.
     ///
     /// Exact port of RPython's `_number_boxes(self, iter, iterator, numb_state)`.
@@ -3218,6 +3278,16 @@ impl ResumeDataLoopMemo {
             } else {
                 debug_assert_eq!(tagbits, TAGVIRTUAL);
                 virtual_worklist.push(opref_id);
+            }
+        }
+
+        // virtualizable.py:read_boxes parity: vable_array entries get FRESH
+        // TAGBOX numbers via _number_boxes_fresh, bypassing the liveboxes
+        // cache. They live in numb_state.fresh_tagbox_entries instead, and
+        // must be added to the liveboxes vec at their assigned indices.
+        for &(tagbox_idx, opref) in &numb_state.fresh_tagbox_entries {
+            if (tagbox_idx as usize) < liveboxes.len() {
+                liveboxes[tagbox_idx as usize] = Some(opref);
             }
         }
 
