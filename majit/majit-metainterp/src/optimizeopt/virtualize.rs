@@ -1158,9 +1158,24 @@ impl OptVirtualize {
             }
         }
 
+        // RPython info.py:763-772: ConstPtrInfo.get_known_class(cpu) reads
+        // vtable from the constant GC object (cls_of_box). If it matches
+        // expected_class, the guard is redundant and can be removed.
+        if let Some(const_ref_raw) = ctx.get_constant_int(obj_ref) {
+            let const_ptr = const_ref_raw as usize;
+            if const_ptr != 0 {
+                let vtable = unsafe { *(const_ptr as *const usize) };
+                if vtable != 0 {
+                    if let Some(expected) = expected_class {
+                        if vtable == expected.0 {
+                            return OptimizationResult::Remove;
+                        }
+                    }
+                }
+            }
+        }
         // Constant-fold: if the guarded value is a compile-time constant,
         // check the class at optimization time. If it matches, remove the guard.
-        // PyPy guard.py: guards on constants are always removable.
         // This handles Phase 2 where virtual typeptr fields resolve to constants.
         if op.num_args() >= 2 {
             if let Some(value) = ctx.get_constant_int(obj_ref) {
