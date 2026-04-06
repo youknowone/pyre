@@ -4122,7 +4122,20 @@ fn run_compiled_code(
     // and updates the GcRef in place.
     let jf_shadow_depth = majit_gc::shadow_stack::push_jf(jf_gcref);
 
+    if std::env::var_os("MAJIT_LOG").is_some() {
+        eprintln!(
+            "[pre-call] code_ptr={:p} jf_ptr={:p} inputs.len={} ref_roots={} max_output={}",
+            code_ptr,
+            jf_ptr,
+            inputs.len(),
+            num_ref_roots,
+            max_output_slots
+        );
+    }
     let result_jf = unsafe { func(jf_ptr) };
+    if std::env::var_os("MAJIT_LOG").is_some() {
+        eprintln!("[post-call] result_jf={:p}", result_jf);
+    }
 
     // _call_footer_shadowstack (assembler.py:1130-1136) parity:
     majit_gc::shadow_stack::pop_jf_to(jf_shadow_depth);
@@ -4860,6 +4873,17 @@ impl CraneliftBackend {
             .filter_map(|(idx, op)| (op.opcode == OpCode::Label).then_some(idx))
             .collect();
         let has_entry_label = label_indices.first().copied() == Some(0);
+
+        if std::env::var_os("MAJIT_DUMP_CLIF").is_some() {
+            for &li in &label_indices {
+                eprintln!(
+                    "[label-dump] idx={} args.len={} args={:?}",
+                    li,
+                    ops[li].args.len(),
+                    ops[li].args
+                );
+            }
+        }
 
         // Body-direct entry disabled — requires bridge to provide full body args.
         let body_direct_num_inputs = 0;
@@ -8692,6 +8716,16 @@ impl CraneliftBackend {
 
         // Compile
         let mut ctx = Context::for_function(func);
+        if std::env::var_os("MAJIT_DUMP_CLIF").is_some() {
+            eprintln!(
+                "[jit][clif-dump] trace_id={} header_pc={} num_inputs={} num_ops={}\n{}",
+                trace_id,
+                header_pc,
+                inputargs.len(),
+                ops.len(),
+                ctx.func.display()
+            );
+        }
         if let Err(e) = self.module.define_function(func_id, &mut ctx) {
             if std::env::var_os("MAJIT_LOG").is_some() {
                 eprintln!("[jit][clif-error] {e}\nCLIF IR:\n{}", ctx.func.display());

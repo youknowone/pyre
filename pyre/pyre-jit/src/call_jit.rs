@@ -2723,6 +2723,8 @@ fn bh_call_fn_impl(callable: PyObjectRef, args: &[PyObjectRef]) -> i64 {
     // calls go through call_callable → call_user_function which checks
     // EVAL_OVERRIDE. Without force_plain_eval, those nested calls would
     // re-enter JIT compiled code, causing nested blackhole resume.
+    // TODO: implement bhimpl_recursive_call for portal calls to enable
+    // bridge compilation (blackhole.py:1101-1132).
     let _plain_guard = pyre_interpreter::call::force_plain_eval();
     if callable.is_null() {
         let err = pyre_interpreter::PyError::new(

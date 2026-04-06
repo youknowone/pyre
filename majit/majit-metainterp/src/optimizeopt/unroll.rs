@@ -888,6 +888,11 @@ impl UnrollOptimizer {
         }
 
         // ── Assembly (compile.py:310-338) ──
+        let field_remap = opt_p2
+            .final_ctx
+            .as_ref()
+            .map(|c| c.imported_field_remap.clone())
+            .unwrap_or_default();
         let mut combined = assemble_peeled_trace_with_jump_args(
             &p1_ops,
             &body_ops,
@@ -907,6 +912,8 @@ impl UnrollOptimizer {
             self.target_tokens
                 .last()
                 .map(|target| target.as_jump_target_descr()),
+            &exported_end_args,
+            &field_remap,
         );
         // RPython Box parity: drop duplicate-position ops. In RPython
         // each Box is unique so collisions can't happen. Keep first.
@@ -2564,6 +2571,9 @@ impl OptUnroll {
     /// reprocessing the same trace op at position X would overwrite the
     /// forwarding/PtrInfo set during import for the virtual's field at X.
     /// Remapping to fresh positions prevents this collision.
+    /// Also: two virtuals sharing a source op need distinct label slots.
+    /// The fresh position → original source mapping is captured in
+    /// ctx.imported_field_remap for the assembly to emit SameAs ops.
     fn remap_field_ref(
         old: OpRef,
         exported_infos: &HashMap<OpRef, ExportedValueInfo>,
@@ -2593,6 +2603,8 @@ impl OptUnroll {
         if let Some(&tp) = ctx.constant_types_for_numbering.get(&old.0) {
             ctx.constant_types_for_numbering.insert(fresh.0, tp);
         }
+        // Record fresh → old mapping for assembly label SameAs emission.
+        ctx.imported_field_remap.insert(fresh, old);
         fresh
     }
 
@@ -3403,6 +3415,8 @@ fn assemble_peeled_trace(
         constants,
         start_label_descr,
         loop_label_descr,
+        &[],             // no p1_end_args for simple assembly
+        &HashMap::new(), // no field_remap for simple assembly
     )
 }
 
@@ -3421,6 +3435,8 @@ fn assemble_peeled_trace_with_jump_args(
     constants: &std::collections::HashMap<u32, i64>,
     start_label_descr: Option<DescrRef>,
     loop_label_descr: Option<DescrRef>,
+    p1_end_args: &[OpRef],
+    imported_field_remap: &HashMap<OpRef, OpRef>,
 ) -> Vec<Op> {
     let mut result =
         Vec::with_capacity(p1_ops.len() + p2_ops.len() + 1 + imported_short_aliases.len());
@@ -3709,6 +3725,57 @@ fn assemble_peeled_trace_with_jump_args(
         // to the fresh aliases. Store in label_dedup_remap for remap_body_arg.
         for (fresh, original) in &label_scope_dedup {
             label_dedup_remap.insert(*original, *fresh);
+        }
+    }
+
+    // RPython Box identity parity: virtual field values remapped by
+    // import_state's remap_field_ref need SameAs ops to connect fresh
+    // label positions to their original Phase 1 sources. Also cover base
+    // label_args whose forwarding chain leads to a Phase 1 end_arg.
+    // In RPython, the JUMP's Box IS the label's Box — no mapping needed.
+    // flat OpRef emits explicit SameAs ops as an equivalent bridge.
+    for (i, &la) in full_label_args.iter().enumerate() {
+        if la.is_none() || is_trace_constant_ref(la, constants) {
+            continue;
+        }
+        if preamble_defs.contains(&la)
+            || imported_alias_remap.values().any(|&v| v == la)
+            || label_rescue_remap.values().any(|&v| v == la)
+            || label_dedup_remap.values().any(|&v| v == la)
+        {
+            continue; // already defined by preamble or alias SameAs
+        }
+        // Priority 1: field remap captured in import_state. The fresh label
+        // position maps to an original Phase 1 op position.
+        let source_opt = imported_field_remap.get(&la).copied().or_else(|| {
+            // Priority 2: base label arg position. Use the corresponding
+            // Phase 1 JUMP arg as the source.
+            if i < p1_end_args.len() {
+                let jump_arg = p1_end_args[i];
+                if !jump_arg.is_none() && preamble_defs.contains(&jump_arg) && jump_arg != la {
+                    return Some(jump_arg);
+                }
+            }
+            None
+        });
+        if let Some(source) = source_opt {
+            if preamble_defs.contains(&source) {
+                // Determine the correct SameAs opcode based on the preamble
+                // op's result type. Using SameAsI for Float values would cause
+                // Cranelift to misplace the value in an integer register.
+                let same_as_opcode = result
+                    .iter()
+                    .find(|op| op.pos == source)
+                    .map(|op| match op.opcode.result_type() {
+                        Type::Float => OpCode::SameAsF,
+                        Type::Ref => OpCode::SameAsR,
+                        _ => OpCode::SameAsI,
+                    })
+                    .unwrap_or(OpCode::SameAsI);
+                let mut op = Op::new(same_as_opcode, &[source]);
+                op.pos = la;
+                result.push(op);
+            }
         }
     }
 
