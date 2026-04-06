@@ -548,7 +548,7 @@ pub fn expand_state(input: DeriveInput) -> TokenStream {
                 if heap_ptr.is_null() {
                     return false;
                 }
-                unsafe { info.write_boxes(heap_ptr, static_boxes); }
+                unsafe { info.write_static_boxes(heap_ptr, static_boxes); }
                 true
             }
 
