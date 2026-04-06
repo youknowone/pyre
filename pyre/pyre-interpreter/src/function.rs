@@ -46,7 +46,9 @@ pub struct Function {
     pub w_kw_defs: PyObjectRef,
 }
 
+/// function.py:706 — `class BuiltinFunction(Function): can_change_code = False`
 pub type BuiltinFunction = Function;
+/// function.py:703 — `class FunctionWithFixedCode(Function): can_change_code = False`
 pub type FunctionWithFixedCode = Function;
 pub type Method = pyre_object::methodobject::W_MethodObject;
 pub type StaticMethod = pyre_object::propertyobject::W_StaticMethodObject;
@@ -97,6 +99,42 @@ pub fn function_new_with_closure(
         w_kw_defs: PY_NULL,
     });
     Box::into_raw(obj) as PyObjectRef
+}
+
+/// function.py:703 — `class FunctionWithFixedCode(Function): can_change_code = False`
+/// Allocate a function whose code pointer the JIT can treat as immutable.
+pub fn function_new_with_fixed_code(
+    code: *const (),
+    name: String,
+    w_func_globals: *mut PyNamespace,
+) -> PyObjectRef {
+    let name_ptr = Box::into_raw(Box::new(name)) as *const String;
+    let obj = Box::new(Function {
+        ob: PyObject {
+            ob_type: &FUNCTION_TYPE as *const PyType,
+        },
+        code,
+        can_change_code: false, // function.py:704
+        name: name_ptr,
+        w_func_globals,
+        closure: PY_NULL,
+        defs_w: PY_NULL,
+        w_kw_defs: PY_NULL,
+    });
+    Box::into_raw(obj) as PyObjectRef
+}
+
+/// function.py:367-370 — `_check_code_mutable(attr)`:
+/// Raises TypeError if function code is not mutable.
+pub unsafe fn _check_code_mutable(func: PyObjectRef, attr: &str) -> Result<(), crate::PyError> {
+    if (*(func as *const Function)).can_change_code {
+        Ok(())
+    } else {
+        Err(crate::PyError::type_error(format!(
+            "Cannot change {} attribute of builtin functions",
+            attr
+        )))
+    }
 }
 
 /// function.py:23 — `@jit.elidable_promote()`
@@ -358,9 +396,7 @@ pub unsafe fn fset_func_name(obj: PyObjectRef, name: PyObjectRef) {
     function_set_func_name(obj, name)
 }
 
-/// PyPy compatibility helper for descriptor mutation checks.
-#[inline]
-pub unsafe fn _check_code_mutable(_obj: PyObjectRef, _attr: *const str) {}
+// _check_code_mutable is defined above (function.py:367-370 parity).
 
 /// PyPy-compatible `__globals__` getter alias.
 #[inline]
@@ -374,11 +410,12 @@ pub unsafe fn function_set_w_globals(obj: PyObjectRef, globals: *mut PyNamespace
     (*(obj as *mut Function)).w_func_globals = globals;
 }
 
-/// PyPy-compatible `fset_func_code` descriptor.
+/// function.py:367 — fset_func_code checks mutability before setting.
 #[inline]
-pub unsafe fn fset_func_code(obj: PyObjectRef, code: *const ()) {
-    _check_code_mutable(obj, "func_code");
+pub unsafe fn fset_func_code(obj: PyObjectRef, code: *const ()) -> Result<(), crate::PyError> {
+    _check_code_mutable(obj, "func_code")?;
     function_set_func_code(obj, code);
+    Ok(())
 }
 
 /// PyPy-compatible `__closure__` getter alias.

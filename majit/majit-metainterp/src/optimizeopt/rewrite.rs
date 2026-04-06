@@ -2492,11 +2492,6 @@ impl Optimization for OptRewrite {
                 //     if info and info.is_null():
                 //         raise InvalidLoop(...)
                 //     return self.optimize_GUARD_CLASS(op)
-                //
-                // RPython's `getptrinfo(ConstPtr)` synthesizes a
-                // `ConstPtrInfo` (info.py:888-889), so a null `ConstPtr`
-                // is also caught here. `OptContext::getptrinfo` mirrors
-                // that synthesis.
                 if let Some(info) = ctx.getptrinfo(op.arg(0)) {
                     if info.is_null() {
                         raise_invalid_loop("GUARD_NONNULL_CLASS proven to always fail");

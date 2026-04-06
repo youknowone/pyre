@@ -61,6 +61,10 @@ pub enum OptimizationResult {
     Remove,
     /// Pass the operation to the next pass unchanged.
     PassOn,
+    /// rewrite.py:406 — a guard was proven to always fail; abort the trace.
+    /// RPython raises `InvalidLoop`; the optimizer catches it and discards
+    /// the loop or bridge.
+    InvalidLoop,
 }
 
 /// optimizer.py:47-54: deferred postprocess for GUARD_CLASS/GUARD_NONNULL_CLASS.
@@ -2339,10 +2343,6 @@ impl OptContext {
     pub fn getptrinfo(&self, opref: OpRef) -> Option<std::borrow::Cow<'_, PtrInfo>> {
         let resolved = self.get_box_replacement(opref);
         // info.py:888-889: isinstance(op, ConstPtr) → ConstPtrInfo(op).
-        // majit constants may be stored as Value::Ref(gcref) or as
-        // Value::Int(0) (a NULL ref encoded as integer). Synthesize
-        // PtrInfo::Constant in both cases so `is_null` / `is_nonnull`
-        // behave like RPython's ConstPtrInfo.
         if let Some(value) = self.get_constant(resolved) {
             match value {
                 Value::Ref(gcref) => {
