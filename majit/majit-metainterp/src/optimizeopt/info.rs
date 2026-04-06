@@ -637,11 +637,12 @@ impl PtrInfo {
         }
 
         // RPython info.py:148,226: optforce.emit_extra(op)
-        // When called from _emit_operation (in_final_emission=true),
-        // RPython is at the end of the chain so emit_extra goes directly
-        // to _newoperations. Use ctx.emit() for direct emission.
-        // When called from pass-level code (in_final_emission=false),
-        // route through emit_extra to process through remaining passes.
+        // `optforce` determines where emitted ops enter the pass chain:
+        //   optforce=Optimizer (in_final_emission) → emit directly
+        //   optforce=OptEarlyForce → route from earlyforce.next (= heap)
+        // When called from EarlyForce pass, current_pass_idx == earlyforce_idx
+        // so emit_extra automatically routes from earlyforce.next.
+        // When called from _emit_operation, in_final_emission=true → direct.
         let emit_op = |ctx: &mut crate::optimizeopt::OptContext, op: Op| -> OpRef {
             if ctx.in_final_emission {
                 ctx.emit(op)

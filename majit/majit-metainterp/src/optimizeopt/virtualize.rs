@@ -1857,16 +1857,11 @@ impl Optimization for OptVirtualize {
             _ if op.opcode.is_call() => self.optimize_escaping_op(op, ctx),
 
             // JUMP — RPython virtualize.py has no optimize_JUMP.
-            // pre_force_virtual_state is set by optimizer.rs before JUMP
-            // enters passes.
-            // Virtualizable frame: keep virtual, force others.
-            // optimizer.py:536-538 parity note: RPython does NOT send Phase 1
-            // JUMP through passes (flush=False). Virtuals stay virtual for
-            // export_state. In pyre, Phase 1 JUMP goes through passes because
-            // OptHeap lazy-set flush and guard resume data depend on it.
-            // This forces Phase 1 virtuals, which is a known deviation.
-            // TODO: implement force_box_for_end_of_preamble (unroll.py:454)
-            // to decouple virtual export from JUMP pass processing.
+            // RPython: Phase 1 JUMP doesn't go through passes (flush=False).
+            // In majit, Phase 1 JUMP goes through passes for heap flush.
+            // When NEW_WITH_VTABLE→Virtual is active, JUMP handler must NOT
+            // force virtuals (use PassOn). For VirtualStruct path, force
+            // non-virtualizable args to materialize lazy sets.
             OpCode::Jump if self.vable_config.is_some() => {
                 let frame_ref = ctx.get_box_replacement(OpRef(0));
                 let mut jump_op = op.clone();
@@ -1883,8 +1878,6 @@ impl Optimization for OptVirtualize {
                 }
                 OptimizationResult::Replace(jump_op)
             }
-
-            // Phase 2 JUMP (no virtualizable) — force escaping values.
             OpCode::Jump => self.optimize_escaping_op(op, ctx),
 
             // Escape ops (testing)

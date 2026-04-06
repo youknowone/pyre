@@ -245,6 +245,11 @@ pub struct OptContext {
     /// matching RPython's emit_extra(op, emit=False) which routes to
     /// self.next_optimization.
     pub current_pass_idx: usize,
+    /// earlyforce.py:32: self.optimizer.optearlyforce = self
+    /// Index of the OptEarlyForce pass in the pass chain.
+    /// Used by force_box_for_end_of_preamble and force_box to route
+    /// forced operations starting from earlyforce.next (= heap).
+    pub optearlyforce_idx: usize,
     /// optimizer.py: pendingfields — deferred SetfieldGc/SetarrayitemGc ops
     /// where the stored value is virtual. Set by OptHeap.emitting_operation()
     /// before a guard, consumed by emit_operation() to encode into
@@ -685,6 +690,7 @@ impl OptContext {
             preamble_end_args: None,
             skip_flush_mode: false,
             current_pass_idx: 0,
+            optearlyforce_idx: 0,
 
             in_final_emission: false,
             pending_for_guard: Vec::new(),
@@ -742,6 +748,7 @@ impl OptContext {
             preamble_end_args: None,
             skip_flush_mode: false,
             current_pass_idx: 0,
+            optearlyforce_idx: 0,
 
             in_final_emission: false,
             pending_for_guard: Vec::new(),
