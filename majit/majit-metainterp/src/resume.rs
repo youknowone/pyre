@@ -148,6 +148,9 @@ pub struct NumberingState {
     pub liveboxes: LiveboxMap,
     pub num_boxes: i32,
     pub num_virtuals: i32,
+    /// RPython Box.type parity: type of each TAGBOX livebox, captured at
+    /// numbering time when env.get_type() is called.
+    pub livebox_types: std::collections::HashMap<u32, majit_ir::Type>,
 }
 
 impl NumberingState {
@@ -157,6 +160,7 @@ impl NumberingState {
             liveboxes: LiveboxMap::new(),
             num_boxes: 0,
             num_virtuals: 0,
+            livebox_types: std::collections::HashMap::new(),
         }
     }
     pub fn append_short(&mut self, item: i16) {
@@ -3052,7 +3056,8 @@ impl ResumeDataLoopMemo {
                 numb_state.append_short(tagged);
                 continue;
             }
-            let is_virtual = match env.get_type(opref) {
+            let box_type = env.get_type(opref);
+            let is_virtual = match box_type {
                 majit_ir::Type::Ref => env.is_virtual_ref(opref),
                 majit_ir::Type::Int => env.is_virtual_raw(opref),
                 _ => false,
@@ -3062,6 +3067,7 @@ impl ResumeDataLoopMemo {
                 numb_state.num_virtuals += 1;
                 t
             } else {
+                numb_state.livebox_types.insert(opref.0, box_type);
                 let t = tag(numb_state.num_boxes, TAGBOX)?;
                 numb_state.num_boxes += 1;
                 t
@@ -3157,7 +3163,7 @@ impl ResumeDataLoopMemo {
     /// `optimizer_knowledge`: bridgeopt.py:63 serialize_optimizer_knowledge.
     ///   Heap field triples and known-class info for bridge compilation.
     ///
-    /// Returns `(rd_numb, rd_consts, rd_virtuals, liveboxes)`.
+    /// Returns `(rd_numb, rd_consts, rd_virtuals, liveboxes, livebox_types)`.
     pub fn finish(
         &mut self,
         mut numb_state: NumberingState,
@@ -3169,6 +3175,7 @@ impl ResumeDataLoopMemo {
         Vec<(i64, majit_ir::Type)>,
         Vec<majit_ir::RdVirtualInfo>,
         Vec<majit_ir::OpRef>,
+        std::collections::HashMap<u32, majit_ir::Type>,
     ) {
         let num_env_virtuals = numb_state.num_virtuals;
 
@@ -3537,7 +3544,21 @@ impl ResumeDataLoopMemo {
             })
             .collect();
 
-        (rd_numb, rd_consts, rd_virtuals, ordered_liveboxes)
+        // Merge livebox_types: numbering-time types + types for boxes
+        // discovered during virtual field walking.
+        let mut all_livebox_types = numb_state.livebox_types;
+        for &opref in &ordered_liveboxes {
+            if !opref.is_none() && !all_livebox_types.contains_key(&opref.0) {
+                all_livebox_types.insert(opref.0, env.get_type(opref));
+            }
+        }
+        (
+            rd_numb,
+            rd_consts,
+            rd_virtuals,
+            ordered_liveboxes,
+            all_livebox_types,
+        )
     }
 
     /// resume.py:452-468 finish (on ResumeDataVirtualAdder) — encode with shared pool.
@@ -5158,7 +5179,7 @@ mod tests {
 
         let snapshot = Snapshot::single_frame(8, vec![OpRef(10001), OpRef(1), OpRef(2), OpRef(3)]);
         let numb_state = memo.number(&snapshot, &env).unwrap();
-        let (rd_numb, rd_consts, _rd_virtuals, liveboxes) =
+        let (rd_numb, rd_consts, _rd_virtuals, liveboxes, _livebox_types) =
             memo.finish(numb_state, &env, &mut [], None);
 
         // liveboxes should contain only TAGBOX entries: OpRef(1) and OpRef(3)

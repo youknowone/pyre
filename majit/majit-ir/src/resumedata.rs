@@ -137,6 +137,8 @@ pub struct NumberingState {
     pub liveboxes: HashMap<u32, i16>,
     pub num_boxes: i32,
     pub num_virtuals: i32,
+    /// RPython Box.type parity: type of each TAGBOX livebox.
+    pub livebox_types: HashMap<u32, Type>,
 }
 
 impl NumberingState {
@@ -146,6 +148,7 @@ impl NumberingState {
             liveboxes: HashMap::new(),
             num_boxes: 0,
             num_virtuals: 0,
+            livebox_types: HashMap::new(),
         }
     }
 
@@ -299,7 +302,8 @@ impl ResumeDataLoopMemo {
                 continue;
             }
             // resume.py:210-216: virtual check
-            let is_virtual = match env.get_type(opref) {
+            let box_type = env.get_type(opref);
+            let is_virtual = match box_type {
                 Type::Ref => env.is_virtual_ref(opref),
                 Type::Int => env.is_virtual_raw(opref),
                 _ => false,
@@ -310,6 +314,7 @@ impl ResumeDataLoopMemo {
                 numb_state.num_virtuals += 1;
                 t
             } else {
+                numb_state.livebox_types.insert(opref.0, box_type);
                 let t = tag(numb_state.num_boxes, TAGBOX)?;
                 numb_state.num_boxes += 1;
                 t
