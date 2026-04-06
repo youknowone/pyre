@@ -291,15 +291,19 @@ pub fn function_get_doc(obj: PyObjectRef) -> PyObjectRef {
     crate::getattr(obj, "__doc__").unwrap_or(pyre_object::w_none())
 }
 
-/// PyPy `W_Function.w_doc` mutator.
+/// function.py:400 — `fset_func_doc` mutator.
 #[inline]
 pub fn function_set_doc(obj: PyObjectRef, value: PyObjectRef) {
+    // function.py:401
+    let _ = unsafe { _check_code_mutable(obj, "func_doc") };
     let _ = crate::setattr(obj, "__doc__", value);
 }
 
-/// PyPy `W_Function.w_doc` deleter.
+/// function.py:404 — `fdel_func_doc` deleter.
 #[inline]
 pub fn function_del_doc(obj: PyObjectRef) {
+    // function.py:405
+    let _ = unsafe { _check_code_mutable(obj, "func_doc") };
     let _ = crate::delattr(obj, "__doc__");
 }
 
@@ -314,9 +318,11 @@ pub unsafe fn fget_func_defaults(obj: PyObjectRef) -> PyObjectRef {
     }
 }
 
-/// PyPy `fset_func_defaults` mutator.
+/// function.py:381 — `fset_func_defaults` mutator.
 #[inline]
 pub unsafe fn fset_func_defaults(obj: PyObjectRef, value: PyObjectRef) {
+    // function.py:382
+    let _ = _check_code_mutable(obj, "func_defaults");
     if value.is_null() || unsafe { pyre_object::is_none(value) } {
         function_set_defaults(obj, pyre_object::PY_NULL);
     } else {
@@ -324,9 +330,11 @@ pub unsafe fn fset_func_defaults(obj: PyObjectRef, value: PyObjectRef) {
     }
 }
 
-/// PyPy `fdel_func_defaults` deleter.
+/// function.py:391 — `fdel_func_defaults` deleter.
 #[inline]
 pub unsafe fn fdel_func_defaults(obj: PyObjectRef) {
+    // function.py:392
+    let _ = _check_code_mutable(obj, "func_defaults");
     function_set_defaults(obj, pyre_object::PY_NULL);
 }
 
@@ -341,9 +349,10 @@ pub unsafe fn fget_func_kwdefaults(obj: PyObjectRef) -> PyObjectRef {
     }
 }
 
-/// PyPy `fset_func_kwdefaults` mutator.
+/// function.py — `fset_func_kwdefaults` mutator.
 #[inline]
 pub unsafe fn fset_func_kwdefaults(obj: PyObjectRef, value: PyObjectRef) {
+    let _ = _check_code_mutable(obj, "func_kwdefaults");
     if value.is_null() || unsafe { pyre_object::is_none(value) } {
         function_set_kwdefaults(obj, pyre_object::PY_NULL);
     } else {
@@ -357,10 +366,11 @@ pub unsafe fn fdel_func_kwdefaults(obj: PyObjectRef) {
     function_set_kwdefaults(obj, pyre_object::PY_NULL);
 }
 
-/// PyPy-compatible `__code__` getter alias.
+/// function.py:435-436 — `fget_func_code(self, space): return self.getcode()`
+/// Uses getcode() for JIT elidable_promote / promote path.
 #[inline]
 pub unsafe fn function_get_func_code(obj: PyObjectRef) -> *const () {
-    function_get_code(obj)
+    getcode(obj)
 }
 
 /// PyPy-compatible `__code__` setter.
@@ -390,9 +400,11 @@ pub unsafe fn function_set_func_name(obj: PyObjectRef, name: PyObjectRef) {
     (*(obj as *mut Function)).name = name;
 }
 
-/// PyPy-compatible setter for `__name__` descriptor.
+/// function.py:411 — `fset_func_name` setter.
 #[inline]
 pub unsafe fn fset_func_name(obj: PyObjectRef, name: PyObjectRef) {
+    // function.py:412
+    let _ = _check_code_mutable(obj, "func_name");
     function_set_func_name(obj, name)
 }
 

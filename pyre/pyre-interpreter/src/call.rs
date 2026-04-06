@@ -202,7 +202,7 @@ fn call_user_function_with_eval(
     args: &[PyObjectRef],
     eval_fn: EvalFn,
 ) -> PyResult {
-    let code_ptr = unsafe { function_get_code(callable) };
+    let code_ptr = unsafe { crate::getcode(callable) };
     let globals = unsafe { function_get_globals(callable) };
     let closure = unsafe { function_get_closure(callable) };
     let defaults = unsafe { crate::function_get_defaults(callable) };
@@ -396,7 +396,7 @@ pub fn call_user_function_plain_with_ctx(
     callable: PyObjectRef,
     args: &[PyObjectRef],
 ) -> PyResult {
-    let code_ptr = unsafe { function_get_code(callable) };
+    let code_ptr = unsafe { crate::getcode(callable) };
     let globals = unsafe { function_get_globals(callable) };
     let closure = unsafe { function_get_closure(callable) };
     let func_code = code_ptr as *const crate::CodeObject;
@@ -529,7 +529,7 @@ pub(crate) fn resolve_kwargs(
         return args.to_vec();
     };
 
-    let code_ptr = unsafe { function_get_code(target_func) };
+    let code_ptr = unsafe { crate::getcode(target_func) };
     let code = unsafe { &*(code_ptr as *const crate::CodeObject) };
     // Total named params = positional + keyword-only
     let total_params = (code.arg_count + code.kwonlyarg_count) as usize;
@@ -659,7 +659,7 @@ pub fn call_with_kwargs(
 
     // For user functions: resolve kwargs to parameter slots
     if unsafe { crate::is_function(callable) } {
-        let code_ptr = unsafe { function_get_code(callable) };
+        let code_ptr = unsafe { crate::getcode(callable) };
         let code = unsafe { &*(code_ptr as *const crate::CodeObject) };
         let total_params = (code.arg_count + code.kwonlyarg_count) as usize;
         let has_varkw = code.flags.contains(crate::CodeFlags::VARKEYWORDS);
@@ -977,7 +977,7 @@ fn issubtype_ptr(w_type: PyObjectRef, cls: PyObjectRef) -> bool {
 
 /// Helper: call a user function with arbitrary args from descriptor context.
 fn call_user_function_with_args(func: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRef {
-    let code_ptr = unsafe { function_get_code(func) };
+    let code_ptr = unsafe { crate::getcode(func) };
     let globals = unsafe { function_get_globals(func) };
     let closure = unsafe { function_get_closure(func) };
     let defaults = unsafe { crate::function_get_defaults(func) };
@@ -1081,7 +1081,7 @@ fn call_metaclass_with_kwargs(
     if let Some(new_fn) = new_fn {
         if unsafe { crate::is_function(new_fn) } {
             // User function: resolve kwargs to kwonly params
-            let code_ptr = unsafe { function_get_code(new_fn) };
+            let code_ptr = unsafe { crate::getcode(new_fn) };
             let code = unsafe { &*(code_ptr as *const crate::CodeObject) };
             let nparams = code.arg_count as usize; // positional params
             let nkwonly = code.kwonlyarg_count as usize;
@@ -1234,7 +1234,7 @@ fn build_class_inner(
     w_metaclass: Option<PyObjectRef>,
     extra_kwargs: Option<PyObjectRef>,
 ) -> PyResult {
-    let code_ptr = unsafe { function_get_code(body_fn) };
+    let code_ptr = unsafe { crate::getcode(body_fn) };
     let globals = unsafe { function_get_globals(body_fn) };
     let closure = unsafe { function_get_closure(body_fn) };
     let func_code = code_ptr as *const crate::CodeObject;
