@@ -613,7 +613,6 @@ pub enum OpCode {
     GuardGcType,
     GuardIsObject,
     GuardSubclass,
-    GuardCompatible,
     // ── Guards (non-foldable) ──
     GuardNoException,
     GuardException,
@@ -907,7 +906,7 @@ const FINAL_LAST: u16 = OpCode::Finish as u16;
 
 const GUARD_FIRST: u16 = OpCode::GuardTrue as u16;
 const GUARD_FOLDABLE_FIRST: u16 = OpCode::GuardTrue as u16;
-const GUARD_FOLDABLE_LAST: u16 = OpCode::GuardCompatible as u16;
+const GUARD_FOLDABLE_LAST: u16 = OpCode::GuardSubclass as u16;
 const GUARD_LAST: u16 = OpCode::GuardAlwaysFails as u16;
 
 const ALWAYS_PURE_FIRST: u16 = OpCode::IntAdd as u16;
@@ -1516,7 +1515,6 @@ static OPARITY: [Option<u8>; OPCODE_COUNT] = {
     set!(GuardGcType, 2);
     set!(GuardIsObject, 1);
     set!(GuardSubclass, 2);
-    set!(GuardCompatible, 2);
     set!(GuardNoException, 0);
     set!(GuardException, 1);
     set!(GuardNoOverflow, 0);
@@ -1754,7 +1752,6 @@ static OPWITHDESCR: [bool; OPCODE_COUNT] = {
         GuardGcType,
         GuardIsObject,
         GuardSubclass,
-        GuardCompatible,
         GuardNoException,
         GuardException,
         GuardNoOverflow,
@@ -2120,7 +2117,6 @@ static OPNAME: [&str; OPCODE_COUNT] = {
         GuardGcType,
         GuardIsObject,
         GuardSubclass,
-        GuardCompatible,
         GuardNoException,
         GuardException,
         GuardNoOverflow,
@@ -2552,7 +2548,6 @@ mod tests {
             OpCode::GuardNonnullClass,
             OpCode::GuardGcType,
             OpCode::GuardSubclass,
-            OpCode::GuardCompatible,
             OpCode::SetfieldGc,
             OpCode::SetfieldRaw,
             OpCode::CondCallGcWbArray,
@@ -2865,7 +2860,6 @@ mod tests {
             OpCode::GuardGcType,
             OpCode::GuardIsObject,
             OpCode::GuardSubclass,
-            OpCode::GuardCompatible,
             OpCode::GuardNoException,
             OpCode::GuardException,
             OpCode::GuardNoOverflow,
@@ -2896,7 +2890,6 @@ mod tests {
             OpCode::GuardGcType,
             OpCode::GuardIsObject,
             OpCode::GuardSubclass,
-            OpCode::GuardCompatible,
         ];
         for op in &foldable_guards {
             assert!(op.is_foldable_guard(), "{:?} should be foldable", op);

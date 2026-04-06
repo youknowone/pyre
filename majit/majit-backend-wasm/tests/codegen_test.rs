@@ -41,7 +41,8 @@ fn test_empty_trace() {
     }];
     let constants = HashMap::new();
     let (bytes, guards) =
-        codegen::build_wasm_module(&inputargs, &ops, &constants, Some(0), &HashMap::new());
+        codegen::build_wasm_module(&inputargs, &ops, &constants, Some(0), &HashMap::new())
+            .expect("wasm codegen should succeed");
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 1);
     assert!(guards[0].is_finish);
@@ -78,7 +79,8 @@ fn test_int_add_loop() {
     ];
 
     let (bytes, guards) =
-        codegen::build_wasm_module(&inputargs, &ops, &constants, Some(0), &HashMap::new());
+        codegen::build_wasm_module(&inputargs, &ops, &constants, Some(0), &HashMap::new())
+            .expect("wasm codegen should succeed");
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 1); // one guard
     assert!(!guards[0].is_finish);
@@ -114,7 +116,8 @@ fn test_float_ops() {
 
     let constants = HashMap::new();
     let (bytes, guards) =
-        codegen::build_wasm_module(&inputargs, &ops, &constants, Some(0), &HashMap::new());
+        codegen::build_wasm_module(&inputargs, &ops, &constants, Some(0), &HashMap::new())
+            .expect("wasm codegen should succeed");
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 1);
 }
@@ -137,7 +140,8 @@ fn test_call_generates_import() {
     }];
 
     let (bytes, guards) =
-        codegen::build_wasm_module(&inputargs, &ops, &constants, Some(0), &HashMap::new());
+        codegen::build_wasm_module(&inputargs, &ops, &constants, Some(0), &HashMap::new())
+            .expect("wasm codegen should succeed");
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 1);
 
@@ -200,7 +204,8 @@ fn test_guard_types() {
 
     let constants = HashMap::new();
     let (bytes, guards) =
-        codegen::build_wasm_module(&inputargs, &ops, &constants, Some(0), &HashMap::new());
+        codegen::build_wasm_module(&inputargs, &ops, &constants, Some(0), &HashMap::new())
+            .expect("wasm codegen should succeed");
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 7);
 }
@@ -229,19 +234,22 @@ fn test_guard_gc_type_uses_immediate_typeid() {
     ];
 
     let (bytes, guards) =
-        codegen::build_wasm_module(&inputargs, &ops, &constants, Some(0), &HashMap::new());
+        codegen::build_wasm_module(&inputargs, &ops, &constants, Some(0), &HashMap::new())
+            .expect("wasm codegen should succeed");
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 1);
 }
 
-/// GUARD_IS_OBJECT / GUARD_SUBCLASS / GUARD_COMPATIBLE are not emitted
-/// by pyre's tracer and have no RPython semantics implementable against
-/// pyre's runtime layout (no TYPE_INFO table, no subclassrange fields,
-/// no RPython origin respectively). The wasm backend skips them at
-/// codegen time — no instructions, no panic. This test only checks
-/// that the generated module still validates when the opcodes appear.
+/// GUARD_IS_OBJECT and GUARD_SUBCLASS have defined RPython semantics
+/// (x86/assembler.py:1924-1943 and 1945-1980) that require the
+/// gc_ll_descr TYPE_INFO/infobits and subclassrange layouts. pyre's
+/// runtime does not install those layouts on the wasm backend, so
+/// lowering would silently diverge from RPython. The wasm backend must
+/// reject these opcodes at compile time rather than pass them through.
 #[test]
-fn test_unused_type_guards_are_skipped() {
+fn test_guard_is_object_is_rejected() {
+    use majit_backend::BackendError;
+
     let inputargs = vec![InputArg {
         index: 0,
         tp: Type::Int,
@@ -250,15 +258,42 @@ fn test_unused_type_guards_are_skipped() {
     let ops = vec![
         Op::new(OpCode::Label, &[OpRef(0)]),
         make_guard(OpCode::GuardIsObject, &[OpRef(0)], &[OpRef(0)]),
-        make_guard(OpCode::GuardSubclass, &[OpRef(0), OpRef(0)], &[OpRef(0)]),
-        make_guard(OpCode::GuardCompatible, &[OpRef(0), OpRef(0)], &[OpRef(0)]),
         Op::new(OpCode::Jump, &[OpRef(0)]),
     ];
 
     let constants = HashMap::new();
-    let (bytes, _guards) =
-        codegen::build_wasm_module(&inputargs, &ops, &constants, Some(0), &HashMap::new());
-    validate_wasm(&bytes);
+    match codegen::build_wasm_module(&inputargs, &ops, &constants, Some(0), &HashMap::new()) {
+        Err(BackendError::CompilationFailed(msg)) => {
+            assert!(msg.contains("GUARD_IS_OBJECT"), "unexpected error: {msg}");
+        }
+        Err(other) => panic!("expected CompilationFailed, got {other:?}"),
+        Ok(_) => panic!("GUARD_IS_OBJECT should be rejected"),
+    }
+}
+
+#[test]
+fn test_guard_subclass_is_rejected() {
+    use majit_backend::BackendError;
+
+    let inputargs = vec![InputArg {
+        index: 0,
+        tp: Type::Int,
+    }];
+
+    let ops = vec![
+        Op::new(OpCode::Label, &[OpRef(0)]),
+        make_guard(OpCode::GuardSubclass, &[OpRef(0), OpRef(0)], &[OpRef(0)]),
+        Op::new(OpCode::Jump, &[OpRef(0)]),
+    ];
+
+    let constants = HashMap::new();
+    match codegen::build_wasm_module(&inputargs, &ops, &constants, Some(0), &HashMap::new()) {
+        Err(BackendError::CompilationFailed(msg)) => {
+            assert!(msg.contains("GUARD_SUBCLASS"), "unexpected error: {msg}");
+        }
+        Err(other) => panic!("expected CompilationFailed, got {other:?}"),
+        Ok(_) => panic!("GUARD_SUBCLASS should be rejected"),
+    }
 }
 
 #[test]
@@ -287,7 +322,8 @@ fn test_sameas_and_conversions() {
 
     let constants = HashMap::new();
     let (bytes, _) =
-        codegen::build_wasm_module(&inputargs, &ops, &constants, Some(0), &HashMap::new());
+        codegen::build_wasm_module(&inputargs, &ops, &constants, Some(0), &HashMap::new())
+            .expect("wasm codegen should succeed");
     validate_wasm(&bytes);
 }
 
@@ -326,7 +362,8 @@ fn test_overflow_ops() {
 
     let constants = HashMap::new();
     let (bytes, guards) =
-        codegen::build_wasm_module(&inputargs, &ops, &constants, Some(0), &HashMap::new());
+        codegen::build_wasm_module(&inputargs, &ops, &constants, Some(0), &HashMap::new())
+            .expect("wasm codegen should succeed");
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 3); // 2 GuardNoOverflow + 1 Finish
 }
