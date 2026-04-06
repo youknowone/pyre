@@ -15,6 +15,7 @@ members = [
     "majit/majit-trace",
     "majit/majit-backend",
     "majit/majit-backend-cranelift",
+    "majit/majit-backend-dynasm",
     "majit/majit-backend-wasm",
     "majit/majit-gc",
     "majit/majit-macros",
@@ -60,6 +61,7 @@ majit-ir = { version = "0.0.2", path = "majit/majit-ir" }
 majit-trace = { version = "0.0.2", path = "majit/majit-trace" }
 majit-backend = { version = "0.0.2", path = "majit/majit-backend" }
 majit-backend-cranelift = { version = "0.0.2", path = "majit/majit-backend-cranelift" }
+majit-backend-dynasm = { version = "0.0.2", path = "majit/majit-backend-dynasm" }
 majit-backend-wasm = { version = "0.0.2", path = "majit/majit-backend-wasm" }
 majit-gc = { version = "0.0.2", path = "majit/majit-gc" }
 majit-macros = { version = "0.0.2", path = "majit/majit-macros" }

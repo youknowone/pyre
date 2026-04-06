@@ -11,4 +11,4 @@ path = "src/main.rs"
 [dependencies]
 pyre-object = { workspace = true }
 pyre-interpreter = { workspace = true }
-pyre-jit = { workspace = true }
+pyre-jit = { workspace = true, features = ["cranelift"] }
