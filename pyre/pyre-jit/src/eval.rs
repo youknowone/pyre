@@ -723,6 +723,11 @@ fn init_callbacks() {
                 jit_create_self_recursive_callee_frame_1_raw_int:
                     crate::call_jit::jit_create_self_recursive_callee_frame_1_raw_int as *const (),
                 driver_pair: || JIT_DRIVER.with(|cell| cell.get() as *mut u8),
+                ensure_majit_jitcode: |code| {
+                    if !code.is_null() {
+                        crate::jit::codewriter::ensure_jitcode_for(unsafe { &*code });
+                    }
+                },
             }));
             callbacks::init(cb);
         }
