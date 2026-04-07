@@ -3327,13 +3327,19 @@ mod tests {
         assert_eq!(stats.loops_compiled, 0);
         assert_eq!(stats.loops_aborted, 0);
 
-        // Warm up and start tracing.
+        // Warm up and start tracing. Pass a single live value so that
+        // setup_tracing (pyjitpl.rs:1186) registers one inputarg via
+        // recorder.record_input_arg — this gives the trace a valid
+        // `OpRef(0)` inputarg that the GuardTrue below references.
+        // Without the inputarg, TraceIterator (opencoder.py:257-266)
+        // correctly rejects a TAGBOX reference to an unseeded cache
+        // slot (`_get(i)` asserts `res is not None`).
         assert!(matches!(
-            driver.meta.on_back_edge(key, &[]),
+            driver.meta.on_back_edge(key, &[0i64]),
             BackEdgeAction::Interpret
         ));
         assert!(matches!(
-            driver.meta.on_back_edge(key, &[]),
+            driver.meta.on_back_edge(key, &[0i64]),
             BackEdgeAction::StartedTracing
         ));
 
