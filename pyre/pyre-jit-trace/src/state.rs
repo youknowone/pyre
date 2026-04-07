@@ -2298,7 +2298,7 @@ impl JitState for PyreJitState {
 
     fn update_meta_for_cut(meta: &mut Self::Meta, header_pc: usize, original_box_types: &[Type]) {
         // Update valuestackdepth from the merge point's box layout.
-        // Layout: [Ref(frame), Int(ni), Int(vsd), locals..., stack...]
+        // Layout: [Ref(frame), Int(ni), Ref(code), Int(vsd), Ref(ns), locals..., stack...]
         // PyreMeta.valuestackdepth is ABSOLUTE (nlocals + stack_items).
         use crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
         if original_box_types.len() >= NUM_SCALAR_INPUTARGS {
@@ -2579,7 +2579,7 @@ impl JitState for PyreJitState {
         // pyre frame slots (locals_cells_stack_w) are all GCREF (Ref).
         let nlocals = meta.num_locals;
         let stack_only = self.valuestackdepth().saturating_sub(nlocals);
-        // Header [frame_ptr=Ref, ni=Int, vsd=Int] + all locals/stack as Ref.
+        // Header [frame_ptr=Ref, ni=Int, code=Ref, vsd=Int, ns=Ref] + all locals/stack as Ref.
         Some(crate::virtualizable_gen::virt_live_value_types(
             nlocals + stack_only,
         ))
@@ -2590,7 +2590,7 @@ impl JitState for PyreJitState {
     /// each callback_r writes a ref value to the register at the given index.
     /// In pyre, this writes values to the PyFrame's locals/stack via the
     /// virtualizable mechanism (restore_virtualizable_state handles the
-    /// full [frame, ni, vsd, locals..., stack...] layout).
+    /// full [frame, ni, code, vsd, ns, locals..., stack...] layout).
     fn restore_reconstructed_frame_values(
         &mut self,
         meta: &Self::Meta,
@@ -4130,7 +4130,7 @@ mod tests {
         // Liveness-based: only slots live at orgpc are included.
         assert!(
             fail_args.len() >= crate::virtualizable_gen::NUM_SCALAR_INPUTARGS,
-            "must have frame + ni + vsd header"
+            "must have frame + ni + code + vsd + ns header"
         );
         assert_eq!(fail_args[0], frame_ref);
         assert!(
