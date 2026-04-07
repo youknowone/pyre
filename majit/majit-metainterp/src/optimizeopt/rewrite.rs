@@ -1134,10 +1134,20 @@ impl OptRewrite {
     fn optimize_int_is_true(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = op.arg(0);
 
-        // `is_raw_ptr(arg)` is only true for Ref-typed raw pointers; for
-        // those RPython skips the is_bool shortcut. Int-typed bools go
-        // through the intbound path.
-        if !self.is_ref_typed(arg0, ctx) {
+        // rewrite.py:505-510 optimize_INT_IS_TRUE:
+        //     if (not self.is_raw_ptr(op.getarg(0)) and
+        //         self.getintbound(op.getarg(0)).is_bool()):
+        //         self.make_equal_to(op, op.getarg(0))
+        //         return
+        //     return self._optimize_nullness(op, op.getarg(0), True)
+        //
+        // is_raw_ptr (optimizer.py:154-158) checks for an
+        // AbstractRawPtrInfo on the box's forwarded slot — NOT a
+        // Ref-typed Box check. A raw-pointer 'i'-typed Box (i.e. one
+        // pointing into a virtual raw buffer) skips the is_bool
+        // shortcut because the buffer pointer's intbound is unrelated
+        // to its boolean truthiness.
+        if !ctx.is_raw_ptr(arg0) {
             if let Some(bound) = ctx.get_int_bound(arg0) {
                 if bound.is_bool() {
                     // make_equal_to: replace INT_IS_TRUE result with arg0.
