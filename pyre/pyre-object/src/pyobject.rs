@@ -64,41 +64,52 @@ pub const OB_TYPE_OFFSET: usize = std::mem::offset_of!(PyObject, ob_type);
 
 /// Every built-in `PyType` static that represents a full `PyObject`
 /// subtype (i.e. instances carry `ob_type` at offset 0, matching
-/// `rclass.OBJECT` layout). The JIT registers each of these with the
-/// GC via `register_vtable_for_type` so `cpu.check_is_object(gcref)`
-/// returns true for their instances — see llmodel.py:541-546 and
-/// info.py:763-772 `ConstPtrInfo.get_known_class(cpu)`.
+/// `rclass.OBJECT` layout), paired with its parent class.
 ///
-/// `INT_TYPE` and `FLOAT_TYPE` are intentionally absent: they get
-/// their own type_ids (`W_INT_GC_TYPE_ID` / `W_FLOAT_GC_TYPE_ID`)
+/// Modelled on RPython's `assign_inheritance_ids`
+/// (normalizecalls.py:373-389) which walks `classdef.getmro()` to build
+/// the reversed-MRO witness for each class. The JIT registers each
+/// `(type, parent)` pair with the GC via `register_vtable_for_type`,
+/// using the parent typeid as `TypeInfo::object_subclass`'s `parent`
+/// argument so the resulting `subclassrange_{min,max}` faithfully
+/// represents the `rclass.OBJECT` hierarchy. `GUARD_SUBCLASS` then
+/// resolves to `int_between(cls.min, subcls.min, cls.max)` per
+/// rclass.py:1133-1137 `ll_issubclass`.
+///
+/// `INSTANCE_TYPE` (the `tp_name = "object"` root) is intentionally
+/// absent: it is registered separately as the `rclass.OBJECT` root
+/// with no parent. `INT_TYPE` and `FLOAT_TYPE` are also absent: they
+/// get their own ids (`W_INT_GC_TYPE_ID` / `W_FLOAT_GC_TYPE_ID`)
 /// because the JIT backend allocates W_IntObject / W_FloatObject
 /// through NewWithVtable and needs the correct payload size.
-pub fn all_foreign_pytypes() -> &'static [&'static PyType] {
-    static PYTYPES: &[&PyType] = &[
-        &BOOL_TYPE,
-        &STR_TYPE,
-        &LIST_TYPE,
-        &TUPLE_TYPE,
-        &DICT_TYPE,
-        &LONG_TYPE,
-        &NONE_TYPE,
-        &NOTIMPLEMENTED_TYPE,
-        &MODULE_TYPE,
-        &TYPE_TYPE,
-        &INSTANCE_TYPE,
-        &crate::superobject::SUPER_TYPE,
-        &crate::bytearrayobject::BYTEARRAY_TYPE,
-        &crate::generatorobject::GENERATOR_TYPE,
-        &crate::unionobject::UNION_TYPE,
-        &crate::rangeobject::RANGE_ITER_TYPE,
-        &crate::rangeobject::SEQ_ITER_TYPE,
-        &crate::cellobject::CELL_TYPE,
-        &crate::methodobject::METHOD_TYPE,
-        &crate::propertyobject::PROPERTY_TYPE,
-        &crate::propertyobject::STATICMETHOD_TYPE,
-        &crate::propertyobject::CLASSMETHOD_TYPE,
-        &crate::excobject::EXCEPTION_TYPE,
-        &crate::sliceobject::SLICE_TYPE,
+pub fn all_foreign_pytypes() -> &'static [(&'static PyType, &'static PyType)] {
+    static PYTYPES: &[(&PyType, &PyType)] = &[
+        // bool inherits from int (objectobject.py W_BoolObject.typedef).
+        (&BOOL_TYPE, &INT_TYPE),
+        (&STR_TYPE, &INSTANCE_TYPE),
+        (&LIST_TYPE, &INSTANCE_TYPE),
+        (&TUPLE_TYPE, &INSTANCE_TYPE),
+        (&DICT_TYPE, &INSTANCE_TYPE),
+        // longobject.py W_LongObject — Python 3 unifies long under int,
+        // but pyre carries a separate static for the BigInt-backed flavour.
+        (&LONG_TYPE, &INSTANCE_TYPE),
+        (&NONE_TYPE, &INSTANCE_TYPE),
+        (&NOTIMPLEMENTED_TYPE, &INSTANCE_TYPE),
+        (&MODULE_TYPE, &INSTANCE_TYPE),
+        (&TYPE_TYPE, &INSTANCE_TYPE),
+        (&crate::superobject::SUPER_TYPE, &INSTANCE_TYPE),
+        (&crate::bytearrayobject::BYTEARRAY_TYPE, &INSTANCE_TYPE),
+        (&crate::generatorobject::GENERATOR_TYPE, &INSTANCE_TYPE),
+        (&crate::unionobject::UNION_TYPE, &INSTANCE_TYPE),
+        (&crate::rangeobject::RANGE_ITER_TYPE, &INSTANCE_TYPE),
+        (&crate::rangeobject::SEQ_ITER_TYPE, &INSTANCE_TYPE),
+        (&crate::cellobject::CELL_TYPE, &INSTANCE_TYPE),
+        (&crate::methodobject::METHOD_TYPE, &INSTANCE_TYPE),
+        (&crate::propertyobject::PROPERTY_TYPE, &INSTANCE_TYPE),
+        (&crate::propertyobject::STATICMETHOD_TYPE, &INSTANCE_TYPE),
+        (&crate::propertyobject::CLASSMETHOD_TYPE, &INSTANCE_TYPE),
+        (&crate::excobject::EXCEPTION_TYPE, &INSTANCE_TYPE),
+        (&crate::sliceobject::SLICE_TYPE, &INSTANCE_TYPE),
     ];
     PYTYPES
 }

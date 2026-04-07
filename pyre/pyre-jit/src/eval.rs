@@ -49,7 +49,7 @@ enum JitAction {
 }
 
 use crate::jit::descr::{
-    JITFRAME_GC_TYPE_ID, PYRE_OBJECT_GC_TYPE_ID, W_FLOAT_GC_TYPE_ID, W_INT_GC_TYPE_ID,
+    JITFRAME_GC_TYPE_ID, OBJECT_GC_TYPE_ID, W_FLOAT_GC_TYPE_ID, W_INT_GC_TYPE_ID,
 };
 use crate::jit::virtualizable_gen::build_virtualizable_info;
 use majit_gc::collector::MiniMarkGC;
@@ -72,58 +72,98 @@ thread_local! {
         d.meta_interp_mut().num_scalar_inputargs =
             pyre_jit_trace::virtualizable_gen::NUM_SCALAR_INPUTARGS;
         let mut gc = MiniMarkGC::new();
+        // rclass.OBJECT root (rclass.py:160-166). pyre's static
+        // `INSTANCE_TYPE` is the `tp_name = "object"` PyType — every
+        // other `PyObject`-layout class chains its `parent` field to
+        // this id so `assign_inheritance_ids` (normalizecalls.py:373-389)
+        // produces a `subclassrange_{min,max}` covering every
+        // descendant. The size is `sizeof(PyObject)` because instances
+        // tagged with `&INSTANCE_TYPE` (i.e. user `object()` calls)
+        // carry only the `ob_type` header.
+        let object_tid =
+            gc.register_type(TypeInfo::object(std::mem::size_of::<pyre_object::PyObject>()));
+        debug_assert_eq!(object_tid, OBJECT_GC_TYPE_ID);
         // W_IntObject / W_FloatObject carry `PyObject.ob_type` at offset 0,
         // matching RPython `rclass.OBJECT` layout (T_IS_RPYTHON_INSTANCE,
-        // gc.py:642). Register them with `TypeInfo::object` so
-        // `cpu.check_is_object(gcref)` returns true and the optimizer's
-        // `ConstPtrInfo.get_known_class(cpu)` path can call `cls_of_box`.
-        let w_int_tid = gc.register_type(TypeInfo::object(std::mem::size_of::<W_IntObject>()));
+        // gc.py:642). They are NewWithVtable allocation targets so the
+        // payload size must be the actual struct size, and they sit one
+        // level below the OBJECT root (`int.__bases__ == (object,)`,
+        // `float.__bases__ == (object,)`).
+        let w_int_tid = gc.register_type(TypeInfo::object_subclass(
+            std::mem::size_of::<W_IntObject>(),
+            object_tid,
+        ));
         debug_assert_eq!(w_int_tid, W_INT_GC_TYPE_ID);
-        let w_float_tid =
-            gc.register_type(TypeInfo::object(std::mem::size_of::<W_FloatObject>()));
+        let w_float_tid = gc.register_type(TypeInfo::object_subclass(
+            std::mem::size_of::<W_FloatObject>(),
+            object_tid,
+        ));
         debug_assert_eq!(w_float_tid, W_FLOAT_GC_TYPE_ID);
         // jitframe.py:49 — rgc.register_custom_trace_hook(JITFRAME, jitframe_trace)
         let jitframe_tid = gc.register_type(majit_metainterp::jitframe::jitframe_type_info());
         debug_assert_eq!(jitframe_tid, JITFRAME_GC_TYPE_ID);
-        // Collective type_id for every other pyre `PyObject`-layout
-        // type. Size is sizeof(PyObject) (the ob_type header); this
-        // type_id is never used as a GC allocation target, only as
-        // `check_is_object` lookup (see PYRE_OBJECT_GC_TYPE_ID docs).
-        let pyre_object_tid =
-            gc.register_type(TypeInfo::object(std::mem::size_of::<pyre_object::PyObject>()));
-        debug_assert_eq!(pyre_object_tid, PYRE_OBJECT_GC_TYPE_ID);
         // llsupport/gc.py:563 vtable→typeid mapping. RPython derives the
         // typeid arithmetically from gc_get_type_info_group; pyre keeps an
-        // explicit table because INT_TYPE / FLOAT_TYPE are static globals
-        // unrelated to the GC's internal layout.
+        // explicit table because every PyType is a static global
+        // unrelated to the GC's internal layout. The OBJECT root and
+        // INT/FLOAT are wired up first so subsequent foreign-pytype
+        // entries can resolve their parents through the same map.
+        let mut pytype_to_tid: HashMap<usize, u32> = HashMap::new();
+        majit_gc::GcAllocator::register_vtable_for_type(
+            &mut gc,
+            &pyre_object::pyobject::INSTANCE_TYPE as *const _ as usize,
+            object_tid,
+        );
+        pytype_to_tid.insert(
+            &pyre_object::pyobject::INSTANCE_TYPE as *const _ as usize,
+            object_tid,
+        );
         majit_gc::GcAllocator::register_vtable_for_type(
             &mut gc,
             &pyre_object::pyobject::INT_TYPE as *const _ as usize,
-            W_INT_GC_TYPE_ID,
+            w_int_tid,
+        );
+        pytype_to_tid.insert(
+            &pyre_object::pyobject::INT_TYPE as *const _ as usize,
+            w_int_tid,
         );
         majit_gc::GcAllocator::register_vtable_for_type(
             &mut gc,
             &pyre_object::pyobject::FLOAT_TYPE as *const _ as usize,
-            W_FLOAT_GC_TYPE_ID,
+            w_float_tid,
         );
-        // Every other built-in PyType: register under the shared
-        // PYRE_OBJECT_GC_TYPE_ID so constant-class folding
-        // (info.py:763-772 `ConstPtrInfo.get_known_class(cpu)`) works
-        // for str / list / None / exception / type / instance / etc.
+        pytype_to_tid.insert(
+            &pyre_object::pyobject::FLOAT_TYPE as *const _ as usize,
+            w_float_tid,
+        );
+        // Walk every remaining built-in PyType and register one
+        // `TypeInfo::object_subclass` per class, mirroring how
+        // `assign_inheritance_ids` (normalizecalls.py:373-389) walks
+        // `bk.bookkeeper.classdefs`. Each entry resolves its parent
+        // through `pytype_to_tid`, so the resulting hierarchy obeys
+        // `int_between(cls.min, subcls.min, cls.max)` (rclass.py:1133).
         // `pyre_object::pyobject::all_foreign_pytypes()` covers object
         // module PyTypes; `pyre_interpreter::all_foreign_pytypes()`
         // covers interpreter-level PyTypes (CODE_TYPE / FUNCTION_TYPE
         // / BUILTIN_CODE_TYPE) that flow through tracing as constant
         // callable/code pointers.
-        for pytype in pyre_object::pyobject::all_foreign_pytypes()
+        for (pytype, parent) in pyre_object::pyobject::all_foreign_pytypes()
             .iter()
             .chain(pyre_interpreter::all_foreign_pytypes().iter())
         {
+            let parent_tid = *pytype_to_tid
+                .get(&(*parent as *const _ as usize))
+                .expect("foreign pytype parent must be registered before its subclass");
+            let tid = gc.register_type(TypeInfo::object_subclass(
+                std::mem::size_of::<pyre_object::PyObject>(),
+                parent_tid,
+            ));
             majit_gc::GcAllocator::register_vtable_for_type(
                 &mut gc,
                 *pytype as *const _ as usize,
-                PYRE_OBJECT_GC_TYPE_ID,
+                tid,
             );
+            pytype_to_tid.insert(*pytype as *const _ as usize, tid);
         }
         d.set_gc_allocator(Box::new(gc));
         // llmodel.py:67-69 self.vtable_offset, _ = symbolic.get_field_token(
@@ -4156,6 +4196,63 @@ while i < 300:
             let s = *(*frame.namespace).get("s").unwrap();
             assert_eq!(pyre_object::intobject::w_int_get_value(s), 8_999_900);
         }
+    }
+
+    /// rclass.py:1133-1137 `ll_issubclass(subcls, cls)` parity. After
+    /// `set_gc_allocator` runs `freeze_types`, the materialized
+    /// `(subclassrange_min, subclassrange_max)` for each registered
+    /// PyType must satisfy `int_between(cls.min, subcls.min, cls.max)`
+    /// for every (cls, subcls) pair where `subcls` Python-inherits from
+    /// `cls`. This test exercises the `assign_inheritance_ids`
+    /// (normalizecalls.py:373-389) preorder walk by verifying:
+    ///   1. `INSTANCE_TYPE` (root `object`) range contains every other
+    ///      PyType's range.
+    ///   2. `INT_TYPE` range contains `BOOL_TYPE` range
+    ///      (`bool.__bases__ == (int,)`).
+    ///   3. Sibling classes (`INT_TYPE` vs `FLOAT_TYPE`, `STR_TYPE` vs
+    ///      `LIST_TYPE`) are disjoint.
+    #[test]
+    fn test_subclass_range_preorder_bounds() {
+        // Force JIT_DRIVER initialization so set_gc_allocator runs and
+        // installs the active subclass_range hook.
+        let _ = driver_pair();
+
+        fn range(t: &pyre_object::pyobject::PyType) -> (i64, i64) {
+            majit_gc::subclass_range(t as *const _ as usize)
+                .expect("every built-in PyType must be registered with the GC")
+        }
+
+        // ll_issubclass(subcls, cls): a <= b < c.
+        let contains = |outer: (i64, i64), inner: (i64, i64)| {
+            outer.0 <= inner.0 && inner.0 < outer.1 && inner.1 <= outer.1
+        };
+        let disjoint = |a: (i64, i64), b: (i64, i64)| a.1 <= b.0 || b.1 <= a.0;
+
+        let object_r = range(&pyre_object::pyobject::INSTANCE_TYPE);
+        let int_r = range(&pyre_object::pyobject::INT_TYPE);
+        let float_r = range(&pyre_object::pyobject::FLOAT_TYPE);
+        let bool_r = range(&pyre_object::pyobject::BOOL_TYPE);
+        let str_r = range(&pyre_object::pyobject::STR_TYPE);
+        let list_r = range(&pyre_object::pyobject::LIST_TYPE);
+        let none_r = range(&pyre_object::pyobject::NONE_TYPE);
+
+        // (1) object encompasses every descendant.
+        assert!(contains(object_r, int_r), "object ⊇ int");
+        assert!(contains(object_r, float_r), "object ⊇ float");
+        assert!(contains(object_r, bool_r), "object ⊇ bool");
+        assert!(contains(object_r, str_r), "object ⊇ str");
+        assert!(contains(object_r, list_r), "object ⊇ list");
+        assert!(contains(object_r, none_r), "object ⊇ NoneType");
+
+        // (2) int ⊇ bool (PyPy: W_BoolObject inherits from W_IntObject).
+        assert!(contains(int_r, bool_r), "int ⊇ bool");
+
+        // (3) Disjoint siblings.
+        assert!(disjoint(int_r, float_r), "int ⊥ float");
+        assert!(disjoint(int_r, str_r), "int ⊥ str");
+        assert!(disjoint(float_r, str_r), "float ⊥ str");
+        assert!(disjoint(str_r, list_r), "str ⊥ list");
+        assert!(disjoint(float_r, bool_r), "float ⊥ bool");
     }
 
     #[test]
