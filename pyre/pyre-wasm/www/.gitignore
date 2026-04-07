@@ -1,0 +1,8 @@
+# wasm-pack build output (regenerated from pyre/pyre-wasm/src/lib.rs)
+pyre_wasm.js
+pyre_wasm.d.ts
+pyre_wasm_bg.wasm
+pyre_wasm_bg.wasm.d.ts
+
+# Copy of majit/majit-backend-wasm/js/jit_glue.js placed here at build time
+jit_glue.js
