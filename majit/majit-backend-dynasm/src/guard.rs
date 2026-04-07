@@ -17,6 +17,10 @@ pub struct DynasmFailDescr {
     pub fail_arg_types: Vec<Type>,
     pub is_finish: bool,
 
+    /// regalloc parity: fail_locs — maps fail_args[i] to jitframe slot.
+    /// None = virtual/unmapped (not in jitframe).
+    pub fail_arg_locs: Vec<Option<usize>>,
+
     /// compile.py:685 status: packs ST_BUSY_FLAG + type tag + hash.
     pub status: AtomicU64,
 
@@ -60,6 +64,7 @@ impl DynasmFailDescr {
             trace_id,
             fail_arg_types,
             is_finish,
+            fail_arg_locs: Vec::new(),
             status: AtomicU64::new(0),
             adr_jump_offset: UnsafeCell::new(0),
             bridge_addr: UnsafeCell::new(0),

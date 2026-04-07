@@ -334,8 +334,9 @@ impl CodeWriter {
                     current_depth += 1;
                 }
 
-                // Superinstruction: two consecutive LoadFastBorrow
-                Instruction::LoadFastBorrowLoadFastBorrow { var_nums } => {
+                // Superinstruction: two consecutive LoadFast / LoadFastBorrow
+                Instruction::LoadFastBorrowLoadFastBorrow { var_nums }
+                | Instruction::LoadFastLoadFast { var_nums } => {
                     let pair = var_nums.get(op_arg);
                     let reg_a = u32::from(pair.idx_1()) as u16;
                     let reg_b = u32::from(pair.idx_2()) as u16;
@@ -721,10 +722,58 @@ impl CodeWriter {
                     assembler.abort_permanent();
                 }
 
+                // CPython 3.13 superinstruction: STORE_FAST_STORE_FAST.
+                // Pops 2 values and stores to two locals.
+                Instruction::StoreFastStoreFast { var_nums } => {
+                    let pair = var_nums.get(op_arg);
+                    let reg_a = u32::from(pair.idx_1()) as u16;
+                    let reg_b = u32::from(pair.idx_2()) as u16;
+                    current_depth -= 1;
+                    assembler.move_r(reg_a, stack_base + current_depth);
+                    current_depth -= 1;
+                    assembler.move_r(reg_b, stack_base + current_depth);
+                }
+
+                // CPython 3.13 UNPACK_SEQUENCE: pop 1 (seq), push `count`.
+                // Emit abort_permanent (no getitem helper yet) but
+                // adjust current_depth so subsequent instructions don't
+                // underflow.
+                Instruction::UnpackSequence { count } => {
+                    let n = count.get(op_arg) as u16;
+                    assembler.abort_permanent();
+                    // Stack effect: pop 1 + push n = net (n - 1)
+                    if current_depth > 0 {
+                        current_depth -= 1;
+                    }
+                    current_depth += n;
+                }
+
+                // CPython 3.13 iterator protocol — emit abort_permanent
+                // with correct depth tracking so subsequent instructions
+                // don't underflow.
+                Instruction::GetIter => {
+                    // pop iterable, push iterator: net 0
+                    assembler.abort_permanent();
+                }
+
+                Instruction::ForIter { .. } => {
+                    // push next item: net +1
+                    assembler.abort_permanent();
+                    current_depth += 1;
+                }
+
+                Instruction::EndFor => {
+                    // pop iterator + last value: net -2
+                    assembler.abort_permanent();
+                    current_depth = current_depth.saturating_sub(2);
+                }
+
+                Instruction::PopIter => {
+                    // pop iterator: net -1
+                    current_depth = current_depth.saturating_sub(1);
+                }
+
                 // Unsupported instruction: abort_permanent.
-                // Using BC_ABORT_PERMANENT(14) instead of BC_ABORT(13) so
-                // has_abort check doesn't false-positive on functions where
-                // only exception/module paths have unsupported instructions.
                 _other => {
                     assembler.abort_permanent();
                 }
