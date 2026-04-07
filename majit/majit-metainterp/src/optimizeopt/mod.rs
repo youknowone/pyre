@@ -2575,6 +2575,37 @@ impl OptContext {
         self.getptrinfo(opref)?.get_known_class()
     }
 
+    /// optimizer.py:154-158 `is_raw_ptr(op)` parity (line-by-line port).
+    ///
+    /// ```python
+    /// def is_raw_ptr(self, op):
+    ///     fw = get_box_replacement(op).get_forwarded()
+    ///     if isinstance(fw, info.AbstractRawPtrInfo):
+    ///         return True
+    ///     return False
+    /// ```
+    ///
+    /// `AbstractRawPtrInfo` is the upstream base for `RawBufferPtrInfo`,
+    /// `RawStructPtrInfo`, `RawSlicePtrInfo` (info.py:374-485). majit
+    /// currently only ports `VirtualRawBuffer` (corresponding to the
+    /// virtual case of `RawBufferPtrInfo`); the non-virtual `RawStruct`
+    /// and `RawSlice` shapes are TODO line-by-line ports — they will
+    /// be added to this dispatch as new `PtrInfo` variants land.
+    ///
+    /// `ConstPtrInfo` is NOT a subclass of `AbstractRawPtrInfo` in
+    /// upstream, so a constant raw-pointer `ConstInt` is `False` here
+    /// (matches `isinstance(fw, AbstractRawPtrInfo)` returning `False`
+    /// for `ConstPtrInfo`).
+    pub fn is_raw_ptr(&self, opref: OpRef) -> bool {
+        let resolved = self.get_box_replacement(opref);
+        matches!(
+            self.get_ptr_info(resolved),
+            Some(PtrInfo::VirtualRawBuffer(_)) // TODO line-by-line port: RawStructPtrInfo, RawSlicePtrInfo
+                                               //                         (info.py:452-485) once their
+                                               //                         majit variants land.
+        )
+    }
+
     /// info.py: getptrinfo(op) — mutable variant.
     pub fn get_ptr_info_mut(&mut self, opref: OpRef) -> Option<&mut PtrInfo> {
         use crate::optimizeopt::info::Forwarded;
