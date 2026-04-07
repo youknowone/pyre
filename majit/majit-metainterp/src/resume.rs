@@ -2961,11 +2961,15 @@ impl ResumeDataLoopMemo {
         new_liveboxes: &mut LiveboxMap,
         new_liveboxes_order: &mut Vec<u32>,
     ) {
-        if opref.is_none()
-            || env.is_const(opref)
-            || liveboxes_from_env.contains_key(opref.0)
-            || new_liveboxes.contains_key(opref.0)
-        {
+        if opref.is_none() {
+            return;
+        }
+        // resume.py:370-374 register_box: constants are handled by
+        // _gettagged (TAGCONST/TAGINT) and don't need livebox slots.
+        if env.is_const(opref) {
+            return;
+        }
+        if liveboxes_from_env.contains_key(opref.0) || new_liveboxes.contains_key(opref.0) {
             return;
         }
         // resume.py:212-216: check if field is virtual
