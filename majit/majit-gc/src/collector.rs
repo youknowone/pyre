@@ -433,6 +433,20 @@ impl MiniMarkGC {
             }
         });
 
+        // Phase 1d: Process blackhole interpreter register banks.
+        // blackhole.py BlackholeInterpreter.registers_r parity: each
+        // active blackhole frame's ref register file is part of the GC
+        // root set. RPython traces these via the RPython object graph
+        // (Box arrays); pyre stores raw i64 in Vec<i64> so we walk the
+        // explicit thread-local stack of register banks.
+        crate::shadow_stack::walk_bh_regs(|gcref| {
+            if self.is_nursery_object_start(gcref.0) {
+                if !self.pinned_objects.contains(&gcref.0) {
+                    *gcref = self.copy_nursery_object(gcref.0);
+                }
+            }
+        });
+
         // Phase 2: Process remembered set and transitive closure.
         let mut idx = 0;
         loop {
