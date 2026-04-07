@@ -998,6 +998,17 @@ fn rebuild_state_after_failure(
     // Process ALL frames, not just frames[0].
     if let Some(recovery) = recovery {
         if !recovery.frames.is_empty() {
+            if std::env::var_os("MAJIT_LOG").is_some() {
+                eprintln!(
+                    "[rebuild] outputs.len={} virtual_layouts.len={} pending={}",
+                    outputs.len(),
+                    recovery.virtual_layouts.len(),
+                    recovery.pending_field_layouts.len()
+                );
+                for (vi, vl) in recovery.virtual_layouts.iter().enumerate() {
+                    eprintln!("[rebuild] virtual_layout[{}]={:?}", vi, vl);
+                }
+            }
             // Step 1: materialize all virtuals referenced by any frame.
             // Keep materialized pointers indexed by vidx for pending fields.
             let mut materialized: Vec<Option<i64>> = vec![None; recovery.virtual_layouts.len()];
@@ -9666,10 +9677,22 @@ fn collect_guards(
             }
 
             // Build virtual_layouts from rd_virtuals.
+            let total_fail_args = fail_arg_refs.len();
             let resolve_fieldnum = |fnum: i16| -> ExitValueSourceLayout {
                 let (val, tagbits) = resumedata::untag(fnum);
                 match tagbits {
-                    resumedata::TAGBOX => ExitValueSourceLayout::ExitValue(val as usize),
+                    // resume.py:1260 parity: TAGBOX indices can be negative
+                    // (assigned by assign_number_to_box for virtual field values).
+                    // RPython uses Python negative indexing (liveboxes[-1]);
+                    // Rust needs explicit conversion to positive index.
+                    resumedata::TAGBOX => {
+                        let idx = if val >= 0 {
+                            val as usize
+                        } else {
+                            (total_fail_args as i32 + val) as usize
+                        };
+                        ExitValueSourceLayout::ExitValue(idx)
+                    }
                     resumedata::TAGVIRTUAL => ExitValueSourceLayout::Virtual(val as usize),
                     resumedata::TAGINT => ExitValueSourceLayout::Constant(val as i64),
                     resumedata::TAGCONST => {
