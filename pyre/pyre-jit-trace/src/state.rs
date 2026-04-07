@@ -434,6 +434,12 @@ pub struct PyreSym {
     #[vable(nlocals)]
     pub(crate) nlocals: usize,
     pub(crate) symbolic_initialized: bool,
+    /// Bridge-specific override for symbolic_locals.
+    /// resume.py:1042 parity: when set, init_symbolic uses these OpRefs
+    /// (mapped from RebuiltValue::Box(n) in rebuild_from_resumedata) instead
+    /// of the vable_array_base-based layout. This ensures bridge traces see
+    /// frame locals as symbolic InputArgs, not concrete values.
+    pub(crate) bridge_local_oprefs: Option<Vec<OpRef>>,
     // virtualizable.py:86-93: ALL static fields in declared order.
     // RPython's unroll_static_fields includes every field from
     // _virtualizable_; ALL must be inputarg (not info_only).
@@ -1466,6 +1472,7 @@ impl PyreSym {
             valuestackdepth: 0,
             nlocals: 0,
             symbolic_initialized: false,
+            bridge_local_oprefs: None,
             vable_next_instr: OpRef::NONE,
             vable_code: OpRef::NONE,
             vable_valuestackdepth: OpRef::NONE,
@@ -1521,7 +1528,13 @@ impl PyreSym {
         } else {
             frame_locals_cells_stack_array(ctx, self.frame)
         };
-        self.symbolic_locals = if let Some(base) = self.vable_array_base {
+        self.symbolic_locals = if let Some(ref overrides) = self.bridge_local_oprefs {
+            // resume.py:1042 parity: bridge trace uses OpRefs derived from
+            // rebuild_from_resumedata (Box(n) → bridge InputArg OpRef(n)).
+            let mut locals = overrides.clone();
+            locals.resize(nlocals, OpRef::NONE);
+            locals
+        } else if let Some(base) = self.vable_array_base {
             (0..nlocals).map(|i| OpRef(base + i as u32)).collect()
         } else {
             vec![OpRef::NONE; nlocals]
@@ -2139,6 +2152,33 @@ impl JitState for PyreJitState {
             fail_arg_types.len(),
             crate::virtualizable_gen::NUM_SCALAR_INPUTARGS,
         );
+    }
+
+    fn setup_bridge_sym(sym: &mut Self::Sym, resume_data: &majit_metainterp::ResumeDataResult) {
+        use majit_ir::resumedata::RebuiltValue;
+
+        let Some(frame) = resume_data.frames.first() else {
+            return;
+        };
+        // resume.py:1042 parity: map frame locals to bridge InputArg OpRefs.
+        // RebuiltValue::Box(n) → bridge InputArg OpRef(n).
+        // RebuiltValue::Int/Const → constant, leave as OpRef::NONE
+        // (the concrete fallback will read from the frame).
+        let local_oprefs: Vec<OpRef> = frame
+            .values
+            .iter()
+            .map(|v| match v {
+                RebuiltValue::Box(n) => OpRef(*n as u32),
+                _ => OpRef::NONE,
+            })
+            .collect();
+        if majit_metainterp::majit_log_enabled() {
+            eprintln!(
+                "[jit][bridge-sym] frame.values={:?} → local_oprefs={:?}",
+                frame.values, local_oprefs,
+            );
+        }
+        sym.bridge_local_oprefs = Some(local_oprefs);
     }
 
     /// resume.py:1042-1057 rebuild_from_resumedata parity.

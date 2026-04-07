@@ -2591,6 +2591,13 @@ impl<S: JitState> JitDriver<S> {
         }
 
         self.sym = Some(S::create_sym(&trace_meta, resume_pc));
+        // resume.py:1042 parity: map frame locals to bridge InputArg OpRefs
+        // so bridge tracing sees locals as symbolic variables, not concrete values.
+        if let Some(ref bfm) = resume_data_result {
+            if let Some(ref mut sym) = self.sym {
+                S::setup_bridge_sym(sym, bfm);
+            }
+        }
         self.trace_meta = Some(trace_meta);
         // resume.py:1042: inject bridge frame constants into the trace's
         // constant pool so the optimizer can fold them.
