@@ -914,10 +914,17 @@ impl MIFrame {
         // creating artificial guards (patchguardop). record_guard calls
         // capture_resumedata which captures the full framestack +
         // virtualizable_boxes + virtualref_boxes.
+        //
+        // RPython only emits GUARD_FUTURE_CONDITION here. GUARD_NOT_INVALIDATED
+        // is *not* unconditionally emitted before JUMP — pyjitpl.py:1086-1089
+        // emits it only inside `opimpl_record_quasi_immutable_field`, after a
+        // quasi-immut field read sets `heapcache.need_guard_not_invalidated`.
+        // The pyre frontend does the same via `flush_guard_not_invalidated`,
+        // so an unconditional emit here would (a) leak resume data for traces
+        // that have no quasi-immut dep at all, and (b) leave a runtime guard
+        // whose flag is decoupled from any watcher, which can spuriously
+        // exit a hot inner loop with no chance of re-tracing.
         self.record_guard(ctx, majit_ir::OpCode::GuardFutureCondition, &[]);
-        // heapcache.py:176: GUARD_NOT_INVALIDATED. In RPython emitted by
-        // heapcache during tracing. Same frame state as GUARD_FUTURE_CONDITION.
-        self.record_guard(ctx, majit_ir::OpCode::GuardNotInvalidated, &[]);
         args
     }
 
