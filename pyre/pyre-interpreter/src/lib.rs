@@ -55,6 +55,26 @@ pub use pyopcode::*;
 pub use runtime_ops::*;
 pub use shared_opcode::*;
 
+/// Every interpreter-level `PyType` static that represents a
+/// `PyObject`-layout type (instances carry `ob_type` at offset 0,
+/// matching `rclass.OBJECT`). The JIT registers each of these with
+/// the GC via `register_vtable_for_type` so
+/// `cpu.check_is_object(gcref)` returns true for their constant
+/// pointers and `ConstPtrInfo.get_known_class(cpu)`
+/// (info.py:763-772) can fold their class.
+///
+/// These live here rather than in `pyre_object::pyobject` because
+/// `pyre-object` cannot depend on `pyre-interpreter`. Callers should
+/// register both lists (see `pyre/pyre-jit/src/eval.rs`).
+pub fn all_foreign_pytypes() -> &'static [&'static pyre_object::pyobject::PyType] {
+    static PYTYPES: &[&pyre_object::pyobject::PyType] = &[
+        &crate::pycode::CODE_TYPE,
+        &crate::function::FUNCTION_TYPE,
+        &crate::gateway::BUILTIN_CODE_TYPE,
+    ];
+    PYTYPES
+}
+
 // ── Print hook for wasm (stdout capture) ──
 use std::cell::RefCell;
 thread_local! {
