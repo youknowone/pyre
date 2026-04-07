@@ -2562,6 +2562,9 @@ mod tests {
                 OptimizationResult::PassOn => {
                     ctx.emit(resolved);
                 }
+                OptimizationResult::InvalidLoop => {
+                    panic!("unexpected InvalidLoop in test");
+                }
             }
         }
 
@@ -2829,6 +2832,9 @@ mod tests {
                 }
                 OptimizationResult::PassOn => {
                     ctx.emit(resolved);
+                }
+                OptimizationResult::InvalidLoop => {
+                    panic!("unexpected InvalidLoop in test");
                 }
             }
         }
@@ -3281,6 +3287,9 @@ mod tests {
                 OptimizationResult::PassOn => {
                     ctx.emit(resolved);
                 }
+                OptimizationResult::InvalidLoop => {
+                    panic!("unexpected InvalidLoop in test");
+                }
             }
         }
 
@@ -3719,6 +3728,9 @@ mod tests {
                 OptimizationResult::PassOn => {
                     ctx.emit(resolved);
                 }
+                OptimizationResult::InvalidLoop => {
+                    panic!("unexpected InvalidLoop in test");
+                }
             }
         }
 
@@ -3772,6 +3784,9 @@ mod tests {
                 }
                 OptimizationResult::PassOn => {
                     ctx.emit(resolved);
+                }
+                OptimizationResult::InvalidLoop => {
+                    panic!("unexpected InvalidLoop in test");
                 }
             }
         }
@@ -3868,6 +3883,9 @@ mod tests {
                 OptimizationResult::PassOn => {
                     ctx.emit(resolved);
                 }
+                OptimizationResult::InvalidLoop => {
+                    panic!("unexpected InvalidLoop in test");
+                }
             }
         }
 
@@ -3946,6 +3964,9 @@ mod tests {
                 OptimizationResult::PassOn => {
                     ctx.emit(resolved);
                 }
+                OptimizationResult::InvalidLoop => {
+                    panic!("unexpected InvalidLoop in test");
+                }
             }
         }
 
@@ -4013,6 +4034,9 @@ mod tests {
                 OptimizationResult::PassOn => {
                     ctx.emit(resolved);
                 }
+                OptimizationResult::InvalidLoop => {
+                    panic!("unexpected InvalidLoop in test");
+                }
             }
         }
 
@@ -4078,6 +4102,9 @@ mod tests {
                 }
                 OptimizationResult::PassOn => {
                     ctx.emit(resolved);
+                }
+                OptimizationResult::InvalidLoop => {
+                    panic!("unexpected InvalidLoop in test");
                 }
             }
         }
@@ -4151,6 +4178,9 @@ mod tests {
                 }
                 OptimizationResult::PassOn => {
                     ctx.emit(resolved);
+                }
+                OptimizationResult::InvalidLoop => {
+                    panic!("unexpected InvalidLoop in test");
                 }
             }
         }
@@ -4355,6 +4385,9 @@ mod tests {
                 OptimizationResult::PassOn => {
                     ctx.emit(resolved);
                 }
+                OptimizationResult::InvalidLoop => {
+                    panic!("unexpected InvalidLoop in test");
+                }
             }
         }
 
@@ -4408,6 +4441,9 @@ mod tests {
                 OptimizationResult::PassOn => {
                     ctx.emit(resolved);
                 }
+                OptimizationResult::InvalidLoop => {
+                    panic!("unexpected InvalidLoop in test");
+                }
             }
         }
 
@@ -4454,6 +4490,9 @@ mod tests {
                 }
                 OptimizationResult::PassOn => {
                     ctx.emit(resolved);
+                }
+                OptimizationResult::InvalidLoop => {
+                    panic!("unexpected InvalidLoop in test");
                 }
             }
         }
