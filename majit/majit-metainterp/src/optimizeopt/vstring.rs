@@ -618,7 +618,7 @@ impl OptString {
             }
             let l1 = self.get_known_length(a, ctx);
             let l2 = self.get_known_length(b, ctx);
-            // Different known lengths → always unequal
+            // vstring.py:706-712: different known lengths → always unequal
             if let (Some(len1), Some(len2)) = (l1, l2) {
                 if len1 != len2 {
                     ctx.make_constant(op.pos, Value::Int(0));
@@ -631,6 +631,30 @@ impl OptString {
             }
             if let Some(result) = self.handle_str_equal_level1(b, a, op, ctx) {
                 return result;
+            }
+            // vstring.py:720-724: handle_str_equal_level2 both directions
+            if let Some(result) = self.handle_str_equal_level2(a, b, op, ctx) {
+                return result;
+            }
+            if let Some(result) = self.handle_str_equal_level2(b, a, op, ctx) {
+                return result;
+            }
+            // vstring.py:727-732: fallback with null checks
+            let a_nonnull = self.is_known_nonnull(a, ctx);
+            let b_nonnull = self.is_known_nonnull(b, ctx);
+            if a_nonnull && b_nonnull {
+                // vstring.py:728: l1box.same_box(l2box) — same strlen
+                // result OpRef (not just same constant value).
+                let l1box = self.getstrlen_if_known(a, ctx);
+                let l2box = self.getstrlen_if_known(b, ctx);
+                let oopspec = if l1box.is_some() && l2box.is_some() && l1box == l2box {
+                    OopSpecIndex::StreqLengthok
+                } else {
+                    OopSpecIndex::StreqNonnull
+                };
+                if let Some(result) = self.generate_modified_call(oopspec, &[a, b], op, ctx) {
+                    return result;
+                }
             }
         }
         self.force_args_if_virtual(op, ctx);
@@ -655,10 +679,11 @@ impl OptString {
                 return Some(OptimizationResult::Emit(eq_op));
             }
         }
-        // vstring.py:757-768: both length 1 → compare chars
+        // vstring.py:757-774: length-1 string optimizations
         if l2 == Some(1) {
             let l1 = self.get_known_length(arg1, ctx);
             if l1 == Some(1) {
+                // vstring.py:761-768: both length 1 → compare chars
                 let c1 = self.strgetitem(arg1, 0, ctx);
                 let c2 = self.strgetitem(arg2, 0, ctx);
                 if let (Some(ch1), Some(ch2)) = (c1, c2) {
@@ -667,8 +692,134 @@ impl OptString {
                     return Some(OptimizationResult::Emit(eq_op));
                 }
             }
+            // vstring.py:769-774: arg1 is a virtual slice, arg2 is length 1
+            let resolved1 = ctx.get_box_replacement(arg1);
+            if let Some(VStringInfo::Slice {
+                source,
+                start,
+                length,
+            }) = self.vstrings.get(&resolved1).cloned()
+            {
+                if let Some(vchar) = self.strgetitem(arg2, 0, ctx) {
+                    return self.generate_modified_call(
+                        OopSpecIndex::StreqSliceChar,
+                        &[source, start, length, vchar],
+                        op,
+                        ctx,
+                    );
+                }
+            }
+        }
+        // vstring.py:776-787: arg2 is null
+        if self.is_known_null(arg2, ctx) {
+            if self.is_known_nonnull(arg1, ctx) {
+                ctx.make_constant(op.pos, Value::Int(0));
+                return Some(OptimizationResult::Remove);
+            }
+            if self.is_known_null(arg1, ctx) {
+                ctx.make_constant(op.pos, Value::Int(1));
+                return Some(OptimizationResult::Remove);
+            }
+            let null_const = self.emit_constant_int(0, ctx);
+            let mut eq_op = Op::new(OpCode::PtrEq, &[arg1, null_const]);
+            eq_op.pos = op.pos;
+            return Some(OptimizationResult::Emit(eq_op));
         }
         None
+    }
+
+    /// vstring.py:789-814 handle_str_equal_level2
+    fn handle_str_equal_level2(
+        &self,
+        arg1: OpRef,
+        arg2: OpRef,
+        op: &Op,
+        ctx: &mut OptContext,
+    ) -> Option<OptimizationResult> {
+        // vstring.py:792-798: use getstrlen + intbound to check constant length.
+        // RPython: l2box = i2.getstrlen(...); l2info = self.getintbound(l2box)
+        // This catches lengths known via intbound analysis, not just from
+        // get_known_length (which only returns virtual/constant lengths).
+        let l2 = self.get_known_length(arg2, ctx).or_else(|| {
+            let len_ref = self.getstrlen_if_known(arg2, ctx)?;
+            let bound = ctx.get_int_bound(len_ref)?;
+            bound.known_eq_const(1).then_some(1)
+        });
+        if l2 == Some(1) {
+            if let Some(vchar) = self.strgetitem(arg2, 0, ctx) {
+                let oopspec = if self.is_known_nonnull(arg1, ctx) {
+                    OopSpecIndex::StreqNonnullChar
+                } else {
+                    OopSpecIndex::StreqChecknullChar
+                };
+                return self.generate_modified_call(oopspec, &[arg1, vchar], op, ctx);
+            }
+        }
+        // vstring.py:807-813: if arg1 is a virtual slice
+        let resolved1 = ctx.get_box_replacement(arg1);
+        if let Some(VStringInfo::Slice {
+            source,
+            start,
+            length,
+        }) = self.vstrings.get(&resolved1).cloned()
+        {
+            let oopspec = if self.is_known_nonnull(arg2, ctx) {
+                OopSpecIndex::StreqSliceNonnull
+            } else {
+                OopSpecIndex::StreqSliceChecknull
+            };
+            return self.generate_modified_call(oopspec, &[source, start, length, arg2], op, ctx);
+        }
+        None
+    }
+
+    /// Check if an opref is known to be null.
+    fn is_known_null(&self, opref: OpRef, ctx: &OptContext) -> bool {
+        let resolved = ctx.get_box_replacement(opref);
+        if let Some(info) = ctx.get_ptr_info(resolved) {
+            return info.is_null();
+        }
+        // Constant zero is null
+        ctx.get_constant_int(resolved) == Some(0)
+    }
+
+    /// Check if an opref is known to be non-null.
+    fn is_known_nonnull(&self, opref: OpRef, ctx: &OptContext) -> bool {
+        // Virtual strings are always non-null
+        let resolved = ctx.get_box_replacement(opref);
+        if self.vstrings.contains_key(&resolved) {
+            return true;
+        }
+        // PtrInfo with is_nonnull
+        if let Some(info) = ctx.get_ptr_info(resolved) {
+            if info.is_nonnull() || info.is_virtual() {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// vstring.py:853-860 generate_modified_call
+    ///
+    /// Look up the calldescr and func_ptr for the given oopspec in the
+    /// CallInfoCollection, and emit a CALL_I with those args.
+    fn generate_modified_call(
+        &self,
+        oopspec: OopSpecIndex,
+        args: &[OpRef],
+        result_op: &Op,
+        ctx: &mut OptContext,
+    ) -> Option<OptimizationResult> {
+        // Clone Arc to avoid borrow conflict with ctx
+        let cic = ctx.callinfocollection.clone()?;
+        let &(ref calldescr, func_addr) = cic.get(oopspec)?;
+        let func_const = ctx.alloc_op_position();
+        ctx.make_constant(func_const, Value::Int(func_addr as i64));
+        let mut call_args = vec![func_const];
+        call_args.extend_from_slice(args);
+        let mut call_op = Op::with_descr(OpCode::CallI, &call_args, calldescr.clone());
+        call_op.pos = result_op.pos;
+        Some(OptimizationResult::Emit(call_op))
     }
 
     /// vstring.py:816-838 opt_call_stroruni_STR_CMP

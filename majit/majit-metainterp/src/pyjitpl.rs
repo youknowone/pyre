@@ -431,6 +431,9 @@ pub struct MetaInterp<M: Clone> {
     /// for a green key so the loop should finish early instead of repeatedly
     /// aborting once it nears the trace limit.
     pub(crate) force_finish_trace: bool,
+    /// RPython metainterp_sd.callinfocollection parity.
+    /// Maps oopspec indices to (calldescr, func_ptr) for generate_modified_call.
+    pub(crate) callinfocollection: Option<std::sync::Arc<majit_ir::descr::CallInfoCollection>>,
     /// pyjitpl.py:2389: partial trace from a failed bridge compilation attempt.
     /// When bridge optimization returns "not final" (retrace needed), the
     /// partial optimized ops are saved here so compile_retrace can append
@@ -782,6 +785,7 @@ impl<M: Clone> MetaInterp<M> {
             tracing_call_depth: None,
             max_unroll_recursion: 7, // RPython default from rlib/jit.py
             force_finish_trace: false,
+            callinfocollection: None,
             partial_trace: None,
             retracing_from: None,
             exported_state: None,
@@ -1906,6 +1910,7 @@ impl<M: Clone> MetaInterp<M> {
         unroll_opt.retrace_limit = self.warm_state.retrace_limit();
         unroll_opt.max_retrace_guards = self.warm_state.max_retrace_guards();
         unroll_opt.constant_types = constant_types.clone();
+        unroll_opt.callinfocollection = self.callinfocollection.clone();
         unroll_opt.numbering_type_overrides = numbering_overrides.clone();
         // RPython Box type parity: each InputArg carries its type from
         // tracing. Propagate to optimizer so value_types covers inputargs.
@@ -2687,6 +2692,7 @@ impl<M: Clone> MetaInterp<M> {
         unroll_opt.retrace_limit = self.warm_state.retrace_limit();
         unroll_opt.max_retrace_guards = self.warm_state.max_retrace_guards();
         unroll_opt.constant_types = constant_types.clone();
+        unroll_opt.callinfocollection = self.callinfocollection.clone();
         unroll_opt.numbering_type_overrides = numbering_overrides;
         let (
             retrace_snapshot_boxes,
