@@ -3183,7 +3183,16 @@ fn build_resumed_frames(
         // Per-frame VSD: outermost uses vable_vsd, inner frames derive
         // from their code's nlocals + snapshot stack depth.
         let vsd = if frames.len() == 1 || idx == frames.len() - 1 {
-            vable_vsd
+            // resume.py:1395 parity: outermost frame's vsd comes from
+            // the virtualizable. If 0, fall back to code's nlocals+stack.
+            if vable_vsd > 0 {
+                vable_vsd
+            } else if !raw_code.is_null() {
+                let nlocals = unsafe { &*raw_code }.varnames.len();
+                nlocals + values.len().saturating_sub(nlocals)
+            } else {
+                values.len()
+            }
         } else if !raw_code.is_null() {
             let nlocals = unsafe { &*raw_code }.varnames.len();
             nlocals + values.len().saturating_sub(nlocals)
