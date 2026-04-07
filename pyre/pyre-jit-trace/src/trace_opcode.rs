@@ -969,6 +969,14 @@ impl MIFrame {
         // that have no quasi-immut dep at all, and (b) leave a runtime guard
         // whose flag is decoupled from any watcher, which can spuriously
         // exit a hot inner loop with no chance of re-tracing.
+        //
+        // RPython parity: orgpc must be the loop header TARGET, not the
+        // JUMP_BACKWARD's PC. The patchguardop from this GuardFutureCondition
+        // provides the resume_position for all peeled body virtual state guards.
+        // If orgpc is wrong, all those guards resume at the wrong PC.
+        if let Some(pc) = target_pc {
+            self.orgpc = pc;
+        }
         self.record_guard(ctx, majit_ir::OpCode::GuardFutureCondition, &[]);
         args
     }
@@ -4986,7 +4994,7 @@ impl ControlFlowOpcodeHandler for MIFrame {
                 let has_partial = driver.meta_interp().has_partial_trace();
                 let bridge_origin = driver.bridge_origin();
                 if !has_partial && driver.meta_interp().has_compiled_targets(back_edge_key) {
-                    let jump_args = MIFrame::close_loop_args(this, ctx);
+                    let jump_args = this.close_loop_args_at(ctx, Some(target));
                     let outcome = driver
                         .meta_interp_mut()
                         .compile_trace(back_edge_key, &jump_args, bridge_origin);
@@ -5006,8 +5014,19 @@ impl ControlFlowOpcodeHandler for MIFrame {
             }
             // pyjitpl.py:2994-3036: search current_merge_points
             if !ctx.has_merge_point(back_edge_key) {
-                // pyjitpl.py:3034-3036: no loop found → register and continue
-                let live_args = MIFrame::close_loop_args(this, ctx);
+                // pyjitpl.py:3034-3036: no loop found → register and continue.
+                // RPython parity: update next_instr to the loop header BEFORE
+                // capturing live args. The JUMP_BACKWARD's PC is not the loop
+                // header — the TARGET PC is. Without this, all guards in the
+                // peeled body inherit the JUMP_BACKWARD's PC as their resume
+                // point, causing the blackhole to re-enter the loop body.
+                MIFrame::set_next_instr(this, ctx, target);
+                // RPython parity: pass target PC so close_loop_args_at
+                // overrides vable_next_instr after flush_to_frame.
+                // Without this, GuardFutureCondition's snapshot inherits
+                // the JUMP_BACKWARD's orgpc, and all peeled body guards
+                // from virtual state import resume at the wrong PC.
+                let live_args = this.close_loop_args_at(ctx, Some(target));
                 let live_types = {
                     let s = this.sym();
                     let mut types = crate::virtualizable_gen::virt_live_value_types(0);
@@ -5021,7 +5040,6 @@ impl ControlFlowOpcodeHandler for MIFrame {
                     types
                 };
                 ctx.add_merge_point(back_edge_key, live_args, live_types, target);
-                MIFrame::set_next_instr(this, ctx, target);
                 if majit_metainterp::majit_log_enabled() {
                     eprintln!(
                         "[jit][reached_loop_header] first visit, unroll: key={} pc={}",
@@ -5032,7 +5050,7 @@ impl ControlFlowOpcodeHandler for MIFrame {
             }
             // pyjitpl.py:3002-3030: Found! Compile it as a loop.
             MIFrame::set_next_instr(this, ctx, target);
-            let oprefs = MIFrame::close_loop_args(this, ctx);
+            let oprefs = this.close_loop_args_at(ctx, Some(target));
             Ok(Some(
                 oprefs.into_iter().map(FrontendOp::opref_only).collect(),
             ))
