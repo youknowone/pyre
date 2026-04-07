@@ -93,6 +93,9 @@ pub struct Assembler386 {
     header_pc: u64,
     /// Input argument types.
     input_types: Vec<Type>,
+    /// Bridge source slots: maps bridge InputArg[i] to the parent
+    /// trace's jitframe slot. None for loop traces.
+    bridge_source_slots: Option<Vec<usize>>,
 
     // ── State tracking for code generation ──
     /// Maps OpRef index → jitframe slot index.
@@ -168,6 +171,7 @@ impl Assembler386 {
             trace_id,
             header_pc,
             input_types: Vec::new(),
+            bridge_source_slots: None,
             opref_to_slot: HashMap::new(),
             constants,
             next_slot: 0,
@@ -317,14 +321,26 @@ impl Assembler386 {
             ; mov x29, x0
         );
 
-        // Input args are pre-loaded at jf_ptr[1..n+1].
-        // Map them to slots 0..n.
-        for (i, _ia) in inputargs.iter().enumerate() {
-            // The caller already placed the value at jf_ptr[1+i].
-            // We just record the slot mapping.
-            self.opref_to_slot.insert(i as u32, i);
+        if let Some(ref source_slots) = self.bridge_source_slots {
+            // Bridge: InputArgs are at the parent trace's jitframe slots.
+            // Map each bridge InputArg[i] to its source slot position.
+            let mut max_slot = 0;
+            for (i, _ia) in inputargs.iter().enumerate() {
+                let src_slot = source_slots.get(i).copied().unwrap_or(i);
+                self.opref_to_slot.insert(i as u32, src_slot);
+                if src_slot >= max_slot {
+                    max_slot = src_slot + 1;
+                }
+            }
+            self.next_slot = max_slot;
+        } else {
+            // Loop: Input args are pre-loaded at jf_ptr[1..n+1].
+            // Map them to slots 0..n.
+            for (i, _ia) in inputargs.iter().enumerate() {
+                self.opref_to_slot.insert(i as u32, i);
+            }
+            self.next_slot = inputargs.len();
         }
-        self.next_slot = inputargs.len();
     }
 
     // ----------------------------------------------------------------
@@ -401,8 +417,14 @@ impl Assembler386 {
         fail_descr: &dyn FailDescr,
         inputargs: &[InputArg],
         ops: &[Op],
+        source_slots: &[usize],
     ) -> Result<CompiledCode, BackendError> {
         self.input_types = inputargs.iter().map(|ia| ia.tp).collect();
+        self.bridge_source_slots = if source_slots.is_empty() {
+            None
+        } else {
+            Some(source_slots.to_vec())
+        };
 
         // assembler.py:641 prepare_bridge
         let entry = self.mc.offset();
@@ -1454,17 +1476,26 @@ impl Assembler386 {
             .as_ref()
             .map(|ts| ts.clone())
             .unwrap_or_default();
-        let descr = Arc::new(DynasmFailDescr::new(
-            fail_index,
-            self.trace_id,
-            fail_arg_types,
-            false,
-        ));
         let fail_args = op
             .fail_args
             .as_ref()
             .map(|fa| fa.to_vec())
             .unwrap_or_default();
+        // Record slot positions for each fail_arg so bridge compilation
+        // can read InputArgs from the correct jitframe offsets.
+        let fail_args_slots: Vec<usize> = fail_args
+            .iter()
+            .map(|&opref| {
+                if opref.is_none() || opref.is_constant() {
+                    0
+                } else {
+                    self.opref_to_slot.get(&opref.0).copied().unwrap_or(0)
+                }
+            })
+            .collect();
+        let mut descr = DynasmFailDescr::new(fail_index, self.trace_id, fail_arg_types, false);
+        descr.fail_args_slots = fail_args_slots;
+        let descr = Arc::new(descr);
         let jump_offset = self.mc.offset();
         self.pending_guard_tokens.push(GuardToken {
             jump_offset,
