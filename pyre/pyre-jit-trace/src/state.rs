@@ -434,14 +434,16 @@ pub struct PyreSym {
     #[vable(nlocals)]
     pub(crate) nlocals: usize,
     pub(crate) symbolic_initialized: bool,
-    // virtualizable.py:86-93: static fields in declared order.
+    // virtualizable.py:86-93: ALL static fields in declared order.
+    // RPython's unroll_static_fields includes every field from
+    // _virtualizable_; ALL must be inputarg (not info_only).
     #[vable(inputarg)]
     pub(crate) vable_next_instr: OpRef,
-    #[vable(info_only)]
+    #[vable(inputarg)]
     pub(crate) vable_code: OpRef,
     #[vable(inputarg)]
     pub(crate) vable_valuestackdepth: OpRef,
-    #[vable(info_only)]
+    #[vable(inputarg)]
     pub(crate) vable_namespace: OpRef,
     pub(crate) symbolic_namespace_slots: std::collections::HashMap<usize, OpRef>,
     #[vable(array_base)]
@@ -623,8 +625,12 @@ pub(crate) fn frame_next_instr_descr() -> DescrRef {
     make_field_descr(PYFRAME_NEXT_INSTR_OFFSET, 8, Type::Int, true)
 }
 
+pub(crate) fn frame_code_descr() -> DescrRef {
+    make_field_descr(PYFRAME_CODE_OFFSET, 8, Type::Ref, true)
+}
+
 pub(crate) fn frame_namespace_descr() -> DescrRef {
-    make_field_descr(PYFRAME_NAMESPACE_OFFSET, 8, Type::Int, false)
+    make_field_descr(PYFRAME_NAMESPACE_OFFSET, 8, Type::Ref, false)
 }
 
 pub(crate) fn trace_ob_type_descr() -> DescrRef {
@@ -1052,8 +1058,16 @@ pub(crate) fn frame_get_next_instr(ctx: &mut TraceCtx, frame: OpRef) -> OpRef {
     ctx.record_op_with_descr(OpCode::GetfieldRawI, &[frame], frame_next_instr_descr())
 }
 
+pub(crate) fn frame_get_code(ctx: &mut TraceCtx, frame: OpRef) -> OpRef {
+    ctx.record_op_with_descr(OpCode::GetfieldGcR, &[frame], frame_code_descr())
+}
+
 pub(crate) fn frame_get_stack_depth(ctx: &mut TraceCtx, frame: OpRef) -> OpRef {
     ctx.record_op_with_descr(OpCode::GetfieldRawI, &[frame], frame_stack_depth_descr())
+}
+
+pub(crate) fn frame_get_namespace(ctx: &mut TraceCtx, frame: OpRef) -> OpRef {
+    ctx.record_op_with_descr(OpCode::GetfieldGcR, &[frame], frame_namespace_descr())
 }
 
 /// Read a value from the unified `locals_cells_stack_w` at the given absolute index.
@@ -1137,13 +1151,15 @@ pub(crate) fn record_current_state_guard(
     ctx: &mut TraceCtx,
     frame: OpRef,
     next_instr: OpRef,
+    code: OpRef,
     stack_depth: OpRef,
+    namespace: OpRef,
     locals: &[OpRef],
     stack: &[OpRef],
     opcode: OpCode,
     args: &[OpRef],
 ) {
-    let mut fail_args = vec![frame, next_instr, stack_depth];
+    let mut fail_args = vec![frame, next_instr, code, stack_depth, namespace];
     fail_args.extend_from_slice(locals);
     fail_args.extend_from_slice(stack);
     let num_slots = fail_args.len() - crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
@@ -1400,12 +1416,18 @@ pub(crate) fn synthesize_fresh_callee_entry_args(
     callee_frame: OpRef,
     args: &[OpRef],
     callee_nlocals: usize,
+    callee_code_ptr: usize,
+    callee_namespace_ptr: usize,
 ) -> Vec<OpRef> {
-    // Fresh entry: next_instr=0, valuestackdepth=nlocals (empty stack)
+    // Fresh entry: next_instr=0, valuestackdepth=nlocals (empty stack).
+    // virtualizable.py:86: read_boxes reads ALL static fields from the heap.
+    // code and namespace are immutable for the callee — use concrete values.
     let mut ca_args = vec![
         callee_frame,
-        ctx.const_int(0),
-        ctx.const_int(callee_nlocals as i64),
+        ctx.const_int(0),                           // next_instr
+        ctx.const_ref(callee_code_ptr as i64),      // code
+        ctx.const_int(callee_nlocals as i64),       // valuestackdepth
+        ctx.const_ref(callee_namespace_ptr as i64), // namespace
     ];
     ca_args.extend(args.iter().copied().take(callee_nlocals));
     let null = ctx.const_int(PY_NULL as i64);
@@ -1900,6 +1922,35 @@ impl PyreJitState {
         );
     }
 
+    /// Read the code pointer (pycode) from the heap frame.
+    pub fn code_as_usize(&self) -> usize {
+        self.read_frame_usize(PYFRAME_CODE_OFFSET)
+            .expect("PyreJitState.frame must point to a valid PyFrame")
+    }
+
+    /// Read the namespace pointer from the heap frame.
+    pub fn namespace_as_usize(&self) -> usize {
+        self.read_frame_usize(PYFRAME_NAMESPACE_OFFSET)
+            .expect("PyreJitState.frame must point to a valid PyFrame")
+    }
+
+    /// Write the code pointer to the heap frame.
+    /// virtualizable.py:101-107 write_boxes: ALL static fields written.
+    pub fn set_code(&mut self, value: usize) {
+        assert!(
+            self.write_frame_usize(PYFRAME_CODE_OFFSET, value),
+            "PyreJitState.frame must point to a valid PyFrame"
+        );
+    }
+
+    /// Write the namespace pointer to the heap frame.
+    pub fn set_namespace(&mut self, value: usize) {
+        assert!(
+            self.write_frame_usize(PYFRAME_NAMESPACE_OFFSET, value),
+            "PyreJitState.frame must point to a valid PyFrame"
+        );
+    }
+
     /// Validate that the frame pointer is usable (fields readable, array present).
     fn validate_frame(&self) -> bool {
         self.read_frame_usize(PYFRAME_NEXT_INSTR_OFFSET).is_some()
@@ -2027,7 +2078,9 @@ impl JitState for PyreJitState {
         crate::virtualizable_gen::virt_extract_live_values(
             self.frame,
             self.next_instr(),
+            self.code_as_usize(),
             self.valuestackdepth(),
+            self.namespace_as_usize(),
             meta.num_locals,
             meta.valuestackdepth,
             |i| self.local_at(i).unwrap_or(PY_NULL) as usize,
@@ -2317,18 +2370,31 @@ impl JitState for PyreJitState {
             return self.validate_frame();
         }
 
-        // virtualizable.py:126-133: write static fields from resumedata.
+        // virtualizable.py:126-137 write_from_resume_data_partial:
+        // ALL static fields in unroll_static_fields order.
         if let Some(ni) = values
             .get(crate::virtualizable_gen::SYM_NEXT_INSTR_IDX as usize)
             .map(value_to_usize)
         {
             self.set_next_instr(ni);
         }
+        if let Some(code) = values
+            .get(crate::virtualizable_gen::SYM_CODE_IDX as usize)
+            .map(value_to_usize)
+        {
+            self.set_code(code);
+        }
         if let Some(vsd) = values
             .get(crate::virtualizable_gen::SYM_VALUESTACKDEPTH_IDX as usize)
             .map(value_to_usize)
         {
             self.set_valuestackdepth(vsd);
+        }
+        if let Some(ns) = values
+            .get(crate::virtualizable_gen::SYM_NAMESPACE_IDX as usize)
+            .map(value_to_usize)
+        {
+            self.set_namespace(ns);
         }
 
         let nlocals = self.local_count();
@@ -3087,13 +3153,15 @@ mod tests {
             slot_types: vec![Type::Ref, Type::Ref, Type::Ref, Type::Ref],
         };
         let values = vec![
-            Value::Ref(GcRef(frame_ptr)),
-            Value::Int(9),
-            Value::Int(4),
-            Value::Ref(GcRef(w_int_new(1) as usize)),
-            Value::Ref(GcRef(w_int_new(2) as usize)),
-            Value::Ref(GcRef(w_int_new(3) as usize)),
-            Value::Int(7),
+            Value::Ref(GcRef(frame_ptr)),             // frame
+            Value::Int(9),                            // next_instr
+            Value::Ref(GcRef(frame.code as usize)),   // code
+            Value::Int(4),                            // valuestackdepth
+            Value::Ref(GcRef(0)),                     // namespace
+            Value::Ref(GcRef(w_int_new(1) as usize)), // local a
+            Value::Ref(GcRef(w_int_new(2) as usize)), // local b
+            Value::Ref(GcRef(w_int_new(3) as usize)), // local c
+            Value::Int(7),                            // local i
         ];
 
         assert!(<PyreJitState as JitState>::restore_guard_failure_values(
@@ -3768,10 +3836,10 @@ mod tests {
             .expect("branch guard should carry explicit fail args");
         assert_eq!(guard.opcode, OpCode::GuardTrue);
         // fail_args: [frame, pc_const, vsd_const, lower_stack, ...]
-        assert!(fail_args.len() >= 4);
+        // fail_args: [frame, ni, code, vsd, ns, lower_stack, ...]
+        assert!(fail_args.len() >= 6);
         assert_eq!(fail_args[0], frame_ref);
-        // Verify lower_stack is present in the expected position
-        assert_eq!(fail_args[3], lower_stack);
+        assert_eq!(fail_args[5], lower_stack);
     }
 
     #[test]
@@ -3829,8 +3897,8 @@ mod tests {
             .as_ref()
             .expect("branch guard should carry explicit fail args");
         assert_eq!(guard.opcode, OpCode::GuardTrue);
-        // fail_args: [frame, pc_const, vsd_const, lower_stack, ...]
-        assert!(fail_args.len() >= 4);
+        // fail_args: [frame, ni, code, vsd, ns, lower_stack, ...]
+        assert!(fail_args.len() >= 6);
         assert_eq!(fail_args[0], frame_ref);
     }
 
@@ -3912,12 +3980,12 @@ mod tests {
         let fail_args = state.with_ctx(|this, ctx| this.current_fail_args(ctx));
 
         // fail_args: [frame, next_instr_const, vsd_const, local0, stack0, stack1]
-        assert_eq!(fail_args.len(), 6);
+        // fail_args: [frame, ni, code, vsd, ns, local0, stack0, stack1]
+        assert_eq!(fail_args.len(), 8);
         assert_eq!(fail_args[0], frame_ref);
-        // next_instr and vsd are const_int values (exact OpRef depends on allocation order)
-        assert_eq!(fail_args[3], local0);
-        assert_eq!(fail_args[4], stack0);
-        assert_eq!(fail_args[5], stack1);
+        assert_eq!(fail_args[5], local0);
+        assert_eq!(fail_args[6], stack0);
+        assert_eq!(fail_args[7], stack1);
     }
 
     #[test]

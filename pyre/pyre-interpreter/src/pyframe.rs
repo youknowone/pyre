@@ -517,8 +517,8 @@ impl PyFrame {
     /// bytecodes concretely during tracing, so use an owned snapshot when
     /// recording a trace to keep the real frame state unchanged until the
     /// interpreter actually executes the same path.
-    pub fn snapshot_for_tracing(&self) -> Self {
-        let mut frame = PyFrame {
+    pub fn snapshot_for_tracing(&self) -> Box<Self> {
+        let mut frame = Box::new(PyFrame {
             execution_context: self.execution_context,
             code: self.code,
             locals_cells_stack_w: PyObjectArray::from_vec(self.locals_cells_stack_w.to_vec()),
@@ -530,7 +530,9 @@ impl PyFrame {
             pending_inline_results: self.pending_inline_results.clone(),
             pending_inline_resume_pc: self.pending_inline_resume_pc,
             class_locals: self.class_locals,
-        };
+        });
+        // fix_array_ptrs AFTER Box allocation: inline_buf ptr must
+        // point to the heap-allocated frame, not a stale stack address.
         frame.fix_array_ptrs();
         frame
     }

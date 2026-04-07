@@ -20,11 +20,16 @@ majit_macros::virtualizable! {
     // Frame pointer field in PyreJitState
     frame_field = frame,
 
-    // Scalar inputarg fields: included in extract_live / jump_args
-    // Layout: [frame:Ref, next_instr:Int, valuestackdepth:Int, locals..., stack...]
+    // Scalar inputarg fields: included in extract_live / jump_args.
+    // Must match `fields` order — RPython includes ALL static fields
+    // in unroll_static_fields (virtualizable.py:90-93 read_boxes).
+    // Layout: [frame:Ref, next_instr:Int, code:Ref, valuestackdepth:Int,
+    //          namespace:Ref, array[0..len(lst)]:Ref]
     inputargs = {
         next_instr: Int,
+        code: Ref,
         valuestackdepth: Int,
+        namespace: Ref,
     },
 
     // Array items are PyObjectRef (Ref)

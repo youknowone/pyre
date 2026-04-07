@@ -23,6 +23,10 @@ fn type_token(field_type: &syn::Ident) -> TokenStream {
 ///
 /// Returns a `TokenStream` for a function that constructs a
 /// `majit_metainterp::virtualizable::VirtualizableInfo` from the declaration.
+///
+/// virtualizable.py:61: num_static_extra_boxes = len(static_fields)
+/// ALL declared fields are added — RPython includes every field from
+/// `_virtualizable_` in unroll_static_fields.
 pub fn generate_vable_info_fn(decl: &VirtualizableDecl) -> TokenStream {
     let token_offset = &decl.token_offset;
     let field_adds: Vec<TokenStream> = decl

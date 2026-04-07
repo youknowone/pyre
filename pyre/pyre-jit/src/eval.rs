@@ -69,6 +69,8 @@ thread_local! {
         let info = build_virtualizable_info();
         let mut d = JitDriver::new(JIT_THRESHOLD);
         d.set_virtualizable_info(info.clone());
+        d.meta_interp_mut().num_scalar_inputargs =
+            pyre_jit_trace::virtualizable_gen::NUM_SCALAR_INPUTARGS;
         let mut gc = MiniMarkGC::new();
         // W_IntObject / W_FloatObject carry `PyObject.ob_type` at offset 0,
         // matching RPython `rclass.OBJECT` layout (T_IS_RPYTHON_INSTANCE,
@@ -1138,7 +1140,7 @@ fn jit_merge_point_hook(
             // lazy — ensure the code's JitCode (with liveness) exists before
             // tracing so get_list_of_active_boxes can use it.
             crate::jit::codewriter::ensure_jitcode_for(code, frame.code);
-            let snapshot = Box::new(frame.snapshot_for_tracing());
+            let snapshot = frame.snapshot_for_tracing();
             let _ = concrete_frame;
             let (action, _executed_frame) = trace_bytecode(ctx, sym, code, pc, snapshot);
             action
@@ -1325,10 +1327,31 @@ fn resume_in_blackhole_from_exit_layout(
             exit_layout.rd_numb.as_ref().map(|n| n.len())
         );
     }
+    // Save frame state before consume_vable_info modifies it.
+    // RPython's blackhole always completes; pyre's may fail and fall
+    // back to the interpreter, which needs the original frame state.
+    let saved_ni = frame.next_instr;
+    let saved_code = frame.code;
+    let saved_vsd = frame.valuestackdepth;
+    let saved_ns = frame.namespace;
+    let saved_array: Vec<pyre_object::PyObjectRef> = frame.locals_cells_stack_w.as_slice().to_vec();
+
     build_blackhole_frames_from_deadframe(raw_values, exit_layout);
     let guard_frames = take_last_guard_frames();
     if let Some(ref frames) = guard_frames {
-        crate::call_jit::resume_in_blackhole(frame, frames)
+        let result = crate::call_jit::resume_in_blackhole(frame, frames);
+        if matches!(result, BlackholeResult::Failed) {
+            // Restore frame to pre-consume state so the fallback
+            // interpreter can continue from the original frame.
+            frame.next_instr = saved_ni;
+            frame.code = saved_code;
+            frame.valuestackdepth = saved_vsd;
+            frame.namespace = saved_ns;
+            let dest = frame.locals_cells_stack_w.as_mut_slice();
+            let n = dest.len().min(saved_array.len());
+            dest[..n].copy_from_slice(&saved_array[..n]);
+        }
+        result
     } else {
         BlackholeResult::Failed
     }
@@ -1547,7 +1570,7 @@ fn bound_reached(
             // run their own eval_loop_jit) don't trigger jit_merge_point_hook.
             driver.meta_interp_mut().tracing_call_depth = Some(call_depth());
             let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
-            let concrete_frame = Box::new(frame.snapshot_for_tracing());
+            let concrete_frame = frame.snapshot_for_tracing();
             let outcome = driver.jit_merge_point_keyed(
                 green_key,
                 loop_header_pc,
@@ -1639,6 +1662,11 @@ fn bound_reached(
 /// Called at every portal entry (function call). Must be fast for the
 /// common case (no compiled code, not tracing, threshold not reached).
 pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
+    // warmstate.py parity: PYRE_NO_JIT disables ALL JIT paths.
+    static NO_JIT_FN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *NO_JIT_FN.get_or_init(|| std::env::var_os("PYRE_NO_JIT").is_some()) {
+        return None;
+    }
     if std::env::var_os("MAJIT_DUMP_BYTECODE").is_some() {
         let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
         if code.obj_name.as_str() == "fannkuch" && frame.next_instr == 0 {
@@ -2579,24 +2607,28 @@ pub(crate) fn decode_and_restore_guard_failure(
 
     // resume.py:1312 blackhole_from_resumedata parity:
     // Build per-frame ResumedFrame chain from rd_numb decoded frames.
+    // consume_vable=false: guard-failure recovery, JIT may re-enter trace.
     let resumed_frames = {
         let rd_numb = exit_layout.rd_numb.as_deref().unwrap_or(&[]);
         let rd_consts = exit_layout.rd_consts.as_deref().unwrap_or(&[]);
         if !rd_numb.is_empty() {
-            build_resumed_frames(raw_values, rd_numb, rd_consts, exit_layout)
+            build_resumed_frames(raw_values, rd_numb, rd_consts, exit_layout, false)
         } else {
             // Fallback for guards with empty rd_numb: single frame from typed.
-            // typed still has old format [frame, ni, vsd, locals..., stack...]
+            // typed = [frame, ni, code, vsd, ns, locals..., stack...]
+            let ns = pyre_jit_trace::virtualizable_gen::NUM_SCALAR_INPUTARGS;
+            let ni_idx = pyre_jit_trace::virtualizable_gen::SYM_NEXT_INSTR_IDX as usize;
+            let vsd_idx = pyre_jit_trace::virtualizable_gen::SYM_VALUESTACKDEPTH_IDX as usize;
             let frame_ptr = match typed.first() {
                 Some(Value::Ref(r)) => r.as_usize() as *mut pyre_interpreter::pyframe::PyFrame,
                 Some(Value::Int(v)) => *v as *mut pyre_interpreter::pyframe::PyFrame,
                 _ => std::ptr::null_mut(),
             };
-            let py_pc = match typed.get(1) {
+            let py_pc = match typed.get(ni_idx) {
                 Some(Value::Int(v)) => *v as usize,
                 _ => 0,
             };
-            let vsd = match typed.get(2) {
+            let vsd = match typed.get(vsd_idx) {
                 Some(Value::Int(v)) => *v as usize,
                 _ => 0,
             };
@@ -2605,8 +2637,8 @@ pub(crate) fn decode_and_restore_guard_failure(
             } else {
                 std::ptr::null()
             };
-            let slot_values = if typed.len() > 3 {
-                typed[3..].to_vec()
+            let slot_values = if typed.len() > ns {
+                typed[ns..].to_vec()
             } else {
                 Vec::new()
             };
@@ -2661,7 +2693,8 @@ pub(crate) fn build_blackhole_frames_from_deadframe(
         );
     }
     let resumed_frames = if !rd_numb.is_empty() {
-        build_resumed_frames(raw_values, rd_numb, rd_consts, exit_layout)
+        // consume_vable=true: blackhole path, write vable fields to frame.
+        build_resumed_frames(raw_values, rd_numb, rd_consts, exit_layout, true)
     } else {
         let typed = decode_exit_layout_values(raw_values, exit_layout);
         build_blackhole_frames_fallback(&typed)
@@ -2680,7 +2713,8 @@ pub(crate) fn build_resumed_frames_from_deadframe(
     let rd_numb = exit_layout.rd_numb.as_deref().unwrap_or(&[]);
     let rd_consts = exit_layout.rd_consts.as_deref().unwrap_or(&[]);
     if !rd_numb.is_empty() {
-        build_resumed_frames(raw_values, rd_numb, rd_consts, exit_layout)
+        // consume_vable=true: blackhole path.
+        build_resumed_frames(raw_values, rd_numb, rd_consts, exit_layout, true)
     } else {
         let typed = decode_exit_layout_values(raw_values, exit_layout);
         build_blackhole_frames_fallback(&typed)
@@ -2688,12 +2722,15 @@ pub(crate) fn build_resumed_frames_from_deadframe(
 }
 
 fn build_blackhole_frames_fallback(typed: &[Value]) -> Vec<crate::call_jit::ResumedFrame> {
+    let ns = pyre_jit_trace::virtualizable_gen::NUM_SCALAR_INPUTARGS;
+    let ni_idx = pyre_jit_trace::virtualizable_gen::SYM_NEXT_INSTR_IDX as usize;
+    let vsd_idx = pyre_jit_trace::virtualizable_gen::SYM_VALUESTACKDEPTH_IDX as usize;
     let frame_ptr = match typed.first() {
         Some(Value::Ref(r)) => r.as_usize() as *mut pyre_interpreter::pyframe::PyFrame,
         Some(Value::Int(v)) => *v as *mut pyre_interpreter::pyframe::PyFrame,
         _ => std::ptr::null_mut(),
     };
-    let py_pc = match typed.get(1) {
+    let py_pc = match typed.get(ni_idx) {
         Some(Value::Int(v)) => *v as usize,
         _ => 0,
     };
@@ -2702,13 +2739,13 @@ fn build_blackhole_frames_fallback(typed: &[Value]) -> Vec<crate::call_jit::Resu
     } else {
         std::ptr::null()
     };
-    // typed still has old format [frame, ni, vsd, ...]. Extract vsd and strip header.
-    let vsd = match typed.get(2) {
+    // typed = [frame, ni, code, vsd, ns, locals..., stack...]
+    let vsd = match typed.get(vsd_idx) {
         Some(Value::Int(v)) => *v as usize,
         _ => 0,
     };
-    let slot_values = if typed.len() > 3 {
-        typed[3..].to_vec()
+    let slot_values = if typed.len() > ns {
+        typed[ns..].to_vec()
     } else {
         Vec::new()
     };
@@ -2796,30 +2833,19 @@ fn rebuild_typed_from_rd_numb(
     // Frame registers fill frame.registers_i/r/f independently.
 
     // vable_values = [frame_ptr(0), ni(1), code(2), vsd(3), ns(4), array...]
-    // fail_args header = [frame, ni, vsd] (3-slot; code/ns immutable → skip)
-    let header: Vec<Value> = if vable_values.len() >= 5 {
-        vec![
-            decode_rv(
-                &vable_values[0],
-                &dead_frame_typed,
-                exit_layout,
-                &mut virtuals_cache,
-            ),
-            decode_rv(
-                &vable_values[1], // ni
-                &dead_frame_typed,
-                exit_layout,
-                &mut virtuals_cache,
-            ),
-            // skip vable_values[2]=code (immutable)
-            decode_rv(
-                &vable_values[3], // vsd
-                &dead_frame_typed,
-                exit_layout,
-                &mut virtuals_cache,
-            ),
-            // skip vable_values[4]=namespace (immutable)
-        ]
+    // virtualizable.py:86-99 read_boxes: ALL static fields in declared order.
+    let num_scalars = pyre_jit_trace::virtualizable_gen::NUM_SCALAR_INPUTARGS;
+    let header: Vec<Value> = if vable_values.len() >= num_scalars {
+        (0..num_scalars)
+            .map(|i| {
+                decode_rv(
+                    &vable_values[i],
+                    &dead_frame_typed,
+                    exit_layout,
+                    &mut virtuals_cache,
+                )
+            })
+            .collect()
     } else {
         Vec::new()
     };
@@ -2864,6 +2890,10 @@ fn build_resumed_frames(
     rd_numb: &[u8],
     rd_consts: &[(i64, majit_ir::Type)],
     exit_layout: &CompiledExitLayout,
+    // resume.py:1399 parity: true when called from blackhole path
+    // (blackhole_from_resumedata). false when pre-building frames
+    // for guard-failure recovery (JIT may re-enter trace).
+    consume_vable: bool,
 ) -> Vec<crate::call_jit::ResumedFrame> {
     use majit_ir::resumedata::rebuild_from_numbering;
 
@@ -2967,53 +2997,102 @@ fn build_resumed_frames(
     // opencoder.py:722 _list_of_boxes_virtualizable: snapshot reorders
     // virtualizable_ptr from end to front.
     // vable_values = [frame_ptr(0), ni(1), code(2), vsd(3), ns(4), array...]
-    let (vable_frame_ptr, _vable_ni, vable_vsd) = if vable_values.len() >= 5 {
-        let frame_val = resolve_rebuilt_value(
-            &vable_values[0],
-            &dead_frame_typed,
-            exit_layout,
-            &mut virtuals_cache,
-        );
-        let ni_val = resolve_rebuilt_value(
-            &vable_values[1], // ni
-            &dead_frame_typed,
-            exit_layout,
-            &mut virtuals_cache,
-        );
-        // skip vable_values[2]=code (immutable)
-        let vsd_val = resolve_rebuilt_value(
-            &vable_values[3], // vsd
-            &dead_frame_typed,
-            exit_layout,
-            &mut virtuals_cache,
-        );
-        // skip vable_values[4]=namespace (immutable)
-        let fp = match &frame_val {
+    let num_scalars = pyre_jit_trace::virtualizable_gen::NUM_SCALAR_INPUTARGS;
+    let ni_idx = pyre_jit_trace::virtualizable_gen::SYM_NEXT_INSTR_IDX as usize;
+    let vsd_idx = pyre_jit_trace::virtualizable_gen::SYM_VALUESTACKDEPTH_IDX as usize;
+
+    // Resolve ALL vable fields from resume data.
+    // vable_values = [frame_ptr(0), ni(1), code(2), vsd(3), ns(4), array...]
+    // RPython reader.load_next_value_of_type reads ALL values sequentially.
+    let resolved_vable: Vec<Value> = (0..vable_values.len())
+        .map(|i| {
+            resolve_rebuilt_value(
+                &vable_values[i],
+                &dead_frame_typed,
+                exit_layout,
+                &mut virtuals_cache,
+            )
+        })
+        .collect();
+
+    let vable_frame_ptr = resolved_vable
+        .first()
+        .map(|v| match v {
             Value::Ref(r) => r.as_usize() as *mut pyre_interpreter::pyframe::PyFrame,
             Value::Int(v) => *v as *mut pyre_interpreter::pyframe::PyFrame,
             _ => std::ptr::null_mut(),
-        };
-        let ni = match &ni_val {
-            Value::Int(v) => *v as usize,
-            _ => 0,
-        };
-        let vsd = match &vsd_val {
-            Value::Int(v) => *v as usize,
-            _ => 0,
-        };
-        (fp, ni, vsd)
-    } else {
-        (std::ptr::null_mut(), 0, 0)
-    };
+        })
+        .unwrap_or(std::ptr::null_mut());
 
-    // TODO: resume.py:1399 consume_vable_info writes ALL vable fields
-    // back to the virtualizable frame BEFORE the blackhole runs.
-    // Blocked: when GEN is enabled for LoadFastBorrowLoadFastBorrow,
-    // more locals are live and the blackhole succeeds, but dead locals
-    // get stale CONST values from trace recording time (not guard failure
-    // time). The blackhole then reads these stale values, producing wrong
-    // output. Fix: implement full consume_vable_info with runtime-resolved
-    // vable array values pre-filling blackhole registers.
+    let vable_ni = resolved_vable
+        .get(ni_idx)
+        .map(|v| match v {
+            Value::Int(v) => *v as usize,
+            _ => 0,
+        })
+        .unwrap_or(0);
+
+    let vable_vsd = resolved_vable
+        .get(vsd_idx)
+        .map(|v| match v {
+            Value::Int(v) => *v as usize,
+            _ => 0,
+        })
+        .unwrap_or(0);
+
+    // resume.py:1399-1408 consume_vable_info:
+    //   virtualizable = self.next_ref()
+    //   vinfo.reset_token_gcref(virtualizable)
+    //   vinfo.write_from_resume_data_partial(virtualizable, self)
+    if !vable_frame_ptr.is_null() && consume_vable {
+        let frame_u8 = vable_frame_ptr as *mut u8;
+        let vinfo = pyre_jit_trace::virtualizable_gen::build_virtualizable_info();
+        unsafe {
+            // resume.py:1407
+            vinfo.reset_vable_token(frame_u8);
+
+            // virtualizable.py:126-137 write_from_resume_data_partial:
+            //   for FIELDTYPE, fieldname in unroll_static_fields:
+            //       x = reader.load_next_value_of_type(FIELDTYPE)
+            //       setattr(virtualizable, fieldname, x)
+            let static_boxes: Vec<i64> = resolved_vable[1..num_scalars.min(resolved_vable.len())]
+                .iter()
+                .map(|v| match v {
+                    Value::Int(i) => *i,
+                    Value::Ref(r) => r.as_usize() as i64,
+                    _ => 0,
+                })
+                .collect();
+
+            //   for ARRAYITEMTYPE, fieldname in unroll_array_fields:
+            //       lst = getattr(virtualizable, fieldname)
+            //       for j in range(len(lst)):
+            //           lst[j] = reader.load_next_value_of_type(ARRAYITEMTYPE)
+            let heap_array_len = vinfo.get_array_length(frame_u8.cast_const(), 0);
+            let array_start = num_scalars.min(resolved_vable.len());
+            let array_items: Vec<i64> = (0..heap_array_len)
+                .map(|j| {
+                    resolved_vable
+                        .get(array_start + j)
+                        .map(|v| match v {
+                            Value::Int(i) => *i,
+                            Value::Ref(r) => r.as_usize() as i64,
+                            _ => 0,
+                        })
+                        .unwrap_or(0)
+                })
+                .collect();
+            let array_boxes = vec![array_items];
+
+            vinfo.write_from_resume_data_partial(frame_u8, &static_boxes, &array_boxes);
+        }
+        if majit_metainterp::majit_log_enabled() {
+            eprintln!(
+                "[jit][consume_vable_info] write_from_resume_data_partial on frame {:?}",
+                vable_frame_ptr,
+            );
+        }
+    }
 
     let mut result = Vec::with_capacity(frames.len());
     for (idx, (frame, values)) in frames.iter().zip(all_values.into_iter()).enumerate() {
@@ -3024,7 +3103,7 @@ fn build_resumed_frames(
             frame.pc as usize
         } else {
             // No-snapshot guard: fall back to vable ni.
-            _vable_ni
+            vable_ni
         };
         // resume.py:1339 jitcodes[jitcode_pos]:
         // Outermost frame (last): code from PyFrame (the live caller).
