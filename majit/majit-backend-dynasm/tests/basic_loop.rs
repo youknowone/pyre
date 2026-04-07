@@ -45,11 +45,11 @@ fn test_simple_int_add() {
     // Simple trace: i1 = int_add(i0, CONST_1)
     // finish(i1)  [fail_arg_types: [Int], fail_args: [i1]]
     let i0 = OpRef(0);
-    let const_1 = OpRef(10001);
+    let const_1 = OpRef(100001);
 
-    // Set constant: OpRef(10001) = 1
+    // Set constant: OpRef(100001) = 1
     let mut constants = HashMap::new();
-    constants.insert(10001u32, 1i64);
+    constants.insert(100001u32, 1i64);
     backend.set_constants(constants);
 
     let inputargs = vec![InputArg {
@@ -89,11 +89,11 @@ fn test_float_add() {
     let mut token = JitCellToken::new(1);
 
     let i0 = OpRef(0); // input: f64
-    let const_half = OpRef(10001);
+    let const_half = OpRef(100001);
 
     // constant 0.5 as raw bits
     let mut constants = HashMap::new();
-    constants.insert(10001u32, 0.5f64.to_bits() as i64);
+    constants.insert(100001u32, 0.5f64.to_bits() as i64);
     backend.set_constants(constants);
 
     let inputargs = vec![InputArg {
@@ -142,8 +142,8 @@ fn test_guard_and_loop() {
     let mut token = JitCellToken::new(1);
 
     let mut constants = HashMap::new();
-    constants.insert(10001u32, 1i64);
-    constants.insert(10005u32, 5i64);
+    constants.insert(100001u32, 1i64);
+    constants.insert(100005u32, 5i64);
     backend.set_constants(constants);
 
     let inputargs = vec![InputArg {
@@ -154,10 +154,10 @@ fn test_guard_and_loop() {
     let mut label_op = Op::new(OpCode::Label, &[OpRef(0)]);
     label_op.pos = OpRef(100);
 
-    let mut add_op = Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(10001)]);
+    let mut add_op = Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(100001)]);
     add_op.pos = OpRef(1);
 
-    let mut lt_op = Op::new(OpCode::IntLt, &[OpRef(1), OpRef(10005)]);
+    let mut lt_op = Op::new(OpCode::IntLt, &[OpRef(1), OpRef(100005)]);
     lt_op.pos = OpRef(2);
 
     let mut guard_op = Op::new(OpCode::GuardTrue, &[OpRef(2)]);
