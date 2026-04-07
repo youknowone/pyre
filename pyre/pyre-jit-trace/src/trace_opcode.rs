@@ -9,6 +9,7 @@ use majit_ir::{DescrRef, GcRef, OpCode, OpRef, Type, Value};
 use majit_metainterp::{TraceAction, TraceCtx};
 
 use pyre_interpreter::bytecode::{BinaryOperator, CodeObject, ComparisonOperator, Instruction};
+use pyre_object::pyobject::{is_int_or_long, is_long};
 
 /// floatobject.py:561 `descr_pow` → `_pow(space, x, y)` parity.
 ///
@@ -982,9 +983,8 @@ impl MIFrame {
     }
 
     /// pyjitpl.py:2586 capture_resumedata: build fail_args for CURRENT
-    /// top frame. Returns [frame, ni, vsd, active_boxes...] for Cranelift.
-    /// RPython always captures the current frame; parent frames are handled
-    /// separately via _ensure_parent_resumedata (opencoder.py:819).
+    /// top frame. Returns [frame, ni, code, vsd, ns, active_boxes...].
+    /// virtualizable.py:86 read_boxes: all static fields in order.
     pub(crate) fn current_fail_args(&mut self, ctx: &mut TraceCtx) -> Vec<OpRef> {
         self.flush_to_frame_for_guard(ctx);
         let active_boxes = self.get_list_of_active_boxes(ctx, false, false);
@@ -2192,13 +2192,21 @@ impl MIFrame {
             return self.trace_binary_value(a, b, op);
         }
 
-        // Determine which operands are int (need int→float cast) vs float.
-        // RPython: float_add etc. call space.float_w() which dispatches on
-        // type — int objects go through int2float (CastIntToFloat).
+        // floatobject.py _to_float: accepts int, float, long.
+        // Trace fast path handles int (CastIntToFloat) and float (direct).
+        // Long → residual fallback (long→float can lose precision and
+        // can't be inlined; floatobject.py calls space.float_w as residual).
         let lhs_is_int = (!concrete_lhs.is_null() && unsafe { is_int(concrete_lhs) })
             || self.value_type(a) == Type::Int;
         let rhs_is_int = (!concrete_rhs.is_null() && unsafe { is_int(concrete_rhs) })
             || self.value_type(b) == Type::Int;
+        let lhs_is_long =
+            !concrete_lhs.is_null() && unsafe { is_long(concrete_lhs) } && !lhs_is_int;
+        let rhs_is_long =
+            !concrete_rhs.is_null() && unsafe { is_long(concrete_rhs) } && !rhs_is_int;
+        if lhs_is_long || rhs_is_long {
+            return self.trace_binary_value(a, b, op);
+        }
 
         self.with_ctx(|this, ctx| {
             let float_type_addr = &FLOAT_TYPE as *const _ as i64;
@@ -2321,17 +2329,50 @@ impl MIFrame {
                     }
                 });
             }
-            if is_float(lhs_obj) && is_float(rhs_obj) {
+            // baseobjspace::compare step 2: is_int_or_long × is_int_or_long
+            // Long comparison needs BigInt which can't be inlined → residual.
+            if is_int_or_long(lhs_obj) && is_int_or_long(rhs_obj) {
+                return self.trace_compare_value(a, b, op);
+            }
+            // baseobjspace::compare step 3: is_float_pair
+            // Handles float×float, float×int, int×float.
+            // Long in float_pair → residual (can't inline long→f64).
+            let lhs_is_float = is_float(lhs_obj);
+            let rhs_is_float = is_float(rhs_obj);
+            let lhs_is_int = is_int(lhs_obj);
+            let rhs_is_int = is_int(rhs_obj);
+            let lhs_numeric = lhs_is_float || lhs_is_int;
+            let rhs_numeric = rhs_is_float || rhs_is_int;
+            // Exclude long from trace fast path
+            let is_trace_float_pair = lhs_numeric && rhs_numeric && (lhs_is_float || rhs_is_float);
+            if is_trace_float_pair {
                 let cmp = crate::float_compare_lookup(op);
                 return self.with_ctx(|this, ctx| {
                     let float_type_addr = &FLOAT_TYPE as *const _ as i64;
+                    let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+                    // Unbox lhs: float direct, int via CastIntToFloat
                     let lhs_raw = if this.value_type(a) == Type::Float {
                         a
+                    } else if lhs_is_int || this.value_type(a) == Type::Int {
+                        let raw_int = if this.value_type(a) == Type::Int {
+                            a
+                        } else {
+                            crate::state::trace_unbox_int_with_resume(this, ctx, a, int_type_addr)
+                        };
+                        ctx.record_op(OpCode::CastIntToFloat, &[raw_int])
                     } else {
                         crate::state::trace_unbox_float_with_resume(this, ctx, a, float_type_addr)
                     };
+                    // Unbox rhs: same pattern
                     let rhs_raw = if this.value_type(b) == Type::Float {
                         b
+                    } else if rhs_is_int || this.value_type(b) == Type::Int {
+                        let raw_int = if this.value_type(b) == Type::Int {
+                            b
+                        } else {
+                            crate::state::trace_unbox_int_with_resume(this, ctx, b, int_type_addr)
+                        };
+                        ctx.record_op(OpCode::CastIntToFloat, &[raw_int])
                     } else {
                         crate::state::trace_unbox_float_with_resume(this, ctx, b, float_type_addr)
                     };
@@ -5022,20 +5063,34 @@ impl ControlFlowOpcodeHandler for MIFrame {
             let back_edge_key = crate::driver::make_green_key(code_ptr, target);
             // pyjitpl.py:2951: self.heapcache.reset()
             ctx.reset_heap_cache();
-            // pyjitpl.py:2978-2983: get_procedure_token(greenboxes)
-            // RPython uses the CURRENT greenboxes (back_edge_key), not root_key.
-            // pyjitpl.py:2979: if not self.partial_trace — skip compile_trace
-            // when a retrace is pending (compile_retrace handles it via
-            // compile_loop at the final merge point).
+            // pyjitpl.py:2957-2965: build live_arg_boxes ONCE.
+            // RPython constructs live_arg_boxes = greenboxes + redboxes +
+            // virtualizable_boxes[:-1], then reuses it for compile_trace,
+            // merge point search, and registration. GUARD_FUTURE_CONDITION
+            // is emitted once (line 2969) before any of these.
+            let live_args = MIFrame::close_loop_args_at(this, ctx, Some(target));
+            let live_types = {
+                let s = this.sym();
+                let mut types = crate::virtualizable_gen::virt_live_value_types(0);
+                types.extend(s.symbolic_local_types.iter().copied());
+                let stack_only = s.stack_only_depth();
+                types.extend(
+                    s.symbolic_stack_types[..stack_only.min(s.symbolic_stack_types.len())]
+                        .iter()
+                        .copied(),
+                );
+                types
+            };
+
+            // pyjitpl.py:2978-2983: compile_trace attempt.
             {
                 let (driver, _) = crate::driver::driver_pair();
                 let has_partial = driver.meta_interp().has_partial_trace();
                 let bridge_origin = driver.bridge_origin();
                 if !has_partial && driver.meta_interp().has_compiled_targets(back_edge_key) {
-                    let jump_args = this.close_loop_args_at(ctx, Some(target));
                     let outcome = driver
                         .meta_interp_mut()
-                        .compile_trace(back_edge_key, &jump_args, bridge_origin);
+                        .compile_trace(back_edge_key, &live_args, bridge_origin);
                     if matches!(outcome, majit_metainterp::CompileOutcome::Compiled { .. }) {
                         if majit_metainterp::majit_log_enabled() {
                             eprintln!(
@@ -5043,9 +5098,8 @@ impl ControlFlowOpcodeHandler for MIFrame {
                                 back_edge_key, target, bridge_origin
                             );
                         }
-                        MIFrame::set_next_instr(this, ctx, target);
                         return Ok(Some(
-                            jump_args.into_iter().map(FrontendOp::opref_only).collect(),
+                            live_args.into_iter().map(FrontendOp::opref_only).collect(),
                         ));
                     }
                 }
@@ -5053,30 +5107,6 @@ impl ControlFlowOpcodeHandler for MIFrame {
             // pyjitpl.py:2994-3036: search current_merge_points
             if !ctx.has_merge_point(back_edge_key) {
                 // pyjitpl.py:3034-3036: no loop found → register and continue.
-                // RPython parity: update next_instr to the loop header BEFORE
-                // capturing live args. The JUMP_BACKWARD's PC is not the loop
-                // header — the TARGET PC is. Without this, all guards in the
-                // peeled body inherit the JUMP_BACKWARD's PC as their resume
-                // point, causing the blackhole to re-enter the loop body.
-                MIFrame::set_next_instr(this, ctx, target);
-                // RPython parity: pass target PC so close_loop_args_at
-                // overrides vable_next_instr after flush_to_frame.
-                // Without this, GuardFutureCondition's snapshot inherits
-                // the JUMP_BACKWARD's orgpc, and all peeled body guards
-                // from virtual state import resume at the wrong PC.
-                let live_args = this.close_loop_args_at(ctx, Some(target));
-                let live_types = {
-                    let s = this.sym();
-                    let mut types = crate::virtualizable_gen::virt_live_value_types(0);
-                    types.extend(s.symbolic_local_types.iter().copied());
-                    let stack_only = s.stack_only_depth();
-                    types.extend(
-                        s.symbolic_stack_types[..stack_only.min(s.symbolic_stack_types.len())]
-                            .iter()
-                            .copied(),
-                    );
-                    types
-                };
                 ctx.add_merge_point(back_edge_key, live_args, live_types, target);
                 if majit_metainterp::majit_log_enabled() {
                     eprintln!(
@@ -5087,10 +5117,8 @@ impl ControlFlowOpcodeHandler for MIFrame {
                 return Ok(None);
             }
             // pyjitpl.py:3002-3030: Found! Compile it as a loop.
-            MIFrame::set_next_instr(this, ctx, target);
-            let oprefs = this.close_loop_args_at(ctx, Some(target));
             Ok(Some(
-                oprefs.into_iter().map(FrontendOp::opref_only).collect(),
+                live_args.into_iter().map(FrontendOp::opref_only).collect(),
             ))
         })
     }

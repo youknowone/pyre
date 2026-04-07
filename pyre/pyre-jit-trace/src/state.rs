@@ -18,7 +18,7 @@ use pyre_object::boolobject::w_bool_get_value;
 use pyre_object::listobject::w_list_getitem;
 use pyre_object::pyobject::{
     BOOL_TYPE, DICT_TYPE, FLOAT_TYPE, INT_TYPE, LIST_TYPE, NONE_TYPE, PyType, TUPLE_TYPE, is_bool,
-    is_dict, is_float, is_int, is_list, is_none, is_tuple,
+    is_dict, is_float, is_int, is_int_or_long, is_list, is_long, is_none, is_tuple,
 };
 use pyre_object::rangeobject::RANGE_ITER_TYPE;
 use pyre_object::strobject::is_str;
