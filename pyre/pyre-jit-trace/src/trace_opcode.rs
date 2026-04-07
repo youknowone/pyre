@@ -1425,7 +1425,11 @@ impl MIFrame {
 
     pub(crate) fn guard_nonnull(&mut self, ctx: &mut TraceCtx, value: OpRef) {
         // heapcache.py:561-565: skip if nullity or class already known
-        if ctx.heap_cache().is_nullity_known(value) == Some(true) {
+        if ctx
+            .heap_cache()
+            .is_nullity_known(value, |op| ctx.const_value(op))
+            == Some(true)
+        {
             return;
         }
         if ctx.heap_cache().is_class_known(value) {

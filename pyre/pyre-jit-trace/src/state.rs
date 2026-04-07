@@ -2162,13 +2162,29 @@ impl JitState for PyreJitState {
         };
         // resume.py:1042 parity: map frame locals to bridge InputArg OpRefs.
         // RebuiltValue::Box(n) → bridge InputArg OpRef(n).
-        // RebuiltValue::Int/Const → constant, leave as OpRef::NONE
-        // (the concrete fallback will read from the frame).
+        // RebuiltValue::Int(v)/Const(v,tp) → constant OpRef from resume_data.constants.
+        //
+        // The constants vec is populated in order: first vable/vref entries,
+        // then frame entries. We need the frame-local constant offset.
+        let vable_vref_const_count = resume_data
+            .virtualizable_values
+            .iter()
+            .chain(resume_data.virtualref_values.iter())
+            .filter(|v| matches!(v, RebuiltValue::Const(..) | RebuiltValue::Int(_)))
+            .count();
+        let mut frame_const_cursor = vable_vref_const_count;
+
         let local_oprefs: Vec<OpRef> = frame
             .values
             .iter()
             .map(|v| match v {
                 RebuiltValue::Box(n) => OpRef(*n as u32),
+                RebuiltValue::Int(_) | RebuiltValue::Const(..) => {
+                    // This constant was injected at position frame_const_cursor.
+                    let opref = majit_ir::OpRef::from_const(frame_const_cursor as u32);
+                    frame_const_cursor += 1;
+                    opref
+                }
                 _ => OpRef::NONE,
             })
             .collect();
@@ -2209,31 +2225,12 @@ impl JitState for PyreJitState {
             return None;
         }
 
-        // Allocate constant OpRefs for TAGCONST/TAGINT entries.
-        // RPython uses ConstInt/ConstPtr box objects natively; Rust needs
-        // explicit constant pool entries for the optimizer to see them.
-        //
-        // Both TAGCONST (large consts from rd_consts) and TAGINT (small
-        // inline integers) become ConstInt/ConstPtr in RPython and should
-        // be treated as constants by the optimizer. This includes
-        // interpreter state (ni, vsd) AND user variables that were small
-        // ints at guard time. The optimizer's unrolling/constant-folding
-        // will properly handle which values can be folded vs kept symbolic.
+        // resume.py:1245 decode_box parity: TAGCONST and TAGINT entries
+        // become ConstPtr/ConstInt boxes in RPython. Rust needs explicit
+        // constant pool entries for the optimizer to see them.
+        // All sections (vable, vref, frame) are treated uniformly.
         let mut constants = Vec::new();
         let mut const_idx: u32 = 0;
-        // RPython resume.py:1042-1057 parity: rebuild_from_resumedata
-        // restores virtualizable_boxes, virtualref_boxes, AND frame boxes.
-        //
-        // TAGCONST entries (from rd_consts) are always injected — they are
-        // large constants that cannot be inline. TAGINT entries from
-        // vable_values/vref_values (interpreter state: ni, vsd, code ptr)
-        // are also injected as they are constant across loop iterations.
-        //
-        // However, TAGINT entries from frame.values (user variables like
-        // i, j, s) must NOT be injected — they are concrete values at guard
-        // failure time that change across iterations. RPython wraps these as
-        // ConstInt boxes, but the bridge trace treats them as trace-time
-        // constants via the tracing itself (not via pre-injection).
         for value in vable_values.iter().chain(vref_values.iter()) {
             match value {
                 RebuiltValue::Const(raw, tp) => {
@@ -2251,12 +2248,24 @@ impl JitState for PyreJitState {
                 _ => {}
             }
         }
-        // Frame values: only inject TAGCONST, not TAGINT (user variables).
+        // resume.py:1245 decode_box parity: TAGINT → ConstInt(num) regardless
+        // of whether it came from vable, vref, or a frame slot.
         for frame in &frames {
             for value in &frame.values {
-                if let RebuiltValue::Const(raw, tp) = value {
-                    constants.push((majit_ir::OpRef::from_const(const_idx).0, *raw, *tp));
-                    const_idx += 1;
+                match value {
+                    RebuiltValue::Const(raw, tp) => {
+                        constants.push((majit_ir::OpRef::from_const(const_idx).0, *raw, *tp));
+                        const_idx += 1;
+                    }
+                    RebuiltValue::Int(v) => {
+                        constants.push((
+                            majit_ir::OpRef::from_const(const_idx).0,
+                            *v as i64,
+                            Type::Int,
+                        ));
+                        const_idx += 1;
+                    }
+                    _ => {}
                 }
             }
         }
