@@ -202,13 +202,39 @@ impl PyError {
             ExcKind::BaseException | ExcKind::Exception => PyErrorKind::RuntimeError,
         }
     }
+
+    pub fn render_exception(&self) -> String {
+        let name = exc_kind_name(self.to_exc_kind());
+        if self.message.is_empty() {
+            name.to_string()
+        } else {
+            format!("{name}: {}", self.message)
+        }
+    }
 }
 
 impl std::fmt::Display for PyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let name = exc_kind_name(self.to_exc_kind());
-        write!(f, "{}: {}", name, self.message)
+        write!(f, "{}", self.render_exception())
     }
+}
+
+pub fn write_exception<W: Write>(
+    writer: &mut W,
+    err: &PyError,
+    include_traceback: bool,
+) -> std::io::Result<()> {
+    if include_traceback {
+        writeln!(writer, "Traceback (most recent call last):")?;
+        writeln!(writer, "  {}", err.render_exception())
+    } else {
+        writeln!(writer, "{}", err.render_exception())
+    }
+}
+
+pub fn eprint_exception(err: &PyError, include_traceback: bool) {
+    let mut stderr = std::io::stderr().lock();
+    let _ = write_exception(&mut stderr, err, include_traceback);
 }
 
 pub fn get_cleared_operation_error(_space: PyObjectRef) -> OperationError {
@@ -256,6 +282,27 @@ pub fn decompose_valuefmt(valuefmt: &str) -> (Vec<String>, Vec<String>) {
 pub fn get_operrcls2(valuefmt: &str) -> (PyObjectRef, Vec<String>) {
     let (strings, _formats) = decompose_valuefmt(valuefmt);
     (std::ptr::null_mut(), strings)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PyError, PyErrorKind, write_exception};
+
+    #[test]
+    fn render_exception_omits_empty_message_separator() {
+        let err = PyError::new(PyErrorKind::StopIteration, "");
+        assert_eq!(err.render_exception(), "StopIteration");
+    }
+
+    #[test]
+    fn write_exception_includes_traceback_header() {
+        let err = PyError::type_error("bad operand");
+        let mut out = Vec::new();
+        write_exception(&mut out, &err, true).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("Traceback (most recent call last):"));
+        assert!(text.contains("TypeError: bad operand"));
+    }
 }
 
 pub fn get_operr_class(valuefmt: &str) -> (PyObjectRef, Vec<String>) {

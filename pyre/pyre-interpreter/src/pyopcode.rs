@@ -1,6 +1,6 @@
 use crate::bytecode::{
     BinaryOperator, CodeObject, CodeUnit, ComparisonOperator, ConstantData, Instruction,
-    IntrinsicFunction1, IntrinsicFunction2, OpArg, OpArgState,
+    IntrinsicFunction1, IntrinsicFunction2, OpArg, OpArgState, SpecialMethod,
 };
 
 use crate::{
@@ -1630,6 +1630,24 @@ where
             executor.build_string(count.get(op_arg) as usize)?;
             Ok(StepResult::Continue)
         }
+        // Template strings (PEP 750) — `t"hello {name}"`. Stack: [strings, interps].
+        // PyPy has no equivalent; we consume the operands and push a 2-tuple
+        // that preserves the strings+interpolations structure. Sufficient for
+        // module import; real Template type semantics are not implemented.
+        Instruction::BuildTemplate => {
+            OpcodeStepExecutor::build_tuple(executor, 2)?;
+            Ok(StepResult::Continue)
+        }
+        Instruction::BuildInterpolation { format } => {
+            let oparg_val = u32::from(format.get(op_arg));
+            let has_format_spec = (oparg_val & 1) != 0;
+            if has_format_spec {
+                let _ = executor.pop_value()?;
+            }
+            // Stack: [value, expression_str] — wrap as a 2-tuple interpolation.
+            OpcodeStepExecutor::build_tuple(executor, 2)?;
+            Ok(StepResult::Continue)
+        }
         Instruction::ListExtend { i } => {
             executor.list_extend(i.get(op_arg) as usize)?;
             Ok(StepResult::Continue)
@@ -1876,8 +1894,19 @@ where
         }
 
         // ── Misc stubs ──
-        Instruction::LoadSpecial { .. } => {
-            Err(crate::PyError::type_error("LOAD_SPECIAL not yet implemented").into())
+        // Pops obj, pushes (callable, self_or_null).
+        // Used by `with` statement to load __enter__ / __exit__.
+        // RustPython: frame.rs LoadSpecial, delegates to get_special_method.
+        // Pyre: delegate to load_method with the special method name.
+        Instruction::LoadSpecial { method } => {
+            let name = match method.get(op_arg) {
+                SpecialMethod::Enter => "__enter__",
+                SpecialMethod::Exit => "__exit__",
+                SpecialMethod::AEnter => "__aenter__",
+                SpecialMethod::AExit => "__aexit__",
+            };
+            executor.load_method(name)?;
+            Ok(StepResult::Continue)
         }
         Instruction::ExitInitCheck => Ok(StepResult::Continue),
         Instruction::WithExceptStart => {

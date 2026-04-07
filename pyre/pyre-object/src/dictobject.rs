@@ -108,11 +108,63 @@ pub unsafe fn w_dict_store(obj: PyObjectRef, key: PyObjectRef, value: PyObjectRe
     for entry in entries.iter_mut() {
         if dict_keys_equal(entry.0, key) {
             entry.1 = value;
+            // Namespace proxy sync: if this dict is backed by a PyNamespace
+            // (typical for globals()), propagate the update back so that
+            // module-level assignments via `globals()[name] = value` appear
+            // in the frame's namespace.
+            maybe_sync_namespace_store(dict.namespace_proxy, key, value);
             return;
         }
     }
     entries.push((key, value));
     dict.len += 1;
+    maybe_sync_namespace_store(dict.namespace_proxy, key, value);
+}
+
+/// Write a str-keyed assignment back to the dict's backing PyNamespace,
+/// if any. Declared in pyre-interpreter and re-exported via an `extern`
+/// hook registered at startup to avoid a circular dependency.
+unsafe fn maybe_sync_namespace_store(ns_ptr: *mut u8, key: PyObjectRef, value: PyObjectRef) {
+    if ns_ptr.is_null() || !crate::is_str(key) {
+        return;
+    }
+    if let Some(hook) = NAMESPACE_STORE_HOOK
+        .load(std::sync::atomic::Ordering::Acquire)
+        .as_ref()
+    {
+        let name = crate::w_str_get_value(key);
+        hook(ns_ptr, name, value);
+    }
+}
+
+type NamespaceStoreHook = unsafe fn(*mut u8, &str, PyObjectRef);
+
+struct AtomicHookPtr(std::sync::atomic::AtomicPtr<NamespaceStoreHook>);
+
+impl AtomicHookPtr {
+    const fn new() -> Self {
+        Self(std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()))
+    }
+
+    fn store(&self, hook: NamespaceStoreHook) {
+        // Leak a boxed function pointer so the pointer lives for the entire
+        // process lifetime; this matches PyPy's one-time interp init.
+        let boxed: Box<NamespaceStoreHook> = Box::new(hook);
+        let raw = Box::into_raw(boxed);
+        self.0.store(raw, std::sync::atomic::Ordering::Release);
+    }
+
+    fn load(&self, order: std::sync::atomic::Ordering) -> *const NamespaceStoreHook {
+        self.0.load(order) as *const NamespaceStoreHook
+    }
+}
+
+static NAMESPACE_STORE_HOOK: AtomicHookPtr = AtomicHookPtr::new();
+
+/// Register the interpreter-level hook that writes (name, value) into a
+/// PyNamespace. Called once during interpreter startup.
+pub fn register_namespace_store_hook(hook: NamespaceStoreHook) {
+    NAMESPACE_STORE_HOOK.store(hook);
 }
 
 /// Get the namespace_proxy pointer from a dict (used by interpreter for
@@ -158,6 +210,12 @@ pub unsafe fn w_dict_setitem_str(obj: PyObjectRef, key: &str, value: PyObjectRef
 /// Get the number of entries.
 pub unsafe fn w_dict_len(obj: PyObjectRef) -> usize {
     (*(obj as *const W_DictObject)).len
+}
+
+/// Iterate over all (key, value) pairs without type assumptions.
+pub unsafe fn w_dict_items(obj: PyObjectRef) -> Vec<(PyObjectRef, PyObjectRef)> {
+    let dict = &*(obj as *const W_DictObject);
+    (*dict.entries).clone()
 }
 
 /// Iterate over (key_str, value) pairs. Keys must be str objects.

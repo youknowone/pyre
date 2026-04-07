@@ -148,6 +148,146 @@ pub fn init(ns: &mut PyNamespace) {
     namespace_store(ns, "argv", w_list_new(vec![]));
     // sys.warnoptions
     namespace_store(ns, "warnoptions", w_list_new(vec![]));
+    // sys.builtin_module_names — tuple of names of modules compiled into
+    // the interpreter. PyPy: pypy/module/sys/state.py get_builtin_module_names.
+    // Pyre: include all stub/native built-ins from importing.rs.
+    namespace_store(
+        ns,
+        "builtin_module_names",
+        w_tuple_new(vec![
+            w_str_new("_abc"),
+            w_str_new("_bisect"),
+            w_str_new("_blake2"),
+            w_str_new("_codecs"),
+            w_str_new("_collections"),
+            w_str_new("_collections_abc"),
+            w_str_new("_contextvars"),
+            w_str_new("_csv"),
+            w_str_new("_datetime"),
+            w_str_new("_decimal"),
+            w_str_new("_functools"),
+            w_str_new("_hashlib"),
+            w_str_new("_heapq"),
+            w_str_new("_imp"),
+            w_str_new("_io"),
+            w_str_new("_json"),
+            w_str_new("_locale"),
+            w_str_new("_md5"),
+            w_str_new("_opcode"),
+            w_str_new("_operator"),
+            w_str_new("_pickle"),
+            w_str_new("_random"),
+            w_str_new("_sha1"),
+            w_str_new("_sha2"),
+            w_str_new("_sha3"),
+            w_str_new("_signal"),
+            w_str_new("_socket"),
+            w_str_new("_sre"),
+            w_str_new("_stat"),
+            w_str_new("_string"),
+            w_str_new("_struct"),
+            w_str_new("_thread"),
+            w_str_new("_tokenize"),
+            w_str_new("_tracemalloc"),
+            w_str_new("_typing"),
+            w_str_new("_warnings"),
+            w_str_new("_weakref"),
+            w_str_new("atexit"),
+            w_str_new("binascii"),
+            w_str_new("builtins"),
+            w_str_new("copyreg"),
+            w_str_new("errno"),
+            w_str_new("fcntl"),
+            w_str_new("grp"),
+            w_str_new("itertools"),
+            w_str_new("marshal"),
+            w_str_new("math"),
+            w_str_new("cmath"),
+            w_str_new("operator"),
+            w_str_new("posix"),
+            w_str_new("pwd"),
+            w_str_new("select"),
+            w_str_new("sys"),
+            w_str_new("time"),
+        ]),
+    );
+    // sys.exception — returns the currently handled exception or None
+    namespace_store(
+        ns,
+        "exception",
+        crate::make_builtin_function("exception", |_| Ok(w_none())),
+    );
+    // sys.exc_clear — no-op
+    namespace_store(
+        ns,
+        "exc_clear",
+        crate::make_builtin_function("exc_clear", |_| Ok(w_none())),
+    );
+    // sys.gettrace / settrace — no-op
+    namespace_store(
+        ns,
+        "gettrace",
+        crate::make_builtin_function("gettrace", |_| Ok(w_none())),
+    );
+    namespace_store(
+        ns,
+        "settrace",
+        crate::make_builtin_function("settrace", |_| Ok(w_none())),
+    );
+    // sys.getprofile / setprofile — no-op
+    namespace_store(
+        ns,
+        "getprofile",
+        crate::make_builtin_function("getprofile", |_| Ok(w_none())),
+    );
+    namespace_store(
+        ns,
+        "setprofile",
+        crate::make_builtin_function("setprofile", |_| Ok(w_none())),
+    );
+    // sys.getfilesystemencoding
+    namespace_store(
+        ns,
+        "getfilesystemencoding",
+        crate::make_builtin_function("getfilesystemencoding", |_| Ok(w_str_new("utf-8"))),
+    );
+    namespace_store(
+        ns,
+        "getfilesystemencodeerrors",
+        crate::make_builtin_function("getfilesystemencodeerrors", |_| {
+            Ok(w_str_new("surrogateescape"))
+        }),
+    );
+    // sys.audit — no-op
+    namespace_store(
+        ns,
+        "audit",
+        crate::make_builtin_function("audit", |_| Ok(w_none())),
+    );
+    // sys.is_finalizing
+    namespace_store(
+        ns,
+        "is_finalizing",
+        crate::make_builtin_function("is_finalizing", |_| Ok(w_bool_from(false))),
+    );
+    // sys.displayhook / excepthook
+    namespace_store(
+        ns,
+        "displayhook",
+        crate::make_builtin_function("displayhook", |_| Ok(w_none())),
+    );
+    namespace_store(
+        ns,
+        "excepthook",
+        crate::make_builtin_function("excepthook", |_| Ok(w_none())),
+    );
+    // sys.path_hooks / path_importer_cache
+    namespace_store(ns, "path_hooks", w_list_new(vec![]));
+    namespace_store(ns, "path_importer_cache", w_dict_new());
+    // sys.meta_path — empty
+    namespace_store(ns, "meta_path", w_list_new(vec![]));
+    // sys.dont_write_bytecode
+    namespace_store(ns, "dont_write_bytecode", w_bool_from(true));
     // sys.addaudithook
     namespace_store(
         ns,

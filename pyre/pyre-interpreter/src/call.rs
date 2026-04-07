@@ -694,7 +694,7 @@ pub fn call_with_kwargs(
                 }
             }
 
-            // Fill defaults
+            // Fill positional defaults from __defaults__ tuple.
             let n_pos_params = code.arg_count as usize;
             let defaults = unsafe { crate::function_get_defaults(callable) };
             if !defaults.is_null() {
@@ -709,6 +709,27 @@ pub fn call_with_kwargs(
                                 unsafe { pyre_object::w_tuple_getitem(defaults, di as i64) }
                             {
                                 result[pi] = v;
+                            }
+                        }
+                    }
+                }
+            }
+            // Fill keyword-only defaults from __kwdefaults__ dict.
+            // function.py Function._apply_defaults — kw-only args take their
+            // defaults from the kwdefaults dict by name lookup.
+            let nkwonly = code.kwonlyarg_count as usize;
+            if nkwonly > 0 {
+                let kwdefaults = unsafe { crate::function_get_kwdefaults(callable) };
+                if !kwdefaults.is_null() && unsafe { pyre_object::is_dict(kwdefaults) } {
+                    for ki in 0..nkwonly {
+                        let slot = n_pos_params + ki;
+                        if slot < result.len() && result[slot].is_null() {
+                            let param_name = &code.varnames[slot];
+                            let key = pyre_object::w_str_new(param_name);
+                            if let Some(v) =
+                                unsafe { pyre_object::w_dict_lookup(kwdefaults, key) }
+                            {
+                                result[slot] = v;
                             }
                         }
                     }
@@ -834,6 +855,15 @@ pub fn call_with_kwargs(
 
 pub fn register_build_class() {
     crate::typedef::init_typeobjects();
+    // Wire the dict→namespace write-through hook so that
+    // `globals()[name] = value` stays visible after the globals() dict
+    // is discarded. PyPy: the module dict IS the namespace in PyPy,
+    // so there is no separate hook; pyre keeps the namespace as a
+    // flat PyNamespace and syncs via this callback.
+    pyre_object::dictobject::register_namespace_store_hook(|ns_ptr, name, value| unsafe {
+        let ns = &mut *(ns_ptr as *mut crate::PyNamespace);
+        crate::namespace_store(ns, name, value);
+    });
 }
 
 /// `ObjSpace.call_function(callable, *args)` — direct implementation.
@@ -844,6 +874,11 @@ pub fn register_build_class() {
 ///
 /// Dispatches to builtins, user functions, and type objects.
 /// Type call uses the same __new__ + __init__ protocol as type_descr_call.
+/// Re-export for crate-external callers that need a frame-less call path.
+pub fn call_function_impl_raw(callable: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRef {
+    call_function_impl(callable, args)
+}
+
 pub(crate) fn call_function_impl(callable: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRef {
     unsafe {
         if pyre_object::is_method(callable) {
