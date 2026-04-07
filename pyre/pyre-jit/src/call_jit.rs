@@ -644,7 +644,19 @@ extern "C" fn jit_force_callee_frame_interp(frame_ptr: i64) -> i64 {
     let green_key = crate::eval::make_green_key(frame.code, frame.next_instr);
     let protocol = finish_protocol(green_key);
 
-    let result = blackhole_from_jit_frame(frame);
+    // warmspot.py:1021-1028 assembler_call_helper parity: if the blackhole
+    // cannot run (pc_map miss = corrupt resume data), fall back to plain
+    // interpreter evaluation. RPython's assembler_call_helper asserts
+    // handle_fail never returns silently; the nearest structural equivalent
+    // in pyre is eval_frame_plain, which re-runs the frame in the
+    // interpreter without JIT re-entry.
+    let result = match blackhole_from_jit_frame(frame) {
+        Some(r) => r,
+        None => match pyre_interpreter::eval::eval_frame_plain(frame) {
+            Ok(r) => r,
+            Err(_) => pyre_object::PY_NULL,
+        },
+    };
 
     match protocol {
         FinishProtocol::RawInt if !result.is_null() && unsafe { is_int(result) } => unsafe {
@@ -653,13 +665,6 @@ extern "C" fn jit_force_callee_frame_interp(frame_ptr: i64) -> i64 {
         FinishProtocol::RawInt => result as i64,
         FinishProtocol::Boxed => result as i64,
     }
-}
-
-/// RPython: blackhole.py resume_in_blackhole()
-///
-/// Public wrapper for guard failure recovery.
-pub fn resume_in_blackhole_pub(frame: &mut PyFrame) -> pyre_object::PyObjectRef {
-    blackhole_from_jit_frame(frame)
 }
 
 /// blackhole.py:1095 get_portal_runner / warmspot.py portal_runner parity:
@@ -679,7 +684,16 @@ fn bh_portal_runner(frame_ptr: i64) -> i64 {
 /// Compiles the frame's CodeObject to JitCode (via CodeWriter), creates
 /// a BlackholeInterpreter, loads frame state, and runs it.
 /// The blackhole has NO JIT entry points — structural isolation.
-fn blackhole_from_jit_frame(frame: &mut PyFrame) -> PyObjectRef {
+///
+/// Returns `None` when the blackhole cannot run (e.g. the frame's Python
+/// PC is outside the jitcode's pc_map — a bug-tier condition in RPython's
+/// model, where the resume data is supposed to be consistent with the
+/// jitcode). Callers must fall back to the plain interpreter on `None`
+/// rather than treating it as a successful null result; RPython's
+/// `assembler_call_helper` asserts `handle_fail` never returns without
+/// raising, and a silent null would corrupt computations that depend on
+/// the call's return value (see `jit_force_recursive_call_raw_1`).
+fn blackhole_from_jit_frame(frame: &mut PyFrame) -> Option<PyObjectRef> {
     // RPython parity: blackhole has no jit_merge_point.
     // bh_call_fn_impl uses force_plain_eval so all nested calls
     // stay in the plain interpreter (no JIT re-entry).
@@ -719,7 +733,7 @@ fn blackhole_from_jit_frame(frame: &mut PyFrame) -> PyObjectRef {
                 pyjitcode.pc_map.len(),
             );
         }
-        return std::ptr::null_mut();
+        return None;
     };
 
     // RPython: blackholeinterp = builder.acquire_interp()
@@ -797,7 +811,7 @@ fn blackhole_from_jit_frame(frame: &mut PyFrame) -> PyObjectRef {
     // RPython: builder.release_interp(blackholeinterp) — return to pool
     builder.release_interp(bh);
 
-    result
+    Some(result)
 }
 
 /// RPython blackhole.py _run_forever + jitexc.py parity.
@@ -1570,10 +1584,20 @@ pub extern "C" fn jit_force_recursive_call_raw_1(
 
     let boxed = pyre_object::intobject::w_int_new(raw_int_arg);
     let frame_ptr = create_callee_frame_impl_1_boxed(caller_frame, callable_ref, boxed);
-    // RPython parity: nested calls CAN enter JIT (blackhole.py:1095)
+    // RPython parity: nested calls CAN enter JIT (blackhole.py:1095).
+    // warmspot.py:1021-1028 assembler_call_helper parity: if the blackhole
+    // cannot run (pc_map miss), fall back to plain interpreter evaluation.
+    // Previously we returned the raw null as if it were a normal result,
+    // which would silently corrupt recursive-call computations on failure.
     let result = {
         let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
-        let bh_result = blackhole_from_jit_frame(frame);
+        let bh_result = match blackhole_from_jit_frame(frame) {
+            Some(r) => r,
+            None => match pyre_interpreter::eval::eval_frame_plain(frame) {
+                Ok(r) => r,
+                Err(_) => pyre_object::PY_NULL,
+            },
+        };
         match protocol {
             FinishProtocol::RawInt if !bh_result.is_null() && unsafe { is_int(bh_result) } => unsafe {
                 w_int_get_value(bh_result)
