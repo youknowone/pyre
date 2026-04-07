@@ -108,7 +108,15 @@ thread_local! {
         // PYRE_OBJECT_GC_TYPE_ID so constant-class folding
         // (info.py:763-772 `ConstPtrInfo.get_known_class(cpu)`) works
         // for str / list / None / exception / type / instance / etc.
-        for pytype in pyre_object::pyobject::all_foreign_pytypes() {
+        // `pyre_object::pyobject::all_foreign_pytypes()` covers object
+        // module PyTypes; `pyre_interpreter::all_foreign_pytypes()`
+        // covers interpreter-level PyTypes (CODE_TYPE / FUNCTION_TYPE
+        // / BUILTIN_CODE_TYPE) that flow through tracing as constant
+        // callable/code pointers.
+        for pytype in pyre_object::pyobject::all_foreign_pytypes()
+            .iter()
+            .chain(pyre_interpreter::all_foreign_pytypes().iter())
+        {
             majit_gc::GcAllocator::register_vtable_for_type(
                 &mut gc,
                 *pytype as *const _ as usize,
