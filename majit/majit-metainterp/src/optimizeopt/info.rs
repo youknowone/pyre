@@ -412,13 +412,14 @@ impl PtrInfo {
     ///
     /// - `KnownClass`/`Instance`/`Virtual`: return the stored
     ///   `known_class` field.
-    /// - `Constant`: null constants → `None`; otherwise gate on the
-    ///   thread-local backend shim (`majit_gc::supports_guard_gc_type`
-    ///   + `majit_gc::check_is_object`) and call `cls_of_box` (read
-    ///   typeptr at offset 0) only when both pass. This mirrors
-    ///   llmodel.py:541-561 exactly: non-object constant pointers are
-    ///   rejected by `check_is_object` and return `None` so the
-    ///   optimizer does not read garbage at offset 0.
+    /// - `Constant`: null constants → `None`; otherwise, when the
+    ///   backend supports `guard_gc_type` (`majit_gc::supports_guard_gc_type`),
+    ///   gate `cls_of_box` on `majit_gc::check_is_object` so that
+    ///   non-object constant pointers are rejected and the optimizer
+    ///   does not read garbage at offset 0. When the backend does
+    ///   not support `guard_gc_type`, RPython skips the
+    ///   `check_is_object` call entirely and still returns
+    ///   `cls_of_box(self._const)`; this port follows that.
     /// - Everything else: `None`.
     pub fn get_known_class(&self) -> Option<GcRef> {
         match self {
@@ -430,12 +431,11 @@ impl PtrInfo {
                 if gcref.is_null() {
                     return None;
                 }
-                // info.py:765-767: gate `cls_of_box` on
-                // `supports_guard_gc_type` + `check_is_object`.
-                if !majit_gc::supports_guard_gc_type() {
-                    return None;
-                }
-                if !majit_gc::check_is_object(*gcref) {
+                // info.py:765-767: gate the `check_is_object` call on
+                // `supports_guard_gc_type`. When the backend doesn't
+                // support guard_gc_type, RPython simply skips the
+                // `check_is_object` step and still calls `cls_of_box`.
+                if majit_gc::supports_guard_gc_type() && !majit_gc::check_is_object(*gcref) {
                     return None;
                 }
                 // info.py:768 / llmodel.py:556-561 `cls_of_box`: read

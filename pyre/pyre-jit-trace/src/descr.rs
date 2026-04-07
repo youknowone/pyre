@@ -222,6 +222,15 @@ pub const W_INT_GC_TYPE_ID: u32 = 0;
 pub const W_FLOAT_GC_TYPE_ID: u32 = 1;
 /// GC type id for JitFrame (jitframe.py:49 register_custom_trace_hook).
 pub const JITFRAME_GC_TYPE_ID: u32 = 2;
+/// Shared type id for every pyre `PyObject`-layout type that is not
+/// allocated through the JIT. RPython assigns one typeid per class in
+/// `rclass.OBJECT`'s type_info_group; pyre collapses them into a
+/// single entry because (a) these types are never allocated through
+/// the JIT's NewWithVtable path, so the payload `size` field is
+/// unused, and (b) the only consumer on this path is
+/// `check_is_object(gcref)` (llmodel.py:541-546), which only needs
+/// the `T_IS_RPYTHON_INSTANCE` bit (gc.py:642) to be set.
+pub const PYRE_OBJECT_GC_TYPE_ID: u32 = 3;
 
 impl Descr for PyreSizeDescr {
     fn index(&self) -> u32 {

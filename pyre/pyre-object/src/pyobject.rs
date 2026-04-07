@@ -62,6 +62,47 @@ pub static INSTANCE_TYPE: PyType = PyType { tp_name: "object" };
 /// Field offset of `ob_type` within PyObject, for JIT field access.
 pub const OB_TYPE_OFFSET: usize = std::mem::offset_of!(PyObject, ob_type);
 
+/// Every built-in `PyType` static that represents a full `PyObject`
+/// subtype (i.e. instances carry `ob_type` at offset 0, matching
+/// `rclass.OBJECT` layout). The JIT registers each of these with the
+/// GC via `register_vtable_for_type` so `cpu.check_is_object(gcref)`
+/// returns true for their instances — see llmodel.py:541-546 and
+/// info.py:763-772 `ConstPtrInfo.get_known_class(cpu)`.
+///
+/// `INT_TYPE` and `FLOAT_TYPE` are intentionally absent: they get
+/// their own type_ids (`W_INT_GC_TYPE_ID` / `W_FLOAT_GC_TYPE_ID`)
+/// because the JIT backend allocates W_IntObject / W_FloatObject
+/// through NewWithVtable and needs the correct payload size.
+pub fn all_foreign_pytypes() -> &'static [&'static PyType] {
+    static PYTYPES: &[&PyType] = &[
+        &BOOL_TYPE,
+        &STR_TYPE,
+        &LIST_TYPE,
+        &TUPLE_TYPE,
+        &DICT_TYPE,
+        &LONG_TYPE,
+        &NONE_TYPE,
+        &NOTIMPLEMENTED_TYPE,
+        &MODULE_TYPE,
+        &TYPE_TYPE,
+        &INSTANCE_TYPE,
+        &crate::superobject::SUPER_TYPE,
+        &crate::bytearrayobject::BYTEARRAY_TYPE,
+        &crate::generatorobject::GENERATOR_TYPE,
+        &crate::unionobject::UNION_TYPE,
+        &crate::rangeobject::RANGE_ITER_TYPE,
+        &crate::rangeobject::SEQ_ITER_TYPE,
+        &crate::cellobject::CELL_TYPE,
+        &crate::methodobject::METHOD_TYPE,
+        &crate::propertyobject::PROPERTY_TYPE,
+        &crate::propertyobject::STATICMETHOD_TYPE,
+        &crate::propertyobject::CLASSMETHOD_TYPE,
+        &crate::excobject::EXCEPTION_TYPE,
+        &crate::sliceobject::SLICE_TYPE,
+    ];
+    PYTYPES
+}
+
 // ── Type checks ───────────────────────────────────────────────────────
 
 /// Check if an object is of a given type (pointer identity comparison).
