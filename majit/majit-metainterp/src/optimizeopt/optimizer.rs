@@ -539,7 +539,18 @@ impl Optimizer {
             if let Some(iv) = iv_map.get(&state_idx) {
                 // Virtual state: process fields recursively, consuming slots
                 // for non-virtual leaf fields.
-                let raw = OpRef(iv.inputarg_index as u32);
+                //
+                // `iv.inputarg_index` is the virtualizable state's index
+                // within `next_iteration_args`, which corresponds to
+                // Phase 2 inputarg slot i (not to a raw OpRef). Shift
+                // by `ctx.inputarg_base` so the OpRef we resolve points
+                // to Phase 2's fresh inputarg slot in the disjoint
+                // `[inputarg_base..inputarg_base+num_inputs)` range
+                // (matches RPython's TraceIterator fresh-InputArg model).
+                // For Phase 1 / standalone runs `inputarg_base == 0`, so
+                // the shift is a no-op and the legacy raw-position path
+                // still works.
+                let raw = OpRef(ctx.inputarg_base + iv.inputarg_index as u32);
                 let virtual_head = ctx.get_box_replacement(raw);
                 let mut fields = Vec::new();
                 let mut field_descrs = Vec::new();
@@ -1620,18 +1631,33 @@ impl Optimizer {
         }
 
         if let Some(exported_state) = self.imported_loop_state.as_ref() {
-            // opencoder.py:259 parity: RPython allocates fresh InputArg Box
-            // objects for each Phase 2 iteration. In majit's flat OpRef model,
-            // source == target creates a forwarding cycle, so fresh allocation
-            // is only applied for cross-slot collisions (target[i] == source[j],
-            // i!=j). The source == target case is a no-op in replace_op.
+            // opencoder.py:259 + unroll.py:479-504 parity: RPython's
+            // TraceIterator allocates fresh InputArg Box objects for
+            // each iteration, and `import_state` asserts
+            // `source is not target` (unroll.py:483) because the fresh
+            // Phase 2 inputargs never coincide with any Phase 1 emitted
+            // Box. majit encodes "fresh per iteration" via the
+            // `ctx.inputarg_base` offset — Phase 2's source slots live
+            // at `[inputarg_base..inputarg_base+n)`, disjoint from
+            // Phase 1 emitted OpRefs `[num_inputs..next_global_opref)`.
+            //
+            // With disjoint namespaces, the `source == target` edge
+            // case RPython avoids by construction cannot occur here
+            // either: any `target` coming from `next_iteration_args`
+            // is either a constant, a Phase 1 emitted OpRef, or a
+            // Phase 1 inputarg OpRef (in `[0..num_inputs)`) — all
+            // outside the Phase 2 `source` range. The cross-slot
+            // collision guard below is preserved for the Phase 1 /
+            // standalone path where `inputarg_base == 0` and `source`
+            // can coincide with another slot's `target`.
+            let inputarg_base = ctx.inputarg_base;
             let nia = &exported_state.next_iteration_args;
             let n = nia.len();
             let source_set: std::collections::HashSet<OpRef> =
-                (0..n).map(|i| OpRef(i as u32)).collect();
+                (0..n).map(|i| OpRef(inputarg_base + i as u32)).collect();
             let targetargs: Vec<OpRef> = (0..n)
                 .map(|i| {
-                    let source = OpRef(i as u32);
+                    let source = OpRef(inputarg_base + i as u32);
                     let target = nia[i];
                     // Constants don't participate in forwarding.
                     if ctx.is_constant(target) {
