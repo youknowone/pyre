@@ -2591,6 +2591,12 @@ impl<S: JitState> JitDriver<S> {
         }
 
         self.sym = Some(S::create_sym(&trace_meta, resume_pc));
+        // pyjitpl.py:2890 parity: bridge traces start at resume_pc, not at
+        // function entry (pc=0). Set header_pc so init_symbolic correctly
+        // detects this is NOT a function-entry trace.
+        if let Some(ref mut ctx) = self.meta.tracing {
+            ctx.header_pc = resume_pc;
+        }
         // resume.py:1042 parity: map frame locals to bridge InputArg OpRefs
         // so bridge tracing sees locals as symbolic variables, not concrete values.
         if let Some(ref bfm) = resume_data_result {

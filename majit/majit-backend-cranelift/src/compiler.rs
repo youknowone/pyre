@@ -5131,15 +5131,15 @@ impl CraneliftBackend {
             // bridge tracer saw via rebuild_from_resumedata (resume.py:1042).
             let bridge_guard = fail_descr.bridge_ref();
             if let Some(ref bridge) = *bridge_guard {
-                let mut bridge_outputs = outputs;
-                rebuild_state_after_failure(
-                    &mut bridge_outputs,
-                    &fail_descr.fail_arg_types,
-                    fail_descr.recovery_layout_ref().as_ref(),
-                    bridge.num_inputs,
-                );
-                let n = bridge.num_inputs.min(bridge_outputs.len());
-                let bridge_inputs = bridge_outputs[..n].to_vec();
+                // llgraph/runner.py:1184-1191 parity: bridge receives the
+                // guard's raw fail_arg values (self.env[box] in RPython).
+                // NOTE: rebuild_state_after_failure replaces outputs with
+                // frame-section values; for bridge dispatch, start from raw
+                // outputs and let rebuild EXTEND (not replace) if needed.
+                // The bridge's num_inputs may be smaller than outputs.len();
+                // use outputs directly — they already have fail_args in order.
+                let n = bridge.num_inputs.min(outputs.len());
+                let bridge_inputs = outputs[..n].to_vec();
                 cur_code_ptr = bridge.code_ptr;
                 cur_fail_descrs = bridge.fail_descrs.clone();
                 cur_gc_runtime_id = bridge.gc_runtime_id;
