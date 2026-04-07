@@ -73,7 +73,7 @@ fn normalize_direct_finish_result(protocol: FinishProtocol, raw: i64) -> i64 {
 }
 
 fn debug_instruction_window(frame: &PyFrame) -> String {
-    let code = unsafe { &*frame.code };
+    let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
     let mut out = String::new();
     let mut arg_state = OpArgState::default();
     let current = frame.next_instr;
@@ -511,7 +511,7 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
     let (code, namespace, exec_ctx) = unsafe {
         use pyre_interpreter::pyframe::*;
         let p = frame_ptr as *const u8;
-        let code = *(p.add(PYFRAME_CODE_OFFSET) as *const *const pyre_interpreter::CodeObject);
+        let code = *(p.add(PYFRAME_CODE_OFFSET) as *const *const ());
         let ns = *(p.add(std::mem::offset_of!(PyFrame, namespace))
             as *const *mut pyre_interpreter::PyNamespace);
         let ec = *(p.add(std::mem::offset_of!(PyFrame, execution_context))
@@ -595,7 +595,11 @@ fn jit_force_callee_frame_raw(frame_ptr: i64) -> i64 {
     let (driver, _) = crate::eval::driver_pair();
     if let Some(token) = driver.get_loop_token(green_key) {
         let token_num = token.number;
-        let nlocals = unsafe { (&*frame.code).varnames.len() };
+        let nlocals = unsafe {
+            (&*pyre_interpreter::pyframe_get_pycode(frame))
+                .varnames
+                .len()
+        };
         let mut inputs = vec![
             frame_ptr,
             frame.next_instr as i64,
@@ -685,7 +689,7 @@ fn blackhole_from_jit_frame(frame: &mut PyFrame) -> PyObjectRef {
     // RPython parity: blackhole has no jit_merge_point.
     // bh_call_fn_impl uses force_plain_eval so all nested calls
     // stay in the plain interpreter (no JIT re-entry).
-    let code = unsafe { &*frame.code };
+    let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
     let py_pc = frame.next_instr;
 
     // RPython: blackhole_from_resumedata() → setposition + consume_one_section
@@ -701,7 +705,7 @@ fn blackhole_from_jit_frame(frame: &mut PyFrame) -> PyObjectRef {
         bh_store_subscr_fn,
         crate::call_jit::bh_build_list_fn,
     );
-    let pyjitcode = crate::jit::codewriter::get_jitcode(code, &writer);
+    let pyjitcode = crate::jit::codewriter::get_jitcode(code, frame.code, &writer);
 
     // Map Python PC → JitCode PC
     let jitcode_pc = if py_pc < pyjitcode.pc_map.len() {
@@ -908,7 +912,8 @@ pub fn resume_in_blackhole(
         let stack_only = vsd.saturating_sub(nlocals);
 
         // call.py:148: jitcode via get_jitcode (jitdriver_sd set on portal).
-        let pyjitcode = crate::jit::codewriter::get_jitcode(code, &writer);
+        let w_code = unsafe { (*frame_ptr).code };
+        let pyjitcode = crate::jit::codewriter::get_jitcode(code, w_code, &writer);
         let jitcode_pc = if py_pc < pyjitcode.pc_map.len() {
             pyjitcode.pc_map[py_pc]
         } else {
@@ -953,7 +958,12 @@ pub fn resume_in_blackhole(
             crate::call_jit::bh_build_list_fn,
         );
         let code_ref = unsafe { &*section.code };
-        let pyjitcode = crate::jit::codewriter::get_jitcode(code_ref, &writer);
+        let w_code_for_jitcode = if !section.frame_ptr.is_null() {
+            unsafe { (*section.frame_ptr).code }
+        } else {
+            code_ref as *const pyre_interpreter::CodeObject as *const ()
+        };
+        let pyjitcode = crate::jit::codewriter::get_jitcode(code_ref, w_code_for_jitcode, &writer);
         let jc = &pyjitcode.jitcode;
         let liveness_info = jc
             .py_to_jit_pc
@@ -1076,7 +1086,7 @@ pub fn resume_in_blackhole(
             let frame_ptr = bh.virtualizable_ptr as *mut PyFrame;
             if !frame_ptr.is_null() {
                 let frame = unsafe { &mut *frame_ptr };
-                let code = unsafe { &*frame.code };
+                let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
                 let nlocals = code.varnames.len();
                 // blackhole.py:1068 parity: only live values are carried
                 // by ContinueRunningNormally. Use liveness at the merge
@@ -1229,7 +1239,7 @@ fn materialize_virtual(val: &majit_ir::Value) -> i64 {
 /// This implements the RPython flow:
 ///   guard fail → resume_in_blackhole → jit_merge_point → ContinueRunningNormally
 pub fn resume_in_blackhole_to_merge_point(frame: &mut PyFrame) -> bool {
-    let code = unsafe { &*frame.code };
+    let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
     let py_pc = frame.next_instr;
 
     let writer = crate::jit::codewriter::CodeWriter::new(
@@ -1243,7 +1253,7 @@ pub fn resume_in_blackhole_to_merge_point(frame: &mut PyFrame) -> bool {
         bh_store_subscr_fn,
         crate::call_jit::bh_build_list_fn,
     );
-    let pyjitcode = crate::jit::codewriter::get_jitcode(code, &writer);
+    let pyjitcode = crate::jit::codewriter::get_jitcode(code, frame.code, &writer);
 
     let jitcode_pc = if py_pc < pyjitcode.pc_map.len() {
         pyjitcode.pc_map[py_pc]
@@ -1732,8 +1742,15 @@ pub fn blackhole_resume_via_rd_numb(
             if code_ptr.is_null() {
                 return None;
             }
-            let code = unsafe { &*code_ptr };
-            let pyjitcode = crate::jit::codewriter::get_jitcode(code, &writer);
+            let raw_code = unsafe {
+                pyre_interpreter::w_code_get_ptr(code_ptr as pyre_object::PyObjectRef)
+                    as *const pyre_interpreter::CodeObject
+            };
+            if raw_code.is_null() {
+                return None;
+            }
+            let code = unsafe { &*raw_code };
+            let pyjitcode = crate::jit::codewriter::get_jitcode(code, code_ptr, &writer);
             if pyjitcode.has_abort_opcode() {
                 return None;
             }
@@ -1983,7 +2000,7 @@ pub fn trace_and_compile_from_bridge(
         return false;
     }
     frame.next_instr = resume_pc;
-    let code = unsafe { &*frame.code };
+    let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
     let env = PyreEnv;
     let mut jit_state = build_jit_state(frame, info);
 
@@ -2244,16 +2261,15 @@ fn create_callee_frame_impl_1_boxed(
     callable: PyObjectRef,
     boxed_arg: PyObjectRef,
 ) -> i64 {
-    let code_ptr = unsafe { pyre_interpreter::get_pycode(callable) };
+    let w_code = unsafe { pyre_interpreter::get_pycode(callable) };
     let caller = unsafe { &*(caller_frame as *const PyFrame) };
     let globals = unsafe { function_get_globals(callable) };
-    let func_code = code_ptr as *const pyre_interpreter::CodeObject;
 
     let arena = arena_ref();
     if let Some((ptr, was_init)) = arena.take() {
         if was_init {
             let f = unsafe { &mut *ptr };
-            if f.code == func_code
+            if f.code == w_code
                 && f.namespace == globals
                 && f.execution_context == caller.execution_context
             {
@@ -2263,7 +2279,7 @@ fn create_callee_frame_impl_1_boxed(
                     std::ptr::write(
                         ptr,
                         PyFrame::new_for_call(
-                            func_code,
+                            w_code,
                             &[boxed_arg],
                             globals,
                             caller.execution_context,
@@ -2276,12 +2292,7 @@ fn create_callee_frame_impl_1_boxed(
             unsafe {
                 std::ptr::write(
                     ptr,
-                    PyFrame::new_for_call(
-                        func_code,
-                        &[boxed_arg],
-                        globals,
-                        caller.execution_context,
-                    ),
+                    PyFrame::new_for_call(w_code, &[boxed_arg], globals, caller.execution_context),
                 );
                 (&mut *ptr).fix_array_ptrs();
             }
@@ -2291,7 +2302,7 @@ fn create_callee_frame_impl_1_boxed(
     }
 
     let frame_ptr = Box::into_raw(Box::new(PyFrame::new_for_call(
-        func_code,
+        w_code,
         &[boxed_arg],
         globals,
         caller.execution_context,
@@ -2352,10 +2363,9 @@ fn create_self_recursive_callee_frame_impl_1_boxed(
 
 fn create_callee_frame_impl(caller_frame: i64, callable: i64, args: &[PyObjectRef]) -> i64 {
     let callable = callable as PyObjectRef;
-    let code_ptr = unsafe { pyre_interpreter::get_pycode(callable) };
+    let w_code = unsafe { pyre_interpreter::get_pycode(callable) };
     let caller = unsafe { &*(caller_frame as *const PyFrame) };
     let globals = unsafe { function_get_globals(callable) };
-    let func_code = code_ptr as *const pyre_interpreter::CodeObject;
 
     let arena = arena_ref();
     if let Some((ptr, was_init)) = arena.take() {
@@ -2364,7 +2374,7 @@ fn create_callee_frame_impl(caller_frame: i64, callable: i64, args: &[PyObjectRe
             // code, execution_context, namespace, locals_cells_stack_w.ptr
             // are stable for self-recursion (same function, same module).
             let f = unsafe { &mut *ptr };
-            if f.code == func_code
+            if f.code == w_code
                 && f.namespace == globals
                 && f.execution_context == caller.execution_context
             {
@@ -2374,7 +2384,7 @@ fn create_callee_frame_impl(caller_frame: i64, callable: i64, args: &[PyObjectRe
                 unsafe {
                     std::ptr::write(
                         ptr,
-                        PyFrame::new_for_call(func_code, args, globals, caller.execution_context),
+                        PyFrame::new_for_call(w_code, args, globals, caller.execution_context),
                     );
                     (&mut *ptr).fix_array_ptrs();
                 }
@@ -2384,7 +2394,7 @@ fn create_callee_frame_impl(caller_frame: i64, callable: i64, args: &[PyObjectRe
             unsafe {
                 std::ptr::write(
                     ptr,
-                    PyFrame::new_for_call(func_code, args, globals, caller.execution_context),
+                    PyFrame::new_for_call(w_code, args, globals, caller.execution_context),
                 );
                 (&mut *ptr).fix_array_ptrs();
             }
@@ -2395,7 +2405,7 @@ fn create_callee_frame_impl(caller_frame: i64, callable: i64, args: &[PyObjectRe
 
     // Arena full: heap fallback (should not happen for recursion < 64)
     let frame_ptr = Box::into_raw(Box::new(PyFrame::new_for_call(
-        func_code,
+        w_code,
         args,
         globals,
         caller.execution_context,

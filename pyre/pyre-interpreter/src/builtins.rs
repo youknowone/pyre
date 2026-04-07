@@ -1509,7 +1509,7 @@ fn builtin_locals(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             return Ok(dict);
         }
         let dict = pyre_object::w_dict_new();
-        let code = unsafe { &*frame.code };
+        let code = unsafe { &*crate::pyframe_get_pycode(frame) };
         for (idx, name) in code.varnames.iter().enumerate() {
             let value = frame.locals_cells_stack_w[idx];
             if !value.is_null() {

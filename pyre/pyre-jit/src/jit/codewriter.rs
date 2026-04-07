@@ -929,7 +929,11 @@ thread_local! {
 /// jitcode.py:18: jitdriver_sd is not None for portal jitcodes.
 /// call.py:148 grab_initial_jitcodes: sets jitdriver_sd on the portal.
 /// Cached per CodeObject pointer — jitdriver_sd is fixed per jitcode.
-pub fn get_jitcode(code: &CodeObject, writer: &CodeWriter) -> &'static PyJitCode {
+pub fn get_jitcode(
+    code: &CodeObject,
+    w_code: *const (),
+    writer: &CodeWriter,
+) -> &'static PyJitCode {
     let key = code as *const CodeObject as usize;
     JITCODE_CACHE.with(|cell| {
         let cache = unsafe { &mut *cell.get() };
@@ -941,7 +945,7 @@ pub fn get_jitcode(code: &CodeObject, writer: &CodeWriter) -> &'static PyJitCode
             // consume_one_section (resume.py all_liveness parity).
             let entry = cache.get(&key).unwrap();
             pyre_jit_trace::set_majit_jitcode(
-                code as *const _,
+                w_code,
                 &entry.jitcode as *const majit_metainterp::jitcode::JitCode,
             );
         }
@@ -955,7 +959,7 @@ pub fn get_jitcode(code: &CodeObject, writer: &CodeWriter) -> &'static PyJitCode
 /// In pyre, JitCode compilation is lazy. This function ensures the
 /// JitCode (with liveness info) exists for a CodeObject so that
 /// get_list_of_active_boxes can use it during tracing.
-pub fn ensure_jitcode_for(code: &pyre_interpreter::CodeObject) {
+pub fn ensure_jitcode_for(code: &pyre_interpreter::CodeObject, w_code: *const ()) {
     let writer = CodeWriter::new(
         crate::call_jit::bh_call_fn,
         crate::call_jit::bh_load_global_fn,
@@ -967,12 +971,12 @@ pub fn ensure_jitcode_for(code: &pyre_interpreter::CodeObject) {
         crate::call_jit::bh_store_subscr_fn,
         crate::call_jit::bh_build_list_fn,
     );
-    let _ = get_jitcode(code, &writer);
+    let _ = get_jitcode(code, w_code, &writer);
 }
 
 /// jitcode.py:18: `jitcode.jitdriver_sd is not None`.
-pub fn is_portal(code: &pyre_interpreter::CodeObject) -> bool {
-    ensure_jitcode_for(code);
+pub fn is_portal(code: &pyre_interpreter::CodeObject, w_code: *const ()) -> bool {
+    ensure_jitcode_for(code, w_code);
     let key = code as *const pyre_interpreter::CodeObject as usize;
     JITCODE_CACHE.with(|cell| {
         let cache = unsafe { &*cell.get() };

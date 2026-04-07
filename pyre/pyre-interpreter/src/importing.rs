@@ -648,7 +648,8 @@ fn exec_code_module(
     execution_context: *const PyExecutionContext,
 ) -> Result<PyObjectRef, crate::PyError> {
     let code_ptr = Box::into_raw(Box::new(code));
-    let mut frame = PyFrame::new_with_namespace(code_ptr, execution_context, namespace);
+    let w_code = crate::w_code_new(code_ptr as *const ());
+    let mut frame = PyFrame::new_with_namespace(w_code as *const (), execution_context, namespace);
     eval_frame_plain(&mut frame)
 }
 

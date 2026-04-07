@@ -3357,7 +3357,7 @@ fn generator_next(gen_obj: PyObjectRef) -> PyResult {
             Ok(value) => {
                 // Distinguish yield vs return: if the frame is at a YIELD_VALUE
                 // instruction (pc-1), it's a yield. Otherwise it's a return.
-                let code = &*frame.code;
+                let code = &*crate::pyframe_get_pycode(&*frame);
                 let pc = frame.next_instr;
                 let is_yield = if pc > 0 && pc <= code.instructions.len() {
                     matches!(

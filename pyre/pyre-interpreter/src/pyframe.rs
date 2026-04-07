@@ -49,9 +49,11 @@ pub struct PyFrame {
     /// The top-level frame leaks the Rc via `Rc::into_raw`.
     /// Callee frames just copy the pointer (no atomic refcount ops).
     pub execution_context: *const PyExecutionContext,
-    /// Raw pointer to the code object (shared, not owned — the CodeObject
-    /// is leaked via `Box::into_raw` at creation time and lives forever).
-    pub code: *const CodeObject,
+    /// Pointer to the Code object (W_CodeObject).
+    ///
+    /// PyPy: pyframe.py `self.pycode = code` — stores the PyCode instance.
+    /// Same pointer as `func.getcode()`, so `getcode(func) == frame.code`.
+    pub code: *const (),
     /// Unified locals + cells + operand stack array.
     pub locals_cells_stack_w: PyObjectArray,
     /// Absolute index into `locals_cells_stack_w` marking the top of the
@@ -91,6 +93,15 @@ pub struct PyFrame {
     /// and LOAD_NAME checks here first before falling back to `namespace`.
     /// Used for class body execution where locals ≠ globals.
     pub class_locals: *mut PyNamespace,
+}
+
+/// Extract raw CodeObject from frame's W_CodeObject.
+///
+/// PyPy: `frame.pycode` gives `PyCode` which IS the code object.
+/// pyre: W_CodeObject wraps a raw CodeObject — this extracts it.
+#[inline]
+pub unsafe fn pyframe_get_pycode(frame: &PyFrame) -> *const CodeObject {
+    crate::w_code_get_ptr(frame.code as pyre_object::PyObjectRef) as *const CodeObject
 }
 
 #[derive(Clone, Copy)]
@@ -345,22 +356,24 @@ impl PyFrame {
     #[inline]
     pub fn __init__(
         &mut self,
-        code: *const CodeObject,
+        code: *const (),
         namespace: *mut PyNamespace,
         outer_func: PyObjectRef,
     ) {
         let _ = outer_func;
         self.code = code;
+        let raw =
+            unsafe { crate::w_code_get_ptr(code as pyre_object::PyObjectRef) as *const CodeObject };
         self.namespace = namespace;
         self.locals_cells_stack_w = PyObjectArray::filled(
             unsafe {
-                (&*code).varnames.len()
-                    + ncells(unsafe { &*code })
-                    + unsafe { (&*code).max_stackdepth as usize }
+                (&*raw).varnames.len()
+                    + ncells(unsafe { &*raw })
+                    + unsafe { (&*raw).max_stackdepth as usize }
             },
             PY_NULL,
         );
-        self.valuestackdepth = unsafe { (&*code).varnames.len() + ncells(unsafe { &*code }) };
+        self.valuestackdepth = unsafe { (&*raw).varnames.len() + ncells(unsafe { &*raw }) };
         self.next_instr = 0;
         self.block_stack.clear();
         self.pending_inline_results.clear();
@@ -405,7 +418,7 @@ impl PyFrame {
 
     /// PyPy-compatible `initialize_frame_scopes`.
     #[inline]
-    pub fn initialize_frame_scopes(&mut self, _outer_func: PyObjectRef, _code: *const CodeObject) {
+    pub fn initialize_frame_scopes(&mut self, _outer_func: PyObjectRef, _code: *const ()) {
         let _ = _outer_func;
         let _ = _code;
     }
@@ -419,12 +432,14 @@ impl PyFrame {
     /// Create a minimal frame stub for passing to call dispatch.
     /// Used by MIFrame Box tracking when concrete_frame is unavailable.
     pub fn new_minimal(
-        code: *const CodeObject,
+        code: *const (),
         namespace: *mut crate::PyNamespace,
         execution_context: *const PyExecutionContext,
     ) -> Self {
-        let nlocals = unsafe { (&*code).varnames.len() };
-        let ncells = unsafe { (&*code).cellvars.len() + (&*code).freevars.len() };
+        let raw =
+            unsafe { crate::w_code_get_ptr(code as pyre_object::PyObjectRef) as *const CodeObject };
+        let nlocals = unsafe { (&*raw).varnames.len() };
+        let ncells = unsafe { (&*raw).cellvars.len() + (&*raw).freevars.len() };
         let size = nlocals + ncells + 16; // small stack
         PyFrame {
             execution_context,
@@ -461,17 +476,20 @@ impl PyFrame {
         );
         let namespace = Box::into_raw(namespace);
         let code_ptr = Box::into_raw(Box::new(code));
+        let w_code = crate::w_code_new(code_ptr as *const ());
         let ctx_ptr = Rc::into_raw(execution_context);
-        Self::new_with_namespace(code_ptr, ctx_ptr, namespace)
+        Self::new_with_namespace(w_code as *const (), ctx_ptr, namespace)
     }
 
     /// Create a new frame with an explicitly provided namespace pointer.
     pub fn new_with_namespace(
-        code: *const CodeObject,
+        code: *const (),
         execution_context: *const PyExecutionContext,
         namespace: *mut PyNamespace,
     ) -> Self {
-        let code_ref = unsafe { &*code };
+        let raw =
+            unsafe { crate::w_code_get_ptr(code as pyre_object::PyObjectRef) as *const CodeObject };
+        let code_ref = unsafe { &*raw };
         let num_locals = code_ref.varnames.len();
         let num_cells = ncells(code_ref);
         let max_stack = code_ref.max_stackdepth as usize;
@@ -520,13 +538,13 @@ impl PyFrame {
     /// Number of local variable slots (from code object).
     #[inline]
     pub fn nlocals(&self) -> usize {
-        unsafe { (&(*self.code).varnames).len() }
+        unsafe { (&*pyframe_get_pycode(self)).varnames.len() }
     }
 
     /// Number of cell + free variable slots.
     #[inline]
     pub fn ncells(&self) -> usize {
-        unsafe { ncells(&*self.code) }
+        unsafe { ncells(&*pyframe_get_pycode(self)) }
     }
 
     /// First index of the operand stack (after locals and cells).
@@ -1045,7 +1063,7 @@ impl PyFrame {
     /// `closure` is a tuple of cell objects from the enclosing scope,
     /// or PY_NULL if the function has no free variables.
     pub fn new_for_call(
-        code: *const CodeObject,
+        code: *const (),
         args: &[PyObjectRef],
         globals: *mut PyNamespace,
         execution_context: *const PyExecutionContext,
@@ -1055,13 +1073,15 @@ impl PyFrame {
 
     /// Create a new frame for a function call with a closure.
     pub fn new_for_call_with_closure(
-        code: *const CodeObject,
+        code: *const (),
         args: &[PyObjectRef],
         globals: *mut PyNamespace,
         execution_context: *const PyExecutionContext,
         closure: PyObjectRef,
     ) -> Self {
-        let code_ref = unsafe { &*code };
+        let code_ref = unsafe {
+            &*(crate::w_code_get_ptr(code as pyre_object::PyObjectRef) as *const CodeObject)
+        };
         let num_locals = code_ref.varnames.len();
         let num_cells = ncells(code_ref);
         let max_stack = code_ref.max_stackdepth as usize;
@@ -1101,10 +1121,10 @@ impl PyFrame {
         }
     }
 
-    /// Borrow the shared code object.
+    /// Borrow the raw CodeObject.
     #[inline]
     pub fn code(&self) -> &CodeObject {
-        unsafe { &*self.code }
+        unsafe { &*pyframe_get_pycode(self) }
     }
 
     /// Repoint internal array pointers after a struct move.

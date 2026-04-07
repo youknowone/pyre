@@ -103,7 +103,7 @@ impl MIFrame {
     }
 
     pub(crate) fn next_instruction_consumes_comparison_truth(&self) -> bool {
-        let code = unsafe { &*(*self.sym().jitcode).code };
+        let code = unsafe { &*(*self.sym().jitcode).raw_code() };
         // RPython optimize_goto_if_not works on the semantic successor,
         // not on bytecode trivia like EXTENDED_ARG/NOT_TAKEN/CACHE.
         let mut pc = self.fallthrough_pc;
@@ -279,9 +279,9 @@ impl MIFrame {
             // NEVER returns empty for a guard inside a loop — the codewriter
             // guarantees liveness at every guard position. When majit JitCode
             // liveness is empty or unavailable, fall back to LiveVars.
-            let code_ptr = unsafe { (*self.sym().jitcode).code };
-            let live = if !code_ptr.is_null() {
-                Some(liveness_for(code_ptr))
+            let raw_code_ptr = unsafe { (*self.sym().jitcode).raw_code() };
+            let live = if !raw_code_ptr.is_null() {
+                Some(liveness_for(raw_code_ptr))
             } else {
                 None
             };
@@ -2852,10 +2852,12 @@ impl MIFrame {
                 });
             }
             if is_function(concrete_callable) {
-                let callee_code_ptr =
-                    unsafe { pyre_interpreter::get_pycode(concrete_callable) } as *const CodeObject;
-                let callee_key = crate::driver::make_green_key(callee_code_ptr, 0);
-                let callee_code = unsafe { &*callee_code_ptr };
+                let w_callee_code = unsafe { pyre_interpreter::getcode(concrete_callable) };
+                let callee_key = crate::driver::make_green_key(w_callee_code, 0);
+                let callee_code = unsafe {
+                    &*(pyre_interpreter::w_code_get_ptr(w_callee_code as pyre_object::PyObjectRef)
+                        as *const CodeObject)
+                };
                 let callee_has_loop = code_has_backward_jump(callee_code);
                 let (driver, _) = crate::driver::driver_pair();
                 let nargs = args.len();
@@ -3350,13 +3352,16 @@ impl MIFrame {
         let caller_code = unsafe { (*self.sym().jitcode).code };
         let caller_exec_ctx = self.sym().concrete_execution_context;
         let caller_namespace_ptr = self.sym().concrete_namespace;
-        let code_ptr =
-            unsafe { pyre_interpreter::get_pycode(concrete_callable) } as *const CodeObject;
+        let w_code = unsafe { pyre_interpreter::getcode(concrete_callable) };
+        let raw_code = unsafe {
+            pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
+                as *const CodeObject
+        };
         let globals = unsafe { function_get_globals(concrete_callable) };
         let closure = unsafe { pyre_interpreter::function_get_closure(concrete_callable) };
         let is_self_recursive = crate::driver::make_green_key(caller_code, 0) == callee_key;
         let mut callee_frame = PyFrame::new_for_call_with_closure(
-            code_ptr,
+            w_code,
             &concrete_args,
             globals,
             caller_exec_ctx,
@@ -3364,7 +3369,7 @@ impl MIFrame {
         );
         callee_frame.fix_array_ptrs();
 
-        let callee_code = unsafe { &*callee_frame.code };
+        let callee_code = unsafe { &*pyre_interpreter::pyframe_get_pycode(&callee_frame) };
         let callee_nlocals = callee_code.varnames.len();
         let caller_namespace = caller_namespace_ptr;
         let callee_globals = unsafe { function_get_globals(concrete_callable) };
@@ -3390,17 +3395,17 @@ impl MIFrame {
             sym.concrete_locals
                 .resize(callee_nlocals, ConcreteValue::Null);
             sym.concrete_stack = Vec::new();
-            sym.jitcode = jitcode_for(code_ptr);
+            sym.jitcode = jitcode_for(w_code);
             sym.concrete_namespace = callee_globals as *mut PyNamespace;
             sym.concrete_execution_context = self.sym().concrete_execution_context;
             let (vable_next_instr, vable_code, vable_valuestackdepth, vable_namespace) = self
                 .with_ctx(|_, ctx| {
-                    // code_ptr and callee_globals are PyObjectRef pointers;
+                    // w_code and callee_globals are PyObjectRef pointers;
                     // tag them as Ref so the typed constant pool dedupes
                     // them with any other Ref reference to the same address.
                     (
                         ctx.const_int(0),
-                        ctx.const_ref(code_ptr as i64),
+                        ctx.const_ref(w_code as i64),
                         ctx.const_int(callee_nlocals as i64),
                         ctx.const_ref(callee_globals as i64),
                     )
@@ -3462,7 +3467,7 @@ impl MIFrame {
             sym.concrete_locals
                 .resize(callee_nlocals, ConcreteValue::Null);
             sym.concrete_stack = Vec::new();
-            sym.jitcode = jitcode_for(code_ptr);
+            sym.jitcode = jitcode_for(w_code);
             sym.concrete_namespace = callee_globals as *mut PyNamespace;
             sym.concrete_execution_context = self.sym().concrete_execution_context;
             (sym, Some(callee_frame_opref))

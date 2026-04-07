@@ -18,7 +18,7 @@ use super::state::{
 pub struct MetaInterpFrame {
     pub sym: *mut PyreSym,
     pub owned_sym: Option<Box<PyreSym>>,
-    pub jitcode: *const CodeObject,
+    pub jitcode: *const (),
     pub pc: usize,
     pub greenkey: Option<u64>,
     pub concrete_frame: usize,
@@ -51,14 +51,14 @@ impl MetaInterpFrame {
 pub struct PyreMetaInterp {
     pub framestack: Vec<MetaInterpFrame>,
     pub portal_call_depth: i32,
-    pub jitcode: *const CodeObject,
+    pub jitcode: *const (),
     pub namespace: *mut pyre_interpreter::PyNamespace,
     inline_call_guard: Option<pyre_interpreter::call::InlineCallOverrideGuard>,
     inline_trace_base: usize,
 }
 
 impl PyreMetaInterp {
-    pub fn new(jitcode: *const CodeObject, namespace: *mut pyre_interpreter::PyNamespace) -> Self {
+    pub fn new(jitcode: *const (), namespace: *mut pyre_interpreter::PyNamespace) -> Self {
         Self {
             framestack: Vec::new(),
             portal_call_depth: -1,
@@ -77,7 +77,10 @@ impl PyreMetaInterp {
             let Some(top) = self.framestack.last_mut() else {
                 return TraceAction::Abort;
             };
-            let code = unsafe { &*top.jitcode };
+            let code = unsafe {
+                &*(pyre_interpreter::w_code_get_ptr(top.jitcode as pyre_object::PyObjectRef)
+                    as *const pyre_interpreter::CodeObject)
+            };
             // RPython _interpret() parity: all frames use cf.next_instr as PC.
             // Skip trivia (Cache, ExtendedArg, etc.) — RPython's trace loop
             // only processes real opcodes. Inline frame returns or branch
@@ -133,7 +136,10 @@ impl PyreMetaInterp {
 
     fn step_root_frame(&mut self, ctx: &mut TraceCtx, pc: usize) -> LoopAction {
         let top = self.framestack.last_mut().unwrap();
-        let code = unsafe { &*top.jitcode };
+        let code = unsafe {
+            &*(pyre_interpreter::w_code_get_ptr(top.jitcode as pyre_object::PyObjectRef)
+                as *const pyre_interpreter::CodeObject)
+        };
         let sym = unsafe { &mut *top.sym };
         let cf_addr = top.concrete_frame_addr();
         let fallthrough_pc = semantic_fallthrough_pc(code, pc);
@@ -187,7 +193,10 @@ impl PyreMetaInterp {
 
     fn step_inline_frame(&mut self, ctx: &mut TraceCtx, pc: usize) -> LoopAction {
         let top = self.framestack.last_mut().unwrap();
-        let code = unsafe { &*top.jitcode };
+        let code = unsafe {
+            &*(pyre_interpreter::w_code_get_ptr(top.jitcode as pyre_object::PyObjectRef)
+                as *const pyre_interpreter::CodeObject)
+        };
         let sym = unsafe { &mut *top.sym };
         let cf_addr = top.concrete_frame_addr();
         let parent_frames = top.parent_frames.clone();
@@ -262,7 +271,10 @@ impl PyreMetaInterp {
             super::state::InlineTraceStepAction::PushFrame(pending) => {
                 // trace_code_step_inline already took the pending frame
                 let top = self.framestack.last_mut().unwrap();
-                let code = unsafe { &*top.jitcode };
+                let code = unsafe {
+                    &*(pyre_interpreter::w_code_get_ptr(top.jitcode as pyre_object::PyObjectRef)
+                        as *const pyre_interpreter::CodeObject)
+                };
                 let sym = unsafe { &mut *top.sym };
                 let sfall = semantic_fallthrough_pc(code, pc);
                 top.pc = sym.pending_next_instr.take().unwrap_or(sfall);
@@ -427,7 +439,7 @@ impl PyreMetaInterp {
             return;
         };
         let cf = &mut **cf;
-        let code = unsafe { &*cf.code };
+        let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(cf) };
         let ni = cf.next_instr;
         if ni >= code.instructions.len() {
             return;
@@ -457,7 +469,7 @@ impl PyreMetaInterp {
             return pyre_object::PY_NULL;
         };
         let cf = &mut **cf;
-        let code = unsafe { &*cf.code };
+        let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(cf) };
         let ni = cf.next_instr;
         if ni >= code.instructions.len() {
             return pyre_object::PY_NULL;
@@ -480,18 +492,15 @@ impl PyreMetaInterp {
     // ── Helpers ──────────────────────────────────────────────────
 
     fn handle_close_loop(&self, ctx: &mut TraceCtx, action: &TraceAction, pc: usize) {
-        let code = unsafe { &*self.framestack[0].jitcode };
+        let w_code = self.framestack[0].jitcode;
         if let TraceAction::CloseLoopWithArgs {
             loop_header_pc: Some(target_pc),
             ..
         } = action
         {
-            ctx.set_green_key(crate::driver::make_green_key(
-                code as *const CodeObject,
-                *target_pc,
-            ));
+            ctx.set_green_key(crate::driver::make_green_key(w_code, *target_pc));
         } else if matches!(action, TraceAction::CloseLoop) {
-            ctx.set_green_key(crate::driver::make_green_key(code as *const CodeObject, pc));
+            ctx.set_green_key(crate::driver::make_green_key(w_code, pc));
         }
     }
 
@@ -505,7 +514,10 @@ impl PyreMetaInterp {
     fn finishframe_exception(&mut self, ctx: &mut TraceCtx) -> Option<LoopAction> {
         // RPython pyjitpl.py:2506: while self.framestack:
         while let Some(top) = self.framestack.last() {
-            let code = unsafe { &*top.jitcode };
+            let code = unsafe {
+                &*(pyre_interpreter::w_code_get_ptr(top.jitcode as pyre_object::PyObjectRef)
+                    as *const pyre_interpreter::CodeObject)
+            };
             let sym = unsafe { &*top.sym };
             let pc = top.pc;
 
