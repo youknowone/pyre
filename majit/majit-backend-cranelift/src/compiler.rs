@@ -9500,18 +9500,25 @@ fn collect_guards(
         // Guard gcmap: bit i ⟺ fail_args[i] is Ref, stored at jf_frame[i].
         // No JITFRAME_FIXED_SIZE offset needed because fail_args start at
         // jf_frame[0] (not jf_frame[JITFRAME_FIXED_SIZE]).
+        // assembler.py:2114-2155 genop_finish + regalloc.py:1190-1206 longevity:
+        //   - GUARD: getfailargs() must not contain Const (regalloc.py:1206 assert).
+        //   - FINISH: getarglist() may contain Const (regalloc.py:1192-1193 skip).
+        //     The const value is loaded as immediate and stored into frame
+        //     slot 0; gcmap_for_finish (assembler.py:160 = r_uint(1)) marks
+        //     that slot so the GC traces the constant Ref.
+        //   - JUMP (external/non-label): a normal op whose getarglist() may
+        //     also contain Const (handled by regalloc.py:1192-1193 in the same
+        //     loop). majit groups external JUMP with FINISH for fail_args
+        //     bookkeeping; treat their gcmap the same way.
         let gcmap = {
             let mut bits: u64 = 0;
             for (i, tp) in fail_arg_types.iter().enumerate() {
                 if *tp == Type::Ref {
-                    // regalloc.py:1206 — assert not isinstance(arg, Const)
-                    // Cannot promote to assert!: constant OpRefs (>=10000)
-                    // still appear in fail_args due to optimizer constant/
-                    // variable collision (see callmayforce_optimizer_bug.md).
                     let opref_id = fail_arg_refs.get(i).map(|r| r.0).unwrap_or(u32::MAX);
+                    // regalloc.py:1206 — guard fail_args must never be Const.
                     debug_assert!(
-                        !constants.contains_key(&opref_id),
-                        "regalloc.py:1206: fail_args must not contain Const (slot={i}, opref={opref_id})"
+                        is_finish || is_external_jump || !constants.contains_key(&opref_id),
+                        "regalloc.py:1206: guard fail_args must not contain Const (slot={i}, opref={opref_id})"
                     );
                     if (i as u32) < 64 {
                         bits |= 1u64 << i;
