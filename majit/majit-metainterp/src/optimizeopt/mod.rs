@@ -242,7 +242,7 @@ pub struct OptContext {
     pub pre_force_virtual_state: Option<crate::optimizeopt::virtualstate::VirtualState>,
     /// JUMP args captured BEFORE force (corresponding to pre_force_virtual_state).
     pub pre_force_jump_args: Option<Vec<OpRef>>,
-    /// RPython optimizer.py: end_args after force_box_for_end_of_preamble().
+    /// RPython optimizer.py: end_args after force_at_the_end_of_preamble().
     /// export_state() prefers this over a raw get_replacement() snapshot.
     pub preamble_end_args: Option<Vec<OpRef>>,
     /// Phase-2 loop-body mode from optimizer.skip_flush.
@@ -256,7 +256,7 @@ pub struct OptContext {
     pub current_pass_idx: usize,
     /// earlyforce.py:32: self.optimizer.optearlyforce = self
     /// Index of the OptEarlyForce pass in the pass chain.
-    /// Used by force_box_for_end_of_preamble and force_box to route
+    /// Used by force_at_the_end_of_preamble and force_box to route
     /// forced operations starting from earlyforce.next (= heap).
     pub optearlyforce_idx: usize,
     /// optimizer.py: pendingfields — deferred SetfieldGc/SetarrayitemGc ops
@@ -1936,6 +1936,10 @@ impl OptContext {
             op.rd_virtuals = self.new_operations[idx].rd_virtuals.clone();
             op.rd_pendingfields = self.new_operations[idx].rd_pendingfields.clone();
             op.fail_args = self.new_operations[idx].fail_args.clone();
+            // optimizer.py:698-699: _maybe_replace_guard_value after copy.
+            if op.opcode == OpCode::GuardValue {
+                self.maybe_replace_guard_value(op);
+            }
             // Don't update last_guard_idx — copied guards don't become sources.
         } else {
             // optimizer.py:678: store_final_boxes_in_guard
@@ -1958,12 +1962,41 @@ impl OptContext {
                     }
                 }
             }
+            // optimizer.py:750-751: _maybe_replace_guard_value after store.
+            if op.opcode == OpCode::GuardValue {
+                self.maybe_replace_guard_value(op);
+            }
         }
 
         // optimizer.py:684-685: GUARD_EXCEPTION clears sharing.
         if opnum == OpCode::GuardException {
             self.last_guard_idx = None;
         }
+    }
+
+    /// optimizer.py:754-778 _maybe_replace_guard_value — turn
+    /// guard_value(bool) into guard_true/guard_false.
+    fn maybe_replace_guard_value(&self, op: &mut Op) {
+        let arg0 = op.arg(0);
+        // optimizer.py:755: op.getarg(0).type == 'i'
+        let Some(bound) = self.get_int_bound(arg0) else {
+            return;
+        };
+        if !bound.is_bool() {
+            return;
+        }
+        let arg1 = op.arg(1);
+        let Some(constvalue) = self.get_constant_int(arg1) else {
+            return;
+        };
+        let new_opcode = match constvalue {
+            0 => OpCode::GuardFalse,
+            1 => OpCode::GuardTrue,
+            _ => return, // optimizer.py:775: strange code, just disable
+        };
+        op.opcode = new_opcode;
+        op.args.clear();
+        op.args.push(arg0);
     }
 
     /// optimizer.py:345-364 force_box — inline equivalent for
@@ -2624,13 +2657,13 @@ pub trait Optimization {
     /// heap.py: deserialize_optheap — import cached fields into this pass.
     fn import_cached_fields(&mut self, _entries: &[(OpRef, u32, OpRef)]) {}
 
-    /// bridgeopt.py:113-122: serialize_optrewrite — export loopinvariant results.
-    fn export_loopinvariant_results(&self) -> Vec<(i64, OpRef)> {
+    /// rewrite.py:828-834 serialize_optrewrite
+    fn serialize_optrewrite(&self) -> Vec<(i64, OpRef)> {
         Vec::new()
     }
 
-    /// bridgeopt.py:173-185: deserialize_optrewrite — import loopinvariant results.
-    fn import_loopinvariant_results(&mut self, _entries: &[(i64, OpRef)]) {}
+    /// rewrite.py:836-838 deserialize_optrewrite
+    fn deserialize_optrewrite(&mut self, _entries: &[(i64, OpRef)]) {}
 
     /// shortpreamble.py:112-126: PureOp.produce_op / LoopInvariantOp.produce_op
     /// Transfer imported PreambleOp entries from OptContext to this pass.

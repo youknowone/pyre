@@ -73,7 +73,7 @@ impl OptString {
     /// Force a virtual string: emit NEWSTR + STRSETITEM ops so it becomes real.
     ///
     /// Returns the OpRef of the emitted NEWSTR.
-    fn force_string(&mut self, opref: OpRef, ctx: &mut OptContext) -> OpRef {
+    fn force_box(&mut self, opref: OpRef, ctx: &mut OptContext) -> OpRef {
         let resolved = ctx.get_box_replacement(opref);
         let info = match self.vstrings.remove(&resolved) {
             Some(info) => info,
@@ -115,21 +115,21 @@ impl OptString {
                 let left_len_val = self.get_known_length(left, ctx);
                 let right_len_val = self.get_known_length(right, ctx);
                 if left_len_val == Some(0) {
-                    let right_forced = self.force_string(right, ctx);
+                    let right_forced = self.force_box(right, ctx);
                     ctx.replace_op(resolved, right_forced);
                     return right_forced;
                 }
                 if right_len_val == Some(0) {
-                    let left_forced = self.force_string(left, ctx);
+                    let left_forced = self.force_box(left, ctx);
                     ctx.replace_op(resolved, left_forced);
                     return left_forced;
                 }
 
                 let is_unicode = self.unicode_refs.contains(&resolved);
-                let left_forced = self.force_string(left, ctx);
-                let right_forced = self.force_string(right, ctx);
-                let left_len = self.get_or_emit_strlen(left_forced, ctx);
-                let right_len = self.get_or_emit_strlen(right_forced, ctx);
+                let left_forced = self.force_box(left, ctx);
+                let right_forced = self.force_box(right, ctx);
+                let left_len = self.getstrlen(left_forced, ctx);
+                let right_len = self.getstrlen(right_forced, ctx);
                 let total_op = Op::new(OpCode::IntAdd, &[left_len, right_len]);
                 let total_ref = ctx.emit(total_op);
                 // vstring.py: use correct opcodes for byte vs unicode strings
@@ -161,7 +161,7 @@ impl OptString {
                 start,
                 length,
             } => {
-                let src_forced = self.force_string(source, ctx);
+                let src_forced = self.force_box(source, ctx);
                 let start_resolved = ctx.get_box_replacement(start);
                 let length_resolved = ctx.get_box_replacement(length);
                 let is_unicode = self.unicode_refs.contains(&resolved);
@@ -202,7 +202,7 @@ impl OptString {
     }
 
     /// Get or compute the STRLEN for a string OpRef.
-    fn get_or_emit_strlen(&self, opref: OpRef, ctx: &mut OptContext) -> OpRef {
+    fn getstrlen(&self, opref: OpRef, ctx: &mut OptContext) -> OpRef {
         let resolved = ctx.get_box_replacement(opref);
         if let Some(&len_ref) = self.known_lengths.get(&resolved) {
             return ctx.get_box_replacement(len_ref);
@@ -213,7 +213,7 @@ impl OptString {
     }
 
     /// Get the strlen OpRef if already known, without emitting a new op.
-    fn get_or_emit_strlen_if_known(&self, opref: OpRef, ctx: &mut OptContext) -> Option<OpRef> {
+    fn getstrlen_if_known(&self, opref: OpRef, ctx: &mut OptContext) -> Option<OpRef> {
         let resolved = ctx.get_box_replacement(opref);
         if let Some(&len_ref) = self.known_lengths.get(&resolved) {
             return Some(ctx.get_box_replacement(len_ref));
@@ -231,7 +231,7 @@ impl OptString {
     }
 
     /// Try to get a character from a virtual string at a constant index.
-    fn try_get_char(&self, opref: OpRef, index: i64, ctx: &OptContext) -> Option<OpRef> {
+    fn strgetitem(&self, opref: OpRef, index: i64, ctx: &OptContext) -> Option<OpRef> {
         let resolved = ctx.get_box_replacement(opref);
         let info = self.vstrings.get(&resolved)?;
         match info {
@@ -244,14 +244,14 @@ impl OptString {
                 let left_resolved = ctx.get_box_replacement(*left);
                 let left_len = self.get_known_length(left_resolved, ctx)?;
                 if index < left_len {
-                    self.try_get_char(*left, index, ctx)
+                    self.strgetitem(*left, index, ctx)
                 } else {
-                    self.try_get_char(*right, index - left_len, ctx)
+                    self.strgetitem(*right, index - left_len, ctx)
                 }
             }
             VStringInfo::Slice { source, start, .. } => {
                 let start_val = ctx.get_constant_int(*start)?;
-                self.try_get_char(*source, index + start_val, ctx)
+                self.strgetitem(*source, index + start_val, ctx)
             }
         }
     }
@@ -326,7 +326,7 @@ impl OptString {
         let idx_ref = op.arg(1);
 
         if let Some(idx) = ctx.get_constant_int(idx_ref) {
-            if let Some(ch_ref) = self.try_get_char(str_ref, idx, ctx) {
+            if let Some(ch_ref) = self.strgetitem(str_ref, idx, ctx) {
                 let ch_resolved = ctx.get_box_replacement(ch_ref);
                 ctx.replace_op(op.pos, ch_resolved);
                 return OptimizationResult::Remove;
@@ -373,7 +373,7 @@ impl OptString {
                 let mut all_resolved = true;
                 let mut resolved_chars = Vec::new();
                 for i in 0..length {
-                    if let Some(ch) = self.try_get_char(src_ref, src_start + i, ctx) {
+                    if let Some(ch) = self.strgetitem(src_ref, src_start + i, ctx) {
                         resolved_chars.push(Some(ch));
                     } else {
                         all_resolved = false;
@@ -441,7 +441,7 @@ impl OptString {
     fn force_if_virtual(&mut self, opref: OpRef, ctx: &mut OptContext) {
         let resolved = ctx.get_box_replacement(opref);
         if self.vstrings.contains_key(&resolved) {
-            self.force_string(resolved, ctx);
+            self.force_box(resolved, ctx);
         }
     }
 
@@ -484,26 +484,38 @@ impl OptString {
         self.vstrings.contains_key(&resolved)
     }
 
-    /// Force all args that are virtual strings.
-    /// vstring.py: _int_add(opref1, opref2, ctx)
-    /// If both are constants, return a constant OpRef for their sum.
-    fn int_add_oprefs(&self, a: OpRef, b: OpRef, ctx: &mut OptContext) -> Option<OpRef> {
-        let va = ctx.get_constant_int(a)?;
-        let vb = ctx.get_constant_int(b)?;
-        let sum = va.checked_add(vb)?;
-        let result = ctx.emit(Op::new(OpCode::SameAsI, &[]));
-        ctx.make_constant(result, Value::Int(sum));
-        Some(result)
+    /// vstring.py:371-381 _int_add — constant-fold if both args are constant,
+    /// otherwise emit INT_ADD.
+    fn int_add(&self, a: OpRef, b: OpRef, ctx: &mut OptContext) -> OpRef {
+        if let Some(va) = ctx.get_constant_int(a) {
+            if va == 0 {
+                return b;
+            }
+            if let Some(vb) = ctx.get_constant_int(b) {
+                return self.emit_constant_int(va + vb, ctx);
+            }
+        } else if let Some(vb) = ctx.get_constant_int(b) {
+            if vb == 0 {
+                return a;
+            }
+        }
+        let op = Op::new(OpCode::IntAdd, &[a, b]);
+        ctx.emit(op)
     }
 
-    /// vstring.py: _int_sub(opref1, opref2, ctx)
-    fn int_sub_oprefs(&self, a: OpRef, b: OpRef, ctx: &mut OptContext) -> Option<OpRef> {
-        let va = ctx.get_constant_int(a)?;
-        let vb = ctx.get_constant_int(b)?;
-        let diff = va.checked_sub(vb)?;
-        let result = ctx.emit(Op::new(OpCode::SameAsI, &[]));
-        ctx.make_constant(result, Value::Int(diff));
-        Some(result)
+    /// vstring.py:383-391 _int_sub — constant-fold if both args are constant,
+    /// otherwise emit INT_SUB.
+    fn int_sub(&self, a: OpRef, b: OpRef, ctx: &mut OptContext) -> OpRef {
+        if let Some(vb) = ctx.get_constant_int(b) {
+            if vb == 0 {
+                return a;
+            }
+            if let Some(va) = ctx.get_constant_int(a) {
+                return self.emit_constant_int(va - vb, ctx);
+            }
+        }
+        let op = Op::new(OpCode::IntSub, &[a, b]);
+        ctx.emit(op)
     }
 
     /// vstring.py: postprocess — after STRLEN on a known-length string,
@@ -531,13 +543,12 @@ impl OptString {
             .collect();
         for arg in args {
             if self.vstrings.contains_key(&arg) {
-                self.force_string(arg, ctx);
+                self.force_box(arg, ctx);
             }
         }
     }
 
-    /// Handle string oopspec calls.
-    /// vstring.py: optimize_call_pure_STR_CONCAT/STR_SLICE/STR_EQUAL etc.
+    /// Dispatch oopspec calls to specialized handlers.
     fn optimize_oopspec_call(
         &mut self,
         op: &Op,
@@ -545,120 +556,139 @@ impl OptString {
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         match ei.oopspec_index {
-            OopSpecIndex::StrConcat => {
-                // STR_CONCAT(a, b): create a virtual Concat.
-                if op.num_args() >= 3 {
-                    // args: [func_ptr, a, b]
-                    let left = ctx.get_box_replacement(op.arg(1));
-                    let right = ctx.get_box_replacement(op.arg(2));
-                    self.vstrings
-                        .insert(op.pos, VStringInfo::Concat { left, right });
-                    return OptimizationResult::Remove;
-                }
-                self.force_args_if_virtual(op, ctx);
-                OptimizationResult::PassOn
-            }
-            OopSpecIndex::StrSlice => {
-                // STR_SLICE(s, start, stop): create a virtual Slice.
-                if op.num_args() >= 4 {
-                    let source = ctx.get_box_replacement(op.arg(1));
-                    let start = ctx.get_box_replacement(op.arg(2));
-                    let stop = ctx.get_box_replacement(op.arg(3));
-                    // vstring.py: length = stop - start
-                    let length = if let Some(length_ref) = self.int_sub_oprefs(stop, start, ctx) {
-                        length_ref
-                    } else {
-                        let sub_op = Op::new(OpCode::IntSub, &[stop, start]);
-                        ctx.emit(sub_op)
-                    };
-                    self.vstrings.insert(
-                        op.pos,
-                        VStringInfo::Slice {
-                            source,
-                            start,
-                            length,
-                        },
-                    );
-                    return OptimizationResult::Remove;
-                }
-                self.force_args_if_virtual(op, ctx);
-                OptimizationResult::PassOn
-            }
-            OopSpecIndex::StrEqual => {
-                // vstring.py: opt_call_stroruni_STR_EQUAL
-                if op.num_args() >= 3 {
-                    let a = ctx.get_box_replacement(op.arg(1));
-                    let b = ctx.get_box_replacement(op.arg(2));
-                    // Same ref → always equal
-                    if a == b {
-                        ctx.make_constant(op.pos, Value::Int(1));
-                        return OptimizationResult::Remove;
-                    }
-                    let l1 = self.get_known_length(a, ctx);
-                    let l2 = self.get_known_length(b, ctx);
-                    // Different known lengths → always unequal
-                    if let (Some(len1), Some(len2)) = (l1, l2) {
-                        if len1 != len2 {
-                            ctx.make_constant(op.pos, Value::Int(0));
-                            return OptimizationResult::Remove;
-                        }
-                    }
-                    // handle_str_equal_level1: length-0 string
-                    if l2 == Some(0) {
-                        if let Some(len_ref) = self.get_or_emit_strlen_if_known(a, ctx) {
-                            let zero = self.emit_constant_int(0, ctx);
-                            let mut eq_op = Op::new(OpCode::IntEq, &[len_ref, zero]);
-                            eq_op.pos = op.pos;
-                            return OptimizationResult::Emit(eq_op);
-                        }
-                    }
-                    if l1 == Some(0) {
-                        if let Some(len_ref) = self.get_or_emit_strlen_if_known(b, ctx) {
-                            let zero = self.emit_constant_int(0, ctx);
-                            let mut eq_op = Op::new(OpCode::IntEq, &[len_ref, zero]);
-                            eq_op.pos = op.pos;
-                            return OptimizationResult::Emit(eq_op);
-                        }
-                    }
-                    // handle_str_equal_level1: both length 1 → compare chars
-                    if l1 == Some(1) && l2 == Some(1) {
-                        let c1 = self.try_get_char(a, 0, ctx);
-                        let c2 = self.try_get_char(b, 0, ctx);
-                        if let (Some(ch1), Some(ch2)) = (c1, c2) {
-                            let mut eq_op = Op::new(OpCode::IntEq, &[ch1, ch2]);
-                            eq_op.pos = op.pos;
-                            return OptimizationResult::Emit(eq_op);
-                        }
-                    }
-                }
-                self.force_args_if_virtual(op, ctx);
-                OptimizationResult::PassOn
-            }
-            // vstring.py: STR_CMP(a, b) → if same ref, result is 0 (equal).
-            OopSpecIndex::StrCmp => {
-                if op.num_args() >= 3 {
-                    let a = ctx.get_box_replacement(op.arg(1));
-                    let b = ctx.get_box_replacement(op.arg(2));
-                    if a == b {
-                        ctx.make_constant(op.pos, Value::Int(0));
-                        return OptimizationResult::Remove;
-                    }
-                }
-                self.force_args_if_virtual(op, ctx);
-                OptimizationResult::PassOn
-            }
-            // vstring.py: SHRINK_ARRAY is a hint that can be removed.
-            OopSpecIndex::ShrinkArray => {
-                // The array is already allocated; shrinking is a no-op
-                // for the optimizer (the backend handles it).
-                self.force_args_if_virtual(op, ctx);
-                OptimizationResult::PassOn
-            }
+            OopSpecIndex::StrConcat => self.opt_call_stroruni_str_concat(op, ctx),
+            OopSpecIndex::StrSlice => self.opt_call_stroruni_str_slice(op, ctx),
+            OopSpecIndex::StrEqual => self.opt_call_stroruni_str_equal(op, ctx),
+            OopSpecIndex::StrCmp => self.opt_call_stroruni_str_cmp(op, ctx),
+            OopSpecIndex::ShrinkArray => self.opt_call_shrink_array(op, ctx),
             _ => {
                 self.force_args_if_virtual(op, ctx);
                 OptimizationResult::PassOn
             }
         }
+    }
+
+    /// vstring.py:653-661 opt_call_stroruni_STR_CONCAT
+    fn opt_call_stroruni_str_concat(
+        &mut self,
+        op: &Op,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
+        if op.num_args() >= 3 {
+            let left = ctx.get_box_replacement(op.arg(1));
+            let right = ctx.get_box_replacement(op.arg(2));
+            self.vstrings
+                .insert(op.pos, VStringInfo::Concat { left, right });
+            return OptimizationResult::Remove;
+        }
+        self.force_args_if_virtual(op, ctx);
+        OptimizationResult::PassOn
+    }
+
+    /// vstring.py:662-690 opt_call_stroruni_STR_SLICE
+    fn opt_call_stroruni_str_slice(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+        if op.num_args() >= 4 {
+            let source = ctx.get_box_replacement(op.arg(1));
+            let start = ctx.get_box_replacement(op.arg(2));
+            let stop = ctx.get_box_replacement(op.arg(3));
+            let length = self.int_sub(stop, start, ctx);
+            self.vstrings.insert(
+                op.pos,
+                VStringInfo::Slice {
+                    source,
+                    start,
+                    length,
+                },
+            );
+            return OptimizationResult::Remove;
+        }
+        self.force_args_if_virtual(op, ctx);
+        OptimizationResult::PassOn
+    }
+
+    /// vstring.py:692-733 opt_call_stroruni_STR_EQUAL
+    fn opt_call_stroruni_str_equal(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+        if op.num_args() >= 3 {
+            let a = ctx.get_box_replacement(op.arg(1));
+            let b = ctx.get_box_replacement(op.arg(2));
+            // Same ref → always equal
+            if a == b {
+                ctx.make_constant(op.pos, Value::Int(1));
+                return OptimizationResult::Remove;
+            }
+            let l1 = self.get_known_length(a, ctx);
+            let l2 = self.get_known_length(b, ctx);
+            // Different known lengths → always unequal
+            if let (Some(len1), Some(len2)) = (l1, l2) {
+                if len1 != len2 {
+                    ctx.make_constant(op.pos, Value::Int(0));
+                    return OptimizationResult::Remove;
+                }
+            }
+            // vstring.py:714-718: handle_str_equal_level1 both directions
+            if let Some(result) = self.handle_str_equal_level1(a, b, op, ctx) {
+                return result;
+            }
+            if let Some(result) = self.handle_str_equal_level1(b, a, op, ctx) {
+                return result;
+            }
+        }
+        self.force_args_if_virtual(op, ctx);
+        OptimizationResult::PassOn
+    }
+
+    /// vstring.py:735-787 handle_str_equal_level1
+    fn handle_str_equal_level1(
+        &self,
+        arg1: OpRef,
+        arg2: OpRef,
+        op: &Op,
+        ctx: &mut OptContext,
+    ) -> Option<OptimizationResult> {
+        let l2 = self.get_known_length(arg2, ctx);
+        // vstring.py:743-756: length-0 string
+        if l2 == Some(0) {
+            if let Some(len_ref) = self.getstrlen_if_known(arg1, ctx) {
+                let zero = self.emit_constant_int(0, ctx);
+                let mut eq_op = Op::new(OpCode::IntEq, &[len_ref, zero]);
+                eq_op.pos = op.pos;
+                return Some(OptimizationResult::Emit(eq_op));
+            }
+        }
+        // vstring.py:757-768: both length 1 → compare chars
+        if l2 == Some(1) {
+            let l1 = self.get_known_length(arg1, ctx);
+            if l1 == Some(1) {
+                let c1 = self.strgetitem(arg1, 0, ctx);
+                let c2 = self.strgetitem(arg2, 0, ctx);
+                if let (Some(ch1), Some(ch2)) = (c1, c2) {
+                    let mut eq_op = Op::new(OpCode::IntEq, &[ch1, ch2]);
+                    eq_op.pos = op.pos;
+                    return Some(OptimizationResult::Emit(eq_op));
+                }
+            }
+        }
+        None
+    }
+
+    /// vstring.py:816-838 opt_call_stroruni_STR_CMP
+    fn opt_call_stroruni_str_cmp(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+        if op.num_args() >= 3 {
+            let a = ctx.get_box_replacement(op.arg(1));
+            let b = ctx.get_box_replacement(op.arg(2));
+            if a == b {
+                ctx.make_constant(op.pos, Value::Int(0));
+                return OptimizationResult::Remove;
+            }
+        }
+        self.force_args_if_virtual(op, ctx);
+        OptimizationResult::PassOn
+    }
+
+    /// vstring.py:839-851 opt_call_SHRINK_ARRAY
+    fn opt_call_shrink_array(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+        self.force_args_if_virtual(op, ctx);
+        OptimizationResult::PassOn
     }
 }
 
@@ -680,7 +710,7 @@ impl Optimization for OptString {
             // vstring.py: Unicode operations — same logic as string ops
             // but with unicode-specific opcodes.
             OpCode::Newunicode => {
-                // Track that this is a unicode string for force_string.
+                // Track that this is a unicode string for force_box.
                 self.unicode_refs.insert(op.pos);
                 self.optimize_newstr(op, ctx)
             }
@@ -992,11 +1022,11 @@ mod tests {
         );
 
         // Get char at index 0 of the slice -> should be source[1] = OpRef(201)
-        let ch = pass.try_get_char(slice_ref, 0, &ctx);
+        let ch = pass.strgetitem(slice_ref, 0, &ctx);
         assert_eq!(ch, Some(OpRef(201)));
 
         // Get char at index 1 of the slice -> should be source[2] = OpRef(202)
-        let ch = pass.try_get_char(slice_ref, 1, &ctx);
+        let ch = pass.strgetitem(slice_ref, 1, &ctx);
         assert_eq!(ch, Some(OpRef(202)));
     }
 
@@ -1257,13 +1287,13 @@ mod tests {
             .insert(concat, VStringInfo::Concat { left, right });
 
         // Index 0 -> left[0] = 200
-        assert_eq!(pass.try_get_char(concat, 0, &ctx), Some(OpRef(200)));
+        assert_eq!(pass.strgetitem(concat, 0, &ctx), Some(OpRef(200)));
         // Index 1 -> left[1] = 201
-        assert_eq!(pass.try_get_char(concat, 1, &ctx), Some(OpRef(201)));
+        assert_eq!(pass.strgetitem(concat, 1, &ctx), Some(OpRef(201)));
         // Index 2 -> right[0] = 202
-        assert_eq!(pass.try_get_char(concat, 2, &ctx), Some(OpRef(202)));
+        assert_eq!(pass.strgetitem(concat, 2, &ctx), Some(OpRef(202)));
         // Index 3 -> right[1] = 203
-        assert_eq!(pass.try_get_char(concat, 3, &ctx), Some(OpRef(203)));
+        assert_eq!(pass.strgetitem(concat, 3, &ctx), Some(OpRef(203)));
     }
 
     #[test]
