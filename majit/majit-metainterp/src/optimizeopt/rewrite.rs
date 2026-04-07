@@ -2117,6 +2117,11 @@ impl OptRewrite {
     /// then INT_LT(a, b) = 1 - K (boolean inverse).
     /// rewrite.py:56-66 try_boolinvers — check if the inverse operation has
     /// a cached boolean result and negate it.
+    ///
+    /// RPython uses get_pure_result(targs) + getintbound(oldop).known_eq_const()
+    /// which recognizes values that are guaranteed to be 0 or 1 even if not
+    /// explicitly constant-folded. We match this by checking IntBound in
+    /// addition to direct constant lookup.
     fn try_boolinvers(
         &self,
         op: &Op,
@@ -2127,11 +2132,26 @@ impl OptRewrite {
     ) -> Option<OptimizationResult> {
         let key = (inverse_opcode, arg0, arg1);
         let &cached_ref = self.bool_result_cache.get(&key)?;
-        let val = ctx.get_constant_int(cached_ref)?;
-        // Inverse of a known boolean: 1 - val
-        let result = 1 - val;
-        ctx.make_constant(op.pos, Value::Int(result));
-        Some(OptimizationResult::Remove)
+        // rewrite.py:60-65: b = self.getintbound(oldop)
+        // First try direct constant (fast path)
+        if let Some(val) = ctx.get_constant_int(cached_ref) {
+            let result = 1 - val;
+            ctx.make_constant(op.pos, Value::Int(result));
+            return Some(OptimizationResult::Remove);
+        }
+        // rewrite.py:61-65: b.known_eq_const(1) / b.known_eq_const(0)
+        // Intbound analysis: the value may be bounded to exactly 0 or 1
+        // even without being a constant in the optimizer's sense.
+        if let Some(bound) = ctx.get_int_bound(cached_ref) {
+            if bound.known_eq_const(1) {
+                ctx.make_constant(op.pos, Value::Int(0));
+                return Some(OptimizationResult::Remove);
+            } else if bound.known_eq_const(0) {
+                ctx.make_constant(op.pos, Value::Int(1));
+                return Some(OptimizationResult::Remove);
+            }
+        }
+        None
     }
 
     /// rewrite.py:68-93 find_rewritable_bool — three-phase boolean rewrite:
