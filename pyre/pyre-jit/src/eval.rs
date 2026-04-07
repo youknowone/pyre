@@ -48,7 +48,9 @@ enum JitAction {
     ContinueRunningNormally,
 }
 
-use crate::jit::descr::{JITFRAME_GC_TYPE_ID, W_FLOAT_GC_TYPE_ID, W_INT_GC_TYPE_ID};
+use crate::jit::descr::{
+    JITFRAME_GC_TYPE_ID, PYRE_OBJECT_GC_TYPE_ID, W_FLOAT_GC_TYPE_ID, W_INT_GC_TYPE_ID,
+};
 use crate::jit::virtualizable_gen::build_virtualizable_info;
 use majit_gc::collector::MiniMarkGC;
 use majit_metainterp::JitDriver;
@@ -81,6 +83,13 @@ thread_local! {
         // jitframe.py:49 — rgc.register_custom_trace_hook(JITFRAME, jitframe_trace)
         let jitframe_tid = gc.register_type(majit_metainterp::jitframe::jitframe_type_info());
         debug_assert_eq!(jitframe_tid, JITFRAME_GC_TYPE_ID);
+        // Collective type_id for every other pyre `PyObject`-layout
+        // type. Size is sizeof(PyObject) (the ob_type header); this
+        // type_id is never used as a GC allocation target, only as
+        // `check_is_object` lookup (see PYRE_OBJECT_GC_TYPE_ID docs).
+        let pyre_object_tid =
+            gc.register_type(TypeInfo::object(std::mem::size_of::<pyre_object::PyObject>()));
+        debug_assert_eq!(pyre_object_tid, PYRE_OBJECT_GC_TYPE_ID);
         // llsupport/gc.py:563 vtable→typeid mapping. RPython derives the
         // typeid arithmetically from gc_get_type_info_group; pyre keeps an
         // explicit table because INT_TYPE / FLOAT_TYPE are static globals
@@ -95,6 +104,17 @@ thread_local! {
             &pyre_object::pyobject::FLOAT_TYPE as *const _ as usize,
             W_FLOAT_GC_TYPE_ID,
         );
+        // Every other built-in PyType: register under the shared
+        // PYRE_OBJECT_GC_TYPE_ID so constant-class folding
+        // (info.py:763-772 `ConstPtrInfo.get_known_class(cpu)`) works
+        // for str / list / None / exception / type / instance / etc.
+        for pytype in pyre_object::pyobject::all_foreign_pytypes() {
+            majit_gc::GcAllocator::register_vtable_for_type(
+                &mut gc,
+                *pytype as *const _ as usize,
+                PYRE_OBJECT_GC_TYPE_ID,
+            );
+        }
         d.set_gc_allocator(Box::new(gc));
         // llmodel.py:67-69 self.vtable_offset, _ = symbolic.get_field_token(
         //     rclass.OBJECT, 'typeptr', translate_support_code)
