@@ -237,15 +237,29 @@ impl IntBound {
         self.lower > 0
     }
 
-    /// intutils.py: getnullness — return NONNULL (1), NULL (-1), or UNKNOWN (0).
+    /// intutils.py:1318-1329 `IntBound.getnullness()` parity (line-by-line port).
+    ///
+    /// ```python
+    /// def getnullness(self):
+    ///     if self.known_gt_const(0) or \
+    ///        self.known_lt_const(0) or \
+    ///        self.tvalue != 0:
+    ///         return INFO_NONNULL
+    ///     if self.is_constant() and self.get_constant_int() == 0:
+    ///         return INFO_NULL
+    ///     return INFO_UNKNOWN
+    /// ```
+    ///
+    /// Returns RPython's `INFO_NULL` / `INFO_NONNULL` / `INFO_UNKNOWN`
+    /// (info.py:13-15) so callers can compare directly against the
+    /// upstream constants without remapping.
     pub fn getnullness(&self) -> i8 {
-        // intutils.py: known_gt(0) or known_lt(0) or tvalue != 0
         if self.known_gt_const(0) || self.known_lt_const(0) || self.tvalue != 0 {
-            1 // NONNULL
+            crate::optimizeopt::INFO_NONNULL
         } else if self.is_constant() && self.get_constant() == 0 {
-            -1 // NULL
+            crate::optimizeopt::INFO_NULL
         } else {
-            0 // UNKNOWN
+            crate::optimizeopt::INFO_UNKNOWN
         }
     }
 

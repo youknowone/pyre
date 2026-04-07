@@ -1326,15 +1326,18 @@ impl Optimizer {
         }
     }
 
-    /// optimizer.py: getnullness(op)
-    /// Check the nullness of an OpRef: NONNULL (1), NULL (-1), or UNKNOWN (0).
-    pub fn getnullness(ctx: &OptContext, opref: OpRef) -> i8 {
-        let resolved = ctx.get_box_replacement(opref);
-        if let Some(val) = ctx.get_constant_int(resolved) {
-            if val != 0 { 1 } else { -1 }
-        } else {
-            0 // unknown
-        }
+    /// optimizer.py:127-135 `getnullness(op)` parity (line-by-line port).
+    ///
+    /// Delegates to `OptContext::getnullness`, which implements the
+    /// upstream `op.type == 'r' or is_raw_ptr(op)` dispatch and the
+    /// `getintbound(op).getnullness()` fallback for `'i'`-typed Boxes.
+    /// Returns one of `INFO_NULL` / `INFO_NONNULL` / `INFO_UNKNOWN`
+    /// (info.py:13-15).
+    ///
+    /// Takes `&mut OptContext` to mirror the upstream `getintbound`
+    /// lazy-install side effect (optimizer.py:102-112).
+    pub fn getnullness(ctx: &mut OptContext, opref: OpRef) -> i8 {
+        ctx.getnullness(opref)
     }
 
     /// optimizer.py:137-152: make_constant_class(op, class_const, update_last_guard)
@@ -3776,17 +3779,22 @@ mod tests {
         assert_eq!(opt.num_pending_fields(), 1);
     }
 
+    /// optimizer.py:127-135 `getnullness(op)` parity test.
+    ///
+    /// Returns the upstream INFO_NULL / INFO_NONNULL / INFO_UNKNOWN
+    /// integer constants (info.py:13-15).
     #[test]
     fn test_getnullness() {
+        use crate::optimizeopt::{INFO_NONNULL, INFO_NULL, INFO_UNKNOWN};
         let mut ctx = OptContext::new(10);
-        // Unknown → 0
-        assert_eq!(Optimizer::getnullness(&ctx, OpRef(0)), 0);
-        // Known nonzero → 1 (NONNULL)
+        // Unknown integer → INFO_UNKNOWN.
+        assert_eq!(Optimizer::getnullness(&mut ctx, OpRef(0)), INFO_UNKNOWN);
+        // Known nonzero integer → INFO_NONNULL.
         ctx.make_constant(OpRef(1), majit_ir::Value::Int(42));
-        assert_eq!(Optimizer::getnullness(&ctx, OpRef(1)), 1);
-        // Known zero → -1 (NULL)
+        assert_eq!(Optimizer::getnullness(&mut ctx, OpRef(1)), INFO_NONNULL);
+        // Known zero integer → INFO_NULL.
         ctx.make_constant(OpRef(2), majit_ir::Value::Int(0));
-        assert_eq!(Optimizer::getnullness(&ctx, OpRef(2)), -1);
+        assert_eq!(Optimizer::getnullness(&mut ctx, OpRef(2)), INFO_NULL);
     }
 
     #[test]

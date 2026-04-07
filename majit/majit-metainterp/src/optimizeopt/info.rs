@@ -858,6 +858,30 @@ impl PtrInfo {
         }
     }
 
+    /// info.py:64-69 `PtrInfo.getnullness()` parity (line-by-line port).
+    ///
+    /// ```python
+    /// def getnullness(self):
+    ///     if self.is_null():
+    ///         return INFO_NULL
+    ///     elif self.is_nonnull():
+    ///         return INFO_NONNULL
+    ///     return INFO_UNKNOWN
+    /// ```
+    ///
+    /// Returns one of `INFO_NULL` / `INFO_NONNULL` / `INFO_UNKNOWN`
+    /// (info.py:13-15). majit's representation matches RPython's
+    /// integer enum: NULL=0, NONNULL=1, UNKNOWN=2.
+    pub fn getnullness(&self) -> i8 {
+        if self.is_null() {
+            crate::optimizeopt::INFO_NULL
+        } else if self.is_nonnull() {
+            crate::optimizeopt::INFO_NONNULL
+        } else {
+            crate::optimizeopt::INFO_UNKNOWN
+        }
+    }
+
     /// info.py: is_about_object() — whether this info describes an object
     /// (has fields/vtable, as opposed to an array or raw buffer).
     pub fn is_about_object(&self) -> bool {
