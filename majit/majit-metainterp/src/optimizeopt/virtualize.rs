@@ -1509,40 +1509,15 @@ impl Optimization for OptVirtualize {
                 OptimizationResult::Remove
             }
 
-            // Everything else passes through, but force any virtual args first.
-            // optimizer.py:614-625 _emit_operation forces every arg via force_box.
-            _ => {
-                let is_guard = op.opcode.is_guard();
-
-                // optimizer.py:623-625: for i in range(op.numargs()): arg = self.force_box(op.getarg(i))
-                for i in 0..op.num_args() {
-                    let arg = ctx.get_box_replacement(op.arg(i));
-                    self.force_virtual(arg, ctx);
-                }
-
-                // optimizer.py:652-686 emit_guard_operation: store_final_boxes_in_guard
-                // is invoked from OptContext::emit() at the actual emission point and
-                // walks the snapshot's vable_array via _number_boxes (TAGVIRTUAL).
-                // Per-pass guard fail_args do not need extra augmentation.
-                if is_guard {
-                    let mut guard_op = op.clone();
-
-                    for arg in &mut guard_op.args {
-                        *arg = ctx.get_box_replacement(*arg);
-                    }
-
-                    if let Some(ref mut fa) = guard_op.fail_args {
-                        for arg in fa.iter_mut() {
-                            let resolved = ctx.get_box_replacement(*arg);
-                            *arg = self.prepare_guard_fail_arg(resolved, ctx);
-                        }
-                    }
-
-                    return OptimizationResult::Replace(guard_op);
-                }
-
-                OptimizationResult::PassOn
-            }
+            // virtualize.py:417-418 dispatch_opt = make_dispatcher_method(
+            //     OptVirtualize, 'optimize_', default=OptVirtualize.emit)
+            // The default for unhandled opcodes is the base Optimization.emit
+            // which forwards to the next pass without touching args. Forcing
+            // virtual args and fail_args happens at the terminal Optimizer
+            // emit step (optimizer.py:614-686 _emit_operation /
+            // emit_guard_operation), which majit mirrors in
+            // OptContext::emit / emit_guard_operation.
+            _ => OptimizationResult::PassOn,
         }
     }
 
@@ -1946,34 +1921,6 @@ mod tests {
             get_count, 2,
             "standard virtualizable path should not absorb raw array reads into optimizer-owned state"
         );
-    }
-
-    #[test]
-    fn test_standard_virtualizable_guard_with_full_frame_payload_is_not_reaugmented() {
-        let mut ctx = OptContext::with_num_inputs(8, 3);
-        let mut pass = OptVirtualize::with_virtualizable(VirtualizableConfig {
-            static_field_offsets: vec![8],
-            static_field_types: vec![Type::Int],
-            array_field_offsets: vec![24],
-            array_item_types: vec![Type::Int],
-            array_lengths: vec![1],
-        });
-        pass.setup();
-
-        let pc = OpRef(50);
-        let vsd = OpRef(51);
-        ctx.make_constant(pc, Value::Int(6));
-        ctx.make_constant(vsd, Value::Int(1));
-        let local0 = OpRef(2);
-        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef(99)]);
-        guard.fail_args = Some(vec![OpRef(0), pc, vsd, local0].into());
-
-        let replaced = match pass.propagate_forward(&guard, &mut ctx) {
-            OptimizationResult::Replace(op) => op,
-            other => panic!("expected guard replacement, got {other:?}"),
-        };
-        let fail_args = replaced.fail_args.expect("guard should have fail args");
-        assert_eq!(fail_args.as_slice(), &[OpRef(0), pc, vsd, local0]);
     }
 
     #[test]
