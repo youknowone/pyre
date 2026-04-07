@@ -3053,21 +3053,48 @@ fn build_resumed_frames(
         })
         .unwrap_or(std::ptr::null());
 
-    // resume.py:1399-1408 consume_vable_info:
-    //   virtualizable = self.next_ref()
-    //   vinfo.reset_token_gcref(virtualizable)
-    //   vinfo.write_from_resume_data_partial(virtualizable, self)
+    // resume.py:1399-1408 consume_vable_info literal port:
+    //
+    //     def consume_vable_info(self, vinfo, vable_size):
+    //         assert vable_size
+    //         virtualizable = self.next_ref()
+    //         assert vinfo.get_total_size(virtualizable) == vable_size - 1
+    //         vinfo.reset_token_gcref(virtualizable)
+    //         vinfo.write_from_resume_data_partial(virtualizable, self)
+    //
+    // Called from `consume_vref_and_vable` (resume.py:1424-1431) in the
+    // ResumeDataBoxReader path that `blackhole_from_resumedata`
+    // (resume.py:1312-1342) drives. majit's blackhole entry mirrors that
+    // path: `build_blackhole_frames_from_deadframe` /
+    // `build_resumed_frames_from_deadframe` invoke `build_resumed_frames`
+    // with `consume_vable=true`, so this branch fires once per blackhole
+    // entry to write the captured vable header back to the frame BEFORE
+    // any blackhole interpreter starts running.
+    //
+    // The guard-failure recovery path (`rebuild_from_resumedata_with_exit_layout`)
+    // uses `consume_vable=false`, matching RPython's
+    // `consume_vref_and_vable_boxes` (resume.py:1099-1109) — that recovery
+    // path RETURNS the vable boxes for the optimizer to inspect rather
+    // than writing them back, so the JIT can re-enter via a bridge with
+    // its own vable view.
     if !vable_frame_ptr.is_null() && consume_vable {
         let frame_u8 = vable_frame_ptr as *mut u8;
         let vinfo = pyre_jit_trace::virtualizable_gen::build_virtualizable_info();
         unsafe {
-            // resume.py:1407
+            // resume.py:1407 reset_token_gcref
             vinfo.reset_vable_token(frame_u8);
 
             // virtualizable.py:126-137 write_from_resume_data_partial:
-            //   for FIELDTYPE, fieldname in unroll_static_fields:
-            //       x = reader.load_next_value_of_type(FIELDTYPE)
-            //       setattr(virtualizable, fieldname, x)
+            //
+            //     for FIELDTYPE, fieldname in unroll_static_fields:
+            //         x = reader.load_next_value_of_type(FIELDTYPE)
+            //         setattr(virtualizable, fieldname, x)
+            //
+            // resolved_vable layout (opencoder.py:722
+            // _list_of_boxes_virtualizable parity):
+            //   [0]            virtualizable_ptr  (= the frame itself)
+            //   [1..num_scalars] static fields    (next_instr, code, vsd, ns)
+            //   [num_scalars..] array items
             let static_boxes: Vec<i64> = resolved_vable[1..num_scalars.min(resolved_vable.len())]
                 .iter()
                 .map(|v| match v {
@@ -3077,12 +3104,16 @@ fn build_resumed_frames(
                 })
                 .collect();
 
-            //   for ARRAYITEMTYPE, fieldname in unroll_array_fields:
-            //       lst = getattr(virtualizable, fieldname)
-            //       for j in range(len(lst)):
-            //           lst[j] = reader.load_next_value_of_type(ARRAYITEMTYPE)
-            // virtualizable.py:136: uses len(lst) — the HEAP array length
-            // from the actual virtualizable object, not from resume data.
+            //     for ARRAYITEMTYPE, fieldname in unroll_array_fields:
+            //         lst = getattr(virtualizable, fieldname)
+            //         for j in range(len(lst)):
+            //             lst[j] = reader.load_next_value_of_type(ARRAYITEMTYPE)
+            //
+            // virtualizable.py:136 uses `len(lst)` — the HEAP array length
+            // read from the live virtualizable object, not from resume data.
+            // pyre PyFrame has a single array slot (locals + stack merged),
+            // so the `unroll_array_fields` loop reduces to one iteration and
+            // `get_array_length(frame, 0)` returns that live length.
             let heap_array_len = vinfo.get_array_length(frame_u8.cast_const(), 0);
             let array_start = num_scalars.min(resolved_vable.len());
             let array_len = heap_array_len;
@@ -3098,6 +3129,17 @@ fn build_resumed_frames(
                         .unwrap_or(0)
                 })
                 .collect();
+            // resume.py:1404 size assertion: total field count must
+            // match the snapshot's recorded vable_size minus the
+            // virtualizable_ptr slot itself.
+            debug_assert_eq!(
+                static_boxes.len() + array_items.len(),
+                resolved_vable.len().saturating_sub(1),
+                "consume_vable_info size mismatch: static={} + array={} != vable_size - 1 = {}",
+                static_boxes.len(),
+                array_items.len(),
+                resolved_vable.len().saturating_sub(1),
+            );
             let array_boxes = vec![array_items];
             vinfo.write_from_resume_data_partial(frame_u8, &static_boxes, &array_boxes);
         }
