@@ -1322,21 +1322,35 @@ impl MIFrame {
             boxes.push(Self::opref_to_snapshot_tagged(opref, ctx));
         }
         // Array items: locals + stack (virtualizable.py:86 read_boxes).
+        // pyjitpl.py:177 parity: use pre_opcode_stack (orgpc state) when
+        // available, matching get_list_of_active_boxes. The current
+        // symbolic_stack may reflect mid-operation state (values popped
+        // and intermediate results pushed), while the snapshot must
+        // capture the stack at orgpc (before the current operation).
+        let stack_values = if let Some(ref pre_stack) = sym.pre_opcode_stack {
+            pre_stack.clone()
+        } else {
+            sym.symbolic_stack[..stack_only.min(sym.symbolic_stack.len())].to_vec()
+        };
         let concrete_frame = if !sym.concrete_vable_ptr.is_null() {
             Some(unsafe { &*(sym.concrete_vable_ptr as *const pyre_interpreter::pyframe::PyFrame) })
         } else {
             None
         };
-        let full_array_len = concrete_frame
-            .map(|f| f.locals_cells_stack_w.len())
-            .unwrap_or(sym.symbolic_locals.len() + stack_only);
+        // virtualizable.py:86 read_boxes parity: array length =
+        // nlocals + current_stack_depth (from pre_opcode_vsd at orgpc),
+        // NOT the physical array length. RPython uses
+        // vinfo.get_total_size(virtualizable) which reads the arraylen
+        // field (= valuestackdepth for PyFrame).
+        let current_vsd = sym.pre_opcode_vsd.unwrap_or(sym.valuestackdepth);
+        let full_array_len = current_vsd;
         for i in 0..full_array_len {
             let opref = if i < sym.symbolic_locals.len() {
                 sym.symbolic_locals[i]
             } else {
                 let stack_idx = i - sym.nlocals;
-                if stack_idx < stack_only && stack_idx < sym.symbolic_stack.len() {
-                    sym.symbolic_stack[stack_idx]
+                if stack_idx < stack_values.len() {
+                    stack_values[stack_idx]
                 } else {
                     OpRef::NONE
                 }
