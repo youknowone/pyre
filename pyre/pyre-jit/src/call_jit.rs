@@ -859,8 +859,12 @@ pub struct ResumedFrame {
     pub frame_ptr: *mut PyFrame,
     /// valuestackdepth extracted from vable_values (snapshot).
     pub vsd: usize,
+    /// interp_jit.py:31 w_globals — namespace pointer from vable_values.
+    /// virtualizable.py:126-137 write_from_resume_data_partial:
+    /// ALL static fields come from resume data, not from the heap.
+    pub namespace: *const (),
     /// resume.py:928-931 consume_one_section: resolved values.
-    /// Structure: [live_registers...] — no [frame, ni, vsd] header.
+    /// Structure: [live_registers...] — no scalar inputarg header.
     /// RPython parity: vable values come from snapshot, not fail_args.
     pub values: Vec<majit_ir::Value>,
 }
@@ -975,7 +979,8 @@ pub fn resume_in_blackhole(
         let stack_only = vsd.saturating_sub(nlocals);
 
         // call.py:148: jitcode via get_jitcode (jitdriver_sd set on portal).
-        let w_code = unsafe { (*frame_ptr).code };
+        // virtualizable.py:126-137: code from resume data, not heap.
+        let w_code = section.code;
         let pyjitcode = crate::jit::codewriter::get_jitcode(code, w_code, &writer);
         let jitcode_pc = if py_pc < pyjitcode.pc_map.len() {
             pyjitcode.pc_map[py_pc]
@@ -2291,7 +2296,7 @@ fn jit_ca_handle_guard_failure(
     };
 
     // Obtain callee frame from deadframe vable header.
-    // pyre vable_boxes = [frame, ni, vsd, locals..., stack...],
+    // pyre vable_boxes = [frame, ni, code, vsd, ns, locals..., stack...],
     // so raw_values[0] is the callee's PyFrame pointer.
     let frame_ptr = raw_values[0] as *mut PyFrame;
     if frame_ptr.is_null() {

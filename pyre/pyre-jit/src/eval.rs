@@ -2615,41 +2615,7 @@ pub(crate) fn decode_and_restore_guard_failure(
             build_resumed_frames(raw_values, rd_numb, rd_consts, exit_layout, false)
         } else {
             // Fallback for guards with empty rd_numb: single frame from typed.
-            // typed = [frame, ni, code, vsd, ns, locals..., stack...]
-            let ns = pyre_jit_trace::virtualizable_gen::NUM_SCALAR_INPUTARGS;
-            let ni_idx = pyre_jit_trace::virtualizable_gen::SYM_NEXT_INSTR_IDX as usize;
-            let vsd_idx = pyre_jit_trace::virtualizable_gen::SYM_VALUESTACKDEPTH_IDX as usize;
-            let frame_ptr = match typed.first() {
-                Some(Value::Ref(r)) => r.as_usize() as *mut pyre_interpreter::pyframe::PyFrame,
-                Some(Value::Int(v)) => *v as *mut pyre_interpreter::pyframe::PyFrame,
-                _ => std::ptr::null_mut(),
-            };
-            let py_pc = match typed.get(ni_idx) {
-                Some(Value::Int(v)) => *v as usize,
-                _ => 0,
-            };
-            let vsd = match typed.get(vsd_idx) {
-                Some(Value::Int(v)) => *v as usize,
-                _ => 0,
-            };
-            let code = if !frame_ptr.is_null() {
-                unsafe { (*frame_ptr).code }
-            } else {
-                std::ptr::null()
-            };
-            let slot_values = if typed.len() > ns {
-                typed[ns..].to_vec()
-            } else {
-                Vec::new()
-            };
-            vec![crate::call_jit::ResumedFrame {
-                code,
-                py_pc,
-                rd_numb_pc: None,
-                frame_ptr,
-                vsd,
-                values: slot_values,
-            }]
+            build_blackhole_frames_fallback(&typed)
         }
     };
     LAST_GUARD_FRAMES.with(|c| *c.borrow_mut() = Some(resumed_frames));
@@ -2722,30 +2688,38 @@ pub(crate) fn build_resumed_frames_from_deadframe(
 }
 
 fn build_blackhole_frames_fallback(typed: &[Value]) -> Vec<crate::call_jit::ResumedFrame> {
-    let ns = pyre_jit_trace::virtualizable_gen::NUM_SCALAR_INPUTARGS;
+    let num_scalars = pyre_jit_trace::virtualizable_gen::NUM_SCALAR_INPUTARGS;
     let ni_idx = pyre_jit_trace::virtualizable_gen::SYM_NEXT_INSTR_IDX as usize;
+    let code_idx = pyre_jit_trace::virtualizable_gen::SYM_CODE_IDX as usize;
     let vsd_idx = pyre_jit_trace::virtualizable_gen::SYM_VALUESTACKDEPTH_IDX as usize;
+    let ns_idx = pyre_jit_trace::virtualizable_gen::SYM_NAMESPACE_IDX as usize;
     let frame_ptr = match typed.first() {
         Some(Value::Ref(r)) => r.as_usize() as *mut pyre_interpreter::pyframe::PyFrame,
         Some(Value::Int(v)) => *v as *mut pyre_interpreter::pyframe::PyFrame,
         _ => std::ptr::null_mut(),
     };
+    // virtualizable.py:86-99 read_boxes: ALL static fields in declared order.
+    // typed = [frame(0), ni(1), code(2), vsd(3), ns(4), array...]
     let py_pc = match typed.get(ni_idx) {
         Some(Value::Int(v)) => *v as usize,
         _ => 0,
     };
-    let code = if !frame_ptr.is_null() {
-        unsafe { (*frame_ptr).code }
-    } else {
-        std::ptr::null()
+    let code = match typed.get(code_idx) {
+        Some(Value::Ref(r)) => r.as_usize() as *const (),
+        Some(Value::Int(v)) => *v as *const (),
+        _ => std::ptr::null(),
     };
-    // typed = [frame, ni, code, vsd, ns, locals..., stack...]
     let vsd = match typed.get(vsd_idx) {
         Some(Value::Int(v)) => *v as usize,
         _ => 0,
     };
-    let slot_values = if typed.len() > ns {
-        typed[ns..].to_vec()
+    let namespace = match typed.get(ns_idx) {
+        Some(Value::Ref(r)) => r.as_usize() as *const (),
+        Some(Value::Int(v)) => *v as *const (),
+        _ => std::ptr::null(),
+    };
+    let slot_values = if typed.len() > num_scalars {
+        typed[num_scalars..].to_vec()
     } else {
         Vec::new()
     };
@@ -2755,6 +2729,7 @@ fn build_blackhole_frames_fallback(typed: &[Value]) -> Vec<crate::call_jit::Resu
         rd_numb_pc: None,
         frame_ptr,
         vsd,
+        namespace,
         values: slot_values,
     }]
 }
@@ -2780,7 +2755,7 @@ fn rebuild_typed_from_rd_numb(
         rebuild_from_numbering(rd_numb, rd_consts, None);
 
     // resume.py:1045 consume_vref_and_vable_boxes parity.
-    // vable_array format: [frame_ptr, ni, vsd, locals..., stack...]
+    // vable_array format: [frame_ptr, ni, code, vsd, ns, locals..., stack...]
     // (opencoder.py:722 moves virtualizable_ptr to front).
     if majit_metainterp::majit_log_enabled() && !vable_values.is_empty() {
         eprintln!(
@@ -2794,7 +2769,7 @@ fn rebuild_typed_from_rd_numb(
     let mut virtuals_cache: HashMap<usize, Value> = HashMap::new();
 
     // resume.py:1083 + pyjitpl.py:3400-3428 parity:
-    // Decode vable_values into typed prefix [frame_ptr, ni, vsd, locals..., stack...].
+    // Decode vable_values into typed prefix [frame_ptr, ni, code, vsd, ns, locals..., stack...].
     // In RPython, virtualizable_boxes are restored first, then synchronize_virtualizable
     // writes them back to the actual frame object.
     fn decode_rv(
@@ -2918,7 +2893,7 @@ fn build_resumed_frames(
     let mut virtuals_cache: HashMap<usize, Value> = HashMap::new();
 
     // resume.py:1045 consume_vref_and_vable parity:
-    // Reconstruct header [frame_ptr, ni, vsd] from vable_values.
+    // Reconstruct header [frame_ptr, ni, code, vsd, ns] from vable_values.
     fn resolve_rebuilt_value(
         rv: &majit_ir::resumedata::RebuiltValue,
         dead_frame_typed: &[Value],
@@ -2999,7 +2974,9 @@ fn build_resumed_frames(
     // vable_values = [frame_ptr(0), ni(1), code(2), vsd(3), ns(4), array...]
     let num_scalars = pyre_jit_trace::virtualizable_gen::NUM_SCALAR_INPUTARGS;
     let ni_idx = pyre_jit_trace::virtualizable_gen::SYM_NEXT_INSTR_IDX as usize;
+    let code_idx = pyre_jit_trace::virtualizable_gen::SYM_CODE_IDX as usize;
     let vsd_idx = pyre_jit_trace::virtualizable_gen::SYM_VALUESTACKDEPTH_IDX as usize;
+    let ns_idx = pyre_jit_trace::virtualizable_gen::SYM_NAMESPACE_IDX as usize;
 
     // Resolve ALL vable fields from resume data.
     // vable_values = [frame_ptr(0), ni(1), code(2), vsd(3), ns(4), array...]
@@ -3039,6 +3016,25 @@ fn build_resumed_frames(
             _ => 0,
         })
         .unwrap_or(0);
+
+    // virtualizable.py:86-99 read_boxes: ALL static fields in declared order.
+    let vable_code: *const () = resolved_vable
+        .get(code_idx)
+        .map(|v| match v {
+            Value::Ref(r) => r.as_usize() as *const (),
+            Value::Int(v) => *v as *const (),
+            _ => std::ptr::null(),
+        })
+        .unwrap_or(std::ptr::null());
+
+    let vable_ns: *const () = resolved_vable
+        .get(ns_idx)
+        .map(|v| match v {
+            Value::Ref(r) => r.as_usize() as *const (),
+            Value::Int(v) => *v as *const (),
+            _ => std::ptr::null(),
+        })
+        .unwrap_or(std::ptr::null());
 
     // resume.py:1399-1408 consume_vable_info:
     //   virtualizable = self.next_ref()
@@ -3106,11 +3102,18 @@ fn build_resumed_frames(
             vable_ni
         };
         // resume.py:1339 jitcodes[jitcode_pos]:
-        // Outermost frame (last): code from PyFrame (the live caller).
+        // Outermost frame (last): code from vable resume data.
         // Inner frames: code from jitcode_index registry (inlined calls).
         let is_outermost = frames.len() == 1 || idx == frames.len() - 1;
-        let w_code = if is_outermost && !vable_frame_ptr.is_null() {
-            unsafe { (*vable_frame_ptr).code }
+        let w_code = if is_outermost {
+            // virtualizable.py:86-99: code from resume data, not heap.
+            if !vable_code.is_null() {
+                vable_code
+            } else if !vable_frame_ptr.is_null() {
+                unsafe { (*vable_frame_ptr).code }
+            } else {
+                std::ptr::null()
+            }
         } else {
             pyre_jit_trace::state::code_for_jitcode_index(frame.jitcode_index)
                 .unwrap_or(std::ptr::null())
@@ -3148,6 +3151,19 @@ fn build_resumed_frames(
         } else {
             values.len()
         };
+        // virtualizable.py:86-99: namespace from resume data.
+        let namespace = if is_outermost {
+            if !vable_ns.is_null() {
+                vable_ns
+            } else if !vable_frame_ptr.is_null() {
+                unsafe { (*vable_frame_ptr).namespace as *const () }
+            } else {
+                std::ptr::null()
+            }
+        } else {
+            // Inner frames share the chain virtualizable's namespace.
+            vable_ns
+        };
         result.push(crate::call_jit::ResumedFrame {
             code: w_code,
             py_pc,
@@ -3158,6 +3174,7 @@ fn build_resumed_frames(
             },
             frame_ptr,
             vsd,
+            namespace,
             values,
         });
     }

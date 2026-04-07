@@ -305,7 +305,7 @@ impl MIFrame {
 
     /// RPython Box.type parity: build fail_arg_types matching compact
     /// active_boxes length. Each box carries its own immutable type.
-    /// header = [Ref, Int, Int] (frame, next_instr, valuestackdepth).
+    /// header = [Ref, Int, Ref, Int, Ref] (frame, next_instr, code, valuestackdepth, namespace).
     fn build_fail_arg_types_for_active_boxes(&self, active_boxes: &[OpRef]) -> Vec<Type> {
         let mut types = crate::virtualizable_gen::virt_live_value_types(0);
         for &opref in active_boxes {
@@ -1073,7 +1073,7 @@ impl MIFrame {
                 self.orgpc
             };
             // opencoder.py:819-834: snapshot uses active boxes (not fail_args).
-            // callee_snapshot_types_full includes header [Ref, Int, Int];
+            // callee_snapshot_types_full includes header [Ref, Int, Ref, Int, Ref];
             // snapshot needs only the active_boxes portion.
             let __n = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
             let callee_snapshot_types = &callee_snapshot_types_full[__n..];
@@ -1106,7 +1106,7 @@ impl MIFrame {
             fail_args.extend_from_slice(&callee_active_boxes);
             let mut types = callee_snapshot_types_full;
             // opencoder.py:806: parent frames keep their original pc.
-            // Snapshot boxes = active boxes only (skip [frame, ni, vsd] header).
+            // Snapshot boxes = active boxes only (skip scalar inputarg header).
             for (pfa, pfa_types, pfa_resumepc, pfa_jitcode_index) in &self.parent_frames {
                 // pyjitpl.py:2586-2602 capture_resumedata: parent frames'
                 // snapshot stores ONLY their active boxes (the registers
@@ -1232,7 +1232,7 @@ impl MIFrame {
         };
 
         // opencoder.py:767-770: snapshot uses active boxes (not fail_args).
-        // snapshot_full_types includes [Ref, Int, Int] header; snapshot
+        // snapshot_full_types includes [Ref, Int, Ref, Int, Ref] header; snapshot
         // needs only the active_boxes portion starting after NUM_SCALAR_INPUTARGS.
         let n = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
         let snapshot_types = &snapshot_full_types[n..];
@@ -1571,7 +1571,7 @@ impl MIFrame {
             ),
         }];
         // opencoder.py:806: parent frames keep their original pc.
-        // Snapshot boxes = active boxes only (skip [frame, ni, vsd] header).
+        // Snapshot boxes = active boxes only (skip scalar inputarg header).
         for (pfa, pfa_types, pfa_resumepc, pfa_jitcode_index) in &self.parent_frames {
             let parent_active: &[OpRef] = if pfa.len() > __n { &pfa[__n..] } else { &[] };
             let parent_types: &[Type] = if pfa_types.len() > __n {
@@ -4281,7 +4281,7 @@ impl MIFrame {
                 // pyjitpl.py:2597: capture_resumedata(self.framestack, ...)
                 let __n = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
                 let jitcode_index = unsafe { (*this.sym().jitcode).index } as u32;
-                // fail_arg_types includes header [Ref, Int, Int]; snapshot
+                // fail_arg_types includes header [Ref, Int, Ref, Int, Ref]; snapshot
                 // needs only the active_boxes portion.
                 let snapshot_types = &fail_arg_types[__n..];
                 let mut frames = vec![majit_trace::recorder::SnapshotFrame {
