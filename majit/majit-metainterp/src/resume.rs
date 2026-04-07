@@ -2966,10 +2966,10 @@ impl ResumeDataLoopMemo {
         }
         // resume.py:370-374 register_box: constants are handled by
         // _gettagged (TAGCONST/TAGINT) and don't need livebox slots.
-        if env.is_const(opref) {
-            return;
-        }
-        if liveboxes_from_env.contains_key(opref.0) || new_liveboxes.contains_key(opref.0) {
+        let is_c = env.is_const(opref);
+        let in_env = liveboxes_from_env.contains_key(opref.0);
+        let in_new = new_liveboxes.contains_key(opref.0);
+        if is_c || in_env || in_new {
             return;
         }
         // resume.py:212-216: check if field is virtual
@@ -3302,7 +3302,8 @@ impl ResumeDataLoopMemo {
             if virtual_fields.contains_key(&opref_id) {
                 continue; // already_seen_virtual
             }
-            if let Some(vf) = env.get_virtual_fields(majit_ir::OpRef(opref_id)) {
+            let vf_result = env.get_virtual_fields(majit_ir::OpRef(opref_id));
+            if let Some(vf) = vf_result {
                 // resume.py:362-368: register_virtual_fields
                 for &field_opref in &vf.field_oprefs {
                     // resume.py:370-374: register_box
