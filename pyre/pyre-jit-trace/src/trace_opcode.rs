@@ -1342,8 +1342,14 @@ impl MIFrame {
         // NOT the physical array length. RPython uses
         // vinfo.get_total_size(virtualizable) which reads the arraylen
         // field (= valuestackdepth for PyFrame).
+        // virtualizable.py:86 parity: array length = nlocals + actual
+        // stack depth. Bound by stack_values.len() to avoid reading
+        // uninitialized stack slots beyond the pre-opcode snapshot.
         let current_vsd = sym.pre_opcode_vsd.unwrap_or(sym.valuestackdepth);
-        let full_array_len = current_vsd;
+        let stack_depth = current_vsd
+            .saturating_sub(sym.nlocals)
+            .min(stack_values.len());
+        let full_array_len = sym.nlocals + stack_depth;
         for i in 0..full_array_len {
             let opref = if i < sym.symbolic_locals.len() {
                 sym.symbolic_locals[i]
