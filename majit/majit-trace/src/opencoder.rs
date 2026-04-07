@@ -654,120 +654,219 @@ impl Drop for SnapshotStorage {
     }
 }
 
-// ── Trace Iterator (opencoder.py: TraceIterator) ──
+// ── Trace Iterator ──
+// opencoder.py:249-406 TraceIterator(BaseTrace).
+//
+// Literal port of RPython's TraceIterator. Each call to `next()` produces
+// a *fresh* operation whose `pos` is a freshly allocated OpRef from `_index`,
+// and whose args have been translated through `_cache` from raw trace
+// positions to the per-iteration fresh OpRefs.
+//
+// In RPython every visited op is a freshly allocated `cls()` ResOperation
+// Python object whose identity is `is`. Two iterators over the same trace
+// therefore produce DIFFERENT box objects at the same `_index` slot. majit
+// has no separate identity from position — `OpRef(u32)` IS the identity —
+// so the iterator's `_index` counter must start at a value chosen by the
+// caller (`start_index`) so that two iterations produce disjoint OpRefs.
+// Phase 1 starts with `start_index = num_inputs`; Phase 2 starts with
+// `start_index = phase1._index_after_iteration`. The cache key remains the
+// raw trace position (matching `_cache[trace.inputargs[i].get_position()]`).
 
-/// opencoder.py: TraceIterator — iterates operations in a trace
-/// with dead range tracking.
-///
-/// The iterator walks through encoded trace operations and maintains
-/// live/dead range information for each value (OpRef). This enables
-/// the optimizer to know which values are still in use at each point.
+/// opencoder.py:249 class TraceIterator(BaseTrace).
 pub struct TraceIterator<'a> {
-    /// The operations being iterated.
-    ops: &'a [majit_ir::Op],
-    /// Current position in the operation list.
-    pos: usize,
-    /// Live range end for each OpRef: maps OpRef → last use position.
-    /// opencoder.py: _deadranges
-    live_range_end: Vec<usize>,
-    /// Whether live ranges have been computed.
-    ranges_computed: bool,
+    /// opencoder.py:252 self.trace
+    pub trace: &'a [majit_ir::Op],
+    /// opencoder.py:255 self._cache: per-iterator map from raw trace
+    /// position to fresh box (OpRef) materialized for this iteration.
+    /// In RPython this is `[None] * trace._index`; here `Vec<Option<OpRef>>`.
+    pub _cache: Vec<Option<OpRef>>,
+    /// opencoder.py:259-262 self.inputargs: fresh inputarg boxes for this
+    /// iteration. Each is an `OpRef` allocated from the iterator's
+    /// `_index` namespace at construction time.
+    pub inputargs: Vec<OpRef>,
+    /// opencoder.py:268 self.start
+    pub start: usize,
+    /// opencoder.py:269 self.pos
+    pub pos: usize,
+    /// opencoder.py:270 self._count
+    pub _count: u32,
+    /// opencoder.py:271 self._index: monotonic counter for the position of
+    /// resulting resops. Each non-void result allocates `OpRef(self._index)`
+    /// and then `self._index += 1`. The starting value is supplied by the
+    /// caller so different iterations get disjoint OpRefs.
+    pub _index: u32,
+    /// opencoder.py:272 self.start_index
+    pub start_index: u32,
+    /// opencoder.py:273 self.end
+    pub end: usize,
 }
 
 impl<'a> TraceIterator<'a> {
-    /// Create a new TraceIterator over the given operations.
-    pub fn new(ops: &'a [majit_ir::Op]) -> Self {
-        TraceIterator {
-            ops,
-            pos: 0,
-            live_range_end: Vec::new(),
-            ranges_computed: false,
-        }
-    }
-
-    /// Get the next operation, or None if exhausted.
-    pub fn next_op(&mut self) -> Option<&'a majit_ir::Op> {
-        if self.pos < self.ops.len() {
-            let op = &self.ops[self.pos];
-            self.pos += 1;
-            Some(op)
-        } else {
-            None
-        }
-    }
-
-    /// Current position in the operation list.
-    pub fn position(&self) -> usize {
-        self.pos
-    }
-
-    /// Whether all operations have been consumed.
-    pub fn done(&self) -> bool {
-        self.pos >= self.ops.len()
-    }
-
-    /// Total number of operations.
-    pub fn num_ops(&self) -> usize {
-        self.ops.len()
-    }
-
-    /// Reset to the beginning.
-    pub fn reset(&mut self) {
-        self.pos = 0;
-    }
-
-    /// opencoder.py: get_dead_ranges() — compute live ranges for all values.
-    /// Returns a reference to the live_range_end map.
-    pub fn compute_dead_ranges(&mut self) -> &[usize] {
-        if self.ranges_computed {
-            return &self.live_range_end;
-        }
-
-        // Find the maximum OpRef used
-        let max_ref = self
-            .ops
+    /// opencoder.py:250-273 TraceIterator.__init__.
+    ///
+    /// `force_inputargs` corresponds to the same RPython parameter
+    /// (cut-trace path); when None, the iterator pre-seeds the cache with
+    /// the trace's own inputargs at positions `[0, num_inputargs)`.
+    /// `start_index` is the starting value of `self._index`; majit must
+    /// expose this so two iterations can produce disjoint OpRefs.
+    pub fn new(
+        trace: &'a [majit_ir::Op],
+        start: usize,
+        end: usize,
+        force_inputargs: Option<&[OpRef]>,
+        num_inputargs: usize,
+        start_index: u32,
+    ) -> Self {
+        // self._cache = [None] * trace._index
+        // The iterator's cache must be large enough to hold any raw trace
+        // position we may encounter. RPython sizes it from `trace._index`
+        // (the encoder's monotonic op-result counter); here the equivalent
+        // is the maximum raw position seen in `trace[start..end]` plus one.
+        let max_pos = trace[start..end]
             .iter()
             .flat_map(|op| {
-                op.args
-                    .iter()
-                    .chain(op.fail_args.iter().flat_map(|fa| fa.iter()))
-                    .map(|r| r.0 as usize)
+                std::iter::once(op.pos.0)
+                    .chain(op.args.iter().map(|a| a.0))
+                    .chain(op.fail_args.iter().flat_map(|fa| fa.iter().map(|a| a.0)))
             })
+            .filter(|&p| p != u32::MAX && p < OpRef::CONST_BASE)
             .max()
             .unwrap_or(0);
-
-        self.live_range_end = vec![0; max_ref + 1];
-
-        // Walk backwards: last use of each OpRef is its dead range end.
-        for (i, op) in self.ops.iter().enumerate().rev() {
-            for arg in &op.args {
-                let idx = arg.0 as usize;
-                if idx < self.live_range_end.len() && self.live_range_end[idx] == 0 {
-                    self.live_range_end[idx] = i;
+        let cache_size = ((max_pos as usize) + 1).max(num_inputargs);
+        let mut _cache: Vec<Option<OpRef>> = vec![None; cache_size];
+        let mut next_index = start_index;
+        let inputargs: Vec<OpRef>;
+        if let Some(force) = force_inputargs {
+            // self.inputargs = [rop.inputarg_from_tp(arg.type) for
+            //                   arg in force_inputargs]
+            // for i, arg in enumerate(force_inputargs):
+            //     self._cache[arg.get_position()] = self.inputargs[i]
+            inputargs = force
+                .iter()
+                .map(|_| {
+                    let r = OpRef(next_index);
+                    next_index += 1;
+                    r
+                })
+                .collect();
+            for (i, &arg) in force.iter().enumerate() {
+                let p = arg.0 as usize;
+                if p >= _cache.len() {
+                    _cache.resize(p + 1, None);
                 }
+                _cache[p] = Some(inputargs[i]);
             }
-            if let Some(ref fa) = op.fail_args {
-                for arg in fa.iter() {
-                    let idx = arg.0 as usize;
-                    if idx < self.live_range_end.len() && self.live_range_end[idx] == 0 {
-                        self.live_range_end[idx] = i;
-                    }
-                }
+        } else {
+            // self.inputargs = [rop.inputarg_from_tp(arg.type) for
+            //                   arg in self.trace.inputargs]
+            // for i, arg in enumerate(self.inputargs):
+            //     self._cache[self.trace.inputargs[i].get_position()] = arg
+            inputargs = (0..num_inputargs)
+                .map(|_| {
+                    let r = OpRef(next_index);
+                    next_index += 1;
+                    r
+                })
+                .collect();
+            for i in 0..num_inputargs {
+                _cache[i] = Some(inputargs[i]);
             }
         }
-
-        self.ranges_computed = true;
-        &self.live_range_end
+        TraceIterator {
+            trace,
+            _cache,
+            inputargs,
+            start,
+            pos: start,
+            _count: start as u32,
+            _index: next_index,
+            start_index: next_index,
+            end,
+        }
     }
 
-    /// Check if a value is dead at the given position.
-    /// opencoder.py: is_dead(opref, pos)
-    pub fn is_dead_at(&self, opref: majit_ir::OpRef, pos: usize) -> bool {
-        let idx = opref.0 as usize;
-        if idx >= self.live_range_end.len() {
-            return true; // never used
+    /// opencoder.py:286-289 _get(self, i).
+    fn _get(&self, i: usize) -> OpRef {
+        let res = self._cache[i];
+        debug_assert!(res.is_some(), "TraceIterator._get cache miss at {i}");
+        res.unwrap()
+    }
+
+    /// opencoder.py:291-292 done().
+    pub fn done(&self) -> bool {
+        self.pos >= self.end
+    }
+
+    /// opencoder.py:321-335 _untag(tagged).
+    ///
+    /// In RPython this dispatches on the tag (TAGBOX/TAGINT/TAGCONSTPTR/
+    /// TAGCONSTOTHER). majit's OpRef carries the tag implicitly: constants
+    /// have `OpRef >= CONST_BASE`, NONE is `u32::MAX`. Both pass through
+    /// unchanged; only TAGBOX-equivalent OpRefs go through `_get`.
+    fn _untag(&self, opref: OpRef) -> OpRef {
+        if opref.is_none() || opref.is_constant() {
+            opref
+        } else {
+            self._get(opref.0 as usize)
         }
-        self.live_range_end[idx] < pos
+    }
+
+    /// opencoder.py:278-280 kill_cache_at(pos).
+    pub fn kill_cache_at(&mut self, pos: usize) {
+        if pos != 0 {
+            self._cache[pos] = None;
+        }
+    }
+
+    /// opencoder.py:282-284 replace_last_cached(oldbox, box).
+    pub fn replace_last_cached(&mut self, oldbox: OpRef, new_box: OpRef) {
+        let last_idx = (self._index - 1) as usize;
+        debug_assert_eq!(self._cache[last_idx], Some(oldbox));
+        self._cache[last_idx] = Some(new_box);
+    }
+
+    /// opencoder.py:362-406 next() — produce the next operation as a fresh
+    /// box (`cls()` in RPython) with translated args.
+    pub fn next(&mut self) -> Option<majit_ir::Op> {
+        if self.done() {
+            return None;
+        }
+        let src = &self.trace[self.pos];
+        self.pos += 1;
+        let mut res = src.clone();
+        // for i in range(argnum):
+        //     res.setarg(i, self._untag(self._next()))
+        for arg in res.args.iter_mut() {
+            *arg = self._untag(*arg);
+        }
+        if let Some(ref mut fa) = res.fail_args {
+            for arg in fa.iter_mut() {
+                *arg = self._untag(*arg);
+            }
+        }
+        // if res.type != 'v':
+        //     self._cache[self._index] = res
+        //     self._index += 1
+        if !src.pos.is_none() && src.opcode.result_type() != majit_ir::Type::Void {
+            let orig = src.pos.0 as usize;
+            if orig >= self._cache.len() {
+                self._cache.resize(orig + 1, None);
+            }
+            let fresh = if let Some(existing) = self._cache[orig] {
+                existing
+            } else {
+                let f = OpRef(self._index);
+                self._index += 1;
+                self._cache[orig] = Some(f);
+                f
+            };
+            res.pos = fresh;
+        } else {
+            res.pos = src.pos;
+        }
+        // self._count += 1
+        self._count += 1;
+        Some(res)
     }
 }
 
@@ -1115,13 +1214,41 @@ impl TraceRecordBuffer {
         self.create_top_snapshot(empty_snap, vable_array_index, vref_array_index)
     }
 
-    /// opencoder.py: get_live_ranges()
-    /// Compute live ranges for all recorded values.
-    /// Returns a vector where index i contains the last position
-    /// where value i is used.
+    /// opencoder.py:852-858 Trace.get_live_ranges().
+    ///
+    /// Returns a list where `liveranges[i]` is the last position at which
+    /// the value with raw trace position `i` is used. RPython walks the
+    /// trace via `TraceIterator.next_element_update_live_range`; majit's
+    /// decoded form lets us scan ops directly.
     pub fn get_live_ranges(&self, ops: &[majit_ir::Op]) -> Vec<usize> {
-        let mut iter = TraceIterator::new(ops);
-        iter.compute_dead_ranges().to_vec()
+        let max_ref = ops
+            .iter()
+            .flat_map(|op| {
+                op.args
+                    .iter()
+                    .chain(op.fail_args.iter().flat_map(|fa| fa.iter()))
+                    .map(|r| r.0 as usize)
+            })
+            .max()
+            .unwrap_or(0);
+        let mut liveranges = vec![0usize; max_ref + 1];
+        for (i, op) in ops.iter().enumerate().rev() {
+            for arg in &op.args {
+                let idx = arg.0 as usize;
+                if idx < liveranges.len() && liveranges[idx] == 0 {
+                    liveranges[idx] = i;
+                }
+            }
+            if let Some(ref fa) = op.fail_args {
+                for arg in fa.iter() {
+                    let idx = arg.0 as usize;
+                    if idx < liveranges.len() && liveranges[idx] == 0 {
+                        liveranges[idx] = i;
+                    }
+                }
+            }
+        }
+        liveranges
     }
 
     /// opencoder.py: unpack()
@@ -1425,25 +1552,142 @@ mod tests {
         assert_eq!(float_idx, 0);
     }
 
+    /// Helper: build an Op with a specific raw trace position.
+    fn op_at(pos: u32, opcode: majit_ir::OpCode, args: &[OpRef]) -> majit_ir::Op {
+        let mut op = majit_ir::Op::new(opcode, args);
+        op.pos = OpRef(pos);
+        op
+    }
+
     #[test]
-    fn test_trace_iterator_dead_ranges() {
+    fn test_trace_iterator_next_basic() {
+        // opencoder.py:362-406 TraceIterator.next() parity:
+        //
+        // Phase-1 iteration over a 2-inputarg trace producing two IntAdd
+        // results. Inputargs occupy positions [0, 2); the first non-void
+        // result is allocated at OpRef(2) (= start_index = num_inputargs).
         let ops = vec![
-            majit_ir::Op::new(majit_ir::OpCode::IntAdd, &[OpRef(100), OpRef(101)]),
-            majit_ir::Op::new(majit_ir::OpCode::IntAdd, &[OpRef(0), OpRef(101)]),
-            majit_ir::Op::new(majit_ir::OpCode::Finish, &[OpRef(1)]),
+            op_at(2, majit_ir::OpCode::IntAdd, &[OpRef(0), OpRef(1)]),
+            op_at(3, majit_ir::OpCode::IntAdd, &[OpRef(2), OpRef(0)]),
+            majit_ir::Op::new(majit_ir::OpCode::Finish, &[OpRef(3)]),
         ];
-        let mut iter = TraceIterator::new(&ops);
-        assert_eq!(iter.num_ops(), 3);
-        assert!(!iter.done());
+        let num_inputargs = 2;
 
-        let ranges = iter.compute_dead_ranges();
-        // OpRef(100) is used at position 0 only → dead after 0
-        // OpRef(101) is used at positions 0 and 1 → dead after 1
-        assert!(ranges.len() > 100);
+        // Phase 1 / legacy layout: start_index = 0 → inputargs allocated
+        // at [OpRef(0), OpRef(1)], op results follow at [OpRef(2), …).
+        let mut iter = TraceIterator::new(&ops, 0, ops.len(), None, num_inputargs, 0);
+        assert_eq!(iter.inputargs, vec![OpRef(0), OpRef(1)]);
+        assert_eq!(iter._cache[0], Some(OpRef(0)));
+        assert_eq!(iter._cache[1], Some(OpRef(1)));
 
-        // Check iterator works
-        assert!(iter.next_op().is_some());
-        assert_eq!(iter.position(), 1);
+        // First IntAdd: result at fresh OpRef(2), args translated via cache.
+        let r1 = iter.next().unwrap();
+        assert_eq!(r1.pos, OpRef(2));
+        assert_eq!(r1.args[0], OpRef(0));
+        assert_eq!(r1.args[1], OpRef(1));
+
+        // Second IntAdd: result at fresh OpRef(3); first arg references the
+        // previous result (raw pos 2 → cached OpRef(2)).
+        let r2 = iter.next().unwrap();
+        assert_eq!(r2.pos, OpRef(3));
+        assert_eq!(r2.args[0], OpRef(2));
+        assert_eq!(r2.args[1], OpRef(0));
+
+        // Finish is void: pos unchanged, arg cached → OpRef(3).
+        let finish = iter.next().unwrap();
+        assert_eq!(finish.args[0], OpRef(3));
+        assert!(iter.done());
+    }
+
+    #[test]
+    fn test_trace_iterator_phase1_phase2_disjoint() {
+        // opencoder.py:362-406 TraceIterator.next() identity parity:
+        //
+        // RPython distinguishes Phase 1 boxes from Phase 2 boxes by Python
+        // `is`-identity even when the two iterators visit the same source
+        // trace position. majit lacks separate identity from position, so
+        // each phase passes a different `start_index` and the iterator
+        // produces disjoint OpRefs by construction.
+        let ops = vec![
+            op_at(2, majit_ir::OpCode::IntAdd, &[OpRef(0), OpRef(1)]),
+            op_at(3, majit_ir::OpCode::IntAdd, &[OpRef(2), OpRef(0)]),
+            majit_ir::Op::new(majit_ir::OpCode::Finish, &[OpRef(3)]),
+        ];
+        let num_inputargs = 2;
+
+        // Phase 1: start_index = 0 reproduces the legacy positional layout
+        // (inputargs at [0, num_inputargs), op results at [num_inputargs, …)).
+        let mut p1 = TraceIterator::new(&ops, 0, ops.len(), None, num_inputargs, 0);
+        let mut p1_ops = Vec::new();
+        while let Some(op) = p1.next() {
+            p1_ops.push(op);
+        }
+        let p1_high_water = p1._index;
+        assert_eq!(p1_high_water, 4);
+
+        // Phase 2: start_index = phase1 high water → disjoint namespace.
+        let mut p2 = TraceIterator::new(&ops, 0, ops.len(), None, num_inputargs, p1_high_water);
+        let mut p2_ops = Vec::new();
+        while let Some(op) = p2.next() {
+            p2_ops.push(op);
+        }
+        assert_eq!(p2.inputargs, vec![OpRef(4), OpRef(5)]);
+        assert_eq!(p2_ops[0].pos, OpRef(6));
+        assert_eq!(p2_ops[0].args[0], OpRef(4));
+        assert_eq!(p2_ops[0].args[1], OpRef(5));
+        assert_eq!(p2_ops[1].pos, OpRef(7));
+        assert_eq!(p2_ops[1].args[0], OpRef(6));
+        assert_eq!(p2_ops[1].args[1], OpRef(4));
+        assert_eq!(p2_ops[2].args[0], OpRef(7));
+
+        // No Phase 1 OpRef equals any Phase 2 OpRef.
+        let p1_set: std::collections::HashSet<u32> = p1_ops
+            .iter()
+            .map(|op| op.pos.0)
+            .filter(|&p| p != u32::MAX)
+            .collect();
+        let p2_set: std::collections::HashSet<u32> = p2_ops
+            .iter()
+            .map(|op| op.pos.0)
+            .filter(|&p| p != u32::MAX)
+            .collect();
+        assert!(p1_set.is_disjoint(&p2_set));
+    }
+
+    #[test]
+    fn test_trace_iterator_constants_passthrough() {
+        // opencoder.py:321-335 _untag(): TAGINT/TAGCONSTPTR/TAGCONSTOTHER
+        // pass through unchanged. In majit, OpRefs >= CONST_BASE are
+        // constants and must NOT be remapped through `_cache`.
+        let const_ref = OpRef(majit_ir::OpRef::CONST_BASE + 5);
+        let ops = vec![op_at(1, majit_ir::OpCode::IntAdd, &[OpRef(0), const_ref])];
+        let mut iter = TraceIterator::new(&ops, 0, ops.len(), None, 1, 0);
+        let r = iter.next().unwrap();
+        assert_eq!(r.pos, OpRef(1));
+        assert_eq!(r.args[0], OpRef(0));
+        assert_eq!(r.args[1], const_ref);
+    }
+
+    #[test]
+    fn test_trace_iterator_fail_args_remapped() {
+        // opencoder.py:362-406 next() routes guard fail_args through the
+        // same _untag/_get path as regular args.
+        let mut guard = op_at(2, majit_ir::OpCode::GuardTrue, &[OpRef(1)]);
+        guard.fail_args = Some(vec![OpRef(0), OpRef(1)].into());
+        let ops = vec![
+            op_at(1, majit_ir::OpCode::IntEq, &[OpRef(0), OpRef(0)]),
+            guard,
+        ];
+        let mut iter = TraceIterator::new(&ops, 0, ops.len(), None, 1, 10);
+        let r1 = iter.next().unwrap();
+        assert_eq!(r1.pos, OpRef(11));
+        assert_eq!(r1.args[0], OpRef(10));
+        assert_eq!(r1.args[1], OpRef(10));
+        let r2 = iter.next().unwrap();
+        assert_eq!(r2.args[0], OpRef(11));
+        let fa = r2.fail_args.as_ref().unwrap();
+        assert_eq!(fa[0], OpRef(10));
+        assert_eq!(fa[1], OpRef(11));
     }
 
     #[test]

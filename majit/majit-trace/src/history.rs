@@ -120,9 +120,17 @@ impl TreeLoop {
         self.inputargs.iter().map(|ia| ia.tp).collect()
     }
 
-    /// Create a trace iterator for this trace.
+    /// opencoder.py:848-850 Trace.get_iter() — produce a TraceIterator over
+    /// the recorded ops with fresh per-iteration boxes.
+    ///
+    /// `start_index = 0` reproduces the legacy positional layout: inputargs
+    /// allocated at `[OpRef(0), …, OpRef(num_inputargs - 1))`, op results
+    /// at `[OpRef(num_inputargs), …)`. Phase 2 / bridge callers that need
+    /// disjoint OpRef namespaces must construct `TraceIterator::new`
+    /// directly with a higher `start_index`.
     pub fn get_iter(&self) -> crate::opencoder::TraceIterator<'_> {
-        crate::opencoder::TraceIterator::new(&self.ops)
+        let num_inputargs = self.inputargs.len();
+        crate::opencoder::TraceIterator::new(&self.ops, 0, self.ops.len(), None, num_inputargs, 0)
     }
 
     /// history.py: check_consistency()
@@ -996,17 +1004,24 @@ mod tests {
 
     #[test]
     fn test_get_iter() {
-        let ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]),
-            Op::new(OpCode::IntMul, &[OpRef(0), OpRef(1)]),
-            Op::new(OpCode::Jump, &[OpRef(0)]),
-        ];
-        let trace = TreeLoop::new(vec![], ops);
+        // opencoder.py:848-850 Trace.get_iter() — produce a TraceIterator
+        // that walks the trace producing fresh boxes per visited op.
+        // The trace must reference its own inputargs at OpRef positions
+        // [0, num_inputargs); a malformed trace that references OpRef(0)
+        // without a matching inputarg would cache-miss in `_get`.
+        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let mut add = Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]);
+        add.pos = OpRef(2);
+        let ops = vec![add, Op::new(OpCode::Jump, &[OpRef(2)])];
+        let trace = TreeLoop::new(inputargs, ops);
         let mut iter = trace.get_iter();
-        assert_eq!(iter.num_ops(), 3);
         assert!(!iter.done());
-        iter.next_op();
-        assert_eq!(iter.position(), 1);
+        // Walk one op via TraceIterator.next() — opencoder.py:362-406.
+        let r = iter.next().unwrap();
+        assert_eq!(r.pos, OpRef(2));
+        assert_eq!(r.args[0], OpRef(0));
+        assert_eq!(r.args[1], OpRef(1));
+        assert_eq!(iter.pos, 1);
     }
 
     #[test]
