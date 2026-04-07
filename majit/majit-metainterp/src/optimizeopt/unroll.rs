@@ -3670,18 +3670,26 @@ fn assemble_peeled_trace_with_jump_args(
         .unwrap_or(0);
     let mut max_pos = result_max.max(p1_all_max).max(source_slot_max);
     max_pos = next_free_pos(max_pos.saturating_add(1));
-    // Split alias_remap into 3 namespace-scoped maps to prevent cross-namespace
-    // chain collisions. RPython Box identity prevents this — flat OpRef model needs
-    // explicit separation. See assembly_remap_refactor.md.
-    let mut imported_alias_remap: HashMap<OpRef, OpRef> = HashMap::new();
-    let mut label_rescue_remap: HashMap<OpRef, OpRef> = HashMap::new();
-    let mut label_dedup_remap: HashMap<OpRef, OpRef> = HashMap::new();
+    // Step 6 of the Box identity plan: the per-iteration alias /
+    // rescue / dedup remap maps used to live here, splitting the
+    // assembly's collision-compensation logic into three namespace
+    // buckets. After Commit D1/D2 (Phase 2 disjoint OpRef ranges) the
+    // body-use-before-def fall-throughs and label-arg duplicates that
+    // populated `label_rescue_remap` / `label_dedup_remap` are empty
+    // across the entire test suite. Both maps and the lookups that
+    // consumed them have been removed.
+    //
+    // `imported_short_aliases` still drives SameAs emission for the
+    // imported short-preamble alias result OpRefs (the alias is the
+    // alias_result that body ops will reference; without the SameAs
+    // op the preamble does not produce that OpRef). The previous code
+    // recorded a fresh-position alias_remap entry; with disjoint
+    // OpRef ranges the alias result already lives at a unique
+    // position, so the SameAs op is emitted at the alias's existing
+    // result OpRef directly.
     for alias in imported_short_aliases {
-        let pos = OpRef(max_pos);
-        max_pos = next_free_pos(max_pos.saturating_add(1));
         let mut op = Op::new(alias.same_as_opcode, &[alias.same_as_source]);
-        op.pos = pos;
-        imported_alias_remap.insert(alias.result, pos);
+        op.pos = alias.result;
         result.push(op);
     }
 
@@ -3702,10 +3710,6 @@ fn assemble_peeled_trace_with_jump_args(
             if !op.pos.is_none() && op.opcode != OpCode::Jump && op.result_type() != Type::Void {
                 s.insert(op.pos);
             }
-        }
-        // Alias results are also defined in the preamble.
-        for (&_from, &to) in &imported_alias_remap {
-            s.insert(to);
         }
         s
     };
@@ -3762,44 +3766,32 @@ fn assemble_peeled_trace_with_jump_args(
     }
     max_pos = next_free_pos(max_pos);
 
-    // Use a separate position counter for extra SameAs ops. Must start
-    // AFTER all positions that may be referenced in the body, not just
-    // p1_ops positions — Phase 2 allocated fresh slots during import_state
-    // for heap imports, virtual fields and pure ops that live above
-    // preamble_max and would otherwise collide.
-    let mut extra_pos = max_pos;
-    for &arg in &filtered_extra_label_args {
-        let mapped = imported_alias_remap.get(&arg).copied().unwrap_or(arg);
-        if !preamble_defs.contains(&mapped) {
-            if let Some(&source) = short_source_map.get(&arg) {
-                if preamble_defs.contains(&source) {
-                    let pos = OpRef(extra_pos);
-                    extra_pos = next_free_pos(extra_pos.saturating_add(1));
-                    let mut op = Op::new(OpCode::SameAsI, &[source]);
-                    op.pos = pos;
-                    label_rescue_remap.insert(arg, pos);
-                    result.push(op);
-                }
-            }
-        }
-    }
-    // Synchronize max_pos with extra_pos so that body-use-before-def
-    // positions don't collide with the extra SameAs ops allocated above.
-    max_pos = max_pos.max(extra_pos);
+    // Step 6 of the Box identity plan: the extra-SameAs allocation loop
+    // for `filtered_extra_label_args` was a band-aid that emitted
+    // explicit SameAs ops to bridge label args to their imported short
+    // sources when the alias / rescue maps had populated entries. Both
+    // maps are dead under Commit D1/D2 (verified zero entries across
+    // 909 tests), so the SameAs allocation loop is also dead — extra
+    // label args resolve directly to the original `filtered_extra_label_args`
+    // OpRefs without remapping.
     let extra_label_start_idx = full_label_args.len();
-    full_label_args.extend(filtered_extra_label_args.iter().map(|arg| {
-        imported_alias_remap
-            .get(arg)
-            .or_else(|| label_rescue_remap.get(arg))
-            .copied()
-            .unwrap_or(*arg)
-    }));
+    full_label_args.extend(filtered_extra_label_args.iter().copied());
 
     // RPython compile.py parity: after the loop label, only the loop-header
-    // contract is live. When majit's detached redirected tail still mentions
-    // body temps before redefining them, carry those refs through the label
-    // so the assembled body does not contain use-before-def slots.
-    // preamble_defs already computed above (includes inputargs + alias results)
+    // contract is live. When `splice_redirected_tail` glues a redirected
+    // tail onto the body, the spliced output may mention OpRefs whose
+    // defining op was removed (the section between the splice point and
+    // the original Jump). Carry such "body use-before-def" references
+    // through the label so the assembled body doesn't contain dangling
+    // references.
+    //
+    // Step 6 of the Box identity plan: the previous code populated
+    // `label_rescue_remap` (now deleted) with synthetic SameAs ops to
+    // bridge these references. With Commit D1/D2 the carried OpRef is
+    // already in a unique slot, so adding it directly to
+    // `full_label_args` is sufficient — the JUMP's mapped_base_args
+    // path will pick up the corresponding fresh value on the next
+    // iteration.
     let mut carried_source_slots: std::collections::HashSet<OpRef> =
         if !label_source_slots.is_empty() && label_source_slots.len() == label_args.len() {
             label_source_slots.iter().copied().collect()
@@ -3808,94 +3800,31 @@ fn assemble_peeled_trace_with_jump_args(
         };
     carried_source_slots.extend(filtered_extra_jump_args.iter().copied());
     let mut label_set: std::collections::HashSet<OpRef> = full_label_args.iter().copied().collect();
-    let mut seen_body_defs = std::collections::HashSet::new();
-    for op in p2_ops {
-        let all_refs = op
-            .args
-            .iter()
-            .chain(op.fail_args.as_ref().into_iter().flat_map(|fa| fa.iter()));
-        for &arg in all_refs {
-            if !is_trace_runtime_ref(arg, constants) {
-                continue; // skip NONE and constants
-            }
-            if label_set.contains(&arg)
-                || carried_source_slots.contains(&arg)
-                || imported_alias_remap.contains_key(&arg)
-                || label_rescue_remap.contains_key(&arg)
-                || label_dedup_remap.contains_key(&arg)
-                || seen_body_defs.contains(&arg)
-            {
-                continue;
-            }
-            // preamble_defs values are available in the fall-through from
-            // preamble to the first iteration. BUT after the Label (loop
-            // body back-edge), only Label args are available — preamble defs
-            // are not carried across the back-edge. So do NOT skip them.
-            // Body-use-before-def: a value used in the body before its
-            // defining op is encountered. Carry it through the label so
-            // the assembled body has it available.
-            // If the value comes from short preamble import, emit a SameAs
-            // in the preamble to make its source visible.
-            if !full_label_args.contains(&arg) {
-                if let Some(&source) = short_source_map.get(&arg) {
-                    if preamble_defs.contains(&source)
-                        && !imported_alias_remap.contains_key(&arg)
-                        && !label_rescue_remap.contains_key(&arg)
-                        && !label_dedup_remap.contains_key(&arg)
-                    {
-                        let pos = OpRef(max_pos);
-                        max_pos = next_free_pos(max_pos.saturating_add(1));
-                        let same_as_opcode = OpCode::SameAsI; // default to Int
-                        let mut op = Op::new(same_as_opcode, &[source]);
-                        op.pos = pos;
-                        label_rescue_remap.insert(arg, pos);
-                        // Insert before the label (which is at the end of result)
-                        result.push(op);
-                        full_label_args.push(pos);
-                        label_set.insert(pos);
-                        continue;
-                    }
-                }
-                full_label_args.push(arg);
-                label_set.insert(arg);
-            }
-        }
-        if op.result_type() != Type::Void && !op.pos.is_none() {
-            seen_body_defs.insert(op.pos);
-        }
-    }
-
-    // RPython parity: each label position must be a distinct OpRef so the
-    // backend assigns independent register slots. When make_inputargs produces
-    // duplicates (e.g. [v0, v3, v20, v20, v30, v20]), create SameAs aliases
-    // for the second and subsequent occurrences. This mirrors RPython where
-    // each label arg is a distinct Box even when forwarded to the same value.
     {
-        let mut seen_in_label: HashMap<OpRef, usize> = HashMap::new();
-        let mut label_scope_dedup: HashMap<OpRef, OpRef> = HashMap::new();
-        let n_label = full_label_args.len();
-        for i in 0..n_label {
-            let arg = full_label_args[i];
-            if arg.is_none() || constants.contains_key(&arg.0) {
-                continue;
+        let mut seen_body_defs = std::collections::HashSet::new();
+        for op in p2_ops {
+            let all_refs = op
+                .args
+                .iter()
+                .chain(op.fail_args.as_ref().into_iter().flat_map(|fa| fa.iter()));
+            for &arg in all_refs {
+                if !is_trace_runtime_ref(arg, constants) {
+                    continue; // skip NONE and constants
+                }
+                if label_set.contains(&arg)
+                    || carried_source_slots.contains(&arg)
+                    || seen_body_defs.contains(&arg)
+                {
+                    continue;
+                }
+                if !full_label_args.contains(&arg) {
+                    full_label_args.push(arg);
+                    label_set.insert(arg);
+                }
             }
-            if let Some(&first_idx) = seen_in_label.get(&arg) {
-                let fresh = OpRef(next_free_pos(max_pos.saturating_add(1)));
-                max_pos = fresh.0;
-                let source = full_label_args[first_idx];
-                let mut same_op = Op::new(OpCode::SameAsI, &[source]);
-                same_op.pos = fresh;
-                result.push(same_op);
-                label_scope_dedup.insert(fresh, arg);
-                full_label_args[i] = fresh;
-            } else {
-                seen_in_label.insert(arg, i);
+            if op.result_type() != Type::Void && !op.pos.is_none() {
+                seen_body_defs.insert(op.pos);
             }
-        }
-        // Also remap body ops that reference the original duplicate OpRefs
-        // to the fresh aliases. Store in label_dedup_remap for remap_body_arg.
-        for (fresh, original) in &label_scope_dedup {
-            label_dedup_remap.insert(*original, *fresh);
         }
     }
 
@@ -3909,12 +3838,8 @@ fn assemble_peeled_trace_with_jump_args(
         if la.is_none() || is_trace_constant_ref(la, constants) {
             continue;
         }
-        if preamble_defs.contains(&la)
-            || imported_alias_remap.values().any(|&v| v == la)
-            || label_rescue_remap.values().any(|&v| v == la)
-            || label_dedup_remap.values().any(|&v| v == la)
-        {
-            continue; // already defined by preamble or alias SameAs
+        if preamble_defs.contains(&la) {
+            continue; // already defined by preamble
         }
         // Step 6 of the Box identity plan: the `imported_field_remap`
         // priority-1 lookup is gone (the map is dead after Commit D1/D2 —
@@ -3984,9 +3909,6 @@ fn assemble_peeled_trace_with_jump_args(
     let visible_before_label: std::collections::HashSet<OpRef> = full_label_args
         .iter()
         .copied()
-        .chain(imported_alias_remap.values().copied())
-        .chain(label_rescue_remap.values().copied())
-        .chain(label_dedup_remap.values().copied())
         .chain(preamble_defs.iter().copied())
         .collect();
 
@@ -4032,15 +3954,16 @@ fn assemble_peeled_trace_with_jump_args(
         if let Some(&mapped_pos) = body_result_remap.get(&op.pos) {
             new_op.pos = mapped_pos;
         }
-        // Single-step priority lookup per map — no iterative chain following.
-        // Each map operates on a distinct namespace; chaining across maps
-        // caused OpRef collisions (see assembly_remap_refactor.md).
+        // Step 6 of the Box identity plan: the 6-way priority remap was
+        // a band-aid for the flat OpRef model where multiple namespaces
+        // (preamble emit, label dedup, alias import, body redefine)
+        // could collide on the same OpRef. With Commit D1/D2's disjoint
+        // Phase 2 namespace, the 3 reactive maps (alias / rescue / dedup)
+        // are dead and have been removed. The remaining 3-way priority
+        // is: inner label scope > body redefine > input remap.
         let remap_body_arg = |arg: OpRef,
                               label_scope_remap: &HashMap<OpRef, OpRef>,
                               input_remap: &HashMap<OpRef, OpRef>,
-                              imported_alias_remap: &HashMap<OpRef, OpRef>,
-                              label_rescue_remap: &HashMap<OpRef, OpRef>,
-                              label_dedup_remap: &HashMap<OpRef, OpRef>,
                               body_result_remap: &HashMap<OpRef, OpRef>,
                               seen_body_defs: &std::collections::HashSet<OpRef>,
                               visible_before_label: &std::collections::HashSet<OpRef>|
@@ -4059,18 +3982,6 @@ fn assemble_peeled_trace_with_jump_args(
             if let Some(&mapped) = input_remap.get(&arg) {
                 return mapped;
             }
-            // 4. label_rescue_remap — body use-before-def → preamble SameAs
-            if let Some(&mapped) = label_rescue_remap.get(&arg) {
-                return mapped;
-            }
-            // 5. imported_alias_remap — imported short alias → fresh pos
-            if let Some(&mapped) = imported_alias_remap.get(&arg) {
-                return mapped;
-            }
-            // 6. label_dedup_remap — duplicate label arg → fresh dedup pos
-            if let Some(&mapped) = label_dedup_remap.get(&arg) {
-                return mapped;
-            }
             arg
         };
         for arg in &mut new_op.args {
@@ -4078,9 +3989,6 @@ fn assemble_peeled_trace_with_jump_args(
                 *arg,
                 &label_scope_remap,
                 &input_remap,
-                &imported_alias_remap,
-                &label_rescue_remap,
-                &label_dedup_remap,
                 &body_result_remap,
                 &seen_body_defs,
                 &visible_before_label,
@@ -4113,10 +4021,7 @@ fn assemble_peeled_trace_with_jump_args(
                     let available_before_label = visible_before_label.contains(&arg)
                         || seen_body_defs.contains(&arg)
                         || short_source_map.contains_key(&arg)
-                        || input_remap.contains_key(&arg)
-                        || imported_alias_remap.contains_key(&arg)
-                        || label_rescue_remap.contains_key(&arg)
-                        || label_dedup_remap.contains_key(&arg);
+                        || input_remap.contains_key(&arg);
                     if available_before_label {
                         extra_inner_set.insert(arg);
                         extra_inner_sources.push(arg);
@@ -4131,9 +4036,6 @@ fn assemble_peeled_trace_with_jump_args(
                     source_arg,
                     &label_scope_remap,
                     &input_remap,
-                    &imported_alias_remap,
-                    &label_rescue_remap,
-                    &label_dedup_remap,
                     &body_result_remap,
                     &seen_body_defs,
                     &visible_before_label,
@@ -4154,14 +4056,6 @@ fn assemble_peeled_trace_with_jump_args(
                         .map(|entry| entry.result)
                     {
                         label_scope_remap.insert(imported_result, mapped_arg);
-                    }
-                    // Check all alias maps for source_arg
-                    let aliased = imported_alias_remap
-                        .get(&source_arg)
-                        .or_else(|| label_rescue_remap.get(&source_arg))
-                        .or_else(|| label_dedup_remap.get(&source_arg));
-                    if let Some(&aliased_result) = aliased {
-                        label_scope_remap.insert(aliased_result, mapped_arg);
                     }
                 }
             }
@@ -4229,9 +4123,6 @@ fn assemble_peeled_trace_with_jump_args(
                         input_remap
                             .get(&extra_arg)
                             .copied()
-                            .or_else(|| imported_alias_remap.get(&extra_arg).copied())
-                            .or_else(|| label_rescue_remap.get(&extra_arg).copied())
-                            .or_else(|| label_dedup_remap.get(&extra_arg).copied())
                             .or_else(|| {
                                 body_result_remap
                                     .get(&extra_arg)
@@ -4269,9 +4160,6 @@ fn assemble_peeled_trace_with_jump_args(
                     .get(a)
                     .copied()
                     .or_else(|| input_remap.get(a).copied())
-                    .or_else(|| imported_alias_remap.get(a).copied())
-                    .or_else(|| label_rescue_remap.get(a).copied())
-                    .or_else(|| label_dedup_remap.get(a).copied())
                     .or_else(|| {
                         body_result_remap.get(a).copied().filter(|_| {
                             seen_body_defs.contains(a) && !visible_before_label.contains(a)
@@ -4317,27 +4205,6 @@ fn assemble_peeled_trace_with_jump_args(
         if op.result_type() != Type::Void && !op.pos.is_none() {
             seen_body_defs.insert(op.pos);
             defs_since_inner_label.insert(result.last().unwrap().pos);
-        }
-    }
-
-    // Step 6 of the Box identity plan (band-aid deletion — instrumentation
-    // phase): log the insertion counts of the three remaining
-    // assembly-local band-aid remap maps (`imported_alias_remap`,
-    // `label_rescue_remap`, `label_dedup_remap`). After Commit D1/D2 the
-    // Phase 2 OpRef namespace is disjoint from Phase 1's emitted range,
-    // so these collision-compensation maps stay empty on correct traces.
-    // A non-zero count under MAJIT_LOG is a regression signal.
-    if std::env::var_os("MAJIT_LOG").is_some() {
-        let iar = imported_alias_remap.len();
-        let lrr = label_rescue_remap.len();
-        let ldr = label_dedup_remap.len();
-        if iar + lrr + ldr > 0 {
-            eprintln!(
-                "[jit][assemble] band-aid maps non-empty: \
-                 imported_alias_remap={iar} label_rescue_remap={lrr} \
-                 label_dedup_remap={ldr} \
-                 (these should be dead after Commit D1/D2)"
-            );
         }
     }
 
