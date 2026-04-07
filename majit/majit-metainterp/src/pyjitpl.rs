@@ -2506,7 +2506,7 @@ impl<M: Clone> MetaInterp<M> {
                         Some(c) => c,
                         None => return CompileOutcome::Cancelled,
                     };
-                    match Self::bridge_fail_descr_proxy(compiled, trace_id, fail_index) {
+                    match self.bridge_fail_descr_proxy(compiled, trace_id, fail_index) {
                         Some(d) => Box::new(d) as Box<dyn majit_ir::FailDescr>,
                         None => return CompileOutcome::Cancelled,
                     }
@@ -4683,7 +4683,7 @@ impl<M: Clone> MetaInterp<M> {
         let Some(compiled) = self.compiled_loops.get(&green_key) else {
             return 0;
         };
-        Self::bridge_fail_descr_proxy(compiled, trace_id, fail_index)
+        self.bridge_fail_descr_proxy(compiled, trace_id, fail_index)
             .map(|p| p.fail_arg_types.len())
             .unwrap_or(0)
     }
@@ -5000,6 +5000,7 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     pub fn bridge_fail_descr_proxy(
+        &self,
         compiled: &CompiledEntry<M>,
         trace_id: u64,
         fail_index: u32,
@@ -5013,12 +5014,31 @@ impl<M: Clone> MetaInterp<M> {
         // fail_descr has the UPDATED types; exit_layout.exit_types may have
         // the ORIGINAL MetaFailDescr types (before optimizer update).
         // Prefer the backend's types when available.
-        let fail_arg_types = exit_layout.exit_types.clone();
+        let fail_arg_types = self
+            .backend
+            .compiled_trace_fail_descr_layouts(&compiled.token, trace_id)
+            .and_then(|layouts| {
+                layouts
+                    .into_iter()
+                    .find(|l| l.fail_index == fail_index)
+                    .map(|l| l.fail_arg_types)
+            })
+            .unwrap_or_else(|| exit_layout.exit_types.clone());
+        let gc_ref_slots = self
+            .backend
+            .compiled_trace_fail_descr_layouts(&compiled.token, trace_id)
+            .and_then(|layouts| {
+                layouts
+                    .into_iter()
+                    .find(|l| l.fail_index == fail_index)
+                    .map(|l| l.gc_ref_slots)
+            })
+            .unwrap_or_else(|| exit_layout.gc_ref_slots.clone());
         Some(compile::BridgeFailDescrProxy {
             fail_index,
             trace_id,
             fail_arg_types,
-            gc_ref_slots: exit_layout.gc_ref_slots.clone(),
+            gc_ref_slots,
             force_token_slots: exit_layout.force_token_slots.clone(),
             is_finish: exit_layout.is_finish,
             rd_numb: None,
@@ -5205,7 +5225,7 @@ impl<M: Clone> MetaInterp<M> {
                 Some(c) => c,
                 None => return,
             };
-            match Self::bridge_fail_descr_proxy(compiled, pending.trace_id, pending.fail_index) {
+            match self.bridge_fail_descr_proxy(compiled, pending.trace_id, pending.fail_index) {
                 Some(d) => Box::new(d) as Box<dyn majit_ir::FailDescr>,
                 None => return,
             }
@@ -5263,9 +5283,9 @@ impl<M: Clone> MetaInterp<M> {
         fail_index: u32,
     ) -> Option<Box<dyn majit_ir::FailDescr>> {
         let compiled = self.compiled_loops.get(&green_key)?;
-        Some(Box::new(Self::bridge_fail_descr_proxy(
-            compiled, trace_id, fail_index,
-        )?))
+        Some(Box::new(
+            self.bridge_fail_descr_proxy(compiled, trace_id, fail_index)?,
+        ))
     }
 
     /// Return the full recovery slot types for a guard exit, concatenated
@@ -5878,32 +5898,17 @@ impl<M: Clone> MetaInterp<M> {
             })
             .unwrap_or(false);
 
-        let fail_descr = match Self::bridge_fail_descr_proxy(compiled, trace_id, fail_index) {
+        let fail_descr = match self.bridge_fail_descr_proxy(compiled, trace_id, fail_index) {
             Some(descr) => descr,
             None => return None,
         };
 
         // compile.py:797-811 parity: bridge inputargs come from the guard's
         // fail_arg_types AFTER store_final_boxes_in_guard. The backend's
-        // fail_descr has the UPDATED types (may include virtual field boxes);
-        // the front-end exit_layout may still have the original types.
-        // Prefer backend types which reflect the actual deadframe layout.
-        let backend_types = self
-            .backend
-            .compiled_trace_fail_descr_layouts(&compiled.token, norm_tid)
-            .and_then(|layouts| {
-                layouts
-                    .into_iter()
-                    .find(|l| l.fail_index == fail_index)
-                    .map(|l| l.fail_arg_types)
-            });
-        let fallback_types = fail_descr.fail_arg_types();
-        // compile.py:797-811 parity: log bridge input type resolution.
-        // Prefer backend types (from store_final_boxes_in_guard) over
-        // front-end exit_layout types (from original MetaFailDescr).
-        let bridge_input_types: Vec<Type> =
-            backend_types.unwrap_or_else(|| fallback_types.to_vec());
-        let recorder = self.warm_state.start_retrace(&bridge_input_types);
+        // fail_descr has the UPDATED types (may include virtual field boxes).
+        // bridge_fail_descr_proxy already prefers backend types.
+        let bridge_input_types = fail_descr.fail_arg_types();
+        let recorder = self.warm_state.start_retrace(bridge_input_types);
         self.forced_virtualizable = None;
         self.force_finish_trace = false;
         self.tracing = Some(crate::trace_ctx::TraceCtx::new(recorder, green_key));
