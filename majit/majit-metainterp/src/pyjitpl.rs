@@ -5,9 +5,9 @@ use majit_backend::{
     Backend, CompiledTraceInfo, ExitFrameLayout, ExitRecoveryLayout, FailDescrLayout, JitCellToken,
     TerminalExitLayout,
 };
-#[cfg(all(not(target_arch = "wasm32"), not(feature = "dynasm")))]
+#[cfg(feature = "cranelift")]
 pub(crate) use majit_backend_cranelift::CraneliftBackend as BackendImpl;
-#[cfg(feature = "dynasm")]
+#[cfg(all(feature = "dynasm", not(feature = "cranelift")))]
 pub(crate) use majit_backend_dynasm::runner::DynasmBackend as BackendImpl;
 #[cfg(target_arch = "wasm32")]
 pub(crate) use majit_backend_wasm::WasmBackend as BackendImpl;
@@ -1103,8 +1103,12 @@ impl<M: Clone> MetaInterp<M> {
                 // target so call_assembler can resolve the pending token at
                 // runtime. call_assembler_fast_path detects null code_ptr and
                 // falls back to force_fn.
-                self.backend
-                    .register_pending_target(pending_num, input_types, num_inputs);
+                self.backend.register_pending_target(
+                    pending_num,
+                    input_types,
+                    num_inputs,
+                    self.num_scalar_inputargs,
+                );
                 if let Some(ref hook) = self.hooks.on_trace_start {
                     hook(green_key);
                 }
@@ -7152,10 +7156,12 @@ mod tests {
     use crate::resume::{FrameSlotSource, ReconstructedValue, ResolvedPendingFieldWrite};
     use majit_backend::DeadFrame;
     use majit_backend::{Backend, ExitFrameLayout, ExitRecoveryLayout, ExitValueSourceLayout};
+    #[cfg(feature = "cranelift")]
     use majit_backend_cranelift::compiler::{
         force_token_to_dead_frame, get_int_from_deadframe, get_latest_descr_from_deadframe,
         set_savedata_ref_on_deadframe,
     };
+    #[cfg(feature = "cranelift")]
     use majit_backend_cranelift::guard::CraneliftFailDescr;
     use majit_gc::collector::MiniMarkGC;
     use majit_ir::descr::{CallDescr, Descr, EffectInfo, ExtraEffect};
@@ -7278,10 +7284,12 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
+    #[cfg(feature = "cranelift")]
     fn with_forced_deadframe(force_token: i64, f: impl FnOnce(DeadFrame)) {
         f(force_token_to_dead_frame(GcRef(force_token as usize)));
     }
 
+    #[cfg(feature = "cranelift")]
     extern "C" fn maybe_force_and_return_void(force_token: i64, flag: i64) {
         if flag == 0 {
             return;
@@ -7302,6 +7310,7 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "cranelift")]
     fn attach_procedure_to_interp_entry(
         meta: &mut MetaInterp<()>,
         green_key: u64,
@@ -7382,6 +7391,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "cranelift")]
     fn install_may_force_void_entry(meta: &mut MetaInterp<()>, green_key: u64) {
         may_force_void_values()
             .lock()
@@ -7968,6 +7978,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "cranelift")]
     fn test_on_compile_bridge_fires() {
         // Parity with test_on_compile_bridge: after_compile_bridge hook fires
         // when a bridge is compiled.

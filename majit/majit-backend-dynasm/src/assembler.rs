@@ -26,6 +26,7 @@ use majit_backend::BackendError;
 use majit_ir::{FailDescr, InputArg, Op, OpCode, OpRef, Type};
 
 use crate::arch::*;
+use crate::codebuf;
 use crate::guard::DynasmFailDescr;
 
 /// Resolved argument: either a frame slot (frame-pointer-relative offset) or a constant.
@@ -100,6 +101,10 @@ pub struct Assembler386 {
     // ── State tracking for code generation ──
     /// Maps OpRef index → jitframe slot index.
     opref_to_slot: HashMap<u32, usize>,
+    /// resoperation.py Box.type parity: OpRef → Type for fail_arg_types
+    /// inference. Populated during code generation from input types and
+    /// op result types.
+    value_types: HashMap<u32, Type>,
     /// Constants: OpRef index (>= 10000) → i64 value.
     constants: HashMap<u32, i64>,
     /// Next available frame slot index.
@@ -110,6 +115,8 @@ pub struct Assembler386 {
     guard_success_cc: Option<u8>,
     /// Dynamic label for the LABEL op (back-edge target for JUMP).
     loop_label: Option<DynamicLabel>,
+    /// Buffer-relative offset of the LABEL op.
+    loop_label_offset: Option<AssemblyOffset>,
     /// llmodel.py:64-69 self.vtable_offset — typeptr field byte offset.
     /// `None` corresponds to RPython's gcremovetypeptr config.
     vtable_offset: Option<usize>,
@@ -118,9 +125,11 @@ pub struct Assembler386 {
     /// the gcremovetypeptr branch of `_cmp_guard_class`.
     classptr_to_typeid: HashMap<i64, u32>,
     /// Dynamic label at the function entry for self-recursive CALL_ASSEMBLER.
-    /// Used as the call target for recursive calls (relative call within
-    /// the same code buffer). Set by assemble_loop before _assemble.
     self_entry_label: Option<DynamicLabel>,
+    /// regalloc.py jump_target_descr parity: absolute address of the
+    /// LABEL in the original loop, for bridge JUMP to return to.
+    /// Set by assemble_bridge from the parent loop's label_addr.
+    jump_target_addr: Option<usize>,
 }
 
 /// assembler.py GuardToken — represents a pending guard needing
@@ -136,6 +145,9 @@ struct GuardToken {
     fail_descr: Arc<DynasmFailDescr>,
     /// Fail argument OpRefs for recovery (to save to sequential output slots).
     fail_args: Vec<OpRef>,
+    /// regalloc parity: snapshot of opref_to_slot at guard emission time.
+    /// Needed by recovery stubs to read fail_args from correct slots.
+    opref_to_slot_snapshot: HashMap<u32, usize>,
 }
 
 /// Compiled output from assemble_loop/assemble_bridge.
@@ -152,6 +164,14 @@ pub struct CompiledCode {
     pub trace_id: u64,
     /// header_pc (green_key).
     pub header_pc: u64,
+    /// Frame depth (number of jitframe slots used).
+    pub frame_depth: usize,
+    /// asmmemmgr.py parity: keep bridge ExecutableBuffers alive.
+    pub bridge_buffers: Vec<ExecutableBuffer>,
+    /// Absolute address of the LABEL op (loop body entry).
+    /// Used by bridge JUMP to return to the loop. RPython stores
+    /// this as TargetToken._ll_loop_code.
+    pub label_addr: usize,
 }
 
 impl Assembler386 {
@@ -173,13 +193,16 @@ impl Assembler386 {
             input_types: Vec::new(),
             bridge_source_slots: None,
             opref_to_slot: HashMap::new(),
+            value_types: HashMap::new(),
             constants,
             next_slot: 0,
             guard_success_cc: None,
             loop_label: None,
+            loop_label_offset: None,
             vtable_offset,
             classptr_to_typeid,
             self_entry_label: None,
+            jump_target_addr: None,
         }
     }
 
@@ -195,20 +218,26 @@ impl Assembler386 {
     }
 
     /// Resolve an OpRef to either a frame slot offset or an immediate constant.
+    /// Cranelift resolve_opref parity: check constants map FIRST
+    /// (regardless of CONST_BIT), then fall back to slot mapping.
     fn resolve_opref(&self, opref: OpRef) -> ResolvedArg {
-        if opref.is_constant() {
-            let val = self.constants.get(&opref.0).copied().unwrap_or(0);
-            ResolvedArg::Const(val)
-        } else if let Some(&slot) = self.opref_to_slot.get(&opref.0) {
-            ResolvedArg::Slot(Self::slot_offset(slot))
-        } else {
-            // Unmapped OpRef — treat as 0 (shouldn't happen in well-formed IR).
-            ResolvedArg::Const(0)
+        // Op results take precedence over constants (Cranelift parity).
+        if let Some(&slot) = self.opref_to_slot.get(&opref.0) {
+            return ResolvedArg::Slot(Self::slot_offset(slot));
         }
+        if let Some(&val) = self.constants.get(&opref.0) {
+            return ResolvedArg::Const(val);
+        }
+        // Unmapped OpRef — treat as 0.
+        ResolvedArg::Const(0)
     }
 
-    /// Allocate a new frame slot for an OpRef and return the slot index.
+    /// Allocate a frame slot for an OpRef and return the slot index.
+    /// Reuses existing slot if the OpRef already has one.
     fn allocate_slot(&mut self, opref: OpRef) -> usize {
+        if let Some(&existing) = self.opref_to_slot.get(&opref.0) {
+            return existing;
+        }
         let slot = self.next_slot;
         self.next_slot += 1;
         if self.next_slot + 1 > self.frame_depth {
@@ -322,22 +351,20 @@ impl Assembler386 {
         );
 
         if let Some(ref source_slots) = self.bridge_source_slots {
-            // Bridge: InputArgs are at the parent trace's jitframe slots.
-            // Map each bridge InputArg[i] to its source slot position.
             let mut max_slot = 0;
-            for (i, _ia) in inputargs.iter().enumerate() {
+            for (i, ia) in inputargs.iter().enumerate() {
                 let src_slot = source_slots.get(i).copied().unwrap_or(i);
                 self.opref_to_slot.insert(i as u32, src_slot);
+                self.value_types.insert(i as u32, ia.tp);
                 if src_slot >= max_slot {
                     max_slot = src_slot + 1;
                 }
             }
             self.next_slot = max_slot;
         } else {
-            // Loop: Input args are pre-loaded at jf_ptr[1..n+1].
-            // Map them to slots 0..n.
-            for (i, _ia) in inputargs.iter().enumerate() {
+            for (i, ia) in inputargs.iter().enumerate() {
                 self.opref_to_slot.insert(i as u32, i);
+                self.value_types.insert(i as u32, ia.tp);
             }
             self.next_slot = inputargs.len();
         }
@@ -392,14 +419,29 @@ impl Assembler386 {
         let entry = self.mc.offset();
         self._assemble(inputargs, ops)?;
 
+        // Post-pass: allocate slots for fail_arg OpRefs that were not
+        // emitted (virtuals/dead code). Must happen BEFORE recovery
+        // stubs so fail_arg_locs are correct in the stub code.
+        self.allocate_unmapped_fail_arg_slots();
+
         // assembler.py:553 write_pending_failure_recoveries
-        self.write_pending_failure_recoveries();
+        let stub_offsets = self.write_pending_failure_recoveries();
 
         // assembler.py:556 materialize_loop — finalize to executable memory
         let buffer = self
             .mc
             .finalize()
             .map_err(|_| BackendError::CompilationFailed("dynasm finalize failed".to_string()))?;
+
+        // assembler.py:849 patch_pending_failure_recoveries
+        let rawstart = codebuf::buffer_ptr(&buffer) as usize;
+        Self::patch_pending_failure_recoveries(rawstart, &stub_offsets);
+
+        // TargetToken._ll_loop_code parity: absolute address of the LABEL.
+        let label_addr = self
+            .loop_label_offset
+            .map(|off| rawstart + off.0)
+            .unwrap_or(0);
 
         Ok(CompiledCode {
             buffer,
@@ -408,7 +450,17 @@ impl Assembler386 {
             input_types: self.input_types,
             trace_id: self.trace_id,
             header_pc: self.header_pc,
+            frame_depth: self.frame_depth,
+            bridge_buffers: Vec::new(),
+            label_addr,
         })
+    }
+
+    /// Set the jump target address for bridge JUMP ops.
+    /// assembler.py closing_jump parity: bridge JUMP returns to
+    /// the original loop's LABEL via absolute address.
+    pub fn set_jump_target_addr(&mut self, addr: usize) {
+        self.jump_target_addr = Some(addr);
     }
 
     /// assembler.py:623 assemble_bridge: compile a bridge trace.
@@ -429,12 +481,16 @@ impl Assembler386 {
         // assembler.py:641 prepare_bridge
         let entry = self.mc.offset();
         self._assemble(inputargs, ops)?;
-        self.write_pending_failure_recoveries();
+        self.allocate_unmapped_fail_arg_slots();
+        let stub_offsets = self.write_pending_failure_recoveries();
 
         let buffer = self
             .mc
             .finalize()
             .map_err(|_| BackendError::CompilationFailed("dynasm finalize failed".to_string()))?;
+
+        let rawstart = codebuf::buffer_ptr(&buffer) as usize;
+        Self::patch_pending_failure_recoveries(rawstart, &stub_offsets);
 
         Ok(CompiledCode {
             buffer,
@@ -443,6 +499,9 @@ impl Assembler386 {
             input_types: self.input_types,
             trace_id: self.trace_id,
             header_pc: self.header_pc,
+            frame_depth: self.frame_depth,
+            bridge_buffers: Vec::new(),
+            label_addr: 0,
         })
     }
 
@@ -784,8 +843,38 @@ impl Assembler386 {
                     eprintln!("[dynasm] WARNING: unhandled opcode {:?}", op.opcode);
                 }
             }
+
+            // resoperation.py Box.type parity: record the result type
+            // for fail_arg_types inference.
+            if !op.pos.is_none() {
+                self.value_types.insert(op.pos.0, op.result_type());
+            }
         }
+
         Ok(())
+    }
+
+    /// Update fail_arg_locs on all pending guard descriptors.
+    /// Unmapped (virtual/dead) OpRefs get None — the resume system
+    /// handles them via rd_numb TAGVIRTUAL/TAGCONST encoding.
+    fn allocate_unmapped_fail_arg_slots(&mut self) {
+        for gt in &self.pending_guard_tokens {
+            let locs: Vec<Option<usize>> = gt
+                .fail_args
+                .iter()
+                .map(|opref| {
+                    if opref.is_none() || opref.is_constant() {
+                        None
+                    } else {
+                        self.opref_to_slot.get(&opref.0).copied()
+                    }
+                })
+                .collect();
+            unsafe {
+                let descr_mut = &mut *(Arc::as_ptr(&gt.fail_descr) as *mut DynasmFailDescr);
+                descr_mut.fail_arg_locs = locs;
+            }
+        }
     }
 
     // ----------------------------------------------------------------
@@ -805,8 +894,15 @@ impl Assembler386 {
     ///
     /// In our frame-slot approach (no regalloc), all values are already
     /// in the jitframe. Recovery only needs to store jf_descr and return.
-    fn write_pending_failure_recoveries(&mut self) {
+    /// assembler.py:835 write_pending_failure_recoveries +
+    /// assembler.py:849 patch_pending_failure_recoveries.
+    /// Returns recovery stub offsets for post-finalize address fixup.
+    fn write_pending_failure_recoveries(&mut self) -> Vec<(Arc<DynasmFailDescr>, usize)> {
+        let mut stub_offsets = Vec::new();
         for guard_token in std::mem::take(&mut self.pending_guard_tokens) {
+            // assembler.py:845 pos_recovery_stub = generate_quick_failure
+            let stub_start = self.mc.offset();
+
             // Bind the fail_label — guard's Jcc lands here.
             let fail_label = guard_token.fail_label;
             #[cfg(target_arch = "x86_64")]
@@ -814,9 +910,10 @@ impl Assembler386 {
             #[cfg(target_arch = "aarch64")]
             dynasm!(self.mc ; .arch aarch64 ; =>fail_label);
 
-            // assembler.py:2087 _push_all_regs_to_frame:
-            // All values are already in jitframe slots (no registers to flush).
-            // When we add regalloc, this is where we'd flush registers.
+            // RPython: _push_all_regs_to_frame. In our frame-slot model,
+            // values are already in their natural slots. No reordering
+            // in the stub — get_int_value/get_ref_value/get_float_value
+            // use fail_arg_locs to read from the correct slot.
 
             // assembler.py:2106-2107: store jf_descr
             let descr_ptr = Arc::as_ptr(&guard_token.fail_descr) as i64;
@@ -837,11 +934,20 @@ impl Assembler386 {
             // assembler.py:2112 _call_footer — return jf_ptr
             self._call_footer();
 
-            // assembler.py:987 — store adr_jump_offset on the descriptor.
-            let recovery_offset = self.mc.offset();
-            guard_token
-                .fail_descr
-                .set_adr_jump_offset(recovery_offset.0);
+            stub_offsets.push((guard_token.fail_descr, stub_start.0));
+        }
+        stub_offsets
+    }
+
+    /// assembler.py:849 patch_pending_failure_recoveries — convert
+    /// buffer-relative offsets to absolute addresses after finalize.
+    fn patch_pending_failure_recoveries(
+        rawstart: usize,
+        stub_offsets: &[(Arc<DynasmFailDescr>, usize)],
+    ) {
+        for (descr, stub_offset) in stub_offsets {
+            let abs_addr = rawstart + stub_offset;
+            descr.set_adr_jump_offset(abs_addr);
         }
     }
 
@@ -849,104 +955,91 @@ impl Assembler386 {
     // assembler.py:965-987 patch_jump_for_descr
     // ----------------------------------------------------------------
 
-    /// assembler.py:965 patch_jump_for_descr: redirect a guard's
-    /// conditional jump to the bridge at adr_new_target.
+    /// assembler.py:965 patch_jump_for_descr: redirect a guard to a
+    /// bridge by overwriting the recovery stub with a JMP to bridge.
+    ///
+    /// `adr_jump_offset` is the absolute address of the recovery stub
+    /// (set by patch_pending_failure_recoveries). We overwrite the
+    /// stub with "MOV r11, bridge_addr; JMP r11" (x64) or "B imm26"
+    /// (aarch64).
     pub fn patch_jump_for_descr(descr: &DynasmFailDescr, adr_new_target: usize) {
-        let adr_jump_offset = descr.adr_jump_offset();
-        assert!(adr_jump_offset != 0, "guard already patched");
+        let stub_addr = descr.adr_jump_offset();
+        assert!(stub_addr != 0, "guard already patched");
 
-        #[cfg(target_arch = "x86_64")]
-        {
-            // assembler.py:968 — x86_64: patch rel32 offset
-            let offset = adr_new_target as isize - (adr_jump_offset as isize + 4);
-
-            if offset >= i32::MIN as isize && offset <= i32::MAX as isize {
-                // assembler.py:976-977: fits in rel32 — patch directly
-                let patch_ptr = adr_jump_offset as *mut i32;
-                unsafe { patch_ptr.write(offset as i32) };
-            } else {
-                // assembler.py:982-986: long jump — patch recovery stub
-                // with MOV r11, addr; JMP r11 (13 bytes)
-                let stub_target = adr_jump_offset as isize
-                    + 4
-                    + unsafe { *(adr_jump_offset as *const i32) } as isize;
-                let stub_ptr = stub_target as *mut u8;
-                // MOV r11, imm64 (10 bytes) + JMP r11 (3 bytes)
-                unsafe {
-                    // REX.W + MOV r11, imm64: 49 BB <imm64>
-                    *stub_ptr = 0x49;
-                    *stub_ptr.add(1) = 0xBB;
-                    (stub_ptr.add(2) as *mut u64).write(adr_new_target as u64);
-                    // JMP r11: 41 FF E3
-                    *stub_ptr.add(10) = 0x41;
-                    *stub_ptr.add(11) = 0xFF;
-                    *stub_ptr.add(12) = 0xE3;
+        codebuf::with_writable(stub_addr as *mut u8, 16, || {
+            #[cfg(target_arch = "x86_64")]
+            {
+                let stub_ptr = stub_addr as *mut u8;
+                let offset = adr_new_target as isize - (stub_addr as isize + 5);
+                if offset >= i32::MIN as isize && offset <= i32::MAX as isize {
+                    unsafe {
+                        *stub_ptr = 0xE9;
+                        (stub_ptr.add(1) as *mut i32).write(offset as i32);
+                    }
+                } else {
+                    unsafe {
+                        *stub_ptr = 0x49;
+                        *stub_ptr.add(1) = 0xBB;
+                        (stub_ptr.add(2) as *mut u64).write(adr_new_target as u64);
+                        *stub_ptr.add(10) = 0x41;
+                        *stub_ptr.add(11) = 0xFF;
+                        *stub_ptr.add(12) = 0xE3;
+                    }
                 }
             }
-        }
+
+            #[cfg(target_arch = "aarch64")]
+            {
+                let offset = adr_new_target as isize - stub_addr as isize;
+                let imm26 = ((offset >> 2) & 0x03FF_FFFF) as u32;
+                let insn = 0x1400_0000 | imm26;
+                unsafe { (stub_addr as *mut u32).write(insn) };
+            }
+        });
 
         #[cfg(target_arch = "aarch64")]
-        {
-            // aarch64: patch B (branch) instruction with new offset.
-            // B instruction: bits [25:0] = imm26 (signed, * 4 byte units)
-            let offset = adr_new_target as isize - adr_jump_offset as isize;
-            let imm26 = (offset >> 2) & 0x03FF_FFFF;
-            let patch_ptr = adr_jump_offset as *mut u32;
-            unsafe {
-                let old_insn = patch_ptr.read();
-                // Preserve opcode bits, replace imm26
-                let new_insn = (old_insn & 0xFC00_0000) | (imm26 as u32);
-                patch_ptr.write(new_insn);
-            }
-            flush_icache(adr_jump_offset as *const u8, 4);
-        }
+        flush_icache(stub_addr as *const u8, 16);
 
         // assembler.py:987
         descr.set_adr_jump_offset(0); // "patched"
-
-        #[cfg(target_arch = "aarch64")]
-        flush_icache(adr_jump_offset as *const u8, 16);
     }
 
     /// assembler.py:1138 redirect_call_assembler: patch old loop entry
     /// to JMP to new loop after retrace.
     pub fn redirect_call_assembler(old_addr: *const u8, new_addr: *const u8) {
-        #[cfg(target_arch = "x86_64")]
-        {
-            // assembler.py:1153 JMP imm — overwrite old entry with JMP to new
-            let old_ptr = old_addr as *mut u8;
-            let offset = new_addr as isize - (old_addr as isize + 5); // JMP rel32 is 5 bytes
-
-            if offset >= i32::MIN as isize && offset <= i32::MAX as isize {
-                unsafe {
-                    // JMP rel32: E9 <rel32>
-                    *old_ptr = 0xE9;
-                    (old_ptr.add(1) as *mut i32).write(offset as i32);
-                }
-            } else {
-                unsafe {
-                    // MOV r11, imm64 (10 bytes) + JMP r11 (3 bytes) = 13 bytes
-                    *old_ptr = 0x49;
-                    *old_ptr.add(1) = 0xBB;
-                    (old_ptr.add(2) as *mut u64).write(new_addr as u64);
-                    *old_ptr.add(10) = 0x41;
-                    *old_ptr.add(11) = 0xFF;
-                    *old_ptr.add(12) = 0xE3;
+        codebuf::with_writable(old_addr as *mut u8, 16, || {
+            #[cfg(target_arch = "x86_64")]
+            {
+                let old_ptr = old_addr as *mut u8;
+                let offset = new_addr as isize - (old_addr as isize + 5);
+                if offset >= i32::MIN as isize && offset <= i32::MAX as isize {
+                    unsafe {
+                        *old_ptr = 0xE9;
+                        (old_ptr.add(1) as *mut i32).write(offset as i32);
+                    }
+                } else {
+                    unsafe {
+                        *old_ptr = 0x49;
+                        *old_ptr.add(1) = 0xBB;
+                        (old_ptr.add(2) as *mut u64).write(new_addr as u64);
+                        *old_ptr.add(10) = 0x41;
+                        *old_ptr.add(11) = 0xFF;
+                        *old_ptr.add(12) = 0xE3;
+                    }
                 }
             }
-        }
+
+            #[cfg(target_arch = "aarch64")]
+            {
+                let offset = new_addr as isize - old_addr as isize;
+                let imm26 = ((offset >> 2) & 0x03FF_FFFF) as u32;
+                let insn = 0x1400_0000 | imm26;
+                unsafe { (old_addr as *mut u32).write(insn) };
+            }
+        });
 
         #[cfg(target_arch = "aarch64")]
-        {
-            // aarch64: overwrite old entry with B (unconditional branch)
-            let offset = new_addr as isize - old_addr as isize;
-            let old_ptr = old_addr as *mut u32;
-            let imm26 = ((offset >> 2) & 0x03FF_FFFF) as u32;
-            // B imm26: 0001_01 + imm26
-            let insn = 0x1400_0000 | imm26;
-            unsafe { old_ptr.write(insn) };
-            flush_icache(old_addr, 4);
-        }
+        flush_icache(old_addr, 4);
     }
 
     // ----------------------------------------------------------------
@@ -1471,29 +1564,45 @@ impl Assembler386 {
     /// Common tail: build DynasmFailDescr, create GuardToken, push to
     /// pending_guard_tokens and fail_descrs.
     fn append_guard_token(&mut self, op: &Op, fail_index: u32, fail_label: DynamicLabel) {
-        let fail_arg_types = op
-            .fail_arg_types
-            .as_ref()
-            .map(|ts| ts.clone())
-            .unwrap_or_default();
+        // resoperation.py Box.type parity: infer fail_arg_types from
+        // value_types if not explicitly set on the Op.
+        let fail_arg_types = if let Some(ref ts) = op.fail_arg_types {
+            ts.clone()
+        } else if let Some(ref fa) = op.fail_args {
+            fa.iter()
+                .map(|opref| {
+                    if opref.is_none() {
+                        Type::Ref
+                    } else {
+                        self.value_types.get(&opref.0).copied().unwrap_or(Type::Ref)
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let fail_args = op
             .fail_args
             .as_ref()
             .map(|fa| fa.to_vec())
             .unwrap_or_default();
-        // Record slot positions for each fail_arg so bridge compilation
-        // can read InputArgs from the correct jitframe offsets.
-        let fail_args_slots: Vec<usize> = fail_args
+        // regalloc parity: fail_arg_locs + fail_args_slots
+        let fail_arg_locs: Vec<Option<usize>> = fail_args
             .iter()
-            .map(|&opref| {
+            .map(|opref| {
                 if opref.is_none() || opref.is_constant() {
-                    0
+                    None
                 } else {
-                    self.opref_to_slot.get(&opref.0).copied().unwrap_or(0)
+                    self.opref_to_slot.get(&opref.0).copied()
                 }
             })
             .collect();
+        let fail_args_slots: Vec<usize> = fail_arg_locs
+            .iter()
+            .map(|loc| loc.unwrap_or(0))
+            .collect();
         let mut descr = DynasmFailDescr::new(fail_index, self.trace_id, fail_arg_types, false);
+        descr.fail_arg_locs = fail_arg_locs;
         descr.fail_args_slots = fail_args_slots;
         let descr = Arc::new(descr);
         let jump_offset = self.mc.offset();
@@ -1502,6 +1611,7 @@ impl Assembler386 {
             fail_label,
             fail_descr: descr.clone(),
             fail_args,
+            opref_to_slot_snapshot: self.opref_to_slot.clone(),
         });
         self.fail_descrs.push(descr);
     }
@@ -1510,10 +1620,24 @@ impl Assembler386 {
     // assembler.py:1773 genop_guard_guard_true
     // ----------------------------------------------------------------
 
+    /// regalloc.py:429 load_condition_into_cc — if guard_success_cc
+    /// is not yet set, emit TEST arg0 and set cc = NZ.
+    fn load_condition_into_cc(&mut self, op: &Op) {
+        if self.guard_success_cc.is_none() {
+            self.load_arg_to_rax(op.arg(0));
+            #[cfg(target_arch = "x86_64")]
+            dynasm!(self.mc ; .arch x64 ; test rax, rax);
+            #[cfg(target_arch = "aarch64")]
+            dynasm!(self.mc ; .arch aarch64 ; cmp x0, 0);
+            self.guard_success_cc = Some(CC_NE); // rx86.Conditions['NZ']
+        }
+    }
+
     /// assembler.py:1773 genop_guard_guard_true.
     /// genop_guard_guard_nonnull = genop_guard_guard_true (alias)
     /// genop_guard_guard_no_overflow = genop_guard_guard_true (alias)
     fn genop_guard_guard_true(&mut self, op: &Op, fail_index: u32) {
+        self.load_condition_into_cc(op);
         self.implement_guard(op, fail_index);
     }
 
@@ -1521,7 +1645,8 @@ impl Assembler386 {
     /// genop_guard_guard_isnull = genop_guard_guard_false (alias)
     /// genop_guard_guard_overflow = genop_guard_guard_false (alias)
     fn genop_guard_guard_false(&mut self, op: &Op, fail_index: u32) {
-        self.guard_success_cc = Some(invert_cc(self.guard_success_cc.take().unwrap_or(CC_NE)));
+        self.load_condition_into_cc(op);
+        self.guard_success_cc = Some(invert_cc(self.guard_success_cc.take().unwrap()));
         self.implement_guard(op, fail_index);
     }
 
@@ -1624,116 +1749,254 @@ impl Assembler386 {
     // ----------------------------------------------------------------
 
     /// LABEL: define the back-edge target for JUMP.
-    /// Remap Label's args to canonical slots 0..n so JUMP can write
-    /// back to slots 0..n and the body reads from the same slots.
-    /// Also emit code to copy values from old slots to new canonical slots.
+    ///
+    /// RPython: LABEL does NOT emit code. The regalloc establishes
+    /// the slot mapping. JUMP handles slot remapping.
+    ///
+    /// In our frame-slot model: preamble values may be in non-canonical
+    /// slots. We emit copies from old→canonical slots BEFORE the
+    /// LABEL binding, so they execute only on first entry from the
+    /// preamble. JUMP writes directly to canonical slots and jumps
+    /// to the LABEL, skipping the copies.
     fn genop_label(&mut self, op: &Op) {
-        // First, emit moves from old slots to new canonical slots.
-        // This is needed because the preamble may have allocated
-        // values to non-canonical slots (e.g., OpRef(13) at slot 5).
-        // The body expects them at canonical slots (slot 1).
-        for (i, &arg_ref) in op.args.iter().enumerate() {
-            if arg_ref.is_none() || arg_ref.is_constant() {
-                continue;
-            }
-            let new_offset = Self::slot_offset(i);
-            if let Some(&old_slot) = self.opref_to_slot.get(&arg_ref.0) {
-                let old_offset = Self::slot_offset(old_slot);
-                if old_offset != new_offset {
-                    // Copy value from old slot to new canonical slot.
-                    #[cfg(target_arch = "x86_64")]
-                    dynasm!(self.mc ; .arch x64
-                        ; mov rax, [rbp + old_offset]
-                        ; mov [rbp + new_offset], rax
-                    );
-                    #[cfg(target_arch = "aarch64")]
-                    dynasm!(self.mc ; .arch aarch64
-                        ; ldr x0, [x29, old_offset as u32]
-                        ; str x0, [x29, new_offset as u32]
-                    );
+        // Emit preamble→canonical copies BEFORE the label.
+        // Two-pass push/pop: safely handles slot overlaps.
+        let n_label = op.args.len();
+        // Pass 1: push source values
+        for i in 0..n_label {
+            let arg_ref = op.args[i];
+            if arg_ref.is_none() {
+                let dst = Self::slot_offset(i);
+                #[cfg(target_arch = "x86_64")]
+                dynasm!(self.mc ; .arch x64 ; push QWORD [rbp + dst]);
+                #[cfg(target_arch = "aarch64")]
+                dynasm!(self.mc ; .arch aarch64 ; ldr x0, [x29, dst as u32] ; str x0, [sp, #-16]!);
+            } else if arg_ref.is_constant() {
+                let val = self.constants.get(&arg_ref.0).copied().unwrap_or(0);
+                #[cfg(target_arch = "x86_64")]
+                {
+                    dynasm!(self.mc ; .arch x64 ; mov rax, QWORD val as i64 ; push rax);
                 }
+                #[cfg(target_arch = "aarch64")]
+                {
+                    self.emit_mov_imm64(0, val);
+                    dynasm!(self.mc ; .arch aarch64 ; str x0, [sp, #-16]!);
+                }
+            } else if let Some(&old_slot) = self.opref_to_slot.get(&arg_ref.0) {
+                let src = Self::slot_offset(old_slot);
+                #[cfg(target_arch = "x86_64")]
+                dynasm!(self.mc ; .arch x64 ; push QWORD [rbp + src]);
+                #[cfg(target_arch = "aarch64")]
+                dynasm!(self.mc ; .arch aarch64 ; ldr x0, [x29, src as u32] ; str x0, [sp, #-16]!);
+            } else {
+                #[cfg(target_arch = "x86_64")]
+                dynasm!(self.mc ; .arch x64 ; push 0);
+                #[cfg(target_arch = "aarch64")]
+                dynasm!(self.mc ; .arch aarch64 ; str xzr, [sp, #-16]!);
             }
         }
-        // Now remap: Label's arg[i] → slot i
+        // Pass 2: pop in reverse into canonical slots
+        for i in (0..n_label).rev() {
+            let dst = Self::slot_offset(i);
+            #[cfg(target_arch = "x86_64")]
+            dynasm!(self.mc ; .arch x64 ; pop QWORD [rbp + dst]);
+            #[cfg(target_arch = "aarch64")]
+            dynasm!(self.mc ; .arch aarch64 ; ldr x0, [sp], #16 ; str x0, [x29, dst as u32]);
+        }
+
+        // Bind the LABEL — JUMP targets here (after the copies).
+        let label = self.mc.new_dynamic_label();
+        #[cfg(target_arch = "x86_64")]
+        dynasm!(self.mc ; .arch x64 ; =>label);
+        #[cfg(target_arch = "aarch64")]
+        dynasm!(self.mc ; .arch aarch64 ; =>label);
+        self.loop_label = Some(label);
+        self.loop_label_offset = Some(self.mc.offset());
+
+        // Remap: Label's arg[i] → canonical slot i
         for (i, &arg_ref) in op.args.iter().enumerate() {
             if !arg_ref.is_none() {
                 self.opref_to_slot.insert(arg_ref.0, i);
             }
         }
         self.next_slot = self.next_slot.max(op.args.len());
+    }
 
-        let label = self.mc.new_dynamic_label();
-        #[cfg(target_arch = "x86_64")]
-        dynasm!(self.mc
-            ; .arch x64
-            ; =>label
-        );
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64
-            ; =>label
-        );
-        self.loop_label = Some(label);
+    /// jump.py:66 _move: emit a single slot-to-slot or const-to-slot move.
+    fn emit_slot_move(&mut self, src: i32, dst: i32, is_const: bool, val: i64) {
+        if is_const {
+            #[cfg(target_arch = "x86_64")]
+            dynasm!(self.mc ; .arch x64
+                ; mov rax, QWORD val
+                ; mov [rbp + dst], rax
+            );
+            #[cfg(target_arch = "aarch64")]
+            {
+                self.emit_mov_imm64(0, val);
+                dynasm!(self.mc ; .arch aarch64 ; str x0, [x29, dst as u32]);
+            }
+        } else if src != dst {
+            #[cfg(target_arch = "x86_64")]
+            dynasm!(self.mc ; .arch x64
+                ; mov rax, [rbp + src]
+                ; mov [rbp + dst], rax
+            );
+            #[cfg(target_arch = "aarch64")]
+            dynasm!(self.mc ; .arch aarch64
+                ; ldr x0, [x29, src as u32]
+                ; str x0, [x29, dst as u32]
+            );
+        }
     }
 
     /// JUMP: unconditional branch to the loop label.
+    /// jump.py:1 remap_frame_layout parity: parallel move algorithm
+    /// to handle cyclic slot dependencies.
     fn genop_jump(&mut self, op: &Op) {
-        // Before jumping, write JUMP args back to their canonical input slots.
+        // Build src→dst move list.
+        // Each entry: (src_offset_or_const, dst_offset, is_const, const_val)
+        let n = op.args.len();
+        let mut moves: Vec<(i32, i32, bool, i64)> = Vec::with_capacity(n);
         for (i, &arg_ref) in op.args.iter().enumerate() {
-            let dst_offset = Self::slot_offset(i);
+            let dst = Self::slot_offset(i);
             match self.resolve_opref(arg_ref) {
-                ResolvedArg::Slot(src_offset) => {
-                    if src_offset != dst_offset {
-                        #[cfg(target_arch = "x86_64")]
-                        dynasm!(self.mc
-                            ; .arch x64
-                            ; mov rax, [rbp + src_offset]
-                            ; mov [rbp + dst_offset], rax
-                        );
-                        #[cfg(target_arch = "aarch64")]
-                        dynasm!(self.mc ; .arch aarch64
-                            ; ldr x0, [x29, src_offset as u32]
-                            ; str x0, [x29, dst_offset as u32]
-                        );
-                    }
+                ResolvedArg::Slot(src) => moves.push((src, dst, false, 0)),
+                ResolvedArg::Const(val) => moves.push((0, dst, true, val)),
+            }
+        }
+
+        // jump.py:1-64 remap_frame_layout: topological order with
+        // cycle breaking via push/pop.
+        // srccount[dst] = number of times dst appears as a src
+        let mut srccount: HashMap<i32, i32> = HashMap::new();
+        for m in &moves {
+            srccount.entry(m.1).or_insert(0); // ensure dst exists
+        }
+        let mut pending = n as i32;
+        for (i, m) in moves.iter().enumerate() {
+            if m.2 {
+                continue;
+            } // constant → no src dependency
+            let src = m.0;
+            if let Some(cnt) = srccount.get_mut(&src) {
+                if src == moves[i].1 {
+                    // self-move: skip
+                    *cnt = -(n as i32) - 1;
+                    pending -= 1;
+                } else {
+                    *cnt += 1;
                 }
-                ResolvedArg::Const(val) => {
-                    #[cfg(target_arch = "x86_64")]
-                    dynasm!(self.mc
-                        ; .arch x64
-                        ; mov rax, QWORD val as i64
-                        ; mov [rbp + dst_offset], rax
-                    );
-                    #[cfg(target_arch = "aarch64")]
-                    {
-                        self.emit_mov_imm64(0, val);
-                        dynasm!(self.mc ; .arch aarch64
-                            ; str x0, [x29, dst_offset as u32]
-                        );
+            }
+        }
+
+        while pending > 0 {
+            let mut progress = false;
+            for i in 0..n {
+                let dst = moves[i].1;
+                if srccount.get(&dst).copied().unwrap_or(-1) == 0 {
+                    *srccount.get_mut(&dst).unwrap() = -1; // done
+                    pending -= 1;
+                    if !moves[i].2 {
+                        let src = moves[i].0;
+                        if let Some(cnt) = srccount.get_mut(&src) {
+                            *cnt -= 1;
+                        }
+                    }
+                    self.emit_slot_move(moves[i].0, dst, moves[i].2, moves[i].3);
+                    progress = true;
+                }
+            }
+            if !progress {
+                // Cycle: use push/pop to break it.
+                for i in 0..n {
+                    let dst = moves[i].1;
+                    if srccount.get(&dst).copied().unwrap_or(-1) >= 0 {
+                        // Push first dst in the cycle
+                        #[cfg(target_arch = "x86_64")]
+                        dynasm!(self.mc ; .arch x64 ; push QWORD [rbp + dst]);
+                        #[cfg(target_arch = "aarch64")]
+                        {
+                            dynasm!(self.mc ; .arch aarch64
+                                ; ldr x0, [x29, dst as u32]
+                                ; str x0, [sp, #-16]!
+                            );
+                        }
+                        // Walk the cycle
+                        let mut cur = i;
+                        loop {
+                            let cd = moves[cur].1;
+                            *srccount.get_mut(&cd).unwrap() = -1;
+                            pending -= 1;
+                            // Find the move whose dst is this src
+                            let src = moves[cur].0;
+                            let next = moves.iter().position(|m| m.1 == src);
+                            if let Some(ni) = next {
+                                if srccount.get(&moves[ni].1).copied().unwrap_or(-1) < 0 {
+                                    // End of cycle: pop into this slot
+                                    #[cfg(target_arch = "x86_64")]
+                                    dynasm!(self.mc ; .arch x64 ; pop QWORD [rbp + cd]);
+                                    #[cfg(target_arch = "aarch64")]
+                                    {
+                                        dynasm!(self.mc ; .arch aarch64
+                                            ; ldr x0, [sp], #16
+                                            ; str x0, [x29, cd as u32]
+                                        );
+                                    }
+                                    break;
+                                }
+                                self.emit_slot_move(src, cd, false, 0);
+                                cur = ni;
+                            } else {
+                                // No cycle found — emit move and break
+                                self.emit_slot_move(moves[cur].0, cd, moves[cur].2, moves[cur].3);
+                                break;
+                            }
+                        }
                     }
                 }
             }
         }
 
         if let Some(label) = self.loop_label {
+            // Same-buffer jump (loop body)
             #[cfg(target_arch = "x86_64")]
-            dynasm!(self.mc
-                ; .arch x64
-                ; jmp =>label
-            );
+            dynasm!(self.mc ; .arch x64 ; jmp =>label);
             #[cfg(target_arch = "aarch64")]
-            dynasm!(self.mc ; .arch aarch64
-                ; b =>label
-            );
+            dynasm!(self.mc ; .arch aarch64 ; b =>label);
+        } else if let Some(target) = self.jump_target_addr {
+            // assembler.py closing_jump parity: bridge jumps back to
+            // the original loop's LABEL via absolute address.
+            #[cfg(target_arch = "x86_64")]
+            {
+                let addr = target as i64;
+                dynasm!(self.mc ; .arch x64
+                    ; mov rax, QWORD addr
+                    ; jmp rax
+                );
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                self.emit_mov_imm64(0, target as i64);
+                dynasm!(self.mc ; .arch aarch64 ; br x0);
+            }
         }
     }
 
     /// FINISH: store result (if any), store descr ptr, return jf_ptr.
     fn genop_finish(&mut self, op: &Op, fail_index: u32) {
-        let fail_arg_types = op
-            .fail_arg_types
-            .as_ref()
-            .map(|ts| ts.clone())
-            .unwrap_or_default();
+        // Infer fail_arg_types for FINISH result (same as guard inference).
+        let fail_arg_types = if let Some(ref ts) = op.fail_arg_types {
+            ts.clone()
+        } else if op.num_args() > 0 {
+            vec![
+                self.value_types
+                    .get(&op.arg(0).0)
+                    .copied()
+                    .unwrap_or(Type::Int),
+            ]
+        } else {
+            Vec::new()
+        };
         // compile.py:665-674 parity: use global singleton for Finish descr.
         let descr = Arc::new(DynasmFailDescr::new(
             fail_index,
@@ -1789,9 +2052,16 @@ impl Assembler386 {
     // ----------------------------------------------------------------
 
     /// SAME_AS: result = arg0 (copy value)
+    /// SAME_AS: result = arg0 (identity).
+    /// regalloc.py parity: no code emitted — just alias the slot.
     fn genop_same_as(&mut self, op: &Op) {
-        self.load_arg_to_rax(op.arg(0));
-        self.store_rax_to_result(op.pos);
+        let arg = op.arg(0);
+        if let Some(&slot) = self.opref_to_slot.get(&arg.0) {
+            self.opref_to_slot.insert(op.pos.0, slot);
+        } else {
+            self.load_arg_to_rax(arg);
+            self.store_rax_to_result(op.pos);
+        }
     }
 
     // ----------------------------------------------------------------

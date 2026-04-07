@@ -7,7 +7,9 @@ repository.workspace = true
 description = "Meta-interpreter and optimizer for majit JIT compiler"
 
 [features]
+default = ["cranelift"]
 dynasm = ["dep:majit-backend-dynasm"]
+cranelift = ["dep:majit-backend-cranelift"]
 
 [dependencies]
 majit-ir = { workspace = true }
@@ -17,7 +19,7 @@ majit-gc = { workspace = true }
 majit-backend-dynasm = { workspace = true, optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-majit-backend-cranelift = { workspace = true }
+majit-backend-cranelift = { workspace = true, optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 majit-backend-wasm = { workspace = true }

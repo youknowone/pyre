@@ -2017,6 +2017,7 @@ pub fn register_pending_call_assembler_target(
     token_number: u64,
     inputarg_types: Vec<Type>,
     num_inputs: usize,
+    num_scalar_inputargs: usize,
 ) {
     let target = RegisteredLoopTarget {
         trace_id: 0,
@@ -2031,7 +2032,7 @@ pub fn register_pending_call_assembler_target(
         num_ref_roots: 0,
         max_output_slots: 1,
         inputarg_types,
-        num_scalar_inputargs: 0, // Updated by register_call_assembler_target
+        num_scalar_inputargs,
     };
     call_assembler_registry()
         .lock()
@@ -10060,8 +10061,14 @@ impl majit_backend::Backend for CraneliftBackend {
         token_number: u64,
         input_types: Vec<majit_ir::Type>,
         num_inputs: usize,
+        num_scalar_inputargs: usize,
     ) {
-        register_pending_call_assembler_target(token_number, input_types, num_inputs);
+        register_pending_call_assembler_target(
+            token_number,
+            input_types,
+            num_inputs,
+            num_scalar_inputargs,
+        );
     }
 
     fn compile_bridge(

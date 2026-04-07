@@ -1,8 +1,20 @@
 #!/bin/bash
 # pyre pre-merge check: correctness + regression guard + comparison
-# Usage: ./pyre/check.sh [path/to/pyre]
+# Usage: ./pyre/check.sh [--backend dynasm|cranelift] [path/to/pyre]
 
 set -euo pipefail
+
+BACKEND=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --backend)
+            BACKEND="$2"; shift 2 ;;
+        --backend=*|backend=*)
+            BACKEND="${1#*=}"; shift ;;
+        *)
+            break ;;
+    esac
+done
 
 PYRE="${1:-./target/release/pyre}"
 BENCH=pyre/bench
@@ -11,8 +23,15 @@ FAIL=0
 RESULTS=()
 COMPARISONS=()
 
-echo "Building pyre (release)..."
-cargo build --release -p pyrex 2>&1 | tail -1
+CARGO_EXTRA=""
+case "$BACKEND" in
+    dynasm)    CARGO_EXTRA="--no-default-features --features dynasm" ;;
+    cranelift|"") ;;  # cranelift is default
+    *) echo "ERROR: unknown backend '$BACKEND' (use: dynasm, cranelift)"; exit 1 ;;
+esac
+
+echo "Building pyre (release, backend=${BACKEND:-cranelift})..."
+cargo build --release -p pyrex $CARGO_EXTRA 2>&1 | tail -1
 
 if [ ! -x "$PYRE" ]; then
     echo "ERROR: build failed"
@@ -125,7 +144,7 @@ run_bench() {
 
 echo ""
 bold "pyre pre-merge check"; echo ""
-echo "binary: $PYRE"
+echo "binary: $PYRE  backend: ${BACKEND:-dynasm}"
 echo ""
 
 # Warm up: cold run to prime disk/CPU caches (results discarded)
