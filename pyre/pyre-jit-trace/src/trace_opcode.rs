@@ -1428,27 +1428,38 @@ impl MIFrame {
         }
 
         // pyjitpl.py:510-520 goto_if_not(box, target, orgpc):
-        // RPython's goto_if_not is a compound opcode (jtransform.py:196
-        // optimize_goto_if_not merges comparison + branch). resumepc=orgpc
-        // points to the compound opcode; blackhole.py:865 bhimpl_goto_if_not
-        // re-evaluates the condition and takes the other path.
+        //   self.metainterp.generate_guard(opnum, box, resumepc=orgpc)
+        // blackhole.py:864 bhimpl_goto_if_not(a, target, pc) re-pops the
+        // truth from a register and re-decides which arm to take.
         //
-        // pyre has separate COMPARE_OP + POP_JUMP_IF_FALSE (Python bytecodes).
-        // Using COMPARE_OP's pc as resumepc is infeasible because:
-        //   1. The JIT may have unboxed comparison operands (Int OpRefs),
-        //      but the Python interpreter's COMPARE_OP expects boxed
-        //      PyObject values on the stack. Re-executing COMPARE_OP with
-        //      raw ints causes a type mismatch crash.
-        //   2. RPython avoids this because both JIT bytecode AND blackhole
-        //      operate on the same unboxed register representation.
+        // RPython's goto_if_not is a compound jitcode opcode produced by
+        // jtransform.optimize_goto_if_not (jtransform.py:196): COMPARE_OP +
+        // GOTO_IF_NOT are fused into a single op that takes the comparison
+        // operands directly and branches. The trace's "register" for the
+        // truth and the jitcode's "register" agree on type (int).
         //
-        // INTENTIONAL ADAPTATION (not source parity):
-        // Use other_target (the not-taken branch destination) so the
-        // blackhole starts at the correct path without re-comparing.
-        // This achieves the same behavioral result as RPython's
-        // goto_if_not but is NOT structurally equivalent — RPython
-        // uses resumepc=orgpc with a compound opcode, pyre uses a
-        // direct jump to the alternate branch target.
+        // Pyre has separate Python bytecodes for COMPARE_OP and
+        // POP_JUMP_IF_FALSE. The trace records them via
+        // last_comparison_truth/last_comparison_concrete_truth which is a
+        // trace-time emulation of the fused op, but the codewriter still
+        // generates two separate JitCode opcodes for the blackhole, and the
+        // POP_JUMP_IF_FALSE jitcode reads a Ref (boxed PyBool) from the
+        // PyFrame stack via move_r + call_int_typed(truth_fn). If we used
+        // orgpc as the resume_pc, the snapshot at orgpc would carry the
+        // symbolic stack top — which is a Type::Int raw truth from
+        // trace_compare_value's fast path, not a Ref — and the blackhole
+        // would call truth_fn on a raw int (NULL pointer dereference).
+        //
+        // ADAPTATION (pending fused jitcode opcode infrastructure):
+        // Resume at other_target (the runtime branch destination) so the
+        // blackhole skips POP_JUMP_IF_FALSE entirely and re-enters the
+        // interpreter at the not-taken branch. The truth never has to be
+        // restored — its only role was to pick the resume_pc at trace time.
+        // True line-by-line parity requires implementing
+        // jtransform.optimize_goto_if_not at pyre's codewriter level: a
+        // fused goto_if_not_int_lt jitcode opcode taking int operands +
+        // target label, and the matching bhimpl_goto_if_not_int_lt. See
+        // task #30.
         let other_target = self.sym().pending_branch_other_target;
         let resume_pc = {
             let s = self.sym();
