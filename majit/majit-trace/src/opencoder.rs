@@ -725,11 +725,12 @@ impl<'a> TraceIterator<'a> {
         let max_pos = trace[start..end]
             .iter()
             .flat_map(|op| {
-                std::iter::once(op.pos.0)
-                    .chain(op.args.iter().map(|a| a.0))
-                    .chain(op.fail_args.iter().flat_map(|fa| fa.iter().map(|a| a.0)))
+                std::iter::once(op.pos)
+                    .chain(op.args.iter().copied())
+                    .chain(op.fail_args.iter().flat_map(|fa| fa.iter().copied()))
             })
-            .filter(|&p| p != u32::MAX && p < OpRef::CONST_BASE)
+            .filter(|opref| !opref.is_none() && !opref.is_constant())
+            .map(|opref| opref.0)
             .max()
             .unwrap_or(0);
         let cache_size = ((max_pos as usize) + 1).max(num_inputargs);
@@ -1657,9 +1658,9 @@ mod tests {
     #[test]
     fn test_trace_iterator_constants_passthrough() {
         // opencoder.py:321-335 _untag(): TAGINT/TAGCONSTPTR/TAGCONSTOTHER
-        // pass through unchanged. In majit, OpRefs >= CONST_BASE are
-        // constants and must NOT be remapped through `_cache`.
-        let const_ref = OpRef(majit_ir::OpRef::CONST_BASE + 5);
+        // pass through unchanged. In majit, constant OpRefs (is_constant
+        // high-bit marker) must NOT be remapped through `_cache`.
+        let const_ref = OpRef::from_const(5);
         let ops = vec![op_at(1, majit_ir::OpCode::IntAdd, &[OpRef(0), const_ref])];
         let mut iter = TraceIterator::new(&ops, 0, ops.len(), None, 1, 0);
         let r = iter.next().unwrap();
