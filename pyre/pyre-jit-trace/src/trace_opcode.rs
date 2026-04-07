@@ -1466,10 +1466,6 @@ impl MIFrame {
         } else {
             OpCode::GuardFalse
         };
-        if !self.parent_frames.is_empty() {
-            self.record_guard(ctx, opcode, &[truth]);
-            return;
-        }
 
         // pyjitpl.py:510-520 goto_if_not(box, target, orgpc):
         //   self.metainterp.generate_guard(opnum, box, resumepc=orgpc)
@@ -1499,11 +1495,13 @@ impl MIFrame {
         // blackhole skips POP_JUMP_IF_FALSE entirely and re-enters the
         // interpreter at the not-taken branch. The truth never has to be
         // restored — its only role was to pick the resume_pc at trace time.
-        // True line-by-line parity requires implementing
-        // jtransform.optimize_goto_if_not at pyre's codewriter level: a
-        // fused goto_if_not_int_lt jitcode opcode taking int operands +
-        // target label, and the matching bhimpl_goto_if_not_int_lt. See
-        // task #30.
+        // This adaptation applies to inline-frame branch guards too: the
+        // callee frame's resume pc is other_target, and parent frames keep
+        // their original return_point pc. True line-by-line parity
+        // requires implementing jtransform.optimize_goto_if_not at pyre's
+        // codewriter level: a fused goto_if_not_int_lt jitcode opcode
+        // taking int operands + target label, and the matching
+        // bhimpl_goto_if_not_int_lt. See task #30.
         let other_target = self.sym().pending_branch_other_target;
         let resume_pc = {
             let s = self.sym();
@@ -1520,13 +1518,18 @@ impl MIFrame {
 
         self.flush_to_frame_for_guard(ctx);
         // pyjitpl.py:177: get_list_of_active_boxes uses frame.pc for liveness
-        let active_boxes = self.get_list_of_active_boxes(ctx, false, false);
+        let callee_active_boxes = self.get_list_of_active_boxes(ctx, false, false);
         // pyjitpl.py:2558-2585 generate_guard parity: record a raw fail_args
         // "hint". store_final_boxes_in_guard rebuilds the real fail_args from
         // the snapshot via _number_boxes (Consts go to TAGCONST, not liveboxes).
-        let fail_arg_types = self.build_fail_arg_types_for_active_boxes(&active_boxes);
-        let fail_args: Vec<OpRef> = {
+        let callee_snapshot_types_full =
+            self.build_fail_arg_types_for_active_boxes(&callee_active_boxes);
+
+        let mut fail_args: Vec<OpRef> = {
             let s = self.sym();
+            // virtualizable_gen::NUM_SCALAR_INPUTARGS = 5: pyre's vable header
+            // is [frame_ptr, next_instr, code, valuestackdepth, namespace]
+            // (matches the merged record_guard_core layout in this same file).
             let mut fa = vec![
                 s.frame,
                 s.vable_next_instr,
@@ -1534,26 +1537,61 @@ impl MIFrame {
                 s.vable_valuestackdepth,
                 s.vable_namespace,
             ];
-            fa.extend_from_slice(&active_boxes);
+            fa.extend_from_slice(&callee_active_boxes);
             fa
         };
+        let mut types = callee_snapshot_types_full.clone();
 
-        // opencoder.py:767-770: snapshot uses active boxes (not fail_args)
-        let snapshot_boxes = Self::fail_args_to_snapshot_boxes(&active_boxes, ctx);
+        // opencoder.py:819 capture_resumedata(framestack) parity:
+        // Encode the full framestack [callee (top) with resume_pc=other_target,
+        // caller(s) with return_point pc]. Branch guards in inline callees
+        // use the same other_target adaptation — the callee frame's resume
+        // pc points past POP_JUMP_IF_* (not at it), while parent frames
+        // keep their original return_point pc.
+        let __n = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
+        let callee_snapshot_types = &callee_snapshot_types_full[__n..];
+        let mut frames = vec![majit_trace::recorder::SnapshotFrame {
+            jitcode_index: unsafe { (*self.sym().jitcode).index } as u32,
+            pc: resume_pc as u32,
+            boxes: Self::fail_args_to_snapshot_boxes_typed(
+                &callee_active_boxes,
+                callee_snapshot_types,
+                ctx,
+            ),
+        }];
+        // opencoder.py:806: parent frames keep their original pc.
+        // Snapshot boxes = active boxes only (skip [frame, ni, vsd] header).
+        for (pfa, pfa_types, pfa_resumepc, pfa_jitcode_index) in &self.parent_frames {
+            let parent_active: &[OpRef] = if pfa.len() > __n { &pfa[__n..] } else { &[] };
+            let parent_types: &[Type] = if pfa_types.len() > __n {
+                &pfa_types[__n..]
+            } else {
+                &[]
+            };
+            frames.push(majit_trace::recorder::SnapshotFrame {
+                jitcode_index: *pfa_jitcode_index as u32,
+                pc: *pfa_resumepc as u32,
+                boxes: Self::fail_args_to_snapshot_boxes_typed(parent_active, parent_types, ctx),
+            });
+            fail_args.extend_from_slice(pfa);
+            if !pfa_types.is_empty() {
+                types.extend_from_slice(pfa_types);
+            } else {
+                let pt = fail_arg_types_for_virtualizable_state(pfa.len());
+                types.extend_from_slice(&pt);
+            }
+        }
+
         let vable_boxes = Self::build_virtualizable_boxes(self.sym(), ctx);
-        let jitcode_index = unsafe { (*self.sym().jitcode).index } as u32;
+        let vref_boxes = Self::build_virtualref_boxes(self.sym(), ctx);
         let snapshot = majit_trace::recorder::Snapshot {
-            frames: vec![majit_trace::recorder::SnapshotFrame {
-                jitcode_index,
-                pc: resume_pc as u32,
-                boxes: snapshot_boxes,
-            }],
+            frames,
             vable_boxes,
-            vref_boxes: Self::build_virtualref_boxes(self.sym(), ctx),
+            vref_boxes,
         };
         let snapshot_id = ctx.capture_resumedata(snapshot);
 
-        ctx.record_guard_typed_with_fail_args(opcode, &[truth], fail_arg_types, &fail_args);
+        ctx.record_guard_typed_with_fail_args(opcode, &[truth], types, &fail_args);
         ctx.set_last_guard_resume_position(snapshot_id);
 
         // pyjitpl.py:2602: frame.pc = saved_pc (restore all, record_guard_core parity)
