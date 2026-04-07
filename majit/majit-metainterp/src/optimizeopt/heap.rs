@@ -158,6 +158,12 @@ impl CachedField {
         self.cached_descrs.clear();
     }
 
+    /// heapcache.py:119-130: invalidate_unescaped — remove entries for
+    /// ESCAPED objects, keep entries for unescaped allocations.
+    fn invalidate_unescaped(&mut self, unescaped: &[bool]) {
+        self.retain_entries(|obj| vb_get(unescaped, obj.0));
+    }
+
     /// heap.py:189-196: invalidate with PtrInfo cleanup.
     fn invalidate_with_ctx(&mut self, field_idx: u32, ctx: &mut crate::optimizeopt::OptContext) {
         for &obj in &self.cached_structs {
@@ -288,6 +294,12 @@ impl ArrayCachedItem {
         self.cached_arrays.clear();
         self.cached_values.clear();
         self.cached_descrs.clear();
+    }
+
+    /// heapcache.py:119-130: invalidate_unescaped — remove entries for
+    /// ESCAPED objects, keep entries for unescaped allocations.
+    fn invalidate_unescaped(&mut self, unescaped: &[bool]) {
+        self.retain_entries(|obj| vb_get(unescaped, obj.0));
     }
 
     fn retain_entries(&mut self, f: impl Fn(&OpRef) -> bool) {
@@ -942,7 +954,14 @@ impl OptHeap {
     /// Selective cache invalidation based on EffectInfo bitstrings.
     /// Instead of invalidating all caches, only force/invalidate
     /// fields and arrays that the call may read or write.
+    ///
+    /// heapcache.py:341 parity: mark_escaped_varargs runs BEFORE
+    /// invalidate_unescaped so that call arguments are already escaped
+    /// when cache invalidation checks unescaped status.
     fn force_from_effectinfo(&mut self, op: &Op, ctx: &mut OptContext) {
+        // heapcache.py:259-293: escape call arguments first
+        self.mark_escaped_varargs(op, ctx);
+
         let ei = match op.descr.as_ref().and_then(|d| d.as_call_descr()) {
             Some(cd) => cd.effect_info().clone(),
             None => {
@@ -963,6 +982,11 @@ impl OptHeap {
         // function (emitting_operation line 460: !has_random_effects → return).
         // No special handling needed here.
 
+        // heapcache.py:362-370: Only invalidate entries for escaped objects.
+        // Unescaped allocations survive the call because the callee cannot
+        // access them. Snapshot unescaped bitset to avoid borrow conflicts.
+        let unescaped_snapshot = self.unescaped.clone();
+
         // Force/invalidate field caches based on read/write bitstrings
         let field_indices: Vec<u32> = self.cached_fields.keys().copied().collect();
         for field_idx in field_indices {
@@ -975,15 +999,30 @@ impl OptHeap {
                 }
             }
             if ei.check_write_descr_field(field_idx) {
-                // heap.py:137-145: force_lazy_set(can_cache=False)
+                // heap.py:545-546: force_lazy_set(can_cache=False)
                 // Call writes this field → force lazy set AND invalidate cache.
-                // No put_field_back_to_info: the call overwrites the value.
+                // heapcache.py:362-370: only invalidate escaped entries.
+                // For unescaped objects, re-cache the value after forcing the
+                // lazy set so later reads can still be optimized away.
                 if let Some(cf) = self.cached_fields.get_mut(&field_idx) {
-                    if let Some((_, mut lazy_op)) = cf.lazy_set.take() {
+                    let lazy_info = cf.lazy_set.take();
+                    if let Some((obj, mut lazy_op)) = lazy_info {
+                        // heap.py:139: put_field_back_to_info for unescaped
+                        // objects: the callee cannot modify them, so re-cache
+                        // after emitting.
+                        let re_cache_value = if vb_get(&unescaped_snapshot, obj.0) {
+                            Some((obj, lazy_op.arg(1), lazy_op.descr.clone()))
+                        } else {
+                            None
+                        };
                         Self::emit_lazy_setfield(&mut lazy_op, ctx, true);
+                        if let Some((obj, value, descr)) = re_cache_value {
+                            cf.register_info(obj, value, descr.as_ref());
+                        }
                     }
                     if !vb_get(&self.immutable_field_descrs, field_idx) {
-                        cf.invalidate();
+                        // heapcache.py:365-366: cache.invalidate_unescaped()
+                        cf.invalidate_unescaped(&unescaped_snapshot);
                     }
                 }
             }
@@ -1001,10 +1040,21 @@ impl OptHeap {
             }
             if ei.check_write_descr_array(descr_idx) {
                 if let Some(cai) = self.cached_arrayitems.get_mut(&(descr_idx, index)) {
-                    if let Some((_, mut lazy_op)) = cai.lazy_set.take() {
+                    let lazy_info = cai.lazy_set.take();
+                    if let Some((arr, mut lazy_op)) = lazy_info {
+                        let re_cache_value = if vb_get(&unescaped_snapshot, arr.0) {
+                            // RPython: re-cache for unescaped array
+                            Some((arr, lazy_op.arg(2), lazy_op.descr.clone()))
+                        } else {
+                            None
+                        };
                         Self::emit_lazy_setfield(&mut lazy_op, ctx, true);
+                        if let Some((arr, value, descr)) = re_cache_value {
+                            cai.register_info(arr, value, descr.as_ref());
+                        }
                     }
-                    cai.invalidate();
+                    // heapcache.py:367-369: cache.invalidate_unescaped()
+                    cai.invalidate_unescaped(&unescaped_snapshot);
                 }
             }
         }
@@ -2309,6 +2359,7 @@ mod tests {
 
     use majit_ir::{
         CallDescr, Descr, DescrRef, EffectInfo, ExtraEffect, OopSpecIndex, Op, OpCode, OpRef,
+        SimpleCallDescr,
     };
 
     use crate::optimizeopt::info::PtrInfo;
@@ -2347,6 +2398,24 @@ mod tests {
 
     fn immutable_descr(idx: u32) -> DescrRef {
         Arc::new(ImmutableDescr(idx))
+    }
+
+    /// Call descriptor with default EffectInfo (non-random, non-elidable).
+    /// heapcache.py:362-370 parity: plain calls with known effectinfo
+    /// use invalidate_unescaped instead of full reset.
+    fn plain_call_descr(idx: u32) -> DescrRef {
+        Arc::new(majit_ir::SimpleCallDescr::new(
+            idx,
+            vec![],
+            majit_ir::Type::Void,
+            0,
+            EffectInfo {
+                // Write all fields/arrays so invalidation is triggered
+                write_descrs_fields: u64::MAX,
+                write_descrs_arrays: u64::MAX,
+                ..EffectInfo::default()
+            },
+        ))
     }
 
     /// Helper: assign sequential positions to ops.
@@ -3191,7 +3260,7 @@ mod tests {
         let mut ops = vec![
             Op::new(OpCode::New, &[]), // pos=0 -> p0
             Op::with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(10)], d.clone()),
-            Op::new(OpCode::CallN, &[OpRef(200)]), // some unrelated func
+            Op::with_descr(OpCode::CallN, &[OpRef(200)], plain_call_descr(100)),
             Op::with_descr(OpCode::GetfieldGcI, &[OpRef(0)], d.clone()),
             Op::new(OpCode::Jump, &[]),
         ];
@@ -3218,7 +3287,7 @@ mod tests {
         let mut ops = vec![
             Op::new(OpCode::New, &[]), // pos=0 -> p0
             Op::with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(10)], d.clone()),
-            Op::new(OpCode::CallN, &[OpRef(0)]), // pass p0 to call
+            Op::with_descr(OpCode::CallN, &[OpRef(0)], plain_call_descr(100)), // pass p0 to call
             Op::with_descr(OpCode::GetfieldGcI, &[OpRef(0)], d.clone()),
             Op::new(OpCode::Jump, &[]),
         ];
@@ -3252,7 +3321,7 @@ mod tests {
             Op::new(OpCode::New, &[]), // pos=1 -> p1
             Op::with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(10)], d0.clone()), // p0.f0 = i10
             Op::with_descr(OpCode::SetfieldGc, &[OpRef(1), OpRef(0)], d1.clone()), // p1.f1 = p0 (p0 escapes)
-            Op::new(OpCode::CallN, &[OpRef(1)]), // call(p1) (p1 escapes)
+            Op::with_descr(OpCode::CallN, &[OpRef(1)], plain_call_descr(100)), // call(p1) (p1 escapes)
             Op::with_descr(OpCode::GetfieldGcI, &[OpRef(0)], d0.clone()),
             Op::new(OpCode::Jump, &[]),
         ];
@@ -3312,7 +3381,7 @@ mod tests {
                 &[OpRef(0), idx, OpRef(10)],
                 d.clone(),
             ),
-            Op::new(OpCode::CallN, &[OpRef(200)]),
+            Op::with_descr(OpCode::CallN, &[OpRef(200)], plain_call_descr(100)),
             Op::with_descr(OpCode::GetarrayitemGcI, &[OpRef(0), idx], d.clone()),
             Op::new(OpCode::Jump, &[]),
         ];
@@ -3366,8 +3435,8 @@ mod tests {
         let mut ops = vec![
             Op::new(OpCode::New, &[]),
             Op::with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(10)], d.clone()),
-            Op::new(OpCode::CallN, &[OpRef(200)]),
-            Op::new(OpCode::CallN, &[OpRef(201)]),
+            Op::with_descr(OpCode::CallN, &[OpRef(200)], plain_call_descr(100)),
+            Op::with_descr(OpCode::CallN, &[OpRef(201)], plain_call_descr(101)),
             Op::with_descr(OpCode::GetfieldGcI, &[OpRef(0)], d.clone()),
             Op::new(OpCode::Jump, &[]),
         ];

@@ -3095,12 +3095,63 @@ fn build_ref_root_slots(
     inputargs: &[InputArg],
     ops: &[Op],
     force_tokens: &HashSet<u32>,
-) -> Vec<(u32, usize)> {
+) -> Result<Vec<(u32, usize)>, BackendError> {
     let mut seen = HashSet::new();
     let mut slots = Vec::new();
 
+    // RPython parity: when jump_to_preamble is used without
+    // force_box_for_end_of_preamble, the body JUMP may pass Float/Int
+    // values at Ref-typed inputarg positions. Build a set of inputarg
+    // indices that receive non-Ref values from the backedge JUMP.
+    // These positions must NOT be treated as GC ref roots, because
+    // (1) the GC would try to trace Float/Int bits as pointers, and
+    // (2) the preamble guard check would dereference non-pointer values.
+    let mut non_ref_at_backedge: HashSet<u32> = HashSet::new();
+    let mut has_float_at_ref_position = false;
+    {
+        // Build type map: pos → result_type for all ops
+        let mut type_map: HashMap<u32, Type> = HashMap::new();
+        for op in ops.iter() {
+            if op.result_type() != Type::Void && !op.pos.is_none() {
+                type_map.insert(op.pos.0, op.result_type());
+            }
+        }
+        // Find the closing JUMP and check arg types against inputarg types
+        if let Some(jump) = ops.iter().rfind(|op| op.opcode == OpCode::Jump) {
+            let num_inputs = inputargs.len();
+            for (i, &arg) in jump.args.iter().enumerate() {
+                if i >= num_inputs {
+                    break;
+                }
+                if inputargs[i].tp != Type::Ref {
+                    continue;
+                }
+                if (arg.0 as usize) < num_inputs {
+                    continue; // inputarg reference — always safe
+                }
+                if let Some(&actual_tp) = type_map.get(&arg.0) {
+                    if actual_tp != Type::Ref {
+                        non_ref_at_backedge.insert(i as u32);
+                        if actual_tp == Type::Float {
+                            has_float_at_ref_position = true;
+                        }
+                        if std::env::var_os("MAJIT_LOG").is_some() {
+                            eprintln!(
+                                "[ref-root] SKIP inputarg idx={}: backedge passes {:?} (arg={:?})",
+                                i, actual_tp, arg
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     for input in inputargs {
-        if input.tp == Type::Ref && !force_tokens.contains(&input.index) && seen.insert(input.index)
+        if input.tp == Type::Ref
+            && !force_tokens.contains(&input.index)
+            && !non_ref_at_backedge.contains(&input.index)
+            && seen.insert(input.index)
         {
             if std::env::var_os("MAJIT_LOG").is_some() {
                 eprintln!("[ref-root] inputarg idx={} tp={:?}", input.index, input.tp);
@@ -3124,7 +3175,16 @@ fn build_ref_root_slots(
         }
     }
 
-    slots
+    // Float at Ref positions always crashes (float bits are not valid
+    // pointers). Int at Ref positions may be valid GC pointer constants
+    // (e.g., inlined PyInt class pointer). Reject only Float mismatches.
+    if has_float_at_ref_position {
+        return Err(BackendError::Unsupported(
+            "jump_to_preamble passes Float at Ref-typed inputarg position".to_string(),
+        ));
+    }
+
+    Ok(slots)
 }
 
 /// Simple normalization: assign sequential pos to ops without pos.
@@ -4966,7 +5026,7 @@ impl CraneliftBackend {
         let num_inputs = inputargs.len();
         let known_values = build_known_values_set(inputargs, ops);
         let value_types = build_value_type_map_simple(inputargs, ops);
-        let ref_root_slots = build_ref_root_slots(inputargs, ops, &force_tokens);
+        let ref_root_slots = build_ref_root_slots(inputargs, ops, &force_tokens)?;
         let gc_runtime_id = self.gc_runtime_id;
         // llmodel.py:64-69 self.vtable_offset — backend property used by
         // bh_new_with_vtable. Capture for use in NEW_WITH_VTABLE codegen.
