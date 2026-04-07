@@ -3585,11 +3585,11 @@ mod tests {
             Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]),
             Op::new(OpCode::Jump, &[OpRef(0), OpRef(1)]),
         ];
-        ops[0].pos = OpRef(10066);
-        ops[1].pos = OpRef(10067);
+        ops[0].pos = OpRef(66);
+        ops[1].pos = OpRef(67);
 
         let mut constants = std::collections::HashMap::new();
-        constants.insert(10068, 472);
+        constants.insert(68, 472);
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
 
         let new_positions: std::collections::HashSet<_> = result
@@ -3599,8 +3599,8 @@ mod tests {
             .collect();
         assert_eq!(
             new_positions,
-            std::collections::HashSet::from([10069]),
-            "queued New should skip constant-only slot v10068; got {:?}",
+            std::collections::HashSet::from([69]),
+            "queued New should skip constant-only slot v68; got {:?}",
             result
         );
         assert!(
@@ -3611,9 +3611,9 @@ mod tests {
             "SetfieldGc targets must remain emitted New refs; got {:?}",
             result
         );
-        assert_eq!(constants.get(&10068), Some(&472));
+        assert_eq!(constants.get(&68), Some(&472));
         assert!(
-            !constants.contains_key(&10069),
+            !constants.contains_key(&69),
             "live New position must not collide with constant map {:?}",
             constants
         );
