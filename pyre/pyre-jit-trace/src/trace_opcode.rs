@@ -4738,18 +4738,25 @@ impl NamespaceOpcodeHandler for MIFrame {
                 //
                 // 2. RECORD_KNOWN_RESULT(result, ns, slot) — cache the
                 //    trace-time lookup result (RPython call_pure_results).
+                //    pyjitpl.py:419: jitcode opname `record_known_result_r`
+                //    when result kind is ref (jtransform.py:303-307); same
+                //    RECORD_KNOWN_RESULT opcode at the trace level.
                 //
-                // 3. CALL_PURE_I(ns, slot) — elidable lookup call.
+                // 3. CALL_PURE_R(ns, slot) — elidable lookup call.
+                //    resoperation.py:1214 call_pure_for_descr returns
+                //    rop.CALL_PURE_R when the descr's normalized result type
+                //    is 'r'; namespace lookup returns a PyObjectRef so the
+                //    matching opnum is CALL_PURE_R, not CALL_PURE_I.
                 //    RPython record_result_of_call_pure: all args constant
-                //    → history.cut() → trace-time constant. Our OptPure
-                //    folds via lookup_known_result → same effect.
+                //    → history.cut() → trace-time constant. OptPure folds
+                //    via lookup_known_result → same effect.
                 let opref = self.with_ctx(|this, ctx| {
                     // ns and concrete_value are PyObjectRef pointers (Ref-typed).
                     // Use const_ref so the constant pool tracks them with the
                     // correct type — otherwise typed seeding sees them as Int
-                    // and OptVirtualize.optimize_guard_value cannot match a
-                    // Ref-typed expected against an Int-typed obj_ref, leaving
-                    // a redundant GuardValue with no resume snapshot in the
+                    // and optimize_guard_value cannot match a Ref-typed
+                    // expected against an Int-typed obj_ref, leaving a
+                    // redundant GuardValue with no resume snapshot in the
                     // optimized trace.
                     let ns_const = ctx.const_ref(ns as i64);
                     let slot_const = ctx.const_int(slot as i64);
@@ -4759,7 +4766,7 @@ impl NamespaceOpcodeHandler for MIFrame {
                         OpCode::RecordKnownResult,
                         &[result_const, ns_const, slot_const],
                     );
-                    let call_result = ctx.record_op(OpCode::CallPureI, &[ns_const, slot_const]);
+                    let call_result = ctx.record_op(OpCode::CallPureR, &[ns_const, slot_const]);
                     this.sym_mut()
                         .symbolic_namespace_slots
                         .insert(slot, call_result);

@@ -1474,14 +1474,27 @@ impl OptRewrite {
         let arg0 = op.arg(0);
         let arg1 = op.arg(1);
 
-        // rewrite.py:284-301 + executor.py:544-551 parity:
-        // GUARD_VALUE on a constant equal to the expected constant is
-        // redundant. Constants may be Int- or Ref-typed under typed
-        // seeding (raise_catch_loop, fib_recursive); compare via
-        // get_constant() which preserves Value semantics.
+        // rewrite.py:163-184 optimize_guard(op, constbox) — base contradiction
+        // check called from optimize_GUARD_VALUE at line 301. Constants may
+        // be Int- or Ref-typed under typed seeding; compare via get_constant
+        // which preserves Value semantics (rewrite.py:166-182 same_constant
+        // for both 'i' and 'r'). For 'f', rewrite.py:295-298 returns silently
+        // when arg0 is constant without checking equality, so we mirror that
+        // by removing on equality but never raising on float mismatch.
         if let (Some(actual), Some(expected)) = (ctx.get_constant(arg0), ctx.get_constant(arg1)) {
             if actual == expected {
                 return OptimizationResult::Remove;
+            }
+            match actual {
+                Value::Int(_) | Value::Ref(_) => {
+                    raise_invalid_loop("GUARD_VALUE proven to always fail");
+                }
+                Value::Float(_) => {
+                    // rewrite.py:295-298 'f' prelude: return silently on
+                    // constant arg0; no contradiction check.
+                    return OptimizationResult::Remove;
+                }
+                Value::Void => {}
             }
         }
 
@@ -1495,20 +1508,35 @@ impl OptRewrite {
             }
             // rewrite.py:307-347: replace_old_guard_with_guard_value
             if let Some(old_guard) = ctx.get_last_guard(obj).cloned() {
-                if let Some(ev) = ctx.get_constant_int(arg1) {
-                    if ev == 0 {
+                // rewrite.py:320: c_value = op.getarg(1) — generic Const.
+                // Under typed seeding c_value can be Int OR Ref; the
+                // previous gating on get_constant_int dropped the Ref
+                // case entirely so prior GUARD_NONNULL/GUARD_CLASS were
+                // never strengthened to GUARD_VALUE for Ref-typed args.
+                if let Some(c_value) = ctx.get_constant(arg1).copied() {
+                    // rewrite.py:321-323: c_value.nonnull(). ConstInt.nonnull
+                    // == (value != 0); ConstPtr.nonnull == (gcref != null).
+                    let c_nonnull = match c_value {
+                        Value::Int(i) => i != 0,
+                        Value::Ref(g) => !g.is_null(),
+                        Value::Float(_) => true,
+                        Value::Void => true,
+                    };
+                    if !c_nonnull {
                         raise_invalid_loop(
-                            "GUARD_VALUE(..., NULL) follows a guard that it is not NULL",
+                            "GUARD_VALUE(..., NULL) follows some other guard that it is not NULL",
                         );
                     }
-                    // rewrite.py:324-332: check class consistency via
-                    // `info.get_known_class(cpu)`; ConstPtrInfo's override
-                    // reads the constant's typeptr via cls_of_box.
+                    // rewrite.py:324-332: previous_classbox = info.get_known_class(cpu)
+                    // expected_classbox = cpu.cls_of_box(c_value)
+                    // get_known_class on the c_value side dispatches through
+                    // getptrinfo → ConstPtrInfo.get_known_class (info.py:763-772)
+                    // which is exactly cls_of_box for constant pointers.
                     if let Some(prev_cls) = info.get_known_class() {
-                        if let Some(known_cls) = ctx.get_known_class(arg1) {
-                            if prev_cls != known_cls {
+                        if let Some(expected_cls) = ctx.get_known_class(arg1) {
+                            if prev_cls != expected_cls {
                                 raise_invalid_loop(
-                                    "GUARD_VALUE class contradicts prior GUARD_CLASS",
+                                    "GUARD_VALUE proven to always fail (class mismatch)",
                                 );
                             }
                         }
@@ -1519,8 +1547,12 @@ impl OptRewrite {
                     }
                     // rewrite.py:335-347: replace old guard with GUARD_VALUE.
                     // last_guard_pos is a _newoperations index (info.py:100-103).
+                    // rewrite.py:339-340: old descr must not be ResumeAtPositionDescr
+                    // — RPython's fresh ResumeGuardDescr() at line 335 must
+                    // not overwrite a RAPD marker.
                     if let Some(old_idx) =
                         ctx.get_ptr_info(obj).and_then(|i| i.get_last_guard_pos())
+                        && !ctx.is_resume_at_position_guard(old_idx as i32)
                     {
                         // rewrite.py:335-338 + resoperation.py:498-503
                         // GuardResOp.copy_and_change parity: shallow copy
@@ -1540,7 +1572,9 @@ impl OptRewrite {
                         if let Some(info_mut) = ctx.get_ptr_info_mut(obj) {
                             info_mut.reset_last_guard_pos();
                         }
-                        ctx.make_constant(arg0, majit_ir::Value::Int(ev));
+                        // postprocess_GUARD_VALUE (rewrite.py:303-305): make_constant
+                        // with the actual c_value (preserving Int vs Ref typing).
+                        ctx.make_constant(arg0, c_value);
                         return OptimizationResult::Remove;
                     }
                 }
@@ -1627,23 +1661,33 @@ impl OptRewrite {
         // rewrite.py:408-427: guard strengthening.
         // If there was a previous GUARD_NONNULL on the same value,
         // replace it with GUARD_NONNULL_CLASS (combining both checks).
+        // rewrite.py:409-410: skip replacement if old descr is a
+        // ResumeAtPositionDescr — RPython's fresh ResumeGuardDescr() at
+        // line 417 must not overwrite a RAPD marker (rewrite.py:421-422
+        // "old descr must not be ResumeAtPositionDescr").
         if let Some(old_guard) = ctx.get_last_guard(obj) {
-            if old_guard.opcode == OpCode::GuardNonnull && op.num_args() >= 2 {
+            if old_guard.opcode == OpCode::GuardNonnull
+                && op.num_args() >= 2
+                && ctx.can_replace_guards
+            {
                 // last_guard_pos is a _newoperations index.
                 let old_guard_idx = ctx.get_ptr_info(obj).and_then(|i| i.get_last_guard_pos());
-                if let Some(old_idx) = old_guard_idx {
+                if let Some(old_idx) = old_guard_idx
+                    && !ctx.is_resume_at_position_guard(old_idx as i32)
+                {
                     // rewrite.py:417-420 + resoperation.py:498-503
-                    // GuardResOp.copy_and_change parity: preserves descr,
-                    // fail_args, rd_resume_position, AND the rd_numb /
-                    // rd_consts / rd_virtuals / rd_pendingfields that
-                    // majit's inline `store_final_boxes_in_guard` already
-                    // populated on the old guard. A manual field-by-field
-                    // copy would drop those and leave the replacement
-                    // guard without resume data at runtime.
+                    // GuardResOp.copy_and_change parity: preserves
+                    // fail_args, fail_arg_types, rd_resume_position,
+                    // rd_numb, rd_consts, rd_virtuals, rd_pendingfields
+                    // that majit's inline store_final_boxes_in_guard
+                    // populated on the old guard. descr is cleared
+                    // (Some(None)) per rewrite.py:417 fresh ResumeGuardDescr,
+                    // dropping any RAPD marker so codegen produces a
+                    // fresh CraneliftFailDescr.
                     let combined = old_guard.copy_and_change(
                         OpCode::GuardNonnullClass,
                         Some(&[old_guard.arg(0), op.arg(1)]),
-                        None,
+                        Some(None),
                     );
                     ctx.new_operations[old_idx] = combined;
                     // postprocess: record known class
