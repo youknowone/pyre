@@ -20,7 +20,9 @@ pub fn make_function_from_code_obj(
 ) -> PyObjectRef {
     let code_ptr = unsafe { w_code_get_ptr(code_obj) };
     let code = unsafe { &*(code_ptr as *const crate::CodeObject) };
-    function_new(code_ptr, code.qualname.to_string(), globals)
+    // Store the W_CodeObject (Code-level wrapper) in Function.code,
+    // not the raw CodeObject pointer.
+    function_new(code_obj as *const (), code.qualname.to_string(), globals)
 }
 
 fn decode_name(name_ptr: i64, name_len: i64) -> Option<&'static str> {
@@ -81,7 +83,8 @@ pub fn register_jit_function_caller(caller: JitFunctionCaller) {
 fn call_builtin_with_args(callable: i64, args: &[i64]) -> i64 {
     let callable = callable as PyObjectRef;
     unsafe {
-        let func = builtin_code_get(callable);
+        let code = crate::getcode(callable);
+        let func = builtin_code_get(code as PyObjectRef);
         let arg_slice = std::slice::from_raw_parts(args.as_ptr() as *const PyObjectRef, args.len());
         match func(arg_slice) {
             Ok(result) => result as i64,
@@ -250,10 +253,15 @@ where
     // Grow stack for deep Python call recursion (fib(32+)).
     // Red zone 512KB ensures growth before guard page hit.
     stacker::maybe_grow(512 * 1024, 8 * 1024 * 1024, move || unsafe {
-        if is_builtin_code(callable) {
-            on_builtin(callable)
-        } else if is_function(callable) {
-            on_user(callable)
+        if is_function(callable) {
+            // All callables are Function objects. Check code type to distinguish
+            // builtins (BuiltinCode) from user functions (W_CodeObject).
+            let code = crate::getcode(callable);
+            if is_builtin_code(code as PyObjectRef) {
+                on_builtin(callable)
+            } else {
+                on_user(callable)
+            }
         } else {
             Err(PyError::type_error(format!(
                 "'{}' object is not callable",
@@ -802,7 +810,9 @@ mod tests {
         let result = dispatch_callable(
             abs,
             |callable| {
-                let func = unsafe { crate::builtin_code_get(callable) };
+                // Builtins are now Function objects; extract code then func pointer.
+                let code = unsafe { crate::getcode(callable) };
+                let func = unsafe { crate::builtin_code_get(code as PyObjectRef) };
                 func(&[w_int_new(-9)])
             },
             |_callable| panic!("builtin callable should not take user branch"),

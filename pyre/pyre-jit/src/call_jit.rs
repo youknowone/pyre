@@ -104,7 +104,8 @@ pub(crate) fn recursive_force_cache_safe(callable: PyObjectRef) -> bool {
         if !function_get_closure(callable).is_null() {
             return false;
         }
-        let code = &*(pyre_interpreter::getcode(callable) as *const pyre_interpreter::CodeObject);
+        let code =
+            &*(pyre_interpreter::get_pycode(callable) as *const pyre_interpreter::CodeObject);
         let func_name = function_get_name(callable);
         let mut arg_state = OpArgState::default();
         let mut saw_self_reference = false;
@@ -2237,7 +2238,7 @@ fn create_callee_frame_impl_1_boxed(
     callable: PyObjectRef,
     boxed_arg: PyObjectRef,
 ) -> i64 {
-    let code_ptr = unsafe { pyre_interpreter::getcode(callable) };
+    let code_ptr = unsafe { pyre_interpreter::get_pycode(callable) };
     let caller = unsafe { &*(caller_frame as *const PyFrame) };
     let globals = unsafe { function_get_globals(callable) };
     let func_code = code_ptr as *const pyre_interpreter::CodeObject;
@@ -2345,7 +2346,7 @@ fn create_self_recursive_callee_frame_impl_1_boxed(
 
 fn create_callee_frame_impl(caller_frame: i64, callable: i64, args: &[PyObjectRef]) -> i64 {
     let callable = callable as PyObjectRef;
-    let code_ptr = unsafe { pyre_interpreter::getcode(callable) };
+    let code_ptr = unsafe { pyre_interpreter::get_pycode(callable) };
     let caller = unsafe { &*(caller_frame as *const PyFrame) };
     let globals = unsafe { function_get_globals(callable) };
     let func_code = code_ptr as *const pyre_interpreter::CodeObject;
@@ -2736,17 +2737,25 @@ fn bh_call_fn_impl(callable: PyObjectRef, args: &[PyObjectRef]) -> i64 {
         return 0;
     }
     // RPython bhimpl_residual_call: dispatch builtin vs user function.
-    if !unsafe { is_function(callable) } {
-        let func = unsafe { pyre_interpreter::builtin_code_get(callable) };
-        match func(args) {
-            Ok(result) if !result.is_null() => return result as i64,
-            Ok(_) => return 0,
-            Err(err) => {
-                let exc_obj = err.to_exc_object();
-                majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
-                return 0;
+    if unsafe { is_function(callable) } {
+        let code = unsafe { pyre_interpreter::getcode(callable) };
+        if unsafe { pyre_interpreter::is_builtin_code(code as pyre_object::PyObjectRef) } {
+            let func =
+                unsafe { pyre_interpreter::builtin_code_get(code as pyre_object::PyObjectRef) };
+            match func(args) {
+                Ok(result) if !result.is_null() => return result as i64,
+                Ok(_) => return 0,
+                Err(err) => {
+                    let exc_obj = err.to_exc_object();
+                    majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+                    return 0;
+                }
             }
         }
+    } else {
+        let err = pyre_interpreter::PyError::type_error("call on non-function callable");
+        majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(err.to_exc_object() as i64));
+        return 0;
     }
     // blackhole.py bhimpl_residual_call: parent frame from BH_VABLE_PTR.
     // call_user_function_plain handles full call protocol (defaults,
@@ -2841,8 +2850,8 @@ pub extern "C" fn bh_compare_fn(lhs: i64, rhs: i64, op_code: i64) -> i64 {
                 if pyre_object::is_str(rhs) {
                     let type_name = pyre_object::w_str_get_value(rhs);
                     pyre_object::exc_kind_matches(kind, type_name)
-                } else if pyre_interpreter::is_builtin_code(rhs) {
-                    let type_name = pyre_interpreter::builtin_code_name(rhs);
+                } else if pyre_interpreter::is_function(rhs) {
+                    let type_name = pyre_interpreter::function_get_name(rhs);
                     pyre_object::exc_kind_matches(kind, type_name)
                 } else {
                     true

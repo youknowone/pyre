@@ -2,7 +2,7 @@
 //!
 //! Uses sre-engine crate (RustPython's SRE bytecode interpreter).
 
-use crate::{PyNamespace, builtin_code_new, namespace_store};
+use crate::{PyNamespace, make_builtin_function, namespace_store};
 use pyre_object::*;
 use sre_engine::engine::{Request, State, StrDrive};
 use std::cell::RefCell;
@@ -19,11 +19,11 @@ pub fn init(ns: &mut PyNamespace) {
     namespace_store(ns, "CODESIZE", w_int_new(sre_engine::CODESIZE as i64));
     namespace_store(ns, "MAXREPEAT", w_int_new(sre_engine::MAXREPEAT as i64));
     namespace_store(ns, "MAXGROUPS", w_int_new(sre_engine::MAXGROUPS as i64));
-    namespace_store(ns, "compile", builtin_code_new("compile", sre_compile));
+    namespace_store(ns, "compile", make_builtin_function("compile", sre_compile));
     namespace_store(
         ns,
         "ascii_iscased",
-        builtin_code_new("ascii_iscased", |args| {
+        make_builtin_function("ascii_iscased", |args| {
             if args.is_empty() {
                 return Ok(w_bool_from(false));
             }
@@ -34,7 +34,7 @@ pub fn init(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "unicode_iscased",
-        builtin_code_new("unicode_iscased", |args| {
+        make_builtin_function("unicode_iscased", |args| {
             if args.is_empty() {
                 return Ok(w_bool_from(false));
             }
@@ -45,7 +45,7 @@ pub fn init(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "ascii_tolower",
-        builtin_code_new("ascii_tolower", |args| {
+        make_builtin_function("ascii_tolower", |args| {
             if args.is_empty() {
                 return Ok(w_int_new(0));
             }
@@ -57,7 +57,7 @@ pub fn init(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "unicode_tolower",
-        builtin_code_new("unicode_tolower", |args| {
+        make_builtin_function("unicode_tolower", |args| {
             if args.is_empty() {
                 return Ok(w_int_new(0));
             }
@@ -68,14 +68,14 @@ pub fn init(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "getcodesize",
-        builtin_code_new("getcodesize", |_| {
+        make_builtin_function("getcodesize", |_| {
             Ok(w_int_new(sre_engine::CODESIZE as i64))
         }),
     );
     namespace_store(
         ns,
         "getlower",
-        builtin_code_new("getlower", |args| {
+        make_builtin_function("getlower", |args| {
             if args.is_empty() {
                 return Ok(w_int_new(0));
             }
@@ -148,7 +148,7 @@ fn sre_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         ("split", sre_pattern_split),
         ("fullmatch", sre_pattern_fullmatch),
     ] {
-        let _ = crate::baseobjspace::setattr(pat, name, builtin_code_new(name, func));
+        let _ = crate::baseobjspace::setattr(pat, name, make_builtin_function(name, func));
     }
 
     Ok(pat)
@@ -276,7 +276,7 @@ fn make_match(pat: PyObjectRef, string: PyObjectRef, state: &State<&str>, s: &st
         ("end", sre_match_end),
         ("span", sre_match_span),
     ] {
-        let _ = crate::baseobjspace::setattr(m, name, builtin_code_new(name, func));
+        let _ = crate::baseobjspace::setattr(m, name, make_builtin_function(name, func));
     }
     m
 }

@@ -6,7 +6,7 @@
 //! Functions are registered so `import cmath` succeeds, but complex
 //! arithmetic requires W_ComplexObject (future work).
 
-use crate::{PyNamespace, builtin_code_new, namespace_store};
+use crate::{PyNamespace, make_builtin_function, namespace_store};
 use pyre_object::*;
 
 pub fn init(ns: &mut PyNamespace) {
@@ -22,7 +22,7 @@ pub fn init(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "phase",
-        builtin_code_new("phase", |args| {
+        make_builtin_function("phase", |args| {
             Ok(floatobject::w_float_new(
                 super::interp_math::get_double(args[0]).atan2(0.0),
             ))
@@ -31,7 +31,7 @@ pub fn init(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "polar",
-        builtin_code_new("polar", |args| {
+        make_builtin_function("polar", |args| {
             let x = super::interp_math::get_double(args[0]);
             Ok(w_tuple_new(vec![
                 floatobject::w_float_new(x.abs()),
@@ -42,7 +42,7 @@ pub fn init(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "rect",
-        builtin_code_new("rect", |args| {
+        make_builtin_function("rect", |args| {
             let r = super::interp_math::get_double(args[0]);
             let phi = super::interp_math::get_double(args[1]);
             Ok(floatobject::w_float_new(r * phi.cos()))
@@ -51,7 +51,7 @@ pub fn init(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "isfinite",
-        builtin_code_new("isfinite", |args| {
+        make_builtin_function("isfinite", |args| {
             Ok(w_bool_from(
                 super::interp_math::get_double(args[0]).is_finite(),
             ))
@@ -60,7 +60,7 @@ pub fn init(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "isinf",
-        builtin_code_new("isinf", |args| {
+        make_builtin_function("isinf", |args| {
             Ok(w_bool_from(
                 super::interp_math::get_double(args[0]).is_infinite(),
             ))
@@ -69,7 +69,7 @@ pub fn init(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "isnan",
-        builtin_code_new("isnan", |args| {
+        make_builtin_function("isnan", |args| {
             Ok(w_bool_from(
                 super::interp_math::get_double(args[0]).is_nan(),
             ))
@@ -98,6 +98,6 @@ pub fn init(ns: &mut PyNamespace) {
         ("acosh", super::interp_math::acosh),
         ("atanh", super::interp_math::atanh),
     ] {
-        namespace_store(ns, name, builtin_code_new(name, func));
+        namespace_store(ns, name, make_builtin_function(name, func));
     }
 }

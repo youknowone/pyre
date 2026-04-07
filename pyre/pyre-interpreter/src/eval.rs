@@ -594,14 +594,16 @@ impl OpcodeStepExecutor for PyFrame {
     ) -> Result<(), Self::Error> {
         use crate::bytecode::CommonConstant;
         let val = match cc {
-            CommonConstant::AssertionError => crate::builtin_code_new("AssertionError", |_args| {
-                Err(crate::PyError::new(
-                    crate::PyErrorKind::AssertionError,
-                    "assertion error".to_string(),
-                ))
-            }),
+            CommonConstant::AssertionError => {
+                crate::make_builtin_function("AssertionError", |_args| {
+                    Err(crate::PyError::new(
+                        crate::PyErrorKind::AssertionError,
+                        "assertion error".to_string(),
+                    ))
+                })
+            }
             CommonConstant::NotImplementedError => {
-                crate::builtin_code_new("NotImplementedError", |_args| {
+                crate::make_builtin_function("NotImplementedError", |_args| {
                     Err(crate::PyError::type_error("not implemented"))
                 })
             }
@@ -609,10 +611,10 @@ impl OpcodeStepExecutor for PyFrame {
                 crate::typedef::gettypeobject(&pyre_object::pyobject::TUPLE_TYPE)
             }
             CommonConstant::BuiltinAll => {
-                crate::builtin_code_new("all", crate::builtins::builtin_all_fn)
+                crate::make_builtin_function("all", crate::builtins::builtin_all_fn)
             }
             CommonConstant::BuiltinAny => {
-                crate::builtin_code_new("any", crate::builtins::builtin_any_fn)
+                crate::make_builtin_function("any", crate::builtins::builtin_any_fn)
             }
             CommonConstant::BuiltinList => {
                 crate::typedef::gettypeobject(&pyre_object::pyobject::LIST_TYPE)
@@ -760,10 +762,12 @@ impl OpcodeStepExecutor for PyFrame {
                 unsafe {
                     if pyre_object::is_exception(exc) {
                         Err(PyError::from_exc_object(exc))
-                    } else if crate::is_builtin_code(exc) {
+                    } else if crate::is_function(exc)
+                        && crate::is_builtin_code(crate::getcode(exc) as pyre_object::PyObjectRef)
+                    {
                         // raise TypeError → call TypeError() to create instance
-                        // PyPy: RAISE_VARARGS calls type to create exception instance
-                        let func = crate::builtin_code_get(exc);
+                        let code = crate::getcode(exc);
+                        let func = crate::builtin_code_get(code as pyre_object::PyObjectRef);
                         match func(&[]) {
                             Ok(exc_obj) if pyre_object::is_exception(exc_obj) => {
                                 Err(PyError::from_exc_object(exc_obj))
@@ -993,8 +997,8 @@ impl OpcodeStepExecutor for PyFrame {
                 if pyre_object::is_str(exc_type) {
                     let type_name = pyre_object::w_str_get_value(exc_type);
                     pyre_object::exc_kind_matches(kind, type_name)
-                } else if crate::is_builtin_code(exc_type) {
-                    let type_name = crate::builtin_code_name(exc_type);
+                } else if crate::is_function(exc_type) {
+                    let type_name = crate::function_get_name(exc_type);
                     pyre_object::exc_kind_matches(kind, type_name)
                 } else {
                     true
@@ -1516,7 +1520,13 @@ impl OpcodeStepExecutor for PyFrame {
 
         // Resolve keyword args into positional order.
         // PyPy: argument.py _match_signature step: match keywords to argnames
-        let resolved = if unsafe { crate::is_builtin_code(callable_unwrapped) } {
+        let is_builtin = unsafe { crate::is_function(callable_unwrapped) }
+            && unsafe {
+                crate::is_builtin_code(
+                    crate::getcode(callable_unwrapped) as pyre_object::PyObjectRef
+                )
+            };
+        let resolved = if is_builtin {
             // Builtin functions: pack kwargs into a dict as last arg
             let nkw = if unsafe { pyre_object::is_tuple(kwarg_names) } {
                 unsafe { pyre_object::w_tuple_len(kwarg_names) }
