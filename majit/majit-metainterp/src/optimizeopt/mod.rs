@@ -2403,67 +2403,165 @@ impl OptContext {
         }
     }
 
-    /// info.py:706-758 `ConstPtrInfo._const.getref_base()` parity.
+    /// resoperation.py: `op.type` parity. RPython Boxes carry their
+    /// type intrinsically (`AbstractValue.type` ∈ {`'i'`, `'r'`, `'f'`,
+    /// `'v'`}). majit's flat OpRef model has no such intrinsic field,
+    /// so the type is reconstructed from the available metadata sources
+    /// in priority order:
     ///
-    /// Returns the GC pointer address for any constant that RPython would
-    /// wrap in a `ConstPtrInfo`. RPython's `getptrinfo` (info.py:880-894)
-    /// dispatches on `op.type` BEFORE consulting the constant value:
-    /// - `op.type == 'r'` and `isinstance(op, ConstPtr)` →
-    ///   `ConstPtrInfo(op)`; `_const.getref_base()` reads the boxed
-    ///   pointer (which may be NULL).
-    /// - `op.type == 'i'` defers to `getrawptrinfo` (info.py:865-878),
-    ///   which only synthesizes `ConstPtrInfo` for raw-pointer
-    ///   `ConstInt` boxes. A plain integer `ConstInt` (e.g. a counter)
-    ///   never reaches this path because the upstream caller already
-    ///   knows the box is a raw pointer from its annotated type.
+    /// 1. The seeded constant value's intrinsic Rust type. A
+    ///    `Value::Int` is `'i'`, `Value::Float` is `'f'`, `Value::Ref`
+    ///    is `'r'`. The `constant_types_for_numbering` override is a
+    ///    raw-pointer marker on `'i'`-typed Boxes (RPython's
+    ///    `getrawptrinfo` ConstInt path) — it does NOT change `op.type`
+    ///    from `'i'` to `'r'`, matching the upstream invariant that a
+    ///    raw-pointer `ConstInt` Box stays `op.type == 'i'` while still
+    ///    becoming `ConstPtrInfo` through `getrawptrinfo`.
+    /// 2. `value_types`, populated when an op is emitted via
+    ///    `OptContext::emit` (mirrors RPython `op.type` lookup on
+    ///    operations with a known result type).
+    /// 3. The producing op's static `result_type()` (last resort for
+    ///    OpRefs that have not been emitted yet but exist in
+    ///    `new_operations`).
     ///
-    /// majit's constant pool stores both shapes:
-    /// - `Value::Ref(gcref)` — full Ref-typed entry, returned directly
-    ///   (NULL is `Value::Ref(GcRef(0))`).
-    /// - `Value::Int(bits)` with a `Type::Ref` override in
-    ///   `constant_types_for_numbering` — a static class pointer or other
-    ///   GC-untracked address that the backend keeps as Int to skip
-    ///   shadow-stack rooting (mirrors RPython's
-    ///   `cast_instance_to_gcref`/`cast_int_to_ptr` round-trip on a
-    ///   ConstInt argument).
-    ///
-    /// Plain `Value::Int(bits)` WITHOUT a `Type::Ref` override is a
-    /// regular integer constant and must NOT be coerced into a
-    /// `ConstPtrInfo` here — that would conflate counters/indices with
-    /// null pointers and trigger spurious `is_null()` optimizations on
-    /// integer slots. RPython enforces the same separation via
-    /// `op.type == 'i'` raw-pointer-only annotation.
-    fn constant_ptr_addr(&self, opref: OpRef) -> Option<majit_ir::GcRef> {
+    /// Returns `None` only when none of the above sources have type
+    /// information for the OpRef. Callers must treat `None` like
+    /// RPython's "unknown type" path and avoid making structural
+    /// assumptions about it.
+    pub fn opref_type(&self, opref: OpRef) -> Option<majit_ir::Type> {
         let resolved = self.get_box_replacement(opref);
-        match self.get_constant(resolved)? {
-            Value::Ref(gcref) => Some(*gcref),
-            Value::Int(bits) => {
-                let tp = self.constant_types_for_numbering.get(&resolved.0)?;
-                if *tp == majit_ir::Type::Ref {
-                    Some(majit_ir::GcRef(*bits as usize))
-                } else {
-                    None
-                }
-            }
-            _ => None,
+        // 1. Seeded constant — read the intrinsic Rust shape.
+        //    The constant_types_for_numbering override is intentionally
+        //    NOT consulted here — it is a raw-pointer marker on
+        //    'i'-typed Boxes, not a type-changing annotation.
+        if let Some(val) = self.get_constant(resolved) {
+            return Some(val.get_type());
         }
+        // 2. value_types entry from a prior emit.
+        if let Some(&tp) = self.value_types.get(&resolved.0) {
+            return Some(tp);
+        }
+        // 3. Producing op result type.
+        self.get_op_result_type(resolved)
     }
 
-    /// info.py:880-894 `getptrinfo(op)` parity. RPython's `getptrinfo`
-    /// returns a freshly-constructed `ConstPtrInfo(op)` when `op` is a
-    /// `ConstPtr`, even when no info has been forwarded. majit mirrors
-    /// that here by synthesizing `PtrInfo::Constant(gcref)` for any
-    /// constant pointer (whether stored as `Value::Ref` or as
-    /// `Value::Int` with a `Type::Ref` override — see `constant_ptr_addr`),
-    /// otherwise borrowing the forwarded info. Returns a `Cow` so
-    /// callers can read the result without forcing an allocation in the
-    /// common forwarded case.
-    pub fn getptrinfo(&self, opref: OpRef) -> Option<std::borrow::Cow<'_, PtrInfo>> {
+    /// info.py:865-878 `getrawptrinfo(op)` parity (line-by-line port).
+    ///
+    /// ```python
+    /// def getrawptrinfo(op):
+    ///     from rpython.jit.metainterp.optimizeopt.intutils import IntBound
+    ///     assert op.type == 'i'
+    ///     op = op.get_box_replacement()
+    ///     assert op.type == 'i'
+    ///     if isinstance(op, ConstInt):
+    ///         return ConstPtrInfo(op)
+    ///     fw = op.get_forwarded()
+    ///     if isinstance(fw, IntBound):
+    ///         return None
+    ///     if fw is not None:
+    ///         assert isinstance(fw, AbstractRawPtrInfo)
+    ///         return fw
+    ///     return None
+    /// ```
+    ///
+    /// majit's only structural difference is the `ConstInt` arm: RPython
+    /// trusts the upstream caller to have selected `getrawptrinfo` only
+    /// for raw-pointer Boxes (i.e. the upstream caller is statically
+    /// certain that this `ConstInt` carries a raw pointer rather than a
+    /// plain integer). majit's flat constant pool cannot recover that
+    /// caller-side intent from the `ConstInt` alone, so the raw-pointer
+    /// signal is encoded as a `Type::Ref` entry in
+    /// `constant_types_for_numbering`. A plain `Value::Int` constant
+    /// without that annotation is treated as a plain integer (returns
+    /// `None`), preventing counters/indices from masquerading as null
+    /// pointers and triggering spurious `is_null` optimizations.
+    pub fn getrawptrinfo(&self, opref: OpRef) -> Option<std::borrow::Cow<'_, PtrInfo>> {
+        // assert op.type == 'i'
+        debug_assert!(
+            matches!(self.opref_type(opref), Some(majit_ir::Type::Int) | None),
+            "getrawptrinfo: expected 'i'-typed OpRef, got {:?}",
+            self.opref_type(opref)
+        );
+        // op = op.get_box_replacement()
         let resolved = self.get_box_replacement(opref);
-        // info.py:888-889: isinstance(op, ConstPtr) → ConstPtrInfo(op).
-        if let Some(gcref) = self.constant_ptr_addr(resolved) {
-            return Some(std::borrow::Cow::Owned(PtrInfo::Constant(gcref)));
+        // assert op.type == 'i'
+        debug_assert!(matches!(
+            self.opref_type(resolved),
+            Some(majit_ir::Type::Int) | None
+        ));
+        // if isinstance(op, ConstInt): return ConstPtrInfo(op)
+        // The `Type::Ref` override is majit's raw-pointer marker on the
+        // 'i'-typed constant pool entry — see opref_type docs.
+        if let Some(Value::Int(bits)) = self.get_constant(resolved) {
+            if let Some(majit_ir::Type::Ref) =
+                self.constant_types_for_numbering.get(&resolved.0).copied()
+            {
+                return Some(std::borrow::Cow::Owned(PtrInfo::Constant(majit_ir::GcRef(
+                    *bits as usize,
+                ))));
+            }
+            // Plain integer ConstInt (no raw-pointer marker) → upstream
+            // would never reach this branch from a properly-typed call
+            // site; majit returns None to mirror that "no info".
+            return None;
         }
+        // fw = op.get_forwarded()
+        // if isinstance(fw, IntBound): return None  →  get_ptr_info
+        //   already returns None for non-PtrInfo forwards (IntBound is
+        //   tracked separately in OptContext::int_bounds, not in
+        //   OptContext::forwarded[Forwarded::Info]).
+        // if fw is not None: assert isinstance(fw, AbstractRawPtrInfo); return fw
+        self.get_ptr_info(resolved).map(std::borrow::Cow::Borrowed)
+    }
+
+    /// info.py:880-894 `getptrinfo(op)` parity (line-by-line port).
+    ///
+    /// ```python
+    /// def getptrinfo(op):
+    ///     if op.type == 'i':
+    ///         return getrawptrinfo(op)
+    ///     elif op.type == 'f':
+    ///         return None
+    ///     assert op.type == 'r'
+    ///     op = get_box_replacement(op)
+    ///     assert op.type == 'r'
+    ///     if isinstance(op, ConstPtr):
+    ///         return ConstPtrInfo(op)
+    ///     fw = op.get_forwarded()
+    ///     if fw is not None:
+    ///         assert isinstance(fw, PtrInfo)
+    ///         return fw
+    ///     return None
+    /// ```
+    ///
+    /// The `op.type == 'r'` ConstPtr arm corresponds to a `Value::Ref`
+    /// constant in majit's pool. The `op.type == 'i'` arm delegates to
+    /// `getrawptrinfo`, which is the only path by which an integer
+    /// constant becomes `ConstPtrInfo` — matching upstream's
+    /// raw-pointer-only routing.
+    pub fn getptrinfo(&self, opref: OpRef) -> Option<std::borrow::Cow<'_, PtrInfo>> {
+        // if op.type == 'i': return getrawptrinfo(op)
+        // elif op.type == 'f': return None
+        // assert op.type == 'r'
+        match self.opref_type(opref) {
+            Some(majit_ir::Type::Int) => return self.getrawptrinfo(opref),
+            Some(majit_ir::Type::Float) => return None,
+            Some(majit_ir::Type::Ref) => {}
+            // Type::Void or unknown — RPython would have asserted; majit
+            // returns the forwarded slot (or None) to mirror "no info
+            // available" rather than panicking on traces that haven't
+            // populated value_types for every transitively reachable
+            // OpRef.
+            _ => {}
+        }
+        // op = get_box_replacement(op)
+        let resolved = self.get_box_replacement(opref);
+        // if isinstance(op, ConstPtr): return ConstPtrInfo(op)
+        if let Some(Value::Ref(gcref)) = self.get_constant(resolved) {
+            return Some(std::borrow::Cow::Owned(PtrInfo::Constant(*gcref)));
+        }
+        // fw = op.get_forwarded()
+        // if fw is not None: assert isinstance(fw, PtrInfo); return fw
         self.get_ptr_info(resolved).map(std::borrow::Cow::Borrowed)
     }
 
@@ -2526,28 +2624,52 @@ impl OptContext {
 
     /// info.py:718-726 `ConstPtrInfo._get_info(descr, optheap)` parity.
     ///
-    /// For a constant GC object, returns the per-object `StructPtrInfo`
-    /// (here represented as `PtrInfo::Instance`) shared via `optheap.
-    /// const_infos`. RPython looks up by `_const.getref_base()`; majit
-    /// resolves the address through `constant_ptr_addr` so that
-    /// `Value::Ref` constants AND `Value::Int` bits with a `Type::Ref`
-    /// override (e.g. static class pointers passed through `const_ref` or
-    /// `mark_type`) hash to the same `const_infos` slot — matching the
-    /// upstream invariant that any `ConstPtrInfo._get_info()` call on the
-    /// same constant returns the same shared `StructPtrInfo`.
-    /// Returns None if `opref` is not a constant pointer or is null.
+    /// ```python
+    /// def _get_info(self, descr, optheap):
+    ///     ref = self._const.getref_base()
+    ///     if not ref:
+    ///         raise InvalidLoop   # null protection
+    ///     info = optheap.const_infos.get(ref, None)
+    ///     if info is None:
+    ///         info = StructPtrInfo(descr)
+    ///         optheap.const_infos[ref] = info
+    ///     return info
+    /// ```
+    ///
+    /// majit's port: route through `getptrinfo` (which encapsulates the
+    /// RPython `op.type` dispatch + `ConstPtrInfo` synthesis), then read
+    /// `_const.getref_base()` from the resulting `PtrInfo::Constant`.
+    /// Both `Value::Ref` constants and `Value::Int` constants tagged
+    /// with a `Type::Ref` override hash to the same `const_infos` slot
+    /// — the upstream invariant that any `ConstPtrInfo._get_info()`
+    /// call on the same address returns the same shared
+    /// `StructPtrInfo`.
+    ///
+    /// Returns None if `opref` is not a constant pointer (matching the
+    /// "no info" path) or is null (matching `if not ref: raise
+    /// InvalidLoop`; majit lifts the InvalidLoop into the calling
+    /// optimizer pass via `Option::None`).
     pub fn get_const_info_mut(
         &mut self,
         opref: OpRef,
     ) -> Option<&mut crate::optimizeopt::info::PtrInfo> {
-        // info.py:719-720: `if not ref: raise InvalidLoop` — null protection.
-        let gcref = self.constant_ptr_addr(opref)?;
+        use crate::optimizeopt::info::PtrInfo;
+        // info.py:719: ref = self._const.getref_base()
+        // Honor the RPython op.type dispatch via getptrinfo so a plain
+        // Value::Int (no Type::Ref override) is rejected here too.
+        let gcref = match self.getptrinfo(opref).as_deref() {
+            Some(PtrInfo::Constant(g)) => *g,
+            _ => return None,
+        };
+        // info.py:720-721: if not ref: raise InvalidLoop  → null protection.
         if gcref.is_null() {
             return None;
         }
         let addr = gcref.0;
         use std::collections::hash_map::Entry;
         match self.const_infos.entry(addr) {
+            // info.py:722-725: info = optheap.const_infos.get(ref, None)
+            //                  if info is None: info = StructPtrInfo(descr); ...
             Entry::Occupied(e) => Some(e.into_mut()),
             Entry::Vacant(e) => {
                 Some(e.insert(crate::optimizeopt::info::PtrInfo::instance(None, None)))
