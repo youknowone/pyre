@@ -1438,20 +1438,31 @@ fn init_type_type(ns: &mut PyNamespace) {
             return Ok(pyre_object::w_dict_new());
         }
         let cls = args[0];
-        // Pyre stores class annotations as an ATTR_TABLE entry on the
-        // type object under the "__annotations__" key.
+        // First try a directly stored __annotations__ dict — pyre's
+        // legacy path stashes it on the type's ATTR_TABLE entry.
         let stored = crate::baseobjspace::ATTR_TABLE.with(|table| {
-            let table = table.borrow();
-            if let Some(attrs) = table.get(&(cls as usize)) {
-                for (name, value) in attrs {
-                    if name == "__annotations__" {
-                        return Some(*value);
-                    }
-                }
-            }
-            None
+            table
+                .borrow()
+                .get(&(cls as usize))
+                .and_then(|d| d.get("__annotations__").copied())
         });
-        Ok(stored.unwrap_or_else(pyre_object::w_dict_new))
+        if let Some(v) = stored {
+            return Ok(v);
+        }
+        // PEP 649 path: bytecode emits `__annotate_func__` (== `__annotate__`).
+        // Call it with format=1 (VALUE) to materialise the dict.
+        if let Some(annotate_fn) =
+            unsafe { crate::baseobjspace::lookup_in_type(cls, "__annotate_func__") }
+                .or_else(|| unsafe { crate::baseobjspace::lookup_in_type(cls, "__annotate__") })
+        {
+            if !annotate_fn.is_null() && !unsafe { pyre_object::is_none(annotate_fn) } {
+                return Ok(crate::call::call_function_impl_raw(
+                    annotate_fn,
+                    &[pyre_object::w_int_new(1)],
+                ));
+            }
+        }
+        Ok(pyre_object::w_dict_new())
     });
     namespace_store(
         ns,

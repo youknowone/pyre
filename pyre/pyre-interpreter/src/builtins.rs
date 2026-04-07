@@ -174,10 +174,10 @@ pub fn install_default_builtins(namespace: &mut PyNamespace) {
         make_builtin_function("globals", builtin_globals)
     });
     namespace.get_or_insert_with("locals", || make_builtin_function("locals", builtin_locals));
-    namespace.get_or_insert_with("exec", || make_builtin_function("exec", |_| Ok(w_none())));
-    namespace.get_or_insert_with("eval", || make_builtin_function("eval", |_| Ok(w_none())));
+    namespace.get_or_insert_with("exec", || make_builtin_function("exec", builtin_exec));
+    namespace.get_or_insert_with("eval", || make_builtin_function("eval", builtin_eval));
     namespace.get_or_insert_with("compile", || {
-        make_builtin_function("compile", |_| Ok(w_none()))
+        make_builtin_function("compile", builtin_compile)
     });
     namespace.get_or_insert_with("complex", || {
         make_builtin_function("complex", |_| Ok(w_none()))
@@ -1362,6 +1362,216 @@ fn builtin_callable(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
                 .is_some())
     };
     Ok(w_bool_from(is_callable))
+}
+
+/// `compile(source, filename, mode, ...)` — PyPy: pyopcode.py builtin_compile
+///
+/// Compiles a Python string to a code object. Only `source`, `filename` and
+/// `mode` are honoured; flags / dont_inherit / optimize are accepted but
+/// ignored, matching the minimal stub PyPy uses for shim modules.
+fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.len() < 3 {
+        return Err(crate::PyError::type_error(
+            "compile() requires source, filename, mode",
+        ));
+    }
+    let source = args[0];
+    let filename_obj = args[1];
+    let mode_obj = args[2];
+    let source_str = unsafe {
+        if pyre_object::is_str(source) {
+            pyre_object::w_str_get_value(source).to_string()
+        } else if pyre_object::bytearrayobject::is_bytearray(source) {
+            String::from_utf8_lossy(pyre_object::bytearrayobject::w_bytearray_data(source))
+                .into_owned()
+        } else {
+            return Err(crate::PyError::type_error(
+                "compile() arg 1 must be a string or bytes",
+            ));
+        }
+    };
+    let filename = unsafe {
+        if pyre_object::is_str(filename_obj) {
+            pyre_object::w_str_get_value(filename_obj).to_string()
+        } else {
+            "<string>".to_string()
+        }
+    };
+    let mode = unsafe {
+        if pyre_object::is_str(mode_obj) {
+            pyre_object::w_str_get_value(mode_obj).to_string()
+        } else {
+            "exec".to_string()
+        }
+    };
+    let mode = match mode.as_str() {
+        "exec" => crate::compile::Mode::Exec,
+        "eval" => crate::compile::Mode::Eval,
+        "single" => crate::compile::Mode::Single,
+        other => {
+            return Err(crate::PyError::new(
+                crate::PyErrorKind::ValueError,
+                format!("compile() mode must be 'exec', 'eval' or 'single', not {other:?}"),
+            ));
+        }
+    };
+    let code = crate::compile::compile_source_with_filename(&source_str, mode, &filename)
+        .map_err(|e| crate::PyError::new(crate::PyErrorKind::ValueError, e))?;
+    let code_ptr = Box::into_raw(Box::new(code)) as *const ();
+    Ok(crate::w_code_new(code_ptr))
+}
+
+/// `exec(source_or_code, globals=None, locals=None)` — PyPy:
+/// pyopcode.py builtin_exec.
+///
+/// Compiles `source` if necessary, then runs the resulting code object in
+/// the supplied namespaces.  When the namespaces are dicts, pyre converts
+/// them into `PyNamespace`s before invocation and copies the post-run
+/// namespace contents back so that callers see the new bindings.
+fn builtin_exec(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.is_empty() {
+        return Err(crate::PyError::type_error("exec() requires source"));
+    }
+    let source = args[0];
+    let globals_arg = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+    let locals_arg = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
+    exec_or_eval(source, globals_arg, locals_arg, false)
+}
+
+/// `eval(source_or_code, globals=None, locals=None)` — same plumbing as
+/// exec but returns the value of the expression.
+fn builtin_eval(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.is_empty() {
+        return Err(crate::PyError::type_error("eval() requires source"));
+    }
+    let source = args[0];
+    let globals_arg = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+    let locals_arg = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
+    exec_or_eval(source, globals_arg, locals_arg, true)
+}
+
+fn exec_or_eval(
+    source: PyObjectRef,
+    globals_arg: PyObjectRef,
+    locals_arg: PyObjectRef,
+    is_eval: bool,
+) -> Result<PyObjectRef, crate::PyError> {
+    // Resolve a runnable code object: accept a precompiled W_Code or
+    // compile a str on the fly.
+    let code_obj_ref = unsafe {
+        if pyre_object::is_str(source) {
+            let s = pyre_object::w_str_get_value(source).to_string();
+            let mode = if is_eval {
+                crate::compile::Mode::Eval
+            } else {
+                crate::compile::Mode::Exec
+            };
+            let code = crate::compile::compile_source(&s, mode)
+                .map_err(|e| crate::PyError::new(crate::PyErrorKind::ValueError, e))?;
+            let code_ptr = Box::into_raw(Box::new(code)) as *const ();
+            crate::w_code_new(code_ptr)
+        } else if !source.is_null() && crate::is_code(source) {
+            source
+        } else {
+            return Err(crate::PyError::type_error(
+                "exec() / eval() expects str or code",
+            ));
+        }
+    };
+    let raw_code = unsafe {
+        crate::w_code_get_ptr(code_obj_ref as pyre_object::PyObjectRef) as *const crate::CodeObject
+    };
+
+    // Build a PyNamespace from the supplied globals dict (or fall back to
+    // the caller's frame globals when None / missing). Mutations made by
+    // the executed code propagate back to the original dict via the
+    // dict-namespace sync helpers.
+    let (ns_box, sync_back_dict) =
+        if !globals_arg.is_null() && unsafe { pyre_object::is_dict(globals_arg) } {
+            let mut ns = Box::new(crate::PyNamespace::new());
+            unsafe {
+                for (key, value) in pyre_object::w_dict_items(globals_arg) {
+                    if !value.is_null() && pyre_object::is_str(key) {
+                        crate::namespace_store(&mut ns, pyre_object::w_str_get_value(key), value);
+                    }
+                }
+            }
+            ns.fix_ptr();
+            (ns, Some(globals_arg))
+        } else {
+            // Inherit caller globals.
+            let mut ns = Box::new(crate::PyNamespace::new());
+            crate::eval::CURRENT_FRAME.with(|current| {
+                let frame = current.get();
+                if !frame.is_null() {
+                    let parent_ns = unsafe { (*frame).namespace };
+                    if !parent_ns.is_null() {
+                        for (k, &v) in unsafe { &*parent_ns }.entries() {
+                            if !v.is_null() {
+                                crate::namespace_store(&mut ns, k, v);
+                            }
+                        }
+                    }
+                }
+            });
+            ns.fix_ptr();
+            (ns, None)
+        };
+    // If a separate `locals` dict was passed, layer its bindings on top
+    // of the globals namespace. Module-level execs in dataclasses pass
+    // the same dict for both, so this also covers `exec(src, g, l)` where
+    // `l is g`. Track which dict to write back into.
+    let mut ns_box = ns_box;
+    let locals_sync = if !locals_arg.is_null()
+        && unsafe { pyre_object::is_dict(locals_arg) }
+        && !std::ptr::eq(locals_arg, globals_arg)
+    {
+        unsafe {
+            for (key, value) in pyre_object::w_dict_items(locals_arg) {
+                if !value.is_null() && pyre_object::is_str(key) {
+                    crate::namespace_store(&mut ns_box, pyre_object::w_str_get_value(key), value);
+                }
+            }
+        }
+        Some(locals_arg)
+    } else {
+        None
+    };
+    let ns_ptr = Box::into_raw(ns_box);
+
+    let exec_ctx = crate::eval::CURRENT_FRAME.with(|current| {
+        let frame = current.get();
+        if frame.is_null() {
+            std::ptr::null::<crate::PyExecutionContext>()
+        } else {
+            unsafe { (*frame).execution_context }
+        }
+    });
+    let mut frame =
+        crate::pyframe::PyFrame::new_with_namespace(code_obj_ref as *const (), exec_ctx, ns_ptr);
+    frame.fix_array_ptrs();
+    let result = crate::eval::eval_frame_plain(&mut frame);
+
+    // Drain the namespace back into the dict the caller passed in so the
+    // exec'd module-level bindings are visible to subsequent code.
+    let writeback_target = locals_sync.or(sync_back_dict);
+    if let Some(target) = writeback_target {
+        unsafe {
+            for (k, &v) in (*ns_ptr).entries() {
+                if !v.is_null() {
+                    pyre_object::w_dict_store(target, pyre_object::w_str_new(k), v);
+                }
+            }
+        }
+    }
+
+    let _ = raw_code; // keep raw_code alive until after exec for safety.
+    let _ = unsafe { Box::from_raw(ns_ptr) };
+    match result {
+        Ok(v) if is_eval => Ok(v),
+        Ok(_) => Ok(pyre_object::w_none()),
+        Err(e) => Err(e),
+    }
 }
 
 fn builtin_globals(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {

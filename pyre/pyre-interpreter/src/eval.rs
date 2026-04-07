@@ -605,6 +605,25 @@ impl ConstantOpcodeHandler for PyFrame {
 impl OpcodeStepExecutor for PyFrame {
     type Error = PyError;
 
+    /// SETUP_ANNOTATIONS — ensure `__annotations__` exists in the
+    /// current locals namespace. PyPy: pyopcode.py SETUP_ANNOTATIONS
+    /// (typeobject.py auto-fills the slot at class creation, but the
+    /// pyre-equivalent flow runs the bytecode opcode and writes into
+    /// the class_locals namespace just like CPython).
+    fn setup_annotations(&mut self) -> Result<(), Self::Error> {
+        let ns = if !self.class_locals.is_null() {
+            unsafe { &mut *self.class_locals }
+        } else if !self.namespace.is_null() {
+            unsafe { &mut *self.namespace }
+        } else {
+            return Ok(());
+        };
+        if namespace_load(ns, "__annotations__").is_err() {
+            namespace_store(ns, "__annotations__", pyre_object::w_dict_new());
+        }
+        Ok(())
+    }
+
     // ── LoadCommonConstant ──
     fn load_common_constant(
         &mut self,
