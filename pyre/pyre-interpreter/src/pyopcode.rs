@@ -290,6 +290,10 @@ pub trait ConstantOpcodeHandler: SharedOpcodeHandler {
         // Default: build as tuple. PyFrame overrides to create W_SliceObject.
         self.build_tuple(&[start, stop, step])
     }
+    fn frozenset_constant(&mut self, items: &[Self::Value]) -> Result<Self::Value, PyError> {
+        // Default: build as tuple. PyFrame overrides to create W_FrozenSetObject.
+        self.build_tuple(items)
+    }
 }
 
 fn load_const_value<H: ConstantOpcodeHandler + ?Sized>(
@@ -329,12 +333,11 @@ fn load_const_value<H: ConstantOpcodeHandler + ?Sized>(
             handler.float_constant(value.re)
         }
         ConstantData::Frozenset { elements } => {
-            // frozenset → tuple (stub: proper frozenset not yet available)
             let mut items = Vec::with_capacity(elements.len());
             for element in elements {
                 items.push(load_const_value(handler, element)?);
             }
-            handler.build_tuple(&items)
+            handler.frozenset_constant(&items)
         }
         ConstantData::Slice { elements } => {
             // Slice constant → build start/stop/step via handler.slice_constant()

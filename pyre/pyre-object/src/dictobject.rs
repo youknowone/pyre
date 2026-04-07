@@ -62,25 +62,63 @@ pub fn w_dict_new_with_namespace(ns: *mut u8) -> PyObjectRef {
 /// Compare two dict keys for equality.
 ///
 /// PyPy: uses space.eq_w which dispatches to type-specific comparison.
-/// Simplified: pointer identity → int equality → str equality.
-unsafe fn dict_keys_equal(a: PyObjectRef, b: PyObjectRef) -> bool {
+/// pyre handles the hashable builtin types directly: int, str, bool, tuple,
+/// frozenset, plus pointer identity for everything else.
+pub(crate) unsafe fn dict_keys_equal(a: PyObjectRef, b: PyObjectRef) -> bool {
     if std::ptr::eq(a, b) {
         return true;
     }
     if a.is_null() || b.is_null() {
         return false;
     }
-    // Int keys
-    if crate::is_int(a) && crate::is_int(b) {
-        return crate::w_int_get_value(a) == crate::w_int_get_value(b);
+    // Mixed numeric: bool ↔ int (Python: True == 1 and False == 0).
+    let a_is_bool = crate::is_bool(a);
+    let b_is_bool = crate::is_bool(b);
+    let a_is_int = crate::is_int(a);
+    let b_is_int = crate::is_int(b);
+    if (a_is_int || a_is_bool) && (b_is_int || b_is_bool) {
+        let av = if a_is_bool {
+            crate::w_bool_get_value(a) as i64
+        } else {
+            crate::w_int_get_value(a)
+        };
+        let bv = if b_is_bool {
+            crate::w_bool_get_value(b) as i64
+        } else {
+            crate::w_int_get_value(b)
+        };
+        return av == bv;
     }
     // Str keys
     if crate::is_str(a) && crate::is_str(b) {
         return crate::w_str_get_value(a) == crate::w_str_get_value(b);
     }
-    // Bool keys
-    if crate::is_bool(a) && crate::is_bool(b) {
-        return crate::w_bool_get_value(a) == crate::w_bool_get_value(b);
+    // Tuple keys — element-wise compare via dict_keys_equal recursively.
+    if crate::is_tuple(a) && crate::is_tuple(b) {
+        let la = crate::w_tuple_len(a);
+        let lb = crate::w_tuple_len(b);
+        if la != lb {
+            return false;
+        }
+        for i in 0..la {
+            let ea = crate::w_tuple_getitem(a, i as i64).unwrap_or(std::ptr::null_mut());
+            let eb = crate::w_tuple_getitem(b, i as i64).unwrap_or(std::ptr::null_mut());
+            if !dict_keys_equal(ea, eb) {
+                return false;
+            }
+        }
+        return true;
+    }
+    // frozenset / set: element-wise containment via the same equality.
+    if crate::is_frozenset(a) && crate::is_frozenset(b) {
+        let ai = crate::w_set_items(a);
+        let bi = crate::w_set_items(b);
+        if ai.len() != bi.len() {
+            return false;
+        }
+        return ai
+            .iter()
+            .all(|&x| bi.iter().any(|&y| dict_keys_equal(x, y)));
     }
     false
 }
