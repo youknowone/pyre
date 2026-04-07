@@ -2762,8 +2762,12 @@ impl MIFrame {
         }
 
         unsafe {
-            if is_builtin_code(concrete_callable) {
-                let builtin_name = builtin_code_name(concrete_callable);
+            let is_builtin = is_function(concrete_callable)
+                && is_builtin_code(
+                    pyre_interpreter::getcode(concrete_callable) as pyre_object::PyObjectRef
+                );
+            if is_builtin {
+                let builtin_name = pyre_interpreter::function_get_name(concrete_callable);
                 if args.len() == 1 {
                     let c_arg0 = concrete_args.first().copied().unwrap_or(PY_NULL);
                     self.with_ctx(|this, ctx| {
@@ -2811,7 +2815,7 @@ impl MIFrame {
             }
             if is_function(concrete_callable) {
                 let callee_code_ptr =
-                    pyre_interpreter::getcode(concrete_callable) as *const CodeObject;
+                    unsafe { pyre_interpreter::get_pycode(concrete_callable) } as *const CodeObject;
                 let callee_key = crate::driver::make_green_key(callee_code_ptr, 0);
                 let callee_code = unsafe { &*callee_code_ptr };
                 let callee_has_loop = code_has_backward_jump(callee_code);
@@ -2990,9 +2994,9 @@ impl MIFrame {
                     );
                 }
                 if let Some(token_number) = driver.get_pending_token_number(callee_key) {
-                    let callee_nlocals = {
+                    let callee_nlocals = unsafe {
                         let code_ptr =
-                            pyre_interpreter::getcode(concrete_callable) as *const CodeObject;
+                            pyre_interpreter::get_pycode(concrete_callable) as *const CodeObject;
                         (&*code_ptr).varnames.len()
                     };
                     if nargs == 1 || (crate::callbacks::get().callee_frame_helper)(nargs).is_some()
@@ -3308,7 +3312,8 @@ impl MIFrame {
         let caller_code = unsafe { (*self.sym().jitcode).code };
         let caller_exec_ctx = self.sym().concrete_execution_context;
         let caller_namespace_ptr = self.sym().concrete_namespace;
-        let code_ptr = unsafe { pyre_interpreter::getcode(concrete_callable) } as *const CodeObject;
+        let code_ptr =
+            unsafe { pyre_interpreter::get_pycode(concrete_callable) } as *const CodeObject;
         let globals = unsafe { function_get_globals(concrete_callable) };
         let closure = unsafe { pyre_interpreter::function_get_closure(concrete_callable) };
         let is_self_recursive = crate::driver::make_green_key(caller_code, 0) == callee_key;
@@ -4479,8 +4484,14 @@ impl SharedOpcodeHandler for MIFrame {
         let mut result_concrete = ConcreteValue::Null;
         if !concrete_callable.is_null() && concrete_args.iter().all(|v| !v.is_null()) {
             unsafe {
-                if pyre_interpreter::is_builtin_code(concrete_callable) {
-                    let func = pyre_interpreter::builtin_code_get(concrete_callable);
+                if pyre_interpreter::is_function(concrete_callable)
+                    && pyre_interpreter::is_builtin_code(pyre_interpreter::getcode(
+                        concrete_callable,
+                    )
+                        as pyre_object::PyObjectRef)
+                {
+                    let code = pyre_interpreter::getcode(concrete_callable);
+                    let func = pyre_interpreter::builtin_code_get(code as pyre_object::PyObjectRef);
                     let result = func(&concrete_args).unwrap_or(pyre_object::PY_NULL);
                     result_concrete = ConcreteValue::from_pyobj(result);
                 } else if pyre_interpreter::is_function(concrete_callable) {
@@ -5292,8 +5303,8 @@ impl OpcodeStepExecutor for MIFrame {
                     if pyre_object::is_str(exc_type_obj) {
                         let type_name = pyre_object::w_str_get_value(exc_type_obj);
                         pyre_object::exc_kind_matches(kind, type_name)
-                    } else if pyre_interpreter::is_builtin_code(exc_type_obj) {
-                        let type_name = pyre_interpreter::builtin_code_name(exc_type_obj);
+                    } else if pyre_interpreter::is_function(exc_type_obj) {
+                        let type_name = pyre_interpreter::function_get_name(exc_type_obj);
                         pyre_object::exc_kind_matches(kind, type_name)
                     } else {
                         true // unrecognized type format → match

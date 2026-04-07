@@ -56,7 +56,7 @@ pub fn init(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "_getframe",
-        crate::builtin_code_new("_getframe", |_| {
+        crate::make_builtin_function("_getframe", |_| {
             let frame_type = crate::typedef::w_object();
             let frame = pyre_object::w_instance_new(frame_type);
             let _ = crate::baseobjspace::setattr(frame, "f_locals", w_dict_new());
@@ -71,7 +71,7 @@ pub fn init(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "exc_info",
-        crate::builtin_code_new("exc_info", |_| {
+        crate::make_builtin_function("exc_info", |_| {
             Ok(w_tuple_new(vec![w_none(), w_none(), w_none()]))
         }),
     );
@@ -104,24 +104,24 @@ pub fn init(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "getdefaultencoding",
-        crate::builtin_code_new("getdefaultencoding", |_| Ok(w_str_new("utf-8"))),
+        crate::make_builtin_function("getdefaultencoding", |_| Ok(w_str_new("utf-8"))),
     );
     // sys.getrecursionlimit / setrecursionlimit
     namespace_store(
         ns,
         "getrecursionlimit",
-        crate::builtin_code_new("getrecursionlimit", |_| Ok(w_int_new(1000))),
+        crate::make_builtin_function("getrecursionlimit", |_| Ok(w_int_new(1000))),
     );
     namespace_store(
         ns,
         "setrecursionlimit",
-        crate::builtin_code_new("setrecursionlimit", |_| Ok(w_none())),
+        crate::make_builtin_function("setrecursionlimit", |_| Ok(w_none())),
     );
     // sys.intern
     namespace_store(
         ns,
         "intern",
-        crate::builtin_code_new("intern", |args| {
+        crate::make_builtin_function("intern", |args| {
             Ok(if args.is_empty() {
                 w_str_new("")
             } else {
@@ -152,6 +152,6 @@ pub fn init(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "addaudithook",
-        crate::builtin_code_new("addaudithook", |_| Ok(w_none())),
+        crate::make_builtin_function("addaudithook", |_| Ok(w_none())),
     );
 }

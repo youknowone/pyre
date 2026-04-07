@@ -616,7 +616,11 @@ mod tests {
 
         unsafe {
             assert!(pyre_interpreter::is_function(func));
-            assert_eq!(pyre_interpreter::function_get_code(func), code_ptr);
+            // Function.code now stores the W_CodeObject, not the raw CodeObject.
+            assert_eq!(
+                pyre_interpreter::function_get_code(func),
+                code_obj as *const ()
+            );
         }
     }
 

@@ -2129,7 +2129,7 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
         if pyre_object::generatorobject::is_generator(obj) {
             match name {
                 "close" | "send" | "throw" | "__next__" | "__iter__" => {
-                    return Ok(crate::builtin_code_new("gen_method", gen_stub_method));
+                    return Ok(crate::make_builtin_function("gen_method", gen_stub_method));
                 }
                 _ => {}
             }
@@ -2200,7 +2200,7 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
                 }
                 // Step 5: builtin methods found in base type MRO need binding
                 // CPython: PyFunction_GET_CODE slot → bound method
-                if crate::is_builtin_code(descr) {
+                if crate::is_function(descr) {
                     return Ok(pyre_object::w_method_new(descr, obj, w_type));
                 }
                 return Ok(descr);
@@ -2318,7 +2318,7 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
     // methods pre-installed, matching PyPy's TypeDef interpleveldefs.
     if let Some(w_type) = crate::typedef::r#type(obj) {
         if let Some(method) = unsafe { lookup_in_type_where(w_type, name) } {
-            if unsafe { crate::is_builtin_code(method) } {
+            if unsafe { crate::is_function(method) } {
                 return Ok(pyre_object::w_method_new(method, obj, w_type));
             }
             if let Some(result) = unsafe { get(method, obj, w_type) } {
@@ -2330,7 +2330,7 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
 
     // Function object attributes — PyPy: funcobject.py W_Function
     // Check ATTR_TABLE first (for dynamically set attrs like __name__, __doc__)
-    if unsafe { crate::is_function(obj) || crate::is_builtin_code(obj) } {
+    if unsafe { crate::is_function(obj) } {
         let found = ATTR_TABLE.with(|table| {
             table
                 .borrow()
@@ -2345,11 +2345,12 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
         if crate::is_function(obj) {
             match name {
                 "__code__" => {
-                    let code_ptr = crate::function_get_code(obj) as *const crate::CodeObject;
-                    if code_ptr.is_null() {
+                    // function_get_code returns Code-level pointer (W_CodeObject or BuiltinCode)
+                    let code = crate::function_get_code(obj) as PyObjectRef;
+                    if code.is_null() {
                         return Ok(w_none());
                     }
-                    return Ok(crate::pycode::box_code_constant(&*code_ptr));
+                    return Ok(code);
                 }
                 "__name__" => {
                     return Ok(w_str_new(crate::function_get_name(obj)));
@@ -2387,9 +2388,13 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
                     if let Some(value) = found {
                         return Ok(value);
                     }
-                    let code_ptr = crate::function_get_code(obj) as *const crate::CodeObject;
-                    if !code_ptr.is_null() {
-                        return Ok(w_str_new((*code_ptr).qualname.as_ref()));
+                    let code = crate::function_get_code(obj) as PyObjectRef;
+                    if !code.is_null() && crate::pycode::is_code(code) {
+                        let raw_code_ptr =
+                            crate::pycode::w_code_get_ptr(code) as *const crate::CodeObject;
+                        if !raw_code_ptr.is_null() {
+                            return Ok(w_str_new((*raw_code_ptr).qualname.as_ref()));
+                        }
                     }
                     return Ok(w_str_new(crate::function_get_name(obj)));
                 }
@@ -2520,7 +2525,7 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
     if let Some(w_class) = overridden_class {
         if unsafe { is_type(w_class) } {
             if let Some(method) = unsafe { lookup_in_type_where(w_class, name) } {
-                if unsafe { crate::is_builtin_code(method) } {
+                if unsafe { crate::is_function(method) } {
                     return Ok(pyre_object::w_method_new(method, obj, w_class));
                 }
                 if let Some(result) = unsafe { get(method, obj, w_class) } {
@@ -3042,7 +3047,6 @@ pub fn call_function(callable: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRef
 pub fn callable_w(obj: PyObjectRef) -> bool {
     unsafe {
         is_function(obj)
-            || crate::is_builtin_code(obj)
             || is_type(obj)
             || (is_instance(obj) && lookup_in_type(w_instance_get_type(obj), "__call__").is_some())
     }

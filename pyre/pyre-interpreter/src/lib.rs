@@ -45,7 +45,7 @@ pub use frame_array::*;
 pub use function::*;
 pub use gateway::{
     BUILTIN_CODE_TYPE, BuiltinCode, BuiltinCodeFn, builtin_code_get, builtin_code_name,
-    builtin_code_new, is_builtin_code,
+    builtin_code_new, is_builtin_code, make_builtin_function,
 };
 pub use malachite_bigint::BigInt as PyBigInt;
 pub use opcode_ops::*;

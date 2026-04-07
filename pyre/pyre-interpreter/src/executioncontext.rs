@@ -845,7 +845,7 @@ pub fn make_finalizer_queue<WRoot>(w_root: WRoot, _space: PyObjectRef) -> WRootF
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::is_builtin_code;
+    use crate::is_function;
 
     #[test]
     fn test_fresh_namespace_starts_with_builtins() {
@@ -855,9 +855,10 @@ mod tests {
         let print = *namespace.get("print").unwrap();
         let range = *namespace.get("range").unwrap();
 
+        // Builtins are now Function objects (FunctionWithFixedCode) wrapping BuiltinCode.
         unsafe {
-            assert!(is_builtin_code(print));
-            assert!(is_builtin_code(range));
+            assert!(is_function(print));
+            assert!(is_function(range));
         }
     }
 

@@ -184,7 +184,7 @@ pub fn int_unwrapping_space_method<T>(_typ: T) -> &'static str {
 
 pub fn interp2app(func: PyObjectRef) -> PyObjectRef {
     let _ = func;
-    builtin_code_new("interp2app", |_| Ok(std::ptr::null_mut()))
+    make_builtin_function("interp2app", |_| Ok(std::ptr::null_mut()))
 }
 
 pub fn interp2app_temp(func: PyObjectRef) -> PyObjectRef {
@@ -201,7 +201,7 @@ pub fn interpindirect2app(
 
 pub fn unwrap_spec(_spec: &[&'static str]) -> PyObjectRef {
     let _ = _spec;
-    builtin_code_new("unwrap", |_| Ok(std::ptr::null_mut()))
+    make_builtin_function("unwrap", |_| Ok(std::ptr::null_mut()))
 }
 
 pub fn appdef(
@@ -293,4 +293,14 @@ pub unsafe fn builtin_code_get(obj: PyObjectRef) -> BuiltinCodeFn {
 pub unsafe fn builtin_code_name(obj: PyObjectRef) -> &'static str {
     let func_obj = obj as *const BuiltinCode;
     unsafe { (*func_obj).name }
+}
+
+/// gateway.py GatewayCache.build() parity — wrap a BuiltinCodeFn as FunctionWithFixedCode.
+///
+/// Creates a BuiltinCode (Code object) and wraps it in a Function with
+/// `can_change_code = false`, matching PyPy's:
+///   `fn = FunctionWithFixedCode(space, code, None, defs, forcename=gateway.name)`
+pub fn make_builtin_function(name: &'static str, func: BuiltinCodeFn) -> PyObjectRef {
+    let code = builtin_code_new(name, func);
+    crate::function_new_with_fixed_code(code as *const (), name.to_string(), std::ptr::null_mut())
 }

@@ -16,7 +16,8 @@ pub static FUNCTION_TYPE: PyType = PyType {
 /// User-defined function object.
 ///
 /// Layout: `[ob_type | code | can_change_code | name_ptr | w_func_globals | closure]`
-/// - `code`: opaque pointer to the CodeObject
+/// - `code`: pointer to a Code object (W_CodeObject for user funcs, BuiltinCode for builtins).
+///   function.py:47 — `_immutable_fields_ = ['code?', ...]`
 /// - `can_change_code`: function.py:33 — True by default; False for
 ///   `FunctionWithFixedCode` subclass (used by builtins).
 /// - `name_ptr`: leaked `Box<String>` containing the function name
@@ -25,7 +26,7 @@ pub static FUNCTION_TYPE: PyType = PyType {
 #[repr(C)]
 pub struct Function {
     pub ob: PyObject,
-    /// Opaque pointer to the CodeObject (borrowed from constants).
+    /// Pointer to a Code object (W_CodeObject or BuiltinCode).
     /// function.py:47 — `_immutable_fields_ = ['code?', ...]`
     pub code: *const (),
     /// function.py:33 — `can_change_code = True`
@@ -67,7 +68,7 @@ pub const FUNCTION_CLOSURE_OFFSET: usize = std::mem::offset_of!(Function, closur
 
 /// Allocate a new `Function`.
 ///
-/// `code` is an opaque pointer to the CodeObject.
+/// `code` is a pointer to a Code object (W_CodeObject) cast to `*const ()`.
 /// `name` is the function name string (leaked).
 /// `w_func_globals` is the defining module's namespace pointer (shared).
 pub fn function_new(
@@ -182,7 +183,9 @@ pub unsafe fn getcode(obj: PyObjectRef) -> *const () {
     (*func).code
 }
 
-/// Get the opaque code pointer from a function object.
+/// Get the Code object pointer from a function object.
+///
+/// Returns a pointer to the Code-level object (W_CodeObject or BuiltinCode).
 ///
 /// # Safety
 /// `obj` must point to a valid `Function`.
@@ -191,6 +194,25 @@ pub unsafe fn getcode(obj: PyObjectRef) -> *const () {
 #[inline]
 pub unsafe fn function_get_code(obj: PyObjectRef) -> *const () {
     unsafe { (*(obj as *const Function)).code }
+}
+
+/// Extract the raw bytecode CodeObject pointer from a user function.
+///
+/// Equivalent to accessing `self.getcode().code_ptr` in PyPy terms:
+/// `getcode()` returns the Code wrapper (W_CodeObject), and this
+/// dereferences through it to the underlying CodeObject.
+///
+/// # Safety
+/// `obj` must point to a valid `Function` whose `code` field is a `W_CodeObject`
+/// (i.e., NOT a BuiltinCode). Only call on user-defined functions.
+#[inline]
+pub unsafe fn get_pycode(obj: PyObjectRef) -> *const () {
+    let code = getcode(obj);
+    debug_assert!(
+        !crate::is_builtin_code(code as PyObjectRef),
+        "get_pycode called on a builtin function"
+    );
+    crate::w_code_get_ptr(code as PyObjectRef)
 }
 
 /// Get the function name.
@@ -881,13 +903,15 @@ mod tests {
 
     #[test]
     fn test_function_create() {
-        let code = 0xDEAD_BEEF as *const ();
+        // Function.code now stores a Code-level wrapper (W_CodeObject).
+        let raw_code = 0xDEAD_BEEF as *const ();
+        let w_code = crate::w_code_new(raw_code);
         let mut ns = PyNamespace::new();
-        let obj = function_new(code, "myfunc".to_string(), &mut ns);
+        let obj = function_new(w_code as *const (), "myfunc".to_string(), &mut ns);
         unsafe {
             assert!(is_function(obj));
             assert!(!is_int(obj));
-            assert_eq!(function_get_code(obj), code);
+            assert_eq!(function_get_code(obj), w_code as *const ());
             assert_eq!(function_get_name(obj), "myfunc");
             assert_eq!(function_get_globals(obj), &mut ns as *mut PyNamespace);
             assert!(function_get_closure(obj).is_null());

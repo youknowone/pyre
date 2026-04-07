@@ -2,57 +2,65 @@
 //!
 //! PyPy equivalent: pypy/module/_io/
 
-use crate::{PyNamespace, builtin_code_new, namespace_store};
+use crate::{PyNamespace, make_builtin_function, namespace_store};
 use pyre_object::*;
 
 pub fn init(ns: &mut PyNamespace) {
     namespace_store(ns, "DEFAULT_BUFFER_SIZE", w_int_new(8192));
 
     // StringIO stub — returns an empty object with write/getvalue
-    namespace_store(ns, "StringIO", builtin_code_new("StringIO", stub_stringio));
-    namespace_store(ns, "BytesIO", builtin_code_new("BytesIO", stub_bytesio));
-    namespace_store(ns, "FileIO", builtin_code_new("FileIO", stub_fileio));
+    namespace_store(
+        ns,
+        "StringIO",
+        make_builtin_function("StringIO", stub_stringio),
+    );
+    namespace_store(
+        ns,
+        "BytesIO",
+        make_builtin_function("BytesIO", stub_bytesio),
+    );
+    namespace_store(ns, "FileIO", make_builtin_function("FileIO", stub_fileio));
     namespace_store(
         ns,
         "BufferedReader",
-        builtin_code_new("BufferedReader", stub_noop_ctor),
+        make_builtin_function("BufferedReader", stub_noop_ctor),
     );
     namespace_store(
         ns,
         "BufferedWriter",
-        builtin_code_new("BufferedWriter", stub_noop_ctor),
+        make_builtin_function("BufferedWriter", stub_noop_ctor),
     );
     namespace_store(
         ns,
         "BufferedRWPair",
-        builtin_code_new("BufferedRWPair", stub_noop_ctor),
+        make_builtin_function("BufferedRWPair", stub_noop_ctor),
     );
     namespace_store(
         ns,
         "BufferedRandom",
-        builtin_code_new("BufferedRandom", stub_noop_ctor),
+        make_builtin_function("BufferedRandom", stub_noop_ctor),
     );
     namespace_store(
         ns,
         "TextIOWrapper",
-        builtin_code_new("TextIOWrapper", stub_noop_ctor),
+        make_builtin_function("TextIOWrapper", stub_noop_ctor),
     );
     namespace_store(
         ns,
         "IncrementalNewlineDecoder",
-        builtin_code_new("IncrementalNewlineDecoder", stub_noop_ctor),
+        make_builtin_function("IncrementalNewlineDecoder", stub_noop_ctor),
     );
-    namespace_store(ns, "open", builtin_code_new("open", stub_noop_ctor));
+    namespace_store(ns, "open", make_builtin_function("open", stub_noop_ctor));
 
     namespace_store(
         ns,
         "open_code",
-        builtin_code_new("open_code", stub_noop_ctor),
+        make_builtin_function("open_code", stub_noop_ctor),
     );
     namespace_store(
         ns,
         "text_encoding",
-        builtin_code_new("text_encoding", |args| {
+        make_builtin_function("text_encoding", |args| {
             Ok(if args.is_empty() {
                 w_str_new("utf-8")
             } else {
@@ -87,27 +95,39 @@ pub fn init(ns: &mut PyNamespace) {
 pub fn init_io(ns: &mut PyNamespace) {
     init(ns);
     // Additional names io.py would define
-    namespace_store(ns, "IOBase", builtin_code_new("IOBase", stub_noop_ctor));
+    namespace_store(
+        ns,
+        "IOBase",
+        make_builtin_function("IOBase", stub_noop_ctor),
+    );
     namespace_store(
         ns,
         "RawIOBase",
-        builtin_code_new("RawIOBase", stub_noop_ctor),
+        make_builtin_function("RawIOBase", stub_noop_ctor),
     );
     namespace_store(
         ns,
         "BufferedIOBase",
-        builtin_code_new("BufferedIOBase", stub_noop_ctor),
+        make_builtin_function("BufferedIOBase", stub_noop_ctor),
     );
     namespace_store(
         ns,
         "TextIOBase",
-        builtin_code_new("TextIOBase", stub_noop_ctor),
+        make_builtin_function("TextIOBase", stub_noop_ctor),
     );
     namespace_store(ns, "SEEK_SET", w_int_new(0));
     namespace_store(ns, "SEEK_CUR", w_int_new(1));
     namespace_store(ns, "SEEK_END", w_int_new(2));
-    namespace_store(ns, "Reader", builtin_code_new("Reader", stub_noop_ctor));
-    namespace_store(ns, "Writer", builtin_code_new("Writer", stub_noop_ctor));
+    namespace_store(
+        ns,
+        "Reader",
+        make_builtin_function("Reader", stub_noop_ctor),
+    );
+    namespace_store(
+        ns,
+        "Writer",
+        make_builtin_function("Writer", stub_noop_ctor),
+    );
 }
 
 fn stub_stringio(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {

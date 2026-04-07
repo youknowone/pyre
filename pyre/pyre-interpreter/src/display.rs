@@ -105,11 +105,20 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> String {
         ) {
             "NotImplemented".to_string()
         } else if std::ptr::eq(tp, &BUILTIN_CODE_TYPE as *const PyType) {
+            // Raw BuiltinCode objects (Code-level, not normally user-visible)
             let name = builtin_code_name(obj);
-            format!("<built-in function {name}>")
+            format!("<code {name}>")
         } else if std::ptr::eq(tp, &FUNCTION_TYPE as *const PyType) {
             let name = function_get_name(obj);
-            format!("<function {name}>")
+            // Distinguish builtins from user functions by checking code type
+            let is_builtin = unsafe {
+                crate::is_builtin_code(crate::function_get_code(obj) as pyre_object::PyObjectRef)
+            };
+            if is_builtin {
+                format!("<built-in function {name}>")
+            } else {
+                format!("<function {name}>")
+            }
         } else if std::ptr::eq(tp, &EXCEPTION_TYPE as *const PyType) {
             let msg = pyre_object::excobject::w_exception_get_message(obj);
             msg.to_string()
