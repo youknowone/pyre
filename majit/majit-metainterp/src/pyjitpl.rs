@@ -202,7 +202,12 @@ fn snapshot_map_from_trace_snapshots(
     // Collected here so _number_boxes can detect virtual vs int correctly.
     let mut snapshot_box_types: std::collections::HashMap<u32, majit_ir::Type> =
         std::collections::HashMap::new();
-    let mut next_const_idx = constants.keys().copied().max().unwrap_or(10_000) + 1;
+    let mut next_const_idx = constants
+        .keys()
+        .copied()
+        .max()
+        .unwrap_or(majit_ir::OpRef::CONST_BASE)
+        + 1;
     // opencoder.py:603 _encode: Box/Virtual → OpRef, Const → pool OpRef.
     let mut tagged_to_opref = |t: &majit_trace::recorder::SnapshotTagged| -> majit_ir::OpRef {
         match t {
