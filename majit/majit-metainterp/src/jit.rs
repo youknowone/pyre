@@ -792,10 +792,29 @@ pub fn record_exact_value<T: Copy + PartialEq + std::fmt::Debug>(value: T, const
 //   → jitcode_lower intercepts macro → `__builder.conditional_call_void_typed_args`
 //   → BC_COND_CALL_VOID JitCode bytecode
 //
-// Use the `conditional_call!` macro in `#[jit_interp]` functions.
-// There is no function-form API because Rust closures hide the callee
-// identity from the JIT — RPython's rtyper decomposes (function, *args)
-// but Rust cannot.
+// Use the `conditional_call!` macro in `#[jit_interp]` functions for the
+// JIT path. The plain function below is the non-JIT runtime helper —
+// rlib/jit.py:1301-1316 `conditional_call` falls back to `if condition:
+// function(*args)` outside JIT.
+
+/// Does the same as:
+///
+/// ```text
+/// if condition:
+///     function(*args)
+/// ```
+///
+/// rlib/jit.py:1301-1316 — non-JIT runtime helper.
+///
+/// For JIT-compiled `#[jit_interp]` functions, use `conditional_call!` macro
+/// which takes `(condition, func_path, args...)` matching RPython's
+/// `(condition, function, *args)`.
+#[inline(always)]
+pub fn conditional_call<F: FnOnce()>(condition: bool, function: F) {
+    if condition {
+        function()
+    }
+}
 
 // ── conditional_call_elidable ──
 // rlib/jit.py:1318-1359
@@ -854,9 +873,11 @@ impl<T> JitCondFalsy for Option<T> {
 
 /// Does the same as:
 ///
-///     if value == <0 or None or NULL>:
-///         value = function(*args)
-///     return value
+/// ```text
+/// if value == <0 or None or NULL>:
+///     value = function(*args)
+/// return value
+/// ```
 ///
 /// For the JIT.  Allows one branch which doesn't create a bridge,
 /// typically used for caching.  The value and the function's return
