@@ -432,32 +432,40 @@ impl OptIntBounds {
         self.intersect_bound(op.pos, &b);
     }
 
-    /// intbounds.py: INT_OR pure_from_args synthesis.
-    /// When both args are non-negative and their ranges don't overlap
-    /// (upper(a) < lower(b) or vice versa), INT_OR == INT_ADD.
-    /// Record the equivalent INT_ADD as a pure op so CSE can find it.
+    /// intbounds.py:60-71 postprocess_INT_OR
     fn postprocess_int_or(&mut self, op: &Op, ctx: &OptContext) {
-        let b0 = self.getintbound(op.arg(0), ctx);
-        let b1 = self.getintbound(op.arg(1), ctx);
+        let arg0 = ctx.get_box_replacement(op.arg(0));
+        let arg1 = ctx.get_box_replacement(op.arg(1));
+        let b0 = self.getintbound(arg0, ctx);
+        let b1 = self.getintbound(arg1, ctx);
+        // intbounds.py:65: if b0.and_bound(b1).known_eq_const(0):
+        if b0.and_bound(&b1).known_eq_const(0) {
+            // intbounds.py:66-69:
+            //   pure_from_args2(rop.INT_ADD, arg0, arg1, op)
+            //   pure_from_args2(rop.INT_XOR, arg0, arg1, op)
+            self.record_pure_from_args(OpCode::IntAdd, arg0, arg1, op.pos);
+            self.record_pure_from_args(OpCode::IntXor, arg0, arg1, op.pos);
+        }
         let b = b0.or_bound(&b1);
         self.intersect_bound(op.pos, &b);
-        // pure_from_args: if both non-negative, INT_OR(a,b) = INT_ADD(a,b)
-        if b0.known_nonnegative() && b1.known_nonnegative() {
-            self.record_pure_from_args(OpCode::IntAdd, op.arg(0), op.arg(1), op.pos);
-        }
     }
 
-    /// intbounds.py: INT_XOR pure_from_args synthesis.
-    /// Same logic as INT_OR: when ranges don't overlap, XOR == ADD.
+    /// intbounds.py:73-84 postprocess_INT_XOR
     fn postprocess_int_xor(&mut self, op: &Op, ctx: &OptContext) {
-        let b0 = self.getintbound(op.arg(0), ctx);
-        let b1 = self.getintbound(op.arg(1), ctx);
+        let arg0 = ctx.get_box_replacement(op.arg(0));
+        let arg1 = ctx.get_box_replacement(op.arg(1));
+        let b0 = self.getintbound(arg0, ctx);
+        let b1 = self.getintbound(arg1, ctx);
+        // intbounds.py:78: if b0.and_bound(b1).known_eq_const(0):
+        if b0.and_bound(&b1).known_eq_const(0) {
+            // intbounds.py:79-82:
+            //   pure_from_args2(rop.INT_ADD, arg0, arg1, op)
+            //   pure_from_args2(rop.INT_OR, arg0, arg1, op)
+            self.record_pure_from_args(OpCode::IntAdd, arg0, arg1, op.pos);
+            self.record_pure_from_args(OpCode::IntOr, arg0, arg1, op.pos);
+        }
         let b = b0.xor_bound(&b1);
         self.intersect_bound(op.pos, &b);
-        // pure_from_args: if both non-negative, INT_XOR(a,b) = INT_ADD(a,b)
-        if b0.known_nonnegative() && b1.known_nonnegative() {
-            self.record_pure_from_args(OpCode::IntAdd, op.arg(0), op.arg(1), op.pos);
-        }
     }
 
     /// intbounds.py: INT_LSHIFT pure_from_args synthesis.
