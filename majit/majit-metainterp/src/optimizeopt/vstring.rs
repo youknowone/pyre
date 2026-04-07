@@ -793,6 +793,9 @@ mod tests {
                 OptimizationResult::PassOn => {
                     ctx.emit(resolved_op);
                 }
+                OptimizationResult::InvalidLoop => {
+                    panic!("unexpected InvalidLoop in test");
+                }
             }
         }
 

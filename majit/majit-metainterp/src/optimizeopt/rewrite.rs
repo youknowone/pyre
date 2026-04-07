@@ -2947,6 +2947,11 @@ mod tests {
                 OptimizationResult::PassOn => {
                     ctx.emit(resolved);
                 }
+                OptimizationResult::InvalidLoop => {
+                    std::panic::panic_any(crate::optimize::InvalidLoop(
+                        "guard proven to always fail",
+                    ));
+                }
             }
         }
 
@@ -3431,6 +3436,11 @@ mod tests {
                 OptimizationResult::PassOn => {
                     ctx.emit(resolved);
                 }
+                OptimizationResult::InvalidLoop => {
+                    std::panic::panic_any(crate::optimize::InvalidLoop(
+                        "guard proven to always fail",
+                    ));
+                }
             }
         }
 
@@ -3471,6 +3481,11 @@ mod tests {
                     OptimizationResult::Remove => {}
                     OptimizationResult::PassOn => {
                         ctx.emit(resolved);
+                    }
+                    OptimizationResult::InvalidLoop => {
+                        std::panic::panic_any(crate::optimize::InvalidLoop(
+                            "guard proven to always fail",
+                        ));
                     }
                 }
             }
