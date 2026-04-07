@@ -2407,27 +2407,36 @@ impl OptContext {
     ///
     /// Returns the GC pointer address for any constant that RPython would
     /// wrap in a `ConstPtrInfo`. RPython's `getptrinfo` (info.py:880-894)
-    /// dispatches on `op.type`: a `ConstPtr` (Ref-typed) becomes
-    /// `ConstPtrInfo(op)` and `_const.getref_base()` reads the boxed
-    /// pointer; a `ConstInt` produced by `getrawptrinfo` (info.py:865-878)
-    /// also becomes `ConstPtrInfo(op)` and `_const.getref_base()` reads
-    /// the raw pointer bits cast through `cast_int_to_ptr`.
+    /// dispatches on `op.type` BEFORE consulting the constant value:
+    /// - `op.type == 'r'` and `isinstance(op, ConstPtr)` →
+    ///   `ConstPtrInfo(op)`; `_const.getref_base()` reads the boxed
+    ///   pointer (which may be NULL).
+    /// - `op.type == 'i'` defers to `getrawptrinfo` (info.py:865-878),
+    ///   which only synthesizes `ConstPtrInfo` for raw-pointer
+    ///   `ConstInt` boxes. A plain integer `ConstInt` (e.g. a counter)
+    ///   never reaches this path because the upstream caller already
+    ///   knows the box is a raw pointer from its annotated type.
     ///
-    /// majit's constant pool tracks both shapes:
-    /// - `Value::Ref(gcref)` — full Ref-typed entry, returned directly.
+    /// majit's constant pool stores both shapes:
+    /// - `Value::Ref(gcref)` — full Ref-typed entry, returned directly
+    ///   (NULL is `Value::Ref(GcRef(0))`).
     /// - `Value::Int(bits)` with a `Type::Ref` override in
     ///   `constant_types_for_numbering` — a static class pointer or other
     ///   GC-untracked address that the backend keeps as Int to skip
     ///   shadow-stack rooting (mirrors RPython's
     ///   `cast_instance_to_gcref`/`cast_int_to_ptr` round-trip on a
-    ///   ConstInt argument). Both shapes must report the same address
-    ///   here so `getptrinfo` and `get_const_info_mut` see them as the
-    ///   same `ConstPtrInfo`.
+    ///   ConstInt argument).
+    ///
+    /// Plain `Value::Int(bits)` WITHOUT a `Type::Ref` override is a
+    /// regular integer constant and must NOT be coerced into a
+    /// `ConstPtrInfo` here — that would conflate counters/indices with
+    /// null pointers and trigger spurious `is_null()` optimizations on
+    /// integer slots. RPython enforces the same separation via
+    /// `op.type == 'i'` raw-pointer-only annotation.
     fn constant_ptr_addr(&self, opref: OpRef) -> Option<majit_ir::GcRef> {
         let resolved = self.get_box_replacement(opref);
         match self.get_constant(resolved)? {
             Value::Ref(gcref) => Some(*gcref),
-            Value::Int(0) => Some(majit_ir::GcRef(0)),
             Value::Int(bits) => {
                 let tp = self.constant_types_for_numbering.get(&resolved.0)?;
                 if *tp == majit_ir::Type::Ref {
@@ -2796,20 +2805,43 @@ mod constant_ptr_info_tests {
         assert!(ctx.getptrinfo(opref).is_none());
     }
 
-    /// info.py:888-889 getptrinfo(NULL) parity: a null `ConstPtr` still
-    /// becomes `ConstPtrInfo(NULL)` (later callers null-check via
-    /// `is_null`/`getref_base`). The Int(0) shape must produce the same
-    /// `PtrInfo::Constant(GcRef(0))` so downstream null-handling sees a
-    /// uniform constant info.
+    /// info.py:865-878 getrawptrinfo(ConstInt) parity: a raw-pointer
+    /// `ConstInt` (here represented as a `Value::Int` constant tagged
+    /// with `Type::Ref`) becomes `ConstPtrInfo(op)` even when the
+    /// pointer bits are NULL. Downstream callers null-check via
+    /// `is_null`/`getref_base`.
+    ///
+    /// The plain `Value::Int(0)` shape (no Type::Ref override) is a
+    /// regular integer constant and is covered by
+    /// `getptrinfo_skips_int_without_ref_override` — it must NOT be
+    /// promoted to `ConstPtrInfo`, matching RPython's `op.type == 'i'`
+    /// raw-pointer-only routing.
     #[test]
-    fn getptrinfo_null_int_constant_is_constant_null() {
+    fn getptrinfo_null_int_constant_with_ref_override_is_constant_null() {
         let mut ctx = OptContext::new(0);
         let opref = OpRef(10_003);
         ctx.seed_constant(opref, Value::Int(0));
+        ctx.constant_types_for_numbering.insert(opref.0, Type::Ref);
         match ctx.getptrinfo(opref) {
             Some(Cow::Owned(PtrInfo::Constant(g))) => assert_eq!(g.0, 0),
             other => panic!("expected ConstPtrInfo(NULL), got {other:?}"),
         }
+    }
+
+    /// info.py:881-882 getptrinfo(ConstInt(0)) without a Ref-typed box →
+    /// `getrawptrinfo` is the only path into `ConstPtrInfo` for integer
+    /// constants, and it is only called for raw-pointer Boxes (`op.type
+    /// == 'i'` annotated as a pointer). A plain integer `ConstInt(0)`
+    /// must therefore NOT become `ConstPtrInfo(NULL)` — otherwise an
+    /// integer counter at zero would erroneously trigger `is_null`
+    /// optimizations on integer slots.
+    #[test]
+    fn getptrinfo_int_zero_without_ref_override_is_none() {
+        let mut ctx = OptContext::new(0);
+        let opref = OpRef(10_009);
+        ctx.seed_constant(opref, Value::Int(0));
+        // No constant_types_for_numbering entry → no Ref override.
+        assert!(ctx.getptrinfo(opref).is_none());
     }
 
     /// info.py:718-726 ConstPtrInfo._get_info(descr, optheap) parity:
