@@ -513,7 +513,7 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
         (code, ns, ec)
     };
 
-    let green_key = crate::eval::make_green_key(code as *const _, 0);
+    let green_key = crate::eval::make_green_key(code, 0);
     let protocol = finish_protocol(green_key);
 
     let mut func_frame = PyFrame::new_for_call(code, &[], namespace, exec_ctx);
@@ -1564,8 +1564,8 @@ pub extern "C" fn jit_force_self_recursive_call_raw_1(caller_frame: i64, raw_int
         eprintln!("[jit][force-self-recursive] enter arg={}", raw_int_arg);
     }
     let caller = unsafe { &*(caller_frame as *const PyFrame) };
-    let code_ptr = caller.code;
-    let green_key = crate::eval::make_green_key(code_ptr as *const _, 0);
+    let w_code = caller.code;
+    let green_key = crate::eval::make_green_key(w_code, 0);
     let (protocol, _token_num) = self_recursive_dispatch(green_key);
 
     let boxed = pyre_object::intobject::w_int_new(raw_int_arg);
