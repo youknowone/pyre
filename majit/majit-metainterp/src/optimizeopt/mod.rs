@@ -2435,6 +2435,22 @@ impl OptContext {
                         0,
                     ))));
                 }
+                Value::Int(bits) => {
+                    // history.py InputArgRef parity: when the ConstantPool
+                    // tracks an i64 bits-pattern as Ref-typed (vtable address
+                    // passed through `const_ref` / `numbering_type_overrides`),
+                    // `ensure_ptr_info_arg0` must still wrap it in a
+                    // ConstPtrInfo so cls_of_box can fold a GUARD_CLASS on
+                    // the pointer. The backend keeps the bits as Int to
+                    // avoid GC root tracking for static type pointers.
+                    if let Some(tp) = self.constant_types_for_numbering.get(&resolved.0) {
+                        if *tp == majit_ir::Type::Ref {
+                            return Some(std::borrow::Cow::Owned(PtrInfo::Constant(
+                                majit_ir::GcRef(*bits as usize),
+                            )));
+                        }
+                    }
+                }
                 _ => {}
             }
         }
