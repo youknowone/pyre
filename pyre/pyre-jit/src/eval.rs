@@ -3103,13 +3103,11 @@ fn build_resumed_frames(
             //       lst = getattr(virtualizable, fieldname)
             //       for j in range(len(lst)):
             //           lst[j] = reader.load_next_value_of_type(ARRAYITEMTYPE)
-            // virtualizable.py:126-137 write_from_resume_data_partial:
-            // Array length = number of entries from resume data, NOT the
-            // physical array length. RPython reads exactly
-            // vinfo.get_total_size() entries; pyre should read exactly
-            // resolved_vable.len() - num_scalars entries.
+            // virtualizable.py:136: uses len(lst) — the HEAP array length
+            // from the actual virtualizable object, not from resume data.
+            let heap_array_len = vinfo.get_array_length(frame_u8.cast_const(), 0);
             let array_start = num_scalars.min(resolved_vable.len());
-            let array_len = resolved_vable.len().saturating_sub(array_start);
+            let array_len = heap_array_len;
             let array_items: Vec<i64> = (0..array_len)
                 .map(|j| {
                     resolved_vable
@@ -3187,16 +3185,9 @@ fn build_resumed_frames(
         // Per-frame VSD: outermost uses vable_vsd, inner frames derive
         // from their code's nlocals + snapshot stack depth.
         let vsd = if frames.len() == 1 || idx == frames.len() - 1 {
-            // resume.py:1395 parity: outermost frame's vsd comes from
-            // the virtualizable. If 0, fall back to code's nlocals+stack.
-            if vable_vsd > 0 {
-                vable_vsd
-            } else if !raw_code.is_null() {
-                let nlocals = unsafe { &*raw_code }.varnames.len();
-                nlocals + values.len().saturating_sub(nlocals)
-            } else {
-                values.len()
-            }
+            // resume.py:1399 parity: outermost frame's vsd comes directly
+            // from the virtualizable. RPython does not sentinel-check 0.
+            vable_vsd
         } else if !raw_code.is_null() {
             let nlocals = unsafe { &*raw_code }.varnames.len();
             nlocals + values.len().saturating_sub(nlocals)
