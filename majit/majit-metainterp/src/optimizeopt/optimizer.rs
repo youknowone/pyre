@@ -179,6 +179,9 @@ pub struct Optimizer {
     pub per_guard_knowledge: Vec<(OpRef, OptimizerKnowledge)>,
     /// optimizer.py:787: constant_fold allocator for compile-time object creation.
     pub constant_fold_alloc: Option<crate::optimizeopt::ConstantFoldAllocFn>,
+    /// RPython metainterp_sd.callinfocollection parity.
+    /// Propagated to OptContext for generate_modified_call (vstring.py:853).
+    pub callinfocollection: Option<std::sync::Arc<majit_ir::descr::CallInfoCollection>>,
     /// optimizer.py:732 — resume.ResumeDataLoopMemo.
     /// Shared constant pool + box numbering cache across all guards in a loop.
     pub resumedata_memo: crate::resume::ResumeDataLoopMemo,
@@ -888,6 +891,7 @@ impl Optimizer {
             pending_bridge_knowledge: None,
             per_guard_knowledge: Vec::new(),
             constant_fold_alloc: None,
+            callinfocollection: None,
             resumedata_memo: crate::resume::ResumeDataLoopMemo::new(),
             snapshot_boxes: std::collections::HashMap::new(),
             snapshot_frame_sizes: std::collections::HashMap::new(),
@@ -1456,6 +1460,7 @@ impl Optimizer {
         let mut ctx = OptContext::with_num_inputs(ops.len(), effective_inputs);
         ctx.skip_flush_mode = self.skip_flush;
         ctx.constant_fold_alloc = self.constant_fold_alloc.take();
+        ctx.callinfocollection = self.callinfocollection.clone();
         // RPython resume.py parity: Phase 2 optimizer needs imported_label_args
         // to resolve NONE positions in fail_args inherited from Phase 1.
         ctx.imported_virtuals = self.imported_virtuals.clone();
@@ -1698,9 +1703,57 @@ impl Optimizer {
         // finish_and_compile — terminal op is sent through passes and ends
         // up in new_operations naturally.
         if let Some(mut terminal_op) = last_op {
-            // Follow forwarding on terminal op args regardless of flush mode.
-            for arg in &mut terminal_op.args {
-                *arg = ctx.get_box_replacement(*arg);
+            // RPython unroll.py:126-127 parity:
+            //   for a in end_jump.getarglist():
+            //       self.force_box_for_end_of_preamble(get_box_replacement(a))
+            //
+            // Call force_at_the_end_of_preamble on ALL args (not just
+            // Ref-mismatch ones). RPython's force_box_for_end_of_preamble
+            // handles both Ref virtuals (type 'r') and raw-ptr-int (type 'i'):
+            //   - Ref virtual: recursively process fields, keep virtual alive
+            //   - Raw ptr int: force via optearlyforce
+            //   - Non-virtual: return get_box_replacement(op) unchanged
+            //
+            // Additionally, in majit OpRef forwarding is typeless, so a Ref
+            // virtual can forward to a Float (SameAsF). When that happens,
+            // force_box materializes the virtual to preserve Ref type.
+            let inputarg_types = self.trace_inputarg_types.clone();
+            // Phase 1: resolve and call force_at_the_end_of_preamble on all args
+            let resolved_args: Vec<OpRef> = terminal_op
+                .args
+                .iter()
+                .map(|&arg| ctx.get_box_replacement(arg))
+                .collect();
+            for &resolved in &resolved_args {
+                self.force_at_the_end_of_preamble(resolved, &mut ctx);
+            }
+            // Phase 2: re-resolve after forcing (force may have changed forwarding)
+            // and fix Ref→non-Ref type crossings by force_box
+            let mut force_needed: Vec<usize> = Vec::new();
+            for (i, arg) in terminal_op.args.iter_mut().enumerate() {
+                let resolved = ctx.get_box_replacement(*arg);
+                let expected_ref =
+                    i < inputarg_types.len() && inputarg_types[i] == majit_ir::Type::Ref;
+                let resolved_is_ref = ctx.value_types.get(&resolved.0).copied()
+                    == Some(majit_ir::Type::Ref)
+                    || ctx.get_ptr_info(resolved).is_some()
+                    || (resolved.0 as usize) < inputarg_types.len()
+                        && inputarg_types.get(resolved.0 as usize).copied()
+                            == Some(majit_ir::Type::Ref);
+                if expected_ref && !resolved_is_ref && !ctx.is_constant(resolved) {
+                    if ctx.get_ptr_info(*arg).is_some_and(|i| i.is_virtual()) {
+                        force_needed.push(i);
+                    } else {
+                        *arg = resolved;
+                    }
+                } else {
+                    *arg = resolved;
+                }
+            }
+            for i in force_needed {
+                let original = terminal_op.args[i];
+                let forced = self.force_box(original, &mut ctx);
+                terminal_op.args[i] = ctx.get_box_replacement(forced);
             }
             if self.skip_flush {
                 // flush=False: store for caller to consume.
