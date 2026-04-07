@@ -1627,7 +1627,7 @@ impl MIFrame {
         self.guard_value(ctx, actual_value, expected);
     }
 
-    fn guard_int_like_value(&mut self, ctx: &mut TraceCtx, value: OpRef, expected: i64) {
+    pub(crate) fn guard_int_like_value(&mut self, ctx: &mut TraceCtx, value: OpRef, expected: i64) {
         if self.value_type(value) == Type::Int {
             self.guard_value(ctx, value, expected);
         } else {
@@ -1666,17 +1666,17 @@ impl MIFrame {
         raw
     }
 
-    fn guard_len_gt_index(&mut self, ctx: &mut TraceCtx, len: OpRef, index: usize) {
+    pub(crate) fn guard_len_gt_index(&mut self, ctx: &mut TraceCtx, len: OpRef, index: usize) {
         let index = ctx.const_int(index as i64);
         let in_bounds = ctx.record_op(OpCode::IntGt, &[len, index]);
         self.record_guard(ctx, OpCode::GuardTrue, &[in_bounds]);
     }
 
-    fn guard_len_eq(&mut self, ctx: &mut TraceCtx, len: OpRef, expected: usize) {
+    pub(crate) fn guard_len_eq(&mut self, ctx: &mut TraceCtx, len: OpRef, expected: usize) {
         self.guard_value(ctx, len, expected as i64);
     }
 
-    fn guard_list_strategy(&mut self, ctx: &mut TraceCtx, obj: OpRef, expected: i64) {
+    pub(crate) fn guard_list_strategy(&mut self, ctx: &mut TraceCtx, obj: OpRef, expected: i64) {
         let strategy = trace_gc_object_int_field(ctx, obj, list_strategy_descr());
         self.guard_value(ctx, strategy, expected);
     }
@@ -1692,27 +1692,7 @@ impl MIFrame {
         len: OpRef,
         concrete_key: i64,
     ) -> OpRef {
-        let raw_index = if self.value_type(key) == Type::Int {
-            key
-        } else {
-            crate::state::trace_unbox_int_with_resume(self, ctx, key, &INT_TYPE as *const _ as i64)
-        };
-        let zero = ctx.const_int(0);
-        if concrete_key >= 0 {
-            let nonnegative = ctx.record_op(OpCode::IntGe, &[raw_index, zero]);
-            self.record_guard(ctx, OpCode::GuardTrue, &[nonnegative]);
-            let in_bounds = ctx.record_op(OpCode::IntLt, &[raw_index, len]);
-            self.record_guard(ctx, OpCode::GuardTrue, &[in_bounds]);
-            raw_index
-        } else {
-            let negative = ctx.record_op(OpCode::IntLt, &[raw_index, zero]);
-            self.record_guard(ctx, OpCode::GuardTrue, &[negative]);
-            let normalized = ctx.record_op(OpCode::IntAddOvf, &[len, raw_index]);
-            self.record_guard(ctx, OpCode::GuardNoOverflow, &[]);
-            let in_bounds = ctx.record_op(OpCode::IntGe, &[normalized, zero]);
-            self.record_guard(ctx, OpCode::GuardTrue, &[in_bounds]);
-            normalized
-        }
+        crate::generated_dynamic_list_index(self, ctx, key, len, concrete_key)
     }
 
     fn trace_direct_tuple_getitem(
@@ -1720,18 +1700,12 @@ impl MIFrame {
         ctx: &mut TraceCtx,
         obj: OpRef,
         key: OpRef,
-        expected_type: *const PyType,
-        items_ptr_descr: DescrRef,
-        items_len_descr: DescrRef,
+        _expected_type: *const PyType,
+        _items_ptr_descr: DescrRef,
+        _items_len_descr: DescrRef,
         concrete_index: usize,
     ) -> OpRef {
-        self.guard_object_class(ctx, obj, expected_type);
-        self.guard_int_like_value(ctx, key, concrete_index as i64);
-        let len = trace_arraylen_gc(ctx, obj, items_len_descr);
-        self.guard_len_gt_index(ctx, len, concrete_index);
-        let items_ptr = trace_gc_object_int_field(ctx, obj, items_ptr_descr);
-        let index = ctx.const_int(concrete_index as i64);
-        trace_raw_array_getitem_value(ctx, items_ptr, index)
+        crate::generated_tuple_getitem(self, ctx, obj, key, concrete_index as i64, 0)
     }
 
     fn trace_direct_negative_tuple_getitem(
@@ -1739,22 +1713,61 @@ impl MIFrame {
         ctx: &mut TraceCtx,
         obj: OpRef,
         key: OpRef,
-        expected_type: *const PyType,
-        items_ptr_descr: DescrRef,
-        items_len_descr: DescrRef,
+        _expected_type: *const PyType,
+        _items_ptr_descr: DescrRef,
+        _items_len_descr: DescrRef,
         concrete_key: i64,
         concrete_len: usize,
     ) -> OpRef {
-        let normalized = (concrete_len as i64 + concrete_key) as usize;
-        self.guard_object_class(ctx, obj, expected_type);
-        self.guard_int_like_value(ctx, key, concrete_key);
-        let len = trace_arraylen_gc(ctx, obj, items_len_descr);
-        self.guard_len_eq(ctx, len, concrete_len);
-        let items_ptr = trace_gc_object_int_field(ctx, obj, items_ptr_descr);
-        let index = ctx.const_int(normalized as i64);
-        trace_raw_array_getitem_value(ctx, items_ptr, index)
+        crate::generated_tuple_getitem(self, ctx, obj, key, concrete_key, concrete_len)
     }
 
+    /// List getitem covering PyPy list strategy model
+    /// (pypy/objspace/std/listobject.py) as compiled through the codewriter.
+    /// In RPython, jtransform expands list storage access into guard_class +
+    /// getfield(items) + check_neg_index + getarrayitem_gc; pyjitpl.py:814
+    /// opimpl_getlistitem_gc_* is just the final getfield+getarrayitem step.
+    /// This function covers the full expanded sequence including strategy
+    /// guard and index normalization.
+    ///
+    /// strategy_id: 0 = object, 1 = int, 2 = float.
+    /// Handles both positive and negative concrete_key.
+    pub(crate) fn trace_direct_list_getitem_by_strategy(
+        &mut self,
+        ctx: &mut TraceCtx,
+        obj: OpRef,
+        key: OpRef,
+        concrete_key: i64,
+        strategy_id: u32,
+    ) -> OpRef {
+        self.guard_object_class(ctx, obj, &LIST_TYPE as *const PyType);
+        self.guard_list_strategy(ctx, obj, strategy_id as i64);
+        let (len_descr, ptr_descr) = match strategy_id {
+            0 => (list_items_len_descr(), list_items_ptr_descr()),
+            1 => (list_int_items_len_descr(), list_int_items_ptr_descr()),
+            2 => (list_float_items_len_descr(), list_float_items_ptr_descr()),
+            _ => unreachable!(),
+        };
+        let len = trace_arraylen_gc(ctx, obj, len_descr);
+        let index = self.trace_dynamic_list_index(ctx, key, len, concrete_key);
+        let items_ptr = trace_gc_object_int_field(ctx, obj, ptr_descr);
+        match strategy_id {
+            0 => trace_raw_array_getitem_value(ctx, items_ptr, index),
+            1 => {
+                let raw = trace_raw_int_array_getitem_value(ctx, items_ptr, index);
+                self.remember_value_type(raw, Type::Int);
+                raw
+            }
+            2 => {
+                let raw = trace_raw_float_array_getitem_value(ctx, items_ptr, index);
+                self.remember_value_type(raw, Type::Float);
+                raw
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    // Keep old names as thin wrappers for external callers.
     fn trace_direct_object_list_getitem(
         &mut self,
         ctx: &mut TraceCtx,
@@ -1762,14 +1775,8 @@ impl MIFrame {
         key: OpRef,
         concrete_index: usize,
     ) -> OpRef {
-        self.guard_object_class(ctx, obj, &LIST_TYPE as *const PyType);
-        self.guard_list_strategy(ctx, obj, 0);
-        let len = trace_arraylen_gc(ctx, obj, list_items_len_descr());
-        let index = self.trace_dynamic_list_index(ctx, key, len, concrete_index as i64);
-        let items_ptr = trace_gc_object_int_field(ctx, obj, list_items_ptr_descr());
-        trace_raw_array_getitem_value(ctx, items_ptr, index)
+        self.trace_direct_list_getitem_by_strategy(ctx, obj, key, concrete_index as i64, 0)
     }
-
     fn trace_direct_negative_object_list_getitem(
         &mut self,
         ctx: &mut TraceCtx,
@@ -1778,14 +1785,8 @@ impl MIFrame {
         concrete_key: i64,
         _concrete_len: usize,
     ) -> OpRef {
-        self.guard_object_class(ctx, obj, &LIST_TYPE as *const PyType);
-        self.guard_list_strategy(ctx, obj, 0);
-        let len = trace_arraylen_gc(ctx, obj, list_items_len_descr());
-        let index = self.trace_dynamic_list_index(ctx, key, len, concrete_key);
-        let items_ptr = trace_gc_object_int_field(ctx, obj, list_items_ptr_descr());
-        trace_raw_array_getitem_value(ctx, items_ptr, index)
+        self.trace_direct_list_getitem_by_strategy(ctx, obj, key, concrete_key, 0)
     }
-
     fn trace_direct_int_list_getitem(
         &mut self,
         ctx: &mut TraceCtx,
@@ -1793,16 +1794,8 @@ impl MIFrame {
         key: OpRef,
         concrete_index: usize,
     ) -> OpRef {
-        self.guard_object_class(ctx, obj, &LIST_TYPE as *const PyType);
-        self.guard_list_strategy(ctx, obj, 1);
-        let len = trace_arraylen_gc(ctx, obj, list_int_items_len_descr());
-        let index = self.trace_dynamic_list_index(ctx, key, len, concrete_index as i64);
-        let items_ptr = trace_gc_object_int_field(ctx, obj, list_int_items_ptr_descr());
-        let raw = trace_raw_int_array_getitem_value(ctx, items_ptr, index);
-        self.remember_value_type(raw, Type::Int);
-        raw
+        self.trace_direct_list_getitem_by_strategy(ctx, obj, key, concrete_index as i64, 1)
     }
-
     fn trace_direct_negative_int_list_getitem(
         &mut self,
         ctx: &mut TraceCtx,
@@ -1811,16 +1804,8 @@ impl MIFrame {
         concrete_key: i64,
         _concrete_len: usize,
     ) -> OpRef {
-        self.guard_object_class(ctx, obj, &LIST_TYPE as *const PyType);
-        self.guard_list_strategy(ctx, obj, 1);
-        let len = trace_arraylen_gc(ctx, obj, list_int_items_len_descr());
-        let index = self.trace_dynamic_list_index(ctx, key, len, concrete_key);
-        let items_ptr = trace_gc_object_int_field(ctx, obj, list_int_items_ptr_descr());
-        let raw = trace_raw_int_array_getitem_value(ctx, items_ptr, index);
-        self.remember_value_type(raw, Type::Int);
-        raw
+        self.trace_direct_list_getitem_by_strategy(ctx, obj, key, concrete_key, 1)
     }
-
     pub(crate) fn trace_direct_float_list_getitem(
         &mut self,
         ctx: &mut TraceCtx,
@@ -1828,16 +1813,8 @@ impl MIFrame {
         key: OpRef,
         concrete_index: usize,
     ) -> OpRef {
-        self.guard_object_class(ctx, obj, &LIST_TYPE as *const PyType);
-        self.guard_list_strategy(ctx, obj, 2);
-        let len = trace_arraylen_gc(ctx, obj, list_float_items_len_descr());
-        let index = self.trace_dynamic_list_index(ctx, key, len, concrete_index as i64);
-        let items_ptr = trace_gc_object_int_field(ctx, obj, list_float_items_ptr_descr());
-        let raw = trace_raw_float_array_getitem_value(ctx, items_ptr, index);
-        self.remember_value_type(raw, Type::Float);
-        raw
+        self.trace_direct_list_getitem_by_strategy(ctx, obj, key, concrete_index as i64, 2)
     }
-
     fn trace_direct_negative_float_list_getitem(
         &mut self,
         ctx: &mut TraceCtx,
@@ -1846,14 +1823,7 @@ impl MIFrame {
         concrete_key: i64,
         _concrete_len: usize,
     ) -> OpRef {
-        self.guard_object_class(ctx, obj, &LIST_TYPE as *const PyType);
-        self.guard_list_strategy(ctx, obj, 2);
-        let len = trace_arraylen_gc(ctx, obj, list_float_items_len_descr());
-        let index = self.trace_dynamic_list_index(ctx, key, len, concrete_key);
-        let items_ptr = trace_gc_object_int_field(ctx, obj, list_float_items_ptr_descr());
-        let raw = trace_raw_float_array_getitem_value(ctx, items_ptr, index);
-        self.remember_value_type(raw, Type::Float);
-        raw
+        self.trace_direct_list_getitem_by_strategy(ctx, obj, key, concrete_key, 2)
     }
 
     fn trace_unpack_known_sequence(
@@ -2003,71 +1973,31 @@ impl MIFrame {
                                     ));
                                 }
                             }
-                        } else if is_list(concrete_obj) && w_list_uses_object_storage(concrete_obj)
-                        {
-                            let concrete_len = w_list_len(concrete_obj);
-                            if index >= 0 {
-                                let index = index as usize;
-                                if index < concrete_len {
-                                    return Ok(
-                                        this.trace_direct_object_list_getitem(ctx, a, b, index)
-                                    );
-                                }
-                            } else if let Some(abs_index) = index
-                                .checked_neg()
-                                .and_then(|value| usize::try_from(value).ok())
-                            {
-                                if abs_index <= concrete_len {
-                                    return Ok(this.trace_direct_negative_object_list_getitem(
-                                        ctx,
-                                        a,
-                                        b,
-                                        index,
-                                        concrete_len,
-                                    ));
-                                }
-                            }
-                        } else if is_list(concrete_obj) && w_list_uses_int_storage(concrete_obj) {
-                            let concrete_len = w_list_len(concrete_obj);
-                            if index >= 0 {
-                                let index = index as usize;
-                                if index < concrete_len {
-                                    return Ok(this.trace_direct_int_list_getitem(ctx, a, b, index));
-                                }
-                            } else if let Some(abs_index) = index
-                                .checked_neg()
-                                .and_then(|value| usize::try_from(value).ok())
-                            {
-                                if abs_index <= concrete_len {
-                                    return Ok(this.trace_direct_negative_int_list_getitem(
-                                        ctx,
-                                        a,
-                                        b,
-                                        index,
-                                        concrete_len,
-                                    ));
-                                }
-                            }
-                        } else if is_list(concrete_obj) && w_list_uses_float_storage(concrete_obj) {
-                            let concrete_len = w_list_len(concrete_obj);
-                            if index >= 0 {
-                                let index = index as usize;
-                                if index < concrete_len {
-                                    return Ok(
-                                        this.trace_direct_float_list_getitem(ctx, a, b, index)
-                                    );
-                                }
-                            } else if let Some(abs_index) = index
-                                .checked_neg()
-                                .and_then(|value| usize::try_from(value).ok())
-                            {
-                                if abs_index <= concrete_len {
-                                    return Ok(this.trace_direct_negative_float_list_getitem(
-                                        ctx,
-                                        a,
-                                        b,
-                                        index,
-                                        concrete_len,
+                        // PyPy list strategy model (listobject.py): unified list subscript.
+                        // strategy_id: 0=object, 1=int, 2=float — matches list storage.
+                        } else if is_list(concrete_obj) {
+                            let strategy_id = if w_list_uses_object_storage(concrete_obj) {
+                                Some(0u32)
+                            } else if w_list_uses_int_storage(concrete_obj) {
+                                Some(1u32)
+                            } else if w_list_uses_float_storage(concrete_obj) {
+                                Some(2u32)
+                            } else {
+                                None
+                            };
+                            if let Some(sid) = strategy_id {
+                                let concrete_len = w_list_len(concrete_obj);
+                                let in_bounds = if index >= 0 {
+                                    (index as usize) < concrete_len
+                                } else {
+                                    index
+                                        .checked_neg()
+                                        .and_then(|v| usize::try_from(v).ok())
+                                        .map_or(false, |abs| abs <= concrete_len)
+                                };
+                                if in_bounds {
+                                    return Ok(this.trace_direct_list_getitem_by_strategy(
+                                        ctx, a, b, index, sid,
                                     ));
                                 }
                             }
@@ -2182,155 +2112,34 @@ impl MIFrame {
         }
 
         unsafe {
-            if is_list(concrete_obj)
-                && w_list_uses_object_storage(concrete_obj)
-                && is_int(concrete_key)
-            {
-                let index = w_int_get_value(concrete_key);
-                let concrete_len = w_list_len(concrete_obj);
-                if index >= 0 {
-                    let index = index as usize;
-                    if index < concrete_len {
+            // RPython opimpl_setlistitem_gc_{i,r,f}: unified list store
+            // via generated_list_setitem_by_strategy.
+            if is_list(concrete_obj) && is_int(concrete_key) {
+                let strategy_id = if w_list_uses_object_storage(concrete_obj) {
+                    Some(0i64)
+                } else if w_list_uses_int_storage(concrete_obj) && is_int(concrete_value) {
+                    Some(1i64)
+                } else if w_list_uses_float_storage(concrete_obj) && is_float(concrete_value) {
+                    Some(2i64)
+                } else {
+                    None
+                };
+                if let Some(sid) = strategy_id {
+                    let index = w_int_get_value(concrete_key);
+                    let concrete_len = w_list_len(concrete_obj);
+                    let in_bounds = if index >= 0 {
+                        (index as usize) < concrete_len
+                    } else {
+                        index
+                            .checked_neg()
+                            .and_then(|v| usize::try_from(v).ok())
+                            .map_or(false, |abs| abs <= concrete_len)
+                    };
+                    if in_bounds {
                         return self.with_ctx(|this, ctx| {
-                            this.guard_object_class(ctx, obj, &LIST_TYPE as *const PyType);
-                            this.guard_list_strategy(ctx, obj, 0);
-                            let len = trace_arraylen_gc(ctx, obj, list_items_len_descr());
-                            let index = this.trace_dynamic_list_index(ctx, key, len, index as i64);
-                            let items_ptr =
-                                trace_gc_object_int_field(ctx, obj, list_items_ptr_descr());
-                            trace_raw_array_setitem_value(ctx, items_ptr, index, value);
-                            Ok(())
-                        });
-                    }
-                } else if let Some(abs_index) = index
-                    .checked_neg()
-                    .and_then(|value| usize::try_from(value).ok())
-                {
-                    if abs_index <= concrete_len {
-                        return self.with_ctx(|this, ctx| {
-                            this.guard_object_class(ctx, obj, &LIST_TYPE as *const PyType);
-                            this.guard_list_strategy(ctx, obj, 0);
-                            let len = trace_arraylen_gc(ctx, obj, list_items_len_descr());
-                            let index = this.trace_dynamic_list_index(ctx, key, len, index);
-                            let items_ptr =
-                                trace_gc_object_int_field(ctx, obj, list_items_ptr_descr());
-                            trace_raw_array_setitem_value(ctx, items_ptr, index, value);
-                            Ok(())
-                        });
-                    }
-                }
-            } else if is_list(concrete_obj)
-                && w_list_uses_int_storage(concrete_obj)
-                && is_int(concrete_key)
-                && is_int(concrete_value)
-            {
-                let index = w_int_get_value(concrete_key);
-                let concrete_len = w_list_len(concrete_obj);
-                if index >= 0 {
-                    let index = index as usize;
-                    if index < concrete_len {
-                        return self.with_ctx(|this, ctx| {
-                            this.guard_object_class(ctx, obj, &LIST_TYPE as *const PyType);
-                            this.guard_list_strategy(ctx, obj, 1);
-                            let len = trace_arraylen_gc(ctx, obj, list_int_items_len_descr());
-                            let index = this.trace_dynamic_list_index(ctx, key, len, index as i64);
-                            let items_ptr =
-                                trace_gc_object_int_field(ctx, obj, list_int_items_ptr_descr());
-                            let raw = if this.value_type(value) == Type::Int {
-                                value
-                            } else {
-                                crate::state::trace_unbox_int_with_resume(
-                                    this,
-                                    ctx,
-                                    value,
-                                    &INT_TYPE as *const _ as i64,
-                                )
-                            };
-                            trace_raw_int_array_setitem_value(ctx, items_ptr, index, raw);
-                            Ok(())
-                        });
-                    }
-                } else if let Some(abs_index) = index
-                    .checked_neg()
-                    .and_then(|value| usize::try_from(value).ok())
-                {
-                    if abs_index <= concrete_len {
-                        return self.with_ctx(|this, ctx| {
-                            this.guard_object_class(ctx, obj, &LIST_TYPE as *const PyType);
-                            this.guard_list_strategy(ctx, obj, 1);
-                            let len = trace_arraylen_gc(ctx, obj, list_int_items_len_descr());
-                            let index = this.trace_dynamic_list_index(ctx, key, len, index);
-                            let items_ptr =
-                                trace_gc_object_int_field(ctx, obj, list_int_items_ptr_descr());
-                            let raw = if this.value_type(value) == Type::Int {
-                                value
-                            } else {
-                                crate::state::trace_unbox_int_with_resume(
-                                    this,
-                                    ctx,
-                                    value,
-                                    &INT_TYPE as *const _ as i64,
-                                )
-                            };
-                            trace_raw_int_array_setitem_value(ctx, items_ptr, index, raw);
-                            Ok(())
-                        });
-                    }
-                }
-            } else if is_list(concrete_obj)
-                && w_list_uses_float_storage(concrete_obj)
-                && is_int(concrete_key)
-                && is_float(concrete_value)
-            {
-                let index = w_int_get_value(concrete_key);
-                let concrete_len = w_list_len(concrete_obj);
-                if index >= 0 {
-                    let index = index as usize;
-                    if index < concrete_len {
-                        return self.with_ctx(|this, ctx| {
-                            this.guard_object_class(ctx, obj, &LIST_TYPE as *const PyType);
-                            this.guard_list_strategy(ctx, obj, 2);
-                            let len = trace_arraylen_gc(ctx, obj, list_float_items_len_descr());
-                            let index = this.trace_dynamic_list_index(ctx, key, len, index as i64);
-                            let items_ptr =
-                                trace_gc_object_int_field(ctx, obj, list_float_items_ptr_descr());
-                            let raw = if this.value_type(value) == Type::Float {
-                                value
-                            } else {
-                                crate::state::trace_unbox_float_with_resume(
-                                    this,
-                                    ctx,
-                                    value,
-                                    &FLOAT_TYPE as *const _ as i64,
-                                )
-                            };
-                            trace_raw_float_array_setitem_value(ctx, items_ptr, index, raw);
-                            Ok(())
-                        });
-                    }
-                } else if let Some(abs_index) = index
-                    .checked_neg()
-                    .and_then(|value| usize::try_from(value).ok())
-                {
-                    if abs_index <= concrete_len {
-                        return self.with_ctx(|this, ctx| {
-                            this.guard_object_class(ctx, obj, &LIST_TYPE as *const PyType);
-                            this.guard_list_strategy(ctx, obj, 2);
-                            let len = trace_arraylen_gc(ctx, obj, list_float_items_len_descr());
-                            let index = this.trace_dynamic_list_index(ctx, key, len, index);
-                            let items_ptr =
-                                trace_gc_object_int_field(ctx, obj, list_float_items_ptr_descr());
-                            let raw = if this.value_type(value) == Type::Float {
-                                value
-                            } else {
-                                crate::state::trace_unbox_float_with_resume(
-                                    this,
-                                    ctx,
-                                    value,
-                                    &FLOAT_TYPE as *const _ as i64,
-                                )
-                            };
-                            trace_raw_float_array_setitem_value(ctx, items_ptr, index, raw);
+                            crate::generated_list_setitem_by_strategy(
+                                this, ctx, obj, key, value, index, sid,
+                            );
                             Ok(())
                         });
                     }
@@ -2352,118 +2161,32 @@ impl MIFrame {
         }
 
         unsafe {
-            if is_list(concrete_list)
-                && w_list_uses_object_storage(concrete_list)
-                && w_list_can_append_without_realloc(concrete_list)
-            {
-                let concrete_len = w_list_len(concrete_list);
-                return self.with_ctx(|this, ctx| {
-                    this.guard_object_class(ctx, list, &LIST_TYPE as *const PyType);
-                    this.guard_list_strategy(ctx, list, 0);
-                    if w_list_is_inline_storage(concrete_list) {
-                        let heap_cap = ctx.record_op_with_descr(
-                            OpCode::GetfieldGcI,
-                            &[list],
-                            list_items_heap_cap_descr(),
-                        );
-                        this.guard_value(ctx, heap_cap, 0);
-                    } else {
-                        let len = trace_arraylen_gc(ctx, list, list_items_len_descr());
-                        this.guard_value(ctx, len, concrete_len as i64);
-                    }
-                    let items_ptr = trace_gc_object_int_field(ctx, list, list_items_ptr_descr());
-                    let index = ctx.const_int(concrete_len as i64);
-                    trace_raw_array_setitem_value(ctx, items_ptr, index, value);
-                    let new_len = ctx.const_int((concrete_len + 1) as i64);
-                    let len_descr = list_items_len_descr();
-                    let len_descr_idx = len_descr.index();
-                    ctx.record_op_with_descr(OpCode::SetfieldGc, &[list, new_len], len_descr);
-                    ctx.heap_cache_mut()
-                        .setfield_cached(list, len_descr_idx, new_len);
-                    Ok(())
-                });
-            } else if is_list(concrete_list)
-                && w_list_uses_int_storage(concrete_list)
-                && w_list_can_append_without_realloc(concrete_list)
-            {
-                let concrete_len = w_list_len(concrete_list);
-                return self.with_ctx(|this, ctx| {
-                    this.guard_object_class(ctx, list, &LIST_TYPE as *const PyType);
-                    this.guard_list_strategy(ctx, list, 1);
-                    if w_list_is_inline_storage(concrete_list) {
-                        let heap_cap = ctx.record_op_with_descr(
-                            OpCode::GetfieldGcI,
-                            &[list],
-                            list_int_items_heap_cap_descr(),
-                        );
-                        this.guard_value(ctx, heap_cap, 0);
-                    } else {
-                        let len = trace_arraylen_gc(ctx, list, list_int_items_len_descr());
-                        this.guard_value(ctx, len, concrete_len as i64);
-                    }
-                    let items_ptr =
-                        trace_gc_object_int_field(ctx, list, list_int_items_ptr_descr());
-                    let index = ctx.const_int(concrete_len as i64);
-                    let raw = if this.value_type(value) == Type::Int {
-                        value
-                    } else {
-                        crate::state::trace_unbox_int_with_resume(
+            if is_list(concrete_list) && w_list_can_append_without_realloc(concrete_list) {
+                let strategy_id = if w_list_uses_object_storage(concrete_list) {
+                    Some(0i64)
+                } else if w_list_uses_int_storage(concrete_list) {
+                    Some(1i64)
+                } else if w_list_uses_float_storage(concrete_list) {
+                    Some(2i64)
+                } else {
+                    None
+                };
+                if let Some(sid) = strategy_id {
+                    let concrete_len = w_list_len(concrete_list);
+                    let is_inline = w_list_is_inline_storage(concrete_list);
+                    return self.with_ctx(|this, ctx| {
+                        crate::generated_list_append_by_strategy(
                             this,
                             ctx,
+                            list,
                             value,
-                            &INT_TYPE as *const _ as i64,
-                        )
-                    };
-                    trace_raw_int_array_setitem_value(ctx, items_ptr, index, raw);
-                    let new_len = ctx.const_int((concrete_len + 1) as i64);
-                    let len_descr = list_int_items_len_descr();
-                    let len_descr_idx = len_descr.index();
-                    ctx.record_op_with_descr(OpCode::SetfieldGc, &[list, new_len], len_descr);
-                    ctx.heap_cache_mut()
-                        .setfield_cached(list, len_descr_idx, new_len);
-                    Ok(())
-                });
-            } else if is_list(concrete_list)
-                && w_list_uses_float_storage(concrete_list)
-                && w_list_can_append_without_realloc(concrete_list)
-            {
-                let concrete_len = w_list_len(concrete_list);
-                return self.with_ctx(|this, ctx| {
-                    this.guard_object_class(ctx, list, &LIST_TYPE as *const PyType);
-                    this.guard_list_strategy(ctx, list, 2);
-                    if w_list_is_inline_storage(concrete_list) {
-                        let heap_cap = ctx.record_op_with_descr(
-                            OpCode::GetfieldGcI,
-                            &[list],
-                            list_float_items_heap_cap_descr(),
+                            concrete_len,
+                            sid,
+                            is_inline,
                         );
-                        this.guard_value(ctx, heap_cap, 0);
-                    } else {
-                        let len = trace_arraylen_gc(ctx, list, list_float_items_len_descr());
-                        this.guard_value(ctx, len, concrete_len as i64);
-                    }
-                    let items_ptr =
-                        trace_gc_object_int_field(ctx, list, list_float_items_ptr_descr());
-                    let index = ctx.const_int(concrete_len as i64);
-                    let raw = if this.value_type(value) == Type::Float {
-                        value
-                    } else {
-                        crate::state::trace_unbox_float_with_resume(
-                            this,
-                            ctx,
-                            value,
-                            &FLOAT_TYPE as *const _ as i64,
-                        )
-                    };
-                    trace_raw_float_array_setitem_value(ctx, items_ptr, index, raw);
-                    let new_len = ctx.const_int((concrete_len + 1) as i64);
-                    let len_descr = list_float_items_len_descr();
-                    let len_descr_idx = len_descr.index();
-                    ctx.record_op_with_descr(OpCode::SetfieldGc, &[list, new_len], len_descr);
-                    ctx.heap_cache_mut()
-                        .setfield_cached(list, len_descr_idx, new_len);
-                    Ok(())
-                });
+                        Ok(())
+                    });
+                }
             }
         }
 
@@ -2494,61 +2217,16 @@ impl MIFrame {
         value: OpRef,
         concrete_value: PyObjectRef,
     ) -> Result<OpRef, PyError> {
-        if concrete_value.is_null() {
-            return self.trace_known_builtin_call(callable, &[value]);
+        // Delegate to auto-generated function (RPython jitcode parity:
+        // guard_class + getfield(length) for str/dict/list/tuple).
+        let gen_result: Option<OpRef> = self.with_ctx(|this, ctx| {
+            Ok::<_, PyError>(unsafe {
+                crate::generated_direct_len_value(this, ctx, value, concrete_value)
+            })
+        })?;
+        if let Some(result) = gen_result {
+            return Ok(result);
         }
-
-        unsafe {
-            if is_str(concrete_value) {
-                return self.with_ctx(|this, ctx| {
-                    this.guard_object_class(ctx, value, &pyre_object::STR_TYPE as *const PyType);
-                    let len = trace_arraylen_gc(ctx, value, str_len_descr());
-                    this.remember_value_type(len, Type::Int);
-                    Ok(len)
-                });
-            }
-            if is_dict(concrete_value) {
-                return self.with_ctx(|this, ctx| {
-                    this.guard_object_class(ctx, value, &DICT_TYPE as *const PyType);
-                    let len = trace_arraylen_gc(ctx, value, dict_len_descr());
-                    this.remember_value_type(len, Type::Int);
-                    Ok(len)
-                });
-            }
-            if is_list(concrete_value) {
-                return self.with_ctx(|this, ctx| {
-                    this.guard_object_class(ctx, value, &LIST_TYPE as *const PyType);
-                    let len = if w_list_uses_object_storage(concrete_value) {
-                        this.guard_list_strategy(ctx, value, 0);
-                        trace_arraylen_gc(ctx, value, list_items_len_descr())
-                    } else if w_list_uses_int_storage(concrete_value) {
-                        this.guard_list_strategy(ctx, value, 1);
-                        trace_arraylen_gc(ctx, value, list_int_items_len_descr())
-                    } else if w_list_uses_float_storage(concrete_value) {
-                        this.guard_list_strategy(ctx, value, 2);
-                        trace_arraylen_gc(ctx, value, list_float_items_len_descr())
-                    } else {
-                        let boxed_value = box_value_for_python_helper(this, ctx, value);
-                        return crate::helpers::emit_trace_call_known_builtin(
-                            ctx,
-                            callable,
-                            &[boxed_value],
-                        );
-                    };
-                    this.remember_value_type(len, Type::Int);
-                    Ok(len)
-                });
-            }
-            if is_tuple(concrete_value) {
-                return self.with_ctx(|this, ctx| {
-                    this.guard_object_class(ctx, value, &TUPLE_TYPE as *const PyType);
-                    let len = trace_arraylen_gc(ctx, value, tuple_items_len_descr());
-                    this.remember_value_type(len, Type::Int);
-                    Ok(len)
-                });
-            }
-        }
-
         self.trace_known_builtin_call(callable, &[value])
     }
 
@@ -2558,40 +2236,14 @@ impl MIFrame {
         value: OpRef,
         concrete_value: PyObjectRef,
     ) -> Result<OpRef, PyError> {
-        if concrete_value.is_null() {
-            return self.trace_known_builtin_call(callable, &[value]);
+        let gen_result: Option<OpRef> = self.with_ctx(|this, ctx| {
+            Ok::<_, PyError>(unsafe {
+                crate::generated_direct_abs_value(this, ctx, value, concrete_value)
+            })
+        })?;
+        if let Some(result) = gen_result {
+            return Ok(result);
         }
-
-        unsafe {
-            if is_int(concrete_value) {
-                let concrete_int = w_int_get_value(concrete_value);
-                if concrete_int == i64::MIN {
-                    return self.trace_known_builtin_call(callable, &[value]);
-                }
-                return self.with_ctx(|this, ctx| {
-                    let int_value = this.trace_guarded_int_payload(ctx, value);
-                    let min_value = ctx.const_int(i64::MIN);
-                    let is_min = ctx.record_op(OpCode::IntEq, &[int_value, min_value]);
-                    this.record_guard(ctx, OpCode::GuardFalse, &[is_min]);
-                    let shift = ctx.const_int((i64::BITS - 1) as i64);
-                    let sign = ctx.record_op(OpCode::IntRshift, &[int_value, shift]);
-                    let xor = ctx.record_op(OpCode::IntXor, &[int_value, sign]);
-                    let abs_value = ctx.record_op(OpCode::IntSub, &[xor, sign]);
-                    Ok({
-                        let int_type_addr = &INT_TYPE as *const _ as i64;
-                        crate::generated::trace_box_int(
-                            ctx,
-                            abs_value,
-                            w_int_size_descr(),
-                            ob_type_descr(),
-                            int_intval_descr(),
-                            int_type_addr,
-                        )
-                    })
-                });
-            }
-        }
-
         self.trace_known_builtin_call(callable, &[value])
     }
 
@@ -2601,19 +2253,15 @@ impl MIFrame {
         value: OpRef,
         concrete_value: PyObjectRef,
     ) -> Result<OpRef, PyError> {
-        if concrete_value.is_null() {
-            return self.trace_known_builtin_call(callable, &[value]);
+        let gen_result: Option<OpRef> = self.with_ctx(|this, ctx| {
+            Ok::<_, PyError>(unsafe {
+                crate::generated_direct_type_value(this, ctx, value, concrete_value)
+            })
+        })?;
+        if let Some(result) = gen_result {
+            return Ok(result);
         }
-
-        unsafe {
-            let concrete_obj_type = (*concrete_value).ob_type;
-            let type_name = (*concrete_obj_type).tp_name;
-            return self.with_ctx(|this, ctx| {
-                this.guard_object_class(ctx, value, concrete_obj_type);
-                // box_str_constant returns a PyObjectRef.
-                Ok(ctx.const_ref(pyre_object::box_str_constant(type_name) as i64))
-            });
-        }
+        self.trace_known_builtin_call(callable, &[value])
     }
 
     fn direct_isinstance_value(
@@ -2624,24 +2272,21 @@ impl MIFrame {
         concrete_obj: PyObjectRef,
         concrete_type_name: PyObjectRef,
     ) -> Result<OpRef, PyError> {
-        if concrete_obj.is_null() || concrete_type_name.is_null() {
-            return self.trace_known_builtin_call(callable, &[obj, type_name]);
+        let gen_result: Option<OpRef> = self.with_ctx(|this, ctx| {
+            Ok::<_, PyError>(unsafe {
+                crate::generated_direct_isinstance_value(
+                    this,
+                    ctx,
+                    obj,
+                    type_name,
+                    concrete_obj,
+                    concrete_type_name,
+                )
+            })
+        })?;
+        if let Some(result) = gen_result {
+            return Ok(result);
         }
-
-        unsafe {
-            if is_str(concrete_type_name) {
-                let concrete_obj_type = (*concrete_obj).ob_type;
-                let concrete_result =
-                    (*concrete_obj_type).tp_name == w_str_get_value(concrete_type_name);
-                return self.with_ctx(|this, ctx| {
-                    this.guard_object_class(ctx, obj, concrete_obj_type);
-                    this.guard_value(ctx, type_name, concrete_type_name as i64);
-                    // w_bool_from returns a PyObjectRef (Ref-typed singleton).
-                    Ok(ctx.const_ref(w_bool_from(concrete_result) as i64))
-                });
-            }
-        }
-
         self.trace_known_builtin_call(callable, &[obj, type_name])
     }
 
@@ -2654,57 +2299,16 @@ impl MIFrame {
         concrete_a: PyObjectRef,
         concrete_b: PyObjectRef,
     ) -> Result<OpRef, PyError> {
-        if concrete_a.is_null() || concrete_b.is_null() {
-            return self.trace_known_builtin_call(callable, &[a, b]);
+        let gen_result: Option<OpRef> = self.with_ctx(|this, ctx| {
+            Ok::<_, PyError>(unsafe {
+                crate::generated_direct_minmax_value(
+                    this, ctx, a, b, choose_max, concrete_a, concrete_b,
+                )
+            })
+        })?;
+        if let Some(result) = gen_result {
+            return Ok(result);
         }
-
-        unsafe {
-            if is_int(concrete_a) && is_int(concrete_b) {
-                let lhs = w_int_get_value(concrete_a);
-                let rhs = w_int_get_value(concrete_b);
-                let concrete_result = if choose_max {
-                    lhs.max(rhs)
-                } else {
-                    lhs.min(rhs)
-                };
-                let concrete_obj = if choose_max {
-                    if lhs >= rhs { concrete_a } else { concrete_b }
-                } else if lhs <= rhs {
-                    concrete_a
-                } else {
-                    concrete_b
-                };
-                if w_int_new(concrete_result) != concrete_obj {
-                    return self.trace_known_builtin_call(callable, &[a, b]);
-                }
-                return self.with_ctx(|this, ctx| {
-                    let lhs = this.trace_guarded_int_payload(ctx, a);
-                    let rhs = this.trace_guarded_int_payload(ctx, b);
-                    let cmp = ctx.record_op(OpCode::IntLt, &[lhs, rhs]);
-                    let zero = ctx.const_int(0);
-                    let mask = ctx.record_op(OpCode::IntSub, &[zero, cmp]);
-                    let xor = ctx.record_op(OpCode::IntXor, &[lhs, rhs]);
-                    let select_bits = ctx.record_op(OpCode::IntAnd, &[xor, mask]);
-                    let selected = if choose_max {
-                        ctx.record_op(OpCode::IntXor, &[lhs, select_bits])
-                    } else {
-                        ctx.record_op(OpCode::IntXor, &[rhs, select_bits])
-                    };
-                    Ok({
-                        let int_type_addr = &INT_TYPE as *const _ as i64;
-                        crate::generated::trace_box_int(
-                            ctx,
-                            selected,
-                            w_int_size_descr(),
-                            ob_type_descr(),
-                            int_intval_descr(),
-                            int_type_addr,
-                        )
-                    })
-                });
-            }
-        }
-
         self.trace_known_builtin_call(callable, &[a, b])
     }
 
@@ -3638,64 +3242,25 @@ impl MIFrame {
         let concrete_current = unsafe {
             (*(concrete_iter as *const pyre_object::rangeobject::W_RangeIterator)).current
         };
-        let concrete_step_positive = concrete_step > 0;
-        if concrete_continues {
-            if concrete_current.checked_add(concrete_step).is_none() {
-                let opref = self.trace_iter_next_value(iter)?;
-                return Ok(FrontendOp::opref_only(opref));
-            }
-        }
 
-        self.with_ctx(|this, ctx| {
-            MIFrame::guard_range_iter(this, ctx, iter);
-
-            let current = trace_gc_object_int_field(ctx, iter, range_iter_current_descr());
-            let stop = trace_gc_object_int_field(ctx, iter, range_iter_stop_descr());
-            let step = trace_gc_object_int_field(ctx, iter, range_iter_step_descr());
-            let zero = ctx.const_int(0);
-            // pyjitpl.py:1877 opimpl_goto_if_not: boolean guards use
-            // GuardTrue/GuardFalse, NOT GuardValue. GuardValue's replace_box
-            // propagates a constant substitution that unroll's body-peeling
-            // then drops because the peeled body recomputes the value from
-            // fresh field reads. GuardTrue only records the truth assertion
-            // without constant substitution, so the body's corresponding
-            // guard is preserved after unrolling.
-            let step_positive = ctx.record_op(OpCode::IntGt, &[step, zero]);
-            if concrete_step_positive {
-                this.record_guard(ctx, OpCode::GuardTrue, &[step_positive]);
-            } else {
-                this.record_guard(ctx, OpCode::GuardFalse, &[step_positive]);
-            }
-
-            let continues = if concrete_step_positive {
-                ctx.record_op(OpCode::IntLt, &[current, stop])
-            } else {
-                ctx.record_op(OpCode::IntGt, &[current, stop])
-            };
-            if concrete_continues {
-                this.record_guard(ctx, OpCode::GuardTrue, &[continues]);
-            } else {
-                this.record_guard(ctx, OpCode::GuardFalse, &[continues]);
-            }
-
-            if !concrete_continues {
-                this.remember_value_type(zero, Type::Int);
-                return Ok(FrontendOp::new(zero, ConcreteValue::Int(0)));
-            }
-
-            let next_current = ctx.record_op(OpCode::IntAddOvf, &[current, step]);
-            this.record_guard(ctx, OpCode::GuardNoOverflow, &[]);
-            let ri_descr = range_iter_current_descr();
-            let ri_descr_idx = ri_descr.index();
-            ctx.record_op_with_descr(OpCode::SetfieldGc, &[iter, next_current], ri_descr);
-            ctx.heap_cache_mut()
-                .setfield_cached(iter, ri_descr_idx, next_current);
-            this.remember_value_type(current, Type::Int);
-            Ok(FrontendOp::new(
-                current,
-                ConcreteValue::Int(concrete_current),
+        // Delegate to auto-generated function (RPython jitcode parity:
+        // getfield(current/stop/step) → step sign guard → continues guard
+        // → int_add_ovf → guard_no_overflow → setfield).
+        let gen_result: Option<(OpRef, i64)> = self.with_ctx(|this, ctx| {
+            Ok::<_, PyError>(crate::generated_iter_next_value(
+                this,
+                ctx,
+                iter,
+                concrete_continues,
+                concrete_step,
+                concrete_current,
             ))
-        })
+        })?;
+        if let Some((opref, cv)) = gen_result {
+            return Ok(FrontendOp::new(opref, ConcreteValue::Int(cv)));
+        }
+        let opref = self.trace_iter_next_value(iter)?;
+        Ok(FrontendOp::opref_only(opref))
     }
 
     pub(crate) fn concrete_branch_truth_for_value(
@@ -3723,136 +3288,16 @@ impl MIFrame {
         value: OpRef,
         concrete_val: PyObjectRef,
     ) -> Result<OpRef, PyError> {
-        // RPython goto_if_not fusion: if the previous op was a comparison,
-        // use the cached raw truth (0/1) directly instead of unboxing the
-        // bool object. This eliminates the CallI(bool_helper) + GetfieldGcI
-        // round-trip, matching RPython's fused goto_if_not_int_lt pattern.
-        if let Some(truth) = self.sym_mut().last_comparison_truth.take() {
-            return Ok(truth);
+        // Delegate to auto-generated function (RPython jitcode parity:
+        // type-specialized is_true via guard_class + getfield → int_ne).
+        let gen_result: Option<OpRef> = self.with_ctx(|this, ctx| {
+            Ok::<_, PyError>(unsafe {
+                crate::generated_truth_value_direct(this, ctx, value, concrete_val)
+            })
+        })?;
+        if let Some(result) = gen_result {
+            return Ok(result);
         }
-
-        if !concrete_val.is_null() {
-            let cached_concrete_truth = objspace_truth_value(concrete_val);
-            self.sym_mut().last_comparison_concrete_truth = Some(cached_concrete_truth);
-        }
-
-        if self.value_type(value) == Type::Int {
-            return self.with_ctx(|_, ctx| {
-                let zero = ctx.const_int(0);
-                Ok(ctx.record_op(OpCode::IntNe, &[value, zero]))
-            });
-        }
-        if self.value_type(value) == Type::Float {
-            return self.with_ctx(|_, ctx| {
-                let zero = ctx.const_int(0);
-                let zero_float = ctx.record_op(OpCode::CastIntToFloat, &[zero]);
-                Ok(ctx.record_op(OpCode::FloatNe, &[value, zero_float]))
-            });
-        }
-
-        let concrete_value = concrete_val;
-        if concrete_value.is_null() {
-            return self.trace_truth_value(value);
-        }
-
-        unsafe {
-            if is_int(concrete_value) {
-                return self.with_ctx(|this, ctx| {
-                    let int_type_addr = &INT_TYPE as *const _ as i64;
-                    let int_value = if let Some(raw) =
-                        try_trace_const_boxed_int(ctx, value, concrete_value)
-                    {
-                        raw
-                    } else {
-                        crate::state::trace_unbox_int_with_resume(this, ctx, value, int_type_addr)
-                    };
-                    let zero = ctx.const_int(0);
-                    Ok(ctx.record_op(OpCode::IntNe, &[int_value, zero]))
-                });
-            }
-            if is_bool(concrete_value) {
-                return self.with_ctx(|this, ctx| {
-                    let bool_type_addr = &BOOL_TYPE as *const _ as i64;
-                    let bool_value =
-                        if let Some(raw) = try_trace_const_boxed_int(ctx, value, concrete_value) {
-                            raw
-                        } else {
-                            crate::state::trace_unbox_int_with_resume_descr(
-                                this,
-                                ctx,
-                                value,
-                                bool_type_addr,
-                                crate::descr::bool_boolval_descr(),
-                            )
-                        };
-                    let zero = ctx.const_int(0);
-                    Ok(ctx.record_op(OpCode::IntNe, &[bool_value, zero]))
-                });
-            }
-            if is_none(concrete_value) {
-                return self.with_ctx(|this, ctx| {
-                    this.guard_object_class(ctx, value, &NONE_TYPE as *const PyType);
-                    Ok(ctx.const_int(0))
-                });
-            }
-            if is_float(concrete_value) {
-                return self.with_ctx(|this, ctx| {
-                    let float_type_addr = &FLOAT_TYPE as *const _ as i64;
-                    let float_value = crate::state::trace_unbox_float_with_resume(
-                        this,
-                        ctx,
-                        value,
-                        float_type_addr,
-                    );
-                    let zero = ctx.const_int(0);
-                    let zero_float = ctx.record_op(OpCode::CastIntToFloat, &[zero]);
-                    Ok(ctx.record_op(OpCode::FloatNe, &[float_value, zero_float]))
-                });
-            }
-            if is_str(concrete_value) {
-                return self.with_ctx(|this, ctx| {
-                    this.guard_object_class(ctx, value, &pyre_object::STR_TYPE as *const PyType);
-                    let len =
-                        ctx.record_op_with_descr(OpCode::GetfieldRawI, &[value], str_len_descr());
-                    let zero = ctx.const_int(0);
-                    Ok(ctx.record_op(OpCode::IntNe, &[len, zero]))
-                });
-            }
-            if is_dict(concrete_value) {
-                return self.with_ctx(|this, ctx| {
-                    this.guard_object_class(ctx, value, &DICT_TYPE as *const PyType);
-                    let len =
-                        ctx.record_op_with_descr(OpCode::GetfieldRawI, &[value], dict_len_descr());
-                    let zero = ctx.const_int(0);
-                    Ok(ctx.record_op(OpCode::IntNe, &[len, zero]))
-                });
-            }
-            if is_list(concrete_value) && w_list_uses_object_storage(concrete_value) {
-                return self.with_ctx(|this, ctx| {
-                    this.guard_object_class(ctx, value, &LIST_TYPE as *const PyType);
-                    let len = ctx.record_op_with_descr(
-                        OpCode::GetfieldRawI,
-                        &[value],
-                        list_items_len_descr(),
-                    );
-                    let zero = ctx.const_int(0);
-                    Ok(ctx.record_op(OpCode::IntNe, &[len, zero]))
-                });
-            }
-            if is_tuple(concrete_value) {
-                return self.with_ctx(|this, ctx| {
-                    this.guard_object_class(ctx, value, &TUPLE_TYPE as *const PyType);
-                    let len = ctx.record_op_with_descr(
-                        OpCode::GetfieldRawI,
-                        &[value],
-                        tuple_items_len_descr(),
-                    );
-                    let zero = ctx.const_int(0);
-                    Ok(ctx.record_op(OpCode::IntNe, &[len, zero]))
-                });
-            }
-        }
-
         self.trace_truth_value(value)
     }
 
@@ -3862,31 +3307,25 @@ impl MIFrame {
         opcode: OpCode,
         concrete_value: PyObjectRef,
     ) -> Result<OpRef, PyError> {
-        let is_int_operand = !concrete_value.is_null() && unsafe { is_int(concrete_value) };
-        if !is_int_operand {
-            return match opcode {
-                OpCode::IntNeg => self.trace_unary_negative_value(value),
-                OpCode::IntInvert => self.trace_unary_invert_value(value),
-                _ => unreachable!("unexpected unary opcode"),
-            };
+        // Delegate to auto-generated function (RPython jitcode parity:
+        // guard_class + getfield_gc_i + INT_NEG/INT_INVERT).
+        let gen_result: Option<OpRef> = self.with_ctx(|this, ctx| {
+            Ok::<_, PyError>(crate::generated_unary_int_value(
+                this,
+                ctx,
+                value,
+                opcode,
+                concrete_value,
+            ))
+        })?;
+        if let Some(result) = gen_result {
+            return Ok(result);
         }
-
-        self.with_ctx(|this, ctx| {
-            let payload = if this.value_type(value) == Type::Int {
-                value
-            } else {
-                let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
-                crate::state::trace_unbox_int_with_resume(this, ctx, value, int_type_addr)
-            };
-            if matches!(opcode, OpCode::IntNeg) {
-                let min_val = ctx.const_int(i64::MIN);
-                let is_min = ctx.record_op(OpCode::IntEq, &[payload, min_val]);
-                this.record_guard(ctx, OpCode::GuardFalse, &[is_min]);
-            }
-            let result = ctx.record_op(opcode, &[payload]);
-            this.remember_value_type(result, Type::Int);
-            Ok(result)
-        })
+        match opcode {
+            OpCode::IntNeg => self.trace_unary_negative_value(value),
+            OpCode::IntInvert => self.trace_unary_invert_value(value),
+            _ => unreachable!("unexpected unary opcode"),
+        }
     }
 
     pub(crate) fn into_trace_action(
