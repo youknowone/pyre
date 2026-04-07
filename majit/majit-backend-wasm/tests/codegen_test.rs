@@ -69,11 +69,11 @@ fn test_int_add_loop() {
         }, // sum
     ];
 
-    let const_1 = OpRef(10000);
-    let const_100 = OpRef(10001);
+    let const_1 = OpRef::from_const(0);
+    let const_100 = OpRef::from_const(1);
     let mut constants = HashMap::new();
-    constants.insert(10000, 1i64);
-    constants.insert(10001, 100i64);
+    constants.insert(OpRef::from_const(0).0, 1i64);
+    constants.insert(OpRef::from_const(1).0, 100i64);
 
     let ops = vec![
         Op::new(OpCode::Label, &[OpRef(0), OpRef(1)]),
@@ -147,9 +147,9 @@ fn test_call_generates_import() {
         tp: Type::Int,
     }];
 
-    let func_ptr = OpRef(10000);
+    let func_ptr = OpRef::from_const(0);
     let mut constants = HashMap::new();
-    constants.insert(10000, 42i64); // fake func_ptr
+    constants.insert(OpRef::from_const(0).0, 42i64); // fake func_ptr
 
     let ops = vec![make_op(OpCode::CallI, &[func_ptr, OpRef(0)], OpRef(1)), {
         let mut op = Op::new(OpCode::Finish, &[OpRef(1)]);
@@ -253,13 +253,17 @@ fn test_guard_gc_type_uses_immediate_typeid() {
         tp: Type::Int,
     }];
 
-    // OpRef(10000) holds the immediate typeid 0x42
+    // OpRef::from_const(0) holds the immediate typeid 0x42
     let mut constants = HashMap::new();
-    constants.insert(10_000, 0x42_i64);
+    constants.insert(OpRef::from_const(0).0, 0x42_i64);
 
     let ops = vec![
         Op::new(OpCode::Label, &[OpRef(0)]),
-        make_guard(OpCode::GuardGcType, &[OpRef(0), OpRef(10_000)], &[OpRef(0)]),
+        make_guard(
+            OpCode::GuardGcType,
+            &[OpRef(0), OpRef::from_const(0)],
+            &[OpRef(0)],
+        ),
         Op::new(OpCode::Jump, &[OpRef(0)]),
     ];
 

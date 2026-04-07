@@ -15,21 +15,34 @@ pub struct OpRef(pub u32);
 
 impl OpRef {
     pub const NONE: OpRef = OpRef(u32::MAX);
-    /// Constants use OpRef indices starting from this base.
-    /// RPython uses Box identity (ConstInt/ConstPtr are separate objects)
-    /// so there is no equivalent boundary. This value must be large enough
-    /// that trace op positions never reach it, but small enough that
-    /// Vec<Option<Value>> indexed by OpRef.0 stays practical.
-    /// Real traces rarely exceed a few thousand ops.
-    pub const CONST_BASE: u32 = 100_000;
+    /// High bit distinguishes constant-namespace OpRefs from operation OpRefs.
+    /// opencoder.py: TAGINT/TAGCONSTPTR/TAGCONSTOTHER/TAGBOX use 2-bit tags;
+    /// here a single high bit suffices (op vs const).
+    const CONST_BIT: u32 = 1 << 31;
 
     pub fn is_none(self) -> bool {
         self.0 == u32::MAX
     }
 
-    /// resoperation.py: is_constant() — constants have OpRef >= CONST_BASE.
+    /// Create an OpRef in the constant namespace from a zero-based index.
+    pub fn from_const(index: u32) -> OpRef {
+        debug_assert!(
+            index & Self::CONST_BIT == 0,
+            "const index too large: {}",
+            index
+        );
+        OpRef(index | Self::CONST_BIT)
+    }
+
+    /// Extract the zero-based constant index (masks off high bit).
+    pub fn const_index(self) -> u32 {
+        debug_assert!(self.is_constant());
+        self.0 & !Self::CONST_BIT
+    }
+
+    /// resoperation.py: is_constant() — Const subclass check.
     pub fn is_constant(self) -> bool {
-        self.0 >= Self::CONST_BASE && self.0 != u32::MAX
+        self.0 & Self::CONST_BIT != 0 && self.0 != u32::MAX
     }
 }
 

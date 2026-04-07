@@ -32,14 +32,14 @@ fn read_typeid(obj_ptr: i64) -> Option<u32> {
 
 /// Fast value store for trace execution.
 ///
-/// Op results (OpRef < CONST_BASE) → `results` Vec, direct indexed.
-/// Constants (OpRef >= CONST_BASE) → `constants` Vec, offset by CONST_BASE.
+/// Op results (non-constant OpRef) → `results` Vec, direct indexed.
+/// Constants (constant-namespace OpRef) → `constants` Vec, indexed by const_index.
 ///
 /// Replaces `HashMap<u32, i64>` on the hot path with O(1) Vec indexing.
 pub(crate) struct TraceValues {
-    /// Op results, indexed by OpRef.0 (always < CONST_BASE).
+    /// Op results, indexed by OpRef.0 (operation namespace).
     pub results: Vec<i64>,
-    /// Constants, indexed by (OpRef.0 - CONST_BASE).
+    /// Constants, indexed by OpRef.const_index() (constant namespace).
     pub constants: Vec<i64>,
 }
 
@@ -54,15 +54,15 @@ impl TraceValues {
     pub fn from_hashmap(map: &HashMap<u32, i64>) -> Self {
         let max_op = map
             .keys()
-            .filter(|&&k| k < OpRef::CONST_BASE)
+            .filter(|&&k| !OpRef(k).is_constant())
             .max()
             .copied()
             .unwrap_or(0) as usize;
         let max_const = map
             .keys()
-            .filter(|&&k| k >= OpRef::CONST_BASE)
+            .filter(|&&k| OpRef(k).is_constant())
             .max()
-            .map(|&k| (k - OpRef::CONST_BASE) as usize)
+            .map(|&k| OpRef(k).const_index() as usize)
             .unwrap_or(0);
         let mut tv = Self::new(max_op + 1, max_const + 1);
         for (&k, &v) in map {
@@ -73,8 +73,9 @@ impl TraceValues {
 
     #[inline(always)]
     pub fn get(&self, idx: u32) -> i64 {
-        if idx >= OpRef::CONST_BASE {
-            let ci = (idx - OpRef::CONST_BASE) as usize;
+        let opref = OpRef(idx);
+        if opref.is_constant() {
+            let ci = opref.const_index() as usize;
             if ci < self.constants.len() {
                 self.constants[ci]
             } else {
@@ -92,8 +93,9 @@ impl TraceValues {
 
     #[inline(always)]
     pub fn set(&mut self, idx: u32, value: i64) {
-        if idx >= OpRef::CONST_BASE {
-            let ci = (idx - OpRef::CONST_BASE) as usize;
+        let opref = OpRef(idx);
+        if opref.is_constant() {
+            let ci = opref.const_index() as usize;
             if ci >= self.constants.len() {
                 self.constants.resize(ci + 1, 0);
             }

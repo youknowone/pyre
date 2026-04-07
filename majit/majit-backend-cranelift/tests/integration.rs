@@ -88,9 +88,7 @@ fn test_simple_arithmetic() {
     let mut rec = Trace::new();
     let i0 = rec.record_input_arg(Type::Int);
 
-    // Use a high OpRef index for the constant so it doesn't collide with
-    // variable indices used by the recorder.
-    let const_one = OpRef(1000);
+    let const_one = OpRef::from_const(0);
     let result = rec.record_op(OpCode::IntAdd, &[i0, const_one]);
     rec.finish(&[result], make_descr(0));
     let trace = rec.get_trace();
@@ -98,7 +96,7 @@ fn test_simple_arithmetic() {
     // Compile directly without optimizer (RPython test_compile_linear_loop parity)
     let mut backend = CraneliftBackend::new();
     let mut constants = HashMap::new();
-    constants.insert(1000, 1i64);
+    constants.insert(OpRef::from_const(0).0, 1i64);
     backend.set_constants(constants);
 
     let mut token = JitCellToken::new(0);
@@ -125,8 +123,8 @@ fn test_sum_loop() {
     let i = rec.record_input_arg(Type::Int);
     let sum = rec.record_input_arg(Type::Int);
 
-    let const_one = OpRef(1000);
-    let const_zero = OpRef(1001);
+    let const_one = OpRef::from_const(0);
+    let const_zero = OpRef::from_const(1);
 
     let sum2 = rec.record_op(OpCode::IntAdd, &[sum, i]);
     let i2 = rec.record_op(OpCode::IntSub, &[i, const_one]);
@@ -140,8 +138,8 @@ fn test_sum_loop() {
     // Compile
     let mut backend = CraneliftBackend::new();
     let mut constants = HashMap::new();
-    constants.insert(1000, 1i64);
-    constants.insert(1001, 0i64);
+    constants.insert(OpRef::from_const(0).0, 1i64);
+    constants.insert(OpRef::from_const(1).0, 0i64);
     backend.set_constants(constants);
 
     let mut token = JitCellToken::new(1);
@@ -204,8 +202,8 @@ fn test_guard_failure_path() {
     let mut rec = Trace::new();
     let x = rec.record_input_arg(Type::Int);
 
-    let const_zero = OpRef(1000);
-    let const_two = OpRef(1001);
+    let const_zero = OpRef::from_const(0);
+    let const_two = OpRef::from_const(1);
 
     let cmp = rec.record_op(OpCode::IntGt, &[x, const_zero]);
     rec.record_guard(OpCode::GuardTrue, &[cmp], make_descr(0));
@@ -218,8 +216,8 @@ fn test_guard_failure_path() {
     // Compile
     let mut backend = CraneliftBackend::new();
     let mut constants = HashMap::new();
-    constants.insert(1000, 0i64);
-    constants.insert(1001, 2i64);
+    constants.insert(OpRef::from_const(0).0, 0i64);
+    constants.insert(OpRef::from_const(1).0, 2i64);
     backend.set_constants(constants);
 
     let mut token = JitCellToken::new(3);
@@ -268,8 +266,8 @@ fn test_bridge_end_to_end() {
     let i = rec.record_input_arg(Type::Int);
     let sum = rec.record_input_arg(Type::Int);
 
-    let const_one = OpRef(1000);
-    let const_zero = OpRef(1001);
+    let const_one = OpRef::from_const(0);
+    let const_zero = OpRef::from_const(1);
 
     let sum2 = rec.record_op(OpCode::IntAdd, &[sum, i]);
     let i2 = rec.record_op(OpCode::IntSub, &[i, const_one]);
@@ -283,8 +281,8 @@ fn test_bridge_end_to_end() {
     // Compile main loop
     let mut backend = CraneliftBackend::new();
     let mut constants = HashMap::new();
-    constants.insert(1000, 1i64);
-    constants.insert(1001, 0i64);
+    constants.insert(OpRef::from_const(0).0, 1i64);
+    constants.insert(OpRef::from_const(1).0, 0i64);
     backend.set_constants(constants);
 
     let mut token = JitCellToken::new(10);
@@ -314,13 +312,13 @@ fn test_bridge_end_to_end() {
     let bsum = bridge_rec.record_input_arg(Type::Int);
     let _ = bi; // bridge ignores i
 
-    let bridge_const_two = OpRef(1000);
+    let bridge_const_two = OpRef::from_const(0);
     let result = bridge_rec.record_op(OpCode::IntMul, &[bsum, bridge_const_two]);
     bridge_rec.finish(&[result], make_descr(1));
     let bridge_trace = bridge_rec.get_trace();
 
     let mut bridge_constants = HashMap::new();
-    bridge_constants.insert(1000, 2i64);
+    bridge_constants.insert(OpRef::from_const(0).0, 2i64);
     backend.set_constants(bridge_constants);
 
     // We need a CraneliftFailDescr to pass to compile_bridge.
@@ -388,10 +386,9 @@ fn build_magic_div_trace(m: i64, token_id: u64) -> (CraneliftBackend, JitCellTok
     let mut rec = Trace::new();
     let x = rec.record_input_arg(Type::Int);
 
-    // Constants via high OpRef indices.
-    let const_k = OpRef(1000);
-    let const_i = OpRef(1001);
-    let const_63 = OpRef(1002);
+    let const_k = OpRef::from_const(0);
+    let const_i = OpRef::from_const(1);
+    let const_63 = OpRef::from_const(2);
 
     // t = x >> 63
     let t = rec.record_op(OpCode::IntRshift, &[x, const_63]);
@@ -407,9 +404,9 @@ fn build_magic_div_trace(m: i64, token_id: u64) -> (CraneliftBackend, JitCellTok
     let trace = rec.get_trace();
 
     let mut constants = HashMap::new();
-    constants.insert(1000, k as i64);
-    constants.insert(1001, i as i64);
-    constants.insert(1002, 63i64);
+    constants.insert(OpRef::from_const(0).0, k as i64);
+    constants.insert(OpRef::from_const(1).0, i as i64);
+    constants.insert(OpRef::from_const(2).0, 63i64);
 
     let mut backend = CraneliftBackend::new();
     backend.set_constants(constants);
@@ -429,10 +426,10 @@ fn build_magic_mod_trace(m: i64, token_id: u64) -> (CraneliftBackend, JitCellTok
     let mut rec = Trace::new();
     let x = rec.record_input_arg(Type::Int);
 
-    let const_k = OpRef(1000);
-    let const_i = OpRef(1001);
-    let const_63 = OpRef(1002);
-    let const_m = OpRef(1003);
+    let const_k = OpRef::from_const(0);
+    let const_i = OpRef::from_const(1);
+    let const_63 = OpRef::from_const(2);
+    let const_m = OpRef::from_const(3);
 
     // Division: floor_div(x, m)
     let t = rec.record_op(OpCode::IntRshift, &[x, const_63]);
@@ -447,10 +444,10 @@ fn build_magic_mod_trace(m: i64, token_id: u64) -> (CraneliftBackend, JitCellTok
     let trace = rec.get_trace();
 
     let mut constants = HashMap::new();
-    constants.insert(1000, k as i64);
-    constants.insert(1001, i as i64);
-    constants.insert(1002, 63i64);
-    constants.insert(1003, m);
+    constants.insert(OpRef::from_const(0).0, k as i64);
+    constants.insert(OpRef::from_const(1).0, i as i64);
+    constants.insert(OpRef::from_const(2).0, 63i64);
+    constants.insert(OpRef::from_const(3).0, m);
 
     let mut backend = CraneliftBackend::new();
     backend.set_constants(constants);
@@ -476,9 +473,9 @@ fn build_power_of_two_div_trace(divisor: i64, token_id: u64) -> (CraneliftBacken
     let mut rec = Trace::new();
     let x = rec.record_input_arg(Type::Int);
 
-    let const_63 = OpRef(1000);
-    let const_mask = OpRef(1001);
-    let const_shift = OpRef(1002);
+    let const_63 = OpRef::from_const(0);
+    let const_mask = OpRef::from_const(1);
+    let const_shift = OpRef::from_const(2);
 
     let sign = rec.record_op(OpCode::IntRshift, &[x, const_63]);
     let correction = rec.record_op(OpCode::IntAnd, &[sign, const_mask]);
@@ -488,9 +485,9 @@ fn build_power_of_two_div_trace(divisor: i64, token_id: u64) -> (CraneliftBacken
     let trace = rec.get_trace();
 
     let mut constants = HashMap::new();
-    constants.insert(1000, 63i64);
-    constants.insert(1001, divisor - 1);
-    constants.insert(1002, shift as i64);
+    constants.insert(OpRef::from_const(0).0, 63i64);
+    constants.insert(OpRef::from_const(1).0, divisor - 1);
+    constants.insert(OpRef::from_const(2).0, shift as i64);
 
     let mut backend = CraneliftBackend::new();
     backend.set_constants(constants);
@@ -664,9 +661,9 @@ fn test_vec_int_add_simd() {
     let c = rec.record_input_arg(Type::Int);
     let d = rec.record_input_arg(Type::Int);
 
-    let const_0 = OpRef(1000);
-    let const_1 = OpRef(1001);
-    let const_2 = OpRef(1002);
+    let const_0 = OpRef::from_const(0);
+    let const_1 = OpRef::from_const(1);
+    let const_2 = OpRef::from_const(2);
 
     let vec0 = rec.record_op(OpCode::VecI, &[]);
     let vec1 = rec.record_op(OpCode::VecPackI, &[vec0, a, const_0, const_2]);
@@ -682,9 +679,9 @@ fn test_vec_int_add_simd() {
 
     let mut backend = CraneliftBackend::new();
     let mut constants = HashMap::new();
-    constants.insert(1000, 0i64);
-    constants.insert(1001, 1i64);
-    constants.insert(1002, 2i64);
+    constants.insert(OpRef::from_const(0).0, 0i64);
+    constants.insert(OpRef::from_const(1).0, 1i64);
+    constants.insert(OpRef::from_const(2).0, 2i64);
     backend.set_constants(constants);
 
     let mut token = JitCellToken::new(300);
@@ -726,9 +723,9 @@ fn test_vec_int_sub_simd() {
     let c = rec.record_input_arg(Type::Int);
     let d = rec.record_input_arg(Type::Int);
 
-    let const_0 = OpRef(1000);
-    let const_1 = OpRef(1001);
-    let const_2 = OpRef(1002);
+    let const_0 = OpRef::from_const(0);
+    let const_1 = OpRef::from_const(1);
+    let const_2 = OpRef::from_const(2);
 
     let vec0 = rec.record_op(OpCode::VecI, &[]);
     let vec1 = rec.record_op(OpCode::VecPackI, &[vec0, a, const_0, const_2]);
@@ -744,9 +741,9 @@ fn test_vec_int_sub_simd() {
 
     let mut backend = CraneliftBackend::new();
     let mut constants = HashMap::new();
-    constants.insert(1000, 0i64);
-    constants.insert(1001, 1i64);
-    constants.insert(1002, 2i64);
+    constants.insert(OpRef::from_const(0).0, 0i64);
+    constants.insert(OpRef::from_const(1).0, 1i64);
+    constants.insert(OpRef::from_const(2).0, 2i64);
     backend.set_constants(constants);
 
     let mut token = JitCellToken::new(301);
@@ -775,9 +772,9 @@ fn test_vec_int_mul_simd() {
     let c = rec.record_input_arg(Type::Int);
     let d = rec.record_input_arg(Type::Int);
 
-    let const_0 = OpRef(1000);
-    let const_1 = OpRef(1001);
-    let const_2 = OpRef(1002);
+    let const_0 = OpRef::from_const(0);
+    let const_1 = OpRef::from_const(1);
+    let const_2 = OpRef::from_const(2);
 
     let vec0 = rec.record_op(OpCode::VecI, &[]);
     let vec1 = rec.record_op(OpCode::VecPackI, &[vec0, a, const_0, const_2]);
@@ -793,9 +790,9 @@ fn test_vec_int_mul_simd() {
 
     let mut backend = CraneliftBackend::new();
     let mut constants = HashMap::new();
-    constants.insert(1000, 0i64);
-    constants.insert(1001, 1i64);
-    constants.insert(1002, 2i64);
+    constants.insert(OpRef::from_const(0).0, 0i64);
+    constants.insert(OpRef::from_const(1).0, 1i64);
+    constants.insert(OpRef::from_const(2).0, 2i64);
     backend.set_constants(constants);
 
     let mut token = JitCellToken::new(302);
@@ -830,9 +827,9 @@ fn test_vec_expand_add_simd() {
     let b = rec.record_input_arg(Type::Int);
     let s = rec.record_input_arg(Type::Int);
 
-    let const_0 = OpRef(1000);
-    let const_1 = OpRef(1001);
-    let const_2 = OpRef(1002);
+    let const_0 = OpRef::from_const(0);
+    let const_1 = OpRef::from_const(1);
+    let const_2 = OpRef::from_const(2);
 
     let vec0 = rec.record_op(OpCode::VecI, &[]);
     let vec1 = rec.record_op(OpCode::VecPackI, &[vec0, a, const_0, const_2]);
@@ -846,9 +843,9 @@ fn test_vec_expand_add_simd() {
 
     let mut backend = CraneliftBackend::new();
     let mut constants = HashMap::new();
-    constants.insert(1000, 0i64);
-    constants.insert(1001, 1i64);
-    constants.insert(1002, 2i64);
+    constants.insert(OpRef::from_const(0).0, 0i64);
+    constants.insert(OpRef::from_const(1).0, 1i64);
+    constants.insert(OpRef::from_const(2).0, 2i64);
     backend.set_constants(constants);
 
     let mut token = JitCellToken::new(303);
@@ -886,9 +883,9 @@ fn test_vec_float_add_simd() {
     let c = rec.record_input_arg(Type::Int);
     let d = rec.record_input_arg(Type::Int);
 
-    let const_0 = OpRef(1000);
-    let const_1 = OpRef(1001);
-    let const_2 = OpRef(1002);
+    let const_0 = OpRef::from_const(0);
+    let const_1 = OpRef::from_const(1);
+    let const_2 = OpRef::from_const(2);
 
     // Pack f64 bit patterns into I64X2 vectors
     let vec0 = rec.record_op(OpCode::VecI, &[]);
@@ -907,9 +904,9 @@ fn test_vec_float_add_simd() {
 
     let mut backend = CraneliftBackend::new();
     let mut constants = HashMap::new();
-    constants.insert(1000, 0i64);
-    constants.insert(1001, 1i64);
-    constants.insert(1002, 2i64);
+    constants.insert(OpRef::from_const(0).0, 0i64);
+    constants.insert(OpRef::from_const(1).0, 1i64);
+    constants.insert(OpRef::from_const(2).0, 2i64);
     backend.set_constants(constants);
 
     let mut token = JitCellToken::new(304);
@@ -961,9 +958,9 @@ fn test_vec_chained_add_mul_simd() {
     let e = rec.record_input_arg(Type::Int);
     let f = rec.record_input_arg(Type::Int);
 
-    let const_0 = OpRef(1000);
-    let const_1 = OpRef(1001);
-    let const_2 = OpRef(1002);
+    let const_0 = OpRef::from_const(0);
+    let const_1 = OpRef::from_const(1);
+    let const_2 = OpRef::from_const(2);
 
     let vec0 = rec.record_op(OpCode::VecI, &[]);
     let vec_a = rec.record_op(OpCode::VecPackI, &[vec0, a, const_0, const_2]);
@@ -986,9 +983,9 @@ fn test_vec_chained_add_mul_simd() {
 
     let mut backend = CraneliftBackend::new();
     let mut constants = HashMap::new();
-    constants.insert(1000, 0i64);
-    constants.insert(1001, 1i64);
-    constants.insert(1002, 2i64);
+    constants.insert(OpRef::from_const(0).0, 0i64);
+    constants.insert(OpRef::from_const(1).0, 1i64);
+    constants.insert(OpRef::from_const(2).0, 2i64);
     backend.set_constants(constants);
 
     let mut token = JitCellToken::new(305);
@@ -1279,14 +1276,14 @@ fn test_threadlocalref_get_basic() {
     let mut rec = Trace::new();
     let _dummy = rec.record_input_arg(Type::Int); // need at least one input
 
-    let const_offset = OpRef(1000); // offset = 0 bytes
+    let const_offset = OpRef::from_const(0); // offset = 0 bytes
     let result = rec.record_op(OpCode::ThreadlocalrefGet, &[const_offset]);
     rec.finish(&[result], make_descr(0));
     let trace = rec.get_trace();
 
     let mut backend = CraneliftBackend::new();
     let mut constants = HashMap::new();
-    constants.insert(1000, 0i64); // offset 0
+    constants.insert(OpRef::from_const(0).0, 0i64); // offset 0
     backend.set_constants(constants);
 
     let mut token = JitCellToken::new(500);
@@ -1327,8 +1324,8 @@ fn test_threadlocalref_get_multiple_slots() {
     let mut rec = Trace::new();
     let _dummy = rec.record_input_arg(Type::Int);
 
-    let const_off0 = OpRef(1000);
-    let const_off8 = OpRef(1001);
+    let const_off0 = OpRef::from_const(0);
+    let const_off8 = OpRef::from_const(1);
 
     let r0 = rec.record_op(OpCode::ThreadlocalrefGet, &[const_off0]);
     let r1 = rec.record_op(OpCode::ThreadlocalrefGet, &[const_off8]);
@@ -1338,8 +1335,8 @@ fn test_threadlocalref_get_multiple_slots() {
 
     let mut backend = CraneliftBackend::new();
     let mut constants = HashMap::new();
-    constants.insert(1000, 0i64);
-    constants.insert(1001, 8i64);
+    constants.insert(OpRef::from_const(0).0, 0i64);
+    constants.insert(OpRef::from_const(1).0, 8i64);
     backend.set_constants(constants);
 
     let mut token = JitCellToken::new(501);
@@ -1371,14 +1368,14 @@ fn test_threadlocalref_set_and_read_roundtrip() {
     let mut rec = Trace::new();
     let _dummy = rec.record_input_arg(Type::Int);
 
-    let const_offset = OpRef(1000);
+    let const_offset = OpRef::from_const(0);
     let result = rec.record_op(OpCode::ThreadlocalrefGet, &[const_offset]);
     rec.finish(&[result], make_descr(0));
     let trace = rec.get_trace();
 
     let mut backend = CraneliftBackend::new();
     let mut constants = HashMap::new();
-    constants.insert(1000, 16i64); // offset 16 -> slot index 2
+    constants.insert(OpRef::from_const(0).0, 16i64); // offset 16 -> slot index 2
     backend.set_constants(constants);
 
     let mut token = JitCellToken::new(502);
@@ -1499,7 +1496,7 @@ fn test_call_release_gil_i_compiles_and_executes() {
     let a = rec.record_input_arg(Type::Int);
     let b = rec.record_input_arg(Type::Int);
 
-    let fn_ptr = OpRef(1000);
+    let fn_ptr = OpRef::from_const(0);
 
     let result = rec.record_op_with_descr(OpCode::CallReleaseGilI, &[fn_ptr, a, b], cd);
     rec.record_guard_with_fail_args(OpCode::GuardNotForced, &[], make_descr(0), &[a, b, result]);
@@ -1508,7 +1505,7 @@ fn test_call_release_gil_i_compiles_and_executes() {
 
     let mut backend = CraneliftBackend::new();
     let mut constants = HashMap::new();
-    constants.insert(1000, ffi_add as *const () as usize as i64);
+    constants.insert(OpRef::from_const(0).0, ffi_add as *const () as usize as i64);
     backend.set_constants(constants);
 
     let mut token = JitCellToken::new(600);
@@ -1541,7 +1538,7 @@ fn test_call_release_gil_i_no_args() {
 
     let mut rec = Trace::new();
     let dummy = rec.record_input_arg(Type::Int); // need at least one input
-    let fn_ptr = OpRef(1000);
+    let fn_ptr = OpRef::from_const(0);
 
     let result = rec.record_op_with_descr(OpCode::CallReleaseGilI, &[fn_ptr], cd);
     rec.record_guard_with_fail_args(OpCode::GuardNotForced, &[], make_descr(0), &[dummy, result]);
@@ -1550,7 +1547,10 @@ fn test_call_release_gil_i_no_args() {
 
     let mut backend = CraneliftBackend::new();
     let mut constants = HashMap::new();
-    constants.insert(1000, ffi_constant as *const () as usize as i64);
+    constants.insert(
+        OpRef::from_const(0).0,
+        ffi_constant as *const () as usize as i64,
+    );
     backend.set_constants(constants);
 
     let mut token = JitCellToken::new(601);
@@ -1581,7 +1581,7 @@ fn test_call_release_gil_n_void_return() {
 
     let mut rec = Trace::new();
     let input = rec.record_input_arg(Type::Int);
-    let fn_ptr = OpRef(1000);
+    let fn_ptr = OpRef::from_const(0);
 
     rec.record_op_with_descr(OpCode::CallReleaseGilN, &[fn_ptr, input], cd);
     rec.record_guard_with_fail_args(OpCode::GuardNotForced, &[], make_descr(0), &[input]);
@@ -1590,7 +1590,10 @@ fn test_call_release_gil_n_void_return() {
 
     let mut backend = CraneliftBackend::new();
     let mut constants = HashMap::new();
-    constants.insert(1000, ffi_sink as *const () as usize as i64);
+    constants.insert(
+        OpRef::from_const(0).0,
+        ffi_sink as *const () as usize as i64,
+    );
     backend.set_constants(constants);
 
     let mut token = JitCellToken::new(602);
@@ -1617,9 +1620,9 @@ fn test_call_release_gil_result_flows_through_trace() {
 
     let mut rec = Trace::new();
     let x = rec.record_input_arg(Type::Int);
-    let fn_ptr = OpRef(1000);
-    let const_10 = OpRef(1001);
-    let const_5 = OpRef(1002);
+    let fn_ptr = OpRef::from_const(0);
+    let const_10 = OpRef::from_const(1);
+    let const_5 = OpRef::from_const(2);
 
     let tmp = rec.record_op_with_descr(OpCode::CallReleaseGilI, &[fn_ptr, x, const_10], cd);
     rec.record_guard_with_fail_args(OpCode::GuardNotForced, &[], make_descr(0), &[x, tmp]);
@@ -1629,9 +1632,9 @@ fn test_call_release_gil_result_flows_through_trace() {
 
     let mut backend = CraneliftBackend::new();
     let mut constants = HashMap::new();
-    constants.insert(1000, ffi_add as *const () as usize as i64);
-    constants.insert(1001, 10i64);
-    constants.insert(1002, 5i64);
+    constants.insert(OpRef::from_const(0).0, ffi_add as *const () as usize as i64);
+    constants.insert(OpRef::from_const(1).0, 10i64);
+    constants.insert(OpRef::from_const(2).0, 5i64);
     backend.set_constants(constants);
 
     let mut token = JitCellToken::new(603);
@@ -1731,7 +1734,7 @@ fn raw_descr_float() -> DescrRef {
 #[test]
 fn test_raw_store_load_int_roundtrip() {
     let ad = raw_descr_int(8);
-    let const_offset = OpRef(1000);
+    let const_offset = OpRef::from_const(0);
 
     let mut rec = Trace::new();
     let r0 = rec.record_input_arg(Type::Ref);
@@ -1744,7 +1747,7 @@ fn test_raw_store_load_int_roundtrip() {
 
     let mut backend = CraneliftBackend::new();
     let mut constants = HashMap::new();
-    constants.insert(1000, 0i64); // offset 0
+    constants.insert(OpRef::from_const(0).0, 0i64); // offset 0
     backend.set_constants(constants);
 
     let mut token = JitCellToken::new(600);
@@ -1773,7 +1776,7 @@ fn test_raw_store_load_int_roundtrip() {
 #[test]
 fn test_raw_store_load_float_roundtrip() {
     let ad = raw_descr_float();
-    let const_offset = OpRef(1000);
+    let const_offset = OpRef::from_const(0);
 
     let mut rec = Trace::new();
     let r0 = rec.record_input_arg(Type::Ref);
@@ -1786,7 +1789,7 @@ fn test_raw_store_load_float_roundtrip() {
 
     let mut backend = CraneliftBackend::new();
     let mut constants = HashMap::new();
-    constants.insert(1000, 0i64);
+    constants.insert(OpRef::from_const(0).0, 0i64);
     backend.set_constants(constants);
 
     let mut token = JitCellToken::new(601);
@@ -1814,8 +1817,8 @@ fn test_raw_store_load_float_roundtrip() {
 #[test]
 fn test_raw_ops_different_offsets_no_interference() {
     let ad = raw_descr_int(8);
-    let off0 = OpRef(1000);
-    let off8 = OpRef(1001);
+    let off0 = OpRef::from_const(0);
+    let off8 = OpRef::from_const(1);
 
     let mut rec = Trace::new();
     let r0 = rec.record_input_arg(Type::Ref);
@@ -1835,8 +1838,8 @@ fn test_raw_ops_different_offsets_no_interference() {
 
     let mut backend = CraneliftBackend::new();
     let mut constants = HashMap::new();
-    constants.insert(1000, 0i64);
-    constants.insert(1001, 8i64);
+    constants.insert(OpRef::from_const(0).0, 0i64);
+    constants.insert(OpRef::from_const(1).0, 8i64);
     backend.set_constants(constants);
 
     let mut token = JitCellToken::new(602);
@@ -1872,7 +1875,7 @@ fn test_raw_load_unsigned_byte() {
         item_type: Type::Int,
         signed: false,
     });
-    let const_offset = OpRef(1000);
+    let const_offset = OpRef::from_const(0);
 
     let mut rec = Trace::new();
     let r0 = rec.record_input_arg(Type::Ref);
@@ -1883,7 +1886,7 @@ fn test_raw_load_unsigned_byte() {
 
     let mut backend = CraneliftBackend::new();
     let mut constants = HashMap::new();
-    constants.insert(1000, 0i64);
+    constants.insert(OpRef::from_const(0).0, 0i64);
     backend.set_constants(constants);
 
     let mut token = JitCellToken::new(603);
@@ -1973,7 +1976,7 @@ fn test_call_release_gil_with_guard_not_forced() {
     let token_ref = rec.record_op(OpCode::ForceToken, &[]);
 
     // fn_ptr is stored as a constant
-    let fn_ptr = OpRef(1000);
+    let fn_ptr = OpRef::from_const(0);
 
     // CallMayForceI: arg(0)=fn_ptr, rest=[force_token, x]
     let result = rec.record_op_with_descr(OpCode::CallMayForceI, &[fn_ptr, token_ref, x], cd);
@@ -1986,7 +1989,10 @@ fn test_call_release_gil_with_guard_not_forced() {
 
     let mut backend = CraneliftBackend::new();
     let mut constants = HashMap::new();
-    constants.insert(1000, ffi_add_no_force as *const () as usize as i64);
+    constants.insert(
+        OpRef::from_const(0).0,
+        ffi_add_no_force as *const () as usize as i64,
+    );
     backend.set_constants(constants);
 
     let mut token = JitCellToken::new(700);
@@ -2032,7 +2038,7 @@ fn test_call_may_force_with_forcing_semantics() {
     let flag = rec.record_input_arg(Type::Int);
 
     let token_ref = rec.record_op(OpCode::ForceToken, &[]);
-    let fn_ptr = OpRef(1000);
+    let fn_ptr = OpRef::from_const(0);
 
     let result = rec.record_op_with_descr(OpCode::CallMayForceI, &[fn_ptr, token_ref, flag], cd);
 
@@ -2043,7 +2049,10 @@ fn test_call_may_force_with_forcing_semantics() {
 
     let mut backend = CraneliftBackend::new();
     let mut constants = HashMap::new();
-    constants.insert(1000, ffi_maybe_force as *const () as usize as i64);
+    constants.insert(
+        OpRef::from_const(0).0,
+        ffi_maybe_force as *const () as usize as i64,
+    );
     backend.set_constants(constants);
 
     let mut token = JitCellToken::new(701);
@@ -2096,7 +2105,7 @@ fn test_ffi_call_exception_propagation() {
     let mut rec = Trace::new();
     let val = rec.record_input_arg(Type::Int);
 
-    let fn_ptr = OpRef(1000);
+    let fn_ptr = OpRef::from_const(0);
     let result = rec.record_op_with_descr(OpCode::CallReleaseGilI, &[fn_ptr, val], cd);
 
     // GuardNotForced: required immediately after CallReleaseGil
@@ -2109,7 +2118,10 @@ fn test_ffi_call_exception_propagation() {
 
     let mut backend = CraneliftBackend::new();
     let mut constants = HashMap::new();
-    constants.insert(1000, ffi_raise_exception as *const () as usize as i64);
+    constants.insert(
+        OpRef::from_const(0).0,
+        ffi_raise_exception as *const () as usize as i64,
+    );
     backend.set_constants(constants);
 
     let mut token = JitCellToken::new(702);
@@ -2159,8 +2171,8 @@ fn test_compiled_guard_failure_preserves_frame_stack_metadata() {
     let mut rec = Trace::new();
     let x = rec.record_input_arg(Type::Int);
 
-    let const_5 = OpRef(1000);
-    let const_100 = OpRef(1001);
+    let const_5 = OpRef::from_const(0);
+    let const_100 = OpRef::from_const(1);
 
     let result = rec.record_op(OpCode::IntAdd, &[x, const_5]);
     let cmp = rec.record_op(OpCode::IntLt, &[result, const_100]);
@@ -2170,8 +2182,8 @@ fn test_compiled_guard_failure_preserves_frame_stack_metadata() {
 
     let mut backend = CraneliftBackend::new();
     let mut constants = HashMap::new();
-    constants.insert(1000, 5i64);
-    constants.insert(1001, 100i64);
+    constants.insert(OpRef::from_const(0).0, 5i64);
+    constants.insert(OpRef::from_const(1).0, 100i64);
     backend.set_constants(constants);
 
     let mut token = JitCellToken::new(900);
@@ -2228,9 +2240,9 @@ fn test_compiled_trace_multi_guard_frame_stacks_query() {
     let mut rec = Trace::new();
     let x = rec.record_input_arg(Type::Int);
 
-    let const_0 = OpRef(1000);
-    let const_1 = OpRef(1001);
-    let const_1000 = OpRef(1002);
+    let const_0 = OpRef::from_const(0);
+    let const_1 = OpRef::from_const(1);
+    let const_1000 = OpRef::from_const(2);
 
     let cmp1 = rec.record_op(OpCode::IntGt, &[x, const_0]);
     rec.record_guard(OpCode::GuardTrue, &[cmp1], make_descr(0));
@@ -2242,9 +2254,9 @@ fn test_compiled_trace_multi_guard_frame_stacks_query() {
 
     let mut backend = CraneliftBackend::new();
     let mut constants = HashMap::new();
-    constants.insert(1000, 0i64);
-    constants.insert(1001, 1i64);
-    constants.insert(1002, 1000i64);
+    constants.insert(OpRef::from_const(0).0, 0i64);
+    constants.insert(OpRef::from_const(1).0, 1i64);
+    constants.insert(OpRef::from_const(2).0, 1000i64);
     backend.set_constants(constants);
 
     let mut token = JitCellToken::new(901);
@@ -2301,8 +2313,8 @@ fn test_compiled_bridge_guard_failure_has_frame_stack() {
     let i = rec.record_input_arg(Type::Int);
     let sum = rec.record_input_arg(Type::Int);
 
-    let const_one = OpRef(1000);
-    let const_zero = OpRef(1001);
+    let const_one = OpRef::from_const(0);
+    let const_zero = OpRef::from_const(1);
 
     let sum2 = rec.record_op(OpCode::IntAdd, &[sum, i]);
     let i2 = rec.record_op(OpCode::IntSub, &[i, const_one]);
@@ -2313,8 +2325,8 @@ fn test_compiled_bridge_guard_failure_has_frame_stack() {
 
     let mut backend = CraneliftBackend::new();
     let mut constants = HashMap::new();
-    constants.insert(1000, 1i64);
-    constants.insert(1001, 0i64);
+    constants.insert(OpRef::from_const(0).0, 1i64);
+    constants.insert(OpRef::from_const(1).0, 0i64);
     backend.set_constants(constants);
 
     backend.set_next_trace_id(910);
@@ -2360,8 +2372,8 @@ fn test_compiled_bridge_guard_failure_has_frame_stack() {
     let _bi = bridge_rec.record_input_arg(Type::Int);
     let bsum = bridge_rec.record_input_arg(Type::Int);
 
-    let bridge_const_zero = OpRef(1000);
-    let bridge_const_two = OpRef(1001);
+    let bridge_const_zero = OpRef::from_const(0);
+    let bridge_const_two = OpRef::from_const(1);
 
     let bcmp = bridge_rec.record_op(OpCode::IntGt, &[bsum, bridge_const_zero]);
     bridge_rec.record_guard(OpCode::GuardTrue, &[bcmp], make_descr(10));
@@ -2370,8 +2382,8 @@ fn test_compiled_bridge_guard_failure_has_frame_stack() {
     let bridge_trace = bridge_rec.get_trace();
 
     let mut bridge_constants = HashMap::new();
-    bridge_constants.insert(1000, 0i64);
-    bridge_constants.insert(1001, 2i64);
+    bridge_constants.insert(OpRef::from_const(0).0, 0i64);
+    bridge_constants.insert(OpRef::from_const(1).0, 2i64);
     backend.set_constants(bridge_constants);
 
     let bridge_fail_descr = CraneliftFailDescr::new_with_trace_and_kind_and_force_tokens(
@@ -2438,14 +2450,14 @@ fn test_call_assembler_callee_guard_failure_frame_stack() {
     let callee_inputargs = vec![InputArg::new_int(0)];
     let mut callee_ops = vec![
         Op::new(OpCode::Label, &[OpRef(0)]),
-        Op::new(OpCode::IntGt, &[OpRef(0), OpRef(1000)]),
+        Op::new(OpCode::IntGt, &[OpRef(0), OpRef::from_const(0)]),
         Op::with_descr(OpCode::GuardTrue, &[OpRef(1)], make_descr(0)),
         Op::with_descr(OpCode::Finish, &[OpRef(0)], make_descr(1)),
     ];
     assign_positions(&mut callee_ops, 0);
 
     let mut backend = CraneliftBackend::new();
-    backend.set_constants(HashMap::from([(1000, 10i64)]));
+    backend.set_constants(HashMap::from([(OpRef::from_const(0).0, 10i64)]));
 
     backend.set_next_trace_id(920);
     backend.set_next_header_pc(3000);
@@ -2500,7 +2512,7 @@ fn test_frame_stack_slot_types_match_fail_arg_types() {
     let x_int = rec.record_input_arg(Type::Int);
     let x_float = rec.record_input_arg(Type::Float);
 
-    let const_0 = OpRef(1000);
+    let const_0 = OpRef::from_const(0);
 
     let cmp = rec.record_op(OpCode::IntGt, &[x_int, const_0]);
     rec.record_guard_with_fail_args(OpCode::GuardTrue, &[cmp], make_descr(0), &[x_int, x_float]);
@@ -2509,7 +2521,7 @@ fn test_frame_stack_slot_types_match_fail_arg_types() {
 
     let mut backend = CraneliftBackend::new();
     let mut constants = HashMap::new();
-    constants.insert(1000, 0i64);
+    constants.insert(OpRef::from_const(0).0, 0i64);
     backend.set_constants(constants);
 
     backend.set_next_trace_id(930);
@@ -2602,9 +2614,9 @@ fn test_ffi_exchange_buffer_pattern() {
     let cd = call_descr_release_gil_i(80, vec![Type::Ref]);
 
     // Constants: offset_16 = 16 (exchange_args[0]), offset_32 = 32 (exchange_result)
-    let off_arg = OpRef(1000); // offset 16
-    let off_result = OpRef(1001); // offset 32
-    let fn_ptr = OpRef(1002); // ffi_exchange_buffer_fn
+    let off_arg = OpRef::from_const(0); // offset 16
+    let off_result = OpRef::from_const(1); // offset 32
+    let fn_ptr = OpRef::from_const(2); // ffi_exchange_buffer_fn
 
     let mut rec = Trace::new();
     // Inputs: r0 = exchange buffer pointer, i0 = argument value
@@ -2627,9 +2639,12 @@ fn test_ffi_exchange_buffer_pattern() {
 
     let mut backend = CraneliftBackend::new();
     let mut constants = HashMap::new();
-    constants.insert(1000, 16i64);
-    constants.insert(1001, 32i64);
-    constants.insert(1002, ffi_exchange_buffer_fn as *const () as usize as i64);
+    constants.insert(OpRef::from_const(0).0, 16i64);
+    constants.insert(OpRef::from_const(1).0, 32i64);
+    constants.insert(
+        OpRef::from_const(2).0,
+        ffi_exchange_buffer_fn as *const () as usize as i64,
+    );
     backend.set_constants(constants);
 
     let mut token = JitCellToken::new(950);

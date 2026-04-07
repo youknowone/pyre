@@ -63,7 +63,7 @@ fn wasm_typeid_is_object(typeid: u32) -> Option<bool> {
 
 pub struct WasmBackend {
     trace_counter: u64,
-    /// Optimizer constant pool (OpRef >= CONST_BASE → i64 value).
+    /// Optimizer constant pool (constant-namespace OpRef → i64 value).
     constants: HashMap<u32, i64>,
     /// llmodel.py:64-69 self.vtable_offset.
     vtable_offset: Option<usize>,

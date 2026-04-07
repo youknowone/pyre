@@ -3476,6 +3476,13 @@ fn resolve_opref_or_imm(
     if known_values.contains(&opref.0) {
         return builder.use_var(var(opref.0));
     }
+    // Constant-namespace OpRef: the const_index IS the value
+    // (RPython ConstInt(n).getint() == n).
+    if opref.is_constant() {
+        return builder
+            .ins()
+            .iconst(cl_types::I64, opref.const_index() as i64);
+    }
     builder.ins().iconst(cl_types::I64, opref.0 as i64)
 }
 
@@ -3495,11 +3502,20 @@ fn resolve_constant_i64(
             &format!("{what} must be a compile-time constant"),
         ));
     }
+    if opref.is_constant() {
+        return Ok(opref.const_index() as i64);
+    }
     Ok(opref.0 as i64)
 }
 
 fn resolve_rewriter_immediate_i64(constants: &HashMap<u32, i64>, opref: OpRef) -> i64 {
-    constants.get(&opref.0).copied().unwrap_or(opref.0 as i64)
+    constants.get(&opref.0).copied().unwrap_or_else(|| {
+        if opref.is_constant() {
+            opref.const_index() as i64
+        } else {
+            opref.0 as i64
+        }
+    })
 }
 
 fn type_for_opref(

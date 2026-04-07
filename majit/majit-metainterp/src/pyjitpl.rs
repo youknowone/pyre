@@ -204,10 +204,11 @@ fn snapshot_map_from_trace_snapshots(
         std::collections::HashMap::new();
     let mut next_const_idx = constants
         .keys()
-        .copied()
+        .filter(|k| majit_ir::OpRef(**k).is_constant())
+        .map(|k| majit_ir::OpRef(*k).const_index())
         .max()
-        .unwrap_or(majit_ir::OpRef::CONST_BASE)
-        + 1;
+        .map(|m| m + 1)
+        .unwrap_or(0);
     // opencoder.py:603 _encode: Box/Virtual → OpRef, Const → pool OpRef.
     let mut tagged_to_opref = |t: &majit_trace::recorder::SnapshotTagged| -> majit_ir::OpRef {
         match t {
@@ -233,11 +234,11 @@ fn snapshot_map_from_trace_snapshots(
                     })
                     .map(|(k, _)| *k);
                 let key = existing.unwrap_or_else(|| {
-                    let k = next_const_idx;
+                    let opref = majit_ir::OpRef::from_const(next_const_idx);
                     next_const_idx += 1;
-                    constants.insert(k, *val);
-                    constant_types.insert(k, *tp);
-                    k
+                    constants.insert(opref.0, *val);
+                    constant_types.insert(opref.0, *tp);
+                    opref.0
                 });
                 majit_ir::OpRef(key)
             }

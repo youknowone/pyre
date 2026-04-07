@@ -70,9 +70,9 @@ pub const TAG_CONST_OFFSET: i32 = 0;
 /// Replaces HashMap<u32, i16> with O(1) Vec indexing.
 /// Sentinel i16::MIN means "not present".
 pub struct LiveboxMap {
-    /// Op results (OpRef < CONST_BASE).
+    /// Op results (operation-namespace OpRef).
     results: Vec<i16>,
-    /// Constants (OpRef >= CONST_BASE), offset by CONST_BASE.
+    /// Constants (constant-namespace OpRef), indexed by const_index.
     constants: Vec<i16>,
 }
 
@@ -88,11 +88,9 @@ impl LiveboxMap {
 
     #[inline(always)]
     pub fn get(&self, key: u32) -> Option<i16> {
-        let (vec, idx) = if key >= majit_ir::OpRef::CONST_BASE {
-            (
-                &self.constants,
-                (key - majit_ir::OpRef::CONST_BASE) as usize,
-            )
+        let opref = majit_ir::OpRef(key);
+        let (vec, idx) = if opref.is_constant() {
+            (&self.constants, opref.const_index() as usize)
         } else {
             (&self.results, key as usize)
         };
@@ -106,11 +104,9 @@ impl LiveboxMap {
 
     #[inline(always)]
     pub fn insert(&mut self, key: u32, value: i16) {
-        let (vec, idx) = if key >= majit_ir::OpRef::CONST_BASE {
-            (
-                &mut self.constants,
-                (key - majit_ir::OpRef::CONST_BASE) as usize,
-            )
+        let opref = majit_ir::OpRef(key);
+        let (vec, idx) = if opref.is_constant() {
+            (&mut self.constants, opref.const_index() as usize)
         } else {
             (&mut self.results, key as usize)
         };
@@ -137,7 +133,7 @@ impl LiveboxMap {
                     .iter()
                     .enumerate()
                     .filter(|(_, v)| **v != LIVEBOX_ABSENT)
-                    .map(|(i, v)| (i as u32 + majit_ir::OpRef::CONST_BASE, *v)),
+                    .map(|(i, v)| (majit_ir::OpRef::from_const(i as u32).0, *v)),
             )
     }
 }
@@ -3960,8 +3956,9 @@ mod tests {
         use majit_ir::OpRef;
         let mut memo = ResumeDataLoopMemo::new();
         let mut env = SimpleBoxEnv::new();
-        env.constants.insert(10001, (42i64, majit_ir::Type::Int));
-        let snapshot = Snapshot::single_frame(8, vec![OpRef(10001), OpRef(1), OpRef(2)]);
+        env.constants
+            .insert(OpRef::from_const(1).0, (42i64, majit_ir::Type::Int));
+        let snapshot = Snapshot::single_frame(8, vec![OpRef::from_const(1), OpRef(1), OpRef(2)]);
         let numb_state = memo.number(&snapshot, &env).unwrap();
         // Should have: [size, num_failargs, 0(vable), 0(vref), 0(jitcode), 8(pc), tagged...]
         let items = crate::resumecode::unpack_all(&numb_state.create_numbering());
@@ -3978,7 +3975,7 @@ mod tests {
         assert_eq!(items[4], 0);
         // items[5] = pc = 8
         assert_eq!(items[5], 8);
-        // items[6] = OpRef(10001) tagged as TAGINT(42) since 42 fits in 13 bits
+        // items[6] = OpRef::from_const(1) tagged as TAGINT(42) since 42 fits in 13 bits
         let (val, tagbits) = untag(items[6] as i16);
         assert_eq!(tagbits, TAGINT);
         assert_eq!(val, 42);
@@ -3997,8 +3994,9 @@ mod tests {
         use majit_ir::OpRef;
         let mut memo = ResumeDataLoopMemo::new();
         let mut env = SimpleBoxEnv::new();
-        env.constants.insert(10001, (42i64, majit_ir::Type::Int));
-        let snapshot = Snapshot::single_frame(8, vec![OpRef(10001), OpRef(1), OpRef(2)]);
+        env.constants
+            .insert(OpRef::from_const(1).0, (42i64, majit_ir::Type::Int));
+        let snapshot = Snapshot::single_frame(8, vec![OpRef::from_const(1), OpRef(1), OpRef(2)]);
         let mut numb_state = memo.number(&snapshot, &env).unwrap();
         // RPython: ResumeDataVirtualAdder.finish() patches slot 1 with num_boxes.
         numb_state.writer.patch(1, numb_state.num_boxes);
@@ -4069,7 +4067,8 @@ mod tests {
         use majit_ir::OpRef;
         let mut memo = ResumeDataLoopMemo::new();
         let mut env = SimpleBoxEnv::new();
-        env.constants.insert(10000, (99i64, majit_ir::Type::Int));
+        env.constants
+            .insert(OpRef::from_const(0).0, (99i64, majit_ir::Type::Int));
 
         let snapshot = Snapshot {
             vable_array: vec![],
@@ -4078,7 +4077,7 @@ mod tests {
                 SnapshotFrame {
                     jitcode_index: 0,
                     pc: 10,
-                    boxes: vec![OpRef(1), OpRef(10000)],
+                    boxes: vec![OpRef(1), OpRef::from_const(0)],
                 },
                 SnapshotFrame {
                     jitcode_index: 1,
@@ -4128,11 +4127,13 @@ mod tests {
         use majit_ir::OpRef;
         let mut memo = ResumeDataLoopMemo::new();
         let mut env = SimpleBoxEnv::new();
-        env.constants.insert(10001, (42i64, majit_ir::Type::Int));
+        env.constants
+            .insert(OpRef::from_const(1).0, (42i64, majit_ir::Type::Int));
         env.virtuals.insert(2);
         env.types.insert(2, majit_ir::Type::Ref);
 
-        let snapshot = Snapshot::single_frame(8, vec![OpRef(10001), OpRef(1), OpRef(2), OpRef(3)]);
+        let snapshot =
+            Snapshot::single_frame(8, vec![OpRef::from_const(1), OpRef(1), OpRef(2), OpRef(3)]);
         let numb_state = memo.number(&snapshot, &env).unwrap();
         let (rd_numb, rd_consts, _rd_virtuals, liveboxes, _livebox_types) =
             memo.finish(numb_state, &env, &mut [], None);

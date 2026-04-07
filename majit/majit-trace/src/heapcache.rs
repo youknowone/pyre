@@ -11,6 +11,9 @@ use std::marker::PhantomData;
 // Vec<bool> helpers — RPython stores these as FrontendOp flags, not sets.
 #[inline(always)]
 fn vb_insert(v: &mut Vec<bool>, opref: OpRef) {
+    if opref.is_constant() {
+        return;
+    }
     let i = opref.0 as usize;
     if i >= v.len() {
         v.resize(i + 1, false);
@@ -19,10 +22,16 @@ fn vb_insert(v: &mut Vec<bool>, opref: OpRef) {
 }
 #[inline(always)]
 fn vb_contains(v: &[bool], opref: &OpRef) -> bool {
+    if opref.is_constant() {
+        return false;
+    }
     v.get(opref.0 as usize).copied().unwrap_or(false)
 }
 #[inline(always)]
 fn vb_remove(v: &mut Vec<bool>, opref: &OpRef) -> bool {
+    if opref.is_constant() {
+        return false;
+    }
     let i = opref.0 as usize;
     if i < v.len() && v[i] {
         v[i] = false;
@@ -364,10 +373,16 @@ impl HeapCache {
     }
 
     fn flags_for_ref(&self, opref: OpRef) -> u32 {
+        if opref.is_constant() {
+            return 0;
+        }
         self.heapc_flags.get(opref.0 as usize).copied().unwrap_or(0)
     }
 
     fn set_flags_for_ref(&mut self, opref: OpRef, flags: u32) {
+        if opref.is_constant() {
+            return;
+        }
         let i = opref.0 as usize;
         if i >= self.heapc_flags.len() {
             self.heapc_flags.resize(i + 1, 0);
@@ -420,6 +435,9 @@ impl HeapCache {
 
     /// RPython: _set_flag(box, flag)
     pub fn _set_flag(&mut self, opref: OpRef, flag: u8) {
+        if opref.is_constant() {
+            return;
+        }
         self.update_version(opref);
         let flags = self.flags_for_ref(opref) | u32::from(flag);
         self.set_flags_for_ref(opref, flags);
@@ -460,6 +478,9 @@ impl HeapCache {
     }
 
     fn _remove_flag(&mut self, opref: OpRef, flag: u8) {
+        if opref.is_constant() {
+            return;
+        }
         let flags = self.flags_for_ref(opref);
         if flags == 0 {
             return;
@@ -521,6 +542,9 @@ impl HeapCache {
 
     /// Alias to keep recursion behavior explicit with Python name.
     pub fn mark_escaped_box(&mut self, opref: OpRef) {
+        if opref.is_constant() {
+            return;
+        }
         if !vb_remove(&mut self.is_unescaped, &opref) {
             return;
         }
@@ -680,6 +704,9 @@ impl HeapCache {
     /// Record a new array allocation. Constant-length arrays are also
     /// marked as likely_virtual.
     pub fn new_array(&mut self, opref: OpRef, length_is_const: bool) {
+        if opref.is_constant() {
+            return;
+        }
         vb_insert(&mut self.is_unescaped, opref);
         vb_insert(&mut self.seen_allocation, opref);
         {
@@ -697,6 +724,9 @@ impl HeapCache {
     /// heapcache.py: nonstandard_virtualizables_now_known(box)
     /// Mark a box as a known nonstandard virtualizable.
     pub fn nonstandard_virtualizables_now_known(&mut self, opref: OpRef) {
+        if opref.is_constant() {
+            return;
+        }
         // In RPython this sets HF_NONSTD_VABLE flag.
         // We track it as a known non-null value.
         {
@@ -742,6 +772,9 @@ impl HeapCache {
     /// heapcache.py:470-473: class_now_known sets both class AND nullity.
     ///   self._set_flag(box, HF_KNOWN_CLASS | HF_KNOWN_NULLITY)
     pub fn class_now_known(&mut self, opref: OpRef, class: GcRef) {
+        if opref.is_constant() {
+            return;
+        }
         let i = opref.0 as usize;
         if i >= self.known_class.len() {
             self.known_class.resize(i + 1, None);
@@ -753,6 +786,9 @@ impl HeapCache {
 
     /// Check if the class of an object is known.
     pub fn is_class_known(&self, opref: OpRef) -> bool {
+        if opref.is_constant() {
+            return false;
+        }
         self.known_class
             .get(opref.0 as usize)
             .map_or(false, |v| v.is_some())
@@ -760,6 +796,9 @@ impl HeapCache {
 
     /// Get the known class of an object, if available.
     pub fn get_known_class(&self, opref: OpRef) -> Option<GcRef> {
+        if opref.is_constant() {
+            return None;
+        }
         self.known_class.get(opref.0 as usize).and_then(|v| *v)
     }
 
@@ -1091,6 +1130,9 @@ impl HeapCache {
     /// Record that a value's nullity is known.
     /// heapcache.py: nullity_now_known(box, is_nonnull)
     pub fn nullity_now_known(&mut self, opref: OpRef, is_nonnull: bool) {
+        if opref.is_constant() {
+            return;
+        }
         {
             let _i = opref.0 as usize;
             if _i >= self.known_nullity.len() {
@@ -1101,8 +1143,15 @@ impl HeapCache {
     }
 
     /// Check if a value's nullity is known.
-    /// heapcache.py: is_nullity_known(box)
+    /// heapcache.py:475-478: is_nullity_known(box)
+    ///   if isinstance(box, Const): return bool(box.getref_base())
     pub fn is_nullity_known(&self, opref: OpRef) -> Option<bool> {
+        if opref.is_constant() {
+            // RPython: Const boxes have known nullity from their value.
+            // Constant-namespace OpRefs are always non-null refs in practice
+            // (null is encoded as TAGINT 0, not as a constant-namespace OpRef).
+            return Some(true);
+        }
         self.known_nullity
             .get(opref.0 as usize)
             .and_then(|v| if *v == 0 { None } else { Some(*v == 1) })

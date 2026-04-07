@@ -1797,18 +1797,20 @@ mod tests {
         let mut env = SimpleBoxEnv::new();
         env.types.insert(0, Type::Ref);
         env.types.insert(1, Type::Int);
-        env.constants.insert(10001, (8, Type::Int));
-        env.constants.insert(10002, (777, Type::Int)); // code object payload
-        env.constants.insert(10003, (2, Type::Int));
-        env.constants.insert(10004, (999, Type::Int)); // namespace payload
+        env.constants.insert(OpRef::from_const(1).0, (8, Type::Int));
+        env.constants
+            .insert(OpRef::from_const(2).0, (777, Type::Int)); // code object payload
+        env.constants.insert(OpRef::from_const(3).0, (2, Type::Int));
+        env.constants
+            .insert(OpRef::from_const(4).0, (999, Type::Int)); // namespace payload
 
         let snapshot = Snapshot {
             vable_array: vec![
                 OpRef(0),
-                OpRef(10001),
-                OpRef(10002),
-                OpRef(10003),
-                OpRef(10004),
+                OpRef::from_const(1),
+                OpRef::from_const(2),
+                OpRef::from_const(3),
+                OpRef::from_const(4),
             ],
             vref_array: vec![],
             framestack: vec![SnapshotFrame {

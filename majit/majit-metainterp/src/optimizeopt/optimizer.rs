@@ -1525,6 +1525,13 @@ impl Optimizer {
                 value_from_backend_constant_bits_typed(OpRef(idx), val, ops, &self.constant_types),
             );
         }
+        // Advance next_const_idx past all seeded constant-namespace entries
+        // so new allocations (intdiv, make_guards) don't collide with
+        // constants inherited from a previous phase.
+        if !ctx.const_pool.is_empty() {
+            let max_idx = ctx.const_pool.keys().max().copied().unwrap_or(0);
+            ctx.next_const_idx = ctx.next_const_idx.max(max_idx + 1);
+        }
 
         // Setup all passes
         for pass in &mut self.passes {
@@ -2211,6 +2218,12 @@ impl Optimizer {
                     .entry(idx as u32)
                     .or_insert_with(|| value_to_backend_constant_bits(value));
             }
+        }
+        for (&const_idx, value) in &ctx.const_pool {
+            let key = OpRef::from_const(const_idx).0;
+            // Use insert (not or_insert) so that constants created during
+            // this phase overwrite stale entries inherited from a prior phase.
+            constants.insert(key, value_to_backend_constant_bits(value));
         }
 
         // Preserve final context for jump_to_existing_trace.
@@ -3642,7 +3655,7 @@ mod tests {
         ops[1].pos = OpRef(67);
 
         let mut constants = std::collections::HashMap::new();
-        constants.insert(68, 472);
+        constants.insert(OpRef::from_const(0).0, 472);
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
 
         let new_positions: std::collections::HashSet<_> = result
@@ -3650,10 +3663,12 @@ mod tests {
             .filter(|op| op.opcode == OpCode::New)
             .map(|op| op.pos.0)
             .collect();
+        // With high-bit constant namespace, constant OpRefs never collide with
+        // operation positions, so the New op lands at next_pos (68) directly.
         assert_eq!(
             new_positions,
-            std::collections::HashSet::from([69]),
-            "queued New should skip constant-only slot v68; got {:?}",
+            std::collections::HashSet::from([68]),
+            "queued New should get next available slot; got {:?}",
             result
         );
         assert!(
@@ -3664,9 +3679,9 @@ mod tests {
             "SetfieldGc targets must remain emitted New refs; got {:?}",
             result
         );
-        assert_eq!(constants.get(&68), Some(&472));
+        assert_eq!(constants.get(&OpRef::from_const(0).0), Some(&472));
         assert!(
-            !constants.contains_key(&69),
+            !constants.contains_key(&68),
             "live New position must not collide with constant map {:?}",
             constants
         );
