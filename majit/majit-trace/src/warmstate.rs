@@ -196,6 +196,11 @@ const DEFAULT_TRACE_LIMIT: u32 = crate::recorder::DEFAULT_TRACE_LIMIT as u32;
 /// warmspot.py:93 retrace_limit=5
 const DEFAULT_RETRACE_LIMIT: u32 = 5;
 
+/// Maximum number of trace aborts before permanently marking a green key
+/// as DONT_TRACE_HERE. Prevents infinite retrace loops when optimization
+/// always fails (e.g. InvalidLoop) for the same key.
+const MAX_TRACE_ABORT_COUNT: u32 = 5;
+
 /// rlib/jit.py:599 disable_unrolling = 200
 const DEFAULT_DISABLE_UNROLLING: u32 = 200;
 
@@ -532,6 +537,11 @@ impl WarmEnterState {
             if cell.flags & jc_flags::DONT_TRACE_HERE != 0 && cell.has_seen_a_procedure_token() {
                 return HotResult::NotHot;
             }
+            // Give up after too many failed trace attempts to prevent
+            // infinite retrace loops (e.g. InvalidLoop every time).
+            if cell.abort_count >= MAX_TRACE_ABORT_COUNT {
+                return HotResult::NotHot;
+            }
         }
 
         self.start_tracing_cell(green_key_hash)
@@ -565,7 +575,13 @@ impl WarmEnterState {
         if let Some(cell) = self.cells.get_mut(&green_key_hash) {
             cell.flags &= !jc_flags::TRACING;
             cell.abort_count += 1;
-            cell.state = BaseJitCellState::NotHot;
+            if cell.abort_count >= MAX_TRACE_ABORT_COUNT {
+                // Too many failed attempts — permanently disable tracing here.
+                cell.flags |= jc_flags::DONT_TRACE_HERE;
+                cell.state = BaseJitCellState::DontTraceHere;
+            } else {
+                cell.state = BaseJitCellState::NotHot;
+            }
         }
 
         if disable_noninlinable_function {

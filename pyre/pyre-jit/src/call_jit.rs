@@ -177,7 +177,10 @@ pub(crate) fn self_recursive_function_entry_candidate(frame: &PyFrame) -> bool {
         }
         let is_candidate = unsafe {
             is_function(value)
-                && pyre_interpreter::getcode(value) == code_ptr
+                && !pyre_interpreter::is_builtin_code(
+                    pyre_interpreter::function_get_code(value) as pyre_object::PyObjectRef
+                )
+                && pyre_interpreter::get_pycode(value) == code_ptr
                 && function_get_globals(value) == namespace_ptr
                 && function_get_closure(value).is_null()
         };
@@ -204,7 +207,7 @@ pub(crate) fn callable_prefers_function_entry(callable: PyObjectRef) -> bool {
         let Some(namespace) = (!globals.is_null()).then_some(&*globals) else {
             return false;
         };
-        let code_ptr = pyre_interpreter::getcode(callable);
+        let code_ptr = pyre_interpreter::get_pycode(callable);
 
         for idx in 0..namespace.len() {
             let Some(value) = namespace.get_slot(idx) else {
@@ -214,7 +217,10 @@ pub(crate) fn callable_prefers_function_entry(callable: PyObjectRef) -> bool {
                 continue;
             }
             let is_candidate = is_function(value)
-                && pyre_interpreter::getcode(value) == code_ptr
+                && !pyre_interpreter::is_builtin_code(
+                    pyre_interpreter::function_get_code(value) as pyre_object::PyObjectRef
+                )
+                && pyre_interpreter::get_pycode(value) == code_ptr
                 && function_get_globals(value) == globals
                 && function_get_closure(value).is_null();
             if is_candidate && recursive_force_cache_safe(value) {
@@ -251,7 +257,7 @@ pub fn maybe_handle_inline_concrete_call(
     }
 
     let raw_arg = unsafe { w_int_get_value(arg0) };
-    let code_ptr = unsafe { pyre_interpreter::getcode(callable) };
+    let code_ptr = unsafe { pyre_interpreter::get_pycode(callable) };
     let green_key = crate::eval::make_green_key(code_ptr as *const _, 0);
     // Inline concrete execution sometimes falls back to a helper-boundary
     // recursive call instead of a real frame switch. That helper must run as
@@ -1355,7 +1361,7 @@ pub extern "C" fn jit_force_recursive_call_1(
 ) -> i64 {
     let callable_ref = callable as PyObjectRef;
     let boxed_arg_ref = boxed_arg as PyObjectRef;
-    let code_ptr = unsafe { pyre_interpreter::getcode(callable_ref) };
+    let code_ptr = unsafe { pyre_interpreter::get_pycode(callable_ref) };
     let green_key = crate::eval::make_green_key(code_ptr as *const _, 0);
     if matches!(finish_protocol(green_key), FinishProtocol::RawInt)
         && !boxed_arg_ref.is_null()
@@ -1421,7 +1427,7 @@ pub extern "C" fn jit_force_recursive_call_argraw_boxed_1(
 ) -> i64 {
     let _suspend_inline_result = pyre_interpreter::call::suspend_inline_handled_result();
     let callable_ref = callable as PyObjectRef;
-    let code_ptr = unsafe { pyre_interpreter::getcode(callable_ref) };
+    let code_ptr = unsafe { pyre_interpreter::get_pycode(callable_ref) };
     let green_key = crate::eval::make_green_key(code_ptr as *const _, 0);
     if matches!(finish_protocol(green_key), FinishProtocol::RawInt) {
         let forced = jit_force_recursive_call_raw_1(caller_frame, callable, raw_int_arg);
@@ -1505,7 +1511,7 @@ pub extern "C" fn jit_force_recursive_call_raw_1(
 ) -> i64 {
     let _suspend_inline_result = pyre_interpreter::call::suspend_inline_handled_result();
     let callable_ref = callable as PyObjectRef;
-    let code_ptr = unsafe { pyre_interpreter::getcode(callable_ref) };
+    let code_ptr = unsafe { pyre_interpreter::get_pycode(callable_ref) };
     let green_key = crate::eval::make_green_key(code_ptr as *const _, 0);
     let (protocol, _token_num, _memo_safe) = recursive_dispatch(callable_ref, green_key);
 

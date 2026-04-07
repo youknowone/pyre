@@ -3535,7 +3535,7 @@ impl MIFrame {
                         let callee_frame =
                             ctx.call_ref_typed(helper, &[this.frame(), raw_arg], &helper_arg_types);
                         let callee_nlocals = unsafe {
-                            let code_ptr = pyre_interpreter::getcode(concrete_callable)
+                            let code_ptr = pyre_interpreter::get_pycode(concrete_callable)
                                 as *const pyre_interpreter::CodeObject;
                             (&*code_ptr).varnames.len()
                         };

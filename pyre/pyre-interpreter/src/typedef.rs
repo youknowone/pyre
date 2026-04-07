@@ -1252,6 +1252,7 @@ fn init_function_type(ns: &mut PyNamespace) {
             let asking_for_bound = unsafe {
                 (w_cls.is_null() || pyre_object::is_none(w_cls))
                     || (!w_obj.is_null() && !pyre_object::is_none(w_obj))
+                    || std::ptr::eq(w_cls, gettypeobject(&pyre_object::NONE_TYPE))
             };
             if asking_for_bound {
                 // function.py:470  Method(space, w_function, w_obj, w_cls)
