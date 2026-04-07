@@ -5007,10 +5007,17 @@ impl<M: Clone> MetaInterp<M> {
         let trace_id = Self::normalize_trace_id(compiled, trace_id);
         let (_, trace_data) = Self::trace_for_exit(compiled, trace_id)?;
         let exit_layout = trace_data.exit_layouts.get(&fail_index)?;
+        // compile.py:797-811 parity: bridge inputargs come from the guard's
+        // fail_arg_types AFTER store_final_boxes_in_guard (which may add
+        // virtual field boxes, changing the types list). The backend's
+        // fail_descr has the UPDATED types; exit_layout.exit_types may have
+        // the ORIGINAL MetaFailDescr types (before optimizer update).
+        // Prefer the backend's types when available.
+        let fail_arg_types = exit_layout.exit_types.clone();
         Some(compile::BridgeFailDescrProxy {
             fail_index,
             trace_id,
-            fail_arg_types: exit_layout.exit_types.clone(),
+            fail_arg_types,
             gc_ref_slots: exit_layout.gc_ref_slots.clone(),
             force_token_slots: exit_layout.force_token_slots.clone(),
             is_finish: exit_layout.is_finish,
@@ -5876,13 +5883,27 @@ impl<M: Clone> MetaInterp<M> {
             None => return None,
         };
 
-        // compile.py:797-811 / resume.py:1042: bridge inputargs come from
-        // rebuild_from_resumedata, which produces boxes matching the guard's
-        // fail_arg_types exactly. Always use fail_arg_types regardless of
-        // what the interpreter's live_types say — they may differ for
-        // bridge guards where the optimizer reduced the fail_args count.
-        let bridge_input_types = fail_descr.fail_arg_types();
-        let recorder = self.warm_state.start_retrace(bridge_input_types);
+        // compile.py:797-811 parity: bridge inputargs come from the guard's
+        // fail_arg_types AFTER store_final_boxes_in_guard. The backend's
+        // fail_descr has the UPDATED types (may include virtual field boxes);
+        // the front-end exit_layout may still have the original types.
+        // Prefer backend types which reflect the actual deadframe layout.
+        let backend_types = self
+            .backend
+            .compiled_trace_fail_descr_layouts(&compiled.token, norm_tid)
+            .and_then(|layouts| {
+                layouts
+                    .into_iter()
+                    .find(|l| l.fail_index == fail_index)
+                    .map(|l| l.fail_arg_types)
+            });
+        let fallback_types = fail_descr.fail_arg_types();
+        // compile.py:797-811 parity: log bridge input type resolution.
+        // Prefer backend types (from store_final_boxes_in_guard) over
+        // front-end exit_layout types (from original MetaFailDescr).
+        let bridge_input_types: Vec<Type> =
+            backend_types.unwrap_or_else(|| fallback_types.to_vec());
+        let recorder = self.warm_state.start_retrace(&bridge_input_types);
         self.forced_virtualizable = None;
         self.force_finish_trace = false;
         self.tracing = Some(crate::trace_ctx::TraceCtx::new(recorder, green_key));
