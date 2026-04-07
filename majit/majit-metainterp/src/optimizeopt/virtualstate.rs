@@ -849,6 +849,16 @@ impl VirtualState {
                     .get_ptr_info(resolved)
                     .map_or(false, |pi| pi.is_virtual());
                 if !is_virtual {
+                    if std::env::var_os("MAJIT_LOG_JTET").is_some() {
+                        let ptr_info_kind = ctx
+                            .get_ptr_info(resolved)
+                            .map(|pi| format!("{:?}", std::mem::discriminant(pi)))
+                            .unwrap_or_else(|| "None".to_string());
+                        eprintln!(
+                            "[jit][jte] enum_forced: Virtual VS slot but resolved={:?} (orig={:?}) is_virtual=false ptr_info={ptr_info_kind}",
+                            resolved, opref,
+                        );
+                    }
                     return Err(());
                 }
                 let field_refs: Vec<_> = fields

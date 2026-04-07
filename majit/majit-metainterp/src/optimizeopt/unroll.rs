@@ -1903,6 +1903,11 @@ impl OptUnroll {
             ) {
                 Ok(guards) => guards,
                 Err(()) => {
+                    if std::env::var_os("MAJIT_LOG_JTET").is_some() {
+                        eprintln!(
+                            "[jit][jte] target_token #{tt_idx} generate_guards failed (force_boxes={force_boxes})",
+                        );
+                    }
                     continue;
                 }
             };
@@ -1927,6 +1932,11 @@ impl OptUnroll {
             {
                 Ok(result) => result,
                 Err(()) => {
+                    if std::env::var_os("MAJIT_LOG_JTET").is_some() {
+                        eprintln!(
+                            "[jit][jte] target_token #{tt_idx} make_inputargs failed (force_boxes={force_boxes})",
+                        );
+                    }
                     if force_boxes {
                         args = jump_args
                             .iter()
