@@ -811,7 +811,13 @@ pub struct ResumedFrame {
     ///   pc=0 is valid (function start / loop header at bytecode 0).
     /// None: no-snapshot guard (rd_numb pc=-1), positional fallback.
     pub rd_numb_pc: Option<usize>,
-    /// Frame pointer for this stack frame.
+    /// CHAIN virtualizable pointer (same value on every section).
+    /// RPython parity: there is ONE virtualizable per jitdriver_sd for the
+    /// whole blackhole chain; inner sections do not own a separate PyFrame.
+    /// Carried on every `ResumedFrame` only because pyre pre-decodes the
+    /// rd_numb stream into a `Vec<ResumedFrame>` instead of streaming it
+    /// like RPython's `blackhole_from_resumedata` — the value MUST be
+    /// identical across sections (enforced by `build_resumed_frames`).
     pub frame_ptr: *mut PyFrame,
     /// valuestackdepth extracted from vable_values (snapshot).
     pub vsd: usize,
@@ -867,12 +873,34 @@ pub fn resume_in_blackhole(
     // pointing to the caller.
     let mut prev_bh: Option<majit_metainterp::blackhole::BlackholeInterpreter> = None;
 
+    // resume.py:1333-1343 parity: virtualizable_ptr is chain-level (one
+    // for the whole blackhole chain). RPython doesn't have a per-frame
+    // frame_ptr — the `vable` argument is passed to each `bhimpl_*_vable_*`
+    // bytecode explicitly. pyre carries the same virtualizable pointer on
+    // every `ResumedFrame` (enforced by build_resumed_frames), so we read
+    // it once from the first section for the whole chain.
+    let chain_vable_ptr = frames
+        .first()
+        .map(|f| f.frame_ptr)
+        .unwrap_or(std::ptr::null_mut());
+    if chain_vable_ptr.is_null() {
+        if majit_metainterp::majit_log_enabled() {
+            eprintln!("[jit][bh-fail] resume_in_blackhole: chain virtualizable is null",);
+        }
+        return BlackholeResult::Failed;
+    }
+    // Enforce the invariant: every section carries the same chain vable.
+    debug_assert!(
+        frames.iter().all(|f| f.frame_ptr == chain_vable_ptr),
+        "ResumedFrame.frame_ptr must be identical across sections (chain virtualizable)"
+    );
+
     for (sec_idx, section) in frames.iter().enumerate().rev() {
-        if section.frame_ptr.is_null() || section.code.is_null() {
+        if section.code.is_null() {
             if majit_metainterp::majit_log_enabled() {
                 eprintln!(
-                    "[jit][bh-fail] resume_in_blackhole: null ptr at sec={} frame={:?} code={:?} py_pc={}",
-                    sec_idx, section.frame_ptr, section.code, section.py_pc,
+                    "[jit][bh-fail] resume_in_blackhole: null code at sec={} py_pc={}",
+                    sec_idx, section.py_pc,
                 );
             }
             builder.release_chain(prev_bh);
@@ -883,7 +911,7 @@ pub fn resume_in_blackhole(
                 as *const pyre_interpreter::CodeObject)
         };
         let nlocals = code.varnames.len();
-        let frame_ptr = section.frame_ptr;
+        let frame_ptr = chain_vable_ptr;
 
         // resume.py:1340 curbh.setposition(jitcode, pc)
         let mut py_pc = section.py_pc;
@@ -1737,6 +1765,12 @@ pub fn blackhole_resume_via_rd_numb(
     // Resolve to CodeObject via code_for_jitcode_index, then compile jitcode.
     let resolve_jitcode =
         |jitcode_index: i32, pc: i32| -> Option<(majit_metainterp::jitcode::JitCode, usize)> {
+            // resume.py:928/1338 parity: pc is read directly from rd_numb and
+            // passed to setposition as-is. RPython does NOT introduce a
+            // "start from 0" recovery path for negative or out-of-bounds PCs.
+            // If pyre's pc_map lookup fails, the resume data is corrupt —
+            // fail loudly (return None) instead of silently restarting from
+            // the function entry, which would produce wrong results.
             if pc < 0 {
                 return None;
             }
@@ -1757,7 +1791,8 @@ pub fn blackhole_resume_via_rd_numb(
                 return None;
             }
             // Convert Python PC → JitCode byte offset via pc_map.
-            let jitcode_pc = pyjitcode.pc_map.get(pc as usize).copied().unwrap_or(0);
+            // pc_map miss is a BUG — fail rather than silently restart from 0.
+            let jitcode_pc = pyjitcode.pc_map.get(pc as usize).copied()?;
             Some((pyjitcode.jitcode.clone(), jitcode_pc))
         };
 

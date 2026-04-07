@@ -727,34 +727,17 @@ pub(crate) fn box_args_for_python_helper(
         .collect()
 }
 
-pub(crate) fn try_trace_const_pure_int_field(
-    ctx: &mut TraceCtx,
-    obj: OpRef,
-    descr: &DescrRef,
-) -> Option<OpRef> {
-    if !descr.is_always_pure() {
-        return None;
-    }
-    let ptr = ctx.const_value(obj)?;
-    if ptr == 0 {
-        return None;
-    }
-    let field = descr.as_field_descr()?;
-    let addr = ptr as usize + field.offset();
-    let value = unsafe {
-        match (field.field_size(), field.is_field_signed()) {
-            (8, _) => *(addr as *const i64),
-            (4, true) => *(addr as *const i32) as i64,
-            (4, false) => *(addr as *const u32) as i64,
-            (2, true) => *(addr as *const i16) as i64,
-            (2, false) => *(addr as *const u16) as i64,
-            (1, true) => *(addr as *const i8) as i64,
-            (1, false) => *(addr as *const u8) as i64,
-            _ => return None,
-        }
-    };
-    Some(ctx.const_int(value))
-}
+// RPython parity note: pyjitpl.py (tracer) records GETFIELD_GC ops WITHOUT
+// any constant folding. Folding happens exclusively in the optimizer's
+// `optimize_GETFIELD_GC_I` (heap.py:639-646), which delegates to
+// `optimizer.constant_fold(op)` → `_execute_arglist` → `do_getfield_gc_*`.
+// pyre's `OptContext::constant_fold` in optimizeopt/mod.rs is the exact
+// port of that path — it handles Int/Float/Ref via `execute_nonspec_const`
+// dispatched on `field_type()` and `field_size()`.
+//
+// The previous tracer-level `try_trace_const_pure_int_field` helper was a
+// pyre-specific pre-optimization that duplicated (and mistyped) the
+// optimizer logic. It has been removed for structural parity with RPython.
 
 pub(crate) fn try_trace_const_boxed_int(
     ctx: &mut TraceCtx,
@@ -811,9 +794,12 @@ pub(crate) fn trace_arraylen_gc(ctx: &mut TraceCtx, obj: OpRef, descr: DescrRef)
 }
 
 pub(crate) fn trace_gc_object_int_field(ctx: &mut TraceCtx, obj: OpRef, descr: DescrRef) -> OpRef {
-    if let Some(folded) = try_trace_const_pure_int_field(ctx, obj, &descr) {
-        return folded;
-    }
+    // pyjitpl.py:opimpl_getfield_gc_i parity: the tracer does NOT fold
+    // pure field reads on constant objects. Folding happens in the
+    // optimizer (heap.py:optimize_GETFIELD_GC_I → optimizer.constant_fold),
+    // which pyre ports in OptContext::execute_nonspec_const with correct
+    // type dispatch (Int/Float/Ref). The tracer only records the GC op.
+    //
     // heapcache.py: check if this field was already read/written in this trace
     let field_index = descr.index();
     if let Some(cached) = ctx.heap_cache().getfield_cached(obj, field_index) {
@@ -847,6 +833,13 @@ pub(crate) fn trace_gc_object_int_field(ctx: &mut TraceCtx, obj: OpRef, descr: D
 pub(crate) fn trace_gc_object_type_field(ctx: &mut TraceCtx, obj: OpRef, descr: DescrRef) -> OpRef {
     trace_gc_object_int_field(ctx, obj, descr)
 }
+
+// Note: pyre does not currently route GetfieldGcF/GetfieldGcPureF through
+// state.rs. Float field unboxing goes via the codewriter-generated
+// `trace_getfield_gc_float_pureornot` (majit-codewriter/src/codegen.rs),
+// which — matching RPython's pyjitpl.py opimpl_getfield_gc_f — records
+// the GC op without folding. The optimizer's `optimize_GETFIELD_GC_F`
+// (= `optimize_GETFIELD_GC_I` via RPython's alias) handles folding.
 
 /// Unbox int with proper GuardClass resume data via MIFrame::record_guard.
 pub(crate) fn trace_unbox_int_with_resume(
