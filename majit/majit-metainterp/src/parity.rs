@@ -70,8 +70,22 @@ fn render_op(op: &Op, constants: &HashMap<u32, i64>, vars: &mut VarRenumbering) 
 }
 
 /// Normalize a completed trace into stable line strings for parity checks.
+///
+/// Inputargs are pre-numbered in declaration order so that parity cases
+/// can reference them as `v0`, `v1`, … regardless of which ops happen
+/// to touch them first. Without this pre-population, the first
+/// inputarg touched by a later op would take the next available vN,
+/// shifting op-result IDs and breaking the stable line format
+/// parity cases expect (mirrors RPython `opimpl_*` trace shapes that
+/// assume the inputarg slot numbering is the canonical prefix).
 pub fn normalize_trace(trace: &TreeLoop, constants: &HashMap<u32, i64>) -> Vec<String> {
     let mut vars = VarRenumbering::default();
+    for i in 0..trace.inputargs.len() {
+        // Pre-allocate v0..vN for the inputarg slots. Inputargs occupy
+        // `OpRef(0)..OpRef(num_inputargs)` per `record_input_arg` in
+        // `recorder.rs`; any later render_arg hit reuses these IDs.
+        vars.id_for(OpRef(i as u32));
+    }
     trace
         .ops
         .iter()
