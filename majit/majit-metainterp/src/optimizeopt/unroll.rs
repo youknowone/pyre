@@ -508,8 +508,104 @@ impl UnrollOptimizer {
             );
         }
 
-        let p2_ops =
-            opt_p2.optimize_with_constants_and_inputs(&ops, &mut consts_p2, body_num_inputs);
+        // opencoder.py:249-406 TraceIterator parity for Phase 2.
+        //
+        // RPython's `optimize_peeled_loop` calls `trace.get_iter()` which
+        // constructs a FRESH TraceIterator whose `__init__` allocates new
+        // Box objects for every inputarg (inputarg_from_tp) and whose
+        // `next()` allocates new cls() ResOperation instances for every
+        // emitted op. Each iteration over the same trace produces a
+        // completely disjoint set of Python identities; the cache
+        // `_cache[raw_position]` records the per-iteration fresh box so
+        // later references resolve to the iteration-local identity.
+        //
+        // majit's `OpRef(u32)` IS the identity, so "fresh per iteration"
+        // means disjoint integer ranges. Phase 2 must not emit op results
+        // at OpRefs that collide with Phase 1's emitted positions — doing
+        // so reintroduces the box-identity collision that the reactive
+        // check at `mod.rs::emit` (collision detection + forwarding
+        // redirect) currently compensates for.
+        //
+        // This step (Commit D1 of the Box identity plan): run Phase 2
+        // ops through TraceIterator and advance `_index` to Phase 1's
+        // high water BEFORE `next()` begins consuming ops, giving Phase
+        // 2 op results a disjoint `[next_global_opref..)` range. Phase 2
+        // inputargs stay at the identity `[0..body_num_inputs)` positions
+        // for this step — full RPython parity (Phase 2 inputargs also at
+        // fresh OpRefs) is Commit D2, which requires corresponding fixes
+        // in `install_imported_virtuals`, `import_state_with_source_slots`,
+        // and `assemble_peeled_trace_with_jump_args` that assume the
+        // shared-inputarg layout.
+        let mut iter = majit_trace::opencoder::TraceIterator::new(
+            &ops,
+            0,
+            ops.len(),
+            None,
+            body_num_inputs,
+            0, // inputarg start index: keep at 0 for shared inputargs
+        );
+        // opencoder.py:271 self._index advance — force non-void result
+        // allocations to start at Phase 1's high water so Phase 2 op
+        // results never collide with Phase 1's emitted positions.
+        iter._index = self.next_global_opref.max(body_num_inputs as u32);
+        let mut p2_ops_in: Vec<Op> = Vec::with_capacity(ops.len());
+        while let Some(op) = iter.next() {
+            p2_ops_in.push(op);
+        }
+        let p2_high_water = iter._index;
+        let p2_cache = iter._cache;
+        // opencoder.py: `_cache[raw_pos]` holds the fresh per-iteration
+        // box. Use it to translate Phase 2-side maps that were populated
+        // against raw trace OpRefs so they match the fresh layout of
+        // `p2_ops_in`. Inputarg positions (raw `[0..body_num_inputs)`)
+        // are seeded to identity by `TraceIterator::new`, so any
+        // reference to an inputarg OpRef translates to itself — only
+        // op-result OpRefs are actually remapped.
+        let translate_opref = |opref: OpRef| -> OpRef {
+            if opref.is_none() || opref.is_constant() {
+                return opref;
+            }
+            p2_cache
+                .get(opref.0 as usize)
+                .copied()
+                .flatten()
+                .unwrap_or(opref)
+        };
+        for boxes in opt_p2.snapshot_boxes.values_mut() {
+            for r in boxes.iter_mut() {
+                *r = translate_opref(*r);
+            }
+        }
+        for boxes in opt_p2.snapshot_vable_boxes.values_mut() {
+            for r in boxes.iter_mut() {
+                *r = translate_opref(*r);
+            }
+        }
+        // KEY translation: rebuild HashMap with translated keys.
+        let translated_box_types: HashMap<u32, Type> = opt_p2
+            .snapshot_box_types
+            .iter()
+            .map(|(&k, &v)| (translate_opref(OpRef(k)).0, v))
+            .collect();
+        opt_p2.snapshot_box_types = translated_box_types;
+        let translated_op_types: HashMap<u32, Type> = opt_p2
+            .original_trace_op_types
+            .iter()
+            .map(|(&k, &v)| (translate_opref(OpRef(k)).0, v))
+            .collect();
+        opt_p2.original_trace_op_types = translated_op_types;
+        // Phase 1's emitted op types are already in Phase 1's emitted
+        // namespace `[num_inputs..next_global_opref)`. Phase 2 body may
+        // reference these via `imported_label_args`. They are NOT in the
+        // `p2_cache` (only raw trace positions are), so leave
+        // `phase1_value_types` untranslated.
+        let p2_ops = opt_p2.optimize_with_constants_and_inputs_at(
+            &p2_ops_in,
+            &mut consts_p2,
+            body_num_inputs,
+            0, // inputarg_base = 0 (shared inputargs — simpler alternative)
+            p2_high_water,
+        );
         // Phase 2 may discover new constants via make_constant (e.g., guard
         // class pointers from collect_use_box_guards).
         // Merge back into consts_p2 so the backend can resolve them.
