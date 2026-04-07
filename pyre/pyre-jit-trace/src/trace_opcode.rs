@@ -1163,6 +1163,27 @@ impl MIFrame {
                 | OpCode::GuardNotForced
                 | OpCode::GuardAlwaysFails
         );
+        // pyjitpl.py:2558-2602 generate_guard + capture_resumedata parity:
+        // RPython sets `frame.pc = resumepc` on the TOP frame regardless of
+        // whether the framestack has parent frames. The branch-guard path
+        // (`record_branch_guard`, see goto_if_not at pyjitpl.py:510-520)
+        // passes a non-orgpc resumepc — the runtime branch destination —
+        // and that adaptation must apply uniformly to inline-callee branch
+        // guards. Earlier majit revisions checked `parent_frames` first
+        // and routed inline-frame guards through the generic record_guard
+        // body, silently skipping the `pending_branch_other_target`
+        // adaptation. Recheck the branch-guard pending state up front so
+        // both standalone and inline-frame branch guards take the same
+        // resume_pc adaptation path — `record_branch_guard` itself handles
+        // the multi-frame snapshot assembly for parent_frames.
+        if let Some(branch_value) = self.sym().pending_branch_value
+            && matches!(opcode, OpCode::GuardTrue | OpCode::GuardFalse)
+        {
+            let truth = args.first().copied().unwrap_or(OpRef::NONE);
+            let concrete_truth = opcode == OpCode::GuardTrue;
+            self.record_branch_guard(ctx, branch_value, truth, concrete_truth);
+            return;
+        }
         // opencoder.py:819 capture_resumedata(framestack) parity:
         // Encode the full framestack [callee (top), caller (parent)] into
         // a multi-frame snapshot. The callee's pc is set to resumepc
@@ -1264,13 +1285,6 @@ impl MIFrame {
 
             ctx.record_guard_typed_with_fail_args(opcode, args, types, &fail_args);
             ctx.set_last_guard_resume_position(snapshot_id);
-            return;
-        }
-
-        if let Some(branch_value) = self.sym().pending_branch_value {
-            let truth = args.first().copied().unwrap_or(OpRef::NONE);
-            let concrete_truth = opcode == OpCode::GuardTrue;
-            self.record_branch_guard(ctx, branch_value, truth, concrete_truth);
             return;
         }
 
