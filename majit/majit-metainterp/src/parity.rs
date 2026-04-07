@@ -19,32 +19,48 @@ pub struct TraceParityCase<'a> {
     pub expected_lines: &'a [&'a str],
 }
 
-fn render_arg(arg: OpRef, constants: &HashMap<u32, i64>) -> String {
-    if let Some(value) = constants.get(&arg.0) {
-        value.to_string()
-    } else {
-        format!("v{}", arg.0)
+#[derive(Default)]
+struct VarRenumbering {
+    next_id: u32,
+    ids: HashMap<u32, u32>,
+}
+
+impl VarRenumbering {
+    fn id_for(&mut self, opref: OpRef) -> u32 {
+        *self.ids.entry(opref.0).or_insert_with(|| {
+            let id = self.next_id;
+            self.next_id += 1;
+            id
+        })
     }
 }
 
-fn render_op(op: &Op, constants: &HashMap<u32, i64>) -> String {
+fn render_arg(arg: OpRef, constants: &HashMap<u32, i64>, vars: &mut VarRenumbering) -> String {
+    if let Some(value) = constants.get(&arg.0) {
+        value.to_string()
+    } else {
+        format!("v{}", vars.id_for(arg))
+    }
+}
+
+fn render_op(op: &Op, constants: &HashMap<u32, i64>, vars: &mut VarRenumbering) -> String {
     let args = op
         .args
         .iter()
-        .map(|&arg| render_arg(arg, constants))
+        .map(|&arg| render_arg(arg, constants, vars))
         .collect::<Vec<_>>()
         .join(", ");
 
     let mut line = if op.opcode.is_guard() || op.opcode.result_type() == Type::Void {
         format!("{:?}({args})", op.opcode)
     } else {
-        format!("v{} = {:?}({args})", op.pos.0, op.opcode)
+        format!("v{} = {:?}({args})", vars.id_for(op.pos), op.opcode)
     };
 
     if let Some(fail_args) = &op.fail_args {
         let fail_args = fail_args
             .iter()
-            .map(|&arg| render_arg(arg, constants))
+            .map(|&arg| render_arg(arg, constants, vars))
             .collect::<Vec<_>>()
             .join(", ");
         line.push_str(&format!(" [fail_args={fail_args}]"));
@@ -55,17 +71,21 @@ fn render_op(op: &Op, constants: &HashMap<u32, i64>) -> String {
 
 /// Normalize a completed trace into stable line strings for parity checks.
 pub fn normalize_trace(trace: &TreeLoop, constants: &HashMap<u32, i64>) -> Vec<String> {
+    let mut vars = VarRenumbering::default();
     trace
         .ops
         .iter()
-        .map(|op| render_op(op, constants))
+        .map(|op| render_op(op, constants, &mut vars))
         .collect()
 }
 
 /// Normalize an op slice into the same stable line format used by
 /// [`normalize_trace`].
 pub fn normalize_ops(ops: &[Op], constants: &HashMap<u32, i64>) -> Vec<String> {
-    ops.iter().map(|op| render_op(op, constants)).collect()
+    let mut vars = VarRenumbering::default();
+    ops.iter()
+        .map(|op| render_op(op, constants, &mut vars))
+        .collect()
 }
 
 /// Assert that a trace matches a normalized parity case.

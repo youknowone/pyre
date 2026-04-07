@@ -218,19 +218,18 @@ pub struct PyreSizeDescr {
     vtable: usize,
 }
 
-pub const W_INT_GC_TYPE_ID: u32 = 0;
-pub const W_FLOAT_GC_TYPE_ID: u32 = 1;
+/// GC type id for the `rclass.OBJECT` root — pyre's static `INSTANCE_TYPE`
+/// PyType (`tp_name = "object"`). All `PyObject`-layout subclasses chain
+/// their `parent` field to this id so `assign_inheritance_ids`
+/// (normalizecalls.py:373-389) emits a `subclassrange_{min,max}` covering
+/// every descendant. `GUARD_SUBCLASS(obj, &INSTANCE_TYPE)` then succeeds
+/// for any `is_object` instance via `int_between(root.min, obj_typeid.min,
+/// root.max)` (rclass.py:1133-1137 `ll_issubclass`).
+pub const OBJECT_GC_TYPE_ID: u32 = 0;
+pub const W_INT_GC_TYPE_ID: u32 = 1;
+pub const W_FLOAT_GC_TYPE_ID: u32 = 2;
 /// GC type id for JitFrame (jitframe.py:49 register_custom_trace_hook).
-pub const JITFRAME_GC_TYPE_ID: u32 = 2;
-/// Shared type id for every pyre `PyObject`-layout type that is not
-/// allocated through the JIT. RPython assigns one typeid per class in
-/// `rclass.OBJECT`'s type_info_group; pyre collapses them into a
-/// single entry because (a) these types are never allocated through
-/// the JIT's NewWithVtable path, so the payload `size` field is
-/// unused, and (b) the only consumer on this path is
-/// `check_is_object(gcref)` (llmodel.py:541-546), which only needs
-/// the `T_IS_RPYTHON_INSTANCE` bit (gc.py:642) to be set.
-pub const PYRE_OBJECT_GC_TYPE_ID: u32 = 3;
+pub const JITFRAME_GC_TYPE_ID: u32 = 3;
 
 impl Descr for PyreSizeDescr {
     fn index(&self) -> u32 {

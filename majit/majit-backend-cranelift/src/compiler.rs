@@ -5130,7 +5130,7 @@ impl CraneliftBackend {
 
                 continue;
             }
-            drop(bridge_guard);
+            let _ = bridge_guard;
 
             // llgraph/runner.py:1192-1194 fail_guard without bridge →
             // ExecutionFinished(LLDeadFrame).
@@ -11776,7 +11776,7 @@ mod tests {
 
         let frame = backend.execute_token(&token, &[Value::Int(42)]);
         let descr = backend.get_latest_descr(&frame);
-        assert_eq!(descr.fail_index(), 0);
+        assert!(descr.is_finish());
         assert_eq!(backend.get_int_value(&frame, 0), 42);
     }
 
@@ -12836,7 +12836,7 @@ mod tests {
         assert!(!jit_exc_is_pending());
 
         let frame = backend.execute_token(&token, &[Value::Int(0)]);
-        assert_eq!(backend.get_latest_descr(&frame).fail_index(), 1);
+        assert!(backend.get_latest_descr(&frame).is_finish());
         assert_eq!(backend.get_int_value(&frame, 0), 0);
         assert_eq!(exc_class_of(&backend, &frame), 0);
         assert_eq!(backend.grab_exc_value(&frame), GcRef::NULL);
@@ -13338,7 +13338,7 @@ mod tests {
 
         let frame = backend.execute_token(&token, &[Value::Int(42)]);
         let descr = backend.get_latest_descr(&frame);
-        assert_eq!(descr.fail_index(), 1); // Finish
+        assert!(descr.is_finish()); // Finish
         assert_eq!(backend.get_int_value(&frame, 0), 42);
 
         // Test: value doesn't match -> guard fails
@@ -13856,6 +13856,7 @@ mod tests {
     #[test]
     fn test_guard_nonnull_class_checks_object_header_and_null() {
         let mut backend = CraneliftBackend::new();
+        backend.set_vtable_offset(Some(0));
 
         let inputargs = vec![InputArg::new_ref(0)];
         let ops = vec![
@@ -13879,7 +13880,7 @@ mod tests {
         let ptr = object_words.as_mut_ptr() as usize;
 
         let frame = backend.execute_token(&token, &[Value::Ref(GcRef(ptr))]);
-        assert_eq!(backend.get_latest_descr(&frame).fail_index(), 1);
+        assert!(backend.get_latest_descr(&frame).is_finish());
         assert_eq!(backend.get_ref_value(&frame, 0), GcRef(ptr));
 
         object_words[0] = 0xDEAD_BEEFu64 as i64;
@@ -13910,7 +13911,7 @@ mod tests {
         // 10 + 20 = 30 (no overflow)
         let frame = backend.execute_token(&token, &[Value::Int(10), Value::Int(20)]);
         let descr = backend.get_latest_descr(&frame);
-        assert_eq!(descr.fail_index(), 1); // Finish (guard passed)
+        assert!(descr.is_finish()); // Finish (guard passed)
         assert_eq!(backend.get_int_value(&frame, 0), 30);
     }
 
@@ -13973,7 +13974,7 @@ mod tests {
 
         let frame = backend.execute_token(&token, &[Value::Int(100), Value::Int(58)]);
         let descr = backend.get_latest_descr(&frame);
-        assert_eq!(descr.fail_index(), 1); // Finish (guard passed)
+        assert!(descr.is_finish()); // Finish (guard passed)
         assert_eq!(backend.get_int_value(&frame, 0), 42);
     }
 
@@ -13994,7 +13995,7 @@ mod tests {
 
         let frame = backend.execute_token(&token, &[Value::Int(6), Value::Int(7)]);
         let descr = backend.get_latest_descr(&frame);
-        assert_eq!(descr.fail_index(), 1); // Finish (guard passed)
+        assert!(descr.is_finish()); // Finish (guard passed)
         assert_eq!(backend.get_int_value(&frame, 0), 42);
     }
 
@@ -14037,7 +14038,7 @@ mod tests {
         // With overflow: guard_overflow passes (continues)
         let frame = backend.execute_token(&token, &[Value::Int(i64::MAX), Value::Int(1)]);
         let descr = backend.get_latest_descr(&frame);
-        assert_eq!(descr.fail_index(), 1); // Finish (overflow happened, guard passed)
+        assert!(descr.is_finish()); // Finish (overflow happened, guard passed)
 
         // Without overflow: guard_overflow fails (side-exits)
         let mut token2 = JitCellToken::new(87);
@@ -14932,7 +14933,7 @@ mod tests {
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(20), Value::Int(0)]);
-        assert_eq!(backend.get_latest_descr(&frame).fail_index(), 1);
+        assert!(backend.get_latest_descr(&frame).is_finish());
         assert_eq!(backend.get_int_value(&frame, 0), 20);
         assert!(may_force_void_values().lock().unwrap().is_empty());
 
@@ -15074,7 +15075,7 @@ mod tests {
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(20), Value::Int(0)]);
-        assert_eq!(backend.get_latest_descr(&frame).fail_index(), 1);
+        assert!(backend.get_latest_descr(&frame).is_finish());
         assert_eq!(backend.get_int_value(&frame, 0), 42);
         assert!(may_force_int_values().lock().unwrap().is_empty());
 
@@ -15124,7 +15125,7 @@ mod tests {
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(20), Value::Int(0)]);
-        assert_eq!(backend.get_latest_descr(&frame).fail_index(), 1);
+        assert!(backend.get_latest_descr(&frame).is_finish());
         assert_eq!(backend.get_float_value(&frame, 0), 12.5);
         assert!(may_force_float_values().lock().unwrap().is_empty());
 
@@ -15199,7 +15200,7 @@ mod tests {
             &token,
             &[Value::Ref(live_ref), Value::Ref(return_ref), Value::Int(0)],
         );
-        assert_eq!(backend.get_latest_descr(&frame).fail_index(), 1);
+        assert!(backend.get_latest_descr(&frame).is_finish());
         let unforced_result = backend.get_ref_value(&frame, 0);
         assert_eq!(unforced_result, return_ref);
         assert!(may_force_ref_values().lock().unwrap().is_empty());

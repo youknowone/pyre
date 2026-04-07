@@ -1484,6 +1484,17 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                 Some(args)
             }
 
+            fn fail_args_with_ctx(
+                &mut self,
+                _ctx: &mut majit_metainterp::TraceCtx,
+            ) -> Option<Vec<majit_ir::OpRef>> {
+                let mut args = Vec::new();
+                for &(sidx, _) in self.storage_layout.iter().take(self.meta_storage_count) {
+                    args.extend(self.stacks[&sidx].to_jump_args());
+                }
+                Some(args)
+            }
+
             fn fail_storage_lengths(&self) -> Option<Vec<usize>> {
                 Some(
                     self.storage_layout
@@ -1570,70 +1581,86 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
             }
 
             fn restore(&mut self, meta: &__JitMeta, values: &[i64]) {
-                // values[0] = stackpos (red inputarg for promote).
-                // Rest: stack values, possibly with suffix.
                 if values.is_empty() {
                     self.#sel_field = meta.initial_selected;
                     return;
                 }
-                // values[0] = stackpos inputarg (promote target).
-                // The actual stack restore below resets storage length,
-                // so we don't need to explicitly write stackpos here.
-
-                let values = &values[1..]; // strip stackpos prefix
-
-                // Two possible formats:
-                // 1. JUMP args (loop finish): [stack_elems...] — length == sum(num_slots)
-                // 2. Guard fail_args: [stack_elems..., lengths..., selected, resume_pc]
                 let total_meta_slots: usize = meta.storage_layout.iter().map(|&(_, n)| n).sum();
-                if values.len() == total_meta_slots {
-                    // Format 1: simple JUMP args — restore stacks from meta depths
+                let n_storages = meta.storage_layout.len();
+                let suffix_len = n_storages + 2; // lengths + selected + resume_pc
+
+                let mut restore_jump_args = |payload: &[i64]| {
                     let mut offset = 0;
                     for &(sidx, num_slots) in &meta.storage_layout {
                         let end = offset + num_slots;
                         let store = self.#pool_field.get_mut(sidx);
                         store.clear();
-                        for &value in &values[offset..end] {
+                        for &value in &payload[offset..end] {
                             store.push(value);
                         }
                         offset = end;
                     }
-                    self.#sel_field = meta.initial_selected;
-                    return;
-                }
-                // Format 2: guard fail_args with suffix
-                let n_storages = meta.storage_layout.len();
-                let suffix_len = n_storages + 2; // lengths + selected + resume_pc
-                if values.len() < suffix_len {
-                    self.#sel_field = meta.initial_selected;
-                    return;
-                }
-                let total_stack_elems = values.len() - suffix_len;
-                let lengths_offset = total_stack_elems;
-                let selected_offset = lengths_offset + n_storages;
+                };
 
-                let mut offset = 0;
-                for (i, &(sidx, _)) in meta.storage_layout.iter().enumerate() {
-                    let current_len = values
-                        .get(lengths_offset + i)
-                        .copied()
-                        .and_then(|v| usize::try_from(v).ok())
-                        .unwrap_or(0);
-                    let end = offset + current_len;
-                    let store = self.#pool_field.get_mut(sidx);
-                    store.clear();
-                    if end <= total_stack_elems {
-                        for &value in &values[offset..end] {
+                if values.len() == total_meta_slots {
+                    // JUMP args without a stacksize prefix.
+                    restore_jump_args(values);
+                    self.#sel_field = meta.initial_selected;
+                    return;
+                }
+
+                if values.len() == total_meta_slots + 1 {
+                    // Legacy JUMP args with a stacksize prefix.
+                    restore_jump_args(&values[1..]);
+                    self.#sel_field = meta.initial_selected;
+                    return;
+                }
+
+                let mut try_restore_guard = |payload: &[i64]| -> Option<usize> {
+                    if payload.len() < suffix_len {
+                        return None;
+                    }
+                    let total_stack_elems = payload.len() - suffix_len;
+                    let lengths_offset = total_stack_elems;
+                    let selected_offset = lengths_offset + n_storages;
+
+                    let mut offset = 0;
+                    for (i, &(sidx, _)) in meta.storage_layout.iter().enumerate() {
+                        let current_len = payload
+                            .get(lengths_offset + i)
+                            .copied()
+                            .and_then(|v| usize::try_from(v).ok())?;
+                        let end = offset + current_len;
+                        if end > total_stack_elems {
+                            return None;
+                        }
+                        let store = self.#pool_field.get_mut(sidx);
+                        store.clear();
+                        for &value in &payload[offset..end] {
                             store.push(value);
                         }
+                        offset = end;
                     }
-                    offset = end;
+                    if offset != total_stack_elems {
+                        return None;
+                    }
+                    payload
+                        .get(selected_offset)
+                        .copied()
+                        .and_then(|v| usize::try_from(v).ok())
+                };
+
+                if let Some(selected) = try_restore_guard(values) {
+                    self.#sel_field = selected;
+                    return;
                 }
-                self.#sel_field = values
-                    .get(selected_offset)
-                    .copied()
-                    .and_then(|v| usize::try_from(v).ok())
-                    .unwrap_or(meta.initial_selected);
+
+                if let Some(selected) = try_restore_guard(&values[1..]) {
+                    self.#sel_field = selected;
+                    return;
+                }
+
+                self.#sel_field = meta.initial_selected;
             }
 
             fn collect_jump_args(sym: &__JitSym) -> Vec<majit_ir::OpRef> {
