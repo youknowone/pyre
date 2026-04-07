@@ -622,13 +622,11 @@ impl UnrollOptimizer {
         // Try to match the body's JUMP virtual state to an existing target.
         // RPython: new_virtual_state = jump_to_existing_trace(end_jump, ...)
         //
-        // Safety: skip jump_to_existing_trace when Phase 2 body has many
-        // guards. make_inputargs_and_virtuals_with_optimizer is O(n²+) for
-        // large bodies, causing hangs. jump_to_preamble is used instead.
-        // RPython doesn't have this issue because same-function target tokens
-        // make VirtualState matching fast.
+        // RPython parity: never skip jump_to_existing_trace based on
+        // guard count. RPython's unroll.py always attempts
+        // jump_to_existing_trace regardless of body size.
         let p2_guard_count = p2_ops.iter().filter(|o| o.opcode.is_guard()).count();
-        let skip_jump_to_existing = p2_guard_count > 30;
+        let skip_jump_to_existing = false;
         if std::env::var_os("MAJIT_LOG").is_some() {
             eprintln!(
                 "[jit] post-finalize: entering jump_to_existing_trace section (p2_guards={}, skip={})",
@@ -852,6 +850,16 @@ impl UnrollOptimizer {
 
         if !jump_to_self {
             // unroll.py:170-171: jump_to_preamble — body JUMP → preamble Label
+            //
+            // RPython parity: force_box_for_end_of_preamble (unroll.py:126-127)
+            // re-boxes unboxed values before the JUMP so types match the
+            // preamble inputargs. Without force_box, the body JUMP may pass
+            // Float/Int values at Ref-typed positions, causing the preamble's
+            // guard checks to dereference non-pointer values → segfault.
+            //
+            // Until force_box_for_end_of_preamble is implemented, reject
+            // traces where the body JUMP types don't match preamble inputarg
+            // types. The metainterp falls back to interpretation.
             let preamble_target = self
                 .target_tokens
                 .first()

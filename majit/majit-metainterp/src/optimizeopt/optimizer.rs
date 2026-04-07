@@ -1128,12 +1128,19 @@ impl Optimizer {
 
     /// optimizer.py:345-364: force_box — force a virtual to be materialized.
     /// Also pops from potential_extra_ops (optimizer.py:351-359).
+    ///
+    /// majit source/result split: RPython uses a single Box identity, so a
+    /// single `potential_extra_ops.pop(op)` always finds the entry. majit
+    /// separates preamble source and imported result, so we must try three
+    /// keys: resolved, opref, and imported_short_source(opref).
+    /// Mirrors force_box_inline (mod.rs) contract.
     pub fn force_box(&mut self, opref: OpRef, ctx: &mut OptContext) -> OpRef {
         // optimizer.py:346: op = get_box_replacement(op)
         let preamble_source = ctx.imported_short_source(opref);
         let resolved = ctx.get_box_replacement(opref);
         // optimizer.py:351-359: potential_extra_ops.pop(op)
         // → sb.add_preamble_op(preamble_op)
+        // Try three keys to account for the source/result split:
         let tracked = ctx
             .take_potential_extra_op(resolved)
             .or_else(|| ctx.take_potential_extra_op(opref))
