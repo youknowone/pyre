@@ -120,6 +120,18 @@ impl std::fmt::Debug for DynasmFailDescr {
     }
 }
 
+/// compile.py:665-674 done_with_this_frame_descr singleton.
+/// All Finish ops write this pointer to jf_descr. CALL_ASSEMBLER
+/// compares jf_descr against this pointer for the fast path.
+static DONE_WITH_THIS_FRAME_DESCR: std::sync::LazyLock<Arc<DynasmFailDescr>> =
+    std::sync::LazyLock::new(|| Arc::new(DynasmFailDescr::new(u32::MAX, 0, vec![Type::Int], true)));
+
+/// Return the raw pointer for done_with_this_frame_descr.
+/// Used by genop_call_assembler for inline CMP.
+pub fn done_with_this_frame_descr_ptr() -> usize {
+    Arc::as_ptr(&DONE_WITH_THIS_FRAME_DESCR) as usize
+}
+
 impl Descr for DynasmFailDescr {}
 
 impl FailDescr for DynasmFailDescr {

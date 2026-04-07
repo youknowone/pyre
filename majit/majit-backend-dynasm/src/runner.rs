@@ -258,19 +258,24 @@ impl Backend for DynasmBackend {
         // llmodel.py:412-420 get_latest_descr: read jf_descr from frame
         let jf_descr_raw = unsafe { *result_jf.add(0) };
 
-        // Find the matching fail descriptor by pointer
-        let descr = compiled
-            .fail_descrs
-            .iter()
-            .find(|d| Arc::as_ptr(d) as usize == jf_descr_raw as usize)
-            .cloned()
-            .unwrap_or_else(|| {
+        // Find the matching fail descriptor by pointer.
+        // compile.py:665-674 parity: check global done_with_this_frame_descr first.
+        let global_done = crate::guard::done_with_this_frame_descr_ptr();
+        let descr =
+            if jf_descr_raw as usize == global_done {
+                Arc::new(DynasmFailDescr::new(u32::MAX, 0, vec![Type::Int], true))
+            } else {
                 compiled
                     .fail_descrs
-                    .last()
+                    .iter()
+                    .find(|d| Arc::as_ptr(d) as usize == jf_descr_raw as usize)
                     .cloned()
-                    .unwrap_or_else(|| Arc::new(DynasmFailDescr::new(0, 0, Vec::new(), true)))
-            });
+                    .unwrap_or_else(|| {
+                        compiled.fail_descrs.last().cloned().unwrap_or_else(|| {
+                            Arc::new(DynasmFailDescr::new(0, 0, Vec::new(), true))
+                        })
+                    })
+            };
 
         // RPython: the deadframe IS the jitframe — ALL slots accessible.
         // Extract full jitframe content so rd_numb can reference any slot.

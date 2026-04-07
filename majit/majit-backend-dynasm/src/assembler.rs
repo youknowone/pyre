@@ -114,6 +114,10 @@ pub struct Assembler386 {
     /// via gc_ll_descr.get_typeid_from_classptr_if_gcremovetypeptr. Used by
     /// the gcremovetypeptr branch of `_cmp_guard_class`.
     classptr_to_typeid: HashMap<i64, u32>,
+    /// Dynamic label at the function entry for self-recursive CALL_ASSEMBLER.
+    /// Used as the call target for recursive calls (relative call within
+    /// the same code buffer). Set by assemble_loop before _assemble.
+    self_entry_label: Option<DynamicLabel>,
 }
 
 /// assembler.py GuardToken — represents a pending guard needing
@@ -171,6 +175,7 @@ impl Assembler386 {
             loop_label: None,
             vtable_offset,
             classptr_to_typeid,
+            self_entry_label: None,
         }
     }
 
@@ -302,6 +307,7 @@ impl Assembler386 {
         dynasm!(self.mc
             ; .arch x64
             ; push rbp
+            ; push r12               // save r12 (used by genop_call_assembler)
             ; mov rbp, rdi
         );
         #[cfg(target_arch = "aarch64")]
@@ -331,6 +337,7 @@ impl Assembler386 {
         dynasm!(self.mc
             ; .arch x64
             ; mov rax, rbp
+            ; pop r12                // restore r12
             ; pop rbp
             ; ret
         );
@@ -361,6 +368,11 @@ impl Assembler386 {
         // For now, simplified: all args in frame slots
 
         // assembler.py:547 _assemble — generate code for all ops
+        // Create a dynamic label at the entry point for self-recursive
+        // CALL_ASSEMBLER (redirect_call_assembler parity).
+        let entry_label = self.mc.new_dynamic_label();
+        dynasm!(self.mc ; =>entry_label);
+        self.self_entry_label = Some(entry_label);
         let entry = self.mc.offset();
         self._assemble(inputargs, ops)?;
 
@@ -443,153 +455,311 @@ impl Assembler386 {
                     op_idx, op.opcode, op.pos, op.args
                 );
             }
-            if op.opcode.is_guard() {
-                self.genop_guard(op, fail_index);
-                fail_index += 1;
-            } else {
-                match op.opcode {
-                    // ---- Integer arithmetic ----
-                    OpCode::IntAdd => self.genop_int_add(op),
-                    OpCode::IntSub => self.genop_int_sub(op),
-                    OpCode::IntMul => self.genop_int_mul(op),
-                    OpCode::IntAnd => self.genop_int_and(op),
-                    OpCode::IntOr => self.genop_int_or(op),
-                    OpCode::IntXor => self.genop_int_xor(op),
-                    OpCode::IntNeg => self.genop_int_neg(op),
-                    OpCode::IntInvert => self.genop_int_invert(op),
-                    OpCode::IntLshift => self.genop_int_lshift(op),
-                    OpCode::IntRshift => self.genop_int_rshift(op),
-                    OpCode::UintRshift => self.genop_uint_rshift(op),
+            match op.opcode {
+                // ---- Guards (assembler.py:1773-1917, 2228-2232) ----
+                // genop_guard_guard_true = genop_guard_guard_nonnull
+                // = genop_guard_guard_no_overflow  (aliases in RPython)
+                OpCode::GuardTrue
+                | OpCode::VecGuardTrue
+                | OpCode::GuardNonnull
+                | OpCode::GuardNoOverflow => {
+                    self.genop_guard_guard_true(op, fail_index);
+                    fail_index += 1;
+                }
+                // genop_guard_guard_false = genop_guard_guard_isnull
+                // = genop_guard_guard_overflow  (aliases in RPython)
+                OpCode::GuardFalse
+                | OpCode::VecGuardFalse
+                | OpCode::GuardIsnull
+                | OpCode::GuardOverflow => {
+                    self.genop_guard_guard_false(op, fail_index);
+                    fail_index += 1;
+                }
+                OpCode::GuardValue => {
+                    self.genop_guard_guard_value(op, fail_index);
+                    fail_index += 1;
+                }
+                OpCode::GuardClass => {
+                    self.genop_guard_guard_class(op, fail_index);
+                    fail_index += 1;
+                }
+                OpCode::GuardNonnullClass => {
+                    self.genop_guard_guard_nonnull_class(op, fail_index);
+                    fail_index += 1;
+                }
+                OpCode::GuardNoException => {
+                    self.genop_guard_guard_no_exception(op, fail_index);
+                    fail_index += 1;
+                }
+                OpCode::GuardNotInvalidated => {
+                    self.genop_guard_guard_not_invalidated(op, fail_index);
+                    fail_index += 1;
+                }
+                OpCode::GuardNotForced | OpCode::GuardNotForced2 => {
+                    self.genop_guard_guard_not_forced(op, fail_index);
+                    fail_index += 1;
+                }
+                // Remaining guards: stub
+                _ if op.opcode.is_guard() => {
+                    self.implement_guard_nojump(op, fail_index);
+                    fail_index += 1;
+                }
 
-                    // ---- Overflow arithmetic ----
-                    OpCode::IntAddOvf => self.genop_int_add_ovf(op),
-                    OpCode::IntSubOvf => self.genop_int_sub_ovf(op),
-                    OpCode::IntMulOvf => self.genop_int_mul_ovf(op),
+                // ---- Integer arithmetic ----
+                OpCode::IntAdd => self.genop_int_add(op),
+                OpCode::IntSub => self.genop_int_sub(op),
+                OpCode::IntMul => self.genop_int_mul(op),
+                OpCode::IntAnd => self.genop_int_and(op),
+                OpCode::IntOr => self.genop_int_or(op),
+                OpCode::IntXor => self.genop_int_xor(op),
+                OpCode::IntNeg => self.genop_int_neg(op),
+                OpCode::IntInvert => self.genop_int_invert(op),
+                OpCode::IntLshift => self.genop_int_lshift(op),
+                OpCode::IntRshift => self.genop_int_rshift(op),
+                OpCode::UintRshift => self.genop_uint_rshift(op),
 
-                    // ---- Comparisons ----
-                    OpCode::IntLt
-                    | OpCode::IntLe
-                    | OpCode::IntGt
-                    | OpCode::IntGe
-                    | OpCode::IntEq
-                    | OpCode::IntNe
-                    | OpCode::UintLt
-                    | OpCode::UintLe
-                    | OpCode::UintGt
-                    | OpCode::UintGe => {
-                        self.genop_int_cmp(op);
-                    }
+                // ---- Overflow arithmetic ----
+                OpCode::IntAddOvf => self.genop_int_add_ovf(op),
+                OpCode::IntSubOvf => self.genop_int_sub_ovf(op),
+                OpCode::IntMulOvf => self.genop_int_mul_ovf(op),
 
-                    // ---- Float arithmetic ----
-                    OpCode::FloatAdd => self.genop_float_add(op),
-                    OpCode::FloatSub => self.genop_float_sub(op),
-                    OpCode::FloatMul => self.genop_float_mul(op),
-                    OpCode::FloatTrueDiv => self.genop_float_truediv(op),
-                    OpCode::FloatNeg => self.genop_float_neg(op),
-                    OpCode::CastIntToFloat => self.genop_cast_int_to_float(op),
-                    OpCode::CastFloatToInt => self.genop_cast_float_to_int(op),
+                // ---- Comparisons ----
+                OpCode::IntLt
+                | OpCode::IntLe
+                | OpCode::IntGt
+                | OpCode::IntGe
+                | OpCode::IntEq
+                | OpCode::IntNe
+                | OpCode::UintLt
+                | OpCode::UintLe
+                | OpCode::UintGt
+                | OpCode::UintGe
+                | OpCode::PtrEq
+                | OpCode::PtrNe
+                | OpCode::InstancePtrEq
+                | OpCode::InstancePtrNe => {
+                    self.genop_int_cmp(op);
+                }
 
-                    // ---- Memory operations ----
-                    OpCode::GetfieldGcI
-                    | OpCode::GetfieldGcR
-                    | OpCode::GetfieldGcF
-                    | OpCode::GetfieldGcPureI
-                    | OpCode::GetfieldGcPureR
-                    | OpCode::GetfieldGcPureF
-                    | OpCode::GetfieldRawI
-                    | OpCode::GetfieldRawR
-                    | OpCode::GetfieldRawF => {
-                        self.genop_getfield(op);
-                    }
-                    OpCode::SetfieldGc | OpCode::SetfieldRaw => {
-                        self.genop_setfield(op);
-                    }
-                    OpCode::GetarrayitemGcI
-                    | OpCode::GetarrayitemGcR
-                    | OpCode::GetarrayitemGcF
-                    | OpCode::GetarrayitemGcPureI
-                    | OpCode::GetarrayitemGcPureR
-                    | OpCode::GetarrayitemGcPureF
-                    | OpCode::GetarrayitemRawI
-                    | OpCode::GetarrayitemRawR
-                    | OpCode::GetarrayitemRawF => {
-                        self.genop_getarrayitem(op);
-                    }
-                    OpCode::SetarrayitemGc | OpCode::SetarrayitemRaw => {
-                        self.genop_setarrayitem(op);
-                    }
-                    OpCode::ArraylenGc => self.genop_arraylen(op),
+                // ---- Float arithmetic ----
+                OpCode::FloatAdd => self.genop_float_add(op),
+                OpCode::FloatSub => self.genop_float_sub(op),
+                OpCode::FloatMul => self.genop_float_mul(op),
+                OpCode::FloatTrueDiv => self.genop_float_truediv(op),
+                OpCode::FloatNeg => self.genop_float_neg(op),
+                OpCode::CastIntToFloat => self.genop_cast_int_to_float(op),
+                OpCode::CastFloatToInt => self.genop_cast_float_to_int(op),
 
-                    // ---- Control flow ----
-                    OpCode::Jump => self.genop_jump(op),
-                    OpCode::Finish => {
-                        self.genop_finish(op, fail_index);
-                        fail_index += 1;
-                    }
-                    OpCode::Label => self.genop_label(op),
+                // ---- Memory operations ----
+                OpCode::GetfieldGcI
+                | OpCode::GetfieldGcR
+                | OpCode::GetfieldGcF
+                | OpCode::GetfieldGcPureI
+                | OpCode::GetfieldGcPureR
+                | OpCode::GetfieldGcPureF
+                | OpCode::GetfieldRawI
+                | OpCode::GetfieldRawR
+                | OpCode::GetfieldRawF => {
+                    self.genop_getfield(op);
+                }
+                OpCode::SetfieldGc | OpCode::SetfieldRaw => {
+                    self.genop_discard_setfield(op);
+                }
+                OpCode::GetarrayitemGcI
+                | OpCode::GetarrayitemGcR
+                | OpCode::GetarrayitemGcF
+                | OpCode::GetarrayitemGcPureI
+                | OpCode::GetarrayitemGcPureR
+                | OpCode::GetarrayitemGcPureF
+                | OpCode::GetarrayitemRawI
+                | OpCode::GetarrayitemRawR
+                | OpCode::GetarrayitemRawF => {
+                    self.genop_getarrayitem(op);
+                }
+                OpCode::SetarrayitemGc | OpCode::SetarrayitemRaw => {
+                    self.genop_discard_setarrayitem(op);
+                }
+                OpCode::ArraylenGc => self.genop_arraylen(op),
 
-                    // ---- Calls ----
-                    OpCode::CallI | OpCode::CallR | OpCode::CallF | OpCode::CallN => {
-                        self.genop_call(op);
-                    }
-                    OpCode::CallAssemblerI
-                    | OpCode::CallAssemblerR
-                    | OpCode::CallAssemblerF
-                    | OpCode::CallAssemblerN => {
-                        self.genop_call_assembler(op);
-                    }
+                // ---- Control flow ----
+                OpCode::Jump => self.genop_jump(op),
+                OpCode::Finish => {
+                    self.genop_finish(op, fail_index);
+                    fail_index += 1;
+                }
+                OpCode::Label => self.genop_label(op),
 
-                    // ---- Type conversions ----
-                    OpCode::SameAsI | OpCode::SameAsR | OpCode::SameAsF => self.genop_same_as(op),
-                    OpCode::IntIsTrue => self.genop_int_is_true(op),
-                    OpCode::IntIsZero => self.genop_int_is_zero(op),
+                // ---- Calls ----
+                OpCode::CallI | OpCode::CallR | OpCode::CallF | OpCode::CallN => {
+                    self.genop_call(op);
+                }
+                OpCode::CallAssemblerI
+                | OpCode::CallAssemblerR
+                | OpCode::CallAssemblerF
+                | OpCode::CallAssemblerN => {
+                    self.genop_call_assembler(op);
+                }
 
-                    // ---- Allocation ----
-                    OpCode::New => self.genop_new(op),
-                    OpCode::NewWithVtable => self.genop_new_with_vtable(op),
-                    OpCode::NewArray | OpCode::NewArrayClear => self.genop_new_array(op),
+                // ---- Type conversions ----
+                OpCode::SameAsI | OpCode::SameAsR | OpCode::SameAsF => self.genop_same_as(op),
+                OpCode::IntIsTrue => self.genop_int_is_true(op),
+                OpCode::IntIsZero => self.genop_int_is_zero(op),
 
-                    // ---- Misc ----
-                    OpCode::ForceToken => self.genop_force_token(op),
-                    OpCode::Strlen | OpCode::Unicodelen => self.genop_strlen(op),
-                    OpCode::Strgetitem | OpCode::Unicodegetitem => self.genop_strgetitem(op),
+                // ---- Allocation ----
+                OpCode::New => self.genop_new(op),
+                OpCode::NewWithVtable => self.genop_new_with_vtable(op),
+                OpCode::NewArray | OpCode::NewArrayClear => self.genop_new_array(op),
 
-                    // ---- Overflow checks (guards handle by is_guard) ----
+                // ---- Misc ----
+                OpCode::ForceToken => self.genop_force_token(op),
+                OpCode::Strlen | OpCode::Unicodelen => self.genop_strlen(op),
+                OpCode::Strgetitem | OpCode::Unicodegetitem => self.genop_strgetitem(op),
 
-                    // ---- Misc ops with result ----
-                    OpCode::IntForceGeZero => {
-                        // result = max(arg0, 0)
-                        self.load_arg_to_rax(op.arg(0));
-                        #[cfg(target_arch = "x86_64")]
-                        dynasm!(self.mc ; .arch x64
-                            ; test rax, rax
-                            ; jge >pos
-                            ; xor rax, rax
-                            ; pos:
-                        );
-                        #[cfg(target_arch = "aarch64")]
-                        dynasm!(self.mc ; .arch aarch64
-                            ; cmp x0, 0
-                            ; csel x0, x0, xzr, ge
-                        );
-                        self.store_rax_to_result(op.pos);
-                    }
+                // ---- Overflow checks (guards handle by is_guard) ----
 
-                    // ---- GC write barrier (discard — no result) ----
-                    OpCode::CondCallGcWb | OpCode::CondCallGcWbArray => {
-                        // Write barrier — no-op for now (no GC integration)
-                    }
+                // ---- Misc ops with result ----
+                OpCode::IntForceGeZero => {
+                    // result = max(arg0, 0)
+                    self.load_arg_to_rax(op.arg(0));
+                    #[cfg(target_arch = "x86_64")]
+                    dynasm!(self.mc ; .arch x64
+                        ; test rax, rax
+                        ; jge >pos
+                        ; xor rax, rax
+                        ; pos:
+                    );
+                    #[cfg(target_arch = "aarch64")]
+                    dynasm!(self.mc ; .arch aarch64
+                        ; cmp x0, 0
+                        ; csel x0, x0, xzr, ge
+                    );
+                    self.store_rax_to_result(op.pos);
+                }
 
-                    // ---- Ops that produce no result (discard) ----
-                    OpCode::JitDebug | OpCode::DebugMergePoint => {
-                        // No-op ops — nothing to emit
-                    }
+                // ---- Integer arithmetic (extended) ----
+                OpCode::IntFloorDiv => self.genop_int_floordiv(op),
+                OpCode::IntMod => self.genop_int_mod(op),
+                OpCode::UintMulHigh => self.genop_uint_mul_high(op),
+                OpCode::IntSignext => self.genop_int_signext(op),
 
-                    _ => {
-                        // Unhandled opcode — emit trap for debugging
-                        #[cfg(debug_assertions)]
-                        eprintln!("[dynasm] WARNING: unhandled opcode {:?}", op.opcode);
-                    }
+                // ---- Float (extended) ----
+                OpCode::FloatAbs => self.genop_float_abs(op),
+                OpCode::FloatLt
+                | OpCode::FloatLe
+                | OpCode::FloatEq
+                | OpCode::FloatNe
+                | OpCode::FloatGt
+                | OpCode::FloatGe => self.genop_float_cmp(op),
+                OpCode::CastFloatToSinglefloat => {
+                    self.genop_cast_float_to_singlefloat(op);
+                }
+                OpCode::CastSinglefloatToFloat => {
+                    self.genop_cast_singlefloat_to_float(op);
+                }
+                OpCode::ConvertFloatBytesToLonglong | OpCode::ConvertLonglongBytesToFloat => {
+                    // Bit reinterpretation — identity in frame-slot model
+                    self.genop_same_as(op);
+                }
+
+                // ---- Identity / cast ----
+                OpCode::CastPtrToInt | OpCode::CastIntToPtr | OpCode::CastOpaquePtr => {
+                    self.genop_same_as(op)
+                }
+                OpCode::LoadFromGcTable => self.genop_same_as(op),
+
+                // ---- GC memory operations ----
+                OpCode::GcLoadI | OpCode::GcLoadR | OpCode::GcLoadF => self.genop_gc_load(op),
+                OpCode::GcLoadIndexedI | OpCode::GcLoadIndexedR | OpCode::GcLoadIndexedF => {
+                    self.genop_gc_load_indexed(op);
+                }
+                OpCode::GcStore => self.genop_discard_gc_store(op),
+                OpCode::GcStoreIndexed => self.genop_discard_gc_store_indexed(op),
+                OpCode::RawLoadI | OpCode::RawLoadF => self.genop_raw_load(op),
+                OpCode::RawStore => self.genop_discard_raw_store(op),
+
+                // ---- Interior field ops ----
+                OpCode::GetinteriorfieldGcI
+                | OpCode::GetinteriorfieldGcR
+                | OpCode::GetinteriorfieldGcF => {
+                    self.genop_getinteriorfield(op);
+                }
+                OpCode::SetinteriorfieldGc | OpCode::SetinteriorfieldRaw => {
+                    self.genop_discard_setinteriorfield(op);
+                }
+
+                // ---- Call variants ----
+                OpCode::CallPureI
+                | OpCode::CallPureR
+                | OpCode::CallPureF
+                | OpCode::CallPureN
+                | OpCode::CallLoopinvariantI
+                | OpCode::CallLoopinvariantR
+                | OpCode::CallLoopinvariantF
+                | OpCode::CallLoopinvariantN
+                | OpCode::CallMayForceI
+                | OpCode::CallMayForceR
+                | OpCode::CallMayForceF
+                | OpCode::CallMayForceN
+                | OpCode::CallReleaseGilI
+                | OpCode::CallReleaseGilR
+                | OpCode::CallReleaseGilF
+                | OpCode::CallReleaseGilN => {
+                    self.genop_call(op);
+                }
+                OpCode::CondCallN => self.genop_discard_cond_call(op),
+                OpCode::CondCallValueI | OpCode::CondCallValueR => {
+                    self.genop_cond_call_value(op);
+                }
+
+                // ---- String/array operations ----
+                OpCode::Strsetitem | OpCode::Unicodesetitem => {
+                    self.genop_discard_strsetitem(op);
+                }
+                OpCode::Copystrcontent | OpCode::Copyunicodecontent => {
+                    self.genop_discard_copystrcontent(op);
+                }
+                OpCode::Newstr => self.genop_newstr(op),
+                OpCode::Newunicode => self.genop_newunicode(op),
+                OpCode::ZeroArray => self.genop_discard_zero_array(op),
+
+                // ---- Address computation ----
+                OpCode::LoadEffectiveAddress => {
+                    self.genop_load_effective_address(op);
+                }
+                OpCode::NurseryPtrIncrement => self.genop_int_add(op),
+
+                // ---- GC write barrier (no-op — no GC integration) ----
+                OpCode::CondCallGcWb | OpCode::CondCallGcWbArray => {}
+
+                // ---- No-op / hint ops ----
+                OpCode::JitDebug
+                | OpCode::DebugMergePoint
+                | OpCode::RecordExactClass
+                | OpCode::RecordExactValueR
+                | OpCode::RecordExactValueI
+                | OpCode::RecordKnownResult
+                | OpCode::QuasiimmutField
+                | OpCode::AssertNotNone
+                | OpCode::Keepalive
+                | OpCode::EnterPortalFrame
+                | OpCode::LeavePortalFrame
+                | OpCode::IncrementDebugCounter
+                | OpCode::VirtualRefFinish
+                | OpCode::ForceSpill => {}
+
+                // ---- Virtual refs (identity) ----
+                OpCode::VirtualRefR => self.genop_same_as(op),
+
+                // ---- Exception handling (assembler.py:1817-1853) ----
+                OpCode::SaveException => self.genop_save_exception(op),
+                OpCode::SaveExcClass => self.genop_save_exc_class(op),
+                OpCode::RestoreException => {
+                    // genop_discard_restore_exception — stub
+                }
+
+                _ => {
+                    #[cfg(debug_assertions)]
+                    eprintln!("[dynasm] WARNING: unhandled opcode {:?}", op.opcode);
                 }
             }
         }
@@ -939,55 +1109,55 @@ impl Assembler386 {
     // genop_* — overflow arithmetic (assembler.py:1413-1425)
     // ----------------------------------------------------------------
 
-    /// INT_ADD_OVF: result = arg0 + arg1, sets overflow flag.
-    /// The following GUARD_NO_OVERFLOW will check the flag.
+    /// assembler.py:1856 genop_int_add_ovf — delegates to genop_int_add,
+    /// then sets guard_success_cc = 'NO'. On x86, ADD always sets OF.
     fn genop_int_add_ovf(&mut self, op: &Op) {
-        self.load_arg_to_rax(op.arg(0));
-        self.load_arg_to_rcx(op.arg(1));
         #[cfg(target_arch = "x86_64")]
-        dynasm!(self.mc ; .arch x64 ; add rax, rcx);
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64 ; adds x0, x0, x1);
-        // Overflow flag is set — GUARD_NO_OVERFLOW/GUARD_OVERFLOW will read it.
-        self.guard_success_cc = Some(CC_NO); // "no overflow" = success
-        self.store_rax_to_result(op.pos);
-    }
-
-    /// INT_SUB_OVF: result = arg0 - arg1, sets overflow flag.
-    fn genop_int_sub_ovf(&mut self, op: &Op) {
-        self.load_arg_to_rax(op.arg(0));
-        self.load_arg_to_rcx(op.arg(1));
-        #[cfg(target_arch = "x86_64")]
-        dynasm!(self.mc ; .arch x64 ; sub rax, rcx);
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64 ; subs x0, x0, x1);
-        self.guard_success_cc = Some(CC_NO);
-        self.store_rax_to_result(op.pos);
-    }
-
-    /// INT_MUL_OVF: result = arg0 * arg1, sets overflow flag.
-    fn genop_int_mul_ovf(&mut self, op: &Op) {
-        self.load_arg_to_rax(op.arg(0));
-        self.load_arg_to_rcx(op.arg(1));
-        #[cfg(target_arch = "x86_64")]
-        dynasm!(self.mc
-            ; .arch x64
-            ; imul rax, rcx
-        );
+        self.genop_int_add(op); // ADD sets OF on x86
         #[cfg(target_arch = "aarch64")]
         {
-            // ARM64 doesn't have a direct overflow flag from MUL.
-            // Use SMULH to get the high 64 bits, compare with sign extension.
-            dynasm!(self.mc ; .arch aarch64
-                ; mul x2, x0, x1        // x2 = low result
-                ; smulh x3, x0, x1      // x3 = high bits
-                ; asr x4, x2, 63        // x4 = sign extension of low
-                ; cmp x3, x4            // overflow if high != sign_ext(low)
-                ; mov x0, x2            // result = low
-            );
+            self.load_arg_to_rax(op.arg(0));
+            self.load_arg_to_rcx(op.arg(1));
+            dynasm!(self.mc ; .arch aarch64 ; adds x0, x0, x1);
+            self.store_rax_to_result(op.pos);
         }
         self.guard_success_cc = Some(CC_NO);
-        self.store_rax_to_result(op.pos);
+    }
+
+    /// assembler.py:1860 genop_int_sub_ovf.
+    fn genop_int_sub_ovf(&mut self, op: &Op) {
+        #[cfg(target_arch = "x86_64")]
+        self.genop_int_sub(op);
+        #[cfg(target_arch = "aarch64")]
+        {
+            self.load_arg_to_rax(op.arg(0));
+            self.load_arg_to_rcx(op.arg(1));
+            dynasm!(self.mc ; .arch aarch64 ; subs x0, x0, x1);
+            self.store_rax_to_result(op.pos);
+        }
+        self.guard_success_cc = Some(CC_NO);
+    }
+
+    /// assembler.py:1864 genop_int_mul_ovf.
+    fn genop_int_mul_ovf(&mut self, op: &Op) {
+        #[cfg(target_arch = "x86_64")]
+        self.genop_int_mul(op); // IMUL sets OF on x86
+        #[cfg(target_arch = "aarch64")]
+        {
+            // ARM64: no direct overflow flag from MUL.
+            // Use SMULH to get high bits, compare with sign extension.
+            self.load_arg_to_rax(op.arg(0));
+            self.load_arg_to_rcx(op.arg(1));
+            dynasm!(self.mc ; .arch aarch64
+                ; mul x2, x0, x1
+                ; smulh x3, x0, x1
+                ; asr x4, x2, 63
+                ; cmp x3, x4
+                ; mov x0, x2
+            );
+            self.store_rax_to_result(op.pos);
+        }
+        self.guard_success_cc = Some(CC_NO);
     }
 
     // ----------------------------------------------------------------
@@ -1007,6 +1177,8 @@ impl Assembler386 {
             OpCode::UintLe => CC_BE,
             OpCode::UintGt => CC_A,
             OpCode::UintGe => CC_AE,
+            OpCode::PtrEq | OpCode::InstancePtrEq => CC_E,
+            OpCode::PtrNe | OpCode::InstancePtrNe => CC_NE,
             _ => CC_E, // fallback
         }
     }
@@ -1146,7 +1318,7 @@ impl Assembler386 {
     /// `expected_classptr_imm` is the immediate value of loc_classptr, used
     /// only by the gcremovetypeptr branch (RPython requires this to be an
     /// `ImmedLoc`).
-    fn emit_cmp_guard_class_rax_rcx(&mut self, expected_classptr_imm: Option<i64>) {
+    fn _cmp_guard_class(&mut self, expected_classptr_imm: Option<i64>) {
         if let Some(off_usize) = self.vtable_offset {
             // x86/assembler.py:1884-1885 vtable_offset path: full classptr CMP.
             #[cfg(target_arch = "x86_64")]
@@ -1253,8 +1425,30 @@ impl Assembler386 {
         fail_label
     }
 
-    /// Unified guard handler: dispatches to guard-specific code gen.
-    fn genop_guard(&mut self, op: &Op, fail_index: u32) {
+    /// assembler.py:2157 implement_guard — emit conditional jump to
+    /// failure stub and append guard token to pending list.
+    fn implement_guard(&mut self, op: &Op, fail_index: u32) {
+        let cc = self
+            .guard_success_cc
+            .take()
+            .expect("implement_guard: guard_success_cc not set");
+        let fail_cc = invert_cc(cc);
+        let fail_label = self.emit_guard_jcc(fail_cc);
+        // guard_success_cc is already None after .take()
+
+        self.append_guard_token(op, fail_index, fail_label);
+    }
+
+    /// Register a guard token without emitting a conditional jump.
+    /// assembler.py:1799-1806 genop_guard_guard_not_invalidated pattern.
+    fn implement_guard_nojump(&mut self, op: &Op, fail_index: u32) {
+        let fail_label = self.mc.new_dynamic_label();
+        self.append_guard_token(op, fail_index, fail_label);
+    }
+
+    /// Common tail: build DynasmFailDescr, create GuardToken, push to
+    /// pending_guard_tokens and fail_descrs.
+    fn append_guard_token(&mut self, op: &Op, fail_index: u32, fail_label: DynamicLabel) {
         let fail_arg_types = op
             .fail_arg_types
             .as_ref()
@@ -1264,11 +1458,56 @@ impl Assembler386 {
             fail_index,
             self.trace_id,
             fail_arg_types,
-            op.opcode == OpCode::Finish,
+            false,
         ));
+        let fail_args = op
+            .fail_args
+            .as_ref()
+            .map(|fa| fa.to_vec())
+            .unwrap_or_default();
+        let jump_offset = self.mc.offset();
+        self.pending_guard_tokens.push(GuardToken {
+            jump_offset,
+            fail_label,
+            fail_descr: descr.clone(),
+            fail_args,
+        });
+        self.fail_descrs.push(descr);
+    }
 
-        // regalloc.py:496-501 make_a_counter_per_value for GUARD_VALUE
-        if op.opcode == OpCode::GuardValue {
+    // ----------------------------------------------------------------
+    // assembler.py:1773 genop_guard_guard_true
+    // ----------------------------------------------------------------
+
+    /// assembler.py:1773 genop_guard_guard_true.
+    /// genop_guard_guard_nonnull = genop_guard_guard_true (alias)
+    /// genop_guard_guard_no_overflow = genop_guard_guard_true (alias)
+    fn genop_guard_guard_true(&mut self, op: &Op, fail_index: u32) {
+        self.implement_guard(op, fail_index);
+    }
+
+    /// assembler.py:1777 genop_guard_guard_false.
+    /// genop_guard_guard_isnull = genop_guard_guard_false (alias)
+    /// genop_guard_guard_overflow = genop_guard_guard_false (alias)
+    fn genop_guard_guard_false(&mut self, op: &Op, fail_index: u32) {
+        self.guard_success_cc = Some(invert_cc(self.guard_success_cc.take().unwrap_or(CC_NE)));
+        self.implement_guard(op, fail_index);
+    }
+
+    /// assembler.py:1871 genop_guard_guard_value.
+    fn genop_guard_guard_value(&mut self, op: &Op, fail_index: u32) {
+        self.load_arg_to_rax(op.arg(0));
+        self.load_arg_to_rcx(op.arg(1));
+        #[cfg(target_arch = "x86_64")]
+        dynasm!(self.mc ; .arch x64 ; cmp rax, rcx);
+        #[cfg(target_arch = "aarch64")]
+        dynasm!(self.mc ; .arch aarch64 ; cmp x0, x1);
+
+        self.guard_success_cc = Some(CC_E);
+        self.implement_guard(op, fail_index);
+
+        // regalloc.py:496-501 make_a_counter_per_value
+        if let Some(descr) = self.fail_descrs.last() {
             if let Some(fa) = op.fail_args.as_ref() {
                 let arg0 = op.arg(0);
                 if let Some(idx) = fa.iter().position(|&r| r == arg0) {
@@ -1281,150 +1520,72 @@ impl Assembler386 {
                 }
             }
         }
+    }
 
-        // Emit the guard check and conditional jump.
-        let _fail_label = match op.opcode {
-            OpCode::GuardTrue | OpCode::VecGuardTrue => {
-                // Guard succeeds if the condition is true.
-                // Jump to recovery if the condition is FALSE (inverted).
-                let cc = self.guard_success_cc.take().unwrap_or(CC_NE);
-                let fail_cc = invert_cc(cc);
-                self.emit_guard_jcc(fail_cc)
-            }
-            OpCode::GuardFalse | OpCode::VecGuardFalse => {
-                // Guard succeeds if the condition is false.
-                // Jump to recovery if the condition is TRUE.
-                let cc = self.guard_success_cc.take().unwrap_or(CC_NE);
-                self.emit_guard_jcc(cc)
-            }
-            OpCode::GuardValue => {
-                // CMP arg0, arg1; JNE recovery
-                self.load_arg_to_rax(op.arg(0));
-                self.load_arg_to_rcx(op.arg(1));
-                #[cfg(target_arch = "x86_64")]
-                dynasm!(self.mc
-                    ; .arch x64
-                    ; cmp rax, rcx
-                );
-                #[cfg(target_arch = "aarch64")]
-                dynasm!(self.mc ; .arch aarch64
-                    ; cmp x0, x1
-                );
-                self.emit_guard_jcc(CC_NE)
-            }
-            OpCode::GuardNonnull => {
-                // TEST arg0, arg0; JZ recovery
-                self.load_arg_to_rax(op.arg(0));
-                #[cfg(target_arch = "x86_64")]
-                dynasm!(self.mc
-                    ; .arch x64
-                    ; test rax, rax
-                );
-                #[cfg(target_arch = "aarch64")]
-                dynasm!(self.mc ; .arch aarch64
-                    ; cmp x0, 0
-                );
-                self.emit_guard_jcc(CC_E)
-            }
-            OpCode::GuardIsnull => {
-                // TEST arg0, arg0; JNZ recovery
-                self.load_arg_to_rax(op.arg(0));
-                #[cfg(target_arch = "x86_64")]
-                dynasm!(self.mc
-                    ; .arch x64
-                    ; test rax, rax
-                );
-                #[cfg(target_arch = "aarch64")]
-                dynasm!(self.mc ; .arch aarch64
-                    ; cmp x0, 0
-                );
-                self.emit_guard_jcc(CC_NE)
-            }
-            OpCode::GuardNonnullClass => {
-                // TEST arg0, arg0; JZ recovery
-                // Then _cmp_guard_class via vtable_offset; JNE recovery
-                self.load_arg_to_rax(op.arg(0));
-                #[cfg(target_arch = "x86_64")]
-                dynasm!(self.mc
-                    ; .arch x64
-                    ; test rax, rax
-                );
-                #[cfg(target_arch = "aarch64")]
-                dynasm!(self.mc ; .arch aarch64
-                    ; cmp x0, 0
-                );
-                let fail_label = self.emit_guard_jcc(CC_E);
-                // x86/assembler.py:1887 assert isinstance(loc_classptr, ImmedLoc)
-                let expected_classptr_imm = match self.resolve_opref(op.arg(1)) {
-                    ResolvedArg::Const(v) => Some(v),
-                    _ => None,
-                };
-                self.load_arg_to_rax(op.arg(0));
-                self.load_arg_to_rcx(op.arg(1));
-                self.emit_cmp_guard_class_rax_rcx(expected_classptr_imm);
-                #[cfg(target_arch = "x86_64")]
-                dynasm!(self.mc ; .arch x64 ; jne =>fail_label);
-                #[cfg(target_arch = "aarch64")]
-                dynasm!(self.mc ; .arch aarch64 ; b.ne =>fail_label);
-                fail_label
-            }
-            OpCode::GuardClass => {
-                // x86/assembler.py:1880-1891 _cmp_guard_class:
-                //   offset = self.cpu.vtable_offset
-                //   if offset is not None:
-                //       CMP(mem(loc_ptr, offset), loc_classptr)
-                //   else: _cmp_guard_gc_type(...)
-                let expected_classptr_imm = match self.resolve_opref(op.arg(1)) {
-                    ResolvedArg::Const(v) => Some(v),
-                    _ => None,
-                };
-                self.load_arg_to_rax(op.arg(0));
-                self.load_arg_to_rcx(op.arg(1));
-                self.emit_cmp_guard_class_rax_rcx(expected_classptr_imm);
-                self.emit_guard_jcc(CC_NE)
-            }
-            OpCode::GuardNoException
-            | OpCode::GuardNotInvalidated
-            | OpCode::GuardNotForced
-            | OpCode::GuardNotForced2 => {
-                // These guards check runtime state that isn't represented in
-                // the frame-only model yet. Emit a NOP-style guard that always
-                // succeeds for now (no conditional jump). The recovery stub is
-                // still registered so bridges can be attached.
-                let fail_label = self.mc.new_dynamic_label();
-                // No jump emitted — guard always passes.
-                fail_label
-            }
-            OpCode::GuardOverflow => {
-                // Jump to recovery on overflow.
-                self.emit_guard_jcc(CC_O)
-            }
-            OpCode::GuardNoOverflow => {
-                // Jump to recovery on overflow (inverted: guard succeeds if no overflow).
-                self.emit_guard_jcc(CC_O)
-            }
-            _ => {
-                // Unknown guard — no-op, register stub anyway.
-                let fail_label = self.mc.new_dynamic_label();
-                fail_label
-            }
+    /// assembler.py:1903 genop_guard_guard_class.
+    fn genop_guard_guard_class(&mut self, op: &Op, fail_index: u32) {
+        let expected_classptr_imm = match self.resolve_opref(op.arg(1)) {
+            ResolvedArg::Const(v) => Some(v),
+            _ => None,
         };
+        self.load_arg_to_rax(op.arg(0));
+        self.load_arg_to_rcx(op.arg(1));
+        self._cmp_guard_class(expected_classptr_imm);
+        self.guard_success_cc = Some(CC_E);
+        self.implement_guard(op, fail_index);
+    }
 
-        // Collect fail_args for recovery.
-        let fail_args = op
-            .fail_args
-            .as_ref()
-            .map(|fa| fa.to_vec())
-            .unwrap_or_default();
+    /// assembler.py:1908 genop_guard_guard_nonnull_class.
+    /// CMP(locs[0], imm1); JB → fail; _cmp_guard_class; JNE → fail
+    fn genop_guard_guard_nonnull_class(&mut self, op: &Op, fail_index: u32) {
+        self.load_arg_to_rax(op.arg(0));
+        // assembler.py:1909 CMP(locs[0], imm1) — JB catches NULL (0)
+        #[cfg(target_arch = "x86_64")]
+        dynasm!(self.mc ; .arch x64 ; cmp rax, 1);
+        #[cfg(target_arch = "aarch64")]
+        dynasm!(self.mc ; .arch aarch64 ; cmp x0, 1);
 
-        let jump_offset = self.mc.offset();
-        self.pending_guard_tokens.push(GuardToken {
-            jump_offset,
-            fail_label: _fail_label,
-            fail_descr: descr.clone(),
-            fail_args,
-        });
-        self.fail_descrs.push(descr);
+        // assembler.py:1911 emit_forward_jump('B') — jump if below (NULL)
+        let fail_label = self.emit_guard_jcc(CC_B);
+
+        let expected_classptr_imm = match self.resolve_opref(op.arg(1)) {
+            ResolvedArg::Const(v) => Some(v),
+            _ => None,
+        };
+        self.load_arg_to_rax(op.arg(0));
+        self.load_arg_to_rcx(op.arg(1));
+        self._cmp_guard_class(expected_classptr_imm);
+
+        // assembler.py:1914 patch_forward_jump — both paths share the
+        // same fail_label, so a second JNE to the same target suffices.
+        #[cfg(target_arch = "x86_64")]
+        dynasm!(self.mc ; .arch x64 ; jne =>fail_label);
+        #[cfg(target_arch = "aarch64")]
+        dynasm!(self.mc ; .arch aarch64 ; b.ne =>fail_label);
+
+        // assembler.py:1916-1917
+        // guard_success_cc is not used here — we already emitted the jumps.
+        // Manually append the guard token.
+        self.append_guard_token(op, fail_index, fail_label);
+    }
+
+    /// assembler.py:1782 genop_guard_guard_no_exception.
+    /// Stub: no exception tracking yet.
+    fn genop_guard_guard_no_exception(&mut self, op: &Op, fail_index: u32) {
+        self.implement_guard_nojump(op, fail_index);
+    }
+
+    /// assembler.py:1799 genop_guard_guard_not_invalidated.
+    /// Does NOT emit a conditional jump — records position for external
+    /// invalidation patching.
+    fn genop_guard_guard_not_invalidated(&mut self, op: &Op, fail_index: u32) {
+        self.implement_guard_nojump(op, fail_index);
+    }
+
+    /// assembler.py:2228 genop_guard_guard_not_forced.
+    /// Stub: no force-token tracking yet.
+    fn genop_guard_guard_not_forced(&mut self, op: &Op, fail_index: u32) {
+        self.implement_guard_nojump(op, fail_index);
     }
 
     // ----------------------------------------------------------------
@@ -1542,12 +1703,16 @@ impl Assembler386 {
             .as_ref()
             .map(|ts| ts.clone())
             .unwrap_or_default();
+        // compile.py:665-674 parity: use global singleton for Finish descr.
         let descr = Arc::new(DynasmFailDescr::new(
             fail_index,
             self.trace_id,
             fail_arg_types,
             true,
         ));
+        // Finish ops write the GLOBAL singleton pointer to jf_descr
+        // so CALL_ASSEMBLER's fast path CMP always matches.
+        let global_descr_ptr = crate::guard::done_with_this_frame_descr_ptr() as i64;
 
         // If there's a result argument, store it to jf_frame[0].
         if op.num_args() > 0 {
@@ -1566,7 +1731,8 @@ impl Assembler386 {
         }
 
         // Store descr pointer at jf_ptr[0] (jf_descr slot).
-        let descr_ptr = Arc::as_ptr(&descr) as i64;
+        // compile.py:665-674 parity: use global singleton pointer.
+        let descr_ptr = global_descr_ptr;
         #[cfg(target_arch = "x86_64")]
         dynasm!(self.mc
             ; .arch x64
@@ -1885,7 +2051,7 @@ impl Assembler386 {
     }
 
     /// SETFIELD_GC: [arg0 + offset] = arg1
-    fn genop_setfield(&mut self, op: &Op) {
+    fn genop_discard_setfield(&mut self, op: &Op) {
         let offset = Self::field_offset_from_descr(op);
         let size = Self::field_size_from_descr(op);
 
@@ -2019,7 +2185,7 @@ impl Assembler386 {
 
     /// SETARRAYITEM_GC: array[index] = value
     /// arg0 = array pointer, arg1 = index, arg2 = value.
-    fn genop_setarrayitem(&mut self, op: &Op) {
+    fn genop_discard_setarrayitem(&mut self, op: &Op) {
         let (base_size, item_size) = op
             .descr
             .as_ref()
@@ -2159,34 +2325,23 @@ impl Assembler386 {
     // x86/assembler.py:2230 _genop_call
     // ----------------------------------------------------------------
 
-    /// CALL_*: invoke a function via the calling convention.
-    /// arg0 = function pointer, arg1.. = arguments.
-    /// The CallDescr from op.descr provides argument/result types.
-    fn genop_call(&mut self, op: &Op) {
+    /// Emit a function call. `func_arg` is the index of the function
+    /// pointer arg; call arguments start at `func_arg + 1`.
+    fn emit_call(&mut self, op: &Op, func_arg: usize) {
         let arg_count = op.num_args();
-        // arg0 is the function pointer.
-        // arg1..N are the call arguments.
 
-        // Save frame pointer before call (callee may clobber it).
         #[cfg(target_arch = "x86_64")]
-        dynasm!(self.mc
-            ; .arch x64
-            ; push rbp
-        );
+        dynasm!(self.mc ; .arch x64 ; push rbp);
         #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64
-            ; stp x29, x30, [sp, #-16]!
-        );
+        dynasm!(self.mc ; .arch aarch64 ; stp x29, x30, [sp, #-16]!);
 
-        // Load arguments into ABI registers.
-        // x64: rdi, rsi, rdx, rcx, r8, r9
-        // aarch64: x0-x7
-        for i in 1..arg_count.min(7) {
+        for i in (func_arg + 1)..arg_count.min(func_arg + 7) {
             let arg = op.arg(i);
+            let abi_idx = i - func_arg - 1;
             match self.resolve_opref(arg) {
                 ResolvedArg::Slot(offset) => {
                     #[cfg(target_arch = "x86_64")]
-                    match i - 1 {
+                    match abi_idx {
                         0 => dynasm!(self.mc ; .arch x64 ; mov rdi, [rbp + offset]),
                         1 => dynasm!(self.mc ; .arch x64 ; mov rsi, [rbp + offset]),
                         2 => dynasm!(self.mc ; .arch x64 ; mov rdx, [rbp + offset]),
@@ -2197,7 +2352,7 @@ impl Assembler386 {
                     }
                     #[cfg(target_arch = "aarch64")]
                     {
-                        let reg = (i - 1) as u8;
+                        let reg = abi_idx as u8;
                         dynasm!(self.mc ; .arch aarch64
                             ; ldr X(reg), [x29, offset as u32]
                         );
@@ -2205,7 +2360,7 @@ impl Assembler386 {
                 }
                 ResolvedArg::Const(val) => {
                     #[cfg(target_arch = "x86_64")]
-                    match i - 1 {
+                    match abi_idx {
                         0 => dynasm!(self.mc ; .arch x64 ; mov rdi, QWORD val as i64),
                         1 => dynasm!(self.mc ; .arch x64 ; mov rsi, QWORD val as i64),
                         2 => dynasm!(self.mc ; .arch x64 ; mov rdx, QWORD val as i64),
@@ -2216,19 +2371,17 @@ impl Assembler386 {
                     }
                     #[cfg(target_arch = "aarch64")]
                     {
-                        let reg = (i - 1) as u32;
+                        let reg = abi_idx as u32;
                         self.emit_mov_imm64(reg, val);
                     }
                 }
             }
         }
 
-        // Load function pointer into rax/x8 and call.
-        match self.resolve_opref(op.arg(0)) {
+        match self.resolve_opref(op.arg(func_arg)) {
             ResolvedArg::Slot(offset) => {
                 #[cfg(target_arch = "x86_64")]
-                dynasm!(self.mc
-                    ; .arch x64
+                dynasm!(self.mc ; .arch x64
                     ; mov rax, [rbp + offset]
                     ; call rax
                 );
@@ -2240,47 +2393,199 @@ impl Assembler386 {
             }
             ResolvedArg::Const(val) => {
                 #[cfg(target_arch = "x86_64")]
-                dynasm!(self.mc
-                    ; .arch x64
+                dynasm!(self.mc ; .arch x64
                     ; mov rax, QWORD val as i64
                     ; call rax
                 );
                 #[cfg(target_arch = "aarch64")]
                 {
                     self.emit_mov_imm64(8, val);
-                    dynasm!(self.mc ; .arch aarch64
-                        ; blr x8
-                    );
+                    dynasm!(self.mc ; .arch aarch64 ; blr x8);
                 }
             }
         }
 
-        // Restore frame pointer after call.
         #[cfg(target_arch = "x86_64")]
-        dynasm!(self.mc
-            ; .arch x64
-            ; pop rbp
-        );
+        dynasm!(self.mc ; .arch x64 ; pop rbp);
         #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64
-            ; ldp x19, x20, [sp, #16]
-            ; ldp x29, x30, [sp], #32
-        );
+        dynasm!(self.mc ; .arch aarch64 ; ldp x29, x30, [sp], #16);
+    }
 
-        // Store return value (in rax/x0) to result slot.
+    /// assembler.py:2176 _genop_call — internal call implementation.
+    fn _genop_call(&mut self, op: &Op) {
+        self.emit_call(op, 0);
+    }
+
+    /// assembler.py:2169-2174 _genop_real_call.
+    /// genop_call_i = genop_call_r = genop_call_f = genop_call_n
+    fn genop_call(&mut self, op: &Op) {
+        self._genop_call(op);
         if !op.pos.is_none() {
             self.store_rax_to_result(op.pos);
         }
     }
 
-    /// CALL_ASSEMBLER_*: invoke a compiled JIT loop.
-    /// Similar to CALL but targets a JIT-compiled trace.
-    /// For now, implemented identically to genop_call.
+    /// assembler.py:295-360 call_assembler: invoke a compiled JIT loop.
+    ///
+    /// RPython fast path (assembler.py:295-360):
+    ///   1. _call_assembler_emit_call — call the target trace
+    ///   2. _call_assembler_check_descr — CMP jf_descr == done_with_this_frame_descr
+    ///   3. Path A (slow): call assembler_helper
+    ///   4. Path B (fast): MOV result, [frame + ofs]
+    ///   5. join paths
     fn genop_call_assembler(&mut self, op: &Op) {
-        // CALL_ASSEMBLER passes jf_ptr as the sole argument to the
-        // target trace. The target trace returns jf_ptr.
-        // For now, delegate to the general call mechanism.
-        self.genop_call(op);
+        let descr = op.descr.as_ref().and_then(|d| d.as_call_descr());
+        let target_token = descr.and_then(|cd| cd.call_target_token()).unwrap_or(0);
+
+        // Allocate a temporary jitframe on the stack for the callee.
+        // Layout: [jf_descr, frame[0], frame[1], ...]
+        let num_args = op.args.len();
+        let jf_words = 1 + num_args.max(8); // 1 for jf_descr + frame slots
+        // Align to 16 bytes for ABI compliance before CALL.
+        let jf_bytes = (((jf_words * 8) + 15) & !15) as i32;
+
+        // Store callee args to the temp jitframe.
+        // The temp jf is on the machine stack: rsp-based.
+        #[cfg(target_arch = "x86_64")]
+        dynasm!(self.mc ; .arch x64
+            ; sub rsp, jf_bytes       // allocate temp jitframe on stack
+        );
+        #[cfg(target_arch = "aarch64")]
+        dynasm!(self.mc ; .arch aarch64
+            ; sub sp, sp, jf_bytes as u32
+        );
+
+        // Zero the jf_descr slot.
+        #[cfg(target_arch = "x86_64")]
+        dynasm!(self.mc ; .arch x64
+            ; mov QWORD [rsp], 0      // jf_descr = 0
+        );
+        #[cfg(target_arch = "aarch64")]
+        dynasm!(self.mc ; .arch aarch64
+            ; str xzr, [sp]
+        );
+
+        // Store each arg at jf_frame[i] = rsp + (1+i)*8.
+        for (i, &arg_ref) in op.args.iter().enumerate() {
+            let dest_offset = ((1 + i) * 8) as i32;
+            self.load_arg_to_rax(arg_ref);
+            #[cfg(target_arch = "x86_64")]
+            dynasm!(self.mc ; .arch x64
+                ; mov [rsp + dest_offset], rax
+            );
+            #[cfg(target_arch = "aarch64")]
+            dynasm!(self.mc ; .arch aarch64
+                ; str x0, [sp, dest_offset as u32]
+            );
+        }
+
+        // Save caller's jf_ptr (rbp) in a callee-saved register.
+        // RPython: EBP is the jitframe pointer throughout.
+        #[cfg(target_arch = "x86_64")]
+        dynasm!(self.mc ; .arch x64
+            ; mov r12, rbp            // save caller's jf_ptr in r12
+            ; lea rdi, [rsp]          // rdi = temp jf ptr
+        );
+        #[cfg(target_arch = "aarch64")]
+        dynasm!(self.mc ; .arch aarch64
+            ; mov x19, x29            // save caller's jf_ptr
+            ; mov x0, sp              // x0 = temp jf ptr
+        );
+
+        // _call_assembler_emit_call (assembler.py:2267-2269):
+        // Call the target trace's entry point via DynamicLabel.
+        // Self-recursion: call the same code buffer's entry (relative).
+        if let Some(label) = self.self_entry_label {
+            #[cfg(target_arch = "x86_64")]
+            dynasm!(self.mc ; .arch x64
+                ; call =>label
+            );
+            #[cfg(target_arch = "aarch64")]
+            dynasm!(self.mc ; .arch aarch64
+                ; bl =>label
+            );
+        } else {
+            // Non-self-recursive: would need dispatch table lookup.
+            // Placeholder — trap for now.
+            #[cfg(target_arch = "x86_64")]
+            dynasm!(self.mc ; .arch x64 ; ud2);
+            #[cfg(target_arch = "aarch64")]
+            dynasm!(self.mc ; .arch aarch64 ; brk 0);
+        }
+        // Result: rax/x0 = callee's returned jf_ptr.
+
+        // Restore caller's jf_ptr from callee-saved register.
+        #[cfg(target_arch = "x86_64")]
+        dynasm!(self.mc ; .arch x64
+            ; mov rbp, r12            // restore caller's jf_ptr
+        );
+        #[cfg(target_arch = "aarch64")]
+        dynasm!(self.mc ; .arch aarch64
+            ; mov x29, x19            // restore
+        );
+
+        // _call_assembler_check_descr (assembler.py:2274-2278):
+        //   CMP [rax + jf_descr_ofs], done_with_this_frame_descr
+        //   JE fast_path
+        // rax = callee's returned jf_ptr. jf_descr is at offset 0.
+        let done_descr_ptr = crate::guard::done_with_this_frame_descr_ptr() as i64;
+        #[cfg(target_arch = "x86_64")]
+        {
+            let fast_path = self.mc.new_dynamic_label();
+            let merge = self.mc.new_dynamic_label();
+            dynasm!(self.mc ; .arch x64
+                ; mov rcx, [rax]                    // rcx = jf_descr
+                ; mov rdx, QWORD done_descr_ptr     // rdx = done_with_this_frame_descr
+                ; cmp rcx, rdx
+                ; je =>fast_path
+            );
+
+            // Path A (slow): callee didn't finish. Use extern helper.
+            // For now: return 0 (we'll implement assembler_helper later).
+            dynasm!(self.mc ; .arch x64
+                ; xor eax, eax                      // result = 0
+                ; jmp =>merge
+            );
+
+            // Path B (fast): _call_assembler_load_result (assembler.py:2291-2303)
+            //   MOV rax, [rax + ofs] — load from dead frame at index 0.
+            dynasm!(self.mc ; .arch x64
+                ; =>fast_path
+                ; mov rax, [rax + 8]                // result = jf_frame[0]
+                ; =>merge
+            );
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            let fast_path = self.mc.new_dynamic_label();
+            let merge = self.mc.new_dynamic_label();
+            self.emit_mov_imm64(2, done_descr_ptr);
+            dynasm!(self.mc ; .arch aarch64
+                ; ldr x1, [x0]                      // x1 = jf_descr
+                ; cmp x1, x2
+                ; b.eq =>fast_path
+                ; mov x0, 0                          // slow path: result = 0
+                ; b =>merge
+                ; =>fast_path
+                ; ldr x0, [x0, 8]                    // result = jf_frame[0]
+                ; =>merge
+            );
+        }
+
+        // Deallocate temp jitframe.
+        #[cfg(target_arch = "x86_64")]
+        dynasm!(self.mc ; .arch x64
+            ; add rsp, jf_bytes
+        );
+        #[cfg(target_arch = "aarch64")]
+        dynasm!(self.mc ; .arch aarch64
+            ; add sp, sp, jf_bytes as u32
+        );
+
+        // Store result to the output slot.
+        if !op.pos.is_none() {
+            self.store_rax_to_result(op.pos);
+        }
     }
 
     // ----------------------------------------------------------------
@@ -2412,18 +2717,13 @@ impl Assembler386 {
 
     /// NEW_ARRAY / NEW_ARRAY_CLEAR: allocate an array.
     fn genop_new_array(&mut self, op: &Op) {
-        #[cfg(target_arch = "x86_64")]
-        dynasm!(self.mc
-            ; .arch x64
-            ; ud2
-        );
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64
-            ; brk 0
-        );
-        if !op.pos.is_none() {
-            let _ = self.allocate_slot(op.pos);
-        }
+        let (base_size, item_size) = op
+            .descr
+            .as_ref()
+            .and_then(|d| d.as_array_descr())
+            .map(|ad| (ad.base_size() as i64, ad.item_size() as i64))
+            .unwrap_or((8, 8));
+        self.genop_alloc_varsize(op, base_size, item_size);
     }
 
     // ----------------------------------------------------------------
@@ -2546,6 +2846,944 @@ impl Assembler386 {
                 _ => dynasm!(self.mc ; .arch aarch64
                     ; ldr x0, [x0]
                 ),
+            }
+        }
+
+        self.store_rax_to_result(op.pos);
+    }
+
+    // ================================================================
+    // assembler.py:1817 genop_save_exc_class / genop_save_exception
+    // ================================================================
+
+    /// assembler.py:1817 genop_save_exc_class — stub: returns 0.
+    fn genop_save_exc_class(&mut self, op: &Op) {
+        #[cfg(target_arch = "x86_64")]
+        dynasm!(self.mc ; .arch x64 ; xor eax, eax);
+        #[cfg(target_arch = "aarch64")]
+        dynasm!(self.mc ; .arch aarch64 ; mov x0, 0);
+        if !op.pos.is_none() {
+            self.store_rax_to_result(op.pos);
+        }
+    }
+
+    /// assembler.py:1827 genop_save_exception — stub: returns 0.
+    fn genop_save_exception(&mut self, op: &Op) {
+        #[cfg(target_arch = "x86_64")]
+        dynasm!(self.mc ; .arch x64 ; xor eax, eax);
+        #[cfg(target_arch = "aarch64")]
+        dynasm!(self.mc ; .arch aarch64 ; mov x0, 0);
+        if !op.pos.is_none() {
+            self.store_rax_to_result(op.pos);
+        }
+    }
+
+    // ================================================================
+    // genop_* — extended integer arithmetic
+    // ================================================================
+
+    /// INT_FLOORDIV: result = arg0 / arg1 (signed)
+    fn genop_int_floordiv(&mut self, op: &Op) {
+        self.load_arg_to_rax(op.arg(0));
+        self.load_arg_to_rcx(op.arg(1));
+        #[cfg(target_arch = "x86_64")]
+        dynasm!(self.mc ; .arch x64
+            ; cqo
+            ; idiv rcx
+        );
+        #[cfg(target_arch = "aarch64")]
+        dynasm!(self.mc ; .arch aarch64
+            ; sdiv x0, x0, x1
+        );
+        self.store_rax_to_result(op.pos);
+    }
+
+    /// INT_MOD: result = arg0 % arg1 (signed)
+    fn genop_int_mod(&mut self, op: &Op) {
+        self.load_arg_to_rax(op.arg(0));
+        self.load_arg_to_rcx(op.arg(1));
+        #[cfg(target_arch = "x86_64")]
+        dynasm!(self.mc ; .arch x64
+            ; cqo
+            ; idiv rcx
+            ; mov rax, rdx
+        );
+        #[cfg(target_arch = "aarch64")]
+        dynasm!(self.mc ; .arch aarch64
+            ; sdiv x2, x0, x1
+            ; msub x0, x2, x1, x0
+        );
+        self.store_rax_to_result(op.pos);
+    }
+
+    /// UINT_MUL_HIGH: upper 64 bits of unsigned multiply
+    fn genop_uint_mul_high(&mut self, op: &Op) {
+        self.load_arg_to_rax(op.arg(0));
+        self.load_arg_to_rcx(op.arg(1));
+        #[cfg(target_arch = "x86_64")]
+        dynasm!(self.mc ; .arch x64
+            ; mul rcx
+            ; mov rax, rdx
+        );
+        #[cfg(target_arch = "aarch64")]
+        dynasm!(self.mc ; .arch aarch64
+            ; umulh x0, x0, x1
+        );
+        self.store_rax_to_result(op.pos);
+    }
+
+    /// INT_SIGNEXT: sign-extend from num_bytes width to 64 bits.
+    fn genop_int_signext(&mut self, op: &Op) {
+        self.load_arg_to_rax(op.arg(0));
+        let num_bytes = match self.resolve_opref(op.arg(1)) {
+            ResolvedArg::Const(v) => v,
+            _ => 8,
+        };
+        let shift = 64 - num_bytes * 8;
+        if shift > 0 && shift < 64 {
+            let sh = shift as u8;
+            #[cfg(target_arch = "x86_64")]
+            dynasm!(self.mc ; .arch x64
+                ; shl rax, sh
+                ; sar rax, sh
+            );
+            #[cfg(target_arch = "aarch64")]
+            {
+                let sh32 = shift as u32;
+                dynasm!(self.mc ; .arch aarch64
+                    ; lsl x0, x0, sh32
+                    ; asr x0, x0, sh32
+                );
+            }
+        }
+        self.store_rax_to_result(op.pos);
+    }
+
+    // ================================================================
+    // genop_* — extended float operations
+    // ================================================================
+
+    /// FLOAT_ABS: result = |arg0|
+    fn genop_float_abs(&mut self, op: &Op) {
+        self.load_float_arg_to_d0(op.arg(0));
+        #[cfg(target_arch = "x86_64")]
+        {
+            let mask: i64 = i64::MAX; // 0x7FFF_FFFF_FFFF_FFFF
+            dynasm!(self.mc ; .arch x64
+                ; mov rax, QWORD mask
+                ; movq xmm1, rax
+                ; andpd xmm0, xmm1
+            );
+        }
+        #[cfg(target_arch = "aarch64")]
+        dynasm!(self.mc ; .arch aarch64
+            ; fabs d0, d0
+        );
+        self.store_d0_to_result(op.pos);
+    }
+
+    /// FLOAT_LT/LE/EQ/NE/GT/GE: float comparison.
+    /// For lt/le, swap operands so JA/JAE handles NaN correctly.
+    fn genop_float_cmp(&mut self, op: &Op) {
+        let swap = matches!(op.opcode, OpCode::FloatLt | OpCode::FloatLe);
+        if swap {
+            self.load_float_arg_to_d0(op.arg(1));
+            self.load_float_arg_to_d1(op.arg(0));
+        } else {
+            self.load_float_arg_to_d0(op.arg(0));
+            self.load_float_arg_to_d1(op.arg(1));
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            dynasm!(self.mc ; .arch x64 ; ucomisd xmm0, xmm1);
+            match op.opcode {
+                OpCode::FloatLt | OpCode::FloatGt => {
+                    dynasm!(self.mc ; .arch x64 ; seta al ; movzx eax, al);
+                }
+                OpCode::FloatLe | OpCode::FloatGe => {
+                    dynasm!(self.mc ; .arch x64 ; setae al ; movzx eax, al);
+                }
+                OpCode::FloatEq => {
+                    dynasm!(self.mc ; .arch x64
+                        ; sete al ; setnp cl ; and al, cl ; movzx eax, al
+                    );
+                }
+                OpCode::FloatNe => {
+                    dynasm!(self.mc ; .arch x64
+                        ; setne al ; setp cl ; or al, cl ; movzx eax, al
+                    );
+                }
+                _ => {
+                    dynasm!(self.mc ; .arch x64 ; sete al ; movzx eax, al);
+                }
+            }
+            dynasm!(self.mc ; .arch x64 ; test rax, rax);
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            dynasm!(self.mc ; .arch aarch64 ; fcmp d0, d1);
+            match op.opcode {
+                OpCode::FloatLt | OpCode::FloatGt => {
+                    dynasm!(self.mc ; .arch aarch64 ; cset x0, gt);
+                }
+                OpCode::FloatLe | OpCode::FloatGe => {
+                    dynasm!(self.mc ; .arch aarch64 ; cset x0, ge);
+                }
+                OpCode::FloatEq => {
+                    dynasm!(self.mc ; .arch aarch64 ; cset x0, eq);
+                }
+                OpCode::FloatNe => {
+                    dynasm!(self.mc ; .arch aarch64 ; cset x0, ne);
+                }
+                _ => {
+                    dynasm!(self.mc ; .arch aarch64 ; cset x0, eq);
+                }
+            }
+            dynasm!(self.mc ; .arch aarch64 ; cmp x0, 0);
+        }
+        self.guard_success_cc = Some(CC_NE);
+        if !op.pos.is_none() {
+            self.store_rax_to_result(op.pos);
+        }
+    }
+
+    /// CAST_FLOAT_TO_SINGLEFLOAT: f64 → f32 (bits in lower 32 of i64)
+    fn genop_cast_float_to_singlefloat(&mut self, op: &Op) {
+        self.load_float_arg_to_d0(op.arg(0));
+        #[cfg(target_arch = "x86_64")]
+        dynasm!(self.mc ; .arch x64
+            ; cvtsd2ss xmm0, xmm0
+            ; movd eax, xmm0
+        );
+        #[cfg(target_arch = "aarch64")]
+        dynasm!(self.mc ; .arch aarch64
+            ; fcvt s0, d0
+            ; fmov w0, s0
+        );
+        self.store_rax_to_result(op.pos);
+    }
+
+    /// CAST_SINGLEFLOAT_TO_FLOAT: f32 (bits in lower 32) → f64
+    fn genop_cast_singlefloat_to_float(&mut self, op: &Op) {
+        self.load_arg_to_rax(op.arg(0));
+        #[cfg(target_arch = "x86_64")]
+        dynasm!(self.mc ; .arch x64
+            ; movd xmm0, eax
+            ; cvtss2sd xmm0, xmm0
+        );
+        #[cfg(target_arch = "aarch64")]
+        dynasm!(self.mc ; .arch aarch64
+            ; fmov s0, w0
+            ; fcvt d0, s0
+        );
+        self.store_d0_to_result(op.pos);
+    }
+
+    // ================================================================
+    // genop_* — GC memory operations
+    // ================================================================
+
+    /// Emit a sized load from [rax]/[x0]. Positive size = zero-extend,
+    /// negative = sign-extend.
+    fn emit_load_from_rax_sized(&mut self, itemsize: i32) {
+        let abs_size = itemsize.unsigned_abs() as usize;
+        let signed = itemsize < 0;
+        #[cfg(target_arch = "x86_64")]
+        match (abs_size, signed) {
+            (1, true) => dynasm!(self.mc ; .arch x64 ; movsx rax, BYTE [rax]),
+            (2, true) => dynasm!(self.mc ; .arch x64 ; movsx rax, WORD [rax]),
+            (4, true) => dynasm!(self.mc ; .arch x64
+                ; mov eax, [rax]
+                ; cdqe
+            ),
+            (1, false) => dynasm!(self.mc ; .arch x64 ; movzx eax, BYTE [rax]),
+            (2, false) => dynasm!(self.mc ; .arch x64 ; movzx eax, WORD [rax]),
+            (4, false) => dynasm!(self.mc ; .arch x64 ; mov eax, [rax]),
+            _ => dynasm!(self.mc ; .arch x64 ; mov rax, [rax]),
+        }
+        #[cfg(target_arch = "aarch64")]
+        match (abs_size, signed) {
+            (1, true) => dynasm!(self.mc ; .arch aarch64 ; ldrsb x0, [x0]),
+            (2, true) => dynasm!(self.mc ; .arch aarch64 ; ldrsh x0, [x0]),
+            (4, true) => dynasm!(self.mc ; .arch aarch64 ; ldrsw x0, [x0]),
+            (1, false) => dynasm!(self.mc ; .arch aarch64 ; ldrb w0, [x0]),
+            (2, false) => dynasm!(self.mc ; .arch aarch64 ; ldrh w0, [x0]),
+            (4, false) => dynasm!(self.mc ; .arch aarch64 ; ldr w0, [x0]),
+            _ => dynasm!(self.mc ; .arch aarch64 ; ldr x0, [x0]),
+        }
+    }
+
+    /// Emit a sized store of rcx/x1 to [rax]/[x0].
+    fn emit_store_to_rax_sized(&mut self, size: usize) {
+        #[cfg(target_arch = "x86_64")]
+        match size {
+            1 => dynasm!(self.mc ; .arch x64 ; mov [rax], cl),
+            2 => dynasm!(self.mc ; .arch x64 ; mov [rax], cx),
+            4 => dynasm!(self.mc ; .arch x64 ; mov [rax], ecx),
+            _ => dynasm!(self.mc ; .arch x64 ; mov [rax], rcx),
+        }
+        #[cfg(target_arch = "aarch64")]
+        match size {
+            1 => dynasm!(self.mc ; .arch aarch64 ; strb w1, [x0]),
+            2 => dynasm!(self.mc ; .arch aarch64 ; strh w1, [x0]),
+            4 => dynasm!(self.mc ; .arch aarch64 ; str w1, [x0]),
+            _ => dynasm!(self.mc ; .arch aarch64 ; str x1, [x0]),
+        }
+    }
+
+    /// Resolve an OpRef that is expected to be a compile-time constant.
+    fn resolve_const_or(&self, opref: OpRef, default: i64) -> i64 {
+        match self.resolve_opref(opref) {
+            ResolvedArg::Const(v) => v,
+            _ => default,
+        }
+    }
+
+    /// GC_LOAD_I/R/F: load from base + offset with given itemsize.
+    /// arg(0) = base, arg(1) = offset, arg(2) = itemsize.
+    fn genop_gc_load(&mut self, op: &Op) {
+        self.load_arg_to_rax(op.arg(0));
+        self.load_arg_to_rcx(op.arg(1));
+        #[cfg(target_arch = "x86_64")]
+        dynasm!(self.mc ; .arch x64 ; add rax, rcx);
+        #[cfg(target_arch = "aarch64")]
+        dynasm!(self.mc ; .arch aarch64 ; add x0, x0, x1);
+
+        let itemsize = self.resolve_const_or(op.arg(2), 8) as i32;
+        self.emit_load_from_rax_sized(itemsize);
+        self.store_rax_to_result(op.pos);
+    }
+
+    /// GC_LOAD_INDEXED_I/R/F: load from base + base_offset + index * scale.
+    /// arg(0)=base, arg(1)=index, arg(2)=scale, arg(3)=base_offset, arg(4)=itemsize.
+    fn genop_gc_load_indexed(&mut self, op: &Op) {
+        let scale = self.resolve_const_or(op.arg(2), 1) as i32;
+        let base_offset = self.resolve_const_or(op.arg(3), 0) as i32;
+        let itemsize = self.resolve_const_or(op.arg(4), 8) as i32;
+
+        self.load_arg_to_rax(op.arg(0));
+        self.load_arg_to_rcx(op.arg(1));
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            if scale != 1 {
+                dynasm!(self.mc ; .arch x64 ; imul rcx, rcx, scale);
+            }
+            dynasm!(self.mc ; .arch x64 ; add rax, rcx);
+            if base_offset != 0 {
+                dynasm!(self.mc ; .arch x64 ; add rax, base_offset);
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            if scale != 1 {
+                self.emit_mov_imm64(2, scale as i64);
+                dynasm!(self.mc ; .arch aarch64 ; mul x1, x1, x2);
+            }
+            dynasm!(self.mc ; .arch aarch64 ; add x0, x0, x1);
+            if base_offset != 0 {
+                dynasm!(self.mc ; .arch aarch64 ; add x0, x0, base_offset as u32);
+            }
+        }
+
+        self.emit_load_from_rax_sized(itemsize);
+        self.store_rax_to_result(op.pos);
+    }
+
+    /// GC_STORE: store value to base + offset.
+    /// 4-arg form: arg(0)=base, arg(1)=offset, arg(2)=value, arg(3)=itemsize.
+    fn genop_discard_gc_store(&mut self, op: &Op) {
+        if op.num_args() < 4 {
+            return; // 3-arg GC rewrite form — skip for now
+        }
+        let itemsize = self.resolve_const_or(op.arg(3), 8).unsigned_abs() as usize;
+
+        self.load_arg_to_rax(op.arg(0));
+        self.load_arg_to_rcx(op.arg(1));
+        #[cfg(target_arch = "x86_64")]
+        {
+            dynasm!(self.mc ; .arch x64 ; add rax, rcx);
+            dynasm!(self.mc ; .arch x64 ; push rax);
+            self.load_arg_to_rcx(op.arg(2));
+            dynasm!(self.mc ; .arch x64 ; pop rax);
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            dynasm!(self.mc ; .arch aarch64 ; add x0, x0, x1);
+            dynasm!(self.mc ; .arch aarch64 ; mov x2, x0);
+            self.load_arg_to_rcx(op.arg(2));
+            dynasm!(self.mc ; .arch aarch64 ; mov x0, x2);
+        }
+        self.emit_store_to_rax_sized(itemsize);
+    }
+
+    /// GC_STORE_INDEXED: store to base + base_offset + index * scale.
+    /// arg(0)=base, arg(1)=index, arg(2)=value, arg(3)=scale,
+    /// arg(4)=base_offset, arg(5)=itemsize.
+    fn genop_discard_gc_store_indexed(&mut self, op: &Op) {
+        let scale = self.resolve_const_or(op.arg(3), 1) as i32;
+        let base_offset = self.resolve_const_or(op.arg(4), 0) as i32;
+        let itemsize = self.resolve_const_or(op.arg(5), 8).unsigned_abs() as usize;
+
+        self.load_arg_to_rax(op.arg(0));
+        self.load_arg_to_rcx(op.arg(1));
+        #[cfg(target_arch = "x86_64")]
+        {
+            if scale != 1 {
+                dynasm!(self.mc ; .arch x64 ; imul rcx, rcx, scale);
+            }
+            dynasm!(self.mc ; .arch x64 ; add rax, rcx);
+            if base_offset != 0 {
+                dynasm!(self.mc ; .arch x64 ; add rax, base_offset);
+            }
+            dynasm!(self.mc ; .arch x64 ; push rax);
+            self.load_arg_to_rcx(op.arg(2));
+            dynasm!(self.mc ; .arch x64 ; pop rax);
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            if scale != 1 {
+                self.emit_mov_imm64(2, scale as i64);
+                dynasm!(self.mc ; .arch aarch64 ; mul x1, x1, x2);
+            }
+            dynasm!(self.mc ; .arch aarch64 ; add x0, x0, x1);
+            if base_offset != 0 {
+                dynasm!(self.mc ; .arch aarch64 ; add x0, x0, base_offset as u32);
+            }
+            dynasm!(self.mc ; .arch aarch64 ; mov x2, x0);
+            self.load_arg_to_rcx(op.arg(2));
+            dynasm!(self.mc ; .arch aarch64 ; mov x0, x2);
+        }
+        self.emit_store_to_rax_sized(itemsize);
+    }
+
+    /// RAW_LOAD_I/F: load from base + offset using descriptor.
+    fn genop_raw_load(&mut self, op: &Op) {
+        let offset = Self::field_offset_from_descr(op);
+        let size = Self::field_size_from_descr(op);
+
+        self.load_arg_to_rax(op.arg(0));
+        self.load_arg_to_rcx(op.arg(1));
+        #[cfg(target_arch = "x86_64")]
+        dynasm!(self.mc ; .arch x64 ; add rax, rcx);
+        #[cfg(target_arch = "aarch64")]
+        dynasm!(self.mc ; .arch aarch64 ; add x0, x0, x1);
+
+        self.emit_load_from_rax_sized(size as i32);
+        let _ = offset; // offset is in the descriptor, not used for raw_load
+        self.store_rax_to_result(op.pos);
+    }
+
+    /// RAW_STORE: store value to base + offset using descriptor.
+    fn genop_discard_raw_store(&mut self, op: &Op) {
+        let size = Self::field_size_from_descr(op);
+
+        self.load_arg_to_rax(op.arg(0));
+        self.load_arg_to_rcx(op.arg(1));
+        #[cfg(target_arch = "x86_64")]
+        {
+            dynasm!(self.mc ; .arch x64 ; add rax, rcx);
+            dynasm!(self.mc ; .arch x64 ; push rax);
+            self.load_arg_to_rcx(op.arg(2));
+            dynasm!(self.mc ; .arch x64 ; pop rax);
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            dynasm!(self.mc ; .arch aarch64 ; add x0, x0, x1);
+            dynasm!(self.mc ; .arch aarch64 ; mov x2, x0);
+            self.load_arg_to_rcx(op.arg(2));
+            dynasm!(self.mc ; .arch aarch64 ; mov x0, x2);
+        }
+        self.emit_store_to_rax_sized(size);
+    }
+
+    // ================================================================
+    // genop_* — interior field operations
+    // ================================================================
+
+    /// GETINTERIORFIELD_GC_I/R/F: load field from array-of-structs element.
+    fn genop_getinteriorfield(&mut self, op: &Op) {
+        let (base_size, item_size, field_offset, field_size) = op
+            .descr
+            .as_ref()
+            .and_then(|d| d.as_interior_field_descr())
+            .map(|id| {
+                let ad = id.array_descr();
+                let fd = id.field_descr();
+                (
+                    ad.base_size() as i32,
+                    ad.item_size() as i32,
+                    fd.offset() as i32,
+                    fd.field_size(),
+                )
+            })
+            .unwrap_or((8, 8, 0, 8));
+
+        self.load_arg_to_rax(op.arg(0));
+        self.load_arg_to_rcx(op.arg(1));
+        let total_offset = base_size + field_offset;
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            if item_size != 1 {
+                dynasm!(self.mc ; .arch x64 ; imul rcx, rcx, item_size);
+            }
+            dynasm!(self.mc ; .arch x64
+                ; add rax, total_offset
+                ; add rax, rcx
+            );
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            if item_size != 1 {
+                self.emit_mov_imm64(2, item_size as i64);
+                dynasm!(self.mc ; .arch aarch64 ; mul x1, x1, x2);
+            }
+            if total_offset != 0 {
+                dynasm!(self.mc ; .arch aarch64 ; add x0, x0, total_offset as u32);
+            }
+            dynasm!(self.mc ; .arch aarch64 ; add x0, x0, x1);
+        }
+
+        self.emit_load_from_rax_sized(field_size as i32);
+        self.store_rax_to_result(op.pos);
+    }
+
+    /// SETINTERIORFIELD_GC/RAW: write field in array-of-structs element.
+    fn genop_discard_setinteriorfield(&mut self, op: &Op) {
+        let (base_size, item_size, field_offset, field_size) = op
+            .descr
+            .as_ref()
+            .and_then(|d| d.as_interior_field_descr())
+            .map(|id| {
+                let ad = id.array_descr();
+                let fd = id.field_descr();
+                (
+                    ad.base_size() as i32,
+                    ad.item_size() as i32,
+                    fd.offset() as i32,
+                    fd.field_size(),
+                )
+            })
+            .unwrap_or((8, 8, 0, 8));
+
+        self.load_arg_to_rax(op.arg(0));
+        self.load_arg_to_rcx(op.arg(1));
+        let total_offset = base_size + field_offset;
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            if item_size != 1 {
+                dynasm!(self.mc ; .arch x64 ; imul rcx, rcx, item_size);
+            }
+            dynasm!(self.mc ; .arch x64
+                ; add rax, total_offset
+                ; add rax, rcx
+            );
+            dynasm!(self.mc ; .arch x64 ; push rax);
+            self.load_arg_to_rcx(op.arg(2));
+            dynasm!(self.mc ; .arch x64 ; pop rax);
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            if item_size != 1 {
+                self.emit_mov_imm64(2, item_size as i64);
+                dynasm!(self.mc ; .arch aarch64 ; mul x1, x1, x2);
+            }
+            if total_offset != 0 {
+                dynasm!(self.mc ; .arch aarch64 ; add x0, x0, total_offset as u32);
+            }
+            dynasm!(self.mc ; .arch aarch64 ; add x0, x0, x1);
+            dynasm!(self.mc ; .arch aarch64 ; mov x2, x0);
+            self.load_arg_to_rcx(op.arg(2));
+            dynasm!(self.mc ; .arch aarch64 ; mov x0, x2);
+        }
+
+        self.emit_store_to_rax_sized(field_size);
+    }
+
+    // ================================================================
+    // genop_* — call variants
+    // ================================================================
+
+    /// COND_CALL_N: if arg(0) != 0, call function at arg(1).
+    fn genop_discard_cond_call(&mut self, op: &Op) {
+        self.load_arg_to_rax(op.arg(0));
+        let skip_label = self.mc.new_dynamic_label();
+        #[cfg(target_arch = "x86_64")]
+        dynasm!(self.mc ; .arch x64 ; test rax, rax ; jz =>skip_label);
+        #[cfg(target_arch = "aarch64")]
+        dynasm!(self.mc ; .arch aarch64 ; cbz x0, =>skip_label);
+
+        self.emit_call(op, 1);
+
+        #[cfg(target_arch = "x86_64")]
+        dynasm!(self.mc ; .arch x64 ; =>skip_label);
+        #[cfg(target_arch = "aarch64")]
+        dynasm!(self.mc ; .arch aarch64 ; =>skip_label);
+    }
+
+    /// COND_CALL_VALUE_I/R: if arg(0) == 0, call function; else result = arg(0).
+    fn genop_cond_call_value(&mut self, op: &Op) {
+        self.load_arg_to_rax(op.arg(0));
+        let skip_label = self.mc.new_dynamic_label();
+        #[cfg(target_arch = "x86_64")]
+        dynasm!(self.mc ; .arch x64 ; test rax, rax ; jnz =>skip_label);
+        #[cfg(target_arch = "aarch64")]
+        dynasm!(self.mc ; .arch aarch64 ; cbnz x0, =>skip_label);
+
+        self.emit_call(op, 1);
+
+        #[cfg(target_arch = "x86_64")]
+        dynasm!(self.mc ; .arch x64 ; =>skip_label);
+        #[cfg(target_arch = "aarch64")]
+        dynasm!(self.mc ; .arch aarch64 ; =>skip_label);
+
+        if !op.pos.is_none() {
+            self.store_rax_to_result(op.pos);
+        }
+    }
+
+    // ================================================================
+    // genop_* — string/array operations
+    // ================================================================
+
+    /// STRSETITEM / UNICODESETITEM: string[index] = value.
+    fn genop_discard_strsetitem(&mut self, op: &Op) {
+        let (base_size, item_size) = op
+            .descr
+            .as_ref()
+            .and_then(|d| d.as_array_descr())
+            .map(|ad| (ad.base_size() as i32, ad.item_size() as i32))
+            .unwrap_or((16, 1));
+
+        self.load_arg_to_rax(op.arg(0)); // string
+        self.load_arg_to_rcx(op.arg(1)); // index
+        #[cfg(target_arch = "x86_64")]
+        {
+            if item_size != 1 {
+                dynasm!(self.mc ; .arch x64 ; imul rcx, rcx, item_size);
+            }
+            dynasm!(self.mc ; .arch x64 ; add rax, base_size ; add rax, rcx);
+            dynasm!(self.mc ; .arch x64 ; push rax);
+            self.load_arg_to_rcx(op.arg(2));
+            dynasm!(self.mc ; .arch x64 ; pop rax);
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            if item_size != 1 {
+                self.emit_mov_imm64(2, item_size as i64);
+                dynasm!(self.mc ; .arch aarch64 ; mul x1, x1, x2);
+            }
+            dynasm!(self.mc ; .arch aarch64
+                ; add x0, x0, base_size as u32
+                ; add x0, x0, x1
+            );
+            dynasm!(self.mc ; .arch aarch64 ; mov x2, x0);
+            self.load_arg_to_rcx(op.arg(2));
+            dynasm!(self.mc ; .arch aarch64 ; mov x0, x2);
+        }
+        self.emit_store_to_rax_sized(item_size as usize);
+    }
+
+    /// COPYSTRCONTENT / COPYUNICODECONTENT: copy substring.
+    /// arg(0)=src, arg(1)=dst, arg(2)=src_start, arg(3)=dst_start, arg(4)=length.
+    fn genop_discard_copystrcontent(&mut self, op: &Op) {
+        let (base_size, item_size) = op
+            .descr
+            .as_ref()
+            .and_then(|d| d.as_array_descr())
+            .map(|ad| (ad.base_size() as i64, ad.item_size() as i64))
+            .unwrap_or((16, 1));
+
+        // Compute byte_count = length * item_size
+        self.load_arg_to_rax(op.arg(4));
+        #[cfg(target_arch = "x86_64")]
+        {
+            if item_size != 1 {
+                dynasm!(self.mc ; .arch x64
+                    ; mov rcx, QWORD item_size
+                    ; imul rax, rcx
+                );
+            }
+            dynasm!(self.mc ; .arch x64 ; push rax); // [rsp] = byte_count
+
+            // Compute src_addr = src + base_size + src_start * item_size
+            self.load_arg_to_rax(op.arg(0));
+            self.load_arg_to_rcx(op.arg(2));
+            if item_size != 1 {
+                dynasm!(self.mc ; .arch x64
+                    ; mov rdx, QWORD item_size
+                    ; imul rcx, rdx
+                );
+            }
+            dynasm!(self.mc ; .arch x64
+                ; add rax, DWORD base_size as i32
+                ; add rax, rcx
+                ; push rax  // [rsp] = src_addr
+            );
+
+            // Compute dst_addr = dst + base_size + dst_start * item_size
+            self.load_arg_to_rax(op.arg(1));
+            self.load_arg_to_rcx(op.arg(3));
+            if item_size != 1 {
+                dynasm!(self.mc ; .arch x64
+                    ; mov rdx, QWORD item_size
+                    ; imul rcx, rdx
+                );
+            }
+            dynasm!(self.mc ; .arch x64
+                ; add rax, DWORD base_size as i32
+                ; add rax, rcx
+            );
+
+            // memmove(dst_addr, src_addr, byte_count)
+            let memmove_ptr = libc::memmove as *const () as i64;
+            dynasm!(self.mc ; .arch x64
+                ; mov rdi, rax   // dst
+                ; pop rsi        // src
+                ; pop rdx        // count
+                ; push rbp
+                ; mov rax, QWORD memmove_ptr
+                ; call rax
+                ; pop rbp
+            );
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            if item_size != 1 {
+                self.emit_mov_imm64(1, item_size);
+                dynasm!(self.mc ; .arch aarch64 ; mul x0, x0, x1);
+            }
+            dynasm!(self.mc ; .arch aarch64 ; str x0, [sp, #-16]!); // byte_count
+
+            self.load_arg_to_rax(op.arg(0));
+            self.load_arg_to_rcx(op.arg(2));
+            if item_size != 1 {
+                self.emit_mov_imm64(2, item_size);
+                dynasm!(self.mc ; .arch aarch64 ; mul x1, x1, x2);
+            }
+            dynasm!(self.mc ; .arch aarch64
+                ; add x0, x0, base_size as u32
+                ; add x0, x0, x1
+                ; str x0, [sp, #-16]!  // src_addr
+            );
+
+            self.load_arg_to_rax(op.arg(1));
+            self.load_arg_to_rcx(op.arg(3));
+            if item_size != 1 {
+                self.emit_mov_imm64(2, item_size);
+                dynasm!(self.mc ; .arch aarch64 ; mul x1, x1, x2);
+            }
+            dynasm!(self.mc ; .arch aarch64
+                ; add x0, x0, base_size as u32
+                ; add x0, x0, x1
+            );
+
+            let memmove_ptr = libc::memmove as *const () as i64;
+            dynasm!(self.mc ; .arch aarch64
+                ; ldr x1, [sp], #16  // src
+                ; ldr x2, [sp], #16  // count
+            );
+            // x0 = dst already
+            dynasm!(self.mc ; .arch aarch64 ; stp x29, x30, [sp, #-16]!);
+            self.emit_mov_imm64(3, memmove_ptr);
+            dynasm!(self.mc ; .arch aarch64
+                ; blr x3
+                ; ldp x29, x30, [sp], #16
+            );
+        }
+    }
+
+    /// NEWSTR: allocate a byte string of given length.
+    fn genop_newstr(&mut self, op: &Op) {
+        self.genop_alloc_varsize(op, 16, 1);
+    }
+
+    /// NEWUNICODE: allocate a unicode string (4-byte chars).
+    fn genop_newunicode(&mut self, op: &Op) {
+        self.genop_alloc_varsize(op, 16, 4);
+    }
+
+    /// Shared implementation for NEWSTR / NEWUNICODE / NEW_ARRAY.
+    /// Allocates base_size + length * item_size bytes, zero-fills,
+    /// and writes length to the header.
+    fn genop_alloc_varsize(&mut self, op: &Op, base_size: i64, item_size: i64) {
+        // arg(0) = length
+        self.load_arg_to_rax(op.arg(0));
+        let malloc_ptr = libc::malloc as *const () as i64;
+        let memset_ptr = libc::memset as *const () as i64;
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            // Save length, compute total_size = base_size + length * item_size
+            dynasm!(self.mc ; .arch x64
+                ; push rax                           // save length
+                ; imul rax, rax, item_size as i32
+                ; add rax, base_size as i32
+                ; mov rdi, rax                       // malloc arg
+                ; push rax                           // save total_size
+                ; mov rax, QWORD malloc_ptr
+                ; call rax
+                ; pop rcx                            // rcx = total_size
+                ; push rax                           // save ptr
+                // memset(ptr, 0, total_size)
+                ; mov rdi, rax
+                ; xor esi, esi
+                ; mov rdx, rcx
+                ; mov rax, QWORD memset_ptr
+                ; call rax
+                ; pop rax                            // rax = ptr
+                ; pop rcx                            // rcx = length
+                // Store length at offset 8 (RPython string header)
+                ; mov [rax + 8], rcx
+            );
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            dynasm!(self.mc ; .arch aarch64
+                ; str x0, [sp, #-16]!               // save length
+            );
+            if item_size != 1 {
+                self.emit_mov_imm64(1, item_size);
+                dynasm!(self.mc ; .arch aarch64 ; mul x0, x0, x1);
+            }
+            dynasm!(self.mc ; .arch aarch64
+                ; add x0, x0, base_size as u32
+                ; str x0, [sp, #-16]!               // save total_size
+            );
+            dynasm!(self.mc ; .arch aarch64 ; stp x29, x30, [sp, #-16]!);
+            self.emit_mov_imm64(8, malloc_ptr);
+            dynasm!(self.mc ; .arch aarch64
+                ; blr x8
+                ; ldp x29, x30, [sp], #16
+                ; ldr x2, [sp], #16                 // total_size
+                ; mov x19, x0                        // save ptr
+                ; mov x1, 0                          // val = 0
+                ; stp x29, x30, [sp, #-16]!
+            );
+            self.emit_mov_imm64(8, memset_ptr);
+            dynasm!(self.mc ; .arch aarch64
+                ; blr x8
+                ; ldp x29, x30, [sp], #16
+                ; mov x0, x19                        // restore ptr
+                ; ldr x1, [sp], #16                  // length
+                ; str x1, [x0, 8]                    // store length at offset 8
+            );
+        }
+
+        if !op.pos.is_none() {
+            self.store_rax_to_result(op.pos);
+        }
+    }
+
+    /// ZERO_ARRAY: zero a range in an array.
+    /// arg(0)=base, arg(1)=start, arg(2)=size, arg(3)=scale_start, arg(4)=scale_size.
+    fn genop_discard_zero_array(&mut self, op: &Op) {
+        let (base_size, _) = op
+            .descr
+            .as_ref()
+            .and_then(|d| d.as_array_descr())
+            .map(|ad| (ad.base_size() as i64, ad.item_size() as i64))
+            .unwrap_or((8, 8));
+
+        let scale_start = self.resolve_const_or(op.arg(3), 1);
+        let scale_size = self.resolve_const_or(op.arg(4), 1);
+        let memset_ptr = libc::memset as *const () as i64;
+
+        // byte_offset = base_size + start * scale_start
+        // byte_length = size * scale_size
+        self.load_arg_to_rax(op.arg(0)); // base
+        self.load_arg_to_rcx(op.arg(1)); // start
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            if scale_start != 1 {
+                dynasm!(self.mc ; .arch x64 ; imul rcx, rcx, scale_start as i32);
+            }
+            dynasm!(self.mc ; .arch x64
+                ; add rax, DWORD base_size as i32
+                ; add rax, rcx
+                ; push rax                           // save dest
+            );
+            self.load_arg_to_rax(op.arg(2)); // size
+            if scale_size != 1 {
+                dynasm!(self.mc ; .arch x64 ; imul rax, rax, scale_size as i32);
+            }
+            // memset(dest, 0, byte_length)
+            dynasm!(self.mc ; .arch x64
+                ; mov rdx, rax                       // byte_length
+                ; pop rdi                            // dest
+                ; xor esi, esi                       // val = 0
+                ; push rbp
+                ; mov rax, QWORD memset_ptr
+                ; call rax
+                ; pop rbp
+            );
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            if scale_start != 1 {
+                self.emit_mov_imm64(2, scale_start);
+                dynasm!(self.mc ; .arch aarch64 ; mul x1, x1, x2);
+            }
+            dynasm!(self.mc ; .arch aarch64
+                ; add x0, x0, base_size as u32
+                ; add x0, x0, x1
+                ; str x0, [sp, #-16]!               // save dest
+            );
+            self.load_arg_to_rax(op.arg(2));
+            if scale_size != 1 {
+                self.emit_mov_imm64(1, scale_size);
+                dynasm!(self.mc ; .arch aarch64 ; mul x0, x0, x1);
+            }
+            dynasm!(self.mc ; .arch aarch64
+                ; mov x2, x0                         // byte_length
+                ; ldr x0, [sp], #16                  // dest
+                ; mov x1, 0
+                ; stp x29, x30, [sp, #-16]!
+            );
+            self.emit_mov_imm64(8, memset_ptr);
+            dynasm!(self.mc ; .arch aarch64
+                ; blr x8
+                ; ldp x29, x30, [sp], #16
+            );
+        }
+    }
+
+    // ================================================================
+    // genop_* — address computation
+    // ================================================================
+
+    /// LOAD_EFFECTIVE_ADDRESS: result = base + index * scale + offset.
+    /// arg(0)=base, arg(1)=index, arg(2)=scale, arg(3)=offset.
+    fn genop_load_effective_address(&mut self, op: &Op) {
+        let scale = self.resolve_const_or(op.arg(2), 1) as i32;
+        let offset = self.resolve_const_or(op.arg(3), 0) as i32;
+
+        self.load_arg_to_rax(op.arg(0));
+        self.load_arg_to_rcx(op.arg(1));
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            if scale != 1 {
+                dynasm!(self.mc ; .arch x64 ; imul rcx, rcx, scale);
+            }
+            dynasm!(self.mc ; .arch x64 ; add rax, rcx);
+            if offset != 0 {
+                dynasm!(self.mc ; .arch x64 ; add rax, offset);
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            if scale != 1 {
+                self.emit_mov_imm64(2, scale as i64);
+                dynasm!(self.mc ; .arch aarch64 ; mul x1, x1, x2);
+            }
+            dynasm!(self.mc ; .arch aarch64 ; add x0, x0, x1);
+            if offset != 0 {
+                dynasm!(self.mc ; .arch aarch64 ; add x0, x0, offset as u32);
             }
         }
 
