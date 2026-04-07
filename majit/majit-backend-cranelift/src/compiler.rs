@@ -5400,6 +5400,18 @@ impl CraneliftBackend {
             }
         }
 
+        // RPython parity: EBP holds the jitframe pointer throughout the
+        // assembled trace. After every collecting call, _reload_frame_if_necessary
+        // (assembler.py:405-412) reloads ebp from the shadow stack — this is
+        // a single mutable register, NOT new SSA values per reload site.
+        // Cranelift's SSA model would otherwise require us to thread the
+        // reloaded jf_ptr through every merge block manually; using a
+        // Variable lets the FunctionBuilder insert the necessary block
+        // parameters automatically so v66 (post-reload) does not get
+        // referenced from a path that did not perform the reload.
+        let jf_ptr_var = builder.declare_var(ptr_type);
+        builder.def_var(jf_ptr_var, jf_ptr);
+
         // Debug: save declared_vars snapshot for resolve_opref checking.
         DECLARED_VARS_DEBUG.with(|cell| {
             *cell.borrow_mut() = Some(declared_vars.clone());
@@ -5599,6 +5611,16 @@ impl CraneliftBackend {
             }
             let op = &ops[op_idx];
             let vi = op_var_index(op, op_idx, num_inputs) as u32;
+
+            // RPython parity: ebp is the live register at every instruction
+            // boundary. Refresh the cached jf_ptr/outputs_ptr CValues from
+            // the Cranelift Variable so the FunctionBuilder threads the
+            // correct value through any merge blocks introduced by the
+            // previous opcode (LABEL, brif, etc.). Without this, opcode
+            // handlers that emit IR directly using the cached locals can
+            // reference an SSA value defined in a non-dominating block.
+            jf_ptr = builder.use_var(jf_ptr_var);
+            outputs_ptr = jf_ptr;
 
             match op.opcode {
                 // ── Integer arithmetic ──
@@ -5888,7 +5910,8 @@ impl CraneliftBackend {
 
                     builder.switch_to_block(exit_block);
                     builder.seal_block(exit_block);
-                    emit_guard_exit(&mut builder, &constants, outputs_ptr, info);
+                    let cur_jf = builder.use_var(jf_ptr_var);
+                    emit_guard_exit(&mut builder, &constants, cur_jf, info);
 
                     builder.switch_to_block(cont_block);
                     builder.seal_block(cont_block);
@@ -5911,7 +5934,8 @@ impl CraneliftBackend {
 
                     builder.switch_to_block(exit_block);
                     builder.seal_block(exit_block);
-                    emit_guard_exit(&mut builder, &constants, outputs_ptr, info);
+                    let cur_jf = builder.use_var(jf_ptr_var);
+                    emit_guard_exit(&mut builder, &constants, cur_jf, info);
 
                     builder.switch_to_block(cont_block);
                     builder.seal_block(cont_block);
@@ -5951,7 +5975,8 @@ impl CraneliftBackend {
 
                     builder.switch_to_block(exit_block);
                     builder.seal_block(exit_block);
-                    emit_guard_exit(&mut builder, &constants, outputs_ptr, info);
+                    let cur_jf = builder.use_var(jf_ptr_var);
+                    emit_guard_exit(&mut builder, &constants, cur_jf, info);
 
                     builder.switch_to_block(cont_block);
                     builder.seal_block(cont_block);
@@ -5993,7 +6018,8 @@ impl CraneliftBackend {
 
                     builder.switch_to_block(exit_block);
                     builder.seal_block(exit_block);
-                    emit_guard_exit(&mut builder, &constants, outputs_ptr, info);
+                    let cur_jf = builder.use_var(jf_ptr_var);
+                    emit_guard_exit(&mut builder, &constants, cur_jf, info);
 
                     builder.switch_to_block(cont_block);
                     builder.seal_block(cont_block);
@@ -6027,7 +6053,8 @@ impl CraneliftBackend {
 
                     builder.switch_to_block(exit_block);
                     builder.seal_block(exit_block);
-                    emit_guard_exit(&mut builder, &constants, outputs_ptr, info);
+                    let cur_jf = builder.use_var(jf_ptr_var);
+                    emit_guard_exit(&mut builder, &constants, cur_jf, info);
 
                     builder.switch_to_block(cont_block);
                     builder.seal_block(cont_block);
@@ -6061,7 +6088,8 @@ impl CraneliftBackend {
 
                     builder.switch_to_block(exit_block);
                     builder.seal_block(exit_block);
-                    emit_guard_exit(&mut builder, &constants, outputs_ptr, info);
+                    let cur_jf = builder.use_var(jf_ptr_var);
+                    emit_guard_exit(&mut builder, &constants, cur_jf, info);
 
                     builder.switch_to_block(cont_block);
                     builder.seal_block(cont_block);
@@ -6107,7 +6135,8 @@ impl CraneliftBackend {
 
                     builder.switch_to_block(exit_block);
                     builder.seal_block(exit_block);
-                    emit_guard_exit(&mut builder, &constants, outputs_ptr, info);
+                    let cur_jf = builder.use_var(jf_ptr_var);
+                    emit_guard_exit(&mut builder, &constants, cur_jf, info);
 
                     builder.switch_to_block(cont_block);
                     builder.seal_block(cont_block);
@@ -6136,7 +6165,8 @@ impl CraneliftBackend {
 
                     builder.switch_to_block(exit_block);
                     builder.seal_block(exit_block);
-                    emit_guard_exit(&mut builder, &constants, outputs_ptr, info);
+                    let cur_jf = builder.use_var(jf_ptr_var);
+                    emit_guard_exit(&mut builder, &constants, cur_jf, info);
 
                     builder.switch_to_block(cont_block);
                     builder.seal_block(cont_block);
@@ -6173,7 +6203,8 @@ impl CraneliftBackend {
 
                     builder.switch_to_block(exit_block);
                     builder.seal_block(exit_block);
-                    emit_guard_exit(&mut builder, &constants, outputs_ptr, info);
+                    let cur_jf = builder.use_var(jf_ptr_var);
+                    emit_guard_exit(&mut builder, &constants, cur_jf, info);
 
                     builder.switch_to_block(cont_block);
                     builder.seal_block(cont_block);
@@ -6196,9 +6227,10 @@ impl CraneliftBackend {
 
                     // _store_force_index(op): store descr to jf_force_descr
                     let descr_val = builder.ins().iconst(cl_types::I64, info.fail_descr_ptr);
+                    let cur_jf = builder.use_var(jf_ptr_var);
                     builder
                         .ins()
-                        .store(MemFlags::trusted(), descr_val, jf_ptr, JF_FORCE_DESCR_OFS);
+                        .store(MemFlags::trusted(), descr_val, cur_jf, JF_FORCE_DESCR_OFS);
 
                     // implement_guard_recovery / _update_at_exit parity:
                     // Write fail_arg values to jf_frame[0..n] in fail_args order.
@@ -6207,7 +6239,7 @@ impl CraneliftBackend {
                         builder.ins().store(
                             MemFlags::trusted(),
                             raw,
-                            outputs_ptr,
+                            cur_jf,
                             JF_FRAME_ITEM0_OFS + (index as i32) * 8,
                         );
                     }
@@ -6241,7 +6273,8 @@ impl CraneliftBackend {
 
                         builder.switch_to_block(exit_block);
                         builder.seal_block(exit_block);
-                        emit_guard_exit(&mut builder, &constants, outputs_ptr, info);
+                        let cur_jf = builder.use_var(jf_ptr_var);
+                        emit_guard_exit(&mut builder, &constants, cur_jf, info);
 
                         builder.switch_to_block(cont_block);
                         builder.seal_block(cont_block);
@@ -6269,7 +6302,8 @@ impl CraneliftBackend {
 
                     builder.switch_to_block(exit_block);
                     builder.seal_block(exit_block);
-                    emit_guard_exit(&mut builder, &constants, outputs_ptr, info);
+                    let cur_jf = builder.use_var(jf_ptr_var);
+                    emit_guard_exit(&mut builder, &constants, cur_jf, info);
 
                     builder.switch_to_block(cont_block);
                     builder.seal_block(cont_block);
@@ -6280,7 +6314,8 @@ impl CraneliftBackend {
                     let info = &guard_infos[guard_idx];
                     guard_idx += 1;
 
-                    emit_guard_exit(&mut builder, &constants, outputs_ptr, info);
+                    let cur_jf = builder.use_var(jf_ptr_var);
+                    emit_guard_exit(&mut builder, &constants, cur_jf, info);
 
                     // Create a continuation block for subsequent ops (dead code).
                     let dead_block = builder.create_block();
@@ -6321,7 +6356,8 @@ impl CraneliftBackend {
 
                     builder.switch_to_block(exit_block);
                     builder.seal_block(exit_block);
-                    emit_guard_exit(&mut builder, &constants, outputs_ptr, info);
+                    let cur_jf = builder.use_var(jf_ptr_var);
+                    emit_guard_exit(&mut builder, &constants, cur_jf, info);
 
                     builder.switch_to_block(cont_block);
                     builder.seal_block(cont_block);
@@ -6416,7 +6452,8 @@ impl CraneliftBackend {
 
                     builder.switch_to_block(exit_block);
                     builder.seal_block(exit_block);
-                    emit_guard_exit(&mut builder, &constants, outputs_ptr, info);
+                    let cur_jf = builder.use_var(jf_ptr_var);
+                    emit_guard_exit(&mut builder, &constants, cur_jf, info);
 
                     builder.switch_to_block(cont_block);
                     builder.seal_block(cont_block);
@@ -6563,7 +6600,8 @@ impl CraneliftBackend {
 
                     builder.switch_to_block(exit_block);
                     builder.seal_block(exit_block);
-                    emit_guard_exit(&mut builder, &constants, outputs_ptr, info);
+                    let cur_jf = builder.use_var(jf_ptr_var);
+                    emit_guard_exit(&mut builder, &constants, cur_jf, info);
 
                     builder.switch_to_block(cont_block);
                     builder.seal_block(cont_block);
@@ -6702,6 +6740,7 @@ impl CraneliftBackend {
                     }
                     jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
                     outputs_ptr = jf_ptr;
+                    builder.def_var(jf_ptr_var, jf_ptr);
                 }
 
                 OpCode::CallAssemblerI
@@ -7044,6 +7083,13 @@ impl CraneliftBackend {
                         );
                     }
 
+                    // After switch_to_block(shim_fallback_block), the cached
+                    // jf_ptr local may correspond to a value defined in a
+                    // different block on the upstream tree. Read the fresh
+                    // jitframe pointer through the Variable so Cranelift
+                    // threads it through the necessary block params.
+                    jf_ptr = builder.use_var(jf_ptr_var);
+                    outputs_ptr = jf_ptr;
                     spill_ref_roots(
                         &mut builder,
                         jf_ptr,
@@ -7065,6 +7111,12 @@ impl CraneliftBackend {
                         ],
                         Some(cl_types::I64),
                     );
+                    // _reload_frame_if_necessary (assembler.py:405-412):
+                    // GC may have moved the jitframe during the shim call.
+                    // Reload jf_ptr from shadow stack before reading from it.
+                    jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                    outputs_ptr = jf_ptr;
+                    builder.def_var(jf_ptr_var, jf_ptr);
                     emit_pop_gcmap(&mut builder, jf_ptr, per_call_gcmap);
                     reload_ref_roots(
                         &mut builder,
@@ -7142,9 +7194,10 @@ impl CraneliftBackend {
                     // into jf_force_descr before the call. If the callee
                     // forces the frame, force() reads this to set jf_descr.
                     let descr_val = builder.ins().iconst(cl_types::I64, info.fail_descr_ptr);
+                    let cur_jf = builder.use_var(jf_ptr_var);
                     builder
                         .ins()
-                        .store(MemFlags::trusted(), descr_val, jf_ptr, JF_FORCE_DESCR_OFS);
+                        .store(MemFlags::trusted(), descr_val, cur_jf, JF_FORCE_DESCR_OFS);
 
                     // regalloc.py before_call() parity: spill fail_args to
                     // jf_frame so force_token_to_dead_frame() reads correct
@@ -7159,7 +7212,7 @@ impl CraneliftBackend {
                         builder.ins().store(
                             MemFlags::trusted(),
                             raw,
-                            outputs_ptr,
+                            cur_jf,
                             JF_FRAME_ITEM0_OFS + (index as i32) * 8,
                         );
                     }
@@ -7189,6 +7242,7 @@ impl CraneliftBackend {
                     }
                     jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
                     outputs_ptr = jf_ptr;
+                    builder.def_var(jf_ptr_var, jf_ptr);
                 }
 
                 OpCode::CallReleaseGilI
@@ -7211,9 +7265,10 @@ impl CraneliftBackend {
                     }
                     let info = &guard_infos[guard_idx];
                     let descr_val = builder.ins().iconst(cl_types::I64, info.fail_descr_ptr);
+                    let cur_jf = builder.use_var(jf_ptr_var);
                     builder
                         .ins()
-                        .store(MemFlags::trusted(), descr_val, jf_ptr, JF_FORCE_DESCR_OFS);
+                        .store(MemFlags::trusted(), descr_val, cur_jf, JF_FORCE_DESCR_OFS);
 
                     // regalloc.py before_call() parity: spill fail_args to
                     // jf_frame so force_token_to_dead_frame() reads correct
@@ -7227,7 +7282,7 @@ impl CraneliftBackend {
                         builder.ins().store(
                             MemFlags::trusted(),
                             raw,
-                            outputs_ptr,
+                            cur_jf,
                             JF_FRAME_ITEM0_OFS + (index as i32) * 8,
                         );
                     }
@@ -7379,6 +7434,7 @@ impl CraneliftBackend {
                             );
                             jf_ptr =
                                 emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                            builder.def_var(jf_ptr_var, jf_ptr);
                         }
                     }
 
@@ -7435,6 +7491,7 @@ impl CraneliftBackend {
                             }
                             jf_ptr =
                                 emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                            builder.def_var(jf_ptr_var, jf_ptr);
                         }
                     }
 
@@ -7474,6 +7531,7 @@ impl CraneliftBackend {
                     .expect("GC allocation helper must return a value");
                     jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
                     outputs_ptr = jf_ptr;
+                    builder.def_var(jf_ptr_var, jf_ptr);
                     builder.def_var(var(vi), result);
                 }
                 OpCode::CallMallocNurseryVarsize => {
@@ -7507,6 +7565,7 @@ impl CraneliftBackend {
                     .expect("GC varsize allocation helper must return a value");
                     jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
                     outputs_ptr = jf_ptr;
+                    builder.def_var(jf_ptr_var, jf_ptr);
                     builder.def_var(var(vi), result);
                 }
                 OpCode::CallMallocNurseryVarsizeFrame => {
@@ -7599,6 +7658,7 @@ impl CraneliftBackend {
                     let result = builder.block_params(merge_block)[0];
                     jf_ptr = builder.block_params(merge_block)[1];
                     outputs_ptr = jf_ptr;
+                    builder.def_var(jf_ptr_var, jf_ptr);
                     builder.def_var(var(vi), result);
                 }
 
@@ -8397,14 +8457,16 @@ impl CraneliftBackend {
                         // target loop with these output values.
                         let info = &guard_infos[guard_idx];
                         guard_idx += 1;
-                        emit_guard_exit(&mut builder, &constants, outputs_ptr, info);
+                        let cur_jf = builder.use_var(jf_ptr_var);
+                        emit_guard_exit(&mut builder, &constants, cur_jf, info);
                     }
                 }
 
                 OpCode::Finish => {
                     let info = &guard_infos[guard_idx];
                     guard_idx += 1;
-                    emit_guard_exit(&mut builder, &constants, outputs_ptr, info);
+                    let cur_jf = builder.use_var(jf_ptr_var);
+                    emit_guard_exit(&mut builder, &constants, cur_jf, info);
                 }
 
                 OpCode::Label => {}
@@ -8502,7 +8564,8 @@ impl CraneliftBackend {
                     // x86/assembler.py genop_force_token: mov resloc, ebp
                     // FORCE_TOKEN returns the JitFrame pointer itself.
                     // resoperation.py:1090: "returns the jitframe"
-                    builder.def_var(var(vi), jf_ptr);
+                    let cur_jf = builder.use_var(jf_ptr_var);
+                    builder.def_var(var(vi), cur_jf);
                 }
 
                 // ── VirtualRef operations ──
@@ -8532,7 +8595,8 @@ impl CraneliftBackend {
                         .brif(is_false, exit_block, &[], cont_block, &[]);
                     builder.switch_to_block(exit_block);
                     builder.seal_block(exit_block);
-                    emit_guard_exit(&mut builder, &constants, outputs_ptr, info);
+                    let cur_jf = builder.use_var(jf_ptr_var);
+                    emit_guard_exit(&mut builder, &constants, cur_jf, info);
                     builder.switch_to_block(cont_block);
                     builder.seal_block(cont_block);
                 }
@@ -8553,7 +8617,8 @@ impl CraneliftBackend {
                         .brif(is_true, exit_block, &[], cont_block, &[]);
                     builder.switch_to_block(exit_block);
                     builder.seal_block(exit_block);
-                    emit_guard_exit(&mut builder, &constants, outputs_ptr, info);
+                    let cur_jf = builder.use_var(jf_ptr_var);
+                    emit_guard_exit(&mut builder, &constants, cur_jf, info);
                     builder.switch_to_block(cont_block);
                     builder.seal_block(cont_block);
                 }
@@ -9054,11 +9119,12 @@ impl CraneliftBackend {
                     let vtable_off_i32 = vtable_offset.unwrap_or(0) as i32;
                     if let Some(runtime_id) = gc_runtime_id {
                         let runtime_id = builder.ins().iconst(cl_types::I64, runtime_id as i64);
+                        let cur_jf = builder.use_var(jf_ptr_var);
                         let result = emit_collecting_gc_call(
                             &mut builder,
                             ptr_type,
                             call_conv,
-                            jf_ptr,
+                            cur_jf,
                             &ref_root_slots,
                             &defined_ref_vars,
                             ref_root_base_ofs,
@@ -9074,6 +9140,7 @@ impl CraneliftBackend {
                         // Reload jf_ptr so subsequent spill/reload use the correct address.
                         jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
                         outputs_ptr = jf_ptr;
+                        builder.def_var(jf_ptr_var, jf_ptr);
                         if write_vtable {
                             let vtable_val = builder.ins().iconst(cl_types::I64, vtable as i64);
                             builder.ins().store(
@@ -9145,6 +9212,7 @@ impl CraneliftBackend {
                     .expect("GC varsize allocation helper must return a value");
                     jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
                     outputs_ptr = jf_ptr;
+                    builder.def_var(jf_ptr_var, jf_ptr);
                     builder.def_var(var(vi), result);
                 }
 
@@ -9276,6 +9344,7 @@ impl CraneliftBackend {
                     .expect("GC varsize allocation helper must return a value");
                     jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
                     outputs_ptr = jf_ptr;
+                    builder.def_var(jf_ptr_var, jf_ptr);
                     builder.def_var(var(vi), result);
                 }
                 OpCode::Newunicode => {
@@ -9301,6 +9370,7 @@ impl CraneliftBackend {
                     .expect("GC varsize allocation helper must return a value");
                     jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
                     outputs_ptr = jf_ptr;
+                    builder.def_var(jf_ptr_var, jf_ptr);
                     builder.def_var(var(vi), result);
                 }
                 // All OpCode variants are explicitly handled above.
