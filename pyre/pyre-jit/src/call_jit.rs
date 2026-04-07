@@ -2794,8 +2794,11 @@ fn bh_call_fn_impl(callable: PyObjectRef, args: &[PyObjectRef]) -> i64 {
 /// jtransform.py parity: namespace and code come from getfield_vable_r.
 /// namespace = getfield_vable_r(frame, w_globals), code = getfield_vable_r(frame, pycode).
 /// namei is the raw oparg from LOAD_GLOBAL: name_idx = namei >> 1.
-pub extern "C" fn bh_load_global_fn(namespace_ptr: i64, code_ptr: i64, namei: i64) -> i64 {
-    let code = unsafe { &*(code_ptr as *const pyre_interpreter::CodeObject) };
+pub extern "C" fn bh_load_global_fn(namespace_ptr: i64, w_code_ptr: i64, namei: i64) -> i64 {
+    let code = unsafe {
+        &*(pyre_interpreter::w_code_get_ptr(w_code_ptr as pyre_object::PyObjectRef)
+            as *const pyre_interpreter::CodeObject)
+    };
     let raw = namei as usize;
     let idx = raw >> 1;
 
@@ -2822,8 +2825,11 @@ pub extern "C" fn bh_load_global_fn(namespace_ptr: i64, code_ptr: i64, namei: i6
 
 /// Load a constant from the code object.
 /// jtransform.py parity: code comes from getfield_vable_r(frame, pycode).
-pub extern "C" fn bh_load_const_fn(code_ptr: i64, consti: i64) -> i64 {
-    let code = unsafe { &*(code_ptr as *const pyre_interpreter::CodeObject) };
+pub extern "C" fn bh_load_const_fn(w_code_ptr: i64, consti: i64) -> i64 {
+    let code = unsafe {
+        &*(pyre_interpreter::w_code_get_ptr(w_code_ptr as pyre_object::PyObjectRef)
+            as *const pyre_interpreter::CodeObject)
+    };
     pyre_interpreter::pyframe::load_const_from_code(code, consti as usize) as i64
 }
 
