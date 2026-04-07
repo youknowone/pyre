@@ -281,6 +281,8 @@ pub fn all_foreign_pytypes() -> &'static [(&'static PyType, &'static PyType)] {
         (&crate::propertyobject::CLASSMETHOD_TYPE, &INSTANCE_TYPE),
         (&crate::excobject::EXCEPTION_TYPE, &INSTANCE_TYPE),
         (&crate::sliceobject::SLICE_TYPE, &INSTANCE_TYPE),
+        (&crate::setobject::SET_TYPE, &INSTANCE_TYPE),
+        (&crate::setobject::FROZENSET_TYPE, &INSTANCE_TYPE),
     ];
     PYTYPES
 }

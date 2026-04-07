@@ -764,6 +764,20 @@ pub fn sub(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         if is_float_pair(a, b) {
             return float_sub(a, b);
         }
+        // set / frozenset difference — PyPy: setobject.py W_BaseSetObject.descr_sub
+        if pyre_object::is_set_or_frozenset(a) {
+            let other_items = crate::builtins::collect_iterable(b)?;
+            let probe = pyre_object::w_set_from_items(&other_items);
+            let result: Vec<PyObjectRef> = pyre_object::w_set_items(a)
+                .into_iter()
+                .filter(|&item| !pyre_object::w_set_contains(probe, item))
+                .collect();
+            return Ok(if pyre_object::is_frozenset(a) {
+                pyre_object::w_frozenset_from_items(&result)
+            } else {
+                pyre_object::w_set_from_items(&result)
+            });
+        }
         if let Some(result) = try_instance_binop(a, b, "__sub__") {
             return result;
         }
@@ -1197,6 +1211,20 @@ pub fn and_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         if is_int_or_long(a) && is_int_or_long(b) {
             return long_bitand(a, b);
         }
+        // set / frozenset intersection — PyPy: setobject.py W_BaseSetObject.descr_and
+        if pyre_object::is_set_or_frozenset(a) {
+            let other_items = crate::builtins::collect_iterable(b)?;
+            let probe = pyre_object::w_set_from_items(&other_items);
+            let result: Vec<PyObjectRef> = pyre_object::w_set_items(a)
+                .into_iter()
+                .filter(|&item| pyre_object::w_set_contains(probe, item))
+                .collect();
+            return Ok(if pyre_object::is_frozenset(a) {
+                pyre_object::w_frozenset_from_items(&result)
+            } else {
+                pyre_object::w_set_from_items(&result)
+            });
+        }
         if let Some(result) = try_instance_binop(a, b, "__and__") {
             return result;
         }
@@ -1228,6 +1256,18 @@ pub fn or_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         if is_int_or_long(a) && is_int_or_long(b) {
             return long_bitor(a, b);
         }
+        // set / frozenset union — PyPy: setobject.py W_BaseSetObject.descr_or
+        if pyre_object::is_set_or_frozenset(a) {
+            let mut items = pyre_object::w_set_items(a);
+            for item in crate::builtins::collect_iterable(b)? {
+                items.push(item);
+            }
+            return Ok(if pyre_object::is_frozenset(a) {
+                pyre_object::w_frozenset_from_items(&items)
+            } else {
+                pyre_object::w_set_from_items(&items)
+            });
+        }
         if let Some(result) = try_instance_binop(a, b, "__or__") {
             return result;
         }
@@ -1236,7 +1276,6 @@ pub fn or_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         if unionable(a) && unionable(b) {
             return Ok(pyre_object::w_union_new(a, b));
         }
-        // set | set bitwise OR
         if let Some(result) = try_instance_binop(a, b, "__ror__") {
             return result;
         }
@@ -1346,6 +1385,30 @@ pub fn compare(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
                 CompareOp::Ne => la != lb,
             }));
         }
+        // set / frozenset comparison — subset / superset / equality.
+        // PyPy: setobject.py W_BaseSetObject.descr_eq, descr_le, descr_lt
+        if pyre_object::is_set_or_frozenset(a) && pyre_object::is_set_or_frozenset(b) {
+            let la = pyre_object::w_set_len(a);
+            let lb = pyre_object::w_set_len(b);
+            let a_subset_b = || {
+                pyre_object::w_set_items(a)
+                    .into_iter()
+                    .all(|item| pyre_object::w_set_contains(b, item))
+            };
+            let b_subset_a = || {
+                pyre_object::w_set_items(b)
+                    .into_iter()
+                    .all(|item| pyre_object::w_set_contains(a, item))
+            };
+            return Ok(w_bool_from(match op {
+                CompareOp::Eq => la == lb && a_subset_b(),
+                CompareOp::Ne => la != lb || !a_subset_b(),
+                CompareOp::Le => la <= lb && a_subset_b(),
+                CompareOp::Lt => la < lb && a_subset_b(),
+                CompareOp::Ge => la >= lb && b_subset_a(),
+                CompareOp::Gt => la > lb && b_subset_a(),
+            }));
+        }
         // List lexicographic comparison — same logic as tuple.
         if is_list(a) && is_list(b) {
             let la = pyre_object::w_list_len(a);
@@ -1442,6 +1505,9 @@ pub fn is_true(obj: PyObjectRef) -> bool {
         }
         if is_dict(obj) {
             return w_dict_len(obj) > 0;
+        }
+        if pyre_object::is_set_or_frozenset(obj) {
+            return pyre_object::w_set_len(obj) > 0;
         }
         if is_none(obj) {
             return false;
@@ -1663,13 +1729,12 @@ pub fn getitem(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
                         format!("'{}'", w_str_get_value(index))
                     } else if is_int(index) {
                         format!("{}", w_int_get_value(index))
+                    } else if !index.is_null() {
+                        crate::py_repr(index)
                     } else {
-                        "key".to_string()
+                        "<null>".to_string()
                     };
-                    Err(PyError::new(
-                        PyErrorKind::KeyError,
-                        format!("KeyError: {key_repr}"),
-                    ))
+                    Err(PyError::new(PyErrorKind::KeyError, key_repr))
                 }
             }
         } else if is_str(obj) {
@@ -2087,6 +2152,8 @@ pub fn len(obj: PyObjectRef) -> PyResult {
             Ok(w_int_new(w_tuple_len(obj) as i64))
         } else if is_dict(obj) {
             Ok(w_int_new(w_dict_len(obj) as i64))
+        } else if pyre_object::is_set_or_frozenset(obj) {
+            Ok(w_int_new(pyre_object::w_set_len(obj) as i64))
         } else if is_str(obj) {
             Ok(w_int_new(w_str_len(obj) as i64))
         } else if pyre_object::bytearrayobject::is_bytearray(obj) {
@@ -3478,6 +3545,14 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
             let len = entries.len();
             return Ok(pyre_object::w_seq_iter_new(key_list, len));
         }
+        // set / frozenset → iterate via stable insertion order (PyPy:
+        // setobject.py W_BaseSetObject.descr_iter, W_BaseSetIterObject).
+        if pyre_object::is_set_or_frozenset(obj) {
+            let items = pyre_object::w_set_items(obj);
+            let len = items.len();
+            let key_list = pyre_object::w_list_new(items);
+            return Ok(pyre_object::w_seq_iter_new(key_list, len));
+        }
         // Already an iterator
         if is_range_iter(obj) || is_seq_iter(obj) || pyre_object::generatorobject::is_generator(obj)
         {
@@ -4081,6 +4156,10 @@ pub fn contains(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, PyEr
         // dict: key containment (dictobject.py __contains__)
         if is_dict(haystack) {
             return Ok(w_dict_lookup(haystack, needle).is_some());
+        }
+        // set / frozenset (setobject.py W_BaseSetObject.descr_contains)
+        if pyre_object::is_set_or_frozenset(haystack) {
+            return Ok(pyre_object::w_set_contains(haystack, needle));
         }
     }
     // Instance __contains__ — PyPy: descroperation.py contains_w

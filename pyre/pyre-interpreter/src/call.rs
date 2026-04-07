@@ -3,13 +3,51 @@
 //! JIT-specific call infrastructure (force/bridge callbacks, callee frame
 //! creation helpers, frame pool) lives in pyre-jit/src/call_jit.rs.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::sync::OnceLock;
 
 use crate::{
     PyError, PyErrorKind, PyNamespace, PyResult, builtin_code_get, dispatch_callable,
     function_get_closure, function_get_code, function_get_globals,
 };
+
+thread_local! {
+    /// Most recent error swallowed by `call_function_impl` /
+    /// `call_user_function_with_args`. These functions return a bare
+    /// `PyObjectRef` for legacy reasons; when the underlying call raises,
+    /// they stash the error here and return PY_NULL / w_none() so that
+    /// callers that need the real error can pull it back out via
+    /// `take_call_error()`.
+    ///
+    /// Pattern is the inverse of CPython's `PyErr_Occurred()` — see
+    /// `pyerrors.c`. Same idea: a thread-local error indicator paired with
+    /// out-of-band NULL returns.
+    static PENDING_CALL_ERROR: RefCell<Option<PyError>> = const { RefCell::new(None) };
+}
+
+/// Stash an error from the bare-PyObjectRef call path so a caller that
+/// recognizes the NULL return can recover the original PyError.
+pub(crate) fn set_call_error(e: PyError) {
+    PENDING_CALL_ERROR.with(|slot| {
+        *slot.borrow_mut() = Some(e);
+    });
+}
+
+/// Take and clear the most recent stashed call error. Returns None if no
+/// error is pending. Callers must pair this with the bare-return call
+/// helpers (`call_function_impl`, `call_function_impl_raw`,
+/// `call_user_function_with_args`) immediately after the call so the
+/// error refers to the most recent failed dispatch.
+pub fn take_call_error() -> Option<PyError> {
+    PENDING_CALL_ERROR.with(|slot| slot.borrow_mut().take())
+}
+
+/// Clear any pending stashed error without consuming it.
+pub fn clear_call_error() {
+    PENDING_CALL_ERROR.with(|slot| {
+        slot.borrow_mut().take();
+    });
+}
 use pyre_object::{PY_NULL, PyObjectRef};
 
 use crate::eval::eval_frame_plain;
@@ -907,7 +945,8 @@ pub(crate) fn call_function_impl(callable: PyObjectRef, args: &[PyObjectRef]) ->
                         if std::env::var("PYRE_DEBUG_CALL").is_ok() {
                             eprintln!("[call_function_impl] builtin error: {}", e.message);
                         }
-                        pyre_object::w_none()
+                        set_call_error(e);
+                        PY_NULL
                     }
                 };
             }
@@ -1104,7 +1143,13 @@ fn call_user_function_with_args(func: PyObjectRef, args: &[PyObjectRef]) -> PyOb
     let mut frame =
         PyFrame::new_for_call_with_closure(w_code, &final_args, globals, exec_ctx, closure);
     frame.fix_array_ptrs();
-    eval_frame_plain(&mut frame).unwrap_or(PY_NULL)
+    match eval_frame_plain(&mut frame) {
+        Ok(v) => v,
+        Err(e) => {
+            set_call_error(e);
+            PY_NULL
+        }
+    }
 }
 
 /// Call a metaclass with extra keyword arguments.
@@ -1432,6 +1477,7 @@ fn build_class_inner(
         // expects the user-declared bases. Default (object,) is added by
         // type.__new__ internally if needed.
         let name_obj = pyre_object::w_str_new(name);
+        clear_call_error();
         let result = if let Some(kw) = extra_kwargs {
             // Only use kwargs path if there are actual extra kwargs
             let has_extra = unsafe { pyre_object::is_dict(kw) && pyre_object::w_dict_len(kw) > 0 };
@@ -1443,6 +1489,16 @@ fn build_class_inner(
         } else {
             crate::call_function(w_metaclass, &[name_obj, bases, w_namespace_dict])
         };
+        // If the metaclass call raised, propagate the original error rather
+        // than silently producing a NULL class object.
+        if result.is_null() {
+            if let Some(err) = take_call_error() {
+                return Err(err);
+            }
+            return Err(PyError::type_error(format!(
+                "metaclass call for {name} returned NULL"
+            )));
+        }
         // baseobjspace.py:76 getclass() — set w_class to the metaclass
         // so type(C) returns the correct metatype.
         if unsafe { pyre_object::is_type(result) } {

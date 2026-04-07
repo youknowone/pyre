@@ -357,6 +357,16 @@ pub fn init_typeobjects() {
         new_typeobject_with_base("bytearray", init_bytearray_type, object_type) as usize,
     );
 
+    // set / frozenset — PyPy: setobject.py, bases=(object,)
+    reg.insert(
+        &pyre_object::setobject::SET_TYPE as *const PyType as usize,
+        new_typeobject_with_base("set", init_set_type, object_type) as usize,
+    );
+    reg.insert(
+        &pyre_object::setobject::FROZENSET_TYPE as *const PyType as usize,
+        new_typeobject_with_base("frozenset", init_frozenset_type, object_type) as usize,
+    );
+
     let _ = TYPEOBJECT_CACHE.set(reg);
 
     // rclass.py:739-743 parity — cache W_TypeObject on each PyType
@@ -569,7 +579,45 @@ fn int_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 }
 
 descr_new_wrapper!(float_descr_new, crate::builtins::builtin_float);
-descr_new_wrapper!(str_descr_new, crate::builtins::builtin_str);
+
+/// Wrap a `__new__` builtin function in a staticmethod descriptor.
+///
+/// `__new__` must NOT bind a receiver — calling `cls.__new__(other_cls, ...)`
+/// passes `other_cls` as the first argument, not `cls`. PyPy/CPython model
+/// this by automatically wrapping `__new__` definitions in `staticmethod` at
+/// type-creation time. pyre's TypeDef registry uses this helper at install
+/// time so each builtin type's `__new__` slot already carries the correct
+/// non-binding descriptor.
+fn make_new_descr(func: fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>) -> PyObjectRef {
+    let f = make_builtin_function("__new__", func);
+    pyre_object::w_staticmethod_new(f)
+}
+
+/// `str.__new__(cls, *args)` — PyPy: unicodeobject.py descr__new__
+///
+/// `cls` is `str` itself: return the plain `W_StrObject` from `builtin_str`.
+/// `cls` is a `str` subclass: build the value, then allocate a fresh
+/// `W_StrObject` tagged with `__class__ = cls` so `type(obj) == cls` while
+/// the underlying layout still satisfies `is_str()` for the JIT fast path.
+fn str_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let cls = if args.is_empty() {
+        pyre_object::PY_NULL
+    } else {
+        args[0]
+    };
+    let value = crate::builtins::builtin_str(&args[1..])?;
+    if cls.is_null() || !unsafe { pyre_object::is_type(cls) } {
+        return Ok(value);
+    }
+    let str_typeobj = gettypefor(&pyre_object::STR_TYPE);
+    if str_typeobj.map_or(false, |t| std::ptr::eq(cls, t)) {
+        return Ok(value);
+    }
+    let s_owned = unsafe { pyre_object::w_str_get_value(value) }.to_string();
+    let obj = pyre_object::w_str_new(&s_owned);
+    let _ = crate::baseobjspace::setattr(obj, "__class__", cls);
+    Ok(obj)
+}
 
 /// dict.__new__(cls, *args) — if cls is a dict subclass, create an instance
 /// with a backing dict for storage. PyPy: dictobject.py descr__new__
@@ -616,11 +664,7 @@ descr_new_wrapper!(tuple_descr_new, crate::builtins::builtin_tuple);
 // PyPy: pypy/objspace/std/listobject.py TypeDef("list", ...)
 
 fn init_list_type(ns: &mut PyNamespace) {
-    namespace_store(
-        ns,
-        "__new__",
-        make_builtin_function("__new__", list_descr_new),
-    );
+    namespace_store(ns, "__new__", make_new_descr(list_descr_new));
     namespace_store(
         ns,
         "append",
@@ -682,11 +726,7 @@ fn init_list_type(ns: &mut PyNamespace) {
 // PyPy: pypy/objspace/std/unicodeobject.py TypeDef("str", ...)
 
 fn init_str_type(ns: &mut PyNamespace) {
-    namespace_store(
-        ns,
-        "__new__",
-        make_builtin_function("__new__", str_descr_new),
-    );
+    namespace_store(ns, "__new__", make_new_descr(str_descr_new));
     namespace_store(
         ns,
         "join",
@@ -1023,11 +1063,7 @@ fn init_str_type(ns: &mut PyNamespace) {
 // PyPy: pypy/objspace/std/dictobject.py TypeDef("dict", ...)
 
 fn init_dict_type(ns: &mut PyNamespace) {
-    namespace_store(
-        ns,
-        "__new__",
-        make_builtin_function("__new__", dict_descr_new),
-    );
+    namespace_store(ns, "__new__", make_new_descr(dict_descr_new));
     namespace_store(
         ns,
         "get",
@@ -1243,11 +1279,7 @@ fn init_dict_type(ns: &mut PyNamespace) {
 // ── Tuple TypeDef ────────────────────────────────────────────────────
 
 fn init_tuple_type(ns: &mut PyNamespace) {
-    namespace_store(
-        ns,
-        "__new__",
-        make_builtin_function("__new__", tuple_descr_new),
-    );
+    namespace_store(ns, "__new__", make_new_descr(tuple_descr_new));
     namespace_store(
         ns,
         "index",
@@ -1386,7 +1418,7 @@ fn init_type_type(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "__new__",
-        make_builtin_function("__new__", crate::builtins::type_descr_new),
+        make_new_descr(crate::builtins::type_descr_new),
     );
     // type.__init__ — no-op for now
     namespace_store(
@@ -1498,22 +1530,29 @@ fn init_function_type(ns: &mut PyNamespace) {
             let w_function = args.first().copied().unwrap_or(pyre_object::w_none());
             let w_obj = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
             let w_cls = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
-            // function.py:466-468 descr_function_get
-            let asking_for_bound = unsafe {
-                (w_cls.is_null() || pyre_object::is_none(w_cls))
-                    || (!w_obj.is_null() && !pyre_object::is_none(w_obj))
-                    || std::ptr::eq(w_cls, gettypeobject(&pyre_object::NONE_TYPE))
-            };
-            if asking_for_bound {
+            // function.py:464-470 descr_function_get
+            //
+            //   asking_for_function = (
+            //       space.is_w(w_cls, space.w_None)
+            //       or (
+            //           space.is_w(w_obj, space.w_None)
+            //           and not space.is_w(w_cls, space.type(space.w_None))
+            //       )
+            //   )
+            //
+            // The class-access case (`w_obj == None and w_cls is some type`)
+            // returns the bare function — that's how `cls.func` stays callable
+            // as a plain function rather than a bound method.
+            let cls_is_none = unsafe { w_cls.is_null() || pyre_object::is_none(w_cls) };
+            let obj_is_none = unsafe { w_obj.is_null() || pyre_object::is_none(w_obj) };
+            let cls_is_none_type =
+                unsafe { std::ptr::eq(w_cls, gettypeobject(&pyre_object::NONE_TYPE)) };
+            let asking_for_function = cls_is_none || (obj_is_none && !cls_is_none_type);
+            if asking_for_function {
+                Ok(w_function)
+            } else {
                 // function.py:470  Method(space, w_function, w_obj, w_cls)
                 Ok(pyre_object::w_method_new(w_function, w_obj, w_cls))
-            } else {
-                // function.py:472  Method(space, w_function, None, w_cls)
-                Ok(pyre_object::w_method_new(
-                    w_function,
-                    pyre_object::PY_NULL,
-                    w_cls,
-                ))
             }
         }),
     );
@@ -1597,11 +1636,7 @@ fn init_classmethod_type(ns: &mut PyNamespace) {
 }
 
 fn init_int_type(ns: &mut PyNamespace) {
-    namespace_store(
-        ns,
-        "__new__",
-        make_builtin_function("__new__", int_descr_new),
-    );
+    namespace_store(ns, "__new__", make_new_descr(int_descr_new));
     namespace_store(
         ns,
         "bit_length",
@@ -1757,18 +1792,10 @@ fn init_int_type(ns: &mut PyNamespace) {
     );
 }
 fn init_float_type(ns: &mut PyNamespace) {
-    namespace_store(
-        ns,
-        "__new__",
-        make_builtin_function("__new__", float_descr_new),
-    );
+    namespace_store(ns, "__new__", make_new_descr(float_descr_new));
 }
 fn init_bool_type(ns: &mut PyNamespace) {
-    namespace_store(
-        ns,
-        "__new__",
-        make_builtin_function("__new__", bool_descr_new),
-    );
+    namespace_store(ns, "__new__", make_new_descr(bool_descr_new));
 }
 
 // ── Object TypeDef ───────────────────────────────────────────────────
@@ -1797,11 +1824,7 @@ fn object_descr_init(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
 }
 
 fn init_object_type(ns: &mut PyNamespace) {
-    namespace_store(
-        ns,
-        "__new__",
-        make_builtin_function("__new__", object_descr_new),
-    );
+    namespace_store(ns, "__new__", make_new_descr(object_descr_new));
     namespace_store(
         ns,
         "__init__",
@@ -2037,4 +2060,432 @@ fn init_bytearray_type(ns: &mut PyNamespace) {
             }
         }),
     );
+}
+
+// ── set / frozenset TypeDef ──────────────────────────────────────────
+// PyPy: pypy/objspace/std/setobject.py W_BaseSetObject.typedef
+// pyre splits the shared methods through `init_setlike_common` so the
+// frozenset typedef can omit the in-place mutators.
+
+fn init_setlike_common(ns: &mut PyNamespace) {
+    namespace_store(
+        ns,
+        "__contains__",
+        make_builtin_function("__contains__", |args| {
+            if args.len() < 2 {
+                return Ok(pyre_object::w_bool_from(false));
+            }
+            unsafe {
+                if pyre_object::is_set_or_frozenset(args[0]) {
+                    return Ok(pyre_object::w_bool_from(pyre_object::w_set_contains(
+                        args[0], args[1],
+                    )));
+                }
+            }
+            Ok(pyre_object::w_bool_from(false))
+        }),
+    );
+    namespace_store(
+        ns,
+        "__len__",
+        make_builtin_function("__len__", |args| {
+            if args.is_empty() {
+                return Ok(pyre_object::w_int_new(0));
+            }
+            unsafe {
+                if pyre_object::is_set_or_frozenset(args[0]) {
+                    return Ok(pyre_object::w_int_new(
+                        pyre_object::w_set_len(args[0]) as i64
+                    ));
+                }
+            }
+            Ok(pyre_object::w_int_new(0))
+        }),
+    );
+    namespace_store(
+        ns,
+        "__iter__",
+        make_builtin_function("__iter__", |args| {
+            if args.is_empty() {
+                return Ok(pyre_object::w_none());
+            }
+            crate::baseobjspace::iter(args[0])
+        }),
+    );
+    namespace_store(
+        ns,
+        "__bool__",
+        make_builtin_function("__bool__", |args| {
+            if args.is_empty() {
+                return Ok(pyre_object::w_bool_from(false));
+            }
+            unsafe {
+                if pyre_object::is_set_or_frozenset(args[0]) {
+                    return Ok(pyre_object::w_bool_from(
+                        pyre_object::w_set_len(args[0]) > 0,
+                    ));
+                }
+            }
+            Ok(pyre_object::w_bool_from(true))
+        }),
+    );
+    namespace_store(
+        ns,
+        "__or__",
+        make_builtin_function("__or__", set_method_union),
+    );
+    namespace_store(
+        ns,
+        "__and__",
+        make_builtin_function("__and__", set_method_intersection),
+    );
+    namespace_store(
+        ns,
+        "__sub__",
+        make_builtin_function("__sub__", set_method_difference),
+    );
+    namespace_store(
+        ns,
+        "__xor__",
+        make_builtin_function("__xor__", set_method_symmetric_difference),
+    );
+    namespace_store(ns, "__eq__", make_builtin_function("__eq__", set_method_eq));
+    namespace_store(ns, "__le__", make_builtin_function("__le__", set_method_le));
+    namespace_store(ns, "__ge__", make_builtin_function("__ge__", set_method_ge));
+    namespace_store(
+        ns,
+        "__lt__",
+        make_builtin_function("__lt__", |args| {
+            if args.len() < 2 {
+                return Ok(pyre_object::w_bool_from(false));
+            }
+            let le = unsafe { pyre_object::w_bool_get_value(set_method_le(args)?) };
+            let eq = unsafe { pyre_object::w_bool_get_value(set_method_eq(args)?) };
+            Ok(pyre_object::w_bool_from(le && !eq))
+        }),
+    );
+    namespace_store(
+        ns,
+        "__gt__",
+        make_builtin_function("__gt__", |args| {
+            if args.len() < 2 {
+                return Ok(pyre_object::w_bool_from(false));
+            }
+            let ge = unsafe { pyre_object::w_bool_get_value(set_method_ge(args)?) };
+            let eq = unsafe { pyre_object::w_bool_get_value(set_method_eq(args)?) };
+            Ok(pyre_object::w_bool_from(ge && !eq))
+        }),
+    );
+    namespace_store(
+        ns,
+        "union",
+        make_builtin_function("union", set_method_union),
+    );
+    namespace_store(
+        ns,
+        "intersection",
+        make_builtin_function("intersection", set_method_intersection),
+    );
+    namespace_store(
+        ns,
+        "difference",
+        make_builtin_function("difference", set_method_difference),
+    );
+    namespace_store(
+        ns,
+        "symmetric_difference",
+        make_builtin_function("symmetric_difference", set_method_symmetric_difference),
+    );
+    namespace_store(
+        ns,
+        "issubset",
+        make_builtin_function("issubset", set_method_le),
+    );
+    namespace_store(
+        ns,
+        "issuperset",
+        make_builtin_function("issuperset", set_method_ge),
+    );
+    namespace_store(
+        ns,
+        "isdisjoint",
+        make_builtin_function("isdisjoint", |args| {
+            if args.len() < 2 {
+                return Ok(pyre_object::w_bool_from(true));
+            }
+            let other_items = crate::builtins::collect_iterable(args[1])?;
+            unsafe {
+                for item in &other_items {
+                    if pyre_object::w_set_contains(args[0], *item) {
+                        return Ok(pyre_object::w_bool_from(false));
+                    }
+                }
+            }
+            Ok(pyre_object::w_bool_from(true))
+        }),
+    );
+    namespace_store(
+        ns,
+        "copy",
+        make_builtin_function("copy", |args| {
+            if args.is_empty() {
+                return Ok(pyre_object::w_set_new());
+            }
+            let items = unsafe { pyre_object::w_set_items(args[0]) };
+            unsafe {
+                if pyre_object::is_frozenset(args[0]) {
+                    return Ok(pyre_object::w_frozenset_from_items(&items));
+                }
+            }
+            Ok(pyre_object::w_set_from_items(&items))
+        }),
+    );
+}
+
+fn set_method_union(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    if args.is_empty() {
+        return Ok(pyre_object::w_set_new());
+    }
+    let mut items = unsafe { pyre_object::w_set_items(args[0]) };
+    for other in &args[1..] {
+        let other_items = crate::builtins::collect_iterable(*other)?;
+        for item in other_items {
+            items.push(item);
+        }
+    }
+    unsafe {
+        if pyre_object::is_frozenset(args[0]) {
+            return Ok(pyre_object::w_frozenset_from_items(&items));
+        }
+    }
+    Ok(pyre_object::w_set_from_items(&items))
+}
+
+fn set_method_intersection(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    if args.is_empty() {
+        return Ok(pyre_object::w_set_new());
+    }
+    let self_items = unsafe { pyre_object::w_set_items(args[0]) };
+    let mut result: Vec<pyre_object::PyObjectRef> = self_items;
+    for other in &args[1..] {
+        let other_items = crate::builtins::collect_iterable(*other)?;
+        result.retain(|&item| unsafe {
+            other_items
+                .iter()
+                .any(|&o| pyre_object::w_set_contains(pyre_object::w_set_from_items(&[o]), item))
+        });
+    }
+    unsafe {
+        if pyre_object::is_frozenset(args[0]) {
+            return Ok(pyre_object::w_frozenset_from_items(&result));
+        }
+    }
+    Ok(pyre_object::w_set_from_items(&result))
+}
+
+fn set_method_difference(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    if args.is_empty() {
+        return Ok(pyre_object::w_set_new());
+    }
+    let mut items = unsafe { pyre_object::w_set_items(args[0]) };
+    for other in &args[1..] {
+        let other_items = crate::builtins::collect_iterable(*other)?;
+        let probe = pyre_object::w_set_from_items(&other_items);
+        items.retain(|&item| !unsafe { pyre_object::w_set_contains(probe, item) });
+    }
+    unsafe {
+        if pyre_object::is_frozenset(args[0]) {
+            return Ok(pyre_object::w_frozenset_from_items(&items));
+        }
+    }
+    Ok(pyre_object::w_set_from_items(&items))
+}
+
+fn set_method_symmetric_difference(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    if args.len() < 2 {
+        if args.is_empty() {
+            return Ok(pyre_object::w_set_new());
+        }
+        return Ok(args[0]);
+    }
+    let self_items = unsafe { pyre_object::w_set_items(args[0]) };
+    let other_items = crate::builtins::collect_iterable(args[1])?;
+    let other_probe = pyre_object::w_set_from_items(&other_items);
+    let self_probe = pyre_object::w_set_from_items(&self_items);
+    let mut result: Vec<pyre_object::PyObjectRef> = self_items
+        .iter()
+        .copied()
+        .filter(|&item| !unsafe { pyre_object::w_set_contains(other_probe, item) })
+        .collect();
+    for item in other_items {
+        if !unsafe { pyre_object::w_set_contains(self_probe, item) } {
+            result.push(item);
+        }
+    }
+    unsafe {
+        if pyre_object::is_frozenset(args[0]) {
+            return Ok(pyre_object::w_frozenset_from_items(&result));
+        }
+    }
+    Ok(pyre_object::w_set_from_items(&result))
+}
+
+fn set_method_eq(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    if args.len() < 2 {
+        return Ok(pyre_object::w_bool_from(false));
+    }
+    unsafe {
+        if !pyre_object::is_set_or_frozenset(args[1]) {
+            return Ok(pyre_object::w_bool_from(false));
+        }
+        if pyre_object::w_set_len(args[0]) != pyre_object::w_set_len(args[1]) {
+            return Ok(pyre_object::w_bool_from(false));
+        }
+        for item in pyre_object::w_set_items(args[0]) {
+            if !pyre_object::w_set_contains(args[1], item) {
+                return Ok(pyre_object::w_bool_from(false));
+            }
+        }
+    }
+    Ok(pyre_object::w_bool_from(true))
+}
+
+fn set_method_le(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    if args.len() < 2 {
+        return Ok(pyre_object::w_bool_from(true));
+    }
+    let other_items = crate::builtins::collect_iterable(args[1])?;
+    let probe = pyre_object::w_set_from_items(&other_items);
+    unsafe {
+        for item in pyre_object::w_set_items(args[0]) {
+            if !pyre_object::w_set_contains(probe, item) {
+                return Ok(pyre_object::w_bool_from(false));
+            }
+        }
+    }
+    Ok(pyre_object::w_bool_from(true))
+}
+
+fn set_method_ge(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    if args.len() < 2 {
+        return Ok(pyre_object::w_bool_from(true));
+    }
+    let other_items = crate::builtins::collect_iterable(args[1])?;
+    unsafe {
+        for item in other_items {
+            if !pyre_object::w_set_contains(args[0], item) {
+                return Ok(pyre_object::w_bool_from(false));
+            }
+        }
+    }
+    Ok(pyre_object::w_bool_from(true))
+}
+
+fn init_set_type(ns: &mut PyNamespace) {
+    init_setlike_common(ns);
+    namespace_store(
+        ns,
+        "add",
+        make_builtin_function("add", |args| {
+            if args.len() >= 2 {
+                unsafe { pyre_object::w_set_add(args[0], args[1]) };
+            }
+            Ok(pyre_object::w_none())
+        }),
+    );
+    namespace_store(
+        ns,
+        "discard",
+        make_builtin_function("discard", |args| {
+            if args.len() >= 2 {
+                unsafe { pyre_object::w_set_discard(args[0], args[1]) };
+            }
+            Ok(pyre_object::w_none())
+        }),
+    );
+    namespace_store(
+        ns,
+        "remove",
+        make_builtin_function("remove", |args| {
+            if args.len() < 2 {
+                return Err(crate::PyError::type_error("remove() requires an argument"));
+            }
+            let removed = unsafe { pyre_object::w_set_discard(args[0], args[1]) };
+            if !removed {
+                return Err(crate::PyError::new(
+                    crate::PyErrorKind::KeyError,
+                    "set.remove(x): x not in set",
+                ));
+            }
+            Ok(pyre_object::w_none())
+        }),
+    );
+    namespace_store(
+        ns,
+        "pop",
+        make_builtin_function("pop", |args| {
+            if args.is_empty() {
+                return Err(crate::PyError::new(
+                    crate::PyErrorKind::KeyError,
+                    "pop from an empty set",
+                ));
+            }
+            let items = unsafe { pyre_object::w_set_items(args[0]) };
+            if let Some(&item) = items.first() {
+                unsafe { pyre_object::w_set_discard(args[0], item) };
+                return Ok(item);
+            }
+            Err(crate::PyError::new(
+                crate::PyErrorKind::KeyError,
+                "pop from an empty set",
+            ))
+        }),
+    );
+    namespace_store(
+        ns,
+        "clear",
+        make_builtin_function("clear", |args| {
+            if !args.is_empty() {
+                let items = unsafe { pyre_object::w_set_items(args[0]) };
+                for item in items {
+                    unsafe { pyre_object::w_set_discard(args[0], item) };
+                }
+            }
+            Ok(pyre_object::w_none())
+        }),
+    );
+    namespace_store(
+        ns,
+        "update",
+        make_builtin_function("update", |args| {
+            if args.is_empty() {
+                return Ok(pyre_object::w_none());
+            }
+            for other in &args[1..] {
+                let other_items = crate::builtins::collect_iterable(*other)?;
+                for item in other_items {
+                    unsafe { pyre_object::w_set_add(args[0], item) };
+                }
+            }
+            Ok(pyre_object::w_none())
+        }),
+    );
+}
+
+fn init_frozenset_type(ns: &mut PyNamespace) {
+    init_setlike_common(ns);
 }

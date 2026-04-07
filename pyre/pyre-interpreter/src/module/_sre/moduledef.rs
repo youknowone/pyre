@@ -86,11 +86,51 @@ pub fn init(ns: &mut PyNamespace) {
     );
     // Create SRE_Pattern and SRE_Match types.
     // PyPy: interp_sre.py W_SRE_Pattern, W_SRE_Match
-    let pat_type = crate::typedef::make_builtin_type("re.Pattern", |_| {});
+    let pat_type = crate::typedef::make_builtin_type("re.Pattern", init_sre_pattern_type);
     SRE_PATTERN_TYPE.with(|t| *t.borrow_mut() = pat_type);
-    let match_type = crate::typedef::make_builtin_type("re.Match", |_| {});
+    let match_type = crate::typedef::make_builtin_type("re.Match", init_sre_match_type);
     SRE_MATCH_TYPE.with(|t| *t.borrow_mut() = match_type);
 }
+
+/// Register Pattern instance methods on the type so that `pat.match(s)`
+/// goes through the descriptor protocol and binds `pat` as `self`. Each
+/// per-pattern data lives in `ATTR_TABLE` keyed by the instance address.
+fn init_sre_pattern_type(ns: &mut PyNamespace) {
+    namespace_store(
+        ns,
+        "match",
+        make_builtin_function("match", sre_pattern_match),
+    );
+    namespace_store(
+        ns,
+        "fullmatch",
+        make_builtin_function("fullmatch", sre_pattern_fullmatch),
+    );
+    namespace_store(
+        ns,
+        "search",
+        make_builtin_function("search", sre_pattern_search),
+    );
+    namespace_store(
+        ns,
+        "findall",
+        make_builtin_function("findall", sre_pattern_findall),
+    );
+    namespace_store(
+        ns,
+        "finditer",
+        make_builtin_function("finditer", sre_pattern_finditer),
+    );
+    namespace_store(ns, "sub", make_builtin_function("sub", sre_pattern_sub));
+    namespace_store(ns, "subn", make_builtin_function("subn", sre_pattern_sub));
+    namespace_store(
+        ns,
+        "split",
+        make_builtin_function("split", sre_pattern_split),
+    );
+}
+
+fn init_sre_match_type(_ns: &mut PyNamespace) {}
 
 /// _sre.compile(pattern, flags, code, groups, groupindex, indexgroup)
 fn sre_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -137,19 +177,6 @@ fn sre_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         );
         d.insert("_code_len".into(), w_int_new(code_box.len() as i64));
     });
-
-    for (name, func) in [
-        ("match", sre_pattern_match as fn(&[PyObjectRef]) -> _),
-        ("search", sre_pattern_search),
-        ("findall", sre_pattern_findall),
-        ("finditer", sre_pattern_finditer),
-        ("sub", sre_pattern_sub),
-        ("subn", sre_pattern_sub),
-        ("split", sre_pattern_split),
-        ("fullmatch", sre_pattern_fullmatch),
-    ] {
-        let _ = crate::baseobjspace::setattr(pat, name, make_builtin_function(name, func));
-    }
 
     Ok(pat)
 }

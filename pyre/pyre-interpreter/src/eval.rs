@@ -374,6 +374,16 @@ impl IterOpcodeHandler for PyFrame {
                 self.locals_cells_stack_w[self.valuestackdepth - 1] = seq_iter;
                 return Ok(());
             }
+            // set / frozenset → iterate via insertion order (PyPy:
+            // setobject.py W_BaseSetObject.descr_iter)
+            if pyre_object::is_set_or_frozenset(iter) {
+                let items = pyre_object::w_set_items(iter);
+                let len = items.len();
+                let key_list = pyre_object::w_list_new(items);
+                let seq_iter = pyre_object::w_seq_iter_new(key_list, len);
+                self.locals_cells_stack_w[self.valuestackdepth - 1] = seq_iter;
+                return Ok(());
+            }
             // User-defined __iter__ — PyPy: space.iter → __iter__()
             // Delegates to baseobjspace::iter which handles type MRO,
             // ATTR_TABLE, and __getitem__ fallback (PyPy: space.iter →
@@ -585,6 +595,10 @@ impl ConstantOpcodeHandler for PyFrame {
         step: Self::Value,
     ) -> Result<Self::Value, PyError> {
         Ok(pyre_object::w_slice_new(start, stop, step))
+    }
+
+    fn frozenset_constant(&mut self, items: &[Self::Value]) -> Result<Self::Value, PyError> {
+        Ok(pyre_object::w_frozenset_from_items(items))
     }
 }
 
@@ -1673,7 +1687,12 @@ impl OpcodeStepExecutor for PyFrame {
         let iterable = self.pop();
         let set = PyFrame::peek_at(self, i - 1);
         unsafe {
-            if pyre_object::is_list(set) {
+            if pyre_object::is_set_or_frozenset(set) {
+                let items = crate::builtins::collect_iterable(iterable)?;
+                for item in items {
+                    pyre_object::w_set_add(set, item);
+                }
+            } else if pyre_object::is_list(set) {
                 if pyre_object::is_list(iterable) {
                     let src = &*(iterable as *const pyre_object::listobject::W_ListObject);
                     for &item in src.items.as_slice() {
@@ -1683,14 +1702,6 @@ impl OpcodeStepExecutor for PyFrame {
                     let src = &*(iterable as *const pyre_object::tupleobject::W_TupleObject);
                     for &item in src.items.as_slice() {
                         pyre_object::w_list_append(set, item);
-                    }
-                }
-            } else if pyre_object::is_instance(set) {
-                // set instance backed by __data__ dict
-                if let Ok(data) = crate::baseobjspace::getattr(set, "__data__") {
-                    let items = crate::builtins::collect_iterable(iterable)?;
-                    for item in items {
-                        pyre_object::w_dict_store(data, item, pyre_object::w_none());
                     }
                 }
             }
