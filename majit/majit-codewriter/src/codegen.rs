@@ -59,6 +59,7 @@ pub fn generate_from_pipeline(result: &crate::passes::ProgramPipelineResult) -> 
     generate_canonical_dispatch_table(&mut out, result);
     generate_dispatch_tables(&mut out);
     generate_concrete_computation(&mut out);
+    generate_concrete_object_helpers(&mut out);
     generate_trace_functions(&mut out);
 
     let flattened_count = result
@@ -450,6 +451,67 @@ pub fn concrete_int_binop(op: BinaryOperator, lhs: i64, rhs: i64) -> Option<i64>
             }
         }
         _ => None,
+    }
+}
+"#,
+    );
+}
+
+fn generate_concrete_object_helpers(out: &mut String) {
+    // ── Concrete object-level computation ──
+    // Delegates to the actual interpreter dispatch functions.
+    // baseobjspace.rs add/sub/mul/etc and compare() handle all type
+    // combinations (int, long, float, str, list, tuple, dunder) so we
+    // call them directly instead of reimplementing the dispatch.
+
+    out.push_str(
+        r#"
+/// Concrete binary computation on Python objects.
+///
+/// Delegates to baseobjspace dispatch which handles:
+///   is_int × is_int → int_add (checked, overflow → long)
+///   is_int_or_long × is_int_or_long → long_add (BigInt)
+///   is_float_pair → float_add (as_float coercion: int|float|long → f64)
+///   str, list, tuple, bytearray, dunder dispatch
+pub fn concrete_binary_value(
+    op: BinaryOperator,
+    lhs_obj: pyre_object::PyObjectRef,
+    rhs_obj: pyre_object::PyObjectRef,
+) -> crate::state::ConcreteValue {
+    use crate::state::ConcreteValue;
+    if lhs_obj.is_null() || rhs_obj.is_null() {
+        return ConcreteValue::Null;
+    }
+    // Delegate to the interpreter's baseobjspace dispatch.
+    // This handles all type combinations correctly including long,
+    // overflow promotion, str/list/tuple concat, dunder methods.
+    let result = pyre_interpreter::opcode_ops::binary_value(lhs_obj, rhs_obj, op);
+    match result {
+        Ok(r) => ConcreteValue::from_pyobj(r),
+        Err(_) => ConcreteValue::Null,
+    }
+}
+
+/// Concrete comparison computation on Python objects.
+///
+/// Delegates to baseobjspace::compare which handles:
+///   is_int × is_int → int comparison
+///   is_int_or_long × is_int_or_long → BigInt comparison
+///   is_float_pair → float comparison (as_float coercion)
+///   str comparison, dunder dispatch
+pub fn concrete_compare_value(
+    op: ComparisonOperator,
+    lhs_obj: pyre_object::PyObjectRef,
+    rhs_obj: pyre_object::PyObjectRef,
+) -> crate::state::ConcreteValue {
+    use crate::state::ConcreteValue;
+    if lhs_obj.is_null() || rhs_obj.is_null() {
+        return ConcreteValue::Null;
+    }
+    let result = pyre_interpreter::opcode_ops::compare_value(lhs_obj, rhs_obj, op);
+    match result {
+        Ok(r) => ConcreteValue::from_pyobj(r),
+        Err(_) => ConcreteValue::Null,
     }
 }
 "#,

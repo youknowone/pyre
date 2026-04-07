@@ -928,13 +928,29 @@ pub(crate) unsafe fn objspace_compare_ints(
     }
 }
 
+/// baseobjspace as_float: coerce int|float → f64.
+/// Called only for int/float operands in the tracing fast path.
+/// Long operands are handled by residual fallback, not this function.
+unsafe fn as_float_for_trace(obj: PyObjectRef) -> f64 {
+    if is_float(obj) {
+        w_float_get_value(obj)
+    } else if is_int(obj) {
+        w_int_get_value(obj) as f64
+    } else {
+        0.0 // unreachable in trace fast path — long triggers residual
+    }
+}
+
+/// Compare two numeric values as floats. Handles float_pair (int+float)
+/// via as_float coercion matching baseobjspace::float_lt/le/gt/ge/eq/ne.
+/// Long operands don't reach here — they trigger residual fallback.
 pub(crate) unsafe fn objspace_compare_floats(
     lhs_obj: PyObjectRef,
     rhs_obj: PyObjectRef,
     op: ComparisonOperator,
 ) -> bool {
-    let lhs = w_float_get_value(lhs_obj);
-    let rhs = w_float_get_value(rhs_obj);
+    let lhs = as_float_for_trace(lhs_obj);
+    let rhs = as_float_for_trace(rhs_obj);
     match op {
         ComparisonOperator::Less => lhs < rhs,
         ComparisonOperator::LessOrEqual => lhs <= rhs,
