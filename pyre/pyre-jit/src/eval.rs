@@ -1005,10 +1005,8 @@ pub fn portal_runner(frame: &mut PyFrame) -> pyre_object::PyObjectRef {
 /// pyre-local debug instrumentation (no PyPy counterpart).
 /// `@not_in_trace` so that compiled code does not include this call.
 #[majit_macros::not_in_trace]
-fn trace_jit_bytecode(pc: usize, _instruction_name: &str) {
-    if cfg!(debug_assertions) {
-        eprintln!("[pyre-jit] pc={pc}");
-    }
+fn trace_jit_bytecode(_pc: usize, _instruction_name: &str) {
+    // Debug logging disabled — per-bytecode eprintln causes O(n) slowdown.
 }
 
 /// JIT hooks are thin inline checks; all heavy logic is in #[cold] helpers.
@@ -1206,6 +1204,14 @@ fn maybe_compile_and_run(
     // available for this green_key.
     if driver.has_compiled_loop(green_key) {
         return execute_assembler(frame, green_key, loop_header_pc, driver, info, env);
+    }
+    // warmstate.py:484: DONT_TRACE_HERE → skip counter tick entirely
+    if driver
+        .meta_interp()
+        .warm_state_ref()
+        .is_dont_trace_here(green_key)
+    {
+        return None;
     }
     // warmstate.py:496-511: counter.tick → threshold reached → bound_reached
     if driver
