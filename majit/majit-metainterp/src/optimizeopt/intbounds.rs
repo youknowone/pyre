@@ -964,48 +964,70 @@ impl OptIntBounds {
 
     // ── Bound narrowing helpers ──
 
+    /// intbounds.py:564-570 make_int_lt
     fn make_int_lt(&mut self, box1: OpRef, box2: OpRef, ctx: &OptContext) {
         let b2 = self.getintbound(box2, ctx);
         let b1 = self.get_bound_mut(box1);
-        let _ = b1.make_lt(&b2);
+        if b1.make_lt(&b2).is_ok() {
+            self.propagate_bounds_backward(box1, ctx);
+        }
         let b1 = self.getintbound(box1, ctx);
         let b2_mut = self.get_bound_mut(box2);
-        let _ = b2_mut.make_gt(&b1);
+        if b2_mut.make_gt(&b1).is_ok() {
+            self.propagate_bounds_backward(box2, ctx);
+        }
     }
 
+    /// intbounds.py:572-578 make_int_le
     fn make_int_le(&mut self, box1: OpRef, box2: OpRef, ctx: &OptContext) {
         let b2 = self.getintbound(box2, ctx);
         let b1 = self.get_bound_mut(box1);
-        let _ = b1.make_le(&b2);
+        if b1.make_le(&b2).is_ok() {
+            self.propagate_bounds_backward(box1, ctx);
+        }
         let b1 = self.getintbound(box1, ctx);
         let b2_mut = self.get_bound_mut(box2);
-        let _ = b2_mut.make_ge(&b1);
+        if b2_mut.make_ge(&b1).is_ok() {
+            self.propagate_bounds_backward(box2, ctx);
+        }
     }
 
+    /// intbounds.py:580-581 make_int_gt
     fn make_int_gt(&mut self, box1: OpRef, box2: OpRef, ctx: &OptContext) {
         self.make_int_lt(box2, box1, ctx);
     }
 
+    /// intbounds.py:583-584 make_int_ge
     fn make_int_ge(&mut self, box1: OpRef, box2: OpRef, ctx: &OptContext) {
         self.make_int_le(box2, box1, ctx);
     }
 
+    /// intbounds.py:586-592 make_unsigned_lt
     fn make_unsigned_lt(&mut self, box1: OpRef, box2: OpRef, ctx: &OptContext) {
         let b2 = self.getintbound(box2, ctx);
         let b1 = self.get_bound_mut(box1);
-        let _ = b1.make_unsigned_lt(&b2);
+        if b1.make_unsigned_lt(&b2).is_ok() {
+            self.propagate_bounds_backward(box1, ctx);
+        }
         let b1 = self.getintbound(box1, ctx);
         let b2_mut = self.get_bound_mut(box2);
-        let _ = b2_mut.make_unsigned_gt(&b1);
+        if b2_mut.make_unsigned_gt(&b1).is_ok() {
+            self.propagate_bounds_backward(box2, ctx);
+        }
     }
 
+    /// intbounds.py:594-600 make_unsigned_le
     fn make_unsigned_le(&mut self, box1: OpRef, box2: OpRef, ctx: &OptContext) {
         let b2 = self.getintbound(box2, ctx);
         let b1 = self.get_bound_mut(box1);
-        let _ = b1.make_unsigned_le(&b2);
+        if b1.make_unsigned_le(&b2).is_ok() {
+            self.propagate_bounds_backward(box1, ctx);
+        }
         let b1 = self.getintbound(box1, ctx);
         let b2_mut = self.get_bound_mut(box2);
-        let _ = b2_mut.make_unsigned_ge(&b1);
+        if b2_mut.make_unsigned_ge(&b1).is_ok() {
+            self.propagate_bounds_backward(box2, ctx);
+        }
     }
 
     fn make_unsigned_gt(&mut self, box1: OpRef, box2: OpRef, ctx: &OptContext) {
