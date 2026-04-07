@@ -976,10 +976,22 @@ mod tests {
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptString::new()));
 
-        // We need to seed constants into the context. Since Optimizer::optimize
+        // Seed constants into the context. Since Optimizer::optimize
         // creates its own context, we use a custom approach: run the pass
-        // manually.
-        let mut ctx = OptContext::new(ops.len());
+        // manually. Seed reserve_pos above any trace op.pos so that
+        // force_virtual's synthesized ops don't collide with the original
+        // trace positions — matches the invariant
+        // `optimize_with_constants_and_inputs` maintains
+        // (start_next_pos = max(num_inputs, max_pos + 1)).
+        let max_pos = ops
+            .iter()
+            .map(|op| op.pos)
+            .filter(|op| !op.is_none() && !op.is_constant())
+            .map(|op| op.0)
+            .max()
+            .unwrap_or(0);
+        let start_next_pos = (max_pos + 1).max(ops.len() as u32);
+        let mut ctx = OptContext::with_num_inputs_and_start_pos(ops.len(), 0, 0, start_next_pos);
         for &(opref, val) in constants {
             ctx.make_constant(opref, Value::Int(val));
         }

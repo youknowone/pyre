@@ -889,52 +889,54 @@ impl OptContext {
     pub fn emit(&mut self, mut op: Op) -> OpRef {
         if op.pos.is_none() || op.pos.is_constant() {
             op.pos = self.reserve_pos();
-        } else if self.new_operations.iter().any(|e| e.pos == op.pos) {
-            // RPython Box parity: reassign position to avoid collision.
-            // This path is a band-aid that compensates for the flat OpRef
-            // model's lack of per-iteration Box identity. Step 2 Commit D1
-            // of the Box identity plan runs Phase 2 through a fresh
-            // TraceIterator so Phase 2 op results live in a disjoint
-            // range — after D1 this branch should fire zero times in
-            // Phase 2. Log under MAJIT_LOG so benchmark runs can detect
-            // regressions that reintroduce collisions.
-            if std::env::var_os("MAJIT_LOG").is_some() {
-                eprintln!(
-                    "[jit][emit] collision reassign {:?} → fresh (band-aid — D1 should make this dead)",
-                    op.pos
-                );
-            }
-            op.pos = self.reserve_pos();
-        } else if self.has_op_forwarding(op.pos) && op.result_type() != majit_ir::Type::Void {
-            // Phase 2 body emitting at a trace position that was forwarded
-            // by import_state (e.g. Phase 1 v14 → Phase 2 fresh v42 from
-            // heap import) would otherwise leave the fresh body op
-            // unreachable — downstream reads of v14 return v42 via the
-            // stale forwarding chain instead of the new body result.
-            // RPython Box identity isolates each Phase 2 op; the flat OpRef
-            // model must allocate a fresh position and redirect forwarding.
-            // Only Forwarded::Op triggers this — Info/Const/IntBound are
-            // terminal metadata, not positional redirects from import_state.
-            //
-            // Same band-aid scope note as above: after D1 Phase 2 emits at
-            // fresh OpRefs above next_global_opref, and import_state only
-            // forwards positions in [0..num_inputs). The two ranges are
-            // disjoint, so this branch should be dead. Log for regression
-            // detection.
-            if std::env::var_os("MAJIT_LOG").is_some() {
-                eprintln!(
-                    "[jit][emit] forwarding redirect {:?} → fresh (band-aid — D1 should make this dead)",
-                    op.pos
-                );
-            }
-            let old_pos = op.pos;
-            op.pos = self.reserve_pos();
-            // Redirect the trace position to the fresh body result so that
-            // downstream ops reading the old position pick up the freshly
-            // computed value (matching RPython where the new body Box
-            // replaces the imported one in all subsequent consumers).
-            self.replace_op(old_pos, op.pos);
         } else {
+            // Step 2 Commit D1/D2 invariants (Box identity plan, Step 7):
+            //
+            // (a) Phase 2 runs through a fresh TraceIterator whose
+            //     `_index` starts at `next_global_opref`, so Phase 2 op
+            //     results live in a disjoint `[next_global_opref..)`
+            //     range that no prior `emit` has touched.
+            //
+            // (b) Phase 1 / standalone runs start `next_pos` at
+            //     `max(num_inputs, max_raw_pos + 1)`, and `reserve_pos`
+            //     is monotonic, so fresh positions are always above any
+            //     raw trace op.pos the trace carries.
+            //
+            // (c) `import_state` only creates `Forwarded::Op` chains on
+            //     inputarg slots (in `[inputarg_base..inputarg_base +
+            //     num_inputs)`) — never on op-result positions that a
+            //     later `emit` would try to use.
+            //
+            // Together these guarantee that:
+            //   - `new_operations` never contains two ops at the same pos
+            //   - an op being emitted whose pos is a non-void result does
+            //     not already have Forwarded::Op set
+            //
+            // Earlier majit revisions compensated for the broken invariant
+            // with two reactive branches in `emit()` (a collision reassign
+            // that called `reserve_pos` again, and a forwarding-redirect
+            // that called `reserve_pos` + `replace_op(old, new)` to route
+            // downstream readers to the fresh position). Both branches
+            // are dead under the Commit D1/D2 layout — verified by
+            // `MAJIT_LOG=1 cargo test -p majit-metainterp --lib` reporting
+            // zero "band-aid" fires across 909 tests. Hard-assert the
+            // invariants here so any regression is caught at the emit
+            // site rather than at a downstream symptom.
+            debug_assert!(
+                !self.new_operations.iter().any(|e| e.pos == op.pos),
+                "emit: OpRef collision at {:?} — new_operations already contains this position. \
+                 Phase 2 should run through a fresh TraceIterator (Commit D1) and Phase 1's \
+                 reserve_pos() should be monotonic above all raw trace positions.",
+                op.pos,
+            );
+            debug_assert!(
+                !(self.has_op_forwarding(op.pos) && op.result_type() != majit_ir::Type::Void),
+                "emit: Forwarded::Op set on non-void result position {:?} — \
+                 import_state should only forward inputarg slots in \
+                 [inputarg_base..inputarg_base + num_inputs), and Phase 2 op results \
+                 live in a disjoint range [p2_high_water..) (Commit D1).",
+                op.pos,
+            );
             self.next_pos = self.next_pos.max(op.pos.0.saturating_add(1));
         }
         let pos_ref = op.pos;
