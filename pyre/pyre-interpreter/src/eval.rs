@@ -75,7 +75,7 @@ pub fn handle_exception(frame: &mut PyFrame, err: &PyError) -> bool {
     if err.kind == crate::PyErrorKind::GeneratorReturn {
         return false;
     }
-    let code = unsafe { &*frame.code };
+    let code = unsafe { &*crate::pyframe_get_pycode(frame) };
     let pc = frame.next_instr.saturating_sub(1) as u32;
 
     // Python 3.11+ exception table dispatch
@@ -126,7 +126,7 @@ pub fn eval_loop_for_force(frame: &mut PyFrame) -> PyResult {
 
 fn eval_loop(frame: &mut PyFrame) -> PyResult {
     let _current_frame_guard = install_current_frame(frame);
-    let code = unsafe { &*frame.code };
+    let code = unsafe { &*crate::pyframe_get_pycode(frame) };
 
     loop {
         if frame.next_instr >= code.instructions.len() {
@@ -705,7 +705,7 @@ impl OpcodeStepExecutor for PyFrame {
     /// LoadFast on cell slots returns the cell object itself (needed for
     /// closure creation via BUILD_TUPLE + SET_FUNCTION_ATTRIBUTE).
     fn make_cell(&mut self, idx: usize) -> Result<(), Self::Error> {
-        let code = unsafe { &*self.code };
+        let code = unsafe { &*crate::pyframe_get_pycode(self) };
         if std::env::var("PYRE_DEBUG_CELL").is_ok() {
             eprintln!("  varnames: {:?}", code.varnames);
             eprintln!("  cellvars: {:?}", code.cellvars);
@@ -1273,12 +1273,12 @@ impl OpcodeStepExecutor for PyFrame {
         // Legacy path for CPython-style RETURN_GENERATOR (not used with RustPython compiler):
         // Copy the current frame into a heap-allocated frame for the generator.
         // PyPy: GeneratorIterator stores the PyFrame and resumes it on __next__.
-        let code = self.code;
-        let code_ref = unsafe { &*code };
+        let w_code = self.code;
+        let code_ref = unsafe { &*crate::pyframe_get_pycode(self) };
         let n_total = code_ref.varnames.len() + code_ref.cellvars.len() + code_ref.freevars.len();
 
         let mut gen_frame = crate::pyframe::PyFrame::new_with_namespace(
-            code,
+            w_code,
             self.execution_context,
             self.namespace,
         );
@@ -1581,7 +1581,7 @@ impl OpcodeStepExecutor for PyFrame {
                     }
                 }
             } else {
-                let code = &*self.code;
+                let code = &*crate::pyframe_get_pycode(self);
                 for (idx, name) in code.varnames.iter().enumerate() {
                     let value = self.locals_cells_stack_w[idx];
                     if !value.is_null() {

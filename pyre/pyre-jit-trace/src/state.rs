@@ -38,8 +38,9 @@ use pyre_object::{
 unsafe impl Sync for JitCode {}
 
 pub(crate) struct JitCode {
-    /// The Python CodeObject (RPython: jitcode.code = bytecode).
-    pub code: *const CodeObject,
+    /// Pointer to the Code object (W_CodeObject).
+    /// Matches frame.code and getcode(func).
+    pub code: *const (),
     /// codewriter.py:68: jitcode.index = len(all_jitcodes).
     pub index: i32,
     /// RPython parity: pointer to majit JitCode (liveness, bytecodes).
@@ -47,6 +48,14 @@ pub(crate) struct JitCode {
     /// get_list_of_active_boxes to access the same LivenessInfo
     /// that consume_one_section uses (all_liveness parity).
     pub majit_jitcode: *const majit_metainterp::jitcode::JitCode,
+}
+
+impl JitCode {
+    /// Extract raw CodeObject from the W_CodeObject stored in this JitCode.
+    #[inline]
+    pub unsafe fn raw_code(&self) -> *const CodeObject {
+        pyre_interpreter::w_code_get_ptr(self.code as pyre_object::PyObjectRef) as *const CodeObject
+    }
 }
 
 /// warmspot.py:148-282: MetaInterpStaticData — per-driver compile-time data.
@@ -75,7 +84,7 @@ impl MetaInterpStaticData {
 
     /// codewriter.py:68: get or create JitCode for a CodeObject.
     /// Returns a stable pointer (Box ensures no reallocation moves).
-    fn jitcode_for(&mut self, code: *const CodeObject) -> *const JitCode {
+    fn jitcode_for(&mut self, code: *const ()) -> *const JitCode {
         let key = code as usize;
         if let Some(&idx) = self.by_code.get(&key) {
             return &*self.jitcodes[idx] as *const JitCode;
@@ -103,7 +112,7 @@ thread_local! {
 
 /// pyjitpl.py:74: frame.jitcode — get or create JitCode for CodeObject.
 /// RPython: MetaInterp.staticdata.jitcodes[idx]; pyre: METAINTERP_SD.
-pub(crate) fn jitcode_for(code: *const CodeObject) -> *const JitCode {
+pub(crate) fn jitcode_for(code: *const ()) -> *const JitCode {
     // Register global frame_value_count callback on first use.
     use std::sync::Once;
     static INIT: Once = Once::new();
@@ -118,7 +127,7 @@ pub(crate) fn jitcode_for(code: *const CodeObject) -> *const JitCode {
 /// get_list_of_active_boxes can look up LivenessInfo from the same
 /// data source as consume_one_section (RPython all_liveness parity).
 pub fn set_majit_jitcode(
-    code: *const CodeObject,
+    code: *const (),
     majit_jitcode: *const majit_metainterp::jitcode::JitCode,
 ) {
     METAINTERP_SD.with(|r| {
@@ -137,7 +146,7 @@ pub fn set_majit_jitcode(
 /// warmspot.py:282 metainterp_sd.jitcodes[jitcode_index]:
 /// Resolve jitcode_index (sequential int from snapshot numbering)
 /// to the corresponding CodeObject pointer.
-pub fn code_for_jitcode_index(jitcode_index: i32) -> Option<*const CodeObject> {
+pub fn code_for_jitcode_index(jitcode_index: i32) -> Option<*const ()> {
     METAINTERP_SD.with(|r| {
         let sd = r.borrow();
         let idx = jitcode_index as usize;
@@ -175,8 +184,9 @@ pub fn frame_value_count_at(jitcode_index: i32, pc: i32) -> usize {
         // the decoder value count agree even for inlined-function
         // frames whose majit_jitcode has not been built at trace time.
         if !jc.code.is_null() {
-            let live = crate::liveness::liveness_for(jc.code);
-            let code_ref = unsafe { &*jc.code };
+            let raw = unsafe { jc.raw_code() };
+            let live = crate::liveness::liveness_for(raw);
+            let code_ref = unsafe { &*raw };
             let nlocals = code_ref.varnames.len();
             let live_locals = (0..nlocals)
                 .filter(|&i| live.is_local_live(pc as usize, i))
@@ -3315,7 +3325,9 @@ mod tests {
         use pyre_interpreter::pyframe::PyFrame;
 
         let code = compile_exec("if 1 < 2:\n    x = 3\n").expect("test code should compile");
-        let code_ref = &code as *const _;
+        let code_ref =
+            pyre_interpreter::w_code_new(Box::into_raw(Box::new(code.clone())) as *const ())
+                as *const ();
         let compare_pc = (0..code.instructions.len())
             .find(|&pc| {
                 matches!(
@@ -3414,7 +3426,9 @@ mod tests {
         use pyre_interpreter::pyframe::PyFrame;
 
         let code = compile_exec("x = 1").expect("test code should compile");
-        let code_ref = &code as *const _;
+        let code_ref =
+            pyre_interpreter::w_code_new(Box::into_raw(Box::new(code.clone())) as *const ())
+                as *const ();
         let mut frame = Box::new(PyFrame::new(code));
         frame.fix_array_ptrs();
         frame.push(w_int_new(1));
@@ -3511,7 +3525,9 @@ mod tests {
             "test source should force trivia between COMPARE_OP and POP_JUMP_IF"
         );
 
-        let code_ref = &code as *const _;
+        let code_ref =
+            pyre_interpreter::w_code_new(Box::into_raw(Box::new(code.clone())) as *const ())
+                as *const ();
         let mut frame = Box::new(PyFrame::new(code));
         frame.fix_array_ptrs();
         let _frame_ptr = (&mut *frame) as *mut PyFrame as usize;

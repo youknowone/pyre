@@ -368,10 +368,7 @@ fn green_key_from_pycode(next_instr: usize, w_pycode: pyre_object::PyObjectRef) 
     if code_ptr.is_null() {
         return None;
     }
-    Some(make_green_key(
-        code_ptr as *const pyre_interpreter::CodeObject,
-        next_instr,
-    ))
+    Some(make_green_key(code_ptr, next_instr))
 }
 
 /// RPython interp_jit.py helper: get_printable_location.
@@ -761,9 +758,9 @@ fn init_callbacks() {
                 jit_create_self_recursive_callee_frame_1_raw_int:
                     crate::call_jit::jit_create_self_recursive_callee_frame_1_raw_int as *const (),
                 driver_pair: || JIT_DRIVER.with(|cell| cell.get() as *mut u8),
-                ensure_majit_jitcode: |code| {
+                ensure_majit_jitcode: |code, w_code| {
                     if !code.is_null() {
-                        crate::jit::codewriter::ensure_jitcode_for(unsafe { &*code });
+                        crate::jit::codewriter::ensure_jitcode_for(unsafe { &*code }, w_code);
                     }
                 },
             }));
@@ -785,7 +782,7 @@ fn call_depth() -> u32 {
 /// RPython green_key = (pycode, next_instr).
 /// Each (code, pc) pair has independent warmup counter and compiled loop.
 #[inline(always)]
-pub fn make_green_key(code_ptr: *const pyre_interpreter::CodeObject, pc: usize) -> u64 {
+pub fn make_green_key(code_ptr: *const (), pc: usize) -> u64 {
     (code_ptr as u64).wrapping_mul(1000003) ^ (pc as u64)
 }
 
@@ -1011,7 +1008,7 @@ fn trace_jit_bytecode(_pc: usize, _instruction_name: &str) {
 
 /// JIT hooks are thin inline checks; all heavy logic is in #[cold] helpers.
 fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
-    let code = unsafe { &*frame.code };
+    let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
     let env = PyreEnv;
     let (driver, info) = driver_pair();
     // jitcode.py:18: jitdriver_sd is not None for portals.
@@ -1140,7 +1137,7 @@ fn jit_merge_point_hook(
             // starts, populating all_liveness. In pyre, JitCode compilation is
             // lazy — ensure the code's JitCode (with liveness) exists before
             // tracing so get_list_of_active_boxes can use it.
-            crate::jit::codewriter::ensure_jitcode_for(code);
+            crate::jit::codewriter::ensure_jitcode_for(code, frame.code);
             let snapshot = Box::new(frame.snapshot_for_tracing());
             let _ = concrete_frame;
             let (action, _executed_frame) = trace_bytecode(ctx, sym, code, pc, snapshot);
@@ -1549,7 +1546,7 @@ fn bound_reached(
             // Set tracing_call_depth so inner function calls (which
             // run their own eval_loop_jit) don't trigger jit_merge_point_hook.
             driver.meta_interp_mut().tracing_call_depth = Some(call_depth());
-            let code = unsafe { &*frame.code };
+            let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
             let concrete_frame = Box::new(frame.snapshot_for_tracing());
             let outcome = driver.jit_merge_point_keyed(
                 green_key,
@@ -1559,7 +1556,7 @@ fn bound_reached(
                 || {},
                 |ctx, sym| {
                     use pyre_jit_trace::trace::trace_bytecode;
-                    crate::jit::codewriter::ensure_jitcode_for(code);
+                    crate::jit::codewriter::ensure_jitcode_for(code, frame.code);
                     let (action, _) =
                         trace_bytecode(ctx, sym, code, loop_header_pc, concrete_frame);
                     action
@@ -1643,7 +1640,7 @@ fn bound_reached(
 /// common case (no compiled code, not tracing, threshold not reached).
 pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     if std::env::var_os("MAJIT_DUMP_BYTECODE").is_some() {
-        let code = unsafe { &*frame.code };
+        let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
         if code.obj_name.as_str() == "fannkuch" && frame.next_instr == 0 {
             use std::sync::OnceLock;
             static DUMPED: OnceLock<()> = OnceLock::new();
@@ -2604,7 +2601,7 @@ pub(crate) fn decode_and_restore_guard_failure(
                 _ => 0,
             };
             let code = if !frame_ptr.is_null() {
-                unsafe { (*frame_ptr).code }
+                unsafe { pyre_interpreter::pyframe_get_pycode(&*frame_ptr) }
             } else {
                 std::ptr::null()
             };
@@ -2701,7 +2698,7 @@ fn build_blackhole_frames_fallback(typed: &[Value]) -> Vec<crate::call_jit::Resu
         _ => 0,
     };
     let code = if !frame_ptr.is_null() {
-        unsafe { (*frame_ptr).code }
+        unsafe { pyre_interpreter::pyframe_get_pycode(&*frame_ptr) }
     } else {
         std::ptr::null()
     };
@@ -3033,11 +3030,19 @@ fn build_resumed_frames(
         // Outermost frame (last): code from PyFrame (the live caller).
         // Inner frames: code from jitcode_index registry (inlined calls).
         let is_outermost = frames.len() == 1 || idx == frames.len() - 1;
-        let code = if is_outermost && !vable_frame_ptr.is_null() {
+        let w_code = if is_outermost && !vable_frame_ptr.is_null() {
             unsafe { (*vable_frame_ptr).code }
         } else {
             pyre_jit_trace::state::code_for_jitcode_index(frame.jitcode_index)
                 .unwrap_or(std::ptr::null())
+        };
+        let code = if !w_code.is_null() {
+            unsafe {
+                pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
+                    as *const pyre_interpreter::CodeObject
+            }
+        } else {
+            std::ptr::null()
         };
         // resume.py:1095/1067 parity: virtualizable_ptr is the JIT driver's
         // PyFrame, shared across the entire blackhole chain. RPython's

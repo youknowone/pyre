@@ -9,7 +9,7 @@ use crate::state::PyreJitState;
 /// RPython green_key = (pycode, next_instr).
 /// Each (code, pc) pair has independent warmup counter and compiled loop.
 #[inline(always)]
-pub fn make_green_key(code_ptr: *const pyre_interpreter::CodeObject, pc: usize) -> u64 {
+pub fn make_green_key(code_ptr: *const (), pc: usize) -> u64 {
     (code_ptr as u64).wrapping_mul(1000003) ^ (pc as u64)
 }
 

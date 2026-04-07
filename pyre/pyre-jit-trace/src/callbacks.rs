@@ -32,7 +32,7 @@ pub struct CallJitCallbacks {
     /// `code` (with full liveness) so that get_list_of_active_boxes uses
     /// the same liveness data as resume.py:1022 enumerate_vars at decode
     /// time. Idempotent: no-op when already built.
-    pub ensure_majit_jitcode: fn(*const CodeObject),
+    pub ensure_majit_jitcode: fn(*const CodeObject, *const ()),
 }
 
 // Safety: function pointers are 'static and never mutated after init

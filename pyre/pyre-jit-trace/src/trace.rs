@@ -28,11 +28,12 @@ pub fn trace_bytecode(
     // PyFrame snapshot. MetaInterp drives both symbolic tracing AND
     // concrete execution — the interpreter does not run during tracing.
     concrete_frame.next_instr = start_pc;
+    let w_code = concrete_frame.code;
     let cf_addr = &*concrete_frame as *const pyre_interpreter::pyframe::PyFrame as usize;
     let frame = MetaInterpFrame {
         sym: sym as *mut PyreSym,
         owned_sym: None,
-        jitcode: code as *const CodeObject,
+        jitcode: w_code,
         pc: start_pc,
         greenkey: None,
         concrete_frame: cf_addr,
@@ -43,13 +44,13 @@ pub fn trace_bytecode(
         arg_state: pyre_interpreter::bytecode::OpArgState::default(),
     };
 
-    let mut metainterp = PyreMetaInterp::new(code as *const CodeObject, std::ptr::null_mut());
+    let mut metainterp = PyreMetaInterp::new(w_code, std::ptr::null_mut());
     metainterp.framestack.push(frame);
 
     // pyjitpl.py:2971-2973: register the initial merge point so
     // reached_loop_header recognizes the trace start backedge and closes
     // the loop instead of unrolling it as a first-visit inner loop.
-    let start_key = crate::driver::make_green_key(code as *const CodeObject, start_pc);
+    let start_key = crate::driver::make_green_key(w_code, start_pc);
     {
         let input_args: Vec<majit_ir::OpRef> = (0..ctx.num_inputs())
             .map(|i| majit_ir::OpRef(i as u32))
@@ -75,13 +76,13 @@ pub fn trace_bytecode(
             loop_header_pc: Some(target_pc),
             ..
         } if *target_pc != start_pc => {
-            let target_key = crate::driver::make_green_key(code as *const CodeObject, *target_pc);
+            let target_key = crate::driver::make_green_key(w_code, *target_pc);
             ctx.set_green_key(target_key);
             ctx.header_pc = *target_pc;
             ctx.cut_inner_green_key = Some(target_key);
         }
         TraceAction::CloseLoop | TraceAction::CloseLoopWithArgs { .. } => {
-            let key = crate::driver::make_green_key(code as *const CodeObject, start_pc);
+            let key = crate::driver::make_green_key(w_code, start_pc);
             ctx.set_green_key(key);
             ctx.header_pc = start_pc;
         }
