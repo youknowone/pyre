@@ -2601,7 +2601,7 @@ pub(crate) fn decode_and_restore_guard_failure(
                 _ => 0,
             };
             let code = if !frame_ptr.is_null() {
-                unsafe { pyre_interpreter::pyframe_get_pycode(&*frame_ptr) }
+                unsafe { (*frame_ptr).code }
             } else {
                 std::ptr::null()
             };
@@ -2698,7 +2698,7 @@ fn build_blackhole_frames_fallback(typed: &[Value]) -> Vec<crate::call_jit::Resu
         _ => 0,
     };
     let code = if !frame_ptr.is_null() {
-        unsafe { pyre_interpreter::pyframe_get_pycode(&*frame_ptr) }
+        unsafe { (*frame_ptr).code }
     } else {
         std::ptr::null()
     };
@@ -3036,7 +3036,7 @@ fn build_resumed_frames(
             pyre_jit_trace::state::code_for_jitcode_index(frame.jitcode_index)
                 .unwrap_or(std::ptr::null())
         };
-        let code = if !w_code.is_null() {
+        let raw_code = if !w_code.is_null() {
             unsafe {
                 pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
                     as *const pyre_interpreter::CodeObject
@@ -3063,14 +3063,14 @@ fn build_resumed_frames(
         // from their code's nlocals + snapshot stack depth.
         let vsd = if frames.len() == 1 || idx == frames.len() - 1 {
             vable_vsd
-        } else if !code.is_null() {
-            let nlocals = unsafe { &*code }.varnames.len();
+        } else if !raw_code.is_null() {
+            let nlocals = unsafe { &*raw_code }.varnames.len();
             nlocals + values.len().saturating_sub(nlocals)
         } else {
             values.len()
         };
         result.push(crate::call_jit::ResumedFrame {
-            code,
+            code: w_code,
             py_pc,
             rd_numb_pc: if frame.pc >= 0 {
                 Some(frame.pc as usize)
