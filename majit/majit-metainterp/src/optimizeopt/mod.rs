@@ -2415,44 +2415,57 @@ impl OptContext {
         }
     }
 
+    /// info.py:706-758 `ConstPtrInfo._const.getref_base()` parity.
+    ///
+    /// Returns the GC pointer address for any constant that RPython would
+    /// wrap in a `ConstPtrInfo`. RPython's `getptrinfo` (info.py:880-894)
+    /// dispatches on `op.type`: a `ConstPtr` (Ref-typed) becomes
+    /// `ConstPtrInfo(op)` and `_const.getref_base()` reads the boxed
+    /// pointer; a `ConstInt` produced by `getrawptrinfo` (info.py:865-878)
+    /// also becomes `ConstPtrInfo(op)` and `_const.getref_base()` reads
+    /// the raw pointer bits cast through `cast_int_to_ptr`.
+    ///
+    /// majit's constant pool tracks both shapes:
+    /// - `Value::Ref(gcref)` — full Ref-typed entry, returned directly.
+    /// - `Value::Int(bits)` with a `Type::Ref` override in
+    ///   `constant_types_for_numbering` — a static class pointer or other
+    ///   GC-untracked address that the backend keeps as Int to skip
+    ///   shadow-stack rooting (mirrors RPython's
+    ///   `cast_instance_to_gcref`/`cast_int_to_ptr` round-trip on a
+    ///   ConstInt argument). Both shapes must report the same address
+    ///   here so `getptrinfo` and `get_const_info_mut` see them as the
+    ///   same `ConstPtrInfo`.
+    fn constant_ptr_addr(&self, opref: OpRef) -> Option<majit_ir::GcRef> {
+        let resolved = self.get_box_replacement(opref);
+        match self.get_constant(resolved)? {
+            Value::Ref(gcref) => Some(*gcref),
+            Value::Int(0) => Some(majit_ir::GcRef(0)),
+            Value::Int(bits) => {
+                let tp = self.constant_types_for_numbering.get(&resolved.0)?;
+                if *tp == majit_ir::Type::Ref {
+                    Some(majit_ir::GcRef(*bits as usize))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// info.py:880-894 `getptrinfo(op)` parity. RPython's `getptrinfo`
     /// returns a freshly-constructed `ConstPtrInfo(op)` when `op` is a
     /// `ConstPtr`, even when no info has been forwarded. majit mirrors
-    /// that here by synthesizing `PtrInfo::Constant(gcref)` for constant
-    /// Refs, otherwise borrowing the forwarded info. Returns a `Cow` so
+    /// that here by synthesizing `PtrInfo::Constant(gcref)` for any
+    /// constant pointer (whether stored as `Value::Ref` or as
+    /// `Value::Int` with a `Type::Ref` override — see `constant_ptr_addr`),
+    /// otherwise borrowing the forwarded info. Returns a `Cow` so
     /// callers can read the result without forcing an allocation in the
     /// common forwarded case.
     pub fn getptrinfo(&self, opref: OpRef) -> Option<std::borrow::Cow<'_, PtrInfo>> {
         let resolved = self.get_box_replacement(opref);
         // info.py:888-889: isinstance(op, ConstPtr) → ConstPtrInfo(op).
-        if let Some(value) = self.get_constant(resolved) {
-            match value {
-                Value::Ref(gcref) => {
-                    return Some(std::borrow::Cow::Owned(PtrInfo::Constant(*gcref)));
-                }
-                Value::Int(0) => {
-                    return Some(std::borrow::Cow::Owned(PtrInfo::Constant(majit_ir::GcRef(
-                        0,
-                    ))));
-                }
-                Value::Int(bits) => {
-                    // history.py InputArgRef parity: when the ConstantPool
-                    // tracks an i64 bits-pattern as Ref-typed (vtable address
-                    // passed through `const_ref` / `numbering_type_overrides`),
-                    // `ensure_ptr_info_arg0` must still wrap it in a
-                    // ConstPtrInfo so cls_of_box can fold a GUARD_CLASS on
-                    // the pointer. The backend keeps the bits as Int to
-                    // avoid GC root tracking for static type pointers.
-                    if let Some(tp) = self.constant_types_for_numbering.get(&resolved.0) {
-                        if *tp == majit_ir::Type::Ref {
-                            return Some(std::borrow::Cow::Owned(PtrInfo::Constant(
-                                majit_ir::GcRef(*bits as usize),
-                            )));
-                        }
-                    }
-                }
-                _ => {}
-            }
+        if let Some(gcref) = self.constant_ptr_addr(resolved) {
+            return Some(std::borrow::Cow::Owned(PtrInfo::Constant(gcref)));
         }
         self.get_ptr_info(resolved).map(std::borrow::Cow::Borrowed)
     }
@@ -2508,17 +2521,28 @@ impl OptContext {
         }
     }
 
-    /// info.py:716-721: ConstPtrInfo._get_info(descr, optheap)
-    /// For constant GC objects, get or create a StructPtrInfo in const_infos.
-    /// Returns None if opref is not a Ref constant.
+    /// info.py:718-726 `ConstPtrInfo._get_info(descr, optheap)` parity.
+    ///
+    /// For a constant GC object, returns the per-object `StructPtrInfo`
+    /// (here represented as `PtrInfo::Instance`) shared via `optheap.
+    /// const_infos`. RPython looks up by `_const.getref_base()`; majit
+    /// resolves the address through `constant_ptr_addr` so that
+    /// `Value::Ref` constants AND `Value::Int` bits with a `Type::Ref`
+    /// override (e.g. static class pointers passed through `const_ref` or
+    /// `mark_type`) hash to the same `const_infos` slot — matching the
+    /// upstream invariant that any `ConstPtrInfo._get_info()` call on the
+    /// same constant returns the same shared `StructPtrInfo`.
+    /// Returns None if `opref` is not a constant pointer or is null.
     pub fn get_const_info_mut(
         &mut self,
         opref: OpRef,
     ) -> Option<&mut crate::optimizeopt::info::PtrInfo> {
-        let addr = match self.get_constant(opref) {
-            Some(majit_ir::Value::Ref(r)) if !r.is_null() => r.0,
-            _ => return None,
-        };
+        // info.py:719-720: `if not ref: raise InvalidLoop` — null protection.
+        let gcref = self.constant_ptr_addr(opref)?;
+        if gcref.is_null() {
+            return None;
+        }
+        let addr = gcref.0;
         use std::collections::hash_map::Entry;
         match self.const_infos.entry(addr) {
             Entry::Occupied(e) => Some(e.into_mut()),
@@ -2718,4 +2742,160 @@ pub trait Optimization {
     /// starting AFTER the current pass. In majit, pass this index to
     /// `emit_extra` to achieve the same behavior.
     fn emitting_operation(&mut self, _op: &Op, _ctx: &mut OptContext, _self_pass_idx: usize) {}
+}
+
+#[cfg(test)]
+mod constant_ptr_info_tests {
+    //! info.py:706-758 + 865-894 ConstPtrInfo / getptrinfo / getrawptrinfo
+    //! parity tests for the typed-Int constant override path. RPython
+    //! treats `ConstInt` (raw pointer) and `ConstPtr` uniformly via
+    //! `_const.getref_base()`; majit must do the same regardless of how
+    //! the constant pool stored the bits (`Value::Ref` vs `Value::Int`
+    //! with a `Type::Ref` override).
+    use super::*;
+    use crate::optimizeopt::info::PtrInfo;
+    use majit_ir::{GcRef, OpRef, Type, Value};
+    use std::borrow::Cow;
+
+    /// info.py:880-894 getptrinfo(ConstPtr) → ConstPtrInfo(op).
+    /// A `Value::Ref` constant must be wrapped in `PtrInfo::Constant`.
+    #[test]
+    fn getptrinfo_returns_constant_for_value_ref() {
+        let mut ctx = OptContext::new(0);
+        let opref = OpRef(10_000);
+        ctx.seed_constant(opref, Value::Ref(GcRef(0xdead_beef)));
+        match ctx.getptrinfo(opref) {
+            Some(Cow::Owned(PtrInfo::Constant(g))) => assert_eq!(g.0, 0xdead_beef),
+            other => panic!("expected ConstPtrInfo(0xdeadbeef), got {other:?}"),
+        }
+    }
+
+    /// info.py:865-878 getrawptrinfo(ConstInt) → ConstPtrInfo(op).
+    /// A `Value::Int` whose `constant_types_for_numbering` entry is
+    /// `Type::Ref` (the typed-override path used for static class
+    /// pointers) must also produce `PtrInfo::Constant`.
+    #[test]
+    fn getptrinfo_returns_constant_for_int_with_ref_override() {
+        let mut ctx = OptContext::new(0);
+        let opref = OpRef(10_001);
+        ctx.seed_constant(opref, Value::Int(0x1234_5678));
+        ctx.constant_types_for_numbering.insert(opref.0, Type::Ref);
+        match ctx.getptrinfo(opref) {
+            Some(Cow::Owned(PtrInfo::Constant(g))) => assert_eq!(g.0, 0x1234_5678),
+            other => panic!("expected ConstPtrInfo(0x12345678), got {other:?}"),
+        }
+    }
+
+    /// info.py:881-882 getptrinfo(ConstInt) without a Ref-typed box →
+    /// `getrawptrinfo` returns None for non-raw-pointer constants. majit
+    /// honors that by leaving plain `Value::Int` constants without an
+    /// override unwrapped.
+    #[test]
+    fn getptrinfo_skips_int_without_ref_override() {
+        let mut ctx = OptContext::new(0);
+        let opref = OpRef(10_002);
+        ctx.seed_constant(opref, Value::Int(42));
+        // No constant_types_for_numbering entry → no Ref override.
+        assert!(ctx.getptrinfo(opref).is_none());
+    }
+
+    /// info.py:888-889 getptrinfo(NULL) parity: a null `ConstPtr` still
+    /// becomes `ConstPtrInfo(NULL)` (later callers null-check via
+    /// `is_null`/`getref_base`). The Int(0) shape must produce the same
+    /// `PtrInfo::Constant(GcRef(0))` so downstream null-handling sees a
+    /// uniform constant info.
+    #[test]
+    fn getptrinfo_null_int_constant_is_constant_null() {
+        let mut ctx = OptContext::new(0);
+        let opref = OpRef(10_003);
+        ctx.seed_constant(opref, Value::Int(0));
+        match ctx.getptrinfo(opref) {
+            Some(Cow::Owned(PtrInfo::Constant(g))) => assert_eq!(g.0, 0),
+            other => panic!("expected ConstPtrInfo(NULL), got {other:?}"),
+        }
+    }
+
+    /// info.py:718-726 ConstPtrInfo._get_info(descr, optheap) parity:
+    /// the same constant must always resolve to the same shared
+    /// `const_infos[ref]` slot. Calling `get_const_info_mut` twice on a
+    /// `Value::Ref` constant returns identical info — and a mutation
+    /// observed via the second call confirms the slot identity.
+    #[test]
+    fn const_info_mut_returns_same_slot_for_value_ref() {
+        let mut ctx = OptContext::new(0);
+        let opref = OpRef(10_004);
+        ctx.seed_constant(opref, Value::Ref(GcRef(0xa5a5_a5a5)));
+        // First lookup: install Instance via the Vacant entry path,
+        // then mark a known class so the second lookup observes it.
+        {
+            let info = ctx
+                .get_const_info_mut(opref)
+                .expect("Ref constant should have const_infos slot");
+            *info = PtrInfo::known_class(GcRef(0x1111_2222), true);
+        }
+        // Second lookup: the slot must contain the previously written
+        // PtrInfo, not a freshly minted Instance.
+        let info = ctx
+            .get_const_info_mut(opref)
+            .expect("Ref constant should still have const_infos slot");
+        match info {
+            PtrInfo::KnownClass { class_ptr, .. } => {
+                assert_eq!(class_ptr.0, 0x1111_2222);
+            }
+            other => panic!("expected KnownClass after re-lookup, got {other:?}"),
+        }
+    }
+
+    /// info.py:718-726 ConstPtrInfo._get_info parity for the typed-Int
+    /// override path: a `Value::Int` constant tagged as `Type::Ref` must
+    /// share its `const_infos` slot with any other reference to the same
+    /// address (whether that other reference came in as `Value::Ref` or
+    /// as another tagged Int). Without this, two `getfield` paths on the
+    /// same vtable address would maintain disjoint heap caches.
+    #[test]
+    fn const_info_mut_shares_slot_between_ref_and_tagged_int() {
+        let mut ctx = OptContext::new(0);
+        let ref_op = OpRef(10_005);
+        let int_op = OpRef(10_006);
+        let addr: usize = 0xfeed_face;
+        ctx.seed_constant(ref_op, Value::Ref(GcRef(addr)));
+        ctx.seed_constant(int_op, Value::Int(addr as i64));
+        ctx.constant_types_for_numbering.insert(int_op.0, Type::Ref);
+
+        // Mutate via the Ref-typed constant.
+        {
+            let info = ctx
+                .get_const_info_mut(ref_op)
+                .expect("Ref constant should resolve");
+            *info = PtrInfo::known_class(GcRef(0xc0de_cafe), true);
+        }
+        // Read back via the typed-Int alias — must observe the same
+        // PtrInfo because both keys hash to the same const_infos entry.
+        let info = ctx
+            .get_const_info_mut(int_op)
+            .expect("typed-Int alias should resolve to the same slot");
+        match info {
+            PtrInfo::KnownClass { class_ptr, .. } => {
+                assert_eq!(class_ptr.0, 0xc0de_cafe);
+            }
+            other => panic!("expected shared KnownClass, got {other:?}"),
+        }
+    }
+
+    /// info.py:719-720 `if not ref: raise InvalidLoop` — null protection.
+    /// `get_const_info_mut` must return None for null constant pointers
+    /// regardless of whether the bits arrived via `Value::Int(0)` or
+    /// `Value::Ref(NULL)`.
+    #[test]
+    fn const_info_mut_rejects_null_constant() {
+        let mut ctx = OptContext::new(0);
+        let ref_null = OpRef(10_007);
+        let int_null = OpRef(10_008);
+        ctx.seed_constant(ref_null, Value::Ref(GcRef(0)));
+        ctx.seed_constant(int_null, Value::Int(0));
+        ctx.constant_types_for_numbering
+            .insert(int_null.0, Type::Ref);
+        assert!(ctx.get_const_info_mut(ref_null).is_none());
+        assert!(ctx.get_const_info_mut(int_null).is_none());
+    }
 }
