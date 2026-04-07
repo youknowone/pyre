@@ -180,17 +180,33 @@ impl Backend for DynasmBackend {
         let constants = std::mem::take(&mut self.constants);
         let typeid_table = self.collect_classptr_typeid_table(ops, &constants);
         let asm = Assembler386::new(trace_id, 0, constants, self.vtable_offset, typeid_table);
-        let compiled = asm.assemble_bridge(fail_descr, inputargs, ops)?;
+        // Read fail_args_slots from the original guard's fail_descr
+        // so the bridge knows where each InputArg lives in the parent jitframe.
+        let source_slots: Vec<usize> = {
+            let orig_compiled = Self::get_compiled(original_token);
+            let fi = fail_descr.fail_index();
+            // fail_descrs Vec is indexed by sequential guard number,
+            // not by fail_index. Find the matching descriptor.
+            orig_compiled
+                .fail_descrs
+                .iter()
+                .find(|d| d.fail_index == fi)
+                .map(|d| d.fail_args_slots.clone())
+                .unwrap_or_default()
+        };
+        let compiled = asm.assemble_bridge(fail_descr, inputargs, ops, &source_slots)?;
 
         let bridge_addr = codebuf::buffer_ptr(&compiled.buffer) as usize;
         let code_size = compiled.buffer.len();
 
         // assembler.py:987 patch_jump_for_descr — redirect guard to bridge.
         // Find the DynasmFailDescr in the original token and patch it.
+        let fi = fail_descr.fail_index();
         let orig_compiled = Self::get_compiled(original_token);
         if let Some(descr) = orig_compiled
             .fail_descrs
-            .get(fail_descr.fail_index() as usize)
+            .iter()
+            .find(|d| d.fail_index == fi)
         {
             if descr.adr_jump_offset() != 0 {
                 Assembler386::patch_jump_for_descr(descr, bridge_addr);

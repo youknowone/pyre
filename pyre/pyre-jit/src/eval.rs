@@ -3032,7 +3032,7 @@ fn build_resumed_frames(
         })
         .collect();
 
-    let vable_frame_ptr = resolved_vable
+    let mut vable_frame_ptr = resolved_vable
         .first()
         .map(|v| match v {
             Value::Ref(r) => r.as_usize() as *mut pyre_interpreter::pyframe::PyFrame,
@@ -3040,7 +3040,6 @@ fn build_resumed_frames(
             _ => std::ptr::null_mut(),
         })
         .unwrap_or(std::ptr::null_mut());
-
     let vable_ni = resolved_vable
         .get(ni_idx)
         .map(|v| match v {

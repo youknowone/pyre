@@ -2591,8 +2591,17 @@ fn call_assembler_fast_path_heap(
 
     let bridge_guard = fail_descr.bridge_ref();
     if let Some(ref bridge) = *bridge_guard {
+        // rebuild_state_after_failure decodes recovery_layout to match
+        // what the bridge tracer saw via rebuild_from_resumedata.
+        let mut bridge_outputs = outputs;
+        rebuild_state_after_failure(
+            &mut bridge_outputs,
+            &fail_descr.fail_arg_types,
+            fail_descr.recovery_layout_ref().as_ref(),
+            bridge.num_inputs,
+        );
         let mut frame =
-            CraneliftBackend::execute_bridge(bridge, &outputs, &fail_descr.fail_arg_types);
+            CraneliftBackend::execute_bridge(bridge, &bridge_outputs, &fail_descr.fail_arg_types);
         let bridge_descr = get_latest_descr_from_deadframe(&frame)
             .expect("bridge deadframe must have a descriptor");
         if bridge_descr.is_finish() {
@@ -5134,11 +5143,6 @@ impl CraneliftBackend {
 
             // llgraph/runner.py:1192-1194 fail_guard without bridge →
             // ExecutionFinished(LLDeadFrame).
-            // jf_savedata is already correct in jf_frame memory:
-            //   - force called → callee's set_savedata_ref wrote it
-            //   - no force → zeroed alloc → 0
-            // jf_guard_exc already written by emit_guard_exit.
-
             return deadframe_from_jitframe(
                 exec.jf_gcref,
                 fail_descr.clone(),
@@ -5159,7 +5163,6 @@ impl CraneliftBackend {
         // The bridge's inputs are the parent guard's fail args.
         let num_bridge_inputs = bridge.num_inputs.min(parent_types.len());
         let bridge_inputs = &parent_outputs[..num_bridge_inputs];
-
         let exec = run_compiled_code(
             bridge.code_ptr,
             &bridge.fail_descrs,
