@@ -103,6 +103,18 @@ pub struct UnrollOptimizer {
     /// RPython: same Optimizer instance across phases keeps patchguardop.
     /// In majit, separate instances — forward explicitly.
     phase1_patchguardop: Option<majit_ir::Op>,
+    /// opencoder.py:271 self._index parity (cross-phase OpRef high water).
+    ///
+    /// In RPython each `TraceIterator.next()` allocates a fresh `cls()`
+    /// ResOperation whose Python identity distinguishes Phase 1 from
+    /// Phase 2 boxes; majit's `OpRef(u32)` IS the identity, so Phase 2 must
+    /// continue allocating *above* Phase 1's high water mark to keep the
+    /// two phases' OpRef sets disjoint. After Phase 1 finishes,
+    /// `next_global_opref` holds the smallest OpRef Phase 2 may emit; it
+    /// is the `start_index` argument the next `TraceIterator::new` call
+    /// (or bridge entry) should use. Initialized to 0.
+    #[allow(dead_code)]
+    pub(crate) next_global_opref: u32,
     /// RPython metainterp_sd.callinfocollection parity.
     /// Maps oopspec indices to (calldescr, func_ptr) for generate_modified_call.
     pub callinfocollection: Option<std::sync::Arc<majit_ir::descr::CallInfoCollection>>,
@@ -129,6 +141,7 @@ impl UnrollOptimizer {
             original_trace_op_types: std::collections::HashMap::new(),
             phase1_value_types: std::collections::HashMap::new(),
             phase1_patchguardop: None,
+            next_global_opref: 0,
             callinfocollection: None,
         }
     }
@@ -343,6 +356,19 @@ impl UnrollOptimizer {
                     }
                     // Export Phase 1's heap cache for Phase 2.
                     state.preamble_heap_cache = opt_p1.export_all_cached_fields();
+                    // opencoder.py:271 _index parity: Phase 2's TraceIterator
+                    // must allocate fresh boxes ABOVE Phase 1's high water
+                    // mark so the two phases' OpRef namespaces are disjoint
+                    // (RPython relies on Python identity to distinguish them;
+                    // majit relies on disjoint integer ranges). The high
+                    // water is `final_ctx.next_pos` after Phase 1 emit, with
+                    // a floor of `num_inputs` for empty traces.
+                    self.next_global_opref = opt_p1
+                        .final_ctx
+                        .as_ref()
+                        .map(|c| c.next_pos)
+                        .unwrap_or(num_inputs as u32)
+                        .max(num_inputs as u32);
                     // RPython Box type parity: Phase 1's emitted op types
                     // must be accessible to Phase 2 (imported_label_args
                     // reference Phase 1 OpRefs). Save Phase 1 value_types.

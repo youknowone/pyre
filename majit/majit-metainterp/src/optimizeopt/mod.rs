@@ -150,6 +150,18 @@ pub struct OptContext {
     /// Number of input arguments, used to offset emitted op positions
     /// so that variable indices don't collide with input arg indices.
     num_inputs: u32,
+    /// opencoder.py:259-267 inputarg base in the OpRef namespace.
+    ///
+    /// RPython lets each TraceIterator allocate fresh inputarg boxes whose
+    /// Python identity (`is`) distinguishes them from any other phase's
+    /// boxes; majit needs to encode that as a numeric offset because OpRef
+    /// IS the identity. Phase 1 uses `inputarg_base = 0` (legacy positional
+    /// layout); Phase 2/bridges shift inputarg OpRefs above the parent
+    /// trace's high water mark by setting `inputarg_base = parent_high_water`.
+    /// `reserve_pos` floors `next_pos` at `inputarg_base + num_inputs +
+    /// new_operations.len()` so freshly emitted ops never collide with
+    /// inputargs or imported high-water marks.
+    pub(crate) inputarg_base: u32,
     /// Next unique op position for newly emitted or queued extra operations.
     pub(crate) next_pos: u32,
     /// Zero-based counter for constant-namespace OpRef allocation.
@@ -689,6 +701,7 @@ impl OptContext {
             const_pool: HashMap::new(),
             forwarded: Vec::new(),
             num_inputs: 0,
+            inputarg_base: 0,
             next_pos: 0,
             next_const_idx: 0,
             extra_operations_after: VecDeque::new(),
@@ -745,13 +758,35 @@ impl OptContext {
     }
 
     pub fn with_num_inputs(estimated_ops: usize, num_inputs: usize) -> Self {
+        Self::with_num_inputs_and_start_pos(estimated_ops, num_inputs, 0, num_inputs as u32)
+    }
+
+    /// Construct an `OptContext` whose inputarg / fresh-OpRef numbering is
+    /// shifted to start above a parent trace's high water mark.
+    ///
+    /// `inputarg_base` corresponds to RPython's `start = trace._start` for
+    /// `TraceIterator`: it is the smallest OpRef this iteration may use, and
+    /// inputargs occupy `[inputarg_base, inputarg_base + num_inputs)`.
+    /// `start_next_pos` is the value of `_index` after the inputargs were
+    /// pre-allocated, i.e. the first fresh OpRef the optimizer will assign
+    /// to a non-void op result. Phase 1 / standalone passes use
+    /// `inputarg_base = 0`, `start_next_pos = num_inputs`; Phase 2 / bridges
+    /// pass `inputarg_base = parent_high_water`,
+    /// `start_next_pos = parent_high_water + num_inputs`.
+    pub fn with_num_inputs_and_start_pos(
+        estimated_ops: usize,
+        num_inputs: usize,
+        inputarg_base: u32,
+        start_next_pos: u32,
+    ) -> Self {
         OptContext {
             new_operations: Vec::with_capacity(estimated_ops),
             constants: Vec::new(),
             const_pool: HashMap::new(),
             forwarded: Vec::new(),
             num_inputs: num_inputs as u32,
-            next_pos: num_inputs as u32,
+            inputarg_base,
+            next_pos: start_next_pos,
             next_const_idx: 0,
             extra_operations_after: VecDeque::new(),
             pending_guard_class_postprocess: None,
@@ -823,9 +858,13 @@ impl OptContext {
     }
 
     pub(crate) fn reserve_pos(&mut self) -> OpRef {
+        // opencoder.py:271 _index parity: floor at the iteration's inputarg
+        // base + num_inputs + emitted-op count, so reserve_pos never returns
+        // an OpRef inside the inputarg slice or below the parent trace's
+        // high water mark when called from a Phase 2 / bridge OptContext.
         self.next_pos = self
             .next_pos
-            .max(self.num_inputs + self.new_operations.len() as u32);
+            .max(self.inputarg_base + self.num_inputs + self.new_operations.len() as u32);
         while self
             .constants
             .get(self.next_pos as usize)
@@ -2409,7 +2448,9 @@ impl OptContext {
     /// Clear the output operation list (used when restarting optimization).
     pub fn clear_newoperations(&mut self) {
         self.new_operations.clear();
-        self.next_pos = self.num_inputs;
+        // Reset next_pos to the iteration's first fresh OpRef position
+        // (right after the inputarg slice in the OpRef namespace).
+        self.next_pos = self.inputarg_base + self.num_inputs;
         self.int_bounds.clear();
         self.imported_int_bounds.clear();
         self.const_infos.clear();

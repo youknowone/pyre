@@ -1437,11 +1437,47 @@ impl Optimizer {
     /// Like `optimize_with_constants`, but also takes `num_inputs` so that
     /// ops emitted by the optimizer (e.g. from force_virtual) get pos values
     /// that don't collide with input argument variable indices.
+    /// Phase 1 / standalone entry point. Computes `start_next_pos` from
+    /// the input ops' max OpRef so newly emitted ops never collide with
+    /// the trace's existing positional layout. Phase 2 and bridge callers
+    /// should use [`Self::optimize_with_constants_and_inputs_at`] with an
+    /// explicit `inputarg_base` to allocate disjoint OpRefs.
     pub fn optimize_with_constants_and_inputs(
         &mut self,
         ops: &[Op],
         constants: &mut std::collections::HashMap<u32, i64>,
         num_inputs: usize,
+    ) -> Vec<Op> {
+        use majit_ir::OpRef;
+        // Ensure new ops get positions beyond all original trace positions.
+        // Original ops keep their tracer-assigned positions; new ops (constants,
+        // force materializations) must not collide with them.
+        let max_pos = ops
+            .iter()
+            .map(|op| op.pos)
+            .filter(|op| !op.is_none() && !op.is_constant())
+            .map(|op| op.0)
+            .max()
+            .unwrap_or(0);
+        let start_next_pos = ((max_pos as u32) + 1).max(num_inputs as u32);
+        self.optimize_with_constants_and_inputs_at(ops, constants, num_inputs, 0, start_next_pos)
+    }
+
+    /// opencoder.py:271 _index parity entry point.
+    ///
+    /// Optimizes a slice of ops whose `pos`/`args` reference OpRefs in a
+    /// shifted namespace `[inputarg_base, …)`. The first fresh OpRef the
+    /// optimizer assigns to a non-void result is `OpRef(start_next_pos)`.
+    /// Phase 2 / bridges pass `inputarg_base = parent_high_water` and
+    /// `start_next_pos = parent_high_water + num_inputs` so the iteration's
+    /// OpRefs are disjoint from any parent trace's emitted ops.
+    pub fn optimize_with_constants_and_inputs_at(
+        &mut self,
+        ops: &[Op],
+        constants: &mut std::collections::HashMap<u32, i64>,
+        num_inputs: usize,
+        inputarg_base: u32,
+        start_next_pos: u32,
     ) -> Vec<Op> {
         use majit_ir::OpRef;
         self.imported_label_args = None;
@@ -1450,17 +1486,12 @@ impl Optimizer {
         // RPython parity: each optimizer run is a fresh Optimizer instance.
         // In pyre we reuse the same Optimizer, so clear per-run state.
         self.last_guard_op = None;
-        // Ensure new ops get positions beyond all original trace positions.
-        // Original ops keep their tracer-assigned positions; new ops (constants,
-        // force materializations) must not collide with them.
-        let max_pos = ops
-            .iter()
-            .map(|op| op.pos.0)
-            .filter(|&p| p != u32::MAX) // skip OpRef::NONE
-            .max()
-            .unwrap_or(0);
-        let effective_inputs = num_inputs.max((max_pos + 1) as usize);
-        let mut ctx = OptContext::with_num_inputs(ops.len(), effective_inputs);
+        let mut ctx = OptContext::with_num_inputs_and_start_pos(
+            ops.len(),
+            num_inputs,
+            inputarg_base,
+            start_next_pos,
+        );
         ctx.skip_flush_mode = self.skip_flush;
         ctx.constant_fold_alloc = self.constant_fold_alloc.take();
         ctx.callinfocollection = self.callinfocollection.clone();
@@ -1488,9 +1519,11 @@ impl Optimizer {
             ctx.value_types.insert(k, v);
         }
         // 4. Inputarg types (from recorder — RPython InputArgInt/Ref/Float)
-        //    Highest priority — override all others.
+        //    Highest priority — override all others. Inputargs occupy
+        //    `[inputarg_base, inputarg_base + num_inputs)` in the OpRef
+        //    namespace; for Phase 1 / standalone runs `inputarg_base = 0`.
         for (i, &tp) in self.trace_inputarg_types.iter().enumerate() {
-            ctx.value_types.insert(i as u32, tp);
+            ctx.value_types.insert(inputarg_base + i as u32, tp);
         }
 
         // optimizer.py:293 patchguardop parity: propagate to Phase 2
@@ -1975,7 +2008,10 @@ impl Optimizer {
         // additional inputargs, the corresponding SETFIELD/SETARRAYITEM must
         // remain in the trace rather than being silently discarded.
         // final_num_inputs = original inputs + virtual inputs added by passes.
-        let num_virtual_inputs = (ctx.num_inputs as usize).saturating_sub(effective_inputs);
+        // Pipeline passes (e.g., virtualizable) may bump ctx.num_inputs by
+        // adding synthetic input slots. The delta is the count of virtual
+        // inputargs the optimizer needs to materialize at trace entry.
+        let num_virtual_inputs = (ctx.num_inputs as usize).saturating_sub(num_inputs);
         self.final_num_inputs = num_inputs + num_virtual_inputs;
 
         // RPython store_final_boxes_in_guard parity: re-encode late virtuals
@@ -2083,9 +2119,9 @@ impl Optimizer {
             let fni = self.final_num_inputs as u32;
             let mut remap = std::collections::HashMap::new();
 
-            // Virtual input positions: optimizer used effective_inputs+k, backend needs num_inputs+k
+            // Virtual input positions: optimizer used num_inputs+k, backend needs num_inputs+k
             for k in 0..num_virtual_inputs {
-                let opt_pos = (effective_inputs + k) as u32;
+                let opt_pos = (num_inputs + k) as u32;
                 let be_pos = (num_inputs + k) as u32;
                 if opt_pos != be_pos {
                     remap.insert(opt_pos, be_pos);
