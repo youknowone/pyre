@@ -1145,12 +1145,19 @@ impl HeapCache {
     /// Check if a value's nullity is known.
     /// heapcache.py:475-478: is_nullity_known(box)
     ///   if isinstance(box, Const): return bool(box.getref_base())
-    pub fn is_nullity_known(&self, opref: OpRef) -> Option<bool> {
+    ///
+    /// `const_value` resolves a constant-namespace OpRef to its raw value.
+    /// RPython reads `box.getref_base()` directly; Rust needs a lookup
+    /// into the constant pool.
+    pub fn is_nullity_known(
+        &self,
+        opref: OpRef,
+        const_value: impl Fn(OpRef) -> Option<i64>,
+    ) -> Option<bool> {
         if opref.is_constant() {
-            // RPython: Const boxes have known nullity from their value.
-            // Constant-namespace OpRefs are always non-null refs in practice
-            // (null is encoded as TAGINT 0, not as a constant-namespace OpRef).
-            return Some(true);
+            // heapcache.py:477: return bool(box.getref_base())
+            // A null ConstPtr (value 0) is known-null; non-zero is known-nonnull.
+            return Some(const_value(opref).unwrap_or(0) != 0);
         }
         self.known_nullity
             .get(opref.0 as usize)
@@ -1496,12 +1503,12 @@ mod tests {
         let mut cache = HeapCache::new();
         let obj = OpRef(10);
 
-        assert_eq!(cache.is_nullity_known(obj), None);
+        assert_eq!(cache.is_nullity_known(obj, |_| None), None);
         cache.nullity_now_known(obj, true);
-        assert_eq!(cache.is_nullity_known(obj), Some(true));
+        assert_eq!(cache.is_nullity_known(obj, |_| None), Some(true));
 
         cache.nullity_now_known(obj, false);
-        assert_eq!(cache.is_nullity_known(obj), Some(false));
+        assert_eq!(cache.is_nullity_known(obj, |_| None), Some(false));
     }
 
     #[test]
@@ -1540,6 +1547,6 @@ mod tests {
 
         // GUARD_NONNULL makes nullity known
         cache.notify_op(OpCode::GuardNonnull, &[obj], OpRef::NONE);
-        assert_eq!(cache.is_nullity_known(obj), Some(true));
+        assert_eq!(cache.is_nullity_known(obj, |_| None), Some(true));
     }
 }
