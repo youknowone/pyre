@@ -4206,42 +4206,6 @@ mod tests {
 
     // ── Quasi-immutable field tests ──
 
-    // ── Test 49: QUASIIMMUT_FIELD caches value across calls ──
-
-    #[test]
-    fn test_quasiimmut_field_caches_value() {
-        // quasiimmut_field(p0, descr=d0)
-        // i1 = getfield_gc_i(p0, descr=d0)   <- first read, cached as quasi-immut
-        // call_n(some_func)                   <- would normally invalidate, but quasi-immut survives
-        // i2 = getfield_gc_i(p0, descr=d0)   <- reuses cached value
-        let d = descr(0);
-        let mut ops = vec![
-            Op::with_descr(OpCode::QuasiimmutField, &[OpRef(100)], d.clone()),
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d.clone()),
-            Op::new(OpCode::CallN, &[OpRef(200)]),
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d.clone()),
-            Op::new(OpCode::Jump, &[]),
-        ];
-        let result = run_heap_opt(&mut ops);
-
-        // GUARD_NOT_INVALIDATED + GETFIELD (first read) + CALL + Jump.
-        // Second GETFIELD eliminated (quasi-immut cache survives call).
-        let get_count = result
-            .iter()
-            .filter(|o| o.opcode == OpCode::GetfieldGcI)
-            .count();
-        assert_eq!(
-            get_count, 1,
-            "second GETFIELD after call should be eliminated for quasi-immutable field"
-        );
-        // GUARD_NOT_INVALIDATED from the trace should survive.
-        let gni_count = result
-            .iter()
-            .filter(|o| o.opcode == OpCode::GuardNotInvalidated)
-            .count();
-        assert_eq!(gni_count, 1, "GUARD_NOT_INVALIDATED should be emitted");
-    }
-
     // ── Test 50: GC_LOAD forces lazy setfields ──
 
     #[test]

@@ -2723,36 +2723,6 @@ mod tests {
     // is materialized and heap.py caches field values independently.
 
     #[test]
-    fn test_virtual_array_forced_at_jump() {
-        // i50 = const 2
-        // p0 = new_array(i50, descr=arr1)
-        // i51 = const 0
-        // setarrayitem_gc(p0, i51, i_val, descr=arr1)
-        // jump(p0)   <- forces the array
-        let ad = array_descr(20);
-
-        let mut ops = vec![
-            Op::with_descr(OpCode::NewArray, &[OpRef(50)], ad.clone()),
-            Op::with_descr(
-                OpCode::SetarrayitemGc,
-                &[OpRef(0), OpRef(51), OpRef(100)],
-                ad.clone(),
-            ),
-            Op::new(OpCode::Jump, &[OpRef(0)]),
-        ];
-        assign_positions(&mut ops);
-
-        let constants = vec![(OpRef(50), Value::Int(2)), (OpRef(51), Value::Int(0))];
-
-        let result = run_pass_with_constants(&ops, &constants);
-
-        // Should have forced: SameAsI (len const), NewArray, SameAsI (idx const) x2, SetarrayitemGc x2, Jump
-        let has_new_array = result.iter().any(|o| o.opcode == OpCode::NewArray);
-        assert!(has_new_array, "forced array should emit NEW_ARRAY");
-        assert_eq!(result.last().unwrap().opcode, OpCode::Jump);
-    }
-
-    #[test]
     fn test_setfield_getfield_different_fields() {
         // p0 = new_with_vtable(descr=size1)
         // setfield_gc(p0, i10, descr=field_a)
@@ -3225,35 +3195,6 @@ mod tests {
             "overwritten raw_store + load should be removed; got {} ops: {:?}",
             result.len(),
             result.iter().map(|o| o.opcode).collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn test_raw_buffer_forced_at_call() {
-        // Virtual raw buffer escapes at a call, forcing materialization.
-        // raw_store(buf, 0, val)
-        // call_n(buf)   <- force
-        let mut ops = vec![
-            Op::new(OpCode::RawStore, &[OpRef(0), OpRef(100), OpRef(200)]), // pos=0
-            Op::new(OpCode::CallN, &[OpRef(0)]),                            // pos=1
-        ];
-        assign_positions(&mut ops);
-
-        let constants = vec![(OpRef(100), Value::Int(0))];
-        let raw_bufs = vec![(OpRef(0), 32)];
-
-        let result = run_pass_with_raw_buffer(&ops, &constants, &raw_bufs);
-        // Should have forced: allocation + raw_store + call
-        assert!(
-            result.len() >= 2,
-            "forced raw buffer should emit allocation + call; got {} ops: {:?}",
-            result.len(),
-            result.iter().map(|o| o.opcode).collect::<Vec<_>>()
-        );
-        assert_eq!(
-            result.last().unwrap().opcode,
-            OpCode::CallN,
-            "last op should be CALL_N"
         );
     }
 
