@@ -2660,11 +2660,20 @@ impl OptContext {
     /// ```
     ///
     /// `AbstractRawPtrInfo` is the upstream base for `RawBufferPtrInfo`,
-    /// `RawStructPtrInfo`, `RawSlicePtrInfo` (info.py:374-485). majit
-    /// currently only ports `VirtualRawBuffer` (corresponding to the
-    /// virtual case of `RawBufferPtrInfo`); the non-virtual `RawStruct`
-    /// and `RawSlice` shapes are TODO line-by-line ports — they will
-    /// be added to this dispatch as new `PtrInfo` variants land.
+    /// `RawStructPtrInfo`, `RawSlicePtrInfo` (info.py:374-485). Of these:
+    ///
+    /// - `RawBufferPtrInfo` ↔ majit `PtrInfo::VirtualRawBuffer` (created
+    ///   by `OptVirtualize` from `RAW_MALLOC_VARSIZE_CHAR`).
+    /// - `RawSlicePtrInfo` is created upstream by
+    ///   `virtualize.py:60 make_virtual_raw_slice` from
+    ///   `optimize_INT_ADD(raw_buffer, const_offset)`. majit has neither
+    ///   the `PtrInfo::VirtualRawSlice` variant nor the `INT_ADD` slice
+    ///   creator yet — TODO line-by-line port.
+    /// - `RawStructPtrInfo` is defined at info.py:452 but never
+    ///   instantiated anywhere in upstream (`grep -rn "RawStructPtrInfo("
+    ///   rpython/jit/` returns only the class definition). It is dead
+    ///   reservation code, so the absence of a majit variant is not a
+    ///   parity gap.
     ///
     /// `ConstPtrInfo` is NOT a subclass of `AbstractRawPtrInfo` in
     /// upstream, so a constant raw-pointer `ConstInt` is `False` here
@@ -2674,9 +2683,9 @@ impl OptContext {
         let resolved = self.get_box_replacement(opref);
         matches!(
             self.get_ptr_info(resolved),
-            Some(PtrInfo::VirtualRawBuffer(_)) // TODO line-by-line port: RawStructPtrInfo, RawSlicePtrInfo
-                                               //                         (info.py:452-485) once their
-                                               //                         majit variants land.
+            Some(PtrInfo::VirtualRawBuffer(_)) // TODO add VirtualRawSlice (info.py:459) once
+                                               //      OptVirtualize::optimize_int_add slice
+                                               //      creator + variant land.
         )
     }
 
