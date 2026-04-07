@@ -2532,7 +2532,6 @@ impl OptUnroll {
         );
 
         // unroll.py:483-490: source.set_forwarded(target) + setinfo_from_preamble
-        let mut import_seen: std::collections::HashSet<OpRef> = std::collections::HashSet::new();
         if crate::optimizeopt::majit_log_enabled() {
             eprintln!(
                 "[jit][import] next_iteration_args={:?}",
@@ -2541,24 +2540,28 @@ impl OptUnroll {
         }
         for (i, target) in exported_state.next_iteration_args.iter().enumerate() {
             let source = targetargs[i];
-            // unroll.py:485-486: source.set_forwarded(target)
-            // RPython guarantees source is not target via fresh Box identity.
-            // majit: source == target is possible when both phases share a
-            // trace position — replace_op(x, x) is a no-op, matching the
-            // RPython invariant that self-forwarding never occurs.
-            // Cross-slot collisions are handled in optimizer.rs.
+            // unroll.py:485 assert source is not target
+            // After Step 2 Commit D2 the Phase 2 source slot OpRefs live
+            // in the disjoint range [inputarg_base..) while
+            // next_iteration_args carry Phase 1 emitted OpRefs in
+            // [num_inputs..next_global_opref) — the assertion holds by
+            // construction. The Phase 1 / standalone path
+            // (`inputarg_base == 0`) may still see source == target for
+            // pass-through inputarg slots; treat that as a no-op
+            // forwarding rather than asserting, matching `replace_op`'s
+            // self-forwarding short-circuit.
+            debug_assert!(
+                ctx.inputarg_base == 0 || source != *target,
+                "import_state: source == target should be impossible \
+                 when inputarg_base != 0 (Step 2 Commit D2 invariant)",
+            );
+            // unroll.py:486: source.set_forwarded(target)
             ctx.replace_op(source, *target);
-            // unroll.py:487-490
+            // unroll.py:487-490: setinfo_from_preamble(source, info, exported_infos)
             if let Some(info) = exported_state.exported_infos.get(target) {
-                // unroll.py:53-54: op = get_box_replacement(op)
-                let resolved = ctx.get_box_replacement(source);
-                self.setinfo_from_preamble_recursive(
-                    resolved,
-                    info,
-                    &exported_state.exported_infos,
-                    ctx,
-                    &mut import_seen,
-                );
+                // unroll.py:53-54: op = get_box_replacement(op) — already
+                // performed inside `setinfo_from_preamble`.
+                self.setinfo_from_preamble(source, info, &exported_state.exported_infos, ctx);
             }
         }
 
@@ -2661,6 +2664,26 @@ impl OptUnroll {
         }
     }
 
+    /// unroll.py:53-98 setinfo_from_preamble(op, preamble_info, exported_infos)
+    /// literal port.
+    ///
+    /// ```python
+    /// def setinfo_from_preamble(self, op, preamble_info, exported_infos):
+    ///     op = get_box_replacement(op)
+    ///     if op.get_forwarded() is not None:
+    ///         return
+    ///     if op.is_constant():
+    ///         return  # nothing we can learn
+    ///     if isinstance(preamble_info, info.PtrInfo):
+    ///         …
+    /// ```
+    ///
+    /// majit's equivalent of `op.get_forwarded() is not None` is
+    /// `Forwarded != Forwarded::None` — i.e. either an Op forwarding,
+    /// a Const terminal, an IntBound, or a PtrInfo. The cycle-prevention
+    /// short-circuit is identical to RPython's. The recursive walk over
+    /// virtual field PtrInfos is delegated to `apply_exported_ptr_info`,
+    /// which calls back into `setinfo_from_preamble` for each field.
     fn setinfo_from_preamble(
         &self,
         opref: OpRef,
@@ -2668,21 +2691,12 @@ impl OptUnroll {
         exported_infos: &HashMap<OpRef, ExportedValueInfo>,
         ctx: &mut OptContext,
     ) {
-        let mut seen = std::collections::HashSet::new();
-        self.setinfo_from_preamble_recursive(opref, info, exported_infos, ctx, &mut seen);
-    }
-
-    fn setinfo_from_preamble_recursive(
-        &self,
-        opref: OpRef,
-        info: &ExportedValueInfo,
-        exported_infos: &HashMap<OpRef, ExportedValueInfo>,
-        ctx: &mut OptContext,
-        seen: &mut std::collections::HashSet<OpRef>,
-    ) {
         // unroll.py:53-54: op = get_box_replacement(op)
         let target = ctx.get_box_replacement(opref);
-        if !seen.insert(target) {
+        // unroll.py:55-56: if op.get_forwarded() is not None: return
+        // Skip targets that already have info attached so recursive
+        // walks over virtual field references don't loop forever.
+        if ctx.has_forwarding(target) {
             return;
         }
         // RPython setinfo_from_preamble parity (unroll.py:73-75):
@@ -2707,7 +2721,7 @@ impl OptUnroll {
             }
         }
         if let Some(ptr_info) = info.ptr_info.clone() {
-            self.apply_exported_ptr_info(target, ptr_info, exported_infos, ctx, seen);
+            self.apply_exported_ptr_info(target, ptr_info, exported_infos, ctx);
         } else {
             match info.ptr_kind {
                 ExportedPtrKind::Instance => {
@@ -2778,7 +2792,6 @@ impl OptUnroll {
         ptr_info: crate::optimizeopt::info::PtrInfo,
         exported_infos: &HashMap<OpRef, ExportedValueInfo>,
         ctx: &mut OptContext,
-        seen: &mut std::collections::HashSet<OpRef>,
     ) {
         use crate::optimizeopt::info::PtrInfo;
 
@@ -2805,13 +2818,7 @@ impl OptUnroll {
                 ctx.set_ptr_info(opref, PtrInfo::Virtual(info));
                 for field_ref in field_refs {
                     if let Some(field_info) = exported_infos.get(&field_ref) {
-                        self.setinfo_from_preamble_recursive(
-                            field_ref,
-                            field_info,
-                            exported_infos,
-                            ctx,
-                            seen,
-                        );
+                        self.setinfo_from_preamble(field_ref, field_info, exported_infos, ctx);
                     }
                 }
             }
@@ -2824,13 +2831,7 @@ impl OptUnroll {
                 ctx.set_ptr_info(opref, PtrInfo::VirtualStruct(info));
                 for field_ref in field_refs {
                     if let Some(field_info) = exported_infos.get(&field_ref) {
-                        self.setinfo_from_preamble_recursive(
-                            field_ref,
-                            field_info,
-                            exported_infos,
-                            ctx,
-                            seen,
-                        );
+                        self.setinfo_from_preamble(field_ref, field_info, exported_infos, ctx);
                     }
                 }
             }
@@ -2839,13 +2840,7 @@ impl OptUnroll {
                 ctx.set_ptr_info(opref, PtrInfo::VirtualArray(info));
                 for item_ref in item_refs {
                     if let Some(item_info) = exported_infos.get(&item_ref) {
-                        self.setinfo_from_preamble_recursive(
-                            item_ref,
-                            item_info,
-                            exported_infos,
-                            ctx,
-                            seen,
-                        );
+                        self.setinfo_from_preamble(item_ref, item_info, exported_infos, ctx);
                     }
                 }
             }
@@ -2859,13 +2854,7 @@ impl OptUnroll {
                 ctx.set_ptr_info(opref, PtrInfo::VirtualArrayStruct(info));
                 for field_ref in all_field_refs {
                     if let Some(field_info) = exported_infos.get(&field_ref) {
-                        self.setinfo_from_preamble_recursive(
-                            field_ref,
-                            field_info,
-                            exported_infos,
-                            ctx,
-                            seen,
-                        );
+                        self.setinfo_from_preamble(field_ref, field_info, exported_infos, ctx);
                     }
                 }
             }
@@ -2874,13 +2863,7 @@ impl OptUnroll {
                 ctx.set_ptr_info(opref, PtrInfo::VirtualRawBuffer(info));
                 for entry_ref in entry_refs {
                     if let Some(entry_info) = exported_infos.get(&entry_ref) {
-                        self.setinfo_from_preamble_recursive(
-                            entry_ref,
-                            entry_info,
-                            exported_infos,
-                            ctx,
-                            seen,
-                        );
+                        self.setinfo_from_preamble(entry_ref, entry_info, exported_infos, ctx);
                     }
                 }
             }
@@ -2888,13 +2871,7 @@ impl OptUnroll {
                 ctx.set_ptr_info(opref, PtrInfo::Instance(info.clone()));
                 for &(_, field_ref) in &info.fields {
                     if let Some(field_info) = exported_infos.get(&field_ref) {
-                        self.setinfo_from_preamble_recursive(
-                            field_ref,
-                            field_info,
-                            exported_infos,
-                            ctx,
-                            seen,
-                        );
+                        self.setinfo_from_preamble(field_ref, field_info, exported_infos, ctx);
                     }
                 }
             }
@@ -2902,13 +2879,7 @@ impl OptUnroll {
                 ctx.set_ptr_info(opref, PtrInfo::Struct(info.clone()));
                 for &(_, field_ref) in &info.fields {
                     if let Some(field_info) = exported_infos.get(&field_ref) {
-                        self.setinfo_from_preamble_recursive(
-                            field_ref,
-                            field_info,
-                            exported_infos,
-                            ctx,
-                            seen,
-                        );
+                        self.setinfo_from_preamble(field_ref, field_info, exported_infos, ctx);
                     }
                 }
             }
@@ -2916,13 +2887,7 @@ impl OptUnroll {
                 ctx.set_ptr_info(opref, PtrInfo::Array(info.clone()));
                 for &item_ref in &info.items {
                     if let Some(item_info) = exported_infos.get(&item_ref) {
-                        self.setinfo_from_preamble_recursive(
-                            item_ref,
-                            item_info,
-                            exported_infos,
-                            ctx,
-                            seen,
-                        );
+                        self.setinfo_from_preamble(item_ref, item_info, exported_infos, ctx);
                     }
                 }
             }
