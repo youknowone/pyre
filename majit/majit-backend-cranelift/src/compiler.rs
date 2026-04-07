@@ -3175,12 +3175,19 @@ fn build_ref_root_slots(
         }
     }
 
-    // Float at Ref positions always crashes (float bits are not valid
-    // pointers). Int at Ref positions may be valid GC pointer constants
-    // (e.g., inlined PyInt class pointer). Reject only Float mismatches.
+    // RPython parity note: this situation (non-Ref at Ref inputarg position)
+    // does not arise in RPython because Box identity preserves types through
+    // optimization. In RPython, force_box_for_end_of_preamble materializes
+    // virtuals; the type of the Box never changes. majit's flat OpRef model
+    // allows type substitution (SameAsF/SameAsI replacing Ref) which RPython
+    // cannot express.
+    //
+    // Float at Ref always segfaults (IEEE754 bits are never valid pointers).
+    // Int at Ref can be safe: the optimizer may forward a GC pointer through
+    // SameAsI without changing the actual runtime value.
     if has_float_at_ref_position {
         return Err(BackendError::Unsupported(
-            "jump_to_preamble passes Float at Ref-typed inputarg position".to_string(),
+            "jump_to_preamble: backedge passes Float at Ref-typed inputarg position".to_string(),
         ));
     }
 
@@ -6942,16 +6949,20 @@ impl CraneliftBackend {
                     // x86/assembler.py:2234-2235 _genop_call_may_force:
                     //   self._store_force_index(self._find_nearby_operation(+1))
                     //   self._genop_call(op, arglocs, result_loc)
-                    // _find_nearby_operation(+1) = operations[position + 1]
-                    // _store_force_index asserts GUARD_NOT_FORCED or GUARD_NOT_FORCED_2
-                    let next_op = ops.get(op_idx + 1);
-                    let is_paired_guard = next_op.is_some_and(|o| {
-                        o.opcode == OpCode::GuardNotForced || o.opcode == OpCode::GuardNotForced2
-                    });
-                    if !is_paired_guard {
+                    // Find the paired GuardNotForced by scanning forward.
+                    // The optimizer may emit intervening ops (e.g. SameAsI)
+                    // between CallMayForce and GuardNotForced.
+                    let guard_not_forced_idx = ops[op_idx + 1..]
+                        .iter()
+                        .position(|o| {
+                            o.opcode == OpCode::GuardNotForced
+                                || o.opcode == OpCode::GuardNotForced2
+                        })
+                        .map(|delta| op_idx + 1 + delta);
+                    if guard_not_forced_idx.is_none() {
                         return Err(unsupported_semantics(
                             op.opcode,
-                            "call_may_force: ops[position+1] must be guard_not_forced(_2)",
+                            "call_may_force: no guard_not_forced(_2) found after call",
                         ));
                     }
                     let info = &guard_infos[guard_idx];
