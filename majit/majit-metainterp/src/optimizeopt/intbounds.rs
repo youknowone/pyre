@@ -968,12 +968,12 @@ impl OptIntBounds {
     fn make_int_lt(&mut self, box1: OpRef, box2: OpRef, ctx: &OptContext) {
         let b2 = self.getintbound(box2, ctx);
         let b1 = self.get_bound_mut(box1);
-        if matches!(b1.make_lt(&b2), Ok(true)) {
+        if b1.make_lt(&b2).is_ok() {
             self.propagate_bounds_backward(box1, ctx);
         }
         let b1 = self.getintbound(box1, ctx);
         let b2_mut = self.get_bound_mut(box2);
-        if matches!(b2_mut.make_gt(&b1), Ok(true)) {
+        if b2_mut.make_gt(&b1).is_ok() {
             self.propagate_bounds_backward(box2, ctx);
         }
     }
@@ -982,12 +982,12 @@ impl OptIntBounds {
     fn make_int_le(&mut self, box1: OpRef, box2: OpRef, ctx: &OptContext) {
         let b2 = self.getintbound(box2, ctx);
         let b1 = self.get_bound_mut(box1);
-        if matches!(b1.make_le(&b2), Ok(true)) {
+        if b1.make_le(&b2).is_ok() {
             self.propagate_bounds_backward(box1, ctx);
         }
         let b1 = self.getintbound(box1, ctx);
         let b2_mut = self.get_bound_mut(box2);
-        if matches!(b2_mut.make_ge(&b1), Ok(true)) {
+        if b2_mut.make_ge(&b1).is_ok() {
             self.propagate_bounds_backward(box2, ctx);
         }
     }
@@ -1006,12 +1006,12 @@ impl OptIntBounds {
     fn make_unsigned_lt(&mut self, box1: OpRef, box2: OpRef, ctx: &OptContext) {
         let b2 = self.getintbound(box2, ctx);
         let b1 = self.get_bound_mut(box1);
-        if matches!(b1.make_unsigned_lt(&b2), Ok(true)) {
+        if b1.make_unsigned_lt(&b2).is_ok() {
             self.propagate_bounds_backward(box1, ctx);
         }
         let b1 = self.getintbound(box1, ctx);
         let b2_mut = self.get_bound_mut(box2);
-        if matches!(b2_mut.make_unsigned_gt(&b1), Ok(true)) {
+        if b2_mut.make_unsigned_gt(&b1).is_ok() {
             self.propagate_bounds_backward(box2, ctx);
         }
     }
@@ -1020,12 +1020,12 @@ impl OptIntBounds {
     fn make_unsigned_le(&mut self, box1: OpRef, box2: OpRef, ctx: &OptContext) {
         let b2 = self.getintbound(box2, ctx);
         let b1 = self.get_bound_mut(box1);
-        if matches!(b1.make_unsigned_le(&b2), Ok(true)) {
+        if b1.make_unsigned_le(&b2).is_ok() {
             self.propagate_bounds_backward(box1, ctx);
         }
         let b1 = self.getintbound(box1, ctx);
         let b2_mut = self.get_bound_mut(box2);
-        if matches!(b2_mut.make_unsigned_ge(&b1), Ok(true)) {
+        if b2_mut.make_unsigned_ge(&b1).is_ok() {
             self.propagate_bounds_backward(box2, ctx);
         }
     }
@@ -1038,18 +1038,13 @@ impl OptIntBounds {
         self.make_unsigned_le(box2, box1, ctx);
     }
 
-    /// intbounds.py:658-664 make_eq
     fn make_eq(&mut self, arg0: OpRef, arg1: OpRef, ctx: &OptContext) {
         let b1 = self.getintbound(arg1, ctx);
         let b0 = self.get_bound_mut(arg0);
-        if matches!(b0.intersect(&b1), Ok(true)) {
-            self.propagate_bounds_backward(arg0, ctx);
-        }
+        let _ = b0.intersect(&b1);
         let b0 = self.getintbound(arg0, ctx);
         let b1_mut = self.get_bound_mut(arg1);
-        if matches!(b1_mut.intersect(&b0), Ok(true)) {
-            self.propagate_bounds_backward(arg1, ctx);
-        }
+        let _ = b1_mut.intersect(&b0);
     }
 
     fn make_ne(&mut self, arg0: OpRef, arg1: OpRef, ctx: &OptContext) {
