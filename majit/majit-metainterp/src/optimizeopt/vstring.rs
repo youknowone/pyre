@@ -673,11 +673,28 @@ impl OptString {
 
     /// vstring.py:816-838 opt_call_stroruni_STR_CMP
     fn opt_call_stroruni_str_cmp(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        if op.num_args() >= 3 {
-            let a = ctx.get_box_replacement(op.arg(1));
-            let b = ctx.get_box_replacement(op.arg(2));
-            if a == b {
-                ctx.make_constant(op.pos, Value::Int(0));
+        if op.num_args() < 3 {
+            self.force_args_if_virtual(op, ctx);
+            return OptimizationResult::PassOn;
+        }
+        let arg1 = ctx.get_box_replacement(op.arg(1));
+        let arg2 = ctx.get_box_replacement(op.arg(2));
+        // Same-ref: result is 0
+        if arg1 == arg2 {
+            ctx.make_constant(op.pos, Value::Int(0));
+            return OptimizationResult::Remove;
+        }
+        // vstring.py:825-836: if both lengths are known constant 1,
+        // extract characters and replace with INT_SUB
+        let l1 = self.get_known_length(arg1, ctx);
+        let l2 = self.get_known_length(arg2, ctx);
+        if l1 == Some(1) && l2 == Some(1) {
+            if let (Some(char1), Some(char2)) = (
+                self.strgetitem(op.arg(1), 0, ctx),
+                self.strgetitem(op.arg(2), 0, ctx),
+            ) {
+                let result = self.int_sub(char1, char2, ctx);
+                ctx.replace_op(op.pos, result);
                 return OptimizationResult::Remove;
             }
         }
@@ -687,6 +704,21 @@ impl OptString {
 
     /// vstring.py:839-851 opt_call_SHRINK_ARRAY
     fn opt_call_shrink_array(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+        if op.num_args() >= 3 {
+            let arg1 = ctx.get_box_replacement(op.arg(1));
+            let length = ctx.get_constant_int(op.arg(2));
+            // vstring.py:844-850: if index is constant, argument is virtual
+            // VStringPlainInfo → shrink the virtual in-place and remove the call.
+            if let (Some(length), Some(info)) = (length, self.vstrings.get_mut(&arg1)) {
+                if matches!(info, VStringInfo::Plain { .. }) {
+                    if let VStringInfo::Plain { chars } = info {
+                        chars.truncate(length as usize);
+                    }
+                    ctx.replace_op(op.pos, arg1);
+                    return OptimizationResult::Remove;
+                }
+            }
+        }
         self.force_args_if_virtual(op, ctx);
         OptimizationResult::PassOn
     }
