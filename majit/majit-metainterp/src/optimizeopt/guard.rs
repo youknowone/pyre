@@ -215,7 +215,7 @@ impl Guard {
         let ncp = next_const_pos;
         let cv = const_values;
         let ops = var.get_operations(|value| {
-            let cref = OpRef(*ncp);
+            let cref = OpRef::from_const(*ncp);
             *ncp += 1;
             cv.insert(cref, value);
             cref
@@ -413,7 +413,7 @@ pub struct GuardEliminator {
     guards: HashMap<usize, Option<Guard>>,
     /// renamer.py: Renamer — maps old OpRef → new OpRef for renamed vars.
     renamer: HashMap<OpRef, OpRef>,
-    /// Counter for constant OpRef allocation (>= CONST_BASE).
+    /// Zero-based counter for constant-namespace OpRef allocation.
     next_const_pos: u32,
     /// Materialized constant values: OpRef → i64.
     /// RPython uses ConstInt boxes inline; majit stores const values here.
@@ -430,7 +430,7 @@ impl GuardEliminator {
             strongest_guards: HashMap::new(),
             guards: HashMap::new(),
             renamer: HashMap::new(),
-            next_const_pos: OpRef::CONST_BASE + 50000,
+            next_const_pos: 0,
             const_values: HashMap::new(),
         }
     }
@@ -535,7 +535,7 @@ impl GuardEliminator {
                         let ncp = &mut self.next_const_pos;
                         let cv = &mut self.const_values;
                         let result = index_var.emit_operations(&mut self._newoperations, |value| {
-                            let cref = OpRef(*ncp);
+                            let cref = OpRef::from_const(*ncp);
                             *ncp += 1;
                             cv.insert(cref, value);
                             cref

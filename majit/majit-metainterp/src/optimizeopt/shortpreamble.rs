@@ -550,6 +550,10 @@ impl ShortBoxes {
                 self.note_known_constant(OpRef(idx as u32));
             }
         }
+        // Also register constant-namespace entries from const_pool.
+        for (&const_idx, _) in &ctx.const_pool {
+            self.note_known_constant(OpRef::from_const(const_idx));
+        }
     }
 
     fn add_op(&mut self, result: OpRef, pop: PotentialShortOp) {

@@ -460,13 +460,17 @@ impl PtrInfo {
     }
 
     /// info.py:83: make_guards(op, short, optimizer)
+    /// info.py: make_guards(self, op, short, optimizer)
+    ///
     /// Append guard operations to `short` that check this PtrInfo's
     /// properties hold for `op`. Used by use_box (shortpreamble.py:382).
+    /// `alloc_const` allocates a constant-namespace OpRef and seeds the
+    /// value — RPython equivalent: ConstInt(value) / ConstPtr(value).
     pub fn make_guards(
         &self,
         op: OpRef,
         short: &mut Vec<Op>,
-        const_pool: &mut Vec<(OpRef, Value)>,
+        alloc_const: &mut impl FnMut(Value) -> OpRef,
     ) {
         match self {
             // info.py:83-84: PtrInfo base — no-op
@@ -476,13 +480,13 @@ impl PtrInfo {
             }
             PtrInfo::KnownClass { class_ptr, .. } => {
                 // info.py:336-345: InstancePtrInfo.make_guards with known_class
-                let class_ref = Self::alloc_guard_const(const_pool, Value::Ref(*class_ptr));
+                let class_ref = alloc_const(Value::Ref(*class_ptr));
                 short.push(Op::new(OpCode::GuardNonnullClass, &[op, class_ref]));
             }
             PtrInfo::Instance(info) => {
                 // info.py:336-353: InstancePtrInfo.make_guards
                 if let Some(cls) = &info.known_class {
-                    let class_ref = Self::alloc_guard_const(const_pool, Value::Ref(*cls));
+                    let class_ref = alloc_const(Value::Ref(*cls));
                     short.push(Op::new(OpCode::GuardNonnullClass, &[op, class_ref]));
                 } else {
                     // info.py:353: fallback to AbstractStructPtrInfo (NonNull)
@@ -495,7 +499,7 @@ impl PtrInfo {
             }
             PtrInfo::Constant(gcref) => {
                 // info.py:715-716: ConstPtrInfo.make_guards
-                let c = Self::alloc_guard_const(const_pool, Value::Ref(*gcref));
+                let c = alloc_const(Value::Ref(*gcref));
                 short.push(Op::new(OpCode::GuardValue, &[op, c]));
             }
             PtrInfo::Array(_) => {
@@ -517,7 +521,7 @@ impl PtrInfo {
                         short.push(lenop);
                         // intutils.py: IntBound.make_guards → generate bound guards
                         for (guard_opcode, value) in bound.make_guards() {
-                            let c = Self::alloc_guard_const(const_pool, Value::Int(value));
+                            let c = alloc_const(Value::Int(value));
                             short.push(Op::new(guard_opcode, &[lenop_pos, c]));
                         }
                     }
@@ -526,22 +530,6 @@ impl PtrInfo {
             // Virtuals/Virtualizable: no guards needed in short preamble
             _ => {}
         }
-    }
-
-    /// Record a constant needed by a short preamble guard.
-    /// The caller (collect_use_box_guards) allocates proper OpRefs
-    /// via alloc_op_position and registers them in the constant map.
-    fn alloc_guard_const(const_pool: &mut Vec<(OpRef, Value)>, value: Value) -> OpRef {
-        // Check if we already have this value in the pool
-        for &(ref_existing, ref val_existing) in const_pool.iter() {
-            if *val_existing == value {
-                return ref_existing;
-            }
-        }
-        // Placeholder — caller replaces with alloc_op_position result
-        let placeholder = OpRef(u32::MAX - const_pool.len() as u32);
-        const_pool.push((placeholder, value));
-        placeholder
     }
 
     /// Get the string length from a constant string pointer.

@@ -313,6 +313,16 @@ impl UnrollOptimizer {
                         consts_p1.entry(idx as u32).or_insert(raw);
                     }
                 }
+                for (&const_idx, v) in &final_ctx.const_pool {
+                    let key = OpRef::from_const(const_idx).0;
+                    let raw = match v {
+                        majit_ir::Value::Int(v) => *v,
+                        majit_ir::Value::Float(f) => f.to_bits() as i64,
+                        majit_ir::Value::Ref(r) => r.0 as i64,
+                        majit_ir::Value::Void => 0,
+                    };
+                    consts_p1.entry(key).or_insert(raw);
+                }
             }
             let p1_ni = opt_p1.final_num_inputs();
 
@@ -5382,13 +5392,13 @@ mod tests {
         let mut ctx = crate::optimizeopt::OptContext::with_num_inputs(8, 0);
         let ptr = GcRef(0x1234_5678);
         let field_descr = majit_ir::descr::make_field_descr_full(88, 0, 8, Type::Int, false);
-        ctx.seed_constant(OpRef(10023), Value::Ref(ptr));
+        ctx.seed_constant(OpRef::from_const(23), Value::Ref(ptr));
         ctx.exported_short_boxes
             .push(crate::optimizeopt::shortpreamble::PreambleOp {
                 op: {
                     let mut op = Op::with_descr(
                         OpCode::GetfieldGcPureI,
-                        &[OpRef(10023)],
+                        &[OpRef::from_const(23)],
                         field_descr.clone(),
                     );
                     op.pos = OpRef(11);
@@ -5408,7 +5418,7 @@ mod tests {
                 opcode: OpCode::GetfieldGcPureI,
                 descr: Some(field_descr.clone()),
                 args: vec![ExportedShortArg::Const {
-                    source: OpRef(10023),
+                    source: OpRef::from_const(23),
                     value: Value::Ref(ptr),
                 }],
                 result: ExportedShortResult::Slot(1),
@@ -5420,7 +5430,10 @@ mod tests {
         let mut ctx2 = crate::optimizeopt::OptContext::with_num_inputs(8, 2);
         let label_args = import_state(&[OpRef(0), OpRef(1)], &exported, &mut ctx2);
         assert_eq!(label_args, vec![OpRef(12), OpRef(11)]);
-        assert_eq!(ctx2.get_constant(OpRef(10023)), Some(&Value::Ref(ptr)));
+        assert_eq!(
+            ctx2.get_constant(OpRef::from_const(23)),
+            Some(&Value::Ref(ptr))
+        );
         assert_eq!(
             ctx2.imported_short_pure_ops,
             vec![crate::optimizeopt::ImportedShortPureOp {
@@ -5428,7 +5441,7 @@ mod tests {
                 descr: Some(field_descr.clone()),
                 args: vec![crate::optimizeopt::ImportedShortPureArg::Const(
                     Value::Ref(ptr),
-                    OpRef(10023)
+                    OpRef::from_const(23)
                 )],
                 result: OpRef(11),
             }]
@@ -5663,12 +5676,12 @@ mod tests {
         }];
         let p2_ops = vec![
             {
-                let mut op = Op::new(OpCode::IntGe, &[OpRef(11), OpRef(10000)]);
+                let mut op = Op::new(OpCode::IntGe, &[OpRef(11), OpRef::from_const(0)]);
                 op.pos = OpRef(4);
                 op
             },
             {
-                let mut op = Op::new(OpCode::IntAdd, &[OpRef(11), OpRef(10001)]);
+                let mut op = Op::new(OpCode::IntAdd, &[OpRef(11), OpRef::from_const(1)]);
                 op.pos = OpRef(11);
                 op
             },
@@ -5676,8 +5689,8 @@ mod tests {
         ];
 
         let mut constants = std::collections::HashMap::new();
-        constants.insert(10_000, 2);
-        constants.insert(10_001, 1);
+        constants.insert(OpRef::from_const(0).0, 2);
+        constants.insert(OpRef::from_const(1).0, 1);
 
         let combined = assemble_peeled_trace(
             &p1_ops,
@@ -5733,7 +5746,7 @@ mod tests {
                 op
             },
             {
-                let mut op = Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(10001)]);
+                let mut op = Op::new(OpCode::IntAdd, &[OpRef(0), OpRef::from_const(1)]);
                 op.pos = OpRef(19);
                 op
             },
@@ -5741,7 +5754,7 @@ mod tests {
         ];
 
         let mut constants = std::collections::HashMap::new();
-        constants.insert(10_001, 1);
+        constants.insert(OpRef::from_const(1).0, 1);
 
         let combined = assemble_peeled_trace(
             &p1_ops,
@@ -5863,13 +5876,13 @@ mod tests {
                 op
             },
             {
-                let mut op = Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(10000)]);
+                let mut op = Op::new(OpCode::IntAdd, &[OpRef(0), OpRef::from_const(0)]);
                 op.pos = OpRef(64);
                 op
             },
             Op::new(OpCode::Jump, &[OpRef(64)]),
         ];
-        let constants = std::collections::HashMap::from([(10_000_u32, 1_i64)]);
+        let constants = std::collections::HashMap::from([(OpRef::from_const(0).0, 1_i64)]);
 
         let combined = assemble_peeled_trace(
             &[],
@@ -6005,10 +6018,10 @@ mod tests {
     #[test]
     fn test_assemble_peeled_trace_maps_body_inputs_via_source_slots() {
         let mut constants = std::collections::HashMap::new();
-        constants.insert(10_000, 1);
+        constants.insert(OpRef::from_const(0).0, 1);
         let p2_ops = vec![
             {
-                let mut op = Op::new(OpCode::IntAdd, &[OpRef(5), OpRef(10_000)]);
+                let mut op = Op::new(OpCode::IntAdd, &[OpRef(5), OpRef::from_const(0)]);
                 op.pos = OpRef(20);
                 op
             },

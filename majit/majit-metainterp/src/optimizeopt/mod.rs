@@ -127,8 +127,10 @@ pub type ConstantFoldAllocFn = Box<dyn Fn(usize) -> majit_ir::GcRef>;
 pub struct OptContext {
     /// The output operation list being built.
     pub new_operations: Vec<Op>,
-    /// Constants known at optimization time (op -> value).
+    /// Constants known at optimization time for operation-namespace OpRefs.
     pub constants: Vec<Option<Value>>,
+    /// Constants for constant-namespace OpRefs, keyed by const_index().
+    pub const_pool: HashMap<u32, Value>,
     /// resoperation.py: _forwarded — unified forwarding + PtrInfo.
     /// Forwarded::Op(target) = forwarding, Forwarded::Info(info) = terminal.
     pub forwarded: Vec<crate::optimizeopt::info::Forwarded>,
@@ -139,8 +141,8 @@ pub struct OptContext {
     num_inputs: u32,
     /// Next unique op position for newly emitted or queued extra operations.
     pub(crate) next_pos: u32,
-    /// Next unique constant position (OpRef >= CONST_BASE).
-    pub(crate) next_const_pos: u32,
+    /// Zero-based counter for constant-namespace OpRef allocation.
+    pub(crate) next_const_idx: u32,
     /// RPython emit_extra(op, emit=False) parity: ops queued to be
     /// processed starting from a specific pass index (skipping earlier passes).
     /// Used by heap's force_lazy_set to route ops through remaining passes
@@ -346,7 +348,7 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
 
     fn is_const(&self, opref: OpRef) -> bool {
         // RPython resume.py:204: isinstance(box, Const)
-        // True Const = constant pool entry (>= CONST_BASE) or PtrInfo::Constant.
+        // True Const = constant-namespace OpRef or PtrInfo::Constant.
         // NOT optimizer-known values from make_constant() on operation results.
         if opref.is_constant() {
             return true;
@@ -668,10 +670,11 @@ impl OptContext {
         OptContext {
             new_operations: Vec::with_capacity(estimated_ops),
             constants: Vec::new(),
+            const_pool: HashMap::new(),
             forwarded: Vec::new(),
             num_inputs: 0,
             next_pos: 0,
-            next_const_pos: OpRef::CONST_BASE,
+            next_const_idx: 0,
             extra_operations_after: VecDeque::new(),
             pending_guard_class_postprocess: None,
             pending_mark_last_guard: None,
@@ -728,10 +731,11 @@ impl OptContext {
         OptContext {
             new_operations: Vec::with_capacity(estimated_ops),
             constants: Vec::new(),
+            const_pool: HashMap::new(),
             forwarded: Vec::new(),
             num_inputs: num_inputs as u32,
             next_pos: num_inputs as u32,
-            next_const_pos: OpRef::CONST_BASE,
+            next_const_idx: 0,
             extra_operations_after: VecDeque::new(),
             pending_guard_class_postprocess: None,
             pending_mark_last_guard: None,
@@ -793,23 +797,11 @@ impl OptContext {
         self.reserve_pos()
     }
 
-    /// Allocate a fresh OpRef in the constant namespace (>= CONST_BASE).
-    pub(crate) fn reserve_const_pos(&mut self) -> OpRef {
-        while self
-            .constants
-            .get(self.next_const_pos as usize)
-            .is_some_and(|value| value.is_some())
-        {
-            self.next_const_pos += 1;
-        }
-        debug_assert!(
-            self.next_const_pos >= OpRef::CONST_BASE,
-            "reserve_const_pos allocated non-constant OpRef below constant namespace: {}",
-            self.next_const_pos
-        );
-        let pos_ref = OpRef(self.next_const_pos);
-        self.next_const_pos += 1;
-        pos_ref
+    /// Allocate a fresh OpRef in the constant namespace.
+    pub(crate) fn reserve_const_ref(&mut self) -> OpRef {
+        let opref = OpRef::from_const(self.next_const_idx);
+        self.next_const_idx += 1;
+        opref
     }
 
     pub(crate) fn reserve_pos(&mut self) -> OpRef {
@@ -824,8 +816,8 @@ impl OptContext {
             self.next_pos += 1;
         }
         debug_assert!(
-            self.next_pos < OpRef::CONST_BASE,
-            "reserve_pos in constant namespace: {}",
+            !OpRef(self.next_pos).is_constant(),
+            "reserve_pos overflowed into constant namespace: {}",
             self.next_pos
         );
         let pos_ref = OpRef(self.next_pos);
@@ -838,7 +830,7 @@ impl OptContext {
     /// If the op has no pos assigned (NONE), sets it to `num_inputs + idx`
     /// so the backend's variable numbering stays consistent.
     pub fn emit(&mut self, mut op: Op) -> OpRef {
-        if op.pos.is_none() || op.pos.0 >= OpRef::CONST_BASE {
+        if op.pos.is_none() || op.pos.is_constant() {
             op.pos = self.reserve_pos();
         } else if self.new_operations.iter().any(|e| e.pos == op.pos) {
             // RPython Box parity: reassign position to avoid collision.
@@ -949,6 +941,9 @@ impl OptContext {
             if val.is_some() {
                 builder.note_known_constant(OpRef(idx as u32));
             }
+        }
+        for (&const_idx, _) in &self.const_pool {
+            builder.note_known_constant(OpRef::from_const(const_idx));
         }
         self.imported_short_preamble_builder = Some(builder);
         self.imported_short_preamble_used.clear();
@@ -1098,6 +1093,9 @@ impl OptContext {
                 builder.note_known_constant(OpRef(idx as u32));
             }
         }
+        for (&const_idx, _) in &self.const_pool {
+            builder.note_known_constant(OpRef::from_const(const_idx));
+        }
         self.imported_short_preamble_builder = Some(builder);
         self.imported_short_preamble_used.clear();
         true
@@ -1220,45 +1218,20 @@ impl OptContext {
             .cloned()
             .map(|info| (produced.preamble_op.pos, info));
 
-        // Now generate guards — can call &mut self for constant allocation
+        // Now generate guards — alloc_const directly allocates constant
+        // OpRefs, matching RPython where ConstInt/ConstPtr are created inline.
         let mut arg_guards = Vec::new();
-        let mut const_pool = Vec::new();
+        let mut alloc_const = |value: Value| -> OpRef {
+            let pos = self.reserve_const_ref();
+            self.seed_constant(pos, value);
+            pos
+        };
         for (arg, info) in &arg_infos {
-            info.make_guards(*arg, &mut arg_guards, &mut const_pool);
+            info.make_guards(*arg, &mut arg_guards, &mut alloc_const);
         }
         let mut result_guards = Vec::new();
         if let Some((result_ref, info)) = &result_info {
-            info.make_guards(*result_ref, &mut result_guards, &mut const_pool);
-        }
-        // Replace placeholder OpRefs with stable constant pool OpRefs.
-        // Use 10600+ range to avoid interfering with alloc_op_position
-        // (which advances next_pos and shifts all subsequent OpRefs).
-        let mut remap: std::collections::HashMap<OpRef, OpRef> = std::collections::HashMap::new();
-        for (i, (placeholder, value)) in const_pool.into_iter().enumerate() {
-            let real = OpRef(10600 + i as u32);
-            // Store directly: make_constant early-returns for is_constant()
-            // OpRefs (>= 10000), so we must bypass it for the constants Vec.
-            let idx = real.0 as usize;
-            if idx >= self.constants.len() {
-                self.constants.resize(idx + 1, None);
-            }
-            self.constants[idx] = Some(value.clone());
-            // Also set forwarded so get_constant() and optimizer can see it.
-            if idx >= self.forwarded.len() {
-                self.forwarded
-                    .resize(idx + 1, crate::optimizeopt::info::Forwarded::None);
-            }
-            self.forwarded[idx] = crate::optimizeopt::info::Forwarded::Const(value);
-            remap.insert(placeholder, real);
-        }
-        if !remap.is_empty() {
-            for guard in arg_guards.iter_mut().chain(result_guards.iter_mut()) {
-                for arg in &mut guard.args {
-                    if let Some(&real) = remap.get(arg) {
-                        *arg = real;
-                    }
-                }
-            }
+            info.make_guards(*result_ref, &mut result_guards, &mut alloc_const);
         }
         (arg_guards, result_guards)
     }
@@ -1518,7 +1491,7 @@ impl OptContext {
     }
 
     pub fn replace_op(&mut self, old: OpRef, new: OpRef) {
-        if old == new {
+        if old == new || old.is_constant() {
             return;
         }
         use crate::optimizeopt::info::Forwarded;
@@ -1615,11 +1588,15 @@ impl OptContext {
     /// Store a constant value WITHOUT setting Forwarded::Const.
     /// Used for pre-populating backend constants and call_pure_results.
     pub fn seed_constant(&mut self, opref: OpRef, value: Value) {
-        let idx = opref.0 as usize;
-        if idx >= self.constants.len() {
-            self.constants.resize(idx + 1, None);
+        if opref.is_constant() {
+            self.const_pool.insert(opref.const_index(), value);
+        } else {
+            let idx = opref.0 as usize;
+            if idx >= self.constants.len() {
+                self.constants.resize(idx + 1, None);
+            }
+            self.constants[idx] = Some(value);
         }
-        self.constants[idx] = Some(value);
     }
 
     /// optimizer.py:99-113: getintbound(op) — get or create IntBound for
@@ -1631,6 +1608,9 @@ impl OptContext {
         // optimizer.py:102-103: if isinstance(op, ConstInt): return from_constant
         if let Some(Value::Int(v)) = self.get_constant(replaced) {
             return crate::optimizeopt::intutils::IntBound::from_constant(*v as i64);
+        }
+        if replaced.is_constant() {
+            return crate::optimizeopt::intutils::IntBound::unbounded();
         }
         let idx = replaced.0 as usize;
         if idx < self.forwarded.len() {
@@ -1658,7 +1638,7 @@ impl OptContext {
     pub fn setintbound(&mut self, opref: OpRef, bound: &crate::optimizeopt::intutils::IntBound) {
         use crate::optimizeopt::info::Forwarded;
         let replaced = self.get_box_replacement(opref);
-        if self.get_constant(replaced).is_some() {
+        if replaced.is_constant() || self.get_constant(replaced).is_some() {
             return;
         }
         let idx = replaced.0 as usize;
@@ -1867,6 +1847,15 @@ impl OptContext {
     /// Get the constant value for an operation, if known.
     pub fn get_constant(&self, opref: OpRef) -> Option<&Value> {
         let opref = self.get_box_replacement(opref);
+        if opref.is_constant() {
+            return self.const_pool.get(&opref.const_index());
+        }
+        // Check Forwarded::Const first (constant-folded operations)
+        if let Some(crate::optimizeopt::info::Forwarded::Const(val)) =
+            self.forwarded.get(opref.0 as usize)
+        {
+            return Some(val);
+        }
         let idx = opref.0 as usize;
         self.constants.get(idx).and_then(|v| v.as_ref())
     }
@@ -2206,29 +2195,28 @@ impl OptContext {
     ///
     /// RPython equivalent: `ConstInt(value)` — constants in RPython are
     /// first-class Const objects, not boxes. majit's constant pool model
-    /// reserves an OpRef in the constant namespace (>= CONST_BASE) and
-    /// stores the value via `seed_constant`.
+    /// reserves an OpRef in the constant namespace and stores the value
+    /// via `seed_constant`.
     ///
     /// NOTE: do NOT route through `make_constant`. That helper is the
     /// `optimizer.py:make_constant(box, constbox)` analogue and is meant
     /// to forward an existing **box** OpRef to a constant value. It bails
     /// out early when the input is already a constant OpRef
-    /// (`is_constant()` true), which would silently drop the new entry
-    /// here because freshly allocated constant OpRefs are >= CONST_BASE.
+    /// (`is_constant()` true), which would silently drop the new entry.
     pub fn make_constant_int(&mut self, value: i64) -> OpRef {
-        let pos = self.reserve_const_pos();
+        let pos = self.reserve_const_ref();
         self.seed_constant(pos, Value::Int(value));
         pos
     }
 
     pub fn make_constant_ref(&mut self, value: GcRef) -> OpRef {
-        let pos = self.reserve_const_pos();
+        let pos = self.reserve_const_ref();
         self.seed_constant(pos, Value::Ref(value));
         pos
     }
 
     pub fn make_constant_float(&mut self, value: f64) -> OpRef {
-        let pos = self.reserve_const_pos();
+        let pos = self.reserve_const_ref();
         self.seed_constant(pos, Value::Float(value));
         pos
     }
@@ -2494,6 +2482,9 @@ impl OptContext {
     /// Ensure a PtrInfo exists for the given OpRef. Creates an empty
     /// Instance if none exists, so that set_field can store values.
     pub fn ensure_ptr_info(&mut self, opref: OpRef) {
+        if opref.is_constant() {
+            return;
+        }
         use crate::optimizeopt::info::Forwarded;
         let idx = opref.0 as usize;
         if idx >= self.forwarded.len() {
@@ -2512,6 +2503,9 @@ impl OptContext {
     fn ensure_ptr_info_preserve_forwarding(&mut self, opref: OpRef, info: PtrInfo) {
         use crate::optimizeopt::info::Forwarded;
         let terminal = self.get_box_replacement(opref);
+        if terminal.is_constant() {
+            return;
+        }
         let idx = terminal.0 as usize;
         if idx >= self.forwarded.len() {
             self.forwarded.resize(idx + 1, Forwarded::None);
@@ -2623,6 +2617,9 @@ impl OptContext {
     }
 
     pub fn set_ptr_info(&mut self, opref: OpRef, info: PtrInfo) {
+        if opref.is_constant() {
+            return;
+        }
         use crate::optimizeopt::info::Forwarded;
         let idx = opref.0 as usize;
         if idx >= self.forwarded.len() {

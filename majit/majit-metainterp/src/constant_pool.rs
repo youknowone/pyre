@@ -16,7 +16,7 @@ use majit_ir::{GcRef, OpRef, Type};
 
 /// Constant pool for trace recording.
 ///
-/// Manages the mapping from OpRef (>= 10_000) to i64 values.
+/// Manages the mapping from constant-namespace OpRef to i64 values.
 /// Deduplicates identical values within the same type.
 ///
 /// gcreftracer.py parity: Ref-typed constants are pushed onto the GC
@@ -24,6 +24,7 @@ use majit_ir::{GcRef, OpRef, Type};
 /// On consumption (into_inner / snapshot), the HashMap is refreshed
 /// from the shadow stack to pick up any GC-updated pointers.
 pub struct ConstantPool {
+    /// Keyed by OpRef.0 (tagged constant value, i.e. index | CONST_BIT).
     constants: HashMap<u32, i64>,
     /// Type of each constant OpRef. Populated by `get_or_insert_typed`.
     constant_types: HashMap<u32, Type>,
@@ -31,7 +32,8 @@ pub struct ConstantPool {
     /// RPython parity: GcRef pointers recorded as const_int need Ref type
     /// for resume data encoding without triggering GC root tracking.
     numbering_type_overrides: HashMap<u32, Type>,
-    next_ref: u32,
+    /// Zero-based counter for allocating new constant indices.
+    next_const_idx: u32,
     /// gcreftracer.py parity: (OpRef key, shadow stack index) for each
     /// rooted Ref constant. walk_roots updates shadow stack entries;
     /// refresh_from_gc copies values back to `constants`.
@@ -46,7 +48,7 @@ impl ConstantPool {
             constants: HashMap::new(),
             constant_types: HashMap::new(),
             numbering_type_overrides: HashMap::new(),
-            next_ref: OpRef::CONST_BASE,
+            next_const_idx: 0,
             rooted_refs: Vec::new(),
             shadow_stack_base: shadow_stack::depth(),
         }
@@ -65,8 +67,8 @@ impl ConstantPool {
                 }
             }
         }
-        let opref = OpRef(self.next_ref);
-        self.next_ref += 1;
+        let opref = OpRef::from_const(self.next_const_idx);
+        self.next_const_idx += 1;
         self.constants.insert(opref.0, value);
         opref
     }
@@ -90,8 +92,8 @@ impl ConstantPool {
                 }
             }
         }
-        let opref = OpRef(self.next_ref);
-        self.next_ref += 1;
+        let opref = OpRef::from_const(self.next_const_idx);
+        self.next_const_idx += 1;
         self.constants.insert(opref.0, value);
         self.constant_types.insert(opref.0, tp);
         // Root non-null Ref constants on shadow stack.

@@ -2169,23 +2169,54 @@ impl JitState for PyreJitState {
             return None;
         }
 
-        // Rust-specific: allocate constant OpRefs for TAGCONST/TAGINT
-        // entries so the optimizer can fold them. RPython uses ConstBox
-        // objects natively; Rust needs explicit constant pool entries.
+        // Allocate constant OpRefs for TAGCONST/TAGINT entries.
+        // RPython uses ConstInt/ConstPtr box objects natively; Rust needs
+        // explicit constant pool entries for the optimizer to see them.
+        //
+        // Both TAGCONST (large consts from rd_consts) and TAGINT (small
+        // inline integers) become ConstInt/ConstPtr in RPython and should
+        // be treated as constants by the optimizer. This includes
+        // interpreter state (ni, vsd) AND user variables that were small
+        // ints at guard time. The optimizer's unrolling/constant-folding
+        // will properly handle which values can be folded vs kept symbolic.
         let mut constants = Vec::new();
-        let mut const_idx = majit_ir::OpRef::CONST_BASE;
+        let mut const_idx: u32 = 0;
+        // RPython resume.py:1042-1057 parity: rebuild_from_resumedata
+        // restores virtualizable_boxes, virtualref_boxes, AND frame boxes.
+        //
+        // TAGCONST entries (from rd_consts) are always injected — they are
+        // large constants that cannot be inline. TAGINT entries from
+        // vable_values/vref_values (interpreter state: ni, vsd, code ptr)
+        // are also injected as they are constant across loop iterations.
+        //
+        // However, TAGINT entries from frame.values (user variables like
+        // i, j, s) must NOT be injected — they are concrete values at guard
+        // failure time that change across iterations. RPython wraps these as
+        // ConstInt boxes, but the bridge trace treats them as trace-time
+        // constants via the tracing itself (not via pre-injection).
+        for value in vable_values.iter().chain(vref_values.iter()) {
+            match value {
+                RebuiltValue::Const(raw, tp) => {
+                    constants.push((majit_ir::OpRef::from_const(const_idx).0, *raw, *tp));
+                    const_idx += 1;
+                }
+                RebuiltValue::Int(v) => {
+                    constants.push((
+                        majit_ir::OpRef::from_const(const_idx).0,
+                        *v as i64,
+                        Type::Int,
+                    ));
+                    const_idx += 1;
+                }
+                _ => {}
+            }
+        }
+        // Frame values: only inject TAGCONST, not TAGINT (user variables).
         for frame in &frames {
             for value in &frame.values {
-                match value {
-                    RebuiltValue::Const(raw, tp) => {
-                        constants.push((const_idx, *raw, *tp));
-                        const_idx += 1;
-                    }
-                    RebuiltValue::Int(v) => {
-                        constants.push((const_idx, *v as i64, Type::Int));
-                        const_idx += 1;
-                    }
-                    _ => {}
+                if let RebuiltValue::Const(raw, tp) = value {
+                    constants.push((majit_ir::OpRef::from_const(const_idx).0, *raw, *tp));
+                    const_idx += 1;
                 }
             }
         }
