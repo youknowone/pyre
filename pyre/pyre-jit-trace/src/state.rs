@@ -2198,6 +2198,42 @@ impl JitState for PyreJitState {
             );
         }
         sym.bridge_local_oprefs = Some(local_oprefs);
+
+        // pyjitpl.py:3281-3288 parity: bridge vable scalar fields must
+        // reflect the bridge's InputArg layout, NOT the loop trace's layout.
+        // The loop's init_vable_indices sets OpRef(0)=frame, OpRef(1)=ni,
+        // OpRef(2)=code, OpRef(3)=vsd, OpRef(4)=ns — which conflicts with
+        // bridge InputArgs that have different values at those positions.
+        // Override the vable scalar fields from rebuild_from_resumedata:
+        // Box(n) → bridge InputArg OpRef(n); Int/Const → constant OpRef.
+        let num_scalars = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
+        let vvals = &resume_data.virtualizable_values;
+        let mut vable_const_cursor: u32 = 0;
+        let resolve_vable = |v: &RebuiltValue, cursor: &mut u32| -> OpRef {
+            match v {
+                RebuiltValue::Box(n) => OpRef(*n as u32),
+                RebuiltValue::Int(_) | RebuiltValue::Const(..) => {
+                    let opref = majit_ir::OpRef::from_const(*cursor);
+                    *cursor += 1;
+                    opref
+                }
+                _ => OpRef::NONE,
+            }
+        };
+        // vable_values layout: [frame_ptr, ni, code, vsd, ns, locals..., stack...]
+        // Scalar fields: index 0=frame, 1=ni, 2=code, 3=vsd, 4=ns
+        if vvals.len() > 1 {
+            sym.vable_next_instr = resolve_vable(&vvals[1], &mut vable_const_cursor);
+        }
+        if vvals.len() > 2 {
+            sym.vable_code = resolve_vable(&vvals[2], &mut vable_const_cursor);
+        }
+        if vvals.len() > 3 {
+            sym.vable_valuestackdepth = resolve_vable(&vvals[3], &mut vable_const_cursor);
+        }
+        if vvals.len() > 4 {
+            sym.vable_namespace = resolve_vable(&vvals[4], &mut vable_const_cursor);
+        }
     }
 
     /// resume.py:1042-1057 rebuild_from_resumedata parity.
