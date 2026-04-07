@@ -1744,42 +1744,24 @@ impl OptRewrite {
 
     // ── SAME_AS identity ──
 
-    /// SAME_AS_I/R/F(x) -> x
-    /// optimizer.py:127-135 `getnullness(op)`:
-    ///     if op.type == 'r' or self.is_raw_ptr(op):
-    ///         ptrinfo = getptrinfo(op)
-    ///         if ptrinfo is None: return INFO_UNKNOWN
-    ///         return ptrinfo.getnullness()
-    ///     elif op.type == 'i':
-    ///         return self.getintbound(op).getnullness()
-    ///
-    /// Ref / raw-ptr path: `getptrinfo` synthesizes `ConstPtrInfo` for
-    /// constant Refs, so null / non-null constants are reported correctly
-    /// (info.py:64-69 `getnullness`).
+    /// optimizer.py:127-135 `getnullness(op)` wrapper. Delegates to
+    /// `OptContext::getnullness`, which implements the upstream
+    /// `op.type == 'r' or is_raw_ptr(op)` dispatch line-by-line, then
+    /// converts the upstream `INFO_NULL` / `INFO_NONNULL` /
+    /// `INFO_UNKNOWN` integer return into the local `Nullness` enum.
     fn getnullness(&self, opref: OpRef, ctx: &mut OptContext) -> Nullness {
-        let is_ref = self.is_ref_typed(opref, ctx);
-        if is_ref {
-            match ctx.getptrinfo(opref) {
-                None => return Nullness::Unknown,
-                Some(info) => {
-                    if info.is_null() {
-                        return Nullness::Null;
-                    }
-                    if info.is_nonnull() {
-                        return Nullness::Nonnull;
-                    }
-                    return Nullness::Unknown;
-                }
-            }
-        }
-        // intutils.py:1318-1329 IntBound.getnullness(): known_gt(0) or
-        // known_lt(0) or tvalue != 0.
-        let b = ctx.getintbound(opref);
-        let nullness = b.getnullness();
-        match nullness {
-            1 => Nullness::Nonnull,
-            -1 => Nullness::Null,
-            _ => Nullness::Unknown,
+        Self::nullness_from_info(ctx.getnullness(opref))
+    }
+
+    /// Convert an `info.py` INFO_NULL/INFO_NONNULL/INFO_UNKNOWN return
+    /// into the local `Nullness` enum used by the rewrite pass.
+    fn nullness_from_info(value: i8) -> Nullness {
+        if value == crate::optimizeopt::INFO_NULL {
+            Nullness::Null
+        } else if value == crate::optimizeopt::INFO_NONNULL {
+            Nullness::Nonnull
+        } else {
+            Nullness::Unknown
         }
     }
 

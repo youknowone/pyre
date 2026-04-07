@@ -41,6 +41,17 @@ pub(crate) fn majit_log_enabled() -> bool {
     std::env::var_os("MAJIT_LOG").is_some()
 }
 
+/// info.py:13-15 INFO_NULL / INFO_NONNULL / INFO_UNKNOWN constants.
+///
+/// Used by `PtrInfo::getnullness` and `IntBound::getnullness` to
+/// report whether a slot is known null, known non-null, or unknown.
+/// Matches RPython's integer enum values exactly so that majit code
+/// can be ported line-by-line from upstream `optimizer.py:127` /
+/// `rewrite.py:496-503` `_optimize_nullness` switches.
+pub const INFO_NULL: i8 = 0;
+pub const INFO_NONNULL: i8 = 1;
+pub const INFO_UNKNOWN: i8 = 2;
+
 /// Create a ResumeAtPositionDescr for optimizer-generated guards.
 ///
 /// Delegates to fail_descr::make_resume_at_position_descr which wraps a
@@ -2573,6 +2584,48 @@ impl OptContext {
     /// `KnownClass`/`Instance`/`Virtual` read their stored `known_class`.
     pub fn get_known_class(&self, opref: OpRef) -> Option<majit_ir::GcRef> {
         self.getptrinfo(opref)?.get_known_class()
+    }
+
+    /// optimizer.py:127-135 `getnullness(op)` parity (line-by-line port).
+    ///
+    /// ```python
+    /// def getnullness(self, op):
+    ///     if op.type == 'r' or self.is_raw_ptr(op):
+    ///         ptrinfo = getptrinfo(op)
+    ///         if ptrinfo is None:
+    ///             return info.INFO_UNKNOWN
+    ///         return ptrinfo.getnullness()
+    ///     elif op.type == 'i':
+    ///         return self.getintbound(op).getnullness()
+    ///     assert False
+    /// ```
+    ///
+    /// Returns one of `INFO_NULL` / `INFO_NONNULL` / `INFO_UNKNOWN`
+    /// (info.py:13-15) so callers can compare directly against the
+    /// upstream constants.
+    ///
+    /// Takes `&mut self` because the upstream `getintbound` lazily
+    /// installs an unbounded `IntBound` on first access (optimizer.py:
+    /// 102-112), and majit mirrors that side effect via
+    /// `OptContext::getintbound`.
+    pub fn getnullness(&mut self, opref: OpRef) -> i8 {
+        let tp = self.opref_type(opref);
+        // optimizer.py:128: op.type == 'r' or self.is_raw_ptr(op)
+        if matches!(tp, Some(majit_ir::Type::Ref)) || self.is_raw_ptr(opref) {
+            // ptrinfo = getptrinfo(op)
+            // if ptrinfo is None: return INFO_UNKNOWN
+            // return ptrinfo.getnullness()
+            return match self.getptrinfo(opref) {
+                None => INFO_UNKNOWN,
+                Some(info) => info.getnullness(),
+            };
+        }
+        // optimizer.py:133-134: elif op.type == 'i': return getintbound(op).getnullness()
+        if matches!(tp, Some(majit_ir::Type::Int) | None) {
+            return self.getintbound(opref).getnullness();
+        }
+        // optimizer.py:135: assert False  →  Float never reaches here.
+        INFO_UNKNOWN
     }
 
     /// optimizer.py:154-158 `is_raw_ptr(op)` parity (line-by-line port).
