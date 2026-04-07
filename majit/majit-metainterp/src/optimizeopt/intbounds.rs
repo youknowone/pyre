@@ -350,12 +350,12 @@ impl OptIntBounds {
 
     // ── Arithmetic postprocessing ──
 
-    /// intbounds.py: INT_ADD pure_from_args synthesis.
-    /// Record INT_SUB reverse: if res = INT_ADD(a, b), then a = INT_SUB(res, b).
+    /// intbounds.py:114-146 postprocess_INT_ADD
     fn postprocess_int_add(&mut self, op: &Op, ctx: &mut OptContext) {
         let arg0 = ctx.get_box_replacement(op.arg(0));
         let arg1 = ctx.get_box_replacement(op.arg(1));
         let b0 = self.getintbound(arg0, ctx);
+        // intbounds.py:119-123: if arg0 is arg1: b = b0.lshift_bound(1) (x+x is even)
         let b = if arg0 == arg1 {
             b0.lshift_bound(&IntBound::from_constant(1))
         } else {
@@ -363,20 +363,19 @@ impl OptIntBounds {
             b0.add_bound(&b1)
         };
         self.intersect_bound(op.pos, &b);
-        // Synthesis: INT_ADD(a,b)=res → INT_SUB(res,b)=a, INT_SUB(res,a)=b
+        // intbounds.py:125-127:
+        //   self.optimizer.pure_from_args2(rop.INT_SUB, op, arg1, arg0)
+        //   self.optimizer.pure_from_args2(rop.INT_SUB, op, arg0, arg1)
         self.record_pure_from_args(OpCode::IntSub, op.pos, arg1, arg0);
         self.record_pure_from_args(OpCode::IntSub, op.pos, arg0, arg1);
-        // intbounds.py: constant inversion synthesis
-        // If one arg is constant c, synthesize with -c:
-        //   INT_SUB(other, -c) = res, INT_SUB(other, res) = -c
-        let c0 = ctx.get_constant_int(arg0);
-        let c1 = ctx.get_constant_int(arg1);
-        let (inv_const, other) = if let Some(c) = c0 {
+        // intbounds.py:128-142: pick the constant arg, fall back to commutative
+        // swap so `arg1` ends up holding the non-const operand.
+        let (inv_const, other) = if let Some(c) = ctx.get_constant_int(arg0) {
             if c == i64::MIN {
                 return;
             }
             (c, arg1)
-        } else if let Some(c) = c1 {
+        } else if let Some(c) = ctx.get_constant_int(arg1) {
             if c == i64::MIN {
                 return;
             }
@@ -385,8 +384,15 @@ impl OptIntBounds {
             return;
         };
         let neg_ref = self.get_or_make_const(-inv_const, ctx);
+        // intbounds.py:143-146:
+        //   self.optimizer.pure_from_args2(rop.INT_SUB, arg1, inv_arg0, op)
+        //   self.optimizer.pure_from_args2(rop.INT_SUB, arg1, op, inv_arg0)
+        //   self.optimizer.pure_from_args2(rop.INT_ADD, op, inv_arg0, arg1)
+        //   self.optimizer.pure_from_args2(rop.INT_ADD, inv_arg0, op, arg1)
         self.record_pure_from_args(OpCode::IntSub, other, neg_ref, op.pos);
         self.record_pure_from_args(OpCode::IntSub, other, op.pos, neg_ref);
+        self.record_pure_from_args(OpCode::IntAdd, op.pos, neg_ref, other);
+        self.record_pure_from_args(OpCode::IntAdd, neg_ref, op.pos, other);
     }
 
     /// intbounds.py: INT_SUB postprocess with constant inversion synthesis.
