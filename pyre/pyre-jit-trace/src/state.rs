@@ -1087,14 +1087,16 @@ pub fn concrete_stack_value(frame: usize, abs_idx: usize) -> Option<PyObjectRef>
 /// Return nlocals for the given frame (from the unified array's total length and code object).
 pub(crate) fn concrete_nlocals(frame: usize) -> Option<usize> {
     let frame_ptr = (frame != 0).then_some(frame as *const u8)?;
-    let code_ptr = unsafe {
-        *(frame_ptr.add(crate::frame_layout::PYFRAME_CODE_OFFSET)
-            as *const *const pyre_interpreter::CodeObject)
-    };
-    if code_ptr.is_null() {
+    let w_code =
+        unsafe { *(frame_ptr.add(crate::frame_layout::PYFRAME_CODE_OFFSET) as *const *const ()) };
+    if w_code.is_null() {
         return None;
     }
-    Some(unsafe { (&(*code_ptr).varnames).len() })
+    let raw_code = unsafe {
+        pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
+            as *const pyre_interpreter::CodeObject
+    };
+    Some(unsafe { (&(*raw_code).varnames).len() })
 }
 
 /// Return nlocals as the "locals_len" for virtualizable.
@@ -2346,16 +2348,24 @@ impl JitState for PyreJitState {
         //
         // values[3..] = compact active_boxes from get_list_of_active_boxes,
         // which filters by liveness. Use the same liveness table to restore.
-        let code_ptr = if self.frame != 0 {
-            unsafe {
+        let raw_code_ptr = if self.frame != 0 {
+            let w_code = unsafe {
                 *((self.frame as *const u8).add(crate::frame_layout::PYFRAME_CODE_OFFSET)
-                    as *const *const pyre_interpreter::CodeObject)
+                    as *const *const ())
+            };
+            if !w_code.is_null() {
+                unsafe {
+                    pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
+                        as *const pyre_interpreter::CodeObject
+                }
+            } else {
+                std::ptr::null()
             }
         } else {
             std::ptr::null()
         };
-        let live = if !code_ptr.is_null() {
-            Some(liveness_for(code_ptr))
+        let live = if !raw_code_ptr.is_null() {
+            Some(liveness_for(raw_code_ptr))
         } else {
             None
         };
