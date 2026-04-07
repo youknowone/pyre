@@ -1564,6 +1564,11 @@ impl OptRewrite {
             ctx.make_constant(arg0, majit_ir::Value::Int(expected));
             let resolved_arg0 = ctx.get_box_replacement(arg0);
             ctx.make_constant(resolved_arg0, majit_ir::Value::Int(expected));
+            // optimizer.py:776 self.replace_op_with(op, opnum, [op.getarg(0)], descr)
+            // → resoperation.py:498-503 GuardResOp.copy_and_change preserves
+            // failargs AND rd_resume_position. Without rd_resume_position the
+            // bridge optimizer's store_final_boxes_in_guard would skip this
+            // guard and leave constants in fail_args (regalloc.py:1206).
             if expected == 0 {
                 let new_op = op.copy_and_change(OpCode::GuardFalse, Some(&[arg0]), None);
                 return OptimizationResult::Replace(new_op);
