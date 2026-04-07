@@ -5303,7 +5303,11 @@ impl OpcodeStepExecutor for MIFrame {
                     if pyre_object::is_str(exc_type_obj) {
                         let type_name = pyre_object::w_str_get_value(exc_type_obj);
                         pyre_object::exc_kind_matches(kind, type_name)
-                    } else if pyre_interpreter::is_function(exc_type_obj) {
+                    } else if pyre_interpreter::is_function(exc_type_obj)
+                        && pyre_interpreter::is_builtin_code(
+                            pyre_interpreter::getcode(exc_type_obj) as pyre_object::PyObjectRef,
+                        )
+                    {
                         let type_name = pyre_interpreter::function_get_name(exc_type_obj);
                         pyre_object::exc_kind_matches(kind, type_name)
                     } else {
