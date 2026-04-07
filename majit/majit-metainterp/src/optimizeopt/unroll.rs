@@ -103,6 +103,9 @@ pub struct UnrollOptimizer {
     /// RPython: same Optimizer instance across phases keeps patchguardop.
     /// In majit, separate instances — forward explicitly.
     phase1_patchguardop: Option<majit_ir::Op>,
+    /// RPython metainterp_sd.callinfocollection parity.
+    /// Maps oopspec indices to (calldescr, func_ptr) for generate_modified_call.
+    pub callinfocollection: Option<std::sync::Arc<majit_ir::descr::CallInfoCollection>>,
 }
 
 impl UnrollOptimizer {
@@ -126,6 +129,7 @@ impl UnrollOptimizer {
             original_trace_op_types: std::collections::HashMap::new(),
             phase1_value_types: std::collections::HashMap::new(),
             phase1_patchguardop: None,
+            callinfocollection: None,
         }
     }
 
@@ -277,6 +281,7 @@ impl UnrollOptimizer {
                 None => crate::optimizeopt::optimizer::Optimizer::default_pipeline(),
             };
             opt_p1.constant_types = self.constant_types.clone();
+            opt_p1.callinfocollection = self.callinfocollection.clone();
             opt_p1.numbering_type_overrides = self.numbering_type_overrides.clone();
             opt_p1.trace_inputarg_types = self.trace_inputarg_types.clone();
             opt_p1.original_trace_op_types = self.original_trace_op_types.clone();
@@ -411,6 +416,7 @@ impl UnrollOptimizer {
             None => crate::optimizeopt::optimizer::Optimizer::default_pipeline(),
         };
         opt_p2.constant_types = self.constant_types.clone();
+        opt_p2.callinfocollection = self.callinfocollection.clone();
         opt_p2.numbering_type_overrides = self.numbering_type_overrides.clone();
         opt_p2.trace_inputarg_types = self.trace_inputarg_types.clone();
         opt_p2.original_trace_op_types = self.original_trace_op_types.clone();

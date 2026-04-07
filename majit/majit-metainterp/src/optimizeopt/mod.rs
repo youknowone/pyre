@@ -276,6 +276,10 @@ pub struct OptContext {
     /// just before final emission. In this phase, virtual forcing must emit
     /// directly into new_operations instead of re-entering the pass chain.
     pub in_final_emission: bool,
+    /// effectinfo.py: CallInfoCollection — maps oopspec indices to
+    /// (calldescr, func_ptr) pairs. Used by generate_modified_call
+    /// (vstring.py:853) to emit specialized string comparison calls.
+    pub callinfocollection: Option<std::sync::Arc<majit_ir::descr::CallInfoCollection>>,
     /// resume.py parity: per-guard snapshot boxes from tracing time.
     /// Used by emit() to call store_final_boxes_in_guard inline (RPython
     /// calls this during optimization, not post-assembly).
@@ -702,6 +706,7 @@ impl OptContext {
             optearlyforce_idx: 0,
 
             in_final_emission: false,
+            callinfocollection: None,
             pending_for_guard: Vec::new(),
             pending_pure_from_args: Vec::new(),
             constant_fold_alloc: None,
@@ -761,6 +766,7 @@ impl OptContext {
             optearlyforce_idx: 0,
 
             in_final_emission: false,
+            callinfocollection: None,
             pending_for_guard: Vec::new(),
             pending_pure_from_args: Vec::new(),
             constant_fold_alloc: None,
