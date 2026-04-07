@@ -891,6 +891,19 @@ impl OptContext {
             op.pos = self.reserve_pos();
         } else if self.new_operations.iter().any(|e| e.pos == op.pos) {
             // RPython Box parity: reassign position to avoid collision.
+            // This path is a band-aid that compensates for the flat OpRef
+            // model's lack of per-iteration Box identity. Step 2 Commit D1
+            // of the Box identity plan runs Phase 2 through a fresh
+            // TraceIterator so Phase 2 op results live in a disjoint
+            // range — after D1 this branch should fire zero times in
+            // Phase 2. Log under MAJIT_LOG so benchmark runs can detect
+            // regressions that reintroduce collisions.
+            if std::env::var_os("MAJIT_LOG").is_some() {
+                eprintln!(
+                    "[jit][emit] collision reassign {:?} → fresh (band-aid — D1 should make this dead)",
+                    op.pos
+                );
+            }
             op.pos = self.reserve_pos();
         } else if self.has_op_forwarding(op.pos) && op.result_type() != majit_ir::Type::Void {
             // Phase 2 body emitting at a trace position that was forwarded
@@ -902,6 +915,18 @@ impl OptContext {
             // model must allocate a fresh position and redirect forwarding.
             // Only Forwarded::Op triggers this — Info/Const/IntBound are
             // terminal metadata, not positional redirects from import_state.
+            //
+            // Same band-aid scope note as above: after D1 Phase 2 emits at
+            // fresh OpRefs above next_global_opref, and import_state only
+            // forwards positions in [0..num_inputs). The two ranges are
+            // disjoint, so this branch should be dead. Log for regression
+            // detection.
+            if std::env::var_os("MAJIT_LOG").is_some() {
+                eprintln!(
+                    "[jit][emit] forwarding redirect {:?} → fresh (band-aid — D1 should make this dead)",
+                    op.pos
+                );
+            }
             let old_pos = op.pos;
             op.pos = self.reserve_pos();
             // Redirect the trace position to the fresh body result so that
