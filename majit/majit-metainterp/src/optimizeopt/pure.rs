@@ -627,6 +627,11 @@ impl Optimization for OptPure {
         for (opcode, arg0, result) in ctx.pending_pure_from_args.drain(..) {
             self.pure_from_args1(opcode, arg0, result);
         }
+        // optimizer.py: pure_from_args2 parity — consume binary registrations
+        // (INSTANCE_PTR_EQ/NE swapped-args from rewrite.py:565,571).
+        for (opcode, arg0, arg1, result) in ctx.pending_pure_from_args2.drain(..) {
+            self.pure_from_args2(opcode, arg0, arg1, result);
+        }
 
         // Don't reset for GUARD_NO_EXCEPTION — it needs the previous state.
         if op.opcode != OpCode::GuardNoException {

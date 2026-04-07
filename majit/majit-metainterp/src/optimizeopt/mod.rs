@@ -281,6 +281,11 @@ pub struct OptContext {
     /// registered by rewrite pass (CAST_*, CONVERT_*) and consumed by pure pass.
     /// Each entry: (opcode, arg0, result) meaning pure(opcode, arg0) = result.
     pub pending_pure_from_args: Vec<(OpCode, OpRef, OpRef)>,
+    /// optimizer.py: pure_from_args2 parity — binary reverse-pure relationships
+    /// registered by rewrite pass (INSTANCE_PTR_EQ/NE swapped-args). Consumed
+    /// by OptPure. Each entry: (opcode, arg0, arg1, result) meaning
+    /// pure(opcode, arg0, arg1) = result.
+    pub pending_pure_from_args2: Vec<(OpCode, OpRef, OpRef, OpRef)>,
     /// optimizer.py:787: constant_fold allocator callback.
     /// When set, the optimizer can fold immutable virtuals filled with
     /// constants into compile-time constant pointers (info.py:140-145).
@@ -723,6 +728,7 @@ impl OptContext {
             callinfocollection: None,
             pending_for_guard: Vec::new(),
             pending_pure_from_args: Vec::new(),
+            pending_pure_from_args2: Vec::new(),
             constant_fold_alloc: None,
             quasi_immutable_deps: HashSet::new(),
             snapshot_boxes: HashMap::new(),
@@ -784,6 +790,7 @@ impl OptContext {
             callinfocollection: None,
             pending_for_guard: Vec::new(),
             pending_pure_from_args: Vec::new(),
+            pending_pure_from_args2: Vec::new(),
             constant_fold_alloc: None,
             quasi_immutable_deps: HashSet::new(),
             snapshot_boxes: HashMap::new(),
@@ -1499,6 +1506,20 @@ impl OptContext {
     /// Consumed by OptPure at flush time.
     pub fn register_pure_from_args1(&mut self, opcode: OpCode, result: OpRef, arg0: OpRef) {
         self.pending_pure_from_args.push((opcode, result, arg0));
+    }
+
+    /// optimizer.py: pure_from_args2 parity.
+    /// Register binary reverse-pure: pure(opcode, arg0, arg1) = result.
+    /// Consumed by OptPure at flush time.
+    pub fn register_pure_from_args2(
+        &mut self,
+        opcode: OpCode,
+        result: OpRef,
+        arg0: OpRef,
+        arg1: OpRef,
+    ) {
+        self.pending_pure_from_args2
+            .push((opcode, arg0, arg1, result));
     }
 
     pub fn replace_op(&mut self, old: OpRef, new: OpRef) {
