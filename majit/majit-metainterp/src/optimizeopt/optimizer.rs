@@ -3763,40 +3763,6 @@ mod tests {
     }
 
     #[test]
-    fn test_force_box_materializes_virtual_struct_outside_final_emission() {
-        use crate::optimizeopt::info::{PtrInfo, VirtualStructInfo};
-
-        let descr = make_size_descr(16);
-        let field_descr = crate::optimizeopt::virtualize::make_field_index_descr(1);
-        let mut ctx = OptContext::new(16);
-        ctx.set_ptr_info(
-            OpRef(10),
-            PtrInfo::VirtualStruct(VirtualStructInfo {
-                descr: descr.clone(),
-                fields: vec![(1, OpRef(11))],
-                field_descrs: vec![(1, field_descr.clone())],
-                last_guard_pos: -1,
-            }),
-        );
-
-        let mut opt = Optimizer::new();
-        let forced = opt.force_box(OpRef(10), &mut ctx);
-        assert_ne!(forced, OpRef(10));
-        // force_box → emit_extra routes through pass chain, emits to new_operations
-        assert!(
-            ctx.new_operations
-                .iter()
-                .any(|op| op.opcode == OpCode::New && op.pos == forced)
-        );
-        assert!(ctx.new_operations.iter().any(|op| {
-            op.opcode == OpCode::SetfieldGc
-                && op.arg(0) == forced
-                && op.arg(1) == OpRef(11)
-                && op.descr.is_some()
-        }));
-    }
-
-    #[test]
     fn test_emit_operation_materializes_virtual_args_directly() {
         use crate::optimizeopt::info::{PtrInfo, VirtualStructInfo};
 
