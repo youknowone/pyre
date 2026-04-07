@@ -497,16 +497,18 @@ impl JitFrameDeadFrame {
         gc_runtime_id: Option<u64>,
         heap_owner: Option<Vec<i64>>,
     ) -> Self {
-        let mut frame = JitFrameDeadFrame {
+        JitFrameDeadFrame {
             jf_gcref,
             fail_descr,
             gc_runtime_id,
             _heap_owner: heap_owner,
-        };
-        if let Some(runtime_id) = gc_runtime_id {
-            register_gc_roots(runtime_id, std::slice::from_mut(&mut frame.jf_gcref));
         }
-        frame
+    }
+
+    pub fn register_roots(&mut self) {
+        if let Some(runtime_id) = self.gc_runtime_id {
+            register_gc_roots(runtime_id, std::slice::from_mut(&mut self.jf_gcref));
+        }
     }
 
     #[inline]

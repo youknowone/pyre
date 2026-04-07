@@ -2053,14 +2053,23 @@ pub fn force_token_to_dead_frame(force_token: GcRef) -> DeadFrame {
     // pointer. Shadow stack keeps the object alive, but does NOT
     // update this separate copy of jf_gcref.
     let gc_runtime_id = fail_descr.gc_runtime_id;
-    DeadFrame {
-        data: Box::new(JitFrameDeadFrame::new(
-            jf_gcref,
-            fail_descr,
-            gc_runtime_id,
-            None,
-        )),
-    }
+    deadframe_from_jitframe(jf_gcref, fail_descr, gc_runtime_id, None)
+}
+
+fn deadframe_from_jitframe(
+    jf_gcref: GcRef,
+    fail_descr: Arc<CraneliftFailDescr>,
+    gc_runtime_id: Option<u64>,
+    heap_owner: Option<Vec<i64>>,
+) -> DeadFrame {
+    let mut frame = Box::new(JitFrameDeadFrame::new(
+        jf_gcref,
+        fail_descr,
+        gc_runtime_id,
+        heap_owner,
+    ));
+    frame.register_roots();
+    DeadFrame { data: frame }
 }
 
 pub fn set_savedata_ref_on_deadframe(
@@ -2207,14 +2216,12 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
         // jf_guard_exc already written by emit_guard_exit
         // (_build_failure_recovery parity).
 
-        return DeadFrame {
-            data: Box::new(JitFrameDeadFrame::new(
-                exec.jf_gcref,
-                fail_descr.clone(),
-                target.gc_runtime_id,
-                exec.heap_owner,
-            )),
-        };
+        return deadframe_from_jitframe(
+            exec.jf_gcref,
+            fail_descr.clone(),
+            target.gc_runtime_id,
+            exec.heap_owner,
+        );
     } // end loop
 }
 
@@ -4824,14 +4831,12 @@ impl CraneliftBackend {
                 // Real FINISH — function completed.
                 // jf_savedata already correct in jf_frame memory.
                 // jf_guard_exc already written by emit_guard_exit.
-                return DeadFrame {
-                    data: Box::new(JitFrameDeadFrame::new(
-                        exec.jf_gcref,
-                        fail_descr.clone(),
-                        compiled.gc_runtime_id,
-                        exec.heap_owner,
-                    )),
-                };
+                return deadframe_from_jitframe(
+                    exec.jf_gcref,
+                    fail_descr.clone(),
+                    compiled.gc_runtime_id,
+                    exec.heap_owner,
+                );
             }
 
             fail_descr.increment_fail_count();
@@ -4873,14 +4878,12 @@ impl CraneliftBackend {
             //   - no force → zeroed alloc → 0
             // jf_guard_exc already written by emit_guard_exit.
 
-            return DeadFrame {
-                data: Box::new(JitFrameDeadFrame::new(
-                    exec.jf_gcref,
-                    fail_descr.clone(),
-                    compiled.gc_runtime_id,
-                    exec.heap_owner,
-                )),
-            };
+            return deadframe_from_jitframe(
+                exec.jf_gcref,
+                fail_descr.clone(),
+                compiled.gc_runtime_id,
+                exec.heap_owner,
+            );
         } // end loop
     }
 
@@ -4929,14 +4932,12 @@ impl CraneliftBackend {
         // bridge's exit is misinterpreted as a guard failure.
         if fail_descr.is_finish {
             // jf_guard_exc already written by emit_guard_exit.
-            return DeadFrame {
-                data: Box::new(JitFrameDeadFrame::new(
-                    exec.jf_gcref,
-                    fail_descr.clone(),
-                    bridge.gc_runtime_id,
-                    exec.heap_owner,
-                )),
-            };
+            return deadframe_from_jitframe(
+                exec.jf_gcref,
+                fail_descr.clone(),
+                bridge.gc_runtime_id,
+                exec.heap_owner,
+            );
         }
 
         fail_descr.increment_fail_count();
@@ -4948,14 +4949,12 @@ impl CraneliftBackend {
         let _ = bridge_guard;
 
         // jf_guard_exc already written by emit_guard_exit.
-        DeadFrame {
-            data: Box::new(JitFrameDeadFrame::new(
-                exec.jf_gcref,
-                fail_descr.clone(),
-                bridge.gc_runtime_id,
-                exec.heap_owner,
-            )),
-        }
+        deadframe_from_jitframe(
+            exec.jf_gcref,
+            fail_descr.clone(),
+            bridge.gc_runtime_id,
+            exec.heap_owner,
+        )
     }
 
     fn do_compile(
@@ -6949,20 +6948,16 @@ impl CraneliftBackend {
                     // x86/assembler.py:2234-2235 _genop_call_may_force:
                     //   self._store_force_index(self._find_nearby_operation(+1))
                     //   self._genop_call(op, arglocs, result_loc)
-                    // Find the paired GuardNotForced by scanning forward.
-                    // The optimizer may emit intervening ops (e.g. SameAsI)
-                    // between CallMayForce and GuardNotForced.
-                    let guard_not_forced_idx = ops[op_idx + 1..]
-                        .iter()
-                        .position(|o| {
-                            o.opcode == OpCode::GuardNotForced
-                                || o.opcode == OpCode::GuardNotForced2
-                        })
-                        .map(|delta| op_idx + 1 + delta);
-                    if guard_not_forced_idx.is_none() {
+                    // _find_nearby_operation(+1) = operations[position + 1]
+                    // _store_force_index asserts GUARD_NOT_FORCED or GUARD_NOT_FORCED_2
+                    let next_op = ops.get(op_idx + 1);
+                    let is_paired_guard = next_op.is_some_and(|o| {
+                        o.opcode == OpCode::GuardNotForced || o.opcode == OpCode::GuardNotForced2
+                    });
+                    if !is_paired_guard {
                         return Err(unsupported_semantics(
                             op.opcode,
-                            "call_may_force: no guard_not_forced(_2) found after call",
+                            "call_may_force: ops[position+1] must be guard_not_forced(_2)",
                         ));
                     }
                     let info = &guard_infos[guard_idx];
@@ -14726,10 +14721,8 @@ mod tests {
 
     #[test]
     fn test_call_may_force_with_intervening_ops() {
-        // CallMayForceI -> SameAsI -> GuardNotForced
-        // Verifies that intervening non-guard ops between
-        // CallMayForce and GuardNotForced compile and execute correctly.
-        let mut backend = CraneliftBackend::new();
+        // RPython backend parity requires GUARD_NOT_FORCED to be the
+        // immediate next operation after CALL_MAY_FORCE.
         let descr = make_call_descr(vec![Type::Ref, Type::Int], Type::Int);
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let mut guard_op = mk_op(OpCode::GuardNotForced, &[], OpRef::NONE.0);
@@ -14759,23 +14752,19 @@ mod tests {
             100,
             maybe_force_and_return_int_isolated as *const () as usize as i64,
         );
+        let mut backend = CraneliftBackend::new();
         backend.set_constants(constants);
-
         let mut token = JitCellToken::new(1500_410);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
-
-        // Not forced: reaches Finish with SameAsI result (== call result == 42)
-        let frame = backend.execute_token(&token, &[Value::Int(20), Value::Int(0)]);
-        assert_eq!(backend.get_latest_descr(&frame).fail_index(), 1);
-        assert_eq!(backend.get_int_value(&frame, 0), 42);
-
-        // Forced: exits via GuardNotForced
-        let frame = backend.execute_token(&token, &[Value::Int(10), Value::Int(1)]);
-        assert_eq!(backend.get_latest_descr(&frame).fail_index(), 0);
-        assert_eq!(backend.get_int_value(&frame, 0), 1);
-        assert_eq!(backend.get_int_value(&frame, 1), 42);
-        assert_eq!(backend.get_int_value(&frame, 2), 10);
-        assert_eq!(backend.get_savedata_ref(&frame).unwrap(), GcRef(0xBABA));
+        let err = backend
+            .compile_loop(&inputargs, &ops, &mut token)
+            .unwrap_err();
+        match err {
+            BackendError::Unsupported(msg) => {
+                assert!(msg.contains("CallMayForceI"));
+                assert!(msg.contains("ops[position+1] must be guard_not_forced(_2)"));
+            }
+            other => panic!("expected unsupported error, got {other:?}"),
+        }
     }
 
     #[test]
