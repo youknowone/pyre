@@ -73,6 +73,12 @@ pub struct OptVirtualize {
     /// folds away their CALL; checked by optimize_GUARD_NO_EXCEPTION and
     /// optimize_GUARD_NOT_FORCED to skip the now-orphaned guard.
     last_emitted_was_removed: bool,
+    /// virtualize.py:48 OptVirtualize.__init__: self._last_guard_not_forced_2 = None
+    /// virtualize.py:77-78 optimize_GUARD_NOT_FORCED_2 stashes the op here.
+    /// virtualize.py:80-90 optimize_FINISH / postprocess_FINISH consumes it
+    /// and re-inserts it just before the FINISH op in `_newoperations`
+    /// (after `store_final_boxes_in_guard`).
+    last_guard_not_forced_2: Option<Op>,
 }
 
 impl OptVirtualize {
@@ -84,6 +90,7 @@ impl OptVirtualize {
             vable_initialized: false,
             needs_vable_setup: false,
             last_emitted_was_removed: false,
+            last_guard_not_forced_2: None,
         }
     }
 
@@ -96,6 +103,7 @@ impl OptVirtualize {
             vable_initialized: false,
             needs_vable_setup: false,
             last_emitted_was_removed: false,
+            last_guard_not_forced_2: None,
         }
     }
 
@@ -1233,6 +1241,82 @@ impl OptVirtualize {
         OptimizationResult::Remove
     }
 
+    /// virtualize.py:166-182 _optimize_JIT_FORCE_VIRTUAL
+    ///
+    /// ```python
+    /// def _optimize_JIT_FORCE_VIRTUAL(self, op):
+    ///     vref = getptrinfo(op.getarg(1))
+    ///     vrefinfo = self.optimizer.metainterp_sd.virtualref_info
+    ///     if vref and vref.is_virtual():
+    ///         tokenop = vref.getfield(vrefinfo.descr_virtual_token, None)
+    ///         if tokenop is None:
+    ///             return False
+    ///         tokeninfo = getptrinfo(tokenop)
+    ///         if (tokeninfo is not None and tokeninfo.is_constant() and
+    ///                 not tokeninfo.is_nonnull()):
+    ///             forcedop = vref.getfield(vrefinfo.descr_forced, None)
+    ///             forcedinfo = getptrinfo(forcedop)
+    ///             if forcedinfo is not None and not forcedinfo.is_null():
+    ///                 self.make_equal_to(op, forcedop)
+    ///                 self.last_emitted_operation = REMOVED
+    ///                 return True
+    ///     return False
+    /// ```
+    ///
+    /// Returns true when the call was eliminated by aliasing `op` to the
+    /// already-forced object stored in the vref's `forced` field. The narrow
+    /// condition is critical: the vref must be virtual, its `virtual_token`
+    /// field must hold a constant null (set by VirtualRefFinish on the normal
+    /// frame-leave path), and its `forced` field must point at a non-null
+    /// object (set by VirtualRefFinish in the forced-during-tracing path).
+    fn optimize_jit_force_virtual(&mut self, op: &Op, ctx: &mut OptContext) -> bool {
+        if op.num_args() < 2 {
+            return false;
+        }
+        let vref = ctx.get_box_replacement(op.arg(1));
+        // vref = getptrinfo(op.getarg(1)); if vref and vref.is_virtual():
+        let (token_ref, forced_ref) = match ctx.get_ptr_info(vref) {
+            Some(PtrInfo::VirtualStruct(vinfo)) => {
+                // tokenop = vref.getfield(vrefinfo.descr_virtual_token, None)
+                // if tokenop is None: return False
+                let tok = match get_field(&vinfo.fields, VREF_VIRTUAL_TOKEN_FIELD_INDEX) {
+                    Some(r) => r,
+                    None => return false,
+                };
+                // forcedop = vref.getfield(vrefinfo.descr_forced, None)
+                let forced = get_field(&vinfo.fields, VREF_FORCED_FIELD_INDEX);
+                (tok, forced)
+            }
+            _ => return false,
+        };
+        // tokeninfo = getptrinfo(tokenop)
+        // if tokeninfo is not None and tokeninfo.is_constant() and not tokeninfo.is_nonnull():
+        // The token field is stored as an integer in majit; constant null is
+        // represented by `emit_constant_int(0)` (see optimize_virtual_ref_finish).
+        if !ctx.get_constant_int(token_ref).is_some_and(|v| v == 0) {
+            return false;
+        }
+        // forcedinfo = getptrinfo(forcedop)
+        // if forcedinfo is not None and not forcedinfo.is_null():
+        let forced_ref = match forced_ref {
+            Some(r) if r != OpRef::NONE => r,
+            _ => return false,
+        };
+        let forced_resolved = ctx.get_box_replacement(forced_ref);
+        let forced_ok = match ctx.get_ptr_info(forced_resolved) {
+            Some(info) => !info.is_null(),
+            None => false,
+        };
+        if !forced_ok {
+            return false;
+        }
+        // self.make_equal_to(op, forcedop)
+        ctx.make_equal_to(op.pos, forced_resolved);
+        // self.last_emitted_operation = REMOVED
+        self.last_emitted_was_removed = true;
+        true
+    }
+
     /// Handle operations that may cause virtuals to escape.
     fn optimize_escaping_op(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let mut forced = op.clone();
@@ -1396,18 +1480,18 @@ impl Optimization for OptVirtualize {
 
             // virtualize.py:77-78 optimize_GUARD_NOT_FORCED_2
             //   self._last_guard_not_forced_2 = op
-            // (handled by optimize_finish via the _finish_guard_op stash;
-            // here we simply pass through.)
-            OpCode::GuardNotForced2 => OptimizationResult::PassOn,
+            // The op is NOT emitted here; it is stashed and re-inserted just
+            // before the FINISH op in postprocess_FINISH below.
+            OpCode::GuardNotForced2 => {
+                self.last_guard_not_forced_2 = Some(op.clone());
+                OptimizationResult::Remove
+            }
 
             // virtualize.py:92-101 optimize_CALL_MAY_FORCE_I/R/F/N
             //   if oopspecindex == EffectInfo.OS_JIT_FORCE_VIRTUAL:
             //       if self._optimize_JIT_FORCE_VIRTUAL(op):
             //           return
             //   return self.emit(op)
-            // _optimize_JIT_FORCE_VIRTUAL (virtualize.py:166-182) sets
-            // last_emitted_operation = REMOVED before returning True so
-            // the trailing GUARD_NO_EXCEPTION can be skipped.
             OpCode::CallMayForceI
             | OpCode::CallMayForceR
             | OpCode::CallMayForceF
@@ -1415,11 +1499,8 @@ impl Optimization for OptVirtualize {
                 if let Some(ref descr) = op.descr {
                     if let Some(cd) = descr.as_call_descr() {
                         let ei = cd.effect_info();
-                        if ei.oopspec_index == OopSpecIndex::JitForceVirtual && op.num_args() >= 2 {
-                            let vref = ctx.get_box_replacement(op.arg(1));
-                            if Self::is_virtual(vref, ctx) {
-                                // virtualize.py:180 self.last_emitted_operation = REMOVED
-                                self.last_emitted_was_removed = true;
+                        if ei.oopspec_index == OopSpecIndex::JitForceVirtual {
+                            if self.optimize_jit_force_virtual(op, ctx) {
                                 return OptimizationResult::Remove;
                             }
                         }
@@ -1428,9 +1509,35 @@ impl Optimization for OptVirtualize {
                 self.optimize_escaping_op(op, ctx)
             }
 
-            // virtualize.py: optimize_FINISH — force the last
-            // GUARD_NOT_FORCED_2 op for resume data.
+            // virtualize.py:80-90 optimize_FINISH / postprocess_FINISH
+            //
+            //   def optimize_FINISH(self, op):
+            //       self._finish_guard_op = self._last_guard_not_forced_2
+            //       return self.emit(op)
+            //
+            //   def postprocess_FINISH(self, op):
+            //       guard_op = self._finish_guard_op
+            //       if guard_op is not None:
+            //           guard_op = self.optimizer.store_final_boxes_in_guard(
+            //               guard_op, [])
+            //           i = len(self.optimizer._newoperations) - 1
+            //           assert i >= 0
+            //           self.optimizer._newoperations.insert(i, guard_op)
+            //
+            // majit ordering: emit_extra queues the stashed guard for the
+            // passes after virtualize, and `drain_extra_operations_from`
+            // (called by propagate_from_pass_range right after this method
+            // returns) flushes those queued ops through the pipeline before
+            // the FINISH replacement is propagated. The guard therefore lands
+            // in `new_operations` first, the FINISH lands second — matching
+            // RPython's "insert at len-1" final layout. The guard's resume
+            // data is finalized when `emit_guard_operation` calls
+            // `store_final_boxes_in_guard` during its emission.
             OpCode::Finish => {
+                if let Some(stashed) = self.last_guard_not_forced_2.take() {
+                    let after = ctx.current_pass_idx;
+                    ctx.emit_extra(after, stashed);
+                }
                 // Force all virtual args (same as escaping op).
                 self.optimize_escaping_op(op, ctx)
             }
@@ -1454,19 +1561,43 @@ impl Optimization for OptVirtualize {
                 self.optimize_escaping_op(op, ctx)
             }
 
-            // virtualize.py: optimize_CALL_N/R/I — special handling for
-            // OS_JIT_FORCE_VIRTUALIZABLE (remove if target is virtual).
-            OpCode::CallN | OpCode::CallR | OpCode::CallI | OpCode::CallF => {
+            // virtualize.py:226-240 optimize_CALL_N (aliased to CALL_R / CALL_I)
+            //
+            //   def optimize_CALL_N(self, op):
+            //       effectinfo = op.getdescr().get_extra_info()
+            //       if effectinfo.oopspecindex == EffectInfo.OS_RAW_MALLOC_VARSIZE_CHAR:
+            //           return self.do_RAW_MALLOC_VARSIZE_CHAR(op)
+            //       elif effectinfo.oopspecindex == EffectInfo.OS_RAW_FREE:
+            //           return self.do_RAW_FREE(op)
+            //       elif effectinfo.oopspecindex == EffectInfo.OS_JIT_FORCE_VIRTUALIZABLE:
+            //           # we might end up having CALL here instead of COND_CALL
+            //           info = getptrinfo(op.getarg(1))
+            //           if info and info.is_virtual():
+            //               return
+            //       else:
+            //           return self.emit(op)
+            //
+            // The Python control flow is significant: when oopspecindex is
+            // JIT_FORCE_VIRTUALIZABLE, the function falls off without
+            // emitting regardless of whether the inner is_virtual check
+            // succeeds — the elif chain blocks the else: emit branch.
+            //
+            // CALL_F is NOT in the alias list (RPython virtualize.py defines
+            // only optimize_CALL_N/R/I) — float-typed calls flow through the
+            // base Optimization.emit and only get virtual-arg forcing in the
+            // standard force_box path.
+            OpCode::CallN | OpCode::CallR | OpCode::CallI => {
                 if let Some(ref descr) = op.descr {
                     if let Some(cd) = descr.as_call_descr() {
                         let ei = cd.effect_info();
-                        // virtualize.py:228-247 do_RAW_MALLOC_VARSIZE_CHAR
-                        //   sizebox = self.get_constant_box(op.getarg(1))
-                        //   if sizebox is None:
-                        //       return self.emit(op)
-                        //   self.make_virtual_raw_memory(sizebox.getint(), op)
-                        //   self.last_emitted_operation = REMOVED
+                        // virtualize.py:228 do_RAW_MALLOC_VARSIZE_CHAR
                         if ei.oopspec_index == OopSpecIndex::RawMallocVarsizeChar {
+                            // virtualize.py:242-247 do_RAW_MALLOC_VARSIZE_CHAR:
+                            //   sizebox = self.get_constant_box(op.getarg(1))
+                            //   if sizebox is None:
+                            //       return self.emit(op)
+                            //   self.make_virtual_raw_memory(sizebox.getint(), op)
+                            //   self.last_emitted_operation = REMOVED
                             if op.num_args() >= 2 {
                                 if let Some(size) = ctx.get_constant_int(op.arg(1)) {
                                     let info = PtrInfo::VirtualRawBuffer(
@@ -1477,16 +1608,19 @@ impl Optimization for OptVirtualize {
                                         },
                                     );
                                     ctx.set_ptr_info(op.pos, info);
-                                    // virtualize.py:247 self.last_emitted_operation = REMOVED
                                     self.last_emitted_was_removed = true;
                                     return OptimizationResult::Remove;
                                 }
                             }
-                            // virtualize.py:244-245 sizebox is None → return self.emit(op)
                             return self.optimize_escaping_op(op, ctx);
                         }
-                        // virtualize.py: OS_RAW_FREE → remove if target is virtual raw buffer
+                        // virtualize.py:230 do_RAW_FREE
                         if ei.oopspec_index == OopSpecIndex::RawFree {
+                            // virtualize.py:249-253 do_RAW_FREE:
+                            //   opinfo = getrawptrinfo(op.getarg(1))
+                            //   if opinfo and opinfo.is_virtual():
+                            //       return
+                            //   return self.emit(op)
                             if op.num_args() >= 2 {
                                 let target = ctx.get_box_replacement(op.arg(1));
                                 if Self::is_virtual(target, ctx) {
@@ -1495,17 +1629,17 @@ impl Optimization for OptVirtualize {
                             }
                             return self.optimize_escaping_op(op, ctx);
                         }
-                        // virtualize.py: OS_JIT_FORCE_VIRTUALIZABLE
+                        // virtualize.py:232-236 OS_JIT_FORCE_VIRTUALIZABLE
+                        //   info = getptrinfo(op.getarg(1))
+                        //   if info and info.is_virtual():
+                        //       return
+                        //   # falls off (no else branch matches) → REMOVED
                         if ei.oopspec_index == OopSpecIndex::JitForceVirtualizable {
-                            if op.num_args() > 1 {
-                                let target = ctx.get_box_replacement(op.arg(1));
-                                if Self::is_virtual(target, ctx) {
-                                    return OptimizationResult::Remove;
-                                }
-                            }
+                            return OptimizationResult::Remove;
                         }
                     }
                 }
+                // virtualize.py:237-238 else: return self.emit(op)
                 self.optimize_escaping_op(op, ctx)
             }
 

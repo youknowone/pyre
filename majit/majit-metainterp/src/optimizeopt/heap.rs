@@ -368,9 +368,19 @@ pub struct OptHeap {
     /// all its dependencies are transitively escaped.
     heapc_deps: HashMap<u32, Vec<OpRef>>,
 
-    /// Whether the last call is known to not raise (for GUARD_NO_EXCEPTION dedup).
-    /// RPython heap.py: consecutive GUARD_NO_EXCEPTION can be deduplicated.
-    last_call_did_not_raise: bool,
+    /// heap.py:27 OptHeap inherits Optimization.last_emitted_operation,
+    /// which is set to REMOVED by `_optimize_CALL_DICT_LOOKUP`
+    /// (heap.py:527) when a folded CALL_PURE collapses into its cached
+    /// result. `optimize_GUARD_NO_EXCEPTION` (heap.py:530-533) reads the
+    /// flag and skips emitting the trailing guard. majit models the
+    /// REMOVED state as a per-pass boolean — set true on the explicit
+    /// removal paths, false on every other dispatch entry.
+    last_emitted_was_removed: bool,
+    /// Snapshot of `last_emitted_was_removed` taken at the start of every
+    /// `propagate_forward` call so that handlers (e.g.,
+    /// `optimize_GUARD_NO_EXCEPTION`) read the *previous* op's outcome
+    /// rather than their own reset state.
+    prior_emitted_was_removed: bool,
 
     /// Fields known to be quasi-immutable: (obj, field_idx) -> cached value OpRef.
     /// Populated by QUASIIMMUT_FIELD, consumed by subsequent GETFIELD_GC_*.
@@ -403,7 +413,8 @@ impl OptHeap {
             unescaped: Vec::new(),
             known_nonnull: Vec::new(),
             heapc_deps: HashMap::new(),
-            last_call_did_not_raise: false,
+            last_emitted_was_removed: false,
+            prior_emitted_was_removed: false,
             quasi_immut_cache: HashMap::new(),
             field_descr_map: HashMap::new(),
             cached_arraylens: HashMap::new(),
@@ -1697,7 +1708,6 @@ impl OptHeap {
                     if Self::call_can_invalidate(op) {
                         self.seen_guard_not_invalidated = false;
                     }
-                    self.last_call_did_not_raise = false;
                     return OptimizationResult::Emit(op.clone());
                 }
             }
@@ -1707,8 +1717,6 @@ impl OptHeap {
         if !opcode.has_no_side_effect() && !opcode.is_ovf() {
             self.force_all_lazy_sets(ctx.current_pass_idx, ctx);
             self.clean_caches();
-            // Any side-effecting op may raise — reset exception dedup state.
-            self.last_call_did_not_raise = false;
             return OptimizationResult::Emit(op.clone());
         }
 
@@ -1832,7 +1840,6 @@ impl OptHeap {
                 // heap.py:463-464: force_all_lazy_sets + clean_caches.
                 self.force_all_lazy_sets(ctx.current_pass_idx, ctx);
                 self.clean_caches();
-                self.last_call_did_not_raise = false;
                 return OptimizationResult::Emit(op.clone());
             }
 
@@ -1855,7 +1862,6 @@ impl OptHeap {
                 self.mark_escaped_varargs(op, ctx);
                 // Postpone the call — it will be emitted when GUARD_NOT_FORCED arrives.
                 self.postponed_op = Some(op.clone());
-                self.last_call_did_not_raise = false;
                 if Self::call_has_random_effects(op) {
                     self.clean_caches();
                 } else {
@@ -1913,34 +1919,31 @@ impl OptHeap {
             OpCode::CondCallN => {
                 self.force_all_lazy_sets(ctx.current_pass_idx, ctx);
                 self.clean_caches();
-                self.last_call_did_not_raise = false;
                 OptimizationResult::PassOn
             }
 
-            // ── GUARD_NO_EXCEPTION ──
-            // RPython heap.py: emit any postponed op before the guard,
-            // then deduplicate consecutive GUARD_NO_EXCEPTION.
-            OpCode::GuardNoException => {
-                // RPython emit_postponed_op: route through next_optimization
-                if let Some(postponed) = self.postponed_op.take() {
-                    ctx.emit_extra(ctx.current_pass_idx, postponed);
-                }
-                if self.last_call_did_not_raise {
+            // heap.py:530-535 optimize_GUARD_NO_EXCEPTION
+            // (alias optimize_GUARD_EXCEPTION = optimize_GUARD_NO_EXCEPTION):
+            //
+            //     def optimize_GUARD_NO_EXCEPTION(self, op):
+            //         if self.last_emitted_operation is REMOVED:
+            //             return
+            //         return self.emit(op)
+            //     optimize_GUARD_EXCEPTION = optimize_GUARD_NO_EXCEPTION
+            //
+            // The REMOVED check fires only on paths that explicitly set
+            // self.last_emitted_operation = REMOVED — currently just
+            // _optimize_CALL_DICT_LOOKUP (heap.py:527). emit() flushes the
+            // postponed op and runs emitting_operation, which delegates
+            // force_lazy_sets_for_guard via the guard branch.
+            OpCode::GuardNoException | OpCode::GuardException => {
+                if self.prior_emitted_was_removed {
                     return OptimizationResult::Remove;
                 }
-                self.last_call_did_not_raise = true;
-                self.force_all_lazy_sets(ctx.current_pass_idx, ctx);
-                return OptimizationResult::Emit(op.clone());
-            }
-
-            // heap.py: GUARD_EXCEPTION — emit postponed op, then pass through.
-            // Unlike GUARD_NO_EXCEPTION, this does NOT deduplicate.
-            OpCode::GuardException => {
-                // RPython emit_postponed_op: route through next_optimization
+                // emit() override: flush postponed op before the guard.
                 if let Some(postponed) = self.postponed_op.take() {
                     ctx.emit_extra(ctx.current_pass_idx, postponed);
                 }
-                self.last_call_did_not_raise = false;
                 self.force_all_lazy_sets(ctx.current_pass_idx, ctx);
                 return OptimizationResult::Emit(op.clone());
             }
@@ -2040,6 +2043,15 @@ impl Default for OptHeap {
 
 impl Optimization for OptHeap {
     fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+        // optimizer.py:84-92 base emit/emit_result reset
+        // last_emitted_operation to the current op on every emit. RPython's
+        // `last_emitted is REMOVED` check therefore reads the prior op's
+        // outcome — model that by snapshotting the flag at entry and
+        // resetting it. Removal paths set the flag back to true before
+        // returning Remove. dispatch_propagate reads the snapshot via
+        // self.prior_emitted_was_removed.
+        self.prior_emitted_was_removed = self.last_emitted_was_removed;
+        self.last_emitted_was_removed = false;
         let result = self.dispatch_propagate(op, ctx);
         // RPython heap.py:417-425 emit() override parity:
         // Before emitting any new op, flush the postponed op. Then
@@ -2070,7 +2082,8 @@ impl Optimization for OptHeap {
         self.seen_allocation.clear();
         self.unescaped.clear();
         self.known_nonnull.clear();
-        self.last_call_did_not_raise = false;
+        self.last_emitted_was_removed = false;
+        self.prior_emitted_was_removed = false;
         self.quasi_immut_cache.clear();
         self.cached_arraylens.clear();
         self.cached_arrayitems_var.clear();
