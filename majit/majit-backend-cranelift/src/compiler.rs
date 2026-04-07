@@ -8942,17 +8942,6 @@ impl CraneliftBackend {
                     builder.def_var(var(vi), result);
                 }
 
-                // ── Escape ops (for testing) ──
-                // These are used in optimizer tests to force values to escape.
-                // In the backend they're no-ops that pass through the value.
-                OpCode::EscapeI | OpCode::EscapeR | OpCode::EscapeF => {
-                    let val = resolve_opref(&mut builder, &constants, op.arg(0));
-                    builder.def_var(var(vi), val);
-                }
-                OpCode::EscapeN => {
-                    // Void-returning escape: just evaluate args for side effects
-                }
-
                 // ── Raw array item read (ref-typed) ──
                 OpCode::GetarrayitemRawR => {
                     let base = resolve_opref(&mut builder, &constants, op.arg(0));

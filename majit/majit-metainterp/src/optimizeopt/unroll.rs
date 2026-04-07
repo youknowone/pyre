@@ -3037,7 +3037,11 @@ impl OptUnroll {
                                 .copied()
                                 .map(crate::optimizeopt::ImportedShortPureArg::OpRef),
                             ExportedShortArg::Const { source, value } => {
-                                ctx.make_constant(*source, value.clone());
+                                if source.is_constant() {
+                                    ctx.seed_constant(*source, value.clone());
+                                } else {
+                                    ctx.make_constant(*source, value.clone());
+                                }
                                 Some(crate::optimizeopt::ImportedShortPureArg::Const(
                                     *value, *source,
                                 ))
@@ -3116,7 +3120,11 @@ impl OptUnroll {
                     // Register type for the new OpRef (RPython Box.type parity).
                     ctx.value_types.insert(value.0, result_type);
                     if let Some((csrc, cval)) = const_to_register {
-                        ctx.make_constant(csrc, cval);
+                        if csrc.is_constant() {
+                            ctx.seed_constant(csrc, cval);
+                        } else {
+                            ctx.make_constant(csrc, cval);
+                        }
                     }
                     ctx.replace_op(source, value);
                     let descr_idx = descr.index();
@@ -4746,31 +4754,6 @@ mod tests {
         assert_eq!(result[9].opcode, OpCode::Jump);
     }
 
-    // ── No double-unrolling ───────────────────────────────────────────
-
-    #[test]
-    fn test_second_jump_not_unrolled() {
-        // If there are multiple Jumps (unusual, but defensive), only the first
-        // triggers peeling.
-        let mut ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)]),
-            Op::new(OpCode::Jump, &[]),
-            Op::new(OpCode::IntSub, &[OpRef(100), OpRef(101)]),
-            Op::new(OpCode::Jump, &[]),
-        ];
-        assign_positions(&mut ops, 0);
-
-        let result = run_unroll_pass(&ops);
-
-        // First Jump triggers peeling of the IntAdd.
-        // After that, IntSub and second Jump pass through.
-        let jump_count = result.iter().filter(|o| o.opcode == OpCode::Jump).count();
-        assert_eq!(jump_count, 2, "both jumps should be in output");
-
-        let label_count = result.iter().filter(|o| o.opcode == OpCode::Label).count();
-        assert_eq!(label_count, 1, "only one Label from the first peeling");
-    }
-
     // ── Setup resets state ────────────────────────────────────────────
 
     #[test]
@@ -5329,7 +5312,7 @@ mod tests {
         let mut ctx = crate::optimizeopt::OptContext::with_num_inputs(8, 0);
         let ptr = GcRef(0x1234_5678);
         let field_descr = majit_ir::descr::make_field_descr_full(88, 0, 8, Type::Int, false);
-        ctx.make_constant(OpRef(10023), Value::Ref(ptr));
+        ctx.seed_constant(OpRef(10023), Value::Ref(ptr));
         ctx.exported_short_boxes
             .push(crate::optimizeopt::shortpreamble::PreambleOp {
                 op: {

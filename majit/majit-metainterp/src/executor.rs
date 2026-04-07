@@ -867,10 +867,6 @@ pub(crate) fn execute_one(
         | OpCode::LeavePortalFrame
         | OpCode::JitDebug => OpResult::Void,
 
-        // ── Escape ops (testing) ──
-        OpCode::EscapeI | OpCode::EscapeR | OpCode::EscapeF => OpResult::Value(0),
-        OpCode::EscapeN => OpResult::Void,
-
         // ── LoadFromGcTable / LoadEffectiveAddress ──
         OpCode::LoadFromGcTable | OpCode::LoadEffectiveAddress => OpResult::Value(0),
 

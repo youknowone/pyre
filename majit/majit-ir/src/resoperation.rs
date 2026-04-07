@@ -896,10 +896,6 @@ pub enum OpCode {
     JitDebug,
 
     // ── Testing only ──
-    EscapeI,
-    EscapeR,
-    EscapeF,
-    EscapeN,
     ForceSpill,
 
     // ── Misc side effects ──
@@ -2142,11 +2138,6 @@ static OPRESTYPE: [Type; OPCODE_COUNT] = {
     int!(VecI, VecUnpackI, VecPackI, VecExpandI, VecLoadI);
     float!(VecF, VecUnpackF, VecPackF, VecExpandF, VecLoadF);
     int!(VirtualRefI);
-    // Escape ops (testing)
-    int!(EscapeI);
-    ref_!(EscapeR);
-    float!(EscapeF);
-
     t
 };
 
@@ -2345,10 +2336,6 @@ static OPNAME: [&str; OPCODE_COUNT] = {
         EnterPortalFrame,
         LeavePortalFrame,
         JitDebug,
-        EscapeI,
-        EscapeR,
-        EscapeF,
-        EscapeN,
         ForceSpill,
         VirtualRefFinish,
         Copystrcontent,
@@ -2677,10 +2664,6 @@ mod tests {
             OpCode::CallPureN,
             OpCode::CallMallocNurseryVarsize,
             OpCode::RecordKnownResult,
-            OpCode::EscapeI,
-            OpCode::EscapeR,
-            OpCode::EscapeF,
-            OpCode::EscapeN,
         ];
         for op in &variadic_ops {
             assert_eq!(op.arity(), None, "{:?} should be variadic (arity=None)", op);
@@ -2735,7 +2718,6 @@ mod tests {
             OpCode::CallAssemblerI,
             OpCode::CallLoopinvariantI,
             OpCode::CallReleaseGilI,
-            OpCode::EscapeI,
             OpCode::SaveExcClass,
         ];
         for op in &int_ops {
@@ -2769,7 +2751,6 @@ mod tests {
             OpCode::CallAssemblerF,
             OpCode::CallLoopinvariantF,
             OpCode::CallReleaseGilF,
-            OpCode::EscapeF,
         ];
         for op in &float_ops {
             assert_eq!(
@@ -2816,7 +2797,6 @@ mod tests {
             OpCode::CallMallocNurseryVarsize,
             OpCode::CallMallocNurseryVarsizeFrame,
             OpCode::SaveException,
-            OpCode::EscapeR,
         ];
         for op in &ref_ops {
             assert_eq!(op.result_type(), Type::Ref, "{:?} should return Ref", op);
@@ -2853,7 +2833,6 @@ mod tests {
             OpCode::CallLoopinvariantN,
             OpCode::CallReleaseGilN,
             OpCode::CallPureN,
-            OpCode::EscapeN,
             OpCode::ForceSpill,
             OpCode::VirtualRefFinish,
             OpCode::Copystrcontent,

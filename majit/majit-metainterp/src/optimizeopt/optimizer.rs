@@ -1130,14 +1130,24 @@ impl Optimizer {
     /// Also pops from potential_extra_ops (optimizer.py:351-359).
     pub fn force_box(&mut self, opref: OpRef, ctx: &mut OptContext) -> OpRef {
         // optimizer.py:346: op = get_box_replacement(op)
+        let preamble_source = ctx.imported_short_source(opref);
         let resolved = ctx.get_box_replacement(opref);
         // optimizer.py:351-359: potential_extra_ops.pop(op)
         // → sb.add_preamble_op(preamble_op)
-        if let Some(preamble_op) = ctx.take_potential_extra_op(resolved) {
+        let tracked = ctx
+            .take_potential_extra_op(resolved)
+            .or_else(|| ctx.take_potential_extra_op(opref))
+            .or_else(|| {
+                (preamble_source != resolved && preamble_source != opref)
+                    .then(|| ctx.take_potential_extra_op(preamble_source))
+                    .flatten()
+            });
+        if let Some(preamble_op) = tracked {
+            let resolved_for_pop = ctx.get_box_replacement(preamble_op.op);
             if let Some(builder) = ctx.active_short_preamble_producer_mut() {
-                builder.add_preamble_op_from_pop(&preamble_op, resolved);
+                builder.add_preamble_op_from_pop(&preamble_op, resolved_for_pop);
             } else if let Some(builder) = ctx.imported_short_preamble_builder.as_mut() {
-                builder.add_preamble_op_from_pop(&preamble_op, resolved);
+                builder.add_preamble_op_from_pop(&preamble_op, resolved_for_pop);
             }
         }
         if ctx

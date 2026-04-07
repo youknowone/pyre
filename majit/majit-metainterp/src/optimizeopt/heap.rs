@@ -744,6 +744,29 @@ impl OptHeap {
         // (no dict_reads cache in majit)
     }
 
+    /// heapcache.py:363-369 invalidate_unescaped / clear_caches_varargs
+    ///
+    /// Preserve cached values for unescaped allocations across residual calls.
+    /// Only entries attached to boxes that have escaped are invalidated.
+    fn invalidate_caches_for_escaped(&mut self) {
+        for (&field_idx, cf) in self.cached_fields.iter_mut() {
+            if vb_get(&self.immutable_field_descrs, field_idx) {
+                continue;
+            }
+            cf.retain_entries(|obj| vb_get(&self.unescaped, obj.0));
+        }
+        for (&(descr_idx, _index), cai) in self.cached_arrayitems.iter_mut() {
+            if vb_get(&self.immutable_array_descrs, descr_idx) {
+                continue;
+            }
+            cai.retain_entries(|obj| vb_get(&self.unescaped, obj.0));
+        }
+        self.cached_arrayitems_var
+            .retain(|&(obj, descr_idx, _), _| {
+                vb_get(&self.immutable_array_descrs, descr_idx) || vb_get(&self.unescaped, obj.0)
+            });
+    }
+
     /// Invalidate field caches affected by a write to `obj` for field `field_idx`.
     ///
     /// Uses aliasing analysis: objects allocated in this trace (seen_allocation)
@@ -1209,6 +1232,15 @@ impl OptHeap {
             None => return OptimizationResult::Emit(op.clone()),
         };
 
+        // RPython heap.py keeps immutability on the descriptor itself, so
+        // SetfieldGc on an always-pure field must also seed the immutable
+        // descriptor table before any cache invalidation happens.
+        if let Some(descr) = &op.descr {
+            if descr.is_always_pure() {
+                vb_set(&mut self.immutable_field_descrs, key.1);
+            }
+        }
+
         let (raw_obj, field_idx) = key;
         // Resolve forwarding so that two OpRefs pointing to the same object
         // compare equal (PtrInfo identity semantics, heap.py same_info).
@@ -1597,12 +1629,19 @@ impl OptHeap {
                 }
                 _ => {
                     self.mark_escaped_varargs(op, ctx);
-                    // heap.py: force_from_effectinfo — selective cache
-                    // invalidation using EffectInfo bitstrings.
-                    if Self::call_has_random_effects(op) {
+                    // heapcache.py:337-369 clear_caches_varargs
+                    // Plain residual calls preserve cache entries for
+                    // unescaped allocations. Calls with explicit EffectInfo
+                    // keep the more precise heap.py force_from_effectinfo path.
+                    if op.descr.is_none() {
+                        self.force_all_lazy_sets(ctx.current_pass_idx, ctx);
+                        self.invalidate_caches_for_escaped();
+                    } else if Self::call_has_random_effects(op) {
                         self.force_all_lazy_sets(ctx.current_pass_idx, ctx);
                         self.clean_caches();
                     } else {
+                        // heap.py: force_from_effectinfo — selective cache
+                        // invalidation using EffectInfo bitstrings.
                         self.force_from_effectinfo(op, ctx);
                     }
                     if Self::call_can_invalidate(op) {
@@ -2089,6 +2128,12 @@ impl Optimization for OptHeap {
             } else {
                 if Self::call_can_invalidate(op) {
                     self.seen_guard_not_invalidated = false;
+                }
+                if op.descr.is_none() {
+                    self.force_all_lazy_sets(self_pass_idx, ctx);
+                    self.invalidate_caches_for_escaped();
+                    ctx.current_pass_idx = saved_pass_idx;
+                    return;
                 }
                 if !Self::call_has_random_effects(op) {
                     self.force_from_effectinfo(op, ctx);
