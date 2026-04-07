@@ -101,6 +101,11 @@ pub(crate) extern "C" fn jit_loop_arg_box_int(raw: i64) -> i64 {
 #[inline]
 pub(crate) fn recursive_force_cache_safe(callable: PyObjectRef) -> bool {
     unsafe {
+        if pyre_interpreter::is_builtin_code(
+            pyre_interpreter::function_get_code(callable) as pyre_object::PyObjectRef
+        ) {
+            return false;
+        }
         if !function_get_closure(callable).is_null() {
             return false;
         }
@@ -197,7 +202,12 @@ pub(crate) fn self_recursive_function_entry_candidate(frame: &PyFrame) -> bool {
 /// recursive pure functions on the dedicated function-entry path.
 pub(crate) fn callable_prefers_function_entry(callable: PyObjectRef) -> bool {
     unsafe {
-        if !is_function(callable) || !function_get_closure(callable).is_null() {
+        if !is_function(callable)
+            || pyre_interpreter::is_builtin_code(
+                pyre_interpreter::function_get_code(callable) as pyre_object::PyObjectRef
+            )
+            || !function_get_closure(callable).is_null()
+        {
             return false;
         }
         let globals = function_get_globals(callable);
