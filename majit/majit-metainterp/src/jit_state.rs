@@ -184,6 +184,12 @@ pub trait JitState: Sized {
     /// not the interpreter frame's shape (which may have more live values).
     fn update_meta_for_bridge(_meta: &mut Self::Meta, _fail_arg_types: &[Type]) {}
 
+    /// resume.py:1042 parity: set up bridge-specific symbolic local mapping.
+    /// Called after rebuild_from_resumedata to map frame locals to bridge
+    /// InputArg OpRefs. In RPython, MIFrame.registers are populated with
+    /// InputArg/Const boxes from rebuild; this is the Rust equivalent.
+    fn setup_bridge_sym(_sym: &mut Self::Sym, _resume_data: &ResumeDataResult) {}
+
     /// resume.py:1042-1057 rebuild_from_resumedata: decode rd_numb to
     /// reconstruct the complete frame state for bridge tracing.
     ///
