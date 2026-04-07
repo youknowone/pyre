@@ -27,6 +27,13 @@ thread_local! {
     /// category=1 is the is_minor marker (incminimark.py optimization).
     /// GC walks this to find jitframes and trace their ref slots via jf_gcmap.
     static JF_SHADOW_STACK: RefCell<Vec<JfShadowEntry>> = RefCell::new(Vec::with_capacity(16));
+
+    /// Thread-local stack of blackhole interpreter register banks.
+    /// blackhole.py BlackholeInterpreter.registers_r parity: each active
+    /// blackhole frame's ref register file is a GC root range. The GC must
+    /// trace these slots during minor collection so nursery objects held only
+    /// by a blackhole register survive across collecting calls.
+    static BH_REGS_STACK: RefCell<Vec<BhRegsEntry>> = RefCell::new(Vec::with_capacity(16));
 }
 
 /// The shadow stack itself.
@@ -198,6 +205,101 @@ pub fn jf_top_ptr() -> GcRef {
         let ss = ss.borrow();
         ss.last().map(|e| e.jf_ptr).unwrap_or(GcRef::NULL)
     })
+}
+
+// ── Blackhole register bank shadow stack ────────────────────────
+//
+// blackhole.py:840 BlackholeInterpreter.registers_r parity:
+// the ref register file is part of the GC's root set during the
+// blackhole interpreter's lifetime. RPython's GC scans the
+// blackhole interpreter's RPython-managed Box arrays directly;
+// pyre stores raw i64 ptrs in Vec<i64> so we register the active
+// register banks with the collector explicitly.
+
+/// One active blackhole register bank.
+///
+/// `regs_ptr` points at the start of a `Vec<i64>` slot range; `regs_len`
+/// is the number of slots (working registers AND constants — constants
+/// are pre-existing old-gen pointers and pass through `copy_nursery_object`
+/// untouched). `tmpreg_ptr` points at the temporary ref register that
+/// holds in-flight call return values.
+#[derive(Clone, Copy)]
+struct BhRegsEntry {
+    regs_ptr: *mut i64,
+    regs_len: usize,
+    tmpreg_ptr: *mut i64,
+}
+
+// `*mut i64` is not `Send` by default. The thread-local storage means we
+// only ever access entries from the thread that pushed them, so this
+// `unsafe impl` is sound.
+unsafe impl Send for BhRegsEntry {}
+
+/// Push a blackhole interpreter's register bank onto the GC root stack.
+///
+/// The caller must ensure the slice remains valid until the matching
+/// `pop_bh_regs_to(depth)` is called. Returns the previous depth so the
+/// caller can restore it on exit (RPython _call_header_shadowstack /
+/// _call_footer_shadowstack pattern).
+///
+/// # Safety
+/// `regs` must remain alive and pinned until pop.
+pub unsafe fn push_bh_regs(regs: &mut [i64], tmpreg: &mut i64) -> usize {
+    BH_REGS_STACK.with(|ss| {
+        let mut ss = ss.borrow_mut();
+        let depth = ss.len();
+        assert!(
+            depth < MAX_SHADOW_STACK_DEPTH,
+            "blackhole regs stack overflow"
+        );
+        ss.push(BhRegsEntry {
+            regs_ptr: regs.as_mut_ptr(),
+            regs_len: regs.len(),
+            tmpreg_ptr: tmpreg as *mut i64,
+        });
+        depth
+    })
+}
+
+/// Pop blackhole register entries back to the given depth.
+pub fn pop_bh_regs_to(depth: usize) {
+    let _ = BH_REGS_STACK.try_with(|ss| {
+        ss.borrow_mut().truncate(depth);
+    });
+}
+
+/// Walk all active blackhole register banks as GC roots.
+///
+/// Each i64 slot is exposed as `&mut GcRef`. Slots holding non-nursery
+/// pointers (constants, old-gen, NULL) are passed through unchanged by
+/// `copy_nursery_object` semantics in the visitor.
+pub fn walk_bh_regs(mut visitor: impl FnMut(&mut GcRef)) {
+    BH_REGS_STACK.with(|ss| {
+        let ss = ss.borrow();
+        for entry in ss.iter() {
+            // SAFETY: the BlackholeInterpreter that pushed this entry is on
+            // the call stack above us (we are inside its run() body via a
+            // collecting call). The Vec<i64> backing storage is pinned for
+            // the lifetime of that frame.
+            let slots = unsafe { std::slice::from_raw_parts_mut(entry.regs_ptr, entry.regs_len) };
+            for slot in slots.iter_mut() {
+                let gcref = unsafe { &mut *(slot as *mut i64 as *mut GcRef) };
+                visitor(gcref);
+            }
+            // tmpreg_r holds in-flight call return values between
+            // `let result = call_int_function(...)` and the subsequent
+            // `self.registers_r[dst] = result;` store. RPython's blackhole
+            // interpreter holds this in an RPython-managed slot so it is
+            // automatically a root.
+            let tmp = unsafe { &mut *(entry.tmpreg_ptr as *mut GcRef) };
+            visitor(tmp);
+        }
+    });
+}
+
+/// Current depth of the blackhole register bank stack.
+pub fn bh_regs_depth() -> usize {
+    BH_REGS_STACK.with(|ss| ss.borrow().len())
 }
 
 // ── Extern "C" interface for compiled code ──────────────────────

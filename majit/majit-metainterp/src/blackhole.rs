@@ -1344,7 +1344,16 @@ impl BlackholeInterpreter {
         // blackhole) do not corrupt the caller's parent pointer.
         let saved_bh_vable = BH_VABLE_PTR.with(|c| c.get());
         BH_VABLE_PTR.with(|c| c.set(self.virtualizable_ptr));
+        // blackhole.py BlackholeInterpreter.registers_r parity: register the
+        // ref register bank with the GC so nursery objects held only by
+        // blackhole regs survive across collecting calls. RPython traces
+        // these via the Box array's RPython type; pyre uses an explicit
+        // thread-local stack walked by `do_collect_nursery`.
+        let bh_depth = unsafe {
+            majit_gc::shadow_stack::push_bh_regs(&mut self.registers_r, &mut self.tmpreg_r)
+        };
         self.run_inner();
+        majit_gc::shadow_stack::pop_bh_regs_to(bh_depth);
         BH_VABLE_PTR.with(|c| c.set(saved_bh_vable));
     }
 
