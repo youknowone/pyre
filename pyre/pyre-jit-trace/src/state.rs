@@ -54,6 +54,9 @@ impl JitCode {
     /// Extract raw CodeObject from the W_CodeObject stored in this JitCode.
     #[inline]
     pub unsafe fn raw_code(&self) -> *const CodeObject {
+        if self.code.is_null() {
+            return std::ptr::null();
+        }
         pyre_interpreter::w_code_get_ptr(self.code as pyre_object::PyObjectRef) as *const CodeObject
     }
 }

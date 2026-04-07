@@ -35,7 +35,7 @@ use pyre_object::pyobject::{is_int_or_long, is_long};
 /// Must match `float_pow_impl` semantics in `baseobjspace.rs`: any
 /// divergence would cause the JIT compiled code to produce a different
 /// result from the interpreter for the same input (correctness bug).
-extern "C" fn float_pow_jit(x: f64, y: f64) -> f64 {
+pub(crate) extern "C" fn float_pow_jit(x: f64, y: f64) -> f64 {
     match pyre_interpreter::float_pow_raw(x, y) {
         Ok(z) => z,
         Err(err) => {
@@ -314,7 +314,7 @@ impl MIFrame {
         types
     }
 
-    fn remember_value_type(&mut self, value: OpRef, value_type: Type) {
+    pub(crate) fn remember_value_type(&mut self, value: OpRef, value_type: Type) {
         if value.is_none() {
             return;
         }
@@ -2090,99 +2090,24 @@ impl MIFrame {
         concrete_lhs: PyObjectRef,
         concrete_rhs: PyObjectRef,
     ) -> Result<OpRef, PyError> {
-        // RPython intobject.py:588 descr_add: type-based dispatch via GuardClass + unbox.
-        // Extract concrete int values for range checks (FloorDiv, Mod, Shift).
-        let concrete = unsafe {
-            if concrete_lhs.is_null()
-                || concrete_rhs.is_null()
-                || !is_int(concrete_lhs)
-                || !is_int(concrete_rhs)
-            {
-                None
-            } else {
-                Some((w_int_get_value(concrete_lhs), w_int_get_value(concrete_rhs)))
-            }
-        };
-
-        // Table lookup: BinaryOperator → (OpCode, has_overflow, needs_concrete_check)
-        let Some((op_code, has_overflow, needs_concrete_check)) = crate::int_binop_lookup(op)
-        else {
-            return self.trace_binary_value(a, b, op);
-        };
-
-        // Operators needing concrete value validation before trace emission
-        if needs_concrete_check {
-            match op_code {
-                OpCode::IntFloorDiv | OpCode::IntMod => {
-                    let Some((lhs, rhs)) = concrete else {
-                        return self.trace_binary_value(a, b, op);
-                    };
-                    if lhs < 0 || rhs <= 0 {
-                        return self.trace_binary_value(a, b, op);
-                    }
-                }
-                OpCode::IntLshift => {
-                    let Some((lhs, rhs)) = concrete else {
-                        return self.trace_binary_value(a, b, op);
-                    };
-                    let Ok(shift) = u32::try_from(rhs) else {
-                        return self.trace_binary_value(a, b, op);
-                    };
-                    if shift >= i64::BITS {
-                        return self.trace_binary_value(a, b, op);
-                    }
-                    // intobject.py:207 ovfcheck(a << b): if the shift overflows
-                    // i64 range, fall back to interpreter for long promotion.
-                    let result = lhs.wrapping_shl(shift);
-                    if result.wrapping_shr(shift) != lhs {
-                        return self.trace_binary_value(a, b, op);
-                    }
-                }
-                OpCode::IntRshift => {
-                    let Some((lhs, rhs)) = concrete else {
-                        return self.trace_binary_value(a, b, op);
-                    };
-                    // intobject.py:225: r_uint(b) >= LONG_BIT
-                    let Ok(shift) = u32::try_from(rhs) else {
-                        return self.trace_binary_value(a, b, op);
-                    };
-                    if shift >= i64::BITS {
-                        // intobject.py:229-231: large shift → 0 or -1
-                        let result = if lhs < 0 { -1i64 } else { 0i64 };
-                        return self.with_ctx(|this, ctx| {
-                            let raw = ctx.const_int(result);
-                            let boxed = box_traced_raw_int(ctx, raw);
-                            this.remember_value_type(boxed, Type::Ref);
-                            Ok(boxed)
-                        });
-                    }
-                }
-                _ => {}
-            }
+        // Delegate to auto-generated function (RPython jitcode parity:
+        // guard_class + getfield_gc_i + int_OP_ovf + guard_no_overflow
+        // + new_with_vtable + setfield_gc).
+        let gen_result: Option<OpRef> = self.with_ctx(|this, ctx| {
+            Ok::<_, PyError>(crate::generated_binary_int_value(
+                this,
+                ctx,
+                a,
+                b,
+                op,
+                concrete_lhs,
+                concrete_rhs,
+            ))
+        })?;
+        if let Some(result) = gen_result {
+            return Ok(result);
         }
-        self.with_ctx(|this, ctx| {
-            let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
-            let lhs_raw = if this.value_type(a) == Type::Int {
-                a
-            } else {
-                crate::state::trace_unbox_int_with_resume(this, ctx, a, int_type_addr)
-            };
-            let rhs_raw = if this.value_type(b) == Type::Int {
-                b
-            } else {
-                crate::state::trace_unbox_int_with_resume(this, ctx, b, int_type_addr)
-            };
-            let raw_result = ctx.record_op(op_code, &[lhs_raw, rhs_raw]);
-            if has_overflow {
-                this.record_guard(ctx, OpCode::GuardNoOverflow, &[]);
-            }
-            // RPython parity: wrapint(space, z) re-boxes the raw int result.
-            // Record New(W_IntObject) + SetfieldGc so optimizer can virtualize.
-            // pypy/objspace/std/intobject.py:671 wrapint
-            let boxed = box_traced_raw_int(ctx, raw_result);
-            this.remember_value_type(boxed, Type::Ref);
-            Ok(boxed)
-        })
+        self.trace_binary_value(a, b, op)
     }
 
     pub(crate) fn binary_float_value(
@@ -2193,105 +2118,24 @@ impl MIFrame {
         concrete_lhs: PyObjectRef,
         concrete_rhs: PyObjectRef,
     ) -> Result<OpRef, PyError> {
-        let is_power = matches!(op, BinaryOperator::Power | BinaryOperator::InplacePower);
-        let op_code = crate::float_binop_lookup(op);
-
-        // resoperation.py: no FLOAT_POW / FLOAT_FLOORDIV / FLOAT_MOD opcodes.
-        // FloorDivide/Remainder → residual Python-level call.
-        // Power → raw-float call_may_force (ll_math_pow, EF_CAN_RAISE).
-        if op_code.is_none() && !is_power {
-            return self.trace_binary_value(a, b, op);
+        // Delegate to auto-generated function (RPython jitcode parity:
+        // guard_class + getfield_gc_f/cast_int_to_float + float_OP
+        // + new_with_vtable + setfield_gc).
+        let gen_result: Option<OpRef> = self.with_ctx(|this, ctx| {
+            Ok::<_, PyError>(crate::generated_binary_float_value(
+                this,
+                ctx,
+                a,
+                b,
+                op,
+                concrete_lhs,
+                concrete_rhs,
+            ))
+        })?;
+        if let Some(result) = gen_result {
+            return Ok(result);
         }
-
-        // floatobject.py _to_float: accepts int, float, long.
-        // Trace fast path handles int (CastIntToFloat) and float (direct).
-        // Long → residual fallback (long→float can lose precision and
-        // can't be inlined; floatobject.py calls space.float_w as residual).
-        let lhs_is_int = (!concrete_lhs.is_null() && unsafe { is_int(concrete_lhs) })
-            || self.value_type(a) == Type::Int;
-        let rhs_is_int = (!concrete_rhs.is_null() && unsafe { is_int(concrete_rhs) })
-            || self.value_type(b) == Type::Int;
-        let lhs_is_long =
-            !concrete_lhs.is_null() && unsafe { is_long(concrete_lhs) } && !lhs_is_int;
-        let rhs_is_long =
-            !concrete_rhs.is_null() && unsafe { is_long(concrete_rhs) } && !rhs_is_int;
-        if lhs_is_long || rhs_is_long {
-            return self.trace_binary_value(a, b, op);
-        }
-
-        self.with_ctx(|this, ctx| {
-            let float_type_addr = &FLOAT_TYPE as *const _ as i64;
-            let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
-            // Unbox a float object to raw f64.
-            let unbox_float = |this: &mut MIFrame, ctx: &mut TraceCtx, obj: OpRef| -> OpRef {
-                if !ctx.heap_cache().is_class_known(obj) {
-                    let type_const = ctx.const_int(float_type_addr);
-                    this.record_guard(ctx, OpCode::GuardClass, &[obj, type_const]);
-                    ctx.heap_cache_mut()
-                        .class_now_known(obj, majit_ir::GcRef(float_type_addr as usize));
-                }
-                {
-                    let ff_descr = crate::descr::float_floatval_descr();
-                    let ff_idx = ff_descr.index();
-                    if let Some(cached) = ctx.heap_cache().getfield_cached(obj, ff_idx) {
-                        cached
-                    } else {
-                        let r = ctx.record_op_with_descr(OpCode::GetfieldGcPureF, &[obj], ff_descr);
-                        ctx.heap_cache_mut().getfield_now_known(obj, ff_idx, r);
-                        r
-                    }
-                }
-            };
-            // Unbox an int object to raw i64, then CastIntToFloat → f64.
-            // RPython: space.float_w(w_int) → float(w_int.intval)
-            let unbox_int_to_float =
-                |this: &mut MIFrame, ctx: &mut TraceCtx, obj: OpRef| -> OpRef {
-                    let raw_int = if this.value_type(obj) == Type::Int {
-                        obj
-                    } else {
-                        crate::state::trace_unbox_int_with_resume(this, ctx, obj, int_type_addr)
-                    };
-                    ctx.record_op(OpCode::CastIntToFloat, &[raw_int])
-                };
-            let lhs_raw = if this.value_type(a) == Type::Float {
-                a
-            } else if lhs_is_int {
-                unbox_int_to_float(this, ctx, a)
-            } else {
-                unbox_float(this, ctx, a)
-            };
-            let rhs_raw = if this.value_type(b) == Type::Float {
-                b
-            } else if rhs_is_int {
-                unbox_int_to_float(this, ctx, b)
-            } else {
-                unbox_float(this, ctx, b)
-            };
-            let result = if is_power {
-                // floatobject.py:561 descr_pow → _pow(space, x, y) parity.
-                // ll_math_pow (ll_math.py:260) is EF_CAN_RAISE, NOT
-                // force_virtual. pyjitpl.py:2084-2121 routes EF_CAN_RAISE
-                // calls to `execute_varargs(rop.CALL_F, ..., exc=True, pure=False)`
-                // which records CALL_F and then calls handle_possible_exception
-                // (pyjitpl.py:1950-1955, 3395) — that generates GUARD_NO_EXCEPTION.
-                let call_result = ctx.call_float_typed(
-                    float_pow_jit as *const (),
-                    &[lhs_raw, rhs_raw],
-                    &[Type::Float, Type::Float],
-                );
-                // pyjitpl.py:3395 GUARD_NO_EXCEPTION from handle_possible_exception.
-                this.record_guard(ctx, OpCode::GuardNoException, &[]);
-                call_result
-            } else {
-                ctx.record_op(op_code.unwrap(), &[lhs_raw, rhs_raw])
-            };
-            this.remember_value_type(result, Type::Float);
-            // RPython parity: wrapfloat(space, z) re-boxes the raw float result.
-            // pypy/objspace/std/floatobject.py
-            let boxed = box_traced_raw_float(ctx, result);
-            this.remember_value_type(boxed, Type::Ref);
-            Ok(boxed)
-        })
+        self.trace_binary_value(a, b, op)
     }
 
     pub(crate) fn compare_value_direct(
@@ -2302,105 +2146,25 @@ impl MIFrame {
         concrete_lhs: PyObjectRef,
         concrete_rhs: PyObjectRef,
     ) -> Result<OpRef, PyError> {
-        let (lhs_obj, rhs_obj) = (concrete_lhs, concrete_rhs);
-        if lhs_obj.is_null() || rhs_obj.is_null() {
-            return self.trace_compare_value(a, b, op);
+        // Delegate to auto-generated function (RPython jitcode parity:
+        // guard_class + getfield_gc_i/f + int_LT/float_LT, with
+        // goto_if_not fusion truth caching).
+        let gen_result: Option<OpRef> = self.with_ctx(|this, ctx| {
+            Ok::<_, PyError>(unsafe {
+                crate::generated_compare_value_direct(
+                    this,
+                    ctx,
+                    a,
+                    b,
+                    op,
+                    concrete_lhs,
+                    concrete_rhs,
+                )
+            })
+        })?;
+        if let Some(result) = gen_result {
+            return Ok(result);
         }
-
-        unsafe {
-            if is_int(lhs_obj) && is_int(rhs_obj) {
-                let cmp = crate::int_compare_lookup(op);
-                return self.with_ctx(|this, ctx| {
-                    let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
-                    let lhs_raw = if this.value_type(a) == Type::Int {
-                        a
-                    } else if let Some(raw) = try_trace_const_boxed_int(ctx, a, lhs_obj) {
-                        raw
-                    } else {
-                        crate::state::trace_unbox_int_with_resume(this, ctx, a, int_type_addr)
-                    };
-                    let rhs_raw = if this.value_type(b) == Type::Int {
-                        b
-                    } else if let Some(raw) = try_trace_const_boxed_int(ctx, b, rhs_obj) {
-                        raw
-                    } else {
-                        crate::state::trace_unbox_int_with_resume(this, ctx, b, int_type_addr)
-                    };
-                    let truth = ctx.record_op(cmp, &[lhs_raw, rhs_raw]);
-                    this.remember_value_type(truth, Type::Int);
-                    // RPython goto_if_not fusion: cache truth for
-                    // the next POP_JUMP_IF to consume directly.
-                    this.sym_mut().last_comparison_truth = Some(truth);
-                    this.sym_mut().last_comparison_concrete_truth =
-                        Some(objspace_compare_ints(lhs_obj, rhs_obj, op));
-                    if this.next_instruction_consumes_comparison_truth() {
-                        Ok(truth)
-                    } else {
-                        Ok(emit_trace_bool_value_from_truth(ctx, truth, false))
-                    }
-                });
-            }
-            // baseobjspace::compare step 2: is_int_or_long × is_int_or_long
-            // Long comparison needs BigInt which can't be inlined → residual.
-            if is_int_or_long(lhs_obj) && is_int_or_long(rhs_obj) {
-                return self.trace_compare_value(a, b, op);
-            }
-            // baseobjspace::compare step 3: is_float_pair
-            // Handles float×float, float×int, int×float.
-            // Long in float_pair → residual (can't inline long→f64).
-            let lhs_is_float = is_float(lhs_obj);
-            let rhs_is_float = is_float(rhs_obj);
-            let lhs_is_int = is_int(lhs_obj);
-            let rhs_is_int = is_int(rhs_obj);
-            let lhs_numeric = lhs_is_float || lhs_is_int;
-            let rhs_numeric = rhs_is_float || rhs_is_int;
-            // Exclude long from trace fast path
-            let is_trace_float_pair = lhs_numeric && rhs_numeric && (lhs_is_float || rhs_is_float);
-            if is_trace_float_pair {
-                let cmp = crate::float_compare_lookup(op);
-                return self.with_ctx(|this, ctx| {
-                    let float_type_addr = &FLOAT_TYPE as *const _ as i64;
-                    let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
-                    // Unbox lhs: float direct, int via CastIntToFloat
-                    let lhs_raw = if this.value_type(a) == Type::Float {
-                        a
-                    } else if lhs_is_int || this.value_type(a) == Type::Int {
-                        let raw_int = if this.value_type(a) == Type::Int {
-                            a
-                        } else {
-                            crate::state::trace_unbox_int_with_resume(this, ctx, a, int_type_addr)
-                        };
-                        ctx.record_op(OpCode::CastIntToFloat, &[raw_int])
-                    } else {
-                        crate::state::trace_unbox_float_with_resume(this, ctx, a, float_type_addr)
-                    };
-                    // Unbox rhs: same pattern
-                    let rhs_raw = if this.value_type(b) == Type::Float {
-                        b
-                    } else if rhs_is_int || this.value_type(b) == Type::Int {
-                        let raw_int = if this.value_type(b) == Type::Int {
-                            b
-                        } else {
-                            crate::state::trace_unbox_int_with_resume(this, ctx, b, int_type_addr)
-                        };
-                        ctx.record_op(OpCode::CastIntToFloat, &[raw_int])
-                    } else {
-                        crate::state::trace_unbox_float_with_resume(this, ctx, b, float_type_addr)
-                    };
-                    let truth = ctx.record_op(cmp, &[lhs_raw, rhs_raw]);
-                    this.remember_value_type(truth, Type::Int);
-                    this.sym_mut().last_comparison_truth = Some(truth);
-                    this.sym_mut().last_comparison_concrete_truth =
-                        Some(objspace_compare_floats(lhs_obj, rhs_obj, op));
-                    if this.next_instruction_consumes_comparison_truth() {
-                        Ok(truth)
-                    } else {
-                        Ok(emit_trace_bool_value_from_truth(ctx, truth, false))
-                    }
-                });
-            }
-        }
-
         self.trace_compare_value(a, b, op)
     }
 
