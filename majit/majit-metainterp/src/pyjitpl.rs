@@ -1990,20 +1990,20 @@ impl<M: Clone> MetaInterp<M> {
             Err(payload) => {
                 // Phase 2 panicked — unroll_opt dropped. Phase 1 results
                 // survive in phase1_out (written before Phase 2 started).
-                if payload
-                    .downcast_ref::<crate::optimize::InvalidLoop>()
-                    .is_some()
-                {
+                if let Some(inv) = payload.downcast_ref::<crate::optimize::InvalidLoop>() {
                     if crate::majit_log_enabled() {
                         eprintln!(
-                            "[jit] abort trace at key={} (InvalidLoop during optimize)",
-                            green_key
+                            "[jit] abort trace at key={} (InvalidLoop: {})",
+                            green_key, inv.0,
                         );
                     }
                     self.cancel_count += 1;
-                    // pyjitpl.py:3021-3030: if cancelled too many times,
-                    // try one last time without unrolling.
-                    if self.cancelled_too_many_times() {
+                    // pyjitpl.py:3021-3030: try without unrolling.
+                    // RPython retries after cancel_count > max_unroll_loops because
+                    // RPython's tracer continues after InvalidLoop (same MetaInterp).
+                    // pyre's tracer resets cancel_count each session, so we retry
+                    // immediately on FIRST InvalidLoop to avoid infinite retry loops.
+                    {
                         let mut retry_constants = constants_snapshot;
                         let mut simple_opt = Optimizer::default_pipeline();
                         simple_opt.constant_types = constant_types.clone();
@@ -2040,52 +2040,6 @@ impl<M: Clone> MetaInterp<M> {
                                 return CompileOutcome::Aborted;
                             }
                         }
-                    } else {
-                        // compile.py:288-290 parity: preserve preamble target tokens
-                        if !unroll_opt.target_tokens.is_empty() {
-                            if let Some(compiled) = self.compiled_loops.get_mut(&green_key) {
-                                if compiled.front_target_tokens.is_empty() {
-                                    compiled.front_target_tokens = unroll_opt.target_tokens.clone();
-                                }
-                            } else {
-                                self.pending_preamble_tokens
-                                    .insert(green_key, unroll_opt.target_tokens.clone());
-                            }
-                        }
-                        // RPython pyjitpl.py:3014-3017 parity: InvalidLoop
-                        // but cancel_count < limit — set up retrace with
-                        // Phase 1 preamble so the next compile_loop call
-                        // uses compile_retrace with new runtime values.
-                        // RPython compile.py:278-284 parity: use Phase 1
-                        // preamble ops (JUMP excluded by optimizer) for
-                        // retrace_needed partial_trace. phase1_out was
-                        // written before Phase 2 started, so it survives
-                        // the Phase 2 panic.
-                        if let Some((preamble_ops, es)) = phase1_out.take() {
-                            if crate::majit_log_enabled() {
-                                eprintln!(
-                                    "[jit] retrace_needed after InvalidLoop at key={} preamble_ops={}",
-                                    green_key,
-                                    preamble_ops.len(),
-                                );
-                            }
-                            self.potential_retrace_position =
-                                Some(majit_trace::recorder::TracePosition {
-                                    op_count: 0,
-                                    ops_len: 0,
-                                });
-                            self.retrace_needed(
-                                green_key,
-                                preamble_ops,
-                                trace.inputargs.clone(),
-                                constants_snapshot.clone(),
-                                es,
-                            );
-                        } else {
-                            self.warm_state.abort_tracing(green_key, false);
-                        }
-                        self.warm_state.reset_function_counts();
-                        return CompileOutcome::Cancelled;
                     }
                 } else {
                     std::panic::resume_unwind(payload);
