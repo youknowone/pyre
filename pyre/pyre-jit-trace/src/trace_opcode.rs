@@ -5161,75 +5161,9 @@ impl ArithmeticOpcodeHandler for MIFrame {
         let b = b_fop.opref;
         let lhs_obj = a_fop.concrete.to_pyobj();
         let rhs_obj = b_fop.concrete.to_pyobj();
-        let mut result_concrete = ConcreteValue::Null;
-        // MIFrame Box tracking: compute concrete result for binary ops
-        // Float path
-        if !lhs_obj.is_null() && !rhs_obj.is_null() {
-            unsafe {
-                let is_float_op = is_float(lhs_obj) || is_float(rhs_obj);
-                if is_float_op {
-                    let lhs_f = if is_float(lhs_obj) {
-                        w_float_get_value(lhs_obj)
-                    } else if is_int(lhs_obj) {
-                        w_int_get_value(lhs_obj) as f64
-                    } else {
-                        0.0
-                    };
-                    let rhs_f = if is_float(rhs_obj) {
-                        w_float_get_value(rhs_obj)
-                    } else if is_int(rhs_obj) {
-                        w_int_get_value(rhs_obj) as f64
-                    } else {
-                        0.0
-                    };
-                    if let Some(result) = crate::concrete_float_binop(op, lhs_f, rhs_f) {
-                        if !result.is_nan()
-                            || matches!(
-                                op,
-                                BinaryOperator::TrueDivide | BinaryOperator::InplaceTrueDivide
-                            )
-                        {
-                            result_concrete = ConcreteValue::Float(result);
-                        }
-                    }
-                }
-            }
-        }
-        // Int path
-        if result_concrete.is_null() && !lhs_obj.is_null() && !rhs_obj.is_null() {
-            unsafe {
-                if is_int(lhs_obj) && is_int(rhs_obj) {
-                    let lhs = w_int_get_value(lhs_obj);
-                    let rhs = w_int_get_value(rhs_obj);
-                    // intobject.py:556 int_add/sub/mul: overflow → long path.
-                    // intobject.py:205 _lshift: ovfcheck(a << b).
-                    // Use checked arithmetic; on overflow, skip this fast path
-                    // and fall through to the objspace slow path.
-                    let result: Option<i64> = crate::concrete_int_binop(op, lhs, rhs);
-                    if let Some(r) = result {
-                        result_concrete = ConcreteValue::Int(r);
-                    }
-                }
-            }
-        }
-        // Fallback: objspace (BigInt, mixed types)
-        if result_concrete.is_null() && !lhs_obj.is_null() && !rhs_obj.is_null() {
-            let result = match op {
-                BinaryOperator::Add | BinaryOperator::InplaceAdd => {
-                    pyre_interpreter::baseobjspace::add(lhs_obj, rhs_obj)
-                }
-                BinaryOperator::Subtract | BinaryOperator::InplaceSubtract => {
-                    pyre_interpreter::baseobjspace::sub(lhs_obj, rhs_obj)
-                }
-                BinaryOperator::Multiply | BinaryOperator::InplaceMultiply => {
-                    pyre_interpreter::baseobjspace::mul(lhs_obj, rhs_obj)
-                }
-                _ => Err(pyre_interpreter::PyError::type_error("unsupported")),
-            };
-            if let Ok(r) = result {
-                result_concrete = ConcreteValue::from_pyobj(r);
-            }
-        }
+        // Concrete result via interpreter dispatch (baseobjspace).
+        // Handles all type combinations: int, long, float, str, list, etc.
+        let result_concrete = crate::concrete_binary_value(op, lhs_obj, rhs_obj);
         if matches!(op, BinaryOperator::Subscr) {
             let fop = self.binary_subscr_value(a, b, lhs_obj, rhs_obj)?;
             let concrete = if result_concrete.is_null() {
@@ -5262,66 +5196,9 @@ impl ArithmeticOpcodeHandler for MIFrame {
         let b = b_fop.opref;
         let lhs_obj = a_fop.concrete.to_pyobj();
         let rhs_obj = b_fop.concrete.to_pyobj();
-        let mut result_concrete = ConcreteValue::Null;
-        if !lhs_obj.is_null() && !rhs_obj.is_null() {
-            unsafe {
-                if is_float(lhs_obj) || is_float(rhs_obj) {
-                    let lhs_f = if is_float(lhs_obj) {
-                        w_float_get_value(lhs_obj)
-                    } else if is_int(lhs_obj) {
-                        w_int_get_value(lhs_obj) as f64
-                    } else {
-                        0.0
-                    };
-                    let rhs_f = if is_float(rhs_obj) {
-                        w_float_get_value(rhs_obj)
-                    } else if is_int(rhs_obj) {
-                        w_int_get_value(rhs_obj) as f64
-                    } else {
-                        0.0
-                    };
-                    let result = match op {
-                        ComparisonOperator::Less => lhs_f < rhs_f,
-                        ComparisonOperator::LessOrEqual => lhs_f <= rhs_f,
-                        ComparisonOperator::Greater => lhs_f > rhs_f,
-                        ComparisonOperator::GreaterOrEqual => lhs_f >= rhs_f,
-                        ComparisonOperator::Equal => lhs_f == rhs_f,
-                        ComparisonOperator::NotEqual => lhs_f != rhs_f,
-                    };
-                    result_concrete = ConcreteValue::Int(result as i64);
-                }
-            }
-        }
-        if result_concrete.is_null() && !lhs_obj.is_null() && !rhs_obj.is_null() {
-            unsafe {
-                if is_int(lhs_obj) && is_int(rhs_obj) {
-                    let lhs = w_int_get_value(lhs_obj);
-                    let rhs = w_int_get_value(rhs_obj);
-                    let result = match op {
-                        ComparisonOperator::Less => lhs < rhs,
-                        ComparisonOperator::LessOrEqual => lhs <= rhs,
-                        ComparisonOperator::Greater => lhs > rhs,
-                        ComparisonOperator::GreaterOrEqual => lhs >= rhs,
-                        ComparisonOperator::Equal => lhs == rhs,
-                        ComparisonOperator::NotEqual => lhs != rhs,
-                    };
-                    result_concrete = ConcreteValue::Int(result as i64);
-                }
-            }
-        }
-        if result_concrete.is_null() && !lhs_obj.is_null() && !rhs_obj.is_null() {
-            let cmp_op = match op {
-                ComparisonOperator::Less => pyre_interpreter::baseobjspace::CompareOp::Lt,
-                ComparisonOperator::LessOrEqual => pyre_interpreter::baseobjspace::CompareOp::Le,
-                ComparisonOperator::Greater => pyre_interpreter::baseobjspace::CompareOp::Gt,
-                ComparisonOperator::GreaterOrEqual => pyre_interpreter::baseobjspace::CompareOp::Ge,
-                ComparisonOperator::Equal => pyre_interpreter::baseobjspace::CompareOp::Eq,
-                ComparisonOperator::NotEqual => pyre_interpreter::baseobjspace::CompareOp::Ne,
-            };
-            if let Ok(r) = pyre_interpreter::baseobjspace::compare(lhs_obj, rhs_obj, cmp_op) {
-                result_concrete = ConcreteValue::from_pyobj(r);
-            }
-        }
+        // Concrete result via interpreter dispatch (baseobjspace::compare).
+        // Handles all type combinations: int, long, float_pair, str, dunder.
+        let result_concrete = crate::concrete_compare_value(op, lhs_obj, rhs_obj);
         let opref = self.compare_value_direct(a, b, op, lhs_obj, rhs_obj)?;
         Ok(FrontendOp::new(opref, result_concrete))
     }
