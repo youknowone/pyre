@@ -16,7 +16,12 @@ pub struct OpRef(pub u32);
 impl OpRef {
     pub const NONE: OpRef = OpRef(u32::MAX);
     /// Constants use OpRef indices starting from this base.
-    pub const CONST_BASE: u32 = 10_000;
+    /// RPython uses Box identity (ConstInt/ConstPtr are separate objects)
+    /// so there is no equivalent boundary. This value must be large enough
+    /// that trace op positions never reach it, but small enough that
+    /// Vec<Option<Value>> indexed by OpRef.0 stays practical.
+    /// Real traces rarely exceed a few thousand ops.
+    pub const CONST_BASE: u32 = 100_000;
 
     pub fn is_none(self) -> bool {
         self.0 == u32::MAX

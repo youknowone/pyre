@@ -46,7 +46,7 @@ impl ConstantPool {
             constants: HashMap::new(),
             constant_types: HashMap::new(),
             numbering_type_overrides: HashMap::new(),
-            next_ref: 10_000,
+            next_ref: OpRef::CONST_BASE,
             rooted_refs: Vec::new(),
             shadow_stack_base: shadow_stack::depth(),
         }

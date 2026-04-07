@@ -2099,7 +2099,7 @@ impl JitState for PyreJitState {
         // entries so the optimizer can fold them. RPython uses ConstBox
         // objects natively; Rust needs explicit constant pool entries.
         let mut constants = Vec::new();
-        let mut const_idx = 10_000u32;
+        let mut const_idx = majit_ir::OpRef::CONST_BASE;
         for frame in &frames {
             for value in &frame.values {
                 match value {
