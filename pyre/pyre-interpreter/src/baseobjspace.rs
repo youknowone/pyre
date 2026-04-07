@@ -1598,6 +1598,52 @@ pub fn invert(a: PyObjectRef) -> PyResult {
 
 // ── Subscript operations ─────────────────────────────────────────────
 
+/// Normalize a slice to (start, stop, step) for a sequence of `length`.
+///
+/// PyPy: sliceobject.py descr_indices, mirroring CPython
+/// `PySlice_Unpack` + `PySlice_AdjustIndices`. Handles negative `step`
+/// (which CPython adjusts the start/stop bounds for separately from
+/// positive `step`).
+pub(crate) unsafe fn normalize_slice(
+    index: PyObjectRef,
+    length: i64,
+) -> Result<(i64, i64, i64), PyError> {
+    let start_obj = w_slice_get_start(index);
+    let stop_obj = w_slice_get_stop(index);
+    let step_obj = w_slice_get_step(index);
+    let step = if is_none(step_obj) {
+        1
+    } else {
+        w_int_get_value(step_obj)
+    };
+    if step == 0 {
+        return Err(PyError::new(
+            PyErrorKind::ValueError,
+            "slice step cannot be zero",
+        ));
+    }
+    let (lower, upper) = if step > 0 {
+        (0, length)
+    } else {
+        (-1, length - 1)
+    };
+    let start = if is_none(start_obj) {
+        if step > 0 { 0 } else { length - 1 }
+    } else {
+        let v = w_int_get_value(start_obj);
+        let v = if v < 0 { v + length } else { v };
+        v.max(lower).min(upper)
+    };
+    let stop = if is_none(stop_obj) {
+        if step > 0 { length } else { -1 }
+    } else {
+        let v = w_int_get_value(stop_obj);
+        let v = if v < 0 { v + length } else { v };
+        v.max(lower).min(upper)
+    };
+    Ok((start, stop, step))
+}
+
 /// Get item by index: `obj[index]`.
 ///
 /// Dispatches based on the type of `obj`.
@@ -1609,49 +1655,14 @@ pub fn getitem(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
         if is_list(obj) {
             if is_slice(index) {
                 let len = w_list_len(obj) as i64;
-                let start = w_slice_get_start(index);
-                let stop = w_slice_get_stop(index);
-                let step = w_slice_get_step(index);
-                let step_val = if is_none(step) {
-                    1
-                } else {
-                    w_int_get_value(step)
-                };
-                let s = if is_none(start) {
-                    if step_val < 0 { len - 1 } else { 0 }
-                } else {
-                    let v = w_int_get_value(start);
-                    if v < 0 { (len + v).max(0) } else { v.min(len) }
-                };
-                let e = if is_none(stop) {
-                    if step_val < 0 { -1 } else { len }
-                } else {
-                    let v = w_int_get_value(stop);
-                    if v < 0 { (len + v).max(-1) } else { v.min(len) }
-                };
+                let (start, stop, step) = normalize_slice(index, len)?;
                 let mut items = Vec::new();
-                if step_val == 1 {
-                    for i in s..e {
-                        if let Some(v) = w_list_getitem(obj, i) {
-                            items.push(v);
-                        }
+                let mut i = start;
+                while (step > 0 && i < stop) || (step < 0 && i > stop) {
+                    if let Some(v) = w_list_getitem(obj, i) {
+                        items.push(v);
                     }
-                } else if step_val > 0 {
-                    let mut i = s;
-                    while i < e {
-                        if let Some(v) = w_list_getitem(obj, i) {
-                            items.push(v);
-                        }
-                        i += step_val;
-                    }
-                } else if step_val < 0 {
-                    let mut i = s;
-                    while i > e {
-                        if let Some(v) = w_list_getitem(obj, i) {
-                            items.push(v);
-                        }
-                        i += step_val;
-                    }
+                    i += step;
                 }
                 return Ok(w_list_new(items));
             }
@@ -1670,43 +1681,16 @@ pub fn getitem(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
             }
         } else if is_tuple(obj) {
             if is_slice(index) {
-                // PyPy: tupleobject.py descr_getslice
+                // PyPy: tupleobject.py descr_getslice → slice.indices.
                 let len = w_tuple_len(obj) as i64;
-                let start = w_slice_get_start(index);
-                let stop = w_slice_get_stop(index);
-                let step = w_slice_get_step(index);
-                let s = if is_none(start) {
-                    0
-                } else {
-                    w_int_get_value(start)
-                };
-                let e = if is_none(stop) {
-                    len
-                } else {
-                    w_int_get_value(stop)
-                };
-                let step_val = if is_none(step) {
-                    1
-                } else {
-                    w_int_get_value(step)
-                };
-                let s = if s < 0 { (len + s).max(0) } else { s.min(len) } as usize;
-                let e = if e < 0 { (len + e).max(0) } else { e.min(len) } as usize;
+                let (start, stop, step) = normalize_slice(index, len)?;
                 let mut items = Vec::new();
-                if step_val == 1 {
-                    for i in s..e {
-                        if let Some(v) = w_tuple_getitem(obj, i as i64) {
-                            items.push(v);
-                        }
+                let mut i = start;
+                while (step > 0 && i < stop) || (step < 0 && i > stop) {
+                    if let Some(v) = w_tuple_getitem(obj, i) {
+                        items.push(v);
                     }
-                } else if step_val > 0 {
-                    let mut i = s as i64;
-                    while (i as usize) < e {
-                        if let Some(v) = w_tuple_getitem(obj, i) {
-                            items.push(v);
-                        }
-                        i += step_val;
-                    }
+                    i += step;
                 }
                 return Ok(w_tuple_new(items));
             }
@@ -2421,15 +2405,68 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
             if name == "__bases__" {
                 return Ok(w_type_get_bases(obj));
             }
+            // PEP 649 lazy annotations: when `cls.__annotations__` is
+            // requested and only `__annotate_func__` (or `__annotate__`)
+            // is set, call the annotate function with format=1 to
+            // produce the actual dict.  CPython 3.14+ stops emitting
+            // `__annotations__` directly in class bodies in favour of
+            // this lazy form.
+            if name == "__annotations__" {
+                if let Some(v) = lookup_in_type_where(obj, "__annotations__") {
+                    return Ok(v);
+                }
+                if let Some(annotate_fn) = lookup_in_type_where(obj, "__annotate_func__")
+                    .or_else(|| lookup_in_type_where(obj, "__annotate__"))
+                {
+                    if !annotate_fn.is_null() && !is_none(annotate_fn) {
+                        // format=1 (VALUE) — return runtime values.
+                        return Ok(crate::call_function(annotate_fn, &[w_int_new(1)]));
+                    }
+                }
+                return Ok(pyre_object::w_dict_new());
+            }
+            // PEP 649: `__annotate__` and `__annotate_func__` are the
+            // same slot. Bytecode stores it as `__annotate_func__` in the
+            // class dict; user code reads it as `__annotate__`. Forward
+            // either name to the other, matching CPython's mapping in
+            // typeobject.c type_get___annotate__.
+            if name == "__annotate__" || name == "__annotate_func__" {
+                if let Some(v) = lookup_in_type_where(obj, name) {
+                    return Ok(v);
+                }
+                let alt = if name == "__annotate__" {
+                    "__annotate_func__"
+                } else {
+                    "__annotate__"
+                };
+                if let Some(v) = lookup_in_type_where(obj, alt) {
+                    return Ok(v);
+                }
+                return Ok(w_none());
+            }
+            // `__abstractmethods__` is a descriptor on `type` that raises
+            // AttributeError when the slot is not populated, NOT a getter
+            // that returns None. abc.update_abstractmethods relies on
+            // hasattr() returning False to short-circuit non-ABCs.
+            if name == "__abstractmethods__" {
+                if let Some(v) = lookup_in_type_where(obj, name) {
+                    return Ok(v);
+                }
+                return Err(PyError::new(
+                    PyErrorKind::AttributeError,
+                    format!(
+                        "type object '{}' has no attribute '__abstractmethods__'",
+                        w_type_get_name(obj),
+                    ),
+                ));
+            }
             if name == "__doc__"
                 || name == "__module__"
-                || name == "__abstractmethods__"
                 || name == "__flags__"
                 || name == "__code__"
                 || name == "__func__"
                 || name == "__self__"
                 || name == "__wrapped__"
-                || name == "__annotations__"
                 || name == "__globals__"
                 || name == "__closure__"
                 || name == "__defaults__"

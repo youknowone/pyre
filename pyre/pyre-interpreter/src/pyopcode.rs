@@ -804,6 +804,17 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
         opcode_make_function(self).map_err(Into::into)
     }
 
+    /// `SETUP_ANNOTATIONS` — ensure the current locals namespace exposes
+    /// `__annotations__` as a dict for subsequent `STORE_SUBSCR` writes.
+    /// Default no-op so non-PyFrame handlers (e.g. trace recorder) can
+    /// ignore the opcode; PyFrame overrides this to do the actual work.
+    fn setup_annotations(&mut self) -> Result<(), Self::Error>
+    where
+        Self: SharedOpcodeHandler,
+    {
+        Ok(())
+    }
+
     fn call(&mut self, nargs: usize) -> Result<(), Self::Error>
     where
         Self: SharedOpcodeHandler,
@@ -1779,7 +1790,14 @@ where
         }
 
         // ── Misc ──
-        Instruction::SetupAnnotations => Ok(StepResult::Continue),
+        // SETUP_ANNOTATIONS: ensure that the current locals namespace has
+        // an `__annotations__` dict. The class body / module top-level
+        // emits this once before any annotated assignment so STORE_SUBSCR
+        // can populate it.
+        Instruction::SetupAnnotations => {
+            executor.setup_annotations()?;
+            Ok(StepResult::Continue)
+        }
         Instruction::LoadLocals => {
             executor.load_locals()?;
             Ok(StepResult::Continue)
