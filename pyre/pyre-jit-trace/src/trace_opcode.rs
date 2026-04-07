@@ -489,7 +489,14 @@ impl MIFrame {
             return Err(PyError::type_error("local index out of range in trace"));
         }
         if s.symbolic_locals[idx] == OpRef::NONE {
-            if let Some(base) = s.vable_array_base {
+            if s.bridge_local_oprefs.is_some() {
+                // Bridge trace: OpRef::NONE means this local is a constant
+                // or virtual from resume data, not a missing vable slot.
+                // Read from the concrete frame via array getitem.
+                let frame_ref = s.frame;
+                let idx_const = ctx.const_int(idx as i64);
+                s.symbolic_locals[idx] = trace_array_getitem_value(ctx, frame_ref, idx_const);
+            } else if let Some(base) = s.vable_array_base {
                 // Virtualizable: locals[idx] was loaded in the preamble
                 // and carried as a JUMP arg. OpRef(base + idx) references it.
                 s.symbolic_locals[idx] = OpRef(base + idx as u32);

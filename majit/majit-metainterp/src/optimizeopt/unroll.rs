@@ -485,7 +485,7 @@ impl UnrollOptimizer {
         let p2_ops =
             opt_p2.optimize_with_constants_and_inputs(&ops, &mut consts_p2, body_num_inputs);
         // Phase 2 may discover new constants via make_constant (e.g., guard
-        // class pointers from collect_use_box_guards OpRef(10600+) range).
+        // class pointers from collect_use_box_guards).
         // Merge back into consts_p2 so the backend can resolve them.
         if let Some(ref final_ctx) = opt_p2.final_ctx {
             for (idx, val) in final_ctx.constants.iter().enumerate() {
