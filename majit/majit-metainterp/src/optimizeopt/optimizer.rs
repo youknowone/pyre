@@ -934,7 +934,7 @@ impl Optimizer {
         for pass in &self.passes {
             knowledge
                 .loopinvariant_results
-                .extend(pass.export_loopinvariant_results());
+                .extend(pass.serialize_optrewrite());
         }
 
         knowledge
@@ -963,7 +963,7 @@ impl Optimizer {
         // bridgeopt.py:173-185: loopinvariant results -> OptRewrite
         if !knowledge.loopinvariant_results.is_empty() {
             for pass in &mut self.passes {
-                pass.import_loopinvariant_results(&knowledge.loopinvariant_results);
+                pass.deserialize_optrewrite(&knowledge.loopinvariant_results);
             }
         }
     }
@@ -1164,16 +1164,16 @@ impl Optimizer {
         resolved
     }
 
-    /// optimizer.py: force_box_for_end_of_preamble(box)
+    /// optimizer.py: force_at_the_end_of_preamble(box)
     ///
     /// The exported loop state should record the boxes that survive the end of
     /// the preamble after virtuals have been forced into a loop-carried shape.
-    pub fn force_box_for_end_of_preamble(&mut self, opref: OpRef, ctx: &mut OptContext) -> OpRef {
+    pub fn force_at_the_end_of_preamble(&mut self, opref: OpRef, ctx: &mut OptContext) -> OpRef {
         let mut rec = std::collections::HashSet::new();
-        self.force_box_for_end_of_preamble_rec(opref, ctx, &mut rec)
+        self.force_at_the_end_of_preamble_rec(opref, ctx, &mut rec)
     }
 
-    fn force_box_for_end_of_preamble_rec(
+    fn force_at_the_end_of_preamble_rec(
         &mut self,
         opref: OpRef,
         ctx: &mut OptContext,
@@ -1199,7 +1199,7 @@ impl Optimizer {
                 return resolved;
             }
             info.force_at_the_end_of_preamble(|child| {
-                self.force_box_for_end_of_preamble_rec(child, ctx, rec)
+                self.force_at_the_end_of_preamble_rec(child, ctx, rec)
             });
             ctx.set_ptr_info(resolved, info);
             return resolved;
@@ -1741,7 +1741,7 @@ impl Optimizer {
         self.exported_loop_state = jump.map(|jump| {
             // Use pre-JUMP virtual state captured before passes forced virtuals.
             // RPython unroll.py:457: get_virtual_state(end_args) — computed
-            // after force_box_for_end_of_preamble but before final JUMP emission.
+            // after force_at_the_end_of_preamble but before final JUMP emission.
             let (pre_vs, pre_args) = pre_jump_virtual_state.clone()
                 .unwrap_or_else(|| {
                     let args: Vec<OpRef> = jump.args.iter()
@@ -1800,11 +1800,11 @@ impl Optimizer {
             ctx.preamble_end_args = Some(
                 resolved_args
                     .iter()
-                    .map(|&arg| self.force_box_for_end_of_preamble(arg, &mut ctx))
+                    .map(|&arg| self.force_at_the_end_of_preamble(arg, &mut ctx))
                     .collect(),
             );
             // RPython parity: nested virtuals in output ops should be
-            // forced by force_box_for_end_of_preamble's recursive walk.
+            // forced by force_at_the_end_of_preamble's recursive walk.
             // Additional force is handled by the undefined-ref cleanup below
             // which drops ops referencing un-forced virtual OpRefs.
             // Virtual state was captured before JUMP went through passes.
@@ -1923,7 +1923,7 @@ impl Optimizer {
                 let resolved = ctx.get_box_replacement(opref);
                 if let Some(info) = ctx.get_ptr_info(resolved) {
                     if info.is_virtual() {
-                        self.force_box_for_end_of_preamble(resolved, &mut ctx);
+                        self.force_at_the_end_of_preamble(resolved, &mut ctx);
                     }
                 }
             }
@@ -2261,7 +2261,7 @@ impl Optimizer {
         });
 
         // RPython parity: export virtual state BEFORE flush() and
-        // force_box_for_end_of_preamble(). In RPython, get_virtual_state
+        // force_at_the_end_of_preamble(). In RPython, get_virtual_state
         // is called inside _jump_to_existing_trace on the original Box
         // objects whose PtrInfo reflects the pre-flush optimizer state.
         // flush() may force pending virtuals, changing their PtrInfo to
@@ -2271,16 +2271,16 @@ impl Optimizer {
 
         self.flush(&mut ctx);
 
-        // unroll.py:204-205: force_box_for_end_of_preamble for each jump arg
+        // unroll.py:204-205: force_at_the_end_of_preamble for each jump arg
         let saved_pass_idx = ctx.current_pass_idx;
         ctx.current_pass_idx = ctx.optearlyforce_idx;
         for &arg in &jump_args {
-            let _ = self.force_box_for_end_of_preamble(arg, &mut ctx);
+            let _ = self.force_at_the_end_of_preamble(arg, &mut ctx);
         }
         ctx.current_pass_idx = saved_pass_idx;
 
         // RPython parity: jump_op.getarglist() returns the ORIGINAL Boxes.
-        // force_box_for_end_of_preamble recurses into virtual fields but
+        // force_at_the_end_of_preamble recurses into virtual fields but
         // does NOT force the top-level virtuals. So get_virtual_state on
         // the original args still sees Virtual PtrInfo.
         // DO NOT resolve jump_args here — pass originals so virtual_state
@@ -3725,7 +3725,7 @@ mod tests {
     }
 
     #[test]
-    fn test_force_box_for_end_of_preamble_recurses_virtual_fields() {
+    fn test_force_at_the_end_of_preamble_recurses_virtual_fields() {
         use crate::optimizeopt::info::{PtrInfo, VirtualStructInfo};
 
         let descr = make_size_descr(16);
@@ -3751,7 +3751,7 @@ mod tests {
         );
 
         let mut opt = Optimizer::new();
-        let result = opt.force_box_for_end_of_preamble(OpRef(10), &mut ctx);
+        let result = opt.force_at_the_end_of_preamble(OpRef(10), &mut ctx);
 
         // The virtual is forced to a concrete allocation; the returned ref
         // is the allocation's position, which ctx.get_box_replacement(OpRef(10))

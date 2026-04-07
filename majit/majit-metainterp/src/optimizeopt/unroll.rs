@@ -1627,7 +1627,7 @@ impl OptUnroll {
         ctx: &OptContext,
         exported_int_bounds: Option<&HashMap<OpRef, crate::optimizeopt::intutils::IntBound>>,
     ) -> ExportedState {
-        // unroll.py:454: end_args = [force_box_for_end_of_preamble(a) ...]
+        // unroll.py:454: end_args = [force_at_the_end_of_preamble(a) ...]
         let end_args: Vec<OpRef> = ctx.preamble_end_args.clone().unwrap_or_else(|| {
             original_label_args
                 .iter()
@@ -1798,7 +1798,7 @@ impl OptUnroll {
     }
 
     /// Like jump_to_existing_trace, but with an optional pre-computed
-    /// virtual_state. Used by optimize_bridge where force_box_for_end_of_preamble
+    /// virtual_state. Used by optimize_bridge where force_at_the_end_of_preamble
     /// may change forwarding chains after the virtual state was exported.
     pub fn jump_to_existing_trace_with_vs(
         &self,

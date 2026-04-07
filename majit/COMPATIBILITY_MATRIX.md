@@ -35,16 +35,16 @@ Tracks equivalence between majit (Rust, 81k LOC) and the in-tree RPython JIT sou
 | pure.rs | pure.py | 1,502 | 95% | — |
 | simplify.rs | simplify.py | 242 | 95% | — |
 | unroll.rs | unroll.py | 3,461 | 95% | ~~inline_short_preamble~~ 추가됨 |
-| optimizer.rs | optimizer.py | 1,863 | 90% | guard sharing |
+| optimizer.rs | optimizer.py | 1,863 | 95% | ~~guard sharing~~ ~~_maybe_replace_guard_value~~ 추가됨 |
 | virtualstate.rs | virtualstate.py | 1,683 | 90% | — |
 | shortpreamble.rs | shortpreamble.py | 1,980 | 90% | ~~CompoundOp~~ 추가됨 |
 | info.rs | info.py | 1,214 | 85% | — |
 | descr.rs | effectinfo.py | 1,500 | 85% | bitstring optimization |
-| rewrite.rs | rewrite.py | 3,546 | 90% | ~~INT_PY_DIV~~ ~~oois_ooisnot~~ ~~replace_old_guard_with_guard_value~~ 추가됨. CALL_N arraycopy unroll 남음 |
+| rewrite.rs | rewrite.py | 3,546 | 95% | ~~INT_PY_DIV~~ ~~oois_ooisnot~~ ~~replace_old_guard_with_guard_value~~ ~~CALL_N arraycopy~~ 추가됨. try_boolinvers 분리, serialize/deserialize 이름 parity. ~~optimize_float_abs~~ 메서드 추출 |
 | virtualize.rs | virtualize.py | 3,986 | 80% | ~~COND_CALL, JIT_FORCE_VIRTUAL~~ 추가됨 |
 | heap.rs | heap.py | 3,592 | 85% | ~~pendingfields, DICT_LOOKUP, serialization, variable-index, aliasing~~ 추가됨. clean_caches 정제 남음 |
-| vstring.rs | vstring.py | 1,298 | 70% | ~~STR_CONCAT, copy_str_content~~ 추가됨 |
-| bridgeopt.rs | bridgeopt.py | 829 | 60% | — |
+| vstring.rs | vstring.py | 1,298 | 80% | ~~STR_CONCAT, copy_str_content~~ 추가됨. ~~메서드 이름 parity~~ (strgetitem, getstrlen, int_add/int_sub, force_box, handle_str_equal_level1, opt_call_stroruni_* 분리). handle_str_equal_level2, generate_modified_call 남음 |
+| bridgeopt.rs | bridgeopt.py | 829 | 95% | serialize/deserialize/tag_box/decode_box 모두 구현됨 |
 | guard.rs | guard.py | 931 | 85% | ~~implies~~ ~~transitive_imply~~ ~~eliminate_array_bound_checks~~ 추가됨. IndexVar 연동 |
 | vector.rs | vector.py | 917 | 55% | loop unrolling |
 | dependency.rs | dependency.py | 233 | — | vector.rs에서 분리 |
@@ -114,13 +114,14 @@ Tracks equivalence between majit (Rust, 81k LOC) and the in-tree RPython JIT sou
 - Missing: diagnostic logging (log_inputargs/log_op/log_result), print_rewrite_rule_statistics
 - Note: 이들은 디버깅 전용이며 최적화 정확성에 영향 없음
 
-**rewrite.rs** (85%)
-- Implemented: `_optimize_oois_ooisnot()` (virtual/null/class 기반 포인터 비교 — PtrEq/PtrNe/InstancePtrEq/InstancePtrNe)
-- Implemented: `_optimize_nullness()` (null/nonnull 기반 결과 상수화)
-- Implemented: postprocess inline — GUARD_NONNULL(set nonnull), GUARD_ISNULL(make null), GUARD_CLASS(set known_class), GUARD_VALUE(make constant)
-- Missing: `replace_old_guard_with_guard_value()` (기존 가드를 GUARD_VALUE로 교체)
-- Missing: `optimize_CALL_N()` arraycopy/arraymove dispatch
-- Missing: `serialize_optrewrite()` / `deserialize_optrewrite()` (bridgeopt loop-invariant 직렬화)
+**rewrite.rs** (95%)
+- Implemented: `_optimize_oois_ooisnot()`, `_optimize_nullness()`, postprocess inline
+- Implemented: `replace_old_guard_with_guard_value()` (기존 가드를 GUARD_VALUE로 교체)
+- Implemented: `optimize_CALL_N()` arraycopy/arraymove dispatch
+- Implemented: `serialize_optrewrite()` / `deserialize_optrewrite()` (bridgeopt loop-invariant 직렬화)
+- Implemented: `try_boolinvers()` 별도 메서드 추출 (rewrite.py:56-66 parity)
+- Implemented: `find_rewritable_bool()` 3단계: inverse + reflex + inverse·reflex (rewrite.py:85-91)
+- Implemented: `optimize_float_abs()` 별도 메서드 추출 (rewrite.py:155-161)
 - Note: GUARD_SUBCLASS/IS_OBJECT/NONNULL/CLASS, COND_CALL, INT_PY_DIV는 propagate_forward match arm으로 구현됨
 
 **heap.rs** (85%)

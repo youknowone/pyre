@@ -1342,6 +1342,130 @@ mod tests {
     }
 
     #[test]
+    fn test_call_loopinvariant_cse() {
+        // Two identical CALL_LOOPINVARIANT_I calls → second eliminated.
+        let mut ops = vec![
+            Op::new(OpCode::CallLoopinvariantI, &[OpRef(100), OpRef(101)]),
+            Op::new(OpCode::CallLoopinvariantI, &[OpRef(100), OpRef(101)]),
+        ];
+        assign_positions(&mut ops);
+
+        let mut constants = std::collections::HashMap::new();
+        constants.insert(100, 0xCAFE_i64); // func pointer must be a known constant
+        let mut opt = Optimizer::new();
+        opt.add_pass(Box::new(crate::optimizeopt::rewrite::OptRewrite::new()));
+        opt.add_pass(Box::new(OptPure::new()));
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
+
+        // Only the first call should remain, demoted to CallI.
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].opcode, OpCode::CallI);
+    }
+
+    #[test]
+    fn test_call_loopinvariant_different_args() {
+        // CALL_LOOPINVARIANT_I with different args → both kept.
+        let mut ops = vec![
+            Op::new(OpCode::CallLoopinvariantI, &[OpRef(100), OpRef(101)]),
+            Op::new(OpCode::CallLoopinvariantI, &[OpRef(100), OpRef(102)]),
+        ];
+        assign_positions(&mut ops);
+
+        let mut opt = Optimizer::new();
+        opt.add_pass(Box::new(crate::optimizeopt::rewrite::OptRewrite::new()));
+        opt.add_pass(Box::new(OptPure::new()));
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut std::collections::HashMap::new(),
+            1024,
+        );
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].opcode, OpCode::CallI);
+        assert_eq!(result[1].opcode, OpCode::CallI);
+    }
+
+    #[test]
+    fn test_call_loopinvariant_all_types() {
+        for (loopinv_op, expected_op) in [
+            (OpCode::CallLoopinvariantI, OpCode::CallI),
+            (OpCode::CallLoopinvariantR, OpCode::CallR),
+            (OpCode::CallLoopinvariantF, OpCode::CallF),
+            (OpCode::CallLoopinvariantN, OpCode::CallN),
+        ] {
+            let mut ops = vec![Op::new(loopinv_op, &[OpRef(0)])];
+            assign_positions(&mut ops);
+
+            let mut opt = Optimizer::new();
+            opt.add_pass(Box::new(crate::optimizeopt::rewrite::OptRewrite::new()));
+            opt.add_pass(Box::new(OptPure::new()));
+            let result = opt.optimize_with_constants_and_inputs(
+                &ops,
+                &mut std::collections::HashMap::new(),
+                1024,
+            );
+
+            assert_eq!(result.len(), 1);
+            assert_eq!(result[0].opcode, expected_op);
+        }
+    }
+
+    #[test]
+    fn test_call_loopinvariant_no_eviction() {
+        // Unlike pure CSE (LRU limit 16), loop-invariant cache has no eviction.
+        // Create 20 unique calls, then re-check the first one.
+        let mut ops = Vec::new();
+        for i in 0..20u32 {
+            ops.push(Op::new(
+                OpCode::CallLoopinvariantI,
+                &[OpRef(i + 100), OpRef(200)],
+            ));
+        }
+        // Re-insert call #0: same args as ops[0]
+        ops.push(Op::new(
+            OpCode::CallLoopinvariantI,
+            &[OpRef(100), OpRef(200)],
+        ));
+        assign_positions(&mut ops);
+
+        // Each func pointer must be a known constant for OptRewrite CSE.
+        let mut constants = std::collections::HashMap::new();
+        for i in 0..20u32 {
+            constants.insert(i + 100, (i + 100) as i64);
+        }
+        let mut opt = Optimizer::new();
+        opt.add_pass(Box::new(crate::optimizeopt::rewrite::OptRewrite::new()));
+        opt.add_pass(Box::new(OptPure::new()));
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
+
+        // 20 unique calls + the duplicate (#0) should be eliminated → 20 total
+        assert_eq!(result.len(), 20);
+    }
+
+    #[test]
+    fn test_call_loopinvariant_mixed_with_pure() {
+        // Loop-invariant and pure CSE should coexist.
+        let mut ops = vec![
+            Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)]), // pure
+            Op::new(OpCode::CallLoopinvariantI, &[OpRef(200), OpRef(201)]), // loopinvariant
+            Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)]), // pure dup → removed
+            Op::new(OpCode::CallLoopinvariantI, &[OpRef(200), OpRef(201)]), // loopinvariant dup → removed
+        ];
+        assign_positions(&mut ops);
+
+        let mut constants = std::collections::HashMap::new();
+        constants.insert(200, 0xBEEF_i64); // func pointer must be a known constant
+        let mut opt = Optimizer::new();
+        opt.add_pass(Box::new(crate::optimizeopt::rewrite::OptRewrite::new()));
+        opt.add_pass(Box::new(OptPure::new()));
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].opcode, OpCode::IntAdd);
+        assert_eq!(result[1].opcode, OpCode::CallI);
+    }
+
+    #[test]
     fn test_constant_fold_int_add() {
         // IntAdd(const(3), const(4)) → eliminated, result = const(7)
         let mut ops = vec![
@@ -1754,6 +1878,57 @@ mod tests {
             crate::optimizeopt::shortpreamble::PreambleOpKind::Pure
         ));
         assert_eq!(collected[0].1.preamble_op.opcode, OpCode::CallPureI);
+    }
+
+    #[test]
+    fn test_short_preamble_collects_loopinvariant_candidate() {
+        let mut rewrite = crate::optimizeopt::rewrite::OptRewrite::new();
+        let mut pass = OptPure::new();
+        let mut ctx = OptContext::with_num_inputs(6, 0);
+        // func pointer arg must be a known constant for OptRewrite tracking
+        ctx.seed_constant(OpRef(100), majit_ir::Value::Int(0xCAFE));
+        rewrite.setup();
+        pass.setup();
+
+        let mut op = Op::new(OpCode::CallLoopinvariantI, &[OpRef(100), OpRef(0)]);
+        op.pos = OpRef(2);
+        op.descr = Some(majit_ir::descr::make_call_descr(
+            vec![majit_ir::Type::Int, majit_ir::Type::Int],
+            majit_ir::Type::Int,
+            majit_ir::EffectInfo::elidable(),
+        ));
+        // OptRewrite demotes CallLoopinvariantI → CallI
+        let rewrite_result = rewrite.propagate_forward(&op, &mut ctx);
+        let demoted = match rewrite_result {
+            OptimizationResult::Emit(emitted) => emitted,
+            other => panic!("expected OptRewrite to emit demoted call, got {other:?}"),
+        };
+        assert_eq!(demoted.opcode, OpCode::CallI);
+        // OptPure sees the demoted CallI
+        let result = pass.propagate_forward(&demoted, &mut ctx);
+        match result {
+            OptimizationResult::Emit(emitted) => assert_eq!(emitted.opcode, OpCode::CallI),
+            OptimizationResult::PassOn => {} // PassOn is also acceptable
+            other => panic!("expected emitted or pass-on from OptPure, got {other:?}"),
+        }
+
+        // OptRewrite tracks loopinvariant for short preamble collection
+        let mut sb = crate::optimizeopt::shortpreamble::ShortBoxes::with_label_args(&[
+            OpRef(0),
+            OpRef(2),
+            OpRef(100),
+        ]);
+        rewrite.produce_potential_short_preamble_ops(&mut sb, &ctx);
+        let collected = sb.produced_ops();
+        assert_eq!(collected.len(), 1);
+        assert!(matches!(
+            collected[0].1.kind,
+            crate::optimizeopt::shortpreamble::PreambleOpKind::LoopInvariant
+        ));
+        assert_eq!(
+            collected[0].1.preamble_op.opcode,
+            OpCode::CallLoopinvariantI
+        );
     }
 
     #[test]

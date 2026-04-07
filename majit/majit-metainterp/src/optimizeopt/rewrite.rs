@@ -2115,6 +2115,29 @@ impl OptRewrite {
     /// rewrite.py: find_rewritable_bool(op)
     /// If we see INT_LT(a, b) and previously computed INT_GE(a, b) = K,
     /// then INT_LT(a, b) = 1 - K (boolean inverse).
+    /// rewrite.py:56-66 try_boolinvers — check if the inverse operation has
+    /// a cached boolean result and negate it.
+    fn try_boolinvers(
+        &self,
+        op: &Op,
+        inverse_opcode: OpCode,
+        arg0: OpRef,
+        arg1: OpRef,
+        ctx: &mut OptContext,
+    ) -> Option<OptimizationResult> {
+        let key = (inverse_opcode, arg0, arg1);
+        let &cached_ref = self.bool_result_cache.get(&key)?;
+        let val = ctx.get_constant_int(cached_ref)?;
+        // Inverse of a known boolean: 1 - val
+        let result = 1 - val;
+        ctx.make_constant(op.pos, Value::Int(result));
+        Some(OptimizationResult::Remove)
+    }
+
+    /// rewrite.py:68-93 find_rewritable_bool — three-phase boolean rewrite:
+    /// 1. boolinverse(same args)
+    /// 2. boolreflex(swapped args)
+    /// 3. boolreflex.boolinverse(swapped args)
     fn find_rewritable_bool(&self, op: &Op, ctx: &mut OptContext) -> Option<OptimizationResult> {
         if op.num_args() < 2 {
             return None;
@@ -2122,26 +2145,26 @@ impl OptRewrite {
         let arg0 = op.arg(0);
         let arg1 = op.arg(1);
 
-        // Check inverse: INT_LT ↔ INT_GE, INT_LE ↔ INT_GT, etc.
+        // rewrite.py:72-75: boolinverse(arg0, arg1)
         if let Some(inverse_opcode) = op.opcode.bool_inverse() {
-            let key = (inverse_opcode, arg0, arg1);
-            if let Some(&cached_ref) = self.bool_result_cache.get(&key) {
-                if let Some(val) = ctx.get_constant_int(cached_ref) {
-                    // Inverse of a known boolean: 1 - val
-                    let result = 1 - val;
-                    ctx.make_constant(op.pos, Value::Int(result));
-                    return Some(OptimizationResult::Remove);
-                }
+            if let Some(result) = self.try_boolinvers(op, inverse_opcode, arg0, arg1, ctx) {
+                return Some(result);
             }
         }
 
-        // Check reflex: INT_LT(a,b) = INT_GT(b,a)
+        // rewrite.py:77-83: boolreflex(arg1, arg0)
         if let Some(reflex_opcode) = op.opcode.bool_reflex() {
             let key = (reflex_opcode, arg1, arg0);
             if let Some(&cached_ref) = self.bool_result_cache.get(&key) {
-                // Same result, just swapped args.
                 ctx.replace_op(op.pos, cached_ref);
                 return Some(OptimizationResult::Remove);
+            }
+
+            // rewrite.py:87-91: boolreflex.boolinverse(arg1, arg0)
+            if let Some(reflex_inverse) = reflex_opcode.bool_inverse() {
+                if let Some(result) = self.try_boolinvers(op, reflex_inverse, arg1, arg0, ctx) {
+                    return Some(result);
+                }
             }
         }
 
@@ -2330,6 +2353,27 @@ impl OptRewrite {
             if inner_op.opcode == OpCode::FloatNeg {
                 let inner_arg = inner_op.arg(0);
                 ctx.replace_op(op.pos, inner_arg);
+                return OptimizationResult::Remove;
+            }
+        }
+
+        OptimizationResult::PassOn
+    }
+
+    /// rewrite.py:155-161 optimize_FLOAT_ABS — idempotent: ABS(ABS(x)) → ABS(x).
+    fn optimize_float_abs(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+        let arg0 = op.arg(0);
+
+        if let Some(a) = ctx.get_constant_float(arg0) {
+            ctx.make_constant(op.pos, Value::Float(a.abs()));
+            return OptimizationResult::Remove;
+        }
+
+        // rewrite.py:157-160: FLOAT_ABS(FLOAT_ABS(x)) → FLOAT_ABS(x)
+        let v = ctx.get_box_replacement(arg0);
+        if let Some(arg_op) = ctx.get_producing_op(v) {
+            if arg_op.opcode == OpCode::FloatAbs {
+                ctx.replace_op(op.pos, v);
                 return OptimizationResult::Remove;
             }
         }
@@ -2536,23 +2580,7 @@ impl Optimization for OptRewrite {
             OpCode::FloatMul => self.optimize_float_mul(op, ctx),
             OpCode::FloatTrueDiv => self.optimize_float_truediv(op, ctx),
             OpCode::FloatNeg => self.optimize_float_neg(op, ctx),
-            // rewrite.py: optimize_FLOAT_ABS — FLOAT_ABS(FLOAT_ABS(x)) → FLOAT_ABS(x)
-            OpCode::FloatAbs => {
-                // rewrite.py:155-161: optimize_FLOAT_ABS
-                // FLOAT_ABS(FLOAT_ABS(x)) → FLOAT_ABS(x)
-                let v = ctx.get_box_replacement(op.arg(0));
-                if let Some(arg_op) = ctx.get_producing_op(v) {
-                    if arg_op.opcode == OpCode::FloatAbs {
-                        ctx.replace_op(op.pos, v);
-                        return OptimizationResult::Remove;
-                    }
-                }
-                if let Some(fv) = ctx.get_constant_float(op.arg(0)) {
-                    ctx.make_constant(op.pos, Value::Float(fv.abs()));
-                    return OptimizationResult::Remove;
-                }
-                OptimizationResult::PassOn
-            }
+            OpCode::FloatAbs => self.optimize_float_abs(op, ctx),
             OpCode::FloatFloorDiv => self.optimize_float_floordiv(op, ctx),
             OpCode::FloatMod => self.optimize_float_mod(op, ctx),
 
@@ -2893,8 +2921,8 @@ impl Optimization for OptRewrite {
         }
     }
 
-    /// rewrite.py: serialize_optrewrite — export loopinvariant results.
-    fn export_loopinvariant_results(&self) -> Vec<(i64, OpRef)> {
+    /// rewrite.py:828-834 serialize_optrewrite
+    fn serialize_optrewrite(&self) -> Vec<(i64, OpRef)> {
         self.loop_invariant_results
             .iter()
             .filter_map(|(&func_ptr, entry)| match entry {
@@ -2904,8 +2932,8 @@ impl Optimization for OptRewrite {
             .collect()
     }
 
-    /// rewrite.py: deserialize_optrewrite — import loopinvariant results.
-    fn import_loopinvariant_results(&mut self, entries: &[(i64, OpRef)]) {
+    /// rewrite.py:836-838 deserialize_optrewrite
+    fn deserialize_optrewrite(&mut self, entries: &[(i64, OpRef)]) {
         for &(func_ptr, result) in entries {
             self.loop_invariant_results
                 .insert(func_ptr, LoopInvariantEntry::Direct(result));
@@ -2987,9 +3015,9 @@ mod tests {
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(3);
-        ctx.make_constant(OpRef(const_pos as u32), Value::Int(const_val));
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
+        ctx.make_constant(OpRef(const_pos as u32), Value::Int(const_val));
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
         assert!(
@@ -3012,10 +3040,10 @@ mod tests {
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(3);
-        ctx.make_constant(OpRef(0), Value::Int(a));
-        ctx.make_constant(OpRef(1), Value::Int(b));
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
+        ctx.make_constant(OpRef(0), Value::Int(a));
+        ctx.make_constant(OpRef(1), Value::Int(b));
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
         assert!(
@@ -3103,9 +3131,9 @@ mod tests {
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(3);
-        ctx.make_constant(OpRef(1), Value::Int(0));
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
+        ctx.make_constant(OpRef(1), Value::Int(0));
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
@@ -3127,9 +3155,9 @@ mod tests {
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(3);
-        ctx.make_constant(OpRef(1), Value::Int(8));
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
+        ctx.make_constant(OpRef(1), Value::Int(8));
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
         match result {
@@ -3152,9 +3180,9 @@ mod tests {
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(3);
-        ctx.make_constant(OpRef(0), Value::Int(0));
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
+        ctx.make_constant(OpRef(0), Value::Int(0));
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
@@ -3176,9 +3204,9 @@ mod tests {
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(3);
-        ctx.make_constant(OpRef(1), Value::Int(1));
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
+        ctx.make_constant(OpRef(1), Value::Int(1));
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
@@ -3222,8 +3250,8 @@ mod tests {
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(2);
-        ctx.make_constant(OpRef(0), Value::Int(42));
         ctx.emit(ops[0].clone());
+        ctx.make_constant(OpRef(0), Value::Int(42));
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[1], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
@@ -3236,8 +3264,8 @@ mod tests {
         ];
         with_positions(&mut ops2);
         let mut ctx2 = OptContext::new(2);
-        ctx2.make_constant(OpRef(0), Value::Int(0xFF));
         ctx2.emit(ops2[0].clone());
+        ctx2.make_constant(OpRef(0), Value::Int(0xFF));
         let result2 = pass.propagate_forward(&ops2[1], &mut ctx2);
         assert!(matches!(result2, OptimizationResult::Remove));
         assert_eq!(ctx2.get_constant_int(OpRef(1)), Some(!0xFF));
@@ -3253,8 +3281,8 @@ mod tests {
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(2);
-        ctx.make_constant(OpRef(0), Value::Int(0));
         ctx.emit(ops[0].clone());
+        ctx.make_constant(OpRef(0), Value::Int(0));
         let result = pass.propagate_forward(&ops[1], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_constant_int(OpRef(1)), Some(1));
@@ -3266,8 +3294,8 @@ mod tests {
         ];
         with_positions(&mut ops2);
         let mut ctx2 = OptContext::new(2);
-        ctx2.make_constant(OpRef(0), Value::Int(5));
         ctx2.emit(ops2[0].clone());
+        ctx2.make_constant(OpRef(0), Value::Int(5));
         let result2 = pass.propagate_forward(&ops2[1], &mut ctx2);
         assert!(matches!(result2, OptimizationResult::Remove));
         assert_eq!(ctx2.get_constant_int(OpRef(1)), Some(0));
@@ -3292,8 +3320,8 @@ mod tests {
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(2);
-        ctx.make_constant(OpRef(0), Value::Int(1));
         ctx.emit(ops[0].clone());
+        ctx.make_constant(OpRef(0), Value::Int(1));
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[1], &mut ctx);
@@ -3308,8 +3336,8 @@ mod tests {
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(2);
-        ctx.make_constant(OpRef(0), Value::Int(0));
         ctx.emit(ops[0].clone());
+        ctx.make_constant(OpRef(0), Value::Int(0));
 
         let mut pass = OptRewrite::new();
         let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -3342,8 +3370,8 @@ mod tests {
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(2);
-        ctx.make_constant(OpRef(0), Value::Int(0));
         ctx.emit(ops[0].clone());
+        ctx.make_constant(OpRef(0), Value::Int(0));
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[1], &mut ctx);
@@ -3358,8 +3386,8 @@ mod tests {
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(2);
-        ctx.make_constant(OpRef(0), Value::Int(1));
         ctx.emit(ops[0].clone());
+        ctx.make_constant(OpRef(0), Value::Int(1));
 
         let mut pass = OptRewrite::new();
         let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -3378,10 +3406,10 @@ mod tests {
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(3);
-        ctx.make_constant(OpRef(0), Value::Int(42));
-        ctx.make_constant(OpRef(1), Value::Int(42));
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
+        ctx.make_constant(OpRef(0), Value::Int(42));
+        ctx.make_constant(OpRef(1), Value::Int(42));
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
@@ -3426,12 +3454,11 @@ mod tests {
         // inject constants. Since we're testing through the optimizer,
         // let's test the pass directly instead.
         let mut ctx = OptContext::new(3);
-        ctx.make_constant(OpRef(1), Value::Int(0));
 
         let mut pass = OptRewrite::new();
 
         // Simulate the optimizer loop
-        for op in &ops {
+        for (i, op) in ops.iter().enumerate() {
             let mut resolved = op.clone();
             for arg in &mut resolved.args {
                 *arg = ctx.get_box_replacement(*arg);
@@ -3452,6 +3479,10 @@ mod tests {
                         "guard proven to always fail",
                     ));
                 }
+            }
+            // Set op1 as constant 0 after it has been emitted
+            if i == 1 {
+                ctx.make_constant(OpRef(1), Value::Int(0));
             }
         }
 
@@ -3516,10 +3547,10 @@ mod tests {
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(3);
-        ctx.make_constant(OpRef(0), Value::Int(i64::MAX));
-        ctx.make_constant(OpRef(1), Value::Int(1));
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
+        ctx.make_constant(OpRef(0), Value::Int(i64::MAX));
+        ctx.make_constant(OpRef(1), Value::Int(1));
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
@@ -3538,9 +3569,9 @@ mod tests {
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(3);
-        ctx.make_constant(OpRef(0), Value::Int(0));
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
+        ctx.make_constant(OpRef(0), Value::Int(0));
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
@@ -3557,9 +3588,9 @@ mod tests {
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(3);
-        ctx.make_constant(OpRef(0), Value::Int(0));
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
+        ctx.make_constant(OpRef(0), Value::Int(0));
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
@@ -3608,10 +3639,10 @@ mod tests {
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(3);
-        ctx.make_constant(OpRef(0), Value::Int(0xFF));
-        ctx.make_constant(OpRef(1), Value::Int(0x0F));
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
+        ctx.make_constant(OpRef(0), Value::Int(0xFF));
+        ctx.make_constant(OpRef(1), Value::Int(0x0F));
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
@@ -3630,10 +3661,10 @@ mod tests {
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(3);
-        ctx.make_constant(OpRef(0), Value::Int(0xF0));
-        ctx.make_constant(OpRef(1), Value::Int(0x0F));
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
+        ctx.make_constant(OpRef(0), Value::Int(0xF0));
+        ctx.make_constant(OpRef(1), Value::Int(0x0F));
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
@@ -3652,9 +3683,9 @@ mod tests {
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(3);
-        ctx.make_constant(OpRef(1), Value::Int(0));
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
+        ctx.make_constant(OpRef(1), Value::Int(0));
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
@@ -3671,10 +3702,10 @@ mod tests {
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(3);
-        ctx.make_constant(OpRef(0), Value::Int(-1)); // all ones
-        ctx.make_constant(OpRef(1), Value::Int(1));
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
+        ctx.make_constant(OpRef(0), Value::Int(-1)); // all ones
+        ctx.make_constant(OpRef(1), Value::Int(1));
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
@@ -3694,9 +3725,9 @@ mod tests {
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(3);
-        ctx.make_constant(OpRef(1), Value::Float(0.0));
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
+        ctx.make_constant(OpRef(1), Value::Float(0.0));
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
@@ -3713,9 +3744,9 @@ mod tests {
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(3);
-        ctx.make_constant(OpRef(0), Value::Float(0.0));
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
+        ctx.make_constant(OpRef(0), Value::Float(0.0));
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
@@ -3732,10 +3763,10 @@ mod tests {
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(3);
-        ctx.make_constant(OpRef(0), Value::Float(1.5));
-        ctx.make_constant(OpRef(1), Value::Float(2.5));
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
+        ctx.make_constant(OpRef(0), Value::Float(1.5));
+        ctx.make_constant(OpRef(1), Value::Float(2.5));
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
@@ -3752,9 +3783,9 @@ mod tests {
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(3);
-        ctx.make_constant(OpRef(1), Value::Float(0.0));
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
+        ctx.make_constant(OpRef(1), Value::Float(0.0));
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
@@ -3771,10 +3802,10 @@ mod tests {
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(3);
-        ctx.make_constant(OpRef(0), Value::Float(5.0));
-        ctx.make_constant(OpRef(1), Value::Float(3.0));
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
+        ctx.make_constant(OpRef(0), Value::Float(5.0));
+        ctx.make_constant(OpRef(1), Value::Float(3.0));
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
@@ -3791,9 +3822,9 @@ mod tests {
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(3);
-        ctx.make_constant(OpRef(1), Value::Float(1.0));
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
+        ctx.make_constant(OpRef(1), Value::Float(1.0));
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
@@ -3810,9 +3841,9 @@ mod tests {
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(3);
-        ctx.make_constant(OpRef(0), Value::Float(1.0));
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
+        ctx.make_constant(OpRef(0), Value::Float(1.0));
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
@@ -3829,10 +3860,10 @@ mod tests {
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(3);
-        ctx.make_constant(OpRef(0), Value::Float(3.0));
-        ctx.make_constant(OpRef(1), Value::Float(4.0));
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
+        ctx.make_constant(OpRef(0), Value::Float(3.0));
+        ctx.make_constant(OpRef(1), Value::Float(4.0));
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
@@ -3849,9 +3880,9 @@ mod tests {
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(3);
-        ctx.make_constant(OpRef(1), Value::Float(1.0));
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
+        ctx.make_constant(OpRef(1), Value::Float(1.0));
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
@@ -3868,10 +3899,10 @@ mod tests {
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(3);
-        ctx.make_constant(OpRef(0), Value::Float(10.0));
-        ctx.make_constant(OpRef(1), Value::Float(2.0));
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
+        ctx.make_constant(OpRef(0), Value::Float(10.0));
+        ctx.make_constant(OpRef(1), Value::Float(2.0));
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
@@ -3887,8 +3918,8 @@ mod tests {
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(2);
-        ctx.make_constant(OpRef(0), Value::Float(3.14));
         ctx.emit(ops[0].clone());
+        ctx.make_constant(OpRef(0), Value::Float(3.14));
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[1], &mut ctx);
@@ -3929,10 +3960,10 @@ mod tests {
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(3);
-        ctx.make_constant(OpRef(0), Value::Float(7.0));
-        ctx.make_constant(OpRef(1), Value::Float(2.0));
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
+        ctx.make_constant(OpRef(0), Value::Float(7.0));
+        ctx.make_constant(OpRef(1), Value::Float(2.0));
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
@@ -3949,10 +3980,10 @@ mod tests {
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(3);
-        ctx.make_constant(OpRef(0), Value::Float(7.0));
-        ctx.make_constant(OpRef(1), Value::Float(3.0));
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
+        ctx.make_constant(OpRef(0), Value::Float(7.0));
+        ctx.make_constant(OpRef(1), Value::Float(3.0));
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
@@ -3990,10 +4021,10 @@ mod tests {
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(4);
-        ctx.make_constant(OpRef(0), Value::Int(0));
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
         ctx.emit(ops[2].clone());
+        ctx.make_constant(OpRef(0), Value::Int(0));
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[3], &mut ctx);
@@ -4011,10 +4042,10 @@ mod tests {
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(4);
-        ctx.make_constant(OpRef(0), Value::Int(1));
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
         ctx.emit(ops[2].clone());
+        ctx.make_constant(OpRef(0), Value::Int(1));
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[3], &mut ctx);
@@ -4043,10 +4074,10 @@ mod tests {
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(4);
-        ctx.make_constant(OpRef(0), Value::Int(42));
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
         ctx.emit(ops[2].clone());
+        ctx.make_constant(OpRef(0), Value::Int(42));
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[3], &mut ctx);
@@ -4065,10 +4096,10 @@ mod tests {
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(4);
-        ctx.make_constant(OpRef(0), Value::Int(0));
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
         ctx.emit(ops[2].clone());
+        ctx.make_constant(OpRef(0), Value::Int(0));
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[3], &mut ctx);
@@ -4163,10 +4194,10 @@ mod tests {
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(3);
-        ctx.make_constant(OpRef(0), Value::Ref(GcRef(100)));
-        ctx.make_constant(OpRef(1), Value::Ref(GcRef(200)));
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
+        ctx.make_constant(OpRef(0), Value::Ref(GcRef(100)));
+        ctx.make_constant(OpRef(1), Value::Ref(GcRef(200)));
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
@@ -4274,9 +4305,9 @@ mod tests {
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(4);
-        ctx.make_constant(OpRef(0), Value::Int(0));
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
+        ctx.make_constant(OpRef(0), Value::Int(0));
 
         let mut pass = OptRewrite::new();
         // Process CondCallN -> removed
