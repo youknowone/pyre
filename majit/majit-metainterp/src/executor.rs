@@ -379,33 +379,40 @@ pub(crate) fn execute_one(
             }
         }
         OpCode::GuardSubclass => {
-            // rclass.py:1133-1140 ll_issubclass + opimpl.py:235-239
-            // op_int_between (`a <= b < c`):
-            //     return llop.int_between(Bool,
-            //                             cls.subclassrange_min,
-            //                             subcls.subclassrange_min,
-            //                             cls.subclassrange_max)
+            // llgraph/runner.py:1271-1281 execute_guard_subclass parity:
             //
-            // x86/assembler.py:1975-1979 lowers the same predicate as
-            // an unsigned `(tmp - min) < (max - min)` compare; the
-            // cranelift / wasm backends already follow that pattern
-            // (`majit-backend-cranelift/src/compiler.rs:6439-6448`,
-            // `majit-backend-wasm/src/codegen.rs:978`). The executor
-            // path must use the same exclusive upper bound — note
-            // that `llgraph/runner.py:1271-1281`'s inclusive `<=` is a
-            // long-standing inconsistency in the testing fallback,
-            // not the assembler / rtyper contract.
+            //     value = lltype.cast_opaque_ptr(rclass.OBJECTPTR, arg)
+            //     expected_class = ...
+            //     if (expected_class.subclassrange_min
+            //             <= value.typeptr.subclassrange_min
+            //             <= expected_class.subclassrange_max):
+            //         pass
+            //     else:
+            //         self.fail_guard(descr)
             //
-            // The object side reads its typeid through `get_actual_typeid`
-            // (which handles both the managed GC header and pyre's
-            // foreign PyObject seam) and resolves the preorder lower
-            // bound via `typeid_subclass_range`. The expected class
-            // side looks up its bounds through `subclass_range`,
-            // which translates the constant vtable pointer embedded
-            // in the guard arg. Unresolved entries fall through to
-            // `executor.py:351-358` skip semantics (guards are not in
-            // the dispatch table at all, so the blackhole never
-            // evaluates them in production).
+            // RPython lowers `a <= b <= c` via `op_int_between` /
+            // x86/assembler.py:1975-1979 as the unsigned half-open
+            // `(b - a) < (c - a)`; the majit backends emit the same
+            // half-open form (`majit-backend-cranelift/src/compiler.rs`
+            // :6439-6448, `majit-backend-wasm/src/codegen.rs:978`).
+            // The executor matches the assembler / rtyper contract
+            // rather than the inclusive bounds in the llgraph fallback,
+            // because the executor is the trace re-execution path the
+            // bridge / blackhole loop relies on — it must agree with
+            // the JIT-compiled side bit-for-bit.
+            //
+            // Object side: `read_typeid` reads the GC header (managed)
+            // or the registered vtable (pyre PyObject seam), then
+            // `typeid_subclass_range` resolves the preorder lower
+            // bound. Expected side: `subclass_range` translates the
+            // constant vtable pointer embedded in the guard arg.
+            //
+            // RPython has no fallback for "typeid lookup failed" —
+            // `cast_opaque_ptr` either succeeds or crashes. majit
+            // can't crash on synthetic test inputs, so an unresolved
+            // typeid translates to `GuardFailed`: if the executor
+            // can't prove the guard succeeds, the safe answer is
+            // "deopt to interpretation", never "silently allow".
             let (obj_ptr, expected_classptr) = binop(values, op);
             let value_min = read_typeid(obj_ptr)
                 .and_then(|tid| majit_gc::typeid_subclass_range(tid).map(|(min, _)| min));
@@ -418,7 +425,7 @@ pub(crate) fn execute_one(
                         OpResult::GuardFailed
                     }
                 }
-                _ => OpResult::Void,
+                _ => OpResult::GuardFailed,
             }
         }
         OpCode::GuardNoOverflow => {
@@ -466,19 +473,22 @@ pub(crate) fn execute_one(
             OpResult::GuardFailed
         }
         OpCode::GuardGcType => {
-            // llgraph/runner.py:1257-1261 execute_guard_gc_type:
+            // llgraph/runner.py:1257-1261 execute_guard_gc_type literal:
+            //
             //     assert isinstance(typeid, TypeIDSymbolic)
             //     TYPE = arg._obj.container._TYPE
             //     if TYPE != typeid.STRUCT_OR_ARRAY:
             //         self.fail_guard(descr)
             //
             // majit reads `arg`'s typeid from the GC header and
-            // compares it against the immediate `typeid` carried in
-            // arg[1] (rewrite.py:GuardGcType emits a `ConstInt(type_id)`
-            // there). When the pointer cannot be dereferenced (e.g.
-            // unit tests dispatching with a placeholder integer), fall
-            // through to RPython's `executor.py:351-358` skip
-            // semantics: guards are not in the executor table.
+            // compares it against the immediate `typeid` constant
+            // carried in arg[1] (rewrite.py emits a `ConstInt(type_id)`
+            // there). RPython has no fallback for "typeid unreadable":
+            // `arg._obj.container._TYPE` either succeeds or crashes.
+            // For majit, an unreadable typeid translates to
+            // `GuardFailed` so the bridge / blackhole loop deopts to
+            // interpretation rather than silently allowing the guard
+            // to pass.
             let (obj_ptr, expected_tid) = binop(values, op);
             match read_typeid(obj_ptr) {
                 Some(actual_tid) => {
@@ -488,11 +498,12 @@ pub(crate) fn execute_one(
                         OpResult::GuardFailed
                     }
                 }
-                None => OpResult::Void,
+                None => OpResult::GuardFailed,
             }
         }
         OpCode::GuardIsObject => {
-            // llgraph/runner.py:1263-1269 execute_guard_is_object:
+            // llgraph/runner.py:1263-1269 execute_guard_is_object literal:
+            //
             //     TYPE = arg._obj.container._TYPE
             //     while TYPE is not rclass.OBJECT:
             //         if not isinstance(TYPE, lltype.GcStruct):
@@ -500,16 +511,22 @@ pub(crate) fn execute_one(
             //             return
             //         _, TYPE = TYPE._first_struct()
             //
-            // majit's TYPE_INFO table stores a pre-computed
-            // `T_IS_RPYTHON_INSTANCE` flag per typeid
-            // (gctypelayout.py:642), so the equivalent walk is a
-            // single seam lookup. Without the backend installed, fall
-            // through to executor.py:351-358 skip semantics.
+            // The walk inspects each `_first_struct` ancestor for
+            // GcStruct-ness; the loop returns silently when it
+            // reaches `rclass.OBJECT`, otherwise fails the guard.
+            // majit's TYPE_INFO table pre-computes the same answer
+            // (`T_IS_RPYTHON_INSTANCE`, gctypelayout.py:642), so the
+            // equivalent is a single seam lookup. Same fallback rule
+            // as the other typeid guards: an unreadable typeid means
+            // `GuardFailed`, never `Void`. Earlier majit revisions
+            // skipped to `Void` here, which silently degraded the
+            // guard into a nonnull check — that's the regression the
+            // user flagged.
             let obj_ptr = unop(values, op);
             match read_typeid(obj_ptr).and_then(majit_gc::typeid_is_object) {
                 Some(true) => OpResult::Void,
                 Some(false) => OpResult::GuardFailed,
-                None => OpResult::Void,
+                None => OpResult::GuardFailed,
             }
         }
 
