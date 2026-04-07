@@ -1223,6 +1223,49 @@ fn init_union_type(ns: &mut PyNamespace) {
     );
 }
 
+thread_local! {
+    static GETSET_DESCRIPTOR_TYPE: std::cell::OnceCell<pyre_object::PyObjectRef>
+        = const { std::cell::OnceCell::new() };
+}
+
+fn getset_descriptor_type() -> pyre_object::PyObjectRef {
+    GETSET_DESCRIPTOR_TYPE.with(|cell| {
+        *cell.get_or_init(|| make_builtin_type("getset_descriptor", init_getset_descriptor_type))
+    })
+}
+
+fn init_getset_descriptor_type(ns: &mut PyNamespace) {
+    // descr.__get__(self, instance, owner=None) — call wrapped getter
+    // with instance when it is non-null. Returns the descriptor itself when
+    // accessed directly on the class.
+    namespace_store(
+        ns,
+        "__get__",
+        make_builtin_function("__get__", |args| {
+            if args.is_empty() {
+                return Ok(pyre_object::w_none());
+            }
+            let descr_self = args[0];
+            let instance = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+            if instance.is_null() || unsafe { pyre_object::is_none(instance) } {
+                return Ok(descr_self);
+            }
+            let wrapped = crate::baseobjspace::getattr(descr_self, "__wrapped__")?;
+            Ok(crate::call::call_function_impl_raw(wrapped, &[instance]))
+        }),
+    );
+}
+
+/// Wrap a getter so that `descr.__get__(obj)` invokes the getter with obj.
+/// Mimics CPython's `getset_descriptor` for type-level accessors like
+/// `type.__dict__['__annotations__']`.
+fn make_getset_descriptor(getter: pyre_object::PyObjectRef) -> pyre_object::PyObjectRef {
+    use pyre_object::instanceobject::w_instance_new;
+    let obj = w_instance_new(getset_descriptor_type());
+    let _ = crate::baseobjspace::setattr(obj, "__wrapped__", getter);
+    obj
+}
+
 fn init_type_type(ns: &mut PyNamespace) {
     // type.__new__(metatype, name, bases, dict) — creates new type
     namespace_store(
@@ -1236,6 +1279,98 @@ fn init_type_type(ns: &mut PyNamespace) {
         "__init__",
         make_builtin_function("__init__", |_| Ok(pyre_object::w_none())),
     );
+    // type.__annotations__ / __dict__ / __mro__ / __name__ / __bases__
+    // are exposed as getset descriptors so
+    // `type.__dict__['<name>'].__get__(cls)` invokes the underlying getter
+    // and returns the real value (matching CPython's getset_descriptor).
+    //
+    // PyPy: pypy/objspace/std/typeobject.py get_annotations / descr_getdict
+    // / descr_getmro / descr_getname / descr_getbases.
+    let annotations_getter = make_builtin_function("__annotations__", |args| {
+        if args.is_empty() {
+            return Ok(pyre_object::w_dict_new());
+        }
+        let cls = args[0];
+        // Pyre stores class annotations as an ATTR_TABLE entry on the
+        // type object under the "__annotations__" key.
+        let stored = crate::baseobjspace::ATTR_TABLE.with(|table| {
+            let table = table.borrow();
+            if let Some(attrs) = table.get(&(cls as usize)) {
+                for (name, value) in attrs {
+                    if name == "__annotations__" {
+                        return Some(*value);
+                    }
+                }
+            }
+            None
+        });
+        Ok(stored.unwrap_or_else(pyre_object::w_dict_new))
+    });
+    namespace_store(
+        ns,
+        "__annotations__",
+        make_getset_descriptor(annotations_getter),
+    );
+
+    let mro_getter = make_builtin_function("__mro__", |args| {
+        if args.is_empty() {
+            return Ok(pyre_object::w_tuple_new(vec![]));
+        }
+        let cls = args[0];
+        unsafe {
+            let mro_ptr = pyre_object::w_type_get_mro(cls);
+            if mro_ptr.is_null() {
+                return Ok(pyre_object::w_tuple_new(vec![]));
+            }
+            Ok(pyre_object::w_tuple_new((*mro_ptr).clone()))
+        }
+    });
+    namespace_store(ns, "__mro__", make_getset_descriptor(mro_getter));
+
+    let dict_getter = make_builtin_function("__dict__", |args| {
+        if args.is_empty() {
+            return Ok(pyre_object::w_dict_new());
+        }
+        let cls = args[0];
+        unsafe {
+            let ns_ptr = pyre_object::typeobject::w_type_get_dict_ptr(cls);
+            if ns_ptr.is_null() {
+                return Ok(pyre_object::w_dict_new());
+            }
+            let dict = pyre_object::w_dict_new_with_namespace(ns_ptr);
+            let ns = &*(ns_ptr as *const PyNamespace);
+            for (name, &value) in ns.entries() {
+                pyre_object::w_dict_store(dict, pyre_object::w_str_new(name), value);
+            }
+            Ok(dict)
+        }
+    });
+    namespace_store(ns, "__dict__", make_getset_descriptor(dict_getter));
+
+    let name_getter = make_builtin_function("__name__", |args| {
+        if args.is_empty() {
+            return Ok(pyre_object::w_str_new(""));
+        }
+        unsafe {
+            let name = pyre_object::w_type_get_name(args[0]);
+            Ok(pyre_object::w_str_new(name))
+        }
+    });
+    namespace_store(ns, "__name__", make_getset_descriptor(name_getter));
+
+    let bases_getter = make_builtin_function("__bases__", |args| {
+        if args.is_empty() {
+            return Ok(pyre_object::w_tuple_new(vec![]));
+        }
+        unsafe {
+            let bases = pyre_object::w_type_get_bases(args[0]);
+            if bases.is_null() {
+                return Ok(pyre_object::w_tuple_new(vec![]));
+            }
+            Ok(bases)
+        }
+    });
+    namespace_store(ns, "__bases__", make_getset_descriptor(bases_getter));
 }
 
 /// function/builtin_function_or_method — PyPy: function.py Function typedef
@@ -1382,6 +1517,128 @@ fn init_int_type(ns: &mut PyNamespace) {
                 val.unsigned_abs().count_ones() as i64
             ))
         }),
+    );
+    // int.to_bytes(length=1, byteorder='big', *, signed=False)
+    // PyPy: longobject.py descr_to_bytes
+    namespace_store(
+        ns,
+        "to_bytes",
+        make_builtin_function("to_bytes", |args| {
+            let val = if !args.is_empty() && unsafe { pyre_object::is_int(args[0]) } {
+                unsafe { pyre_object::w_int_get_value(args[0]) }
+            } else {
+                0
+            };
+            let length = if args.len() >= 2 && unsafe { pyre_object::is_int(args[1]) } {
+                unsafe { pyre_object::w_int_get_value(args[1]) as usize }
+            } else {
+                1
+            };
+            let little_endian = if args.len() >= 3 && unsafe { pyre_object::is_str(args[2]) } {
+                unsafe { pyre_object::w_str_get_value(args[2]) == "little" }
+            } else {
+                false
+            };
+            let mut bytes = vec![0u8; length];
+            let uval = val as u64;
+            for i in 0..length {
+                let shift = if little_endian { i } else { length - 1 - i } * 8;
+                bytes[i] = ((uval >> shift) & 0xff) as u8;
+            }
+            Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(&bytes))
+        }),
+    );
+    // int.from_bytes(bytes, byteorder='big', *, signed=False) — classmethod in CPython
+    namespace_store(
+        ns,
+        "from_bytes",
+        make_builtin_function("from_bytes", |args| {
+            if args.is_empty() {
+                return Ok(pyre_object::w_int_new(0));
+            }
+            // First arg can be the cls or the data depending on call site.
+            let data_arg = if args.len() >= 2 && !unsafe { pyre_object::is_type(args[0]) } {
+                args[0]
+            } else if args.len() >= 2 {
+                args[1]
+            } else {
+                args[0]
+            };
+            let byteorder_arg = if args.len() >= 3 {
+                args[2]
+            } else if args.len() >= 2 && unsafe { pyre_object::is_str(args[1]) } {
+                args[1]
+            } else {
+                pyre_object::w_str_new("big")
+            };
+            let bytes: Vec<u8> = unsafe {
+                if pyre_object::bytearrayobject::is_bytearray(data_arg) {
+                    pyre_object::bytearrayobject::w_bytearray_data(data_arg).to_vec()
+                } else if pyre_object::is_str(data_arg) {
+                    pyre_object::w_str_get_value(data_arg).as_bytes().to_vec()
+                } else {
+                    vec![]
+                }
+            };
+            let little_endian = unsafe {
+                pyre_object::is_str(byteorder_arg)
+                    && pyre_object::w_str_get_value(byteorder_arg) == "little"
+            };
+            let mut val: u64 = 0;
+            if little_endian {
+                for (i, &b) in bytes.iter().enumerate() {
+                    val |= (b as u64) << (i * 8);
+                }
+            } else {
+                for &b in &bytes {
+                    val = (val << 8) | b as u64;
+                }
+            }
+            Ok(pyre_object::w_int_new(val as i64))
+        }),
+    );
+    // int.__index__ / __int__ / __trunc__ — identity
+    for method in ["__index__", "__int__", "__trunc__"] {
+        namespace_store(
+            ns,
+            method,
+            make_builtin_function(method, |args| {
+                Ok(args.first().copied().unwrap_or(pyre_object::w_int_new(0)))
+            }),
+        );
+    }
+    // int.conjugate — identity
+    namespace_store(
+        ns,
+        "conjugate",
+        make_builtin_function("conjugate", |args| {
+            Ok(args.first().copied().unwrap_or(pyre_object::w_int_new(0)))
+        }),
+    );
+    // int.real / int.imag — return value or 0
+    namespace_store(
+        ns,
+        "real",
+        make_builtin_function("real", |args| {
+            Ok(args.first().copied().unwrap_or(pyre_object::w_int_new(0)))
+        }),
+    );
+    namespace_store(
+        ns,
+        "imag",
+        make_builtin_function("imag", |_| Ok(pyre_object::w_int_new(0))),
+    );
+    namespace_store(
+        ns,
+        "numerator",
+        make_builtin_function("numerator", |args| {
+            Ok(args.first().copied().unwrap_or(pyre_object::w_int_new(0)))
+        }),
+    );
+    namespace_store(
+        ns,
+        "denominator",
+        make_builtin_function("denominator", |_| Ok(pyre_object::w_int_new(1))),
     );
 }
 fn init_float_type(ns: &mut PyNamespace) {

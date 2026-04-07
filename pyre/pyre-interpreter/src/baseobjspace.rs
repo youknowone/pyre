@@ -1321,6 +1321,56 @@ pub fn compare(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
                 CompareOp::Ne => sa != sb,
             }));
         }
+        // Tuple lexicographic comparison — PyPy: tupleobject.py descr_lt / _eq / etc.
+        if is_tuple(a) && is_tuple(b) {
+            let la = w_tuple_len(a);
+            let lb = w_tuple_len(b);
+            let min_len = la.min(lb);
+            for i in 0..min_len {
+                let ea = w_tuple_getitem(a, i as i64).unwrap_or(PY_NULL);
+                let eb = w_tuple_getitem(b, i as i64).unwrap_or(PY_NULL);
+                let eq = match compare(ea, eb, CompareOp::Eq) {
+                    Ok(r) => is_true(r),
+                    Err(_) => false,
+                };
+                if !eq {
+                    return compare(ea, eb, op);
+                }
+            }
+            return Ok(w_bool_from(match op {
+                CompareOp::Lt => la < lb,
+                CompareOp::Le => la <= lb,
+                CompareOp::Gt => la > lb,
+                CompareOp::Ge => la >= lb,
+                CompareOp::Eq => la == lb,
+                CompareOp::Ne => la != lb,
+            }));
+        }
+        // List lexicographic comparison — same logic as tuple.
+        if is_list(a) && is_list(b) {
+            let la = pyre_object::w_list_len(a);
+            let lb = pyre_object::w_list_len(b);
+            let min_len = la.min(lb);
+            for i in 0..min_len {
+                let ea = pyre_object::w_list_getitem(a, i as i64).unwrap_or(PY_NULL);
+                let eb = pyre_object::w_list_getitem(b, i as i64).unwrap_or(PY_NULL);
+                let eq = match compare(ea, eb, CompareOp::Eq) {
+                    Ok(r) => is_true(r),
+                    Err(_) => false,
+                };
+                if !eq {
+                    return compare(ea, eb, op);
+                }
+            }
+            return Ok(w_bool_from(match op {
+                CompareOp::Lt => la < lb,
+                CompareOp::Le => la <= lb,
+                CompareOp::Gt => la > lb,
+                CompareOp::Ge => la >= lb,
+                CompareOp::Eq => la == lb,
+                CompareOp::Ne => la != lb,
+            }));
+        }
         // Instance dunder dispatch for comparison
         let dunder = match op {
             CompareOp::Lt => "__lt__",
@@ -2155,6 +2205,37 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
         }
     }
 
+    // Property descriptor methods — PyPy: descriptor.py W_Property.setter / getter / deleter
+    // Returns a bound method (W_Method) that captures the property via w_self,
+    // so the static handler can extract the property from args[0].
+    unsafe {
+        if is_property(obj) {
+            let static_name: Option<(
+                &'static str,
+                fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
+            )> = match name {
+                "setter" => Some(("setter", property_setter_impl)),
+                "getter" => Some(("getter", property_getter_impl)),
+                "deleter" => Some(("deleter", property_deleter_impl)),
+                _ => None,
+            };
+            if let Some((sname, func)) = static_name {
+                let builtin = crate::make_builtin_function(sname, func);
+                return Ok(pyre_object::methodobject::w_method_new(
+                    builtin,
+                    obj,
+                    pyre_object::PY_NULL,
+                ));
+            }
+            match name {
+                "fget" => return Ok(w_property_get_fget(obj)),
+                "fset" => return Ok(w_property_get_fset(obj)),
+                "fdel" => return Ok(w_property_get_fdel(obj)),
+                _ => {}
+            }
+        }
+    }
+
     // Module objects: look up in module namespace
     // PyPy: space.getattr(w_module, w_name) → Module.getdictvalue(space, name)
     unsafe {
@@ -2872,6 +2953,17 @@ unsafe fn set(descr: PyObjectRef, obj: PyObjectRef, value: PyObjectRef) -> bool 
 pub fn setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult {
     let obj = unwrap_cell(obj);
     let value = unwrap_cell(value);
+    // Module objects: store directly in the module namespace so `sys.ps1 = ...`
+    // and similar interactive mutations are visible through module getattr/import.
+    unsafe {
+        if is_module(obj) {
+            let ns_ptr = w_module_get_dict_ptr(obj) as *mut crate::PyNamespace;
+            if !ns_ptr.is_null() {
+                crate::namespace_store(&mut *ns_ptr, name, value);
+                return Ok(w_none());
+            }
+        }
+    }
     // Data descriptor __set__ takes priority (PyPy: descr__setattr__ step 1)
     unsafe {
         if is_instance(obj) {
@@ -2911,6 +3003,15 @@ pub fn setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult {
 /// PyPy: descroperation.py descr__delattr__
 pub fn delattr(obj: PyObjectRef, name: &str) -> PyResult {
     let obj = unwrap_cell(obj);
+    unsafe {
+        if is_module(obj) {
+            let ns_ptr = w_module_get_dict_ptr(obj) as *mut crate::PyNamespace;
+            if !ns_ptr.is_null() {
+                crate::namespace_store(&mut *ns_ptr, name, PY_NULL);
+                return Ok(w_none());
+            }
+        }
+    }
     // Type objects: set to PY_NULL in class dict
     // (PyNamespace doesn't support removal, null slot acts as deleted)
     unsafe {
@@ -3309,6 +3410,38 @@ pub fn next(obj: PyObjectRef) -> PyResult {
 }
 
 /// Stub method for generator.close/send/throw — no-op.
+/// Property setter/getter/deleter helpers — PyPy: W_Property.setter/getter/deleter.
+/// args[0] is the owning property (bound via W_Method), args[1] is the new fn.
+fn property_setter_impl(args: &[PyObjectRef]) -> PyResult {
+    let prop = args[0];
+    let new_fn = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+    unsafe {
+        let fget = w_property_get_fget(prop);
+        let fdel = w_property_get_fdel(prop);
+        Ok(pyre_object::w_property_new(fget, new_fn, fdel))
+    }
+}
+
+fn property_getter_impl(args: &[PyObjectRef]) -> PyResult {
+    let prop = args[0];
+    let new_fn = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+    unsafe {
+        let fset = w_property_get_fset(prop);
+        let fdel = w_property_get_fdel(prop);
+        Ok(pyre_object::w_property_new(new_fn, fset, fdel))
+    }
+}
+
+fn property_deleter_impl(args: &[PyObjectRef]) -> PyResult {
+    let prop = args[0];
+    let new_fn = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+    unsafe {
+        let fget = w_property_get_fget(prop);
+        let fset = w_property_get_fset(prop);
+        Ok(pyre_object::w_property_new(fget, fset, new_fn))
+    }
+}
+
 fn gen_stub_method(args: &[PyObjectRef]) -> PyResult {
     // close(): mark exhausted
     if !args.is_empty() {
@@ -3638,6 +3771,35 @@ mod tests {
         setattr(obj, "x", w_int_new(2)).unwrap();
         let result = getattr(obj, "x").unwrap();
         unsafe { assert_eq!(w_int_get_value(result), 2) };
+    }
+
+    #[test]
+    fn test_module_setattr_getattr() {
+        let mut namespace = Box::new(crate::PyNamespace::default());
+        namespace.fix_ptr();
+        let module = pyre_object::moduleobject::w_module_new(
+            "test_module",
+            Box::into_raw(namespace) as *mut u8,
+        );
+
+        setattr(module, "ps1", w_str_new("py> ")).unwrap();
+        let result = getattr(module, "ps1").unwrap();
+        unsafe { assert_eq!(w_str_get_value(result), "py> ") };
+    }
+
+    #[test]
+    fn test_module_delattr() {
+        let mut namespace = Box::new(crate::PyNamespace::default());
+        namespace.fix_ptr();
+        let module = pyre_object::moduleobject::w_module_new(
+            "test_module",
+            Box::into_raw(namespace) as *mut u8,
+        );
+
+        setattr(module, "ps1", w_str_new("py> ")).unwrap();
+        delattr(module, "ps1").unwrap();
+        let err = getattr(module, "ps1").unwrap_err();
+        assert!(matches!(err.kind, PyErrorKind::AttributeError));
     }
 
     #[test]

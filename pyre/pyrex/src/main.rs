@@ -1,6 +1,5 @@
 //! pyre — A Rust meta-tracing JIT Python interpreter.
 
-use std::io::{self, BufRead, Write};
 use std::path::Path;
 use std::rc::Rc;
 
@@ -13,6 +12,9 @@ use pyre_interpreter::pyframe::PyFrame;
 use pyre_interpreter::*;
 use pyre_interpreter::{PyDisplay, PyExecutionContext};
 use pyre_jit::eval::eval_with_jit;
+
+mod repl;
+mod repl_readline;
 
 enum RunMode {
     Script(String),
@@ -111,7 +113,7 @@ fn real_main() {
             importing::init_sys_path(&cwd);
             run_source(&cmd, Mode::Exec);
             if inspect {
-                run_repl(true);
+                repl::run_repl(true);
             }
         }
         RunMode::Script(path) => {
@@ -131,14 +133,14 @@ fn real_main() {
             importing::init_sys_path(&script_dir);
             run_source(&source, Mode::Exec);
             if inspect {
-                run_repl(true);
+                repl::run_repl(true);
             }
         }
         RunMode::Repl => {
             // Initialize sys.path with CWD for REPL mode.
             let cwd = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
             importing::init_sys_path(&cwd);
-            run_repl(quiet);
+            repl::run_repl(quiet);
         }
     }
 }
@@ -174,139 +176,8 @@ fn run_source(source: &str, mode: Mode) {
             }
         }
         Err(e) => {
-            eprintln!("Traceback (most recent call last):");
-            eprintln!("  {e}");
+            pyre_interpreter::eprint_exception(&e, true);
             std::process::exit(1);
-        }
-    }
-}
-
-fn run_repl(quiet: bool) {
-    let stdin = io::stdin();
-    let mut reader = stdin.lock();
-    let execution_context = Rc::new(PyExecutionContext::default());
-    let ctx_ptr = Rc::into_raw(Rc::clone(&execution_context));
-
-    // Shared namespace across all REPL statements
-    let mut namespace = Box::new(execution_context.fresh_namespace());
-    namespace.fix_ptr();
-    // PyPy: Module.__init__ sets __name__ in w_dict
-    pyre_interpreter::namespace_store(
-        &mut namespace,
-        "__name__",
-        pyre_object::w_str_new("__main__"),
-    );
-    let namespace = Box::into_raw(namespace);
-
-    if !quiet {
-        println!("pyre 0.0.1 (Rust meta-tracing JIT)");
-        println!("Type \"exit()\" or Ctrl-D to exit.");
-    }
-
-    let mut buffer = String::new();
-    let mut continuation = false;
-
-    loop {
-        let prompt = if continuation { "... " } else { ">>> " };
-        print!("{prompt}");
-        if io::stdout().flush().is_err() {
-            break;
-        }
-
-        let mut line = String::new();
-        match reader.read_line(&mut line) {
-            Ok(0) => {
-                println!();
-                break;
-            }
-            Ok(_) => {}
-            Err(_) => break,
-        }
-
-        if !continuation && line.trim().is_empty() {
-            continue;
-        }
-
-        buffer.push_str(&line);
-
-        // In continuation mode, only try to compile when the user
-        // enters a blank line (like CPython's interactive mode).
-        if continuation && !line.trim().is_empty() {
-            continue;
-        }
-
-        match try_compile_single(&buffer) {
-            CompileResult::Complete(code) => {
-                let code_ptr = Box::into_raw(Box::new(code));
-                let w_code = pyre_interpreter::pycode::w_code_new(code_ptr as *const ());
-                let mut frame =
-                    PyFrame::new_with_namespace(w_code as *const (), ctx_ptr, namespace);
-                match eval_with_jit(&mut frame) {
-                    Ok(result) => {
-                        if !result.is_null() && !unsafe { pyre_object::is_none(result) } {
-                            println!("{}", PyDisplay(result));
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("Traceback (most recent call last):");
-                        eprintln!("  {e}");
-                    }
-                }
-                buffer.clear();
-                continuation = false;
-            }
-            CompileResult::Incomplete => {
-                continuation = true;
-            }
-            CompileResult::Error(e) => {
-                eprintln!("{e}");
-                buffer.clear();
-                continuation = false;
-            }
-        }
-    }
-}
-
-enum CompileResult {
-    Complete(CodeObject),
-    Incomplete,
-    Error(String),
-}
-
-/// Detect errors that indicate the input is incomplete rather than invalid.
-fn is_incomplete_error(err: &str) -> bool {
-    err.contains("Expected an indented block")
-        || err.contains("unexpected EOF while parsing")
-        || err.contains("expected an indented block")
-        || err.contains("unexpected end of input")
-}
-
-/// Mimics CPython's codeop._maybe_compile:
-///   compile(source + "\n", "single")     → err1
-///   compile(source + "\n\n", "single")   → err2
-///   if err1 != err2 → incomplete (adding more input changes the error)
-///   if both succeed → use the "\n" version
-///   if both fail with same error → real syntax error
-fn try_compile_single(source: &str) -> CompileResult {
-    let trimmed = source.trim_end();
-    if trimmed.is_empty() {
-        return CompileResult::Incomplete;
-    }
-
-    let with_one = format!("{trimmed}\n");
-    let with_two = format!("{trimmed}\n\n");
-
-    match compile_source(&with_one, Mode::Single) {
-        Ok(code) => CompileResult::Complete(code),
-        Err(e1) => {
-            if is_incomplete_error(&e1) {
-                return CompileResult::Incomplete;
-            }
-            match compile_source(&with_two, Mode::Single) {
-                Ok(_) => CompileResult::Incomplete,
-                Err(e2) if e2 != e1 => CompileResult::Incomplete,
-                Err(_) => CompileResult::Error(e1),
-            }
         }
     }
 }

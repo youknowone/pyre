@@ -23,3 +23,6 @@ pyre-interpreter = { workspace = true }
 pyre-jit = { workspace = true }
 majit-metainterp = { workspace = true }
 lexopt = "0.3"
+rustpython-compiler = { workspace = true }
+dirs = "6"
+rustyline = "17"
