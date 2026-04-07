@@ -1025,8 +1025,11 @@ impl MIFrame {
             // pyjitpl.py:177: active boxes = registers only (no header).
             let callee_active_boxes =
                 self.get_list_of_active_boxes(ctx, false, after_residual_call);
-            // RPython Box.type parity: fail_arg_types must match compact active_boxes
-            let callee_types = self.build_fail_arg_types_for_active_boxes(&callee_active_boxes);
+            // RPython Box.type parity: snapshot types match the full
+            // (un-filtered) active_boxes — constants are part of the
+            // snapshot via TAGCONST.
+            let callee_snapshot_types_full =
+                self.build_fail_arg_types_for_active_boxes(&callee_active_boxes);
 
             // snapshot.pc must match the liveness PC used for active boxes
             // (get_list_of_active_boxes uses fallthrough_pc when after_residual_call).
@@ -1036,10 +1039,10 @@ impl MIFrame {
                 self.orgpc
             };
             // opencoder.py:819-834: snapshot uses active boxes (not fail_args).
-            // callee_types includes header [Ref, Int, Int]; snapshot needs
-            // only the active_boxes portion.
+            // callee_snapshot_types_full includes header [Ref, Int, Int];
+            // snapshot needs only the active_boxes portion.
             let __n = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
-            let callee_snapshot_types = &callee_types[__n..];
+            let callee_snapshot_types = &callee_snapshot_types_full[__n..];
             let mut frames = vec![majit_trace::recorder::SnapshotFrame {
                 jitcode_index: unsafe { (*self.sym().jitcode).index } as u32,
                 pc: callee_live_pc as u32,
@@ -1049,26 +1052,24 @@ impl MIFrame {
                     ctx,
                 ),
             }];
-            // fail_args = header + active_boxes (for Cranelift deadframe).
-            let mut fail_args = {
+            // pyjitpl.py:2558-2585 generate_guard parity: record guard with
+            // a raw fail_args "hint" (header + active_boxes). The optimizer's
+            // store_final_boxes_in_guard (mod.rs:finalize_guard_resume_data)
+            // calls ResumeDataLoopMemo::finish() which rebuilds fail_args
+            // from the snapshot via _number_boxes — Consts are dropped from
+            // liveboxes during numbering (resume.py:202-207 getconst path),
+            // so the post-optimizer fail_args naturally satisfy regalloc.py:1203.
+            let mut fail_args: Vec<OpRef> = {
                 let s = self.sym();
                 vec![s.frame, s.vable_next_instr, s.vable_valuestackdepth]
             };
             fail_args.extend_from_slice(&callee_active_boxes);
-            let mut types = callee_types;
+            let mut types = callee_snapshot_types_full;
             // opencoder.py:806: parent frames keep their original pc.
             // Snapshot boxes = active boxes only (skip [frame, ni, vsd] header).
             for (pfa, pfa_types, pfa_resumepc, pfa_jitcode_index) in &self.parent_frames {
-                // pfa = [frame, ni, vsd, active_boxes...]; snapshot gets [active_boxes...].
-                // pyjitpl.py:2586-2602 capture_resumedata: parent frames'
-                // snapshot stores ONLY their active boxes (the registers
-                // live at the call site), NOT the [frame, ni, vsd] header.
-                // When pfa.len() <= __n there are zero active boxes — the
-                // snapshot body must be empty, NOT the header itself.
                 let __n = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
                 let parent_active: &[OpRef] = if pfa.len() > __n { &pfa[__n..] } else { &[] };
-                // pfa_types includes header [Ref, Int, Int]; snapshot needs
-                // only the active_boxes portion matching parent_active.
                 let parent_types: &[Type] = if pfa_types.len() > __n {
                     &pfa_types[__n..]
                 } else {
@@ -1084,12 +1085,12 @@ impl MIFrame {
                     ),
                 });
                 fail_args.extend_from_slice(pfa);
-                let pt = if pfa_types.is_empty() {
-                    fail_arg_types_for_virtualizable_state(pfa.len())
+                if !pfa_types.is_empty() {
+                    types.extend_from_slice(pfa_types);
                 } else {
-                    pfa_types.clone()
-                };
-                types.extend_from_slice(&pt);
+                    let pt = fail_arg_types_for_virtualizable_state(pfa.len());
+                    types.extend_from_slice(&pt);
+                }
             }
             let vable_boxes = Self::build_virtualizable_boxes(self.sym(), ctx);
             // pyjitpl.py:2597: self.virtualref_boxes
@@ -1152,11 +1153,18 @@ impl MIFrame {
         self.flush_to_frame_for_guard(ctx);
         // pyjitpl.py:177: active boxes = registers only (no header).
         let active_boxes = self.get_list_of_active_boxes(ctx, false, after_residual_call);
-        // RPython Box.type parity: each box carries its own type.
-        // fail_arg_types must match active_boxes length (compact/liveness-filtered).
-        let fail_arg_types = self.build_fail_arg_types_for_active_boxes(&active_boxes);
-        // fail_args = header + active_boxes (for Cranelift deadframe).
-        let fail_args = {
+        // RPython Box.type parity: snapshot types match the full (un-filtered)
+        // active_boxes — snapshot encodes Consts as TAGCONST.
+        let snapshot_full_types = self.build_fail_arg_types_for_active_boxes(&active_boxes);
+        // pyjitpl.py:2558-2585 generate_guard parity: record a raw fail_args
+        // "hint" (header + active_boxes including Consts). The optimizer's
+        // store_final_boxes_in_guard rebuilds fail_args from the snapshot
+        // via ResumeDataLoopMemo::finish() → _number_boxes, which drops
+        // Consts from liveboxes (resume.py:202-207 getconst path). This
+        // satisfies regalloc.py:1203 structurally rather than via an
+        // ad-hoc tracer-level filter.
+        let fail_arg_types = snapshot_full_types.clone();
+        let fail_args: Vec<OpRef> = {
             let s = self.sym();
             let mut fa = vec![s.frame, s.vable_next_instr, s.vable_valuestackdepth];
             fa.extend_from_slice(&active_boxes);
@@ -1173,10 +1181,10 @@ impl MIFrame {
         };
 
         // opencoder.py:767-770: snapshot uses active boxes (not fail_args).
-        // fail_arg_types includes [Ref, Int, Int] header; snapshot needs
-        // only the active_boxes portion starting after NUM_SCALAR_INPUTARGS.
+        // snapshot_full_types includes [Ref, Int, Int] header; snapshot
+        // needs only the active_boxes portion starting after NUM_SCALAR_INPUTARGS.
         let n = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
-        let snapshot_types = &fail_arg_types[n..];
+        let snapshot_types = &snapshot_full_types[n..];
         let snapshot_boxes =
             Self::fail_args_to_snapshot_boxes_typed(&active_boxes, snapshot_types, ctx);
         let vable_boxes = Self::build_virtualizable_boxes(self.sym(), ctx);
@@ -1458,10 +1466,11 @@ impl MIFrame {
         self.flush_to_frame_for_guard(ctx);
         // pyjitpl.py:177: get_list_of_active_boxes uses frame.pc for liveness
         let active_boxes = self.get_list_of_active_boxes(ctx, false, false);
-        // RPython Box.type parity: fail_arg_types must match compact active_boxes
+        // pyjitpl.py:2558-2585 generate_guard parity: record a raw fail_args
+        // "hint". store_final_boxes_in_guard rebuilds the real fail_args from
+        // the snapshot via _number_boxes (Consts go to TAGCONST, not liveboxes).
         let fail_arg_types = self.build_fail_arg_types_for_active_boxes(&active_boxes);
-        // fail_args = header + active_boxes (for Cranelift deadframe)
-        let fail_args = {
+        let fail_args: Vec<OpRef> = {
             let s = self.sym();
             let mut fa = vec![s.frame, s.vable_next_instr, s.vable_valuestackdepth];
             fa.extend_from_slice(&active_boxes);
