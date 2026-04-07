@@ -60,10 +60,10 @@ mod tests {
             &[obj],
         );
         let ops = get_ops(ctx);
-        assert_eq!(
-            ops,
-            vec![OpCode::GetfieldGcI, OpCode::GuardClass, OpCode::GetfieldGcI,]
-        );
+        // GUARD_CLASS(box, cls): backend loads typeptr from obj at offset 0
+        // (llgraph/runner.py:1245), no explicit pre-read. Followed by the
+        // intval field read.
+        assert_eq!(ops, vec![OpCode::GuardClass, OpCode::GetfieldGcI]);
         eprintln!("✓ trace_unbox_int: {:?}", ops);
     }
 
@@ -79,10 +79,10 @@ mod tests {
             FAKE_INT_TYPE,
         );
         let ops = get_ops(ctx);
-        assert_eq!(
-            ops,
-            vec![OpCode::New, OpCode::SetfieldGc, OpCode::SetfieldGc,]
-        );
+        // rewrite.py:479-484 GC rewriter: NEW_WITH_VTABLE emits the vtable
+        // field via fielddescr_vtable, so the trace records
+        // NEW_WITH_VTABLE(size) + only the non-type field setter.
+        assert_eq!(ops, vec![OpCode::NewWithVtable, OpCode::SetfieldGc]);
         eprintln!("✓ trace_box_int: {:?}", ops);
     }
 
@@ -104,17 +104,14 @@ mod tests {
         assert_eq!(
             ops,
             vec![
-                OpCode::GetfieldGcI,
                 OpCode::GuardClass,
                 OpCode::GetfieldGcI, // unbox a
-                OpCode::GetfieldGcI,
                 OpCode::GuardClass,
                 OpCode::GetfieldGcI, // unbox b
                 OpCode::IntAddOvf,
                 OpCode::GuardNoOverflow, // add + guard
-                OpCode::New,
-                OpCode::SetfieldGc,
-                OpCode::SetfieldGc, // box
+                OpCode::NewWithVtable,
+                OpCode::SetfieldGc, // box (NEW_WITH_VTABLE + intval setter)
             ]
         );
         eprintln!("✓ trace_int_binop_ovf: {} ops", ops.len());
@@ -133,10 +130,7 @@ mod tests {
             &[obj],
         );
         let ops = get_ops(ctx);
-        assert_eq!(
-            ops,
-            vec![OpCode::GetfieldGcI, OpCode::GuardClass, OpCode::GetfieldGcF,]
-        );
+        assert_eq!(ops, vec![OpCode::GuardClass, OpCode::GetfieldGcF]);
         eprintln!("✓ trace_unbox_float: {:?}", ops);
     }
 
@@ -153,14 +147,9 @@ mod tests {
             &[obj],
         );
         let ops = get_ops(ctx);
-        assert_eq!(
-            ops,
-            vec![
-                OpCode::GetfieldGcPureI,
-                OpCode::GuardClass,
-                OpCode::GetfieldGcPureI,
-            ]
-        );
+        // Immutable intval descr → GetfieldGcPureI for the value read.
+        // GuardClass takes the object directly (no pre-read of ob_type).
+        assert_eq!(ops, vec![OpCode::GuardClass, OpCode::GetfieldGcPureI]);
     }
 
     #[test]
@@ -176,14 +165,7 @@ mod tests {
             &[obj],
         );
         let ops = get_ops(ctx);
-        assert_eq!(
-            ops,
-            vec![
-                OpCode::GetfieldGcPureI,
-                OpCode::GuardClass,
-                OpCode::GetfieldGcPureF,
-            ]
-        );
+        assert_eq!(ops, vec![OpCode::GuardClass, OpCode::GetfieldGcPureF]);
     }
 
     #[test]
@@ -198,10 +180,7 @@ mod tests {
             FAKE_FLOAT_TYPE,
         );
         let ops = get_ops(ctx);
-        assert_eq!(
-            ops,
-            vec![OpCode::New, OpCode::SetfieldGc, OpCode::SetfieldGc,]
-        );
+        assert_eq!(ops, vec![OpCode::NewWithVtable, OpCode::SetfieldGc]);
         eprintln!("✓ trace_box_float: {:?}", ops);
     }
 
@@ -223,15 +202,12 @@ mod tests {
         assert_eq!(
             ops,
             vec![
-                OpCode::GetfieldGcI,
                 OpCode::GuardClass,
                 OpCode::GetfieldGcF, // unbox a
-                OpCode::GetfieldGcI,
                 OpCode::GuardClass,
                 OpCode::GetfieldGcF, // unbox b
                 OpCode::FloatAdd,
-                OpCode::New,
-                OpCode::SetfieldGc,
+                OpCode::NewWithVtable,
                 OpCode::SetfieldGc, // box
             ]
         );

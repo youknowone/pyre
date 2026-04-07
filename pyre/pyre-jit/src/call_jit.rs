@@ -701,11 +701,25 @@ fn blackhole_from_jit_frame(frame: &mut PyFrame) -> PyObjectRef {
     );
     let pyjitcode = crate::jit::codewriter::get_jitcode(code, frame.code, &writer);
 
-    // Map Python PC → JitCode PC
+    // Map Python PC → JitCode PC.
+    // resume.py:928/1338 parity: rd_numb pc is consumed as-is. RPython does
+    // not silently restart from the function entry on out-of-range PC; an
+    // out-of-range PC means the resume data is corrupt. Match the other two
+    // pc_map call sites (blackhole_resume_via_rd_numb at line ~933,
+    // direct_run_blackhole_at at line ~1269) which return Failed/false on
+    // miss instead of silently restarting from 0 — a silent restart would
+    // re-execute the function from scratch and produce incorrect results.
     let jitcode_pc = if py_pc < pyjitcode.pc_map.len() {
         pyjitcode.pc_map[py_pc]
     } else {
-        0
+        if majit_metainterp::majit_log_enabled() {
+            eprintln!(
+                "[jit][bh-fail] blackhole_from_jit_frame: py_pc={} out of pc_map (len={})",
+                py_pc,
+                pyjitcode.pc_map.len(),
+            );
+        }
+        return std::ptr::null_mut();
     };
 
     // RPython: blackholeinterp = builder.acquire_interp()
