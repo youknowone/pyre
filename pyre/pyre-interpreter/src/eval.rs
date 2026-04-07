@@ -997,7 +997,9 @@ impl OpcodeStepExecutor for PyFrame {
                 if pyre_object::is_str(exc_type) {
                     let type_name = pyre_object::w_str_get_value(exc_type);
                     pyre_object::exc_kind_matches(kind, type_name)
-                } else if crate::is_function(exc_type) {
+                } else if crate::is_function(exc_type)
+                    && crate::is_builtin_code(crate::getcode(exc_type) as pyre_object::PyObjectRef)
+                {
                     let type_name = crate::function_get_name(exc_type);
                     pyre_object::exc_kind_matches(kind, type_name)
                 } else {

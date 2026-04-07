@@ -285,14 +285,10 @@ pub fn init_typeobjects() {
         new_typeobject_with_base("function", init_function_type, object_type) as usize,
     );
 
-    // builtin_function_or_method
+    // builtin-code — PyPy: BuiltinCode.typedef = TypeDef('builtin-code', ...)
     reg.insert(
         &crate::BUILTIN_CODE_TYPE as *const PyType as usize,
-        new_typeobject_with_base(
-            "builtin_function_or_method",
-            init_builtin_function_type,
-            object_type,
-        ) as usize,
+        new_typeobject_with_base("builtin-code", init_builtin_code_type, object_type) as usize,
     );
 
     reg.insert(
@@ -1242,32 +1238,51 @@ fn init_type_type(ns: &mut PyNamespace) {
     );
 }
 
-/// function/builtin_function_or_method — PyPy: funcobject.py Function typedef
-/// Functions are descriptors: __get__ returns the function itself (for class access)
-/// or a bound method (for instance access).
+/// function/builtin_function_or_method — PyPy: function.py Function typedef
+/// descr_function_get (function.py:462): always returns a Method.
 fn init_function_type(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "__get__",
         make_builtin_function("__get__", |args| {
-            let func = args.first().copied().unwrap_or(pyre_object::w_none());
-            let obj = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-            let objtype = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
-            if obj.is_null() || unsafe { pyre_object::is_none(obj) } {
-                Ok(func)
+            let w_function = args.first().copied().unwrap_or(pyre_object::w_none());
+            let w_obj = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+            let w_cls = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
+            // function.py:466-468 descr_function_get
+            let asking_for_bound = unsafe {
+                (w_cls.is_null() || pyre_object::is_none(w_cls))
+                    || (!w_obj.is_null() && !pyre_object::is_none(w_obj))
+            };
+            if asking_for_bound {
+                // function.py:470  Method(space, w_function, w_obj, w_cls)
+                Ok(pyre_object::w_method_new(w_function, w_obj, w_cls))
             } else {
-                Ok(pyre_object::w_method_new(func, obj, objtype))
+                // function.py:472  Method(space, w_function, None, w_cls)
+                Ok(pyre_object::w_method_new(
+                    w_function,
+                    pyre_object::PY_NULL,
+                    w_cls,
+                ))
             }
         }),
     );
 }
 
-fn init_builtin_function_type(ns: &mut PyNamespace) {
+/// BuiltinCode.typedef (typedef.py) — code object attributes for builtins.
+///
+/// PyPy exposes co_name, co_varnames, co_argcount, co_flags, co_consts.
+/// No __get__ — BuiltinCode is a code object, not a descriptor.
+fn init_builtin_code_type(ns: &mut PyNamespace) {
     namespace_store(
         ns,
-        "__get__",
-        make_builtin_function("__get__", |args| {
-            Ok(args.first().copied().unwrap_or(pyre_object::w_none()))
+        "co_name",
+        make_builtin_function("co_name", |args| {
+            let code = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+            if code.is_null() {
+                return Ok(pyre_object::w_none());
+            }
+            let name = unsafe { crate::builtin_code_name(code) };
+            Ok(pyre_object::w_str_new(name))
         }),
     );
 }

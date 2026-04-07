@@ -2850,7 +2850,11 @@ pub extern "C" fn bh_compare_fn(lhs: i64, rhs: i64, op_code: i64) -> i64 {
                 if pyre_object::is_str(rhs) {
                     let type_name = pyre_object::w_str_get_value(rhs);
                     pyre_object::exc_kind_matches(kind, type_name)
-                } else if pyre_interpreter::is_function(rhs) {
+                } else if pyre_interpreter::is_function(rhs)
+                    && pyre_interpreter::is_builtin_code(
+                        pyre_interpreter::function_get_code(rhs) as pyre_object::PyObjectRef
+                    )
+                {
                     let type_name = pyre_interpreter::function_get_name(rhs);
                     pyre_object::exc_kind_matches(kind, type_name)
                 } else {

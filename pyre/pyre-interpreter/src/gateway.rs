@@ -235,9 +235,11 @@ impl UnwrapSpec_EmitShortcut {
     pub fn handle(self) {}
 }
 
-/// Type descriptor for built-in functions.
+/// Type descriptor for built-in code objects.
+///
+/// PyPy typedef.py: BuiltinCode.typedef = TypeDef('builtin-code', ...)
 pub static BUILTIN_CODE_TYPE: PyType = PyType {
-    tp_name: "builtin_function_or_method",
+    tp_name: "builtin-code",
 };
 
 /// Signature of a built-in function.
