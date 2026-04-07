@@ -3103,9 +3103,14 @@ fn build_resumed_frames(
             //       lst = getattr(virtualizable, fieldname)
             //       for j in range(len(lst)):
             //           lst[j] = reader.load_next_value_of_type(ARRAYITEMTYPE)
-            let heap_array_len = vinfo.get_array_length(frame_u8.cast_const(), 0);
+            // virtualizable.py:126-137 write_from_resume_data_partial:
+            // Array length = number of entries from resume data, NOT the
+            // physical array length. RPython reads exactly
+            // vinfo.get_total_size() entries; pyre should read exactly
+            // resolved_vable.len() - num_scalars entries.
             let array_start = num_scalars.min(resolved_vable.len());
-            let array_items: Vec<i64> = (0..heap_array_len)
+            let array_len = resolved_vable.len().saturating_sub(array_start);
+            let array_items: Vec<i64> = (0..array_len)
                 .map(|j| {
                     resolved_vable
                         .get(array_start + j)
@@ -3118,7 +3123,6 @@ fn build_resumed_frames(
                 })
                 .collect();
             let array_boxes = vec![array_items];
-
             vinfo.write_from_resume_data_partial(frame_u8, &static_boxes, &array_boxes);
         }
         if majit_metainterp::majit_log_enabled() {
