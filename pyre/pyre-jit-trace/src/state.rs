@@ -1523,16 +1523,7 @@ impl PyreSym {
                 self.is_function_entry_trace
             );
         }
-        // pyjitpl.py:177 parity: for bridge traces (bridge_local_oprefs set),
-        // use self.valuestackdepth (set by setup_bridge_sym to resume_pc's
-        // stack state = nlocals). The concrete frame's valuestackdepth may
-        // reflect the guard failure point (mid-expression) rather than the
-        // resume point (statement boundary, empty stack).
-        let valuestackdepth = if self.bridge_local_oprefs.is_some() {
-            self.valuestackdepth
-        } else {
-            concrete_stack_depth(concrete_frame).unwrap_or(nlocals)
-        };
+        let valuestackdepth = concrete_stack_depth(concrete_frame).unwrap_or(nlocals);
         let stack_only_depth = valuestackdepth.saturating_sub(nlocals);
         self.nlocals = nlocals;
         self.locals_cells_stack_array_ref = if self.vable_array_base.is_some() {
@@ -2243,13 +2234,6 @@ impl JitState for PyreJitState {
         if vvals.len() > 4 {
             sym.vable_namespace = resolve_vable(&vvals[4], &mut vable_const_cursor);
         }
-        // pyjitpl.py:3281 parity: bridge starts at resume_pc which is a
-        // statement boundary — the evaluation stack is empty. The frame's
-        // current valuestackdepth may reflect the guard failure point
-        // (mid-expression with stack entries). Reset to nlocals so that
-        // build_virtualizable_boxes doesn't include stale stack entries
-        // in the vable snapshot.
-        sym.valuestackdepth = sym.nlocals;
     }
 
     /// resume.py:1042-1057 rebuild_from_resumedata parity.
