@@ -694,20 +694,46 @@ impl OptIntBounds {
         self.intersect_bound(op.pos, &b);
     }
 
+    /// intbounds.py:209-229 optimize_GUARD_NO_OVERFLOW
     fn optimize_guard_no_overflow(&mut self, op: &Op) -> OptimizationResult {
         let _ = op;
+        // intbounds.py:210-220: lastop = self.last_emitted_operation
+        //   if lastop is not None:
+        //     if opnum not in (INT_ADD_OVF, INT_SUB_OVF, INT_MUL_OVF): return
+        let last_opcode = self.last_emitted_opcode;
         let last_is_ovf = matches!(
-            self.last_emitted_opcode,
+            last_opcode,
             Some(OpCode::IntAddOvf | OpCode::IntSubOvf | OpCode::IntMulOvf)
         );
         if !last_is_ovf {
-            // RPython intbounds.py: if the last emitted operation is not an
-            // INT_*_OVF anymore, the GUARD_NO_OVERFLOW is redundant and must
-            // be dropped. This also prevents late bridge traces from keeping a
-            // stray guard after the ovf-producing op was optimized away.
             self.pending_overflow_guard = None;
             return OptimizationResult::Remove;
         }
+        // intbounds.py:222-228: synthesize the non-overflowing inverse for
+        // optimize_default to reuse, plus the reverse op.
+        //   if INT_ADD_OVF:
+        //     pure_from_args2(INT_SUB, result, args[1], args[0])
+        //     pure_from_args2(INT_SUB, result, args[0], args[1])
+        //   elif INT_SUB_OVF:
+        //     pure_from_args2(INT_ADD, result, args[1], args[0])
+        //     pure_from_args2(INT_SUB, args[0], result, args[1])
+        let result = self.last_emitted_ref;
+        if self.last_emitted_args.len() >= 2 && !result.is_none() {
+            let arg0 = self.last_emitted_args[0];
+            let arg1 = self.last_emitted_args[1];
+            match last_opcode {
+                Some(OpCode::IntAddOvf) => {
+                    self.record_pure_from_args(OpCode::IntSub, result, arg1, arg0);
+                    self.record_pure_from_args(OpCode::IntSub, result, arg0, arg1);
+                }
+                Some(OpCode::IntSubOvf) => {
+                    self.record_pure_from_args(OpCode::IntAdd, result, arg1, arg0);
+                    self.record_pure_from_args(OpCode::IntSub, arg0, result, arg1);
+                }
+                _ => {}
+            }
+        }
+        // intbounds.py:229: return self.emit(op)
         match self.pending_overflow_guard.take() {
             Some(PendingOverflowGuard::Present) => OptimizationResult::PassOn,
             Some(PendingOverflowGuard::ProvenSafeRemoved) | None => OptimizationResult::Remove,
