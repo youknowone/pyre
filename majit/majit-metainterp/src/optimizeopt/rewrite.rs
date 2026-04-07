@@ -2691,10 +2691,25 @@ impl Optimization for OptRewrite {
             // ── Pointer equality (rewrite.py: _optimize_oois_ooisnot) ──
             OpCode::PtrEq | OpCode::InstancePtrEq => {
                 let instance = matches!(op.opcode, OpCode::InstancePtrEq);
+                if instance {
+                    // rewrite.py:563-565 optimize_INSTANCE_PTR_EQ:
+                    //     arg0 = get_box_replacement(op.getarg(0))
+                    //     arg1 = get_box_replacement(op.getarg(1))
+                    //     self.pure_from_args2(rop.INSTANCE_PTR_EQ, arg1, arg0, op)
+                    let arg0 = ctx.get_box_replacement(op.arg(0));
+                    let arg1 = ctx.get_box_replacement(op.arg(1));
+                    ctx.register_pure_from_args2(OpCode::InstancePtrEq, op.pos, arg1, arg0);
+                }
                 return self.optimize_oois_ooisnot(op, false, instance, ctx);
             }
             OpCode::PtrNe | OpCode::InstancePtrNe => {
                 let instance = matches!(op.opcode, OpCode::InstancePtrNe);
+                if instance {
+                    // rewrite.py:568-571 optimize_INSTANCE_PTR_NE: same swap.
+                    let arg0 = ctx.get_box_replacement(op.arg(0));
+                    let arg1 = ctx.get_box_replacement(op.arg(1));
+                    ctx.register_pure_from_args2(OpCode::InstancePtrNe, op.pos, arg1, arg0);
+                }
                 return self.optimize_oois_ooisnot(op, true, instance, ctx);
             }
 
