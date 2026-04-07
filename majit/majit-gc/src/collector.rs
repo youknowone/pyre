@@ -15,7 +15,7 @@ use crate::flags;
 use crate::header::{GcHeader, header_of};
 use crate::nursery::{DEFAULT_NURSERY_SIZE, Nursery};
 use crate::oldgen::OldGen;
-use crate::trace::{TypeInfo, TypeRegistry};
+use crate::trace::{ClassTypeLayout, TypeEntry, TypeInfo, TypeInfoLayout, TypeRegistry};
 
 /// Configuration for the MiniMarkGC.
 pub struct GcConfig {
@@ -129,6 +129,7 @@ impl IncrementalMarkState {
 const MAJOR_COLLECT_RATIO: f64 = 1.82;
 
 /// The MiniMark generational GC.
+#[allow(non_snake_case)] // _T_IS_RPYTHON_INSTANCE_BYTE keeps the RPython spelling
 pub struct MiniMarkGC {
     /// The nursery (young generation).
     nursery: Nursery,
@@ -183,6 +184,22 @@ pub struct MiniMarkGC {
     /// keeps an explicit table because frontends register vtables
     /// independently of any translator pipeline.
     vtable_to_type_id: HashMap<usize, u32>,
+    /// `gc.py:603-622 _setup_guard_is_object` instance state.
+    /// `_infobits_offset` is the byte offset of `infobits` inside
+    /// `TYPE_INFO`; `_infobits_offset_plus` is the additional offset
+    /// past leading zero bytes of the little-endian flag word.
+    /// `_T_IS_RPYTHON_INSTANCE_BYTE` is the single non-zero byte
+    /// pulled out of the flag word.
+    ///
+    /// Mirrors RPython's GcLLDescr_framework instance fields exactly
+    /// — they're computed once at construction by `_setup_guard_is_object`
+    /// and read by `get_translated_info_for_guard_is_object`. The
+    /// `_T_IS_RPYTHON_INSTANCE_BYTE` field name keeps the RPython
+    /// upper-case spelling so a `git grep` across the two trees
+    /// finds the same name on both sides.
+    _infobits_offset: usize,
+    _infobits_offset_plus: usize,
+    _T_IS_RPYTHON_INSTANCE_BYTE: u8,
 }
 
 impl MiniMarkGC {
@@ -194,7 +211,7 @@ impl MiniMarkGC {
     /// Create a new GC with custom configuration.
     pub fn with_config(config: GcConfig) -> Self {
         let nursery_size = config.nursery_size;
-        MiniMarkGC {
+        let mut gc = MiniMarkGC {
             nursery: Nursery::new(config.nursery_size),
             oldgen: OldGen::new(),
             types: TypeRegistry::new(),
@@ -212,7 +229,55 @@ impl MiniMarkGC {
             pinned_objects: HashSet::new(),
             compiled_code_registry: CompiledCodeRegistry::new(),
             vtable_to_type_id: HashMap::new(),
+            _infobits_offset: 0,
+            _infobits_offset_plus: 0,
+            _T_IS_RPYTHON_INSTANCE_BYTE: 0,
+        };
+        gc._setup_guard_is_object();
+        gc
+    }
+
+    /// `gc.py:603-617 _setup_guard_is_object` parity. Computes
+    /// `(_infobits_offset, _infobits_offset_plus, _T_IS_RPYTHON_INSTANCE_BYTE)`
+    /// once at construction time and stores them as instance state.
+    /// Mirrors line-by-line:
+    ///
+    /// ```python
+    /// def _setup_guard_is_object(self):
+    ///     from rpython.memory.gctypelayout import GCData, T_IS_RPYTHON_INSTANCE
+    ///     import struct
+    ///     infobits_offset, _ = symbolic.get_field_token(
+    ///         GCData.TYPE_INFO, 'infobits', True)
+    ///     mask = struct.pack("l", T_IS_RPYTHON_INSTANCE)
+    ///     assert mask.count('\x00') == len(mask) - 1
+    ///     infobits_offset_plus = 0
+    ///     while mask.startswith('\x00'):
+    ///         infobits_offset_plus += 1
+    ///         mask = mask[1:]
+    ///     self._infobits_offset = infobits_offset
+    ///     self._infobits_offset_plus = infobits_offset_plus
+    ///     self._T_IS_RPYTHON_INSTANCE_BYTE = ord(mask[0])
+    /// ```
+    fn _setup_guard_is_object(&mut self) {
+        // `symbolic.get_field_token(TYPE_INFO, 'infobits', True)`.
+        let infobits_offset = TypeInfoLayout::INFOBITS_OFFSET;
+        // `mask = struct.pack("l", T_IS_RPYTHON_INSTANCE)`.
+        let mask = TypeInfoLayout::T_IS_RPYTHON_INSTANCE.to_le_bytes();
+        // `assert mask.count('\x00') == len(mask) - 1`.
+        let nonzero = mask.iter().filter(|&&b| b != 0).count();
+        assert_eq!(
+            nonzero, 1,
+            "T_IS_RPYTHON_INSTANCE must occupy exactly one byte of \
+             the packed Signed word (gc.py:610)"
+        );
+        // `while mask.startswith('\x00'): infobits_offset_plus += 1; mask = mask[1:]`.
+        let mut infobits_offset_plus = 0usize;
+        while infobits_offset_plus < mask.len() && mask[infobits_offset_plus] == 0 {
+            infobits_offset_plus += 1;
         }
+        self._infobits_offset = infobits_offset;
+        self._infobits_offset_plus = infobits_offset_plus;
+        self._T_IS_RPYTHON_INSTANCE_BYTE = mask[infobits_offset_plus];
     }
 
     /// Register a type and return its ID.
@@ -1410,53 +1475,168 @@ impl GcAllocator for MiniMarkGC {
         self.vtable_to_type_id.insert(vtable, type_id);
     }
 
+    /// gctypelayout.py:393-398 `encode_type_shapes_now` parity:
+    /// closes the type-registration phase on the underlying
+    /// `TypeRegistry`. The materialized `type_info_group` base
+    /// address is stable from this point on, and every is_object
+    /// type's preorder `subclassrange_{min,max}` is computed via
+    /// `assign_inheritance_ids` (normalizecalls.py:373-389).
+    fn freeze_types(&mut self) {
+        self.types.freeze_types();
+    }
+
+    /// gc.py:318 `GcLLDescr_framework.supports_guard_gc_type = True`.
+    /// MiniMarkGC owns a `TypeRegistry` that materializes a `TYPE_INFO`
+    /// table on demand, so the framework-equivalent flag is always
+    /// true here. (Boehm-equivalent stubs override the trait default
+    /// and leave it `false`.)
+    fn supports_guard_gc_type(&self) -> bool {
+        true
+    }
+
     /// gc.py:631-642 `check_is_object` parity.
     ///
-    /// RPython reads the type_id from the GC header and consults the
-    /// `T_IS_RPYTHON_INSTANCE` flag in `TypeInfo`. MiniMarkGC's managed
-    /// objects have a `GcHeader` immediately before the payload; for
-    /// foreign pointers (e.g. frontend-allocated objects with no majit
-    /// GC header) the lookup falls back to the vtable→type_id table
-    /// populated via `register_vtable_for_type`. The fallback reads
-    /// offset 0 of the payload as a class pointer — this is safe under
-    /// the RPython `rclass.OBJECT` layout invariant and mirrors
-    /// `cpu.cls_of_box` (llmodel.py:556-561).
+    /// Implemented line-by-line as the RPython source:
+    ///     typeid = self.get_actual_typeid(gcptr)
+    ///     base_type_info, shift_by, sizeof_ti = (
+    ///         self.get_translated_info_for_typeinfo())
+    ///     infobits_offset, IS_OBJECT_FLAG = (
+    ///         self.get_translated_info_for_guard_is_object())
+    ///     p = base_type_info + (typeid << shift_by) + infobits_offset
+    ///     p = rffi.cast(rffi.CCHARP, p)
+    ///     return (ord(p[0]) & IS_OBJECT_FLAG) != 0
+    ///
+    /// `get_actual_typeid` is the only majit-specific seam: managed
+    /// objects carry a `GcHeader` immediately before the payload, while
+    /// pyre's host-allocated foreign objects keep their classptr at
+    /// offset 0 and rely on the `vtable→type_id` table populated via
+    /// `register_vtable_for_type`.
     fn check_is_object(&self, gcref: GcRef) -> bool {
         if gcref.is_null() {
             return false;
         }
-        // Managed path: header at `gcref - HEADER_SIZE` holds the
-        // type_id for objects allocated through this collector.
+        // gc.py:634: typeid = self.get_actual_typeid(gcptr).
+        let Some(typeid) = self.get_actual_typeid(gcref) else {
+            return false;
+        };
+        // gc.py:636-637: gc_ll_descr lookups.
+        let (base_type_info, shift_by, _sizeof_ti) = self.get_translated_info_for_typeinfo();
+        let (infobits_offset, is_object_flag) = self.get_translated_info_for_guard_is_object();
+        // gc.py:640-642: addr arithmetic + byte test.
+        let typeid = typeid as usize;
+        if typeid >= self.types.len() {
+            return false;
+        }
+        let p = base_type_info + (typeid << shift_by) + infobits_offset;
+        let byte = unsafe { *(p as *const u8) };
+        (byte & is_object_flag) != 0
+    }
+
+    /// gc.py:592 `get_translated_info_for_typeinfo` parity.
+    /// Returns `(type_info_group_base, shift_by, sizeof_ti)` — the
+    /// base address of the materialized `type_info_group` table, the
+    /// SIB-style scale `genop_guard_guard_is_object` /
+    /// `genop_guard_guard_subclass` apply to the typeid register
+    /// (x86/assembler.py:1934, 1967), and `rffi.sizeof(TYPE_INFO)`.
+    ///
+    /// RPython's 64-bit port sets `shift_by = 0` because its typeid
+    /// is already `GROUP_MEMBER_OFFSET`, i.e. the raw byte offset of
+    /// the member inside the group struct
+    /// (translator/c/src/llgroup.h:36). majit keeps typeid as a
+    /// small-integer index (returned by `register_type`) and encodes
+    /// the per-entry stride here: `shift_by = log2(TypeEntry::STRIDE)`
+    /// so the backend formula
+    /// `base + (typeid << shift_by) + offset` lands on the correct
+    /// `TypeEntry[typeid]` field. `sizeof_ti` stays equal to
+    /// `rffi.sizeof(TYPE_INFO)` because that is the distance to the
+    /// paired `CLASSTYPE` entry the `genop_guard_guard_subclass`
+    /// formula needs (`+ sizeof_ti + offset2`
+    /// x86/assembler.py:1968-1969, gctypelayout.py:359-374
+    /// `add_vtable_after_typeinfo`).
+    fn get_translated_info_for_typeinfo(&self) -> (usize, u8, usize) {
+        let table = self.types.type_info_table();
+        let base = table.as_ptr() as usize;
+        (base, TypeEntry::SHIFT_BY, TypeInfoLayout::SIZE_OF_TI)
+    }
+
+    /// gc.py:619-622 `get_translated_info_for_guard_is_object` parity.
+    /// Reads the instance state populated by `_setup_guard_is_object`
+    /// and returns `(infobits_offset + infobits_offset_plus,
+    /// T_IS_RPYTHON_INSTANCE_BYTE)`. Mirrors:
+    ///
+    /// ```python
+    /// def get_translated_info_for_guard_is_object(self):
+    ///     infobits_offset = rffi.cast(lltype.Signed, self._infobits_offset)
+    ///     infobits_offset += self._infobits_offset_plus
+    ///     return (infobits_offset, self._T_IS_RPYTHON_INSTANCE_BYTE)
+    /// ```
+    fn get_translated_info_for_guard_is_object(&self) -> (usize, u8) {
+        let infobits_offset = self._infobits_offset + self._infobits_offset_plus;
+        (infobits_offset, self._T_IS_RPYTHON_INSTANCE_BYTE)
+    }
+
+    /// x86/assembler.py:1951 `cpu.subclassrange_min_offset` parity.
+    /// Byte offset of `subclassrange_min` inside `ClassTypeLayout`,
+    /// the paired `rclass.CLASSTYPE` member that immediately follows
+    /// the `TYPE_INFO` entry in the type_info_group
+    /// (gctypelayout.py:359-374).
+    fn subclassrange_min_offset(&self) -> usize {
+        ClassTypeLayout::SUBCLASSRANGE_MIN_OFFSET
+    }
+
+    /// x86/assembler.py:1971-1974 codegen-time bounds lookup parity.
+    /// Resolves `classptr` through the registered vtable→typeid map and
+    /// returns the type's `(subclassrange_min, subclassrange_max)`.
+    fn subclass_range(&self, classptr: usize) -> Option<(i64, i64)> {
+        let type_id = self.vtable_to_type_id.get(&classptr).copied()?;
+        let info = self.types.get(type_id);
+        Some((info.subclassrange_min, info.subclassrange_max))
+    }
+
+    /// Companion to `subclass_range` keyed by typeid. Used by the
+    /// executor's `GuardSubclass` arm after it resolves `value.typeptr`
+    /// via `get_actual_typeid` (llgraph/runner.py:1271-1281).
+    fn typeid_subclass_range(&self, typeid: u32) -> Option<(i64, i64)> {
+        if (typeid as usize) >= self.types.len() {
+            return None;
+        }
+        let info = self.types.get(typeid);
+        Some((info.subclassrange_min, info.subclassrange_max))
+    }
+
+    /// gc.py:624-629 `get_actual_typeid` parity.
+    ///
+    /// RPython reads the typeid from the GC header word
+    /// (`llop.extract_ushort(llgroup.HALFWORD, hdr.tid)`). MiniMarkGC's
+    /// managed objects use the same layout — `GcHeader::SIZE` bytes
+    /// before the payload, type id in the lower `TYPE_ID_BITS`. pyre's
+    /// host-allocated "foreign" objects do not carry a `GcHeader`; for
+    /// those we recover the type id by reading the classptr (offset 0)
+    /// and looking it up in `vtable_to_type_id`, which is what
+    /// `register_vtable_for_type` populated.
+    fn get_actual_typeid(&self, gcref: GcRef) -> Option<u32> {
+        if gcref.is_null() {
+            return None;
+        }
         if self.is_managed_heap_object(gcref.0) {
             let header_addr = gcref.0.wrapping_sub(crate::header::GcHeader::SIZE);
             let header: crate::header::GcHeader = unsafe { *(header_addr as *const _) };
-            let type_id = header.type_id() as usize;
-            if type_id >= self.types.len() {
-                return false;
-            }
-            return self.types.get(type_id as u32).is_object;
+            return Some(header.type_id());
         }
-        // Foreign path: read offset 0 as the classptr and consult the
-        // vtable→type_id map. Only objects whose frontends registered
-        // their vtables pass this check; raw buffers / non-object
-        // foreign pointers whose offset 0 is not a known class return
-        // false.
+        // Foreign object — read classptr at offset 0 and consult the
+        // vtable→type_id table populated via register_vtable_for_type.
         let vtable = unsafe { *(gcref.0 as *const usize) };
-        let Some(type_id) = self.vtable_to_type_id.get(&vtable).copied() else {
-            return false;
-        };
-        let type_id = type_id as usize;
-        if type_id >= self.types.len() {
-            return false;
-        }
-        self.types.get(type_id as u32).is_object
+        self.vtable_to_type_id.get(&vtable).copied()
     }
 
-    /// llmodel.py:63 parity. MiniMarkGC carries a type registry rich
-    /// enough for `check_is_object`, so it behaves like a translated
-    /// real backend (`supports_guard_gc_type = True`).
-    fn supports_guard_gc_type(&self) -> bool {
-        true
+    /// Companion to `check_is_object` keyed by typeid. Reads the
+    /// `T_IS_RPYTHON_INSTANCE` bit directly from the materialized
+    /// TYPE_INFO entry (gctypelayout.py:642).
+    fn typeid_is_object(&self, typeid: u32) -> Option<bool> {
+        if (typeid as usize) >= self.types.len() {
+            return None;
+        }
+        Some(self.types.get(typeid).is_object)
     }
 }
 

@@ -895,6 +895,62 @@ fn check_is_object_via_active_runtime(gcref: GcRef) -> bool {
     })
 }
 
+/// `majit_gc::GetActualTypeidFn` installed by `set_gc_allocator`.
+/// Mirrors `gc.py:624-629 get_actual_typeid`: extracts the managed GC
+/// header half-word typeid, falling back to the
+/// `vtable_to_type_id` table populated via `register_vtable_for_type`
+/// for pyre's foreign PyObject layout.
+fn get_actual_typeid_via_active_runtime(gcref: GcRef) -> Option<u32> {
+    let id = ACTIVE_GC_RUNTIME_ID.with(|c| c.get())?;
+    GC_RUNTIMES.with(|r| {
+        let guard = r.borrow();
+        guard
+            .get(&id)
+            .and_then(|runtime| runtime.get_actual_typeid(gcref))
+    })
+}
+
+/// `majit_gc::SubclassRangeFn` installed by `set_gc_allocator`.
+/// Resolves the codegen-time `rclass.CLASSTYPE.subclassrange_{min,max}`
+/// lookup from x86/assembler.py:1971-1974 through the GC's
+/// vtable→typeid table.
+fn subclass_range_via_active_runtime(classptr: usize) -> Option<(i64, i64)> {
+    let id = ACTIVE_GC_RUNTIME_ID.with(|c| c.get())?;
+    GC_RUNTIMES.with(|r| {
+        let guard = r.borrow();
+        guard
+            .get(&id)
+            .and_then(|runtime| runtime.subclass_range(classptr))
+    })
+}
+
+/// `majit_gc::TypeidSubclassRangeFn` installed by `set_gc_allocator`.
+/// Companion to `subclass_range` keyed by typeid — the executor uses
+/// it to recover `value.typeptr.subclassrange_min` after extracting
+/// the typeid via `get_actual_typeid`.
+fn typeid_subclass_range_via_active_runtime(typeid: u32) -> Option<(i64, i64)> {
+    let id = ACTIVE_GC_RUNTIME_ID.with(|c| c.get())?;
+    GC_RUNTIMES.with(|r| {
+        let guard = r.borrow();
+        guard
+            .get(&id)
+            .and_then(|runtime| runtime.typeid_subclass_range(typeid))
+    })
+}
+
+/// `majit_gc::TypeidIsObjectFn` installed by `set_gc_allocator`.
+/// Answers "does this typeid have `T_IS_RPYTHON_INSTANCE` set in its
+/// TYPE_INFO entry" for the executor's `GuardIsObject` arm.
+fn typeid_is_object_via_active_runtime(typeid: u32) -> Option<bool> {
+    let id = ACTIVE_GC_RUNTIME_ID.with(|c| c.get())?;
+    GC_RUNTIMES.with(|r| {
+        let guard = r.borrow();
+        guard
+            .get(&id)
+            .and_then(|runtime| runtime.typeid_is_object(typeid))
+    })
+}
+
 pub(crate) fn register_gc_roots(runtime_id: u64, roots: &mut [GcRef]) {
     if roots.is_empty() {
         return;
@@ -4845,22 +4901,32 @@ impl CraneliftBackend {
 
     pub fn set_gc_allocator(&mut self, mut gc: Box<dyn GcAllocator>) {
         ensure_jitframe_type_registered(gc.as_mut());
+        // gctypelayout.encode_type_shapes_now parity: close the
+        // type-registration phase before any compile embeds the
+        // type_info_group base address. After this, register_type
+        // panics and every is_object type's subclassrange is filled
+        // in by the preorder walk in assign_inheritance_ids.
+        gc.freeze_types();
         let supports_guard_gc_type = gc.supports_guard_gc_type();
         if let Some(runtime_id) = self.gc_runtime_id {
             replace_gc_runtime(runtime_id, gc);
         } else {
             self.gc_runtime_id = Some(register_gc_runtime(gc));
         }
-        // Publish the backend's `check_is_object` implementation on a
-        // thread-local so the backend-agnostic optimizer (majit-metainterp)
-        // can consult it from `PtrInfo::get_known_class` on constant Refs
-        // without taking a cranelift dependency. Mirrors RPython's
+        // Publish the backend's GC-guard seam on a thread-local so
+        // the backend-agnostic optimizer (majit-metainterp) and
+        // blackhole executor can reach the live allocator without
+        // taking a cranelift dependency. Mirrors RPython's
         // `self.optimizer.cpu.check_is_object(...)` access path.
         ACTIVE_GC_RUNTIME_ID.with(|c| c.set(self.gc_runtime_id));
-        majit_gc::set_active_check_is_object(
-            Some(check_is_object_via_active_runtime),
+        majit_gc::set_active_gc_guard_hooks(majit_gc::ActiveGcGuardHooks {
+            check_is_object: Some(check_is_object_via_active_runtime),
+            get_actual_typeid: Some(get_actual_typeid_via_active_runtime),
+            subclass_range: Some(subclass_range_via_active_runtime),
+            typeid_subclass_range: Some(typeid_subclass_range_via_active_runtime),
+            typeid_is_object: Some(typeid_is_object_via_active_runtime),
             supports_guard_gc_type,
-        );
+        });
     }
 
     /// Register constants available during the next `compile_loop` call.

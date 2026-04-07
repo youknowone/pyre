@@ -5,9 +5,30 @@
 
 use std::collections::HashMap;
 
-use majit_ir::{Op, OpCode, OpRef};
+use majit_ir::{GcRef, Op, OpCode, OpRef};
 
 use crate::blackhole::ExceptionState;
+
+/// llgraph/runner.py:1245-1251 `execute_guard_class` parity helper:
+/// mirrors `gc_ll_descr.get_actual_typeid(gcptr)` (gc.py:624-629)
+/// through the thread-local GC seam installed by the active backend.
+///
+/// For managed objects the active callback reads the GC header word
+/// and returns its typeid half-word; for pyre's foreign PyObject
+/// layout it consults the `vtable_to_type_id` table populated via
+/// `register_vtable_for_type`. Returns `None` when no backend is
+/// installed (unit tests dispatching with placeholder integers), which
+/// the caller translates into `executor.py:351-358` skip semantics.
+fn read_typeid(obj_ptr: i64) -> Option<u32> {
+    if obj_ptr <= 0 {
+        return None;
+    }
+    let addr = obj_ptr as usize;
+    if addr < 4096 {
+        return None;
+    }
+    majit_gc::get_actual_typeid(GcRef(addr))
+}
 
 /// Fast value store for trace execution.
 ///
@@ -356,22 +377,47 @@ pub(crate) fn execute_one(
             }
         }
         OpCode::GuardSubclass => {
-            // llgraph/runner.py:1271-1281 execute_guard_subclass:
-            //   unsigned range check
-            //     expected.subclassrange_min
-            //       <= value.typeptr.subclassrange_min
-            //       <= expected.subclassrange_max
-            // majit's blackhole executor does not yet carry the
-            // subclassrange fields on its runtime types; re-executing
-            // GUARD_SUBCLASS in blackhole would require walking the
-            // TypeInfo table. Until that plumbing lands, treat the guard
-            // as passing when re-executed (the same decision the JIT
-            // made at compile time). This matches executor.py, which
-            // simply skips guards in its _GUARD_FIRST..._GUARD_LAST
-            // range; only the backend and the blackhole interpreter
-            // are supposed to re-run them, and our blackhole has no
-            // subclass-range lookup yet.
-            OpResult::Void
+            // rclass.py:1133-1140 ll_issubclass + opimpl.py:235-239
+            // op_int_between (`a <= b < c`):
+            //     return llop.int_between(Bool,
+            //                             cls.subclassrange_min,
+            //                             subcls.subclassrange_min,
+            //                             cls.subclassrange_max)
+            //
+            // x86/assembler.py:1975-1979 lowers the same predicate as
+            // an unsigned `(tmp - min) < (max - min)` compare; the
+            // cranelift / wasm backends already follow that pattern
+            // (`majit-backend-cranelift/src/compiler.rs:6439-6448`,
+            // `majit-backend-wasm/src/codegen.rs:978`). The executor
+            // path must use the same exclusive upper bound — note
+            // that `llgraph/runner.py:1271-1281`'s inclusive `<=` is a
+            // long-standing inconsistency in the testing fallback,
+            // not the assembler / rtyper contract.
+            //
+            // The object side reads its typeid through `get_actual_typeid`
+            // (which handles both the managed GC header and pyre's
+            // foreign PyObject seam) and resolves the preorder lower
+            // bound via `typeid_subclass_range`. The expected class
+            // side looks up its bounds through `subclass_range`,
+            // which translates the constant vtable pointer embedded
+            // in the guard arg. Unresolved entries fall through to
+            // `executor.py:351-358` skip semantics (guards are not in
+            // the dispatch table at all, so the blackhole never
+            // evaluates them in production).
+            let (obj_ptr, expected_classptr) = binop(values, op);
+            let value_min = read_typeid(obj_ptr)
+                .and_then(|tid| majit_gc::typeid_subclass_range(tid).map(|(min, _)| min));
+            let expected = majit_gc::subclass_range(expected_classptr as usize);
+            match (value_min, expected) {
+                (Some(vm), Some((emin, emax))) => {
+                    if emin <= vm && vm < emax {
+                        OpResult::Void
+                    } else {
+                        OpResult::GuardFailed
+                    }
+                }
+                _ => OpResult::Void,
+            }
         }
         OpCode::GuardNoOverflow => {
             if exc.ovf_flag {
@@ -418,15 +464,50 @@ pub(crate) fn execute_one(
             OpResult::GuardFailed
         }
         OpCode::GuardGcType => {
-            // In blackhole, skip (no GC type checking)
-            OpResult::Void
+            // llgraph/runner.py:1257-1261 execute_guard_gc_type:
+            //     assert isinstance(typeid, TypeIDSymbolic)
+            //     TYPE = arg._obj.container._TYPE
+            //     if TYPE != typeid.STRUCT_OR_ARRAY:
+            //         self.fail_guard(descr)
+            //
+            // majit reads `arg`'s typeid from the GC header and
+            // compares it against the immediate `typeid` carried in
+            // arg[1] (rewrite.py:GuardGcType emits a `ConstInt(type_id)`
+            // there). When the pointer cannot be dereferenced (e.g.
+            // unit tests dispatching with a placeholder integer), fall
+            // through to RPython's `executor.py:351-358` skip
+            // semantics: guards are not in the executor table.
+            let (obj_ptr, expected_tid) = binop(values, op);
+            match read_typeid(obj_ptr) {
+                Some(actual_tid) => {
+                    if actual_tid as i64 == expected_tid {
+                        OpResult::Void
+                    } else {
+                        OpResult::GuardFailed
+                    }
+                }
+                None => OpResult::Void,
+            }
         }
         OpCode::GuardIsObject => {
-            let a = unop(values, op);
-            if a != 0 {
-                OpResult::Void
-            } else {
-                OpResult::GuardFailed
+            // llgraph/runner.py:1263-1269 execute_guard_is_object:
+            //     TYPE = arg._obj.container._TYPE
+            //     while TYPE is not rclass.OBJECT:
+            //         if not isinstance(TYPE, lltype.GcStruct):
+            //             self.fail_guard(descr)
+            //             return
+            //         _, TYPE = TYPE._first_struct()
+            //
+            // majit's TYPE_INFO table stores a pre-computed
+            // `T_IS_RPYTHON_INSTANCE` flag per typeid
+            // (gctypelayout.py:642), so the equivalent walk is a
+            // single seam lookup. Without the backend installed, fall
+            // through to executor.py:351-358 skip semantics.
+            let obj_ptr = unop(values, op);
+            match read_typeid(obj_ptr).and_then(majit_gc::typeid_is_object) {
+                Some(true) => OpResult::Void,
+                Some(false) => OpResult::GuardFailed,
+                None => OpResult::Void,
             }
         }
 

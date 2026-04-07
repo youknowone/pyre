@@ -276,15 +276,38 @@ fn test_guard_gc_type_uses_immediate_typeid() {
     assert_eq!(guards.len(), 1);
 }
 
-/// x86/assembler.py:1925 `assert self.cpu.supports_guard_gc_type` —
-/// mirrored line-by-line as the first statement in the wasm codegen's
-/// GUARD_IS_OBJECT arm (codegen.rs). A default `GuardGcTypeInfo`
-/// matches `AbstractCPU.supports_guard_gc_type = False`
-/// (backend/model.py:21), so reaching this arm must panic rather than
-/// silently pass.
+/// Build a `GuardGcTypeInfo` matching what `WasmBackend::compile_loop`
+/// derives from a real `GcLLDescr_framework`-equivalent allocator.
+/// Mirrors `gc.py:592 get_translated_info_for_typeinfo` /
+/// `gc.py:619 get_translated_info_for_guard_is_object` /
+/// `x86/assembler.py:1951 cpu.subclassrange_min_offset`.
+fn enabled_guard_gc_type_info() -> codegen::GuardGcTypeInfo {
+    let mut info = codegen::GuardGcTypeInfo::default();
+    info.supports_guard_gc_type = true;
+    // Pretend the TYPE_INFO table sits at a small in-memory address;
+    // wasm validation only checks the bytecode shape, not the actual
+    // load addresses, so any value works for codegen testing.
+    info.base_type_info = 0x1000;
+    // majit `TypeEntry` stride = 32 bytes (TypeInfoLayout 16 + ClassTypeLayout 16).
+    // shift_by = log2(32) = 5, sizeof_ti = rffi.sizeof(TYPE_INFO) = 16.
+    info.shift_by = 5;
+    info.sizeof_ti = 16; // size_of::<TypeInfoLayout>()
+    // gc.py:603-622 _setup_guard_is_object: T_IS_RPYTHON_INSTANCE
+    // = 0x100000 (gctypelayout.py:196), packed little-endian into a
+    // Signed word — byte at offset +2 carries the flag, mask = 0x10.
+    info.infobits_offset = 2;
+    info.is_object_flag = 0x10;
+    info.subclassrange_min_offset = 0; // offset within ClassTypeLayout
+    info
+}
+
+/// x86/assembler.py:1924-1943 `genop_guard_guard_is_object` lowering —
+/// the wasm backend's GUARD_IS_OBJECT arm emits the same MOV+addr_add
+/// +TEST8+branch sequence. With `supports_guard_gc_type` enabled the
+/// `assert` at line 1925 falls through and the rest of the lowering
+/// runs; the resulting module must validate as legal wasm.
 #[test]
-#[should_panic(expected = "supports_guard_gc_type")]
-fn test_guard_is_object_asserts_supports_guard_gc_type() {
+fn test_guard_is_object_lowers_to_typeinfo_test() {
     let inputargs = vec![InputArg {
         index: 0,
         tp: Type::Int,
@@ -297,41 +320,69 @@ fn test_guard_is_object_asserts_supports_guard_gc_type() {
     ];
 
     let constants = HashMap::new();
-    let _ = codegen::build_wasm_module(
+    let (bytes, guards) = codegen::build_wasm_module(
         &inputargs,
         &ops,
         &constants,
         Some(0),
         &HashMap::new(),
-        &codegen::GuardGcTypeInfo::default(),
-    );
+        &enabled_guard_gc_type_info(),
+    )
+    .expect("wasm codegen should succeed when supports_guard_gc_type=true");
+    validate_wasm(&bytes);
+    assert_eq!(guards.len(), 1);
 }
 
-/// x86/assembler.py:1946 `assert self.cpu.supports_guard_gc_type` — same
-/// contract as GUARD_IS_OBJECT above for the GUARD_SUBCLASS arm.
+/// x86/assembler.py:1945-1980 `genop_guard_guard_subclass` lowering —
+/// the wasm backend's GUARD_SUBCLASS arm emits the gcremovetypeptr
+/// branch (cpu.vtable_offset = None) when `vtable_offset` is `None`,
+/// otherwise the vtable-load branch. With `supports_guard_gc_type`
+/// enabled and the constant classptr's `(min, max)` pre-fetched, the
+/// lowering runs to completion.
 #[test]
-#[should_panic(expected = "supports_guard_gc_type")]
-fn test_guard_subclass_asserts_supports_guard_gc_type() {
+fn test_guard_subclass_lowers_to_subclassrange_check() {
     let inputargs = vec![InputArg {
         index: 0,
         tp: Type::Int,
     }];
 
+    let class_constant = OpRef(10_000);
+    let mut constants = HashMap::new();
+    constants.insert(10_000, 0xCAFEi64);
+
     let ops = vec![
         Op::new(OpCode::Label, &[OpRef(0)]),
-        make_guard(OpCode::GuardSubclass, &[OpRef(0), OpRef(0)], &[OpRef(0)]),
+        make_guard(
+            OpCode::GuardSubclass,
+            &[OpRef(0), class_constant],
+            &[OpRef(0)],
+        ),
         Op::new(OpCode::Jump, &[OpRef(0)]),
     ];
 
-    let constants = HashMap::new();
-    let _ = codegen::build_wasm_module(
+    let mut info = enabled_guard_gc_type_info();
+    // assembler.py:1971-1974: codegen-time
+    // (vtable_ptr.subclassrange_min, vtable_ptr.subclassrange_max).
+    info.subclass_ranges.insert(0xCAFE, (10, 20));
+
+    // gcremovetypeptr branch: vtable_offset = None.
+    let (bytes, guards) =
+        codegen::build_wasm_module(&inputargs, &ops, &constants, None, &HashMap::new(), &info)
+            .expect("wasm codegen should succeed when supports_guard_gc_type=true");
+    validate_wasm(&bytes);
+    assert_eq!(guards.len(), 1);
+
+    // vtable-load branch: vtable_offset = Some(...).
+    let (bytes2, _) = codegen::build_wasm_module(
         &inputargs,
         &ops,
         &constants,
-        Some(0),
+        Some(8),
         &HashMap::new(),
-        &codegen::GuardGcTypeInfo::default(),
-    );
+        &info,
+    )
+    .expect("wasm codegen should succeed when vtable_offset is set");
+    validate_wasm(&bytes2);
 }
 
 #[test]

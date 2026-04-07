@@ -8,7 +8,7 @@
 ///
 /// Reference: rpython/memory/gc/incminimark.py, rpython/jit/backend/llsupport/gc.py
 use majit_ir::{GcRef, Op};
-pub use trace::TypeInfo;
+pub use trace::{ClassTypeLayout, TypeEntry, TypeInfo, TypeInfoLayout};
 
 pub mod collector;
 pub mod header;
@@ -227,6 +227,19 @@ pub trait GcAllocator: Send {
     /// GC type_info_group.
     fn register_vtable_for_type(&mut self, _vtable: usize, _type_id: u32) {}
 
+    /// `gctypelayout.encode_type_shapes_now` parity
+    /// (gctypelayout.py:393-398): closes the type-registration phase.
+    /// After freeze, `register_type` is forbidden, the
+    /// `type_info_group` base address is stable, and every
+    /// `is_object` type's `subclassrange_{min,max}` reflects the
+    /// preorder of its inheritance chain (`assign_inheritance_ids`,
+    /// rtyper/normalizecalls.py:373-389).
+    ///
+    /// Backends call this from `set_gc_allocator` so the embedded
+    /// codegen-time pointers and bounds are immutable thereafter.
+    /// Default no-op for stub allocators with no type table.
+    fn freeze_types(&mut self) {}
+
     /// llsupport/gc.py:162 / gc.py:318 `supports_guard_gc_type` flag.
     /// `GcLLDescr_boehm` sets it to `False`; `GcLLDescr_framework` sets
     /// it to `True`. Relayed to `cpu.supports_guard_gc_type` via
@@ -329,6 +342,30 @@ pub trait GcAllocator: Send {
     fn subclass_range(&self, _classptr: usize) -> Option<(i64, i64)> {
         None
     }
+
+    /// Companion to `subclass_range` keyed by typeid instead of
+    /// classptr. Used by the executor's `GuardSubclass` arm after it
+    /// resolves `value.typeptr` via `get_actual_typeid`
+    /// (llgraph/runner.py:1271-1281). Default `None`.
+    fn typeid_subclass_range(&self, _typeid: u32) -> Option<(i64, i64)> {
+        None
+    }
+
+    /// gc.py:624-629 `get_actual_typeid` parity. Reads the typeid
+    /// from the GC header half-word for managed objects, or resolves
+    /// the foreign object's classptr through `vtable_to_type_id` for
+    /// backends that register a seam (e.g. pyre's PyObject layout).
+    /// Default `None` for stubs without a type registry.
+    fn get_actual_typeid(&self, _gcref: GcRef) -> Option<u32> {
+        None
+    }
+
+    /// Companion to `check_is_object` keyed by typeid. Returns
+    /// whether the typeid carries `T_IS_RPYTHON_INSTANCE` in its
+    /// TYPE_INFO entry (gctypelayout.py:642). Default `None`.
+    fn typeid_is_object(&self, _typeid: u32) -> Option<bool> {
+        None
+    }
 }
 
 /// GC rewriter — transforms IR operations for GC integration.
@@ -415,17 +452,76 @@ use std::cell::Cell;
 /// unregistered.
 pub type CheckIsObjectFn = fn(GcRef) -> bool;
 
+/// Thread-local callback that answers `gc_ll_descr.get_actual_typeid`
+/// (gc.py:624-629) for the currently active backend. Returns the
+/// `rffi.cast(HDRPTR, gcptr).tid` half-word for managed objects and
+/// `vtable_to_type_id` for the foreign-object seam pyre uses. Paired
+/// with `ACTIVE_CHECK_IS_OBJECT`; both are installed together so the
+/// metainterp's guard interpretation stays consistent with the GC's
+/// runtime layout assumptions.
+pub type GetActualTypeidFn = fn(GcRef) -> Option<u32>;
+
+/// Thread-local callback that answers the codegen-time bounds lookup
+/// `rffi.cast(rclass.CLASSTYPE, vtable_ptr).subclassrange_{min,max}`
+/// from x86/assembler.py:1971-1974. Used by the executor's
+/// `GuardSubclass` arm to evaluate bridges interpretively.
+pub type SubclassRangeFn = fn(classptr: usize) -> Option<(i64, i64)>;
+
+/// Thread-local callback that answers the `value.typeptr
+/// .subclassrange_min/max` lookup from llgraph/runner.py:1271-1281
+/// directly by typeid. The backend installs this alongside
+/// `subclass_range` so the executor can recover the object side of
+/// `execute_guard_subclass` without going through a vtable pointer —
+/// managed objects carry only a typeid in their GC header, and the
+/// TYPE_INFO table already stores the preorder bounds in its paired
+/// `CLASSTYPE` entry (gctypelayout.py:359-374).
+pub type TypeidSubclassRangeFn = fn(typeid: u32) -> Option<(i64, i64)>;
+
+/// Thread-local callback that answers `rclass.OBJECT`-layout queries
+/// by typeid — "does this typeid carry `T_IS_RPYTHON_INSTANCE` in its
+/// TYPE_INFO entry" (gctypelayout.py:642). The executor's
+/// `GuardIsObject` arm calls this after resolving the object's typeid
+/// via the `get_actual_typeid` seam, avoiding a second indirection
+/// through `check_is_object` (which would re-resolve the typeid).
+pub type TypeidIsObjectFn = fn(typeid: u32) -> Option<bool>;
+
 thread_local! {
     static ACTIVE_CHECK_IS_OBJECT: Cell<Option<CheckIsObjectFn>> = const { Cell::new(None) };
+    static ACTIVE_GET_ACTUAL_TYPEID: Cell<Option<GetActualTypeidFn>> = const { Cell::new(None) };
+    static ACTIVE_SUBCLASS_RANGE: Cell<Option<SubclassRangeFn>> = const { Cell::new(None) };
+    static ACTIVE_TYPEID_SUBCLASS_RANGE: Cell<Option<TypeidSubclassRangeFn>> = const { Cell::new(None) };
+    static ACTIVE_TYPEID_IS_OBJECT: Cell<Option<TypeidIsObjectFn>> = const { Cell::new(None) };
     static ACTIVE_SUPPORTS_GUARD_GC_TYPE: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Install the active backend's `check_is_object` callback on this
-/// thread. Called by backends when they enter a JIT region. Pass `None`
-/// to clear.
-pub fn set_active_check_is_object(check: Option<CheckIsObjectFn>, supports_guard_gc_type: bool) {
-    ACTIVE_CHECK_IS_OBJECT.with(|c| c.set(check));
-    ACTIVE_SUPPORTS_GUARD_GC_TYPE.with(|c| c.set(supports_guard_gc_type));
+/// Bundle of callbacks the metainterp / executor can reach through
+/// thread-locals. Mirrors the fan-out of methods RPython's optimizer
+/// and blackhole reach via `self.cpu` / `self.cpu.gc_ll_descr`; majit
+/// installs them together so a backend swap is a single call.
+#[derive(Clone, Copy, Default)]
+pub struct ActiveGcGuardHooks {
+    pub check_is_object: Option<CheckIsObjectFn>,
+    pub get_actual_typeid: Option<GetActualTypeidFn>,
+    pub subclass_range: Option<SubclassRangeFn>,
+    pub typeid_subclass_range: Option<TypeidSubclassRangeFn>,
+    pub typeid_is_object: Option<TypeidIsObjectFn>,
+    pub supports_guard_gc_type: bool,
+}
+
+/// Install the active backend's GC-guard callbacks on this thread.
+/// Called by backends when they enter a JIT region. Pass a default
+/// `ActiveGcGuardHooks` with every field set to `None` / `false` to
+/// clear. Mirrors how RPython's `cpu` field lets the optimizer and
+/// executor reach `cpu.check_is_object`, `gc_ll_descr
+/// .get_actual_typeid`, and the codegen-time bounds lookup; majit
+/// bundles them here so a backend install is a single call.
+pub fn set_active_gc_guard_hooks(hooks: ActiveGcGuardHooks) {
+    ACTIVE_CHECK_IS_OBJECT.with(|c| c.set(hooks.check_is_object));
+    ACTIVE_GET_ACTUAL_TYPEID.with(|c| c.set(hooks.get_actual_typeid));
+    ACTIVE_SUBCLASS_RANGE.with(|c| c.set(hooks.subclass_range));
+    ACTIVE_TYPEID_SUBCLASS_RANGE.with(|c| c.set(hooks.typeid_subclass_range));
+    ACTIVE_TYPEID_IS_OBJECT.with(|c| c.set(hooks.typeid_is_object));
+    ACTIVE_SUPPORTS_GUARD_GC_TYPE.with(|c| c.set(hooks.supports_guard_gc_type));
 }
 
 /// llmodel.py:541-546 `cpu.check_is_object(gcptr)` shim. Returns whether
@@ -439,6 +535,47 @@ pub fn check_is_object(gcref: GcRef) -> bool {
         Some(f) => f(gcref),
         None => false,
     })
+}
+
+/// gc.py:624-629 `gc_ll_descr.get_actual_typeid(gcptr)` shim.
+/// Delegates to the active backend's installed callback; returns
+/// `None` when no backend is installed, which mirrors
+/// `llgraph/runner.py:1263-1269` skip semantics (the interpretive
+/// guard treats an unresolved object as passing).
+pub fn get_actual_typeid(gcref: GcRef) -> Option<u32> {
+    if gcref.is_null() {
+        return None;
+    }
+    ACTIVE_GET_ACTUAL_TYPEID.with(|c| match c.get() {
+        Some(f) => f(gcref),
+        None => None,
+    })
+}
+
+/// x86/assembler.py:1971-1974 codegen-time bounds lookup shim used by
+/// the interpretive `GuardSubclass`. Returns
+/// `(subclassrange_min, subclassrange_max)` for the class whose vtable
+/// pointer is given, or `None` when no backend is installed.
+pub fn subclass_range(classptr: usize) -> Option<(i64, i64)> {
+    ACTIVE_SUBCLASS_RANGE.with(|c| c.get().and_then(|f| f(classptr)))
+}
+
+/// Companion to `subclass_range` keyed by typeid instead of classptr.
+/// Resolves `value.typeptr.subclassrange_min/max` from
+/// llgraph/runner.py:1271-1281 when the executor only has a typeid in
+/// hand (e.g. after calling `get_actual_typeid` on an object whose
+/// classptr is known only to the GC). Returns `None` when no backend
+/// is installed.
+pub fn typeid_subclass_range(typeid: u32) -> Option<(i64, i64)> {
+    ACTIVE_TYPEID_SUBCLASS_RANGE.with(|c| c.get().and_then(|f| f(typeid)))
+}
+
+/// Companion to `check_is_object` keyed by typeid. Called by the
+/// executor's `GuardIsObject` arm after resolving the object to a
+/// typeid via `get_actual_typeid`. Returns `None` when no backend is
+/// installed.
+pub fn typeid_is_object(typeid: u32) -> Option<bool> {
+    ACTIVE_TYPEID_IS_OBJECT.with(|c| c.get().and_then(|f| f(typeid)))
 }
 
 /// llmodel.py:63 `supports_guard_gc_type` shim. Mirrors the active

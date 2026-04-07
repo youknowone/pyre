@@ -10,12 +10,56 @@ pub mod failguard;
 #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
 mod js_glue;
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use failguard::{CompiledWasmLoop, WasmFailDescr, WasmFrameData};
 use majit_backend::{AsmInfo, BackendError, DeadFrame, JitCellToken};
+use majit_gc::GcAllocator;
 use majit_ir::{FailDescr, GcRef, InputArg, Op, OpRef, Type, Value};
+
+thread_local! {
+    /// llmodel.py self.gc_ll_descr — owned by the active wasm
+    /// backend on this thread. Stored as a thread-local so the
+    /// backend-agnostic `majit_gc::ActiveGcGuardHooks` shims can
+    /// reach the live allocator without taking a wasm dependency.
+    /// Mirrors `cranelift::compiler::GC_RUNTIMES` /
+    /// `ACTIVE_GC_RUNTIME_ID`; cranelift carries an id because it
+    /// supports multiple registered GCs across compile sessions,
+    /// while wasm only has one active backend at a time.
+    static WASM_ACTIVE_GC: RefCell<Option<Box<dyn GcAllocator>>> = const { RefCell::new(None) };
+}
+
+fn with_wasm_active_gc<R>(f: impl FnOnce(&dyn GcAllocator) -> R) -> Option<R> {
+    WASM_ACTIVE_GC.with(|cell| {
+        let guard = cell.borrow();
+        guard.as_deref().map(f)
+    })
+}
+
+/// `majit_gc::CheckIsObjectFn` installed by `set_gc_allocator`.
+/// Mirrors cranelift's `check_is_object_via_active_runtime`: dispatches
+/// through the wasm-thread-local GC allocator.
+fn wasm_check_is_object(gcref: GcRef) -> bool {
+    with_wasm_active_gc(|gc| gc.check_is_object(gcref)).unwrap_or(false)
+}
+
+fn wasm_get_actual_typeid(gcref: GcRef) -> Option<u32> {
+    with_wasm_active_gc(|gc| gc.get_actual_typeid(gcref)).flatten()
+}
+
+fn wasm_subclass_range(classptr: usize) -> Option<(i64, i64)> {
+    with_wasm_active_gc(|gc| gc.subclass_range(classptr)).flatten()
+}
+
+fn wasm_typeid_subclass_range(typeid: u32) -> Option<(i64, i64)> {
+    with_wasm_active_gc(|gc| gc.typeid_subclass_range(typeid)).flatten()
+}
+
+fn wasm_typeid_is_object(typeid: u32) -> Option<bool> {
+    with_wasm_active_gc(|gc| gc.typeid_is_object(typeid)).flatten()
+}
 
 pub struct WasmBackend {
     trace_counter: u64,
@@ -23,9 +67,6 @@ pub struct WasmBackend {
     constants: HashMap<u32, i64>,
     /// llmodel.py:64-69 self.vtable_offset.
     vtable_offset: Option<usize>,
-    /// llmodel.py self.gc_ll_descr — GC layer used by the
-    /// gcremovetypeptr branch of `_cmp_guard_class`.
-    gc_ll_descr: Option<Box<dyn majit_gc::GcAllocator>>,
 }
 
 impl WasmBackend {
@@ -34,7 +75,6 @@ impl WasmBackend {
             trace_counter: 0,
             constants: HashMap::new(),
             vtable_offset: None,
-            gc_ll_descr: None,
         }
     }
 
@@ -57,10 +97,28 @@ impl WasmBackend {
     pub fn set_next_header_pc(&mut self, _header_pc: u64) {}
 
     /// llmodel.py:53-54: store gc_ll_descr on the cpu instance.
-    /// wasm has no allocator codegen yet, but the gc_ll_descr is still
-    /// needed by the gcremovetypeptr branch of _cmp_guard_class.
-    pub fn set_gc_allocator(&mut self, gc: Box<dyn majit_gc::GcAllocator>) {
-        self.gc_ll_descr = Some(gc);
+    ///
+    /// Mirrors `CraneliftBackend::set_gc_allocator`: stores the box in
+    /// the wasm thread-local seam and publishes the same five
+    /// `ActiveGcGuardHooks` so the backend-agnostic optimizer /
+    /// blackhole executor reach the live allocator without taking a
+    /// wasm dependency.
+    pub fn set_gc_allocator(&mut self, mut gc: Box<dyn majit_gc::GcAllocator>) {
+        // gctypelayout.encode_type_shapes_now parity: close the
+        // type-registration phase before any compile embeds the
+        // type_info_group base address. Mirrors
+        // `CraneliftBackend::set_gc_allocator`.
+        gc.freeze_types();
+        let supports_guard_gc_type = gc.supports_guard_gc_type();
+        WASM_ACTIVE_GC.with(|cell| *cell.borrow_mut() = Some(gc));
+        majit_gc::set_active_gc_guard_hooks(majit_gc::ActiveGcGuardHooks {
+            check_is_object: Some(wasm_check_is_object),
+            get_actual_typeid: Some(wasm_get_actual_typeid),
+            subclass_range: Some(wasm_subclass_range),
+            typeid_subclass_range: Some(wasm_typeid_subclass_range),
+            typeid_is_object: Some(wasm_typeid_is_object),
+            supports_guard_gc_type,
+        });
     }
 
     /// llmodel.py:64-69 self.vtable_offset configuration.
@@ -73,9 +131,7 @@ impl WasmBackend {
     /// Resolves a vtable pointer to its registered GC type id via the
     /// installed gc_ll_descr.
     pub fn lookup_typeid_from_classptr(&self, classptr: usize) -> Option<u32> {
-        self.gc_ll_descr
-            .as_ref()
-            .and_then(|gc| gc.get_typeid_from_classptr_if_gcremovetypeptr(classptr))
+        with_wasm_active_gc(|gc| gc.get_typeid_from_classptr_if_gcremovetypeptr(classptr)).flatten()
     }
 
     /// Pre-compute classptr → expected_typeid pairs for every GuardClass /
@@ -86,7 +142,10 @@ impl WasmBackend {
     /// GUARD_IS_OBJECT / GUARD_SUBCLASS use a different lookup path.
     fn collect_classptr_typeid_table(&self, ops: &[Op]) -> HashMap<i64, u32> {
         let mut table = HashMap::new();
-        if self.vtable_offset.is_some() || self.gc_ll_descr.is_none() {
+        if self.vtable_offset.is_some() {
+            return table;
+        }
+        if WASM_ACTIVE_GC.with(|cell| cell.borrow().is_none()) {
             return table;
         }
         for op in ops {
@@ -119,37 +178,36 @@ impl WasmBackend {
     /// every constant classptr argument of a `GuardSubclass` op
     /// (assembler.py:1971-1974 reads these bounds at codegen time).
     fn collect_guard_gc_type_info(&self, ops: &[Op]) -> codegen::GuardGcTypeInfo {
-        let mut info = codegen::GuardGcTypeInfo::default();
-        let gc = match self.gc_ll_descr.as_ref() {
-            Some(gc) => gc,
-            None => return info,
-        };
-        info.supports_guard_gc_type = gc.supports_guard_gc_type();
-        if !info.supports_guard_gc_type {
-            return info;
-        }
-        // assembler.py:1934-1937: gc_ll_descr lookups.
-        let (base, shift, sizeof_ti) = gc.get_translated_info_for_typeinfo();
-        info.base_type_info = base;
-        info.shift_by = shift;
-        info.sizeof_ti = sizeof_ti;
-        let (infobits_off, is_object_flag) = gc.get_translated_info_for_guard_is_object();
-        info.infobits_offset = infobits_off;
-        info.is_object_flag = is_object_flag;
-        // assembler.py:1951: cpu.subclassrange_min_offset.
-        info.subclassrange_min_offset = gc.subclassrange_min_offset();
-        // assembler.py:1971-1974: (subclassrange_min, subclassrange_max)
-        // for every constant GuardSubclass arg1.
-        for op in ops {
-            if op.opcode == majit_ir::OpCode::GuardSubclass && op.args.len() >= 2 {
-                if let Some(&classptr) = self.constants.get(&op.args[1].0) {
-                    if let Some(range) = gc.subclass_range(classptr as usize) {
-                        info.subclass_ranges.insert(classptr, range);
+        with_wasm_active_gc(|gc| {
+            let mut info = codegen::GuardGcTypeInfo::default();
+            info.supports_guard_gc_type = gc.supports_guard_gc_type();
+            if !info.supports_guard_gc_type {
+                return info;
+            }
+            // assembler.py:1934-1937: gc_ll_descr lookups.
+            let (base, shift, sizeof_ti) = gc.get_translated_info_for_typeinfo();
+            info.base_type_info = base;
+            info.shift_by = shift;
+            info.sizeof_ti = sizeof_ti;
+            let (infobits_off, is_object_flag) = gc.get_translated_info_for_guard_is_object();
+            info.infobits_offset = infobits_off;
+            info.is_object_flag = is_object_flag;
+            // assembler.py:1951: cpu.subclassrange_min_offset.
+            info.subclassrange_min_offset = gc.subclassrange_min_offset();
+            // assembler.py:1971-1974: (subclassrange_min, subclassrange_max)
+            // for every constant GuardSubclass arg1.
+            for op in ops {
+                if op.opcode == majit_ir::OpCode::GuardSubclass && op.args.len() >= 2 {
+                    if let Some(&classptr) = self.constants.get(&op.args[1].0) {
+                        if let Some(range) = gc.subclass_range(classptr as usize) {
+                            info.subclass_ranges.insert(classptr, range);
+                        }
                     }
                 }
             }
-        }
-        info
+            info
+        })
+        .unwrap_or_default()
     }
 
     /// Collect constants from ops (constant OpRefs that appear as args).
