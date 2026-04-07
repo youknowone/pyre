@@ -526,28 +526,34 @@ impl UnrollOptimizer {
         // check at `mod.rs::emit` (collision detection + forwarding
         // redirect) currently compensates for.
         //
-        // This step (Commit D1 of the Box identity plan): run Phase 2
-        // ops through TraceIterator and advance `_index` to Phase 1's
-        // high water BEFORE `next()` begins consuming ops, giving Phase
-        // 2 op results a disjoint `[next_global_opref..)` range. Phase 2
-        // inputargs stay at the identity `[0..body_num_inputs)` positions
-        // for this step — full RPython parity (Phase 2 inputargs also at
-        // fresh OpRefs) is Commit D2, which requires corresponding fixes
-        // in `install_imported_virtuals`, `import_state_with_source_slots`,
-        // and `assemble_peeled_trace_with_jump_args` that assume the
-        // shared-inputarg layout.
+        // This step (Commit D2 of the Box identity plan): run Phase 2
+        // ops through TraceIterator with `start_index = next_global_opref`,
+        // which gives BOTH inputargs AND op results fresh OpRefs in a
+        // disjoint range. Phase 2 inputargs live at
+        // `[next_global_opref..next_global_opref+body_num_inputs)` and
+        // op results at `[next_global_opref+body_num_inputs..)`. This is
+        // the RPython-literal model where each TraceIterator produces
+        // freshly allocated InputArg and ResOp Python instances for
+        // every iteration — `import_state`'s `assert source is not
+        // target` (unroll.py:483) now holds by construction because the
+        // Phase 2 source slot OpRefs are always distinct from any
+        // Phase 1 end_arg OpRef.
+        //
+        // After optimization, Phase 2 output is post-translated back to
+        // the shared `[0..body_num_inputs)` inputarg layout for the
+        // final assembly (see the `shift_back` pass below). The
+        // assembly and downstream consumers continue to assume the
+        // shared-inputarg layout; only the Phase 2 optimizer internals
+        // see the disjoint range.
+        let phase2_inputarg_base = self.next_global_opref.max(body_num_inputs as u32);
         let mut iter = majit_trace::opencoder::TraceIterator::new(
             &ops,
             0,
             ops.len(),
             None,
             body_num_inputs,
-            0, // inputarg start index: keep at 0 for shared inputargs
+            phase2_inputarg_base, // fresh inputargs at [phase2_inputarg_base..)
         );
-        // opencoder.py:271 self._index advance — force non-void result
-        // allocations to start at Phase 1's high water so Phase 2 op
-        // results never collide with Phase 1's emitted positions.
-        iter._index = self.next_global_opref.max(body_num_inputs as u32);
         let mut p2_ops_in: Vec<Op> = Vec::with_capacity(ops.len());
         while let Some(op) = iter.next() {
             p2_ops_in.push(op);
@@ -599,13 +605,66 @@ impl UnrollOptimizer {
         // reference these via `imported_label_args`. They are NOT in the
         // `p2_cache` (only raw trace positions are), so leave
         // `phase1_value_types` untranslated.
-        let p2_ops = opt_p2.optimize_with_constants_and_inputs_at(
+        let mut p2_ops = opt_p2.optimize_with_constants_and_inputs_at(
             &p2_ops_in,
             &mut consts_p2,
             body_num_inputs,
-            0, // inputarg_base = 0 (shared inputargs — simpler alternative)
+            phase2_inputarg_base, // inputarg_base — Phase 2 inputargs at [phase2_inputarg_base..)
             p2_high_water,
         );
+        // Post-translate Phase 2 output back to the shared-inputarg
+        // layout expected by `assemble_peeled_trace_with_jump_args`.
+        //
+        // Phase 2's OptContext internally used disjoint inputarg OpRefs
+        // at `[phase2_inputarg_base..phase2_inputarg_base+body_num_inputs)`
+        // so the RPython `import_state` "source is not target"
+        // (unroll.py:483) invariant held by construction. The final
+        // assembled trace, however, uses shared body inputargs at
+        // `[0..body_num_inputs)` so that the preamble and body share
+        // the same inputarg slots — the `Label(label_args)` op at the
+        // body boundary binds them to the preamble's end values, and
+        // downstream consumers (Cranelift regalloc, resume data) see
+        // a single consistent inputarg numbering.
+        //
+        // This shift only touches op args, fail_args, and the label /
+        // source_slot vectors. Op positions (the emitted results) are
+        // already in `[p2_high_water..)`, which is above both the
+        // shared range `[0..body_num_inputs)` and the Phase 1 emitted
+        // range `[num_inputs..next_global_opref)`, so they stay put.
+        if phase2_inputarg_base > 0 {
+            let end = phase2_inputarg_base + body_num_inputs as u32;
+            let shift_back = |opref: OpRef| -> OpRef {
+                if !opref.is_none()
+                    && !opref.is_constant()
+                    && opref.0 >= phase2_inputarg_base
+                    && opref.0 < end
+                {
+                    OpRef(opref.0 - phase2_inputarg_base)
+                } else {
+                    opref
+                }
+            };
+            for op in p2_ops.iter_mut() {
+                for arg in op.args.iter_mut() {
+                    *arg = shift_back(*arg);
+                }
+                if let Some(ref mut fa) = op.fail_args {
+                    for arg in fa.iter_mut() {
+                        *arg = shift_back(*arg);
+                    }
+                }
+            }
+            if let Some(ref mut label_args) = opt_p2.imported_label_args {
+                for arg in label_args.iter_mut() {
+                    *arg = shift_back(*arg);
+                }
+            }
+            if let Some(ref mut source_slots) = opt_p2.imported_label_source_slots {
+                for arg in source_slots.iter_mut() {
+                    *arg = shift_back(*arg);
+                }
+            }
+        }
         // Phase 2 may discover new constants via make_constant (e.g., guard
         // class pointers from collect_use_box_guards).
         // Merge back into consts_p2 so the backend can resolve them.
