@@ -1203,10 +1203,6 @@ fn build_function(
             | OpCode::EnterPortalFrame
             | OpCode::LeavePortalFrame
             | OpCode::VirtualRefFinish
-            | OpCode::EscapeI
-            | OpCode::EscapeR
-            | OpCode::EscapeF
-            | OpCode::EscapeN
             | OpCode::ForceSpill
             | OpCode::Keepalive => {}
 

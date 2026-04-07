@@ -877,12 +877,12 @@ mod tests {
         // p0 = newstr(2)
         // strsetitem(p0, 0, c0)
         // strsetitem(p0, 1, c1)
-        // escape_r(p0)   -> forces the string
+        // call_n(p0)     -> forces the string
         let mut ops = vec![
             Op::new(OpCode::Newstr, &[OpRef(100)]), // op 0
             Op::new(OpCode::Strsetitem, &[OpRef(0), OpRef(101), OpRef(200)]), // op 1
             Op::new(OpCode::Strsetitem, &[OpRef(0), OpRef(102), OpRef(201)]), // op 2
-            Op::new(OpCode::EscapeR, &[OpRef(0)]),  // op 3: forces
+            Op::new(OpCode::CallN, &[OpRef(0)]),    // op 3: forces
         ];
         assign_positions(&mut ops);
 
@@ -895,24 +895,21 @@ mod tests {
         // - Newstr
         // - SameAsI (constant 0), Strsetitem (char at 0)
         // - SameAsI (constant 1), Strsetitem (char at 1)
-        // - EscapeR (with forwarded ref to the new Newstr)
+        // - CallN (with forwarded ref to the new Newstr)
         //
         // The exact count depends on how many constant-int SameAsI ops are emitted.
-        // Key check: there should be a Newstr and Strsetitem ops in the output.
+        // Key check: there should be a Newstr, Strsetitem ops, and the call.
 
         let newstr_count = result.iter().filter(|o| o.opcode == OpCode::Newstr).count();
         let setitem_count = result
             .iter()
             .filter(|o| o.opcode == OpCode::Strsetitem)
             .count();
-        let escape_count = result
-            .iter()
-            .filter(|o| o.opcode == OpCode::EscapeR)
-            .count();
+        let call_count = result.iter().filter(|o| o.opcode == OpCode::CallN).count();
 
         assert_eq!(newstr_count, 1, "Should have 1 Newstr after forcing");
         assert_eq!(setitem_count, 2, "Should have 2 Strsetitem after forcing");
-        assert_eq!(escape_count, 1, "Should have 1 EscapeR");
+        assert_eq!(call_count, 1, "Should have 1 CallN");
     }
 
     // ── Test 4: Concat virtual string length ──
@@ -1082,10 +1079,10 @@ mod tests {
     #[test]
     fn test_force_empty_virtual() {
         // p0 = newstr(0) -> virtual (0 chars)
-        // escape_r(p0)    -> force: emits newstr(0) only, no strsetitem
+        // call_n(p0)      -> force: emits newstr(0) only, no strsetitem
         let mut ops = vec![
             Op::new(OpCode::Newstr, &[OpRef(100)]),
-            Op::new(OpCode::EscapeR, &[OpRef(0)]),
+            Op::new(OpCode::CallN, &[OpRef(0)]),
         ];
         assign_positions(&mut ops);
 

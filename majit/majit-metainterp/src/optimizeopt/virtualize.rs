@@ -1600,11 +1600,6 @@ impl Optimization for OptVirtualize {
             // dispatches to the standard emit path — no virtualize-specific
             // handler. Falling through to the default PassOn matches RPython.
 
-            // Escape ops (testing)
-            OpCode::EscapeI | OpCode::EscapeR | OpCode::EscapeF | OpCode::EscapeN => {
-                self.optimize_escaping_op(op, ctx)
-            }
-
             // ── Record hint opcodes ──
             // These record information about values that downstream passes can use.
             // The hints themselves are removed (no code emitted).
@@ -2826,52 +2821,6 @@ mod tests {
         assert_eq!(result[1].opcode, OpCode::GetfieldGcI);
     }
 
-    #[test]
-    fn test_escape_forces_virtual() {
-        // p0 = new_with_vtable(descr=size1)
-        // escape_r(p0)   <- forces the virtual
-        let sd = size_descr(1);
-
-        let mut ops = vec![
-            Op::with_descr(OpCode::NewWithVtable, &[], sd.clone()),
-            Op::new(OpCode::EscapeR, &[OpRef(0)]),
-        ];
-        assign_positions(&mut ops);
-
-        let result = run_pass(&ops);
-        assert!(
-            result.len() >= 2,
-            "escape should force virtual; got {} ops",
-            result.len()
-        );
-        assert_eq!(result[0].opcode, OpCode::NewWithVtable);
-        assert_eq!(result.last().unwrap().opcode, OpCode::EscapeR);
-    }
-
-    #[test]
-    fn test_force_emits_through_downstream_heap_passes() {
-        let sd = size_descr(1);
-        let fd = field_descr(10);
-
-        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef(200)]);
-        guard.fail_args = Some(vec![OpRef(0)].into());
-        let mut ops = vec![
-            Op::with_descr(OpCode::New, &[], sd),
-            Op::with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(100)], fd.clone()),
-            guard,
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(0)], fd),
-            Op::new(OpCode::Jump, &[]),
-        ];
-        assign_positions(&mut ops);
-
-        let result = run_default_pipeline(&ops);
-        assert!(
-            !result.iter().any(|op| op.opcode == OpCode::GetfieldGcI),
-            "forced SetfieldGc should go through Heap and forward later GetfieldGcI; got {:?}",
-            result.iter().map(|op| op.opcode).collect::<Vec<_>>()
-        );
-    }
-
     // ── VirtualRef tests ──
 
     #[test]
@@ -3221,38 +3170,54 @@ mod tests {
     }
 
     #[test]
-    fn test_force_virtual_getfield_forwarding_through_heap() {
-        // RPython parity: after force_virtual emits NEW + SETFIELD_GC via
-        // emit_through_passes, the SETFIELD goes through heap pass and
-        // gets cached as a lazy set. A subsequent GETFIELD on the forced
-        // object should be forwarded from the heap cache.
+    fn test_call_forced_virtual_pure_getfield() {
+        // RPython test_optimizeopt.py:test_forced_virtual_pure_getfield
         //
-        // p0 = new(descr=size1)
-        // setfield_gc(p0, i10, descr=field1)
-        // escape_n(p0)            <- forces p0
-        // i2 = getfield_gc_i(p0, descr=field1)  <- should forward to i10
+        // [p0]
+        // p1 = new_with_vtable(descr=nodesize3)
+        // setfield_gc(p1, p0, descr=valuedescr3)   <- immutable field
+        // call_n(p1)
+        // p2 = getfield_gc_r(p1, descr=valuedescr3)
+        // call_n(p2)
+        // jump(p0)
+        //
+        // Expected:
+        // [p0]
+        // p1 = new_with_vtable(descr=nodesize3)
+        // setfield_gc(p1, p0, descr=valuedescr3)
+        // call_n(p1)
+        // call_n(p0)
+        // jump(p0)
         let sd = size_descr(1);
-        let fd = field_descr(10);
+        let fd = majit_ir::descr::make_field_descr_full(10, 0, 8, Type::Ref, true);
         let mut ops = vec![
-            Op::with_descr(OpCode::New, &[], sd.clone()),
+            Op::with_descr(OpCode::NewWithVtable, &[], sd.clone()),
             Op::with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(100)], fd.clone()),
-            Op::new(OpCode::EscapeN, &[OpRef(0)]),
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(0)], fd.clone()),
-            Op::new(OpCode::Jump, &[]),
+            Op::new(OpCode::CallN, &[OpRef(0)]),
+            Op::with_descr(OpCode::GetfieldGcR, &[OpRef(0)], fd.clone()),
+            Op::new(OpCode::CallN, &[OpRef(3)]),
+            Op::new(OpCode::Jump, &[OpRef(100)]),
         ];
         assign_positions(&mut ops);
 
         let result = run_default_pipeline(&ops);
-        let getfield_count = result
-            .iter()
-            .filter(|o| o.opcode == OpCode::GetfieldGcI)
-            .count();
-        assert_eq!(
-            getfield_count,
-            0,
-            "GETFIELD after force should be forwarded via heap cache; got ops: {:?}",
-            result.iter().map(|o| o.opcode).collect::<Vec<_>>()
+        let opcodes: Vec<_> = result.iter().map(|o| o.opcode).collect();
+        assert!(
+            !opcodes.contains(&OpCode::GetfieldGcR),
+            "forced immutable getfield should be removed; got {opcodes:?}"
         );
+        assert_eq!(
+            opcodes,
+            vec![
+                OpCode::NewWithVtable,
+                OpCode::SetfieldGc,
+                OpCode::CallN,
+                OpCode::CallN,
+                OpCode::Jump,
+            ]
+        );
+        assert_eq!(result[3].arg(0), OpRef(100));
+        assert_eq!(result[4].arg(0), OpRef(100));
     }
 
     #[test]
