@@ -1093,11 +1093,6 @@ impl UnrollOptimizer {
         }
 
         // ── Assembly (compile.py:310-338) ──
-        let field_remap = opt_p2
-            .final_ctx
-            .as_ref()
-            .map(|c| c.imported_field_remap.clone())
-            .unwrap_or_default();
         let mut combined = assemble_peeled_trace_with_jump_args(
             &p1_ops,
             &body_ops,
@@ -1118,7 +1113,6 @@ impl UnrollOptimizer {
                 .last()
                 .map(|target| target.as_jump_target_descr()),
             &exported_end_args,
-            &field_remap,
         );
         // RPython Box parity: drop duplicate-position ops. In RPython
         // each Box is unique so collisions can't happen. Keep first.
@@ -2778,51 +2772,6 @@ impl OptUnroll {
         }
     }
 
-    /// RPython Box identity parity: allocate a fresh OpRef for a Phase 1
-    /// virtual field value. RPython Boxes are Python objects with unique
-    /// identity — Phase 1 Box and Phase 2 Box at the same trace position
-    /// are different objects, so Phase 2 trace processing never overwrites
-    /// Phase 1 field values. In majit, OpRef is a shared u32 index: Phase 2
-    /// reprocessing the same trace op at position X would overwrite the
-    /// forwarding/PtrInfo set during import for the virtual's field at X.
-    /// Remapping to fresh positions prevents this collision.
-    /// Also: two virtuals sharing a source op need distinct label slots.
-    /// The fresh position → original source mapping is captured in
-    /// ctx.imported_field_remap for the assembly to emit SameAs ops.
-    fn remap_field_ref(
-        old: OpRef,
-        exported_infos: &HashMap<OpRef, ExportedValueInfo>,
-        ctx: &mut OptContext,
-    ) -> OpRef {
-        if old.is_none()
-            || ctx.is_constant(old)
-            || exported_infos
-                .get(&old)
-                .is_some_and(|info| info.constant.is_some())
-        {
-            // Constants and NONE don't need remapping — they are globally
-            // valid and won't be overwritten by Phase 2 trace processing.
-            return old;
-        }
-        let fresh = ctx.reserve_pos();
-        // Copy value_type so backend knows the type of this position.
-        if let Some(&tp) = ctx.value_types.get(&old.0) {
-            ctx.value_types.insert(fresh.0, tp);
-        }
-        // Copy constant value if the field is a known constant.
-        if let Some(val) = ctx.get_constant(old).cloned() {
-            ctx.make_constant(fresh, val);
-        }
-        // Copy constant_types_for_numbering so resume data encoding
-        // picks up the correct type for this position.
-        if let Some(&tp) = ctx.constant_types_for_numbering.get(&old.0) {
-            ctx.constant_types_for_numbering.insert(fresh.0, tp);
-        }
-        // Record fresh → old mapping for assembly label SameAs emission.
-        ctx.imported_field_remap.insert(fresh, old);
-        fresh
-    }
-
     fn apply_exported_ptr_info(
         &self,
         opref: OpRef,
@@ -2833,28 +2782,31 @@ impl OptUnroll {
     ) {
         use crate::optimizeopt::info::PtrInfo;
 
+        // Step 6 of the Box identity plan: the per-field reference
+        // remapping that lived here (`remap_field_ref` allocating fresh
+        // positions in `ctx.imported_field_remap`) was a majit-only
+        // band-aid for the OpRef-collision case where Phase 2 reprocessed
+        // a raw trace position that Phase 1 had already used for a
+        // virtual field value. After Step 2 Commit D1/D2 Phase 2 runs
+        // through a fresh TraceIterator with disjoint OpRef ranges, so
+        // Phase 1 emitted positions referenced by a virtual's PtrInfo
+        // are NEVER overwritten by Phase 2 trace processing. The
+        // PtrInfo's field OpRefs flow through to the final assembled
+        // trace unchanged, matching RPython's `setinfo_from_preamble`
+        // (unroll.py:53-98) which simply copies the PtrInfo without
+        // any per-field renaming.
         match ptr_info {
             PtrInfo::Virtual(info) => {
-                // Remap field OpRefs to fresh positions (Box identity parity).
-                let mut new_info = info.clone();
-                let remaps: Vec<(OpRef, OpRef)> = new_info
+                let field_refs: Vec<OpRef> = info
                     .fields
-                    .iter_mut()
-                    .map(|(_, field_ref)| {
-                        let old = *field_ref;
-                        let fresh = Self::remap_field_ref(old, exported_infos, ctx);
-                        *field_ref = fresh;
-                        (old, fresh)
-                    })
+                    .iter()
+                    .map(|(_, field_ref)| *field_ref)
                     .collect();
-                ctx.set_ptr_info(opref, PtrInfo::Virtual(new_info));
-                for (old, fresh) in remaps {
-                    if old == fresh {
-                        continue;
-                    }
-                    if let Some(field_info) = exported_infos.get(&old) {
+                ctx.set_ptr_info(opref, PtrInfo::Virtual(info));
+                for field_ref in field_refs {
+                    if let Some(field_info) = exported_infos.get(&field_ref) {
                         self.setinfo_from_preamble_recursive(
-                            fresh,
+                            field_ref,
                             field_info,
                             exported_infos,
                             ctx,
@@ -2864,25 +2816,16 @@ impl OptUnroll {
                 }
             }
             PtrInfo::VirtualStruct(info) => {
-                let mut new_info = info.clone();
-                let remaps: Vec<(OpRef, OpRef)> = new_info
+                let field_refs: Vec<OpRef> = info
                     .fields
-                    .iter_mut()
-                    .map(|(_, field_ref)| {
-                        let old = *field_ref;
-                        let fresh = Self::remap_field_ref(old, exported_infos, ctx);
-                        *field_ref = fresh;
-                        (old, fresh)
-                    })
+                    .iter()
+                    .map(|(_, field_ref)| *field_ref)
                     .collect();
-                ctx.set_ptr_info(opref, PtrInfo::VirtualStruct(new_info));
-                for (old, fresh) in remaps {
-                    if old == fresh {
-                        continue;
-                    }
-                    if let Some(field_info) = exported_infos.get(&old) {
+                ctx.set_ptr_info(opref, PtrInfo::VirtualStruct(info));
+                for field_ref in field_refs {
+                    if let Some(field_info) = exported_infos.get(&field_ref) {
                         self.setinfo_from_preamble_recursive(
-                            fresh,
+                            field_ref,
                             field_info,
                             exported_infos,
                             ctx,
@@ -2892,25 +2835,12 @@ impl OptUnroll {
                 }
             }
             PtrInfo::VirtualArray(info) => {
-                let mut new_info = info.clone();
-                let remaps: Vec<(OpRef, OpRef)> = new_info
-                    .items
-                    .iter_mut()
-                    .map(|item_ref| {
-                        let old = *item_ref;
-                        let fresh = Self::remap_field_ref(old, exported_infos, ctx);
-                        *item_ref = fresh;
-                        (old, fresh)
-                    })
-                    .collect();
-                ctx.set_ptr_info(opref, PtrInfo::VirtualArray(new_info));
-                for (old, fresh) in remaps {
-                    if old == fresh {
-                        continue;
-                    }
-                    if let Some(item_info) = exported_infos.get(&old) {
+                let item_refs: Vec<OpRef> = info.items.iter().copied().collect();
+                ctx.set_ptr_info(opref, PtrInfo::VirtualArray(info));
+                for item_ref in item_refs {
+                    if let Some(item_info) = exported_infos.get(&item_ref) {
                         self.setinfo_from_preamble_recursive(
-                            fresh,
+                            item_ref,
                             item_info,
                             exported_infos,
                             ctx,
@@ -2920,24 +2850,17 @@ impl OptUnroll {
                 }
             }
             PtrInfo::VirtualArrayStruct(info) => {
-                let mut new_info = info.clone();
-                let mut remaps: Vec<(OpRef, OpRef)> = Vec::new();
-                for fields in &mut new_info.element_fields {
-                    for (_, field_ref) in fields.iter_mut() {
-                        let old = *field_ref;
-                        let fresh = Self::remap_field_ref(old, exported_infos, ctx);
-                        *field_ref = fresh;
-                        remaps.push((old, fresh));
+                let mut all_field_refs: Vec<OpRef> = Vec::new();
+                for fields in &info.element_fields {
+                    for (_, field_ref) in fields.iter() {
+                        all_field_refs.push(*field_ref);
                     }
                 }
-                ctx.set_ptr_info(opref, PtrInfo::VirtualArrayStruct(new_info));
-                for (old, fresh) in remaps {
-                    if old == fresh {
-                        continue;
-                    }
-                    if let Some(field_info) = exported_infos.get(&old) {
+                ctx.set_ptr_info(opref, PtrInfo::VirtualArrayStruct(info));
+                for field_ref in all_field_refs {
+                    if let Some(field_info) = exported_infos.get(&field_ref) {
                         self.setinfo_from_preamble_recursive(
-                            fresh,
+                            field_ref,
                             field_info,
                             exported_infos,
                             ctx,
@@ -2947,25 +2870,12 @@ impl OptUnroll {
                 }
             }
             PtrInfo::VirtualRawBuffer(info) => {
-                let mut new_info = info.clone();
-                let remaps: Vec<(OpRef, OpRef)> = new_info
-                    .entries
-                    .iter_mut()
-                    .map(|(_, _, entry_ref)| {
-                        let old = *entry_ref;
-                        let fresh = Self::remap_field_ref(old, exported_infos, ctx);
-                        *entry_ref = fresh;
-                        (old, fresh)
-                    })
-                    .collect();
-                ctx.set_ptr_info(opref, PtrInfo::VirtualRawBuffer(new_info));
-                for (old, fresh) in remaps {
-                    if old == fresh {
-                        continue;
-                    }
-                    if let Some(entry_info) = exported_infos.get(&old) {
+                let entry_refs: Vec<OpRef> = info.entries.iter().map(|(_, _, e)| *e).collect();
+                ctx.set_ptr_info(opref, PtrInfo::VirtualRawBuffer(info));
+                for entry_ref in entry_refs {
+                    if let Some(entry_info) = exported_infos.get(&entry_ref) {
                         self.setinfo_from_preamble_recursive(
-                            fresh,
+                            entry_ref,
                             entry_info,
                             exported_infos,
                             ctx,
@@ -3674,8 +3584,7 @@ fn assemble_peeled_trace(
         constants,
         start_label_descr,
         loop_label_descr,
-        &[],             // no p1_end_args for simple assembly
-        &HashMap::new(), // no field_remap for simple assembly
+        &[], // no p1_end_args for simple assembly
     )
 }
 
@@ -3695,7 +3604,6 @@ fn assemble_peeled_trace_with_jump_args(
     start_label_descr: Option<DescrRef>,
     loop_label_descr: Option<DescrRef>,
     p1_end_args: &[OpRef],
-    imported_field_remap: &HashMap<OpRef, OpRef>,
 ) -> Vec<Op> {
     let mut result =
         Vec::with_capacity(p1_ops.len() + p2_ops.len() + 1 + imported_short_aliases.len());
@@ -3817,10 +3725,9 @@ fn assemble_peeled_trace_with_jump_args(
     // fresh SameAs positions. In RPython, Box identity prevents collisions;
     // in the flat OpRef model, the assembly-allocated SameAs position must
     // not overlap base label_args, filtered_extra_label_args, p2_ops
-    // positions/args/fail_args, imported_short_sources.result fresh slots,
-    // or imported_field_remap fresh slots — each of those may be referenced
-    // by the body. A single colliding OpRef aliases two distinct values and
-    // corrupts the loop.
+    // positions/args/fail_args, or imported_short_sources.result fresh
+    // slots — each of those may be referenced by the body. A single
+    // colliding OpRef aliases two distinct values and corrupts the loop.
     for &la in &full_label_args {
         if is_trace_runtime_ref(la, constants) {
             max_pos = max_pos.max(la.0.saturating_add(1));
@@ -3851,11 +3758,6 @@ fn assemble_peeled_trace_with_jump_args(
     for entry in imported_short_sources.iter() {
         if is_trace_runtime_ref(entry.result, constants) {
             max_pos = max_pos.max(entry.result.0.saturating_add(1));
-        }
-    }
-    for (&fresh, _) in imported_field_remap.iter() {
-        if is_trace_runtime_ref(fresh, constants) {
-            max_pos = max_pos.max(fresh.0.saturating_add(1));
         }
     }
     max_pos = next_free_pos(max_pos);
@@ -4014,19 +3916,22 @@ fn assemble_peeled_trace_with_jump_args(
         {
             continue; // already defined by preamble or alias SameAs
         }
-        // Priority 1: field remap captured in import_state. The fresh label
-        // position maps to an original Phase 1 op position.
-        let source_opt = imported_field_remap.get(&la).copied().or_else(|| {
-            // Priority 2: base label arg position. Use the corresponding
-            // Phase 1 JUMP arg as the source.
-            if i < p1_end_args.len() {
-                let jump_arg = p1_end_args[i];
-                if !jump_arg.is_none() && preamble_defs.contains(&jump_arg) && jump_arg != la {
-                    return Some(jump_arg);
-                }
+        // Step 6 of the Box identity plan: the `imported_field_remap`
+        // priority-1 lookup is gone (the map is dead after Commit D1/D2 —
+        // Phase 2's disjoint OpRef range means virtual fields keep their
+        // Phase 1 emitted positions and never need a fresh-position
+        // SameAs to reach them). Only the base label-arg → Phase 1 JUMP
+        // arg path remains.
+        let source_opt = if i < p1_end_args.len() {
+            let jump_arg = p1_end_args[i];
+            if !jump_arg.is_none() && preamble_defs.contains(&jump_arg) && jump_arg != la {
+                Some(jump_arg)
+            } else {
+                None
             }
+        } else {
             None
-        });
+        };
         if let Some(source) = source_opt {
             if preamble_defs.contains(&source) {
                 // Determine the correct SameAs opcode based on the preamble
@@ -4412,6 +4317,27 @@ fn assemble_peeled_trace_with_jump_args(
         if op.result_type() != Type::Void && !op.pos.is_none() {
             seen_body_defs.insert(op.pos);
             defs_since_inner_label.insert(result.last().unwrap().pos);
+        }
+    }
+
+    // Step 6 of the Box identity plan (band-aid deletion — instrumentation
+    // phase): log the insertion counts of the three remaining
+    // assembly-local band-aid remap maps (`imported_alias_remap`,
+    // `label_rescue_remap`, `label_dedup_remap`). After Commit D1/D2 the
+    // Phase 2 OpRef namespace is disjoint from Phase 1's emitted range,
+    // so these collision-compensation maps stay empty on correct traces.
+    // A non-zero count under MAJIT_LOG is a regression signal.
+    if std::env::var_os("MAJIT_LOG").is_some() {
+        let iar = imported_alias_remap.len();
+        let lrr = label_rescue_remap.len();
+        let ldr = label_dedup_remap.len();
+        if iar + lrr + ldr > 0 {
+            eprintln!(
+                "[jit][assemble] band-aid maps non-empty: \
+                 imported_alias_remap={iar} label_rescue_remap={lrr} \
+                 label_dedup_remap={ldr} \
+                 (these should be dead after Commit D1/D2)"
+            );
         }
     }
 
