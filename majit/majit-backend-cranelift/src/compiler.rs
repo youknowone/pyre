@@ -34,6 +34,82 @@ use majit_ir::{
 
 use crate::guard::{BridgeData, CraneliftFailDescr, JitFrameDeadFrame};
 
+// ── compile.py:665-674 done_with_this_frame singletons ──────────────
+//
+// RPython creates ONE global FailDescr per return type. ALL Finish ops
+// across ALL loops/bridges write the SAME descr pointer into jf_descr.
+// This makes the pointer comparison in _call_assembler_check_descr
+// (assembler.py:2274) always succeed for any callee finish.
+//
+// compile.py:665-674 make_and_attach_done_descrs
+
+static DONE_WITH_THIS_FRAME_DESCR_INT: std::sync::LazyLock<Arc<CraneliftFailDescr>> =
+    std::sync::LazyLock::new(|| {
+        Arc::new(
+            CraneliftFailDescr::new_with_trace_and_kind_and_force_tokens(
+                u32::MAX,
+                0,
+                vec![Type::Int],
+                true,
+                vec![],
+                None,
+            ),
+        )
+    });
+
+static DONE_WITH_THIS_FRAME_DESCR_FLOAT: std::sync::LazyLock<Arc<CraneliftFailDescr>> =
+    std::sync::LazyLock::new(|| {
+        Arc::new(
+            CraneliftFailDescr::new_with_trace_and_kind_and_force_tokens(
+                u32::MAX,
+                0,
+                vec![Type::Float],
+                true,
+                vec![],
+                None,
+            ),
+        )
+    });
+
+static DONE_WITH_THIS_FRAME_DESCR_REF: std::sync::LazyLock<Arc<CraneliftFailDescr>> =
+    std::sync::LazyLock::new(|| {
+        Arc::new(
+            CraneliftFailDescr::new_with_trace_and_kind_and_force_tokens(
+                u32::MAX,
+                0,
+                vec![Type::Ref],
+                true,
+                vec![],
+                None,
+            ),
+        )
+    });
+
+static DONE_WITH_THIS_FRAME_DESCR_VOID: std::sync::LazyLock<Arc<CraneliftFailDescr>> =
+    std::sync::LazyLock::new(|| {
+        Arc::new(
+            CraneliftFailDescr::new_with_trace_and_kind_and_force_tokens(
+                u32::MAX,
+                0,
+                vec![],
+                true,
+                vec![],
+                None,
+            ),
+        )
+    });
+
+/// compile.py:665-674 parity: return the singleton FailDescr for a
+/// given Finish result type. ALL Finish ops must use this.
+fn done_with_this_frame_descr(result_types: &[Type]) -> &'static Arc<CraneliftFailDescr> {
+    match result_types {
+        [Type::Float] => &DONE_WITH_THIS_FRAME_DESCR_FLOAT,
+        [Type::Ref] => &DONE_WITH_THIS_FRAME_DESCR_REF,
+        [] => &DONE_WITH_THIS_FRAME_DESCR_VOID,
+        _ => &DONE_WITH_THIS_FRAME_DESCR_INT,
+    }
+}
+
 // ── JitFrame layout constants (jitframe.py:61-83) ───────────────────
 // Header: [frame_info:8, descr:8, force_descr:8, gcmap:8,
 //          savedata:8, guard_exc:8, forward:8]  = 56 bytes
@@ -304,6 +380,9 @@ struct RegisteredLoopTarget {
     num_ref_roots: usize,
     max_output_slots: usize,
     inputarg_types: Vec<Type>,
+    /// virtualizable.py:86 read_boxes: number of scalar inputargs
+    /// (frame + static fields). First local is at this index.
+    num_scalar_inputargs: usize,
 }
 
 unsafe impl Send for RegisteredLoopTarget {}
@@ -857,7 +936,7 @@ fn rebuild_state_after_failure(
     outputs: &mut Vec<i64>,
     types: &[majit_ir::Type],
     recovery: Option<&majit_backend::ExitRecoveryLayout>,
-    bridge_num_inputs: usize,
+    _bridge_num_inputs: usize,
 ) {
     // Phase 1: recovery_layout-based materialization (rd_virtuals parity).
     // Process ALL frames, not just frames[0].
@@ -945,36 +1024,8 @@ fn rebuild_state_after_failure(
             return;
         }
     }
-    // Phase 2: compact virtual field pairs when outputs has more slots
-    // than bridge expects. Pattern: [frame, ni, vsd, ob_type_0, intval_0,
-    // ob_type_1, intval_1, ...] → [frame, ni, vsd, boxed_0, boxed_1, ...].
-    if bridge_num_inputs > 0 && outputs.len() > bridge_num_inputs {
-        let prefix = 3; // frame, ni, vsd
-        let object_slots = bridge_num_inputs - prefix;
-        let field_pairs = outputs.len() - prefix;
-        if object_slots > 0 && field_pairs == object_slots * 2 {
-            let mut compacted = outputs[..prefix].to_vec();
-            for i in 0..object_slots {
-                let ob_type = outputs[prefix + i * 2];
-                let intval = outputs[prefix + i * 2 + 1];
-                let mut temp = vec![0i64, ob_type, intval];
-                let temp_types = vec![
-                    majit_ir::Type::Ref,
-                    majit_ir::Type::Int,
-                    majit_ir::Type::Int,
-                ];
-                REBUILD_STATE_AFTER_FAILURE.with(|c| {
-                    if let Some(f) = c.get() {
-                        f(&mut temp, &temp_types);
-                    }
-                });
-                compacted.push(temp[0]);
-            }
-            *outputs = compacted;
-            return;
-        }
-    }
-    // Phase 3: original heuristic fallback.
+    // resume.py:945/993 parity: virtual materialization is handled by
+    // rd_virtuals (Phase 1 above). No virtual pair compaction needed.
     REBUILD_STATE_AFTER_FAILURE.with(|c| {
         if let Some(f) = c.get() {
             f(outputs, types);
@@ -1344,6 +1395,11 @@ static CALL_ASSEMBLER_FORCE_FN: OnceLock<extern "C" fn(i64) -> i64> = OnceLock::
 /// This reads the guard's resume data, restores state from fail_values (deadframe),
 /// and executes the remaining IR ops from the guard point to Finish.
 /// bh_fn(green_key, trace_id, fail_index, rebuilt_values, num_rebuilt, raw_deadframe, num_raw)
+/// Unbox a Ref (boxed int pointer) to a raw i64 int value.
+/// Used by call_assembler_guard_failure's FALLBACK path when the
+/// first local is a Ref type (boxed int) instead of raw Int.
+static CALL_ASSEMBLER_UNBOX_INT_FN: OnceLock<fn(i64) -> i64> = OnceLock::new();
+
 static CALL_ASSEMBLER_BLACKHOLE_FN: OnceLock<
     fn(u64, u64, u32, *const i64, usize, *const i64, usize) -> Option<i64>,
 > = OnceLock::new();
@@ -1587,6 +1643,11 @@ pub fn register_call_assembler_force(f: extern "C" fn(i64) -> i64) {
 ///
 /// This is used by jit_force_callee_frame to avoid the eval_with_jit →
 /// try_function_entry_jit → run_compiled → execute_token indirection chain.
+/// Register an unbox-int callback for CALL_ASSEMBLER's FALLBACK path.
+pub fn register_call_assembler_unbox_int(f: fn(i64) -> i64) {
+    let _ = CALL_ASSEMBLER_UNBOX_INT_FN.set(f);
+}
+
 pub fn execute_call_assembler_direct(
     token_number: u64,
     inputs: &[i64],
@@ -1838,6 +1899,17 @@ fn register_call_assembler_target(
         num_ref_roots: compiled.num_ref_roots,
         max_output_slots: compiled.max_output_slots,
         inputarg_types: token.inputarg_types.clone(),
+        // virtualizable.py:86 read_boxes: header = frame + static fields.
+        // If token doesn't have this set, derive from inputarg_types:
+        // header has mixed Int/Ref, locals follow. Header ends after
+        // the last Int in the header pattern.
+        num_scalar_inputargs: if token.num_scalar_inputargs > 0 {
+            token.num_scalar_inputargs
+        } else {
+            // Derive from types: find last Int in what looks like the
+            // header (first N entries with at least one Int).
+            token.inputarg_types.len().min(compiled.num_inputs)
+        },
     };
     validate_registered_target_against_call_assembler_expectations(token.number, &target)?;
     // Invalidate thread-local cache in case a pending placeholder was cached.
@@ -1846,8 +1918,9 @@ fn register_call_assembler_target(
     ca_dispatch_slot(token.number, compiled.code_ptr);
     // Set the finish_descr_ptr so the direct call path can compare jf_descr
     // with the finish FailDescr pointer (RPython done_with_this_frame parity).
+    // compile.py:665-674: use the global singleton, not the per-trace pointer.
     if let Some(finish_descr) = compiled.fail_descrs.iter().find(|d| d.is_finish()) {
-        let ptr = Arc::as_ptr(finish_descr) as i64;
+        let ptr = Arc::as_ptr(done_with_this_frame_descr(&finish_descr.fail_arg_types)) as i64;
         ca_dispatch_set_finish_descr_ptr(token.number, ptr);
     }
     call_assembler_registry()
@@ -1891,6 +1964,7 @@ pub fn register_pending_call_assembler_target(
         num_ref_roots: 0,
         max_output_slots: 1,
         inputarg_types,
+        num_scalar_inputargs: 0, // Updated by register_call_assembler_target
     };
     call_assembler_registry()
         .lock()
@@ -2278,7 +2352,8 @@ extern "C" fn call_assembler_guard_failure(
                 // _call_assembler_load_result (x86/assembler.py:2291-2303):
                 // MOV eax, [eax + ofs] — load from returned frame, not original.
                 let header_words = JF_FRAME_ITEM0_OFS as usize / 8;
-                return unsafe { *result_jf.add(header_words) };
+                let result = unsafe { *result_jf.add(header_words) };
+                return result;
             }
         }
         // Bridge didn't finish — fall through to blackhole/force.
@@ -2348,11 +2423,31 @@ extern "C" fn call_assembler_guard_failure(
         }
     }
     // Fallback: force_fn re-executes the callee from scratch.
-    if !inputs_ptr.is_null() && target.inputarg_types.len() > 3 {
-        let raw = unsafe { *inputs_ptr.add(3) };
-        PENDING_FORCE_LOCAL0.with(|c| c.set(Some(raw)));
+    // Read the first local (after the virtualizable header).
+    let first_local_idx = target.num_scalar_inputargs;
+    if !inputs_ptr.is_null() && target.inputarg_types.len() > first_local_idx {
+        let raw = unsafe { *inputs_ptr.add(first_local_idx) };
+        // The fail_args type at first_local_idx may be Ref (boxed int
+        // from the unoptimized trace). jit_force_self_recursive_call_raw_1
+        // expects a RAW int. Unbox if needed.
+        let unboxed = if target.inputarg_types.get(first_local_idx).copied() == Some(Type::Ref) {
+            let obj_ptr = raw as usize as *const u8;
+            if !obj_ptr.is_null() {
+                if let Some(unbox_fn) = CALL_ASSEMBLER_UNBOX_INT_FN.get() {
+                    unbox_fn(raw)
+                } else {
+                    raw
+                }
+            } else {
+                raw
+            }
+        } else {
+            raw
+        };
+        PENDING_FORCE_LOCAL0.with(|c| c.set(Some(unboxed)));
     }
-    CALL_ASSEMBLER_FORCE_FN.get().map_or(0, |f| f(frame_ptr))
+    let result = CALL_ASSEMBLER_FORCE_FN.get().map_or(0, |f| f(frame_ptr));
+    result
 }
 
 /// Fast path for call_assembler when a force callback is available.
@@ -2373,8 +2468,9 @@ fn call_assembler_fast_path(
         // Set pending_force_local0 for lazy frame creation.
         // When create_frame is elided, frame_ptr is the caller frame.
         // force_fn uses pending_force_local0 to create a callee frame.
-        if inputs.len() > 3 {
-            PENDING_FORCE_LOCAL0.with(|c| c.set(Some(inputs[3])));
+        let fli = target.num_scalar_inputargs;
+        if inputs.len() > fli {
+            PENDING_FORCE_LOCAL0.with(|c| c.set(Some(inputs[fli])));
         }
         let result = force_fn(frame_ptr);
         unsafe {
@@ -2547,8 +2643,9 @@ fn call_assembler_shim_inner(
             *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
             *outcome.add(1) = 0;
         }
-        return finish_result_from_deadframe(&mut frame)
+        let result = finish_result_from_deadframe(&mut frame)
             .expect("finish_result_from_deadframe failed") as u64;
+        return result;
     }
 
     // RPython resume_in_blackhole parity: use blackhole to resume from
@@ -2606,8 +2703,9 @@ fn call_assembler_shim_inner(
     // Fallback: force_fn re-executes from scratch.
     if let Some(force_fn) = CALL_ASSEMBLER_FORCE_FN.get() {
         let callee_frame_ptr = input_slice[0];
-        if input_slice.len() > 3 {
-            PENDING_FORCE_LOCAL0.with(|c| c.set(Some(input_slice[3])));
+        let fli = target.num_scalar_inputargs;
+        if input_slice.len() > fli {
+            PENDING_FORCE_LOCAL0.with(|c| c.set(Some(input_slice[fli])));
         }
         let result = force_fn(callee_frame_ptr);
         unsafe {
@@ -4366,6 +4464,22 @@ fn run_compiled_code_inner(
             .iter()
             .find(|d| Arc::as_ptr(d) as usize == jf_descr_raw as usize)
             .cloned();
+        // compile.py:665-674 parity: done_with_this_frame_descr is a
+        // global singleton — it won't appear in per-trace fail_descrs.
+        let arc = arc.or_else(|| {
+            let ptr = jf_descr_raw as usize;
+            for global in [
+                &*DONE_WITH_THIS_FRAME_DESCR_INT,
+                &*DONE_WITH_THIS_FRAME_DESCR_FLOAT,
+                &*DONE_WITH_THIS_FRAME_DESCR_REF,
+                &*DONE_WITH_THIS_FRAME_DESCR_VOID,
+            ] {
+                if Arc::as_ptr(global) as usize == ptr {
+                    return Some(global.clone());
+                }
+            }
+            None
+        });
         (fi, arc)
     };
 
@@ -4606,6 +4720,71 @@ pub struct CraneliftBackend {
 }
 
 impl CraneliftBackend {
+    /// Propagate bridges from previous tokens' fail_descrs to the current
+    /// token's fail_descrs. Called after finish_and_compile replaces the
+    /// token — bridges compiled during main loop tracing were attached to
+    /// the old token and need to be copied to the new one.
+    pub fn propagate_bridges_from_previous_tokens(
+        &self,
+        current_token: &JitCellToken,
+        previous_tokens: &[JitCellToken],
+    ) {
+        let compiled = match current_token
+            .compiled
+            .as_ref()
+            .and_then(|c| c.downcast_ref::<CompiledLoop>())
+        {
+            Some(c) => c,
+            None => return,
+        };
+        let new_descrs = &compiled.fail_descrs;
+        for prev in previous_tokens {
+            if let Some(prev_compiled) = prev
+                .compiled
+                .as_ref()
+                .and_then(|c| c.downcast_ref::<CompiledLoop>())
+            {
+                for prev_d in &prev_compiled.fail_descrs {
+                    if prev_d.has_bridge() {
+                        let fi = prev_d.fail_index();
+                        let tid = prev_d.trace_id;
+                        if let Some(new_d) = find_fail_descr_in_fail_descrs(new_descrs, tid, fi) {
+                            if !new_d.has_bridge() {
+                                let bridge = prev_d.bridge_ref();
+                                if let Some(ref b) = *bridge {
+                                    if std::env::var_os("MAJIT_LOG").is_some() {
+                                        eprintln!(
+                                            "[jit] propagate bridge tid={} fi={} to new token",
+                                            tid, fi,
+                                        );
+                                    }
+                                    new_d.attach_bridge(BridgeData {
+                                        trace_id: b.trace_id,
+                                        input_types: b.input_types.clone(),
+                                        header_pc: b.header_pc,
+                                        source_guard: b.source_guard,
+                                        caller_prefix_layout: b.caller_prefix_layout.clone(),
+                                        code_ptr: b.code_ptr,
+                                        fail_descrs: b.fail_descrs.clone(),
+                                        gc_runtime_id: b.gc_runtime_id,
+                                        num_inputs: b.num_inputs,
+                                        num_ref_roots: b.num_ref_roots,
+                                        max_output_slots: b.max_output_slots,
+                                        terminal_exit_layouts: UnsafeCell::new(
+                                            unsafe { &*b.terminal_exit_layouts.get() }.clone(),
+                                        ),
+                                        loop_reentry: b.loop_reentry,
+                                        invalidated_arc: b.invalidated_arc.clone(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     pub fn new() -> Self {
         let mut flag_builder = settings::builder();
         flag_builder.set("opt_level", "speed").unwrap();
@@ -6732,14 +6911,17 @@ impl CraneliftBackend {
 
                         // ── Path B: finish — load result from frame[0] ──
                         // assembler.py:2303 _call_assembler_load_result:
-                        //   MOV eax, [eax + ofs]  — load from callee's frame array[0]
-                        // args_ptr IS the callee's jitframe (passed as argument).
+                        //   MOV eax, [eax + ofs]  — load from RETURNED frame
+                        // result_jf is the callee's returned jitframe pointer.
+                        // After shadow stack reload inside the callee, the
+                        // callee may write results to a different jf_ptr than
+                        // the passed args_ptr. Always read from result_jf.
                         builder.switch_to_block(direct_finish_block);
                         builder.seal_block(direct_finish_block);
                         let direct_result = builder.ins().load(
                             cl_types::I64,
                             MemFlags::trusted(),
-                            args_ptr,
+                            result_jf,
                             JF_FRAME_ITEM0_OFS,
                         );
                         builder
@@ -9633,7 +9815,15 @@ fn collect_guards(
         }
         // assembler.py:2126 get_gcref_from_faildescr parity:
         // store the FailDescr pointer (not index) in jf_descr.
-        let fail_descr_ptr = Arc::as_ptr(&descr) as i64;
+        // compile.py:665-674 parity: Finish ops use the global singleton
+        // (done_with_this_frame_descr) so that ALL traces share the same
+        // pointer. This makes _call_assembler_check_descr (assembler.py:2274)
+        // work across bridges (bridge's Finish descr == main trace's).
+        let fail_descr_ptr = if is_finish {
+            Arc::as_ptr(done_with_this_frame_descr(&descr.fail_arg_types)) as i64
+        } else {
+            Arc::as_ptr(&descr) as i64
+        };
         fail_descrs.push(descr);
         // assembler.py:40-44 must_save_exception parity:
         let must_save_exception = matches!(
@@ -9816,7 +10006,8 @@ impl majit_backend::Backend for CraneliftBackend {
             Some(flag_ptr), // compile.py:186: bridges share parent's invalidation flag
             Some((source_trace_id, fail_descr.fail_index())),
             caller_layout.as_ref(),
-        )?;
+        );
+        let compiled = compiled?;
         let info = AsmInfo {
             code_addr: compiled.code_ptr as usize,
             code_size: compiled.code_size,

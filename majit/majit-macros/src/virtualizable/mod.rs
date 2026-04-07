@@ -453,10 +453,17 @@ fn generate_layout_helpers(
 
         /// Extract live values from state in virtualizable layout order.
         ///
-        /// Layout: `[frame:Ref, scalars..., locals[0..nlocals]:ItemT, stack[0..stack_only]:ItemT]`
+        /// virtualizable.py:86-99 read_boxes / get_list_of_active_boxes:
+        ///   for _, fieldname in unroll_static_fields:
+        ///       boxes.append(wrap(cpu, getattr(virtualizable, fieldname)))
+        ///   for _, fieldname in unroll_array_fields:
+        ///       lst = getattr(virtualizable, fieldname)
+        ///       for j in range(len(lst)):
+        ///           boxes.append(wrap(cpu, lst[j]))
         ///
-        /// `local_at(i)` returns the raw value of local slot `i`.
-        /// `stack_at(i)` returns the raw value of stack-only slot `i`.
+        /// Layout: `[frame:Ref, scalars..., array[0..len(lst)]:ItemT]`
+        ///
+        /// `local_at(i)` returns the raw value of array slot `i` (direct index).
         pub fn virt_extract_live_values(
             __frame: usize,
             #(#scalar_params,)*

@@ -901,9 +901,12 @@ impl<S: JitState> JitDriver<S> {
                             bridge_key, bridge_trace_id, bridge_fail_index, finish_args
                         );
                     }
-                    // compile.py:3198 compile_done_with_this_frame:
-                    // Bridge traces ending in FINISH are compiled and
-                    // attached to the failing guard via compile_bridge.
+                    // Save bridge data for compilation after finish_and_compile.
+                    // RPython parity: in RPython, bridge traces only fire AFTER
+                    // the main loop is compiled. In pyre, the bridge action is
+                    // processed after the main trace action, so we need to save
+                    // the data now (while the tracing context is still alive)
+                    // and compile after the main loop is stored.
                     self.meta.compile_done_with_this_frame(
                         bridge_key,
                         bridge_trace_id,
@@ -914,6 +917,8 @@ impl<S: JitState> JitDriver<S> {
                     self.sym = None;
                     self.trace_meta = None;
                     self.meta.abort_trace(false);
+                    // DON'T return — fall through to process pending bridges
+                    // in the main trace action below.
                     return;
                 }
                 let meta = self.trace_meta.take().unwrap();

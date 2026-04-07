@@ -382,6 +382,23 @@ pub(crate) struct PartialTrace {
 /// `M` is the interpreter-specific metadata stored alongside each compiled loop
 /// (e.g., storage layout, register mapping). The interpreter provides `M` when
 /// closing a trace and receives it back when running compiled code.
+/// Bridge trace data extracted from the tracing context, ready for
+/// deferred compilation after the main loop is stored.
+pub(crate) struct PendingDoneBridge {
+    pub green_key: u64,
+    pub trace_id: u64,
+    pub fail_index: u32,
+    pub bridge_ops: Vec<majit_ir::Op>,
+    pub bridge_inputargs: Vec<majit_ir::InputArg>,
+    pub constants: HashMap<u32, i64>,
+    pub constant_types: HashMap<u32, majit_ir::Type>,
+    pub snapshot_boxes: HashMap<i32, Vec<majit_ir::OpRef>>,
+    pub snapshot_frame_sizes: HashMap<i32, Vec<usize>>,
+    pub snapshot_vable_boxes: HashMap<i32, Vec<majit_ir::OpRef>>,
+    pub snapshot_frame_pcs: HashMap<i32, Vec<(i32, i32)>>,
+    pub snapshot_box_types: HashMap<u32, majit_ir::Type>,
+}
+
 pub struct MetaInterp<M: Clone> {
     pub(crate) warm_state: WarmEnterState,
     pub(crate) backend: BackendImpl,
@@ -454,6 +471,16 @@ pub struct MetaInterp<M: Clone> {
     /// from the tracing green_key when cross-loop cut retargets to the
     /// inner loop's key (compile.py:269).
     pub(crate) last_compiled_key: Option<u64>,
+    /// virtualizable.py:86 NUM_SCALAR_INPUTARGS: number of scalar inputargs
+    /// (frame + static fields). Set by the interpreter at JIT init.
+    pub num_scalar_inputargs: usize,
+    /// Deferred bridge compilations from compile_done_with_this_frame.
+    /// RPython parity: in RPython, bridge traces only fire AFTER the main
+    /// loop is compiled and the first execution happens after all bridge
+    /// actions are processed. In pyre, the interpreter may resume between
+    /// finish_and_compile and compile_done_with_this_frame. Pending bridges
+    /// are compiled immediately after finish_and_compile stores the main loop.
+    pub(crate) pending_done_bridges: Vec<PendingDoneBridge>,
     /// pyjitpl.py:3182: trace position saved before compile_trace records
     /// a tentative JUMP. If compile_trace triggers retrace_needed, this
     /// becomes the retracing_from position.
@@ -791,6 +818,8 @@ impl<M: Clone> MetaInterp<M> {
             exported_state: None,
             cancel_count: 0,
             last_compiled_key: None,
+            num_scalar_inputargs: 0,
+            pending_done_bridges: Vec::new(),
             potential_retrace_position: None,
             last_quasi_immutable_deps: Vec::new(),
             retrace_after_bridge: false,
@@ -2153,6 +2182,9 @@ impl<M: Clone> MetaInterp<M> {
         self.backend.set_next_trace_id(trace_id);
         self.backend.set_next_header_pc(green_key);
 
+        // virtualizable.py:86 read_boxes: set num_scalar_inputargs on token
+        // so the backend can find the first local in force_fn paths.
+        token.num_scalar_inputargs = self.num_scalar_inputargs;
         let compile_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.backend
                 .compile_loop(&inputargs, &optimized_ops, &mut token)
@@ -3211,6 +3243,9 @@ impl<M: Clone> MetaInterp<M> {
         let compiled_constant_types = constant_types.clone();
         self.backend.set_constants(constants);
         token.green_key = green_key;
+        // virtualizable.py:86 read_boxes: set num_scalar_inputargs on token
+        // so the backend can find the first local in force_fn paths.
+        token.num_scalar_inputargs = self.num_scalar_inputargs;
 
         match self
             .backend
@@ -3320,6 +3355,7 @@ impl<M: Clone> MetaInterp<M> {
                         .get(&green_key)
                         .map(|c| c.retraced_count)
                         .unwrap_or(0);
+                    let had_old = self.compiled_loops.contains_key(&green_key);
                     if let Some(old_entry) = self.compiled_loops.remove(&green_key) {
                         previous_tokens.push(old_entry.token);
                         previous_tokens.extend(old_entry.previous_tokens);
@@ -3355,6 +3391,16 @@ impl<M: Clone> MetaInterp<M> {
                 }
                 if let Some(ref hook) = self.hooks.on_compile_loop {
                     hook(green_key, num_ops_before, num_ops_after);
+                }
+                // Compile deferred done_with_this_frame bridges now that
+                // the main loop is stored. The bridge attaches to the
+                // NEW token's fail_descrs (which are the same Arcs as
+                // in the registered call_assembler target).
+                let pending = std::mem::take(&mut self.pending_done_bridges);
+                for pb in pending {
+                    if pb.green_key == green_key {
+                        self.compile_pending_done_bridge(pb);
+                    }
                 }
             }
             Err(e) => {
@@ -5101,8 +5147,132 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// pyjitpl.py:3198-3220: compile_done_with_this_frame — bridge that
-    /// exits via return. Calls compile_trace with ends_with_jump=false (FINISH).
+    /// exits via return. Constructs a minimal bridge trace (just a Finish op)
+    /// and compiles it. Does NOT access the tracing context (which may have
+    /// been consumed by finish_and_compile).
     pub fn compile_done_with_this_frame(
+        &mut self,
+        green_key: u64,
+        trace_id: u64,
+        fail_index: u32,
+        finish_args: &[OpRef],
+        finish_arg_types: Vec<Type>,
+    ) {
+        // Build the bridge trace: a single Finish op using finish_args.
+        // The bridge inputargs are derived from the guard's fail_arg_types.
+        let finish_descr = crate::make_fail_descr_typed(finish_arg_types.clone());
+        let mut finish_op = majit_ir::Op::new(majit_ir::OpCode::Finish, finish_args);
+        finish_op.descr = Some(finish_descr);
+        let bridge_ops = vec![finish_op];
+
+        // Inputargs: from the guard's fail_arg_types (the bridge inputs
+        // are the guard's fail_args in order).
+        let bridge_inputargs: Vec<majit_ir::InputArg> = {
+            let compiled = self.compiled_loops.get(&green_key);
+            if let Some(compiled) = compiled {
+                let trace_id_norm = Self::normalize_trace_id(compiled, trace_id);
+                if let Some((_, trace_data)) = Self::trace_for_exit(compiled, trace_id_norm) {
+                    if let Some(exit_layout) = trace_data.exit_layouts.get(&fail_index) {
+                        exit_layout
+                            .exit_types
+                            .iter()
+                            .enumerate()
+                            .map(|(i, &tp)| majit_ir::InputArg::from_type(tp, i as u32))
+                            .collect()
+                    } else {
+                        finish_arg_types
+                            .iter()
+                            .enumerate()
+                            .map(|(i, &tp)| majit_ir::InputArg::from_type(tp, i as u32))
+                            .collect()
+                    }
+                } else {
+                    finish_arg_types
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &tp)| majit_ir::InputArg::from_type(tp, i as u32))
+                        .collect()
+                }
+            } else {
+                finish_arg_types
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &tp)| majit_ir::InputArg::from_type(tp, i as u32))
+                    .collect()
+            }
+        };
+
+        let pb = PendingDoneBridge {
+            green_key,
+            trace_id,
+            fail_index,
+            bridge_ops,
+            bridge_inputargs,
+            constants: HashMap::new(),
+            constant_types: HashMap::new(),
+            snapshot_boxes: HashMap::new(),
+            snapshot_frame_sizes: HashMap::new(),
+            snapshot_vable_boxes: HashMap::new(),
+            snapshot_frame_pcs: HashMap::new(),
+            snapshot_box_types: HashMap::new(),
+        };
+
+        if self.compiled_loops.contains_key(&green_key) {
+            if crate::majit_log_enabled() {
+                eprintln!(
+                    "[jit] compile_done_with_this_frame: compiling NOW key={} fail={}",
+                    green_key, fail_index,
+                );
+            }
+            self.compile_pending_done_bridge(pb);
+        } else {
+            if crate::majit_log_enabled() {
+                eprintln!(
+                    "[jit] compile_done_with_this_frame: deferring key={} fail={}",
+                    green_key, fail_index,
+                );
+            }
+            self.pending_done_bridges.push(pb);
+        }
+    }
+
+    /// Compile a pending done_with_this_frame bridge using saved trace data.
+    fn compile_pending_done_bridge(&mut self, pending: PendingDoneBridge) {
+        let fail_descr = {
+            let compiled = match self.compiled_loops.get(&pending.green_key) {
+                Some(c) => c,
+                None => return,
+            };
+            match Self::bridge_fail_descr_proxy(compiled, pending.trace_id, pending.fail_index) {
+                Some(d) => Box::new(d) as Box<dyn majit_ir::FailDescr>,
+                None => return,
+            }
+        };
+        if crate::majit_log_enabled() {
+            eprintln!(
+                "[jit] compile pending done bridge key={} fail={}",
+                pending.green_key, pending.fail_index,
+            );
+        }
+        self.compile_bridge(
+            pending.green_key,
+            pending.fail_index,
+            &*fail_descr,
+            &pending.bridge_ops,
+            &pending.bridge_inputargs,
+            pending.constants,
+            pending.constant_types,
+            pending.snapshot_boxes,
+            pending.snapshot_frame_sizes,
+            pending.snapshot_vable_boxes,
+            pending.snapshot_frame_pcs,
+            pending.snapshot_box_types,
+        );
+    }
+
+    // Keep the old signature for backward compatibility — this is dead code now
+    // but compile_trace_finish might still reference it.
+    fn _compile_done_with_this_frame_direct(
         &mut self,
         green_key: u64,
         trace_id: u64,

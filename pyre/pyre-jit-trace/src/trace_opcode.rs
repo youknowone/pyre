@@ -863,13 +863,26 @@ impl MIFrame {
                 }
             }
         }
-        let (frame, next_instr, stack_depth, nlocals, locals, stack, local_types, stack_types) = {
+        let (
+            frame,
+            next_instr,
+            code,
+            stack_depth,
+            namespace,
+            nlocals,
+            locals,
+            stack,
+            local_types,
+            stack_types,
+        ) = {
             let s = self.sym();
             let stack_only = s.stack_only_depth();
             (
                 s.frame,
                 s.vable_next_instr,
+                s.vable_code,
                 s.vable_valuestackdepth,
+                s.vable_namespace,
                 s.nlocals,
                 s.symbolic_locals.clone(),
                 s.symbolic_stack[..stack_only.min(s.symbolic_stack.len())].to_vec(),
@@ -900,7 +913,7 @@ impl MIFrame {
                 ctx.inputarg_types()
             }
         };
-        let mut args = vec![frame, next_instr, stack_depth];
+        let mut args = vec![frame, next_instr, code, stack_depth, namespace];
         for (idx, value) in locals.into_iter().enumerate() {
             let target_type = inputarg_types
                 .get(crate::virtualizable_gen::NUM_SCALAR_INPUTARGS + idx)
@@ -927,7 +940,7 @@ impl MIFrame {
         // needs distinct identities to track values independently.
         {
             use std::collections::HashSet;
-            let header_len = 3; // [frame, next_instr, valuestackdepth]
+            let header_len = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
             let mut seen = HashSet::new();
             for i in header_len..args.len() {
                 let opref = args[i];
@@ -968,7 +981,13 @@ impl MIFrame {
         self.flush_to_frame_for_guard(ctx);
         let active_boxes = self.get_list_of_active_boxes(ctx, false, false);
         let s = self.sym();
-        let mut fa = vec![s.frame, s.vable_next_instr, s.vable_valuestackdepth];
+        let mut fa = vec![
+            s.frame,
+            s.vable_next_instr,
+            s.vable_code,
+            s.vable_valuestackdepth,
+            s.vable_namespace,
+        ];
         fa.extend_from_slice(&active_boxes);
         fa
     }
@@ -1061,13 +1080,24 @@ impl MIFrame {
             // so the post-optimizer fail_args naturally satisfy regalloc.py:1203.
             let mut fail_args: Vec<OpRef> = {
                 let s = self.sym();
-                vec![s.frame, s.vable_next_instr, s.vable_valuestackdepth]
+                vec![
+                    s.frame,
+                    s.vable_next_instr,
+                    s.vable_code,
+                    s.vable_valuestackdepth,
+                    s.vable_namespace,
+                ]
             };
             fail_args.extend_from_slice(&callee_active_boxes);
             let mut types = callee_snapshot_types_full;
             // opencoder.py:806: parent frames keep their original pc.
             // Snapshot boxes = active boxes only (skip [frame, ni, vsd] header).
             for (pfa, pfa_types, pfa_resumepc, pfa_jitcode_index) in &self.parent_frames {
+                // pyjitpl.py:2586-2602 capture_resumedata: parent frames'
+                // snapshot stores ONLY their active boxes (the registers
+                // live at the call site), NOT the header.
+                // When pfa.len() <= __n there are zero active boxes — the
+                // snapshot body must be empty, NOT the header itself.
                 let __n = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
                 let parent_active: &[OpRef] = if pfa.len() > __n { &pfa[__n..] } else { &[] };
                 let parent_types: &[Type] = if pfa_types.len() > __n {
@@ -1166,7 +1196,13 @@ impl MIFrame {
         let fail_arg_types = snapshot_full_types.clone();
         let fail_args: Vec<OpRef> = {
             let s = self.sym();
-            let mut fa = vec![s.frame, s.vable_next_instr, s.vable_valuestackdepth];
+            let mut fa = vec![
+                s.frame,
+                s.vable_next_instr,
+                s.vable_code,
+                s.vable_valuestackdepth,
+                s.vable_namespace,
+            ];
             fa.extend_from_slice(&active_boxes);
             fa
         };
@@ -1483,7 +1519,13 @@ impl MIFrame {
         let fail_arg_types = self.build_fail_arg_types_for_active_boxes(&active_boxes);
         let fail_args: Vec<OpRef> = {
             let s = self.sym();
-            let mut fa = vec![s.frame, s.vable_next_instr, s.vable_valuestackdepth];
+            let mut fa = vec![
+                s.frame,
+                s.vable_next_instr,
+                s.vable_code,
+                s.vable_valuestackdepth,
+                s.vable_namespace,
+            ];
             fa.extend_from_slice(&active_boxes);
             fa
         };
@@ -3115,11 +3157,15 @@ impl MIFrame {
                                         .map(|&arg| ensure_boxed_for_ca(ctx, &*this, arg))
                                         .collect()
                                 };
+                            let ca_code = unsafe { function_get_code(concrete_callable) } as usize;
+                            let ca_ns = unsafe { function_get_globals(concrete_callable) } as usize;
                             let ca_args = synthesize_fresh_callee_entry_args(
                                 ctx,
                                 callee_frame,
                                 &ca_locals,
                                 callee_nlocals,
+                                ca_code,
+                                ca_ns,
                             );
                             let callee_slot_types = pending_entry_slot_types_from_args(
                                 &vec![Type::Ref; ca_locals.len()],
@@ -3250,6 +3296,10 @@ impl MIFrame {
                                     ));
                                 };
 
+                                let ca_code =
+                                    unsafe { function_get_code(concrete_callable) } as usize;
+                                let ca_ns =
+                                    unsafe { function_get_globals(concrete_callable) } as usize;
                                 let ca_args = if target_num_inputs <= 1 {
                                     vec![callee_frame]
                                 } else if callee_stack_only == 0 {
@@ -3258,11 +3308,21 @@ impl MIFrame {
                                         callee_frame,
                                         args,
                                         callee_nlocals,
+                                        ca_code,
+                                        ca_ns,
                                     )
                                 } else {
                                     let callee_ni = frame_get_next_instr(ctx, callee_frame);
+                                    let callee_code = frame_get_code(ctx, callee_frame);
                                     let callee_sd = frame_get_stack_depth(ctx, callee_frame);
-                                    let mut a = vec![callee_frame, callee_ni, callee_sd];
+                                    let callee_ns = frame_get_namespace(ctx, callee_frame);
+                                    let mut a = vec![
+                                        callee_frame,
+                                        callee_ni,
+                                        callee_code,
+                                        callee_sd,
+                                        callee_ns,
+                                    ];
                                     let callee_arr =
                                         frame_locals_cells_stack_array(ctx, callee_frame);
                                     for i in 0..callee_nlocals {
@@ -3511,7 +3571,13 @@ impl MIFrame {
         // fail_args = header + active_boxes (for Cranelift deadframe).
         let my_fail_args = self.with_ctx(|this, _ctx| {
             let s = this.sym();
-            let mut fa = vec![s.frame, s.vable_next_instr, s.vable_valuestackdepth];
+            let mut fa = vec![
+                s.frame,
+                s.vable_next_instr,
+                s.vable_code,
+                s.vable_valuestackdepth,
+                s.vable_namespace,
+            ];
             fa.extend_from_slice(&my_active_boxes);
             fa
         });
@@ -3603,11 +3669,15 @@ impl MIFrame {
                             (&*code_ptr).varnames.len()
                         };
                         // RPython pyjitpl.py:3583: pass raw Int arg, return raw Int.
+                        let ca_code = unsafe { function_get_code(concrete_callable) } as usize;
+                        let ca_ns = unsafe { function_get_globals(concrete_callable) } as usize;
                         let ca_args = synthesize_fresh_callee_entry_args(
                             ctx,
                             callee_frame,
                             &[raw_arg],
                             callee_nlocals,
+                            ca_code,
+                            ca_ns,
                         );
                         let callee_slot_types =
                             pending_entry_slot_types_from_args(&[Type::Int], callee_nlocals, 0);
@@ -4098,7 +4168,13 @@ impl MIFrame {
                 let fail_arg_types = this.build_fail_arg_types_for_active_boxes(&active_boxes);
                 let fail_args = {
                     let s = this.sym();
-                    let mut fa = vec![s.frame, s.vable_next_instr, s.vable_valuestackdepth];
+                    let mut fa = vec![
+                        s.frame,
+                        s.vable_next_instr,
+                        s.vable_code,
+                        s.vable_valuestackdepth,
+                        s.vable_namespace,
+                    ];
                     fa.extend_from_slice(&active_boxes);
                     fa
                 };
@@ -4125,7 +4201,7 @@ impl MIFrame {
                 for (pfa, pfa_types, pfa_resumepc, pfa_jitcode_index) in &this.parent_frames {
                     // pyjitpl.py:2586-2602 capture_resumedata: parent
                     // frames' snapshot stores ONLY their active boxes (not
-                    // the [frame, ni, vsd] header). When pfa.len() <= __n,
+                    // the header). When pfa.len() <= __n,
                     // there are zero active boxes — body must be empty.
                     let parent_active: &[OpRef] = if pfa.len() > __n { &pfa[__n..] } else { &[] };
                     let parent_types: &[Type] = if pfa_types.len() > __n {

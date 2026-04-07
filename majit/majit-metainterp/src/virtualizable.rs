@@ -147,6 +147,9 @@ impl VirtualizableInfo {
     }
 
     /// Add a static field.
+    ///
+    /// virtualizable.py:61: num_static_extra_boxes = len(static_fields)
+    /// ALL declared fields are included in snapshots.
     pub fn add_field(&mut self, name: impl Into<String>, field_type: Type, offset: usize) {
         self.static_fields.push(VableFieldInfo {
             name: name.into(),
@@ -1996,7 +1999,7 @@ impl crate::resume::VirtualizableInfo for VirtualizableInfo {
         if vable_ptr.is_null() {
             return;
         }
-        // virtualizable.py:131-133: static fields
+        // virtualizable.py:131-133: ALL static fields
         for field in &self.static_fields {
             let value = reader.next_value_of_type(field.field_type);
             unsafe {

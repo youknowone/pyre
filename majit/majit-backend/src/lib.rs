@@ -616,6 +616,9 @@ pub struct JitCellToken {
     pub green_key: u64,
     /// Types of the input arguments.
     pub inputarg_types: Vec<Type>,
+    /// virtualizable.py:86 read_boxes: number of scalar inputargs
+    /// (frame + static fields). First local is at this index.
+    pub num_scalar_inputargs: usize,
     /// Backend-specific compiled data.
     pub compiled: Option<Box<dyn std::any::Any + Send>>,
     /// Flag indicating whether the compiled code has been invalidated.
@@ -636,6 +639,7 @@ impl JitCellToken {
             number,
             green_key: 0,
             inputarg_types: Vec::new(),
+            num_scalar_inputargs: 0,
             compiled: None,
             invalidated: Arc::new(AtomicBool::new(false)),
             version_info: None,

@@ -1120,12 +1120,11 @@ pub fn resume_in_blackhole(
         bh.run();
 
         if bh.reached_merge_point {
-            // blackhole.py:1068 ContinueRunningNormally parity:
-            // RPython raises ContinueRunningNormally(*args) at
-            // jit_merge_point, carrying live values to warmspot.py
-            // which calls portal_runner. pyre writes live values
-            // back to the frame and returns ContinueRunningNormally.
-            // RPython blackhole.py:1068 — virtualizable_ptr IS the frame.
+            // jitexc.py:53 ContinueRunningNormally:
+            // RPython raises ContinueRunningNormally(gi, gr, gf, ri, rr, rf)
+            // with portal arguments in 6 type-grouped arrays to re-enter
+            // the portal from warmspot. pyre writes the blackhole's final
+            // register state to the frame directly and returns the enum.
             let py_pc = bh.jitcode.jit_pc_to_py_pc(bh.last_opcode_position) as usize;
             let frame_ptr = bh.virtualizable_ptr as *mut PyFrame;
             if !frame_ptr.is_null() {
@@ -1638,6 +1637,18 @@ pub extern "C" fn jit_force_self_recursive_call_raw_1(caller_frame: i64, raw_int
     result
 }
 
+/// Unbox a Ref (PyObjectRef to boxed int) to a raw i64 value.
+/// Used by call_assembler_guard_failure's FALLBACK path when the first
+/// local is a Ref type (boxed int) instead of raw Int.
+fn unbox_int_for_force(raw: i64) -> i64 {
+    let obj = raw as pyre_object::PyObjectRef;
+    if !obj.is_null() && unsafe { is_int(obj) } {
+        unsafe { w_int_get_value(obj) }
+    } else {
+        raw
+    }
+}
+
 pub fn install_jit_call_bridge() {
     static INSTALL: Once = Once::new();
     INSTALL.call_once(|| {
@@ -1650,6 +1661,7 @@ pub fn install_jit_call_bridge() {
                 jit_blackhole_resume_from_guard,
             );
             majit_backend_cranelift::register_inline_frame_arena(arena_global_info());
+            majit_backend_cranelift::register_call_assembler_unbox_int(unbox_int_for_force);
         }
     });
 }
@@ -2125,7 +2137,7 @@ pub fn trace_and_compile_from_bridge(
 
     // pyjitpl.py:2841 interpret(): trace bytecodes from guard failure PC
     // until the bridge path terminates (Finish or CloseLoop).
-    let mut trace_frame = Box::new(frame.snapshot_for_tracing());
+    let mut trace_frame = frame.snapshot_for_tracing();
     let max_bridge_ops = 200;
 
     for step in 0..max_bridge_ops {
@@ -2143,7 +2155,7 @@ pub fn trace_and_compile_from_bridge(
             || {},
             |ctx, sym| {
                 // Bridge tracing: create a per-step snapshot.
-                let snapshot = Box::new(trace_frame.snapshot_for_tracing());
+                let snapshot = trace_frame.snapshot_for_tracing();
                 let (action, _executed) = trace_bytecode(ctx, sym, code, pc, snapshot);
                 action
             },
