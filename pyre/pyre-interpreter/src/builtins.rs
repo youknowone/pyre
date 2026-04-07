@@ -692,6 +692,20 @@ fn builtin_isinstance(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     Ok(w_bool_from(isinstance_w(obj, cls)))
 }
 
+/// isinstance(obj, cls) for JIT fast path.
+///
+/// Returns Some(bool) if the check can be resolved, None if cls format
+/// is not supported for the fast path (e.g. tuple of types).
+/// Uses the same MRO-based issubtype_w as builtin_isinstance.
+pub fn call_isinstance(obj: PyObjectRef, cls: PyObjectRef) -> Option<bool> {
+    unsafe {
+        if is_type(cls) {
+            return Some(isinstance_w(obj, cls));
+        }
+    }
+    None
+}
+
 /// Single-type isinstance check.
 ///
 /// PyPy: baseobjspace.py `isinstance_w` → `abstract_issubclass_w`
