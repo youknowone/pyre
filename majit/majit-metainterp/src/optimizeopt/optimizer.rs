@@ -2913,30 +2913,25 @@ impl Optimizer {
     /// Resolve fail_args through get_box_replacement and delegate to
     /// finalize_guard_resume_data for snapshot-based virtual encoding
     /// (rd_numb, rd_consts, rd_virtuals).
+    ///
+    /// resume.py:389-452 finish() is unconditional: every guard reaching
+    /// here must have a snapshot. We delegate without any guard condition
+    /// — finalize_guard_resume_data already handles the missing-snapshot
+    /// case internally (silent return for guards without rd_resume_position
+    /// or snapshot_boxes entry).
     fn store_final_boxes_in_guard(mut op: Op, ctx: &mut OptContext) -> Op {
-        let Some(ref mut fail_args) = op.fail_args else {
-            // RPython optimizer.py:722-752: store_final_boxes_in_guard
-            // calls modifier.finish() even when fail_args is initially None
-            // (e.g. Phase 2 guards from unroll copy_and_change). The snapshot
-            // provides the sole source of fail_args via _number_boxes.
-            if op.rd_resume_position >= 0 && ctx.snapshot_boxes.contains_key(&op.rd_resume_position)
-            {
-                ctx.finalize_guard_resume_data(&mut op);
-            }
-            return op;
-        };
-
         // optimizer.py:732-748 + resume.py:389-452:
         // RPython finish() handles virtuals without forcing.
         // _number_boxes tags virtual fail_args as TAGVIRTUAL,
         // _number_virtuals builds rd_virtuals from PtrInfo.
-        for fa_idx in 0..fail_args.len() {
-            if !fail_args[fa_idx].is_none() {
-                fail_args[fa_idx] = ctx.get_box_replacement(fail_args[fa_idx]);
+        if let Some(ref mut fail_args) = op.fail_args {
+            for fa_idx in 0..fail_args.len() {
+                if !fail_args[fa_idx].is_none() {
+                    fail_args[fa_idx] = ctx.get_box_replacement(fail_args[fa_idx]);
+                }
             }
         }
         ctx.finalize_guard_resume_data(&mut op);
-
         op
     }
 }
