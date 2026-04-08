@@ -1457,17 +1457,10 @@ fn build_class_inner(
         result
     } else {
         let w = pyre_object::w_type_new(name, w_effective_bases, class_ns_ptr as *mut u8);
-        // typeobject.py:1143-1204 create_all_slots: detect __slots__,
-        // collect sorted newslotnames, record nslots count.
+        // typeobject.py:1143-1204 create_all_slots parity.
         unsafe {
             let ns = &*class_ns_ptr;
-            if let Some(&w_slots) = ns.get("__slots__") {
-                let mut slot_names = collect_slot_names(w_slots);
-                slot_names.sort();
-                let nslots = slot_names.len() as u32;
-                pyre_object::w_type_set_nslots(w, nslots);
-                pyre_object::w_type_set_newslotnames(w, slot_names);
-            }
+            create_all_slots(w, ns, w_effective_bases);
         }
         // baseobjspace.py:76 — set w_class to 'type' (default metaclass)
         unsafe {
@@ -1583,7 +1576,7 @@ fn type_descr_call(frame: &mut PyFrame, w_type: PyObjectRef, args: &[PyObjectRef
 
 /// typeobject.py:1155-1188 — extract slot names from __slots__ value.
 /// Returns a Vec of slot name strings (NOT yet sorted; caller must sort).
-pub fn collect_slot_names(w_slots: pyre_object::PyObjectRef) -> Vec<String> {
+fn collect_slot_names(w_slots: pyre_object::PyObjectRef) -> Vec<String> {
     unsafe {
         if pyre_object::is_tuple(w_slots) {
             let len = pyre_object::w_tuple_len(w_slots);
@@ -1603,4 +1596,71 @@ pub fn collect_slot_names(w_slots: pyre_object::PyObjectRef) -> Vec<String> {
             Vec::new()
         }
     }
+}
+
+/// typeobject.py:1143-1204 create_all_slots parity.
+///
+/// Processes __slots__, sets newslotnames/nslots/hasdict/weakrefable/base_layout
+/// on the type object.
+///
+/// # Safety
+/// `w_type` must be a valid W_TypeObject pointer. `ns` must be valid.
+/// `w_bases` must be a valid tuple of base types.
+pub unsafe fn create_all_slots(
+    w_type: pyre_object::PyObjectRef,
+    ns: &crate::PyNamespace,
+    w_bases: pyre_object::PyObjectRef,
+) {
+    // typeobject.py:1146: base_layout = w_bestbase.layout
+    // Find best base (first base class that is a type object).
+    let w_bestbase = find_best_base(w_bases);
+
+    // Set base_layout to point to best base type.
+    if !w_bestbase.is_null() {
+        pyre_object::w_type_set_base_layout(w_type, w_bestbase);
+    }
+
+    if let Some(&w_slots) = ns.get("__slots__") {
+        // typeobject.py:1154-1176: has __slots__
+        let mut wantdict = false;
+        let mut wantweakref = false;
+        let all_names = collect_slot_names(w_slots);
+        let mut newslotnames = Vec::new();
+        for slot_name in &all_names {
+            match slot_name.as_str() {
+                // typeobject.py:1165-1169
+                "__dict__" => wantdict = true,
+                // typeobject.py:1170-1174
+                "__weakref__" => wantweakref = true,
+                // typeobject.py:1175-1176
+                _ => newslotnames.push(slot_name.clone()),
+            }
+        }
+        // typeobject.py:1178: string_sort(newslotnames)
+        newslotnames.sort();
+        let nslots = newslotnames.len() as u32;
+        pyre_object::w_type_set_nslots(w_type, nslots);
+        pyre_object::w_type_set_newslotnames(w_type, newslotnames);
+        pyre_object::w_type_set_hasdict(w_type, wantdict);
+        pyre_object::w_type_set_weakrefable(w_type, wantweakref);
+    }
+    // else: typeobject.py:1151-1153 — no __slots__ → hasdict=true, weakrefable=true
+    // (defaults set by w_type_new)
+}
+
+/// Find the best base class from a bases tuple.
+/// typeobject.py:1246: check_and_find_best_base
+unsafe fn find_best_base(w_bases: pyre_object::PyObjectRef) -> pyre_object::PyObjectRef {
+    if w_bases.is_null() || !pyre_object::is_tuple(w_bases) {
+        return std::ptr::null_mut();
+    }
+    let len = pyre_object::w_tuple_len(w_bases);
+    for i in 0..len {
+        if let Some(base) = pyre_object::w_tuple_getitem(w_bases, i as i64) {
+            if pyre_object::is_type(base) {
+                return base;
+            }
+        }
+    }
+    std::ptr::null_mut()
 }

@@ -53,6 +53,16 @@ pub struct W_TypeObject {
     /// Used in Layout.expand() tuple for __class__ assignment compatibility.
     /// Null means empty (no __slots__ or all slots inherited).
     pub newslotnames: *const Vec<String>,
+    /// typeobject.py:116 `Layout.base_layout` — pointer to the best base
+    /// type's W_TypeObject. Identity comparison in Layout.expand().
+    /// PY_NULL for root types (object, int, etc.).
+    pub base_layout: PyObjectRef,
+    /// typeobject.py:179 `hasdict` — True when instances have __dict__.
+    /// True for classes without __slots__, or with "__dict__" in __slots__.
+    pub hasdict: bool,
+    /// typeobject.py:181 `weakrefable` — True when instances support weakrefs.
+    /// True for classes without __slots__, or with "__weakref__" in __slots__.
+    pub weakrefable: bool,
 }
 
 /// Allocate a new W_TypeObject.
@@ -78,6 +88,9 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: *mut u8) -> PyObject
         layout: &INSTANCE_TYPE as *const PyType,
         nslots: 0,
         newslotnames: std::ptr::null(),
+        base_layout: std::ptr::null_mut(),
+        hasdict: true,
+        weakrefable: true,
     });
     Box::into_raw(obj) as PyObjectRef
 }
@@ -123,6 +136,9 @@ pub fn w_type_new_builtin(
         layout: layout_pytype,
         nslots: 0,
         newslotnames: std::ptr::null(),
+        base_layout: std::ptr::null_mut(),
+        hasdict: false,
+        weakrefable: false,
     });
     Box::into_raw(obj) as PyObjectRef
 }
@@ -174,6 +190,36 @@ pub unsafe fn w_type_set_newslotnames(obj: PyObjectRef, names: Vec<String>) {
 pub unsafe fn w_type_get_newslotnames(obj: PyObjectRef) -> &'static [String] {
     let ptr = (*(obj as *const W_TypeObject)).newslotnames;
     if ptr.is_null() { &[] } else { &*ptr }
+}
+
+/// typeobject.py:116 `Layout.base_layout` setter.
+pub unsafe fn w_type_set_base_layout(obj: PyObjectRef, base: PyObjectRef) {
+    (*(obj as *mut W_TypeObject)).base_layout = base;
+}
+
+/// typeobject.py:116 `Layout.base_layout` getter.
+pub unsafe fn w_type_get_base_layout(obj: PyObjectRef) -> PyObjectRef {
+    (*(obj as *const W_TypeObject)).base_layout
+}
+
+/// typeobject.py:179 `hasdict` setter.
+pub unsafe fn w_type_set_hasdict(obj: PyObjectRef, v: bool) {
+    (*(obj as *mut W_TypeObject)).hasdict = v;
+}
+
+/// typeobject.py:179 `hasdict` getter.
+pub unsafe fn w_type_get_hasdict(obj: PyObjectRef) -> bool {
+    (*(obj as *const W_TypeObject)).hasdict
+}
+
+/// typeobject.py:181 `weakrefable` setter.
+pub unsafe fn w_type_set_weakrefable(obj: PyObjectRef, v: bool) {
+    (*(obj as *mut W_TypeObject)).weakrefable = v;
+}
+
+/// typeobject.py:181 `weakrefable` getter.
+pub unsafe fn w_type_get_weakrefable(obj: PyObjectRef) -> bool {
+    (*(obj as *const W_TypeObject)).weakrefable
 }
 
 /// typeobject.py:543-544 `is_heaptype(self)`.
