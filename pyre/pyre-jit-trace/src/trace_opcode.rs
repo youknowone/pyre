@@ -557,7 +557,7 @@ impl MIFrame {
         // during hot loops. Emit GUARD_NOT_INVALIDATED on first global access
         // so compiled code is invalidated if globals mutate.
         if ctx.heap_cache_mut().check_and_clear_guard_not_invalidated() {
-            self.record_guard(ctx, OpCode::GuardNotInvalidated, &[]);
+            self.generate_guard(ctx, OpCode::GuardNotInvalidated, &[]);
         }
         let frame = self.sym().frame;
         let namespace = frame_namespace_ptr(ctx, frame);
@@ -672,37 +672,65 @@ impl MIFrame {
             .flush_vable_fields(ctx, &[resume_pc as i64, code_ptr as i64, vsd, ns_ptr]);
     }
 
-    fn sync_standard_virtualizable_before_residual_call(&mut self, ctx: &mut TraceCtx) {
-        let Some(vable_ref) = ctx.standard_virtualizable_box() else {
-            return;
-        };
-        ctx.gen_store_back_in_vable(vable_ref);
-        let info = crate::virtualizable_gen::build_virtualizable_info();
+    /// pyjitpl.py:3317 vable_and_vrefs_before_residual_call.
+    ///
+    /// RPython order: vref token marking FIRST (always), then
+    /// virtualizable processing (only if vinfo is not None).
+    fn vable_and_vrefs_before_residual_call(&mut self, ctx: &mut TraceCtx) {
+        // pyjitpl.py:3319-3322: virtualref token marking (ALWAYS runs,
+        // even without virtualizable info).
+        self.vrefs_before_residual_call();
+
+        // pyjitpl.py:3326-3335: virtualizable processing (conditional).
+        // RPython: if vinfo is not None:
         let obj_ptr = self.sym().concrete_vable_ptr;
-        unsafe {
-            info.tracing_before_residual_call(obj_ptr);
+        if let Some(vable_ref) = ctx.standard_virtualizable_box() {
+            if obj_ptr.is_null() {
+                return;
+            }
+            ctx.gen_store_back_in_vable(vable_ref);
+            let info = crate::virtualizable_gen::build_virtualizable_info();
+            unsafe {
+                info.tracing_before_residual_call(obj_ptr);
+            }
+            let force_token = ctx.force_token();
+            ctx.vable_setfield_descr(vable_ref, force_token, info.token_field_descr());
         }
-        let force_token = ctx.force_token();
-        ctx.vable_setfield_descr(vable_ref, force_token, info.token_field_descr());
-        // pyjitpl.py:2575 parity: mark all active virtual references
-        // as "in residual call" (TOKEN_TRACING_RESCALL) so that if the
-        // callee forces a vref, we detect it after the call.
-        self.virtualref_before_residual_call();
     }
 
-    fn sync_standard_virtualizable_after_residual_call(&mut self, ctx: &mut TraceCtx) -> bool {
-        let info = crate::virtualizable_gen::build_virtualizable_info();
+    /// pyjitpl.py:3337 vrefs_after_residual_call +
+    /// pyjitpl.py:3349 vable_after_residual_call.
+    ///
+    /// RPython: vrefs_after_residual_call runs first, then
+    /// vable_after_residual_call. If virtualizable escaped,
+    /// RPython raises SwitchToBlackhole (abort tracing).
+    /// Returns Err to signal abort.
+    fn vable_after_residual_call(&mut self, ctx: &mut TraceCtx) -> Result<(), PyError> {
+        // pyjitpl.py:3337-3347: check vrefs (always runs).
+        self.vrefs_after_residual_call(ctx);
+
+        // pyjitpl.py:3350: vinfo = self.jitdriver_sd.virtualizable_info
+        // pyjitpl.py:3351: if vinfo is not None:
         let obj_ptr = self.sym().concrete_vable_ptr;
+        if obj_ptr.is_null() {
+            return Ok(());
+        }
+        let info = crate::virtualizable_gen::build_virtualizable_info();
         let vable_forced = unsafe { info.tracing_after_residual_call(obj_ptr) };
-        // pyjitpl.py:3400 parity: check if any virtualref was forced
-        // during the residual call.
-        self.virtualref_after_residual_call(ctx);
-        vable_forced
+        if vable_forced {
+            // pyjitpl.py:3355-3366: the virtualizable escaped during
+            // CALL_MAY_FORCE. RPython reloads fields from heap and
+            // raises SwitchToBlackhole(ABORT_ESCAPE).
+            return Err(PyError::type_error(
+                "virtualizable escaped during residual call (SwitchToBlackhole parity)",
+            ));
+        }
+        Ok(())
     }
 
     /// pyjitpl.py:3317-3337 parity: before residual call, set all
     /// active virtualref tokens to TOKEN_TRACING_RESCALL.
-    fn virtualref_before_residual_call(&self) {
+    fn vrefs_before_residual_call(&self) {
         let vref_boxes = &self.sym().virtualref_boxes;
         if vref_boxes.is_empty() {
             return;
@@ -726,7 +754,7 @@ impl MIFrame {
     /// after residual call, check if any virtualref was forced.
     /// If forced, call stop_tracking_virtualref(i) to record
     /// VIRTUAL_REF_FINISH and replace odd slot with CONST_NULL.
-    fn virtualref_after_residual_call(&mut self, ctx: &mut TraceCtx) {
+    fn vrefs_after_residual_call(&mut self, ctx: &mut TraceCtx) {
         let sym = unsafe { &mut *self.sym };
         if sym.virtualref_boxes.is_empty() {
             return;
@@ -735,7 +763,7 @@ impl MIFrame {
         let len = sym.virtualref_boxes.len();
         let mut i = 0;
         while i < len {
-            let (vref_opref, vref_ptr) = sym.virtualref_boxes[i + 1];
+            let (_, vref_ptr) = sym.virtualref_boxes[i + 1];
             if vref_ptr != 0 {
                 let forced = unsafe {
                     vref_info.tracing_after_residual_call(
@@ -744,17 +772,25 @@ impl MIFrame {
                     )
                 };
                 if forced {
-                    // pyjitpl.py:3371-3378: stop_tracking_virtualref(i)
-                    let virt_opref = sym.virtualref_boxes[i].0;
-                    // record VIRTUAL_REF_FINISH(vrefbox, virtualbox)
-                    let _ = ctx.record_op(OpCode::VirtualRefFinish, &[vref_opref, virt_opref]);
-                    // virtualref_boxes[i+1] = CONST_NULL
-                    let null_opref = ctx.const_int(0);
-                    sym.virtualref_boxes[i + 1] = (null_opref, 0);
+                    Self::stop_tracking_virtualref(sym, ctx, i);
                 }
             }
             i += 2;
         }
+    }
+
+    /// pyjitpl.py:3371-3378 stop_tracking_virtualref parity.
+    ///
+    /// Record VIRTUAL_REF_FINISH(vrefbox, virtualbox) and replace
+    /// the odd slot with ConstPtr(NULL).
+    fn stop_tracking_virtualref(sym: &mut PyreSym, ctx: &mut TraceCtx, i: usize) {
+        let virt_opref = sym.virtualref_boxes[i].0;
+        let (vref_opref, _) = sym.virtualref_boxes[i + 1];
+        // pyjitpl.py:3376: record VIRTUAL_REF_FINISH(vrefbox, virtualbox)
+        let _ = ctx.record_op(OpCode::VirtualRefFinish, &[vref_opref, virt_opref]);
+        // pyjitpl.py:3378: self.virtualref_boxes[i+1] = CONST_NULL
+        let null_opref = ctx.const_int(0);
+        sym.virtualref_boxes[i + 1] = (null_opref, 0);
     }
 
     /// Loop-carried values must follow the typed live-state contract used by
@@ -985,7 +1021,7 @@ impl MIFrame {
         if let Some(pc) = target_pc {
             self.orgpc = pc;
         }
-        self.record_guard(ctx, majit_ir::OpCode::GuardFutureCondition, &[]);
+        self.generate_guard(ctx, majit_ir::OpCode::GuardFutureCondition, &[]);
         args
     }
 
@@ -1022,7 +1058,7 @@ impl MIFrame {
             let saved_branch = self.sym_mut().pending_branch_value.take();
             let saved_other = self.sym_mut().pending_branch_other_target.take();
             self.orgpc = saved_orgpc;
-            self.record_guard(ctx, OpCode::GuardNotInvalidated, &[]);
+            self.generate_guard(ctx, OpCode::GuardNotInvalidated, &[]);
             self.orgpc = current_orgpc;
             self.sym_mut().pending_branch_value = saved_branch;
             self.sym_mut().pending_branch_other_target = saved_other;
@@ -1031,7 +1067,7 @@ impl MIFrame {
 
     /// PyPy generate_guard + capture_resumedata: uses current_fail_args
     /// which encodes the full framestack for multi-frame resume.
-    pub(crate) fn record_guard(&mut self, ctx: &mut TraceCtx, opcode: OpCode, args: &[OpRef]) {
+    pub(crate) fn generate_guard(&mut self, ctx: &mut TraceCtx, opcode: OpCode, args: &[OpRef]) {
         // pyjitpl.py:1087 parity: flush pending guard_not_invalidated
         // before recording any new guard (the quasi-immut guard should be
         // emitted with its own snapshot before the current guard).
@@ -1172,16 +1208,14 @@ impl MIFrame {
         } else {
             self.orgpc
         };
-        self.record_guard_core(ctx, opcode, args, resume_pc, after_residual_call);
+        self.generate_guard_core(ctx, opcode, args, resume_pc, after_residual_call);
     }
 
     /// Core guard recording with explicit resume PC.
     ///
-    /// pyjitpl.py:2586-2602 capture_resumedata parity: temporarily
-    /// substitute frame.pc = resume_pc before snapshot capture.
-    /// Used by both record_guard (resume_pc=orgpc) and
-    /// record_branch_guard (resume_pc=other_target).
-    fn record_guard_core(
+    /// pyjitpl.py:2558-2584 generate_guard parity: record guard op,
+    /// then call capture_resumedata.
+    fn generate_guard_core(
         &mut self,
         ctx: &mut TraceCtx,
         opcode: OpCode,
@@ -1189,25 +1223,9 @@ impl MIFrame {
         resume_pc: usize,
         after_residual_call: bool,
     ) {
-        // pyjitpl.py:2594-2596: saved_pc = frame.pc; frame.pc = resumepc
-        let saved_orgpc = self.orgpc;
-        let saved_ni = self.sym().vable_next_instr;
-        let saved_vsd = self.sym().vable_valuestackdepth;
-        self.orgpc = resume_pc;
-
         self.flush_to_frame_for_guard(ctx);
-        // pyjitpl.py:177: active boxes = registers only (no header).
         let active_boxes = self.get_list_of_active_boxes(ctx, false, after_residual_call);
-        // RPython Box.type parity: snapshot types match the full (un-filtered)
-        // active_boxes — snapshot encodes Consts as TAGCONST.
         let snapshot_full_types = self.build_fail_arg_types_for_active_boxes(&active_boxes);
-        // pyjitpl.py:2558-2585 generate_guard parity: record a raw fail_args
-        // "hint" (header + active_boxes including Consts). The optimizer's
-        // store_final_boxes_in_guard rebuilds fail_args from the snapshot
-        // via ResumeDataLoopMemo::finish() → _number_boxes, which drops
-        // Consts from liveboxes (resume.py:202-207 getconst path). This
-        // satisfies regalloc.py:1203 structurally rather than via an
-        // ad-hoc tracer-level filter.
         let fail_arg_types = snapshot_full_types.clone();
         let fail_args: Vec<OpRef> = {
             let s = self.sym();
@@ -1222,9 +1240,39 @@ impl MIFrame {
             fa
         };
 
+        ctx.record_guard_typed_with_fail_args(opcode, args, fail_arg_types, &fail_args);
+
+        // pyjitpl.py:2579: self.capture_resumedata(resumepc, after_residual_call)
+        self.capture_resumedata(
+            ctx,
+            resume_pc,
+            after_residual_call,
+            &active_boxes,
+            &snapshot_full_types,
+        );
+    }
+
+    /// pyjitpl.py:2586-2602 capture_resumedata parity.
+    ///
+    /// Temporarily sets frame.pc = resumepc, captures the full framestack
+    /// + virtualizable_boxes + virtualref_boxes into a snapshot, then
+    /// restores frame.pc.
+    fn capture_resumedata(
+        &mut self,
+        ctx: &mut TraceCtx,
+        resume_pc: usize,
+        after_residual_call: bool,
+        active_boxes: &[OpRef],
+        snapshot_full_types: &[Type],
+    ) {
+        // pyjitpl.py:2594-2596: saved_pc = frame.pc; frame.pc = resumepc
+        let saved_orgpc = self.orgpc;
+        let saved_ni = self.sym().vable_next_instr;
+        let saved_vsd = self.sym().vable_valuestackdepth;
+        self.orgpc = resume_pc;
+
         // The snapshot's frame.pc must match the liveness PC used by
-        // get_list_of_active_boxes, so the blackhole decoder applies the
-        // same bitvector. after_residual_call → fallthrough_pc, else orgpc.
+        // get_list_of_active_boxes.
         let snapshot_live_pc = if after_residual_call {
             self.fallthrough_pc
         } else {
@@ -1232,14 +1280,16 @@ impl MIFrame {
         };
 
         // opencoder.py:767-770: snapshot uses active boxes (not fail_args).
-        // snapshot_full_types includes [Ref, Int, Ref, Int, Ref] header; snapshot
-        // needs only the active_boxes portion starting after NUM_SCALAR_INPUTARGS.
         let n = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
         let snapshot_types = &snapshot_full_types[n..];
         let snapshot_boxes =
-            Self::fail_args_to_snapshot_boxes_typed(&active_boxes, snapshot_types, ctx);
+            Self::fail_args_to_snapshot_boxes_typed(active_boxes, snapshot_types, ctx);
         let vable_boxes = Self::build_virtualizable_boxes(self.sym(), ctx);
         let jitcode_index = unsafe { (*self.sym().jitcode).index } as u32;
+
+        // pyjitpl.py:2597-2600: history.trace.capture_resumedata(
+        //     self.framestack, virtualizable_boxes, self.virtualref_boxes,
+        //     after_residual_call)
         let snapshot = majit_trace::recorder::Snapshot {
             frames: vec![majit_trace::recorder::SnapshotFrame {
                 jitcode_index,
@@ -1247,12 +1297,9 @@ impl MIFrame {
                 boxes: snapshot_boxes,
             }],
             vable_boxes,
-            // pyjitpl.py:2597: self.virtualref_boxes
             vref_boxes: Self::build_virtualref_boxes(self.sym(), ctx),
         };
         let snapshot_id = ctx.capture_resumedata(snapshot);
-
-        ctx.record_guard_typed_with_fail_args(opcode, args, fail_arg_types, &fail_args);
         ctx.set_last_guard_resume_position(snapshot_id);
 
         // pyjitpl.py:2602: frame.pc = saved_pc (restore)
@@ -1433,12 +1480,17 @@ impl MIFrame {
 
     /// pyjitpl.py:1916-1927 implement_guard_value parity.
     /// executor.py:544-551 constant_from_op(box): dispatches on box.type.
-    pub(crate) fn guard_value(&mut self, ctx: &mut TraceCtx, value: OpRef, expected: i64) {
+    pub(crate) fn implement_guard_value(
+        &mut self,
+        ctx: &mut TraceCtx,
+        value: OpRef,
+        expected: i64,
+    ) {
         let expected_ref = match self.value_type(value) {
             majit_ir::Type::Ref => ctx.const_ref(expected),
             _ => ctx.const_int(expected),
         };
-        self.record_guard(ctx, OpCode::GuardValue, &[value, expected_ref]);
+        self.generate_guard(ctx, OpCode::GuardValue, &[value, expected_ref]);
         // pyjitpl.py:3512: replace_box
         ctx.heap_cache_mut().replace_box(value, expected_ref);
     }
@@ -1455,12 +1507,12 @@ impl MIFrame {
         if ctx.heap_cache().is_class_known(value) {
             return; // class known implies nonnull
         }
-        self.record_guard(ctx, OpCode::GuardNonnull, &[value]);
+        self.generate_guard(ctx, OpCode::GuardNonnull, &[value]);
         ctx.heap_cache_mut().nullity_now_known(value, true);
     }
 
     pub(crate) fn guard_range_iter(&mut self, ctx: &mut TraceCtx, obj: OpRef) {
-        self.guard_object_class(ctx, obj, &RANGE_ITER_TYPE as *const PyType);
+        self.guard_class(ctx, obj, &RANGE_ITER_TYPE as *const PyType);
     }
 
     pub(crate) fn record_for_iter_guard(
@@ -1480,7 +1532,7 @@ impl MIFrame {
         } else {
             OpCode::GuardIsnull
         };
-        self.record_guard(ctx, opcode, &[next]);
+        self.generate_guard(ctx, opcode, &[next]);
         // heapcache: track nullity after for-iter guard
         ctx.heap_cache_mut().nullity_now_known(next, continues);
     }
@@ -1541,7 +1593,7 @@ impl MIFrame {
 
         // pyjitpl.py:2593-2602: saved_pc = frame.pc; frame.pc = resumepc;
         // capture_resumedata(); frame.pc = saved_pc
-        // Save ALL state BEFORE flush (record_guard_core parity).
+        // Save ALL state BEFORE flush (generate_guard_core parity).
         let saved_orgpc = self.orgpc;
         let saved_ni = self.sym().vable_next_instr;
         let saved_vsd = self.sym().vable_valuestackdepth;
@@ -1560,7 +1612,7 @@ impl MIFrame {
             let s = self.sym();
             // virtualizable_gen::NUM_SCALAR_INPUTARGS = 5: pyre's vable header
             // is [frame_ptr, next_instr, code, valuestackdepth, namespace]
-            // (matches the merged record_guard_core layout in this same file).
+            // (matches the merged generate_guard_core layout in this same file).
             let mut fa = vec![
                 s.frame,
                 s.vable_next_instr,
@@ -1625,7 +1677,7 @@ impl MIFrame {
         ctx.record_guard_typed_with_fail_args(opcode, &[truth], types, &fail_args);
         ctx.set_last_guard_resume_position(snapshot_id);
 
-        // pyjitpl.py:2602: frame.pc = saved_pc (restore all, record_guard_core parity)
+        // pyjitpl.py:2602: frame.pc = saved_pc (restore all, generate_guard_core parity)
         self.orgpc = saved_orgpc;
         let s = self.sym_mut();
         s.vable_next_instr = saved_ni;
@@ -1642,20 +1694,21 @@ impl MIFrame {
     }
 
     fn guard_int_object_value(&mut self, ctx: &mut TraceCtx, int_obj: OpRef, expected: i64) {
-        self.guard_object_class(ctx, int_obj, &INT_TYPE as *const PyType);
-        let actual_value = trace_gc_object_int_field(ctx, int_obj, int_intval_descr());
-        self.guard_value(ctx, actual_value, expected);
+        self.guard_class(ctx, int_obj, &INT_TYPE as *const PyType);
+        let actual_value = opimpl_getfield_gc_i(ctx, int_obj, int_intval_descr());
+        self.implement_guard_value(ctx, actual_value, expected);
     }
 
     pub(crate) fn guard_int_like_value(&mut self, ctx: &mut TraceCtx, value: OpRef, expected: i64) {
         if self.value_type(value) == Type::Int {
-            self.guard_value(ctx, value, expected);
+            self.implement_guard_value(ctx, value, expected);
         } else {
             self.guard_int_object_value(ctx, value, expected);
         }
     }
 
-    pub(crate) fn guard_object_class(
+    /// pyjitpl.py:1518 opimpl_guard_class
+    pub(crate) fn guard_class(
         &mut self,
         ctx: &mut TraceCtx,
         obj: OpRef,
@@ -1666,7 +1719,7 @@ impl MIFrame {
             return;
         }
         let expected_type_const = ctx.const_int(expected_type as usize as i64);
-        self.record_guard(ctx, OpCode::GuardNonnullClass, &[obj, expected_type_const]);
+        self.generate_guard(ctx, OpCode::GuardNonnullClass, &[obj, expected_type_const]);
         // heapcache.py:470-473: class_now_known sets class + nullity.
         ctx.heap_cache_mut()
             .class_now_known(obj, majit_ir::GcRef(expected_type as usize));
@@ -1680,8 +1733,8 @@ impl MIFrame {
         if self.value_type(int_obj) == Type::Int {
             return int_obj;
         }
-        self.guard_object_class(ctx, int_obj, &INT_TYPE as *const PyType);
-        let raw = trace_gc_object_int_field(ctx, int_obj, int_intval_descr());
+        self.guard_class(ctx, int_obj, &INT_TYPE as *const PyType);
+        let raw = opimpl_getfield_gc_i(ctx, int_obj, int_intval_descr());
         self.remember_value_type(raw, Type::Int);
         raw
     }
@@ -1689,16 +1742,16 @@ impl MIFrame {
     pub(crate) fn guard_len_gt_index(&mut self, ctx: &mut TraceCtx, len: OpRef, index: usize) {
         let index = ctx.const_int(index as i64);
         let in_bounds = ctx.record_op(OpCode::IntGt, &[len, index]);
-        self.record_guard(ctx, OpCode::GuardTrue, &[in_bounds]);
+        self.generate_guard(ctx, OpCode::GuardTrue, &[in_bounds]);
     }
 
     pub(crate) fn guard_len_eq(&mut self, ctx: &mut TraceCtx, len: OpRef, expected: usize) {
-        self.guard_value(ctx, len, expected as i64);
+        self.implement_guard_value(ctx, len, expected as i64);
     }
 
     pub(crate) fn guard_list_strategy(&mut self, ctx: &mut TraceCtx, obj: OpRef, expected: i64) {
-        let strategy = trace_gc_object_int_field(ctx, obj, list_strategy_descr());
-        self.guard_value(ctx, strategy, expected);
+        let strategy = opimpl_getfield_gc_i(ctx, obj, list_strategy_descr());
+        self.implement_guard_value(ctx, strategy, expected);
     }
 
     /// PyPy list strategies index directly into unwrapped storage with the
@@ -1760,7 +1813,7 @@ impl MIFrame {
         concrete_key: i64,
         strategy_id: u32,
     ) -> OpRef {
-        self.guard_object_class(ctx, obj, &LIST_TYPE as *const PyType);
+        self.guard_class(ctx, obj, &LIST_TYPE as *const PyType);
         self.guard_list_strategy(ctx, obj, strategy_id as i64);
         let (len_descr, ptr_descr) = match strategy_id {
             0 => (list_items_len_descr(), list_items_ptr_descr()),
@@ -1770,7 +1823,7 @@ impl MIFrame {
         };
         let len = trace_arraylen_gc(ctx, obj, len_descr);
         let index = self.trace_dynamic_list_index(ctx, key, len, concrete_key);
-        let items_ptr = trace_gc_object_int_field(ctx, obj, ptr_descr);
+        let items_ptr = opimpl_getfield_gc_i(ctx, obj, ptr_descr);
         match strategy_id {
             0 => trace_raw_array_getitem_value(ctx, items_ptr, index),
             1 => {
@@ -1855,12 +1908,12 @@ impl MIFrame {
         items_ptr_descr: DescrRef,
         items_len_descr: DescrRef,
     ) -> Vec<OpRef> {
-        self.guard_object_class(ctx, seq, expected_type);
+        self.guard_class(ctx, seq, expected_type);
 
         let len = trace_arraylen_gc(ctx, seq, items_len_descr);
-        self.guard_value(ctx, len, count as i64);
+        self.implement_guard_value(ctx, len, count as i64);
 
-        let items_ptr = trace_gc_object_int_field(ctx, seq, items_ptr_descr);
+        let items_ptr = opimpl_getfield_gc_i(ctx, seq, items_ptr_descr);
         (0..count)
             .map(|idx| {
                 let idx = ctx.const_int(idx as i64);
@@ -2137,7 +2190,10 @@ impl MIFrame {
             if is_list(concrete_obj) && is_int(concrete_key) {
                 let strategy_id = if w_list_uses_object_storage(concrete_obj) {
                     Some(0i64)
-                } else if w_list_uses_int_storage(concrete_obj) && is_int(concrete_value) {
+                } else if w_list_uses_int_storage(concrete_obj)
+                    && is_int(concrete_value)
+                    && int_strategy_preserves_identity(concrete_value)
+                {
                     Some(1i64)
                 } else if w_list_uses_float_storage(concrete_obj) && is_float(concrete_value) {
                     Some(2i64)
@@ -2175,6 +2231,7 @@ impl MIFrame {
         list: OpRef,
         value: OpRef,
         concrete_list: PyObjectRef,
+        concrete_value: PyObjectRef,
     ) -> Result<(), PyError> {
         if concrete_list.is_null() {
             return self.trace_list_append(list, value);
@@ -2182,11 +2239,21 @@ impl MIFrame {
 
         unsafe {
             if is_list(concrete_list) && w_list_can_append_without_realloc(concrete_list) {
+                // listobject.rs:234: typed strategies (int/float) de-specialize
+                // to object strategy if the appended value doesn't match.
+                // Only enter typed fast path when concrete value type matches.
                 let strategy_id = if w_list_uses_object_storage(concrete_list) {
                     Some(0i64)
-                } else if w_list_uses_int_storage(concrete_list) {
+                } else if w_list_uses_int_storage(concrete_list)
+                    && !concrete_value.is_null()
+                    && is_int(concrete_value)
+                    && int_strategy_preserves_identity(concrete_value)
+                {
                     Some(1i64)
-                } else if w_list_uses_float_storage(concrete_list) {
+                } else if w_list_uses_float_storage(concrete_list)
+                    && !concrete_value.is_null()
+                    && is_float(concrete_value)
+                {
                     Some(2i64)
                 } else {
                     None
@@ -2357,7 +2424,7 @@ impl MIFrame {
                 if args.len() == 1 {
                     let c_arg0 = concrete_args.first().copied().unwrap_or(PY_NULL);
                     self.with_ctx(|this, ctx| {
-                        this.guard_value(ctx, callable, concrete_callable as i64)
+                        this.implement_guard_value(ctx, callable, concrete_callable as i64)
                     });
                     if builtin_name == "type" {
                         return self.direct_type_value(callable, args[0], c_arg0);
@@ -2372,7 +2439,7 @@ impl MIFrame {
                     let c_arg0 = concrete_args.first().copied().unwrap_or(PY_NULL);
                     let c_arg1 = concrete_args.get(1).copied().unwrap_or(PY_NULL);
                     self.with_ctx(|this, ctx| {
-                        this.guard_value(ctx, callable, concrete_callable as i64)
+                        this.implement_guard_value(ctx, callable, concrete_callable as i64)
                     });
                     return self
                         .direct_isinstance_value(callable, args[0], args[1], c_arg0, c_arg1);
@@ -2380,7 +2447,7 @@ impl MIFrame {
                     let c_arg0 = concrete_args.first().copied().unwrap_or(PY_NULL);
                     let c_arg1 = concrete_args.get(1).copied().unwrap_or(PY_NULL);
                     self.with_ctx(|this, ctx| {
-                        this.guard_value(ctx, callable, concrete_callable as i64)
+                        this.implement_guard_value(ctx, callable, concrete_callable as i64)
                     });
                     return self
                         .direct_minmax_value(callable, args[0], args[1], false, c_arg0, c_arg1);
@@ -2388,13 +2455,13 @@ impl MIFrame {
                     let c_arg0 = concrete_args.first().copied().unwrap_or(PY_NULL);
                     let c_arg1 = concrete_args.get(1).copied().unwrap_or(PY_NULL);
                     self.with_ctx(|this, ctx| {
-                        this.guard_value(ctx, callable, concrete_callable as i64)
+                        this.implement_guard_value(ctx, callable, concrete_callable as i64)
                     });
                     return self
                         .direct_minmax_value(callable, args[0], args[1], true, c_arg0, c_arg1);
                 }
                 return self.with_ctx(|this, ctx| {
-                    this.guard_value(ctx, callable, concrete_callable as i64);
+                    this.implement_guard_value(ctx, callable, concrete_callable as i64);
                     let boxed_args = box_args_for_python_helper(this, ctx, args);
                     crate::helpers::emit_trace_call_known_builtin(ctx, callable, &boxed_args)
                 });
@@ -2491,7 +2558,7 @@ impl MIFrame {
                 if callee_prefers_function_entry && !is_self_recursive {
                     let call_pc = self.fallthrough_pc.saturating_sub(1);
                     return self.with_ctx(|this, ctx| {
-                        this.guard_value(ctx, callable, concrete_callable as i64);
+                        this.implement_guard_value(ctx, callable, concrete_callable as i64);
                         let boxed_args = box_args_for_python_helper(this, ctx, args);
                         let result = crate::helpers::emit_trace_call_known_function(
                             ctx,
@@ -2500,7 +2567,7 @@ impl MIFrame {
                             &boxed_args,
                         )?;
                         this.push_call_replay_stack(ctx, callable, args, call_pc);
-                        this.record_guard(ctx, OpCode::GuardNotForced, &[]);
+                        this.generate_guard(ctx, OpCode::GuardNotForced, &[]);
                         ctx.heap_cache_mut().invalidate_caches_for_escaped();
                         this.pop_call_replay_stack(ctx, args.len())?;
                         Ok(result)
@@ -2591,7 +2658,7 @@ impl MIFrame {
                     {
                         return self.with_ctx(|this, ctx| {
                             if !is_self_recursive {
-                                this.guard_value(ctx, callable, concrete_callable as i64);
+                                this.implement_guard_value(ctx, callable, concrete_callable as i64);
                             }
                             let self_recursive_raw_arg = if is_self_recursive
                                 && nargs == 1
@@ -2637,7 +2704,7 @@ impl MIFrame {
                             // array type. Raw Int args are re-boxed before passing.
                             let ca_locals: Vec<OpRef> =
                                 if let Some(raw_arg) = self_recursive_raw_arg {
-                                    vec![box_traced_raw_int(ctx, raw_arg)]
+                                    vec![wrapint(ctx, raw_arg)]
                                 } else {
                                     args.iter()
                                         .map(|&arg| ensure_boxed_for_ca(ctx, &*this, arg))
@@ -2670,7 +2737,7 @@ impl MIFrame {
                                 &[callee_frame],
                             );
                             let result = if inline_framestack_active {
-                                box_traced_raw_int(ctx, result)
+                                wrapint(ctx, result)
                             } else {
                                 result
                             };
@@ -2716,7 +2783,7 @@ impl MIFrame {
                         let Some(token_number) = driver.get_loop_token_number(callee_key) else {
                             let call_pc = self.fallthrough_pc.saturating_sub(1);
                             return self.with_ctx(|this, ctx| {
-                                this.guard_value(ctx, callable, concrete_callable as i64);
+                                this.implement_guard_value(ctx, callable, concrete_callable as i64);
                                 let result = crate::helpers::emit_trace_call_known_function(
                                     ctx,
                                     this.frame(),
@@ -2724,7 +2791,7 @@ impl MIFrame {
                                     args,
                                 )?;
                                 this.push_call_replay_stack(ctx, callable, args, call_pc);
-                                this.record_guard(ctx, OpCode::GuardNotForced, &[]);
+                                this.generate_guard(ctx, OpCode::GuardNotForced, &[]);
                                 ctx.heap_cache_mut().invalidate_caches_for_escaped();
                                 this.pop_call_replay_stack(ctx, args.len())?;
                                 Ok(result)
@@ -2747,7 +2814,11 @@ impl MIFrame {
                                 // Self-recursive: no callable guard needed (same function).
                                 // Non-self-recursive: guard on callable value.
                                 if !is_self_recursive {
-                                    this.guard_value(ctx, callable, concrete_callable as i64);
+                                    this.implement_guard_value(
+                                        ctx,
+                                        callable,
+                                        concrete_callable as i64,
+                                    );
                                 }
                                 let callee_frame = if args.len() == 1 {
                                     let (helper, helper_arg_types) = one_arg_callee_frame_helper(
@@ -2845,7 +2916,7 @@ impl MIFrame {
                                 let result = if inline_framestack_active
                                     && driver.has_raw_int_finish(callee_key)
                                 {
-                                    box_traced_raw_int(ctx, result)
+                                    wrapint(ctx, result)
                                 } else {
                                     result
                                 };
@@ -2872,7 +2943,7 @@ impl MIFrame {
 
                 let call_pc = self.fallthrough_pc.saturating_sub(1);
                 return self.with_ctx(|this, ctx| {
-                    this.guard_value(ctx, callable, concrete_callable as i64);
+                    this.implement_guard_value(ctx, callable, concrete_callable as i64);
                     let boxed_args = box_args_for_python_helper(this, ctx, args);
                     let result = crate::helpers::emit_trace_call_known_function(
                         ctx,
@@ -2881,7 +2952,7 @@ impl MIFrame {
                         &boxed_args,
                     )?;
                     this.push_call_replay_stack(ctx, callable, args, call_pc);
-                    this.record_guard(ctx, OpCode::GuardNotForced, &[]);
+                    this.generate_guard(ctx, OpCode::GuardNotForced, &[]);
                     ctx.heap_cache_mut().invalidate_caches_for_escaped();
                     this.pop_call_replay_stack(ctx, args.len())?;
                     Ok(result)
@@ -2903,7 +2974,7 @@ impl MIFrame {
         use pyre_interpreter::pyframe::PyFrame;
 
         self.with_ctx(|this, ctx| {
-            this.guard_value(ctx, callable, concrete_callable as i64);
+            this.implement_guard_value(ctx, callable, concrete_callable as i64);
         });
 
         let concrete_args: Vec<PyObjectRef> = passed_concrete_args.to_vec();
@@ -3111,7 +3182,7 @@ impl MIFrame {
         let call_pc = self.fallthrough_pc.saturating_sub(1);
 
         let result = self.with_ctx(|this, ctx| {
-            this.guard_value(ctx, callable, concrete_callable as i64);
+            this.implement_guard_value(ctx, callable, concrete_callable as i64);
 
             if args.len() == 1 {
                 let result = if matches!(concrete_arg0, Some(arg) if unsafe { is_int(arg) }) {
@@ -3129,7 +3200,7 @@ impl MIFrame {
                     } else {
                         crate::callbacks::get().jit_force_recursive_call_argraw_boxed_1
                     };
-                    this.sync_standard_virtualizable_before_residual_call(ctx);
+                    this.vable_and_vrefs_before_residual_call(ctx);
                     // RPython parity: use CALL_ASSEMBLER_I when a token
                     // exists for the callee (compiled or pending).
                     // RPython parity: use CALL_ASSEMBLER_I when a token
@@ -3198,29 +3269,29 @@ impl MIFrame {
                     // CallAssemblerI handles guard failures internally
                     // (call_assembler_fast_path). No GuardNotForced needed,
                     // but virtualizable token must be cleaned up.
-                    if ca_token.is_some() {
-                        this.sync_standard_virtualizable_after_residual_call(ctx);
-                    } else if !this.sync_standard_virtualizable_after_residual_call(ctx) {
+                    // pyjitpl.py:3349: vable_after_residual_call — if
+                    // virtualizable escaped, abort (SwitchToBlackhole).
+                    this.vable_after_residual_call(ctx)?;
+                    if ca_token.is_none() {
                         this.push_call_replay_stack(ctx, callable, args, call_pc);
-                        this.record_guard(ctx, OpCode::GuardNotForced, &[]);
+                        this.generate_guard(ctx, OpCode::GuardNotForced, &[]);
                         ctx.heap_cache_mut().invalidate_caches_for_escaped();
                         this.pop_call_replay_stack(ctx, args.len())?;
                     }
                     result
                 } else {
                     let force_fn = crate::callbacks::get().jit_force_recursive_call_1;
-                    this.sync_standard_virtualizable_before_residual_call(ctx);
+                    this.vable_and_vrefs_before_residual_call(ctx);
                     let result = ctx.call_may_force_ref_typed(
                         force_fn,
                         &[this.frame(), callable, args[0]],
                         &[Type::Ref, Type::Ref, Type::Ref],
                     );
-                    if !this.sync_standard_virtualizable_after_residual_call(ctx) {
-                        this.push_call_replay_stack(ctx, callable, args, call_pc);
-                        this.record_guard(ctx, OpCode::GuardNotForced, &[]);
-                        ctx.heap_cache_mut().invalidate_caches_for_escaped();
-                        this.pop_call_replay_stack(ctx, args.len())?;
-                    }
+                    this.vable_after_residual_call(ctx)?;
+                    this.push_call_replay_stack(ctx, callable, args, call_pc);
+                    this.generate_guard(ctx, OpCode::GuardNotForced, &[]);
+                    ctx.heap_cache_mut().invalidate_caches_for_escaped();
+                    this.pop_call_replay_stack(ctx, args.len())?;
                     result
                 };
                 Ok(result)
@@ -3231,15 +3302,15 @@ impl MIFrame {
                 let callee_frame =
                     ctx.call_ref_typed(frame_helper, &helper_args, &helper_arg_types);
                 let force_fn = crate::callbacks::get().jit_force_callee_frame;
-                this.sync_standard_virtualizable_before_residual_call(ctx);
+                this.vable_and_vrefs_before_residual_call(ctx);
                 let result = ctx.call_may_force_ref_typed(force_fn, &[callee_frame], &[Type::Ref]);
-                if !this.sync_standard_virtualizable_after_residual_call(ctx) {
-                    // GuardNotForced fail → interpreter must re-execute CALL.
-                    this.push_call_replay_stack(ctx, callable, args, call_pc);
-                    this.record_guard(ctx, OpCode::GuardNotForced, &[]);
-                    ctx.heap_cache_mut().invalidate_caches_for_escaped();
-                    this.pop_call_replay_stack(ctx, args.len())?;
-                }
+                // pyjitpl.py:3349: vable_after_residual_call — abort if forced
+                this.vable_after_residual_call(ctx)?;
+                // GuardNotForced fail → interpreter must re-execute CALL.
+                this.push_call_replay_stack(ctx, callable, args, call_pc);
+                this.generate_guard(ctx, OpCode::GuardNotForced, &[]);
+                ctx.heap_cache_mut().invalidate_caches_for_escaped();
+                this.pop_call_replay_stack(ctx, args.len())?;
                 ctx.call_void(
                     crate::callbacks::get().jit_drop_callee_frame,
                     &[callee_frame],
@@ -3588,7 +3659,7 @@ impl MIFrame {
         } else {
             // pyjitpl.py:3397: GUARD_NO_EXCEPTION
             self.with_ctx(|this, ctx| {
-                this.record_guard(ctx, majit_ir::OpCode::GuardNoException, &[]);
+                this.generate_guard(ctx, majit_ir::OpCode::GuardNoException, &[]);
             });
             TraceAction::Continue
         }
@@ -3870,7 +3941,7 @@ impl TraceHelperAccess for MIFrame {
 
     fn trace_record_not_forced_guard(&mut self) {
         self.with_ctx(|this, ctx| {
-            this.record_guard(ctx, OpCode::GuardNotForced, &[]);
+            this.generate_guard(ctx, OpCode::GuardNotForced, &[]);
             // heapcache.py: invalidate_caches after non-pure calls.
             // The call may have mutated heap state, so cached field
             // values for escaped objects are no longer reliable.
@@ -4063,7 +4134,12 @@ impl SharedOpcodeHandler for MIFrame {
 
     fn list_append(&mut self, list: Self::Value, value: Self::Value) -> Result<(), PyError> {
         // RPython MIFrame parity: trace-only, no concrete mutation.
-        self.list_append_value(list.opref, value.opref, list.concrete.to_pyobj())
+        self.list_append_value(
+            list.opref,
+            value.opref,
+            list.concrete.to_pyobj(),
+            value.concrete.to_pyobj(),
+        )
     }
 
     fn unpack_sequence(
@@ -4394,7 +4470,7 @@ impl BranchOpcodeHandler for MIFrame {
             } else {
                 OpCode::GuardFalse
             };
-            MIFrame::record_guard(this, ctx, opcode, &[truth]);
+            MIFrame::generate_guard(this, ctx, opcode, &[truth]);
             Ok(())
         })
     }
@@ -4709,7 +4785,7 @@ impl OpcodeStepExecutor for MIFrame {
                 // exc_value_box, clsbox, resumepc=orgpc).
                 if !ctx.heap_cache().is_class_known(exc_val.opref) {
                     let cls_const = ctx.const_int(exc_class_ptr as usize as i64);
-                    this.record_guard(ctx, OpCode::GuardClass, &[exc_val.opref, cls_const]);
+                    this.generate_guard(ctx, OpCode::GuardClass, &[exc_val.opref, cls_const]);
                     ctx.heap_cache_mut()
                         .class_now_known(exc_val.opref, majit_ir::GcRef(exc_class_ptr as usize));
                 }
@@ -4737,5 +4813,23 @@ impl OpcodeStepExecutor for MIFrame {
         Err(PyError::type_error(format!(
             "unsupported instruction during trace: {instruction:?}"
         )))
+    }
+}
+
+/// listobject.rs:241-249 parity: int strategy only preserves identity for
+/// canonical cached ints. Unique small ints (from w_int_new_unique) trigger
+/// de-specialization to object strategy.
+///
+/// For large ints (outside small cache range), the strategy always keeps them
+/// as raw i64 values regardless of pointer identity.
+unsafe fn int_strategy_preserves_identity(value: PyObjectRef) -> bool {
+    let v = w_int_get_value(value);
+    if pyre_object::w_int_small_cached(v) {
+        // Small cached range: only canonical pointer preserves int strategy.
+        // listobject.rs:247: std::ptr::eq(value, w_int_new(v))
+        std::ptr::eq(value, w_int_new(v))
+    } else {
+        // Large ints are always stored as raw i64 in int strategy.
+        true
     }
 }

@@ -726,8 +726,7 @@ pub fn call_with_kwargs(
                         if slot < result.len() && result[slot].is_null() {
                             let param_name = &code.varnames[slot];
                             let key = pyre_object::w_str_new(param_name);
-                            if let Some(v) =
-                                unsafe { pyre_object::w_dict_lookup(kwdefaults, key) }
+                            if let Some(v) = unsafe { pyre_object::w_dict_lookup(kwdefaults, key) }
                             {
                                 result[slot] = v;
                             }

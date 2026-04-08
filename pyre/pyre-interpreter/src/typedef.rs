@@ -179,10 +179,11 @@ pub fn gettypefor(tp: *const PyType) -> Option<PyObjectRef> {
 
 /// Get the W_TypeObject for any PyObjectRef.
 ///
-/// PyPy: `space.type(w_obj)`
+/// PyPy: `space.type(w_obj)` → `w_obj.getclass(space)`
 /// - Instance of user class → w_instance_get_type
+/// - Builtin object with __class__ override → ATTR_TABLE["__class__"]
 /// - Builtin object → type registry lookup
-/// - Type object → type of type (not implemented, returns None)
+/// - Type object → metaclass or type(type)
 pub fn r#type(obj: PyObjectRef) -> Option<PyObjectRef> {
     if obj.is_null() {
         return None;
@@ -204,6 +205,20 @@ pub fn r#type(obj: PyObjectRef) -> Option<PyObjectRef> {
             }
             // Default: type of type is type
             return gettypefor(&pyre_object::pyobject::TYPE_TYPE);
+        }
+        // Check for __class__ override in ATTR_TABLE (e.g. int subclass
+        // created via int.__new__(MyIntSubclass, value) sets
+        // ATTR_TABLE[obj]["__class__"] = MyIntSubclass).
+        // This matches PyPy's w_obj.getclass(space) which returns
+        // the real Python class, including __class__ overrides.
+        let class_override = crate::baseobjspace::ATTR_TABLE.with(|table| {
+            table
+                .borrow()
+                .get(&(obj as usize))
+                .and_then(|d| d.get("__class__").copied())
+        });
+        if let Some(cls) = class_override {
+            return Some(cls);
         }
         let tp = (*obj).ob_type;
         gettypefor(tp)

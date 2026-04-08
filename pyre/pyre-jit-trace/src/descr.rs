@@ -308,6 +308,18 @@ use pyre_object::{
 };
 use pyre_object::{FLOAT_TYPE, INT_TYPE};
 
+/// Field descriptor for `W_InstanceObject.w_type` (Ref, immutable).
+///
+/// W_InstanceObject layout: [ob_type(8)] [w_type(8)]
+/// The w_type field holds the real Python class of the instance.
+/// RPython parity: this is the field that jit.promote(__class__) reads.
+pub fn instance_w_type_descr() -> DescrRef {
+    // W_InstanceObject.w_type is at offset sizeof(PyObject) = sizeof(pointer) = OB_TYPE_OFFSET + 8
+    // More precisely: ob_header is a PyObject { ob_type: *const PyType }, which is 8 bytes.
+    const INSTANCE_W_TYPE_OFFSET: usize = std::mem::size_of::<pyre_object::pyobject::PyObject>();
+    make_immutable_field_descr(INSTANCE_W_TYPE_OFFSET, 8, Type::Ref, false)
+}
+
 /// Field descriptor for `W_RangeIterator.current` (i64, signed).
 pub fn range_iter_current_descr() -> DescrRef {
     make_field_descr(RANGE_ITER_CURRENT_OFFSET, 8, Type::Int, true)
