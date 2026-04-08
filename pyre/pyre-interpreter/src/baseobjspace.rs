@@ -2992,13 +2992,12 @@ fn descr_set___class__(w_obj: PyObjectRef, w_newcls: PyObjectRef) -> PyResult {
         // objectobject.py:148-154 — full instance layout must match.
         // typeobject.py:125-129 `Layout.expand()` returns
         // `(typedef, newslotnames, base_layout, hasdict, weakrefable)`.
-        // Two types must agree on all components for __class__ assignment.
-        // In pyre: compare layout PyType (typedef) and nslots.
+        // Two types must agree on all 5 components for __class__ assignment.
         let old_layout = w_type_get_layout(w_oldcls);
         let new_layout = w_type_get_layout(w_newcls);
-        let old_nslots = w_type_get_nslots(w_oldcls);
-        let new_nslots = w_type_get_nslots(w_newcls);
-        if !std::ptr::eq(old_layout, new_layout) || old_nslots != new_nslots {
+        let old_slotnames = pyre_object::w_type_get_newslotnames(w_oldcls);
+        let new_slotnames = pyre_object::w_type_get_newslotnames(w_newcls);
+        if !std::ptr::eq(old_layout, new_layout) || old_slotnames != new_slotnames {
             return Err(crate::PyError::type_error(format!(
                 "__class__ assignment: '{}' object layout differs from '{}'",
                 pyre_object::w_type_get_name(w_oldcls),

@@ -1220,8 +1220,9 @@ pub fn generated_list_setitem_by_strategy(
         2 => (crate::descr::list_float_items_len_descr(), crate::descr::list_float_items_ptr_descr()),
         _ => unreachable!(),
     };
-    let len = crate::state::trace_arraylen_gc(ctx, obj, len_descr);
-    let index = frame.trace_dynamic_list_index(ctx, key, len, concrete_key);
+    // pyjitpl.py:841: opimpl_check_resizable_neg_index for index normalization
+    let index = opimpl_check_resizable_neg_index(frame, ctx, obj, key, len_descr, concrete_key);
+    // pyjitpl.py:832: arraybox = opimpl_getfield_gc_r(listbox, itemsdescr)
     let items_ptr = crate::state::opimpl_getfield_gc_i(ctx, obj, ptr_descr);
     match strategy_id {
         0 => crate::state::trace_raw_array_setitem_value(ctx, items_ptr, index, value),
@@ -1703,14 +1704,11 @@ pub fn generated_direct_minmax_value(
 
     None
 }
-/// Trace tuple[int_key] getitem: guard_class → guard_index → arraylen →
-/// guard_len → items_ptr → raw array getitem.
+/// jtransform do_fixed_list_getitem parity:
+///   guard_class + opimpl_check_neg_index + getarrayitem_gc_r_pure.
 ///
-/// RPython jtransform do_fixed_list_getitem parity:
-///   guard_class + check_neg_index + getarrayitem_gc_r.
-///
-/// Handles both positive and negative concrete_key.
-/// Returns None if not a recognized tuple getitem.
+/// Tuples are fixed-size arrays: uses opimpl_check_neg_index for index
+/// normalization (ARRAYLEN_GC for length).
 #[inline]
 pub fn generated_tuple_getitem(
     frame: &mut crate::state::MIFrame,
@@ -1718,35 +1716,122 @@ pub fn generated_tuple_getitem(
     obj: majit_ir::OpRef,
     key: majit_ir::OpRef,
     concrete_key: i64,
-    concrete_len: usize,
+    _concrete_len: usize,
 ) -> majit_ir::OpRef {
     let expected_type = &pyre_object::pyobject::TUPLE_TYPE as *const _ as *const pyre_object::PyType;
     let items_ptr_descr = crate::descr::tuple_items_ptr_descr();
     let items_len_descr = crate::descr::tuple_items_len_descr();
 
     frame.guard_class(ctx, obj, expected_type);
-    frame.guard_int_like_value(ctx, key, concrete_key);
-    let len = crate::state::trace_arraylen_gc(ctx, obj, items_len_descr);
-
-    let index = if concrete_key >= 0 {
-        frame.guard_len_gt_index(ctx, len, concrete_key as usize);
-        ctx.const_int(concrete_key)
-    } else {
-        frame.guard_len_eq(ctx, len, concrete_len);
-        let normalized = (concrete_len as i64 + concrete_key) as usize;
-        ctx.const_int(normalized as i64)
-    };
+    // pyjitpl.py:767-776 opimpl_check_neg_index
+    let index = opimpl_check_neg_index(frame, ctx, obj, key, items_len_descr, concrete_key);
 
     let items_ptr = crate::state::opimpl_getfield_gc_i(ctx, obj, items_ptr_descr);
     crate::state::trace_raw_array_getitem_value(ctx, items_ptr, index)
 }
 
-/// Trace list/tuple index normalization: unbox key → bounds check guards.
+/// pyjitpl.py:767-776 opimpl_check_neg_index:
+///   negbox = INT_LT(indexbox, CONST_FALSE)
+///   negbox = implement_guard_value(negbox, orgpc)
+///   if negbox.getint():
+///       lengthbox = opimpl_arraylen_gc(arraybox, arraydescr)
+///       indexbox = INT_ADD(indexbox, lengthbox)
+///   return indexbox
 ///
-/// RPython pyjitpl.py:841 opimpl_check_resizable_neg_index:
-///   INT_LT(index, 0) → implement_guard_value → if negative: getfield(length) + INT_ADD.
+/// For fixed-size arrays (tuples). Bounds guards added for raw-pointer safety.
+#[inline]
+pub fn opimpl_check_neg_index(
+    frame: &mut crate::state::MIFrame,
+    ctx: &mut majit_metainterp::TraceCtx,
+    arraybox: majit_ir::OpRef,
+    indexbox: majit_ir::OpRef,
+    arraydescr: majit_ir::DescrRef,
+    concrete_key: i64,
+) -> majit_ir::OpRef {
+    use majit_ir::OpCode;
+
+    let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+    let raw_index = if frame.value_type(indexbox) == majit_ir::Type::Int {
+        indexbox
+    } else {
+        crate::state::trace_unbox_int_with_resume(frame, ctx, indexbox, int_type_addr)
+    };
+    let zero = ctx.const_int(0);
+    // pyjitpl.py:768-770
+    let negbox = ctx.record_op(OpCode::IntLt, &[raw_index, zero]);
+    frame.implement_guard_value(ctx, negbox, if concrete_key < 0 { 1 } else { 0 });
+    if concrete_key < 0 {
+        // pyjitpl.py:773: lengthbox = self.opimpl_arraylen_gc(arraybox, arraydescr)
+        let lengthbox = crate::state::trace_arraylen_gc(ctx, arraybox, arraydescr);
+        // pyjitpl.py:774-775: indexbox = INT_ADD(indexbox, lengthbox)
+        let indexbox = ctx.record_op(OpCode::IntAdd, &[raw_index, lengthbox]);
+        // bounds guard (raw-pointer safety, not in RPython meta-interp)
+        let in_bounds = ctx.record_op(OpCode::IntGe, &[indexbox, zero]);
+        frame.generate_guard(ctx, OpCode::GuardTrue, &[in_bounds]);
+        indexbox
+    } else {
+        // RPython: no bounds check in check_neg_index for positive index.
+        // We add one for raw-pointer safety (no GC array bounds check).
+        let lengthbox = crate::state::trace_arraylen_gc(ctx, arraybox, arraydescr);
+        let in_bounds = ctx.record_op(OpCode::IntLt, &[raw_index, lengthbox]);
+        frame.generate_guard(ctx, OpCode::GuardTrue, &[in_bounds]);
+        raw_index
+    }
+}
+
+/// pyjitpl.py:841-852 opimpl_check_resizable_neg_index:
+///   negbox = INT_LT(indexbox, CONST_FALSE)
+///   negbox = implement_guard_value(negbox, orgpc)
+///   if negbox.getint():
+///       lenbox = execute_and_record(GETFIELD_GC, lengthdescr, listbox)
+///       indexbox = INT_ADD(indexbox, lenbox)
+///   return indexbox
 ///
-/// Returns the final index OpRef (positive, bounds-checked).
+/// For resizable lists. Uses GETFIELD_GC for length (not ARRAYLEN_GC).
+/// Bounds guards added for raw-pointer safety.
+#[inline]
+pub fn opimpl_check_resizable_neg_index(
+    frame: &mut crate::state::MIFrame,
+    ctx: &mut majit_metainterp::TraceCtx,
+    listbox: majit_ir::OpRef,
+    indexbox: majit_ir::OpRef,
+    lengthdescr: majit_ir::DescrRef,
+    concrete_key: i64,
+) -> majit_ir::OpRef {
+    use majit_ir::OpCode;
+
+    let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+    let raw_index = if frame.value_type(indexbox) == majit_ir::Type::Int {
+        indexbox
+    } else {
+        crate::state::trace_unbox_int_with_resume(frame, ctx, indexbox, int_type_addr)
+    };
+    let zero = ctx.const_int(0);
+    // pyjitpl.py:843-845
+    let negbox = ctx.record_op(OpCode::IntLt, &[raw_index, zero]);
+    frame.implement_guard_value(ctx, negbox, if concrete_key < 0 { 1 } else { 0 });
+    if concrete_key < 0 {
+        // pyjitpl.py:848: lenbox = execute_and_record(GETFIELD_GC, lengthdescr, listbox)
+        let lenbox = crate::state::opimpl_getfield_gc_i(ctx, listbox, lengthdescr);
+        // pyjitpl.py:850-851: indexbox = INT_ADD(indexbox, lenbox)
+        let indexbox = ctx.record_op(OpCode::IntAdd, &[raw_index, lenbox]);
+        // bounds guard (raw-pointer safety)
+        let in_bounds = ctx.record_op(OpCode::IntGe, &[indexbox, zero]);
+        frame.generate_guard(ctx, OpCode::GuardTrue, &[in_bounds]);
+        indexbox
+    } else {
+        // RPython: no bounds check for positive index.
+        // We add one for raw-pointer safety.
+        let lenbox = crate::state::opimpl_getfield_gc_i(ctx, listbox, lengthdescr);
+        let in_bounds = ctx.record_op(OpCode::IntLt, &[raw_index, lenbox]);
+        frame.generate_guard(ctx, OpCode::GuardTrue, &[in_bounds]);
+        raw_index
+    }
+}
+
+/// Backward-compat wrapper with pre-computed length parameter.
+/// check_neg_index/check_resizable_neg_index read length internally;
+/// this legacy path accepts a pre-read `len` for existing callers.
 #[inline]
 pub fn generated_dynamic_list_index(
     frame: &mut crate::state::MIFrame,
@@ -1764,20 +1849,200 @@ pub fn generated_dynamic_list_index(
         crate::state::trace_unbox_int_with_resume(frame, ctx, key, int_type_addr)
     };
     let zero = ctx.const_int(0);
-    if concrete_key >= 0 {
-        let nonnegative = ctx.record_op(OpCode::IntGe, &[raw_index, zero]);
-        frame.generate_guard(ctx, OpCode::GuardTrue, &[nonnegative]);
+    // pyjitpl.py:843-845 implement_guard_value parity
+    let negbox = ctx.record_op(OpCode::IntLt, &[raw_index, zero]);
+    frame.implement_guard_value(ctx, negbox, if concrete_key < 0 { 1 } else { 0 });
+    if concrete_key < 0 {
+        // pyjitpl.py:850-851: INT_ADD(indexbox, lenbox)
+        let indexbox = ctx.record_op(OpCode::IntAdd, &[raw_index, len]);
+        let in_bounds = ctx.record_op(OpCode::IntGe, &[indexbox, zero]);
+        frame.generate_guard(ctx, OpCode::GuardTrue, &[in_bounds]);
+        indexbox
+    } else {
         let in_bounds = ctx.record_op(OpCode::IntLt, &[raw_index, len]);
         frame.generate_guard(ctx, OpCode::GuardTrue, &[in_bounds]);
         raw_index
+    }
+}
+
+/// pyjitpl.py:814-827 opimpl_getlistitem_gc_{i,r,f}:
+///   arraybox = getfield_gc_r(listbox, itemsdescr)
+///   return getarrayitem_gc_{i,r,f}(arraybox, indexbox, arraydescr)
+///
+/// Combined with guard_class + guard_strategy + opimpl_check_resizable_neg_index
+/// as emitted by jtransform do_resizable_list_getitem.
+///
+/// strategy_id: 0 = object, 1 = int, 2 = float.
+#[inline]
+pub fn generated_list_getitem_by_strategy(
+    frame: &mut crate::state::MIFrame,
+    ctx: &mut majit_metainterp::TraceCtx,
+    obj: majit_ir::OpRef,
+    key: majit_ir::OpRef,
+    concrete_key: i64,
+    strategy_id: i64,
+) -> majit_ir::OpRef {
+    frame.guard_class(ctx, obj, &pyre_object::pyobject::LIST_TYPE as *const _ as *const pyre_object::PyType);
+    frame.guard_list_strategy(ctx, obj, strategy_id);
+    let (len_descr, ptr_descr) = match strategy_id {
+        0 => (crate::descr::list_items_len_descr(), crate::descr::list_items_ptr_descr()),
+        1 => (crate::descr::list_int_items_len_descr(), crate::descr::list_int_items_ptr_descr()),
+        2 => (crate::descr::list_float_items_len_descr(), crate::descr::list_float_items_ptr_descr()),
+        _ => unreachable!(),
+    };
+    let index = opimpl_check_resizable_neg_index(frame, ctx, obj, key, len_descr, concrete_key);
+    let items_ptr = crate::state::opimpl_getfield_gc_i(ctx, obj, ptr_descr);
+    match strategy_id {
+        0 => crate::state::trace_raw_array_getitem_value(ctx, items_ptr, index),
+        1 => {
+            let raw = crate::state::trace_raw_int_array_getitem_value(ctx, items_ptr, index);
+            frame.remember_value_type(raw, majit_ir::Type::Int);
+            raw
+        }
+        2 => {
+            let raw = crate::state::trace_raw_float_array_getitem_value(ctx, items_ptr, index);
+            frame.remember_value_type(raw, majit_ir::Type::Float);
+            raw
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// Dispatch binary subscript (getitem) to type-specialized trace paths.
+///
+/// jtransform do_fixed_list_getitem / do_resizable_list_getitem parity:
+///   tuple → opimpl_check_neg_index + getarrayitem_gc_r_pure
+///   list  → guard_class + guard_strategy + opimpl_check_resizable_neg_index
+///           + opimpl_getlistitem_gc_{i,r,f}
+///
+/// Returns None if not a recognized subscript → caller falls back to residual.
+#[inline]
+pub fn generated_binary_subscr_value(
+    frame: &mut crate::state::MIFrame,
+    ctx: &mut majit_metainterp::TraceCtx,
+    a: majit_ir::OpRef,
+    b: majit_ir::OpRef,
+    concrete_obj: pyre_object::PyObjectRef,
+    concrete_key: pyre_object::PyObjectRef,
+) -> Option<majit_ir::OpRef> {
+    if concrete_obj.is_null() || concrete_key.is_null() {
+        return None;
+    }
+    unsafe {
+        if !pyre_object::pyobject::is_int(concrete_key) {
+            return None;
+        }
+        let index = pyre_object::w_int_get_value(concrete_key);
+
+        if pyre_object::pyobject::is_tuple(concrete_obj) {
+            let concrete_len = pyre_object::w_tuple_len(concrete_obj);
+            if check_index_in_bounds(index, concrete_len) {
+                return Some(generated_tuple_getitem(frame, ctx, a, b, index, concrete_len));
+            }
+        } else if pyre_object::pyobject::is_list(concrete_obj) {
+            if let Some(sid) = detect_list_getitem_strategy(concrete_obj) {
+                let concrete_len = pyre_object::w_list_len(concrete_obj);
+                if check_index_in_bounds(index, concrete_len) {
+                    return Some(generated_list_getitem_by_strategy(
+                        frame, ctx, a, b, index, sid,
+                    ));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Dispatch store subscript (setitem) to type-specialized trace paths.
+///
+/// jtransform do_resizable_list_setitem parity:
+///   list + int key → guard_class + guard_strategy + opimpl_check_resizable_neg_index
+///                    + opimpl_setlistitem_gc_{i,r,f}
+///
+/// Returns true if handled, false if caller should fall back to residual.
+#[inline]
+pub fn generated_store_subscr_value(
+    frame: &mut crate::state::MIFrame,
+    ctx: &mut majit_metainterp::TraceCtx,
+    obj: majit_ir::OpRef,
+    key: majit_ir::OpRef,
+    value: majit_ir::OpRef,
+    concrete_obj: pyre_object::PyObjectRef,
+    concrete_key: pyre_object::PyObjectRef,
+    concrete_value: pyre_object::PyObjectRef,
+) -> bool {
+    if concrete_obj.is_null() || concrete_key.is_null() || concrete_value.is_null() {
+        return false;
+    }
+    unsafe {
+        if pyre_object::pyobject::is_list(concrete_obj)
+            && pyre_object::pyobject::is_int(concrete_key)
+        {
+            if let Some(sid) = detect_list_setitem_strategy(concrete_obj, concrete_value) {
+                let index = pyre_object::w_int_get_value(concrete_key);
+                let concrete_len = pyre_object::w_list_len(concrete_obj);
+                if check_index_in_bounds(index, concrete_len) {
+                    generated_list_setitem_by_strategy(
+                        frame, ctx, obj, key, value, index, sid,
+                    );
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Check if index is within bounds of a container with given length.
+#[inline]
+fn check_index_in_bounds(index: i64, len: usize) -> bool {
+    if index >= 0 {
+        (index as usize) < len
     } else {
-        let negative = ctx.record_op(OpCode::IntLt, &[raw_index, zero]);
-        frame.generate_guard(ctx, OpCode::GuardTrue, &[negative]);
-        let normalized = ctx.record_op(OpCode::IntAddOvf, &[len, raw_index]);
-        frame.generate_guard(ctx, OpCode::GuardNoOverflow, &[]);
-        let in_bounds = ctx.record_op(OpCode::IntGe, &[normalized, zero]);
-        frame.generate_guard(ctx, OpCode::GuardTrue, &[in_bounds]);
-        normalized
+        index
+            .checked_neg()
+            .and_then(|v| usize::try_from(v).ok())
+            .map_or(false, |abs| abs <= len)
+    }
+}
+
+/// Detect list strategy for getitem.
+/// Returns strategy_id: 0 = object, 1 = int, 2 = float, or None.
+#[inline]
+unsafe fn detect_list_getitem_strategy(
+    concrete_obj: pyre_object::PyObjectRef,
+) -> Option<i64> {
+    if pyre_object::w_list_uses_object_storage(concrete_obj) {
+        Some(0)
+    } else if pyre_object::w_list_uses_int_storage(concrete_obj) {
+        Some(1)
+    } else if pyre_object::w_list_uses_float_storage(concrete_obj) {
+        Some(2)
+    } else {
+        None
+    }
+}
+
+/// Detect list strategy for setitem, checking value type compatibility.
+/// listobject.py: int strategy requires int value, float strategy requires float.
+#[inline]
+unsafe fn detect_list_setitem_strategy(
+    concrete_obj: pyre_object::PyObjectRef,
+    concrete_value: pyre_object::PyObjectRef,
+) -> Option<i64> {
+    if pyre_object::w_list_uses_object_storage(concrete_obj) {
+        Some(0)
+    } else if pyre_object::w_list_uses_int_storage(concrete_obj)
+        && pyre_object::pyobject::is_int(concrete_value)
+        && crate::state::int_strategy_preserves_identity(concrete_value)
+    {
+        Some(1)
+    } else if pyre_object::w_list_uses_float_storage(concrete_obj)
+        && pyre_object::pyobject::is_float(concrete_value)
+    {
+        Some(2)
+    } else {
+        None
     }
 }
 

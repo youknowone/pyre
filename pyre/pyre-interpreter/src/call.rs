@@ -1457,18 +1457,16 @@ fn build_class_inner(
         result
     } else {
         let w = pyre_object::w_type_new(name, w_effective_bases, class_ns_ptr as *mut u8);
-        // typeobject.py:114 — detect __slots__ and record count.
+        // typeobject.py:1143-1204 create_all_slots: detect __slots__,
+        // collect sorted newslotnames, record nslots count.
         unsafe {
             let ns = &*class_ns_ptr;
             if let Some(&w_slots) = ns.get("__slots__") {
-                let nslots = if pyre_object::is_tuple(w_slots) {
-                    pyre_object::w_tuple_len(w_slots) as u32
-                } else if pyre_object::is_str(w_slots) {
-                    1
-                } else {
-                    1
-                };
+                let mut slot_names = collect_slot_names(w_slots);
+                slot_names.sort();
+                let nslots = slot_names.len() as u32;
                 pyre_object::w_type_set_nslots(w, nslots);
+                pyre_object::w_type_set_newslotnames(w, slot_names);
             }
         }
         // baseobjspace.py:76 — set w_class to 'type' (default metaclass)
@@ -1581,4 +1579,28 @@ fn type_descr_call(frame: &mut PyFrame, w_type: PyObjectRef, args: &[PyObjectRef
     }
 
     Ok(instance)
+}
+
+/// typeobject.py:1155-1188 — extract slot names from __slots__ value.
+/// Returns a Vec of slot name strings (NOT yet sorted; caller must sort).
+pub fn collect_slot_names(w_slots: pyre_object::PyObjectRef) -> Vec<String> {
+    unsafe {
+        if pyre_object::is_tuple(w_slots) {
+            let len = pyre_object::w_tuple_len(w_slots);
+            (0..len)
+                .filter_map(|i| {
+                    let w_name = pyre_object::w_tuple_getitem(w_slots, i as i64)?;
+                    if pyre_object::is_str(w_name) {
+                        Some(pyre_object::w_str_get_value(w_name).to_string())
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        } else if pyre_object::is_str(w_slots) {
+            vec![pyre_object::w_str_get_value(w_slots).to_string()]
+        } else {
+            Vec::new()
+        }
+    }
 }

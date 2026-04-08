@@ -2925,12 +2925,15 @@ impl PyreJitState {
         }
     }
 
+    /// resume.py:597-602 AbstractVirtualStructInfo.setfields parity:
+    /// ALL traced fields are restored, including w_class.
     fn materialize_virtual_object(
         &mut self,
         fields: &[(u32, majit_metainterp::resume::MaterializedValue)],
         materialized_refs: &[Option<majit_ir::GcRef>],
     ) -> Option<majit_ir::GcRef> {
         let mut ob_type: usize = 0;
+        let mut w_class: usize = 0;
         let mut int_payload: i64 = 0;
         let mut list_items_ptr: usize = 0;
         let mut list_items_len: usize = 0;
@@ -2946,7 +2949,8 @@ impl PyreJitState {
             let concrete = value.resolve_with_refs(materialized_refs)?;
             match offset {
                 Some(o) if o == OB_TYPE_OFFSET => ob_type = concrete as usize,
-                Some(o) if o == W_CLASS_OFFSET => { /* w_class: skip, set by w_*_new */ }
+                // resume.py:598-602: restore ALL fields, including w_class.
+                Some(o) if o == W_CLASS_OFFSET => w_class = concrete as usize,
                 Some(o) if o == PAYLOAD_0 => {
                     if ob_type == &LIST_TYPE as *const _ as usize {
                         list_items_ptr = concrete as usize;
@@ -2961,12 +2965,10 @@ impl PyreJitState {
             }
         }
 
-        if ob_type == &INT_TYPE as *const _ as usize {
-            let ptr = pyre_object::intobject::w_int_new(int_payload);
-            Some(majit_ir::GcRef(ptr as usize))
+        let ptr = if ob_type == &INT_TYPE as *const _ as usize {
+            pyre_object::intobject::w_int_new(int_payload)
         } else if ob_type == &FLOAT_TYPE as *const _ as usize {
-            let ptr = pyre_object::floatobject::w_float_new(f64::from_bits(int_payload as u64));
-            Some(majit_ir::GcRef(ptr as usize))
+            pyre_object::floatobject::w_float_new(f64::from_bits(int_payload as u64))
         } else if ob_type == &LIST_TYPE as *const _ as usize {
             let items = if list_items_len == 0 {
                 Vec::new()
@@ -2979,11 +2981,22 @@ impl PyreJitState {
                         .to_vec()
                 }
             };
-            let ptr = w_list_new(items);
-            Some(majit_ir::GcRef(ptr as usize))
+            w_list_new(items)
         } else {
-            None
+            return None;
+        };
+
+        // resume.py:602 setfields parity: restore traced w_class if recorded.
+        // Without this, builtin subclasses or __class__-mutated objects would
+        // revert to the default builtin type after guard failure.
+        if w_class != 0 {
+            unsafe {
+                (*(ptr as *mut pyre_object::pyobject::PyObject)).w_class =
+                    w_class as *mut pyre_object::pyobject::PyObject;
+            }
         }
+
+        Some(majit_ir::GcRef(ptr as usize))
     }
 }
 
@@ -4378,8 +4391,9 @@ mod tests {
             concrete_frame_addr: 0,
         };
 
-        let result =
-            state.with_ctx(|this, ctx| this.trace_direct_float_list_getitem(ctx, list, key, 2));
+        let result = state.with_ctx(|this, ctx| {
+            crate::generated_list_getitem_by_strategy(this, ctx, list, key, 2, 2)
+        });
         assert_eq!(state.value_type(result), Type::Float);
 
         let recorder = ctx.into_recorder();
@@ -4726,3 +4740,20 @@ pub fn execute_inline_residual_call(
 // which uses a single framestack for both root and inline frames.
 // trace_through_callee removed — replaced by build_pending_inline_frame +
 // MetaInterp.push_inline_frame (RPython perform_call parity).
+
+/// listobject.rs:241-249 parity: int strategy only preserves identity for
+/// canonical cached ints. Unique small ints (from w_int_new_unique) trigger
+/// de-specialization to object strategy.
+///
+/// For large ints (outside small cache range), the strategy always keeps them
+/// as raw i64 values regardless of pointer identity.
+pub unsafe fn int_strategy_preserves_identity(value: pyre_object::PyObjectRef) -> bool {
+    let v = pyre_object::w_int_get_value(value);
+    if pyre_object::w_int_small_cached(v) {
+        // Small cached range: only canonical pointer preserves int strategy.
+        std::ptr::eq(value, pyre_object::w_int_new(v))
+    } else {
+        // Large ints are always stored as raw i64 in int strategy.
+        true
+    }
+}

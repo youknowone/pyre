@@ -1923,10 +1923,7 @@ impl MIFrame {
         self.implement_guard_value(ctx, strategy, expected);
     }
 
-    /// PyPy list strategies index directly into unwrapped storage with the
-    /// runtime integer index; they do not specialize every list access to an
-    /// exact constant key. We follow that model here and only guard the
-    /// key's sign/bounds for the current trace.
+    /// pyjitpl.py:841-852 opimpl_check_resizable_neg_index delegate.
     pub(crate) fn trace_dynamic_list_index(
         &mut self,
         ctx: &mut TraceCtx,
@@ -1935,137 +1932,6 @@ impl MIFrame {
         concrete_key: i64,
     ) -> OpRef {
         crate::generated_dynamic_list_index(self, ctx, key, len, concrete_key)
-    }
-
-    fn trace_direct_tuple_getitem(
-        &mut self,
-        ctx: &mut TraceCtx,
-        obj: OpRef,
-        key: OpRef,
-        _expected_type: *const PyType,
-        _items_ptr_descr: DescrRef,
-        _items_len_descr: DescrRef,
-        concrete_index: usize,
-    ) -> OpRef {
-        crate::generated_tuple_getitem(self, ctx, obj, key, concrete_index as i64, 0)
-    }
-
-    fn trace_direct_negative_tuple_getitem(
-        &mut self,
-        ctx: &mut TraceCtx,
-        obj: OpRef,
-        key: OpRef,
-        _expected_type: *const PyType,
-        _items_ptr_descr: DescrRef,
-        _items_len_descr: DescrRef,
-        concrete_key: i64,
-        concrete_len: usize,
-    ) -> OpRef {
-        crate::generated_tuple_getitem(self, ctx, obj, key, concrete_key, concrete_len)
-    }
-
-    /// List getitem covering PyPy list strategy model
-    /// (pypy/objspace/std/listobject.py) as compiled through the codewriter.
-    /// In RPython, jtransform expands list storage access into guard_class +
-    /// getfield(items) + check_neg_index + getarrayitem_gc; pyjitpl.py:814
-    /// opimpl_getlistitem_gc_* is just the final getfield+getarrayitem step.
-    /// This function covers the full expanded sequence including strategy
-    /// guard and index normalization.
-    ///
-    /// strategy_id: 0 = object, 1 = int, 2 = float.
-    /// Handles both positive and negative concrete_key.
-    pub(crate) fn trace_direct_list_getitem_by_strategy(
-        &mut self,
-        ctx: &mut TraceCtx,
-        obj: OpRef,
-        key: OpRef,
-        concrete_key: i64,
-        strategy_id: u32,
-    ) -> OpRef {
-        self.guard_class(ctx, obj, &LIST_TYPE as *const PyType);
-        self.guard_list_strategy(ctx, obj, strategy_id as i64);
-        let (len_descr, ptr_descr) = match strategy_id {
-            0 => (list_items_len_descr(), list_items_ptr_descr()),
-            1 => (list_int_items_len_descr(), list_int_items_ptr_descr()),
-            2 => (list_float_items_len_descr(), list_float_items_ptr_descr()),
-            _ => unreachable!(),
-        };
-        let len = trace_arraylen_gc(ctx, obj, len_descr);
-        let index = self.trace_dynamic_list_index(ctx, key, len, concrete_key);
-        let items_ptr = opimpl_getfield_gc_i(ctx, obj, ptr_descr);
-        match strategy_id {
-            0 => trace_raw_array_getitem_value(ctx, items_ptr, index),
-            1 => {
-                let raw = trace_raw_int_array_getitem_value(ctx, items_ptr, index);
-                self.remember_value_type(raw, Type::Int);
-                raw
-            }
-            2 => {
-                let raw = trace_raw_float_array_getitem_value(ctx, items_ptr, index);
-                self.remember_value_type(raw, Type::Float);
-                raw
-            }
-            _ => unreachable!(),
-        }
-    }
-
-    // Keep old names as thin wrappers for external callers.
-    fn trace_direct_object_list_getitem(
-        &mut self,
-        ctx: &mut TraceCtx,
-        obj: OpRef,
-        key: OpRef,
-        concrete_index: usize,
-    ) -> OpRef {
-        self.trace_direct_list_getitem_by_strategy(ctx, obj, key, concrete_index as i64, 0)
-    }
-    fn trace_direct_negative_object_list_getitem(
-        &mut self,
-        ctx: &mut TraceCtx,
-        obj: OpRef,
-        key: OpRef,
-        concrete_key: i64,
-        _concrete_len: usize,
-    ) -> OpRef {
-        self.trace_direct_list_getitem_by_strategy(ctx, obj, key, concrete_key, 0)
-    }
-    fn trace_direct_int_list_getitem(
-        &mut self,
-        ctx: &mut TraceCtx,
-        obj: OpRef,
-        key: OpRef,
-        concrete_index: usize,
-    ) -> OpRef {
-        self.trace_direct_list_getitem_by_strategy(ctx, obj, key, concrete_index as i64, 1)
-    }
-    fn trace_direct_negative_int_list_getitem(
-        &mut self,
-        ctx: &mut TraceCtx,
-        obj: OpRef,
-        key: OpRef,
-        concrete_key: i64,
-        _concrete_len: usize,
-    ) -> OpRef {
-        self.trace_direct_list_getitem_by_strategy(ctx, obj, key, concrete_key, 1)
-    }
-    pub(crate) fn trace_direct_float_list_getitem(
-        &mut self,
-        ctx: &mut TraceCtx,
-        obj: OpRef,
-        key: OpRef,
-        concrete_index: usize,
-    ) -> OpRef {
-        self.trace_direct_list_getitem_by_strategy(ctx, obj, key, concrete_index as i64, 2)
-    }
-    fn trace_direct_negative_float_list_getitem(
-        &mut self,
-        ctx: &mut TraceCtx,
-        obj: OpRef,
-        key: OpRef,
-        concrete_key: i64,
-        _concrete_len: usize,
-    ) -> OpRef {
-        self.trace_direct_list_getitem_by_strategy(ctx, obj, key, concrete_key, 2)
     }
 
     fn trace_unpack_known_sequence(
@@ -2165,91 +2031,32 @@ impl MIFrame {
         concrete_obj: PyObjectRef,
         concrete_key: PyObjectRef,
     ) -> Result<FrontendOp, PyError> {
-        if concrete_obj.is_null() || concrete_key.is_null() {
-            let opref = self.trace_binary_value(a, b, BinaryOperator::Subscr)?;
-            return Ok(FrontendOp::new(opref, ConcreteValue::Null));
-        }
-        // MIFrame Box tracking: compute concrete subscr result
-        let subscr_concrete = if let Ok(result) =
-            pyre_interpreter::baseobjspace::getitem(concrete_obj, concrete_key)
-        {
-            ConcreteValue::from_pyobj(result)
+        // Concrete subscr result for FrontendOp Box tracking.
+        let subscr_concrete = if !concrete_obj.is_null() && !concrete_key.is_null() {
+            if let Ok(result) = pyre_interpreter::baseobjspace::getitem(concrete_obj, concrete_key)
+            {
+                ConcreteValue::from_pyobj(result)
+            } else {
+                ConcreteValue::Null
+            }
         } else {
             ConcreteValue::Null
         };
 
-        unsafe {
-            if is_int(concrete_key) {
-                let index = w_int_get_value(concrete_key);
-                return self
-                    .with_ctx(|this, ctx| {
-                        if is_tuple(concrete_obj) {
-                            let concrete_len = w_tuple_len(concrete_obj);
-                            if index >= 0 {
-                                let index = index as usize;
-                                if index < concrete_len {
-                                    return Ok(this.trace_direct_tuple_getitem(
-                                        ctx,
-                                        a,
-                                        b,
-                                        &TUPLE_TYPE as *const PyType,
-                                        tuple_items_ptr_descr(),
-                                        tuple_items_len_descr(),
-                                        index,
-                                    ));
-                                }
-                            } else if let Some(abs_index) = index
-                                .checked_neg()
-                                .and_then(|value| usize::try_from(value).ok())
-                            {
-                                if abs_index <= concrete_len {
-                                    return Ok(this.trace_direct_negative_tuple_getitem(
-                                        ctx,
-                                        a,
-                                        b,
-                                        &TUPLE_TYPE as *const PyType,
-                                        tuple_items_ptr_descr(),
-                                        tuple_items_len_descr(),
-                                        index,
-                                        concrete_len,
-                                    ));
-                                }
-                            }
-                        // PyPy list strategy model (listobject.py): unified list subscript.
-                        // strategy_id: 0=object, 1=int, 2=float — matches list storage.
-                        } else if is_list(concrete_obj) {
-                            let strategy_id = if w_list_uses_object_storage(concrete_obj) {
-                                Some(0u32)
-                            } else if w_list_uses_int_storage(concrete_obj) {
-                                Some(1u32)
-                            } else if w_list_uses_float_storage(concrete_obj) {
-                                Some(2u32)
-                            } else {
-                                None
-                            };
-                            if let Some(sid) = strategy_id {
-                                let concrete_len = w_list_len(concrete_obj);
-                                let in_bounds = if index >= 0 {
-                                    (index as usize) < concrete_len
-                                } else {
-                                    index
-                                        .checked_neg()
-                                        .and_then(|v| usize::try_from(v).ok())
-                                        .map_or(false, |abs| abs <= concrete_len)
-                                };
-                                if in_bounds {
-                                    return Ok(this.trace_direct_list_getitem_by_strategy(
-                                        ctx, a, b, index, sid,
-                                    ));
-                                }
-                            }
-                        }
-                        this.trace_binary_value(a, b, BinaryOperator::Subscr)
-                    })
-                    .map(|op| FrontendOp::new(op, subscr_concrete));
-            }
+        // jtransform do_fixed_list_getitem / do_resizable_list_getitem dispatch.
+        let gen_result: Option<OpRef> = self.with_ctx(|this, ctx| {
+            Ok::<_, PyError>(crate::generated_binary_subscr_value(
+                this,
+                ctx,
+                a,
+                b,
+                concrete_obj,
+                concrete_key,
+            ))
+        })?;
+        if let Some(opref) = gen_result {
+            return Ok(FrontendOp::new(opref, subscr_concrete));
         }
-
         let opref = self.trace_binary_value(a, b, BinaryOperator::Subscr)?;
         Ok(FrontendOp::new(opref, subscr_concrete))
     }
@@ -2349,49 +2156,22 @@ impl MIFrame {
         concrete_key: PyObjectRef,
         concrete_value: PyObjectRef,
     ) -> Result<(), PyError> {
-        if concrete_obj.is_null() || concrete_key.is_null() || concrete_value.is_null() {
-            return self.trace_store_subscr(obj, key, value);
+        // jtransform do_resizable_list_setitem dispatch.
+        let handled: bool = self.with_ctx(|this, ctx| {
+            Ok::<_, PyError>(crate::generated_store_subscr_value(
+                this,
+                ctx,
+                obj,
+                key,
+                value,
+                concrete_obj,
+                concrete_key,
+                concrete_value,
+            ))
+        })?;
+        if handled {
+            return Ok(());
         }
-
-        unsafe {
-            // RPython opimpl_setlistitem_gc_{i,r,f}: unified list store
-            // via generated_list_setitem_by_strategy.
-            if is_list(concrete_obj) && is_int(concrete_key) {
-                let strategy_id = if w_list_uses_object_storage(concrete_obj) {
-                    Some(0i64)
-                } else if w_list_uses_int_storage(concrete_obj)
-                    && is_int(concrete_value)
-                    && int_strategy_preserves_identity(concrete_value)
-                {
-                    Some(1i64)
-                } else if w_list_uses_float_storage(concrete_obj) && is_float(concrete_value) {
-                    Some(2i64)
-                } else {
-                    None
-                };
-                if let Some(sid) = strategy_id {
-                    let index = w_int_get_value(concrete_key);
-                    let concrete_len = w_list_len(concrete_obj);
-                    let in_bounds = if index >= 0 {
-                        (index as usize) < concrete_len
-                    } else {
-                        index
-                            .checked_neg()
-                            .and_then(|v| usize::try_from(v).ok())
-                            .map_or(false, |abs| abs <= concrete_len)
-                    };
-                    if in_bounds {
-                        return self.with_ctx(|this, ctx| {
-                            crate::generated_list_setitem_by_strategy(
-                                this, ctx, obj, key, value, index, sid,
-                            );
-                            Ok(())
-                        });
-                    }
-                }
-            }
-        }
-
         self.trace_store_subscr(obj, key, value)
     }
 
@@ -2416,7 +2196,7 @@ impl MIFrame {
                 } else if w_list_uses_int_storage(concrete_list)
                     && !concrete_value.is_null()
                     && is_int(concrete_value)
-                    && int_strategy_preserves_identity(concrete_value)
+                    && crate::state::int_strategy_preserves_identity(concrete_value)
                 {
                     Some(1i64)
                 } else if w_list_uses_float_storage(concrete_list)
@@ -5002,23 +4782,5 @@ impl OpcodeStepExecutor for MIFrame {
         Err(PyError::type_error(format!(
             "unsupported instruction during trace: {instruction:?}"
         )))
-    }
-}
-
-/// listobject.rs:241-249 parity: int strategy only preserves identity for
-/// canonical cached ints. Unique small ints (from w_int_new_unique) trigger
-/// de-specialization to object strategy.
-///
-/// For large ints (outside small cache range), the strategy always keeps them
-/// as raw i64 values regardless of pointer identity.
-unsafe fn int_strategy_preserves_identity(value: PyObjectRef) -> bool {
-    let v = w_int_get_value(value);
-    if pyre_object::w_int_small_cached(v) {
-        // Small cached range: only canonical pointer preserves int strategy.
-        // listobject.rs:247: std::ptr::eq(value, w_int_new(v))
-        std::ptr::eq(value, w_int_new(v))
-    } else {
-        // Large ints are always stored as raw i64 in int strategy.
-        true
     }
 }
