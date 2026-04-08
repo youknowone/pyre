@@ -228,8 +228,7 @@ fn test_guard_failure_path() {
     // Execute with x=5: guard passes, result = 5 * 2 = 10
     let frame = backend.execute_token(&token, &[Value::Int(5)]);
     let descr = backend.get_latest_descr(&frame);
-    // fail_index=1 means Finish was reached (second guard/finish in the trace)
-    assert_eq!(descr.fail_index(), 1);
+    assert!(descr.is_finish());
     assert_eq!(backend.get_int_value(&frame, 0), 10);
 
     // Execute with x=-1: guard fails, DeadFrame has input arg values
@@ -2002,10 +2001,9 @@ fn test_call_release_gil_with_guard_not_forced() {
 
     // Not forced: guard passes, finish returns result = x * 2
     let frame = backend.execute_token(&token, &[Value::Int(21)]);
-    assert_eq!(
-        backend.get_latest_descr(&frame).fail_index(),
-        1,
-        "should reach Finish (descr index 1)"
+    assert!(
+        backend.get_latest_descr(&frame).is_finish(),
+        "should reach Finish"
     );
     assert_eq!(
         backend.get_int_value(&frame, 0),
@@ -2015,7 +2013,7 @@ fn test_call_release_gil_with_guard_not_forced() {
 
     // Another input
     let frame = backend.execute_token(&token, &[Value::Int(0)]);
-    assert_eq!(backend.get_latest_descr(&frame).fail_index(), 1);
+    assert!(backend.get_latest_descr(&frame).is_finish());
     assert_eq!(
         backend.get_int_value(&frame, 0),
         0,
@@ -2062,10 +2060,9 @@ fn test_call_may_force_with_forcing_semantics() {
 
     // flag=0 -> not forced -> reaches Finish
     let frame = backend.execute_token(&token, &[Value::Int(0)]);
-    assert_eq!(
-        backend.get_latest_descr(&frame).fail_index(),
-        1,
-        "flag=0: should reach Finish (descr 1)"
+    assert!(
+        backend.get_latest_descr(&frame).is_finish(),
+        "flag=0: should reach Finish"
     );
     assert_eq!(
         backend.get_int_value(&frame, 0),
@@ -2132,10 +2129,9 @@ fn test_ffi_call_exception_propagation() {
     // collect_guards: GuardNotForced=0, GuardNoException=1, Finish=2
     // val=0 -> no exception -> reaches Finish
     let frame = backend.execute_token(&token, &[Value::Int(0)]);
-    assert_eq!(
-        backend.get_latest_descr(&frame).fail_index(),
-        2,
-        "val=0: should reach Finish (fail_index=2)"
+    assert!(
+        backend.get_latest_descr(&frame).is_finish(),
+        "val=0: should reach Finish"
     );
     assert_eq!(backend.get_int_value(&frame, 0), 0, "val=0: result = 0");
 
@@ -2194,7 +2190,7 @@ fn test_compiled_guard_failure_preserves_frame_stack_metadata() {
     // x=50: guard passes (55 < 100), reaches Finish
     let frame = backend.execute_token(&token, &[Value::Int(50)]);
     let descr = backend.get_latest_descr(&frame);
-    assert_eq!(descr.fail_index(), 1, "x=50 should reach Finish");
+    assert!(descr.is_finish(), "x=50 should reach Finish");
     assert_eq!(backend.get_int_value(&frame, 0), 55);
 
     // x=200: guard fails (205 < 100 is false)
@@ -2293,7 +2289,7 @@ fn test_compiled_trace_multi_guard_frame_stacks_query() {
 
     // Verify execution: x=5 -> both guards pass -> finish returns 6
     let frame = backend.execute_token(&token, &[Value::Int(5)]);
-    assert_eq!(backend.get_latest_descr(&frame).fail_index(), 2);
+    assert!(backend.get_latest_descr(&frame).is_finish());
     assert_eq!(backend.get_int_value(&frame, 0), 6);
 
     // x=-1 -> first guard fails
@@ -2468,7 +2464,7 @@ fn test_call_assembler_callee_guard_failure_frame_stack() {
 
     // x=20: guard passes, finish
     let frame = backend.execute_token(&callee_token, &[Value::Int(20)]);
-    assert_eq!(backend.get_latest_descr(&frame).fail_index(), 1);
+    assert!(backend.get_latest_descr(&frame).is_finish());
     assert_eq!(backend.get_int_value(&frame, 0), 20);
 
     // x=5: guard fails (5 > 10 is false)
@@ -2533,7 +2529,7 @@ fn test_frame_stack_slot_types_match_fail_arg_types() {
 
     // x_int=10, x_float=3.14: guard passes, finish returns 10
     let frame = backend.execute_token(&token, &[Value::Int(10), Value::Float(3.14)]);
-    assert_eq!(backend.get_latest_descr(&frame).fail_index(), 1);
+    assert!(backend.get_latest_descr(&frame).is_finish());
     assert_eq!(backend.get_int_value(&frame, 0), 10);
 
     // x_int=-5, x_float=2.718: guard fails (-5 > 0 is false)
