@@ -91,7 +91,7 @@ impl Snapshot {
         n += self.vable_array.len();
         n += self.vref_array.len();
         for f in &self.framestack {
-            n += 3 + f.boxes.len(); // jitcode_index + pc + slot_count + boxes
+            n += 2 + f.boxes.len(); // jitcode_index + pc + boxes
         }
         n
     }
@@ -384,13 +384,10 @@ impl ResumeDataLoopMemo {
         self._number_boxes(&snapshot.vref_array, &mut numb_state, env)?;
 
         // resume.py:249-253: frame chain.
-        // Per-frame: jitcode_index, pc, box_count, [tagged_values...].
-        // box_count is majit-specific — RPython omits it and uses
-        // jitcode.get_live_vars_info(pc) at decode time instead.
+        // Per-frame: jitcode_index, pc, [tagged_values...].
         for frame in &snapshot.framestack {
             numb_state.append_int(frame.jitcode_index);
             numb_state.append_int(frame.pc);
-            numb_state.append_int(frame.boxes.len() as i32);
             self._number_boxes(&frame.boxes, &mut numb_state, env)?;
         }
 

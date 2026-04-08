@@ -340,6 +340,10 @@ pub struct EncodedResumeData {
     /// In RPython, liveboxes[n] is the Box object that was assigned TAGBOX(n).
     /// Here, liveboxes[n] is the original deadframe slot index.
     pub liveboxes: Vec<usize>,
+    /// Per-frame slot count — equivalent to jitcode liveness info.
+    /// RPython uses jitcode.get_live_vars_info(pc) at decode time;
+    /// we store the counts at encode time since this path lacks jitcodes.
+    pub frame_sizes: Vec<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -506,6 +510,7 @@ impl ResumeValueLayoutSummary {
 impl ResumeFrameLayoutSummary {
     fn to_frame_info(&self) -> FrameInfo {
         FrameInfo {
+            jitcode_index: 0,
             pc: self.pc,
             slot_map: self
                 .slot_layouts
@@ -1031,6 +1036,8 @@ fn decode_u64(value: i64) -> u64 {
 /// that map to tagged resume sources.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FrameInfo {
+    /// resume.py:250 jitcode_index — index into metainterp_sd.jitcodes[].
+    pub jitcode_index: i32,
     /// Bytecode position (program counter) for this frame.
     pub pc: u64,
     /// Mapping from slot index to a tagged resume source.
@@ -1710,13 +1717,15 @@ impl EncodedResumeData {
             );
             rd_numb.push(tagged);
         }
+        // resume.py:243-247: vref_array (pairs). No vrefs in this path.
         rd_numb.push(encode_len(0));
-        rd_numb.push(encode_len(frames.len()));
 
-        // resume.py:249-258: per-frame encoding via _number_boxes
+        // resume.py:249-253: per-frame encoding via _number_boxes.
+        // Per-frame: jitcode_index, pc, [tagged_values...].
+        let mut frame_sizes = Vec::with_capacity(frames.len());
         for frame in frames {
+            rd_numb.push(frame.jitcode_index as i64);
             rd_numb.push(encode_u64(frame.pc));
-            rd_numb.push(encode_len(frame.slot_map.len()));
             // resume.py:253 _number_boxes(snapshot_iter, iter_array(snapshot), numb_state)
             for source in &frame.slot_map {
                 let tagged = encode_tagged_source(
@@ -1728,6 +1737,7 @@ impl EncodedResumeData {
                 );
                 rd_numb.push(tagged);
             }
+            frame_sizes.push(frame.slot_map.len());
         }
 
         // compile.py:858 rd_virtuals — stored as live objects, not serialized.
@@ -1780,6 +1790,7 @@ impl EncodedResumeData {
             rd_pendingfields,
             rd_virtuals,
             liveboxes,
+            frame_sizes,
         }
     }
 
@@ -1805,16 +1816,32 @@ impl EncodedResumeData {
         for _ in 0..(vref_count * 2) {
             let _ = self.decode_box(self.next_word(&mut cursor));
         }
-        let num_frames = decode_len(self.next_word(&mut cursor));
-        let mut frames = Vec::with_capacity(num_frames);
-        for _ in 0..num_frames {
+        // resume.py:1049-1055: frame section.
+        // Per-frame: jitcode_index, pc, [tagged_values...].
+        // RPython uses jitcode.get_live_vars_info(pc) for frame boundary;
+        // we use self.frame_sizes[] stored at encode time.
+        let items_resume_len = decode_len(items_resume_section);
+        let mut frames = Vec::new();
+        let mut frame_idx = 0usize;
+        while cursor < items_resume_len {
+            let jitcode_index = self.next_word(&mut cursor) as i32;
             let pc = decode_u64(self.next_word(&mut cursor));
-            let slot_count = decode_len(self.next_word(&mut cursor));
+            let slot_count = if frame_idx < self.frame_sizes.len() {
+                self.frame_sizes[frame_idx]
+            } else {
+                // Single-frame fallback: consume all remaining items.
+                items_resume_len - cursor
+            };
             let mut slot_map = Vec::with_capacity(slot_count);
             for _ in 0..slot_count {
                 slot_map.push(self.decode_box(self.next_word(&mut cursor)));
             }
-            frames.push(FrameInfo { pc, slot_map });
+            frames.push(FrameInfo {
+                jitcode_index,
+                pc,
+                slot_map,
+            });
+            frame_idx += 1;
         }
 
         // compile.py:858 rd_virtuals — live objects, not deserialized from rd_numb.
@@ -1996,7 +2023,11 @@ impl ResumeData {
         let slot_map: Vec<FrameSlotSource> = (0..num_slots).map(FrameSlotSource::FailArg).collect();
         ResumeData {
             vable_array: Vec::new(),
-            frames: vec![FrameInfo { pc, slot_map }],
+            frames: vec![FrameInfo {
+                jitcode_index: 0,
+                pc,
+                slot_map,
+            }],
             virtuals: Vec::new(),
             pending_fields: Vec::new(),
         }
@@ -2037,7 +2068,7 @@ impl ResumeData {
                     header_pc: None,
                     source_guard: None,
                     pc: frame.pc,
-                    jitcode_index: 0,
+                    jitcode_index: frame.jitcode_index,
                     slot_types: None,
                     values,
                 }
@@ -2514,6 +2545,7 @@ pub struct ResumeDataVirtualAdder {
 }
 
 struct FrameInfoBuilder {
+    jitcode_index: i32,
     pc: u64,
     slot_map: Vec<FrameSlotSource>,
 }
@@ -2534,8 +2566,10 @@ impl ResumeDataVirtualAdder {
     }
 
     /// Push a new frame onto the stack.
-    pub fn push_frame(&mut self, pc: u64) {
+    /// resume.py:249-252: jitcode_index, pc per frame.
+    pub fn push_frame(&mut self, jitcode_index: i32, pc: u64) {
         self.frames.push(FrameInfoBuilder {
+            jitcode_index,
             pc,
             slot_map: Vec::new(),
         });
@@ -2756,6 +2790,7 @@ impl ResumeDataVirtualAdder {
                 .frames
                 .into_iter()
                 .map(|f| FrameInfo {
+                    jitcode_index: f.jitcode_index,
                     pc: f.pc,
                     slot_map: f.slot_map,
                 })
@@ -3659,13 +3694,14 @@ impl ResumeDataLoopMemo {
             );
             rd_numb.push(tagged);
         }
+        // resume.py:243-247: vref_array (pairs). No vrefs in this path.
         rd_numb.push(encode_len(0));
-        rd_numb.push(encode_len(rd.frames.len()));
 
-        // resume.py:249-258: per-frame via _number_boxes
+        // resume.py:249-253: per-frame: jitcode_index, pc, [tagged_values...].
+        let mut frame_sizes = Vec::with_capacity(rd.frames.len());
         for frame in &rd.frames {
+            rd_numb.push(frame.jitcode_index as i64);
             rd_numb.push(encode_u64(frame.pc));
-            rd_numb.push(encode_len(frame.slot_map.len()));
             for source in &frame.slot_map {
                 let tagged = encode_tagged_source(
                     source,
@@ -3676,6 +3712,7 @@ impl ResumeDataLoopMemo {
                 );
                 rd_numb.push(tagged);
             }
+            frame_sizes.push(frame.slot_map.len());
         }
 
         let rd_virtuals = rd.virtuals.clone();
@@ -3727,6 +3764,7 @@ impl ResumeDataLoopMemo {
             rd_pendingfields,
             rd_virtuals,
             liveboxes,
+            frame_sizes,
         }
     }
 
@@ -3880,6 +3918,7 @@ mod tests {
     fn test_resume_data_with_gaps() {
         let rd = ResumeData {
             frames: vec![FrameInfo {
+                jitcode_index: 0,
                 pc: 100,
                 slot_map: vec![
                     FrameSlotSource::FailArg(2),
@@ -3909,10 +3948,12 @@ mod tests {
         let rd = ResumeData {
             frames: vec![
                 FrameInfo {
+                    jitcode_index: 0,
                     pc: 10,
                     slot_map: vec![FrameSlotSource::FailArg(0), FrameSlotSource::FailArg(1)],
                 },
                 FrameInfo {
+                    jitcode_index: 1,
                     pc: 20,
                     slot_map: vec![FrameSlotSource::FailArg(2), FrameSlotSource::FailArg(3)],
                 },
@@ -3939,7 +3980,7 @@ mod tests {
     #[test]
     fn test_builder() {
         let mut builder = ResumeDataVirtualAdder::new();
-        builder.push_frame(42);
+        builder.push_frame(0, 42);
         builder.map_slot(0, 0);
         builder.map_slot(2, 1); // gap at slot 1
         let rd = builder.build();
