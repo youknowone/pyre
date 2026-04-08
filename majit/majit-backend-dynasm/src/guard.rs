@@ -127,16 +127,62 @@ impl std::fmt::Debug for DynasmFailDescr {
     }
 }
 
-/// compile.py:665-674 done_with_this_frame_descr singleton.
-/// All Finish ops write this pointer to jf_descr. CALL_ASSEMBLER
-/// compares jf_descr against this pointer for the fast path.
-static DONE_WITH_THIS_FRAME_DESCR: std::sync::LazyLock<Arc<DynasmFailDescr>> =
+/// compile.py:618-669 done_with_this_frame_descr — four type-specific
+/// singletons, matching RPython's DoneWithThisFrameDescrVoid/Int/Ref/Float.
+///
+/// CALL_ASSEMBLER's fast path compares jf_descr against the type-appropriate
+/// singleton to decide whether the callee finished normally.
+static DONE_WITH_THIS_FRAME_DESCR_VOID: std::sync::LazyLock<Arc<DynasmFailDescr>> =
+    std::sync::LazyLock::new(|| Arc::new(DynasmFailDescr::new(u32::MAX, 0, vec![], true)));
+static DONE_WITH_THIS_FRAME_DESCR_INT: std::sync::LazyLock<Arc<DynasmFailDescr>> =
     std::sync::LazyLock::new(|| Arc::new(DynasmFailDescr::new(u32::MAX, 0, vec![Type::Int], true)));
+static DONE_WITH_THIS_FRAME_DESCR_REF: std::sync::LazyLock<Arc<DynasmFailDescr>> =
+    std::sync::LazyLock::new(|| Arc::new(DynasmFailDescr::new(u32::MAX, 0, vec![Type::Ref], true)));
+static DONE_WITH_THIS_FRAME_DESCR_FLOAT: std::sync::LazyLock<Arc<DynasmFailDescr>> =
+    std::sync::LazyLock::new(|| {
+        Arc::new(DynasmFailDescr::new(u32::MAX, 0, vec![Type::Float], true))
+    });
 
-/// Return the raw pointer for done_with_this_frame_descr.
-/// Used by genop_call_assembler for inline CMP.
+/// compile.py:667 done_with_this_frame_descr_void
+pub fn done_with_this_frame_descr_void_ptr() -> usize {
+    Arc::as_ptr(&DONE_WITH_THIS_FRAME_DESCR_VOID) as usize
+}
+/// compile.py:668 done_with_this_frame_descr_int
+pub fn done_with_this_frame_descr_int_ptr() -> usize {
+    Arc::as_ptr(&DONE_WITH_THIS_FRAME_DESCR_INT) as usize
+}
+/// compile.py:669 done_with_this_frame_descr_ref
+pub fn done_with_this_frame_descr_ref_ptr() -> usize {
+    Arc::as_ptr(&DONE_WITH_THIS_FRAME_DESCR_REF) as usize
+}
+/// compile.py:670 done_with_this_frame_descr_float
+pub fn done_with_this_frame_descr_float_ptr() -> usize {
+    Arc::as_ptr(&DONE_WITH_THIS_FRAME_DESCR_FLOAT) as usize
+}
+
+/// Return the type-appropriate done_with_this_frame_descr pointer.
+/// compile.py:324-336 call_assembler: selects descr by op.type.
+pub fn done_with_this_frame_descr_ptr_for_type(tp: Type) -> usize {
+    match tp {
+        Type::Void => done_with_this_frame_descr_void_ptr(),
+        Type::Int => done_with_this_frame_descr_int_ptr(),
+        Type::Ref => done_with_this_frame_descr_ref_ptr(),
+        Type::Float => done_with_this_frame_descr_float_ptr(),
+    }
+}
+
+/// Backward compat: return the INT descr ptr (used by find_descr_by_ptr).
 pub fn done_with_this_frame_descr_ptr() -> usize {
-    Arc::as_ptr(&DONE_WITH_THIS_FRAME_DESCR) as usize
+    done_with_this_frame_descr_int_ptr()
+}
+
+/// Check if a raw pointer matches ANY done_with_this_frame_descr variant.
+/// Used by runner.rs find_descr_by_ptr to recognize finish exits.
+pub fn is_done_with_this_frame_descr(ptr: usize) -> bool {
+    ptr == done_with_this_frame_descr_void_ptr()
+        || ptr == done_with_this_frame_descr_int_ptr()
+        || ptr == done_with_this_frame_descr_ref_ptr()
+        || ptr == done_with_this_frame_descr_float_ptr()
 }
 
 impl Descr for DynasmFailDescr {}

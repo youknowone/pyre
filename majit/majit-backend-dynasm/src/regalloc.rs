@@ -553,9 +553,12 @@ impl FrameManager {
     fn _find_frame_location(&self, size: usize, tp: Type, hint: i32) -> Option<FrameLoc> {
         debug_assert!(size == 1 || size == 2);
         if size == 1 {
-            let hint = hint as usize;
-            if hint < self.current_frame_depth && self.boxes_in_frame[hint].is_none() {
-                return Some(Self::frame_pos(hint, tp, self.base_ofs));
+            // regalloc.py:145 — check 0 <= hint < depth
+            if 0 <= hint
+                && (hint as usize) < self.current_frame_depth
+                && self.boxes_in_frame[hint as usize].is_none()
+            {
+                return Some(Self::frame_pos(hint as usize, tp, self.base_ofs));
             }
             for i in 0..self.current_frame_depth {
                 if self.boxes_in_frame[i].is_none() {
@@ -677,6 +680,8 @@ pub struct RegisterManager {
     pub frame_reg: RegLoc,
     /// Type filter: INT/REF for GPR, FLOAT for XMM
     pub box_types: Option<Vec<Type>>,
+    /// x86/regalloc.py:52,120 call_result_location — hardcoded return register.
+    pub call_result_reg: RegLoc,
 
     // ── Instance state ──
     /// regalloc.py:369
@@ -699,6 +704,7 @@ impl RegisterManager {
         save_around_call_regs: Vec<RegLoc>,
         frame_reg: RegLoc,
         box_types: Option<Vec<Type>>,
+        call_result_reg: RegLoc,
     ) -> Self {
         let n = all_regs.len();
         let mut free_regs = all_regs.clone();
@@ -709,6 +715,7 @@ impl RegisterManager {
             save_around_call_regs,
             frame_reg,
             box_types,
+            call_result_reg,
             free_regs,
             reg_bindings_list: vec![None; n],
             temp_boxes: Vec::new(),
@@ -1257,6 +1264,7 @@ impl RegisterManager {
         longevity: &mut LifetimeManager,
         fm: &mut FrameManager,
         pending_moves: &mut Vec<(Loc, Loc)>,
+        value_types: &HashMap<u32, Type>,
     ) {
         self.spill_or_move_registers_before_call(
             &self.save_around_call_regs.clone(),
@@ -1265,6 +1273,7 @@ impl RegisterManager {
             longevity,
             fm,
             pending_moves,
+            value_types,
         );
     }
 
@@ -1277,6 +1286,7 @@ impl RegisterManager {
         longevity: &mut LifetimeManager,
         fm: &mut FrameManager,
         pending_moves: &mut Vec<(Loc, Loc)>,
+        value_types: &HashMap<u32, Type>,
     ) {
         let mut new_free_regs: Vec<RegLoc> = Vec::new();
         let mut move_or_spill: Vec<OpRef> = Vec::new();
@@ -1285,6 +1295,7 @@ impl RegisterManager {
         let items: Vec<(OpRef, RegLoc)> = self.reg_bindings_items();
         for (v, reg) in items {
             let max_age = longevity.get(v).unwrap().last_usage;
+            let v_type = value_types.get(&v.0).copied().unwrap_or(Type::Int);
             if !force_store.contains(&v) && max_age <= self.position {
                 // variable dies
                 self.reg_bindings_del(v, longevity);
@@ -1293,10 +1304,11 @@ impl RegisterManager {
             }
 
             if save_all_regs == SAVE_ALL_REGS {
-                self._bc_spill(v, Type::Int, &mut new_free_regs, longevity, fm);
-            } else if save_all_regs == SAVE_GCREF_REGS {
-                // TODO: check if v is REF type
-                self._bc_spill(v, Type::Int, &mut new_free_regs, longevity, fm);
+                // regalloc.py:782-784
+                self._bc_spill(v, v_type, &mut new_free_regs, longevity, fm);
+            } else if save_all_regs == SAVE_GCREF_REGS && v_type == Type::Ref {
+                // regalloc.py:786-788 — spill GC ptrs only
+                self._bc_spill(v, v_type, &mut new_free_regs, longevity, fm);
             } else if !save_sublist.contains(&reg) {
                 continue; // callee-saved: fine where it is
             } else {
@@ -1359,10 +1371,9 @@ impl RegisterManager {
         Loc::Immed(ImmedLoc::new(val))
     }
 
-    /// x86/regalloc.py:51 call_result_location → eax (GPR) or xmm0 (float)
+    /// x86/regalloc.py:52 call_result_location → eax (GPR) or xmm0 (XMM).
     pub fn call_result_location(&self) -> RegLoc {
-        // GPR manager returns EAX, XMM manager returns XMM0
-        self.all_regs[0] // First register is always the return register
+        self.call_result_reg
     }
 
     /// Infer type for an OpRef (INT for GPR manager, FLOAT for XMM).
@@ -1439,13 +1450,15 @@ impl RegAlloc {
         }
     }
 
-    /// x86/regalloc.py:45-63 X86_64_RegisterManager configuration.
+    /// x86/regalloc.py:65-75 X86_64_RegisterManager configuration.
     fn make_gpr_manager() -> RegisterManager {
-        // x86/regalloc.py:65-75 X86_64_RegisterManager
+        // x86/regalloc.py:67
         let all_regs = vec![
             ECX, EAX, EDX, EBX, ESI, EDI, R8, R9, R10, R12, R13, R14, R15,
         ];
-        let no_lower_byte_regs = vec![]; // x86_64: all regs have lower byte
+        // x86/regalloc.py:71
+        let no_lower_byte_regs = vec![];
+        // x86/regalloc.py:72
         let save_around_call_regs = vec![EAX, ECX, EDX, ESI, EDI, R8, R9, R10];
         let frame_reg = EBP;
         RegisterManager::new(
@@ -1454,15 +1467,20 @@ impl RegAlloc {
             save_around_call_regs,
             frame_reg,
             Some(vec![Type::Int, Type::Ref]),
+            EAX, // x86/regalloc.py:52 call_result_location → eax
         )
     }
 
-    /// x86/regalloc.py:77-121 X86XMMRegisterManager configuration.
+    /// x86/regalloc.py:77-121,123-128 X86_64_XMMRegisterManager configuration.
     fn make_xmm_manager() -> RegisterManager {
+        // x86/regalloc.py:79 all_regs = [xmm0..xmm7]
+        // x86/regalloc.py:123-128 X86_64_XMMRegisterManager extends to xmm15,
+        // but xmm15 is reserved for scratch.
         let all_regs = vec![
             XMM0, XMM1, XMM2, XMM3, XMM4, XMM5, XMM6, XMM7, XMM8, XMM9, XMM10, XMM11, XMM12, XMM13,
-            XMM14, XMM15,
+            XMM14,
         ];
+        // x86/regalloc.py:81 save_around_call_regs = all_regs
         let save_around_call_regs = all_regs.clone();
         let frame_reg = EBP;
         RegisterManager::new(
@@ -1471,6 +1489,7 @@ impl RegAlloc {
             save_around_call_regs,
             frame_reg,
             Some(vec![Type::Float]),
+            XMM0, // x86/regalloc.py:120 call_result_location → xmm0
         )
     }
 
@@ -1519,37 +1538,62 @@ impl RegAlloc {
         }
     }
 
-    /// x86/regalloc.py:237 _update_bindings — bind bridge inputargs to their locations.
+    /// x86/regalloc.py:291 _update_bindings — bind bridge inputargs to their locations.
     fn _update_bindings(&mut self, locs: &[Loc], inputargs: &[InputArg]) {
-        let mut used_gpr: Vec<RegLoc> = Vec::new();
-        let mut used_xmm: Vec<RegLoc> = Vec::new();
+        let mut used: HashMap<RegLoc, ()> = HashMap::new();
 
+        // x86/regalloc.py:295-312
         for (iarg, loc) in inputargs.iter().zip(locs.iter()) {
             let v = OpRef(iarg.index);
             let tp = iarg.tp;
             match loc {
                 Loc::Reg(reg) => {
-                    if reg.is_xmm {
+                    if tp == Type::Float {
                         self.xrm.reg_bindings_set(v, *reg, &mut self.longevity);
-                        used_xmm.push(*reg);
+                        used.insert(*reg, ());
+                    } else if *reg == EBP {
+                        // x86/regalloc.py:305-307
+                        debug_assert!(self.rm.box_currently_in_frame_reg.is_none());
+                        self.rm.box_currently_in_frame_reg = Some(v);
                     } else {
                         self.rm.reg_bindings_set(v, *reg, &mut self.longevity);
-                        used_gpr.push(*reg);
+                        used.insert(*reg, ());
                     }
                 }
                 Loc::Frame(floc) => {
                     self.fm.bind(v, *floc, tp, &mut self.longevity);
                 }
                 _ => {
-                    // Stack/immediate → allocate frame slot
-                    let _floc = self.fm.get_new_loc(v, tp, &mut self.longevity);
+                    self.fm.bind(
+                        v,
+                        FrameManager::frame_pos(0, tp, self.fm.base_ofs),
+                        tp,
+                        &mut self.longevity,
+                    );
                 }
             }
         }
 
-        // Update free_regs
-        self.rm.free_regs.retain(|r| !used_gpr.contains(r));
-        self.xrm.free_regs.retain(|r| !used_xmm.contains(r));
+        // x86/regalloc.py:313-320 rebuild free_regs from scratch
+        self.rm.free_regs = Vec::new();
+        for &reg in &self.rm.all_regs {
+            if !used.contains_key(&reg) {
+                self.rm.free_regs.push(reg);
+            }
+        }
+        self.xrm.free_regs = Vec::new();
+        for &reg in &self.xrm.all_regs {
+            if !used.contains_key(&reg) {
+                self.xrm.free_regs.push(reg);
+            }
+        }
+
+        // x86/regalloc.py:321
+        for iarg in inputargs {
+            let opref = OpRef(iarg.index);
+            self.possibly_free_var(opref, iarg.tp);
+        }
+        // x86/regalloc.py:322
         self.fm.finish_binding();
     }
 
@@ -1765,23 +1809,23 @@ impl RegAlloc {
             self.rm.position = i as i32;
             self.xrm.position = i as i32;
 
-            // x86/regalloc.py:387-390 skip dead ops
+            // Record result type before dispatch (needed by tp() lookups)
+            if !op.pos.is_none() && op.opcode.result_type() != Type::Void {
+                self.value_types.insert(op.pos.0, op.opcode.result_type());
+            }
+
+            // x86/regalloc.py:383-386 skip dead ops
             if op.opcode.has_no_side_effect() && !self.longevity.contains(op.pos) {
                 self._free_op_vars(op);
                 output.push(RegAllocOp::Skip);
                 continue;
             }
 
-            // Dispatch to consider_* methods
+            // x86/regalloc.py:390 dispatch to consider_* method
             self._dispatch(op, i, &mut output);
 
-            // Free operation arguments and result
+            // x86/regalloc.py:391 possibly_free_vars_for_op
             self._free_op_vars(op);
-
-            // Record result type
-            if !op.pos.is_none() {
-                self.value_types.insert(op.pos.0, op.opcode.result_type());
-            }
         }
 
         // x86/regalloc.py:400-401 free inputargs
@@ -1823,8 +1867,12 @@ impl RegAlloc {
                 self.consider_binop_symm(op, i, output);
             }
             // ── Integer binary (non-symmetric) ──
-            OpCode::IntSub | OpCode::IntSubOvf => {
+            OpCode::IntSubOvf => {
                 self.consider_binop(op, i, output);
+            }
+            // x86/regalloc.py:575 consider_int_sub — LEA when -const fits 32 bits.
+            OpCode::IntSub => {
+                self.consider_int_sub(op, i, output);
             }
             // ── Integer add (may use LEA) ──
             OpCode::IntAdd | OpCode::NurseryPtrIncrement => {
@@ -1862,11 +1910,15 @@ impl RegAlloc {
             OpCode::IntForceGeZero => {
                 self.consider_unary_int(op, i, output);
             }
-            OpCode::IntFloorDiv | OpCode::IntMod | OpCode::UintMulHigh => {
+            OpCode::IntFloorDiv | OpCode::IntMod => {
                 self.consider_binop(op, i, output);
             }
+            // x86/regalloc.py:591 consider_uint_mul_high — uses eax and edx
+            OpCode::UintMulHigh => {
+                self.consider_uint_mul_high(op, i, output);
+            }
             OpCode::IntSignext => {
-                self.consider_unary_int(op, i, output);
+                self.consider_int_signext(op, i, output);
             }
 
             // ── Float binary ──
@@ -1904,14 +1956,13 @@ impl RegAlloc {
             }
 
             // ── Guards ──
+            // x86/regalloc.py:440-443
             OpCode::GuardTrue
             | OpCode::VecGuardTrue
             | OpCode::GuardFalse
             | OpCode::VecGuardFalse
             | OpCode::GuardNonnull
-            | OpCode::GuardIsnull
-            | OpCode::GuardNoOverflow
-            | OpCode::GuardOverflow => {
+            | OpCode::GuardIsnull => {
                 self.consider_guard_cc(op, i, output);
             }
             OpCode::GuardValue => {
@@ -1920,11 +1971,21 @@ impl RegAlloc {
             OpCode::GuardClass | OpCode::GuardNonnullClass | OpCode::GuardGcType => {
                 self.consider_guard_class(op, i, output);
             }
-            OpCode::GuardNoException | OpCode::GuardNotForced | OpCode::GuardNotForced2 => {
+            // x86/regalloc.py:455,492-494
+            OpCode::GuardNoException
+            | OpCode::GuardNoOverflow
+            | OpCode::GuardOverflow
+            | OpCode::GuardNotForced
+            | OpCode::GuardNotForced2 => {
                 self.consider_guard_no_args(op, i, output);
             }
+            // x86/regalloc.py:458
             OpCode::GuardNotInvalidated => {
                 self.consider_guard_no_args(op, i, output);
+            }
+            // x86/regalloc.py:468
+            OpCode::GuardException => {
+                self.consider_guard_exception(op, i, output);
             }
             _ if op.opcode.is_guard() => {
                 self.consider_guard_no_args(op, i, output);
@@ -2082,6 +2143,10 @@ impl RegAlloc {
             OpCode::SaveException | OpCode::SaveExcClass => {
                 self.consider_no_arg_result(op, i, output);
             }
+            // x86/regalloc.py:486
+            OpCode::RestoreException => {
+                self.consider_restore_exception(op, i, output);
+            }
 
             // ── No-ops ──
             OpCode::JitDebug
@@ -2098,10 +2163,8 @@ impl RegAlloc {
             | OpCode::IncrementDebugCounter
             | OpCode::VirtualRefFinish
             | OpCode::ForceSpill
-            | OpCode::RestoreException
             | OpCode::CondCallGcWb
-            | OpCode::CondCallGcWbArray
-            | OpCode::GuardException => {
+            | OpCode::CondCallGcWbArray => {
                 output.push(RegAllocOp::Skip);
             }
 
@@ -2115,12 +2178,31 @@ impl RegAlloc {
     // ── consider_* methods ──
 
     /// x86/regalloc.py:527 _consider_binop_part
-    fn _consider_binop_part(&mut self, op: &Op, _symm: bool) -> (Loc, Loc) {
-        let x = op.args[0];
-        let y = op.args[1];
+    fn _consider_binop_part(&mut self, op: &Op, symm: bool) -> (Loc, Loc) {
+        let mut x = op.args[0];
+        let mut y = op.args[1];
+        let xloc = self.loc(x, self.tp(x));
+        let mut argloc = self.loc(y, self.tp(y));
+
+        // x86/regalloc.py:536-542 symmetry optimization:
+        // if x is not in a reg, but y is, and x lives longer while y dies,
+        // swap the role of x and y
+        if symm && !xloc.is_reg() && argloc.is_reg() {
+            let x_lives_longer = !self.longevity.contains(x)
+                || self.longevity.get(x).unwrap().last_usage > self.rm.position;
+            let y_dies = self
+                .longevity
+                .get(y)
+                .map(|lt| lt.last_usage == self.rm.position)
+                .unwrap_or(false);
+            if x_lives_longer && y_dies {
+                std::mem::swap(&mut x, &mut y);
+                argloc = self.loc(y, self.tp(y));
+            }
+        }
+
         let tp = self.tp(x);
         let args: Vec<OpRef> = op.args.iter().copied().collect();
-        // force_result_in_reg: result goes into same register as x
         let loc = self.rm.force_result_in_reg(
             op.pos,
             x,
@@ -2131,9 +2213,6 @@ impl RegAlloc {
             &self.constants,
             &mut self.pending_moves,
         );
-        let argloc = self
-            .rm
-            .loc(y, false, &self.longevity, &self.fm, &self.constants);
         (loc, argloc)
     }
 
@@ -2149,10 +2228,39 @@ impl RegAlloc {
         self.perform(i, vec![loc, argloc], Some(loc), output);
     }
 
-    /// x86/regalloc.py:566 consider_int_add — may use LEA
+    /// x86/regalloc.py:556 _consider_lea
+    fn _consider_lea(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
+        let x = op.args[0];
+        let loc = self.make_sure_var_in_reg(x, self.tp(x), &[], None, false);
+        // make it possible to have argloc be == loc if x dies
+        self.possibly_free_var(x, self.tp(x));
+        let argloc = self.loc(op.args[1], self.tp(op.args[1]));
+        let resloc = Loc::Reg(self.force_allocate_reg(op.pos, Type::Int, &[], None, false));
+        self.perform(i, vec![loc, argloc], Some(resloc), output);
+    }
+
+    /// x86/regalloc.py:566 consider_int_add — LEA when const fits 32 bits.
     fn consider_int_add(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
-        // For simplicity, use _consider_binop_symm pattern
+        let y = op.args[1];
+        if y.is_constant() {
+            let val = self.constants.get(&y.const_index()).copied().unwrap_or(0);
+            if fits_in_32bits(val) {
+                return self._consider_lea(op, i, output);
+            }
+        }
         self.consider_binop_symm(op, i, output);
+    }
+
+    /// x86/regalloc.py:575 consider_int_sub
+    fn consider_int_sub(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
+        let y = op.args[1];
+        if y.is_constant() {
+            let val = self.constants.get(&y.const_index()).copied().unwrap_or(0);
+            if fits_in_32bits(-val) {
+                return self._consider_lea(op, i, output);
+            }
+        }
+        self.consider_binop(op, i, output);
     }
 
     /// x86/regalloc.py:624 consider_int_lshift (shift operations need ecx)
@@ -2193,17 +2301,68 @@ impl RegAlloc {
         self.perform(i, vec![loc], Some(loc), output);
     }
 
+    /// x86/regalloc.py:591 consider_uint_mul_high
+    fn consider_uint_mul_high(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
+        let mut arg1 = op.args[0];
+        let mut arg2 = op.args[1];
+        // x86/regalloc.py:594 — optimized for (box, const)
+        if arg1.is_constant() {
+            std::mem::swap(&mut arg1, &mut arg2);
+        }
+        // arg2 must be in eax
+        self.make_sure_var_in_reg(arg2, Type::Int, &[], Some(EAX), false);
+        let l1 = self.loc(arg1, Type::Int);
+        // eax will be trash after the operation
+        self.possibly_free_var(arg2, Type::Int);
+        // allocate temporary in eax (will be trashed by MUL)
+        let tmp = OpRef(u32::MAX - 1); // temp var
+        if !self.longevity.contains(tmp) {
+            self.longevity
+                .set(tmp, Lifetime::new(self.rm.position, self.rm.position));
+        }
+        self.rm.force_allocate_reg(
+            tmp,
+            &[],
+            Some(EAX),
+            false,
+            &mut self.longevity,
+            &mut self.fm,
+        );
+        self.rm
+            .possibly_free_var(tmp, &mut self.longevity, &mut self.fm, Type::Int);
+        // result in edx
+        self.rm.force_allocate_reg(
+            op.pos,
+            &[],
+            Some(EDX),
+            false,
+            &mut self.longevity,
+            &mut self.fm,
+        );
+        self.perform(i, vec![l1], Some(Loc::Reg(EDX)), output);
+    }
+
+    /// x86/regalloc.py:618 consider_int_signext
+    fn consider_int_signext(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
+        let argloc = self.loc(op.args[0], Type::Int);
+        let numbytesloc = self.loc(op.args[1], Type::Int);
+        let resloc = Loc::Reg(self.force_allocate_reg(op.pos, Type::Int, &[], None, false));
+        self.perform(i, vec![argloc, numbytesloc], Some(resloc), output);
+    }
+
     /// x86/regalloc.py:636 _consider_compop
     fn consider_compop(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let vx = op.args[0];
         let vy = op.args[1];
         let mut arglocs = vec![self.loc(vx, self.tp(vx)), self.loc(vy, self.tp(vy))];
-        // If neither is in a register, move one there
+        // x86/regalloc.py:640-644
         let vx_in_reg = self.rm.reg_bindings_contains(vx, &self.longevity);
         let vy_in_reg = self.rm.reg_bindings_contains(vy, &self.longevity);
         if !vx_in_reg && !vy_in_reg && !vx.is_constant() && !vy.is_constant() {
             arglocs[0] = self.make_sure_var_in_reg(vx, Type::Int, &[], None, false);
         }
+        // x86/regalloc.py:645 force_allocate_reg_or_cc
+        // For now, allocate a register (CC optimization is assembler-level)
         let result_loc = Loc::Reg(self.force_allocate_reg(op.pos, Type::Int, &[], None, false));
         self.perform(i, arglocs, Some(result_loc), output);
     }
@@ -2227,6 +2386,52 @@ impl RegAlloc {
         let x = self.make_sure_var_in_reg(op.args[0], Type::Ref, &[], None, false);
         let y = self.loc(op.args[1], Type::Int);
         self.perform_guard(op, i, vec![x, y], None, output);
+    }
+
+    /// x86/regalloc.py:468 consider_guard_exception
+    fn consider_guard_exception(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
+        let loc = self.make_sure_var_in_reg(op.args[0], Type::Ref, &[], None, false);
+        // x86/regalloc.py:470-471 TempVar for scratch register
+        let tmp = OpRef(u32::MAX - 2);
+        if !self.longevity.contains(tmp) {
+            self.longevity
+                .set(tmp, Lifetime::new(self.rm.position, self.rm.position));
+        }
+        let args: Vec<OpRef> = op.args.iter().copied().collect();
+        let loc1 = Loc::Reg(self.rm.force_allocate_reg(
+            tmp,
+            &args,
+            None,
+            false,
+            &mut self.longevity,
+            &mut self.fm,
+        ));
+        // x86/regalloc.py:473-477
+        let resloc = if self.longevity.contains(op.pos) {
+            let mut forbidden = args.clone();
+            forbidden.push(tmp);
+            Some(Loc::Reg(self.rm.force_allocate_reg(
+                op.pos,
+                &forbidden,
+                None,
+                false,
+                &mut self.longevity,
+                &mut self.fm,
+            )))
+        } else {
+            None
+        };
+        self.perform_guard(op, i, vec![loc, loc1], resloc, output);
+        self.rm
+            .possibly_free_var(tmp, &mut self.longevity, &mut self.fm, Type::Int);
+    }
+
+    /// x86/regalloc.py:486 consider_restore_exception
+    fn consider_restore_exception(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
+        let args: Vec<OpRef> = op.args.iter().copied().collect();
+        let loc0 = self.make_sure_var_in_reg(op.args[0], Type::Ref, &args, None, false);
+        let loc1 = self.make_sure_var_in_reg(op.args[1], Type::Ref, &args, None, false);
+        self.perform_discard(i, vec![loc0, loc1], output);
     }
 
     /// Guards with no arguments (guard_no_exception, guard_not_forced, etc.)
@@ -2458,6 +2663,7 @@ impl RegAlloc {
             &mut self.longevity,
             &mut self.fm,
             &mut self.pending_moves,
+            &self.value_types,
         );
         self.xrm.before_call(
             &[],
@@ -2465,6 +2671,7 @@ impl RegAlloc {
             &mut self.longevity,
             &mut self.fm,
             &mut self.pending_moves,
+            &self.value_types,
         );
 
         let mut arglocs = Vec::new();
@@ -2583,6 +2790,11 @@ pub fn get_scale(size: usize) -> u8 {
     } else {
         ((size >> 2) + 1) as u8 // 4, 8 => 2, 3
     }
+}
+
+/// rx86.py fits_in_32bits
+pub fn fits_in_32bits(value: i64) -> bool {
+    value == value as i32 as i64
 }
 
 /// Compare two Loc values for equality.
@@ -2709,6 +2921,7 @@ mod tests {
             vec![EAX, ECX, EDX],
             EBP,
             Some(vec![Type::Int, Type::Ref]),
+            EAX,
         );
         rm.position = 0;
 
@@ -2739,7 +2952,7 @@ mod tests {
         longevity.set(OpRef(2), lt2);
 
         // Only 2 registers available
-        let mut rm = RegisterManager::new(vec![EAX, ECX], vec![], vec![EAX, ECX], EBP, None);
+        let mut rm = RegisterManager::new(vec![EAX, ECX], vec![], vec![EAX, ECX], EBP, None, EAX);
         rm.position = 3;
         let mut fm = FrameManager::new(0);
 

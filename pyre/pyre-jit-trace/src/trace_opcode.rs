@@ -45,7 +45,9 @@ pub(crate) extern "C" fn float_pow_jit(x: f64, y: f64) -> f64 {
             let exc_obj = err.to_exc_object();
             #[cfg(feature = "cranelift")]
             majit_backend_cranelift::jit_exc_raise(exc_obj as i64);
-            let _ = exc_obj; // suppress unused warning when cranelift is off
+            #[cfg(feature = "dynasm")]
+            majit_backend_dynasm::jit_exc_raise(exc_obj as i64);
+            let _ = exc_obj; // suppress unused warning when no backend
             // Return value is discarded by GuardNoException path; use NaN
             // as a safe sentinel in case the guard is elided.
             f64::NAN

@@ -1313,11 +1313,6 @@ fn handle_fail(
     _info: &majit_metainterp::virtualizable::VirtualizableInfo,
 ) -> HandleFailOutcome {
     // compile.py:702-703: must_compile() AND not stack_almost_full()
-    // [DYNASM-TEMP] Disable bridge compilation until frame restoration
-    // is fully debugged. The bridge tracing path's restore_guard_failure_values
-    // can corrupt the frame state, causing NULL jf_ptr on re-entry.
-    #[cfg(not(feature = "cranelift"))]
-    let should_bridge = false;
     if should_bridge && !stack_almost_full() {
         let is_tracing = {
             let (driver, _) = driver_pair();
@@ -3743,59 +3738,17 @@ fn rebuild_state_after_failure_from_recovery_layout(
         }
     }
 
+    // resume.py:1042-1057 rebuild_from_resumedata parity:
     // Replace Virtual(idx) frame slots with materialized pointers.
+    // RPython does a straightforward replacement without non-null checks.
     let mut replaced = 0usize;
     if let Some(frame) = recovery.frames.last() {
         for (slot_idx, src) in frame.slots.iter().enumerate() {
             if let majit_backend::ExitValueSourceLayout::Virtual(vidx) = src {
                 if let Some(&ptr) = materialized.get(*vidx) {
                     if slot_idx < typed.len() {
-                        // resume.py parity: do NOT replace existing non-zero
-                        // Ref values. The rd_numb-decoded typed array already
-                        // has the correct value (e.g., frame pointer from
-                        // Box(0)). The recovery_layout's frame.slots may
-                        // have stale Virtual markers that would overwrite it
-                        // with a freshly materialized object.
-                        // resume.py parity: do NOT replace existing non-zero
-                        // Ref values. The rd_numb-decoded typed array already
-                        // has the correct value (e.g., frame pointer from
-                        // Box(0)). The recovery_layout's frame.slots may
-                        // have stale Virtual markers that would overwrite it
-                        // with a freshly materialized object.
-                        let existing_nonnull = matches!(
-                            typed[slot_idx],
-                            Value::Ref(majit_ir::GcRef(p)) if p != 0
-                        );
-                        if existing_nonnull {
-                            continue;
-                        }
                         typed[slot_idx] = Value::Ref(majit_ir::GcRef(ptr));
                         replaced += 1;
-                    }
-                }
-            }
-        }
-    }
-
-    // [pyre safety] target_slot fallback: Virtual markers in frame.slots
-    // can be lost during to_exit_recovery_layout_with_caller_prefix merge.
-    // Use target_slot from ExitVirtualLayout to place remaining objects.
-    if replaced == 0 && !materialized.is_empty() {
-        for (vidx, vl) in recovery.virtual_layouts.iter().enumerate() {
-            let target = match vl {
-                majit_backend::ExitVirtualLayout::Object { target_slot, .. }
-                | majit_backend::ExitVirtualLayout::Struct { target_slot, .. } => *target_slot,
-                _ => None,
-            };
-            if let Some(slot_idx) = target {
-                if slot_idx < typed.len()
-                    && matches!(typed[slot_idx], Value::Ref(majit_ir::GcRef(0)))
-                {
-                    if let Some(&ptr) = materialized.get(vidx) {
-                        if ptr != 0 {
-                            typed[slot_idx] = Value::Ref(majit_ir::GcRef(ptr));
-                            replaced += 1;
-                        }
                     }
                 }
             }

@@ -1,4 +1,7 @@
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::LazyLock;
+use std::sync::Mutex;
 /// runner.py: AbstractX86CPU — the Backend trait implementation.
 ///
 /// This is the entry point for the dynasm backend, corresponding to
@@ -15,6 +18,14 @@ use crate::assembler::{Assembler386, CompiledCode};
 use crate::codebuf;
 use crate::frame::FrameData;
 use crate::guard::DynasmFailDescr;
+
+/// Global CALL_ASSEMBLER target registry.
+///
+/// RPython stores `descr._ll_function_addr` on the target token. Dynasm
+/// resolves the target by token number at compile time, so keep a process-wide
+/// token_number -> code address map of compiled loop entries.
+static CALL_ASSEMBLER_TARGETS: LazyLock<Mutex<HashMap<u64, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// runner.py:23 AbstractX86CPU — concrete Backend implementation.
 pub struct DynasmBackend {
@@ -144,10 +155,19 @@ impl DynasmBackend {
     /// Panics if not found — RPython uses object identity, so lookup
     /// failure is impossible in well-formed execution.
     fn find_descr_by_ptr(token: &JitCellToken, ptr: usize) -> Arc<DynasmFailDescr> {
-        // compile.py:665-674 done_with_this_frame_descr singleton
-        let global_done = crate::guard::done_with_this_frame_descr_ptr();
-        if ptr == global_done {
-            return Arc::new(DynasmFailDescr::new(u32::MAX, 0, vec![Type::Int], true));
+        // compile.py:618-669 done_with_this_frame_descr — check all 4 variants
+        if crate::guard::is_done_with_this_frame_descr(ptr) {
+            // Determine type from which variant matched
+            let types = if ptr == crate::guard::done_with_this_frame_descr_void_ptr() {
+                vec![]
+            } else if ptr == crate::guard::done_with_this_frame_descr_float_ptr() {
+                vec![Type::Float]
+            } else if ptr == crate::guard::done_with_this_frame_descr_ref_ptr() {
+                vec![Type::Ref]
+            } else {
+                vec![Type::Int]
+            };
+            return Arc::new(DynasmFailDescr::new(u32::MAX, 0, types, true));
         }
 
         // Search root loop
@@ -228,6 +248,27 @@ impl DynasmBackend {
             trace_id, fail_index
         );
     }
+
+    fn call_assembler_targets_snapshot() -> HashMap<u64, usize> {
+        CALL_ASSEMBLER_TARGETS
+            .lock()
+            .expect("CALL_ASSEMBLER_TARGETS poisoned")
+            .clone()
+    }
+
+    fn register_call_assembler_target(token_number: u64, code_addr: usize) {
+        CALL_ASSEMBLER_TARGETS
+            .lock()
+            .expect("CALL_ASSEMBLER_TARGETS poisoned")
+            .insert(token_number, code_addr);
+    }
+
+    fn redirect_call_assembler_target(old_number: u64, new_addr: usize) {
+        CALL_ASSEMBLER_TARGETS
+            .lock()
+            .expect("CALL_ASSEMBLER_TARGETS poisoned")
+            .insert(old_number, new_addr);
+    }
 }
 
 impl Backend for DynasmBackend {
@@ -243,17 +284,19 @@ impl Backend for DynasmBackend {
 
         let constants = std::mem::take(&mut self.constants);
         let typeid_table = self.collect_classptr_typeid_table(ops, &constants);
-        let asm = Assembler386::new(
+        let mut asm = Assembler386::new(
             trace_id,
             header_pc,
             constants,
             self.vtable_offset,
             typeid_table,
         );
+        asm.set_call_assembler_targets(Self::call_assembler_targets_snapshot());
         let compiled = asm.assemble_loop(inputargs, ops)?;
 
         let code_addr = codebuf::buffer_ptr(&compiled.buffer) as usize;
         let code_size = compiled.buffer.len();
+        Self::register_call_assembler_target(token.number, code_addr);
         token.compiled = Some(Box::new(compiled));
 
         Ok(AsmInfo {
@@ -276,6 +319,7 @@ impl Backend for DynasmBackend {
         let constants = std::mem::take(&mut self.constants);
         let typeid_table = self.collect_classptr_typeid_table(ops, &constants);
         let mut asm = Assembler386::new(trace_id, 0, constants, self.vtable_offset, typeid_table);
+        asm.set_call_assembler_targets(Self::call_assembler_targets_snapshot());
 
         // assembler.py closing_jump parity: set the bridge's JUMP target
         let orig_compiled = Self::get_compiled(original_token);
@@ -560,6 +604,7 @@ impl Backend for DynasmBackend {
         let old_addr = codebuf::buffer_ptr(&old_compiled.buffer);
         let new_addr = codebuf::buffer_ptr(&new_compiled.buffer);
         Assembler386::redirect_call_assembler(old_addr, new_addr);
+        Self::redirect_call_assembler_target(old.number, new_addr as usize);
         Ok(())
     }
 

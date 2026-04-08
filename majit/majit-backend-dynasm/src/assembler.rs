@@ -126,6 +126,10 @@ pub struct Assembler386 {
     classptr_to_typeid: HashMap<i64, u32>,
     /// Dynamic label at the function entry for self-recursive CALL_ASSEMBLER.
     self_entry_label: Option<DynamicLabel>,
+    /// assembler.py:320 descr._ll_function_addr parity:
+    /// Maps call_target_token → compiled code address for CALL_ASSEMBLER.
+    /// Populated by the runner before compilation, from registered loop targets.
+    call_assembler_targets: HashMap<u64, usize>,
     /// regalloc.py jump_target_descr parity: absolute address of the
     /// LABEL in the original loop, for bridge JUMP to return to.
     /// Set by assemble_bridge from the parent loop's label_addr.
@@ -202,6 +206,7 @@ impl Assembler386 {
             vtable_offset,
             classptr_to_typeid,
             self_entry_label: None,
+            call_assembler_targets: HashMap::new(),
             jump_target_addr: None,
         }
     }
@@ -462,6 +467,12 @@ impl Assembler386 {
         self.jump_target_addr = Some(addr);
     }
 
+    /// assembler.py:320 descr._ll_function_addr parity: store
+    /// call_target_token → code_addr mappings for CALL_ASSEMBLER.
+    pub fn set_call_assembler_targets(&mut self, targets: HashMap<u64, usize>) {
+        self.call_assembler_targets = targets;
+    }
+
     /// assembler.py:623 assemble_bridge: compile a bridge trace.
     pub fn assemble_bridge(
         mut self,
@@ -676,6 +687,9 @@ impl Assembler386 {
                 | OpCode::CallAssemblerR
                 | OpCode::CallAssemblerF
                 | OpCode::CallAssemblerN => {
+                    // assembler.py:2260 _store_force_index: look ahead for
+                    // GUARD_NOT_FORCED and store its descr to jf_force_descr.
+                    self._store_force_index_if_next_guard(ops, op_idx, fail_index);
                     self.genop_call_assembler(op);
                 }
 
@@ -778,11 +792,17 @@ impl Assembler386 {
                 | OpCode::CallMayForceI
                 | OpCode::CallMayForceR
                 | OpCode::CallMayForceF
-                | OpCode::CallMayForceN
-                | OpCode::CallReleaseGilI
+                | OpCode::CallMayForceN => {
+                    // assembler.py:2234-2236 _genop_call_may_force
+                    self._store_force_index_if_next_guard(ops, op_idx, fail_index);
+                    self.genop_call(op);
+                }
+                OpCode::CallReleaseGilI
                 | OpCode::CallReleaseGilR
                 | OpCode::CallReleaseGilF
                 | OpCode::CallReleaseGilN => {
+                    // assembler.py:2242-2244 _genop_call_release_gil
+                    self._store_force_index_if_next_guard(ops, op_idx, fail_index);
                     self.genop_call(op);
                 }
                 OpCode::CondCallN => self.genop_discard_cond_call(op),
@@ -1732,10 +1752,46 @@ impl Assembler386 {
         self.implement_guard_nojump(op, fail_index);
     }
 
-    /// assembler.py:2228 genop_guard_guard_not_forced.
-    /// Stub: no force-token tracking yet.
+    /// assembler.py:2207-2222 _store_force_index: before a call that may force,
+    /// zero jf_descr so GUARD_NOT_FORCED's CMP [jf_descr], 0 starts clean.
+    /// RPython stores the guard descr pointer to jf_force_descr; in our
+    /// frame layout jf_descr is used directly (zeroed here, set by force).
+    fn _store_force_index_if_next_guard(&mut self, ops: &[Op], op_idx: usize, _fail_index: u32) {
+        // assembler.py:2224-2226 _find_nearby_operation(+1)
+        let next_idx = op_idx + 1;
+        if next_idx >= ops.len() {
+            return;
+        }
+        let next_op = &ops[next_idx];
+        if next_op.opcode != OpCode::GuardNotForced && next_op.opcode != OpCode::GuardNotForced2 {
+            return;
+        }
+        // Zero jf_descr before the call so GUARD_NOT_FORCED sees 0 (not forced).
+        #[cfg(target_arch = "x86_64")]
+        dynasm!(self.mc ; .arch x64
+            ; mov QWORD [rbp], 0
+        );
+        #[cfg(target_arch = "aarch64")]
+        dynasm!(self.mc ; .arch aarch64
+            ; str xzr, [x29]
+        );
+    }
+
+    /// assembler.py:2228-2232 genop_guard_guard_not_forced.
+    /// Check jf_descr == 0 (not forced); if non-zero, guard fails.
     fn genop_guard_guard_not_forced(&mut self, op: &Op, fail_index: u32) {
-        self.implement_guard_nojump(op, fail_index);
+        // assembler.py:2229-2231: CMP [jf_descr], 0; guard_success_cc = 'E'
+        #[cfg(target_arch = "x86_64")]
+        dynasm!(self.mc ; .arch x64
+            ; cmp QWORD [rbp], 0           // jf_descr == 0?
+        );
+        #[cfg(target_arch = "aarch64")]
+        dynasm!(self.mc ; .arch aarch64
+            ; ldr x0, [x29]               // x0 = jf_descr
+            ; cmp x0, 0
+        );
+        self.guard_success_cc = Some(CC_E); // guard succeeds if equal (not forced)
+        self.implement_guard(op, fail_index);
     }
 
     // ----------------------------------------------------------------
@@ -1991,31 +2047,52 @@ impl Assembler386 {
         } else {
             Vec::new()
         };
-        // compile.py:665-674 parity: use global singleton for Finish descr.
+        // compile.py:618-669 parity: use type-specific global singleton.
         let descr = Arc::new(DynasmFailDescr::new(
             fail_index,
             self.trace_id,
-            fail_arg_types,
+            fail_arg_types.clone(),
             true,
         ));
-        // Finish ops write the GLOBAL singleton pointer to jf_descr
-        // so CALL_ASSEMBLER's fast path CMP always matches.
-        let global_descr_ptr = crate::guard::done_with_this_frame_descr_ptr() as i64;
+        // Finish ops write the type-appropriate singleton pointer to jf_descr
+        // so CALL_ASSEMBLER's fast path CMP matches the correct variant.
+        let result_type = if fail_arg_types.is_empty() {
+            Type::Void
+        } else {
+            fail_arg_types[0]
+        };
+        let global_descr_ptr =
+            crate::guard::done_with_this_frame_descr_ptr_for_type(result_type) as i64;
 
         // If there's a result argument, store it to jf_frame[0].
+        // assembler.py:2291-2303 parity: float results use xmm0/MOVSD.
         if op.num_args() > 0 {
             let arg0 = op.arg(0);
-            self.load_arg_to_rax(arg0);
             let slot0_offset = Self::slot_offset(0);
-            #[cfg(target_arch = "x86_64")]
-            dynasm!(self.mc
-                ; .arch x64
-                ; mov [rbp + slot0_offset], rax
-            );
-            #[cfg(target_arch = "aarch64")]
-            dynasm!(self.mc ; .arch aarch64
-                ; str x0, [x29, slot0_offset as u32]
-            );
+            if result_type == Type::Float {
+                // Float: load to xmm0, store via MOVSD
+                self.load_arg_to_rax(arg0); // loads raw bits
+                #[cfg(target_arch = "x86_64")]
+                dynasm!(self.mc
+                    ; .arch x64
+                    ; mov [rbp + slot0_offset], rax  // store float bits via GPR
+                );
+                #[cfg(target_arch = "aarch64")]
+                dynasm!(self.mc ; .arch aarch64
+                    ; str x0, [x29, slot0_offset as u32]
+                );
+            } else {
+                self.load_arg_to_rax(arg0);
+                #[cfg(target_arch = "x86_64")]
+                dynasm!(self.mc
+                    ; .arch x64
+                    ; mov [rbp + slot0_offset], rax
+                );
+                #[cfg(target_arch = "aarch64")]
+                dynasm!(self.mc ; .arch aarch64
+                    ; str x0, [x29, slot0_offset as u32]
+                );
+            }
         }
 
         // Store descr pointer at jf_ptr[0] (jf_descr slot).
@@ -2817,7 +2894,32 @@ impl Assembler386 {
             ; mov x0, x20             // x0 = heap jf ptr
         );
 
-        if let Some(label) = self.self_entry_label {
+        // assembler.py:320 _call_assembler_emit_call(descr._ll_function_addr, ...)
+        // Resolve target address from descr.call_target_token() or self_entry_label.
+        let target_addr: Option<usize> = op
+            .descr
+            .as_ref()
+            .and_then(|d| d.as_call_descr())
+            .and_then(|cd| cd.call_target_token())
+            .and_then(|token| self.call_assembler_targets.get(&token).copied());
+
+        if let Some(addr) = target_addr {
+            // External target: indirect call via absolute address
+            let addr = addr as i64;
+            #[cfg(target_arch = "x86_64")]
+            dynasm!(self.mc ; .arch x64
+                ; mov rax, QWORD addr
+                ; call rax
+            );
+            #[cfg(target_arch = "aarch64")]
+            {
+                self.emit_mov_imm64(2, addr);
+                dynasm!(self.mc ; .arch aarch64
+                    ; blr x2
+                );
+            }
+        } else if let Some(label) = self.self_entry_label {
+            // Self-recursion: direct call via label
             #[cfg(target_arch = "x86_64")]
             dynasm!(self.mc ; .arch x64
                 ; call =>label
@@ -2827,6 +2929,7 @@ impl Assembler386 {
                 ; bl =>label
             );
         } else {
+            // No target resolved — should not happen in correct compilation.
             #[cfg(target_arch = "x86_64")]
             dynasm!(self.mc ; .arch x64 ; ud2);
             #[cfg(target_arch = "aarch64")]
@@ -2860,9 +2963,13 @@ impl Assembler386 {
             ; mov x20, x0             // x20 = callee jf_ptr
         );
 
+        // assembler.py:324-336 call_assembler: select done_descr by op.type.
+        let result_type = op.opcode.result_type();
+        let done_descr_ptr =
+            crate::guard::done_with_this_frame_descr_ptr_for_type(result_type) as i64;
+
         // _call_assembler_check_descr (assembler.py:2274-2278):
-        //   CMP [jf_ptr + jf_descr_ofs], done_with_this_frame_descr
-        let done_descr_ptr = crate::guard::done_with_this_frame_descr_ptr() as i64;
+        //   CMP [jf_ptr + jf_descr_ofs], done_with_this_frame_descr_{type}
         #[cfg(target_arch = "x86_64")]
         {
             let fast_path = self.mc.new_dynamic_label();
@@ -2874,9 +2981,17 @@ impl Assembler386 {
                 ; je =>fast_path
             );
 
-            // Path A (slow): callee didn't finish (guard failure).
-            // assembler.py:345 _call_assembler_emit_helper_call.
-            // Free the callee jf, return 0 (assembler_helper stub).
+            // Path A (slow): callee didn't finish normally (guard failure).
+            // assembler.py:345-350:
+            //   asm_helper_adr = cpu.cast_adr_to_int(jd.assembler_helper_adr)
+            //   _call_assembler_emit_helper_call(asm_helper_adr, [tmploc, vloc], result_loc)
+            //
+            // RPython calls the meta-interp's assembler_helper which handles
+            // blackhole resume, bridge entry, and exception propagation.
+            // When the helper infrastructure is registered (like Cranelift's
+            // register_call_assembler_blackhole), this should call it.
+            // For now: free the callee jitframe and return 0 as a fallback.
+            // The caller-side (eval.rs) handles the zero result appropriately.
             dynasm!(self.mc ; .arch x64
                 ; mov rdi, rdx                      // free(callee_jf)
                 ; sub rsp, 8
@@ -2891,15 +3006,35 @@ impl Assembler386 {
             //   Load result from jf_frame[0], then free the heap jf.
             dynasm!(self.mc ; .arch x64
                 ; =>fast_path
-                ; mov r12, [rdx + 8]                // r12 = jf_frame[0] (result)
-                ; mov rdi, rdx                      // free(callee_jf)
-                ; sub rsp, 8
-                ; mov rax, QWORD free_ptr
-                ; call rax
-                ; add rsp, 8
-                ; mov rax, r12                      // rax = result
-                ; =>merge
             );
+
+            // assembler.py:2295-2303: type-specific result load
+            if result_type == Type::Float {
+                // assembler.py:2296-2298: MOVSD xmm0, [eax + ofs]
+                dynasm!(self.mc ; .arch x64
+                    ; movsd xmm0, [rdx + 8]        // xmm0 = jf_frame[0] (float)
+                    ; movq r12, xmm0               // preserve bits across libc::free
+                    ; mov rdi, rdx                  // free(callee_jf)
+                    ; sub rsp, 8
+                    ; mov rax, QWORD free_ptr
+                    ; call rax
+                    ; add rsp, 8
+                    ; mov rax, r12                  // pack float bits to rax
+                    ; =>merge
+                );
+            } else {
+                // assembler.py:2301-2302: MOV eax, [eax + ofs]
+                dynasm!(self.mc ; .arch x64
+                    ; mov r12, [rdx + 8]            // r12 = jf_frame[0] (result)
+                    ; mov rdi, rdx                  // free(callee_jf)
+                    ; sub rsp, 8
+                    ; mov rax, QWORD free_ptr
+                    ; call rax
+                    ; add rsp, 8
+                    ; mov rax, r12                  // rax = result
+                    ; =>merge
+                );
+            }
         }
         #[cfg(target_arch = "aarch64")]
         {
