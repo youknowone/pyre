@@ -272,15 +272,25 @@ impl CodeWriter {
         // jitcode.py:18: jitdriver_sd is not None for portals.
         // call.py:148: jd.mainjitcode.jitdriver_sd = jd
         // interp_jit.py:78: dispatch() has jit_merge_point — is the portal.
-        // <module> code is never a portal (no jit_merge_point).
-        let is_portal = &*code.obj_name != "<module>";
+        // pyre: every eval_loop_jit call acts as a portal (each Python
+        // function has its own dispatch loop), so all jitcodes with loop
+        // headers are portals.
+        let is_portal = !loop_header_pcs.is_empty();
+        // Independent toggle for the "portal locals → vable array" epic:
+        // controls whether LoadFast / StoreFast in the body of this jitcode
+        // compile into `GETARRAYITEM_VABLE_R` / `SETARRAYITEM_VABLE_R`
+        // against `locals_cells_stack_w` (portal semantics) or into plain
+        // register moves (non-portal semantics).
+        //
+        // Kept in lock-step with `is_portal` today, but named separately so
+        // Phase 4/5 of the epic can bisect "did vable emission break this?"
+        // without touching jitdriver_sd / jit_merge_point decisions at
+        // `:802` and the merge-point block below.
+        let should_emit_vable_for_portal_locals = is_portal;
+        let _ = should_emit_vable_for_portal_locals; // consumed in Phase 4/5
         // jtransform.py:1690-1712: portal jitcodes get jit_merge_point
-        // at the first loop header. Non-portal: loop_header only.
-        let merge_point_pc = if is_portal {
-            loop_header_pcs.iter().copied().min()
-        } else {
-            None
-        };
+        // at the first loop header. Non-portal (no loops): no merge point.
+        let merge_point_pc = loop_header_pcs.iter().copied().min();
         let mut emitted_merge_point = false;
 
         for py_pc in 0..num_instrs {
