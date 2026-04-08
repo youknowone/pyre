@@ -504,6 +504,17 @@ pub struct PyreSym {
     pub(crate) pre_opcode_vsd: Option<usize>,
     pub(crate) pre_opcode_stack: Option<Vec<OpRef>>,
     pub(crate) pre_opcode_stack_types: Option<Vec<Type>>,
+    /// RPython generate_guard parity (pyjitpl.py:2558-2570): when a
+    /// COMPARE_OP fast-path emits IntLt/FloatLt directly, save the PC
+    /// and pre-opcode stack snapshot of the COMPARE_OP itself. The
+    /// following PopJumpIf*'s record_branch_guard uses these so the
+    /// guard's resume PC is the COMPARE_OP's orgpc and the operands
+    /// are still on the symbolic stack — matching what blackhole sees
+    /// when it re-executes the COMPARE_OP from orgpc.
+    pub(crate) last_comparison_orgpc: Option<usize>,
+    pub(crate) last_comparison_pre_vsd: Option<usize>,
+    pub(crate) last_comparison_pre_stack: Option<Vec<OpRef>>,
+    pub(crate) last_comparison_pre_stack_types: Option<Vec<Type>>,
     /// RPython MetaInterp.last_exc_value (pyjitpl.py:2745): concrete
     /// exception object pending during tracing. Set by execute_ll_raised
     /// (raise_varargs), consumed by handle_possible_exception.
@@ -1494,6 +1505,10 @@ impl PyreSym {
             pre_opcode_vsd: None,
             pre_opcode_stack: None,
             pre_opcode_stack_types: None,
+            last_comparison_orgpc: None,
+            last_comparison_pre_vsd: None,
+            last_comparison_pre_stack: None,
+            last_comparison_pre_stack_types: None,
             last_exc_value: std::ptr::null_mut(),
             class_of_last_exc_is_const: false,
             last_exc_box: OpRef::NONE,
