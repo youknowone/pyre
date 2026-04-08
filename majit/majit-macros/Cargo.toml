@@ -9,6 +9,10 @@ description = "Proc macros for majit JIT integration"
 [lib]
 proc-macro = true
 
+[features]
+cranelift = ["majit-metainterp/cranelift"]
+dynasm = ["majit-metainterp/dynasm"]
+
 [dependencies]
 syn = { version = "2", features = ["full", "visit-mut"] }
 quote = "1"
