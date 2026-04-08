@@ -165,7 +165,9 @@ pub struct CompiledCode {
     /// header_pc (green_key).
     pub header_pc: u64,
     /// Frame depth (number of jitframe slots used).
-    pub frame_depth: usize,
+    /// AtomicUsize for redirect_call_assembler's update_frame_info
+    /// parity: may be updated through &CompiledCode (shared ref).
+    pub frame_depth: std::sync::atomic::AtomicUsize,
     /// Absolute address of the LABEL op (loop body entry).
     /// Used by bridge JUMP to return to the loop. RPython stores
     /// this as TargetToken._ll_loop_code.
@@ -448,7 +450,7 @@ impl Assembler386 {
             input_types: self.input_types,
             trace_id: self.trace_id,
             header_pc: self.header_pc,
-            frame_depth: self.frame_depth,
+            frame_depth: std::sync::atomic::AtomicUsize::new(self.frame_depth),
             label_addr,
         })
     }
@@ -496,7 +498,7 @@ impl Assembler386 {
             input_types: self.input_types,
             trace_id: self.trace_id,
             header_pc: self.header_pc,
-            frame_depth: self.frame_depth,
+            frame_depth: std::sync::atomic::AtomicUsize::new(self.frame_depth),
             label_addr: 0,
         })
     }
