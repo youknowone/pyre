@@ -1588,6 +1588,15 @@ pub fn install_jit_call_bridge() {
             majit_backend_cranelift::register_inline_frame_arena(arena_global_info());
             majit_backend_cranelift::register_call_assembler_unbox_int(unbox_int_for_force);
         }
+        #[cfg(feature = "dynasm")]
+        {
+            majit_backend_dynasm::register_call_assembler_force(jit_force_callee_frame);
+            majit_backend_dynasm::register_call_assembler_bridge(jit_ca_handle_guard_failure);
+            majit_backend_dynasm::register_call_assembler_blackhole(
+                jit_blackhole_resume_from_guard,
+            );
+            majit_backend_dynasm::register_call_assembler_unbox_int(unbox_int_for_force);
+        }
         majit_metainterp::set_ref_unbox_int_fn(unbox_int_for_force);
     });
 }

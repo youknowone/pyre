@@ -2929,11 +2929,19 @@ impl Assembler386 {
                 ; bl =>label
             );
         } else {
-            // No target resolved — should not happen in correct compilation.
+            // Pending/unresolved target: call the helper trampoline directly.
+            // The helper handles force/blackhole fallback for pending tokens.
+            let helper = crate::call_assembler_helper_addr() as i64;
             #[cfg(target_arch = "x86_64")]
-            dynasm!(self.mc ; .arch x64 ; ud2);
+            dynasm!(self.mc ; .arch x64
+                ; mov rax, QWORD helper
+                ; call rax
+            );
             #[cfg(target_arch = "aarch64")]
-            dynasm!(self.mc ; .arch aarch64 ; brk 0);
+            {
+                self.emit_mov_imm64(8, helper);
+                dynasm!(self.mc ; .arch aarch64 ; blr x8);
+            }
         }
 
         // rax/x0 = callee's returned jf_ptr (= heap jf_ptr we passed).
@@ -2986,19 +2994,16 @@ impl Assembler386 {
             //   asm_helper_adr = cpu.cast_adr_to_int(jd.assembler_helper_adr)
             //   _call_assembler_emit_helper_call(asm_helper_adr, [tmploc, vloc], result_loc)
             //
-            // RPython calls the meta-interp's assembler_helper which handles
-            // blackhole resume, bridge entry, and exception propagation.
-            // When the helper infrastructure is registered (like Cranelift's
-            // register_call_assembler_blackhole), this should call it.
-            // For now: free the callee jitframe and return 0 as a fallback.
-            // The caller-side (eval.rs) handles the zero result appropriately.
+            // Call the assembler helper trampoline. It reads jf_descr from
+            // the callee frame, dispatches to blackhole/bridge/force handler,
+            // frees the callee jitframe, and returns the result.
+            let helper_addr = crate::call_assembler_helper_addr() as i64;
             dynasm!(self.mc ; .arch x64
-                ; mov rdi, rdx                      // free(callee_jf)
+                ; mov rdi, rdx                      // arg0 = callee_jf_ptr
                 ; sub rsp, 8
-                ; mov rax, QWORD free_ptr
-                ; call rax
+                ; mov rax, QWORD helper_addr
+                ; call rax                          // rax = helper result
                 ; add rsp, 8
-                ; xor eax, eax                      // result = 0
                 ; jmp =>merge
             );
 
@@ -3046,13 +3051,13 @@ impl Assembler386 {
                 ; cmp x1, x2
                 ; b.eq =>fast_path
             );
-            // Path A (slow): free + result = 0
+            // Path A (slow): call assembler helper trampoline
             {
-                self.emit_mov_imm64(2, free_ptr);
+                let helper_addr = crate::call_assembler_helper_addr() as i64;
+                self.emit_mov_imm64(2, helper_addr);
                 dynasm!(self.mc ; .arch aarch64
-                    ; mov x0, x20
-                    ; blr x2
-                    ; mov x0, 0
+                    ; mov x0, x20                   // arg0 = callee_jf_ptr
+                    ; blr x2                        // x0 = helper result
                     ; b =>merge
                 );
             }
