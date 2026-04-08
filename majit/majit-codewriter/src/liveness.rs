@@ -153,6 +153,127 @@ fn compute_liveness_pass(
     must_continue
 }
 
+// ____________________________________________________________
+// helper functions for compactly encoding and decoding liveness info
+//
+// liveness is encoded as a 2 byte offset into the single string all_liveness
+// (which is stored on the metainterp_sd)
+
+/// RPython liveness.py:125 `OFFSET_SIZE`.
+pub const OFFSET_SIZE: usize = 2;
+
+/// RPython liveness.py:127-131 `encode_offset(pos, code)`.
+pub fn encode_offset(pos: usize, code: &mut Vec<u8>) {
+    assert_eq!(OFFSET_SIZE, 2);
+    code.push((pos & 0xff) as u8);
+    code.push(((pos >> 8) & 0xff) as u8);
+    assert_eq!(pos >> 16, 0);
+}
+
+/// RPython liveness.py:133-136 `decode_offset(jitcode, pc)`.
+pub fn decode_offset(jitcode: &[u8], pc: usize) -> usize {
+    assert_eq!(OFFSET_SIZE, 2);
+    (jitcode[pc] as usize) | ((jitcode[pc + 1] as usize) << 8)
+}
+
+// within the string of all_liveness, we encode the bitsets of which of the 256
+// registers are live as follows: first three byte with the number of set bits
+// for each of the categories ints, refs, floats followed by the necessary
+// number of bytes to store them (this number of bytes is implicit), for each of
+// the categories
+// | len live_i | len live_r | len live_f
+// | bytes for live_i | bytes for live_r | bytes for live_f
+
+/// RPython liveness.py:147-166 `encode_liveness(live)`.
+///
+/// Encodes a single register-kind bitset: `live` is a sorted list of
+/// register indices (each `< 256`). Returns the packed bitset bytes
+/// (no length header — the caller is responsible for emitting the
+/// three `len_i/len_r/len_f` header bytes).
+pub fn encode_liveness(live: &[u8]) -> Vec<u8> {
+    // RPython liveness.py:148 `live = sorted(live)` — enforce sorted input.
+    debug_assert!(
+        live.windows(2).all(|w| w[0] <= w[1]),
+        "encode_liveness: input must be sorted"
+    );
+    let mut liveness: Vec<u8> = Vec::new();
+    let mut offset: u32 = 0;
+    let mut char_: u32 = 0;
+    let mut i = 0;
+    while i < live.len() {
+        let x = live[i] as u32;
+        let x = x.wrapping_sub(offset);
+        if x >= 8 {
+            liveness.push(char_ as u8);
+            char_ = 0;
+            offset += 8;
+            continue;
+        }
+        char_ |= 1 << x;
+        assert!(char_ < 256);
+        i += 1;
+    }
+    if char_ != 0 {
+        liveness.push(char_ as u8);
+    }
+    liveness
+}
+
+/// RPython liveness.py:170-200 `LivenessIterator`.
+///
+/// Iterates set bit positions from a bitset stored in `all_liveness`
+/// starting at `offset`, producing `length` indices total.
+#[derive(Debug, Clone)]
+pub struct LivenessIterator<'a> {
+    pub all_liveness: &'a [u8],
+    pub offset: usize,
+    pub length: u32,
+    pub curr_byte: u32,
+    pub count: u32,
+}
+
+impl<'a> LivenessIterator<'a> {
+    /// RPython liveness.py:172-178 `__init__(self, offset, length, all_liveness)`.
+    pub fn new(offset: usize, length: u32, all_liveness: &'a [u8]) -> Self {
+        assert!(length != 0);
+        LivenessIterator {
+            all_liveness,
+            offset,
+            length,
+            curr_byte: 0,
+            count: 0,
+        }
+    }
+}
+
+impl<'a> Iterator for LivenessIterator<'a> {
+    type Item = u32;
+
+    /// RPython liveness.py:184-200 `next(self)`.
+    fn next(&mut self) -> Option<u32> {
+        if self.length == 0 {
+            return None;
+        }
+        self.length -= 1;
+        let mut count = self.count;
+        let all_liveness = self.all_liveness;
+        let mut curr_byte = self.curr_byte;
+        // find next bit set
+        loop {
+            if (count & 7) == 0 {
+                curr_byte = all_liveness[self.offset] as u32;
+                self.curr_byte = curr_byte;
+                self.offset += 1;
+            }
+            if (curr_byte >> (count & 7)) & 1 != 0 {
+                self.count = count + 1;
+                return Some(count);
+            }
+            count += 1;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,5 +318,39 @@ mod tests {
 
         // Should not panic
         compute_liveness(&mut flat);
+    }
+
+    #[test]
+    fn encode_decode_offset_roundtrip() {
+        let mut code: Vec<u8> = Vec::new();
+        encode_offset(0x1234, &mut code);
+        assert_eq!(code, vec![0x34, 0x12]);
+        assert_eq!(decode_offset(&code, 0), 0x1234);
+    }
+
+    #[test]
+    fn encode_liveness_empty() {
+        assert_eq!(encode_liveness(&[]), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn encode_liveness_small() {
+        // live = [0, 1, 7] -> first byte has bits 0, 1, 7 set = 0b1000_0011 = 0x83
+        assert_eq!(encode_liveness(&[0u8, 1, 7]), vec![0x83]);
+    }
+
+    #[test]
+    fn encode_liveness_multi_byte() {
+        // live = [0, 8, 15] -> byte 0 = 0x01, byte 1 = 0b1000_0001 = 0x81
+        assert_eq!(encode_liveness(&[0u8, 8, 15]), vec![0x01, 0x81]);
+    }
+
+    #[test]
+    fn liveness_iterator_roundtrip() {
+        let live = [0u8, 3, 5, 9, 12, 17];
+        let encoded = encode_liveness(&live);
+        let mut it = LivenessIterator::new(0, live.len() as u32, &encoded);
+        let decoded: Vec<u32> = (&mut it).collect();
+        assert_eq!(decoded, live.iter().map(|&i| i as u32).collect::<Vec<_>>());
     }
 }
