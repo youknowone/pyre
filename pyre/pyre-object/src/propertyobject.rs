@@ -20,9 +20,7 @@ pub struct W_PropertyObject {
     pub fdel: PyObjectRef,
 }
 
-pub static PROPERTY_TYPE: PyType = PyType {
-    tp_name: "property",
-};
+pub static PROPERTY_TYPE: PyType = crate::pyobject::new_pytype("property");
 
 /// Allocate a new property object.
 ///
@@ -69,9 +67,7 @@ pub struct W_StaticMethodObject {
     pub w_function: PyObjectRef,
 }
 
-pub static STATICMETHOD_TYPE: PyType = PyType {
-    tp_name: "staticmethod",
-};
+pub static STATICMETHOD_TYPE: PyType = crate::pyobject::new_pytype("staticmethod");
 
 pub fn w_staticmethod_new(func: PyObjectRef) -> PyObjectRef {
     let obj = Box::new(W_StaticMethodObject {
@@ -105,9 +101,7 @@ pub struct W_ClassMethodObject {
     pub w_function: PyObjectRef,
 }
 
-pub static CLASSMETHOD_TYPE: PyType = PyType {
-    tp_name: "classmethod",
-};
+pub static CLASSMETHOD_TYPE: PyType = crate::pyobject::new_pytype("classmethod");
 
 pub fn w_classmethod_new(func: PyObjectRef) -> PyObjectRef {
     let obj = Box::new(W_ClassMethodObject {

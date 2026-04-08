@@ -7,7 +7,7 @@
 
 use crate::pyobject::*;
 
-pub static SUPER_TYPE: PyType = PyType { tp_name: "super" };
+pub static SUPER_TYPE: PyType = crate::pyobject::new_pytype("super");
 
 /// super proxy: [ob_type | super_type (cls) | obj (self)]
 #[repr(C)]

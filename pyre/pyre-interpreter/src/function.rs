@@ -9,9 +9,7 @@ use crate::executioncontext::PyNamespace;
 use pyre_object::pyobject::*;
 
 /// Type descriptor for user-defined functions.
-pub static FUNCTION_TYPE: PyType = PyType {
-    tp_name: "function",
-};
+pub static FUNCTION_TYPE: PyType = pyre_object::pyobject::new_pytype("function");
 
 /// User-defined function object.
 ///

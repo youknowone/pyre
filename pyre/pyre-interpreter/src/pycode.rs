@@ -20,7 +20,7 @@ pub struct CodeHookCache {
 }
 
 /// Type descriptor for code objects.
-pub static CODE_TYPE: PyType = PyType { tp_name: "code" };
+pub static CODE_TYPE: PyType = pyre_object::pyobject::new_pytype("code");
 
 /// Python code object wrapper.
 ///

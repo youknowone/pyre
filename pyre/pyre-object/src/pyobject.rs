@@ -4,12 +4,28 @@
 //! Concrete types (W_IntObject, W_BoolObject, etc.) embed this header as their
 //! first field, enabling safe pointer casts between `*mut PyObject` and typed pointers.
 
-/// Type descriptor for Python objects.
+use std::sync::atomic::{AtomicI64, Ordering};
+
+/// Type descriptor for Python objects — corresponds to RPython's OBJECT_VTABLE
+/// (rclass.py:167-174).
 ///
 /// Each built-in type has a single static `PyType` instance.
-/// The JIT uses `GuardClass` on the `ob_type` pointer to specialize code paths.
+/// The JIT uses `GuardClass` on the `ob_type` pointer to specialize code paths,
+/// and `GuardSubclass` via `int_between(cls.min, subcls.min, cls.max)`
+/// (rclass.py:1133-1137 `ll_issubclass`).
+///
+/// Fields match OBJECT_VTABLE layout order:
+///   subclassrange_min, subclassrange_max, (rtti omitted), name, (instantiate omitted)
+///
+/// `AtomicI64` provides interior mutability for static instances:
+/// ranges are assigned once at init time by `assign_subclass_range()`,
+/// mirroring `assign_inheritance_ids` (normalizecalls.py:373-389).
+/// The JIT backend reads them at raw offsets — `AtomicI64` is layout-
+/// compatible with `i64` (same size and alignment).
 #[repr(C)]
 pub struct PyType {
+    pub subclassrange_min: AtomicI64,
+    pub subclassrange_max: AtomicI64,
     pub tp_name: &'static str,
 }
 
@@ -47,23 +63,29 @@ pub const PY_NULL: PyObjectRef = std::ptr::null_mut();
 
 // ── Type identity ─────────────────────────────────────────────────────
 
-pub static INT_TYPE: PyType = PyType { tp_name: "int" };
-pub static BOOL_TYPE: PyType = PyType { tp_name: "bool" };
-pub static FLOAT_TYPE: PyType = PyType { tp_name: "float" };
-pub static STR_TYPE: PyType = PyType { tp_name: "str" };
-pub static LIST_TYPE: PyType = PyType { tp_name: "list" };
-pub static TUPLE_TYPE: PyType = PyType { tp_name: "tuple" };
-pub static DICT_TYPE: PyType = PyType { tp_name: "dict" };
-pub static LONG_TYPE: PyType = PyType { tp_name: "int" };
-pub static NONE_TYPE: PyType = PyType {
-    tp_name: "NoneType",
-};
-pub static NOTIMPLEMENTED_TYPE: PyType = PyType {
-    tp_name: "NotImplementedType",
-};
-pub static MODULE_TYPE: PyType = PyType { tp_name: "module" };
-pub static TYPE_TYPE: PyType = PyType { tp_name: "type" };
-pub static INSTANCE_TYPE: PyType = PyType { tp_name: "object" };
+/// Construct a PyType with zeroed subclass ranges.
+/// Ranges are assigned at init time by `assign_subclass_range()`.
+pub const fn new_pytype(tp_name: &'static str) -> PyType {
+    PyType {
+        subclassrange_min: AtomicI64::new(0),
+        subclassrange_max: AtomicI64::new(0),
+        tp_name,
+    }
+}
+
+pub static INT_TYPE: PyType = new_pytype("int");
+pub static BOOL_TYPE: PyType = new_pytype("bool");
+pub static FLOAT_TYPE: PyType = new_pytype("float");
+pub static STR_TYPE: PyType = new_pytype("str");
+pub static LIST_TYPE: PyType = new_pytype("list");
+pub static TUPLE_TYPE: PyType = new_pytype("tuple");
+pub static DICT_TYPE: PyType = new_pytype("dict");
+pub static LONG_TYPE: PyType = new_pytype("int");
+pub static NONE_TYPE: PyType = new_pytype("NoneType");
+pub static NOTIMPLEMENTED_TYPE: PyType = new_pytype("NotImplementedType");
+pub static MODULE_TYPE: PyType = new_pytype("module");
+pub static TYPE_TYPE: PyType = new_pytype("type");
+pub static INSTANCE_TYPE: PyType = new_pytype("object");
 
 /// Field offset of `ob_type` within PyObject, for JIT field access.
 pub const OB_TYPE_OFFSET: usize = std::mem::offset_of!(PyObject, ob_type);
@@ -71,6 +93,52 @@ pub const OB_TYPE_OFFSET: usize = std::mem::offset_of!(PyObject, ob_type);
 /// Field offset of `w_class` within PyObject, for JIT field access.
 /// RPython: this corresponds to reading typeptr + gettypefor (fused into one field).
 pub const W_CLASS_OFFSET: usize = std::mem::offset_of!(PyObject, w_class);
+
+/// Field offset of `subclassrange_min` within PyType (OBJECT_VTABLE).
+/// rclass.py:168 — first field in OBJECT_VTABLE.
+pub const SUBCLASSRANGE_MIN_OFFSET: usize = std::mem::offset_of!(PyType, subclassrange_min);
+
+/// Field offset of `subclassrange_max` within PyType (OBJECT_VTABLE).
+/// rclass.py:169 — second field in OBJECT_VTABLE.
+pub const SUBCLASSRANGE_MAX_OFFSET: usize = std::mem::offset_of!(PyType, subclassrange_max);
+
+/// rclass.py:1133-1137 `ll_issubclass(subcls, cls)`.
+///
+/// O(1) subclass check via preorder numbering:
+///   `int_between(cls.subclassrange_min, subcls.subclassrange_min, cls.subclassrange_max)`
+#[inline]
+pub fn ll_issubclass(subcls: &PyType, cls: &PyType) -> bool {
+    let cls_min = cls.subclassrange_min.load(Ordering::Relaxed);
+    let subcls_min = subcls.subclassrange_min.load(Ordering::Relaxed);
+    let cls_max = cls.subclassrange_max.load(Ordering::Relaxed);
+    // int_between(a, b, c) ≡ a <= b < c
+    cls_min <= subcls_min && subcls_min < cls_max
+}
+
+/// rclass.py:1143-1147 `ll_isinstance(obj, cls)`.
+///
+/// # Safety
+/// `obj` must be a valid non-null `PyObject`.
+#[inline]
+pub unsafe fn ll_isinstance(obj: PyObjectRef, cls: &PyType) -> bool {
+    if obj.is_null() {
+        return false;
+    }
+    let obj_cls = unsafe { &*(*obj).ob_type };
+    ll_issubclass(obj_cls, cls)
+}
+
+/// Write subclass ranges to a `PyType` instance.
+///
+/// Mirrors `assign_inheritance_ids` (normalizecalls.py:373-389) which
+/// assigns `classdef.minid` / `classdef.maxid` to each vtable entry.
+///
+/// Uses `Relaxed` ordering: ranges are written once at init time
+/// before any concurrent reads.
+pub fn assign_subclass_range(tp: &PyType, min: i64, max: i64) {
+    tp.subclassrange_min.store(min, Ordering::Relaxed);
+    tp.subclassrange_max.store(max, Ordering::Relaxed);
+}
 
 /// Every built-in `PyType` static that represents a full `PyObject`
 /// subtype (i.e. instances carry `ob_type` at offset 0, matching

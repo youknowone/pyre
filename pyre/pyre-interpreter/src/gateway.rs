@@ -238,9 +238,7 @@ impl UnwrapSpec_EmitShortcut {
 /// Type descriptor for built-in code objects.
 ///
 /// PyPy typedef.py: BuiltinCode.typedef = TypeDef('builtin-code', ...)
-pub static BUILTIN_CODE_TYPE: PyType = PyType {
-    tp_name: "builtin-code",
-};
+pub static BUILTIN_CODE_TYPE: PyType = pyre_object::pyobject::new_pytype("builtin-code");
 
 /// Signature of a built-in function.
 ///

@@ -7,9 +7,7 @@
 
 use crate::pyobject::*;
 
-pub static GENERATOR_TYPE: PyType = PyType {
-    tp_name: "generator",
-};
+pub static GENERATOR_TYPE: PyType = crate::pyobject::new_pytype("generator");
 
 /// Generator object: holds a boxed frame that can be resumed.
 ///

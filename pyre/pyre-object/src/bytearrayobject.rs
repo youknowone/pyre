@@ -4,9 +4,7 @@
 
 use crate::pyobject::*;
 
-pub static BYTEARRAY_TYPE: PyType = PyType {
-    tp_name: "bytearray",
-};
+pub static BYTEARRAY_TYPE: PyType = crate::pyobject::new_pytype("bytearray");
 
 /// Python bytearray object.
 ///

@@ -7,7 +7,7 @@
 use crate::pyobject::*;
 
 /// Type descriptor for cell objects.
-pub static CELL_TYPE: PyType = PyType { tp_name: "cell" };
+pub static CELL_TYPE: PyType = crate::pyobject::new_pytype("cell");
 
 /// Python cell object.
 ///

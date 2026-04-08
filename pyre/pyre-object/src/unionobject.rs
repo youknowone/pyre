@@ -23,9 +23,7 @@ pub struct W_UnionType {
     pub args: PyObjectRef,
 }
 
-pub static UNION_TYPE: PyType = PyType {
-    tp_name: "types.UnionType",
-};
+pub static UNION_TYPE: PyType = crate::pyobject::new_pytype("types.UnionType");
 
 /// Check if an object is a UnionType.
 #[inline]

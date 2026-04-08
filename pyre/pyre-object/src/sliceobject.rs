@@ -2,7 +2,7 @@
 
 use crate::pyobject::*;
 
-pub static SLICE_TYPE: PyType = PyType { tp_name: "slice" };
+pub static SLICE_TYPE: PyType = crate::pyobject::new_pytype("slice");
 
 #[repr(C)]
 pub struct W_SliceObject {
