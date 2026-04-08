@@ -180,9 +180,7 @@ fn test_guard_and_loop() {
     let descr = backend.get_latest_descr(&frame);
     assert!(!descr.is_finish(), "should be guard failure, not finish");
 
-    // RPython parity: values stay in their allocated slots.
-    // OpRef(1) was allocated to slot 1 by genop_int_add.
-    // After Label remap, OpRef(0)=slot 0 (input), OpRef(1)=slot 1.
-    let result_val = backend.get_int_value(&frame, 1);
-    assert_eq!(result_val, 5, "loop should stop at 5, value at slot 1");
+    // fail_args = [OpRef(1)], so fail_arg index 0 = the IntAdd result.
+    let result_val = backend.get_int_value(&frame, 0);
+    assert_eq!(result_val, 5, "loop should stop at 5, fail_arg[0]");
 }
