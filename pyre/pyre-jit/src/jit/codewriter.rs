@@ -32,11 +32,22 @@ use pyre_jit_trace::virtualizable_spec::LOCALS_CELLS_STACK_W_VABLE_ARRAY_INDEX;
 ///
 /// PyFrame lays out locals, cells, and the value stack in a single
 /// vector; `var_num` from `LOAD_FAST`/`STORE_FAST` is already a direct
-/// offset into that vector (no indirection). Kept as a named helper so
-/// Phase 4/5 of the vable-locals epic has a single well-commented call
-/// site for this mapping.
+/// offset into that vector (no indirection).
+///
+/// **NOT YET WIRED UP**: this helper exists for the planned port of
+/// `LOAD_FAST`/`STORE_FAST` → `BC_GETARRAYITEM_VABLE_R` /
+/// `BC_SETARRAYITEM_VABLE_R` against `locals_cells_stack_w`. The
+/// matching `pypy/interpreter/pyopcode.py:495 LOAD_FAST` reads
+/// `frame.locals_cells_stack_w[var_num]` directly, and PyPy's JIT
+/// translator rewrites that read into a `getarrayitem_vable_r`
+/// against the virtualizable array. pyre's codewriter currently emits
+/// a plain `move_r` for both opcodes (see the LoadFast / StoreFast
+/// arms below); the lowering is gated on the parallel "virtualizable
+/// box propagation across loop iterations" port (task: virtualizable
+/// boxes / unroll preamble). Until both halves land together this
+/// helper has no callers — see Phase 4/5 of the vable-locals epic.
 #[inline]
-#[allow(dead_code)] // consumed in Phase 4/5
+#[allow(dead_code)] // see doc comment: pending Phase 4/5 wiring
 fn local_to_vable_slot(var_num: usize) -> usize {
     var_num
 }
@@ -276,18 +287,15 @@ impl CodeWriter {
         // function has its own dispatch loop), so all jitcodes with loop
         // headers are portals.
         let is_portal = !loop_header_pcs.is_empty();
-        // Independent toggle for the "portal locals → vable array" epic:
-        // controls whether LoadFast / StoreFast in the body of this jitcode
-        // compile into `GETARRAYITEM_VABLE_R` / `SETARRAYITEM_VABLE_R`
-        // against `locals_cells_stack_w` (portal semantics) or into plain
-        // register moves (non-portal semantics).
-        //
-        // Kept in lock-step with `is_portal` today, but named separately so
-        // Phase 4/5 of the epic can bisect "did vable emission break this?"
-        // without touching jitdriver_sd / jit_merge_point decisions at
-        // `:802` and the merge-point block below.
-        let should_emit_vable_for_portal_locals = is_portal;
-        let _ = should_emit_vable_for_portal_locals; // consumed in Phase 4/5
+        // NOTE: the planned `should_emit_vable_for_portal_locals` toggle
+        // (which would gate LoadFast/StoreFast on the
+        // `getarrayitem_vable_r` / `setarrayitem_vable_r` lowering — see
+        // `local_to_vable_slot` above) is intentionally omitted: pyre's
+        // LoadFast/StoreFast still emit plain `move_r` and the matching
+        // virtualizable-box propagation across loop iterations is not yet
+        // ported. Wiring the toggle without the lowering would be dead
+        // scaffolding that misleads readers about the port status. Both
+        // halves must land together (Phase 4/5 of the vable-locals epic).
         // jtransform.py:1690-1712: portal jitcodes get jit_merge_point
         // at the first loop header. Non-portal (no loops): no merge point.
         let merge_point_pc = loop_header_pcs.iter().copied().min();
@@ -331,6 +339,19 @@ impl CodeWriter {
 
                 // flatten.py: input args → registers 0..n-1
                 // regalloc.py: LOAD_FAST = ref_copy local → stack register
+                //
+                // **DIVERGENCE FROM PYPY** (tracked: vable-locals epic,
+                // Phase 4/5): pypy/interpreter/pyopcode.py:495 reads
+                // `self.locals_cells_stack_w[varindex]`, which the JIT
+                // translator rewrites into `getarrayitem_vable_r`
+                // (locals_cells_stack_w array, var_num) on portal
+                // jitcodes. pyre's codewriter currently emits a plain
+                // ref-register copy: this is correct only because pyre's
+                // local registers are aliased onto the same indices that
+                // the heuristic resume path writes back from
+                // `frame.locals_cells_stack_w`. The vable lowering is
+                // gated on porting `virtualizable_boxes[-1]` propagation
+                // across loop iterations (a separate epic).
                 Instruction::LoadFast { var_num } | Instruction::LoadFastBorrow { var_num } => {
                     let reg = var_num.get(op_arg).as_usize() as u16;
                     assembler.move_r(stack_base + current_depth, reg);
