@@ -1598,16 +1598,15 @@ pub fn generated_direct_type_value(
                 frame.implement_guard_value(ctx, w_type_opref, concrete_type_obj as i64);
             } else {
                 // __class__ override: .w_type differs from typedef::type().
-                // RPython: jit.promote(w_obj.__class__) evaluates __class__
-                // (via getfield chain in mapdict) then guard_value on the CLASS.
+                // RPython: jit.promote(w_obj.__class__) = getfield(ob_type) + GUARD_VALUE.
                 // pyre: ATTR_TABLE is not getfield-accessible; use
-                // CallLoopinvariantR(jit_read_class) + guard_value(class).
+                // elidable call (closest to getfield semantics) + GUARD_VALUE.
                 frame.guard_class(
                     ctx,
                     value,
                     &pyre_object::pyobject::INSTANCE_TYPE as *const _ as *const pyre_object::PyType,
                 );
-                let class_opref = ctx.call_loopinvariant_ref_typed(
+                let class_opref = ctx.call_elidable_ref_typed(
                     crate::state::jit_read_class as *const (),
                     &[value],
                     &[majit_ir::Type::Ref],
@@ -1632,9 +1631,9 @@ pub fn generated_direct_type_value(
             let has_custom_metaclass = default_metaclass
                 .map_or(true, |dm| !std::ptr::eq(dm, concrete_type_obj));
             if has_custom_metaclass {
-                // Custom metaclass: read metaclass via CallLoopinvariantR
-                // and guard the CLASS value, not the type object identity.
-                let class_opref = ctx.call_loopinvariant_ref_typed(
+                // Custom metaclass: elidable read + GUARD_VALUE on the CLASS.
+                // RPython: getfield(metaclass) + promote. pyre: elidable call.
+                let class_opref = ctx.call_elidable_ref_typed(
                     crate::state::jit_read_class as *const (),
                     &[value],
                     &[majit_ir::Type::Ref],
@@ -1650,10 +1649,10 @@ pub fn generated_direct_type_value(
         let concrete_obj_type = (*concrete_value).ob_type;
         let default_type = pyre_interpreter::typedef::gettypefor(concrete_obj_type);
         if default_type.map_or(true, |dt| !std::ptr::eq(dt, concrete_type_obj)) {
-            // __class__ override: guard_class(ob_type) + CallLoopinvariantR
-            // to read actual class + guard_value on the CLASS, not the object.
+            // __class__ override: guard_class(ob_type) + elidable read + GUARD_VALUE.
+            // RPython: getfield(ob_type) + promote. pyre: elidable call.
             frame.guard_class(ctx, value, concrete_obj_type);
-            let class_opref = ctx.call_loopinvariant_ref_typed(
+            let class_opref = ctx.call_elidable_ref_typed(
                 crate::state::jit_read_class as *const (),
                 &[value],
                 &[majit_ir::Type::Ref],
@@ -1672,7 +1671,7 @@ pub fn generated_direct_type_value(
 /// calls jit.promote(w_obj.__class__). Same guard strategy as type():
 ///   - builtin: guard_class (ob_type is unique)
 ///   - instance: guard_class(INSTANCE_TYPE) + getfield(w_type) + guard_value
-///   - __class__ override: guard_class + CallLoopinvariantR(jit_read_class) + guard_value
+///   - __class__ override: guard_class + elidable read + guard_value
 /// cls is always promoted via implement_guard_value.
 ///
 /// Returns None if not handled → caller falls back to residual call.
@@ -1710,8 +1709,8 @@ pub fn generated_direct_isinstance_value(
                 );
                 frame.implement_guard_value(ctx, w_type_opref, w_type as i64);
             } else {
-                // __class__ override: CallLoopinvariantR + guard_value on CLASS.
-                let class_opref = ctx.call_loopinvariant_ref_typed(
+                // __class__ override: elidable read + GUARD_VALUE on CLASS.
+                let class_opref = ctx.call_elidable_ref_typed(
                     crate::state::jit_read_class as *const (),
                     &[obj],
                     &[majit_ir::Type::Ref],
@@ -1736,8 +1735,8 @@ pub fn generated_direct_isinstance_value(
                 default_metaclass.map_or(true, |dm| !std::ptr::eq(dm, at))
             });
             if has_custom_metaclass {
-                // Custom metaclass: CallLoopinvariantR + guard_value on CLASS.
-                let class_opref = ctx.call_loopinvariant_ref_typed(
+                // Custom metaclass: elidable read + GUARD_VALUE on CLASS.
+                let class_opref = ctx.call_elidable_ref_typed(
                     crate::state::jit_read_class as *const (),
                     &[obj],
                     &[majit_ir::Type::Ref],
@@ -1757,8 +1756,8 @@ pub fn generated_direct_isinstance_value(
             });
             frame.guard_class(ctx, obj, concrete_obj_type);
             if has_class_override {
-                // __class__ override: CallLoopinvariantR + guard_value on CLASS.
-                let class_opref = ctx.call_loopinvariant_ref_typed(
+                // __class__ override: elidable read + GUARD_VALUE on CLASS.
+                let class_opref = ctx.call_elidable_ref_typed(
                     crate::state::jit_read_class as *const (),
                     &[obj],
                     &[majit_ir::Type::Ref],
