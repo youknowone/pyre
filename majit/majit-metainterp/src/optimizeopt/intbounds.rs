@@ -812,7 +812,6 @@ impl OptIntBounds {
             return OptimizationResult::Remove;
         }
 
-        // RPython: just emit. Bounds propagation is in postprocess.
         OptimizationResult::PassOn
     }
 
@@ -830,7 +829,6 @@ impl OptIntBounds {
             return OptimizationResult::Remove;
         }
 
-        // RPython: just emit. Bounds propagation is in postprocess.
         OptimizationResult::PassOn
     }
 
@@ -2034,20 +2032,40 @@ mod tests {
             for arg in &mut resolved_op.args {
                 *arg = ctx.get_box_replacement(*arg);
             }
-            match pass.propagate_forward(&resolved_op, &mut ctx) {
+            let emitted_op = match pass.propagate_forward(&resolved_op, &mut ctx) {
                 OptimizationResult::Emit(emit_op) => {
-                    ctx.emit(emit_op);
+                    ctx.emit(emit_op.clone());
+                    Some(emit_op)
                 }
                 OptimizationResult::Replace(rep_op) => {
-                    ctx.emit(rep_op);
+                    ctx.emit(rep_op.clone());
+                    Some(rep_op)
                 }
-                OptimizationResult::Remove => {}
+                OptimizationResult::Remove => None,
                 OptimizationResult::PassOn => {
-                    ctx.emit(resolved_op);
+                    ctx.emit(resolved_op.clone());
+                    Some(resolved_op)
                 }
                 OptimizationResult::InvalidLoop => {
                     panic!("unexpected InvalidLoop in test");
                 }
+            };
+            if let Some(ref emitted) = emitted_op {
+                // Simulate rewrite pass postprocess: make_constant on guard condition.
+                // In the real optimizer, rewrite.rs postprocess_GUARD_TRUE sets
+                // condition = CONST_1 before intbounds postprocess runs.
+                match emitted.opcode {
+                    OpCode::GuardTrue => {
+                        let cond = ctx.get_box_replacement(emitted.arg(0));
+                        ctx.make_constant(cond, majit_ir::Value::Int(1));
+                    }
+                    OpCode::GuardFalse => {
+                        let cond = ctx.get_box_replacement(emitted.arg(0));
+                        ctx.make_constant(cond, majit_ir::Value::Int(0));
+                    }
+                    _ => {}
+                }
+                pass.propagate_postprocess(emitted, &mut ctx);
             }
         }
 
