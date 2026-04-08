@@ -1336,9 +1336,19 @@ impl BlackholeInterpreter {
     /// RPython: `BlackholeInterpreter.run()` catches `LeaveFrame` and breaks,
     /// catches exceptions and calls `handle_exception_in_frame`.
     pub fn run(&mut self) {
-        // Publish virtualizable_ptr so extern "C" call helpers can access
-        // the parent frame without it being passed through the register file.
+        // blackhole.py parity: each BlackholeInterp has its own parent frame
+        // via its nextblackholeinterp chain. In pyre we expose the parent
+        // frame via BH_VABLE_PTR (thread-local) for extern "C" call helpers.
+        // Save/restore the previous value so nested blackhole runs (triggered
+        // by bhimpl_residual_call re-entering compiled code → another
+        // blackhole) do not corrupt the caller's parent pointer.
+        let saved_bh_vable = BH_VABLE_PTR.with(|c| c.get());
         BH_VABLE_PTR.with(|c| c.set(self.virtualizable_ptr));
+        self.run_inner();
+        BH_VABLE_PTR.with(|c| c.set(saved_bh_vable));
+    }
+
+    fn run_inner(&mut self) {
         let trace = crate::majit_log_enabled();
         loop {
             if self.finished() {
