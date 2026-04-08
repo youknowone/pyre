@@ -1613,6 +1613,7 @@ impl OptRewrite {
             // failargs AND rd_resume_position. Without rd_resume_position the
             // bridge optimizer's store_final_boxes_in_guard would skip this
             // guard and leave constants in fail_args (regalloc.py:1206).
+            // copy_and_change preserves `pos` automatically.
             if expected == 0 {
                 let new_op = op.copy_and_change(OpCode::GuardFalse, Some(&[arg0]), None);
                 return OptimizationResult::Replace(new_op);
