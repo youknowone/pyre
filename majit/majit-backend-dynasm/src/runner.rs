@@ -415,6 +415,10 @@ impl Backend for DynasmBackend {
         }
 
         if std::env::var_os("MAJIT_LOG").is_some() {
+            for (i, arg) in args.iter().enumerate() {
+                let raw = unsafe { *jf_ptr.add(1 + i) };
+                eprintln!("[dynasm]   arg[{}] = {:#018x} ({:?})", i, raw as u64, arg);
+            }
             eprintln!(
                 "[dynasm] execute_token: entry={:?} jf_ptr={:?} num_args={} num_slots={} code_len={}",
                 entry,
