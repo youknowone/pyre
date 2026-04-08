@@ -756,6 +756,7 @@ impl UnrollOptimizer {
             exported_short_inputargs,
             exported_short_boxes,
             exported_renamed_inputargs,
+            exported_renamed_inputarg_types,
         ) = {
             let es = opt_p2
                 .imported_loop_state
@@ -767,6 +768,7 @@ impl UnrollOptimizer {
                 es.short_inputargs.clone(),
                 es.exported_short_boxes.clone(),
                 es.renamed_inputargs.clone(),
+                es.renamed_inputarg_types.clone(),
             )
         };
         let mut initial_sp = opt_p2.imported_short_preamble.clone().unwrap_or_else(|| {

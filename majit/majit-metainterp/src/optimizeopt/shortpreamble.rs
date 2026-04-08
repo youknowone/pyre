@@ -595,6 +595,13 @@ impl ShortBoxes {
         // SameAsI default type-coerces Ref locals to Int, which surfaces
         // downstream as `exit_types[i] = Int` and makes
         // `materialize_virtual` box a raw pointer via `w_int_new`.
+        //
+        // Flat OpRef bookkeeping can occasionally leave `Type::Void` on a
+        // label arg position that conceptually carries a real Box. RPython
+        // would never construct a short-preamble inputarg for a void-typed
+        // Box; treat that case as an imprecise "some runtime value" and
+        // route it through the ref bank instead of panicking.
+        let arg_type = normalize_same_as_type(arg_type);
         let label_arg_idx = self.lookup_label_arg(arg);
         let mut same_as = Op::new(OpCode::same_as_for_type(arg_type), &[arg]);
         same_as.pos = arg;
@@ -715,6 +722,13 @@ impl ShortBoxes {
             None => pop,
         };
         self.add_op(result, next);
+    }
+}
+
+fn normalize_same_as_type(tp: majit_ir::Type) -> majit_ir::Type {
+    match tp {
+        majit_ir::Type::Void => majit_ir::Type::Ref,
+        other => other,
     }
 }
 

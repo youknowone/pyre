@@ -887,6 +887,14 @@ pub struct BlackholeInterpreter {
     /// Pointer to the VirtualizableInfo describing field offsets.
     /// Used by vable bytecodes to compute memory offsets.
     pub virtualizable_info: *const crate::virtualizable::VirtualizableInfo,
+    /// pyre-specific portal contract: absolute start index of the operand
+    /// stack in the virtualizable's unified locals+cells+stack array.
+    ///
+    /// blackhole.py passes reds explicitly into bh_call_r(...); pyre packs
+    /// the same state into `locals_cells_stack_w` before calling the portal
+    /// runner, so the blackhole needs the stack base to reconstruct the
+    /// frame layout correctly on recursive portal re-entry.
+    pub virtualizable_stack_base: usize,
     /// blackhole.py:1095 get_portal_runner(jdindex):
     ///   jitdriver_sd = self.builder.metainterp_sd.jitdrivers_sd[jdindex]
     ///   fnptr = adr2int(jitdriver_sd.portal_runner_adr)
@@ -938,6 +946,7 @@ impl BlackholeInterpreter {
             exception_last_value: 0,
             virtualizable_ptr: 0,
             virtualizable_info: std::ptr::null(),
+            virtualizable_stack_base: 0,
             portal_runner_ptr: None,
         }
     }
@@ -1018,21 +1027,82 @@ impl BlackholeInterpreter {
     pub fn bhimpl_recursive_call_r(&self, portal_runner: fn(i64) -> i64) -> i64 {
         // bh_call_r(fnptr, greens_i + reds_i, greens_r + reds_r, ..., calldescr)
         // pyre packs args into the virtualizable before the call.
-        if self.virtualizable_ptr != 0 && !self.virtualizable_info.is_null() {
-            let py_pc = self.jitcode.jit_pc_to_py_pc(self.last_opcode_position) as usize;
-            let frame_ptr = self.virtualizable_ptr as *mut u8;
-            let info = unsafe { &*self.virtualizable_info };
-            // green: next_instr
-            unsafe { info.write_field(frame_ptr, 0, py_pc as i64) };
-            // reds: locals → virtualizable array 0
-            let nlocals = self.jitcode.nlocals;
-            for i in 0..nlocals {
-                if i < self.registers_r.len() {
-                    unsafe { info.write_array_item(frame_ptr, 0, i, self.registers_r[i]) };
-                }
+        self.sync_virtualizable_for_recursive_portal();
+        portal_runner(self.virtualizable_ptr)
+    }
+
+    /// pyre portal recursion contract: materialize the live virtualizable
+    /// state in the heap frame before calling `portal_runner(frame_ptr)`.
+    ///
+    /// RPython's bh_call_r path forwards the current greens/reds directly as
+    /// call arguments. pyre stores the equivalent state in the unified
+    /// `locals_cells_stack_w` array and scalar virtualizable fields:
+    ///   - green: next_instr
+    ///   - red scalar: valuestackdepth
+    ///   - red array: locals + live value stack
+    ///
+    /// Without the stack and valuestackdepth write-back, recursive portal
+    /// re-entry observes a stale frame shape and can resume with the wrong
+    /// operand stack contents.
+    fn sync_virtualizable_for_recursive_portal(&self) {
+        const PYFRAME_NEXT_INSTR_FIELD_INDEX: usize = 0;
+        const PYFRAME_VALUESTACKDEPTH_FIELD_INDEX: usize = 2;
+        const PYFRAME_LOCALS_CELLS_STACK_ARRAY_INDEX: usize = 0;
+
+        if self.virtualizable_ptr == 0 || self.virtualizable_info.is_null() {
+            return;
+        }
+
+        let py_pc = self.jitcode.jit_pc_to_py_pc(self.last_opcode_position) as usize;
+        let frame_ptr = self.virtualizable_ptr as *mut u8;
+        let info = unsafe { &*self.virtualizable_info };
+        let nlocals = self.jitcode.nlocals;
+        let stack_depth = self.jitcode.depth_at_py_pc.get(py_pc).copied().unwrap_or(0) as usize;
+        let stack_base = self.virtualizable_stack_base.max(nlocals);
+
+        unsafe {
+            info.write_field(frame_ptr, PYFRAME_NEXT_INSTR_FIELD_INDEX, py_pc as i64);
+            info.write_field(
+                frame_ptr,
+                PYFRAME_VALUESTACKDEPTH_FIELD_INDEX,
+                (stack_base + stack_depth) as i64,
+            );
+        }
+
+        let array_len = info
+            .array_fields
+            .get(PYFRAME_LOCALS_CELLS_STACK_ARRAY_INDEX)
+            .map(|array| unsafe {
+                crate::virtualizable::vable_array_len(frame_ptr as *const u8, array)
+            })
+            .unwrap_or(0);
+
+        for i in 0..nlocals {
+            if i < self.registers_r.len() && i < array_len {
+                unsafe {
+                    info.write_array_item(
+                        frame_ptr,
+                        PYFRAME_LOCALS_CELLS_STACK_ARRAY_INDEX,
+                        i,
+                        self.registers_r[i],
+                    )
+                };
             }
         }
-        portal_runner(self.virtualizable_ptr)
+        for d in 0..stack_depth {
+            let reg_idx = nlocals + d;
+            let frame_idx = stack_base + d;
+            if reg_idx < self.registers_r.len() && frame_idx < array_len {
+                unsafe {
+                    info.write_array_item(
+                        frame_ptr,
+                        PYFRAME_LOCALS_CELLS_STACK_ARRAY_INDEX,
+                        frame_idx,
+                        self.registers_r[reg_idx],
+                    )
+                };
+            }
+        }
     }
 
     /// Set an integer register value.
@@ -2150,6 +2220,7 @@ impl BlackholeInterpBuilder {
         interp.reached_merge_point = false;
         interp.aborted = false;
         interp.got_exception = false;
+        interp.virtualizable_stack_base = 0;
         self.pool.push(interp);
     }
 
