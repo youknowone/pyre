@@ -2770,11 +2770,22 @@ fn resolve_opref(
         return builder.ins().iconst(cl_types::I64, 0);
     }
     // Safety net: verify this OpRef has a defined Cranelift variable
-    // (either an op result or a declared input arg) before calling use_var.
-    // RPython's regalloc tracks all Boxes; Cranelift only has def_var for
-    // emitted ops and input args. If the optimizer's forwarding chain left
-    // an unmaterialized OpRef in fail_args, return zero rather than reading
-    // an undefined variable.
+    // (either an op result or a declared input arg) before calling
+    // use_var. RPython's regalloc tracks all Boxes; Cranelift only
+    // has def_var for emitted ops and input args.
+    //
+    // Pyre's optimizer occasionally leaves an unmaterialized OpRef in
+    // a non-dereferencing op's arg or in fail_args; for those cases
+    // we fall back to `iconst(0)` (the pre-existing legacy behaviour
+    // — wrong but non-crashing). The crash-causing path —
+    // `GuardClass(undefined)` and friends, which would lower to
+    // `mov x0, #0; ldr x0, [x0]` and SIGSEGV — is rejected at the
+    // entry to `do_compile` by `validate_oprefs_for_compile`, which
+    // returns `BackendError::CompilationFailed` so the bridge falls
+    // back to the blackhole resume path. The two checks together
+    // recover the RPython invariant ("any Box used as a guard arg
+    // is bound") without breaking traces that pyre's optimizer
+    // currently emits with undefined non-dereferencing OpRefs.
     let is_op_result = OP_RESULT_VARS.with(|cell| {
         cell.borrow()
             .as_ref()
@@ -2900,6 +2911,138 @@ fn op_var_index(op: &Op, op_idx: usize, num_inputs: usize) -> usize {
     } else {
         op.pos.0 as usize
     }
+}
+
+/// rewrite.py:397-407 `optimize_GUARD_CLASS` parity:
+/// Pre-flight check that the OpRefs feeding pointer-dereferencing
+/// guard ops are bound to a defined value. RPython's box-identity
+/// scheme makes the equivalent of an "undefined OpRef" impossible —
+/// every Box used as a guard argument is tracked through regalloc.
+/// pyre uses OpRef indices instead of identity, and pyre's optimizer
+/// occasionally emits ops that reference OpRefs no preceding op
+/// produced. Cranelift's `use_var` on an undeclared variable then
+/// silently returns the lazy default value (zero) and the
+/// constant-folder turns it into `mov x0, #0; ldr x0, [x0]` (a null
+/// vtable read) which crashes at runtime.
+///
+/// This validator catches that pattern at compile time for the
+/// pointer-dereferencing opcodes — `Guard{Class,NonnullClass,Nonnull}`,
+/// `GetfieldGc{,Pure}{I,R,F}`, `GetarrayitemGc*` etc. — and returns
+/// `BackendError::CompilationFailed` so the caller falls back to the
+/// blackhole resume path. Non-dereferencing opcodes (`IntAddOvf` etc.)
+/// are deliberately left alone: they tolerate the legacy
+/// silent-iconst-zero fallback (the value is wrong but the call does
+/// not crash), and validating them would reject many bridges that
+/// pyre's existing optimizer happens to emit with undefined OpRef
+/// references. Pyre's optimizer should ultimately stop producing
+/// undefined OpRefs (RPython parity), but until that lands, the
+/// validator only protects the crash-causing paths.
+///
+/// `is_rewriter_immediate_arg` mirrors the GC-rewriter convention
+/// used by `resolve_rewriter_immediate_i64`: a handful of opcodes
+/// encode numeric immediates (allocation sizes, scale factors) by
+/// stuffing the raw value directly into the OpRef field instead of
+/// going via the constant pool. Those args are NOT real OpRef
+/// references and must be skipped by the validator.
+fn is_rewriter_immediate_arg(opcode: majit_ir::OpCode, arg_idx: usize) -> bool {
+    use majit_ir::OpCode;
+    match opcode {
+        // gc/rewrite.rs:560,590: CALL_MALLOC_NURSERY(size_immediate)
+        OpCode::CallMallocNursery => arg_idx == 0,
+        // ZeroArray(base, start_imm, size_imm, scale_start_imm, scale_size_imm)
+        OpCode::ZeroArray => arg_idx >= 1 && arg_idx <= 4,
+        // NurseryPtrIncrement(base, byte_offset_imm)
+        OpCode::NurseryPtrIncrement => arg_idx == 1,
+        _ => false,
+    }
+}
+
+/// True for opcodes that dereference their first arg as a pointer.
+/// An undefined OpRef in `arg(0)` of one of these ops becomes a null
+/// pointer dereference at runtime — the validator must reject these.
+fn op_dereferences_first_arg(opcode: majit_ir::OpCode) -> bool {
+    use majit_ir::OpCode;
+    matches!(
+        opcode,
+        // assembler.py:1880-1891 _cmp_guard_class: CMP(mem(loc_ptr, offset), classptr)
+        OpCode::GuardClass
+            | OpCode::GuardNonnullClass
+            | OpCode::GuardSubclass
+            | OpCode::GuardGcType
+            | OpCode::GuardIsObject
+            // GetfieldGc*: load from [loc_ptr + offset]
+            | OpCode::GetfieldGcI
+            | OpCode::GetfieldGcR
+            | OpCode::GetfieldGcF
+            | OpCode::GetfieldGcPureI
+            | OpCode::GetfieldGcPureR
+            | OpCode::GetfieldGcPureF
+            // SetfieldGc: store to [loc_ptr + offset]
+            | OpCode::SetfieldGc
+            // GetArrayItemGc / SetArrayItemGc: load/store from arrays
+            | OpCode::GetarrayitemGcI
+            | OpCode::GetarrayitemGcR
+            | OpCode::GetarrayitemGcF
+            | OpCode::GetarrayitemGcPureI
+            | OpCode::GetarrayitemGcPureR
+            | OpCode::GetarrayitemGcPureF
+            | OpCode::SetarrayitemGc
+    )
+}
+
+fn validate_oprefs_for_compile(
+    inputargs: &[InputArg],
+    ops: &[Op],
+    constants: &HashMap<u32, i64>,
+) -> Result<(), BackendError> {
+    let num_inputs = inputargs.len();
+    // RPython rewrite.py:397 + regalloc invariant: at the current op,
+    // every dereferenced argument MUST be currently live (bound by an
+    // earlier op result, an inputarg, a label arg seen at this PC, or
+    // a constant). Forward references — boxes that will only be
+    // defined later in the trace — are a structural bug, not a
+    // recoverable case. Walk the ops in trace order with a single
+    // `seen` set; do NOT pre-collect a `defined` set that lets
+    // forward-references slip through.
+    let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    for input in inputargs {
+        seen.insert(input.index);
+    }
+    for (op_idx, op) in ops.iter().enumerate() {
+        if op.opcode == majit_ir::OpCode::Label {
+            // LABEL params are introduced at the label block.
+            for &arg in &op.args {
+                if !arg.is_none() {
+                    seen.insert(arg.0);
+                }
+            }
+            // The label op result itself (if any) is bound after the
+            // label arg insertion below; fall through.
+        }
+        if op_dereferences_first_arg(op.opcode) {
+            let arg = op.arg(0);
+            let bound = arg.is_none()
+                || constants.contains_key(&arg.0)
+                || is_rewriter_immediate_arg(op.opcode, 0)
+                || seen.contains(&arg.0);
+            if !bound {
+                if std::env::var_os("MAJIT_LOG").is_some() {
+                    eprintln!(
+                        "[validate-oprefs] op[{}] {:?} dereferences undefined OpRef({}) — InvalidLoop",
+                        op_idx, op.opcode, arg.0
+                    );
+                }
+                return Err(BackendError::CompilationFailed(format!(
+                    "InvalidLoop: op[{}] {:?} dereferences undefined OpRef({})",
+                    op_idx, op.opcode, arg.0
+                )));
+            }
+        }
+        if op.result_type() != majit_ir::Type::Void {
+            seen.insert(op_var_index(op, op_idx, num_inputs) as u32);
+        }
+    }
+    Ok(())
 }
 
 fn unsupported_semantics(opcode: OpCode, detail: &str) -> BackendError {
@@ -5139,6 +5282,20 @@ impl CraneliftBackend {
     ) -> Result<CompiledLoop, BackendError> {
         let prepared_ops = self.prepare_ops_for_compile(inputargs, ops, &self.constants.clone());
         let ops = prepared_ops.as_slice();
+        // RPython parity: regalloc asserts that every Box used as an
+        // argument or in fail_args is bound to a register or stack
+        // location before code emission begins. The pyre/Cranelift
+        // pipeline uses OpRef indices instead of Box identity, so the
+        // equivalent invariant is "every referenced OpRef is either an
+        // op result, an inputarg, a label arg, or a constant".
+        // Violations indicate a structurally inconsistent trace
+        // (e.g. unmapped short-preamble arg, see `unroll.py:404
+        // _map_args`'s KeyError → InvalidLoop path) and must abort
+        // compilation with `CompilationFailed` so the caller falls
+        // back to the blackhole resume path. This pre-pass replaces
+        // the silent `iconst(0)` fallback that previously turned
+        // undefined OpRefs into runtime SIGSEGVs.
+        validate_oprefs_for_compile(inputargs, ops, &self.constants)?;
         let trace_id = self.next_trace_id.take().unwrap_or_else(|| {
             let trace_id = self.trace_counter;
             self.trace_counter += 1;
