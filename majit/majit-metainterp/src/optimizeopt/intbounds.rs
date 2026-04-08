@@ -802,12 +802,11 @@ impl OptIntBounds {
         // Check if the bound on the condition tells us it's always true
         let b = self.getintbound(cond_ref, ctx);
         if b.known_gt_const(0) {
-            // known nonzero, guard always passes
             return OptimizationResult::Remove;
         }
 
-        // After emitting, propagate bounds backward from the guard
-        // The condition is known to be true (nonzero) after this guard
+        // After emitting, propagate bounds backward from the guard.
+        // The condition is known to be true (nonzero) after this guard.
         self.propagate_bounds_from_guard_true(cond_ref, ctx);
         OptimizationResult::PassOn
     }
@@ -1913,12 +1912,18 @@ impl Optimization for OptIntBounds {
                 // propagate_bounds_backward does two things:
                 // 1. If bound is constant → make_constant_int (may invalidate loop)
                 // 2. Find producing op → dispatch_bounds_ops (narrow arg bounds)
+                // intbounds.py:40-50 propagate_bounds_backward:
+                //   b = self.getintbound(box)
+                //   if b.is_constant():
+                //       self.make_constant_int(box, b.get_constant_int())
+                //   box1 = self.optimizer.as_operation(box)
+                //   if box1 is not None:
+                //       dispatch_bounds_ops(self, box1)
                 //
-                // At postprocess time, (1) may conflict with earlier bounds.
-                // Only do (2): find the comparison that produced the guard's
-                // condition and narrow the comparison args' bounds. This is the
-                // critical path for IntAddOvf→IntAdd conversion.
-                let is_true = op.opcode == OpCode::GuardTrue;
+                // RPython calls propagate_bounds_backward(arg0) for ALL three
+                // guard types identically. The is_true/is_false direction is
+                // already encoded in the condition's IntBound (set during
+                // propagate_forward's optimize_guard_true/false/value).
                 let arg0 = ctx.get_box_replacement(op.arg(0));
                 let is_int = ctx
                     .opref_type(arg0)
@@ -1926,33 +1931,29 @@ impl Optimization for OptIntBounds {
                 if !is_int {
                     return;
                 }
-                // intbounds.py:48-50: as_operation(box) → dispatch_bounds_ops
-                // Use narrow_bounds_from_comparison instead of the full
-                // propagate_bounds_from_comparison to avoid cascading
-                // propagate_bounds_backward → make_constant_int → potential
-                // infinite re-optimization. The full propagation runs
-                // during propagate_forward; postprocess only narrows.
-                // intbounds.py:52-58 _postprocess_guard_true_false_value:
-                //     self.propagate_bounds_backward(op.getarg(0))
+                // intbounds.py:40-50 propagate_bounds_backward(arg0).
                 //
-                // propagate_bounds_backward:
-                //   1. If constant → make_constant_int
-                //   2. Find producing op → dispatch_bounds_ops (narrow args)
+                // RPython's postprocess calls propagate_bounds_backward which:
+                // 1. If constant → make_constant_int
+                // 2. Find producing op → dispatch_bounds_ops (narrow args)
                 //
-                // For now, only set the constant bound on the comparison
-                // result. The full propagate_bounds_backward (finding the
-                // producing comparison and narrowing its operands) will be
-                // enabled after the nbody hang root cause is identified.
-                if is_true {
-                    self.setintbound(
-                        arg0,
-                        crate::optimizeopt::intutils::IntBound::from_constant(1),
-                    );
-                } else {
-                    self.setintbound(
-                        arg0,
-                        crate::optimizeopt::intutils::IntBound::from_constant(0),
-                    );
+                // Currently: only step 2 for guards where the comparison op
+                // was postponed by the heap pass and not found during
+                // propagate_forward. This covers the critical case of
+                // heap-postponed comparisons (IntLt before GuardTrue).
+                //
+                // The full propagate_bounds_backward (with step 1) is
+                // deferred until the cascading make_constant_int issue
+                // that causes nbody hang is resolved.
+                // propagate_forward's optimize_guard_true/false already calls
+                // propagate_bounds_from_guard_true/false, which either:
+                // (a) finds the producing op and propagates immediately, or
+                // (b) defers to pending_guard_bounds (flushed on next op).
+                //
+                // Postprocess runs AFTER emission, when the heap-postponed
+                // comparison is in new_operations. Retry deferred propagation:
+                if self.pending_guard_bounds.is_some() {
+                    self.flush_pending_guard_bounds(ctx);
                 }
             }
             _ => {}
