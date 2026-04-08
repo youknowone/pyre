@@ -95,6 +95,8 @@ pub struct W_TypeObject {
     pub hasdict: bool,
     /// typeobject.py:181 `weakrefable` — True when instances support weakrefs.
     pub weakrefable: bool,
+    /// typedef.py:43 `acceptable_as_base_class = '__new__' in rawdict`.
+    pub acceptable_as_base_class: bool,
 }
 
 /// Leak a Layout to get a 'static pointer for sharing.
@@ -121,6 +123,7 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: *mut u8) -> PyObject
         layout: std::ptr::null(),
         hasdict: false,
         weakrefable: false,
+        acceptable_as_base_class: true,
     });
     Box::into_raw(obj) as PyObjectRef
 }
@@ -147,6 +150,7 @@ pub fn w_type_new_builtin(
         layout: std::ptr::null(),
         hasdict: false,
         weakrefable: false,
+        acceptable_as_base_class: true,
     });
     Box::into_raw(obj) as PyObjectRef
 }
@@ -269,6 +273,14 @@ pub unsafe fn is_type(obj: PyObjectRef) -> bool {
 #[inline]
 pub unsafe fn w_type_is_heaptype(obj: PyObjectRef) -> bool {
     (*(obj as *const W_TypeObject)).flag_heaptype
+}
+
+/// typedef.py:43 `acceptable_as_base_class` getter/setter.
+pub unsafe fn w_type_get_acceptable_as_base_class(obj: PyObjectRef) -> bool {
+    (*(obj as *const W_TypeObject)).acceptable_as_base_class
+}
+pub unsafe fn w_type_set_acceptable_as_base_class(obj: PyObjectRef, v: bool) {
+    (*(obj as *mut W_TypeObject)).acceptable_as_base_class = v;
 }
 
 // Backward-compat no-ops for removed direct field setters.
