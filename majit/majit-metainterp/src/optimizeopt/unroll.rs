@@ -2163,7 +2163,19 @@ impl OptUnroll {
             if let Some(sp) = target_token.short_preamble.clone() {
                 if let Some(mut builder) = target_token.short_preamble_producer.take() {
                     if let Some(label_args) = current_label_args {
-                        builder.setup(&sp, label_args);
+                        // shortpreamble.py:283-296 / 311-341 parity:
+                        // setup() returns false when an op references an
+                        // unresolvable Phase 1 OpRef. Treat this exactly
+                        // like RPython's "produce_arg returned None →
+                        // add_op_to_short returned None" path: drop the
+                        // peeled trace and let the unroll caller raise
+                        // InvalidLoop, falling back to jump_to_preamble.
+                        if !builder.setup(&sp, label_args) {
+                            target_token.short_preamble_producer = Some(builder);
+                            std::panic::panic_any(crate::optimize::InvalidLoop(
+                                "short preamble has unresolvable Phase 1 args",
+                            ));
+                        }
                         ctx.activate_short_preamble_producer(builder);
                         extra = Self::inline_short_preamble(
                             &short_jump_args,
