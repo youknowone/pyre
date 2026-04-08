@@ -2175,12 +2175,42 @@ impl JitState for PyreJitState {
         let Some(frame) = resume_data.frames.first() else {
             return;
         };
-        // resume.py:1042 parity: map frame locals to bridge InputArg OpRefs.
-        // RebuiltValue::Box(n) → bridge InputArg OpRef(n).
-        // RebuiltValue::Int(v)/Const(v,tp) → constant OpRef from resume_data.constants.
+        // resume.py:1042-1057 rebuild_from_resumedata + 1077
+        // consume_boxes parity:
         //
-        // The constants vec is populated in order: first vable/vref entries,
-        // then frame entries. We need the frame-local constant offset.
+        //   def consume_boxes(self, info, boxes_i, boxes_r, boxes_f):
+        //       self.boxes_i = boxes_i
+        //       self.boxes_r = boxes_r
+        //       self.boxes_f = boxes_f
+        //       self._prepare_next_section(info)
+        //
+        //   def _prepare_next_section(self, info):
+        //       enumerate_vars(info,
+        //               self.metainterp_sd.liveness_info,
+        //               self._callback_i,
+        //               self._callback_r,
+        //               self._callback_f,
+        //               self.unique_id)
+        //
+        //   def _callback_r(self, register_index):
+        //       value = self.next_ref()
+        //       self.write_a_ref(register_index, value)
+        //
+        // Each compact entry from `frame.values` is keyed by REGISTER
+        // INDEX (from the liveness table at the resume PC), not by
+        // its linear position. Pyre's encoder
+        // (`get_list_of_active_boxes`) iterates `live_i_regs`,
+        // `live_r_regs`, `live_f_regs` at the resume PC; the decoder
+        // here mirrors that order to compute the corresponding
+        // register index for each compact value, and writes the
+        // resolved OpRef into `bridge_local_oprefs[register_index]`.
+        //
+        // Without this unpacking, `setup_bridge_sym` would dump
+        // `frame.values` linearly into `bridge_local_oprefs`, leaving
+        // any unfilled tail as `OpRef::NONE` and shifting the
+        // remaining values to the wrong local indices — causing
+        // "TypeError: binary op on null operand" / "comparison on
+        // null operand" downstream.
         let vable_vref_const_count = resume_data
             .virtualizable_values
             .iter()
@@ -2189,27 +2219,77 @@ impl JitState for PyreJitState {
             .count();
         let mut frame_const_cursor = vable_vref_const_count;
 
-        let local_oprefs: Vec<OpRef> = frame
-            .values
-            .iter()
-            .map(|v| match v {
+        let resolve = |v: &RebuiltValue, cursor: &mut usize| -> OpRef {
+            match v {
                 RebuiltValue::Box(n) => OpRef(*n as u32),
                 RebuiltValue::Int(_) | RebuiltValue::Const(..) => {
-                    // This constant was injected at position frame_const_cursor.
-                    let opref = majit_ir::OpRef::from_const(frame_const_cursor as u32);
-                    frame_const_cursor += 1;
+                    let opref = majit_ir::OpRef::from_const(*cursor as u32);
+                    *cursor += 1;
                     opref
                 }
                 _ => OpRef::NONE,
-            })
-            .collect();
+            }
+        };
+
+        // Look up liveness for this frame's resume PC. The encoder
+        // walks live_i_regs + live_r_regs + live_f_regs in that
+        // order, so the decoder follows the same iteration to
+        // produce a register-indexed `bridge_local_oprefs`.
+        let liveness = METAINTERP_SD.with(|r| {
+            let sd = r.borrow();
+            let idx = frame.jitcode_index as usize;
+            let jc = sd.jitcodes.get(idx)?;
+            if jc.majit_jitcode.is_null() {
+                return None;
+            }
+            let mjc = unsafe { &*jc.majit_jitcode };
+            let pc = frame.pc as usize;
+            let jit_pc = mjc.py_to_jit_pc.get(pc).copied()?;
+            mjc.liveness
+                .iter()
+                .find(|info| info.pc as usize == jit_pc)
+                .cloned()
+        });
+
+        let nlocals = sym.nlocals;
+        let mut bridge_locals = vec![OpRef::NONE; nlocals];
+        if let Some(info) = liveness {
+            let mut value_iter = frame.values.iter();
+            // Encoder order: live_i_regs, live_r_regs, live_f_regs.
+            for &reg_idx in info
+                .live_i_regs
+                .iter()
+                .chain(info.live_r_regs.iter())
+                .chain(info.live_f_regs.iter())
+            {
+                let Some(v) = value_iter.next() else { break };
+                let resolved = resolve(v, &mut frame_const_cursor);
+                let idx = reg_idx as usize;
+                if idx < nlocals {
+                    bridge_locals[idx] = resolved;
+                }
+                // Stack-region register indices (idx >= nlocals) are
+                // ignored here — bridge_local_oprefs covers locals
+                // only. The stack is rebuilt from `vable_values`
+                // (covered separately below).
+            }
+        } else {
+            // No liveness info: fall back to the linear mapping.
+            // Same as the pre-unpacking behaviour.
+            for (i, v) in frame.values.iter().enumerate() {
+                if i >= nlocals {
+                    break;
+                }
+                bridge_locals[i] = resolve(v, &mut frame_const_cursor);
+            }
+        }
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
-                "[jit][bridge-sym] frame.values={:?} → local_oprefs={:?}",
-                frame.values, local_oprefs,
+                "[jit][bridge-sym] frame.values={:?} → bridge_locals={:?}",
+                frame.values, bridge_locals,
             );
         }
-        sym.bridge_local_oprefs = Some(local_oprefs);
+        sym.bridge_local_oprefs = Some(bridge_locals);
 
         // pyjitpl.py:3281-3288 parity: bridge vable scalar fields must
         // reflect the bridge's InputArg layout, NOT the loop trace's layout.
