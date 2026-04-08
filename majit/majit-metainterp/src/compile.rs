@@ -712,41 +712,6 @@ pub(crate) fn build_guard_metadata(
     (result, guard_op_indices, exit_layouts)
 }
 
-pub(crate) fn retag_fail_descrs_from_trace_types(inputargs: &[InputArg], ops: &mut [majit_ir::Op]) {
-    let (value_types, _) = build_trace_value_maps(inputargs, ops);
-    // Build constant_types from ops: constant OpRefs that produce Ref type.
-    let constant_types: HashMap<u32, Type> = ops
-        .iter()
-        .filter(|op| op.pos.is_constant() && op.result_type() != Type::Void)
-        .map(|op| (op.pos.0, op.result_type()))
-        .collect();
-    let mut next_fail_index = 0u32;
-    for op in ops.iter_mut() {
-        let is_exit = op.opcode.is_guard() || op.opcode == OpCode::Finish;
-        if !is_exit {
-            continue;
-        }
-        let types: Vec<Type> = if op.opcode == OpCode::Finish {
-            op.args
-                .iter()
-                .map(|opref| value_types.get(&opref.0).copied().unwrap_or(Type::Int))
-                .collect()
-        } else if let Some(ref fail_args) = op.fail_args {
-            fail_args
-                .iter()
-                .map(|opref| fail_arg_type(opref, &value_types, &constant_types))
-                .collect()
-        } else {
-            inputargs.iter().map(|arg| arg.tp).collect()
-        };
-        op.descr = Some(crate::fail_descr::make_fail_descr_typed_with_index(
-            next_fail_index,
-            types,
-        ));
-        next_fail_index += 1;
-    }
-}
-
 pub(crate) fn merge_backend_exit_layouts(
     exit_layouts: &mut HashMap<u32, StoredExitLayout>,
     backend_layouts: &[FailDescrLayout],
@@ -1750,44 +1715,6 @@ mod tests {
     use crate::fail_descr::make_fail_descr_with_index;
     use crate::resume::{ResumeDataLoopMemo, SimpleBoxEnv, Snapshot, SnapshotFrame};
     use majit_ir::{Op, OpCode, OpRef};
-
-    #[test]
-    fn test_retag_fail_descrs_from_trace_types_rebuilds_dense_exit_numbering() {
-        let inputargs = vec![InputArg::new_ref(0), InputArg::new_int(1)];
-
-        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef(1)]);
-        guard.descr = Some(make_fail_descr_with_index(42, 2));
-        guard.fail_args = Some(smallvec::smallvec![OpRef(0), OpRef(1)]);
-
-        let mut finish = Op::new(OpCode::Finish, &[OpRef(0), OpRef(1)]);
-        finish.descr = Some(make_fail_descr_with_index(77, 2));
-
-        let mut ops = vec![Op::new(OpCode::Label, &[OpRef(0), OpRef(1)]), guard, finish];
-        retag_fail_descrs_from_trace_types(&inputargs, &mut ops);
-
-        assert_eq!(find_fail_index_for_exit_op(&ops, 1), Some(0));
-        assert_eq!(find_fail_index_for_exit_op(&ops, 2), Some(1));
-        assert_eq!(
-            ops[1]
-                .descr
-                .as_ref()
-                .unwrap()
-                .as_fail_descr()
-                .unwrap()
-                .fail_arg_types(),
-            &[Type::Ref, Type::Int]
-        );
-        assert_eq!(
-            ops[2]
-                .descr
-                .as_ref()
-                .unwrap()
-                .as_fail_descr()
-                .unwrap()
-                .fail_arg_types(),
-            &[Type::Ref, Type::Int]
-        );
-    }
 
     #[test]
     fn test_build_guard_metadata_keeps_vable_array_out_of_frame_slots() {
