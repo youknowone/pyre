@@ -2986,6 +2986,14 @@ pub fn setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult {
             }
         }
     }
+    // __class__ assignment: update w_class field directly.
+    // RPython: __class__ assignment changes ob_type (typeptr).
+    // pyre: changes w_class on the PyObject header.
+    if name == "__class__" {
+        unsafe {
+            (*obj).w_class = value;
+        }
+    }
     // Store in instance dict (ATTR_TABLE)
     ATTR_TABLE.with(|table| {
         let mut table = table.borrow_mut();

@@ -39,6 +39,7 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: *mut u8) -> PyObject
     let obj = Box::new(W_TypeObject {
         ob_header: PyObject {
             ob_type: &TYPE_TYPE as *const PyType,
+            w_class: std::ptr::null_mut(),
         },
         mro_w: std::ptr::null_mut(), // set after construction via set_mro
         name: Box::into_raw(Box::new(name.to_string())),

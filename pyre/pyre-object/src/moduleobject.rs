@@ -32,6 +32,7 @@ pub fn w_module_new(name: &str, dict_ptr: *mut u8) -> PyObjectRef {
     let obj = Box::new(W_ModuleObject {
         ob_header: PyObject {
             ob_type: &MODULE_TYPE as *const PyType,
+            w_class: std::ptr::null_mut(),
         },
         name: Box::into_raw(Box::new(name.to_string())),
         dict: dict_ptr,

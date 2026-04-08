@@ -36,6 +36,7 @@ static SMALL_INTS: LazyLock<Vec<W_IntObject>> = LazyLock::new(|| {
         .map(|v| W_IntObject {
             ob_header: PyObject {
                 ob_type: &INT_TYPE as *const PyType,
+                w_class: std::ptr::null_mut(),
             },
             intval: v,
         })
@@ -55,6 +56,7 @@ pub fn w_int_new(value: i64) -> PyObjectRef {
         let obj = Box::new(W_IntObject {
             ob_header: PyObject {
                 ob_type: &INT_TYPE as *const PyType,
+                w_class: std::ptr::null_mut(),
             },
             intval: value,
         });
@@ -70,6 +72,7 @@ pub fn w_int_new_unique(value: i64) -> PyObjectRef {
     let obj = Box::new(W_IntObject {
         ob_header: PyObject {
             ob_type: &INT_TYPE as *const PyType,
+            w_class: std::ptr::null_mut(),
         },
         intval: value,
     });
@@ -129,7 +132,7 @@ mod tests {
 
     #[test]
     fn test_int_field_offset() {
-        assert_eq!(INT_INTVAL_OFFSET, 8); // after *const PyType (8 bytes on 64-bit)
+        assert_eq!(INT_INTVAL_OFFSET, 16); // after *const PyType (8 bytes on 64-bit)
     }
 
     #[test]

@@ -38,6 +38,7 @@ pub fn w_range_iter_new(start: i64, stop: i64, step: i64) -> PyObjectRef {
     let obj = Box::new(W_RangeIterator {
         ob: PyObject {
             ob_type: &RANGE_ITER_TYPE as *const PyType,
+            w_class: std::ptr::null_mut(),
         },
         current: start,
         stop,
@@ -176,9 +177,9 @@ mod tests {
 
     #[test]
     fn test_range_iter_field_offsets() {
-        assert_eq!(RANGE_ITER_CURRENT_OFFSET, 8);
-        assert_eq!(RANGE_ITER_STOP_OFFSET, 16);
-        assert_eq!(RANGE_ITER_STEP_OFFSET, 24);
+        assert_eq!(RANGE_ITER_CURRENT_OFFSET, 16);
+        assert_eq!(RANGE_ITER_STOP_OFFSET, 24);
+        assert_eq!(RANGE_ITER_STEP_OFFSET, 32);
     }
 }
 
@@ -200,6 +201,7 @@ pub fn w_seq_iter_new(seq: PyObjectRef, length: usize) -> PyObjectRef {
     let obj = Box::new(W_SeqIterator {
         ob: PyObject {
             ob_type: &SEQ_ITER_TYPE as *const PyType,
+            w_class: std::ptr::null_mut(),
         },
         seq,
         index: 0,

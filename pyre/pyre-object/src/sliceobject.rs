@@ -16,6 +16,7 @@ pub fn w_slice_new(start: PyObjectRef, stop: PyObjectRef, step: PyObjectRef) -> 
     let obj = Box::new(W_SliceObject {
         ob_header: PyObject {
             ob_type: &SLICE_TYPE as *const PyType,
+            w_class: std::ptr::null_mut(),
         },
         start,
         stop,

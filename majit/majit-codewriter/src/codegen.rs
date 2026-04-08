@@ -1540,27 +1540,15 @@ pub fn generated_direct_abs_value(
     None
 }
 
-/// Trace type() for known object: guard_class → const_ptr(type_object).
+/// Trace type(obj): guard_class + getfield(w_class) + GUARD_VALUE → const type.
 ///
-/// RPython parity: pypy/objspace/std/objspace.py:400
+/// RPython parity: objspace.py:400-402
 ///   def type(self, w_obj):
 ///       jit.promote(w_obj.__class__)
 ///       return w_obj.getclass(self)
 ///
-/// RPython objspace.py:400: jit.promote(w_obj.__class__) evaluates
-/// __class__ (via getfield chain in mapdict) then GUARD_VALUE on the CLASS.
-///
-/// pyre's ob_type is NOT unique per Python class (INSTANCE_TYPE is
-/// shared by all user instances, TYPE_TYPE by all type objects).
-/// Guard strategy matching RPython's promote(__class__):
-///   - builtin: guard_class(ob_type) — ob_type IS unique for builtins
-///   - instance (no override): guard_class(INSTANCE_TYPE) + getfield(w_type) + guard_value
-///   - instance (__class__ override): guard_class(INSTANCE_TYPE)
-///     + CallLoopinvariantR(jit_read_class) + guard_value on CLASS
-///   - type (custom metaclass): guard_class(TYPE_TYPE)
-///     + CallLoopinvariantR(jit_read_class) + guard_value on METACLASS
-///   - builtin (__class__ override): guard_class(ob_type)
-///     + CallLoopinvariantR(jit_read_class) + guard_value on CLASS
+/// With w_class on PyObject, all object types use the same pattern:
+///   guard_class(ob_type) + getfield_gc_r(obj, w_class) + GUARD_VALUE(w_class)
 ///
 /// Returns None if not handled → caller falls back to residual call.
 #[inline]
@@ -1577,101 +1565,32 @@ pub fn generated_direct_type_value(
     let concrete_type_obj = pyre_interpreter::typedef::r#type(concrete_value)?;
 
     unsafe {
-        if pyre_object::is_instance(concrete_value) {
-            // User instance: ob_type is shared INSTANCE_TYPE.
-            // Check if __class__ override exists (e.g. obj.__class__ = Other).
-            let w_type = pyre_object::w_instance_get_type(concrete_value);
-            if std::ptr::eq(w_type, concrete_type_obj) {
-                // No __class__ override: read .w_type field + guard_value.
-                // RPython: jit.promote(w_obj.__class__)
-                frame.guard_class(
-                    ctx,
-                    value,
-                    &pyre_object::pyobject::INSTANCE_TYPE as *const _ as *const pyre_object::PyType,
-                );
-                let w_type_descr = crate::descr::instance_w_type_descr();
-                let w_type_opref = ctx.record_op_with_descr(
-                    majit_ir::OpCode::GetfieldGcR,
-                    &[value],
-                    w_type_descr,
-                );
-                frame.implement_guard_value(ctx, w_type_opref, concrete_type_obj as i64);
-            } else {
-                // __class__ override: .w_type differs from typedef::type().
-                // RPython: jit.promote(w_obj.__class__) = getfield(ob_type) + GUARD_VALUE.
-                // pyre: ATTR_TABLE is not getfield-accessible; use
-                // elidable call (closest to getfield semantics) + GUARD_VALUE.
-                frame.guard_class(
-                    ctx,
-                    value,
-                    &pyre_object::pyobject::INSTANCE_TYPE as *const _ as *const pyre_object::PyType,
-                );
-                let class_opref = ctx.call_elidable_ref_typed(
-                    crate::state::jit_read_class as *const (),
-                    &[value],
-                    &[majit_ir::Type::Ref],
-                );
-                frame.implement_guard_value(ctx, class_opref, concrete_type_obj as i64);
-            }
-            return Some(ctx.const_ref(concrete_type_obj as i64));
-        }
-
-        if pyre_object::typeobject::is_type(concrete_value) {
-            // RPython objspace.py:401: jit.promote(w_obj.__class__)
-            // For type objects, __class__ is the metaclass.
-            // guard_class(TYPE_TYPE) + promote metaclass via CallLoopinvariantR.
-            frame.guard_class(
-                ctx,
-                value,
-                &pyre_object::pyobject::TYPE_TYPE as *const _ as *const pyre_object::PyType,
-            );
-            let default_metaclass = pyre_interpreter::typedef::gettypefor(
-                &pyre_object::pyobject::TYPE_TYPE as *const _ as *const pyre_object::PyType,
-            );
-            let has_custom_metaclass = default_metaclass
-                .map_or(true, |dm| !std::ptr::eq(dm, concrete_type_obj));
-            if has_custom_metaclass {
-                // Custom metaclass: elidable read + GUARD_VALUE on the CLASS.
-                // RPython: getfield(metaclass) + promote. pyre: elidable call.
-                let class_opref = ctx.call_elidable_ref_typed(
-                    crate::state::jit_read_class as *const (),
-                    &[value],
-                    &[majit_ir::Type::Ref],
-                );
-                frame.implement_guard_value(ctx, class_opref, concrete_type_obj as i64);
-            }
-            // Default metaclass (type): guard_class(TYPE_TYPE) is sufficient.
-            return Some(ctx.const_ref(concrete_type_obj as i64));
-        }
-
-        // Builtin types: ob_type IS normally unique per Python class.
-        // __class__ override via ATTR_TABLE (e.g. int subclass) can differ.
+        // guard_class(ob_type) — guards the dispatch-level type tag.
         let concrete_obj_type = (*concrete_value).ob_type;
-        let default_type = pyre_interpreter::typedef::gettypefor(concrete_obj_type);
-        if default_type.map_or(true, |dt| !std::ptr::eq(dt, concrete_type_obj)) {
-            // __class__ override: guard_class(ob_type) + elidable read + GUARD_VALUE.
-            // RPython: getfield(ob_type) + promote. pyre: elidable call.
-            frame.guard_class(ctx, value, concrete_obj_type);
-            let class_opref = ctx.call_elidable_ref_typed(
-                crate::state::jit_read_class as *const (),
-                &[value],
-                &[majit_ir::Type::Ref],
-            );
-            frame.implement_guard_value(ctx, class_opref, concrete_type_obj as i64);
-        } else {
-            frame.guard_class(ctx, value, concrete_obj_type);
-        }
+        frame.guard_class(ctx, value, concrete_obj_type);
+
+        // getfield_gc_r(obj, w_class_descr) — read the Python class.
+        // RPython: getfield_gc_r(obj, typeptr_descr)
+        let w_class_descr = crate::descr::w_class_descr();
+        let w_class_opref = ctx.record_op_with_descr(
+            majit_ir::OpCode::GetfieldGcR,
+            &[value],
+            w_class_descr,
+        );
+
+        // GUARD_VALUE(w_class, concrete_type) — promote to constant.
+        // RPython: jit.promote(w_obj.__class__) → ref_guard_value
+        frame.implement_guard_value(ctx, w_class_opref, concrete_type_obj as i64);
+
         Some(ctx.const_ref(concrete_type_obj as i64))
     }
 }
 
-/// Trace isinstance(obj, cls): guard obj class + implement_guard_value(cls) → const bool.
+/// Trace isinstance(obj, cls): guard_class + getfield(w_class) + GUARD_VALUE → const bool.
 ///
 /// RPython parity: isinstance uses space.type(w_obj) internally, which
-/// calls jit.promote(w_obj.__class__). Same guard strategy as type():
-///   - builtin: guard_class (ob_type is unique)
-///   - instance: guard_class(INSTANCE_TYPE) + getfield(w_type) + guard_value
-///   - __class__ override: guard_class + elidable read + guard_value
+/// calls jit.promote(w_obj.__class__). Same unified pattern as type():
+///   guard_class(ob_type) + getfield_gc_r(obj, w_class) + GUARD_VALUE
 /// cls is always promoted via implement_guard_value.
 ///
 /// Returns None if not handled → caller falls back to residual call.
@@ -1691,85 +1610,24 @@ pub fn generated_direct_isinstance_value(
     let concrete_result = pyre_interpreter::builtins::call_isinstance(concrete_obj, concrete_cls)?;
 
     unsafe {
-        if pyre_object::is_instance(concrete_obj) {
-            let w_type = pyre_object::w_instance_get_type(concrete_obj);
-            let actual_type = pyre_interpreter::typedef::r#type(concrete_obj);
-            frame.guard_class(
-                ctx,
-                obj,
-                &pyre_object::pyobject::INSTANCE_TYPE as *const _ as *const pyre_object::PyType,
+        let concrete_type_obj = pyre_interpreter::typedef::r#type(concrete_obj);
+
+        // guard_class(ob_type)
+        let concrete_obj_type = (*concrete_obj).ob_type;
+        frame.guard_class(ctx, obj, concrete_obj_type);
+
+        // getfield_gc_r(obj, w_class) + GUARD_VALUE — promote w_class
+        if let Some(type_obj) = concrete_type_obj {
+            let w_class_descr = crate::descr::w_class_descr();
+            let w_class_opref = ctx.record_op_with_descr(
+                majit_ir::OpCode::GetfieldGcR,
+                &[obj],
+                w_class_descr,
             );
-            if actual_type.map_or(true, |at| std::ptr::eq(at, w_type)) {
-                // No __class__ override: getfield(w_type) + guard_value.
-                let w_type_descr = crate::descr::instance_w_type_descr();
-                let w_type_opref = ctx.record_op_with_descr(
-                    majit_ir::OpCode::GetfieldGcR,
-                    &[obj],
-                    w_type_descr,
-                );
-                frame.implement_guard_value(ctx, w_type_opref, w_type as i64);
-            } else {
-                // __class__ override: elidable read + GUARD_VALUE on CLASS.
-                let class_opref = ctx.call_elidable_ref_typed(
-                    crate::state::jit_read_class as *const (),
-                    &[obj],
-                    &[majit_ir::Type::Ref],
-                );
-                frame.implement_guard_value(
-                    ctx,
-                    class_opref,
-                    actual_type.unwrap() as i64,
-                );
-            }
-        } else if pyre_object::typeobject::is_type(concrete_obj) {
-            frame.guard_class(
-                ctx,
-                obj,
-                &pyre_object::pyobject::TYPE_TYPE as *const _ as *const pyre_object::PyType,
-            );
-            let default_metaclass = pyre_interpreter::typedef::gettypefor(
-                &pyre_object::pyobject::TYPE_TYPE as *const _ as *const pyre_object::PyType,
-            );
-            let actual_type = pyre_interpreter::typedef::r#type(concrete_obj);
-            let has_custom_metaclass = actual_type.map_or(true, |at| {
-                default_metaclass.map_or(true, |dm| !std::ptr::eq(dm, at))
-            });
-            if has_custom_metaclass {
-                // Custom metaclass: elidable read + GUARD_VALUE on CLASS.
-                let class_opref = ctx.call_elidable_ref_typed(
-                    crate::state::jit_read_class as *const (),
-                    &[obj],
-                    &[majit_ir::Type::Ref],
-                );
-                frame.implement_guard_value(
-                    ctx,
-                    class_opref,
-                    actual_type.unwrap() as i64,
-                );
-            }
-        } else {
-            let concrete_obj_type = (*concrete_obj).ob_type;
-            let default_type = pyre_interpreter::typedef::gettypefor(concrete_obj_type);
-            let actual_type = pyre_interpreter::typedef::r#type(concrete_obj);
-            let has_class_override = actual_type.map_or(false, |at| {
-                default_type.map_or(true, |dt| !std::ptr::eq(dt, at))
-            });
-            frame.guard_class(ctx, obj, concrete_obj_type);
-            if has_class_override {
-                // __class__ override: elidable read + GUARD_VALUE on CLASS.
-                let class_opref = ctx.call_elidable_ref_typed(
-                    crate::state::jit_read_class as *const (),
-                    &[obj],
-                    &[majit_ir::Type::Ref],
-                );
-                frame.implement_guard_value(
-                    ctx,
-                    class_opref,
-                    actual_type.unwrap() as i64,
-                );
-            }
+            frame.implement_guard_value(ctx, w_class_opref, type_obj as i64);
         }
 
+        // promote cls argument
         frame.implement_guard_value(ctx, cls, concrete_cls as i64);
         Some(ctx.const_ref(pyre_object::w_bool_from(concrete_result) as i64))
     }

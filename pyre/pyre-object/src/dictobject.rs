@@ -35,6 +35,7 @@ pub fn w_dict_new() -> PyObjectRef {
     let obj = Box::new(W_DictObject {
         ob_header: PyObject {
             ob_type: &DICT_TYPE as *const PyType,
+            w_class: std::ptr::null_mut(),
         },
         entries: Box::into_raw(Box::new(Vec::new())),
         len: 0,
@@ -49,6 +50,7 @@ pub fn w_dict_new_with_namespace(ns: *mut u8) -> PyObjectRef {
     let obj = Box::new(W_DictObject {
         ob_header: PyObject {
             ob_type: &DICT_TYPE as *const PyType,
+            w_class: std::ptr::null_mut(),
         },
         entries: Box::into_raw(Box::new(Vec::new())),
         len: 0,

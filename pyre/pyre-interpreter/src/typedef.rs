@@ -179,61 +179,26 @@ pub fn gettypefor(tp: *const PyType) -> Option<PyObjectRef> {
 
 /// Get the W_TypeObject for any PyObjectRef.
 ///
-/// PyPy: `space.type(w_obj)` → `w_obj.getclass(space)`
-/// - Instance of user class → w_instance_get_type
-/// - Builtin object with __class__ override → ATTR_TABLE["__class__"]
-/// - Builtin object → type registry lookup
-/// - Type object → metaclass or type(type)
+/// RPython: `space.type(w_obj)` → `jit.promote(w_obj.__class__); w_obj.getclass(space)`
+///
+/// With `w_class` on PyObject, this is a direct field read. Falls back to
+/// `gettypefor(ob_type)` for objects created before init_typeobjects()
+/// (where w_class is null).
 pub fn r#type(obj: PyObjectRef) -> Option<PyObjectRef> {
     if obj.is_null() {
         return None;
     }
     unsafe {
-        if is_instance(obj) {
-            // Check for __class__ override in ATTR_TABLE first.
-            // Python allows obj.__class__ = OtherClass for compatible layouts.
-            // PyPy: w_obj.getclass(space) respects __class__ descriptor.
-            let class_override = crate::baseobjspace::ATTR_TABLE.with(|table| {
-                table
-                    .borrow()
-                    .get(&(obj as usize))
-                    .and_then(|d| d.get("__class__").copied())
-            });
-            if let Some(cls) = class_override {
-                return Some(cls);
-            }
-            return Some(w_instance_get_type(obj));
+        let w_class = (*obj).w_class;
+        if !w_class.is_null() {
+            return Some(w_class);
         }
-        if is_type(obj) {
-            // Check for custom metaclass in ATTR_TABLE
-            let mc = crate::baseobjspace::ATTR_TABLE.with(|table| {
-                table
-                    .borrow()
-                    .get(&(obj as usize))
-                    .and_then(|d| d.get("__metaclass__").copied())
-            });
-            if let Some(metaclass) = mc {
-                return Some(metaclass);
-            }
-            // Default: type of type is type
-            return gettypefor(&pyre_object::pyobject::TYPE_TYPE);
-        }
-        // Check for __class__ override in ATTR_TABLE (e.g. int subclass
-        // created via int.__new__(MyIntSubclass, value) sets
-        // ATTR_TABLE[obj]["__class__"] = MyIntSubclass).
-        // This matches PyPy's w_obj.getclass(space) which returns
-        // the real Python class, including __class__ overrides.
-        let class_override = crate::baseobjspace::ATTR_TABLE.with(|table| {
-            table
-                .borrow()
-                .get(&(obj as usize))
-                .and_then(|d| d.get("__class__").copied())
-        });
-        if let Some(cls) = class_override {
-            return Some(cls);
-        }
+        // Fallback for objects created before init_typeobjects (singletons etc.)
+        // Populate w_class lazily so future reads hit the fast path.
         let tp = (*obj).ob_type;
-        gettypefor(tp)
+        let cls = gettypefor(tp)?;
+        (*obj).w_class = cls;
+        Some(cls)
     }
 }
 
@@ -468,15 +433,15 @@ fn int_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if int_typeobj.map_or(false, |t| std::ptr::eq(cls, t)) {
         return Ok(value);
     }
-    // cls is a subclass of int — create a W_IntObject with cls's type.
-    // Register the type as an int subclass so is_int() recognizes it.
     // cls is a subclass of int. Create a unique W_IntObject (bypassing
-    // the small-int cache so each instance has its own identity for
-    // ATTR_TABLE). Tag with __class__ = cls so type()/isinstance()
-    // see the subclass while preserving W_IntObject layout for arithmetic.
+    // the small-int cache so each instance has its own identity).
+    // Set w_class = cls so type()/isinstance() see the subclass while
+    // preserving W_IntObject layout for arithmetic.
     let int_val = unsafe { pyre_object::w_int_get_value(value) };
     let obj = pyre_object::w_int_new_unique(int_val);
-    let _ = crate::baseobjspace::setattr(obj, "__class__", cls);
+    unsafe {
+        (*obj).w_class = cls;
+    }
     Ok(obj)
 }
 
