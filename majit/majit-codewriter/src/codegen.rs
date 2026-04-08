@@ -1596,11 +1596,43 @@ pub fn generated_direct_type_value(
         }
 
         if pyre_object::typeobject::is_type(concrete_value) {
-            // Type object: ob_type is shared TYPE_TYPE.
-            // Different type objects (with different metaclasses) share TYPE_TYPE.
-            // Promote the type object itself to fix its identity.
-            frame.implement_guard_value(ctx, value, concrete_value as i64);
-            return Some(ctx.const_ref(concrete_type_obj as i64));
+            // RPython objspace.py:401: jit.promote(w_obj.__class__)
+            // For type objects, __class__ is the metaclass.
+            // RPython promotes the metaclass, not the type object itself.
+            // pyre's ob_type is shared TYPE_TYPE, so guard_class(TYPE_TYPE)
+            // is not enough. We guard_class(TYPE_TYPE) then read the
+            // metaclass via typedef::type() and promote it.
+            frame.guard_class(
+                ctx,
+                value,
+                &pyre_object::pyobject::TYPE_TYPE as *const _ as *const pyre_object::PyType,
+            );
+            // Read metaclass and promote it.
+            // concrete_type_obj IS the metaclass (typedef::type on a type
+            // object returns its metaclass).
+            // For most type objects metaclass == type, but custom metaclasses
+            // can differ. Promoting metaclass matches RPython's promote(__class__).
+            let metaclass_const = ctx.const_ref(concrete_type_obj as i64);
+            // We need an OpRef for the metaclass in the trace.
+            // Since pyre stores metaclass in ATTR_TABLE (not a struct field),
+            // we can't emit getfield. Instead, use a residual call to
+            // typedef::type() and promote the result.
+            // For simplicity, use GUARD_VALUE on the type object when
+            // the metaclass is non-default (custom metaclass).
+            let default_metaclass = pyre_interpreter::typedef::gettypefor(
+                &pyre_object::pyobject::TYPE_TYPE as *const _ as *const pyre_object::PyType,
+            );
+            let has_custom_metaclass = default_metaclass
+                .map_or(true, |dm| !std::ptr::eq(dm, concrete_type_obj));
+            if has_custom_metaclass {
+                // Custom metaclass: must fix type object identity
+                // (can't read metaclass from struct field in trace).
+                frame.implement_guard_value(ctx, value, concrete_value as i64);
+            }
+            // If default metaclass (type), guard_class(TYPE_TYPE) is enough
+            // since all type objects with default metaclass return the same
+            // metaclass from typedef::type().
+            return Some(metaclass_const);
         }
 
         // Builtin types (int, float, str, list, ...): ob_type IS normally unique.
@@ -1663,8 +1695,22 @@ pub fn generated_direct_isinstance_value(
             let concrete_type = pyre_object::w_instance_get_type(concrete_obj);
             frame.implement_guard_value(ctx, w_type_opref, concrete_type as i64);
         } else if pyre_object::typeobject::is_type(concrete_obj) {
-            // Type object: promote identity directly.
-            frame.implement_guard_value(ctx, obj, concrete_obj as i64);
+            // RPython: promote metaclass, not type object identity.
+            frame.guard_class(
+                ctx,
+                obj,
+                &pyre_object::pyobject::TYPE_TYPE as *const _ as *const pyre_object::PyType,
+            );
+            let default_metaclass = pyre_interpreter::typedef::gettypefor(
+                &pyre_object::pyobject::TYPE_TYPE as *const _ as *const pyre_object::PyType,
+            );
+            let actual_type = pyre_interpreter::typedef::r#type(concrete_obj);
+            let has_custom_metaclass = actual_type.map_or(true, |at| {
+                default_metaclass.map_or(true, |dm| !std::ptr::eq(dm, at))
+            });
+            if has_custom_metaclass {
+                frame.implement_guard_value(ctx, obj, concrete_obj as i64);
+            }
         } else {
             // Builtin: check for __class__ override (int subclass etc.)
             let concrete_obj_type = (*concrete_obj).ob_type;
