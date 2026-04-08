@@ -2319,19 +2319,21 @@ fn materialize_virtual_from_rd(
             let int_type_addr = &pyre_object::INT_TYPE as *const _ as i64;
             let float_type_addr = &pyre_object::FLOAT_TYPE as *const _ as i64;
             if ob_type == int_type_addr {
+                let tp = unsafe { &*(ob_type as *const pyre_object::pyobject::PyType) };
                 let obj = Box::new(pyre_object::intobject::W_IntObject {
                     ob_header: pyre_object::pyobject::PyObject {
-                        ob_type: ob_type as *const pyre_object::pyobject::PyType,
-                        w_class: std::ptr::null_mut(),
+                        ob_type: tp,
+                        w_class: pyre_object::pyobject::get_instantiate(tp),
                     },
                     intval: 0,
                 });
                 Box::into_raw(obj) as usize
             } else if ob_type == float_type_addr {
+                let tp = unsafe { &*(ob_type as *const pyre_object::pyobject::PyType) };
                 let obj = Box::new(pyre_object::floatobject::W_FloatObject {
                     ob_header: pyre_object::pyobject::PyObject {
-                        ob_type: ob_type as *const pyre_object::pyobject::PyType,
-                        w_class: std::ptr::null_mut(),
+                        ob_type: tp,
+                        w_class: pyre_object::pyobject::get_instantiate(tp),
                     },
                     floatval: 0.0,
                 });
@@ -3907,7 +3909,9 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
                 let obj = Box::new(pyre_object::intobject::W_IntObject {
                     ob_header: pyre_object::pyobject::PyObject {
                         ob_type: &pyre_object::pyobject::INT_TYPE as *const _,
-                        w_class: std::ptr::null_mut(),
+                        w_class: pyre_object::pyobject::get_instantiate(
+                            &pyre_object::pyobject::INT_TYPE,
+                        ),
                     },
                     intval: 0,
                 });
@@ -3917,7 +3921,9 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
                 let obj = Box::new(pyre_object::floatobject::W_FloatObject {
                     ob_header: pyre_object::pyobject::PyObject {
                         ob_type: &pyre_object::pyobject::FLOAT_TYPE as *const _,
-                        w_class: std::ptr::null_mut(),
+                        w_class: pyre_object::pyobject::get_instantiate(
+                            &pyre_object::pyobject::FLOAT_TYPE,
+                        ),
                     },
                     floatval: 0.0,
                 });

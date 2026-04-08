@@ -90,7 +90,7 @@ pub fn function_new_with_closure(
     let obj = Box::new(Function {
         ob: PyObject {
             ob_type: &FUNCTION_TYPE as *const PyType,
-            w_class: std::ptr::null_mut(),
+            w_class: pyre_object::pyobject::get_instantiate(&FUNCTION_TYPE),
         },
         code,
         can_change_code: true, // function.py:33
@@ -115,7 +115,7 @@ pub fn function_new_with_fixed_code(
     let obj = Box::new(Function {
         ob: PyObject {
             ob_type: &FUNCTION_TYPE as *const PyType,
-            w_class: std::ptr::null_mut(),
+            w_class: pyre_object::pyobject::get_instantiate(&FUNCTION_TYPE),
         },
         code,
         can_change_code: false, // function.py:704

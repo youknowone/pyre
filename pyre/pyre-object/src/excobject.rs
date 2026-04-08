@@ -47,7 +47,7 @@ pub fn w_exception_new(kind: ExcKind, message: &str) -> PyObjectRef {
     let obj = Box::new(W_ExceptionObject {
         ob_header: PyObject {
             ob_type: &EXCEPTION_TYPE as *const PyType,
-            w_class: std::ptr::null_mut(),
+            w_class: get_instantiate(&EXCEPTION_TYPE),
         },
         kind,
         message: msg,

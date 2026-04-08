@@ -24,7 +24,7 @@ pub fn w_super_new(super_type: PyObjectRef, obj: PyObjectRef) -> PyObjectRef {
     let s = Box::new(W_SuperObject {
         ob: PyObject {
             ob_type: &SUPER_TYPE as *const PyType,
-            w_class: std::ptr::null_mut(),
+            w_class: get_instantiate(&SUPER_TYPE),
         },
         super_type,
         obj,

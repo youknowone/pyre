@@ -56,7 +56,7 @@ pub fn w_int_new(value: i64) -> PyObjectRef {
         let obj = Box::new(W_IntObject {
             ob_header: PyObject {
                 ob_type: &INT_TYPE as *const PyType,
-                w_class: std::ptr::null_mut(),
+                w_class: get_instantiate(&INT_TYPE),
             },
             intval: value,
         });
@@ -72,7 +72,7 @@ pub fn w_int_new_unique(value: i64) -> PyObjectRef {
     let obj = Box::new(W_IntObject {
         ob_header: PyObject {
             ob_type: &INT_TYPE as *const PyType,
-            w_class: std::ptr::null_mut(),
+            w_class: get_instantiate(&INT_TYPE),
         },
         intval: value,
     });

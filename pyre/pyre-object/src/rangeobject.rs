@@ -36,7 +36,7 @@ pub fn w_range_iter_new(start: i64, stop: i64, step: i64) -> PyObjectRef {
     let obj = Box::new(W_RangeIterator {
         ob: PyObject {
             ob_type: &RANGE_ITER_TYPE as *const PyType,
-            w_class: std::ptr::null_mut(),
+            w_class: get_instantiate(&RANGE_ITER_TYPE),
         },
         current: start,
         stop,
@@ -197,7 +197,7 @@ pub fn w_seq_iter_new(seq: PyObjectRef, length: usize) -> PyObjectRef {
     let obj = Box::new(W_SeqIterator {
         ob: PyObject {
             ob_type: &SEQ_ITER_TYPE as *const PyType,
-            w_class: std::ptr::null_mut(),
+            w_class: get_instantiate(&SEQ_ITER_TYPE),
         },
         seq,
         index: 0,

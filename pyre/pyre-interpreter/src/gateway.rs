@@ -259,7 +259,7 @@ pub fn builtin_code_new(name: &'static str, func: BuiltinCodeFn) -> PyObjectRef 
     let obj = Box::new(BuiltinCode {
         ob: PyObject {
             ob_type: &BUILTIN_CODE_TYPE,
-            w_class: std::ptr::null_mut(),
+            w_class: pyre_object::pyobject::get_instantiate(&BUILTIN_CODE_TYPE),
         },
         name,
         func,

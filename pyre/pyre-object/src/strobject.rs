@@ -34,7 +34,7 @@ pub fn w_str_new(s: &str) -> PyObjectRef {
     let obj = Box::new(W_StrObject {
         ob_header: PyObject {
             ob_type: &STR_TYPE as *const PyType,
-            w_class: std::ptr::null_mut(),
+            w_class: get_instantiate(&STR_TYPE),
         },
         value: inner,
         len: s.len(),

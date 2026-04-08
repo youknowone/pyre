@@ -4,7 +4,7 @@
 //! Concrete types (W_IntObject, W_BoolObject, etc.) embed this header as their
 //! first field, enabling safe pointer casts between `*mut PyObject` and typed pointers.
 
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicPtr, Ordering};
 
 /// Type descriptor for Python objects — corresponds to RPython's OBJECT_VTABLE
 /// (rclass.py:167-174).
@@ -17,16 +17,24 @@ use std::sync::atomic::{AtomicI64, Ordering};
 /// Fields match OBJECT_VTABLE layout order:
 ///   subclassrange_min, subclassrange_max, (rtti omitted), name, (instantiate omitted)
 ///
-/// `AtomicI64` provides interior mutability for static instances:
-/// ranges are assigned once at init time by `assign_subclass_range()`,
+/// `AtomicI64`/`AtomicPtr` provide interior mutability for static instances:
+/// ranges and instantiate are assigned once at init time,
 /// mirroring `assign_inheritance_ids` (normalizecalls.py:373-389).
-/// The JIT backend reads them at raw offsets — `AtomicI64` is layout-
-/// compatible with `i64` (same size and alignment).
+/// The JIT backend reads them at raw offsets — atomics are layout-
+/// compatible with their inner types (same size and alignment).
 #[repr(C)]
 pub struct PyType {
     pub subclassrange_min: AtomicI64,
     pub subclassrange_max: AtomicI64,
     pub name: &'static str,
+    /// rclass.py:172 `('instantiate', Ptr(FuncType([], OBJECTPTR)))`.
+    ///
+    /// RPython stores an instantiate function pointer; pyre caches
+    /// the W_TypeObject pointer here instead. rclass.py:739-743
+    /// `new_instance` sets `__class__` at allocation — pyre reads
+    /// this cached pointer to set `w_class` at allocation time.
+    /// Null until `init_typeobjects()` runs.
+    pub instantiate: AtomicPtr<PyObject>,
 }
 
 /// Common header for all Python objects.
@@ -70,7 +78,25 @@ pub const fn new_pytype(name: &'static str) -> PyType {
         subclassrange_min: AtomicI64::new(0),
         subclassrange_max: AtomicI64::new(0),
         name,
+        instantiate: AtomicPtr::new(std::ptr::null_mut()),
     }
+}
+
+/// rclass.py:739-743 parity — cache the W_TypeObject on the PyType
+/// so allocators can set `w_class` at allocation time.
+///
+/// Called by `init_typeobjects()` for each built-in type.
+pub fn set_instantiate(tp: &PyType, w_typeobject: PyObjectRef) {
+    tp.instantiate.store(w_typeobject, Ordering::Release);
+}
+
+/// Read the cached W_TypeObject from a PyType.
+///
+/// Returns the W_TypeObject (for `w_class`), or null if not yet initialized
+/// (bootstrap phase before `init_typeobjects()`).
+#[inline]
+pub fn get_instantiate(tp: &PyType) -> PyObjectRef {
+    tp.instantiate.load(Ordering::Acquire)
 }
 
 pub static INT_TYPE: PyType = new_pytype("int");
