@@ -119,34 +119,46 @@ pub fn register_call_assembler_unbox_int(f: UnboxIntFn) {
 /// assembler.py:345 assembler_helper_adr parity:
 /// C-callable trampoline for CALL_ASSEMBLER slow path.
 ///
-/// Called from generated machine code when callee didn't finish with
-/// done_with_this_frame_descr. The callee_jf_ptr[0] contains the
-/// guard's DynasmFailDescr pointer.
+/// Called from generated machine code when:
+/// (a) callee finished with a guard failure (jf_descr != done_descr), or
+/// (b) target was pending/unresolved (jf_descr == 0).
+///
+/// Dispatch order matches Cranelift's call_assembler_guard_failure:
+///   1. bridge (if CA_BRIDGE_FN registered and compiles successfully)
+///   2. blackhole resume (if CA_BLACKHOLE_FN registered)
+///   3. force (if CA_FORCE_FN registered — re-execute callee in interpreter)
+///   4. return 0 (no handler available)
 ///
 /// Input:  rdi/x0 = callee_jf_ptr (heap-allocated jitframe)
 /// Output: rax/x0 = result value (0 if void/unhandled)
 ///
-/// The trampoline reads the fail descriptor from jf_descr, extracts
-/// trace_id/fail_index, reads fail_arg values, then dispatches to
-/// the registered blackhole/bridge/force handler.
 /// Always frees the callee jitframe before returning.
 pub extern "C" fn call_assembler_helper_trampoline(callee_jf_ptr: *mut i64) -> i64 {
     if callee_jf_ptr.is_null() {
         return 0;
     }
 
-    // Read jf_descr — raw pointer to DynasmFailDescr
+    // Read jf_descr — raw pointer to DynasmFailDescr (or 0 for pending)
     let descr_raw = unsafe { *callee_jf_ptr } as usize;
-    let result;
 
-    if descr_raw == 0 {
-        // No descriptor set — callee didn't write jf_descr (shouldn't happen)
-        result = 0;
+    let result = if descr_raw == 0 || guard::is_done_with_this_frame_descr(descr_raw) {
+        // Case (b): pending target (jf_descr == 0) or somehow a finish descr
+        // leaked here. Fall through to force_fn which re-executes callee
+        // in the interpreter.
+        //
+        // Cranelift parity: call_assembler_fast_path detects null code_ptr,
+        // calls force_fn(callee_frame_ptr) with PENDING_FORCE_LOCAL0.
+        if let Some(force_fn) = CA_FORCE_FN.get() {
+            force_fn(callee_jf_ptr as i64)
+        } else {
+            0
+        }
     } else {
-        // Cast to &DynasmFailDescr (safe: the Arc keeps it alive)
+        // Case (a): guard failure. jf_descr points to DynasmFailDescr.
         let descr = unsafe { &*(descr_raw as *const guard::DynasmFailDescr) };
         let trace_id = descr.trace_id;
         let fail_index = descr.fail_index;
+        let descr_addr = descr_raw;
 
         // Read fail_arg values from callee frame: jf_frame[0..n] at jf_ptr[1..]
         let n_fail_args = descr.fail_arg_types.len();
@@ -156,24 +168,48 @@ pub extern "C" fn call_assembler_helper_trampoline(callee_jf_ptr: *mut i64) -> i
             raw_values.push(unsafe { *callee_jf_ptr.add(1 + slot) });
         }
 
-        // Try blackhole resume
-        result = if let Some(blackhole) = CA_BLACKHOLE_FN.get() {
-            match blackhole(
-                0, // green_key (resolved by the handler)
+        // Step 1: Try bridge compilation (compile.py:701-717 must_compile)
+        if let Some(bridge_fn) = CA_BRIDGE_FN.get() {
+            let _compiled = bridge_fn(
+                0, // green_key (resolved by handler)
                 trace_id,
                 fail_index,
                 raw_values.as_ptr(),
                 raw_values.len(),
-                raw_values.as_ptr(), // typed outputs = raw values
+                descr_addr,
+            );
+            // If bridge compiled, it will be used on next guard failure.
+            // For this invocation, fall through to blackhole.
+        }
+
+        // Step 2: Try blackhole resume (resume.py:1312 parity)
+        if let Some(blackhole) = CA_BLACKHOLE_FN.get() {
+            match blackhole(
+                0, // green_key
+                trace_id,
+                fail_index,
+                raw_values.as_ptr(),
+                raw_values.len(),
+                raw_values.as_ptr(),
                 raw_values.len(),
             ) {
                 Some(val) => val,
-                None => 0,
+                None => {
+                    // Step 3: Force fallback — re-execute callee in interpreter
+                    if let Some(force_fn) = CA_FORCE_FN.get() {
+                        force_fn(callee_jf_ptr as i64)
+                    } else {
+                        0
+                    }
+                }
             }
+        } else if let Some(force_fn) = CA_FORCE_FN.get() {
+            // No blackhole, try force directly
+            force_fn(callee_jf_ptr as i64)
         } else {
             0
-        };
-    }
+        }
+    };
 
     // Free the callee jitframe
     unsafe { libc::free(callee_jf_ptr as *mut std::ffi::c_void) };
@@ -192,17 +228,20 @@ pub fn call_assembler_helper_addr() -> usize {
 // This API delegates to it for pending target registration.
 
 /// Register a pending CALL_ASSEMBLER target (code not yet compiled).
-/// Matches Cranelift's register_pending_call_assembler_target.
-/// The actual code_addr is set later by compile_loop via
-/// DynasmBackend::register_call_assembler_target.
+/// Matches Cranelift's register_pending_call_assembler_target API.
+///
+/// The actual registration happens via Backend::register_pending_target
+/// → DynasmBackend::register_pending_target (runner.rs), which inserts
+/// a 0 entry into CALL_ASSEMBLER_TARGETS. When compile_loop completes,
+/// it overwrites with the real code_addr.
+///
+/// This function is the direct-call equivalent for non-Backend callers.
 pub fn register_pending_call_assembler_target(
-    _token_number: u64,
+    token_number: u64,
     _inputarg_types: Vec<majit_ir::Type>,
     _num_inputs: usize,
     _num_scalar_inputargs: usize,
 ) {
-    // Pending tokens are resolved at compile time via
-    // Assembler386.call_assembler_targets (populated from runner.rs registry).
-    // No pre-registration needed — unresolved tokens fall through to
-    // the helper trampoline (which handles force/blackhole).
+    // Delegate to the runner's CALL_ASSEMBLER_TARGETS registry.
+    runner::DynasmBackend::register_pending_call_assembler_target_static(token_number);
 }
