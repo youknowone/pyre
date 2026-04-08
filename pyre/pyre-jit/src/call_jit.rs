@@ -788,6 +788,7 @@ fn blackhole_from_jit_frame(frame: &mut PyFrame) -> Option<PyObjectRef> {
     // RPython: the virtualizable ptr is the frame itself.
     bh.virtualizable_ptr = frame as *mut PyFrame as i64;
     bh.virtualizable_info = crate::eval::get_virtualizable_info();
+    bh.virtualizable_stack_base = frame_stack_base;
 
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
@@ -1198,6 +1199,7 @@ pub fn resume_in_blackhole(
         // blackhole.py bhimpl_getfield_vable_*: set virtualizable pointer.
         bh.virtualizable_ptr = frame_ptr as i64;
         bh.virtualizable_info = crate::eval::get_virtualizable_info();
+        bh.virtualizable_stack_base = nlocals + pyre_interpreter::pyframe::ncells(code_ref);
 
         // RPython: nextbh.nextblackholeinterp = curbh
         bh.nextblackholeinterp = prev_bh.map(Box::new);
@@ -1870,6 +1872,16 @@ pub fn blackhole_resume_via_rd_numb(
         bh.virtualizable_ptr = deadframe[0];
     }
     bh.virtualizable_info = crate::eval::get_virtualizable_info();
+    if bh.virtualizable_ptr != 0 {
+        let frame = unsafe { &*(bh.virtualizable_ptr as *const PyFrame) };
+        let stack_base = frame.stack_base();
+        bh.virtualizable_stack_base = stack_base;
+        let mut current = bh.nextblackholeinterp.as_deref_mut();
+        while let Some(caller_bh) = current {
+            caller_bh.virtualizable_stack_base = stack_base;
+            current = caller_bh.nextblackholeinterp.as_deref_mut();
+        }
+    }
     // blackhole.py:1095 get_portal_runner parity
     bh.portal_runner_ptr = Some(bh_portal_runner);
 

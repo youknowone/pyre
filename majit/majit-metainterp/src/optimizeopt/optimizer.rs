@@ -601,11 +601,15 @@ impl Optimizer {
             }
         }
         for (label_arg, entry_idx, field_idx) in &same_as_targets {
-            let tp = ctx
+            let tp = match ctx
                 .value_types
                 .get(&label_arg.0)
                 .copied()
-                .unwrap_or(majit_ir::Type::Int);
+                .unwrap_or(majit_ir::Type::Int)
+            {
+                majit_ir::Type::Void => majit_ir::Type::Ref,
+                other => other,
+            };
             let same_as_op = majit_ir::OpCode::same_as_for_type(tp);
             let mut op = majit_ir::Op::new(same_as_op, &[*label_arg]);
             op.pos = ctx.reserve_pos();
@@ -1934,11 +1938,15 @@ impl Optimizer {
                         continue;
                     }
                     let orig = *arg;
-                    let arg_type = ctx
+                    let arg_type = match ctx
                         .value_types
                         .get(&orig.0)
                         .copied()
-                        .unwrap_or(majit_ir::Type::Ref);
+                        .unwrap_or(majit_ir::Type::Ref)
+                    {
+                        majit_ir::Type::Void => majit_ir::Type::Ref,
+                        other => other,
+                    };
                     let same_as = OpCode::same_as_for_type(arg_type);
                     let fresh = ctx.alloc_op_position();
                     let mut op = Op::new(same_as, &[orig]);
@@ -2013,11 +2021,15 @@ impl Optimizer {
                 // (which emit() maintains per op result type) so that the
                 // SameAs opcode reflects the actual Box shape. Default to
                 // Int only for non-resolvable OpRefs (constants etc.).
-                let arg_type = ctx
+                let arg_type = match ctx
                     .value_types
                     .get(&arg.0)
                     .copied()
-                    .unwrap_or(majit_ir::Type::Int);
+                    .unwrap_or(majit_ir::Type::Int)
+                {
+                    majit_ir::Type::Void => majit_ir::Type::Ref,
+                    other => other,
+                };
                 short_boxes.add_short_input_arg(arg, arg_type);
             }
             self.produce_potential_short_preamble_ops(&mut short_boxes, &ctx);
