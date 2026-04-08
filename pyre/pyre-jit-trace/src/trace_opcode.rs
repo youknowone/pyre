@@ -705,37 +705,68 @@ impl MIFrame {
             .flush_vable_fields(ctx, &[resume_pc as i64, code_ptr as i64, vsd, ns_ptr]);
     }
 
-    /// pyjitpl.py:3317 vable_and_vrefs_before_residual_call.
+    /// pyjitpl.py:3317-3335 vable_and_vrefs_before_residual_call.
     ///
-    /// RPython order: vref token marking FIRST (always), then
-    /// virtualizable processing (only if vinfo is not None).
+    /// RPython structure:
+    ///
+    ///     def vable_and_vrefs_before_residual_call(self):
+    ///         vrefinfo = self.staticdata.virtualref_info
+    ///         for i in range(1, len(self.virtualref_boxes), 2):
+    ///             vrefbox = self.virtualref_boxes[i]
+    ///             vref = vrefbox.getref_base()
+    ///             vrefinfo.tracing_before_residual_call(vref)
+    ///         #
+    ///         vinfo = self.jitdriver_sd.virtualizable_info
+    ///         if vinfo is not None:
+    ///             virtualizable_box = self.virtualizable_boxes[-1]
+    ///             virtualizable = vinfo.unwrap_virtualizable_box(virtualizable_box)
+    ///             vinfo.tracing_before_residual_call(virtualizable)
+    ///             force_token = self.history.record0(rop.FORCE_TOKEN, ...)
+    ///             self.history.record2(rop.SETFIELD_GC, virtualizable_box,
+    ///                                  force_token, None,
+    ///                                  descr=vinfo.vable_token_descr)
+    ///
+    /// Key points:
+    ///   1. vref token marking is unconditional (no vinfo check).
+    ///   2. virtualizable processing only runs when vinfo is not None.
+    ///   3. No call to `gen_store_back_in_vable` — that helper is only
+    ///      invoked from `opimpl_hint_force_virtualizable` (pyjitpl.py:1071).
     fn vable_and_vrefs_before_residual_call(&mut self, ctx: &mut TraceCtx) {
         // pyjitpl.py:3319-3322: virtualref token marking (ALWAYS runs,
         // even without virtualizable info).
         self.vrefs_before_residual_call();
 
-        // pyjitpl.py:3326-3335: virtualizable processing (conditional).
-        // RPython: vinfo = self.jitdriver_sd.virtualizable_info
-        //          if vinfo is not None:
+        // pyjitpl.py:3326: vinfo = self.jitdriver_sd.virtualizable_info
+        // pyjitpl.py:3327: if vinfo is not None:
+        //
+        // majit's pyre port uses `standard_virtualizable_box()` as the
+        // vinfo proxy — it returns `Some(box)` iff the jitdriver has a
+        // standard virtualizable registered for the current frame. RPython
+        // checks the per-jitdriver `vinfo` first, then derefs the box; the
+        // pyre-side null check on `concrete_vable_ptr` is the defensive
+        // analogue of `unwrap_virtualizable_box(virtualizable_box)`.
+        let Some(vable_ref) = ctx.standard_virtualizable_box() else {
+            return;
+        };
         let obj_ptr = self.sym().concrete_vable_ptr;
         if obj_ptr.is_null() {
             return;
         }
-        if let Some(vable_ref) = ctx.standard_virtualizable_box() {
-            let info = crate::virtualizable_gen::build_virtualizable_info();
-            // pyjitpl.py:3329-3330:
-            //   virtualizable = vinfo.unwrap_virtualizable_box(virtualizable_box)
-            //   vinfo.tracing_before_residual_call(virtualizable)
-            unsafe {
-                info.tracing_before_residual_call(obj_ptr);
-            }
-            // pyjitpl.py:3332-3335:
-            //   force_token = self.history.record0(rop.FORCE_TOKEN, ...)
-            //   self.history.record2(rop.SETFIELD_GC, virtualizable_box,
-            //       force_token, None, descr=vinfo.vable_token_descr)
-            let force_token = ctx.force_token();
-            ctx.vable_setfield_descr(vable_ref, force_token, info.token_field_descr());
+        // pyjitpl.py:3329-3330:
+        //   virtualizable = vinfo.unwrap_virtualizable_box(virtualizable_box)
+        //   vinfo.tracing_before_residual_call(virtualizable)
+        let info = crate::virtualizable_gen::build_virtualizable_info();
+        unsafe {
+            info.tracing_before_residual_call(obj_ptr);
         }
+        // pyjitpl.py:3332-3335:
+        //   force_token = self.history.record0(rop.FORCE_TOKEN,
+        //                                      lltype.nullptr(llmemory.GCREF.TO))
+        //   self.history.record2(rop.SETFIELD_GC, virtualizable_box,
+        //                        force_token, None,
+        //                        descr=vinfo.vable_token_descr)
+        let force_token = ctx.force_token();
+        ctx.vable_setfield_descr(vable_ref, force_token, info.token_field_descr());
     }
 
     /// pyjitpl.py:3349-3366 vable_after_residual_call.
