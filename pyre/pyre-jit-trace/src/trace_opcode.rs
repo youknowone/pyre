@@ -593,7 +593,7 @@ impl MIFrame {
             self.generate_guard(ctx, OpCode::GuardNotInvalidated, &[]);
         }
         let frame = self.sym().frame;
-        let namespace = frame_namespace_ptr(ctx, frame);
+        let namespace = frame_get_namespace(ctx, frame);
         let len = ctx.record_op_with_descr(
             OpCode::GetfieldRawI,
             &[namespace],
@@ -618,7 +618,7 @@ impl MIFrame {
         value: OpRef,
     ) -> Result<(), PyError> {
         let frame = self.sym().frame;
-        let namespace = frame_namespace_ptr(ctx, frame);
+        let namespace = frame_get_namespace(ctx, frame);
         let len = ctx.record_op_with_descr(
             OpCode::GetfieldRawI,
             &[namespace],
@@ -4072,7 +4072,7 @@ impl TraceHelperAccess for MIFrame {
     }
 
     fn trace_globals_ptr(&mut self) -> OpRef {
-        self.with_ctx(|this, ctx| frame_namespace_ptr(ctx, this.frame()))
+        self.with_ctx(|this, ctx| frame_get_namespace(ctx, this.frame()))
     }
 
     fn trace_record_not_forced_guard(&mut self) {

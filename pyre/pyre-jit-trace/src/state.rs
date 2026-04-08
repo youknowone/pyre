@@ -978,10 +978,6 @@ pub(crate) fn frame_locals_cells_stack_array(ctx: &mut TraceCtx, frame: OpRef) -
     )
 }
 
-pub(crate) fn frame_namespace_ptr(ctx: &mut TraceCtx, frame: OpRef) -> OpRef {
-    ctx.record_op_with_descr(OpCode::GetfieldRawI, &[frame], frame_namespace_descr())
-}
-
 /// Read from frame's locals_cells_stack_w array.
 /// Uses GcR (Ref-typed) to match RPython's GETARRAYITEM_GC_R,
 /// ensuring the optimizer knows these are boxed pointers.
