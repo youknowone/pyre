@@ -2845,8 +2845,11 @@ unsafe fn is_data_descr(descr: PyObjectRef) -> bool {
         return false;
     }
     // property objects are always data descriptors
-    // PyPy: W_Property has __get__, __set__, __delete__
     if is_property(descr) {
+        return true;
+    }
+    // typedef.py:492-496 Member is a data descriptor (__get__, __set__, __delete__)
+    if pyre_object::is_member(descr) {
         return true;
     }
     // Check if the descriptor's class has __set__ or __delete__
@@ -2896,6 +2899,23 @@ unsafe fn get(descr: PyObjectRef, obj: PyObjectRef, w_type: PyObjectRef) -> Opti
         return Some(crate::call_function(fget, &[obj]));
     }
 
+    // typedef.py:464-475 Member.descr_member_get:
+    //   if obj is None: return self (unbound access)
+    //   return obj.getslotvalue(self.index)  → in pyre: read from ATTR_TABLE
+    if pyre_object::is_member(descr) {
+        if obj.is_null() || is_none(obj) {
+            return Some(descr);
+        }
+        let slot_name = pyre_object::w_member_get_name(descr);
+        let found = ATTR_TABLE.with(|table| {
+            let table = table.borrow();
+            table
+                .get(&(obj as usize))
+                .and_then(|d| d.get(slot_name).copied())
+        });
+        return found;
+    }
+
     // staticmethod: PyPy StaticMethod.descr_staticmethod_get → return w_function
     if is_staticmethod(descr) {
         return Some(w_staticmethod_get_func(descr));
@@ -2941,6 +2961,20 @@ unsafe fn set(descr: PyObjectRef, obj: PyObjectRef, value: PyObjectRef) -> bool 
             return false;
         }
         crate::call_function(fset, &[obj, value]);
+        return true;
+    }
+
+    // typedef.py:477-481 Member.descr_member_set:
+    //   obj.setslotvalue(self.index, value)  → in pyre: write to ATTR_TABLE
+    if pyre_object::is_member(descr) {
+        let slot_name = pyre_object::w_member_get_name(descr);
+        ATTR_TABLE.with(|table| {
+            let mut table = table.borrow_mut();
+            table
+                .entry(obj as usize)
+                .or_default()
+                .insert(slot_name.to_string(), value);
+        });
         return true;
     }
 

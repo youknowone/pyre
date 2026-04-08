@@ -227,11 +227,8 @@ pub fn init_typeobjects() {
     // type — PyPy: typeobject.py, bases=(object,)
     // type.__new__(metatype, name, bases, dict) creates new types
     let type_type = new_typeobject_with_base("type", init_type_type, object_type);
-    // typeobject.py:1262-1263: type has hasdict=True, weakrefable=True
-    unsafe {
-        pyre_object::w_type_set_hasdict(type_type, true);
-        pyre_object::w_type_set_weakrefable(type_type, true);
-    }
+    // hasdict/weakrefable/acceptable now set by typedef.py:34,37,43 logic
+    // in new_typeobject_with_base_and_layout from init_type_type's dict contents.
     reg.insert(&TYPE_TYPE as *const PyType as usize, type_type as usize);
     let _ = W_TYPE_TYPEOBJECT.set(type_type as usize);
 
@@ -296,10 +293,7 @@ pub fn init_typeobjects() {
     // Functions are descriptors: function.__get__ returns a bound method.
     let function_type = new_typeobject_with_base("function", init_function_type, object_type);
     // funcobject.py typedef: hasdict=True, weakrefable=True
-    unsafe {
-        pyre_object::w_type_set_hasdict(function_type, true);
-        pyre_object::w_type_set_weakrefable(function_type, true);
-    }
+    // hasdict/weakrefable/acceptable now set from init_function_type's dict.
     reg.insert(
         &crate::FUNCTION_TYPE as *const PyType as usize,
         function_type as usize,
@@ -488,11 +482,18 @@ fn new_typeobject_with_base_and_layout(
             })
         };
         pyre_object::w_type_set_layout(type_obj, layout);
-        // typeobject.py:1262-1263: w_self.hasdict = instancetypedef.hasdict
-        // Most builtins: hasdict=false, weakrefable=false.
-        // Only type/function have both true.
-        pyre_object::w_type_set_hasdict(type_obj, false);
-        pyre_object::w_type_set_weakrefable(type_obj, false);
+        // typedef.py:34,37,43 — set flags from typedef dict contents.
+        // hasdict = '__dict__' in rawdict; weakrefable = '__weakref__' in rawdict
+        // acceptable_as_base_class = '__new__' in rawdict
+        // Then inherit from bases: typedef.py:39-41
+        let has_dict = (*ns_ptr).get("__dict__").is_some();
+        let has_weakref = (*ns_ptr).get("__weakref__").is_some();
+        let has_new = (*ns_ptr).get("__new__").is_some();
+        let base_hasdict = pyre_object::w_type_get_hasdict(base);
+        let base_weakrefable = pyre_object::w_type_get_weakrefable(base);
+        pyre_object::w_type_set_hasdict(type_obj, has_dict || base_hasdict);
+        pyre_object::w_type_set_weakrefable(type_obj, has_weakref || base_weakrefable);
+        pyre_object::w_type_set_acceptable_as_base_class(type_obj, has_new);
     }
 
     // MRO = [self] + base_mro

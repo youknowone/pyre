@@ -1881,20 +1881,8 @@ unsafe fn check_and_find_best_base(
     Ok(w_bestbase)
 }
 
-/// typedef.py:43 acceptable_as_base_class = '__new__' in rawdict.
-/// Check by type name — types whose typedef lacks __new__ can't be subclassed.
-/// In Python 3: bool, NoneType, NotImplementedType, function, method, code, etc.
+/// typedef.py:43 `acceptable_as_base_class = '__new__' in rawdict`.
+/// typeobject.py:1116 checks this flag on the bestbase.
 unsafe fn is_acceptable_base_class(w_type: pyre_object::PyObjectRef) -> bool {
-    let name = pyre_object::w_type_get_name(w_type);
-    !matches!(
-        name,
-        "bool"
-            | "NoneType"
-            | "NotImplementedType"
-            | "function"
-            | "builtin-code"
-            | "code"
-            | "instancemethod"
-            | "member_descriptor"
-    )
+    pyre_object::w_type_get_acceptable_as_base_class(w_type)
 }
