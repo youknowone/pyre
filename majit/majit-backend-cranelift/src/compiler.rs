@@ -7544,6 +7544,20 @@ impl CraneliftBackend {
                     builder.switch_to_block(fast_block);
                     builder.seal_block(fast_block);
                     builder.ins().store(flags, new_free, nf_ptr, 0);
+                    // rewrite.py:557-563 + alloc_with_type parity: the slow
+                    // path goes through alloc_with_type which calls
+                    // init_nursery_object to write a fresh GcHeader at the
+                    // payload base. The inline fast path was previously
+                    // writing the new free pointer but skipping the header
+                    // init, leaving whatever bytes were left over in the
+                    // nursery from a prior allocation. The next minor GC
+                    // would then read garbage tid_and_flags through
+                    // copy_nursery_object and panic with `invalid type_id`.
+                    // Mirror init_nursery_object here so the inline path
+                    // produces an object whose header matches what
+                    // alloc_with_type would have written.
+                    let zero_hdr = builder.ins().iconst(cl_types::I64, 0);
+                    builder.ins().store(MemFlags::trusted(), zero_hdr, free, 0);
                     // Return pointer past GC header
                     let header_size = builder.ins().iconst(ptr_type, GcHeader::SIZE as i64);
                     let obj_ptr = builder.ins().iadd(free, header_size);
