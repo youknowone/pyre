@@ -370,7 +370,16 @@ impl GcRewriterImpl {
             .as_size_descr()
             .expect("NEW descr must be SizeDescr");
 
-        let size = round_up(descr.size());
+        // rewrite.py:474-484 handle_malloc_operation parity:
+        // descr.size in RPython already includes the GC header (the
+        // OBJECT type is built with `size = sizeof(header) + sizeof(fields)`).
+        // pyre's PyreSizeDescr reports `obj_size` as the bare struct size
+        // (e.g. `size_of::<W_IntObject>() == 16`) WITHOUT the GC header,
+        // so we add it here so that CallMallocNursery sees the same
+        // "object-with-header" total that the cranelift backend expects
+        // (it strips the header back off before passing to the alloc
+        // shim's payload size).
+        let size = round_up(descr.size() + crate::header::GcHeader::SIZE);
         let type_id = descr.type_id();
 
         let obj_ref = self.gen_malloc_nursery(size, op.pos, st);
@@ -1050,7 +1059,13 @@ mod tests {
         // Expect: CallMallocNursery, GcStore (tid)
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].opcode, OpCode::CallMallocNursery);
-        assert_eq!(result[0].args[0].0, 32); // size (already aligned)
+        // rewrite.py:474-484 parity: descr.size + GcHeader::SIZE.
+        // PyreSizeDescr reports the bare struct size, so handle_new adds
+        // the 8-byte GC header before passing the total to gen_malloc_nursery.
+        assert_eq!(
+            result[0].args[0].0,
+            32 + crate::header::GcHeader::SIZE as u32
+        );
         assert_eq!(result[1].opcode, OpCode::GcStore); // tid init
         assert_eq!(result[1].args[2].0, 7); // type_id = 7
     }
@@ -1170,15 +1185,22 @@ mod tests {
             .iter()
             .find(|o| o.opcode == OpCode::CallMallocNursery)
             .unwrap();
-        // Combined size: round_up(24) + round_up(32) = 24 + 32 = 56
-        assert_eq!(malloc.args[0].0, 56);
+        // rewrite.py:474-484 parity: each NEW contributes
+        // round_up(descr.size + GcHeader::SIZE) bytes. Combined:
+        // round_up(24+8) + round_up(32+8) = 32 + 40 = 72.
+        let header = crate::header::GcHeader::SIZE as u32;
+        assert_eq!(
+            malloc.args[0].0,
+            round_up(24 + header as usize) as u32 + round_up(32 + header as usize) as u32
+        );
 
         let incr = result
             .iter()
             .find(|o| o.opcode == OpCode::NurseryPtrIncrement)
             .unwrap();
-        // Offset = previous_size = round_up(24) = 24
-        assert_eq!(incr.args[1].0, 24);
+        // Offset of the second alloc = first allocation's full slot
+        // (round_up(24 + GcHeader::SIZE) = 32).
+        assert_eq!(incr.args[1].0, round_up(24 + header as usize) as u32);
 
         // Both should have tid initialisation.
         let tid_stores: Vec<_> = result
