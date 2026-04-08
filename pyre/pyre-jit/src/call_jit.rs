@@ -1872,15 +1872,19 @@ pub fn blackhole_resume_via_rd_numb(
         bh.virtualizable_ptr = deadframe[0];
     }
     bh.virtualizable_info = crate::eval::get_virtualizable_info();
-    if bh.virtualizable_ptr != 0 {
-        let frame = unsafe { &*(bh.virtualizable_ptr as *const PyFrame) };
-        let stack_base = frame.stack_base();
-        bh.virtualizable_stack_base = stack_base;
-        let mut current = bh.nextblackholeinterp.as_deref_mut();
-        while let Some(caller_bh) = current {
-            caller_bh.virtualizable_stack_base = stack_base;
-            current = caller_bh.nextblackholeinterp.as_deref_mut();
-        }
+    // resume.py:1341 consume_one_section parity: each section in the
+    // resumed chain corresponds to a different Python function with its
+    // own `nlocals + ncells` layout. The heuristic-resume sibling path
+    // (call_jit.rs:1192) computes this per-section from the section's own
+    // CodeObject; the rd_numb path likewise must give every bh in the
+    // chain its own value, otherwise a multi-frame chain whose caller
+    // and callee differ in nlocals+ncells uses the wrong operand-stack
+    // offset on recursive portal re-entry.
+    bh.virtualizable_stack_base = bh.jitcode.stack_base;
+    let mut current = bh.nextblackholeinterp.as_deref_mut();
+    while let Some(caller_bh) = current {
+        caller_bh.virtualizable_stack_base = caller_bh.jitcode.stack_base;
+        current = caller_bh.nextblackholeinterp.as_deref_mut();
     }
     // blackhole.py:1095 get_portal_runner parity
     bh.portal_runner_ptr = Some(bh_portal_runner);

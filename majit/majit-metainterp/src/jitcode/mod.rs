@@ -237,6 +237,14 @@ pub struct JitCode {
     /// Used by bhimpl_jit_merge_point's recursive call to limit frame writeback
     /// to merge-point args only (RPython greens + reds parity).
     pub nlocals: usize,
+    /// Absolute start index of the operand stack inside the virtualizable's
+    /// unified `locals_cells_stack_w` array (i.e. `nlocals + ncells`).
+    /// Computed once at codewriter time per source function so that
+    /// resume / merge-point exit paths can write back stack temporaries
+    /// without re-deriving the layout from a `CodeObject` lookup. Each
+    /// jitcode in a blackhole chain owns its own value because every
+    /// Python function has its own locals/cells/stack layout.
+    pub stack_base: usize,
     /// flatten.py / regalloc.py parity: symbolic value-stack depth at each
     /// Python PC, in slots above `stack_base = nlocals + ncells`. RPython's
     /// flatten/regalloc statically assigns every value-stack temporary to a
