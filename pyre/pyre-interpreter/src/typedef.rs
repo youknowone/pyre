@@ -427,6 +427,7 @@ fn new_root_typeobject(name: &str, init: fn(&mut PyNamespace)) -> PyObjectRef {
             nslots: 0,
             newslotnames: vec![],
             base_layout: std::ptr::null(),
+            acceptable_as_base_class: true, // object has __new__
         });
         pyre_object::w_type_set_layout(type_obj, layout);
         // object: hasdict=False, weakrefable=False (bare object() has no __dict__)
@@ -480,26 +481,26 @@ fn new_typeobject_with_base_and_layout(
         let layout = if reuse {
             parent_layout
         } else {
+            // typedef.py:34,37,43 — set flags from typedef dict contents.
+            let has_dict = (*ns_ptr).get("__dict__").is_some();
+            let has_weakref = (*ns_ptr).get("__weakref__").is_some();
+            let has_new = (*ns_ptr).get("__new__").is_some();
             pyre_object::typeobject::leak_layout(pyre_object::typeobject::Layout {
                 typedef: layout_pytype,
                 nslots: 0,
                 newslotnames: vec![],
                 base_layout: parent_layout,
+                acceptable_as_base_class: has_new,
             })
         };
         pyre_object::w_type_set_layout(type_obj, layout);
-        // typedef.py:34,37,43 — set flags from typedef dict contents.
-        // hasdict = '__dict__' in rawdict; weakrefable = '__weakref__' in rawdict
-        // acceptable_as_base_class = '__new__' in rawdict
-        // Then inherit from bases: typedef.py:39-41
+        // typedef.py:39-41: inherit from bases
         let has_dict = (*ns_ptr).get("__dict__").is_some();
         let has_weakref = (*ns_ptr).get("__weakref__").is_some();
-        let has_new = (*ns_ptr).get("__new__").is_some();
         let base_hasdict = pyre_object::w_type_get_hasdict(base);
         let base_weakrefable = pyre_object::w_type_get_weakrefable(base);
         pyre_object::w_type_set_hasdict(type_obj, has_dict || base_hasdict);
         pyre_object::w_type_set_weakrefable(type_obj, has_weakref || base_weakrefable);
-        pyre_object::w_type_set_acceptable_as_base_class(type_obj, has_new);
     }
 
     // MRO = [self] + base_mro
