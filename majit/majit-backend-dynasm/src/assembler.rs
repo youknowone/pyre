@@ -1180,36 +1180,47 @@ impl Assembler386 {
             }
             // ── Float binary ──
             OpCode::FloatAdd | OpCode::FloatSub | OpCode::FloatMul | OpCode::FloatTrueDiv => {
-                if let (Some(Loc::Reg(dst)), Some(Loc::Reg(src))) = (result_loc, arglocs.get(1)) {
+                if let Some(Loc::Reg(dst)) = result_loc {
+                    // Ensure second arg is in an XMM register
+                    let src_reg = if let Some(Loc::Reg(s)) = arglocs.get(1) {
+                        *s
+                    } else if let Some(src_loc) = arglocs.get(1) {
+                        // Immed or Frame — load to scratch XMM (d14/xmm14)
+                        let scratch = crate::regloc::RegLoc::new(14, true);
+                        self.regalloc_mov(src_loc, &Loc::Reg(scratch));
+                        scratch
+                    } else {
+                        return; // shouldn't happen
+                    };
                     #[cfg(target_arch = "x86_64")]
                     match op.opcode {
                         OpCode::FloatAdd => {
-                            dynasm!(self.mc ; .arch x64 ; addsd Rx(dst.value), Rx(src.value));
+                            dynasm!(self.mc ; .arch x64 ; addsd Rx(dst.value), Rx(src_reg.value));
                         }
                         OpCode::FloatSub => {
-                            dynasm!(self.mc ; .arch x64 ; subsd Rx(dst.value), Rx(src.value));
+                            dynasm!(self.mc ; .arch x64 ; subsd Rx(dst.value), Rx(src_reg.value));
                         }
                         OpCode::FloatMul => {
-                            dynasm!(self.mc ; .arch x64 ; mulsd Rx(dst.value), Rx(src.value));
+                            dynasm!(self.mc ; .arch x64 ; mulsd Rx(dst.value), Rx(src_reg.value));
                         }
                         OpCode::FloatTrueDiv => {
-                            dynasm!(self.mc ; .arch x64 ; divsd Rx(dst.value), Rx(src.value));
+                            dynasm!(self.mc ; .arch x64 ; divsd Rx(dst.value), Rx(src_reg.value));
                         }
                         _ => {}
                     }
                     #[cfg(target_arch = "aarch64")]
                     match op.opcode {
                         OpCode::FloatAdd => {
-                            dynasm!(self.mc ; .arch aarch64 ; fadd D(dst.value), D(dst.value), D(src.value));
+                            dynasm!(self.mc ; .arch aarch64 ; fadd D(dst.value), D(dst.value), D(src_reg.value));
                         }
                         OpCode::FloatSub => {
-                            dynasm!(self.mc ; .arch aarch64 ; fsub D(dst.value), D(dst.value), D(src.value));
+                            dynasm!(self.mc ; .arch aarch64 ; fsub D(dst.value), D(dst.value), D(src_reg.value));
                         }
                         OpCode::FloatMul => {
-                            dynasm!(self.mc ; .arch aarch64 ; fmul D(dst.value), D(dst.value), D(src.value));
+                            dynasm!(self.mc ; .arch aarch64 ; fmul D(dst.value), D(dst.value), D(src_reg.value));
                         }
                         OpCode::FloatTrueDiv => {
-                            dynasm!(self.mc ; .arch aarch64 ; fdiv D(dst.value), D(dst.value), D(src.value));
+                            dynasm!(self.mc ; .arch aarch64 ; fdiv D(dst.value), D(dst.value), D(src_reg.value));
                         }
                         _ => {}
                     }
