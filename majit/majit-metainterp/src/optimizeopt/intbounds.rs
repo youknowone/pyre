@@ -1888,13 +1888,9 @@ impl Optimization for OptIntBounds {
         "intbounds"
     }
 
-    // TODO(rpython-parity): enable postprocess once the cascading bounds
-    // issue is resolved. The propagate_postprocess infrastructure is ready
-    // (optimizer.rs) and the postprocess_GUARD_TRUE/FALSE implementation
-    // below matches intbounds.py:52-58. The hang occurs outside the optimizer
-    // (likely in unroll.rs virtual state matching) when bounds narrowing
-    // changes guard outcomes.
-    // fn has_postprocess(&self) -> bool { true }
+    fn has_postprocess(&self) -> bool {
+        true
+    }
 
     /// intbounds.py:52-58 _postprocess_guard_true_false_value parity.
     ///
@@ -1909,7 +1905,7 @@ impl Optimization for OptIntBounds {
     /// postponed comparison op, so find_producing_op succeeds.
     fn propagate_postprocess(&mut self, op: &Op, ctx: &mut OptContext) {
         match op.opcode {
-            OpCode::GuardTrue | OpCode::GuardFalse => {
+            OpCode::GuardTrue | OpCode::GuardFalse | OpCode::GuardValue => {
                 // intbounds.py:52-58 _postprocess_guard_true_false_value:
                 //   if op.getarg(0).type == 'i':
                 //       self.propagate_bounds_backward(op.getarg(0))
@@ -1936,11 +1932,27 @@ impl Optimization for OptIntBounds {
                 // propagate_bounds_backward → make_constant_int → potential
                 // infinite re-optimization. The full propagation runs
                 // during propagate_forward; postprocess only narrows.
-                if let Some(producing_op) = self.find_producing_op(arg0, ctx) {
-                    if producing_op.opcode.returns_bool() {
-                        let producing_op = producing_op.clone();
-                        self.narrow_bounds_from_comparison(&producing_op, is_true, ctx);
-                    }
+                // intbounds.py:52-58 _postprocess_guard_true_false_value:
+                //     self.propagate_bounds_backward(op.getarg(0))
+                //
+                // propagate_bounds_backward:
+                //   1. If constant → make_constant_int
+                //   2. Find producing op → dispatch_bounds_ops (narrow args)
+                //
+                // For now, only set the constant bound on the comparison
+                // result. The full propagate_bounds_backward (finding the
+                // producing comparison and narrowing its operands) will be
+                // enabled after the nbody hang root cause is identified.
+                if is_true {
+                    self.setintbound(
+                        arg0,
+                        crate::optimizeopt::intutils::IntBound::from_constant(1),
+                    );
+                } else {
+                    self.setintbound(
+                        arg0,
+                        crate::optimizeopt::intutils::IntBound::from_constant(0),
+                    );
                 }
             }
             _ => {}
@@ -2773,7 +2785,7 @@ mod tests {
     /// (pending_guard_bounds) works for Phase 2 only. This test is marked
     /// `ignore` until `propagate_postprocess` is ported.
     #[test]
-    #[ignore = "requires intbounds postprocess_GUARD_TRUE — causes optimizer hang on nbody"]
+    #[ignore = "requires narrow_bounds_from_comparison in postprocess — causes nbody hang"]
     fn test_guard_true_int_lt_enables_add_ovf_removal() {
         use crate::optimizeopt::optimizer::Optimizer;
 

@@ -1320,9 +1320,13 @@ mod tests {
             .filter(|o| o.opcode == OpCode::GuardNoOverflow)
             .count();
 
+        // With intbounds postprocess_GUARD_TRUE, OpRef(1) becomes known
+        // constant 1 after GuardTrue(OpRef(1)). IntMulOvf(x, 1) cannot
+        // overflow → second GuardNoOverflow is removed. This matches
+        // RPython intbounds.py:52-58 _postprocess_guard_true_false_value.
         assert_eq!(
-            guard_count, 2,
-            "distinct overflow guards must survive full-pipeline optimization"
+            guard_count, 1,
+            "first overflow guard survives; second removed (mul by constant 1 cannot overflow)"
         );
     }
 
