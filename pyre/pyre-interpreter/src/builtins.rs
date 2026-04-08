@@ -555,12 +555,16 @@ fn type_descr_new_with_metaclass(
             for i in 0..n {
                 if let Some(base) = unsafe { pyre_object::w_tuple_getitem(bases, i as i64) } {
                     if unsafe { pyre_object::is_type(base) } {
-                        let w_metaclass = crate::baseobjspace::ATTR_TABLE.with(|table| {
-                            table
-                                .borrow()
-                                .get(&(base as usize))
-                                .and_then(|d| d.get("__metaclass__").copied())
-                        });
+                        // baseobjspace.py:76 — metaclass from w_class
+                        let w_metaclass = unsafe {
+                            let w_class = (*base).w_class;
+                            let w_type_type = crate::typedef::w_type();
+                            if !w_class.is_null() && !std::ptr::eq(w_class, w_type_type) {
+                                Some(w_class)
+                            } else {
+                                None
+                            }
+                        };
                         if let Some(w_metaclass) = w_metaclass {
                             // Delegate: call metaclass(name, bases, dict, **kwds)
                             // Pass extra args from the original call

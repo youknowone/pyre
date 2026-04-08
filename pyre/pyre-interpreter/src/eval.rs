@@ -386,12 +386,16 @@ impl IterOpcodeHandler for PyFrame {
             // Type object: metaclass __iter__ (NOT the type's own MRO)
             // CPython: iter(X) calls type(X).__iter__(X)
             if pyre_object::is_type(iter) {
-                let mc = crate::baseobjspace::ATTR_TABLE.with(|table| {
-                    table
-                        .borrow()
-                        .get(&(iter as usize))
-                        .and_then(|d| d.get("__metaclass__").copied())
-                });
+                // baseobjspace.py:76 — metaclass from w_class
+                let mc = {
+                    let w_class = (*iter).w_class;
+                    let w_type_type = crate::typedef::w_type();
+                    if !w_class.is_null() && !std::ptr::eq(w_class, w_type_type) {
+                        Some(w_class)
+                    } else {
+                        None
+                    }
+                };
                 if let Some(metaclass) = mc {
                     if let Some(method) = crate::baseobjspace::lookup_in_type(metaclass, "__iter__")
                     {
