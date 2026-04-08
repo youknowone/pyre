@@ -569,6 +569,66 @@ impl<M: Clone> MetaInterp<M> {
         io_buffer::io_buffer_commit();
     }
 
+    #[inline]
+    fn is_jump_exit(is_finish: bool, fail_index: u32) -> bool {
+        !is_finish && fail_index == u32::MAX
+    }
+
+    #[inline]
+    fn should_record_guard_failure(is_finish: bool, fail_index: u32) -> bool {
+        !is_finish && !Self::is_jump_exit(is_finish, fail_index)
+    }
+
+    #[inline]
+    fn record_guard_failure_event(&mut self, green_key: u64, fail_index: u32) {
+        if crate::majit_log_enabled() {
+            eprintln!(
+                "[jit] guard failure at key={}, guard={}",
+                green_key, fail_index
+            );
+        }
+        self.stats.guard_failures += 1;
+        self.warm_state.log_guard_failure(fail_index);
+        if let Some(ref hook) = self.hooks.on_guard_failure {
+            hook(green_key, fail_index, 0);
+        }
+    }
+
+    #[inline]
+    fn run_result_for_jump_exit(
+        fail_index: u32,
+        values: Vec<i64>,
+        meta: M,
+        savedata: Option<GcRef>,
+    ) -> Option<RunResult<M>> {
+        (fail_index == u32::MAX).then_some(RunResult::Jump {
+            values,
+            meta,
+            savedata,
+        })
+    }
+
+    #[inline]
+    fn blackhole_result_for_jump_exit(
+        fail_index: u32,
+        values: Vec<i64>,
+        typed_values: Vec<Value>,
+        exit_layout: CompiledExitLayout,
+        meta: M,
+        savedata: Option<GcRef>,
+        exception: ExceptionState,
+    ) -> Option<BlackholeRunResult<M>> {
+        (fail_index == u32::MAX).then_some(BlackholeRunResult::Jump {
+            values,
+            typed_values: Some(typed_values),
+            exit_layout: Some(exit_layout),
+            meta,
+            via_blackhole: false,
+            savedata,
+            exception,
+        })
+    }
+
     fn alloc_trace_id(&mut self) -> u64 {
         let trace_id = self.next_trace_id;
         self.next_trace_id += 1;
@@ -3730,20 +3790,8 @@ impl<M: Clone> MetaInterp<M> {
         let fail_index = result.fail_index;
         let trace_id = Self::normalize_trace_id(compiled, result.trace_id);
 
-        if !result.is_finish {
-            if crate::majit_log_enabled() {
-                eprintln!(
-                    "[jit] guard failure at key={}, guard={}",
-                    green_key, fail_index
-                );
-            }
-
-            self.stats.guard_failures += 1;
-            self.warm_state.log_guard_failure(fail_index);
-
-            if let Some(ref hook) = self.hooks.on_guard_failure {
-                hook(green_key, fail_index, 0);
-            }
+        if Self::should_record_guard_failure(result.is_finish, fail_index) {
+            self.record_guard_failure_event(green_key, fail_index);
         }
 
         let compiled = self.compiled_loops.get(&green_key).unwrap();
@@ -3771,20 +3819,8 @@ impl<M: Clone> MetaInterp<M> {
         let fail_index = result.fail_index;
         let trace_id = Self::normalize_trace_id(compiled, result.trace_id);
 
-        if !result.is_finish {
-            if crate::majit_log_enabled() {
-                eprintln!(
-                    "[jit] guard failure at key={}, guard={}",
-                    green_key, fail_index
-                );
-            }
-
-            self.stats.guard_failures += 1;
-            self.warm_state.log_guard_failure(fail_index);
-
-            if let Some(ref hook) = self.hooks.on_guard_failure {
-                hook(green_key, fail_index, 0);
-            }
+        if Self::should_record_guard_failure(result.is_finish, fail_index) {
+            self.record_guard_failure_event(green_key, fail_index);
         }
 
         let compiled = self.compiled_loops.get(&green_key).unwrap();
@@ -3808,20 +3844,8 @@ impl<M: Clone> MetaInterp<M> {
         let fail_index = result.fail_index;
         let trace_id = Self::normalize_trace_id(compiled, result.trace_id);
 
-        if !result.is_finish {
-            if crate::majit_log_enabled() {
-                eprintln!(
-                    "[jit] guard failure at key={}, guard={}",
-                    green_key, fail_index
-                );
-            }
-
-            self.stats.guard_failures += 1;
-            self.warm_state.log_guard_failure(fail_index);
-
-            if let Some(ref hook) = self.hooks.on_guard_failure {
-                hook(green_key, fail_index, 0);
-            }
+        if Self::should_record_guard_failure(result.is_finish, fail_index) {
+            self.record_guard_failure_event(green_key, fail_index);
         }
 
         let compiled = self.compiled_loops.get(&green_key).unwrap();
@@ -3844,20 +3868,8 @@ impl<M: Clone> MetaInterp<M> {
         let fail_index = result.fail_index;
         let trace_id = Self::normalize_trace_id(compiled, result.trace_id);
 
-        if !result.is_finish {
-            if crate::majit_log_enabled() {
-                eprintln!(
-                    "[jit] guard failure at key={}, guard={}",
-                    green_key, fail_index
-                );
-            }
-
-            self.stats.guard_failures += 1;
-            self.warm_state.log_guard_failure(fail_index);
-
-            if let Some(ref hook) = self.hooks.on_guard_failure {
-                hook(green_key, fail_index, 0);
-            }
+        if Self::should_record_guard_failure(result.is_finish, fail_index) {
+            self.record_guard_failure_event(green_key, fail_index);
         }
 
         let compiled = self.compiled_loops.get(&green_key).unwrap();
@@ -3959,18 +3971,8 @@ impl<M: Clone> MetaInterp<M> {
             );
         }
 
-        if !effective_is_finish {
-            if crate::majit_log_enabled() {
-                eprintln!(
-                    "[jit] guard failure at key={}, guard={}",
-                    green_key, fail_index
-                );
-            }
-            self.stats.guard_failures += 1;
-            self.warm_state.log_guard_failure(fail_index);
-            if let Some(ref hook) = self.hooks.on_guard_failure {
-                hook(green_key, fail_index, 0);
-            }
+        if Self::should_record_guard_failure(effective_is_finish, fail_index) {
+            self.record_guard_failure_event(green_key, fail_index);
         }
 
         // pyjitpl.py:3119-3123: exc_class = ptr2int(exception_obj.typeptr)
@@ -4090,18 +4092,8 @@ impl<M: Clone> MetaInterp<M> {
             );
         }
 
-        if !effective_is_finish {
-            if crate::majit_log_enabled() {
-                eprintln!(
-                    "[jit] guard failure at key={}, guard={}",
-                    green_key, fail_index
-                );
-            }
-            self.stats.guard_failures += 1;
-            self.warm_state.log_guard_failure(fail_index);
-            if let Some(ref hook) = self.hooks.on_guard_failure {
-                hook(green_key, fail_index, 0);
-            }
+        if Self::should_record_guard_failure(effective_is_finish, fail_index) {
+            self.record_guard_failure_event(green_key, fail_index);
         }
         // pyjitpl.py:3119-3123: exc_class = ptr2int(exception_obj.typeptr)
         let exc_class = if result.exception_value.is_null() {
@@ -4152,18 +4144,21 @@ impl<M: Clone> MetaInterp<M> {
         let fail_index = descr.fail_index();
         let trace_id = Self::normalize_trace_id(compiled, descr.trace_id());
         let is_finish = descr.is_finish();
+        let exit_types = descr.fail_arg_types().to_vec();
+        let gc_ref_slots: Vec<usize> = exit_types
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, _)| descr.is_gc_ref_slot(slot).then_some(slot))
+            .collect();
+        let force_token_slots = descr.force_token_slots().to_vec();
+        let status = descr.get_status();
+        let descr_addr = descr as *const dyn majit_ir::FailDescr as *const () as usize;
         Self::finish_compiled_run_io(is_finish);
 
-        if !is_finish {
-            self.stats.guard_failures += 1;
-            self.warm_state.log_guard_failure(fail_index);
-
-            if let Some(ref hook) = self.hooks.on_guard_failure {
-                hook(green_key, fail_index, 0);
-            }
+        if Self::should_record_guard_failure(is_finish, fail_index) {
+            self.record_guard_failure_event(green_key, fail_index);
         }
 
-        let exit_types = descr.fail_arg_types();
         let exit_arity = exit_types.len();
         let compiled = self.compiled_loops.get(&green_key).unwrap();
         let mut exit_layout = Self::trace_for_exit(compiled, trace_id)
@@ -4175,14 +4170,10 @@ impl<M: Clone> MetaInterp<M> {
                 trace_id,
                 fail_index,
                 source_op_index: None,
-                exit_types: exit_types.to_vec(),
+                exit_types: exit_types.clone(),
                 is_finish,
-                gc_ref_slots: exit_types
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(slot, _)| descr.is_gc_ref_slot(slot).then_some(slot))
-                    .collect(),
-                force_token_slots: descr.force_token_slots().to_vec(),
+                gc_ref_slots,
+                force_token_slots,
                 recovery_layout: None,
                 resume_layout: None,
                 rd_numb: None,
@@ -4245,8 +4236,8 @@ impl<M: Clone> MetaInterp<M> {
             exit_layout,
             savedata,
             exception,
-            status: descr.get_status(),
-            descr_addr: descr as *const dyn majit_ir::FailDescr as *const () as usize,
+            status,
+            descr_addr,
         })
     }
 
@@ -4324,21 +4315,24 @@ impl<M: Clone> MetaInterp<M> {
         let fail_index = descr.fail_index();
         let trace_id = Self::normalize_trace_id(compiled, descr.trace_id());
         let is_finish = descr.is_finish();
+        let exit_types = descr.fail_arg_types().to_vec();
+        let gc_ref_slots: Vec<usize> = exit_types
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, _)| descr.is_gc_ref_slot(slot).then_some(slot))
+            .collect();
+        let force_token_slots = descr.force_token_slots().to_vec();
+        let status = descr.get_status();
+        let descr_addr = descr as *const dyn majit_ir::FailDescr as *const () as usize;
         Self::finish_compiled_run_io(is_finish);
 
         // RPython: guard failure counter tick and bridge compilation happen
         // in handle_fail → must_compile (compile.py:701-784).
         // must_compile handles tick.
-        if !is_finish {
-            self.stats.guard_failures += 1;
-            self.warm_state.log_guard_failure(fail_index);
-
-            if let Some(ref hook) = self.hooks.on_guard_failure {
-                hook(green_key, fail_index, 0);
-            }
+        if Self::should_record_guard_failure(is_finish, fail_index) {
+            self.record_guard_failure_event(green_key, fail_index);
         }
 
-        let exit_types = descr.fail_arg_types();
         let exit_arity = exit_types.len();
         let compiled = self.compiled_loops.get(&green_key).unwrap();
         let mut exit_layout = Self::trace_for_exit(compiled, trace_id)
@@ -4350,14 +4344,10 @@ impl<M: Clone> MetaInterp<M> {
                 trace_id,
                 fail_index,
                 source_op_index: None,
-                exit_types: exit_types.to_vec(),
+                exit_types: exit_types.clone(),
                 is_finish,
-                gc_ref_slots: exit_types
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(slot, _)| descr.is_gc_ref_slot(slot).then_some(slot))
-                    .collect(),
-                force_token_slots: descr.force_token_slots().to_vec(),
+                gc_ref_slots,
+                force_token_slots,
                 recovery_layout: None,
                 resume_layout: None,
                 rd_numb: None,
@@ -4420,8 +4410,8 @@ impl<M: Clone> MetaInterp<M> {
             exit_layout,
             savedata,
             exception,
-            status: descr.get_status(),
-            descr_addr: descr as *const dyn majit_ir::FailDescr as *const () as usize,
+            status,
+            descr_addr,
         })
     }
 
@@ -6222,6 +6212,12 @@ impl<M: Clone> MetaInterp<M> {
             });
         }
 
+        if let Some(jump) =
+            Self::run_result_for_jump_exit(fail_index, values.clone(), meta.clone(), savedata)
+        {
+            return Some(jump);
+        }
+
         // Guard failure — recover
         let recovery = self.handle_guard_failure_in_trace_with_savedata(
             green_key,
@@ -6326,6 +6322,18 @@ impl<M: Clone> MetaInterp<M> {
                 savedata,
                 exception,
             });
+        }
+
+        if let Some(jump) = Self::blackhole_result_for_jump_exit(
+            fail_index,
+            values.clone(),
+            typed_values.clone(),
+            compiled_exit_layout.clone(),
+            meta.clone(),
+            savedata,
+            exception.clone(),
+        ) {
+            return Some(jump);
         }
 
         let initial_recovery = self.handle_guard_failure_in_trace_with_savedata(
@@ -6583,6 +6591,18 @@ impl<M: Clone> MetaInterp<M> {
                 savedata,
                 exception,
             });
+        }
+
+        if let Some(jump) = Self::blackhole_result_for_jump_exit(
+            fail_index,
+            values.clone(),
+            typed_values.clone(),
+            compiled_exit_layout.clone(),
+            meta.clone(),
+            savedata,
+            exception.clone(),
+        ) {
+            return Some(jump);
         }
 
         let initial_recovery = self.handle_guard_failure_in_trace_with_savedata(
@@ -7040,6 +7060,12 @@ pub struct GuardRecovery {
 pub enum RunResult<M> {
     /// The loop finished normally.
     Finished {
+        values: Vec<i64>,
+        meta: M,
+        savedata: Option<GcRef>,
+    },
+    /// The trace exited via a normal back-edge jump.
+    Jump {
         values: Vec<i64>,
         meta: M,
         savedata: Option<GcRef>,
@@ -8056,6 +8082,94 @@ mod tests {
         assert_eq!(events[0], (42, 3, 1));
         assert_eq!(events[1], (42, 3, 2));
         assert_eq!(events[2], (42, 5, 1));
+    }
+
+    #[test]
+    fn test_should_record_guard_failure_skips_jump_exit() {
+        assert!(!MetaInterp::<()>::should_record_guard_failure(
+            false,
+            u32::MAX
+        ));
+        assert!(MetaInterp::<()>::should_record_guard_failure(false, 7));
+        assert!(!MetaInterp::<()>::should_record_guard_failure(true, 7));
+    }
+
+    #[test]
+    fn test_run_result_for_jump_exit_returns_jump() {
+        let result = MetaInterp::<()>::run_result_for_jump_exit(u32::MAX, vec![42], (), None)
+            .expect("jump exit should produce a direct Jump result");
+        match result {
+            RunResult::Jump { values, .. } => assert_eq!(values, vec![42]),
+            other => panic!("expected Jump result, got {other:?}"),
+        }
+
+        assert!(
+            MetaInterp::<()>::run_result_for_jump_exit(3, vec![42], (), None).is_none(),
+            "guard failure exits must keep using recovery paths"
+        );
+    }
+
+    #[test]
+    fn test_blackhole_result_for_jump_exit_returns_jump() {
+        let exit_layout = CompiledExitLayout {
+            rd_loop_token: 91,
+            trace_id: 12,
+            fail_index: u32::MAX,
+            source_op_index: Some(3),
+            exit_types: vec![Type::Int],
+            is_finish: false,
+            gc_ref_slots: Vec::new(),
+            force_token_slots: Vec::new(),
+            recovery_layout: None,
+            resume_layout: None,
+            rd_numb: None,
+            rd_consts: None,
+            rd_virtuals: None,
+            rd_pendingfields: None,
+        };
+        let exception = ExceptionState::default();
+
+        let result = MetaInterp::<()>::blackhole_result_for_jump_exit(
+            u32::MAX,
+            vec![42],
+            vec![Value::Int(42)],
+            exit_layout.clone(),
+            (),
+            None,
+            exception.clone(),
+        )
+        .expect("jump exit should bypass blackhole recovery");
+        match result {
+            BlackholeRunResult::Jump {
+                values,
+                typed_values,
+                exit_layout,
+                via_blackhole,
+                exception,
+                ..
+            } => {
+                assert_eq!(values, vec![42]);
+                assert_eq!(typed_values, Some(vec![Value::Int(42)]));
+                assert_eq!(exit_layout.unwrap().trace_id, 12);
+                assert!(!via_blackhole);
+                assert_eq!(exception, ExceptionState::default());
+            }
+            other => panic!("expected Jump result, got {other:?}"),
+        }
+
+        assert!(
+            MetaInterp::<()>::blackhole_result_for_jump_exit(
+                5,
+                vec![42],
+                vec![Value::Int(42)],
+                exit_layout,
+                (),
+                None,
+                exception,
+            )
+            .is_none(),
+            "guard failure exits must keep using guard recovery / blackhole fallback"
+        );
     }
 
     #[test]
