@@ -2999,29 +2999,39 @@ unsafe fn get(
 ///
 /// PyPy: descroperation.py `descr__setattr__` →
 /// `space.get_and_call_function(w_set, w_descr, w_obj, w_value)`
-unsafe fn set(descr: PyObjectRef, obj: PyObjectRef, value: PyObjectRef) -> bool {
+unsafe fn set(
+    descr: PyObjectRef,
+    obj: PyObjectRef,
+    value: PyObjectRef,
+) -> Result<bool, crate::PyError> {
     if descr.is_null() {
-        return false;
+        return Ok(false);
     }
 
     // property: PyPy W_Property.set → call_function(fset, obj, value)
     if is_property(descr) {
         let fset = w_property_get_fset(descr);
         if fset.is_null() || is_none(fset) {
-            return false;
+            return Ok(false);
         }
         crate::call_function(fset, &[obj, value]);
-        return true;
+        return Ok(true);
     }
 
     // typedef.py:477-481 Member.descr_member_set:
     //   self.typecheck(space, w_obj)
     //   w_obj.setslotvalue(self.index, w_value)
     if pyre_object::is_member(descr) {
-        // typedef.py:480: typecheck
+        // typedef.py:480: self.typecheck(space, w_obj) → TypeError
         let w_cls = pyre_object::w_member_get_cls(descr);
         if !w_cls.is_null() && is_type(w_cls) && !isinstance_w(obj, w_cls) {
-            return false;
+            let slot_name = pyre_object::w_member_get_name(descr);
+            return Err(crate::PyError::type_error(format!(
+                "descriptor '{}' for '{}' objects doesn't apply to '{}' object",
+                slot_name,
+                pyre_object::w_type_get_name(w_cls),
+                (*(*obj).ob_type).name,
+            )));
         }
         let slot_name = pyre_object::w_member_get_name(descr);
         ATTR_TABLE.with(|table| {
@@ -3031,7 +3041,7 @@ unsafe fn set(descr: PyObjectRef, obj: PyObjectRef, value: PyObjectRef) -> bool 
                 .or_default()
                 .insert(slot_name.to_string(), value);
         });
-        return true;
+        return Ok(true);
     }
 
     // General __set__: look up on descriptor's type MRO
@@ -3040,11 +3050,11 @@ unsafe fn set(descr: PyObjectRef, obj: PyObjectRef, value: PyObjectRef) -> bool 
         if let Some(set_fn) = lookup_in_type_where(descr_type, "__set__") {
             if !set_fn.is_null() {
                 crate::call_function(set_fn, &[obj, value]);
-                return true;
+                return Ok(true);
             }
         }
     }
-    false
+    Ok(false)
 }
 
 /// Set an attribute on an object: `obj.name = value`.
@@ -3122,7 +3132,7 @@ pub fn setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult {
         if is_instance(obj) {
             let w_type = w_instance_get_type(obj);
             if let Some(descr) = lookup_in_type_where(w_type, name) {
-                if set(descr, obj, value) {
+                if set(descr, obj, value)? {
                     return Ok(w_none());
                 }
             }
