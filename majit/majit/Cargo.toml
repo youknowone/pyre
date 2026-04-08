@@ -6,6 +6,10 @@ license.workspace = true
 repository.workspace = true
 description = "Meta-tracing JIT compiler framework"
 
+[features]
+cranelift = ["majit-metainterp/cranelift"]
+dynasm = ["majit-metainterp/dynasm"]
+
 [dependencies]
 majit-ir = { workspace = true }
 majit-metainterp = { workspace = true }
