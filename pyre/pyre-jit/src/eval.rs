@@ -74,7 +74,7 @@ thread_local! {
             pyre_jit_trace::virtualizable_gen::NUM_SCALAR_INPUTARGS;
         let mut gc = MiniMarkGC::new();
         // rclass.OBJECT root (rclass.py:160-166). pyre's static
-        // `INSTANCE_TYPE` is the `tp_name = "object"` PyType — every
+        // `INSTANCE_TYPE` is the `name = "object"` PyType — every
         // other `PyObject`-layout class chains its `parent` field to
         // this id so `assign_inheritance_ids` (normalizecalls.py:373-389)
         // produces a `subclassrange_{min,max}` covering every

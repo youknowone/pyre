@@ -676,7 +676,7 @@ fn type_descr_new_with_metaclass(
             &pyre_object::pyobject::NONE_TYPE,
         ));
     }
-    let name = unsafe { (*(*obj).ob_type).tp_name };
+    let name = unsafe { (*(*obj).ob_type).name };
     Ok(box_str_constant(name))
 }
 

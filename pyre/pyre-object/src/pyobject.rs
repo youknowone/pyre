@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 pub struct PyType {
     pub subclassrange_min: AtomicI64,
     pub subclassrange_max: AtomicI64,
-    pub tp_name: &'static str,
+    pub name: &'static str,
 }
 
 /// Common header for all Python objects.
@@ -65,11 +65,11 @@ pub const PY_NULL: PyObjectRef = std::ptr::null_mut();
 
 /// Construct a PyType with zeroed subclass ranges.
 /// Ranges are assigned at init time by `assign_subclass_range()`.
-pub const fn new_pytype(tp_name: &'static str) -> PyType {
+pub const fn new_pytype(name: &'static str) -> PyType {
     PyType {
         subclassrange_min: AtomicI64::new(0),
         subclassrange_max: AtomicI64::new(0),
-        tp_name,
+        name,
     }
 }
 
@@ -102,6 +102,27 @@ pub const SUBCLASSRANGE_MIN_OFFSET: usize = std::mem::offset_of!(PyType, subclas
 /// rclass.py:169 — second field in OBJECT_VTABLE.
 pub const SUBCLASSRANGE_MAX_OFFSET: usize = std::mem::offset_of!(PyType, subclassrange_max);
 
+/// rclass.py:1126-1127 `ll_cast_to_object(obj)`.
+///
+/// In RPython this casts a typed pointer to `OBJECTPTR`. In pyre all
+/// objects are already `PyObjectRef`, so this is an identity function
+/// kept for structural parity.
+#[inline]
+pub fn ll_cast_to_object(obj: PyObjectRef) -> PyObjectRef {
+    obj
+}
+
+/// rclass.py:1130-1131 `ll_type(obj)`.
+///
+/// Extract the type pointer (CLASSTYPE) from an object.
+///
+/// # Safety
+/// `obj` must be a valid non-null `PyObject`.
+#[inline]
+pub unsafe fn ll_type(obj: PyObjectRef) -> *const PyType {
+    (*obj).ob_type
+}
+
 /// rclass.py:1133-1137 `ll_issubclass(subcls, cls)`.
 ///
 /// O(1) subclass check via preorder numbering:
@@ -115,6 +136,17 @@ pub fn ll_issubclass(subcls: &PyType, cls: &PyType) -> bool {
     cls_min <= subcls_min && subcls_min < cls_max
 }
 
+/// rclass.py:1139-1140 `ll_issubclass_const(subcls, minid, maxid)`.
+///
+/// Variant of `ll_issubclass` where the class bounds are already known
+/// constants. Used by the JIT when the target class is constant-folded.
+#[inline]
+pub fn ll_issubclass_const(subcls: &PyType, minid: i64, maxid: i64) -> bool {
+    let subcls_min = subcls.subclassrange_min.load(Ordering::Relaxed);
+    // int_between(a, b, c) ≡ a <= b < c
+    minid <= subcls_min && subcls_min < maxid
+}
+
 /// rclass.py:1143-1147 `ll_isinstance(obj, cls)`.
 ///
 /// # Safety
@@ -126,6 +158,21 @@ pub unsafe fn ll_isinstance(obj: PyObjectRef, cls: &PyType) -> bool {
     }
     let obj_cls = unsafe { &*(*obj).ob_type };
     ll_issubclass(obj_cls, cls)
+}
+
+/// rclass.py:1173-1178 `ll_inst_type(obj)`.
+///
+/// Return the typeptr if obj is non-null, null otherwise.
+///
+/// # Safety
+/// If non-null, `obj` must be a valid `PyObject`.
+#[inline]
+pub unsafe fn ll_inst_type(obj: PyObjectRef) -> *const PyType {
+    if !obj.is_null() {
+        (*obj).ob_type
+    } else {
+        std::ptr::null()
+    }
 }
 
 /// Write subclass ranges to a `PyType` instance.
@@ -154,7 +201,7 @@ pub fn assign_subclass_range(tp: &PyType, min: i64, max: i64) {
 /// resolves to `int_between(cls.min, subcls.min, cls.max)` per
 /// rclass.py:1133-1137 `ll_issubclass`.
 ///
-/// `INSTANCE_TYPE` (the `tp_name = "object"` root) is intentionally
+/// `INSTANCE_TYPE` (the `name = "object"` root) is intentionally
 /// absent: it is registered separately as the `rclass.OBJECT` root
 /// with no parent. `INT_TYPE` and `FLOAT_TYPE` are also absent: they
 /// get their own ids (`W_INT_GC_TYPE_ID` / `W_FLOAT_GC_TYPE_ID`)

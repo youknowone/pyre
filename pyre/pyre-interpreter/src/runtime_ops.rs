@@ -265,7 +265,7 @@ where
         } else {
             Err(PyError::type_error(format!(
                 "'{}' object is not callable",
-                (*(*callable).ob_type).tp_name
+                (*(*callable).ob_type).name
             )))
         }
     }) // stacker::maybe_grow
@@ -656,7 +656,7 @@ pub fn sequence_len(seq: PyObjectRef) -> Result<usize, PyError> {
         }
         Err(PyError::type_error(format!(
             "cannot unpack non-sequence {}",
-            (*(*seq).ob_type).tp_name
+            (*(*seq).ob_type).name
         )))
     }
 }
@@ -688,7 +688,7 @@ pub fn sequence_getitem(seq: PyObjectRef, index: usize) -> Result<PyObjectRef, P
         }
         Err(PyError::type_error(format!(
             "cannot unpack non-sequence {}",
-            (*(*seq).ob_type).tp_name
+            (*(*seq).ob_type).name
         )))
     }
 }
@@ -750,7 +750,7 @@ pub fn ensure_range_iter(iter: PyObjectRef) -> Result<(), PyError> {
     }
     Err(PyError::type_error(format!(
         "'{}' object is not iterable",
-        unsafe { (*(*iter).ob_type).tp_name }
+        unsafe { (*(*iter).ob_type).name }
     )))
 }
 

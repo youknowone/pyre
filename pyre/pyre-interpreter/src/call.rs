@@ -943,7 +943,7 @@ pub(crate) fn call_function_impl(callable: PyObjectRef, args: &[PyObjectRef]) ->
         }
     }
     panic!("call_function: '{}' object is not callable", unsafe {
-        (*(*callable).ob_type).tp_name
+        (*(*callable).ob_type).name
     });
 }
 
