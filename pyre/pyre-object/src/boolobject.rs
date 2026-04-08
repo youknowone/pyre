@@ -20,7 +20,7 @@ pub fn w_bool_new(value: bool) -> PyObjectRef {
     let obj = Box::new(W_BoolObject {
         ob_header: PyObject {
             ob_type: &BOOL_TYPE as *const PyType,
-            w_class: std::ptr::null_mut(),
+            w_class: get_instantiate(&BOOL_TYPE),
         },
         boolval: value,
     });

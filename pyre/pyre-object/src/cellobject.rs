@@ -28,7 +28,7 @@ pub fn w_cell_new(value: PyObjectRef) -> PyObjectRef {
     let obj = Box::new(W_CellObject {
         ob_header: PyObject {
             ob_type: &CELL_TYPE as *const PyType,
-            w_class: std::ptr::null_mut(),
+            w_class: get_instantiate(&CELL_TYPE),
         },
         contents: value,
     });

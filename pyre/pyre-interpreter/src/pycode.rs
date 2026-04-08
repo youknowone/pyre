@@ -79,7 +79,7 @@ pub fn w_code_new(code_ptr: *const ()) -> PyObjectRef {
     let obj = Box::new(W_CodeObject {
         ob_header: PyObject {
             ob_type: &CODE_TYPE as *const PyType,
-            w_class: std::ptr::null_mut(),
+            w_class: pyre_object::pyobject::get_instantiate(&CODE_TYPE),
         },
         code_ptr,
     });

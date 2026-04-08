@@ -24,7 +24,7 @@ pub fn w_method_new(
     let obj = Box::new(W_MethodObject {
         ob_header: PyObject {
             ob_type: &METHOD_TYPE as *const PyType,
-            w_class: std::ptr::null_mut(),
+            w_class: get_instantiate(&METHOD_TYPE),
         },
         w_function,
         w_self,

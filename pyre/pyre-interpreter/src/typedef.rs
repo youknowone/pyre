@@ -330,6 +330,29 @@ pub fn init_typeobjects() {
     );
 
     let _ = TYPEOBJECT_CACHE.set(reg);
+
+    // rclass.py:739-743 parity — cache W_TypeObject on each PyType
+    // so allocators can set w_class at allocation time (like RPython's
+    // `self.setfield(vptr, '__class__', ctypeptr, llops)` in new_instance).
+    if let Some(cache) = TYPEOBJECT_CACHE.get() {
+        for (&pytype_addr, &w_typeobject_addr) in cache {
+            let tp = unsafe { &*(pytype_addr as *const PyType) };
+            let w_typeobject = w_typeobject_addr as PyObjectRef;
+            pyre_object::pyobject::set_instantiate(tp, w_typeobject);
+        }
+        // Set w_class on all built-in type objects to `type`.
+        // baseobjspace.py:76 getclass() — for type objects, the class
+        // is the metatype (default: `type`).
+        let w_type_type = w_type();
+        for &w_typeobject_addr in cache.values() {
+            let w_typeobj = w_typeobject_addr as PyObjectRef;
+            unsafe {
+                if (*w_typeobj).w_class.is_null() {
+                    (*w_typeobj).w_class = w_type_type;
+                }
+            }
+        }
+    }
 }
 
 /// The global `object` type object, accessible from builtins.

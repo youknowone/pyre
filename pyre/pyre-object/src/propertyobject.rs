@@ -29,7 +29,7 @@ pub fn w_property_new(fget: PyObjectRef, fset: PyObjectRef, fdel: PyObjectRef) -
     let obj = Box::new(W_PropertyObject {
         ob_header: PyObject {
             ob_type: &PROPERTY_TYPE as *const PyType,
-            w_class: std::ptr::null_mut(),
+            w_class: get_instantiate(&PROPERTY_TYPE),
         },
         fget,
         fset,
@@ -73,7 +73,7 @@ pub fn w_staticmethod_new(func: PyObjectRef) -> PyObjectRef {
     let obj = Box::new(W_StaticMethodObject {
         ob_header: PyObject {
             ob_type: &STATICMETHOD_TYPE as *const PyType,
-            w_class: std::ptr::null_mut(),
+            w_class: get_instantiate(&STATICMETHOD_TYPE),
         },
         w_function: func,
     });
@@ -107,7 +107,7 @@ pub fn w_classmethod_new(func: PyObjectRef) -> PyObjectRef {
     let obj = Box::new(W_ClassMethodObject {
         ob_header: PyObject {
             ob_type: &CLASSMETHOD_TYPE as *const PyType,
-            w_class: std::ptr::null_mut(),
+            w_class: get_instantiate(&CLASSMETHOD_TYPE),
         },
         w_function: func,
     });

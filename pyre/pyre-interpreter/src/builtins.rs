@@ -627,23 +627,14 @@ fn type_descr_new_with_metaclass(
         let w_metaclass = w_winner;
 
         let w_type = pyre_object::w_type_new(name, w_effective_bases, ns_ptr as *mut u8);
+        // rclass.py:739-743 — set w_class (typeptr) at allocation time.
+        // For type objects, w_class is the metaclass (type(C) → Meta).
+        // PyPy: baseobjspace.py:76 getclass() returns the metatype.
+        unsafe {
+            (*w_type).w_class = w_metaclass;
+        }
         let mro = unsafe { crate::baseobjspace::compute_default_mro(w_type) };
         unsafe { pyre_object::w_type_set_mro(w_type, mro) };
-
-        // Store metaclass BEFORE __set_name__ so descriptors can access
-        // metaclass methods (e.g. EnumType._add_member_ during _proto_member.__set_name__)
-        if !w_metaclass.is_null() {
-            let w_type_type = crate::typedef::gettypeobject(&pyre_object::pyobject::TYPE_TYPE);
-            if !std::ptr::eq(w_metaclass, w_type_type) {
-                crate::baseobjspace::ATTR_TABLE.with(|table| {
-                    table
-                        .borrow_mut()
-                        .entry(w_type as usize)
-                        .or_default()
-                        .insert("__metaclass__".to_string(), w_metaclass);
-                });
-            }
-        }
 
         // __set_name__ protocol — CPython: type_new_set_names
         // PyPy: typeobject.py type_new → call __set_name__(owner, name) on each descriptor

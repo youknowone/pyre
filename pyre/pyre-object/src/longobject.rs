@@ -34,7 +34,7 @@ pub fn w_long_new(value: BigInt) -> PyObjectRef {
     let obj = Box::new(W_LongObject {
         ob_header: PyObject {
             ob_type: &LONG_TYPE as *const PyType,
-            w_class: std::ptr::null_mut(),
+            w_class: get_instantiate(&LONG_TYPE),
         },
         value: inner,
     });

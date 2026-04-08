@@ -23,7 +23,7 @@ pub fn w_float_new(value: f64) -> PyObjectRef {
     let obj = Box::new(W_FloatObject {
         ob_header: PyObject {
             ob_type: &FLOAT_TYPE as *const PyType,
-            w_class: std::ptr::null_mut(),
+            w_class: get_instantiate(&FLOAT_TYPE),
         },
         floatval: value,
     });

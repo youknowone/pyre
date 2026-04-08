@@ -2986,13 +2986,28 @@ pub fn setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult {
             }
         }
     }
-    // __class__ assignment: update w_class field directly.
-    // RPython: __class__ assignment changes ob_type (typeptr).
-    // pyre: changes w_class on the PyObject header.
+    // objectobject.py:137-154 descr_set___class__ — validate before
+    // allowing __class__ assignment.
     if name == "__class__" {
         unsafe {
+            // (1) w_newcls must be a type object
+            if !is_type(value) {
+                return Err(crate::PyError::type_error(
+                    "__class__ must be set to a class, not a non-class object".to_string(),
+                ));
+            }
+            // (2) Only heap types (user-defined classes) can be assigned.
+            // Built-in types (int, str, etc.) are not heap types.
+            // For now, only user-defined instances can have __class__ reassigned.
+            let obj_ob_type = (*obj).ob_type;
+            if !std::ptr::eq(obj_ob_type, &INSTANCE_TYPE) {
+                return Err(crate::PyError::type_error(
+                    "__class__ assignment: only for heap types".to_string(),
+                ));
+            }
             (*obj).w_class = value;
         }
+        return Ok(w_none());
     }
     // Store in instance dict (ATTR_TABLE)
     ATTR_TABLE.with(|table| {

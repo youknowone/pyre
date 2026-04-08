@@ -29,7 +29,7 @@ pub fn w_generator_new(frame_ptr: *mut u8) -> PyObjectRef {
     let obj = Box::new(W_GeneratorObject {
         ob: PyObject {
             ob_type: &GENERATOR_TYPE as *const PyType,
-            w_class: std::ptr::null_mut(),
+            w_class: get_instantiate(&GENERATOR_TYPE),
         },
         frame_ptr,
         started: false,

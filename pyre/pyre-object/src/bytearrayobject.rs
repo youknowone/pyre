@@ -20,7 +20,7 @@ pub fn w_bytearray_new(size: usize) -> PyObjectRef {
     let obj = Box::new(W_BytearrayObject {
         ob_header: PyObject {
             ob_type: &BYTEARRAY_TYPE as *const PyType,
-            w_class: std::ptr::null_mut(),
+            w_class: get_instantiate(&BYTEARRAY_TYPE),
         },
         data: Box::into_raw(Box::new(vec![0u8; size])),
     });
@@ -32,7 +32,7 @@ pub fn w_bytearray_from_bytes(bytes: &[u8]) -> PyObjectRef {
     let obj = Box::new(W_BytearrayObject {
         ob_header: PyObject {
             ob_type: &BYTEARRAY_TYPE as *const PyType,
-            w_class: std::ptr::null_mut(),
+            w_class: get_instantiate(&BYTEARRAY_TYPE),
         },
         data: Box::into_raw(Box::new(bytes.to_vec())),
     });

@@ -46,7 +46,7 @@ pub fn w_union_new(a: PyObjectRef, b: PyObjectRef) -> PyObjectRef {
     let obj = Box::new(W_UnionType {
         ob_header: PyObject {
             ob_type: &UNION_TYPE as *const PyType,
-            w_class: std::ptr::null_mut(),
+            w_class: get_instantiate(&UNION_TYPE),
         },
         args,
     });
