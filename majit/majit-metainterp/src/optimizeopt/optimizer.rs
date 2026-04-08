@@ -2873,7 +2873,12 @@ impl Optimizer {
             // optimizer.py:672-683: _copy_resume_data_from / store_final_boxes_in_guard.
             let shared = op.descr.is_none() && self.last_guard_op.is_some();
             if shared {
-                // optimizer.py:688-695: _copy_resume_data_from
+                // optimizer.py:688-700 _copy_resume_data_from:
+                //   last_descr = last_guard_op.getdescr()
+                //   descr = invent_fail_descr_for_op(...)
+                //   guard_op.setdescr(descr); setfailargs(last.failargs)
+                //   if guard_op.opnum == GUARD_VALUE:
+                //       guard_op = self._maybe_replace_guard_value(guard_op, descr)
                 let last = self.last_guard_op.as_ref().unwrap();
                 op.descr = last.descr.clone();
                 op.fail_args = last.fail_args.clone();
@@ -2882,6 +2887,9 @@ impl Optimizer {
                 op.rd_numb = last.rd_numb.clone();
                 op.rd_consts = last.rd_consts.clone();
                 op.rd_virtuals = last.rd_virtuals.clone();
+                if op.opcode == OpCode::GuardValue {
+                    op = Self::_maybe_replace_guard_value(op, ctx);
+                }
             } else {
                 // optimizer.py:678: store_final_boxes_in_guard
                 op = Self::store_final_boxes_in_guard(op, ctx);
@@ -2893,6 +2901,11 @@ impl Optimizer {
                             self.force_box(farg, ctx);
                         }
                     }
+                }
+                // optimizer.py:750-751: GUARD_VALUE → bool replacement after
+                // store_final_boxes_in_guard so descr.guard_opnum is preserved.
+                if op.opcode == OpCode::GuardValue {
+                    op = Self::_maybe_replace_guard_value(op, ctx);
                 }
             }
 
@@ -3094,6 +3107,57 @@ impl Optimizer {
         }
         ctx.finalize_guard_resume_data(&mut op);
         op
+    }
+
+    /// optimizer.py:754-778 _maybe_replace_guard_value
+    ///
+    /// Turns `GUARD_VALUE(bool, 0/1)` into `GUARD_FALSE(bool)` /
+    /// `GUARD_TRUE(bool)` after `store_final_boxes_in_guard` has tagged the
+    /// resume data, leaving `descr.guard_opnum` set to the original
+    /// `GUARD_VALUE` (resume.py preserves it via `store_final_boxes`).
+    ///
+    /// Returns `op` unchanged when:
+    /// - the first arg is not int-typed,
+    /// - the first arg's IntBound is not bool (`is_bool()` false),
+    /// - or the constant on the right is neither 0 nor 1 (issue #3128).
+    fn _maybe_replace_guard_value(op: Op, ctx: &mut OptContext) -> Op {
+        // optimizer.py:755: if op.getarg(0).type == 'i'
+        let arg0 = op.arg(0);
+        if op.opcode != OpCode::GuardValue {
+            return op;
+        }
+        // Only int-typed first arg is eligible.
+        let arg0_resolved = ctx.get_box_replacement(arg0);
+        // Constant ints are folded earlier; if arg0 is constant, no replacement.
+        if ctx.is_constant(arg0_resolved) {
+            return op;
+        }
+        // optimizer.py:756-757: b = self.getintbound(op.getarg(0)); if b.is_bool()
+        let b = ctx.getintbound(arg0_resolved);
+        if !b.is_bool() {
+            return op;
+        }
+        // optimizer.py:762: constvalue = op.getarg(1).getint()
+        let Some(constvalue) = ctx.get_constant_int(op.arg(1)) else {
+            return op;
+        };
+        // optimizer.py:763-775: 0 → GUARD_FALSE, 1 → GUARD_TRUE, else give up.
+        let new_opcode = match constvalue {
+            0 => OpCode::GuardFalse,
+            1 => OpCode::GuardTrue,
+            _ => return op,
+        };
+        // optimizer.py:776: replace_op_with(op, opnum, [op.getarg(0)], descr)
+        let mut newop = Op::new(new_opcode, &[arg0]);
+        newop.pos = op.pos;
+        newop.descr = op.descr.clone();
+        newop.fail_args = op.fail_args.clone();
+        newop.rd_numb = op.rd_numb.clone();
+        newop.rd_consts = op.rd_consts.clone();
+        newop.rd_virtuals = op.rd_virtuals.clone();
+        newop.rd_pendingfields = op.rd_pendingfields.clone();
+        newop.rd_resume_position = op.rd_resume_position;
+        newop
     }
 }
 
