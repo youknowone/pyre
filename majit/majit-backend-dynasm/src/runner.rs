@@ -461,17 +461,22 @@ impl Backend for DynasmBackend {
         }
 
         // RPython parity: remap jitframe values using fail_arg_locs.
-        // Position i in raw_values holds the value of fail_args[i],
-        // read from its actual jitframe slot via fail_arg_locs[i].
-        // This matches what RPython's _push_all_regs_to_frame +
-        // _update_at_exit produce.
         let n_locs = descr.fail_arg_locs.len();
         let mut raw_values = Vec::with_capacity(num_slots);
         for i in 0..num_slots {
             if i < n_locs {
                 match descr.fail_arg_locs[i] {
-                    Some(slot) => raw_values.push(unsafe { *result_jf.add(1 + slot) }),
-                    None => raw_values.push(0), // virtual: no physical value
+                    Some(slot) => {
+                        let val = unsafe { *result_jf.add(1 + slot) };
+                        if std::env::var_os("MAJIT_LOG").is_some() && i < 10 {
+                            eprintln!(
+                                "[dynasm] fail_arg[{}]: slot={} val={:#018x}",
+                                i, slot, val as u64
+                            );
+                        }
+                        raw_values.push(val);
+                    }
+                    None => raw_values.push(0),
                 }
             } else {
                 raw_values.push(unsafe { *result_jf.add(1 + i) });
