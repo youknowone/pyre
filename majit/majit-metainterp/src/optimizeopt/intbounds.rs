@@ -848,7 +848,12 @@ impl OptIntBounds {
 
     /// Given that a comparison op produced `is_true`, narrow the bounds of its arguments.
     fn propagate_bounds_from_comparison(&mut self, op: &Op, is_true: bool, ctx: &OptContext) {
-        let arg0 = op.arg(0);
+        // RPython intbounds.py parity: resolve through get_box_replacement
+        // so bounds are stored on the canonical OpRef. Without this, SameAs
+        // forwarding (e.g. OpRef(44) → OpRef(39)) causes bounds to be set
+        // on the stale OpRef while subsequent lookups resolve to the
+        // canonical one, losing the bound information.
+        let arg0 = ctx.get_box_replacement(op.arg(0));
 
         // Handle unary ops
         match op.opcode {
@@ -885,7 +890,11 @@ impl OptIntBounds {
             _ => {}
         }
 
-        let arg1 = if op.num_args() > 1 { op.arg(1) } else { return };
+        let arg1 = if op.num_args() > 1 {
+            ctx.get_box_replacement(op.arg(1))
+        } else {
+            return;
+        };
 
         match op.opcode {
             OpCode::IntLt => {
