@@ -297,26 +297,6 @@ pub fn make_resume_at_position_descr_with_data(
     })
 }
 
-/// Create a plain ResumeGuardDescr with empty resume_data.
-///
-/// Used by ResumeAtPositionDescr.clone_descr() and
-/// OptResumeAtPositionDescr.clone_descr() — RPython's inherited
-/// ResumeGuardDescr.clone() returns a plain ResumeGuardDescr,
-/// losing the ResumeAtPositionDescr marker.
-pub fn make_plain_resume_guard_descr(types: Vec<Type>) -> DescrRef {
-    Arc::new(ResumeGuardDescr {
-        fail_index: alloc_fail_index(),
-        types,
-        resume_data: ResumeData {
-            vable_array: Vec::new(),
-            frames: Vec::new(),
-            virtuals: Vec::new(),
-            pending_fields: Vec::new(),
-        },
-        vector_info: UnsafeCell::new(Vec::new()),
-    })
-}
-
 /// compile.py:895-908: CompileLoopVersionDescr(ResumeGuardDescr)
 ///
 /// A guard descriptor for loop-version guards. These guards must never
