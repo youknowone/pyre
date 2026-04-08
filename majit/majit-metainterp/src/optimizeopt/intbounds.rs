@@ -58,7 +58,7 @@ impl OptIntBounds {
 
     /// Retry deferred guard bounds propagation. By the time the next op
     /// arrives, the heap pass has flushed the postponed comparison.
-    fn flush_pending_guard_bounds(&mut self, ctx: &OptContext) {
+    fn flush_pending_guard_bounds(&mut self, ctx: &mut OptContext) {
         let pending = match self.pending_guard_bounds.take() {
             Some(p) => p,
             None => return,
@@ -141,9 +141,16 @@ impl OptIntBounds {
     /// Validates that the constant value is within the existing IntBound
     /// range before making the box constant. Raises InvalidLoop if not.
     fn make_constant_int(&mut self, op: &Op, value: i64, ctx: &mut OptContext) {
+        self.make_constant_int_ref(op.pos, value, ctx);
+    }
+
+    /// OpRef-keyed variant of make_constant_int. Used by
+    /// `propagate_bounds_backward` and the IntIsTrue/IsZero arms which
+    /// receive an OpRef rather than an &Op.
+    fn make_constant_int_ref(&mut self, opref: OpRef, value: i64, ctx: &mut OptContext) {
         // optimizer.py:415-426: safety check — if the box already has an
         // IntBound, verify the constant is within that range.
-        let replaced = ctx.get_box_replacement(op.pos);
+        let replaced = ctx.get_box_replacement(opref);
         let existing = self.getintbound(replaced, ctx);
         if !existing.is_unbounded() {
             if !existing.contains(value) {
@@ -161,8 +168,8 @@ impl OptIntBounds {
                 }
             }
         }
-        ctx.make_constant(op.pos, Value::Int(value));
-        self.setintbound(op.pos, IntBound::from_constant(value));
+        ctx.make_constant(opref, Value::Int(value));
+        self.setintbound(opref, IntBound::from_constant(value));
     }
 
     /// Record a pure_from_args entry for CSE.
@@ -839,7 +846,7 @@ impl OptIntBounds {
 
     /// Propagate bounds backward after GUARD_TRUE.
     /// The condition (cond_ref) is known to produce a nonzero value (true).
-    fn propagate_bounds_from_guard_true(&mut self, cond_ref: OpRef, ctx: &OptContext) {
+    fn propagate_bounds_from_guard_true(&mut self, cond_ref: OpRef, ctx: &mut OptContext) {
         if let Some(producing_op) = self.find_producing_op(cond_ref, ctx) {
             if producing_op.opcode.returns_bool() {
                 self.setintbound(cond_ref, IntBound::from_constant(1));
@@ -866,7 +873,7 @@ impl OptIntBounds {
 
     /// Propagate bounds backward after GUARD_FALSE.
     /// The condition is known to produce 0 (false).
-    fn propagate_bounds_from_guard_false(&mut self, cond_ref: OpRef, ctx: &OptContext) {
+    fn propagate_bounds_from_guard_false(&mut self, cond_ref: OpRef, ctx: &mut OptContext) {
         self.setintbound(cond_ref, IntBound::from_constant(0));
 
         if let Some(producing_op) = self.find_producing_op(cond_ref, ctx) {
@@ -880,7 +887,7 @@ impl OptIntBounds {
     }
 
     /// Given that a comparison op produced `is_true`, narrow the bounds of its arguments.
-    fn propagate_bounds_from_comparison(&mut self, op: &Op, is_true: bool, ctx: &OptContext) {
+    fn propagate_bounds_from_comparison(&mut self, op: &Op, is_true: bool, ctx: &mut OptContext) {
         // RPython intbounds.py parity: resolve through get_box_replacement
         // so bounds are stored on the canonical OpRef. Without this, SameAs
         // forwarding (e.g. OpRef(44) → OpRef(39)) causes bounds to be set
@@ -1022,7 +1029,7 @@ impl OptIntBounds {
     /// `make_lt` returns truthy ("the bound was actually tightened"), so
     /// `matches!(.., Ok(true))` is the line-by-line equivalent of the
     /// RPython `if`.
-    fn make_int_lt(&mut self, box1: OpRef, box2: OpRef, ctx: &OptContext) {
+    fn make_int_lt(&mut self, box1: OpRef, box2: OpRef, ctx: &mut OptContext) {
         let b2 = self.getintbound(box2, ctx);
         let b1 = self.get_bound_mut(box1);
         let changed1 = matches!(b1.make_lt(&b2), Ok(true));
@@ -1038,7 +1045,7 @@ impl OptIntBounds {
     }
 
     /// intbounds.py:572-578 make_int_le
-    fn make_int_le(&mut self, box1: OpRef, box2: OpRef, ctx: &OptContext) {
+    fn make_int_le(&mut self, box1: OpRef, box2: OpRef, ctx: &mut OptContext) {
         let b2 = self.getintbound(box2, ctx);
         let b1 = self.get_bound_mut(box1);
         let changed1 = matches!(b1.make_le(&b2), Ok(true));
@@ -1054,17 +1061,17 @@ impl OptIntBounds {
     }
 
     /// intbounds.py:580-581 make_int_gt
-    fn make_int_gt(&mut self, box1: OpRef, box2: OpRef, ctx: &OptContext) {
+    fn make_int_gt(&mut self, box1: OpRef, box2: OpRef, ctx: &mut OptContext) {
         self.make_int_lt(box2, box1, ctx);
     }
 
     /// intbounds.py:583-584 make_int_ge
-    fn make_int_ge(&mut self, box1: OpRef, box2: OpRef, ctx: &OptContext) {
+    fn make_int_ge(&mut self, box1: OpRef, box2: OpRef, ctx: &mut OptContext) {
         self.make_int_le(box2, box1, ctx);
     }
 
     /// intbounds.py:586-592 make_unsigned_lt
-    fn make_unsigned_lt(&mut self, box1: OpRef, box2: OpRef, ctx: &OptContext) {
+    fn make_unsigned_lt(&mut self, box1: OpRef, box2: OpRef, ctx: &mut OptContext) {
         let b2 = self.getintbound(box2, ctx);
         let b1 = self.get_bound_mut(box1);
         let changed1 = matches!(b1.make_unsigned_lt(&b2), Ok(true));
@@ -1080,7 +1087,7 @@ impl OptIntBounds {
     }
 
     /// intbounds.py:594-600 make_unsigned_le
-    fn make_unsigned_le(&mut self, box1: OpRef, box2: OpRef, ctx: &OptContext) {
+    fn make_unsigned_le(&mut self, box1: OpRef, box2: OpRef, ctx: &mut OptContext) {
         let b2 = self.getintbound(box2, ctx);
         let b1 = self.get_bound_mut(box1);
         let changed1 = matches!(b1.make_unsigned_le(&b2), Ok(true));
@@ -1095,11 +1102,11 @@ impl OptIntBounds {
         }
     }
 
-    fn make_unsigned_gt(&mut self, box1: OpRef, box2: OpRef, ctx: &OptContext) {
+    fn make_unsigned_gt(&mut self, box1: OpRef, box2: OpRef, ctx: &mut OptContext) {
         self.make_unsigned_lt(box2, box1, ctx);
     }
 
-    fn make_unsigned_ge(&mut self, box1: OpRef, box2: OpRef, ctx: &OptContext) {
+    fn make_unsigned_ge(&mut self, box1: OpRef, box2: OpRef, ctx: &mut OptContext) {
         self.make_unsigned_le(box2, box1, ctx);
     }
 
@@ -1114,7 +1121,7 @@ impl OptIntBounds {
     ///     if b1.intersect(b0):
     ///         self.propagate_bounds_backward(arg1)
     /// ```
-    fn make_eq(&mut self, arg0: OpRef, arg1: OpRef, ctx: &OptContext) {
+    fn make_eq(&mut self, arg0: OpRef, arg1: OpRef, ctx: &mut OptContext) {
         let b1 = self.getintbound(arg1, ctx);
         let b0 = self.get_bound_mut(arg0);
         let changed0 = matches!(b0.intersect(&b1), Ok(true));
@@ -1144,7 +1151,7 @@ impl OptIntBounds {
     ///         if b1.make_ne_const(v0):
     ///             self.propagate_bounds_backward(arg1)
     /// ```
-    fn make_ne(&mut self, arg0: OpRef, arg1: OpRef, ctx: &OptContext) {
+    fn make_ne(&mut self, arg0: OpRef, arg1: OpRef, ctx: &mut OptContext) {
         let b1 = self.getintbound(arg1, ctx);
         if b1.is_constant() {
             let v1 = b1.get_constant();
@@ -1177,11 +1184,15 @@ impl OptIntBounds {
     ///     if box1 is not None:
     ///         dispatch_bounds_ops(self, box1)
     /// ```
-    fn propagate_bounds_backward(&mut self, opref: OpRef, ctx: &OptContext) {
+    ///
+    /// Both branches run unconditionally (no early return after the
+    /// constant fold) — RPython falls through into the `dispatch_bounds_ops`
+    /// call so the producing op of a now-constant value also gets a chance
+    /// to tighten its other arguments.
+    fn propagate_bounds_backward(&mut self, opref: OpRef, ctx: &mut OptContext) {
         let b = self.getintbound(opref, ctx);
         if b.is_constant() {
-            // Already a constant - nothing more to propagate
-            return;
+            self.make_constant_int_ref(opref, b.get_constant(), ctx);
         }
         // Look at the producing operation for backward propagation
         if let Some(producing_op) = self.find_producing_op(opref, ctx) {
@@ -1190,7 +1201,40 @@ impl OptIntBounds {
         }
     }
 
-    fn propagate_bounds_backward_op(&mut self, op: &Op, ctx: &OptContext) {
+    /// intbounds.py:678-693 _propagate_int_is_true_or_zero (helper for
+    /// propagate_bounds_INT_IS_TRUE / IS_ZERO).
+    fn propagate_int_is_true_or_zero(
+        &mut self,
+        op: &Op,
+        valnonzero: i64,
+        valzero: i64,
+        ctx: &mut OptContext,
+    ) {
+        if ctx.is_raw_ptr(op.arg(0)) {
+            return;
+        }
+        let r = self.getintbound(op.pos, ctx);
+        if !r.is_constant() {
+            return;
+        }
+        let arg0 = op.arg(0);
+        let r_const = r.get_constant();
+        if r_const == valnonzero {
+            let b1 = self.getintbound(arg0, ctx);
+            if b1.known_nonnegative() {
+                let _ = self.get_bound_mut(arg0).make_gt_const(0);
+                self.propagate_bounds_backward(arg0, ctx);
+            } else if b1.known_le_const(0) {
+                let _ = self.get_bound_mut(arg0).make_lt_const(0);
+                self.propagate_bounds_backward(arg0, ctx);
+            }
+        } else if r_const == valzero {
+            self.make_constant_int_ref(arg0, 0, ctx);
+            self.propagate_bounds_backward(arg0, ctx);
+        }
+    }
+
+    fn propagate_bounds_backward_op(&mut self, op: &Op, ctx: &mut OptContext) {
         match op.opcode {
             // intbounds.py:701-712 propagate_bounds_INT_ADD
             //
@@ -1457,8 +1501,8 @@ impl OptIntBounds {
                     self.make_ne(op.arg(0), op.arg(1), ctx);
                 }
             }
-            // intbounds.py:678-696 _propagate_int_is_true_or_zero +
-            // propagate_bounds_INT_IS_TRUE.
+            // intbounds.py:678-693 _propagate_int_is_true_or_zero +
+            // propagate_bounds_INT_IS_TRUE / IS_ZERO.
             //
             // ```python
             // def _propagate_int_is_true_or_zero(self, op, valnonzero, valzero):
@@ -1477,49 +1521,18 @@ impl OptIntBounds {
             //         elif r.get_constant_int() == valzero:
             //             self.make_constant_int(op.getarg(0), 0)
             //             self.propagate_bounds_backward(op.getarg(0))
-            // ```
             //
-            // The `make_constant_int` arm requires mutable ctx (it sets
-            // a forwarding to a constant). propagate_bounds_backward
-            // currently runs with `ctx: &OptContext`, so the constant
-            // arm is left out — bounds-only narrowing still fires.
+            // def propagate_bounds_INT_IS_TRUE(self, op):
+            //     self._propagate_int_is_true_or_zero(op, 1, 0)
+            //
+            // def propagate_bounds_INT_IS_ZERO(self, op):
+            //     self._propagate_int_is_true_or_zero(op, 0, 1)
+            // ```
             OpCode::IntIsTrue => {
-                if ctx.is_raw_ptr(op.arg(0)) {
-                    return;
-                }
-                let r = self.getintbound(op.pos, ctx);
-                if r.is_constant() && r.lower == 1 {
-                    let arg0 = op.arg(0);
-                    let b1 = self.getintbound(arg0, ctx);
-                    if b1.known_nonnegative() {
-                        let _ = self.get_bound_mut(arg0).make_gt_const(0);
-                        self.propagate_bounds_backward(arg0, ctx);
-                    } else if b1.known_le_const(0) {
-                        let _ = self.get_bound_mut(arg0).make_lt_const(0);
-                        self.propagate_bounds_backward(arg0, ctx);
-                    }
-                }
-                // r == 0 (false) → arg is zero; needs make_constant_int
-                // which requires &mut OptContext. Skipped for now.
+                self.propagate_int_is_true_or_zero(op, 1, 0, ctx);
             }
             OpCode::IntIsZero => {
-                if ctx.is_raw_ptr(op.arg(0)) {
-                    return;
-                }
-                let r = self.getintbound(op.pos, ctx);
-                if r.is_constant() && r.lower == 0 {
-                    // r == valnonzero==0 (false): arg is nonzero
-                    let arg0 = op.arg(0);
-                    let b1 = self.getintbound(arg0, ctx);
-                    if b1.known_nonnegative() {
-                        let _ = self.get_bound_mut(arg0).make_gt_const(0);
-                        self.propagate_bounds_backward(arg0, ctx);
-                    } else if b1.known_le_const(0) {
-                        let _ = self.get_bound_mut(arg0).make_lt_const(0);
-                        self.propagate_bounds_backward(arg0, ctx);
-                    }
-                }
-                // r == 1 (true) → arg == 0; needs make_constant_int.
+                self.propagate_int_is_true_or_zero(op, 0, 1, ctx);
             }
             _ => {}
         }
@@ -2592,10 +2605,10 @@ mod tests {
         let initial_bounds = vec![(OpRef(0), IntBound::unbounded())];
         let ops = vec![make_op(OpCode::IntNeg, &[OpRef(0)], 1)];
 
-        let (_result, mut pass, ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        let (_result, mut pass, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
         // Manually tighten the result and trigger backward prop
         pass.setintbound(OpRef(1), IntBound::bounded(-5, -1));
-        pass.propagate_bounds_backward(OpRef(1), &ctx);
+        pass.propagate_bounds_backward(OpRef(1), &mut ctx);
         let b0 = pass.bounds[0].as_ref().unwrap();
         assert!(
             b0.lower >= 1,
