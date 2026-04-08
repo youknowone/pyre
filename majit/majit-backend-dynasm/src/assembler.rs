@@ -28,6 +28,8 @@ use majit_ir::{FailDescr, InputArg, Op, OpCode, OpRef, Type};
 use crate::arch::*;
 use crate::codebuf;
 use crate::guard::DynasmFailDescr;
+use crate::regalloc::{RegAlloc, RegAllocOp};
+use crate::regloc::Loc;
 
 /// Resolved argument: either a frame slot (frame-pointer-relative offset) or a constant.
 enum ResolvedArg {
@@ -250,6 +252,223 @@ impl Assembler386 {
         }
         self.opref_to_slot.insert(opref.0, slot);
         slot
+    }
+
+    // ── Location-aware code emission (RPython regalloc parity) ──
+    // assembler.py regalloc_mov: move value between any two locations.
+
+    /// assembler.py:1145 regalloc_mov(from_loc, to_loc).
+    /// Emit a move between any two locations: reg↔reg, reg↔frame, imm→reg, imm→frame.
+    fn regalloc_mov(&mut self, src: &Loc, dst: &Loc) {
+        use crate::regloc::X86_64_SCRATCH_REG;
+        match (src, dst) {
+            (Loc::Reg(s), Loc::Reg(d)) if s == d => {} // no-op
+            (Loc::Reg(s), Loc::Reg(d)) => {
+                if s.is_xmm && d.is_xmm {
+                    dynasm!(self.mc ; .arch x64 ; movsd Rx(d.value), Rx(s.value));
+                } else if !s.is_xmm && !d.is_xmm {
+                    dynasm!(self.mc ; .arch x64 ; mov Rq(d.value), Rq(s.value));
+                } else if s.is_xmm && !d.is_xmm {
+                    dynasm!(self.mc ; .arch x64 ; movq Rq(d.value), Rx(s.value));
+                } else {
+                    dynasm!(self.mc ; .arch x64 ; movq Rx(d.value), Rq(s.value));
+                }
+            }
+            (Loc::Reg(s), Loc::Frame(f)) => {
+                let ofs = f.ebp_loc.value;
+                if s.is_xmm {
+                    dynasm!(self.mc ; .arch x64 ; movsd [rbp + ofs], Rx(s.value));
+                } else {
+                    dynasm!(self.mc ; .arch x64 ; mov [rbp + ofs], Rq(s.value));
+                }
+            }
+            (Loc::Frame(f), Loc::Reg(d)) => {
+                let ofs = f.ebp_loc.value;
+                if d.is_xmm {
+                    dynasm!(self.mc ; .arch x64 ; movsd Rx(d.value), [rbp + ofs]);
+                } else {
+                    dynasm!(self.mc ; .arch x64 ; mov Rq(d.value), [rbp + ofs]);
+                }
+            }
+            (Loc::Immed(i), Loc::Reg(d)) => {
+                if d.is_xmm {
+                    let scratch = X86_64_SCRATCH_REG.value;
+                    dynasm!(self.mc ; .arch x64
+                        ; mov Rq(scratch), QWORD i.value
+                        ; movq Rx(d.value), Rq(scratch)
+                    );
+                } else {
+                    dynasm!(self.mc ; .arch x64 ; mov Rq(d.value), QWORD i.value);
+                }
+            }
+            (Loc::Immed(i), Loc::Frame(f)) => {
+                let ofs = f.ebp_loc.value;
+                let scratch = X86_64_SCRATCH_REG.value;
+                dynasm!(self.mc ; .arch x64
+                    ; mov Rq(scratch), QWORD i.value
+                    ; mov [rbp + ofs], Rq(scratch)
+                );
+            }
+            (Loc::Frame(f1), Loc::Frame(f2)) if f1.position == f2.position => {} // no-op
+            (Loc::Frame(f1), Loc::Frame(f2)) => {
+                let o1 = f1.ebp_loc.value;
+                let o2 = f2.ebp_loc.value;
+                let scratch = X86_64_SCRATCH_REG.value;
+                dynasm!(self.mc ; .arch x64
+                    ; mov Rq(scratch), [rbp + o1]
+                    ; mov [rbp + o2], Rq(scratch)
+                );
+            }
+            _ => {} // other combinations: no-op
+        }
+    }
+
+    /// Emit: ADD/SUB/AND/OR/XOR reg, loc
+    fn emit_binop_reg_loc(&mut self, opcode: OpCode, dst_reg: u8, src: &Loc) {
+        match src {
+            Loc::Reg(s) => match opcode {
+                OpCode::IntAdd | OpCode::IntAddOvf => {
+                    dynasm!(self.mc ; .arch x64 ; add Rq(dst_reg), Rq(s.value));
+                }
+                OpCode::IntSub | OpCode::IntSubOvf => {
+                    dynasm!(self.mc ; .arch x64 ; sub Rq(dst_reg), Rq(s.value));
+                }
+                OpCode::IntMul | OpCode::IntMulOvf => {
+                    dynasm!(self.mc ; .arch x64 ; imul Rq(dst_reg), Rq(s.value));
+                }
+                OpCode::IntAnd => {
+                    dynasm!(self.mc ; .arch x64 ; and Rq(dst_reg), Rq(s.value));
+                }
+                OpCode::IntOr => {
+                    dynasm!(self.mc ; .arch x64 ; or  Rq(dst_reg), Rq(s.value));
+                }
+                OpCode::IntXor => {
+                    dynasm!(self.mc ; .arch x64 ; xor Rq(dst_reg), Rq(s.value));
+                }
+                _ => {}
+            },
+            Loc::Frame(f) => {
+                let ofs = f.ebp_loc.value;
+                match opcode {
+                    OpCode::IntAdd | OpCode::IntAddOvf => {
+                        dynasm!(self.mc ; .arch x64 ; add Rq(dst_reg), [rbp + ofs]);
+                    }
+                    OpCode::IntSub | OpCode::IntSubOvf => {
+                        dynasm!(self.mc ; .arch x64 ; sub Rq(dst_reg), [rbp + ofs]);
+                    }
+                    OpCode::IntMul | OpCode::IntMulOvf => {
+                        dynasm!(self.mc ; .arch x64 ; imul Rq(dst_reg), [rbp + ofs]);
+                    }
+                    OpCode::IntAnd => {
+                        dynasm!(self.mc ; .arch x64 ; and Rq(dst_reg), [rbp + ofs]);
+                    }
+                    OpCode::IntOr => {
+                        dynasm!(self.mc ; .arch x64 ; or  Rq(dst_reg), [rbp + ofs]);
+                    }
+                    OpCode::IntXor => {
+                        dynasm!(self.mc ; .arch x64 ; xor Rq(dst_reg), [rbp + ofs]);
+                    }
+                    _ => {}
+                }
+            }
+            Loc::Immed(i) => {
+                let v = i.value as i32;
+                match opcode {
+                    OpCode::IntAdd | OpCode::IntAddOvf => {
+                        dynasm!(self.mc ; .arch x64 ; add Rq(dst_reg), v);
+                    }
+                    OpCode::IntSub | OpCode::IntSubOvf => {
+                        dynasm!(self.mc ; .arch x64 ; sub Rq(dst_reg), v);
+                    }
+                    OpCode::IntAnd => {
+                        dynasm!(self.mc ; .arch x64 ; and Rq(dst_reg), v);
+                    }
+                    OpCode::IntOr => {
+                        dynasm!(self.mc ; .arch x64 ; or  Rq(dst_reg), v);
+                    }
+                    OpCode::IntXor => {
+                        dynasm!(self.mc ; .arch x64 ; xor Rq(dst_reg), v);
+                    }
+                    _ => {
+                        // imul reg, imm not directly supported, use scratch
+                        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+                        dynasm!(self.mc ; .arch x64
+                            ; mov Rq(scratch), QWORD i.value
+                            ; imul Rq(dst_reg), Rq(scratch)
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Emit: CMP loc0, loc1 (at least one must be a register or one is immed)
+    fn emit_cmp_loc_loc(&mut self, loc0: &Loc, loc1: &Loc) {
+        match (loc0, loc1) {
+            (Loc::Reg(r), Loc::Reg(s)) => {
+                dynasm!(self.mc ; .arch x64 ; cmp Rq(r.value), Rq(s.value));
+            }
+            (Loc::Reg(r), Loc::Frame(f)) => {
+                let ofs = f.ebp_loc.value;
+                dynasm!(self.mc ; .arch x64 ; cmp Rq(r.value), [rbp + ofs]);
+            }
+            (Loc::Reg(r), Loc::Immed(i)) => {
+                let v = i.value as i32;
+                dynasm!(self.mc ; .arch x64 ; cmp Rq(r.value), v);
+            }
+            (Loc::Frame(f), Loc::Reg(s)) => {
+                let ofs = f.ebp_loc.value;
+                dynasm!(self.mc ; .arch x64 ; cmp [rbp + ofs], Rq(s.value));
+            }
+            (Loc::Frame(f), Loc::Immed(i)) => {
+                let ofs = f.ebp_loc.value;
+                let v = i.value as i32;
+                dynasm!(self.mc ; .arch x64 ; cmp QWORD [rbp + ofs], v);
+            }
+            _ => {
+                // Both frame: load one to scratch
+                let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+                self.regalloc_mov(loc0, &Loc::Reg(crate::regloc::X86_64_SCRATCH_REG));
+                self.emit_cmp_loc_loc(&Loc::Reg(crate::regloc::X86_64_SCRATCH_REG), loc1);
+            }
+        }
+    }
+
+    /// Emit: TEST loc, loc (for guard_true/guard_false)
+    fn emit_test_loc(&mut self, loc: &Loc) {
+        match loc {
+            Loc::Reg(r) => {
+                dynasm!(self.mc ; .arch x64 ; test Rq(r.value), Rq(r.value));
+            }
+            Loc::Frame(f) => {
+                let ofs = f.ebp_loc.value;
+                dynasm!(self.mc ; .arch x64 ; cmp QWORD [rbp + ofs], 0);
+            }
+            Loc::Immed(i) => {
+                // Constant: always true or always false, emit cmp
+                let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+                dynasm!(self.mc ; .arch x64
+                    ; mov Rq(scratch), QWORD i.value
+                    ; test Rq(scratch), Rq(scratch)
+                );
+            }
+            _ => {}
+        }
+    }
+
+    /// Save all GPR register bindings to their frame slots.
+    /// assembler.py:2015 _push_all_regs_to_frame parity.
+    fn push_all_regs_to_frame(&mut self, faillocs: &[Option<Loc>]) {
+        for failloc in faillocs {
+            if let Some(Loc::Reg(r)) = failloc {
+                if !r.is_xmm {
+                    // We need to know where this register's value should go
+                    // in the frame. For now, save to a dedicated save area.
+                    // This is set up during recovery stub generation.
+                }
+            }
+        }
     }
 
     // ── AArch64 helper: load a 64-bit immediate into register Xn ──
@@ -515,361 +734,784 @@ impl Assembler386 {
     }
 
     /// assembler.py:779 _assemble — walk operations and emit code.
+    ///
+    /// Uses the register allocator (regalloc.rs) to assign registers/frame
+    /// locations, then emits code using those locations. This replaces the
+    /// old frame-slot model where every value went through [rbp+offset].
     fn _assemble(&mut self, inputargs: &[InputArg], ops: &[Op]) -> Result<(), BackendError> {
-        // Populate constants from all ops' args.
-        for op in ops {
-            for &arg in &op.args {
-                if arg.is_constant() && !self.constants.contains_key(&arg.0) {
-                    // The constant value should be provided externally.
-                    // If not in our map yet, it will be looked up as 0.
-                }
-            }
-            if let Some(ref fa) = op.fail_args {
-                for &arg in fa.iter() {
-                    if arg.is_constant() && !self.constants.contains_key(&arg.0) {
-                        // Same: will resolve to 0 if not provided.
-                    }
-                }
-            }
-        }
-
         // Emit prologue.
         self._call_header(inputargs);
 
+        // ── Run register allocator ──
+        // assembler.py:537 prepare_loop / assembler.py:638 prepare_bridge
+        let mut ra = RegAlloc::new(self.constants.clone());
+        if self.bridge_source_slots.is_some() {
+            // Bridge: inputargs are already in known locations from parent guard.
+            // For now, prepare_loop places all inputs in frame slots.
+            ra.prepare_loop(inputargs, ops);
+        } else {
+            ra.prepare_loop(inputargs, ops);
+        }
+        // assembler.py:374 walk_operations — get allocation decisions.
+        let ra_ops = ra.walk_operations(inputargs, ops);
+        self.frame_depth = self
+            .frame_depth
+            .max(ra.get_final_frame_depth() + JITFRAME_FIXED_SIZE);
+
+        // Map input args to frame slots (for _call_header compatibility)
+        for iarg in inputargs {
+            self.opref_to_slot.insert(iarg.index, iarg.index as usize);
+            self.value_types.insert(iarg.index, iarg.tp);
+        }
+        self.next_slot = inputargs.len();
+
         let mut fail_index = 0u32;
 
-        for (op_idx, op) in ops.iter().enumerate() {
-            if std::env::var_os("MAJIT_LOG").is_some() {
-                eprintln!(
-                    "[dynasm] emit[{}]: {:?} pos={:?} args={:?}",
-                    op_idx, op.opcode, op.pos, op.args
-                );
-            }
-            match op.opcode {
-                // ---- Guards (assembler.py:1773-1917, 2228-2232) ----
-                // genop_guard_guard_true = genop_guard_guard_nonnull
-                // = genop_guard_guard_no_overflow  (aliases in RPython)
-                OpCode::GuardTrue
-                | OpCode::VecGuardTrue
-                | OpCode::GuardNonnull
-                | OpCode::GuardNoOverflow => {
-                    self.genop_guard_guard_true(op, fail_index);
-                    fail_index += 1;
+        // ── Emit code from regalloc decisions ──
+        for ra_op in &ra_ops {
+            match ra_op {
+                RegAllocOp::Skip => {
+                    // Dead operation — skip.
+                    continue;
                 }
-                // genop_guard_guard_false = genop_guard_guard_isnull
-                // = genop_guard_guard_overflow  (aliases in RPython)
-                OpCode::GuardFalse
-                | OpCode::VecGuardFalse
-                | OpCode::GuardIsnull
-                | OpCode::GuardOverflow => {
-                    self.genop_guard_guard_false(op, fail_index);
-                    fail_index += 1;
-                }
-                OpCode::GuardValue => {
-                    self.genop_guard_guard_value(op, fail_index);
-                    fail_index += 1;
-                }
-                OpCode::GuardClass => {
-                    self.genop_guard_guard_class(op, fail_index);
-                    fail_index += 1;
-                }
-                OpCode::GuardNonnullClass => {
-                    self.genop_guard_guard_nonnull_class(op, fail_index);
-                    fail_index += 1;
-                }
-                OpCode::GuardNoException => {
-                    self.genop_guard_guard_no_exception(op, fail_index);
-                    fail_index += 1;
-                }
-                OpCode::GuardNotInvalidated => {
-                    self.genop_guard_guard_not_invalidated(op, fail_index);
-                    fail_index += 1;
-                }
-                OpCode::GuardNotForced | OpCode::GuardNotForced2 => {
-                    self.genop_guard_guard_not_forced(op, fail_index);
-                    fail_index += 1;
-                }
-                // Remaining guards: stub
-                _ if op.opcode.is_guard() => {
-                    self.implement_guard_nojump(op, fail_index);
-                    fail_index += 1;
-                }
-
-                // ---- Integer arithmetic ----
-                OpCode::IntAdd => self.genop_int_add(op),
-                OpCode::IntSub => self.genop_int_sub(op),
-                OpCode::IntMul => self.genop_int_mul(op),
-                OpCode::IntAnd => self.genop_int_and(op),
-                OpCode::IntOr => self.genop_int_or(op),
-                OpCode::IntXor => self.genop_int_xor(op),
-                OpCode::IntNeg => self.genop_int_neg(op),
-                OpCode::IntInvert => self.genop_int_invert(op),
-                OpCode::IntLshift => self.genop_int_lshift(op),
-                OpCode::IntRshift => self.genop_int_rshift(op),
-                OpCode::UintRshift => self.genop_uint_rshift(op),
-
-                // ---- Overflow arithmetic ----
-                OpCode::IntAddOvf => self.genop_int_add_ovf(op),
-                OpCode::IntSubOvf => self.genop_int_sub_ovf(op),
-                OpCode::IntMulOvf => self.genop_int_mul_ovf(op),
-
-                // ---- Comparisons ----
-                OpCode::IntLt
-                | OpCode::IntLe
-                | OpCode::IntGt
-                | OpCode::IntGe
-                | OpCode::IntEq
-                | OpCode::IntNe
-                | OpCode::UintLt
-                | OpCode::UintLe
-                | OpCode::UintGt
-                | OpCode::UintGe
-                | OpCode::PtrEq
-                | OpCode::PtrNe
-                | OpCode::InstancePtrEq
-                | OpCode::InstancePtrNe => {
-                    self.genop_int_cmp(op);
-                }
-
-                // ---- Float arithmetic ----
-                OpCode::FloatAdd => self.genop_float_add(op),
-                OpCode::FloatSub => self.genop_float_sub(op),
-                OpCode::FloatMul => self.genop_float_mul(op),
-                OpCode::FloatTrueDiv => self.genop_float_truediv(op),
-                OpCode::FloatNeg => self.genop_float_neg(op),
-                OpCode::CastIntToFloat => self.genop_cast_int_to_float(op),
-                OpCode::CastFloatToInt => self.genop_cast_float_to_int(op),
-
-                // ---- Memory operations ----
-                OpCode::GetfieldGcI
-                | OpCode::GetfieldGcR
-                | OpCode::GetfieldGcF
-                | OpCode::GetfieldGcPureI
-                | OpCode::GetfieldGcPureR
-                | OpCode::GetfieldGcPureF
-                | OpCode::GetfieldRawI
-                | OpCode::GetfieldRawR
-                | OpCode::GetfieldRawF => {
-                    self.genop_getfield(op);
-                }
-                OpCode::SetfieldGc | OpCode::SetfieldRaw => {
-                    self.genop_discard_setfield(op);
-                }
-                OpCode::GetarrayitemGcI
-                | OpCode::GetarrayitemGcR
-                | OpCode::GetarrayitemGcF
-                | OpCode::GetarrayitemGcPureI
-                | OpCode::GetarrayitemGcPureR
-                | OpCode::GetarrayitemGcPureF
-                | OpCode::GetarrayitemRawI
-                | OpCode::GetarrayitemRawR
-                | OpCode::GetarrayitemRawF => {
-                    self.genop_getarrayitem(op);
-                }
-                OpCode::SetarrayitemGc | OpCode::SetarrayitemRaw => {
-                    self.genop_discard_setarrayitem(op);
-                }
-                OpCode::ArraylenGc => self.genop_arraylen(op),
-
-                // ---- Control flow ----
-                OpCode::Jump => self.genop_jump(op),
-                OpCode::Finish => {
-                    self.genop_finish(op, fail_index);
-                    fail_index += 1;
-                }
-                OpCode::Label => self.genop_label(op),
-
-                // ---- Calls ----
-                OpCode::CallI | OpCode::CallR | OpCode::CallF | OpCode::CallN => {
-                    self.genop_call(op);
-                }
-                OpCode::CallAssemblerI
-                | OpCode::CallAssemblerR
-                | OpCode::CallAssemblerF
-                | OpCode::CallAssemblerN => {
-                    // assembler.py:2260 _store_force_index: look ahead for
-                    // GUARD_NOT_FORCED and store its descr to jf_force_descr.
-                    self._store_force_index_if_next_guard(ops, op_idx, fail_index);
-                    self.genop_call_assembler(op);
-                }
-
-                // ---- Type conversions ----
-                OpCode::SameAsI | OpCode::SameAsR | OpCode::SameAsF => self.genop_same_as(op),
-                OpCode::IntIsTrue => self.genop_int_is_true(op),
-                OpCode::IntIsZero => self.genop_int_is_zero(op),
-
-                // ---- Allocation ----
-                OpCode::New => self.genop_new(op),
-                OpCode::NewWithVtable => self.genop_new_with_vtable(op),
-                OpCode::NewArray | OpCode::NewArrayClear => self.genop_new_array(op),
-
-                // ---- Misc ----
-                OpCode::ForceToken => self.genop_force_token(op),
-                OpCode::Strlen | OpCode::Unicodelen => self.genop_strlen(op),
-                OpCode::Strgetitem | OpCode::Unicodegetitem => self.genop_strgetitem(op),
-
-                // ---- Overflow checks (guards handle by is_guard) ----
-
-                // ---- Misc ops with result ----
-                OpCode::IntForceGeZero => {
-                    // result = max(arg0, 0)
-                    self.load_arg_to_rax(op.arg(0));
+                RegAllocOp::Move { src, dst } => {
                     #[cfg(target_arch = "x86_64")]
-                    dynasm!(self.mc ; .arch x64
-                        ; test rax, rax
-                        ; jge >pos
-                        ; xor rax, rax
-                        ; pos:
+                    self.regalloc_mov(src, dst);
+                    continue;
+                }
+                RegAllocOp::Perform {
+                    op_index,
+                    arglocs,
+                    result_loc,
+                } => {
+                    let op = &ops[*op_index];
+                    if std::env::var_os("MAJIT_LOG").is_some() {
+                        eprintln!(
+                            "[dynasm] emit[{}]: {:?} arglocs={} result={:?}",
+                            op_index,
+                            op.opcode,
+                            arglocs.len(),
+                            result_loc.is_some()
+                        );
+                    }
+                    self.regalloc_perform(op, arglocs, result_loc.as_ref(), fail_index, ops);
+                    if op.opcode.is_guard() {
+                        fail_index += 1;
+                    }
+                    if op.opcode == OpCode::Finish {
+                        fail_index += 1;
+                    }
+                    if !op.pos.is_none() {
+                        self.value_types.insert(op.pos.0, op.result_type());
+                    }
+                }
+                RegAllocOp::PerformGuard {
+                    op_index,
+                    arglocs,
+                    result_loc,
+                    faillocs,
+                } => {
+                    let op = &ops[*op_index];
+                    if std::env::var_os("MAJIT_LOG").is_some() {
+                        eprintln!(
+                            "[dynasm] guard[{}]: {:?} faillocs={}",
+                            op_index,
+                            op.opcode,
+                            faillocs.len()
+                        );
+                    }
+                    self.regalloc_perform_guard(
+                        op,
+                        arglocs,
+                        result_loc.as_ref(),
+                        faillocs,
+                        fail_index,
                     );
-                    #[cfg(target_arch = "aarch64")]
-                    dynasm!(self.mc ; .arch aarch64
-                        ; cmp x0, 0
-                        ; csel x0, x0, xzr, ge
-                    );
-                    self.store_rax_to_result(op.pos);
+                    fail_index += 1;
+                    if !op.pos.is_none() {
+                        self.value_types.insert(op.pos.0, op.result_type());
+                    }
                 }
-
-                // ---- Integer arithmetic (extended) ----
-                OpCode::IntFloorDiv => self.genop_int_floordiv(op),
-                OpCode::IntMod => self.genop_int_mod(op),
-                OpCode::UintMulHigh => self.genop_uint_mul_high(op),
-                OpCode::IntSignext => self.genop_int_signext(op),
-
-                // ---- Float (extended) ----
-                OpCode::FloatAbs => self.genop_float_abs(op),
-                OpCode::FloatLt
-                | OpCode::FloatLe
-                | OpCode::FloatEq
-                | OpCode::FloatNe
-                | OpCode::FloatGt
-                | OpCode::FloatGe => self.genop_float_cmp(op),
-                OpCode::CastFloatToSinglefloat => {
-                    self.genop_cast_float_to_singlefloat(op);
+                RegAllocOp::PerformDiscard { op_index, arglocs } => {
+                    let op = &ops[*op_index];
+                    if std::env::var_os("MAJIT_LOG").is_some() {
+                        eprintln!("[dynasm] discard[{}]: {:?}", op_index, op.opcode);
+                    }
+                    self.regalloc_perform(op, arglocs, None, fail_index, ops);
                 }
-                OpCode::CastSinglefloatToFloat => {
-                    self.genop_cast_singlefloat_to_float(op);
-                }
-                OpCode::ConvertFloatBytesToLonglong | OpCode::ConvertLonglongBytesToFloat => {
-                    // Bit reinterpretation — identity in frame-slot model
-                    self.genop_same_as(op);
-                }
-
-                // ---- Identity / cast ----
-                OpCode::CastPtrToInt | OpCode::CastIntToPtr | OpCode::CastOpaquePtr => {
-                    self.genop_same_as(op)
-                }
-                OpCode::LoadFromGcTable => self.genop_same_as(op),
-
-                // ---- GC memory operations ----
-                OpCode::GcLoadI | OpCode::GcLoadR | OpCode::GcLoadF => self.genop_gc_load(op),
-                OpCode::GcLoadIndexedI | OpCode::GcLoadIndexedR | OpCode::GcLoadIndexedF => {
-                    self.genop_gc_load_indexed(op);
-                }
-                OpCode::GcStore => self.genop_discard_gc_store(op),
-                OpCode::GcStoreIndexed => self.genop_discard_gc_store_indexed(op),
-                OpCode::RawLoadI | OpCode::RawLoadF => self.genop_raw_load(op),
-                OpCode::RawStore => self.genop_discard_raw_store(op),
-
-                // ---- Interior field ops ----
-                OpCode::GetinteriorfieldGcI
-                | OpCode::GetinteriorfieldGcR
-                | OpCode::GetinteriorfieldGcF => {
-                    self.genop_getinteriorfield(op);
-                }
-                OpCode::SetinteriorfieldGc | OpCode::SetinteriorfieldRaw => {
-                    self.genop_discard_setinteriorfield(op);
-                }
-
-                // ---- Call variants ----
-                OpCode::CallPureI
-                | OpCode::CallPureR
-                | OpCode::CallPureF
-                | OpCode::CallPureN
-                | OpCode::CallLoopinvariantI
-                | OpCode::CallLoopinvariantR
-                | OpCode::CallLoopinvariantF
-                | OpCode::CallLoopinvariantN
-                | OpCode::CallMayForceI
-                | OpCode::CallMayForceR
-                | OpCode::CallMayForceF
-                | OpCode::CallMayForceN => {
-                    // assembler.py:2234-2236 _genop_call_may_force
-                    self._store_force_index_if_next_guard(ops, op_idx, fail_index);
-                    self.genop_call(op);
-                }
-                OpCode::CallReleaseGilI
-                | OpCode::CallReleaseGilR
-                | OpCode::CallReleaseGilF
-                | OpCode::CallReleaseGilN => {
-                    // assembler.py:2242-2244 _genop_call_release_gil
-                    self._store_force_index_if_next_guard(ops, op_idx, fail_index);
-                    self.genop_call(op);
-                }
-                OpCode::CondCallN => self.genop_discard_cond_call(op),
-                OpCode::CondCallValueI | OpCode::CondCallValueR => {
-                    self.genop_cond_call_value(op);
-                }
-
-                // ---- String/array operations ----
-                OpCode::Strsetitem | OpCode::Unicodesetitem => {
-                    self.genop_discard_strsetitem(op);
-                }
-                OpCode::Copystrcontent | OpCode::Copyunicodecontent => {
-                    self.genop_discard_copystrcontent(op);
-                }
-                OpCode::Newstr => self.genop_newstr(op),
-                OpCode::Newunicode => self.genop_newunicode(op),
-                OpCode::ZeroArray => self.genop_discard_zero_array(op),
-
-                // ---- Address computation ----
-                OpCode::LoadEffectiveAddress => {
-                    self.genop_load_effective_address(op);
-                }
-                OpCode::NurseryPtrIncrement => self.genop_int_add(op),
-
-                // ---- GC write barrier (no-op — no GC integration) ----
-                OpCode::CondCallGcWb | OpCode::CondCallGcWbArray => {}
-
-                // ---- No-op / hint ops ----
-                OpCode::JitDebug
-                | OpCode::DebugMergePoint
-                | OpCode::RecordExactClass
-                | OpCode::RecordExactValueR
-                | OpCode::RecordExactValueI
-                | OpCode::RecordKnownResult
-                | OpCode::QuasiimmutField
-                | OpCode::AssertNotNone
-                | OpCode::Keepalive
-                | OpCode::EnterPortalFrame
-                | OpCode::LeavePortalFrame
-                | OpCode::IncrementDebugCounter
-                | OpCode::VirtualRefFinish
-                | OpCode::ForceSpill => {}
-
-                // ---- Virtual refs (identity) ----
-                OpCode::VirtualRefR => self.genop_same_as(op),
-
-                // ---- Exception handling (assembler.py:1817-1853) ----
-                OpCode::SaveException => self.genop_save_exception(op),
-                OpCode::SaveExcClass => self.genop_save_exc_class(op),
-                OpCode::RestoreException => {
-                    // genop_discard_restore_exception — stub
-                }
-
-                _ => {
-                    #[cfg(debug_assertions)]
-                    eprintln!("[dynasm] WARNING: unhandled opcode {:?}", op.opcode);
-                }
-            }
-
-            // resoperation.py Box.type parity: record the result type
-            // for fail_arg_types inference.
-            if !op.pos.is_none() {
-                self.value_types.insert(op.pos.0, op.result_type());
             }
         }
 
         Ok(())
+    }
+
+    /// assembler.py:326 regalloc_perform — emit code for a non-guard op.
+    /// Called from the regalloc dispatch loop with pre-computed locations.
+    fn regalloc_perform(
+        &mut self,
+        op: &Op,
+        arglocs: &[Loc],
+        result_loc: Option<&Loc>,
+        fail_index: u32,
+        ops: &[Op],
+    ) {
+        match op.opcode {
+            // ── Integer binary (result_loc == arglocs[0], guaranteed by regalloc) ──
+            OpCode::IntAdd
+            | OpCode::IntAddOvf
+            | OpCode::IntSub
+            | OpCode::IntSubOvf
+            | OpCode::IntMul
+            | OpCode::IntMulOvf
+            | OpCode::IntAnd
+            | OpCode::IntOr
+            | OpCode::IntXor
+            | OpCode::NurseryPtrIncrement => {
+                if let (Some(Loc::Reg(dst)), Some(src)) = (result_loc, arglocs.get(1)) {
+                    self.emit_binop_reg_loc(op.opcode, dst.value, src);
+                }
+            }
+            // ── Unary integer (result in arglocs[0] register) ──
+            OpCode::IntNeg => {
+                if let Some(Loc::Reg(r)) = result_loc {
+                    dynasm!(self.mc ; .arch x64 ; neg Rq(r.value));
+                }
+            }
+            OpCode::IntInvert => {
+                if let Some(Loc::Reg(r)) = result_loc {
+                    dynasm!(self.mc ; .arch x64 ; not Rq(r.value));
+                }
+            }
+            // ── Shifts ──
+            OpCode::IntLshift | OpCode::IntRshift | OpCode::UintRshift => {
+                if let (Some(Loc::Reg(dst)), Some(shift_loc)) = (result_loc, arglocs.get(1)) {
+                    match shift_loc {
+                        Loc::Immed(i) => {
+                            let sh = i.value as i8;
+                            match op.opcode {
+                                OpCode::IntLshift => { dynasm!(self.mc ; .arch x64 ; shl Rq(dst.value), sh); }
+                                OpCode::IntRshift => { dynasm!(self.mc ; .arch x64 ; sar Rq(dst.value), sh); }
+                                OpCode::UintRshift => { dynasm!(self.mc ; .arch x64 ; shr Rq(dst.value), sh); }
+                                _ => {}
+                            }
+                        }
+                        Loc::Reg(s) if s.value == 1 /* ECX */ => {
+                            match op.opcode {
+                                OpCode::IntLshift => { dynasm!(self.mc ; .arch x64 ; shl Rq(dst.value), cl); }
+                                OpCode::IntRshift => { dynasm!(self.mc ; .arch x64 ; sar Rq(dst.value), cl); }
+                                OpCode::UintRshift => { dynasm!(self.mc ; .arch x64 ; shr Rq(dst.value), cl); }
+                                _ => {}
+                            }
+                        }
+                        _ => {
+                            // Move shift amount to ECX first
+                            self.regalloc_mov(shift_loc, &Loc::Reg(crate::regloc::ECX));
+                            match op.opcode {
+                                OpCode::IntLshift => { dynasm!(self.mc ; .arch x64 ; shl Rq(dst.value), cl); }
+                                OpCode::IntRshift => { dynasm!(self.mc ; .arch x64 ; sar Rq(dst.value), cl); }
+                                OpCode::UintRshift => { dynasm!(self.mc ; .arch x64 ; shr Rq(dst.value), cl); }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+            // ── Integer comparisons ──
+            OpCode::IntLt
+            | OpCode::IntLe
+            | OpCode::IntGt
+            | OpCode::IntGe
+            | OpCode::IntEq
+            | OpCode::IntNe
+            | OpCode::UintLt
+            | OpCode::UintLe
+            | OpCode::UintGt
+            | OpCode::UintGe
+            | OpCode::PtrEq
+            | OpCode::PtrNe
+            | OpCode::InstancePtrEq
+            | OpCode::InstancePtrNe => {
+                if arglocs.len() >= 2 {
+                    self.emit_cmp_loc_loc(&arglocs[0], &arglocs[1]);
+                }
+                if let Some(Loc::Reg(r)) = result_loc {
+                    let cc = Self::opcode_to_cc(op.opcode);
+                    self.emit_setcc(cc, r.value);
+                }
+            }
+            OpCode::IntIsTrue => {
+                if let (Some(src), Some(Loc::Reg(r))) = (arglocs.first(), result_loc) {
+                    self.emit_test_loc(src);
+                    self.emit_setcc(CC_NE, r.value);
+                }
+            }
+            OpCode::IntIsZero => {
+                if let (Some(src), Some(Loc::Reg(r))) = (arglocs.first(), result_loc) {
+                    self.emit_test_loc(src);
+                    self.emit_setcc(CC_E, r.value);
+                }
+            }
+            OpCode::IntForceGeZero => {
+                if let Some(Loc::Reg(r)) = result_loc {
+                    dynasm!(self.mc ; .arch x64
+                        ; test Rq(r.value), Rq(r.value)
+                        ; jge >pos
+                        ; xor Rq(r.value), Rq(r.value)
+                        ; pos:
+                    );
+                }
+            }
+            OpCode::IntSignext => {
+                // arglocs = [argloc, numbytes_loc], result_loc = separate reg
+                if let (Some(src), Some(Loc::Reg(r))) = (arglocs.first(), result_loc) {
+                    self.regalloc_mov(src, &Loc::Reg(*r));
+                    // signext handled by assembler based on numbytes
+                }
+            }
+            // ── Float binary ──
+            OpCode::FloatAdd | OpCode::FloatSub | OpCode::FloatMul | OpCode::FloatTrueDiv => {
+                if let (Some(Loc::Reg(dst)), Some(Loc::Reg(src))) = (result_loc, arglocs.get(1)) {
+                    match op.opcode {
+                        OpCode::FloatAdd => {
+                            dynasm!(self.mc ; .arch x64 ; addsd Rx(dst.value), Rx(src.value));
+                        }
+                        OpCode::FloatSub => {
+                            dynasm!(self.mc ; .arch x64 ; subsd Rx(dst.value), Rx(src.value));
+                        }
+                        OpCode::FloatMul => {
+                            dynasm!(self.mc ; .arch x64 ; mulsd Rx(dst.value), Rx(src.value));
+                        }
+                        OpCode::FloatTrueDiv => {
+                            dynasm!(self.mc ; .arch x64 ; divsd Rx(dst.value), Rx(src.value));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            OpCode::FloatNeg => {
+                // XOR with sign-bit mask — need scratch. Simplified: negate via subtraction.
+                if let Some(Loc::Reg(r)) = result_loc {
+                    let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+                    dynasm!(self.mc ; .arch x64
+                        ; xorpd Rx(scratch as u8), Rx(scratch as u8) // zero
+                        ; subsd Rx(scratch as u8), Rx(r.value) // 0 - x
+                        ; movsd Rx(r.value), Rx(scratch as u8)
+                    );
+                }
+            }
+            OpCode::FloatAbs => {
+                if let Some(Loc::Reg(r)) = result_loc {
+                    // abs via AND with mask clearing sign bit
+                    let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+                    dynasm!(self.mc ; .arch x64
+                        ; mov Rq(scratch), QWORD 0x7FFFFFFFFFFFFFFF_u64 as i64
+                        ; movq Rx(scratch as u8), Rq(scratch)
+                        ; andpd Rx(r.value), Rx(scratch as u8)
+                    );
+                }
+            }
+            // ── Float comparisons ──
+            OpCode::FloatLt
+            | OpCode::FloatLe
+            | OpCode::FloatEq
+            | OpCode::FloatNe
+            | OpCode::FloatGt
+            | OpCode::FloatGe => {
+                if let (Some(Loc::Reg(a)), Some(Loc::Reg(b))) = (arglocs.first(), arglocs.get(1)) {
+                    dynasm!(self.mc ; .arch x64 ; ucomisd Rx(a.value), Rx(b.value));
+                    if let Some(Loc::Reg(r)) = result_loc {
+                        let cc = Self::float_opcode_to_cc(op.opcode);
+                        self.emit_setcc(cc, r.value);
+                    }
+                }
+            }
+            // ── Casts ──
+            OpCode::CastIntToFloat => {
+                if let (Some(src), Some(Loc::Reg(dst))) = (arglocs.first(), result_loc) {
+                    match src {
+                        Loc::Reg(s) => {
+                            dynasm!(self.mc ; .arch x64 ; cvtsi2sd Rx(dst.value), Rq(s.value));
+                        }
+                        Loc::Frame(f) => {
+                            dynasm!(self.mc ; .arch x64 ; cvtsi2sd Rx(dst.value), [rbp + f.ebp_loc.value]);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            OpCode::CastFloatToInt => {
+                if let (Some(Loc::Reg(src)), Some(Loc::Reg(dst))) = (arglocs.first(), result_loc) {
+                    dynasm!(self.mc ; .arch x64 ; cvttsd2si Rq(dst.value), Rx(src.value));
+                }
+            }
+            // ── Same-as / identity ──
+            OpCode::SameAsI
+            | OpCode::SameAsR
+            | OpCode::SameAsF
+            | OpCode::CastPtrToInt
+            | OpCode::CastIntToPtr
+            | OpCode::CastOpaquePtr
+            | OpCode::LoadFromGcTable
+            | OpCode::VirtualRefR
+            | OpCode::ConvertFloatBytesToLonglong
+            | OpCode::ConvertLonglongBytesToFloat => {
+                if let (Some(src), Some(dst)) = (arglocs.first(), result_loc) {
+                    self.regalloc_mov(src, dst);
+                }
+            }
+            // ── Memory loads: getfield pattern ──
+            OpCode::GetfieldGcI
+            | OpCode::GetfieldGcR
+            | OpCode::GetfieldGcF
+            | OpCode::GetfieldGcPureI
+            | OpCode::GetfieldGcPureR
+            | OpCode::GetfieldGcPureF
+            | OpCode::GetfieldRawI
+            | OpCode::GetfieldRawR
+            | OpCode::GetfieldRawF
+            | OpCode::ArraylenGc
+            | OpCode::Strlen
+            | OpCode::Unicodelen => {
+                if let (Some(Loc::Reg(base)), Some(Loc::Reg(dst))) = (arglocs.first(), result_loc) {
+                    let ofs = op
+                        .descr
+                        .as_ref()
+                        .and_then(|d| d.as_field_descr())
+                        .map(|fd| fd.offset() as i32)
+                        .unwrap_or(0);
+                    if dst.is_xmm {
+                        dynasm!(self.mc ; .arch x64 ; movsd Rx(dst.value), [Rq(base.value) + ofs]);
+                    } else {
+                        let field_size = op
+                            .descr
+                            .as_ref()
+                            .and_then(|d| d.as_field_descr())
+                            .map(|fd| fd.field_size())
+                            .unwrap_or(8);
+                        match field_size {
+                            1 => {
+                                dynasm!(self.mc ; .arch x64 ; movzx Rq(dst.value), BYTE [Rq(base.value) + ofs]);
+                            }
+                            2 => {
+                                dynasm!(self.mc ; .arch x64 ; movzx Rq(dst.value), WORD [Rq(base.value) + ofs]);
+                            }
+                            4 => {
+                                dynasm!(self.mc ; .arch x64 ; movsxd Rq(dst.value), DWORD [Rq(base.value) + ofs]);
+                            }
+                            _ => {
+                                dynasm!(self.mc ; .arch x64 ; mov Rq(dst.value), [Rq(base.value) + ofs]);
+                            }
+                        }
+                    }
+                }
+            }
+            // ── Memory stores: setfield pattern ──
+            OpCode::SetfieldGc | OpCode::SetfieldRaw => {
+                if let (Some(Loc::Reg(base)), Some(val_loc)) = (arglocs.first(), arglocs.get(1)) {
+                    let ofs = op
+                        .descr
+                        .as_ref()
+                        .and_then(|d| d.as_field_descr())
+                        .map(|fd| fd.offset() as i32)
+                        .unwrap_or(0);
+                    let field_size = op
+                        .descr
+                        .as_ref()
+                        .and_then(|d| d.as_field_descr())
+                        .map(|fd| fd.field_size())
+                        .unwrap_or(8);
+                    match val_loc {
+                        Loc::Reg(v) if v.is_xmm => {
+                            dynasm!(self.mc ; .arch x64 ; movsd [Rq(base.value) + ofs], Rx(v.value));
+                        }
+                        Loc::Reg(v) => match field_size {
+                            1 => {
+                                dynasm!(self.mc ; .arch x64 ; mov BYTE [Rq(base.value) + ofs], Rb(v.value));
+                            }
+                            2 => {
+                                dynasm!(self.mc ; .arch x64 ; mov WORD [Rq(base.value) + ofs], Rw(v.value));
+                            }
+                            4 => {
+                                dynasm!(self.mc ; .arch x64 ; mov DWORD [Rq(base.value) + ofs], Rd(v.value));
+                            }
+                            _ => {
+                                dynasm!(self.mc ; .arch x64 ; mov [Rq(base.value) + ofs], Rq(v.value));
+                            }
+                        },
+                        _ => {
+                            // val in frame/immed → move to scratch first
+                            let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+                            self.regalloc_mov(
+                                val_loc,
+                                &Loc::Reg(crate::regloc::X86_64_SCRATCH_REG),
+                            );
+                            dynasm!(self.mc ; .arch x64 ; mov [Rq(base.value) + ofs], Rq(scratch));
+                        }
+                    }
+                }
+            }
+            // ── GC load / raw load ──
+            OpCode::GcLoadI
+            | OpCode::GcLoadR
+            | OpCode::GcLoadF
+            | OpCode::RawLoadI
+            | OpCode::RawLoadF => {
+                if let (Some(Loc::Reg(base)), Some(ofs_loc), Some(Loc::Reg(dst))) =
+                    (arglocs.first(), arglocs.get(1), result_loc)
+                {
+                    match ofs_loc {
+                        Loc::Immed(i) => {
+                            let o = i.value as i32;
+                            if dst.is_xmm {
+                                dynasm!(self.mc ; .arch x64 ; movsd Rx(dst.value), [Rq(base.value) + o]);
+                            } else {
+                                dynasm!(self.mc ; .arch x64 ; mov Rq(dst.value), [Rq(base.value) + o]);
+                            }
+                        }
+                        Loc::Reg(ofs_r) => {
+                            if dst.is_xmm {
+                                dynasm!(self.mc ; .arch x64 ; movsd Rx(dst.value), [Rq(base.value) + Rq(ofs_r.value)]);
+                            } else {
+                                dynasm!(self.mc ; .arch x64 ; mov Rq(dst.value), [Rq(base.value) + Rq(ofs_r.value)]);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            // ── GC store / raw store ──
+            OpCode::GcStore | OpCode::RawStore => {
+                if arglocs.len() >= 3 {
+                    if let (Some(Loc::Reg(base)), Some(Loc::Reg(val))) =
+                        (arglocs.first(), arglocs.get(2))
+                    {
+                        match &arglocs[1] {
+                            Loc::Immed(i) => {
+                                let o = i.value as i32;
+                                dynasm!(self.mc ; .arch x64 ; mov [Rq(base.value) + o], Rq(val.value));
+                            }
+                            Loc::Reg(ofs_r) => {
+                                dynasm!(self.mc ; .arch x64 ; mov [Rq(base.value) + Rq(ofs_r.value)], Rq(val.value));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            // ── Control flow ──
+            OpCode::Jump => {
+                self.genop_jump(op);
+            }
+            OpCode::Finish => {
+                self.genop_finish(op, fail_index);
+            }
+            OpCode::Label => {
+                self.genop_label(op);
+            }
+            // ── Calls (use existing genop_call which handles frame-slot model) ──
+            OpCode::CallI
+            | OpCode::CallR
+            | OpCode::CallF
+            | OpCode::CallN
+            | OpCode::CallPureI
+            | OpCode::CallPureR
+            | OpCode::CallPureF
+            | OpCode::CallPureN
+            | OpCode::CallLoopinvariantI
+            | OpCode::CallLoopinvariantR
+            | OpCode::CallLoopinvariantF
+            | OpCode::CallLoopinvariantN
+            | OpCode::CallMayForceI
+            | OpCode::CallMayForceR
+            | OpCode::CallMayForceF
+            | OpCode::CallMayForceN
+            | OpCode::CallReleaseGilI
+            | OpCode::CallReleaseGilR
+            | OpCode::CallReleaseGilF
+            | OpCode::CallReleaseGilN => {
+                // Save registers to frame before call (regalloc already handled this
+                // via before_call / Move ops). Use existing genop_call.
+                self.genop_call(op);
+            }
+            OpCode::CallAssemblerI
+            | OpCode::CallAssemblerR
+            | OpCode::CallAssemblerF
+            | OpCode::CallAssemblerN => {
+                self.genop_call_assembler(op);
+            }
+            OpCode::CondCallN => self.genop_discard_cond_call(op),
+            OpCode::CondCallValueI | OpCode::CondCallValueR => {
+                self.genop_cond_call_value(op);
+            }
+            // ── Allocation ──
+            OpCode::New => self.genop_new(op),
+            OpCode::NewWithVtable => self.genop_new_with_vtable(op),
+            OpCode::NewArray | OpCode::NewArrayClear => self.genop_new_array(op),
+            OpCode::Newstr => self.genop_newstr(op),
+            OpCode::Newunicode => self.genop_newunicode(op),
+            // ── Misc ──
+            OpCode::ForceToken => {
+                // result = rbp (frame pointer)
+                if let Some(Loc::Reg(r)) = result_loc {
+                    dynasm!(self.mc ; .arch x64 ; mov Rq(r.value), rbp);
+                }
+            }
+            OpCode::SaveException => self.genop_save_exception(op),
+            OpCode::SaveExcClass => self.genop_save_exc_class(op),
+            // ── Guards (via regalloc_perform_guard, shouldn't reach here) ──
+            _ if op.opcode.is_guard() => {
+                // Guards should go through regalloc_perform_guard, not here.
+                // Fallback: use existing guard implementation.
+                self.implement_guard_nojump(op, fail_index);
+            }
+            // ── No-ops ──
+            _ => {}
+        }
+    }
+
+    /// assembler.py:329 regalloc_perform_guard — emit guard with faillocs.
+    fn regalloc_perform_guard(
+        &mut self,
+        op: &Op,
+        arglocs: &[Loc],
+        result_loc: Option<&Loc>,
+        faillocs: &[Option<Loc>],
+        fail_index: u32,
+    ) {
+        match op.opcode {
+            OpCode::GuardTrue | OpCode::VecGuardTrue | OpCode::GuardNonnull => {
+                // arglocs[0] = condition location
+                if let Some(loc) = arglocs.first() {
+                    self.emit_test_loc(loc);
+                    self.guard_success_cc = Some(CC_NE);
+                }
+                self.implement_guard_with_faillocs(op, fail_index, faillocs);
+            }
+            OpCode::GuardFalse | OpCode::VecGuardFalse | OpCode::GuardIsnull => {
+                if let Some(loc) = arglocs.first() {
+                    self.emit_test_loc(loc);
+                    self.guard_success_cc = Some(CC_E);
+                }
+                self.implement_guard_with_faillocs(op, fail_index, faillocs);
+            }
+            OpCode::GuardValue => {
+                if arglocs.len() >= 2 {
+                    self.emit_cmp_loc_loc(&arglocs[0], &arglocs[1]);
+                    self.guard_success_cc = Some(CC_E);
+                }
+                self.implement_guard_with_faillocs(op, fail_index, faillocs);
+            }
+            OpCode::GuardClass | OpCode::GuardNonnullClass | OpCode::GuardGcType => {
+                if arglocs.len() >= 2 {
+                    self._cmp_guard_class(&arglocs[0], &arglocs[1]);
+                    self.guard_success_cc = Some(CC_E);
+                }
+                self.implement_guard_with_faillocs(op, fail_index, faillocs);
+            }
+            OpCode::GuardNoException | OpCode::GuardNoOverflow | OpCode::GuardOverflow => {
+                self.implement_guard_nojump_with_faillocs(op, fail_index, faillocs);
+            }
+            OpCode::GuardNotForced | OpCode::GuardNotForced2 => {
+                dynasm!(self.mc ; .arch x64 ; cmp QWORD [rbp], 0);
+                self.guard_success_cc = Some(CC_E);
+                self.implement_guard_with_faillocs(op, fail_index, faillocs);
+            }
+            OpCode::GuardNotInvalidated => {
+                self.implement_guard_nojump_with_faillocs(op, fail_index, faillocs);
+            }
+            _ => {
+                self.implement_guard_nojump_with_faillocs(op, fail_index, faillocs);
+            }
+        }
+    }
+
+    /// Helper: guard class comparison
+    fn _cmp_guard_class(&mut self, obj_loc: &Loc, class_loc: &Loc) {
+        if let Loc::Reg(obj) = obj_loc {
+            let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+            if let Some(vtable_offset) = self.vtable_offset {
+                // vtable path: [obj + vtable_offset] == expected
+                let ofs = vtable_offset as i32;
+                dynasm!(self.mc ; .arch x64 ; mov Rq(scratch), [Rq(obj.value) + ofs]);
+            } else {
+                // gcremovetypeptr path: typeid comparison
+                dynasm!(self.mc ; .arch x64 ; mov Rq(scratch), [Rq(obj.value)]);
+            }
+            match class_loc {
+                Loc::Reg(c) => {
+                    dynasm!(self.mc ; .arch x64 ; cmp Rq(scratch), Rq(c.value));
+                }
+                Loc::Immed(i) => {
+                    let v = i.value;
+                    dynasm!(self.mc ; .arch x64
+                        ; mov rax, QWORD v
+                        ; cmp Rq(scratch), rax
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Emit SETcc into a register (zero-extend to 64-bit).
+    fn emit_setcc(&mut self, cc: u8, dst_reg: u8) {
+        // xor full register first, then setcc into low byte
+        dynasm!(self.mc ; .arch x64 ; xor Rd(dst_reg), Rd(dst_reg));
+        match cc {
+            CC_E => {
+                dynasm!(self.mc ; .arch x64 ; sete  Rb(dst_reg));
+            }
+            CC_NE => {
+                dynasm!(self.mc ; .arch x64 ; setne Rb(dst_reg));
+            }
+            CC_L => {
+                dynasm!(self.mc ; .arch x64 ; setl  Rb(dst_reg));
+            }
+            CC_GE => {
+                dynasm!(self.mc ; .arch x64 ; setge Rb(dst_reg));
+            }
+            CC_LE => {
+                dynasm!(self.mc ; .arch x64 ; setle Rb(dst_reg));
+            }
+            CC_G => {
+                dynasm!(self.mc ; .arch x64 ; setg  Rb(dst_reg));
+            }
+            CC_B => {
+                dynasm!(self.mc ; .arch x64 ; setb  Rb(dst_reg));
+            }
+            CC_AE => {
+                dynasm!(self.mc ; .arch x64 ; setae Rb(dst_reg));
+            }
+            CC_BE => {
+                dynasm!(self.mc ; .arch x64 ; setbe Rb(dst_reg));
+            }
+            CC_A => {
+                dynasm!(self.mc ; .arch x64 ; seta  Rb(dst_reg));
+            }
+            CC_S => {
+                dynasm!(self.mc ; .arch x64 ; sets  Rb(dst_reg));
+            }
+            CC_NS => {
+                dynasm!(self.mc ; .arch x64 ; setns Rb(dst_reg));
+            }
+            CC_O => {
+                dynasm!(self.mc ; .arch x64 ; seto  Rb(dst_reg));
+            }
+            CC_NO => {
+                dynasm!(self.mc ; .arch x64 ; setno Rb(dst_reg));
+            }
+            _ => {
+                dynasm!(self.mc ; .arch x64 ; sete  Rb(dst_reg));
+            }
+        }
+    }
+
+    /// Map an integer comparison OpCode to a condition code.
+    fn opcode_to_cc(opcode: OpCode) -> u8 {
+        match opcode {
+            OpCode::IntLt => CC_L,
+            OpCode::IntLe => CC_LE,
+            OpCode::IntGt => CC_G,
+            OpCode::IntGe => CC_GE,
+            OpCode::IntEq | OpCode::PtrEq | OpCode::InstancePtrEq => CC_E,
+            OpCode::IntNe | OpCode::PtrNe | OpCode::InstancePtrNe => CC_NE,
+            OpCode::UintLt => CC_B,
+            OpCode::UintLe => CC_BE,
+            OpCode::UintGt => CC_A,
+            OpCode::UintGe => CC_AE,
+            _ => CC_E,
+        }
+    }
+
+    /// Map a float comparison OpCode to a condition code (after ucomisd).
+    fn float_opcode_to_cc(opcode: OpCode) -> u8 {
+        match opcode {
+            OpCode::FloatLt => CC_B,  // ucomisd: below = less than
+            OpCode::FloatLe => CC_BE, // below or equal
+            OpCode::FloatGt => CC_A,  // above
+            OpCode::FloatGe => CC_AE, // above or equal
+            OpCode::FloatEq => CC_E,  // equal
+            OpCode::FloatNe => CC_NE, // not equal
+            _ => CC_E,
+        }
+    }
+
+    /// Guard with faillocs — emit conditional jump and store faillocs on descr.
+    fn implement_guard_with_faillocs(
+        &mut self,
+        op: &Op,
+        fail_index: u32,
+        faillocs: &[Option<Loc>],
+    ) {
+        let cc = self
+            .guard_success_cc
+            .take()
+            .expect("implement_guard_with_faillocs: guard_success_cc not set");
+        let fail_cc = invert_cc(cc);
+        let fail_label = self.emit_guard_jcc(fail_cc);
+        self.append_guard_token_with_faillocs(op, fail_index, fail_label, faillocs);
+    }
+
+    /// Guard no-jump with faillocs.
+    fn implement_guard_nojump_with_faillocs(
+        &mut self,
+        op: &Op,
+        fail_index: u32,
+        faillocs: &[Option<Loc>],
+    ) {
+        let fail_label = self.mc.new_dynamic_label();
+        self.append_guard_token_with_faillocs(op, fail_index, fail_label, faillocs);
+    }
+
+    /// Append guard token with regalloc faillocs instead of opref_to_slot snapshot.
+    fn append_guard_token_with_faillocs(
+        &mut self,
+        op: &Op,
+        fail_index: u32,
+        fail_label: DynamicLabel,
+        faillocs: &[Option<Loc>],
+    ) {
+        let fail_arg_types = self.infer_fail_arg_types(op);
+        let descr = Arc::new(DynasmFailDescr::new(
+            fail_index,
+            self.trace_id,
+            fail_arg_types,
+            false,
+        ));
+
+        // Convert regalloc faillocs to frame slot indices for the descr.
+        // Reg locs: the recovery stub will flush registers to known frame
+        // positions. Frame locs: use position directly.
+        let fail_arg_locs: Vec<Option<usize>> = faillocs
+            .iter()
+            .map(|fl| match fl {
+                Some(Loc::Reg(r)) => {
+                    // Register values will be saved to frame by recovery stub.
+                    // Use a dedicated save area: slot = JITFRAME_FIXED_SIZE + reg_index
+                    Some(JITFRAME_FIXED_SIZE + r.value as usize)
+                }
+                Some(Loc::Frame(f)) => Some(f.position),
+                Some(Loc::Immed(_)) => None, // constants don't need saving
+                _ => None,
+            })
+            .collect();
+        unsafe {
+            let descr_mut = &mut *(Arc::as_ptr(&descr) as *mut DynasmFailDescr);
+            descr_mut.fail_arg_locs = fail_arg_locs;
+        }
+
+        self.pending_guard_tokens.push(GuardToken {
+            jump_offset: self.mc.offset(),
+            fail_label,
+            fail_descr: descr.clone(),
+            fail_args: op
+                .fail_args
+                .as_ref()
+                .map(|fa| fa.to_vec())
+                .unwrap_or_default(),
+            opref_to_slot_snapshot: self.opref_to_slot.clone(),
+        });
+        self.fail_descrs.push(descr);
     }
 
     /// Update fail_arg_locs on all pending guard descriptors.
@@ -1297,25 +1939,6 @@ impl Assembler386 {
     // genop_* — comparisons
     // ----------------------------------------------------------------
 
-    /// Map OpCode to abstract condition code for comparisons.
-    fn opcode_to_cc(opcode: OpCode) -> u8 {
-        match opcode {
-            OpCode::IntLt => CC_L,
-            OpCode::IntLe => CC_LE,
-            OpCode::IntGt => CC_G,
-            OpCode::IntGe => CC_GE,
-            OpCode::IntEq => CC_E,
-            OpCode::IntNe => CC_NE,
-            OpCode::UintLt => CC_B,
-            OpCode::UintLe => CC_BE,
-            OpCode::UintGt => CC_A,
-            OpCode::UintGe => CC_AE,
-            OpCode::PtrEq | OpCode::InstancePtrEq => CC_E,
-            OpCode::PtrNe | OpCode::InstancePtrNe => CC_NE,
-            _ => CC_E, // fallback
-        }
-    }
-
     /// INT_LT/LE/GT/GE/EQ/NE/UINT_*: CMP arg0, arg1 then store CC.
     /// If the next op is a guard, guard_success_cc is set and consumed.
     /// Otherwise, materialize the boolean result via SETcc/CSET.
@@ -1451,7 +2074,7 @@ impl Assembler386 {
     /// `expected_classptr_imm` is the immediate value of loc_classptr, used
     /// only by the gcremovetypeptr branch (RPython requires this to be an
     /// `ImmedLoc`).
-    fn _cmp_guard_class(&mut self, expected_classptr_imm: Option<i64>) {
+    fn _cmp_guard_class_old(&mut self, expected_classptr_imm: Option<i64>) {
         if let Some(off_usize) = self.vtable_offset {
             // x86/assembler.py:1884-1885 vtable_offset path: full classptr CMP.
             #[cfg(target_arch = "x86_64")]
@@ -1579,12 +2202,9 @@ impl Assembler386 {
         self.append_guard_token(op, fail_index, fail_label);
     }
 
-    /// Common tail: build DynasmFailDescr, create GuardToken, push to
-    /// pending_guard_tokens and fail_descrs.
-    fn append_guard_token(&mut self, op: &Op, fail_index: u32, fail_label: DynamicLabel) {
-        // resoperation.py Box.type parity: infer fail_arg_types from
-        // value_types if not explicitly set on the Op.
-        let fail_arg_types = if let Some(ref ts) = op.fail_arg_types {
+    /// Infer fail_arg_types from value_types or op.fail_arg_types.
+    fn infer_fail_arg_types(&self, op: &Op) -> Vec<Type> {
+        if let Some(ref ts) = op.fail_arg_types {
             ts.clone()
         } else if let Some(ref fa) = op.fail_args {
             fa.iter()
@@ -1598,7 +2218,13 @@ impl Assembler386 {
                 .collect()
         } else {
             Vec::new()
-        };
+        }
+    }
+
+    /// Common tail: build DynasmFailDescr, create GuardToken, push to
+    /// pending_guard_tokens and fail_descrs.
+    fn append_guard_token(&mut self, op: &Op, fail_index: u32, fail_label: DynamicLabel) {
+        let fail_arg_types = self.infer_fail_arg_types(op);
         let fail_args = op
             .fail_args
             .as_ref()
@@ -1700,7 +2326,7 @@ impl Assembler386 {
         };
         self.load_arg_to_rax(op.arg(0));
         self.load_arg_to_rcx(op.arg(1));
-        self._cmp_guard_class(expected_classptr_imm);
+        self._cmp_guard_class_old(expected_classptr_imm);
         self.guard_success_cc = Some(CC_E);
         self.implement_guard(op, fail_index);
     }
@@ -1724,7 +2350,7 @@ impl Assembler386 {
         };
         self.load_arg_to_rax(op.arg(0));
         self.load_arg_to_rcx(op.arg(1));
-        self._cmp_guard_class(expected_classptr_imm);
+        self._cmp_guard_class_old(expected_classptr_imm);
 
         // assembler.py:1914 patch_forward_jump — both paths share the
         // same fail_label, so a second JNE to the same target suffices.

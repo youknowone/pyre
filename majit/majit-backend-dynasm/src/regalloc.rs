@@ -659,8 +659,19 @@ impl FrameManager {
 }
 
 /// x86/regalloc.py:21 get_ebp_ofs(base_ofs, position)
+///
+/// RPython: rbp points past the frame header, slots grow downward:
+///   -(position+1)*WORD + base_ofs
+///
+/// Dynasm: rbp points to jitframe start, slots grow upward:
+///   (1+position)*WORD + base_ofs
+///   jf_ptr[0] = jf_descr, jf_ptr[1+position] = frame slot
+///
+/// The sign difference is because RPython's GC-managed JITFRAME has
+/// rbp pointing to the interior (after gc header + fixed fields),
+/// while dynasm's malloc'd jitframe has rbp at the base.
 pub fn get_ebp_ofs(base_ofs: i32, position: usize) -> i32 {
-    -((position as i32 + 1) * WORD as i32) + base_ofs
+    ((1 + position) as i32 * WORD as i32) + base_ofs
 }
 
 // ── RegisterManager ────────────────────────────────────────────────
