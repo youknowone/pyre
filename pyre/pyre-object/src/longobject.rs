@@ -104,6 +104,6 @@ mod tests {
     #[test]
     fn test_long_type_name_is_int() {
         // Python users see "int" for both W_IntObject and W_LongObject
-        assert_eq!(LONG_TYPE.tp_name, "int");
+        assert_eq!(LONG_TYPE.name, "int");
     }
 }

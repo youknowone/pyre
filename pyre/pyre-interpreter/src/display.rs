@@ -157,7 +157,7 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> String {
             let name = pyre_object::w_type_get_name(w_type);
             format!("<{name} object at {obj:?}>")
         } else {
-            format!("<{} object at {:?}>", (*tp).tp_name, obj)
+            format!("<{} object at {:?}>", (*tp).name, obj)
         }
     }
 }

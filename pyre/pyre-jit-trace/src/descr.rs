@@ -219,7 +219,7 @@ pub struct PyreSizeDescr {
 }
 
 /// GC type id for the `rclass.OBJECT` root — pyre's static `INSTANCE_TYPE`
-/// PyType (`tp_name = "object"`). All `PyObject`-layout subclasses chain
+/// PyType (`name = "object"`). All `PyObject`-layout subclasses chain
 /// their `parent` field to this id so `assign_inheritance_ids`
 /// (normalizecalls.py:373-389) emits a `subclassrange_{min,max}` covering
 /// every descendant. `GUARD_SUBCLASS(obj, &INSTANCE_TYPE)` then succeeds

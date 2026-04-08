@@ -745,8 +745,8 @@ pub fn add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         }
         Err(PyError::type_error(format!(
             "unsupported operand type(s) for +: '{}' and '{}'",
-            (*(*a).ob_type).tp_name,
-            (*(*b).ob_type).tp_name,
+            (*(*a).ob_type).name,
+            (*(*b).ob_type).name,
         )))
     }
 }
@@ -769,8 +769,8 @@ pub fn sub(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         }
         Err(PyError::type_error(format!(
             "unsupported operand type(s) for -: '{}' and '{}'",
-            (*(*a).ob_type).tp_name,
-            (*(*b).ob_type).tp_name,
+            (*(*a).ob_type).name,
+            (*(*b).ob_type).name,
         )))
     }
 }
@@ -806,8 +806,8 @@ pub fn mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         }
         Err(PyError::type_error(format!(
             "unsupported operand type(s) for *: '{}' and '{}'",
-            (*(*a).ob_type).tp_name,
-            (*(*b).ob_type).tp_name,
+            (*(*a).ob_type).name,
+            (*(*b).ob_type).name,
         )))
     }
 }
@@ -830,8 +830,8 @@ pub fn floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         }
         Err(PyError::type_error(format!(
             "unsupported operand type(s) for //: '{}' and '{}'",
-            (*(*a).ob_type).tp_name,
-            (*(*b).ob_type).tp_name,
+            (*(*a).ob_type).name,
+            (*(*b).ob_type).name,
         )))
     }
 }
@@ -858,8 +858,8 @@ pub fn mod_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         }
         Err(PyError::type_error(format!(
             "unsupported operand type(s) for %: '{}' and '{}'",
-            (*(*a).ob_type).tp_name,
-            (*(*b).ob_type).tp_name,
+            (*(*a).ob_type).name,
+            (*(*b).ob_type).name,
         )))
     }
 }
@@ -1021,8 +1021,8 @@ pub fn truediv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         }
         Err(PyError::type_error(format!(
             "unsupported operand type(s) for /: '{}' and '{}'",
-            (*(*a).ob_type).tp_name,
-            (*(*b).ob_type).tp_name,
+            (*(*a).ob_type).name,
+            (*(*b).ob_type).name,
         )))
     }
 }
@@ -1047,8 +1047,8 @@ pub fn pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         }
         Err(PyError::type_error(format!(
             "unsupported operand type(s) for **: '{}' and '{}'",
-            (*(*a).ob_type).tp_name,
-            (*(*b).ob_type).tp_name,
+            (*(*a).ob_type).name,
+            (*(*b).ob_type).name,
         )))
     }
 }
@@ -1156,8 +1156,8 @@ pub fn lshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         }
         Err(PyError::type_error(format!(
             "unsupported operand type(s) for <<: '{}' and '{}'",
-            (*(*a).ob_type).tp_name,
-            (*(*b).ob_type).tp_name,
+            (*(*a).ob_type).name,
+            (*(*b).ob_type).name,
         )))
     }
 }
@@ -1179,8 +1179,8 @@ pub fn rshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         }
         Err(PyError::type_error(format!(
             "unsupported operand type(s) for >>: '{}' and '{}'",
-            (*(*a).ob_type).tp_name,
-            (*(*b).ob_type).tp_name,
+            (*(*a).ob_type).name,
+            (*(*b).ob_type).name,
         )))
     }
 }
@@ -1202,8 +1202,8 @@ pub fn and_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         }
         Err(PyError::type_error(format!(
             "unsupported operand type(s) for &: '{}' and '{}'",
-            (*(*a).ob_type).tp_name,
-            (*(*b).ob_type).tp_name,
+            (*(*a).ob_type).name,
+            (*(*b).ob_type).name,
         )))
     }
 }
@@ -1242,8 +1242,8 @@ pub fn or_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         }
         Err(PyError::type_error(format!(
             "unsupported operand type(s) for |: '{}' and '{}'",
-            (*(*a).ob_type).tp_name,
-            (*(*b).ob_type).tp_name,
+            (*(*a).ob_type).name,
+            (*(*b).ob_type).name,
         )))
     }
 }
@@ -1265,8 +1265,8 @@ pub fn xor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         }
         Err(PyError::type_error(format!(
             "unsupported operand type(s) for ^: '{}' and '{}'",
-            (*(*a).ob_type).tp_name,
-            (*(*b).ob_type).tp_name,
+            (*(*a).ob_type).name,
+            (*(*b).ob_type).name,
         )))
     }
 }
@@ -1392,8 +1392,8 @@ pub fn compare(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
         }
         Err(PyError::type_error(format!(
             "'{op:?}' not supported between instances of '{}' and '{}'",
-            (*(*a).ob_type).tp_name,
-            (*(*b).ob_type).tp_name,
+            (*(*a).ob_type).name,
+            (*(*b).ob_type).name,
         )))
     }
 }
@@ -1504,7 +1504,7 @@ pub fn neg(a: PyObjectRef) -> PyResult {
         }
         Err(PyError::type_error(format!(
             "bad operand type for unary -: '{}'",
-            (*(*a).ob_type).tp_name,
+            (*(*a).ob_type).name,
         )))
     }
 }
@@ -1525,7 +1525,7 @@ pub fn invert(a: PyObjectRef) -> PyResult {
         }
         Err(PyError::type_error(format!(
             "bad operand type for unary ~: '{}'",
-            (*(*a).ob_type).tp_name,
+            (*(*a).ob_type).name,
         )))
     }
 }
@@ -1878,7 +1878,7 @@ pub fn getitem(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
         } else {
             Err(PyError::type_error(format!(
                 "'{}' object is not subscriptable",
-                (*(*obj).ob_type).tp_name,
+                (*(*obj).ob_type).name,
             )))
         }
     }
@@ -1935,7 +1935,7 @@ pub fn setitem(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef) -> PyRe
                 let tp = if index.is_null() {
                     "NULL"
                 } else {
-                    (*(*index).ob_type).tp_name
+                    (*(*index).ob_type).name
                 };
                 return Err(PyError::type_error(format!(
                     "list indices must be integers, not {tp}"
@@ -1982,7 +1982,7 @@ pub fn setitem(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef) -> PyRe
         } else {
             Err(PyError::type_error(format!(
                 "'{}' object does not support item assignment",
-                (*(*obj).ob_type).tp_name,
+                (*(*obj).ob_type).name,
             )))
         }
     }
@@ -2109,7 +2109,7 @@ pub fn len(obj: PyObjectRef) -> PyResult {
         } else {
             Err(PyError::type_error(format!(
                 "object of type '{}' has no len()",
-                (*(*obj).ob_type).tp_name,
+                (*(*obj).ob_type).name,
             )))
         }
     }
@@ -2640,7 +2640,7 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
         let tp_name = if obj.is_null() {
             "NULL"
         } else {
-            (*(*obj).ob_type).tp_name
+            (*(*obj).ob_type).name
         };
         Err(PyError::new(
             PyErrorKind::AttributeError,
@@ -3042,7 +3042,7 @@ pub fn delattr(obj: PyObjectRef, name: &str) -> PyResult {
     if removed {
         Ok(w_none())
     } else {
-        let tp_name = unsafe { (*(*obj).ob_type).tp_name };
+        let tp_name = unsafe { (*(*obj).ob_type).name };
         Err(PyError::new(
             PyErrorKind::AttributeError,
             format!("'{tp_name}' object has no attribute '{name}'"),
@@ -3212,7 +3212,7 @@ pub fn wrappable_class_name(class: PyObjectRef) -> String {
         return "internal subclass".to_string();
     }
     unsafe {
-        let type_name = (*(*class).ob_type).tp_name;
+        let type_name = (*(*class).ob_type).name;
         if is_type(class) {
             type_name.to_string()
         } else {
@@ -3345,7 +3345,7 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
     }
     Err(PyError::type_error(format!(
         "'{}' object is not iterable",
-        unsafe { (*(*obj).ob_type).tp_name }
+        unsafe { (*(*obj).ob_type).name }
     )))
 }
 
@@ -3818,7 +3818,7 @@ mod tests {
             assert!(
                 is_list(list),
                 "should be list, got type: {}",
-                (*(*list).ob_type).tp_name
+                (*(*list).ob_type).name
             );
         }
         let result = super::contains(list, needle).expect("contains failed");
