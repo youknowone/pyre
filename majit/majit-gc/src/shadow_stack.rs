@@ -132,6 +132,21 @@ pub fn push_jf(jf_ptr: GcRef) -> usize {
     })
 }
 
+/// Read the GC-updated jf_ptr from the shadow stack at the given depth.
+///
+/// RPython _call_footer_shadowstack (assembler.py:1130-1136):
+///   MOV eax, [rootstacktop - WORD]  // read GC-updated jf_ptr
+///   SUB rootstacktop, 2*WORD
+///
+/// The GC may have forwarded the nursery jitframe to old gen and updated
+/// the shadow stack entry in place. This returns the forwarded address.
+pub fn peek_jf(depth: usize) -> GcRef {
+    JF_SHADOW_STACK.with(|ss| {
+        let ss = ss.borrow();
+        ss[depth].jf_ptr
+    })
+}
+
 /// Pop jitframe entries back to the given depth.
 ///
 /// RPython _call_footer_shadowstack (assembler.py:1130-1136):
