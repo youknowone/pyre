@@ -309,6 +309,14 @@ pub trait JitCodeSym {
     /// Update a scalar state field's OpRef.
     fn set_state_field_ref(&mut self, _field_idx: usize, _value: OpRef) {}
 
+    /// Read a scalar state field's current concrete value.
+    fn state_field_value(&self, _field_idx: usize) -> Option<i64> {
+        None
+    }
+
+    /// Update a scalar state field's concrete value.
+    fn set_state_field_value(&mut self, _field_idx: usize, _value: i64) {}
+
     /// Read an array state field element's current OpRef.
     fn state_array_ref(&self, _array_idx: usize, _elem_idx: usize) -> Option<OpRef> {
         None
@@ -316,6 +324,14 @@ pub trait JitCodeSym {
 
     /// Update an array state field element's OpRef.
     fn set_state_array_ref(&mut self, _array_idx: usize, _elem_idx: usize, _value: OpRef) {}
+
+    /// Read an array state field element's current concrete value.
+    fn state_array_value(&self, _array_idx: usize, _elem_idx: usize) -> Option<i64> {
+        None
+    }
+
+    /// Update an array state field element's concrete value.
+    fn set_state_array_value(&mut self, _array_idx: usize, _elem_idx: usize, _value: i64) {}
 
     // -- State virtualizable array support ---------------
     //
@@ -1366,14 +1382,17 @@ where
                 let opref = sym
                     .state_field_ref(field_idx)
                     .expect("state field not initialized");
-                // Runtime value not needed -- we track symbolically.
-                self.set_int_reg(dest, Some(opref), Some(0));
+                let value = sym
+                    .state_field_value(field_idx)
+                    .expect("state field concrete value not initialized");
+                self.set_int_reg(dest, Some(opref), Some(value));
             }
             BC_STORE_STATE_FIELD => {
                 let field_idx = self.frames.current_mut().next_u16() as usize;
                 let src = self.frames.current_mut().next_u16() as usize;
-                let (opref, _) = self.read_int_reg(src);
+                let (opref, value) = self.read_int_reg(src);
                 sym.set_state_field_ref(field_idx, opref);
+                sym.set_state_field_value(field_idx, value);
             }
             BC_LOAD_STATE_ARRAY => {
                 let array_idx = self.frames.current_mut().next_u16() as usize;
@@ -1383,7 +1402,10 @@ where
                 let elem_idx = index_concrete as usize;
                 let opref = sym.state_array_ref(array_idx, elem_idx);
                 if let Some(opref) = opref {
-                    self.set_int_reg(dest, Some(opref), Some(0));
+                    let value = sym
+                        .state_array_value(array_idx, elem_idx)
+                        .expect("state array concrete value not initialized");
+                    self.set_int_reg(dest, Some(opref), Some(value));
                 } else {
                     // Array element beyond initialized range (e.g., push expanded).
                     // Abort trace -- this path needs dynamic array support.
@@ -1396,8 +1418,9 @@ where
                 let src = self.frames.current_mut().next_u16() as usize;
                 let (_, index_concrete) = self.read_int_reg(index_reg);
                 let elem_idx = index_concrete as usize;
-                let (opref, _) = self.read_int_reg(src);
+                let (opref, value) = self.read_int_reg(src);
                 sym.set_state_array_ref(array_idx, elem_idx, opref);
+                sym.set_state_array_value(array_idx, elem_idx, value);
             }
 
             // -- First-class virtualizable access (RPython getfield_vable_*) --

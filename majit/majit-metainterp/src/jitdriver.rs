@@ -1239,6 +1239,15 @@ impl<S: JitState> JitDriver<S> {
                 return Some(target_pc);
             }
 
+            // Normal loop back-edge JUMP, not a guard failure.
+            if result.fail_index == u32::MAX {
+                let run_meta = result.meta.clone();
+                state.restore_values(&run_meta, &result.typed_values);
+                let run_descriptor = self.driver_descriptor_for(state, &run_meta);
+                self.sync_after(state, &run_meta, run_descriptor.as_ref());
+                return Some(target_pc);
+            }
+
             // compile.py:701-716 handle_fail
             let fail_index = result.fail_index;
             let trace_id = result.trace_id;
@@ -1438,7 +1447,9 @@ impl<S: JitState> JitDriver<S> {
                 if let Some(ctx) = self.meta.trace_ctx() {
                     ctx.header_pc = target_pc;
                 }
-                self.sym = Some(S::create_sym(&meta, target_pc));
+                let mut sym = S::create_sym(&meta, target_pc);
+                state.initialize_sym(&mut sym, &meta);
+                self.sym = Some(sym);
                 self.trace_meta = Some(meta);
             }
             _ => {}
@@ -1474,7 +1485,9 @@ impl<S: JitState> JitDriver<S> {
                 if let Some(ctx) = self.meta.trace_ctx() {
                     ctx.header_pc = target_pc;
                 }
-                self.sym = Some(S::create_sym(&meta, target_pc));
+                let mut sym = S::create_sym(&meta, target_pc);
+                state.initialize_sym(&mut sym, &meta);
+                self.sym = Some(sym);
                 self.trace_meta = Some(meta);
             }
             _ => {}
@@ -1510,7 +1523,9 @@ impl<S: JitState> JitDriver<S> {
                 if let Some(ctx) = self.meta.trace_ctx() {
                     ctx.header_pc = target_pc;
                 }
-                self.sym = Some(S::create_sym(&meta, target_pc));
+                let mut sym = S::create_sym(&meta, target_pc);
+                state.initialize_sym(&mut sym, &meta);
+                self.sym = Some(sym);
                 self.trace_meta = Some(meta);
             }
             BackEdgeAction::AlreadyTracing | BackEdgeAction::RunCompiled => {}
@@ -2590,7 +2605,9 @@ impl<S: JitState> JitDriver<S> {
             S::update_meta_for_bridge(&mut trace_meta, &retrace.fail_types);
         }
 
-        self.sym = Some(S::create_sym(&trace_meta, resume_pc));
+        let mut sym = S::create_sym(&trace_meta, resume_pc);
+        state.initialize_sym(&mut sym, &trace_meta);
+        self.sym = Some(sym);
         // pyjitpl.py:2890 parity: bridge traces start at resume_pc, not at
         // function entry (pc=0). Set header_pc so init_symbolic correctly
         // detects this is NOT a function-entry trace.

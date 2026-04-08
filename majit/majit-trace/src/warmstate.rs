@@ -575,7 +575,10 @@ impl WarmEnterState {
         if let Some(cell) = self.cells.get_mut(&green_key_hash) {
             cell.flags &= !jc_flags::TRACING;
             cell.abort_count += 1;
-            if cell.abort_count >= MAX_TRACE_ABORT_COUNT {
+            if disable_noninlinable_function || (cell.flags & jc_flags::DONT_TRACE_HERE != 0) {
+                cell.flags |= jc_flags::DONT_TRACE_HERE;
+                cell.state = BaseJitCellState::DontTraceHere;
+            } else if cell.abort_count >= MAX_TRACE_ABORT_COUNT {
                 // Too many failed attempts — permanently disable tracing here.
                 cell.flags |= jc_flags::DONT_TRACE_HERE;
                 cell.state = BaseJitCellState::DontTraceHere;

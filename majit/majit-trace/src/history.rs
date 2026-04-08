@@ -1122,7 +1122,7 @@ mod tests {
 
     #[test]
     fn test_cut_trace_from_constants_preserved() {
-        // Constants (OpRef >= 10_000) should not be remapped.
+        // Tagged constant OpRefs should not be remapped.
         let inputargs = vec![InputArg::new_int(0)];
         let mut ops = Vec::new();
         // pre-cut: noop
@@ -1130,7 +1130,8 @@ mod tests {
         op0.pos = OpRef(1);
         ops.push(op0);
         // post-cut: uses a constant
-        let mut op1 = Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(10_000)]);
+        let const_ref = OpRef::from_const(0);
+        let mut op1 = Op::new(OpCode::IntAdd, &[OpRef(0), const_ref]);
         op1.pos = OpRef(2);
         ops.push(op1);
         let mut op2 = Op::new(OpCode::Jump, &[OpRef(2)]);
@@ -1148,7 +1149,7 @@ mod tests {
         let cut = trace.cut_trace_from(start, &original_boxes, &original_box_types);
         assert_eq!(cut.ops.len(), 2);
         // Constant ref should be preserved as-is
-        assert_eq!(cut.ops[0].args[1], OpRef(10_000));
+        assert_eq!(cut.ops[0].args[1], const_ref);
     }
 
     #[test]

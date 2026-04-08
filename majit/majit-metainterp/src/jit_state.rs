@@ -148,6 +148,12 @@ pub trait JitState: Sized {
 
     fn create_sym(meta: &Self::Meta, header_pc: usize) -> Self::Sym;
 
+    /// Seed tracing-time concrete mirrors in the symbolic state.
+    ///
+    /// Interpreters that lower state reads through jitcode need this so
+    /// branch decisions during tracing use the real runtime values.
+    fn initialize_sym(&self, _sym: &mut Self::Sym, _meta: &Self::Meta) {}
+
     fn driver_descriptor(&self, _meta: &Self::Meta) -> Option<JitDriverStaticData> {
         None
     }
