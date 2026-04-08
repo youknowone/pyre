@@ -1256,23 +1256,39 @@ impl TraceRecordBuffer {
     ///
     /// Returns a list where `liveranges[v]` is the trace step at which the
     /// value with raw trace position `v` is last used. Mirrors RPython's
-    /// `TraceIterator.next_element_update_live_range` (opencoder.py:339-360):
+    /// `TraceIterator.next_element_update_live_range` (opencoder.py:339-360).
+    ///
+    /// `index_start` is the equivalent of RPython's `t._count` at the
+    /// moment `get_live_ranges` enters the iteration loop
+    /// (opencoder.py:855 `index = t._count`). For a full Trace this is
+    /// `Trace._start = max_num_inputargs` (opencoder.py:268-270, set by
+    /// `TraceIterator.__init__`). For a `CutTrace` it is the cut's saved
+    /// `count` (opencoder.py:421-425), which can be larger than
+    /// `num_inputargs` because the cut starts in the middle of a trace.
+    /// Callers that operate on a freshly recorded full trace pass
+    /// `self.num_inputargs`; callers that have a cut/slice MUST pass the
+    /// equivalent `count` so that the sequential index numbering picks up
+    /// where the parent left off, matching `CutTrace.get_iter`'s
+    /// `iter._count = self.count` override (opencoder.py:421).
     ///
     /// 1. The array is sized to cover the entire raw box space
     ///    (`[0] * self._index`). Constants live in a separate namespace —
     ///    in majit they sit above the `CONST_BIT` boundary at value
     ///    `>= 1<<31` — and must NOT contribute to the array length, or a
     ///    single constant reference would inflate the allocation by 2 GiB.
-    ///    Walking `op.pos` (rather than the union of arg slots) gives the
-    ///    same coverage as RPython's `_index` while excluding constants
-    ///    and `OpRef::NONE` sentinels.
+    ///    The size is computed from `op.pos` after filtering constants and
+    ///    `OpRef::NONE` sentinels. Note: in majit this slot space is
+    ///    LARGER than RPython's `_index`, because majit's recorder
+    ///    consumes a sequential OpRef for every op including voids
+    ///    (recorder.rs:163-203). Per-op slots that belong to void ops sit
+    ///    in the array unused, which is harmless for live/dead range
+    ///    consumers — they only read slots they reference via arg.0.
     /// 2. The forward walk writes `liveranges[v] = index` for every TAGBOX
     ///    argument (`!is_constant() && !is_none()`) — TAGINT / TAGCONSTPTR /
     ///    TAGCONSTOTHER refs are skipped, just like opencoder.py:347-349.
     ///    `index` is the RPython sequential counter, NOT `op.pos`. RPython
-    ///    starts the counter at `t._count = max_num_inputargs` and only
-    ///    increments it for non-void ops (opencoder.py:357-358); void ops
-    ///    keep using the previous index. majit's recorder consumes a
+    ///    only increments it for non-void ops (opencoder.py:357-358); void
+    ///    ops keep using the previous index. majit's recorder consumes a
     ///    sequential OpRef for every op including void ones, so `op.pos`
     ///    advances on every op and would skew live-range step values
     ///    across runs of consecutive guards / SetfieldGc. Tracking a
@@ -1285,7 +1301,7 @@ impl TraceRecordBuffer {
     ///    this self-definition the dead-range computation collapses any
     ///    value that is produced but never read into position 0, which is
     ///    wrong for the register allocator's free-slot logic.
-    pub fn get_live_ranges(&self, ops: &[majit_ir::Op]) -> Vec<usize> {
+    pub fn get_live_ranges(&self, ops: &[majit_ir::Op], index_start: usize) -> Vec<usize> {
         use majit_ir::Type;
         // opencoder.py:854 — `[0] * self._index`. _index = the full raw
         // box space (inputargs + every recorded op slot). majit assigns a
@@ -1301,12 +1317,11 @@ impl TraceRecordBuffer {
             .unwrap_or(0);
         let total = self.num_ops.max(computed_max).max(self.num_inputargs);
         let mut liveranges = vec![0usize; total];
-        // opencoder.py:339-358 next_element_update_live_range — forward
-        // iteration. The `index` counter starts at `t._count = start =
-        // max_num_inputargs` (TraceIterator.__init__) and is bumped only
-        // for non-void ops. We use the same counter so void ops between
-        // two non-void ops do not push the live-step forward.
-        let mut index = self.num_inputargs;
+        // opencoder.py:855 — `index = t._count`. Equivalent to
+        // `iter._count = start` (opencoder.py:270) for a full Trace, and
+        // to `iter._count = self.count` (opencoder.py:421) for a CutTrace.
+        // The caller passes whichever value matches the slice it owns.
+        let mut index = index_start;
         for op in ops {
             if op.pos.is_none() || op.pos.is_constant() {
                 continue;
@@ -1437,8 +1452,14 @@ impl TraceRecordBuffer {
     /// Compute dead ranges: for each op index x, the values that are
     /// known to be dead before x. Used by the register allocator to
     /// know when to free registers.
-    pub fn get_dead_ranges(&self, ops: &[majit_ir::Op]) -> Vec<usize> {
-        let live_ranges = self.get_live_ranges(ops);
+    ///
+    /// `index_start` is forwarded to `get_live_ranges`; see that
+    /// function's doc for the `t._count` semantics. Full-trace callers
+    /// pass `self.num_inputargs`; cut/slice callers pass the cut's
+    /// `count` so the sequential index numbering matches the parent
+    /// trace's continuation point.
+    pub fn get_dead_ranges(&self, ops: &[majit_ir::Op], index_start: usize) -> Vec<usize> {
+        let live_ranges = self.get_live_ranges(ops, index_start);
         let mut dead_ranges = vec![0usize; live_ranges.len() + 2];
         for (i, &last_use) in live_ranges.iter().enumerate() {
             if last_use > 0 && last_use + 1 < dead_ranges.len() {
@@ -1684,7 +1705,8 @@ mod tests {
         buf.num_inputargs = 3;
         // Inject the op_count via a backdoor: the field is private, so use
         // get_live_ranges with the exact slice that has the right max pos.
-        let lr = buf.get_live_ranges(&ops);
+        // Full-trace caller passes num_inputargs as t._count.
+        let lr = buf.get_live_ranges(&ops, buf.num_inputargs);
         // total >= max(op.pos)+1 = 5, total >= num_inputargs = 3 → length 5.
         assert_eq!(lr.len(), total);
         // i0/i1/i2/p0 last referenced by GUARD_TRUE at position 4.
@@ -1711,7 +1733,7 @@ mod tests {
         let mut guard = op_at(3, majit_ir::OpCode::GuardTrue, &[OpRef(1)]);
         guard.fail_args = Some(smallvec::smallvec![const_ref, OpRef(2)]);
         let ops = vec![add, guard];
-        let lr = buf.get_live_ranges(&ops);
+        let lr = buf.get_live_ranges(&ops, buf.num_inputargs);
         // Length should be at most max(op.pos)+1 = 4 — never the constant
         // value (>= 1<<31). Anything bigger means the constant leaked into
         // the size calculation.
@@ -1738,7 +1760,7 @@ mod tests {
         // v1 = IntAdd(i0, i0) — value-producing, never used.
         let add = op_at(1, majit_ir::OpCode::IntAdd, &[OpRef(0), OpRef(0)]);
         let ops = vec![add];
-        let lr = buf.get_live_ranges(&ops);
+        let lr = buf.get_live_ranges(&ops, buf.num_inputargs);
         // i0 last referenced at IntAdd's position.
         assert_eq!(lr[0], 1);
         // v1 self-defines at pos 1 even though no later op reads it.
@@ -1765,7 +1787,7 @@ mod tests {
         g2.fail_args = Some(smallvec::smallvec![OpRef(2)]);
         let mul = op_at(5, majit_ir::OpCode::IntMul, &[OpRef(0), OpRef(1)]);
         let ops = vec![add, g1, g2, mul];
-        let lr = buf.get_live_ranges(&ops);
+        let lr = buf.get_live_ranges(&ops, buf.num_inputargs);
 
         // Sequential index walk (start = num_inputargs = 2):
         //   IntAdd     index=2 → liveranges[2]=2,                       index → 3
@@ -1789,6 +1811,48 @@ mod tests {
         // value = sequential index (3). Slot space is majit pos; values
         // are sequential RPython index — matching the arg-write semantics.
         assert_eq!(lr[5], 3);
+    }
+
+    /// opencoder.py:421 — `CutTrace.get_iter` overrides `iter._count =
+    /// self.count` so the sequential index numbering picks up where the
+    /// parent trace left off. The same slice fed through
+    /// `get_live_ranges` with `index_start = num_inputargs` would assign
+    /// indices starting at num_inputargs; with `index_start = cut_count`
+    /// the indices start at cut_count. Verify both are reachable via the
+    /// new parameter.
+    #[test]
+    fn test_get_live_ranges_honours_cut_trace_count() {
+        let buf = TraceRecordBuffer::new(2);
+        // pos 0, 1 = inputargs (live, but unreferenced in this slice)
+        // pos 2    = IntAdd(i0, i1)        (non-void)
+        // pos 3    = IntMul(v2, i0)        (non-void, references v2)
+        let add = op_at(2, majit_ir::OpCode::IntAdd, &[OpRef(0), OpRef(1)]);
+        let mul = op_at(3, majit_ir::OpCode::IntMul, &[OpRef(2), OpRef(0)]);
+        let ops = vec![add, mul];
+
+        // Full-trace caller: index starts at num_inputargs = 2.
+        let lr_full = buf.get_live_ranges(&ops, buf.num_inputargs);
+        // IntAdd at index=2 → liveranges[0]=2, liveranges[1]=2,
+        //                     liveranges[2]=2,                 index → 3
+        // IntMul at index=3 → liveranges[2]=3, liveranges[0]=3,
+        //                     liveranges[3]=3,                 index → 4
+        assert_eq!(lr_full[0], 3);
+        assert_eq!(lr_full[1], 2);
+        assert_eq!(lr_full[2], 3);
+        assert_eq!(lr_full[3], 3);
+
+        // CutTrace caller: imagine the parent left off at sequential
+        // count = 17 (e.g. 17 prior non-void ops). Pass that as
+        // index_start; the live-range step values shift accordingly.
+        let lr_cut = buf.get_live_ranges(&ops, 17);
+        // IntAdd at index=17 → liveranges[1]=17, liveranges[2]=17,
+        //                      liveranges[0]=17,                 index → 18
+        // IntMul at index=18 → liveranges[2]=18, liveranges[0]=18,
+        //                      liveranges[3]=18,                 index → 19
+        assert_eq!(lr_cut[0], 18);
+        assert_eq!(lr_cut[1], 17);
+        assert_eq!(lr_cut[2], 18);
+        assert_eq!(lr_cut[3], 18);
     }
 
     #[test]
