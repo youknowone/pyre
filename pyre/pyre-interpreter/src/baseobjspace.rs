@@ -2378,14 +2378,16 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
                 return Ok(value);
             }
             // Metaclass attribute lookup — PyPy: type.__getattribute__
-            // Check if this type was created by a custom metaclass.
-            // The metaclass is stored as __metaclass__ in ATTR_TABLE.
-            let w_metaclass = ATTR_TABLE.with(|table| {
-                let table = table.borrow();
-                table
-                    .get(&(obj as usize))
-                    .and_then(|d| d.get("__metaclass__").copied())
-            });
+            // baseobjspace.py:76 — the metaclass is type(C), read from w_class.
+            let w_metaclass = {
+                let w_class = (*obj).w_class;
+                let w_type_type = crate::typedef::w_type();
+                if !w_class.is_null() && !std::ptr::eq(w_class, w_type_type) {
+                    Some(w_class)
+                } else {
+                    None
+                }
+            };
             // PyPy: type.__getattribute__ → metatype descriptor protocol.
             // Search metaclass MRO. Binding is handled by load_method.
             let w_metaclasses: [Option<PyObjectRef>; 2] =
@@ -3379,13 +3381,16 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         // PyPy/CPython: iter(X) calls type(X).__iter__(X), not X.__iter__
         // For type objects, type(X) is the metaclass.
         if is_type(obj) {
-            // Look up __iter__ in the metaclass MRO
-            let w_metaclass = ATTR_TABLE.with(|table| {
-                table
-                    .borrow()
-                    .get(&(obj as usize))
-                    .and_then(|d| d.get("__metaclass__").copied())
-            });
+            // baseobjspace.py:76 — metaclass from w_class
+            let w_metaclass = unsafe {
+                let w_class = (*obj).w_class;
+                let w_type_type = crate::typedef::w_type();
+                if !w_class.is_null() && !std::ptr::eq(w_class, w_type_type) {
+                    Some(w_class)
+                } else {
+                    None
+                }
+            };
             if let Some(w_metaclass) = w_metaclass {
                 if let Some(method) = lookup_in_type_where(w_metaclass, "__iter__") {
                     return Ok(crate::call_function(method, &[obj]));

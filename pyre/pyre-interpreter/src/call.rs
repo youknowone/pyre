@@ -1254,15 +1254,11 @@ pub(crate) fn real_build_class(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
             for i in 0..n {
                 if let Some(base) = pyre_object::w_tuple_getitem(bases_tuple, i as i64) {
                     if pyre_object::is_type(base) {
-                        // Check if base has a custom metaclass
-                        let w_metaclass = crate::baseobjspace::ATTR_TABLE.with(|table| {
-                            table
-                                .borrow()
-                                .get(&(base as usize))
-                                .and_then(|d| d.get("__metaclass__").copied())
-                        });
-                        if w_metaclass.is_some() {
-                            return w_metaclass;
+                        // baseobjspace.py:76 — metaclass from w_class
+                        let w_class = (*base).w_class;
+                        let w_type_type = crate::typedef::w_type();
+                        if !w_class.is_null() && !std::ptr::eq(w_class, w_type_type) {
+                            return Some(w_class);
                         }
                     }
                 }
