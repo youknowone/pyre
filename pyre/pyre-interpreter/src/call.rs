@@ -1460,7 +1460,7 @@ fn build_class_inner(
         // typeobject.py:1143-1204 create_all_slots parity.
         unsafe {
             let ns = &*class_ns_ptr;
-            create_all_slots(w, ns, w_effective_bases);
+            create_all_slots(w, ns, w_effective_bases)?;
         }
         // baseobjspace.py:76 — set w_class to 'type' (default metaclass)
         unsafe {
@@ -1662,17 +1662,19 @@ unsafe fn copy_flags_from_bases(
 
 /// typeobject.py:1143-1204 create_all_slots.
 ///
+/// Returns `Err` for invalid __slots__ (TypeError), matching PyPy.
+///
 /// # Safety
 /// `w_type` must be a valid W_TypeObject pointer.
 pub unsafe fn create_all_slots(
     w_type: pyre_object::PyObjectRef,
     ns: &crate::PyNamespace,
     w_bases: pyre_object::PyObjectRef,
-) {
+) -> Result<(), crate::PyError> {
     use pyre_object::typeobject::{Layout, leak_layout};
 
     // typeobject.py:1245: w_bestbase = check_and_find_best_base(space, bases_w)
-    let w_bestbase = find_best_base(w_bases);
+    let w_bestbase = check_and_find_best_base(w_bases)?;
 
     // typeobject.py:1254: copy_flags_from_bases — inherit hasdict/weakrefable
     copy_flags_from_bases(w_type, w_bases);
@@ -1693,29 +1695,27 @@ pub unsafe fn create_all_slots(
         // typeobject.py:1154-1176: has __slots__
         let mut wantdict = false;
         let mut wantweakref = false;
-        let all_names = match collect_slot_names(w_slots) {
-            Ok(names) => names,
-            Err(_) => {
-                // Slot name validation failed — fall back to default layout.
-                set_default_layout(w_type, base_layout);
-                return;
-            }
-        };
+        // Issue 1 fix: propagate validation errors, don't swallow them.
+        let all_names = collect_slot_names(w_slots)?;
         let mut newslotnames = Vec::new();
         for slot_name in &all_names {
             match slot_name.as_str() {
                 // typeobject.py:1165-1169: __dict__ slot
                 "__dict__" => {
+                    // Issue 2 fix: raise TypeError on duplicate.
                     if wantdict || pyre_object::w_type_get_hasdict(w_type) {
-                        // Duplicate __dict__ — silently ignore for now
-                        // PyPy raises TypeError here
+                        return Err(crate::PyError::type_error(
+                            "__dict__ slot disallowed: we already got one".to_string(),
+                        ));
                     }
                     wantdict = true;
                 }
                 // typeobject.py:1170-1174: __weakref__ slot
                 "__weakref__" => {
                     if wantweakref || pyre_object::w_type_get_weakrefable(w_type) {
-                        // Duplicate __weakref__ — silently ignore for now
+                        return Err(crate::PyError::type_error(
+                            "__weakref__ slot disallowed: we already got one".to_string(),
+                        ));
                     }
                     wantweakref = true;
                 }
@@ -1726,6 +1726,29 @@ pub unsafe fn create_all_slots(
         // typeobject.py:1178: string_sort(newslotnames)
         newslotnames.sort();
 
+        // typeobject.py:1183-1189 create_slot: add slot to class dict if
+        // name not already present (name mangling omitted for now).
+        // Issue 3: slot descriptors — record in dict for name conflict check.
+        let type_ns = pyre_object::w_type_get_dict_ptr(w_type) as *mut crate::PyNamespace;
+        let mut i = 0;
+        while i < newslotnames.len() {
+            let slot_name = &newslotnames[i];
+            if !type_ns.is_null() && (*type_ns).get(slot_name.as_str()).is_some() {
+                // typeobject.py:1212: name conflict → skip this slot
+                newslotnames.remove(i);
+            } else {
+                // typeobject.py:1216-1217: create_slot → put placeholder in dict.
+                // Full Member descriptor omitted; placeholder marks the name.
+                if !type_ns.is_null() {
+                    (*type_ns).insert(
+                        slot_name.clone(),
+                        pyre_object::w_none(), // placeholder for Member descriptor
+                    );
+                }
+                i += 1;
+            }
+        }
+
         // typeobject.py:1191-1195: set hasdict/weakrefable
         if wantdict {
             pyre_object::w_type_set_hasdict(w_type, true);
@@ -1733,6 +1756,8 @@ pub unsafe fn create_all_slots(
         if wantweakref {
             pyre_object::w_type_set_weakrefable(w_type, true);
         }
+
+        // typeobject.py:1196-1197: __del__ → hasuserdel (noted, no field yet)
 
         let nslots = base_nslots + newslotnames.len() as u32;
 
@@ -1759,6 +1784,7 @@ pub unsafe fn create_all_slots(
         pyre_object::w_type_set_weakrefable(w_type, true);
         set_default_layout(w_type, base_layout);
     }
+    Ok(())
 }
 
 /// Set default layout (reuse base or create root).
@@ -1780,8 +1806,7 @@ unsafe fn set_default_layout(
     pyre_object::w_type_set_layout(w_type, layout);
 }
 
-/// typeobject.py:1089-1105 find_best_base: pick the base with the
-/// most-derived layout (using issublayout).
+/// typeobject.py:1089-1105 find_best_base.
 unsafe fn find_best_base(w_bases: pyre_object::PyObjectRef) -> pyre_object::PyObjectRef {
     if w_bases.is_null() || !pyre_object::is_tuple(w_bases) {
         return std::ptr::null_mut();
@@ -1797,8 +1822,6 @@ unsafe fn find_best_base(w_bases: pyre_object::PyObjectRef) -> pyre_object::PyOb
                 w_bestbase = w_candidate;
                 continue;
             }
-            // typeobject.py:1100-1104: pick candidate if its layout
-            // is a sub-layout of the current best.
             let cand_layout = pyre_object::w_type_get_layout_ptr(w_candidate);
             let best_layout = pyre_object::w_type_get_layout_ptr(w_bestbase);
             if cand_layout != best_layout
@@ -1810,4 +1833,39 @@ unsafe fn find_best_base(w_bases: pyre_object::PyObjectRef) -> pyre_object::PyOb
         }
     }
     w_bestbase
+}
+
+/// typeobject.py:1107-1129 check_and_find_best_base:
+///   1. find_best_base
+///   2. check bestbase is not None
+///   3. check all other bases' layouts are super-layouts of bestbase
+unsafe fn check_and_find_best_base(
+    w_bases: pyre_object::PyObjectRef,
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    let w_bestbase = find_best_base(w_bases);
+    // typeobject.py:1113-1115: bestbase must exist
+    if w_bestbase.is_null() {
+        // No type base found — common for classes inheriting from object
+        // which is always a type. Return null to indicate "use root layout".
+        return Ok(std::ptr::null_mut());
+    }
+    // typeobject.py:1122-1128: check layout conflicts
+    let best_layout = pyre_object::w_type_get_layout_ptr(w_bestbase);
+    if !best_layout.is_null() && !w_bases.is_null() && pyre_object::is_tuple(w_bases) {
+        let len = pyre_object::w_tuple_len(w_bases);
+        for i in 0..len {
+            if let Some(w_base) = pyre_object::w_tuple_getitem(w_bases, i as i64) {
+                if !pyre_object::is_type(w_base) {
+                    continue;
+                }
+                let layout = pyre_object::w_type_get_layout_ptr(w_base);
+                if !layout.is_null() && !(*best_layout).issublayout(layout) {
+                    return Err(crate::PyError::type_error(
+                        "instance layout conflicts in multiple inheritance".to_string(),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(w_bestbase)
 }

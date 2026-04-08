@@ -227,6 +227,11 @@ pub fn init_typeobjects() {
     // type — PyPy: typeobject.py, bases=(object,)
     // type.__new__(metatype, name, bases, dict) creates new types
     let type_type = new_typeobject_with_base("type", init_type_type, object_type);
+    // typeobject.py:1262-1263: type has hasdict=True, weakrefable=True
+    unsafe {
+        pyre_object::w_type_set_hasdict(type_type, true);
+        pyre_object::w_type_set_weakrefable(type_type, true);
+    }
     reg.insert(&TYPE_TYPE as *const PyType as usize, type_type as usize);
     let _ = W_TYPE_TYPEOBJECT.set(type_type as usize);
 
@@ -289,9 +294,15 @@ pub fn init_typeobjects() {
 
     // function — PyPy: funcobject.py
     // Functions are descriptors: function.__get__ returns a bound method.
+    let function_type = new_typeobject_with_base("function", init_function_type, object_type);
+    // funcobject.py typedef: hasdict=True, weakrefable=True
+    unsafe {
+        pyre_object::w_type_set_hasdict(function_type, true);
+        pyre_object::w_type_set_weakrefable(function_type, true);
+    }
     reg.insert(
         &crate::FUNCTION_TYPE as *const PyType as usize,
-        new_typeobject_with_base("function", init_function_type, object_type) as usize,
+        function_type as usize,
     );
 
     // builtin-code — PyPy: BuiltinCode.typedef = TypeDef('builtin-code', ...)
@@ -418,8 +429,9 @@ fn new_root_typeobject(name: &str, init: fn(&mut PyNamespace)) -> PyObjectRef {
             base_layout: std::ptr::null(),
         });
         pyre_object::w_type_set_layout(type_obj, layout);
-        pyre_object::w_type_set_hasdict(type_obj, true);
-        pyre_object::w_type_set_weakrefable(type_obj, true);
+        // object: hasdict=False, weakrefable=False (bare object() has no __dict__)
+        pyre_object::w_type_set_hasdict(type_obj, false);
+        pyre_object::w_type_set_weakrefable(type_obj, false);
     }
     unsafe { w_type_set_mro(type_obj, vec![type_obj]) };
     type_obj
@@ -476,9 +488,11 @@ fn new_typeobject_with_base_and_layout(
             })
         };
         pyre_object::w_type_set_layout(type_obj, layout);
-        // Builtin types generally have hasdict=true, weakrefable=true.
-        pyre_object::w_type_set_hasdict(type_obj, true);
-        pyre_object::w_type_set_weakrefable(type_obj, true);
+        // typeobject.py:1262-1263: w_self.hasdict = instancetypedef.hasdict
+        // Most builtins: hasdict=false, weakrefable=false.
+        // Only type/function have both true.
+        pyre_object::w_type_set_hasdict(type_obj, false);
+        pyre_object::w_type_set_weakrefable(type_obj, false);
     }
 
     // MRO = [self] + base_mro

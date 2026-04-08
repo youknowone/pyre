@@ -634,7 +634,7 @@ fn type_descr_new_with_metaclass(
         // typeobject.py:1143-1204 create_all_slots parity.
         unsafe {
             let ns = &*ns_ptr;
-            crate::call::create_all_slots(w_type, ns, w_effective_bases);
+            crate::call::create_all_slots(w_type, ns, w_effective_bases)?;
         }
         // rclass.py:739-743 — set w_class (typeptr) at allocation time.
         // For type objects, w_class is the metaclass (type(C) → Meta).
