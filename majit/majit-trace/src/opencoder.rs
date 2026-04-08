@@ -1254,36 +1254,80 @@ impl TraceRecordBuffer {
 
     /// opencoder.py:852-858 Trace.get_live_ranges().
     ///
-    /// Returns a list where `liveranges[i]` is the last position at which
-    /// the value with raw trace position `i` is used. RPython walks the
-    /// trace via `TraceIterator.next_element_update_live_range`; majit's
-    /// decoded form lets us scan ops directly.
+    /// Returns a list where `liveranges[v]` is the last position at which
+    /// the value with raw trace position `v` is used. Mirrors RPython's
+    /// `TraceIterator.next_element_update_live_range` (opencoder.py:339-360):
+    ///
+    /// 1. The array is sized to cover the entire raw box space
+    ///    (`[0] * self._index`). Constants live in a separate namespace —
+    ///    in majit they sit above the `CONST_BIT` boundary at value
+    ///    `>= 1<<31` — and must NOT contribute to the array length, or a
+    ///    single constant reference would inflate the allocation by 2 GiB.
+    ///    Walking `op.pos` (rather than the union of arg slots) gives the
+    ///    same coverage as RPython's `_index` while excluding constants
+    ///    and `OpRef::NONE` sentinels.
+    /// 2. The forward walk writes `liveranges[v] = current_position` for
+    ///    every TAGBOX argument (`!is_constant() && !is_none()`) — TAGINT /
+    ///    TAGCONSTPTR / TAGCONSTOTHER refs are skipped, just like
+    ///    opencoder.py:347-349.
+    /// 3. Each non-void op also self-defines at its own position
+    ///    (`liveranges[index] = index`, opencoder.py:351-352). Without this
+    ///    self-definition the dead-range computation collapses any value
+    ///    that is produced but never read into position 0, which is wrong
+    ///    for the register allocator's free-slot logic.
     pub fn get_live_ranges(&self, ops: &[majit_ir::Op]) -> Vec<usize> {
-        let max_ref = ops
+        use majit_ir::Type;
+        // opencoder.py:854 — `[0] * self._index`. _index = the full raw
+        // box space (inputargs + every recorded op slot). majit assigns a
+        // sequential OpRef to every recorded op via `op_count`, so the
+        // recorder's own counter is the most accurate ceiling. Fall back
+        // to scanning op.pos for callers that pass a slice that no longer
+        // matches the recorder state.
+        let computed_max = ops
             .iter()
-            .flat_map(|op| {
-                op.args
-                    .iter()
-                    .chain(op.fail_args.iter().flat_map(|fa| fa.iter()))
-                    .map(|r| r.0 as usize)
-            })
+            .filter(|op| !op.pos.is_none() && !op.pos.is_constant())
+            .map(|op| op.pos.0 as usize + 1)
             .max()
             .unwrap_or(0);
-        let mut liveranges = vec![0usize; max_ref + 1];
-        for (i, op) in ops.iter().enumerate().rev() {
-            for arg in &op.args {
-                let idx = arg.0 as usize;
-                if idx < liveranges.len() && liveranges[idx] == 0 {
-                    liveranges[idx] = i;
+        let total = self.num_ops.max(computed_max).max(self.num_inputargs);
+        let mut liveranges = vec![0usize; total];
+        // opencoder.py:339-358 next_element_update_live_range — forward
+        // iteration. RPython tracks an `index` counter that advances by 1
+        // per non-void op; majit's recorder increments op_count for every
+        // op, so the equivalent "current position" is just `op.pos.0`.
+        for op in ops {
+            if op.pos.is_none() || op.pos.is_constant() {
+                continue;
+            }
+            let cur_index = op.pos.0 as usize;
+            // opencoder.py:347-349 — TAGBOX args set liveranges[v] = index.
+            // Skip constants (TAGINT/TAGCONSTPTR/TAGCONSTOTHER) and the
+            // OpRef::NONE sentinel (no live data behind it).
+            for &arg in &op.args {
+                if arg.is_none() || arg.is_constant() {
+                    continue;
+                }
+                let v = arg.0 as usize;
+                if v < liveranges.len() {
+                    liveranges[v] = cur_index;
                 }
             }
             if let Some(ref fa) = op.fail_args {
-                for arg in fa.iter() {
-                    let idx = arg.0 as usize;
-                    if idx < liveranges.len() && liveranges[idx] == 0 {
-                        liveranges[idx] = i;
+                for &arg in fa.iter() {
+                    if arg.is_none() || arg.is_constant() {
+                        continue;
+                    }
+                    let v = arg.0 as usize;
+                    if v < liveranges.len() {
+                        liveranges[v] = cur_index;
                     }
                 }
+            }
+            // opencoder.py:351-352 — non-void ops self-define at the
+            // current index so values that are produced but never read
+            // still get a real liverange entry.
+            if op.result_type() != Type::Void && cur_index < liveranges.len() {
+                liveranges[cur_index] = cur_index;
             }
         }
         liveranges
@@ -1595,6 +1639,91 @@ mod tests {
         let mut op = majit_ir::Op::new(opcode, args);
         op.pos = OpRef(pos);
         op
+    }
+
+    /// rpython/jit/metainterp/test/test_opencoder.py::test_liveranges parity.
+    /// 3 inputargs + NEW_WITH_VTABLE (= p0 at pos 3) + GUARD_TRUE (void at pos
+    /// 4) referencing all four boxes via fail_args. The final liverange of
+    /// every box should be the GUARD_TRUE position so that nothing dies
+    /// before the guard.
+    #[test]
+    fn test_get_live_ranges_parity() {
+        let mut buf = TraceRecordBuffer::new(3);
+        // Mirror RPython: p0 = NEW_WITH_VTABLE at raw position 3, then a
+        // GUARD_TRUE that pulls i0/i1/i2/p0 into its fail_args (the
+        // capture_resumedata equivalent for the guard's snapshot refs).
+        let p0 = op_at(3, majit_ir::OpCode::NewWithVtable, &[]);
+        let mut guard = op_at(4, majit_ir::OpCode::GuardTrue, &[OpRef(0)]);
+        guard.fail_args = Some(smallvec::smallvec![OpRef(1), OpRef(2), OpRef(3)]);
+        let ops = vec![p0, guard];
+        // op_count covers inputargs + recorded ops in record order.
+        buf.num_ops = ops.len();
+        // Pretend the recorder allocated positions 0..5 (3 inputargs + 2 ops).
+        // The recorder's internal counter would normally bump op_count;
+        // for the unit test we set it explicitly.
+        let total = 5;
+        buf.num_inputargs = 3;
+        // Inject the op_count via a backdoor: the field is private, so use
+        // get_live_ranges with the exact slice that has the right max pos.
+        let lr = buf.get_live_ranges(&ops);
+        // total >= max(op.pos)+1 = 5, total >= num_inputargs = 3 → length 5.
+        assert_eq!(lr.len(), total);
+        // i0/i1/i2/p0 last referenced by GUARD_TRUE at position 4.
+        assert_eq!(lr[0], 4);
+        assert_eq!(lr[1], 4);
+        assert_eq!(lr[2], 4);
+        assert_eq!(lr[3], 4);
+        // GUARD_TRUE is void → no self-def at its own slot.
+        assert_eq!(lr[4], 0);
+    }
+
+    /// Constants must NOT inflate the liveranges array. A single constant
+    /// in majit's CONST_BIT namespace has value `>= 1<<31`; treating it as a
+    /// raw box index would request a 16 GiB allocation. The function must
+    /// skip TAGINT/TAGCONSTPTR refs entirely (opencoder.py:347-349).
+    #[test]
+    fn test_get_live_ranges_skips_constants() {
+        let buf = TraceRecordBuffer::new(2);
+        // i0 is OpRef(0), i1 is OpRef(1). v2 = i0 + const(42).
+        let const_ref = OpRef::from_const(0);
+        assert!(const_ref.is_constant());
+        assert!(const_ref.0 >= 1u32 << 31);
+        let add = op_at(2, majit_ir::OpCode::IntAdd, &[OpRef(0), const_ref]);
+        let mut guard = op_at(3, majit_ir::OpCode::GuardTrue, &[OpRef(1)]);
+        guard.fail_args = Some(smallvec::smallvec![const_ref, OpRef(2)]);
+        let ops = vec![add, guard];
+        let lr = buf.get_live_ranges(&ops);
+        // Length should be at most max(op.pos)+1 = 4 — never the constant
+        // value (>= 1<<31). Anything bigger means the constant leaked into
+        // the size calculation.
+        assert!(
+            lr.len() <= 16,
+            "liveranges grew to {} — constants leaked into size calc",
+            lr.len()
+        );
+        // i0 used by IntAdd at pos 2.
+        assert_eq!(lr[0], 2);
+        // i1 used by GuardTrue at pos 3.
+        assert_eq!(lr[1], 3);
+        // v2 (IntAdd result) used by GuardTrue's fail_args at pos 3, AND
+        // self-defined at pos 2. Last write wins → 3.
+        assert_eq!(lr[2], 3);
+    }
+
+    /// Non-void ops must self-define their slot so values that are produced
+    /// but never read still have a real liverange entry. Without this the
+    /// dead-range computation collapses dead values into position 0.
+    #[test]
+    fn test_get_live_ranges_self_defines_unused_results() {
+        let buf = TraceRecordBuffer::new(1);
+        // v1 = IntAdd(i0, i0) — value-producing, never used.
+        let add = op_at(1, majit_ir::OpCode::IntAdd, &[OpRef(0), OpRef(0)]);
+        let ops = vec![add];
+        let lr = buf.get_live_ranges(&ops);
+        // i0 last referenced at IntAdd's position.
+        assert_eq!(lr[0], 1);
+        // v1 self-defines at pos 1 even though no later op reads it.
+        assert_eq!(lr[1], 1);
     }
 
     #[test]
