@@ -1508,19 +1508,27 @@ impl MIFrame {
         } else {
             None
         };
-        // virtualizable.py:86 read_boxes parity: array length =
-        // nlocals + current_stack_depth (from pre_opcode_vsd at orgpc),
-        // NOT the physical array length. RPython uses
-        // vinfo.get_total_size(virtualizable) which reads the arraylen
-        // field (= valuestackdepth for PyFrame).
-        // virtualizable.py:86 parity: array length = nlocals + actual
-        // stack depth. Bound by stack_values.len() to avoid reading
-        // uninitialized stack slots beyond the pre-opcode snapshot.
-        let current_vsd = sym.pre_opcode_vsd.unwrap_or(sym.valuestackdepth);
-        let stack_depth = current_vsd
-            .saturating_sub(sym.nlocals)
-            .min(stack_values.len());
-        let full_array_len = sym.nlocals + stack_depth;
+        // virtualizable.py:86 read_boxes parity: encoder must emit one
+        // box per slot in the heap-side `locals_cells_stack_w` array
+        // because the decoder reads `vinfo.get_total_size(virtualizable)`
+        // (= static_fields + heap array length) on the runtime PyFrame.
+        // Using the symbolic current stack depth here was off by
+        // (max_stackdepth - current_stack_depth) and produced
+        // `vable_size - 1 != vinfo.get_total_size` panics whenever a
+        // bridge tried to consume the snapshot at a state where the
+        // physical frame had been allocated with stack room beyond the
+        // current symbolic depth. Read the physical frame length and
+        // pad missing slots with the live concrete value (or NULL).
+        let physical_array_len = concrete_frame
+            .map(|f| f.locals_cells_stack_w.len())
+            .unwrap_or_else(|| {
+                let current_vsd = sym.pre_opcode_vsd.unwrap_or(sym.valuestackdepth);
+                let stack_depth = current_vsd
+                    .saturating_sub(sym.nlocals)
+                    .min(stack_values.len());
+                sym.nlocals + stack_depth
+            });
+        let full_array_len = physical_array_len;
         for i in 0..full_array_len {
             let opref = if i < sym.symbolic_locals.len() {
                 sym.symbolic_locals[i]
