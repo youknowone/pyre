@@ -391,9 +391,10 @@ pub fn compute_vars_longevity(inputargs: &[InputArg], operations: &[Op]) -> Life
         let i = i as i32;
 
         if !longevity.contains(opref) {
-            // regalloc.py:1183-1186
-            if opnum.result_type() == Type::Void && opnum.has_no_side_effect() {
-                continue; // dead: no side-effect, result unused
+            // regalloc.py:1183-1186: if op.type != 'v' and has_no_side_effect:
+            // result not used, operation has no side-effect → dead code
+            if opnum.result_type() != Type::Void && opnum.has_no_side_effect() {
+                continue;
             }
             longevity.set(opref, Lifetime::new(i, i));
         } else {
@@ -996,6 +997,10 @@ impl RegisterManager {
         for &next in regs {
             let reg = self.reg_bindings_get(next, longevity).unwrap();
             if forbidden_vars.contains(&next) {
+                continue;
+            }
+            // regalloc.py:544
+            if self.temp_boxes.contains(&next) {
                 continue;
             }
             if let Some(sel) = selected_reg {
