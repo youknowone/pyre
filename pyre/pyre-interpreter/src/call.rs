@@ -1574,8 +1574,7 @@ fn type_descr_call(frame: &mut PyFrame, w_type: PyObjectRef, args: &[PyObjectRef
     Ok(instance)
 }
 
-/// typeobject.py:1155-1188 — extract slot names from __slots__ value.
-/// Returns a Vec of slot name strings (NOT yet sorted; caller must sort).
+/// typeobject.py:1157-1162 — unpack __slots__ to slot name strings.
 fn collect_slot_names(w_slots: pyre_object::PyObjectRef) -> Vec<String> {
     unsafe {
         if pyre_object::is_tuple(w_slots) {
@@ -1598,27 +1597,61 @@ fn collect_slot_names(w_slots: pyre_object::PyObjectRef) -> Vec<String> {
     }
 }
 
-/// typeobject.py:1143-1204 create_all_slots parity.
+/// typeobject.py:1131-1140 copy_flags_from_bases:
+///   w_self.hasdict |= w_base.hasdict
+///   w_self.weakrefable |= w_base.weakrefable
+unsafe fn copy_flags_from_bases(
+    w_type: pyre_object::PyObjectRef,
+    w_bases: pyre_object::PyObjectRef,
+) {
+    if w_bases.is_null() || !pyre_object::is_tuple(w_bases) {
+        return;
+    }
+    let len = pyre_object::w_tuple_len(w_bases);
+    for i in 0..len {
+        if let Some(base) = pyre_object::w_tuple_getitem(w_bases, i as i64) {
+            if pyre_object::is_type(base) {
+                if pyre_object::w_type_get_hasdict(base) {
+                    pyre_object::w_type_set_hasdict(w_type, true);
+                }
+                if pyre_object::w_type_get_weakrefable(base) {
+                    pyre_object::w_type_set_weakrefable(w_type, true);
+                }
+            }
+        }
+    }
+}
+
+/// typeobject.py:1143-1204 create_all_slots.
 ///
-/// Processes __slots__, sets newslotnames/nslots/hasdict/weakrefable/base_layout
-/// on the type object.
+/// Returns the Layout pointer to set on the type.
 ///
 /// # Safety
-/// `w_type` must be a valid W_TypeObject pointer. `ns` must be valid.
-/// `w_bases` must be a valid tuple of base types.
+/// `w_type` must be a valid W_TypeObject pointer.
 pub unsafe fn create_all_slots(
     w_type: pyre_object::PyObjectRef,
     ns: &crate::PyNamespace,
     w_bases: pyre_object::PyObjectRef,
 ) {
-    // typeobject.py:1146: base_layout = w_bestbase.layout
-    // Find best base (first base class that is a type object).
+    use pyre_object::typeobject::{Layout, leak_layout};
+
+    // typeobject.py:1245: w_bestbase = check_and_find_best_base(space, bases_w)
     let w_bestbase = find_best_base(w_bases);
 
-    // Set base_layout to point to best base type.
-    if !w_bestbase.is_null() {
-        pyre_object::w_type_set_base_layout(w_type, w_bestbase);
-    }
+    // typeobject.py:1254: copy_flags_from_bases — inherit hasdict/weakrefable
+    copy_flags_from_bases(w_type, w_bases);
+
+    // typeobject.py:1146: base_layout = w_bestbase.layout
+    let base_layout = if w_bestbase.is_null() {
+        std::ptr::null()
+    } else {
+        pyre_object::w_type_get_layout_ptr(w_bestbase)
+    };
+    let base_nslots = if base_layout.is_null() {
+        0
+    } else {
+        (*base_layout).nslots
+    };
 
     if let Some(&w_slots) = ns.get("__slots__") {
         // typeobject.py:1154-1176: has __slots__
@@ -1628,39 +1661,103 @@ pub unsafe fn create_all_slots(
         let mut newslotnames = Vec::new();
         for slot_name in &all_names {
             match slot_name.as_str() {
-                // typeobject.py:1165-1169
-                "__dict__" => wantdict = true,
-                // typeobject.py:1170-1174
-                "__weakref__" => wantweakref = true,
-                // typeobject.py:1175-1176
+                // typeobject.py:1165-1169: __dict__ slot
+                "__dict__" => {
+                    if wantdict || pyre_object::w_type_get_hasdict(w_type) {
+                        // Duplicate __dict__ — silently ignore for now
+                        // PyPy raises TypeError here
+                    }
+                    wantdict = true;
+                }
+                // typeobject.py:1170-1174: __weakref__ slot
+                "__weakref__" => {
+                    if wantweakref || pyre_object::w_type_get_weakrefable(w_type) {
+                        // Duplicate __weakref__ — silently ignore for now
+                    }
+                    wantweakref = true;
+                }
+                // typeobject.py:1175-1176: regular slot name
                 _ => newslotnames.push(slot_name.clone()),
             }
         }
         // typeobject.py:1178: string_sort(newslotnames)
         newslotnames.sort();
-        let nslots = newslotnames.len() as u32;
-        pyre_object::w_type_set_nslots(w_type, nslots);
-        pyre_object::w_type_set_newslotnames(w_type, newslotnames);
-        pyre_object::w_type_set_hasdict(w_type, wantdict);
-        pyre_object::w_type_set_weakrefable(w_type, wantweakref);
+
+        // typeobject.py:1191-1195: set hasdict/weakrefable
+        if wantdict {
+            pyre_object::w_type_set_hasdict(w_type, true);
+        }
+        if wantweakref {
+            pyre_object::w_type_set_weakrefable(w_type, true);
+        }
+
+        let nslots = base_nslots + newslotnames.len() as u32;
+
+        // typeobject.py:1200-1204: reuse base_layout if no new slots added
+        let typedef = if base_layout.is_null() {
+            &pyre_object::pyobject::INSTANCE_TYPE as *const _
+        } else {
+            (*base_layout).typedef
+        };
+        let layout = if newslotnames.is_empty() && !base_layout.is_null() {
+            base_layout
+        } else {
+            leak_layout(Layout {
+                typedef,
+                nslots,
+                newslotnames,
+                base_layout,
+            })
+        };
+        pyre_object::w_type_set_layout(w_type, layout);
+    } else {
+        // typeobject.py:1151-1153: no __slots__ → wantdict=True, wantweakref=True
+        pyre_object::w_type_set_hasdict(w_type, true);
+        pyre_object::w_type_set_weakrefable(w_type, true);
+
+        // typeobject.py:1200: reuse base_layout (no new slots)
+        let layout = if !base_layout.is_null() {
+            base_layout
+        } else {
+            leak_layout(Layout {
+                typedef: &pyre_object::pyobject::INSTANCE_TYPE as *const _,
+                nslots: 0,
+                newslotnames: vec![],
+                base_layout: std::ptr::null(),
+            })
+        };
+        pyre_object::w_type_set_layout(w_type, layout);
     }
-    // else: typeobject.py:1151-1153 — no __slots__ → hasdict=true, weakrefable=true
-    // (defaults set by w_type_new)
 }
 
-/// Find the best base class from a bases tuple.
-/// typeobject.py:1246: check_and_find_best_base
+/// typeobject.py:1089-1105 find_best_base: pick the base with the
+/// most-derived layout (using issublayout).
 unsafe fn find_best_base(w_bases: pyre_object::PyObjectRef) -> pyre_object::PyObjectRef {
     if w_bases.is_null() || !pyre_object::is_tuple(w_bases) {
         return std::ptr::null_mut();
     }
     let len = pyre_object::w_tuple_len(w_bases);
+    let mut w_bestbase: pyre_object::PyObjectRef = std::ptr::null_mut();
     for i in 0..len {
-        if let Some(base) = pyre_object::w_tuple_getitem(w_bases, i as i64) {
-            if pyre_object::is_type(base) {
-                return base;
+        if let Some(w_candidate) = pyre_object::w_tuple_getitem(w_bases, i as i64) {
+            if !pyre_object::is_type(w_candidate) {
+                continue;
+            }
+            if w_bestbase.is_null() {
+                w_bestbase = w_candidate;
+                continue;
+            }
+            // typeobject.py:1100-1104: pick candidate if its layout
+            // is a sub-layout of the current best.
+            let cand_layout = pyre_object::w_type_get_layout_ptr(w_candidate);
+            let best_layout = pyre_object::w_type_get_layout_ptr(w_bestbase);
+            if cand_layout != best_layout
+                && !cand_layout.is_null()
+                && (*cand_layout).issublayout(best_layout)
+            {
+                w_bestbase = w_candidate;
             }
         }
     }
-    std::ptr::null_mut()
+    w_bestbase
 }
