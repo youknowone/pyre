@@ -1727,9 +1727,10 @@ pub unsafe fn create_all_slots(
         newslotnames.sort();
 
         // typeobject.py:1183-1189 create_slot: add slot to class dict if
-        // name not already present (name mangling omitted for now).
-        // Issue 3: slot descriptors — record in dict for name conflict check.
+        // typeobject.py:1183-1189 create_slot: add Member descriptor to
+        // class dict for each slot. Skip if name already exists in dict.
         let type_ns = pyre_object::w_type_get_dict_ptr(w_type) as *mut crate::PyNamespace;
+        let mut slot_index = base_nslots;
         let mut i = 0;
         while i < newslotnames.len() {
             let slot_name = &newslotnames[i];
@@ -1737,14 +1738,14 @@ pub unsafe fn create_all_slots(
                 // typeobject.py:1212: name conflict → skip this slot
                 newslotnames.remove(i);
             } else {
-                // typeobject.py:1216-1217: create_slot → put placeholder in dict.
-                // Full Member descriptor omitted; placeholder marks the name.
+                // typeobject.py:1206-1217 create_slot:
+                //   member = Member(index_next_extra_slot, slot_name, w_self)
+                //   w_self.dict_w[slot_name] = member
                 if !type_ns.is_null() {
-                    (*type_ns).insert(
-                        slot_name.clone(),
-                        pyre_object::w_none(), // placeholder for Member descriptor
-                    );
+                    let member = pyre_object::w_member_new(slot_index, slot_name.clone(), w_type);
+                    (*type_ns).insert(slot_name.clone(), member);
                 }
+                slot_index += 1;
                 i += 1;
             }
         }
@@ -1836,18 +1837,28 @@ unsafe fn find_best_base(w_bases: pyre_object::PyObjectRef) -> pyre_object::PyOb
 }
 
 /// typeobject.py:1107-1129 check_and_find_best_base:
-///   1. find_best_base
-///   2. check bestbase is not None
-///   3. check all other bases' layouts are super-layouts of bestbase
+///   w_bestbase = find_best_base(bases_w)
+///   if w_bestbase is None: raise TypeError
+///   if not w_bestbase.layout.typedef.acceptable_as_base_class: raise TypeError
+///   for w_base in bases_w: check layout conflicts
 unsafe fn check_and_find_best_base(
     w_bases: pyre_object::PyObjectRef,
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
     let w_bestbase = find_best_base(w_bases);
-    // typeobject.py:1113-1115: bestbase must exist
+    // typeobject.py:1113-1115
     if w_bestbase.is_null() {
-        // No type base found — common for classes inheriting from object
-        // which is always a type. Return null to indicate "use root layout".
-        return Ok(std::ptr::null_mut());
+        return Err(crate::PyError::type_error(
+            "a new-style class can't have only classic bases".to_string(),
+        ));
+    }
+    // typeobject.py:1116-1118: acceptable_as_base_class check.
+    // typedef.py:43: acceptable = '__new__' in rawdict.
+    // bool and NoneType are not acceptable in Python 3.
+    if !is_acceptable_base_class(w_bestbase) {
+        return Err(crate::PyError::type_error(format!(
+            "type '{}' is not an acceptable base class",
+            pyre_object::w_type_get_name(w_bestbase),
+        )));
     }
     // typeobject.py:1122-1128: check layout conflicts
     let best_layout = pyre_object::w_type_get_layout_ptr(w_bestbase);
@@ -1868,4 +1879,22 @@ unsafe fn check_and_find_best_base(
         }
     }
     Ok(w_bestbase)
+}
+
+/// typedef.py:43 acceptable_as_base_class = '__new__' in rawdict.
+/// Check by type name — types whose typedef lacks __new__ can't be subclassed.
+/// In Python 3: bool, NoneType, NotImplementedType, function, method, code, etc.
+unsafe fn is_acceptable_base_class(w_type: pyre_object::PyObjectRef) -> bool {
+    let name = pyre_object::w_type_get_name(w_type);
+    !matches!(
+        name,
+        "bool"
+            | "NoneType"
+            | "NotImplementedType"
+            | "function"
+            | "builtin-code"
+            | "code"
+            | "instancemethod"
+            | "member_descriptor"
+    )
 }
