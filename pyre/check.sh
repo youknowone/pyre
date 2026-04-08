@@ -163,7 +163,7 @@ run_bench       "fib_recursive" "$BENCH/fib_recursive.py"        5       ""     
 run_bench       "nested_loop"    "$BENCH/nested_loop.py"          5
 run_bench       "raise_catch"   "$BENCH/raise_catch_loop.py"     6
 run_bench       "spectral_norm" "$BENCH/spectral_norm.py"       10      ""       15
-run_bench       "nbody"          "$BENCH/nbody_50k.py"           5       ""       10
+run_bench       "nbody"          "$BENCH/nbody_50k.py"           5       ""       11
 run_bench       "fannkuch"       "$BENCH/fannkuch.py"          5
 
 echo ""
