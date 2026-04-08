@@ -646,7 +646,7 @@ pub(crate) fn trace_ob_type_descr() -> DescrRef {
     ob_type_descr()
 }
 
-pub(crate) fn box_traced_raw_int(ctx: &mut TraceCtx, value: OpRef) -> OpRef {
+pub(crate) fn wrapint(ctx: &mut TraceCtx, value: OpRef) -> OpRef {
     crate::helpers::emit_box_int_inline(ctx, value, w_int_size_descr(), int_intval_descr())
 }
 
@@ -708,14 +708,14 @@ pub(crate) fn note_root_trace_too_long(green_key: u64) {
     }
 }
 
-pub(crate) fn box_traced_raw_float(ctx: &mut TraceCtx, value: OpRef) -> OpRef {
+pub(crate) fn wrapfloat(ctx: &mut TraceCtx, value: OpRef) -> OpRef {
     emit_box_float_inline(ctx, value, w_float_size_descr(), float_floatval_descr())
 }
 
 pub(crate) fn ensure_boxed_for_ca(ctx: &mut TraceCtx, state: &MIFrame, value: OpRef) -> OpRef {
     match state.value_type(value) {
-        Type::Int => box_traced_raw_int(ctx, value),
-        Type::Float => box_traced_raw_float(ctx, value),
+        Type::Int => wrapint(ctx, value),
+        Type::Float => wrapfloat(ctx, value),
         Type::Ref | Type::Void => value,
     }
 }
@@ -726,8 +726,8 @@ pub(crate) fn box_value_for_python_helper(
     value: OpRef,
 ) -> OpRef {
     match state.value_type(value) {
-        Type::Int => box_traced_raw_int(ctx, value),
-        Type::Float => box_traced_raw_float(ctx, value),
+        Type::Int => wrapint(ctx, value),
+        Type::Float => wrapfloat(ctx, value),
         Type::Ref | Type::Void => value,
     }
 }
@@ -802,13 +802,13 @@ pub(crate) fn trace_arraylen_gc(ctx: &mut TraceCtx, obj: OpRef, descr: DescrRef)
     if let Some(cached) = ctx.heap_cache().arraylen(obj, descr_idx) {
         return cached;
     }
-    let result = trace_gc_object_int_field(ctx, obj, descr.clone());
+    let result = opimpl_getfield_gc_i(ctx, obj, descr.clone());
     ctx.heap_cache_mut()
         .arraylen_now_known(obj, descr_idx, result);
     result
 }
 
-pub(crate) fn trace_gc_object_int_field(ctx: &mut TraceCtx, obj: OpRef, descr: DescrRef) -> OpRef {
+pub(crate) fn opimpl_getfield_gc_i(ctx: &mut TraceCtx, obj: OpRef, descr: DescrRef) -> OpRef {
     // pyjitpl.py:opimpl_getfield_gc_i parity: the tracer does NOT fold
     // pure field reads on constant objects. Folding happens in the
     // optimizer (heap.py:optimize_GETFIELD_GC_I → optimizer.constant_fold),
@@ -824,7 +824,7 @@ pub(crate) fn trace_gc_object_int_field(ctx: &mut TraceCtx, obj: OpRef, descr: D
     // Record the field as quasi-immut known so subsequent reads skip
     // the QUASIIMMUT_FIELD op. Emit GUARD_NOT_INVALIDATED if needed.
     // NOTE: GuardNotInvalidated is NOT emitted here — it requires
-    // PyreSym.record_guard for proper snapshot/fail_args (pyjitpl.py:1087
+    // PyreSym.generate_guard for proper snapshot/fail_args (pyjitpl.py:1087
     // generate_guard parity). Instead, set a flag on ctx so the caller
     // (PyreSym with_ctx block) can emit it with full resume data.
     if descr.is_quasi_immutable() && !ctx.heap_cache().is_quasi_immut_known(obj, field_index) {
@@ -846,17 +846,17 @@ pub(crate) fn trace_gc_object_int_field(ctx: &mut TraceCtx, obj: OpRef, descr: D
 }
 
 pub(crate) fn trace_gc_object_type_field(ctx: &mut TraceCtx, obj: OpRef, descr: DescrRef) -> OpRef {
-    trace_gc_object_int_field(ctx, obj, descr)
+    opimpl_getfield_gc_i(ctx, obj, descr)
 }
 
 // Note: pyre does not currently route GetfieldGcF/GetfieldGcPureF through
 // state.rs. Float field unboxing goes via the codewriter-generated
-// `trace_getfield_gc_float_pureornot` (majit-codewriter/src/codegen.rs),
+// `getfield_gc_f_pureornot` (majit-codewriter/src/codegen.rs),
 // which — matching RPython's pyjitpl.py opimpl_getfield_gc_f — records
 // the GC op without folding. The optimizer's `optimize_GETFIELD_GC_F`
 // (= `optimize_GETFIELD_GC_I` via RPython's alias) handles folding.
 
-/// Unbox int with proper GuardClass resume data via MIFrame::record_guard.
+/// Unbox int with proper GuardClass resume data via MIFrame::generate_guard.
 pub(crate) fn trace_unbox_int_with_resume(
     frame: &mut MIFrame,
     ctx: &mut TraceCtx,
@@ -883,7 +883,7 @@ pub(crate) fn trace_unbox_int_with_resume_descr(
     // backend loads typeptr at offset 0.
     if !ctx.heap_cache().is_class_known(obj) {
         let type_const = ctx.const_int(type_addr);
-        frame.record_guard(ctx, OpCode::GuardClass, &[obj, type_const]);
+        frame.generate_guard(ctx, OpCode::GuardClass, &[obj, type_const]);
         ctx.heap_cache_mut()
             .class_now_known(obj, majit_ir::GcRef(type_addr as usize));
     }
@@ -897,7 +897,7 @@ pub(crate) fn trace_unbox_int_with_resume_descr(
     )
 }
 
-/// Unbox float with proper GuardClass resume data via MIFrame::record_guard.
+/// Unbox float with proper GuardClass resume data via MIFrame::generate_guard.
 pub(crate) fn trace_unbox_float_with_resume(
     frame: &mut MIFrame,
     ctx: &mut TraceCtx,
@@ -906,7 +906,7 @@ pub(crate) fn trace_unbox_float_with_resume(
 ) -> OpRef {
     if !ctx.heap_cache().is_class_known(obj) {
         let type_const = ctx.const_int(float_type_addr);
-        frame.record_guard(ctx, OpCode::GuardClass, &[obj, type_const]);
+        frame.generate_guard(ctx, OpCode::GuardClass, &[obj, type_const]);
         ctx.heap_cache_mut()
             .class_now_known(obj, majit_ir::GcRef(float_type_addr as usize));
     }
@@ -3010,7 +3010,7 @@ mod tests {
     }
 
     #[test]
-    fn test_guard_object_class_uses_guard_nonnull_class() {
+    fn test_guard_class_uses_guard_nonnull_class() {
         let mut ctx = TraceCtx::for_test(1);
         let obj = OpRef(0);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
@@ -3031,7 +3031,7 @@ mod tests {
         };
 
         state.with_ctx(|this, ctx| {
-            this.guard_object_class(ctx, obj, &INT_TYPE as *const PyType);
+            this.guard_class(ctx, obj, &INT_TYPE as *const PyType);
         });
 
         let recorder = ctx.into_recorder();
@@ -4022,7 +4022,7 @@ mod tests {
         state.sym_mut().pending_branch_value = Some(OpRef::NONE);
         state.with_ctx(|this, ctx| {
             this.sym_mut().pending_branch_value = Some(OpRef::NONE);
-            this.record_guard(ctx, OpCode::GuardTrue, &[truth]);
+            this.generate_guard(ctx, OpCode::GuardTrue, &[truth]);
         });
 
         let recorder = ctx.into_recorder();
@@ -4070,7 +4070,7 @@ mod tests {
         };
 
         state.with_ctx(|this, ctx| {
-            this.record_guard(ctx, OpCode::GuardTrue, &[truth]);
+            this.generate_guard(ctx, OpCode::GuardTrue, &[truth]);
         });
         // concrete_branch_truth_for_value now takes concrete value as parameter
         assert_eq!(
@@ -4341,8 +4341,9 @@ mod tests {
             concrete_frame_addr: 0,
         };
 
+        let concrete_value = w_int_new(42);
         state
-            .list_append_value(list, value, concrete_list)
+            .list_append_value(list, value, concrete_list, concrete_value)
             .expect("integer-list append fast path should trace");
 
         let recorder = ctx.into_recorder();
@@ -4432,8 +4433,9 @@ mod tests {
             concrete_frame_addr: 0,
         };
 
+        let concrete_value = pyre_object::w_float_new(3.14);
         state
-            .list_append_value(list, value, concrete_list)
+            .list_append_value(list, value, concrete_list, concrete_value)
             .expect("float-list append fast path should trace");
 
         let recorder = ctx.into_recorder();
