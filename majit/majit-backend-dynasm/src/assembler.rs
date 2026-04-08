@@ -2913,30 +2913,70 @@ impl Assembler386 {
         let green_key = self.header_pc as i64;
 
         if !is_resolved {
-            // Pending/unresolved target: cannot call callee. The heap jf
-            // has args stored but no code to execute. Free it and return 0.
-            // RPython parity: call_assembler_fast_path detects null code_ptr
-            // and calls force_fn. Our force_fn requires a PyFrame, not a
-            // jitframe array, so we return 0 (caller handles via blackhole).
+            // Pending/unresolved target: code not yet compiled.
+            // RPython parity: call_assembler_fast_path (compiler.rs:2430)
+            // detects null code_ptr and calls force_fn(inputs[0]) where
+            // inputs[0] = the callee's frame pointer (a PyFrame).
+            //
+            // In dynasm, args[0] was stored at jf_frame[0] = [rdx + 8].
+            // Read it, free the heap jf, then call force_fn(frame_ptr).
+            let force_addr = crate::call_assembler_force_fn_addr() as i64;
             #[cfg(target_arch = "x86_64")]
-            dynasm!(self.mc ; .arch x64
-                ; mov rdi, rdx                      // free(heap_jf)
-                ; sub rsp, 8
-                ; mov rax, QWORD free_ptr
-                ; call rax
-                ; add rsp, 8
-                ; mov rbp, r12                      // restore caller jf_ptr
-                ; xor eax, eax                      // result = 0
-            );
+            {
+                if force_addr != 0 {
+                    dynasm!(self.mc ; .arch x64
+                        ; mov r13, [rdx + 8]            // r13 = jf_frame[0] = args[0] (PyFrame ptr)
+                        ; mov rdi, rdx                   // free(heap_jf)
+                        ; sub rsp, 8
+                        ; mov rax, QWORD free_ptr
+                        ; call rax
+                        ; add rsp, 8
+                        ; mov rbp, r12                   // restore caller jf_ptr
+                        ; mov rdi, r13                   // arg0 = PyFrame ptr
+                        ; sub rsp, 8
+                        ; mov rax, QWORD force_addr
+                        ; call rax                       // rax = force_fn(frame_ptr) = result
+                        ; add rsp, 8
+                    );
+                } else {
+                    // No force_fn registered — free and return 0.
+                    dynasm!(self.mc ; .arch x64
+                        ; mov rdi, rdx                   // free(heap_jf)
+                        ; sub rsp, 8
+                        ; mov rax, QWORD free_ptr
+                        ; call rax
+                        ; add rsp, 8
+                        ; mov rbp, r12                   // restore caller jf_ptr
+                        ; xor eax, eax                   // result = 0
+                    );
+                }
+            }
             #[cfg(target_arch = "aarch64")]
             {
-                self.emit_mov_imm64(2, free_ptr);
-                dynasm!(self.mc ; .arch aarch64
-                    ; mov x0, x20
-                    ; blr x2
-                    ; mov x29, x19                  // restore caller jf_ptr
-                    ; mov x0, 0                     // result = 0
-                );
+                if force_addr != 0 {
+                    dynasm!(self.mc ; .arch aarch64
+                        ; ldr x21, [x20, 8]             // x21 = jf_frame[0] (PyFrame ptr)
+                    );
+                    self.emit_mov_imm64(2, free_ptr);
+                    dynasm!(self.mc ; .arch aarch64
+                        ; mov x0, x20
+                        ; blr x2                        // free(heap_jf)
+                        ; mov x29, x19                  // restore caller jf_ptr
+                        ; mov x0, x21                   // arg0 = PyFrame ptr
+                    );
+                    self.emit_mov_imm64(2, force_addr);
+                    dynasm!(self.mc ; .arch aarch64
+                        ; blr x2                        // x0 = force_fn(frame_ptr)
+                    );
+                } else {
+                    self.emit_mov_imm64(2, free_ptr);
+                    dynasm!(self.mc ; .arch aarch64
+                        ; mov x0, x20
+                        ; blr x2
+                        ; mov x29, x19
+                        ; mov x0, 0
+                    );
+                }
             }
         } else {
             // Resolved target: call callee and handle fast/slow path.
