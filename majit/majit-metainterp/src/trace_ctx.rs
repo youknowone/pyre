@@ -355,6 +355,36 @@ impl TraceCtx {
         self.replacements.push((old, new));
     }
 
+    /// pyjitpl.py:3499 `replace_box(oldbox, newbox)` parity.
+    ///
+    /// In RPython this walks every place where the old Box might appear
+    /// (frame stacks, virtualref_boxes, virtualizable_boxes, heap caches)
+    /// and replaces it with the new Box. The pyre equivalent applies the
+    /// same logic to the side-channel `virtualizable_boxes` so that
+    /// `metainterp.virtualizable_boxes[-1]` (the standard vable identity)
+    /// stays in sync after `replace_op` calls.
+    ///
+    /// Trace ops, virtualref_boxes, and heap cache state are handled by
+    /// `apply_replacements` (deferred batch) and the optimizer's separate
+    /// `forwarded` chain. This method covers only the
+    /// `virtualizable_boxes` walk that has no other home.
+    pub fn replace_box_in_virtualizable_boxes(&mut self, old: OpRef, new: OpRef) {
+        // pyjitpl.py:3506-3511 parity:
+        //     if (jitdriver_sd.virtualizable_info is not None or
+        //         jitdriver_sd.greenfield_info is not None):
+        //         boxes = self.virtualizable_boxes
+        //         for i in range(len(boxes)):
+        //             if boxes[i] is oldbox:
+        //                 boxes[i] = newbox
+        if let Some(boxes) = self.virtualizable_boxes.as_mut() {
+            for slot in boxes.iter_mut() {
+                if *slot == old {
+                    *slot = new;
+                }
+            }
+        }
+    }
+
     /// Apply all pending replacements to the trace ops.
     pub fn apply_replacements(&mut self) {
         if self.replacements.is_empty() {
@@ -367,6 +397,19 @@ impl TraceCtx {
             );
             for (old, new) in &self.replacements {
                 eprintln!("  {:?} → {:?}", old, new);
+            }
+        }
+        // pyjitpl.py:3499 replace_box parity: every replacement that the
+        // tracer registers must also propagate to virtualizable_boxes,
+        // matching RPython's eager replace_box(virtualizable_boxes) walk.
+        // Apply this to each (old, new) pair before draining.
+        for (old, new) in &self.replacements {
+            if let Some(boxes) = self.virtualizable_boxes.as_mut() {
+                for slot in boxes.iter_mut() {
+                    if *slot == *old {
+                        *slot = *new;
+                    }
+                }
             }
         }
         let replacements: std::collections::HashMap<OpRef, OpRef> =
