@@ -23,6 +23,10 @@ pub struct Layout {
     pub newslotnames: Vec<String>,
     /// typeobject.py:116 — parent layout (identity comparison).
     pub base_layout: *const Layout,
+    /// typedef.py:43 — `acceptable_as_base_class = '__new__' in rawdict`.
+    /// Stored on Layout (≈ TypeDef level) so the check goes through
+    /// w_bestbase.layout, not the type object itself.
+    pub acceptable_as_base_class: bool,
 }
 
 impl Layout {
@@ -95,8 +99,6 @@ pub struct W_TypeObject {
     pub hasdict: bool,
     /// typeobject.py:181 `weakrefable` — True when instances support weakrefs.
     pub weakrefable: bool,
-    /// typedef.py:43 `acceptable_as_base_class = '__new__' in rawdict`.
-    pub acceptable_as_base_class: bool,
 }
 
 /// Leak a Layout to get a 'static pointer for sharing.
@@ -123,7 +125,6 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: *mut u8) -> PyObject
         layout: std::ptr::null(),
         hasdict: false,
         weakrefable: false,
-        acceptable_as_base_class: true,
     });
     Box::into_raw(obj) as PyObjectRef
 }
@@ -150,7 +151,6 @@ pub fn w_type_new_builtin(
         layout: std::ptr::null(),
         hasdict: false,
         weakrefable: false,
-        acceptable_as_base_class: true,
     });
     Box::into_raw(obj) as PyObjectRef
 }
@@ -275,12 +275,38 @@ pub unsafe fn w_type_is_heaptype(obj: PyObjectRef) -> bool {
     (*(obj as *const W_TypeObject)).flag_heaptype
 }
 
-/// typedef.py:43 `acceptable_as_base_class` getter/setter.
+/// typedef.py:43 `acceptable_as_base_class` — read from Layout level.
+/// typeobject.py:1116: w_bestbase.layout.typedef.acceptable_as_base_class
 pub unsafe fn w_type_get_acceptable_as_base_class(obj: PyObjectRef) -> bool {
-    (*(obj as *const W_TypeObject)).acceptable_as_base_class
+    let layout = (*(obj as *const W_TypeObject)).layout;
+    if layout.is_null() {
+        true
+    } else {
+        (*layout).acceptable_as_base_class
+    }
 }
+/// Override acceptable_as_base_class by cloning the Layout.
+/// typedef.py:742,765,664 explicit overrides after initial creation.
+/// Layouts may be shared (reused from parent), so we clone to avoid
+/// corrupting the parent type's flag.
 pub unsafe fn w_type_set_acceptable_as_base_class(obj: PyObjectRef, v: bool) {
-    (*(obj as *mut W_TypeObject)).acceptable_as_base_class = v;
+    let old_layout = (*(obj as *const W_TypeObject)).layout;
+    if old_layout.is_null() {
+        return;
+    }
+    let old = &*old_layout;
+    if old.acceptable_as_base_class == v {
+        return; // already correct
+    }
+    // Clone with new value to avoid mutating shared Layout.
+    let new_layout = leak_layout(Layout {
+        typedef: old.typedef,
+        nslots: old.nslots,
+        newslotnames: old.newslotnames.clone(),
+        base_layout: old.base_layout,
+        acceptable_as_base_class: v,
+    });
+    (*(obj as *mut W_TypeObject)).layout = new_layout;
 }
 
 // Backward-compat no-ops for removed direct field setters.
@@ -308,12 +334,14 @@ mod tests {
             nslots: 0,
             newslotnames: vec![],
             base_layout: std::ptr::null(),
+            acceptable_as_base_class: true,
         });
         let child = leak_layout(Layout {
             typedef: &INSTANCE_TYPE,
             nslots: 1,
             newslotnames: vec!["x".to_string()],
             base_layout: root,
+            acceptable_as_base_class: true,
         });
         unsafe {
             assert!((*child).issublayout(root));
@@ -329,6 +357,7 @@ mod tests {
             nslots: 1,
             newslotnames: vec!["x".to_string()],
             base_layout: std::ptr::null(),
+            acceptable_as_base_class: true,
         });
         // Same Layout pointer → equal
         assert!(Layout::expands_equal(root, true, true, root, true, true));

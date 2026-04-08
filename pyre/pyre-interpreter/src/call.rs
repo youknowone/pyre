@@ -1798,6 +1798,8 @@ pub unsafe fn create_all_slots(
                 nslots,
                 newslotnames,
                 base_layout,
+                // User-defined classes always have __new__ (inherited from object).
+                acceptable_as_base_class: true,
             })
         };
         pyre_object::w_type_set_layout(w_type, layout);
@@ -1824,6 +1826,7 @@ unsafe fn set_default_layout(
             nslots: 0,
             newslotnames: vec![],
             base_layout: std::ptr::null(),
+            acceptable_as_base_class: true,
         })
     };
     pyre_object::w_type_set_layout(w_type, layout);
