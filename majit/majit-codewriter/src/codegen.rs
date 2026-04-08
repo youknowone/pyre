@@ -1063,9 +1063,19 @@ pub fn generated_compare_value_direct(
             frame.remember_value_type(truth, majit_ir::Type::Int);
             // RPython goto_if_not fusion: cache truth for
             // the next POP_JUMP_IF to consume directly.
-            frame.sym_mut().last_comparison_truth = Some(truth);
-            frame.sym_mut().last_comparison_concrete_truth =
+            let cmp_orgpc = frame.orgpc;
+            let sym = frame.sym_mut();
+            sym.last_comparison_truth = Some(truth);
+            sym.last_comparison_concrete_truth =
                 Some(crate::state::objspace_compare_ints(concrete_lhs, concrete_rhs, op));
+            // RPython generate_guard parity (pyjitpl.py:2558-2570):
+            // record COMPARE_OP's pre-opcode state so the following
+            // PopJumpIf*'s branch_guard resumes at COMPARE_OP's orgpc
+            // with operands still on the symbolic stack.
+            sym.last_comparison_orgpc = Some(cmp_orgpc);
+            sym.last_comparison_pre_vsd = sym.pre_opcode_vsd;
+            sym.last_comparison_pre_stack = sym.pre_opcode_stack.clone();
+            sym.last_comparison_pre_stack_types = sym.pre_opcode_stack_types.clone();
             return if frame.next_instruction_consumes_comparison_truth() {
                 Some(truth)
             } else {
@@ -1120,9 +1130,15 @@ pub fn generated_compare_value_direct(
             };
             let truth = ctx.record_op(cmp, &[lhs_raw, rhs_raw]);
             frame.remember_value_type(truth, majit_ir::Type::Int);
-            frame.sym_mut().last_comparison_truth = Some(truth);
-            frame.sym_mut().last_comparison_concrete_truth =
+            let cmp_orgpc = frame.orgpc;
+            let sym = frame.sym_mut();
+            sym.last_comparison_truth = Some(truth);
+            sym.last_comparison_concrete_truth =
                 Some(crate::state::objspace_compare_floats(concrete_lhs, concrete_rhs, op));
+            sym.last_comparison_orgpc = Some(cmp_orgpc);
+            sym.last_comparison_pre_vsd = sym.pre_opcode_vsd;
+            sym.last_comparison_pre_stack = sym.pre_opcode_stack.clone();
+            sym.last_comparison_pre_stack_types = sym.pre_opcode_stack_types.clone();
             return if frame.next_instruction_consumes_comparison_truth() {
                 Some(truth)
             } else {
