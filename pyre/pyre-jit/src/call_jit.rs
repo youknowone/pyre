@@ -996,8 +996,8 @@ pub fn resume_in_blackhole(
         let mut bh = builder.acquire_interp();
         bh.setposition(pyjitcode.jitcode.clone(), jitcode_pc);
         // blackhole.py:1095 get_portal_runner parity:
-        // Set portal_runner_fn for bhimpl_recursive_call.
-        bh.portal_runner_fn = Some(bh_portal_runner);
+        // Set portal_runner_ptr for bhimpl_recursive_call.
+        bh.portal_runner_ptr = Some(bh_portal_runner);
 
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
@@ -1805,7 +1805,7 @@ pub fn blackhole_resume_via_rd_numb(
     }
     bh.virtualizable_info = crate::eval::get_virtualizable_info();
     // blackhole.py:1095 get_portal_runner parity
-    bh.portal_runner_fn = Some(bh_portal_runner);
+    bh.portal_runner_ptr = Some(bh_portal_runner);
 
     if majit_metainterp::majit_log_enabled() {
         eprintln!("[blackhole-resume] rd_numb path, chain built, running _run_forever",);

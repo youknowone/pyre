@@ -890,8 +890,9 @@ pub struct BlackholeInterpreter {
     /// blackhole.py:1095 get_portal_runner(jdindex):
     ///   jitdriver_sd = self.builder.metainterp_sd.jitdrivers_sd[jdindex]
     ///   fnptr = adr2int(jitdriver_sd.portal_runner_adr)
-    /// pyre: single jitdriver, portal_runner receives virtualizable_ptr (frame).
-    pub portal_runner_fn: Option<fn(i64) -> i64>,
+    ///   calldescr = jitdriver_sd.mainjitcode.calldescr
+    /// pyre: single jitdriver. portal_runner_ptr is the fnptr.
+    pub portal_runner_ptr: Option<fn(i64) -> i64>,
 }
 
 /// blackhole.py: last exception value from a residual call.
@@ -937,7 +938,7 @@ impl BlackholeInterpreter {
             exception_last_value: 0,
             virtualizable_ptr: 0,
             virtualizable_info: std::ptr::null(),
-            portal_runner_fn: None,
+            portal_runner_ptr: None,
         }
     }
 
@@ -997,6 +998,41 @@ impl BlackholeInterpreter {
         self.last_opcode_position = position;
         self.exception_last_value = 0;
         self.reached_merge_point = false;
+    }
+
+    /// blackhole.py:1095-1098 get_portal_runner(jdindex):
+    ///   jitdriver_sd = self.builder.metainterp_sd.jitdrivers_sd[jdindex]
+    ///   fnptr = adr2int(jitdriver_sd.portal_runner_adr)
+    ///   calldescr = jitdriver_sd.mainjitcode.calldescr
+    ///   return fnptr, calldescr
+    pub fn get_portal_runner(&self) -> Option<fn(i64) -> i64> {
+        self.portal_runner_ptr
+    }
+
+    /// blackhole.py:1109-1116 bhimpl_recursive_call_r:
+    ///   fnptr, calldescr = self.get_portal_runner(jdindex)
+    ///   return self.cpu.bh_call_r(fnptr, greens_i+reds_i, greens_r+reds_r, ...)
+    ///
+    /// pyre: greens = [next_instr], reds = [locals via virtualizable].
+    /// Write greens+reds to the virtualizable (frame) then call portal_runner.
+    pub fn bhimpl_recursive_call_r(&self, portal_runner: fn(i64) -> i64) -> i64 {
+        // bh_call_r(fnptr, greens_i + reds_i, greens_r + reds_r, ..., calldescr)
+        // pyre packs args into the virtualizable before the call.
+        if self.virtualizable_ptr != 0 && !self.virtualizable_info.is_null() {
+            let py_pc = self.jitcode.jit_pc_to_py_pc(self.last_opcode_position) as usize;
+            let frame_ptr = self.virtualizable_ptr as *mut u8;
+            let info = unsafe { &*self.virtualizable_info };
+            // green: next_instr
+            unsafe { info.write_field(frame_ptr, 0, py_pc as i64) };
+            // reds: locals → virtualizable array 0
+            let nlocals = self.jitcode.nlocals;
+            for i in 0..nlocals {
+                if i < self.registers_r.len() {
+                    unsafe { info.write_array_item(frame_ptr, 0, i, self.registers_r[i]) };
+                }
+            }
+        }
+        portal_runner(self.virtualizable_ptr)
     }
 
     /// Set an integer register value.
@@ -1632,39 +1668,18 @@ impl BlackholeInterpreter {
                     return Err(DispatchError::LeaveFrame);
                 }
                 // blackhole.py:1074-1093: recursive portal level.
+                //   sd = self.builder.metainterp_sd
                 //   result_type = sd.jitdrivers_sd[jdindex].result_type
                 //   x = self.bhimpl_recursive_call_r(jdindex, *args)
                 //   self.bhimpl_ref_return(x)
-                // blackhole.py:1101 bhimpl_recursive_call_r:
-                //   fnptr, calldescr = self.get_portal_runner(jdindex)
-                //   return self.cpu.bh_call_r(fnptr, greens_i+reds_i, ...)
-                // pyre: portal_runner(frame_ptr) — greens = [next_instr],
-                //       reds = [frame]. Write next_instr + locals to frame.
-                if let Some(portal_runner) = self.portal_runner_fn {
-                    if self.virtualizable_ptr != 0 && !self.virtualizable_info.is_null() {
-                        let py_pc =
-                            self.jitcode.jit_pc_to_py_pc(self.last_opcode_position) as usize;
-                        let frame_ptr = self.virtualizable_ptr as *mut u8;
-                        let info = unsafe { &*self.virtualizable_info };
-                        // green arg: next_instr → static field 0
-                        unsafe { info.write_field(frame_ptr, 0, py_pc as i64) };
-                        // red args: locals → array 0 items [0..nlocals)
-                        let nlocals = self.jitcode.nlocals;
-                        for i in 0..nlocals {
-                            if i < self.registers_r.len() {
-                                unsafe {
-                                    info.write_array_item(frame_ptr, 0, i, self.registers_r[i]);
-                                }
-                            }
-                        }
-                        // bhimpl_recursive_call_r → bh_call_r(fnptr, args)
-                        let result = portal_runner(self.virtualizable_ptr);
-                        self.tmpreg_r = result;
-                        self.return_type = BhReturnType::Ref;
-                        return Err(DispatchError::LeaveFrame);
-                    }
+                // pyre: result_type is always 'r' (PyObjectRef).
+                if let Some(portal_runner) = self.get_portal_runner() {
+                    let x = self.bhimpl_recursive_call_r(portal_runner);
+                    // bhimpl_ref_return(x): tmpreg_r = x; raise LeaveFrame
+                    self.tmpreg_r = x;
+                    self.return_type = BhReturnType::Ref;
+                    return Err(DispatchError::LeaveFrame);
                 }
-                // No portal_runner: continue executing (non-portal jitcode).
             }
             BC_JUMP_TARGET => {
                 // Non-portal loop header marker (helper jitcodes only).
