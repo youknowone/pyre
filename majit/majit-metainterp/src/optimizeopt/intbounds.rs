@@ -1391,6 +1391,54 @@ impl OptIntBounds {
                     self.propagate_bounds_backward(arg0, ctx);
                 }
             }
+            // intbounds.py:608-615 propagate_bounds_INT_LT
+            OpCode::IntLt => {
+                let r = self.getintbound(op.pos, ctx);
+                if r.is_constant() {
+                    if r.lower == 1 {
+                        self.make_int_lt(op.arg(0), op.arg(1), ctx);
+                    } else {
+                        debug_assert_eq!(r.lower, 0);
+                        self.make_int_ge(op.arg(0), op.arg(1), ctx);
+                    }
+                }
+            }
+            // intbounds.py:617-624 propagate_bounds_INT_GT
+            OpCode::IntGt => {
+                let r = self.getintbound(op.pos, ctx);
+                if r.is_constant() {
+                    if r.lower == 1 {
+                        self.make_int_gt(op.arg(0), op.arg(1), ctx);
+                    } else {
+                        debug_assert_eq!(r.lower, 0);
+                        self.make_int_le(op.arg(0), op.arg(1), ctx);
+                    }
+                }
+            }
+            // intbounds.py:626-633 propagate_bounds_INT_LE
+            OpCode::IntLe => {
+                let r = self.getintbound(op.pos, ctx);
+                if r.is_constant() {
+                    if r.lower == 1 {
+                        self.make_int_le(op.arg(0), op.arg(1), ctx);
+                    } else {
+                        debug_assert_eq!(r.lower, 0);
+                        self.make_int_gt(op.arg(0), op.arg(1), ctx);
+                    }
+                }
+            }
+            // intbounds.py:635-642 propagate_bounds_INT_GE
+            OpCode::IntGe => {
+                let r = self.getintbound(op.pos, ctx);
+                if r.is_constant() {
+                    if r.lower == 1 {
+                        self.make_int_ge(op.arg(0), op.arg(1), ctx);
+                    } else {
+                        debug_assert_eq!(r.lower, 0);
+                        self.make_int_lt(op.arg(0), op.arg(1), ctx);
+                    }
+                }
+            }
             // intbounds.py:644-651 propagate_bounds_INT_EQ
             OpCode::IntEq => {
                 let r = self.getintbound(op.pos, ctx);
