@@ -702,7 +702,8 @@ impl MIFrame {
     ///
     /// Only checks virtualizable (not vrefs — those are checked
     /// separately by vrefs_after_residual_call at the call site).
-    /// If virtualizable escaped, returns Err (SwitchToBlackhole parity).
+    /// If virtualizable escaped, reloads fields and aborts tracing
+    /// (SwitchToBlackhole parity).
     fn vable_after_residual_call(&mut self) -> Result<(), PyError> {
         // pyjitpl.py:3350-3351: if vinfo is not None:
         let obj_ptr = self.sym().concrete_vable_ptr;
@@ -712,14 +713,57 @@ impl MIFrame {
         let info = crate::virtualizable_gen::build_virtualizable_info();
         let vable_forced = unsafe { info.tracing_after_residual_call(obj_ptr) };
         if vable_forced {
-            // pyjitpl.py:3355-3366: the virtualizable escaped during
-            // CALL_MAY_FORCE. RPython reloads fields from heap and
-            // raises SwitchToBlackhole(ABORT_ESCAPE, raising_exception=True).
-            return Err(PyError::type_error(
-                "virtualizable escaped during residual call (SwitchToBlackhole parity)",
+            // pyjitpl.py:3356: self.load_fields_from_virtualizable()
+            self.load_fields_from_virtualizable();
+            // pyjitpl.py:3365-3366:
+            //   raise SwitchToBlackhole(Counters.ABORT_ESCAPE,
+            //                           raising_exception=True)
+            return Err(PyError::runtime_error(
+                "ABORT_ESCAPE: virtualizable escaped during residual call",
             ));
         }
         Ok(())
+    }
+
+    /// pyjitpl.py:3452-3463 load_fields_from_virtualizable.
+    ///
+    /// Force a reload of the virtualizable fields into the local
+    /// boxes (called only in escaping cases, just before abort).
+    fn load_fields_from_virtualizable(&mut self) {
+        let obj_ptr = self.sym().concrete_vable_ptr;
+        if obj_ptr.is_null() {
+            return;
+        }
+        let info = crate::virtualizable_gen::build_virtualizable_info();
+        // pyjitpl.py:3460-3462: self.virtualizable_boxes = vinfo.read_boxes(
+        //     self.cpu, virtualizable, 0)
+        // Re-read all virtualizable fields from the heap object.
+        let lengths = unsafe { info.read_array_lengths_from_heap(obj_ptr as *const u8) };
+        let (static_boxes, array_boxes) =
+            unsafe { info.read_all_boxes(obj_ptr as *const u8, &lengths) };
+        // Store back into PyreSym's concrete state so the blackhole
+        // interpreter sees the up-to-date values.
+        let sym = self.sym_mut();
+        // Static fields: update concrete_locals for the virtualizable fields.
+        for (i, &val) in static_boxes.iter().enumerate() {
+            if i < sym.concrete_locals.len() {
+                sym.concrete_locals[i] = ConcreteValue::Int(val);
+            }
+        }
+        // Array fields: update concrete locals/stack from array boxes.
+        if let Some(arr) = array_boxes.first() {
+            let nlocals = sym.nlocals;
+            for (i, &val) in arr.iter().enumerate() {
+                if i < nlocals && i < sym.concrete_locals.len() {
+                    sym.concrete_locals[i] = ConcreteValue::Ref(val as PyObjectRef);
+                } else {
+                    let stack_idx = i.saturating_sub(nlocals);
+                    if stack_idx < sym.concrete_stack.len() {
+                        sym.concrete_stack[stack_idx] = ConcreteValue::Ref(val as PyObjectRef);
+                    }
+                }
+            }
+        }
     }
 
     /// pyjitpl.py:3317-3337 parity: before residual call, set all
@@ -3246,15 +3290,6 @@ impl MIFrame {
                         );
                         this.remember_value_type(ca_result, Type::Int);
                         ca_result
-                    } else {
-                        OpRef::NONE // placeholder, will be set by call_may_force below
-                    };
-                    // pyjitpl.py:2049: step 3 — vrefs_after_residual_call
-                    // VIRTUAL_REF_FINISH is recorded BEFORE CALL_MAY_FORCE
-                    this.vrefs_after_residual_call(ctx);
-                    // pyjitpl.py:2067: step 4 — direct_call_may_force (trace recording)
-                    let result = if ca_token.is_some() {
-                        result // already recorded as call_assembler above
                     } else if force_fn
                         == crate::callbacks::get().jit_force_self_recursive_call_argraw_boxed_1
                     {
@@ -3270,7 +3305,9 @@ impl MIFrame {
                             &[Type::Ref, Type::Ref, Type::Int],
                         )
                     };
-                    // pyjitpl.py:2078: step 5 — vable_after_residual_call
+                    // pyjitpl.py:2049: vrefs_after_residual_call
+                    this.vrefs_after_residual_call(ctx);
+                    // pyjitpl.py:2078: vable_after_residual_call
                     this.vable_after_residual_call()?;
                     if ca_token.is_none() {
                         // pyjitpl.py:2079: step 6 — GUARD_NOT_FORCED
@@ -3283,15 +3320,14 @@ impl MIFrame {
                 } else {
                     let force_fn = crate::callbacks::get().jit_force_recursive_call_1;
                     this.vable_and_vrefs_before_residual_call(ctx);
-                    // pyjitpl.py:2049: step 3 — vrefs BEFORE call recording
-                    this.vrefs_after_residual_call(ctx);
-                    // pyjitpl.py:2067: step 4 — record CALL_MAY_FORCE
                     let result = ctx.call_may_force_ref_typed(
                         force_fn,
                         &[this.frame(), callable, args[0]],
                         &[Type::Ref, Type::Ref, Type::Ref],
                     );
-                    // pyjitpl.py:2078: step 5
+                    // pyjitpl.py:2049: vrefs_after_residual_call
+                    this.vrefs_after_residual_call(ctx);
+                    // pyjitpl.py:2078: vable_after_residual_call
                     this.vable_after_residual_call()?;
                     this.push_call_replay_stack(ctx, callable, args, call_pc);
                     this.generate_guard(ctx, OpCode::GuardNotForced, &[]);
@@ -3308,11 +3344,10 @@ impl MIFrame {
                     ctx.call_ref_typed(frame_helper, &helper_args, &helper_arg_types);
                 let force_fn = crate::callbacks::get().jit_force_callee_frame;
                 this.vable_and_vrefs_before_residual_call(ctx);
-                // pyjitpl.py:2049: step 3 — vrefs BEFORE call recording
-                this.vrefs_after_residual_call(ctx);
-                // pyjitpl.py:2067: step 4 — record CALL_MAY_FORCE
                 let result = ctx.call_may_force_ref_typed(force_fn, &[callee_frame], &[Type::Ref]);
-                // pyjitpl.py:2078: step 5 — vable_after_residual_call
+                // pyjitpl.py:2049: vrefs_after_residual_call
+                this.vrefs_after_residual_call(ctx);
+                // pyjitpl.py:2078: vable_after_residual_call
                 this.vable_after_residual_call()?;
                 this.push_call_replay_stack(ctx, callable, args, call_pc);
                 this.generate_guard(ctx, OpCode::GuardNotForced, &[]);
