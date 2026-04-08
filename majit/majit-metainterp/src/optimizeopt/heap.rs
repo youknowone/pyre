@@ -425,9 +425,9 @@ pub struct OptHeap {
     /// Immutable (pure) field cache — separate to survive all invalidation.
     /// RPython heap.py: is_always_pure() fields are never invalidated.
     immutable_cached_fields: HashMap<FieldKey, OpRef>,
-    /// heap.py:332: cached_arrayitems -- per-(descr, index) array cache.
-    /// Key: (descr_idx, const_index) -> ArrayCachedItem.
-    cached_arrayitems: HashMap<(u32, i64), ArrayCachedItem>,
+    /// heap.py:332: cached_arrayitems -- per-arraydescr cache.
+    /// Key: descr_idx -> ArrayCacheSubMap (const_indexes + cached_varindex_triples).
+    cached_arrayitems: HashMap<u32, ArrayCacheSubMap>,
     /// Whether we've already emitted a GUARD_NOT_INVALIDATED.
     seen_guard_not_invalidated: bool,
     /// Postponed operation: held back until the next GUARD_NO_EXCEPTION.
@@ -473,9 +473,6 @@ pub struct OptHeap {
     field_descr_map: HashMap<u32, DescrRef>,
     /// heap.py: cached array lengths.
     cached_arraylens: HashMap<(OpRef, u32), OpRef>,
-    /// heap.py: variable-index array cache.
-    /// Key: (array, descr_index, index_opref) → value OpRef.
-    cached_arrayitems_var: HashMap<(OpRef, u32, OpRef), OpRef>,
     /// heap.py: arrayinfo.getlenbound() — minimum known array lengths.
     /// When GETARRAYITEM_GC with constant index N is seen, the array
     /// must have length >= N+1. Tracked per array OpRef.
@@ -501,7 +498,6 @@ impl OptHeap {
             quasi_immut_cache: HashMap::new(),
             field_descr_map: HashMap::new(),
             cached_arraylens: HashMap::new(),
-            cached_arrayitems_var: HashMap::new(),
             array_min_lengths: HashMap::new(),
         }
     }
@@ -548,16 +544,6 @@ impl OptHeap {
         Some((array, descr.index(), index_val))
     }
 
-    /// heap.py:319-324 lookup_cached: variable-index array cache key.
-    /// Canonicalizes array and index through get_box_replacement so
-    /// forwarded refs hit the same cache entry.
-    fn arrayitem_key_variable(op: &Op, ctx: &OptContext) -> Option<(OpRef, u32, OpRef)> {
-        let descr = op.descr.as_ref()?;
-        let array = ctx.get_box_replacement(op.arg(0));
-        let index_ref = ctx.get_box_replacement(op.arg(1));
-        Some((array, descr.index(), index_ref))
-    }
-
     /// Register a cached value in the per-descr CachedField.
     /// RPython: cf.register_info(structop, info)
     /// Keep nonnull knowledge only for boxes known to be allocated in this trace.
@@ -586,10 +572,19 @@ impl OptHeap {
             .or_insert_with(CachedField::new)
     }
 
-    /// heap.py:409: arrayitem_cache(descr, index)
-    fn arrayitem_cache(&mut self, descr_idx: u32, index: i64) -> &mut ArrayCachedItem {
+    /// heap.py:399-405 arrayitem_submap(descr, create_if_nonexistant=True)
+    fn arrayitem_submap(&mut self, descr_idx: u32) -> &mut ArrayCacheSubMap {
         self.cached_arrayitems
-            .entry((descr_idx, index))
+            .entry(descr_idx)
+            .or_insert_with(ArrayCacheSubMap::new)
+    }
+
+    /// heap.py:409: arrayitem_cache(descr, index)
+    /// → submap[descr].const_indexes[index] (or insert).
+    fn arrayitem_cache(&mut self, descr_idx: u32, index: i64) -> &mut ArrayCachedItem {
+        self.arrayitem_submap(descr_idx)
+            .const_indexes
+            .entry(index)
             .or_insert_with(ArrayCachedItem::new)
     }
 
@@ -699,14 +694,22 @@ impl OptHeap {
     }
 
     fn force_all_lazy_setarrayitems(&mut self, heap_pass_idx: usize, ctx: &mut OptContext) {
-        // Collect all lazy sets from all ArrayCachedItems.
+        // heap.py:600-606 force_all_lazy_sets array half:
+        //   for submap in self.cached_arrayitems.itervalues():
+        //       items = submap.const_indexes.items() ...
+        //       for index, cf in items: cf.force_lazy_set(self, None)
         let pending: Vec<(u32, i64, OpRef, Op)> = self
             .cached_arrayitems
             .iter_mut()
-            .filter_map(|(&(descr_idx, index), cai)| {
-                cai.lazy_set
-                    .take()
-                    .map(|(obj, op)| (descr_idx, index, obj, op))
+            .flat_map(|(&descr_idx, submap)| {
+                submap
+                    .const_indexes
+                    .iter_mut()
+                    .filter_map(move |(&index, cai)| {
+                        cai.lazy_set
+                            .take()
+                            .map(|(obj, op)| (descr_idx, index, obj, op))
+                    })
             })
             .collect();
         for (descr_idx, index, obj, mut op) in pending {
@@ -784,13 +787,20 @@ impl OptHeap {
         }
 
         // heap.py:622-636: iterate cached array items
+        //   for descr, submap in self.cached_arrayitems.iteritems():
+        //       for index, cf in submap.const_indexes.iteritems():
         let array_entries: Vec<(u32, i64, OpRef, Op)> = self
             .cached_arrayitems
             .iter_mut()
-            .filter_map(|(&(descr_idx, index), cai)| {
-                cai.lazy_set
-                    .take()
-                    .map(|(obj, op)| (descr_idx, index, obj, op))
+            .flat_map(|(&descr_idx, submap)| {
+                submap
+                    .const_indexes
+                    .iter_mut()
+                    .filter_map(move |(&index, cai)| {
+                        cai.lazy_set
+                            .take()
+                            .map(|(obj, op)| (descr_idx, index, obj, op))
+                    })
             })
             .collect();
         for (descr_idx, index, _obj, mut op) in array_entries {
@@ -835,17 +845,23 @@ impl OptHeap {
                 cf.invalidate();
             }
         }
-        // heap.py:386-389: invalidate non-pure array caches
-        for (&(descr_idx, _index), cai) in self.cached_arrayitems.iter_mut() {
+        // heap.py:386-389:
+        //   for descr, submap in self.cached_arrayitems.iteritems():
+        //       if not descr.is_always_pure():
+        //           for index, cf in submap.const_indexes.iteritems():
+        //               cf.invalidate(None)
+        //
+        // RPython's `cf.invalidate(None)` clears the constant-index entry AND
+        // calls `self.parent.clear_varindex()` (heap.py:266). majit inlines
+        // the parent step via `submap.invalidate_index(index)`.
+        for (&descr_idx, submap) in self.cached_arrayitems.iter_mut() {
             if !vb_get(&self.immutable_array_descrs, descr_idx) {
-                cai.invalidate();
+                let indexes: Vec<i64> = submap.const_indexes.keys().copied().collect();
+                for index in indexes {
+                    submap.invalidate_index(index);
+                }
             }
         }
-        // heap.py:386-389: variable-index cache also respects is_always_pure.
-        // RPython: descr.is_always_pure() skips the entire submap, which
-        // includes both const_indexes and variable-index entries.
-        self.cached_arrayitems_var
-            .retain(|&(_, descr_idx, _), _| vb_get(&self.immutable_array_descrs, descr_idx));
         // heap.py:390: self.cached_dict_reads.clear()
         // (no dict_reads cache in majit)
     }
@@ -861,16 +877,22 @@ impl OptHeap {
             }
             cf.retain_entries(|obj| vb_get(&self.unescaped, obj.0));
         }
-        for (&(descr_idx, _index), cai) in self.cached_arrayitems.iter_mut() {
+        for (&descr_idx, submap) in self.cached_arrayitems.iter_mut() {
             if vb_get(&self.immutable_array_descrs, descr_idx) {
                 continue;
             }
-            cai.retain_entries(|obj| vb_get(&self.unescaped, obj.0));
+            for cai in submap.const_indexes.values_mut() {
+                cai.retain_entries(|obj| vb_get(&self.unescaped, obj.0));
+            }
+            // varindex triples reference array boxes by OpRef; drop any
+            // triple whose arrayinfo (first slot) has escaped.
+            if let Some(triples) = submap.cached_varindex_triples.as_mut() {
+                triples.retain(|&(arrayinfo, _, _)| vb_get(&self.unescaped, arrayinfo.0));
+                if triples.is_empty() {
+                    submap.cached_varindex_triples = None;
+                }
+            }
         }
-        self.cached_arrayitems_var
-            .retain(|&(obj, descr_idx, _), _| {
-                vb_get(&self.immutable_array_descrs, descr_idx) || vb_get(&self.unescaped, obj.0)
-            });
     }
 
     /// Invalidate field caches affected by a write to `obj` for field `field_idx`.
@@ -947,21 +969,28 @@ impl OptHeap {
         dest_start: Option<i64>,
         length: Option<i64>,
     ) {
-        for (&(_descr_idx, index), cai) in self.cached_arrayitems.iter_mut() {
-            cai.retain_entries(|obj| {
-                if *obj != dest_ref {
-                    return true;
-                }
-                if let (Some(start), Some(len)) = (dest_start, length) {
-                    if index < start || index >= start + len {
+        for submap in self.cached_arrayitems.values_mut() {
+            for (&index, cai) in submap.const_indexes.iter_mut() {
+                cai.retain_entries(|obj| {
+                    if *obj != dest_ref {
                         return true;
                     }
+                    if let (Some(start), Some(len)) = (dest_start, length) {
+                        if index < start || index >= start + len {
+                            return true;
+                        }
+                    }
+                    false
+                });
+            }
+            // Variable-index triples touching `dest_ref` are invalidated.
+            if let Some(triples) = submap.cached_varindex_triples.as_mut() {
+                triples.retain(|&(arrayinfo, _, _)| arrayinfo != dest_ref);
+                if triples.is_empty() {
+                    submap.cached_varindex_triples = None;
                 }
-                false
-            });
+            }
         }
-        self.cached_arrayitems_var
-            .retain(|&(obj, _descr_idx, _index_ref), _| obj != dest_ref);
     }
 
     /// Extract OopSpecIndex from a call op's descriptor, if available.
@@ -1122,38 +1151,68 @@ impl OptHeap {
             }
         }
 
-        // Force/invalidate array caches
-        let array_keys: Vec<(u32, i64)> = self.cached_arrayitems.keys().copied().collect();
-        for (descr_idx, index) in array_keys {
-            if ei.check_readonly_descr_array(descr_idx) {
-                if let Some(cai) = self.cached_arrayitems.get_mut(&(descr_idx, index)) {
-                    if let Some((_, mut lazy_op)) = cai.lazy_set.take() {
-                        Self::emit_lazy_setfield(&mut lazy_op, ctx, true);
+        // heap.py:554-558: per-arraydescr force/invalidate.
+        //   for arraydescr, submap in self.cached_arrayitems.items():
+        //       if effectinfo.check_readonly_descr_array(arraydescr):
+        //           self.force_lazy_setarrayitem_submap(submap)
+        //       if effectinfo.check_write_descr_array(arraydescr):
+        //           self.force_lazy_setarrayitem_submap(submap, can_cache=False)
+        let array_descrs: Vec<u32> = self.cached_arrayitems.keys().copied().collect();
+        for descr_idx in array_descrs {
+            let read = ei.check_readonly_descr_array(descr_idx);
+            let write = ei.check_write_descr_array(descr_idx);
+            if !read && !write {
+                continue;
+            }
+            // Snapshot the indexes so we can iterate without holding a long
+            // borrow on the submap (the lazy_setfield path mutates ctx).
+            let indexes: Vec<i64> = match self.cached_arrayitems.get(&descr_idx) {
+                Some(submap) => submap.const_indexes.keys().copied().collect(),
+                None => continue,
+            };
+            for index in indexes {
+                if read {
+                    if let Some(cai) = self
+                        .cached_arrayitems
+                        .get_mut(&descr_idx)
+                        .and_then(|s| s.const_indexes.get_mut(&index))
+                    {
+                        if let Some((_, mut lazy_op)) = cai.lazy_set.take() {
+                            Self::emit_lazy_setfield(&mut lazy_op, ctx, true);
+                        }
+                    }
+                }
+                if write {
+                    if let Some(cai) = self
+                        .cached_arrayitems
+                        .get_mut(&descr_idx)
+                        .and_then(|s| s.const_indexes.get_mut(&index))
+                    {
+                        let lazy_info = cai.lazy_set.take();
+                        if let Some((arr, mut lazy_op)) = lazy_info {
+                            let re_cache_value = if vb_get(&unescaped_snapshot, arr.0) {
+                                Some((arr, lazy_op.arg(2), lazy_op.descr.clone()))
+                            } else {
+                                None
+                            };
+                            Self::emit_lazy_setfield(&mut lazy_op, ctx, true);
+                            if let Some((arr, value, descr)) = re_cache_value {
+                                cai.register_info(arr, value, descr.as_ref());
+                            }
+                        }
+                        // heapcache.py:367-369: cache.invalidate_unescaped()
+                        cai.invalidate_unescaped(&unescaped_snapshot);
                     }
                 }
             }
-            if ei.check_write_descr_array(descr_idx) {
-                if let Some(cai) = self.cached_arrayitems.get_mut(&(descr_idx, index)) {
-                    let lazy_info = cai.lazy_set.take();
-                    if let Some((arr, mut lazy_op)) = lazy_info {
-                        let re_cache_value = if vb_get(&unescaped_snapshot, arr.0) {
-                            // RPython: re-cache for unescaped array
-                            Some((arr, lazy_op.arg(2), lazy_op.descr.clone()))
-                        } else {
-                            None
-                        };
-                        Self::emit_lazy_setfield(&mut lazy_op, ctx, true);
-                        if let Some((arr, value, descr)) = re_cache_value {
-                            cai.register_info(arr, value, descr.as_ref());
-                        }
-                    }
-                    // heapcache.py:367-369: cache.invalidate_unescaped()
-                    cai.invalidate_unescaped(&unescaped_snapshot);
+            if write {
+                // heap.py:266 ArrayCachedItem.invalidate → parent.clear_varindex().
+                // A write through this descr can clobber any varindex triple.
+                if let Some(submap) = self.cached_arrayitems.get_mut(&descr_idx) {
+                    submap.clear_varindex();
                 }
             }
         }
-        self.cached_arrayitems_var
-            .retain(|&(_, descr_idx, _), _| !ei.check_write_descr_array(descr_idx));
     }
 
     // ── Handlers for specific opcodes ──
@@ -1488,7 +1547,11 @@ impl OptHeap {
         if let Some(key) = Self::arrayitem_key(op, ctx) {
             let (array, descr_idx, const_index) = key;
             // Check lazy_set first (most up-to-date value)
-            if let Some(cai) = self.cached_arrayitems.get(&(descr_idx, const_index)) {
+            if let Some(cai) = self
+                .cached_arrayitems
+                .get(&descr_idx)
+                .and_then(|s| s.const_indexes.get(&const_index))
+            {
                 if let Some(cached) = cai.getfield_from_cache(array) {
                     ctx.replace_op(op.pos, cached);
                     return OptimizationResult::Remove;
@@ -1508,7 +1571,11 @@ impl OptHeap {
                     cai.register_info(array, cached, d.as_ref());
                 }
             }
-            if let Some(cai) = self.cached_arrayitems.get(&(descr_idx, const_index)) {
+            if let Some(cai) = self
+                .cached_arrayitems
+                .get(&descr_idx)
+                .and_then(|s| s.const_indexes.get(&const_index))
+            {
                 if let Some(cached) = cai._getfield(array) {
                     let cached = ctx.get_box_replacement(cached);
                     ctx.replace_op(op.pos, cached);
@@ -1541,14 +1608,20 @@ impl OptHeap {
             return OptimizationResult::Emit(op.clone());
         }
 
-        // heap.py:688-699 variable-index cache — same array + same index OpRef.
-        if let Some(var_key) = Self::arrayitem_key_variable(op, ctx) {
-            if let Some(&cached) = self.cached_arrayitems_var.get(&var_key) {
-                let cached = ctx.get_box_replacement(cached);
-                ctx.replace_op(op.pos, cached);
-                return OptimizationResult::Remove;
+        // heap.py:319-324 lookup_cached + heap.py:308-314 cache_varindex_read
+        // — variable-index cache via per-arraydescr submap.
+        if let Some(descr) = op.descr.as_ref() {
+            let descr_idx = descr.index();
+            let arrayinfo = ctx.get_box_replacement(op.arg(0));
+            let indexbox = ctx.get_box_replacement(op.arg(1));
+            if let Some(submap) = self.cached_arrayitems.get(&descr_idx) {
+                if let Some(cached) = submap.lookup_cached(arrayinfo, indexbox, ctx) {
+                    ctx.replace_op(op.pos, cached);
+                    return OptimizationResult::Remove;
+                }
             }
-            self.cached_arrayitems_var.insert(var_key, op.pos);
+            self.arrayitem_submap(descr_idx)
+                .cache_varindex_read(arrayinfo, indexbox, op.pos);
         }
 
         // heap.py line 701: make_nonnull(op.getarg(0))
@@ -1569,20 +1642,25 @@ impl OptHeap {
             Some(k) => k,
             None => {
                 // Non-constant index: force all lazy array stores and invalidate
-                // both constant-index and variable-index caches.
-                // heap.py: ArrayCachedItem.invalidate() calls parent.clear_varindex()
+                // both constant-index and variable-index caches via ArrayCachedItem.invalidate
+                // (which RPython implements as: clear const_indexes entry + parent.clear_varindex).
                 self.force_all_lazy_setarrayitems(ctx.current_pass_idx, ctx);
-                self.cached_arrayitems
-                    .values_mut()
-                    .for_each(|cai| cai.invalidate());
-                self.cached_arrayitems_var.clear();
+                for submap in self.cached_arrayitems.values_mut() {
+                    let indexes: Vec<i64> = submap.const_indexes.keys().copied().collect();
+                    for index in indexes {
+                        submap.invalidate_index(index);
+                    }
+                }
                 self.array_min_lengths.clear();
-                // heap.py: cache_varindex_write -- cache this write so that
+                // heap.py:316-317 cache_varindex_write -- cache this write so that
                 // a subsequent read with the same variable index can hit.
-                // heap.py:764 cache_varindex_write: canonicalize value
-                if let Some(var_key) = Self::arrayitem_key_variable(op, ctx) {
-                    self.cached_arrayitems_var
-                        .insert(var_key, ctx.get_box_replacement(op.arg(2)));
+                if let Some(descr) = op.descr.as_ref() {
+                    let descr_idx = descr.index();
+                    let arrayinfo = ctx.get_box_replacement(op.arg(0));
+                    let indexbox = ctx.get_box_replacement(op.arg(1));
+                    let resbox = ctx.get_box_replacement(op.arg(2));
+                    self.arrayitem_submap(descr_idx)
+                        .cache_varindex_write(arrayinfo, indexbox, resbox);
                 }
                 return OptimizationResult::Emit(op.clone());
             }
@@ -1611,16 +1689,19 @@ impl OptHeap {
         // heap.py:81-83: possible_aliasing → force_lazy_set
         let needs_force = self
             .cached_arrayitems
-            .get(&(descr_idx, const_index))
+            .get(&descr_idx)
+            .and_then(|s| s.const_indexes.get(&const_index))
             .map_or(false, |cai| cai.possible_aliasing(array));
         if needs_force {
             let lazy_data = self
                 .cached_arrayitems
-                .get_mut(&(descr_idx, const_index))
+                .get_mut(&descr_idx)
+                .and_then(|s| s.const_indexes.get_mut(&const_index))
                 .and_then(|cai| cai.lazy_set.take());
             if let Some((lazy_obj, mut lazy_op)) = lazy_data {
-                let cai = self.arrayitem_cache(descr_idx, const_index);
-                cai.invalidate();
+                if let Some(submap) = self.cached_arrayitems.get_mut(&descr_idx) {
+                    submap.invalidate_index(const_index);
+                }
                 if let Some(ref postponed) = self.postponed_op {
                     let ppos = postponed.pos;
                     if lazy_op.args.iter().any(|a| *a == ppos) {
@@ -1668,11 +1749,12 @@ impl OptHeap {
         if let Some(info) = ctx.get_ptr_info_mut(ctx.get_box_replacement(op.arg(0))) {
             info.setitem(const_index as usize, new_value);
         }
-        // heap.py: ArrayCachedItem.invalidate() calls parent.clear_varindex()
-        // -- writing to any constant index invalidates variable-index cache
-        // for the same array+descr, since the variable index could match.
-        self.cached_arrayitems_var
-            .retain(|&(a, d, _), _| !(a == array && d == descr_idx));
+        // heap.py:266 ArrayCachedItem.invalidate → parent.clear_varindex().
+        // Writing to any constant index potentially clobbers a varindex
+        // triple in the same submap.
+        if let Some(submap) = self.cached_arrayitems.get_mut(&descr_idx) {
+            submap.clear_varindex();
+        }
 
         OptimizationResult::Remove
     }
@@ -2169,7 +2251,6 @@ impl Optimization for OptHeap {
         self.prior_emitted_was_removed = false;
         self.quasi_immut_cache.clear();
         self.cached_arraylens.clear();
-        self.cached_arrayitems_var.clear();
         self.array_min_lengths.clear();
     }
 
@@ -2347,24 +2428,30 @@ impl Optimization for OptHeap {
             }
         }
 
-        for (&(_descr_idx, index), cai) in &self.cached_arrayitems {
-            for i in 0..cai.cached_arrays.len() {
-                let obj = cai.cached_arrays[i];
-                let cached_val = cai.cached_values[i];
-                if cached_val.is_none() || obj.is_none() {
-                    continue;
+        // heap.py:374-377:
+        //   for descr, submap in self.cached_arrayitems.items():
+        //       for index, d in submap.const_indexes.items():
+        //           d.produce_potential_short_preamble_ops(optimizer, sb, descr, index)
+        for submap in self.cached_arrayitems.values() {
+            for (&index, cai) in &submap.const_indexes {
+                for i in 0..cai.cached_arrays.len() {
+                    let obj = cai.cached_arrays[i];
+                    let cached_val = cai.cached_values[i];
+                    if cached_val.is_none() || obj.is_none() {
+                        continue;
+                    }
+                    let Some(descr) = cai.get_descr(obj) else {
+                        continue;
+                    };
+                    let idx_ref = OpRef(index as u32);
+                    let opcode = descr
+                        .as_array_descr()
+                        .map(|array_descr| OpCode::getarrayitem_for_type(array_descr.item_type()))
+                        .unwrap_or(OpCode::GetarrayitemGcI);
+                    let mut op = Op::with_descr(opcode, &[obj, idx_ref], descr.clone());
+                    op.pos = cached_val;
+                    sb.add_heap_op(op);
                 }
-                let Some(descr) = cai.get_descr(obj) else {
-                    continue;
-                };
-                let idx_ref = OpRef(index as u32);
-                let opcode = descr
-                    .as_array_descr()
-                    .map(|array_descr| OpCode::getarrayitem_for_type(array_descr.item_type()))
-                    .unwrap_or(OpCode::GetarrayitemGcI);
-                let mut op = Op::with_descr(opcode, &[obj, idx_ref], descr.clone());
-                op.pos = cached_val;
-                sb.add_heap_op(op);
             }
         }
     }
@@ -2408,6 +2495,7 @@ impl Optimization for OptHeap {
         let pending_arr: Vec<(OpRef, Op)> = self
             .cached_arrayitems
             .values_mut()
+            .flat_map(|submap| submap.const_indexes.values_mut())
             .filter_map(|cai| cai.lazy_set.take())
             .collect();
         for (_obj, mut op) in pending_arr {
