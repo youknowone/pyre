@@ -1635,6 +1635,25 @@ fn valid_slot_name(name: &str) -> bool {
     true
 }
 
+/// astcompiler/misc.py:78-92 mangle(name, klass):
+///   if not name.startswith('__'): return name
+///   if name.endswith('__') or '.' in name: return name
+///   strip leading underscores from klass
+///   return "_%s%s" % (klass[i:], name)
+fn mangle(name: &str, klass: &str) -> String {
+    if !name.starts_with("__") {
+        return name.to_string();
+    }
+    if name.ends_with("__") || name.contains('.') {
+        return name.to_string();
+    }
+    let stripped = klass.trim_start_matches('_');
+    if stripped.is_empty() {
+        return name.to_string();
+    }
+    format!("_{stripped}{name}")
+}
+
 /// typeobject.py:1131-1140 copy_flags_from_bases:
 ///   w_self.hasdict |= w_base.hasdict
 ///   w_self.weakrefable |= w_base.weakrefable
@@ -1730,20 +1749,23 @@ pub unsafe fn create_all_slots(
         // typeobject.py:1183-1189 create_slot: add Member descriptor to
         // class dict for each slot. Skip if name already exists in dict.
         let type_ns = pyre_object::w_type_get_dict_ptr(w_type) as *mut crate::PyNamespace;
+        let type_name = pyre_object::w_type_get_name(w_type);
         let mut slot_index = base_nslots;
         let mut i = 0;
         while i < newslotnames.len() {
-            let slot_name = &newslotnames[i];
-            if !type_ns.is_null() && (*type_ns).get(slot_name.as_str()).is_some() {
+            // typeobject.py:1211: slot_name = mangle(slot_name, w_self.name)
+            let mangled = mangle(&newslotnames[i], type_name);
+            if !type_ns.is_null() && (*type_ns).get(mangled.as_str()).is_some() {
                 // typeobject.py:1212: name conflict → skip this slot
                 newslotnames.remove(i);
             } else {
-                // typeobject.py:1206-1217 create_slot:
+                // typeobject.py:1216-1217 create_slot:
                 //   member = Member(index_next_extra_slot, slot_name, w_self)
                 //   w_self.dict_w[slot_name] = member
+                newslotnames[i] = mangled.clone();
                 if !type_ns.is_null() {
-                    let member = pyre_object::w_member_new(slot_index, slot_name.clone(), w_type);
-                    (*type_ns).insert(slot_name.clone(), member);
+                    let member = pyre_object::w_member_new(slot_index, mangled.clone(), w_type);
+                    (*type_ns).insert(mangled, member);
                 }
                 slot_index += 1;
                 i += 1;
