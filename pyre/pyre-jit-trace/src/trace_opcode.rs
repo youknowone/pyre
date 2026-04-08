@@ -3246,6 +3246,15 @@ impl MIFrame {
                         );
                         this.remember_value_type(ca_result, Type::Int);
                         ca_result
+                    } else {
+                        OpRef::NONE // placeholder, will be set by call_may_force below
+                    };
+                    // pyjitpl.py:2049: step 3 — vrefs_after_residual_call
+                    // VIRTUAL_REF_FINISH is recorded BEFORE CALL_MAY_FORCE
+                    this.vrefs_after_residual_call(ctx);
+                    // pyjitpl.py:2067: step 4 — direct_call_may_force (trace recording)
+                    let result = if ca_token.is_some() {
+                        result // already recorded as call_assembler above
                     } else if force_fn
                         == crate::callbacks::get().jit_force_self_recursive_call_argraw_boxed_1
                     {
@@ -3261,8 +3270,6 @@ impl MIFrame {
                             &[Type::Ref, Type::Ref, Type::Int],
                         )
                     };
-                    // pyjitpl.py:2049: step 3 — vrefs_after_residual_call
-                    this.vrefs_after_residual_call(ctx);
                     // pyjitpl.py:2078: step 5 — vable_after_residual_call
                     this.vable_after_residual_call()?;
                     if ca_token.is_none() {
@@ -3276,13 +3283,14 @@ impl MIFrame {
                 } else {
                     let force_fn = crate::callbacks::get().jit_force_recursive_call_1;
                     this.vable_and_vrefs_before_residual_call(ctx);
+                    // pyjitpl.py:2049: step 3 — vrefs BEFORE call recording
+                    this.vrefs_after_residual_call(ctx);
+                    // pyjitpl.py:2067: step 4 — record CALL_MAY_FORCE
                     let result = ctx.call_may_force_ref_typed(
                         force_fn,
                         &[this.frame(), callable, args[0]],
                         &[Type::Ref, Type::Ref, Type::Ref],
                     );
-                    // pyjitpl.py:2049: step 3
-                    this.vrefs_after_residual_call(ctx);
                     // pyjitpl.py:2078: step 5
                     this.vable_after_residual_call()?;
                     this.push_call_replay_stack(ctx, callable, args, call_pc);
@@ -3300,9 +3308,10 @@ impl MIFrame {
                     ctx.call_ref_typed(frame_helper, &helper_args, &helper_arg_types);
                 let force_fn = crate::callbacks::get().jit_force_callee_frame;
                 this.vable_and_vrefs_before_residual_call(ctx);
-                let result = ctx.call_may_force_ref_typed(force_fn, &[callee_frame], &[Type::Ref]);
-                // pyjitpl.py:2049: step 3 — vrefs_after_residual_call
+                // pyjitpl.py:2049: step 3 — vrefs BEFORE call recording
                 this.vrefs_after_residual_call(ctx);
+                // pyjitpl.py:2067: step 4 — record CALL_MAY_FORCE
+                let result = ctx.call_may_force_ref_typed(force_fn, &[callee_frame], &[Type::Ref]);
                 // pyjitpl.py:2078: step 5 — vable_after_residual_call
                 this.vable_after_residual_call()?;
                 this.push_call_replay_stack(ctx, callable, args, call_pc);
