@@ -3679,6 +3679,63 @@ fn assemble_peeled_trace_with_jump_args(
         result.push(op);
     }
 
+    // RPython compile.py:327 extra_same_as parity for non-invented imports.
+    // shortpreamble.py PureOp/HeapOp.produce_op emits a SameAs (or the
+    // original op) before the loop label so the body's reference to the
+    // imported result OpRef has a defining op. The `imported_short_aliases`
+    // loop above only handles compound alternates (`invented_name=true`);
+    // single non-invented imported short ops (a Pure GetfieldGcPureI on a
+    // non-constant object, a HeapField, …) record their `(result, source)`
+    // mapping in `imported_short_sources` instead and never reach the alias
+    // emission. Without an extra SameAs they leave Phase 2 body ops with an
+    // undefined fresh OpRef (e.g. v56 = i.intval) that the body
+    // use-before-def loop later promotes into the loop label, producing
+    // an undefined Cranelift Variable on the head's fall-through into the
+    // body label.
+    //
+    // Mirror RPython by emitting `SameAs(source)` at `pos=result` for every
+    // non-invented entry whose source is a real (preamble-defined) OpRef.
+    // Constant sources are skipped: the body sees them via the constants
+    // pool, not via SSA. Entries already produced by the alias loop or by
+    // the preamble itself are skipped to avoid duplicate definitions.
+    {
+        let mut already_defined: std::collections::HashSet<OpRef> =
+            imported_short_aliases.iter().map(|a| a.result).collect();
+        for op in &result {
+            if !op.pos.is_none() && op.opcode != OpCode::Jump && op.result_type() != Type::Void {
+                already_defined.insert(op.pos);
+            }
+        }
+        for entry in imported_short_sources.iter() {
+            if entry.result.is_none() || entry.result.is_constant() {
+                continue;
+            }
+            if already_defined.contains(&entry.result) {
+                continue;
+            }
+            if entry.source.is_none() || entry.source.is_constant() {
+                continue;
+            }
+            // Skip when source already equals the result (no-op SameAs).
+            if entry.source == entry.result {
+                already_defined.insert(entry.result);
+                continue;
+            }
+            let same_as_opcode = {
+                let ty = result
+                    .iter()
+                    .find(|op| op.pos == entry.source)
+                    .map(|op| op.opcode.result_type())
+                    .unwrap_or(Type::Int);
+                OpCode::same_as_for_type(ty)
+            };
+            let mut op = Op::new(same_as_opcode, &[entry.source]);
+            op.pos = entry.result;
+            result.push(op);
+            already_defined.insert(entry.result);
+        }
+    }
+
     // Label position
     let label_pos = next_free_pos(max_pos);
     let mut full_label_args: Vec<OpRef> = label_args
