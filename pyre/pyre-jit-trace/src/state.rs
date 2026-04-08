@@ -2139,6 +2139,7 @@ impl JitState for PyreJitState {
         sym.init_vable_indices();
         sym.nlocals = _meta.num_locals;
         sym.valuestackdepth = _meta.valuestackdepth;
+        // RPython parity: all Python locals/stack are Ref (PyObjectRef).
         sym.symbolic_local_types = vec![Type::Ref; _meta.num_locals.min(_meta.slot_types.len())];
         sym.symbolic_stack_types =
             vec![Type::Ref; _meta.slot_types.len().saturating_sub(_meta.num_locals)];
@@ -2367,6 +2368,7 @@ impl JitState for PyreJitState {
         original_box_types: &[Type],
     ) -> PyreMeta {
         use crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
+        // RPython parity: Python locals/stack are always Ref.
         let slot_types = if original_box_types.len() >= NUM_SCALAR_INPUTARGS {
             vec![Type::Ref; original_box_types.len() - NUM_SCALAR_INPUTARGS]
         } else {
