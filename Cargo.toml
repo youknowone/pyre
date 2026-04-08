@@ -69,6 +69,7 @@ majit-macros = { version = "0.0.2", path = "majit/majit-macros" }
 majit-codewriter = { version = "0.0.2", path = "majit/majit-codewriter" }
 
 # shared dependencies
+parking_lot = "0.12"
 malachite-bigint = "0.9"
 num-traits = "0.2"
 num-integer = "0.1"

@@ -631,6 +631,38 @@ pub struct JitCellToken {
     /// that this loop can jump to (via CALL_ASSEMBLER or JUMP).
     /// Prevents the target from being evicted while this loop is alive.
     pub keepalive_tokens: Vec<u64>,
+    /// llmodel.py:252 `compiled_loop_token.asmmemmgr_blocks` parity.
+    ///
+    /// Backend-owned memory blocks (bridge ExecutableBuffers, etc.)
+    /// that must live as long as this token. Freed when the token is
+    /// dropped — mirrors RPython's `free_loop_and_bridges` which
+    /// iterates `asmmemmgr_blocks` and returns each block to the
+    /// `AsmMemoryManager` free-list.
+    ///
+    /// ## Why `parking_lot::Mutex`
+    ///
+    /// `compile_bridge` receives `&JitCellToken` (shared ref) because
+    /// the metainterp holds the token in a `HashMap` and may inspect
+    /// other fields concurrently.  Bridge compilation must append to
+    /// this vec through a shared ref → interior mutability is required.
+    ///
+    /// `RefCell` is insufficient: under free-threading (no-GIL Python),
+    /// multiple OS threads may hold references to the same
+    /// `JitCellToken` — one thread executing compiled code while
+    /// another compiles a bridge for a guard in the same loop.
+    /// `RefCell`'s single-threaded borrow checking would panic.
+    ///
+    /// `std::sync::Mutex` works but has two drawbacks:
+    ///   1. Poisoning on panic makes recovery cumbersome.
+    ///   2. On macOS/Linux, `pthread_mutex` is heavier than needed
+    ///      for an uncontended fast-path (bridge compilation is rare).
+    ///
+    /// `parking_lot::Mutex` avoids both: no poisoning semantics, and
+    /// the uncontended lock/unlock is a single atomic CAS — ideal for
+    /// the typical case where only one thread touches this field at a
+    /// time, with the Mutex serving as a correctness guard for the
+    /// rare concurrent bridge-compilation scenario.
+    pub asmmemmgr_blocks: parking_lot::Mutex<Vec<Box<dyn std::any::Any + Send>>>,
 }
 
 impl JitCellToken {
@@ -644,6 +676,7 @@ impl JitCellToken {
             invalidated: Arc::new(AtomicBool::new(false)),
             version_info: None,
             keepalive_tokens: Vec::new(),
+            asmmemmgr_blocks: parking_lot::Mutex::new(Vec::new()),
         }
     }
 

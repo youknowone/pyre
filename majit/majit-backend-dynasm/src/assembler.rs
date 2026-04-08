@@ -166,8 +166,6 @@ pub struct CompiledCode {
     pub header_pc: u64,
     /// Frame depth (number of jitframe slots used).
     pub frame_depth: usize,
-    /// asmmemmgr.py parity: keep bridge ExecutableBuffers alive.
-    pub bridge_buffers: Vec<ExecutableBuffer>,
     /// Absolute address of the LABEL op (loop body entry).
     /// Used by bridge JUMP to return to the loop. RPython stores
     /// this as TargetToken._ll_loop_code.
@@ -451,7 +449,6 @@ impl Assembler386 {
             trace_id: self.trace_id,
             header_pc: self.header_pc,
             frame_depth: self.frame_depth,
-            bridge_buffers: Vec::new(),
             label_addr,
         })
     }
@@ -500,7 +497,6 @@ impl Assembler386 {
             trace_id: self.trace_id,
             header_pc: self.header_pc,
             frame_depth: self.frame_depth,
-            bridge_buffers: Vec::new(),
             label_addr: 0,
         })
     }
@@ -1597,10 +1593,8 @@ impl Assembler386 {
                 }
             })
             .collect();
-        let fail_args_slots: Vec<usize> = fail_arg_locs
-            .iter()
-            .map(|loc| loc.unwrap_or(0))
-            .collect();
+        let fail_args_slots: Vec<usize> =
+            fail_arg_locs.iter().map(|loc| loc.unwrap_or(0)).collect();
         let mut descr = DynasmFailDescr::new(fail_index, self.trace_id, fail_arg_types, false);
         descr.fail_arg_locs = fail_arg_locs;
         descr.fail_args_slots = fail_args_slots;

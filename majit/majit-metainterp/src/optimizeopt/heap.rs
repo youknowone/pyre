@@ -2228,11 +2228,10 @@ impl Optimization for OptHeap {
         // info.py:262: op = get_box_replacement(self._fields[fielddescr.get_index()])
         for (&field_idx, cf) in &self.cached_fields {
             // heap.py:53: assert self._lazy_set is None
-            // Skip fields with pending lazy_set — the cache is
-            // out-of-date and would produce wrong preamble ops.
-            if cf.lazy_set.is_some() {
-                continue;
-            }
+            debug_assert!(
+                cf.lazy_set.is_none(),
+                "lazy_set must be flushed before produce_potential_short_preamble_ops"
+            );
             for i in 0..cf.cached_structs.len() {
                 // heap.py:55: structbox = get_box_replacement(self.cached_structs[i])
                 let obj = ctx.get_box_replacement(cf.cached_structs[i]);
