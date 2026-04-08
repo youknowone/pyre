@@ -1192,133 +1192,221 @@ impl OptIntBounds {
 
     fn propagate_bounds_backward_op(&mut self, op: &Op, ctx: &OptContext) {
         match op.opcode {
+            // intbounds.py:701-712 propagate_bounds_INT_ADD
+            //
+            // ```python
+            // def propagate_bounds_INT_ADD(self, op):
+            //     if self.is_raw_ptr(op.getarg(0)) or self.is_raw_ptr(op.getarg(1)):
+            //         return
+            //     b1 = self.getintbound(op.getarg(0))
+            //     b2 = self.getintbound(op.getarg(1))
+            //     r = self.getintbound(op)
+            //     b = r.sub_bound(b2)
+            //     if b1.intersect(b):
+            //         self.propagate_bounds_backward(op.getarg(0))
+            //     b = r.sub_bound(b1)
+            //     if b2.intersect(b):
+            //         self.propagate_bounds_backward(op.getarg(1))
+            // ```
             OpCode::IntAdd | OpCode::IntAddOvf => {
-                let b1 = self.getintbound(op.arg(0), ctx);
-                let b2 = self.getintbound(op.arg(1), ctx);
+                if ctx.is_raw_ptr(op.arg(0)) || ctx.is_raw_ptr(op.arg(1)) {
+                    return;
+                }
+                let arg0 = op.arg(0);
+                let arg1 = op.arg(1);
+                let b1 = self.getintbound(arg0, ctx);
+                let b2 = self.getintbound(arg1, ctx);
                 let r = self.getintbound(op.pos, ctx);
                 let b = r.sub_bound(&b2);
-                let b1_mut = self.get_bound_mut(op.arg(0));
-                let _ = b1_mut.intersect(&b);
+                let changed0 = matches!(self.get_bound_mut(arg0).intersect(&b), Ok(true));
+                if changed0 {
+                    self.propagate_bounds_backward(arg0, ctx);
+                }
                 let b = r.sub_bound(&b1);
-                let b2_mut = self.get_bound_mut(op.arg(1));
-                let _ = b2_mut.intersect(&b);
+                let changed1 = matches!(self.get_bound_mut(arg1).intersect(&b), Ok(true));
+                if changed1 {
+                    self.propagate_bounds_backward(arg1, ctx);
+                }
             }
+            // intbounds.py:714-723 propagate_bounds_INT_SUB
             OpCode::IntSub | OpCode::IntSubOvf => {
-                let b1 = self.getintbound(op.arg(0), ctx);
-                let b2 = self.getintbound(op.arg(1), ctx);
+                let arg0 = op.arg(0);
+                let arg1 = op.arg(1);
+                let b1 = self.getintbound(arg0, ctx);
+                let b2 = self.getintbound(arg1, ctx);
                 let r = self.getintbound(op.pos, ctx);
                 let b = r.add_bound(&b2);
-                let b1_mut = self.get_bound_mut(op.arg(0));
-                let _ = b1_mut.intersect(&b);
+                let changed0 = matches!(self.get_bound_mut(arg0).intersect(&b), Ok(true));
+                if changed0 {
+                    self.propagate_bounds_backward(arg0, ctx);
+                }
                 let b = r.sub_bound(&b1).neg_bound();
-                let b2_mut = self.get_bound_mut(op.arg(1));
-                let _ = b2_mut.intersect(&b);
+                let changed1 = matches!(self.get_bound_mut(arg1).intersect(&b), Ok(true));
+                if changed1 {
+                    self.propagate_bounds_backward(arg1, ctx);
+                }
             }
+            // intbounds.py:725-737 propagate_bounds_INT_MUL
             OpCode::IntMul | OpCode::IntMulOvf => {
-                let b1 = self.getintbound(op.arg(0), ctx);
-                let b2 = self.getintbound(op.arg(1), ctx);
+                let arg0 = op.arg(0);
+                let arg1 = op.arg(1);
+                let b1 = self.getintbound(arg0, ctx);
+                let b2 = self.getintbound(arg1, ctx);
                 if op.opcode != OpCode::IntMulOvf && !b1.mul_bound_cannot_overflow(&b2) {
                     return;
                 }
                 let r = self.getintbound(op.pos, ctx);
                 let b = r.py_div_bound(&b2);
-                let _ = self.get_bound_mut(op.arg(0)).intersect(&b);
+                let changed0 = matches!(self.get_bound_mut(arg0).intersect(&b), Ok(true));
+                if changed0 {
+                    self.propagate_bounds_backward(arg0, ctx);
+                }
                 let b = r.py_div_bound(&b1);
-                let _ = self.get_bound_mut(op.arg(1)).intersect(&b);
+                let changed1 = matches!(self.get_bound_mut(arg1).intersect(&b), Ok(true));
+                if changed1 {
+                    self.propagate_bounds_backward(arg1, ctx);
+                }
             }
+            // intbounds.py:739-747 propagate_bounds_INT_LSHIFT
             OpCode::IntLshift => {
-                let b1 = self.getintbound(op.arg(0), ctx);
-                let b2 = self.getintbound(op.arg(1), ctx);
+                let arg0 = op.arg(0);
+                let arg1 = op.arg(1);
+                let b1 = self.getintbound(arg0, ctx);
+                let b2 = self.getintbound(arg1, ctx);
                 if !b1.lshift_bound_cannot_overflow(&b2) {
                     return;
                 }
                 let r = self.getintbound(op.pos, ctx);
                 if let Ok(b) = r.lshift_bound_backwards(&b2) {
-                    let _ = self.get_bound_mut(op.arg(0)).intersect(&b);
+                    let changed = matches!(self.get_bound_mut(arg0).intersect(&b), Ok(true));
+                    if changed {
+                        self.propagate_bounds_backward(arg0, ctx);
+                    }
                 }
             }
+            // intbounds.py:759-767 propagate_bounds_INT_RSHIFT
             OpCode::IntRshift => {
+                let arg0 = op.arg(0);
                 let b2 = self.getintbound(op.arg(1), ctx);
                 if !b2.is_constant() {
                     return;
                 }
                 let r = self.getintbound(op.pos, ctx);
                 let b = r.rshift_bound_backwards(&b2);
-                let _ = self.get_bound_mut(op.arg(0)).intersect(&b);
+                let changed = matches!(self.get_bound_mut(arg0).intersect(&b), Ok(true));
+                if changed {
+                    self.propagate_bounds_backward(arg0, ctx);
+                }
             }
+            // intbounds.py:749-757 propagate_bounds_UINT_RSHIFT
             OpCode::UintRshift => {
+                let arg0 = op.arg(0);
                 let b2 = self.getintbound(op.arg(1), ctx);
                 if !b2.is_constant() {
                     return;
                 }
                 let r = self.getintbound(op.pos, ctx);
                 let b = r.urshift_bound_backwards(&b2);
-                let _ = self.get_bound_mut(op.arg(0)).intersect(&b);
+                let changed = matches!(self.get_bound_mut(arg0).intersect(&b), Ok(true));
+                if changed {
+                    self.propagate_bounds_backward(arg0, ctx);
+                }
             }
+            // intbounds.py:773-782 propagate_bounds_INT_AND
             OpCode::IntAnd => {
+                let arg0 = op.arg(0);
+                let arg1 = op.arg(1);
                 let r = self.getintbound(op.pos, ctx);
-                let b0 = self.getintbound(op.arg(0), ctx);
-                let b1 = self.getintbound(op.arg(1), ctx);
+                let b0 = self.getintbound(arg0, ctx);
+                let b1 = self.getintbound(arg1, ctx);
                 if let Ok(b) = b0.and_bound_backwards(&r) {
-                    let _ = self.get_bound_mut(op.arg(1)).intersect(&b);
+                    let changed = matches!(self.get_bound_mut(arg1).intersect(&b), Ok(true));
+                    if changed {
+                        self.propagate_bounds_backward(arg1, ctx);
+                    }
                 }
                 if let Ok(b) = b1.and_bound_backwards(&r) {
-                    let _ = self.get_bound_mut(op.arg(0)).intersect(&b);
+                    let changed = matches!(self.get_bound_mut(arg0).intersect(&b), Ok(true));
+                    if changed {
+                        self.propagate_bounds_backward(arg0, ctx);
+                    }
                 }
             }
+            // intbounds.py:784-793 propagate_bounds_INT_OR
             OpCode::IntOr => {
+                let arg0 = op.arg(0);
+                let arg1 = op.arg(1);
                 let r = self.getintbound(op.pos, ctx);
-                let b0 = self.getintbound(op.arg(0), ctx);
-                let b1 = self.getintbound(op.arg(1), ctx);
+                let b0 = self.getintbound(arg0, ctx);
+                let b1 = self.getintbound(arg1, ctx);
                 if let Ok(b) = b0.or_bound_backwards(&r) {
-                    let _ = self.get_bound_mut(op.arg(1)).intersect(&b);
+                    let changed = matches!(self.get_bound_mut(arg1).intersect(&b), Ok(true));
+                    if changed {
+                        self.propagate_bounds_backward(arg1, ctx);
+                    }
                 }
                 if let Ok(b) = b1.or_bound_backwards(&r) {
-                    let _ = self.get_bound_mut(op.arg(0)).intersect(&b);
+                    let changed = matches!(self.get_bound_mut(arg0).intersect(&b), Ok(true));
+                    if changed {
+                        self.propagate_bounds_backward(arg0, ctx);
+                    }
                 }
             }
+            // intbounds.py:795-804 propagate_bounds_INT_XOR
             OpCode::IntXor => {
+                let arg0 = op.arg(0);
+                let arg1 = op.arg(1);
                 let r = self.getintbound(op.pos, ctx);
-                let b0 = self.getintbound(op.arg(0), ctx);
-                let b1 = self.getintbound(op.arg(1), ctx);
+                let b0 = self.getintbound(arg0, ctx);
+                let b1 = self.getintbound(arg1, ctx);
                 // xor is its own inverse
                 let b = b0.xor_bound(&r);
-                let _ = self.get_bound_mut(op.arg(1)).intersect(&b);
+                let changed1 = matches!(self.get_bound_mut(arg1).intersect(&b), Ok(true));
+                if changed1 {
+                    self.propagate_bounds_backward(arg1, ctx);
+                }
                 let b = b1.xor_bound(&r);
-                let _ = self.get_bound_mut(op.arg(0)).intersect(&b);
+                let changed0 = matches!(self.get_bound_mut(arg0).intersect(&b), Ok(true));
+                if changed0 {
+                    self.propagate_bounds_backward(arg0, ctx);
+                }
             }
+            // intbounds.py:481-487 propagate_bounds_INT_INVERT
             OpCode::IntInvert => {
+                let arg0 = op.arg(0);
                 let bres = self.getintbound(op.pos, ctx);
                 let bounds = bres.invert_bound();
-                let _ = self.get_bound_mut(op.arg(0)).intersect(&bounds);
+                let changed = matches!(self.get_bound_mut(arg0).intersect(&bounds), Ok(true));
+                if changed {
+                    self.propagate_bounds_backward(arg0, ctx);
+                }
             }
+            // intbounds.py:489-495 propagate_bounds_INT_NEG
             OpCode::IntNeg => {
+                let arg0 = op.arg(0);
                 let bres = self.getintbound(op.pos, ctx);
                 let bounds = bres.neg_bound();
-                let _ = self.get_bound_mut(op.arg(0)).intersect(&bounds);
+                let changed = matches!(self.get_bound_mut(arg0).intersect(&bounds), Ok(true));
+                if changed {
+                    self.propagate_bounds_backward(arg0, ctx);
+                }
             }
-            // intbounds.py: propagate_bounds_INT_EQ
-            // If result is known 1 (true): arg0 == arg1 → intersect bounds
-            // If result is known 0 (false): no bounds propagation for !=
+            // intbounds.py:644-651 propagate_bounds_INT_EQ
             OpCode::IntEq => {
                 let r = self.getintbound(op.pos, ctx);
                 if r.is_constant() && r.lower == 1 {
-                    // make_eq: intersect arg0 with arg1's bounds and vice versa
-                    let b0 = self.getintbound(op.arg(0), ctx);
-                    let b1 = self.getintbound(op.arg(1), ctx);
-                    let _ = self.get_bound_mut(op.arg(0)).intersect(&b1);
-                    let _ = self.get_bound_mut(op.arg(1)).intersect(&b0);
+                    self.make_eq(op.arg(0), op.arg(1), ctx);
+                } else if r.is_constant() && r.lower == 0 {
+                    self.make_ne(op.arg(0), op.arg(1), ctx);
                 }
             }
-            // intbounds.py: propagate_bounds_INT_NE
-            // If result is known 0 (false): arg0 == arg1 → intersect bounds
+            // intbounds.py:653-656 propagate_bounds_INT_NE
             OpCode::IntNe => {
                 let r = self.getintbound(op.pos, ctx);
                 if r.is_constant() && r.lower == 0 {
-                    let b0 = self.getintbound(op.arg(0), ctx);
-                    let b1 = self.getintbound(op.arg(1), ctx);
-                    let _ = self.get_bound_mut(op.arg(0)).intersect(&b1);
-                    let _ = self.get_bound_mut(op.arg(1)).intersect(&b0);
+                    self.make_eq(op.arg(0), op.arg(1), ctx);
+                } else if r.is_constant() && r.lower == 1 {
+                    self.make_ne(op.arg(0), op.arg(1), ctx);
                 }
             }
             _ => {}
