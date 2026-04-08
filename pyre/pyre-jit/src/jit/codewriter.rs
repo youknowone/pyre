@@ -844,6 +844,51 @@ impl CodeWriter {
             jitcode.liveness = merged;
         }
 
+        // liveness.py:147-166 encode_liveness parity: pack each
+        // merged LivenessInfo into the all_liveness byte string with
+        // the `[len_i][len_r][len_f] | bitset_i | bitset_r | bitset_f`
+        // layout (liveness.py:139-145). `jitcode.liveness_offsets`
+        // maps each jit_pc to the entry's offset in the packed string —
+        // the same information RPython embeds inline via the `-live-`
+        // opcode and `encode_offset`.
+        {
+            use majit_codewriter::liveness::encode_liveness;
+
+            // live_i_regs / live_f_regs are always empty in pyre (all
+            // Python values are PyObjectRef → ref bank only), so
+            // encoding stays symmetric across the three kinds.
+            fn to_u8_sorted(regs: &[u16]) -> Vec<u8> {
+                let mut bytes: Vec<u8> = regs
+                    .iter()
+                    .filter_map(|&r| if r < 256 { Some(r as u8) } else { None })
+                    .collect();
+                bytes.sort_unstable();
+                bytes.dedup();
+                bytes
+            }
+
+            let mut liveness_info: Vec<u8> = Vec::new();
+            let mut liveness_offsets: std::collections::HashMap<u32, u32> =
+                std::collections::HashMap::new();
+            for entry in &jitcode.liveness {
+                let offset = liveness_info.len() as u32;
+                liveness_offsets.insert(entry.pc as u32, offset);
+                let live_i_bytes = to_u8_sorted(&entry.live_i_regs);
+                let live_r_bytes = to_u8_sorted(&entry.live_r_regs);
+                let live_f_bytes = to_u8_sorted(&entry.live_f_regs);
+                // liveness.py:144 header: three lengths.
+                liveness_info.push(live_i_bytes.len() as u8);
+                liveness_info.push(live_r_bytes.len() as u8);
+                liveness_info.push(live_f_bytes.len() as u8);
+                // liveness.py:145 body: three packed bitsets.
+                liveness_info.extend(encode_liveness(&live_i_bytes));
+                liveness_info.extend(encode_liveness(&live_r_bytes));
+                liveness_info.extend(encode_liveness(&live_f_bytes));
+            }
+            jitcode.liveness_info = liveness_info;
+            jitcode.liveness_offsets = liveness_offsets;
+        }
+
         // RPython parity: forward PC map (py_pc → jitcode_pc) so
         // get_list_of_active_boxes can look up LivenessInfo by Python PC.
         jitcode.py_to_jit_pc = pc_map.clone();
