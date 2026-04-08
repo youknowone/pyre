@@ -1951,7 +1951,17 @@ impl Optimizer {
                 crate::optimizeopt::shortpreamble::ShortBoxes::with_label_args(&preview_short_args);
             short_boxes.note_known_constants_from_ctx(&ctx);
             for &arg in &preview_short_args {
-                short_boxes.add_short_input_arg(arg);
+                // RPython shortpreamble.py parity: Box.type carries the
+                // source type. Look up the OpRef's type from `value_types`
+                // (which emit() maintains per op result type) so that the
+                // SameAs opcode reflects the actual Box shape. Default to
+                // Int only for non-resolvable OpRefs (constants etc.).
+                let arg_type = ctx
+                    .value_types
+                    .get(&arg.0)
+                    .copied()
+                    .unwrap_or(majit_ir::Type::Int);
+                short_boxes.add_short_input_arg(arg, arg_type);
             }
             self.produce_potential_short_preamble_ops(&mut short_boxes, &ctx);
             let produced = short_boxes.produced_ops();
