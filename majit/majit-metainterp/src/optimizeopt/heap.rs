@@ -3172,8 +3172,8 @@ mod tests {
             OpRef(101),
         ]);
         // Register input args so produce_arg can resolve them.
-        sb.add_short_input_arg(OpRef(100));
-        sb.add_short_input_arg(OpRef(101));
+        sb.add_short_input_arg(OpRef(100), majit_ir::Type::Int);
+        sb.add_short_input_arg(OpRef(101), majit_ir::Type::Int);
         let ctx = crate::optimizeopt::OptContext::new(256);
         pass.produce_potential_short_preamble_ops(&mut sb, &ctx);
         let produced = sb.produced_ops();

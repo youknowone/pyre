@@ -588,22 +588,23 @@ impl ShortBoxes {
         );
     }
 
-    pub(crate) fn add_short_input_arg(&mut self, arg: OpRef) {
+    pub(crate) fn add_short_input_arg(&mut self, arg: OpRef, arg_type: majit_ir::Type) {
+        // RPython shortpreamble.py parity: the short-preamble InputArg's
+        // SameAs opcode must match the BoxType (Box.type). BoxInt →
+        // same_as_i, BoxRef → same_as_r, BoxFloat → same_as_f. A fixed
+        // SameAsI default type-coerces Ref locals to Int, which surfaces
+        // downstream as `exit_types[i] = Int` and makes
+        // `materialize_virtual` box a raw pointer via `w_int_new`.
         let label_arg_idx = self.lookup_label_arg(arg);
-        let op = match majit_ir::Type::Int {
-            _ => {
-                let mut same_as = Op::new(OpCode::SameAsI, &[arg]);
-                same_as.pos = arg;
-                same_as
-            }
-        };
+        let mut same_as = Op::new(OpCode::same_as_for_type(arg_type), &[arg]);
+        same_as.pos = arg;
         if !self.potential_order.contains(&arg) {
             self.potential_order.push(arg);
         }
         self.potential_ops.insert(
             arg,
             PotentialShortOp::Preamble(PreambleOp {
-                op,
+                op: same_as,
                 kind: PreambleOpKind::InputArg,
                 label_arg_idx,
                 invented_name: false,
@@ -725,10 +726,15 @@ impl ShortBoxes {
 pub fn create_short_boxes(
     short_boxes: &mut ShortBoxes,
     label_args: &[OpRef],
+    label_arg_types: &[majit_ir::Type],
     _optimizer_ops: &[Op],
 ) -> Vec<ProducedShortOp> {
-    for &arg in label_args {
-        short_boxes.add_short_input_arg(arg);
+    for (i, &arg) in label_args.iter().enumerate() {
+        let arg_type = label_arg_types
+            .get(i)
+            .copied()
+            .unwrap_or(majit_ir::Type::Int);
+        short_boxes.add_short_input_arg(arg, arg_type);
     }
     short_boxes
         .produced_ops()
@@ -2493,7 +2499,7 @@ mod tests {
     #[test]
     fn test_rpython_create_short_boxes_prefers_short_inputarg_over_heap_result() {
         let mut sb = ShortBoxes::with_label_args(&[OpRef(10), OpRef(30)]);
-        sb.add_short_input_arg(OpRef(10));
+        sb.add_short_input_arg(OpRef(10), majit_ir::Type::Int);
 
         let mut heap = Op::with_descr(
             OpCode::GetfieldGcI,
