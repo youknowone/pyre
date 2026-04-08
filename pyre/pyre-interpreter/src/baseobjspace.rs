@@ -2840,6 +2840,32 @@ unsafe fn compute_mro(w_type: PyObjectRef) -> Vec<PyObjectRef> {
 /// In Python, a data descriptor is any object whose type defines __set__
 /// or __delete__. For pyre's current object model, we check the ATTR_TABLE
 /// and type dict for these names.
+/// baseobjspace.py isinstance_w: check if w_obj is instance of w_cls
+/// by walking the MRO of type(w_obj) and comparing with w_cls.
+unsafe fn isinstance_w(w_obj: PyObjectRef, w_cls: PyObjectRef) -> bool {
+    let w_obj_type = if is_instance(w_obj) {
+        w_instance_get_type(w_obj)
+    } else {
+        crate::typedef::r#type(w_obj).unwrap_or(pyre_object::PY_NULL)
+    };
+    if w_obj_type.is_null() {
+        return false;
+    }
+    if std::ptr::eq(w_obj_type, w_cls) {
+        return true;
+    }
+    // Walk MRO
+    let mro_ptr = w_type_get_mro(w_obj_type);
+    if !mro_ptr.is_null() {
+        for &t in &*mro_ptr {
+            if std::ptr::eq(t, w_cls) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 unsafe fn is_data_descr(descr: PyObjectRef) -> bool {
     if descr.is_null() {
         return false;
@@ -2900,11 +2926,23 @@ unsafe fn get(descr: PyObjectRef, obj: PyObjectRef, w_type: PyObjectRef) -> Opti
     }
 
     // typedef.py:464-475 Member.descr_member_get:
-    //   if obj is None: return self (unbound access)
-    //   return obj.getslotvalue(self.index)  → in pyre: read from ATTR_TABLE
+    //   if space.is_w(w_obj, space.w_None): return self
+    //   self.typecheck(space, w_obj)
+    //   w_result = w_obj.getslotvalue(self.index)
+    //   if w_result is None: raise AttributeError(self.name)
+    //   return w_result
     if pyre_object::is_member(descr) {
+        // typedef.py:467: unbound access → return descriptor itself
         if obj.is_null() || is_none(obj) {
             return Some(descr);
+        }
+        // typedef.py:470: typecheck — verify obj is instance of descriptor's class
+        let w_cls = pyre_object::w_member_get_cls(descr);
+        if !w_cls.is_null() && is_type(w_cls) {
+            if !isinstance_w(obj, w_cls) {
+                // TypeError: descriptor doesn't apply
+                return None;
+            }
         }
         let slot_name = pyre_object::w_member_get_name(descr);
         let found = ATTR_TABLE.with(|table| {
@@ -2913,6 +2951,12 @@ unsafe fn get(descr: PyObjectRef, obj: PyObjectRef, w_type: PyObjectRef) -> Opti
                 .get(&(obj as usize))
                 .and_then(|d| d.get(slot_name).copied())
         });
+        // typedef.py:472-474: if slot value is None → AttributeError
+        if found.is_none() {
+            // Return None to signal "not found" — caller's AttributeError
+            // path handles this (line 2318 in getattr).
+            return None;
+        }
         return found;
     }
 
@@ -3121,6 +3165,34 @@ pub fn delattr(obj: PyObjectRef, name: &str) -> PyResult {
             if !dict_ptr.is_null() {
                 crate::namespace_store(&mut *dict_ptr, name, PY_NULL);
                 return Ok(w_none());
+            }
+        }
+    }
+    // typedef.py:483-490 Member.descr_member_del:
+    //   self.typecheck(space, w_obj)
+    //   success = w_obj.delslotvalue(self.index)
+    //   if not success: raise AttributeError(self.name)
+    unsafe {
+        if is_instance(obj) {
+            let w_type = w_instance_get_type(obj);
+            if let Some(descr) = lookup_in_type_where(w_type, name) {
+                if pyre_object::is_member(descr) {
+                    let slot_name = pyre_object::w_member_get_name(descr);
+                    let removed = ATTR_TABLE.with(|table| {
+                        let mut table = table.borrow_mut();
+                        table
+                            .get_mut(&(obj as usize))
+                            .and_then(|d| d.remove(slot_name))
+                            .is_some()
+                    });
+                    if !removed {
+                        return Err(PyError::new(
+                            PyErrorKind::AttributeError,
+                            slot_name.to_string(),
+                        ));
+                    }
+                    return Ok(w_none());
+                }
             }
         }
     }

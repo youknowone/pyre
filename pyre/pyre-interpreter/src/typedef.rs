@@ -292,8 +292,8 @@ pub fn init_typeobjects() {
     // function — PyPy: funcobject.py
     // Functions are descriptors: function.__get__ returns a bound method.
     let function_type = new_typeobject_with_base("function", init_function_type, object_type);
-    // funcobject.py typedef: hasdict=True, weakrefable=True
-    // hasdict/weakrefable/acceptable now set from init_function_type's dict.
+    // typedef.py:742 Function.typedef.acceptable_as_base_class = False
+    unsafe { pyre_object::w_type_set_acceptable_as_base_class(function_type, false) };
     reg.insert(
         &crate::FUNCTION_TYPE as *const PyType as usize,
         function_type as usize,
@@ -305,14 +305,20 @@ pub fn init_typeobjects() {
         new_typeobject_with_base("builtin-code", init_builtin_code_type, object_type) as usize,
     );
 
+    // typedef.py:765 Method.typedef.acceptable_as_base_class = False
+    let method_type = new_typeobject_with_base("method", init_method_type, object_type);
+    unsafe { pyre_object::w_type_set_acceptable_as_base_class(method_type, false) };
     reg.insert(
         &pyre_object::methodobject::METHOD_TYPE as *const PyType as usize,
-        new_typeobject_with_base("method", init_method_type, object_type) as usize,
+        method_type as usize,
     );
 
+    // typedef.py:664 PyCode.typedef.acceptable_as_base_class = False
+    let code_type = new_typeobject_with_base("code", init_code_type, object_type);
+    unsafe { pyre_object::w_type_set_acceptable_as_base_class(code_type, false) };
     reg.insert(
         &crate::pycode::CODE_TYPE as *const PyType as usize,
-        new_typeobject_with_base("code", init_code_type, object_type) as usize,
+        code_type as usize,
     );
 
     // staticmethod — PyPy: function.py StaticMethod, bases=(object,)
