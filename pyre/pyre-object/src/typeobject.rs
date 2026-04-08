@@ -48,6 +48,11 @@ pub struct W_TypeObject {
     /// 0 for classes without `__slots__`. Used in layout comparison:
     /// classes with different nslots have incompatible layouts.
     pub nslots: u32,
+    /// typeobject.py:115 `Layout.newslotnames` — sorted list of slot names
+    /// introduced by THIS class (not inherited from bases).
+    /// Used in Layout.expand() tuple for __class__ assignment compatibility.
+    /// Null means empty (no __slots__ or all slots inherited).
+    pub newslotnames: *const Vec<String>,
 }
 
 /// Allocate a new W_TypeObject.
@@ -72,6 +77,7 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: *mut u8) -> PyObject
         flag_heaptype: true,
         layout: &INSTANCE_TYPE as *const PyType,
         nslots: 0,
+        newslotnames: std::ptr::null(),
     });
     Box::into_raw(obj) as PyObjectRef
 }
@@ -116,6 +122,7 @@ pub fn w_type_new_builtin(
         flag_heaptype: false,
         layout: layout_pytype,
         nslots: 0,
+        newslotnames: std::ptr::null(),
     });
     Box::into_raw(obj) as PyObjectRef
 }
@@ -149,6 +156,24 @@ pub unsafe fn w_type_set_mro(obj: PyObjectRef, mro: Vec<PyObjectRef>) {
 #[inline]
 pub unsafe fn is_type(obj: PyObjectRef) -> bool {
     py_type_check(obj, &TYPE_TYPE)
+}
+
+/// typeobject.py:115 `Layout.newslotnames` setter.
+/// `names` must be sorted (PyPy's create_all_slots sorts them).
+///
+/// # Safety
+/// `obj` must be a valid W_TypeObject pointer.
+pub unsafe fn w_type_set_newslotnames(obj: PyObjectRef, names: Vec<String>) {
+    (*(obj as *mut W_TypeObject)).newslotnames = Box::into_raw(Box::new(names));
+}
+
+/// typeobject.py:115 `Layout.newslotnames` getter.
+///
+/// # Safety
+/// `obj` must be a valid W_TypeObject pointer.
+pub unsafe fn w_type_get_newslotnames(obj: PyObjectRef) -> &'static [String] {
+    let ptr = (*(obj as *const W_TypeObject)).newslotnames;
+    if ptr.is_null() { &[] } else { &*ptr }
 }
 
 /// typeobject.py:543-544 `is_heaptype(self)`.
