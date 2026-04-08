@@ -134,6 +134,50 @@ impl DynasmBackend {
             .downcast_ref::<CompiledCode>()
             .expect("compiled data is not CompiledCode")
     }
+
+    /// llmodel.py:412 get_latest_descr parity: resolve a raw jf_descr
+    /// pointer to its Arc<DynasmFailDescr>. Searches root loop
+    /// fail_descrs first, then all bridge fail_descrs stored in
+    /// asmmemmgr_blocks. RPython does this via AbstractDescr.show()
+    /// which works for any descr from any loop/bridge.
+    fn find_descr_by_ptr(token: &JitCellToken, ptr: usize) -> Arc<DynasmFailDescr> {
+        // compile.py:665-674 done_with_this_frame_descr singleton
+        let global_done = crate::guard::done_with_this_frame_descr_ptr();
+        if ptr == global_done {
+            return Arc::new(DynasmFailDescr::new(u32::MAX, 0, vec![Type::Int], true));
+        }
+
+        // Search root loop
+        let compiled = Self::get_compiled(token);
+        if let Some(found) = compiled
+            .fail_descrs
+            .iter()
+            .find(|d| Arc::as_ptr(d) as usize == ptr)
+        {
+            return found.clone();
+        }
+
+        // Search bridge fail_descrs in asmmemmgr_blocks
+        let blocks = token.asmmemmgr_blocks.lock();
+        for block in blocks.iter() {
+            if let Some(bridge) = block.downcast_ref::<CompiledCode>() {
+                if let Some(found) = bridge
+                    .fail_descrs
+                    .iter()
+                    .find(|d| Arc::as_ptr(d) as usize == ptr)
+                {
+                    return found.clone();
+                }
+            }
+        }
+
+        // Fallback — should not happen in well-formed execution
+        compiled
+            .fail_descrs
+            .last()
+            .cloned()
+            .unwrap_or_else(|| Arc::new(DynasmFailDescr::new(0, 0, Vec::new(), true)))
+    }
 }
 
 impl Backend for DynasmBackend {
@@ -247,7 +291,7 @@ impl Backend for DynasmBackend {
         let num_slots = args
             .len()
             .max(compiled.fail_descrs.len() * 4)
-            .max(compiled.frame_depth)
+            .max(compiled.frame_depth.load(Ordering::Acquire))
             .max(64);
         let jf_total = 1 + num_slots;
         let mut jf: Vec<i64> = vec![0i64; jf_total];
@@ -289,27 +333,12 @@ impl Backend for DynasmBackend {
             );
         }
 
-        // llmodel.py:412-420 get_latest_descr: read jf_descr from frame
+        // llmodel.py:412-420 get_latest_descr: read jf_descr from frame.
+        // RPython resolves jf_descr via AbstractDescr.show() which
+        // works for any descr from any loop or bridge. We search root
+        // loop fail_descrs + all bridge fail_descrs in asmmemmgr_blocks.
         let jf_descr_raw = unsafe { *result_jf.add(0) };
-
-        // Find the matching fail descriptor by pointer.
-        // compile.py:665-674 parity: check global done_with_this_frame_descr first.
-        let global_done = crate::guard::done_with_this_frame_descr_ptr();
-        let descr =
-            if jf_descr_raw as usize == global_done {
-                Arc::new(DynasmFailDescr::new(u32::MAX, 0, vec![Type::Int], true))
-            } else {
-                compiled
-                    .fail_descrs
-                    .iter()
-                    .find(|d| Arc::as_ptr(d) as usize == jf_descr_raw as usize)
-                    .cloned()
-                    .unwrap_or_else(|| {
-                        compiled.fail_descrs.last().cloned().unwrap_or_else(|| {
-                            Arc::new(DynasmFailDescr::new(0, 0, Vec::new(), true))
-                        })
-                    })
-            };
+        let descr = Self::find_descr_by_ptr(token, jf_descr_raw as usize);
 
         if std::env::var_os("MAJIT_LOG").is_some() {
             eprintln!(
@@ -360,7 +389,7 @@ impl Backend for DynasmBackend {
         let num_slots = args
             .len()
             .max(compiled.fail_descrs.len() * 4)
-            .max(compiled.frame_depth)
+            .max(compiled.frame_depth.load(Ordering::Acquire))
             .max(64);
         let jf_total = 1 + num_slots;
         let mut jf: Vec<i64> = vec![0i64; jf_total];
@@ -375,18 +404,7 @@ impl Backend for DynasmBackend {
         let result_jf = unsafe { func(jf_ptr) };
 
         let jf_descr_raw = unsafe { *result_jf.add(0) };
-        let descr = compiled
-            .fail_descrs
-            .iter()
-            .find(|d| Arc::as_ptr(d) as usize == jf_descr_raw as usize)
-            .cloned()
-            .unwrap_or_else(|| {
-                compiled
-                    .fail_descrs
-                    .last()
-                    .cloned()
-                    .unwrap_or_else(|| Arc::new(DynasmFailDescr::new(0, 0, Vec::new(), true)))
-            });
+        let descr = Self::find_descr_by_ptr(token, jf_descr_raw as usize);
 
         // RPython parity: typed_outputs correspond to fail_arg_types.
         // raw outputs contain ALL jitframe slots; typed_outputs only
@@ -481,6 +499,14 @@ impl Backend for DynasmBackend {
     ) -> Result<(), BackendError> {
         let old_compiled = Self::get_compiled(old);
         let new_compiled = Self::get_compiled(new);
+        // assembler.py:1148-1151 update_frame_info parity: propagate
+        // new loop's frame_depth to old token so that callers entering
+        // via the old token allocate a jitframe large enough for the
+        // new (potentially deeper) loop body.
+        let new_depth = new_compiled.frame_depth.load(Ordering::Acquire);
+        old_compiled
+            .frame_depth
+            .fetch_max(new_depth, Ordering::Release);
         let old_addr = codebuf::buffer_ptr(&old_compiled.buffer);
         let new_addr = codebuf::buffer_ptr(&new_compiled.buffer);
         Assembler386::redirect_call_assembler(old_addr, new_addr);
