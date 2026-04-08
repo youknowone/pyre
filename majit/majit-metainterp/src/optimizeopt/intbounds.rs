@@ -37,6 +37,10 @@ pub struct OptIntBounds {
     /// (e.g., INT_OR with non-overlapping ranges = INT_ADD).
     /// Key: (opcode, arg0, arg1), Value: result OpRef.
     pure_from_args_cache: Vec<(OpCode, OpRef, OpRef, OpRef)>,
+    /// Deferred guard bounds propagation. When a guard's comparison op
+    /// is postponed by the heap pass, find_producing_op can't find it.
+    /// Store (cond_ref, is_guard_true) and retry on next op.
+    pending_guard_bounds: Option<(OpRef, bool)>,
 }
 
 impl OptIntBounds {
@@ -48,6 +52,26 @@ impl OptIntBounds {
             last_emitted_args: Vec::new(),
             last_emitted_ref: OpRef::NONE,
             pending_overflow_guard: None,
+            pending_guard_bounds: None,
+        }
+    }
+
+    /// Retry deferred guard bounds propagation. By the time the next op
+    /// arrives, the heap pass has flushed the postponed comparison.
+    fn flush_pending_guard_bounds(&mut self, ctx: &OptContext) {
+        let pending = match self.pending_guard_bounds.take() {
+            Some(p) => p,
+            None => return,
+        };
+        let (cond_ref, is_true) = pending;
+        if let Some(producing_op) = self.find_producing_op(cond_ref, ctx) {
+            if producing_op.opcode.returns_bool() {
+                if is_true {
+                    self.setintbound(cond_ref, IntBound::from_constant(1));
+                }
+                let producing_op = producing_op.clone();
+                self.propagate_bounds_from_comparison(&producing_op, is_true, ctx);
+            }
         }
     }
 
@@ -823,6 +847,13 @@ impl OptIntBounds {
                 self.propagate_bounds_from_comparison(&producing_op, true, ctx);
                 return;
             }
+        } else if ctx.imported_label_args.is_some() {
+            // Defer only in Phase 2 (has imported_label_args) where the
+            // comparison is postponed by the heap pass and bounds
+            // propagation is needed for overflow elimination in loop bodies.
+            // Phase 1 (preamble) also has skip_flush but doesn't need
+            // deferred propagation.
+            self.pending_guard_bounds = Some((cond_ref, true));
         }
 
         let b0 = self.getintbound(cond_ref, ctx);
@@ -843,6 +874,8 @@ impl OptIntBounds {
                 let producing_op = producing_op.clone();
                 self.propagate_bounds_from_comparison(&producing_op, false, ctx);
             }
+        } else if ctx.imported_label_args.is_some() {
+            self.pending_guard_bounds = Some((cond_ref, false));
         }
     }
 
@@ -1231,6 +1264,9 @@ impl Default for OptIntBounds {
 
 impl Optimization for OptIntBounds {
     fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+        // RPython emit-then-propagate parity: retry deferred guard bounds.
+        self.flush_pending_guard_bounds(ctx);
+
         let result = match op.opcode {
             // ── Comparisons ──
             OpCode::IntLt => self.optimize_int_lt(op, ctx),
