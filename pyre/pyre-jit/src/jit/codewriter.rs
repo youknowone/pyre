@@ -894,6 +894,14 @@ impl CodeWriter {
         // RPython parity: forward PC map (py_pc → jitcode_pc) so
         // get_list_of_active_boxes can look up LivenessInfo by Python PC.
         jitcode.py_to_jit_pc = pc_map.clone();
+        // flatten.py / regalloc.py parity: record the symbolic value-stack
+        // depth at every Python PC. RPython jitcodes pre-allocate a typed
+        // register for every value-stack temporary, so resume / merge
+        // exit paths can read exactly `depth_at_py_pc[py_pc]` registers
+        // starting at `stack_base = nlocals` (the codewriter never emits
+        // BC_PUSH_R / BC_POP_R against a runtime stack — only BC_MOVE_R
+        // against the typed register bank).
+        jitcode.depth_at_py_pc = depth_at_pc.clone();
 
         // call.py:148 grab_initial_jitcodes: jd.mainjitcode.jitdriver_sd = jd
         // pyre uses index 0 (single jitdriver) for portal jitcodes.
