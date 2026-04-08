@@ -429,6 +429,24 @@ impl Backend for DynasmBackend {
             );
         }
 
+        if std::env::var_os("MAJIT_DUMP").is_some() {
+            let code = unsafe { std::slice::from_raw_parts(entry, compiled.buffer.len()) };
+            eprintln!("[dynasm] CODE DUMP ({} bytes at {:?}):", code.len(), entry);
+            for (i, chunk) in code.chunks(4).enumerate() {
+                let word = u32::from_le_bytes([
+                    chunk.get(0).copied().unwrap_or(0),
+                    chunk.get(1).copied().unwrap_or(0),
+                    chunk.get(2).copied().unwrap_or(0),
+                    chunk.get(3).copied().unwrap_or(0),
+                ]);
+                eprint!("{:08x} ", word);
+                if (i + 1) % 8 == 0 {
+                    eprintln!();
+                }
+            }
+            eprintln!();
+        }
+
         // llmodel.py:323: ll_frame = func(ll_frame)
         let func: unsafe extern "C" fn(*mut i64) -> *mut i64 =
             unsafe { std::mem::transmute(entry) };

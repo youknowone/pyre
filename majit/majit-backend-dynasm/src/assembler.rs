@@ -1929,7 +1929,15 @@ impl Assembler386 {
         let fail_arg_locs: Vec<Option<usize>> = faillocs
             .iter()
             .map(|fl| match fl {
-                Some(Loc::Reg(r)) => Some(JITFRAME_FIXED_SIZE + r.value as usize),
+                Some(Loc::Reg(r)) => {
+                    if r.is_xmm {
+                        // FP save area: JITFRAME_FIXED_SIZE + 16 + reg_value
+                        Some(JITFRAME_FIXED_SIZE + 16 + r.value as usize)
+                    } else {
+                        // GPR save area: JITFRAME_FIXED_SIZE + reg_value
+                        Some(JITFRAME_FIXED_SIZE + r.value as usize)
+                    }
+                }
                 Some(Loc::Frame(f)) => Some(f.position),
                 Some(Loc::Immed(i)) => {
                     // Allocate a slot for this constant in the save area.
@@ -2036,6 +2044,7 @@ impl Assembler386 {
         {
             dynasm!(self.mc ; .arch aarch64 ; =>save_regs_label);
             use crate::regloc::*;
+            // Save GPR registers
             let gprs = [
                 ECX, EAX, EDX, EBX, ESI, EDI, R8, R9, R10, R12, R13, R14, R15,
             ];
@@ -2043,6 +2052,18 @@ impl Assembler386 {
                 let save_slot = JITFRAME_FIXED_SIZE + reg.value as usize;
                 let ofs = ((1 + save_slot) * 8) as u32;
                 dynasm!(self.mc ; .arch aarch64 ; str X(reg.value), [x29, ofs]);
+            }
+            // Save FP/SIMD registers (d0-d14) to separate save area.
+            // GPR save area: JITFRAME_FIXED_SIZE + 0..15
+            // FP save area:  JITFRAME_FIXED_SIZE + 16..31
+            let fprs = [
+                XMM0, XMM1, XMM2, XMM3, XMM4, XMM5, XMM6, XMM7, XMM8, XMM9, XMM10, XMM11, XMM12,
+                XMM13, XMM14,
+            ];
+            for &reg in &fprs {
+                let save_slot = JITFRAME_FIXED_SIZE + 16 + reg.value as usize;
+                let ofs = ((1 + save_slot) * 8) as u32;
+                dynasm!(self.mc ; .arch aarch64 ; str D(reg.value), [x29, ofs]);
             }
             dynasm!(self.mc ; .arch aarch64 ; ret);
         }
