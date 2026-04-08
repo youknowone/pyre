@@ -32,6 +32,46 @@ pub const PYFRAME_VABLE_FIELDS: &[(&str, usize)] = &[
 /// Virtualizable array fields in canonical index order.
 pub const PYFRAME_VABLE_ARRAYS: &[(&str, usize)] = &[("locals_cells_stack_w", 0)];
 
+/// Canonical vable-array index for `locals_cells_stack_w`.
+///
+/// PyFrame's unified locals+cells+stack vector is the first (and currently
+/// only) virtualizable array. Portal `LOAD_FAST`/`STORE_FAST` in the
+/// codewriter use this constant with the Python `var_num` as item index to
+/// emit `GETARRAYITEM_VABLE_R` / `SETARRAYITEM_VABLE_R`.
+///
+/// Compile-time invariants guarded below: the entry must be present at
+/// index 0 and named `"locals_cells_stack_w"`.
+pub const LOCALS_CELLS_STACK_W_VABLE_ARRAY_INDEX: usize = 0;
+
+const _: () = {
+    assert!(
+        !PYFRAME_VABLE_ARRAYS.is_empty(),
+        "PYFRAME_VABLE_ARRAYS must contain locals_cells_stack_w"
+    );
+    assert!(
+        PYFRAME_VABLE_ARRAYS[LOCALS_CELLS_STACK_W_VABLE_ARRAY_INDEX].1
+            == LOCALS_CELLS_STACK_W_VABLE_ARRAY_INDEX,
+        "locals_cells_stack_w must be registered at the expected vable array index"
+    );
+    // Verify the name bytewise — no `str::eq` in const context.
+    let name = PYFRAME_VABLE_ARRAYS[LOCALS_CELLS_STACK_W_VABLE_ARRAY_INDEX]
+        .0
+        .as_bytes();
+    let expected = b"locals_cells_stack_w";
+    assert!(
+        name.len() == expected.len(),
+        "PYFRAME_VABLE_ARRAYS[0] name mismatch"
+    );
+    let mut i = 0;
+    while i < expected.len() {
+        assert!(
+            name[i] == expected[i],
+            "PYFRAME_VABLE_ARRAYS[0] name mismatch"
+        );
+        i += 1;
+    }
+};
+
 /// Canonical field-role descriptors used by trace-pattern classification.
 pub const PYFRAME_FIELD_ROLES: &[FieldRoleSpec] = &[
     FieldRoleSpec {
