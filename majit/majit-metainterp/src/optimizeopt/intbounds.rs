@@ -37,10 +37,12 @@ pub struct OptIntBounds {
     /// (e.g., INT_OR with non-overlapping ranges = INT_ADD).
     /// Key: (opcode, arg0, arg1), Value: result OpRef.
     pure_from_args_cache: Vec<(OpCode, OpRef, OpRef, OpRef)>,
-    /// Deferred guard bounds propagation. When a guard's comparison op
-    /// is postponed by the heap pass, find_producing_op can't find it.
-    /// Store (cond_ref, is_guard_true) and retry on next op.
-    pending_guard_bounds: Option<(OpRef, bool)>,
+    /// RPython as_operation parity: record ops processed by this pass so
+    /// find_producing_op can locate them even when a later pass (OptHeap)
+    /// postpones them and they haven't appeared in new_operations yet.
+    /// RPython's recursive pass chain ensures all passes process an op before
+    /// postprocess runs; majit's iterative loop doesn't, so we cache here.
+    processed_ops: Vec<Op>,
 }
 
 impl OptIntBounds {
@@ -52,26 +54,7 @@ impl OptIntBounds {
             last_emitted_args: Vec::new(),
             last_emitted_ref: OpRef::NONE,
             pending_overflow_guard: None,
-            pending_guard_bounds: None,
-        }
-    }
-
-    /// Retry deferred guard bounds propagation. By the time the next op
-    /// arrives, the heap pass has flushed the postponed comparison.
-    fn flush_pending_guard_bounds(&mut self, ctx: &OptContext) {
-        let pending = match self.pending_guard_bounds.take() {
-            Some(p) => p,
-            None => return,
-        };
-        let (cond_ref, is_true) = pending;
-        if let Some(producing_op) = self.find_producing_op(cond_ref, ctx) {
-            if producing_op.opcode.returns_bool() {
-                if is_true {
-                    self.setintbound(cond_ref, IntBound::from_constant(1));
-                }
-                let producing_op = producing_op.clone();
-                self.propagate_bounds_from_comparison(&producing_op, is_true, ctx);
-            }
+            processed_ops: Vec::new(),
         }
     }
 
@@ -827,14 +810,21 @@ impl OptIntBounds {
     /// Find the operation that produced cond_ref by searching new_operations.
     /// RPython's `as_operation(box)` checks `_emittedoperations` directly;
     /// majit's flat OpRef model requires a positional lookup.
-    fn find_producing_op<'a>(&self, cond_ref: OpRef, ctx: &'a OptContext) -> Option<&'a Op> {
-        // First try direct index (when OpRef matches new_operations index)
+    fn find_producing_op(&self, cond_ref: OpRef, ctx: &OptContext) -> Option<Op> {
+        // First try new_operations (already emitted ops).
         let idx = cond_ref.0 as usize;
         if idx < ctx.new_operations.len() && ctx.new_operations[idx].pos == cond_ref {
-            return Some(&ctx.new_operations[idx]);
+            return Some(ctx.new_operations[idx].clone());
         }
-        // Otherwise search by pos field
-        ctx.new_operations.iter().rfind(|op| op.pos == cond_ref)
+        if let Some(op) = ctx.new_operations.iter().rfind(|op| op.pos == cond_ref) {
+            return Some(op.clone());
+        }
+        // RPython as_operation parity: also check ops that this pass has seen
+        // but that may not yet be in new_operations (e.g., postponed by heap).
+        self.processed_ops
+            .iter()
+            .rfind(|op| op.pos == cond_ref)
+            .cloned()
     }
 
     /// Propagate bounds backward after GUARD_TRUE.
@@ -843,17 +833,9 @@ impl OptIntBounds {
         if let Some(producing_op) = self.find_producing_op(cond_ref, ctx) {
             if producing_op.opcode.returns_bool() {
                 self.setintbound(cond_ref, IntBound::from_constant(1));
-                let producing_op = producing_op.clone();
                 self.propagate_bounds_from_comparison(&producing_op, true, ctx);
                 return;
             }
-        } else if ctx.imported_label_args.is_some() {
-            // Defer only in Phase 2 (has imported_label_args) where the
-            // comparison is postponed by the heap pass and bounds
-            // propagation is needed for overflow elimination in loop bodies.
-            // Phase 1 (preamble) also has skip_flush but doesn't need
-            // deferred propagation.
-            self.pending_guard_bounds = Some((cond_ref, true));
         }
 
         let b0 = self.getintbound(cond_ref, ctx);
@@ -871,11 +853,8 @@ impl OptIntBounds {
 
         if let Some(producing_op) = self.find_producing_op(cond_ref, ctx) {
             if producing_op.opcode.returns_bool() {
-                let producing_op = producing_op.clone();
                 self.propagate_bounds_from_comparison(&producing_op, false, ctx);
             }
-        } else if ctx.imported_label_args.is_some() {
-            self.pending_guard_bounds = Some((cond_ref, false));
         }
     }
 
@@ -1094,7 +1073,6 @@ impl OptIntBounds {
         }
         // Look at the producing operation for backward propagation
         if let Some(producing_op) = self.find_producing_op(opref, ctx) {
-            let producing_op = producing_op.clone();
             self.propagate_bounds_backward_op(&producing_op, ctx);
         }
     }
@@ -1264,9 +1242,6 @@ impl Default for OptIntBounds {
 
 impl Optimization for OptIntBounds {
     fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        // RPython emit-then-propagate parity: retry deferred guard bounds.
-        self.flush_pending_guard_bounds(ctx);
-
         let result = match op.opcode {
             // ── Comparisons ──
             OpCode::IntLt => self.optimize_int_lt(op, ctx),
@@ -1499,6 +1474,21 @@ impl Optimization for OptIntBounds {
             }
         }
 
+        // RPython as_operation parity: record non-removed ops so
+        // find_producing_op can locate them even when OptHeap postpones
+        // them (postponed comparison ops are not yet in new_operations
+        // when the guard that references them is processed by IntBounds).
+        if !matches!(result, OptimizationResult::Remove) {
+            match &result {
+                OptimizationResult::Emit(emitted_op) => {
+                    self.processed_ops.push(emitted_op.clone());
+                }
+                _ => {
+                    self.processed_ops.push(op.clone());
+                }
+            }
+        }
+
         // optimizer.py:415-426 parity: sync bounds to OptContext so that
         // later passes calling make_constant can validate int ranges.
         ctx.int_bounds.clone_from(&self.bounds);
@@ -1512,6 +1502,7 @@ impl Optimization for OptIntBounds {
         self.last_emitted_args.clear();
         self.last_emitted_ref = OpRef::NONE;
         self.pending_overflow_guard = None;
+        self.processed_ops.clear();
     }
 
     fn name(&self) -> &'static str {
