@@ -1574,27 +1574,65 @@ fn type_descr_call(frame: &mut PyFrame, w_type: PyObjectRef, args: &[PyObjectRef
     Ok(instance)
 }
 
-/// typeobject.py:1157-1162 — unpack __slots__ to slot name strings.
-fn collect_slot_names(w_slots: pyre_object::PyObjectRef) -> Vec<String> {
+/// typeobject.py:1157-1176 — unpack __slots__ to slot name strings.
+///
+/// PyPy:
+///   if isinstance(w_slots, (bytes, unicode)):
+///       slot_names_w = [w_slots]
+///   else:
+///       slot_names_w = space.unpackiterable(w_slots)
+///   for w_slot_name in slot_names_w:
+///       slot_name = space.text_w(w_slot_name)
+fn collect_slot_names(w_slots: pyre_object::PyObjectRef) -> Result<Vec<String>, crate::PyError> {
     unsafe {
-        if pyre_object::is_tuple(w_slots) {
-            let len = pyre_object::w_tuple_len(w_slots);
-            (0..len)
-                .filter_map(|i| {
-                    let w_name = pyre_object::w_tuple_getitem(w_slots, i as i64)?;
-                    if pyre_object::is_str(w_name) {
-                        Some(pyre_object::w_str_get_value(w_name).to_string())
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        } else if pyre_object::is_str(w_slots) {
-            vec![pyre_object::w_str_get_value(w_slots).to_string()]
+        // typeobject.py:1158-1162: str → single-element list, else unpackiterable
+        let slot_names_w = if pyre_object::is_str(w_slots) {
+            vec![w_slots]
         } else {
-            Vec::new()
+            crate::baseobjspace::unpackiterable(w_slots)?
+        };
+        let mut names = Vec::new();
+        for w_slot_name in slot_names_w {
+            if !pyre_object::is_str(w_slot_name) {
+                return Err(crate::PyError::type_error(
+                    "__slots__ items must be strings, not type".to_string(),
+                ));
+            }
+            let slot_name = pyre_object::w_str_get_value(w_slot_name).to_string();
+            // typeobject.py:1208-1209 valid_slot_name
+            if !valid_slot_name(&slot_name) {
+                return Err(crate::PyError::type_error(
+                    "__slots__ must be identifiers".to_string(),
+                ));
+            }
+            names.push(slot_name);
+        }
+        Ok(names)
+    }
+}
+
+/// typeobject.py:1234-1240 valid_slot_name:
+///   if len(slot_name) == 0 or slot_name[0].isdigit(): return False
+///   for c in slot_name: if not c.isalnum() and c != '_': return False
+///   return True
+fn valid_slot_name(name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let mut chars = name.chars();
+    let first = chars.next().unwrap();
+    if first.is_ascii_digit() {
+        return false;
+    }
+    if !first.is_alphanumeric() && first != '_' {
+        return false;
+    }
+    for c in chars {
+        if !c.is_alphanumeric() && c != '_' {
+            return false;
         }
     }
+    true
 }
 
 /// typeobject.py:1131-1140 copy_flags_from_bases:
@@ -1623,8 +1661,6 @@ unsafe fn copy_flags_from_bases(
 }
 
 /// typeobject.py:1143-1204 create_all_slots.
-///
-/// Returns the Layout pointer to set on the type.
 ///
 /// # Safety
 /// `w_type` must be a valid W_TypeObject pointer.
@@ -1657,7 +1693,14 @@ pub unsafe fn create_all_slots(
         // typeobject.py:1154-1176: has __slots__
         let mut wantdict = false;
         let mut wantweakref = false;
-        let all_names = collect_slot_names(w_slots);
+        let all_names = match collect_slot_names(w_slots) {
+            Ok(names) => names,
+            Err(_) => {
+                // Slot name validation failed — fall back to default layout.
+                set_default_layout(w_type, base_layout);
+                return;
+            }
+        };
         let mut newslotnames = Vec::new();
         for slot_name in &all_names {
             match slot_name.as_str() {
@@ -1714,20 +1757,27 @@ pub unsafe fn create_all_slots(
         // typeobject.py:1151-1153: no __slots__ → wantdict=True, wantweakref=True
         pyre_object::w_type_set_hasdict(w_type, true);
         pyre_object::w_type_set_weakrefable(w_type, true);
-
-        // typeobject.py:1200: reuse base_layout (no new slots)
-        let layout = if !base_layout.is_null() {
-            base_layout
-        } else {
-            leak_layout(Layout {
-                typedef: &pyre_object::pyobject::INSTANCE_TYPE as *const _,
-                nslots: 0,
-                newslotnames: vec![],
-                base_layout: std::ptr::null(),
-            })
-        };
-        pyre_object::w_type_set_layout(w_type, layout);
+        set_default_layout(w_type, base_layout);
     }
+}
+
+/// Set default layout (reuse base or create root).
+unsafe fn set_default_layout(
+    w_type: pyre_object::PyObjectRef,
+    base_layout: *const pyre_object::typeobject::Layout,
+) {
+    use pyre_object::typeobject::{Layout, leak_layout};
+    let layout = if !base_layout.is_null() {
+        base_layout
+    } else {
+        leak_layout(Layout {
+            typedef: &pyre_object::pyobject::INSTANCE_TYPE as *const _,
+            nslots: 0,
+            newslotnames: vec![],
+            base_layout: std::ptr::null(),
+        })
+    };
+    pyre_object::w_type_set_layout(w_type, layout);
 }
 
 /// typeobject.py:1089-1105 find_best_base: pick the base with the

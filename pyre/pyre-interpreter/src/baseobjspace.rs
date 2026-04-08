@@ -3280,6 +3280,27 @@ pub fn wrappable_class_name(class: PyObjectRef) -> String {
     }
 }
 
+/// baseobjspace.py:951-989 unpackiterable(w_iterable):
+///   w_iterator = iter(w_iterable)
+///   items = []
+///   while True:
+///       try: w_item = next(w_iterator)
+///       except StopIteration: break
+///       items.append(w_item)
+///   return items
+pub fn unpackiterable(w_iterable: PyObjectRef) -> Result<Vec<PyObjectRef>, crate::PyError> {
+    let w_iterator = iter(w_iterable)?;
+    let mut items = Vec::new();
+    loop {
+        match next(w_iterator) {
+            Ok(w_item) => items.push(w_item),
+            Err(e) if e.kind == crate::PyErrorKind::StopIteration => break,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(items)
+}
+
 /// `iter(obj)` — PyPy: space.iter(w_obj)
 /// Calls __iter__ on the object if available.
 pub fn iter(obj: PyObjectRef) -> PyResult {
