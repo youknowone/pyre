@@ -190,6 +190,18 @@ pub fn r#type(obj: PyObjectRef) -> Option<PyObjectRef> {
     }
     unsafe {
         if is_instance(obj) {
+            // Check for __class__ override in ATTR_TABLE first.
+            // Python allows obj.__class__ = OtherClass for compatible layouts.
+            // PyPy: w_obj.getclass(space) respects __class__ descriptor.
+            let class_override = crate::baseobjspace::ATTR_TABLE.with(|table| {
+                table
+                    .borrow()
+                    .get(&(obj as usize))
+                    .and_then(|d| d.get("__class__").copied())
+            });
+            if let Some(cls) = class_override {
+                return Some(cls);
+            }
             return Some(w_instance_get_type(obj));
         }
         if is_type(obj) {
