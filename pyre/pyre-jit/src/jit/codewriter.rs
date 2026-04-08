@@ -954,6 +954,12 @@ impl CodeWriter {
         // pyre uses index 0 (single jitdriver) for portal jitcodes.
         jitcode.jitdriver_sd = if is_portal { Some(0) } else { None };
         jitcode.nlocals = code.varnames.len();
+        // Per-jitcode stack base in `locals_cells_stack_w`. Each jitcode in
+        // a blackhole chain owns its own value (different functions have
+        // different cellvar layouts), so the rd_numb resume path can read
+        // it from `bh.jitcode.stack_base` instead of looking up the live
+        // PyFrame's stack_base for the whole chain.
+        jitcode.stack_base = code.varnames.len() + pyre_interpreter::pyframe::ncells(code);
 
         // blackhole.py handle_exception_in_frame: build exception handler table
         // from Python's code.exceptiontable. Maps Python PC ranges to JitCode PCs.
