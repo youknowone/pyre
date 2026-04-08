@@ -119,42 +119,34 @@ pub fn register_call_assembler_unbox_int(f: UnboxIntFn) {
 /// assembler.py:345 assembler_helper_adr parity:
 /// C-callable trampoline for CALL_ASSEMBLER slow path.
 ///
-/// Called from generated machine code when:
-/// (a) callee finished with a guard failure (jf_descr != done_descr), or
-/// (b) target was pending/unresolved (jf_descr == 0).
+/// Called from generated machine code when callee finished with a guard
+/// failure (jf_descr != done_descr). NOT called for pending/unresolved
+/// targets (those skip the callee call entirely).
 ///
 /// Dispatch order matches Cranelift's call_assembler_guard_failure:
 ///   1. bridge (if CA_BRIDGE_FN registered and compiles successfully)
 ///   2. blackhole resume (if CA_BLACKHOLE_FN registered)
-///   3. force (if CA_FORCE_FN registered — re-execute callee in interpreter)
-///   4. return 0 (no handler available)
+///   3. return 0 (no handler available)
 ///
 /// Input:  rdi/x0 = callee_jf_ptr (heap-allocated jitframe)
+///         rsi/x1 = green_key (header_pc of the owning loop)
 /// Output: rax/x0 = result value (0 if void/unhandled)
 ///
 /// Always frees the callee jitframe before returning.
-pub extern "C" fn call_assembler_helper_trampoline(callee_jf_ptr: *mut i64) -> i64 {
+pub extern "C" fn call_assembler_helper_trampoline(callee_jf_ptr: *mut i64, green_key: u64) -> i64 {
     if callee_jf_ptr.is_null() {
         return 0;
     }
 
-    // Read jf_descr — raw pointer to DynasmFailDescr (or 0 for pending)
+    // Read jf_descr — raw pointer to DynasmFailDescr
     let descr_raw = unsafe { *callee_jf_ptr } as usize;
 
     let result = if descr_raw == 0 || guard::is_done_with_this_frame_descr(descr_raw) {
-        // Case (b): pending target (jf_descr == 0) or somehow a finish descr
-        // leaked here. Fall through to force_fn which re-executes callee
-        // in the interpreter.
-        //
-        // Cranelift parity: call_assembler_fast_path detects null code_ptr,
-        // calls force_fn(callee_frame_ptr) with PENDING_FORCE_LOCAL0.
-        if let Some(force_fn) = CA_FORCE_FN.get() {
-            force_fn(callee_jf_ptr as i64)
-        } else {
-            0
-        }
+        // jf_descr is 0 or a done_descr — shouldn't reach slow path.
+        // Safety fallback: return 0.
+        0
     } else {
-        // Case (a): guard failure. jf_descr points to DynasmFailDescr.
+        // Guard failure: jf_descr points to DynasmFailDescr.
         let descr = unsafe { &*(descr_raw as *const guard::DynasmFailDescr) };
         let trace_id = descr.trace_id;
         let fail_index = descr.fail_index;
@@ -171,41 +163,27 @@ pub extern "C" fn call_assembler_helper_trampoline(callee_jf_ptr: *mut i64) -> i
         // Step 1: Try bridge compilation (compile.py:701-717 must_compile)
         if let Some(bridge_fn) = CA_BRIDGE_FN.get() {
             let _compiled = bridge_fn(
-                0, // green_key (resolved by handler)
+                green_key,
                 trace_id,
                 fail_index,
                 raw_values.as_ptr(),
                 raw_values.len(),
                 descr_addr,
             );
-            // If bridge compiled, it will be used on next guard failure.
-            // For this invocation, fall through to blackhole.
         }
 
         // Step 2: Try blackhole resume (resume.py:1312 parity)
         if let Some(blackhole) = CA_BLACKHOLE_FN.get() {
-            match blackhole(
-                0, // green_key
+            blackhole(
+                green_key,
                 trace_id,
                 fail_index,
                 raw_values.as_ptr(),
                 raw_values.len(),
                 raw_values.as_ptr(),
                 raw_values.len(),
-            ) {
-                Some(val) => val,
-                None => {
-                    // Step 3: Force fallback — re-execute callee in interpreter
-                    if let Some(force_fn) = CA_FORCE_FN.get() {
-                        force_fn(callee_jf_ptr as i64)
-                    } else {
-                        0
-                    }
-                }
-            }
-        } else if let Some(force_fn) = CA_FORCE_FN.get() {
-            // No blackhole, try force directly
-            force_fn(callee_jf_ptr as i64)
+            )
+            .unwrap_or(0)
         } else {
             0
         }

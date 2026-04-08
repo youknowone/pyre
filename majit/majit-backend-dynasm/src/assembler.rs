@@ -2903,179 +2903,179 @@ impl Assembler386 {
             .and_then(|cd| cd.call_target_token())
             .and_then(|token| self.call_assembler_targets.get(&token).copied());
 
-        if let Some(addr) = target_addr {
-            // External target: indirect call via absolute address
-            let addr = addr as i64;
-            #[cfg(target_arch = "x86_64")]
-            dynasm!(self.mc ; .arch x64
-                ; mov rax, QWORD addr
-                ; call rax
-            );
-            #[cfg(target_arch = "aarch64")]
-            {
-                self.emit_mov_imm64(2, addr);
-                dynasm!(self.mc ; .arch aarch64
-                    ; blr x2
-                );
-            }
-        } else if let Some(label) = self.self_entry_label {
-            // Self-recursion: direct call via label
-            #[cfg(target_arch = "x86_64")]
-            dynasm!(self.mc ; .arch x64
-                ; call =>label
-            );
-            #[cfg(target_arch = "aarch64")]
-            dynasm!(self.mc ; .arch aarch64
-                ; bl =>label
-            );
-        } else {
-            // Pending/unresolved target: call the helper trampoline directly.
-            // The helper handles force/blackhole fallback for pending tokens.
-            let helper = crate::call_assembler_helper_addr() as i64;
-            #[cfg(target_arch = "x86_64")]
-            dynasm!(self.mc ; .arch x64
-                ; mov rax, QWORD helper
-                ; call rax
-            );
-            #[cfg(target_arch = "aarch64")]
-            {
-                self.emit_mov_imm64(8, helper);
-                dynasm!(self.mc ; .arch aarch64 ; blr x8);
-            }
-        }
-
-        // rax/x0 = callee's returned jf_ptr (= heap jf_ptr we passed).
-        #[cfg(target_arch = "x86_64")]
-        dynasm!(self.mc ; .arch x64
-            ; add rsp, 8              // undo alignment
-        );
-
-        // Restore caller's jf_ptr.
-        #[cfg(target_arch = "x86_64")]
-        dynasm!(self.mc ; .arch x64
-            ; mov rbp, r12            // restore caller's jf_ptr
-        );
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64
-            ; mov x29, x19            // restore
-        );
-
-        // rax = callee's returned jf_ptr (heap-allocated).
-        // Save it in rdx; we need rax for the result and rdi for free.
-        #[cfg(target_arch = "x86_64")]
-        dynasm!(self.mc ; .arch x64
-            ; mov rdx, rax            // rdx = callee jf_ptr
-        );
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64
-            ; mov x20, x0             // x20 = callee jf_ptr
-        );
+        let is_resolved = target_addr.is_some() || self.self_entry_label.is_some();
 
         // assembler.py:324-336 call_assembler: select done_descr by op.type.
         let result_type = op.opcode.result_type();
         let done_descr_ptr =
             crate::guard::done_with_this_frame_descr_ptr_for_type(result_type) as i64;
+        let helper_addr = crate::call_assembler_helper_addr() as i64;
+        let green_key = self.header_pc as i64;
 
-        // _call_assembler_check_descr (assembler.py:2274-2278):
-        //   CMP [jf_ptr + jf_descr_ofs], done_with_this_frame_descr_{type}
-        #[cfg(target_arch = "x86_64")]
-        {
-            let fast_path = self.mc.new_dynamic_label();
-            let merge = self.mc.new_dynamic_label();
+        if !is_resolved {
+            // Pending/unresolved target: cannot call callee. The heap jf
+            // has args stored but no code to execute. Free it and return 0.
+            // RPython parity: call_assembler_fast_path detects null code_ptr
+            // and calls force_fn. Our force_fn requires a PyFrame, not a
+            // jitframe array, so we return 0 (caller handles via blackhole).
+            #[cfg(target_arch = "x86_64")]
             dynasm!(self.mc ; .arch x64
-                ; mov rcx, [rdx]                    // rcx = jf_descr
-                ; mov rax, QWORD done_descr_ptr
-                ; cmp rcx, rax
-                ; je =>fast_path
-            );
-
-            // Path A (slow): callee didn't finish normally (guard failure).
-            // assembler.py:345-350:
-            //   asm_helper_adr = cpu.cast_adr_to_int(jd.assembler_helper_adr)
-            //   _call_assembler_emit_helper_call(asm_helper_adr, [tmploc, vloc], result_loc)
-            //
-            // Call the assembler helper trampoline. It reads jf_descr from
-            // the callee frame, dispatches to blackhole/bridge/force handler,
-            // frees the callee jitframe, and returns the result.
-            let helper_addr = crate::call_assembler_helper_addr() as i64;
-            dynasm!(self.mc ; .arch x64
-                ; mov rdi, rdx                      // arg0 = callee_jf_ptr
+                ; mov rdi, rdx                      // free(heap_jf)
                 ; sub rsp, 8
-                ; mov rax, QWORD helper_addr
-                ; call rax                          // rax = helper result
+                ; mov rax, QWORD free_ptr
+                ; call rax
                 ; add rsp, 8
-                ; jmp =>merge
+                ; mov rbp, r12                      // restore caller jf_ptr
+                ; xor eax, eax                      // result = 0
             );
-
-            // Path B (fast): _call_assembler_load_result (assembler.py:2291-2303)
-            //   Load result from jf_frame[0], then free the heap jf.
-            dynasm!(self.mc ; .arch x64
-                ; =>fast_path
-            );
-
-            // assembler.py:2295-2303: type-specific result load
-            if result_type == Type::Float {
-                // assembler.py:2296-2298: MOVSD xmm0, [eax + ofs]
-                dynasm!(self.mc ; .arch x64
-                    ; movsd xmm0, [rdx + 8]        // xmm0 = jf_frame[0] (float)
-                    ; movq r12, xmm0               // preserve bits across libc::free
-                    ; mov rdi, rdx                  // free(callee_jf)
-                    ; sub rsp, 8
-                    ; mov rax, QWORD free_ptr
-                    ; call rax
-                    ; add rsp, 8
-                    ; mov rax, r12                  // pack float bits to rax
-                    ; =>merge
-                );
-            } else {
-                // assembler.py:2301-2302: MOV eax, [eax + ofs]
-                dynasm!(self.mc ; .arch x64
-                    ; mov r12, [rdx + 8]            // r12 = jf_frame[0] (result)
-                    ; mov rdi, rdx                  // free(callee_jf)
-                    ; sub rsp, 8
-                    ; mov rax, QWORD free_ptr
-                    ; call rax
-                    ; add rsp, 8
-                    ; mov rax, r12                  // rax = result
-                    ; =>merge
-                );
-            }
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            let fast_path = self.mc.new_dynamic_label();
-            let merge = self.mc.new_dynamic_label();
-            self.emit_mov_imm64(2, done_descr_ptr);
-            dynasm!(self.mc ; .arch aarch64
-                ; ldr x1, [x20]                     // x1 = jf_descr
-                ; cmp x1, x2
-                ; b.eq =>fast_path
-            );
-            // Path A (slow): call assembler helper trampoline
+            #[cfg(target_arch = "aarch64")]
             {
-                let helper_addr = crate::call_assembler_helper_addr() as i64;
-                self.emit_mov_imm64(2, helper_addr);
-                dynasm!(self.mc ; .arch aarch64
-                    ; mov x0, x20                   // arg0 = callee_jf_ptr
-                    ; blr x2                        // x0 = helper result
-                    ; b =>merge
-                );
-            }
-            // Path B (fast): load result, free
-            {
-                dynasm!(self.mc ; .arch aarch64
-                    ; =>fast_path
-                    ; ldr x19, [x20, 8]             // x19 = result
-                );
                 self.emit_mov_imm64(2, free_ptr);
                 dynasm!(self.mc ; .arch aarch64
                     ; mov x0, x20
                     ; blr x2
-                    ; mov x0, x19                   // x0 = result
-                    ; =>merge
+                    ; mov x29, x19                  // restore caller jf_ptr
+                    ; mov x0, 0                     // result = 0
                 );
             }
-        }
+        } else {
+            // Resolved target: call callee and handle fast/slow path.
+            if let Some(addr) = target_addr {
+                let addr = addr as i64;
+                #[cfg(target_arch = "x86_64")]
+                dynasm!(self.mc ; .arch x64
+                    ; mov rax, QWORD addr
+                    ; call rax
+                );
+                #[cfg(target_arch = "aarch64")]
+                {
+                    self.emit_mov_imm64(2, addr);
+                    dynasm!(self.mc ; .arch aarch64 ; blr x2);
+                }
+            } else if let Some(label) = self.self_entry_label {
+                #[cfg(target_arch = "x86_64")]
+                dynasm!(self.mc ; .arch x64 ; call =>label);
+                #[cfg(target_arch = "aarch64")]
+                dynasm!(self.mc ; .arch aarch64 ; bl =>label);
+            }
+
+            // rax/x0 = callee's returned jf_ptr (= heap jf_ptr we passed).
+            #[cfg(target_arch = "x86_64")]
+            dynasm!(self.mc ; .arch x64
+                ; add rsp, 8              // undo alignment
+            );
+
+            // Restore caller's jf_ptr.
+            #[cfg(target_arch = "x86_64")]
+            dynasm!(self.mc ; .arch x64
+                ; mov rbp, r12            // restore caller's jf_ptr
+            );
+            #[cfg(target_arch = "aarch64")]
+            dynasm!(self.mc ; .arch aarch64
+                ; mov x29, x19            // restore
+            );
+
+            // rax = callee's returned jf_ptr (heap-allocated).
+            // Save it in rdx for descr check and free.
+            #[cfg(target_arch = "x86_64")]
+            dynasm!(self.mc ; .arch x64
+                ; mov rdx, rax            // rdx = callee jf_ptr
+            );
+            #[cfg(target_arch = "aarch64")]
+            dynasm!(self.mc ; .arch aarch64
+                ; mov x20, x0             // x20 = callee jf_ptr
+            );
+
+            // _call_assembler_check_descr (assembler.py:2274-2278):
+            //   CMP [jf_ptr + jf_descr_ofs], done_with_this_frame_descr_{type}
+            #[cfg(target_arch = "x86_64")]
+            {
+                let fast_path = self.mc.new_dynamic_label();
+                let merge = self.mc.new_dynamic_label();
+                dynasm!(self.mc ; .arch x64
+                    ; mov rcx, [rdx]                    // rcx = jf_descr
+                    ; mov rax, QWORD done_descr_ptr
+                    ; cmp rcx, rax
+                    ; je =>fast_path
+                );
+
+                // Path A (slow): guard failure.
+                // assembler.py:345-350 _call_assembler_emit_helper_call
+                dynasm!(self.mc ; .arch x64
+                    ; mov rdi, rdx                      // arg0 = callee_jf_ptr
+                    ; mov rsi, QWORD green_key as i64   // arg1 = green_key
+                    ; sub rsp, 8
+                    ; mov rax, QWORD helper_addr
+                    ; call rax                          // rax = helper result
+                    ; add rsp, 8
+                    ; jmp =>merge
+                );
+
+                // Path B (fast): _call_assembler_load_result (assembler.py:2291-2303)
+                dynasm!(self.mc ; .arch x64
+                    ; =>fast_path
+                );
+                if result_type == Type::Float {
+                    dynasm!(self.mc ; .arch x64
+                        ; movsd xmm0, [rdx + 8]        // xmm0 = jf_frame[0] (float)
+                        ; movq r12, xmm0               // preserve bits across free
+                        ; mov rdi, rdx                  // free(callee_jf)
+                        ; sub rsp, 8
+                        ; mov rax, QWORD free_ptr
+                        ; call rax
+                        ; add rsp, 8
+                        ; mov rax, r12                  // float bits in rax
+                        ; =>merge
+                    );
+                } else {
+                    dynasm!(self.mc ; .arch x64
+                        ; mov r12, [rdx + 8]            // r12 = jf_frame[0] (result)
+                        ; mov rdi, rdx                  // free(callee_jf)
+                        ; sub rsp, 8
+                        ; mov rax, QWORD free_ptr
+                        ; call rax
+                        ; add rsp, 8
+                        ; mov rax, r12                  // rax = result
+                        ; =>merge
+                    );
+                }
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                let fast_path = self.mc.new_dynamic_label();
+                let merge = self.mc.new_dynamic_label();
+                self.emit_mov_imm64(2, done_descr_ptr);
+                dynasm!(self.mc ; .arch aarch64
+                    ; ldr x1, [x20]                     // x1 = jf_descr
+                    ; cmp x1, x2
+                    ; b.eq =>fast_path
+                );
+                // Path A (slow)
+                {
+                    self.emit_mov_imm64(2, helper_addr);
+                    self.emit_mov_imm64(1, green_key); // x1 = green_key
+                    dynasm!(self.mc ; .arch aarch64
+                        ; mov x0, x20                   // arg0 = callee_jf_ptr
+                        ; blr x2                        // x0 = helper result
+                        ; b =>merge
+                    );
+                }
+                // Path B (fast)
+                {
+                    dynasm!(self.mc ; .arch aarch64
+                        ; =>fast_path
+                        ; ldr x19, [x20, 8]             // x19 = result
+                    );
+                    self.emit_mov_imm64(2, free_ptr);
+                    dynasm!(self.mc ; .arch aarch64
+                        ; mov x0, x20
+                        ; blr x2
+                        ; mov x0, x19                   // x0 = result
+                        ; =>merge
+                    );
+                }
+            }
+        } // end if is_resolved
 
         // Store result to the output slot.
         if !op.pos.is_none() {
