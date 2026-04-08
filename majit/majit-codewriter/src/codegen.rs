@@ -529,7 +529,7 @@ fn generate_trace_functions(out: &mut String) {
 ///
 /// Auto-generated equivalent of PyPy's int_unbox annotation.
 /// Returns the raw i64 OpRef, with heapcache integration.
-fn trace_getfield_gc_int_pureornot(
+fn getfield_gc_i_pureornot(
     ctx: &mut majit_metainterp::TraceCtx,
     obj: majit_ir::OpRef,
     descr: majit_ir::DescrRef,
@@ -572,7 +572,7 @@ pub fn trace_unbox_int(
         ctx.heap_cache_mut()
             .class_now_known(obj, majit_ir::GcRef(int_type_addr as usize));
     }
-    trace_getfield_gc_int_pureornot(ctx, obj, intval_descr)
+    getfield_gc_i_pureornot(ctx, obj, intval_descr)
 }
 
 /// Box a raw i64 into a Python int object.
@@ -665,7 +665,7 @@ pub fn trace_int_compare(
 /// Unbox a Python float object: emit GuardClass + GetfieldGc(F|PureF).
 ///
 /// Returns the raw f64 OpRef.
-fn trace_getfield_gc_float_pureornot(
+fn getfield_gc_f_pureornot(
     ctx: &mut majit_metainterp::TraceCtx,
     obj: majit_ir::OpRef,
     descr: majit_ir::DescrRef,
@@ -705,7 +705,7 @@ pub fn trace_unbox_float(
         ctx.heap_cache_mut()
             .class_now_known(obj, majit_ir::GcRef(float_type_addr as usize));
     }
-    trace_getfield_gc_float_pureornot(ctx, obj, floatval_descr)
+    getfield_gc_f_pureornot(ctx, obj, floatval_descr)
 }
 
 /// Box a raw f64 into a Python float object: emit New + SetfieldGc.
@@ -854,7 +854,7 @@ pub fn generated_binary_int_value(
                     // intobject.py:229-231: large shift → 0 or -1
                     let result = if lhs < 0 { -1i64 } else { 0i64 };
                     let raw = ctx.const_int(result);
-                    let boxed = crate::state::box_traced_raw_int(ctx, raw);
+                    let boxed = crate::state::wrapint(ctx, raw);
                     frame.remember_value_type(boxed, majit_ir::Type::Ref);
                     return Some(boxed);
                 }
@@ -880,11 +880,11 @@ pub fn generated_binary_int_value(
     // RPython jitcode: int_OP_ovf(a_raw, b_raw) → guard_no_overflow
     let raw_result = ctx.record_op(op_code, &[lhs_raw, rhs_raw]);
     if has_overflow {
-        frame.record_guard(ctx, OpCode::GuardNoOverflow, &[]);
+        frame.generate_guard(ctx, OpCode::GuardNoOverflow, &[]);
     }
 
     // RPython jitcode: wrapint → new_with_vtable + setfield_gc
-    let boxed = crate::state::box_traced_raw_int(ctx, raw_result);
+    let boxed = crate::state::wrapint(ctx, raw_result);
     frame.remember_value_type(boxed, majit_ir::Type::Ref);
     Some(boxed)
 }
@@ -946,7 +946,7 @@ pub fn generated_binary_float_value(
         |frame: &mut crate::state::MIFrame, ctx: &mut majit_metainterp::TraceCtx, obj: majit_ir::OpRef| -> majit_ir::OpRef {
             if !ctx.heap_cache().is_class_known(obj) {
                 let type_const = ctx.const_int(float_type_addr);
-                frame.record_guard(ctx, OpCode::GuardClass, &[obj, type_const]);
+                frame.generate_guard(ctx, OpCode::GuardClass, &[obj, type_const]);
                 ctx.heap_cache_mut()
                     .class_now_known(obj, majit_ir::GcRef(float_type_addr as usize));
             }
@@ -1001,7 +1001,7 @@ pub fn generated_binary_float_value(
             &[majit_ir::Type::Float, majit_ir::Type::Float],
         );
         // pyjitpl.py:3395 GUARD_NO_EXCEPTION from handle_possible_exception.
-        frame.record_guard(ctx, OpCode::GuardNoException, &[]);
+        frame.generate_guard(ctx, OpCode::GuardNoException, &[]);
         call_result
     } else {
         ctx.record_op(op_code.unwrap(), &[lhs_raw, rhs_raw])
@@ -1009,7 +1009,7 @@ pub fn generated_binary_float_value(
     frame.remember_value_type(result, majit_ir::Type::Float);
 
     // RPython: wrapfloat → new_with_vtable + setfield_gc
-    let boxed = crate::state::box_traced_raw_float(ctx, result);
+    let boxed = crate::state::wrapfloat(ctx, result);
     frame.remember_value_type(boxed, majit_ir::Type::Ref);
     Some(boxed)
 }
@@ -1167,7 +1167,7 @@ pub fn generated_unary_int_value(
     if matches!(opcode, OpCode::IntNeg) {
         let min_val = ctx.const_int(i64::MIN);
         let is_min = ctx.record_op(OpCode::IntEq, &[payload, min_val]);
-        frame.record_guard(ctx, OpCode::GuardFalse, &[is_min]);
+        frame.generate_guard(ctx, OpCode::GuardFalse, &[is_min]);
     }
     let result = ctx.record_op(opcode, &[payload]);
     frame.remember_value_type(result, majit_ir::Type::Int);
@@ -1196,7 +1196,7 @@ pub fn generated_list_setitem_by_strategy(
     concrete_key: i64,
     strategy_id: i64,
 ) {
-    frame.guard_object_class(ctx, obj, &pyre_object::pyobject::LIST_TYPE as *const _ as *const pyre_object::PyType);
+    frame.guard_class(ctx, obj, &pyre_object::pyobject::LIST_TYPE as *const _ as *const pyre_object::PyType);
     frame.guard_list_strategy(ctx, obj, strategy_id);
     let (len_descr, ptr_descr) = match strategy_id {
         0 => (crate::descr::list_items_len_descr(), crate::descr::list_items_ptr_descr()),
@@ -1206,7 +1206,7 @@ pub fn generated_list_setitem_by_strategy(
     };
     let len = crate::state::trace_arraylen_gc(ctx, obj, len_descr);
     let index = frame.trace_dynamic_list_index(ctx, key, len, concrete_key);
-    let items_ptr = crate::state::trace_gc_object_int_field(ctx, obj, ptr_descr);
+    let items_ptr = crate::state::opimpl_getfield_gc_i(ctx, obj, ptr_descr);
     match strategy_id {
         0 => crate::state::trace_raw_array_setitem_value(ctx, items_ptr, index, value),
         1 => {
@@ -1313,7 +1313,7 @@ pub fn generated_truth_value_direct(
         }
         // noneobject.py: None is always false
         if pyre_object::is_none(concrete_val) {
-            frame.guard_object_class(ctx, value, &pyre_object::pyobject::NONE_TYPE as *const _ as *const pyre_object::PyType);
+            frame.guard_class(ctx, value, &pyre_object::pyobject::NONE_TYPE as *const _ as *const pyre_object::PyType);
             return Some(ctx.const_int(0));
         }
         // floatobject.py: float_is_true → guard_class + getfield(floatval) → float_ne(0.0)
@@ -1328,14 +1328,14 @@ pub fn generated_truth_value_direct(
         }
         // strobject.py: str truth → guard_class + getfield_raw(len) → int_ne(0)
         if pyre_object::is_str(concrete_val) {
-            frame.guard_object_class(ctx, value, &pyre_object::STR_TYPE as *const _ as *const pyre_object::PyType);
+            frame.guard_class(ctx, value, &pyre_object::STR_TYPE as *const _ as *const pyre_object::PyType);
             let len = ctx.record_op_with_descr(OpCode::GetfieldRawI, &[value], crate::descr::str_len_descr());
             let zero = ctx.const_int(0);
             return Some(ctx.record_op(OpCode::IntNe, &[len, zero]));
         }
         // dictobject.py: dict truth → guard_class + getfield_raw(len) → int_ne(0)
         if pyre_object::is_dict(concrete_val) {
-            frame.guard_object_class(ctx, value, &pyre_object::pyobject::DICT_TYPE as *const _ as *const pyre_object::PyType);
+            frame.guard_class(ctx, value, &pyre_object::pyobject::DICT_TYPE as *const _ as *const pyre_object::PyType);
             let len = ctx.record_op_with_descr(OpCode::GetfieldRawI, &[value], crate::descr::dict_len_descr());
             let zero = ctx.const_int(0);
             return Some(ctx.record_op(OpCode::IntNe, &[len, zero]));
@@ -1343,7 +1343,7 @@ pub fn generated_truth_value_direct(
         // listobject.py:423 W_ListObject.length() → strategy.length()
         // All list strategies determine truth by length, same as len() fast path.
         if pyre_object::is_list(concrete_val) {
-            frame.guard_object_class(ctx, value, &pyre_object::pyobject::LIST_TYPE as *const _ as *const pyre_object::PyType);
+            frame.guard_class(ctx, value, &pyre_object::pyobject::LIST_TYPE as *const _ as *const pyre_object::PyType);
             let len_descr = if pyre_object::w_list_uses_object_storage(concrete_val) {
                 frame.guard_list_strategy(ctx, value, 0);
                 crate::descr::list_items_len_descr()
@@ -1362,7 +1362,7 @@ pub fn generated_truth_value_direct(
         }
         // tupleobject.py: tuple truth → guard_class + getfield_raw(items_len) → int_ne(0)
         if pyre_object::is_tuple(concrete_val) {
-            frame.guard_object_class(ctx, value, &pyre_object::pyobject::TUPLE_TYPE as *const _ as *const pyre_object::PyType);
+            frame.guard_class(ctx, value, &pyre_object::pyobject::TUPLE_TYPE as *const _ as *const pyre_object::PyType);
             let len = ctx.record_op_with_descr(OpCode::GetfieldRawI, &[value], crate::descr::tuple_items_len_descr());
             let zero = ctx.const_int(0);
             return Some(ctx.record_op(OpCode::IntNe, &[len, zero]));
@@ -1392,7 +1392,7 @@ pub fn generated_list_append_by_strategy(
 ) {
     use majit_ir::OpCode;
 
-    frame.guard_object_class(ctx, list, &pyre_object::pyobject::LIST_TYPE as *const _ as *const pyre_object::PyType);
+    frame.guard_class(ctx, list, &pyre_object::pyobject::LIST_TYPE as *const _ as *const pyre_object::PyType);
     frame.guard_list_strategy(ctx, list, strategy_id);
 
     let (len_descr, ptr_descr, heap_cap_descr) = match strategy_id {
@@ -1405,13 +1405,13 @@ pub fn generated_list_append_by_strategy(
     // Capacity guard: inline storage → guard heap_cap==0, else guard len==concrete_len.
     if is_inline {
         let heap_cap = ctx.record_op_with_descr(OpCode::GetfieldGcI, &[list], heap_cap_descr);
-        frame.guard_value(ctx, heap_cap, 0);
+        frame.implement_guard_value(ctx, heap_cap, 0);
     } else {
         let len = crate::state::trace_arraylen_gc(ctx, list, len_descr.clone());
-        frame.guard_value(ctx, len, concrete_len as i64);
+        frame.implement_guard_value(ctx, len, concrete_len as i64);
     }
 
-    let items_ptr = crate::state::trace_gc_object_int_field(ctx, list, ptr_descr);
+    let items_ptr = crate::state::opimpl_getfield_gc_i(ctx, list, ptr_descr);
     let index = ctx.const_int(concrete_len as i64);
 
     // Write value: object strategy stores directly, int/float unbox first.
@@ -1462,19 +1462,19 @@ pub fn generated_direct_len_value(
 
     unsafe {
         if pyre_object::is_str(concrete_value) {
-            frame.guard_object_class(ctx, value, &pyre_object::STR_TYPE as *const _ as *const pyre_object::PyType);
+            frame.guard_class(ctx, value, &pyre_object::STR_TYPE as *const _ as *const pyre_object::PyType);
             let len = crate::state::trace_arraylen_gc(ctx, value, crate::descr::str_len_descr());
             frame.remember_value_type(len, majit_ir::Type::Int);
             return Some(len);
         }
         if pyre_object::is_dict(concrete_value) {
-            frame.guard_object_class(ctx, value, &pyre_object::pyobject::DICT_TYPE as *const _ as *const pyre_object::PyType);
+            frame.guard_class(ctx, value, &pyre_object::pyobject::DICT_TYPE as *const _ as *const pyre_object::PyType);
             let len = crate::state::trace_arraylen_gc(ctx, value, crate::descr::dict_len_descr());
             frame.remember_value_type(len, majit_ir::Type::Int);
             return Some(len);
         }
         if pyre_object::is_list(concrete_value) {
-            frame.guard_object_class(ctx, value, &pyre_object::pyobject::LIST_TYPE as *const _ as *const pyre_object::PyType);
+            frame.guard_class(ctx, value, &pyre_object::pyobject::LIST_TYPE as *const _ as *const pyre_object::PyType);
             let len_descr = if pyre_object::w_list_uses_object_storage(concrete_value) {
                 frame.guard_list_strategy(ctx, value, 0);
                 crate::descr::list_items_len_descr()
@@ -1492,7 +1492,7 @@ pub fn generated_direct_len_value(
             return Some(len);
         }
         if pyre_object::is_tuple(concrete_value) {
-            frame.guard_object_class(ctx, value, &pyre_object::pyobject::TUPLE_TYPE as *const _ as *const pyre_object::PyType);
+            frame.guard_class(ctx, value, &pyre_object::pyobject::TUPLE_TYPE as *const _ as *const pyre_object::PyType);
             let len = crate::state::trace_arraylen_gc(ctx, value, crate::descr::tuple_items_len_descr());
             frame.remember_value_type(len, majit_ir::Type::Int);
             return Some(len);
@@ -1527,13 +1527,13 @@ pub fn generated_direct_abs_value(
             let int_value = frame.trace_guarded_int_payload(ctx, value);
             let min_value = ctx.const_int(i64::MIN);
             let is_min = ctx.record_op(OpCode::IntEq, &[int_value, min_value]);
-            frame.record_guard(ctx, OpCode::GuardFalse, &[is_min]);
+            frame.generate_guard(ctx, OpCode::GuardFalse, &[is_min]);
             // branchless abs: (x ^ sign) - sign
             let shift = ctx.const_int((i64::BITS - 1) as i64);
             let sign = ctx.record_op(OpCode::IntRshift, &[int_value, shift]);
             let xor = ctx.record_op(OpCode::IntXor, &[int_value, sign]);
             let abs_value = ctx.record_op(OpCode::IntSub, &[xor, sign]);
-            return Some(crate::state::box_traced_raw_int(ctx, abs_value));
+            return Some(crate::state::wrapint(ctx, abs_value));
         }
     }
 
@@ -1542,9 +1542,22 @@ pub fn generated_direct_abs_value(
 
 /// Trace type() for known object: guard_class → const_ptr(type_object).
 ///
-/// RPython jitcode parity: guard_class(obj, known_cls) then return the
-/// type object as a constant reference.  The interpreter's builtin_type
-/// returns real type objects (via typedef::type), NOT tp_name strings.
+/// RPython parity: pypy/objspace/std/objspace.py:400
+///   def type(self, w_obj):
+///       jit.promote(w_obj.__class__)
+///       return w_obj.getclass(self)
+///
+/// RPython uses jit.promote (→ GUARD_VALUE) on w_obj.__class__,
+/// which is the RPython-level class pointer (unique per Python class).
+///
+/// pyre's ob_type is NOT unique per Python class (INSTANCE_TYPE is
+/// shared by all user instances, TYPE_TYPE by all type objects).
+/// To achieve equivalent safety:
+///   - builtin types (int, float, str, ...): guard_class(obj, ob_type)
+///     is sufficient because ob_type IS unique for builtins.
+///   - user instances: guard_class(INSTANCE_TYPE) + read w_type field
+///     + implement_guard_value on the w_type pointer → fixes the real class.
+///   - type objects: implement_guard_value(obj) → fixes identity directly.
 ///
 /// Returns None if not handled → caller falls back to residual call.
 #[inline]
@@ -1558,22 +1571,64 @@ pub fn generated_direct_type_value(
         return None;
     }
 
-    // Compute the concrete type object the same way the interpreter does.
     let concrete_type_obj = pyre_interpreter::typedef::r#type(concrete_value)?;
 
     unsafe {
+        if pyre_object::is_instance(concrete_value) {
+            // User instance: ob_type is shared INSTANCE_TYPE.
+            // Read the real class from W_InstanceObject.w_type field,
+            // then promote it to a constant (RPython: jit.promote(__class__)).
+            frame.guard_class(
+                ctx,
+                value,
+                &pyre_object::pyobject::INSTANCE_TYPE as *const _ as *const pyre_object::PyType,
+            );
+            // getfield_gc_r(obj, w_type_offset) → read .w_type
+            let w_type_descr = crate::descr::instance_w_type_descr();
+            let w_type_opref = ctx.record_op_with_descr(
+                majit_ir::OpCode::GetfieldGcR,
+                &[value],
+                w_type_descr,
+            );
+            // jit.promote(w_obj.__class__) → GUARD_VALUE
+            frame.implement_guard_value(ctx, w_type_opref, concrete_type_obj as i64);
+            return Some(ctx.const_ref(concrete_type_obj as i64));
+        }
+
+        if pyre_object::typeobject::is_type(concrete_value) {
+            // Type object: ob_type is shared TYPE_TYPE.
+            // Different type objects (with different metaclasses) share TYPE_TYPE.
+            // Promote the type object itself to fix its identity.
+            frame.implement_guard_value(ctx, value, concrete_value as i64);
+            return Some(ctx.const_ref(concrete_type_obj as i64));
+        }
+
+        // Builtin types (int, float, str, list, ...): ob_type IS normally unique.
+        // BUT: __class__ override via ATTR_TABLE (e.g. int subclass) means
+        // different objects with the same ob_type can have different types.
+        // Check if typedef::type() returned something different from
+        // the static type registry for this ob_type.
         let concrete_obj_type = (*concrete_value).ob_type;
-        frame.guard_object_class(ctx, value, concrete_obj_type);
+        let default_type = pyre_interpreter::typedef::gettypefor(concrete_obj_type);
+        if default_type.map_or(true, |dt| !std::ptr::eq(dt, concrete_type_obj)) {
+            // __class__ override: guard_class is not enough.
+            // Promote object identity like we do for instances/types.
+            frame.implement_guard_value(ctx, value, concrete_value as i64);
+        } else {
+            frame.guard_class(ctx, value, concrete_obj_type);
+        }
         Some(ctx.const_ref(concrete_type_obj as i64))
     }
 }
 
-/// Trace isinstance(obj, cls): guard_class(obj) + guard_value(cls) → const bool.
+/// Trace isinstance(obj, cls): guard obj class + implement_guard_value(cls) → const bool.
 ///
-/// RPython jitcode parity: guard_class fixes the obj type, guard_value fixes
-/// the cls argument.  With both guarded, the result is a compile-time constant
-/// computed from the concrete isinstance check (MRO-based, same as the
-/// interpreter's builtin_isinstance).
+/// RPython parity: isinstance uses space.type(w_obj) internally, which
+/// calls jit.promote(w_obj.__class__). Same guard strategy as type():
+///   - builtin: guard_class (ob_type is unique)
+///   - instance: guard_class(INSTANCE_TYPE) + getfield(w_type) + guard_value
+///   - type object: guard_value(obj identity)
+/// cls is always promoted via implement_guard_value.
 ///
 /// Returns None if not handled → caller falls back to residual call.
 #[inline]
@@ -1589,15 +1644,43 @@ pub fn generated_direct_isinstance_value(
         return None;
     }
 
-    // Compute concrete result the same way the interpreter does.
-    // This calls builtin_isinstance which uses MRO-based issubtype_w,
-    // NOT string name comparison.
     let concrete_result = pyre_interpreter::builtins::call_isinstance(concrete_obj, concrete_cls)?;
 
     unsafe {
-        let concrete_obj_type = (*concrete_obj).ob_type;
-        frame.guard_object_class(ctx, obj, concrete_obj_type);
-        frame.guard_value(ctx, cls, concrete_cls as i64);
+        if pyre_object::is_instance(concrete_obj) {
+            // User instance: promote real class via w_type field.
+            frame.guard_class(
+                ctx,
+                obj,
+                &pyre_object::pyobject::INSTANCE_TYPE as *const _ as *const pyre_object::PyType,
+            );
+            let w_type_descr = crate::descr::instance_w_type_descr();
+            let w_type_opref = ctx.record_op_with_descr(
+                majit_ir::OpCode::GetfieldGcR,
+                &[obj],
+                w_type_descr,
+            );
+            let concrete_type = pyre_object::w_instance_get_type(concrete_obj);
+            frame.implement_guard_value(ctx, w_type_opref, concrete_type as i64);
+        } else if pyre_object::typeobject::is_type(concrete_obj) {
+            // Type object: promote identity directly.
+            frame.implement_guard_value(ctx, obj, concrete_obj as i64);
+        } else {
+            // Builtin: check for __class__ override (int subclass etc.)
+            let concrete_obj_type = (*concrete_obj).ob_type;
+            let default_type = pyre_interpreter::typedef::gettypefor(concrete_obj_type);
+            let actual_type = pyre_interpreter::typedef::r#type(concrete_obj);
+            let has_class_override = actual_type.map_or(false, |at| {
+                default_type.map_or(true, |dt| !std::ptr::eq(dt, at))
+            });
+            if has_class_override {
+                frame.implement_guard_value(ctx, obj, concrete_obj as i64);
+            } else {
+                frame.guard_class(ctx, obj, concrete_obj_type);
+            }
+        }
+
+        frame.implement_guard_value(ctx, cls, concrete_cls as i64);
         Some(ctx.const_ref(pyre_object::w_bool_from(concrete_result) as i64))
     }
 }
@@ -1650,7 +1733,7 @@ pub fn generated_direct_minmax_value(
             } else {
                 ctx.record_op(OpCode::IntXor, &[rhs, select_bits])
             };
-            return Some(crate::state::box_traced_raw_int(ctx, selected));
+            return Some(crate::state::wrapint(ctx, selected));
         }
     }
 
@@ -1677,7 +1760,7 @@ pub fn generated_tuple_getitem(
     let items_ptr_descr = crate::descr::tuple_items_ptr_descr();
     let items_len_descr = crate::descr::tuple_items_len_descr();
 
-    frame.guard_object_class(ctx, obj, expected_type);
+    frame.guard_class(ctx, obj, expected_type);
     frame.guard_int_like_value(ctx, key, concrete_key);
     let len = crate::state::trace_arraylen_gc(ctx, obj, items_len_descr);
 
@@ -1690,14 +1773,14 @@ pub fn generated_tuple_getitem(
         ctx.const_int(normalized as i64)
     };
 
-    let items_ptr = crate::state::trace_gc_object_int_field(ctx, obj, items_ptr_descr);
+    let items_ptr = crate::state::opimpl_getfield_gc_i(ctx, obj, items_ptr_descr);
     crate::state::trace_raw_array_getitem_value(ctx, items_ptr, index)
 }
 
 /// Trace list/tuple index normalization: unbox key → bounds check guards.
 ///
 /// RPython pyjitpl.py:841 opimpl_check_resizable_neg_index:
-///   INT_LT(index, 0) → guard_value → if negative: getfield(length) + INT_ADD.
+///   INT_LT(index, 0) → implement_guard_value → if negative: getfield(length) + INT_ADD.
 ///
 /// Returns the final index OpRef (positive, bounds-checked).
 #[inline]
@@ -1719,17 +1802,17 @@ pub fn generated_dynamic_list_index(
     let zero = ctx.const_int(0);
     if concrete_key >= 0 {
         let nonnegative = ctx.record_op(OpCode::IntGe, &[raw_index, zero]);
-        frame.record_guard(ctx, OpCode::GuardTrue, &[nonnegative]);
+        frame.generate_guard(ctx, OpCode::GuardTrue, &[nonnegative]);
         let in_bounds = ctx.record_op(OpCode::IntLt, &[raw_index, len]);
-        frame.record_guard(ctx, OpCode::GuardTrue, &[in_bounds]);
+        frame.generate_guard(ctx, OpCode::GuardTrue, &[in_bounds]);
         raw_index
     } else {
         let negative = ctx.record_op(OpCode::IntLt, &[raw_index, zero]);
-        frame.record_guard(ctx, OpCode::GuardTrue, &[negative]);
+        frame.generate_guard(ctx, OpCode::GuardTrue, &[negative]);
         let normalized = ctx.record_op(OpCode::IntAddOvf, &[len, raw_index]);
-        frame.record_guard(ctx, OpCode::GuardNoOverflow, &[]);
+        frame.generate_guard(ctx, OpCode::GuardNoOverflow, &[]);
         let in_bounds = ctx.record_op(OpCode::IntGe, &[normalized, zero]);
-        frame.record_guard(ctx, OpCode::GuardTrue, &[in_bounds]);
+        frame.generate_guard(ctx, OpCode::GuardTrue, &[in_bounds]);
         normalized
     }
 }
@@ -1763,17 +1846,17 @@ pub fn generated_iter_next_value(
 
     frame.guard_range_iter(ctx, iter);
 
-    let current = crate::state::trace_gc_object_int_field(ctx, iter, crate::descr::range_iter_current_descr());
-    let stop = crate::state::trace_gc_object_int_field(ctx, iter, crate::descr::range_iter_stop_descr());
-    let step = crate::state::trace_gc_object_int_field(ctx, iter, crate::descr::range_iter_step_descr());
+    let current = crate::state::opimpl_getfield_gc_i(ctx, iter, crate::descr::range_iter_current_descr());
+    let stop = crate::state::opimpl_getfield_gc_i(ctx, iter, crate::descr::range_iter_stop_descr());
+    let step = crate::state::opimpl_getfield_gc_i(ctx, iter, crate::descr::range_iter_step_descr());
     let zero = ctx.const_int(0);
 
     // pyjitpl.py:1877 opimpl_goto_if_not: boolean guards.
     let step_positive = ctx.record_op(OpCode::IntGt, &[step, zero]);
     if concrete_step_positive {
-        frame.record_guard(ctx, OpCode::GuardTrue, &[step_positive]);
+        frame.generate_guard(ctx, OpCode::GuardTrue, &[step_positive]);
     } else {
-        frame.record_guard(ctx, OpCode::GuardFalse, &[step_positive]);
+        frame.generate_guard(ctx, OpCode::GuardFalse, &[step_positive]);
     }
 
     let continues = if concrete_step_positive {
@@ -1782,9 +1865,9 @@ pub fn generated_iter_next_value(
         ctx.record_op(OpCode::IntGt, &[current, stop])
     };
     if concrete_continues {
-        frame.record_guard(ctx, OpCode::GuardTrue, &[continues]);
+        frame.generate_guard(ctx, OpCode::GuardTrue, &[continues]);
     } else {
-        frame.record_guard(ctx, OpCode::GuardFalse, &[continues]);
+        frame.generate_guard(ctx, OpCode::GuardFalse, &[continues]);
     }
 
     if !concrete_continues {
@@ -1793,7 +1876,7 @@ pub fn generated_iter_next_value(
     }
 
     let next_current = ctx.record_op(OpCode::IntAddOvf, &[current, step]);
-    frame.record_guard(ctx, OpCode::GuardNoOverflow, &[]);
+    frame.generate_guard(ctx, OpCode::GuardNoOverflow, &[]);
     let ri_descr = crate::descr::range_iter_current_descr();
     let ri_descr_idx = ri_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[iter, next_current], ri_descr);
