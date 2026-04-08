@@ -784,7 +784,7 @@ impl OptIntBounds {
 
         // After emitting, propagate bounds backward from the guard
         // The condition is known to be true (nonzero) after this guard
-        self.propagate_bounds_from_guard_true(cond_ref, ctx);
+        self.postprocess_guard_true(cond_ref, ctx);
         OptimizationResult::PassOn
     }
 
@@ -802,7 +802,7 @@ impl OptIntBounds {
             return OptimizationResult::Remove;
         }
 
-        self.propagate_bounds_from_guard_false(cond_ref, ctx);
+        self.postprocess_guard_false(cond_ref, ctx);
         OptimizationResult::PassOn
     }
 
@@ -827,160 +827,20 @@ impl OptIntBounds {
             .cloned()
     }
 
-    /// Propagate bounds backward after GUARD_TRUE.
-    /// The condition (cond_ref) is known to produce a nonzero value (true).
-    fn propagate_bounds_from_guard_true(&mut self, cond_ref: OpRef, ctx: &OptContext) {
-        if let Some(producing_op) = self.find_producing_op(cond_ref, ctx) {
-            if producing_op.opcode.returns_bool() {
-                self.setintbound(cond_ref, IntBound::from_constant(1));
-                self.propagate_bounds_from_comparison(&producing_op, true, ctx);
-                return;
-            }
-        }
+    // ── Guard backward propagation — intbounds.py:52-58 parity ──
 
-        let b0 = self.getintbound(cond_ref, ctx);
-        if b0.known_nonnegative() {
-            let _ = self.get_bound_mut(cond_ref).make_gt_const(0);
-        } else if b0.known_le_const(0) {
-            let _ = self.get_bound_mut(cond_ref).make_lt_const(0);
-        }
+    /// intbounds.py:52-54 _postprocess_guard_true_false_value parity.
+    /// optimizer.py:518 optimize_GUARD_TRUE: make_constant(box, CONST_1).
+    /// Then propagate_bounds_backward dispatches to propagate_bounds_* methods.
+    fn postprocess_guard_true(&mut self, cond_ref: OpRef, ctx: &OptContext) {
+        self.setintbound(cond_ref, IntBound::from_constant(1));
+        self.propagate_bounds_backward(cond_ref, ctx);
     }
 
-    /// Propagate bounds backward after GUARD_FALSE.
-    /// The condition is known to produce 0 (false).
-    fn propagate_bounds_from_guard_false(&mut self, cond_ref: OpRef, ctx: &OptContext) {
+    /// optimizer.py:530 optimize_GUARD_FALSE: make_constant(box, CONST_0).
+    fn postprocess_guard_false(&mut self, cond_ref: OpRef, ctx: &OptContext) {
         self.setintbound(cond_ref, IntBound::from_constant(0));
-
-        if let Some(producing_op) = self.find_producing_op(cond_ref, ctx) {
-            if producing_op.opcode.returns_bool() {
-                self.propagate_bounds_from_comparison(&producing_op, false, ctx);
-            }
-        }
-    }
-
-    /// Given that a comparison op produced `is_true`, narrow the bounds of its arguments.
-    fn propagate_bounds_from_comparison(&mut self, op: &Op, is_true: bool, ctx: &OptContext) {
-        // RPython intbounds.py parity: resolve through get_box_replacement
-        // so bounds are stored on the canonical OpRef. Without this, SameAs
-        // forwarding (e.g. OpRef(44) → OpRef(39)) causes bounds to be set
-        // on the stale OpRef while subsequent lookups resolve to the
-        // canonical one, losing the bound information.
-        let arg0 = ctx.get_box_replacement(op.arg(0));
-
-        // Handle unary ops
-        match op.opcode {
-            OpCode::IntIsTrue => {
-                if is_true {
-                    // nonzero
-                    let b0 = self.getintbound(arg0, ctx);
-                    if b0.known_nonnegative() {
-                        let _ = self.get_bound_mut(arg0).make_gt_const(0);
-                    } else if b0.known_le_const(0) {
-                        let _ = self.get_bound_mut(arg0).make_lt_const(0);
-                    }
-                } else {
-                    // zero
-                    let _ = self.get_bound_mut(arg0).make_eq_const(0);
-                }
-                return;
-            }
-            OpCode::IntIsZero => {
-                if is_true {
-                    // the value is zero
-                    let _ = self.get_bound_mut(arg0).make_eq_const(0);
-                } else {
-                    // the value is nonzero
-                    let b0 = self.getintbound(arg0, ctx);
-                    if b0.known_nonnegative() {
-                        let _ = self.get_bound_mut(arg0).make_gt_const(0);
-                    } else if b0.known_le_const(0) {
-                        let _ = self.get_bound_mut(arg0).make_lt_const(0);
-                    }
-                }
-                return;
-            }
-            _ => {}
-        }
-
-        let arg1 = if op.num_args() > 1 {
-            ctx.get_box_replacement(op.arg(1))
-        } else {
-            return;
-        };
-
-        match op.opcode {
-            OpCode::IntLt => {
-                if is_true {
-                    self.make_int_lt(arg0, arg1, ctx);
-                } else {
-                    self.make_int_ge(arg0, arg1, ctx);
-                }
-            }
-            OpCode::IntLe => {
-                if is_true {
-                    self.make_int_le(arg0, arg1, ctx);
-                } else {
-                    self.make_int_gt(arg0, arg1, ctx);
-                }
-            }
-            OpCode::IntGt => {
-                if is_true {
-                    self.make_int_gt(arg0, arg1, ctx);
-                } else {
-                    self.make_int_le(arg0, arg1, ctx);
-                }
-            }
-            OpCode::IntGe => {
-                if is_true {
-                    self.make_int_ge(arg0, arg1, ctx);
-                } else {
-                    self.make_int_lt(arg0, arg1, ctx);
-                }
-            }
-            OpCode::IntEq => {
-                if is_true {
-                    self.make_eq(arg0, arg1, ctx);
-                } else {
-                    self.make_ne(arg0, arg1, ctx);
-                }
-            }
-            OpCode::IntNe => {
-                if is_true {
-                    self.make_ne(arg0, arg1, ctx);
-                } else {
-                    self.make_eq(arg0, arg1, ctx);
-                }
-            }
-            OpCode::UintLt => {
-                if is_true {
-                    self.make_unsigned_lt(arg0, arg1, ctx);
-                } else {
-                    self.make_unsigned_ge(arg0, arg1, ctx);
-                }
-            }
-            OpCode::UintLe => {
-                if is_true {
-                    self.make_unsigned_le(arg0, arg1, ctx);
-                } else {
-                    self.make_unsigned_gt(arg0, arg1, ctx);
-                }
-            }
-            OpCode::UintGt => {
-                if is_true {
-                    self.make_unsigned_gt(arg0, arg1, ctx);
-                } else {
-                    self.make_unsigned_le(arg0, arg1, ctx);
-                }
-            }
-            OpCode::UintGe => {
-                if is_true {
-                    self.make_unsigned_ge(arg0, arg1, ctx);
-                } else {
-                    self.make_unsigned_lt(arg0, arg1, ctx);
-                }
-            }
-            _ => {}
-        }
+        self.propagate_bounds_backward(cond_ref, ctx);
     }
 
     // ── Bound narrowing helpers ──
@@ -1062,22 +922,18 @@ impl OptIntBounds {
         }
     }
 
-    // ── Backward propagation after constant discovery ──
+    // ── intbounds.py:40-50 propagate_bounds_backward ──
 
-    #[allow(dead_code)]
+    /// intbounds.py:40-50 propagate_bounds_backward.
+    /// optimizer.py:366 as_operation(box) + intbounds.py:810 dispatch_bounds_ops.
     fn propagate_bounds_backward(&mut self, opref: OpRef, ctx: &OptContext) {
-        let b = self.getintbound(opref, ctx);
-        if b.is_constant() {
-            // Already a constant - nothing more to propagate
-            return;
-        }
-        // Look at the producing operation for backward propagation
+        // intbounds.py:48-50: as_operation(box) → dispatch_bounds_ops
         if let Some(producing_op) = self.find_producing_op(opref, ctx) {
             self.propagate_bounds_backward_op(&producing_op, ctx);
         }
     }
 
-    #[allow(dead_code)]
+    /// intbounds.py:810 dispatch_bounds_ops — dispatches to propagate_bounds_* methods.
     fn propagate_bounds_backward_op(&mut self, op: &Op, ctx: &OptContext) {
         match op.opcode {
             OpCode::IntAdd | OpCode::IntAddOvf => {
@@ -1185,28 +1041,160 @@ impl OptIntBounds {
                 let bounds = bres.neg_bound();
                 let _ = self.get_bound_mut(op.arg(0)).intersect(&bounds);
             }
-            // intbounds.py: propagate_bounds_INT_EQ
-            // If result is known 1 (true): arg0 == arg1 → intersect bounds
-            // If result is known 0 (false): no bounds propagation for !=
-            OpCode::IntEq => {
+            // intbounds.py:608-656 propagate_bounds_INT_LT/GT/LE/GE/EQ/NE
+            OpCode::IntLt => {
                 let r = self.getintbound(op.pos, ctx);
-                if r.is_constant() && r.lower == 1 {
-                    // make_eq: intersect arg0 with arg1's bounds and vice versa
-                    let b0 = self.getintbound(op.arg(0), ctx);
-                    let b1 = self.getintbound(op.arg(1), ctx);
-                    let _ = self.get_bound_mut(op.arg(0)).intersect(&b1);
-                    let _ = self.get_bound_mut(op.arg(1)).intersect(&b0);
+                if r.is_constant() {
+                    let arg0 = ctx.get_box_replacement(op.arg(0));
+                    let arg1 = ctx.get_box_replacement(op.arg(1));
+                    if r.get_constant() == 1 {
+                        self.make_int_lt(arg0, arg1, ctx);
+                    } else {
+                        self.make_int_ge(arg0, arg1, ctx);
+                    }
                 }
             }
-            // intbounds.py: propagate_bounds_INT_NE
-            // If result is known 0 (false): arg0 == arg1 → intersect bounds
+            OpCode::IntGt => {
+                let r = self.getintbound(op.pos, ctx);
+                if r.is_constant() {
+                    let arg0 = ctx.get_box_replacement(op.arg(0));
+                    let arg1 = ctx.get_box_replacement(op.arg(1));
+                    if r.get_constant() == 1 {
+                        self.make_int_gt(arg0, arg1, ctx);
+                    } else {
+                        self.make_int_le(arg0, arg1, ctx);
+                    }
+                }
+            }
+            OpCode::IntLe => {
+                let r = self.getintbound(op.pos, ctx);
+                if r.is_constant() {
+                    let arg0 = ctx.get_box_replacement(op.arg(0));
+                    let arg1 = ctx.get_box_replacement(op.arg(1));
+                    if r.get_constant() == 1 {
+                        self.make_int_le(arg0, arg1, ctx);
+                    } else {
+                        self.make_int_gt(arg0, arg1, ctx);
+                    }
+                }
+            }
+            OpCode::IntGe => {
+                let r = self.getintbound(op.pos, ctx);
+                if r.is_constant() {
+                    let arg0 = ctx.get_box_replacement(op.arg(0));
+                    let arg1 = ctx.get_box_replacement(op.arg(1));
+                    if r.get_constant() == 1 {
+                        self.make_int_ge(arg0, arg1, ctx);
+                    } else {
+                        self.make_int_lt(arg0, arg1, ctx);
+                    }
+                }
+            }
+            // intbounds.py:644-656 propagate_bounds_INT_EQ/NE
+            OpCode::IntEq => {
+                let r = self.getintbound(op.pos, ctx);
+                let arg0 = ctx.get_box_replacement(op.arg(0));
+                let arg1 = ctx.get_box_replacement(op.arg(1));
+                if r.known_eq_const(1) {
+                    self.make_eq(arg0, arg1, ctx);
+                } else if r.known_eq_const(0) {
+                    self.make_ne(arg0, arg1, ctx);
+                }
+            }
             OpCode::IntNe => {
                 let r = self.getintbound(op.pos, ctx);
-                if r.is_constant() && r.lower == 0 {
-                    let b0 = self.getintbound(op.arg(0), ctx);
-                    let b1 = self.getintbound(op.arg(1), ctx);
-                    let _ = self.get_bound_mut(op.arg(0)).intersect(&b1);
-                    let _ = self.get_bound_mut(op.arg(1)).intersect(&b0);
+                let arg0 = ctx.get_box_replacement(op.arg(0));
+                let arg1 = ctx.get_box_replacement(op.arg(1));
+                if r.known_eq_const(0) {
+                    self.make_eq(arg0, arg1, ctx);
+                } else if r.known_eq_const(1) {
+                    self.make_ne(arg0, arg1, ctx);
+                }
+            }
+            // intbounds.py:695-699 propagate_bounds_INT_IS_TRUE/INT_IS_ZERO
+            OpCode::IntIsTrue => {
+                let r = self.getintbound(op.pos, ctx);
+                let arg0 = ctx.get_box_replacement(op.arg(0));
+                if r.is_constant() {
+                    if r.get_constant() == 1 {
+                        // nonzero
+                        let b0 = self.getintbound(arg0, ctx);
+                        if b0.known_nonnegative() {
+                            let _ = self.get_bound_mut(arg0).make_gt_const(0);
+                        } else if b0.known_le_const(0) {
+                            let _ = self.get_bound_mut(arg0).make_lt_const(0);
+                        }
+                    } else {
+                        // zero
+                        let _ = self.get_bound_mut(arg0).make_eq_const(0);
+                    }
+                }
+            }
+            OpCode::IntIsZero => {
+                let r = self.getintbound(op.pos, ctx);
+                let arg0 = ctx.get_box_replacement(op.arg(0));
+                if r.is_constant() {
+                    if r.get_constant() == 1 {
+                        // is zero → value is 0
+                        let _ = self.get_bound_mut(arg0).make_eq_const(0);
+                    } else {
+                        // is not zero → value is nonzero
+                        let b0 = self.getintbound(arg0, ctx);
+                        if b0.known_nonnegative() {
+                            let _ = self.get_bound_mut(arg0).make_gt_const(0);
+                        } else if b0.known_le_const(0) {
+                            let _ = self.get_bound_mut(arg0).make_lt_const(0);
+                        }
+                    }
+                }
+            }
+            // intbounds.py:379-442 propagate_bounds_UINT_LT/GT/LE/GE
+            OpCode::UintLt => {
+                let r = self.getintbound(op.pos, ctx);
+                if r.is_constant() {
+                    let arg0 = ctx.get_box_replacement(op.arg(0));
+                    let arg1 = ctx.get_box_replacement(op.arg(1));
+                    if r.get_constant() == 1 {
+                        self.make_unsigned_lt(arg0, arg1, ctx);
+                    } else {
+                        self.make_unsigned_ge(arg0, arg1, ctx);
+                    }
+                }
+            }
+            OpCode::UintGt => {
+                let r = self.getintbound(op.pos, ctx);
+                if r.is_constant() {
+                    let arg0 = ctx.get_box_replacement(op.arg(0));
+                    let arg1 = ctx.get_box_replacement(op.arg(1));
+                    if r.get_constant() == 1 {
+                        self.make_unsigned_gt(arg0, arg1, ctx);
+                    } else {
+                        self.make_unsigned_le(arg0, arg1, ctx);
+                    }
+                }
+            }
+            OpCode::UintLe => {
+                let r = self.getintbound(op.pos, ctx);
+                if r.is_constant() {
+                    let arg0 = ctx.get_box_replacement(op.arg(0));
+                    let arg1 = ctx.get_box_replacement(op.arg(1));
+                    if r.get_constant() == 1 {
+                        self.make_unsigned_le(arg0, arg1, ctx);
+                    } else {
+                        self.make_unsigned_gt(arg0, arg1, ctx);
+                    }
+                }
+            }
+            OpCode::UintGe => {
+                let r = self.getintbound(op.pos, ctx);
+                if r.is_constant() {
+                    let arg0 = ctx.get_box_replacement(op.arg(0));
+                    let arg1 = ctx.get_box_replacement(op.arg(1));
+                    if r.get_constant() == 1 {
+                        self.make_unsigned_ge(arg0, arg1, ctx);
+                    } else {
+                        self.make_unsigned_lt(arg0, arg1, ctx);
+                    }
                 }
             }
             _ => {}
@@ -1825,18 +1813,23 @@ mod tests {
 
     #[test]
     fn test_second_overflow_guard_survives_after_first_guard() {
+        // After GUARD_TRUE(v1), v1 is known constant 1 (optimizer.py:518
+        // make_constant(box, CONST_1)). This means IntSubOvf(v0, v1=1)
+        // can't overflow, so its GuardNoOverflow is removed.
+        // Use separate inputargs for guard and arithmetic to keep both guards.
         let initial_bounds = vec![
             (OpRef(0), IntBound::unbounded()),
             (OpRef(1), IntBound::unbounded()),
             (OpRef(2), IntBound::unbounded()),
+            (OpRef(3), IntBound::unbounded()),
         ];
         let ops = vec![
-            make_op(OpCode::GuardTrue, &[OpRef(1)], 3),
-            make_op(OpCode::IntSubOvf, &[OpRef(0), OpRef(1)], 4),
-            make_op(OpCode::GuardNoOverflow, &[], 5),
-            make_op(OpCode::IntMulOvf, &[OpRef(2), OpRef(1)], 6),
-            make_op(OpCode::GuardNoOverflow, &[], 7),
-            make_op(OpCode::Jump, &[OpRef(4), OpRef(4), OpRef(6)], 8),
+            make_op(OpCode::GuardTrue, &[OpRef(3)], 4),
+            make_op(OpCode::IntSubOvf, &[OpRef(0), OpRef(1)], 5),
+            make_op(OpCode::GuardNoOverflow, &[], 6),
+            make_op(OpCode::IntMulOvf, &[OpRef(2), OpRef(1)], 7),
+            make_op(OpCode::GuardNoOverflow, &[], 8),
+            make_op(OpCode::Jump, &[OpRef(5), OpRef(5), OpRef(7), OpRef(4)], 9),
         ];
 
         let (result, _pass, _ctx) = run_pass_with_bounds(&ops, &initial_bounds);
