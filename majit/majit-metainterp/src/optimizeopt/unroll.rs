@@ -3575,12 +3575,32 @@ fn assemble_peeled_trace_with_jump_args(
         Vec::with_capacity(p1_ops.len() + p2_ops.len() + 1 + imported_short_aliases.len());
     let mut filtered_extra_label_args = Vec::new();
     let mut filtered_extra_jump_args = Vec::new();
-    // RPython Box parity: do NOT deduplicate extra_label_args.
-    // Each used_box is a distinct Box in RPython. Duplicates pass through
-    // to label_scope_dedup which assigns fresh OpRefs for each occurrence.
+    // RPython Box parity (compile.py:327, shortpreamble.py:436-439):
+    //
+    //   loop.operations = ([start_label] + preamble_ops + loop_info.extra_same_as +
+    //                      loop_info.extra_before_label + [loop_info.label_op] + loop_ops)
+    //
+    //   op = preamble_op.op.get_box_replacement()
+    //   if preamble_op.invented_name:
+    //       self.extra_same_as.append(op)
+    //   self.used_boxes.append(op)
+    //   self.short_preamble_jump.append(preamble_op.preamble_op)
+    //
+    // `used_boxes` is appended to `label_op.arglist()` in its entirety, with
+    // NO deduplication against the base label args. RPython's Box identity
+    // makes every used_box a distinct Python object; even two boxes that
+    // happen to carry the same runtime value are separate slots in the
+    // label. In majit's flat OpRef model we carry this literally — do not
+    // drop entries just because their OpRef coincides with a base label
+    // arg, because that silently corrupts the loop arity (the matching
+    // `extra_jump_args[idx]` value that the JUMP was supposed to deliver
+    // into that slot disappears along with it).
+    //
+    // The only entries that legitimately drop out here are constants:
+    // those become immediates in the body and carry no live-in slot.
     for (idx, &label_arg) in extra_label_args.iter().enumerate() {
         let jump_arg = extra_jump_args.get(idx).copied().unwrap_or(label_arg);
-        if is_trace_constant_ref(label_arg, constants) || label_args.contains(&label_arg) {
+        if is_trace_constant_ref(label_arg, constants) {
             continue;
         }
         filtered_extra_label_args.push(label_arg);
@@ -3808,6 +3828,14 @@ fn assemble_peeled_trace_with_jump_args(
             (0..label_args.len()).map(|i| OpRef(i as u32)).collect()
         };
     carried_source_slots.extend(filtered_extra_jump_args.iter().copied());
+    // `label_set` tracks which OpRefs are already carried by the label so
+    // that the body-use-before-def pass doesn't add the same OpRef twice
+    // (which would inflate label arity without adding new information).
+    // RPython's Box identity makes this a correctness filter: two
+    // references to the same Box collapse into one live-in slot. This
+    // is NOT the Issue 1 dedup — which drops distinct Boxes that happen
+    // to share an OpRef — it is RPython parity: the same Box appears
+    // once in the label arglist.
     let mut label_set: std::collections::HashSet<OpRef> = full_label_args.iter().copied().collect();
     {
         let mut seen_body_defs = std::collections::HashSet::new();
@@ -3826,10 +3854,8 @@ fn assemble_peeled_trace_with_jump_args(
                 {
                     continue;
                 }
-                if !full_label_args.contains(&arg) {
-                    full_label_args.push(arg);
-                    label_set.insert(arg);
-                }
+                full_label_args.push(arg);
+                label_set.insert(arg);
             }
             if op.result_type() != Type::Void && !op.pos.is_none() {
                 seen_body_defs.insert(op.pos);
@@ -4040,6 +4066,15 @@ fn assemble_peeled_trace_with_jump_args(
                     seen_after_label_defs.insert(later_op.pos);
                 }
             }
+            // RPython Box parity: do not dedup the inner-label extension
+            // against its existing args. Each source_arg collected from
+            // the later body is a distinct RPython Box; adding it as a
+            // separate slot matches `label_op.initarglist(label_op.getarglist()
+            // + sb.used_boxes)` (unroll.py:300) where RPython never filters
+            // by value or by box coincidence. The outer collection above
+            // already dedups by box identity (`extra_inner_set.contains`),
+            // so each source_arg appears at most once — which is the
+            // RPython-parity behavior for Box-keyed live-in sets.
             for &source_arg in &extra_inner_sources {
                 let mapped_arg = remap_body_arg(
                     source_arg,
@@ -4049,9 +4084,6 @@ fn assemble_peeled_trace_with_jump_args(
                     &seen_body_defs,
                     &visible_before_label,
                 );
-                if new_op.args.contains(&mapped_arg) {
-                    continue;
-                }
                 new_op.args.push(mapped_arg);
                 original_args.push(source_arg);
             }
