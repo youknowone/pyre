@@ -1254,8 +1254,8 @@ impl TraceRecordBuffer {
 
     /// opencoder.py:852-858 Trace.get_live_ranges().
     ///
-    /// Returns a list where `liveranges[v]` is the last position at which
-    /// the value with raw trace position `v` is used. Mirrors RPython's
+    /// Returns a list where `liveranges[v]` is the trace step at which the
+    /// value with raw trace position `v` is last used. Mirrors RPython's
     /// `TraceIterator.next_element_update_live_range` (opencoder.py:339-360):
     ///
     /// 1. The array is sized to cover the entire raw box space
@@ -1266,15 +1266,25 @@ impl TraceRecordBuffer {
     ///    Walking `op.pos` (rather than the union of arg slots) gives the
     ///    same coverage as RPython's `_index` while excluding constants
     ///    and `OpRef::NONE` sentinels.
-    /// 2. The forward walk writes `liveranges[v] = current_position` for
-    ///    every TAGBOX argument (`!is_constant() && !is_none()`) — TAGINT /
-    ///    TAGCONSTPTR / TAGCONSTOTHER refs are skipped, just like
-    ///    opencoder.py:347-349.
-    /// 3. Each non-void op also self-defines at its own position
-    ///    (`liveranges[index] = index`, opencoder.py:351-352). Without this
-    ///    self-definition the dead-range computation collapses any value
-    ///    that is produced but never read into position 0, which is wrong
-    ///    for the register allocator's free-slot logic.
+    /// 2. The forward walk writes `liveranges[v] = index` for every TAGBOX
+    ///    argument (`!is_constant() && !is_none()`) — TAGINT / TAGCONSTPTR /
+    ///    TAGCONSTOTHER refs are skipped, just like opencoder.py:347-349.
+    ///    `index` is the RPython sequential counter, NOT `op.pos`. RPython
+    ///    starts the counter at `t._count = max_num_inputargs` and only
+    ///    increments it for non-void ops (opencoder.py:357-358); void ops
+    ///    keep using the previous index. majit's recorder consumes a
+    ///    sequential OpRef for every op including void ones, so `op.pos`
+    ///    advances on every op and would skew live-range step values
+    ///    across runs of consecutive guards / SetfieldGc. Tracking a
+    ///    separate `index` counter restores parity.
+    /// 3. Each non-void op also self-defines its slot
+    ///    (`liveranges[index] = index`, opencoder.py:351-352). majit
+    ///    addresses the slot by `op.pos.0` (because that's how arg
+    ///    references find it) but stores the sequential `index` value to
+    ///    stay coordinate-consistent with the arg writes above. Without
+    ///    this self-definition the dead-range computation collapses any
+    ///    value that is produced but never read into position 0, which is
+    ///    wrong for the register allocator's free-slot logic.
     pub fn get_live_ranges(&self, ops: &[majit_ir::Op]) -> Vec<usize> {
         use majit_ir::Type;
         // opencoder.py:854 — `[0] * self._index`. _index = the full raw
@@ -1292,14 +1302,15 @@ impl TraceRecordBuffer {
         let total = self.num_ops.max(computed_max).max(self.num_inputargs);
         let mut liveranges = vec![0usize; total];
         // opencoder.py:339-358 next_element_update_live_range — forward
-        // iteration. RPython tracks an `index` counter that advances by 1
-        // per non-void op; majit's recorder increments op_count for every
-        // op, so the equivalent "current position" is just `op.pos.0`.
+        // iteration. The `index` counter starts at `t._count = start =
+        // max_num_inputargs` (TraceIterator.__init__) and is bumped only
+        // for non-void ops. We use the same counter so void ops between
+        // two non-void ops do not push the live-step forward.
+        let mut index = self.num_inputargs;
         for op in ops {
             if op.pos.is_none() || op.pos.is_constant() {
                 continue;
             }
-            let cur_index = op.pos.0 as usize;
             // opencoder.py:347-349 — TAGBOX args set liveranges[v] = index.
             // Skip constants (TAGINT/TAGCONSTPTR/TAGCONSTOTHER) and the
             // OpRef::NONE sentinel (no live data behind it).
@@ -1309,7 +1320,7 @@ impl TraceRecordBuffer {
                 }
                 let v = arg.0 as usize;
                 if v < liveranges.len() {
-                    liveranges[v] = cur_index;
+                    liveranges[v] = index;
                 }
             }
             if let Some(ref fa) = op.fail_args {
@@ -1319,15 +1330,23 @@ impl TraceRecordBuffer {
                     }
                     let v = arg.0 as usize;
                     if v < liveranges.len() {
-                        liveranges[v] = cur_index;
+                        liveranges[v] = index;
                     }
                 }
             }
-            // opencoder.py:351-352 — non-void ops self-define at the
-            // current index so values that are produced but never read
-            // still get a real liverange entry.
-            if op.result_type() != Type::Void && cur_index < liveranges.len() {
-                liveranges[cur_index] = cur_index;
+            // opencoder.py:351-352 — non-void ops self-define. RPython's
+            // `liveranges[index] = index` writes at slot=index because
+            // RPython's index space and box position space coincide; in
+            // majit the slot is addressed by `op.pos.0` (the value other
+            // ops will reference via arg.0) while the value is the
+            // sequential index, matching the arg-write semantics above.
+            if op.result_type() != Type::Void {
+                let v = op.pos.0 as usize;
+                if v < liveranges.len() {
+                    liveranges[v] = index;
+                }
+                // opencoder.py:357-358 — only non-void ops advance index.
+                index += 1;
             }
         }
         liveranges
@@ -1724,6 +1743,52 @@ mod tests {
         assert_eq!(lr[0], 1);
         // v1 self-defines at pos 1 even though no later op reads it.
         assert_eq!(lr[1], 1);
+    }
+
+    /// opencoder.py:357-358 — only non-void ops advance the index counter.
+    /// Consecutive void ops between two non-void ops must keep the same
+    /// index, otherwise majit's `op.pos`-driven counter (which advances
+    /// for every recorded op including guards/SetfieldGc) skews live-range
+    /// step values whenever real traces hit guard chains.
+    #[test]
+    fn test_get_live_ranges_consecutive_voids_share_index() {
+        let buf = TraceRecordBuffer::new(2);
+        // Trace shape:
+        //   pos 0, 1 = inputargs i0, i1
+        //   pos 2    = IntAdd(i0, i1)        (non-void)
+        //   pos 3    = GuardTrue(v2)         (void)
+        //   pos 4    = GuardNoException()    (void, references v2 via fail_args)
+        //   pos 5    = IntMul(i0, i1)        (non-void)
+        let add = op_at(2, majit_ir::OpCode::IntAdd, &[OpRef(0), OpRef(1)]);
+        let g1 = op_at(3, majit_ir::OpCode::GuardTrue, &[OpRef(2)]);
+        let mut g2 = op_at(4, majit_ir::OpCode::GuardNoException, &[]);
+        g2.fail_args = Some(smallvec::smallvec![OpRef(2)]);
+        let mul = op_at(5, majit_ir::OpCode::IntMul, &[OpRef(0), OpRef(1)]);
+        let ops = vec![add, g1, g2, mul];
+        let lr = buf.get_live_ranges(&ops);
+
+        // Sequential index walk (start = num_inputargs = 2):
+        //   IntAdd     index=2 → liveranges[2]=2,                       index → 3
+        //   GuardTrue  index=3 → liveranges[2]=3,                       index → 3
+        //   GuardNoExc index=3 → liveranges[2]=3 (via fail_args),       index → 3
+        //   IntMul     index=3 → liveranges[0]=3, liveranges[1]=3,
+        //                        liveranges[5]=3,                       index → 4
+        //
+        // The two void ops between IntAdd and IntMul share index 3 with
+        // IntMul. Under the old `cur_index = op.pos` formula liveranges[2]
+        // would have been bumped to 4 (GuardNoException's pos) instead of
+        // staying at 3, and the IntMul self-def would land at 5 instead
+        // of 3 — diverging from RPython parity.
+        assert_eq!(lr[0], 3);
+        assert_eq!(lr[1], 3);
+        assert_eq!(lr[2], 3);
+        // Void slots stay at 0 (no self-def for guards).
+        assert_eq!(lr[3], 0);
+        assert_eq!(lr[4], 0);
+        // IntMul self-def written at the IntMul's slot (op.pos = 5) with
+        // value = sequential index (3). Slot space is majit pos; values
+        // are sequential RPython index — matching the arg-write semantics.
+        assert_eq!(lr[5], 3);
     }
 
     #[test]
