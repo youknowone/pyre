@@ -64,6 +64,7 @@ pub use pyjitpl::{
     BackEdgeAction, BlackholeRunResult, BridgeRetraceResult, CompileOutcome, CompiledExitLayout,
     CompiledTerminalExitLayout, CompiledTraceLayout, DeadFrameArtifacts, DetailedDriverRunOutcome,
     DriverRunOutcome, InlineDecision, JitHooks, JitStats, MetaInterp, RawCompileResult,
+    set_ref_unbox_int_fn,
 };
 pub use quasiimmut::QuasiImmut;
 pub use symbolic_stack::SymbolicStack;

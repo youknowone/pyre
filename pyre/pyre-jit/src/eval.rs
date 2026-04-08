@@ -55,8 +55,8 @@ use crate::jit::descr::{
 use crate::jit::virtualizable_gen::build_virtualizable_info;
 use majit_gc::collector::MiniMarkGC;
 use majit_metainterp::JitDriver;
-use pyre_object::floatobject::W_FloatObject;
-use pyre_object::intobject::W_IntObject;
+use pyre_object::floatobject::{FLOAT_FLOATVAL_OFFSET, W_FloatObject};
+use pyre_object::intobject::{INT_INTVAL_OFFSET, W_IntObject};
 use pyre_object::{w_bool_from, w_int_new, w_none, w_str_new, w_tuple_new};
 
 const JIT_THRESHOLD: u32 = 200;
@@ -2394,11 +2394,11 @@ fn materialize_virtual_from_rd(
         VirtualKind::Instance { known_class, .. }
             if known_class == Some(&pyre_object::INT_TYPE as *const _ as i64) =>
         {
-            // W_IntObject fast path: find intval field (offset 8).
+            // W_IntObject fast path: find intval field.
             // fielddescrs may include ob_type (offset 0) first.
             let intval_idx = fielddescrs
                 .iter()
-                .position(|fd| fd.offset == 8)
+                .position(|fd| fd.offset == INT_INTVAL_OFFSET)
                 .unwrap_or(0);
             if let Some(&tagged) = fieldnums.get(intval_idx) {
                 let val = decode_tagged_value(
@@ -2424,10 +2424,10 @@ fn materialize_virtual_from_rd(
         VirtualKind::Instance { known_class, .. }
             if known_class == Some(&pyre_object::FLOAT_TYPE as *const _ as i64) =>
         {
-            // W_FloatObject fast path: find floatval field (offset 8).
+            // W_FloatObject fast path: find floatval field.
             let floatval_idx = fielddescrs
                 .iter()
-                .position(|fd| fd.offset == 8)
+                .position(|fd| fd.offset == FLOAT_FLOATVAL_OFFSET)
                 .unwrap_or(0);
             if let Some(&tagged) = fieldnums.get(floatval_idx) {
                 let val = decode_tagged_value(

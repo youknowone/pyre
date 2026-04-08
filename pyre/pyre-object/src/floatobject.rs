@@ -4,8 +4,8 @@ use crate::pyobject::*;
 
 /// Python float object.
 ///
-/// Layout: `[ob_type: *const PyType | floatval: f64]`
-/// The JIT reads `floatval` via `GetfieldGcF` at offset 8 (after the type pointer).
+/// Layout: `[ob_header: PyObject { ob_type, w_class } | floatval: f64]`
+/// The JIT reads `floatval` via `GetfieldGcF` at `FLOAT_FLOATVAL_OFFSET`.
 #[repr(C)]
 pub struct W_FloatObject {
     pub ob_header: PyObject,
@@ -84,6 +84,6 @@ mod tests {
 
     #[test]
     fn test_float_field_offset() {
-        assert_eq!(FLOAT_FLOATVAL_OFFSET, 16); // after *const PyType (8 bytes on 64-bit)
+        assert_eq!(FLOAT_FLOATVAL_OFFSET, 16); // after PyObject { ob_type(8) + w_class(8) }
     }
 }
