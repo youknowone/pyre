@@ -1571,6 +1571,7 @@ pub fn install_jit_call_bridge() {
             majit_backend_cranelift::register_inline_frame_arena(arena_global_info());
             majit_backend_cranelift::register_call_assembler_unbox_int(unbox_int_for_force);
         }
+        majit_metainterp::set_ref_unbox_int_fn(unbox_int_for_force);
     });
 }
 

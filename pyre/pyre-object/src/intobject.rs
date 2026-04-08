@@ -9,8 +9,8 @@ use crate::pyobject::*;
 
 /// Python integer object.
 ///
-/// Layout: `[ob_type: *const PyType | intval: i64]`
-/// The JIT reads `intval` via `GetfieldGcI` at offset 8 (after the type pointer).
+/// Layout: `[ob_header: PyObject { ob_type, w_class } | intval: i64]`
+/// The JIT reads `intval` via `GetfieldGcI` at `INT_INTVAL_OFFSET`.
 #[repr(C)]
 pub struct W_IntObject {
     pub ob_header: PyObject,
@@ -132,7 +132,7 @@ mod tests {
 
     #[test]
     fn test_int_field_offset() {
-        assert_eq!(INT_INTVAL_OFFSET, 16); // after *const PyType (8 bytes on 64-bit)
+        assert_eq!(INT_INTVAL_OFFSET, 16); // after PyObject { ob_type(8) + w_class(8) }
     }
 
     #[test]

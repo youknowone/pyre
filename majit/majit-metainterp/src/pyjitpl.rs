@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
 
 use crate::optimizeopt::optimizer::{Optimizer, OptimizerKnowledge};
 use majit_backend::{
@@ -32,6 +33,16 @@ use crate::resume::{
 };
 use crate::trace_ctx::TraceCtx;
 use crate::virtualizable::VirtualizableInfo;
+
+/// Callback for unboxing a Ref (boxed int pointer) to a raw i64 value.
+/// Registered by pyre at init time so adapt_live_values_to_trace_types
+/// can unbox W_IntObject without depending on pyre-object.
+static REF_UNBOX_INT_FN: OnceLock<fn(i64) -> i64> = OnceLock::new();
+
+/// Register the Ref→Int unbox callback for adapt_live_values_to_trace_types.
+pub fn set_ref_unbox_int_fn(f: fn(i64) -> i64) {
+    let _ = REF_UNBOX_INT_FN.set(f);
+}
 
 /// No direct RPython equivalent — Rust struct carrying data that RPython
 /// passes through internal method calls in handle_guard_failure
@@ -4276,13 +4287,11 @@ impl<M: Clone> MetaInterp<M> {
                 break;
             }
             if let (Value::Ref(r), Type::Int) = (&values[i], tp) {
-                let ptr = r.as_usize();
-                // W_IntObject layout: [ob_type: 8 bytes][intval: 8 bytes]
-                // Unbox by reading *(ptr + 8) as i64.
-                if ptr >= 0x1_0000 && ptr < (1u64 << 56) as usize && (ptr & 7) == 0 {
-                    values[i] = Value::Int(unsafe { *((ptr + 8) as *const i64) });
+                let raw = r.as_usize() as i64;
+                if let Some(unbox_fn) = REF_UNBOX_INT_FN.get() {
+                    values[i] = Value::Int(unbox_fn(raw));
                 } else {
-                    values[i] = Value::Int(ptr as i64);
+                    values[i] = Value::Int(raw);
                 }
             }
         }
