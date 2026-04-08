@@ -1365,6 +1365,16 @@ impl OpcodeStepExecutor for PyFrame {
                     Some(d) if pyre_object::is_staticmethod(d) => PY_NULL,
                     // PyPy: ClassMethod.__get__ → Method(func, klass)
                     Some(d) if pyre_object::is_classmethod(d) => w_type,
+                    Some(d)
+                        if crate::is_function(d)
+                            && crate::is_builtin_code(
+                                crate::function_get_code(d) as pyre_object::PyObjectRef
+                            ) =>
+                    {
+                        // Builtin functions stored on a user class behave like plain
+                        // callable attributes here; do not prepend `self`.
+                        PY_NULL
+                    }
                     Some(_) => obj, // found in type MRO → bind self (method)
                     None => {
                         // Not found in type MRO → found in instance __dict__.
