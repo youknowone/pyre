@@ -1821,6 +1821,12 @@ impl RegAlloc {
                 locs.push(None);
                 continue;
             }
+            // RPython: isinstance(arg, Const) → convert_to_imm(arg)
+            if arg.is_constant() {
+                let val = self.constants.get(&arg.0).copied().unwrap_or(0);
+                locs.push(Some(Loc::Immed(crate::regloc::ImmedLoc::new(val))));
+                continue;
+            }
             if let Some(reg) = self.rm.reg_bindings_get(arg, &self.longevity) {
                 locs.push(Some(Loc::Reg(reg)));
             } else if let Some(reg) = self.xrm.reg_bindings_get(arg, &self.longevity) {
