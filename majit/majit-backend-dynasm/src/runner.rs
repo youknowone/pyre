@@ -140,6 +140,9 @@ impl DynasmBackend {
     /// fail_descrs first, then all bridge fail_descrs stored in
     /// asmmemmgr_blocks. RPython does this via AbstractDescr.show()
     /// which works for any descr from any loop/bridge.
+    ///
+    /// Panics if not found — RPython uses object identity, so lookup
+    /// failure is impossible in well-formed execution.
     fn find_descr_by_ptr(token: &JitCellToken, ptr: usize) -> Arc<DynasmFailDescr> {
         // compile.py:665-674 done_with_this_frame_descr singleton
         let global_done = crate::guard::done_with_this_frame_descr_ptr();
@@ -171,19 +174,33 @@ impl DynasmBackend {
             }
         }
 
-        // Fallback — should not happen in well-formed execution
-        compiled
-            .fail_descrs
-            .last()
-            .cloned()
-            .unwrap_or_else(|| Arc::new(DynasmFailDescr::new(0, 0, Vec::new(), true)))
+        panic!(
+            "find_descr_by_ptr: jf_descr {:#x} not found in root loop \
+             or any bridge — RPython equivalent (AbstractDescr.show) \
+             never fails",
+            ptr
+        );
     }
 
     /// Find a descr by (trace_id, fail_index) across root loop + all
     /// bridges. Used by compile_bridge to locate the exact guard descr
     /// that failed — RPython passes the faildescr object directly.
+    ///
+    /// trace_id == 0 is normalized to the root trace id, matching
+    /// cranelift (compiler.rs:10092) and the BridgeFailDescrProxy
+    /// convention.
+    ///
+    /// Panics if not found — in RPython, the faildescr is the exact
+    /// object, so there is no lookup-miss path.
     fn find_descr(token: &JitCellToken, trace_id: u64, fail_index: u32) -> Arc<DynasmFailDescr> {
         let compiled = Self::get_compiled(token);
+        // Normalize trace_id: 0 → root trace id
+        let trace_id = if trace_id == 0 {
+            compiled.trace_id
+        } else {
+            trace_id
+        };
+
         if let Some(found) = compiled
             .fail_descrs
             .iter()
@@ -203,12 +220,13 @@ impl DynasmBackend {
                 }
             }
         }
-        // Fallback
-        compiled
-            .fail_descrs
-            .last()
-            .cloned()
-            .unwrap_or_else(|| Arc::new(DynasmFailDescr::new(0, 0, Vec::new(), true)))
+
+        panic!(
+            "find_descr: (trace_id={}, fail_index={}) not found in \
+             root loop or any bridge — RPython uses exact faildescr \
+             object identity, so this lookup must succeed",
+            trace_id, fail_index
+        );
     }
 }
 
