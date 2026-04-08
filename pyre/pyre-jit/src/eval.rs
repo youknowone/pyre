@@ -3740,7 +3740,6 @@ fn rebuild_state_after_failure_from_recovery_layout(
 
     // resume.py:1042-1057 rebuild_from_resumedata parity:
     // Replace Virtual(idx) frame slots with materialized pointers.
-    // RPython does a straightforward replacement without non-null checks.
     let mut replaced = 0usize;
     if let Some(frame) = recovery.frames.last() {
         for (slot_idx, src) in frame.slots.iter().enumerate() {
@@ -3749,6 +3748,36 @@ fn rebuild_state_after_failure_from_recovery_layout(
                     if slot_idx < typed.len() {
                         typed[slot_idx] = Value::Ref(majit_ir::GcRef(ptr));
                         replaced += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // [pyre-specific deviation] target_slot fallback:
+    // pyre's recovery layout merging (to_exit_recovery_layout_with_caller_prefix)
+    // can lose Virtual(vidx) markers in frame.slots during prefix insertion.
+    // When no Virtual slots are found but materialized objects exist, fall back
+    // to the target_slot field on ExitVirtualLayout to place them.
+    // RPython's resume.py does not need this because its rd_numb encoding
+    // preserves virtual markers through the entire chain. Pyre's exit layout
+    // representation differs, requiring this compensating path.
+    if replaced == 0 && !materialized.is_empty() {
+        for (vidx, vl) in recovery.virtual_layouts.iter().enumerate() {
+            let target = match vl {
+                majit_backend::ExitVirtualLayout::Object { target_slot, .. }
+                | majit_backend::ExitVirtualLayout::Struct { target_slot, .. } => *target_slot,
+                _ => None,
+            };
+            if let Some(slot_idx) = target {
+                if slot_idx < typed.len()
+                    && matches!(typed[slot_idx], Value::Ref(majit_ir::GcRef(0)))
+                {
+                    if let Some(&ptr) = materialized.get(vidx) {
+                        if ptr != 0 {
+                            typed[slot_idx] = Value::Ref(majit_ir::GcRef(ptr));
+                            replaced += 1;
+                        }
                     }
                 }
             }
