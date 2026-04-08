@@ -8,3 +8,4 @@ description = "Backend trait for majit JIT compiler"
 
 [dependencies]
 majit-ir = { workspace = true }
+parking_lot = { workspace = true }

@@ -16,11 +16,6 @@ use crate::codebuf;
 use crate::frame::FrameData;
 use crate::guard::DynasmFailDescr;
 
-/// asmmemmgr.py parity: global storage for bridge ExecutableBuffers.
-/// Keeps bridge code alive after compile_bridge returns.
-static BRIDGE_KEEPALIVE: std::sync::LazyLock<std::sync::Mutex<Vec<dynasmrt::ExecutableBuffer>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
-
 /// runner.py:23 AbstractX86CPU — concrete Backend implementation.
 pub struct DynasmBackend {
     /// Next unique trace ID.
@@ -94,7 +89,9 @@ impl DynasmBackend {
     pub fn lookup_typeid_from_classptr(&self, classptr: usize) -> Option<u32> {
         self.gc_ll_descr
             .as_ref()
-            .and_then(|gc| gc.get_typeid_from_classptr_if_gcremovetypeptr(classptr))
+            .and_then(|gc: &Box<dyn majit_gc::GcAllocator>| {
+                gc.get_typeid_from_classptr_if_gcremovetypeptr(classptr)
+            })
     }
 
     /// Pre-compute classptr → expected_typeid pairs for every GuardClass /
@@ -222,9 +219,18 @@ impl Backend for DynasmBackend {
             descr.set_bridge_addr(bridge_addr);
         }
 
-        // asmmemmgr.py parity: the bridge's ExecutableBuffer must stay
-        // alive (keeps the code memory mapped). Store in global pool.
-        BRIDGE_KEEPALIVE.lock().unwrap().push(compiled.buffer);
+        // llmodel.py:252 asmmemmgr_blocks parity: store the entire
+        // bridge CompiledCode on the owning loop token. This keeps
+        // both the ExecutableBuffer (mapped code) AND the fail_descrs
+        // (Arc<DynasmFailDescr>) alive. Recovery stubs embed raw
+        // pointers to these Arcs — dropping them would create
+        // dangling pointers when a bridge-internal guard fires.
+        // RPython's asmmemmgr ties code blocks and their resume
+        // descriptors to the same compiled_loop_token lifetime.
+        original_token
+            .asmmemmgr_blocks
+            .lock()
+            .push(Box::new(compiled));
 
         Ok(AsmInfo {
             code_addr: bridge_addr,

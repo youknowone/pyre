@@ -144,7 +144,7 @@ run_bench() {
 
 echo ""
 bold "pyre pre-merge check"; echo ""
-echo "binary: $PYRE  backend: ${BACKEND:-dynasm}"
+echo "binary: $PYRE  backend: ${BACKEND:-cranelift}"
 echo ""
 
 # Warm up: cold run to prime disk/CPU caches (results discarded)

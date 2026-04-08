@@ -1866,6 +1866,10 @@ impl Optimizer {
                     }
                 }
             }
+            // unroll.py:203 self.flush() — force lazy sets before
+            // producing short preamble ops (heap.py:53 invariant).
+            self.flush(&mut ctx);
+
             // Now force all resolved (and dedup'd) args.
             ctx.preamble_end_args = Some(
                 resolved_args
