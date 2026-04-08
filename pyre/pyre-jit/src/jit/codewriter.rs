@@ -21,9 +21,25 @@ use majit_metainterp::jitcode::{JitCode, JitCodeBuilder};
 use pyre_interpreter::bytecode::{CodeObject, Instruction, OpArgState};
 use pyre_interpreter::runtime_ops::{binary_op_tag, compare_op_tag};
 
+use pyre_jit_trace::virtualizable_spec::LOCALS_CELLS_STACK_W_VABLE_ARRAY_INDEX;
+
 // ---------------------------------------------------------------------------
 // RPython: codewriter/flatten.py KINDS = ['int', 'ref', 'float']
 // ---------------------------------------------------------------------------
+
+/// Python `var_num` → flat index into the `locals_cells_stack_w`
+/// virtualizable array.
+///
+/// PyFrame lays out locals, cells, and the value stack in a single
+/// vector; `var_num` from `LOAD_FAST`/`STORE_FAST` is already a direct
+/// offset into that vector (no indirection). Kept as a named helper so
+/// Phase 4/5 of the vable-locals epic has a single well-commented call
+/// site for this mapping.
+#[inline]
+#[allow(dead_code)] // consumed in Phase 4/5
+fn local_to_vable_slot(var_num: usize) -> usize {
+    var_num
+}
 
 /// Compiled JitCode with Python PC → JitCode PC mapping.
 ///
