@@ -682,17 +682,24 @@ impl MIFrame {
         self.vrefs_before_residual_call();
 
         // pyjitpl.py:3326-3335: virtualizable processing (conditional).
-        // RPython: if vinfo is not None:
+        // RPython: vinfo = self.jitdriver_sd.virtualizable_info
+        //          if vinfo is not None:
         let obj_ptr = self.sym().concrete_vable_ptr;
+        if obj_ptr.is_null() {
+            return;
+        }
         if let Some(vable_ref) = ctx.standard_virtualizable_box() {
-            if obj_ptr.is_null() {
-                return;
-            }
-            ctx.gen_store_back_in_vable(vable_ref);
             let info = crate::virtualizable_gen::build_virtualizable_info();
+            // pyjitpl.py:3329-3330:
+            //   virtualizable = vinfo.unwrap_virtualizable_box(virtualizable_box)
+            //   vinfo.tracing_before_residual_call(virtualizable)
             unsafe {
                 info.tracing_before_residual_call(obj_ptr);
             }
+            // pyjitpl.py:3332-3335:
+            //   force_token = self.history.record0(rop.FORCE_TOKEN, ...)
+            //   self.history.record2(rop.SETFIELD_GC, virtualizable_box,
+            //       force_token, None, descr=vinfo.vable_token_descr)
             let force_token = ctx.force_token();
             ctx.vable_setfield_descr(vable_ref, force_token, info.token_field_descr());
         }
@@ -3239,9 +3246,8 @@ impl MIFrame {
                     } else {
                         crate::callbacks::get().jit_force_recursive_call_argraw_boxed_1
                     };
+                    // pyjitpl.py:2017: do_residual_call step 1
                     this.vable_and_vrefs_before_residual_call(ctx);
-                    // RPython parity: use CALL_ASSEMBLER_I when a token
-                    // exists for the callee (compiled or pending).
                     // RPython parity: use CALL_ASSEMBLER_I when a token
                     // exists (compiled or pending).
                     let ca_token = if is_self_recursive {
@@ -3310,7 +3316,7 @@ impl MIFrame {
                     // pyjitpl.py:2078: vable_after_residual_call
                     this.vable_after_residual_call()?;
                     if ca_token.is_none() {
-                        // pyjitpl.py:2079: step 6 — GUARD_NOT_FORCED
+                        // pyjitpl.py:2079: GUARD_NOT_FORCED
                         this.push_call_replay_stack(ctx, callable, args, call_pc);
                         this.generate_guard(ctx, OpCode::GuardNotForced, &[]);
                         ctx.heap_cache_mut().invalidate_caches_for_escaped();
@@ -3319,6 +3325,7 @@ impl MIFrame {
                     result
                 } else {
                     let force_fn = crate::callbacks::get().jit_force_recursive_call_1;
+                    // pyjitpl.py:2017: do_residual_call step 1
                     this.vable_and_vrefs_before_residual_call(ctx);
                     let result = ctx.call_may_force_ref_typed(
                         force_fn,
@@ -3343,6 +3350,7 @@ impl MIFrame {
                 let callee_frame =
                     ctx.call_ref_typed(frame_helper, &helper_args, &helper_arg_types);
                 let force_fn = crate::callbacks::get().jit_force_callee_frame;
+                // pyjitpl.py:2017: do_residual_call step 1
                 this.vable_and_vrefs_before_residual_call(ctx);
                 let result = ctx.call_may_force_ref_typed(force_fn, &[callee_frame], &[Type::Ref]);
                 // pyjitpl.py:2049: vrefs_after_residual_call
@@ -4083,6 +4091,12 @@ impl SharedOpcodeHandler for MIFrame {
                     let result = func(&concrete_args).unwrap_or(pyre_object::PY_NULL);
                     result_concrete = ConcreteValue::from_pyobj(result);
                 } else if pyre_interpreter::is_function(concrete_callable) {
+                    // pyjitpl.py:2025: concrete execution only.
+                    // vable_and_vrefs_before/after are NOT called here —
+                    // RPython calls them only in do_residual_call, not
+                    // in perform_call (inline path). The decision between
+                    // residual and inline happens in call_callable_value,
+                    // and vref hooks are applied there for residual only.
                     use std::cell::Cell;
                     thread_local! {
                         static CONCRETE_CALL_DEPTH: Cell<u32> = Cell::new(0);

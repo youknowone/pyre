@@ -1576,22 +1576,28 @@ pub fn generated_direct_type_value(
     unsafe {
         if pyre_object::is_instance(concrete_value) {
             // User instance: ob_type is shared INSTANCE_TYPE.
-            // Read the real class from W_InstanceObject.w_type field,
-            // then promote it to a constant (RPython: jit.promote(__class__)).
-            frame.guard_class(
-                ctx,
-                value,
-                &pyre_object::pyobject::INSTANCE_TYPE as *const _ as *const pyre_object::PyType,
-            );
-            // getfield_gc_r(obj, w_type_offset) → read .w_type
-            let w_type_descr = crate::descr::instance_w_type_descr();
-            let w_type_opref = ctx.record_op_with_descr(
-                majit_ir::OpCode::GetfieldGcR,
-                &[value],
-                w_type_descr,
-            );
-            // jit.promote(w_obj.__class__) → GUARD_VALUE
-            frame.implement_guard_value(ctx, w_type_opref, concrete_type_obj as i64);
+            // Check if __class__ override exists (e.g. obj.__class__ = Other).
+            let w_type = pyre_object::w_instance_get_type(concrete_value);
+            if std::ptr::eq(w_type, concrete_type_obj) {
+                // No __class__ override: read .w_type field + guard_value.
+                // RPython: jit.promote(w_obj.__class__)
+                frame.guard_class(
+                    ctx,
+                    value,
+                    &pyre_object::pyobject::INSTANCE_TYPE as *const _ as *const pyre_object::PyType,
+                );
+                let w_type_descr = crate::descr::instance_w_type_descr();
+                let w_type_opref = ctx.record_op_with_descr(
+                    majit_ir::OpCode::GetfieldGcR,
+                    &[value],
+                    w_type_descr,
+                );
+                frame.implement_guard_value(ctx, w_type_opref, concrete_type_obj as i64);
+            } else {
+                // __class__ override: .w_type differs from typedef::type().
+                // Must guard identity to fix the ATTR_TABLE __class__ binding.
+                frame.implement_guard_value(ctx, value, concrete_value as i64);
+            }
             return Some(ctx.const_ref(concrete_type_obj as i64));
         }
 
@@ -1680,20 +1686,27 @@ pub fn generated_direct_isinstance_value(
 
     unsafe {
         if pyre_object::is_instance(concrete_obj) {
-            // User instance: promote real class via w_type field.
-            frame.guard_class(
-                ctx,
-                obj,
-                &pyre_object::pyobject::INSTANCE_TYPE as *const _ as *const pyre_object::PyType,
-            );
-            let w_type_descr = crate::descr::instance_w_type_descr();
-            let w_type_opref = ctx.record_op_with_descr(
-                majit_ir::OpCode::GetfieldGcR,
-                &[obj],
-                w_type_descr,
-            );
-            let concrete_type = pyre_object::w_instance_get_type(concrete_obj);
-            frame.implement_guard_value(ctx, w_type_opref, concrete_type as i64);
+            // User instance: check for __class__ override.
+            let w_type = pyre_object::w_instance_get_type(concrete_obj);
+            let actual_type = pyre_interpreter::typedef::r#type(concrete_obj);
+            if actual_type.map_or(true, |at| std::ptr::eq(at, w_type)) {
+                // No __class__ override: guard via w_type field.
+                frame.guard_class(
+                    ctx,
+                    obj,
+                    &pyre_object::pyobject::INSTANCE_TYPE as *const _ as *const pyre_object::PyType,
+                );
+                let w_type_descr = crate::descr::instance_w_type_descr();
+                let w_type_opref = ctx.record_op_with_descr(
+                    majit_ir::OpCode::GetfieldGcR,
+                    &[obj],
+                    w_type_descr,
+                );
+                frame.implement_guard_value(ctx, w_type_opref, w_type as i64);
+            } else {
+                // __class__ override: guard identity.
+                frame.implement_guard_value(ctx, obj, concrete_obj as i64);
+            }
         } else if pyre_object::typeobject::is_type(concrete_obj) {
             // RPython: promote metaclass, not type object identity.
             frame.guard_class(
