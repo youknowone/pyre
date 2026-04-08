@@ -522,6 +522,16 @@ pub struct PyreSym {
     pub(crate) virtualref_boxes: Vec<(OpRef, usize)>,
 }
 
+/// C-ABI wrapper for `typedef::type()`, callable from JIT-compiled code.
+///
+/// RPython parity: `jit.promote(w_obj.__class__)` reads the class via
+/// getfield chain (mapdict). pyre stores `__class__` override in ATTR_TABLE
+/// (not a struct field), so JIT traces use `CallLoopinvariantR` to this
+/// function instead of getfield, then `GUARD_VALUE` on the result.
+pub extern "C" fn jit_read_class(obj: PyObjectRef) -> PyObjectRef {
+    pyre_interpreter::typedef::r#type(obj).unwrap_or(PY_NULL)
+}
+
 /// Trace-time view over the virtualizable `PyFrame`.
 ///
 /// Per-instruction wrapper that borrows persistent symbolic state from

@@ -665,12 +665,9 @@ fn type_descr_new_with_metaclass(
     }
 
     // type(obj) — 1-arg form returns the type
+    // PyPy objspace.py:400: space.type(w_obj) → w_obj.getclass(space)
+    // typedef::type() respects __class__ override for all object kinds.
     let obj = args[0];
-    unsafe {
-        if is_instance(obj) {
-            return Ok(w_instance_get_type(obj));
-        }
-    }
     if let Some(tp) = crate::typedef::r#type(obj) {
         return Ok(tp);
     }
@@ -738,19 +735,16 @@ pub fn call_isinstance(obj: PyObjectRef, cls: PyObjectRef) -> Option<bool> {
 
 /// Single-type isinstance check.
 ///
-/// PyPy: baseobjspace.py `isinstance_w` → `abstract_issubclass_w`
+/// PyPy abstractinst.py: p_recursive_isinstance_type_w uses
+/// space.type(w_obj) which respects __class__ override.
 fn isinstance_w(obj: PyObjectRef, cls: PyObjectRef) -> bool {
     unsafe {
         if !is_type(cls) {
             return false;
         }
-        let w_obj_type = if is_instance(obj) {
-            w_instance_get_type(obj)
-        } else {
-            match crate::typedef::r#type(obj) {
-                Some(t) => t,
-                None => return false,
-            }
+        let w_obj_type = match crate::typedef::r#type(obj) {
+            Some(t) => t,
+            None => return false,
         };
         issubtype_w(w_obj_type, cls)
     }
