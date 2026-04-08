@@ -12,6 +12,7 @@ pyre-interpreter = { workspace = true }
 majit-ir = { workspace = true }
 majit-macros = { workspace = true }
 majit-metainterp = { workspace = true }
+majit-codewriter = { workspace = true }
 majit-backend = { workspace = true }
 majit-trace = { workspace = true }
 majit-gc = { workspace = true }
