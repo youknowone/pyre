@@ -2989,20 +2989,17 @@ fn descr_set___class__(w_obj: PyObjectRef, w_newcls: PyObjectRef) -> PyResult {
                 ));
             }
         };
-        // objectobject.py:148-154 — full instance layout must match.
-        // typeobject.py:125-129 Layout.expand() returns 5-tuple:
+        // objectobject.py:148-154 — get_full_instance_layout() must match.
+        // typeobject.py:125-129 Layout.expand() compares 5-tuple:
         //   (typedef, newslotnames, base_layout, hasdict, weakrefable)
-        // Two types must agree on ALL components for __class__ assignment.
-        let layouts_compatible =
-            std::ptr::eq(w_type_get_layout(w_oldcls), w_type_get_layout(w_newcls))
-                && pyre_object::w_type_get_newslotnames(w_oldcls)
-                    == pyre_object::w_type_get_newslotnames(w_newcls)
-                && pyre_object::w_type_get_base_layout(w_oldcls)
-                    == pyre_object::w_type_get_base_layout(w_newcls)
-                && pyre_object::w_type_get_hasdict(w_oldcls)
-                    == pyre_object::w_type_get_hasdict(w_newcls)
-                && pyre_object::w_type_get_weakrefable(w_oldcls)
-                    == pyre_object::w_type_get_weakrefable(w_newcls);
+        let layouts_compatible = pyre_object::typeobject::Layout::expands_equal(
+            pyre_object::w_type_get_layout_ptr(w_oldcls),
+            pyre_object::w_type_get_hasdict(w_oldcls),
+            pyre_object::w_type_get_weakrefable(w_oldcls),
+            pyre_object::w_type_get_layout_ptr(w_newcls),
+            pyre_object::w_type_get_hasdict(w_newcls),
+            pyre_object::w_type_get_weakrefable(w_newcls),
+        );
         if !layouts_compatible {
             return Err(crate::PyError::type_error(format!(
                 "__class__ assignment: '{}' object layout differs from '{}'",

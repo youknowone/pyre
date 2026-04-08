@@ -398,7 +398,6 @@ pub fn w_object() -> PyObjectRef {
 }
 
 /// Create the root `object` type. MRO = [object].
-/// typeobject.py:174 `is_heaptype=False` — builtin type.
 fn new_root_typeobject(name: &str, init: fn(&mut PyNamespace)) -> PyObjectRef {
     let mut ns = Box::new(PyNamespace::new());
     ns.fix_ptr();
@@ -410,13 +409,24 @@ fn new_root_typeobject(name: &str, init: fn(&mut PyNamespace)) -> PyObjectRef {
         ns_ptr as *mut u8,
         &INSTANCE_TYPE as *const PyType,
     );
+    // typeobject.py:1261-1280 setup_builtin_type — root type gets its own Layout.
+    unsafe {
+        let layout = pyre_object::typeobject::leak_layout(pyre_object::typeobject::Layout {
+            typedef: &INSTANCE_TYPE as *const PyType,
+            nslots: 0,
+            newslotnames: vec![],
+            base_layout: std::ptr::null(),
+        });
+        pyre_object::w_type_set_layout(type_obj, layout);
+        pyre_object::w_type_set_hasdict(type_obj, true);
+        pyre_object::w_type_set_weakrefable(type_obj, true);
+    }
     unsafe { w_type_set_mro(type_obj, vec![type_obj]) };
     type_obj
 }
 
 /// Create a builtin type with a single base. MRO = [self] + base.mro().
-/// typeobject.py:174 `is_heaptype=False` — builtin type.
-/// `layout_pytype` defaults to `INSTANCE_TYPE` (general object layout).
+/// Layout defaults to INSTANCE_TYPE (general object layout).
 fn new_typeobject_with_base(
     name: &str,
     init: fn(&mut PyNamespace),
@@ -426,6 +436,10 @@ fn new_typeobject_with_base(
 }
 
 /// Create a builtin type with explicit layout PyType.
+///
+/// typeobject.py:1261-1280 setup_builtin_type parity: each builtin type
+/// gets its own Layout based on its instancetypedef. Types that share
+/// the same typedef as their base reuse the parent's Layout object.
 fn new_typeobject_with_base_and_layout(
     name: &str,
     init: fn(&mut PyNamespace),
@@ -438,6 +452,35 @@ fn new_typeobject_with_base_and_layout(
     let ns_ptr = Box::into_raw(ns);
     let bases = w_tuple_new(vec![base]);
     let type_obj = w_type_new_builtin(name, bases, ns_ptr as *mut u8, layout_pytype);
+
+    // typeobject.py:1273-1280 setup_builtin_type:
+    //   parent_layout = w_bestbase.layout
+    //   if parent_layout.typedef is instancetypedef:
+    //       return parent_layout      ← reuse
+    //   return Layout(instancetypedef, 0, base_layout=parent_layout)
+    unsafe {
+        let parent_layout = pyre_object::w_type_get_layout_ptr(base);
+        let reuse = if !parent_layout.is_null() {
+            std::ptr::eq((*parent_layout).typedef, layout_pytype)
+        } else {
+            false
+        };
+        let layout = if reuse {
+            parent_layout
+        } else {
+            pyre_object::typeobject::leak_layout(pyre_object::typeobject::Layout {
+                typedef: layout_pytype,
+                nslots: 0,
+                newslotnames: vec![],
+                base_layout: parent_layout,
+            })
+        };
+        pyre_object::w_type_set_layout(type_obj, layout);
+        // Builtin types generally have hasdict=true, weakrefable=true.
+        pyre_object::w_type_set_hasdict(type_obj, true);
+        pyre_object::w_type_set_weakrefable(type_obj, true);
+    }
+
     // MRO = [self] + base_mro
     let base_mro = unsafe { w_type_get_mro(base) };
     let mut mro = vec![type_obj];
