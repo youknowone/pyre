@@ -1409,6 +1409,70 @@ impl OptIntBounds {
                     self.make_ne(op.arg(0), op.arg(1), ctx);
                 }
             }
+            // intbounds.py:678-696 _propagate_int_is_true_or_zero +
+            // propagate_bounds_INT_IS_TRUE.
+            //
+            // ```python
+            // def _propagate_int_is_true_or_zero(self, op, valnonzero, valzero):
+            //     if self.is_raw_ptr(op.getarg(0)):
+            //         return
+            //     r = self.getintbound(op)
+            //     if r.is_constant():
+            //         if r.get_constant_int() == valnonzero:
+            //             b1 = self.getintbound(op.getarg(0))
+            //             if b1.known_nonnegative():
+            //                 b1.make_gt_const(0)
+            //                 self.propagate_bounds_backward(op.getarg(0))
+            //             elif b1.known_le_const(0):
+            //                 b1.make_lt_const(0)
+            //                 self.propagate_bounds_backward(op.getarg(0))
+            //         elif r.get_constant_int() == valzero:
+            //             self.make_constant_int(op.getarg(0), 0)
+            //             self.propagate_bounds_backward(op.getarg(0))
+            // ```
+            //
+            // The `make_constant_int` arm requires mutable ctx (it sets
+            // a forwarding to a constant). propagate_bounds_backward
+            // currently runs with `ctx: &OptContext`, so the constant
+            // arm is left out — bounds-only narrowing still fires.
+            OpCode::IntIsTrue => {
+                if ctx.is_raw_ptr(op.arg(0)) {
+                    return;
+                }
+                let r = self.getintbound(op.pos, ctx);
+                if r.is_constant() && r.lower == 1 {
+                    let arg0 = op.arg(0);
+                    let b1 = self.getintbound(arg0, ctx);
+                    if b1.known_nonnegative() {
+                        let _ = self.get_bound_mut(arg0).make_gt_const(0);
+                        self.propagate_bounds_backward(arg0, ctx);
+                    } else if b1.known_le_const(0) {
+                        let _ = self.get_bound_mut(arg0).make_lt_const(0);
+                        self.propagate_bounds_backward(arg0, ctx);
+                    }
+                }
+                // r == 0 (false) → arg is zero; needs make_constant_int
+                // which requires &mut OptContext. Skipped for now.
+            }
+            OpCode::IntIsZero => {
+                if ctx.is_raw_ptr(op.arg(0)) {
+                    return;
+                }
+                let r = self.getintbound(op.pos, ctx);
+                if r.is_constant() && r.lower == 0 {
+                    // r == valnonzero==0 (false): arg is nonzero
+                    let arg0 = op.arg(0);
+                    let b1 = self.getintbound(arg0, ctx);
+                    if b1.known_nonnegative() {
+                        let _ = self.get_bound_mut(arg0).make_gt_const(0);
+                        self.propagate_bounds_backward(arg0, ctx);
+                    } else if b1.known_le_const(0) {
+                        let _ = self.get_bound_mut(arg0).make_lt_const(0);
+                        self.propagate_bounds_backward(arg0, ctx);
+                    }
+                }
+                // r == 1 (true) → arg == 0; needs make_constant_int.
+            }
             _ => {}
         }
     }
