@@ -1073,6 +1073,8 @@ impl JitCodeBuilder {
             constants_r: Vec::new(),
             constants_f: Vec::new(),
             liveness: Vec::new(),
+            liveness_info: Vec::new(),
+            liveness_offsets: std::collections::HashMap::new(),
             opcodes: self.opcodes,
             sub_jitcodes: self.sub_jitcodes,
             fn_ptrs: self.fn_ptrs,

@@ -110,8 +110,14 @@ pub(crate) const MAX_HOST_CALL_ARITY: usize = 16;
 
 /// GC liveness metadata at a specific bytecode PC.
 ///
-/// RPython liveness.py: `[len_i][len_r][len_f][bitset_i][bitset_r][bitset_f]`
+/// RPython liveness.py: `[len_i][len_r][len_f][bitset_i][bitset_r][bitset_f]`.
 /// Tracks which registers of each type (int/ref/float) are live at a given PC.
+///
+/// TODO: pyre currently keeps this per-entry form alongside the packed
+/// `liveness_info` string on each JitCode so the codewriter can build
+/// the encoded bytes. Once the codewriter emits the packed form directly
+/// this can be removed and liveness will be consumed exclusively via
+/// `enumerate_vars(offset, all_liveness, ...)` (jitcode.py:146-167).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LivenessInfo {
     pub pc: u16,
@@ -124,30 +130,54 @@ pub struct LivenessInfo {
 }
 
 impl LivenessInfo {
-    /// jitcode.py:146-167 enumerate_vars parity.
-    /// Iterates live registers in typed order: int, then ref, then float.
-    /// Both encoder (get_list_of_active_boxes) and decoder (consume_one_section)
-    /// MUST use this same iteration order.
-    pub fn enumerate_vars(
-        &self,
-        mut callback_i: impl FnMut(u16),
-        mut callback_r: impl FnMut(u16),
-        mut callback_f: impl FnMut(u16),
-    ) {
-        for &idx in &self.live_i_regs {
-            callback_i(idx);
-        }
-        for &idx in &self.live_r_regs {
-            callback_r(idx);
-        }
-        for &idx in &self.live_f_regs {
-            callback_f(idx);
-        }
-    }
-
     /// Total number of live registers across all typed banks.
     pub fn total_live(&self) -> usize {
         self.live_i_regs.len() + self.live_r_regs.len() + self.live_f_regs.len()
+    }
+}
+
+/// RPython jitcode.py:146-167 `enumerate_vars(offset, all_liveness,
+/// callback_i, callback_r, callback_f, spec)`.
+///
+/// Reads the `[len_i][len_r][len_f]` header at `offset`, then walks the
+/// three packed bitsets (int, ref, float) via `LivenessIterator`,
+/// invoking the matching callback for each live register index.
+pub fn enumerate_vars(
+    mut offset: usize,
+    all_liveness: &[u8],
+    mut callback_i: impl FnMut(u32),
+    mut callback_r: impl FnMut(u32),
+    mut callback_f: impl FnMut(u32),
+) {
+    use majit_codewriter::liveness::LivenessIterator;
+    // jitcode.py:149-151
+    let length_i = all_liveness[offset] as u32;
+    let length_r = all_liveness[offset + 1] as u32;
+    let length_f = all_liveness[offset + 2] as u32;
+    // jitcode.py:152
+    offset += 3;
+    // jitcode.py:153-157
+    if length_i != 0 {
+        let mut it = LivenessIterator::new(offset, length_i, all_liveness);
+        for index in &mut it {
+            callback_i(index);
+        }
+        offset = it.offset;
+    }
+    // jitcode.py:158-162
+    if length_r != 0 {
+        let mut it = LivenessIterator::new(offset, length_r, all_liveness);
+        for index in &mut it {
+            callback_r(index);
+        }
+        offset = it.offset;
+    }
+    // jitcode.py:163-166
+    if length_f != 0 {
+        let mut it = LivenessIterator::new(offset, length_f, all_liveness);
+        for index in &mut it {
+            callback_f(index);
+        }
     }
 }
 
@@ -167,6 +197,18 @@ pub struct JitCode {
     pub constants_f: Vec<i64>,
     /// Liveness metadata for GC / deopt expansion.
     pub liveness: Vec<LivenessInfo>,
+    /// RPython `metainterp_sd.liveness_info`: packed `[len_i][len_r][len_f]`
+    /// headers followed by `encode_liveness`-bitsets, one entry per
+    /// distinct live-point PC. Upstream stores this on metainterp_sd and
+    /// shares it across all jitcodes; pyre keeps it per-jitcode for now
+    /// (same encoding, narrower sharing). Consumed via `enumerate_vars`.
+    pub liveness_info: Vec<u8>,
+    /// jit_pc → offset into `liveness_info`, set by the codewriter. In
+    /// upstream the offset lives inline in `JitCode.code` as a 2-byte
+    /// payload after the `-live-` opcode and is decoded via
+    /// `get_live_vars_info(pc, op_live)`. Pyre uses a side table until
+    /// the codewriter embeds `-live-` directly.
+    pub liveness_offsets: std::collections::HashMap<u32, u32>,
     /// Pool of majit IR opcodes referenced from the bytecode stream.
     pub opcodes: Vec<OpCode>,
     /// Sub-JitCodes for `inline_call` targets (compound methods).
@@ -271,6 +313,27 @@ impl JitCode {
     /// RPython: `JitCode.num_regs_and_consts_f()`
     pub fn num_regs_and_consts_f(&self) -> usize {
         self.num_regs[2] as usize + self.constants_f.len()
+    }
+
+    /// RPython jitcode.py:82-93 `get_live_vars_info(self, pc, op_live)`.
+    ///
+    /// Upstream walks `JitCode.code` to find the nearest `-live-` opcode
+    /// (at `pc` or `pc - OFFSET_SIZE - 1`) and decodes the 2-byte offset
+    /// that follows. Pyre's codewriter does not yet embed `-live-` in
+    /// `JitCode.code`, so the offset is read from the side table
+    /// `liveness_offsets[pc]` instead; the returned value is still an
+    /// offset into `JitCode.liveness_info` and is consumed by
+    /// `enumerate_vars` exactly like upstream.
+    pub fn get_live_vars_info(&self, pc: usize, _op_live: u8) -> usize {
+        if let Some(&offset) = self.liveness_offsets.get(&(pc as u32)) {
+            return offset as usize;
+        }
+        self._missing_liveness(pc)
+    }
+
+    /// RPython jitcode.py:95-100 `_missing_liveness(self, pc)`.
+    pub fn _missing_liveness(&self, pc: usize) -> ! {
+        panic!("missing liveness[{}] in JitCode", pc)
     }
 
     /// RPython: `JitCode.follow_jump(position)` -- follow a label at position.

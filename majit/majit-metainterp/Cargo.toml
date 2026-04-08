@@ -16,6 +16,7 @@ majit-ir = { workspace = true }
 majit-trace = { workspace = true }
 majit-backend = { workspace = true }
 majit-gc = { workspace = true }
+majit-codewriter = { workspace = true }
 majit-backend-dynasm = { workspace = true, optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
