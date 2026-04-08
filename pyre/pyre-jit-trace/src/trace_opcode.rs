@@ -698,19 +698,13 @@ impl MIFrame {
         }
     }
 
-    /// pyjitpl.py:3337 vrefs_after_residual_call +
-    /// pyjitpl.py:3349 vable_after_residual_call.
+    /// pyjitpl.py:3349-3366 vable_after_residual_call.
     ///
-    /// RPython: vrefs_after_residual_call runs first, then
-    /// vable_after_residual_call. If virtualizable escaped,
-    /// RPython raises SwitchToBlackhole (abort tracing).
-    /// Returns Err to signal abort.
-    fn vable_after_residual_call(&mut self, ctx: &mut TraceCtx) -> Result<(), PyError> {
-        // pyjitpl.py:3337-3347: check vrefs (always runs).
-        self.vrefs_after_residual_call(ctx);
-
-        // pyjitpl.py:3350: vinfo = self.jitdriver_sd.virtualizable_info
-        // pyjitpl.py:3351: if vinfo is not None:
+    /// Only checks virtualizable (not vrefs — those are checked
+    /// separately by vrefs_after_residual_call at the call site).
+    /// If virtualizable escaped, returns Err (SwitchToBlackhole parity).
+    fn vable_after_residual_call(&mut self) -> Result<(), PyError> {
+        // pyjitpl.py:3350-3351: if vinfo is not None:
         let obj_ptr = self.sym().concrete_vable_ptr;
         if obj_ptr.is_null() {
             return Ok(());
@@ -720,7 +714,7 @@ impl MIFrame {
         if vable_forced {
             // pyjitpl.py:3355-3366: the virtualizable escaped during
             // CALL_MAY_FORCE. RPython reloads fields from heap and
-            // raises SwitchToBlackhole(ABORT_ESCAPE).
+            // raises SwitchToBlackhole(ABORT_ESCAPE, raising_exception=True).
             return Err(PyError::type_error(
                 "virtualizable escaped during residual call (SwitchToBlackhole parity)",
             ));
@@ -789,7 +783,8 @@ impl MIFrame {
         // pyjitpl.py:3376: record VIRTUAL_REF_FINISH(vrefbox, virtualbox)
         let _ = ctx.record_op(OpCode::VirtualRefFinish, &[vref_opref, virt_opref]);
         // pyjitpl.py:3378: self.virtualref_boxes[i+1] = CONST_NULL
-        let null_opref = ctx.const_int(0);
+        // CONST_NULL is a Ref-typed null pointer, not Int 0.
+        let null_opref = ctx.const_ref(0);
         sym.virtualref_boxes[i + 1] = (null_opref, 0);
     }
 
@@ -3266,13 +3261,12 @@ impl MIFrame {
                             &[Type::Ref, Type::Ref, Type::Int],
                         )
                     };
-                    // CallAssemblerI handles guard failures internally
-                    // (call_assembler_fast_path). No GuardNotForced needed,
-                    // but virtualizable token must be cleaned up.
-                    // pyjitpl.py:3349: vable_after_residual_call — if
-                    // virtualizable escaped, abort (SwitchToBlackhole).
-                    this.vable_after_residual_call(ctx)?;
+                    // pyjitpl.py:2049: step 3 — vrefs_after_residual_call
+                    this.vrefs_after_residual_call(ctx);
+                    // pyjitpl.py:2078: step 5 — vable_after_residual_call
+                    this.vable_after_residual_call()?;
                     if ca_token.is_none() {
+                        // pyjitpl.py:2079: step 6 — GUARD_NOT_FORCED
                         this.push_call_replay_stack(ctx, callable, args, call_pc);
                         this.generate_guard(ctx, OpCode::GuardNotForced, &[]);
                         ctx.heap_cache_mut().invalidate_caches_for_escaped();
@@ -3287,7 +3281,10 @@ impl MIFrame {
                         &[this.frame(), callable, args[0]],
                         &[Type::Ref, Type::Ref, Type::Ref],
                     );
-                    this.vable_after_residual_call(ctx)?;
+                    // pyjitpl.py:2049: step 3
+                    this.vrefs_after_residual_call(ctx);
+                    // pyjitpl.py:2078: step 5
+                    this.vable_after_residual_call()?;
                     this.push_call_replay_stack(ctx, callable, args, call_pc);
                     this.generate_guard(ctx, OpCode::GuardNotForced, &[]);
                     ctx.heap_cache_mut().invalidate_caches_for_escaped();
@@ -3304,9 +3301,10 @@ impl MIFrame {
                 let force_fn = crate::callbacks::get().jit_force_callee_frame;
                 this.vable_and_vrefs_before_residual_call(ctx);
                 let result = ctx.call_may_force_ref_typed(force_fn, &[callee_frame], &[Type::Ref]);
-                // pyjitpl.py:3349: vable_after_residual_call — abort if forced
-                this.vable_after_residual_call(ctx)?;
-                // GuardNotForced fail → interpreter must re-execute CALL.
+                // pyjitpl.py:2049: step 3 — vrefs_after_residual_call
+                this.vrefs_after_residual_call(ctx);
+                // pyjitpl.py:2078: step 5 — vable_after_residual_call
+                this.vable_after_residual_call()?;
                 this.push_call_replay_stack(ctx, callable, args, call_pc);
                 this.generate_guard(ctx, OpCode::GuardNotForced, &[]);
                 ctx.heap_cache_mut().invalidate_caches_for_escaped();
