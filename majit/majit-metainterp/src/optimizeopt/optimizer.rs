@@ -2830,9 +2830,12 @@ impl Optimizer {
             op.args[i] = self.force_box(arg, ctx);
         }
         if op.opcode.is_guard() {
+            // optimizer.py:630-631: pendingfields = self.pendingfields; self.pendingfields = None
+            // — captured into ctx.pending_for_guard by the heap pass via emitting_operation.
+            // emit_guard_operation reads ctx.pending_for_guard inside store_final_boxes_in_guard
+            // and clears it.
+
             // optimizer.py:632-635: replaces_guard check BEFORE emit_guard_operation.
-            // If this guard should replace a previously emitted guard, do it
-            // now and return — skip all guard processing.
             if self.can_replace_guards {
                 if let Some(replacement) = self.replaces_guard.remove(&op.pos.0) {
                     let target_pos = replacement.pos.0 as usize;
@@ -2853,168 +2856,8 @@ impl Optimizer {
                 }
             }
 
-            // optimizer.py:652-686 emit_guard_operation
-            let opcode = op.opcode;
-
-            // optimizer.py:661-664: guard chain management.
-            if (opcode == OpCode::GuardNoException || opcode == OpCode::GuardException)
-                && self.last_guard_op.as_ref().is_some_and(|last| {
-                    last.opcode != OpCode::GuardNotForced && last.opcode != OpCode::GuardNotForced2
-                })
-            {
-                self.last_guard_op = None;
-            }
-            // optimizer.py:665-670: GUARD_ALWAYS_FAILS must never share resume
-            // data with a previous guard.
-            if opcode == OpCode::GuardAlwaysFails {
-                self.last_guard_op = None;
-            }
-
-            // optimizer.py:672-683: _copy_resume_data_from / store_final_boxes_in_guard.
-            let shared = op.descr.is_none() && self.last_guard_op.is_some();
-            if shared {
-                // optimizer.py:688-700 _copy_resume_data_from:
-                //   last_descr = last_guard_op.getdescr()
-                //   descr = invent_fail_descr_for_op(...)
-                //   guard_op.setdescr(descr); setfailargs(last.failargs)
-                //   if guard_op.opnum == GUARD_VALUE:
-                //       guard_op = self._maybe_replace_guard_value(guard_op, descr)
-                let last = self.last_guard_op.as_ref().unwrap();
-                op.descr = last.descr.clone();
-                op.fail_args = last.fail_args.clone();
-                op.rd_resume_position = last.rd_resume_position;
-                // Copy complete resume data so store_final_boxes_in_guard is a no-op.
-                op.rd_numb = last.rd_numb.clone();
-                op.rd_consts = last.rd_consts.clone();
-                op.rd_virtuals = last.rd_virtuals.clone();
-                if op.opcode == OpCode::GuardValue {
-                    op = Self::_maybe_replace_guard_value(op, ctx);
-                }
-            } else {
-                // optimizer.py:678: store_final_boxes_in_guard
-                op = Self::store_final_boxes_in_guard(op, ctx);
-                // optimizer.py:681-683: force_box on fail_args for unrolling.
-                if let Some(ref fa) = op.fail_args {
-                    let fargs: Vec<OpRef> = fa.iter().copied().collect();
-                    for farg in fargs {
-                        if !farg.is_none() {
-                            self.force_box(farg, ctx);
-                        }
-                    }
-                }
-                // optimizer.py:750-751: GUARD_VALUE → bool replacement after
-                // store_final_boxes_in_guard so descr.guard_opnum is preserved.
-                if op.opcode == OpCode::GuardValue {
-                    op = Self::_maybe_replace_guard_value(op, ctx);
-                }
-            }
-
-            // resume.py:570-574: _add_optimizer_sections captures the
-            // optimizer's knowledge AT THIS GUARD POINT.
-            // bridgeopt.py:74-88: known classes from ptr_info.
-            {
-                let mut heap_fields = Vec::new();
-                for pass in &self.passes {
-                    let fields = pass.export_cached_fields();
-                    if !fields.is_empty() {
-                        heap_fields = fields;
-                        break;
-                    }
-                }
-                // bridgeopt.py:74-88: collect known classes for bridge
-                // deserialization. RPython iterates liveboxes (= fail_args)
-                // and calls getptrinfo(box).get_known_class() for Ref boxes.
-                // Follow box replacement (forwarding) to find PtrInfo.
-                let mut known_classes = Vec::new();
-                if let Some(ref fa) = op.fail_args {
-                    for &farg in fa {
-                        if farg.is_none() {
-                            continue;
-                        }
-                        let resolved = ctx.get_box_replacement(farg);
-                        if let Some(info) = ctx.get_ptr_info(resolved) {
-                            if let Some(class_ptr) = info.get_known_class() {
-                                known_classes.push((farg, class_ptr));
-                            }
-                        }
-                    }
-                }
-                if !heap_fields.is_empty() || !known_classes.is_empty() {
-                    self.per_guard_knowledge.push((
-                        op.pos,
-                        OptimizerKnowledge {
-                            heap_fields,
-                            known_classes,
-                            loopinvariant_results: Vec::new(),
-                        },
-                    ));
-                }
-            }
-
-            // RPython parity: fail_arg_types are set by store_final_boxes_in_guard.
-            // RPython's typed Box objects carry type information intrinsically.
-            // Snapshot-based type inference resolves types during numbering.
-
-            // optimizer.py:630-631: pendingfields → rd_pendingfields
-            // resume.py:428-445: encode pending SetfieldGc/SetarrayitemGc
-            let pending = std::mem::take(&mut ctx.pending_for_guard);
-            if !pending.is_empty() {
-                op.rd_pendingfields = Some(
-                    pending
-                        .into_iter()
-                        .map(|pf_op| {
-                            let (target, value, item_index) =
-                                if pf_op.opcode == OpCode::SetarrayitemGc {
-                                    let idx = ctx
-                                        .get_constant_int(ctx.get_box_replacement(pf_op.arg(1)))
-                                        .unwrap_or(0);
-                                    (pf_op.arg(0), pf_op.arg(2), idx as i32)
-                                } else {
-                                    (pf_op.arg(0), pf_op.arg(1), -1i32)
-                                };
-                            // Extract field layout from the descriptor for backend
-                            // store emission on guard failure.
-                            let (field_offset, field_size, field_type) =
-                                if let Some(ref descr) = pf_op.descr {
-                                    if let Some(fd) = descr.as_field_descr() {
-                                        (fd.offset(), fd.field_size(), fd.field_type())
-                                    } else if let Some(ad) = descr.as_array_descr() {
-                                        let offset = ad.base_size()
-                                            + (item_index.max(0) as usize) * ad.item_size();
-                                        (offset, ad.item_size(), ad.item_type())
-                                    } else {
-                                        (0, 8, majit_ir::Type::Int)
-                                    }
-                                } else {
-                                    (0, 8, majit_ir::Type::Int)
-                                };
-                            majit_ir::GuardPendingFieldEntry {
-                                descr_index: pf_op.descr.as_ref().map_or(0, |d| d.index()),
-                                item_index,
-                                target: ctx.get_box_replacement(target),
-                                value: ctx.get_box_replacement(value),
-                                // resume.py:554-555: tagged encoding set during
-                                // resume numbering (_add_pending_fields).
-                                // UNASSIGNED means "not yet tagged".
-                                target_tagged: majit_ir::resumedata::UNASSIGNED,
-                                value_tagged: majit_ir::resumedata::UNASSIGNED,
-                                field_offset,
-                                field_size,
-                                field_type,
-                            }
-                        })
-                        .collect(),
-                );
-            }
-
-            // optimizer.py:679: update last_guard_op only for fresh guards
-            // (not shared). optimizer.py:684-685: GUARD_EXCEPTION breaks chain.
-            if !shared {
-                self.last_guard_op = Some(op.clone());
-            }
-            if opcode == OpCode::GuardException {
-                self.last_guard_op = None;
-            }
+            // optimizer.py:637: op = self.emit_guard_operation(op, pendingfields)
+            op = self.emit_guard_operation(op, ctx);
         } else {
             // optimizer.py:639-644: preserve last_guard_op for guard chaining
             // unless the op has side effects or is a call_pure that can raise.
@@ -3080,6 +2923,175 @@ impl Optimizer {
             );
         }
         ctx.in_final_emission = saved_in_final_emission;
+    }
+
+    /// optimizer.py:652-686 emit_guard_operation
+    ///
+    /// Manages the guard sharing chain (`_last_guard_op`) and dispatches to
+    /// `_copy_resume_data_from` (descrless follow-up guard, e.g.
+    /// `GUARD_NO_EXCEPTION` after a `CALL_MAY_FORCE`) or to
+    /// `store_final_boxes_in_guard` for fresh guards.
+    fn emit_guard_operation(&mut self, mut op: Op, ctx: &mut OptContext) -> Op {
+        let opcode = op.opcode;
+        // optimizer.py:661-664: GUARD_NO_EXCEPTION / GUARD_EXCEPTION can only
+        // share resume data with a preceding GUARD_NOT_FORCED. Anything else
+        // breaks the chain.
+        if (opcode == OpCode::GuardNoException || opcode == OpCode::GuardException)
+            && self.last_guard_op.as_ref().is_some_and(|last| {
+                last.opcode != OpCode::GuardNotForced && last.opcode != OpCode::GuardNotForced2
+            })
+        {
+            self.last_guard_op = None;
+        }
+        // optimizer.py:665-670: GUARD_ALWAYS_FAILS must never share resume data.
+        if opcode == OpCode::GuardAlwaysFails {
+            self.last_guard_op = None;
+        }
+
+        // optimizer.py:672-683: shared vs. fresh dispatch.
+        let shared = op.descr.is_none() && self.last_guard_op.is_some();
+        if shared {
+            op = self._copy_resume_data_from(op, ctx);
+        } else {
+            // optimizer.py:678: store_final_boxes_in_guard
+            op = Self::store_final_boxes_in_guard(op, ctx);
+            // optimizer.py:681-683: force_box on each fail_arg for unrolling.
+            if let Some(ref fa) = op.fail_args {
+                let fargs: Vec<OpRef> = fa.iter().copied().collect();
+                for farg in fargs {
+                    if !farg.is_none() {
+                        self.force_box(farg, ctx);
+                    }
+                }
+            }
+            // optimizer.py:750-751 (called from store_final_boxes_in_guard):
+            // GUARD_VALUE → bool replacement. We invoke it here so descr is
+            // already set when _maybe_replace_guard_value reads it.
+            if op.opcode == OpCode::GuardValue {
+                op = Self::_maybe_replace_guard_value(op, ctx);
+            }
+        }
+
+        // resume.py:570-574 _add_optimizer_sections + bridgeopt.py:74-88:
+        // capture per-guard knowledge for bridge serialization. RPython runs
+        // this inside store_final_boxes_in_guard via ResumeDataVirtualAdder;
+        // majit holds it adjacent to keep store_final_boxes_in_guard pure.
+        {
+            let mut heap_fields = Vec::new();
+            for pass in &self.passes {
+                let fields = pass.export_cached_fields();
+                if !fields.is_empty() {
+                    heap_fields = fields;
+                    break;
+                }
+            }
+            let mut known_classes = Vec::new();
+            if let Some(ref fa) = op.fail_args {
+                for &farg in fa {
+                    if farg.is_none() {
+                        continue;
+                    }
+                    let resolved = ctx.get_box_replacement(farg);
+                    if let Some(info) = ctx.get_ptr_info(resolved) {
+                        if let Some(class_ptr) = info.get_known_class() {
+                            known_classes.push((farg, class_ptr));
+                        }
+                    }
+                }
+            }
+            if !heap_fields.is_empty() || !known_classes.is_empty() {
+                self.per_guard_knowledge.push((
+                    op.pos,
+                    OptimizerKnowledge {
+                        heap_fields,
+                        known_classes,
+                        loopinvariant_results: Vec::new(),
+                    },
+                ));
+            }
+        }
+
+        // optimizer.py:630-631: pendingfields → rd_pendingfields.
+        // resume.py:428-445 _add_pending_fields encoding (UNASSIGNED tag is
+        // patched in by the resumedata numbering pass).
+        let pending = std::mem::take(&mut ctx.pending_for_guard);
+        if !pending.is_empty() {
+            op.rd_pendingfields = Some(
+                pending
+                    .into_iter()
+                    .map(|pf_op| {
+                        let (target, value, item_index) = if pf_op.opcode == OpCode::SetarrayitemGc
+                        {
+                            let idx = ctx
+                                .get_constant_int(ctx.get_box_replacement(pf_op.arg(1)))
+                                .unwrap_or(0);
+                            (pf_op.arg(0), pf_op.arg(2), idx as i32)
+                        } else {
+                            (pf_op.arg(0), pf_op.arg(1), -1i32)
+                        };
+                        let (field_offset, field_size, field_type) =
+                            if let Some(ref descr) = pf_op.descr {
+                                if let Some(fd) = descr.as_field_descr() {
+                                    (fd.offset(), fd.field_size(), fd.field_type())
+                                } else if let Some(ad) = descr.as_array_descr() {
+                                    let offset = ad.base_size()
+                                        + (item_index.max(0) as usize) * ad.item_size();
+                                    (offset, ad.item_size(), ad.item_type())
+                                } else {
+                                    (0, 8, majit_ir::Type::Int)
+                                }
+                            } else {
+                                (0, 8, majit_ir::Type::Int)
+                            };
+                        majit_ir::GuardPendingFieldEntry {
+                            descr_index: pf_op.descr.as_ref().map_or(0, |d| d.index()),
+                            item_index,
+                            target: ctx.get_box_replacement(target),
+                            value: ctx.get_box_replacement(value),
+                            target_tagged: majit_ir::resumedata::UNASSIGNED,
+                            value_tagged: majit_ir::resumedata::UNASSIGNED,
+                            field_offset,
+                            field_size,
+                            field_type,
+                        }
+                    })
+                    .collect(),
+            );
+        }
+
+        // optimizer.py:679: update last_guard_op only on the fresh-guard path.
+        if !shared {
+            self.last_guard_op = Some(op.clone());
+        }
+        // optimizer.py:684-685: GUARD_EXCEPTION breaks the chain.
+        if opcode == OpCode::GuardException {
+            self.last_guard_op = None;
+        }
+        op
+    }
+
+    /// optimizer.py:688-700 _copy_resume_data_from
+    ///
+    /// Inherits descr / fail_args / resume_data from `_last_guard_op` for the
+    /// follow-up descrless guard, then runs `_maybe_replace_guard_value` if
+    /// the inheriting op is a `GUARD_VALUE`.
+    fn _copy_resume_data_from(&mut self, mut op: Op, ctx: &mut OptContext) -> Op {
+        let last = self
+            .last_guard_op
+            .as_ref()
+            .expect("_copy_resume_data_from requires last_guard_op");
+        op.descr = last.descr.clone();
+        op.fail_args = last.fail_args.clone();
+        op.rd_resume_position = last.rd_resume_position;
+        // Copy complete resume data so store_final_boxes_in_guard is a no-op.
+        op.rd_numb = last.rd_numb.clone();
+        op.rd_consts = last.rd_consts.clone();
+        op.rd_virtuals = last.rd_virtuals.clone();
+        // optimizer.py:698-699: if guard_op.opnum == GUARD_VALUE: ...
+        if op.opcode == OpCode::GuardValue {
+            op = Self::_maybe_replace_guard_value(op, ctx);
+        }
+        op
     }
 
     /// optimizer.py:722-752 store_final_boxes_in_guard
