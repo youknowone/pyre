@@ -263,39 +263,77 @@ impl IntBound {
         }
     }
 
-    /// intutils.py: make_guards — generate guard ops to enforce these bounds.
+    /// intutils.py:1264-1289 `IntBound.make_guards(box, guards, optimizer)`
+    /// (line-by-line port).
     ///
-    /// Returns a list of (opcode, constant_arg) pairs. Handles:
-    /// - Constant → GUARD_VALUE
-    /// - Lower bound → INT_GE + GUARD_TRUE
-    /// - Upper bound → INT_LE + GUARD_TRUE
-    /// - Known bits → INT_AND + GUARD_VALUE
-    pub fn make_guards(&self) -> Vec<(majit_ir::OpCode, i64)> {
-        let mut guards = Vec::new();
+    /// ```python
+    /// def make_guards(self, box, guards, optimizer):
+    ///     if self.is_constant():
+    ///         guards.append(ResOperation(rop.GUARD_VALUE,
+    ///                                    [box, ConstInt(self.upper)]))
+    ///         return
+    ///     if self.lower > MININT:
+    ///         bound = self.lower
+    ///         op = ResOperation(rop.INT_GE, [box, ConstInt(bound)])
+    ///         guards.append(op)
+    ///         op = ResOperation(rop.GUARD_TRUE, [op])
+    ///         guards.append(op)
+    ///     if self.upper < MAXINT:
+    ///         bound = self.upper
+    ///         op = ResOperation(rop.INT_LE, [box, ConstInt(bound)])
+    ///         guards.append(op)
+    ///         op = ResOperation(rop.GUARD_TRUE, [op])
+    ///         guards.append(op)
+    ///     if not self._are_knownbits_implied():
+    ///         op = ResOperation(rop.INT_AND, [box, ConstInt(intmask(~self.tmask))])
+    ///         guards.append(op)
+    ///         op = ResOperation(rop.GUARD_VALUE, [op, ConstInt(intmask(self.tvalue))])
+    ///         guards.append(op)
+    /// ```
+    ///
+    /// Each `INT_GE` / `INT_LE` / `INT_AND` is followed by a guard whose
+    /// first argument is the *result* of that op, not `box`. The previous
+    /// pyre signature returned `Vec<(OpCode, i64)>` and the caller emitted
+    /// every guard against `box` directly, dropping the chained guard pair
+    /// and leaving the bound silently unenforced.
+    pub fn make_guards<F>(
+        &self,
+        box_ref: majit_ir::OpRef,
+        guards: &mut Vec<crate::optimizeopt::Op>,
+        alloc_const: &mut F,
+    ) where
+        F: FnMut(majit_ir::Value) -> majit_ir::OpRef,
+    {
+        use crate::optimizeopt::Op;
+        use majit_ir::{OpCode, Value};
 
-        // intutils.py: constant → GUARD_VALUE
         if self.is_constant() {
-            guards.push((majit_ir::OpCode::GuardValue, self.upper));
-            return guards;
+            let c = alloc_const(Value::Int(self.upper));
+            guards.push(Op::new(OpCode::GuardValue, &[box_ref, c]));
+            return;
         }
-
-        // intutils.py: lower bound → INT_GE
         if self.lower > i64::MIN {
-            guards.push((majit_ir::OpCode::IntGe, self.lower));
+            let bound = alloc_const(Value::Int(self.lower));
+            let op = Op::new(OpCode::IntGe, &[box_ref, bound]);
+            let op_pos = op.pos;
+            guards.push(op);
+            guards.push(Op::new(OpCode::GuardTrue, &[op_pos]));
         }
-
-        // intutils.py: upper bound → INT_LE
         if self.upper < i64::MAX {
-            guards.push((majit_ir::OpCode::IntLe, self.upper));
+            let bound = alloc_const(Value::Int(self.upper));
+            let op = Op::new(OpCode::IntLe, &[box_ref, bound]);
+            let op_pos = op.pos;
+            guards.push(op);
+            guards.push(Op::new(OpCode::GuardTrue, &[op_pos]));
         }
-
-        // intutils.py: known bits → INT_AND + GUARD_VALUE
         if !self.are_knownbits_implied() {
-            guards.push((majit_ir::OpCode::IntAnd, !self.tmask as i64));
-            guards.push((majit_ir::OpCode::GuardValue, self.tvalue as i64));
+            let mask = alloc_const(Value::Int(!self.tmask as i64));
+            let op = Op::new(OpCode::IntAnd, &[box_ref, mask]);
+            let op_pos = op.pos;
+            guards.push(op);
+            let value = alloc_const(Value::Int(self.tvalue as i64));
+            guards.push(Op::new(OpCode::GuardValue, &[op_pos, value]));
         }
-
-        guards
     }
 
     /// intutils.py: _are_knownbits_implied — check if known bits are

@@ -479,32 +479,81 @@ impl PtrInfo {
                 short.push(Op::new(OpCode::GuardNonnull, &[op]));
             }
             PtrInfo::KnownClass { class_ptr, .. } => {
-                // info.py:336-345: InstancePtrInfo.make_guards with known_class
+                // info.py:336-345: InstancePtrInfo.make_guards with _known_class
+                // (remove_gctypeptr=true branch — pyre's default object layout
+                // matches the modern translated PyPy "no gctypeptr" model).
                 let class_ref = alloc_const(Value::Ref(*class_ptr));
                 short.push(Op::new(OpCode::GuardNonnullClass, &[op, class_ref]));
             }
             PtrInfo::Instance(info) => {
                 // info.py:336-353: InstancePtrInfo.make_guards
                 if let Some(cls) = &info.known_class {
+                    // remove_gctypeptr branch
                     let class_ref = alloc_const(Value::Ref(*cls));
                     short.push(Op::new(OpCode::GuardNonnullClass, &[op, class_ref]));
+                } else if let Some(descr) = &info.descr {
+                    // info.py:346-351: descr-only branch.
+                    //   short.append(GUARD_NONNULL[op])
+                    //   short.append(GUARD_SUBCLASS[op, ConstInt(descr.get_vtable())])
+                    short.push(Op::new(OpCode::GuardNonnull, &[op]));
+                    let vtable = descr
+                        .as_size_descr()
+                        .map(|sd| sd.vtable() as i64)
+                        .unwrap_or(0);
+                    let vtable_const = alloc_const(Value::Int(vtable));
+                    short.push(Op::new(OpCode::GuardSubclass, &[op, vtable_const]));
                 } else {
-                    // info.py:353: fallback to AbstractStructPtrInfo (NonNull)
+                    // info.py:353: fall back to AbstractStructPtrInfo →
+                    // NonNullPtrInfo.make_guards (just GUARD_NONNULL).
                     short.push(Op::new(OpCode::GuardNonnull, &[op]));
                 }
             }
-            PtrInfo::Struct(_) => {
-                // info.py:360-366: StructPtrInfo.make_guards
+            PtrInfo::Struct(info) => {
+                // info.py:360-366: StructPtrInfo.make_guards.
+                //   if self.descr is not None:
+                //       c_typeid = ConstInt(self.descr.get_type_id())
+                //       short.extend([GUARD_NONNULL[op],
+                //                     GUARD_GC_TYPE[op, c_typeid]])
+                let type_id = info
+                    .descr
+                    .as_size_descr()
+                    .map(|sd| sd.type_id() as i64)
+                    .unwrap_or(0);
+                let type_id_const = alloc_const(Value::Int(type_id));
                 short.push(Op::new(OpCode::GuardNonnull, &[op]));
+                short.push(Op::new(OpCode::GuardGcType, &[op, type_id_const]));
             }
             PtrInfo::Constant(gcref) => {
                 // info.py:715-716: ConstPtrInfo.make_guards
                 let c = alloc_const(Value::Ref(*gcref));
                 short.push(Op::new(OpCode::GuardValue, &[op, c]));
             }
-            PtrInfo::Array(_) => {
-                // info.py:632-633: ArrayPtrInfo.make_guards
+            PtrInfo::Array(info) => {
+                // info.py:632-639: ArrayPtrInfo.make_guards.
+                //   AbstractVirtualPtrInfo.make_guards → NonNullPtrInfo.make_guards
+                //   short.append(GUARD_GC_TYPE[op, ConstInt(descr.get_type_id())])
+                //   if self.lenbound is not None:
+                //       lenop = ARRAYLEN_GC[op] (descr=self.descr)
+                //       short.append(lenop)
+                //       self.lenbound.make_guards(lenop, short, optimizer)
                 short.push(Op::new(OpCode::GuardNonnull, &[op]));
+                let type_id = info
+                    .descr
+                    .as_array_descr()
+                    .map(|ad| ad.type_id() as i64)
+                    .unwrap_or(0);
+                let type_id_const = alloc_const(Value::Int(type_id));
+                short.push(Op::new(OpCode::GuardGcType, &[op, type_id_const]));
+                // Always emit ARRAYLEN_GC + bound guards: pyre's
+                // ArrayPtrInfo.lenbound is a plain `IntBound`, not an
+                // `Option`, so the parity check is on `is_unbounded()`
+                // rather than `is None`.
+                if !info.lenbound.is_unbounded() {
+                    let lenop = Op::with_descr(OpCode::ArraylenGc, &[op], info.descr.clone());
+                    let lenop_pos = lenop.pos;
+                    short.push(lenop);
+                    info.lenbound.make_guards(lenop_pos, short, alloc_const);
+                }
             }
             PtrInfo::Str(sinfo) => {
                 // vstring.py:116-126: StrPtrInfo.make_guards
@@ -519,11 +568,10 @@ impl PtrInfo {
                         let lenop = Op::new(lenop_code, &[op]);
                         let lenop_pos = lenop.pos;
                         short.push(lenop);
-                        // intutils.py: IntBound.make_guards → generate bound guards
-                        for (guard_opcode, value) in bound.make_guards() {
-                            let c = alloc_const(Value::Int(value));
-                            short.push(Op::new(guard_opcode, &[lenop_pos, c]));
-                        }
+                        // intutils.py:1264-1289 IntBound.make_guards: emits the
+                        // chained INT_GE/INT_LE/INT_AND → GUARD_TRUE/GUARD_VALUE
+                        // pairs against `lenop_pos`.
+                        bound.make_guards(lenop_pos, short, alloc_const);
                     }
                 }
             }
