@@ -1430,7 +1430,16 @@ impl ExtendedShortPreambleBuilder {
     /// RPython parity: builds single `short` list from base ops + JUMP sentinel.
     /// For each base op, ensures missing deps from produced_short_boxes are
     /// inserted before the consumer (RPython use_box arg-handling parity).
-    pub fn setup(&mut self, short_preamble: &ShortPreamble, label_args: &[OpRef]) {
+    ///
+    /// Returns `true` on success; `false` if any op references an
+    /// unresolvable Phase 1 OpRef. RPython equivalent: `produce_arg`
+    /// returning None propagates up to `add_op_to_short` returning None,
+    /// and the entire short_op is dropped (shortpreamble.py:283-296,
+    /// 311-341). Pyre's structural counterpart is to bail out of `setup`
+    /// so the caller (`jump_to_existing_trace`) can fall back to
+    /// `jump_to_preamble` instead of attempting to inline a broken short
+    /// preamble.
+    pub fn setup(&mut self, short_preamble: &ShortPreamble, label_args: &[OpRef]) -> bool {
         // Build Phase 1 → current inputarg remap from arg_mapping.
         self.phase1_to_inputarg.clear();
         for entry in &short_preamble.ops {
@@ -1454,6 +1463,7 @@ impl ExtendedShortPreambleBuilder {
         // Build single short list with inline dep resolution.
         let inputargs_set: HashSet<OpRef> = label_args.iter().copied().collect();
         let constants_set: HashSet<u32> = short_preamble.constants.keys().copied().collect();
+        let pos_to_key = build_pos_to_key(&self.produced_short_boxes);
         self.short.clear();
         self.short_results.clear();
         for entry in &short_preamble.ops {
@@ -1466,7 +1476,18 @@ impl ExtendedShortPreambleBuilder {
             // RPython use_box arg loop: insert missing deps before this op.
             // Recursive: deps of deps are also inserted (transitive closure).
             for &arg in &op.args {
-                self.insert_dep_recursive(arg, &inputargs_set, &constants_set);
+                if !self.insert_dep_recursive(arg, &inputargs_set, &constants_set, &pos_to_key) {
+                    if crate::optimizeopt::majit_log_enabled() {
+                        eprintln!(
+                            "[jit] short_preamble setup: dropping inline (unresolved arg {:?} in op pos={:?} opcode={:?})",
+                            arg, op.pos, op.opcode
+                        );
+                    }
+                    self.short.clear();
+                    self.short_results.clear();
+                    self.label_args = label_args.to_vec();
+                    return false;
+                }
             }
             self.short_results.insert(op.pos);
             self.short.push(op);
@@ -1484,46 +1505,71 @@ impl ExtendedShortPreambleBuilder {
         self.label_args = label_args.to_vec();
         self.used_boxes = short_preamble.used_boxes.clone();
         self.short_jump_args = jump_args;
+        true
     }
 
     /// Recursively insert a dep (and its transitive deps) into self.short.
     /// Used by setup() to ensure all args of base ops are satisfied.
     /// Applies phase1_to_inputarg remap when reading from produced_short_boxes.
+    ///
+    /// Returns `true` if `arg` was resolved (or was already known); `false`
+    /// if it was an unresolvable Phase 1 reference. Mirrors RPython
+    /// `produce_arg → None` semantics (shortpreamble.py:283-296): a missing
+    /// dep means the entire short preamble cannot be inlined cleanly, so
+    /// the caller should bail out instead of leaving dangling args that
+    /// later trip `inline_short_preamble`'s `_map_args` (unroll.py:404).
     fn insert_dep_recursive(
         &mut self,
         arg: OpRef,
         inputargs_set: &HashSet<OpRef>,
         constants_set: &HashSet<u32>,
-    ) {
+        pos_to_key: &HashMap<OpRef, OpRef>,
+    ) -> bool {
         if self.short_results.contains(&arg)
             || inputargs_set.contains(&arg)
             || self.known_constants.contains(&arg)
             || constants_set.contains(&arg.0)
+            || arg.is_constant()
+            || arg.is_none()
         {
-            return;
+            return true;
         }
-        if let Some(dep) = self.produced_short_boxes.get(&arg).cloned() {
-            let dep_pos = dep.preamble_op.pos;
-            if self.short_results.contains(&dep_pos) {
-                return;
-            }
-            // Remap dep args on-the-fly (don't mutate produced_short_boxes)
-            let mut dep_op = dep.preamble_op.clone();
-            for a in &mut dep_op.args {
-                if let Some(&remapped) = self.phase1_to_inputarg.get(a) {
-                    *a = remapped;
-                }
-            }
-            // Recurse into dep's own args first (transitive)
-            for &dep_arg in &dep_op.args {
-                self.insert_dep_recursive(dep_arg, inputargs_set, constants_set);
-            }
-            self.short_results.insert(dep_pos);
-            self.short.push(dep_op);
-            if dep.preamble_op.opcode.is_ovf() {
-                self.short.push(Op::new(OpCode::GuardNoOverflow, &[]));
+        // shortpreamble.py:284-285 — `op in self.produced_short_boxes`.
+        // RPython uses Box identity; pyre needs both direct lookup and the
+        // reverse `preamble_op.pos → key` lookup because produce_arg may
+        // return a `.pos` distinct from the original key.
+        let dep = self.produced_short_boxes.get(&arg).cloned().or_else(|| {
+            pos_to_key
+                .get(&arg)
+                .and_then(|key| self.produced_short_boxes.get(key).cloned())
+        });
+        let Some(dep) = dep else {
+            return false;
+        };
+        let dep_pos = dep.preamble_op.pos;
+        if self.short_results.contains(&dep_pos) {
+            return true;
+        }
+        // Remap dep args on-the-fly (don't mutate produced_short_boxes)
+        let mut dep_op = dep.preamble_op.clone();
+        for a in &mut dep_op.args {
+            if let Some(&remapped) = self.phase1_to_inputarg.get(a) {
+                *a = remapped;
             }
         }
+        // Recurse into dep's own args first (transitive). If any sub-dep
+        // can't be resolved, bail out — the dep cannot be safely emitted.
+        for &dep_arg in &dep_op.args {
+            if !self.insert_dep_recursive(dep_arg, inputargs_set, constants_set, pos_to_key) {
+                return false;
+            }
+        }
+        self.short_results.insert(dep_pos);
+        self.short.push(dep_op);
+        if dep.preamble_op.opcode.is_ovf() {
+            self.short.push(Op::new(OpCode::GuardNoOverflow, &[]));
+        }
+        true
     }
 
     fn use_box_recursive(&mut self, result: OpRef, visiting: &mut HashSet<OpRef>) -> Option<Op> {
