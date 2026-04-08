@@ -1083,6 +1083,7 @@ impl JitCodeBuilder {
             jit_to_py_pc: Vec::new(),
             py_to_jit_pc: Vec::new(),
             nlocals: 0,
+            depth_at_py_pc: Vec::new(),
             has_abort: self.has_abort,
             jitdriver_sd: None,
         }

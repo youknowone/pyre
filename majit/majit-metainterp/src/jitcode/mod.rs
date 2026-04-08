@@ -237,6 +237,15 @@ pub struct JitCode {
     /// Used by bhimpl_jit_merge_point's recursive call to limit frame writeback
     /// to merge-point args only (RPython greens + reds parity).
     pub nlocals: usize,
+    /// flatten.py / regalloc.py parity: symbolic value-stack depth at each
+    /// Python PC, in slots above `stack_base = nlocals + ncells`. RPython's
+    /// flatten/regalloc statically assigns every value-stack temporary to a
+    /// typed register; pyre's codewriter mirrors this with
+    /// `move_r(stack_base + depth, ...)`. Resume / merge-point exit paths
+    /// read this to know how many stack registers to fill / write back —
+    /// without it the runtime would need a separate runtime_stacks Vec
+    /// (which RPython jitcodes never use).
+    pub depth_at_py_pc: Vec<u16>,
     /// True if BC_ABORT was emitted (not BC_ABORT_PERMANENT).
     /// Set by JitCodeBuilder::abort(), not by raw byte scan.
     pub has_abort: bool,
