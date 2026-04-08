@@ -185,6 +185,9 @@ pub enum PtrInfo {
     /// Virtual raw buffer.
     /// info.py: RawBufferPtrInfo
     VirtualRawBuffer(VirtualRawBufferInfo),
+    /// Virtual raw slice (offset alias into a parent raw buffer).
+    /// info.py: RawSlicePtrInfo
+    VirtualRawSlice(VirtualRawSliceInfo),
     /// Virtualizable object (interpreter frame).
     Virtualizable(VirtualizableFieldState),
     /// vstring.py:50: StrPtrInfo — string with known length bounds.
@@ -228,6 +231,7 @@ impl PtrInfo {
             PtrInfo::VirtualStruct(v) => v.last_guard_pos,
             PtrInfo::VirtualArrayStruct(v) => v.last_guard_pos,
             PtrInfo::VirtualRawBuffer(v) => v.last_guard_pos,
+            PtrInfo::VirtualRawSlice(v) => v.last_guard_pos,
             PtrInfo::Virtualizable(v) => v.last_guard_pos,
             PtrInfo::Str(s) => s.last_guard_pos,
             PtrInfo::Constant(_) => return None, // ConstPtrInfo has no last_guard_pos
@@ -248,6 +252,7 @@ impl PtrInfo {
             PtrInfo::VirtualStruct(v) => v.last_guard_pos,
             PtrInfo::VirtualArrayStruct(v) => v.last_guard_pos,
             PtrInfo::VirtualRawBuffer(v) => v.last_guard_pos,
+            PtrInfo::VirtualRawSlice(v) => v.last_guard_pos,
             PtrInfo::Virtualizable(v) => v.last_guard_pos,
             PtrInfo::Str(s) => s.last_guard_pos,
             PtrInfo::Constant(_) => return None,
@@ -268,6 +273,7 @@ impl PtrInfo {
             PtrInfo::VirtualStruct(v) => v.last_guard_pos = pos,
             PtrInfo::VirtualArrayStruct(v) => v.last_guard_pos = pos,
             PtrInfo::VirtualRawBuffer(v) => v.last_guard_pos = pos,
+            PtrInfo::VirtualRawSlice(v) => v.last_guard_pos = pos,
             PtrInfo::Virtualizable(v) => v.last_guard_pos = pos,
             PtrInfo::Str(s) => s.last_guard_pos = pos,
             PtrInfo::Constant(_) => {} // ConstPtrInfo: no-op
@@ -375,6 +381,7 @@ impl PtrInfo {
             | PtrInfo::VirtualStruct(_)
             | PtrInfo::VirtualArrayStruct(_)
             | PtrInfo::VirtualRawBuffer(_)
+            | PtrInfo::VirtualRawSlice(_)
             | PtrInfo::Virtualizable(_)
             | PtrInfo::Str(_) => true,
         }
@@ -390,6 +397,7 @@ impl PtrInfo {
                 | PtrInfo::VirtualStruct(_)
                 | PtrInfo::VirtualArrayStruct(_)
                 | PtrInfo::VirtualRawBuffer(_)
+                | PtrInfo::VirtualRawSlice(_)
         )
     }
 
@@ -955,6 +963,7 @@ impl PtrInfo {
                 | PtrInfo::VirtualStruct(_)
                 | PtrInfo::VirtualArrayStruct(_)
                 | PtrInfo::VirtualRawBuffer(_)
+                | PtrInfo::VirtualRawSlice(_)
         )
     }
 
@@ -1465,6 +1474,24 @@ pub struct VirtualArrayStructInfo {
     /// resume.py VArrayStructInfo.fielddescrs — InteriorFieldDescr per field.
     /// Used by _number_virtuals to extract item_size/field_offset/field_size.
     pub fielddescrs: Vec<DescrRef>,
+    /// info.py:91-92
+    pub last_guard_pos: i32,
+}
+
+/// info.py:RawSlicePtrInfo — alias view into a parent virtual raw buffer.
+///
+/// Created by `make_virtual_raw_slice` (virtualize.py:60-65) when an
+/// `INT_ADD(rawbuf, const_offset)` is folded against a virtual raw buffer.
+/// Reads / writes through a slice add `offset` to the requested byte
+/// offset and forward to the parent buffer.
+#[derive(Clone, Debug)]
+pub struct VirtualRawSliceInfo {
+    /// Slice offset relative to the parent buffer's base.
+    pub offset: usize,
+    /// OpRef of the parent VirtualRawBuffer (or another VirtualRawSlice
+    /// — `optimize_int_add` flattens chained slices when the underlying
+    /// info is `VirtualRawBufferInfo`/`VirtualRawSliceInfo`).
+    pub parent: OpRef,
     /// info.py:91-92
     pub last_guard_pos: i32,
 }

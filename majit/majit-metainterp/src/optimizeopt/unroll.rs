@@ -2890,6 +2890,15 @@ impl OptUnroll {
                     }
                 }
             }
+            PtrInfo::VirtualRawSlice(info) => {
+                // RawSlicePtrInfo points back to a parent virtual raw buffer.
+                // The parent must already have been imported by the caller.
+                let parent_ref = info.parent;
+                ctx.set_ptr_info(opref, PtrInfo::VirtualRawSlice(info));
+                if let Some(parent_info) = exported_infos.get(&parent_ref) {
+                    self.setinfo_from_preamble(parent_ref, parent_info, exported_infos, ctx);
+                }
+            }
             PtrInfo::Instance(info) => {
                 ctx.set_ptr_info(opref, PtrInfo::Instance(info.clone()));
                 for &(_, field_ref) in &info.fields {

@@ -124,6 +124,7 @@ impl OptVirtualize {
             Some(PtrInfo::VirtualArray(vinfo)) => PtrInfo::VirtualArray(vinfo),
             Some(PtrInfo::VirtualArrayStruct(vinfo)) => PtrInfo::VirtualArrayStruct(vinfo),
             Some(PtrInfo::VirtualRawBuffer(vinfo)) => PtrInfo::VirtualRawBuffer(vinfo),
+            Some(PtrInfo::VirtualRawSlice(vinfo)) => PtrInfo::VirtualRawSlice(vinfo),
             Some(PtrInfo::Virtualizable(vinfo)) => PtrInfo::Virtualizable(vinfo),
             Some(PtrInfo::Instance(mut iinfo)) => {
                 if iinfo.known_class.is_none() {
@@ -280,6 +281,21 @@ impl OptVirtualize {
                 self.force_virtual_array_struct(resolved, vinfo, ctx)
             }
             PtrInfo::VirtualRawBuffer(vinfo) => self.force_virtual_raw_buffer(resolved, vinfo, ctx),
+            PtrInfo::VirtualRawSlice(slice) => {
+                // Force the parent buffer first, then emit an INT_ADD that
+                // re-creates the slice pointer concretely. RPython does the
+                // same in info.RawSlicePtrInfo.force_box.
+                let parent_forced = self.force_virtual(slice.parent, ctx);
+                let parent_forced = ctx.get_box_replacement(parent_forced);
+                let offset_ref = self.emit_constant_int(ctx, slice.offset as i64);
+                let add_op = Op::new(OpCode::IntAdd, &[parent_forced, offset_ref]);
+                let new_ref = ctx.emit_extra(ctx.current_pass_idx, add_op);
+                ctx.set_ptr_info(resolved, PtrInfo::nonnull());
+                if resolved != new_ref {
+                    ctx.replace_op(resolved, new_ref);
+                }
+                new_ref
+            }
             PtrInfo::Virtualizable(vinfo) => {
                 if self.is_standard_virtualizable_ref(resolved, ctx) {
                     resolved
@@ -529,6 +545,45 @@ impl OptVirtualize {
         }
 
         alloc_ref
+    }
+
+    /// virtualize.py:60-65 make_virtual_raw_slice
+    ///
+    /// Create a `RawSlicePtrInfo` aliasing `parent` at byte offset `offset`.
+    /// `source_op` is the trace op (typically `INT_ADD`) whose result becomes
+    /// the slice. PtrInfo is set on `source_op.pos` and the slice is treated
+    /// as virtual until forced.
+    fn make_virtual_raw_slice(
+        &mut self,
+        offset: usize,
+        parent: OpRef,
+        source_op: &Op,
+        ctx: &mut OptContext,
+    ) {
+        let opinfo = crate::optimizeopt::info::VirtualRawSliceInfo {
+            offset,
+            parent,
+            last_guard_pos: -1,
+        };
+        ctx.set_ptr_info(source_op.pos, PtrInfo::VirtualRawSlice(opinfo));
+    }
+
+    /// Resolve a slice/buffer alias chain to the underlying parent OpRef and
+    /// the cumulative byte offset. Returns `(parent, total_offset)` when the
+    /// chain ends in a `VirtualRawBuffer`, or `None` otherwise.
+    fn resolve_raw_slice(opref: OpRef, ctx: &OptContext) -> Option<(OpRef, usize)> {
+        let mut current = ctx.get_box_replacement(opref);
+        let mut total_offset = 0usize;
+        loop {
+            match ctx.get_ptr_info(current) {
+                Some(PtrInfo::VirtualRawSlice(slice)) => {
+                    total_offset = total_offset.checked_add(slice.offset)?;
+                    current = ctx.get_box_replacement(slice.parent);
+                }
+                Some(PtrInfo::VirtualRawBuffer(_)) => return Some((current, total_offset)),
+                _ => return None,
+            }
+        }
     }
 
     fn force_virtual_raw_buffer(
@@ -1074,15 +1129,68 @@ impl OptVirtualize {
         OptimizationResult::PassOn
     }
 
+    /// virtualize.py:255-266 optimize_INT_ADD
+    ///
+    /// Detect `INT_ADD(rawbuf_or_slice, constant_offset)` against a virtual
+    /// raw buffer (or an existing slice into one) and replace it with a
+    /// new `RawSlicePtrInfo` so subsequent reads/writes through the result
+    /// fold against the parent buffer.
+    fn optimize_int_add(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+        if op.num_args() < 2 {
+            return OptimizationResult::PassOn;
+        }
+        let arg0 = ctx.get_box_replacement(op.arg(0));
+        let Some(offset) = ctx.get_constant_int(op.arg(1)) else {
+            return OptimizationResult::PassOn;
+        };
+        let info = ctx.get_ptr_info(arg0).cloned();
+        match info {
+            Some(PtrInfo::VirtualRawBuffer(_)) => {
+                if offset < 0 {
+                    return OptimizationResult::PassOn;
+                }
+                self.make_virtual_raw_slice(offset as usize, arg0, op, ctx);
+                OptimizationResult::Remove
+            }
+            Some(PtrInfo::VirtualRawSlice(slice)) => {
+                if offset < 0 {
+                    return OptimizationResult::PassOn;
+                }
+                let total = slice
+                    .offset
+                    .checked_add(offset as usize)
+                    .unwrap_or(slice.offset);
+                self.make_virtual_raw_slice(total, slice.parent, op, ctx);
+                OptimizationResult::Remove
+            }
+            _ => OptimizationResult::PassOn,
+        }
+    }
+
     fn optimize_raw_load(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let buf_ref = ctx.get_box_replacement(op.arg(0));
         let offset_ref = op.arg(1);
 
         if let Some(offset) = ctx.get_constant_int(offset_ref) {
-            if let Some(PtrInfo::VirtualRawBuffer(vinfo)) = ctx.get_ptr_info(buf_ref) {
-                let offset = offset as usize;
-                if let Some((_, _, val_ref)) =
-                    vinfo.entries.iter().find(|(off, _, _)| *off == offset)
+            // virtualize.py:358-371: walk through RawSlicePtrInfo to the
+            // underlying VirtualRawBuffer, accumulating any slice offset.
+            let (parent, base_offset) = match Self::resolve_raw_slice(buf_ref, ctx) {
+                Some((p, o)) => (p, o),
+                None if matches!(
+                    ctx.get_ptr_info(buf_ref),
+                    Some(PtrInfo::VirtualRawBuffer(_))
+                ) =>
+                {
+                    (buf_ref, 0)
+                }
+                None => return OptimizationResult::PassOn,
+            };
+            if let Some(PtrInfo::VirtualRawBuffer(vinfo)) = ctx.get_ptr_info(parent) {
+                let lookup_offset = base_offset + offset as usize;
+                if let Some((_, _, val_ref)) = vinfo
+                    .entries
+                    .iter()
+                    .find(|(off, _, _)| *off == lookup_offset)
                 {
                     ctx.replace_op(op.pos, *val_ref);
                     return OptimizationResult::Remove;
@@ -1098,20 +1206,30 @@ impl OptVirtualize {
         let value_ref = ctx.get_box_replacement(op.arg(2));
 
         if let Some(offset) = ctx.get_constant_int(offset_ref) {
-            if let Some(info) = ctx.get_ptr_info_mut(buf_ref) {
-                if let PtrInfo::VirtualRawBuffer(vinfo) = info {
-                    let offset = offset as usize;
-                    // Update or insert entry (use default word size 8 for untyped stores)
-                    if let Some(entry) = vinfo.entries.iter_mut().find(|(off, _, _)| *off == offset)
-                    {
-                        entry.2 = value_ref;
-                    } else {
-                        // Use write_value for sorted insertion with overlap check.
-                        // Default length of 8 bytes (word-sized store).
-                        let _ = vinfo.write_value(offset, 8, value_ref);
-                    }
-                    return OptimizationResult::Remove;
+            // virtualize.py:374-385: same slice→parent walk as raw_load.
+            let (parent, base_offset) = match Self::resolve_raw_slice(buf_ref, ctx) {
+                Some((p, o)) => (p, o),
+                None if matches!(
+                    ctx.get_ptr_info(buf_ref),
+                    Some(PtrInfo::VirtualRawBuffer(_))
+                ) =>
+                {
+                    (buf_ref, 0)
                 }
+                None => return OptimizationResult::PassOn,
+            };
+            if let Some(PtrInfo::VirtualRawBuffer(vinfo)) = ctx.get_ptr_info_mut(parent) {
+                let store_offset = base_offset + offset as usize;
+                if let Some(entry) = vinfo
+                    .entries
+                    .iter_mut()
+                    .find(|(off, _, _)| *off == store_offset)
+                {
+                    entry.2 = value_ref;
+                } else {
+                    let _ = vinfo.write_value(store_offset, 8, value_ref);
+                }
+                return OptimizationResult::Remove;
             }
         }
         OptimizationResult::PassOn
@@ -1439,7 +1557,10 @@ impl Optimization for OptVirtualize {
             | OpCode::GetinteriorfieldGcF => self.optimize_getinteriorfield_gc(op, ctx),
             OpCode::SetinteriorfieldGc => self.optimize_setinteriorfield_gc(op, ctx),
 
-            // Raw memory access on potentially-virtual raw buffers
+            // virtualize.py:255-266 optimize_INT_ADD: rawbuf + const → slice
+            OpCode::IntAdd => self.optimize_int_add(op, ctx),
+
+            // Raw memory access on potentially-virtual raw buffers (and slices)
             OpCode::RawLoadI | OpCode::RawLoadF => self.optimize_raw_load(op, ctx),
             OpCode::RawStore => self.optimize_raw_store(op, ctx),
 

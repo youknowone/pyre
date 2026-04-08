@@ -1785,6 +1785,13 @@ fn export_single_value(
                     entries,
                 };
             }
+            PtrInfo::VirtualRawSlice(_) => {
+                // RawSlicePtrInfo aliases its parent buffer; the parent is
+                // always exported separately. Slices have no independent
+                // virtual-state representation, so emit NonNull (matches
+                // RPython's `getlenbound` fallback for RawSlicePtrInfo).
+                return VirtualStateInfo::NonNull;
+            }
             PtrInfo::KnownClass {
                 class_ptr,
                 is_nonnull: _,
