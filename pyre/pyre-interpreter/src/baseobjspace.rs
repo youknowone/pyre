@@ -2275,7 +2275,7 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
             // Step 2: data descriptor takes priority over instance dict
             if let Some(descr) = w_descr {
                 if is_data_descr(descr) {
-                    if let Some(result) = get(descr, obj, w_type) {
+                    if let Some(result) = get(descr, obj, w_type)? {
                         return Ok(result);
                     }
                 }
@@ -2295,7 +2295,7 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
             // Step 4: non-data descriptor
             // PyPy: descroperation.py — invoke __get__ to bind methods
             if let Some(descr) = w_descr {
-                if let Some(result) = get(descr, obj, w_type) {
+                if let Some(result) = get(descr, obj, w_type)? {
                     return Ok(result);
                 }
                 // Step 5: builtin methods found in base type MRO need binding
@@ -2376,7 +2376,7 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
             }
 
             if let Some(value) = lookup_in_type_where(obj, name) {
-                if let Some(result) = get(value, PY_NULL, obj) {
+                if let Some(result) = get(value, PY_NULL, obj)? {
                     return Ok(result);
                 }
                 return Ok(value);
@@ -2400,7 +2400,7 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
                 let w_metaclass = *w_metaclass;
                 if is_type(w_metaclass) {
                     if let Some(value) = lookup_in_type_where(w_metaclass, name) {
-                        if let Some(result) = get(value, obj, w_metaclass) {
+                        if let Some(result) = get(value, obj, w_metaclass)? {
                             return Ok(result);
                         }
                         return Ok(value);
@@ -2427,7 +2427,7 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
             if unsafe { crate::is_function(method) } {
                 return Ok(pyre_object::w_method_new(method, obj, w_type));
             }
-            if let Some(result) = unsafe { get(method, obj, w_type) } {
+            if let Some(result) = unsafe { get(method, obj, w_type)? } {
                 return Ok(result);
             }
             return Ok(method);
@@ -2632,7 +2632,7 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
             } {
                 return Ok(pyre_object::w_method_new(method, obj, w_class));
             }
-            if let Some(result) = unsafe { get(method, obj, w_class) } {
+            if let Some(result) = unsafe { get(method, obj, w_class)? } {
                 return Ok(result);
             }
             return Ok(method);
@@ -2899,9 +2899,13 @@ unsafe fn is_data_descr(descr: PyObjectRef) -> bool {
 ///
 /// PyPy: descroperation.py `space.get(w_descr, w_obj)` →
 /// dispatch on descriptor type, then fallback to __get__ MRO lookup.
-unsafe fn get(descr: PyObjectRef, obj: PyObjectRef, w_type: PyObjectRef) -> Option<PyObjectRef> {
+unsafe fn get(
+    descr: PyObjectRef,
+    obj: PyObjectRef,
+    w_type: PyObjectRef,
+) -> Result<Option<PyObjectRef>, crate::PyError> {
     if descr.is_null() {
-        return None;
+        return Ok(None);
     }
 
     // PyPy removes __get__ from BuiltinFunction.typedef. Builtin functions
@@ -2910,19 +2914,19 @@ unsafe fn get(descr: PyObjectRef, obj: PyObjectRef, w_type: PyObjectRef) -> Opti
     if crate::is_function(descr)
         && crate::is_builtin_code(crate::function_get_code(descr) as pyre_object::PyObjectRef)
     {
-        return None;
+        return Ok(None);
     }
 
     // property: PyPy W_Property.get → call fget(obj)
     if is_property(descr) {
         if obj.is_null() {
-            return Some(descr);
+            return Ok(Some(descr));
         }
         let fget = w_property_get_fget(descr);
         if fget.is_null() || is_none(fget) {
-            return None;
+            return Ok(None);
         }
-        return Some(crate::call_function(fget, &[obj]));
+        return Ok(Some(crate::call_function(fget, &[obj])));
     }
 
     // typedef.py:464-475 Member.descr_member_get:
@@ -2932,17 +2936,20 @@ unsafe fn get(descr: PyObjectRef, obj: PyObjectRef, w_type: PyObjectRef) -> Opti
     //   if w_result is None: raise AttributeError(self.name)
     //   return w_result
     if pyre_object::is_member(descr) {
-        // typedef.py:467: unbound access → return descriptor itself
+        // typedef.py:467
         if obj.is_null() || is_none(obj) {
-            return Some(descr);
+            return Ok(Some(descr));
         }
-        // typedef.py:470: typecheck — verify obj is instance of descriptor's class
+        // typedef.py:470: self.typecheck(space, w_obj) → TypeError
         let w_cls = pyre_object::w_member_get_cls(descr);
-        if !w_cls.is_null() && is_type(w_cls) {
-            if !isinstance_w(obj, w_cls) {
-                // TypeError: descriptor doesn't apply
-                return None;
-            }
+        if !w_cls.is_null() && is_type(w_cls) && !isinstance_w(obj, w_cls) {
+            let slot_name = pyre_object::w_member_get_name(descr);
+            return Err(crate::PyError::type_error(format!(
+                "descriptor '{}' for '{}' objects doesn't apply to '{}' object",
+                slot_name,
+                pyre_object::w_type_get_name(w_cls),
+                (*(*obj).ob_type).name,
+            )));
         }
         let slot_name = pyre_object::w_member_get_name(descr);
         let found = ATTR_TABLE.with(|table| {
@@ -2951,18 +2958,19 @@ unsafe fn get(descr: PyObjectRef, obj: PyObjectRef, w_type: PyObjectRef) -> Opti
                 .get(&(obj as usize))
                 .and_then(|d| d.get(slot_name).copied())
         });
-        // typedef.py:472-474: if slot value is None → AttributeError
+        // typedef.py:472-474: if w_result is None: raise AttributeError(self.name)
         if found.is_none() {
-            // Return None to signal "not found" — caller's AttributeError
-            // path handles this (line 2318 in getattr).
-            return None;
+            return Err(crate::PyError::new(
+                crate::PyErrorKind::AttributeError,
+                slot_name.to_string(),
+            ));
         }
-        return found;
+        return Ok(found);
     }
 
     // staticmethod: PyPy StaticMethod.descr_staticmethod_get → return w_function
     if is_staticmethod(descr) {
-        return Some(w_staticmethod_get_func(descr));
+        return Ok(Some(w_staticmethod_get_func(descr)));
     }
 
     // classmethod: PyPy ClassMethod.descr_classmethod_get → func bound to class
@@ -2970,23 +2978,21 @@ unsafe fn get(descr: PyObjectRef, obj: PyObjectRef, w_type: PyObjectRef) -> Opti
         let func = w_classmethod_get_func(descr);
         let receiver = if !w_type.is_null() { w_type } else { obj };
         if receiver.is_null() || is_none(receiver) {
-            return Some(func);
+            return Ok(Some(func));
         }
         let owner = crate::typedef::r#type(receiver).unwrap_or(PY_NULL);
-        return Some(pyre_object::w_method_new(func, receiver, owner));
+        return Ok(Some(pyre_object::w_method_new(func, receiver, owner)));
     }
 
     // General __get__: look up __get__ on the descriptor's own type MRO
-    // PyPy: descroperation.py → space.get_and_call_function(w_get, descr, obj, type)
     if let Some(descr_type) = crate::typedef::r#type(descr) {
         if let Some(get_fn) = lookup_in_type_where(descr_type, "__get__") {
             if !get_fn.is_null() {
-                // Call __get__(descr, obj, type) via ObjSpace.call_function
-                return Some(crate::call_function(get_fn, &[descr, obj, w_type]));
+                return Ok(Some(crate::call_function(get_fn, &[descr, obj, w_type])));
             }
         }
     }
-    None
+    Ok(None)
 }
 
 /// Call a descriptor's __set__ method.
