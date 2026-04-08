@@ -2975,10 +2975,7 @@ fn descr_set___class__(w_obj: PyObjectRef, w_newcls: PyObjectRef) -> PyResult {
             )));
         }
         // objectobject.py:143-145 — w_newcls must be a heap type.
-        // In pyre, heap types are user-defined classes created by
-        // class statement / type(). Built-in types (int, str, etc.)
-        // are NOT heap types.
-        if !is_heaptype(w_newcls) {
+        if !w_type_is_heaptype(w_newcls) {
             return Err(crate::PyError::type_error(
                 "__class__ assignment: only for heap types".to_string(),
             ));
@@ -2993,14 +2990,18 @@ fn descr_set___class__(w_obj: PyObjectRef, w_newcls: PyObjectRef) -> PyResult {
             }
         };
         // objectobject.py:148-154 — full instance layout must match.
-        // In pyre, layout compatibility means both old and new class
-        // must be user-defined (INSTANCE_TYPE) instances. Built-in
-        // types have incompatible C layouts (W_IntObject vs W_ListObject).
-        let obj_ob_type = (*w_obj).ob_type;
-        if !std::ptr::eq(obj_ob_type, &INSTANCE_TYPE) {
+        // typeobject.py:125-129 `Layout.expand()` returns
+        // `(typedef, newslotnames, base_layout, hasdict, weakrefable)`.
+        // Two types must agree on all components for __class__ assignment.
+        // In pyre: compare layout PyType (typedef) and nslots.
+        let old_layout = w_type_get_layout(w_oldcls);
+        let new_layout = w_type_get_layout(w_newcls);
+        let old_nslots = w_type_get_nslots(w_oldcls);
+        let new_nslots = w_type_get_nslots(w_newcls);
+        if !std::ptr::eq(old_layout, new_layout) || old_nslots != new_nslots {
             return Err(crate::PyError::type_error(format!(
                 "__class__ assignment: '{}' object layout differs from '{}'",
-                (*obj_ob_type).name,
+                pyre_object::w_type_get_name(w_oldcls),
                 pyre_object::w_type_get_name(w_newcls),
             )));
         }
@@ -3008,27 +3009,6 @@ fn descr_set___class__(w_obj: PyObjectRef, w_newcls: PyObjectRef) -> PyResult {
         (*w_obj).w_class = w_newcls;
     }
     Ok(w_none())
-}
-
-/// typeobject.py — check if a type is a heap type (user-defined class).
-///
-/// Heap types are dynamically created by `class` statement or `type()`.
-/// Built-in types (int, str, list, etc.) are NOT heap types.
-/// In pyre, heap types have `ob_type == TYPE_TYPE` and were created
-/// by `w_type_new()` (not by init_typeobjects static definitions).
-#[inline]
-fn is_heaptype(w_type: PyObjectRef) -> bool {
-    // A type is a heap type if it was created dynamically.
-    // Built-in types created by init_typeobjects have their w_class
-    // set to the 'type' type object but are conceptually not heap types.
-    // For now, all user-defined classes are heap types, and built-in
-    // types are not. We distinguish by checking if the type appears
-    // in the TYPEOBJECT_CACHE (built-in → not heap).
-    let addr = w_type as usize;
-    let is_builtin = crate::typedef::TYPEOBJECT_CACHE
-        .get()
-        .map_or(false, |cache| cache.values().any(|&v| v == addr));
-    !is_builtin
 }
 
 pub fn setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult {

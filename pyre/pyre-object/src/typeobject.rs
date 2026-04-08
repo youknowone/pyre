@@ -11,13 +11,13 @@ use crate::pyobject::*;
 
 /// Python type object (user-defined class).
 ///
-/// Layout: `[ob_type | name | bases | dict]`
+/// PyPy: pypy/objspace/std/typeobject.py W_TypeObject
 ///
 /// - `name`: heap-allocated class name string
 /// - `bases`: tuple of base type objects (PyObjectRef to tuple)
 /// - `dict`: raw pointer to PyNamespace (class methods/attrs)
-///
-/// PyPy equivalent fields: W_TypeObject.name, bases_w, dict_w
+/// - `flag_heaptype`: typeobject.py:544 — True for dynamically created types
+///   (class statement / type()), False for builtin types
 #[repr(C)]
 pub struct W_TypeObject {
     pub ob_header: PyObject,
@@ -27,14 +27,38 @@ pub struct W_TypeObject {
     pub bases: PyObjectRef,
     /// Raw pointer to the class namespace (PyNamespace from pyre-interpreter).
     pub dict: *mut u8,
-    /// Cached C3 MRO — PyPy: W_TypeObject.mro_w.
+    /// Cached C3 MRO — W_TypeObject.mro_w.
     /// Computed once at type creation and cached.
     pub mro_w: *mut Vec<PyObjectRef>,
+    /// typeobject.py:144,184 `flag_heaptype` — immutable after creation.
+    /// True for user-defined classes (class statement / type()),
+    /// False for builtin types created by init_typeobjects.
+    pub flag_heaptype: bool,
+    /// typeobject.py:153,336 `layout` — immutable after creation.
+    ///
+    /// Points to the PyType that describes the RPython-level instance
+    /// layout. For user-defined classes this is `&INSTANCE_TYPE`;
+    /// for builtin subclasses (e.g. int subclass) it's `&INT_TYPE`.
+    /// `get_full_instance_layout()` compares this pointer to decide
+    /// whether `__class__` reassignment is safe.
+    ///
+    /// Corresponds to `Layout.typedef` in PyPy's typeobject.py:113.
+    pub layout: *const PyType,
+    /// typeobject.py:114 `Layout.nslots` — number of `__slots__` entries.
+    /// 0 for classes without `__slots__`. Used in layout comparison:
+    /// classes with different nslots have incompatible layouts.
+    pub nslots: u32,
 }
 
 /// Allocate a new W_TypeObject.
 ///
 /// PyPy equivalent: W_TypeObject.__init__(space, name, bases_w, dict_w)
+/// Allocate a new W_TypeObject with `flag_heaptype = true`.
+///
+/// typeobject.py:174 `__init__(..., is_heaptype=True)` — dynamically
+/// created types (class statement / type()) are heap types.
+/// Layout is `INSTANCE_TYPE` (all user-defined instances share
+/// the same RPython-level struct layout).
 pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: *mut u8) -> PyObjectRef {
     let obj = Box::new(W_TypeObject {
         ob_header: PyObject {
@@ -45,6 +69,53 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: *mut u8) -> PyObject
         name: Box::into_raw(Box::new(name.to_string())),
         bases,
         dict: dict_ptr,
+        flag_heaptype: true,
+        layout: &INSTANCE_TYPE as *const PyType,
+        nslots: 0,
+    });
+    Box::into_raw(obj) as PyObjectRef
+}
+
+/// Set the number of `__slots__` entries on a type object.
+///
+/// # Safety
+/// `obj` must be a valid W_TypeObject pointer.
+pub unsafe fn w_type_set_nslots(obj: PyObjectRef, n: u32) {
+    (*(obj as *mut W_TypeObject)).nslots = n;
+}
+
+/// Get the number of `__slots__` entries on a type object.
+///
+/// # Safety
+/// `obj` must be a valid W_TypeObject pointer.
+#[inline]
+pub unsafe fn w_type_get_nslots(obj: PyObjectRef) -> u32 {
+    (*(obj as *const W_TypeObject)).nslots
+}
+
+/// Allocate a new W_TypeObject with `flag_heaptype = false`.
+///
+/// typeobject.py:174 `__init__(..., is_heaptype=False)` — builtin types
+/// created by init_typeobjects are not heap types.
+/// `layout_pytype` specifies which PyType describes the instance layout.
+pub fn w_type_new_builtin(
+    name: &str,
+    bases: PyObjectRef,
+    dict_ptr: *mut u8,
+    layout_pytype: *const PyType,
+) -> PyObjectRef {
+    let obj = Box::new(W_TypeObject {
+        ob_header: PyObject {
+            ob_type: &TYPE_TYPE as *const PyType,
+            w_class: std::ptr::null_mut(),
+        },
+        mro_w: std::ptr::null_mut(),
+        name: Box::into_raw(Box::new(name.to_string())),
+        bases,
+        dict: dict_ptr,
+        flag_heaptype: false,
+        layout: layout_pytype,
+        nslots: 0,
     });
     Box::into_raw(obj) as PyObjectRef
 }
@@ -78,6 +149,28 @@ pub unsafe fn w_type_set_mro(obj: PyObjectRef, mro: Vec<PyObjectRef>) {
 #[inline]
 pub unsafe fn is_type(obj: PyObjectRef) -> bool {
     py_type_check(obj, &TYPE_TYPE)
+}
+
+/// typeobject.py:543-544 `is_heaptype(self)`.
+///
+/// # Safety
+/// `obj` must be a valid W_TypeObject pointer.
+#[inline]
+pub unsafe fn w_type_is_heaptype(obj: PyObjectRef) -> bool {
+    (*(obj as *const W_TypeObject)).flag_heaptype
+}
+
+/// typeobject.py:336-337 `get_full_instance_layout(self)`.
+///
+/// Returns the layout key (PyType pointer) that describes the instance's
+/// RPython-level struct layout. Two types have compatible layouts iff
+/// their layout keys are identical.
+///
+/// # Safety
+/// `obj` must be a valid W_TypeObject pointer.
+#[inline]
+pub unsafe fn w_type_get_layout(obj: PyObjectRef) -> *const PyType {
+    (*(obj as *const W_TypeObject)).layout
 }
 
 #[cfg(test)]

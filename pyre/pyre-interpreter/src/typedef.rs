@@ -230,20 +230,37 @@ pub fn init_typeobjects() {
     reg.insert(&TYPE_TYPE as *const PyType as usize, type_type as usize);
     let _ = W_TYPE_TYPEOBJECT.set(type_type as usize);
 
-    // int — PyPy: intobject.py W_IntObject.typedef, bases=(object,)
-    let int_type = new_typeobject_with_base("int", init_int_type, object_type);
+    // int — intobject.py W_IntObject.typedef, bases=(object,)
+    // Layout = INT_TYPE because instances are W_IntObject.
+    let int_type = new_typeobject_with_base_and_layout(
+        "int",
+        init_int_type,
+        object_type,
+        &INT_TYPE as *const PyType,
+    );
     reg.insert(&INT_TYPE as *const PyType as usize, int_type as usize);
 
-    // float — PyPy: floatobject.py, bases=(object,)
+    // float — floatobject.py, bases=(object,)
     reg.insert(
         &FLOAT_TYPE as *const PyType as usize,
-        new_typeobject_with_base("float", init_float_type, object_type) as usize,
+        new_typeobject_with_base_and_layout(
+            "float",
+            init_float_type,
+            object_type,
+            &FLOAT_TYPE as *const PyType,
+        ) as usize,
     );
 
-    // bool — PyPy: boolobject.py, bases=(int,)
+    // bool — boolobject.py, bases=(int,)
+    // Layout = BOOL_TYPE (not INT_TYPE: different struct size).
     reg.insert(
         &BOOL_TYPE as *const PyType as usize,
-        new_typeobject_with_base("bool", init_bool_type, int_type) as usize,
+        new_typeobject_with_base_and_layout(
+            "bool",
+            init_bool_type,
+            int_type,
+            &BOOL_TYPE as *const PyType,
+        ) as usize,
     );
 
     // str — PyPy: unicodeobject.py, bases=(object,)
@@ -381,29 +398,46 @@ pub fn w_object() -> PyObjectRef {
 }
 
 /// Create the root `object` type. MRO = [object].
+/// typeobject.py:174 `is_heaptype=False` — builtin type.
 fn new_root_typeobject(name: &str, init: fn(&mut PyNamespace)) -> PyObjectRef {
     let mut ns = Box::new(PyNamespace::new());
     ns.fix_ptr();
     init(&mut ns);
     let ns_ptr = Box::into_raw(ns);
-    let type_obj = w_type_new(name, PY_NULL, ns_ptr as *mut u8);
+    let type_obj = w_type_new_builtin(
+        name,
+        PY_NULL,
+        ns_ptr as *mut u8,
+        &INSTANCE_TYPE as *const PyType,
+    );
     unsafe { w_type_set_mro(type_obj, vec![type_obj]) };
     type_obj
 }
 
 /// Create a builtin type with a single base. MRO = [self] + base.mro().
-/// PyPy: typeobject.py — compute_default_mro for single-inheritance
+/// typeobject.py:174 `is_heaptype=False` — builtin type.
+/// `layout_pytype` defaults to `INSTANCE_TYPE` (general object layout).
 fn new_typeobject_with_base(
     name: &str,
     init: fn(&mut PyNamespace),
     base: PyObjectRef,
+) -> PyObjectRef {
+    new_typeobject_with_base_and_layout(name, init, base, &INSTANCE_TYPE as *const PyType)
+}
+
+/// Create a builtin type with explicit layout PyType.
+fn new_typeobject_with_base_and_layout(
+    name: &str,
+    init: fn(&mut PyNamespace),
+    base: PyObjectRef,
+    layout_pytype: *const PyType,
 ) -> PyObjectRef {
     let mut ns = Box::new(PyNamespace::new());
     ns.fix_ptr();
     init(&mut ns);
     let ns_ptr = Box::into_raw(ns);
     let bases = w_tuple_new(vec![base]);
-    let type_obj = w_type_new(name, bases, ns_ptr as *mut u8);
+    let type_obj = w_type_new_builtin(name, bases, ns_ptr as *mut u8, layout_pytype);
     // MRO = [self] + base_mro
     let base_mro = unsafe { w_type_get_mro(base) };
     let mut mro = vec![type_obj];
@@ -419,6 +453,7 @@ fn new_typeobject_with_base(
 /// Create a named builtin type inheriting from `object`.
 ///
 /// Used by extension modules (e.g. _sre) to define their own types.
+/// typeobject.py:174 `is_heaptype=False` — builtin type.
 pub fn make_builtin_type(name: &str, init: fn(&mut PyNamespace)) -> PyObjectRef {
     new_typeobject_with_base(name, init, w_object())
 }
