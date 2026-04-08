@@ -1160,7 +1160,7 @@ impl MIFrame {
     /// pyjitpl.py:1087 parity: after a field read that might have set the
     /// needs_guard_not_invalidated flag (quasi-immutable field), emit the
     /// guard with full snapshot via record_guard.
-    fn flush_guard_not_invalidated(&mut self, ctx: &mut TraceCtx) {
+    pub(crate) fn flush_guard_not_invalidated(&mut self, ctx: &mut TraceCtx) {
         if let Some(saved_orgpc) = ctx.pending_guard_not_invalidated_pc() {
             ctx.set_pending_guard_not_invalidated(None);
             // pyjitpl.py:1087 parity: use the field read's orgpc so the
@@ -1866,6 +1866,25 @@ impl MIFrame {
     ) {
         // heapcache.py: skip guard if class already known for this object
         if ctx.heap_cache().is_class_known(obj) {
+            return;
+        }
+        // pyjitpl.py:2558-2560 generate_guard parity:
+        //     if isinstance(box, Const):    # no need for a guard
+        //         return
+        // The concrete value (and therefore its class) is known at trace
+        // time, so the runtime type check is guaranteed to pass. RPython
+        // also short-circuits before capture_resumedata, so no snapshot is
+        // attached for the skipped guard. heapcache.class_now_known is
+        // still called below — pyjitpl.py:1523 opimpl_guard_class invokes
+        // it unconditionally after generate_guard.
+        if obj.is_constant() {
+            // pyjitpl.py:1087 parity: a pending GUARD_NOT_INVALIDATED from a
+            // preceding quasi-immut field read must still be flushed even
+            // when the type guard is skipped, otherwise the watcher and the
+            // trace's quasi-immut dependency would be silently dropped.
+            self.flush_guard_not_invalidated(ctx);
+            ctx.heap_cache_mut()
+                .class_now_known(obj, majit_ir::GcRef(expected_type as usize));
             return;
         }
         let expected_type_const = ctx.const_int(expected_type as usize as i64);
