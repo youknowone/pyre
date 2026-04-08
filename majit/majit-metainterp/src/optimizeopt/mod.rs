@@ -436,18 +436,40 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
         }
         // RPython: box.type — check constant_types_for_numbering (includes
         // inputarg types and constant pool types registered by the tracer).
+        //
+        // resoperation.py Box.type parity: a Box's type is always one of
+        // `'i'` / `'r'` / `'f'`. Void is NOT a valid Box type — only
+        // value-producing ops have Boxes. pyre's recorder assigns `pos`
+        // to every op (including void ops like SetfieldGc and guards),
+        // so a stale lookup of a void op's pos would otherwise leak
+        // `Type::Void` here. Filter it out and fall through so it never
+        // reaches snapshot_box_types / livebox_types / fail_arg_types,
+        // where it would propagate into bridge `exit_types` and produce
+        // `Value::Void` slots in `decode_exit_layout_values` that zero
+        // out the bridge fail-arg bank.
         if let Some(&tp) = self.ctx.constant_types_for_numbering.get(&opref.0) {
-            return tp;
+            if tp != majit_ir::Type::Void {
+                return tp;
+            }
         }
         // RPython box.type parity: snapshot Box carries its type.
         if let Some(&tp) = self.ctx.snapshot_box_types.get(&opref.0) {
-            return tp;
+            if tp != majit_ir::Type::Void {
+                return tp;
+            }
         }
-        // Check emitted op result type (most accurate for concrete values)
+        // Check emitted op result type (most accurate for concrete values).
+        // Void result_type means the op produces no value (SetfieldGc,
+        // guards, …). RPython would never query Box.type for such an op;
+        // fall through to the PtrInfo / default-int probes below.
         let resolved = self.ctx.get_box_replacement(opref);
         for op in &self.ctx.new_operations {
             if op.pos == resolved {
-                return op.result_type();
+                let tp = op.result_type();
+                if tp != majit_ir::Type::Void {
+                    return tp;
+                }
+                break;
             }
         }
         // PtrInfo presence → Ref type (for non-emitted ops like input args)

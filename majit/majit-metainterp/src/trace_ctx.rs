@@ -605,6 +605,15 @@ impl TraceCtx {
     /// RPython parity: boxes carry their own type. Here we check
     /// inputargs, constant pool (constant_type + numbering overrides),
     /// and recorded ops to determine the type.
+    ///
+    /// resoperation.py Box.type parity: a Box's type is always one of
+    /// `'i'` / `'r'` / `'f'`. Void is NOT a valid Box type — only
+    /// value-producing ops have Boxes. pyre's recorder assigns `pos`
+    /// to every op (including void ops like SetfieldGc and guards),
+    /// so a stale lookup of a void op's pos would otherwise return
+    /// `Type::Void`. Filter that case out and return `None` so callers
+    /// fall back to a safe default rather than letting Void leak into
+    /// `snapshot_box_types` / `livebox_types` / `fail_arg_types`.
     pub fn get_opref_type(&self, opref: OpRef) -> Option<Type> {
         if (opref.0 as usize) < self.recorder.num_inputargs() {
             return Some(self.recorder.inputarg_types()[opref.0 as usize]);
@@ -622,6 +631,7 @@ impl TraceCtx {
         self.recorder
             .get_op_by_pos(opref)
             .map(|op| op.result_type())
+            .filter(|tp| *tp != Type::Void)
     }
 
     /// The green key hash (loop header PC) for this trace.
