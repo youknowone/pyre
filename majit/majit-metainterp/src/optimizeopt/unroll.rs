@@ -1114,6 +1114,7 @@ impl UnrollOptimizer {
                 .last()
                 .map(|target| target.as_jump_target_descr()),
             &exported_end_args,
+            &exported_renamed_inputarg_types,
         );
         // RPython Box parity: drop duplicate-position ops. In RPython
         // each Box is unique so collisions can't happen. Keep first.
@@ -3563,6 +3564,7 @@ fn assemble_peeled_trace(
         start_label_descr,
         loop_label_descr,
         &[], // no p1_end_args for simple assembly
+        &[], // no inputarg_types for simple assembly
     )
 }
 
@@ -3582,6 +3584,7 @@ fn assemble_peeled_trace_with_jump_args(
     start_label_descr: Option<DescrRef>,
     loop_label_descr: Option<DescrRef>,
     p1_end_args: &[OpRef],
+    inputarg_types: &[Type],
 ) -> Vec<Op> {
     let mut result =
         Vec::with_capacity(p1_ops.len() + p2_ops.len() + 1 + imported_short_aliases.len());
@@ -3625,6 +3628,22 @@ fn assemble_peeled_trace_with_jump_args(
             next += 1;
         }
         next
+    };
+
+    // RPython Box.type parity: SameAs opcode must match the source Box's type.
+    // In the flat OpRef model, inputargs don't have a defining op in `result`,
+    // so consult `inputarg_types` first and only then fall back to the emitted op.
+    let derive_same_as_opcode = |source: OpRef, result: &[Op]| -> OpCode {
+        if (source.0 as usize) < body_num_inputs {
+            if let Some(tp) = inputarg_types.get(source.0 as usize) {
+                return OpCode::same_as_for_type(*tp);
+            }
+        }
+        result
+            .iter()
+            .find(|op| op.pos == source)
+            .map(|op| OpCode::same_as_for_type(op.opcode.result_type()))
+            .unwrap_or(OpCode::SameAsI)
     };
 
     if let Some(start_label_descr) = start_label_descr {
@@ -3733,14 +3752,7 @@ fn assemble_peeled_trace_with_jump_args(
                 already_defined.insert(entry.result);
                 continue;
             }
-            let same_as_opcode = {
-                let ty = result
-                    .iter()
-                    .find(|op| op.pos == entry.source)
-                    .map(|op| op.opcode.result_type())
-                    .unwrap_or(Type::Int);
-                OpCode::same_as_for_type(ty)
-            };
+            let same_as_opcode = derive_same_as_opcode(entry.source, &result);
             let mut op = Op::new(same_as_opcode, &[entry.source]);
             op.pos = entry.result;
             result.push(op);
@@ -3860,14 +3872,7 @@ fn assemble_peeled_trace_with_jump_args(
             else {
                 continue;
             };
-            let same_as_opcode = {
-                let ty = result
-                    .iter()
-                    .find(|op| op.pos == source)
-                    .map(|op| op.opcode.result_type())
-                    .unwrap_or(Type::Int);
-                OpCode::same_as_for_type(ty)
-            };
+            let same_as_opcode = derive_same_as_opcode(source, &result);
             let mut op = Op::new(same_as_opcode, &[source]);
             op.pos = la;
             result.push(op);
@@ -3963,18 +3968,7 @@ fn assemble_peeled_trace_with_jump_args(
         };
         if let Some(source) = source_opt {
             if preamble_defs.contains(&source) {
-                // Determine the correct SameAs opcode based on the preamble
-                // op's result type. Using SameAsI for Float values would cause
-                // Cranelift to misplace the value in an integer register.
-                let same_as_opcode = result
-                    .iter()
-                    .find(|op| op.pos == source)
-                    .map(|op| match op.opcode.result_type() {
-                        Type::Float => OpCode::SameAsF,
-                        Type::Ref => OpCode::SameAsR,
-                        _ => OpCode::SameAsI,
-                    })
-                    .unwrap_or(OpCode::SameAsI);
+                let same_as_opcode = derive_same_as_opcode(source, &result);
                 let mut op = Op::new(same_as_opcode, &[source]);
                 op.pos = la;
                 result.push(op);
