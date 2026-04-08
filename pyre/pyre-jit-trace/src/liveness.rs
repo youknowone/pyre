@@ -1,8 +1,6 @@
 //! Bytecode liveness analysis (codewriter/liveness.py parity).
 
 use pyre_interpreter::bytecode::{CodeObject, Instruction};
-use std::cell::RefCell;
-use std::collections::HashMap;
 
 /// Skip Cache pseudo-instructions starting at `pos`.
 /// Returns the index of the first non-Cache instruction at or after `pos`.
