@@ -7,7 +7,7 @@ repository.workspace = true
 description = "Meta-interpreter and optimizer for majit JIT compiler"
 
 [features]
-default = ["cranelift"]
+default = []
 dynasm = ["dep:majit-backend-dynasm"]
 cranelift = ["dep:majit-backend-cranelift"]
 

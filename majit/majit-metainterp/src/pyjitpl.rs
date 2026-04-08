@@ -12,6 +12,9 @@ pub(crate) use majit_backend_cranelift::CraneliftBackend as BackendImpl;
 pub(crate) use majit_backend_dynasm::runner::DynasmBackend as BackendImpl;
 #[cfg(target_arch = "wasm32")]
 pub(crate) use majit_backend_wasm::WasmBackend as BackendImpl;
+
+#[cfg(not(any(feature = "cranelift", feature = "dynasm", target_arch = "wasm32")))]
+compile_error!("majit-metainterp requires a backend: enable feature \"cranelift\" or \"dynasm\"");
 use majit_ir::{FailDescr, GcRef, InputArg, Op, OpCode, OpRef, Type, Value};
 use majit_trace::history::TreeLoop;
 use majit_trace::warmstate::{HotResult, WarmEnterState};

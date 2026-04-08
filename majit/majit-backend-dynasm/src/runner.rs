@@ -283,7 +283,7 @@ impl Backend for DynasmBackend {
             asm.set_jump_target_addr(orig_compiled.label_addr);
         }
 
-        // assembler.py:638 rebuild_faillocs_from_descr(faildescr, ...)
+        // assembler.py:638 rebuild_faillocs_from_descr(faildescr, inputargs)
         // RPython uses the exact faildescr object. We find the matching
         // DynasmFailDescr by (trace_id, fail_index) across root loop +
         // all bridges. This handles bridge-on-bridge correctly.
@@ -292,7 +292,15 @@ impl Backend for DynasmBackend {
             fail_descr.trace_id(),
             fail_descr.fail_index(),
         );
-        let source_slots = guard_descr.fail_args_slots.clone();
+        // assembler.py:201 rebuild_faillocs_from_descr parity:
+        // iterate rd_locs and SKIP 0xFFFF entries (virtual/unmapped).
+        // Bridge inputargs exclude virtual failargs, so source_slots
+        // must also exclude None entries to maintain 1:1 correspondence.
+        let source_slots: Vec<usize> = guard_descr
+            .fail_arg_locs
+            .iter()
+            .filter_map(|loc| *loc)
+            .collect();
         let compiled = asm.assemble_bridge(fail_descr, inputargs, ops, &source_slots)?;
 
         let bridge_addr = codebuf::buffer_ptr(&compiled.buffer) as usize;

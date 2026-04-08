@@ -1584,7 +1584,8 @@ impl Assembler386 {
             .as_ref()
             .map(|fa| fa.to_vec())
             .unwrap_or_default();
-        // regalloc parity: fail_arg_locs + fail_args_slots
+        // assembler.py:238-270 store_info_on_descr parity: fail_arg_locs
+        // maps each fail_arg to its jitframe slot. None = 0xFFFF (virtual).
         let fail_arg_locs: Vec<Option<usize>> = fail_args
             .iter()
             .map(|opref| {
@@ -1595,11 +1596,8 @@ impl Assembler386 {
                 }
             })
             .collect();
-        let fail_args_slots: Vec<usize> =
-            fail_arg_locs.iter().map(|loc| loc.unwrap_or(0)).collect();
         let mut descr = DynasmFailDescr::new(fail_index, self.trace_id, fail_arg_types, false);
         descr.fail_arg_locs = fail_arg_locs;
-        descr.fail_args_slots = fail_args_slots;
         let descr = Arc::new(descr);
         let jump_offset = self.mc.offset();
         self.pending_guard_tokens.push(GuardToken {
@@ -2730,68 +2728,95 @@ impl Assembler386 {
     ///   3. Path A (slow): call assembler_helper
     ///   4. Path B (fast): MOV result, [frame + ofs]
     ///   5. join paths
+    ///
+    /// RPython allocates the callee jitframe via malloc_jitframe (heap).
+    /// We use malloc for parity: the callee's frame-slot model needs
+    /// frame_depth slots (not just num_args), and heap allocation avoids
+    /// stack overflow on deep recursion.
     fn genop_call_assembler(&mut self, op: &Op) {
-        let descr = op.descr.as_ref().and_then(|d| d.as_call_descr());
-        let target_token = descr.and_then(|cd| cd.call_target_token()).unwrap_or(0);
+        let _descr = op.descr.as_ref().and_then(|d| d.as_call_descr());
 
-        // Allocate a temporary jitframe on the stack for the callee.
-        // Layout: [jf_descr, frame[0], frame[1], ...]
         let num_args = op.args.len();
-        let jf_words = 1 + num_args.max(8); // 1 for jf_descr + frame slots
-        // Align to 16 bytes for ABI compliance before CALL.
-        let jf_bytes = (((jf_words * 8) + 15) & !15) as i32;
+        // llmodel.py:298 malloc_jitframe parity: callee needs frame_depth
+        // slots (frame-slot model stores ALL intermediates in jitframe).
+        let jf_slots = self.frame_depth.max(num_args);
+        let jf_alloc_bytes = ((1 + jf_slots) * 8) as i64;
+        let malloc_ptr = libc::malloc as *const () as i64;
+        let free_ptr = libc::free as *const () as i64;
 
-        // Store callee args to the temp jitframe.
-        // The temp jf is on the machine stack: rsp-based.
-        #[cfg(target_arch = "x86_64")]
-        dynasm!(self.mc ; .arch x64
-            ; sub rsp, jf_bytes       // allocate temp jitframe on stack
-        );
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64
-            ; sub sp, sp, jf_bytes as u32
-        );
-
-        // Zero the jf_descr slot.
-        #[cfg(target_arch = "x86_64")]
-        dynasm!(self.mc ; .arch x64
-            ; mov QWORD [rsp], 0      // jf_descr = 0
-        );
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64
-            ; str xzr, [sp]
-        );
-
-        // Store each arg at jf_frame[i] = rsp + (1+i)*8.
-        for (i, &arg_ref) in op.args.iter().enumerate() {
-            let dest_offset = ((1 + i) * 8) as i32;
-            self.load_arg_to_rax(arg_ref);
-            #[cfg(target_arch = "x86_64")]
-            dynasm!(self.mc ; .arch x64
-                ; mov [rsp + dest_offset], rax
-            );
-            #[cfg(target_arch = "aarch64")]
-            dynasm!(self.mc ; .arch aarch64
-                ; str x0, [sp, dest_offset as u32]
-            );
-        }
-
-        // Save caller's jf_ptr (rbp) in a callee-saved register.
-        // RPython: EBP is the jitframe pointer throughout.
+        // Save caller's jf_ptr before clobbering rbp/x29.
         #[cfg(target_arch = "x86_64")]
         dynasm!(self.mc ; .arch x64
             ; mov r12, rbp            // save caller's jf_ptr in r12
-            ; lea rdi, [rsp]          // rdi = temp jf ptr
         );
         #[cfg(target_arch = "aarch64")]
         dynasm!(self.mc ; .arch aarch64
             ; mov x19, x29            // save caller's jf_ptr
-            ; mov x0, sp              // x0 = temp jf ptr
         );
 
+        // Allocate callee jitframe on heap via malloc.
+        // Stack alignment: after prologue (push rbp + push r12) + return
+        // addr, rsp ≡ -8 (mod 16). sub 8 aligns to 16 for ABI call.
+        #[cfg(target_arch = "x86_64")]
+        dynasm!(self.mc ; .arch x64
+            ; sub rsp, 8                        // align to 16
+            ; mov rdi, QWORD jf_alloc_bytes     // malloc size
+            ; mov rax, QWORD malloc_ptr
+            ; call rax                          // rax = heap jf_ptr
+            ; add rsp, 8                        // unalign
+        );
+        #[cfg(target_arch = "aarch64")]
+        {
+            self.emit_mov_imm64(0, jf_alloc_bytes);
+            self.emit_mov_imm64(2, malloc_ptr);
+            dynasm!(self.mc ; .arch aarch64
+                ; sub sp, sp, 16                // align
+                ; blr x2                        // x0 = heap jf_ptr
+                ; add sp, sp, 16                // unalign
+            );
+        }
+
+        // rdx/x20 = heap jf_ptr (held across arg stores).
+        // load_arg_to_rax reads from [rbp+offset], rbp still = caller's jf.
+        // Wait: rbp was saved to r12 but NOT changed yet. Actually we did
+        // `mov r12, rbp` above, so rbp still points to caller's jf. ✓
+        #[cfg(target_arch = "x86_64")]
+        dynasm!(self.mc ; .arch x64
+            ; mov rdx, rax            // rdx = heap jf_ptr
+            ; mov QWORD [rdx], 0      // zero jf_descr
+        );
+        #[cfg(target_arch = "aarch64")]
+        dynasm!(self.mc ; .arch aarch64
+            ; mov x20, x0             // x20 = heap jf_ptr
+            ; str xzr, [x20]          // zero jf_descr
+        );
+
+        // Store callee args at jf_frame[i] = heap_jf + (1+i)*8.
+        for (i, &arg_ref) in op.args.iter().enumerate() {
+            let dest_offset = ((1 + i) * 8) as i32;
+            self.load_arg_to_rax(arg_ref); // reads from [rbp+...], doesn't clobber rdx
+            #[cfg(target_arch = "x86_64")]
+            dynasm!(self.mc ; .arch x64
+                ; mov [rdx + dest_offset], rax
+            );
+            #[cfg(target_arch = "aarch64")]
+            dynasm!(self.mc ; .arch aarch64
+                ; str x0, [x20, dest_offset as u32]
+            );
+        }
+
         // _call_assembler_emit_call (assembler.py:2267-2269):
-        // Call the target trace's entry point via DynamicLabel.
-        // Self-recursion: call the same code buffer's entry (relative).
+        // rdi/x0 = callee jf_ptr.
+        #[cfg(target_arch = "x86_64")]
+        dynasm!(self.mc ; .arch x64
+            ; mov rdi, rdx            // rdi = heap jf ptr
+            ; sub rsp, 8              // align stack for call
+        );
+        #[cfg(target_arch = "aarch64")]
+        dynasm!(self.mc ; .arch aarch64
+            ; mov x0, x20             // x0 = heap jf ptr
+        );
+
         if let Some(label) = self.self_entry_label {
             #[cfg(target_arch = "x86_64")]
             dynasm!(self.mc ; .arch x64
@@ -2802,16 +2827,19 @@ impl Assembler386 {
                 ; bl =>label
             );
         } else {
-            // Non-self-recursive: would need dispatch table lookup.
-            // Placeholder — trap for now.
             #[cfg(target_arch = "x86_64")]
             dynasm!(self.mc ; .arch x64 ; ud2);
             #[cfg(target_arch = "aarch64")]
             dynasm!(self.mc ; .arch aarch64 ; brk 0);
         }
-        // Result: rax/x0 = callee's returned jf_ptr.
 
-        // Restore caller's jf_ptr from callee-saved register.
+        // rax/x0 = callee's returned jf_ptr (= heap jf_ptr we passed).
+        #[cfg(target_arch = "x86_64")]
+        dynasm!(self.mc ; .arch x64
+            ; add rsp, 8              // undo alignment
+        );
+
+        // Restore caller's jf_ptr.
         #[cfg(target_arch = "x86_64")]
         dynasm!(self.mc ; .arch x64
             ; mov rbp, r12            // restore caller's jf_ptr
@@ -2821,34 +2849,55 @@ impl Assembler386 {
             ; mov x29, x19            // restore
         );
 
+        // rax = callee's returned jf_ptr (heap-allocated).
+        // Save it in rdx; we need rax for the result and rdi for free.
+        #[cfg(target_arch = "x86_64")]
+        dynasm!(self.mc ; .arch x64
+            ; mov rdx, rax            // rdx = callee jf_ptr
+        );
+        #[cfg(target_arch = "aarch64")]
+        dynasm!(self.mc ; .arch aarch64
+            ; mov x20, x0             // x20 = callee jf_ptr
+        );
+
         // _call_assembler_check_descr (assembler.py:2274-2278):
-        //   CMP [rax + jf_descr_ofs], done_with_this_frame_descr
-        //   JE fast_path
-        // rax = callee's returned jf_ptr. jf_descr is at offset 0.
+        //   CMP [jf_ptr + jf_descr_ofs], done_with_this_frame_descr
         let done_descr_ptr = crate::guard::done_with_this_frame_descr_ptr() as i64;
         #[cfg(target_arch = "x86_64")]
         {
             let fast_path = self.mc.new_dynamic_label();
             let merge = self.mc.new_dynamic_label();
             dynasm!(self.mc ; .arch x64
-                ; mov rcx, [rax]                    // rcx = jf_descr
-                ; mov rdx, QWORD done_descr_ptr     // rdx = done_with_this_frame_descr
-                ; cmp rcx, rdx
+                ; mov rcx, [rdx]                    // rcx = jf_descr
+                ; mov rax, QWORD done_descr_ptr
+                ; cmp rcx, rax
                 ; je =>fast_path
             );
 
-            // Path A (slow): callee didn't finish. Use extern helper.
-            // For now: return 0 (we'll implement assembler_helper later).
+            // Path A (slow): callee didn't finish (guard failure).
+            // assembler.py:345 _call_assembler_emit_helper_call.
+            // Free the callee jf, return 0 (assembler_helper stub).
             dynasm!(self.mc ; .arch x64
+                ; mov rdi, rdx                      // free(callee_jf)
+                ; sub rsp, 8
+                ; mov rax, QWORD free_ptr
+                ; call rax
+                ; add rsp, 8
                 ; xor eax, eax                      // result = 0
                 ; jmp =>merge
             );
 
             // Path B (fast): _call_assembler_load_result (assembler.py:2291-2303)
-            //   MOV rax, [rax + ofs] — load from dead frame at index 0.
+            //   Load result from jf_frame[0], then free the heap jf.
             dynasm!(self.mc ; .arch x64
                 ; =>fast_path
-                ; mov rax, [rax + 8]                // result = jf_frame[0]
+                ; mov r12, [rdx + 8]                // r12 = jf_frame[0] (result)
+                ; mov rdi, rdx                      // free(callee_jf)
+                ; sub rsp, 8
+                ; mov rax, QWORD free_ptr
+                ; call rax
+                ; add rsp, 8
+                ; mov rax, r12                      // rax = result
                 ; =>merge
             );
         }
@@ -2858,26 +2907,35 @@ impl Assembler386 {
             let merge = self.mc.new_dynamic_label();
             self.emit_mov_imm64(2, done_descr_ptr);
             dynasm!(self.mc ; .arch aarch64
-                ; ldr x1, [x0]                      // x1 = jf_descr
+                ; ldr x1, [x20]                     // x1 = jf_descr
                 ; cmp x1, x2
                 ; b.eq =>fast_path
-                ; mov x0, 0                          // slow path: result = 0
-                ; b =>merge
-                ; =>fast_path
-                ; ldr x0, [x0, 8]                    // result = jf_frame[0]
-                ; =>merge
             );
+            // Path A (slow): free + result = 0
+            {
+                self.emit_mov_imm64(2, free_ptr);
+                dynasm!(self.mc ; .arch aarch64
+                    ; mov x0, x20
+                    ; blr x2
+                    ; mov x0, 0
+                    ; b =>merge
+                );
+            }
+            // Path B (fast): load result, free
+            {
+                dynasm!(self.mc ; .arch aarch64
+                    ; =>fast_path
+                    ; ldr x19, [x20, 8]             // x19 = result
+                );
+                self.emit_mov_imm64(2, free_ptr);
+                dynasm!(self.mc ; .arch aarch64
+                    ; mov x0, x20
+                    ; blr x2
+                    ; mov x0, x19                   // x0 = result
+                    ; =>merge
+                );
+            }
         }
-
-        // Deallocate temp jitframe.
-        #[cfg(target_arch = "x86_64")]
-        dynasm!(self.mc ; .arch x64
-            ; add rsp, jf_bytes
-        );
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64
-            ; add sp, sp, jf_bytes as u32
-        );
 
         // Store result to the output slot.
         if !op.pos.is_none() {

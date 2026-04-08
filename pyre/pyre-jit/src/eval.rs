@@ -1313,6 +1313,11 @@ fn handle_fail(
     _info: &majit_metainterp::virtualizable::VirtualizableInfo,
 ) -> HandleFailOutcome {
     // compile.py:702-703: must_compile() AND not stack_almost_full()
+    // [DYNASM-TEMP] Disable bridge compilation until frame restoration
+    // is fully debugged. The bridge tracing path's restore_guard_failure_values
+    // can corrupt the frame state, causing NULL jf_ptr on re-entry.
+    #[cfg(not(feature = "cranelift"))]
+    let should_bridge = false;
     if should_bridge && !stack_almost_full() {
         let is_tracing = {
             let (driver, _) = driver_pair();
@@ -2656,7 +2661,6 @@ pub(crate) fn decode_and_restore_guard_failure(
     LAST_GUARD_FRAMES.with(|c| *c.borrow_mut() = Some(resumed_frames));
 
     // virtualizable.py:126: write fields from resumedata to frame.
-    // virtualizable.py:126: write fields from resumedata to frame.
     let restored = jit_state.restore_guard_failure_values(meta, &typed, &ExceptionState::default());
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
@@ -3746,6 +3750,25 @@ fn rebuild_state_after_failure_from_recovery_layout(
             if let majit_backend::ExitValueSourceLayout::Virtual(vidx) = src {
                 if let Some(&ptr) = materialized.get(*vidx) {
                     if slot_idx < typed.len() {
+                        // resume.py parity: do NOT replace existing non-zero
+                        // Ref values. The rd_numb-decoded typed array already
+                        // has the correct value (e.g., frame pointer from
+                        // Box(0)). The recovery_layout's frame.slots may
+                        // have stale Virtual markers that would overwrite it
+                        // with a freshly materialized object.
+                        // resume.py parity: do NOT replace existing non-zero
+                        // Ref values. The rd_numb-decoded typed array already
+                        // has the correct value (e.g., frame pointer from
+                        // Box(0)). The recovery_layout's frame.slots may
+                        // have stale Virtual markers that would overwrite it
+                        // with a freshly materialized object.
+                        let existing_nonnull = matches!(
+                            typed[slot_idx],
+                            Value::Ref(majit_ir::GcRef(p)) if p != 0
+                        );
+                        if existing_nonnull {
+                            continue;
+                        }
                         typed[slot_idx] = Value::Ref(majit_ir::GcRef(ptr));
                         replaced += 1;
                     }

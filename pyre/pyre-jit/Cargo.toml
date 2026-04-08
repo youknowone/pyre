@@ -8,8 +8,8 @@ description = "JIT compiler integration for pyre interpreter"
 
 [features]
 jit = []  # meta feature: enabled by cranelift or dynasm
-cranelift = ["jit", "majit-backend-cranelift"]
-dynasm = ["jit", "majit-metainterp/dynasm"]
+cranelift = ["jit", "majit-backend-cranelift", "majit-metainterp/cranelift", "pyre-jit-trace/cranelift"]
+dynasm = ["jit", "majit-metainterp/dynasm", "pyre-jit-trace/dynasm"]
 
 [dependencies]
 pyre-object = { workspace = true }
