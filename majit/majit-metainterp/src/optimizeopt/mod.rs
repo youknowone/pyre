@@ -2983,6 +2983,20 @@ pub trait Optimization {
     /// Process an operation. Called for each operation in the trace.
     fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult;
 
+    /// optimizer.py:71 propagate_postprocess — called AFTER the op has been
+    /// emitted through all passes and added to new_operations. Runs in
+    /// REVERSE pass order. RPython uses this for bounds propagation
+    /// (intbounds.py postprocess_GUARD_TRUE) and heap cache updates
+    /// (heap.py postprocess_GETFIELD_GC_I).
+    fn propagate_postprocess(&mut self, _op: &Op, _ctx: &mut OptContext) {}
+
+    /// optimizer.py:74-75 have_postprocess — returns true if this pass
+    /// overrides propagate_postprocess. Used to avoid allocating
+    /// OptimizationResult objects for passes that don't need it.
+    fn has_postprocess(&self) -> bool {
+        false
+    }
+
     /// Called once before optimization starts.
     fn setup(&mut self) {}
 
