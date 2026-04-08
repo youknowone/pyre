@@ -942,6 +942,69 @@ impl<M: Clone> MetaInterp<M> {
         Vec::new()
     }
 
+    /// pyjitpl.py:3290 `initialize_virtualizable(self, original_boxes)`.
+    ///
+    /// RPython:
+    ///     vinfo = self.jitdriver_sd.virtualizable_info
+    ///     if vinfo is not None:
+    ///         index = (self.jitdriver_sd.num_green_args +
+    ///                  self.jitdriver_sd.index_of_virtualizable)
+    ///         virtualizable_box = original_boxes[index]
+    ///         virtualizable = vinfo.unwrap_virtualizable_box(virtualizable_box)
+    ///         vinfo.clear_vable_token(virtualizable)
+    ///         startindex = len(original_boxes) - self.jitdriver_sd.num_green_args
+    ///         self.virtualizable_boxes = vinfo.read_boxes(self.cpu, virtualizable, startindex)
+    ///         original_boxes += self.virtualizable_boxes
+    ///         self.virtualizable_boxes.append(virtualizable_box)
+    ///         self.check_synchronized_virtualizable()
+    ///
+    /// pyre adaptation: pyre's TraceCtx already holds the
+    /// `virtualizable_boxes` field. This method is the RPython-named
+    /// MetaInterp-level entry point; it computes the array lengths /
+    /// derived layout and delegates to the lower-level
+    /// `TraceCtx::init_virtualizable_boxes` helper which performs the
+    /// actual `virtualizable_boxes = [..., vable_ref]` push (matching
+    /// the `read_boxes(...) ; append(virtualizable_box)` shape from
+    /// pyjitpl.py:3302-3306). The `vable_box` is currently the first
+    /// inputarg `OpRef(0)` — the structural divergence from RPython
+    /// (where the vable_box is held in the side-channel
+    /// `virtualizable_boxes[-1]` separate from threading through every
+    /// JUMP arg) is tracked by the `virtualizable_boxes[-1]
+    /// line-by-line port` epic.
+    ///
+    /// `live_values` is the pyre analog of RPython's `original_boxes`:
+    /// the list of input values for the current trace.
+    fn initialize_virtualizable(&self, ctx: &mut TraceCtx, live_values: &[Value]) {
+        let Some(info) = self.virtualizable_info.as_ref() else {
+            return;
+        };
+        let array_lengths = self.trace_entry_vable_lengths(info);
+        let num_static = info.num_static_extra_boxes;
+        let num_array_elems: usize = array_lengths.iter().sum();
+        let total_vable = num_static + num_array_elems;
+        if total_vable == 0 || live_values.len() < 1 + total_vable {
+            return;
+        }
+        // pyjitpl.py:3293-3295: index = num_green_args + index_of_virtualizable
+        // pyre uses single-jitdriver / num_green_args=0 / index_of_virtualizable=0,
+        // so virtualizable_box = original_boxes[0] = OpRef(0).
+        let virtualizable_box = OpRef(0);
+        // pyjitpl.py:3302: virtualizable_boxes = vinfo.read_boxes(...)
+        // pyre lays out the static + array slots immediately after the
+        // virtualizable input arg, mirroring how `read_boxes` returns one
+        // box per static field followed by one box per array element.
+        let vable_oprefs: Vec<OpRef> = (0..total_vable).map(|i| OpRef((1 + i) as u32)).collect();
+        // pyjitpl.py:3306: virtualizable_boxes.append(virtualizable_box)
+        // is folded inside init_virtualizable_boxes (it pushes vable_ref
+        // at the end of the list).
+        ctx.init_virtualizable_boxes(info, virtualizable_box, &vable_oprefs, &array_lengths);
+        // pyjitpl.py:3307: check_synchronized_virtualizable() — debug-only
+        // assertion. pyre's analog is `check_synchronized_virtualizable`
+        // on MetaInterp, but it requires &self which we don't have here.
+        // Callers in setup_tracing / bound_reached perform the check
+        // immediately after `set_force_finish` via the existing path.
+    }
+
     /// warmstate.py:259: set_param_trace_eagerness — delegates to warmstate.
     pub fn set_trace_eagerness(&mut self, eagerness: u32) {
         self.warm_state.set_param_trace_eagerness(eagerness);
@@ -1149,23 +1212,8 @@ impl<M: Clone> MetaInterp<M> {
                 if let Some(descriptor) = driver_descriptor {
                     ctx.set_driver_descriptor(descriptor);
                 }
-                // Init virtualizable boxes (same as on_back_edge_typed)
-                if let Some(ref info) = self.virtualizable_info {
-                    let array_lengths = self.trace_entry_vable_lengths(info);
-                    let num_static = info.num_static_extra_boxes;
-                    let num_array_elems: usize = array_lengths.iter().sum();
-                    let total_vable = num_static + num_array_elems;
-                    if total_vable > 0 && live_values.len() >= 1 + total_vable {
-                        let vable_oprefs: Vec<OpRef> =
-                            (0..total_vable).map(|i| OpRef((1 + i) as u32)).collect();
-                        ctx.init_virtualizable_boxes(
-                            info,
-                            OpRef(0), // frame ref = first inputarg
-                            &vable_oprefs,
-                            &array_lengths,
-                        );
-                    }
-                }
+                // pyjitpl.py:3290 initialize_virtualizable parity.
+                self.initialize_virtualizable(&mut ctx, live_values);
                 self.forced_virtualizable = None;
                 self.force_finish_trace = self.warm_state.take_force_finish_tracing(green_key);
                 ctx.set_force_finish(self.force_finish_trace);
@@ -1294,18 +1342,8 @@ impl<M: Clone> MetaInterp<M> {
         if let Some(descriptor) = driver_descriptor {
             ctx.set_driver_descriptor(descriptor);
         }
-        if let Some(ref info) = self.virtualizable_info {
-            let array_lengths = self.trace_entry_vable_lengths(info);
-            let num_static = info.num_static_extra_boxes;
-            let num_array_elems: usize = array_lengths.iter().sum();
-            let total_vable = num_static + num_array_elems;
-
-            if total_vable > 0 && live_values.len() >= 1 + total_vable {
-                let vable_oprefs: Vec<OpRef> =
-                    (0..total_vable).map(|i| OpRef((1 + i) as u32)).collect();
-                ctx.init_virtualizable_boxes(info, OpRef(0), &vable_oprefs, &array_lengths);
-            }
-        }
+        // pyjitpl.py:3290 initialize_virtualizable parity.
+        self.initialize_virtualizable(&mut ctx, live_values);
 
         self.forced_virtualizable = None;
         self.force_finish_trace = self.warm_state.take_force_finish_tracing(green_key);
