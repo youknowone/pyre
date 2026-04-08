@@ -154,6 +154,9 @@ struct GuardToken {
     /// regalloc parity: snapshot of opref_to_slot at guard emission time.
     /// Needed by recovery stubs to read fail_args from correct slots.
     opref_to_slot_snapshot: HashMap<u32, usize>,
+    /// Constants to store in frame during recovery.
+    /// Each entry: (frame_slot_index, constant_value).
+    const_stores: Vec<(usize, i64)>,
 }
 
 /// Compiled output from assemble_loop/assemble_bridge.
@@ -1889,18 +1892,23 @@ impl Assembler386 {
         ));
 
         // Convert regalloc faillocs to frame slot indices for the descr.
-        // Reg locs: the recovery stub will flush registers to known frame
-        // positions. Frame locs: use position directly.
+        // Reg locs: register save area at JITFRAME_FIXED_SIZE + reg_value.
+        // Frame locs: use position directly.
+        // Immed locs: allocate a frame slot and store the constant in the
+        // recovery stub. RPython uses rd_locs with JITFRAME encoding.
+        let mut const_stores: Vec<(usize, i64)> = Vec::new();
         let fail_arg_locs: Vec<Option<usize>> = faillocs
             .iter()
             .map(|fl| match fl {
-                Some(Loc::Reg(r)) => {
-                    // Register values will be saved to frame by recovery stub.
-                    // Use a dedicated save area: slot = JITFRAME_FIXED_SIZE + reg_index
-                    Some(JITFRAME_FIXED_SIZE + r.value as usize)
-                }
+                Some(Loc::Reg(r)) => Some(JITFRAME_FIXED_SIZE + r.value as usize),
                 Some(Loc::Frame(f)) => Some(f.position),
-                Some(Loc::Immed(_)) => None, // constants don't need saving
+                Some(Loc::Immed(i)) => {
+                    // Allocate a slot for this constant in the save area.
+                    let slot = self.frame_depth;
+                    self.frame_depth += 1;
+                    const_stores.push((slot, i.value));
+                    Some(slot)
+                }
                 _ => None,
             })
             .collect();
@@ -1919,6 +1927,7 @@ impl Assembler386 {
                 .map(|fa| fa.to_vec())
                 .unwrap_or_default(),
             opref_to_slot_snapshot: self.opref_to_slot.clone(),
+            const_stores,
         });
         self.fail_descrs.push(descr);
     }
@@ -2049,6 +2058,26 @@ impl Assembler386 {
                 dynasm!(self.mc ; .arch aarch64
                     ; str x0, [x29]
                 );
+            }
+
+            // Store constant fail_args into their allocated frame slots.
+            // These are values that were Loc::Immed in faillocs — they need
+            // to be written to the frame since they don't live in registers.
+            for &(slot, val) in &guard_token.const_stores {
+                let ofs = ((1 + slot) * 8) as i32;
+                #[cfg(target_arch = "x86_64")]
+                {
+                    let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+                    dynasm!(self.mc ; .arch x64
+                        ; mov Rq(scratch), QWORD val
+                        ; mov [rbp + ofs], Rq(scratch)
+                    );
+                }
+                #[cfg(target_arch = "aarch64")]
+                {
+                    self.emit_mov_imm64(16, val);
+                    dynasm!(self.mc ; .arch aarch64 ; str x16, [x29, ofs as u32]);
+                }
             }
 
             // assembler.py:2112 _call_footer — return jf_ptr
@@ -2725,6 +2754,7 @@ impl Assembler386 {
             fail_descr: descr.clone(),
             fail_args,
             opref_to_slot_snapshot: self.opref_to_slot.clone(),
+            const_stores: Vec::new(),
         });
         self.fail_descrs.push(descr);
     }
