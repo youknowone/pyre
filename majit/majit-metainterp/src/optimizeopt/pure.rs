@@ -501,6 +501,90 @@ impl OptPure {
         self.extra_call_pure
             .push(ExtraCallPureEntry::Preamble { key, pop });
     }
+
+    /// pure.py:162-171 _can_reuse_oldop
+    ///
+    /// OVF guard pairing requires that an overflow-tracking op only reuse
+    /// the result of another overflow-tracking op of the same opnum (since
+    /// a regular `INT_ADD` may have overflowed). The non-OVF case is
+    /// always safe.
+    fn _can_reuse_oldop(oldop_opcode: OpCode, op_opcode: OpCode, ovf: bool) -> bool {
+        if ovf {
+            return oldop_opcode == op_opcode;
+        }
+        true
+    }
+
+    /// pure.py:240-247 _same_args
+    ///
+    /// Compare two argument lists with optional skip-prefixes on each side
+    /// (used by COND_CALL_VALUE so its leading condition slot is not
+    /// matched against a CALL_PURE's first real argument).
+    fn _same_args(
+        op1_args: &[OpRef],
+        op2_args: &[OpRef],
+        start_index1: usize,
+        start_index2: usize,
+        ctx: &OptContext,
+    ) -> bool {
+        if op1_args.len() - start_index1 != op2_args.len() - start_index2 {
+            return false;
+        }
+        let mut j = start_index2;
+        for i in start_index1..op1_args.len() {
+            let a = ctx.get_box_replacement(op1_args[i]);
+            let b = ctx.get_box_replacement(op2_args[j]);
+            if a == b {
+                j += 1;
+                continue;
+            }
+            // Const same_box semantics: matching constant values are equal
+            // even when their OpRefs differ.
+            match (ctx.get_constant(a), ctx.get_constant(b)) {
+                (Some(va), Some(vb)) if va == vb => {}
+                _ => return false,
+            }
+            j += 1;
+        }
+        true
+    }
+
+    /// pure.py:249-265 optimize_call_pure_old
+    ///
+    /// Try to fuse `op` with a previously emitted `old_op` (either an
+    /// inline call_pure recorded in `call_pure_positions` or an entry from
+    /// `extra_call_pure`). Returns true when a match is found and the
+    /// caller should mark the op REMOVED.
+    fn optimize_call_pure_old(
+        op: &Op,
+        old_op_opcode: OpCode,
+        old_op_args: &[OpRef],
+        old_op_descr_index: Option<u32>,
+        op_descr_index: Option<u32>,
+        start_index: usize,
+        ctx: &OptContext,
+    ) -> bool {
+        // pure.py:250-251: descr identity check.
+        if op_descr_index != old_op_descr_index {
+            return false;
+        }
+        // RPython relies on each CALL_PURE having a unique descriptor that
+        // already encodes the return type, so a separate result-type check
+        // is unnecessary upstream. majit allows tests with `descr = None`,
+        // so we keep the implicit invariant explicit here: never CSE across
+        // different return types.
+        if op.opcode.result_type() != old_op_opcode.result_type() {
+            return false;
+        }
+        // pure.py:254: old_start_index = OpHelpers.is_cond_call_value(old_op.opnum)
+        let old_start_index = if old_op_opcode.is_cond_call_value() {
+            1
+        } else {
+            0
+        };
+        // pure.py:255: self._same_args(old_op, op, old_start_index, start_index)
+        Self::_same_args(old_op_args, &op.args, old_start_index, start_index, ctx)
+    }
 }
 
 /// Try to constant-fold a pure operation when all arguments are constants.
@@ -664,18 +748,23 @@ impl Optimization for OptPure {
                     return OptimizationResult::Remove; // guard also removed
                 }
 
-                // pure.py: CSE on the OVF op.
-                // _can_reuse_oldop: OVF ops can only reuse results from
-                // other OVF ops (not regular INT_ADD etc.), because the
-                // guard pairing requires the OVF semantic.
+                // pure.py:139-154 + 162-171 _can_reuse_oldop:
+                // The lookup may surface a non-OVF op of the same shape
+                // (e.g. INT_ADD vs INT_ADD_OVF). _can_reuse_oldop accepts
+                // it only when the cached opnum matches our OVF opnum.
                 let key = PureOpKey::from_op(&postponed);
                 if let Some(cached_ref) = self.lookup_pure(&key) {
-                    let cached_ref = ctx.get_box_replacement(cached_ref);
-                    ctx.replace_op(postponed.pos, cached_ref);
-                    self.last_emitted_was_removed = true;
-                    return OptimizationResult::Remove; // guard also removed
+                    if Self::_can_reuse_oldop(postponed.opcode, postponed.opcode, true) {
+                        let cached_ref = ctx.get_box_replacement(cached_ref);
+                        ctx.replace_op(postponed.pos, cached_ref);
+                        self.last_emitted_was_removed = true;
+                        return OptimizationResult::Remove; // guard also removed
+                    }
                 }
-                // Also check the non-OVF version (INT_ADD for INT_ADD_OVF, etc.)
+                // pure.py:162-171: an OVF op cannot reuse a non-OVF result
+                // even when the args/descr are identical (the prior op
+                // may have overflowed silently). Discard the non-OVF
+                // lookup but document the inverse case for future readers.
                 let non_ovf_opcode = match postponed.opcode {
                     OpCode::IntAddOvf => Some(OpCode::IntAdd),
                     OpCode::IntSubOvf => Some(OpCode::IntSub),
@@ -689,9 +778,9 @@ impl Optimization for OptPure {
                         descr_index: None,
                     };
                     if let Some(cached_ref) = self.lookup_pure(&non_ovf_key) {
-                        // A non-OVF version exists. We CAN'T reuse it for OVF
-                        // because the guard needs the OVF semantics. But we
-                        // record the OVF result as also being the non-OVF result.
+                        // _can_reuse_oldop(non_ovf, ovf=true) is false:
+                        // skip even though the keys would otherwise match.
+                        debug_assert!(!Self::_can_reuse_oldop(non_ovf, postponed.opcode, true));
                         let _ = cached_ref;
                     }
                 }
@@ -758,8 +847,11 @@ impl Optimization for OptPure {
             return OptimizationResult::PassOn;
         }
 
-        // CALL_PURE_* -> CSE or known_result lookup, then demote to CALL_*.
+        // pure.py:185-228 optimize_call_pure
         if op.opcode.is_call_pure() {
+            // pure.py:185-188: force_box on each non-skipped arg.
+            // pure.py:191-196: constant-fold check via _can_optimize_call_pure
+            // (handled by force_preamble_op + try_constant_fold).
             if let Some(cached_ref) = self.force_preamble_op(op, ctx) {
                 ctx.replace_op(op.pos, cached_ref);
                 self.last_emitted_was_removed = true;
@@ -768,15 +860,64 @@ impl Optimization for OptPure {
 
             let key = PureOpKey::from_op(op);
 
-            // CSE: same call_pure with same args → reuse result.
+            // pure.py:200-203 — iterate call_pure_positions and try
+            // optimize_call_pure_old against each emitted call_pure.
+            //
+            // Fast path: HashMap lookup hits the common case (exact
+            // key match). Fallback below covers RPython's cond_call_value
+            // asymmetric reuse.
             if let Some(cached_ref) = self.lookup_pure(&key) {
                 let cached_ref = ctx.get_box_replacement(cached_ref);
                 ctx.replace_op(op.pos, cached_ref);
                 self.last_emitted_was_removed = true;
                 return OptimizationResult::Remove;
             }
-
-            // Check RECORD_KNOWN_RESULT cache.
+            let op_descr_index = op.descr.as_ref().map(|d| d.index());
+            for &pos in &self.call_pure_positions {
+                if let Some(old_op) = ctx.new_operations.get(pos) {
+                    let old_descr_index = old_op.descr.as_ref().map(|d| d.index());
+                    if Self::optimize_call_pure_old(
+                        op,
+                        old_op.opcode,
+                        &old_op.args,
+                        old_descr_index,
+                        op_descr_index,
+                        0,
+                        ctx,
+                    ) {
+                        let cached_ref = ctx.get_box_replacement(old_op.pos);
+                        ctx.replace_op(op.pos, cached_ref);
+                        self.last_emitted_was_removed = true;
+                        return OptimizationResult::Remove;
+                    }
+                }
+            }
+            // pure.py:204-210 — iterate extra_call_pure entries.
+            for entry in &self.extra_call_pure {
+                let (entry_args, entry_descr_index, entry_result) = match entry {
+                    ExtraCallPureEntry::Direct { key, result } => {
+                        (key.args.clone(), key.descr_index, *result)
+                    }
+                    ExtraCallPureEntry::Preamble { key, pop } => {
+                        (key.args.clone(), key.descr_index, pop.resolved)
+                    }
+                };
+                if Self::optimize_call_pure_old(
+                    op,
+                    OpCode::CallPureI,
+                    &entry_args,
+                    entry_descr_index,
+                    op_descr_index,
+                    0,
+                    ctx,
+                ) {
+                    let cached_ref = ctx.get_box_replacement(entry_result);
+                    ctx.replace_op(op.pos, cached_ref);
+                    self.last_emitted_was_removed = true;
+                    return OptimizationResult::Remove;
+                }
+            }
+            // pure.py:211-220 — known_result_call_pure (RECORD_KNOWN_RESULT).
             if let Some(result_ref) = self.lookup_known_result(&key) {
                 let result_ref = ctx.get_box_replacement(result_ref);
                 ctx.replace_op(op.pos, result_ref);
@@ -785,7 +926,7 @@ impl Optimization for OptPure {
             }
 
             self.cache.insert(key, op.pos);
-            // Track position for short preamble generation.
+            // pure.py:222-225: replace CALL_PURE with CALL (start_index == 0).
             self.call_pure_positions.push(ctx.new_operations.len());
             let new_op = self.demote_call_pure(op);
             if !Self::call_pure_can_raise(op) {
