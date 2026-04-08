@@ -34,13 +34,8 @@ pub struct DynasmFailDescr {
     /// Unlike Cranelift, we don't need bridge data — the machine code is
     /// patched in place to jump directly to the bridge.
     pub bridge_addr: UnsafeCell<usize>,
-
-    /// Jitframe slot index for each fail_arg. Used by bridge compilation
-    /// so the bridge's _call_header reads InputArgs from the correct
-    /// positions in the parent trace's jitframe (RPython parity:
-    /// assembler _push_all_regs_to_frame saves registers to known offsets;
-    /// pyre uses slots directly, so bridge must know the slot layout).
-    pub fail_args_slots: Vec<usize>,
+    // fail_args_slots removed: bridge source_slots are derived from
+    // fail_arg_locs via rebuild_faillocs_from_descr (assembler.py:201).
 }
 
 // Safety: single-threaded JIT (like RPython with GIL).
@@ -68,7 +63,6 @@ impl DynasmFailDescr {
             status: AtomicU64::new(0),
             adr_jump_offset: UnsafeCell::new(0),
             bridge_addr: UnsafeCell::new(0),
-            fail_args_slots: Vec::new(),
         }
     }
 
