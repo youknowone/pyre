@@ -1881,47 +1881,104 @@ impl Optimizer {
                 });
             let original_jump_args = pre_args;
             let mut resolved_args = original_jump_args.clone();
-            // Dedup: when two slots reference the same OpRef (e.g. b and t
-            // in fib_loop), create SameAsR with fresh OpRef and copy the
-            // VIRTUAL PtrInfo (before force turns it into Instance).
+            // Dedup: two cases require SameAs allocation at end of preamble.
+            //
+            // Case A — duplicate args: when two JUMP slots reference the same
+            // OpRef (e.g. b and t in fib_loop after b = t aliasing), create a
+            // fresh SameAs for the second occurrence so each slot has a
+            // distinct identity.
+            //
+            // Case B — preamble inputarg position used by a non-self slot:
+            // when JUMP slot j carries OpRef(k) and k < num_inputs, k != j,
+            // the export hands Phase 2 a `next_iteration_args[j] = OpRef(k)`
+            // entry that collides with body inputarg slot k's own source
+            // position. import_state forwards both `OpRef(j) → OpRef(k)` and
+            // `OpRef(k) → nia[k]`, and get_box_replacement walks the chain
+            // through OpRef(k), making body inputarg j resolve to nia[k]
+            // instead of OpRef(k). RPython avoids this with fresh-Box identity
+            // per phase; majit's flat OpRef space needs an explicit SameAs
+            // alias so nia[j] points outside the body inputarg position range.
             {
                 let mut seen = std::collections::HashSet::new();
-                for arg in resolved_args.iter_mut() {
+                // RPython parity: positions already holding an emitted op
+                // are phase 1 results, not body inputarg sources. Only
+                // the UNUSED positions in 0..num_inputs correspond to
+                // trace inputargs (`InputArgRef/Int/Float` in RPython).
+                let emitted_positions: std::collections::HashSet<OpRef> = ctx
+                    .new_operations
+                    .iter()
+                    .map(|op| op.pos)
+                    .filter(|p| !p.is_none())
+                    .collect();
+                let original_args = resolved_args.clone();
+                for (slot_idx, arg) in resolved_args.iter_mut().enumerate() {
                     if ctx.is_constant(*arg) || *arg == OpRef::NONE {
                         continue;
                     }
-                    if !seen.insert(*arg) {
-                        let orig = *arg;
-                        let same_as = OpCode::SameAsR;
-                        let fresh = ctx.alloc_op_position();
-                        let mut op = Op::new(same_as, &[orig]);
-                        op.pos = fresh;
-                        ctx.emit(op);
-                        if let Some(info) = ctx.get_ptr_info(orig).cloned() {
-                            let fresh_info = match info {
-                                crate::optimizeopt::info::PtrInfo::Virtual(mut vinfo) => {
-                                    for field in &mut vinfo.fields {
-                                        let orig_field = field.1;
-                                        let ff = ctx.alloc_op_position();
-                                        ctx.replace_op(ff, orig_field);
-                                        // RPython Box type parity: copy type
-                                        if let Some(&tp) = ctx.value_types.get(&orig_field.0) {
-                                            ctx.value_types.insert(ff.0, tp);
-                                        }
-                                        if let Some(val) =
-                                            ctx.get_constant(orig_field).cloned()
-                                        {
-                                            ctx.make_constant(ff, val);
-                                        }
-                                        field.1 = ff;
+                    let is_dup = !seen.insert(*arg);
+                    // Case B fires only when slot k (where `k = arg.0`, the
+                    // position the current slot points at) holds a DIFFERENT
+                    // OpRef. If slot k self-forwards (original_args[k] ==
+                    // OpRef(k)), Phase 2 sets `forwarding[OpRef(k)] = OpRef(k)`
+                    // which is a no-op in replace_op — no chain forms, so no
+                    // aliasing is needed.
+                    let target_slot = arg.0 as usize;
+                    let target_slot_self_forwards = original_args
+                        .get(target_slot)
+                        .map_or(true, |other| *other == *arg);
+                    let is_cross_inputarg = target_slot < num_inputs
+                        && target_slot != slot_idx
+                        && !emitted_positions.contains(arg)
+                        && !target_slot_self_forwards;
+                    if !is_dup && !is_cross_inputarg {
+                        continue;
+                    }
+                    let orig = *arg;
+                    let arg_type = ctx
+                        .value_types
+                        .get(&orig.0)
+                        .copied()
+                        .unwrap_or(majit_ir::Type::Ref);
+                    let same_as = OpCode::same_as_for_type(arg_type);
+                    let fresh = ctx.alloc_op_position();
+                    let mut op = Op::new(same_as, &[orig]);
+                    op.pos = fresh;
+                    ctx.emit(op);
+                    ctx.value_types.insert(fresh.0, arg_type);
+                    if let Some(val) = ctx.get_constant(orig).cloned() {
+                        ctx.make_constant(fresh, val);
+                    }
+                    if let Some(info) = ctx.get_ptr_info(orig).cloned() {
+                        let fresh_info = match info {
+                            crate::optimizeopt::info::PtrInfo::Virtual(mut vinfo) => {
+                                for field in &mut vinfo.fields {
+                                    let orig_field = field.1;
+                                    let ff = ctx.alloc_op_position();
+                                    ctx.replace_op(ff, orig_field);
+                                    // RPython Box type parity: copy type
+                                    if let Some(&tp) = ctx.value_types.get(&orig_field.0) {
+                                        ctx.value_types.insert(ff.0, tp);
                                     }
-                                    crate::optimizeopt::info::PtrInfo::Virtual(vinfo)
+                                    if let Some(val) =
+                                        ctx.get_constant(orig_field).cloned()
+                                    {
+                                        ctx.make_constant(ff, val);
+                                    }
+                                    field.1 = ff;
                                 }
-                                other => other,
-                            };
-                            ctx.set_ptr_info(fresh, fresh_info);
-                        }
-                        *arg = fresh;
+                                crate::optimizeopt::info::PtrInfo::Virtual(vinfo)
+                            }
+                            other => other,
+                        };
+                        ctx.set_ptr_info(fresh, fresh_info);
+                    }
+                    *arg = fresh;
+                    // After allocating a fresh alias for an inputarg position,
+                    // update `seen` so the next slot referencing the same
+                    // original OpRef goes through the duplicate path and
+                    // gets its own fresh alias too.
+                    if is_cross_inputarg {
+                        seen.insert(fresh);
                     }
                 }
             }
