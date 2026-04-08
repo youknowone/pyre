@@ -9,48 +9,5 @@
 
 // Re-export the auto-generated tracing functions
 pub use crate::{
-    CANONICAL_TRACE_PATTERNS, trace_box_int, trace_int_binop, trace_int_binop_ovf,
-    trace_int_compare, trace_unbox_int,
+    trace_box_int, trace_int_binop, trace_int_binop_ovf, trace_int_compare, trace_unbox_int,
 };
-
-/// Check if an opcode pattern has been classified for JIT tracing.
-pub fn is_traceable(pattern_name: &str) -> bool {
-    CANONICAL_TRACE_PATTERNS
-        .iter()
-        .any(|(_, cls)| *cls != "Unclassified" && *cls == pattern_name)
-}
-
-/// Get the trace classification for an opcode pattern.
-pub fn get_trace_classification(opcode_pattern: &str) -> Option<&'static str> {
-    CANONICAL_TRACE_PATTERNS
-        .iter()
-        .find(|(pat, _)| *pat == opcode_pattern)
-        .map(|(_, cls)| *cls)
-        .filter(|cls| *cls != "Unclassified")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_traceable_opcodes() {
-        // majit-codewriter classifies opcodes based on static analysis.
-        // VableArrayRead/Write are the primary classified patterns for
-        // locals/cells access (LoadFast → VableArrayRead etc.).
-        assert!(is_traceable("VableArrayRead"));
-        assert!(is_traceable("VableArrayWrite"));
-        assert!(!is_traceable("NonExistent"));
-    }
-
-    #[test]
-    fn test_classification_lookup() {
-        // LoadDeref reads from the virtualizable cells array.
-        let cls = CANONICAL_TRACE_PATTERNS
-            .iter()
-            .find(|(pat, _)| *pat == "Instruction::LoadDeref")
-            .map(|(_, cls)| *cls);
-        assert!(cls.is_some());
-        assert_eq!(cls.unwrap(), "VableArrayRead");
-    }
-}

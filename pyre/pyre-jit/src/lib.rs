@@ -28,51 +28,13 @@ mod trace_verify;
 
 // Re-export auto-generated trace functions from pyre-jit-trace
 pub use pyre_jit_trace::{
-    CANONICAL_TRACE_PATTERNS, GRAPH_FUNCTIONS, trace_box_float, trace_box_int, trace_float_binop,
-    trace_float_compare, trace_int_binop, trace_int_binop_ovf, trace_int_compare,
-    trace_unbox_float, trace_unbox_int,
+    GRAPH_FUNCTIONS, trace_box_float, trace_box_int, trace_float_binop, trace_float_compare,
+    trace_int_binop, trace_int_binop_ovf, trace_int_compare, trace_unbox_float, trace_unbox_int,
 };
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_generated_dispatch_table() {
-        // Verify the auto-generated code compiled and has content
-        assert!(
-            CANONICAL_TRACE_PATTERNS.len() > 20,
-            "expected >20 patterns, got {}",
-            CANONICAL_TRACE_PATTERNS.len()
-        );
-
-        // Check key patterns exist — majit-codewriter classifies opcodes
-        // based on virtualizable array access patterns (RPython parity).
-        let has_vable_read = CANONICAL_TRACE_PATTERNS
-            .iter()
-            .any(|(_, p)| *p == "VableArrayRead");
-        assert!(has_vable_read, "missing VableArrayRead pattern");
-
-        let has_vable_write = CANONICAL_TRACE_PATTERNS
-            .iter()
-            .any(|(_, p)| *p == "VableArrayWrite");
-        assert!(has_vable_write, "missing VableArrayWrite pattern");
-
-        let has_vable_field = CANONICAL_TRACE_PATTERNS
-            .iter()
-            .any(|(_, p)| *p == "VableFieldWrite");
-        assert!(has_vable_field, "missing VableFieldWrite pattern");
-
-        eprintln!(
-            "Auto-generated {} canonical trace patterns",
-            CANONICAL_TRACE_PATTERNS.len()
-        );
-        for (pat, cls) in CANONICAL_TRACE_PATTERNS {
-            if *cls != "Unclassified" {
-                eprintln!("  {} → {}", pat, cls);
-            }
-        }
-    }
 
     #[test]
     fn test_trace_functions_exist() {
