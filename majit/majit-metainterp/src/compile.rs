@@ -285,7 +285,7 @@ pub(crate) fn build_guard_metadata(
                 // as separate sections. Do not merge vable_array entries into
                 // the innermost frame slots here.
                 for (orig_idx, frame) in frames.iter().enumerate().rev() {
-                    builder.push_frame(frame.pc as u64);
+                    builder.push_frame(frame.jitcode_index, frame.pc as u64);
                     let mut slot_idx = 0usize;
                     for val in &frame.values {
                         add_slot(&mut builder, slot_idx, val);
@@ -294,7 +294,7 @@ pub(crate) fn build_guard_metadata(
                 }
             } else {
                 // No rd_numb: single frame, 1:1 mapping (fail_args[i] → state[i]).
-                builder.push_frame(pc);
+                builder.push_frame(0, pc);
                 let num_slots = op
                     .fail_args
                     .as_ref()
