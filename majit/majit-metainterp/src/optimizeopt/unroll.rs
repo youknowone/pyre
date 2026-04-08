@@ -2785,19 +2785,30 @@ impl OptUnroll {
                 }
             }
         }
-        // RPython setinfo_from_preamble parity (unroll.py:73-75):
-        // RPython does NOT import IntBound from preamble to Phase 2.
-        // IntBound is computed independently by the IntBounds pass from
-        // guards and operations in the body loop. Importing preamble
-        // bounds causes Phase 2 to over-specialize on preamble-time
-        // values (e.g., sign=-1 bound [-1,-1] makes IntEq(sign,1)
-        // provably false → InvalidLoop).
+        // unroll.py:93-96: IntBound import with widen().
         //
-        // Only import int_lower_bound hints for array bounds checks
-        // (nonnegative constraints from guards in the preamble).
+        //     elif isinstance(preamble_info, intutils.IntBound):
+        //         loop_info = preamble_info.widen()
+        //         intbound = self.getintbound(op)
+        //         intbound.intersect(loop_info)
+        //
+        // widen() relaxes exact bounds to avoid over-specialization:
+        //   lower < MININT/2 → MININT
+        //   upper > MAXINT/2 → MAXINT
+        //   tvalue/tmask → UNKNOWN
+        // This ensures Phase 2 gets safe bounds (e.g., [0, MAXINT] for
+        // a loop counter) without the exact preamble values.
+        if let Some(bound) = &info.int_bound {
+            let widened = bound.widen();
+            ctx.imported_int_bounds.insert(target, widened);
+        }
         if let Some(lower) = info.int_lower_bound {
             if lower >= 0 {
-                ctx.int_lower_bounds.insert(target, lower);
+                let entry = ctx
+                    .imported_int_bounds
+                    .entry(target)
+                    .or_insert_with(crate::optimizeopt::intutils::IntBound::unbounded);
+                let _ = entry.make_ge_const(lower);
             }
         }
     }
@@ -5092,15 +5103,15 @@ mod tests {
         let mut ctx2 = crate::optimizeopt::OptContext::with_num_inputs(4, 1);
         let label_args = import_state(&[OpRef(0)], &exported, &mut ctx2);
         assert_eq!(label_args, vec![OpRef(21)]);
-        // RPython parity: IntBound is NOT imported from preamble (unroll.py:73-75).
-        // Only int_lower_bound hints are imported for nonnegative array bounds.
+        // unroll.py:93-96: IntBound IS imported with widen().
+        // widen() relaxes bounds: lower < MININT/2 → MININT, upper > MAXINT/2 → MAXINT.
+        // For [10, 20], both are within MININT/2..MAXINT/2 so widen() preserves them.
         assert_eq!(
             ctx2.imported_int_bounds
                 .get(&OpRef(21))
                 .map(|b| (b.lower, b.upper)),
-            None
+            Some((10, 20))
         );
-        assert_eq!(ctx2.int_lower_bounds.get(&OpRef(21)).copied(), Some(10));
     }
 
     #[test]
