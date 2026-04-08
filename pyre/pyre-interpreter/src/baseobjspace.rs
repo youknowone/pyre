@@ -2300,7 +2300,11 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
                 }
                 // Step 5: builtin methods found in base type MRO need binding
                 // CPython: PyFunction_GET_CODE slot → bound method
-                if crate::is_function(descr) {
+                if crate::is_function(descr)
+                    && !crate::is_builtin_code(
+                        crate::function_get_code(descr) as pyre_object::PyObjectRef
+                    )
+                {
                     return Ok(pyre_object::w_method_new(descr, obj, w_type));
                 }
                 return Ok(descr);
@@ -2620,7 +2624,12 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
     let w_class = unsafe { (*obj).w_class };
     if !w_class.is_null() && unsafe { is_type(w_class) } {
         if let Some(method) = unsafe { lookup_in_type_where(w_class, name) } {
-            if unsafe { crate::is_function(method) } {
+            if unsafe {
+                crate::is_function(method)
+                    && !crate::is_builtin_code(
+                        crate::function_get_code(method) as pyre_object::PyObjectRef
+                    )
+            } {
                 return Ok(pyre_object::w_method_new(method, obj, w_class));
             }
             if let Some(result) = unsafe { get(method, obj, w_class) } {
@@ -2863,6 +2872,15 @@ unsafe fn is_data_descr(descr: PyObjectRef) -> bool {
 /// dispatch on descriptor type, then fallback to __get__ MRO lookup.
 unsafe fn get(descr: PyObjectRef, obj: PyObjectRef, w_type: PyObjectRef) -> Option<PyObjectRef> {
     if descr.is_null() {
+        return None;
+    }
+
+    // PyPy removes __get__ from BuiltinFunction.typedef. Builtin functions
+    // stored on user classes therefore stay plain callables instead of
+    // binding `self` like Python functions do.
+    if crate::is_function(descr)
+        && crate::is_builtin_code(crate::function_get_code(descr) as pyre_object::PyObjectRef)
+    {
         return None;
     }
 
