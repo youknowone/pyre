@@ -472,7 +472,7 @@ impl PotentialShortOp {
                 if produced.is_empty() {
                     None
                 } else {
-                    let index = ShortBoxes::pick_produced_op_index(&produced, true);
+                    let index = ShortBoxes::_pick_op_index(&produced, true);
                     let chosen = produced[index].clone();
                     for (i, mut alt) in produced.into_iter().enumerate() {
                         if i == index {
@@ -571,10 +571,26 @@ impl ShortBoxes {
         self.add_potential_op(self.lookup_label_arg(result), op, PreambleOpKind::Pure);
     }
 
-    /// Add a heap read as a short-box candidate.
-    /// shortpreamble.py: sb.add_heap_op(op, getfield_op)
+    /// shortpreamble.py:369-374 add_heap_op(op, getfield_op)
+    ///
+    /// `op.pos` is the box the GETFIELD/GETARRAYITEM produces. If that box is
+    /// a constant, route to `const_short_boxes` (RPython:
+    /// `if isinstance(op, Const): self.const_short_boxes.append(HeapOp(op, getfield_op))`).
+    /// Otherwise it joins `potential_ops` as a heap candidate.
     pub fn add_heap_op(&mut self, op: Op) {
         let result = op.pos;
+        if result.is_constant() || self.known_constants.contains(&result) {
+            // shortpreamble.py:371-373: const_short_boxes.append(HeapOp(...))
+            let label_arg_idx = self.lookup_label_arg(result);
+            self.const_short_boxes.push(PreambleOp {
+                op,
+                kind: PreambleOpKind::Heap,
+                label_arg_idx,
+                invented_name: false,
+                same_as_source: None,
+            });
+            return;
+        }
         self.add_potential_op(self.lookup_label_arg(result), op, PreambleOpKind::Heap);
     }
 
@@ -642,14 +658,23 @@ impl ShortBoxes {
         None
     }
 
-    fn pick_produced_op_index(candidates: &[ProducedShortOp], pick_other: bool) -> usize {
+    /// shortpreamble.py:298-309 _pick_op_index
+    ///
+    /// Pick which compound-op alternative becomes the canonical short box.
+    /// Heap ops are last-resort; the first non-Heap candidate wins on the
+    /// initial `pick_other=True` pass. If two non-Heap candidates are seen,
+    /// recurse with `pick_other=False`, which restricts the second pass to
+    /// `ShortInputArg` candidates only (the highest-priority class).
+    /// Falls back to index 0 when no candidate qualifies.
+    fn _pick_op_index(lst: &[ProducedShortOp], pick_other: bool) -> usize {
         let mut index: Option<usize> = None;
-        for (i, item) in candidates.iter().enumerate() {
+        for (i, item) in lst.iter().enumerate() {
             let prefer = !matches!(item.kind, PreambleOpKind::Heap)
                 && (pick_other || item.kind == PreambleOpKind::InputArg);
             if prefer {
-                if index.is_some() && pick_other {
-                    return Self::pick_produced_op_index(candidates, false);
+                if index.is_some() {
+                    debug_assert!(pick_other, "second-tier ambiguity");
+                    return Self::_pick_op_index(lst, false);
                 }
                 index = Some(i);
             }
@@ -688,6 +713,77 @@ impl ShortBoxes {
                     .map(|produced| (*key, produced))
             })
             .collect()
+    }
+
+    /// shortpreamble.py:246-281 ShortBoxes.create_short_boxes
+    ///
+    /// Materialize all `potential_ops` (already populated by
+    /// `produce_potential_short_preamble_ops` calls on each pass) into
+    /// `produced_short_boxes`, then walk `const_short_boxes`: for each
+    /// constant heap read, try to produce its struct argument; if that
+    /// succeeds, emit a `getfield` short op whose first arg is the
+    /// produced preamble box. Constant heap reads do not allocate fresh
+    /// names — they reuse the original constant box.
+    ///
+    /// `label_args` / `label_arg_types` populate `short_inputargs` via
+    /// `add_short_input_arg` (RPython:
+    /// `self.potential_ops[box] = ShortInputArg(box, renamed)`).
+    pub fn create_short_boxes(
+        &mut self,
+        label_args: &[OpRef],
+        label_arg_types: &[majit_ir::Type],
+    ) -> Vec<ProducedShortOp> {
+        // shortpreamble.py:255-259: register every label arg as a
+        // ShortInputArg potential op.
+        for (i, &arg) in label_args.iter().enumerate() {
+            let arg_type = label_arg_types
+                .get(i)
+                .copied()
+                .unwrap_or(majit_ir::Type::Int);
+            self.add_short_input_arg(arg, arg_type);
+        }
+
+        // shortpreamble.py:261: optimizer.produce_potential_short_preamble_ops(self)
+        // — caller must have invoked this on each pass before calling
+        // create_short_boxes (majit threads passes externally).
+
+        // shortpreamble.py:263-267: short_boxes = []; for shortop in potential_ops.values(): add_op_to_short
+        let mut short_boxes: Vec<ProducedShortOp> =
+            self.produced_ops().into_iter().map(|(_, op)| op).collect();
+
+        // shortpreamble.py:272-280: walk const_short_boxes and try to
+        // produce a struct preamble arg, then emit the getfield op.
+        let const_pending: Vec<PreambleOp> = std::mem::take(&mut self.const_short_boxes);
+        for short_op in const_pending {
+            let getfield_op = &short_op.op;
+            if getfield_op.args.is_empty() {
+                continue;
+            }
+            let struct_arg = getfield_op.arg(0);
+            let Some(preamble_arg) = self.produce_arg(struct_arg) else {
+                continue;
+            };
+            // shortpreamble.py:277-278: copy_and_change(opnum, [preamble_arg] + args[1:])
+            let mut new_args = vec![preamble_arg];
+            new_args.extend_from_slice(&getfield_op.args[1..]);
+            let mut new_op = Op::with_descr(
+                getfield_op.opcode,
+                &new_args,
+                getfield_op
+                    .descr
+                    .clone()
+                    .unwrap_or_else(|| panic!("const_short_boxes heap op without descr")),
+            );
+            new_op.pos = getfield_op.pos;
+            // shortpreamble.py:279: ProducedShortOp(short_op, preamble_op)
+            short_boxes.push(ProducedShortOp {
+                preamble_op: new_op,
+                kind: PreambleOpKind::Heap,
+                invented_name: false,
+                same_as_source: None,
+            });
+        }
+        short_boxes
     }
 
     /// shortpreamble.py: create_short_inputargs(label_args)
@@ -732,29 +828,19 @@ fn normalize_same_as_type(tp: majit_ir::Type) -> majit_ir::Type {
     }
 }
 
-/// shortpreamble.py: create_short_boxes(optimizer, inputargs, label_args)
+/// Backwards-compat wrapper around `ShortBoxes::create_short_boxes`.
 ///
-/// Build the short boxes mapping: for each label arg, determine
-/// which preamble operation produces it. This is used to build
-/// the short preamble that bridges need to replay.
+/// Existing call sites pass an `optimizer_ops` slice that the new
+/// method-form helper does not consume; the slice is preserved for
+/// API stability and ignored. Prefer calling
+/// `ShortBoxes::create_short_boxes` directly.
 pub fn create_short_boxes(
     short_boxes: &mut ShortBoxes,
     label_args: &[OpRef],
     label_arg_types: &[majit_ir::Type],
     _optimizer_ops: &[Op],
 ) -> Vec<ProducedShortOp> {
-    for (i, &arg) in label_args.iter().enumerate() {
-        let arg_type = label_arg_types
-            .get(i)
-            .copied()
-            .unwrap_or(majit_ir::Type::Int);
-        short_boxes.add_short_input_arg(arg, arg_type);
-    }
-    short_boxes
-        .produced_ops()
-        .into_iter()
-        .map(|(_, op)| op)
-        .collect()
+    short_boxes.create_short_boxes(label_args, label_arg_types)
 }
 
 /// Collector-side extended builder for extracting categorized preamble ops from
