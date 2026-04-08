@@ -643,10 +643,8 @@ impl Assembler386 {
         let entry = self.mc.offset();
         self._assemble(inputargs, ops)?;
 
-        // Post-pass: allocate slots for fail_arg OpRefs that were not
-        // emitted (virtuals/dead code). Must happen BEFORE recovery
-        // stubs so fail_arg_locs are correct in the stub code.
-        self.allocate_unmapped_fail_arg_slots();
+        // regalloc sets fail_arg_locs in append_guard_token_with_faillocs.
+        // No allocate_unmapped_fail_arg_slots needed.
 
         // assembler.py:553 write_pending_failure_recoveries
         let stub_offsets = self.write_pending_failure_recoveries();
@@ -710,7 +708,6 @@ impl Assembler386 {
         // assembler.py:641 prepare_bridge
         let entry = self.mc.offset();
         self._assemble(inputargs, ops)?;
-        self.allocate_unmapped_fail_arg_slots();
         let stub_offsets = self.write_pending_failure_recoveries();
 
         let buffer = self
@@ -758,12 +755,21 @@ impl Assembler386 {
             .frame_depth
             .max(ra.get_final_frame_depth() + JITFRAME_FIXED_SIZE);
 
-        // Map input args to frame slots (for _call_header compatibility)
+        // Sync regalloc frame positions to opref_to_slot for backward
+        // compatibility with genop_call/genop_call_assembler which still
+        // use resolve_opref. When regalloc spills a value to a frame slot,
+        // that slot's position must be visible to resolve_opref.
         for iarg in inputargs {
             self.opref_to_slot.insert(iarg.index, iarg.index as usize);
             self.value_types.insert(iarg.index, iarg.tp);
         }
-        self.next_slot = inputargs.len();
+        // Also sync any frame allocations from regalloc's FrameManager.
+        for (&opref, lifetime) in ra.longevity.lifetimes_iter() {
+            if let Some(floc) = lifetime.current_frame_loc {
+                self.opref_to_slot.insert(opref.0, floc.position);
+            }
+        }
+        self.next_slot = ra.get_final_frame_depth();
 
         let mut fail_index = 0u32;
 
@@ -840,6 +846,14 @@ impl Assembler386 {
                     self.regalloc_perform(op, arglocs, None, fail_index, ops);
                 }
             }
+        }
+
+        if std::env::var_os("MAJIT_LOG").is_some() {
+            eprintln!(
+                "[dynasm] _assemble done: pending_guard_tokens={} fail_index={}",
+                self.pending_guard_tokens.len(),
+                fail_index
+            );
         }
 
         Ok(())
@@ -1200,15 +1214,102 @@ impl Assembler386 {
             }
             // ── Control flow ──
             OpCode::Jump => {
-                self.genop_jump(op);
+                // RPython: regalloc consider_jump collects current locations of
+                // jump args. assembler.closing_jump emits the actual JMP.
+                // Move each arg from its current loc to its target frame slot.
+                let slot0_ofs = crate::regalloc::get_ebp_ofs(0, 0);
+                for (i, loc) in arglocs.iter().enumerate() {
+                    let dst_ofs = crate::regalloc::get_ebp_ofs(0, i);
+                    let dst = Loc::Frame(crate::regloc::FrameLoc::new(i, dst_ofs, false));
+                    self.regalloc_mov(loc, &dst);
+                }
+                // Emit jump back to LABEL
+                if let Some(label) = self.loop_label {
+                    #[cfg(target_arch = "x86_64")]
+                    dynasm!(self.mc ; .arch x64 ; jmp =>label);
+                    #[cfg(target_arch = "aarch64")]
+                    dynasm!(self.mc ; .arch aarch64 ; b =>label);
+                } else if let Some(target) = self.jump_target_addr {
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        let addr = target as i64;
+                        dynasm!(self.mc ; .arch x64
+                            ; mov rax, QWORD addr
+                            ; jmp rax
+                        );
+                    }
+                    #[cfg(target_arch = "aarch64")]
+                    {
+                        self.emit_mov_imm64(0, target as i64);
+                        dynasm!(self.mc ; .arch aarch64 ; br x0);
+                    }
+                }
             }
             OpCode::Finish => {
-                self.genop_finish(op, fail_index);
+                // RPython: genop_finish stores result at jf_frame[0] (base_ofs),
+                // writes descr ptr to jf_descr, then calls _call_footer.
+                // arglocs[0] = result location (if any)
+                let fail_arg_types = self.infer_fail_arg_types(op);
+                let result_type = if fail_arg_types.is_empty() {
+                    Type::Void
+                } else {
+                    fail_arg_types[0]
+                };
+                let global_descr_ptr =
+                    crate::guard::done_with_this_frame_descr_ptr_for_type(result_type) as i64;
+                let descr = Arc::new(DynasmFailDescr::new(
+                    fail_index,
+                    self.trace_id,
+                    fail_arg_types.clone(),
+                    true,
+                ));
+
+                // Store result to jf_frame[0]
+                if let Some(result) = arglocs.first() {
+                    let slot0 = Loc::Frame(crate::regloc::FrameLoc::new(
+                        0,
+                        crate::regalloc::get_ebp_ofs(0, 0),
+                        result_type == Type::Float,
+                    ));
+                    self.regalloc_mov(result, &slot0);
+                }
+
+                // Store descr ptr to jf_descr [rbp+0]
+                #[cfg(target_arch = "x86_64")]
+                {
+                    let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+                    dynasm!(self.mc ; .arch x64
+                        ; mov Rq(scratch), QWORD global_descr_ptr
+                        ; mov [rbp], Rq(scratch)
+                    );
+                }
+                #[cfg(target_arch = "aarch64")]
+                {
+                    self.emit_mov_imm64(0, global_descr_ptr);
+                    dynasm!(self.mc ; .arch aarch64 ; str x0, [x29]);
+                }
+
+                self._call_footer();
+                self.fail_descrs.push(descr);
             }
             OpCode::Label => {
-                self.genop_label(op);
+                let label = self.mc.new_dynamic_label();
+                if std::env::var_os("MAJIT_LOG").is_some() {
+                    eprintln!("[dynasm] LABEL: new DynamicLabel({:?})", label);
+                }
+                dynasm!(self.mc ; =>label);
+                self.loop_label = Some(label);
+                self.loop_label_offset = Some(self.mc.offset());
             }
-            // ── Calls (use existing genop_call which handles frame-slot model) ──
+            // ── Calls ──
+            // RPython: regalloc consider_call does before_call (save caller-saved
+            // regs), collects arglocs, calls after_call for result. The assembler
+            // receives arglocs = [func_addr_or_descr_info..., arg_locs...] and
+            // result_loc = register for return value.
+            //
+            // For now, flush all register-resident values to their frame slots
+            // before the call, use the existing frame-slot genop_call, then
+            // mark the result in the allocated register.
             OpCode::CallI
             | OpCode::CallR
             | OpCode::CallF
@@ -1558,22 +1659,73 @@ impl Assembler386 {
     /// assembler.py:849 patch_pending_failure_recoveries.
     /// Returns recovery stub offsets for post-finalize address fixup.
     fn write_pending_failure_recoveries(&mut self) -> Vec<(Arc<DynasmFailDescr>, usize)> {
+        // Emit a shared _push_all_regs_to_frame routine once, then each
+        // recovery stub calls it. This keeps stubs small (call + descr + ret)
+        // and avoids aarch64 branch range issues.
+        let save_regs_label = self.mc.new_dynamic_label();
+        #[cfg(target_arch = "x86_64")]
+        {
+            dynasm!(self.mc ; .arch x64 ; =>save_regs_label);
+            use crate::regloc::*;
+            let gprs = [
+                ECX, EAX, EDX, EBX, ESI, EDI, R8, R9, R10, R12, R13, R14, R15,
+            ];
+            for &reg in &gprs {
+                let save_slot = JITFRAME_FIXED_SIZE + reg.value as usize;
+                let ofs = ((1 + save_slot) * 8) as i32;
+                dynasm!(self.mc ; .arch x64 ; mov [rbp + ofs], Rq(reg.value));
+            }
+            let xmms = [
+                XMM0, XMM1, XMM2, XMM3, XMM4, XMM5, XMM6, XMM7, XMM8, XMM9, XMM10, XMM11, XMM12,
+                XMM13, XMM14,
+            ];
+            for &reg in &xmms {
+                let save_slot = JITFRAME_FIXED_SIZE + reg.value as usize;
+                let ofs = ((1 + save_slot) * 8) as i32;
+                dynasm!(self.mc ; .arch x64 ; movsd [rbp + ofs], Rx(reg.value));
+            }
+            dynasm!(self.mc ; .arch x64 ; ret);
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            dynasm!(self.mc ; .arch aarch64 ; =>save_regs_label);
+            use crate::regloc::*;
+            let gprs = [
+                ECX, EAX, EDX, EBX, ESI, EDI, R8, R9, R10, R12, R13, R14, R15,
+            ];
+            for &reg in &gprs {
+                let save_slot = JITFRAME_FIXED_SIZE + reg.value as usize;
+                let ofs = ((1 + save_slot) * 8) as u32;
+                dynasm!(self.mc ; .arch aarch64 ; str X(reg.value), [x29, ofs]);
+            }
+            dynasm!(self.mc ; .arch aarch64 ; ret);
+        }
+
+        if std::env::var_os("MAJIT_LOG").is_some() {
+            eprintln!(
+                "[dynasm] write_pending_failure_recoveries: {} tokens",
+                self.pending_guard_tokens.len()
+            );
+        }
         let mut stub_offsets = Vec::new();
         for guard_token in std::mem::take(&mut self.pending_guard_tokens) {
-            // assembler.py:845 pos_recovery_stub = generate_quick_failure
             let stub_start = self.mc.offset();
 
             // Bind the fail_label — guard's Jcc lands here.
             let fail_label = guard_token.fail_label;
+            if std::env::var_os("MAJIT_LOG").is_some() {
+                eprintln!("[dynasm] recovery stub: binding {:?}", fail_label);
+            }
             #[cfg(target_arch = "x86_64")]
             dynasm!(self.mc ; .arch x64 ; =>fail_label);
             #[cfg(target_arch = "aarch64")]
             dynasm!(self.mc ; .arch aarch64 ; =>fail_label);
 
-            // RPython: _push_all_regs_to_frame. In our frame-slot model,
-            // values are already in their natural slots. No reordering
-            // in the stub — get_int_value/get_ref_value/get_float_value
-            // use fail_arg_locs to read from the correct slot.
+            // Call shared _push_all_regs_to_frame
+            #[cfg(target_arch = "x86_64")]
+            dynasm!(self.mc ; .arch x64 ; call =>save_regs_label);
+            #[cfg(target_arch = "aarch64")]
+            dynasm!(self.mc ; .arch aarch64 ; bl =>save_regs_label);
 
             // assembler.py:2106-2107: store jf_descr
             let descr_ptr = Arc::as_ptr(&guard_token.fail_descr) as i64;
@@ -1595,6 +1747,9 @@ impl Assembler386 {
             self._call_footer();
 
             stub_offsets.push((guard_token.fail_descr, stub_start.0));
+        }
+        if std::env::var_os("MAJIT_LOG").is_some() {
+            eprintln!("[dynasm] write_pending done: {} stubs", stub_offsets.len());
         }
         stub_offsets
     }
@@ -2160,23 +2315,33 @@ impl Assembler386 {
             CC_NS => dynasm!(self.mc ; .arch x64 ; jns =>fail_label),
             _ => dynasm!(self.mc ; .arch x64 ; je =>fail_label),
         }
+        // aarch64: b.cond has 19-bit range (±1MB), which is too short
+        // for forward references to recovery stubs. Use inverted condition
+        // + unconditional branch (26-bit / ±128MB) pattern instead:
+        //   b.NOT_cond >skip ; b =>fail_label ; skip:
         #[cfg(target_arch = "aarch64")]
-        match fail_cc {
-            CC_L => dynasm!(self.mc ; .arch aarch64 ; b.lt =>fail_label),
-            CC_LE => dynasm!(self.mc ; .arch aarch64 ; b.le =>fail_label),
-            CC_G => dynasm!(self.mc ; .arch aarch64 ; b.gt =>fail_label),
-            CC_GE => dynasm!(self.mc ; .arch aarch64 ; b.ge =>fail_label),
-            CC_E => dynasm!(self.mc ; .arch aarch64 ; b.eq =>fail_label),
-            CC_NE => dynasm!(self.mc ; .arch aarch64 ; b.ne =>fail_label),
-            CC_B => dynasm!(self.mc ; .arch aarch64 ; b.lo =>fail_label),
-            CC_BE => dynasm!(self.mc ; .arch aarch64 ; b.ls =>fail_label),
-            CC_A => dynasm!(self.mc ; .arch aarch64 ; b.hi =>fail_label),
-            CC_AE => dynasm!(self.mc ; .arch aarch64 ; b.hs =>fail_label),
-            CC_O => dynasm!(self.mc ; .arch aarch64 ; b.vs =>fail_label),
-            CC_NO => dynasm!(self.mc ; .arch aarch64 ; b.vc =>fail_label),
-            CC_S => dynasm!(self.mc ; .arch aarch64 ; b.mi =>fail_label),
-            CC_NS => dynasm!(self.mc ; .arch aarch64 ; b.pl =>fail_label),
-            _ => dynasm!(self.mc ; .arch aarch64 ; b.eq =>fail_label),
+        {
+            let skip = self.mc.new_dynamic_label();
+            let inv = invert_cc(fail_cc);
+            match inv {
+                CC_L => dynasm!(self.mc ; .arch aarch64 ; b.lt =>skip),
+                CC_LE => dynasm!(self.mc ; .arch aarch64 ; b.le =>skip),
+                CC_G => dynasm!(self.mc ; .arch aarch64 ; b.gt =>skip),
+                CC_GE => dynasm!(self.mc ; .arch aarch64 ; b.ge =>skip),
+                CC_E => dynasm!(self.mc ; .arch aarch64 ; b.eq =>skip),
+                CC_NE => dynasm!(self.mc ; .arch aarch64 ; b.ne =>skip),
+                CC_B => dynasm!(self.mc ; .arch aarch64 ; b.lo =>skip),
+                CC_BE => dynasm!(self.mc ; .arch aarch64 ; b.ls =>skip),
+                CC_A => dynasm!(self.mc ; .arch aarch64 ; b.hi =>skip),
+                CC_AE => dynasm!(self.mc ; .arch aarch64 ; b.hs =>skip),
+                CC_O => dynasm!(self.mc ; .arch aarch64 ; b.vs =>skip),
+                CC_NO => dynasm!(self.mc ; .arch aarch64 ; b.vc =>skip),
+                CC_S => dynasm!(self.mc ; .arch aarch64 ; b.mi =>skip),
+                CC_NS => dynasm!(self.mc ; .arch aarch64 ; b.pl =>skip),
+                _ => dynasm!(self.mc ; .arch aarch64 ; b.eq =>skip),
+            }
+            dynasm!(self.mc ; .arch aarch64 ; b =>fail_label);
+            dynasm!(self.mc ; .arch aarch64 ; =>skip);
         }
         fail_label
     }

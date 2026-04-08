@@ -262,6 +262,11 @@ impl LifetimeManager {
         self.lifetimes.insert(v, lifetime);
     }
 
+    /// Iterate over all (OpRef, Lifetime) pairs.
+    pub fn lifetimes_iter(&self) -> impl Iterator<Item = (&OpRef, &Lifetime)> {
+        self.lifetimes.iter()
+    }
+
     /// regalloc.py:1066
     pub fn fixed_register(&mut self, opindex: i32, register: RegLoc, var: Option<OpRef>) {
         let definition_pos = match var {
