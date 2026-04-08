@@ -625,15 +625,17 @@ impl Optimizer {
             }
         }
         for (label_arg, entry_idx, field_idx) in &same_as_targets {
-            let tp = match ctx
+            // RPython parity: Box.type carries the source type intrinsically.
+            // value_types[label_arg] is whatever the optimizer's emit() last
+            // recorded for that OpRef. A Type::Void here would be an upstream
+            // bookkeeping bug (a guard's pos collided with a Box position):
+            // letting it through reaches `same_as_for_type(Void)`, which is
+            // `unreachable!` and panics with a clear message.
+            let tp = ctx
                 .value_types
                 .get(&label_arg.0)
                 .copied()
-                .unwrap_or(majit_ir::Type::Int)
-            {
-                majit_ir::Type::Void => majit_ir::Type::Ref,
-                other => other,
-            };
+                .unwrap_or(majit_ir::Type::Int);
             let same_as_op = majit_ir::OpCode::same_as_for_type(tp);
             let mut op = majit_ir::Op::new(same_as_op, &[*label_arg]);
             op.pos = ctx.reserve_pos();
@@ -2020,15 +2022,14 @@ impl Optimizer {
                         continue;
                     }
                     let orig = *arg;
-                    let arg_type = match ctx
+                    // RPython parity: Box.type intrinsically carries i/r/f.
+                    // Pass-through; Type::Void surfaces via same_as_for_type's
+                    // own unreachable! arm rather than a duplicate guard here.
+                    let arg_type = ctx
                         .value_types
                         .get(&orig.0)
                         .copied()
-                        .unwrap_or(majit_ir::Type::Ref)
-                    {
-                        majit_ir::Type::Void => majit_ir::Type::Ref,
-                        other => other,
-                    };
+                        .unwrap_or(majit_ir::Type::Ref);
                     let same_as = OpCode::same_as_for_type(arg_type);
                     let fresh = ctx.alloc_op_position();
                     let mut op = Op::new(same_as, &[orig]);
@@ -2111,21 +2112,38 @@ impl Optimizer {
                 crate::optimizeopt::shortpreamble::ShortBoxes::with_label_args(&preview_short_args);
             short_boxes.note_known_constants_from_ctx(&ctx);
             for &arg in &preview_short_args {
-                // RPython shortpreamble.py parity: Box.type carries the
-                // source type. Look up the OpRef's type from `value_types`
-                // (which emit() maintains per op result type) so that the
-                // SameAs opcode reflects the actual Box shape. Default to
-                // Int only for non-resolvable OpRefs (constants etc.).
-                let arg_type = match ctx
+                // RPython shortpreamble.py:255-259 parity: each label arg
+                // is `box.type`, where Box objects intrinsically carry one
+                // of i / r / f. There is no `void` Box because Box always
+                // wraps a runtime value. Look up the OpRef's type from
+                // `value_types` (maintained per op result type by emit()).
+                let raw_type = ctx
                     .value_types
                     .get(&arg.0)
                     .copied()
-                    .unwrap_or(majit_ir::Type::Int)
-                {
-                    majit_ir::Type::Void => majit_ir::Type::Ref,
-                    other => other,
-                };
-                short_boxes.add_short_input_arg(arg, arg_type);
+                    .unwrap_or(majit_ir::Type::Int);
+                if raw_type == majit_ir::Type::Void {
+                    // Upstream collision: a previously-virtual OpRef whose
+                    // position was reused as a Phase 2 constant slot — its
+                    // value_types entry is the constant op's Void result
+                    // type. Such an OpRef cannot legitimately become a
+                    // short-preamble InputArg in RPython (Box identity
+                    // would have produced a fresh ConstFloat/ConstInt and
+                    // never reach this loop). Skip rather than emitting a
+                    // bogus SameAsR(const0): the same-position constant is
+                    // already in `ctx.constants` and downstream consumers
+                    // resolve it via the constant pool, not via a SameAs.
+                    if crate::optimizeopt::majit_log_enabled() {
+                        eprintln!(
+                            "[unroll] preview_short_args: dropping {:?} \
+                             (Type::Void — Phase 2 constant-slot collision \
+                             with a Phase 1 virtual head OpRef)",
+                            arg
+                        );
+                    }
+                    continue;
+                }
+                short_boxes.add_short_input_arg(arg, raw_type);
             }
             self.produce_potential_short_preamble_ops(&mut short_boxes, &ctx);
             let produced = short_boxes.produced_ops();

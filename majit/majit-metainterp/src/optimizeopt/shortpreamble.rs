@@ -605,19 +605,13 @@ impl ShortBoxes {
     }
 
     pub(crate) fn add_short_input_arg(&mut self, arg: OpRef, arg_type: majit_ir::Type) {
-        // RPython shortpreamble.py parity: the short-preamble InputArg's
-        // SameAs opcode must match the BoxType (Box.type). BoxInt →
-        // same_as_i, BoxRef → same_as_r, BoxFloat → same_as_f. A fixed
-        // SameAsI default type-coerces Ref locals to Int, which surfaces
-        // downstream as `exit_types[i] = Int` and makes
-        // `materialize_virtual` box a raw pointer via `w_int_new`.
-        //
-        // Flat OpRef bookkeeping can occasionally leave `Type::Void` on a
-        // label arg position that conceptually carries a real Box. RPython
-        // would never construct a short-preamble inputarg for a void-typed
-        // Box; treat that case as an imprecise "some runtime value" and
-        // route it through the ref bank instead of panicking.
-        let arg_type = normalize_same_as_type(arg_type);
+        // shortpreamble.py:255-259 parity: ShortInputArg's BoxType is the
+        // intrinsic `box.type` (BoxInt → same_as_i, BoxRef → same_as_r,
+        // BoxFloat → same_as_f). The caller is responsible for filtering
+        // out positions whose `value_types` is `Void` (e.g. constant
+        // collisions); a `Void` reaching here panics in
+        // `OpCode::same_as_for_type`'s `unreachable!` arm with a clear
+        // RPython-parity violation message.
         let label_arg_idx = self.lookup_label_arg(arg);
         let mut same_as = Op::new(OpCode::same_as_for_type(arg_type), &[arg]);
         same_as.pos = arg;
@@ -821,14 +815,7 @@ impl ShortBoxes {
     }
 }
 
-fn normalize_same_as_type(tp: majit_ir::Type) -> majit_ir::Type {
-    match tp {
-        majit_ir::Type::Void => majit_ir::Type::Ref,
-        other => other,
-    }
-}
-
-/// Backwards-compat wrapper around `ShortBoxes::create_short_boxes`.
+/// shortpreamble.py: create_short_boxes(optimizer, inputargs, label_args)
 ///
 /// Existing call sites pass an `optimizer_ops` slice that the new
 /// method-form helper does not consume; the slice is preserved for
