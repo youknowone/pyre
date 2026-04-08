@@ -2718,8 +2718,19 @@ impl Optimizer {
             return;
         }
 
+        // optimizer.py:570-589 parity: collect pass indices that need
+        // postprocess callbacks. After emission, invoke them in reverse
+        // order — matching RPython's OptimizationResult.callback() chain.
+        let mut postprocess_passes: Vec<usize> = Vec::new();
+
         for pass_idx in start_pass..end_pass {
             ctx.current_pass_idx = pass_idx;
+            // Track passes with postprocess BEFORE calling propagate_forward,
+            // matching RPython where `emit()` returns OptimizationResult
+            // for each pass that has postprocess.
+            if self.passes[pass_idx].has_postprocess() {
+                postprocess_passes.push(pass_idx);
+            }
             let result = {
                 let pass = &mut self.passes[pass_idx];
                 pass.propagate_forward(&current_op, ctx)
@@ -2727,19 +2738,15 @@ impl Optimizer {
             self.drain_extra_operations_from(pass_idx + 1, ctx);
             match result {
                 OptimizationResult::Emit(op) => {
-                    self.emit_operation(op, ctx);
+                    self.emit_operation(op.clone(), ctx);
+                    // optimizer.py:585-589: invoke postprocess callbacks
+                    // in reverse order after emission.
+                    for &pp_idx in postprocess_passes.iter().rev() {
+                        self.passes[pp_idx].propagate_postprocess(&op, ctx);
+                    }
                     return;
                 }
                 OptimizationResult::Replace(op) => {
-                    // resoperation.py:498-503 GuardResOp.copy_and_change
-                    // parity: when an optimization pass replaces a guard
-                    // with another guard, the new op MUST inherit
-                    // rd_resume_position (and the rest of the guard
-                    // metadata). Producers are required to call
-                    // Op::copy_and_change which performs this copy.
-                    // If both ops are guards but the source had a valid
-                    // resume_position and the replacement does not, that
-                    // is a copy_and_change-bypass bug at the producer.
                     debug_assert!(
                         !(current_op.opcode.is_guard()
                             && op.opcode.is_guard()
@@ -2771,7 +2778,11 @@ impl Optimizer {
         }
 
         // If no pass handled it, emit as-is
-        self.emit_operation(current_op, ctx);
+        self.emit_operation(current_op.clone(), ctx);
+        // Postprocess in reverse order after emission.
+        for &pp_idx in postprocess_passes.iter().rev() {
+            self.passes[pp_idx].propagate_postprocess(&current_op, ctx);
+        }
     }
 
     /// optimizer.py: _emit_operation — emit with guard tracking.
