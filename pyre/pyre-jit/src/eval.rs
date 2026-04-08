@@ -2546,28 +2546,6 @@ fn decode_tagged_value(
     }
 }
 
-fn decode_virtual_int_payload(value: &Value) -> i64 {
-    match value {
-        Value::Int(n) => *n,
-        Value::Ref(gc) if !gc.is_null() => unsafe {
-            pyre_object::intobject::w_int_get_value(gc.0 as pyre_object::PyObjectRef)
-        },
-        _ => 0,
-    }
-}
-
-fn decode_virtual_float_payload_bits(value: &Value) -> i64 {
-    match value {
-        Value::Float(f) => f.to_bits() as i64,
-        Value::Int(n) => *n,
-        Value::Ref(gc) if !gc.is_null() => unsafe {
-            pyre_object::floatobject::w_float_get_value(gc.0 as pyre_object::PyObjectRef).to_bits()
-                as i64
-        },
-        _ => 0,
-    }
-}
-
 fn decode_exit_layout_values(raw_values: &[i64], layout: &CompiledExitLayout) -> Vec<Value> {
     layout
         .exit_types
@@ -3774,18 +3752,6 @@ fn decode_recovery_float_payload_bits(
     }
 }
 
-fn decode_recovery_int_payload(
-    typed_raw: i64,
-    typed: &[Value],
-    raw_slot: Option<i64>,
-    raw_values: &[i64],
-    exit_types: &[majit_ir::Type],
-) -> i64 {
-    raw_slot
-        .map(|raw| maybe_unbox_known_int_ref(raw, typed, raw_values, exit_types))
-        .unwrap_or(typed_raw)
-}
-
 fn maybe_unbox_known_int_ref(
     raw: i64,
     typed: &[Value],
@@ -3849,17 +3815,6 @@ pub(crate) fn build_jit_state(
         "build_jit_state: frame must be a valid PyFrame with readable fields"
     );
     jit_state
-}
-
-fn sync_jit_state_to_frame(
-    jit_state: &PyreJitState,
-    frame: &mut PyFrame,
-    virtualizable_info: &majit_metainterp::virtualizable::VirtualizableInfo,
-) {
-    // Heap IS the source of truth — read back from the frame pointer.
-    let _ = jit_state.sync_to_virtualizable(virtualizable_info);
-    frame.next_instr = jit_state.next_instr();
-    frame.valuestackdepth = jit_state.valuestackdepth();
 }
 
 /// resume.py:1437-1541 — BlackholeAllocator for pyre's object model.
