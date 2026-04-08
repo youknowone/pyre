@@ -188,7 +188,7 @@ fn jit_interp_branch_group_false_path_records_guard_false() {
     let case = TraceParityCase {
         name: "jit_interp_branch_group_guard_false",
         rpython_reference: "rpython/jit/metainterp/pyjitpl.py: generate_guard(rop.GUARD_FALSE)",
-        expected_lines: &["GuardFalse(v0) [fail_args=0, 0, 1]", "Finish()"],
+        expected_lines: &["GuardFalse(v1) [fail_args=0, 0, 1]", "Finish()"],
     };
     assert_trace_parity(&trace, &constants, &case);
 }
@@ -218,7 +218,7 @@ fn jit_interp_branch_group_true_path_records_guard_true() {
     let case = TraceParityCase {
         name: "jit_interp_branch_group_guard_true",
         rpython_reference: "rpython/jit/metainterp/pyjitpl.py: generate_guard(rop.GUARD_TRUE)",
-        expected_lines: &["GuardTrue(v0) [fail_args=0, 0, 1]", "Finish()"],
+        expected_lines: &["GuardTrue(v1) [fail_args=0, 0, 1]", "Finish()"],
     };
     assert_trace_parity(&trace, &constants, &case);
 }

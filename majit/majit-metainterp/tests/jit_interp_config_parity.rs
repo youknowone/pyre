@@ -179,7 +179,7 @@ fn jit_interp_compound_storage_method_inlines_sub_jitcode() {
     let case = TraceParityCase {
         name: "jit_interp_compound_storage_method",
         rpython_reference: "rpython/jit/metainterp/pyjitpl.py: inlined helper stack binop",
-        expected_lines: &["v2 = IntAdd(v0, v1)", "Finish(v2)"],
+        expected_lines: &["v3 = IntAdd(v1, v2)", "Finish(v3)"],
     };
     assert_trace_parity(&trace, &constants, &case);
 }
@@ -229,7 +229,7 @@ fn jit_interp_selector_and_push_to_route_value_to_other_stack() {
     assert!(matches!(action, TraceAction::Continue));
 
     let moved = sym.stacks.get(&1).unwrap().peek().unwrap();
-    assert_eq!(moved, OpRef(0));
+    assert_eq!(moved, OpRef(1));
 
     let result = sym.stacks.get(&0).unwrap().peek().unwrap();
     let (trace, constants) = interp.finish_trace_for_parity(&[result]).unwrap();

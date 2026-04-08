@@ -1779,11 +1779,25 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig) -> TokenStream {
             quote! { #fname: majit_ir::OpRef, }
         })
         .collect();
+    let sym_scalar_value_fields: Vec<TokenStream> = scalars
+        .iter()
+        .map(|(_, f)| {
+            let value_name = quote::format_ident!("{}_value", f.name);
+            quote! { #value_name: i64, }
+        })
+        .collect();
     let sym_array_fields: Vec<TokenStream> = arrays
         .iter()
         .map(|(_, f)| {
             let fname = &f.name;
             quote! { #fname: Vec<majit_ir::OpRef>, }
+        })
+        .collect();
+    let sym_array_value_fields: Vec<TokenStream> = arrays
+        .iter()
+        .map(|(_, f)| {
+            let value_name = quote::format_ident!("{}_values", f.name);
+            quote! { #value_name: Vec<i64>, }
         })
         .collect();
     let sym_virt_array_fields: Vec<TokenStream> = virt_arrays
@@ -1827,6 +1841,24 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig) -> TokenStream {
             quote! { #idx_lit => { self.#fname = value; } }
         })
         .collect();
+    let state_field_value_arms: Vec<TokenStream> = scalars
+        .iter()
+        .enumerate()
+        .map(|(idx, (_, f))| {
+            let value_name = quote::format_ident!("{}_value", f.name);
+            let idx_lit = idx;
+            quote! { #idx_lit => Some(self.#value_name), }
+        })
+        .collect();
+    let set_state_field_value_arms: Vec<TokenStream> = scalars
+        .iter()
+        .enumerate()
+        .map(|(idx, (_, f))| {
+            let value_name = quote::format_ident!("{}_value", f.name);
+            let idx_lit = idx;
+            quote! { #idx_lit => { self.#value_name = value; } }
+        })
+        .collect();
 
     // ── JitCodeSym: state_array_ref / set_state_array_ref (flattened only) ──
     let state_array_ref_arms: Vec<TokenStream> = arrays
@@ -1847,6 +1879,28 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig) -> TokenStream {
             quote! { #arr_idx_lit => {
                 if elem_idx < self.#fname.len() {
                     self.#fname[elem_idx] = value;
+                }
+            } }
+        })
+        .collect();
+    let state_array_value_arms: Vec<TokenStream> = arrays
+        .iter()
+        .enumerate()
+        .map(|(arr_idx, (_, f))| {
+            let value_name = quote::format_ident!("{}_values", f.name);
+            let arr_idx_lit = arr_idx;
+            quote! { #arr_idx_lit => self.#value_name.get(elem_idx).copied(), }
+        })
+        .collect();
+    let set_state_array_value_arms: Vec<TokenStream> = arrays
+        .iter()
+        .enumerate()
+        .map(|(arr_idx, (_, f))| {
+            let value_name = quote::format_ident!("{}_values", f.name);
+            let arr_idx_lit = arr_idx;
+            quote! { #arr_idx_lit => {
+                if elem_idx < self.#value_name.len() {
+                    self.#value_name[elem_idx] = value;
                 }
             } }
         })
@@ -1971,9 +2025,11 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig) -> TokenStream {
         .iter()
         .map(|(_, f)| {
             let fname = &f.name;
+            let value_name = quote::format_ident!("{}_value", f.name);
             quote! {
                 let #fname = majit_ir::OpRef(__offset as u32);
                 __offset += 1;
+                let #value_name = 0i64;
             }
         })
         .collect();
@@ -1982,6 +2038,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig) -> TokenStream {
         .map(|(_, f)| {
             let fname = &f.name;
             let len_name = quote::format_ident!("{}_len", f.name);
+            let value_name = quote::format_ident!("{}_values", f.name);
             quote! {
                 let #fname: Vec<majit_ir::OpRef> = (0..meta.#len_name)
                     .map(|i| {
@@ -1989,6 +2046,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig) -> TokenStream {
                         r
                     })
                     .collect();
+                let #value_name: Vec<i64> = vec![0; meta.#len_name];
                 __offset += meta.#len_name;
             }
         })
@@ -2008,6 +2066,14 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig) -> TokenStream {
         .collect();
     let create_sym_scalar_names: Vec<&syn::Ident> = scalars.iter().map(|(_, f)| &f.name).collect();
     let create_sym_array_names: Vec<&syn::Ident> = arrays.iter().map(|(_, f)| &f.name).collect();
+    let create_sym_scalar_value_names: Vec<syn::Ident> = scalars
+        .iter()
+        .map(|(_, f)| quote::format_ident!("{}_value", f.name))
+        .collect();
+    let create_sym_array_value_names: Vec<syn::Ident> = arrays
+        .iter()
+        .map(|(_, f)| quote::format_ident!("{}_values", f.name))
+        .collect();
     let create_sym_virt_array_ptr_names: Vec<syn::Ident> = virt_arrays
         .iter()
         .map(|(_, f)| quote::format_ident!("{}_ptr", f.name))
@@ -2065,6 +2131,26 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig) -> TokenStream {
             }
         })
         .collect();
+    let initialize_sym_scalar_parts: Vec<TokenStream> = scalars
+        .iter()
+        .map(|(_, f)| {
+            let fname = &f.name;
+            let value_name = quote::format_ident!("{}_value", f.name);
+            quote! {
+                sym.#value_name = self.#fname;
+            }
+        })
+        .collect();
+    let initialize_sym_array_parts: Vec<TokenStream> = arrays
+        .iter()
+        .map(|(_, f)| {
+            let fname = &f.name;
+            let value_name = quote::format_ident!("{}_values", f.name);
+            quote! {
+                sym.#value_name.clone_from(&self.#fname);
+            }
+        })
+        .collect();
 
     // ── validate_close: flattened array lengths in sym match meta ──
     // Virt arrays always validate (ptr+len are just OpRefs, not sized).
@@ -2089,7 +2175,9 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig) -> TokenStream {
         #[allow(non_camel_case_types)]
         struct __JitSym {
             #(#sym_scalar_fields)*
+            #(#sym_scalar_value_fields)*
             #(#sym_array_fields)*
+            #(#sym_array_value_fields)*
             #(#sym_virt_array_fields)*
             loop_header_pc: usize,
             trace_started: bool,
@@ -2140,6 +2228,20 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig) -> TokenStream {
                 }
             }
 
+            fn state_field_value(&self, field_idx: usize) -> Option<i64> {
+                match field_idx {
+                    #(#state_field_value_arms)*
+                    _ => None,
+                }
+            }
+
+            fn set_state_field_value(&mut self, field_idx: usize, value: i64) {
+                match field_idx {
+                    #(#set_state_field_value_arms)*
+                    _ => {}
+                }
+            }
+
             fn state_array_ref(&self, array_idx: usize, elem_idx: usize) -> Option<majit_ir::OpRef> {
                 match array_idx {
                     #(#state_array_ref_arms)*
@@ -2150,6 +2252,20 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig) -> TokenStream {
             fn set_state_array_ref(&mut self, array_idx: usize, elem_idx: usize, value: majit_ir::OpRef) {
                 match array_idx {
                     #(#set_state_array_ref_arms)*
+                    _ => {}
+                }
+            }
+
+            fn state_array_value(&self, array_idx: usize, elem_idx: usize) -> Option<i64> {
+                match array_idx {
+                    #(#state_array_value_arms)*
+                    _ => None,
+                }
+            }
+
+            fn set_state_array_value(&mut self, array_idx: usize, elem_idx: usize, value: i64) {
+                match array_idx {
+                    #(#set_state_array_value_arms)*
                     _ => {}
                 }
             }
@@ -2207,12 +2323,19 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig) -> TokenStream {
                 #(#create_sym_virt_array_inits)*
                 __JitSym {
                     #(#create_sym_scalar_names,)*
+                    #(#create_sym_scalar_value_names,)*
                     #(#create_sym_array_names,)*
+                    #(#create_sym_array_value_names,)*
                     #(#create_sym_virt_array_ptr_names,)*
                     #(#create_sym_virt_array_len_names,)*
                     loop_header_pc: header_pc,
                     trace_started: false,
                 }
+            }
+
+            fn initialize_sym(&self, sym: &mut __JitSym, _meta: &__JitMeta) {
+                #(#initialize_sym_scalar_parts)*
+                #(#initialize_sym_array_parts)*
             }
 
             fn is_compatible(&self, meta: &__JitMeta) -> bool {

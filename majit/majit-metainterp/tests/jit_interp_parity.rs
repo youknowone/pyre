@@ -199,7 +199,7 @@ fn jit_interp_inline_add_matches_runtime_parity_seam() {
     let case = TraceParityCase {
         name: "jit_interp_inline_add",
         rpython_reference: "rpython/jit/metainterp/pyjitpl.py: opimpl_int_add",
-        expected_lines: &["v2 = IntAdd(v1, v0)", "Finish(v2)"],
+        expected_lines: &["v3 = IntAdd(v2, v1)", "Finish(v3)"],
     };
     assert_trace_parity(&trace, &constants, &case);
 }
@@ -227,10 +227,10 @@ fn jit_interp_inline_complex_expr_matches_runtime_parity_seam() {
         name: "jit_interp_inline_complex_expr",
         rpython_reference: "rpython/jit/metainterp/pyjitpl.py: opimpl_int_add / opimpl_int_sub / opimpl_int_mul",
         expected_lines: &[
-            "v2 = IntAdd(v1, 1)",
-            "v3 = IntSub(v0, 2)",
-            "v4 = IntMul(v2, v3)",
-            "Finish(v4)",
+            "v3 = IntAdd(v2, 1)",
+            "v4 = IntSub(v1, 2)",
+            "v5 = IntMul(v3, v4)",
+            "Finish(v5)",
         ],
     };
     assert_trace_parity(&trace, &constants, &case);
@@ -259,11 +259,11 @@ fn jit_interp_shift_and_compare_matches_runtime_parity_seam() {
         name: "jit_interp_shift_and_compare",
         rpython_reference: "rpython/jit/metainterp/pyjitpl.py: opimpl_int_lshift / opimpl_int_rshift / opimpl_int_ge",
         expected_lines: &[
-            "v2 = IntLshift(v1, 1)",
-            "v3 = IntRshift(v0, 2)",
-            "v4 = IntOr(v2, v3)",
-            "v5 = IntGe(v4, 10)",
-            "Finish(v5)",
+            "v3 = IntLshift(v2, 1)",
+            "v4 = IntRshift(v1, 2)",
+            "v5 = IntOr(v3, v4)",
+            "v6 = IntGe(v5, 10)",
+            "Finish(v6)",
         ],
     };
     assert_trace_parity(&trace, &constants, &case);
@@ -291,7 +291,7 @@ fn jit_interp_eq_booleanization_matches_runtime_parity_seam() {
     let case = TraceParityCase {
         name: "jit_interp_eq_booleanization",
         rpython_reference: "rpython/jit/metainterp/pyjitpl.py: opimpl_int_eq",
-        expected_lines: &["v2 = IntEq(v0, v1)", "Finish(v2)"],
+        expected_lines: &["v3 = IntEq(v1, v2)", "Finish(v3)"],
     };
     assert_trace_parity(&trace, &constants, &case);
 }
@@ -318,7 +318,7 @@ fn jit_interp_nonzero_booleanization_matches_runtime_parity_seam() {
     let case = TraceParityCase {
         name: "jit_interp_nonzero_booleanization",
         rpython_reference: "rpython/jit/metainterp/pyjitpl.py: opimpl_int_ne",
-        expected_lines: &["v1 = IntNe(v0, 0)", "Finish(v1)"],
+        expected_lines: &["v2 = IntNe(v1, 0)", "Finish(v2)"],
     };
     assert_trace_parity(&trace, &constants, &case);
 }
@@ -346,9 +346,9 @@ fn jit_interp_internal_if_taken_path_records_guard_true() {
         name: "jit_interp_internal_if_taken",
         rpython_reference: "rpython/jit/metainterp/pyjitpl.py: bytecode branch on traced bool",
         expected_lines: &[
-            "v1 = IntNe(v0, 0)",
-            "GuardTrue(v1) [fail_args=0, 0, 0]",
-            "v3 = IntAdd(v0, 10)",
+            "v2 = IntNe(v1, 0)",
+            "GuardTrue(v2) [fail_args=0, 0, 0]",
+            "v3 = IntAdd(v1, 10)",
             "Finish(v3)",
         ],
     };
@@ -378,8 +378,8 @@ fn jit_interp_internal_if_fallthrough_records_guard_false() {
         name: "jit_interp_internal_if_fallthrough",
         rpython_reference: "rpython/jit/metainterp/pyjitpl.py: bytecode branch on traced bool",
         expected_lines: &[
-            "v1 = IntNe(v0, 0)",
-            "GuardFalse(v1) [fail_args=0, 0, 0]",
+            "v2 = IntNe(v1, 0)",
+            "GuardFalse(v2) [fail_args=0, 0, 0]",
             "Finish(42)",
         ],
     };
@@ -409,9 +409,9 @@ fn jit_interp_if_expr_taken_path_reuses_branch_value() {
         name: "jit_interp_if_expr_taken",
         rpython_reference: "rpython/jit/metainterp/pyjitpl.py: register-valued branch result",
         expected_lines: &[
-            "v1 = IntNe(v0, 0)",
-            "GuardTrue(v1) [fail_args=0, 0, 0]",
-            "v3 = IntAdd(v0, 1)",
+            "v2 = IntNe(v1, 0)",
+            "GuardTrue(v2) [fail_args=0, 0, 0]",
+            "v3 = IntAdd(v1, 1)",
             "Finish(v3)",
         ],
     };
@@ -441,9 +441,9 @@ fn jit_interp_if_expr_fallthrough_reuses_branch_value() {
         name: "jit_interp_if_expr_fallthrough",
         rpython_reference: "rpython/jit/metainterp/pyjitpl.py: register-valued branch result",
         expected_lines: &[
-            "v1 = IntNe(v0, 0)",
-            "GuardFalse(v1) [fail_args=0, 0, 0]",
-            "v3 = IntSub(v0, 1)",
+            "v2 = IntNe(v1, 0)",
+            "GuardFalse(v2) [fail_args=0, 0, 0]",
+            "v3 = IntSub(v1, 1)",
             "Finish(v3)",
         ],
     };
@@ -463,7 +463,12 @@ fn generated_jit_state_preserves_storage_layout_order() {
     let sym = TestState::create_sym(&meta, 0);
     assert_eq!(
         TestState::collect_jump_args(&sym),
-        vec![majit_ir::OpRef(0), majit_ir::OpRef(1), majit_ir::OpRef(2)]
+        vec![
+            majit_ir::OpRef(0),
+            majit_ir::OpRef(1),
+            majit_ir::OpRef(2),
+            majit_ir::OpRef(3),
+        ]
     );
     assert!(TestState::validate_close(&sym, &meta));
 }
