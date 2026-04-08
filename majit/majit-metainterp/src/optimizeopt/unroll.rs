@@ -3732,15 +3732,58 @@ fn assemble_peeled_trace_with_jump_args(
     }
     max_pos = next_free_pos(max_pos);
 
-    // Step 6 of the Box identity plan: the extra-SameAs allocation loop
-    // for `filtered_extra_label_args` was a band-aid that emitted
-    // explicit SameAs ops to bridge label args to their imported short
-    // sources when the alias / rescue maps had populated entries. Both
-    // maps are dead under Commit D1/D2 (verified zero entries across
-    // 909 tests), so the SameAs allocation loop is also dead — extra
-    // label args resolve directly to the original `filtered_extra_label_args`
-    // OpRefs without remapping.
+    // RPython compile.py:327 extra_same_as parity. Every extra label arg
+    // must be defined before the label — either by a preamble op or by
+    // an explicit SameAs bridge between preamble and label. In RPython
+    // this is the `extra_same_as` list populated by
+    // `ShortPreambleBuilder.add_preamble_op` (shortpreamble.py:436-439)
+    // for every `invented_name` preamble op.
+    //
+    // majit's `imported_short_aliases` already emits the SameAs ops for
+    // invented_name entries at the loop above (`for alias in
+    // imported_short_aliases`). For any other `filtered_extra_label_args`
+    // entry whose OpRef is not produced by the preamble — e.g. the fresh
+    // value OpRef allocated by `import_short_preamble_ops` for a
+    // non-invented HeapField import — emit a SameAs here so the
+    // fall-through into the label sees it defined. Without this bridge,
+    // Cranelift's first iteration would read an undefined OpRef for the
+    // extra label slot.
+    //
+    // The source for the SameAs comes from `imported_short_sources` which
+    // records `(result, source)` for every imported short preamble op.
+    // If an extra label arg has no known source (synthetic test setups
+    // or base-label-arg collisions), it is appended as-is and the caller
+    // is responsible for ensuring it is defined elsewhere.
     let extra_label_start_idx = full_label_args.len();
+    {
+        let alias_results: std::collections::HashSet<OpRef> = imported_short_aliases
+            .iter()
+            .map(|alias| alias.result)
+            .collect();
+        for &la in filtered_extra_label_args.iter() {
+            if preamble_defs.contains(&la) || alias_results.contains(&la) {
+                continue;
+            }
+            let Some(source) = imported_short_sources
+                .iter()
+                .find(|entry| entry.result == la)
+                .map(|entry| entry.source)
+            else {
+                continue;
+            };
+            let same_as_opcode = {
+                let ty = result
+                    .iter()
+                    .find(|op| op.pos == source)
+                    .map(|op| op.opcode.result_type())
+                    .unwrap_or(Type::Int);
+                OpCode::same_as_for_type(ty)
+            };
+            let mut op = Op::new(same_as_opcode, &[source]);
+            op.pos = la;
+            result.push(op);
+        }
+    }
     full_label_args.extend(filtered_extra_label_args.iter().copied());
 
     // RPython compile.py parity: after the loop label, only the loop-header
