@@ -2982,6 +2982,34 @@ impl Optimization for OptRewrite {
         "rewrite"
     }
 
+    fn has_postprocess(&self) -> bool {
+        true
+    }
+
+    /// rewrite.py:352-371 postprocess_GUARD_TRUE/FALSE
+    /// rewrite.py:303-305 postprocess_GUARD_VALUE
+    fn propagate_postprocess(&mut self, op: &Op, ctx: &mut OptContext) {
+        match op.opcode {
+            OpCode::GuardTrue => {
+                let box_ = ctx.get_box_replacement(op.arg(0));
+                ctx.make_constant(box_, majit_ir::Value::Int(1));
+            }
+            OpCode::GuardFalse => {
+                let box_ = ctx.get_box_replacement(op.arg(0));
+                ctx.make_constant(box_, majit_ir::Value::Int(0));
+            }
+            OpCode::GuardValue => {
+                if op.num_args() >= 2 {
+                    let box_ = ctx.get_box_replacement(op.arg(0));
+                    if let Some(val) = ctx.get_constant(op.arg(1)).cloned() {
+                        ctx.make_constant(box_, val);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// rewrite.py:45-47: produce_potential_short_preamble_ops
     fn produce_potential_short_preamble_ops(
         &self,

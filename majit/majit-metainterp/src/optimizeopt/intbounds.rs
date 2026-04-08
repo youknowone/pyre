@@ -1892,9 +1892,14 @@ impl Optimization for OptIntBounds {
         "intbounds"
     }
 
-    fn has_postprocess(&self) -> bool {
-        true
-    }
+    // intbounds postprocess_GUARD_TRUE/FALSE/VALUE is structurally
+    // implemented (propagate_postprocess below) but disabled because
+    // propagate_bounds_backward_op recurses via make_int_lt →
+    // propagate_bounds_backward → deep chain → stack overflow on
+    // Rust's 8MB stack. RPython's Python stack handles this depth.
+    // Rewrite postprocess (make_constant) IS active and provides
+    // the critical constant propagation that enables IntAddOvf→IntAdd.
+    // fn has_postprocess(&self) -> bool { true }
 
     /// intbounds.py:52-58 _postprocess_guard_true_false_value parity.
     ///
