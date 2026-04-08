@@ -253,7 +253,10 @@ impl DynasmBackend {
         CALL_ASSEMBLER_TARGETS
             .lock()
             .expect("CALL_ASSEMBLER_TARGETS poisoned")
-            .clone()
+            .iter()
+            .filter(|(_k, v)| **v != 0) // exclude pending (code_addr == 0)
+            .map(|(&k, &v)| (k, v))
+            .collect()
     }
 
     fn register_call_assembler_target(token_number: u64, code_addr: usize) {
@@ -268,6 +271,15 @@ impl DynasmBackend {
             .lock()
             .expect("CALL_ASSEMBLER_TARGETS poisoned")
             .insert(old_number, new_addr);
+    }
+
+    /// Static entry point for lib.rs register_pending_call_assembler_target.
+    pub fn register_pending_call_assembler_target_static(token_number: u64) {
+        CALL_ASSEMBLER_TARGETS
+            .lock()
+            .expect("CALL_ASSEMBLER_TARGETS poisoned")
+            .entry(token_number)
+            .or_insert(0);
     }
 }
 
@@ -683,6 +695,29 @@ impl Backend for DynasmBackend {
 
     fn bh_getfield_gc_r(&self, struct_ptr: i64, offset: usize) -> GcRef {
         GcRef(unsafe { *((struct_ptr as *const u8).add(offset) as *const usize) })
+    }
+
+    /// compile_tmp_callback parity: register a placeholder for a pending
+    /// CALL_ASSEMBLER target. The real code_addr is set by compile_loop.
+    /// Until then, CALL_ASSEMBLER's generated code falls through to the
+    /// helper trampoline which calls force_fn (interpreter re-execution).
+    fn register_pending_target(
+        &mut self,
+        token_number: u64,
+        _input_types: Vec<Type>,
+        _num_inputs: usize,
+        _num_scalar_inputargs: usize,
+    ) {
+        // Insert with code_addr = 0 (pending). call_assembler_targets_snapshot
+        // will include this entry, but Assembler386.call_assembler_targets
+        // won't find a nonzero address, so the generated code takes the
+        // "unresolved target" path → helper trampoline → force_fn.
+        // compile_loop later overwrites with the real code_addr.
+        CALL_ASSEMBLER_TARGETS
+            .lock()
+            .expect("CALL_ASSEMBLER_TARGETS poisoned")
+            .entry(token_number)
+            .or_insert(0);
     }
 
     fn setup_once(&mut self) {}
