@@ -290,6 +290,13 @@ impl ArrayCachedItem {
             .map(|(_, d)| d)
     }
 
+    /// heap.py:257-266 ArrayCachedItem.invalidate
+    ///
+    /// RPython's `invalidate(descr)` clears `cached_infos`/`cached_structs`
+    /// and then calls `self.parent.clear_varindex()` (the back-pointer).
+    /// majit's borrow checker forbids the back-pointer pattern, so the
+    /// `parent.clear_varindex()` step is performed at the call site
+    /// (always inside `ArrayCacheSubMap::invalidate_index` for parity).
     fn invalidate(&mut self) {
         self.cached_arrays.clear();
         self.cached_values.clear();
@@ -319,6 +326,82 @@ impl ArrayCachedItem {
     #[allow(dead_code)]
     fn is_empty(&self) -> bool {
         self.cached_arrays.is_empty() && self.lazy_set.is_none()
+    }
+}
+
+/// heap.py:300-324 ArrayCacheSubMap
+///
+/// Per-arraydescr container holding both constant-index entries and a
+/// variable-index triples list. Mirrors RPython's `ArrayCacheSubMap`
+/// 1:1.
+struct ArrayCacheSubMap {
+    /// heap.py:302: const_indexes = {} (int -> ArrayCachedItem)
+    const_indexes: HashMap<i64, ArrayCachedItem>,
+    /// heap.py:305-306: cached_varindex_triples = None
+    /// List of (arrayinfo, indexbox, resbox). RPython uses Python object
+    /// identity for arrayinfo; majit uses the canonical array OpRef.
+    cached_varindex_triples: Option<Vec<(OpRef, OpRef, OpRef)>>,
+}
+
+impl ArrayCacheSubMap {
+    fn new() -> Self {
+        ArrayCacheSubMap {
+            const_indexes: HashMap::new(),
+            cached_varindex_triples: None,
+        }
+    }
+
+    /// heap.py:305-306 clear_varindex
+    fn clear_varindex(&mut self) {
+        self.cached_varindex_triples = None;
+    }
+
+    /// heap.py:308-314 cache_varindex_read
+    fn cache_varindex_read(&mut self, arrayinfo: OpRef, indexbox: OpRef, resbox: OpRef) {
+        let entry = (arrayinfo, indexbox, resbox);
+        if self.cached_varindex_triples.is_none() {
+            self.cached_varindex_triples = Some(vec![entry]);
+            return;
+        }
+        self.cached_varindex_triples.as_mut().unwrap().push(entry);
+    }
+
+    /// heap.py:316-317 cache_varindex_write
+    fn cache_varindex_write(&mut self, arrayinfo: OpRef, indexbox: OpRef, resbox: OpRef) {
+        self.cached_varindex_triples = Some(vec![(arrayinfo, indexbox, resbox)]);
+    }
+
+    /// heap.py:319-324 lookup_cached
+    fn lookup_cached(&self, arrayinfo: OpRef, indexbox: OpRef, ctx: &OptContext) -> Option<OpRef> {
+        if let Some(triples) = &self.cached_varindex_triples {
+            for &(cached_arrayinfo, cached_index, cached_result) in triples {
+                if cached_arrayinfo == arrayinfo
+                    && ctx.get_box_replacement(cached_index) == indexbox
+                {
+                    return Some(ctx.get_box_replacement(cached_result));
+                }
+            }
+        }
+        None
+    }
+
+    /// heap.py:257-266 ArrayCachedItem.invalidate (parent step inlined)
+    ///
+    /// Clears the cached entries at `index` AND clears `cached_varindex_triples`.
+    /// This matches RPython's `ArrayCachedItem.invalidate(descr)` exactly:
+    /// the `self.parent.clear_varindex()` call is inlined here because the
+    /// child needs back-access to the parent.
+    fn invalidate_index(&mut self, index: i64) {
+        if let Some(cai) = self.const_indexes.get_mut(&index) {
+            cai.invalidate();
+        }
+        self.clear_varindex();
+    }
+
+    /// True when no const-index entries and no varindex triples remain.
+    #[allow(dead_code)]
+    fn is_empty(&self) -> bool {
+        self.const_indexes.is_empty() && self.cached_varindex_triples.is_none()
     }
 }
 
