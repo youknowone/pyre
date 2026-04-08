@@ -111,6 +111,12 @@ pub fn register_call_assembler_force(f: ForceFn) {
     CA_FORCE_FN.set(f).ok();
 }
 
+/// Return the force_fn address for embedding in generated code.
+/// Returns 0 if not registered.
+pub fn call_assembler_force_fn_addr() -> usize {
+    CA_FORCE_FN.get().map(|f| *f as usize).unwrap_or(0)
+}
+
 /// Register int unbox handler (same API as Cranelift).
 pub fn register_call_assembler_unbox_int(f: UnboxIntFn) {
     CA_UNBOX_INT_FN.set(f).ok();
@@ -142,8 +148,10 @@ pub extern "C" fn call_assembler_helper_trampoline(callee_jf_ptr: *mut i64, gree
     let descr_raw = unsafe { *callee_jf_ptr } as usize;
 
     let result = if descr_raw == 0 || guard::is_done_with_this_frame_descr(descr_raw) {
-        // jf_descr is 0 or a done_descr — shouldn't reach slow path.
-        // Safety fallback: return 0.
+        // jf_descr == 0: callee didn't set a guard descr. This happens when
+        // the slow path is entered from a scenario that shouldn't occur in
+        // normal resolved-target flow. Return 0 — the generated code for
+        // unresolved targets handles force_fn inline before reaching here.
         0
     } else {
         // Guard failure: jf_descr points to DynasmFailDescr.
