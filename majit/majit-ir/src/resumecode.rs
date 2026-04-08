@@ -30,26 +30,23 @@ pub fn encode_varint(buf: &mut Vec<u8>, value: i32) {
 }
 
 /// resumecode.py: numb_next_item(numb, index)
+///
+/// line-by-line port. Does not bounds-check: upstream contract requires
+/// the buffer to contain a complete varint at `index`. A truncated
+/// buffer is a bug in resume data generation and should panic loudly
+/// via the standard slice indexing rather than silently returning 0.
 pub fn decode_varint(buf: &[u8], index: usize) -> (i32, usize) {
-    if index >= buf.len() {
-        // rd_numb truncated — upstream contract: never happens.
-        return (0, index);
-    }
     let mut value = buf[index] as i64;
     let mut index = index + 1;
 
     if value & (1 << 7) != 0 {
         value &= (1 << 7) - 1;
-        if index < buf.len() {
-            value |= (buf[index] as i64) << 7;
+        value |= (buf[index] as i64) << 7;
+        index += 1;
+        if value & (1 << 14) != 0 {
+            value &= (1 << 14) - 1;
+            value |= (buf[index] as i64) << 14;
             index += 1;
-            if value & (1 << 14) != 0 {
-                value &= (1 << 14) - 1;
-                if index < buf.len() {
-                    value |= (buf[index] as i64) << 14;
-                    index += 1;
-                }
-            }
         }
     }
 
