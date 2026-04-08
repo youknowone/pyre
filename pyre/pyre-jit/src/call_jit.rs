@@ -768,15 +768,19 @@ fn blackhole_from_jit_frame(frame: &mut PyFrame) -> Option<PyObjectRef> {
         }
     }
 
-    // Load value stack into blackhole runtime stack.
-    // locals_cells_stack_w layout: [locals..., cells..., stack...]
-    // stack_base = nlocals + ncells (pyframe.py stack_base parity).
+    // Load value stack into blackhole register bank.
+    // locals_cells_stack_w layout: [locals..., cells..., stack...].
+    // stack_base in PyFrame = nlocals + ncells; in JitCode the value-stack
+    // temporaries live at registers_r[nlocals + d] (codewriter parity —
+    // BC_MOVE_R only, no BC_PUSH_R / BC_POP_R against runtime_stacks).
     let ncells = pyre_interpreter::pyframe::ncells(code);
-    let stack_base = nlocals + ncells;
+    let frame_stack_base = nlocals + ncells;
     let vsd = frame.valuestackdepth;
-    for i in stack_base..vsd {
-        if i < frame.locals_cells_stack_w.len() {
-            bh.runtime_stack_push(0, frame.locals_cells_stack_w[i] as i64);
+    for d in 0..vsd.saturating_sub(frame_stack_base) {
+        let frame_idx = frame_stack_base + d;
+        let reg_idx = nlocals + d;
+        if frame_idx < frame.locals_cells_stack_w.len() && reg_idx < bh.registers_r.len() {
+            bh.setarg_r(reg_idx, frame.locals_cells_stack_w[frame_idx] as i64);
         }
     }
 
