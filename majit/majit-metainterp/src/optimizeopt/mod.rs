@@ -2991,10 +2991,17 @@ pub trait Optimization {
     fn propagate_postprocess(&mut self, _op: &Op, _ctx: &mut OptContext) {}
 
     /// optimizer.py:74-75 have_postprocess — returns true if this pass
-    /// overrides propagate_postprocess. Used to avoid allocating
-    /// OptimizationResult objects for passes that don't need it.
+    /// overrides propagate_postprocess. Used to avoid collecting
+    /// postprocess callbacks for passes that don't need it.
     fn has_postprocess(&self) -> bool {
         false
+    }
+
+    /// optimizer.py:77-79 have_postprocess_op(opnum) — per-opcode override.
+    /// Default delegates to has_postprocess(). Passes can override to
+    /// restrict postprocess to specific opcodes for efficiency.
+    fn have_postprocess_op(&self, _opcode: OpCode) -> bool {
+        self.has_postprocess()
     }
 
     /// Called once before optimization starts.

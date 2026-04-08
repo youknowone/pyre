@@ -787,27 +787,32 @@ impl OptIntBounds {
 
     // ── Guard optimizations ──
 
+    /// RPython intbounds.py: no optimize_GUARD_TRUE handler.
+    /// Guards are NOT handled in optimize (propagate_forward).
+    /// The guard is emitted via the default emit path, and
+    /// propagate_bounds_backward runs in postprocess_GUARD_TRUE
+    /// (intbounds.py:56).
+    ///
+    /// The constant/bound checks for guard removal are handled by
+    /// the default dispatch in RPython. In majit, we do them here
+    /// because we don't have per-opcode default dispatch.
     fn optimize_guard_true(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let cond_ref = ctx.get_box_replacement(op.arg(0));
 
-        // If the condition is a known constant, we can determine the guard outcome
+        // Constant check: if condition is known constant nonzero, remove guard.
         if let Some(val) = ctx.get_constant_int(cond_ref) {
             if val != 0 {
-                // Guard always passes, remove it
                 return OptimizationResult::Remove;
             }
-            // Guard always fails - still emit it (will fail at runtime)
         }
 
-        // Check if the bound on the condition tells us it's always true
+        // Bound check: if bound proves always nonzero, remove guard.
         let b = self.getintbound(cond_ref, ctx);
         if b.known_gt_const(0) {
             return OptimizationResult::Remove;
         }
 
-        // After emitting, propagate bounds backward from the guard.
-        // The condition is known to be true (nonzero) after this guard.
-        self.propagate_bounds_from_guard_true(cond_ref, ctx);
+        // RPython: just emit. Bounds propagation is in postprocess.
         OptimizationResult::PassOn
     }
 
@@ -825,7 +830,7 @@ impl OptIntBounds {
             return OptimizationResult::Remove;
         }
 
-        self.propagate_bounds_from_guard_false(cond_ref, ctx);
+        // RPython: just emit. Bounds propagation is in postprocess.
         OptimizationResult::PassOn
     }
 
@@ -1931,29 +1936,23 @@ impl Optimization for OptIntBounds {
                 if !is_int {
                     return;
                 }
-                // intbounds.py:40-50 propagate_bounds_backward(arg0).
+                // intbounds.py:40-50 propagate_bounds_backward(arg0):
+                //   b = self.getintbound(box)
+                //   if b.is_constant():
+                //       self.make_constant_int(box, b.get_constant_int())
+                //   box1 = self.optimizer.as_operation(box)
+                //   if box1 is not None:
+                //       dispatch_bounds_ops(self, box1)
                 //
-                // RPython's postprocess calls propagate_bounds_backward which:
-                // 1. If constant → make_constant_int
-                // 2. Find producing op → dispatch_bounds_ops (narrow args)
-                //
-                // Currently: only step 2 for guards where the comparison op
-                // was postponed by the heap pass and not found during
-                // propagate_forward. This covers the critical case of
-                // heap-postponed comparisons (IntLt before GuardTrue).
-                //
-                // The full propagate_bounds_backward (with step 1) is
-                // deferred until the cascading make_constant_int issue
-                // that causes nbody hang is resolved.
-                // propagate_forward's optimize_guard_true/false already calls
-                // propagate_bounds_from_guard_true/false, which either:
-                // (a) finds the producing op and propagates immediately, or
-                // (b) defers to pending_guard_bounds (flushed on next op).
-                //
-                // Postprocess runs AFTER emission, when the heap-postponed
-                // comparison is in new_operations. Retry deferred propagation:
-                if self.pending_guard_bounds.is_some() {
-                    self.flush_pending_guard_bounds(ctx);
+                // Step 1: constant folding
+                let b = self.getintbound(arg0, ctx);
+                if b.is_constant() {
+                    self.make_constant_int_ref(arg0, b.get_constant(), ctx);
+                }
+                // Step 2: find producing op → dispatch_bounds_ops
+                if let Some(producing_op) = self.find_producing_op(arg0, ctx) {
+                    let producing_op = producing_op.clone();
+                    self.propagate_bounds_backward_op(&producing_op, ctx);
                 }
             }
             _ => {}
