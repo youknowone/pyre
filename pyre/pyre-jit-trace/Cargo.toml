@@ -9,7 +9,7 @@ description = "Trace-time JIT for pyre — MIFrame and tracing logic"
 [features]
 default = []
 cranelift = ["dep:majit-backend-cranelift", "majit-metainterp/cranelift"]
-dynasm = ["majit-metainterp/dynasm"]
+dynasm = ["dep:majit-backend-dynasm", "majit-metainterp/dynasm"]
 
 [dependencies]
 pyre-object = { workspace = true }
@@ -24,6 +24,7 @@ majit-gc = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 majit-backend-cranelift = { workspace = true, optional = true }
+majit-backend-dynasm = { workspace = true, optional = true }
 
 [build-dependencies]
 majit-codewriter = { workspace = true }
