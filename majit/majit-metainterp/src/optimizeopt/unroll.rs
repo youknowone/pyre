@@ -2707,36 +2707,32 @@ impl OptUnroll {
         exported_infos: &HashMap<OpRef, ExportedValueInfo>,
         ctx: &mut OptContext,
     ) {
-        // unroll.py:53-54: op = get_box_replacement(op)
+        // unroll.py:54: op = get_box_replacement(op)
         let target = ctx.get_box_replacement(opref);
         // unroll.py:55-56: if op.get_forwarded() is not None: return
-        // Skip targets that already have info attached so recursive
-        // walks over virtual field references don't loop forever.
         if ctx.has_forwarding(target) {
             return;
         }
-        // RPython setinfo_from_preamble parity (unroll.py:73-75):
-        // RPython does NOT propagate preamble constants via
-        // make_constant/replace_op in setinfo_from_preamble. It only
-        // calls set_forwarded(info) which sets PtrInfo (known_class etc.)
-        // WITHOUT making the box a compile-time constant in the optimizer.
-        //
-        // Propagating constants here causes Phase 2 to constant-fold
-        // GetfieldGcPureI on loop-variant W_IntObject pointers (e.g.,
-        // sign_obj), leading to InvalidLoop when the guard checks the
-        // opposite branch.
-        //
-        // Only import values for targets already known to be constants in the
-        // Phase 2 context. Non-constant targets are handled via PtrInfo below.
-        if let Some(value) = &info.constant {
-            if ctx.is_constant(target) {
-                ctx.make_constant(target, value.clone());
-                if let Value::Ref(ptr) = value {
-                    ctx.set_ptr_info(target, crate::optimizeopt::info::PtrInfo::Constant(*ptr));
-                }
-            }
+        // unroll.py:57-58: if op.is_constant(): return  # nothing we can learn
+        if ctx.is_constant(target) {
+            return;
         }
+        // unroll.py:59-64: isinstance(preamble_info, PtrInfo)
+        // The ptr_info branch handles virtuals, constants, known_class etc.
+        // unroll.py:65-67: preamble_info.is_constant() → set_forwarded(getconst())
+        // When the preamble says this value is a constant Ref but the Phase 2
+        // inputarg is not yet constant, forward it to the constant value.
         if let Some(ptr_info) = info.ptr_info.clone() {
+            if ptr_info.is_constant() {
+                // unroll.py:65-67: op.set_forwarded(preamble_info.getconst())
+                if let Some(value) = &info.constant {
+                    ctx.make_constant(target, value.clone());
+                    if let Value::Ref(ptr) = value {
+                        ctx.set_ptr_info(target, crate::optimizeopt::info::PtrInfo::Constant(*ptr));
+                    }
+                }
+                return;
+            }
             self.apply_exported_ptr_info(target, ptr_info, exported_infos, ctx);
         } else {
             match info.ptr_kind {
