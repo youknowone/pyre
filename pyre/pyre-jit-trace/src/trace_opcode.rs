@@ -3592,8 +3592,13 @@ impl MIFrame {
         if !instruction_consumes_comparison_truth(instruction)
             && !instruction_is_trivia_between_compare_and_branch(instruction)
         {
-            self.sym_mut().last_comparison_truth = None;
-            self.sym_mut().last_comparison_concrete_truth = None;
+            let s = self.sym_mut();
+            s.last_comparison_truth = None;
+            s.last_comparison_concrete_truth = None;
+            s.last_comparison_orgpc = None;
+            s.last_comparison_pre_vsd = None;
+            s.last_comparison_pre_stack = None;
+            s.last_comparison_pre_stack_types = None;
         }
 
         self.set_orgpc(pc);
@@ -3904,8 +3909,13 @@ impl MIFrame {
         if !instruction_consumes_comparison_truth(instruction)
             && !instruction_is_trivia_between_compare_and_branch(instruction)
         {
-            self.sym_mut().last_comparison_truth = None;
-            self.sym_mut().last_comparison_concrete_truth = None;
+            let s = self.sym_mut();
+            s.last_comparison_truth = None;
+            s.last_comparison_concrete_truth = None;
+            s.last_comparison_orgpc = None;
+            s.last_comparison_pre_vsd = None;
+            s.last_comparison_pre_stack = None;
+            s.last_comparison_pre_stack_types = None;
         }
 
         self.prepare_fallthrough();
