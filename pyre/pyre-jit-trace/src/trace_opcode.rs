@@ -215,71 +215,20 @@ impl MIFrame {
         } else {
             self.orgpc
         };
-        // pyjitpl.py:202-203: look up liveness from JitCode (same data
-        // that consume_one_section uses via bh.get_current_position_info).
-        let liveness_info = if !majit_jitcode.is_null() {
-            let jc = unsafe { &*majit_jitcode };
-            jc.py_to_jit_pc
-                .get(live_pc)
-                .and_then(|&jit_pc| jc.liveness.iter().find(|info| info.pc as usize == jit_pc))
-        } else {
-            None
-        };
-        if let Some(info) = liveness_info.filter(|i| {
-            !i.live_r_regs.is_empty() || !i.live_i_regs.is_empty() || !i.live_f_regs.is_empty()
-        }) {
-            // pyjitpl.py:216-233: iterate all three register banks in order.
-            // RPython: length_i + length_r + length_f = total live boxes.
-            // pyre: all Python values are PyObjectRef (GCREF), so live_i_regs
-            // and live_f_regs are normally empty. Iterate all three banks for
-            // structural parity with RPython's get_list_of_active_boxes.
-            let total = info.live_i_regs.len() + info.live_r_regs.len() + info.live_f_regs.len();
-            let mut boxes = Vec::with_capacity(total);
-            // pyjitpl.py:216-221: int bank (registers_i)
-            for &reg_idx in &info.live_i_regs {
-                let idx = reg_idx as usize;
-                let val = if idx < nlocals {
-                    local_values.get(idx).copied().unwrap_or(OpRef::NONE)
-                } else {
-                    stack_values
-                        .get(idx - nlocals)
-                        .copied()
-                        .unwrap_or(OpRef::NONE)
-                };
-                boxes.push(val);
-            }
-            // pyjitpl.py:222-227: ref bank (registers_r)
-            for &reg_idx in &info.live_r_regs {
-                let idx = reg_idx as usize;
-                let val = if idx < nlocals {
-                    local_values.get(idx).copied().unwrap_or(OpRef::NONE)
-                } else {
-                    stack_values
-                        .get(idx - nlocals)
-                        .copied()
-                        .unwrap_or(OpRef::NONE)
-                };
-                boxes.push(val);
-            }
-            // pyjitpl.py:228-233: float bank (registers_f)
-            for &reg_idx in &info.live_f_regs {
-                let idx = reg_idx as usize;
-                let val = if idx < nlocals {
-                    local_values.get(idx).copied().unwrap_or(OpRef::NONE)
-                } else {
-                    stack_values
-                        .get(idx - nlocals)
-                        .copied()
-                        .unwrap_or(OpRef::NONE)
-                };
-                boxes.push(val);
-            }
-            boxes
-        } else {
-            // pyjitpl.py:177-234 parity: RPython's get_list_of_active_boxes
-            // NEVER returns empty for a guard inside a loop — the codewriter
-            // guarantees liveness at every guard position. When majit JitCode
-            // liveness is empty or unavailable, fall back to LiveVars.
+        // pyjitpl.py:202-203: read the 2-byte offset from JitCode.code
+        // (upstream uses `decode_offset(self.jitcode.code, pc + 1)`) and
+        // then read the `[len_i][len_r][len_f]` header from the shared
+        // all_liveness byte string. pyre keeps both the offset side
+        // table (`liveness_offsets`) and the packed `liveness_info`
+        // bytes on the JitCode directly; upstream stores the latter
+        // on metainterp_sd.
+        //
+        // TRANSITIONAL: when `majit_jitcode` has not been populated yet
+        // (inlined-call frames without their own JitCode), fall back to
+        // the pyre-jit-trace LiveVars analysis. Pyre's call.py parity
+        // work will make every tracing frame carry a valid JitCode so
+        // this branch can be removed.
+        if majit_jitcode.is_null() {
             let raw_code_ptr = unsafe { (*self.sym().jitcode).raw_code() };
             let live = if !raw_code_ptr.is_null() {
                 Some(liveness_for(raw_code_ptr))
@@ -299,8 +248,92 @@ impl MIFrame {
                     boxes.push(*slot);
                 }
             }
-            boxes
+            return boxes;
         }
+        let jc = unsafe { &*majit_jitcode };
+        let jit_pc = jc.py_to_jit_pc.get(live_pc).copied().unwrap_or_else(|| {
+            panic!(
+                "get_list_of_active_boxes: no pc_map entry for live_pc={}",
+                live_pc
+            )
+        });
+        let offset = jc
+            .liveness_offsets
+            .get(&(jit_pc as u32))
+            .copied()
+            .unwrap_or_else(|| {
+                panic!(
+                    "get_list_of_active_boxes: missing liveness[{}] (live_pc={})",
+                    jit_pc, live_pc
+                )
+            }) as usize;
+        let all_liveness: &[u8] = &jc.liveness_info;
+        // pyjitpl.py:204-206
+        let length_i = all_liveness[offset] as u32;
+        let length_r = all_liveness[offset + 1] as u32;
+        let length_f = all_liveness[offset + 2] as u32;
+        // pyjitpl.py:207
+        let mut offset = offset + 3;
+
+        // pyjitpl.py:212
+        let total = (length_i + length_r + length_f) as usize;
+        // pyjitpl.py:213-214: allocate a list of the correct size
+        let mut boxes = Vec::with_capacity(total);
+
+        use majit_codewriter::liveness::LivenessIterator;
+
+        // pyjitpl.py:216-221 — int bank (always empty in pyre).
+        if length_i != 0 {
+            let mut it = LivenessIterator::new(offset, length_i, all_liveness);
+            while let Some(reg_idx) = it.next() {
+                let idx = reg_idx as usize;
+                let val = if idx < nlocals {
+                    local_values.get(idx).copied().unwrap_or(OpRef::NONE)
+                } else {
+                    stack_values
+                        .get(idx - nlocals)
+                        .copied()
+                        .unwrap_or(OpRef::NONE)
+                };
+                boxes.push(val);
+            }
+            offset = it.offset;
+        }
+        // pyjitpl.py:222-227 — ref bank (pyre stores everything here).
+        if length_r != 0 {
+            let mut it = LivenessIterator::new(offset, length_r, all_liveness);
+            while let Some(reg_idx) = it.next() {
+                let idx = reg_idx as usize;
+                let val = if idx < nlocals {
+                    local_values.get(idx).copied().unwrap_or(OpRef::NONE)
+                } else {
+                    stack_values
+                        .get(idx - nlocals)
+                        .copied()
+                        .unwrap_or(OpRef::NONE)
+                };
+                boxes.push(val);
+            }
+            offset = it.offset;
+        }
+        // pyjitpl.py:228-233 — float bank (always empty in pyre).
+        if length_f != 0 {
+            let mut it = LivenessIterator::new(offset, length_f, all_liveness);
+            while let Some(reg_idx) = it.next() {
+                let idx = reg_idx as usize;
+                let val = if idx < nlocals {
+                    local_values.get(idx).copied().unwrap_or(OpRef::NONE)
+                } else {
+                    stack_values
+                        .get(idx - nlocals)
+                        .copied()
+                        .unwrap_or(OpRef::NONE)
+                };
+                boxes.push(val);
+            }
+            let _ = offset; // consumed
+        }
+        boxes
     }
 
     /// RPython Box.type parity: build fail_arg_types matching compact
