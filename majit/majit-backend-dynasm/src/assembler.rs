@@ -907,7 +907,6 @@ impl Assembler386 {
                     continue;
                 }
                 RegAllocOp::Move { src, dst } => {
-                    #[cfg(target_arch = "x86_64")]
                     self.regalloc_mov(src, dst);
                     continue;
                 }
