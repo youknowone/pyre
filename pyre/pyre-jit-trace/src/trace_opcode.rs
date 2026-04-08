@@ -1178,6 +1178,20 @@ impl MIFrame {
     /// PyPy generate_guard + capture_resumedata: uses current_fail_args
     /// which encodes the full framestack for multi-frame resume.
     pub(crate) fn generate_guard(&mut self, ctx: &mut TraceCtx, opcode: OpCode, args: &[OpRef]) {
+        // pyjitpl.py:2558-2560 generate_guard parity:
+        //     if isinstance(box, Const):    # no need for a guard
+        //         return
+        // The first arg of every data guard (GUARD_CLASS, GUARD_TRUE,
+        // GUARD_NONNULL, GUARD_VALUE, ...) is the box being checked.
+        // Control-flow guards (GUARD_NOT_FORCED, GUARD_NO_OVERFLOW,
+        // GUARD_NOT_INVALIDATED, ...) call generate_guard with `args=&[]`,
+        // so `args.first()` is None and the check is skipped — matching
+        // RPython where `box=None` for those guards.
+        if let Some(&first) = args.first() {
+            if first.is_constant() {
+                return;
+            }
+        }
         // pyjitpl.py:1087 parity: flush pending guard_not_invalidated
         // before recording any new guard (the quasi-immut guard should be
         // emitted with its own snapshot before the current guard).
