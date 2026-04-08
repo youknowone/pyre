@@ -828,7 +828,43 @@ fn blackhole_from_jit_frame(frame: &mut PyFrame) -> Option<PyObjectRef> {
     Some(result)
 }
 
+/// jitexc.py JitException hierarchy — structural parity with RPython.
+///
+/// `_run_forever` must exit via exactly one of these variants.
+/// Introduced in Phase 0 of the "portal locals → vable array" epic;
+/// call sites still return `BlackholeResult` and will be migrated in
+/// Phase 6 once `consume_vable_info` guarantees resume data validity.
+#[allow(dead_code)] // populated progressively over the epic
+pub enum JitException {
+    /// jitexc.py:53 ContinueRunningNormally(gi, gr, gf, ri, rr, rf):
+    /// blackhole reached the merge point → restart the portal. The six
+    /// vectors carry the green/red int/ref/float live-in arguments used
+    /// by `maybe_compile_and_run` to resume execution.
+    ContinueRunningNormally {
+        green_int: Vec<i64>,
+        green_ref: Vec<PyObjectRef>,
+        green_float: Vec<f64>,
+        red_int: Vec<i64>,
+        red_ref: Vec<PyObjectRef>,
+        red_float: Vec<f64>,
+    },
+    /// jitexc.py:17 DoneWithThisFrameVoid.
+    DoneWithThisFrameVoid,
+    /// jitexc.py:21 DoneWithThisFrameInt(result).
+    DoneWithThisFrameInt(i64),
+    /// jitexc.py:29 DoneWithThisFrameRef(result).
+    DoneWithThisFrameRef(PyObjectRef),
+    /// jitexc.py:37 DoneWithThisFrameFloat(result).
+    DoneWithThisFrameFloat(f64),
+    /// jitexc.py:45 ExitFrameWithExceptionRef(value): blackhole ran out
+    /// of caller frames while propagating a Python exception.
+    ExitFrameWithExceptionRef(pyre_interpreter::error::PyError),
+}
+
 /// RPython blackhole.py _run_forever + jitexc.py parity.
+///
+/// TODO(epic phase 6): replace with direct use of [`JitException`]
+/// once every `Failed` return site has been migrated.
 pub enum BlackholeResult {
     /// RPython jitexc.py:53 ContinueRunningNormally: blackhole reached
     /// the merge point → restart portal to re-enter compiled code.
@@ -838,6 +874,36 @@ pub enum BlackholeResult {
     DoneWithThisFrame(PyResult),
     /// Blackhole couldn't run (bad resume data, BC_ABORT, etc).
     Failed,
+}
+
+impl From<JitException> for BlackholeResult {
+    /// Non-`Failed` projection of a `JitException` onto the legacy
+    /// `BlackholeResult`. Used during the Phase 0→6 migration window.
+    ///
+    /// Every variant must map to `ContinueRunningNormally` or
+    /// `DoneWithThisFrame(..)` — mapping to `Failed` is forbidden by
+    /// construction so callers cannot silently re-introduce the
+    /// loop-invalidation fallback.
+    fn from(exc: JitException) -> Self {
+        match exc {
+            JitException::ContinueRunningNormally { .. } => {
+                BlackholeResult::ContinueRunningNormally
+            }
+            JitException::DoneWithThisFrameVoid => {
+                BlackholeResult::DoneWithThisFrame(Ok(pyre_object::PY_NULL))
+            }
+            JitException::DoneWithThisFrameInt(v) => BlackholeResult::DoneWithThisFrame(Ok(
+                pyre_object::intobject::w_int_new(v) as PyObjectRef,
+            )),
+            JitException::DoneWithThisFrameRef(r) => BlackholeResult::DoneWithThisFrame(Ok(r)),
+            JitException::DoneWithThisFrameFloat(f) => BlackholeResult::DoneWithThisFrame(Ok(
+                pyre_object::floatobject::w_float_new(f) as PyObjectRef,
+            )),
+            JitException::ExitFrameWithExceptionRef(err) => {
+                BlackholeResult::DoneWithThisFrame(Err(err))
+            }
+        }
+    }
 }
 
 /// resume.py:1042 rebuild_from_numbering / read_jitcode_pos_pc output.
