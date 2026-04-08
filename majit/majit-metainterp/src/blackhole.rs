@@ -1066,14 +1066,27 @@ impl BlackholeInterpreter {
         self.exception_last_value = 0;
     }
 
-    /// blackhole.py:393 get_current_position_info
+    /// blackhole.py:393-394 `get_current_position_info`.
     ///
-    /// Returns the liveness info at the current bytecode position.
-    /// Used by ResumeDataDirectReader.consume_one_section to know
-    /// which registers are live and need to be filled.
-    pub fn get_current_position_info(&self) -> Option<&LivenessInfo> {
-        // Search for liveness entry matching current position.
-        // RPython: self.jitcode.get_live_vars_info(self.position, self.builder.op_live)
+    /// RPython returns an offset into `metainterp_sd.liveness_info`
+    /// (via `jitcode.get_live_vars_info(self.position, self.builder.op_live)`).
+    /// pyre currently keeps `liveness_info` per-JitCode and the offsets
+    /// in a side table, but the return value is still that offset —
+    /// consumers pair it with `enumerate_vars(offset, all_liveness, ...)`
+    /// matching `resume.py:1017-1026`.
+    pub fn get_current_position_info(&self) -> usize {
+        // TODO: thread `metainterp_sd.op_live` through the builder once
+        // the bytecode stream embeds `-live-` opcodes.
+        self.jitcode.get_live_vars_info(self.position, 0)
+    }
+
+    /// Transitional helper: look up the per-entry `LivenessInfo` that
+    /// matches the current `bh.position`. Upstream has no such lookup —
+    /// consumers should read live-register bits via `enumerate_vars`
+    /// over the packed `liveness_info` bytes. This exists only so the
+    /// pyre-specific non-live-register seeding in `call_jit` can keep
+    /// compiling until Phase D removes it.
+    pub fn get_current_position_info_legacy(&self) -> Option<&LivenessInfo> {
         self.jitcode
             .liveness
             .iter()

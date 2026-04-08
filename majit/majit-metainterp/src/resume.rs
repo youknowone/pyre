@@ -4743,75 +4743,90 @@ impl<'a> ResumeDataDirectReader<'a> {
 
     // ---- ResumeDataDirectReader methods (resume.py:1380-1601) ----
 
-    /// resume.py:1381 consume_one_section
+    /// resume.py:1381-1384 `consume_one_section(self, blackholeinterp)`.
     ///
-    /// Read one resume frame section and fill the blackhole interpreter's
-    /// registers. Uses liveness info from the jitcode to determine which
-    /// registers of each type (int/ref/float) are live at the current PC.
-    ///
-    /// RPython:
-    ///   self.blackholeinterp = blackholeinterp
-    ///   info = blackholeinterp.get_current_position_info()
-    ///   self._prepare_next_section(info)
+    /// ```python
+    /// def consume_one_section(self, blackholeinterp):
+    ///     self.blackholeinterp = blackholeinterp
+    ///     info = blackholeinterp.get_current_position_info()
+    ///     self._prepare_next_section(info)
+    /// ```
     pub fn consume_one_section(&mut self, bh: &mut BlackholeInterpreter) {
-        // resume.py:1382-1384
-        if let Some(info) = bh.get_current_position_info().cloned() {
-            // resume.py:1017-1026 _prepare_next_section
-            // jitcode.py:146-167 enumerate_vars(info, all_liveness,
-            //     callback_i, callback_r, callback_f, unique_id)
+        // resume.py:1383
+        let info = bh.get_current_position_info();
+        // resume.py:1384
+        self._prepare_next_section(info, bh);
+    }
 
-            // resume.py:1028-1030 _callback_i
-            for &reg_idx in &info.live_i_regs {
-                if self.done_reading() {
-                    break;
-                }
+    /// resume.py:1017-1026 `_prepare_next_section(self, info)`.
+    ///
+    /// ```python
+    /// def _prepare_next_section(self, info):
+    ///     from rpython.jit.codewriter.jitcode import enumerate_vars
+    ///     enumerate_vars(info,
+    ///             self.metainterp_sd.liveness_info,
+    ///             self._callback_i,
+    ///             self._callback_r,
+    ///             self._callback_f,
+    ///             self.unique_id)
+    /// ```
+    ///
+    /// Upstream keeps `liveness_info` on `metainterp_sd`; pyre currently
+    /// keeps it per-JitCode (same encoding, narrower sharing) so the
+    /// slice is borrowed from `bh.jitcode.liveness_info` instead of
+    /// `metainterp_sd`. The three callbacks still call `next_int`/`next_ref`/
+    /// `next_float` on this reader (resume.py:1028-1038), matching
+    /// `_callback_i/_callback_r/_callback_f` plus `write_an_int/write_a_ref/
+    /// write_a_float` (resume.py:1590-1597).
+    fn _prepare_next_section(&mut self, info: usize, bh: &mut BlackholeInterpreter) {
+        use majit_codewriter::liveness::LivenessIterator;
+
+        // SAFETY: `bh.jitcode.liveness_info` is read-only metadata
+        // populated by the codewriter. The mutating operations we
+        // perform below (`setarg_i/setarg_r/setarg_f`) touch the
+        // register arrays, not the liveness bytes. The borrowed slice
+        // therefore stays valid for the duration of this section.
+        let liveness_len = bh.jitcode.liveness_info.len();
+        let liveness_ptr = bh.jitcode.liveness_info.as_ptr();
+        let all_liveness: &[u8] = unsafe { std::slice::from_raw_parts(liveness_ptr, liveness_len) };
+
+        // jitcode.py:149-151 — three length bytes.
+        let length_i = all_liveness[info] as u32;
+        let length_r = all_liveness[info + 1] as u32;
+        let length_f = all_liveness[info + 2] as u32;
+        // jitcode.py:152
+        let mut offset = info + 3;
+
+        // resume.py:1028-1030 `_callback_i` / jitcode.py:153-157.
+        if length_i != 0 {
+            let mut it = LivenessIterator::new(offset, length_i, all_liveness);
+            while let Some(reg_idx) = it.next() {
                 let value = self.next_int();
-                // resume.py:1590-1591 write_an_int
+                // resume.py:1590-1591 `write_an_int`.
                 bh.setarg_i(reg_idx as usize, value);
             }
-            // resume.py:1032-1034 _callback_r
-            for &reg_idx in &info.live_r_regs {
-                if self.done_reading() {
-                    break;
-                }
+            offset = it.offset;
+        }
+        // resume.py:1032-1034 `_callback_r` / jitcode.py:158-162.
+        if length_r != 0 {
+            let mut it = LivenessIterator::new(offset, length_r, all_liveness);
+            while let Some(reg_idx) = it.next() {
                 let value = self.next_ref();
-                // resume.py:1593-1594 write_a_ref
+                // resume.py:1593-1594 `write_a_ref`.
                 bh.setarg_r(reg_idx as usize, value);
             }
-            // resume.py:1036-1038 _callback_f
-            for &reg_idx in &info.live_f_regs {
-                if self.done_reading() {
-                    break;
-                }
+            offset = it.offset;
+        }
+        // resume.py:1036-1038 `_callback_f` / jitcode.py:163-166.
+        if length_f != 0 {
+            let mut it = LivenessIterator::new(offset, length_f, all_liveness);
+            while let Some(reg_idx) = it.next() {
                 let value = self.next_float();
-                // resume.py:1596-1597 write_a_float
+                // resume.py:1596-1597 `write_a_float`.
                 bh.setarg_f(reg_idx as usize, value);
             }
-        } else {
-            // No liveness info at this PC. Fall back to reading all
-            // registers sequentially — handles jitcodes generated
-            // without precise liveness (e.g. the proc-macro path).
-            let num_i = bh.jitcode.num_regs_i() as usize;
-            let num_r = bh.jitcode.num_regs_r() as usize;
-            let num_f = bh.jitcode.num_regs_f() as usize;
-            for i in 0..num_i {
-                if self.done_reading() {
-                    break;
-                }
-                bh.setarg_i(i, self.next_int());
-            }
-            for i in 0..num_r {
-                if self.done_reading() {
-                    break;
-                }
-                bh.setarg_r(i, self.next_ref());
-            }
-            for i in 0..num_f {
-                if self.done_reading() {
-                    break;
-                }
-                bh.setarg_f(i, self.next_float());
-            }
+            // `offset` is the end of the float section; no further use.
+            let _ = offset;
         }
     }
 
