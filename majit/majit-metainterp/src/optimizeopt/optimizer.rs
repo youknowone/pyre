@@ -2725,12 +2725,6 @@ impl Optimizer {
 
         for pass_idx in start_pass..end_pass {
             ctx.current_pass_idx = pass_idx;
-            // Track passes with postprocess BEFORE calling propagate_forward,
-            // matching RPython where `emit()` returns OptimizationResult
-            // for each pass that has postprocess.
-            if self.passes[pass_idx].has_postprocess() {
-                postprocess_passes.push(pass_idx);
-            }
             let result = {
                 let pass = &mut self.passes[pass_idx];
                 pass.propagate_forward(&current_op, ctx)
@@ -2738,6 +2732,11 @@ impl Optimizer {
             self.drain_extra_operations_from(pass_idx + 1, ctx);
             match result {
                 OptimizationResult::Emit(op) => {
+                    // optimizer.py:576-581: collect postprocess for this pass
+                    // if it has postprocess for this opnum.
+                    if self.passes[pass_idx].have_postprocess_op(op.opcode) {
+                        postprocess_passes.push(pass_idx);
+                    }
                     self.emit_operation(op.clone(), ctx);
                     // optimizer.py:585-589: invoke postprocess callbacks
                     // in reverse order after emission.
@@ -2756,18 +2755,28 @@ impl Optimizer {
                         current_op.opcode,
                         op.opcode,
                     );
+                    // optimizer.py:576-581: pass emitted (replace ≈ emit
+                    // with modified op). Collect if has postprocess.
+                    if self.passes[pass_idx].have_postprocess_op(op.opcode) {
+                        postprocess_passes.push(pass_idx);
+                    }
                     current_op = op;
                 }
                 OptimizationResult::Remove => {
-                    // RPython parity: postprocess callbacks only run when the
-                    // op survives to emission (optimizer.py:586-589). If any
-                    // pass removes the op, discard pending postprocess state
-                    // to prevent it from leaking into the next emitted op.
+                    // optimizer.py:573-575: op removed → no postprocess.
                     ctx.pending_mark_last_guard = None;
                     ctx.pending_guard_class_postprocess = None;
                     return;
                 }
-                OptimizationResult::PassOn => {}
+                OptimizationResult::PassOn => {
+                    // optimizer.py:576-583: PASS_OP_ON path.
+                    // RPython's emit() returns PASS_OP_ON if no postprocess,
+                    // OptimizationResult if postprocess needed.
+                    // Collect if this pass has postprocess for this opcode.
+                    if self.passes[pass_idx].have_postprocess_op(current_op.opcode) {
+                        postprocess_passes.push(pass_idx);
+                    }
+                }
                 // rewrite.py:406 — guard proven to always fail
                 OptimizationResult::InvalidLoop => {
                     std::panic::panic_any(crate::optimize::InvalidLoop(
