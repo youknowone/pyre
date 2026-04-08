@@ -175,6 +175,15 @@ pub fn ll_issubclass_const(subcls: &PyType, minid: i64, maxid: i64) -> bool {
 
 /// rclass.py:1143-1147 `ll_isinstance(obj, cls)`.
 ///
+/// RPython-level type check: reads `obj.typeptr` (= `ob_type`) and checks
+/// subclass ranges. This checks the **RPython class** (W_IntObject,
+/// W_ListObject, etc.), NOT the Python-level class. All user-defined
+/// instances share `INSTANCE_TYPE` as their RPython class, just as
+/// RPython groups them under W_ObjectObject's vtable.
+///
+/// For Python-level `isinstance()`, use `issubtype_w` (MRO walk on
+/// `w_class`), not this function.
+///
 /// # Safety
 /// `obj` must be a valid non-null `PyObject`.
 #[inline]
