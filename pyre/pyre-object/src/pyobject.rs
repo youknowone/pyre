@@ -99,6 +99,17 @@ pub fn get_instantiate(tp: &PyType) -> PyObjectRef {
     tp.instantiate.load(Ordering::Acquire)
 }
 
+// Compile-time verification: AtomicI64/AtomicPtr are layout-compatible
+// with i64/*mut T so the JIT can read PyType fields at raw offsets.
+// Also verify OBJECT_VTABLE field order: subclassrange_min @ 0, max @ 8.
+const _: () = {
+    assert!(std::mem::size_of::<AtomicI64>() == std::mem::size_of::<i64>());
+    assert!(std::mem::align_of::<AtomicI64>() == std::mem::align_of::<i64>());
+    assert!(std::mem::size_of::<AtomicPtr<PyObject>>() == std::mem::size_of::<*mut PyObject>());
+    assert!(std::mem::offset_of!(PyType, subclassrange_min) == 0);
+    assert!(std::mem::offset_of!(PyType, subclassrange_max) == 8);
+};
+
 pub static INT_TYPE: PyType = new_pytype("int");
 pub static BOOL_TYPE: PyType = new_pytype("bool");
 pub static FLOAT_TYPE: PyType = new_pytype("float");
