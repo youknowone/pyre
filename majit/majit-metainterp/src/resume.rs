@@ -4364,30 +4364,54 @@ impl VirtualInfo {
             VirtualInfo::VirtualObj {
                 type_id,
                 fields,
+                fielddescrs,
                 descr_size,
                 ..
             } => {
                 // resume.py:619 allocate_with_vtable(descr=self.descr)
                 let obj = allocator.allocate_with_vtable(*type_id, *descr_size);
                 decoder.virtuals_cache_ptr[index] = obj;
-                for (field_descr, source) in fields {
-                    let value = decoder.decode_field_source(source);
-                    allocator.setfield(obj, *field_descr, value);
+                for (i, (field_descr, source)) in fields.iter().enumerate() {
+                    let fd = fielddescrs.get(i);
+                    let field_type = fd.map(|fd| fd.field_type).unwrap_or(majit_ir::Type::Ref);
+                    let value = match field_type {
+                        majit_ir::Type::Ref => decoder.decode_field_source(source),
+                        majit_ir::Type::Float => decoder.decode_field_source_float(source),
+                        _ => decoder.decode_field_source_int(source),
+                    };
+                    // resume.py:1509-1528 setfield uses the descr's byte
+                    // offset/size rather than a symbolic `field_descr` id.
+                    // PyreBlackholeAllocator only implements setfield_typed
+                    // (pyre objects are raw Rust structs); the default
+                    // `setfield` in the trait is a no-op. Always route
+                    // through setfield_typed so the field actually lands.
+                    let field_offset = fd.map(|fd| fd.offset).unwrap_or(0);
+                    let field_size = fd.map(|fd| fd.field_size).unwrap_or(8);
+                    allocator.setfield_typed(obj, value, *field_descr, field_offset, field_size);
                 }
                 obj
             }
             VirtualInfo::VStruct {
                 type_id,
                 fields,
+                fielddescrs,
                 descr_size,
                 ..
             } => {
                 // resume.py:635 allocate_struct(self.typedescr)
                 let obj = allocator.allocate_struct(*type_id, *descr_size);
                 decoder.virtuals_cache_ptr[index] = obj;
-                for (field_descr, source) in fields {
-                    let value = decoder.decode_field_source(source);
-                    allocator.setfield(obj, *field_descr, value);
+                for (i, (field_descr, source)) in fields.iter().enumerate() {
+                    let fd = fielddescrs.get(i);
+                    let field_type = fd.map(|fd| fd.field_type).unwrap_or(majit_ir::Type::Ref);
+                    let value = match field_type {
+                        majit_ir::Type::Ref => decoder.decode_field_source(source),
+                        majit_ir::Type::Float => decoder.decode_field_source_float(source),
+                        _ => decoder.decode_field_source_int(source),
+                    };
+                    let field_offset = fd.map(|fd| fd.offset).unwrap_or(0);
+                    let field_size = fd.map(|fd| fd.field_size).unwrap_or(8);
+                    allocator.setfield_typed(obj, value, *field_descr, field_offset, field_size);
                 }
                 obj
             }
@@ -5031,6 +5055,23 @@ impl<'a> ResumeDataDirectReader<'a> {
             ResumeValueSource::FailArg(index) => self.deadframe[*index],
             ResumeValueSource::Constant(value) => *value,
             ResumeValueSource::Virtual(index) => self.getvirtual_int(*index),
+            ResumeValueSource::Uninitialized => 0,
+            ResumeValueSource::Unavailable => 0,
+        }
+    }
+
+    /// Decode a VirtualFieldSource as a FLOAT value (resume.py:1554 decode_float).
+    ///
+    /// Floats are stored as raw i64 bits. TAGVIRTUAL is invalid for
+    /// float fields — virtual floats would route through a different
+    /// VirtualInfo variant.
+    pub fn decode_field_source_float(&mut self, source: &VirtualFieldSource) -> i64 {
+        match source {
+            ResumeValueSource::FailArg(index) => self.deadframe[*index],
+            ResumeValueSource::Constant(value) => *value,
+            ResumeValueSource::Virtual(_) => {
+                panic!("decode_field_source_float: TAGVIRTUAL not valid for float field")
+            }
             ResumeValueSource::Uninitialized => 0,
             ResumeValueSource::Unavailable => 0,
         }

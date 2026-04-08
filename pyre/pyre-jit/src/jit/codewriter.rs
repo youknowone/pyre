@@ -41,6 +41,18 @@ pub struct PyJitCode {
     pub has_abort: bool,
 }
 
+fn liveness_regs_to_u8_sorted(regs: &[u16]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(regs.len());
+    for &reg in regs {
+        let reg = u8::try_from(reg)
+            .unwrap_or_else(|_| panic!("liveness register {} exceeds 8-bit encoding", reg));
+        bytes.push(reg);
+    }
+    bytes.sort_unstable();
+    bytes.dedup();
+    bytes
+}
+
 impl PyJitCode {
     /// Check if this jitcode has BC_ABORT opcodes.
     pub fn has_abort_opcode(&self) -> bool {
@@ -857,25 +869,15 @@ impl CodeWriter {
             // live_i_regs / live_f_regs are always empty in pyre (all
             // Python values are PyObjectRef → ref bank only), so
             // encoding stays symmetric across the three kinds.
-            fn to_u8_sorted(regs: &[u16]) -> Vec<u8> {
-                let mut bytes: Vec<u8> = regs
-                    .iter()
-                    .filter_map(|&r| if r < 256 { Some(r as u8) } else { None })
-                    .collect();
-                bytes.sort_unstable();
-                bytes.dedup();
-                bytes
-            }
-
             let mut liveness_info: Vec<u8> = Vec::new();
             let mut liveness_offsets: std::collections::HashMap<u32, u32> =
                 std::collections::HashMap::new();
             for entry in &jitcode.liveness {
                 let offset = liveness_info.len() as u32;
                 liveness_offsets.insert(entry.pc as u32, offset);
-                let live_i_bytes = to_u8_sorted(&entry.live_i_regs);
-                let live_r_bytes = to_u8_sorted(&entry.live_r_regs);
-                let live_f_bytes = to_u8_sorted(&entry.live_f_regs);
+                let live_i_bytes = liveness_regs_to_u8_sorted(&entry.live_i_regs);
+                let live_r_bytes = liveness_regs_to_u8_sorted(&entry.live_r_regs);
+                let live_f_bytes = liveness_regs_to_u8_sorted(&entry.live_f_regs);
                 // liveness.py:144 header: three lengths.
                 liveness_info.push(live_i_bytes.len() as u8);
                 liveness_info.push(live_r_bytes.len() as u8);
@@ -1079,4 +1081,20 @@ pub fn is_portal(code: &pyre_interpreter::CodeObject, w_code: *const ()) -> bool
             .map(|pjc| pjc.jitcode.jitdriver_sd.is_some())
             .unwrap_or(false)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::liveness_regs_to_u8_sorted;
+
+    #[test]
+    fn liveness_regs_to_u8_sorted_sorts_and_dedups() {
+        assert_eq!(liveness_regs_to_u8_sorted(&[7, 1, 7, 3]), vec![1, 3, 7]);
+    }
+
+    #[test]
+    #[should_panic(expected = "liveness register 256 exceeds 8-bit encoding")]
+    fn liveness_regs_to_u8_sorted_rejects_out_of_range_registers() {
+        let _ = liveness_regs_to_u8_sorted(&[255, 256]);
+    }
 }
