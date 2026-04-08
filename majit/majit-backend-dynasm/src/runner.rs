@@ -178,6 +178,38 @@ impl DynasmBackend {
             .cloned()
             .unwrap_or_else(|| Arc::new(DynasmFailDescr::new(0, 0, Vec::new(), true)))
     }
+
+    /// Find a descr by (trace_id, fail_index) across root loop + all
+    /// bridges. Used by compile_bridge to locate the exact guard descr
+    /// that failed — RPython passes the faildescr object directly.
+    fn find_descr(token: &JitCellToken, trace_id: u64, fail_index: u32) -> Arc<DynasmFailDescr> {
+        let compiled = Self::get_compiled(token);
+        if let Some(found) = compiled
+            .fail_descrs
+            .iter()
+            .find(|d| d.trace_id == trace_id && d.fail_index == fail_index)
+        {
+            return found.clone();
+        }
+        let blocks = token.asmmemmgr_blocks.lock();
+        for block in blocks.iter() {
+            if let Some(bridge) = block.downcast_ref::<CompiledCode>() {
+                if let Some(found) = bridge
+                    .fail_descrs
+                    .iter()
+                    .find(|d| d.trace_id == trace_id && d.fail_index == fail_index)
+                {
+                    return found.clone();
+                }
+            }
+        }
+        // Fallback
+        compiled
+            .fail_descrs
+            .last()
+            .cloned()
+            .unwrap_or_else(|| Arc::new(DynasmFailDescr::new(0, 0, Vec::new(), true)))
+    }
 }
 
 impl Backend for DynasmBackend {
@@ -233,35 +265,27 @@ impl Backend for DynasmBackend {
             asm.set_jump_target_addr(orig_compiled.label_addr);
         }
 
-        // Read fail_args_slots from the original guard's fail_descr
-        let source_slots: Vec<usize> = {
-            let fi = fail_descr.fail_index();
-            orig_compiled
-                .fail_descrs
-                .iter()
-                .find(|d| d.fail_index == fi)
-                .map(|d| d.fail_args_slots.clone())
-                .unwrap_or_default()
-        };
+        // assembler.py:638 rebuild_faillocs_from_descr(faildescr, ...)
+        // RPython uses the exact faildescr object. We find the matching
+        // DynasmFailDescr by (trace_id, fail_index) across root loop +
+        // all bridges. This handles bridge-on-bridge correctly.
+        let guard_descr = Self::find_descr(
+            original_token,
+            fail_descr.trace_id(),
+            fail_descr.fail_index(),
+        );
+        let source_slots = guard_descr.fail_args_slots.clone();
         let compiled = asm.assemble_bridge(fail_descr, inputargs, ops, &source_slots)?;
 
         let bridge_addr = codebuf::buffer_ptr(&compiled.buffer) as usize;
         let code_size = compiled.buffer.len();
 
         // assembler.py:987 patch_jump_for_descr — redirect guard to bridge.
-        // Find the DynasmFailDescr in the original token and patch it.
-        let fi = fail_descr.fail_index();
-        let orig_compiled = Self::get_compiled(original_token);
-        if let Some(descr) = orig_compiled
-            .fail_descrs
-            .iter()
-            .find(|d| d.fail_index == fi)
-        {
-            if descr.adr_jump_offset() != 0 {
-                Assembler386::patch_jump_for_descr(descr, bridge_addr);
-            }
-            descr.set_bridge_addr(bridge_addr);
+        // Use the exact guard descr found above, not a fail_index search.
+        if guard_descr.adr_jump_offset() != 0 {
+            Assembler386::patch_jump_for_descr(&guard_descr, bridge_addr);
         }
+        guard_descr.set_bridge_addr(bridge_addr);
 
         // llmodel.py:252 asmmemmgr_blocks parity: store the entire
         // bridge CompiledCode on the owning loop token. This keeps
