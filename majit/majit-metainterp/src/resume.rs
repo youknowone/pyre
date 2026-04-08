@@ -377,6 +377,8 @@ pub struct ResumeFrameLayoutSummary {
     pub trace_id: Option<u64>,
     pub header_pc: Option<u64>,
     pub source_guard: Option<(u64, u32)>,
+    /// resume.py:250 jitcode_index — index into metainterp_sd.jitcodes[].
+    pub jitcode_index: i32,
     pub pc: u64,
     pub slot_sources: Vec<ResumeValueKind>,
     pub slot_layouts: Vec<ResumeValueLayoutSummary>,
@@ -510,7 +512,7 @@ impl ResumeValueLayoutSummary {
 impl ResumeFrameLayoutSummary {
     fn to_frame_info(&self) -> FrameInfo {
         FrameInfo {
-            jitcode_index: 0,
+            jitcode_index: self.jitcode_index,
             pc: self.pc,
             slot_map: self
                 .slot_layouts
@@ -551,6 +553,7 @@ impl ResumeFrameLayoutSummary {
             trace_id: exit_frame.trace_id,
             header_pc: exit_frame.header_pc,
             source_guard: exit_frame.source_guard,
+            jitcode_index: 0,
             pc: exit_frame.pc,
             slot_sources,
             slot_layouts,
@@ -894,7 +897,7 @@ impl ResumeLayoutSummary {
                 header_pc: frame.header_pc,
                 source_guard: frame.source_guard,
                 pc: frame.pc,
-                jitcode_index: 0,
+                jitcode_index: frame.jitcode_index,
                 slot_types: frame.slot_types.clone(),
                 values: frame
                     .slot_layouts
@@ -927,7 +930,7 @@ impl ResumeLayoutSummary {
             header_pc: frame.header_pc,
             source_guard: frame.source_guard,
             pc: frame.pc,
-            jitcode_index: 0,
+            jitcode_index: frame.jitcode_index,
             slot_types: frame.slot_types.clone(),
             values: frame
                 .slot_layouts
@@ -1938,6 +1941,7 @@ impl EncodedResumeData {
                     trace_id: None,
                     header_pc: None,
                     source_guard: None,
+                    jitcode_index: frame.jitcode_index,
                     pc: frame.pc,
                     slot_sources: frame.slot_map.iter().map(ResumeValueSource::kind).collect(),
                     slot_layouts: frame
@@ -1980,7 +1984,7 @@ impl EncodedResumeData {
                 header_pc: None,
                 source_guard: None,
                 pc: frame.pc,
-                jitcode_index: 0,
+                jitcode_index: frame.jitcode_index,
                 slot_types: None,
                 values: frame
                     .slot_map
