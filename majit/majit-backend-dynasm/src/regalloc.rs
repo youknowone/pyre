@@ -1126,6 +1126,12 @@ impl RegisterManager {
         if let Some(frame_loc) = fm.get(v, longevity) {
             return Loc::Frame(frame_loc);
         }
+        // Fallback: check constants map. The optimizer may leave constants
+        // as plain OpRefs (without CONST_BIT) when they originate from
+        // short preamble or constant folding.
+        if let Some(&val) = constants.get(&v.0) {
+            return Loc::Immed(ImmedLoc::new(val));
+        }
         if must_exist {
             panic!("RegisterManager.loc: box {:?} not found", v);
         }

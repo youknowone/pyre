@@ -119,6 +119,8 @@ pub struct Assembler386 {
     loop_label: Option<DynamicLabel>,
     /// Buffer-relative offset of the LABEL op.
     loop_label_offset: Option<AssemblyOffset>,
+    /// Regalloc: LABEL's arg locations — JUMP must remap to these.
+    loop_arglocs: Vec<Loc>,
     /// llmodel.py:64-69 self.vtable_offset — typeptr field byte offset.
     /// `None` corresponds to RPython's gcremovetypeptr config.
     vtable_offset: Option<usize>,
@@ -208,6 +210,7 @@ impl Assembler386 {
             guard_success_cc: None,
             loop_label: None,
             loop_label_offset: None,
+            loop_arglocs: Vec::new(),
             vtable_offset,
             classptr_to_typeid,
             self_entry_label: None,
@@ -910,6 +913,9 @@ impl Assembler386 {
                     continue;
                 }
                 RegAllocOp::Move { src, dst } => {
+                    if std::env::var_os("MAJIT_LOG").is_some() {
+                        eprintln!("[dynasm] move: {:?} → {:?}", src, dst);
+                    }
                     self.regalloc_mov(src, dst);
                     continue;
                 }
@@ -920,12 +926,13 @@ impl Assembler386 {
                 } => {
                     let op = &ops[*op_index];
                     if std::env::var_os("MAJIT_LOG").is_some() {
+                        let al: Vec<String> = arglocs.iter().map(|l| format!("{:?}", l)).collect();
                         eprintln!(
-                            "[dynasm] emit[{}]: {:?} arglocs={} result={:?}",
+                            "[dynasm] emit[{}]: {:?} args=[{}] result={:?}",
                             op_index,
                             op.opcode,
-                            arglocs.len(),
-                            result_loc.is_some()
+                            al.join(", "),
+                            result_loc
                         );
                     }
                     self.regalloc_perform(op, arglocs, result_loc.as_ref(), fail_index, ops);
@@ -948,9 +955,14 @@ impl Assembler386 {
                     let op = &ops[*op_index];
                     if std::env::var_os("MAJIT_LOG").is_some() {
                         eprintln!(
-                            "[dynasm] guard[{}]: {:?} faillocs={}",
+                            "[dynasm] guard[{}]: {:?} args=[{}] faillocs={}",
                             op_index,
                             op.opcode,
+                            arglocs
+                                .iter()
+                                .map(|l| format!("{:?}", l))
+                                .collect::<Vec<_>>()
+                                .join(", "),
                             faillocs.len()
                         );
                     }
@@ -1458,13 +1470,17 @@ impl Assembler386 {
             }
             // ── Control flow ──
             OpCode::Jump => {
-                // RPython: regalloc consider_jump collects current locations of
-                // jump args. assembler.closing_jump emits the actual JMP.
-                // Move each arg from its current loc to its target frame slot.
-                let slot0_ofs = crate::regalloc::get_ebp_ofs(0, 0);
+                // RPython: remap_frame_layout — move JUMP args from their
+                // current locations to LABEL's expected locations.
+                // arglocs[i] = current location of jump arg i
+                // loop_arglocs[i] = LABEL's expected location for arg i
                 for (i, loc) in arglocs.iter().enumerate() {
-                    let dst_ofs = crate::regalloc::get_ebp_ofs(0, i);
-                    let dst = Loc::Frame(crate::regloc::FrameLoc::new(i, dst_ofs, false));
+                    let dst = if i < self.loop_arglocs.len() {
+                        self.loop_arglocs[i]
+                    } else {
+                        let dst_ofs = crate::regalloc::get_ebp_ofs(0, i);
+                        Loc::Frame(crate::regloc::FrameLoc::new(i, dst_ofs, false))
+                    };
                     self.regalloc_mov(loc, &dst);
                 }
                 // Emit jump back to LABEL
@@ -1544,6 +1560,8 @@ impl Assembler386 {
                 dynasm!(self.mc ; =>label);
                 self.loop_label = Some(label);
                 self.loop_label_offset = Some(self.mc.offset());
+                // Save LABEL's arglocs — JUMP must remap to these positions.
+                self.loop_arglocs = arglocs.to_vec();
             }
             // ── Calls ──
             // RPython: regalloc consider_call does before_call (save caller-saved
