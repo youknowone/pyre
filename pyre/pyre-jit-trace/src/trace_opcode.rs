@@ -783,8 +783,8 @@ impl MIFrame {
         // pyjitpl.py:3376: record VIRTUAL_REF_FINISH(vrefbox, virtualbox)
         let _ = ctx.record_op(OpCode::VirtualRefFinish, &[vref_opref, virt_opref]);
         // pyjitpl.py:3378: self.virtualref_boxes[i+1] = CONST_NULL
-        // CONST_NULL is a Ref-typed null pointer, not Int 0.
-        let null_opref = ctx.const_ref(0);
+        // history.py:361: CONST_NULL = ConstPtr(ConstPtr.value)
+        let null_opref = ctx.const_null();
         sym.virtualref_boxes[i + 1] = (null_opref, 0);
     }
 

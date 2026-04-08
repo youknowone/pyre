@@ -425,6 +425,12 @@ impl TraceCtx {
             .get_or_insert_typed(value, majit_ir::Type::Ref)
     }
 
+    /// history.py:361 CONST_NULL = ConstPtr(ConstPtr.value).
+    /// Ref-typed null pointer constant.
+    pub fn const_null(&mut self) -> OpRef {
+        self.const_ref(0)
+    }
+
     /// Get or create a Float-typed constant OpRef.
     pub fn const_float(&mut self, value: i64) -> OpRef {
         self.constants
