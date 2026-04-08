@@ -631,9 +631,23 @@ fn type_descr_new_with_metaclass(
         let w_metaclass = w_winner;
 
         let w_type = pyre_object::w_type_new(name, w_effective_bases, ns_ptr as *mut u8);
+        // typeobject.py:114 — detect __slots__ and record count.
+        unsafe {
+            let ns = &*ns_ptr;
+            if let Some(&w_slots) = ns.get("__slots__") {
+                let nslots = if is_tuple(w_slots) {
+                    pyre_object::w_tuple_len(w_slots) as u32
+                } else if is_str(w_slots) {
+                    1 // single string slot name
+                } else {
+                    1 // fallback: at least one slot
+                };
+                pyre_object::w_type_set_nslots(w_type, nslots);
+            }
+        }
         // rclass.py:739-743 — set w_class (typeptr) at allocation time.
         // For type objects, w_class is the metaclass (type(C) → Meta).
-        // PyPy: baseobjspace.py:76 getclass() returns the metatype.
+        // baseobjspace.py:76 getclass() returns the metatype.
         unsafe {
             (*w_type).w_class = w_metaclass;
         }

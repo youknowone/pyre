@@ -1457,6 +1457,20 @@ fn build_class_inner(
         result
     } else {
         let w = pyre_object::w_type_new(name, w_effective_bases, class_ns_ptr as *mut u8);
+        // typeobject.py:114 — detect __slots__ and record count.
+        unsafe {
+            let ns = &*class_ns_ptr;
+            if let Some(&w_slots) = ns.get("__slots__") {
+                let nslots = if pyre_object::is_tuple(w_slots) {
+                    pyre_object::w_tuple_len(w_slots) as u32
+                } else if pyre_object::is_str(w_slots) {
+                    1
+                } else {
+                    1
+                };
+                pyre_object::w_type_set_nslots(w, nslots);
+            }
+        }
         // baseobjspace.py:76 — set w_class to 'type' (default metaclass)
         unsafe {
             (*w).w_class = crate::typedef::w_type();
