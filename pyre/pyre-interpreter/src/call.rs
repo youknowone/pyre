@@ -1447,23 +1447,24 @@ fn build_class_inner(
         } else {
             crate::call_function(w_metaclass, &[name_obj, bases, w_namespace_dict])
         };
-        // If metaclass returned a W_TypeObject, set up MRO and store metaclass ref.
+        // baseobjspace.py:76 getclass() — set w_class to the metaclass
+        // so type(C) returns the correct metatype.
         if unsafe { pyre_object::is_type(result) } {
             let mro = unsafe { crate::baseobjspace::compute_default_mro(result) };
             unsafe { pyre_object::w_type_set_mro(result, mro) };
-            // Store metaclass reference in ATTR_TABLE (not class dict)
-            // for metatype attribute lookup
-            crate::baseobjspace::ATTR_TABLE.with(|table| {
-                table
-                    .borrow_mut()
-                    .entry(result as usize)
-                    .or_default()
-                    .insert("__metaclass__".to_string(), w_metaclass);
-            });
+            unsafe {
+                if (*result).w_class.is_null() {
+                    (*result).w_class = w_metaclass;
+                }
+            }
         }
         result
     } else {
         let w = pyre_object::w_type_new(name, w_effective_bases, class_ns_ptr as *mut u8);
+        // baseobjspace.py:76 — set w_class to 'type' (default metaclass)
+        unsafe {
+            (*w).w_class = crate::typedef::w_type();
+        }
         let mro = unsafe { crate::baseobjspace::compute_default_mro(w) };
         unsafe { pyre_object::w_type_set_mro(w, mro) };
         // __set_name__ protocol — type_new_set_names

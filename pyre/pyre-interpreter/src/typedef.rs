@@ -165,7 +165,7 @@ pub fn always_none(_self: PyObjectRef, _obj: PyObjectRef) -> PyObjectRef {
 ///
 /// PyPy equivalent: space.gettypeobject(cls.typedef) → cached W_TypeObject
 /// Stored as usize to satisfy Send+Sync requirements of OnceLock.
-static TYPEOBJECT_CACHE: OnceLock<HashMap<usize, usize>> = OnceLock::new();
+pub static TYPEOBJECT_CACHE: OnceLock<HashMap<usize, usize>> = OnceLock::new();
 
 /// Get the cached W_TypeObject for a builtin runtime type.
 ///

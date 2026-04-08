@@ -2595,9 +2595,16 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
         });
         return Ok(d);
     }
-    // All other objects: use side table
-    // Check ATTR_TABLE first so __class__ overrides (for int subclasses)
-    // take priority over the static type registry.
+    // __class__: read directly from w_class field (the single source of truth).
+    // objectobject.py:133-134 descr_get___class__ → space.type(w_obj)
+    if name == "__class__" {
+        if let Some(tp) = crate::typedef::r#type(obj) {
+            return Ok(tp);
+        }
+    }
+
+    // Instance attributes from side table (excludes __class__ which lives
+    // in the w_class header field, not ATTR_TABLE).
     let found = ATTR_TABLE.with(|table| {
         let table = table.borrow();
         let key = obj as usize;
@@ -2607,32 +2614,17 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
         return Ok(value);
     }
 
-    // __class__: return from type registry if not overridden in ATTR_TABLE
-    if name == "__class__" {
-        if let Some(tp) = crate::typedef::r#type(obj) {
-            return Ok(tp);
-        }
-    }
-
-    // If the object has an overridden __class__ (int subclass), do MRO
-    // lookup on that class for method resolution.
-    let overridden_class = ATTR_TABLE.with(|table| {
-        let table = table.borrow();
-        table
-            .get(&(obj as usize))
-            .and_then(|dict| dict.get("__class__").copied())
-    });
-    if let Some(w_class) = overridden_class {
-        if unsafe { is_type(w_class) } {
-            if let Some(method) = unsafe { lookup_in_type_where(w_class, name) } {
-                if unsafe { crate::is_function(method) } {
-                    return Ok(pyre_object::w_method_new(method, obj, w_class));
-                }
-                if let Some(result) = unsafe { get(method, obj, w_class) } {
-                    return Ok(result);
-                }
-                return Ok(method);
+    // MRO lookup on the object's Python class (w_class) for method resolution.
+    let w_class = unsafe { (*obj).w_class };
+    if !w_class.is_null() && unsafe { is_type(w_class) } {
+        if let Some(method) = unsafe { lookup_in_type_where(w_class, name) } {
+            if unsafe { crate::is_function(method) } {
+                return Ok(pyre_object::w_method_new(method, obj, w_class));
             }
+            if let Some(result) = unsafe { get(method, obj, w_class) } {
+                return Ok(result);
+            }
+            return Ok(method);
         }
     }
 
@@ -2950,6 +2942,75 @@ unsafe fn set(descr: PyObjectRef, obj: PyObjectRef, value: PyObjectRef) -> bool 
 /// Stores the attribute in the per-object side table.
 /// PyPy: descroperation.py descr__setattr__
 
+/// objectobject.py:137-154 `descr_set___class__(space, w_obj, w_newcls)`.
+///
+/// Validates and performs `obj.__class__ = newcls`.
+fn descr_set___class__(w_obj: PyObjectRef, w_newcls: PyObjectRef) -> PyResult {
+    unsafe {
+        // objectobject.py:139-142 — w_newcls must be a W_TypeObject
+        if !is_type(w_newcls) {
+            return Err(crate::PyError::type_error(format!(
+                "__class__ must be set to new-style class, not '{}' object",
+                (*(*w_newcls).ob_type).name,
+            )));
+        }
+        // objectobject.py:143-145 — w_newcls must be a heap type.
+        // In pyre, heap types are user-defined classes created by
+        // class statement / type(). Built-in types (int, str, etc.)
+        // are NOT heap types.
+        if !is_heaptype(w_newcls) {
+            return Err(crate::PyError::type_error(
+                "__class__ assignment: only for heap types".to_string(),
+            ));
+        }
+        // objectobject.py:146-147 — get the old class
+        let w_oldcls = match crate::typedef::r#type(w_obj) {
+            Some(c) => c,
+            None => {
+                return Err(crate::PyError::type_error(
+                    "__class__ assignment: cannot determine current class".to_string(),
+                ));
+            }
+        };
+        // objectobject.py:148-154 — full instance layout must match.
+        // In pyre, layout compatibility means both old and new class
+        // must be user-defined (INSTANCE_TYPE) instances. Built-in
+        // types have incompatible C layouts (W_IntObject vs W_ListObject).
+        let obj_ob_type = (*w_obj).ob_type;
+        if !std::ptr::eq(obj_ob_type, &INSTANCE_TYPE) {
+            return Err(crate::PyError::type_error(format!(
+                "__class__ assignment: '{}' object layout differs from '{}'",
+                (*obj_ob_type).name,
+                pyre_object::w_type_get_name(w_newcls),
+            )));
+        }
+        // objectobject.py:150 — w_obj.setclass(space, w_newcls)
+        (*w_obj).w_class = w_newcls;
+    }
+    Ok(w_none())
+}
+
+/// typeobject.py — check if a type is a heap type (user-defined class).
+///
+/// Heap types are dynamically created by `class` statement or `type()`.
+/// Built-in types (int, str, list, etc.) are NOT heap types.
+/// In pyre, heap types have `ob_type == TYPE_TYPE` and were created
+/// by `w_type_new()` (not by init_typeobjects static definitions).
+#[inline]
+fn is_heaptype(w_type: PyObjectRef) -> bool {
+    // A type is a heap type if it was created dynamically.
+    // Built-in types created by init_typeobjects have their w_class
+    // set to the 'type' type object but are conceptually not heap types.
+    // For now, all user-defined classes are heap types, and built-in
+    // types are not. We distinguish by checking if the type appears
+    // in the TYPEOBJECT_CACHE (built-in → not heap).
+    let addr = w_type as usize;
+    let is_builtin = crate::typedef::TYPEOBJECT_CACHE
+        .get()
+        .map_or(false, |cache| cache.values().any(|&v| v == addr));
+    !is_builtin
+}
+
 pub fn setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult {
     let obj = unwrap_cell(obj);
     let value = unwrap_cell(value);
@@ -2986,28 +3047,9 @@ pub fn setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult {
             }
         }
     }
-    // objectobject.py:137-154 descr_set___class__ — validate before
-    // allowing __class__ assignment.
+    // objectobject.py:137-154 descr_set___class__
     if name == "__class__" {
-        unsafe {
-            // (1) w_newcls must be a type object
-            if !is_type(value) {
-                return Err(crate::PyError::type_error(
-                    "__class__ must be set to a class, not a non-class object".to_string(),
-                ));
-            }
-            // (2) Only heap types (user-defined classes) can be assigned.
-            // Built-in types (int, str, etc.) are not heap types.
-            // For now, only user-defined instances can have __class__ reassigned.
-            let obj_ob_type = (*obj).ob_type;
-            if !std::ptr::eq(obj_ob_type, &INSTANCE_TYPE) {
-                return Err(crate::PyError::type_error(
-                    "__class__ assignment: only for heap types".to_string(),
-                ));
-            }
-            (*obj).w_class = value;
-        }
-        return Ok(w_none());
+        return descr_set___class__(obj, value);
     }
     // Store in instance dict (ATTR_TABLE)
     ATTR_TABLE.with(|table| {
