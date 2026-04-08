@@ -1388,7 +1388,8 @@ impl RegisterManager {
     /// x86/regalloc.py:55 convert_to_imm
     pub fn convert_to_imm(&self, v: OpRef, constants: &HashMap<u32, i64>) -> Loc {
         debug_assert!(v.is_constant());
-        let val = constants.get(&v.const_index()).copied().unwrap_or(0);
+        // constants map key is opref.0 (raw value WITH CONST_BIT), not const_index
+        let val = constants.get(&v.0).copied().unwrap_or(0);
         Loc::Immed(ImmedLoc::new(val))
     }
 
