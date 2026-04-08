@@ -255,15 +255,15 @@ pub fn init_typeobjects() {
 
     // bool — boolobject.py, bases=(int,)
     // Layout = BOOL_TYPE (not INT_TYPE: different struct size).
-    reg.insert(
-        &BOOL_TYPE as *const PyType as usize,
-        new_typeobject_with_base_and_layout(
-            "bool",
-            init_bool_type,
-            int_type,
-            &BOOL_TYPE as *const PyType,
-        ) as usize,
+    // boolobject.py:110 W_BoolObject.typedef.acceptable_as_base_class = False
+    let bool_type = new_typeobject_with_base_and_layout(
+        "bool",
+        init_bool_type,
+        int_type,
+        &BOOL_TYPE as *const PyType,
     );
+    unsafe { pyre_object::w_type_set_acceptable_as_base_class(bool_type, false) };
+    reg.insert(&BOOL_TYPE as *const PyType as usize, bool_type as usize);
 
     // str — PyPy: unicodeobject.py, bases=(object,)
     reg.insert(

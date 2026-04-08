@@ -3009,8 +3009,14 @@ unsafe fn set(descr: PyObjectRef, obj: PyObjectRef, value: PyObjectRef) -> bool 
     }
 
     // typedef.py:477-481 Member.descr_member_set:
-    //   obj.setslotvalue(self.index, value)  → in pyre: write to ATTR_TABLE
+    //   self.typecheck(space, w_obj)
+    //   w_obj.setslotvalue(self.index, w_value)
     if pyre_object::is_member(descr) {
+        // typedef.py:480: typecheck
+        let w_cls = pyre_object::w_member_get_cls(descr);
+        if !w_cls.is_null() && is_type(w_cls) && !isinstance_w(obj, w_cls) {
+            return false;
+        }
         let slot_name = pyre_object::w_member_get_name(descr);
         ATTR_TABLE.with(|table| {
             let mut table = table.borrow_mut();
@@ -3177,6 +3183,15 @@ pub fn delattr(obj: PyObjectRef, name: &str) -> PyResult {
             let w_type = w_instance_get_type(obj);
             if let Some(descr) = lookup_in_type_where(w_type, name) {
                 if pyre_object::is_member(descr) {
+                    // typedef.py:486: self.typecheck(space, w_obj)
+                    let w_cls = pyre_object::w_member_get_cls(descr);
+                    if !w_cls.is_null() && is_type(w_cls) && !isinstance_w(obj, w_cls) {
+                        return Err(PyError::type_error(format!(
+                            "descriptor for '{}' objects doesn't apply to '{}' object",
+                            pyre_object::w_type_get_name(w_cls),
+                            pyre_object::w_type_get_name(w_type),
+                        )));
+                    }
                     let slot_name = pyre_object::w_member_get_name(descr);
                     let removed = ATTR_TABLE.with(|table| {
                         let mut table = table.borrow_mut();
