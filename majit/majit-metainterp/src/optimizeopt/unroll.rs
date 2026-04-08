@@ -103,7 +103,8 @@ pub struct UnrollOptimizer {
     /// RPython: same Optimizer instance across phases keeps patchguardop.
     /// In majit, separate instances — forward explicitly.
     phase1_patchguardop: Option<majit_ir::Op>,
-    /// opencoder.py:271 self._index parity (cross-phase OpRef high water).
+    /// Cross-phase fresh OpRef high water (majit-specific companion to
+    /// RPython's `TraceIterator._index`).
     ///
     /// In RPython each `TraceIterator.next()` allocates a fresh `cls()`
     /// ResOperation whose Python identity distinguishes Phase 1 from
@@ -111,7 +112,7 @@ pub struct UnrollOptimizer {
     /// continue allocating *above* Phase 1's high water mark to keep the
     /// two phases' OpRef sets disjoint. After Phase 1 finishes,
     /// `next_global_opref` holds the smallest OpRef Phase 2 may emit; it
-    /// is the `start_index` argument the next `TraceIterator::new` call
+    /// is the `start_fresh` argument the next `TraceIterator::new` call
     /// (or bridge entry) should use. Initialized to 0.
     #[allow(dead_code)]
     pub(crate) next_global_opref: u32,
@@ -558,7 +559,7 @@ impl UnrollOptimizer {
         while let Some(op) = iter.next() {
             p2_ops_in.push(op);
         }
-        let p2_high_water = iter._index;
+        let p2_high_water = iter._fresh;
         let p2_cache = iter._cache;
         // opencoder.py: `_cache[raw_pos]` holds the fresh per-iteration
         // box. Use it to translate Phase 2-side maps that were populated

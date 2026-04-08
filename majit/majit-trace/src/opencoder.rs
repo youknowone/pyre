@@ -658,19 +658,30 @@ impl Drop for SnapshotStorage {
 // opencoder.py:249-406 TraceIterator(BaseTrace).
 //
 // Literal port of RPython's TraceIterator. Each call to `next()` produces
-// a *fresh* operation whose `pos` is a freshly allocated OpRef from `_index`,
-// and whose args have been translated through `_cache` from raw trace
-// positions to the per-iteration fresh OpRefs.
+// a *fresh* operation whose `pos` is a freshly allocated OpRef (from the
+// majit-specific `_fresh` counter) and whose args have been translated
+// through `_cache` from raw trace positions to the per-iteration fresh
+// OpRefs.
 //
 // In RPython every visited op is a freshly allocated `cls()` ResOperation
 // Python object whose identity is `is`. Two iterators over the same trace
-// therefore produce DIFFERENT box objects at the same `_index` slot. majit
-// has no separate identity from position — `OpRef(u32)` IS the identity —
-// so the iterator's `_index` counter must start at a value chosen by the
-// caller (`start_index`) so that two iterations produce disjoint OpRefs.
-// Phase 1 starts with `start_index = num_inputs`; Phase 2 starts with
-// `start_index = phase1._index_after_iteration`. The cache key remains the
-// raw trace position (matching `_cache[trace.inputargs[i].get_position()]`).
+// therefore produce DIFFERENT box objects at the same `_index` slot — the
+// `_index` field walks `_cache` in raw trace position coordinates; the
+// freshness comes from `cls()`. majit has no separate identity from
+// position, so we split the RPython `_index` into two fields:
+//
+//   * `_index`  — raw trace position coordinate, matching RPython's
+//                 `self._cache[self._index] = res; self._index += 1`. Used
+//                 by `replace_last_cached`/`kill_cache_at` which key on
+//                 `_cache` slots.
+//   * `_fresh`  — majit-specific fresh OpRef allocation counter, seeded
+//                 from the `start_fresh` constructor argument. Phase 1
+//                 starts at `num_inputs`; Phase 2 starts at Phase 1's
+//                 `_fresh` high water so the two iterations produce
+//                 disjoint OpRef ranges.
+//
+// RPython keeps these two roles fused because Python object identity
+// makes `_index`'s dual use safe.
 
 /// opencoder.py:249 class TraceIterator(BaseTrace).
 pub struct TraceIterator<'a> {
@@ -682,7 +693,7 @@ pub struct TraceIterator<'a> {
     pub _cache: Vec<Option<OpRef>>,
     /// opencoder.py:259-262 self.inputargs: fresh inputarg boxes for this
     /// iteration. Each is an `OpRef` allocated from the iterator's
-    /// `_index` namespace at construction time.
+    /// `_fresh` counter at construction time.
     pub inputargs: Vec<OpRef>,
     /// opencoder.py:268 self.start
     pub start: usize,
@@ -690,15 +701,23 @@ pub struct TraceIterator<'a> {
     pub pos: usize,
     /// opencoder.py:270 self._count
     pub _count: u32,
-    /// opencoder.py:271 self._index: monotonic counter for the position of
-    /// resulting resops. Each non-void result allocates `OpRef(self._index)`
-    /// and then `self._index += 1`. The starting value is supplied by the
-    /// caller so different iterations get disjoint OpRefs.
+    /// opencoder.py:271 self._index: raw trace position coordinate of the
+    /// next `_cache` slot to write. RPython uses this as both the cache
+    /// slot and the implicit fresh-ResOp position; majit uses it ONLY for
+    /// the cache slot (see `_fresh` for the OpRef allocation counter).
+    /// Advanced on every non-void op processed by `next()`.
     pub _index: u32,
-    /// opencoder.py:272 self.start_index
+    /// opencoder.py:272 self.start_index — raw trace position coordinate
+    /// of the iteration start.
     pub start_index: u32,
     /// opencoder.py:273 self.end
     pub end: usize,
+    /// majit-specific fresh OpRef allocation counter. Seeded from the
+    /// `start_fresh` constructor argument. Advances by one per non-void
+    /// op in `next()` and per inputarg in `new()`. Two iterations over
+    /// the same trace produce disjoint OpRef ranges by passing different
+    /// `start_fresh` values.
+    pub _fresh: u32,
 }
 
 impl<'a> TraceIterator<'a> {
@@ -707,15 +726,17 @@ impl<'a> TraceIterator<'a> {
     /// `force_inputargs` corresponds to the same RPython parameter
     /// (cut-trace path); when None, the iterator pre-seeds the cache with
     /// the trace's own inputargs at positions `[0, num_inputargs)`.
-    /// `start_index` is the starting value of `self._index`; majit must
-    /// expose this so two iterations can produce disjoint OpRefs.
+    /// `start_fresh` is majit-specific: it seeds the fresh OpRef counter
+    /// so two iterations over the same trace can produce disjoint OpRef
+    /// ranges. RPython does not need this because each iteration's
+    /// `cls()` allocation produces distinct Python objects.
     pub fn new(
         trace: &'a [majit_ir::Op],
         start: usize,
         end: usize,
         force_inputargs: Option<&[OpRef]>,
         num_inputargs: usize,
-        start_index: u32,
+        start_fresh: u32,
     ) -> Self {
         // self._cache = [None] * trace._index
         // The iterator's cache must be large enough to hold any raw trace
@@ -735,7 +756,7 @@ impl<'a> TraceIterator<'a> {
             .unwrap_or(0);
         let cache_size = ((max_pos as usize) + 1).max(num_inputargs);
         let mut _cache: Vec<Option<OpRef>> = vec![None; cache_size];
-        let mut next_index = start_index;
+        let mut _fresh = start_fresh;
         let inputargs: Vec<OpRef>;
         if let Some(force) = force_inputargs {
             // self.inputargs = [rop.inputarg_from_tp(arg.type) for
@@ -745,8 +766,8 @@ impl<'a> TraceIterator<'a> {
             inputargs = force
                 .iter()
                 .map(|_| {
-                    let r = OpRef(next_index);
-                    next_index += 1;
+                    let r = OpRef(_fresh);
+                    _fresh += 1;
                     r
                 })
                 .collect();
@@ -764,8 +785,8 @@ impl<'a> TraceIterator<'a> {
             //     self._cache[self.trace.inputargs[i].get_position()] = arg
             inputargs = (0..num_inputargs)
                 .map(|_| {
-                    let r = OpRef(next_index);
-                    next_index += 1;
+                    let r = OpRef(_fresh);
+                    _fresh += 1;
                     r
                 })
                 .collect();
@@ -780,9 +801,10 @@ impl<'a> TraceIterator<'a> {
             start,
             pos: start,
             _count: start as u32,
-            _index: next_index,
-            start_index: next_index,
+            _index: start as u32,
+            start_index: start as u32,
             end,
+            _fresh,
         }
     }
 
@@ -820,6 +842,11 @@ impl<'a> TraceIterator<'a> {
     }
 
     /// opencoder.py:282-284 replace_last_cached(oldbox, box).
+    /// RPython writes `_cache[_index - 1]` where `_index` walks `_cache`
+    /// densely in ops-count coordinates. In majit the key is the raw
+    /// trace position (which is monotonic for non-void ops in a
+    /// well-formed trace), so `_index - 1` lands on the same cache slot
+    /// the previous `next()` call wrote.
     pub fn replace_last_cached(&mut self, oldbox: OpRef, new_box: OpRef) {
         let last_idx = (self._index - 1) as usize;
         debug_assert_eq!(self._cache[last_idx], Some(oldbox));
@@ -856,12 +883,22 @@ impl<'a> TraceIterator<'a> {
             let fresh = if let Some(existing) = self._cache[orig] {
                 existing
             } else {
-                let f = OpRef(self._index);
-                self._index += 1;
+                // majit fresh OpRef allocation: allocate from `_fresh`
+                // (independent of `_index` so phase 2 can start above
+                // phase 1's high water).
+                let f = OpRef(self._fresh);
+                self._fresh += 1;
                 self._cache[orig] = Some(f);
                 f
             };
             res.pos = fresh;
+            // RPython `_index` parity: advance past the cache slot we
+            // just wrote. In RPython this happens via `_index += 1`
+            // because `_index` == cache slot index; in majit the cache
+            // key is the raw trace position, so we assign `orig + 1`
+            // directly to keep `_cache[_index - 1]` (`replace_last_cached`)
+            // pointing at the slot we just wrote.
+            self._index = orig as u32 + 1;
         } else {
             res.pos = src.pos;
         }
@@ -1566,7 +1603,7 @@ mod tests {
         //
         // Phase-1 iteration over a 2-inputarg trace producing two IntAdd
         // results. Inputargs occupy positions [0, 2); the first non-void
-        // result is allocated at OpRef(2) (= start_index = num_inputargs).
+        // result is allocated at OpRef(2) (= start_fresh = num_inputargs).
         let ops = vec![
             op_at(2, majit_ir::OpCode::IntAdd, &[OpRef(0), OpRef(1)]),
             op_at(3, majit_ir::OpCode::IntAdd, &[OpRef(2), OpRef(0)]),
@@ -1574,7 +1611,7 @@ mod tests {
         ];
         let num_inputargs = 2;
 
-        // Phase 1 / legacy layout: start_index = 0 → inputargs allocated
+        // Phase 1 / legacy layout: start_fresh = 0 → inputargs allocated
         // at [OpRef(0), OpRef(1)], op results follow at [OpRef(2), …).
         let mut iter = TraceIterator::new(&ops, 0, ops.len(), None, num_inputargs, 0);
         assert_eq!(iter.inputargs, vec![OpRef(0), OpRef(1)]);
@@ -1607,7 +1644,7 @@ mod tests {
         // RPython distinguishes Phase 1 boxes from Phase 2 boxes by Python
         // `is`-identity even when the two iterators visit the same source
         // trace position. majit lacks separate identity from position, so
-        // each phase passes a different `start_index` and the iterator
+        // each phase passes a different `start_fresh` and the iterator
         // produces disjoint OpRefs by construction.
         let ops = vec![
             op_at(2, majit_ir::OpCode::IntAdd, &[OpRef(0), OpRef(1)]),
@@ -1616,17 +1653,21 @@ mod tests {
         ];
         let num_inputargs = 2;
 
-        // Phase 1: start_index = 0 reproduces the legacy positional layout
+        // Phase 1: start_fresh = 0 reproduces the legacy positional layout
         // (inputargs at [0, num_inputargs), op results at [num_inputargs, …)).
         let mut p1 = TraceIterator::new(&ops, 0, ops.len(), None, num_inputargs, 0);
         let mut p1_ops = Vec::new();
         while let Some(op) = p1.next() {
             p1_ops.push(op);
         }
-        let p1_high_water = p1._index;
+        let p1_high_water = p1._fresh;
         assert_eq!(p1_high_water, 4);
+        // RPython `_index` walks the `_cache` slots monotonically; after
+        // the 2 non-void ops it should point just past the last written
+        // raw trace position (3 + 1 = 4).
+        assert_eq!(p1._index, 4);
 
-        // Phase 2: start_index = phase1 high water → disjoint namespace.
+        // Phase 2: start_fresh = phase1 high water → disjoint namespace.
         let mut p2 = TraceIterator::new(&ops, 0, ops.len(), None, num_inputargs, p1_high_water);
         let mut p2_ops = Vec::new();
         while let Some(op) = p2.next() {
@@ -1667,6 +1708,43 @@ mod tests {
         assert_eq!(r.pos, OpRef(1));
         assert_eq!(r.args[0], OpRef(0));
         assert_eq!(r.args[1], const_ref);
+    }
+
+    #[test]
+    fn test_trace_iterator_replace_last_cached_shifted_phase() {
+        // opencoder.py:282-284 replace_last_cached parity. RPython walks
+        // `_cache` densely by ops-count (`_index`), so `_cache[_index - 1]`
+        // always targets the slot just written by `next()`. majit's
+        // `_index` is separated from the fresh OpRef counter — in a
+        // shifted phase (Phase 2 with `start_fresh` >> 0) the cache key
+        // is still the raw trace position, so `_index` must stay in raw
+        // trace position coordinates.
+        let ops = vec![
+            op_at(1, majit_ir::OpCode::IntAdd, &[OpRef(0), OpRef(0)]),
+            op_at(2, majit_ir::OpCode::IntAdd, &[OpRef(1), OpRef(0)]),
+            majit_ir::Op::new(majit_ir::OpCode::Finish, &[OpRef(2)]),
+        ];
+        // Shifted phase: start_fresh = 100 so any confusion between
+        // _index (raw trace position) and _fresh (fresh OpRef counter)
+        // surfaces as an out-of-bounds panic or stale cache slot.
+        let mut iter = TraceIterator::new(&ops, 0, ops.len(), None, 1, 100);
+        let r1 = iter.next().unwrap();
+        // After writing raw pos 1, _index should be 2 (next slot).
+        assert_eq!(iter._index, 2);
+        assert_eq!(r1.pos, OpRef(101));
+        // replace_last_cached(oldbox=OpRef(101), new_box=OpRef(999))
+        // must target _cache[_index - 1] = _cache[1], where the last
+        // write placed OpRef(101).
+        iter.replace_last_cached(OpRef(101), OpRef(999));
+        assert_eq!(iter._cache[1], Some(OpRef(999)));
+
+        // The next op references raw pos 1 as its first arg, so the
+        // replaced value should flow through _untag → _get.
+        let r2 = iter.next().unwrap();
+        assert_eq!(r2.args[0], OpRef(999));
+        assert_eq!(r2.args[1], OpRef(100));
+        // After writing raw pos 2, _index advances to 3.
+        assert_eq!(iter._index, 3);
     }
 
     #[test]
