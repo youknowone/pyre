@@ -23,6 +23,7 @@ pub fn w_float_new(value: f64) -> PyObjectRef {
     let obj = Box::new(W_FloatObject {
         ob_header: PyObject {
             ob_type: &FLOAT_TYPE as *const PyType,
+            w_class: std::ptr::null_mut(),
         },
         floatval: value,
     });
@@ -83,6 +84,6 @@ mod tests {
 
     #[test]
     fn test_float_field_offset() {
-        assert_eq!(FLOAT_FLOATVAL_OFFSET, 8); // after *const PyType (8 bytes on 64-bit)
+        assert_eq!(FLOAT_FLOATVAL_OFFSET, 16); // after *const PyType (8 bytes on 64-bit)
     }
 }

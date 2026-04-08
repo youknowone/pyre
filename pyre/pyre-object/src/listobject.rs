@@ -126,6 +126,7 @@ pub fn w_list_new(items: Vec<PyObjectRef>) -> PyObjectRef {
     let mut obj = Box::new(W_ListObject {
         ob_header: PyObject {
             ob_type: &LIST_TYPE as *const PyType,
+            w_class: std::ptr::null_mut(),
         },
         items,
         strategy,

@@ -308,16 +308,23 @@ use pyre_object::{
 };
 use pyre_object::{FLOAT_TYPE, INT_TYPE};
 
-/// Field descriptor for `W_InstanceObject.w_type` (Ref, immutable).
+/// Field descriptor for `PyObject.w_class` (Ref, mutable).
 ///
-/// W_InstanceObject layout: [ob_type(8)] [w_type(8)]
-/// The w_type field holds the real Python class of the instance.
-/// RPython parity: this is the field that jit.promote(__class__) reads.
+/// PyObject layout: [ob_type(8)] [w_class(8)]
+/// The w_class field holds the Python class for all object types.
+///
+/// RPython parity: jit.promote(w_obj.__class__) reads typeptr via
+/// getfield_gc_r then GUARD_VALUE. This is the pyre equivalent — a
+/// field read on the common PyObject header.
+///
+/// Mutable because __class__ assignment can change it.
+pub fn w_class_descr() -> DescrRef {
+    make_field_descr(pyre_object::pyobject::W_CLASS_OFFSET, 8, Type::Ref, false)
+}
+
+/// Alias for backward compatibility — same as w_class_descr().
 pub fn instance_w_type_descr() -> DescrRef {
-    // W_InstanceObject.w_type is at offset sizeof(PyObject) = sizeof(pointer) = OB_TYPE_OFFSET + 8
-    // More precisely: ob_header is a PyObject { ob_type: *const PyType }, which is 8 bytes.
-    const INSTANCE_W_TYPE_OFFSET: usize = std::mem::size_of::<pyre_object::pyobject::PyObject>();
-    make_immutable_field_descr(INSTANCE_W_TYPE_OFFSET, 8, Type::Ref, false)
+    w_class_descr()
 }
 
 /// Field descriptor for `W_RangeIterator.current` (i64, signed).

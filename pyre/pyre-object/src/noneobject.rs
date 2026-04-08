@@ -12,6 +12,7 @@ pub struct W_NoneObject {
 static NONE_SINGLETON: W_NoneObject = W_NoneObject {
     ob_header: PyObject {
         ob_type: &NONE_TYPE as *const PyType,
+        w_class: std::ptr::null_mut(),
     },
 };
 
@@ -30,6 +31,7 @@ pub struct W_NotImplementedObject {
 static NOT_IMPLEMENTED_SINGLETON: W_NotImplementedObject = W_NotImplementedObject {
     ob_header: PyObject {
         ob_type: &NOTIMPLEMENTED_TYPE as *const PyType,
+        w_class: std::ptr::null_mut(),
     },
 };
 

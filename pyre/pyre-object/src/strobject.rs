@@ -34,6 +34,7 @@ pub fn w_str_new(s: &str) -> PyObjectRef {
     let obj = Box::new(W_StrObject {
         ob_header: PyObject {
             ob_type: &STR_TYPE as *const PyType,
+            w_class: std::ptr::null_mut(),
         },
         value: inner,
         len: s.len(),
@@ -157,8 +158,8 @@ mod tests {
 
     #[test]
     fn test_str_field_offset() {
-        assert_eq!(STR_VALUE_OFFSET, 8); // after *const PyType (8 bytes on 64-bit)
-        assert_eq!(STR_LEN_OFFSET, 16);
+        assert_eq!(STR_VALUE_OFFSET, 16); // after *const PyType (8 bytes on 64-bit)
+        assert_eq!(STR_LEN_OFFSET, 24);
     }
 
     #[test]

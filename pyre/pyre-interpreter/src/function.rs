@@ -92,6 +92,7 @@ pub fn function_new_with_closure(
     let obj = Box::new(Function {
         ob: PyObject {
             ob_type: &FUNCTION_TYPE as *const PyType,
+            w_class: std::ptr::null_mut(),
         },
         code,
         can_change_code: true, // function.py:33
@@ -116,6 +117,7 @@ pub fn function_new_with_fixed_code(
     let obj = Box::new(Function {
         ob: PyObject {
             ob_type: &FUNCTION_TYPE as *const PyType,
+            w_class: std::ptr::null_mut(),
         },
         code,
         can_change_code: false, // function.py:704
@@ -920,9 +922,9 @@ mod tests {
 
     #[test]
     fn test_function_field_offsets() {
-        assert_eq!(FUNCTION_CODE_OFFSET, 8); // after ob_type pointer
-        assert_eq!(FUNCTION_NAME_OFFSET, 16); // after code
-        assert_eq!(FUNCTION_GLOBALS_OFFSET, 24); // after name
-        assert_eq!(FUNCTION_CLOSURE_OFFSET, 32); // after w_func_globals
+        assert_eq!(FUNCTION_CODE_OFFSET, 16); // after PyObject { ob_type(8) + w_class(8) }
+        assert_eq!(FUNCTION_NAME_OFFSET, 32); // after code(8) + can_change_code(1) + padding(7)
+        assert_eq!(FUNCTION_GLOBALS_OFFSET, 40); // after name
+        assert_eq!(FUNCTION_CLOSURE_OFFSET, 48); // after w_func_globals
     }
 }

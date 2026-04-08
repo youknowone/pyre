@@ -15,11 +15,17 @@ pub struct PyType {
 
 /// Common header for all Python objects.
 ///
-/// The `ob_type` pointer identifies the object's type at runtime.
-/// JIT code reads this field as a raw machine word and guards on it via `GuardClass`.
+/// RPython rclass.py: OBJECT = GcStruct('object', ('typeptr', CLASSTYPE))
+///
+/// - `ob_type`: static dispatch tag (like RPython's typeptr for guard_class)
+/// - `w_class`: Python class pointer (like RPython's gettypefor(typeptr) result)
+///
+/// `w_class` is set at allocation time when the type registry is available,
+/// or populated lazily by `init_typeobjects()` for static singletons.
 #[repr(C)]
 pub struct PyObject {
     pub ob_type: *const PyType,
+    pub w_class: *mut PyObject,
 }
 
 /// The universal Python object reference — a raw pointer to `PyObject`.
@@ -61,6 +67,10 @@ pub static INSTANCE_TYPE: PyType = PyType { tp_name: "object" };
 
 /// Field offset of `ob_type` within PyObject, for JIT field access.
 pub const OB_TYPE_OFFSET: usize = std::mem::offset_of!(PyObject, ob_type);
+
+/// Field offset of `w_class` within PyObject, for JIT field access.
+/// RPython: this corresponds to reading typeptr + gettypefor (fused into one field).
+pub const W_CLASS_OFFSET: usize = std::mem::offset_of!(PyObject, w_class);
 
 /// Every built-in `PyType` static that represents a full `PyObject`
 /// subtype (i.e. instances carry `ob_type` at offset 0, matching

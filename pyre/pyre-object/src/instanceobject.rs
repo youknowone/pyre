@@ -2,7 +2,7 @@
 //!
 //! PyPy equivalent: pypy/objspace/std/objectobject.py → W_ObjectObject
 //!
-//! An instance holds a pointer to its W_TypeObject (class).
+//! An instance holds a pointer to its W_TypeObject (class) in `ob_header.w_class`.
 //! Per-instance attributes are stored in the thread-local ATTR_TABLE
 //! side table, matching PyPy's instance __dict__.
 
@@ -12,18 +12,16 @@ use crate::pyobject::*;
 
 /// Python instance object.
 ///
-/// Layout: `[ob_type | w_type]`
+/// Layout: `[ob_type | w_class]` — same as PyObject header.
 ///
 /// - `ob_type`: always &INSTANCE_TYPE (for is_instance() checks)
-/// - `w_type`: pointer to the W_TypeObject this is an instance of
+/// - `w_class`: pointer to the W_TypeObject this is an instance of
 ///
-/// PyPy stores the type in ob_type directly, but pyre uses a fixed
-/// INSTANCE_TYPE for dispatch and stores the actual class separately.
+/// The Python class is stored in `ob_header.w_class`, shared with all
+/// other object types. RPython stores this in `typeptr` (rclass.py).
 #[repr(C)]
 pub struct W_InstanceObject {
     pub ob_header: PyObject,
-    /// The class (W_TypeObject) this object is an instance of.
-    pub w_type: PyObjectRef,
 }
 
 /// Allocate a new instance of a user-defined class.
@@ -33,15 +31,15 @@ pub fn w_instance_new(w_type: PyObjectRef) -> PyObjectRef {
     let obj = Box::new(W_InstanceObject {
         ob_header: PyObject {
             ob_type: &INSTANCE_TYPE as *const PyType,
+            w_class: w_type,
         },
-        w_type,
     });
     Box::into_raw(obj) as PyObjectRef
 }
 
 /// Get the class (W_TypeObject) of an instance.
 pub unsafe fn w_instance_get_type(obj: PyObjectRef) -> PyObjectRef {
-    (*(obj as *const W_InstanceObject)).w_type
+    (*obj).w_class
 }
 
 /// Check if an object is an instance of a user-defined class.

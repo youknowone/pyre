@@ -23,6 +23,7 @@ pub fn w_tuple_new(items: Vec<PyObjectRef>) -> PyObjectRef {
     let mut obj = Box::new(W_TupleObject {
         ob_header: PyObject {
             ob_type: &TUPLE_TYPE as *const PyType,
+            w_class: std::ptr::null_mut(),
         },
         items: PyObjectArray::from_vec(items),
     });

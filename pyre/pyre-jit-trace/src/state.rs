@@ -522,16 +522,6 @@ pub struct PyreSym {
     pub(crate) virtualref_boxes: Vec<(OpRef, usize)>,
 }
 
-/// C-ABI wrapper for `typedef::type()`, callable from JIT-compiled code.
-///
-/// RPython parity: `jit.promote(w_obj.__class__)` reads the class via
-/// getfield chain (mapdict). pyre stores `__class__` override in ATTR_TABLE
-/// (not a struct field), so JIT traces use `CallLoopinvariantR` to this
-/// function instead of getfield, then `GUARD_VALUE` on the result.
-pub extern "C" fn jit_read_class(obj: PyObjectRef) -> PyObjectRef {
-    pyre_interpreter::typedef::r#type(obj).unwrap_or(PY_NULL)
-}
-
 /// Trace-time view over the virtualizable `PyFrame`.
 ///
 /// Per-instruction wrapper that borrows persistent symbolic state from
@@ -2854,19 +2844,26 @@ impl PyreJitState {
         let mut list_items_ptr: usize = 0;
         let mut list_items_len: usize = 0;
 
+        use pyre_object::pyobject::{OB_TYPE_OFFSET, W_CLASS_OFFSET};
+        // PyObject layout: [ob_type @ 0, w_class @ 8]
+        // Payload fields start at sizeof(PyObject) = 16.
+        const PAYLOAD_0: usize = std::mem::size_of::<pyre_object::pyobject::PyObject>();
+        const PAYLOAD_1: usize = PAYLOAD_0 + 8;
+
         for (field_idx, value) in fields {
             let offset = extract_pyre_field_offset(*field_idx);
             let concrete = value.resolve_with_refs(materialized_refs)?;
             match offset {
-                Some(0) => ob_type = concrete as usize,
-                Some(8) => {
+                Some(o) if o == OB_TYPE_OFFSET => ob_type = concrete as usize,
+                Some(o) if o == W_CLASS_OFFSET => { /* w_class: skip, set by w_*_new */ }
+                Some(o) if o == PAYLOAD_0 => {
                     if ob_type == &LIST_TYPE as *const _ as usize {
                         list_items_ptr = concrete as usize;
                     } else {
                         int_payload = concrete;
                     }
                 }
-                Some(16) if ob_type == &LIST_TYPE as *const _ as usize => {
+                Some(o) if o == PAYLOAD_1 && ob_type == &LIST_TYPE as *const _ as usize => {
                     list_items_len = concrete as usize;
                 }
                 _ => {}
