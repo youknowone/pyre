@@ -4061,6 +4061,8 @@ impl Assembler386 {
             .and_then(|cd| cd.call_target_token())
             .and_then(|token| self.call_assembler_targets.get(&token).copied());
 
+        // Exclude address 0 (pending token placeholder) to avoid calling null.
+        let target_addr = target_addr.filter(|&a| a != 0);
         let is_resolved = target_addr.is_some() || self.self_entry_label.is_some();
 
         // assembler.py:324-336 call_assembler: select done_descr by op.type.

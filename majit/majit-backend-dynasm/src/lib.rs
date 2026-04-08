@@ -168,32 +168,44 @@ pub extern "C" fn call_assembler_helper_trampoline(callee_jf_ptr: *mut i64, gree
             raw_values.push(unsafe { *callee_jf_ptr.add(1 + slot) });
         }
 
+        // RPython handle_fail: bridge OR blackhole, not both.
         // Step 1: Try bridge compilation (compile.py:701-717 must_compile)
-        if let Some(bridge_fn) = CA_BRIDGE_FN.get() {
-            let _compiled = bridge_fn(
+        let bridge_compiled = if let Some(bridge_fn) = CA_BRIDGE_FN.get() {
+            bridge_fn(
                 green_key,
                 trace_id,
                 fail_index,
                 raw_values.as_ptr(),
                 raw_values.len(),
                 descr_addr,
-            );
-        }
-
-        // Step 2: Try blackhole resume (resume.py:1312 parity)
-        if let Some(blackhole) = CA_BLACKHOLE_FN.get() {
-            blackhole(
-                green_key,
-                trace_id,
-                fail_index,
-                raw_values.as_ptr(),
-                raw_values.len(),
-                raw_values.as_ptr(),
-                raw_values.len(),
             )
-            .unwrap_or(0)
         } else {
+            false
+        };
+
+        if bridge_compiled {
+            // Bridge compiled — RPython continues running normally via
+            // the bridge. For CALL_ASSEMBLER slow path, this means the
+            // callee's guard failure was handled by compiling a bridge.
+            // The bridge result is not directly available here; return 0.
+            // The caller will re-enter the compiled code on next invocation.
             0
+        } else {
+            // Step 2: Blackhole resume (resume.py:1312 parity)
+            if let Some(blackhole) = CA_BLACKHOLE_FN.get() {
+                blackhole(
+                    green_key,
+                    trace_id,
+                    fail_index,
+                    raw_values.as_ptr(),
+                    raw_values.len(),
+                    raw_values.as_ptr(),
+                    raw_values.len(),
+                )
+                .unwrap_or(0)
+            } else {
+                0
+            }
         }
     };
 
