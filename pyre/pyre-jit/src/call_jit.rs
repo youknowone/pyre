@@ -1179,12 +1179,25 @@ pub fn resume_in_blackhole(
                 }
                 let ncells = pyre_interpreter::pyframe::ncells(code);
                 let stack_base = nlocals + ncells;
-                let stack = bh.runtime_stack_drain(0);
-                frame.valuestackdepth = stack_base + stack.len();
-                for (i, val) in stack.iter().enumerate() {
-                    let idx = stack_base + i;
-                    if idx < frame.locals_cells_stack_w.len() {
-                        frame.locals_cells_stack_w[idx] = *val as pyre_object::PyObjectRef;
+                // flatten.py / regalloc.py parity: read value-stack
+                // temporaries from `registers_r[nlocals + d]` (where the
+                // codewriter parks them via `move_r`), not from a runtime
+                // stack. The previous `runtime_stack_drain(0)` always
+                // returned an empty Vec because pyre's codewriter never
+                // emits BC_PUSH_R / BC_POP_R against runtime_stacks; the
+                // call was a no-op. The number of stack registers to read
+                // is `depth_at_py_pc[merge_py_pc]`, recorded by the
+                // codewriter for each Python PC.
+                let depth = bh.jitcode.depth_at_py_pc.get(py_pc).copied().unwrap_or(0) as usize;
+                frame.valuestackdepth = stack_base + depth;
+                for d in 0..depth {
+                    let reg_idx = nlocals + d;
+                    let frame_idx = stack_base + d;
+                    if reg_idx < bh.registers_r.len()
+                        && frame_idx < frame.locals_cells_stack_w.len()
+                    {
+                        frame.locals_cells_stack_w[frame_idx] =
+                            bh.registers_r[reg_idx] as pyre_object::PyObjectRef;
                     }
                 }
                 frame.next_instr = py_pc;
