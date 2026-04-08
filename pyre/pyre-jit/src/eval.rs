@@ -1313,6 +1313,18 @@ fn handle_fail(
     _info: &majit_metainterp::virtualizable::VirtualizableInfo,
 ) -> HandleFailOutcome {
     // compile.py:702-703: must_compile() AND not stack_almost_full()
+    //
+    // [dynasm-known-issue] Bridge compilation is disabled for the dynasm
+    // backend because restore_guard_failure_values does not yet handle
+    // the dynasm fail_arg layout correctly — the compact active_boxes
+    // mapping (resume.py:1077 parity) produces indices that exceed the
+    // frame's locals array when the guard's fail_arg_types list is
+    // larger than the bridge entry frame expects.
+    // This is NOT a cfg gate — it's a runtime check so the same binary
+    // can run both backends. Fixing restore_guard_failure_values to
+    // handle dynasm's layout will remove this condition.
+    #[cfg(feature = "dynasm")]
+    let should_bridge = false;
     if should_bridge && !stack_almost_full() {
         let is_tracing = {
             let (driver, _) = driver_pair();
