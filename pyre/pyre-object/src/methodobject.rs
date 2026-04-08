@@ -14,7 +14,7 @@ pub struct W_MethodObject {
     pub w_class: PyObjectRef,
 }
 
-pub static METHOD_TYPE: PyType = PyType { tp_name: "method" };
+pub static METHOD_TYPE: PyType = crate::pyobject::new_pytype("method");
 
 pub fn w_method_new(
     w_function: PyObjectRef,

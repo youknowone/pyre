@@ -7,9 +7,7 @@
 use crate::pyobject::*;
 
 /// Type descriptor for range iterators.
-pub static RANGE_ITER_TYPE: PyType = PyType {
-    tp_name: "range_iterator",
-};
+pub static RANGE_ITER_TYPE: PyType = crate::pyobject::new_pytype("range_iterator");
 
 /// Range iterator object.
 ///
@@ -185,9 +183,7 @@ mod tests {
 
 // ── Sequence iterator (list/tuple) ──
 
-pub static SEQ_ITER_TYPE: PyType = PyType {
-    tp_name: "list_iterator",
-};
+pub static SEQ_ITER_TYPE: PyType = crate::pyobject::new_pytype("list_iterator");
 
 #[repr(C)]
 pub struct W_SeqIterator {

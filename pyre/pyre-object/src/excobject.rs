@@ -6,9 +6,7 @@
 
 use crate::pyobject::*;
 
-pub static EXCEPTION_TYPE: PyType = PyType {
-    tp_name: "exception",
-};
+pub static EXCEPTION_TYPE: PyType = crate::pyobject::new_pytype("exception");
 
 /// Numeric tags for exception kinds — must stay in sync with PyErrorKind.
 #[repr(u8)]

@@ -16,6 +16,7 @@ use std::cell::{Cell, UnsafeCell};
 use std::collections::HashMap;
 
 use majit_backend::Backend;
+use majit_gc::GcAllocator;
 use majit_gc::trace::TypeInfo;
 use majit_ir::Value;
 use majit_metainterp::blackhole::ExceptionState;
@@ -164,6 +165,18 @@ thread_local! {
                 tid,
             );
             pytype_to_tid.insert(*pytype as *const _ as usize, tid);
+        }
+        // rclass.py:340-346 — assign subclassrange_{min,max} to each
+        // vtable entry. freeze_types() runs assign_inheritance_ids
+        // (normalizecalls.py:373-389), then we write the computed ranges
+        // back into the static PyType structs so that ll_issubclass
+        // (rclass.py:1133-1137) can read them directly from the typeptr.
+        gc.freeze_types();
+        for (&classptr, &_tid) in &pytype_to_tid {
+            if let Some((min, max)) = gc.subclass_range(classptr) {
+                let tp = unsafe { &*(classptr as *const pyre_object::pyobject::PyType) };
+                pyre_object::pyobject::assign_subclass_range(tp, min, max);
+            }
         }
         d.set_gc_allocator(Box::new(gc));
         // llmodel.py:67-69 self.vtable_offset, _ = symbolic.get_field_token(
@@ -4264,6 +4277,54 @@ while i < 300:
         assert!(disjoint(float_r, str_r), "float ⊥ str");
         assert!(disjoint(str_r, list_r), "str ⊥ list");
         assert!(disjoint(float_r, bool_r), "float ⊥ bool");
+
+        // (4) rclass.py:340-346 parity: subclassrange_{min,max} assigned
+        // directly on the PyType (OBJECT_VTABLE) struct, not only in
+        // the GC's TypeInfo table. ll_issubclass reads them from the
+        // typeptr without a GC indirection.
+        use pyre_object::pyobject::{BOOL_TYPE, FLOAT_TYPE, INSTANCE_TYPE, INT_TYPE};
+        use std::sync::atomic::Ordering;
+        assert_eq!(
+            INSTANCE_TYPE.subclassrange_min.load(Ordering::Relaxed),
+            object_r.0
+        );
+        assert_eq!(
+            INSTANCE_TYPE.subclassrange_max.load(Ordering::Relaxed),
+            object_r.1
+        );
+        assert_eq!(INT_TYPE.subclassrange_min.load(Ordering::Relaxed), int_r.0);
+        assert_eq!(INT_TYPE.subclassrange_max.load(Ordering::Relaxed), int_r.1);
+        assert_eq!(
+            BOOL_TYPE.subclassrange_min.load(Ordering::Relaxed),
+            bool_r.0
+        );
+        assert_eq!(
+            BOOL_TYPE.subclassrange_max.load(Ordering::Relaxed),
+            bool_r.1
+        );
+        assert_eq!(
+            FLOAT_TYPE.subclassrange_min.load(Ordering::Relaxed),
+            float_r.0
+        );
+        assert_eq!(
+            FLOAT_TYPE.subclassrange_max.load(Ordering::Relaxed),
+            float_r.1
+        );
+
+        // (5) ll_issubclass direct PyType reads match GC callback.
+        assert!(pyre_object::pyobject::ll_issubclass(&BOOL_TYPE, &INT_TYPE));
+        assert!(pyre_object::pyobject::ll_issubclass(
+            &INT_TYPE,
+            &INSTANCE_TYPE
+        ));
+        assert!(!pyre_object::pyobject::ll_issubclass(
+            &INT_TYPE,
+            &FLOAT_TYPE
+        ));
+        assert!(!pyre_object::pyobject::ll_issubclass(
+            &FLOAT_TYPE,
+            &INT_TYPE
+        ));
     }
 
     #[test]
