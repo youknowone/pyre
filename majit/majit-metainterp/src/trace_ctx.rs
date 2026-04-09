@@ -394,9 +394,8 @@ impl TraceCtx {
         }
     }
 
-    /// Apply all pending replacements to the trace ops.
-    ///
-    /// pyjitpl.py:3499-3512 `MetaInterp.replace_box(oldbox, newbox)`
+    /// pyjitpl.py:3499-3512 `MetaInterp.replace_box(oldbox, newbox)` —
+    /// trace-context portion.
     ///
     ///     def replace_box(self, oldbox, newbox):
     ///         for frame in self.framestack:
@@ -413,14 +412,52 @@ impl TraceCtx {
     ///                     boxes[i] = newbox
     ///         self.heapcache.replace_box(oldbox, newbox)
     ///
-    /// RPython eagerly rewrites (a) the framestack's active boxes, (b)
-    /// `virtualref_boxes`, (c) `virtualizable_boxes`, and (d) the heap
-    /// cache. pyre defers trace-level rewrites (the framestack references
-    /// and the trace op args) into a batch via `replace_op` and flushes
-    /// them here. The side-channel walks (`virtualizable_boxes` and
-    /// `heap_cache.replace_box`) must still be applied per replacement
-    /// so that subsequent heapcache / standard-vable queries observe the
-    /// new OpRef identities.
+    /// pyre splits `MetaInterp.replace_box` across two layers:
+    ///
+    ///   * `TraceCtx::replace_box` (this method) handles the eager
+    ///     virtualizable_boxes + heap_cache walks AND queues the
+    ///     deferred recorder rewrite via `replace_op`. This is what
+    ///     `is_nonstandard_virtualizable` Step 4 calls because the
+    ///     framestack walk is not reachable from inside TraceCtx.
+    ///
+    ///   * `MetaInterp::replace_box` (in pyjitpl.rs) is a thin
+    ///     wrapper that adds the `virtualref_boxes` walk on top of
+    ///     this TraceCtx call. It is the structural mirror of the
+    ///     full RPython entry point.
+    ///
+    /// The framestack walk
+    /// (`for frame in self.framestack: frame.replace_active_box_in_frame(...)`)
+    /// is missing because pyre's frame state lives in PyreSym
+    /// (in pyre-jit-trace) and is not reachable from MetaInterp.
+    /// The deferred recorder rewrite (queued via `replace_op` and
+    /// flushed in `apply_replacements`) substitutes for the
+    /// per-frame walk by rewriting all already-emitted op args
+    /// once at trace finalization.
+    pub fn replace_box(&mut self, oldbox: OpRef, newbox: OpRef) {
+        // pyjitpl.py:3506-3511 virtualizable_boxes walk.
+        if let Some(boxes) = self.virtualizable_boxes.as_mut() {
+            for slot in boxes.iter_mut() {
+                if *slot == oldbox {
+                    *slot = newbox;
+                }
+            }
+        }
+        // pyjitpl.py:3512 self.heapcache.replace_box(oldbox, newbox).
+        self.heap_cache.replace_box(oldbox, newbox);
+        // Queue the deferred recorder rewrite (pyre-only — RPython's
+        // framestack walk has no equivalent in pyre's MetaInterp;
+        // the queued rewrite is applied at finalization in
+        // `apply_replacements`).
+        self.replace_op(oldbox, newbox);
+    }
+
+    /// Apply all pending replacements to the trace ops.
+    ///
+    /// Flushes the `replace_op` queue: for each `(old, new)` pair,
+    /// re-runs the eager walks (so duplicates from optimizer-level
+    /// `replace_op` calls that did NOT go through `TraceCtx::replace_box`
+    /// also see the heapcache / virtualizable_boxes update) and rewrites
+    /// the recorder's op args + fail_args.
     pub fn apply_replacements(&mut self) {
         if self.replacements.is_empty() {
             return;
@@ -434,7 +471,7 @@ impl TraceCtx {
                 eprintln!("  {:?} → {:?}", old, new);
             }
         }
-        // pyjitpl.py:3506-3511 virtualizable_boxes walk.
+        // pyjitpl.py:3506-3511 virtualizable_boxes walk for queued entries.
         for (old, new) in &self.replacements {
             if let Some(boxes) = self.virtualizable_boxes.as_mut() {
                 for slot in boxes.iter_mut() {
@@ -444,11 +481,7 @@ impl TraceCtx {
                 }
             }
         }
-        // pyjitpl.py:3512 self.heapcache.replace_box(oldbox, newbox).
-        // Migrate the per-OpRef tracking state so the user path
-        // `_nonstandard_virtualizable` (and every other heapcache query)
-        // sees the new OpRef's state after replacement, instead of
-        // starting over on a freshly blank slot.
+        // pyjitpl.py:3512 heapcache walk for queued entries.
         for (old, new) in &self.replacements {
             self.heap_cache.replace_box(*old, *new);
         }
@@ -1130,15 +1163,13 @@ impl TraceCtx {
         #[allow(unreachable_code)]
         if isstandard != 0 {
             // box.type == 'r' (virtualizables are Ref).
-            // pyjitpl.py:3499-3512 `MetaInterp.replace_box(box, standard_box)`:
-            // walks virtualref_boxes / virtualizable_boxes / heapcache and
-            // queues the recorder rewrite. The virtualref_boxes walk lives
-            // on `MetaInterp` (pyjitpl.rs:512) and is therefore a no-op
-            // here; the in-flight trace can still queue the recorder
-            // rewrite via `replace_op`.
-            self.replace_box_in_virtualizable_boxes(vable_opref, standard_box);
-            self.heap_cache.replace_box(vable_opref, standard_box);
-            self.replace_op(vable_opref, standard_box);
+            // pyjitpl.py:1141 `self.metainterp.replace_box(box, standard_box)`.
+            // The trace_ctx-side replace_box runs the
+            // virtualizable_boxes / heap_cache walks AND queues the
+            // recorder rewrite. The framestack / virtualref_boxes walk
+            // lives on `MetaInterp::replace_box` (pyjitpl.rs); both
+            // share this single helper for the trace-context portion.
+            self.replace_box(vable_opref, standard_box);
             return false;
         }
         // Step 5a: emit_force_virtualizable.

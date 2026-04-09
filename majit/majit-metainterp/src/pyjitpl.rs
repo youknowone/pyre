@@ -1433,10 +1433,12 @@ impl<M: Clone> MetaInterp<M> {
         //                          frame.replace_active_box_in_frame(...)
         //
         // pyre defers the per-frame symbolic register rewrite into the
-        // recorder via `TraceCtx::replace_op` (the queue is flushed at
-        // trace finalization in `apply_replacements`). The jitcode
-        // machine's PyreSym frames are not reachable from MetaInterp
-        // and are kept consistent by the deferred recorder pass.
+        // recorder via `TraceCtx::replace_op` (queued by
+        // `TraceCtx::replace_box` below). The jitcode machine's PyreSym
+        // frames are not reachable from MetaInterp; the deferred
+        // recorder pass at trace finalization rewrites all already-emitted
+        // op args + fail_args, which substitutes for the eager per-frame
+        // walk RPython performs here.
         //
         // pyjitpl.py:3502-3505: virtualref_boxes walk
         for slot in self.virtualref_boxes.iter_mut() {
@@ -1445,14 +1447,18 @@ impl<M: Clone> MetaInterp<M> {
             }
         }
         if let Some(ctx) = self.tracing.as_mut() {
-            // pyjitpl.py:3506-3511: virtualizable_boxes walk
-            ctx.replace_box_in_virtualizable_boxes(oldbox, newbox);
-            // pyjitpl.py:3512: self.heapcache.replace_box(oldbox, newbox)
-            ctx.heap_cache_mut().replace_box(oldbox, newbox);
-            // Queue the deferred recorder rewrite (pyre-only — RPython's
-            // frame.replace_active_box_in_frame is the eager equivalent;
-            // pyre flushes via TraceCtx::apply_replacements at finalization).
-            ctx.replace_op(oldbox, newbox);
+            // pyjitpl.py:3506-3512:
+            //     boxes = self.virtualizable_boxes
+            //     for i in range(len(boxes)):
+            //         if boxes[i] is oldbox:
+            //             boxes[i] = newbox
+            //     self.heapcache.replace_box(oldbox, newbox)
+            //
+            // The trace-context portion (virtualizable_boxes walk +
+            // heap_cache walk + deferred recorder rewrite) lives on
+            // `TraceCtx::replace_box` so the trace_ctx-only call site in
+            // `_nonstandard_virtualizable` Step 4 shares the same helper.
+            ctx.replace_box(oldbox, newbox);
         }
     }
 
