@@ -1499,9 +1499,13 @@ where
                 else {
                     return TraceAction::Abort;
                 };
-                let (index, _) = self.read_int_reg(index_reg);
-                let result =
-                    ctx.vable_getarrayitem_int_indexed(vable_opref, index, array_field_offset);
+                let (index, index_value) = self.read_int_reg(index_reg);
+                let result = ctx.vable_getarrayitem_int_indexed(
+                    vable_opref,
+                    index,
+                    index_value,
+                    array_field_offset,
+                );
                 self.set_int_reg(dest, Some(result), Some(0));
             }
             BC_GETARRAYITEM_VABLE_R => {
@@ -1513,9 +1517,13 @@ where
                 else {
                     return TraceAction::Abort;
                 };
-                let (index, _) = self.read_int_reg(index_reg);
-                let result =
-                    ctx.vable_getarrayitem_ref_indexed(vable_opref, index, array_field_offset);
+                let (index, index_value) = self.read_int_reg(index_reg);
+                let result = ctx.vable_getarrayitem_ref_indexed(
+                    vable_opref,
+                    index,
+                    index_value,
+                    array_field_offset,
+                );
                 self.set_ref_reg(dest, Some(result), Some(0));
             }
             BC_GETARRAYITEM_VABLE_F => {
@@ -1527,9 +1535,13 @@ where
                 else {
                     return TraceAction::Abort;
                 };
-                let (index, _) = self.read_int_reg(index_reg);
-                let result =
-                    ctx.vable_getarrayitem_float_indexed(vable_opref, index, array_field_offset);
+                let (index, index_value) = self.read_int_reg(index_reg);
+                let result = ctx.vable_getarrayitem_float_indexed(
+                    vable_opref,
+                    index,
+                    index_value,
+                    array_field_offset,
+                );
                 self.set_float_reg(dest, Some(result), Some(0));
             }
             BC_SETARRAYITEM_VABLE_I => {
@@ -1541,9 +1553,15 @@ where
                 else {
                     return TraceAction::Abort;
                 };
-                let (index, _) = self.read_int_reg(index_reg);
+                let (index, index_value) = self.read_int_reg(index_reg);
                 let (value, _) = self.read_int_reg(src);
-                ctx.vable_setarrayitem_indexed(vable_opref, index, array_field_offset, value);
+                ctx.vable_setarrayitem_indexed(
+                    vable_opref,
+                    index,
+                    index_value,
+                    array_field_offset,
+                    value,
+                );
             }
             BC_SETARRAYITEM_VABLE_R => {
                 let array_idx = self.frames.current_mut().next_u16() as usize;
@@ -1554,9 +1572,15 @@ where
                 else {
                     return TraceAction::Abort;
                 };
-                let (index, _) = self.read_int_reg(index_reg);
+                let (index, index_value) = self.read_int_reg(index_reg);
                 let (value, _) = self.read_ref_reg(src);
-                ctx.vable_setarrayitem_indexed(vable_opref, index, array_field_offset, value);
+                ctx.vable_setarrayitem_indexed(
+                    vable_opref,
+                    index,
+                    index_value,
+                    array_field_offset,
+                    value,
+                );
             }
             BC_SETARRAYITEM_VABLE_F => {
                 let array_idx = self.frames.current_mut().next_u16() as usize;
@@ -1567,9 +1591,15 @@ where
                 else {
                     return TraceAction::Abort;
                 };
-                let (index, _) = self.read_int_reg(index_reg);
+                let (index, index_value) = self.read_int_reg(index_reg);
                 let (value, _) = self.read_float_reg(src);
-                ctx.vable_setarrayitem_indexed(vable_opref, index, array_field_offset, value);
+                ctx.vable_setarrayitem_indexed(
+                    vable_opref,
+                    index,
+                    index_value,
+                    array_field_offset,
+                    value,
+                );
             }
             BC_ARRAYLEN_VABLE => {
                 let array_idx = self.frames.current_mut().next_u16() as usize;

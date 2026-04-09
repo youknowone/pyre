@@ -2489,63 +2489,96 @@ impl<S: JitState> JitDriver<S> {
         &mut self,
         vable_opref: OpRef,
         index: OpRef,
+        index_runtime_value: i64,
         array_field_offset: usize,
     ) -> OpRef {
-        self.meta
-            .opimpl_getarrayitem_vable_int(vable_opref, index, array_field_offset)
+        self.meta.opimpl_getarrayitem_vable_int(
+            vable_opref,
+            index,
+            index_runtime_value,
+            array_field_offset,
+        )
     }
 
     pub fn opimpl_getarrayitem_vable_ref(
         &mut self,
         vable_opref: OpRef,
         index: OpRef,
+        index_runtime_value: i64,
         array_field_offset: usize,
     ) -> OpRef {
-        self.meta
-            .opimpl_getarrayitem_vable_ref(vable_opref, index, array_field_offset)
+        self.meta.opimpl_getarrayitem_vable_ref(
+            vable_opref,
+            index,
+            index_runtime_value,
+            array_field_offset,
+        )
     }
 
     pub fn opimpl_getarrayitem_vable_float(
         &mut self,
         vable_opref: OpRef,
         index: OpRef,
+        index_runtime_value: i64,
         array_field_offset: usize,
     ) -> OpRef {
-        self.meta
-            .opimpl_getarrayitem_vable_float(vable_opref, index, array_field_offset)
+        self.meta.opimpl_getarrayitem_vable_float(
+            vable_opref,
+            index,
+            index_runtime_value,
+            array_field_offset,
+        )
     }
 
     pub fn opimpl_setarrayitem_vable_int(
         &mut self,
         vable_opref: OpRef,
         index: OpRef,
+        index_runtime_value: i64,
         value: OpRef,
         array_field_offset: usize,
     ) {
-        self.meta
-            .opimpl_setarrayitem_vable_int(vable_opref, index, value, array_field_offset);
+        self.meta.opimpl_setarrayitem_vable_int(
+            vable_opref,
+            index,
+            index_runtime_value,
+            value,
+            array_field_offset,
+        );
     }
 
     pub fn opimpl_setarrayitem_vable_ref(
         &mut self,
         vable_opref: OpRef,
         index: OpRef,
+        index_runtime_value: i64,
         value: OpRef,
         array_field_offset: usize,
     ) {
-        self.meta
-            .opimpl_setarrayitem_vable_ref(vable_opref, index, value, array_field_offset);
+        self.meta.opimpl_setarrayitem_vable_ref(
+            vable_opref,
+            index,
+            index_runtime_value,
+            value,
+            array_field_offset,
+        );
     }
 
     pub fn opimpl_setarrayitem_vable_float(
         &mut self,
         vable_opref: OpRef,
         index: OpRef,
+        index_runtime_value: i64,
         value: OpRef,
         array_field_offset: usize,
     ) {
-        self.meta
-            .opimpl_setarrayitem_vable_float(vable_opref, index, value, array_field_offset);
+        self.meta.opimpl_setarrayitem_vable_float(
+            vable_opref,
+            index,
+            index_runtime_value,
+            value,
+            array_field_offset,
+        );
     }
 
     pub fn opimpl_arraylen_vable(
