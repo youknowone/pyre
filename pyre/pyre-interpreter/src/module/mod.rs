@@ -6,6 +6,7 @@
 pub mod __builtin__;
 pub mod _io;
 pub mod _sre;
+pub mod _weakref;
 pub mod math;
 pub mod operator;
 pub mod sys;

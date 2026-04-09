@@ -2040,7 +2040,19 @@ fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 }
             }
         } else if pyre_object::is_instance(obj) {
-            // Collect ATTR_TABLE entries for this instance.
+            // typeobject.py:1247 type_dir collects names from the instance
+            // dict and the type's MRO. The instance dict for hasdict objects
+            // is the live W_DictObject returned by w_obj.getdict(space).
+            let w_dict = crate::baseobjspace::getdict(obj);
+            if !w_dict.is_null() {
+                for (k, _) in pyre_object::w_dict_items(w_dict) {
+                    if pyre_object::is_str(k) {
+                        names.push(pyre_object::w_str_get_value(k).to_string());
+                    }
+                }
+            }
+            // Plus any legacy ATTR_TABLE entries (slot values stored via Member
+            // descriptors before the live-dict path existed).
             crate::baseobjspace::ATTR_TABLE.with(|table| {
                 if let Some(attrs) = table.borrow().get(&(obj as usize)) {
                     for (name, _) in attrs {

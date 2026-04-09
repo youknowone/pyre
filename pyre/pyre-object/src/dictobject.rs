@@ -247,6 +247,22 @@ pub unsafe fn w_dict_setitem_str(obj: PyObjectRef, key: &str, value: PyObjectRef
     w_dict_store(obj, crate::w_str_new(key), value)
 }
 
+/// Remove an entry by str key. Returns true if the key was found.
+pub unsafe fn w_dict_delitem_str(obj: PyObjectRef, key: &str) -> bool {
+    let dict = &mut *(obj as *mut W_DictObject);
+    let entries = &mut *dict.entries;
+    if let Some(idx) = entries
+        .iter()
+        .position(|(k, _)| crate::is_str(*k) && crate::w_str_get_value(*k) == key)
+    {
+        entries.remove(idx);
+        dict.len -= 1;
+        true
+    } else {
+        false
+    }
+}
+
 /// Get the number of entries.
 pub unsafe fn w_dict_len(obj: PyObjectRef) -> usize {
     (*(obj as *const W_DictObject)).len

@@ -912,11 +912,37 @@ pub fn register_build_class() {
 /// Dispatches to builtins, user functions, and type objects.
 /// Type call uses the same __new__ + __init__ protocol as type_descr_call.
 /// Re-export for crate-external callers that need a frame-less call path.
+///
+/// This wrapper preserves the legacy `PyObjectRef`-returning shape used by
+/// most call sites. Errors are stashed in `PENDING_CALL_ERROR`; callers
+/// recover them via `take_call_error()` after a `PY_NULL` return.
 pub fn call_function_impl_raw(callable: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRef {
-    call_function_impl(callable, args)
+    match call_function_impl_result(callable, args) {
+        Ok(result) => result,
+        Err(e) => {
+            if std::env::var("PYRE_DEBUG_CALL").is_ok() {
+                eprintln!("[call_function_impl] error: {}", e.message);
+            }
+            set_call_error(e);
+            PY_NULL
+        }
+    }
 }
 
 pub(crate) fn call_function_impl(callable: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRef {
+    call_function_impl_raw(callable, args)
+}
+
+/// pypy/interpreter/baseobjspace.py call_function — Result-returning entry
+/// point that mirrors PyPy's OperationError-raising space.call.
+///
+/// This is the canonical call path. `call_function_impl_raw` (legacy)
+/// wraps it for callers that expect a bare `PyObjectRef` and stash the
+/// error in `PENDING_CALL_ERROR` instead.
+pub fn call_function_impl_result(
+    callable: PyObjectRef,
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, PyError> {
     unsafe {
         if pyre_object::is_method(callable) {
             let func = pyre_object::w_method_get_func(callable);
@@ -931,44 +957,53 @@ pub(crate) fn call_function_impl(callable: PyObjectRef, args: &[PyObjectRef]) ->
                 call_args.push(receiver);
             }
             call_args.extend_from_slice(args);
-            return call_function_impl(func, &call_args);
+            return call_function_impl_result(func, &call_args);
         }
         // All callables are Function objects.
         if crate::is_function(callable) {
             let code = crate::getcode(callable);
             if crate::is_builtin_code(code as pyre_object::PyObjectRef) {
-                // Builtin function: direct Rust call
+                // Builtin function: direct Rust call. Errors propagate
+                // naturally through the Result return type — this is the
+                // PyPy/OperationError equivalent.
                 let func = crate::builtin_code_get(code as pyre_object::PyObjectRef);
-                return match func(args) {
-                    Ok(result) => result,
-                    Err(e) => {
-                        if std::env::var("PYRE_DEBUG_CALL").is_ok() {
-                            eprintln!("[call_function_impl] builtin error: {}", e.message);
-                        }
-                        set_call_error(e);
-                        PY_NULL
-                    }
-                };
+                return func(args);
             }
-            // User function: create frame + eval
-            return call_user_function_with_args(callable, args);
+            // User function: create frame + eval. The bare-PyObjectRef
+            // helper stashes any error in `PENDING_CALL_ERROR` and returns
+            // PY_NULL; recover it here so it propagates as a real Result.
+            clear_call_error();
+            let result = call_user_function_with_args(callable, args);
+            if result.is_null() {
+                if let Some(err) = take_call_error() {
+                    return Err(err);
+                }
+            }
+            return Ok(result);
         }
         // Type object → descr_call: __new__ + __init__
         // PyPy: typeobject.py descr_call → lookup __new__, call, then __init__
         if pyre_object::is_type(callable) {
-            return type_descr_call_impl(callable, args);
+            clear_call_error();
+            let result = type_descr_call_impl(callable, args);
+            if result.is_null() {
+                if let Some(err) = take_call_error() {
+                    return Err(err);
+                }
+            }
+            return Ok(result);
         }
         // staticmethod → unwrap and call the wrapped function
         // PyPy: function.py StaticMethod.descr_staticmethod__call__
         if pyre_object::is_staticmethod(callable) {
             let func = pyre_object::w_staticmethod_get_func(callable);
-            return call_function_impl(func, args);
+            return call_function_impl_result(func, args);
         }
         // classmethod → unwrap and call the wrapped function
         // PyPy: function.py ClassMethod.descr_classmethod__call__
         if pyre_object::is_classmethod(callable) {
             let func = pyre_object::w_classmethod_get_func(callable);
-            return call_function_impl(func, args);
+            return call_function_impl_result(func, args);
         }
         // Instance with __call__ — PyPy: descroperation.py
         if pyre_object::is_instance(callable) {
@@ -977,7 +1012,7 @@ pub(crate) fn call_function_impl(callable: PyObjectRef, args: &[PyObjectRef]) ->
                 let mut call_args = Vec::with_capacity(1 + args.len());
                 call_args.push(callable);
                 call_args.extend_from_slice(args);
-                return call_function_impl(call_fn, &call_args);
+                return call_function_impl_result(call_fn, &call_args);
             }
         }
     }
@@ -1766,18 +1801,18 @@ pub unsafe fn create_all_slots(
         (*base_layout).nslots
     };
 
+    // typeobject.py:1150-1204 create_all_slots
+    let mut newslotnames = Vec::new();
+    let (mut wantdict, mut wantweakref);
     if let Some(&w_slots) = ns.get("__slots__") {
         // typeobject.py:1154-1176: has __slots__
-        let mut wantdict = false;
-        let mut wantweakref = false;
-        // Issue 1 fix: propagate validation errors, don't swallow them.
+        wantdict = false;
+        wantweakref = false;
         let all_names = collect_slot_names(w_slots)?;
-        let mut newslotnames = Vec::new();
         for slot_name in &all_names {
             match slot_name.as_str() {
                 // typeobject.py:1165-1169: __dict__ slot
                 "__dict__" => {
-                    // Issue 2 fix: raise TypeError on duplicate.
                     if wantdict || pyre_object::w_type_get_hasdict(w_type) {
                         return Err(crate::PyError::type_error(
                             "__dict__ slot disallowed: we already got one".to_string(),
@@ -1801,23 +1836,25 @@ pub unsafe fn create_all_slots(
         // typeobject.py:1178: string_sort(newslotnames)
         newslotnames.sort();
 
-        // typeobject.py:1183-1189 create_slot: add slot to class dict if
-        // typeobject.py:1183-1189 create_slot: add Member descriptor to
-        // class dict for each slot. Skip if name already exists in dict.
+        // typeobject.py:1183-1189: create_slot loop
         let type_ns = pyre_object::w_type_get_dict_ptr(w_type) as *mut crate::PyNamespace;
         let type_name = pyre_object::w_type_get_name(w_type);
         let mut slot_index = base_nslots;
         let mut i = 0;
         while i < newslotnames.len() {
+            // typeobject.py:1208-1209: valid_slot_name check
+            if !valid_slot_name(&newslotnames[i]) {
+                return Err(crate::PyError::type_error(
+                    "__slots__ must be identifiers".to_string(),
+                ));
+            }
             // typeobject.py:1211: slot_name = mangle(slot_name, w_self.name)
             let mangled = mangle(&newslotnames[i], type_name);
             if !type_ns.is_null() && (*type_ns).get(mangled.as_str()).is_some() {
-                // typeobject.py:1212: name conflict → skip this slot
+                // typeobject.py:1219-1220: name conflict → skip this slot
                 newslotnames.remove(i);
             } else {
-                // typeobject.py:1216-1217 create_slot:
-                //   member = Member(index_next_extra_slot, slot_name, w_self)
-                //   w_self.dict_w[slot_name] = member
+                // typeobject.py:1216-1217: create_slot
                 newslotnames[i] = mangled.clone();
                 if !type_ns.is_null() {
                     let member = pyre_object::w_member_new(slot_index, mangled.clone(), w_type);
@@ -1827,65 +1864,81 @@ pub unsafe fn create_all_slots(
                 i += 1;
             }
         }
-
-        // typeobject.py:1191-1195: set hasdict/weakrefable
-        if wantdict {
-            pyre_object::w_type_set_hasdict(w_type, true);
-        }
-        if wantweakref {
-            pyre_object::w_type_set_weakrefable(w_type, true);
-        }
-
-        // typeobject.py:1196-1197: __del__ → hasuserdel (noted, no field yet)
-
-        let nslots = base_nslots + newslotnames.len() as u32;
-
-        // typeobject.py:1200-1204: reuse base_layout if no new slots added
-        let typedef = if base_layout.is_null() {
-            &pyre_object::pyobject::INSTANCE_TYPE as *const _
-        } else {
-            (*base_layout).typedef
-        };
-        let layout = if newslotnames.is_empty() && !base_layout.is_null() {
-            base_layout
-        } else {
-            leak_layout(Layout {
-                typedef,
-                nslots,
-                newslotnames,
-                base_layout,
-                // User-defined classes always have __new__ (inherited from object).
-                acceptable_as_base_class: true,
-            })
-        };
-        pyre_object::w_type_set_layout(w_type, layout);
     } else {
-        // typeobject.py:1151-1153: no __slots__ → wantdict=True, wantweakref=True
-        pyre_object::w_type_set_hasdict(w_type, true);
-        pyre_object::w_type_set_weakrefable(w_type, true);
-        set_default_layout(w_type, base_layout);
+        // typeobject.py:1151-1153: no __slots__
+        wantdict = true;
+        wantweakref = true;
     }
-    Ok(())
-}
 
-/// Set default layout (reuse base or create root).
-unsafe fn set_default_layout(
-    w_type: pyre_object::PyObjectRef,
-    base_layout: *const pyre_object::typeobject::Layout,
-) {
-    use pyre_object::typeobject::{Layout, leak_layout};
-    let layout = if !base_layout.is_null() {
+    // typeobject.py:1192-1195: create_dict_slot / create_weakref_slot
+    if wantdict {
+        create_dict_slot(w_type);
+    }
+    if wantweakref {
+        create_weakref_slot(w_type);
+    }
+
+    // typeobject.py:1199-1204: layout computation
+    let nslots = base_nslots + newslotnames.len() as u32;
+    let typedef = if base_layout.is_null() {
+        &pyre_object::pyobject::INSTANCE_TYPE as *const _
+    } else {
+        (*base_layout).typedef
+    };
+    let layout = if nslots == base_nslots && !base_layout.is_null() {
         base_layout
     } else {
         leak_layout(Layout {
-            typedef: &pyre_object::pyobject::INSTANCE_TYPE as *const _,
-            nslots: 0,
-            newslotnames: vec![],
-            base_layout: std::ptr::null(),
+            typedef,
+            nslots,
+            newslotnames,
+            base_layout,
             acceptable_as_base_class: true,
         })
     };
     pyre_object::w_type_set_layout(w_type, layout);
+    Ok(())
+}
+
+/// objspace/std/typeobject.py:1222-1226 create_dict_slot.
+///
+/// ```python
+/// def create_dict_slot(w_self):
+///     if not w_self.hasdict:
+///         w_self.dict_w.setdefault('__dict__',
+///             dict_descr.copy_for_type(w_self))
+///         w_self.hasdict = True
+/// ```
+unsafe fn create_dict_slot(w_type: pyre_object::PyObjectRef) {
+    if !pyre_object::w_type_get_hasdict(w_type) {
+        let descr = crate::typedef::copy_descriptor_for_type(crate::typedef::dict_descr(), w_type);
+        let type_ns = pyre_object::w_type_get_dict_ptr(w_type) as *mut crate::PyNamespace;
+        if !type_ns.is_null() && (*type_ns).get("__dict__").is_none() {
+            (*type_ns).insert("__dict__".to_string(), descr);
+        }
+        pyre_object::w_type_set_hasdict(w_type, true);
+    }
+}
+
+/// objspace/std/typeobject.py:1228-1232 create_weakref_slot.
+///
+/// ```python
+/// def create_weakref_slot(w_self):
+///     if not w_self.weakrefable:
+///         w_self.dict_w.setdefault('__weakref__',
+///             weakref_descr.copy_for_type(w_self))
+///         w_self.weakrefable = True
+/// ```
+unsafe fn create_weakref_slot(w_type: pyre_object::PyObjectRef) {
+    if !pyre_object::w_type_get_weakrefable(w_type) {
+        let descr =
+            crate::typedef::copy_descriptor_for_type(crate::typedef::weakref_descr(), w_type);
+        let type_ns = pyre_object::w_type_get_dict_ptr(w_type) as *mut crate::PyNamespace;
+        if !type_ns.is_null() && (*type_ns).get("__weakref__").is_none() {
+            (*type_ns).insert("__weakref__".to_string(), descr);
+        }
+        pyre_object::w_type_set_weakrefable(w_type, true);
+    }
 }
 
 /// typeobject.py:1089-1105 find_best_base.

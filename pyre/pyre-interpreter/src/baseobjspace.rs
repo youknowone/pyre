@@ -2181,11 +2181,11 @@ pub fn len(obj: PyObjectRef) -> PyResult {
                 pyre_object::bytearrayobject::w_bytearray_len(obj) as i64,
             ))
         } else if is_instance(obj) {
-            // Instance __len__ — PyPy: descroperation.py len
+            // Instance __len__ — descroperation.py len → space.lookup(obj, '__len__')
             if let Some(method) = lookup_in_type_where(w_instance_get_type(obj), "__len__") {
                 return Ok(crate::call_function(method, &[obj]));
             }
-            // Also check per-instance attributes (ATTR_TABLE)
+            // Per-instance __len__ via the unified getattr path (live dict + ATTR_TABLE).
             if let Ok(method) = getattr(obj, "__len__") {
                 return Ok(crate::call_function(method, &[obj]));
             }
@@ -2211,6 +2211,126 @@ thread_local! {
     /// the repr(C) layout of existing object types.
     pub static ATTR_TABLE: RefCell<HashMap<usize, HashMap<String, PyObjectRef>>> =
         RefCell::new(HashMap::new());
+}
+
+// `INSTANCE_DICT` and `WEAKREF_TABLE` live in `objspace/std/mapdict.rs`,
+// mirroring PyPy's `MapdictDictSupport` and `MapdictWeakrefSupport`.
+
+/// interpreter/baseobjspace.py:43-44 W_Root.getdict(space).
+///
+/// ```python
+/// def getdict(self, space):
+///     return None
+/// ```
+///
+/// objspace/std/mapdict.py:817-818 MapdictDictSupport.getdict overrides
+/// it to call `_obj_getdict`. pyre dispatches at runtime via the type's
+/// hasdict flag because Rust has no per-class virtual table.
+pub fn getdict(obj: PyObjectRef) -> PyObjectRef {
+    let w_type = match crate::typedef::r#type(obj) {
+        Some(tp) => tp,
+        None => return pyre_object::PY_NULL,
+    };
+    if unsafe { pyre_object::w_type_get_hasdict(w_type) } {
+        crate::objspace::std::mapdict::_obj_getdict(obj)
+    } else {
+        // W_Root.getdict default — return None
+        pyre_object::PY_NULL
+    }
+}
+
+/// interpreter/baseobjspace.py:70-73 W_Root.setdict(space, w_dict).
+///
+/// ```python
+/// def setdict(self, space, w_dict):
+///     raise oefmt(space.w_TypeError,
+///                  "attribute '__dict__' of %T objects is not writable",
+///                  self)
+/// ```
+///
+/// objspace/std/mapdict.py:820-821 MapdictDictSupport.setdict overrides
+/// it to call `_obj_setdict`.
+pub fn setdict(obj: PyObjectRef, w_dict: PyObjectRef) -> Result<(), PyError> {
+    let w_type = match crate::typedef::r#type(obj) {
+        Some(tp) => tp,
+        None => {
+            return Err(PyError::type_error(
+                "attribute '__dict__' of object is not writable".to_string(),
+            ));
+        }
+    };
+    if unsafe { pyre_object::w_type_get_hasdict(w_type) } {
+        crate::objspace::std::mapdict::_obj_setdict(obj, w_dict)
+    } else {
+        let tp_name = unsafe { pyre_object::w_type_get_name(w_type) };
+        Err(PyError::type_error(format!(
+            "attribute '__dict__' of '{}' objects is not writable",
+            tp_name,
+        )))
+    }
+}
+
+/// interpreter/baseobjspace.py:142-143 W_Root.getweakref().
+///
+/// ```python
+/// def getweakref(self):
+///     return None
+/// ```
+///
+/// MapdictWeakrefSupport.getweakref overrides it.
+pub fn getweakref(obj: PyObjectRef) -> Option<PyObjectRef> {
+    let w_type = crate::typedef::r#type(obj)?;
+    if unsafe { pyre_object::w_type_get_weakrefable(w_type) } {
+        crate::objspace::std::mapdict::getweakref(obj)
+    } else {
+        None
+    }
+}
+
+/// interpreter/baseobjspace.py:145-147 W_Root.setweakref(space, weakreflifeline).
+///
+/// ```python
+/// def setweakref(self, space, weakreflifeline):
+///     raise oefmt(space.w_TypeError,
+///                  "cannot create weak reference to '%T' object", self)
+/// ```
+///
+/// MapdictWeakrefSupport.setweakref overrides it.
+pub fn setweakref(obj: PyObjectRef, weakreflifeline: PyObjectRef) -> Result<(), PyError> {
+    let w_type = match crate::typedef::r#type(obj) {
+        Some(tp) => tp,
+        None => {
+            return Err(PyError::type_error(
+                "cannot create weak reference to object".to_string(),
+            ));
+        }
+    };
+    if unsafe { pyre_object::w_type_get_weakrefable(w_type) } {
+        crate::objspace::std::mapdict::setweakref(obj, weakreflifeline);
+        Ok(())
+    } else {
+        let tp_name = unsafe { pyre_object::w_type_get_name(w_type) };
+        Err(PyError::type_error(format!(
+            "cannot create weak reference to '{}' object",
+            tp_name,
+        )))
+    }
+}
+
+/// interpreter/baseobjspace.py:149-150 W_Root.delweakref().
+///
+/// ```python
+/// def delweakref(self):
+///     pass
+/// ```
+pub fn delweakref(obj: PyObjectRef) {
+    let w_type = match crate::typedef::r#type(obj) {
+        Some(tp) => tp,
+        None => return,
+    };
+    if unsafe { pyre_object::w_type_get_weakrefable(w_type) } {
+        crate::objspace::std::mapdict::delweakref(obj);
+    }
 }
 
 fn namespace_to_dict(ns_ptr: *const crate::PyNamespace) -> PyObjectRef {
@@ -2323,6 +2443,19 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
         }
     }
 
+    // Member descriptor attributes — typedef.py:443 Member.__name__, __objclass__
+    unsafe {
+        if pyre_object::memberobject::is_member(obj) {
+            match name {
+                "__name__" => {
+                    return Ok(pyre_object::w_str_new(pyre_object::w_member_get_name(obj)));
+                }
+                "__objclass__" => return Ok(pyre_object::w_member_get_cls(obj)),
+                _ => {}
+            }
+        }
+    }
+
     // Module objects: look up in module namespace
     // PyPy: space.getattr(w_module, w_name) → Module.getdictvalue(space, name)
     unsafe {
@@ -2368,7 +2501,16 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
                 }
             }
 
-            // Step 3: instance dict (ATTR_TABLE)
+            // Step 3: instance dict
+            // First check the Python dict (INSTANCE_DICT) for live-view semantics,
+            // then ATTR_TABLE for slot values and legacy attributes.
+            let w_dict = getdict(obj);
+            if !w_dict.is_null() {
+                if let Some(value) = unsafe { pyre_object::w_dict_getitem_str(w_dict, name) } {
+                    return Ok(value);
+                }
+            }
+            // Fallback: ATTR_TABLE (slot values via Member descriptor side-store)
             let found = ATTR_TABLE.with(|table| {
                 let table = table.borrow();
                 table
@@ -2587,8 +2729,15 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
     }
 
     // Function object attributes — PyPy: funcobject.py W_Function
-    // Check ATTR_TABLE first (for dynamically set attrs like __name__, __doc__)
+    // Check the live W_DictObject (functions are hasdict per typedef.py:735
+    // __dict__ = getset_func_dict) before falling through to legacy ATTR_TABLE.
     if unsafe { crate::is_function(obj) } {
+        let w_dict = getdict(obj);
+        if !w_dict.is_null() {
+            if let Some(v) = unsafe { pyre_object::w_dict_getitem_str(w_dict, name) } {
+                return Ok(v);
+            }
+        }
         let found = ATTR_TABLE.with(|table| {
             table
                 .borrow()
@@ -2741,17 +2890,13 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
             _ => {}
         }
     }
+    // __dict__: use getdict() — only returns a dict for hasdict objects,
+    // matching PyPy's descriptor-based __dict__ control.
     if name == "__dict__" {
-        let d = pyre_object::w_dict_new();
-        ATTR_TABLE.with(|table| {
-            let table = table.borrow();
-            if let Some(attrs) = table.get(&(obj as usize)) {
-                for (k, &v) in attrs {
-                    unsafe { pyre_object::w_dict_store(d, pyre_object::w_str_new(k), v) };
-                }
-            }
-        });
-        return Ok(d);
+        let w_dict = getdict(obj);
+        if !w_dict.is_null() {
+            return Ok(w_dict);
+        }
     }
     // __class__: read directly from w_class field (the single source of truth).
     // objectobject.py:133-134 descr_get___class__ → space.type(w_obj)
@@ -2994,7 +3139,7 @@ unsafe fn compute_mro(w_type: PyObjectRef) -> Vec<PyObjectRef> {
 /// and type dict for these names.
 /// baseobjspace.py isinstance_w: check if w_obj is instance of w_cls
 /// by walking the MRO of type(w_obj) and comparing with w_cls.
-unsafe fn isinstance_w(w_obj: PyObjectRef, w_cls: PyObjectRef) -> bool {
+pub unsafe fn isinstance_w(w_obj: PyObjectRef, w_cls: PyObjectRef) -> bool {
     let w_obj_type = if is_instance(w_obj) {
         w_instance_get_type(w_obj)
     } else {
@@ -3016,6 +3161,83 @@ unsafe fn isinstance_w(w_obj: PyObjectRef, w_cls: PyObjectRef) -> bool {
         }
     }
     false
+}
+
+/// pypy/interpreter/baseobjspace.py:419-420 DescrMismatch.
+///
+/// Construct a DescrMismatch error. Used internally by
+/// `descr_self_interp_w`; caught by GetSetProperty.descr_property_get/set/del
+/// which then call `descr_call_mismatch` to raise the user-visible TypeError.
+#[inline]
+pub fn descr_mismatch_error() -> PyError {
+    PyError::new(PyErrorKind::DescrMismatch, String::new())
+}
+
+/// pypy/interpreter/baseobjspace.py:929-933 ObjSpace.descr_self_interp_w.
+///
+/// ```python
+/// @specialize.arg(1)
+/// def descr_self_interp_w(self, RequiredClass, w_obj):
+///     if not isinstance(w_obj, RequiredClass):
+///         raise DescrMismatch()
+///     return w_obj
+/// ```
+pub fn descr_self_interp_w(
+    required_class: PyObjectRef,
+    w_obj: PyObjectRef,
+) -> Result<PyObjectRef, PyError> {
+    if required_class.is_null() {
+        return Ok(w_obj);
+    }
+    if w_obj.is_null() {
+        return Err(descr_mismatch_error());
+    }
+    if !unsafe { isinstance_w(w_obj, required_class) } {
+        return Err(descr_mismatch_error());
+    }
+    Ok(w_obj)
+}
+
+/// pypy/interpreter/baseobjspace.py:132-138 W_Root.descr_call_mismatch.
+///
+/// ```python
+/// def descr_call_mismatch(self, space, opname, RequiredClass, args):
+///     if RequiredClass is None:
+///         classname = '?'
+///     else:
+///         classname = wrappable_class_name(RequiredClass)
+///     raise oefmt(space.w_TypeError,
+///                 "'%s' object expected, got '%T' instead", classname, self)
+/// ```
+///
+/// `_opname` is preserved for parity with PyPy's signature even though the
+/// error message ignores it (PyPy raises the same TypeError regardless of
+/// whether the mismatch came through __getattribute__/__setattr__/__delattr__).
+pub fn descr_call_mismatch(
+    w_obj: PyObjectRef,
+    _opname: &str,
+    required_class: PyObjectRef,
+) -> PyError {
+    let classname: String = if required_class.is_null() {
+        "?".to_string()
+    } else {
+        unsafe { pyre_object::w_type_get_name(required_class).to_string() }
+    };
+    // PyPy `'%T' % obj` formats space.type(obj).getname(space) — the
+    // user-visible class name from `w_obj.w_class`, not the underlying
+    // ob_type tag. Pyre's `crate::typedef::r#type` walks the same chain.
+    let obj_typename: String = if w_obj.is_null() {
+        "NoneType".to_string()
+    } else {
+        match crate::typedef::r#type(w_obj) {
+            Some(tp) => unsafe { pyre_object::w_type_get_name(tp).to_string() },
+            None => unsafe { (*(*w_obj).ob_type).name.to_string() },
+        }
+    };
+    PyError::type_error(format!(
+        "'{}' object expected, got '{}' instead",
+        classname, obj_typename
+    ))
 }
 
 unsafe fn is_data_descr(descr: PyObjectRef) -> bool {
@@ -3151,7 +3373,8 @@ unsafe fn get(
     if let Some(descr_type) = crate::typedef::r#type(descr) {
         if let Some(get_fn) = lookup_in_type_where(descr_type, "__get__") {
             if !get_fn.is_null() {
-                return Ok(Some(crate::call_function(get_fn, &[descr, obj, w_type])));
+                let result = crate::call::call_function_impl_result(get_fn, &[descr, obj, w_type])?;
+                return Ok(Some(result));
             }
         }
     }
@@ -3212,12 +3435,72 @@ unsafe fn set(
         let descr_type = w_instance_get_type(descr);
         if let Some(set_fn) = lookup_in_type_where(descr_type, "__set__") {
             if !set_fn.is_null() {
-                crate::call_function(set_fn, &[obj, value]);
+                crate::call::call_function_impl_result(set_fn, &[descr, obj, value])?;
                 return Ok(true);
             }
         }
     }
     Ok(false)
+}
+
+/// Call a descriptor's __delete__ method.
+///
+/// descroperation.py `space.delete(w_descr, w_obj)`
+unsafe fn delete(descr: PyObjectRef, obj: PyObjectRef) -> Result<(), crate::PyError> {
+    // property: call fdel(obj)
+    if is_property(descr) {
+        let fdel = w_property_get_fdel(descr);
+        if fdel.is_null() || is_none(fdel) {
+            return Err(crate::PyError::new(
+                crate::PyErrorKind::AttributeError,
+                "cannot delete attribute".to_string(),
+            ));
+        }
+        crate::call_function(fdel, &[obj]);
+        return Ok(());
+    }
+    // typedef.py:483-490 Member.descr_member_del
+    if pyre_object::is_member(descr) {
+        let w_cls = pyre_object::w_member_get_cls(descr);
+        if !w_cls.is_null() && is_type(w_cls) && !isinstance_w(obj, w_cls) {
+            let slot_name = pyre_object::w_member_get_name(descr);
+            return Err(crate::PyError::type_error(format!(
+                "descriptor '{}' for '{}' objects doesn't apply to '{}' object",
+                slot_name,
+                pyre_object::w_type_get_name(w_cls),
+                (*(*obj).ob_type).name,
+            )));
+        }
+        let slot_name = pyre_object::w_member_get_name(descr);
+        let removed = ATTR_TABLE.with(|table| {
+            let mut table = table.borrow_mut();
+            table
+                .get_mut(&(obj as usize))
+                .and_then(|d| d.remove(slot_name))
+                .is_some()
+        });
+        if !removed {
+            return Err(crate::PyError::new(
+                crate::PyErrorKind::AttributeError,
+                slot_name.to_string(),
+            ));
+        }
+        return Ok(());
+    }
+    // General __delete__: look up on descriptor's type MRO
+    if is_instance(descr) {
+        let descr_type = w_instance_get_type(descr);
+        if let Some(del_fn) = lookup_in_type_where(descr_type, "__delete__") {
+            if !del_fn.is_null() {
+                crate::call_function(del_fn, &[descr, obj]);
+                return Ok(());
+            }
+        }
+    }
+    Err(crate::PyError::new(
+        crate::PyErrorKind::AttributeError,
+        "cannot delete attribute".to_string(),
+    ))
 }
 
 /// Set an attribute on an object: `obj.name = value`.
@@ -3316,16 +3599,71 @@ pub fn setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult {
     if name == "__class__" {
         return descr_set___class__(obj, value);
     }
-    // Store in instance dict (ATTR_TABLE)
-    ATTR_TABLE.with(|table| {
-        let mut table = table.borrow_mut();
-        let key = obj as usize;
-        table
-            .entry(key)
-            .or_default()
-            .insert(name.to_string(), value);
-    });
-    Ok(w_none())
+    // descroperation.py:108-123 Object.descr__setattr__:
+    //
+    //     def descr__setattr__(space, w_obj, w_name, w_value):
+    //         name = space.text_w(w_name)
+    //         w_descr = space.lookup(w_obj, name)
+    //         if w_descr is not None:
+    //             w_set = space.lookup(w_descr, '__set__')
+    //             if w_set is not None:
+    //                 return space.get_and_call_function(w_set, w_descr, w_obj, w_value)
+    //             if space.lookup(w_descr, '__delete__') is not None:
+    //                 raise oefmt(space.w_AttributeError,
+    //                             "'%T' object is not a descriptor with set", w_descr)
+    //         if w_obj.setdictvalue(space, name, w_value):
+    //             return
+    //         raiseattrerror(space, w_obj, name, w_descr)
+    //
+    // The descriptor + type/module short-circuits above already handle the
+    // first half of this. What remains is `setdictvalue` + raiseattrerror.
+    if setdictvalue(obj, name, value) {
+        return Ok(w_none());
+    }
+    Err(raiseattrerror(obj, name))
+}
+
+/// baseobjspace.py:52-57 W_Root.setdictvalue (default).
+///
+/// ```python
+/// def setdictvalue(self, space, attr, w_value):
+///     w_dict = self.getdict(space)
+///     if w_dict is not None:
+///         space.setitem_str(w_dict, attr, w_value)
+///         return True
+///     return False
+/// ```
+fn setdictvalue(obj: PyObjectRef, name: &str, value: PyObjectRef) -> bool {
+    let w_dict = getdict(obj);
+    if w_dict.is_null() {
+        return false;
+    }
+    unsafe { pyre_object::w_dict_setitem_str(w_dict, name, value) };
+    true
+}
+
+/// descroperation.py:63-69 raiseattrerror.
+///
+/// ```python
+/// def raiseattrerror(space, w_obj, name, w_descr=None):
+///     if w_descr is None:
+///         raise oefmt(space.w_AttributeError,
+///                     "'%T' object has no attribute '%s'", w_obj, name)
+///     else:
+///         raise oefmt(space.w_AttributeError,
+///                     "'%T' object attribute '%s' is read-only", w_obj, name)
+/// ```
+fn raiseattrerror(obj: PyObjectRef, name: &str) -> PyError {
+    let tp_name = unsafe {
+        match crate::typedef::r#type(obj) {
+            Some(tp) => pyre_object::w_type_get_name(tp).to_string(),
+            None => (*(*obj).ob_type).name.to_string(),
+        }
+    };
+    PyError::new(
+        PyErrorKind::AttributeError,
+        format!("'{}' object has no attribute '{}'", tp_name, name),
+    )
 }
 
 /// Delete an attribute: `del obj.name`.
@@ -3353,44 +3691,26 @@ pub fn delattr(obj: PyObjectRef, name: &str) -> PyResult {
             }
         }
     }
-    // typedef.py:483-490 Member.descr_member_del:
-    //   self.typecheck(space, w_obj)
-    //   success = w_obj.delslotvalue(self.index)
-    //   if not success: raise AttributeError(self.name)
+    // descroperation.py descr__delattr__: data descriptor __delete__ takes priority
     unsafe {
         if is_instance(obj) {
             let w_type = w_instance_get_type(obj);
             if let Some(descr) = lookup_in_type_where(w_type, name) {
-                if pyre_object::is_member(descr) {
-                    // typedef.py:486: self.typecheck(space, w_obj)
-                    let w_cls = pyre_object::w_member_get_cls(descr);
-                    if !w_cls.is_null() && is_type(w_cls) && !isinstance_w(obj, w_cls) {
-                        return Err(PyError::type_error(format!(
-                            "descriptor for '{}' objects doesn't apply to '{}' object",
-                            pyre_object::w_type_get_name(w_cls),
-                            pyre_object::w_type_get_name(w_type),
-                        )));
-                    }
-                    let slot_name = pyre_object::w_member_get_name(descr);
-                    let removed = ATTR_TABLE.with(|table| {
-                        let mut table = table.borrow_mut();
-                        table
-                            .get_mut(&(obj as usize))
-                            .and_then(|d| d.remove(slot_name))
-                            .is_some()
-                    });
-                    if !removed {
-                        return Err(PyError::new(
-                            PyErrorKind::AttributeError,
-                            slot_name.to_string(),
-                        ));
-                    }
+                if is_data_descr(descr) {
+                    delete(descr, obj)?;
                     return Ok(w_none());
                 }
             }
         }
     }
-    // Instance/general: remove from ATTR_TABLE
+    // Instance/general: remove from instance dict, then ATTR_TABLE
+    let w_dict = getdict(obj);
+    if !w_dict.is_null() {
+        let removed = unsafe { pyre_object::w_dict_delitem_str(w_dict, name) };
+        if removed {
+            return Ok(w_none());
+        }
+    }
     let removed = ATTR_TABLE.with(|table| {
         let mut table = table.borrow_mut();
         table
@@ -3654,14 +3974,23 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         {
             return Ok(obj);
         }
-        // Instance __iter__ — check type MRO and ATTR_TABLE
+        // Instance __iter__ — check type MRO and the instance dict
         if is_instance(obj) {
             // Check type MRO first (PyPy: type(obj).__iter__)
             let w_type = w_instance_get_type(obj);
             if let Some(method) = lookup_in_type_where(w_type, "__iter__") {
                 return Ok(crate::call_function(method, &[obj]));
             }
-            // Per-instance __iter__ in ATTR_TABLE
+            // Per-instance __iter__ in the live W_DictObject backing
+            // store. PyPy looks this up via space.finditem_str on
+            // w_obj.getdict(space) (baseobjspace.py:46-50 getdictvalue).
+            let w_dict = getdict(obj);
+            if !w_dict.is_null() {
+                if let Some(method) = pyre_object::w_dict_getitem_str(w_dict, "__iter__") {
+                    return Ok(crate::call_function(method, &[obj]));
+                }
+            }
+            // Plus legacy ATTR_TABLE entries.
             let inst_iter = ATTR_TABLE.with(|t| {
                 t.borrow()
                     .get(&(obj as usize))
@@ -4150,7 +4479,10 @@ mod tests {
 
     #[test]
     fn test_setattr_getattr() {
-        let obj = w_int_new(42);
+        // PyPy raises AttributeError when setattr targets a non-hasdict
+        // type. Use a hasdict instance: a W_InstanceObject of a fresh
+        // user class created via type().
+        let obj = make_user_instance();
         setattr(obj, "name", w_int_new(100)).unwrap();
         let result = getattr(obj, "name").unwrap();
         unsafe { assert_eq!(w_int_get_value(result), 100) };
@@ -4165,11 +4497,22 @@ mod tests {
 
     #[test]
     fn test_setattr_overwrite() {
-        let obj = w_int_new(42);
+        let obj = make_user_instance();
         setattr(obj, "x", w_int_new(1)).unwrap();
         setattr(obj, "x", w_int_new(2)).unwrap();
         let result = getattr(obj, "x").unwrap();
         unsafe { assert_eq!(w_int_get_value(result), 2) };
+    }
+
+    /// Helper for the setattr/getattr tests: build an instance of a fresh
+    /// user class so the object has a live W_DictObject backing store
+    /// (analogous to PyPy's `_getusercls` instances).
+    fn make_user_instance() -> PyObjectRef {
+        crate::typedef::init_typeobjects();
+        use pyre_object::instanceobject::w_instance_new;
+        let cls = crate::typedef::make_builtin_type("TestUserClass", |_| {});
+        unsafe { pyre_object::w_type_set_hasdict(cls, true) };
+        w_instance_new(cls)
     }
 
     #[test]
