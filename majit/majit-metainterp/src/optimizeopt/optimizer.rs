@@ -337,10 +337,15 @@ impl Optimizer {
                     // ob_type (offset 0) constants are GcRef pointers stored
                     // as Value::Int. Register as Ref in constant_types so
                     // fail_arg_types + blackhole decode_ref handle them correctly.
+                    // virtualstate.py:159-162: fielddescrs is a flat list,
+                    // box access uses fielddescrs[i].get_index() == field_idx.
                     let offset = field_descrs
                         .iter()
-                        .find(|(di, _)| *di == *field_idx)
-                        .and_then(|(_, d)| d.as_field_descr().map(|fd| fd.offset()));
+                        .find_map(|d| {
+                            d.as_field_descr()
+                                .filter(|fd| fd.index_in_parent() as u32 == *field_idx)
+                        })
+                        .map(|fd| fd.offset());
                     if offset == Some(0) && known_class.is_some() {
                         ctx.constant_types_for_numbering
                             .insert(field_ref.0, majit_ir::Type::Ref);
@@ -509,7 +514,7 @@ impl Optimizer {
             head: OpRef,
             size_descr: majit_ir::DescrRef,
             fields: Vec<(u32, OpRef)>,
-            field_descrs: Vec<(u32, majit_ir::DescrRef)>,
+            field_descrs: Vec<majit_ir::DescrRef>,
             kind: ImportedVirtualKind,
             head_load_descr_index: Option<u32>,
         }
@@ -592,8 +597,12 @@ impl Optimizer {
                     {
                         same_as_targets.push((field_ref, entries.len(), field_idx));
                     }
-                    fields.push((descr.index(), field_ref));
-                    field_descrs.push((descr.index(), descr.clone()));
+                    let field_idx = descr
+                        .as_field_descr()
+                        .map(|field_descr| field_descr.index_in_parent() as u32)
+                        .unwrap_or_else(|| descr.index());
+                    fields.push((field_idx, field_ref));
+                    field_descrs.push(descr.clone());
                 }
                 entries.push(VirtualEntry {
                     head: virtual_head,
@@ -758,10 +767,15 @@ impl Optimizer {
                             ctx,
                             walk_visited,
                         );
+                        // virtualstate.py:159-162: fielddescrs is a flat list,
+                        // box access uses fielddescrs[i].get_index() == field_idx.
                         let offset = field_descrs
                             .iter()
-                            .find(|(di, _)| *di == *field_idx)
-                            .and_then(|(_, d)| d.as_field_descr().map(|fd| fd.offset()));
+                            .find_map(|d| {
+                                d.as_field_descr()
+                                    .filter(|fd| fd.index_in_parent() as u32 == *field_idx)
+                            })
+                            .map(|fd| fd.offset());
                         if offset == Some(0) && known_class.is_some() {
                             ctx.constant_types_for_numbering
                                 .insert(field_ref.0, majit_ir::Type::Ref);
@@ -1902,7 +1916,16 @@ impl Optimizer {
                     if ctx.get_ptr_info(*arg).is_some_and(|i| i.is_virtual()) {
                         force_needed.push(i);
                     } else {
-                        *arg = resolved;
+                        // RPython Box parity: a ref-typed box never forwards to
+                        // an int/float box. majit's flat OpRef forwarding can
+                        // collapse a boxed W_Int/W_Float local to its raw payload,
+                        // but end-of-preamble JUMP args must preserve the ref box
+                        // identity at ref-typed positions.
+                        //
+                        // Keep the original ref-typed arg instead of substituting
+                        // the non-ref replacement. This matches the upstream
+                        // force_box_for_end_of_preamble contract more closely than
+                        // allowing Ref -> Float/Int type substitution at the JUMP.
                     }
                 } else {
                     *arg = resolved;
@@ -2586,6 +2609,7 @@ impl Optimizer {
                 });
                 // unroll.py:240-242: jump_to_preamble → send_extra_operation
                 let mut jump_op = terminal_jump.clone();
+                jump_op.args = pre_opt_jump_args.clone().into();
                 jump_op.descr = Some(preamble_token.as_jump_target_descr());
                 self.send_extra_operation(&jump_op, &mut ctx);
                 let mut result = optimized_ops;
@@ -2648,6 +2672,7 @@ impl Optimizer {
                 if let Some(preamble_token) = front_target_tokens.first() {
                     ctx.clear_newoperations();
                     let mut jump_op = terminal_jump.clone();
+                    jump_op.args = pre_opt_jump_args.clone().into();
                     jump_op.descr = Some(preamble_token.as_jump_target_descr());
                     self.send_extra_operation(&jump_op, &mut ctx);
                     let mut result = optimized_ops;
@@ -2708,6 +2733,7 @@ impl Optimizer {
         if let Some(preamble_token) = front_target_tokens.first() {
             ctx.clear_newoperations();
             let mut jump_op = terminal_jump.clone();
+            jump_op.args = pre_opt_jump_args.into();
             jump_op.descr = Some(preamble_token.as_jump_target_descr());
             self.send_extra_operation(&jump_op, &mut ctx);
             let mut result = optimized_ops;
@@ -2993,8 +3019,19 @@ impl Optimizer {
         // optimizer.py:598-602:
         //     if rop.returns_bool_result(op.opnum):
         //         self.getintbound(op).make_bool()
-        if op.opcode.returns_bool() && matches!(ctx.opref_type(op.pos), Some(Type::Int)) {
-            ctx.with_intbound_mut(op.pos, |bound| bound.make_bool());
+        //
+        // RPython parity guard: returns_bool implies result is int-typed in
+        // RPython because Box.type is intrinsic. pyre's trace pipeline can
+        // leave value_types[op.pos] tagged with a stale type from a removed
+        // op (cut_trace_from / Phase 2 import). Only call into intbound
+        // mutation when the resolved opref is actually int-typed; otherwise
+        // skip silently to avoid corrupting the bound store.
+        if op.opcode.returns_bool() {
+            let resolved = ctx.get_box_replacement(op.pos);
+            let resolved_tp = ctx.opref_type(resolved);
+            if resolved_tp.is_none() || resolved_tp == Some(majit_ir::Type::Int) {
+                ctx.with_intbound_mut(op.pos, |bound| bound.make_bool());
+            }
         }
         let emitted = ctx.emit(op.clone());
         if std::env::var_os("MAJIT_LOG").is_some()
@@ -3270,11 +3307,12 @@ impl Optimizer {
     fn _maybe_replace_guard_value(op: Op, ctx: &mut OptContext) -> Op {
         // optimizer.py:755: if op.getarg(0).type == 'i'
         let arg0 = op.arg(0);
-        if !matches!(ctx.opref_type(arg0), Some(Type::Int)) {
+        let arg0_resolved = ctx.get_box_replacement(arg0);
+        if ctx.opref_type(arg0_resolved) != Some(majit_ir::Type::Int) {
             return op;
         }
         // optimizer.py:756-757: b = self.getintbound(op.getarg(0)); if b.is_bool()
-        let b = ctx.getintbound(ctx.get_box_replacement(arg0));
+        let b = ctx.getintbound(arg0_resolved);
         if !b.is_bool() {
             return op;
         }
@@ -3496,7 +3534,7 @@ mod tests {
     }
 
     impl majit_ir::FieldDescr for TestDescr {
-        fn parent_descr(&self) -> Option<majit_ir::DescrRef> {
+        fn get_parent_descr(&self) -> Option<majit_ir::DescrRef> {
             Some(test_parent_descr())
         }
         fn offset(&self) -> usize {
@@ -4311,7 +4349,7 @@ mod tests {
             PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr: descr.clone(),
                 fields: vec![(1, OpRef(11))],
-                field_descrs: vec![(1, field_descr.clone())],
+                field_descrs: vec![field_descr.clone()],
                 last_guard_pos: -1,
             }),
         );

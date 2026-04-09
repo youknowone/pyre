@@ -6,6 +6,7 @@
 /// Descriptors carry type metadata needed by the optimizer and backend
 /// for field access, array access, function calls, and guard failures.
 use std::sync::Arc;
+use std::sync::Weak;
 
 use crate::OpRef;
 use crate::value::Type;
@@ -296,22 +297,6 @@ pub trait SizeDescr: Descr {
 pub trait FieldDescr: Descr {
     /// descr.py / FieldDescr.get_parent_descr() — the SizeDescr of the
     /// containing struct/object that owns this field. PyPy
-    /// optimizer.py:478-484 reads this in `ensure_ptr_info_arg0` to
-    /// dispatch a fresh GETFIELD/SETFIELD/QUASIIMMUT_FIELD opinfo to
-    /// `InstancePtrInfo` (when `parent_descr.is_object()`) or
-    /// `StructPtrInfo` (otherwise). Default returns `None`; field
-    /// descriptors that don't carry a backreference fall through to the
-    /// generic path and the Rust port's `ensure_ptr_info_arg0` panics
-    /// rather than installing a malformed PtrInfo.
-    ///
-    /// Returns a `DescrRef` (rather than `Arc<dyn SizeDescr>`) so callers
-    /// can store it in `PtrInfo::Instance.descr` / `PtrInfo::Struct.descr`
-    /// directly. The caller reads `parent.as_size_descr().is_object()` to
-    /// pick the Instance vs Struct constructor.
-    fn parent_descr(&self) -> Option<DescrRef> {
-        None
-    }
-
     /// Byte offset from the start of the struct.
     fn offset(&self) -> usize;
 
@@ -358,6 +343,17 @@ pub trait FieldDescr: Descr {
     /// descr.py: index_in_parent — position within parent struct.
     fn index_in_parent(&self) -> usize {
         0
+    }
+
+    /// descr.py: FieldDescr.get_parent_descr() — backreference to the
+    /// SizeDescr of the containing struct/object. Required by
+    /// `OptContext::ensure_ptr_info_arg0` to dispatch Instance vs Struct
+    /// PtrInfo per `optimizer.py:478-484`. Default returns `None`; field
+    /// descriptors that don't carry a backreference fall through to the
+    /// generic path and the Rust port's `ensure_ptr_info_arg0` panics
+    /// rather than installing a malformed PtrInfo.
+    fn get_parent_descr(&self) -> Option<DescrRef> {
+        None
     }
 
     /// descr.py:227 — field name. Format is either:
@@ -1008,11 +1004,16 @@ pub struct SimpleFieldDescr {
     is_immutable: bool,
     is_signed: bool,
     virtualizable: bool,
+    /// descr.py: FieldDescr.index_in_parent — slot position within the
+    /// parent struct's `all_field_descrs`.
+    index_in_parent: usize,
     /// descr.py: FieldDescr.parent_descr — backreference to the SizeDescr
     /// of the containing struct/object. Required by
     /// `OptContext::ensure_ptr_info_arg0` to dispatch Instance vs Struct
-    /// PtrInfo per `optimizer.py:478-484`.
-    parent_descr: Option<DescrRef>,
+    /// PtrInfo per `optimizer.py:478-484`. Stored as `Weak` to break the
+    /// SizeDescr → FieldDescr → SizeDescr Arc cycle introduced by
+    /// `make_simple_descr_group`.
+    parent_descr: Option<Weak<dyn Descr>>,
 }
 
 impl SimpleFieldDescr {
@@ -1032,6 +1033,7 @@ impl SimpleFieldDescr {
             is_immutable,
             is_signed: true,
             virtualizable: false,
+            index_in_parent: 0,
             parent_descr: None,
         }
     }
@@ -1057,6 +1059,7 @@ impl SimpleFieldDescr {
             is_immutable,
             is_signed,
             virtualizable: false,
+            index_in_parent: 0,
             parent_descr: None,
         }
     }
@@ -1071,11 +1074,13 @@ impl SimpleFieldDescr {
         self
     }
 
-    /// Builder: attach a parent SizeDescr backreference. Required when the
-    /// descriptor will be used as the `op.descr` of a GETFIELD/SETFIELD/
-    /// QUASIIMMUT_FIELD that flows through `ensure_ptr_info_arg0`.
-    pub fn with_parent_descr(mut self, parent: DescrRef) -> Self {
-        self.parent_descr = Some(parent);
+    /// Builder: attach a parent SizeDescr backreference + index_in_parent.
+    /// Required when the descriptor will be used as the `op.descr` of a
+    /// GETFIELD/SETFIELD/QUASIIMMUT_FIELD that flows through
+    /// `ensure_ptr_info_arg0` (optimizer.py:478-484).
+    pub fn with_parent_descr(mut self, parent: DescrRef, index_in_parent: usize) -> Self {
+        self.parent_descr = Some(Arc::downgrade(&parent));
+        self.index_in_parent = index_in_parent;
         self
     }
 }
@@ -1096,9 +1101,6 @@ impl Descr for SimpleFieldDescr {
 }
 
 impl FieldDescr for SimpleFieldDescr {
-    fn parent_descr(&self) -> Option<DescrRef> {
-        self.parent_descr.clone()
-    }
     fn offset(&self) -> usize {
         self.offset
     }
@@ -1117,6 +1119,12 @@ impl FieldDescr for SimpleFieldDescr {
     fn field_name(&self) -> &str {
         &self.name
     }
+    fn index_in_parent(&self) -> usize {
+        self.index_in_parent
+    }
+    fn get_parent_descr(&self) -> Option<DescrRef> {
+        self.parent_descr.as_ref().and_then(|p| p.upgrade())
+    }
 }
 
 /// Simple concrete SizeDescr.
@@ -1127,6 +1135,7 @@ pub struct SimpleSizeDescr {
     type_id: u32,
     is_immutable: bool,
     vtable: usize,
+    all_field_descrs: Vec<Arc<dyn FieldDescr>>,
 }
 
 impl SimpleSizeDescr {
@@ -1137,6 +1146,7 @@ impl SimpleSizeDescr {
             type_id,
             is_immutable: false,
             vtable: 0,
+            all_field_descrs: Vec::new(),
         }
     }
 
@@ -1147,7 +1157,13 @@ impl SimpleSizeDescr {
             type_id,
             is_immutable: false,
             vtable,
+            all_field_descrs: Vec::new(),
         }
+    }
+
+    pub fn with_all_field_descrs(mut self, all_field_descrs: Vec<Arc<dyn FieldDescr>>) -> Self {
+        self.all_field_descrs = all_field_descrs;
+        self
     }
 }
 
@@ -1170,11 +1186,83 @@ impl SizeDescr for SimpleSizeDescr {
     fn is_immutable(&self) -> bool {
         self.is_immutable
     }
+    fn all_field_descrs(&self) -> &[Arc<dyn FieldDescr>] {
+        &self.all_field_descrs
+    }
     fn is_object(&self) -> bool {
         self.vtable != 0
     }
     fn vtable(&self) -> usize {
         self.vtable
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SimpleFieldDescrSpec {
+    pub index: u32,
+    pub name: String,
+    pub offset: usize,
+    pub field_size: usize,
+    pub field_type: Type,
+    pub is_immutable: bool,
+    pub is_signed: bool,
+    pub virtualizable: bool,
+    pub index_in_parent: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct SimpleDescrGroup {
+    pub size_descr: Arc<SimpleSizeDescr>,
+    pub field_descrs: Vec<Arc<SimpleFieldDescr>>,
+}
+
+pub fn make_simple_descr_group(
+    index: u32,
+    size: usize,
+    type_id: u32,
+    vtable: usize,
+    field_specs: &[SimpleFieldDescrSpec],
+) -> SimpleDescrGroup {
+    let field_descrs_cell = std::cell::RefCell::new(Vec::<Arc<SimpleFieldDescr>>::new());
+    let field_specs = field_specs.to_vec();
+    let size_descr = Arc::new_cyclic(|weak_size: &Weak<SimpleSizeDescr>| {
+        let parent_descr: Weak<dyn Descr> = weak_size.clone();
+        let field_descrs: Vec<Arc<SimpleFieldDescr>> = field_specs
+            .iter()
+            .map(|spec| {
+                Arc::new(SimpleFieldDescr {
+                    index: spec.index,
+                    name: spec.name.clone(),
+                    offset: spec.offset,
+                    field_size: spec.field_size,
+                    field_type: spec.field_type,
+                    is_immutable: spec.is_immutable,
+                    is_signed: spec.is_signed,
+                    virtualizable: spec.virtualizable,
+                    index_in_parent: spec.index_in_parent,
+                    parent_descr: Some(parent_descr.clone()),
+                })
+            })
+            .collect();
+        *field_descrs_cell.borrow_mut() = field_descrs.clone();
+        let all_field_descrs: Vec<Arc<dyn FieldDescr>> = field_descrs
+            .iter()
+            .cloned()
+            .map(|field_descr| field_descr as Arc<dyn FieldDescr>)
+            .collect();
+        SimpleSizeDescr {
+            index,
+            size,
+            type_id,
+            is_immutable: false,
+            vtable,
+            all_field_descrs,
+        }
+    });
+    let field_descrs = field_descrs_cell.into_inner();
+    SimpleDescrGroup {
+        size_descr,
+        field_descrs,
     }
 }
 
@@ -1295,6 +1383,7 @@ pub struct SimpleInteriorFieldDescr {
     index: u32,
     array_descr: std::sync::Arc<SimpleArrayDescr>,
     field_descr: std::sync::Arc<SimpleFieldDescr>,
+    owner_size_descr: Option<std::sync::Arc<SimpleSizeDescr>>,
 }
 
 impl SimpleInteriorFieldDescr {
@@ -1307,6 +1396,21 @@ impl SimpleInteriorFieldDescr {
             index,
             array_descr,
             field_descr,
+            owner_size_descr: None,
+        }
+    }
+
+    pub fn new_with_owner(
+        index: u32,
+        array_descr: std::sync::Arc<SimpleArrayDescr>,
+        field_descr: std::sync::Arc<SimpleFieldDescr>,
+        owner_size_descr: std::sync::Arc<SimpleSizeDescr>,
+    ) -> Self {
+        SimpleInteriorFieldDescr {
+            index,
+            array_descr,
+            field_descr,
+            owner_size_descr: Some(owner_size_descr),
         }
     }
 }

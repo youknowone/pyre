@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 
 use crate::arch::*;
-use crate::jitframe::FIRST_ITEM_OFFSET;
+use crate::gcmap::{allocate_gcmap, gcmap_set_bit};
 use crate::regloc::*;
 use majit_ir::{InputArg, LoopTargetDescr, Op, OpCode, OpRef, TargetArgLoc, Type};
 
@@ -669,11 +669,30 @@ impl FrameManager {
 /// RPython: rbp points past the frame header, slots grow downward:
 ///   -(position+1)*WORD + base_ofs
 ///
-/// Dynasm uses the same fixed-header/trailing-array JitFrame structure:
-/// slots live in `jf_frame[position]`, starting at FIRST_ITEM_OFFSET bytes
-/// from the frame pointer.
+/// aarch64/locations.py:157 / arm/locations.py:184
+/// get_fp_offset(base_ofs, position) = base_ofs + WORD * (position + JITFRAME_FIXED_SIZE)
+///
+/// Here `JITFRAME_FIXED_SIZE` is the arch-specific managed-register area
+/// reserved at the start of `jf_frame`, not the object-header byte size.
 pub fn get_ebp_ofs(base_ofs: i32, position: usize) -> i32 {
-    FIRST_ITEM_OFFSET as i32 + (position as i32 * WORD as i32) + base_ofs
+    base_ofs + WORD as i32 * (position as i32 + JITFRAME_FIXED_SIZE as i32)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn core_reg_index(reg: RegLoc) -> Option<usize> {
+    all_core_regs()
+        .iter()
+        .position(|candidate| *candidate == reg)
+}
+
+#[cfg(target_arch = "aarch64")]
+fn core_reg_index(reg: RegLoc) -> Option<usize> {
+    match reg.value {
+        0..=13 => Some(reg.value as usize),
+        19 => Some(14),
+        20 => Some(15),
+        _ => None,
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1664,7 +1683,7 @@ impl RegAlloc {
     /// x86/regalloc.py:176 _prepare
     pub fn _prepare(&mut self, inputargs: &[InputArg], operations: &[Op]) {
         self.longevity = compute_vars_longevity(inputargs, operations);
-        let base_ofs = 0i32; // TODO: cpu.get_baseofs_of_frame_field()
+        let base_ofs = crate::jitframe::FIRST_ITEM_OFFSET as i32;
         self.fm = FrameManager::new(base_ofs);
         self.rm = Self::make_gpr_manager();
         self.xrm = Self::make_xmm_manager();
@@ -1930,6 +1949,35 @@ impl RegAlloc {
             result_loc,
             faillocs,
         });
+    }
+
+    /// aarch64/regalloc.py:1089 get_gcmap.
+    pub fn get_gcmap(&self, forbidden_regs: &[RegLoc], noregs: bool) -> *mut usize {
+        let frame_depth = self.fm.get_frame_depth();
+        let gcmap = allocate_gcmap(frame_depth, JITFRAME_FIXED_SIZE);
+        for (v, reg) in self.rm.reg_bindings_iter() {
+            if forbidden_regs.contains(&reg) {
+                continue;
+            }
+            if self.value_types.get(&v.0) == Some(&Type::Ref)
+                && self.rm.is_still_alive(v, &self.longevity)
+            {
+                assert!(!noregs);
+                let val = core_reg_index(reg).expect("gcmap: reg not in managed core regs");
+                gcmap_set_bit(gcmap, val);
+            }
+        }
+        for (v, lifetime) in self.longevity.lifetimes_iter() {
+            if self.value_types.get(&v.0) != Some(&Type::Ref)
+                || !self.rm.is_still_alive(*v, &self.longevity)
+            {
+                continue;
+            }
+            if let Some(loc) = lifetime.current_frame_loc {
+                gcmap_set_bit(gcmap, loc.position + JITFRAME_FIXED_SIZE);
+            }
+        }
+        gcmap
     }
 
     /// x86/regalloc.py:675 perform_discard
@@ -2284,24 +2332,26 @@ impl RegAlloc {
             | OpCode::CallMayForceI
             | OpCode::CallMayForceR
             | OpCode::CallMayForceF
-            | OpCode::CallMayForceN
-            | OpCode::CallReleaseGilI
+            | OpCode::CallMayForceN => {
+                self.consider_call(op, i, output, op.opcode.is_call_may_force(), 1);
+            }
+            OpCode::CallReleaseGilI
             | OpCode::CallReleaseGilR
             | OpCode::CallReleaseGilF
             | OpCode::CallReleaseGilN => {
-                self.consider_call(op, i, output);
+                self.consider_call(op, i, output, true, 2);
             }
             OpCode::CallAssemblerI
             | OpCode::CallAssemblerR
             | OpCode::CallAssemblerF
             | OpCode::CallAssemblerN => {
-                self.consider_call(op, i, output);
+                self.consider_call_assembler(op, i, output);
             }
             OpCode::CondCallN => {
                 self.consider_discard_nargs(op, i, output);
             }
             OpCode::CondCallValueI | OpCode::CondCallValueR => {
-                self.consider_call(op, i, output);
+                self.consider_raw_call_like(op, i, output, SAVE_DEFAULT_REGS);
             }
 
             // ── Allocation ──
@@ -2311,7 +2361,7 @@ impl RegAlloc {
             | OpCode::NewArrayClear
             | OpCode::Newstr
             | OpCode::Newunicode => {
-                self.consider_call(op, i, output);
+                self.consider_raw_call_like(op, i, output, SAVE_DEFAULT_REGS);
             }
 
             // ── Control flow ──
@@ -2863,12 +2913,32 @@ impl RegAlloc {
         self.perform_discard(i, locs, output);
     }
 
-    /// x86/regalloc.py:824 _call — save registers around call.
-    fn consider_call(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
-        // Save all caller-saved registers
+    /// aarch64/regalloc.py:603 _prepare_call.
+    fn consider_call(
+        &mut self,
+        op: &Op,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+        save_all_regs: bool,
+        first_arg_index: usize,
+    ) {
+        let calldescr = op
+            .descr
+            .as_ref()
+            .and_then(|descr| descr.as_call_descr())
+            .expect("call op without CallDescr");
+        assert_eq!(calldescr.arg_types().len(), op.num_args() - first_arg_index);
+
+        let save_regs = if save_all_regs {
+            SAVE_ALL_REGS
+        } else if calldescr.effect_info().can_collect() {
+            SAVE_GCREF_REGS
+        } else {
+            SAVE_DEFAULT_REGS
+        };
         self.rm.before_call(
             &[],
-            SAVE_DEFAULT_REGS,
+            save_regs,
             &mut self.longevity,
             &mut self.fm,
             &mut self.pending_moves,
@@ -2876,7 +2946,63 @@ impl RegAlloc {
         );
         self.xrm.before_call(
             &[],
-            SAVE_DEFAULT_REGS,
+            save_regs,
+            &mut self.longevity,
+            &mut self.fm,
+            &mut self.pending_moves,
+            &self.value_types,
+        );
+
+        let result_tp = op.opcode.result_type();
+        let result_loc = if result_tp != Type::Void {
+            let r = if result_tp == Type::Float {
+                self.xrm.after_call(op.pos, &mut self.longevity)
+            } else {
+                self.rm.after_call(op.pos, &mut self.longevity)
+            };
+            Some(Loc::Reg(r))
+        } else {
+            None
+        };
+
+        let mut arglocs = Vec::with_capacity(op.args.len() + 3);
+        arglocs.push(result_loc.unwrap_or(Loc::Immed(ImmedLoc::new(0))));
+        arglocs.push(Loc::Immed(ImmedLoc::new(calldescr.result_size() as i64)));
+        arglocs.push(Loc::Immed(ImmedLoc::new(if calldescr.is_result_signed() {
+            1
+        } else {
+            0
+        })));
+        for &arg in &op.args {
+            let tp = self.tp(arg);
+            arglocs.push(self.loc(arg, tp));
+        }
+
+        self.perform(i, arglocs, result_loc, output);
+    }
+
+    fn consider_call_assembler(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
+        self.consider_raw_call_like(op, i, output, SAVE_ALL_REGS);
+    }
+
+    fn consider_raw_call_like(
+        &mut self,
+        op: &Op,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+        save_regs: u8,
+    ) {
+        self.rm.before_call(
+            &[],
+            save_regs,
+            &mut self.longevity,
+            &mut self.fm,
+            &mut self.pending_moves,
+            &self.value_types,
+        );
+        self.xrm.before_call(
+            &[],
+            save_regs,
             &mut self.longevity,
             &mut self.fm,
             &mut self.pending_moves,

@@ -142,8 +142,10 @@ pub enum VirtualStateInfo {
         ob_type_descr: Option<DescrRef>,
         /// Field values as VirtualStateInfo (recursive). Excludes typeptr.
         fields: Vec<(u32, Rc<VirtualStateInfo>)>,
-        /// Original field descriptors for each field index.
-        field_descrs: Vec<(u32, DescrRef)>,
+        /// Original field descriptors in parent-local slot order.
+        /// virtualstate.py:159 AbstractVirtualStructStateInfo.fielddescrs
+        /// is a flat list and box access uses `fielddescrs[i].get_index()`.
+        field_descrs: Vec<DescrRef>,
     },
     /// virtualstate.py: VArrayStateInfo — virtual array with known elements.
     VArray {
@@ -157,7 +159,9 @@ pub enum VirtualStateInfo {
     VStruct {
         descr: DescrRef,
         fields: Vec<(u32, Rc<VirtualStateInfo>)>,
-        field_descrs: Vec<(u32, DescrRef)>,
+        /// virtualstate.py:159 AbstractVirtualStructStateInfo.fielddescrs
+        /// stored as a flat parent-local list.
+        field_descrs: Vec<DescrRef>,
     },
     /// virtualstate.py: VArrayStructStateInfo — virtual array of structs.
     VArrayStruct {

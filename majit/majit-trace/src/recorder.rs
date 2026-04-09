@@ -234,12 +234,24 @@ impl Trace {
     /// Close the loop: add a JUMP operation back to the start.
     /// `jump_args` are the values of the input arguments at the end of the loop.
     pub fn close_loop(&mut self, jump_args: &[OpRef]) {
+        self.close_loop_with_descr(jump_args, None);
+    }
+
+    /// Close the loop with an explicit JUMP descriptor.
+    ///
+    /// RPython pyjitpl.py:3188-3190 records the tentative JUMP with
+    /// `descr=ptoken` before compile_trace(). Plain loop recording keeps
+    /// `descr=None` until optimization rewrites it.
+    pub fn close_loop_with_descr(&mut self, jump_args: &[OpRef], descr: Option<DescrRef>) {
         assert!(!self.finalized, "recorder already finalized");
         // RPython parity: Jump args may differ from InputArgs count when
         // virtualizable arrays change depth. The optimizer (OptUnroll preamble
         // peeling) bridges the gap by creating a Label with the extended count.
         let opref = OpRef(self.op_count);
-        let mut op = Op::new(OpCode::Jump, jump_args);
+        let mut op = match descr {
+            Some(descr) => Op::with_descr(OpCode::Jump, jump_args, descr),
+            None => Op::new(OpCode::Jump, jump_args),
+        };
         op.pos = opref;
         self.ops.push(op);
         self.op_count += 1;

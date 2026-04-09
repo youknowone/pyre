@@ -364,10 +364,10 @@ use crate::descr::{
     list_float_items_heap_cap_descr, list_float_items_len_descr, list_float_items_ptr_descr,
     list_int_items_heap_cap_descr, list_int_items_len_descr, list_int_items_ptr_descr,
     list_items_heap_cap_descr, list_items_len_descr, list_items_ptr_descr, list_strategy_descr,
-    make_array_descr, make_field_descr_with_parent, make_size_descr, namespace_values_len_descr,
-    namespace_values_ptr_descr, ob_type_descr, range_iter_current_descr, range_iter_step_descr,
-    range_iter_stop_descr, str_len_descr, tuple_items_len_descr, tuple_items_ptr_descr,
-    w_float_size_descr, w_int_size_descr,
+    make_array_descr, make_size_descr, namespace_values_len_descr, namespace_values_ptr_descr,
+    ob_type_descr, range_iter_current_descr, range_iter_step_descr, range_iter_stop_descr,
+    str_len_descr, tuple_items_len_descr, tuple_items_ptr_descr, w_float_size_descr,
+    w_int_size_descr,
 };
 use crate::frame_layout::{
     PYFRAME_CODE_OFFSET, PYFRAME_LOCALS_CELLS_STACK_OFFSET, PYFRAME_NAMESPACE_OFFSET,
@@ -443,6 +443,10 @@ pub struct PyreSym {
     /// of the vable_array_base-based layout. This ensures bridge traces see
     /// frame locals as symbolic InputArgs, not concrete values.
     pub(crate) bridge_local_oprefs: Option<Vec<OpRef>>,
+    /// Bridge-specific override for symbolic_stack.
+    /// resume.py:1042 parity: consume_boxes fills both local and stack
+    /// registers for the resumed frame.
+    pub(crate) bridge_stack_oprefs: Option<Vec<OpRef>>,
     /// Bridge-specific override for symbolic_local_types.
     /// resume.py:1245 decode_box parity: each slot's `.type` is fixed by
     /// which `_callback_i/_callback_r/_callback_f` the encoder dispatched
@@ -456,6 +460,8 @@ pub struct PyreSym {
     /// `trace_guarded_int_payload` unbox path that the optimizer
     /// constant-folds — producing `Finish(constant 0)` bridges.
     pub(crate) bridge_local_types: Option<Vec<Type>>,
+    /// Bridge-specific override for symbolic_stack_types.
+    pub(crate) bridge_stack_types: Option<Vec<Type>>,
     // virtualizable.py:86-93: ALL static fields in declared order.
     // RPython's unroll_static_fields includes every field from
     // _virtualizable_; ALL must be inputarg (not info_only).
@@ -659,53 +665,23 @@ pub fn pyframe_size_descr() -> DescrRef {
 }
 
 pub(crate) fn frame_locals_cells_stack_descr() -> DescrRef {
-    make_field_descr_with_parent(
-        pyframe_size_descr(),
-        PYFRAME_LOCALS_CELLS_STACK_OFFSET,
-        8,
-        Type::Int,
-        false,
-    )
+    crate::descr::pyframe_locals_cells_stack_descr()
 }
 
 pub(crate) fn frame_stack_depth_descr() -> DescrRef {
-    make_field_descr_with_parent(
-        pyframe_size_descr(),
-        PYFRAME_VALUESTACKDEPTH_OFFSET,
-        8,
-        Type::Int,
-        true,
-    )
+    crate::descr::pyframe_stack_depth_descr()
 }
 
 pub(crate) fn frame_next_instr_descr() -> DescrRef {
-    make_field_descr_with_parent(
-        pyframe_size_descr(),
-        PYFRAME_NEXT_INSTR_OFFSET,
-        8,
-        Type::Int,
-        true,
-    )
+    crate::descr::pyframe_next_instr_descr()
 }
 
 pub(crate) fn frame_code_descr() -> DescrRef {
-    make_field_descr_with_parent(
-        pyframe_size_descr(),
-        PYFRAME_CODE_OFFSET,
-        8,
-        Type::Ref,
-        true,
-    )
+    crate::descr::pyframe_code_descr()
 }
 
 pub(crate) fn frame_namespace_descr() -> DescrRef {
-    make_field_descr_with_parent(
-        pyframe_size_descr(),
-        PYFRAME_NAMESPACE_OFFSET,
-        8,
-        Type::Ref,
-        false,
-    )
+    crate::descr::pyframe_namespace_descr()
 }
 
 pub(crate) fn trace_ob_type_descr() -> DescrRef {
@@ -1535,7 +1511,9 @@ impl PyreSym {
             nlocals: 0,
             symbolic_initialized: false,
             bridge_local_oprefs: None,
+            bridge_stack_oprefs: None,
             bridge_local_types: None,
+            bridge_stack_types: None,
             vable_next_instr: OpRef::NONE,
             vable_code: OpRef::NONE,
             vable_valuestackdepth: OpRef::NONE,
@@ -1656,7 +1634,11 @@ impl PyreSym {
         } else if self.symbolic_local_types.len() != nlocals {
             self.symbolic_local_types = concrete_slot_types(concrete_frame, nlocals, nlocals);
         }
-        self.symbolic_stack = if let Some(base) = self.vable_array_base {
+        self.symbolic_stack = if let Some(ref overrides) = self.bridge_stack_oprefs {
+            let mut stack = overrides.clone();
+            stack.resize(stack_only_depth, OpRef::NONE);
+            stack
+        } else if let Some(base) = self.vable_array_base {
             let stack_base = base + nlocals as u32;
             (0..stack_only_depth)
                 .map(|i| OpRef(stack_base + i as u32))
@@ -1664,7 +1646,11 @@ impl PyreSym {
         } else {
             vec![OpRef::NONE; stack_only_depth]
         };
-        if let Some((_, ref stack_types)) = inputarg_slot_types {
+        if let Some(ref overrides) = self.bridge_stack_types {
+            let mut types = overrides.clone();
+            types.resize(stack_only_depth, Type::Ref);
+            self.symbolic_stack_types = types;
+        } else if let Some((_, ref stack_types)) = inputarg_slot_types {
             self.symbolic_stack_types = stack_types.clone();
         } else if self.symbolic_stack_types.len() != stack_only_depth {
             self.symbolic_stack_types =
@@ -2316,7 +2302,9 @@ impl JitState for PyreJitState {
         });
 
         let nlocals = sym.nlocals;
+        let stack_only_depth = sym.stack_only_depth();
         let mut bridge_locals = vec![OpRef::NONE; nlocals];
+        let mut bridge_stack = vec![OpRef::NONE; stack_only_depth];
         // resume.py:1245 decode_box parity: each slot's `.type` is the
         // `kind` argument to `decode_box`, which is fixed by which
         // _callback_i/_callback_r/_callback_f the encoder dispatched
@@ -2340,6 +2328,7 @@ impl JitState for PyreJitState {
         // the trace_guarded_int_payload unbox path, and the optimizer
         // constant-folds the result into Finish(0).
         let mut bridge_local_types = vec![Type::Ref; nlocals];
+        let mut bridge_stack_types = vec![Type::Ref; stack_only_depth];
         let parent_types = &resume_data.fail_arg_types;
         let type_for_value = |v: &RebuiltValue| -> Type {
             match v {
@@ -2365,27 +2354,34 @@ impl JitState for PyreJitState {
                 if idx < nlocals {
                     bridge_locals[idx] = resolved;
                     bridge_local_types[idx] = slot_type;
+                } else if idx < nlocals + stack_only_depth {
+                    let stack_idx = idx - nlocals;
+                    bridge_stack[stack_idx] = resolved;
+                    bridge_stack_types[stack_idx] = slot_type;
                 }
-                // Stack-region register indices (idx >= nlocals) are
-                // ignored here — bridge_local_oprefs covers locals
-                // only. The stack is rebuilt from `vable_values`
-                // (covered separately below).
             }
         } else {
             // No liveness info: fall back to the linear mapping.
             // Same as the pre-unpacking behaviour.
             for (i, v) in frame.values.iter().enumerate() {
-                if i >= nlocals {
+                let slot_type = type_for_value(v);
+                let resolved = resolve(v, &mut frame_const_cursor);
+                if i < nlocals {
+                    bridge_local_types[i] = slot_type;
+                    bridge_locals[i] = resolved;
+                } else if i < nlocals + stack_only_depth {
+                    let stack_idx = i - nlocals;
+                    bridge_stack_types[stack_idx] = slot_type;
+                    bridge_stack[stack_idx] = resolved;
+                } else {
                     break;
                 }
-                bridge_local_types[i] = type_for_value(v);
-                bridge_locals[i] = resolve(v, &mut frame_const_cursor);
             }
         }
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
-                "[jit][bridge-sym] frame.values={:?} → bridge_locals={:?} types={:?}",
-                frame.values, bridge_locals, bridge_local_types,
+                "[jit][bridge-sym] frame.values={:?} → bridge_locals={:?} stack={:?} local_types={:?} stack_types={:?}",
+                frame.values, bridge_locals, bridge_stack, bridge_local_types, bridge_stack_types,
             );
         }
         // Override sym.symbolic_locals AND sym.symbolic_local_types so
@@ -2424,14 +2420,12 @@ impl JitState for PyreJitState {
         // LOAD_FAST falling through to the vable_array_base branch uses
         // the heap-array path instead of synthesizing parent OpRefs.
         sym.vable_array_base = None;
-        // The bridge symbolic_stack must also be reset — init_symbolic
-        // seeded it with `OpRef(stack_base + i)` from the parent's
-        // vable_array_base. For a bridge resuming at RETURN_VALUE, the
-        // stack is empty until the trace pushes the return value via
-        // LOAD_FAST.
-        sym.symbolic_stack = vec![OpRef::NONE; sym.symbolic_stack.len()];
+        sym.symbolic_stack = bridge_stack.clone();
+        sym.symbolic_stack_types = bridge_stack_types.clone();
         sym.bridge_local_oprefs = Some(bridge_locals);
+        sym.bridge_stack_oprefs = Some(bridge_stack);
         sym.bridge_local_types = Some(bridge_local_types);
+        sym.bridge_stack_types = Some(bridge_stack_types);
 
         // pyjitpl.py:3281-3288 parity: bridge vable scalar fields must
         // reflect the bridge's InputArg layout, NOT the loop trace's layout.

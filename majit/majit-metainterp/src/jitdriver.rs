@@ -193,6 +193,10 @@ pub struct JitDriver<S: JitState> {
     meta: MetaInterp<S::Meta>,
     sym: Option<S::Sym>,
     trace_meta: Option<S::Meta>,
+    /// pyjitpl.py:2978-2983 reached_loop_header direct compile_trace parity.
+    /// The frontend decides whether to call compile_trace(); the driver only
+    /// consumes the successful result and switches back to compiled code.
+    compile_trace_success: bool,
     descriptor: Option<JitDriverStaticData>,
     /// Bridge tracing state: (green_key, trace_id, fail_index).
     /// (green_key, trace_id, fail_index, code_ptr_for_green_key)
@@ -274,6 +278,7 @@ impl<S: JitState> JitDriver<S> {
             meta,
             sym: None,
             trace_meta: None,
+            compile_trace_success: false,
             descriptor: None,
             bridge_info: None,
             resume_data_result: None,
@@ -570,6 +575,14 @@ impl<S: JitState> JitDriver<S> {
         self.meta.trace_ctx().map(|ctx| ctx.green_key())
     }
 
+    /// ResumeFromInterpDescr parity: data needed to compile an entry bridge
+    /// from the currently active trace.
+    pub fn compile_trace_entry_data(&mut self) -> Option<(u64, S::Meta)> {
+        let original_green_key = self.meta.trace_ctx().map(|ctx| ctx.root_green_key())?;
+        let trace_meta = self.trace_meta.as_ref()?.clone();
+        Some((original_green_key, trace_meta))
+    }
+
     /// RPython rlib.jit.current_trace_length().
     /// Returns the number of ops in the active trace, or -1 if not tracing.
     pub fn current_trace_length(&mut self) -> i64 {
@@ -586,7 +599,26 @@ impl<S: JitState> JitDriver<S> {
             self.sym = None;
             self.trace_meta = None;
             self.bridge_info = None;
+            self.compile_trace_success = false;
         }
+    }
+
+    /// reached_loop_header() called compile_trace() successfully and the
+    /// driver should switch to compiled code after the merge-point closure
+    /// returns.
+    pub fn note_compile_trace_success(&mut self) {
+        if crate::majit_log_enabled() {
+            eprintln!("[jit][compile-trace] note success");
+        }
+        self.compile_trace_success = true;
+    }
+
+    pub fn compile_trace_success_pending(&self) -> bool {
+        self.compile_trace_success
+    }
+
+    fn take_compile_trace_success(&mut self) -> bool {
+        std::mem::take(&mut self.compile_trace_success)
     }
 
     /// Tracing hook — call at the top of the dispatch loop.
@@ -704,6 +736,15 @@ impl<S: JitState> JitDriver<S> {
         // Phase 2: handle trace result with full access to self
         match action {
             TraceAction::Continue => {}
+            TraceAction::CompileTrace => {
+                self.meta.abort_trace(false);
+                self.meta.warm_state.reset_function_counts();
+                self.sym = None;
+                self.trace_meta = None;
+                self.bridge_info = None;
+                self.compile_trace_success = true;
+                return;
+            }
             TraceAction::CloseLoop => {
                 // pyjitpl.py:2979-3036 reached_loop_header parity.
                 // Path 1: bridge — only if has_compiled_targets (line 2982).
@@ -1097,51 +1138,21 @@ impl<S: JitState> JitDriver<S> {
         // portal. Nested function calls are prevented by JIT_TRACING
         // flag in eval_loop_jit.
         if self.meta.is_tracing() {
-            // pyjitpl.py:2979-2990 reached_loop_header: if the current
-            // green_key has compiled code with target tokens, compile the
-            // current trace (loop or bridge) as a JUMP to that code.
-            // RPython does NOT skip bridge traces — bridge → existing loop
-            // JUMP is the primary bridge closure mechanism.
-            // Only check when the trace has recorded ops (not on the first
-            // merge_point call before any bytecodes are traced).
-            let has_trace_ops = self
-                .meta
-                .tracing
-                .as_ref()
-                .map_or(false, |ctx| ctx.recorder.ops().len() > 0);
-            // pyjitpl.py:2979-2983 reached_loop_header parity:
-            // "if not self.partial_trace" — compile_trace is skipped
-            // only during retrace (partial_trace != None). Bridge tracing
-            // and normal tracing both attempt this path.
-            if has_trace_ops && self.meta.has_compiled_targets(green_key) {
-                if let Some(sym) = self.sym.as_ref() {
-                    let jump_args = S::collect_jump_args(sym);
-                    // pyjitpl.py:2974-2976: resumekey is ResumeGuardDescr
-                    // for bridges, ResumeFromInterpDescr for loops.
-                    // compile_trace uses bridge_origin to distinguish.
-                    let bridge_origin = self.bridge_origin();
-                    if matches!(
-                        self.meta
-                            .compile_trace(green_key, &jump_args, bridge_origin),
-                        crate::pyjitpl::CompileOutcome::Compiled { .. }
-                    ) {
-                        // pyjitpl.py:3196: raise_if_successful aborts the
-                        // meta-interp after a successful bridge compilation.
-                        self.meta.abort_trace(false);
-                        self.meta.warm_state.reset_function_counts();
-                        self.sym = None;
-                        self.trace_meta = None;
-                        return Some(DetailedDriverRunOutcome::Jump {
-                            via_blackhole: false,
-                        });
-                    }
-                }
-            }
             // pyjitpl.py:2594: record frame.pc for capture_resumedata.
             if let Some(ctx) = self.meta.trace_ctx() {
                 ctx.last_traced_pc = target_pc;
             }
             self.merge_point(trace_fn);
+            if self.take_compile_trace_success() {
+                self.meta.abort_trace(false);
+                self.meta.warm_state.reset_function_counts();
+                self.sym = None;
+                self.trace_meta = None;
+                self.bridge_info = None;
+                return Some(DetailedDriverRunOutcome::Jump {
+                    via_blackhole: false,
+                });
+            }
         }
         None
     }

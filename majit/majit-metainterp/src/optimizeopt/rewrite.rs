@@ -1643,6 +1643,11 @@ impl OptRewrite {
     /// `optimize_GUARD_CLASS` after the null check, so both opcodes go
     /// through the same known-class / strengthening / postprocess logic.
     fn optimize_guard_class(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+        // rewrite.py:402: info = self.ensure_ptr_info_arg0(op) — installs
+        // an InstancePtrInfo on arg0 when one is missing. Discard the
+        // EnsuredPtrInfo borrow; downstream lookups re-acquire via
+        // `getptrinfo` / `get_ptr_info` against the resolved OpRef.
+        let _ = ctx.ensure_ptr_info_arg0(op);
         let obj = ctx.get_box_replacement(op.arg(0));
         // rewrite.py:397-407: ensure_ptr_info_arg0 → info.py:880 getptrinfo.
         // `getptrinfo(ConstPtr)` returns a synthesized ConstPtrInfo, so a
