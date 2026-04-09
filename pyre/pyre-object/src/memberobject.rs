@@ -28,7 +28,7 @@ pub fn w_member_new(index: u32, name: String, w_cls: PyObjectRef) -> PyObjectRef
     let obj = Box::new(W_MemberDescr {
         ob_header: PyObject {
             ob_type: &MEMBER_TYPE as *const PyType,
-            w_class: std::ptr::null_mut(),
+            w_class: get_instantiate(&MEMBER_TYPE),
         },
         index,
         name: Box::into_raw(Box::new(name)),

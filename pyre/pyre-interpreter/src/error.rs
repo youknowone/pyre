@@ -78,9 +78,26 @@ pub enum PyErrorKind {
     ImportError,
     NotImplementedError,
     AssertionError,
+    /// Raised by `_weakref` when a proxy is dereferenced after the
+    /// referent has been collected.
+    /// pypy/module/_weakref/interp__weakref.py:347
+    /// `oefmt(space.w_ReferenceError, "weakly referenced object no longer exists")`.
+    ReferenceError,
     /// Internal: RETURN_GENERATOR unwind signal (not a real exception).
     /// Carries the generator PyObjectRef as message.
     GeneratorReturn,
+    /// pypy/interpreter/baseobjspace.py:419-420 DescrMismatch.
+    ///
+    /// ```python
+    /// class DescrMismatch(Exception):
+    ///     pass
+    /// ```
+    ///
+    /// Internal control-flow exception raised by `space.descr_self_interp_w`
+    /// when a descriptor's typecheck wrapper sees an instance of the wrong
+    /// class. Caught by `GetSetProperty.descr_property_get/set/del` which
+    /// then re-raises a user-visible TypeError via `descr_call_mismatch`.
+    DescrMismatch,
 }
 
 impl PyError {
@@ -132,6 +149,16 @@ impl PyError {
         }
     }
 
+    /// pypy/module/_weakref/interp__weakref.py:347 — raised by `force()`
+    /// when the referent of a proxy is no longer alive.
+    pub fn reference_error(msg: impl Into<String>) -> Self {
+        PyError {
+            kind: PyErrorKind::ReferenceError,
+            message: msg.into(),
+            exc_object: std::ptr::null_mut(),
+        }
+    }
+
     pub fn stop_iteration() -> Self {
         PyError {
             kind: PyErrorKind::StopIteration,
@@ -165,7 +192,13 @@ impl PyError {
             PyErrorKind::ImportError => ExcKind::ImportError,
             PyErrorKind::NotImplementedError => ExcKind::NotImplementedError,
             PyErrorKind::AssertionError => ExcKind::AssertionError,
+            PyErrorKind::ReferenceError => ExcKind::ReferenceError,
             PyErrorKind::GeneratorReturn => ExcKind::RuntimeError,
+            // DescrMismatch is a control-flow exception caught by
+            // GetSetProperty.descr_property_get/set/del. If it ever escapes
+            // to user code without being converted to TypeError it surfaces
+            // as a TypeError, matching PyPy's eventual descr_call_mismatch.
+            PyErrorKind::DescrMismatch => ExcKind::TypeError,
         }
     }
 
@@ -199,6 +232,7 @@ impl PyError {
             ExcKind::ImportError => PyErrorKind::ImportError,
             ExcKind::NotImplementedError => PyErrorKind::NotImplementedError,
             ExcKind::AssertionError => PyErrorKind::AssertionError,
+            ExcKind::ReferenceError => PyErrorKind::ReferenceError,
             ExcKind::BaseException | ExcKind::Exception => PyErrorKind::RuntimeError,
         }
     }

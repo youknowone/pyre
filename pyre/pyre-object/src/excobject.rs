@@ -28,6 +28,10 @@ pub enum ExcKind {
     ImportError = 13,
     NotImplementedError = 14,
     AssertionError = 15,
+    /// Raised by `_weakref` when a proxy is dereferenced after the
+    /// referent has been collected — pypy/module/_weakref/interp__weakref.py:347
+    /// `oefmt(space.w_ReferenceError, "weakly referenced object no longer exists")`.
+    ReferenceError = 16,
 }
 
 /// Layout: `[ob_type: *const PyType | kind: ExcKind | message: *mut String]`
@@ -101,6 +105,7 @@ pub fn exc_kind_name(kind: ExcKind) -> &'static str {
         ExcKind::ImportError => "ImportError",
         ExcKind::NotImplementedError => "NotImplementedError",
         ExcKind::AssertionError => "AssertionError",
+        ExcKind::ReferenceError => "ReferenceError",
     }
 }
 
@@ -142,6 +147,7 @@ pub fn exc_kind_from_name(name: &str) -> Option<ExcKind> {
         "ImportError" => Some(ExcKind::ImportError),
         "NotImplementedError" => Some(ExcKind::NotImplementedError),
         "AssertionError" => Some(ExcKind::AssertionError),
+        "ReferenceError" => Some(ExcKind::ReferenceError),
         _ => None,
     }
 }

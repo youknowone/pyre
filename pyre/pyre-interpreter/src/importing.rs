@@ -68,7 +68,7 @@ pub fn install_builtin_modules() {
 
     // Minimal C-extension stubs required for stdlib import chains.
     // PyPy: these are all implemented as mixed modules under pypy/module/.
-    register_builtin_module("_weakref", init_weakref);
+    register_builtin_module("_weakref", crate::module::_weakref::moduledef::init);
     register_builtin_module("_abc", init_abc);
     register_builtin_module("_functools", init_functools);
     register_builtin_module("_thread", init_thread);
@@ -510,54 +510,6 @@ fn init_contextvars(ns: &mut PyNamespace) {
         ns,
         "copy_context",
         crate::make_builtin_function("copy_context", |_| Ok(pyre_object::w_none())),
-    );
-}
-
-/// _weakref stub — PyPy: pypy/module/_weakref/
-fn init_weakref(ns: &mut PyNamespace) {
-    // PyPy: interp_weakref.W_Weakref / W_CallableProxy.typedef are real
-    // types so weakref.py can subclass them (`class WeakMethod(ref): ...`).
-    // Stub backing — they just return the referent unchanged.
-    let ref_type = crate::typedef::make_builtin_type("ref", |ns| {
-        crate::namespace_store(
-            ns,
-            "__new__",
-            crate::make_builtin_function("__new__", |args| {
-                // args[0] = cls, args[1] = obj, args[2..] = optional callback
-                Ok(args.get(1).copied().unwrap_or(pyre_object::w_none()))
-            }),
-        );
-    });
-    crate::namespace_store(ns, "ref", ref_type);
-    crate::namespace_store(ns, "ReferenceType", ref_type);
-
-    let proxy_type = crate::typedef::make_builtin_type("proxy", |ns| {
-        crate::namespace_store(
-            ns,
-            "__new__",
-            crate::make_builtin_function("__new__", |args| {
-                Ok(args.get(1).copied().unwrap_or(pyre_object::w_none()))
-            }),
-        );
-    });
-    crate::namespace_store(ns, "proxy", proxy_type);
-    crate::namespace_store(ns, "ProxyType", proxy_type);
-    crate::namespace_store(ns, "CallableProxyType", proxy_type);
-
-    crate::namespace_store(
-        ns,
-        "getweakrefcount",
-        crate::make_builtin_function("getweakrefcount", |_| Ok(pyre_object::w_int_new(0))),
-    );
-    crate::namespace_store(
-        ns,
-        "getweakrefs",
-        crate::make_builtin_function("getweakrefs", |_| Ok(pyre_object::w_list_new(vec![]))),
-    );
-    crate::namespace_store(
-        ns,
-        "_remove_dead_weakref",
-        crate::make_builtin_function("_remove_dead_weakref", |_| Ok(pyre_object::w_none())),
     );
 }
 
