@@ -900,6 +900,42 @@ impl TraceCtx {
         // GuardValue(token, 0) at loop entry for freshly created frames.
     }
 
+    /// pyjitpl.py:3222-3236 `MetaInterp.store_token_in_vable()`.
+    ///
+    ///     def store_token_in_vable(self):
+    ///         vinfo = self.jitdriver_sd.virtualizable_info
+    ///         if vinfo is None:
+    ///             return
+    ///         vbox = self.virtualizable_boxes[-1]
+    ///         if vbox is self.forced_virtualizable:
+    ///             return # we already forced it by hand
+    ///         # in case the force_token has not been recorded, record it here
+    ///         # to make sure we know the virtualizable can be broken. However,
+    ///         # the contents of the virtualizable should be generally correct
+    ///         force_token = self.history.record0(rop.FORCE_TOKEN,
+    ///                                            lltype.nullptr(llmemory.GCREF.TO))
+    ///         self.history.record2(rop.SETFIELD_GC, vbox, force_token,
+    ///                              None, descr=vinfo.vable_token_descr)
+    ///         self.generate_guard(rop.GUARD_NOT_FORCED_2)
+    pub fn store_token_in_vable(&mut self) {
+        let info = match self.virtualizable_info.clone() {
+            Some(info) => info,
+            None => return,
+        };
+        let vbox = match self.standard_virtualizable_box() {
+            Some(b) => b,
+            None => return,
+        };
+        if self.forced_virtualizable == Some(vbox) {
+            return;
+        }
+        let force_token = self.recorder.record_op(OpCode::ForceToken, &[]);
+        let token_descr = info.token_field_descr();
+        self.vable_setfield_descr(vbox, force_token, token_descr);
+        // pyjitpl.py:3236 self.generate_guard(rop.GUARD_NOT_FORCED_2)
+        self.record_guard(OpCode::GuardNotForced2, &[], 0);
+    }
+
     /// pyjitpl.py:3465-3497 `MetaInterp.gen_store_back_in_vable(box)`.
     ///
     ///     def gen_store_back_in_vable(self, box):
