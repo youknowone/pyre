@@ -697,11 +697,6 @@ impl UnrollOptimizer {
                     *arg = shift_back(*arg);
                 }
             }
-            if let Some(ref mut source_slots) = opt_p2.imported_label_source_slots {
-                for arg in source_slots.iter_mut() {
-                    *arg = shift_back(*arg);
-                }
-            }
         }
         // Phase 2 may discover new constants via make_constant (e.g., guard
         // class pointers from collect_use_box_guards).
@@ -1137,7 +1132,6 @@ impl UnrollOptimizer {
             &p1_ops,
             &body_ops,
             &label_args,
-            opt_p2.imported_label_source_slots.as_deref().unwrap_or(&[]),
             &exported_renamed_inputargs,
             &sp.used_boxes,
             &sp.jump_args,
@@ -3481,27 +3475,6 @@ pub(crate) fn import_state(
     OptUnroll::new().import_state(targetargs, exported_state, optimizer, ctx)
 }
 
-/// majit-only sibling of `import_state`: derive the per-non-virtual
-/// inputarg "source slot" array from the same `targetargs` /
-/// VirtualState walk that `make_inputargs` performs.
-///
-/// `imported_label_source_slots` carries the *original* incoming Phase
-/// 2 inputarg OpRef for each label_args entry (rather than the
-/// box-replacement target).  `assemble_peeled_trace_with_jump_args`
-/// uses it to map body source references back onto the correct LABEL
-/// slot during peeled-loop assembly.  RPython does not need this
-/// because Box identity is shared across the assembly boundary; in
-/// majit the slot identity is encoded as a parallel OpRef array.
-pub(crate) fn make_imported_label_source_slots(
-    targetargs: &[OpRef],
-    exported_state: &ExportedState,
-    ctx: &OptContext,
-) -> Vec<OpRef> {
-    exported_state
-        .virtual_state
-        .make_inputarg_source_slots(targetargs, ctx)
-}
-
 /// unroll.py: pick_virtual_state(my_vs, label_vs, target_tokens)
 ///
 /// Given the current virtual state and available target tokens,
@@ -3583,7 +3556,6 @@ fn assemble_peeled_trace(
     p1_ops: &[Op],
     p2_ops: &[Op],
     label_args: &[OpRef],
-    label_source_slots: &[OpRef],
     start_label_args: &[OpRef],
     extra_label_args: &[OpRef],
     body_num_inputs: usize,
@@ -3598,7 +3570,6 @@ fn assemble_peeled_trace(
         p1_ops,
         p2_ops,
         label_args,
-        label_source_slots,
         start_label_args,
         extra_label_args,
         extra_label_args,
@@ -3618,7 +3589,6 @@ fn assemble_peeled_trace_with_jump_args(
     p1_ops: &[Op],
     p2_ops: &[Op],
     label_args: &[OpRef],
-    label_source_slots: &[OpRef],
     start_label_args: &[OpRef],
     extra_label_args: &[OpRef],
     extra_jump_args: &[OpRef],
@@ -3722,16 +3692,7 @@ fn assemble_peeled_trace_with_jump_args(
         .filter(|&p| p != u32::MAX)
         .max()
         .unwrap_or(0);
-    // Account for label_source_slots positions to prevent alias
-    // position collisions. label_source_slots carry Phase 2 inputarg
-    // identities that may be higher than preamble op positions.
-    let source_slot_max = label_source_slots
-        .iter()
-        .map(|s| s.0)
-        .filter(|&p| p != u32::MAX)
-        .max()
-        .unwrap_or(0);
-    let mut max_pos = result_max.max(p1_all_max).max(source_slot_max);
+    let mut max_pos = result_max.max(p1_all_max);
     max_pos = next_free_pos(max_pos.saturating_add(1));
     // Step 6 of the Box identity plan: the per-iteration alias /
     // rescue / dedup remap maps used to live here, splitting the
@@ -3941,12 +3902,12 @@ fn assemble_peeled_trace_with_jump_args(
     // `full_label_args` is sufficient — the JUMP's mapped_base_args
     // path will pick up the corresponding fresh value on the next
     // iteration.
+    // After Box identity Step 4, body op args are pre-resolved to label_args
+    // (or imported short-preamble result OpRefs). The source_slot OpRefs
+    // never appear in body args anymore, so the body-use-before-def filter
+    // only needs to skip args that map to filtered_extra_jump_args.
     let mut carried_source_slots: std::collections::HashSet<OpRef> =
-        if !label_source_slots.is_empty() && label_source_slots.len() == label_args.len() {
-            label_source_slots.iter().copied().collect()
-        } else {
-            (0..label_args.len()).map(|i| OpRef(i as u32)).collect()
-        };
+        std::collections::HashSet::new();
     carried_source_slots.extend(filtered_extra_jump_args.iter().copied());
     // `label_set` tracks which OpRefs are already carried by the label so
     // that the body-use-before-def pass doesn't add the same OpRef twice
@@ -4056,19 +4017,10 @@ fn assemble_peeled_trace_with_jump_args(
         .chain(preamble_defs.iter().copied())
         .collect();
 
-    if !label_source_slots.is_empty() && label_source_slots.len() == label_args.len() {
-        for (&source_slot, &la) in label_source_slots.iter().zip(label_args.iter()) {
-            if !source_slot.is_none() {
-                input_remap.insert(source_slot, la);
-            }
-        }
-    } else {
-        for (i, &la) in label_args.iter().enumerate() {
-            if (i as u32) < body_num_inputs as u32 {
-                input_remap.insert(OpRef(i as u32), la);
-            }
-        }
-    }
+    // RPython parity: body op args reach the assembler already resolved
+    // through ctx.get_box_replacement (optimizer.rs:2236-2262 forwarding-
+    // resolve pass), so they already match label_args. No source_slot →
+    // label_arg input_remap step is needed.
     for (i, &source_slot) in filtered_extra_label_args.iter().enumerate() {
         if !source_slot.is_none() {
             if let Some(&extended_label_arg) = full_label_args.get(extra_label_start_idx + i) {
@@ -4234,12 +4186,11 @@ fn assemble_peeled_trace_with_jump_args(
             };
             if std::env::var_os("MAJIT_LOG").is_some() {
                 eprintln!(
-                    "[jit] assemble_jump: inner_label={:?} original_args={:?} mapped_base_args={:?} label_args={:?} label_source_slots={:?} filtered_extra_jump_args={:?}",
+                    "[jit] assemble_jump: inner_label={:?} original_args={:?} mapped_base_args={:?} label_args={:?} filtered_extra_jump_args={:?}",
                     current_inner_label_index,
                     original_args,
                     mapped_base_args,
                     label_args,
-                    label_source_slots,
                     filtered_extra_jump_args,
                 );
             }
@@ -5857,7 +5808,6 @@ mod tests {
             &p1_ops,
             &p2_ops,
             &[OpRef(10)],
-            &[],
             &[OpRef(0)],
             &[],
             1,
@@ -5912,7 +5862,6 @@ mod tests {
             &p1_ops,
             &p2_ops,
             &[OpRef(11)],
-            &[],
             &[OpRef(0)],
             &[],
             1,
@@ -5976,7 +5925,6 @@ mod tests {
             &p1_ops,
             &p2_ops,
             &[OpRef(0)],
-            &[],
             &[OpRef(0)],
             &[],
             1,
@@ -5999,6 +5947,11 @@ mod tests {
 
     #[test]
     fn test_assemble_peeled_trace_extends_label_with_used_boxes() {
+        // Production caller passes body ops whose args have already been
+        // resolved through ctx.get_box_replacement (optimizer.rs:2236-2262
+        // forwarding-resolve pass). We mirror that here by writing the
+        // resolved label_arg (OpRef(10)) directly into the body op rather
+        // than the raw inputarg position OpRef(0).
         let p1_ops = vec![{
             let mut op = Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]);
             op.pos = OpRef(3);
@@ -6006,18 +5959,17 @@ mod tests {
         }];
         let p2_ops = vec![
             {
-                let mut op = Op::new(OpCode::IntMul, &[OpRef(50), OpRef(0)]);
+                let mut op = Op::new(OpCode::IntMul, &[OpRef(50), OpRef(10)]);
                 op.pos = OpRef(1);
                 op
             },
-            Op::new(OpCode::Jump, &[OpRef(0), OpRef(50)]),
+            Op::new(OpCode::Jump, &[OpRef(10), OpRef(50)]),
         ];
 
         let combined = assemble_peeled_trace(
             &p1_ops,
             &p2_ops,
             &[OpRef(10)],
-            &[],
             &[OpRef(0)],
             &[OpRef(50)],
             1,
@@ -6041,6 +5993,9 @@ mod tests {
 
     #[test]
     fn test_assemble_peeled_trace_remaps_extra_label_source_slots() {
+        // Production caller pre-resolves body args through
+        // ctx.get_box_replacement; OpRef(0) (Phase 2 inputarg slot) is
+        // pre-replaced with OpRef(10) (the corresponding label_arg).
         let p2_ops = vec![
             {
                 let mut op = Op::new(OpCode::GetfieldGcPureI, &[OpRef(50)]);
@@ -6048,14 +6003,13 @@ mod tests {
                 op.descr = Some(majit_ir::make_field_descr(0, 8, majit_ir::Type::Int, true));
                 op
             },
-            Op::new(OpCode::Jump, &[OpRef(0), OpRef(50)]),
+            Op::new(OpCode::Jump, &[OpRef(10), OpRef(50)]),
         ];
 
         let combined = assemble_peeled_trace(
             &[],
             &p2_ops,
             &[OpRef(10)],
-            &[OpRef(0)],
             &[OpRef(0)],
             &[OpRef(50)],
             1,
@@ -6085,6 +6039,11 @@ mod tests {
 
     #[test]
     fn test_assemble_peeled_trace_carries_body_value_used_before_local_def() {
+        // Production caller pre-resolves body args through
+        // ctx.get_box_replacement (optimizer.rs:2236-2262), so
+        // OpRef(0) (Phase 2 inputarg slot) would already be replaced
+        // with OpRef(10) (the label_arg for that slot) by the time
+        // it reaches the assembler. We mirror that here.
         let p2_ops = vec![
             {
                 let mut op = Op::new(OpCode::GuardTrue, &[OpRef(64)]);
@@ -6092,7 +6051,7 @@ mod tests {
                 op
             },
             {
-                let mut op = Op::new(OpCode::IntAdd, &[OpRef(0), OpRef::from_const(0)]);
+                let mut op = Op::new(OpCode::IntAdd, &[OpRef(10), OpRef::from_const(0)]);
                 op.pos = OpRef(64);
                 op
             },
@@ -6104,7 +6063,6 @@ mod tests {
             &[],
             &p2_ops,
             &[OpRef(10)],
-            &[OpRef(0)],
             &[OpRef(0)],
             &[],
             1,
@@ -6148,7 +6106,6 @@ mod tests {
             &[],
             &p2_ops,
             &[OpRef(10), OpRef(11), OpRef(12), OpRef(13), OpRef(14)],
-            &[],
             &[OpRef(100), OpRef(101), OpRef(102)],
             &[OpRef(13), OpRef(14)],
             5,
@@ -6186,7 +6143,6 @@ mod tests {
             &[],
             &p2_ops,
             &[OpRef(10)],
-            &[],
             &[OpRef(0)],
             &[],
             1,
@@ -6208,14 +6164,16 @@ mod tests {
 
     #[test]
     fn test_assemble_peeled_trace_skips_constant_extra_label_args() {
-        let p2_ops = vec![Op::new(OpCode::Jump, &[OpRef(0)])];
+        // Production caller pre-resolves the Jump's body inputarg ref
+        // (OpRef(0)) to label_args[0] = OpRef(10) before it reaches the
+        // assembler.
+        let p2_ops = vec![Op::new(OpCode::Jump, &[OpRef(10)])];
         let constants = std::collections::HashMap::from([(7_u32, 606_i64)]);
 
         let combined = assemble_peeled_trace(
             &[],
             &p2_ops,
             &[OpRef(10)],
-            &[OpRef(0)],
             &[OpRef(0)],
             &[OpRef(7), OpRef(8)],
             1,
@@ -6232,23 +6190,28 @@ mod tests {
     }
 
     #[test]
-    fn test_assemble_peeled_trace_maps_body_inputs_via_source_slots() {
+    fn test_assemble_peeled_trace_passes_through_resolved_body_inputs() {
+        // Production caller pre-resolves Phase 2 body op args through
+        // ctx.get_box_replacement (optimizer.rs:2236-2262), so by the time
+        // they reach assemble_peeled_trace they already match label_args.
+        // The assembler is therefore a passthrough for inputarg references
+        // — no source_slot input_remap needed. This test verifies that
+        // pre-resolved body args survive intact.
         let mut constants = std::collections::HashMap::new();
         constants.insert(OpRef::from_const(0).0, 1);
         let p2_ops = vec![
             {
-                let mut op = Op::new(OpCode::IntAdd, &[OpRef(5), OpRef::from_const(0)]);
+                let mut op = Op::new(OpCode::IntAdd, &[OpRef(200), OpRef::from_const(0)]);
                 op.pos = OpRef(20);
                 op
             },
-            Op::new(OpCode::Jump, &[OpRef(5)]),
+            Op::new(OpCode::Jump, &[OpRef(200)]),
         ];
 
         let combined = assemble_peeled_trace(
             &[],
             &p2_ops,
             &[OpRef(200), OpRef(300)],
-            &[OpRef(5), OpRef(0)],
             &[OpRef(0)],
             &[],
             6,
