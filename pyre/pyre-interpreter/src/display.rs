@@ -6,7 +6,9 @@ use pyre_object::pyobject::{
     PyType, STR_TYPE, TYPE_TYPE,
 };
 
-use crate::{BUILTIN_CODE_TYPE, FUNCTION_TYPE, builtin_code_name, function_get_name};
+use crate::{
+    BUILTIN_CODE_TYPE, BUILTIN_FUNCTION_TYPE, FUNCTION_TYPE, builtin_code_name, function_get_name,
+};
 
 /// Try to call a dunder method (__repr__, __str__, etc.) on an instance.
 ///
@@ -108,17 +110,15 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> String {
             // Raw BuiltinCode objects (Code-level, not normally user-visible)
             let name = builtin_code_name(obj);
             format!("<code {name}>")
-        } else if std::ptr::eq(tp, &FUNCTION_TYPE as *const PyType) {
+        } else if std::ptr::eq(tp, &BUILTIN_FUNCTION_TYPE as *const PyType) {
+            // function.py:721 BuiltinFunction.descr_function_repr
             let name = function_get_name(obj);
-            // Distinguish builtins from user functions by checking code type
-            let is_builtin = unsafe {
-                crate::is_builtin_code(crate::function_get_code(obj) as pyre_object::PyObjectRef)
-            };
-            if is_builtin {
-                format!("<built-in function {name}>")
-            } else {
-                format!("<function {name}>")
-            }
+            format!("<built-in function {name}>")
+        } else if std::ptr::eq(tp, &FUNCTION_TYPE as *const PyType) {
+            // function.py:268-269 Function.descr_function_repr —
+            // FunctionWithFixedCode inherits this and reports as <function>.
+            let name = function_get_name(obj);
+            format!("<function {name}>")
         } else if std::ptr::eq(tp, &EXCEPTION_TYPE as *const PyType) {
             let msg = pyre_object::excobject::w_exception_get_message(obj);
             msg.to_string()

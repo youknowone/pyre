@@ -10,6 +10,8 @@ use pyre_object::pyobject::*;
 
 /// Type descriptor for user-defined functions.
 pub static FUNCTION_TYPE: PyType = pyre_object::pyobject::new_pytype("function");
+/// Type descriptor for module-level builtins.
+pub static BUILTIN_FUNCTION_TYPE: PyType = pyre_object::pyobject::new_pytype("builtin_function");
 
 /// User-defined function object.
 ///
@@ -86,14 +88,25 @@ pub fn function_new_with_closure(
     w_func_globals: *mut PyNamespace,
     closure: PyObjectRef,
 ) -> PyObjectRef {
+    function_new_impl(&FUNCTION_TYPE, code, name, w_func_globals, closure, true)
+}
+
+fn function_new_impl(
+    ob_type: &'static PyType,
+    code: *const (),
+    name: String,
+    w_func_globals: *mut PyNamespace,
+    closure: PyObjectRef,
+    can_change_code: bool,
+) -> PyObjectRef {
     let name_ptr = Box::into_raw(Box::new(name)) as *const String;
     let obj = Box::new(Function {
         ob: PyObject {
-            ob_type: &FUNCTION_TYPE as *const PyType,
-            w_class: pyre_object::pyobject::get_instantiate(&FUNCTION_TYPE),
+            ob_type: ob_type as *const PyType,
+            w_class: pyre_object::pyobject::get_instantiate(ob_type),
         },
         code,
-        can_change_code: true, // function.py:33
+        can_change_code,
         name: name_ptr,
         w_func_globals,
         closure,
@@ -111,22 +124,24 @@ pub fn function_new_with_fixed_code(
     name: String,
     w_func_globals: *mut PyNamespace,
 ) -> PyObjectRef {
-    let name_ptr = Box::into_raw(Box::new(name)) as *const String;
-    let obj = Box::new(Function {
-        ob: PyObject {
-            ob_type: &FUNCTION_TYPE as *const PyType,
-            w_class: pyre_object::pyobject::get_instantiate(&FUNCTION_TYPE),
-        },
+    function_new_impl(&FUNCTION_TYPE, code, name, w_func_globals, PY_NULL, false)
+}
+
+/// function.py:706 — `class BuiltinFunction(Function): can_change_code = False`
+/// Allocate a module builtin whose typedef intentionally omits `__get__`.
+pub fn function_new_builtin(
+    code: *const (),
+    name: String,
+    w_func_globals: *mut PyNamespace,
+) -> PyObjectRef {
+    function_new_impl(
+        &BUILTIN_FUNCTION_TYPE,
         code,
-        can_change_code: false, // function.py:704
-        name: name_ptr,
+        name,
         w_func_globals,
-        closure: PY_NULL,
-        defs_w: PY_NULL,
-        w_kw_defs: PY_NULL,
-        w_module: PY_NULL,
-    });
-    Box::into_raw(obj) as PyObjectRef
+        PY_NULL,
+        false,
+    )
 }
 
 /// function.py:367-370 — `_check_code_mutable(attr)`:
@@ -161,7 +176,7 @@ pub unsafe fn _get_immutable_code(func: PyObjectRef) -> *const () {
 /// `obj` must be a valid, non-null pointer to a `PyObject`.
 #[inline]
 pub unsafe fn is_function(obj: PyObjectRef) -> bool {
-    unsafe { py_type_check(obj, &FUNCTION_TYPE) }
+    unsafe { py_type_check(obj, &FUNCTION_TYPE) || py_type_check(obj, &BUILTIN_FUNCTION_TYPE) }
 }
 
 /// function.py:78-83 — `getcode(self)`: three-way dispatch.

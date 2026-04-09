@@ -3282,24 +3282,22 @@ unsafe fn get(
         return Ok(None);
     }
 
-    // function.py: Function.typedef has __get__ (descr_function_get → bound
-    // method). interp2app(...) installed on a TypeDef builds a
-    // FunctionWithFixedCode, which inherits Function.typedef and therefore
-    // binds via __get__. pyre's `make_builtin_function` is the equivalent of
-    // FunctionWithFixedCode, so type-method dispatch must wrap descr+obj
-    // in a Method here.
-    //
-    // (BuiltinFunction is a separate class whose typedef explicitly removes
-    // __get__ — pyre does not yet model that distinction; the few top-level
-    // builtins that should not bind are accessed via the module namespace
-    // path, never through this descriptor route.)
-    if crate::is_function(descr)
-        && crate::is_builtin_code(crate::function_get_code(descr) as pyre_object::PyObjectRef)
-    {
-        if obj.is_null() || is_none(obj) {
+    // PyPy splits BuiltinFunction from FunctionWithFixedCode at the typedef
+    // layer: BuiltinFunction omits __get__, while FunctionWithFixedCode keeps
+    // Function.__get__ and binds like a normal method descriptor.
+    if crate::is_function(descr) {
+        let ob_type = unsafe { (*descr).ob_type };
+        if std::ptr::eq(ob_type, &crate::BUILTIN_FUNCTION_TYPE as *const _) {
             return Ok(Some(descr));
         }
-        return Ok(Some(pyre_object::w_method_new(descr, obj, w_type)));
+        if std::ptr::eq(ob_type, &crate::FUNCTION_TYPE as *const _)
+            && crate::is_builtin_code(crate::function_get_code(descr) as pyre_object::PyObjectRef)
+        {
+            if obj.is_null() || is_none(obj) {
+                return Ok(Some(descr));
+            }
+            return Ok(Some(pyre_object::w_method_new(descr, obj, w_type)));
+        }
     }
 
     // property: PyPy W_Property.get → call fget(obj)
