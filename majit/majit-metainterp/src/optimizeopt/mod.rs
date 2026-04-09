@@ -33,7 +33,7 @@ pub mod vstring;
 use std::collections::{HashMap, HashSet};
 
 use crate::optimizeopt::intutils::IntBound;
-use info::PtrInfo;
+use info::{EnsuredPtrInfo, PtrInfo};
 use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Value};
 use std::collections::VecDeque;
 
@@ -131,6 +131,12 @@ pub struct ImportedShortSource {
 /// SizeDescr size_bytes, and returns a raw pointer (GcRef) to freshly
 /// allocated memory. The optimizer writes field values directly.
 pub type ConstantFoldAllocFn = Box<dyn Fn(usize) -> majit_ir::GcRef>;
+
+/// Re-export of `info::StringLengthResolver` for callers that import
+/// `optimizeopt::StringLengthResolver`. The runtime hook signature is
+/// `Arc<dyn Fn(GcRef, u8) -> Option<i64> + Send + Sync>`. See
+/// `info::EnsuredPtrInfo::getlenbound` for the consumer side.
+pub use crate::optimizeopt::info::StringLengthResolver;
 
 /// Context provided to optimization passes.
 ///
@@ -285,6 +291,12 @@ pub struct OptContext {
     /// When set, the optimizer can fold immutable virtuals filled with
     /// constants into compile-time constant pointers (info.py:140-145).
     pub constant_fold_alloc: Option<ConstantFoldAllocFn>,
+    /// info.py:810-822 `ConstPtrInfo.getstrlen1(mode)` — runtime hook for
+    /// constant byte-string / unicode-string length lookup. Set by the
+    /// host runtime (pyre etc.) at OptContext construction time. When
+    /// `None`, `EnsuredPtrInfo::getlenbound(Some(_))` falls back to
+    /// `IntBound::nonnegative()`.
+    pub string_length_resolver: Option<StringLengthResolver>,
     /// True while optimizer.py:_emit_operation equivalent is forcing args
     /// just before final emission. In this phase, virtual forcing must emit
     /// directly into new_operations instead of re-entering the pass chain.
@@ -742,6 +754,7 @@ impl OptContext {
             pending_pure_from_args: Vec::new(),
             pending_pure_from_args2: Vec::new(),
             constant_fold_alloc: None,
+            string_length_resolver: None,
             quasi_immutable_deps: HashSet::new(),
             snapshot_boxes: HashMap::new(),
             snapshot_frame_sizes: HashMap::new(),
@@ -820,6 +833,7 @@ impl OptContext {
             pending_pure_from_args: Vec::new(),
             pending_pure_from_args2: Vec::new(),
             constant_fold_alloc: None,
+            string_length_resolver: None,
             quasi_immutable_deps: HashSet::new(),
             snapshot_boxes: HashMap::new(),
             snapshot_frame_sizes: HashMap::new(),
@@ -1543,15 +1557,6 @@ impl OptContext {
             .unwrap_or_default()
     }
 
-    /// resoperation.py:240-242: set_forwarded(forwarded_to) — store the
-    /// forwarding target on this box. Info is set separately by setinfo /
-    /// setinfo_from_preamble.
-    ///
-    /// NOTE: This function now matches RPython's set_forwarded semantics,
-    /// but the full import/export cycle that calls it (import_state,
-    /// cross-slot fresh allocation) still operates on majit's flat OpRef
-    /// model, not RPython's per-Box identity. See XXX comments in
-    /// unroll.rs:import_state and optimizer.rs:imported_loop_state.
     /// optimizer.py: pure_from_args1 parity.
     /// Register reverse-pure: pure(opcode, result) = arg0.
     /// Consumed by OptPure at flush time.
@@ -2731,10 +2736,12 @@ impl OptContext {
         }
         // fw = op.get_forwarded()
         // if isinstance(fw, IntBound): return None  →  get_ptr_info
-        //   already returns None for non-PtrInfo forwards (IntBound is
-        //   tracked separately in OptContext::int_bounds, not in
-        //   OptContext::forwarded[Forwarded::Info]).
+        //   only returns Some for Forwarded::Info(PtrInfo). An int-typed
+        //   box that holds Forwarded::IntBound returns None here, matching
+        //   the upstream early-return on IntBound forwarding.
         // if fw is not None: assert isinstance(fw, AbstractRawPtrInfo); return fw
+        //   AbstractRawPtrInfo ↔ PtrInfo::VirtualRawBuffer / VirtualRawSlice
+        //   in majit (see is_raw_ptr).
         self.get_ptr_info(resolved).map(std::borrow::Cow::Borrowed)
     }
 
@@ -2794,7 +2801,7 @@ impl OptContext {
     /// Delegates to `getptrinfo` (which synthesizes `ConstPtrInfo` for
     /// constant Refs) and then `PtrInfo::get_known_class`, so constant
     /// pointers are handled via `cls_of_box` the same way
-    /// `KnownClass`/`Instance`/`Virtual` read their stored `known_class`.
+    /// `Instance` / `Virtual` read their stored `known_class`.
     pub fn get_known_class(&self, opref: OpRef) -> Option<majit_ir::GcRef> {
         self.getptrinfo(opref)?.get_known_class()
     }
@@ -2856,11 +2863,9 @@ impl OptContext {
     ///
     /// - `RawBufferPtrInfo` ↔ majit `PtrInfo::VirtualRawBuffer` (created
     ///   by `OptVirtualize` from `RAW_MALLOC_VARSIZE_CHAR`).
-    /// - `RawSlicePtrInfo` is created upstream by
-    ///   `virtualize.py:60 make_virtual_raw_slice` from
-    ///   `optimize_INT_ADD(raw_buffer, const_offset)`. majit has neither
-    ///   the `PtrInfo::VirtualRawSlice` variant nor the `INT_ADD` slice
-    ///   creator yet — TODO line-by-line port.
+    /// - `RawSlicePtrInfo` ↔ majit `PtrInfo::VirtualRawSlice` (created
+    ///   by `OptVirtualize::optimize_int_add` slice creator,
+    ///   virtualize.py:60 make_virtual_raw_slice).
     /// - `RawStructPtrInfo` is defined at info.py:452 but never
     ///   instantiated anywhere in upstream (`grep -rn "RawStructPtrInfo("
     ///   rpython/jit/` returns only the class definition). It is dead
@@ -2875,9 +2880,7 @@ impl OptContext {
         let resolved = self.get_box_replacement(opref);
         matches!(
             self.get_ptr_info(resolved),
-            Some(PtrInfo::VirtualRawBuffer(_)) // TODO add VirtualRawSlice (info.py:459) once
-                                               //      OptVirtualize::optimize_int_add slice
-                                               //      creator + variant land.
+            Some(PtrInfo::VirtualRawBuffer(_)) | Some(PtrInfo::VirtualRawSlice(_))
         )
     }
 
@@ -3001,7 +3004,8 @@ impl OptContext {
         self.set_ptr_info(resolved, PtrInfo::NonNull { last_guard_pos: -1 });
     }
 
-    /// optimizer.py:461-499: ensure_ptr_info_arg0(op)
+    /// optimizer.py:461-499 `ensure_ptr_info_arg0(op)` — direct line-by-line
+    /// port that returns the same kind of value as PyPy.
     ///
     /// ```python
     /// def ensure_ptr_info_arg0(self, op):
@@ -3044,27 +3048,121 @@ impl OptContext {
     ///     return opinfo
     /// ```
     ///
-    /// Returns the resolved arg0 OpRef so callers can fetch the
-    /// freshly-installed PtrInfo via `get_ptr_info(_mut)`. Borrow-checker
-    /// constraint: the PtrInfo lives in `self.forwarded` and would
-    /// otherwise force `&mut self` to extend through the call site.
-    pub fn ensure_ptr_info_arg0(&mut self, op: &Op) -> OpRef {
+    /// Returns an [`EnsuredPtrInfo`] discriminating the constant arg0 path
+    /// (`Constant(GcRef)` ↔ `info.ConstPtrInfo(arg0)`) from the regular
+    /// path (`Forwarded(&mut PtrInfo)` ↔ `arg0.set_forwarded(opinfo); return
+    /// opinfo`). Callers invoke methods on the return value directly,
+    /// matching PyPy's `structinfo.setfield(...)` /
+    /// `arrayinfo.getlenbound(...)` patterns.
+    pub fn ensure_ptr_info_arg0<'s>(&'s mut self, op: &Op) -> EnsuredPtrInfo<'s> {
         use crate::optimizeopt::info::Forwarded;
+        // optimizer.py:464: arg0 = self.get_box_replacement(op.getarg(0))
         let arg0 = self.get_box_replacement(op.arg(0));
-        // optimizer.py:464-466: arg0.is_constant() → return ConstPtrInfo(arg0).
-        // Constant arg0s are read-only — no mutation needed; callers fetch
-        // the synthesized ConstPtrInfo via getptrinfo() which materializes a
-        // fresh ConstPtrInfo on demand. Return early so we don't overwrite
-        // the constant slot.
-        if arg0.is_constant() {
-            return arg0;
+        // optimizer.py:465-466: if arg0.is_constant(): return info.ConstPtrInfo(arg0)
+        //
+        // PyPy's `info.ConstPtrInfo(arg0)` wraps the constant box itself,
+        // which can be either a `ConstPtr` (Ref) or a `ConstInt` (raw
+        // pointer). PyPy doesn't reject either at this point — downstream
+        // code calls `_const.getref_base()` and raises `InvalidLoop` only
+        // when the ref is null. The Rust port matches that permissive
+        // contract: extract whatever GcRef we can (Ref → the gcref, raw
+        // pointer Int → cast, anything else → null sentinel) and let the
+        // downstream user decide whether to act on it.
+        if arg0.is_constant() || self.get_constant(arg0).is_some() {
+            let gcref = match self.get_constant(arg0) {
+                Some(Value::Ref(g)) => *g,
+                Some(Value::Int(bits)) => majit_ir::GcRef(*bits as usize),
+                // Float / Void / no-constant fall back to a null sentinel —
+                // PyPy's getref_base would return null and InvalidLoop guard
+                // the dereference at the actual use site.
+                _ => majit_ir::GcRef(0),
+            };
+            // info.py:810-822 `ConstPtrInfo.getstrlen1(mode)`: clone the
+            // resolver Arc into the EnsuredPtrInfo so subsequent
+            // `getlenbound(Some(mode))` calls can ask the runtime for an
+            // exact constant string length without re-borrowing self.
+            let resolver = self.string_length_resolver.clone();
+            return EnsuredPtrInfo::Constant {
+                gcref,
+                string_length_resolver: resolver,
+            };
         }
-        // optimizer.py:467-473: virtual ptr info → return as-is; non-virtual
-        // PtrInfo → preserve last_guard_pos for the upgrade.
-        let last_guard_pos = match self.get_ptr_info(arg0) {
-            Some(info) if info.is_virtual() => return arg0,
-            Some(info) => info.last_guard_pos().unwrap_or(-1),
-            None => -1,
+        // optimizer.py:467-474:
+        //     opinfo = arg0.get_forwarded()
+        //     if isinstance(opinfo, info.AbstractVirtualPtrInfo):
+        //         return opinfo
+        //     elif opinfo is not None:
+        //         last_guard_pos = opinfo.get_last_guard_pos()
+        //     else:
+        //         last_guard_pos = -1
+        //     assert opinfo is None or opinfo.__class__ is info.NonNullPtrInfo
+        //
+        // The PyPy class hierarchy that drives the AbstractVirtualPtrInfo
+        // early-return:
+        //
+        //     PtrInfo
+        //       NonNullPtrInfo                       ← only this falls through
+        //         AbstractVirtualPtrInfo
+        //           AbstractStructPtrInfo
+        //             InstancePtrInfo                ← Instance / Virtual
+        //             StructPtrInfo                  ← Struct / VirtualStruct
+        //           AbstractRawPtrInfo
+        //             RawBufferPtrInfo               ← VirtualRawBuffer
+        //             RawSlicePtrInfo                ← VirtualRawSlice
+        //           ArrayPtrInfo                     ← Array / VirtualArray
+        //             ArrayStructInfo                ← VirtualArrayStruct
+        //         vstring.StrPtrInfo                 ← Str
+        //       ConstPtrInfo                         ← Constant (handled before)
+        //
+        // The early-return path uses a `&'s mut PtrInfo` whose lifetime
+        // matches the function return. Once that mutable borrow is taken,
+        // the borrow checker conservatively prevents any further write to
+        // `self.forwarded[idx]` even on the construction branch (which
+        // never executes when we early-returned). To stay close to PyPy's
+        // single-`opinfo` shape we read the slot immutably with
+        // `get_ptr_info` to compute `last_guard_pos`, drop that read, and
+        // then either re-borrow mutably for the early return or fall
+        // through to the upgrade.
+        if let Some(
+            PtrInfo::Instance(_)
+            | PtrInfo::Virtual(_)
+            | PtrInfo::Struct(_)
+            | PtrInfo::VirtualStruct(_)
+            | PtrInfo::Array(_)
+            | PtrInfo::VirtualArray(_)
+            | PtrInfo::VirtualArrayStruct(_)
+            | PtrInfo::VirtualRawBuffer(_)
+            | PtrInfo::VirtualRawSlice(_)
+            | PtrInfo::Virtualizable(_)
+            | PtrInfo::Str(_),
+        ) = self.get_ptr_info(arg0)
+        {
+            // optimizer.py:469: return opinfo. The immutable borrow above
+            // ends at the `if let` brace, freeing `self.forwarded[idx]`
+            // for the mutable re-borrow below.
+            let idx = arg0.0 as usize;
+            let info = match &mut self.forwarded[idx] {
+                Forwarded::Info(info) => info,
+                other => unreachable!(
+                    "ensure_ptr_info_arg0: forwarded[{}] changed under us: {:?}",
+                    idx, other
+                ),
+            };
+            return EnsuredPtrInfo::Forwarded(info);
+        }
+        let last_guard_pos = if let Some(opinfo) = self.get_ptr_info(arg0) {
+            // optimizer.py:474:
+            //     assert opinfo is None or opinfo.__class__ is info.NonNullPtrInfo
+            debug_assert!(
+                matches!(opinfo, PtrInfo::NonNull { .. }),
+                "ensure_ptr_info_arg0: existing non-virtual PtrInfo must be NonNullPtrInfo before upgrade, got {:?}",
+                opinfo
+            );
+            // optimizer.py:471: last_guard_pos = opinfo.get_last_guard_pos()
+            opinfo.last_guard_pos().unwrap_or(-1)
+        } else {
+            // optimizer.py:472-473: else: last_guard_pos = -1
+            -1
         };
         // optimizer.py:475-495: dispatch on opcode to construct the right
         // PtrInfo class. The Rust port reuses PtrInfo factory constructors
@@ -3074,16 +3172,45 @@ impl OptContext {
             || op.opcode == OpCode::SetfieldGc
             || op.opcode == OpCode::QuasiimmutField
         {
-            // optimizer.py:476-484: getfield / setfield_gc / quasiimmut_field
-            // → InstancePtrInfo or StructPtrInfo with init_fields. The Rust
-            // port elides parent_descr.is_object() dispatch — majit's
-            // FieldDescr trait does not yet expose `parent_descr`, and
-            // current call sites only need the array branches. Field call
-            // sites construct PtrInfo eagerly via OptVirtualize.
+            // optimizer.py:476-484:
+            //     descr = op.getdescr()
+            //     parent_descr = descr.get_parent_descr()
+            //     if parent_descr.is_object():
+            //         opinfo = info.InstancePtrInfo(parent_descr)
+            //     else:
+            //         opinfo = info.StructPtrInfo(parent_descr)
+            //     opinfo.init_fields(parent_descr, descr.get_index())
+            let field_descr = op
+                .descr
+                .as_ref()
+                .and_then(|d| d.as_field_descr())
+                .expect("ensure_ptr_info_arg0: field op without FieldDescr");
+            let parent_descr = field_descr.parent_descr().expect(
+                "ensure_ptr_info_arg0: FieldDescr.parent_descr() returned None — \
+                 the FieldDescr implementation must override parent_descr() \
+                 for orthodox parity with optimizer.py:478",
+            );
+            // optimizer.py:480-484: parent_descr.is_object() decides Instance vs Struct.
+            // info.py:180-188 init_fields(parent_descr, index) sets self.descr
+            // and pre-allocates _fields. The Rust port stores fields as
+            // `Vec<(idx, OpRef)>` which grows on demand, so the only durable
+            // effect of init_fields is `self.descr = parent_descr` — already
+            // captured here by the Instance/Struct constructors.
             //
-            // For parity scaffolding we still install an empty InstancePtrInfo
-            // here so the dispatch shape matches RPython.
-            PtrInfo::instance(op.descr.clone(), None)
+            // PyPy unconditionally calls `parent_descr.is_object()` (raises
+            // AttributeError if parent_descr isn't a SizeDescr). The Rust
+            // port mirrors this strict contract by panicking when the
+            // DescrRef downcast fails, rather than silently defaulting to
+            // false.
+            let is_object = parent_descr
+                .as_size_descr()
+                .expect("ensure_ptr_info_arg0: FieldDescr.parent_descr() must point at a SizeDescr")
+                .is_object();
+            if is_object {
+                PtrInfo::instance(Some(parent_descr), None)
+            } else {
+                PtrInfo::struct_ptr(parent_descr)
+            }
         } else if op.opcode.is_getarrayitem()
             || op.opcode == OpCode::SetarrayitemGc
             || op.opcode == OpCode::ArraylenGc
@@ -3119,6 +3246,8 @@ impl OptContext {
             // optimizer.py:494-495: assert False, "operations %s unsupported"
             panic!("ensure_ptr_info_arg0: opcode {:?} unsupported", op.opcode);
         };
+        // optimizer.py:496: assert isinstance(opinfo, info.NonNullPtrInfo)
+        // — every constructed PtrInfo above is a NonNullPtrInfo subclass.
         // optimizer.py:497: opinfo.last_guard_pos = last_guard_pos
         new_info.set_last_guard_pos(last_guard_pos);
         // optimizer.py:498: arg0.set_forwarded(opinfo)
@@ -3127,7 +3256,13 @@ impl OptContext {
             self.forwarded.resize(idx + 1, Forwarded::None);
         }
         self.forwarded[idx] = Forwarded::Info(new_info);
-        arg0
+        // optimizer.py:499: return opinfo — re-borrow the freshly-installed
+        // PtrInfo so the caller can mutate it via Forwarded variant methods.
+        let info = match &mut self.forwarded[idx] {
+            Forwarded::Info(info) => info,
+            _ => unreachable!(),
+        };
+        EnsuredPtrInfo::Forwarded(info)
     }
 
     /// optimizer.py:453-459: make_nonnull_str — record StrPtrInfo on a string box.
@@ -3446,10 +3581,10 @@ mod constant_ptr_info_tests {
             .get_const_info_mut(opref)
             .expect("Ref constant should still have const_infos slot");
         match info {
-            PtrInfo::KnownClass { class_ptr, .. } => {
-                assert_eq!(class_ptr.0, 0x1111_2222);
+            PtrInfo::Instance(iinfo) => {
+                assert_eq!(iinfo.known_class.map(|c| c.0), Some(0x1111_2222));
             }
-            other => panic!("expected KnownClass after re-lookup, got {other:?}"),
+            other => panic!("expected Instance(known_class=Some) after re-lookup, got {other:?}"),
         }
     }
 
@@ -3482,10 +3617,10 @@ mod constant_ptr_info_tests {
             .get_const_info_mut(int_op)
             .expect("typed-Int alias should resolve to the same slot");
         match info {
-            PtrInfo::KnownClass { class_ptr, .. } => {
-                assert_eq!(class_ptr.0, 0xc0de_cafe);
+            PtrInfo::Instance(iinfo) => {
+                assert_eq!(iinfo.known_class.map(|c| c.0), Some(0xc0de_cafe));
             }
-            other => panic!("expected shared KnownClass, got {other:?}"),
+            other => panic!("expected shared Instance(known_class=Some), got {other:?}"),
         }
     }
 
@@ -3504,5 +3639,309 @@ mod constant_ptr_info_tests {
             .insert(int_null.0, Type::Ref);
         assert!(ctx.get_const_info_mut(ref_null).is_none());
         assert!(ctx.get_const_info_mut(int_null).is_none());
+    }
+}
+
+#[cfg(test)]
+mod ensure_ptr_info_arg0_tests {
+    //! optimizer.py:461-499 `ensure_ptr_info_arg0` parity tests.
+    //!
+    //! Each test mirrors a single PyPy branch in `ensure_ptr_info_arg0`:
+    //! the constant arg0 path, the AbstractVirtualPtrInfo early-return path,
+    //! the NonNullPtrInfo upgrade path, and the assertion that fires on
+    //! unexpected forwarded info shapes.
+    use super::*;
+    use crate::optimizeopt::info::{ArrayPtrInfo, EnsuredPtrInfo, PtrInfo};
+    use crate::optimizeopt::intutils::IntBound;
+    use majit_ir::{
+        Descr, DescrRef, GcRef, Op, OpCode, OpRef, SimpleFieldDescr, SizeDescr, Type, Value,
+    };
+    use std::sync::Arc;
+
+    #[derive(Debug)]
+    struct TestSizeDescr {
+        index: u32,
+        is_object: bool,
+    }
+
+    impl Descr for TestSizeDescr {
+        fn index(&self) -> u32 {
+            self.index
+        }
+        fn as_size_descr(&self) -> Option<&dyn SizeDescr> {
+            Some(self)
+        }
+    }
+
+    impl SizeDescr for TestSizeDescr {
+        fn size(&self) -> usize {
+            64
+        }
+        fn type_id(&self) -> u32 {
+            self.index
+        }
+        fn is_immutable(&self) -> bool {
+            false
+        }
+        fn is_object(&self) -> bool {
+            self.is_object
+        }
+    }
+
+    fn struct_parent_descr() -> DescrRef {
+        Arc::new(TestSizeDescr {
+            index: 0xFFFF_0000,
+            is_object: false,
+        })
+    }
+
+    fn instance_parent_descr() -> DescrRef {
+        Arc::new(TestSizeDescr {
+            index: 0xFFFF_0001,
+            is_object: true,
+        })
+    }
+
+    fn field_op_with_parent(parent: DescrRef) -> Op {
+        let descr: DescrRef =
+            Arc::new(SimpleFieldDescr::new(0, 0, 8, Type::Int, false).with_parent_descr(parent));
+        let mut op = Op::with_descr(OpCode::GetfieldGcI, &[OpRef(0)], descr);
+        op.pos = OpRef(1);
+        op
+    }
+
+    fn array_op() -> Op {
+        let descr: DescrRef = Arc::new(TestSizeDescr {
+            index: 7,
+            is_object: false,
+        });
+        let mut op = Op::with_descr(OpCode::ArraylenGc, &[OpRef(0)], descr);
+        op.pos = OpRef(1);
+        op
+    }
+
+    /// optimizer.py:465-466: `if arg0.is_constant(): return info.ConstPtrInfo(arg0)`
+    /// Constant `Value::Ref` arg0 → `EnsuredPtrInfo::Constant(gcref)`.
+    #[test]
+    fn ensure_ptr_info_arg0_returns_constant_for_value_ref() {
+        let mut ctx = OptContext::with_num_inputs(4, 1);
+        ctx.seed_constant(OpRef(0), Value::Ref(GcRef(0xdead_beef)));
+        let op = field_op_with_parent(struct_parent_descr());
+        let info = ctx.ensure_ptr_info_arg0(&op);
+        match info {
+            EnsuredPtrInfo::Constant { gcref, .. } => assert_eq!(gcref.0, 0xdead_beef),
+            _ => panic!("expected EnsuredPtrInfo::Constant"),
+        }
+    }
+
+    /// optimizer.py:465-466 parity for plain `Value::Int` constants — PyPy
+    /// returns `info.ConstPtrInfo(arg0)` regardless of the box's exact type.
+    /// majit's port mirrors that by returning `Constant(GcRef(bits))`; null
+    /// or unsafe pointers are filtered downstream by `_get_info`'s null
+    /// protection (info.py:719-720).
+    #[test]
+    fn ensure_ptr_info_arg0_returns_constant_for_value_int() {
+        let mut ctx = OptContext::with_num_inputs(4, 1);
+        ctx.seed_constant(OpRef(0), Value::Int(1));
+        let op = field_op_with_parent(struct_parent_descr());
+        let info = ctx.ensure_ptr_info_arg0(&op);
+        assert!(matches!(info, EnsuredPtrInfo::Constant { .. }));
+    }
+
+    /// info.py:796-822 `ConstPtrInfo.getlenbound(mode_string)` returns
+    /// `IntBound.from_constant(length)` when `getstrlen1(mode)` knows the
+    /// exact length. The Rust port consults the `string_length_resolver`
+    /// hook the host runtime registered on `OptContext`.
+    #[test]
+    fn ensure_ptr_info_arg0_constant_string_returns_exact_length_via_resolver() {
+        use std::sync::Arc;
+        let mut ctx = OptContext::with_num_inputs(4, 1);
+        ctx.seed_constant(OpRef(0), Value::Ref(GcRef(0xC0FE)));
+        // Resolver pretends every constant has byte-string length 5 in
+        // mode_string and unicode length 7 in mode_unicode.
+        ctx.string_length_resolver = Some(Arc::new(|gcref: GcRef, mode: u8| {
+            assert_eq!(gcref.0, 0xC0FE);
+            match mode {
+                0 => Some(5),
+                1 => Some(7),
+                _ => None,
+            }
+        }));
+        let op = {
+            let descr: DescrRef = Arc::new(TestSizeDescr {
+                index: 1,
+                is_object: false,
+            });
+            let mut op = Op::with_descr(OpCode::Strlen, &[OpRef(0)], descr);
+            op.pos = OpRef(1);
+            op
+        };
+        let mut info = ctx.ensure_ptr_info_arg0(&op);
+        let bound = info
+            .getlenbound(Some(0))
+            .expect("constant string length should resolve");
+        assert_eq!(bound.lower, 5);
+        assert_eq!(bound.upper, 5);
+        let bound = info
+            .getlenbound(Some(1))
+            .expect("constant unicode length should resolve");
+        assert_eq!(bound.lower, 7);
+        assert_eq!(bound.upper, 7);
+    }
+
+    /// info.py:799-801 `if length < 0: return IntBound.nonnegative()` —
+    /// no resolver registered → conservative nonnegative fallback.
+    #[test]
+    fn ensure_ptr_info_arg0_constant_string_falls_back_to_nonnegative_without_resolver() {
+        use std::sync::Arc;
+        let mut ctx = OptContext::with_num_inputs(4, 1);
+        ctx.seed_constant(OpRef(0), Value::Ref(GcRef(0x1234)));
+        let op = {
+            let descr: DescrRef = Arc::new(TestSizeDescr {
+                index: 1,
+                is_object: false,
+            });
+            let mut op = Op::with_descr(OpCode::Strlen, &[OpRef(0)], descr);
+            op.pos = OpRef(1);
+            op
+        };
+        let mut info = ctx.ensure_ptr_info_arg0(&op);
+        let bound = info
+            .getlenbound(Some(0))
+            .expect("nonnegative fallback should be Some");
+        assert_eq!(bound.lower, IntBound::nonnegative().lower);
+        assert!(!bound.is_constant());
+    }
+
+    /// optimizer.py:475-484 GETFIELD branch with `parent_descr.is_object() == false`
+    /// → `info.StructPtrInfo(parent_descr)`. The Rust port returns the
+    /// freshly-installed `PtrInfo::Struct` via `Forwarded(&mut PtrInfo)`.
+    #[test]
+    fn ensure_ptr_info_arg0_constructs_struct_for_non_object_field() {
+        let mut ctx = OptContext::with_num_inputs(4, 1);
+        let op = field_op_with_parent(struct_parent_descr());
+        let mut info = ctx.ensure_ptr_info_arg0(&op);
+        let pi = info.as_mut().expect("Forwarded variant expected");
+        assert!(matches!(pi, PtrInfo::Struct(_)));
+    }
+
+    /// optimizer.py:480-484 GETFIELD branch with `parent_descr.is_object() == true`
+    /// → `info.InstancePtrInfo(parent_descr)`.
+    #[test]
+    fn ensure_ptr_info_arg0_constructs_instance_for_object_field() {
+        let mut ctx = OptContext::with_num_inputs(4, 1);
+        let op = field_op_with_parent(instance_parent_descr());
+        let mut info = ctx.ensure_ptr_info_arg0(&op);
+        let pi = info.as_mut().expect("Forwarded variant expected");
+        assert!(matches!(pi, PtrInfo::Instance(_)));
+    }
+
+    /// optimizer.py:485-487 ARRAYLEN_GC branch → `info.ArrayPtrInfo(descr)`.
+    /// The PyPy primitive returns the same arrayinfo across calls so
+    /// callers can read `arrayinfo.getlenbound(None)` directly. The Rust
+    /// port mirrors that and the `getlenbound` call resolves to the
+    /// pre-installed `nonnegative` lenbound on the freshly-built ArrayPtrInfo.
+    #[test]
+    fn ensure_ptr_info_arg0_arraylen_returns_array_with_nonnegative_lenbound() {
+        let mut ctx = OptContext::with_num_inputs(4, 1);
+        let op = array_op();
+        let mut info = ctx.ensure_ptr_info_arg0(&op);
+        let bound = info
+            .getlenbound(None)
+            .expect("ArrayPtrInfo.getlenbound(None) should be Some");
+        assert_eq!(bound.lower, IntBound::nonnegative().lower);
+    }
+
+    /// info.py:796-802 `ConstPtrInfo.getlenbound(mode)` returns
+    /// `IntBound.nonnegative()` whenever `getstrlen1(mode)` produces a
+    /// negative length. info.py:823-824 makes `mode is None` (no
+    /// vstring mode) one of those cases via the `else: return -1`
+    /// branch. The Rust port must therefore answer `Some(nonnegative())`
+    /// — not `None` — for `Constant.getlenbound(None)` so the
+    /// ARRAYLEN_GC postprocess on a constant array still propagates a
+    /// non-negative bound.
+    #[test]
+    fn ensure_ptr_info_arg0_constant_arraylen_returns_nonnegative() {
+        let mut ctx = OptContext::with_num_inputs(4, 1);
+        ctx.seed_constant(OpRef(0), Value::Ref(GcRef(0xfeed)));
+        let op = array_op();
+        let mut info = ctx.ensure_ptr_info_arg0(&op);
+        let bound = info
+            .getlenbound(None)
+            .expect("ConstPtrInfo.getlenbound(None) must mirror PyPy nonnegative fallback");
+        assert_eq!(bound.lower, IntBound::nonnegative().lower);
+        assert_eq!(bound.upper, IntBound::nonnegative().upper);
+    }
+
+    /// optimizer.py:467-469 `if isinstance(opinfo, AbstractVirtualPtrInfo):
+    /// return opinfo` parity. A second call must return the SAME PtrInfo
+    /// (verified by mutating via the first call and observing the mutation
+    /// via the second). PyPy's structinfo identity is the test of record;
+    /// the Rust port checks via state preserved across calls.
+    #[test]
+    fn ensure_ptr_info_arg0_returns_existing_array_unchanged() {
+        let mut ctx = OptContext::with_num_inputs(4, 1);
+        let op = array_op();
+        // First call constructs the ArrayPtrInfo and tightens the lenbound
+        // through the helper.
+        {
+            let mut info = ctx.ensure_ptr_info_arg0(&op);
+            if let Some(PtrInfo::Array(arr)) = info.as_mut() {
+                let _ = arr.lenbound.make_gt_const(7);
+            } else {
+                panic!("expected fresh ArrayPtrInfo");
+            }
+        }
+        // Second call returns the same ArrayPtrInfo (lenbound preserved).
+        let mut info = ctx.ensure_ptr_info_arg0(&op);
+        match info.as_mut() {
+            Some(PtrInfo::Array(ArrayPtrInfo { lenbound, .. })) => {
+                assert!(
+                    lenbound.lower >= 8,
+                    "second call must return the previously-mutated ArrayPtrInfo (lower={})",
+                    lenbound.lower
+                );
+            }
+            _ => panic!("second call must still return Array"),
+        }
+    }
+
+    /// optimizer.py:470-474 `elif opinfo is not None: ...; assert opinfo is
+    /// None or opinfo.__class__ is info.NonNullPtrInfo`. A pre-existing
+    /// NonNullPtrInfo flows through the upgrade path; its `last_guard_pos`
+    /// is preserved on the freshly-installed PtrInfo.
+    #[test]
+    fn ensure_ptr_info_arg0_upgrades_nonnull_to_struct() {
+        let mut ctx = OptContext::with_num_inputs(4, 1);
+        // Pre-install a NonNullPtrInfo with a specific last_guard_pos.
+        ctx.set_ptr_info(OpRef(0), PtrInfo::NonNull { last_guard_pos: 7 });
+        let op = field_op_with_parent(struct_parent_descr());
+        let mut info = ctx.ensure_ptr_info_arg0(&op);
+        match info.as_mut() {
+            Some(pi @ PtrInfo::Struct(_)) => {
+                assert_eq!(pi.last_guard_pos(), Some(7));
+            }
+            other => panic!("expected upgraded Struct, got {other:?}"),
+        }
+    }
+
+    /// optimizer.py:474 assertion: an unexpected forwarded info shape (e.g.
+    /// a `Forwarded::Op` redirect that resolved to a non-PtrInfo state)
+    /// must NOT silently overwrite. We seed an `Instance` PtrInfo, then
+    /// hand it a field op with a different parent — the early-return path
+    /// hits, and the existing Instance is returned without overwrite.
+    #[test]
+    fn ensure_ptr_info_arg0_does_not_overwrite_existing_instance() {
+        let mut ctx = OptContext::with_num_inputs(4, 1);
+        ctx.set_ptr_info(
+            OpRef(0),
+            PtrInfo::instance(Some(instance_parent_descr()), Some(GcRef(0xc0de))),
+        );
+        let op = field_op_with_parent(struct_parent_descr());
+        let mut info = ctx.ensure_ptr_info_arg0(&op);
+        match info.as_mut() {
+            Some(PtrInfo::Instance(_)) => {} // unchanged
+            other => panic!("expected Instance preserved, got {other:?}"),
+        }
     }
 }

@@ -1990,15 +1990,6 @@ fn export_single_value_inner(
                 // RPython's `getlenbound` fallback for RawSlicePtrInfo).
                 return VirtualStateInfo::NonNull;
             }
-            PtrInfo::KnownClass {
-                class_ptr,
-                is_nonnull: _,
-                ..
-            } => {
-                return VirtualStateInfo::KnownClass {
-                    class_ptr: *class_ptr,
-                };
-            }
             PtrInfo::NonNull { .. } => {
                 return VirtualStateInfo::NonNull;
             }
@@ -2009,7 +2000,16 @@ fn export_single_value_inner(
                 // Virtualizable objects are treated as non-null in virtual state
                 return VirtualStateInfo::NonNull;
             }
-            PtrInfo::Instance(_) | PtrInfo::Struct(_) | PtrInfo::Array(_) => {
+            PtrInfo::Instance(iinfo) => {
+                // info.py:147 InstancePtrInfo(None, class_const) becomes
+                // VirtualStateInfo::KnownClass when only the class is
+                // known. Otherwise it's an opaque non-null instance.
+                if let Some(class_ptr) = iinfo.known_class {
+                    return VirtualStateInfo::KnownClass { class_ptr };
+                }
+                return VirtualStateInfo::NonNull;
+            }
+            PtrInfo::Struct(_) | PtrInfo::Array(_) => {
                 return VirtualStateInfo::NonNull;
             }
             PtrInfo::Str(_) => {

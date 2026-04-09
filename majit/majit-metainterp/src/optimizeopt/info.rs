@@ -153,16 +153,12 @@ pub enum PtrInfo {
     /// Known constant pointer.
     /// info.py: ConstPtrInfo (does NOT inherit NonNullPtrInfo)
     Constant(GcRef),
-    /// Known class (type) of the object.
-    /// info.py: NonNullPtrInfo with _known_class set
-    KnownClass {
-        class_ptr: GcRef,
-        is_nonnull: bool,
-        /// info.py:91-92
-        last_guard_pos: i32,
-    },
     /// Non-virtual GC object with cached field info.
-    /// info.py: InstancePtrInfo (is_virtual = False)
+    /// info.py: InstancePtrInfo (is_virtual = False).
+    /// `make_constant_class` results — class set, no descr, no fields —
+    /// are also stored here as `Instance(descr=None, known_class=Some(...))`,
+    /// matching PyPy's `info.InstancePtrInfo(None, class_const)` factory
+    /// at optimizer.py:147.
     Instance(InstancePtrInfo),
     /// Non-virtual GC struct with cached field info.
     /// info.py: StructPtrInfo (is_virtual = False)
@@ -208,6 +204,131 @@ pub struct StrPtrInfo {
     pub last_guard_pos: i32,
 }
 
+/// Runtime hook for `ConstPtrInfo.getstrlen1(mode)` (info.py:810-822).
+/// Returns `Some(length)` when `gcref` points at a known string of the
+/// requested mode, `None` otherwise. Cloned (Arc) into each
+/// `EnsuredPtrInfo` instance so the helper can satisfy
+/// `getlenbound(Some(mode))` for constant string args without re-borrowing
+/// `OptContext`.
+pub type StringLengthResolver = std::sync::Arc<dyn Fn(GcRef, u8) -> Option<i64> + Send + Sync>;
+
+/// Result of `OptContext::ensure_ptr_info_arg0(op)` — direct line-by-line
+/// equivalent of PyPy's `ensure_ptr_info_arg0` return value
+/// (`optimizer.py:461-499`).
+///
+/// PyPy returns a Python `PtrInfo` object that the caller invokes methods on
+/// (`structinfo.setfield(...)`, `arrayinfo.getlenbound(None).make_gt_const(...)`).
+/// The Rust port can't expose `&mut PtrInfo` directly when the arg0 is a
+/// constant — there's no `Forwarded::Info` slot to borrow from — so the enum
+/// distinguishes the two cases:
+///
+/// - **`Constant { gcref, .. }`** — `arg0.is_constant()`
+///   (`optimizer.py:464-466`). PyPy returns a freshly-constructed
+///   `info.ConstPtrInfo(arg0)`. The Rust variant carries the resolved
+///   `GcRef` so methods like `getlenbound` can synthesize the same answer
+///   on demand. The optional `string_length_resolver` Arc allows
+///   `getlenbound(Some(mode))` to return an exact constant length when the
+///   runtime can read the underlying string object — matching PyPy's
+///   `getstrlen1(mode)` path through `_unpack_str(mode)`.
+///
+/// - **`Forwarded(&mut PtrInfo)`** — `arg0.get_forwarded()` returns either an
+///   existing `AbstractVirtualPtrInfo` subclass (early-return path) or a
+///   freshly-installed Instance/Struct/Array/Str etc. (`optimizer.py:475-498`).
+///   The mutable reference is backed by `OptContext::forwarded[idx]` so
+///   `info.setfield()` / `info.setitem()` mutate the canonical PtrInfo
+///   in-place — matching PyPy's `arg0.set_forwarded(opinfo)` followed by
+///   `opinfo.setfield(...)`.
+pub enum EnsuredPtrInfo<'a> {
+    /// `info.ConstPtrInfo(arg0)` — synthesized from a constant Ref / raw-pointer
+    /// Int OpRef. Read-only by construction.
+    Constant {
+        gcref: GcRef,
+        /// Optional runtime hook for `getstrlen1(mode)` lookups.
+        string_length_resolver: Option<StringLengthResolver>,
+    },
+    /// `arg0.get_forwarded()` — direct mutable handle into the
+    /// `OptContext::forwarded` slot.
+    Forwarded(&'a mut PtrInfo),
+}
+
+impl<'a> EnsuredPtrInfo<'a> {
+    /// `info.py PtrInfo.getlenbound(mode)` — direct delegation to the underlying
+    /// PtrInfo. For `Constant` the call routes through the optional
+    /// `string_length_resolver` so an exact constant length can be returned
+    /// when the runtime knows it (PyPy `ConstPtrInfo.getlenbound` →
+    /// `getstrlen1(mode)` → `_unpack_str(mode)` at info.py:796-822).
+    pub fn getlenbound(&mut self, mode: Option<u8>) -> Option<IntBound> {
+        match self {
+            EnsuredPtrInfo::Constant {
+                gcref,
+                string_length_resolver,
+            } => {
+                // info.py:796-802 ConstPtrInfo.getlenbound(mode):
+                //
+                //     def getlenbound(self, mode):
+                //         length = self.getstrlen1(mode)
+                //         if length < 0:
+                //             return IntBound.nonnegative()
+                //         return IntBound.from_constant(length)
+                //
+                // info.py:810-824 ConstPtrInfo.getstrlen1(mode):
+                //
+                //     def getstrlen1(self, mode):
+                //         if mode is vstring.mode_string:    ...
+                //         elif mode is vstring.mode_unicode: ...
+                //         else:
+                //             return -1
+                //
+                // PyPy returns `IntBound.nonnegative()` regardless of
+                // mode whenever `getstrlen1` cannot supply an exact
+                // length. The Rust port mirrors that:
+                //   * mode == None        → getstrlen1 returns -1 →
+                //                           nonnegative()
+                //   * mode == Some(0|1)   → resolver returns Some(len) →
+                //                           from_constant(len);
+                //                           else nonnegative()
+                let length = match mode {
+                    Some(mode_value) => {
+                        if gcref.is_null() {
+                            -1
+                        } else if let Some(resolver) = string_length_resolver.as_deref() {
+                            resolver(*gcref, mode_value).unwrap_or(-1)
+                        } else {
+                            -1
+                        }
+                    }
+                    // info.py:823-824 `else: return -1` for mode == None.
+                    None => -1,
+                };
+                if length < 0 {
+                    Some(IntBound::nonnegative())
+                } else {
+                    Some(IntBound::from_constant(length))
+                }
+            }
+            EnsuredPtrInfo::Forwarded(info) => info.getlenbound(mode),
+        }
+    }
+
+    /// Mutable access to the underlying `PtrInfo`. Returns `None` for the
+    /// `Constant` variant — PyPy's `ConstPtrInfo.setfield/setitem` route
+    /// through `optheap.const_infos`, not through the constant box's own
+    /// info slot (info.py:738-752).
+    pub fn as_mut(&mut self) -> Option<&mut PtrInfo> {
+        match self {
+            EnsuredPtrInfo::Constant { .. } => None,
+            EnsuredPtrInfo::Forwarded(info) => Some(info),
+        }
+    }
+
+    /// Whether the helper produced a synthesized `ConstPtrInfo` rather than a
+    /// real forwarded entry. Mirrors `isinstance(opinfo, ConstPtrInfo)` at
+    /// the call site.
+    pub fn is_constant(&self) -> bool {
+        matches!(self, EnsuredPtrInfo::Constant { .. })
+    }
+}
+
 impl PtrInfo {
     // ── Constructors (info.py: factory methods) ──
 
@@ -222,7 +343,6 @@ impl PtrInfo {
     pub fn get_last_guard_pos(&self) -> Option<usize> {
         let pos = match self {
             PtrInfo::NonNull { last_guard_pos, .. } => *last_guard_pos,
-            PtrInfo::KnownClass { last_guard_pos, .. } => *last_guard_pos,
             PtrInfo::Instance(i) => i.last_guard_pos,
             PtrInfo::Struct(s) => s.last_guard_pos,
             PtrInfo::Array(a) => a.last_guard_pos,
@@ -243,7 +363,6 @@ impl PtrInfo {
     pub fn last_guard_pos(&self) -> Option<i32> {
         let pos = match self {
             PtrInfo::NonNull { last_guard_pos, .. } => *last_guard_pos,
-            PtrInfo::KnownClass { last_guard_pos, .. } => *last_guard_pos,
             PtrInfo::Instance(i) => i.last_guard_pos,
             PtrInfo::Struct(s) => s.last_guard_pos,
             PtrInfo::Array(a) => a.last_guard_pos,
@@ -264,7 +383,6 @@ impl PtrInfo {
     pub fn set_last_guard_pos(&mut self, pos: i32) {
         match self {
             PtrInfo::NonNull { last_guard_pos, .. } => *last_guard_pos = pos,
-            PtrInfo::KnownClass { last_guard_pos, .. } => *last_guard_pos = pos,
             PtrInfo::Instance(i) => i.last_guard_pos = pos,
             PtrInfo::Struct(s) => s.last_guard_pos = pos,
             PtrInfo::Array(a) => a.last_guard_pos = pos,
@@ -290,13 +408,36 @@ impl PtrInfo {
         PtrInfo::Constant(gcref)
     }
 
-    /// Create a KnownClass PtrInfo.
-    pub fn known_class(class_ptr: GcRef, is_nonnull: bool) -> Self {
-        PtrInfo::KnownClass {
-            class_ptr,
-            is_nonnull,
+    /// `optimizer.py:137-152 make_constant_class` parity:
+    ///
+    /// ```python
+    /// def make_constant_class(self, op, class_const, ...):
+    ///     ...
+    ///     opinfo = info.InstancePtrInfo(None, class_const)
+    ///     opinfo.last_guard_pos = last_guard_pos
+    ///     op.set_forwarded(opinfo)
+    /// ```
+    ///
+    /// PyPy stores known-class state on `InstancePtrInfo` itself (with
+    /// `descr=None` and an empty `_fields`). The Rust port mirrors that
+    /// directly so there is no separate "class only" enum variant — every
+    /// `make_constant_class` result is an `Instance` that subsequent
+    /// `setfield`/`setitem` calls extend with field caches just like
+    /// PyPy's lazy `init_fields`.
+    ///
+    /// `is_nonnull` is accepted for source-compatibility with the prior
+    /// constructor signature; PyPy `InstancePtrInfo` always inherits
+    /// `NonNullPtrInfo.is_nonnull() == True`, so the parameter is unused
+    /// at the storage level.
+    pub fn known_class(class_ptr: GcRef, _is_nonnull: bool) -> Self {
+        PtrInfo::Instance(InstancePtrInfo {
+            descr: None,
+            known_class: Some(class_ptr),
+            fields: Vec::new(),
+            field_descrs: Vec::new(),
+            preamble_fields: Vec::new(),
             last_guard_pos: -1,
-        }
+        })
     }
 
     /// Create a non-virtual InstancePtrInfo.
@@ -372,7 +513,6 @@ impl PtrInfo {
         match self {
             PtrInfo::NonNull { .. } => true,
             PtrInfo::Constant(gcref) => !gcref.is_null(),
-            PtrInfo::KnownClass { is_nonnull, .. } => *is_nonnull,
             PtrInfo::Instance(_)
             | PtrInfo::Struct(_)
             | PtrInfo::Array(_)
@@ -418,8 +558,10 @@ impl PtrInfo {
     ///                 return None
     ///         return cpu.cls_of_box(self._const)
     ///
-    /// - `KnownClass`/`Instance`/`Virtual`: return the stored
-    ///   `known_class` field.
+    /// - `Instance`/`Virtual`: return the stored `known_class` field
+    ///   (PyPy `InstancePtrInfo._known_class`). A class-only result of
+    ///   `make_constant_class` is also stored as `Instance(descr=None,
+    ///   known_class=Some(...))`.
     /// - `Constant`: null constants → `None`; otherwise, when the
     ///   backend supports `guard_gc_type` (`majit_gc::supports_guard_gc_type`),
     ///   gate `cls_of_box` on `majit_gc::check_is_object` so that
@@ -431,7 +573,6 @@ impl PtrInfo {
     /// - Everything else: `None`.
     pub fn get_known_class(&self) -> Option<GcRef> {
         match self {
-            PtrInfo::KnownClass { class_ptr, .. } => Some(*class_ptr),
             PtrInfo::Instance(v) => v.known_class,
             PtrInfo::Virtual(v) => v.known_class,
             PtrInfo::Constant(gcref) => {
@@ -485,13 +626,6 @@ impl PtrInfo {
             PtrInfo::NonNull { .. } => {
                 // info.py:120-122: NonNullPtrInfo.make_guards
                 short.push(Op::new(OpCode::GuardNonnull, &[op]));
-            }
-            PtrInfo::KnownClass { class_ptr, .. } => {
-                // info.py:336-345: InstancePtrInfo.make_guards with _known_class
-                // (remove_gctypeptr=true branch — pyre's default object layout
-                // matches the modern translated PyPy "no gctypeptr" model).
-                let class_ref = alloc_const(Value::Ref(*class_ptr));
-                short.push(Op::new(OpCode::GuardNonnullClass, &[op, class_ref]));
             }
             PtrInfo::Instance(info) => {
                 // info.py:336-353: InstancePtrInfo.make_guards
@@ -927,7 +1061,6 @@ impl PtrInfo {
     pub fn guard_opcodes(&self) -> Vec<majit_ir::OpCode> {
         match self {
             PtrInfo::NonNull { .. } => vec![majit_ir::OpCode::GuardNonnull],
-            PtrInfo::KnownClass { .. } => vec![majit_ir::OpCode::GuardNonnullClass],
             PtrInfo::Instance(info) if info.known_class.is_some() => {
                 vec![majit_ir::OpCode::GuardNonnullClass]
             }
@@ -1039,41 +1172,48 @@ impl PtrInfo {
         }
     }
 
-    /// info.py: getlenbound() on ArrayPtrInfo.
-    pub fn getlenbound(&self) -> Option<&IntBound> {
+    /// `getlenbound(mode)` — polymorphic dispatch matching the PyPy class
+    /// hierarchy:
+    ///
+    /// - info.py:61-62 `PtrInfo.getlenbound(mode)` — base default returns None
+    /// - info.py:515-521 `ArrayPtrInfo.getlenbound(mode)` — asserts mode is None,
+    ///   lazy-creates `nonnegative` lenbound on first access
+    /// - vstring.py:62-70 `StrPtrInfo.getlenbound(mode)` — lazy-creates from
+    ///   `self.length` (constant) or `nonnegative`
+    /// - info.py:796-802 `ConstPtrInfo.getlenbound(mode)` — handled by
+    ///   `EnsuredPtrInfo::Constant::getlenbound`, which routes through the
+    ///   runtime `string_length_resolver`. The base `PtrInfo` method
+    ///   below intentionally returns `None` for `PtrInfo::Constant` so
+    ///   callers that bypass `EnsuredPtrInfo` don't accidentally produce
+    ///   a stale `nonnegative` answer without consulting the resolver.
+    ///
+    /// Returns an owned `IntBound` so callers (which typically need `&mut
+    /// OptContext` next for `setintbound`) don't have to juggle borrows.
+    pub fn getlenbound(&mut self, mode: Option<u8>) -> Option<IntBound> {
         match self {
-            PtrInfo::Array(v) => Some(&v.lenbound),
-            _ => None,
-        }
-    }
-
-    /// vstring.py:62-70 StrPtrInfo.getlenbound(mode)
-    ///
-    /// ```python
-    /// def getlenbound(self, mode):
-    ///     if self.lenbound is None:
-    ///         if self.length == -1:
-    ///             self.lenbound = IntBound.nonnegative()
-    ///         else:
-    ///             self.lenbound = IntBound.from_constant(self.length)
-    ///     return self.lenbound
-    /// ```
-    ///
-    /// `mode` is unused in the body but kept for ABI parity with
-    /// ArrayPtrInfo.getlenbound which is called the same way from
-    /// postprocess_STRLEN/UNICODELEN.
-    pub fn str_getlenbound(&mut self, _mode: u8) -> Option<&IntBound> {
-        if let PtrInfo::Str(sinfo) = self {
-            if sinfo.lenbound.is_none() {
-                sinfo.lenbound = Some(if sinfo.length == -1 {
-                    IntBound::nonnegative()
-                } else {
-                    IntBound::from_constant(sinfo.length as i64)
-                });
+            // info.py:515-521 ArrayPtrInfo.getlenbound: assert mode is None
+            PtrInfo::Array(v) => {
+                debug_assert!(
+                    mode.is_none(),
+                    "ArrayPtrInfo.getlenbound: mode must be None"
+                );
+                Some(v.lenbound.clone())
             }
-            sinfo.lenbound.as_ref()
-        } else {
-            None
+            // vstring.py:62-70 StrPtrInfo.getlenbound: lazy lenbound
+            PtrInfo::Str(sinfo) => {
+                if sinfo.lenbound.is_none() {
+                    sinfo.lenbound = Some(if sinfo.length == -1 {
+                        IntBound::nonnegative()
+                    } else {
+                        IntBound::from_constant(sinfo.length as i64)
+                    });
+                }
+                sinfo.lenbound.clone()
+            }
+            // info.py:61-62 base PtrInfo.getlenbound returns None.
+            // The constant case is handled by EnsuredPtrInfo (which has
+            // access to the runtime string_length_resolver).
+            _ => None,
         }
     }
 
@@ -1139,16 +1279,14 @@ impl PtrInfo {
             }
             _ => {
                 // RPython: AbstractStructPtrInfo always supports _fields.
-                // In majit, KnownClass/NonNull/Ref lack preamble_fields.
-                // Upgrade to Instance, preserving known_class.
-                let known_class = if let PtrInfo::KnownClass { class_ptr, .. } = self {
-                    Some(*class_ptr)
-                } else {
-                    None
-                };
+                // In majit, NonNull / Constant / Str / Virtualizable etc.
+                // lack preamble_fields. Upgrade to Instance — known_class
+                // is None because make_constant_class would already have
+                // installed an Instance with the class set, which would
+                // have hit the first match arm above.
                 *self = PtrInfo::Instance(InstancePtrInfo {
                     descr: None,
-                    known_class,
+                    known_class: None,
                     fields: Vec::new(),
                     field_descrs: Vec::new(),
                     preamble_fields: vec![(field_idx, pop)],
@@ -1912,6 +2050,21 @@ mod tests {
 
         let virtual_struct = PtrInfo::virtual_struct(descr);
         assert!(virtual_struct.is_virtual());
+    }
+
+    #[test]
+    fn test_const_ptr_info_getlenbound_returns_none_at_base() {
+        // The base `PtrInfo::getlenbound` returns None for `PtrInfo::Constant`
+        // — the constant string-length lookup runs through
+        // `EnsuredPtrInfo::Constant::getlenbound`, which threads in the
+        // runtime `string_length_resolver`. Callers that bypass
+        // EnsuredPtrInfo (and thus skip the resolver) must not get a
+        // misleading nonnegative answer here.
+        let mut info = PtrInfo::constant(GcRef(0x1000));
+
+        assert_eq!(info.getlenbound(Some(0)), None);
+        assert_eq!(info.getlenbound(Some(1)), None);
+        assert_eq!(info.getlenbound(None), None);
     }
 
     #[test]

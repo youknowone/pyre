@@ -1245,8 +1245,19 @@ impl OptHeap {
 
         // heap.py:103-120: getfield_from_cache — 3-way aliasing check.
         let (raw_obj, field_idx) = key;
-        // Resolve forwarding (PtrInfo identity semantics, heap.py same_info).
+        // heap.py:645
+        //     structinfo = self.ensure_ptr_info_arg0(op)
+        //
+        // PyPy passes `structinfo` directly to `cf.getfield_from_cache`,
+        // which uses Python object identity. The Rust port's
+        // `cached_fields` map is keyed by `OpRef` instead, so we resolve
+        // arg0 once and then call `ensure_ptr_info_arg0` purely for its
+        // side-effect of installing a `PtrInfo` slot on `box._forwarded`.
+        // Subsequent passes (intbounds, virtualstate) and the local
+        // `setfield` mutation point all read/write that slot via the
+        // canonical OpRef.
         let obj = ctx.get_box_replacement(raw_obj);
+        let _ = ctx.ensure_ptr_info_arg0(op);
         let mut force_lazy = false;
         if let Some(cf) = self.cached_fields.get(&field_idx) {
             if let Some((lazy_obj, lazy_op)) = &cf.lazy_set {
@@ -1300,9 +1311,14 @@ impl OptHeap {
                     let descr = lazy_op.descr.clone();
                     let cf = self.field_cache(field_idx);
                     cf.register_info(lazy_obj, final_value, descr.as_ref());
-                    let lazy_resolved = ctx.get_box_replacement(lazy_obj);
-                    if let Some(info) = ctx.get_ptr_info_mut(lazy_resolved) {
-                        info.setfield(field_idx, final_value);
+                    // heap.py:122 (force_lazy_set → put_field_back_to_info):
+                    //     opinfo.setfield(...) on the structinfo of lazy_obj.
+                    // The line-by-line port: `ctx.ensure_ptr_info_arg0(&lazy_op)`
+                    // returns the structinfo handle, then we call setfield()
+                    // on it via `as_mut()`.
+                    let mut info = ctx.ensure_ptr_info_arg0(&lazy_op);
+                    if let Some(pi) = info.as_mut() {
+                        pi.setfield(field_idx, final_value);
                     }
                 }
             }
@@ -1381,11 +1397,16 @@ impl OptHeap {
         // Cache miss: emit the load and cache the result.
         // heap.py line 652: make_nonnull(op.getarg(0))
         // optimizer.py:437-448: only set NonNull if no existing PtrInfo.
+        // heap.py postprocess_GETFIELD_GC_I:
+        //     structinfo = self.ensure_ptr_info_arg0(op)
+        //     structinfo.setfield(descr, op.getarg(0), op, ...)
+        //
+        // The PyPy primitive returns the same structinfo regardless of
+        // whether it was newly installed or already present, so the
+        // line-by-line port reuses the EnsuredPtrInfo handle for both
+        // the nonnull bookkeeping and the field write.
         let struct_ref = ctx.get_box_replacement(op.arg(0));
         vb_set(&mut self.known_nonnull, struct_ref.0);
-        if ctx.get_ptr_info(struct_ref).is_none() {
-            ctx.set_ptr_info(struct_ref, crate::optimizeopt::info::PtrInfo::nonnull());
-        }
         self.cache_field(obj, field_idx, op.pos, op.descr.as_ref());
         // Save immutable fields in the permanent cache — they survive all
         // invalidation because the value never changes.
@@ -1395,8 +1416,9 @@ impl OptHeap {
         // heap.py postprocess_GETFIELD_GC_I: structinfo.setfield(descr, op)
         // Record the field value in ptr_info so other passes can see it.
         if !is_vable_field {
-            if let Some(info) = ctx.get_ptr_info_mut(struct_ref) {
-                info.setfield(key.1, op.pos);
+            let mut structinfo = ctx.ensure_ptr_info_arg0(op);
+            if let Some(pi) = structinfo.as_mut() {
+                pi.setfield(key.1, op.pos);
             }
         }
         // Virtualizable Ref fields (linked list head) need a null guard.
@@ -1440,9 +1462,13 @@ impl OptHeap {
         }
 
         let (raw_obj, field_idx) = key;
-        // Resolve forwarding so that two OpRefs pointing to the same object
-        // compare equal (PtrInfo identity semantics, heap.py same_info).
+        // heap.py:78 (CachedField.do_setfield via optheap.ensure_ptr_info_arg0):
+        //     structinfo = optheap.ensure_ptr_info_arg0(op)
+        //
+        // Same shape as optimize_getfield: pull the canonical OpRef for
+        // the cache key, install the structinfo as a side effect.
         let obj = ctx.get_box_replacement(raw_obj);
+        let _ = ctx.ensure_ptr_info_arg0(op);
         let new_value = op.arg(1);
 
         // heapcache.py:224-230 _escape_from_write parity:
@@ -1498,13 +1524,14 @@ impl OptHeap {
                 }
                 // 3. emit the setfield
                 Self::emit_lazy_setfield(&mut lazy_op, ctx, true);
-                // 4. put_field_back_to_info
+                // 4. put_field_back_to_info: heap.py:122 calls
+                //    `opinfo.setfield(...)` on the structinfo of lazy_obj.
                 let final_value = lazy_op.arg(1);
                 let descr = lazy_op.descr.clone();
                 self.cache_field(lazy_obj, field_idx, final_value, descr.as_ref());
-                let lazy_obj_resolved = ctx.get_box_replacement(lazy_obj);
-                if let Some(info) = ctx.get_ptr_info_mut(lazy_obj_resolved) {
-                    info.setfield(field_idx, final_value);
+                let mut info = ctx.ensure_ptr_info_arg0(&lazy_op);
+                if let Some(pi) = info.as_mut() {
+                    pi.setfield(field_idx, final_value);
                 }
             }
         }
@@ -1531,8 +1558,15 @@ impl OptHeap {
         // getfield reads from lazy_set first (CachedField.get checks lazy_set).
         let cf = self.field_cache(field_idx);
         cf.lazy_set = Some((obj, op.clone()));
-        if let Some(info) = ctx.get_ptr_info_mut(obj) {
-            info.setfield(field_idx, new_value);
+        // PyPy heap.py:97 (CachedField.do_setfield):
+        //     opinfo.setfield(descr, struct, op, optheap=optheap, cf=cf)
+        // The Rust port reuses the EnsuredPtrInfo handle returned by the
+        // earlier `ensure_ptr_info_arg0(op)` call at the top of
+        // optimize_setfield via a fresh invocation here — re-borrowing is
+        // necessary because intervening cache mutations took `&mut ctx`.
+        let mut info = ctx.ensure_ptr_info_arg0(op);
+        if let Some(pi) = info.as_mut() {
+            pi.setfield(field_idx, new_value);
         }
         OptimizationResult::Remove
     }
@@ -1585,19 +1619,29 @@ impl OptHeap {
                     vb_set(&mut self.immutable_array_descrs, descr_idx);
                 }
             }
-            // heap.py line 701: make_nonnull(op.getarg(0))
-            let array_ref = ctx.ensure_ptr_info_arg0(op);
+            // heap.py:676-681:
+            //     arrayinfo = self.ensure_ptr_info_arg0(op)
+            //     ...
+            //     arrayinfo.getlenbound(None).make_gt_const(index)
+            //
+            // The line-by-line port mirrors PyPy: ask the helper for the
+            // arrayinfo, then call `getlenbound`/`setitem` directly on it.
+            // We capture `array_ref` separately for the make_nonnull bookkeeping
+            // because heap.py:701 says `make_nonnull(op.getarg(0))` (the box,
+            // not the structinfo).
+            let array_ref = ctx.get_box_replacement(op.arg(0));
             vb_set(&mut self.known_nonnull, array_ref.0);
-            // heap.py line 681: arrayinfo.getlenbound(None).make_gt_const(index)
+            let mut arrayinfo = ctx.ensure_ptr_info_arg0(op);
             if const_index >= 0 {
-                if let Some(crate::optimizeopt::info::PtrInfo::Array(arrayinfo)) =
-                    ctx.get_ptr_info_mut(array_ref)
-                {
-                    let _ = arrayinfo.lenbound.make_gt_const(const_index);
+                if let Some(mut bound) = arrayinfo.getlenbound(None) {
+                    let _ = bound.make_gt_const(const_index);
+                    if let Some(crate::optimizeopt::info::PtrInfo::Array(a)) = arrayinfo.as_mut() {
+                        a.lenbound = bound;
+                    }
                 }
             }
-            if let Some(info) = ctx.get_ptr_info_mut(array_ref) {
-                info.setitem(const_index as usize, op.pos);
+            if let Some(pi) = arrayinfo.as_mut() {
+                pi.setitem(const_index as usize, op.pos);
             }
             return OptimizationResult::Emit(op.clone());
         }
@@ -2529,8 +2573,8 @@ mod tests {
     use std::sync::Arc;
 
     use majit_ir::{
-        CallDescr, Descr, DescrRef, EffectInfo, ExtraEffect, OopSpecIndex, Op, OpCode, OpRef,
-        SimpleCallDescr,
+        CallDescr, Descr, DescrRef, EffectInfo, ExtraEffect, FieldDescr, OopSpecIndex, Op, OpCode,
+        OpRef, SimpleCallDescr, SizeDescr, Type,
     };
 
     use crate::optimizeopt::info::PtrInfo;
@@ -2539,13 +2583,77 @@ mod tests {
 
     use super::OptHeap;
 
-    /// Minimal descriptor for tests, identified by its index.
+    /// Test SizeDescr that pretends to wrap a struct with `is_object()` matching
+    /// the constructor arg. Mirrors the PyPy `optimizer.py:480` dispatch test
+    /// for `parent_descr.is_object()`.
+    #[derive(Debug)]
+    struct TestSizeDescr {
+        index: u32,
+        is_object: bool,
+    }
+
+    impl Descr for TestSizeDescr {
+        fn index(&self) -> u32 {
+            self.index
+        }
+        fn as_size_descr(&self) -> Option<&dyn SizeDescr> {
+            Some(self)
+        }
+    }
+
+    impl SizeDescr for TestSizeDescr {
+        fn size(&self) -> usize {
+            64
+        }
+        fn type_id(&self) -> u32 {
+            self.index
+        }
+        fn is_immutable(&self) -> bool {
+            false
+        }
+        fn is_object(&self) -> bool {
+            self.is_object
+        }
+    }
+
+    /// Single shared parent SizeDescr for all test FieldDescrs. The exact
+    /// instance doesn't matter — `ensure_ptr_info_arg0` only reads
+    /// `is_object()`. We use a Struct (is_object=false) so the field branch
+    /// constructs `PtrInfo::Struct` (the matchless case at heap.rs:1313).
+    fn test_parent_descr() -> DescrRef {
+        Arc::new(TestSizeDescr {
+            index: 0xFFFF_0000,
+            is_object: false,
+        })
+    }
+
+    /// Minimal descriptor for tests, identified by its index. Implements
+    /// `FieldDescr` with a synthetic Struct parent so the optimizer's
+    /// `ensure_ptr_info_arg0` field branch can dispatch correctly.
     #[derive(Debug)]
     struct TestDescr(u32);
 
     impl Descr for TestDescr {
         fn index(&self) -> u32 {
             self.0
+        }
+        fn as_field_descr(&self) -> Option<&dyn FieldDescr> {
+            Some(self)
+        }
+    }
+
+    impl FieldDescr for TestDescr {
+        fn parent_descr(&self) -> Option<DescrRef> {
+            Some(test_parent_descr())
+        }
+        fn offset(&self) -> usize {
+            self.0 as usize * 8
+        }
+        fn field_size(&self) -> usize {
+            8
+        }
+        fn field_type(&self) -> Type {
+            Type::Int
         }
     }
 
@@ -2559,6 +2667,28 @@ mod tests {
         }
 
         fn is_always_pure(&self) -> bool {
+            true
+        }
+
+        fn as_field_descr(&self) -> Option<&dyn FieldDescr> {
+            Some(self)
+        }
+    }
+
+    impl FieldDescr for ImmutableDescr {
+        fn parent_descr(&self) -> Option<DescrRef> {
+            Some(test_parent_descr())
+        }
+        fn offset(&self) -> usize {
+            self.0 as usize * 8
+        }
+        fn field_size(&self) -> usize {
+            8
+        }
+        fn field_type(&self) -> Type {
+            Type::Int
+        }
+        fn is_immutable(&self) -> bool {
             true
         }
     }

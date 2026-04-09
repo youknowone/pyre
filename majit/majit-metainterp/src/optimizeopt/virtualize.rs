@@ -132,29 +132,12 @@ impl OptVirtualize {
                 }
                 PtrInfo::Instance(iinfo)
             }
-            Some(PtrInfo::KnownClass {
-                class_ptr: existing,
-                is_nonnull,
-                ..
-            }) => PtrInfo::KnownClass {
-                class_ptr: if existing.is_null() {
-                    class_ptr
-                } else {
-                    existing
-                },
-                is_nonnull: is_nonnull || !class_ptr.is_null(),
-                last_guard_pos: -1,
-            },
             Some(PtrInfo::NonNull { .. })
             | Some(PtrInfo::Constant(_))
             | Some(PtrInfo::Struct(_))
             | Some(PtrInfo::Array(_))
             | Some(PtrInfo::Str(_))
-            | None => PtrInfo::KnownClass {
-                class_ptr,
-                is_nonnull: true,
-                last_guard_pos: -1,
-            },
+            | None => PtrInfo::known_class(class_ptr, true),
         };
         ctx.set_ptr_info(obj_ref, updated);
     }
@@ -2037,6 +2020,21 @@ mod tests {
         fn index(&self) -> u32 {
             self.idx
         }
+        fn as_size_descr(&self) -> Option<&dyn majit_ir::SizeDescr> {
+            Some(self)
+        }
+    }
+
+    impl majit_ir::SizeDescr for TestSizeDescr {
+        fn size(&self) -> usize {
+            64
+        }
+        fn type_id(&self) -> u32 {
+            self.idx
+        }
+        fn is_immutable(&self) -> bool {
+            false
+        }
     }
 
     #[derive(Debug)]
@@ -2048,9 +2046,15 @@ mod tests {
         fn index(&self) -> u32 {
             self.idx
         }
+        fn as_field_descr(&self) -> Option<&dyn FieldDescr> {
+            Some(self)
+        }
     }
 
     impl FieldDescr for TestFieldDescr {
+        fn parent_descr(&self) -> Option<DescrRef> {
+            Some(size_descr(0xFFFF_0000))
+        }
         fn offset(&self) -> usize {
             self.idx as usize * 8
         }
@@ -2082,7 +2086,14 @@ mod tests {
     }
 
     fn ref_field_descr(idx: u32) -> DescrRef {
-        majit_ir::make_field_descr(idx as usize * 8, 8, Type::Ref, false)
+        // ensure_ptr_info_arg0 (mod.rs:3082) requires field descrs flowing
+        // into GETFIELD/SETFIELD to carry a parent_descr backreference per
+        // optimizer.py:478. Wrap the SimpleFieldDescr with a synthetic Struct
+        // parent (matches the test setup for TestFieldDescr above).
+        Arc::new(
+            majit_ir::SimpleFieldDescr::new(idx, idx as usize * 8, 8, Type::Ref, false)
+                .with_parent_descr(size_descr(0xFFFF_0000)),
+        )
     }
 
     fn array_descr(idx: u32) -> DescrRef {

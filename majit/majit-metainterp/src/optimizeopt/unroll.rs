@@ -1323,10 +1323,10 @@ enum ExportedGcRefField {
     InfoConstantRef,
     /// exported_infos[OpRef].ptr_info = PtrInfo::Constant(GcRef)
     InfoPtrInfoConstant,
-    /// exported_infos[OpRef].ptr_info = PtrInfo::KnownClass { class_ptr }
+    /// exported_infos[OpRef].ptr_info = PtrInfo::Instance with known_class set
+    /// (PyPy `InstancePtrInfo._known_class`; majit folds the former
+    /// `KnownClass` variant into `Instance(descr=None, known_class=Some(_))`).
     InfoPtrInfoKnownClass,
-    /// exported_infos[OpRef].ptr_info = PtrInfo::Instance(...) with known_class
-    InfoPtrInfoInstanceKnownClass,
     /// virtual_state.state[index] = KnownClass { class_ptr }
     VirtualStateKnownClass(usize),
     /// virtual_state.state[index] = Virtual { known_class }
@@ -1462,21 +1462,13 @@ impl ExportedState {
                             ss_idx,
                         ));
                     }
-                    PtrInfo::KnownClass { class_ptr, .. } if !class_ptr.is_null() => {
-                        let ss_idx = majit_gc::shadow_stack::push(*class_ptr);
-                        self.rooted_refs.push((
-                            key,
-                            ExportedGcRefField::InfoPtrInfoKnownClass,
-                            ss_idx,
-                        ));
-                    }
                     PtrInfo::Instance(iinfo) => {
                         if let Some(gcref) = iinfo.known_class {
                             if !gcref.is_null() {
                                 let ss_idx = majit_gc::shadow_stack::push(gcref);
                                 self.rooted_refs.push((
                                     key,
-                                    ExportedGcRefField::InfoPtrInfoInstanceKnownClass,
+                                    ExportedGcRefField::InfoPtrInfoKnownClass,
                                     ss_idx,
                                 ));
                             }
@@ -1568,13 +1560,6 @@ impl ExportedState {
                     }
                 }
                 ExportedGcRefField::InfoPtrInfoKnownClass => {
-                    if let Some(info) = self.exported_infos.get_mut(&key) {
-                        if let Some(PtrInfo::KnownClass { class_ptr, .. }) = &mut info.ptr_info {
-                            *class_ptr = updated;
-                        }
-                    }
-                }
-                ExportedGcRefField::InfoPtrInfoInstanceKnownClass => {
                     if let Some(info) = self.exported_infos.get_mut(&key) {
                         if let Some(PtrInfo::Instance(iinfo)) = &mut info.ptr_info {
                             iinfo.known_class = Some(updated);

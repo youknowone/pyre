@@ -455,11 +455,7 @@ impl Optimizer {
             VirtualStateInfo::KnownClass { class_ptr } => {
                 ctx.set_ptr_info(
                     opref,
-                    crate::optimizeopt::info::PtrInfo::KnownClass {
-                        class_ptr: *class_ptr,
-                        is_nonnull: true,
-                        last_guard_pos: -1,
-                    },
+                    crate::optimizeopt::info::PtrInfo::known_class(*class_ptr, true),
                 );
             }
             VirtualStateInfo::NonNull => {
@@ -1039,7 +1035,8 @@ impl Optimizer {
             }
         }
 
-        // bridgeopt.py:133-146: known classes -> PtrInfo::KnownClass
+        // bridgeopt.py:133-146: known classes -> Instance(known_class=Some(_))
+        // (PyPy stores known_class on InstancePtrInfo via make_constant_class).
         for &(opref, class_ptr) in &knowledge.known_classes {
             Self::make_constant_class(ctx, opref, class_ptr.0 as i64, true);
         }
@@ -1456,15 +1453,6 @@ impl Optimizer {
         if update_last_guard {
             ctx.mark_last_guard(resolved);
         }
-    }
-
-    /// optimizer.py: is_raw_ptr(op)
-    /// Check if an OpRef refers to a raw (non-GC) pointer.
-    pub fn is_raw_ptr(_opref: OpRef) -> bool {
-        // In RPython this checks the type annotation.
-        // In majit we don't have type annotations on OpRefs,
-        // so we conservatively return false (assume GC pointer).
-        false
     }
 
     /// optimizer.py: is_call_pure_pure_canraise(op)
@@ -3023,14 +3011,16 @@ impl Optimizer {
             } else {
                 old_guard_pos
             };
-            ctx.set_ptr_info(
-                pp.obj,
-                crate::optimizeopt::info::PtrInfo::KnownClass {
-                    class_ptr: majit_ir::GcRef(pp.class_val as usize),
-                    is_nonnull: true,
-                    last_guard_pos: new_guard_pos,
-                },
+            // optimizer.py:147 InstancePtrInfo(None, class_const) +
+            // last_guard_pos = new_guard_pos. The Rust port stores this as
+            // Instance(descr=None, known_class=Some(class)) via the
+            // `known_class` factory and then sets last_guard_pos.
+            let mut new_info = crate::optimizeopt::info::PtrInfo::known_class(
+                majit_ir::GcRef(pp.class_val as usize),
+                true,
             );
+            new_info.set_last_guard_pos(new_guard_pos);
+            ctx.set_ptr_info(pp.obj, new_info);
         }
         ctx.in_final_emission = saved_in_final_emission;
     }
@@ -3437,11 +3427,59 @@ mod tests {
     }
 
     #[derive(Debug)]
+    struct TestSizeDescr {
+        index: u32,
+    }
+
+    impl majit_ir::Descr for TestSizeDescr {
+        fn index(&self) -> u32 {
+            self.index
+        }
+        fn as_size_descr(&self) -> Option<&dyn majit_ir::SizeDescr> {
+            Some(self)
+        }
+    }
+
+    impl majit_ir::SizeDescr for TestSizeDescr {
+        fn size(&self) -> usize {
+            64
+        }
+        fn type_id(&self) -> u32 {
+            self.index
+        }
+        fn is_immutable(&self) -> bool {
+            false
+        }
+    }
+
+    fn test_parent_descr() -> majit_ir::DescrRef {
+        std::sync::Arc::new(TestSizeDescr { index: 0xFFFF_0000 })
+    }
+
+    #[derive(Debug)]
     struct TestDescr(u32);
 
     impl majit_ir::Descr for TestDescr {
         fn index(&self) -> u32 {
             self.0
+        }
+        fn as_field_descr(&self) -> Option<&dyn majit_ir::FieldDescr> {
+            Some(self)
+        }
+    }
+
+    impl majit_ir::FieldDescr for TestDescr {
+        fn parent_descr(&self) -> Option<majit_ir::DescrRef> {
+            Some(test_parent_descr())
+        }
+        fn offset(&self) -> usize {
+            self.0 as usize * 8
+        }
+        fn field_size(&self) -> usize {
+            8
+        }
+        fn field_type(&self) -> majit_ir::Type {
+            majit_ir::Type::Int
         }
     }
 

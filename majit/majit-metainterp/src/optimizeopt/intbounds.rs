@@ -459,12 +459,11 @@ impl OptIntBounds {
         // intbounds.py:503-505
         //     array = self.ensure_ptr_info_arg0(op)
         //     self.optimizer.setintbound(op, array.getlenbound(None))
-        let array = ctx.ensure_ptr_info_arg0(op);
-        if let Some(bound) = ctx
-            .get_ptr_info(array)
-            .and_then(|i| i.getlenbound())
-            .cloned()
-        {
+        let bound = {
+            let mut array = ctx.ensure_ptr_info_arg0(op);
+            array.getlenbound(None)
+        };
+        if let Some(bound) = bound {
             ctx.setintbound(op.pos, &bound);
         }
     }
@@ -474,12 +473,20 @@ impl OptIntBounds {
         //     self.make_nonnull_str(op.getarg(0), vstring.mode_string)
         //     array = getptrinfo(op.getarg(0))
         //     self.optimizer.setintbound(op, array.getlenbound(vstring.mode_string))
+        //
+        // Rust note: PyPy splits this into make_nonnull_str + getptrinfo
+        // because make_nonnull_str installs the StrPtrInfo on box._forwarded
+        // and getptrinfo reads it back. The Rust port reaches the same state
+        // by calling ensure_ptr_info_arg0 (which constructs StrPtrInfo for
+        // STRLEN per optimizer.py:490-491) and then invoking getlenbound on
+        // the returned handle.
         ctx.make_nonnull_str(op.arg(0), 0);
-        let array = ctx.get_box_replacement(op.arg(0));
-        if let Some(info) = ctx.get_ptr_info_mut(array) {
-            if let Some(bound) = info.str_getlenbound(0).cloned() {
-                ctx.setintbound(op.pos, &bound);
-            }
+        let bound = {
+            let mut info = ctx.ensure_ptr_info_arg0(op);
+            info.getlenbound(Some(0))
+        };
+        if let Some(bound) = bound {
+            ctx.setintbound(op.pos, &bound);
         }
     }
 
@@ -489,11 +496,12 @@ impl OptIntBounds {
         //     array = getptrinfo(op.getarg(0))
         //     self.optimizer.setintbound(op, array.getlenbound(vstring.mode_unicode))
         ctx.make_nonnull_str(op.arg(0), 1);
-        let array = ctx.get_box_replacement(op.arg(0));
-        if let Some(info) = ctx.get_ptr_info_mut(array) {
-            if let Some(bound) = info.str_getlenbound(1).cloned() {
-                ctx.setintbound(op.pos, &bound);
-            }
+        let bound = {
+            let mut info = ctx.ensure_ptr_info_arg0(op);
+            info.getlenbound(Some(1))
+        };
+        if let Some(bound) = bound {
+            ctx.setintbound(op.pos, &bound);
         }
     }
 

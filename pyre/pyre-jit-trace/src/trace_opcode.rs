@@ -759,7 +759,7 @@ impl MIFrame {
         // pyjitpl.py:3329-3330:
         //   virtualizable = vinfo.unwrap_virtualizable_box(virtualizable_box)
         //   vinfo.tracing_before_residual_call(virtualizable)
-        let info = crate::virtualizable_gen::build_virtualizable_info();
+        let info = crate::frame_layout::build_pyframe_virtualizable_info();
         unsafe {
             info.tracing_before_residual_call(obj_ptr);
         }
@@ -785,7 +785,7 @@ impl MIFrame {
         if obj_ptr.is_null() {
             return Ok(());
         }
-        let info = crate::virtualizable_gen::build_virtualizable_info();
+        let info = crate::frame_layout::build_pyframe_virtualizable_info();
         let vable_forced = unsafe { info.tracing_after_residual_call(obj_ptr) };
         if vable_forced {
             // pyjitpl.py:3356: self.load_fields_from_virtualizable()
@@ -809,7 +809,7 @@ impl MIFrame {
         if obj_ptr.is_null() {
             return;
         }
-        let info = crate::virtualizable_gen::build_virtualizable_info();
+        let info = crate::frame_layout::build_pyframe_virtualizable_info();
         // pyjitpl.py:3460-3462: self.virtualizable_boxes = vinfo.read_boxes(
         //     self.cpu, virtualizable, 0)
         // Re-read all virtualizable fields from the heap object.

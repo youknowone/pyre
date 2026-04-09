@@ -132,6 +132,15 @@ pub struct VirtualizableInfo {
     /// `num_boxes = n + s1 + s2 + ...`
     /// (array sizes are known at trace time after a promote).
     pub num_static_extra_boxes: usize,
+    /// `descr.py FieldDescr.parent_descr` for every field descriptor
+    /// constructed via `static_field_descr` / `token_field_descr` /
+    /// `array_pointer_field_descr`. Set by the host runtime via
+    /// `set_parent_descr` so `OptContext::ensure_ptr_info_arg0` can
+    /// dispatch the GETFIELD/SETFIELD branch on `parent_descr.is_object()`
+    /// (`optimizer.py:478-484`). When `None` the descriptor methods fall
+    /// back to bare layout — only safe for code paths that bypass
+    /// `ensure_ptr_info_arg0`.
+    pub parent_descr: Option<DescrRef>,
 }
 
 impl VirtualizableInfo {
@@ -143,7 +152,22 @@ impl VirtualizableInfo {
             array_fields: Vec::new(),
             token_offset,
             num_static_extra_boxes: 0,
+            parent_descr: None,
         }
+    }
+
+    /// Attach a `SizeDescr` backreference for every field descriptor
+    /// produced by this `VirtualizableInfo`.
+    ///
+    /// `descr.py FieldDescr.parent_descr` is the SizeDescr of the host
+    /// virtualizable struct (`PyFrame` for pyre). The optimizer's
+    /// `ensure_ptr_info_arg0` (`optimizer.py:478-484`) reads this to
+    /// pick `InstancePtrInfo` vs `StructPtrInfo` for GETFIELD/SETFIELD
+    /// virtualizable field accesses. Hosts MUST call this once,
+    /// immediately after `build_virtualizable_info()`, before the
+    /// JIT pipeline starts emitting field-typed ops.
+    pub fn set_parent_descr(&mut self, descr: DescrRef) {
+        self.parent_descr = Some(descr);
     }
 
     /// Add a static field.
@@ -408,9 +432,14 @@ impl VirtualizableInfo {
     }
 
     /// Descriptor for a static virtualizable field.
+    ///
+    /// Carries `parent_descr` (the SizeDescr of the host virtualizable
+    /// struct) so the optimizer's `ensure_ptr_info_arg0` field branch
+    /// (`optimizer.py:478-484`) can dispatch the resulting GETFIELD /
+    /// SETFIELD op to `InstancePtrInfo` / `StructPtrInfo`.
     pub fn static_field_descr(&self, field_index: usize) -> DescrRef {
         let field = &self.static_fields[field_index];
-        make_field_descr(
+        self.field_descr_with_parent(
             field.offset,
             item_size_for_type(field.field_type),
             field.field_type,
@@ -420,7 +449,7 @@ impl VirtualizableInfo {
 
     /// Descriptor for the token field on the virtualizable object.
     pub fn token_field_descr(&self) -> DescrRef {
-        make_field_descr(self.token_offset, 8, Type::Int, false)
+        self.field_descr_with_parent(self.token_offset, 8, Type::Int, false)
     }
 
     /// Descriptor for the field that yields the backing array pointer.
@@ -433,7 +462,29 @@ impl VirtualizableInfo {
             VableArrayStorage::DirectPointer => array.field_offset,
             VableArrayStorage::EmbeddedArray { ptr_offset } => array.field_offset + ptr_offset,
         };
-        make_field_descr(offset, 8, Type::Ref, false)
+        self.field_descr_with_parent(offset, 8, Type::Ref, false)
+    }
+
+    /// Internal helper: build a field descriptor that carries
+    /// `self.parent_descr` (when set) so the optimizer's
+    /// `ensure_ptr_info_arg0` can resolve the parent SizeDescr without
+    /// hitting the missing-parent panic. Falls back to the bare
+    /// `make_field_descr` factory when no parent has been registered.
+    fn field_descr_with_parent(
+        &self,
+        offset: usize,
+        field_size: usize,
+        field_type: Type,
+        signed: bool,
+    ) -> DescrRef {
+        match &self.parent_descr {
+            Some(parent) => std::sync::Arc::new(
+                majit_ir::SimpleFieldDescr::new(0, offset, field_size, field_type, false)
+                    .with_signed(signed)
+                    .with_parent_descr(parent.clone()),
+            ),
+            None => make_field_descr(offset, field_size, field_type, signed),
+        }
     }
 
     /// Descriptor for array element accesses on a virtualizable array field.

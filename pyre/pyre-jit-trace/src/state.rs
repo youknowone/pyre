@@ -364,10 +364,10 @@ use crate::descr::{
     list_float_items_heap_cap_descr, list_float_items_len_descr, list_float_items_ptr_descr,
     list_int_items_heap_cap_descr, list_int_items_len_descr, list_int_items_ptr_descr,
     list_items_heap_cap_descr, list_items_len_descr, list_items_ptr_descr, list_strategy_descr,
-    make_array_descr, make_field_descr, namespace_values_len_descr, namespace_values_ptr_descr,
-    ob_type_descr, range_iter_current_descr, range_iter_step_descr, range_iter_stop_descr,
-    str_len_descr, tuple_items_len_descr, tuple_items_ptr_descr, w_float_size_descr,
-    w_int_size_descr,
+    make_array_descr, make_field_descr_with_parent, make_size_descr, namespace_values_len_descr,
+    namespace_values_ptr_descr, ob_type_descr, range_iter_current_descr, range_iter_step_descr,
+    range_iter_stop_descr, str_len_descr, tuple_items_len_descr, tuple_items_ptr_descr,
+    w_float_size_descr, w_int_size_descr,
 };
 use crate::frame_layout::{
     PYFRAME_CODE_OFFSET, PYFRAME_LOCALS_CELLS_STACK_OFFSET, PYFRAME_NAMESPACE_OFFSET,
@@ -646,24 +646,66 @@ pub(crate) fn float_array_descr() -> DescrRef {
     make_array_descr(0, 8, Type::Float, false)
 }
 
+/// `descr.py SizeDescr` for the host `PyFrame` virtualizable struct.
+///
+/// All `PyFrame` field descriptors point at this SizeDescr via
+/// `FieldDescr.parent_descr` so the optimizer's `ensure_ptr_info_arg0`
+/// (`optimizer.py:478-484`) can dispatch the GETFIELD/SETFIELD branch
+/// to `InstancePtrInfo` / `StructPtrInfo`. Also handed to
+/// `VirtualizableInfo::set_parent_descr` so virtualizable field
+/// descriptors share the same parent.
+pub fn pyframe_size_descr() -> DescrRef {
+    make_size_descr(std::mem::size_of::<pyre_interpreter::pyframe::PyFrame>())
+}
+
 pub(crate) fn frame_locals_cells_stack_descr() -> DescrRef {
-    make_field_descr(PYFRAME_LOCALS_CELLS_STACK_OFFSET, 8, Type::Int, false)
+    make_field_descr_with_parent(
+        pyframe_size_descr(),
+        PYFRAME_LOCALS_CELLS_STACK_OFFSET,
+        8,
+        Type::Int,
+        false,
+    )
 }
 
 pub(crate) fn frame_stack_depth_descr() -> DescrRef {
-    make_field_descr(PYFRAME_VALUESTACKDEPTH_OFFSET, 8, Type::Int, true)
+    make_field_descr_with_parent(
+        pyframe_size_descr(),
+        PYFRAME_VALUESTACKDEPTH_OFFSET,
+        8,
+        Type::Int,
+        true,
+    )
 }
 
 pub(crate) fn frame_next_instr_descr() -> DescrRef {
-    make_field_descr(PYFRAME_NEXT_INSTR_OFFSET, 8, Type::Int, true)
+    make_field_descr_with_parent(
+        pyframe_size_descr(),
+        PYFRAME_NEXT_INSTR_OFFSET,
+        8,
+        Type::Int,
+        true,
+    )
 }
 
 pub(crate) fn frame_code_descr() -> DescrRef {
-    make_field_descr(PYFRAME_CODE_OFFSET, 8, Type::Ref, true)
+    make_field_descr_with_parent(
+        pyframe_size_descr(),
+        PYFRAME_CODE_OFFSET,
+        8,
+        Type::Ref,
+        true,
+    )
 }
 
 pub(crate) fn frame_namespace_descr() -> DescrRef {
-    make_field_descr(PYFRAME_NAMESPACE_OFFSET, 8, Type::Ref, false)
+    make_field_descr_with_parent(
+        pyframe_size_descr(),
+        PYFRAME_NAMESPACE_OFFSET,
+        8,
+        Type::Ref,
+        false,
+    )
 }
 
 pub(crate) fn trace_ob_type_descr() -> DescrRef {
@@ -2059,7 +2101,7 @@ impl PyreJitState {
     ) -> bool {
         // virtualizable.py:126-137 write_from_resume_data_partial parity:
         // write ALL static fields to heap via VirtualizableInfo.
-        let info = crate::virtualizable_gen::build_virtualizable_info();
+        let info = crate::frame_layout::build_pyframe_virtualizable_info();
         if !self.virt_import_static_boxes(&info, static_boxes) {
             return false;
         }
@@ -2085,7 +2127,7 @@ impl PyreJitState {
     }
 
     fn export_virtualizable_state(&self) -> (Vec<i64>, Vec<Vec<i64>>) {
-        let info = crate::virtualizable_gen::build_virtualizable_info();
+        let info = crate::frame_layout::build_pyframe_virtualizable_info();
         self.virt_export_all(&info)
     }
 
@@ -3459,7 +3501,7 @@ mod tests {
         let mut state = empty_state();
         state.frame = frame_ptr;
         state.set_valuestackdepth(2);
-        let info = crate::virtualizable_gen::build_virtualizable_info();
+        let info = crate::frame_layout::build_pyframe_virtualizable_info();
 
         // virtualizable.py:86 parity: full array length, not valuestackdepth.
         assert_eq!(

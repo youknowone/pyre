@@ -252,6 +252,24 @@ pub trait SizeDescr: Descr {
 ///
 /// Mirrors rpython/jit/backend/llsupport/descr.py FieldDescr.
 pub trait FieldDescr: Descr {
+    /// descr.py / FieldDescr.get_parent_descr() — the SizeDescr of the
+    /// containing struct/object that owns this field. PyPy
+    /// optimizer.py:478-484 reads this in `ensure_ptr_info_arg0` to
+    /// dispatch a fresh GETFIELD/SETFIELD/QUASIIMMUT_FIELD opinfo to
+    /// `InstancePtrInfo` (when `parent_descr.is_object()`) or
+    /// `StructPtrInfo` (otherwise). Default returns `None`; field
+    /// descriptors that don't carry a backreference fall through to the
+    /// generic path and the Rust port's `ensure_ptr_info_arg0` panics
+    /// rather than installing a malformed PtrInfo.
+    ///
+    /// Returns a `DescrRef` (rather than `Arc<dyn SizeDescr>`) so callers
+    /// can store it in `PtrInfo::Instance.descr` / `PtrInfo::Struct.descr`
+    /// directly. The caller reads `parent.as_size_descr().is_object()` to
+    /// pick the Instance vs Struct constructor.
+    fn parent_descr(&self) -> Option<DescrRef> {
+        None
+    }
+
     /// Byte offset from the start of the struct.
     fn offset(&self) -> usize;
 
@@ -948,6 +966,11 @@ pub struct SimpleFieldDescr {
     is_immutable: bool,
     is_signed: bool,
     virtualizable: bool,
+    /// descr.py: FieldDescr.parent_descr — backreference to the SizeDescr
+    /// of the containing struct/object. Required by
+    /// `OptContext::ensure_ptr_info_arg0` to dispatch Instance vs Struct
+    /// PtrInfo per `optimizer.py:478-484`.
+    parent_descr: Option<DescrRef>,
 }
 
 impl SimpleFieldDescr {
@@ -967,6 +990,7 @@ impl SimpleFieldDescr {
             is_immutable,
             is_signed: true,
             virtualizable: false,
+            parent_descr: None,
         }
     }
 
@@ -991,6 +1015,7 @@ impl SimpleFieldDescr {
             is_immutable,
             is_signed,
             virtualizable: false,
+            parent_descr: None,
         }
     }
 
@@ -1001,6 +1026,14 @@ impl SimpleFieldDescr {
 
     pub fn with_virtualizable(mut self, virtualizable: bool) -> Self {
         self.virtualizable = virtualizable;
+        self
+    }
+
+    /// Builder: attach a parent SizeDescr backreference. Required when the
+    /// descriptor will be used as the `op.descr` of a GETFIELD/SETFIELD/
+    /// QUASIIMMUT_FIELD that flows through `ensure_ptr_info_arg0`.
+    pub fn with_parent_descr(mut self, parent: DescrRef) -> Self {
+        self.parent_descr = Some(parent);
         self
     }
 }
@@ -1021,6 +1054,9 @@ impl Descr for SimpleFieldDescr {
 }
 
 impl FieldDescr for SimpleFieldDescr {
+    fn parent_descr(&self) -> Option<DescrRef> {
+        self.parent_descr.clone()
+    }
     fn offset(&self) -> usize {
         self.offset
     }
