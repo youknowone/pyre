@@ -817,10 +817,29 @@ impl HeapCache {
         self._set_flag(opref, HF_NONSTD_VABLE);
     }
 
-    /// heapcache.py: replace_box(oldbox, newbox)
-    /// Replace tracking for an old box with a new one (e.g., after constant folding).
+    /// heapcache.py:598-602 `replace_box(oldbox, newbox)`.
+    ///
+    ///     def replace_box(self, oldbox, newbox):
+    ///         # here, only for replacing a box with a const
+    ///         if isinstance(oldbox, FrontendOp) and isinstance(newbox, Const):
+    ///             assert newbox.same_constant(constant_from_op(oldbox))
+    ///             oldbox.set_replaced_with_const()
+    ///
+    /// In RPython, flags live directly on Box objects, so replacement with
+    /// a const only marks the oldbox as "replaced with const" and the flag
+    /// storage on `newbox` (if any) keeps working on its own identity.
+    ///
+    /// pyre stores most caches keyed by OpRef, so this method migrates
+    /// the per-OpRef state: the non-versioned field/array caches and the
+    /// legacy Vec<bool> / Vec<u8> mirrors. The versioned `heapc_flags`
+    /// storage is intentionally left alone — each slot holds
+    /// `head_version | flag_bits`, and naively OR-merging two different
+    /// versions corrupts the version cohort. For the flag queries the
+    /// structural RPython contract is that `newbox` starts with its own
+    /// fresh state (RPython's replace_box body is effectively a no-op
+    /// for flags), which pyre matches by not overwriting `new`'s slot.
     pub fn replace_box(&mut self, old: OpRef, new: OpRef) {
-        // Transfer field cache entries
+        // Transfer field cache entries keyed by (OpRef, descr_index).
         let keys: Vec<_> = self
             .field_cache
             .keys()
@@ -832,7 +851,8 @@ impl HeapCache {
                 self.field_cache.insert((new, key.1), val);
             }
         }
-        // Transfer escape/allocation status
+        // Transfer legacy Vec<bool> / Vec<u8> mirrors (kept alive by the
+        // pre-flag code paths — migration to heapc_flags is ongoing).
         if vb_remove(&mut self.is_unescaped, &old) {
             vb_insert(&mut self.is_unescaped, new);
         }
