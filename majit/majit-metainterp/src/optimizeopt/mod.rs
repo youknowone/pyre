@@ -1700,12 +1700,26 @@ impl OptContext {
         }
     }
 
+    /// optimizer.py:99-113 `getintbound(op)` parity assertion: `assert op.type == 'i'`.
+    /// Centralized so getintbound/setintbound/with_intbound_mut/peek_intbound
+    /// all enforce the same type contract as PyPy.
+    fn debug_assert_int_type(&self, opref: OpRef) {
+        debug_assert!(
+            matches!(self.opref_type(opref), Some(majit_ir::Type::Int) | None),
+            "IntBound API called on non-int OpRef: {:?} type={:?}",
+            opref,
+            self.opref_type(opref)
+        );
+    }
+
     /// Read-only variant of `getintbound` — returns the IntBound stored on
     /// `box._forwarded` without materializing an unbounded one on first
     /// access. Returns `None` for boxes that have no IntBound forwarding.
     /// Used by exporters that take `&OptContext` and cannot mutate.
     pub fn peek_intbound(&self, opref: OpRef) -> Option<crate::optimizeopt::intutils::IntBound> {
         use crate::optimizeopt::info::Forwarded;
+        // optimizer.py:100 / 116: assert op.type == 'i'
+        self.debug_assert_int_type(opref);
         let replaced = self.get_box_replacement(opref);
         if let Some(Value::Int(v)) = self.get_constant(replaced) {
             return Some(crate::optimizeopt::intutils::IntBound::from_constant(
@@ -1729,6 +1743,8 @@ impl OptContext {
     /// it in forwarded[].
     pub fn getintbound(&mut self, opref: OpRef) -> crate::optimizeopt::intutils::IntBound {
         use crate::optimizeopt::info::Forwarded;
+        // optimizer.py:100: assert op.type == 'i'
+        self.debug_assert_int_type(opref);
         let replaced = self.get_box_replacement(opref);
         // optimizer.py:102-103: if isinstance(op, ConstInt): return from_constant
         if let Some(Value::Int(v)) = self.get_constant(replaced) {
@@ -1762,6 +1778,8 @@ impl OptContext {
     /// bound with new bound, or set if none exists.
     pub fn setintbound(&mut self, opref: OpRef, bound: &crate::optimizeopt::intutils::IntBound) {
         use crate::optimizeopt::info::Forwarded;
+        // optimizer.py:116: assert op.type == 'i'
+        self.debug_assert_int_type(opref);
         let replaced = self.get_box_replacement(opref);
         if replaced.is_constant() || self.get_constant(replaced).is_some() {
             return;
@@ -1804,6 +1822,8 @@ impl OptContext {
         F: FnOnce(&mut crate::optimizeopt::intutils::IntBound) -> R,
     {
         use crate::optimizeopt::info::Forwarded;
+        // optimizer.py:100 / 116: assert op.type == 'i'
+        self.debug_assert_int_type(opref);
         let replaced = self.get_box_replacement(opref);
         if let Some(Value::Int(v)) = self.get_constant(replaced) {
             let mut tmp = crate::optimizeopt::intutils::IntBound::from_constant(*v as i64);
@@ -3162,7 +3182,7 @@ pub trait Optimization {
     fn export_arg_int_bounds(
         &self,
         _args: &[OpRef],
-        _ctx: &mut OptContext,
+        _ctx: &OptContext,
     ) -> HashMap<OpRef, IntBound> {
         HashMap::new()
     }

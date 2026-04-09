@@ -2073,7 +2073,7 @@ impl Optimizer {
                     );
                 }
             }
-            let exported_int_bounds = self.collect_exported_int_bounds(&jump.args, &mut ctx);
+            let exported_int_bounds = self.collect_exported_int_bounds(&jump.args, &ctx);
             // RPython unroll.py passes optimize_preamble()'s inputargs here,
             // i.e. the external loop-entry contract, not the optimizer's
             // internal position base (`ctx.num_inputs`), which may be widened
@@ -2641,7 +2641,7 @@ impl Optimizer {
     fn collect_exported_int_bounds(
         &self,
         args: &[OpRef],
-        ctx: &mut OptContext,
+        ctx: &OptContext,
     ) -> std::collections::HashMap<OpRef, crate::optimizeopt::intutils::IntBound> {
         let mut exported = std::collections::HashMap::new();
         for pass in &self.passes {

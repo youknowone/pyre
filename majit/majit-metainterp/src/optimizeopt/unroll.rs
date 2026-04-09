@@ -2661,7 +2661,21 @@ impl OptUnroll {
                 ),
                 None => (ExportedPtrKind::None, None, None, None, false),
             };
-        let int_bound = exported_int_bounds.and_then(|bounds| bounds.get(&resolved).cloned());
+        // optimizer.py:99-113 / 115-125: peek_intbound asserts op.type == 'i'.
+        // Match RPython's getintbound type contract by skipping known-non-int
+        // boxes here so we never materialize an empty IntBound on a ref/float
+        // box. Unknown-typed OpRefs (no producing op, no value_types entry)
+        // remain eligible because the caller may know they're int from
+        // external context (e.g. Optimizer.trace_inputarg_types).
+        let is_int_compat = !matches!(
+            ctx.opref_type(resolved),
+            Some(majit_ir::Type::Ref) | Some(majit_ir::Type::Float)
+        );
+        let int_bound = if is_int_compat {
+            exported_int_bounds.and_then(|bounds| bounds.get(&resolved).cloned())
+        } else {
+            None
+        };
         // Fall back to the box's _forwarded IntBound for the lower-bound
         // constraint (heap.py array length etc.); this is the single source
         // of truth that replaces the old `ctx.int_lower_bounds` map.
@@ -2670,6 +2684,9 @@ impl OptUnroll {
             .map(|bound| bound.lower)
             .filter(|lower| *lower > i64::MIN)
             .or_else(|| {
+                if !is_int_compat {
+                    return None;
+                }
                 ctx.peek_intbound(resolved)
                     .map(|b| b.lower)
                     .filter(|l| *l > i64::MIN)
