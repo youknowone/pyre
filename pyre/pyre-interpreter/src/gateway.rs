@@ -247,15 +247,34 @@ pub static BUILTIN_CODE_TYPE: PyType = pyre_object::pyobject::new_pytype("builti
 pub type BuiltinCodeFn = fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>;
 
 /// A built-in function object.
+///
+/// `docstring` mirrors PyPy `BuiltinCode.docstring` (gateway.py:673
+/// `self.docstring = doc or func.__doc__`). It is consulted by
+/// `BuiltinCode::getdocstring`, which is the lazy fallback used by
+/// `Function.fget_func_doc` (function.py:395-398).
 #[repr(C)]
 pub struct BuiltinCode {
     pub ob: PyObject,
     pub name: &'static str,
     pub func: BuiltinCodeFn,
+    pub docstring: Option<&'static str>,
 }
 
-/// Allocate a new `BuiltinCode`.
+/// Allocate a new `BuiltinCode` with no docstring.
 pub fn builtin_code_new(name: &'static str, func: BuiltinCodeFn) -> PyObjectRef {
+    builtin_code_new_with_doc(name, func, None)
+}
+
+/// Allocate a new `BuiltinCode` with an explicit docstring.
+///
+/// PyPy gateway.py:673 — `self.docstring = doc or func.__doc__`. Pyre has
+/// no introspection of `func.__doc__`, so callers must pass the docstring
+/// explicitly when registering a builtin.
+pub fn builtin_code_new_with_doc(
+    name: &'static str,
+    func: BuiltinCodeFn,
+    docstring: Option<&'static str>,
+) -> PyObjectRef {
     let obj = Box::new(BuiltinCode {
         ob: PyObject {
             ob_type: &BUILTIN_CODE_TYPE,
@@ -263,6 +282,7 @@ pub fn builtin_code_new(name: &'static str, func: BuiltinCodeFn) -> PyObjectRef 
         },
         name,
         func,
+        docstring,
     });
     Box::into_raw(obj) as PyObjectRef
 }
@@ -294,6 +314,20 @@ pub unsafe fn builtin_code_get(obj: PyObjectRef) -> BuiltinCodeFn {
 pub unsafe fn builtin_code_name(obj: PyObjectRef) -> &'static str {
     let func_obj = obj as *const BuiltinCode;
     unsafe { (*func_obj).name }
+}
+
+/// gateway.py:777 BuiltinCode.getdocstring — return the stored docstring
+/// wrapped as a `str`, or `None` if no docstring was attached.
+///
+/// # Safety
+/// `obj` must point to a valid `BuiltinCode`.
+#[inline]
+pub unsafe fn builtin_code_get_docstring(obj: PyObjectRef) -> PyObjectRef {
+    let func_obj = obj as *const BuiltinCode;
+    match unsafe { (*func_obj).docstring } {
+        Some(s) => pyre_object::w_str_new(s),
+        None => pyre_object::w_none(),
+    }
 }
 
 /// gateway.py GatewayCache.build() parity — wrap a BuiltinCodeFn as FunctionWithFixedCode.

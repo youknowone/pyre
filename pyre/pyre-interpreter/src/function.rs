@@ -326,25 +326,74 @@ pub unsafe fn setdict(obj: PyObjectRef, value: PyObjectRef) {
     function_setdict(obj, value)
 }
 
-/// PyPy `W_Function.w_doc` accessor.
-#[inline]
+/// PyPy `W_Function.fget_func_doc` accessor (function.py:395-398).
+///
+/// ```text
+/// def fget_func_doc(self, space):
+///     if self.w_doc is None:
+///         self.w_doc = self.code.getdocstring(space)
+///     return self.w_doc
+/// ```
+///
+/// pyre has no `w_doc` struct field, so the explicit override (set via
+/// `function_set_doc`) lives in the instance dict. Both lookups bypass
+/// `crate::getattr` because `getattr(func, "__doc__")` resolves to the
+/// typedef-installed `getset_func_doc` descriptor, which would call back
+/// into here and recurse forever.
 pub fn function_get_doc(obj: PyObjectRef) -> PyObjectRef {
-    crate::getattr(obj, "__doc__").unwrap_or(pyre_object::w_none())
+    if obj.is_null() {
+        return pyre_object::w_none();
+    }
+    // First-level: explicit override stored on the function instance
+    // (function.py:400 fset_func_doc writes here).
+    let w_dict = crate::objspace::std::mapdict::INSTANCE_DICT
+        .with(|table| table.borrow().get(&(obj as usize)).copied())
+        .unwrap_or(pyre_object::PY_NULL);
+    if !w_dict.is_null() {
+        if let Some(v) = unsafe { pyre_object::w_dict_getitem_str(w_dict, "__doc__") } {
+            return v;
+        }
+    }
+    // Second-level: lazy fallback to `code.getdocstring(space)`
+    // (function.py:397). pyre's BuiltinCode stores `docstring` directly;
+    // user-level CodeObjects do not yet, so they default to None.
+    let code = unsafe { function_get_code(obj) } as PyObjectRef;
+    if !code.is_null() && unsafe { crate::gateway::is_builtin_code(code) } {
+        return unsafe { crate::gateway::builtin_code_get_docstring(code) };
+    }
+    pyre_object::w_none()
 }
 
 /// function.py:400 — `fset_func_doc` mutator.
-#[inline]
+///
+/// Writes the doc directly into the instance dict; the typedef-installed
+/// `getset_func_doc` descriptor would otherwise recurse if we routed
+/// through `setattr`.
 pub unsafe fn function_set_doc(obj: PyObjectRef, value: PyObjectRef) -> Result<(), crate::PyError> {
     _check_code_mutable(obj, "func_doc")?; // function.py:401
-    let _ = crate::setattr(obj, "__doc__", value);
+    if obj.is_null() {
+        return Ok(());
+    }
+    let w_dict = crate::baseobjspace::getdict(obj);
+    if !w_dict.is_null() {
+        pyre_object::w_dict_setitem_str(w_dict, "__doc__", value);
+    }
     Ok(())
 }
 
 /// function.py:404 — `fdel_func_doc` deleter.
-#[inline]
+///
+/// Removes the doc directly from the instance dict (see `function_set_doc`
+/// for the recursion rationale).
 pub unsafe fn function_del_doc(obj: PyObjectRef) -> Result<(), crate::PyError> {
     _check_code_mutable(obj, "func_doc")?; // function.py:405
-    let _ = crate::delattr(obj, "__doc__");
+    if obj.is_null() {
+        return Ok(());
+    }
+    let w_dict = crate::baseobjspace::getdict(obj);
+    if !w_dict.is_null() {
+        pyre_object::w_dict_delitem_str(w_dict, "__doc__");
+    }
     Ok(())
 }
 

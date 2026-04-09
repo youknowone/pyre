@@ -844,11 +844,10 @@ pub fn call_with_kwargs(
         } else {
             pyre_object::w_instance_new(callable)
         };
-        // Step 2: __init__(self, *args, **kwargs) with full kwargs support
-        if !instance.is_null() && unsafe { pyre_object::is_instance(instance) } {
-            let w_type = unsafe { pyre_object::w_instance_get_type(instance) };
+        // Step 2: __init__(self, *args, **kwargs) with full kwargs support.
+        if let Some(w_insttype) = type_call_init_type(instance, callable) {
             if let Some(init_fn) =
-                unsafe { crate::baseobjspace::lookup_in_type(w_type, "__init__") }
+                unsafe { crate::baseobjspace::lookup_in_type(w_insttype, "__init__") }
             {
                 let mut init_args = Vec::with_capacity(1 + pos_args.len());
                 init_args.push(instance);
@@ -1066,23 +1065,30 @@ fn type_descr_call_impl(w_type: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRe
             pyre_object::w_instance_new(w_type)
         };
 
-    // Step 2: __init__ — only if __new__ returned an instance of w_type
-    // PyPy: descr_call skips __init__ when __new__ returns a different type
-    if !instance.is_null() && unsafe { pyre_object::is_instance(instance) } {
-        let w_insttype = unsafe { pyre_object::w_instance_get_type(instance) };
-        if std::ptr::eq(w_insttype, w_type) || issubtype_ptr(w_insttype, w_type) {
-            if let Some(init_fn) =
-                unsafe { crate::baseobjspace::lookup_in_type(w_type, "__init__") }
-            {
-                let mut init_args = Vec::with_capacity(1 + args.len());
-                init_args.push(instance);
-                init_args.extend_from_slice(args);
-                let _ = call_function_impl(init_fn, &init_args);
-            }
+    // Step 2: __init__ — only if __new__ returned an instance of w_type.
+    // PyPy checks the Python-level type(instance), so builtin-layout subtypes
+    // like set subclasses still run __init__.
+    if let Some(w_insttype) = type_call_init_type(instance, w_type) {
+        if let Some(init_fn) =
+            unsafe { crate::baseobjspace::lookup_in_type(w_insttype, "__init__") }
+        {
+            let mut init_args = Vec::with_capacity(1 + args.len());
+            init_args.push(instance);
+            init_args.extend_from_slice(args);
+            let _ = call_function_impl(init_fn, &init_args);
         }
     }
 
     instance
+}
+
+fn type_call_init_type(instance: PyObjectRef, w_type: PyObjectRef) -> Option<PyObjectRef> {
+    let w_insttype = crate::typedef::r#type(instance)?;
+    if std::ptr::eq(w_insttype, w_type) || issubtype_ptr(w_insttype, w_type) {
+        Some(w_insttype)
+    } else {
+        None
+    }
 }
 
 /// Pointer-based subtype check for descr_call __init__ guard.
@@ -1646,15 +1652,10 @@ fn type_descr_call(frame: &mut PyFrame, w_type: PyObjectRef, args: &[PyObjectRef
 
     // Step 2: __init__ — only if __new__ returned an instance of w_type.
     // PyPy: descr_call — skips __init__ when __new__ returns a foreign type.
-    let call_init = if !instance.is_null() && unsafe { pyre_object::is_instance(instance) } {
-        let w_insttype = unsafe { pyre_object::w_instance_get_type(instance) };
-        std::ptr::eq(w_insttype, w_type) || issubtype_ptr(w_insttype, w_type)
-    } else {
-        false
-    };
-
-    if call_init {
-        if let Some(init_fn) = unsafe { crate::baseobjspace::lookup_in_type(w_type, "__init__") } {
+    if let Some(w_insttype) = type_call_init_type(instance, w_type) {
+        if let Some(init_fn) =
+            unsafe { crate::baseobjspace::lookup_in_type(w_insttype, "__init__") }
+        {
             let mut init_args = Vec::with_capacity(1 + args.len());
             init_args.push(instance);
             init_args.extend_from_slice(args);

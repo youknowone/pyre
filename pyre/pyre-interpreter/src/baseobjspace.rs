@@ -3823,7 +3823,7 @@ unsafe fn delete(descr: PyObjectRef, obj: PyObjectRef) -> Result<(), crate::PyEr
                 "cannot delete attribute".to_string(),
             ));
         }
-        crate::call_function(fdel, &[obj]);
+        crate::call::call_function_impl_result(fdel, &[obj])?;
         return Ok(());
     }
     // typedef.py:483-490 Member.descr_member_del
@@ -3859,7 +3859,7 @@ unsafe fn delete(descr: PyObjectRef, obj: PyObjectRef) -> Result<(), crate::PyEr
         let descr_type = w_instance_get_type(descr);
         if let Some(del_fn) = lookup_in_type_where(descr_type, "__delete__") {
             if !del_fn.is_null() {
-                crate::call_function(del_fn, &[descr, obj]);
+                crate::call::call_function_impl_result(del_fn, &[descr, obj])?;
                 return Ok(());
             }
         }
@@ -3944,10 +3944,22 @@ pub fn setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult {
             }
         }
     }
-    // Data descriptor __set__ takes priority (PyPy: descr__setattr__ step 1)
+    // Data descriptor __set__ takes priority (PyPy: descroperation.py
+    // descr__setattr__ step 1). PyPy walks `space.type(obj)` regardless of
+    // whether `obj` is a Python-level instance, so the lookup must run for
+    // every object whose type pyre can resolve — not just W_InstanceObject.
     unsafe {
-        if is_instance(obj) {
-            let w_type = w_instance_get_type(obj);
+        let w_type = if is_instance(obj) {
+            w_instance_get_type(obj)
+        } else if is_type(obj) {
+            // For type objects pyre stores attributes in the type's own
+            // dict below; the descriptor walk uses the metaclass MRO so
+            // metatype-installed setters (e.g. on `type`) still fire.
+            crate::typedef::r#type(obj).unwrap_or(std::ptr::null_mut())
+        } else {
+            crate::typedef::r#type(obj).unwrap_or(std::ptr::null_mut())
+        };
+        if !w_type.is_null() {
             if let Some(descr) = lookup_in_type_where(w_type, name) {
                 if set(descr, obj, value)? {
                     return Ok(w_none());
@@ -4066,10 +4078,18 @@ pub fn delattr(obj: PyObjectRef, name: &str) -> PyResult {
             }
         }
     }
-    // descroperation.py descr__delattr__: data descriptor __delete__ takes priority
+    // descroperation.py descr__delattr__: data descriptor __delete__ takes
+    // priority. PyPy walks `space.type(obj)`, so the lookup must run for
+    // any object whose type pyre can resolve — not just W_InstanceObject.
     unsafe {
-        if is_instance(obj) {
-            let w_type = w_instance_get_type(obj);
+        let w_type = if is_instance(obj) {
+            w_instance_get_type(obj)
+        } else if is_type(obj) {
+            crate::typedef::r#type(obj).unwrap_or(std::ptr::null_mut())
+        } else {
+            crate::typedef::r#type(obj).unwrap_or(std::ptr::null_mut())
+        };
+        if !w_type.is_null() {
             if let Some(descr) = lookup_in_type_where(w_type, name) {
                 if is_data_descr(descr) {
                     delete(descr, obj)?;
