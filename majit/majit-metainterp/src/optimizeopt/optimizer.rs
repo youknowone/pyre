@@ -2870,6 +2870,12 @@ impl Optimizer {
                 self.last_guard_op = None;
             }
         }
+        // optimizer.py:598-602:
+        //     if rop.returns_bool_result(op.opnum):
+        //         self.getintbound(op).make_bool()
+        if op.opcode.returns_bool() {
+            ctx.with_intbound_mut(op.pos, |bound| bound.make_bool());
+        }
         let emitted = ctx.emit(op.clone());
         if std::env::var_os("MAJIT_LOG").is_some()
             && matches!(

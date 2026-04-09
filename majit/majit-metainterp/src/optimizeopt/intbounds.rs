@@ -1314,15 +1314,18 @@ impl Optimization for OptIntBounds {
 
     /// RPython: have_dispatcher_method(OptIntBounds, 'postprocess_')
     ///
-    /// Guard postprocess (propagate_bounds_backward) is excluded from
-    /// framework dispatch because it recurses deeply — Rust's 8MB stack
-    /// can't handle the depth that RPython's Python stack handles.
-    /// Guard postprocess runs via the test helper (run_pass_with_bounds)
-    /// which calls propagate_postprocess directly.
+    /// Guard postprocess must be included in framework dispatch so
+    /// intbounds can run its upstream `postprocess_GUARD_TRUE/FALSE` parity:
+    /// after rewrite postprocess has fixed the guard result to 1/0,
+    /// intbounds propagates that knowledge backward through the producing
+    /// int expression before later ops (e.g. INT_ADD_OVF) are optimized.
     fn have_postprocess_op(&self, opcode: OpCode) -> bool {
         matches!(
             opcode,
-            OpCode::IntAdd
+            OpCode::GuardTrue
+                | OpCode::GuardFalse
+                | OpCode::GuardValue
+                | OpCode::IntAdd
                 | OpCode::IntSub
                 | OpCode::IntMul
                 | OpCode::IntAnd
@@ -1385,6 +1388,11 @@ impl Optimization for OptIntBounds {
                     .map_or(true, |t| t == majit_ir::Type::Int);
                 if !is_int {
                     return;
+                }
+                if op.opcode == OpCode::GuardTrue {
+                    self.setintbound(arg0, IntBound::from_constant(1), ctx);
+                } else if op.opcode == OpCode::GuardFalse {
+                    self.setintbound(arg0, IntBound::from_constant(0), ctx);
                 }
                 // intbounds.py:40-50 propagate_bounds_backward
                 let b = self.getintbound(arg0, ctx);
@@ -1542,6 +1550,9 @@ impl Optimization for OptIntBounds {
         let mut exported = std::collections::HashMap::new();
         for &arg in args {
             let resolved = ctx.get_box_replacement(arg);
+            if !matches!(ctx.opref_type(resolved), Some(majit_ir::Type::Int)) {
+                continue;
+            }
             let bound = self.getintbound(resolved, ctx);
             if !bound.is_unbounded() {
                 exported.insert(resolved, bound);
@@ -2378,13 +2389,10 @@ mod tests {
     /// RPython postprocess_GUARD_TRUE parity test:
     /// GuardTrue(IntLt(i, len)) should tighten i's upper bound so that
     /// IntAddOvf(i, 1) is converted to IntAdd. This is the nbody inner
-    /// loop pattern. Currently fails because the full propagate_postprocess
-    /// chain that ports intbounds.py:608-651 is not yet wired through the
-    /// default pipeline driver — the existing has_postprocess() path only
-    /// covers `propagate_bounds_backward`, not the comparison-narrowing
-    /// `make_int_lt/le/gt/ge/eq/ne` callbacks.
+    /// loop pattern and relies on rewrite postprocess first fixing the
+    /// comparison result to 1, then intbounds driving
+    /// propagate_bounds_backward_op() / intbounds.py:608-651.
     #[test]
-    #[ignore = "needs full intbounds.py:608-651 propagate_bounds_INT_LT/LE/GT/GE/EQ/NE wiring through propagate_postprocess"]
     fn test_guard_true_int_lt_enables_add_ovf_removal() {
         use crate::optimizeopt::optimizer::Optimizer;
 

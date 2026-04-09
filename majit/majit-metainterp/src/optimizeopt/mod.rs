@@ -1774,14 +1774,8 @@ impl OptContext {
             Forwarded::IntBound(cur) => {
                 let _ = cur.intersect(bound);
             }
-            fwd @ Forwarded::None => {
-                *fwd = Forwarded::IntBound(bound.clone());
-            }
-            _ => {
-                // Already has Op/Info/Const forwarding — don't overwrite.
-                // RPython: if cur is not IntBound, set_forwarded replaces it,
-                // but that case is rare (RawBufferPtrInfo).
-            }
+            fwd @ Forwarded::None => *fwd = Forwarded::IntBound(bound.clone()),
+            _ => {}
         }
     }
 
