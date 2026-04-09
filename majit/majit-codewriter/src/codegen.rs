@@ -2155,10 +2155,12 @@ mod tests {
         let mut pipeline = crate::passes::ProgramPipelineResult {
             functions: Vec::new(),
             opcode_dispatch: vec![crate::passes::PipelineOpcodeArm {
+                arm_id: 0,
                 selector: crate::OpcodeDispatchSelector::Path(crate::CallPath::from_segments([
                     "Instruction",
                     "Add",
                 ])),
+                entry_jitcode_index: None,
                 flattened: None,
             }],
             jitcodes: Vec::new(),
