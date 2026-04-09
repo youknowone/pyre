@@ -70,13 +70,23 @@ pub struct PyJitCode {
 
 /// rpython/jit/codewriter/liveness.py:139 "we encode the bitsets of which of
 /// the 256 registers are live" — PyPy's compact liveness encoding treats a
-/// register index as a single byte. JitCodes whose register files overflow
-/// this must not reach liveness encoding; the codewriter instead emits a
-/// permanent abort so the JIT driver falls back to the interpreter.
+/// register index as a single byte and assumes the precondition holds. PyPy
+/// raises `AssertionError` (i.e. crashes the translator) if a JitCode ever
+/// emits a register index ≥ 256, so the orthodox behavior is "panic".
 ///
-/// Returns `None` if any register in `regs` exceeds `u8::MAX`; the caller is
-/// expected to have already set `has_abort` and will skip liveness emission
-/// for that jitcode.
+/// **Source-equivalence divergence:** the Rust port returns `None` instead
+/// of panicking, and the caller marks the JitCode with `has_abort = true`
+/// so the driver falls back to the interpreter at runtime
+/// (`pyre/pyre-jit/src/call_jit.rs:1819`). This is a deliberate safety net
+/// — pyre's regalloc can blow past 256 ref registers when stdlib functions
+/// load many locals + a deep value stack, and the orthodox panic would
+/// kill the entire process. The proper fix is to make pyre's regalloc
+/// produce ≤ 256 registers (e.g. by reusing dead slots), at which point
+/// this fallback can be replaced with a hard panic to match PyPy.
+///
+/// Until then, the divergence is documented here and in
+/// `pyre_unittest_landings_2026_04_09.md` so that any future
+/// source-equivalence audit can find it without re-discovering the gap.
 fn liveness_regs_to_u8_sorted(regs: &[u16]) -> Option<Vec<u8>> {
     let mut bytes = Vec::with_capacity(regs.len());
     for &reg in regs {
@@ -926,11 +936,14 @@ impl CodeWriter {
             // encoding stays symmetric across the three kinds.
             //
             // rpython/jit/codewriter/liveness.py:139 comment: "we encode the
-            // bitsets of which of the 256 registers are live". Any entry
-            // whose live_r_regs overflows u8 forces a permanent abort — the
-            // compiled jitcode can no longer encode its own liveness
-            // truthfully. We set has_abort on the jitcode so the outer
-            // driver (call_jit.rs:1819) falls back to the interpreter.
+            // bitsets of which of the 256 registers are live". PyPy treats
+            // this as a hard precondition and the translator panics on a
+            // ≥256 register index. The Rust port DEVIATES by setting
+            // `has_abort = true` on overflow so the outer driver
+            // (`call_jit.rs:1819`) falls back to the interpreter at runtime
+            // — see the comment on `liveness_regs_to_u8_sorted` for the
+            // rationale and the proper-fix TODO. This is a documented
+            // safety net, not source-equivalent behavior.
             let mut liveness_info: Vec<u8> = Vec::new();
             let mut liveness_offsets: std::collections::HashMap<u32, u32> =
                 std::collections::HashMap::new();
