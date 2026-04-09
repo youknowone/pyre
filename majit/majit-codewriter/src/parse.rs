@@ -420,16 +420,17 @@ fn collect_inherent_methods_from_items(
 ///
 /// This preserves source-level match structure and handler calls so canonical
 /// graph/pipeline consumers can resolve and classify these arms directly.
+///
+/// Duplicate opcode selectors are rejected. Silently keeping the first arm
+/// would hide dispatch drift in the interpreter source.
 pub fn extract_opcode_dispatch_arms(parsed: &ParsedInterpreter) -> Vec<ExtractedOpcodeArm> {
-    for item in &parsed.file.items {
-        if let Item::Fn(func) = item {
-            if func.sig.ident == "execute_opcode_step" {
-                return extract_match_arms(func);
-            }
-        }
-    }
-
-    Vec::new()
+    let Some(func) = find_function(parsed, "execute_opcode_step") else {
+        return Vec::new();
+    };
+    let Some(opcode_match) = find_opcode_match(func) else {
+        return Vec::new();
+    };
+    reject_duplicate_opcode_selectors(extract_match_arms(opcode_match))
 }
 
 /// Extract receiver -> trait bounds for `execute_opcode_step`.
@@ -464,11 +465,41 @@ pub fn collect_function_graphs(
     }
 }
 
-/// Extract match arms from a function containing a match on instruction.
-fn extract_match_arms(func: &ItemFn) -> Vec<ExtractedOpcodeArm> {
-    let mut collector = MatchArmCollector { arms: Vec::new() };
-    collector.visit_item_fn(func);
-    collector.arms
+/// Extract opcode-dispatch arms from the canonical dispatch match only.
+fn extract_match_arms(expr: &ExprMatch) -> Vec<ExtractedOpcodeArm> {
+    expr.arms
+        .iter()
+        .map(|arm| {
+            let handler_calls = extract_handler_calls(&arm.body);
+            let selector = extract_opcode_dispatch_selector(&arm.pat);
+            let body_graph = {
+                let name = selector.canonical_key();
+                let mut graph = crate::model::FunctionGraph::new(name);
+                crate::front::ast::lower_expr_into_graph(&mut graph, &arm.body);
+                Some(graph)
+            };
+            ExtractedOpcodeArm {
+                selector,
+                handler_calls,
+                body_graph,
+            }
+        })
+        .collect()
+}
+
+fn reject_duplicate_opcode_selectors(arms: Vec<ExtractedOpcodeArm>) -> Vec<ExtractedOpcodeArm> {
+    let mut seen = std::collections::HashMap::new();
+    for (idx, arm) in arms.iter().enumerate() {
+        let key = arm.selector.canonical_key();
+        if let Some(first_idx) = seen.insert(key.clone(), idx) {
+            panic!(
+                "duplicate opcode dispatch selector `{key}` at arm {} and arm {}",
+                first_idx + 1,
+                idx + 1
+            );
+        }
+    }
+    arms
 }
 
 fn is_opcode_pattern(arm: &syn::Arm) -> bool {
@@ -500,31 +531,6 @@ fn path_is_opcode_dispatch(path: &Path) -> bool {
     path.segments
         .iter()
         .any(|segment| segment.ident == "Instruction")
-}
-
-struct MatchArmCollector {
-    arms: Vec<ExtractedOpcodeArm>,
-}
-
-impl<'ast> Visit<'ast> for MatchArmCollector {
-    fn visit_expr_match(&mut self, expr: &'ast syn::ExprMatch) {
-        for arm in &expr.arms {
-            let handler_calls = extract_handler_calls(&arm.body);
-            let selector = extract_opcode_dispatch_selector(&arm.pat);
-            // Build semantic graph from the arm body expression.
-            let body_graph = {
-                let name = selector.canonical_key();
-                let mut graph = crate::model::FunctionGraph::new(name);
-                crate::front::ast::lower_expr_into_graph(&mut graph, &arm.body);
-                Some(graph)
-            };
-            self.arms.push(ExtractedOpcodeArm {
-                selector,
-                handler_calls,
-                body_graph,
-            });
-        }
-    }
 }
 
 fn extract_opcode_dispatch_selector(pat: &Pat) -> OpcodeDispatchSelector {
@@ -850,5 +856,55 @@ mod tests {
         let func = find_function(&parsed, "execute_opcode_step").expect("execute_opcode_step");
         let opcode_match = find_opcode_match(func).expect("opcode match");
         assert_eq!(opcode_match.arms.len(), 3);
+    }
+
+    #[test]
+    fn extract_opcode_dispatch_arms_ignores_nested_matches_in_arm_bodies() {
+        let parsed = parse_source(
+            r#"
+            fn execute_opcode_step(inst: Instruction, x: i64) {
+                match inst {
+                    Instruction::Copy => {
+                        match x {
+                            Instruction::Copy => {}
+                            _ => {}
+                        }
+                    }
+                    Instruction::YieldValue => {}
+                    _ => {}
+                }
+            }
+        "#,
+        );
+        let arms = extract_opcode_dispatch_arms(&parsed);
+        let selectors: Vec<String> = arms
+            .iter()
+            .map(|arm| arm.selector.canonical_key())
+            .collect();
+        assert_eq!(
+            selectors,
+            vec![
+                "Instruction::Copy".to_string(),
+                "Instruction::YieldValue".to_string(),
+                "_".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate opcode dispatch selector `Instruction::Copy`")]
+    fn extract_opcode_dispatch_arms_rejects_duplicate_selectors() {
+        let parsed = parse_source(
+            r#"
+            fn execute_opcode_step(inst: Instruction) {
+                match inst {
+                    Instruction::Copy => {}
+                    Instruction::Copy => {}
+                    _ => {}
+                }
+            }
+        "#,
+        );
+        let _ = extract_opcode_dispatch_arms(&parsed);
     }
 }

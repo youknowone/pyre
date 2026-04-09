@@ -10,7 +10,6 @@ pub mod descr;
 pub mod driver;
 pub mod frame_layout;
 pub mod helpers;
-pub mod jitcode_table;
 pub mod liveness;
 pub mod metainterp;
 pub mod state;
