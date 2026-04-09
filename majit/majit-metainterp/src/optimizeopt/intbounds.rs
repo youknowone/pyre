@@ -459,19 +459,12 @@ impl OptIntBounds {
         // intbounds.py:503-505
         //     array = self.ensure_ptr_info_arg0(op)
         //     self.optimizer.setintbound(op, array.getlenbound(None))
-        let array = ctx.get_box_replacement(op.arg(0));
-        if ctx.get_ptr_info(array).is_none() {
-            if let Some(descr) = op.descr.clone() {
-                ctx.set_ptr_info(
-                    array,
-                    crate::optimizeopt::info::PtrInfo::array(descr, IntBound::nonnegative()),
-                );
-            }
-        }
-        if let Some(crate::optimizeopt::info::PtrInfo::Array(arrayinfo)) =
-            ctx.get_ptr_info_mut(array)
+        let array = ctx.ensure_ptr_info_arg0(op);
+        if let Some(bound) = ctx
+            .get_ptr_info(array)
+            .and_then(|i| i.getlenbound())
+            .cloned()
         {
-            let bound = arrayinfo.lenbound.clone();
             ctx.setintbound(op.pos, &bound);
         }
     }
@@ -483,15 +476,8 @@ impl OptIntBounds {
         //     self.optimizer.setintbound(op, array.getlenbound(vstring.mode_string))
         ctx.make_nonnull_str(op.arg(0), 0);
         let array = ctx.get_box_replacement(op.arg(0));
-        if let Some(crate::optimizeopt::info::PtrInfo::Str(strinfo)) = ctx.get_ptr_info_mut(array) {
-            if strinfo.lenbound.is_none() {
-                strinfo.lenbound = Some(if strinfo.length == -1 {
-                    IntBound::nonnegative()
-                } else {
-                    IntBound::from_constant(strinfo.length as i64)
-                });
-            }
-            if let Some(bound) = strinfo.lenbound.clone() {
+        if let Some(info) = ctx.get_ptr_info_mut(array) {
+            if let Some(bound) = info.str_getlenbound(0).cloned() {
                 ctx.setintbound(op.pos, &bound);
             }
         }
@@ -504,15 +490,8 @@ impl OptIntBounds {
         //     self.optimizer.setintbound(op, array.getlenbound(vstring.mode_unicode))
         ctx.make_nonnull_str(op.arg(0), 1);
         let array = ctx.get_box_replacement(op.arg(0));
-        if let Some(crate::optimizeopt::info::PtrInfo::Str(strinfo)) = ctx.get_ptr_info_mut(array) {
-            if strinfo.lenbound.is_none() {
-                strinfo.lenbound = Some(if strinfo.length == -1 {
-                    IntBound::nonnegative()
-                } else {
-                    IntBound::from_constant(strinfo.length as i64)
-                });
-            }
-            if let Some(bound) = strinfo.lenbound.clone() {
+        if let Some(info) = ctx.get_ptr_info_mut(array) {
+            if let Some(bound) = info.str_getlenbound(1).cloned() {
                 ctx.setintbound(op.pos, &bound);
             }
         }

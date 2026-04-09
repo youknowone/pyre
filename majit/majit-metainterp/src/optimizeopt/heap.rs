@@ -497,25 +497,6 @@ impl OptHeap {
         }
     }
 
-    /// heap.py:674-681 / 725-732 / 749-756
-    /// `arrayinfo = self.ensure_ptr_info_arg0(op)` followed by
-    /// `arrayinfo.getlenbound(None).make_gt_const(index)`.
-    fn ensure_ptr_info_arg0(&mut self, op: &Op, ctx: &mut OptContext) -> OpRef {
-        let array = ctx.get_box_replacement(op.arg(0));
-        if ctx.get_ptr_info(array).is_none() {
-            if let Some(descr) = op.descr.clone() {
-                ctx.set_ptr_info(
-                    array,
-                    crate::optimizeopt::info::PtrInfo::array(
-                        descr,
-                        crate::optimizeopt::intutils::IntBound::nonnegative(),
-                    ),
-                );
-            }
-        }
-        array
-    }
-
     /// heapcache.py:295-309 _escape_box: escape a box and transitively
     /// escape all its dependencies.
     fn escape_box(&mut self, opref: OpRef) {
@@ -1605,7 +1586,7 @@ impl OptHeap {
                 }
             }
             // heap.py line 701: make_nonnull(op.getarg(0))
-            let array_ref = self.ensure_ptr_info_arg0(op, ctx);
+            let array_ref = ctx.ensure_ptr_info_arg0(op);
             vb_set(&mut self.known_nonnull, array_ref.0);
             // heap.py line 681: arrayinfo.getlenbound(None).make_gt_const(index)
             if const_index >= 0 {

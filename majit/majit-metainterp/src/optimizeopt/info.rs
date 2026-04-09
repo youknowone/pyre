@@ -1047,6 +1047,36 @@ impl PtrInfo {
         }
     }
 
+    /// vstring.py:62-70 StrPtrInfo.getlenbound(mode)
+    ///
+    /// ```python
+    /// def getlenbound(self, mode):
+    ///     if self.lenbound is None:
+    ///         if self.length == -1:
+    ///             self.lenbound = IntBound.nonnegative()
+    ///         else:
+    ///             self.lenbound = IntBound.from_constant(self.length)
+    ///     return self.lenbound
+    /// ```
+    ///
+    /// `mode` is unused in the body but kept for ABI parity with
+    /// ArrayPtrInfo.getlenbound which is called the same way from
+    /// postprocess_STRLEN/UNICODELEN.
+    pub fn str_getlenbound(&mut self, _mode: u8) -> Option<&IntBound> {
+        if let PtrInfo::Str(sinfo) = self {
+            if sinfo.lenbound.is_none() {
+                sinfo.lenbound = Some(if sinfo.length == -1 {
+                    IntBound::nonnegative()
+                } else {
+                    IntBound::from_constant(sinfo.length as i64)
+                });
+            }
+            sinfo.lenbound.as_ref()
+        } else {
+            None
+        }
+    }
+
     /// info.py: setfield(field_descr, value) — set a field on a virtual object.
     /// info.py:176-200 setfield — update the field value in the virtual.
     /// RPython: _fields[fielddescr.get_index()] = op. In majit, fields
