@@ -1296,35 +1296,58 @@ impl OptVirtualize {
         OptimizationResult::Remove
     }
 
-    /// Handle VirtualRefFinish(vref, virtual_obj).
+    /// virtualize.py:132-164 optimize_VIRTUAL_REF_FINISH.
     ///
-    /// Two cases:
-    /// 1. Normal case: virtual_obj is NULL (constant 0) -- the frame is being
-    ///    left normally. Just clear the virtual_token field.
-    /// 2. Forced case: virtual_obj is non-NULL -- the vref was forced during
-    ///    tracing. Store the real object into the `forced` field.
+    /// ```python
+    /// def optimize_VIRTUAL_REF_FINISH(self, op):
+    ///     vrefinfo = self.optimizer.metainterp_sd.virtualref_info
+    ///     seo = self.optimizer.send_extra_operation
     ///
-    /// If the vref is still virtual, these writes are absorbed into the
-    /// virtual struct's field tracking and nothing is emitted.
-    /// If the vref was already forced (escaped), we emit SETFIELD_GC ops.
+    ///     # - set 'forced' to point to the real object
+    ///     objbox = op.getarg(1)
+    ///     if not CONST_NULL.same_constant(objbox):
+    ///         seo(ResOperation(rop.SETFIELD_GC, op.getarglist(),
+    ///                          descr=vrefinfo.descr_forced))
+    ///
+    ///     # - set 'virtual_token' to TOKEN_NONE (== NULL)
+    ///     args = [op.getarg(0), CONST_NULL]
+    ///     seo(ResOperation(rop.SETFIELD_GC, args,
+    ///                      descr=vrefinfo.descr_virtual_token))
+    /// ```
+    ///
+    /// Two uses:
+    /// 1. Normal case: `objbox` is `CONST_NULL` — the frame is being left
+    ///    normally. Just clear the vref.virtual_token.
+    /// 2. Forced case: `objbox` is the real virtual object — the vref was
+    ///    already forced during tracing, so store it into vref.forced.
+    ///
+    /// majit note: RPython routes the emitted SETFIELD_GCs back through
+    /// `send_extra_operation`, which re-enters the virtualize pass and
+    /// lets `optimize_setfield_gc` absorb the writes into the vref's
+    /// virtual fields if it is still virtual. majit's `emit_extra` skips
+    /// the current (virtualize) pass, so the absorption is done in-place
+    /// here on the VirtualStruct half and the setfield_gc emit path is
+    /// taken only when the vref has already escaped.
     fn optimize_virtual_ref_finish(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let vref_ref = ctx.get_box_replacement(op.arg(0));
         let obj_ref = ctx.get_box_replacement(op.arg(1));
 
-        // Check if the virtual object arg is non-null (forced case)
-        let obj_is_null = ctx.get_constant_int(obj_ref).is_some_and(|v| v == 0);
+        // virtualize.py:151: `CONST_NULL.same_constant(objbox)` — only a
+        // Ref-typed null constant matches; a plain ConstInt(0) does not.
+        let obj_is_null = ctx.is_const_null(obj_ref);
 
         // If vref is still virtual, update the virtual struct fields directly
+        // (majit in-place absorption, see doc comment above).
         if let Some(info) = ctx.get_ptr_info_mut(vref_ref) {
             if info.is_virtual() {
                 if let PtrInfo::VirtualStruct(vinfo) = info {
-                    // Set forced field to the object (or keep NULL)
+                    // virtualize.py:150-153: set 'forced' to point to the real
+                    // object (skipped when objbox is CONST_NULL).
                     if !obj_is_null {
                         set_field(&mut vinfo.fields, VREF_FORCED_FIELD_INDEX, obj_ref);
                     }
-                    // Set virtual_token to NULL (TOKEN_NONE)
-                    let null_ref = self.emit_constant_int(ctx, 0);
-                    // Re-borrow: get_ptr_info_mut again after emit_constant_int
+                    // virtualize.py:155-158: set 'virtual_token' to CONST_NULL.
+                    let null_ref = self.emit_constant_ref(ctx, majit_ir::GcRef(0));
                     if let Some(PtrInfo::VirtualStruct(vinfo)) = ctx.get_ptr_info_mut(vref_ref) {
                         set_field(&mut vinfo.fields, VREF_VIRTUAL_TOKEN_FIELD_INDEX, null_ref);
                     }
@@ -1333,17 +1356,17 @@ impl OptVirtualize {
             }
         }
 
-        // vref is not virtual (was forced/escaped): emit SETFIELD_GC ops
+        // vref is not virtual (was forced/escaped): emit SETFIELD_GC ops.
 
-        // Set 'forced' field if the object is non-null
+        // virtualize.py:150-153: set 'forced' to the real object.
         if !obj_is_null {
             let mut set_forced = Op::new(OpCode::SetfieldGc, &[vref_ref, obj_ref]);
             set_forced.descr = Some(make_field_index_descr(VREF_FORCED_FIELD_INDEX));
             ctx.emit_extra(ctx.current_pass_idx, set_forced);
         }
 
-        // Set 'virtual_token' to NULL
-        let null_ref = self.emit_constant_int(ctx, 0);
+        // virtualize.py:155-158: set 'virtual_token' to CONST_NULL.
+        let null_ref = self.emit_constant_ref(ctx, majit_ir::GcRef(0));
         let mut set_token = Op::new(OpCode::SetfieldGc, &[vref_ref, null_ref]);
         set_token.descr = Some(make_field_index_descr(VREF_VIRTUAL_TOKEN_FIELD_INDEX));
         ctx.emit_extra(ctx.current_pass_idx, set_token);
@@ -2109,11 +2132,17 @@ mod tests {
     fn run_pass(ops: &[Op]) -> Vec<Op> {
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptVirtualize::new()));
+        // See `run_heap_opt` in heap.rs for the rationale behind the
+        // 1024 Ref seed: tests use anonymous high-numbered OpRefs as
+        // stand-in Box arguments, and the preamble exporter needs an
+        // intrinsic type per renamed inputarg.
+        opt.trace_inputarg_types = vec![Type::Ref; 1024];
         opt.optimize_with_constants_and_inputs(ops, &mut std::collections::HashMap::new(), 1024)
     }
 
     fn run_default_pipeline(ops: &[Op]) -> Vec<Op> {
         let mut opt = Optimizer::default_pipeline();
+        opt.trace_inputarg_types = vec![Type::Ref; 1024];
         opt.optimize_with_constants_and_inputs(ops, &mut std::collections::HashMap::new(), 1024)
     }
 
@@ -2833,17 +2862,17 @@ mod tests {
     #[test]
     fn test_virtual_ref_non_escaping() {
         // vref = virtual_ref_r(obj, token)   <- becomes virtual struct
-        // virtual_ref_finish(vref, NULL)      <- absorbed into virtual, removed
+        // virtual_ref_finish(vref, CONST_NULL) <- absorbed into virtual, removed
         //
-        // Expected output: only ForceToken (emitted by optimizer) + SameAsI for the null constant
+        // Expected output: only ForceToken (emitted by optimizer) + SameAsR for the null constant
         let mut ops = vec![
             Op::new(OpCode::VirtualRefR, &[OpRef(100), OpRef(101)]), // pos=0
             Op::new(OpCode::VirtualRefFinish, &[OpRef(0), OpRef(102)]), // pos=1
         ];
         assign_positions(&mut ops);
 
-        // OpRef(102) = constant 0 (NULL)
-        let constants = vec![(OpRef(102), Value::Int(0))];
+        // OpRef(102) = CONST_NULL (Ref-typed null, matching producer `const_null()`).
+        let constants = vec![(OpRef(102), Value::Ref(majit_ir::GcRef(0)))];
         let result = run_pass_with_constants(&ops, &constants);
 
         // VirtualRefR should be removed (virtual), VirtualRefFinish should be removed.

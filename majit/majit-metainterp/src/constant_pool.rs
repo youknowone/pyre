@@ -57,6 +57,13 @@ impl ConstantPool {
     /// Get or create a constant OpRef for a given i64 value.
     /// Only matches Int-typed or untyped entries (not Ref/Float).
     /// Returns the same OpRef for the same value (deduplication).
+    ///
+    /// RPython parity: equivalent to constructing `ConstInt(value)` and
+    /// relying on memo-deduping via `ResumeDataLoopMemo.large_ints`. The
+    /// `constant_types` slot is intentionally left absent so that
+    /// resume-data-only overrides stored in `numbering_type_overrides`
+    /// (see `mark_type`) can reinterpret the same i64 as a Ref pointer
+    /// without triggering GC root tracking in the constant pool.
     pub fn get_or_insert(&mut self, value: i64) -> OpRef {
         for (&idx, &v) in &self.constants {
             if v == value {

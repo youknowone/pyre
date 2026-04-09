@@ -2468,6 +2468,9 @@ mod tests {
         ];
 
         let mut opt = Optimizer::default_pipeline();
+        // IntLt/IntAddOvf operate on Int-typed inputs — override the
+        // test default (Ref) used by `optimize_with_constants_and_inputs_at`.
+        opt.trace_inputarg_types = vec![majit_ir::Type::Int; 1024];
         let mut constants = std::collections::HashMap::new();
         constants.insert(200, 1i64);
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);

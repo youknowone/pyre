@@ -1548,6 +1548,15 @@ impl Optimizer {
         start_next_pos: u32,
     ) -> Vec<Op> {
         use majit_ir::OpRef;
+        // Test-only: auto-seed `trace_inputarg_types` when unit tests
+        // pass bare `num_inputs` without staging a recorder. Production
+        // callers always populate `trace_inputarg_types` from the
+        // recorder's InputArg{Int,Ref,Float} entries before calling —
+        // the guard never fires outside `#[cfg(test)]`.
+        #[cfg(test)]
+        if self.trace_inputarg_types.is_empty() && num_inputs > 0 {
+            self.trace_inputarg_types = vec![majit_ir::Type::Ref; num_inputs];
+        }
         self.imported_label_args = None;
         self.imported_label_source_slots = None;
         self.terminal_op = None;
@@ -3726,6 +3735,8 @@ mod tests {
     #[test]
     fn test_default_pipeline_processes_trace() {
         let mut opt = Optimizer::default_pipeline();
+        // IntAdd operates on Int-typed inputs — override the test default.
+        opt.trace_inputarg_types = vec![majit_ir::Type::Int; 1024];
         // A simple trace: two INT_ADD with identical args. The Pure pass (CSE)
         // should eliminate the duplicate.
         let mut ops = vec![
@@ -3834,6 +3845,10 @@ mod tests {
     #[test]
     fn test_get_count_of_ops_and_guards() {
         let mut opt = Optimizer::default_pipeline();
+        // This test only exercises the ops/guard counter; each inputarg
+        // is read by at least one Int-shape consumer (GuardTrue, IntAdd),
+        // so seed Int to keep intbounds' type asserts happy.
+        opt.trace_inputarg_types = vec![majit_ir::Type::Int; 1024];
         let mut ops = vec![
             Op::new(OpCode::GuardTrue, &[OpRef(100)]),
             Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)]),
