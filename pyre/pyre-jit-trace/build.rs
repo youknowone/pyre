@@ -79,16 +79,26 @@ fn main() {
     let out_dir = std::env::var("OUT_DIR").unwrap();
     std::fs::write(format!("{out_dir}/jit_trace_gen.rs"), &code).unwrap();
 
-    // Trait impls go in a separate file because lib.rs `include!`s
+    // Trait impls live in a separate file because lib.rs `include!`s
     // jit_trace_gen.rs twice (once at crate root and once inside
     // `pub mod generated`). Trait impls would conflict (E0119) under double
     // inclusion, so they live in their own file included only once.
-    let trait_impls_code = majit_codewriter::generate_trait_impls_string();
+    //
+    // The source-of-truth is `src/opcode_handler_impls.template.rs` — a
+    // hand-maintained transcription of what trace_opcode.rs used to contain.
+    // build.rs copies it verbatim into OUT_DIR; `tests/trait_impls_snapshot.rs`
+    // guards against drift. Future phases will replace the template with
+    // codegen-derived content, but the include path stays the same.
+    let template_path = format!("{manifest_dir}/src/opcode_handler_impls.template.rs");
+    let trait_impls_code = std::fs::read_to_string(&template_path).unwrap_or_else(|e| {
+        panic!("[pyre-jit-trace build.rs] cannot read {template_path}: {e}");
+    });
     std::fs::write(
         format!("{out_dir}/jit_trace_trait_impls.rs"),
         &trait_impls_code,
     )
     .unwrap();
+    println!("cargo::rerun-if-changed={template_path}");
 
     // JSON metadata for debugging
     let json = serde_json::to_string_pretty(&pipeline).unwrap();
