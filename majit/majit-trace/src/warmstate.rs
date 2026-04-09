@@ -1412,6 +1412,82 @@ impl WarmEnterState {
         self.cells.retain(|_, cell| !cell.should_remove_jitcell());
         before - self.cells.len()
     }
+
+    /// counter.py:239-240 lookup_chain(hash)
+    ///
+    ///     def lookup_chain(self, hash):
+    ///         return self.celltable[self._get_index(hash)]
+    ///
+    /// RPython's celltable is fixed-size and stores a linked list of
+    /// JitCells per bucket. majit's `cells: HashMap<u64, BaseJitCell>`
+    /// gives the equivalent of a one-cell-per-bucket chain because the
+    /// HashMap already handles bucket collisions internally — there is
+    /// no need for a per-bucket linked list. The "head of chain" is
+    /// therefore exactly `cells.get(&hash)`.
+    pub fn lookup_chain(&self, hash: u64) -> Option<&BaseJitCell> {
+        self.cells.get(&hash)
+    }
+
+    /// counter.py:246-256 install_new_cell(hash, newcell)
+    ///
+    ///     def install_new_cell(self, hash, newcell):
+    ///         index = self._get_index(hash)
+    ///         cell = self.celltable[index]
+    ///         keep = newcell
+    ///         while cell is not None:
+    ///             nextcell = cell.next
+    ///             if not cell.should_remove_jitcell():
+    ///                 cell.next = keep
+    ///                 keep = cell
+    ///             cell = nextcell
+    ///         self.celltable[index] = keep
+    ///
+    /// majit collapses RPython's per-bucket linked list to a single
+    /// `Option<BaseJitCell>` because the HashMap already provides
+    /// collision resolution. The semantics:
+    ///
+    /// 1. If `newcell` is `Some`, it becomes the new head — RPython
+    ///    prepends it. There is no "tail" to append in single-cell
+    ///    Rust, so the previous occupant is discarded ONLY when its
+    ///    `should_remove_jitcell()` returns true; otherwise the older
+    ///    cell wins (preserving the procedure-token survivor that
+    ///    RPython's chain walk would also keep).
+    /// 2. If `newcell` is `None` (the `cleanup_chain` path), the
+    ///    existing cell is retained iff `should_remove_jitcell()` is
+    ///    false.
+    pub fn install_new_cell(&mut self, hash: u64, newcell: Option<BaseJitCell>) {
+        match (newcell, self.cells.remove(&hash)) {
+            (Some(new), Some(old)) => {
+                if !old.should_remove_jitcell() {
+                    // Old cell survives the chain walk — RPython would
+                    // append `new` after `old`. With one slot per bucket
+                    // we keep the survivor.
+                    self.cells.insert(hash, old);
+                } else {
+                    self.cells.insert(hash, new);
+                }
+            }
+            (Some(new), None) => {
+                self.cells.insert(hash, new);
+            }
+            (None, Some(old)) => {
+                if !old.should_remove_jitcell() {
+                    self.cells.insert(hash, old);
+                }
+            }
+            (None, None) => {}
+        }
+    }
+
+    /// counter.py:242-244 cleanup_chain(hash)
+    ///
+    ///     def cleanup_chain(self, hash):
+    ///         self.reset(hash)
+    ///         self.install_new_cell(hash, None)
+    pub fn cleanup_chain(&mut self, hash: u64) {
+        self.counter.reset(hash);
+        self.install_new_cell(hash, None);
+    }
 }
 
 #[cfg(test)]
