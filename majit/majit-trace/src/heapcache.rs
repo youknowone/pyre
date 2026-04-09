@@ -751,20 +751,21 @@ impl HeapCache {
         if opref.is_constant() {
             return;
         }
-        // RPython sets HF_SEEN_ALLOCATION | HF_KNOWN_NULLITY unconditionally,
-        // and adds HF_LIKELY_VIRTUAL | HF_IS_UNESCAPED only when the length
-        // is a constant (so the optimizer can virtualize it).
-        vb_insert(&mut self.seen_allocation, opref);
-        {
-            let _i = opref.0 as usize;
-            if _i >= self.known_nullity.len() {
-                self.known_nullity.resize(_i + 1, 0);
-            }
-            self.known_nullity[_i] = 1;
-        };
+        // RPython:
+        //     self.update_version(box)
+        //     flags = HF_SEEN_ALLOCATION | HF_KNOWN_NULLITY
+        //     if isinstance(lengthbox, Const):
+        //         flags |= HF_LIKELY_VIRTUAL | HF_IS_UNESCAPED
+        //     add_flags(box, flags)
+        //     self.arraylen_now_known(box, lengthbox)
+        self.update_version(opref);
+        self._set_flag(opref, HF_SEEN_ALLOCATION);
+        // RPython adds HF_KNOWN_NULLITY directly via add_flags. Route through
+        // nullity_now_known so the Vec<u8> value mirror also captures non-null.
+        self.nullity_now_known(opref, true);
         if length_is_const {
-            vb_insert(&mut self.likely_virtual, opref);
-            vb_insert(&mut self.is_unescaped, opref);
+            self._set_flag(opref, HF_LIKELY_VIRTUAL);
+            self._set_flag(opref, HF_IS_UNESCAPED);
         }
         // heapcache.py:516: self.arraylen_now_known(box, lengthbox)
         self.arraylen_now_known(opref, lengthbox);
