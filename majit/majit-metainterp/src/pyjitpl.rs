@@ -464,6 +464,12 @@ pub struct MetaInterp<M: Clone> {
     /// RPython metainterp_sd.callinfocollection parity.
     /// Maps oopspec indices to (calldescr, func_ptr) for generate_modified_call.
     pub(crate) callinfocollection: Option<std::sync::Arc<majit_ir::descr::CallInfoCollection>>,
+    /// info.py:810-822 `ConstPtrInfo.getstrlen1(mode)` runtime hook. The
+    /// host runtime (pyre etc.) registers this via
+    /// [`MetaInterp::set_string_length_resolver`] at JIT init. Propagated
+    /// to `Optimizer::string_length_resolver` inside `make_optimizer`, then
+    /// on to `OptContext::string_length_resolver` for each optimizer run.
+    pub(crate) string_length_resolver: Option<crate::optimizeopt::info::StringLengthResolver>,
     /// pyjitpl.py:2389: partial trace from a failed bridge compilation attempt.
     /// When bridge optimization returns "not final" (retrace needed), the
     /// partial optimized ops are saved here so compile_retrace can append
@@ -885,6 +891,7 @@ impl<M: Clone> MetaInterp<M> {
             max_unroll_recursion: 7, // RPython default from rlib/jit.py
             force_finish_trace: false,
             callinfocollection: None,
+            string_length_resolver: None,
             partial_trace: None,
             retracing_from: None,
             exported_state: None,
@@ -1110,7 +1117,24 @@ impl<M: Clone> MetaInterp<M> {
                 majit_ir::GcRef(ptr as usize)
             }
         }));
+        // info.py:810-822 `ConstPtrInfo.getstrlen1(mode)` — propagate the
+        // host-runtime resolver so constant STRLEN / UNICODELEN operations
+        // can fold to an exact `IntBound::from_constant(len)` during
+        // intbounds postprocessing.
+        opt.string_length_resolver = self.string_length_resolver.clone();
         opt
+    }
+
+    /// Install the host-runtime `getstrlen1` resolver. The closure must be
+    /// callable from the optimizer for arbitrary constant `GcRef` / mode
+    /// pairs. `mode == 0` is byte-string, `mode == 1` is unicode; any other
+    /// value returns `None` (matching PyPy's `vstring.mode_string` /
+    /// `vstring.mode_unicode` dispatch).
+    pub fn set_string_length_resolver(
+        &mut self,
+        resolver: crate::optimizeopt::info::StringLengthResolver,
+    ) {
+        self.string_length_resolver = Some(resolver);
     }
 
     /// Set a callback for loop compilation events.

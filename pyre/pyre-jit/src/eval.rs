@@ -72,6 +72,26 @@ thread_local! {
         d.set_virtualizable_info(info.clone());
         d.meta_interp_mut().num_scalar_inputargs =
             pyre_jit_trace::virtualizable_gen::NUM_SCALAR_INPUTARGS;
+        // info.py:810-822 `ConstPtrInfo.getstrlen1(mode)` — install pyre's
+        // `W_StrObject` length reader so constant STRLEN / UNICODELEN ops
+        // fold to `IntBound::from_constant(len)` during intbounds
+        // postprocessing. `mode == 0` is byte-string; mode 1 (unicode) has
+        // no distinct representation in pyre (bytes and str share layout),
+        // so it falls through to `None` and the optimizer keeps the
+        // conservative `nonnegative` fallback.
+        d.meta_interp_mut().set_string_length_resolver(std::sync::Arc::new(
+            |gcref: majit_ir::GcRef, mode: u8| -> Option<i64> {
+                if gcref.is_null() || mode != 0 {
+                    return None;
+                }
+                let obj = gcref.0 as pyre_object::pyobject::PyObjectRef;
+                if unsafe { pyre_object::strobject::is_str(obj) } {
+                    Some(unsafe { pyre_object::strobject::w_str_len(obj) } as i64)
+                } else {
+                    None
+                }
+            },
+        ));
         let mut gc = MiniMarkGC::new();
         // rclass.OBJECT root (rclass.py:160-166). pyre's static
         // `INSTANCE_TYPE` is the `name = "object"` PyType — every

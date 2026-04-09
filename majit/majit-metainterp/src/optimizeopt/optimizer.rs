@@ -179,6 +179,15 @@ pub struct Optimizer {
     pub per_guard_knowledge: Vec<(OpRef, OptimizerKnowledge)>,
     /// optimizer.py:787: constant_fold allocator for compile-time object creation.
     pub constant_fold_alloc: Option<crate::optimizeopt::ConstantFoldAllocFn>,
+    /// info.py:810-822 `ConstPtrInfo.getstrlen1(mode)` runtime hook —
+    /// propagated to `OptContext::string_length_resolver` at the start of
+    /// each `optimize_with_constants_and_inputs_at` run so
+    /// `EnsuredPtrInfo::Constant.getlenbound(Some(mode))` can return an
+    /// exact constant string length when the host runtime supplies one.
+    ///
+    /// `Arc` rather than `Box` because the resolver is shared across
+    /// multiple optimizer runs (propagation is a `clone()`, not a `take()`).
+    pub string_length_resolver: Option<crate::optimizeopt::info::StringLengthResolver>,
     /// RPython metainterp_sd.callinfocollection parity.
     /// Propagated to OptContext for generate_modified_call (vstring.py:853).
     pub callinfocollection: Option<std::sync::Arc<majit_ir::descr::CallInfoCollection>>,
@@ -983,6 +992,7 @@ impl Optimizer {
             pending_bridge_knowledge: None,
             per_guard_knowledge: Vec::new(),
             constant_fold_alloc: None,
+            string_length_resolver: None,
             callinfocollection: None,
             resumedata_memo: crate::resume::ResumeDataLoopMemo::new(),
             snapshot_boxes: std::collections::HashMap::new(),
@@ -1587,6 +1597,7 @@ impl Optimizer {
         );
         ctx.skip_flush_mode = self.skip_flush;
         ctx.constant_fold_alloc = self.constant_fold_alloc.take();
+        ctx.string_length_resolver = self.string_length_resolver.clone();
         ctx.callinfocollection = self.callinfocollection.clone();
         // RPython resume.py parity: Phase 2 optimizer needs imported_label_args
         // to resolve NONE positions in fail_args inherited from Phase 1.
