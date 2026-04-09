@@ -395,6 +395,32 @@ impl TraceCtx {
     }
 
     /// Apply all pending replacements to the trace ops.
+    ///
+    /// pyjitpl.py:3499-3512 `MetaInterp.replace_box(oldbox, newbox)`
+    ///
+    ///     def replace_box(self, oldbox, newbox):
+    ///         for frame in self.framestack:
+    ///             frame.replace_active_box_in_frame(oldbox, newbox)
+    ///         boxes = self.virtualref_boxes
+    ///         for i in range(len(boxes)):
+    ///             if boxes[i] is oldbox:
+    ///                 boxes[i] = newbox
+    ///         if (self.jitdriver_sd.virtualizable_info is not None or
+    ///             self.jitdriver_sd.greenfield_info is not None):
+    ///             boxes = self.virtualizable_boxes
+    ///             for i in range(len(boxes)):
+    ///                 if boxes[i] is oldbox:
+    ///                     boxes[i] = newbox
+    ///         self.heapcache.replace_box(oldbox, newbox)
+    ///
+    /// RPython eagerly rewrites (a) the framestack's active boxes, (b)
+    /// `virtualref_boxes`, (c) `virtualizable_boxes`, and (d) the heap
+    /// cache. pyre defers trace-level rewrites (the framestack references
+    /// and the trace op args) into a batch via `replace_op` and flushes
+    /// them here. The side-channel walks (`virtualizable_boxes` and
+    /// `heap_cache.replace_box`) must still be applied per replacement
+    /// so that subsequent heapcache / standard-vable queries observe the
+    /// new OpRef identities.
     pub fn apply_replacements(&mut self) {
         if self.replacements.is_empty() {
             return;
@@ -408,10 +434,7 @@ impl TraceCtx {
                 eprintln!("  {:?} → {:?}", old, new);
             }
         }
-        // pyjitpl.py:3499 replace_box parity: every replacement that the
-        // tracer registers must also propagate to virtualizable_boxes,
-        // matching RPython's eager replace_box(virtualizable_boxes) walk.
-        // Apply this to each (old, new) pair before draining.
+        // pyjitpl.py:3506-3511 virtualizable_boxes walk.
         for (old, new) in &self.replacements {
             if let Some(boxes) = self.virtualizable_boxes.as_mut() {
                 for slot in boxes.iter_mut() {
@@ -420,6 +443,14 @@ impl TraceCtx {
                     }
                 }
             }
+        }
+        // pyjitpl.py:3512 self.heapcache.replace_box(oldbox, newbox).
+        // Migrate the per-OpRef tracking state so the user path
+        // `_nonstandard_virtualizable` (and every other heapcache query)
+        // sees the new OpRef's state after replacement, instead of
+        // starting over on a freshly blank slot.
+        for (old, new) in &self.replacements {
+            self.heap_cache.replace_box(*old, *new);
         }
         let replacements: std::collections::HashMap<OpRef, OpRef> =
             self.replacements.drain(..).collect();
