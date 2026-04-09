@@ -492,9 +492,7 @@ impl HeapCache {
             HF_LIKELY_VIRTUAL => {
                 vb_insert(&mut self.likely_virtual, opref);
             }
-            HF_NONSTD_VABLE => {
-                self.nonstandard_virtualizables_now_known(opref);
-            }
+            // HF_NONSTD_VABLE has no mirror — heapc_flags is the source of truth.
             _ => {}
         }
     }
@@ -798,21 +796,25 @@ impl HeapCache {
         self.arraylen_now_known(opref, lengthbox);
     }
 
-    /// heapcache.py: nonstandard_virtualizables_now_known(box)
-    /// Mark a box as a known nonstandard virtualizable.
+    /// heapcache.py:485-486
+    ///
+    ///     def is_known_nonstandard_virtualizable(self, box):
+    ///         return self._check_flag(box, HF_NONSTD_VABLE) or self._check_flag(box, HF_SEEN_ALLOCATION)
+    pub fn is_known_nonstandard_virtualizable(&self, opref: OpRef) -> bool {
+        self._check_flag(opref, HF_NONSTD_VABLE) || self._check_flag(opref, HF_SEEN_ALLOCATION)
+    }
+
+    /// heapcache.py:488-491
+    ///
+    ///     def nonstandard_virtualizables_now_known(self, box):
+    ///         if isinstance(box, Const):
+    ///             return
+    ///         self._set_flag(box, HF_NONSTD_VABLE)
     pub fn nonstandard_virtualizables_now_known(&mut self, opref: OpRef) {
         if opref.is_constant() {
             return;
         }
-        // In RPython this sets HF_NONSTD_VABLE flag.
-        // We track it as a known non-null value.
-        {
-            let _i = opref.0 as usize;
-            if _i >= self.known_nullity.len() {
-                self.known_nullity.resize(_i + 1, 0);
-            }
-            self.known_nullity[_i] = 1;
-        };
+        self._set_flag(opref, HF_NONSTD_VABLE);
     }
 
     /// heapcache.py: replace_box(oldbox, newbox)
