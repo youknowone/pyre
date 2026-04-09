@@ -144,73 +144,122 @@ pub extern "C" fn call_assembler_helper_trampoline(callee_jf_ptr: *mut i64, gree
         return 0;
     }
 
+    unsafe fn execute_dynasm_bridge(
+        bridge_addr: usize,
+        jf_ptr: *mut i64,
+    ) -> (*mut i64, Option<i64>) {
+        let func: unsafe extern "C" fn(*mut i64) -> *mut i64 =
+            unsafe { std::mem::transmute(bridge_addr) };
+        let result_jf = unsafe { func(jf_ptr) };
+        if result_jf.is_null() {
+            return (jf_ptr, None);
+        }
+        let result_descr = unsafe { *result_jf } as usize;
+        if guard::is_done_with_this_frame_descr(result_descr) {
+            return (result_jf, Some(unsafe { *result_jf.add(1) }));
+        }
+        (result_jf, None)
+    }
+
+    let mut current_jf_ptr = callee_jf_ptr;
+    let mut result = 0i64;
+
     // Read jf_descr — raw pointer to DynasmFailDescr
-    let descr_raw = unsafe { *callee_jf_ptr } as usize;
+    let mut descr_raw = unsafe { *current_jf_ptr } as usize;
 
-    let result = if descr_raw == 0 || guard::is_done_with_this_frame_descr(descr_raw) {
-        // jf_descr == 0: callee didn't set a guard descr. This happens when
-        // the slow path is entered from a scenario that shouldn't occur in
-        // normal resolved-target flow. Return 0 — the generated code for
-        // unresolved targets handles force_fn inline before reaching here.
-        0
-    } else {
-        // Guard failure: jf_descr points to DynasmFailDescr.
+    if descr_raw != 0 && !guard::is_done_with_this_frame_descr(descr_raw) {
         let descr = unsafe { &*(descr_raw as *const guard::DynasmFailDescr) };
-        let trace_id = descr.trace_id;
-        let fail_index = descr.fail_index;
-        let descr_addr = descr_raw;
 
-        // Read fail_arg values from callee frame: jf_frame[0..n] at jf_ptr[1..]
-        let n_fail_args = descr.fail_arg_types.len();
-        let mut raw_values: Vec<i64> = Vec::with_capacity(n_fail_args);
-        for i in 0..n_fail_args {
-            let slot = descr.fail_arg_locs.get(i).and_then(|l| *l).unwrap_or(i);
-            raw_values.push(unsafe { *callee_jf_ptr.add(1 + slot) });
+        // Existing bridge: execute it before tracing a new one.
+        if descr.has_bridge() {
+            let (next_jf_ptr, bridge_result) =
+                unsafe { execute_dynasm_bridge(descr.bridge_addr(), current_jf_ptr) };
+            current_jf_ptr = next_jf_ptr;
+            if let Some(value) = bridge_result {
+                unsafe { libc::free(current_jf_ptr as *mut std::ffi::c_void) };
+                return value;
+            }
+            descr_raw = unsafe { *current_jf_ptr } as usize;
         }
 
-        // RPython handle_fail: bridge OR blackhole, not both.
-        // Step 1: Try bridge compilation (compile.py:701-717 must_compile)
-        let bridge_compiled = if let Some(bridge_fn) = CA_BRIDGE_FN.get() {
-            bridge_fn(
-                green_key,
-                trace_id,
-                fail_index,
-                raw_values.as_ptr(),
-                raw_values.len(),
-                descr_addr,
-            )
-        } else {
-            false
-        };
+        if descr_raw != 0 && !guard::is_done_with_this_frame_descr(descr_raw) {
+            let descr = unsafe { &*(descr_raw as *const guard::DynasmFailDescr) };
+            let trace_id = descr.trace_id;
+            let fail_index = descr.fail_index;
+            let descr_addr = descr_raw;
 
-        if bridge_compiled {
-            // Bridge compiled — RPython continues running normally via
-            // the bridge. For CALL_ASSEMBLER slow path, this means the
-            // callee's guard failure was handled by compiling a bridge.
-            // The bridge result is not directly available here; return 0.
-            // The caller will re-enter the compiled code on next invocation.
-            0
-        } else {
-            // Step 2: Blackhole resume (resume.py:1312 parity)
-            if let Some(blackhole) = CA_BLACKHOLE_FN.get() {
-                blackhole(
+            // Read fail_arg values from the current frame: jf_frame[0..n] at jf_ptr[1..]
+            let n_fail_args = descr.fail_arg_types.len();
+            let mut raw_values: Vec<i64> = Vec::with_capacity(n_fail_args);
+            for i in 0..n_fail_args {
+                let slot = descr.fail_arg_locs.get(i).and_then(|l| *l).unwrap_or(i);
+                raw_values.push(unsafe { *current_jf_ptr.add(1 + slot) });
+            }
+
+            // compile.py:701-717 handle_fail — try bridge tracing first.
+            let bridge_compiled = if let Some(bridge_fn) = CA_BRIDGE_FN.get() {
+                bridge_fn(
                     green_key,
                     trace_id,
                     fail_index,
                     raw_values.as_ptr(),
                     raw_values.len(),
-                    raw_values.as_ptr(),
-                    raw_values.len(),
+                    descr_addr,
                 )
-                .unwrap_or(0)
             } else {
-                0
+                false
+            };
+
+            if bridge_compiled && descr.has_bridge() {
+                let (next_jf_ptr, bridge_result) =
+                    unsafe { execute_dynasm_bridge(descr.bridge_addr(), current_jf_ptr) };
+                current_jf_ptr = next_jf_ptr;
+                if let Some(value) = bridge_result {
+                    unsafe { libc::free(current_jf_ptr as *mut std::ffi::c_void) };
+                    return value;
+                }
+                descr_raw = unsafe { *current_jf_ptr } as usize;
+            }
+
+            // Bridge-on-bridge case: use the latest returned descr for
+            // blackhole/force dispatch instead of the original guard.
+            if descr_raw != 0 && !guard::is_done_with_this_frame_descr(descr_raw) {
+                let latest_descr = unsafe { &*(descr_raw as *const guard::DynasmFailDescr) };
+                let latest_trace_id = latest_descr.trace_id;
+                let latest_fail_index = latest_descr.fail_index;
+                let mut latest_raw_values: Vec<i64> =
+                    Vec::with_capacity(latest_descr.fail_arg_types.len());
+                for i in 0..latest_descr.fail_arg_types.len() {
+                    let slot = latest_descr
+                        .fail_arg_locs
+                        .get(i)
+                        .and_then(|l| *l)
+                        .unwrap_or(i);
+                    latest_raw_values.push(unsafe { *current_jf_ptr.add(1 + slot) });
+                }
+
+                // resume.py:1312 blackhole_from_resumedata parity.
+                if let Some(blackhole) = CA_BLACKHOLE_FN.get() {
+                    result = blackhole(
+                        green_key,
+                        latest_trace_id,
+                        latest_fail_index,
+                        latest_raw_values.as_ptr(),
+                        latest_raw_values.len(),
+                        latest_raw_values.as_ptr(),
+                        latest_raw_values.len(),
+                    )
+                    .unwrap_or(0);
+                } else if let Some(force_fn) = CA_FORCE_FN.get() {
+                    let frame_ptr = unsafe { *current_jf_ptr.add(1) };
+                    result = force_fn(frame_ptr);
+                }
             }
         }
-    };
+    }
 
     // Free the callee jitframe
-    unsafe { libc::free(callee_jf_ptr as *mut std::ffi::c_void) };
+    unsafe { libc::free(current_jf_ptr as *mut std::ffi::c_void) };
     result
 }
 

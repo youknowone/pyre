@@ -88,6 +88,8 @@ pub struct Assembler386 {
     pending_guard_tokens: Vec<GuardToken>,
     /// Frame depth (in WORD units) for the current trace.
     frame_depth: usize,
+    /// Base slot index of the guard-recovery register save area.
+    save_area_base: usize,
     /// Fail descriptors built during assembly.
     fail_descrs: Vec<Arc<DynasmFailDescr>>,
     /// trace_id for this compilation.
@@ -203,6 +205,7 @@ impl Assembler386 {
             mc: Assembler::new().unwrap(),
             pending_guard_tokens: Vec::new(),
             frame_depth: JITFRAME_FIXED_SIZE,
+            save_area_base: 0,
             fail_descrs: Vec::new(),
             trace_id,
             header_pc,
@@ -902,6 +905,7 @@ impl Assembler386 {
         self.frame_depth = self
             .frame_depth
             .max(ra.get_final_frame_depth() + JITFRAME_FIXED_SIZE);
+        self.save_area_base = self.frame_depth - JITFRAME_FIXED_SIZE;
 
         // Sync regalloc frame positions to opref_to_slot for backward
         // compatibility with genop_call/genop_call_assembler which still
@@ -1942,21 +1946,22 @@ impl Assembler386 {
         ));
 
         // Convert regalloc faillocs to frame slot indices for the descr.
-        // Reg locs: register save area at JITFRAME_FIXED_SIZE + reg_value.
+        // Reg locs: register save area at the reserved frame tail.
         // Frame locs: use position directly.
         // Immed locs: allocate a frame slot and store the constant in the
         // recovery stub. RPython uses rd_locs with JITFRAME encoding.
         let mut const_stores: Vec<(usize, i64)> = Vec::new();
+        let save_area_base = self.save_area_base;
         let fail_arg_locs: Vec<Option<usize>> = faillocs
             .iter()
             .map(|fl| match fl {
                 Some(Loc::Reg(r)) => {
                     if r.is_xmm {
-                        // FP save area: JITFRAME_FIXED_SIZE + 16 + reg_value
-                        Some(JITFRAME_FIXED_SIZE + 16 + r.value as usize)
+                        // FP save area: base + 16..31
+                        Some(save_area_base + 16 + r.value as usize)
                     } else {
-                        // GPR save area: JITFRAME_FIXED_SIZE + reg_value
-                        Some(JITFRAME_FIXED_SIZE + r.value as usize)
+                        // GPR save area: base + 0..15
+                        Some(save_area_base + r.value as usize)
                     }
                 }
                 Some(Loc::Frame(f)) => Some(f.position),
@@ -2066,11 +2071,12 @@ impl Assembler386 {
         {
             dynasm!(self.mc ; .arch x64 ; =>save_regs_label);
             use crate::regloc::*;
+            let save_area_base = self.save_area_base;
             let gprs = [
                 ECX, EAX, EDX, EBX, ESI, EDI, R8, R9, R10, R12, R13, R14, R15,
             ];
             for &reg in &gprs {
-                let save_slot = JITFRAME_FIXED_SIZE + reg.value as usize;
+                let save_slot = save_area_base + reg.value as usize;
                 let ofs = ((1 + save_slot) * 8) as i32;
                 dynasm!(self.mc ; .arch x64 ; mov [rbp + ofs], Rq(reg.value));
             }
@@ -2079,7 +2085,8 @@ impl Assembler386 {
                 XMM13, XMM14,
             ];
             for &reg in &xmms {
-                let save_slot = JITFRAME_FIXED_SIZE + reg.value as usize;
+                // Keep x86_64 in sync with fail_arg_locs encoding.
+                let save_slot = save_area_base + 16 + reg.value as usize;
                 let ofs = ((1 + save_slot) * 8) as i32;
                 dynasm!(self.mc ; .arch x64 ; movsd [rbp + ofs], Rx(reg.value));
             }
@@ -2089,24 +2096,23 @@ impl Assembler386 {
         {
             dynasm!(self.mc ; .arch aarch64 ; =>save_regs_label);
             use crate::regloc::*;
+            let save_area_base = self.save_area_base;
             // Save GPR registers
             let gprs = [
                 ECX, EAX, EDX, EBX, ESI, EDI, R8, R9, R10, R12, R13, R14, R15,
             ];
             for &reg in &gprs {
-                let save_slot = JITFRAME_FIXED_SIZE + reg.value as usize;
+                let save_slot = save_area_base + reg.value as usize;
                 let ofs = ((1 + save_slot) * 8) as u32;
                 dynasm!(self.mc ; .arch aarch64 ; str X(reg.value), [x29, ofs]);
             }
             // Save FP/SIMD registers (d0-d14) to separate save area.
-            // GPR save area: JITFRAME_FIXED_SIZE + 0..15
-            // FP save area:  JITFRAME_FIXED_SIZE + 16..31
             let fprs = [
                 XMM0, XMM1, XMM2, XMM3, XMM4, XMM5, XMM6, XMM7, XMM8, XMM9, XMM10, XMM11, XMM12,
                 XMM13, XMM14,
             ];
             for &reg in &fprs {
-                let save_slot = JITFRAME_FIXED_SIZE + 16 + reg.value as usize;
+                let save_slot = save_area_base + 16 + reg.value as usize;
                 let ofs = ((1 + save_slot) * 8) as u32;
                 dynasm!(self.mc ; .arch aarch64 ; str D(reg.value), [x29, ofs]);
             }

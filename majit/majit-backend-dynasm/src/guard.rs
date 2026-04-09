@@ -129,6 +129,11 @@ impl DynasmFailDescr {
         unsafe { *self.bridge_addr.get() != 0 }
     }
 
+    /// Read the compiled bridge entry address.
+    pub fn bridge_addr(&self) -> usize {
+        unsafe { *self.bridge_addr.get() }
+    }
+
     /// Set the bridge address after patching.
     pub fn set_bridge_addr(&self, addr: usize) {
         unsafe { *self.bridge_addr.get() = addr };

@@ -184,3 +184,74 @@ fn test_guard_and_loop() {
     let result_val = backend.get_int_value(&frame, 0);
     assert_eq!(result_val, 5, "loop should stop at 5, fail_arg[0]");
 }
+
+#[test]
+fn test_float_loop_carried_across_jump() {
+    let mut backend = DynasmBackend::new();
+    let mut token = JitCellToken::new(1);
+
+    let mut constants = HashMap::new();
+    constants.insert(OpRef::from_const(5).0, 5i64);
+    constants.insert(OpRef::from_const(10).0, 0.5f64.to_bits() as i64);
+    constants.insert(OpRef::from_const(1).0, 1i64);
+    backend.set_constants(constants);
+
+    let inputargs = vec![
+        InputArg {
+            tp: Type::Float,
+            index: 0,
+        },
+        InputArg {
+            tp: Type::Int,
+            index: 1,
+        },
+    ];
+
+    let mut label_op = Op::new(OpCode::Label, &[OpRef(0), OpRef(1)]);
+    label_op.pos = OpRef(100);
+
+    let mut lt_op = Op::new(OpCode::IntLt, &[OpRef(1), OpRef::from_const(5)]);
+    lt_op.pos = OpRef(2);
+
+    let mut guard_op = Op::new(OpCode::GuardTrue, &[OpRef(2)]);
+    guard_op.pos = OpRef(3);
+    guard_op.fail_arg_types = Some(vec![Type::Float, Type::Int]);
+    guard_op.fail_args = Some(vec![OpRef(0), OpRef(1)].into());
+
+    let mut cast_op = Op::new(OpCode::CastIntToFloat, &[OpRef(1)]);
+    cast_op.pos = OpRef(4);
+
+    let mut mul_op = Op::new(OpCode::FloatMul, &[OpRef(4), OpRef::from_const(10)]);
+    mul_op.pos = OpRef(5);
+
+    let mut add_op = Op::new(OpCode::FloatAdd, &[OpRef(0), OpRef(5)]);
+    add_op.pos = OpRef(6);
+
+    let mut inc_op = Op::new(OpCode::IntAdd, &[OpRef(1), OpRef::from_const(1)]);
+    inc_op.pos = OpRef(7);
+
+    let mut jump_op = Op::new(OpCode::Jump, &[OpRef(6), OpRef(7)]);
+    jump_op.pos = OpRef(8);
+
+    let ops = vec![
+        label_op, lt_op, guard_op, cast_op, mul_op, add_op, inc_op, jump_op,
+    ];
+
+    let result = backend.compile_loop(&inputargs, &ops, &mut token);
+    assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
+
+    let args = vec![Value::Float(0.0), Value::Int(0)];
+    let frame = backend.execute_token(&token, &args);
+
+    let descr = backend.get_latest_descr(&frame);
+    assert!(!descr.is_finish(), "should exit via guard failure");
+
+    let sum = backend.get_float_value(&frame, 0);
+    let index = backend.get_int_value(&frame, 1);
+    assert!(
+        (sum - 5.0).abs() < 1e-10,
+        "expected carried float sum to be 5.0, got {}",
+        sum
+    );
+    assert_eq!(index, 5, "expected guard failure at i=5");
+}
