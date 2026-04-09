@@ -15,7 +15,7 @@
 //! This module provides the Rust equivalent of RPython's `virtualizable.py`.
 
 use majit_ir::descr::make_array_descr;
-use majit_ir::{DescrRef, Type, make_field_descr};
+use majit_ir::{DescrRef, Type};
 
 /// Sentinel value for TOKEN_TRACING_RESCALL.
 ///
@@ -466,10 +466,19 @@ impl VirtualizableInfo {
     }
 
     /// Internal helper: build a field descriptor that carries
-    /// `self.parent_descr` (when set) so the optimizer's
-    /// `ensure_ptr_info_arg0` can resolve the parent SizeDescr without
-    /// hitting the missing-parent panic. Falls back to the bare
-    /// `make_field_descr` factory when no parent has been registered.
+    /// `self.parent_descr` so the optimizer's `ensure_ptr_info_arg0`
+    /// can resolve the parent SizeDescr without hitting the
+    /// missing-parent panic.
+    ///
+    /// PyPy `virtualizable.py:71` (`get_field_descr` /
+    /// `cpu.fielddescrof(...)`) ALWAYS returns a canonical descriptor
+    /// with a parent SizeDescr — there is no "optional parent" state
+    /// in upstream. The Rust port mirrors that strictness by panicking
+    /// if a host failed to call `set_parent_descr` before requesting
+    /// any field descriptor; the bare-make_field_descr fallback that
+    /// existed previously was a majit-only convenience and got removed
+    /// because it leaked through to `ensure_ptr_info_arg0` and broke
+    /// the orthodox FieldDescr.parent_descr() contract.
     fn field_descr_with_parent(
         &self,
         offset: usize,
@@ -477,14 +486,22 @@ impl VirtualizableInfo {
         field_type: Type,
         signed: bool,
     ) -> DescrRef {
-        match &self.parent_descr {
-            Some(parent) => std::sync::Arc::new(
-                majit_ir::SimpleFieldDescr::new(0, offset, field_size, field_type, false)
-                    .with_signed(signed)
-                    .with_parent_descr(parent.clone(), 0),
-            ),
-            None => make_field_descr(offset, field_size, field_type, signed),
-        }
+        let parent = self.parent_descr.as_ref().unwrap_or_else(|| {
+            panic!(
+                "VirtualizableInfo::field_descr_with_parent called before \
+                 set_parent_descr — every host runtime must register the \
+                 parent SizeDescr right after build_virtualizable_info() so \
+                 the resulting FieldDescr carries `descr.py FieldDescr.parent_descr` \
+                 (matching virtualizable.py:71 cpu.fielddescrof). Affected \
+                 VirtualizableInfo: {:?}",
+                self.name
+            )
+        });
+        std::sync::Arc::new(
+            majit_ir::SimpleFieldDescr::new(0, offset, field_size, field_type, false)
+                .with_signed(signed)
+                .with_parent_descr(parent.clone(), 0),
+        )
     }
 
     /// Descriptor for array element accesses on a virtualizable array field.

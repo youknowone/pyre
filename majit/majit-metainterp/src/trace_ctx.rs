@@ -3335,6 +3335,7 @@ mod tests {
         let mut info = crate::virtualizable::VirtualizableInfo::new(0);
         info.add_field("pc", Type::Int, 8);
         info.add_array_field("locals", Type::Ref, 24);
+        info.set_parent_descr(majit_ir::descr::make_size_descr(64));
 
         let mut recorder = Trace::new();
         let vable = recorder.record_input_arg(Type::Ref);

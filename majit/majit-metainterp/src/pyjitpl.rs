@@ -8011,12 +8011,14 @@ mod tests {
     fn test_vable_info_static_only() -> VirtualizableInfo {
         let mut info = VirtualizableInfo::new(0);
         info.add_field("pc", Type::Int, 8);
+        info.set_parent_descr(majit_ir::descr::make_size_descr(64));
         info
     }
 
     fn test_vable_info_with_array() -> VirtualizableInfo {
         let mut info = VirtualizableInfo::new(0);
         info.add_array_field_with_layout("stack", Type::Int, 24, 0, 0);
+        info.set_parent_descr(majit_ir::descr::make_size_descr(64));
         info
     }
 
@@ -8066,6 +8068,7 @@ mod tests {
             0,
             std::mem::size_of::<usize>(),
         );
+        info.set_parent_descr(majit_ir::descr::make_size_descr(64));
 
         let array = TraceEntryArray {
             len: 4,

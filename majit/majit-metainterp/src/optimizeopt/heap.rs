@@ -1315,13 +1315,9 @@ impl OptHeap {
                     cf.register_info(lazy_obj, final_value, descr.as_ref());
                     // heap.py:122 (force_lazy_set → put_field_back_to_info):
                     //     opinfo.setfield(...) on the structinfo of lazy_obj.
-                    // The line-by-line port: `ctx.ensure_ptr_info_arg0(&lazy_op)`
-                    // returns the structinfo handle, then we call setfield()
-                    // on it via `as_mut()`.
-                    let mut info = ctx.ensure_ptr_info_arg0(&lazy_op);
-                    if let Some(pi) = info.as_mut() {
-                        pi.setfield(field_idx, final_value);
-                    }
+                    // Routes constants through `const_infos` per
+                    // `info.py:750-752 ConstPtrInfo.setfield`.
+                    ctx.structinfo_setfield(&lazy_op, field_idx, final_value);
                 }
             }
             // Cache miss — fall through to emit the getfield
@@ -1416,12 +1412,16 @@ impl OptHeap {
             self.immutable_cached_fields.insert(key, op.pos);
         }
         // heap.py postprocess_GETFIELD_GC_I: structinfo.setfield(descr, op)
-        // Record the field value in ptr_info so other passes can see it.
+        //
+        // PyPy info.py:750-752 routes ConstPtrInfo.setfield through
+        // optheap.const_infos via `_get_info(parent_descr, optheap)`, so
+        // a constant struct base ALSO gets its field cached. The Rust
+        // port mirrors that via `OptContext::structinfo_setfield`,
+        // which dispatches by `arg0.is_constant()` to either
+        // `const_infos[gcref]` (constant) or
+        // `ensure_ptr_info_arg0(op).as_mut()` (regular).
         if !is_vable_field {
-            let mut structinfo = ctx.ensure_ptr_info_arg0(op);
-            if let Some(pi) = structinfo.as_mut() {
-                pi.setfield(key.1, op.pos);
-            }
+            ctx.structinfo_setfield(op, key.1, op.pos);
         }
         // Virtualizable Ref fields (linked list head) need a null guard.
         let is_vable_ref =
@@ -1528,13 +1528,12 @@ impl OptHeap {
                 Self::emit_lazy_setfield(&mut lazy_op, ctx, true);
                 // 4. put_field_back_to_info: heap.py:122 calls
                 //    `opinfo.setfield(...)` on the structinfo of lazy_obj.
+                //    Constant struct bases route through `const_infos`
+                //    via `info.py:750-752 ConstPtrInfo.setfield`.
                 let final_value = lazy_op.arg(1);
                 let descr = lazy_op.descr.clone();
                 self.cache_field(lazy_obj, field_idx, final_value, descr.as_ref());
-                let mut info = ctx.ensure_ptr_info_arg0(&lazy_op);
-                if let Some(pi) = info.as_mut() {
-                    pi.setfield(field_idx, final_value);
-                }
+                ctx.structinfo_setfield(&lazy_op, field_idx, final_value);
             }
         }
 
@@ -1562,14 +1561,9 @@ impl OptHeap {
         cf.lazy_set = Some((obj, op.clone()));
         // PyPy heap.py:97 (CachedField.do_setfield):
         //     opinfo.setfield(descr, struct, op, optheap=optheap, cf=cf)
-        // The Rust port reuses the EnsuredPtrInfo handle returned by the
-        // earlier `ensure_ptr_info_arg0(op)` call at the top of
-        // optimize_setfield via a fresh invocation here — re-borrowing is
-        // necessary because intervening cache mutations took `&mut ctx`.
-        let mut info = ctx.ensure_ptr_info_arg0(op);
-        if let Some(pi) = info.as_mut() {
-            pi.setfield(field_idx, new_value);
-        }
+        // Routes constant struct bases through `const_infos` per
+        // `info.py:750-752 ConstPtrInfo.setfield`.
+        ctx.structinfo_setfield(op, field_idx, new_value);
         OptimizationResult::Remove
     }
 
@@ -1633,15 +1627,19 @@ impl OptHeap {
             //     ...
             //     arrayinfo.getlenbound(None).make_gt_const(index)
             //
-            // The line-by-line port mirrors PyPy: ask the helper for the
-            // arrayinfo, then call `getlenbound`/`setitem` directly on it.
-            // We capture `array_ref` separately for the make_nonnull bookkeeping
-            // because heap.py:701 says `make_nonnull(op.getarg(0))` (the box,
-            // not the structinfo).
+            // PyPy then `arrayinfo.setitem(...)` records the cached element.
+            // The Rust port:
+            //   1) `make_nonnull(op.getarg(0))` (heap.py:701) on the box itself
+            //   2) for non-constant arg0, narrow the lenbound on the
+            //      Forwarded::Info(ArrayPtrInfo) slot via `ensure_ptr_info_arg0`
+            //   3) `arrayinfo.setitem(...)` via `arrayinfo_setitem` which
+            //      routes constant arg0 through `_get_array_info` /
+            //      `const_infos[gcref]` and regular arg0 through
+            //      `ensure_ptr_info_arg0(op).as_mut().setitem(...)`.
             let array_ref = ctx.get_box_replacement(op.arg(0));
             vb_set(&mut self.known_nonnull, array_ref.0);
-            let mut arrayinfo = ctx.ensure_ptr_info_arg0(op);
             if const_index >= 0 {
+                let mut arrayinfo = ctx.ensure_ptr_info_arg0(op);
                 if let Some(mut bound) = arrayinfo.getlenbound(None) {
                     let _ = bound.make_gt_const(const_index);
                     if let Some(crate::optimizeopt::info::PtrInfo::Array(a)) = arrayinfo.as_mut() {
@@ -1649,9 +1647,7 @@ impl OptHeap {
                     }
                 }
             }
-            if let Some(pi) = arrayinfo.as_mut() {
-                pi.setitem(const_index as usize, op.pos);
-            }
+            ctx.arrayinfo_setitem(op, const_index as usize, op.pos);
             return OptimizationResult::Emit(op.clone());
         }
 

@@ -1437,6 +1437,12 @@ impl OptRewrite {
 
     /// Optimize GUARD_TRUE following RPython rewrite.py: optimize_guard(op, CONST_1).
     /// If the condition is a known constant 0, the trace is impossible and must abort.
+    ///
+    /// rewrite.py:163-184 `optimize_guard` proper (the contradiction check
+    /// + emit) is the call-time half. The `make_constant(box, CONST_1)` half
+    /// of the upstream `optimize_guard` is split into
+    /// `propagate_postprocess` (rewrite.py:352-371) per RPython's
+    /// `has_postprocess` model — see the bottom of this file.
     fn optimize_guard_true(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = op.arg(0);
 
@@ -1447,13 +1453,6 @@ impl OptRewrite {
             raise_invalid_loop("GUARD_TRUE proven to always fail");
         }
 
-        // NOTE: RPython postprocess_GUARD_TRUE makes arg0 constant 1 via
-        // make_constant(box, CONST_1). In RPython this works because each loop
-        // iteration creates NEW Box objects — the old Box's forwarded pointer
-        // is irrelevant. In majit, OpRef is a stable identifier reused across
-        // iterations, so make_constant here would break loop variables.
-        // The IntBounds pass already narrows guard_true/false args through
-        // its own bounds mechanism (postprocess_guard_true/false).
         OptimizationResult::PassOn
     }
 
@@ -2991,8 +2990,27 @@ impl Optimization for OptRewrite {
         true
     }
 
-    /// rewrite.py:352-371 postprocess_GUARD_TRUE/FALSE
-    /// rewrite.py:303-305 postprocess_GUARD_VALUE
+    /// rewrite.py:303-305 postprocess_GUARD_VALUE,
+    /// rewrite.py:352-371 postprocess_GUARD_TRUE / postprocess_GUARD_FALSE.
+    ///
+    /// The `make_constant(box, CONST_*)` call is the second half of PyPy's
+    /// `optimize_guard` (rewrite.py:163-184). PyPy emits the guard, then
+    /// records that the guard's input box is now known constant. The Rust
+    /// port keeps the same split that `has_postprocess` requires — the
+    /// emit happens via `optimize_guard_true/false/value` and the
+    /// `make_constant` happens here.
+    ///
+    /// Safety on stable OpRefs: PyPy uses fresh `Box` objects per loop
+    /// iteration; majit uses positional `OpRef` slots. The constant lands
+    /// on the resolved OpRef of the comparison result (e.g. the position
+    /// of an `int_lt`), which is itself fresh per iteration: each phase
+    /// emits its own comparison op into a disjoint OpRef range (see the
+    /// box-identity Step 2 work that gives Phase 1 and Phase 2 disjoint
+    /// `forwarded[]` ranges). CSE within a single phase is the only way
+    /// for two uses to share the same OpRef, in which case they describe
+    /// the same value and the constant is correct for all of them. PyPy's
+    /// stable-Box vs majit's stable-OpRef yield the same observable
+    /// behavior.
     fn propagate_postprocess(&mut self, op: &Op, ctx: &mut OptContext) {
         match op.opcode {
             OpCode::GuardTrue => {
