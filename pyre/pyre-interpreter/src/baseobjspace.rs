@@ -3406,6 +3406,27 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
         }
     }
 
+    // objspace/std/mapdict.py:826-840 `MapdictDictSupport.getdict` parity.
+    //
+    // User subclasses of builtin types (`class MyInt(int): ...`) have
+    // `hasdict=True` on the subclass type and their instances are still
+    // laid out as the builtin (W_IntObject etc.), so `is_instance(obj)`
+    // is False and the early descriptor-protocol block at :2858 skipped
+    // the instance dict. `setattr` however stores into
+    // `INSTANCE_DICT[obj as usize]` via `setdictvalue` → `_obj_setdict`,
+    // so the dict is populated but would never be read back.
+    //
+    // Check the per-instance W_DictObject here (same API PyPy's
+    // `descr__getattribute__` uses at descroperation.py:50). This is the
+    // second half of the "hasdict instance dict" protocol and must fire
+    // before the legacy `ATTR_TABLE` fallback.
+    let w_dict = getdict(obj);
+    if !w_dict.is_null() {
+        if let Some(value) = unsafe { pyre_object::w_dict_getitem_str(w_dict, name) } {
+            return Ok(value);
+        }
+    }
+
     // Instance attributes from side table (excludes __class__ which lives
     // in the w_class header field, not ATTR_TABLE).
     let found = ATTR_TABLE.with(|table| {
