@@ -1807,105 +1807,11 @@ impl OptContext {
         {
             return;
         }
-        // optimizer.py:429-431 + info.py:194-198,533-538,718-736:
-        // copy_fields_to_const — create a concrete (non-virtual) info on
-        // the const and copy only the field/item cache.
-        // ConstPtrInfo._get_info → StructPtrInfo(descr)
-        // ConstPtrInfo._get_array_info → ArrayPtrInfo(descr)
+        // optimizer.py:429-431 — when promoting a virtual to a constant,
+        // call `copy_fields_to_const(constinfo, optheap)` so the cached
+        // field/item state survives via the const_infos pool.
         if let Value::Ref(gcref) = value {
-            if let Some(Forwarded::Info(info)) = self.forwarded.get(replaced.0 as usize) {
-                use crate::optimizeopt::info::{ArrayPtrInfo, PtrInfo, StructPtrInfo};
-                let key = gcref.as_usize();
-                match info {
-                    // AbstractStructPtrInfo hierarchy → concrete StructPtrInfo
-                    PtrInfo::Instance(v) if !v.fields.is_empty() => {
-                        if let Some(descr) = v.descr.clone() {
-                            let ci = self.const_infos.entry(key).or_insert_with(|| {
-                                PtrInfo::Struct(StructPtrInfo {
-                                    descr,
-                                    fields: Vec::new(),
-                                    field_descrs: Vec::new(),
-                                    preamble_fields: Vec::new(),
-                                    last_guard_pos: -1,
-                                })
-                            });
-                            if let PtrInfo::Struct(s) = ci {
-                                s.fields = v.fields.clone();
-                            }
-                        }
-                    }
-                    PtrInfo::Struct(v) if !v.fields.is_empty() => {
-                        let ci = self.const_infos.entry(key).or_insert_with(|| {
-                            PtrInfo::Struct(StructPtrInfo {
-                                descr: v.descr.clone(),
-                                fields: Vec::new(),
-                                field_descrs: Vec::new(),
-                                preamble_fields: Vec::new(),
-                                last_guard_pos: -1,
-                            })
-                        });
-                        if let PtrInfo::Struct(s) = ci {
-                            s.fields = v.fields.clone();
-                        }
-                    }
-                    PtrInfo::Virtual(v) if !v.fields.is_empty() => {
-                        let ci = self.const_infos.entry(key).or_insert_with(|| {
-                            PtrInfo::Struct(StructPtrInfo {
-                                descr: v.descr.clone(),
-                                fields: Vec::new(),
-                                field_descrs: Vec::new(),
-                                preamble_fields: Vec::new(),
-                                last_guard_pos: -1,
-                            })
-                        });
-                        if let PtrInfo::Struct(s) = ci {
-                            s.fields = v.fields.clone();
-                        }
-                    }
-                    PtrInfo::VirtualStruct(v) if !v.fields.is_empty() => {
-                        let ci = self.const_infos.entry(key).or_insert_with(|| {
-                            PtrInfo::Struct(StructPtrInfo {
-                                descr: v.descr.clone(),
-                                fields: Vec::new(),
-                                field_descrs: Vec::new(),
-                                preamble_fields: Vec::new(),
-                                last_guard_pos: -1,
-                            })
-                        });
-                        if let PtrInfo::Struct(s) = ci {
-                            s.fields = v.fields.clone();
-                        }
-                    }
-                    // ArrayPtrInfo hierarchy → concrete ArrayPtrInfo
-                    PtrInfo::Array(v) if !v.items.is_empty() => {
-                        let ci = self.const_infos.entry(key).or_insert_with(|| {
-                            PtrInfo::Array(ArrayPtrInfo {
-                                descr: v.descr.clone(),
-                                lenbound: v.lenbound.clone(),
-                                items: Vec::new(),
-                                last_guard_pos: -1,
-                            })
-                        });
-                        if let PtrInfo::Array(a) = ci {
-                            a.items = v.items.clone();
-                        }
-                    }
-                    PtrInfo::VirtualArray(v) if !v.items.is_empty() => {
-                        let ci = self.const_infos.entry(key).or_insert_with(|| {
-                            PtrInfo::Array(ArrayPtrInfo {
-                                descr: v.descr.clone(),
-                                lenbound: IntBound::from_constant(v.items.len() as i64),
-                                items: Vec::new(),
-                                last_guard_pos: -1,
-                            })
-                        });
-                        if let PtrInfo::Array(a) = ci {
-                            a.items = v.items.clone();
-                        }
-                    }
-                    _ => {}
-                }
-            }
+            self.copy_fields_to_const(replaced, gcref);
         }
         // Store in constants array for get_constant() callers.
         let idx = replaced.0 as usize;
@@ -1918,6 +1824,141 @@ impl OptContext {
             self.forwarded.resize(idx + 1, Forwarded::None);
         }
         self.forwarded[idx] = Forwarded::Const(value);
+    }
+
+    /// info.py:194-198 (AbstractStructPtrInfo) + info.py:533-538 (ArrayPtrInfo)
+    /// `copy_fields_to_const(constinfo, optheap)`.
+    ///
+    ///     # AbstractStructPtrInfo
+    ///     def copy_fields_to_const(self, constinfo, optheap):
+    ///         if self._fields is not None:
+    ///             info = constinfo._get_info(self.descr, optheap)
+    ///             assert isinstance(info, AbstractStructPtrInfo)
+    ///             info._fields = self._fields[:]
+    ///
+    ///     # ArrayPtrInfo
+    ///     def copy_fields_to_const(self, constinfo, optheap):
+    ///         descr = self.descr
+    ///         if self._items is not None:
+    ///             info = constinfo._get_array_info(descr, optheap)
+    ///             assert isinstance(info, ArrayPtrInfo)
+    ///             info._items = self._items[:]
+    ///
+    /// majit folds both per-type entries into a single helper because the
+    /// per-source dispatch happens via the PtrInfo enum match. The
+    /// `_get_info`/`_get_array_info` half is `const_infos.entry(...)`
+    /// (RPython: `optheap.const_infos[ref]`).
+    fn copy_fields_to_const(&mut self, source: OpRef, gcref: majit_ir::GcRef) {
+        use crate::optimizeopt::info::{ArrayPtrInfo, Forwarded, PtrInfo, StructPtrInfo};
+        let Some(Forwarded::Info(info)) = self.forwarded.get(source.0 as usize) else {
+            return;
+        };
+        let key = gcref.as_usize();
+        match info {
+            // info.py:194-198 AbstractStructPtrInfo.copy_fields_to_const →
+            // constinfo._get_info(self.descr, optheap) → StructPtrInfo(descr).
+            PtrInfo::Instance(v) if !v.fields.is_empty() => {
+                let Some(descr) = v.descr.clone() else {
+                    return;
+                };
+                let fields = v.fields.clone();
+                let ci = self.const_infos.entry(key).or_insert_with(|| {
+                    PtrInfo::Struct(StructPtrInfo {
+                        descr,
+                        fields: Vec::new(),
+                        field_descrs: Vec::new(),
+                        preamble_fields: Vec::new(),
+                        last_guard_pos: -1,
+                    })
+                });
+                if let PtrInfo::Struct(s) = ci {
+                    s.fields = fields;
+                }
+            }
+            PtrInfo::Struct(v) if !v.fields.is_empty() => {
+                let descr = v.descr.clone();
+                let fields = v.fields.clone();
+                let ci = self.const_infos.entry(key).or_insert_with(|| {
+                    PtrInfo::Struct(StructPtrInfo {
+                        descr,
+                        fields: Vec::new(),
+                        field_descrs: Vec::new(),
+                        preamble_fields: Vec::new(),
+                        last_guard_pos: -1,
+                    })
+                });
+                if let PtrInfo::Struct(s) = ci {
+                    s.fields = fields;
+                }
+            }
+            PtrInfo::Virtual(v) if !v.fields.is_empty() => {
+                let descr = v.descr.clone();
+                let fields = v.fields.clone();
+                let ci = self.const_infos.entry(key).or_insert_with(|| {
+                    PtrInfo::Struct(StructPtrInfo {
+                        descr,
+                        fields: Vec::new(),
+                        field_descrs: Vec::new(),
+                        preamble_fields: Vec::new(),
+                        last_guard_pos: -1,
+                    })
+                });
+                if let PtrInfo::Struct(s) = ci {
+                    s.fields = fields;
+                }
+            }
+            PtrInfo::VirtualStruct(v) if !v.fields.is_empty() => {
+                let descr = v.descr.clone();
+                let fields = v.fields.clone();
+                let ci = self.const_infos.entry(key).or_insert_with(|| {
+                    PtrInfo::Struct(StructPtrInfo {
+                        descr,
+                        fields: Vec::new(),
+                        field_descrs: Vec::new(),
+                        preamble_fields: Vec::new(),
+                        last_guard_pos: -1,
+                    })
+                });
+                if let PtrInfo::Struct(s) = ci {
+                    s.fields = fields;
+                }
+            }
+            // info.py:533-538 ArrayPtrInfo.copy_fields_to_const →
+            // constinfo._get_array_info(descr, optheap) → ArrayPtrInfo(descr).
+            PtrInfo::Array(v) if !v.items.is_empty() => {
+                let descr = v.descr.clone();
+                let lenbound = v.lenbound.clone();
+                let items = v.items.clone();
+                let ci = self.const_infos.entry(key).or_insert_with(|| {
+                    PtrInfo::Array(ArrayPtrInfo {
+                        descr,
+                        lenbound,
+                        items: Vec::new(),
+                        last_guard_pos: -1,
+                    })
+                });
+                if let PtrInfo::Array(a) = ci {
+                    a.items = items;
+                }
+            }
+            PtrInfo::VirtualArray(v) if !v.items.is_empty() => {
+                let descr = v.descr.clone();
+                let len = v.items.len() as i64;
+                let items = v.items.clone();
+                let ci = self.const_infos.entry(key).or_insert_with(|| {
+                    PtrInfo::Array(ArrayPtrInfo {
+                        descr,
+                        lenbound: IntBound::from_constant(len),
+                        items: Vec::new(),
+                        last_guard_pos: -1,
+                    })
+                });
+                if let PtrInfo::Array(a) = ci {
+                    a.items = items;
+                }
+            }
+            _ => {}
+        }
     }
 
     /// resume.py:157 getconst parity for synthetic rd_numb encoding.

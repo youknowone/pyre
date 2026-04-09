@@ -3123,29 +3123,31 @@ impl Optimizer {
 
     /// optimizer.py:754-778 _maybe_replace_guard_value
     ///
-    /// Turns `GUARD_VALUE(bool, 0/1)` into `GUARD_FALSE(bool)` /
-    /// `GUARD_TRUE(bool)` after `store_final_boxes_in_guard` has tagged the
-    /// resume data, leaving `descr.guard_opnum` set to the original
-    /// `GUARD_VALUE` (resume.py preserves it via `store_final_boxes`).
-    ///
-    /// Returns `op` unchanged when:
-    /// - the first arg is not int-typed,
-    /// - the first arg's IntBound is not bool (`is_bool()` false),
-    /// - or the constant on the right is neither 0 nor 1 (issue #3128).
+    ///     def _maybe_replace_guard_value(self, op, descr):
+    ///         if op.getarg(0).type == 'i':
+    ///             b = self.getintbound(op.getarg(0))
+    ///             if b.is_bool():
+    ///                 # Hack: turn guard_value(bool) into guard_true/guard_false.
+    ///                 constvalue = op.getarg(1).getint()
+    ///                 if constvalue == 0:
+    ///                     opnum = rop.GUARD_FALSE
+    ///                 elif constvalue == 1:
+    ///                     opnum = rop.GUARD_TRUE
+    ///                 else:
+    ///                     # Issue #3128: rare cases — give up rather than crash.
+    ///                     return op
+    ///                 newop = self.replace_op_with(op, opnum, [op.getarg(0)], descr)
+    ///                 return newop
+    ///         return op
     fn _maybe_replace_guard_value(op: Op, ctx: &mut OptContext) -> Op {
         // optimizer.py:755: if op.getarg(0).type == 'i'
         let arg0 = op.arg(0);
-        if op.opcode != OpCode::GuardValue {
-            return op;
-        }
-        // Only int-typed first arg is eligible.
-        let arg0_resolved = ctx.get_box_replacement(arg0);
-        // Constant ints are folded earlier; if arg0 is constant, no replacement.
-        if ctx.is_constant(arg0_resolved) {
-            return op;
-        }
+        // GuardValue's first arg is the value being guarded; only int values
+        // can be `bool`-shaped, so the int-type filter is implicit when we
+        // ask `IntBound.is_bool()` on a non-int OpRef (the bound is empty
+        // and `is_bool()` returns false).
         // optimizer.py:756-757: b = self.getintbound(op.getarg(0)); if b.is_bool()
-        let b = ctx.getintbound(arg0_resolved);
+        let b = ctx.getintbound(ctx.get_box_replacement(arg0));
         if !b.is_bool() {
             return op;
         }
