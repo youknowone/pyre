@@ -3393,22 +3393,24 @@ impl Optimizer {
 
     /// optimizer.py:754-778 _maybe_replace_guard_value
     ///
-    ///     def _maybe_replace_guard_value(self, op, descr):
-    ///         if op.getarg(0).type == 'i':
-    ///             b = self.getintbound(op.getarg(0))
-    ///             if b.is_bool():
-    ///                 # Hack: turn guard_value(bool) into guard_true/guard_false.
-    ///                 constvalue = op.getarg(1).getint()
-    ///                 if constvalue == 0:
-    ///                     opnum = rop.GUARD_FALSE
-    ///                 elif constvalue == 1:
-    ///                     opnum = rop.GUARD_TRUE
-    ///                 else:
-    ///                     # Issue #3128: rare cases — give up rather than crash.
-    ///                     return op
-    ///                 newop = self.replace_op_with(op, opnum, [op.getarg(0)], descr)
-    ///                 return newop
-    ///         return op
+    /// ```text
+    /// def _maybe_replace_guard_value(self, op, descr):
+    ///     if op.getarg(0).type == 'i':
+    ///         b = self.getintbound(op.getarg(0))
+    ///         if b.is_bool():
+    ///             # Hack: turn guard_value(bool) into guard_true/guard_false.
+    ///             constvalue = op.getarg(1).getint()
+    ///             if constvalue == 0:
+    ///                 opnum = rop.GUARD_FALSE
+    ///             elif constvalue == 1:
+    ///                 opnum = rop.GUARD_TRUE
+    ///             else:
+    ///                 # Issue #3128: rare cases — give up rather than crash.
+    ///                 return op
+    ///             newop = self.replace_op_with(op, opnum, [op.getarg(0)], descr)
+    ///             return newop
+    ///     return op
+    /// ```
     fn _maybe_replace_guard_value(op: Op, ctx: &mut OptContext) -> Op {
         // optimizer.py:755: if op.getarg(0).type == 'i'
         let arg0 = op.arg(0);

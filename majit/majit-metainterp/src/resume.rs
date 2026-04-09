@@ -4276,19 +4276,21 @@ pub trait GreenfieldInfo {}
 /// Reads encoded resume data (rd_numb) and fills blackhole interpreter
 /// resume.py:874-899 AbstractVirtualCache / get_VirtualCache_class
 ///
-///     class AbstractVirtualCache(object):
-///         pass
+/// ```text
+/// class AbstractVirtualCache(object):
+///     pass
 ///
-///     def get_VirtualCache_class(suffix):
-///         class VirtualCache(AbstractVirtualCache):
-///             def __init__(self, virtuals_ptr_cache, virtuals_int_cache):
-///                 self.virtuals_ptr_cache = virtuals_ptr_cache
-///                 self.virtuals_int_cache = virtuals_int_cache
+/// def get_VirtualCache_class(suffix):
+///     class VirtualCache(AbstractVirtualCache):
+///         def __init__(self, virtuals_ptr_cache, virtuals_int_cache):
+///             self.virtuals_ptr_cache = virtuals_ptr_cache
+///             self.virtuals_int_cache = virtuals_int_cache
 ///
-///             def get_ptr(self, i):  return self.virtuals_ptr_cache[i]
-///             def get_int(self, i):  return self.virtuals_int_cache[i]
-///             def set_ptr(self, i, v): self.virtuals_ptr_cache[i] = v
-///             def set_int(self, i, v): self.virtuals_int_cache[i] = v
+///         def get_ptr(self, i):  return self.virtuals_ptr_cache[i]
+///         def get_int(self, i):  return self.virtuals_int_cache[i]
+///         def set_ptr(self, i, v): self.virtuals_ptr_cache[i] = v
+///         def set_int(self, i, v): self.virtuals_int_cache[i] = v
+/// ```
 ///
 /// RPython generates two flavours of this class — one for
 /// `ResumeDataDirectReader` (raw `i64` slots) and one for the future

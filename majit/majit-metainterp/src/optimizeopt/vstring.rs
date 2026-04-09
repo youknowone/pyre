@@ -859,10 +859,12 @@ impl OptString {
 
     /// vstring.py:155-158 VStringPlainInfo.shrink
     ///
-    ///     def shrink(self, length):
-    ///         assert length >= 0
-    ///         self.length = length
-    ///         del self._chars[length:]
+    /// ```text
+    /// def shrink(self, length):
+    ///     assert length >= 0
+    ///     self.length = length
+    ///     del self._chars[length:]
+    /// ```
     ///
     /// majit's `VStringInfo::Plain { chars }` carries length implicitly via
     /// `chars.len()`, so the explicit `self.length = length` step is folded
@@ -875,19 +877,21 @@ impl OptString {
 
     /// vstring.py:839-851 opt_call_SHRINK_ARRAY
     ///
-    ///     def opt_call_SHRINK_ARRAY(self, op):
-    ///         i1 = getptrinfo(op.getarg(1))
-    ///         i2 = self.getintbound(op.getarg(2))
-    ///         # If the index is constant, if the argument is virtual (we only
-    ///         # support VStringPlainValue for now) we can optimize away the call.
-    ///         if (i2 and i2.is_constant() and i1 and i1.is_virtual() and
-    ///             isinstance(i1, VStringPlainInfo)):
-    ///             length = i2.get_constant_int()
-    ///             i1.shrink(length)
-    ///             self.last_emitted_operation = REMOVED
-    ///             self.make_equal_to(op, op.getarg(1))
-    ///             return True
-    ///         return False
+    /// ```text
+    /// def opt_call_SHRINK_ARRAY(self, op):
+    ///     i1 = getptrinfo(op.getarg(1))
+    ///     i2 = self.getintbound(op.getarg(2))
+    ///     # If the index is constant, if the argument is virtual (we only
+    ///     # support VStringPlainValue for now) we can optimize away the call.
+    ///     if (i2 and i2.is_constant() and i1 and i1.is_virtual() and
+    ///         isinstance(i1, VStringPlainInfo)):
+    ///         length = i2.get_constant_int()
+    ///         i1.shrink(length)
+    ///         self.last_emitted_operation = REMOVED
+    ///         self.make_equal_to(op, op.getarg(1))
+    ///         return True
+    ///     return False
+    /// ```
     fn opt_call_shrink_array(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         if op.num_args() >= 3 {
             let arg1 = ctx.get_box_replacement(op.arg(1));
