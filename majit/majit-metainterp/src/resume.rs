@@ -4252,6 +4252,79 @@ pub trait GreenfieldInfo {}
 /// resume.py:1354 ResumeDataDirectReader
 ///
 /// Reads encoded resume data (rd_numb) and fills blackhole interpreter
+/// resume.py:874-899 AbstractVirtualCache / get_VirtualCache_class
+///
+///     class AbstractVirtualCache(object):
+///         pass
+///
+///     def get_VirtualCache_class(suffix):
+///         class VirtualCache(AbstractVirtualCache):
+///             def __init__(self, virtuals_ptr_cache, virtuals_int_cache):
+///                 self.virtuals_ptr_cache = virtuals_ptr_cache
+///                 self.virtuals_int_cache = virtuals_int_cache
+///
+///             def get_ptr(self, i):  return self.virtuals_ptr_cache[i]
+///             def get_int(self, i):  return self.virtuals_int_cache[i]
+///             def set_ptr(self, i, v): self.virtuals_ptr_cache[i] = v
+///             def set_int(self, i, v): self.virtuals_int_cache[i] = v
+///
+/// RPython generates two flavours of this class — one for
+/// `ResumeDataDirectReader` (raw `i64` slots) and one for the future
+/// `ResumeDataBoxReader` (boxed). majit only emits the direct flavour at
+/// runtime, so a single struct backs both.
+#[derive(Default)]
+pub struct VirtualCache {
+    pub virtuals_ptr_cache: Vec<i64>,
+    pub virtuals_int_cache: Vec<i64>,
+}
+
+impl VirtualCache {
+    pub fn new() -> Self {
+        VirtualCache::default()
+    }
+
+    /// resume.py:882-884 __init__
+    pub fn from_caches(virtuals_ptr_cache: Vec<i64>, virtuals_int_cache: Vec<i64>) -> Self {
+        VirtualCache {
+            virtuals_ptr_cache,
+            virtuals_int_cache,
+        }
+    }
+
+    /// resume.py:886-887 get_ptr
+    #[inline]
+    pub fn get_ptr(&self, i: usize) -> i64 {
+        self.virtuals_ptr_cache[i]
+    }
+
+    /// resume.py:889-890 get_int
+    #[inline]
+    pub fn get_int(&self, i: usize) -> i64 {
+        self.virtuals_int_cache[i]
+    }
+
+    /// resume.py:892-893 set_ptr
+    #[inline]
+    pub fn set_ptr(&mut self, i: usize, v: i64) {
+        self.virtuals_ptr_cache[i] = v;
+    }
+
+    /// resume.py:895-896 set_int
+    #[inline]
+    pub fn set_int(&mut self, i: usize, v: i64) {
+        self.virtuals_int_cache[i] = v;
+    }
+
+    /// `len(self.virtuals_ptr_cache)` — both halves stay the same length.
+    pub fn len(&self) -> usize {
+        self.virtuals_ptr_cache.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.virtuals_ptr_cache.is_empty()
+    }
+}
+
 /// registers directly from the deadframe's fail_args values.
 ///
 /// Combines AbstractResumeDataReader (resume.py:901) mixin with
@@ -4285,9 +4358,10 @@ pub struct ResumeDataDirectReader<'a> {
     // resume.py:909 rd_virtuals
     rd_virtuals: Option<&'a [VirtualInfo]>,
 
-    // resume.py:910 virtuals_cache — lazy-allocated virtual objects
-    virtuals_cache_ptr: Vec<i64>,
-    virtuals_cache_int: Vec<i64>,
+    /// resume.py:910 virtuals_cache — lazy-allocated virtual objects.
+    /// Wraps both the ptr and int half so callers go through the RPython
+    /// `VirtualCache` API (`get_ptr`/`set_ptr`/`get_int`/`set_int`).
+    pub virtuals_cache: VirtualCache,
 
     /// resume.py:1367 — CPU allocation backend.
     /// RPython uses self.cpu (from metainterp_sd.cpu) for allocate_with_vtable etc.
@@ -4415,7 +4489,7 @@ impl VirtualInfo {
             } => {
                 // resume.py:619 allocate_with_vtable(descr=self.descr)
                 let obj = allocator.allocate_with_vtable(*type_id, *descr_size);
-                decoder.virtuals_cache_ptr[index] = obj;
+                decoder.virtuals_cache.set_ptr(index, obj);
                 for (i, (field_descr, source)) in fields.iter().enumerate() {
                     let fd = fielddescrs.get(i);
                     let field_type = fd.map(|fd| fd.field_type).unwrap_or(majit_ir::Type::Ref);
@@ -4445,7 +4519,7 @@ impl VirtualInfo {
             } => {
                 // resume.py:635 allocate_struct(self.typedescr)
                 let obj = allocator.allocate_struct(*type_id, *descr_size);
-                decoder.virtuals_cache_ptr[index] = obj;
+                decoder.virtuals_cache.set_ptr(index, obj);
                 for (i, (field_descr, source)) in fields.iter().enumerate() {
                     let fd = fielddescrs.get(i);
                     let field_type = fd.map(|fd| fd.field_type).unwrap_or(majit_ir::Type::Ref);
@@ -4463,7 +4537,7 @@ impl VirtualInfo {
             VirtualInfo::VArray { descr_index, items } => {
                 let length = items.len();
                 let array = allocator.allocate_array(length, *descr_index, true);
-                decoder.virtuals_cache_ptr[index] = array;
+                decoder.virtuals_cache.set_ptr(index, array);
                 for (i, source) in items.iter().enumerate() {
                     let value = decoder.decode_field_source(source);
                     // resume.py:656-676 — dispatch by arraydescr type
@@ -4472,7 +4546,7 @@ impl VirtualInfo {
                 array
             }
             _ => {
-                decoder.virtuals_cache_ptr[index] = 0;
+                decoder.virtuals_cache.set_ptr(index, 0);
                 0
             }
         }
@@ -4490,7 +4564,7 @@ impl VirtualInfo {
                 // resume.py:703
                 let buffer = allocator.allocate_raw_buffer(*size);
                 // resume.py:704
-                decoder.virtuals_cache_int[index] = buffer;
+                decoder.virtuals_cache.set_int(index, buffer);
                 // resume.py:705-708
                 for (offset, _size_bytes, source) in entries {
                     let value = decoder.decode_field_source(source);
@@ -4502,7 +4576,7 @@ impl VirtualInfo {
                 // resume.py:723-725 — parent is an INT virtual (raw buffer)
                 let parent_val = decoder.decode_field_source_int(parent);
                 let result = parent_val + *offset;
-                decoder.virtuals_cache_int[index] = result;
+                decoder.virtuals_cache.set_int(index, result);
                 result
             }
             _ => panic!("allocate_int called on non-raw virtual"),
@@ -4526,12 +4600,12 @@ impl<'a> ResumeDataDirectReader<'a> {
         let count = resumecodereader.next_item();
 
         // resume.py:1368-1376
-        let (resume_after_guard_not_forced, virtuals_cache_ptr, virtuals_cache_int) =
+        let (resume_after_guard_not_forced, virtuals_cache) =
             if let Some((ptrs, ints)) = all_virtuals {
                 // resume.py:1373-1374: special case for GUARD_NOT_FORCED
-                (2, ptrs, ints)
+                (2, VirtualCache::from_caches(ptrs, ints))
             } else {
-                (0, Vec::new(), Vec::new())
+                (0, VirtualCache::new())
             };
 
         ResumeDataDirectReader {
@@ -4543,8 +4617,7 @@ impl<'a> ResumeDataDirectReader<'a> {
             deadframe_types,
             resume_after_guard_not_forced,
             rd_virtuals: None,
-            virtuals_cache_ptr,
-            virtuals_cache_int,
+            virtuals_cache,
             allocator,
             virtualizable_ptr: 0,
         }
@@ -4737,11 +4810,11 @@ impl<'a> ResumeDataDirectReader<'a> {
     pub fn getvirtual_ptr(&mut self, index: usize) -> i64 {
         // resume.py:950: assert self.virtuals_cache is not None
         assert!(
-            !self.virtuals_cache_ptr.is_empty(),
+            !self.virtuals_cache.is_empty(),
             "getvirtual_ptr: virtuals_cache is empty (rd_virtuals not prepared)"
         );
         // resume.py:951-952
-        let v = self.virtuals_cache_ptr[index];
+        let v = self.virtuals_cache.get_ptr(index);
         if v != 0 {
             return v;
         }
@@ -4756,7 +4829,11 @@ impl<'a> ResumeDataDirectReader<'a> {
         debug_assert!(index < rd_virtuals_len);
         let allocator = self.allocator as *const dyn BlackholeAllocator;
         let v = vinfo.allocate(self, index, unsafe { &*allocator });
-        debug_assert_eq!(v, self.virtuals_cache_ptr[index], "resume.py: bad cache");
+        debug_assert_eq!(
+            v,
+            self.virtuals_cache.get_ptr(index),
+            "resume.py: bad cache"
+        );
         v
     }
 
@@ -4764,11 +4841,11 @@ impl<'a> ResumeDataDirectReader<'a> {
     pub fn getvirtual_int(&mut self, index: usize) -> i64 {
         // resume.py:959: assert self.virtuals_cache is not None
         assert!(
-            !self.virtuals_cache_int.is_empty(),
+            !self.virtuals_cache.is_empty(),
             "getvirtual_int: virtuals_cache is empty (rd_virtuals not prepared)"
         );
         // resume.py:960-961
-        let v = self.virtuals_cache_int[index];
+        let v = self.virtuals_cache.get_int(index);
         if v != 0 {
             return v;
         }
@@ -4779,7 +4856,11 @@ impl<'a> ResumeDataDirectReader<'a> {
         assert!(vinfo.is_about_raw(), "getvirtual_int: not a raw virtual");
         let allocator = self.allocator as *const dyn BlackholeAllocator;
         let v = vinfo.allocate_int(self, index, unsafe { &*allocator });
-        debug_assert_eq!(v, self.virtuals_cache_int[index], "resume.py: bad cache");
+        debug_assert_eq!(
+            v,
+            self.virtuals_cache.get_int(index),
+            "resume.py: bad cache"
+        );
         v
     }
 
@@ -4797,7 +4878,10 @@ impl<'a> ResumeDataDirectReader<'a> {
                 }
             }
         }
-        (&self.virtuals_cache_ptr, &self.virtuals_cache_int)
+        (
+            &self.virtuals_cache.virtuals_ptr_cache,
+            &self.virtuals_cache.virtuals_int_cache,
+        )
     }
 
     /// resume.py:983 _prepare_virtuals
@@ -4805,8 +4889,7 @@ impl<'a> ResumeDataDirectReader<'a> {
         if let Some(v) = virtuals {
             self.rd_virtuals = Some(v);
             // resume.py:990-991
-            self.virtuals_cache_ptr = vec![0; v.len()];
-            self.virtuals_cache_int = vec![0; v.len()];
+            self.virtuals_cache = VirtualCache::from_caches(vec![0; v.len()], vec![0; v.len()]);
         }
     }
 
