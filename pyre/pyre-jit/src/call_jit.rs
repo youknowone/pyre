@@ -704,9 +704,11 @@ fn bh_portal_runner(frame_ptr: i64) -> i64 {
 /// raising, and a silent null would corrupt computations that depend on
 /// the call's return value (see `jit_force_recursive_call_raw_1`).
 fn blackhole_from_jit_frame(frame: &mut PyFrame) -> Option<PyObjectRef> {
-    // RPython parity: blackhole has no jit_merge_point.
-    // bh_call_fn_impl uses force_plain_eval so all nested calls
-    // stay in the plain interpreter (no JIT re-entry).
+    // blackhole.py:1067-1093 bhimpl_jit_merge_point: when blackhole reaches
+    // a portal entry it calls bhimpl_recursive_call_*, which routes through
+    // portal_runner_adr (= JIT entry). pyre wires bh_portal_runner into the
+    // BlackholeInterpreter via portal_runner_ptr below; bh_call_fn_impl uses
+    // call_user_function which honors EVAL_OVERRIDE for the same effect.
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
     let py_pc = frame.next_instr;
 
@@ -2873,15 +2875,13 @@ pub extern "C" fn bh_call_fn_8(
 /// RPython: bhimpl_residual_call dispatches via cpu.bh_call_*.
 /// pyre: dispatches builtin vs user function. Parent frame provides
 /// full call protocol (defaults, kw-only, varargs, generator).
+///
+/// blackhole.py:1101-1132 bhimpl_recursive_call_* parity: nested user
+/// function calls flow through `call_user_function` which honors
+/// `EVAL_OVERRIDE` (= eval_with_jit). This re-enters compiled code via
+/// the same `try_function_entry_jit` path as a top-level call, exactly
+/// equivalent to RPython `cpu.bh_call_*(portal_runner_adr, ...)`.
 fn bh_call_fn_impl(callable: PyObjectRef, args: &[PyObjectRef]) -> i64 {
-    // RPython bhimpl_residual_call parity: the direct call below uses
-    // call_user_function_plain, but the CALLED function's own recursive
-    // calls go through call_callable → call_user_function which checks
-    // EVAL_OVERRIDE. Without force_plain_eval, those nested calls would
-    // re-enter JIT compiled code, causing nested blackhole resume.
-    // TODO: implement bhimpl_recursive_call for portal calls to enable
-    // bridge compilation (blackhole.py:1101-1132).
-    let _plain_guard = pyre_interpreter::call::force_plain_eval();
     if callable.is_null() {
         let err = pyre_interpreter::PyError::new(
             pyre_interpreter::PyErrorKind::TypeError,
@@ -2912,12 +2912,13 @@ fn bh_call_fn_impl(callable: PyObjectRef, args: &[PyObjectRef]) -> i64 {
         return 0;
     }
     // blackhole.py bhimpl_residual_call: parent frame from BH_VABLE_PTR.
-    // call_user_function_plain handles full call protocol (defaults,
-    // kw-only, pack_varargs, generator/coroutine).
+    // `call_user_function` is pyre's portal runner equivalent — it routes
+    // through the JIT-aware EVAL_OVERRIDE so nested calls re-enter compiled
+    // code, matching RPython `cpu.bh_call_*(portal_runner_adr, ...)`.
     let parent_frame_ptr =
         majit_metainterp::blackhole::BH_VABLE_PTR.with(|c| c.get()) as *const PyFrame;
     let parent_frame = unsafe { &*parent_frame_ptr };
-    match pyre_interpreter::call::call_user_function_plain(parent_frame, callable, args) {
+    match pyre_interpreter::call::call_user_function(parent_frame, callable, args) {
         Ok(result) => result as i64,
         Err(err) => {
             let exc_obj = err.to_exc_object();
