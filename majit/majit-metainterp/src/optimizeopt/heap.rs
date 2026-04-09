@@ -677,14 +677,18 @@ impl OptHeap {
             }
             let final_value = op.arg(1);
             let descr = op.descr.clone();
+            // heap.py:142-143 put_field_back_to_info needs the lazy_set Op
+            // AFTER it's been emitted by emit_extra. Clone it so we can
+            // route the structinfo write through `structinfo_setfield`
+            // without restoring or reconstructing the op.
+            let put_back_op = op.clone();
             // heap.py:136: emit_extra(op, emit=False) — route after heap
             ctx.emit_extra(heap_pass_idx, op);
-            // heap.py:142-143: put_field_back_to_info — restore cache
+            // heap.py:142-143: put_field_back_to_info — restore cache +
+            // structinfo. The orthodox helper handles both the Forwarded
+            // path (regular box) and the constant path (const_infos).
             self.cache_field(obj, field_idx, final_value, descr.as_ref());
-            let obj_resolved = ctx.get_box_replacement(obj);
-            if let Some(info) = ctx.get_ptr_info_mut(obj_resolved) {
-                info.setfield(field_idx, final_value);
-            }
+            ctx.structinfo_setfield(&put_back_op, field_idx, final_value);
         }
     }
 
@@ -769,16 +773,18 @@ impl OptHeap {
                 self.field_cache(field_idx)
                     .invalidate_with_ctx(field_idx, ctx);
             }
+            // heap.py:142-143 put_field_back_to_info needs the lazy_set Op
+            // AFTER it's been emitted by emit_extra. Clone it so the
+            // structinfo write goes through `structinfo_setfield` (which
+            // also handles the constant arg0 → const_infos route).
+            let put_back_op = op.clone();
             // emit_extra(op, emit=False): route through passes after heap.
             // RPython: self.next_optimization — always starts AFTER heap,
             // regardless of which pass emitted the guard that triggered this.
             ctx.emit_extra(self_pass_idx, op);
             // heap.py:142-143: put_field_back_to_info — restore cache + PtrInfo
             self.cache_field(obj, field_idx, final_value, descr.as_ref());
-            let obj_resolved = ctx.get_box_replacement(obj);
-            if let Some(info) = ctx.get_ptr_info_mut(obj_resolved) {
-                info.setfield(field_idx, final_value);
-            }
+            ctx.structinfo_setfield(&put_back_op, field_idx, final_value);
         }
 
         // heap.py:622-636: iterate cached array items
@@ -1786,9 +1792,15 @@ impl OptHeap {
             cai.cached_values.swap_remove(idx);
             cai.cached_descrs.retain(|(k, _)| *k != array);
         }
-        if let Some(info) = ctx.get_ptr_info_mut(ctx.get_box_replacement(op.arg(0))) {
-            info.setitem(const_index as usize, new_value);
-        }
+        // heap.py:746-756 postprocess_SETARRAYITEM_GC:
+        //     arrayinfo = self.ensure_ptr_info_arg0(op)
+        //     ...
+        //     arrayinfo.setitem(op.getdescr(), index, ..., optheap=self, cf=cf)
+        //
+        // Routes through `arrayinfo_setitem` so the constant arg0 path
+        // also lands in `const_infos[gcref]` per info.py:746-748
+        // ConstPtrInfo.setitem.
+        ctx.arrayinfo_setitem(op, const_index as usize, new_value);
         // heap.py:266 ArrayCachedItem.invalidate → parent.clear_varindex().
         // Writing to any constant index potentially clobbers a varindex
         // triple in the same submap.
