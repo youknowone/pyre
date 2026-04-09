@@ -1004,12 +1004,25 @@ impl TraceCtx {
         self.vable_setfield_descr(vable_opref, null, info.token_field_descr());
     }
 
-    /// RPython pyjitpl.py:1114 `_nonstandard_virtualizable()`.
+    /// pyjitpl.py:1120-1146 `_nonstandard_virtualizable(pc, box, fielddescr)`.
     ///
-    /// Returns true if `vable_opref` is NOT the standard virtualizable
-    /// (i.e., `vable_opref != virtualizable_boxes[-1]`). Nonstandard
-    /// virtualizables must fall back to heap operations.
+    /// Inline trace_ctx-side equivalent for the proc-macro hot path that
+    /// records `vable_*` accesses directly. Mirrors the Step 1 + Step 3
+    /// of MetaInterp::nonstandard_virtualizable: heapcache short-circuit
+    /// followed by the `boxes[-1]` identity check. Returns true if the
+    /// box is known nonstandard or differs from `virtualizable_boxes[-1]`.
     fn is_nonstandard_virtualizable(&self, vable_opref: OpRef) -> bool {
+        // Step 1: heapcache short-circuit. RPython pyjitpl.py:1123:
+        //     if heapcache.is_known_nonstandard_virtualizable(box): return True
+        if self
+            .heap_cache
+            .is_known_nonstandard_virtualizable(vable_opref)
+        {
+            return true;
+        }
+        // Step 3: standard_box identity check. RPython pyjitpl.py:1130-1132:
+        //     standard_box = self.virtualizable_boxes[-1]
+        //     if standard_box is box: return False
         if let Some(ref boxes) = self.virtualizable_boxes {
             if let Some(&vbox) = boxes.last() {
                 return vbox != vable_opref;
