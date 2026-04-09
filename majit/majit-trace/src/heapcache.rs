@@ -896,7 +896,19 @@ impl HeapCache {
         vb_contains(&self.is_unescaped, &opref)
     }
 
-    /// Check if we saw the allocation of this object in the current trace.
+    /// heapcache.py:79-82 `CacheEntry._seen_alloc(box)`:
+    ///
+    ///     if not isinstance(ref_box, RefFrontendOp):
+    ///         return False
+    ///     return self.heapcache._check_flag(ref_box, HF_SEEN_ALLOCATION)
+    ///
+    /// pyre's `seen_allocation` Vec<bool> mirror is updated by `_set_flag`
+    /// alongside `heapc_flags`, and is wiped on `reset()` together with
+    /// the version bump. The fast Vec<bool> lookup is kept here because
+    /// routing through `_check_flag` (which does test_head_version on
+    /// every call) crosses the fib_recursive bench budget by ~0.02s. The
+    /// behaviour is equivalent within a tracing run because `_set_flag`
+    /// keeps the mirror in sync with `heapc_flags`.
     pub fn saw_allocation(&self, opref: OpRef) -> bool {
         vb_contains(&self.seen_allocation, &opref)
     }
