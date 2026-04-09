@@ -1184,21 +1184,32 @@ impl TraceCtx {
         true
     }
 
-    /// Record a virtualizable field read (GETFIELD_GC_I/R/F).
+    /// pyjitpl.py:1167-1172 `opimpl_getfield_vable_i(box, fielddescr, pc)`.
     ///
-    /// RPython pyjitpl.py:1161 `opimpl_getfield_vable_i`.
-    ///
-    /// Standard virtualizable: returns box value directly (no heap op).
-    /// Nonstandard (escaped/virtual): falls back to GETFIELD_GC.
+    ///     def opimpl_getfield_vable_i(self, box, fielddescr, pc):
+    ///         if self._nonstandard_virtualizable(pc, box, fielddescr):
+    ///             return self.opimpl_getfield_gc_i(box, fielddescr)
+    ///         self.metainterp.check_synchronized_virtualizable()
+    ///         index = self._get_virtualizable_field_index(fielddescr)
+    ///         return self.metainterp.virtualizable_boxes[index]
     pub fn vable_getfield_int(&mut self, vable_opref: OpRef, field_offset: usize) -> OpRef {
-        if !self.is_nonstandard_virtualizable(vable_opref) {
-            if let (Some(boxes), Some(info)) = (&self.virtualizable_boxes, &self.virtualizable_info)
-            {
-                if let Some(index) = info.static_field_index(field_offset) {
-                    return boxes[index];
-                }
-            }
+        if self.is_nonstandard_virtualizable(vable_opref) {
+            // self.opimpl_getfield_gc_i(box, fielddescr)
+            let offset_ref = self.const_int(field_offset as i64);
+            return self.record_op(OpCode::GetfieldGcI, &[vable_opref, offset_ref]);
         }
+        // self.metainterp.check_synchronized_virtualizable() — no-op in pyre.
+        // index = self._get_virtualizable_field_index(fielddescr)
+        // return self.metainterp.virtualizable_boxes[index]
+        let index = self
+            .virtualizable_info
+            .as_ref()
+            .and_then(|info| info.static_field_index(field_offset));
+        if let (Some(idx), Some(boxes)) = (index, self.virtualizable_boxes.as_ref()) {
+            return boxes[idx];
+        }
+        // Fallback for tests/missing layout: emit the heap op as if
+        // _nonstandard_virtualizable had returned True.
         let offset_ref = self.const_int(field_offset as i64);
         self.record_op(OpCode::GetfieldGcI, &[vable_opref, offset_ref])
     }
@@ -1208,24 +1219,36 @@ impl TraceCtx {
         self.record_op_with_descr(OpCode::GetfieldGcI, &[vable_opref], descr)
     }
 
-    /// Record a virtualizable field write (SETFIELD_GC).
+    /// pyjitpl.py:1188-1199 `_opimpl_setfield_vable(box, valuebox, fielddescr, pc)`.
     ///
-    /// RPython pyjitpl.py:1183 `_opimpl_setfield_vable`.
-    ///
-    /// Standard: updates box directly. Nonstandard: falls back to SETFIELD_GC.
+    ///     def _opimpl_setfield_vable(self, box, valuebox, fielddescr, pc):
+    ///         if self._nonstandard_virtualizable(pc, box, fielddescr):
+    ///             return self._opimpl_setfield_gc_any(box, valuebox, fielddescr)
+    ///         index = self._get_virtualizable_field_index(fielddescr)
+    ///         self.metainterp.virtualizable_boxes[index] = valuebox
+    ///         self.metainterp.synchronize_virtualizable()
+    ///         # XXX only the index'th field needs to be synchronized, really
     pub fn vable_setfield(&mut self, vable_opref: OpRef, field_offset: usize, value: OpRef) {
-        if !self.is_nonstandard_virtualizable(vable_opref) {
-            let index = self
-                .virtualizable_info
-                .as_ref()
-                .and_then(|info| info.static_field_index(field_offset));
-            if let Some(idx) = index {
-                if let Some(boxes) = &mut self.virtualizable_boxes {
-                    boxes[idx] = value;
-                    return;
-                }
+        if self.is_nonstandard_virtualizable(vable_opref) {
+            // self._opimpl_setfield_gc_any(box, valuebox, fielddescr)
+            let offset_ref = self.const_int(field_offset as i64);
+            self.record_op(OpCode::SetfieldGc, &[vable_opref, offset_ref, value]);
+            return;
+        }
+        // index = self._get_virtualizable_field_index(fielddescr)
+        // self.metainterp.virtualizable_boxes[index] = valuebox
+        let index = self
+            .virtualizable_info
+            .as_ref()
+            .and_then(|info| info.static_field_index(field_offset));
+        if let Some(idx) = index {
+            if let Some(boxes) = &mut self.virtualizable_boxes {
+                boxes[idx] = value;
+                // self.metainterp.synchronize_virtualizable() — no-op in pyre.
+                return;
             }
         }
+        // Fallback: emit the heap op when the layout is unavailable.
         let offset_ref = self.const_int(field_offset as i64);
         self.record_op(OpCode::SetfieldGc, &[vable_opref, offset_ref, value]);
     }
@@ -1235,17 +1258,25 @@ impl TraceCtx {
         self.record_op_with_descr(OpCode::SetfieldGc, &[vable_opref, value], descr);
     }
 
-    /// Record a virtualizable ref field read (GETFIELD_GC_R).
+    /// pyjitpl.py:1173-1179 `opimpl_getfield_vable_r(box, fielddescr, pc)`.
     ///
-    /// RPython pyjitpl.py:1168 `opimpl_getfield_vable_r`.
+    ///     def opimpl_getfield_vable_r(self, box, fielddescr, pc):
+    ///         if self._nonstandard_virtualizable(pc, box, fielddescr):
+    ///             return self.opimpl_getfield_gc_r(box, fielddescr)
+    ///         self.metainterp.check_synchronized_virtualizable()
+    ///         index = self._get_virtualizable_field_index(fielddescr)
+    ///         return self.metainterp.virtualizable_boxes[index]
     pub fn vable_getfield_ref(&mut self, vable_opref: OpRef, field_offset: usize) -> OpRef {
-        if !self.is_nonstandard_virtualizable(vable_opref) {
-            if let (Some(boxes), Some(info)) = (&self.virtualizable_boxes, &self.virtualizable_info)
-            {
-                if let Some(index) = info.static_field_index(field_offset) {
-                    return boxes[index];
-                }
-            }
+        if self.is_nonstandard_virtualizable(vable_opref) {
+            let offset_ref = self.const_int(field_offset as i64);
+            return self.record_op(OpCode::GetfieldGcR, &[vable_opref, offset_ref]);
+        }
+        let index = self
+            .virtualizable_info
+            .as_ref()
+            .and_then(|info| info.static_field_index(field_offset));
+        if let (Some(idx), Some(boxes)) = (index, self.virtualizable_boxes.as_ref()) {
+            return boxes[idx];
         }
         let offset_ref = self.const_int(field_offset as i64);
         self.record_op(OpCode::GetfieldGcR, &[vable_opref, offset_ref])
@@ -1256,17 +1287,25 @@ impl TraceCtx {
         self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], descr)
     }
 
-    /// Record a virtualizable float field read (GETFIELD_GC_F).
+    /// pyjitpl.py:1180-1186 `opimpl_getfield_vable_f(box, fielddescr, pc)`.
     ///
-    /// RPython pyjitpl.py:1175 `opimpl_getfield_vable_f`.
+    ///     def opimpl_getfield_vable_f(self, box, fielddescr, pc):
+    ///         if self._nonstandard_virtualizable(pc, box, fielddescr):
+    ///             return self.opimpl_getfield_gc_f(box, fielddescr)
+    ///         self.metainterp.check_synchronized_virtualizable()
+    ///         index = self._get_virtualizable_field_index(fielddescr)
+    ///         return self.metainterp.virtualizable_boxes[index]
     pub fn vable_getfield_float(&mut self, vable_opref: OpRef, field_offset: usize) -> OpRef {
-        if !self.is_nonstandard_virtualizable(vable_opref) {
-            if let (Some(boxes), Some(info)) = (&self.virtualizable_boxes, &self.virtualizable_info)
-            {
-                if let Some(index) = info.static_field_index(field_offset) {
-                    return boxes[index];
-                }
-            }
+        if self.is_nonstandard_virtualizable(vable_opref) {
+            let offset_ref = self.const_int(field_offset as i64);
+            return self.record_op(OpCode::GetfieldGcF, &[vable_opref, offset_ref]);
+        }
+        let index = self
+            .virtualizable_info
+            .as_ref()
+            .and_then(|info| info.static_field_index(field_offset));
+        if let (Some(idx), Some(boxes)) = (index, self.virtualizable_boxes.as_ref()) {
+            return boxes[idx];
         }
         let offset_ref = self.const_int(field_offset as i64);
         self.record_op(OpCode::GetfieldGcF, &[vable_opref, offset_ref])
@@ -1297,31 +1336,48 @@ impl TraceCtx {
         self.record_op(OpCode::GetarrayitemGcI, &[array_opref, index, zero])
     }
 
-    /// Virtualizable array item read with an index OpRef.
+    /// pyjitpl.py:1218-1230 `_opimpl_getarrayitem_vable(box, indexbox, fdescr, adescr, pc)`
+    /// (int variant via `opimpl_getarrayitem_vable_i = _opimpl_getarrayitem_vable`).
     ///
-    /// If the index is a known constant and the vable is standard, reads
-    /// directly from `virtualizable_boxes`. Otherwise falls back to heap ops.
+    ///     def _opimpl_getarrayitem_vable(self, box, indexbox, fdescr, adescr, pc):
+    ///         if self._nonstandard_virtualizable(pc, box, fdescr):
+    ///             arraybox = self.opimpl_getfield_gc_r(box, fdescr)
+    ///             ...
+    ///             return self.opimpl_getarrayitem_gc_i(arraybox, indexbox, adescr)
+    ///         self.metainterp.check_synchronized_virtualizable()
+    ///         index = self._get_arrayitem_vable_index(pc, fdescr, indexbox)
+    ///         return self.metainterp.virtualizable_boxes[index]
     pub fn vable_getarrayitem_int_indexed(
         &mut self,
         vable_opref: OpRef,
         index: OpRef,
         array_field_offset: usize,
     ) -> OpRef {
+        if self.is_nonstandard_virtualizable(vable_opref) {
+            // arraybox = self.opimpl_getfield_gc_r(box, fdescr)
+            // return self.opimpl_getarrayitem_gc_i(arraybox, indexbox, adescr)
+            let array_opref = self.vable_getfield_ref(vable_opref, array_field_offset);
+            return self.vable_getarrayitem_int(array_opref, index);
+        }
+        // self.metainterp.check_synchronized_virtualizable() — no-op in pyre.
+        // index = self._get_arrayitem_vable_index(pc, fdescr, indexbox)
+        // return self.metainterp.virtualizable_boxes[index]
         if let Some(item_index) = self
             .const_value(index)
             .and_then(|value| usize::try_from(value).ok())
         {
-            if !self.is_nonstandard_virtualizable(vable_opref) {
-                if let Some(flat_idx) = self.vable_array_flat_index(array_field_offset, item_index)
-                {
-                    if let Some(boxes) = &self.virtualizable_boxes {
-                        return boxes[flat_idx];
-                    }
+            if let Some(flat_idx) = self.vable_array_flat_index(array_field_offset, item_index) {
+                if let Some(boxes) = &self.virtualizable_boxes {
+                    return boxes[flat_idx];
                 }
             }
+            // Fallback: vable layout missing — go through getfield + arrayitem.
             let array_opref = self.vable_getfield_ref(vable_opref, array_field_offset);
             return self.vable_getarrayitem_int_vable(array_opref, array_field_offset, item_index);
         }
+        // RPython asserts indexbox.getint() returns a constant via
+        // `implement_guard_value`; pyre's non-constant index path here is
+        // a pyre extension. Fall back to the heap-array read.
         let array_opref = self.vable_getfield_ref(vable_opref, array_field_offset);
         self.vable_getarrayitem_int(array_opref, index)
     }
@@ -1343,23 +1399,25 @@ impl TraceCtx {
         self.record_op(OpCode::GetarrayitemGcR, &[array_opref, index, zero])
     }
 
-    /// Virtualizable array ref item read with an index OpRef.
+    /// pyjitpl.py:1218-1234 `_opimpl_getarrayitem_vable` — ref variant
+    /// (`opimpl_getarrayitem_vable_r = _opimpl_getarrayitem_vable`).
     pub fn vable_getarrayitem_ref_indexed(
         &mut self,
         vable_opref: OpRef,
         index: OpRef,
         array_field_offset: usize,
     ) -> OpRef {
+        if self.is_nonstandard_virtualizable(vable_opref) {
+            let array_opref = self.vable_getfield_ref(vable_opref, array_field_offset);
+            return self.vable_getarrayitem_ref(array_opref, index);
+        }
         if let Some(item_index) = self
             .const_value(index)
             .and_then(|value| usize::try_from(value).ok())
         {
-            if !self.is_nonstandard_virtualizable(vable_opref) {
-                if let Some(flat_idx) = self.vable_array_flat_index(array_field_offset, item_index)
-                {
-                    if let Some(boxes) = &self.virtualizable_boxes {
-                        return boxes[flat_idx];
-                    }
+            if let Some(flat_idx) = self.vable_array_flat_index(array_field_offset, item_index) {
+                if let Some(boxes) = &self.virtualizable_boxes {
+                    return boxes[flat_idx];
                 }
             }
             let array_opref = self.vable_getfield_ref(vable_opref, array_field_offset);
@@ -1386,23 +1444,25 @@ impl TraceCtx {
         self.record_op(OpCode::GetarrayitemGcF, &[array_opref, index, zero])
     }
 
-    /// Virtualizable array float item read with an index OpRef.
+    /// pyjitpl.py:1218-1234 `_opimpl_getarrayitem_vable` — float variant
+    /// (`opimpl_getarrayitem_vable_f = _opimpl_getarrayitem_vable`).
     pub fn vable_getarrayitem_float_indexed(
         &mut self,
         vable_opref: OpRef,
         index: OpRef,
         array_field_offset: usize,
     ) -> OpRef {
+        if self.is_nonstandard_virtualizable(vable_opref) {
+            let array_opref = self.vable_getfield_ref(vable_opref, array_field_offset);
+            return self.vable_getarrayitem_float(array_opref, index);
+        }
         if let Some(item_index) = self
             .const_value(index)
             .and_then(|value| usize::try_from(value).ok())
         {
-            if !self.is_nonstandard_virtualizable(vable_opref) {
-                if let Some(flat_idx) = self.vable_array_flat_index(array_field_offset, item_index)
-                {
-                    if let Some(boxes) = &self.virtualizable_boxes {
-                        return boxes[flat_idx];
-                    }
+            if let Some(flat_idx) = self.vable_array_flat_index(array_field_offset, item_index) {
+                if let Some(boxes) = &self.virtualizable_boxes {
+                    return boxes[flat_idx];
                 }
             }
             let array_opref = self.vable_getfield_ref(vable_opref, array_field_offset);
@@ -1438,7 +1498,18 @@ impl TraceCtx {
         self.record_op(OpCode::SetarrayitemGc, &[array_opref, index, value, zero]);
     }
 
-    /// Virtualizable array item write with an index OpRef.
+    /// pyjitpl.py:1236-1247 `_opimpl_setarrayitem_vable(box, indexbox, valuebox, fdescr, adescr, pc)`.
+    ///
+    ///     def _opimpl_setarrayitem_vable(self, box, indexbox, valuebox,
+    ///                                    fdescr, adescr, pc):
+    ///         if self._nonstandard_virtualizable(pc, box, fdescr):
+    ///             arraybox = self.opimpl_getfield_gc_r(box, fdescr)
+    ///             self._opimpl_setarrayitem_gc_any(arraybox, indexbox, valuebox,
+    ///                                              adescr)
+    ///             return
+    ///         index = self._get_arrayitem_vable_index(pc, fdescr, indexbox)
+    ///         self.metainterp.virtualizable_boxes[index] = valuebox
+    ///         self.metainterp.synchronize_virtualizable()
     pub fn vable_setarrayitem_indexed(
         &mut self,
         vable_opref: OpRef,
@@ -1446,16 +1517,20 @@ impl TraceCtx {
         array_field_offset: usize,
         value: OpRef,
     ) {
+        if self.is_nonstandard_virtualizable(vable_opref) {
+            let array_opref = self.vable_getfield_ref(vable_opref, array_field_offset);
+            self.vable_setarrayitem(array_opref, index, value);
+            return;
+        }
         if let Some(item_index) = self
             .const_value(index)
             .and_then(|raw| usize::try_from(raw).ok())
         {
-            if !self.is_nonstandard_virtualizable(vable_opref) {
-                if let Some(idx) = self.vable_array_flat_index(array_field_offset, item_index) {
-                    if let Some(boxes) = &mut self.virtualizable_boxes {
-                        boxes[idx] = value;
-                        return;
-                    }
+            if let Some(idx) = self.vable_array_flat_index(array_field_offset, item_index) {
+                if let Some(boxes) = &mut self.virtualizable_boxes {
+                    boxes[idx] = value;
+                    // self.metainterp.synchronize_virtualizable() — no-op in pyre.
+                    return;
                 }
             }
             let array_opref = self.vable_getfield_ref(vable_opref, array_field_offset);
@@ -1466,22 +1541,38 @@ impl TraceCtx {
         self.vable_setarrayitem(array_opref, index, value);
     }
 
-    /// Virtualizable array length.
+    /// pyjitpl.py:1253-1263 `opimpl_arraylen_vable(box, fdescr, adescr, pc)`.
     ///
-    /// Standard virtualizable reads the cached array length directly.
-    /// Nonstandard virtualizable falls back to heap array length.
+    ///     def opimpl_arraylen_vable(self, box, fdescr, adescr, pc):
+    ///         if self._nonstandard_virtualizable(pc, box, fdescr):
+    ///             arraybox = self.opimpl_getfield_gc_r(box, fdescr)
+    ///             return self.opimpl_arraylen_gc(arraybox, adescr)
+    ///         vinfo = self.metainterp.jitdriver_sd.virtualizable_info
+    ///         virtualizable_box = self.metainterp.virtualizable_boxes[-1]
+    ///         virtualizable = vinfo.unwrap_virtualizable_box(virtualizable_box)
+    ///         arrayindex = vinfo.array_field_by_descrs[fdescr]
+    ///         result = vinfo.get_array_length(virtualizable, arrayindex)
+    ///         return ConstInt(result)
     pub fn vable_arraylen_vable(&mut self, vable_opref: OpRef, array_field_offset: usize) -> OpRef {
-        if !self.is_nonstandard_virtualizable(vable_opref) {
-            if let (Some(info), Some(lengths)) =
-                (&self.virtualizable_info, &self.virtualizable_array_lengths)
-            {
-                if let Some(array_idx) = info.array_field_index(array_field_offset) {
-                    if let Some(&length) = lengths.get(array_idx) {
-                        return self.const_int(length as i64);
-                    }
+        if self.is_nonstandard_virtualizable(vable_opref) {
+            // arraybox = self.opimpl_getfield_gc_r(box, fdescr)
+            // return self.opimpl_arraylen_gc(arraybox, adescr)
+            let array_opref = self.vable_getfield_ref(vable_opref, array_field_offset);
+            return self.record_op(OpCode::ArraylenGc, &[array_opref]);
+        }
+        // arrayindex = vinfo.array_field_by_descrs[fdescr]
+        // result = vinfo.get_array_length(virtualizable, arrayindex)
+        // return ConstInt(result)
+        if let (Some(info), Some(lengths)) =
+            (&self.virtualizable_info, &self.virtualizable_array_lengths)
+        {
+            if let Some(array_idx) = info.array_field_index(array_field_offset) {
+                if let Some(&length) = lengths.get(array_idx) {
+                    return self.const_int(length as i64);
                 }
             }
         }
+        // Fallback when the layout is unavailable.
         let array_opref = self.vable_getfield_ref(vable_opref, array_field_offset);
         self.record_op(OpCode::ArraylenGc, &[array_opref])
     }
