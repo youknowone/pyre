@@ -2049,10 +2049,9 @@ fn import_single_value(
         }
         VirtualStateInfo::IntBounded(bound) => {
             // RPython virtualstate.py NotVirtualStateInfoInt: propagate
-            // IntBound info so the IntBounds pass can intersect with it.
-            // This tells the body optimizer that this value is a raw int,
-            // preventing it from being treated as a boxed Ref.
-            ctx.imported_int_bounds.insert(opref, bound.clone());
+            // IntBound info onto the box's _forwarded slot so the IntBounds
+            // pass naturally sees it via getintbound (optimizer.py:99-113).
+            ctx.setintbound(opref, bound);
         }
         VirtualStateInfo::Unknown => {
             // Nothing to import.
