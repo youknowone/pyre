@@ -200,9 +200,6 @@ pub struct Optimizer {
     /// RPython unroll.py: `label_args = import_state(...)`.
     /// The peeled loop's LABEL must use these args, not the phase-1 end_args.
     pub imported_label_args: Option<Vec<OpRef>>,
-    /// Local slot-map needed because majit assembles the peeled trace from a
-    /// slot-indexed body trace. RPython keeps forwarded boxes directly.
-    pub imported_label_source_slots: Option<Vec<OpRef>>,
     /// simplify.py: patchguardop recorded from GUARD_FUTURE_CONDITION.
     pub patchguardop: Option<Op>,
     /// RPython: propagate_all_forward(trace, flush=False) for Phase 2.
@@ -1041,7 +1038,6 @@ impl Optimizer {
             imported_short_preamble: None,
             imported_short_preamble_builder: None,
             imported_label_args: None,
-            imported_label_source_slots: None,
             patchguardop: None,
             skip_flush: false,
             terminal_op: None,
@@ -1631,7 +1627,6 @@ impl Optimizer {
             self.trace_inputarg_types = vec![majit_ir::Type::Ref; num_inputs];
         }
         self.imported_label_args = None;
-        self.imported_label_source_slots = None;
         self.terminal_op = None;
         // RPython parity: each optimizer run is a fresh Optimizer instance.
         // In pyre we reuse the same Optimizer, so clear per-run state.
@@ -1825,14 +1820,6 @@ impl Optimizer {
                 self,
                 &mut ctx,
             );
-            // majit-only sibling: derive the per-non-virtual inputarg
-            // source-slot array used by `assemble_peeled_trace_with_jump_args`
-            // to map body source references back onto LABEL slots.
-            let source_slots = crate::optimizeopt::unroll::make_imported_label_source_slots(
-                &targetargs,
-                exported_state,
-                &ctx,
-            );
             if crate::optimizeopt::majit_log_enabled() {
                 if let Some((base, ref sa)) = ctx.imported_virtual_args {
                     eprintln!(
@@ -1844,7 +1831,6 @@ impl Optimizer {
                 }
             }
             self.imported_label_args = Some(label_args);
-            self.imported_label_source_slots = Some(source_slots);
         }
         // Restore the temporarily-taken imported_loop_state.
         self.imported_loop_state = imported_loop_state_taken;
