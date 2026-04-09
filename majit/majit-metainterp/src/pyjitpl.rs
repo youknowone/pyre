@@ -1488,23 +1488,46 @@ impl<M: Clone> MetaInterp<M> {
             .as_ref()
             .and_then(|ctx| ctx.standard_virtualizable_box());
         if let Some(standard_box) = standard_box_opt {
-            let (ptr_eq_op, zero_const) = {
+            let isstandard = {
                 let ctx = self
                     .tracing
                     .as_mut()
                     .expect("nonstandard_virtualizable requires active tracing");
-                let ptr_eq_op = ctx.record_op(OpCode::PtrEq, &[vable_opref, standard_box]);
-                // implement_guard_value(eqbox, pc) → GUARD_VALUE(eqbox, 0).
-                // The expected value encodes the Step-3-fall-through case:
-                // pyre never creates aliases, so the concrete PTR_EQ result
-                // is known to be false here.
-                let zero = ctx.const_int(0);
-                ctx.record_guard(OpCode::GuardValue, &[ptr_eq_op, zero], 0);
-                (ptr_eq_op, zero)
+                // execute_and_record(rop.PTR_EQ, None, box, standard_box)
+                let eqbox = ctx.record_op(OpCode::PtrEq, &[vable_opref, standard_box]);
+                // eqbox = self.implement_guard_value(eqbox, pc)
+                //
+                // RPython reads the runtime PTR_EQ result via `eqbox.getint()`
+                // after `implement_guard_value` promotes it to a Const. In
+                // pyre's architecture each OpRef is the unique trace identity
+                // for its live concrete pointer — Step 3 above already
+                // returned `false` on identity match — so any vable_opref
+                // reaching this point structurally cannot equal `standard_box`
+                // at runtime. Encode the architectural invariant by
+                // promoting `eqbox` to `ConstInt(0)` via GUARD_VALUE; if a
+                // future caller synthesizes an alias OpRef, the runtime
+                // guard fails and triggers a bridge instead of silently
+                // misclassifying the box.
+                let isstandard: i64 = 0;
+                let const_isstandard = ctx.const_int(isstandard);
+                ctx.record_guard(OpCode::GuardValue, &[eqbox, const_isstandard], 0);
+                isstandard
             };
-            let _ = (ptr_eq_op, zero_const);
-            // isstandard == 0 (by construction), so skip the replace_box
-            // short-circuit and fall through to Step 5.
+            // pyjitpl.py:1139-1142:
+            //     if isstandard:
+            //         if box.type == 'r':
+            //             self.metainterp.replace_box(box, standard_box)
+            //         return False
+            //
+            // `box.type == 'r'` is always true here — virtualizables are
+            // always Ref-typed. The branch is structurally dead under
+            // pyre's architectural invariant (see comment above) but is
+            // emitted line-by-line so a future alias path lights it up.
+            #[allow(unreachable_code)]
+            if isstandard != 0 {
+                self.replace_box(vable_opref, standard_box);
+                return false;
+            }
         }
         // Step 5a: emit_force_virtualizable.
         //     if not self.metainterp.heapcache.is_unescaped(box):
@@ -1559,6 +1582,63 @@ impl<M: Clone> MetaInterp<M> {
                 .nonstandard_virtualizables_now_known(vable_opref);
         }
         true
+    }
+
+    /// pyjitpl.py:3499-3512 `MetaInterp.replace_box(oldbox, newbox)`.
+    ///
+    ///     def replace_box(self, oldbox, newbox):
+    ///         for frame in self.framestack:
+    ///             frame.replace_active_box_in_frame(oldbox, newbox)
+    ///         boxes = self.virtualref_boxes
+    ///         for i in range(len(boxes)):
+    ///             if boxes[i] is oldbox:
+    ///                 boxes[i] = newbox
+    ///         if (self.jitdriver_sd.virtualizable_info is not None or
+    ///             self.jitdriver_sd.greenfield_info is not None):
+    ///             boxes = self.virtualizable_boxes
+    ///             for i in range(len(boxes)):
+    ///                 if boxes[i] is oldbox:
+    ///                     boxes[i] = newbox
+    ///         self.heapcache.replace_box(oldbox, newbox)
+    ///
+    /// RPython rewrites every place where `oldbox` may appear during
+    /// tracing — frame registers, virtualref pairs, the standard
+    /// virtualizable box array, and the heap cache — and does so
+    /// eagerly so subsequent tracing-time queries see the new identity.
+    ///
+    /// pyre's frame registers (PyreSym) live inside the jitcode machine
+    /// driver and are not reachable from MetaInterp during tracing; the
+    /// in-flight trace ops are rewritten as a deferred batch via
+    /// `TraceCtx::replace_op` queued by this method, and the
+    /// virtualref/virtualizable/heap-cache walks are run eagerly here so
+    /// the next call into Step 1 of `nonstandard_virtualizable` (or any
+    /// other heapcache query) observes the new OpRef.
+    pub fn replace_box(&mut self, oldbox: OpRef, newbox: OpRef) {
+        // pyjitpl.py:3500-3501: for frame in self.framestack:
+        //                          frame.replace_active_box_in_frame(...)
+        //
+        // pyre defers the per-frame symbolic register rewrite into the
+        // recorder via `TraceCtx::replace_op` (the queue is flushed at
+        // trace finalization in `apply_replacements`). The jitcode
+        // machine's PyreSym frames are not reachable from MetaInterp
+        // and are kept consistent by the deferred recorder pass.
+        //
+        // pyjitpl.py:3502-3505: virtualref_boxes walk
+        for slot in self.virtualref_boxes.iter_mut() {
+            if slot.0 == oldbox {
+                slot.0 = newbox;
+            }
+        }
+        if let Some(ctx) = self.tracing.as_mut() {
+            // pyjitpl.py:3506-3511: virtualizable_boxes walk
+            ctx.replace_box_in_virtualizable_boxes(oldbox, newbox);
+            // pyjitpl.py:3512: self.heapcache.replace_box(oldbox, newbox)
+            ctx.heap_cache_mut().replace_box(oldbox, newbox);
+            // Queue the deferred recorder rewrite (pyre-only — RPython's
+            // frame.replace_active_box_in_frame is the eager equivalent;
+            // pyre flushes via TraceCtx::apply_replacements at finalization).
+            ctx.replace_op(oldbox, newbox);
+        }
     }
 
     fn virtualizable_field_index(&self, field_offset: usize) -> Option<usize> {
@@ -8243,7 +8323,13 @@ mod tests {
         let ctx = meta.trace_ctx().unwrap();
         let boxes = ctx.collect_virtualizable_boxes().unwrap();
         assert_eq!(boxes[0], new_val);
-        assert_eq!(ctx.recorder.num_ops(), 2);
+        // pyjitpl.py:1189-1194 _opimpl_setfield_vable for STANDARD
+        // virtualizables only updates the cached box and calls
+        // synchronize_virtualizable, which writes back into the
+        // virtualizable struct via `vinfo.write_boxes` WITHOUT recording
+        // any trace ops (RPython pyjitpl.py:3446-3450). The trace stays
+        // empty until a non-virtualizable op is recorded.
+        assert_eq!(ctx.recorder.num_ops(), 0);
     }
 
     #[test]
@@ -8299,9 +8385,21 @@ mod tests {
         };
         let _result = meta.opimpl_getfield_vable_int(nonstandard_vable, 8);
 
+        // pyjitpl.py:1120-1146 _nonstandard_virtualizable falls through
+        // to Step 4 (PTR_EQ + implement_guard_value) and Step 5a
+        // (emit_force_virtualizable: GETFIELD_GC_R(token_descr) +
+        // PTR_NE(CONST_NULL) + COND_CALL) before Step 5b marks the box
+        // known. The COND_CALL tail is currently a TODO; the observable
+        // prefix is the four ops emitted by `nonstandard_virtualizable`,
+        // followed by the caller's GETFIELD_GC_I (the actual non-vable
+        // field read).
         let ops = take_recorded_ops(&mut meta);
-        assert_eq!(ops.len(), 1);
-        assert_eq!(ops[0].opcode, OpCode::GetfieldGcI);
+        assert_eq!(ops.len(), 5);
+        assert_eq!(ops[0].opcode, OpCode::PtrEq); // Step 4: PTR_EQ
+        assert_eq!(ops[1].opcode, OpCode::GuardValue); // Step 4: implement_guard_value
+        assert_eq!(ops[2].opcode, OpCode::GetfieldGcR); // Step 5a: token_descr read
+        assert_eq!(ops[3].opcode, OpCode::PtrNe); // Step 5a: PTR_NE(CONST_NULL)
+        assert_eq!(ops[4].opcode, OpCode::GetfieldGcI); // caller fallback
     }
 
     #[test]
@@ -8320,10 +8418,20 @@ mod tests {
         };
         let _result = meta.opimpl_getarrayitem_vable_int(nonstandard_vable, index, 24);
 
+        // pyjitpl.py:1219-1230 _opimpl_getarrayitem_vable falls back to
+        // GETFIELD_GC_R(arraydescr) + GETARRAYITEM_GC_I(arraybox) when
+        // _nonstandard_virtualizable returns True. The four ops emitted
+        // by `_nonstandard_virtualizable` (Step 4 PTR_EQ + GUARD_VALUE
+        // and Step 5a GETFIELD_GC_R(token_descr) + PTR_NE) precede the
+        // caller's two-op fallback, totalling 6 ops.
         let ops = take_recorded_ops(&mut meta);
-        assert_eq!(ops.len(), 2);
-        assert_eq!(ops[0].opcode, OpCode::GetfieldGcR);
-        assert_eq!(ops[1].opcode, OpCode::GetarrayitemGcI);
+        assert_eq!(ops.len(), 6);
+        assert_eq!(ops[0].opcode, OpCode::PtrEq); // Step 4: PTR_EQ
+        assert_eq!(ops[1].opcode, OpCode::GuardValue); // Step 4: implement_guard_value
+        assert_eq!(ops[2].opcode, OpCode::GetfieldGcR); // Step 5a: token_descr read
+        assert_eq!(ops[3].opcode, OpCode::PtrNe); // Step 5a: PTR_NE(CONST_NULL)
+        assert_eq!(ops[4].opcode, OpCode::GetfieldGcR); // caller fallback: arraybox
+        assert_eq!(ops[5].opcode, OpCode::GetarrayitemGcI); // caller fallback: item read
     }
 
     #[test]
