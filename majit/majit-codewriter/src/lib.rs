@@ -15,6 +15,7 @@ pub mod call;
 mod codegen;
 pub mod codewriter;
 pub mod front;
+pub mod handler_spec;
 pub mod hints;
 pub mod inline;
 pub mod liveness;

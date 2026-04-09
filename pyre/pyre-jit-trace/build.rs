@@ -84,21 +84,37 @@ fn main() {
     // `pub mod generated`). Trait impls would conflict (E0119) under double
     // inclusion, so they live in their own file included only once.
     //
-    // The source-of-truth is `src/opcode_handler_impls.template.rs` — a
-    // hand-maintained transcription of what trace_opcode.rs used to contain.
-    // build.rs copies it verbatim into OUT_DIR; `tests/trait_impls_snapshot.rs`
-    // guards against drift. Future phases will replace the template with
-    // codegen-derived content, but the include path stays the same.
-    let template_path = format!("{manifest_dir}/src/opcode_handler_impls.template.rs");
-    let trait_impls_code = std::fs::read_to_string(&template_path).unwrap_or_else(|e| {
-        panic!("[pyre-jit-trace build.rs] cannot read {template_path}: {e}");
+    // Assembled from THREE pieces (Phase B of the eval-loop automation plan):
+    //   1. `opcode_handler_impls_pre.template.rs` — header + variant
+    //      `SharedOpcodeHandler` impl (transcription).
+    //   2. `majit_codewriter::handler_spec::emit_simple_trait_impls()` —
+    //      the 5 simple traits (Constant/Stack/Truth/Iter/Local), emitted
+    //      from the spec table in majit-codewriter/src/handler_spec.rs.
+    //   3. `opcode_handler_impls_post.template.rs` — remaining variant
+    //      `ControlFlow/Branch/Namespace/Arithmetic` impls (transcription).
+    //
+    // `tests/trait_impls_snapshot.rs` guards against drift by comparing the
+    // assembled output against a checked-in snapshot.
+    let pre_path = format!("{manifest_dir}/src/opcode_handler_impls_pre.template.rs");
+    let post_path = format!("{manifest_dir}/src/opcode_handler_impls_post.template.rs");
+    let pre = std::fs::read_to_string(&pre_path).unwrap_or_else(|e| {
+        panic!("[pyre-jit-trace build.rs] cannot read {pre_path}: {e}");
     });
+    let post = std::fs::read_to_string(&post_path).unwrap_or_else(|e| {
+        panic!("[pyre-jit-trace build.rs] cannot read {post_path}: {e}");
+    });
+    let simple = majit_codewriter::handler_spec::emit_simple_trait_impls();
+    // pre ends with `}\n\n` (Shared close + blank), simple ends with `}\n`,
+    // post starts with `\n` (blank). Concat = `...}\n\nimpl Constant...}\n\nimpl ControlFlow...`
+    // which matches the original single-template structure byte-for-byte.
+    let trait_impls_code = format!("{pre}{simple}{post}");
     std::fs::write(
         format!("{out_dir}/jit_trace_trait_impls.rs"),
         &trait_impls_code,
     )
     .unwrap();
-    println!("cargo::rerun-if-changed={template_path}");
+    println!("cargo::rerun-if-changed={pre_path}");
+    println!("cargo::rerun-if-changed={post_path}");
 
     // JSON metadata for debugging
     let json = serde_json::to_string_pretty(&pipeline).unwrap();
