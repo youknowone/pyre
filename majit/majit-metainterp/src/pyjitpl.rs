@@ -1387,202 +1387,17 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     // ── RPython opimpl_* equivalents for virtualizable ──────────────
-
-    fn is_standard_virtualizable(&self, vable_opref: OpRef) -> bool {
-        self.tracing
-            .as_ref()
-            .and_then(|ctx| ctx.standard_virtualizable_box())
-            .is_some_and(|standard| standard == vable_opref)
-    }
-
-    /// pyjitpl.py:1120-1146 `_nonstandard_virtualizable(pc, box, fielddescr)`.
-    ///
-    ///     def _nonstandard_virtualizable(self, pc, box, fielddescr):
-    ///         # returns True if 'box' is actually not the "standard" virtualizable
-    ///         # that is stored in metainterp.virtualizable_boxes[-1]
-    ///         if self.metainterp.heapcache.is_known_nonstandard_virtualizable(box):
-    ///             self.metainterp.staticdata.profiler.count_ops(rop.PTR_EQ, Counters.HEAPCACHED_OPS)
-    ///             return True
-    ///         if box is self.metainterp.forced_virtualizable:
-    ///             self.metainterp.forced_virtualizable = None
-    ///         if (self.metainterp.jitdriver_sd.virtualizable_info is not None or
-    ///             self.metainterp.jitdriver_sd.greenfield_info is not None):
-    ///             standard_box = self.metainterp.virtualizable_boxes[-1]
-    ///             if standard_box is box:
-    ///                 return False
-    ///             vinfo = self.metainterp.jitdriver_sd.virtualizable_info
-    ///             if vinfo is fielddescr.get_vinfo():
-    ///                 eqbox = self.metainterp.execute_and_record(rop.PTR_EQ, None,
-    ///                                                            box, standard_box)
-    ///                 eqbox = self.implement_guard_value(eqbox, pc)
-    ///                 isstandard = eqbox.getint()
-    ///                 if isstandard:
-    ///                     if box.type == 'r':
-    ///                         self.metainterp.replace_box(box, standard_box)
-    ///                     return False
-    ///         if not self.metainterp.heapcache.is_unescaped(box):
-    ///             self.emit_force_virtualizable(fielddescr, box)
-    ///         self.metainterp.heapcache.nonstandard_virtualizables_now_known(box)
-    ///         return True
-    fn nonstandard_virtualizable(&mut self, vable_opref: OpRef) -> bool {
-        // Step 1: heapcache short-circuit.
-        //     if self.metainterp.heapcache.is_known_nonstandard_virtualizable(box):
-        //         return True
-        if let Some(ctx) = self.tracing.as_ref() {
-            if ctx
-                .heap_cache()
-                .is_known_nonstandard_virtualizable(vable_opref)
-            {
-                return true;
-            }
-        }
-        // Step 2: forced_virtualizable reset on identity.
-        //     if box is self.metainterp.forced_virtualizable:
-        //         self.metainterp.forced_virtualizable = None
-        if let Some(ctx) = self.tracing.as_mut() {
-            if ctx.forced_virtualizable() == Some(vable_opref) {
-                ctx.set_forced_virtualizable(None);
-            }
-        }
-        // Step 3: standard_box identity check.
-        //     standard_box = self.metainterp.virtualizable_boxes[-1]
-        //     if standard_box is box:
-        //         return False
-        if self.virtualizable_info.is_some() && self.is_standard_virtualizable(vable_opref) {
-            return false;
-        }
-        // Step 4: PTR_EQ + implement_guard_value + replace_box.
-        //     vinfo = self.metainterp.jitdriver_sd.virtualizable_info
-        //     if vinfo is fielddescr.get_vinfo():
-        //         eqbox = self.metainterp.execute_and_record(
-        //             rop.PTR_EQ, None, box, standard_box)
-        //         eqbox = self.implement_guard_value(eqbox, pc)
-        //         isstandard = eqbox.getint()
-        //         if isstandard:
-        //             if box.type == 'r':
-        //                 self.metainterp.replace_box(box, standard_box)
-        //             return False
-        //
-        // pyre has only one virtualizable (the PyFrame), so
-        // `vinfo is fielddescr.get_vinfo()` is always true on reach.
-        //
-        // pyre's runtime paths only invoke `nonstandard_virtualizable`
-        // with the standard vable OpRef (the jitcode machine walks
-        // `standard_vable_field_offset` / `standard_vable_array_offset`,
-        // both of which return `ctx.standard_virtualizable_box()`), so
-        // reaching Step 4 requires a caller that synthesizes an alias
-        // OpRef distinct from the standard box. No such caller exists
-        // today, which leaves Step 4 structurally dead.
-        //
-        // Still, emit the PTR_EQ + GUARD_VALUE + replace_box sequence so
-        // the shape matches RPython's `_nonstandard_virtualizable` and a
-        // future MetaInterp-driven vable opcode path gets the correct
-        // identity-promotion semantics for free. The concrete guard value
-        // is assumed to be 0 (not equal) because (a) Step 3 already ruled
-        // out the standard OpRef and (b) pyre architecturally does not
-        // create alias boxes to the standard virtualizable. If an alias
-        // path is added later, the runtime GUARD_VALUE will fail and
-        // trigger a bridge rather than silently misclassifying the box.
-        let standard_box_opt = self
-            .tracing
-            .as_ref()
-            .and_then(|ctx| ctx.standard_virtualizable_box());
-        if let Some(standard_box) = standard_box_opt {
-            let isstandard = {
-                let ctx = self
-                    .tracing
-                    .as_mut()
-                    .expect("nonstandard_virtualizable requires active tracing");
-                // execute_and_record(rop.PTR_EQ, None, box, standard_box)
-                let eqbox = ctx.record_op(OpCode::PtrEq, &[vable_opref, standard_box]);
-                // eqbox = self.implement_guard_value(eqbox, pc)
-                //
-                // RPython reads the runtime PTR_EQ result via `eqbox.getint()`
-                // after `implement_guard_value` promotes it to a Const. In
-                // pyre's architecture each OpRef is the unique trace identity
-                // for its live concrete pointer — Step 3 above already
-                // returned `false` on identity match — so any vable_opref
-                // reaching this point structurally cannot equal `standard_box`
-                // at runtime. Encode the architectural invariant by
-                // promoting `eqbox` to `ConstInt(0)` via GUARD_VALUE; if a
-                // future caller synthesizes an alias OpRef, the runtime
-                // guard fails and triggers a bridge instead of silently
-                // misclassifying the box.
-                let isstandard: i64 = 0;
-                let const_isstandard = ctx.const_int(isstandard);
-                ctx.record_guard(OpCode::GuardValue, &[eqbox, const_isstandard], 0);
-                isstandard
-            };
-            // pyjitpl.py:1139-1142:
-            //     if isstandard:
-            //         if box.type == 'r':
-            //             self.metainterp.replace_box(box, standard_box)
-            //         return False
-            //
-            // `box.type == 'r'` is always true here — virtualizables are
-            // always Ref-typed. The branch is structurally dead under
-            // pyre's architectural invariant (see comment above) but is
-            // emitted line-by-line so a future alias path lights it up.
-            #[allow(unreachable_code)]
-            if isstandard != 0 {
-                self.replace_box(vable_opref, standard_box);
-                return false;
-            }
-        }
-        // Step 5a: emit_force_virtualizable.
-        //     if not self.metainterp.heapcache.is_unescaped(box):
-        //         self.emit_force_virtualizable(fielddescr, box)
-        //
-        //     def emit_force_virtualizable(self, fielddescr, box):
-        //         vinfo = fielddescr.get_vinfo()
-        //         token_descr = vinfo.vable_token_descr
-        //         tokenbox = mi.execute_and_record(
-        //             rop.GETFIELD_GC_R, token_descr, box)
-        //         condbox = mi.execute_and_record(
-        //             rop.PTR_NE, None, tokenbox, CONST_NULL)
-        //         funcbox = ConstInt(rffi.cast(Signed, vinfo.clear_vable_ptr))
-        //         self.execute_varargs(
-        //             rop.COND_CALL, [condbox, funcbox, box],
-        //             vinfo.clear_vable_descr, False, False)
-        //
-        // pyre does not yet register a `clear_vable_ptr` runtime helper
-        // or the matching COND_CALL descriptor on VirtualizableInfo, so
-        // the full sequence cannot be emitted without dead function
-        // pointers. Port the observable prefix (GETFIELD_GC_R + PTR_NE
-        // against CONST_NULL) so the heap cache / optimizer see the same
-        // shape RPython produces, and leave the COND_CALL tail as a
-        // TODO. When `clear_vable_ptr` lands, wrap the tail here under
-        // a `vinfo.clear_vable_descr()` check.
-        let needs_force = self
-            .tracing
-            .as_ref()
-            .map(|ctx| !ctx.heap_cache().is_unescaped(vable_opref))
-            .unwrap_or(false);
-        if needs_force {
-            if let Some(info) = self.virtualizable_info.clone() {
-                let token_descr = info.token_field_descr();
-                if let Some(ctx) = self.tracing.as_mut() {
-                    // tokenbox = GETFIELD_GC_R(box, token_descr)
-                    let tokenbox =
-                        ctx.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], token_descr);
-                    // condbox = PTR_NE(tokenbox, CONST_NULL)
-                    let null_ref = ctx.const_null();
-                    let _condbox = ctx.record_op(OpCode::PtrNe, &[tokenbox, null_ref]);
-                    // TODO(vable-locals epic): emit COND_CALL(condbox,
-                    // funcbox=clear_vable_ptr, box) once VirtualizableInfo
-                    // carries a clear_vable_descr + function pointer.
-                }
-            }
-        }
-        // Step 5b: mark this box as a known nonstandard virtualizable so
-        // future accesses short-circuit at Step 1.
-        //     self.metainterp.heapcache.nonstandard_virtualizables_now_known(box)
-        if let Some(ctx) = self.tracing.as_mut() {
-            ctx.heap_cache_mut()
-                .nonstandard_virtualizables_now_known(vable_opref);
-        }
-        true
-    }
+    //
+    // pyjitpl.py:1120-1146 `_nonstandard_virtualizable(pc, box, fielddescr)`
+    // is implemented in `TraceCtx::is_nonstandard_virtualizable` with the
+    // full Step 1..5b shape; the opimpl_*_vable thin wrappers below forward
+    // to `TraceCtx::vable_*` which are the line-by-line port of RPython's
+    // `opimpl_*_vable` opcode handlers. The earlier `MetaInterp` duplicate
+    // (with its own `is_standard_virtualizable` / `nonstandard_virtualizable`
+    // / `virtualizable_field_index` / `get_arrayitem_vable_index` /
+    // `check_synchronized_virtualizable` helpers) was a pyre-introduced
+    // duplication of the same logic and has been removed in favour of the
+    // single TraceCtx implementation.
 
     /// pyjitpl.py:3499-3512 `MetaInterp.replace_box(oldbox, newbox)`.
     ///
@@ -1641,38 +1456,6 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
-    fn virtualizable_field_index(&self, field_offset: usize) -> Option<usize> {
-        self.virtualizable_info
-            .as_ref()
-            .and_then(|info| info.static_field_index(field_offset))
-    }
-
-    /// RPython equivalent: `_get_arrayitem_vable_index()`.
-    ///
-    /// Returns the flat index into the standard virtualizable box array.
-    fn get_arrayitem_vable_index(&self, array_field_offset: usize, index: OpRef) -> Option<usize> {
-        let ctx = self.tracing.as_ref()?;
-        let raw_index = ctx.const_value(index)?;
-        let item_index = usize::try_from(raw_index).ok()?;
-        let info = self.virtualizable_info.as_ref()?;
-        let lengths = ctx.virtualizable_array_lengths()?;
-        let array_index = info.array_field_index(array_field_offset)?;
-        Some(info.get_index_in_array(array_index, item_index, lengths))
-    }
-
-    /// RPython equivalent: `check_synchronized_virtualizable()`.
-    ///
-    /// In translated PyPy this is effectively a no-op. Keep the same contract:
-    /// the active tracing state is the source of truth, and debug builds may
-    /// assert that a standard virtualizable has been initialized.
-    pub fn check_synchronized_virtualizable(&self) {
-        if let Some(ctx) = self.tracing.as_ref() {
-            debug_assert!(
-                !ctx.has_virtualizable_boxes() || ctx.standard_virtualizable_box().is_some()
-            );
-        }
-    }
-
     /// pyjitpl.py:3446-3450 `MetaInterp.synchronize_virtualizable()`.
     ///
     ///     def synchronize_virtualizable(self):
@@ -1692,226 +1475,116 @@ impl<M: Clone> MetaInterp<M> {
         // intentionally empty — see doc comment.
     }
 
-    /// RPython equivalent: `opimpl_getfield_vable_i(box, fielddescr, pc)`.
+    /// pyjitpl.py:1167-1172 `opimpl_getfield_vable_i(box, fielddescr, pc)`.
+    /// Thin wrapper that forwards to `TraceCtx::vable_getfield_int`, which
+    /// holds the line-by-line port (`_nonstandard_virtualizable` →
+    /// fallback heap op or `virtualizable_boxes[index]` read).
     pub fn opimpl_getfield_vable_int(&mut self, vable_opref: OpRef, field_offset: usize) -> OpRef {
-        if self.nonstandard_virtualizable(vable_opref) {
-            let ctx = self
-                .tracing
-                .as_mut()
-                .expect("opimpl_getfield_vable_int requires active tracing");
-            let offset_ref = ctx.const_int(field_offset as i64);
-            return ctx.record_op(OpCode::GetfieldGcI, &[vable_opref, offset_ref]);
-        }
-        self.check_synchronized_virtualizable();
-        let index = self
-            .virtualizable_field_index(field_offset)
-            .expect("unknown standard virtualizable field offset");
         self.tracing
-            .as_ref()
-            .and_then(|ctx| ctx.virtualizable_box_at(index))
-            .expect("standard virtualizable box missing")
+            .as_mut()
+            .expect("opimpl_getfield_vable_int requires active tracing")
+            .vable_getfield_int(vable_opref, field_offset)
     }
 
-    /// RPython equivalent: `opimpl_getfield_vable_r(box, fielddescr, pc)`.
+    /// pyjitpl.py:1173-1179 `opimpl_getfield_vable_r(box, fielddescr, pc)`.
     pub fn opimpl_getfield_vable_ref(&mut self, vable_opref: OpRef, field_offset: usize) -> OpRef {
-        if self.nonstandard_virtualizable(vable_opref) {
-            let ctx = self
-                .tracing
-                .as_mut()
-                .expect("opimpl_getfield_vable_ref requires active tracing");
-            let offset_ref = ctx.const_int(field_offset as i64);
-            return ctx.record_op(OpCode::GetfieldGcR, &[vable_opref, offset_ref]);
-        }
-        self.check_synchronized_virtualizable();
-        let index = self
-            .virtualizable_field_index(field_offset)
-            .expect("unknown standard virtualizable field offset");
         self.tracing
-            .as_ref()
-            .and_then(|ctx| ctx.virtualizable_box_at(index))
-            .expect("standard virtualizable box missing")
+            .as_mut()
+            .expect("opimpl_getfield_vable_ref requires active tracing")
+            .vable_getfield_ref(vable_opref, field_offset)
     }
 
-    /// RPython equivalent: `opimpl_getfield_vable_f(box, fielddescr, pc)`.
+    /// pyjitpl.py:1180-1186 `opimpl_getfield_vable_f(box, fielddescr, pc)`.
     pub fn opimpl_getfield_vable_float(
         &mut self,
         vable_opref: OpRef,
         field_offset: usize,
     ) -> OpRef {
-        if self.nonstandard_virtualizable(vable_opref) {
-            let ctx = self
-                .tracing
-                .as_mut()
-                .expect("opimpl_getfield_vable_float requires active tracing");
-            let offset_ref = ctx.const_int(field_offset as i64);
-            return ctx.record_op(OpCode::GetfieldGcF, &[vable_opref, offset_ref]);
-        }
-        self.check_synchronized_virtualizable();
-        let index = self
-            .virtualizable_field_index(field_offset)
-            .expect("unknown standard virtualizable field offset");
         self.tracing
-            .as_ref()
-            .and_then(|ctx| ctx.virtualizable_box_at(index))
-            .expect("standard virtualizable box missing")
+            .as_mut()
+            .expect("opimpl_getfield_vable_float requires active tracing")
+            .vable_getfield_float(vable_opref, field_offset)
     }
 
-    fn opimpl_setfield_vable_any(&mut self, vable_opref: OpRef, field_offset: usize, value: OpRef) {
-        if self.nonstandard_virtualizable(vable_opref) {
-            if let Some(ctx) = self.tracing.as_mut() {
-                let offset_ref = ctx.const_int(field_offset as i64);
-                ctx.record_op(OpCode::SetfieldGc, &[vable_opref, value, offset_ref]);
-            }
-            return;
-        }
-        let index = self
-            .virtualizable_field_index(field_offset)
-            .expect("unknown standard virtualizable field offset");
-        if let Some(ctx) = self.tracing.as_mut() {
-            let updated = ctx.set_virtualizable_box_at(index, value);
-            debug_assert!(updated, "standard virtualizable box missing");
-        }
-        self.synchronize_virtualizable(vable_opref);
-    }
-
-    /// RPython equivalent: `opimpl_setfield_vable_i`.
+    /// pyjitpl.py:1188-1199 `_opimpl_setfield_vable(box, valuebox, fielddescr, pc)`.
     pub fn opimpl_setfield_vable_int(
         &mut self,
         vable_opref: OpRef,
         field_offset: usize,
         value: OpRef,
     ) {
-        self.opimpl_setfield_vable_any(vable_opref, field_offset, value);
+        self.tracing
+            .as_mut()
+            .expect("opimpl_setfield_vable_int requires active tracing")
+            .vable_setfield(vable_opref, field_offset, value);
     }
 
-    /// RPython equivalent: `opimpl_setfield_vable_r`.
+    /// pyjitpl.py:1188-1199 `_opimpl_setfield_vable` — ref variant.
     pub fn opimpl_setfield_vable_ref(
         &mut self,
         vable_opref: OpRef,
         field_offset: usize,
         value: OpRef,
     ) {
-        self.opimpl_setfield_vable_any(vable_opref, field_offset, value);
+        self.tracing
+            .as_mut()
+            .expect("opimpl_setfield_vable_ref requires active tracing")
+            .vable_setfield(vable_opref, field_offset, value);
     }
 
-    /// RPython equivalent: `opimpl_setfield_vable_f`.
+    /// pyjitpl.py:1188-1199 `_opimpl_setfield_vable` — float variant.
     pub fn opimpl_setfield_vable_float(
         &mut self,
         vable_opref: OpRef,
         field_offset: usize,
         value: OpRef,
     ) {
-        self.opimpl_setfield_vable_any(vable_opref, field_offset, value);
+        self.tracing
+            .as_mut()
+            .expect("opimpl_setfield_vable_float requires active tracing")
+            .vable_setfield(vable_opref, field_offset, value);
     }
 
-    /// RPython equivalent: `_opimpl_getarrayitem_vable`.
+    /// pyjitpl.py:1218-1234 `_opimpl_getarrayitem_vable` — int variant.
     pub fn opimpl_getarrayitem_vable_int(
         &mut self,
         vable_opref: OpRef,
         index: OpRef,
         array_field_offset: usize,
     ) -> OpRef {
-        if self.nonstandard_virtualizable(vable_opref) {
-            let ctx = self
-                .tracing
-                .as_mut()
-                .expect("opimpl_getarrayitem_vable_int requires active tracing");
-            let field_ref = ctx.const_int(array_field_offset as i64);
-            let array_opref = ctx.record_op(OpCode::GetfieldGcR, &[vable_opref, field_ref]);
-            let zero = ctx.const_int(0);
-            return ctx.record_op(OpCode::GetarrayitemGcI, &[array_opref, index, zero]);
-        }
-        self.check_synchronized_virtualizable();
-        let flat_index = self
-            .get_arrayitem_vable_index(array_field_offset, index)
-            .expect("standard virtualizable array index must be constant");
         self.tracing
-            .as_ref()
-            .and_then(|ctx| ctx.virtualizable_box_at(flat_index))
-            .expect("standard virtualizable array box missing")
+            .as_mut()
+            .expect("opimpl_getarrayitem_vable_int requires active tracing")
+            .vable_getarrayitem_int_indexed(vable_opref, index, array_field_offset)
     }
 
-    /// RPython equivalent: `_opimpl_getarrayitem_vable`.
+    /// pyjitpl.py:1218-1234 `_opimpl_getarrayitem_vable` — ref variant.
     pub fn opimpl_getarrayitem_vable_ref(
         &mut self,
         vable_opref: OpRef,
         index: OpRef,
         array_field_offset: usize,
     ) -> OpRef {
-        if self.nonstandard_virtualizable(vable_opref) {
-            let ctx = self
-                .tracing
-                .as_mut()
-                .expect("opimpl_getarrayitem_vable_ref requires active tracing");
-            let field_ref = ctx.const_int(array_field_offset as i64);
-            let array_opref = ctx.record_op(OpCode::GetfieldGcR, &[vable_opref, field_ref]);
-            let zero = ctx.const_int(0);
-            return ctx.record_op(OpCode::GetarrayitemGcR, &[array_opref, index, zero]);
-        }
-        self.check_synchronized_virtualizable();
-        let flat_index = self
-            .get_arrayitem_vable_index(array_field_offset, index)
-            .expect("standard virtualizable array index must be constant");
         self.tracing
-            .as_ref()
-            .and_then(|ctx| ctx.virtualizable_box_at(flat_index))
-            .expect("standard virtualizable array box missing")
+            .as_mut()
+            .expect("opimpl_getarrayitem_vable_ref requires active tracing")
+            .vable_getarrayitem_ref_indexed(vable_opref, index, array_field_offset)
     }
 
-    /// RPython equivalent: `_opimpl_getarrayitem_vable`.
+    /// pyjitpl.py:1218-1234 `_opimpl_getarrayitem_vable` — float variant.
     pub fn opimpl_getarrayitem_vable_float(
         &mut self,
         vable_opref: OpRef,
         index: OpRef,
         array_field_offset: usize,
     ) -> OpRef {
-        if self.nonstandard_virtualizable(vable_opref) {
-            let ctx = self
-                .tracing
-                .as_mut()
-                .expect("opimpl_getarrayitem_vable_float requires active tracing");
-            let field_ref = ctx.const_int(array_field_offset as i64);
-            let array_opref = ctx.record_op(OpCode::GetfieldGcR, &[vable_opref, field_ref]);
-            let zero = ctx.const_int(0);
-            return ctx.record_op(OpCode::GetarrayitemGcF, &[array_opref, index, zero]);
-        }
-        self.check_synchronized_virtualizable();
-        let flat_index = self
-            .get_arrayitem_vable_index(array_field_offset, index)
-            .expect("standard virtualizable array index must be constant");
         self.tracing
-            .as_ref()
-            .and_then(|ctx| ctx.virtualizable_box_at(flat_index))
-            .expect("standard virtualizable array box missing")
+            .as_mut()
+            .expect("opimpl_getarrayitem_vable_float requires active tracing")
+            .vable_getarrayitem_float_indexed(vable_opref, index, array_field_offset)
     }
 
-    fn opimpl_setarrayitem_vable_any(
-        &mut self,
-        vable_opref: OpRef,
-        index: OpRef,
-        value: OpRef,
-        array_field_offset: usize,
-    ) {
-        if self.nonstandard_virtualizable(vable_opref) {
-            if let Some(ctx) = self.tracing.as_mut() {
-                let field_ref = ctx.const_int(array_field_offset as i64);
-                let array_opref = ctx.record_op(OpCode::GetfieldGcR, &[vable_opref, field_ref]);
-                let zero = ctx.const_int(0);
-                ctx.record_op(OpCode::SetarrayitemGc, &[array_opref, index, value, zero]);
-            }
-            return;
-        }
-        let flat_index = self
-            .get_arrayitem_vable_index(array_field_offset, index)
-            .expect("standard virtualizable array index must be constant");
-        if let Some(ctx) = self.tracing.as_mut() {
-            let updated = ctx.set_virtualizable_box_at(flat_index, value);
-            debug_assert!(updated, "standard virtualizable array box missing");
-        }
-        self.synchronize_virtualizable(vable_opref);
-    }
-
-    /// RPython equivalent: `_opimpl_setarrayitem_vable`.
+    /// pyjitpl.py:1236-1247 `_opimpl_setarrayitem_vable` — int variant.
     pub fn opimpl_setarrayitem_vable_int(
         &mut self,
         vable_opref: OpRef,
@@ -1919,10 +1592,13 @@ impl<M: Clone> MetaInterp<M> {
         value: OpRef,
         array_field_offset: usize,
     ) {
-        self.opimpl_setarrayitem_vable_any(vable_opref, index, value, array_field_offset);
+        self.tracing
+            .as_mut()
+            .expect("opimpl_setarrayitem_vable_int requires active tracing")
+            .vable_setarrayitem_indexed(vable_opref, index, array_field_offset, value);
     }
 
-    /// RPython equivalent: `_opimpl_setarrayitem_vable`.
+    /// pyjitpl.py:1236-1247 `_opimpl_setarrayitem_vable` — ref variant.
     pub fn opimpl_setarrayitem_vable_ref(
         &mut self,
         vable_opref: OpRef,
@@ -1930,10 +1606,13 @@ impl<M: Clone> MetaInterp<M> {
         value: OpRef,
         array_field_offset: usize,
     ) {
-        self.opimpl_setarrayitem_vable_any(vable_opref, index, value, array_field_offset);
+        self.tracing
+            .as_mut()
+            .expect("opimpl_setarrayitem_vable_ref requires active tracing")
+            .vable_setarrayitem_indexed(vable_opref, index, array_field_offset, value);
     }
 
-    /// RPython equivalent: `_opimpl_setarrayitem_vable`.
+    /// pyjitpl.py:1236-1247 `_opimpl_setarrayitem_vable` — float variant.
     pub fn opimpl_setarrayitem_vable_float(
         &mut self,
         vable_opref: OpRef,
@@ -1941,43 +1620,22 @@ impl<M: Clone> MetaInterp<M> {
         value: OpRef,
         array_field_offset: usize,
     ) {
-        self.opimpl_setarrayitem_vable_any(vable_opref, index, value, array_field_offset);
+        self.tracing
+            .as_mut()
+            .expect("opimpl_setarrayitem_vable_float requires active tracing")
+            .vable_setarrayitem_indexed(vable_opref, index, array_field_offset, value);
     }
 
-    /// RPython equivalent: `opimpl_arraylen_vable(box, fdescr, adescr, pc)`.
+    /// pyjitpl.py:1253-1263 `opimpl_arraylen_vable(box, fdescr, adescr, pc)`.
     pub fn opimpl_arraylen_vable(
         &mut self,
         vable_opref: OpRef,
         array_field_offset: usize,
     ) -> OpRef {
-        if self.nonstandard_virtualizable(vable_opref) {
-            let ctx = self
-                .tracing
-                .as_mut()
-                .expect("opimpl_arraylen_vable requires active tracing");
-            let field_ref = ctx.const_int(array_field_offset as i64);
-            let array_opref = ctx.record_op(OpCode::GetfieldGcR, &[vable_opref, field_ref]);
-            return ctx.record_op(OpCode::ArraylenGc, &[array_opref]);
-        }
-        let ctx = self
-            .tracing
-            .as_ref()
-            .expect("opimpl_arraylen_vable requires active tracing");
-        let info = self
-            .virtualizable_info
-            .as_ref()
-            .expect("standard virtualizable info missing");
-        let array_index = info
-            .array_field_index(array_field_offset)
-            .expect("unknown standard virtualizable array offset");
-        let length = ctx
-            .virtualizable_array_lengths()
-            .and_then(|lengths| lengths.get(array_index).copied())
-            .expect("standard virtualizable array length missing");
         self.tracing
             .as_mut()
             .expect("opimpl_arraylen_vable requires active tracing")
-            .const_int(length as i64)
+            .vable_arraylen_vable(vable_opref, array_field_offset)
     }
 
     /// pyjitpl.py:1064-1073 `opimpl_hint_force_virtualizable(box)`.
