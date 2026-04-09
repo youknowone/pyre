@@ -1336,6 +1336,37 @@ impl TraceCtx {
         self.record_op(OpCode::GetarrayitemGcI, &[array_opref, index, zero])
     }
 
+    /// pyjitpl.py:1201-1216 `_get_arrayitem_vable_index(pc, arrayfielddescr, indexbox)`.
+    ///
+    ///     def _get_arrayitem_vable_index(self, pc, arrayfielddescr, indexbox):
+    ///         indexbox = self.implement_guard_value(indexbox, pc)
+    ///         vinfo = self.metainterp.jitdriver_sd.virtualizable_info
+    ///         virtualizable_box = self.metainterp.virtualizable_boxes[-1]
+    ///         virtualizable = vinfo.unwrap_virtualizable_box(virtualizable_box)
+    ///         arrayindex = vinfo.array_field_by_descrs[arrayfielddescr]
+    ///         index = indexbox.getint()
+    ///         assert 0 <= index < vinfo.get_array_length(virtualizable, arrayindex)
+    ///         return vinfo.get_index_in_array(virtualizable, arrayindex, index)
+    fn get_arrayitem_vable_index(
+        &mut self,
+        index: OpRef,
+        index_runtime_value: i64,
+        array_field_offset: usize,
+    ) -> Option<usize> {
+        // indexbox = self.implement_guard_value(indexbox, pc)
+        let promoted_index = if index.is_constant() {
+            index
+        } else {
+            self.promote_int(index, index_runtime_value, 0)
+        };
+        let _ = promoted_index;
+        let item_index = usize::try_from(index_runtime_value).ok()?;
+        // arrayindex = vinfo.array_field_by_descrs[arrayfielddescr]
+        // assert 0 <= index < vinfo.get_array_length(virtualizable, arrayindex)
+        // return vinfo.get_index_in_array(virtualizable, arrayindex, index)
+        self.vable_array_flat_index(array_field_offset, item_index)
+    }
+
     /// pyjitpl.py:1218-1230 `_opimpl_getarrayitem_vable(box, indexbox, fdescr, adescr, pc)`
     /// (int variant via `opimpl_getarrayitem_vable_i = _opimpl_getarrayitem_vable`).
     ///
@@ -1351,6 +1382,7 @@ impl TraceCtx {
         &mut self,
         vable_opref: OpRef,
         index: OpRef,
+        index_runtime_value: i64,
         array_field_offset: usize,
     ) -> OpRef {
         if self.is_nonstandard_virtualizable(vable_opref) {
@@ -1368,26 +1400,21 @@ impl TraceCtx {
         // self.metainterp.check_synchronized_virtualizable() — no-op in pyre.
         // index = self._get_arrayitem_vable_index(pc, fdescr, indexbox)
         // return self.metainterp.virtualizable_boxes[index]
-        if let Some(item_index) = self
-            .const_value(index)
-            .and_then(|value| usize::try_from(value).ok())
+        if let Some(flat_idx) =
+            self.get_arrayitem_vable_index(index, index_runtime_value, array_field_offset)
         {
-            if let Some(flat_idx) = self.vable_array_flat_index(array_field_offset, item_index) {
-                if let Some(boxes) = &self.virtualizable_boxes {
-                    return boxes[flat_idx];
-                }
+            if let Some(boxes) = &self.virtualizable_boxes {
+                return boxes[flat_idx];
             }
-            // Fallback: vable layout missing — go through getfield + arrayitem.
-            let field_ref = self.const_int(array_field_offset as i64);
-            let array_opref = self.record_op(OpCode::GetfieldGcR, &[vable_opref, field_ref]);
-            return self.vable_getarrayitem_int_vable(array_opref, array_field_offset, item_index);
         }
-        // RPython asserts indexbox.getint() returns a constant via
-        // `implement_guard_value`; pyre's non-constant index path here is
-        // a pyre extension. Fall back to the heap-array read.
+        // Fallback: vable layout missing — go through getfield + arrayitem.
         let field_ref = self.const_int(array_field_offset as i64);
         let array_opref = self.record_op(OpCode::GetfieldGcR, &[vable_opref, field_ref]);
-        self.vable_getarrayitem_int(array_opref, index)
+        if let Ok(item_index) = usize::try_from(index_runtime_value) {
+            self.vable_getarrayitem_int_vable(array_opref, array_field_offset, item_index)
+        } else {
+            self.vable_getarrayitem_int(array_opref, index)
+        }
     }
 
     /// Standard virtualizable array item read (ref).
@@ -1413,6 +1440,7 @@ impl TraceCtx {
         &mut self,
         vable_opref: OpRef,
         index: OpRef,
+        index_runtime_value: i64,
         array_field_offset: usize,
     ) -> OpRef {
         if self.is_nonstandard_virtualizable(vable_opref) {
@@ -1423,22 +1451,20 @@ impl TraceCtx {
             let array_opref = self.record_op(OpCode::GetfieldGcR, &[vable_opref, field_ref]);
             return self.vable_getarrayitem_ref(array_opref, index);
         }
-        if let Some(item_index) = self
-            .const_value(index)
-            .and_then(|value| usize::try_from(value).ok())
+        if let Some(flat_idx) =
+            self.get_arrayitem_vable_index(index, index_runtime_value, array_field_offset)
         {
-            if let Some(flat_idx) = self.vable_array_flat_index(array_field_offset, item_index) {
-                if let Some(boxes) = &self.virtualizable_boxes {
-                    return boxes[flat_idx];
-                }
+            if let Some(boxes) = &self.virtualizable_boxes {
+                return boxes[flat_idx];
             }
-            let field_ref = self.const_int(array_field_offset as i64);
-            let array_opref = self.record_op(OpCode::GetfieldGcR, &[vable_opref, field_ref]);
-            return self.vable_getarrayitem_ref_vable(array_opref, array_field_offset, item_index);
         }
         let field_ref = self.const_int(array_field_offset as i64);
         let array_opref = self.record_op(OpCode::GetfieldGcR, &[vable_opref, field_ref]);
-        self.vable_getarrayitem_ref(array_opref, index)
+        if let Ok(item_index) = usize::try_from(index_runtime_value) {
+            self.vable_getarrayitem_ref_vable(array_opref, array_field_offset, item_index)
+        } else {
+            self.vable_getarrayitem_ref(array_opref, index)
+        }
     }
 
     /// Standard virtualizable array item read (float).
@@ -1464,6 +1490,7 @@ impl TraceCtx {
         &mut self,
         vable_opref: OpRef,
         index: OpRef,
+        index_runtime_value: i64,
         array_field_offset: usize,
     ) -> OpRef {
         if self.is_nonstandard_virtualizable(vable_opref) {
@@ -1474,26 +1501,20 @@ impl TraceCtx {
             let array_opref = self.record_op(OpCode::GetfieldGcR, &[vable_opref, field_ref]);
             return self.vable_getarrayitem_float(array_opref, index);
         }
-        if let Some(item_index) = self
-            .const_value(index)
-            .and_then(|value| usize::try_from(value).ok())
+        if let Some(flat_idx) =
+            self.get_arrayitem_vable_index(index, index_runtime_value, array_field_offset)
         {
-            if let Some(flat_idx) = self.vable_array_flat_index(array_field_offset, item_index) {
-                if let Some(boxes) = &self.virtualizable_boxes {
-                    return boxes[flat_idx];
-                }
+            if let Some(boxes) = &self.virtualizable_boxes {
+                return boxes[flat_idx];
             }
-            let field_ref = self.const_int(array_field_offset as i64);
-            let array_opref = self.record_op(OpCode::GetfieldGcR, &[vable_opref, field_ref]);
-            return self.vable_getarrayitem_float_vable(
-                array_opref,
-                array_field_offset,
-                item_index,
-            );
         }
         let field_ref = self.const_int(array_field_offset as i64);
         let array_opref = self.record_op(OpCode::GetfieldGcR, &[vable_opref, field_ref]);
-        self.vable_getarrayitem_float(array_opref, index)
+        if let Ok(item_index) = usize::try_from(index_runtime_value) {
+            self.vable_getarrayitem_float_vable(array_opref, array_field_offset, item_index)
+        } else {
+            self.vable_getarrayitem_float(array_opref, index)
+        }
     }
 
     /// Standard virtualizable array item write.
@@ -1534,6 +1555,7 @@ impl TraceCtx {
         &mut self,
         vable_opref: OpRef,
         index: OpRef,
+        index_runtime_value: i64,
         array_field_offset: usize,
         value: OpRef,
     ) {
@@ -1546,25 +1568,22 @@ impl TraceCtx {
             self.vable_setarrayitem(array_opref, index, value);
             return;
         }
-        if let Some(item_index) = self
-            .const_value(index)
-            .and_then(|raw| usize::try_from(raw).ok())
+        if let Some(flat_idx) =
+            self.get_arrayitem_vable_index(index, index_runtime_value, array_field_offset)
         {
-            if let Some(idx) = self.vable_array_flat_index(array_field_offset, item_index) {
-                if let Some(boxes) = &mut self.virtualizable_boxes {
-                    boxes[idx] = value;
-                    // self.metainterp.synchronize_virtualizable() — no-op in pyre.
-                    return;
-                }
+            if let Some(boxes) = &mut self.virtualizable_boxes {
+                boxes[flat_idx] = value;
+                // self.metainterp.synchronize_virtualizable() — no-op in pyre.
+                return;
             }
-            let field_ref = self.const_int(array_field_offset as i64);
-            let array_opref = self.record_op(OpCode::GetfieldGcR, &[vable_opref, field_ref]);
-            self.vable_setarrayitem_vable(array_opref, array_field_offset, item_index, value);
-            return;
         }
         let field_ref = self.const_int(array_field_offset as i64);
         let array_opref = self.record_op(OpCode::GetfieldGcR, &[vable_opref, field_ref]);
-        self.vable_setarrayitem(array_opref, index, value);
+        if let Ok(item_index) = usize::try_from(index_runtime_value) {
+            self.vable_setarrayitem_vable(array_opref, array_field_offset, item_index, value);
+        } else {
+            self.vable_setarrayitem(array_opref, index, value);
+        }
     }
 
     /// pyjitpl.py:1253-1263 `opimpl_arraylen_vable(box, fdescr, adescr, pc)`.

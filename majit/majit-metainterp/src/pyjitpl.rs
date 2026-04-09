@@ -1550,12 +1550,18 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         vable_opref: OpRef,
         index: OpRef,
+        index_runtime_value: i64,
         array_field_offset: usize,
     ) -> OpRef {
         self.tracing
             .as_mut()
             .expect("opimpl_getarrayitem_vable_int requires active tracing")
-            .vable_getarrayitem_int_indexed(vable_opref, index, array_field_offset)
+            .vable_getarrayitem_int_indexed(
+                vable_opref,
+                index,
+                index_runtime_value,
+                array_field_offset,
+            )
     }
 
     /// pyjitpl.py:1218-1234 `_opimpl_getarrayitem_vable` — ref variant.
@@ -1563,12 +1569,18 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         vable_opref: OpRef,
         index: OpRef,
+        index_runtime_value: i64,
         array_field_offset: usize,
     ) -> OpRef {
         self.tracing
             .as_mut()
             .expect("opimpl_getarrayitem_vable_ref requires active tracing")
-            .vable_getarrayitem_ref_indexed(vable_opref, index, array_field_offset)
+            .vable_getarrayitem_ref_indexed(
+                vable_opref,
+                index,
+                index_runtime_value,
+                array_field_offset,
+            )
     }
 
     /// pyjitpl.py:1218-1234 `_opimpl_getarrayitem_vable` — float variant.
@@ -1576,12 +1588,18 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         vable_opref: OpRef,
         index: OpRef,
+        index_runtime_value: i64,
         array_field_offset: usize,
     ) -> OpRef {
         self.tracing
             .as_mut()
             .expect("opimpl_getarrayitem_vable_float requires active tracing")
-            .vable_getarrayitem_float_indexed(vable_opref, index, array_field_offset)
+            .vable_getarrayitem_float_indexed(
+                vable_opref,
+                index,
+                index_runtime_value,
+                array_field_offset,
+            )
     }
 
     /// pyjitpl.py:1236-1247 `_opimpl_setarrayitem_vable` — int variant.
@@ -1589,13 +1607,20 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         vable_opref: OpRef,
         index: OpRef,
+        index_runtime_value: i64,
         value: OpRef,
         array_field_offset: usize,
     ) {
         self.tracing
             .as_mut()
             .expect("opimpl_setarrayitem_vable_int requires active tracing")
-            .vable_setarrayitem_indexed(vable_opref, index, array_field_offset, value);
+            .vable_setarrayitem_indexed(
+                vable_opref,
+                index,
+                index_runtime_value,
+                array_field_offset,
+                value,
+            );
     }
 
     /// pyjitpl.py:1236-1247 `_opimpl_setarrayitem_vable` — ref variant.
@@ -1603,13 +1628,20 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         vable_opref: OpRef,
         index: OpRef,
+        index_runtime_value: i64,
         value: OpRef,
         array_field_offset: usize,
     ) {
         self.tracing
             .as_mut()
             .expect("opimpl_setarrayitem_vable_ref requires active tracing")
-            .vable_setarrayitem_indexed(vable_opref, index, array_field_offset, value);
+            .vable_setarrayitem_indexed(
+                vable_opref,
+                index,
+                index_runtime_value,
+                array_field_offset,
+                value,
+            );
     }
 
     /// pyjitpl.py:1236-1247 `_opimpl_setarrayitem_vable` — float variant.
@@ -1617,13 +1649,20 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         vable_opref: OpRef,
         index: OpRef,
+        index_runtime_value: i64,
         value: OpRef,
         array_field_offset: usize,
     ) {
         self.tracing
             .as_mut()
             .expect("opimpl_setarrayitem_vable_float requires active tracing")
-            .vable_setarrayitem_indexed(vable_opref, index, array_field_offset, value);
+            .vable_setarrayitem_indexed(
+                vable_opref,
+                index,
+                index_runtime_value,
+                array_field_offset,
+                value,
+            );
     }
 
     /// pyjitpl.py:1253-1263 `opimpl_arraylen_vable(box, fdescr, adescr, pc)`.
@@ -8004,7 +8043,7 @@ mod tests {
             let ctx = meta.trace_ctx().unwrap();
             ctx.const_int(1)
         };
-        let result = meta.opimpl_getarrayitem_vable_int(OpRef(0), index, 24);
+        let result = meta.opimpl_getarrayitem_vable_int(OpRef(0), index, 1, 24);
         assert_eq!(result, OpRef(2));
 
         let ctx = meta.trace_ctx().unwrap();
@@ -8074,7 +8113,7 @@ mod tests {
             let ctx = meta.trace_ctx().unwrap();
             (ctx.const_int(0xCAFE), ctx.const_int(1))
         };
-        let _result = meta.opimpl_getarrayitem_vable_int(nonstandard_vable, index, 24);
+        let _result = meta.opimpl_getarrayitem_vable_int(nonstandard_vable, index, 1, 24);
 
         // pyjitpl.py:1219-1230 _opimpl_getarrayitem_vable falls back to
         // GETFIELD_GC_R(arraydescr) + GETARRAYITEM_GC_I(arraybox) when
@@ -8193,7 +8232,7 @@ mod tests {
             let ctx = meta.trace_ctx().unwrap();
             ctx.const_int(1)
         };
-        let item = meta.opimpl_getarrayitem_vable_int(OpRef(0), index, 24);
+        let item = meta.opimpl_getarrayitem_vable_int(OpRef(0), index, 1, 24);
         if let Some(ctx) = meta.trace_ctx() {
             ctx.record_guard_with_fail_args(
                 OpCode::GuardTrue,
