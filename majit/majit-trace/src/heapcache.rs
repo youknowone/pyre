@@ -525,16 +525,23 @@ impl HeapCache {
         self.escape_deps.entry(opref).or_default()
     }
 
-    /// RPython-compatible alias retained for parity.
-    pub fn _escape_from_write(&mut self, obj: OpRef, fieldbox: OpRef) {
-        if self.is_unescaped(obj) && self.is_unescaped(fieldbox) {
-            self._get_deps(obj).push(fieldbox);
-            return;
+    /// heapcache.py:224-229
+    ///
+    ///     def _escape_from_write(self, box, fieldbox):
+    ///         if self.is_unescaped(box) and self.is_unescaped(fieldbox):
+    ///             deps = self._get_deps(box)
+    ///             deps.append(fieldbox)
+    ///         elif fieldbox is not None:
+    ///             self._escape_box(fieldbox)
+    pub fn _escape_from_write(&mut self, r#box: OpRef, fieldbox: OpRef) {
+        if self.is_unescaped(r#box) && self.is_unescaped(fieldbox) {
+            let deps = self._get_deps(r#box);
+            deps.push(fieldbox);
+        } else {
+            // RPython's `elif fieldbox is not None` — pyre's OpRef is always
+            // present (no None equivalent), so the branch always fires.
+            self._escape_box(fieldbox);
         }
-        if self.is_unescaped(obj) {
-            return;
-        }
-        self._escape_box(fieldbox);
     }
 
     /// RPython-compatible alias.
