@@ -14,9 +14,13 @@ use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
 ///
 /// Keeps track of the bounds placed on integers by guards and removes
 /// redundant guards.
+///
+/// RPython parity: `OptIntBounds(Optimization)` has NO own bounds storage —
+/// all bound state lives on `box._forwarded` and is accessed via the base
+/// class `Optimization.getintbound`/`setintbound` (optimizer.py:99-125).
+/// In majit the equivalent is `OptContext::forwarded[Forwarded::IntBound]`
+/// accessed via `ctx.getintbound`/`ctx.setintbound`/`ctx.with_intbound_mut`.
 pub struct OptIntBounds {
-    /// Per-operation IntBound storage, indexed by OpRef.
-    bounds: Vec<Option<IntBound>>,
     /// intbounds.py: last_emitted_operation — opcode (for overflow guard handling).
     last_emitted_opcode: Option<OpCode>,
     /// intbounds.py: last_emitted_operation — args (for overflow guard handling).
@@ -33,7 +37,6 @@ pub struct OptIntBounds {
 impl OptIntBounds {
     pub fn new() -> Self {
         OptIntBounds {
-            bounds: Vec::new(),
             pure_from_args_cache: Vec::new(),
             last_emitted_opcode: None,
             last_emitted_args: Vec::new(),
@@ -41,101 +44,39 @@ impl OptIntBounds {
         }
     }
 
-    /// Get or create bounds for an operation.
-    fn getintbound(&self, opref: OpRef, ctx: &OptContext) -> IntBound {
-        let opref = ctx.get_box_replacement(opref);
-        // Check if there is a known constant
-        if let Some(val) = ctx.get_constant_int(opref) {
-            return IntBound::from_constant(val);
-        }
-        let imported = ctx.imported_int_bounds.get(&opref).cloned();
-        let idx = opref.0 as usize;
-        if idx < self.bounds.len() {
-            if let Some(ref b) = self.bounds[idx] {
-                let mut merged = if let Some(imported) = imported {
-                    let mut merged = b.clone();
-                    let _ = merged.intersect(&imported);
-                    merged
-                } else {
-                    b.clone()
-                };
-                // heap.py: merge with cross-pass lower bounds (array lengths)
-                if let Some(&lower) = ctx.int_lower_bounds.get(&opref) {
-                    let _ = merged.intersect(&IntBound::bounded(lower, i64::MAX));
-                }
-                return merged;
-            }
-        }
-        if let Some(mut imported) = imported {
-            if let Some(&lower) = ctx.int_lower_bounds.get(&opref) {
-                let _ = imported.intersect(&IntBound::bounded(lower, i64::MAX));
-            }
-            return imported;
-        }
-        // heap.py: check cross-pass lower bounds even without local bound
-        if let Some(&lower) = ctx.int_lower_bounds.get(&opref) {
-            return IntBound::bounded(lower, i64::MAX);
-        }
-        IntBound::unbounded()
+    /// optimizer.py:99-113 getintbound — thin wrapper over `ctx.getintbound`.
+    /// In RPython this lives on the base `Optimization` class; majit's
+    /// `OptContext::getintbound` is the equivalent. Kept here as a method on
+    /// `OptIntBounds` for call-site brevity.
+    fn getintbound(&self, opref: OpRef, ctx: &mut OptContext) -> IntBound {
+        ctx.getintbound(opref)
     }
 
-    /// Store bounds for an operation.
-    fn setintbound(&mut self, opref: OpRef, bound: IntBound) {
-        let idx = opref.0 as usize;
-        if idx >= self.bounds.len() {
-            self.bounds.resize(idx + 1, None);
-        }
-        self.bounds[idx] = Some(bound);
+    /// optimizer.py:115-125 setintbound — thin wrapper over `ctx.setintbound`.
+    fn setintbound(&mut self, opref: OpRef, bound: IntBound, ctx: &mut OptContext) {
+        ctx.setintbound(opref, &bound);
     }
 
-    /// Get a mutable reference to the bound for an opref, creating unbounded if needed.
-    fn get_bound_mut(&mut self, opref: OpRef) -> &mut IntBound {
-        let idx = opref.0 as usize;
-        if idx >= self.bounds.len() {
-            self.bounds.resize(idx + 1, None);
-        }
-        self.bounds[idx].get_or_insert_with(IntBound::unbounded)
+    /// Intersect a bound into the stored bound for opref. RPython:
+    /// `self.getintbound(op).intersect(bound)` (mutates the IntBound stored
+    /// on `op._forwarded` in place).
+    fn intersect_bound(&mut self, opref: OpRef, bound: &IntBound, ctx: &mut OptContext) {
+        ctx.setintbound(opref, bound);
     }
 
-    /// Intersect a bound into the stored bound for opref.
-    fn intersect_bound(&mut self, opref: OpRef, bound: &IntBound) {
-        let b = self.get_bound_mut(opref);
-        let _ = b.intersect(bound);
-    }
-
-    /// optimizer.py:434: make_constant_int(box, intvalue)
-    /// Validates that the constant value is within the existing IntBound
-    /// range before making the box constant. Raises InvalidLoop if not.
+    /// optimizer.py:434: make_constant_int(box, intvalue) — RPython just
+    /// forwards to `make_constant(box, ConstInt(intvalue))`. The bounds-range
+    /// safety check + `make_eq_const` shrink (optimizer.py:415-426) live in
+    /// `OptContext::make_constant`.
     fn make_constant_int(&mut self, op: &Op, value: i64, ctx: &mut OptContext) {
-        self.make_constant_int_ref(op.pos, value, ctx);
+        ctx.make_constant(op.pos, Value::Int(value));
     }
 
     /// OpRef-keyed variant of make_constant_int. Used by
     /// `propagate_bounds_backward` and the IntIsTrue/IsZero arms which
     /// receive an OpRef rather than an &Op.
     fn make_constant_int_ref(&mut self, opref: OpRef, value: i64, ctx: &mut OptContext) {
-        // optimizer.py:415-426: safety check — if the box already has an
-        // IntBound, verify the constant is within that range.
-        let replaced = ctx.get_box_replacement(opref);
-        let existing = self.getintbound(replaced, ctx);
-        if !existing.is_unbounded() {
-            if !existing.contains(value) {
-                std::panic::panic_any(crate::optimize::InvalidLoop(
-                    "constant int is outside the range allowed for that box",
-                ));
-            }
-            // intutils.py:412-423: make_eq_const — narrow the shared bound
-            // to the constant value. Important when the bound is shared
-            // (e.g., with an array length).
-            let idx = replaced.0 as usize;
-            if idx < self.bounds.len() {
-                if let Some(ref mut b) = self.bounds[idx] {
-                    let _ = b.make_eq_const(value);
-                }
-            }
-        }
         ctx.make_constant(opref, Value::Int(value));
-        self.setintbound(opref, IntBound::from_constant(value));
     }
 
     /// Record a pure_from_args entry for CSE.
@@ -344,7 +285,7 @@ impl OptIntBounds {
             let b1 = self.getintbound(arg1, ctx);
             b0.add_bound(&b1)
         };
-        self.intersect_bound(op.pos, &b);
+        self.intersect_bound(op.pos, &b, ctx);
         // intbounds.py:125-127:
         //   self.optimizer.pure_from_args2(rop.INT_SUB, op, arg1, arg0)
         //   self.optimizer.pure_from_args2(rop.INT_SUB, op, arg0, arg1)
@@ -384,7 +325,7 @@ impl OptIntBounds {
         let b0 = self.getintbound(arg0, ctx);
         let b1 = self.getintbound(arg1, ctx);
         let b = b0.sub_bound(&b1);
-        self.intersect_bound(op.pos, &b);
+        self.intersect_bound(op.pos, &b, ctx);
         // Synthesis: INT_SUB(a,b)=res → INT_ADD(res,b)=a, INT_SUB(a,res)=b
         self.record_pure_from_args(OpCode::IntAdd, op.pos, arg1, arg0);
         self.record_pure_from_args(OpCode::IntSub, arg0, op.pos, arg1);
@@ -400,22 +341,22 @@ impl OptIntBounds {
         }
     }
 
-    fn postprocess_int_mul(&mut self, op: &Op, ctx: &OptContext) {
+    fn postprocess_int_mul(&mut self, op: &Op, ctx: &mut OptContext) {
         let b0 = self.getintbound(op.arg(0), ctx);
         let b1 = self.getintbound(op.arg(1), ctx);
         let b = b0.mul_bound(&b1);
-        self.intersect_bound(op.pos, &b);
+        self.intersect_bound(op.pos, &b, ctx);
     }
 
-    fn postprocess_int_and(&mut self, op: &Op, ctx: &OptContext) {
+    fn postprocess_int_and(&mut self, op: &Op, ctx: &mut OptContext) {
         let b0 = self.getintbound(op.arg(0), ctx);
         let b1 = self.getintbound(op.arg(1), ctx);
         let b = b0.and_bound(&b1);
-        self.intersect_bound(op.pos, &b);
+        self.intersect_bound(op.pos, &b, ctx);
     }
 
     /// intbounds.py:60-71 postprocess_INT_OR
-    fn postprocess_int_or(&mut self, op: &Op, ctx: &OptContext) {
+    fn postprocess_int_or(&mut self, op: &Op, ctx: &mut OptContext) {
         let arg0 = ctx.get_box_replacement(op.arg(0));
         let arg1 = ctx.get_box_replacement(op.arg(1));
         let b0 = self.getintbound(arg0, ctx);
@@ -429,11 +370,11 @@ impl OptIntBounds {
             self.record_pure_from_args(OpCode::IntXor, arg0, arg1, op.pos);
         }
         let b = b0.or_bound(&b1);
-        self.intersect_bound(op.pos, &b);
+        self.intersect_bound(op.pos, &b, ctx);
     }
 
     /// intbounds.py:73-84 postprocess_INT_XOR
-    fn postprocess_int_xor(&mut self, op: &Op, ctx: &OptContext) {
+    fn postprocess_int_xor(&mut self, op: &Op, ctx: &mut OptContext) {
         let arg0 = ctx.get_box_replacement(op.arg(0));
         let arg1 = ctx.get_box_replacement(op.arg(1));
         let b0 = self.getintbound(arg0, ctx);
@@ -447,85 +388,85 @@ impl OptIntBounds {
             self.record_pure_from_args(OpCode::IntOr, arg0, arg1, op.pos);
         }
         let b = b0.xor_bound(&b1);
-        self.intersect_bound(op.pos, &b);
+        self.intersect_bound(op.pos, &b, ctx);
     }
 
     /// intbounds.py: INT_LSHIFT pure_from_args synthesis.
     /// If res = INT_LSHIFT(a, b), then a = INT_RSHIFT(res, b).
-    fn postprocess_int_lshift(&mut self, op: &Op, ctx: &OptContext) {
+    fn postprocess_int_lshift(&mut self, op: &Op, ctx: &mut OptContext) {
         let arg0 = ctx.get_box_replacement(op.arg(0));
         let arg1 = ctx.get_box_replacement(op.arg(1));
         let b0 = self.getintbound(arg0, ctx);
         let b1 = self.getintbound(arg1, ctx);
         let b = b0.lshift_bound(&b1);
-        self.intersect_bound(op.pos, &b);
+        self.intersect_bound(op.pos, &b, ctx);
         // intbounds.py:185: only synthesize reverse if lshift cannot overflow
         if b0.lshift_bound_cannot_overflow(&b1) {
             self.record_pure_from_args(OpCode::IntRshift, op.pos, arg1, arg0);
         }
     }
 
-    fn postprocess_int_rshift(&mut self, op: &Op, ctx: &OptContext) {
+    fn postprocess_int_rshift(&mut self, op: &Op, ctx: &mut OptContext) {
         let b0 = self.getintbound(op.arg(0), ctx);
         let b1 = self.getintbound(op.arg(1), ctx);
         let b = b0.rshift_bound(&b1);
-        self.intersect_bound(op.pos, &b);
+        self.intersect_bound(op.pos, &b, ctx);
     }
 
-    fn postprocess_uint_rshift(&mut self, op: &Op, ctx: &OptContext) {
+    fn postprocess_uint_rshift(&mut self, op: &Op, ctx: &mut OptContext) {
         let b0 = self.getintbound(op.arg(0), ctx);
         let b1 = self.getintbound(op.arg(1), ctx);
         let b = b0.urshift_bound(&b1);
-        self.intersect_bound(op.pos, &b);
+        self.intersect_bound(op.pos, &b, ctx);
     }
 
-    fn postprocess_int_floordiv(&mut self, op: &Op, ctx: &OptContext) {
+    fn postprocess_int_floordiv(&mut self, op: &Op, ctx: &mut OptContext) {
         let b0 = self.getintbound(op.arg(0), ctx);
         let b1 = self.getintbound(op.arg(1), ctx);
         let b = b0.floordiv_bound(&b1);
-        self.intersect_bound(op.pos, &b);
+        self.intersect_bound(op.pos, &b, ctx);
     }
 
-    fn postprocess_int_mod(&mut self, op: &Op, ctx: &OptContext) {
+    fn postprocess_int_mod(&mut self, op: &Op, ctx: &mut OptContext) {
         let b0 = self.getintbound(op.arg(0), ctx);
         let b1 = self.getintbound(op.arg(1), ctx);
         let b = b0.mod_bound(&b1);
-        self.intersect_bound(op.pos, &b);
+        self.intersect_bound(op.pos, &b, ctx);
     }
 
-    fn postprocess_int_neg(&mut self, op: &Op, ctx: &OptContext) {
+    fn postprocess_int_neg(&mut self, op: &Op, ctx: &mut OptContext) {
         let b = self.getintbound(op.arg(0), ctx);
         let result = b.neg_bound();
-        self.intersect_bound(op.pos, &result);
+        self.intersect_bound(op.pos, &result, ctx);
     }
 
-    fn postprocess_int_invert(&mut self, op: &Op, ctx: &OptContext) {
+    fn postprocess_int_invert(&mut self, op: &Op, ctx: &mut OptContext) {
         let b = self.getintbound(op.arg(0), ctx);
         let result = b.invert_bound();
-        self.intersect_bound(op.pos, &result);
+        self.intersect_bound(op.pos, &result, ctx);
     }
 
-    fn postprocess_int_force_ge_zero(&mut self, op: &Op, ctx: &OptContext) {
+    fn postprocess_int_force_ge_zero(&mut self, op: &Op, ctx: &mut OptContext) {
         let b_arg = self.getintbound(op.arg(0), ctx);
         let mut result = IntBound::nonnegative();
         if b_arg.upper >= 0 {
             let _ = result.make_le(&b_arg);
         }
-        self.intersect_bound(op.pos, &result);
+        self.intersect_bound(op.pos, &result, ctx);
     }
 
-    fn postprocess_arraylen_gc(&mut self, op: &Op) {
+    fn postprocess_arraylen_gc(&mut self, op: &Op, ctx: &mut OptContext) {
         // Array length is always non-negative
-        self.intersect_bound(op.pos, &IntBound::nonnegative());
+        self.intersect_bound(op.pos, &IntBound::nonnegative(), ctx);
     }
 
-    fn postprocess_strlen(&mut self, op: &Op) {
+    fn postprocess_strlen(&mut self, op: &Op, ctx: &mut OptContext) {
         // String length is always non-negative
-        self.intersect_bound(op.pos, &IntBound::nonnegative());
+        self.intersect_bound(op.pos, &IntBound::nonnegative(), ctx);
     }
 
-    fn postprocess_unicodelen(&mut self, op: &Op) {
-        self.intersect_bound(op.pos, &IntBound::nonnegative());
+    fn postprocess_unicodelen(&mut self, op: &Op, ctx: &mut OptContext) {
+        self.intersect_bound(op.pos, &IntBound::nonnegative(), ctx);
     }
 
     // ── INT_SIGNEXT optimization ──
@@ -547,14 +488,14 @@ impl OptIntBounds {
         OptimizationResult::PassOn
     }
 
-    fn postprocess_int_signext(&mut self, op: &Op, ctx: &OptContext) {
+    fn postprocess_int_signext(&mut self, op: &Op, ctx: &mut OptContext) {
         let b1 = self.getintbound(op.arg(1), ctx);
         if b1.is_constant() {
             let byte_size = b1.get_constant();
             let numbits = byte_size * 8;
             let start = -(1i64 << (numbits - 1));
             let stop = 1i64 << (numbits - 1);
-            let _ = self.get_bound_mut(op.pos).intersect_const(start, stop - 1);
+            let _ = ctx.with_intbound_mut(op.pos, |bm| bm.intersect_const(start, stop - 1));
         }
     }
 
@@ -575,7 +516,7 @@ impl OptIntBounds {
         }
     }
 
-    fn postprocess_int_add_ovf(&mut self, op: &Op, ctx: &OptContext) {
+    fn postprocess_int_add_ovf(&mut self, op: &Op, ctx: &mut OptContext) {
         let arg0 = ctx.get_box_replacement(op.arg(0));
         let arg1 = ctx.get_box_replacement(op.arg(1));
         let b0 = self.getintbound(arg0, ctx);
@@ -585,7 +526,7 @@ impl OptIntBounds {
             let b1 = self.getintbound(arg1, ctx);
             b0.add_bound_no_overflow(&b1)
         };
-        self.intersect_bound(op.pos, &b);
+        self.intersect_bound(op.pos, &b, ctx);
     }
 
     /// intbounds.py:275-287 optimize_INT_SUB_OVF
@@ -610,11 +551,11 @@ impl OptIntBounds {
         }
     }
 
-    fn postprocess_int_sub_ovf(&mut self, op: &Op, ctx: &OptContext) {
+    fn postprocess_int_sub_ovf(&mut self, op: &Op, ctx: &mut OptContext) {
         let b0 = self.getintbound(op.arg(0), ctx);
         let b1 = self.getintbound(op.arg(1), ctx);
         let b = b0.sub_bound_no_overflow(&b1);
-        self.intersect_bound(op.pos, &b);
+        self.intersect_bound(op.pos, &b, ctx);
     }
 
     /// intbounds.py:298-305 optimize_INT_MUL_OVF
@@ -632,7 +573,7 @@ impl OptIntBounds {
         }
     }
 
-    fn postprocess_int_mul_ovf(&mut self, op: &Op, ctx: &OptContext) {
+    fn postprocess_int_mul_ovf(&mut self, op: &Op, ctx: &mut OptContext) {
         let arg0 = ctx.get_box_replacement(op.arg(0));
         let arg1 = ctx.get_box_replacement(op.arg(1));
         let b0 = self.getintbound(arg0, ctx);
@@ -642,7 +583,7 @@ impl OptIntBounds {
             let b1 = self.getintbound(arg1, ctx);
             b0.mul_bound_no_overflow(&b1)
         };
-        self.intersect_bound(op.pos, &b);
+        self.intersect_bound(op.pos, &b, ctx);
     }
 
     /// intbounds.py:209-229 optimize_GUARD_NO_OVERFLOW
@@ -782,14 +723,12 @@ impl OptIntBounds {
     /// RPython `if`.
     fn make_int_lt(&mut self, box1: OpRef, box2: OpRef, ctx: &mut OptContext) {
         let b2 = self.getintbound(box2, ctx);
-        let b1 = self.get_bound_mut(box1);
-        let changed1 = matches!(b1.make_lt(&b2), Ok(true));
+        let changed1 = ctx.with_intbound_mut(box1, |b1| matches!(b1.make_lt(&b2), Ok(true)));
         if changed1 {
             self.propagate_bounds_backward(box1, ctx);
         }
         let b1 = self.getintbound(box1, ctx);
-        let b2_mut = self.get_bound_mut(box2);
-        let changed2 = matches!(b2_mut.make_gt(&b1), Ok(true));
+        let changed2 = ctx.with_intbound_mut(box2, |b2| matches!(b2.make_gt(&b1), Ok(true)));
         if changed2 {
             self.propagate_bounds_backward(box2, ctx);
         }
@@ -798,14 +737,12 @@ impl OptIntBounds {
     /// intbounds.py:572-578 make_int_le
     fn make_int_le(&mut self, box1: OpRef, box2: OpRef, ctx: &mut OptContext) {
         let b2 = self.getintbound(box2, ctx);
-        let b1 = self.get_bound_mut(box1);
-        let changed1 = matches!(b1.make_le(&b2), Ok(true));
+        let changed1 = ctx.with_intbound_mut(box1, |b1| matches!(b1.make_le(&b2), Ok(true)));
         if changed1 {
             self.propagate_bounds_backward(box1, ctx);
         }
         let b1 = self.getintbound(box1, ctx);
-        let b2_mut = self.get_bound_mut(box2);
-        let changed2 = matches!(b2_mut.make_ge(&b1), Ok(true));
+        let changed2 = ctx.with_intbound_mut(box2, |b2| matches!(b2.make_ge(&b1), Ok(true)));
         if changed2 {
             self.propagate_bounds_backward(box2, ctx);
         }
@@ -824,14 +761,14 @@ impl OptIntBounds {
     /// intbounds.py:586-592 make_unsigned_lt
     fn make_unsigned_lt(&mut self, box1: OpRef, box2: OpRef, ctx: &mut OptContext) {
         let b2 = self.getintbound(box2, ctx);
-        let b1 = self.get_bound_mut(box1);
-        let changed1 = matches!(b1.make_unsigned_lt(&b2), Ok(true));
+        let changed1 =
+            ctx.with_intbound_mut(box1, |b1| matches!(b1.make_unsigned_lt(&b2), Ok(true)));
         if changed1 {
             self.propagate_bounds_backward(box1, ctx);
         }
         let b1 = self.getintbound(box1, ctx);
-        let b2_mut = self.get_bound_mut(box2);
-        let changed2 = matches!(b2_mut.make_unsigned_gt(&b1), Ok(true));
+        let changed2 =
+            ctx.with_intbound_mut(box2, |b2| matches!(b2.make_unsigned_gt(&b1), Ok(true)));
         if changed2 {
             self.propagate_bounds_backward(box2, ctx);
         }
@@ -840,14 +777,14 @@ impl OptIntBounds {
     /// intbounds.py:594-600 make_unsigned_le
     fn make_unsigned_le(&mut self, box1: OpRef, box2: OpRef, ctx: &mut OptContext) {
         let b2 = self.getintbound(box2, ctx);
-        let b1 = self.get_bound_mut(box1);
-        let changed1 = matches!(b1.make_unsigned_le(&b2), Ok(true));
+        let changed1 =
+            ctx.with_intbound_mut(box1, |b1| matches!(b1.make_unsigned_le(&b2), Ok(true)));
         if changed1 {
             self.propagate_bounds_backward(box1, ctx);
         }
         let b1 = self.getintbound(box1, ctx);
-        let b2_mut = self.get_bound_mut(box2);
-        let changed2 = matches!(b2_mut.make_unsigned_ge(&b1), Ok(true));
+        let changed2 =
+            ctx.with_intbound_mut(box2, |b2| matches!(b2.make_unsigned_ge(&b1), Ok(true)));
         if changed2 {
             self.propagate_bounds_backward(box2, ctx);
         }
@@ -874,14 +811,12 @@ impl OptIntBounds {
     /// ```
     fn make_eq(&mut self, arg0: OpRef, arg1: OpRef, ctx: &mut OptContext) {
         let b1 = self.getintbound(arg1, ctx);
-        let b0 = self.get_bound_mut(arg0);
-        let changed0 = matches!(b0.intersect(&b1), Ok(true));
+        let changed0 = ctx.with_intbound_mut(arg0, |b0| matches!(b0.intersect(&b1), Ok(true)));
         if changed0 {
             self.propagate_bounds_backward(arg0, ctx);
         }
         let b0 = self.getintbound(arg0, ctx);
-        let b1_mut = self.get_bound_mut(arg1);
-        let changed1 = matches!(b1_mut.intersect(&b0), Ok(true));
+        let changed1 = ctx.with_intbound_mut(arg1, |b1| matches!(b1.intersect(&b0), Ok(true)));
         if changed1 {
             self.propagate_bounds_backward(arg1, ctx);
         }
@@ -906,16 +841,14 @@ impl OptIntBounds {
         let b1 = self.getintbound(arg1, ctx);
         if b1.is_constant() {
             let v1 = b1.get_constant();
-            let b0 = self.get_bound_mut(arg0);
-            if b0.make_ne_const(v1) {
+            if ctx.with_intbound_mut(arg0, |b0| b0.make_ne_const(v1)) {
                 self.propagate_bounds_backward(arg0, ctx);
             }
         } else {
             let b0 = self.getintbound(arg0, ctx);
             if b0.is_constant() {
                 let v0 = b0.get_constant();
-                let b1_mut = self.get_bound_mut(arg1);
-                if b1_mut.make_ne_const(v0) {
+                if ctx.with_intbound_mut(arg1, |b1| b1.make_ne_const(v0)) {
                     self.propagate_bounds_backward(arg1, ctx);
                 }
             }
@@ -972,10 +905,10 @@ impl OptIntBounds {
         if r_const == valnonzero {
             let b1 = self.getintbound(arg0, ctx);
             if b1.known_nonnegative() {
-                let _ = self.get_bound_mut(arg0).make_gt_const(0);
+                let _ = ctx.with_intbound_mut(arg0, |bm| bm.make_gt_const(0));
                 self.propagate_bounds_backward(arg0, ctx);
             } else if b1.known_le_const(0) {
-                let _ = self.get_bound_mut(arg0).make_lt_const(0);
+                let _ = ctx.with_intbound_mut(arg0, |bm| bm.make_lt_const(0));
                 self.propagate_bounds_backward(arg0, ctx);
             }
         } else if r_const == valzero {
@@ -1012,12 +945,14 @@ impl OptIntBounds {
                 let b2 = self.getintbound(arg1, ctx);
                 let r = self.getintbound(op.pos, ctx);
                 let b = r.sub_bound(&b2);
-                let changed0 = matches!(self.get_bound_mut(arg0).intersect(&b), Ok(true));
+                let changed0 =
+                    ctx.with_intbound_mut(arg0, |bm| matches!(bm.intersect(&b), Ok(true)));
                 if changed0 {
                     self.propagate_bounds_backward(arg0, ctx);
                 }
                 let b = r.sub_bound(&b1);
-                let changed1 = matches!(self.get_bound_mut(arg1).intersect(&b), Ok(true));
+                let changed1 =
+                    ctx.with_intbound_mut(arg1, |bm| matches!(bm.intersect(&b), Ok(true)));
                 if changed1 {
                     self.propagate_bounds_backward(arg1, ctx);
                 }
@@ -1030,12 +965,14 @@ impl OptIntBounds {
                 let b2 = self.getintbound(arg1, ctx);
                 let r = self.getintbound(op.pos, ctx);
                 let b = r.add_bound(&b2);
-                let changed0 = matches!(self.get_bound_mut(arg0).intersect(&b), Ok(true));
+                let changed0 =
+                    ctx.with_intbound_mut(arg0, |bm| matches!(bm.intersect(&b), Ok(true)));
                 if changed0 {
                     self.propagate_bounds_backward(arg0, ctx);
                 }
                 let b = r.sub_bound(&b1).neg_bound();
-                let changed1 = matches!(self.get_bound_mut(arg1).intersect(&b), Ok(true));
+                let changed1 =
+                    ctx.with_intbound_mut(arg1, |bm| matches!(bm.intersect(&b), Ok(true)));
                 if changed1 {
                     self.propagate_bounds_backward(arg1, ctx);
                 }
@@ -1051,12 +988,14 @@ impl OptIntBounds {
                 }
                 let r = self.getintbound(op.pos, ctx);
                 let b = r.py_div_bound(&b2);
-                let changed0 = matches!(self.get_bound_mut(arg0).intersect(&b), Ok(true));
+                let changed0 =
+                    ctx.with_intbound_mut(arg0, |bm| matches!(bm.intersect(&b), Ok(true)));
                 if changed0 {
                     self.propagate_bounds_backward(arg0, ctx);
                 }
                 let b = r.py_div_bound(&b1);
-                let changed1 = matches!(self.get_bound_mut(arg1).intersect(&b), Ok(true));
+                let changed1 =
+                    ctx.with_intbound_mut(arg1, |bm| matches!(bm.intersect(&b), Ok(true)));
                 if changed1 {
                     self.propagate_bounds_backward(arg1, ctx);
                 }
@@ -1072,7 +1011,8 @@ impl OptIntBounds {
                 }
                 let r = self.getintbound(op.pos, ctx);
                 if let Ok(b) = r.lshift_bound_backwards(&b2) {
-                    let changed = matches!(self.get_bound_mut(arg0).intersect(&b), Ok(true));
+                    let changed =
+                        ctx.with_intbound_mut(arg0, |bm| matches!(bm.intersect(&b), Ok(true)));
                     if changed {
                         self.propagate_bounds_backward(arg0, ctx);
                     }
@@ -1087,7 +1027,8 @@ impl OptIntBounds {
                 }
                 let r = self.getintbound(op.pos, ctx);
                 let b = r.rshift_bound_backwards(&b2);
-                let changed = matches!(self.get_bound_mut(arg0).intersect(&b), Ok(true));
+                let changed =
+                    ctx.with_intbound_mut(arg0, |bm| matches!(bm.intersect(&b), Ok(true)));
                 if changed {
                     self.propagate_bounds_backward(arg0, ctx);
                 }
@@ -1101,7 +1042,8 @@ impl OptIntBounds {
                 }
                 let r = self.getintbound(op.pos, ctx);
                 let b = r.urshift_bound_backwards(&b2);
-                let changed = matches!(self.get_bound_mut(arg0).intersect(&b), Ok(true));
+                let changed =
+                    ctx.with_intbound_mut(arg0, |bm| matches!(bm.intersect(&b), Ok(true)));
                 if changed {
                     self.propagate_bounds_backward(arg0, ctx);
                 }
@@ -1114,13 +1056,15 @@ impl OptIntBounds {
                 let b0 = self.getintbound(arg0, ctx);
                 let b1 = self.getintbound(arg1, ctx);
                 if let Ok(b) = b0.and_bound_backwards(&r) {
-                    let changed = matches!(self.get_bound_mut(arg1).intersect(&b), Ok(true));
+                    let changed =
+                        ctx.with_intbound_mut(arg1, |bm| matches!(bm.intersect(&b), Ok(true)));
                     if changed {
                         self.propagate_bounds_backward(arg1, ctx);
                     }
                 }
                 if let Ok(b) = b1.and_bound_backwards(&r) {
-                    let changed = matches!(self.get_bound_mut(arg0).intersect(&b), Ok(true));
+                    let changed =
+                        ctx.with_intbound_mut(arg0, |bm| matches!(bm.intersect(&b), Ok(true)));
                     if changed {
                         self.propagate_bounds_backward(arg0, ctx);
                     }
@@ -1134,13 +1078,15 @@ impl OptIntBounds {
                 let b0 = self.getintbound(arg0, ctx);
                 let b1 = self.getintbound(arg1, ctx);
                 if let Ok(b) = b0.or_bound_backwards(&r) {
-                    let changed = matches!(self.get_bound_mut(arg1).intersect(&b), Ok(true));
+                    let changed =
+                        ctx.with_intbound_mut(arg1, |bm| matches!(bm.intersect(&b), Ok(true)));
                     if changed {
                         self.propagate_bounds_backward(arg1, ctx);
                     }
                 }
                 if let Ok(b) = b1.or_bound_backwards(&r) {
-                    let changed = matches!(self.get_bound_mut(arg0).intersect(&b), Ok(true));
+                    let changed =
+                        ctx.with_intbound_mut(arg0, |bm| matches!(bm.intersect(&b), Ok(true)));
                     if changed {
                         self.propagate_bounds_backward(arg0, ctx);
                     }
@@ -1155,12 +1101,14 @@ impl OptIntBounds {
                 let b1 = self.getintbound(arg1, ctx);
                 // xor is its own inverse
                 let b = b0.xor_bound(&r);
-                let changed1 = matches!(self.get_bound_mut(arg1).intersect(&b), Ok(true));
+                let changed1 =
+                    ctx.with_intbound_mut(arg1, |bm| matches!(bm.intersect(&b), Ok(true)));
                 if changed1 {
                     self.propagate_bounds_backward(arg1, ctx);
                 }
                 let b = b1.xor_bound(&r);
-                let changed0 = matches!(self.get_bound_mut(arg0).intersect(&b), Ok(true));
+                let changed0 =
+                    ctx.with_intbound_mut(arg0, |bm| matches!(bm.intersect(&b), Ok(true)));
                 if changed0 {
                     self.propagate_bounds_backward(arg0, ctx);
                 }
@@ -1170,7 +1118,8 @@ impl OptIntBounds {
                 let arg0 = op.arg(0);
                 let bres = self.getintbound(op.pos, ctx);
                 let bounds = bres.invert_bound();
-                let changed = matches!(self.get_bound_mut(arg0).intersect(&bounds), Ok(true));
+                let changed =
+                    ctx.with_intbound_mut(arg0, |bm| matches!(bm.intersect(&bounds), Ok(true)));
                 if changed {
                     self.propagate_bounds_backward(arg0, ctx);
                 }
@@ -1180,7 +1129,8 @@ impl OptIntBounds {
                 let arg0 = op.arg(0);
                 let bres = self.getintbound(op.pos, ctx);
                 let bounds = bres.neg_bound();
-                let changed = matches!(self.get_bound_mut(arg0).intersect(&bounds), Ok(true));
+                let changed =
+                    ctx.with_intbound_mut(arg0, |bm| matches!(bm.intersect(&bounds), Ok(true)));
                 if changed {
                     self.propagate_bounds_backward(arg0, ctx);
                 }
@@ -1349,15 +1299,10 @@ impl Optimization for OptIntBounds {
             }
         }
 
-        // optimizer.py:415-426 parity: sync bounds to OptContext so that
-        // later passes calling make_constant can validate int ranges.
-        ctx.int_bounds.clone_from(&self.bounds);
-
         result
     }
 
     fn setup(&mut self) {
-        self.bounds.clear();
         self.last_emitted_opcode = None;
         self.last_emitted_args.clear();
         self.last_emitted_ref = OpRef::NONE;
@@ -1475,16 +1420,16 @@ impl Optimization for OptIntBounds {
             OpCode::IntMulOvf => self.postprocess_int_mul_ovf(op, ctx),
 
             // ── Lengths ──
-            OpCode::ArraylenGc => self.postprocess_arraylen_gc(op),
-            OpCode::Strlen => self.postprocess_strlen(op),
-            OpCode::Unicodelen => self.postprocess_unicodelen(op),
+            OpCode::ArraylenGc => self.postprocess_arraylen_gc(op, ctx),
+            OpCode::Strlen => self.postprocess_strlen(op, ctx),
+            OpCode::Unicodelen => self.postprocess_unicodelen(op, ctx),
 
             // ── String/Unicode items ──
             OpCode::Strgetitem => {
-                self.intersect_bound(op.pos, &IntBound::bounded(0, 255));
+                self.intersect_bound(op.pos, &IntBound::bounded(0, 255), ctx);
             }
             OpCode::Unicodegetitem => {
-                self.intersect_bound(op.pos, &IntBound::nonnegative());
+                self.intersect_bound(op.pos, &IntBound::nonnegative(), ctx);
             }
 
             // ── Field accesses ──
@@ -1506,7 +1451,7 @@ impl Optimization for OptIntBounds {
                         } else {
                             (0, (1i64 << (field_size * 8)) - 1)
                         };
-                        self.intersect_bound(op.pos, &IntBound::bounded(lo, hi));
+                        self.intersect_bound(op.pos, &IntBound::bounded(lo, hi), ctx);
                     }
                 }
             }
@@ -1524,7 +1469,7 @@ impl Optimization for OptIntBounds {
                             } else {
                                 (0, (1i64 << (item_size * 8)) - 1)
                             };
-                            self.intersect_bound(op.pos, &IntBound::bounded(lo, hi));
+                            self.intersect_bound(op.pos, &IntBound::bounded(lo, hi), ctx);
                         }
                     }
                 }
@@ -1546,7 +1491,7 @@ impl Optimization for OptIntBounds {
                                             0,
                                             u64::MAX,
                                         );
-                                        self.intersect_bound(op.pos, &result_bound);
+                                        self.intersect_bound(op.pos, &result_bound, ctx);
                                     }
                                 }
                             }
@@ -1560,7 +1505,7 @@ impl Optimization for OptIntBounds {
                                             0,
                                             u64::MAX,
                                         );
-                                        self.intersect_bound(op.pos, &result_bound);
+                                        self.intersect_bound(op.pos, &result_bound, ctx);
                                     }
                                 }
                             }
@@ -1572,9 +1517,6 @@ impl Optimization for OptIntBounds {
 
             _ => {}
         }
-
-        // Sync bounds to OptContext after postprocess (optimizer.py parity).
-        ctx.int_bounds.clone_from(&self.bounds);
     }
 
     /// intbounds.py: produce_potential_short_preamble_ops(sb)
@@ -1587,14 +1529,15 @@ impl Optimization for OptIntBounds {
         // In RPython, this adds INT_GE/INT_LE guards for known bounds
         // that the loop body depends on. The bounds are discovered during
         // preamble optimization and must be re-checked on bridge entry.
-        // The actual bounds are in self.bounds — a real implementation
-        // would iterate non-trivial bounds and generate guard ops.
+        // The actual bounds live on box._forwarded (Forwarded::IntBound) —
+        // a real implementation would iterate non-trivial bounds via
+        // ctx.getintbound and generate guard ops.
     }
 
     fn export_arg_int_bounds(
         &self,
         args: &[OpRef],
-        ctx: &OptContext,
+        ctx: &mut OptContext,
     ) -> std::collections::HashMap<OpRef, IntBound> {
         let mut exported = std::collections::HashMap::new();
         for &arg in args {
@@ -1623,13 +1566,34 @@ mod tests {
     fn run_pass_with_bounds(
         ops: &[Op],
         initial_bounds: &[(OpRef, IntBound)],
-    ) -> (Vec<Op>, OptIntBounds, OptContext) {
+    ) -> (Vec<Op>, OptContext) {
         let mut pass = OptIntBounds::new();
-        let mut ctx = OptContext::new(ops.len());
+        // Compute num_inputs as the highest OpRef referenced anywhere (as
+        // arg, result pos, or initial bound key) plus one. With bounds now
+        // living on `ctx.forwarded`, reserve_pos must skip past every
+        // pre-existing OpRef so freshly emitted ops (e.g. SameAsI from
+        // rewrite's `x + x → x << 1`) cannot collide with an input arg.
+        let max_arg = ops
+            .iter()
+            .flat_map(|op| op.args.iter().copied())
+            .filter(|r| !r.is_constant() && !r.is_none())
+            .map(|r| r.0)
+            .max()
+            .unwrap_or(0);
+        let max_pos = ops
+            .iter()
+            .map(|op| op.pos)
+            .filter(|r| !r.is_constant() && !r.is_none())
+            .map(|r| r.0)
+            .max()
+            .unwrap_or(0);
+        let max_initial = initial_bounds.iter().map(|(r, _)| r.0).max().unwrap_or(0);
+        let num_inputs = (max_arg.max(max_pos).max(max_initial) as usize) + 1;
+        let mut ctx = OptContext::with_num_inputs(ops.len(), num_inputs);
 
         pass.setup();
         for (opref, bound) in initial_bounds {
-            pass.setintbound(*opref, bound.clone());
+            ctx.setintbound(*opref, bound);
         }
 
         for op in ops.iter() {
@@ -1676,7 +1640,8 @@ mod tests {
         }
 
         let result = ctx.new_operations.clone();
-        (result, pass, ctx)
+        let _ = pass;
+        (result, ctx)
     }
 
     fn make_op(opcode: OpCode, args: &[OpRef], pos: u32) -> Op {
@@ -1696,12 +1661,12 @@ mod tests {
         ];
         let ops = vec![make_op(OpCode::IntAdd, &[OpRef(0), OpRef(1)], 2)];
 
-        let (result, pass, _ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        let (result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::IntAdd);
 
         // The result should have bounds [5, 30]
-        let b = pass.bounds[2].as_ref().unwrap();
+        let b = ctx.getintbound(OpRef(2));
         assert_eq!(b.lower, 5);
         assert_eq!(b.upper, 30);
     }
@@ -1724,7 +1689,7 @@ mod tests {
             make_op(OpCode::GuardTrue, &[OpRef(2)], 3),
         ];
 
-        let (result, _pass, _ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        let (result, _ctx) = run_pass_with_bounds(&ops, &initial_bounds);
         // INT_LT should be removed (replaced by constant 1)
         // GUARD_TRUE on a known constant 1 should also be removed
         assert!(
@@ -1753,7 +1718,7 @@ mod tests {
             make_op(OpCode::GuardFalse, &[OpRef(2)], 3),
         ];
 
-        let (result, _pass, _ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        let (result, _ctx) = run_pass_with_bounds(&ops, &initial_bounds);
         assert!(
             result.is_empty()
                 || result
@@ -1781,10 +1746,10 @@ mod tests {
             make_op(OpCode::GuardTrue, &[OpRef(2)], 3),
         ];
 
-        let (_result, pass, _ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        let (_result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
 
         // After the guard, i0 should be < 10, meaning upper <= 9
-        let b0 = pass.bounds[0].as_ref().unwrap();
+        let b0 = ctx.getintbound(OpRef(0));
         assert!(
             b0.upper <= 9,
             "After GUARD_TRUE(INT_LT(i0, 10)), i0.upper should be <= 9, got {}",
@@ -1805,9 +1770,9 @@ mod tests {
             make_op(OpCode::GuardTrue, &[OpRef(2)], 3),
         ];
 
-        let (_result, pass, _ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        let (_result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
 
-        let b0 = pass.bounds[0].as_ref().unwrap();
+        let b0 = ctx.getintbound(OpRef(0));
         assert!(
             b0.lower >= 5,
             "After GUARD_TRUE(INT_GE(i0, 5)), i0.lower should be >= 5, got {}",
@@ -1831,7 +1796,7 @@ mod tests {
             make_op(OpCode::GuardNoOverflow, &[], 3),
         ];
 
-        let (result, _pass, _ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        let (result, _ctx) = run_pass_with_bounds(&ops, &initial_bounds);
         // The OVF should be replaced with IntAdd, and the guard removed
         assert!(
             result.iter().any(|op| op.opcode == OpCode::IntAdd),
@@ -1860,7 +1825,7 @@ mod tests {
             make_op(OpCode::GuardNoOverflow, &[], 3),
         ];
 
-        let (result, _pass, _ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        let (result, _ctx) = run_pass_with_bounds(&ops, &initial_bounds);
         assert!(
             result.iter().any(|op| op.opcode == OpCode::IntAddOvf),
             "INT_ADD_OVF should remain when overflow is possible"
@@ -1882,7 +1847,7 @@ mod tests {
             make_op(OpCode::GuardNoOverflow, &[], 3),
         ];
 
-        let (result, _pass, _ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        let (result, _ctx) = run_pass_with_bounds(&ops, &initial_bounds);
         assert!(
             result.iter().any(|op| op.opcode == OpCode::IntSub),
             "INT_SUB_OVF should be transformed to INT_SUB"
@@ -1904,7 +1869,7 @@ mod tests {
             make_op(OpCode::GuardNoOverflow, &[], 3),
         ];
 
-        let (result, _pass, _ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        let (result, _ctx) = run_pass_with_bounds(&ops, &initial_bounds);
         assert!(
             result.iter().any(|op| op.opcode == OpCode::IntMul),
             "INT_MUL_OVF should be transformed to INT_MUL"
@@ -1931,7 +1896,7 @@ mod tests {
             make_op(OpCode::Jump, &[OpRef(5), OpRef(5), OpRef(7)], 9),
         ];
 
-        let (result, _pass, _ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        let (result, _ctx) = run_pass_with_bounds(&ops, &initial_bounds);
         let guard_count = result
             .iter()
             .filter(|op| op.opcode == OpCode::GuardNoOverflow)
@@ -1953,14 +1918,14 @@ mod tests {
         ];
         let ops = vec![make_op(OpCode::IntLt, &[OpRef(0), OpRef(1)], 2)];
 
-        let (result, pass, ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        let (result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
         // Should be removed (replaced by constant 1)
         assert!(
             result.is_empty(),
             "INT_LT should be removed when known true"
         );
         // The constant should be set
-        let b = pass.getintbound(OpRef(2), &ctx);
+        let b = ctx.getintbound(OpRef(2));
         assert!(b.is_constant() && b.get_constant() == 1);
     }
 
@@ -1972,12 +1937,12 @@ mod tests {
         ];
         let ops = vec![make_op(OpCode::IntLt, &[OpRef(0), OpRef(1)], 2)];
 
-        let (result, pass, ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        let (result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
         assert!(
             result.is_empty(),
             "INT_LT should be removed when known false"
         );
-        let b = pass.getintbound(OpRef(2), &ctx);
+        let b = ctx.getintbound(OpRef(2));
         assert!(b.is_constant() && b.get_constant() == 0);
     }
 
@@ -1985,12 +1950,12 @@ mod tests {
     fn test_int_eq_same_arg() {
         let ops = vec![make_op(OpCode::IntEq, &[OpRef(0), OpRef(0)], 1)];
 
-        let (result, pass, ctx) = run_pass_with_bounds(&ops, &[]);
+        let (result, mut ctx) = run_pass_with_bounds(&ops, &[]);
         assert!(
             result.is_empty(),
             "INT_EQ(x, x) should be removed (always 1)"
         );
-        let b = pass.getintbound(OpRef(1), &ctx);
+        let b = ctx.getintbound(OpRef(1));
         assert!(b.is_constant() && b.get_constant() == 1);
     }
 
@@ -1998,12 +1963,12 @@ mod tests {
     fn test_int_ne_same_arg() {
         let ops = vec![make_op(OpCode::IntNe, &[OpRef(0), OpRef(0)], 1)];
 
-        let (result, pass, ctx) = run_pass_with_bounds(&ops, &[]);
+        let (result, mut ctx) = run_pass_with_bounds(&ops, &[]);
         assert!(
             result.is_empty(),
             "INT_NE(x, x) should be removed (always 0)"
         );
-        let b = pass.getintbound(OpRef(1), &ctx);
+        let b = ctx.getintbound(OpRef(1));
         assert!(b.is_constant() && b.get_constant() == 0);
     }
 
@@ -2015,7 +1980,7 @@ mod tests {
         ];
         let ops = vec![make_op(OpCode::IntLe, &[OpRef(0), OpRef(1)], 2)];
 
-        let (result, _pass, _ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        let (result, _ctx) = run_pass_with_bounds(&ops, &initial_bounds);
         assert!(
             result.is_empty(),
             "INT_LE should be removed when known true"
@@ -2030,7 +1995,7 @@ mod tests {
         ];
         let ops = vec![make_op(OpCode::IntGe, &[OpRef(0), OpRef(1)], 2)];
 
-        let (result, _pass, _ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        let (result, _ctx) = run_pass_with_bounds(&ops, &initial_bounds);
         assert!(
             result.is_empty(),
             "INT_GE should be removed when known true"
@@ -2047,9 +2012,9 @@ mod tests {
         ];
         let ops = vec![make_op(OpCode::IntSub, &[OpRef(0), OpRef(1)], 2)];
 
-        let (result, pass, _ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        let (result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
         assert_eq!(result.len(), 1);
-        let b = pass.bounds[2].as_ref().unwrap();
+        let b = ctx.getintbound(OpRef(2));
         // [10, 20] - [0, 5] = [5, 20]
         assert_eq!(b.lower, 5);
         assert_eq!(b.upper, 20);
@@ -2063,9 +2028,9 @@ mod tests {
         ];
         let ops = vec![make_op(OpCode::IntMul, &[OpRef(0), OpRef(1)], 2)];
 
-        let (result, pass, _ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        let (result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
         assert_eq!(result.len(), 1);
-        let b = pass.bounds[2].as_ref().unwrap();
+        let b = ctx.getintbound(OpRef(2));
         // [2, 5] * [3, 7] = [6, 35]
         assert_eq!(b.lower, 6);
         assert_eq!(b.upper, 35);
@@ -2079,9 +2044,9 @@ mod tests {
         ];
         let ops = vec![make_op(OpCode::IntAnd, &[OpRef(0), OpRef(1)], 2)];
 
-        let (result, pass, _ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        let (result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
         assert_eq!(result.len(), 1);
-        let b = pass.bounds[2].as_ref().unwrap();
+        let b = ctx.getintbound(OpRef(2));
         // AND of [0, 255] and [0, 15] -> [0, 15]
         assert!(b.lower >= 0);
         assert!(b.upper <= 15);
@@ -2092,8 +2057,8 @@ mod tests {
         let initial_bounds = vec![(OpRef(0), IntBound::bounded(-10, 20))];
         let ops = vec![make_op(OpCode::IntForceGeZero, &[OpRef(0)], 1)];
 
-        let (_result, pass, _ctx) = run_pass_with_bounds(&ops, &initial_bounds);
-        let b = pass.bounds[1].as_ref().unwrap();
+        let (_result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        let b = ctx.getintbound(OpRef(1));
         assert!(
             b.lower >= 0,
             "INT_FORCE_GE_ZERO result should be >= 0, got {}",
@@ -2110,8 +2075,8 @@ mod tests {
     fn test_arraylen_nonneg() {
         let ops = vec![make_op(OpCode::ArraylenGc, &[OpRef(0)], 1)];
 
-        let (_result, pass, _ctx) = run_pass_with_bounds(&ops, &[]);
-        let b = pass.bounds[1].as_ref().unwrap();
+        let (_result, mut ctx) = run_pass_with_bounds(&ops, &[]);
+        let b = ctx.getintbound(OpRef(1));
         assert!(b.lower >= 0, "ARRAYLEN_GC result should be non-negative");
     }
 
@@ -2119,8 +2084,8 @@ mod tests {
     fn test_strlen_nonneg() {
         let ops = vec![make_op(OpCode::Strlen, &[OpRef(0)], 1)];
 
-        let (_result, pass, _ctx) = run_pass_with_bounds(&ops, &[]);
-        let b = pass.bounds[1].as_ref().unwrap();
+        let (_result, mut ctx) = run_pass_with_bounds(&ops, &[]);
+        let b = ctx.getintbound(OpRef(1));
         assert!(b.lower >= 0, "STRLEN result should be non-negative");
     }
 
@@ -2129,8 +2094,8 @@ mod tests {
         let initial_bounds = vec![(OpRef(0), IntBound::bounded(3, 10))];
         let ops = vec![make_op(OpCode::IntNeg, &[OpRef(0)], 1)];
 
-        let (_result, pass, _ctx) = run_pass_with_bounds(&ops, &initial_bounds);
-        let b = pass.bounds[1].as_ref().unwrap();
+        let (_result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        let b = ctx.getintbound(OpRef(1));
         // neg([3, 10]) = [-10, -3]
         assert_eq!(b.lower, -10);
         assert_eq!(b.upper, -3);
@@ -2141,8 +2106,8 @@ mod tests {
         let initial_bounds = vec![(OpRef(0), IntBound::bounded(3, 10))];
         let ops = vec![make_op(OpCode::IntInvert, &[OpRef(0)], 1)];
 
-        let (_result, pass, _ctx) = run_pass_with_bounds(&ops, &initial_bounds);
-        let b = pass.bounds[1].as_ref().unwrap();
+        let (_result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        let b = ctx.getintbound(OpRef(1));
         // invert([3, 10]) = [!10, !3] = [-11, -4]
         assert_eq!(b.lower, -11);
         assert_eq!(b.upper, -4);
@@ -2154,9 +2119,9 @@ mod tests {
         let initial_bounds = vec![(OpRef(0), IntBound::unbounded())];
         let ops = vec![make_op(OpCode::IntSubOvf, &[OpRef(0), OpRef(0)], 1)];
 
-        let (result, pass, ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        let (result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
         assert!(result.is_empty(), "INT_SUB_OVF(x, x) should be removed");
-        let b = pass.getintbound(OpRef(1), &ctx);
+        let b = ctx.getintbound(OpRef(1));
         assert!(b.is_constant() && b.get_constant() == 0);
     }
 
@@ -2170,7 +2135,7 @@ mod tests {
         ];
         let ops = vec![make_op(OpCode::UintLt, &[OpRef(0), OpRef(1)], 2)];
 
-        let (result, _pass, _ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        let (result, _ctx) = run_pass_with_bounds(&ops, &initial_bounds);
         assert!(
             result.is_empty(),
             "UINT_LT should be removed when known true"
@@ -2187,8 +2152,8 @@ mod tests {
         ];
         let ops = vec![make_op(OpCode::IntLshift, &[OpRef(0), OpRef(1)], 2)];
 
-        let (_result, pass, _ctx) = run_pass_with_bounds(&ops, &initial_bounds);
-        let b = pass.bounds[2].as_ref().unwrap();
+        let (_result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        let b = ctx.getintbound(OpRef(2));
         // [1, 4] << 2 = [4, 16]
         assert_eq!(b.lower, 4);
         assert_eq!(b.upper, 16);
@@ -2204,8 +2169,8 @@ mod tests {
         ];
         let ops = vec![make_op(OpCode::IntRshift, &[OpRef(0), OpRef(1)], 2)];
 
-        let (_result, pass, _ctx) = run_pass_with_bounds(&ops, &initial_bounds);
-        let b = pass.bounds[2].as_ref().unwrap();
+        let (_result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        let b = ctx.getintbound(OpRef(2));
         // [8, 20] >> 2 = [2, 5]
         assert_eq!(b.lower, 2);
         assert_eq!(b.upper, 5);
@@ -2217,7 +2182,7 @@ mod tests {
     fn test_int_is_true_passthrough() {
         // RPython: IntIsTrue has no postprocess — just passes through.
         let ops = vec![make_op(OpCode::IntIsTrue, &[OpRef(0)], 1)];
-        let (result, _pass, _ctx) = run_pass_with_bounds(&ops, &[]);
+        let (result, _ctx) = run_pass_with_bounds(&ops, &[]);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::IntIsTrue);
     }
@@ -2226,7 +2191,7 @@ mod tests {
     fn test_int_is_zero_passthrough() {
         // RPython: IntIsZero has no postprocess — just passes through.
         let ops = vec![make_op(OpCode::IntIsZero, &[OpRef(0)], 1)];
-        let (result, _pass, _ctx) = run_pass_with_bounds(&ops, &[]);
+        let (result, _ctx) = run_pass_with_bounds(&ops, &[]);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::IntIsZero);
     }
@@ -2241,7 +2206,7 @@ mod tests {
         ];
         let ops = vec![make_op(OpCode::IntLt, &[OpRef(0), OpRef(1)], 2)];
 
-        let (result, pass, _ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        let (result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
         assert_eq!(
             result.len(),
             1,
@@ -2261,7 +2226,7 @@ mod tests {
         ];
         let ops = vec![make_op(OpCode::IntSignext, &[OpRef(0), OpRef(1)], 2)];
 
-        let (result, _pass, _ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        let (result, _ctx) = run_pass_with_bounds(&ops, &initial_bounds);
         assert!(
             result.is_empty(),
             "signext should be eliminated when value fits"
@@ -2277,11 +2242,11 @@ mod tests {
         ];
         let ops = vec![make_op(OpCode::IntSignext, &[OpRef(0), OpRef(1)], 2)];
 
-        let (result, pass, _ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        let (result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::IntSignext);
         // Result should have bounds [-128, 127]
-        let b = pass.bounds[2].as_ref().unwrap();
+        let b = ctx.getintbound(OpRef(2));
         assert!(b.lower >= -128);
         assert!(b.upper <= 127);
     }
@@ -2303,7 +2268,7 @@ mod tests {
             make_op(OpCode::IntLt, &[OpRef(2), OpRef(3)], 4),
         ];
 
-        let (result, _pass, ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        let (result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
         // INT_ADD should remain, INT_LT should be eliminated as constant true
         assert_eq!(result.len(), 1, "only INT_ADD should remain");
         assert_eq!(result[0].opcode, OpCode::IntAdd);
@@ -2324,8 +2289,8 @@ mod tests {
             make_op(OpCode::GuardTrue, &[OpRef(1)], 2),
         ];
 
-        let (_result, pass, _ctx) = run_pass_with_bounds(&ops, &initial_bounds);
-        let b0 = pass.bounds[0].as_ref().unwrap();
+        let (_result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        let b0 = ctx.getintbound(OpRef(0));
         assert!(
             b0.lower >= 1,
             "After GUARD_TRUE(INT_IS_TRUE(i0)), i0.lower should be >= 1, got {}",
@@ -2345,8 +2310,8 @@ mod tests {
             make_op(OpCode::GuardFalse, &[OpRef(1)], 2),
         ];
 
-        let (_result, pass, _ctx) = run_pass_with_bounds(&ops, &initial_bounds);
-        let b0 = pass.bounds[0].as_ref().unwrap();
+        let (_result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        let b0 = ctx.getintbound(OpRef(0));
         assert!(
             b0.is_constant() && b0.get_constant() == 0,
             "After GUARD_FALSE(INT_IS_TRUE(i0)), i0 should be 0, got [{}, {}]",
@@ -2363,8 +2328,8 @@ mod tests {
         let initial_bounds = vec![(OpRef(0), IntBound::bounded(3, 5))];
         let ops = vec![make_op(OpCode::IntAdd, &[OpRef(0), OpRef(0)], 1)];
 
-        let (_result, pass, _ctx) = run_pass_with_bounds(&ops, &initial_bounds);
-        let b = pass.bounds[1].as_ref().unwrap();
+        let (_result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        let b = ctx.getintbound(OpRef(1));
         assert!(b.lower >= 6, "lower should be >= 6, got {}", b.lower);
         assert!(b.upper <= 10, "upper should be <= 10, got {}", b.upper);
     }
@@ -2379,11 +2344,15 @@ mod tests {
         let initial_bounds = vec![(OpRef(0), IntBound::unbounded())];
         let ops = vec![make_op(OpCode::IntNeg, &[OpRef(0)], 1)];
 
-        let (_result, mut pass, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
-        // Manually tighten the result and trigger backward prop
-        pass.setintbound(OpRef(1), IntBound::bounded(-5, -1));
+        let (_result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        // Manually tighten the result and trigger backward prop. The
+        // OptIntBounds pass is stateless beyond `pure_from_args_cache`
+        // (everything else lives on `ctx.forwarded`), so we can spin up a
+        // fresh one to drive the backward propagation step.
+        let mut pass = OptIntBounds::new();
+        pass.setintbound(OpRef(1), IntBound::bounded(-5, -1), &mut ctx);
         pass.propagate_bounds_backward(OpRef(1), &mut ctx);
-        let b0 = pass.bounds[0].as_ref().unwrap();
+        let b0 = ctx.getintbound(OpRef(0));
         assert!(
             b0.lower >= 1,
             "backward neg: lower should be >= 1, got {}",
@@ -2400,8 +2369,8 @@ mod tests {
     fn test_strgetitem_bounds() {
         // postprocess_STRGETITEM: result should be bounded to [0, 255].
         let ops = vec![make_op(OpCode::Strgetitem, &[OpRef(0), OpRef(1)], 2)];
-        let (_result, pass, _ctx) = run_pass_with_bounds(&ops, &[]);
-        let b = pass.getintbound(OpRef(2), &_ctx);
+        let (_result, mut ctx) = run_pass_with_bounds(&ops, &[]);
+        let b = ctx.getintbound(OpRef(2));
         assert!(b.lower >= 0, "STRGETITEM lower should be >= 0");
         assert!(b.upper <= 255, "STRGETITEM upper should be <= 255");
     }

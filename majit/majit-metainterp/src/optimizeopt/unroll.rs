@@ -2662,11 +2662,18 @@ impl OptUnroll {
                 None => (ExportedPtrKind::None, None, None, None, false),
             };
         let int_bound = exported_int_bounds.and_then(|bounds| bounds.get(&resolved).cloned());
+        // Fall back to the box's _forwarded IntBound for the lower-bound
+        // constraint (heap.py array length etc.); this is the single source
+        // of truth that replaces the old `ctx.int_lower_bounds` map.
         let int_lower_bound = int_bound
             .as_ref()
             .map(|bound| bound.lower)
             .filter(|lower| *lower > i64::MIN)
-            .or_else(|| ctx.int_lower_bounds.get(&resolved).copied());
+            .or_else(|| {
+                ctx.peek_intbound(resolved)
+                    .map(|b| b.lower)
+                    .filter(|l| *l > i64::MIN)
+            });
         ExportedValueInfo {
             constant,
             ptr_info: ctx.get_ptr_info(resolved).cloned(),
@@ -2794,17 +2801,17 @@ impl OptUnroll {
         //   tvalue/tmask → UNKNOWN
         // This ensures Phase 2 gets safe bounds (e.g., [0, MAXINT] for
         // a loop counter) without the exact preamble values.
+        // RPython parity: imported preamble bounds become the box's
+        // forwarded IntBound directly (optimizer.py:115-125 setintbound).
         if let Some(bound) = &info.int_bound {
             let widened = bound.widen();
-            ctx.imported_int_bounds.insert(target, widened);
+            ctx.setintbound(target, &widened);
         }
         if let Some(lower) = info.int_lower_bound {
             if lower >= 0 {
-                let entry = ctx
-                    .imported_int_bounds
-                    .entry(target)
-                    .or_insert_with(crate::optimizeopt::intutils::IntBound::unbounded);
-                let _ = entry.make_ge_const(lower);
+                let mut lb = crate::optimizeopt::intutils::IntBound::unbounded();
+                let _ = lb.make_ge_const(lower);
+                ctx.setintbound(target, &lb);
             }
         }
     }
@@ -5108,15 +5115,12 @@ mod tests {
         let mut ctx2 = crate::optimizeopt::OptContext::with_num_inputs(4, 1);
         let label_args = import_state(&[OpRef(0)], &exported, &mut ctx2);
         assert_eq!(label_args, vec![OpRef(21)]);
-        // unroll.py:93-96: IntBound IS imported with widen().
+        // unroll.py:93-96: IntBound IS imported with widen() and stored
+        // directly on the box's _forwarded slot via setintbound.
         // widen() relaxes bounds: lower < MININT/2 → MININT, upper > MAXINT/2 → MAXINT.
         // For [10, 20], both are within MININT/2..MAXINT/2 so widen() preserves them.
-        assert_eq!(
-            ctx2.imported_int_bounds
-                .get(&OpRef(21))
-                .map(|b| (b.lower, b.upper)),
-            Some((10, 20))
-        );
+        let imported_bound = ctx2.getintbound(OpRef(21));
+        assert_eq!((imported_bound.lower, imported_bound.upper), (10, 20));
     }
 
     #[test]

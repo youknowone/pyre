@@ -1952,13 +1952,15 @@ impl OptHeap {
                     return OptimizationResult::Remove;
                 }
                 self.cached_arraylens.insert((array, descr_idx), op.pos);
-                // heap.py: transfer array length bound to the ARRAYLEN result.
-                // intbounds can use this to eliminate length guards.
+                // heap.py: transfer array length bound to the ARRAYLEN result
+                // by writing it onto the box's _forwarded slot directly
+                // (optimizer.py:115-125 setintbound). intbounds reads this
+                // through ctx.getintbound and uses it to eliminate length
+                // guards.
                 if let Some(&min_len) = self.array_min_lengths.get(&array) {
-                    let entry = ctx.int_lower_bounds.entry(op.pos).or_insert(0);
-                    if min_len > *entry {
-                        *entry = min_len;
-                    }
+                    let mut bound = crate::optimizeopt::intutils::IntBound::unbounded();
+                    let _ = bound.make_ge_const(min_len);
+                    ctx.setintbound(op.pos, &bound);
                 }
                 OptimizationResult::Emit(op.clone())
             }

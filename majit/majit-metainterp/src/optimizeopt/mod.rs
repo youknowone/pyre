@@ -179,20 +179,14 @@ pub struct OptContext {
     /// Deferred until emit adds the guard to new_operations.
     pub(crate) pending_mark_last_guard: Option<OpRef>,
     // ptr_info merged into forwarded (Forwarded::Info variant)
-    /// Known lower bounds for integer-typed OpRefs, shared across passes.
-    ///
-    /// heap.py: arrayinfo.getlenbound().make_gt_const(index) records that
-    /// an ARRAYLEN_GC result >= index+1. intbounds.py uses this to
-    /// eliminate redundant length guards.
-    pub int_lower_bounds: HashMap<OpRef, i64>,
-    /// optimizer.py:415-426 parity: per-OpRef IntBound from the IntBounds pass.
-    /// Synced at the end of each IntBounds.propagate_forward so that later
-    /// passes (Rewrite, Pure, etc.) calling make_constant can validate that
-    /// the constant is within the known range.
-    pub int_bounds: Vec<Option<IntBound>>,
-    /// RPython unroll.py: widened integer knowledge imported from the preamble.
-    /// OptIntBounds intersects these with freshly discovered facts in phase 2.
-    pub imported_int_bounds: HashMap<OpRef, IntBound>,
+    //
+    // RPython parity: per-OpRef IntBound storage lives ENTIRELY on
+    // `box._forwarded` (Forwarded::IntBound), accessed via getintbound /
+    // setintbound. The previous `int_lower_bounds` (heap.py array length
+    // hint), `int_bounds` (per-pass snapshot), and `imported_int_bounds`
+    // (preamble import) maps were a majit-only divergence from RPython's
+    // single source of truth. They've been merged into Forwarded::IntBound
+    // at write time so reads naturally see all sources via getintbound.
     /// RPython shortpreamble.py / heap.py: imported cached constant-index array
     /// reads from the preamble.
     pub imported_short_arrayitems: HashMap<(OpRef, u32, i64), OpRef>,
@@ -724,9 +718,6 @@ impl OptContext {
             extra_operations_after: VecDeque::new(),
             pending_guard_class_postprocess: None,
             pending_mark_last_guard: None,
-            int_lower_bounds: HashMap::new(),
-            int_bounds: Vec::new(),
-            imported_int_bounds: HashMap::new(),
             imported_short_arrayitems: HashMap::new(),
             imported_short_arrayitem_descrs: HashMap::new(),
             imported_short_pure_ops: Vec::new(),
@@ -807,9 +798,6 @@ impl OptContext {
             extra_operations_after: VecDeque::new(),
             pending_guard_class_postprocess: None,
             pending_mark_last_guard: None,
-            int_lower_bounds: HashMap::new(),
-            int_bounds: Vec::new(),
-            imported_int_bounds: HashMap::new(),
             imported_short_arrayitems: HashMap::new(),
             imported_short_arrayitem_descrs: HashMap::new(),
             imported_short_pure_ops: Vec::new(),
@@ -1712,6 +1700,30 @@ impl OptContext {
         }
     }
 
+    /// Read-only variant of `getintbound` — returns the IntBound stored on
+    /// `box._forwarded` without materializing an unbounded one on first
+    /// access. Returns `None` for boxes that have no IntBound forwarding.
+    /// Used by exporters that take `&OptContext` and cannot mutate.
+    pub fn peek_intbound(&self, opref: OpRef) -> Option<crate::optimizeopt::intutils::IntBound> {
+        use crate::optimizeopt::info::Forwarded;
+        let replaced = self.get_box_replacement(opref);
+        if let Some(Value::Int(v)) = self.get_constant(replaced) {
+            return Some(crate::optimizeopt::intutils::IntBound::from_constant(
+                *v as i64,
+            ));
+        }
+        if replaced.is_constant() {
+            return None;
+        }
+        let idx = replaced.0 as usize;
+        if idx < self.forwarded.len() {
+            if let Forwarded::IntBound(b) = &self.forwarded[idx] {
+                return Some(b.clone());
+            }
+        }
+        None
+    }
+
     /// optimizer.py:99-113: getintbound(op) — get or create IntBound for
     /// an int-typed box. Lazy: creates unbounded on first access and stores
     /// it in forwarded[].
@@ -1769,6 +1781,62 @@ impl OptContext {
                 // Already has Op/Info/Const forwarding — don't overwrite.
                 // RPython: if cur is not IntBound, set_forwarded replaces it,
                 // but that case is rare (RawBufferPtrInfo).
+            }
+        }
+    }
+
+    /// In-place mutation helper for the IntBound stored on `box._forwarded`.
+    ///
+    /// RPython pattern equivalence: where RPython writes
+    /// `self.getintbound(box).<method>(...)` and the method mutates the
+    /// `IntBound` returned from `box.get_forwarded()` directly, the Rust
+    /// borrow checker forces us to materialize the bound, mutate it, and
+    /// store it back. This helper performs that read-modify-write atomically
+    /// and threads through any return value from the closure (e.g. the
+    /// `Result<bool, InvalidLoop>` flag from `intersect`/`make_*`).
+    ///
+    /// For Constant boxes the bound is "fixed" — RPython's `getintbound`
+    /// returns `IntBound.from_constant(...)` and any `intersect` is a
+    /// no-op (the constant value is already in range or InvalidLoop). This
+    /// helper mirrors that by running the closure on a temporary that is
+    /// discarded after — the constant cannot be widened.
+    ///
+    /// For non-IntBound forwarded info (RawBufferPtrInfo etc.), RPython's
+    /// `getintbound` falls through to "return IntBound.unbounded()" without
+    /// overwriting forwarding. We mirror by running the closure on a
+    /// temporary unbounded that is discarded.
+    pub fn with_intbound_mut<F, R>(&mut self, opref: OpRef, f: F) -> R
+    where
+        F: FnOnce(&mut crate::optimizeopt::intutils::IntBound) -> R,
+    {
+        use crate::optimizeopt::info::Forwarded;
+        let replaced = self.get_box_replacement(opref);
+        if let Some(Value::Int(v)) = self.get_constant(replaced) {
+            let mut tmp = crate::optimizeopt::intutils::IntBound::from_constant(*v as i64);
+            return f(&mut tmp);
+        }
+        if replaced.is_constant() {
+            let mut tmp = crate::optimizeopt::intutils::IntBound::unbounded();
+            return f(&mut tmp);
+        }
+        let idx = replaced.0 as usize;
+        if idx >= self.forwarded.len() {
+            self.forwarded.resize(idx + 1, Forwarded::None);
+        }
+        match &mut self.forwarded[idx] {
+            Forwarded::IntBound(b) => f(b),
+            fwd @ Forwarded::None => {
+                // optimizer.py:110-112 first-access: materialize unbounded.
+                let mut new_bound = crate::optimizeopt::intutils::IntBound::unbounded();
+                let result = f(&mut new_bound);
+                *fwd = Forwarded::IntBound(new_bound);
+                result
+            }
+            _ => {
+                // Forwarded::Const/Op/Info — RPython's "rare case" arm:
+                // return IntBound.unbounded() without overwriting forwarding.
+                let mut tmp = crate::optimizeopt::intutils::IntBound::unbounded();
+                f(&mut tmp)
             }
         }
     }
@@ -2331,18 +2399,12 @@ impl OptContext {
         let _ = frame_sizes;
     }
 
-    /// Get the IntBound for an OpRef, if known from imported bounds or constants.
+    /// Get the IntBound for an OpRef, if known from forwarded info or constants.
+    /// Returns `None` for boxes that have no IntBound in `box._forwarded`.
+    /// Equivalent to `peek_intbound`; preserved for legacy callers in
+    /// rewrite.rs that gate optimizations on "is a bound known?".
     pub fn get_int_bound(&self, opref: OpRef) -> Option<crate::optimizeopt::intutils::IntBound> {
-        let opref = self.get_box_replacement(opref);
-        // Check imported bounds first (from Phase 1 / preamble)
-        if let Some(bound) = self.imported_int_bounds.get(&opref) {
-            return Some(bound.clone());
-        }
-        // Constants have exact bounds
-        if let Some(c) = self.get_constant_int(opref) {
-            return Some(crate::optimizeopt::intutils::IntBound::from_constant(c));
-        }
-        None
+        self.peek_intbound(opref)
     }
 
     /// Allocate a fresh constant OpRef and store the value.
@@ -2534,8 +2596,6 @@ impl OptContext {
         // Reset next_pos to the iteration's first fresh OpRef position
         // (right after the inputarg slice in the OpRef namespace).
         self.next_pos = self.inputarg_base + self.num_inputs;
-        self.int_bounds.clear();
-        self.imported_int_bounds.clear();
         self.const_infos.clear();
     }
 
@@ -3108,7 +3168,7 @@ pub trait Optimization {
     fn export_arg_int_bounds(
         &self,
         _args: &[OpRef],
-        _ctx: &OptContext,
+        _ctx: &mut OptContext,
     ) -> HashMap<OpRef, IntBound> {
         HashMap::new()
     }

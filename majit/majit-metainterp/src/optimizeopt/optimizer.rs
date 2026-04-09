@@ -466,11 +466,11 @@ impl Optimizer {
                 ctx.set_ptr_info(opref, crate::optimizeopt::info::PtrInfo::nonnull());
             }
             VirtualStateInfo::IntBounded(bound) => {
+                // RPython parity: imported preamble bounds become the box's
+                // forwarded IntBound directly (optimizer.py:115-125
+                // setintbound). No separate "imported" or "lower-only" maps.
                 let widened = bound.widen();
-                if widened.lower > i64::MIN {
-                    ctx.int_lower_bounds.insert(opref, widened.lower);
-                }
-                ctx.imported_int_bounds.insert(opref, widened);
+                ctx.setintbound(opref, &widened);
             }
             VirtualStateInfo::Unknown => {}
         }
@@ -2073,7 +2073,7 @@ impl Optimizer {
                     );
                 }
             }
-            let exported_int_bounds = self.collect_exported_int_bounds(&jump.args, &ctx);
+            let exported_int_bounds = self.collect_exported_int_bounds(&jump.args, &mut ctx);
             // RPython unroll.py passes optimize_preamble()'s inputargs here,
             // i.e. the external loop-entry contract, not the optimizer's
             // internal position base (`ctx.num_inputs`), which may be widened
@@ -2641,7 +2641,7 @@ impl Optimizer {
     fn collect_exported_int_bounds(
         &self,
         args: &[OpRef],
-        ctx: &OptContext,
+        ctx: &mut OptContext,
     ) -> std::collections::HashMap<OpRef, crate::optimizeopt::intutils::IntBound> {
         let mut exported = std::collections::HashMap::new();
         for pass in &self.passes {
