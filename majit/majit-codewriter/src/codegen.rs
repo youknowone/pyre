@@ -62,6 +62,10 @@ pub fn generate_from_pipeline(result: &crate::passes::ProgramPipelineResult) -> 
     generate_concrete_object_helpers(&mut out);
     generate_trace_functions(&mut out);
     generate_typed_trace_methods(&mut out);
+    // Trait impls are emitted separately via `generate_trait_impls_string()`,
+    // because the main pipeline output is `include!`d twice (once at
+    // crate root and once inside `pub mod generated`), which would cause
+    // duplicate trait impls (E0119).
 
     let flattened_count = result
         .opcode_dispatch
@@ -2112,6 +2116,783 @@ pub fn generated_iter_next_value(
     ctx.heap_cache_mut().setfield_cached(iter, ri_descr_idx, next_current);
     frame.remember_value_type(current, majit_ir::Type::Int);
     Some((current, concrete_current))
+}
+"#);
+}
+
+/// Generate Rust source for the auto-generated `OpcodeHandler` trait impls.
+///
+/// Returned independently from `generate_from_pipeline()` because the main
+/// generated file is `include!`d twice (once inside `pub mod generated`
+/// and once at crate root). Trait impls would conflict (E0119) under double
+/// inclusion, so build.rs writes this to a dedicated `jit_trace_trait_impls.rs`
+/// that lib.rs includes only once at crate root.
+pub fn generate_trait_impls_string() -> String {
+    let mut out = String::new();
+    out.push_str("// Auto-generated OpcodeHandler trait impls — do not edit.\n");
+    out.push_str("// Source: majit/majit-codewriter/src/codegen.rs::generate_trait_impls\n\n");
+    generate_trait_impls(&mut out);
+    out
+}
+
+fn generate_trait_impls(out: &mut String) {
+    // ── OpcodeHandler trait impls (Step 3 — simple, regular handlers) ──
+    //
+    // Replaces hand-written `impl XxxOpcodeHandler for MIFrame` blocks
+    // in pyre/pyre-jit-trace/src/trace_opcode.rs whose method bodies follow
+    // a regular shape (build concrete value → call trace_* helper → wrap in
+    // FrontendOp). The generated file is `include!`d at crate root, so all
+    // referenced items use fully-qualified `crate::*` / `pyre_object::*` paths.
+
+    out.push_str(r#"
+// ── Auto-generated OpcodeHandler trait impls ──
+//
+// The following `impl` blocks replace the hand-written ones that used to
+// live in pyre/pyre-jit-trace/src/trace_opcode.rs. Each method body is
+// trivially regular: build a ConcreteValue, call the matching trace_*
+// helper, wrap the result in FrontendOp.
+
+impl pyre_interpreter::SharedOpcodeHandler for crate::state::MIFrame {
+    type Value = crate::state::FrontendOp;
+
+    fn push_value(&mut self, value: Self::Value) -> Result<(), pyre_interpreter::PyError> {
+        self.with_ctx(|this, ctx| {
+            crate::state::MIFrame::push_value(this, ctx, value.opref, value.concrete);
+            Ok(())
+        })
+    }
+
+    fn pop_value(&mut self) -> Result<Self::Value, pyre_interpreter::PyError> {
+        let s = self.sym();
+        let stack_idx = s.valuestackdepth.checked_sub(s.nlocals + 1).unwrap_or(0);
+        let concrete = s
+            .concrete_stack
+            .get(stack_idx)
+            .copied()
+            .unwrap_or(crate::state::ConcreteValue::Null);
+        let opref =
+            self.with_ctx(|this, ctx| crate::state::MIFrame::pop_value(this, ctx))?;
+        Ok(crate::state::FrontendOp::new(opref, concrete))
+    }
+
+    fn peek_at(&mut self, depth: usize) -> Result<Self::Value, pyre_interpreter::PyError> {
+        let s = self.sym();
+        let stack_idx = s.valuestackdepth.checked_sub(s.nlocals + depth + 1);
+        let concrete = stack_idx
+            .and_then(|idx| s.concrete_stack.get(idx).copied())
+            .unwrap_or(crate::state::ConcreteValue::Null);
+        let opref = self
+            .with_ctx(|this, ctx| crate::state::MIFrame::peek_value(this, ctx, depth))?;
+        Ok(crate::state::FrontendOp::new(opref, concrete))
+    }
+
+    fn guard_nonnull_value(
+        &mut self,
+        value: Self::Value,
+    ) -> Result<(), pyre_interpreter::PyError> {
+        self.with_ctx(|this, ctx| {
+            crate::state::MIFrame::guard_nonnull(this, ctx, value.opref);
+            Ok(())
+        })
+    }
+
+    fn make_function(
+        &mut self,
+        code_obj: Self::Value,
+    ) -> Result<Self::Value, pyre_interpreter::PyError> {
+        use crate::helpers::TraceHelperAccess;
+        let opref = self.trace_make_function(code_obj.opref)?;
+        Ok(crate::state::FrontendOp::opref_only(opref))
+    }
+
+    fn call_callable(
+        &mut self,
+        callable: Self::Value,
+        args: &[Self::Value],
+    ) -> Result<Self::Value, pyre_interpreter::PyError> {
+        // executor.execute_varargs parity: compute concrete result.
+        let concrete_callable = callable.concrete.to_pyobj();
+        let concrete_args: Vec<pyre_object::PyObjectRef> =
+            args.iter().map(|a| a.concrete.to_pyobj()).collect();
+        let mut result_concrete = crate::state::ConcreteValue::Null;
+        if !concrete_callable.is_null() && concrete_args.iter().all(|v| !v.is_null()) {
+            unsafe {
+                if pyre_interpreter::is_function(concrete_callable)
+                    && pyre_interpreter::is_builtin_code(
+                        pyre_interpreter::getcode(concrete_callable)
+                            as pyre_object::PyObjectRef,
+                    )
+                {
+                    let code = pyre_interpreter::getcode(concrete_callable);
+                    let func = pyre_interpreter::builtin_code_get(
+                        code as pyre_object::PyObjectRef,
+                    );
+                    let result = func(&concrete_args).unwrap_or(pyre_object::PY_NULL);
+                    result_concrete = crate::state::ConcreteValue::from_pyobj(result);
+                } else if pyre_interpreter::is_function(concrete_callable) {
+                    // pyjitpl.py:2025 concrete execution only.
+                    use std::cell::Cell;
+                    thread_local! {
+                        static CONCRETE_CALL_DEPTH: Cell<u32> = Cell::new(0);
+                    }
+                    let depth = CONCRETE_CALL_DEPTH.with(|d| d.get());
+                    if depth < 32 {
+                        CONCRETE_CALL_DEPTH.with(|d| d.set(depth + 1));
+                        let exec_ctx = self.sym().concrete_execution_context;
+                        let result =
+                            pyre_interpreter::call::call_user_function_plain_with_ctx(
+                                exec_ctx,
+                                concrete_callable,
+                                &concrete_args,
+                            );
+                        CONCRETE_CALL_DEPTH.with(|d| d.set(depth));
+                        if let Ok(result) = result {
+                            result_concrete = crate::state::ConcreteValue::from_pyobj(result);
+                        }
+                    }
+                }
+            }
+        }
+        let arg_oprefs: Vec<majit_ir::OpRef> = args.iter().map(|a| a.opref).collect();
+        let opref = self.call_callable_value(
+            callable.opref,
+            &arg_oprefs,
+            concrete_callable,
+            &concrete_args,
+        )?;
+        Ok(crate::state::FrontendOp::new(opref, result_concrete))
+    }
+
+    fn build_list(
+        &mut self,
+        items: &[Self::Value],
+    ) -> Result<Self::Value, pyre_interpreter::PyError> {
+        use crate::helpers::TraceHelperAccess;
+        let concrete_items: Vec<pyre_object::PyObjectRef> =
+            items.iter().map(|i| i.concrete.to_pyobj()).collect();
+        let mut result_concrete = crate::state::ConcreteValue::Null;
+        if concrete_items.iter().all(|v| !v.is_null()) {
+            let list = pyre_interpreter::build_list_from_refs(&concrete_items);
+            result_concrete = crate::state::ConcreteValue::from_pyobj(list);
+        }
+        let item_oprefs: Vec<majit_ir::OpRef> = items.iter().map(|i| i.opref).collect();
+        let opref = self.trace_build_list(&item_oprefs)?;
+        Ok(crate::state::FrontendOp::new(opref, result_concrete))
+    }
+
+    fn build_tuple(
+        &mut self,
+        items: &[Self::Value],
+    ) -> Result<Self::Value, pyre_interpreter::PyError> {
+        use crate::helpers::TraceHelperAccess;
+        let concrete_items: Vec<pyre_object::PyObjectRef> =
+            items.iter().map(|i| i.concrete.to_pyobj()).collect();
+        let mut result_concrete = crate::state::ConcreteValue::Null;
+        if concrete_items.iter().all(|v| !v.is_null()) {
+            let tuple = pyre_interpreter::build_tuple_from_refs(&concrete_items);
+            result_concrete = crate::state::ConcreteValue::from_pyobj(tuple);
+        }
+        let item_oprefs: Vec<majit_ir::OpRef> = items.iter().map(|i| i.opref).collect();
+        let opref = self.trace_build_tuple(&item_oprefs)?;
+        Ok(crate::state::FrontendOp::new(opref, result_concrete))
+    }
+
+    fn build_map(
+        &mut self,
+        items: &[Self::Value],
+    ) -> Result<Self::Value, pyre_interpreter::PyError> {
+        use crate::helpers::TraceHelperAccess;
+        let concrete_items: Vec<pyre_object::PyObjectRef> =
+            items.iter().map(|i| i.concrete.to_pyobj()).collect();
+        let mut result_concrete = crate::state::ConcreteValue::Null;
+        if concrete_items.iter().all(|v| !v.is_null()) {
+            let dict = pyre_interpreter::build_map_from_refs(&concrete_items);
+            result_concrete = crate::state::ConcreteValue::from_pyobj(dict);
+        }
+        let item_oprefs: Vec<majit_ir::OpRef> = items.iter().map(|i| i.opref).collect();
+        let opref = self.trace_build_map(&item_oprefs)?;
+        Ok(crate::state::FrontendOp::new(opref, result_concrete))
+    }
+
+    fn store_subscr(
+        &mut self,
+        obj: Self::Value,
+        key: Self::Value,
+        value: Self::Value,
+    ) -> Result<(), pyre_interpreter::PyError> {
+        // MIFrame parity: trace-only, no concrete mutation.
+        // Root frame: interpreter executes the real STORE_SUBSCR.
+        // Inline frame: MetaInterp.concrete_execute_step handles it.
+        self.store_subscr_value(
+            obj.opref,
+            key.opref,
+            value.opref,
+            obj.concrete.to_pyobj(),
+            key.concrete.to_pyobj(),
+            value.concrete.to_pyobj(),
+        )
+    }
+
+    fn list_append(
+        &mut self,
+        list: Self::Value,
+        value: Self::Value,
+    ) -> Result<(), pyre_interpreter::PyError> {
+        // MIFrame parity: trace-only, no concrete mutation.
+        self.list_append_value(
+            list.opref,
+            value.opref,
+            list.concrete.to_pyobj(),
+            value.concrete.to_pyobj(),
+        )
+    }
+
+    fn unpack_sequence(
+        &mut self,
+        seq: Self::Value,
+        count: usize,
+    ) -> Result<Vec<Self::Value>, pyre_interpreter::PyError> {
+        self.unpack_sequence_value(seq.opref, count, seq.concrete.to_pyobj())
+    }
+
+    fn load_attr(
+        &mut self,
+        obj: Self::Value,
+        name: &str,
+    ) -> Result<Self::Value, pyre_interpreter::PyError> {
+        use crate::helpers::TraceHelperAccess;
+        let mut result_concrete = crate::state::ConcreteValue::Null;
+        let c_obj = obj.concrete.to_pyobj();
+        if !c_obj.is_null() {
+            if let Ok(result) = pyre_interpreter::baseobjspace::getattr(c_obj, name) {
+                result_concrete = crate::state::ConcreteValue::from_pyobj(result);
+            }
+        }
+        let opref = self.trace_load_attr(obj.opref, name)?;
+        Ok(crate::state::FrontendOp::new(opref, result_concrete))
+    }
+
+    fn store_attr(
+        &mut self,
+        obj: Self::Value,
+        name: &str,
+        value: Self::Value,
+    ) -> Result<(), pyre_interpreter::PyError> {
+        use crate::helpers::TraceHelperAccess;
+        self.trace_store_attr(obj.opref, name, value.opref)
+    }
+}
+
+impl pyre_interpreter::ConstantOpcodeHandler for crate::state::MIFrame {
+    fn int_constant(&mut self, value: i64) -> Result<Self::Value, pyre_interpreter::PyError> {
+        use crate::helpers::TraceHelperAccess;
+        let concrete = crate::state::ConcreteValue::Int(value);
+        let opref = self.trace_int_constant(value)?;
+        Ok(crate::state::FrontendOp::new(opref, concrete))
+    }
+
+    fn bigint_constant(
+        &mut self,
+        value: &pyre_interpreter::PyBigInt,
+    ) -> Result<Self::Value, pyre_interpreter::PyError> {
+        use crate::helpers::TraceHelperAccess;
+        let concrete = crate::state::ConcreteValue::Ref(pyre_object::w_long_new(value.clone()));
+        let opref = self.trace_bigint_constant(value)?;
+        Ok(crate::state::FrontendOp::new(opref, concrete))
+    }
+
+    fn float_constant(&mut self, value: f64) -> Result<Self::Value, pyre_interpreter::PyError> {
+        use crate::helpers::TraceHelperAccess;
+        let concrete = crate::state::ConcreteValue::Float(value);
+        let opref = self.trace_float_constant(value)?;
+        Ok(crate::state::FrontendOp::new(opref, concrete))
+    }
+
+    fn bool_constant(&mut self, value: bool) -> Result<Self::Value, pyre_interpreter::PyError> {
+        use crate::helpers::TraceHelperAccess;
+        let concrete = crate::state::ConcreteValue::Int(value as i64);
+        let opref = self.trace_bool_constant(value)?;
+        Ok(crate::state::FrontendOp::new(opref, concrete))
+    }
+
+    fn str_constant(&mut self, value: &str) -> Result<Self::Value, pyre_interpreter::PyError> {
+        use crate::helpers::TraceHelperAccess;
+        let concrete = crate::state::ConcreteValue::Ref(pyre_object::w_str_new(value));
+        let opref = self.trace_str_constant(value)?;
+        Ok(crate::state::FrontendOp::new(opref, concrete))
+    }
+
+    fn bytes_constant(&mut self, value: &[u8]) -> Result<Self::Value, pyre_interpreter::PyError> {
+        use crate::helpers::TraceHelperAccess;
+        // pyre lacks a separate bytes type — bytes literals materialise as
+        // bytearray. Call sites that need true immutability must copy.
+        let bytes_ref = pyre_object::bytearrayobject::w_bytearray_from_bytes(value);
+        let concrete = crate::state::ConcreteValue::Ref(bytes_ref);
+        let opref = self.trace_bytes_constant(value)?;
+        Ok(crate::state::FrontendOp::new(opref, concrete))
+    }
+
+    fn code_constant(
+        &mut self,
+        code: &pyre_interpreter::CodeObject,
+    ) -> Result<Self::Value, pyre_interpreter::PyError> {
+        use crate::helpers::TraceHelperAccess;
+        let concrete = crate::state::ConcreteValue::Ref(
+            code as *const pyre_interpreter::CodeObject as pyre_object::PyObjectRef,
+        );
+        let opref = self.trace_code_constant(code)?;
+        Ok(crate::state::FrontendOp::new(opref, concrete))
+    }
+
+    fn none_constant(&mut self) -> Result<Self::Value, pyre_interpreter::PyError> {
+        use crate::helpers::TraceHelperAccess;
+        let concrete = crate::state::ConcreteValue::Ref(pyre_object::w_none());
+        let opref = self.trace_none_constant()?;
+        Ok(crate::state::FrontendOp::new(opref, concrete))
+    }
+}
+
+impl pyre_interpreter::StackOpcodeHandler for crate::state::MIFrame {
+    fn swap_values(&mut self, depth: usize) -> Result<(), pyre_interpreter::PyError> {
+        self.with_ctx(|this, ctx| crate::state::MIFrame::swap_values(this, ctx, depth))
+    }
+}
+
+impl pyre_interpreter::TruthOpcodeHandler for crate::state::MIFrame {
+    type Truth = majit_ir::OpRef;
+
+    fn truth_value(
+        &mut self,
+        value: Self::Value,
+    ) -> Result<Self::Truth, pyre_interpreter::PyError> {
+        self.truth_value_direct(value.opref, value.concrete.to_pyobj())
+    }
+
+    fn bool_value_from_truth(
+        &mut self,
+        truth: Self::Truth,
+        negate: bool,
+    ) -> Result<Self::Value, pyre_interpreter::PyError> {
+        use crate::helpers::TraceHelperAccess;
+        let mut result_concrete = crate::state::ConcreteValue::Null;
+        if let Some(concrete_truth) = self.sym().last_comparison_concrete_truth {
+            let result = if negate { !concrete_truth } else { concrete_truth };
+            result_concrete = crate::state::ConcreteValue::Int(result as i64);
+        }
+        let opref = self.trace_bool_value_from_truth(truth, negate)?;
+        Ok(crate::state::FrontendOp::new(opref, result_concrete))
+    }
+}
+
+impl pyre_interpreter::IterOpcodeHandler for crate::state::MIFrame {
+    fn ensure_iter_value(
+        &mut self,
+        iter: Self::Value,
+    ) -> Result<(), pyre_interpreter::PyError> {
+        self.with_ctx(|this, ctx| {
+            crate::state::MIFrame::guard_range_iter(this, ctx, iter.opref);
+            Ok(())
+        })
+    }
+
+    fn concrete_iter_continues(
+        &mut self,
+        iter: Self::Value,
+    ) -> Result<bool, pyre_interpreter::PyError> {
+        let concrete_iter = iter.concrete.to_pyobj();
+        crate::state::MIFrame::concrete_iter_continues(self, concrete_iter)
+    }
+
+    fn iter_next_value(
+        &mut self,
+        iter: Self::Value,
+    ) -> Result<Self::Value, pyre_interpreter::PyError> {
+        let concrete_iter = iter.concrete.to_pyobj();
+        crate::state::MIFrame::iter_next_value(self, iter.opref, concrete_iter)
+    }
+
+    fn guard_optional_value(
+        &mut self,
+        next: Self::Value,
+        continues: bool,
+    ) -> Result<(), pyre_interpreter::PyError> {
+        self.with_ctx(|this, ctx| {
+            crate::state::MIFrame::record_for_iter_guard(this, ctx, next.opref, continues);
+            Ok(())
+        })
+    }
+
+    fn on_iter_exhausted(&mut self, target: usize) -> Result<(), pyre_interpreter::PyError> {
+        self.with_ctx(|this, ctx| {
+            crate::state::MIFrame::set_next_instr(this, ctx, target);
+            Ok(())
+        })
+    }
+}
+
+impl pyre_interpreter::LocalOpcodeHandler for crate::state::MIFrame {
+    fn load_local_value(
+        &mut self,
+        idx: usize,
+    ) -> Result<Self::Value, pyre_interpreter::PyError> {
+        let concrete = self
+            .sym()
+            .concrete_locals
+            .get(idx)
+            .copied()
+            .unwrap_or(crate::state::ConcreteValue::Null);
+        let opref = self.with_ctx(|this, ctx| crate::state::MIFrame::load_local_value(this, ctx, idx))?;
+        Ok(crate::state::FrontendOp::new(opref, concrete))
+    }
+
+    fn load_local_checked_value(
+        &mut self,
+        idx: usize,
+        name: &str,
+    ) -> Result<Self::Value, pyre_interpreter::PyError> {
+        let _ = name;
+        let concrete = self
+            .sym()
+            .concrete_locals
+            .get(idx)
+            .copied()
+            .unwrap_or(crate::state::ConcreteValue::Null);
+        let opref = self.with_ctx(|this, ctx| crate::state::MIFrame::load_local_value(this, ctx, idx))?;
+        if self.value_type(opref) == majit_ir::Type::Ref {
+            self.with_ctx(|this, ctx| {
+                crate::state::MIFrame::guard_nonnull(this, ctx, opref);
+            });
+        }
+        Ok(crate::state::FrontendOp::new(opref, concrete))
+    }
+
+    fn store_local_value(
+        &mut self,
+        idx: usize,
+        value: Self::Value,
+    ) -> Result<(), pyre_interpreter::PyError> {
+        if idx < self.sym().concrete_locals.len() {
+            self.sym_mut().concrete_locals[idx] = value.concrete;
+        }
+        self.with_ctx(|this, ctx| {
+            crate::state::MIFrame::store_local_value(this, ctx, idx, value.opref)
+        })
+    }
+}
+
+impl pyre_interpreter::ControlFlowOpcodeHandler for crate::state::MIFrame {
+    fn fallthrough_target(&mut self) -> usize {
+        self.fallthrough_pc()
+    }
+
+    fn set_next_instr(&mut self, target: usize) -> Result<(), pyre_interpreter::PyError> {
+        self.with_ctx(|this, ctx| {
+            crate::state::MIFrame::set_next_instr(this, ctx, target);
+            Ok(())
+        })
+    }
+
+    fn close_loop_args(
+        &mut self,
+        target: usize,
+    ) -> Result<Option<Vec<Self::Value>>, pyre_interpreter::PyError> {
+        self.with_ctx(|this, ctx| {
+            // pyjitpl.py:2950-3036 reached_loop_header
+            let code_ptr = unsafe { (*this.sym().jitcode).code };
+            let back_edge_key = crate::driver::make_green_key(code_ptr, target);
+            // pyjitpl.py:2951 self.heapcache.reset()
+            ctx.reset_heap_cache();
+            // pyjitpl.py:2957-2965 build live_arg_boxes ONCE.
+            let live_args =
+                crate::state::MIFrame::close_loop_args_at(this, ctx, Some(target));
+            let live_types = {
+                let s = this.sym();
+                let mut types = crate::virtualizable_gen::virt_live_value_types(0);
+                types.extend(s.symbolic_local_types.iter().copied());
+                let stack_only = s.stack_only_depth();
+                types.extend(
+                    s.symbolic_stack_types[..stack_only.min(s.symbolic_stack_types.len())]
+                        .iter()
+                        .copied(),
+                );
+                types
+            };
+
+            // pyjitpl.py:2978-2983 compile_trace attempt.
+            {
+                let (driver, _) = crate::driver::driver_pair();
+                let has_partial = driver.meta_interp().has_partial_trace();
+                let bridge_origin = driver.bridge_origin();
+                if !has_partial && driver.meta_interp().has_compiled_targets(back_edge_key) {
+                    let outcome = driver.meta_interp_mut().compile_trace(
+                        back_edge_key,
+                        &live_args,
+                        bridge_origin,
+                    );
+                    if matches!(outcome, majit_metainterp::CompileOutcome::Compiled { .. }) {
+                        if majit_metainterp::majit_log_enabled() {
+                            eprintln!(
+                                "[jit][reached_loop_header] compile_trace success: key={} pc={} bridge={:?}",
+                                back_edge_key, target, bridge_origin
+                            );
+                        }
+                        return Ok(Some(
+                            live_args
+                                .into_iter()
+                                .map(crate::state::FrontendOp::opref_only)
+                                .collect(),
+                        ));
+                    }
+                }
+            }
+            // pyjitpl.py:2994-3036 search current_merge_points
+            if !ctx.has_merge_point(back_edge_key) {
+                // pyjitpl.py:3034-3036 first visit, register & continue
+                ctx.add_merge_point(back_edge_key, live_args, live_types, target);
+                if majit_metainterp::majit_log_enabled() {
+                    eprintln!(
+                        "[jit][reached_loop_header] first visit, unroll: key={} pc={}",
+                        back_edge_key, target
+                    );
+                }
+                return Ok(None);
+            }
+            // pyjitpl.py:3002-3030 found, compile as loop.
+            Ok(Some(
+                live_args
+                    .into_iter()
+                    .map(crate::state::FrontendOp::opref_only)
+                    .collect(),
+            ))
+        })
+    }
+}
+
+impl pyre_interpreter::BranchOpcodeHandler for crate::state::MIFrame {
+    fn enter_branch_truth(
+        &mut self,
+        value: Self::Value,
+    ) -> Result<(), pyre_interpreter::PyError> {
+        self.sym_mut().pending_branch_value = Some(value.opref);
+        Ok(())
+    }
+
+    fn leave_branch_truth(&mut self) -> Result<(), pyre_interpreter::PyError> {
+        let sym = self.sym_mut();
+        sym.pending_branch_value = None;
+        sym.pending_branch_other_target = None;
+        Ok(())
+    }
+
+    fn set_branch_other_target(&mut self, target: usize) {
+        self.sym_mut().pending_branch_other_target = Some(target);
+    }
+
+    fn branch_other_target(&self) -> Option<usize> {
+        self.sym().pending_branch_other_target
+    }
+
+    fn concrete_truth_as_bool(
+        &mut self,
+        value: Self::Value,
+        _truth: Self::Truth,
+    ) -> Result<bool, pyre_interpreter::PyError> {
+        crate::state::MIFrame::concrete_branch_truth_for_value(
+            self,
+            value.opref,
+            value.concrete.to_pyobj(),
+        )
+    }
+
+    fn guard_truth_value(
+        &mut self,
+        truth: Self::Truth,
+        expect_true: bool,
+    ) -> Result<(), pyre_interpreter::PyError> {
+        self.with_ctx(|this, ctx| {
+            let opcode = if expect_true {
+                majit_ir::OpCode::GuardTrue
+            } else {
+                majit_ir::OpCode::GuardFalse
+            };
+            crate::state::MIFrame::generate_guard(this, ctx, opcode, &[truth]);
+            Ok(())
+        })
+    }
+
+    fn record_branch_guard(
+        &mut self,
+        value: Self::Value,
+        truth: Self::Truth,
+        concrete_truth: bool,
+    ) -> Result<(), pyre_interpreter::PyError> {
+        self.with_ctx(|this, ctx| {
+            crate::state::MIFrame::record_branch_guard(
+                this,
+                ctx,
+                value.opref,
+                truth,
+                concrete_truth,
+            );
+            Ok(())
+        })
+    }
+}
+
+impl pyre_interpreter::NamespaceOpcodeHandler for crate::state::MIFrame {
+    fn load_name_value(
+        &mut self,
+        name: &str,
+    ) -> Result<Self::Value, pyre_interpreter::PyError> {
+        use crate::helpers::TraceHelperAccess;
+        let ns = self.sym().concrete_namespace;
+        let Some(slot) = crate::state::namespace_slot_direct(ns, name) else {
+            let opref = self.trace_load_name(name)?;
+            return Ok(crate::state::FrontendOp::opref_only(opref));
+        };
+        let concrete_cv = crate::state::namespace_value_direct(ns, slot);
+        let result_concrete = concrete_cv
+            .map(crate::state::ConcreteValue::from_pyobj)
+            .unwrap_or(crate::state::ConcreteValue::Null);
+        if let Some(concrete_value) = concrete_cv {
+            if !concrete_value.is_null() {
+                // celldict.py @elidable_promote + quasiimmut.py parity:
+                // 1. QUASIIMMUT_FIELD(ns, slot) — collected as quasi_immutable_deps
+                //    + GUARD_NOT_INVALIDATED.
+                // 2. RECORD_KNOWN_RESULT(result, ns, slot) — cache trace-time
+                //    lookup result (call_pure_results).
+                // 3. CALL_PURE_R(ns, slot) — elidable lookup; record_result_of_call_pure
+                //    folds via OptPure lookup_known_result.
+                let opref = self.with_ctx(|this, ctx| {
+                    let ns_const = ctx.const_ref(ns as i64);
+                    let slot_const = ctx.const_int(slot as i64);
+                    ctx.record_op(majit_ir::OpCode::QuasiimmutField, &[ns_const, slot_const]);
+                    let result_const = ctx.const_ref(concrete_value as i64);
+                    ctx.record_op(
+                        majit_ir::OpCode::RecordKnownResult,
+                        &[result_const, ns_const, slot_const],
+                    );
+                    let call_result =
+                        ctx.record_op(majit_ir::OpCode::CallPureR, &[ns_const, slot_const]);
+                    this.sym_mut()
+                        .symbolic_namespace_slots
+                        .insert(slot, call_result);
+                    Ok::<_, pyre_interpreter::PyError>(call_result)
+                })?;
+                return Ok(crate::state::FrontendOp::new(opref, result_concrete));
+            }
+        }
+        let opref = self.with_ctx(|this, ctx| {
+            crate::state::MIFrame::load_namespace_value(this, ctx, slot)
+        })?;
+        Ok(crate::state::FrontendOp::new(opref, result_concrete))
+    }
+
+    fn store_name_value(
+        &mut self,
+        name: &str,
+        value: Self::Value,
+    ) -> Result<(), pyre_interpreter::PyError> {
+        use crate::helpers::TraceHelperAccess;
+        let ns = self.sym().concrete_namespace;
+        let Some(slot) = crate::state::namespace_slot_direct(ns, name) else {
+            return self.trace_store_name(name, value.opref);
+        };
+        self.with_ctx(|this, ctx| {
+            crate::state::MIFrame::store_namespace_value(this, ctx, slot, value.opref)
+        })
+    }
+
+    fn null_value(&mut self) -> Result<Self::Value, pyre_interpreter::PyError> {
+        use crate::helpers::TraceHelperAccess;
+        let opref = self.trace_null_value()?;
+        Ok(crate::state::FrontendOp::new(
+            opref,
+            crate::state::ConcreteValue::Ref(pyre_object::PY_NULL),
+        ))
+    }
+}
+
+impl pyre_interpreter::ArithmeticOpcodeHandler for crate::state::MIFrame {
+    fn binary_value(
+        &mut self,
+        a_fop: Self::Value,
+        b_fop: Self::Value,
+        op: BinaryOperator,
+    ) -> Result<Self::Value, pyre_interpreter::PyError> {
+        let a = a_fop.opref;
+        let b = b_fop.opref;
+        let lhs_obj = a_fop.concrete.to_pyobj();
+        let rhs_obj = b_fop.concrete.to_pyobj();
+        // Concrete result via interpreter dispatch (baseobjspace).
+        let result_concrete = crate::concrete_binary_value(op, lhs_obj, rhs_obj);
+        if matches!(op, BinaryOperator::Subscr) {
+            let fop = self.binary_subscr_value(a, b, lhs_obj, rhs_obj)?;
+            let concrete = if result_concrete.is_null() {
+                fop.concrete
+            } else {
+                result_concrete
+            };
+            return Ok(crate::state::FrontendOp::new(fop.opref, concrete));
+        }
+        let is_float_path = (!lhs_obj.is_null()
+            && !rhs_obj.is_null()
+            && unsafe { pyre_object::is_float(lhs_obj) || pyre_object::is_float(rhs_obj) })
+            || self.value_type(a) == majit_ir::Type::Float
+            || self.value_type(b) == majit_ir::Type::Float;
+        let opref = if is_float_path {
+            self.binary_float_value(a, b, op, lhs_obj, rhs_obj)?
+        } else {
+            self.binary_int_value(a, b, op, lhs_obj, rhs_obj)?
+        };
+        Ok(crate::state::FrontendOp::new(opref, result_concrete))
+    }
+
+    fn compare_value(
+        &mut self,
+        a_fop: Self::Value,
+        b_fop: Self::Value,
+        op: ComparisonOperator,
+    ) -> Result<Self::Value, pyre_interpreter::PyError> {
+        let a = a_fop.opref;
+        let b = b_fop.opref;
+        let lhs_obj = a_fop.concrete.to_pyobj();
+        let rhs_obj = b_fop.concrete.to_pyobj();
+        // Concrete result via interpreter dispatch (baseobjspace::compare).
+        let result_concrete = crate::concrete_compare_value(op, lhs_obj, rhs_obj);
+        let opref = self.compare_value_direct(a, b, op, lhs_obj, rhs_obj)?;
+        Ok(crate::state::FrontendOp::new(opref, result_concrete))
+    }
+
+    fn unary_negative_value(
+        &mut self,
+        value: Self::Value,
+    ) -> Result<Self::Value, pyre_interpreter::PyError> {
+        let concrete_val = value.concrete.to_pyobj();
+        let mut result_concrete = crate::state::ConcreteValue::Null;
+        if !concrete_val.is_null() && unsafe { pyre_object::is_int(concrete_val) } {
+            let v = unsafe { pyre_object::w_int_get_value(concrete_val) };
+            result_concrete = crate::state::ConcreteValue::Int(v.wrapping_neg());
+        }
+        let opref =
+            self.unary_int_value(value.opref, majit_ir::OpCode::IntNeg, concrete_val)?;
+        Ok(crate::state::FrontendOp::new(opref, result_concrete))
+    }
+
+    fn unary_invert_value(
+        &mut self,
+        value: Self::Value,
+    ) -> Result<Self::Value, pyre_interpreter::PyError> {
+        let concrete_val = value.concrete.to_pyobj();
+        let mut result_concrete = crate::state::ConcreteValue::Null;
+        if !concrete_val.is_null() && unsafe { pyre_object::is_int(concrete_val) } {
+            let v = unsafe { pyre_object::w_int_get_value(concrete_val) };
+            result_concrete = crate::state::ConcreteValue::Int(!v);
+        }
+        let opref =
+            self.unary_int_value(value.opref, majit_ir::OpCode::IntInvert, concrete_val)?;
+        Ok(crate::state::FrontendOp::new(opref, result_concrete))
+    }
 }
 "#);
 }

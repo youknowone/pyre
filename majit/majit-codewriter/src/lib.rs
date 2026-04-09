@@ -725,6 +725,16 @@ pub fn generate_trace_code_from_pipeline(result: &passes::ProgramPipelineResult)
     codegen::generate_from_pipeline(result)
 }
 
+/// Generate `OpcodeHandler` trait impls (Constant/Stack/Truth).
+///
+/// Returned independently from `generate_trace_code_from_pipeline()` because
+/// the main generated file is `include!`d twice. Trait impls would conflict
+/// (E0119) under double inclusion, so build.rs writes this to a dedicated
+/// file that is included only once at crate root.
+pub fn generate_trait_impls_string() -> String {
+    codegen::generate_trait_impls_string()
+}
+
 /// Produce a recognition report: how much the pipeline understands.
 pub fn recognition_report(result: &passes::ProgramPipelineResult) -> codegen::RecognitionReport {
     codegen::recognition_report(result)

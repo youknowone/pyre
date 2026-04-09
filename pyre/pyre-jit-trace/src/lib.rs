@@ -29,3 +29,8 @@ pub mod generated {
 // Re-export top-level auto-generated functions for crate-level access
 use pyre_interpreter::bytecode::{BinaryOperator, ComparisonOperator};
 include!(concat!(env!("OUT_DIR"), "/jit_trace_gen.rs"));
+
+// Auto-generated `OpcodeHandler` trait impls. Lives in a separate file
+// because jit_trace_gen.rs is `include!`d twice (once inside `pub mod
+// generated`, once at crate root) and trait impls cannot be duplicated.
+include!(concat!(env!("OUT_DIR"), "/jit_trace_trait_impls.rs"));
