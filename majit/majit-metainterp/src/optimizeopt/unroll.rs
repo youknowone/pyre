@@ -3246,6 +3246,7 @@ impl OptUnroll {
                     let value = ctx.alloc_op_position();
                     // Register type for the new OpRef (RPython Box.type parity).
                     ctx.value_types.insert(value.0, result_type);
+                    ctx.replace_op(source, value);
                     // Prefer parent-local index when the FieldDescr is wired
                     // up to a SizeDescr; otherwise (lib-test fixtures or
                     // descrs constructed without parent_descr) fall back to
@@ -3354,6 +3355,7 @@ impl OptUnroll {
                     let value = ctx.alloc_op_position();
                     // Register type for the new OpRef (RPython Box.type parity).
                     ctx.value_types.insert(value.0, result_type);
+                    ctx.replace_op(source, value);
                     let descr_idx = descr.index();
                     // shortpreamble.py:72,84 parity: canonicalize obj through
                     // get_box_replacement so the key matches heap.py lookup
@@ -3424,6 +3426,7 @@ impl OptUnroll {
                     ) else {
                         continue;
                     };
+                    ctx.replace_op(source, value);
                     ctx.imported_loop_invariant_results.insert(func_ptr, value);
                     ctx.imported_short_sources
                         .push(crate::optimizeopt::ImportedShortSource {
@@ -5145,12 +5148,17 @@ mod tests {
     fn test_exported_state_reimports_short_heap_field_facts() {
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
         let mut ctx = crate::optimizeopt::OptContext::with_num_inputs(4, 0);
-        let parent = majit_ir::make_size_descr_full(0xFFFF_1000, 16, 1);
-        let field_descr: majit_ir::DescrRef = std::sync::Arc::new(
-            majit_ir::SimpleFieldDescr::new(0, 0, 8, majit_ir::Type::Int, false)
+        // optimizer.py:478 ensure_ptr_info_arg0 parity: every FieldDescr
+        // must resolve its parent SizeDescr so that the routing between
+        // StructPtrInfo and InstancePtrInfo can ask `is_object()`.
+        // SimpleFieldDescr stores the parent as Weak<DescrRef>, so the
+        // test must keep the parent Arc alive until import_state has run.
+        let parent = majit_ir::descr::make_size_descr(16);
+        let field_descr = std::sync::Arc::new(
+            majit_ir::descr::SimpleFieldDescr::new(0, 0, 8, majit_ir::Type::Int, false)
                 .with_signed(true)
                 .with_parent_descr(parent.clone(), 0),
-        );
+        ) as majit_ir::DescrRef;
         ctx.exported_short_boxes
             .push(crate::optimizeopt::shortpreamble::PreambleOp {
                 op: {
@@ -5171,7 +5179,7 @@ mod tests {
             vec![ExportedShortOp::HeapField {
                 source: OpRef(11),
                 object: ExportedShortArg::Slot(0),
-                descr: field_descr,
+                descr: field_descr.clone(),
                 result_type: Type::Int,
                 result: ExportedShortResult::Slot(1),
                 invented_name: false,
@@ -5194,17 +5202,20 @@ mod tests {
         assert_eq!(pop.op, OpRef(11)); // Phase 1 source
         assert_ne!(pop.resolved, OpRef(10)); // fresh, not label_arg
         assert_ne!(pop.resolved, OpRef(11));
+        drop(parent);
     }
 
     #[test]
     fn test_exported_state_reimports_short_heap_ref_field_facts() {
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
         let mut ctx = crate::optimizeopt::OptContext::with_num_inputs(4, 0);
-        let parent = majit_ir::make_size_descr_full(0xFFFF_1001, 24, 2);
-        let field_descr: majit_ir::DescrRef = std::sync::Arc::new(
-            majit_ir::SimpleFieldDescr::new(56, 8, 8, majit_ir::Type::Ref, false)
+        // optimizer.py:478 ensure_ptr_info_arg0 parity: keep parent alive
+        // while the test runs (SimpleFieldDescr.parent_descr is Weak).
+        let parent = majit_ir::descr::make_size_descr(64);
+        let field_descr = std::sync::Arc::new(
+            majit_ir::descr::SimpleFieldDescr::new(56, 8, 8, majit_ir::Type::Ref, false)
                 .with_parent_descr(parent.clone(), 0),
-        );
+        ) as majit_ir::DescrRef;
         ctx.exported_short_boxes
             .push(crate::optimizeopt::shortpreamble::PreambleOp {
                 op: {
@@ -5225,7 +5236,7 @@ mod tests {
             vec![ExportedShortOp::HeapField {
                 source: OpRef(11),
                 object: ExportedShortArg::Slot(0),
-                descr: field_descr,
+                descr: field_descr.clone(),
                 result_type: Type::Ref,
                 result: ExportedShortResult::Slot(1),
                 invented_name: false,
@@ -5236,7 +5247,9 @@ mod tests {
         let mut ctx2 = crate::optimizeopt::OptContext::with_num_inputs(4, 2);
         let label_args = import_state(&[OpRef(0), OpRef(1)], &exported, &mut optimizer, &mut ctx2);
         assert_eq!(label_args, vec![OpRef(10), OpRef(11)]);
-        // RPython PreambleOp parity: PreambleOp in PtrInfo._fields
+        // RPython PreambleOp parity: PreambleOp in PtrInfo._fields,
+        // keyed by `field_descr.index_in_parent()` when a parent is
+        // attached (unroll.rs:3194-3202 fallback chain).
         let obj_resolved = ctx2.get_box_replacement(OpRef(10));
         let pop = ctx2
             .get_ptr_info_mut(obj_resolved)
@@ -5246,6 +5259,7 @@ mod tests {
         assert_eq!(pop.op, OpRef(11));
         assert_ne!(pop.resolved, OpRef(10));
         assert_ne!(pop.resolved, OpRef(11));
+        drop(parent);
     }
 
     #[test]
@@ -5288,11 +5302,11 @@ mod tests {
     fn test_exported_state_reimports_short_pure_fact() {
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
         let mut ctx = crate::optimizeopt::OptContext::with_num_inputs(6, 0);
-        ctx.seed_constant(OpRef::from_const(10), Value::Int(7));
+        ctx.make_constant(OpRef(10), Value::Int(7));
         ctx.exported_short_boxes
             .push(crate::optimizeopt::shortpreamble::PreambleOp {
                 op: {
-                    let mut op = Op::new(OpCode::IntAdd, &[OpRef(12), OpRef::from_const(10)]);
+                    let mut op = Op::new(OpCode::IntAdd, &[OpRef(12), OpRef(10)]);
                     op.pos = OpRef(11);
                     op
                 },
@@ -5312,7 +5326,7 @@ mod tests {
                 args: vec![
                     ExportedShortArg::Slot(0),
                     ExportedShortArg::Const {
-                        source: OpRef::from_const(10),
+                        source: OpRef(10),
                         value: Value::Int(7),
                     }
                 ],
@@ -5325,10 +5339,7 @@ mod tests {
         let mut ctx2 = crate::optimizeopt::OptContext::with_num_inputs(6, 2);
         let label_args = import_state(&[OpRef(0), OpRef(1)], &exported, &mut optimizer, &mut ctx2);
         assert_eq!(label_args, vec![OpRef(12), OpRef(11)]);
-        assert_eq!(
-            ctx2.get_constant(OpRef::from_const(10)),
-            Some(&Value::Int(7))
-        );
+        assert_eq!(ctx2.get_constant(OpRef(10)), Some(&Value::Int(7)));
         assert_eq!(
             ctx2.imported_short_pure_ops,
             vec![crate::optimizeopt::ImportedShortPureOp {
@@ -5336,10 +5347,7 @@ mod tests {
                 descr: None,
                 args: vec![
                     crate::optimizeopt::ImportedShortPureArg::OpRef(OpRef(12)),
-                    crate::optimizeopt::ImportedShortPureArg::Const(
-                        Value::Int(7),
-                        OpRef::from_const(10)
-                    ),
+                    crate::optimizeopt::ImportedShortPureArg::Const(Value::Int(7), OpRef(10)),
                 ],
                 result: OpRef(11),
             }]
@@ -5350,7 +5358,7 @@ mod tests {
     fn test_exported_state_reimports_short_call_pure_fact() {
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
         let mut ctx = crate::optimizeopt::OptContext::with_num_inputs(8, 0);
-        ctx.seed_constant(OpRef::from_const(10), Value::Int(0x1234));
+        ctx.make_constant(OpRef(10), Value::Int(0x1234));
         let call_descr = majit_ir::descr::make_call_descr_full(
             77,
             vec![majit_ir::Type::Int, majit_ir::Type::Int],
@@ -5361,7 +5369,7 @@ mod tests {
         ctx.exported_short_boxes
             .push(crate::optimizeopt::shortpreamble::PreambleOp {
                 op: {
-                    let mut op = Op::new(OpCode::CallI, &[OpRef::from_const(10), OpRef(12)]);
+                    let mut op = Op::new(OpCode::CallI, &[OpRef(10), OpRef(12)]);
                     op.pos = OpRef(11);
                     op.descr = Some(call_descr.clone());
                     op
@@ -5381,7 +5389,7 @@ mod tests {
                 descr: Some(call_descr.clone()),
                 args: vec![
                     ExportedShortArg::Const {
-                        source: OpRef::from_const(10),
+                        source: OpRef(10),
                         value: Value::Int(0x1234),
                     },
                     ExportedShortArg::Slot(0),
@@ -5395,20 +5403,14 @@ mod tests {
         let mut ctx2 = crate::optimizeopt::OptContext::with_num_inputs(8, 2);
         let label_args = import_state(&[OpRef(0), OpRef(1)], &exported, &mut optimizer, &mut ctx2);
         assert_eq!(label_args, vec![OpRef(12), OpRef(11)]);
-        assert_eq!(
-            ctx2.get_constant(OpRef::from_const(10)),
-            Some(&Value::Int(0x1234))
-        );
+        assert_eq!(ctx2.get_constant(OpRef(10)), Some(&Value::Int(0x1234)));
         assert_eq!(
             ctx2.imported_short_pure_ops,
             vec![crate::optimizeopt::ImportedShortPureOp {
                 opcode: OpCode::CallPureI,
                 descr: Some(call_descr.clone()),
                 args: vec![
-                    crate::optimizeopt::ImportedShortPureArg::Const(
-                        Value::Int(0x1234),
-                        OpRef::from_const(10)
-                    ),
+                    crate::optimizeopt::ImportedShortPureArg::Const(Value::Int(0x1234), OpRef(10)),
                     crate::optimizeopt::ImportedShortPureArg::OpRef(OpRef(12)),
                 ],
                 result: OpRef(11),
@@ -5420,11 +5422,11 @@ mod tests {
     fn test_exported_state_reimports_short_pure_dependency_chain() {
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
         let mut ctx = crate::optimizeopt::OptContext::with_num_inputs(10, 0);
-        ctx.seed_constant(OpRef::from_const(10), Value::Int(7));
+        ctx.make_constant(OpRef(10), Value::Int(7));
         ctx.exported_short_boxes
             .push(crate::optimizeopt::shortpreamble::PreambleOp {
                 op: {
-                    let mut op = Op::new(OpCode::IntAdd, &[OpRef(12), OpRef::from_const(10)]);
+                    let mut op = Op::new(OpCode::IntAdd, &[OpRef(12), OpRef(10)]);
                     op.pos = OpRef(11);
                     op
                 },
@@ -5463,7 +5465,7 @@ mod tests {
                     args: vec![
                         ExportedShortArg::Slot(0),
                         ExportedShortArg::Const {
-                            source: OpRef::from_const(10),
+                            source: OpRef(10),
                             value: Value::Int(7),
                         },
                     ],
@@ -5493,10 +5495,7 @@ mod tests {
             &mut ctx2,
         );
         assert_eq!(label_args, vec![OpRef(12), OpRef(13), OpRef(14)]);
-        assert_eq!(
-            ctx2.get_constant(OpRef::from_const(10)),
-            Some(&Value::Int(7))
-        );
+        assert_eq!(ctx2.get_constant(OpRef(10)), Some(&Value::Int(7)));
         assert_eq!(ctx2.imported_short_pure_ops.len(), 2);
         // The temporary result is allocated by ctx.alloc_op_position();
         // its exact value depends on num_inputs, so read it dynamically.
@@ -5509,10 +5508,7 @@ mod tests {
                     descr: None,
                     args: vec![
                         crate::optimizeopt::ImportedShortPureArg::OpRef(OpRef(12)),
-                        crate::optimizeopt::ImportedShortPureArg::Const(
-                            Value::Int(7),
-                            OpRef::from_const(10)
-                        ),
+                        crate::optimizeopt::ImportedShortPureArg::Const(Value::Int(7), OpRef(10)),
                     ],
                     result: temp_result,
                 },
@@ -5595,11 +5591,11 @@ mod tests {
     fn test_imported_short_builder_tracks_used_dependency_chain() {
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
         let mut ctx = crate::optimizeopt::OptContext::with_num_inputs(10, 0);
-        ctx.seed_constant(OpRef::from_const(10), Value::Int(7));
+        ctx.make_constant(OpRef(10), Value::Int(7));
         ctx.exported_short_boxes
             .push(crate::optimizeopt::shortpreamble::PreambleOp {
                 op: {
-                    let mut op = Op::new(OpCode::IntAdd, &[OpRef(12), OpRef::from_const(10)]);
+                    let mut op = Op::new(OpCode::IntAdd, &[OpRef(12), OpRef(10)]);
                     op.pos = OpRef(11);
                     op
                 },
