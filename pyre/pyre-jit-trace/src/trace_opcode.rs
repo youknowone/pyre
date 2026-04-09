@@ -1207,7 +1207,32 @@ impl MIFrame {
                 }
                 let slot = idx - header;
                 if slot < nlocals_local {
-                    // TODO locals writeback — see nested_loop SIGSEGV.
+                    // TODO(put_back_list_of_boxes3 locals): writing the
+                    // SameAs OpRef into `sym.symbolic_locals[slot]`
+                    // SIGSEGVs `nested_loop` reproducibly. Root cause:
+                    // pyre's `PyreSym::value_type` (state.rs:1704)
+                    // scans `symbolic_locals` to determine an OpRef's
+                    // type via `symbolic_local_types[idx]`. RPython
+                    // reads `box.type` directly off the Box; pyre lost
+                    // the per-Box type tag and reconstructs it by
+                    // slot-position lookup. Once the slot is overwritten
+                    // with the SameAs OpRef, the original OpRef's type
+                    // lookup falls through to `Type::Ref` and downstream
+                    // bridge / loop compilation reads next_instr (Int 14)
+                    // as a Ref pointer, dereferencing 0x1e (= 14 + 0x10
+                    // for the W_IntObject.intval offset).
+                    //
+                    // The structural fix is to stop using `symbolic_locals`
+                    // as the type table — give every OpRef its own
+                    // immutable type tag (RPython `Box.type`) so the
+                    // writeback does not perturb the type lookup. That
+                    // is a multi-file refactor (every `value_type` call
+                    // site, `transient_value_types`, etc.) and is left
+                    // for a follow-up. Until then, locals writeback is
+                    // disabled and the dedup-changed locals slot retains
+                    // its original OpRef in `symbolic_locals` so the
+                    // type table stays consistent. The args returned to
+                    // the caller still carry the SameAs identity.
                     continue;
                 }
                 let stack_slot = slot - nlocals_local;
