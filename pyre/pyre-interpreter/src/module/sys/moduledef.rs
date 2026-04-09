@@ -113,28 +113,46 @@ pub fn init(ns: &mut PyNamespace) {
             Ok(w_tuple_new(vec![w_none(), w_none(), w_none()]))
         }),
     );
-    // sys.flags — stub object with named attributes
+    // sys.flags — pypy/module/sys/app.py:99-119 `class sysflags` with
+    // `__metaclass__ = structseqtype`. PyPy exposes it as a structseq
+    // (immutable tuple subclass with named fields). pyre does not have
+    // structseq yet, so we approximate the orthodox behavior with a
+    // dedicated type whose attributes live in the TYPE's class
+    // namespace rather than the instance dict. Read access via the
+    // descriptor protocol still works (`sys.flags.optimize`); writes
+    // fall through to `setdictvalue → raiseattrerror` because the type
+    // has no `__dict__` slot, matching the read-only contract:
+    //
+    //     >>> sys.flags.optimize = 3
+    //     AttributeError: 'sys.flags' object has no attribute 'optimize'
+    //
+    // The exact exception type differs from PyPy
+    // (`pypy/module/sys/test/test_sysmodule.py:148` expects TypeError)
+    // because pyre lacks the structseq tp_setattro slot. The full
+    // structseq port is tracked separately.
     {
-        let flags = make_sys_namespace_instance();
-        let _ = crate::baseobjspace::setattr(flags, "debug", w_int_new(0));
-        let _ = crate::baseobjspace::setattr(flags, "inspect", w_int_new(0));
-        let _ = crate::baseobjspace::setattr(flags, "interactive", w_int_new(0));
-        let _ = crate::baseobjspace::setattr(flags, "optimize", w_int_new(0));
-        let _ = crate::baseobjspace::setattr(flags, "dont_write_bytecode", w_int_new(0));
-        let _ = crate::baseobjspace::setattr(flags, "no_user_site", w_int_new(0));
-        let _ = crate::baseobjspace::setattr(flags, "no_site", w_int_new(0));
-        let _ = crate::baseobjspace::setattr(flags, "ignore_environment", w_int_new(0));
-        let _ = crate::baseobjspace::setattr(flags, "verbose", w_int_new(0));
-        let _ = crate::baseobjspace::setattr(flags, "bytes_warning", w_int_new(0));
-        let _ = crate::baseobjspace::setattr(flags, "quiet", w_int_new(0));
-        let _ = crate::baseobjspace::setattr(flags, "hash_randomization", w_int_new(0));
-        let _ = crate::baseobjspace::setattr(flags, "isolated", w_int_new(0));
-        let _ = crate::baseobjspace::setattr(flags, "dev_mode", w_bool_from(false));
-        let _ = crate::baseobjspace::setattr(flags, "utf8_mode", w_int_new(1));
-        let _ = crate::baseobjspace::setattr(flags, "warn_default_encoding", w_int_new(0));
-        let _ = crate::baseobjspace::setattr(flags, "safe_path", w_bool_from(false));
-        let _ = crate::baseobjspace::setattr(flags, "int_max_str_digits", w_int_new(4300));
-        let _ = crate::baseobjspace::setattr(flags, "context_aware_warnings", w_bool_from(false));
+        let flags_type = crate::typedef::make_builtin_type("sys.flags", |fns| {
+            namespace_store(fns, "debug", w_int_new(0));
+            namespace_store(fns, "inspect", w_int_new(0));
+            namespace_store(fns, "interactive", w_int_new(0));
+            namespace_store(fns, "optimize", w_int_new(0));
+            namespace_store(fns, "dont_write_bytecode", w_int_new(0));
+            namespace_store(fns, "no_user_site", w_int_new(0));
+            namespace_store(fns, "no_site", w_int_new(0));
+            namespace_store(fns, "ignore_environment", w_int_new(0));
+            namespace_store(fns, "verbose", w_int_new(0));
+            namespace_store(fns, "bytes_warning", w_int_new(0));
+            namespace_store(fns, "quiet", w_int_new(0));
+            namespace_store(fns, "hash_randomization", w_int_new(0));
+            namespace_store(fns, "isolated", w_int_new(0));
+            namespace_store(fns, "dev_mode", w_bool_from(false));
+            namespace_store(fns, "utf8_mode", w_int_new(1));
+            namespace_store(fns, "warn_default_encoding", w_int_new(0));
+            namespace_store(fns, "safe_path", w_bool_from(false));
+            namespace_store(fns, "int_max_str_digits", w_int_new(4300));
+            namespace_store(fns, "context_aware_warnings", w_bool_from(false));
+        });
+        let flags = w_instance_new(flags_type);
         namespace_store(ns, "flags", flags);
     }
     // sys.getdefaultencoding
