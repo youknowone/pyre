@@ -10,12 +10,6 @@ use majit_ir::{Op, OpCode, OpRef, Value};
 use crate::optimizeopt::intutils::IntBound;
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PendingOverflowGuard {
-    Present,
-    ProvenSafeRemoved,
-}
-
 /// Integer bounds optimization pass.
 ///
 /// Keeps track of the bounds placed on integers by guards and removes
@@ -23,15 +17,12 @@ enum PendingOverflowGuard {
 pub struct OptIntBounds {
     /// Per-operation IntBound storage, indexed by OpRef.
     bounds: Vec<Option<IntBound>>,
-    /// The last emitted operation's opcode (for overflow guard handling).
+    /// intbounds.py: last_emitted_operation — opcode (for overflow guard handling).
     last_emitted_opcode: Option<OpCode>,
-    /// The last emitted operation's args (for overflow guard handling).
+    /// intbounds.py: last_emitted_operation — args (for overflow guard handling).
     last_emitted_args: Vec<OpRef>,
-    /// The last emitted operation's OpRef result.
+    /// intbounds.py: last_emitted_operation — OpRef result.
     last_emitted_ref: OpRef,
-    /// Tracks whether the next overflow guard still has a live overflow-producing
-    /// source op, or whether that source was optimized away as provably safe.
-    pending_overflow_guard: Option<PendingOverflowGuard>,
     /// intbounds.py: pure_from_args synthesis cache.
     /// Records equivalent pure operations discovered through bounds analysis
     /// (e.g., INT_OR with non-overlapping ranges = INT_ADD).
@@ -51,7 +42,6 @@ impl OptIntBounds {
             last_emitted_opcode: None,
             last_emitted_args: Vec::new(),
             last_emitted_ref: OpRef::NONE,
-            pending_overflow_guard: None,
             pending_guard_bounds: None,
         }
     }
@@ -214,7 +204,6 @@ impl OptIntBounds {
             self.make_constant_int(op, 0, ctx);
             OptimizationResult::Remove
         } else {
-            self.postprocess_bool_result(op);
             OptimizationResult::PassOn
         }
     }
@@ -231,7 +220,6 @@ impl OptIntBounds {
             self.make_constant_int(op, 0, ctx);
             OptimizationResult::Remove
         } else {
-            self.postprocess_bool_result(op);
             OptimizationResult::PassOn
         }
     }
@@ -248,7 +236,6 @@ impl OptIntBounds {
             self.make_constant_int(op, 0, ctx);
             OptimizationResult::Remove
         } else {
-            self.postprocess_bool_result(op);
             OptimizationResult::PassOn
         }
     }
@@ -265,7 +252,6 @@ impl OptIntBounds {
             self.make_constant_int(op, 0, ctx);
             OptimizationResult::Remove
         } else {
-            self.postprocess_bool_result(op);
             OptimizationResult::PassOn
         }
     }
@@ -282,7 +268,6 @@ impl OptIntBounds {
             self.make_constant_int(op, 0, ctx);
             OptimizationResult::Remove
         } else {
-            self.postprocess_bool_result(op);
             OptimizationResult::PassOn
         }
     }
@@ -299,7 +284,6 @@ impl OptIntBounds {
             self.make_constant_int(op, 1, ctx);
             OptimizationResult::Remove
         } else {
-            self.postprocess_bool_result(op);
             OptimizationResult::PassOn
         }
     }
@@ -318,7 +302,6 @@ impl OptIntBounds {
             self.make_constant_int(op, 0, ctx);
             OptimizationResult::Remove
         } else {
-            self.postprocess_bool_result(op);
             OptimizationResult::PassOn
         }
     }
@@ -335,7 +318,6 @@ impl OptIntBounds {
             self.make_constant_int(op, 0, ctx);
             OptimizationResult::Remove
         } else {
-            self.postprocess_bool_result(op);
             OptimizationResult::PassOn
         }
     }
@@ -352,7 +334,6 @@ impl OptIntBounds {
             self.make_constant_int(op, 0, ctx);
             OptimizationResult::Remove
         } else {
-            self.postprocess_bool_result(op);
             OptimizationResult::PassOn
         }
     }
@@ -369,14 +350,8 @@ impl OptIntBounds {
             self.make_constant_int(op, 0, ctx);
             OptimizationResult::Remove
         } else {
-            self.postprocess_bool_result(op);
             OptimizationResult::PassOn
         }
-    }
-
-    /// Set result bounds to [0, 1] for comparison/boolean-result operations.
-    fn postprocess_bool_result(&mut self, op: &Op) {
-        self.setintbound(op.pos, IntBound::bounded(0, 1));
     }
 
     // ── Arithmetic postprocessing ──
@@ -593,7 +568,6 @@ impl OptIntBounds {
                 return OptimizationResult::Remove;
             }
         }
-        self.postprocess_int_signext(op, ctx);
         OptimizationResult::PassOn
     }
 
@@ -610,31 +584,17 @@ impl OptIntBounds {
 
     // ── Overflow operations ──
 
+    /// intbounds.py:244-256 optimize_INT_ADD_OVF
     fn optimize_int_add_ovf(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        if let (Some(a), Some(b)) = (
-            ctx.get_constant_int(op.arg(0)),
-            ctx.get_constant_int(op.arg(1)),
-        ) {
-            if let Some(result) = a.checked_add(b) {
-                self.make_constant_int(op, result, ctx);
-                self.pending_overflow_guard = Some(PendingOverflowGuard::ProvenSafeRemoved);
-                return OptimizationResult::Remove;
-            }
-        }
         let b0 = self.getintbound(op.arg(0), ctx);
         let b1 = self.getintbound(op.arg(1), ctx);
         if b0.add_bound_cannot_overflow(&b1) {
-            // Transform to non-overflow INT_ADD and mark the following
-            // GUARD_NO_OVERFLOW as redundant.
-            self.pending_overflow_guard = Some(PendingOverflowGuard::ProvenSafeRemoved);
+            // replace_op_with(op, INT_ADD) + send_extra_operation
             let mut new_op = Op::new(OpCode::IntAdd, &op.args);
             new_op.descr = op.descr.clone();
             new_op.pos = op.pos;
-            self.postprocess_int_add(&new_op, ctx);
             OptimizationResult::Emit(new_op)
         } else {
-            self.pending_overflow_guard = Some(PendingOverflowGuard::Present);
-            self.postprocess_int_add_ovf(op, ctx);
             OptimizationResult::PassOn
         }
     }
@@ -652,36 +612,24 @@ impl OptIntBounds {
         self.intersect_bound(op.pos, &b);
     }
 
+    /// intbounds.py:275-287 optimize_INT_SUB_OVF
     fn optimize_int_sub_ovf(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        if let (Some(a), Some(b)) = (
-            ctx.get_constant_int(op.arg(0)),
-            ctx.get_constant_int(op.arg(1)),
-        ) {
-            if let Some(result) = a.checked_sub(b) {
-                self.make_constant_int(op, result, ctx);
-                self.pending_overflow_guard = Some(PendingOverflowGuard::ProvenSafeRemoved);
-                return OptimizationResult::Remove;
-            }
-        }
         let arg0 = ctx.get_box_replacement(op.arg(0));
         let arg1 = ctx.get_box_replacement(op.arg(1));
-        let b0 = self.getintbound(arg0, ctx);
-        let b1 = self.getintbound(arg1, ctx);
         if arg0 == arg1 {
-            // x - x = 0
+            // arg0.same_box(arg1) → x - x = 0
             self.make_constant_int(op, 0, ctx);
             return OptimizationResult::Remove;
         }
+        let b0 = self.getintbound(arg0, ctx);
+        let b1 = self.getintbound(arg1, ctx);
         if b0.sub_bound_cannot_overflow(&b1) {
-            self.pending_overflow_guard = Some(PendingOverflowGuard::ProvenSafeRemoved);
+            // replace_op_with(op, INT_SUB) + send_extra_operation
             let mut new_op = Op::new(OpCode::IntSub, &op.args);
             new_op.descr = op.descr.clone();
             new_op.pos = op.pos;
-            self.postprocess_int_sub(&new_op, ctx);
             OptimizationResult::Emit(new_op)
         } else {
-            self.pending_overflow_guard = Some(PendingOverflowGuard::Present);
-            self.postprocess_int_sub_ovf(op, ctx);
             OptimizationResult::PassOn
         }
     }
@@ -693,29 +641,17 @@ impl OptIntBounds {
         self.intersect_bound(op.pos, &b);
     }
 
+    /// intbounds.py:298-305 optimize_INT_MUL_OVF
     fn optimize_int_mul_ovf(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        if let (Some(a), Some(b)) = (
-            ctx.get_constant_int(op.arg(0)),
-            ctx.get_constant_int(op.arg(1)),
-        ) {
-            if let Some(result) = a.checked_mul(b) {
-                self.make_constant_int(op, result, ctx);
-                self.pending_overflow_guard = Some(PendingOverflowGuard::ProvenSafeRemoved);
-                return OptimizationResult::Remove;
-            }
-        }
         let b0 = self.getintbound(op.arg(0), ctx);
         let b1 = self.getintbound(op.arg(1), ctx);
         if b0.mul_bound_cannot_overflow(&b1) {
-            self.pending_overflow_guard = Some(PendingOverflowGuard::ProvenSafeRemoved);
+            // replace_op_with(op, INT_MUL) + send_extra_operation
             let mut new_op = Op::new(OpCode::IntMul, &op.args);
             new_op.descr = op.descr.clone();
             new_op.pos = op.pos;
-            self.postprocess_int_mul(&new_op, ctx);
             OptimizationResult::Emit(new_op)
         } else {
-            self.pending_overflow_guard = Some(PendingOverflowGuard::Present);
-            self.postprocess_int_mul_ovf(op, ctx);
             OptimizationResult::PassOn
         }
     }
@@ -736,52 +672,56 @@ impl OptIntBounds {
     /// intbounds.py:209-229 optimize_GUARD_NO_OVERFLOW
     fn optimize_guard_no_overflow(&mut self, op: &Op) -> OptimizationResult {
         let _ = op;
-        // intbounds.py:210-220: lastop = self.last_emitted_operation
+        // intbounds.py:210-219:
+        //   lastop = self.last_emitted_operation
         //   if lastop is not None:
-        //     if opnum not in (INT_ADD_OVF, INT_SUB_OVF, INT_MUL_OVF): return
-        let last_opcode = self.last_emitted_opcode;
-        let last_is_ovf = matches!(
-            last_opcode,
-            Some(OpCode::IntAddOvf | OpCode::IntSubOvf | OpCode::IntMulOvf)
-        );
-        if !last_is_ovf {
-            self.pending_overflow_guard = None;
-            return OptimizationResult::Remove;
-        }
-        // intbounds.py:222-228: synthesize the non-overflowing inverse for
-        // optimize_default to reuse, plus the reverse op.
-        //   if INT_ADD_OVF:
-        //     pure_from_args2(INT_SUB, result, args[1], args[0])
-        //     pure_from_args2(INT_SUB, result, args[0], args[1])
-        //   elif INT_SUB_OVF:
-        //     pure_from_args2(INT_ADD, result, args[1], args[0])
-        //     pure_from_args2(INT_SUB, args[0], result, args[1])
-        let result = self.last_emitted_ref;
-        if self.last_emitted_args.len() >= 2 && !result.is_none() {
-            let arg0 = self.last_emitted_args[0];
-            let arg1 = self.last_emitted_args[1];
-            match last_opcode {
-                Some(OpCode::IntAddOvf) => {
-                    self.record_pure_from_args(OpCode::IntSub, result, arg1, arg0);
-                    self.record_pure_from_args(OpCode::IntSub, result, arg0, arg1);
+        //     opnum = lastop.getopnum()
+        //     if opnum not in (INT_ADD_OVF, INT_SUB_OVF, INT_MUL_OVF):
+        //       return   # guard killed
+        if let Some(opcode) = self.last_emitted_opcode {
+            if !matches!(
+                opcode,
+                OpCode::IntAddOvf | OpCode::IntSubOvf | OpCode::IntMulOvf
+            ) {
+                return OptimizationResult::Remove;
+            }
+            // intbounds.py:222-228: synthesize the non-overflowing inverse
+            let result = self.last_emitted_ref;
+            if self.last_emitted_args.len() >= 2 && !result.is_none() {
+                let arg0 = self.last_emitted_args[0];
+                let arg1 = self.last_emitted_args[1];
+                match opcode {
+                    OpCode::IntAddOvf => {
+                        self.record_pure_from_args(OpCode::IntSub, result, arg1, arg0);
+                        self.record_pure_from_args(OpCode::IntSub, result, arg0, arg1);
+                    }
+                    OpCode::IntSubOvf => {
+                        self.record_pure_from_args(OpCode::IntAdd, result, arg1, arg0);
+                        self.record_pure_from_args(OpCode::IntSub, arg0, result, arg1);
+                    }
+                    _ => {}
                 }
-                Some(OpCode::IntSubOvf) => {
-                    self.record_pure_from_args(OpCode::IntAdd, result, arg1, arg0);
-                    self.record_pure_from_args(OpCode::IntSub, arg0, result, arg1);
-                }
-                _ => {}
             }
         }
         // intbounds.py:229: return self.emit(op)
-        match self.pending_overflow_guard.take() {
-            Some(PendingOverflowGuard::Present) => OptimizationResult::PassOn,
-            Some(PendingOverflowGuard::ProvenSafeRemoved) | None => OptimizationResult::Remove,
-        }
+        OptimizationResult::PassOn
     }
 
+    /// intbounds.py:231-242 optimize_GUARD_OVERFLOW
     fn optimize_guard_overflow(&mut self, op: &Op) -> OptimizationResult {
-        self.pending_overflow_guard = None;
         let _ = op;
+        // intbounds.py:232-233: if lastop is None: return
+        let Some(opcode) = self.last_emitted_opcode else {
+            return OptimizationResult::Remove;
+        };
+        // intbounds.py:236-238: if opnum not in OVF_ops: raise InvalidLoop
+        if !matches!(
+            opcode,
+            OpCode::IntAddOvf | OpCode::IntSubOvf | OpCode::IntMulOvf
+        ) {
+            return OptimizationResult::InvalidLoop;
+        }
+        // intbounds.py:240: return self.emit(op)
         OptimizationResult::PassOn
     }
 
@@ -1617,23 +1557,11 @@ impl OptIntBounds {
     }
 
     /// Record what we last emitted (for overflow guard removal).
+    /// Mirrors RPython's self.last_emitted_operation = op in Optimization.emit().
     fn record_emitted(&mut self, op: &Op) {
         self.last_emitted_opcode = Some(op.opcode);
         self.last_emitted_args = op.args.to_vec();
         self.last_emitted_ref = op.pos;
-        if !matches!(
-            op.opcode,
-            OpCode::IntAdd
-                | OpCode::IntSub
-                | OpCode::IntMul
-                | OpCode::IntAddOvf
-                | OpCode::IntSubOvf
-                | OpCode::IntMulOvf
-                | OpCode::GuardNoOverflow
-                | OpCode::GuardOverflow
-        ) {
-            self.pending_overflow_guard = None;
-        }
     }
 }
 
@@ -1677,197 +1605,9 @@ impl Optimization for OptIntBounds {
             OpCode::GuardTrue => self.optimize_guard_true(op, ctx),
             OpCode::GuardFalse => self.optimize_guard_false(op, ctx),
 
-            // ── Arithmetic (postprocess to set bounds, then pass on) ──
-            OpCode::IntAdd => {
-                self.postprocess_int_add(op, ctx);
-                OptimizationResult::PassOn
-            }
-            OpCode::IntSub => {
-                self.postprocess_int_sub(op, ctx);
-                OptimizationResult::PassOn
-            }
-            OpCode::IntMul => {
-                self.postprocess_int_mul(op, ctx);
-                OptimizationResult::PassOn
-            }
-            OpCode::IntAnd => {
-                self.postprocess_int_and(op, ctx);
-                OptimizationResult::PassOn
-            }
-            OpCode::IntOr => {
-                self.postprocess_int_or(op, ctx);
-                OptimizationResult::PassOn
-            }
-            OpCode::IntXor => {
-                self.postprocess_int_xor(op, ctx);
-                OptimizationResult::PassOn
-            }
-            OpCode::IntLshift => {
-                self.postprocess_int_lshift(op, ctx);
-                OptimizationResult::PassOn
-            }
-            OpCode::IntRshift => {
-                self.postprocess_int_rshift(op, ctx);
-                OptimizationResult::PassOn
-            }
-            OpCode::UintRshift => {
-                self.postprocess_uint_rshift(op, ctx);
-                OptimizationResult::PassOn
-            }
-            OpCode::IntFloorDiv => {
-                self.postprocess_int_floordiv(op, ctx);
-                OptimizationResult::PassOn
-            }
-            OpCode::IntMod => {
-                self.postprocess_int_mod(op, ctx);
-                OptimizationResult::PassOn
-            }
-            OpCode::IntNeg => {
-                self.postprocess_int_neg(op, ctx);
-                OptimizationResult::PassOn
-            }
-            OpCode::IntInvert => {
-                self.postprocess_int_invert(op, ctx);
-                OptimizationResult::PassOn
-            }
-            OpCode::IntForceGeZero => {
-                self.postprocess_int_force_ge_zero(op, ctx);
-                OptimizationResult::PassOn
-            }
-            OpCode::IntIsZero | OpCode::IntIsTrue | OpCode::IntBetween => {
-                self.postprocess_bool_result(op);
-                OptimizationResult::PassOn
-            }
-
-            // ── Lengths (always non-negative) ──
-            OpCode::ArraylenGc => {
-                self.postprocess_arraylen_gc(op);
-                OptimizationResult::PassOn
-            }
-            OpCode::Strlen => {
-                self.postprocess_strlen(op);
-                OptimizationResult::PassOn
-            }
-            OpCode::Unicodelen => {
-                self.postprocess_unicodelen(op);
-                OptimizationResult::PassOn
-            }
-
-            // intbounds.py: CALL_PURE_I/CALL_I — propagate bounds from oopspec.
-            // OS_INT_PY_DIV/OS_INT_PY_MOD: result bounded by divisor.
-            OpCode::CallPureI | OpCode::CallI => {
-                if let Some(ref d) = op.descr {
-                    if let Some(cd) = d.as_call_descr() {
-                        let ei = cd.effect_info();
-                        match ei.oopspec_index {
-                            majit_ir::OopSpecIndex::IntPyDiv => {
-                                // Python integer division: result sign = sign(divisor)
-                                // |result| <= |dividend|
-                                // For positive divisor: 0 <= result < divisor
-                                if op.num_args() >= 3 {
-                                    let divisor_bound = self.getintbound(op.arg(2), ctx);
-                                    if divisor_bound.known_positive() {
-                                        let result_bound = IntBound::new(
-                                            0,
-                                            divisor_bound.upper.saturating_sub(1),
-                                            0,
-                                            u64::MAX,
-                                        );
-                                        self.intersect_bound(op.pos, &result_bound);
-                                    }
-                                }
-                            }
-                            majit_ir::OopSpecIndex::IntPyMod => {
-                                // Python modulo: 0 <= result < |divisor| for positive divisor
-                                if op.num_args() >= 3 {
-                                    let divisor_bound = self.getintbound(op.arg(2), ctx);
-                                    if divisor_bound.known_positive() {
-                                        let result_bound = IntBound::new(
-                                            0,
-                                            divisor_bound.upper.saturating_sub(1),
-                                            0,
-                                            u64::MAX,
-                                        );
-                                        self.intersect_bound(op.pos, &result_bound);
-                                    }
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                OptimizationResult::PassOn
-            }
-
-            // intbounds.py: postprocess_STRGETITEM — result in [0, 255].
-            OpCode::Strgetitem => {
-                self.intersect_bound(op.pos, &IntBound::bounded(0, 255));
-                OptimizationResult::PassOn
-            }
-
-            // intbounds.py: postprocess_UNICODEGETITEM — result >= 0.
-            OpCode::Unicodegetitem => {
-                self.intersect_bound(op.pos, &IntBound::nonnegative());
-                OptimizationResult::PassOn
-            }
-
-            // intbounds.py: postprocess_GETFIELD_RAW_I — integer-bounded fields.
-            // If the descriptor indicates a bounded integer field (e.g. u8, u16),
-            // narrow the result bound to [min, max].
-            // RPython aliases all GETFIELD/GETINTERIORFIELD variants (I/R/F)
-            // to the same handler; is_integer_bounded() returns false for
-            // non-integer fields so the intersect is effectively a no-op.
-            OpCode::GetfieldRawI
-            | OpCode::GetfieldGcI
-            | OpCode::GetinteriorfieldGcI
-            | OpCode::GetfieldRawR
-            | OpCode::GetfieldGcR
-            | OpCode::GetinteriorfieldGcR
-            | OpCode::GetfieldRawF
-            | OpCode::GetfieldGcF
-            | OpCode::GetinteriorfieldGcF => {
-                if let Some(ref d) = op.descr {
-                    let (field_size, signed) = d.field_size_and_sign();
-                    if field_size > 0 && field_size < 8 {
-                        let (lo, hi) = if signed {
-                            let half = 1i64 << (field_size * 8 - 1);
-                            (-half, half - 1)
-                        } else {
-                            (0, (1i64 << (field_size * 8)) - 1)
-                        };
-                        self.intersect_bound(op.pos, &IntBound::bounded(lo, hi));
-                    }
-                }
-                OptimizationResult::PassOn
-            }
-
-            // intbounds.py: postprocess_GETARRAYITEM_RAW_I — bounded array items.
-            // RPython aliases all GETARRAYITEM variants to the same handler.
-            OpCode::GetarrayitemRawI | OpCode::GetarrayitemGcI => {
-                if let Some(ref d) = op.descr {
-                    if let Some(ad) = d.as_array_descr() {
-                        let item_size = ad.item_size();
-                        if item_size > 0 && item_size < 8 {
-                            let signed = ad.is_item_signed();
-                            let (lo, hi) = if signed {
-                                let half = 1i64 << (item_size * 8 - 1);
-                                (-half, half - 1)
-                            } else {
-                                (0, (1i64 << (item_size * 8)) - 1)
-                            };
-                            self.intersect_bound(op.pos, &IntBound::bounded(lo, hi));
-                        }
-                    }
-                }
-                OptimizationResult::PassOn
-            }
-
-            // intbounds.py: postprocess_STRLEN — result >= 0.
-            OpCode::Strlen | OpCode::Unicodelen => {
-                self.intersect_bound(op.pos, &IntBound::nonnegative());
-                OptimizationResult::PassOn
-            }
-
+            // ── All other ops: default emit (RPython's Optimization.emit) ──
+            // Postprocess dispatch is in propagate_postprocess, matching
+            // RPython's make_dispatcher_method(OptIntBounds, 'postprocess_').
             _ => OptimizationResult::PassOn,
         };
 
@@ -1892,21 +1632,60 @@ impl Optimization for OptIntBounds {
         self.last_emitted_opcode = None;
         self.last_emitted_args.clear();
         self.last_emitted_ref = OpRef::NONE;
-        self.pending_overflow_guard = None;
     }
 
     fn name(&self) -> &'static str {
         "intbounds"
     }
 
-    // intbounds postprocess_GUARD_TRUE/FALSE/VALUE is structurally
-    // implemented (propagate_postprocess below) but disabled because
-    // propagate_bounds_backward_op recurses via make_int_lt →
-    // propagate_bounds_backward → deep chain → stack overflow on
-    // Rust's 8MB stack. RPython's Python stack handles this depth.
-    // Rewrite postprocess (make_constant) IS active and provides
-    // the critical constant propagation that enables IntAddOvf→IntAdd.
-    // fn has_postprocess(&self) -> bool { true }
+    /// RPython: have_dispatcher_method(OptIntBounds, 'postprocess_')
+    ///
+    /// Guard postprocess (propagate_bounds_backward) is excluded from
+    /// framework dispatch because it recurses deeply — Rust's 8MB stack
+    /// can't handle the depth that RPython's Python stack handles.
+    /// Guard postprocess runs via the test helper (run_pass_with_bounds)
+    /// which calls propagate_postprocess directly.
+    fn have_postprocess_op(&self, opcode: OpCode) -> bool {
+        matches!(
+            opcode,
+            OpCode::IntAdd
+                | OpCode::IntSub
+                | OpCode::IntMul
+                | OpCode::IntAnd
+                | OpCode::IntOr
+                | OpCode::IntXor
+                | OpCode::IntLshift
+                | OpCode::IntRshift
+                | OpCode::UintRshift
+                | OpCode::IntFloorDiv
+                | OpCode::IntMod
+                | OpCode::IntNeg
+                | OpCode::IntInvert
+                | OpCode::IntForceGeZero
+                | OpCode::IntSignext
+                | OpCode::IntAddOvf
+                | OpCode::IntSubOvf
+                | OpCode::IntMulOvf
+                | OpCode::ArraylenGc
+                | OpCode::Strlen
+                | OpCode::Unicodelen
+                | OpCode::Strgetitem
+                | OpCode::Unicodegetitem
+                | OpCode::GetfieldRawI
+                | OpCode::GetfieldGcI
+                | OpCode::GetinteriorfieldGcI
+                | OpCode::GetfieldRawR
+                | OpCode::GetfieldGcR
+                | OpCode::GetinteriorfieldGcR
+                | OpCode::GetfieldRawF
+                | OpCode::GetfieldGcF
+                | OpCode::GetinteriorfieldGcF
+                | OpCode::GetarrayitemRawI
+                | OpCode::GetarrayitemGcI
+                | OpCode::CallPureI
+                | OpCode::CallI
+        )
+    }
 
     /// intbounds.py:52-58 _postprocess_guard_true_false_value parity.
     ///
@@ -1919,28 +1698,13 @@ impl Optimization for OptIntBounds {
     /// Called AFTER the op has been emitted through ALL passes and added
     /// to new_operations. At this point, the heap pass has flushed any
     /// postponed comparison op, so find_producing_op succeeds.
+    /// Matches RPython's make_dispatcher_method(OptIntBounds, 'postprocess_').
+    /// Dispatches to the correct postprocess_* method based on opcode.
     fn propagate_postprocess(&mut self, op: &Op, ctx: &mut OptContext) {
         match op.opcode {
+            // ── _postprocess_guard_true_false_value ──
+            // intbounds.py:52-58
             OpCode::GuardTrue | OpCode::GuardFalse | OpCode::GuardValue => {
-                // intbounds.py:52-58 _postprocess_guard_true_false_value:
-                //   if op.getarg(0).type == 'i':
-                //       self.propagate_bounds_backward(op.getarg(0))
-                //
-                // propagate_bounds_backward does two things:
-                // 1. If bound is constant → make_constant_int (may invalidate loop)
-                // 2. Find producing op → dispatch_bounds_ops (narrow arg bounds)
-                // intbounds.py:40-50 propagate_bounds_backward:
-                //   b = self.getintbound(box)
-                //   if b.is_constant():
-                //       self.make_constant_int(box, b.get_constant_int())
-                //   box1 = self.optimizer.as_operation(box)
-                //   if box1 is not None:
-                //       dispatch_bounds_ops(self, box1)
-                //
-                // RPython calls propagate_bounds_backward(arg0) for ALL three
-                // guard types identically. The is_true/is_false direction is
-                // already encoded in the condition's IntBound (set during
-                // propagate_forward's optimize_guard_true/false/value).
                 let arg0 = ctx.get_box_replacement(op.arg(0));
                 let is_int = ctx
                     .opref_type(arg0)
@@ -1948,27 +1712,140 @@ impl Optimization for OptIntBounds {
                 if !is_int {
                     return;
                 }
-                // intbounds.py:40-50 propagate_bounds_backward(arg0):
-                //   b = self.getintbound(box)
-                //   if b.is_constant():
-                //       self.make_constant_int(box, b.get_constant_int())
-                //   box1 = self.optimizer.as_operation(box)
-                //   if box1 is not None:
-                //       dispatch_bounds_ops(self, box1)
-                //
-                // Step 1: constant folding
+                // intbounds.py:40-50 propagate_bounds_backward
                 let b = self.getintbound(arg0, ctx);
                 if b.is_constant() {
                     self.make_constant_int_ref(arg0, b.get_constant(), ctx);
                 }
-                // Step 2: find producing op → dispatch_bounds_ops
                 if let Some(producing_op) = self.find_producing_op(arg0, ctx) {
                     let producing_op = producing_op.clone();
                     self.propagate_bounds_backward_op(&producing_op, ctx);
                 }
             }
+
+            // ── Arithmetic postprocess ──
+            OpCode::IntAdd => self.postprocess_int_add(op, ctx),
+            OpCode::IntSub => self.postprocess_int_sub(op, ctx),
+            OpCode::IntMul => self.postprocess_int_mul(op, ctx),
+            OpCode::IntAnd => self.postprocess_int_and(op, ctx),
+            OpCode::IntOr => self.postprocess_int_or(op, ctx),
+            OpCode::IntXor => self.postprocess_int_xor(op, ctx),
+            OpCode::IntLshift => self.postprocess_int_lshift(op, ctx),
+            OpCode::IntRshift => self.postprocess_int_rshift(op, ctx),
+            OpCode::UintRshift => self.postprocess_uint_rshift(op, ctx),
+            OpCode::IntFloorDiv => self.postprocess_int_floordiv(op, ctx),
+            OpCode::IntMod => self.postprocess_int_mod(op, ctx),
+            OpCode::IntNeg => self.postprocess_int_neg(op, ctx),
+            OpCode::IntInvert => self.postprocess_int_invert(op, ctx),
+            OpCode::IntForceGeZero => self.postprocess_int_force_ge_zero(op, ctx),
+            OpCode::IntSignext => self.postprocess_int_signext(op, ctx),
+
+            // ── Overflow arithmetic postprocess ──
+            OpCode::IntAddOvf => self.postprocess_int_add_ovf(op, ctx),
+            OpCode::IntSubOvf => self.postprocess_int_sub_ovf(op, ctx),
+            OpCode::IntMulOvf => self.postprocess_int_mul_ovf(op, ctx),
+
+            // ── Lengths ──
+            OpCode::ArraylenGc => self.postprocess_arraylen_gc(op),
+            OpCode::Strlen => self.postprocess_strlen(op),
+            OpCode::Unicodelen => self.postprocess_unicodelen(op),
+
+            // ── String/Unicode items ──
+            OpCode::Strgetitem => {
+                self.intersect_bound(op.pos, &IntBound::bounded(0, 255));
+            }
+            OpCode::Unicodegetitem => {
+                self.intersect_bound(op.pos, &IntBound::nonnegative());
+            }
+
+            // ── Field accesses ──
+            OpCode::GetfieldRawI
+            | OpCode::GetfieldGcI
+            | OpCode::GetinteriorfieldGcI
+            | OpCode::GetfieldRawR
+            | OpCode::GetfieldGcR
+            | OpCode::GetinteriorfieldGcR
+            | OpCode::GetfieldRawF
+            | OpCode::GetfieldGcF
+            | OpCode::GetinteriorfieldGcF => {
+                if let Some(ref d) = op.descr {
+                    let (field_size, signed) = d.field_size_and_sign();
+                    if field_size > 0 && field_size < 8 {
+                        let (lo, hi) = if signed {
+                            let half = 1i64 << (field_size * 8 - 1);
+                            (-half, half - 1)
+                        } else {
+                            (0, (1i64 << (field_size * 8)) - 1)
+                        };
+                        self.intersect_bound(op.pos, &IntBound::bounded(lo, hi));
+                    }
+                }
+            }
+
+            // ── Array item accesses ──
+            OpCode::GetarrayitemRawI | OpCode::GetarrayitemGcI => {
+                if let Some(ref d) = op.descr {
+                    if let Some(ad) = d.as_array_descr() {
+                        let item_size = ad.item_size();
+                        if item_size > 0 && item_size < 8 {
+                            let signed = ad.is_item_signed();
+                            let (lo, hi) = if signed {
+                                let half = 1i64 << (item_size * 8 - 1);
+                                (-half, half - 1)
+                            } else {
+                                (0, (1i64 << (item_size * 8)) - 1)
+                            };
+                            self.intersect_bound(op.pos, &IntBound::bounded(lo, hi));
+                        }
+                    }
+                }
+            }
+
+            // ── Call postprocess ──
+            OpCode::CallPureI | OpCode::CallI => {
+                if let Some(ref d) = op.descr {
+                    if let Some(cd) = d.as_call_descr() {
+                        let ei = cd.effect_info();
+                        match ei.oopspec_index {
+                            majit_ir::OopSpecIndex::IntPyDiv => {
+                                if op.num_args() >= 3 {
+                                    let divisor_bound = self.getintbound(op.arg(2), ctx);
+                                    if divisor_bound.known_positive() {
+                                        let result_bound = IntBound::new(
+                                            0,
+                                            divisor_bound.upper.saturating_sub(1),
+                                            0,
+                                            u64::MAX,
+                                        );
+                                        self.intersect_bound(op.pos, &result_bound);
+                                    }
+                                }
+                            }
+                            majit_ir::OopSpecIndex::IntPyMod => {
+                                if op.num_args() >= 3 {
+                                    let divisor_bound = self.getintbound(op.arg(2), ctx);
+                                    if divisor_bound.known_positive() {
+                                        let result_bound = IntBound::new(
+                                            0,
+                                            divisor_bound.upper.saturating_sub(1),
+                                            0,
+                                            u64::MAX,
+                                        );
+                                        self.intersect_bound(op.pos, &result_bound);
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+
             _ => {}
         }
+
+        // Sync bounds to OptContext after postprocess (optimizer.py parity).
+        ctx.int_bounds.clone_from(&self.bounds);
     }
 
     /// intbounds.py: produce_potential_short_preamble_ops(sb)
@@ -2307,18 +2184,22 @@ mod tests {
 
     #[test]
     fn test_second_overflow_guard_survives_after_first_guard() {
+        // Use OpRef(3) for guard condition so it doesn't affect overflow operands.
+        // GuardTrue(OpRef(3)) makes OpRef(3)=1 via rewrite postprocess,
+        // but OpRef(0), OpRef(1), OpRef(2) remain unbounded.
         let initial_bounds = vec![
             (OpRef(0), IntBound::unbounded()),
             (OpRef(1), IntBound::unbounded()),
             (OpRef(2), IntBound::unbounded()),
+            (OpRef(3), IntBound::unbounded()),
         ];
         let ops = vec![
-            make_op(OpCode::GuardTrue, &[OpRef(1)], 3),
-            make_op(OpCode::IntSubOvf, &[OpRef(0), OpRef(1)], 4),
-            make_op(OpCode::GuardNoOverflow, &[], 5),
-            make_op(OpCode::IntMulOvf, &[OpRef(2), OpRef(1)], 6),
-            make_op(OpCode::GuardNoOverflow, &[], 7),
-            make_op(OpCode::Jump, &[OpRef(4), OpRef(4), OpRef(6)], 8),
+            make_op(OpCode::GuardTrue, &[OpRef(3)], 4),
+            make_op(OpCode::IntSubOvf, &[OpRef(0), OpRef(1)], 5),
+            make_op(OpCode::GuardNoOverflow, &[], 6),
+            make_op(OpCode::IntMulOvf, &[OpRef(2), OpRef(1)], 7),
+            make_op(OpCode::GuardNoOverflow, &[], 8),
+            make_op(OpCode::Jump, &[OpRef(5), OpRef(5), OpRef(7)], 9),
         ];
 
         let (result, _pass, _ctx) = run_pass_with_bounds(&ops, &initial_bounds);
@@ -2604,23 +2485,21 @@ mod tests {
     // ── Test: INT_IS_TRUE and INT_IS_ZERO produce bool bounds ──
 
     #[test]
-    fn test_int_is_true_bool_bounds() {
+    fn test_int_is_true_passthrough() {
+        // RPython: IntIsTrue has no postprocess — just passes through.
         let ops = vec![make_op(OpCode::IntIsTrue, &[OpRef(0)], 1)];
-
-        let (_result, pass, _ctx) = run_pass_with_bounds(&ops, &[]);
-        let b = pass.bounds[1].as_ref().unwrap();
-        assert_eq!(b.lower, 0);
-        assert_eq!(b.upper, 1);
+        let (result, _pass, _ctx) = run_pass_with_bounds(&ops, &[]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].opcode, OpCode::IntIsTrue);
     }
 
     #[test]
-    fn test_int_is_zero_bool_bounds() {
+    fn test_int_is_zero_passthrough() {
+        // RPython: IntIsZero has no postprocess — just passes through.
         let ops = vec![make_op(OpCode::IntIsZero, &[OpRef(0)], 1)];
-
-        let (_result, pass, _ctx) = run_pass_with_bounds(&ops, &[]);
-        let b = pass.bounds[1].as_ref().unwrap();
-        assert_eq!(b.lower, 0);
-        assert_eq!(b.upper, 1);
+        let (result, _pass, _ctx) = run_pass_with_bounds(&ops, &[]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].opcode, OpCode::IntIsZero);
     }
 
     // ── Test: Comparison with unknown bounds stays ──
@@ -2640,10 +2519,6 @@ mod tests {
             "INT_LT should remain when bounds are unknown"
         );
         assert_eq!(result[0].opcode, OpCode::IntLt);
-        // But the result should have bool bounds [0, 1]
-        let b = pass.bounds[2].as_ref().unwrap();
-        assert_eq!(b.lower, 0);
-        assert_eq!(b.upper, 1);
     }
 
     // ── Test: INT_SIGNEXT ──
@@ -2794,15 +2669,10 @@ mod tests {
 
     #[test]
     fn test_strgetitem_bounds() {
-        // STRGETITEM result should be bounded to [0, 255].
-        let mut opt = OptIntBounds::new();
-        let mut op = Op::new(OpCode::Strgetitem, &[OpRef(100), OpRef(101)]);
-        op.pos = OpRef(102);
-        let mut ctx = OptContext::new(10);
-        let result = opt.propagate_forward(&op, &mut ctx);
-        assert!(matches!(result, OptimizationResult::PassOn));
-        // After processing, the bounds for op.pos should be [0, 255].
-        let b = opt.getintbound(op.pos, &ctx);
+        // postprocess_STRGETITEM: result should be bounded to [0, 255].
+        let ops = vec![make_op(OpCode::Strgetitem, &[OpRef(0), OpRef(1)], 2)];
+        let (_result, pass, _ctx) = run_pass_with_bounds(&ops, &[]);
+        let b = pass.getintbound(OpRef(2), &_ctx);
         assert!(b.lower >= 0, "STRGETITEM lower should be >= 0");
         assert!(b.upper <= 255, "STRGETITEM upper should be <= 255");
     }
