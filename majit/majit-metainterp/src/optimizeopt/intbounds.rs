@@ -456,17 +456,66 @@ impl OptIntBounds {
     }
 
     fn postprocess_arraylen_gc(&mut self, op: &Op, ctx: &mut OptContext) {
-        // Array length is always non-negative
-        self.intersect_bound(op.pos, &IntBound::nonnegative(), ctx);
+        // intbounds.py:503-505
+        //     array = self.ensure_ptr_info_arg0(op)
+        //     self.optimizer.setintbound(op, array.getlenbound(None))
+        let array = ctx.get_box_replacement(op.arg(0));
+        if ctx.get_ptr_info(array).is_none() {
+            if let Some(descr) = op.descr.clone() {
+                ctx.set_ptr_info(
+                    array,
+                    crate::optimizeopt::info::PtrInfo::array(descr, IntBound::nonnegative()),
+                );
+            }
+        }
+        if let Some(crate::optimizeopt::info::PtrInfo::Array(arrayinfo)) =
+            ctx.get_ptr_info_mut(array)
+        {
+            let bound = arrayinfo.lenbound.clone();
+            ctx.setintbound(op.pos, &bound);
+        }
     }
 
     fn postprocess_strlen(&mut self, op: &Op, ctx: &mut OptContext) {
-        // String length is always non-negative
-        self.intersect_bound(op.pos, &IntBound::nonnegative(), ctx);
+        // intbounds.py:507-510
+        //     self.make_nonnull_str(op.getarg(0), vstring.mode_string)
+        //     array = getptrinfo(op.getarg(0))
+        //     self.optimizer.setintbound(op, array.getlenbound(vstring.mode_string))
+        ctx.make_nonnull_str(op.arg(0), 0);
+        let array = ctx.get_box_replacement(op.arg(0));
+        if let Some(crate::optimizeopt::info::PtrInfo::Str(strinfo)) = ctx.get_ptr_info_mut(array) {
+            if strinfo.lenbound.is_none() {
+                strinfo.lenbound = Some(if strinfo.length == -1 {
+                    IntBound::nonnegative()
+                } else {
+                    IntBound::from_constant(strinfo.length as i64)
+                });
+            }
+            if let Some(bound) = strinfo.lenbound.clone() {
+                ctx.setintbound(op.pos, &bound);
+            }
+        }
     }
 
     fn postprocess_unicodelen(&mut self, op: &Op, ctx: &mut OptContext) {
-        self.intersect_bound(op.pos, &IntBound::nonnegative(), ctx);
+        // intbounds.py:512-515
+        //     self.make_nonnull_str(op.getarg(0), vstring.mode_unicode)
+        //     array = getptrinfo(op.getarg(0))
+        //     self.optimizer.setintbound(op, array.getlenbound(vstring.mode_unicode))
+        ctx.make_nonnull_str(op.arg(0), 1);
+        let array = ctx.get_box_replacement(op.arg(0));
+        if let Some(crate::optimizeopt::info::PtrInfo::Str(strinfo)) = ctx.get_ptr_info_mut(array) {
+            if strinfo.lenbound.is_none() {
+                strinfo.lenbound = Some(if strinfo.length == -1 {
+                    IntBound::nonnegative()
+                } else {
+                    IntBound::from_constant(strinfo.length as i64)
+                });
+            }
+            if let Some(bound) = strinfo.lenbound.clone() {
+                ctx.setintbound(op.pos, &bound);
+            }
+        }
     }
 
     // ── INT_SIGNEXT optimization ──
@@ -1545,7 +1594,7 @@ impl Optimization for OptIntBounds {
     fn export_arg_int_bounds(
         &self,
         args: &[OpRef],
-        ctx: &mut OptContext,
+        ctx: &OptContext,
     ) -> std::collections::HashMap<OpRef, IntBound> {
         let mut exported = std::collections::HashMap::new();
         for &arg in args {
@@ -1553,8 +1602,10 @@ impl Optimization for OptIntBounds {
             if !matches!(ctx.opref_type(resolved), Some(majit_ir::Type::Int)) {
                 continue;
             }
-            let bound = self.getintbound(resolved, ctx);
-            if !bound.is_unbounded() {
+            if let Some(bound) = ctx.peek_intbound(resolved) {
+                if bound.is_unbounded() {
+                    continue;
+                }
                 exported.insert(resolved, bound);
             }
         }
@@ -1566,6 +1617,21 @@ impl Optimization for OptIntBounds {
 mod tests {
     use super::*;
     use crate::optimizeopt::optimizer::Optimizer;
+    use majit_ir::{Descr, DescrRef};
+    use std::sync::Arc;
+
+    #[derive(Debug)]
+    struct TestDescr(u32);
+
+    impl Descr for TestDescr {
+        fn index(&self) -> u32 {
+            self.0
+        }
+    }
+
+    fn descr(idx: u32) -> DescrRef {
+        Arc::new(TestDescr(idx))
+    }
 
     fn run_pass(ops: &[Op]) -> Vec<Op> {
         let mut opt = Optimizer::new();
@@ -2084,7 +2150,9 @@ mod tests {
 
     #[test]
     fn test_arraylen_nonneg() {
-        let ops = vec![make_op(OpCode::ArraylenGc, &[OpRef(0)], 1)];
+        let mut op = make_op(OpCode::ArraylenGc, &[OpRef(0)], 1);
+        op.descr = Some(descr(1));
+        let ops = vec![op];
 
         let (_result, mut ctx) = run_pass_with_bounds(&ops, &[]);
         let b = ctx.getintbound(OpRef(1));
