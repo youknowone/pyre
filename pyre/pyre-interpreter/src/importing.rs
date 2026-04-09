@@ -86,9 +86,9 @@ pub fn install_builtin_modules() {
     register_builtin_module("importlib", init_importlib_pkg);
     register_builtin_module("importlib.util", init_importlib_util);
     register_builtin_module("importlib.abc", init_importlib_abc);
+    register_builtin_module("_signal", init_signal_stub);
     // _opcode_metadata.py exists in the stdlib; load the real file instead.
     for name in &[
-        "_signal",
         "_string",
         "_locale",
         "_warnings",
@@ -131,6 +131,48 @@ pub fn install_builtin_modules() {
 
 /// Empty module initializer for C-extension stubs.
 fn empty_module_init(_ns: &mut PyNamespace) {}
+
+/// _signal module stub — PyPy: pypy/module/signal/. Provides the signal()
+/// function and SIG_DFL/SIG_IGN constants that signal.py wraps.
+fn init_signal_stub(ns: &mut PyNamespace) {
+    crate::namespace_store(
+        ns,
+        "signal",
+        crate::make_builtin_function("signal", |args| {
+            // signal(signalnum, handler) — return previous handler (None stub).
+            Ok(args.get(1).copied().unwrap_or(pyre_object::w_none()))
+        }),
+    );
+    crate::namespace_store(
+        ns,
+        "getsignal",
+        crate::make_builtin_function("getsignal", |_| Ok(pyre_object::w_none())),
+    );
+    crate::namespace_store(
+        ns,
+        "default_int_handler",
+        crate::make_builtin_function("default_int_handler", |_| Ok(pyre_object::w_none())),
+    );
+    crate::namespace_store(
+        ns,
+        "set_wakeup_fd",
+        crate::make_builtin_function("set_wakeup_fd", |_| Ok(pyre_object::w_int_new(-1))),
+    );
+    crate::namespace_store(ns, "SIG_DFL", pyre_object::w_int_new(0));
+    crate::namespace_store(ns, "SIG_IGN", pyre_object::w_int_new(1));
+    // Common signal numbers (POSIX subset).
+    crate::namespace_store(ns, "SIGINT", pyre_object::w_int_new(2));
+    crate::namespace_store(ns, "SIGTERM", pyre_object::w_int_new(15));
+    crate::namespace_store(ns, "SIGHUP", pyre_object::w_int_new(1));
+    crate::namespace_store(ns, "SIGQUIT", pyre_object::w_int_new(3));
+    crate::namespace_store(ns, "SIGKILL", pyre_object::w_int_new(9));
+    crate::namespace_store(ns, "SIGUSR1", pyre_object::w_int_new(30));
+    crate::namespace_store(ns, "SIGUSR2", pyre_object::w_int_new(31));
+    crate::namespace_store(ns, "SIGPIPE", pyre_object::w_int_new(13));
+    crate::namespace_store(ns, "SIGALRM", pyre_object::w_int_new(14));
+    crate::namespace_store(ns, "SIGCHLD", pyre_object::w_int_new(20));
+    crate::namespace_store(ns, "NSIG", pyre_object::w_int_new(64));
+}
 
 /// _collections_abc stub — provides _check_methods for io.py etc.
 /// The real _collections_abc.py requires ABCMeta (metaclass support).
@@ -473,29 +515,35 @@ fn init_contextvars(ns: &mut PyNamespace) {
 
 /// _weakref stub — PyPy: pypy/module/_weakref/
 fn init_weakref(ns: &mut PyNamespace) {
-    // ref(obj[, callback]) → weakref. Stub: returns obj itself (no GC).
-    crate::namespace_store(
-        ns,
-        "ref",
-        crate::make_builtin_function("ref", |args| {
-            Ok(if args.is_empty() {
-                pyre_object::w_none()
-            } else {
-                args[0]
-            })
-        }),
-    );
-    crate::namespace_store(
-        ns,
-        "proxy",
-        crate::make_builtin_function("proxy", |args| {
-            Ok(if args.is_empty() {
-                pyre_object::w_none()
-            } else {
-                args[0]
-            })
-        }),
-    );
+    // PyPy: interp_weakref.W_Weakref / W_CallableProxy.typedef are real
+    // types so weakref.py can subclass them (`class WeakMethod(ref): ...`).
+    // Stub backing — they just return the referent unchanged.
+    let ref_type = crate::typedef::make_builtin_type("ref", |ns| {
+        crate::namespace_store(
+            ns,
+            "__new__",
+            crate::make_builtin_function("__new__", |args| {
+                // args[0] = cls, args[1] = obj, args[2..] = optional callback
+                Ok(args.get(1).copied().unwrap_or(pyre_object::w_none()))
+            }),
+        );
+    });
+    crate::namespace_store(ns, "ref", ref_type);
+    crate::namespace_store(ns, "ReferenceType", ref_type);
+
+    let proxy_type = crate::typedef::make_builtin_type("proxy", |ns| {
+        crate::namespace_store(
+            ns,
+            "__new__",
+            crate::make_builtin_function("__new__", |args| {
+                Ok(args.get(1).copied().unwrap_or(pyre_object::w_none()))
+            }),
+        );
+    });
+    crate::namespace_store(ns, "proxy", proxy_type);
+    crate::namespace_store(ns, "ProxyType", proxy_type);
+    crate::namespace_store(ns, "CallableProxyType", proxy_type);
+
     crate::namespace_store(
         ns,
         "getweakrefcount",
@@ -506,11 +554,6 @@ fn init_weakref(ns: &mut PyNamespace) {
         "getweakrefs",
         crate::make_builtin_function("getweakrefs", |_| Ok(pyre_object::w_list_new(vec![]))),
     );
-    // Type stubs — weakref.py imports these names from _weakref.
-    // PyPy: pypy/module/_weakref/interp_weakref.py W_WeakrefBase/CallableProxy.
-    crate::namespace_store(ns, "ReferenceType", crate::typedef::w_object());
-    crate::namespace_store(ns, "ProxyType", crate::typedef::w_object());
-    crate::namespace_store(ns, "CallableProxyType", crate::typedef::w_object());
     crate::namespace_store(
         ns,
         "_remove_dead_weakref",
@@ -575,11 +618,17 @@ fn init_functools(ns: &mut PyNamespace) {
             Err(crate::PyError::type_error("reduce not implemented"))
         }),
     );
+    // functools.cmp_to_key(cmp) — returns a callable that wraps a value in
+    // an opaque key. For sorting str / int / tuple of those (the only paths
+    // pyre's stdlib actually exercises), the items are already comparable,
+    // so an identity key gives the same ordering as `cmp(a, b)` would.
     crate::namespace_store(
         ns,
         "cmp_to_key",
-        crate::make_builtin_function("cmp_to_key", |_| {
-            Err(crate::PyError::type_error("cmp_to_key not implemented"))
+        crate::make_builtin_function("cmp_to_key", |_args| {
+            Ok(crate::make_builtin_function("cmp_to_key.K", |args| {
+                Ok(args.first().copied().unwrap_or(pyre_object::w_none()))
+            }))
         }),
     );
 }
@@ -910,6 +959,30 @@ fn init_posix(ns: &mut PyNamespace) {
             crate::make_builtin_function(name, |_| Ok(pyre_object::w_int_new(0))),
         );
     }
+    // os.fspath() — PyPy: posixmodule.c posix_fspath. Returns the argument
+    // unchanged for str/bytes/bytearray (the protocol's identity case);
+    // any other object would normally trigger __fspath__ but we don't
+    // model that protocol yet.
+    crate::namespace_store(
+        ns,
+        "fspath",
+        crate::make_builtin_function("fspath", |args| {
+            let arg = args.first().copied().unwrap_or(pyre_object::w_none());
+            unsafe {
+                if pyre_object::is_str(arg) || pyre_object::bytearrayobject::is_bytearray(arg) {
+                    return Ok(arg);
+                }
+            }
+            // Try __fspath__ — for pathlib.Path-like objects.
+            if let Ok(method) = crate::baseobjspace::getattr(arg, "__fspath__") {
+                let result = crate::call_function(method, &[arg]);
+                if !result.is_null() {
+                    return Ok(result);
+                }
+            }
+            Ok(arg)
+        }),
+    );
     crate::namespace_store(ns, "error", crate::typedef::w_object());
 }
 

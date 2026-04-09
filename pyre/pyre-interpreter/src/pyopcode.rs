@@ -279,6 +279,11 @@ pub trait ConstantOpcodeHandler: SharedOpcodeHandler {
     fn float_constant(&mut self, value: f64) -> Result<Self::Value, PyError>;
     fn bool_constant(&mut self, value: bool) -> Result<Self::Value, PyError>;
     fn str_constant(&mut self, value: &str) -> Result<Self::Value, PyError>;
+    /// Bytes literal — pyre stores immutable bytes values as bytearray.
+    /// PyPy: Bytes literals create W_BytesObject, but pyre lacks a separate
+    /// bytes type so we route through W_BytearrayObject (mutable) and rely
+    /// on call sites that need true immutability to make a copy.
+    fn bytes_constant(&mut self, value: &[u8]) -> Result<Self::Value, PyError>;
     fn code_constant(&mut self, code: &CodeObject) -> Result<Self::Value, PyError>;
     fn none_constant(&mut self) -> Result<Self::Value, PyError>;
     fn slice_constant(
@@ -323,11 +328,7 @@ fn load_const_value<H: ConstantOpcodeHandler + ?Sized>(
         ConstantData::Code { code } => handler.code_constant(code),
         ConstantData::None => handler.none_constant(),
         ConstantData::Ellipsis => handler.none_constant(), // stub: Ellipsis → None
-        ConstantData::Bytes { value } => {
-            // Bytes as string stub (proper bytes object needed later)
-            let s = String::from_utf8_lossy(value);
-            handler.str_constant(&s)
-        }
+        ConstantData::Bytes { value } => handler.bytes_constant(value),
         ConstantData::Complex { value } => {
             // Complex number stub → just the real part
             handler.float_constant(value.re)
@@ -809,6 +810,16 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
     /// Default no-op so non-PyFrame handlers (e.g. trace recorder) can
     /// ignore the opcode; PyFrame overrides this to do the actual work.
     fn setup_annotations(&mut self) -> Result<(), Self::Error>
+    where
+        Self: SharedOpcodeHandler,
+    {
+        Ok(())
+    }
+
+    /// CPython 3.14 WITH_EXCEPT_START — call __exit__ with the active
+    /// exception inside a `with` block. Default no-op for the trace
+    /// recorder; PyFrame overrides to actually invoke __exit__.
+    fn with_except_start(&mut self) -> Result<(), Self::Error>
     where
         Self: SharedOpcodeHandler,
     {
@@ -1931,7 +1942,13 @@ where
         }
         Instruction::ExitInitCheck => Ok(StepResult::Continue),
         Instruction::WithExceptStart => {
-            Err(crate::PyError::type_error("WITH_EXCEPT_START not yet implemented").into())
+            // CPython 3.14 WITH_EXCEPT_START:
+            //   val = TOS         (the exception)
+            //   exit_func = stack[-4]
+            //   res = exit_func(type(val), val, val.__traceback__)
+            //   push(res)
+            executor.with_except_start()?;
+            Ok(StepResult::Continue)
         }
 
         other => executor.unsupported(&other),

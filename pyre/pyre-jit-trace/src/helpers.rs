@@ -461,6 +461,11 @@ pub trait TraceHelperAccess {
         self.with_trace_ctx(|ctx| Ok(ctx.const_ref(box_str_constant(value) as i64)))
     }
 
+    fn trace_bytes_constant(&mut self, value: &[u8]) -> Result<OpRef, PyError> {
+        let r = pyre_object::bytearrayobject::w_bytearray_from_bytes(value);
+        self.with_trace_ctx(|ctx| Ok(ctx.const_ref(r as i64)))
+    }
+
     fn trace_code_constant(
         &mut self,
         code: &pyre_interpreter::CodeObject,

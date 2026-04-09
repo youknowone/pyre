@@ -48,10 +48,16 @@ pub fn init(ns: &mut PyNamespace) {
     namespace_store(ns, "modules", modules_dict);
     // sys.path — empty list placeholder
     namespace_store(ns, "path", w_list_new(vec![]));
-    // sys.stdout/stderr/stdin — stubs
-    namespace_store(ns, "stdout", w_none());
-    namespace_store(ns, "stderr", w_none());
-    namespace_store(ns, "stdin", w_none());
+    // sys.stdout/stderr/stdin — stub file-like objects.  Real CPython
+    // wires these through io.TextIOWrapper around sys.__stdout__; pyre
+    // exposes a tiny object with the bare minimum surface so anything
+    // that writes status (unittest, traceback, warnings) keeps working.
+    namespace_store(ns, "stdout", make_std_stream("<stdout>", false));
+    namespace_store(ns, "stderr", make_std_stream("<stderr>", true));
+    namespace_store(ns, "stdin", make_std_stream("<stdin>", false));
+    namespace_store(ns, "__stdout__", make_std_stream("<stdout>", false));
+    namespace_store(ns, "__stderr__", make_std_stream("<stderr>", true));
+    namespace_store(ns, "__stdin__", make_std_stream("<stdin>", false));
     // sys._getframe — returns a stub frame object with f_locals/f_globals
     namespace_store(
         ns,
@@ -294,4 +300,80 @@ pub fn init(ns: &mut PyNamespace) {
         "addaudithook",
         crate::make_builtin_function("addaudithook", |_| Ok(w_none())),
     );
+}
+
+/// Construct a stub stdio object exposing `write`, `flush`, `isatty`,
+/// `fileno`, and `name`.  PyPy uses real W_File-backed objects via the io
+/// module; pyre routes writes through Rust's stdout/stderr directly.
+fn make_std_stream(name: &'static str, is_stderr: bool) -> PyObjectRef {
+    let stream = w_instance_new(crate::typedef::w_object());
+    let _ = crate::baseobjspace::setattr(stream, "name", w_str_new(name));
+    let _ = crate::baseobjspace::setattr(stream, "encoding", w_str_new("utf-8"));
+    let _ =
+        crate::baseobjspace::setattr(stream, "mode", w_str_new(if is_stderr { "w" } else { "r" }));
+    let _ = crate::baseobjspace::setattr(stream, "closed", w_bool_from(false));
+    let _ = crate::baseobjspace::setattr(stream, "buffer", w_none());
+    // ATTR_TABLE-stored builtin methods do not get `self` prepended (see
+    // pyopcode load_method dispatch), so the first arg may be the string
+    // directly. Pick whichever element is a real str.
+    fn pick_str(args: &[PyObjectRef]) -> Option<&str> {
+        for &a in args {
+            if !a.is_null() && unsafe { is_str(a) } {
+                return Some(unsafe { w_str_get_value(a) });
+            }
+        }
+        None
+    }
+    let write_fn = if is_stderr {
+        crate::make_builtin_function("write", |args| {
+            use std::io::Write;
+            if let Some(text) = pick_str(args) {
+                let _ = std::io::stderr().write_all(text.as_bytes());
+                return Ok(w_int_new(text.len() as i64));
+            }
+            Ok(w_int_new(0))
+        })
+    } else {
+        crate::make_builtin_function("write", |args| {
+            use std::io::Write;
+            if let Some(text) = pick_str(args) {
+                let _ = std::io::stdout().write_all(text.as_bytes());
+                return Ok(w_int_new(text.len() as i64));
+            }
+            Ok(w_int_new(0))
+        })
+    };
+    let _ = crate::baseobjspace::setattr(stream, "write", write_fn);
+    let _ = crate::baseobjspace::setattr(
+        stream,
+        "flush",
+        crate::make_builtin_function("flush", |_| {
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+            let _ = std::io::stderr().flush();
+            Ok(w_none())
+        }),
+    );
+    let _ = crate::baseobjspace::setattr(
+        stream,
+        "isatty",
+        crate::make_builtin_function("isatty", |_| Ok(w_bool_from(false))),
+    );
+    let fileno_fn = if is_stderr {
+        crate::make_builtin_function("fileno", |_| Ok(w_int_new(2)))
+    } else {
+        crate::make_builtin_function("fileno", |_| Ok(w_int_new(1)))
+    };
+    let _ = crate::baseobjspace::setattr(stream, "fileno", fileno_fn);
+    let _ = crate::baseobjspace::setattr(
+        stream,
+        "writable",
+        crate::make_builtin_function("writable", |_| Ok(w_bool_from(true))),
+    );
+    let _ = crate::baseobjspace::setattr(
+        stream,
+        "readable",
+        crate::make_builtin_function("readable", |_| Ok(w_bool_from(false))),
+    );
+    stream
 }

@@ -4564,6 +4564,15 @@ impl ConstantOpcodeHandler for MIFrame {
         Ok(FrontendOp::new(opref, concrete))
     }
 
+    fn bytes_constant(&mut self, value: &[u8]) -> Result<Self::Value, PyError> {
+        // Treat as opaque heap allocation for tracing — pyre's bytes literal
+        // is materialised as bytearray, so the JIT sees it as a Ref.
+        let bytes_ref = pyre_object::bytearrayobject::w_bytearray_from_bytes(value);
+        let concrete = ConcreteValue::Ref(bytes_ref);
+        let opref = self.trace_bytes_constant(value)?;
+        Ok(FrontendOp::new(opref, concrete))
+    }
+
     fn code_constant(&mut self, code: &CodeObject) -> Result<Self::Value, PyError> {
         let concrete = ConcreteValue::Ref(code as *const CodeObject as PyObjectRef);
         let opref = self.trace_code_constant(code)?;

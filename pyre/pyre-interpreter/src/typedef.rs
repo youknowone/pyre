@@ -183,7 +183,8 @@ pub fn gettypefor(tp: *const PyType) -> Option<PyObjectRef> {
 ///
 /// With `w_class` on PyObject, this is a direct field read. Falls back to
 /// `gettypefor(ob_type)` for objects created before init_typeobjects()
-/// (where w_class is null).
+/// (singletons such as None/True/False/Ellipsis live in read-only static
+/// memory, so we never write w_class back into them).
 pub fn r#type(obj: PyObjectRef) -> Option<PyObjectRef> {
     if obj.is_null() {
         return None;
@@ -193,12 +194,11 @@ pub fn r#type(obj: PyObjectRef) -> Option<PyObjectRef> {
         if !w_class.is_null() {
             return Some(w_class);
         }
-        // Fallback for objects created before init_typeobjects (singletons etc.)
-        // Populate w_class lazily so future reads hit the fast path.
+        // Fallback for objects created before init_typeobjects (None, True,
+        // False, Ellipsis, NotImplemented). These are `static`s in RODATA,
+        // so writing to (*obj).w_class would SIGBUS — just look it up.
         let tp = (*obj).ob_type;
-        let cls = gettypefor(tp)?;
-        (*obj).w_class = cls;
-        Some(cls)
+        gettypefor(tp)
     }
 }
 
@@ -333,6 +333,21 @@ pub fn init_typeobjects() {
         new_typeobject_with_base("classmethod", init_classmethod_type, object_type) as usize,
     );
 
+    // property — PyPy: descriptor.py W_Property, bases=(object,)
+    reg.insert(
+        &pyre_object::propertyobject::PROPERTY_TYPE as *const PyType as usize,
+        new_typeobject_with_base("property", init_property_type, object_type) as usize,
+    );
+
+    // exception — pyre uses one shared W_TypeObject for all builtin
+    // exception instances; the per-class hierarchy lives in the namespace
+    // (see make_exc_type in builtins.rs).  Registering it here lets
+    // typedef::r#type return a non-null type for raised exception objects.
+    reg.insert(
+        &pyre_object::excobject::EXCEPTION_TYPE as *const PyType as usize,
+        new_typeobject_with_base("exception", |_| {}, object_type) as usize,
+    );
+
     // NoneType — bases=(object,)
     reg.insert(
         &NONE_TYPE as *const PyType as usize,
@@ -452,7 +467,7 @@ fn new_root_typeobject(name: &str, init: fn(&mut PyNamespace)) -> PyObjectRef {
 /// Layout defaults to INSTANCE_TYPE (general object layout).
 fn new_typeobject_with_base(
     name: &str,
-    init: fn(&mut PyNamespace),
+    init: impl FnOnce(&mut PyNamespace),
     base: PyObjectRef,
 ) -> PyObjectRef {
     new_typeobject_with_base_and_layout(name, init, base, &INSTANCE_TYPE as *const PyType)
@@ -465,7 +480,7 @@ fn new_typeobject_with_base(
 /// the same typedef as their base reuse the parent's Layout object.
 fn new_typeobject_with_base_and_layout(
     name: &str,
-    init: fn(&mut PyNamespace),
+    init: impl FnOnce(&mut PyNamespace),
     base: PyObjectRef,
     layout_pytype: *const PyType,
 ) -> PyObjectRef {
@@ -529,8 +544,17 @@ fn new_typeobject_with_base_and_layout(
 ///
 /// Used by extension modules (e.g. _sre) to define their own types.
 /// typeobject.py:174 `is_heaptype=False` — builtin type.
-pub fn make_builtin_type(name: &str, init: fn(&mut PyNamespace)) -> PyObjectRef {
+pub fn make_builtin_type(name: &str, init: impl FnOnce(&mut PyNamespace)) -> PyObjectRef {
     new_typeobject_with_base(name, init, w_object())
+}
+
+/// Create a named builtin type inheriting from `base`.
+pub fn make_builtin_type_with_base(
+    name: &str,
+    init: impl FnOnce(&mut PyNamespace),
+    base: PyObjectRef,
+) -> PyObjectRef {
+    new_typeobject_with_base(name, init, base)
 }
 
 /// Generate a `__new__` wrapper that skips `cls` (first arg) and delegates
@@ -1646,6 +1670,22 @@ fn init_classmethod_type(ns: &mut PyNamespace) {
     );
 }
 
+/// `property.__new__(cls, fget=None, fset=None, fdel=None, doc=None)`
+/// — descriptor.py W_Property.descr_new
+fn init_property_type(ns: &mut PyNamespace) {
+    namespace_store(
+        ns,
+        "__new__",
+        make_builtin_function("__new__", |args| {
+            // args[0] is cls; fget/fset/fdel follow.
+            let fget = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+            let fset = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
+            let fdel = args.get(3).copied().unwrap_or(pyre_object::PY_NULL);
+            Ok(pyre_object::w_property_new(fget, fset, fdel))
+        }),
+    );
+}
+
 fn init_int_type(ns: &mut PyNamespace) {
     namespace_store(ns, "__new__", make_new_descr(int_descr_new));
     namespace_store(
@@ -1977,8 +2017,51 @@ fn init_object_type(ns: &mut PyNamespace) {
     );
 }
 
+fn bytearray_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    // args[0] = cls (ignored — bytearray subclasses still allocate the
+    // primitive layout). bytearrayobject.py descr_new accepts:
+    //   bytearray()           → empty
+    //   bytearray(int)        → zero-filled buffer of length n
+    //   bytearray(bytes-like) → copy of the contents
+    //   bytearray(str, encoding[, errors]) → encoded bytes (encoding ignored)
+    let rest = if args.is_empty() { args } else { &args[1..] };
+    if rest.is_empty() {
+        return Ok(pyre_object::bytearrayobject::w_bytearray_new(0));
+    }
+    let arg = rest[0];
+    unsafe {
+        if pyre_object::is_int(arg) {
+            let n = pyre_object::w_int_get_value(arg).max(0) as usize;
+            return Ok(pyre_object::bytearrayobject::w_bytearray_new(n));
+        }
+        if pyre_object::bytearrayobject::is_bytearray(arg) {
+            let data = pyre_object::bytearrayobject::w_bytearray_data(arg);
+            return Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(data));
+        }
+        if pyre_object::is_str(arg) {
+            let s = pyre_object::w_str_get_value(arg);
+            return Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(
+                s.as_bytes(),
+            ));
+        }
+    }
+    // Iterable of ints — collect and convert.
+    if let Ok(items) = crate::builtins::collect_iterable(arg) {
+        let mut buf = Vec::with_capacity(items.len());
+        for item in items {
+            if unsafe { pyre_object::is_int(item) } {
+                let v = unsafe { pyre_object::w_int_get_value(item) };
+                buf.push((v & 0xff) as u8);
+            }
+        }
+        return Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(&buf));
+    }
+    Ok(pyre_object::bytearrayobject::w_bytearray_new(0))
+}
+
 /// PyPy: bytearrayobject.py W_BytearrayObject.typedef
 fn init_bytearray_type(ns: &mut PyNamespace) {
+    namespace_store(ns, "__new__", make_new_descr(bytearray_descr_new));
     namespace_store(
         ns,
         "find",
