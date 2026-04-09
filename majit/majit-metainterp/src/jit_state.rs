@@ -113,6 +113,20 @@ pub struct ResumeDataResult {
     /// No RPython equivalent (RPython uses ConstBox natively).
     /// Each entry: (OpRef index >= 10000, raw value, type).
     pub constants: Vec<(u32, i64, Type)>,
+    /// resume.py:1245 decode_box parity: per-livebox kind. RPython's
+    /// `load_box_from_cpu(num, kind)` creates IntFrontendOp/RefFrontendOp/
+    /// FloatFrontendOp by index, where `kind` is determined by the
+    /// callback (`_callback_i/_callback_r/_callback_f`) dispatched through
+    /// `enumerate_vars(info, liveness_info, ...)`. The callback origin IS
+    /// the box `.type`.
+    ///
+    /// In majit/pyre this is the parent guard's `fail_arg_types`
+    /// (`ResumeGuardDescr.fail_arg_types`, compile.py:797), keyed by
+    /// liveboxes index. setup_bridge_sym uses this to type the bridge
+    /// inputarg slots correctly — without it the bridge falls back to
+    /// concrete_slot_types which always returns Type::Ref for W_IntObject
+    /// locals and triggers a spurious unbox path in RETURN_VALUE.
+    pub fail_arg_types: Vec<Type>,
 }
 
 /// Interpreter-specific JIT state contract.
