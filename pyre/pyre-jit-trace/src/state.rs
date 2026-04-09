@@ -804,19 +804,16 @@ pub(crate) fn try_trace_const_boxed_float(
     }
 }
 
-/// pyjitpl.py:750-758: read container length with heapcache arraylen
-/// caching. Uses GetfieldGcI (pyre's length fields are struct fields,
-/// not RPython's GC array headers) but caches via heapcache.arraylen
-/// for separate-from-field-cache semantics.
+/// pyjitpl.py:750-758: read container length.
+///
+/// RPython's `arraylen_gc` reads the GC array header — there is exactly one
+/// length per array, so RPython keeps a per-box `heapc_deps[0]` slot. pyre
+/// stores list/bytes/tuple lengths as plain struct fields, so the cached
+/// value lives in the regular field cache (`heap_cache.field_cache`).
+/// `opimpl_getfield_gc_i` already does that lookup, so this helper is now
+/// just a thin alias kept for source-stability with the call sites.
 pub(crate) fn trace_arraylen_gc(ctx: &mut TraceCtx, obj: OpRef, descr: DescrRef) -> OpRef {
-    let descr_idx = descr.index();
-    if let Some(cached) = ctx.heap_cache().arraylen(obj, descr_idx) {
-        return cached;
-    }
-    let result = opimpl_getfield_gc_i(ctx, obj, descr.clone());
-    ctx.heap_cache_mut()
-        .arraylen_now_known(obj, descr_idx, result);
-    result
+    opimpl_getfield_gc_i(ctx, obj, descr)
 }
 
 pub(crate) fn opimpl_getfield_gc_i(ctx: &mut TraceCtx, obj: OpRef, descr: DescrRef) -> OpRef {
