@@ -413,6 +413,19 @@ impl HeapCache {
     }
 
     /// RPython: update_version(ref_frontend_op)
+    /// heapcache.py:199-209
+    ///
+    ///     def update_version(self, ref_frontend_op):
+    ///         """Ensure the version of 'ref_frontend_op' is current. If not,
+    ///         it will update 'ref_frontend_op' (removing most flags currently set).
+    ///         """
+    ///         if not self.test_head_version(ref_frontend_op):
+    ///             f = self.head_version
+    ///             if (self.test_likely_virtual_version(ref_frontend_op) and
+    ///                 test_flags(ref_frontend_op, HF_LIKELY_VIRTUAL)):
+    ///                 f |= HF_LIKELY_VIRTUAL
+    ///             ref_frontend_op._set_heapc_flags(f)
+    ///             ref_frontend_op._heapc_deps = None
     pub fn update_version(&mut self, opref: OpRef) {
         let old_flags = self.flags_for_ref(opref);
         if Self::versioned_or(old_flags, self.head_version) {
@@ -425,6 +438,8 @@ impl HeapCache {
             flags |= u32::from(HF_LIKELY_VIRTUAL);
         }
         self.set_flags_for_ref(opref, flags);
+        // RPython: ref_frontend_op._heapc_deps = None
+        self.escape_deps.remove(&opref);
     }
 
     /// RPython: _check_flag(box, flag)
