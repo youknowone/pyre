@@ -1848,10 +1848,12 @@ impl ExportCache {
 ///
 /// **Cycle handling**: RPython does
 ///
-///     result = info.visitor_dispatch_virtual_type(self)
-///     self.info[box] = result            # ← cache the empty state
-///     info.visitor_walk_recursive(box, self)
-///     result.fieldstate = [...]          # ← fill afterwards
+/// ```text
+/// result = info.visitor_dispatch_virtual_type(self)
+/// self.info[box] = result            # ← cache the empty state
+/// info.visitor_walk_recursive(box, self)
+/// result.fieldstate = [...]          # ← fill afterwards
+/// ```
 ///
 /// so a cycle (`A.f -> B`, `B.f -> A`) closes on the same Python object.
 /// Rust's `Rc<VirtualStateInfo>` is immutable after construction, and

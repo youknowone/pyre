@@ -576,13 +576,15 @@ impl PtrInfo {
     /// info.py:763-772 `ConstPtrInfo.get_known_class(cpu)` +
     /// the other PtrInfo subclasses' `_known_class` accessors:
     ///
-    ///     def get_known_class(self, cpu):
-    ///         if not self._const.nonnull():
+    /// ```text
+    /// def get_known_class(self, cpu):
+    ///     if not self._const.nonnull():
+    ///         return None
+    ///     if cpu.supports_guard_gc_type:
+    ///         if not cpu.check_is_object(self._const.getref_base()):
     ///             return None
-    ///         if cpu.supports_guard_gc_type:
-    ///             if not cpu.check_is_object(self._const.getref_base()):
-    ///                 return None
-    ///         return cpu.cls_of_box(self._const)
+    ///     return cpu.cls_of_box(self._const)
+    /// ```
     ///
     /// - `Instance`/`Virtual`: return the stored `known_class` field
     ///   (PyPy `InstancePtrInfo._known_class`). A class-only result of
@@ -750,16 +752,18 @@ impl PtrInfo {
 
     /// info.py:74-75 (PtrInfo base) and info.py:804-808 (ConstPtrInfo)
     ///
-    ///     # base
-    ///     def getstrlen(self, op, string_optimizer, mode):
-    ///         return None
+    /// ```text
+    /// # base
+    /// def getstrlen(self, op, string_optimizer, mode):
+    ///     return None
     ///
-    ///     # ConstPtrInfo
-    ///     def getstrlen(self, op, string_optimizer, mode):
-    ///         length = self.getstrlen1(mode)
-    ///         if length < 0:
-    ///             return None
-    ///         return ConstInt(length)
+    /// # ConstPtrInfo
+    /// def getstrlen(self, op, string_optimizer, mode):
+    ///     length = self.getstrlen1(mode)
+    ///     if length < 0:
+    ///         return None
+    ///     return ConstInt(length)
+    /// ```
     ///
     /// `mode` is `0` for byte strings and `1` for unicode (matches majit's
     /// vstring `mode_string` / `mode_unicode` discriminator). The actual
@@ -779,18 +783,20 @@ impl PtrInfo {
 
     /// info.py:826-838 ConstPtrInfo.getstrhash
     ///
-    ///     def getstrhash(self, op, mode):
-    ///         from rpython.jit.metainterp.optimizeopt import vstring
-    ///         if mode is vstring.mode_string:
-    ///             s = self._unpack_str(vstring.mode_string)
-    ///             if s is None:
-    ///                 return None
-    ///             return ConstInt(compute_hash(s))
-    ///         else:
-    ///             s = self._unpack_str(vstring.mode_unicode)
-    ///             if s is None:
-    ///                 return None
-    ///             return ConstInt(compute_hash(s))
+    /// ```text
+    /// def getstrhash(self, op, mode):
+    ///     from rpython.jit.metainterp.optimizeopt import vstring
+    ///     if mode is vstring.mode_string:
+    ///         s = self._unpack_str(vstring.mode_string)
+    ///         if s is None:
+    ///             return None
+    ///         return ConstInt(compute_hash(s))
+    ///     else:
+    ///         s = self._unpack_str(vstring.mode_unicode)
+    ///         if s is None:
+    ///             return None
+    ///         return ConstInt(compute_hash(s))
+    /// ```
     ///
     /// Like `getstrlen`, the actual hash needs a runtime hook because
     /// majit's `GcRef` is opaque. Returns `None` until pyre wires a

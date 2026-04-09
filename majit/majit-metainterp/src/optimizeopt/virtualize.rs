@@ -531,12 +531,14 @@ impl OptVirtualize {
 
     /// virtualize.py:60-65 make_virtual_raw_slice
     ///
-    ///     def make_virtual_raw_slice(self, offset, parent, source_op):
-    ///         opinfo = info.RawSlicePtrInfo(offset, parent)
-    ///         newop = self.replace_op_with(source_op, source_op.getopnum(),
-    ///                                    args=[source_op.getarg(0), ConstInt(offset)])
-    ///         newop.set_forwarded(opinfo)
-    ///         return opinfo
+    /// ```text
+    /// def make_virtual_raw_slice(self, offset, parent, source_op):
+    ///     opinfo = info.RawSlicePtrInfo(offset, parent)
+    ///     newop = self.replace_op_with(source_op, source_op.getopnum(),
+    ///                                args=[source_op.getarg(0), ConstInt(offset)])
+    ///     newop.set_forwarded(opinfo)
+    ///     return opinfo
+    /// ```
     ///
     /// `parent` is the *immediate* predecessor (a `RawBufferPtrInfo` or
     /// another `RawSlicePtrInfo`) — RPython stores the PtrInfo object
@@ -1146,16 +1148,18 @@ impl OptVirtualize {
 
     /// virtualize.py:255-266 optimize_INT_ADD
     ///
-    ///     def optimize_INT_ADD(self, op):
-    ///         opinfo = getrawptrinfo(op.getarg(0))
-    ///         offsetbox = self.get_constant_box(op.getarg(1))
-    ///         if opinfo and opinfo.is_virtual() and offsetbox is not None:
-    ///             offset = offsetbox.getint()
-    ///             if (isinstance(opinfo, info.RawBufferPtrInfo) or
-    ///                 isinstance(opinfo, info.RawSlicePtrInfo)):
-    ///                 self.make_virtual_raw_slice(offset, opinfo, op)
-    ///                 return
-    ///         return self.emit(op)
+    /// ```text
+    /// def optimize_INT_ADD(self, op):
+    ///     opinfo = getrawptrinfo(op.getarg(0))
+    ///     offsetbox = self.get_constant_box(op.getarg(1))
+    ///     if opinfo and opinfo.is_virtual() and offsetbox is not None:
+    ///         offset = offsetbox.getint()
+    ///         if (isinstance(opinfo, info.RawBufferPtrInfo) or
+    ///             isinstance(opinfo, info.RawSlicePtrInfo)):
+    ///             self.make_virtual_raw_slice(offset, opinfo, op)
+    ///             return
+    ///     return self.emit(op)
+    /// ```
     ///
     /// `parent` is the immediate predecessor's PtrInfo (RPython) — in
     /// majit we pass the immediate predecessor's `OpRef`. The slice does

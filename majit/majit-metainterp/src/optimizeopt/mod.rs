@@ -2027,20 +2027,22 @@ impl OptContext {
     /// info.py:194-198 (AbstractStructPtrInfo) + info.py:533-538 (ArrayPtrInfo)
     /// `copy_fields_to_const(constinfo, optheap)`.
     ///
-    ///     # AbstractStructPtrInfo
-    ///     def copy_fields_to_const(self, constinfo, optheap):
-    ///         if self._fields is not None:
-    ///             info = constinfo._get_info(self.descr, optheap)
-    ///             assert isinstance(info, AbstractStructPtrInfo)
-    ///             info._fields = self._fields[:]
+    /// ```text
+    /// # AbstractStructPtrInfo
+    /// def copy_fields_to_const(self, constinfo, optheap):
+    ///     if self._fields is not None:
+    ///         info = constinfo._get_info(self.descr, optheap)
+    ///         assert isinstance(info, AbstractStructPtrInfo)
+    ///         info._fields = self._fields[:]
     ///
-    ///     # ArrayPtrInfo
-    ///     def copy_fields_to_const(self, constinfo, optheap):
-    ///         descr = self.descr
-    ///         if self._items is not None:
-    ///             info = constinfo._get_array_info(descr, optheap)
-    ///             assert isinstance(info, ArrayPtrInfo)
-    ///             info._items = self._items[:]
+    /// # ArrayPtrInfo
+    /// def copy_fields_to_const(self, constinfo, optheap):
+    ///     descr = self.descr
+    ///     if self._items is not None:
+    ///         info = constinfo._get_array_info(descr, optheap)
+    ///         assert isinstance(info, ArrayPtrInfo)
+    ///         info._items = self._items[:]
+    /// ```
     ///
     /// majit folds both per-type entries into a single helper because the
     /// per-source dispatch happens via the PtrInfo enum match. The
