@@ -1466,22 +1466,19 @@ impl HeapCache {
 
     // ── Likely virtual tracking (heapcache.py is_likely_virtual) ──
 
-    /// heapcache.py:new(box) parity: mark a box as freshly allocated.
-    /// Sets HF_IS_UNESCAPED (not escaped to external code) and
-    /// HF_LIKELY_VIRTUAL (candidate for virtualization by optimizer).
-    /// Called by opimpl_virtual_ref after allocating a JitVirtualRef.
+    /// Alias for `new_object` kept under the heapcache.py:502 name `new`.
+    /// Used by `opimpl_virtual_ref` (pyjitpl.py:1807) which calls
+    /// `self.metainterp.heapcache.new(resbox)` after recording VIRTUAL_REF.
     pub fn new_box(&mut self, opref: OpRef) {
-        vb_insert(&mut self.likely_virtual, opref);
-        // HF_IS_UNESCAPED: new allocations haven't escaped yet.
-        // In RPython, this also clears cached field values for the box.
-        // pyre's field cache is keyed by (obj, field_descr) so a new
-        // box with no prior entries is implicitly "no cached values".
+        self.new_object(opref);
     }
 
-    /// Mark a value as likely virtual.
-    /// heapcache.py: HF_LIKELY_VIRTUAL flag
+    /// pyre-only seam used outside the standard `new`/`new_array` allocation
+    /// hooks: stamp HF_LIKELY_VIRTUAL on a box without touching the other
+    /// allocation flags. Routes through `_set_flag` so the version-gated
+    /// heapc_flags stays in sync with the Vec<bool> mirror.
     pub fn mark_likely_virtual(&mut self, opref: OpRef) {
-        vb_insert(&mut self.likely_virtual, opref);
+        self._set_flag(opref, HF_LIKELY_VIRTUAL);
     }
 
     /// Check if a value is likely virtual.
