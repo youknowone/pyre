@@ -1356,7 +1356,13 @@ impl TraceCtx {
         if self.is_nonstandard_virtualizable(vable_opref) {
             // arraybox = self.opimpl_getfield_gc_r(box, fdescr)
             // return self.opimpl_getarrayitem_gc_i(arraybox, indexbox, adescr)
-            let array_opref = self.vable_getfield_ref(vable_opref, array_field_offset);
+            //
+            // RPython's fallback uses `opimpl_getfield_gc_r` (the HEAP-side
+            // accessor), NOT `opimpl_getfield_vable_r`, so no recursive
+            // `_nonstandard_virtualizable` check is performed. Mirror this
+            // by emitting the GETFIELD_GC_R / GETARRAYITEM_GC_I ops directly.
+            let field_ref = self.const_int(array_field_offset as i64);
+            let array_opref = self.record_op(OpCode::GetfieldGcR, &[vable_opref, field_ref]);
             return self.vable_getarrayitem_int(array_opref, index);
         }
         // self.metainterp.check_synchronized_virtualizable() — no-op in pyre.
@@ -1372,13 +1378,15 @@ impl TraceCtx {
                 }
             }
             // Fallback: vable layout missing — go through getfield + arrayitem.
-            let array_opref = self.vable_getfield_ref(vable_opref, array_field_offset);
+            let field_ref = self.const_int(array_field_offset as i64);
+            let array_opref = self.record_op(OpCode::GetfieldGcR, &[vable_opref, field_ref]);
             return self.vable_getarrayitem_int_vable(array_opref, array_field_offset, item_index);
         }
         // RPython asserts indexbox.getint() returns a constant via
         // `implement_guard_value`; pyre's non-constant index path here is
         // a pyre extension. Fall back to the heap-array read.
-        let array_opref = self.vable_getfield_ref(vable_opref, array_field_offset);
+        let field_ref = self.const_int(array_field_offset as i64);
+        let array_opref = self.record_op(OpCode::GetfieldGcR, &[vable_opref, field_ref]);
         self.vable_getarrayitem_int(array_opref, index)
     }
 
@@ -1408,7 +1416,11 @@ impl TraceCtx {
         array_field_offset: usize,
     ) -> OpRef {
         if self.is_nonstandard_virtualizable(vable_opref) {
-            let array_opref = self.vable_getfield_ref(vable_opref, array_field_offset);
+            // RPython uses `opimpl_getfield_gc_r` (heap-side), so emit
+            // GETFIELD_GC_R directly without re-running
+            // `_nonstandard_virtualizable`.
+            let field_ref = self.const_int(array_field_offset as i64);
+            let array_opref = self.record_op(OpCode::GetfieldGcR, &[vable_opref, field_ref]);
             return self.vable_getarrayitem_ref(array_opref, index);
         }
         if let Some(item_index) = self
@@ -1420,10 +1432,12 @@ impl TraceCtx {
                     return boxes[flat_idx];
                 }
             }
-            let array_opref = self.vable_getfield_ref(vable_opref, array_field_offset);
+            let field_ref = self.const_int(array_field_offset as i64);
+            let array_opref = self.record_op(OpCode::GetfieldGcR, &[vable_opref, field_ref]);
             return self.vable_getarrayitem_ref_vable(array_opref, array_field_offset, item_index);
         }
-        let array_opref = self.vable_getfield_ref(vable_opref, array_field_offset);
+        let field_ref = self.const_int(array_field_offset as i64);
+        let array_opref = self.record_op(OpCode::GetfieldGcR, &[vable_opref, field_ref]);
         self.vable_getarrayitem_ref(array_opref, index)
     }
 
@@ -1453,7 +1467,11 @@ impl TraceCtx {
         array_field_offset: usize,
     ) -> OpRef {
         if self.is_nonstandard_virtualizable(vable_opref) {
-            let array_opref = self.vable_getfield_ref(vable_opref, array_field_offset);
+            // RPython uses `opimpl_getfield_gc_r` (heap-side); emit
+            // GETFIELD_GC_R directly to avoid re-running
+            // `_nonstandard_virtualizable`.
+            let field_ref = self.const_int(array_field_offset as i64);
+            let array_opref = self.record_op(OpCode::GetfieldGcR, &[vable_opref, field_ref]);
             return self.vable_getarrayitem_float(array_opref, index);
         }
         if let Some(item_index) = self
@@ -1465,14 +1483,16 @@ impl TraceCtx {
                     return boxes[flat_idx];
                 }
             }
-            let array_opref = self.vable_getfield_ref(vable_opref, array_field_offset);
+            let field_ref = self.const_int(array_field_offset as i64);
+            let array_opref = self.record_op(OpCode::GetfieldGcR, &[vable_opref, field_ref]);
             return self.vable_getarrayitem_float_vable(
                 array_opref,
                 array_field_offset,
                 item_index,
             );
         }
-        let array_opref = self.vable_getfield_ref(vable_opref, array_field_offset);
+        let field_ref = self.const_int(array_field_offset as i64);
+        let array_opref = self.record_op(OpCode::GetfieldGcR, &[vable_opref, field_ref]);
         self.vable_getarrayitem_float(array_opref, index)
     }
 
@@ -1518,7 +1538,11 @@ impl TraceCtx {
         value: OpRef,
     ) {
         if self.is_nonstandard_virtualizable(vable_opref) {
-            let array_opref = self.vable_getfield_ref(vable_opref, array_field_offset);
+            // RPython uses `opimpl_getfield_gc_r` + `_opimpl_setarrayitem_gc_any`,
+            // both heap-side. Emit GETFIELD_GC_R directly to avoid recursing
+            // through `_nonstandard_virtualizable` for the inner load.
+            let field_ref = self.const_int(array_field_offset as i64);
+            let array_opref = self.record_op(OpCode::GetfieldGcR, &[vable_opref, field_ref]);
             self.vable_setarrayitem(array_opref, index, value);
             return;
         }
@@ -1533,11 +1557,13 @@ impl TraceCtx {
                     return;
                 }
             }
-            let array_opref = self.vable_getfield_ref(vable_opref, array_field_offset);
+            let field_ref = self.const_int(array_field_offset as i64);
+            let array_opref = self.record_op(OpCode::GetfieldGcR, &[vable_opref, field_ref]);
             self.vable_setarrayitem_vable(array_opref, array_field_offset, item_index, value);
             return;
         }
-        let array_opref = self.vable_getfield_ref(vable_opref, array_field_offset);
+        let field_ref = self.const_int(array_field_offset as i64);
+        let array_opref = self.record_op(OpCode::GetfieldGcR, &[vable_opref, field_ref]);
         self.vable_setarrayitem(array_opref, index, value);
     }
 
