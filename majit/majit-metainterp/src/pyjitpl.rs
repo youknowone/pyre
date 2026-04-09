@@ -53,12 +53,14 @@ pub fn set_ref_unbox_int_fn(f: fn(i64) -> i64) {
 /// (pyjitpl.py:2890). Fields correspond to:
 /// - `fail_types`: ResumeGuardDescr.fail_arg_types (compile.py:797)
 /// - `is_exception_guard`: isinstance(key, ResumeGuardExcDescr) (compile.py:932)
-/// - `rd_numb`/`rd_consts`: storage.rd_numb/rd_consts (resume.py:1042)
+/// - `rd_numb`/`rd_consts`/`rd_virtuals`: storage.rd_numb/rd_consts/rd_virtuals
+///   (resume.py:1042 rebuild_from_resumedata).
 pub struct BridgeRetraceResult {
     pub is_exception_guard: bool,
     pub fail_types: Vec<Type>,
     pub rd_numb: Option<Vec<u8>>,
     pub rd_consts: Option<Vec<(i64, Type)>>,
+    pub rd_virtuals: Option<Vec<majit_ir::RdVirtualInfo>>,
 }
 
 /// Result of checking a back-edge.
@@ -6382,18 +6384,30 @@ impl<M: Clone> MetaInterp<M> {
             hook(green_key);
         }
 
-        // resume.py:1042: retrieve rd_numb/rd_consts directly from exit_layout
-        // (not from BridgeFailDescrProxy, to avoid cloning on the hot path).
-        let (rd_numb, rd_consts) = Self::trace_for_exit(compiled, norm_tid)
+        // resume.py:1042: retrieve rd_numb/rd_consts/rd_virtuals directly from
+        // exit_layout (not from BridgeFailDescrProxy, to avoid cloning on the
+        // hot path). rd_virtuals carries the parent guard's virtual descriptor
+        // table so a future bridge tracer can rebuild parent virtuals via
+        // NEW_WITH_VTABLE + SETFIELD_GC ops at trace start, mirroring RPython's
+        // ResumeDataBoxReader.consume_boxes → rd_virtuals[i].allocate
+        // (resume.py:945-956 getvirtual_ptr).
+        let (rd_numb, rd_consts, rd_virtuals) = Self::trace_for_exit(compiled, norm_tid)
             .and_then(|(_, trace)| trace.exit_layouts.get(&fail_index))
-            .map(|layout| (layout.rd_numb.clone(), layout.rd_consts.clone()))
-            .unwrap_or((None, None));
+            .map(|layout| {
+                (
+                    layout.rd_numb.clone(),
+                    layout.rd_consts.clone(),
+                    layout.rd_virtuals.clone(),
+                )
+            })
+            .unwrap_or((None, None, None));
 
         Some(BridgeRetraceResult {
             is_exception_guard,
             fail_types: bridge_input_types.to_vec(),
             rd_numb,
             rd_consts,
+            rd_virtuals,
         })
     }
 

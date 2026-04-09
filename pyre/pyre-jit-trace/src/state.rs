@@ -2485,7 +2485,7 @@ impl JitState for PyreJitState {
         // RPython uses jitcode liveness via get_current_position_info; majit
         // routes the same lookup through `frame_value_count_at`.
         let cb = crate::state::frame_value_count_at;
-        let (_num_failargs, vable_values, vref_values, frames) =
+        let (num_failargs, vable_values, vref_values, frames) =
             rebuild_from_numbering(rd_numb, rd_consts, Some(&cb));
 
         if frames.is_empty() {
@@ -2546,6 +2546,10 @@ impl JitState for PyreJitState {
             // fail_arg_types so setup_bridge_sym can type bridge inputarg
             // slots correctly.
             fail_arg_types: fail_arg_types.to_vec(),
+            // resume.py:1042 num_failargs from rd_numb header. Used by
+            // bridge virtual materialization (resume.py:1556-1564 decode_box
+            // negative-index normalization: `num + len(liveboxes)`).
+            num_failargs,
         })
     }
 

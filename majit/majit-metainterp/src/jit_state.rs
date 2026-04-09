@@ -127,6 +127,12 @@ pub struct ResumeDataResult {
     /// concrete_slot_types which always returns Type::Ref for W_IntObject
     /// locals and triggers a spurious unbox path in RETURN_VALUE.
     pub fail_arg_types: Vec<Type>,
+    /// resume.py:1042 num_failargs read from rd_numb header.
+    /// Needed by `materialize_bridge_virtual` to translate negative TAGBOX
+    /// numbers in `rd_virtuals` fieldnums (resume.py:1556-1564 decode_box:
+    /// Python-style negative indexing into the parent guard's liveboxes
+    /// array; the decoder normalizes via `val + num_failargs`).
+    pub num_failargs: i32,
 }
 
 /// Interpreter-specific JIT state contract.
