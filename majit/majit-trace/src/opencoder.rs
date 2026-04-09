@@ -1168,14 +1168,44 @@ impl TraceRecordBuffer {
         self.record_arg(arg2);
     }
 
-    /// RPython-compatible: encode a boxed value array.
+    /// opencoder.py:712-716 _list_of_boxes
+    ///
+    ///     def _list_of_boxes(self, boxes):
+    ///         boxes_list_storage = self.new_array(len(boxes))
+    ///         for i in range(len(boxes)):
+    ///             self._add_box_to_storage(boxes[i])
+    ///         return boxes_list_storage
     pub fn _list_of_boxes(&self, boxes: &[u32]) -> Vec<u32> {
         boxes.iter().map(|&b| self._encode(TAGBOX, b)).collect()
     }
 
-    /// RPython-compatible: encode boxes for virtualizable state.
+    /// opencoder.py:718-726 _list_of_boxes_virtualizable
+    ///
+    ///     def _list_of_boxes_virtualizable(self, boxes):
+    ///         if not boxes:
+    ///             return self.new_array(0)
+    ///         boxes_list_storage = self.new_array(len(boxes))
+    ///         # the virtualizable is at the end, move it to the front
+    ///         self._add_box_to_storage(boxes[-1])
+    ///         for i in range(len(boxes) - 1):
+    ///             self._add_box_to_storage(boxes[i])
+    ///         return boxes_list_storage
+    ///
+    /// The virtualizable always lives at the **end** of the locals_cells_stack
+    /// list at trace time but the snapshot encoding wants it at the **front**
+    /// so the resume reader can pull it out before the local frame slots.
     pub fn _list_of_boxes_virtualizable(&self, boxes: &[u32]) -> Vec<u32> {
-        boxes.iter().map(|&b| self._encode(TAGBOX, b)).collect()
+        if boxes.is_empty() {
+            return Vec::new();
+        }
+        let mut result = Vec::with_capacity(boxes.len());
+        // opencoder.py:723: self._add_box_to_storage(boxes[-1])
+        result.push(self._encode(TAGBOX, boxes[boxes.len() - 1]));
+        // opencoder.py:724-725: for i in range(len(boxes) - 1)
+        for &b in &boxes[..boxes.len() - 1] {
+            result.push(self._encode(TAGBOX, b));
+        }
+        result
     }
 
     /// RPython-compatible helper: return a copied encoded array payload.

@@ -588,20 +588,61 @@ impl PtrInfo {
         }
     }
 
-    /// Get the string length from a constant string pointer.
-    /// info.py: getstrlen() on ConstPtrInfo
-    pub fn getstrlen(&self) -> Option<usize> {
-        // Only meaningful for constant string objects.
-        // In RPython, this reads the string header to get the length.
-        // In our implementation, GcRef doesn't carry string metadata,
-        // so we return None. This can be overridden when GcRef is enriched.
-        None
+    /// info.py:74-75 (PtrInfo base) and info.py:804-808 (ConstPtrInfo)
+    ///
+    ///     # base
+    ///     def getstrlen(self, op, string_optimizer, mode):
+    ///         return None
+    ///
+    ///     # ConstPtrInfo
+    ///     def getstrlen(self, op, string_optimizer, mode):
+    ///         length = self.getstrlen1(mode)
+    ///         if length < 0:
+    ///             return None
+    ///         return ConstInt(length)
+    ///
+    /// `mode` is `0` for byte strings and `1` for unicode (matches majit's
+    /// vstring `mode_string` / `mode_unicode` discriminator). The actual
+    /// length lookup needs a runtime hook because majit's `GcRef` is an
+    /// opaque pointer; that hook is supplied at the `OptContext` level via
+    /// `string_resolver`. When no resolver is plugged in, return `None`
+    /// (matches RPython's "unknown length" path).
+    pub fn getstrlen<F>(&self, mode: u8, mut resolver: F) -> Option<i64>
+    where
+        F: FnMut(majit_ir::GcRef, u8) -> Option<i64>,
+    {
+        match self {
+            PtrInfo::Constant(gcref) if !gcref.is_null() => resolver(*gcref, mode),
+            _ => None,
+        }
     }
 
-    /// Get the string hash from a constant string pointer.
-    /// info.py: getstrhash() on ConstPtrInfo
-    pub fn getstrhash(&self) -> Option<i64> {
-        None
+    /// info.py:826-838 ConstPtrInfo.getstrhash
+    ///
+    ///     def getstrhash(self, op, mode):
+    ///         from rpython.jit.metainterp.optimizeopt import vstring
+    ///         if mode is vstring.mode_string:
+    ///             s = self._unpack_str(vstring.mode_string)
+    ///             if s is None:
+    ///                 return None
+    ///             return ConstInt(compute_hash(s))
+    ///         else:
+    ///             s = self._unpack_str(vstring.mode_unicode)
+    ///             if s is None:
+    ///                 return None
+    ///             return ConstInt(compute_hash(s))
+    ///
+    /// Like `getstrlen`, the actual hash needs a runtime hook because
+    /// majit's `GcRef` is opaque. Returns `None` until pyre wires a
+    /// `hash_resolver` into `OptContext`.
+    pub fn getstrhash<F>(&self, mode: u8, mut resolver: F) -> Option<i64>
+    where
+        F: FnMut(majit_ir::GcRef, u8) -> Option<i64>,
+    {
+        match self {
+            PtrInfo::Constant(gcref) if !gcref.is_null() => resolver(*gcref, mode),
+            _ => None,
+        }
     }
 
     /// Count the number of fields/items in this virtual object.

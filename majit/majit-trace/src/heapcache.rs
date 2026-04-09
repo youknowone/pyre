@@ -1430,37 +1430,53 @@ impl HeapCache {
 
     // ── Loop-invariant call result caching ──
 
-    /// heapcache.py: call_loopinvariant_now_known — record a single
-    /// loop-invariant call result. Only ONE result is stored at a time;
-    /// subsequent calls overwrite the previous entry.
-    pub fn call_loopinvariant_now_known(&mut self, descr_index: u32, arg0_int: i64, result: OpRef) {
-        self.call_loopinvariant_cache(descr_index, arg0_int, result);
-    }
-
-    pub fn call_loopinvariant_cache(&mut self, descr_index: u32, arg0_int: i64, result: OpRef) {
-        self.loopinvariant_descr = Some(descr_index);
-        self.loopinvariant_arg0 = Some(arg0_int);
-        self.loopinvariant_result = Some(result);
-    }
-
-    /// heapcache.py: call_loopinvariant_known_result — look up cached result.
-    /// Returns Some only if descr identity AND arg0 integer value both match.
+    /// heapcache.py:629-634 call_loopinvariant_known_result
+    ///
+    ///     def call_loopinvariant_known_result(self, allboxes, descr):
+    ///         if self.loop_invariant_descr is not descr:
+    ///             return None
+    ///         if self.loop_invariant_arg0int != allboxes[0].getint():
+    ///             return None
+    ///         return self.loop_invariant_result
+    ///
+    /// Only ONE result is stored at a time. RPython matches by descr
+    /// **identity** and the arg0 **integer value**; majit keys both
+    /// values directly because the trace HeapCache deals in `descr.index()`
+    /// + `i64` rather than Python objects.
     pub fn call_loopinvariant_known_result(
         &self,
         descr_index: u32,
         arg0_int: i64,
     ) -> Option<OpRef> {
-        self.call_loopinvariant_lookup(descr_index, arg0_int)
+        if self.loopinvariant_descr != Some(descr_index) {
+            return None;
+        }
+        if self.loopinvariant_arg0 != Some(arg0_int) {
+            return None;
+        }
+        self.loopinvariant_result
     }
 
+    /// heapcache.py:636-639 call_loopinvariant_now_known
+    ///
+    ///     def call_loopinvariant_now_known(self, allboxes, descr, res):
+    ///         self.loop_invariant_descr = descr
+    ///         self.loop_invariant_arg0int = allboxes[0].getint()
+    ///         self.loop_invariant_result = res
+    pub fn call_loopinvariant_now_known(&mut self, descr_index: u32, arg0_int: i64, result: OpRef) {
+        self.loopinvariant_descr = Some(descr_index);
+        self.loopinvariant_arg0 = Some(arg0_int);
+        self.loopinvariant_result = Some(result);
+    }
+
+    /// Internal alias retained for older callsites.
+    pub fn call_loopinvariant_cache(&mut self, descr_index: u32, arg0_int: i64, result: OpRef) {
+        self.call_loopinvariant_now_known(descr_index, arg0_int, result);
+    }
+
+    /// Internal alias retained for older callsites.
     pub fn call_loopinvariant_lookup(&self, descr_index: u32, arg0_int: i64) -> Option<OpRef> {
-        if self.loopinvariant_descr == Some(descr_index)
-            && self.loopinvariant_arg0 == Some(arg0_int)
-        {
-            self.loopinvariant_result
-        } else {
-            None
-        }
+        self.call_loopinvariant_known_result(descr_index, arg0_int)
     }
 
     // ── Reset variants ──
