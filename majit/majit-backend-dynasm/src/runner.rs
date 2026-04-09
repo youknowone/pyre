@@ -338,6 +338,12 @@ impl Backend for DynasmBackend {
         if orig_compiled.label_addr != 0 {
             asm.set_jump_target_addr(orig_compiled.label_addr);
         }
+        // regalloc.py:1308 `descr._x86_arglocs` parity: pass the main
+        // loop's LABEL arglocs to the bridge so its closing JUMP places
+        // arguments in the locations the body code expects.
+        if !orig_compiled.loop_arglocs.is_empty() {
+            asm.set_loop_arglocs(orig_compiled.loop_arglocs.clone());
+        }
 
         // assembler.py:638 rebuild_faillocs_from_descr(faildescr, inputargs)
         // RPython uses the exact faildescr object. We find the matching
@@ -560,19 +566,7 @@ impl Backend for DynasmBackend {
                 _ => Value::Int(raw),
             });
         }
-        let exit_types = descr.fail_arg_types.clone();
-        let exit_layout = Some(majit_backend::FailDescrLayout {
-            fail_index: descr.fail_index,
-            fail_arg_types: exit_types,
-            is_finish: descr.is_finish,
-            trace_id: descr.trace_id,
-            source_op_index: None,
-            gc_ref_slots: Vec::new(),
-            force_token_slots: Vec::new(),
-            frame_stack: None,
-            recovery_layout: None,
-            trace_info: None,
-        });
+        let exit_layout = Some(descr.layout());
 
         drop(jf);
 
@@ -745,6 +739,35 @@ impl Backend for DynasmBackend {
             .expect("CALL_ASSEMBLER_TARGETS poisoned")
             .entry(token_number)
             .or_insert(0);
+    }
+
+    fn compiled_fail_descr_layouts(
+        &self,
+        token: &JitCellToken,
+    ) -> Option<Vec<majit_backend::FailDescrLayout>> {
+        let compiled = Self::get_compiled(token);
+        Some(compiled.fail_descrs.iter().map(|d| d.layout()).collect())
+    }
+
+    fn compiled_trace_fail_descr_layouts(
+        &self,
+        token: &JitCellToken,
+        trace_id: u64,
+    ) -> Option<Vec<majit_backend::FailDescrLayout>> {
+        let compiled = Self::get_compiled(token);
+        if compiled.trace_id == trace_id {
+            return Some(compiled.fail_descrs.iter().map(|d| d.layout()).collect());
+        }
+        // Search bridge fail_descrs in asmmemmgr_blocks.
+        let blocks = token.asmmemmgr_blocks.lock();
+        for block in blocks.iter() {
+            if let Some(bridge) = block.downcast_ref::<CompiledCode>() {
+                if bridge.trace_id == trace_id {
+                    return Some(bridge.fail_descrs.iter().map(|d| d.layout()).collect());
+                }
+            }
+        }
+        None
     }
 
     fn setup_once(&mut self) {}
