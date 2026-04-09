@@ -5,10 +5,13 @@
 /// tick(hash, increment) adds increment; fires when >= 1.0.
 /// 5-way associative cache indexed by _get_index(hash), matched by
 /// _get_subhash(hash). MRU promotion via _swap.
+///
+/// The RPython `celltable` chain management lives in
+/// `warmstate.rs::WarmEnterState`; `JitCounter` only keeps the timing
+/// table used for thresholding.
 
 /// counter.py:82 DEFAULT_SIZE = 2048
 const DEFAULT_SIZE: usize = 2048;
-const DEFAULT_SIZE_MASK: usize = DEFAULT_SIZE - 1;
 
 /// counter.py:12-13 ENTRY: 5 (f32 time, u16 subhash) pairs per bucket.
 const ASSOCIATIVITY: usize = 5;
@@ -42,8 +45,6 @@ impl Default for Entry {
 pub struct JitCounter {
     /// counter.py:97 timetable
     timetable: Vec<Entry>,
-    /// counter.py:103 celltable — compiled code hints per bucket.
-    celltable: Vec<bool>,
     /// counter.py:100 _nexthash
     next_hash: u64,
     /// counter.py:264 decay_by_mult — f64 (Python float).
@@ -61,7 +62,6 @@ impl JitCounter {
     pub fn new(threshold: u32) -> Self {
         JitCounter {
             timetable: vec![Entry::default(); DEFAULT_SIZE],
-            celltable: vec![false; DEFAULT_SIZE],
             next_hash: 0,
             decay_by_mult: 0.96_f64, // counter.py default decay=40 → 1.0-40*0.001=0.96
             increment: Self::compute_threshold_static(threshold),
@@ -264,24 +264,6 @@ impl JitCounter {
                 *time = (*time as f64 * factor) as f32;
             }
         }
-    }
-
-    /// counter.py:239-240 lookup_chain(hash)
-    /// O(1) celltable check.
-    #[inline(always)]
-    pub fn has_compiled_hint(&self, hash: u64) -> bool {
-        self.celltable[Self::get_index(hash)]
-    }
-
-    /// counter.py:246-256 install_new_cell(hash, newcell)
-    pub fn set_compiled_hint(&mut self, hash: u64, compiled: bool) {
-        self.celltable[Self::get_index(hash)] = compiled;
-    }
-
-    /// counter.py:242-244 cleanup_chain(hash)
-    pub fn cleanup_chain(&mut self, hash: u64) {
-        self.reset(hash);
-        self.set_compiled_hint(hash, false);
     }
 
     /// Get current time for a hash (for testing/introspection).

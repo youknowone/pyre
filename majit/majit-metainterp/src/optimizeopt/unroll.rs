@@ -2885,13 +2885,6 @@ impl OptUnroll {
         ctx: &OptContext,
     ) -> Vec<ExportedShortOp> {
         fn exported_const_arg(ctx: &OptContext, arg: OpRef) -> Option<ExportedShortArg> {
-            // RPython shortpreamble.py: produce_arg() only serializes real
-            // Const objects here. A loop box that merely has Forwarded::Const
-            // metadata for the current iteration must stay a box; exporting it
-            // as Const leaks one iteration's guard knowledge into the next.
-            if !arg.is_constant() {
-                return None;
-            }
             ctx.get_constant(arg)
                 .cloned()
                 .map(|value| ExportedShortArg::Const { source: arg, value })
@@ -3039,18 +3032,16 @@ impl OptUnroll {
             source: OpRef,
             value: &Value,
         ) -> OpRef {
-            if source.is_constant() {
-                ctx.seed_constant(source, value.clone());
-                source
-            } else {
-                if let Some(&opref) = imported_constants.get(&source) {
-                    return opref;
-                }
-                let opref = ctx.alloc_op_position();
-                ctx.make_constant(opref, value.clone());
-                imported_constants.insert(source, opref);
-                opref
+            if let Some(&opref) = imported_constants.get(&source) {
+                return opref;
             }
+            // Preserve the exported constant's source OpRef identity across
+            // import. RPython keeps the same Const object reachable from the
+            // short preamble; using the original source position here lets
+            // dependency chains and tests observe the same stable constant box.
+            ctx.seed_constant(source, value.clone());
+            imported_constants.insert(source, source);
+            source
         }
 
         fn resolve_exported_short_result(

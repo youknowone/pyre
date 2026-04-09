@@ -1728,11 +1728,6 @@ fn bound_reached(
             let compiled_key = driver.last_compiled_key().unwrap_or(green_key);
             if !had_compiled && driver.has_compiled_loop(compiled_key) {
                 register_quasi_immutable_deps(compiled_key);
-                driver
-                    .meta_interp_mut()
-                    .warm_state_mut()
-                    .counter
-                    .set_compiled_hint(compiled_key, true);
             }
             // pyjitpl.py:3048-3061 raise_continue_running_normally:
             // after compilation, restart so execute_assembler runs.

@@ -17,6 +17,9 @@ use std::collections::HashMap;
 
 use majit_ir::{EffectInfo, OopSpecIndex, Op, OpCode, OpRef, Value};
 
+use crate::optimizeopt::info::{
+    PtrInfo, StrPtrInfo, VStringConcatInfo, VStringPlainInfo, VStringSliceInfo, VStringVariant,
+};
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
 
 /// Maximum constant string length we will virtualize.
@@ -25,32 +28,8 @@ const MAX_CONST_LEN: usize = 100;
 /// vstring.py mode_string / mode_unicode discriminators.
 pub const mode_string: u8 = 0;
 pub const mode_unicode: u8 = 1;
-
-/// Virtual string representation.
-///
-/// Tracks the contents of a string that has not yet been allocated.
-#[derive(Clone, Debug)]
-#[allow(dead_code)]
-enum VStringInfo {
-    /// String with individually tracked characters.
-    /// Each slot is `Some(opref)` once written, `None` while uninitialized.
-    Plain { chars: Vec<Option<OpRef>> },
-
-    /// Concatenation of two strings (lazy, allocation deferred).
-    Concat { left: OpRef, right: OpRef },
-
-    /// Slice of another string.
-    Slice {
-        source: OpRef,
-        start: OpRef,
-        length: OpRef,
-    },
-}
-
 /// The OptString optimization pass.
 pub struct OptString {
-    /// Map from OpRef (the NEWSTR result) to its virtual string info.
-    vstrings: HashMap<OpRef, VStringInfo>,
     /// Map from OpRef to the known length (as OpRef to a constant op or input).
     known_lengths: HashMap<OpRef, OpRef>,
     /// vstring.py: Track which OpRefs are unicode strings (vs byte strings).
@@ -61,17 +40,90 @@ pub struct OptString {
 impl OptString {
     pub fn new() -> Self {
         OptString {
-            vstrings: HashMap::new(),
             known_lengths: HashMap::new(),
             unicode_refs: std::collections::HashSet::new(),
         }
     }
 
-    /// Get the virtual string info for an OpRef, following forwarding.
-    #[allow(dead_code)]
-    fn get_vstring<'a>(&'a self, opref: OpRef, ctx: &OptContext) -> Option<&'a VStringInfo> {
+    fn get_plain_info<'a>(
+        &self,
+        opref: OpRef,
+        ctx: &'a OptContext,
+    ) -> Option<&'a VStringPlainInfo> {
         let resolved = ctx.get_box_replacement(opref);
-        self.vstrings.get(&resolved)
+        match ctx.get_ptr_info(resolved) {
+            Some(PtrInfo::Str(sinfo)) => match &sinfo.variant {
+                VStringVariant::Plain(info) => Some(info),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn get_plain_info_mut<'a>(
+        &self,
+        opref: OpRef,
+        ctx: &'a mut OptContext,
+    ) -> Option<&'a mut VStringPlainInfo> {
+        let resolved = ctx.get_box_replacement(opref);
+        match ctx.get_ptr_info_mut(resolved) {
+            Some(PtrInfo::Str(sinfo)) => match &mut sinfo.variant {
+                VStringVariant::Plain(info) => Some(info),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn is_virtual_plain(&self, opref: OpRef, ctx: &OptContext) -> bool {
+        self.get_plain_info(opref, ctx).is_some()
+    }
+
+    fn get_concat_info<'a>(
+        &self,
+        opref: OpRef,
+        ctx: &'a OptContext,
+    ) -> Option<&'a VStringConcatInfo> {
+        let resolved = ctx.get_box_replacement(opref);
+        match ctx.get_ptr_info(resolved) {
+            Some(PtrInfo::Str(sinfo)) => match &sinfo.variant {
+                VStringVariant::Concat(info) => Some(info),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn is_virtual_concat(&self, opref: OpRef, ctx: &OptContext) -> bool {
+        self.get_concat_info(opref, ctx).is_some()
+    }
+
+    fn get_slice_info<'a>(
+        &self,
+        opref: OpRef,
+        ctx: &'a OptContext,
+    ) -> Option<&'a VStringSliceInfo> {
+        let resolved = ctx.get_box_replacement(opref);
+        match ctx.get_ptr_info(resolved) {
+            Some(PtrInfo::Str(sinfo)) => match &sinfo.variant {
+                VStringVariant::Slice(info) => Some(info),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn is_virtual_slice(&self, opref: OpRef, ctx: &OptContext) -> bool {
+        self.get_slice_info(opref, ctx).is_some()
+    }
+
+    fn get_mode(&self, opref: OpRef, ctx: &OptContext) -> u8 {
+        let resolved = ctx.get_box_replacement(opref);
+        match ctx.get_ptr_info(resolved) {
+            Some(PtrInfo::Str(sinfo)) => sinfo.mode,
+            _ if self.unicode_refs.contains(&resolved) => 1,
+            _ => 0,
+        }
     }
 
     /// Force a virtual string: emit NEWSTR + STRSETITEM ops so it becomes real.
@@ -79,118 +131,141 @@ impl OptString {
     /// Returns the OpRef of the emitted NEWSTR.
     fn force_box(&mut self, opref: OpRef, ctx: &mut OptContext) -> OpRef {
         let resolved = ctx.get_box_replacement(opref);
-        let info = match self.vstrings.remove(&resolved) {
-            Some(info) => info,
-            None => return resolved, // already forced or not virtual
-        };
-
-        match info {
-            VStringInfo::Plain { chars } => {
-                let len = chars.len();
-                let is_unicode = self.unicode_refs.contains(&resolved);
-                let len_ref = self.emit_constant_int(len as i64, ctx);
-                // vstring.py: use NEWUNICODE/UNICODESETITEM for unicode strings.
-                let new_opcode = if is_unicode {
-                    OpCode::Newunicode
-                } else {
-                    OpCode::Newstr
-                };
-                let set_opcode = if is_unicode {
-                    OpCode::Unicodesetitem
-                } else {
-                    OpCode::Strsetitem
-                };
-                let newstr_op = Op::new(new_opcode, &[len_ref]);
-                let str_ref = ctx.emit(newstr_op);
-                for (i, ch) in chars.iter().enumerate() {
-                    if let Some(ch_ref) = ch {
-                        let idx_ref = self.emit_constant_int(i as i64, ctx);
-                        let ch_resolved = ctx.get_box_replacement(*ch_ref);
-                        let setitem_op = Op::new(set_opcode, &[str_ref, idx_ref, ch_resolved]);
-                        ctx.emit(setitem_op);
-                    }
+        if self.is_virtual_plain(resolved, ctx) {
+            let ptr_info = ctx
+                .take_ptr_info(resolved)
+                .expect("plain virtual string must have StrPtrInfo");
+            let (mode, chars) = match ptr_info {
+                PtrInfo::Str(StrPtrInfo {
+                    mode,
+                    variant: VStringVariant::Plain(info),
+                    ..
+                }) => (mode, info._chars),
+                other => panic!("expected VStringPlainInfo in PtrInfo::Str, got {other:?}"),
+            };
+            let len = chars.len();
+            let is_unicode = mode != 0;
+            let len_ref = self.emit_constant_int(len as i64, ctx);
+            let new_opcode = if is_unicode {
+                OpCode::Newunicode
+            } else {
+                OpCode::Newstr
+            };
+            let set_opcode = if is_unicode {
+                OpCode::Unicodesetitem
+            } else {
+                OpCode::Strsetitem
+            };
+            let newstr_op = Op::new(new_opcode, &[len_ref]);
+            let str_ref = ctx.emit(newstr_op);
+            for (i, ch) in chars.iter().enumerate() {
+                if let Some(ch_ref) = ch {
+                    let idx_ref = self.emit_constant_int(i as i64, ctx);
+                    let ch_resolved = ctx.get_box_replacement(*ch_ref);
+                    let setitem_op = Op::new(set_opcode, &[str_ref, idx_ref, ch_resolved]);
+                    ctx.emit(setitem_op);
                 }
-                // Forward the original opref to the newly emitted NEWSTR.
-                ctx.replace_op(resolved, str_ref);
-                str_ref
             }
-            VStringInfo::Concat { left, right } => {
-                // vstring.py: if one side has length 0, return the other.
-                let left_len_val = self.get_known_length(left, ctx);
-                let right_len_val = self.get_known_length(right, ctx);
-                if left_len_val == Some(0) {
-                    let right_forced = self.force_box(right, ctx);
-                    ctx.replace_op(resolved, right_forced);
-                    return right_forced;
-                }
-                if right_len_val == Some(0) {
-                    let left_forced = self.force_box(left, ctx);
-                    ctx.replace_op(resolved, left_forced);
-                    return left_forced;
-                }
-
-                let is_unicode = self.unicode_refs.contains(&resolved);
-                let left_forced = self.force_box(left, ctx);
-                let right_forced = self.force_box(right, ctx);
-                let left_len = self.getstrlen(left_forced, ctx);
-                let right_len = self.getstrlen(right_forced, ctx);
-                let total_op = Op::new(OpCode::IntAdd, &[left_len, right_len]);
-                let total_ref = ctx.emit(total_op);
-                // vstring.py: use correct opcodes for byte vs unicode strings
-                let new_opcode = if is_unicode {
-                    OpCode::Newunicode
-                } else {
-                    OpCode::Newstr
-                };
-                let copy_opcode = if is_unicode {
-                    OpCode::Copyunicodecontent
-                } else {
-                    OpCode::Copystrcontent
-                };
-                let newstr_op = Op::new(new_opcode, &[total_ref]);
-                let str_ref = ctx.emit(newstr_op);
-                let zero = self.emit_constant_int(0, ctx);
-                let copy_left = Op::new(copy_opcode, &[left_forced, str_ref, zero, zero, left_len]);
-                ctx.emit(copy_left);
-                let copy_right = Op::new(
-                    copy_opcode,
-                    &[right_forced, str_ref, zero, left_len, right_len],
-                );
-                ctx.emit(copy_right);
-                ctx.replace_op(resolved, str_ref);
-                str_ref
-            }
-            VStringInfo::Slice {
-                source,
-                start,
-                length,
-            } => {
-                let src_forced = self.force_box(source, ctx);
-                let start_resolved = ctx.get_box_replacement(start);
-                let length_resolved = ctx.get_box_replacement(length);
-                let is_unicode = self.unicode_refs.contains(&resolved);
-                let new_opcode = if is_unicode {
-                    OpCode::Newunicode
-                } else {
-                    OpCode::Newstr
-                };
-                let copy_opcode = if is_unicode {
-                    OpCode::Copyunicodecontent
-                } else {
-                    OpCode::Copystrcontent
-                };
-                let newstr_op = Op::new(new_opcode, &[length_resolved]);
-                let str_ref = ctx.emit(newstr_op);
-                let zero = self.emit_constant_int(0, ctx);
-                let copy_op = Op::new(
-                    copy_opcode,
-                    &[src_forced, str_ref, start_resolved, zero, length_resolved],
-                );
-                ctx.emit(copy_op);
-                ctx.replace_op(resolved, str_ref);
-                str_ref
-            }
+            ctx.replace_op(resolved, str_ref);
+            return str_ref;
         }
+
+        if self.is_virtual_concat(resolved, ctx) {
+            let ptr_info = ctx
+                .take_ptr_info(resolved)
+                .expect("concat virtual string must have StrPtrInfo");
+            let (mode, vleft, vright) = match ptr_info {
+                PtrInfo::Str(StrPtrInfo {
+                    mode,
+                    variant: VStringVariant::Concat(info),
+                    ..
+                }) => (mode, info.vleft, info.vright),
+                other => panic!("expected VStringConcatInfo in PtrInfo::Str, got {other:?}"),
+            };
+            // vstring.py: if one side has length 0, return the other.
+            let left_len_val = self.get_known_length(vleft, ctx);
+            let right_len_val = self.get_known_length(vright, ctx);
+            if left_len_val == Some(0) {
+                let right_forced = self.force_box(vright, ctx);
+                ctx.replace_op(resolved, right_forced);
+                return right_forced;
+            }
+            if right_len_val == Some(0) {
+                let left_forced = self.force_box(vleft, ctx);
+                ctx.replace_op(resolved, left_forced);
+                return left_forced;
+            }
+
+            let is_unicode = mode != 0;
+            let left_forced = self.force_box(vleft, ctx);
+            let right_forced = self.force_box(vright, ctx);
+            let left_len = self.getstrlen(left_forced, ctx);
+            let right_len = self.getstrlen(right_forced, ctx);
+            let total_op = Op::new(OpCode::IntAdd, &[left_len, right_len]);
+            let total_ref = ctx.emit(total_op);
+            let new_opcode = if is_unicode {
+                OpCode::Newunicode
+            } else {
+                OpCode::Newstr
+            };
+            let copy_opcode = if is_unicode {
+                OpCode::Copyunicodecontent
+            } else {
+                OpCode::Copystrcontent
+            };
+            let newstr_op = Op::new(new_opcode, &[total_ref]);
+            let str_ref = ctx.emit(newstr_op);
+            let zero = self.emit_constant_int(0, ctx);
+            let copy_left = Op::new(copy_opcode, &[left_forced, str_ref, zero, zero, left_len]);
+            ctx.emit(copy_left);
+            let copy_right = Op::new(
+                copy_opcode,
+                &[right_forced, str_ref, zero, left_len, right_len],
+            );
+            ctx.emit(copy_right);
+            ctx.replace_op(resolved, str_ref);
+            return str_ref;
+        }
+
+        if self.is_virtual_slice(resolved, ctx) {
+            let ptr_info = ctx
+                .take_ptr_info(resolved)
+                .expect("slice virtual string must have StrPtrInfo");
+            let (mode, s, start, lgtop) = match ptr_info {
+                PtrInfo::Str(StrPtrInfo {
+                    mode,
+                    variant: VStringVariant::Slice(info),
+                    ..
+                }) => (mode, info.s, info.start, info.lgtop),
+                other => panic!("expected VStringSliceInfo in PtrInfo::Str, got {other:?}"),
+            };
+            let src_forced = self.force_box(s, ctx);
+            let start_resolved = ctx.get_box_replacement(start);
+            let length_resolved = ctx.get_box_replacement(lgtop);
+            let is_unicode = mode != 0;
+            let new_opcode = if is_unicode {
+                OpCode::Newunicode
+            } else {
+                OpCode::Newstr
+            };
+            let copy_opcode = if is_unicode {
+                OpCode::Copyunicodecontent
+            } else {
+                OpCode::Copystrcontent
+            };
+            let newstr_op = Op::new(new_opcode, &[length_resolved]);
+            let str_ref = ctx.emit(newstr_op);
+            let zero = self.emit_constant_int(0, ctx);
+            let copy_op = Op::new(
+                copy_opcode,
+                &[src_forced, str_ref, start_resolved, zero, length_resolved],
+            );
+            ctx.emit(copy_op);
+            ctx.replace_op(resolved, str_ref);
+            return str_ref;
+        }
+
+        resolved
     }
 
     /// Emit a SameAsI op that produces a constant integer value.
@@ -211,8 +286,11 @@ impl OptString {
         if let Some(&len_ref) = self.known_lengths.get(&resolved) {
             return ctx.get_box_replacement(len_ref);
         }
-        // Emit a STRLEN op.
-        let strlen_op = Op::new(OpCode::Strlen, &[resolved]);
+        let strlen_op = if self.get_mode(resolved, ctx) == 0 {
+            Op::new(OpCode::Strlen, &[resolved])
+        } else {
+            Op::new(OpCode::Unicodelen, &[resolved])
+        };
         ctx.emit(strlen_op)
     }
 
@@ -222,13 +300,10 @@ impl OptString {
         if let Some(&len_ref) = self.known_lengths.get(&resolved) {
             return Some(ctx.get_box_replacement(len_ref));
         }
-        if let Some(info) = self.vstrings.get(&resolved) {
-            match info {
-                VStringInfo::Plain { chars } => {
-                    let len = chars.len() as i64;
-                    return Some(self.emit_constant_int(len, ctx));
-                }
-                _ => {}
+        if let Some(info) = ctx.getptrinfo(resolved) {
+            let mode = self.get_mode(resolved, ctx);
+            if let Some(len) = info.as_ref().get_known_str_length(ctx, mode) {
+                return Some(self.emit_constant_int(len, ctx));
             }
         }
         None
@@ -237,49 +312,22 @@ impl OptString {
     /// Try to get a character from a virtual string at a constant index.
     fn strgetitem(&self, opref: OpRef, index: i64, ctx: &OptContext) -> Option<OpRef> {
         let resolved = ctx.get_box_replacement(opref);
-        let info = self.vstrings.get(&resolved)?;
-        match info {
-            VStringInfo::Plain { chars } => {
-                let idx = index as usize;
-                if idx < chars.len() { chars[idx] } else { None }
-            }
-            VStringInfo::Concat { left, right } => {
-                // Need to know the left length to decide which side.
-                let left_resolved = ctx.get_box_replacement(*left);
-                let left_len = self.get_known_length(left_resolved, ctx)?;
-                if index < left_len {
-                    self.strgetitem(*left, index, ctx)
-                } else {
-                    self.strgetitem(*right, index - left_len, ctx)
-                }
-            }
-            VStringInfo::Slice { source, start, .. } => {
-                let start_val = ctx.get_constant_int(*start)?;
-                self.strgetitem(*source, index + start_val, ctx)
-            }
-        }
+        ctx.getptrinfo(resolved)
+            .and_then(|info| info.as_ref().strgetitem(index, ctx))
     }
 
     /// Get the known length of a virtual string as a constant, if available.
     fn get_known_length(&self, opref: OpRef, ctx: &OptContext) -> Option<i64> {
         let resolved = ctx.get_box_replacement(opref);
-        // Check known_lengths map.
-        if let Some(&len_ref) = self.known_lengths.get(&resolved) {
-            return ctx.get_constant_int(len_ref);
-        }
-        // Check vstring info.
-        let info = self.vstrings.get(&resolved)?;
-        match info {
-            VStringInfo::Plain { chars } => Some(chars.len() as i64),
-            VStringInfo::Concat { left, right } => {
-                let left_resolved = ctx.get_box_replacement(*left);
-                let right_resolved = ctx.get_box_replacement(*right);
-                let l = self.get_known_length(left_resolved, ctx)?;
-                let r = self.get_known_length(right_resolved, ctx)?;
-                Some(l + r)
+        if let Some(info) = ctx.getptrinfo(resolved) {
+            let mode = self.get_mode(resolved, ctx);
+            if let Some(length) = info.as_ref().get_known_str_length(ctx, mode) {
+                return Some(length);
             }
-            VStringInfo::Slice { length, .. } => ctx.get_constant_int(*length),
         }
+        self.known_lengths
+            .get(&resolved)
+            .and_then(|len_ref| ctx.get_constant_int(*len_ref))
     }
 
     /// Handle NEWSTR: virtualize if length is a small constant.
@@ -287,10 +335,23 @@ impl OptString {
         let len_ref = op.arg(0);
         if let Some(len) = ctx.get_constant_int(len_ref) {
             if len >= 0 && (len as usize) <= MAX_CONST_LEN {
-                let info = VStringInfo::Plain {
-                    chars: vec![None; len as usize],
+                let mode = if self.unicode_refs.contains(&op.pos) {
+                    1
+                } else {
+                    0
                 };
-                self.vstrings.insert(op.pos, info);
+                ctx.set_ptr_info(
+                    op.pos,
+                    PtrInfo::Str(StrPtrInfo {
+                        lenbound: None,
+                        mode,
+                        length: len as i32,
+                        variant: VStringVariant::Plain(VStringPlainInfo {
+                            _chars: vec![None; len as usize],
+                        }),
+                        last_guard_pos: -1,
+                    }),
+                );
                 self.known_lengths.insert(op.pos, len_ref);
                 return OptimizationResult::Remove;
             }
@@ -307,15 +368,14 @@ impl OptString {
         let str_ref = ctx.get_box_replacement(op.arg(0));
         let idx_ref = op.arg(1);
         let char_ref = op.arg(2);
+        let char_resolved = ctx.get_box_replacement(char_ref);
 
         if let Some(idx) = ctx.get_constant_int(idx_ref) {
-            if let Some(info) = self.vstrings.get_mut(&str_ref) {
-                if let VStringInfo::Plain { chars } = info {
-                    let i = idx as usize;
-                    if i < chars.len() {
-                        chars[i] = Some(ctx.get_box_replacement(char_ref));
-                        return OptimizationResult::Remove;
-                    }
+            if let Some(info) = self.get_plain_info_mut(str_ref, ctx) {
+                let i = idx as usize;
+                if i < info._chars.len() {
+                    info._chars[i] = Some(char_resolved);
+                    return OptimizationResult::Remove;
                 }
             }
         }
@@ -357,81 +417,80 @@ impl OptString {
         OptimizationResult::PassOn
     }
 
-    /// Handle COPYSTRCONTENT: if destination is virtual Plain, track characters.
-    fn optimize_copystrcontent(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn get_constant_int_bound(&self, opref: OpRef, ctx: &OptContext) -> Option<i64> {
+        ctx.get_int_bound(opref)
+            .filter(|bound| bound.is_constant())
+            .map(|bound| bound.get_constant())
+            .or_else(|| ctx.get_constant_int(opref))
+    }
+
+    /// vstring.py:556-589 _optimize_COPYSTRCONTENT
+    fn optimize_copystrcontent(
+        &mut self,
+        op: &Op,
+        mode: u8,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
         // copystrcontent(src, dst, src_start, dst_start, length)
         let src_ref = ctx.get_box_replacement(op.arg(0));
         let dst_ref = ctx.get_box_replacement(op.arg(1));
         let src_start_ref = op.arg(2);
         let dst_start_ref = op.arg(3);
         let length_ref = op.arg(4);
+        let src_info = ctx.getptrinfo(src_ref);
+        let src_is_virtual_or_constant = src_info
+            .as_ref()
+            .is_some_and(|info| info.as_ref().is_virtual() || info.as_ref().is_constant());
+        let dst_virtual = self.is_virtual_plain(dst_ref, ctx);
+        let src_start = self.get_constant_int_bound(src_start_ref, ctx);
+        let dst_start = self.get_constant_int_bound(dst_start_ref, ctx);
+        let length = self.get_constant_int_bound(length_ref, ctx);
 
-        // Only handle copying into a virtual Plain string with all-constant offsets.
-        if let (Some(src_start), Some(dst_start), Some(length)) = (
-            ctx.get_constant_int(src_start_ref),
-            ctx.get_constant_int(dst_start_ref),
-            ctx.get_constant_int(length_ref),
-        ) {
-            if self.vstrings.contains_key(&dst_ref) {
-                // Try to resolve each character from the source.
-                let mut all_resolved = true;
-                let mut resolved_chars = Vec::new();
-                for i in 0..length {
-                    if let Some(ch) = self.strgetitem(src_ref, src_start + i, ctx) {
-                        resolved_chars.push(Some(ch));
-                    } else {
-                        all_resolved = false;
-                        break;
-                    }
-                }
-
-                if all_resolved {
-                    if let Some(VStringInfo::Plain { chars }) = self.vstrings.get_mut(&dst_ref) {
-                        for (i, ch) in resolved_chars.into_iter().enumerate() {
-                            let dst_idx = (dst_start as usize) + i;
-                            if dst_idx < chars.len() {
-                                chars[dst_idx] = ch;
-                            }
-                        }
-                        return OptimizationResult::Remove;
-                    }
-                }
-            }
+        if length == Some(0) {
+            return OptimizationResult::Remove;
         }
 
-        // vstring.py: M-character inline heuristic.
-        // If the source is a non-virtual string, the dest is virtual Plain,
-        // and the length is small (≤8), emit individual STRGETITEM + track
-        // in the virtual's chars array instead of a bulk copy.
-        const MAX_INLINE_COPY: i64 = 8;
-        if let (Some(dst_start), Some(length)) = (
-            ctx.get_constant_int(dst_start_ref),
-            ctx.get_constant_int(length_ref),
-        ) {
-            if length > 0
-                && length <= MAX_INLINE_COPY
-                && !self.vstrings.contains_key(&src_ref)
-                && self.vstrings.contains_key(&dst_ref)
+        if let (Some(src_start), Some(dst_start), Some(length)) = (src_start, dst_start, length) {
+            if src_is_virtual_or_constant
+                && (length < 20 || (src_is_virtual_or_constant && dst_virtual))
             {
-                // Emit STRGETITEM for each character from non-virtual source,
-                // then track them in the virtual dst.
-                let mut char_refs = Vec::new();
-                let src_start_val = ctx.get_constant_int(src_start_ref).unwrap_or(0);
-                for i in 0..length {
-                    let idx_ref = self.emit_constant_int(src_start_val + i, ctx);
-                    let get_op = Op::new(OpCode::Strgetitem, &[src_ref, idx_ref]);
-                    let ch_ref = ctx.emit(get_op);
-                    char_refs.push(ch_ref);
+                let getitem_opcode = if mode == mode_unicode {
+                    OpCode::Unicodegetitem
+                } else {
+                    OpCode::Strgetitem
+                };
+                let setitem_opcode = if mode == mode_unicode {
+                    OpCode::Unicodesetitem
+                } else {
+                    OpCode::Strsetitem
+                };
+                let mut dst_chars = Vec::with_capacity(length as usize);
+                for index in 0..length {
+                    let char_ref =
+                        if let Some(ch_ref) = self.strgetitem(src_ref, src_start + index, ctx) {
+                            ctx.get_box_replacement(ch_ref)
+                        } else {
+                            let index_ref = self.emit_constant_int(src_start + index, ctx);
+                            ctx.emit(Op::new(getitem_opcode, &[src_ref, index_ref]))
+                        };
+                    if dst_virtual {
+                        dst_chars.push(Some(char_ref));
+                    } else {
+                        let dst_index_ref = self.emit_constant_int(dst_start + index, ctx);
+                        ctx.emit(Op::new(setitem_opcode, &[dst_ref, dst_index_ref, char_ref]));
+                    }
                 }
-                if let Some(VStringInfo::Plain { chars }) = self.vstrings.get_mut(&dst_ref) {
-                    for (i, ch) in char_refs.into_iter().enumerate() {
-                        let di = (dst_start as usize) + i;
-                        if di < chars.len() {
-                            chars[di] = Some(ch);
+                if dst_virtual {
+                    if let Some(info) = self.get_plain_info_mut(dst_ref, ctx) {
+                        for (index, ch_ref) in dst_chars.into_iter().enumerate() {
+                            let dst_index = (dst_start as usize) + index;
+                            if dst_index < info._chars.len() {
+                                info._chars[dst_index] = ch_ref;
+                            }
                         }
                     }
-                    return OptimizationResult::Remove;
                 }
+                return OptimizationResult::Remove;
             }
         }
 
@@ -444,7 +503,7 @@ impl OptString {
     /// Force a string if it is virtual.
     fn force_if_virtual(&mut self, opref: OpRef, ctx: &mut OptContext) {
         let resolved = ctx.get_box_replacement(opref);
-        if self.vstrings.contains_key(&resolved) {
+        if self.is_virtual(resolved, ctx) {
             self.force_box(resolved, ctx);
         }
     }
@@ -485,7 +544,8 @@ impl OptString {
     #[allow(dead_code)]
     fn is_virtual(&self, opref: OpRef, ctx: &OptContext) -> bool {
         let resolved = ctx.get_box_replacement(opref);
-        self.vstrings.contains_key(&resolved)
+        ctx.get_ptr_info(resolved)
+            .is_some_and(|info| info.is_virtual())
     }
 
     /// vstring.py:371-381 _int_add — constant-fold if both args are constant,
@@ -546,7 +606,7 @@ impl OptString {
             .map(|a| ctx.get_box_replacement(*a))
             .collect();
         for arg in args {
-            if self.vstrings.contains_key(&arg) {
+            if self.is_virtual(arg, ctx) {
                 self.force_box(arg, ctx);
             }
         }
@@ -579,10 +639,25 @@ impl OptString {
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         if op.num_args() >= 3 {
-            let left = ctx.get_box_replacement(op.arg(1));
-            let right = ctx.get_box_replacement(op.arg(2));
-            self.vstrings
-                .insert(op.pos, VStringInfo::Concat { left, right });
+            let vleft = ctx.get_box_replacement(op.arg(1));
+            let vright = ctx.get_box_replacement(op.arg(2));
+            let mode = self.get_mode(vleft, ctx).max(self.get_mode(vright, ctx));
+            ctx.make_nonnull_str(vleft, mode);
+            ctx.make_nonnull_str(vright, mode);
+            ctx.set_ptr_info(
+                op.pos,
+                PtrInfo::Str(StrPtrInfo {
+                    lenbound: None,
+                    mode,
+                    length: -1,
+                    variant: VStringVariant::Concat(VStringConcatInfo {
+                        vleft,
+                        vright,
+                        _is_virtual: true,
+                    }),
+                    last_guard_pos: -1,
+                }),
+            );
             return OptimizationResult::Remove;
         }
         self.force_args_if_virtual(op, ctx);
@@ -592,17 +667,27 @@ impl OptString {
     /// vstring.py:662-690 opt_call_stroruni_STR_SLICE
     fn opt_call_stroruni_str_slice(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         if op.num_args() >= 4 {
-            let source = ctx.get_box_replacement(op.arg(1));
-            let start = ctx.get_box_replacement(op.arg(2));
+            let mut s = ctx.get_box_replacement(op.arg(1));
+            let mode = self.get_mode(s, ctx);
+            ctx.make_nonnull_str(s, mode);
+            let mut start = ctx.get_box_replacement(op.arg(2));
             let stop = ctx.get_box_replacement(op.arg(3));
-            let length = self.int_sub(stop, start, ctx);
-            self.vstrings.insert(
+            let lgtop = self.int_sub(stop, start, ctx);
+            if let Some(info) = self.get_slice_info(s, ctx) {
+                let source = info.s;
+                let source_start = info.start;
+                s = source;
+                start = self.int_add(source_start, start, ctx);
+            }
+            ctx.set_ptr_info(
                 op.pos,
-                VStringInfo::Slice {
-                    source,
-                    start,
-                    length,
-                },
+                PtrInfo::Str(StrPtrInfo {
+                    lenbound: None,
+                    mode,
+                    length: -1,
+                    variant: VStringVariant::Slice(VStringSliceInfo { s, start, lgtop }),
+                    last_guard_pos: -1,
+                }),
             );
             return OptimizationResult::Remove;
         }
@@ -698,12 +783,10 @@ impl OptString {
             }
             // vstring.py:769-774: arg1 is a virtual slice, arg2 is length 1
             let resolved1 = ctx.get_box_replacement(arg1);
-            if let Some(VStringInfo::Slice {
-                source,
-                start,
-                length,
-            }) = self.vstrings.get(&resolved1).cloned()
-            {
+            if let Some(info) = self.get_slice_info(resolved1, ctx) {
+                let source = info.s;
+                let start = info.start;
+                let length = info.lgtop;
                 if let Some(vchar) = self.strgetitem(arg2, 0, ctx) {
                     return self.generate_modified_call(
                         OopSpecIndex::StreqSliceChar,
@@ -761,12 +844,10 @@ impl OptString {
         }
         // vstring.py:807-813: if arg1 is a virtual slice
         let resolved1 = ctx.get_box_replacement(arg1);
-        if let Some(VStringInfo::Slice {
-            source,
-            start,
-            length,
-        }) = self.vstrings.get(&resolved1).cloned()
-        {
+        if let Some(info) = self.get_slice_info(resolved1, ctx) {
+            let source = info.s;
+            let start = info.start;
+            let length = info.lgtop;
             let oopspec = if self.is_known_nonnull(arg2, ctx) {
                 OopSpecIndex::StreqSliceNonnull
             } else {
@@ -791,7 +872,7 @@ impl OptString {
     fn is_known_nonnull(&self, opref: OpRef, ctx: &OptContext) -> bool {
         // Virtual strings are always non-null
         let resolved = ctx.get_box_replacement(opref);
-        if self.vstrings.contains_key(&resolved) {
+        if self.is_virtual(resolved, ctx) {
             return true;
         }
         // PtrInfo with is_nonnull
@@ -866,12 +947,10 @@ impl OptString {
     ///     del self._chars[length:]
     /// ```
     ///
-    /// majit's `VStringInfo::Plain { chars }` carries length implicitly via
-    /// `chars.len()`, so the explicit `self.length = length` step is folded
-    /// into the truncate.
-    fn vstring_plain_shrink(info: &mut VStringInfo, length: usize) {
-        if let VStringInfo::Plain { chars } = info {
-            chars.truncate(length);
+    fn vstring_plain_shrink(sinfo: &mut StrPtrInfo, length: usize) {
+        sinfo.length = length as i32;
+        if let VStringVariant::Plain(info) = &mut sinfo.variant {
+            info._chars.truncate(length);
         }
     }
 
@@ -898,13 +977,16 @@ impl OptString {
             let length = ctx.get_constant_int(op.arg(2));
             // vstring.py:844-845: i2.is_constant() && i1.is_virtual() &&
             // isinstance(i1, VStringPlainInfo)
-            if let (Some(length), Some(info)) = (length, self.vstrings.get_mut(&arg1)) {
-                if matches!(info, VStringInfo::Plain { .. }) {
-                    // vstring.py:847: i1.shrink(length)
-                    Self::vstring_plain_shrink(info, length as usize);
-                    // vstring.py:849: self.make_equal_to(op, op.getarg(1))
-                    ctx.replace_op(op.pos, arg1);
-                    return OptimizationResult::Remove;
+            if let Some(length) = length {
+                if let Some(PtrInfo::Str(sinfo)) = ctx.get_ptr_info_mut(arg1) {
+                    if matches!(sinfo.variant, VStringVariant::Plain(_)) {
+                        // vstring.py:847: i1.shrink(length)
+                        Self::vstring_plain_shrink(sinfo, length as usize);
+                        self.known_lengths.remove(&arg1);
+                        // vstring.py:849: self.make_equal_to(op, op.getarg(1))
+                        ctx.replace_op(op.pos, arg1);
+                        return OptimizationResult::Remove;
+                    }
                 }
             }
         }
@@ -926,7 +1008,7 @@ impl Optimization for OptString {
             OpCode::Strsetitem => self.optimize_strsetitem(op, ctx),
             OpCode::Strgetitem => self.optimize_strgetitem(op, ctx),
             OpCode::Strlen => self.optimize_strlen(op, ctx),
-            OpCode::Copystrcontent => self.optimize_copystrcontent(op, ctx),
+            OpCode::Copystrcontent => self.optimize_copystrcontent(op, mode_string, ctx),
 
             // vstring.py: Unicode operations — same logic as string ops
             // but with unicode-specific opcodes.
@@ -938,7 +1020,7 @@ impl Optimization for OptString {
             OpCode::Unicodesetitem => self.optimize_strsetitem(op, ctx),
             OpCode::Unicodegetitem => self.optimize_strgetitem(op, ctx),
             OpCode::Unicodelen => self.optimize_strlen(op, ctx),
-            OpCode::Copyunicodecontent => self.optimize_copystrcontent(op, ctx),
+            OpCode::Copyunicodecontent => self.optimize_copystrcontent(op, mode_unicode, ctx),
 
             // vstring.py: STRHASH/UNICODEHASH — force virtual string and emit.
             OpCode::Strhash | OpCode::Unicodehash => {
@@ -987,7 +1069,6 @@ impl Optimization for OptString {
     }
 
     fn setup(&mut self) {
-        self.vstrings.clear();
         self.known_lengths.clear();
         self.unicode_refs.clear();
     }
@@ -1000,6 +1081,9 @@ impl Optimization for OptString {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::optimizeopt::info::{
+        PtrInfo, StrPtrInfo, VStringConcatInfo, VStringPlainInfo, VStringSliceInfo, VStringVariant,
+    };
     use crate::optimizeopt::optimizer::Optimizer;
 
     /// Assign sequential positions to ops and pre-seed constants in OptContext.
@@ -1064,6 +1148,50 @@ mod tests {
 
         pass.flush(&mut ctx);
         ctx.new_operations
+    }
+
+    fn set_vstring_plain(ctx: &mut OptContext, opref: OpRef, chars: Vec<Option<OpRef>>) {
+        let length = chars.len() as i32;
+        ctx.set_ptr_info(
+            opref,
+            PtrInfo::Str(StrPtrInfo {
+                lenbound: None,
+                mode: 0,
+                length,
+                variant: VStringVariant::Plain(VStringPlainInfo { _chars: chars }),
+                last_guard_pos: -1,
+            }),
+        );
+    }
+
+    fn set_vstring_concat(ctx: &mut OptContext, opref: OpRef, vleft: OpRef, vright: OpRef) {
+        ctx.set_ptr_info(
+            opref,
+            PtrInfo::Str(StrPtrInfo {
+                lenbound: None,
+                mode: 0,
+                length: -1,
+                variant: VStringVariant::Concat(VStringConcatInfo {
+                    vleft,
+                    vright,
+                    _is_virtual: true,
+                }),
+                last_guard_pos: -1,
+            }),
+        );
+    }
+
+    fn set_vstring_slice(ctx: &mut OptContext, opref: OpRef, s: OpRef, start: OpRef, lgtop: OpRef) {
+        ctx.set_ptr_info(
+            opref,
+            PtrInfo::Str(StrPtrInfo {
+                lenbound: None,
+                mode: 0,
+                length: -1,
+                variant: VStringVariant::Slice(VStringSliceInfo { s, start, lgtop }),
+                last_guard_pos: -1,
+            }),
+        );
     }
 
     // ── Test 1: STRGETITEM on virtual string returns tracked character ──
@@ -1179,10 +1307,8 @@ mod tests {
 
     #[test]
     fn test_concat_length() {
-        // Build two virtual strings, create a concat, then query length.
-        //
-        // We simulate concat by directly inserting into the pass's vstrings map.
-        // This tests the get_known_length logic.
+        // Build two virtual strings, create a concat in PtrInfo::Str, then
+        // query length.
 
         let mut pass = OptString::new();
         let mut ctx = OptContext::new(10);
@@ -1194,30 +1320,14 @@ mod tests {
         // Virtual plain strings
         let left_ref = OpRef(10);
         let right_ref = OpRef(11);
-        pass.vstrings.insert(
-            left_ref,
-            VStringInfo::Plain {
-                chars: vec![None; 3],
-            },
-        );
+        set_vstring_plain(&mut ctx, left_ref, vec![None; 3]);
         pass.known_lengths.insert(left_ref, OpRef(100));
-        pass.vstrings.insert(
-            right_ref,
-            VStringInfo::Plain {
-                chars: vec![None; 4],
-            },
-        );
+        set_vstring_plain(&mut ctx, right_ref, vec![None; 4]);
         pass.known_lengths.insert(right_ref, OpRef(101));
 
         // Virtual concat
         let concat_ref = OpRef(12);
-        pass.vstrings.insert(
-            concat_ref,
-            VStringInfo::Concat {
-                left: left_ref,
-                right: right_ref,
-            },
-        );
+        set_vstring_concat(&mut ctx, concat_ref, left_ref, right_ref);
 
         // Check total length = 3 + 4 = 7
         let total_len = pass.get_known_length(concat_ref, &ctx);
@@ -1234,25 +1344,17 @@ mod tests {
 
         // source = "abc" (chars at indices 0, 1, 2)
         let src_ref = OpRef(10);
-        pass.vstrings.insert(
+        set_vstring_plain(
+            &mut ctx,
             src_ref,
-            VStringInfo::Plain {
-                chars: vec![Some(OpRef(200)), Some(OpRef(201)), Some(OpRef(202))],
-            },
+            vec![Some(OpRef(200)), Some(OpRef(201)), Some(OpRef(202))],
         );
 
         // slice = source[1:3] (start=1, length=2)
         ctx.make_constant(OpRef(300), Value::Int(1)); // start
         ctx.make_constant(OpRef(301), Value::Int(2)); // length
         let slice_ref = OpRef(11);
-        pass.vstrings.insert(
-            slice_ref,
-            VStringInfo::Slice {
-                source: src_ref,
-                start: OpRef(300),
-                length: OpRef(301),
-            },
-        );
+        set_vstring_slice(&mut ctx, slice_ref, src_ref, OpRef(300), OpRef(301));
 
         // Get char at index 0 of the slice -> should be source[1] = OpRef(201)
         let ch = pass.strgetitem(slice_ref, 0, &ctx);
@@ -1271,28 +1373,34 @@ mod tests {
         let mut ctx = OptContext::new(10);
 
         let src_ref = OpRef(10);
-        pass.vstrings.insert(
-            src_ref,
-            VStringInfo::Plain {
-                chars: vec![None; 5],
-            },
-        );
+        set_vstring_plain(&mut ctx, src_ref, vec![None; 5]);
 
         ctx.make_constant(OpRef(300), Value::Int(1)); // start
         ctx.make_constant(OpRef(301), Value::Int(3)); // length
 
         let slice_ref = OpRef(11);
-        pass.vstrings.insert(
-            slice_ref,
-            VStringInfo::Slice {
-                source: src_ref,
-                start: OpRef(300),
-                length: OpRef(301),
-            },
-        );
+        set_vstring_slice(&mut ctx, slice_ref, src_ref, OpRef(300), OpRef(301));
 
         let len = pass.get_known_length(slice_ref, &ctx);
         assert_eq!(len, Some(3));
+    }
+
+    #[test]
+    fn test_getstrlen_uses_unicodelen_for_unicode() {
+        let mut pass = OptString::new();
+        let mut ctx = OptContext::new(10);
+        let unicode_ref = OpRef(7);
+        pass.unicode_refs.insert(unicode_ref);
+
+        let len_ref = pass.getstrlen(unicode_ref, &mut ctx);
+        let last_op = ctx
+            .new_operations
+            .last()
+            .expect("getstrlen must emit a len op");
+
+        assert_eq!(len_ref, last_op.pos);
+        assert_eq!(last_op.opcode, OpCode::Unicodelen);
+        assert_eq!(last_op.args.as_slice(), &[unicode_ref]);
     }
 
     // ── Test 7: Non-constant length NEWSTR passes through ──
@@ -1395,6 +1503,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_copyunicodecontent_inline_uses_unicodegetitem() {
+        let mut ops = vec![
+            Op::new(OpCode::Newunicode, &[OpRef(100)]),
+            Op::new(OpCode::Newunicode, &[OpRef(100)]),
+            Op::new(
+                OpCode::Copyunicodecontent,
+                &[OpRef(0), OpRef(1), OpRef(101), OpRef(101), OpRef(100)],
+            ),
+        ];
+        assign_positions(&mut ops);
+
+        let constants = vec![(OpRef(100), 2), (OpRef(101), 0)];
+
+        let result = run_with_constants(&ops, &constants);
+
+        let unicode_getitem_count = result
+            .iter()
+            .filter(|op| op.opcode == OpCode::Unicodegetitem)
+            .count();
+        let str_getitem_count = result
+            .iter()
+            .filter(|op| op.opcode == OpCode::Strgetitem)
+            .count();
+
+        assert_eq!(unicode_getitem_count, 2);
+        assert_eq!(str_getitem_count, 0);
+    }
+
     // ── Test 12: Multiple STRLEN calls on same virtual ──
 
     #[test]
@@ -1453,37 +1590,20 @@ mod tests {
         let a = OpRef(10);
         let b = OpRef(11);
         let c = OpRef(12);
-        pass.vstrings.insert(
-            a,
-            VStringInfo::Plain {
-                chars: vec![None; 2],
-            },
-        );
+        set_vstring_plain(&mut ctx, a, vec![None; 2]);
         pass.known_lengths.insert(a, OpRef(100));
-        pass.vstrings.insert(
-            b,
-            VStringInfo::Plain {
-                chars: vec![None; 3],
-            },
-        );
+        set_vstring_plain(&mut ctx, b, vec![None; 3]);
         pass.known_lengths.insert(b, OpRef(101));
-        pass.vstrings.insert(
-            c,
-            VStringInfo::Plain {
-                chars: vec![None; 4],
-            },
-        );
+        set_vstring_plain(&mut ctx, c, vec![None; 4]);
         pass.known_lengths.insert(c, OpRef(102));
 
         // ab = concat(a, b)
         let ab = OpRef(20);
-        pass.vstrings
-            .insert(ab, VStringInfo::Concat { left: a, right: b });
+        set_vstring_concat(&mut ctx, ab, a, b);
 
         // abc = concat(ab, c)
         let abc = OpRef(21);
-        pass.vstrings
-            .insert(abc, VStringInfo::Concat { left: ab, right: c });
+        set_vstring_concat(&mut ctx, abc, ab, c);
 
         assert_eq!(pass.get_known_length(abc, &ctx), Some(9));
     }
@@ -1500,24 +1620,13 @@ mod tests {
 
         let left = OpRef(10);
         let right = OpRef(11);
-        pass.vstrings.insert(
-            left,
-            VStringInfo::Plain {
-                chars: vec![Some(OpRef(200)), Some(OpRef(201))],
-            },
-        );
+        set_vstring_plain(&mut ctx, left, vec![Some(OpRef(200)), Some(OpRef(201))]);
         pass.known_lengths.insert(left, OpRef(100));
-        pass.vstrings.insert(
-            right,
-            VStringInfo::Plain {
-                chars: vec![Some(OpRef(202)), Some(OpRef(203))],
-            },
-        );
+        set_vstring_plain(&mut ctx, right, vec![Some(OpRef(202)), Some(OpRef(203))]);
         pass.known_lengths.insert(right, OpRef(101));
 
         let concat = OpRef(12);
-        pass.vstrings
-            .insert(concat, VStringInfo::Concat { left, right });
+        set_vstring_concat(&mut ctx, concat, left, right);
 
         // Index 0 -> left[0] = 200
         assert_eq!(pass.strgetitem(concat, 0, &ctx), Some(OpRef(200)));

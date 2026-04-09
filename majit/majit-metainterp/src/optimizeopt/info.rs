@@ -225,6 +225,11 @@ pub struct StrPtrInfo {
     pub mode: u8,
     /// vstring.py: self.length — known exact length (-1 if unknown).
     pub length: i32,
+    /// vstring.py: subclass-specific state
+    /// (`VStringPlainInfo` / `VStringSliceInfo` / `VStringConcatInfo`).
+    /// Phase 1a keeps existing callers on the non-virtual `Ptr` path
+    /// while later sub-phases move `vstring.rs` state here.
+    pub variant: VStringVariant,
     /// info.py:91-92: last_guard_pos
     pub last_guard_pos: i32,
 }
@@ -351,6 +356,158 @@ impl<'a> EnsuredPtrInfo<'a> {
     /// the call site.
     pub fn is_constant(&self) -> bool {
         matches!(self, EnsuredPtrInfo::Constant { .. })
+    }
+}
+
+/// vstring.py:142-334 subclass state carried by `StrPtrInfo`.
+#[derive(Clone, Debug)]
+pub enum VStringVariant {
+    /// Non-virtual base `StrPtrInfo`.
+    Ptr,
+    /// vstring.py:142 `VStringPlainInfo`.
+    Plain(VStringPlainInfo),
+    /// vstring.py:214 `VStringSliceInfo`.
+    Slice(VStringSliceInfo),
+    /// vstring.py:266 `VStringConcatInfo`.
+    Concat(VStringConcatInfo),
+}
+
+/// vstring.py:142-212 `VStringPlainInfo`
+#[derive(Clone, Debug)]
+pub struct VStringPlainInfo {
+    pub _chars: Vec<Option<OpRef>>,
+}
+
+/// vstring.py:214-264 `VStringSliceInfo`
+#[derive(Clone, Debug)]
+pub struct VStringSliceInfo {
+    pub s: OpRef,
+    pub start: OpRef,
+    pub lgtop: OpRef,
+}
+
+/// vstring.py:266-334 `VStringConcatInfo`
+#[derive(Clone, Debug)]
+pub struct VStringConcatInfo {
+    pub vleft: OpRef,
+    pub vright: OpRef,
+    pub _is_virtual: bool,
+}
+
+impl StrPtrInfo {
+    /// vstring.py:168 / 227 / 278 `is_virtual()` on the string ptrinfo classes.
+    pub fn is_virtual(&self) -> bool {
+        match &self.variant {
+            VStringVariant::Ptr => false,
+            VStringVariant::Plain(_) | VStringVariant::Slice(_) => true,
+            VStringVariant::Concat(info) => info._is_virtual,
+        }
+    }
+
+    /// vstring.py:103 / 168 / 249 `getstrlen()` on the string ptrinfo classes.
+    ///
+    /// RPython returns a box here; majit lifts the structurally-known constant
+    /// length into `Option<i64>` and lets `OptString` decide whether it should
+    /// materialize a constant OpRef or emit `STRLEN` / `UNICODELEN`.
+    pub fn getstrlen(&self, ctx: &crate::optimizeopt::OptContext, mode: u8) -> Option<i64> {
+        match &self.variant {
+            VStringVariant::Ptr => {
+                if self.length >= 0 {
+                    Some(self.length as i64)
+                } else {
+                    self.lenbound
+                        .as_ref()
+                        .filter(|bound| bound.is_constant())
+                        .map(IntBound::get_constant)
+                }
+            }
+            VStringVariant::Plain(info) => Some(info._chars.len() as i64),
+            VStringVariant::Slice(info) => {
+                let lgtop = ctx.get_box_replacement(info.lgtop);
+                ctx.get_constant_int(lgtop)
+            }
+            VStringVariant::Concat(info) => {
+                let left = ctx.getptrinfo(info.vleft)?;
+                let right = ctx.getptrinfo(info.vright)?;
+                let len1 = left.as_ref().get_known_str_length(ctx, mode)?;
+                let len2 = right.as_ref().get_known_str_length(ctx, mode)?;
+                Some(len1 + len2)
+            }
+        }
+    }
+
+    /// vstring.py:161 / 172 / 298 `get_constant_string_spec()` on the string
+    /// ptrinfo classes.
+    ///
+    /// The upstream method returns either a low-level string or unicode object.
+    /// majit keeps the same recursive shape but represents the constant string
+    /// as character/codepoint integers until a runtime string allocator is
+    /// wired in.
+    pub fn get_constant_string_spec(
+        &self,
+        ctx: &crate::optimizeopt::OptContext,
+        mode: u8,
+    ) -> Option<Vec<i64>> {
+        let _ = mode;
+        match &self.variant {
+            VStringVariant::Ptr => None,
+            VStringVariant::Plain(info) => {
+                let mut chars = Vec::with_capacity(info._chars.len());
+                for ch in &info._chars {
+                    let ch = ctx.get_box_replacement((*ch)?);
+                    chars.push(ctx.get_constant_int(ch)?);
+                }
+                Some(chars)
+            }
+            VStringVariant::Slice(info) => {
+                let source = ctx.getptrinfo(info.s)?;
+                let source_chars = source.as_ref().get_constant_string_spec(ctx, mode)?;
+                let start =
+                    usize::try_from(ctx.get_constant_int(ctx.get_box_replacement(info.start))?)
+                        .ok()?;
+                let length =
+                    usize::try_from(ctx.get_constant_int(ctx.get_box_replacement(info.lgtop))?)
+                        .ok()?;
+                let stop = start.checked_add(length)?;
+                if stop > source_chars.len() {
+                    return None;
+                }
+                Some(source_chars[start..stop].to_vec())
+            }
+            VStringVariant::Concat(info) => {
+                let left = ctx.getptrinfo(info.vleft)?;
+                let right = ctx.getptrinfo(info.vright)?;
+                let mut chars = left.as_ref().get_constant_string_spec(ctx, mode)?;
+                chars.extend(right.as_ref().get_constant_string_spec(ctx, mode)?);
+                Some(chars)
+            }
+        }
+    }
+
+    /// vstring.py:158 / 172 / 230 `strgetitem()` shape, collapsed into a single
+    /// variant-dispatch method on the Rust side.
+    pub fn strgetitem(&self, index: i64, ctx: &crate::optimizeopt::OptContext) -> Option<OpRef> {
+        let index = usize::try_from(index).ok()?;
+        match &self.variant {
+            VStringVariant::Ptr => None,
+            VStringVariant::Plain(info) => info._chars.get(index).copied().flatten(),
+            VStringVariant::Slice(info) => {
+                let start = ctx.get_constant_int(ctx.get_box_replacement(info.start))?;
+                let source = ctx.getptrinfo(info.s)?;
+                source.as_ref().strgetitem(index as i64 + start, ctx)
+            }
+            VStringVariant::Concat(info) => {
+                let left = ctx.getptrinfo(info.vleft)?;
+                let left_len =
+                    usize::try_from(left.as_ref().get_known_str_length(ctx, self.mode)?).ok()?;
+                if index < left_len {
+                    left.as_ref().strgetitem(index as i64, ctx)
+                } else {
+                    let right = ctx.getptrinfo(info.vright)?;
+                    right.as_ref().strgetitem((index - left_len) as i64, ctx)
+                }
+            }
+        }
     }
 }
 
@@ -564,7 +721,7 @@ impl PtrInfo {
                 | PtrInfo::VirtualArrayStruct(_)
                 | PtrInfo::VirtualRawBuffer(_)
                 | PtrInfo::VirtualRawSlice(_)
-        )
+        ) || matches!(self, PtrInfo::Str(sinfo) if sinfo.is_virtual())
     }
 
     /// Whether this is a constant pointer.
@@ -777,6 +934,42 @@ impl PtrInfo {
     {
         match self {
             PtrInfo::Constant(gcref) if !gcref.is_null() => resolver(*gcref, mode),
+            _ => None,
+        }
+    }
+
+    /// info.py:74-75 / vstring.py:103-105 / 249-258 — common string-length
+    /// query across `ConstPtrInfo` and `StrPtrInfo`.
+    pub fn get_known_str_length(
+        &self,
+        ctx: &crate::optimizeopt::OptContext,
+        mode: u8,
+    ) -> Option<i64> {
+        match self {
+            PtrInfo::Str(info) => info.getstrlen(ctx, mode),
+            PtrInfo::Constant(_) => self.getstrlen(mode, |_, _| None),
+            _ => None,
+        }
+    }
+
+    /// info.py:87 / 793 and vstring.py:178 / 236 / 298 — recursive constant
+    /// string extraction.
+    pub fn get_constant_string_spec(
+        &self,
+        ctx: &crate::optimizeopt::OptContext,
+        mode: u8,
+    ) -> Option<Vec<i64>> {
+        match self {
+            PtrInfo::Str(info) => info.get_constant_string_spec(ctx, mode),
+            PtrInfo::Constant(_) => None,
+            _ => None,
+        }
+    }
+
+    /// vstring.py:172 / 230 `strgetitem()` on string ptrinfo.
+    pub fn strgetitem(&self, index: i64, ctx: &crate::optimizeopt::OptContext) -> Option<OpRef> {
+        match self {
+            PtrInfo::Str(info) => info.strgetitem(index, ctx),
             _ => None,
         }
     }
@@ -2075,6 +2268,7 @@ pub struct VirtualizableFieldState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::optimizeopt::OptContext;
     use majit_ir::{Descr, OpCode, Value};
     use std::sync::Arc;
 
@@ -2353,6 +2547,150 @@ mod tests {
         assert_eq!(info.getlenbound(Some(0)), None);
         assert_eq!(info.getlenbound(Some(1)), None);
         assert_eq!(info.getlenbound(None), None);
+    }
+
+    #[test]
+    fn test_str_ptr_info_virtual_variants() {
+        let plain = PtrInfo::Str(StrPtrInfo {
+            lenbound: None,
+            mode: 0,
+            length: 2,
+            variant: VStringVariant::Plain(VStringPlainInfo {
+                _chars: vec![None, None],
+            }),
+            last_guard_pos: -1,
+        });
+        assert!(plain.is_virtual());
+
+        let slice = PtrInfo::Str(StrPtrInfo {
+            lenbound: None,
+            mode: 0,
+            length: -1,
+            variant: VStringVariant::Slice(VStringSliceInfo {
+                s: OpRef(1),
+                start: OpRef(2),
+                lgtop: OpRef(3),
+            }),
+            last_guard_pos: -1,
+        });
+        assert!(slice.is_virtual());
+
+        let concat = PtrInfo::Str(StrPtrInfo {
+            lenbound: None,
+            mode: 0,
+            length: -1,
+            variant: VStringVariant::Concat(VStringConcatInfo {
+                vleft: OpRef(4),
+                vright: OpRef(5),
+                _is_virtual: true,
+            }),
+            last_guard_pos: -1,
+        });
+        assert!(concat.is_virtual());
+
+        let ptr = PtrInfo::Str(StrPtrInfo {
+            lenbound: None,
+            mode: 0,
+            length: -1,
+            variant: VStringVariant::Ptr,
+            last_guard_pos: -1,
+        });
+        assert!(!ptr.is_virtual());
+    }
+
+    #[test]
+    fn test_str_ptr_info_constant_string_spec_and_strgetitem() {
+        let mut ctx = OptContext::new(16);
+        ctx.make_constant(OpRef(10), Value::Int(97));
+        ctx.make_constant(OpRef(11), Value::Int(98));
+        ctx.make_constant(OpRef(12), Value::Int(99));
+
+        let info = PtrInfo::Str(StrPtrInfo {
+            lenbound: None,
+            mode: 0,
+            length: 3,
+            variant: VStringVariant::Plain(VStringPlainInfo {
+                _chars: vec![Some(OpRef(10)), Some(OpRef(11)), Some(OpRef(12))],
+            }),
+            last_guard_pos: -1,
+        });
+
+        assert_eq!(
+            info.get_constant_string_spec(&ctx, 0),
+            Some(vec![97, 98, 99])
+        );
+        assert_eq!(info.get_known_str_length(&ctx, 0), Some(3));
+        assert_eq!(info.strgetitem(1, &ctx), Some(OpRef(11)));
+    }
+
+    #[test]
+    fn test_str_ptr_info_slice_and_concat_dispatch() {
+        let mut ctx = OptContext::new(32);
+        ctx.make_constant(OpRef(10), Value::Int(97));
+        ctx.make_constant(OpRef(11), Value::Int(98));
+        ctx.make_constant(OpRef(12), Value::Int(99));
+        ctx.make_constant(OpRef(20), Value::Int(1));
+        ctx.make_constant(OpRef(21), Value::Int(2));
+
+        let source = OpRef(1);
+        ctx.set_ptr_info(
+            source,
+            PtrInfo::Str(StrPtrInfo {
+                lenbound: None,
+                mode: 0,
+                length: 3,
+                variant: VStringVariant::Plain(VStringPlainInfo {
+                    _chars: vec![Some(OpRef(10)), Some(OpRef(11)), Some(OpRef(12))],
+                }),
+                last_guard_pos: -1,
+            }),
+        );
+
+        let slice = PtrInfo::Str(StrPtrInfo {
+            lenbound: None,
+            mode: 0,
+            length: -1,
+            variant: VStringVariant::Slice(VStringSliceInfo {
+                s: source,
+                start: OpRef(20),
+                lgtop: OpRef(21),
+            }),
+            last_guard_pos: -1,
+        });
+        assert_eq!(slice.get_known_str_length(&ctx, 0), Some(2));
+        assert_eq!(slice.get_constant_string_spec(&ctx, 0), Some(vec![98, 99]));
+        assert_eq!(slice.strgetitem(0, &ctx), Some(OpRef(11)));
+
+        let concat = PtrInfo::Str(StrPtrInfo {
+            lenbound: None,
+            mode: 0,
+            length: -1,
+            variant: VStringVariant::Concat(VStringConcatInfo {
+                vleft: source,
+                vright: OpRef(2),
+                _is_virtual: true,
+            }),
+            last_guard_pos: -1,
+        });
+        ctx.set_ptr_info(
+            OpRef(2),
+            PtrInfo::Str(StrPtrInfo {
+                lenbound: None,
+                mode: 0,
+                length: 2,
+                variant: VStringVariant::Plain(VStringPlainInfo {
+                    _chars: vec![Some(OpRef(11)), Some(OpRef(12))],
+                }),
+                last_guard_pos: -1,
+            }),
+        );
+
+        assert_eq!(concat.get_known_str_length(&ctx, 0), Some(5));
+        assert_eq!(
+            concat.get_constant_string_spec(&ctx, 0),
+            Some(vec![97, 98, 99, 98, 99])
+        );
+        assert_eq!(concat.strgetitem(3, &ctx), Some(OpRef(11)));
     }
 
     #[test]

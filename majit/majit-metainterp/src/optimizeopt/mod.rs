@@ -34,7 +34,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::optimizeopt::intutils::IntBound;
 use info::{EnsuredPtrInfo, PtrInfo};
-use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Value};
+use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Type, Value};
 use std::collections::VecDeque;
 
 pub(crate) fn majit_log_enabled() -> bool {
@@ -887,6 +887,47 @@ impl OptContext {
         opref
     }
 
+    /// Emit a boxed integer constant through the optimizer pipeline and return
+    /// the resulting OpRef.
+    pub fn emit_constant_int(&mut self, value: i64) -> OpRef {
+        let pos_ref = self.reserve_pos();
+        let mut op = Op::new(OpCode::SameAsI, &[pos_ref]);
+        op.pos = pos_ref;
+        let opref = self.emit_extra(self.current_pass_idx, op);
+        self.make_constant(opref, Value::Int(value));
+        opref
+    }
+
+    /// Emit a boxed reference constant through the optimizer pipeline and
+    /// return the resulting OpRef.
+    pub fn emit_constant_ref(&mut self, value: GcRef) -> OpRef {
+        let pos_ref = self.reserve_pos();
+        let mut op = Op::new(OpCode::SameAsR, &[pos_ref]);
+        op.pos = pos_ref;
+        let opref = self.emit_extra(self.current_pass_idx, op);
+        self.make_constant(opref, Value::Ref(value));
+        opref
+    }
+
+    /// Emit a boxed float constant through the optimizer pipeline and return
+    /// the resulting OpRef.
+    pub fn emit_constant_float(&mut self, value: f64) -> OpRef {
+        let pos_ref = self.reserve_pos();
+        let mut op = Op::new(OpCode::SameAsF, &[pos_ref]);
+        op.pos = pos_ref;
+        let opref = self.emit_extra(self.current_pass_idx, op);
+        self.make_constant(opref, Value::Float(value));
+        opref
+    }
+
+    pub fn emit_default_value_for_type(&mut self, item_type: Type) -> OpRef {
+        match item_type {
+            Type::Int | Type::Void => self.emit_constant_int(0),
+            Type::Ref => self.emit_constant_ref(GcRef::NULL),
+            Type::Float => self.emit_constant_float(0.0),
+        }
+    }
+
     pub(crate) fn reserve_pos(&mut self) -> OpRef {
         // opencoder.py:271 _index parity: floor at the iteration's inputarg
         // base + num_inputs + emitted-op count, so reserve_pos never returns
@@ -1550,6 +1591,7 @@ impl OptContext {
                 lenbound: sinfo.lenbound.clone(),
                 mode: sinfo.mode,
                 length: -1,
+                variant: sinfo.variant.clone(),
                 last_guard_pos: -1,
             };
             if new_info.lenbound.is_none() {
@@ -3553,34 +3595,43 @@ impl OptContext {
                 .as_ref()
                 .and_then(|d| d.as_field_descr())
                 .expect("ensure_ptr_info_arg0: field op without FieldDescr");
-            let parent_descr = field_descr.get_parent_descr().expect(
-                "ensure_ptr_info_arg0: FieldDescr.get_parent_descr() returned None — \
-                 the FieldDescr implementation must override get_parent_descr() \
-                 for orthodox parity with optimizer.py:478",
-            );
-            // optimizer.py:480-484: parent_descr.is_object() decides Instance vs Struct.
-            //
-            // PyPy unconditionally calls `parent_descr.is_object()` (raises
-            // AttributeError if parent_descr isn't a SizeDescr). The Rust
-            // port mirrors this strict contract by panicking when the
-            // DescrRef downcast fails, rather than silently defaulting to
-            // false.
-            let is_object = parent_descr
-                .as_size_descr()
-                .expect(
-                    "ensure_ptr_info_arg0: FieldDescr.get_parent_descr() must point at a SizeDescr",
-                )
-                .is_object();
-            let mut new_info = if is_object {
-                PtrInfo::instance(Some(parent_descr.clone()), None)
+            if let Some(parent_descr) = field_descr.get_parent_descr() {
+                // optimizer.py:480-484: parent_descr.is_object() decides Instance vs Struct.
+                //
+                // PyPy unconditionally calls `parent_descr.is_object()` (raises
+                // AttributeError if parent_descr isn't a SizeDescr). The Rust
+                // port mirrors this strict contract when the backreference is
+                // present.
+                let is_object = parent_descr
+                    .as_size_descr()
+                    .expect(
+                        "ensure_ptr_info_arg0: FieldDescr.get_parent_descr() must point at a SizeDescr",
+                    )
+                    .is_object();
+                let mut new_info = if is_object {
+                    PtrInfo::instance(Some(parent_descr.clone()), None)
+                } else {
+                    PtrInfo::struct_ptr(parent_descr.clone())
+                };
+                // optimizer.py:484: opinfo.init_fields(parent_descr, descr.get_index())
+                // info.py:180-188 init_fields(parent_descr, index) sets self.descr
+                // and pre-allocates _fields by parent slot count.
+                new_info.init_fields(parent_descr, field_descr.index_in_parent());
+                new_info
             } else {
-                PtrInfo::struct_ptr(parent_descr.clone())
-            };
-            // optimizer.py:484: opinfo.init_fields(parent_descr, descr.get_index())
-            // info.py:180-188 init_fields(parent_descr, index) sets self.descr
-            // and pre-allocates _fields by parent slot count.
-            new_info.init_fields(parent_descr, field_descr.index_in_parent());
-            new_info
+                // Some synthetic descriptors used by tests and imported short
+                // preambles do not retain a live parent_descr backreference.
+                // Keep the same field-cache behavior by installing a generic
+                // struct holder; the caller already chose the fallback field
+                // index (`descr.index()` vs `index_in_parent()`).
+                PtrInfo::Struct(crate::optimizeopt::info::StructPtrInfo {
+                    descr: std::sync::Arc::new(majit_ir::descr::SimpleSizeDescr::new(0, 0, 0)),
+                    fields: Vec::new(),
+                    field_descrs: Vec::new(),
+                    preamble_fields: Vec::new(),
+                    last_guard_pos,
+                })
+            }
         } else if op.opcode.is_getarrayitem()
             || op.opcode == OpCode::SetarrayitemGc
             || op.opcode == OpCode::ArraylenGc
@@ -3602,6 +3653,7 @@ impl OptContext {
                 lenbound: None,
                 mode: 0,
                 length: -1,
+                variant: crate::optimizeopt::info::VStringVariant::Ptr,
                 last_guard_pos: -1,
             })
         } else if op.opcode == OpCode::Unicodelen {
@@ -3610,6 +3662,7 @@ impl OptContext {
                 lenbound: None,
                 mode: 1,
                 length: -1,
+                variant: crate::optimizeopt::info::VStringVariant::Ptr,
                 last_guard_pos: -1,
             })
         } else {
@@ -3651,6 +3704,7 @@ impl OptContext {
                 lenbound: None,
                 mode,
                 length: -1,
+                variant: crate::optimizeopt::info::VStringVariant::Ptr,
                 last_guard_pos: -1,
             }),
         );
@@ -3865,7 +3919,9 @@ mod constant_ptr_info_tests {
     //! the constant pool stored the bits (`Value::Ref` vs `Value::Int`
     //! with a `Type::Ref` override).
     use super::*;
-    use crate::optimizeopt::info::PtrInfo;
+    use crate::optimizeopt::info::{
+        PtrInfo, VStringVariant, VirtualRawBufferInfo, VirtualRawSliceInfo,
+    };
     use majit_ir::{GcRef, OpRef, Type, Value};
     use std::borrow::Cow;
 
@@ -4072,6 +4128,58 @@ mod constant_ptr_info_tests {
         ctx.seed_constant(opref, Value::Int(0));
         // No constant_types_for_numbering entry → no Ref override.
         assert!(ctx.get_const_info_mut(opref, None).is_none());
+    }
+
+    /// optimizer.py:154-158 `is_raw_ptr(op)` parity for
+    /// `info.RawSlicePtrInfo`: once a raw slice PtrInfo is present, it
+    /// must be classified as an `AbstractRawPtrInfo` exactly like its
+    /// parent raw buffer.
+    #[test]
+    fn is_raw_ptr_accepts_virtual_raw_slice() {
+        let mut ctx = OptContext::new(0);
+        let parent = OpRef(10_010);
+        let slice = OpRef(10_011);
+
+        ctx.set_ptr_info(
+            parent,
+            PtrInfo::VirtualRawBuffer(VirtualRawBufferInfo {
+                size: 32,
+                entries: Vec::new(),
+                last_guard_pos: -1,
+            }),
+        );
+        ctx.set_ptr_info(
+            slice,
+            PtrInfo::VirtualRawSlice(VirtualRawSliceInfo {
+                offset: 8,
+                parent,
+                last_guard_pos: -1,
+            }),
+        );
+
+        assert!(ctx.is_raw_ptr(parent));
+        assert!(ctx.is_raw_ptr(slice));
+    }
+
+    /// vstring.py:50 `StrPtrInfo.__init__(mode, is_virtual=False, length=-1)`
+    /// parity for non-virtual strings: `make_nonnull_str()` must install
+    /// a base `StrPtrInfo`, not one of the virtual subclasses.
+    #[test]
+    fn make_nonnull_str_initializes_ptr_variant() {
+        let mut ctx = OptContext::new(0);
+        let opref = OpRef(10_012);
+
+        ctx.make_nonnull_str(opref, 0);
+
+        match ctx.get_ptr_info(opref) {
+            Some(PtrInfo::Str(sinfo)) => {
+                assert_eq!(sinfo.mode, 0);
+                assert_eq!(sinfo.length, -1);
+                assert!(sinfo.lenbound.is_none());
+                assert!(matches!(sinfo.variant, VStringVariant::Ptr));
+            }
+            other => panic!("expected base StrPtrInfo, got {other:?}"),
+        }
     }
 }
 

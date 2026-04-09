@@ -269,7 +269,7 @@ impl OptVirtualize {
                 // same in info.RawSlicePtrInfo.force_box.
                 let parent_forced = self.force_virtual(slice.parent, ctx);
                 let parent_forced = ctx.get_box_replacement(parent_forced);
-                let offset_ref = self.emit_constant_int(ctx, slice.offset as i64);
+                let offset_ref = ctx.emit_constant_int(slice.offset as i64);
                 let add_op = Op::new(OpCode::IntAdd, &[parent_forced, offset_ref]);
                 let new_ref = ctx.emit_extra(ctx.current_pass_idx, add_op);
                 ctx.set_ptr_info(resolved, PtrInfo::nonnull());
@@ -341,12 +341,12 @@ impl OptVirtualize {
                     .and_then(|config| config.array_item_types.get(array_idx as usize).copied())
                     .unwrap_or(Type::Int);
                 let elem_ref = if elem_ref.is_none() {
-                    self.emit_default_value_for_type(ctx, item_type)
+                    ctx.emit_default_value_for_type(item_type)
                 } else {
                     let forced = self.force_virtual(elem_ref, ctx);
                     ctx.get_box_replacement(forced)
                 };
-                let idx_ref = self.emit_constant_int(ctx, i as i64);
+                let idx_ref = ctx.emit_constant_int(i as i64);
                 let mut set_op = Op::new(OpCode::SetarrayitemRaw, &[array_ref, idx_ref, elem_ref]);
                 set_op.descr = array_descr.clone();
                 ctx.emit_extra(ctx.current_pass_idx, set_op);
@@ -421,7 +421,7 @@ impl OptVirtualize {
         ctx.set_ptr_info(opref, PtrInfo::nonnull());
 
         // Emit the length constant and NEW_ARRAY
-        let len_ref = self.emit_constant_int(ctx, len as i64);
+        let len_ref = ctx.emit_constant_int(len as i64);
         let mut alloc_op = Op::new(OpCode::NewArray, &[len_ref]);
         alloc_op.descr = Some(vinfo.descr.clone());
         let alloc_ref = ctx.emit_extra(ctx.current_pass_idx, alloc_op);
@@ -434,7 +434,7 @@ impl OptVirtualize {
         for (i, item_ref) in vinfo.items.iter().enumerate() {
             let item_ref = self.force_virtual(*item_ref, ctx);
             let item_ref = ctx.get_box_replacement(item_ref);
-            let idx_ref = self.emit_constant_int(ctx, i as i64);
+            let idx_ref = ctx.emit_constant_int(i as i64);
             let mut set_op = Op::new(OpCode::SetarrayitemGc, &[alloc_ref, idx_ref, item_ref]);
             set_op.descr = Some(vinfo.descr.clone());
             ctx.emit_extra(ctx.current_pass_idx, set_op);
@@ -504,7 +504,7 @@ impl OptVirtualize {
         ctx.set_ptr_info(opref, PtrInfo::nonnull());
 
         // Emit NEW_ARRAY for the outer array
-        let len_ref = self.emit_constant_int(ctx, num_elements as i64);
+        let len_ref = ctx.emit_constant_int(num_elements as i64);
         let mut alloc_op = Op::new(OpCode::NewArray, &[len_ref]);
         alloc_op.descr = Some(vinfo.descr.clone());
         let alloc_ref = ctx.emit_extra(ctx.current_pass_idx, alloc_op);
@@ -515,7 +515,7 @@ impl OptVirtualize {
 
         // Emit SETINTERIORFIELD_GC for each element's fields
         for (elem_idx, fields) in vinfo.element_fields.iter().enumerate() {
-            let idx_ref = self.emit_constant_int(ctx, elem_idx as i64);
+            let idx_ref = ctx.emit_constant_int(elem_idx as i64);
             for (field_idx, value_ref) in fields {
                 let value_ref = self.force_virtual(*value_ref, ctx);
                 let value_ref = ctx.get_box_replacement(value_ref);
@@ -639,45 +639,6 @@ impl OptVirtualize {
             }
         }
         new_op
-    }
-
-    /// Emit a constant integer, returning its OpRef.
-    fn emit_constant_int(&self, ctx: &mut OptContext, value: i64) -> OpRef {
-        // Reserve the OpRef up front so the queued op can still self-reference
-        // like RPython's constant boxes do when sent through downstream passes.
-        let pos_ref = ctx.reserve_pos();
-        let mut op = Op::new(OpCode::SameAsI, &[pos_ref]);
-        op.pos = pos_ref;
-        let opref = ctx.emit_extra(ctx.current_pass_idx, op);
-        ctx.make_constant(opref, Value::Int(value));
-        opref
-    }
-
-    fn emit_constant_ref(&self, ctx: &mut OptContext, value: majit_ir::GcRef) -> OpRef {
-        let pos_ref = ctx.reserve_pos();
-        let mut op = Op::new(OpCode::SameAsR, &[pos_ref]);
-        op.pos = pos_ref;
-        let opref = ctx.emit_extra(ctx.current_pass_idx, op);
-        ctx.make_constant(opref, Value::Ref(value));
-        opref
-    }
-
-    fn emit_constant_float(&self, ctx: &mut OptContext, value: f64) -> OpRef {
-        let pos_ref = ctx.reserve_pos();
-        let mut op = Op::new(OpCode::SameAsF, &[pos_ref]);
-        op.pos = pos_ref;
-        let opref = ctx.emit_extra(ctx.current_pass_idx, op);
-        ctx.make_constant(opref, Value::Float(value));
-        opref
-    }
-
-    fn emit_default_value_for_type(&self, ctx: &mut OptContext, item_type: Type) -> OpRef {
-        match item_type {
-            Type::Int => self.emit_constant_int(ctx, 0),
-            Type::Ref => self.emit_constant_ref(ctx, majit_ir::GcRef::NULL),
-            Type::Float => self.emit_constant_float(ctx, 0.0),
-            Type::Void => self.emit_constant_int(ctx, 0),
-        }
     }
 
     // ── Per-opcode handlers ──
@@ -1329,19 +1290,20 @@ impl OptVirtualize {
         // of unrelated virtuals when the vref struct is forced.
         ctx.set_ptr_info(token_ref, PtrInfo::nonnull());
 
-        let null_ref = self.emit_constant_ref(ctx, majit_ir::GcRef::NULL);
+        let null_ref = ctx.emit_constant_ref(majit_ir::GcRef::NULL);
 
         let fields = vec![
             (VREF_VIRTUAL_TOKEN_FIELD_INDEX, token_ref),
             (VREF_FORCED_FIELD_INDEX, null_ref),
         ];
+        let field_descrs = vec![
+            make_field_index_descr(VREF_VIRTUAL_TOKEN_FIELD_INDEX),
+            make_field_index_descr(VREF_FORCED_FIELD_INDEX),
+        ];
         let vinfo = VirtualStructInfo {
             descr: vref_descr,
             fields,
-            field_descrs: vec![
-                make_field_index_descr(VREF_VIRTUAL_TOKEN_FIELD_INDEX),
-                make_field_index_descr(VREF_FORCED_FIELD_INDEX),
-            ],
+            field_descrs,
             last_guard_pos: -1,
         };
         ctx.set_ptr_info(op.pos, PtrInfo::VirtualStruct(vinfo));
@@ -1400,7 +1362,7 @@ impl OptVirtualize {
                         set_field(&mut vinfo.fields, VREF_FORCED_FIELD_INDEX, obj_ref);
                     }
                     // virtualize.py:155-158: set 'virtual_token' to CONST_NULL.
-                    let null_ref = self.emit_constant_ref(ctx, majit_ir::GcRef(0));
+                    let null_ref = ctx.emit_constant_ref(majit_ir::GcRef(0));
                     if let Some(PtrInfo::VirtualStruct(vinfo)) = ctx.get_ptr_info_mut(vref_ref) {
                         set_field(&mut vinfo.fields, VREF_VIRTUAL_TOKEN_FIELD_INDEX, null_ref);
                     }
@@ -1419,7 +1381,7 @@ impl OptVirtualize {
         }
 
         // virtualize.py:155-158: set 'virtual_token' to CONST_NULL.
-        let null_ref = self.emit_constant_ref(ctx, majit_ir::GcRef(0));
+        let null_ref = ctx.emit_constant_ref(majit_ir::GcRef(0));
         let mut set_token = Op::new(OpCode::SetfieldGc, &[vref_ref, null_ref]);
         set_token.descr = Some(make_field_index_descr(VREF_VIRTUAL_TOKEN_FIELD_INDEX));
         ctx.emit_extra(ctx.current_pass_idx, set_token);
@@ -2162,7 +2124,7 @@ mod tests {
 
     impl FieldDescr for TestFieldDescr {
         fn get_parent_descr(&self) -> Option<DescrRef> {
-            Some(size_descr(0xFFFF_0000))
+            None
         }
         fn index_in_parent(&self) -> usize {
             self.idx as usize
