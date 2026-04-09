@@ -2994,10 +2994,22 @@ impl OptContext {
     /// call on the same address returns the same shared
     /// `StructPtrInfo`.
     ///
-    /// Returns None if `opref` is not a constant pointer (matching the
-    /// "no info" path) or is null (matching `if not ref: raise
-    /// InvalidLoop`; majit lifts the InvalidLoop into the calling
-    /// optimizer pass via `Option::None`).
+    /// Returns `None` only when `opref` is not a constant pointer at all
+    /// (matching PyPy's `getrawptrinfo` returning `None` for non-pointer
+    /// boxes — there's no `_get_info` to call). For a constant pointer
+    /// that resolves to a null `gcref`, this raises `InvalidLoop` via
+    /// `panic_any`, exactly as PyPy `info.py:720-721` does:
+    ///
+    /// ```python
+    /// def _get_info(self, descr, optheap):
+    ///     ref = self._const.getref_base()
+    ///     if not ref:
+    ///         raise InvalidLoop   # null protection
+    /// ```
+    ///
+    /// The trace was constant-folding through a null base pointer, which
+    /// is an impossible execution path; the optimizer aborts so the JIT
+    /// can retry with a different shape.
     pub fn get_const_info_mut(
         &mut self,
         opref: OpRef,
@@ -3010,9 +3022,11 @@ impl OptContext {
             Some(PtrInfo::Constant(g)) => *g,
             _ => return None,
         };
-        // info.py:720-721: if not ref: raise InvalidLoop  → null protection.
+        // info.py:720-721: if not ref: raise InvalidLoop
         if gcref.is_null() {
-            return None;
+            std::panic::panic_any(crate::optimize::InvalidLoop(
+                "ConstPtrInfo._get_info: null constant base pointer",
+            ));
         }
         let addr = gcref.0;
         use std::collections::hash_map::Entry;
@@ -3061,7 +3075,9 @@ impl OptContext {
         };
         // info.py:730-731: if not ref: raise InvalidLoop
         if gcref.is_null() {
-            return None;
+            std::panic::panic_any(crate::optimize::InvalidLoop(
+                "ConstPtrInfo._get_array_info: null constant base pointer",
+            ));
         }
         let addr = gcref.0;
         use std::collections::hash_map::Entry;
@@ -3775,20 +3791,60 @@ mod constant_ptr_info_tests {
     }
 
     /// info.py:719-720 `if not ref: raise InvalidLoop` — null protection.
-    /// `get_const_info_mut` must return None for null constant pointers
-    /// regardless of whether the bits arrived via `Value::Int(0)` or
-    /// `Value::Ref(NULL)`.
+    /// `get_const_info_mut` raises `InvalidLoop` (via `panic_any`) when
+    /// the constant pointer resolves to a null `gcref`. Callers in PyPy
+    /// rely on the exception to abort the impossible trace shape so the
+    /// JIT can retry; the Rust port mirrors that contract.
+    ///
+    /// `panic_any(InvalidLoop)` is not a string panic so we use
+    /// `catch_unwind` + downcast to assert the typed payload, matching
+    /// how other optimizer passes catch the same exception.
     #[test]
-    fn const_info_mut_rejects_null_constant() {
+    fn const_info_mut_raises_on_null_value_ref_constant() {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut ctx = OptContext::new(0);
+            let ref_null = OpRef(10_007);
+            ctx.seed_constant(ref_null, Value::Ref(GcRef(0)));
+            let _ = ctx.get_const_info_mut(ref_null);
+        }));
+        let err = result.expect_err("expected InvalidLoop panic");
+        let invalid = err
+            .downcast_ref::<crate::optimize::InvalidLoop>()
+            .expect("expected InvalidLoop payload");
+        assert!(invalid.0.contains("null constant base pointer"));
+    }
+
+    /// Same `if not ref: raise InvalidLoop` path for the typed-Int alias
+    /// — `Value::Int(0)` tagged as `Type::Ref` is the raw-pointer
+    /// representation of NULL and must trip the same protection.
+    #[test]
+    fn const_info_mut_raises_on_null_typed_int_constant() {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut ctx = OptContext::new(0);
+            let int_null = OpRef(10_008);
+            ctx.seed_constant(int_null, Value::Int(0));
+            ctx.constant_types_for_numbering
+                .insert(int_null.0, Type::Ref);
+            let _ = ctx.get_const_info_mut(int_null);
+        }));
+        let err = result.expect_err("expected InvalidLoop panic");
+        let invalid = err
+            .downcast_ref::<crate::optimize::InvalidLoop>()
+            .expect("expected InvalidLoop payload");
+        assert!(invalid.0.contains("null constant base pointer"));
+    }
+
+    /// Plain `Value::Int(0)` (no `Type::Ref` override) is not a constant
+    /// pointer at all — `getrawptrinfo` returns `None` long before the
+    /// null protection runs, matching the integer-counter case where
+    /// the value just happens to be zero.
+    #[test]
+    fn const_info_mut_returns_none_for_plain_int_zero() {
         let mut ctx = OptContext::new(0);
-        let ref_null = OpRef(10_007);
-        let int_null = OpRef(10_008);
-        ctx.seed_constant(ref_null, Value::Ref(GcRef(0)));
-        ctx.seed_constant(int_null, Value::Int(0));
-        ctx.constant_types_for_numbering
-            .insert(int_null.0, Type::Ref);
-        assert!(ctx.get_const_info_mut(ref_null).is_none());
-        assert!(ctx.get_const_info_mut(int_null).is_none());
+        let opref = OpRef(10_010);
+        ctx.seed_constant(opref, Value::Int(0));
+        // No constant_types_for_numbering entry → no Ref override.
+        assert!(ctx.get_const_info_mut(opref).is_none());
     }
 }
 
