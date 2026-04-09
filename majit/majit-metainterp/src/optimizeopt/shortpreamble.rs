@@ -545,12 +545,12 @@ impl ShortBoxes {
     }
 
     pub fn note_known_constants_from_ctx(&mut self, ctx: &crate::optimizeopt::OptContext) {
-        for (idx, value) in ctx.constants.iter().enumerate() {
-            if value.is_some() {
-                self.note_known_constant(OpRef(idx as u32));
-            }
-        }
-        // Also register constant-namespace entries from const_pool.
+        // Only register true Const objects that survive across iterations.
+        // Optimizer-known constants on ordinary OpRefs (for example, values
+        // learned from GUARD_VALUE / GUARD_TRUE / GUARD_FALSE) are trace-local
+        // facts, not invariant Const boxes. Treating them as short-preamble
+        // constants leaks per-iteration specialization into the next loop
+        // import and can turn valid guards into stale constant guards.
         for (&const_idx, _) in &ctx.const_pool {
             self.note_known_constant(OpRef::from_const(const_idx));
         }

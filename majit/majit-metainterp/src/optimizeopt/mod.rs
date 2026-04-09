@@ -1023,13 +1023,7 @@ impl OptContext {
             &produced,
             short_inputargs,
         );
-        // RPython parity: populate known_constants from OptContext
-        // so use_box_recursive can skip constant OpRef args.
-        for (idx, val) in self.constants.iter().enumerate() {
-            if val.is_some() {
-                builder.note_known_constant(OpRef(idx as u32));
-            }
-        }
+        // Only true Const objects survive across iterations.
         for (&const_idx, _) in &self.const_pool {
             builder.note_known_constant(OpRef::from_const(const_idx));
         }
@@ -1142,7 +1136,14 @@ impl OptContext {
                     };
                     let obj = match object {
                         ExportedShortArg::Slot(slot) => short_args.get(*slot).copied(),
-                        ExportedShortArg::Const { source, .. } => Some(*source),
+                        ExportedShortArg::Const { source, value } => {
+                            let opref = imported_constants.entry(*source).or_insert_with(|| {
+                                let opref = self.alloc_op_position();
+                                self.make_constant(opref, value.clone());
+                                opref
+                            });
+                            Some(*opref)
+                        }
                         ExportedShortArg::Produced(_) => None,
                     };
                     let Some(obj) = obj else {
@@ -1174,15 +1175,15 @@ impl OptContext {
         }
 
         let mut builder = ShortPreambleBuilder::new(short_args, &produced, short_inputargs);
-        // RPython parity: populate known_constants from OptContext
-        // so add_op_to_short can resolve constant OpRef args.
-        for (idx, val) in self.constants.iter().enumerate() {
-            if val.is_some() {
-                builder.note_known_constant(OpRef(idx as u32));
-            }
-        }
+        // Only true Const objects survive across iterations.
         for (&const_idx, _) in &self.const_pool {
             builder.note_known_constant(OpRef::from_const(const_idx));
+        }
+        // Imported constants are bridge-local stand-ins for RPython Const
+        // objects; make them available to produce_arg() just like const_pool
+        // entries instead of leaving trace-local source OpRefs in short ops.
+        for &opref in imported_constants.values() {
+            builder.note_known_constant(opref);
         }
         self.imported_short_preamble_builder = Some(builder);
         self.imported_short_preamble_used.clear();
@@ -1506,32 +1507,29 @@ impl OptContext {
                 // snapshot the constant pool so build_short_preamble_struct
                 // can capture referenced constants.
                 let loop_constants: HashMap<u32, i64> = self
-                    .constants
+                    .const_pool
                     .iter()
-                    .enumerate()
-                    .filter_map(|(i, v)| {
-                        v.as_ref().map(|val| {
-                            let raw = match val {
-                                majit_ir::Value::Int(v) => *v,
-                                majit_ir::Value::Float(f) => f.to_bits() as i64,
-                                majit_ir::Value::Ref(r) => r.0 as i64,
-                                majit_ir::Value::Void => 0,
-                            };
-                            (i as u32, raw)
-                        })
+                    .map(|(&i, val)| {
+                        let raw = match val {
+                            majit_ir::Value::Int(v) => *v,
+                            majit_ir::Value::Float(f) => f.to_bits() as i64,
+                            majit_ir::Value::Ref(r) => r.0 as i64,
+                            majit_ir::Value::Void => 0,
+                        };
+                        (OpRef::from_const(i).0, raw)
                     })
                     .collect();
                 let mut loop_constant_types = self.constant_types_for_numbering.clone();
-                for (i, v) in self.constants.iter().enumerate() {
-                    if let Some(val) = v {
-                        let tp = match val {
-                            majit_ir::Value::Int(_) => majit_ir::Type::Int,
-                            majit_ir::Value::Float(_) => majit_ir::Type::Float,
-                            majit_ir::Value::Ref(_) => majit_ir::Type::Ref,
-                            majit_ir::Value::Void => majit_ir::Type::Void,
-                        };
-                        loop_constant_types.entry(i as u32).or_insert(tp);
-                    }
+                for (&i, val) in &self.const_pool {
+                    let tp = match val {
+                        majit_ir::Value::Int(_) => majit_ir::Type::Int,
+                        majit_ir::Value::Float(_) => majit_ir::Type::Float,
+                        majit_ir::Value::Ref(_) => majit_ir::Type::Ref,
+                        majit_ir::Value::Void => majit_ir::Type::Void,
+                    };
+                    loop_constant_types
+                        .entry(OpRef::from_const(i).0)
+                        .or_insert(tp);
                 }
                 builder.build_short_preamble_struct(&loop_constants, &loop_constant_types)
             })

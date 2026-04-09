@@ -2325,21 +2325,18 @@ impl OptUnroll {
                             let mut loop_constants: HashMap<u32, i64> = HashMap::new();
                             let mut loop_constant_types: HashMap<u32, majit_ir::Type> =
                                 optimizer.constant_types.clone();
-                            for (i, v) in ctx.constants.iter().enumerate() {
-                                if let Some(val) = v {
-                                    let (raw, tp) = match val {
-                                        majit_ir::Value::Int(v) => (*v, majit_ir::Type::Int),
-                                        majit_ir::Value::Float(f) => {
-                                            (f.to_bits() as i64, majit_ir::Type::Float)
-                                        }
-                                        majit_ir::Value::Ref(r) => {
-                                            (r.0 as i64, majit_ir::Type::Ref)
-                                        }
-                                        majit_ir::Value::Void => (0, majit_ir::Type::Void),
-                                    };
-                                    loop_constants.insert(i as u32, raw);
-                                    loop_constant_types.entry(i as u32).or_insert(tp);
-                                }
+                            for (&const_idx, val) in &ctx.const_pool {
+                                let (raw, tp) = match val {
+                                    majit_ir::Value::Int(v) => (*v, majit_ir::Type::Int),
+                                    majit_ir::Value::Float(f) => {
+                                        (f.to_bits() as i64, majit_ir::Type::Float)
+                                    }
+                                    majit_ir::Value::Ref(r) => (r.0 as i64, majit_ir::Type::Ref),
+                                    majit_ir::Value::Void => (0, majit_ir::Type::Void),
+                                };
+                                let opref = OpRef::from_const(const_idx);
+                                loop_constants.insert(opref.0, raw);
+                                loop_constant_types.entry(opref.0).or_insert(tp);
                             }
                             // Merge previous short preamble's constants.
                             // RPython's Const objects survive across compilations
@@ -2624,7 +2621,7 @@ impl OptUnroll {
                     .iter()
                     .map(|jump_arg| {
                         let mapped = if short_preamble.constants.contains_key(&jump_arg.0)
-                            || ctx.get_constant(*jump_arg).is_some()
+                            || jump_arg.is_constant()
                         {
                             *jump_arg
                         } else {
@@ -2786,7 +2783,22 @@ impl OptUnroll {
         exported_int_bounds: Option<&HashMap<OpRef, crate::optimizeopt::intutils::IntBound>>,
     ) -> ExportedValueInfo {
         let resolved = ctx.get_box_replacement(opref);
-        let constant = ctx.get_constant(resolved).cloned();
+        // RPython export_state/_expand_info records properties on the Box
+        // objects that survive to the next iteration. In majit, a loop box may
+        // temporarily forward to a Const during the current iteration even
+        // though the next iteration still needs a box identity. Export only
+        // true Const objects here; forwarded-to-Const metadata would otherwise
+        // over-specialize the imported targetarg and leak one iteration's
+        // guard knowledge into the next.
+        let constant = if opref.is_constant() {
+            ctx.get_constant(resolved).cloned()
+        } else {
+            None
+        };
+        let ptr_info = match ctx.get_ptr_info(resolved).cloned() {
+            Some(crate::optimizeopt::info::PtrInfo::Constant(_)) if !opref.is_constant() => None,
+            other => other,
+        };
         // unroll.py:432-443 _expand_info uses self.optimizer.getinfo(arg) which
         // dispatches by op.type ('r' → getptrinfo, 'i' → getintbound). The Rust
         // port stores int bounds in a separate `int_bound` field populated
@@ -2796,7 +2808,7 @@ impl OptUnroll {
         let int_bound = exported_int_bounds.and_then(|bounds| bounds.get(&resolved).cloned());
         ExportedValueInfo {
             constant,
-            ptr_info: ctx.get_ptr_info(resolved).cloned(),
+            ptr_info,
             int_bound,
         }
     }
@@ -2872,6 +2884,19 @@ impl OptUnroll {
         short_args: &[OpRef],
         ctx: &OptContext,
     ) -> Vec<ExportedShortOp> {
+        fn exported_const_arg(ctx: &OptContext, arg: OpRef) -> Option<ExportedShortArg> {
+            // RPython shortpreamble.py: produce_arg() only serializes real
+            // Const objects here. A loop box that merely has Forwarded::Const
+            // metadata for the current iteration must stay a box; exporting it
+            // as Const leaks one iteration's guard knowledge into the next.
+            if !arg.is_constant() {
+                return None;
+            }
+            ctx.get_constant(arg)
+                .cloned()
+                .map(|value| ExportedShortArg::Const { source: arg, value })
+        }
+
         let short_boxes =
             crate::optimizeopt::shortpreamble::ShortBoxes::with_label_args(short_args);
         let mut produced_indices: HashMap<OpRef, usize> = HashMap::new();
@@ -2905,11 +2930,7 @@ impl OptUnroll {
                                         .copied()
                                         .map(ExportedShortArg::Produced)
                                 })
-                                .or_else(|| {
-                                    ctx.get_constant(arg)
-                                        .cloned()
-                                        .map(|value| ExportedShortArg::Const { source: arg, value })
-                                })
+                                .or_else(|| exported_const_arg(ctx, arg))
                         })
                         .collect::<Option<Vec<_>>>();
                     let Some(args) = args else {
@@ -2938,15 +2959,7 @@ impl OptUnroll {
                     let object = short_boxes
                         .lookup_label_arg(struct_arg)
                         .map(ExportedShortArg::Slot)
-                        .or_else(|| {
-                            // RPython produce_arg: isinstance(op, Const) → return op
-                            ctx.get_constant(struct_arg).cloned().map(|value| {
-                                ExportedShortArg::Const {
-                                    source: struct_arg,
-                                    value,
-                                }
-                            })
-                        });
+                        .or_else(|| exported_const_arg(ctx, struct_arg));
                     let Some(object) = object else {
                         continue;
                     };
@@ -3020,17 +3033,33 @@ impl OptUnroll {
         exported_state: &ExportedState,
         ctx: &mut OptContext,
     ) {
-        if std::env::var_os("MAJIT_LOG").is_some() {
-            eprintln!(
-                "[jit] import_short_preamble_ops: short_args={}, exported_short_ops={}",
-                short_args.len(),
-                exported_state.exported_short_ops.len()
-            );
+        fn imported_const_opref(
+            ctx: &mut OptContext,
+            imported_constants: &mut HashMap<OpRef, OpRef>,
+            source: OpRef,
+            value: &Value,
+        ) -> OpRef {
+            if source.is_constant() {
+                ctx.seed_constant(source, value.clone());
+                source
+            } else {
+                if let Some(&opref) = imported_constants.get(&source) {
+                    return opref;
+                }
+                let opref = ctx.alloc_op_position();
+                ctx.make_constant(opref, value.clone());
+                imported_constants.insert(source, opref);
+                opref
+            }
         }
-        let mut produced_results = Vec::with_capacity(exported_state.exported_short_ops.len());
-        let mut temporary_results: Vec<Option<OpRef>> = Vec::new();
-        for entry in &exported_state.exported_short_ops {
-            let mut resolve_result = |result: &ExportedShortResult| match result {
+
+        fn resolve_exported_short_result(
+            result: &ExportedShortResult,
+            short_args: &[OpRef],
+            temporary_results: &mut Vec<Option<OpRef>>,
+            ctx: &mut OptContext,
+        ) -> Option<OpRef> {
+            match result {
                 ExportedShortResult::Slot(slot) => short_args.get(*slot).copied(),
                 // RPython keeps box identity across traces. In majit, raw OpRef
                 // indices are trace-local, so imported temporary short results
@@ -3044,7 +3073,20 @@ impl OptUnroll {
                     let slot = &mut temporary_results[*index];
                     Some(*slot.get_or_insert_with(|| ctx.alloc_op_position()))
                 }
-            };
+            }
+        }
+
+        if std::env::var_os("MAJIT_LOG").is_some() {
+            eprintln!(
+                "[jit] import_short_preamble_ops: short_args={}, exported_short_ops={}",
+                short_args.len(),
+                exported_state.exported_short_ops.len()
+            );
+        }
+        let mut produced_results = Vec::with_capacity(exported_state.exported_short_ops.len());
+        let mut temporary_results: Vec<Option<OpRef>> = Vec::new();
+        let mut imported_constants: HashMap<OpRef, OpRef> = HashMap::new();
+        for entry in &exported_state.exported_short_ops {
             match *entry {
                 ExportedShortOp::Pure {
                     source,
@@ -3055,7 +3097,12 @@ impl OptUnroll {
                     invented_name,
                     same_as_source,
                 } => {
-                    let Some(result_opref) = resolve_result(result) else {
+                    let Some(result_opref) = resolve_exported_short_result(
+                        result,
+                        short_args,
+                        &mut temporary_results,
+                        ctx,
+                    ) else {
                         continue;
                     };
                     // RPython parity: shortpreamble.py:112-126 PureOp.produce_op
@@ -3105,13 +3152,15 @@ impl OptUnroll {
                                 .copied()
                                 .map(crate::optimizeopt::ImportedShortPureArg::OpRef),
                             ExportedShortArg::Const { source, value } => {
-                                if source.is_constant() {
-                                    ctx.seed_constant(*source, value.clone());
-                                } else {
-                                    ctx.make_constant(*source, value.clone());
-                                }
+                                let const_opref = imported_const_opref(
+                                    ctx,
+                                    &mut imported_constants,
+                                    *source,
+                                    value,
+                                );
                                 Some(crate::optimizeopt::ImportedShortPureArg::Const(
-                                    *value, *source,
+                                    *value,
+                                    const_opref,
                                 ))
                             }
                             ExportedShortArg::Produced(index) => produced_results
@@ -3163,15 +3212,14 @@ impl OptUnroll {
                     same_as_source,
                 } => {
                     // Resolve object arg before resolve_result to avoid borrow conflict.
-                    let (obj, const_to_register) = match object {
-                        ExportedShortArg::Slot(slot) => (short_args.get(*slot).copied(), None),
-                        ExportedShortArg::Const { source, value } => {
-                            (Some(*source), Some((*source, value.clone())))
-                        }
-                        ExportedShortArg::Produced(idx) => {
-                            (produced_results.get(*idx).copied(), None)
-                        }
-                    };
+                    let obj =
+                        match object {
+                            ExportedShortArg::Slot(slot) => short_args.get(*slot).copied(),
+                            ExportedShortArg::Const { source, value } => Some(
+                                imported_const_opref(ctx, &mut imported_constants, *source, value),
+                            ),
+                            ExportedShortArg::Produced(idx) => produced_results.get(*idx).copied(),
+                        };
                     let Some(obj) = obj else {
                         continue;
                     };
@@ -3183,17 +3231,15 @@ impl OptUnroll {
                     // and store PreambleOp in PtrInfo._fields.
                     // CachedField._getfield (heap.py:177-187) will detect it
                     // via take_preamble_field and call force_op_from_preamble.
-                    let _slot_value = resolve_result(result);
+                    let _slot_value = resolve_exported_short_result(
+                        result,
+                        short_args,
+                        &mut temporary_results,
+                        ctx,
+                    );
                     let value = ctx.alloc_op_position();
                     // Register type for the new OpRef (RPython Box.type parity).
                     ctx.value_types.insert(value.0, result_type);
-                    if let Some((csrc, cval)) = const_to_register {
-                        if csrc.is_constant() {
-                            ctx.seed_constant(csrc, cval);
-                        } else {
-                            ctx.make_constant(csrc, cval);
-                        }
-                    }
                     ctx.replace_op(source, value);
                     // Prefer parent-local index when the FieldDescr is wired
                     // up to a SizeDescr; otherwise (lib-test fixtures or
@@ -3276,27 +3322,28 @@ impl OptUnroll {
                     invented_name,
                     same_as_source,
                 } => {
-                    let (obj, const_to_register) = match object {
-                        ExportedShortArg::Slot(slot) => (short_args.get(*slot).copied(), None),
-                        ExportedShortArg::Const { source, value } => {
-                            (Some(*source), Some((*source, value.clone())))
-                        }
-                        ExportedShortArg::Produced(idx) => {
-                            (produced_results.get(*idx).copied(), None)
-                        }
-                    };
+                    let obj =
+                        match object {
+                            ExportedShortArg::Slot(slot) => short_args.get(*slot).copied(),
+                            ExportedShortArg::Const { source, value } => Some(
+                                imported_const_opref(ctx, &mut imported_constants, *source, value),
+                            ),
+                            ExportedShortArg::Produced(idx) => produced_results.get(*idx).copied(),
+                        };
                     let Some(obj) = obj else {
                         continue;
                     };
                     // RPython shortpreamble.py:80-85: HeapOp.produce_op (array item)
                     // Fresh OpRef for PreambleOp.op identity isolation.
-                    let _slot_value = resolve_result(result);
+                    let _slot_value = resolve_exported_short_result(
+                        result,
+                        short_args,
+                        &mut temporary_results,
+                        ctx,
+                    );
                     let value = ctx.alloc_op_position();
                     // Register type for the new OpRef (RPython Box.type parity).
                     ctx.value_types.insert(value.0, result_type);
-                    if let Some((csrc, cval)) = const_to_register {
-                        ctx.make_constant(csrc, cval);
-                    }
                     ctx.replace_op(source, value);
                     let descr_idx = descr.index();
                     // shortpreamble.py:72,84 parity: canonicalize obj through
@@ -3349,7 +3396,12 @@ impl OptUnroll {
                     invented_name,
                     same_as_source,
                 } => {
-                    let Some(value) = resolve_result(result) else {
+                    let Some(value) = resolve_exported_short_result(
+                        result,
+                        short_args,
+                        &mut temporary_results,
+                        ctx,
+                    ) else {
                         continue;
                     };
                     ctx.replace_op(source, value);
