@@ -1377,15 +1377,69 @@ impl<M: Clone> MetaInterp<M> {
             .is_some_and(|standard| standard == vable_opref)
     }
 
-    /// RPython equivalent: `MIFrameOpImpl._nonstandard_virtualizable()`.
+    /// pyjitpl.py:1120-1146 `_nonstandard_virtualizable(pc, box, fielddescr)`.
     ///
-    /// Returns true when `vable_opref` is not the active standard
-    /// virtualizable tracked in `virtualizable_boxes[-1]`.
+    ///     def _nonstandard_virtualizable(self, pc, box, fielddescr):
+    ///         # returns True if 'box' is actually not the "standard" virtualizable
+    ///         # that is stored in metainterp.virtualizable_boxes[-1]
+    ///         if self.metainterp.heapcache.is_known_nonstandard_virtualizable(box):
+    ///             self.metainterp.staticdata.profiler.count_ops(rop.PTR_EQ, Counters.HEAPCACHED_OPS)
+    ///             return True
+    ///         if box is self.metainterp.forced_virtualizable:
+    ///             self.metainterp.forced_virtualizable = None
+    ///         if (self.metainterp.jitdriver_sd.virtualizable_info is not None or
+    ///             self.metainterp.jitdriver_sd.greenfield_info is not None):
+    ///             standard_box = self.metainterp.virtualizable_boxes[-1]
+    ///             if standard_box is box:
+    ///                 return False
+    ///             vinfo = self.metainterp.jitdriver_sd.virtualizable_info
+    ///             if vinfo is fielddescr.get_vinfo():
+    ///                 eqbox = self.metainterp.execute_and_record(rop.PTR_EQ, None,
+    ///                                                            box, standard_box)
+    ///                 eqbox = self.implement_guard_value(eqbox, pc)
+    ///                 isstandard = eqbox.getint()
+    ///                 if isstandard:
+    ///                     if box.type == 'r':
+    ///                         self.metainterp.replace_box(box, standard_box)
+    ///                     return False
+    ///         if not self.metainterp.heapcache.is_unescaped(box):
+    ///             self.emit_force_virtualizable(fielddescr, box)
+    ///         self.metainterp.heapcache.nonstandard_virtualizables_now_known(box)
+    ///         return True
     fn nonstandard_virtualizable(&mut self, vable_opref: OpRef) -> bool {
+        // Step 1: heapcache short-circuit.
+        if let Some(ctx) = self.tracing.as_ref() {
+            if ctx
+                .heap_cache()
+                .is_known_nonstandard_virtualizable(vable_opref)
+            {
+                return true;
+            }
+        }
+        // Step 2: forced_virtualizable reset on identity.
         if self.forced_virtualizable == Some(vable_opref) {
             self.forced_virtualizable = None;
         }
-        !self.is_standard_virtualizable(vable_opref)
+        // Step 3: standard_box identity check.
+        if self.virtualizable_info.is_some() && self.is_standard_virtualizable(vable_opref) {
+            return false;
+        }
+        // Step 4 (deferred): PTR_EQ + implement_guard_value + replace_box path.
+        // RPython promotes the box to the standard one when the guard succeeds.
+        // Requires implement_guard_value/PTR_EQ guard infrastructure not yet
+        // ported in pyre — tracked separately under the guard-value epic.
+        //
+        // Step 5a (deferred): emit_force_virtualizable COND_CALL clear-vable-token
+        // path. Requires `clear_vable_ptr` function pointer + `clear_vable_descr`
+        // call descriptor on VirtualizableInfo, and a CONST_NULL constant. Tracked
+        // separately under the COND_CALL emit_force_virtualizable epic.
+        // Step 5b: mark this box as a known nonstandard virtualizable so future
+        // accesses short-circuit at Step 1.
+        if let Some(ctx) = self.tracing.as_mut() {
+            ctx.heap_cache_mut()
+                .nonstandard_virtualizables_now_known(vable_opref);
+        }
+        true
     }
 
     fn virtualizable_field_index(&self, field_offset: usize) -> Option<usize> {
