@@ -542,7 +542,28 @@ impl HeapCache {
         self.mark_escaped_box(boxref);
     }
 
-    /// Alias to keep recursion behavior explicit with Python name.
+    /// heapcache.py:295-309 `_escape_box(box)`.
+    ///
+    ///     def _escape_box(self, box):
+    ///         if isinstance(box, RefFrontendOp):
+    ///             remove_flags(box, HF_LIKELY_VIRTUAL | HF_IS_UNESCAPED)
+    ///             deps = box._heapc_deps
+    ///             if deps is not None:
+    ///                 if not self.test_head_version(box):
+    ///                     box._heapc_deps = None
+    ///                 else:
+    ///                     # 'deps[0]' is abused to store the array length, keep it
+    ///                     if deps[0] is None:
+    ///                         box._heapc_deps = None
+    ///                     else:
+    ///                         box._heapc_deps = [deps[0]]
+    ///                     for i in range(1, len(deps)):
+    ///                         self._escape_box(deps[i])
+    ///
+    /// RPython only clears HF_LIKELY_VIRTUAL and HF_IS_UNESCAPED — escaping
+    /// does NOT clear nullity. The Vec<bool> mirror walks here only exist to
+    /// keep majit's standalone is_unescaped/is_likely_virtual queries in sync
+    /// with the underlying heapc_flags state.
     pub fn mark_escaped_box(&mut self, opref: OpRef) {
         if opref.is_constant() {
             return;
@@ -550,13 +571,12 @@ impl HeapCache {
         if !vb_remove(&mut self.is_unescaped, &opref) {
             return;
         }
-        vb_remove(&mut self.likely_virtual, &opref);
-        {
-            let _i = opref.0 as usize;
-            if _i < self.known_nullity.len() {
-                self.known_nullity[_i] = 0;
-            }
-        };
+        // RPython remove_flags(box, HF_LIKELY_VIRTUAL | HF_IS_UNESCAPED).
+        // _remove_flag updates heapc_flags AND mirrors HF_IS_UNESCAPED /
+        // HF_LIKELY_VIRTUAL Vec<bool> back out, so the version-gated
+        // _check_flag query stays consistent.
+        self._remove_flag(opref, HF_LIKELY_VIRTUAL);
+        self._remove_flag(opref, HF_IS_UNESCAPED);
         if let Some(deps) = self.escape_deps.remove(&opref) {
             let mut pending = deps;
             while let Some(dep) = pending.pop() {
@@ -695,11 +715,25 @@ impl HeapCache {
         }
     }
 
-    /// Record a new object allocation. The object is marked as unescaped
-    /// and seen-allocation.
+    /// heapcache.py:502-506
+    ///
+    ///     def new(self, box):
+    ///         assert isinstance(box, RefFrontendOp)
+    ///         self.update_version(box)
+    ///         add_flags(box, HF_LIKELY_VIRTUAL | HF_SEEN_ALLOCATION | HF_IS_UNESCAPED
+    ///                        | HF_KNOWN_NULLITY)
     pub fn new_object(&mut self, opref: OpRef) {
-        vb_insert(&mut self.is_unescaped, opref);
-        vb_insert(&mut self.seen_allocation, opref);
+        if opref.is_constant() {
+            return;
+        }
+        self.update_version(opref);
+        // RPython add_flags writes the bitwise OR of all four flags into the
+        // versioned heapc_flags. We route through _set_flag so the Vec<bool>
+        // mirrors stay in sync with heapc_flags.
+        self._set_flag(opref, HF_LIKELY_VIRTUAL);
+        self._set_flag(opref, HF_SEEN_ALLOCATION);
+        self._set_flag(opref, HF_IS_UNESCAPED);
+        self._set_flag(opref, HF_KNOWN_NULLITY);
     }
 
     /// heapcache.py:508-516 new_array
