@@ -1480,10 +1480,17 @@ impl HeapCache {
     ///         deps = self._get_deps(box)
     ///         assert deps is not None
     ///         deps[0] = lengthbox
+    ///
+    /// `_get_deps` runs `update_version` as a side effect — pyre splits
+    /// the deps across `escape_deps` (for the dep chain) and
+    /// `cached_arraylen` (for `deps[0]` / the array length). Call
+    /// `_get_deps` so the version is bumped, then write the length to
+    /// the dedicated map.
     pub fn arraylen_now_known(&mut self, array: OpRef, length: OpRef) {
         if array.is_constant() {
             return;
         }
+        self._get_deps(array);
         self.cached_arraylen.insert(array, length);
     }
 
