@@ -75,20 +75,50 @@ thread_local! {
         // info.py:810-822 `ConstPtrInfo.getstrlen1(mode)` — install pyre's
         // `W_StrObject` length reader so constant STRLEN / UNICODELEN ops
         // fold to `IntBound::from_constant(len)` during intbounds
-        // postprocessing. `mode == 0` is byte-string; mode 1 (unicode) has
-        // no distinct representation in pyre (bytes and str share layout),
-        // so it falls through to `None` and the optimizer keeps the
-        // conservative `nonnegative` fallback.
+        // postprocessing.
+        //
+        // PyPy returns the exact length for both modes:
+        //
+        //     def getstrlen1(self, mode):
+        //         from rpython.jit.metainterp.optimizeopt import vstring
+        //         if mode is vstring.mode_string:
+        //             s = self._unpack_str(vstring.mode_string)
+        //             ...
+        //             return len(s)
+        //         elif mode is vstring.mode_unicode:
+        //             s = self._unpack_str(vstring.mode_unicode)
+        //             ...
+        //             return len(s)
+        //
+        // Pyre's `W_StrObject.value` is a Rust `String` whose
+        // `len()` returns the UTF-8 BYTE length and whose
+        // `chars().count()` returns the codepoint count, so the resolver
+        // needs different reads per mode:
+        //
+        //   * mode == 0 (`vstring.mode_string`, byte string) — return the
+        //     UTF-8 byte length, which is what PyPy's `str.len()` would
+        //     produce for an RPython byte string.
+        //   * mode == 1 (`vstring.mode_unicode`, unicode string) — return
+        //     the codepoint count, which is what Python 3's
+        //     `len(str_object)` produces.
         d.meta_interp_mut().set_string_length_resolver(std::sync::Arc::new(
             |gcref: majit_ir::GcRef, mode: u8| -> Option<i64> {
-                if gcref.is_null() || mode != 0 {
+                if gcref.is_null() {
                     return None;
                 }
                 let obj = gcref.0 as pyre_object::pyobject::PyObjectRef;
-                if unsafe { pyre_object::strobject::is_str(obj) } {
-                    Some(unsafe { pyre_object::strobject::w_str_len(obj) } as i64)
-                } else {
-                    None
+                if !unsafe { pyre_object::strobject::is_str(obj) } {
+                    return None;
+                }
+                match mode {
+                    // vstring.mode_string — UTF-8 byte length.
+                    0 => Some(unsafe { pyre_object::strobject::w_str_len(obj) } as i64),
+                    // vstring.mode_unicode — codepoint count.
+                    1 => {
+                        let s = unsafe { pyre_object::strobject::w_str_get_value(obj) };
+                        Some(s.chars().count() as i64)
+                    }
+                    _ => None,
                 }
             },
         ));
