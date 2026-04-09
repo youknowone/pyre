@@ -3181,6 +3181,10 @@ impl<M: Clone> MetaInterp<M> {
         self.force_finish_trace = false;
         let mut ctx = self.tracing.take().unwrap();
         ctx.apply_replacements();
+        // pyjitpl.py:3199 compile_done_with_this_frame: store_token_in_vable
+        // is recorded BEFORE the FINISH op so the JIT-compiled exit path
+        // sets the vable token and emits GUARD_NOT_FORCED_2.
+        ctx.store_token_in_vable();
         let green_key = ctx.green_key;
 
         let mut recorder = ctx.recorder;
