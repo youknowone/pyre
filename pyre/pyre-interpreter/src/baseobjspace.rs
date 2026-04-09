@@ -1097,6 +1097,365 @@ pub fn pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     }
 }
 
+// ── descroperation helpers — pypy/objspace/descroperation.py ──────────
+//
+// These helpers implement the standard "forward + reverse with
+// NotImplemented fallback" dispatch that PyPy generates from
+// `_make_binop_impl` / `_make_descr_unaryop`. They live here in
+// `baseobjspace` (not in `builtins`) because they are space-level
+// semantics shared between the builtin module, the weakproxy wrappers,
+// and any future opcode dispatch — every caller needs the same rule
+// or NotImplemented from the forward path silently swallows the
+// reflected operand.
+
+/// `space.lookup(w_obj, dunder)` — descroperation.py.
+pub(crate) unsafe fn lookup_type_special(obj: PyObjectRef, dunder: &str) -> Option<PyObjectRef> {
+    crate::typedef::r#type(obj).and_then(|tp| lookup_in_type(tp, dunder))
+}
+
+/// descroperation.py `_binop_impl` — when `type(rhs)` is a proper
+/// subtype of `type(lhs)` and defines the reflected dunder, the
+/// reflected operand is tried first.
+pub(crate) unsafe fn should_try_reverse_first(
+    lhs: PyObjectRef,
+    rhs: PyObjectRef,
+    rdunder: &str,
+) -> bool {
+    let Some(lhs_type) = crate::typedef::r#type(lhs) else {
+        return false;
+    };
+    let Some(rhs_type) = crate::typedef::r#type(rhs) else {
+        return false;
+    };
+    !std::ptr::eq(lhs_type, rhs_type)
+        && issubtype_w(rhs_type, lhs_type)
+        && lookup_in_type(rhs_type, rdunder).is_some()
+}
+
+/// Call a special method and treat NotImplemented as "no result", per
+/// descroperation.py `_check_notimplemented`.
+pub(crate) fn try_call_special(
+    method: PyObjectRef,
+    args: &[PyObjectRef],
+) -> Result<Option<PyObjectRef>, PyError> {
+    let result = crate::call::call_function_impl_result(method, args)?;
+    if unsafe { is_not_implemented(result) } {
+        Ok(None)
+    } else {
+        Ok(Some(result))
+    }
+}
+
+/// descroperation.py `_make_binop_impl` — forward `__op__` then
+/// reflected `__rop__`, with the reflected-first reordering rule when
+/// `type(rhs)` subtypes `type(lhs)`.
+pub(crate) fn try_dispatch_binary_special(
+    lhs: PyObjectRef,
+    rhs: PyObjectRef,
+    dunder: &str,
+    rdunder: &str,
+) -> Result<Option<PyObjectRef>, PyError> {
+    let try_reverse_first = unsafe { should_try_reverse_first(lhs, rhs, rdunder) };
+    if try_reverse_first {
+        if let Some(method) = unsafe { lookup_type_special(rhs, rdunder) } {
+            if let Some(result) = try_call_special(method, &[rhs, lhs])? {
+                return Ok(Some(result));
+            }
+        }
+    }
+    if let Some(method) = unsafe { lookup_type_special(lhs, dunder) } {
+        if let Some(result) = try_call_special(method, &[lhs, rhs])? {
+            return Ok(Some(result));
+        }
+    }
+    if !try_reverse_first {
+        if let Some(method) = unsafe { lookup_type_special(rhs, rdunder) } {
+            if let Some(result) = try_call_special(method, &[rhs, lhs])? {
+                return Ok(Some(result));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// descroperation.py:399 `def pow(space, w_obj1, w_obj2, w_obj3)` —
+/// the same forward/reverse dance as the binary version but threading
+/// the third (modulo) operand through to both arms.
+pub(crate) fn try_dispatch_ternary_special(
+    lhs: PyObjectRef,
+    rhs: PyObjectRef,
+    third: PyObjectRef,
+    dunder: &str,
+    rdunder: &str,
+) -> Result<Option<PyObjectRef>, PyError> {
+    let try_reverse_first = unsafe { should_try_reverse_first(lhs, rhs, rdunder) };
+    if try_reverse_first {
+        if let Some(method) = unsafe { lookup_type_special(rhs, rdunder) } {
+            if let Some(result) = try_call_special(method, &[rhs, lhs, third])? {
+                return Ok(Some(result));
+            }
+        }
+    }
+    if let Some(method) = unsafe { lookup_type_special(lhs, dunder) } {
+        if let Some(result) = try_call_special(method, &[lhs, rhs, third])? {
+            return Ok(Some(result));
+        }
+    }
+    if !try_reverse_first {
+        if let Some(method) = unsafe { lookup_type_special(rhs, rdunder) } {
+            if let Some(result) = try_call_special(method, &[rhs, lhs, third])? {
+                return Ok(Some(result));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// `(int|long) ** (int|long) % (int|long)` fast path used by `space.pow`
+/// when a modulus is supplied — longobject.py `int_pow`.
+pub(crate) fn try_int_long_pow_with_modulo(
+    base: PyObjectRef,
+    exp: PyObjectRef,
+    modulus: PyObjectRef,
+) -> Result<Option<PyObjectRef>, PyError> {
+    unsafe {
+        if !is_int_or_long(base) || !is_int_or_long(exp) || !is_int_or_long(modulus) {
+            return Ok(None);
+        }
+
+        let base = crate::builtins::obj_to_bigint(base);
+        let exp = crate::builtins::obj_to_bigint(exp);
+        let modulus = crate::builtins::obj_to_bigint(modulus);
+
+        if modulus == BigInt::from(0) {
+            return Err(PyError::value_error("pow() 3rd argument cannot be 0"));
+        }
+        if exp < BigInt::from(0) {
+            return Err(PyError::type_error(
+                "pow() 2nd argument cannot be negative when 3rd argument specified",
+            ));
+        }
+        if exp == BigInt::from(0) {
+            return Ok(Some(box_bigint_result(BigInt::from(1) % modulus)));
+        }
+
+        let negative_modulus = modulus < BigInt::from(0);
+        let abs_modulus = if negative_modulus {
+            -modulus.clone()
+        } else {
+            modulus.clone()
+        };
+        let mut result = base.modpow(&exp, &abs_modulus);
+        if negative_modulus && result > BigInt::from(0) {
+            result -= abs_modulus;
+        }
+        Ok(Some(box_bigint_result(result)))
+    }
+}
+
+pub(crate) fn box_bigint_result(value: BigInt) -> PyObjectRef {
+    use num_traits::ToPrimitive;
+    if let Some(small) = value.to_i64() {
+        w_int_new(small)
+    } else {
+        w_long_new(value)
+    }
+}
+
+pub(crate) fn binary_builtin_type_error(
+    opname: &str,
+    lhs: PyObjectRef,
+    rhs: PyObjectRef,
+) -> PyError {
+    let lhs_name = unsafe {
+        match crate::typedef::r#type(lhs) {
+            Some(tp) => pyre_object::w_type_get_name(tp).to_string(),
+            None => (*(*lhs).ob_type).name.to_string(),
+        }
+    };
+    let rhs_name = unsafe {
+        match crate::typedef::r#type(rhs) {
+            Some(tp) => pyre_object::w_type_get_name(tp).to_string(),
+            None => (*(*rhs).ob_type).name.to_string(),
+        }
+    };
+    PyError::type_error(format!(
+        "unsupported operand type(s) for {opname}: '{lhs_name}' and '{rhs_name}'"
+    ))
+}
+
+/// pypy/interpreter/baseobjspace.py `issubtype_w` — `cls` is in
+/// `w_type.mro_w`. Uses the cached MRO when present, otherwise
+/// recomputes via `compute_default_mro`.
+pub(crate) unsafe fn issubtype_w(w_type: PyObjectRef, cls: PyObjectRef) -> bool {
+    if w_type.is_null() || !is_type(w_type) {
+        return false;
+    }
+    let mro_ptr = w_type_get_mro(w_type);
+    if !mro_ptr.is_null() {
+        return (*mro_ptr).iter().any(|&t| std::ptr::eq(t, cls));
+    }
+    compute_default_mro(w_type)
+        .iter()
+        .any(|&t| std::ptr::eq(t, cls))
+}
+
+/// 3-arg `pow(a, b, c)` dispatch — pypy/objspace/descroperation.py:399
+/// `def pow(space, w_obj1, w_obj2, w_obj3)`. Tries the int/long modulus
+/// fast path, then forward `__pow__` and reverse `__rpow__` with the
+/// usual NotImplemented fallback. PyPy's MethodTable lists `pow` with
+/// arity=3 (`('pow', '**', 3, ['__pow__', '__rpow__'])`) so a 3-arg
+/// space op exists for the proxy wrapper to call.
+pub fn pow3(base: PyObjectRef, exp: PyObjectRef, modulus: PyObjectRef) -> PyResult {
+    let base = unwrap_cell(base);
+    let exp = unwrap_cell(exp);
+    let modulus = unwrap_cell(modulus);
+    if unsafe { is_none(modulus) } {
+        return pow(base, exp);
+    }
+    if let Some(result) = try_int_long_pow_with_modulo(base, exp, modulus)? {
+        return Ok(result);
+    }
+    if let Some(result) = try_dispatch_ternary_special(base, exp, modulus, "__pow__", "__rpow__")? {
+        return Ok(result);
+    }
+    Err(binary_builtin_type_error("pow()", base, exp))
+}
+
+/// `divmod(a, b)` dispatch — pypy/interpreter/baseobjspace.py:2159
+/// `('divmod', 'divmod', 2, ['__divmod__', '__rdivmod__'])`. Numeric
+/// fast path then forward + reverse special-method dispatch with the
+/// standard NotImplemented fallback.
+pub fn divmod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    let a = unwrap_cell(a);
+    let b = unwrap_cell(b);
+    unsafe {
+        let lhs_num = is_int(a) || is_long(a) || is_float(a);
+        let rhs_num = is_int(b) || is_long(b) || is_float(b);
+        if lhs_num && rhs_num {
+            let q = floordiv(a, b)?;
+            let r = mod_(a, b)?;
+            return Ok(w_tuple_new(vec![q, r]));
+        }
+    }
+    if let Some(result) = try_dispatch_binary_special(a, b, "__divmod__", "__rdivmod__")? {
+        return Ok(result);
+    }
+    Err(binary_builtin_type_error("divmod()", a, b))
+}
+
+/// pypy/module/__builtin__/abstractinst.py:91-126
+/// `abstract_isinstance_w(space, w_obj, w_klass_or_tuple, allow_override=True)`.
+/// Handles tuple/union recursion, the `__instancecheck__` override
+/// looked up via `space.lookup(w_klass_or_tuple, "__instancecheck__")`,
+/// then the recursive type-MRO walk default.
+pub fn isinstance(obj: PyObjectRef, classinfo: PyObjectRef) -> Result<bool, PyError> {
+    let obj = unwrap_cell(obj);
+    let classinfo = unwrap_cell(classinfo);
+    unsafe {
+        // abstractinst.py:104-106 — quick exact-type test.
+        if let Some(t) = crate::typedef::r#type(obj) {
+            if std::ptr::eq(t, classinfo) {
+                return Ok(true);
+            }
+        }
+        // abstractinst.py:108-114 — tuple recursion.
+        if is_tuple(classinfo) {
+            let n = w_tuple_len(classinfo);
+            for i in 0..n {
+                if let Some(c) = w_tuple_getitem(classinfo, i as i64) {
+                    if isinstance(obj, c)? {
+                        return Ok(true);
+                    }
+                }
+            }
+            return Ok(false);
+        }
+        // PEP 604 `X | Y` union recursion — pypy/objspace/std/union.py.
+        if pyre_object::is_union(classinfo) {
+            let union_args = pyre_object::w_union_get_args(classinfo);
+            let n = w_tuple_len(union_args);
+            for i in 0..n {
+                if let Some(c) = w_tuple_getitem(union_args, i as i64) {
+                    if isinstance(obj, c)? {
+                        return Ok(true);
+                    }
+                }
+            }
+            return Ok(false);
+        }
+        // abstractinst.py:117-124 — `__instancecheck__` override
+        // (`allow_override=True`). PyPy uses
+        // `space.lookup(w_klass_or_tuple, "__instancecheck__")`, which
+        // is a metaclass-MRO lookup (`lookup_in_type(type(cls), …)`),
+        // not `getattr(cls, …)`. The distinction matters for the
+        // weakproxy proxy_typedef_dict row: pyre's `getattr` runs the
+        // `force()` fast path at entry and would dereference the proxy
+        // before the typedef row ever gets a chance to fire. Going
+        // through `lookup_in_type` on `type(classinfo)` keeps the
+        // proxy's typedef wrapper installed via `proxy_typedef_dict`
+        // visible. For real type objects pyre's `type` does not yet
+        // install an `__instancecheck__` slot, so this falls through
+        // to `isinstance_w` below — semantics-equivalent to PyPy's
+        // `type.__instancecheck__` slot calling back into
+        // `p_recursive_isinstance_type_w`.
+        if let Some(cls_type) = crate::typedef::r#type(classinfo) {
+            if let Some(check) = lookup_in_type(cls_type, "__instancecheck__") {
+                let result = crate::call::call_function_impl_result(check, &[classinfo, obj])?;
+                return Ok(is_true(result));
+            }
+        }
+        // abstractinst.py:74-88 — p_recursive_isinstance_type_w default.
+        Ok(isinstance_w(obj, classinfo))
+    }
+}
+
+/// pypy/module/__builtin__/abstractinst.py:172-200
+/// `abstract_issubclass_w(space, w_derived, w_klass_or_tuple, allow_override=True)`.
+/// Tuple/union recursion, `__subclasscheck__` override looked up on
+/// `type(classinfo)`, then the recursive type-MRO walk default.
+pub fn issubclass(derived: PyObjectRef, classinfo: PyObjectRef) -> Result<bool, PyError> {
+    let derived = unwrap_cell(derived);
+    let classinfo = unwrap_cell(classinfo);
+    unsafe {
+        // abstractinst.py:184-188 — tuple recursion.
+        if is_tuple(classinfo) {
+            let n = w_tuple_len(classinfo);
+            for i in 0..n {
+                if let Some(c) = w_tuple_getitem(classinfo, i as i64) {
+                    if issubclass(derived, c)? {
+                        return Ok(true);
+                    }
+                }
+            }
+            return Ok(false);
+        }
+        if pyre_object::is_union(classinfo) {
+            let union_args = pyre_object::w_union_get_args(classinfo);
+            let n = w_tuple_len(union_args);
+            for i in 0..n {
+                if let Some(c) = w_tuple_getitem(union_args, i as i64) {
+                    if issubclass(derived, c)? {
+                        return Ok(true);
+                    }
+                }
+            }
+            return Ok(false);
+        }
+        // abstractinst.py:191-198 — `__subclasscheck__` override.
+        // Same `lookup_in_type(type(classinfo), …)` rationale as
+        // `isinstance` above.
+        if let Some(cls_type) = crate::typedef::r#type(classinfo) {
+            if let Some(check) = lookup_in_type(cls_type, "__subclasscheck__") {
+                let result = crate::call::call_function_impl_result(check, &[classinfo, derived])?;
+                return Ok(is_true(result));
+            }
+        }
+        // p_recursive_issubclass_w default — abstractinst.py:155-169.
+        Ok(issubtype_w(derived, classinfo))
+    }
+}
+
 /// floatobject.py:799-881: `_pow(space, x, y)` parity — raw float power
 /// with Python-correct semantics. Handles NaN/Inf edge cases and raises
 /// ZeroDivisionError / ValueError / OverflowError for domain errors.
