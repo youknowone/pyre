@@ -8,7 +8,8 @@ use std::cell::UnsafeCell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use majit_ir::{AccumVectorInfo, Descr, FailDescr, Type};
+use majit_backend::ExitRecoveryLayout;
+use majit_ir::{AccumVectorInfo, Descr, FailDescr, GuardPendingFieldEntry, RdVirtualInfo, Type};
 
 /// assembler.py: ResumeGuardDescr concrete type for dynasm backend.
 pub struct DynasmFailDescr {
@@ -20,6 +21,20 @@ pub struct DynasmFailDescr {
     /// regalloc parity: fail_locs — maps fail_args[i] to jitframe slot.
     /// None = virtual/unmapped (not in jitframe).
     pub fail_arg_locs: Vec<Option<usize>>,
+
+    /// Trace op index of the guard that produced this exit.
+    pub source_op_index: Option<usize>,
+
+    /// resume.py:450 — compact resume numbering (varint-encoded tagged values).
+    pub rd_numb: Option<Vec<u8>>,
+    /// resume.py:451 — shared constant pool referenced by rd_numb.
+    pub rd_consts: Option<Vec<(i64, Type)>>,
+    /// resume.py:488 — virtual object field info.
+    pub rd_virtuals: Option<Vec<RdVirtualInfo>>,
+    /// Deferred heap writes (SETFIELD_GC/SETARRAYITEM_GC with virtual values).
+    pub rd_pendingfields: Option<Vec<GuardPendingFieldEntry>>,
+    /// Backend-origin recovery layout, built at compile time from fail_arg_types.
+    pub recovery_layout: UnsafeCell<Option<ExitRecoveryLayout>>,
 
     /// compile.py:685 status: packs ST_BUSY_FLAG + type tag + hash.
     pub status: AtomicU64,
@@ -60,6 +75,12 @@ impl DynasmFailDescr {
             fail_arg_types,
             is_finish,
             fail_arg_locs: Vec::new(),
+            source_op_index: None,
+            rd_numb: None,
+            rd_consts: None,
+            rd_virtuals: None,
+            rd_pendingfields: None,
+            recovery_layout: UnsafeCell::new(None),
             status: AtomicU64::new(0),
             adr_jump_offset: UnsafeCell::new(0),
             bridge_addr: UnsafeCell::new(0),
@@ -111,6 +132,37 @@ impl DynasmFailDescr {
     /// Set the bridge address after patching.
     pub fn set_bridge_addr(&self, addr: usize) {
         unsafe { *self.bridge_addr.get() = addr };
+    }
+
+    /// Read the recovery_layout.
+    pub fn recovery_layout(&self) -> Option<ExitRecoveryLayout> {
+        unsafe { &*self.recovery_layout.get() }.clone()
+    }
+
+    /// Set the recovery_layout.
+    pub fn set_recovery_layout(&self, layout: ExitRecoveryLayout) {
+        unsafe { *self.recovery_layout.get() = Some(layout) };
+    }
+
+    /// Build a FailDescrLayout for this descriptor (parity with CraneliftFailDescr::layout).
+    pub fn layout(&self) -> majit_backend::FailDescrLayout {
+        majit_backend::FailDescrLayout {
+            fail_index: self.fail_index,
+            fail_arg_types: self.fail_arg_types.clone(),
+            is_finish: self.is_finish,
+            trace_id: self.trace_id,
+            source_op_index: self.source_op_index,
+            gc_ref_slots: self
+                .fail_arg_types
+                .iter()
+                .enumerate()
+                .filter_map(|(i, tp)| (*tp == Type::Ref).then_some(i))
+                .collect(),
+            force_token_slots: Vec::new(),
+            frame_stack: None,
+            recovery_layout: self.recovery_layout(),
+            trace_info: None,
+        }
     }
 }
 

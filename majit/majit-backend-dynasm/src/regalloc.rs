@@ -772,36 +772,64 @@ impl RegisterManager {
     }
 
     /// RegBindingsDict.__setitem__
+    /// regalloc.py:281-288 RegBindingsDict.__setitem__
     pub fn reg_bindings_set(&mut self, v: OpRef, reg: RegLoc, longevity: &mut LifetimeManager) {
-        let index = self._register_index(reg);
+        let new_index = self._register_index(reg);
+        // regalloc.py:284-286: clear variable's OLD register slot first.
+        let old_index = longevity
+            .get(v)
+            .map(|lt| lt.current_register_index)
+            .unwrap_or(-1);
+        if old_index >= 0 {
+            self.reg_bindings_list[old_index as usize] = None;
+        }
+        // Clear new slot's old occupant's register index.
+        if let Some(old_v) = self.reg_bindings_list[new_index] {
+            if old_v != v {
+                if let Some(lt) = longevity.get_mut(old_v) {
+                    lt.current_register_index = -1;
+                }
+            }
+        }
+        // regalloc.py:287-288: set new binding.
         let lifetime = longevity
             .get_mut(v)
             .expect("reg_bindings_set: not in longevity");
-        lifetime.current_register_index = index as i32;
-        self.reg_bindings_list[index] = Some(v);
+        lifetime.current_register_index = new_index as i32;
+        self.reg_bindings_list[new_index] = Some(v);
     }
 
-    /// RegBindingsDict.__delitem__
+    /// regalloc.py:290-297 RegBindingsDict.__delitem__
     pub fn reg_bindings_del(&mut self, v: OpRef, longevity: &mut LifetimeManager) {
         let lifetime = longevity
             .get_mut(v)
             .expect("reg_bindings_del: not in longevity");
         let index = lifetime.current_register_index;
-        debug_assert!(index >= 0, "reg_bindings_del: not in register");
-        lifetime.current_register_index = -1;
+        assert!(
+            index >= 0,
+            "reg_bindings_del: {:?} not in register (index={})",
+            v,
+            index
+        );
         self.reg_bindings_list[index as usize] = None;
+        lifetime.current_register_index = -1;
     }
 
-    /// RegBindingsDict.pop
+    /// regalloc.py:269-278 RegBindingsDict.pop
     pub fn reg_bindings_pop(&mut self, v: OpRef, longevity: &mut LifetimeManager) -> RegLoc {
         let lifetime = longevity
             .get_mut(v)
             .expect("reg_bindings_pop: not in longevity");
         let index = lifetime.current_register_index;
-        debug_assert!(index >= 0, "reg_bindings_pop: not in register");
-        lifetime.current_register_index = -1;
+        assert!(
+            index >= 0,
+            "reg_bindings_pop: {:?} not in register (index={})",
+            v,
+            index
+        );
         let reg = self.all_regs[index as usize];
         self.reg_bindings_list[index as usize] = None;
+        lifetime.current_register_index = -1;
         reg
     }
 

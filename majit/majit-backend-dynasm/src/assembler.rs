@@ -22,7 +22,7 @@ use dynasmrt::aarch64::Assembler;
 use dynasmrt::x64::Assembler;
 use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, ExecutableBuffer, dynasm};
 
-use majit_backend::BackendError;
+use majit_backend::{BackendError, ExitFrameLayout, ExitRecoveryLayout, ExitValueSourceLayout};
 use majit_ir::{FailDescr, InputArg, Op, OpCode, OpRef, Type};
 
 use crate::arch::*;
@@ -183,6 +183,11 @@ pub struct CompiledCode {
     /// Used by bridge JUMP to return to the loop. RPython stores
     /// this as TargetToken._ll_loop_code.
     pub label_addr: usize,
+    /// regalloc.py:1396 descr._x86_arglocs parity:
+    /// LABEL inputarg locations the body code expects on entry.
+    /// Bridges read these via compile_bridge → set_loop_arglocs so
+    /// their closing JUMP places values in the right registers/slots.
+    pub loop_arglocs: Vec<Loc>,
 }
 
 impl Assembler386 {
@@ -806,6 +811,7 @@ impl Assembler386 {
             header_pc: self.header_pc,
             frame_depth: std::sync::atomic::AtomicUsize::new(self.frame_depth),
             label_addr,
+            loop_arglocs: self.loop_arglocs,
         })
     }
 
@@ -814,6 +820,15 @@ impl Assembler386 {
     /// the original loop's LABEL via absolute address.
     pub fn set_jump_target_addr(&mut self, addr: usize) {
         self.jump_target_addr = Some(addr);
+    }
+
+    /// regalloc.py:1308 `arglocs = descr._x86_arglocs` parity:
+    /// inject the main loop's LABEL arglocs so the bridge's closing
+    /// JUMP places its arguments in the locations the body LABEL
+    /// expects (registers and frame slots), instead of falling back
+    /// to a sequential frame layout.
+    pub fn set_loop_arglocs(&mut self, locs: Vec<Loc>) {
+        self.loop_arglocs = locs;
     }
 
     /// assembler.py:320 descr._ll_function_addr parity: store
@@ -859,6 +874,7 @@ impl Assembler386 {
             header_pc: self.header_pc,
             frame_depth: std::sync::atomic::AtomicUsize::new(self.frame_depth),
             label_addr: 0,
+            loop_arglocs: Vec::new(),
         })
     }
 
@@ -968,6 +984,7 @@ impl Assembler386 {
                     }
                     self.regalloc_perform_guard(
                         op,
+                        *op_index,
                         arglocs,
                         result_loc.as_ref(),
                         faillocs,
@@ -1649,6 +1666,7 @@ impl Assembler386 {
     fn regalloc_perform_guard(
         &mut self,
         op: &Op,
+        op_index: usize,
         arglocs: &[Loc],
         result_loc: Option<&Loc>,
         faillocs: &[Option<Loc>],
@@ -1661,31 +1679,31 @@ impl Assembler386 {
                     self.emit_test_loc(loc);
                     self.guard_success_cc = Some(CC_NE);
                 }
-                self.implement_guard_with_faillocs(op, fail_index, faillocs);
+                self.implement_guard_with_faillocs(op, op_index, fail_index, faillocs);
             }
             OpCode::GuardFalse | OpCode::VecGuardFalse | OpCode::GuardIsnull => {
                 if let Some(loc) = arglocs.first() {
                     self.emit_test_loc(loc);
                     self.guard_success_cc = Some(CC_E);
                 }
-                self.implement_guard_with_faillocs(op, fail_index, faillocs);
+                self.implement_guard_with_faillocs(op, op_index, fail_index, faillocs);
             }
             OpCode::GuardValue => {
                 if arglocs.len() >= 2 {
                     self.emit_cmp_loc_loc(&arglocs[0], &arglocs[1]);
                     self.guard_success_cc = Some(CC_E);
                 }
-                self.implement_guard_with_faillocs(op, fail_index, faillocs);
+                self.implement_guard_with_faillocs(op, op_index, fail_index, faillocs);
             }
             OpCode::GuardClass | OpCode::GuardNonnullClass | OpCode::GuardGcType => {
                 if arglocs.len() >= 2 {
                     self._cmp_guard_class(&arglocs[0], &arglocs[1]);
                     self.guard_success_cc = Some(CC_E);
                 }
-                self.implement_guard_with_faillocs(op, fail_index, faillocs);
+                self.implement_guard_with_faillocs(op, op_index, fail_index, faillocs);
             }
             OpCode::GuardNoException | OpCode::GuardNoOverflow | OpCode::GuardOverflow => {
-                self.implement_guard_nojump_with_faillocs(op, fail_index, faillocs);
+                self.implement_guard_nojump_with_faillocs(op, op_index, fail_index, faillocs);
             }
             OpCode::GuardNotForced | OpCode::GuardNotForced2 => {
                 #[cfg(target_arch = "x86_64")]
@@ -1693,13 +1711,13 @@ impl Assembler386 {
                 #[cfg(target_arch = "aarch64")]
                 dynasm!(self.mc ; .arch aarch64 ; ldr X(16), [x29] ; cmp X(16), xzr);
                 self.guard_success_cc = Some(CC_E);
-                self.implement_guard_with_faillocs(op, fail_index, faillocs);
+                self.implement_guard_with_faillocs(op, op_index, fail_index, faillocs);
             }
             OpCode::GuardNotInvalidated => {
-                self.implement_guard_nojump_with_faillocs(op, fail_index, faillocs);
+                self.implement_guard_nojump_with_faillocs(op, op_index, fail_index, faillocs);
             }
             _ => {
-                self.implement_guard_nojump_with_faillocs(op, fail_index, faillocs);
+                self.implement_guard_nojump_with_faillocs(op, op_index, fail_index, faillocs);
             }
         }
     }
@@ -1881,6 +1899,7 @@ impl Assembler386 {
     fn implement_guard_with_faillocs(
         &mut self,
         op: &Op,
+        op_index: usize,
         fail_index: u32,
         faillocs: &[Option<Loc>],
     ) {
@@ -1890,24 +1909,26 @@ impl Assembler386 {
             .expect("implement_guard_with_faillocs: guard_success_cc not set");
         let fail_cc = invert_cc(cc);
         let fail_label = self.emit_guard_jcc(fail_cc);
-        self.append_guard_token_with_faillocs(op, fail_index, fail_label, faillocs);
+        self.append_guard_token_with_faillocs(op, op_index, fail_index, fail_label, faillocs);
     }
 
     /// Guard no-jump with faillocs.
     fn implement_guard_nojump_with_faillocs(
         &mut self,
         op: &Op,
+        op_index: usize,
         fail_index: u32,
         faillocs: &[Option<Loc>],
     ) {
         let fail_label = self.mc.new_dynamic_label();
-        self.append_guard_token_with_faillocs(op, fail_index, fail_label, faillocs);
+        self.append_guard_token_with_faillocs(op, op_index, fail_index, fail_label, faillocs);
     }
 
     /// Append guard token with regalloc faillocs instead of opref_to_slot snapshot.
     fn append_guard_token_with_faillocs(
         &mut self,
         op: &Op,
+        op_index: usize,
         fail_index: u32,
         fail_label: DynamicLabel,
         faillocs: &[Option<Loc>],
@@ -1949,9 +1970,33 @@ impl Assembler386 {
                 _ => None,
             })
             .collect();
+        // Build identity recovery_layout (Cranelift identity_recovery_layout parity).
+        let recovery_layout = {
+            let slot_types = &descr.fail_arg_types;
+            ExitRecoveryLayout {
+                frames: vec![ExitFrameLayout {
+                    trace_id: Some(self.trace_id),
+                    header_pc: Some(self.header_pc),
+                    source_guard: None,
+                    pc: self.header_pc,
+                    slots: (0..slot_types.len())
+                        .map(ExitValueSourceLayout::ExitValue)
+                        .collect(),
+                    slot_types: Some(slot_types.clone()),
+                }],
+                virtual_layouts: vec![],
+                pending_field_layouts: vec![],
+            }
+        };
         unsafe {
             let descr_mut = &mut *(Arc::as_ptr(&descr) as *mut DynasmFailDescr);
             descr_mut.fail_arg_locs = fail_arg_locs;
+            descr_mut.source_op_index = Some(op_index);
+            descr_mut.rd_numb = op.rd_numb.clone();
+            descr_mut.rd_consts = op.rd_consts.clone();
+            descr_mut.rd_virtuals = op.rd_virtuals.clone();
+            descr_mut.rd_pendingfields = op.rd_pendingfields.clone();
+            *descr_mut.recovery_layout.get_mut() = Some(recovery_layout);
         }
 
         self.pending_guard_tokens.push(GuardToken {
