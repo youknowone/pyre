@@ -214,7 +214,22 @@ pub trait JitState: Sized {
     /// Called after rebuild_from_resumedata to map frame locals to bridge
     /// InputArg OpRefs. In RPython, MIFrame.registers are populated with
     /// InputArg/Const boxes from rebuild; this is the Rust equivalent.
-    fn setup_bridge_sym(_sym: &mut Self::Sym, _resume_data: &ResumeDataResult) {}
+    ///
+    /// `ctx` is the bridge's active trace context. When `resume_data` carries
+    /// `RebuiltValue::Virtual` entries, the implementation must emit
+    /// `NEW_WITH_VTABLE`/`SETFIELD_GC` ops via `ctx` to materialize each
+    /// virtual at trace start, mirroring RPython's
+    /// `ResumeDataBoxReader.consume_boxes` → `rd_virtuals[i].allocate(...)`
+    /// → `metainterp.execute_new_with_vtable` (resume.py:945-956 getvirtual_ptr).
+    /// `rd_virtuals` is the parent guard's virtual descriptor table from
+    /// the source trace's exit layout (None when the parent had no virtuals).
+    fn setup_bridge_sym(
+        _sym: &mut Self::Sym,
+        _ctx: &mut crate::trace_ctx::TraceCtx,
+        _resume_data: &ResumeDataResult,
+        _rd_virtuals: Option<&[majit_ir::RdVirtualInfo]>,
+    ) {
+    }
 
     /// resume.py:1042-1057 rebuild_from_resumedata: decode rd_numb to
     /// reconstruct the complete frame state for bridge tracing.

@@ -2660,9 +2660,15 @@ impl<S: JitState> JitDriver<S> {
         }
         // resume.py:1042 parity: map frame locals to bridge InputArg OpRefs
         // so bridge tracing sees locals as symbolic variables, not concrete values.
+        // resume.py:945-956 getvirtual_ptr parity: when frame.values contains
+        // RebuiltValue::Virtual entries, setup_bridge_sym must emit
+        // NEW_WITH_VTABLE/SETFIELD_GC ops via the active trace ctx so the
+        // bridge has fresh local instances instead of stale vable-array reads.
         if let Some(ref bfm) = resume_data_result {
-            if let Some(ref mut sym) = self.sym {
-                S::setup_bridge_sym(sym, bfm);
+            if let (Some(ref mut sym), Some(ref mut ctx)) =
+                (self.sym.as_mut(), self.meta.tracing.as_mut())
+            {
+                S::setup_bridge_sym(sym, ctx, bfm, retrace.rd_virtuals.as_deref());
             }
         }
         self.trace_meta = Some(trace_meta);
