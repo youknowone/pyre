@@ -848,35 +848,54 @@ impl VirtualState {
                 Ok(())
             }
             VirtualStateInfo::VArrayStruct { element_fields, .. } => {
-                // virtualstate.py:333-354 VArrayStructStateInfo.enum_forced_boxes.
+                // virtualstate.py:333-354 VArrayStructStateInfo.enum_forced_boxes:
+                //   for i in range(self.length):
+                //       for descr in self.fielddescrs:
+                //           index = i * len(self.fielddescrs) + descr.get_index()
+                //           fieldstate = self.fieldstate[index]
+                //           itembox = opinfo._items[i * len(self.fielddescrs) +
+                //                                   descr.get_index()]
+                //           if fieldstate is None:
+                //               if itembox is not None:
+                //                   raise VirtualStatesCantMatch
+                //               continue
+                //           if fieldstate.position > self.position:
+                //               fieldstate.enum_forced_boxes(boxes, itembox, ...)
                 //
-                // RPython distinguishes fieldstate=None (no slot) from
-                // Unknown (real LEVEL_UNKNOWN leaf with a slot). Rust's
-                // export_single_value never produces "no slot" — every
-                // field index in `element_fields` already has an
-                // Rc<VirtualStateInfo>, with OpRef::NONE field refs
-                // exported as Unknown leaves. We therefore treat every
-                // entry in element_fields as a present fieldstate and
-                // walk it through enum_forced_boxes_recurse, which keeps
-                // the slot allocation consistent with
-                // `build_sequential_slot_schedule`. RPython's
-                // `if fieldstate is None: ... raise if itembox is not None`
-                // mismatch detection collapses to a no-op here; restoring
-                // it would require an explicit Option wrapper on the
-                // field type — tracked separately as a follow-up.
+                // pyre stores element_fields sparsely: each inner Vec only
+                // contains the fields that have a state. The "fieldstate is
+                // None" case corresponds to a field_idx present in the
+                // runtime's vinfo but absent from the state's element_fields,
+                // which signals a schema mismatch.
                 let resolved = ctx.get_box_replacement(opref);
-                let is_virtual = ctx
-                    .get_ptr_info(resolved)
-                    .map_or(false, |pi| pi.is_virtual());
-                if !is_virtual {
+                let runtime_fields: Vec<Vec<(u32, OpRef)>> = match ctx.get_ptr_info(resolved) {
+                    Some(crate::optimizeopt::info::PtrInfo::VirtualArrayStruct(vinfo)) => {
+                        vinfo.element_fields.clone()
+                    }
+                    _ => return Err(()),
+                };
+                if runtime_fields.len() != element_fields.len() {
                     return Err(());
                 }
-                let mut flat_index = 0usize;
-                for fields in element_fields {
-                    for (_, field_state) in fields {
-                        let item_ref = ctx
-                            .get_ptr_info(resolved)
-                            .and_then(|info| info.getitem(flat_index))
+                for (elem_idx, fields) in element_fields.iter().enumerate() {
+                    let runtime_elem = &runtime_fields[elem_idx];
+                    // virtualstate.py:347-349: if fieldstate is None and
+                    // itembox is not None → raise. In pyre's sparse model,
+                    // a runtime field absent from the state's element_fields
+                    // is the equivalent mismatch.
+                    for (rt_field_idx, _) in runtime_elem {
+                        if !fields.iter().any(|(fdidx, _)| fdidx == rt_field_idx) {
+                            return Err(());
+                        }
+                    }
+                    for (field_idx, field_state) in fields {
+                        // Look up the runtime ref via the proper interior
+                        // accessor (info.py:_compute_index parity), not the
+                        // VirtualArray-only `getitem(flat_index)` helper.
+                        let item_ref = runtime_elem
+                            .iter()
+                            .find(|(fdidx, _)| fdidx == field_idx)
+                            .map(|(_, op)| *op)
                             .unwrap_or(OpRef::NONE);
                         Self::enum_forced_boxes_recurse(
                             field_state,
@@ -890,7 +909,6 @@ impl VirtualState {
                             slot_cursor,
                             visited,
                         )?;
-                        flat_index += 1;
                     }
                 }
                 Ok(())
@@ -1079,13 +1097,29 @@ impl VirtualState {
                 }
             }
             VirtualStateInfo::VArrayStruct { element_fields, .. } => {
+                // Mirrors enum_forced_boxes_recurse for VArrayStruct: look
+                // up the runtime ref via the field_idx-keyed sparse map
+                // (info.py:_compute_index parity), not the broken
+                // VirtualArray-only `getitem(flat_index)` accessor.
                 let resolved = ctx.get_box_replacement(opref);
-                let ptr_info = ctx.get_ptr_info(resolved);
-                let mut flat_index = 0usize;
-                for fields in element_fields {
-                    for (_, field_state) in fields {
-                        let item_ref = ptr_info
-                            .and_then(|info| info.getitem(flat_index))
+                let runtime_fields: Option<Vec<Vec<(u32, OpRef)>>> =
+                    match ctx.get_ptr_info(resolved) {
+                        Some(crate::optimizeopt::info::PtrInfo::VirtualArrayStruct(vinfo)) => {
+                            Some(vinfo.element_fields.clone())
+                        }
+                        _ => None,
+                    };
+                for (elem_idx, fields) in element_fields.iter().enumerate() {
+                    for (field_idx, field_state) in fields {
+                        let item_ref = runtime_fields
+                            .as_ref()
+                            .and_then(|rf| rf.get(elem_idx))
+                            .and_then(|rt_elem| {
+                                rt_elem
+                                    .iter()
+                                    .find(|(fdidx, _)| fdidx == field_idx)
+                                    .map(|(_, op)| *op)
+                            })
                             .unwrap_or(OpRef::NONE);
                         Self::enum_inputarg_source_slots_recurse(
                             field_state,
@@ -1097,7 +1131,6 @@ impl VirtualState {
                             slot_cursor,
                             visited,
                         );
-                        flat_index += 1;
                     }
                 }
             }
