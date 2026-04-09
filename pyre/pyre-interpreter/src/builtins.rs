@@ -747,7 +747,7 @@ fn builtin_abs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 }
 
 /// Convert an int or long object to BigInt for comparison.
-unsafe fn obj_to_bigint(obj: PyObjectRef) -> BigInt {
+pub(crate) unsafe fn obj_to_bigint(obj: PyObjectRef) -> BigInt {
     unsafe {
         if is_int(obj) {
             BigInt::from(w_int_get_value(obj))
@@ -998,127 +998,44 @@ fn type_descr_new_with_metaclass(
     Ok(box_str_constant(name))
 }
 
-/// `isinstance(obj, cls)` — type check supporting user-defined classes.
-///
-/// PyPy: baseobjspace.py `isinstance_w` → check MRO chain.
+/// `isinstance(obj, cls)` — pypy/module/__builtin__/abstractinst.py
+/// `app_isinstance` → `abstract_isinstance_w(allow_override=True)`.
 fn builtin_isinstance(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() == 2, "isinstance() takes exactly two arguments");
-    let obj = args[0];
-    let cls = args[1];
-
-    // isinstance(obj, (cls1, cls2, ...)) — any match
-    if unsafe { is_tuple(cls) } {
-        let len = unsafe { w_tuple_len(cls) };
-        for i in 0..len {
-            if let Some(c) = unsafe { w_tuple_getitem(cls, i as i64) } {
-                if isinstance_w(obj, c) {
-                    return Ok(w_bool_from(true));
-                }
-            }
-        }
-        return Ok(w_bool_from(false));
-    }
-
-    // isinstance(obj, int | str) — UnionType
-    // PyPy: UnionType.__instancecheck__
-    if unsafe { pyre_object::is_union(cls) } {
-        let args = unsafe { pyre_object::w_union_get_args(cls) };
-        let len = unsafe { w_tuple_len(args) };
-        for i in 0..len {
-            if let Some(c) = unsafe { w_tuple_getitem(args, i as i64) } {
-                if isinstance_w(obj, c) {
-                    return Ok(w_bool_from(true));
-                }
-            }
-        }
-        return Ok(w_bool_from(false));
-    }
-
-    Ok(w_bool_from(isinstance_w(obj, cls)))
+    Ok(w_bool_from(crate::baseobjspace::isinstance(
+        args[0], args[1],
+    )?))
 }
 
 /// isinstance(obj, cls) for JIT fast path.
 ///
 /// Returns Some(bool) if the check can be resolved, None if cls format
 /// is not supported for the fast path (e.g. tuple of types).
-/// Uses the same MRO-based issubtype_w as builtin_isinstance.
+/// Uses the same MRO-based `issubtype_w` as the full dispatch.
 pub fn call_isinstance(obj: PyObjectRef, cls: PyObjectRef) -> Option<bool> {
     unsafe {
         if is_type(cls) {
-            return Some(isinstance_w(obj, cls));
+            return Some(crate::baseobjspace::isinstance_w(obj, cls));
         }
     }
     None
 }
 
-/// Single-type isinstance check.
-///
-/// PyPy abstractinst.py: p_recursive_isinstance_type_w uses
-/// space.type(w_obj) which respects __class__ override.
-fn isinstance_w(obj: PyObjectRef, cls: PyObjectRef) -> bool {
-    unsafe {
-        if !is_type(cls) {
-            return false;
-        }
-        let w_obj_type = match crate::typedef::r#type(obj) {
-            Some(t) => t,
-            None => return false,
-        };
-        issubtype_w(w_obj_type, cls)
-    }
-}
-
-/// `issubclass(cls, classinfo)` — PyPy: baseobjspace.py `issubtype_w`
+/// `issubclass(cls, classinfo)` — pypy/module/__builtin__/abstractinst.py
+/// `app_issubclass` → `abstract_issubclass_w(allow_override=True)`.
 fn builtin_issubclass(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() == 2, "issubclass() takes exactly two arguments");
-    let cls = args[0];
-    let classinfo = args[1];
-    if unsafe { is_tuple(classinfo) } {
-        let len = unsafe { w_tuple_len(classinfo) };
-        for i in 0..len {
-            if let Some(c) = unsafe { w_tuple_getitem(classinfo, i as i64) } {
-                if unsafe { issubtype_w(cls, c) } {
-                    return Ok(w_bool_from(true));
-                }
-            }
-        }
-        return Ok(w_bool_from(false));
-    }
-    // issubclass(cls, int | str) — UnionType
-    // PyPy: UnionType.__subclasscheck__
-    if unsafe { pyre_object::is_union(classinfo) } {
-        let args = unsafe { pyre_object::w_union_get_args(classinfo) };
-        let len = unsafe { w_tuple_len(args) };
-        for i in 0..len {
-            if let Some(c) = unsafe { w_tuple_getitem(args, i as i64) } {
-                if unsafe { issubtype_w(cls, c) } {
-                    return Ok(w_bool_from(true));
-                }
-            }
-        }
-        return Ok(w_bool_from(false));
-    }
-    Ok(w_bool_from(unsafe { issubtype_w(cls, classinfo) }))
+    Ok(w_bool_from(crate::baseobjspace::issubclass(
+        args[0], args[1],
+    )?))
 }
 
-/// Check if w_type is cls or a subtype of cls by walking the C3 MRO.
-///
-/// PyPy: baseobjspace.py `issubtype_w` → checks `cls in w_type.mro_w`.
-/// Uses the cached MRO (PyPy: w_type.mro_w) for O(n) lookup.
-unsafe fn issubtype_w(w_type: PyObjectRef, cls: PyObjectRef) -> bool {
-    if w_type.is_null() || !is_type(w_type) {
-        return false;
-    }
-    // Use cached MRO first (PyPy: w_type.mro_w)
-    let mro_ptr = w_type_get_mro(w_type);
-    if !mro_ptr.is_null() {
-        return (*mro_ptr).iter().any(|&t| std::ptr::eq(t, cls));
-    }
-    // Fallback: compute MRO
-    crate::baseobjspace::compute_default_mro(w_type)
-        .iter()
-        .any(|&t| std::ptr::eq(t, cls))
-}
+// Descroperation helpers (lookup_type_special, should_try_reverse_first,
+// try_dispatch_binary_special, try_dispatch_ternary_special,
+// try_int_long_pow_with_modulo, binary_builtin_type_error,
+// box_bigint_result, issubtype_w) live in `crate::baseobjspace` because
+// they are space-level semantics shared between the builtin module,
+// weakproxy wrappers, and any future opcode dispatch.
 
 /// Exception type constructor — called as e.g. `ValueError("msg")`.
 /// Extracts the message from the first argument and creates a W_ExceptionObject.
@@ -2486,27 +2403,20 @@ fn builtin_round(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     panic!("round() not supported for this type");
 }
 
-/// `divmod(a, b)` — PyPy: baseobjspace.py divmod
+/// `divmod(a, b)` — pypy/interpreter/baseobjspace.py:2159 divmod row.
 fn builtin_divmod(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() == 2, "divmod() takes exactly two arguments");
-    unsafe {
-        if is_int(args[0]) && is_int(args[1]) {
-            let a = w_int_get_value(args[0]);
-            let b = w_int_get_value(args[1]);
-            assert!(b != 0, "integer division or modulo by zero");
-            return Ok(w_tuple_new(vec![
-                w_int_new(a.div_euclid(b)),
-                w_int_new(a.rem_euclid(b)),
-            ]));
-        }
-    }
-    panic!("divmod() not supported for these types");
+    crate::baseobjspace::divmod(args[0], args[1])
 }
 
-/// `pow(base, exp)` — PyPy: baseobjspace.py pow
+/// `pow(base, exp[, mod])` — pypy/interpreter/baseobjspace.py:2160 pow row.
 fn builtin_pow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() >= 2, "pow() takes at least two arguments");
-    crate::baseobjspace::pow(args[0], args[1])
+    if args.len() >= 3 && !unsafe { is_none(args[2]) } {
+        crate::baseobjspace::pow3(args[0], args[1], args[2])
+    } else {
+        crate::baseobjspace::pow(args[0], args[1])
+    }
 }
 
 /// `hex(x)` — PyPy: operation.py hex
@@ -2579,4 +2489,92 @@ fn builtin_import_stub(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
         }
     });
     crate::importing::importhook(name, globals, fromlist, level, exec_ctx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_builtin_divmod_delegates_through_proxy() {
+        crate::typedef::init_typeobjects();
+        let proxy = crate::module::_weakref::interp_weakref::W_Proxy_new(w_int_new(5), PY_NULL);
+        let result = builtin_divmod(&[proxy, w_int_new(3)]).unwrap();
+        assert_eq!(
+            unsafe { w_int_get_value(w_tuple_getitem(result, 0).unwrap()) },
+            1
+        );
+        assert_eq!(
+            unsafe { w_int_get_value(w_tuple_getitem(result, 1).unwrap()) },
+            2
+        );
+    }
+
+    #[test]
+    fn test_builtin_divmod_allows_lhs_dunder_before_dead_proxy_rhs() {
+        crate::typedef::init_typeobjects();
+        let user_type = crate::typedef::make_builtin_type("DivmodLhs", |ns| {
+            crate::namespace_store(
+                ns,
+                "__divmod__",
+                make_builtin_function("__divmod__", |_| {
+                    Ok(w_tuple_new(vec![w_int_new(41), w_int_new(1)]))
+                }),
+            );
+        });
+        let lhs = pyre_object::instanceobject::w_instance_new(user_type);
+        let dead_proxy = crate::module::_weakref::interp_weakref::W_Proxy_new(w_none(), PY_NULL);
+        let result = builtin_divmod(&[lhs, dead_proxy]).unwrap();
+        assert_eq!(
+            unsafe { w_int_get_value(w_tuple_getitem(result, 0).unwrap()) },
+            41
+        );
+        assert_eq!(
+            unsafe { w_int_get_value(w_tuple_getitem(result, 1).unwrap()) },
+            1
+        );
+    }
+
+    #[test]
+    fn test_builtin_pow_three_arg_delegates_through_proxy() {
+        crate::typedef::init_typeobjects();
+        let proxy = crate::module::_weakref::interp_weakref::W_Proxy_new(w_int_new(5), PY_NULL);
+        let result = builtin_pow(&[proxy, w_int_new(3), w_int_new(13)]).unwrap();
+        assert_eq!(unsafe { w_int_get_value(result) }, 8);
+    }
+
+    #[test]
+    fn test_builtin_pow_two_arg_delegates_through_proxy() {
+        crate::typedef::init_typeobjects();
+        let proxy = crate::module::_weakref::interp_weakref::W_Proxy_new(w_int_new(5), PY_NULL);
+        let result = builtin_pow(&[proxy, w_int_new(3)]).unwrap();
+        assert_eq!(unsafe { w_int_get_value(result) }, 125);
+    }
+
+    #[test]
+    fn test_builtin_pow_three_arg_allows_lhs_dunder_before_dead_proxy_exp() {
+        crate::typedef::init_typeobjects();
+        let user_type = crate::typedef::make_builtin_type("PowLhs", |ns| {
+            crate::namespace_store(
+                ns,
+                "__pow__",
+                make_builtin_function("__pow__", |_| Ok(w_int_new(99))),
+            );
+        });
+        let lhs = pyre_object::instanceobject::w_instance_new(user_type);
+        let dead_proxy = crate::module::_weakref::interp_weakref::W_Proxy_new(w_none(), PY_NULL);
+        let result = builtin_pow(&[lhs, dead_proxy, w_int_new(7)]).unwrap();
+        assert_eq!(unsafe { w_int_get_value(result) }, 99);
+    }
+
+    #[test]
+    fn test_builtin_pow_three_arg_rejects_negative_exponent() {
+        crate::typedef::init_typeobjects();
+        let err = builtin_pow(&[w_int_new(5), w_int_new(-1), w_int_new(13)]).unwrap_err();
+        assert_eq!(err.kind, crate::PyErrorKind::TypeError);
+        assert_eq!(
+            err.message,
+            "pow() 2nd argument cannot be negative when 3rd argument specified"
+        );
+    }
 }

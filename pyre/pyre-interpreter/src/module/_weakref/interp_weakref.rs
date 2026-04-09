@@ -1008,8 +1008,38 @@ proxy_binary!(proxy_floordiv, crate::baseobjspace::floordiv);
 proxy_binary_reflected!(proxy_rfloordiv, crate::baseobjspace::floordiv);
 proxy_binary!(proxy_mod, crate::baseobjspace::mod_);
 proxy_binary_reflected!(proxy_rmod, crate::baseobjspace::mod_);
-proxy_binary!(proxy_pow, crate::baseobjspace::pow);
-proxy_binary_reflected!(proxy_rpow, crate::baseobjspace::pow);
+// pow / rpow — interp__weakref.py:363 generates a 3-arg wrapper because
+// `('pow', '**', 3, ['__pow__', '__rpow__'])` has arity=3 but
+// `forcing_count = len(special_methods) = 2`, so the optional modulo
+// operand passes through unforced. The wrapper hands the result to
+// `space.pow(w_obj0, w_obj1, w_obj2)` (descroperation.py:399), so
+// NotImplemented from forward `__pow__` properly falls through to the
+// reflected `__rpow__` and vice versa.
+pub fn proxy_pow(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    let w_obj0 = force(args[0])?;
+    let w_obj1 = force(args[1])?;
+    let has_modulo =
+        args.len() >= 3 && !args[2].is_null() && !unsafe { pyre_object::is_none(args[2]) };
+    if has_modulo {
+        crate::baseobjspace::pow3(w_obj0, w_obj1, args[2])
+    } else {
+        crate::baseobjspace::pow(w_obj0, w_obj1)
+    }
+}
+
+pub fn proxy_rpow(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    // interp__weakref.py:382-385 — reflected wrapper swaps the first
+    // two operands; the modulo argument keeps its slot.
+    let w_obj0 = force(args[0])?;
+    let w_obj1 = force(args[1])?;
+    let has_modulo =
+        args.len() >= 3 && !args[2].is_null() && !unsafe { pyre_object::is_none(args[2]) };
+    if has_modulo {
+        crate::baseobjspace::pow3(w_obj1, w_obj0, args[2])
+    } else {
+        crate::baseobjspace::pow(w_obj1, w_obj0)
+    }
+}
 proxy_binary!(proxy_lshift, crate::baseobjspace::lshift);
 proxy_binary_reflected!(proxy_rlshift, crate::baseobjspace::lshift);
 proxy_binary!(proxy_rshift, crate::baseobjspace::rshift);
@@ -1112,39 +1142,37 @@ pub fn proxy_delattr(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     crate::baseobjspace::delattr(w_obj0, name)
 }
 
-// Item ops.
+// Item ops — interp__weakref.py:365 single special method, so
+// `forcing_count = len(special_methods) = 1`. The index/value operands
+// pass through unchanged so weakproxy/dead-proxy keys and values reach
+// the referent's __getitem__/__setitem__/__delitem__ unmodified.
 pub fn proxy_getitem(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let w_obj0 = force(args[0])?;
-    let w_obj1 = force(args[1])?;
-    crate::baseobjspace::getitem(w_obj0, w_obj1)
+    crate::baseobjspace::getitem(w_obj0, args[1])
 }
 
 pub fn proxy_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let w_obj0 = force(args[0])?;
-    let w_obj1 = force(args[1])?;
-    let w_obj2 = force(args[2])?;
-    crate::baseobjspace::setitem(w_obj0, w_obj1, w_obj2)
+    crate::baseobjspace::setitem(w_obj0, args[1], args[2])
 }
 
 pub fn proxy_delitem(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let w_obj0 = force(args[0])?;
-    let w_obj1 = force(args[1])?;
-    crate::baseobjspace::delitem(w_obj0, w_obj1)?;
+    crate::baseobjspace::delitem(w_obj0, args[1])?;
     Ok(pyre_object::w_none())
 }
 
-// __format__(self, format_spec).
+// __format__(self, format_spec) — single special method, force self only.
 pub fn proxy_format(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let w_obj0 = force(args[0])?;
-    let w_obj1 = force(args[1])?;
-    forward_to_dunder(w_obj0, "__format__", &[w_obj1])
+    forward_to_dunder(w_obj0, "__format__", &[args[1]])
 }
 
-// __contains__(self, needle) — pyre's contains returns Result<bool>.
+// __contains__(self, needle) — single special method, force self only.
+// pyre's contains returns Result<bool>.
 pub fn proxy_contains(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let w_obj0 = force(args[0])?;
-    let w_obj1 = force(args[1])?;
-    let result = crate::baseobjspace::contains(w_obj0, w_obj1)?;
+    let result = crate::baseobjspace::contains(w_obj0, args[1])?;
     Ok(pyre_object::w_bool_from(result))
 }
 
@@ -1190,25 +1218,59 @@ pub fn proxy_ne(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     crate::baseobjspace::compare(w_obj0, w_obj1, crate::baseobjspace::CompareOp::Ne)
 }
 
-// Descriptor protocol — `get`/`set`/`delete` rows in MethodTable.
-pub fn proxy_get(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+// pypy/interpreter/baseobjspace.py:2127-2128 isinstance/issubtype rows
+// — single special method so `forcing_count = 1`. The wrapper hands
+// off to `space.isinstance(forced_self, w_obj1)` /
+// `space.issubtype(forced_self, w_obj1)`, which is the descroperation
+// dispatch that consults `__instancecheck__` / `__subclasscheck__` on
+// `type(forced_self)` and falls back to the recursive type-MRO walk.
+pub fn proxy_instancecheck(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    let w_obj0 = force(args[0])?;
+    let result = crate::baseobjspace::isinstance(args[1], w_obj0)?;
+    Ok(pyre_object::w_bool_from(result))
+}
+
+pub fn proxy_subclasscheck(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    let w_obj0 = force(args[0])?;
+    let result = crate::baseobjspace::issubclass(args[1], w_obj0)?;
+    Ok(pyre_object::w_bool_from(result))
+}
+
+// pypy/interpreter/baseobjspace.py:2159 divmod row — two special
+// methods (`__divmod__`, `__rdivmod__`) so `forcing_count = 2`. The
+// wrapper calls `space.divmod`, which is the descroperation dispatch
+// (numeric fast path then forward + reverse `__divmod__`/`__rdivmod__`
+// with NotImplemented fallback).
+pub fn proxy_divmod(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let w_obj0 = force(args[0])?;
     let w_obj1 = force(args[1])?;
-    let w_obj2 = force(args[2])?;
-    forward_to_dunder(w_obj0, "__get__", &[w_obj1, w_obj2])
+    crate::baseobjspace::divmod(w_obj0, w_obj1)
+}
+
+pub fn proxy_rdivmod(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    // Reflected: swap operands per interp__weakref.py:382-385.
+    let w_obj0 = force(args[0])?;
+    let w_obj1 = force(args[1])?;
+    crate::baseobjspace::divmod(w_obj1, w_obj0)
+}
+
+// Descriptor protocol — `get`/`set`/`delete` rows in MethodTable each
+// have a single special method, so `forcing_count = 1`. Only `self` is
+// dereferenced; the descriptor instance and value/type operands pass
+// through unchanged so identity-sensitive bindings remain intact.
+pub fn proxy_get(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    let w_obj0 = force(args[0])?;
+    forward_to_dunder(w_obj0, "__get__", &[args[1], args[2]])
 }
 
 pub fn proxy_set(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let w_obj0 = force(args[0])?;
-    let w_obj1 = force(args[1])?;
-    let w_obj2 = force(args[2])?;
-    forward_to_dunder(w_obj0, "__set__", &[w_obj1, w_obj2])
+    forward_to_dunder(w_obj0, "__set__", &[args[1], args[2]])
 }
 
 pub fn proxy_delete(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let w_obj0 = force(args[0])?;
-    let w_obj1 = force(args[1])?;
-    forward_to_dunder(w_obj0, "__delete__", &[w_obj1])
+    forward_to_dunder(w_obj0, "__delete__", &[args[1]])
 }
 
 /// pypy/module/_weakref/interp__weakref.py:356-395 register the entries
@@ -1303,6 +1365,17 @@ fn register_proxy_typedef_dict(ns: &mut PyNamespace, include_comparisons: bool) 
         ns,
         "__rxor__",
         make_builtin_function("__rxor__", proxy_rxor),
+    );
+    // baseobjspace.py:2159 divmod row — forward + reflected.
+    namespace_store(
+        ns,
+        "__divmod__",
+        make_builtin_function("__divmod__", proxy_divmod),
+    );
+    namespace_store(
+        ns,
+        "__rdivmod__",
+        make_builtin_function("__rdivmod__", proxy_rdivmod),
     );
 
     // Inplace ops — interp__weakref.py:367-369.
@@ -1452,6 +1525,17 @@ fn register_proxy_typedef_dict(ns: &mut PyNamespace, include_comparisons: bool) 
         "__delete__",
         make_builtin_function("__delete__", proxy_delete),
     );
+    // baseobjspace.py:2127-2128 isinstance / issubtype rows.
+    namespace_store(
+        ns,
+        "__instancecheck__",
+        make_builtin_function("__instancecheck__", proxy_instancecheck),
+    );
+    namespace_store(
+        ns,
+        "__subclasscheck__",
+        make_builtin_function("__subclasscheck__", proxy_subclasscheck),
+    );
 
     // interp__weakref.py:390-391 — comparison ops are registered only on
     // `proxy_typedef_dict`, not `callable_proxy_typedef_dict`.
@@ -1551,6 +1635,227 @@ mod tests {
         let plain = pyre_object::w_int_new(99);
         let result = force(plain).unwrap();
         assert!(std::ptr::eq(result, plain));
+    }
+
+    /// `proxy[index]` must NOT force the index operand. PyPy's
+    /// interp__weakref.py:365 sets `forcing_count = len(special_methods)`,
+    /// so for `__getitem__` (single special method) only `self` is
+    /// dereferenced. A weakproxy passed as the index must reach the
+    /// referent's `__getitem__` unchanged so identity-keyed dicts work.
+    #[test]
+    fn test_proxy_getitem_does_not_force_index() {
+        crate::typedef::init_typeobjects();
+        // Build a list referent so getitem accepts an int index.
+        let referent = pyre_object::w_list_new(vec![
+            pyre_object::w_int_new(10),
+            pyre_object::w_int_new(20),
+            pyre_object::w_int_new(30),
+        ]);
+        let proxy = W_Proxy_new(referent, PY_NULL);
+        // Drive the wrapper directly so we exercise its forcing rule.
+        let result = proxy_getitem(&[proxy, pyre_object::w_int_new(1)]).unwrap();
+        assert_eq!(unsafe { pyre_object::w_int_get_value(result) }, 20);
+    }
+
+    /// `__pow__` is a 3-arg row in MethodTable. The wrapper must force
+    /// the first two operands and pass the optional modulo through
+    /// unchanged — PyPy's `forcing_count = len(special_methods) = 2`.
+    #[test]
+    fn test_proxy_pow_two_arg_form() {
+        crate::typedef::init_typeobjects();
+        let referent = pyre_object::w_int_new(2);
+        let proxy = W_Proxy_new(referent, PY_NULL);
+        // 2-arg form: 2 ** 8 == 256
+        let result = proxy_pow(&[proxy, pyre_object::w_int_new(8)]).unwrap();
+        assert_eq!(unsafe { pyre_object::w_int_get_value(result) }, 256);
+    }
+
+    /// pypy/interpreter/baseobjspace.py:2127-2128 — `__instancecheck__`
+    /// and `__subclasscheck__` must be present on both proxy typedefs.
+    /// pypy/interpreter/baseobjspace.py:2159 — divmod must register
+    /// both `__divmod__` and `__rdivmod__`.
+    #[test]
+    fn test_proxy_typedef_dict_includes_metaclass_and_divmod_rows() {
+        crate::typedef::init_typeobjects();
+        let weakproxy = proxy_type();
+        let callable = callable_proxy_type();
+        unsafe {
+            for tp in [weakproxy, callable] {
+                assert!(crate::baseobjspace::lookup_in_type(tp, "__instancecheck__").is_some());
+                assert!(crate::baseobjspace::lookup_in_type(tp, "__subclasscheck__").is_some());
+                assert!(crate::baseobjspace::lookup_in_type(tp, "__divmod__").is_some());
+                assert!(crate::baseobjspace::lookup_in_type(tp, "__rdivmod__").is_some());
+            }
+        }
+    }
+
+    /// `isinstance(obj, weakproxy)` must dispatch through
+    /// `proxy_typedef_dict["__instancecheck__"]` (the proxy_instancecheck
+    /// wrapper), force the proxy, then run the recursive type check on
+    /// the referent. Verifies the new `baseobjspace::isinstance` shares
+    /// the same entry point as the builtin and the proxy wrapper.
+    #[test]
+    fn test_isinstance_through_proxy() {
+        crate::typedef::init_typeobjects();
+        let int_type = unsafe { crate::typedef::r#type(pyre_object::w_int_new(0)).unwrap() };
+        let proxy = W_Proxy_new(int_type, PY_NULL);
+        // 7 is an int — through the proxy it must still resolve.
+        let yes = crate::baseobjspace::isinstance(pyre_object::w_int_new(7), proxy).unwrap();
+        assert!(yes);
+        // A non-int receiver — must be False.
+        let no = crate::baseobjspace::isinstance(pyre_object::w_str_new("hi"), proxy).unwrap();
+        assert!(!no);
+    }
+
+    /// `issubclass(int, weakproxy_around_int)` parity. Same dispatch
+    /// path as `isinstance`, but via `__subclasscheck__`.
+    #[test]
+    fn test_issubclass_through_proxy() {
+        crate::typedef::init_typeobjects();
+        let int_type = unsafe { crate::typedef::r#type(pyre_object::w_int_new(0)).unwrap() };
+        let str_type = unsafe { crate::typedef::r#type(pyre_object::w_str_new("")).unwrap() };
+        let proxy = W_Proxy_new(int_type, PY_NULL);
+        let yes = crate::baseobjspace::issubclass(int_type, proxy).unwrap();
+        assert!(yes);
+        let no = crate::baseobjspace::issubclass(str_type, proxy).unwrap();
+        assert!(!no);
+    }
+
+    /// `isinstance(obj, Checker())` where `Checker` defines
+    /// `__instancecheck__`. Verifies the override path fires for
+    /// non-proxy user instances acting as classinfo —
+    /// pypy/module/__builtin__/abstractinst.py:117-124.
+    #[test]
+    fn test_isinstance_user_instancecheck_override() {
+        crate::typedef::init_typeobjects();
+        let user_type = crate::typedef::make_builtin_type("Checker", |ns| {
+            crate::namespace_store(
+                ns,
+                "__instancecheck__",
+                crate::make_builtin_function("__instancecheck__", |_args| {
+                    Ok(pyre_object::w_bool_from(true))
+                }),
+            );
+        });
+        let checker = pyre_object::instanceobject::w_instance_new(user_type);
+        let yes = crate::baseobjspace::isinstance(pyre_object::w_int_new(123), checker).unwrap();
+        assert!(yes);
+    }
+
+    /// Same as above but for `__subclasscheck__`.
+    #[test]
+    fn test_issubclass_user_subclasscheck_override() {
+        crate::typedef::init_typeobjects();
+        let user_type = crate::typedef::make_builtin_type("ClassChecker", |ns| {
+            crate::namespace_store(
+                ns,
+                "__subclasscheck__",
+                crate::make_builtin_function("__subclasscheck__", |_args| {
+                    Ok(pyre_object::w_bool_from(true))
+                }),
+            );
+        });
+        let checker = pyre_object::instanceobject::w_instance_new(user_type);
+        let int_type = unsafe { crate::typedef::r#type(pyre_object::w_int_new(0)).unwrap() };
+        let yes = crate::baseobjspace::issubclass(int_type, checker).unwrap();
+        assert!(yes);
+    }
+
+    /// `pow(proxy_around_lhs, rhs)` where `lhs.__pow__` returns
+    /// NotImplemented and `rhs.__rpow__` returns the actual answer must
+    /// fall through to the reflected operand. The pre-fix proxy_pow
+    /// called the forward dunder directly and silently swallowed the
+    /// NotImplemented sentinel.
+    #[test]
+    fn test_proxy_pow_falls_through_to_rpow() {
+        crate::typedef::init_typeobjects();
+        let lhs_type = crate::typedef::make_builtin_type("PowLhs", |ns| {
+            crate::namespace_store(
+                ns,
+                "__pow__",
+                crate::make_builtin_function("__pow__", |_args| {
+                    Ok(unsafe { pyre_object::w_not_implemented() })
+                }),
+            );
+        });
+        let rhs_type = crate::typedef::make_builtin_type("PowRhs", |ns| {
+            crate::namespace_store(
+                ns,
+                "__rpow__",
+                crate::make_builtin_function("__rpow__", |_args| Ok(pyre_object::w_int_new(7777))),
+            );
+        });
+        let lhs = pyre_object::instanceobject::w_instance_new(lhs_type);
+        let rhs = pyre_object::instanceobject::w_instance_new(rhs_type);
+        let proxy_lhs = W_Proxy_new(lhs, PY_NULL);
+        // 2-arg form, no modulus.
+        let result = proxy_pow(&[proxy_lhs, rhs]).unwrap();
+        assert_eq!(unsafe { pyre_object::w_int_get_value(result) }, 7777);
+    }
+
+    /// 3-arg `pow(proxy, b, c)` must end up in
+    /// `space.pow3 → try_dispatch_ternary_special`, so a forward
+    /// `__pow__` returning NotImplemented falls through to the
+    /// reflected `__rpow__`.
+    #[test]
+    fn test_proxy_pow_three_arg_falls_through_to_rpow() {
+        crate::typedef::init_typeobjects();
+        let lhs_type = crate::typedef::make_builtin_type("Pow3Lhs", |ns| {
+            crate::namespace_store(
+                ns,
+                "__pow__",
+                crate::make_builtin_function("__pow__", |_args| {
+                    Ok(unsafe { pyre_object::w_not_implemented() })
+                }),
+            );
+        });
+        let rhs_type = crate::typedef::make_builtin_type("Pow3Rhs", |ns| {
+            crate::namespace_store(
+                ns,
+                "__rpow__",
+                crate::make_builtin_function("__rpow__", |args| {
+                    // Echo the modulus operand so we can confirm it
+                    // threaded through to the reflected wrapper.
+                    Ok(args[2])
+                }),
+            );
+        });
+        let lhs = pyre_object::instanceobject::w_instance_new(lhs_type);
+        let rhs = pyre_object::instanceobject::w_instance_new(rhs_type);
+        let proxy_lhs = W_Proxy_new(lhs, PY_NULL);
+        let result = proxy_pow(&[proxy_lhs, rhs, pyre_object::w_int_new(99)]).unwrap();
+        assert_eq!(unsafe { pyre_object::w_int_get_value(result) }, 99);
+    }
+
+    /// `divmod(proxy, rhs)` where `lhs.__divmod__` returns NotImplemented
+    /// must fall through to `rhs.__rdivmod__`. Same regression class as
+    /// `proxy_pow`.
+    #[test]
+    fn test_proxy_divmod_falls_through_to_rdivmod() {
+        crate::typedef::init_typeobjects();
+        let lhs_type = crate::typedef::make_builtin_type("DivmodLhsNI", |ns| {
+            crate::namespace_store(
+                ns,
+                "__divmod__",
+                crate::make_builtin_function("__divmod__", |_args| {
+                    Ok(unsafe { pyre_object::w_not_implemented() })
+                }),
+            );
+        });
+        let rhs_type = crate::typedef::make_builtin_type("DivmodRhs", |ns| {
+            crate::namespace_store(
+                ns,
+                "__rdivmod__",
+                crate::make_builtin_function("__rdivmod__", |_args| {
+                    Ok(pyre_object::w_int_new(123456))
+                }),
+            );
+        });
+        let lhs = pyre_object::instanceobject::w_instance_new(lhs_type);
+        let rhs = pyre_object::instanceobject::w_instance_new(rhs_type);
+        let proxy_lhs = W_Proxy_new(lhs, PY_NULL);
+        let result = proxy_divmod(&[proxy_lhs, rhs]).unwrap();
+        assert_eq!(unsafe { pyre_object::w_int_get_value(result) }, 123456);
     }
 
     /// pypy/module/_weakref/interp__weakref.py:390-391 — comparison ops
