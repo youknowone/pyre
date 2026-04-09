@@ -3026,6 +3026,114 @@ impl OptContext {
         }
     }
 
+    /// info.py:728-735 `ConstPtrInfo._get_array_info(descr, optheap)`
+    /// parity:
+    ///
+    /// ```python
+    /// def _get_array_info(self, descr, optheap):
+    ///     ref = self._const.getref_base()
+    ///     if not ref:
+    ///         raise InvalidLoop   # null protection
+    ///     info = optheap.const_infos.get(ref, None)
+    ///     if info is None:
+    ///         info = ArrayPtrInfo(descr)
+    ///         optheap.const_infos[ref] = info
+    ///     return info
+    /// ```
+    ///
+    /// Companion to `get_const_info_mut` for the array path. Both share
+    /// the same `const_infos` slot keyed by `gcref` — PyPy's invariant
+    /// is that a given constant ref is used as either a struct base or
+    /// an array base, never both. The Vacant entry inserts an
+    /// `ArrayPtrInfo` (descr + `nonnegative` lenbound) so subsequent
+    /// `setitem`/`getitem` calls land on the right variant.
+    pub fn get_const_info_array_mut(
+        &mut self,
+        opref: OpRef,
+        descr: DescrRef,
+    ) -> Option<&mut crate::optimizeopt::info::PtrInfo> {
+        use crate::optimizeopt::info::PtrInfo;
+        // info.py:729: ref = self._const.getref_base() — same dispatch as
+        // _get_info; route through getptrinfo for the op.type contract.
+        let gcref = match self.getptrinfo(opref).as_deref() {
+            Some(PtrInfo::Constant(g)) => *g,
+            _ => return None,
+        };
+        // info.py:730-731: if not ref: raise InvalidLoop
+        if gcref.is_null() {
+            return None;
+        }
+        let addr = gcref.0;
+        use std::collections::hash_map::Entry;
+        match self.const_infos.entry(addr) {
+            Entry::Occupied(e) => Some(e.into_mut()),
+            Entry::Vacant(e) => Some(e.insert(crate::optimizeopt::info::PtrInfo::array(
+                descr,
+                crate::optimizeopt::intutils::IntBound::nonnegative(),
+            ))),
+        }
+    }
+
+    /// info.py:750-752 `ConstPtrInfo.setfield` + info.py:203-211
+    /// `AbstractStructPtrInfo.setfield` parity (line-by-line PyPy
+    /// `structinfo.setfield(...)` routing).
+    ///
+    /// ```python
+    /// # ConstPtrInfo
+    /// def setfield(self, fielddescr, struct, op, optheap=None, cf=None):
+    ///     info = self._get_info(fielddescr.get_parent_descr(), optheap)
+    ///     info.setfield(fielddescr, struct, op, optheap=optheap, cf=cf)
+    ///
+    /// # AbstractStructPtrInfo
+    /// def setfield(self, fielddescr, struct, op, optheap=None, cf=None):
+    ///     self.init_fields(fielddescr.get_parent_descr(),
+    ///                      fielddescr.get_index())
+    ///     self._fields[fielddescr.get_index()] = op
+    /// ```
+    ///
+    /// The Rust port routes both branches through one helper so heap.rs
+    /// callers don't need to special-case the constant arg0 path. The
+    /// constant case lands on `const_infos[gcref]`; the regular case
+    /// runs `ensure_ptr_info_arg0(op).as_mut().setfield(...)`.
+    pub fn structinfo_setfield(&mut self, op: &Op, field_idx: u32, value: OpRef) {
+        let arg0 = self.get_box_replacement(op.arg(0));
+        if arg0.is_constant() || self.get_constant(arg0).is_some() {
+            // info.py:750-752 ConstPtrInfo.setfield → const_infos route.
+            if let Some(info) = self.get_const_info_mut(arg0) {
+                info.setfield(field_idx, value);
+            }
+            return;
+        }
+        // info.py:203-211 AbstractStructPtrInfo.setfield: mutate `_fields`.
+        let mut handle = self.ensure_ptr_info_arg0(op);
+        if let Some(pi) = handle.as_mut() {
+            pi.setfield(field_idx, value);
+        }
+    }
+
+    /// info.py:746-748 `ConstPtrInfo.setitem` + info.py: ArrayPtrInfo
+    /// `setitem` parity. Same shape as `structinfo_setfield` but routes
+    /// through `_get_array_info` (`get_const_info_array_mut`) for the
+    /// constant arg0 path so the const_infos slot is created as
+    /// `PtrInfo::Array` rather than `PtrInfo::Instance`.
+    pub fn arrayinfo_setitem(&mut self, op: &Op, index: usize, value: OpRef) {
+        let arg0 = self.get_box_replacement(op.arg(0));
+        if arg0.is_constant() || self.get_constant(arg0).is_some() {
+            // info.py:746-748 ConstPtrInfo.setitem → _get_array_info.
+            if let Some(descr) = op.descr.clone() {
+                if let Some(info) = self.get_const_info_array_mut(arg0, descr) {
+                    info.setitem(index, value);
+                }
+            }
+            return;
+        }
+        // info.py: ArrayPtrInfo.setitem: mutate `_items`.
+        let mut handle = self.ensure_ptr_info_arg0(op);
+        if let Some(pi) = handle.as_mut() {
+            pi.setitem(index, value);
+        }
+    }
+
     /// RPython set_forwarded parity: setting Info on a box REPLACES
     /// any forwarding. In pyre, ptr_info and forwarding must be
     /// mutually exclusive — the last writer wins.

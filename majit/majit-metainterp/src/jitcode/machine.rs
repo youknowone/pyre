@@ -3163,6 +3163,7 @@ mod tests {
         let mut info = VirtualizableInfo::new(0);
         info.add_field("pc", Type::Int, 8);
         info.add_array_field("stack", Type::Int, 24);
+        info.set_parent_descr(majit_ir::descr::make_size_descr(64));
         info
     }
 
@@ -3235,7 +3236,8 @@ mod tests {
         let jitcode = builder.finish();
 
         let mut ctx = TraceCtx::for_test(0);
-        let info = VirtualizableInfo::new(0);
+        let mut info = VirtualizableInfo::new(0);
+        info.set_parent_descr(majit_ir::descr::make_size_descr(64));
         let vable_ref = ctx.const_int(obj_ptr);
         ctx.init_virtualizable_boxes(&info, vable_ref, &[], &[]);
 
@@ -3286,7 +3288,8 @@ mod tests {
         let jitcode = builder.finish();
 
         let mut ctx = TraceCtx::for_test(0);
-        let info = VirtualizableInfo::new(0);
+        let mut info = VirtualizableInfo::new(0);
+        info.set_parent_descr(majit_ir::descr::make_size_descr(64));
         let vable_ref = ctx.const_int(obj_ptr);
         ctx.init_virtualizable_boxes(&info, vable_ref, &[], &[]);
 
@@ -3331,7 +3334,8 @@ mod tests {
         let jitcode = builder.finish();
 
         let mut ctx = TraceCtx::for_test(0);
-        let info = VirtualizableInfo::new(0);
+        let mut info = VirtualizableInfo::new(0);
+        info.set_parent_descr(majit_ir::descr::make_size_descr(64));
         let vable_ref = ctx.const_int(obj_ptr);
         ctx.init_virtualizable_boxes(&info, vable_ref, &[], &[]);
 
@@ -3380,7 +3384,8 @@ mod tests {
         let jitcode = builder.finish();
 
         let mut ctx = TraceCtx::for_test(0);
-        let info = VirtualizableInfo::new(0);
+        let mut info = VirtualizableInfo::new(0);
+        info.set_parent_descr(majit_ir::descr::make_size_descr(64));
         let vable_ref = ctx.const_int(obj_ptr);
         ctx.init_virtualizable_boxes(&info, vable_ref, &[], &[]);
 
@@ -3429,7 +3434,8 @@ mod tests {
         let jitcode = builder.finish();
 
         let mut ctx = TraceCtx::for_test(0);
-        let info = VirtualizableInfo::new(0);
+        let mut info = VirtualizableInfo::new(0);
+        info.set_parent_descr(majit_ir::descr::make_size_descr(64));
         let vable_ref = ctx.const_int(obj_ptr);
         ctx.init_virtualizable_boxes(&info, vable_ref, &[], &[]);
 

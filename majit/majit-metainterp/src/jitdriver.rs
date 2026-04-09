@@ -3449,6 +3449,7 @@ mod tests {
                 let mut info = crate::virtualizable::VirtualizableInfo::new(24);
                 info.add_field("pc", Type::Int, 8);
                 info.add_array_field("locals_w", Type::Ref, 16);
+                info.set_parent_descr(majit_ir::descr::make_size_descr(64));
                 Some(info)
             }
         }
