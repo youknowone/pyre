@@ -17,6 +17,7 @@ pub mod assembler;
 pub mod callbuilder;
 pub mod codebuf;
 pub mod frame;
+pub mod gcmap;
 pub mod guard;
 pub mod jitframe;
 pub mod jump;
@@ -130,9 +131,9 @@ pub fn register_call_assembler_unbox_int(f: UnboxIntFn) {
 /// failure (jf_descr != done_descr). NOT called for pending/unresolved
 /// targets (those skip the callee call entirely).
 ///
-/// Dispatch order matches Cranelift's call_assembler_guard_failure:
-///   1. bridge (if CA_BRIDGE_FN registered and compiles successfully)
-///   2. blackhole resume (if CA_BLACKHOLE_FN registered)
+/// Dispatch order matches compile.py:701-717 handle_fail:
+///   1. try bridge tracing (if CA_BRIDGE_FN registered)
+///   2. resume in blackhole (if CA_BLACKHOLE_FN registered)
 ///   3. return 0 (no handler available)
 ///
 /// Input:  rdi/x0 = callee_jf_ptr (heap-allocated jitframe)
@@ -147,127 +148,59 @@ pub extern "C" fn call_assembler_helper_trampoline(
     if callee_jf_ptr.is_null() {
         return 0;
     }
-
-    unsafe fn execute_dynasm_bridge(
-        bridge_addr: usize,
-        jf_ptr: *mut jitframe::JitFrame,
-    ) -> (*mut jitframe::JitFrame, Option<i64>) {
-        let func: unsafe extern "C" fn(*mut jitframe::JitFrame) -> *mut jitframe::JitFrame =
-            unsafe { std::mem::transmute(bridge_addr) };
-        let result_jf = unsafe { func(jf_ptr) };
-        if result_jf.is_null() {
-            return (jf_ptr, None);
-        }
-        let result_descr = unsafe { jitframe::JitFrame::get_latest_descr(result_jf) };
-        if guard::is_done_with_this_frame_descr(result_descr) {
-            return (
-                result_jf,
-                Some(unsafe { jitframe::JitFrame::get_int_value(result_jf, 0) }),
-            );
-        }
-        (result_jf, None)
-    }
-
-    let mut current_jf_ptr = callee_jf_ptr;
     let mut result = 0i64;
 
     // Read jf_descr — raw pointer to DynasmFailDescr
-    let mut descr_raw = unsafe { jitframe::JitFrame::get_latest_descr(current_jf_ptr) };
+    let descr_raw = unsafe { jitframe::JitFrame::get_latest_descr(callee_jf_ptr) };
 
     if descr_raw != 0 && !guard::is_done_with_this_frame_descr(descr_raw) {
         let descr = unsafe { &*(descr_raw as *const guard::DynasmFailDescr) };
+        let trace_id = descr.trace_id;
+        let fail_index = descr.fail_index;
 
-        // Existing bridge: execute it before tracing a new one.
-        if descr.has_bridge() {
-            let (next_jf_ptr, bridge_result) =
-                unsafe { execute_dynasm_bridge(descr.bridge_addr(), current_jf_ptr) };
-            current_jf_ptr = next_jf_ptr;
-            if let Some(value) = bridge_result {
-                unsafe { libc::free(current_jf_ptr as *mut std::ffi::c_void) };
-                return value;
-            }
-            descr_raw = unsafe { jitframe::JitFrame::get_latest_descr(current_jf_ptr) };
+        // Read fail_arg values from the failing frame's jf_frame slots.
+        let n_fail_args = descr.fail_arg_types.len();
+        let mut raw_values: Vec<i64> = Vec::with_capacity(n_fail_args);
+        for i in 0..n_fail_args {
+            let slot = descr.fail_arg_locs.get(i).and_then(|l| *l).unwrap_or(i);
+            raw_values.push(unsafe { jitframe::JitFrame::get_int_value(callee_jf_ptr, slot) });
         }
 
-        if descr_raw != 0 && !guard::is_done_with_this_frame_descr(descr_raw) {
-            let descr = unsafe { &*(descr_raw as *const guard::DynasmFailDescr) };
-            let trace_id = descr.trace_id;
-            let fail_index = descr.fail_index;
-            let descr_addr = descr_raw;
+        // compile.py:701-717 handle_fail — decide whether to trace a bridge
+        // from THIS guard failure. The current failure still resumes through
+        // blackhole; compiled bridges are used by future failures after the
+        // guard's jump target is patched in place.
+        if let Some(bridge_fn) = CA_BRIDGE_FN.get() {
+            bridge_fn(
+                green_key,
+                trace_id,
+                fail_index,
+                raw_values.as_ptr(),
+                raw_values.len(),
+                descr_raw,
+            );
+        }
 
-            // Read fail_arg values from the current frame: jf_frame[0..n] at jf_ptr[1..]
-            let n_fail_args = descr.fail_arg_types.len();
-            let mut raw_values: Vec<i64> = Vec::with_capacity(n_fail_args);
-            for i in 0..n_fail_args {
-                let slot = descr.fail_arg_locs.get(i).and_then(|l| *l).unwrap_or(i);
-                raw_values.push(unsafe { jitframe::JitFrame::get_int_value(current_jf_ptr, slot) });
-            }
-
-            // compile.py:701-717 handle_fail — try bridge tracing first.
-            let bridge_compiled = if let Some(bridge_fn) = CA_BRIDGE_FN.get() {
-                bridge_fn(
-                    green_key,
-                    trace_id,
-                    fail_index,
-                    raw_values.as_ptr(),
-                    raw_values.len(),
-                    descr_addr,
-                )
-            } else {
-                false
-            };
-
-            if bridge_compiled && descr.has_bridge() {
-                let (next_jf_ptr, bridge_result) =
-                    unsafe { execute_dynasm_bridge(descr.bridge_addr(), current_jf_ptr) };
-                current_jf_ptr = next_jf_ptr;
-                if let Some(value) = bridge_result {
-                    unsafe { libc::free(current_jf_ptr as *mut std::ffi::c_void) };
-                    return value;
-                }
-                descr_raw = unsafe { jitframe::JitFrame::get_latest_descr(current_jf_ptr) };
-            }
-
-            // Bridge-on-bridge case: use the latest returned descr for
-            // blackhole/force dispatch instead of the original guard.
-            if descr_raw != 0 && !guard::is_done_with_this_frame_descr(descr_raw) {
-                let latest_descr = unsafe { &*(descr_raw as *const guard::DynasmFailDescr) };
-                let latest_trace_id = latest_descr.trace_id;
-                let latest_fail_index = latest_descr.fail_index;
-                let mut latest_raw_values: Vec<i64> =
-                    Vec::with_capacity(latest_descr.fail_arg_types.len());
-                for i in 0..latest_descr.fail_arg_types.len() {
-                    let slot = latest_descr
-                        .fail_arg_locs
-                        .get(i)
-                        .and_then(|l| *l)
-                        .unwrap_or(i);
-                    latest_raw_values
-                        .push(unsafe { jitframe::JitFrame::get_int_value(current_jf_ptr, slot) });
-                }
-
-                // resume.py:1312 blackhole_from_resumedata parity.
-                if let Some(blackhole) = CA_BLACKHOLE_FN.get() {
-                    result = blackhole(
-                        green_key,
-                        latest_trace_id,
-                        latest_fail_index,
-                        latest_raw_values.as_ptr(),
-                        latest_raw_values.len(),
-                        latest_raw_values.as_ptr(),
-                        latest_raw_values.len(),
-                    )
-                    .unwrap_or(0);
-                } else if let Some(force_fn) = CA_FORCE_FN.get() {
-                    let frame_ptr = unsafe { jitframe::JitFrame::get_int_value(current_jf_ptr, 0) };
-                    result = force_fn(frame_ptr);
-                }
-            }
+        // resume.py:1312 blackhole_from_resumedata parity.
+        if let Some(blackhole) = CA_BLACKHOLE_FN.get() {
+            result = blackhole(
+                green_key,
+                trace_id,
+                fail_index,
+                raw_values.as_ptr(),
+                raw_values.len(),
+                raw_values.as_ptr(),
+                raw_values.len(),
+            )
+            .unwrap_or(0);
+        } else if let Some(force_fn) = CA_FORCE_FN.get() {
+            let frame_ptr = unsafe { jitframe::JitFrame::get_int_value(callee_jf_ptr, 0) };
+            result = force_fn(frame_ptr);
         }
     }
 
     // Free the callee jitframe
-    unsafe { libc::free(current_jf_ptr as *mut std::ffi::c_void) };
+    unsafe { libc::free(callee_jf_ptr as *mut std::ffi::c_void) };
     result
 }
 
@@ -307,6 +240,22 @@ mod tests {
     use majit_ir::Type;
     use std::sync::Arc;
 
+    unsafe fn alloc_test_jitframe(descr: usize, slots: &[i64]) -> *mut jitframe::JitFrame {
+        let depth = slots.len();
+        let size = jitframe::JitFrame::alloc_size(depth);
+        let ptr = unsafe { libc::malloc(size) as *mut jitframe::JitFrame };
+        assert!(!ptr.is_null());
+        unsafe {
+            libc::memset(ptr as *mut std::ffi::c_void, 0, size);
+            jitframe::JitFrame::init(ptr, jitframe::NULLFRAMEINFO, depth);
+            jitframe::JitFrame::set_latest_descr(ptr, descr);
+            for (index, value) in slots.iter().copied().enumerate() {
+                jitframe::JitFrame::set_int_value(ptr, index, value);
+            }
+        }
+        ptr
+    }
+
     // ── Bug 1 regression: unresolved target must not dereference result as pointer ──
     // The old code let the helper return value flow into `mov rdx, rax; mov rcx, [rdx]`
     // which dereferenced an integer as a pointer. This test verifies the trampoline
@@ -320,15 +269,9 @@ mod tests {
 
     #[test]
     fn test_helper_trampoline_descr_zero_returns_zero() {
-        // Simulate a pending-target jitframe: jf_descr == 0.
-        // The old code would try to deref 0 as a DynasmFailDescr.
-        let mut jf = vec![0i64; 8]; // jf_descr = 0, rest = 0
-        let result = call_assembler_helper_trampoline(jf.as_mut_ptr(), 42);
+        let jf = unsafe { alloc_test_jitframe(0, &[0, 0, 0, 0]) };
+        let result = call_assembler_helper_trampoline(jf, 42);
         assert_eq!(result, 0);
-        // jf must have been freed by the trampoline — but since it's
-        // stack-allocated we can't test that. The key assertion is no crash.
-        // Prevent double-free by leaking the vec.
-        std::mem::forget(jf);
     }
 
     // ── Bug 2 regression: force_fn must NOT be called with jitframe pointer ──
@@ -351,14 +294,24 @@ mod tests {
         ));
         let descr_ptr = Arc::as_ptr(&descr) as i64;
 
-        // Build a jitframe: [jf_descr, jf_frame[0], jf_frame[1], ...]
-        let mut jf = vec![descr_ptr, 100, 200, 0, 0, 0, 0, 0];
-        let result = call_assembler_helper_trampoline(jf.as_mut_ptr(), 42);
+        let jf = unsafe { alloc_test_jitframe(descr_ptr as usize, &[100, 200, 0, 0]) };
+        let result = call_assembler_helper_trampoline(jf, 42);
         // No blackhole registered → returns 0, no crash.
         assert_eq!(result, 0);
-        // Keep descr alive past trampoline.
         drop(descr);
-        std::mem::forget(jf); // trampoline called free(), prevent double-free
+    }
+
+    #[test]
+    fn test_helper_trampoline_does_not_execute_existing_bridge() {
+        let descr = Arc::new(guard::DynasmFailDescr::new(3, 17, vec![Type::Int], false));
+        descr.set_bridge_addr(1);
+        let descr_ptr = Arc::as_ptr(&descr) as usize;
+
+        let jf = unsafe { alloc_test_jitframe(descr_ptr, &[123, 0, 0, 0]) };
+        let result = call_assembler_helper_trampoline(jf, 99);
+        assert_eq!(result, 0);
+
+        drop(descr);
     }
 
     // ── Bug 3 regression: green_key must reach the handler, not be 0 ──

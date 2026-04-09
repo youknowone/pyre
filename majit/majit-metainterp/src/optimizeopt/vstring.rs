@@ -22,6 +22,10 @@ use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
 /// Maximum constant string length we will virtualize.
 const MAX_CONST_LEN: usize = 100;
 
+/// vstring.py mode_string / mode_unicode discriminators.
+pub const mode_string: u8 = 0;
+pub const mode_unicode: u8 = 1;
+
 /// Virtual string representation.
 ///
 /// Tracks the contents of a string that has not yet been allocated.

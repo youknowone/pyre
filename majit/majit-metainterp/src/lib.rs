@@ -89,6 +89,12 @@ pub fn majit_log_enabled() -> bool {
 pub enum TraceAction {
     /// Continue tracing the next instruction.
     Continue,
+    /// reached_loop_header() compiled the current trace into an existing
+    /// target and tracing must stop immediately.
+    ///
+    /// RPython parity: pyjitpl.py says compile_trace() "raises in case it
+    /// works". pyre surfaces that control-flow edge explicitly.
+    CompileTrace,
     /// Close the loop (back-edge to header detected).
     CloseLoop,
     /// Close the loop with explicit jump arguments supplied by the tracer.

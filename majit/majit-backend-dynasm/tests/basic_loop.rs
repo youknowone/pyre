@@ -84,6 +84,43 @@ fn test_simple_int_add() {
 }
 
 #[test]
+fn test_finish_infers_int_type_when_explicit_types_are_empty() {
+    let mut backend = DynasmBackend::new();
+    let mut token = JitCellToken::new(11);
+
+    let i0 = OpRef(0);
+    let const_1 = OpRef::from_const(1);
+
+    let mut constants = HashMap::new();
+    constants.insert(const_1.0, 1i64);
+    backend.set_constants(constants);
+
+    let inputargs = vec![InputArg {
+        tp: Type::Int,
+        index: 0,
+    }];
+
+    let mut add_op = Op::new(OpCode::IntAdd, &[i0, const_1]);
+    add_op.pos = OpRef(1);
+
+    let mut finish_op = Op::new(OpCode::Finish, &[OpRef(1)]);
+    finish_op.pos = OpRef(2);
+    finish_op.fail_arg_types = Some(vec![]);
+    finish_op.fail_args = Some(vec![OpRef(1)].into());
+
+    let ops = vec![add_op, finish_op];
+
+    let result = backend.compile_loop(&inputargs, &ops, &mut token);
+    assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
+
+    let frame = backend.execute_token(&token, &[Value::Int(42)]);
+    let descr = backend.get_latest_descr(&frame);
+    assert!(descr.is_finish());
+    assert_eq!(descr.fail_arg_types(), &[Type::Int]);
+    assert_eq!(backend.get_int_value(&frame, 0), 43);
+}
+
+#[test]
 fn test_float_add() {
     let mut backend = DynasmBackend::new();
     let mut token = JitCellToken::new(1);

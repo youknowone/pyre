@@ -2168,9 +2168,7 @@ fn all_interiorfielddescrs(
 ) -> (Vec<majit_ir::descr::DescrRef>, usize) {
     // Path 1: actual layout from runtime (RPython: symbolic.get_field_token)
     if let Some(layout) = cc.struct_layouts.get(struct_name) {
-        let mut result = Vec::new();
-        // RPython: heaptracker.get_fielddescr_index_in() — counts non-Void fields.
-        let mut index_in_parent: u32 = 0;
+        let mut field_specs = Vec::new();
         for fl in &layout.fields {
             if fl.field_type == majit_ir::value::Type::Void {
                 continue;
@@ -2178,23 +2176,29 @@ fn all_interiorfielddescrs(
             if fl.flag == majit_ir::descr::ArrayFlag::Struct {
                 return (Vec::new(), 0);
             }
-            let is_signed = fl.flag == majit_ir::descr::ArrayFlag::Signed;
-            let fd = std::sync::Arc::new(majit_ir::descr::SimpleFieldDescr::new_with_name(
+            let index_in_parent = field_specs.len();
+            field_specs.push(majit_ir::descr::SimpleFieldDescrSpec {
+                index: index_in_parent as u32,
+                name: format!("{}.{}", struct_name, fl.name),
+                offset: fl.offset,
+                field_size: fl.size,
+                field_type: fl.field_type,
+                is_immutable: false,
+                is_signed: fl.flag == majit_ir::descr::ArrayFlag::Signed,
+                virtualizable: false,
                 index_in_parent,
-                fl.offset,
-                fl.size,
-                fl.field_type,
-                false,
-                is_signed,
-                format!("{}.{}", struct_name, fl.name),
-            ));
-            let ifd = majit_ir::descr::SimpleInteriorFieldDescr::new(
-                index_in_parent,
+            });
+        }
+        let group = majit_ir::descr::make_simple_descr_group(0, layout.size, 0, 0, &field_specs);
+        let mut result = Vec::new();
+        for (index_in_parent, fd) in group.field_descrs.iter().enumerate() {
+            let ifd = majit_ir::descr::SimpleInteriorFieldDescr::new_with_owner(
+                index_in_parent as u32,
                 array_descr.clone(),
-                fd,
+                fd.clone(),
+                group.size_descr.clone(),
             );
             result.push(std::sync::Arc::new(ifd) as majit_ir::descr::DescrRef);
-            index_in_parent += 1;
         }
         return (result, layout.size);
     }
@@ -2210,9 +2214,7 @@ fn all_interiorfielddescrs(
         }
     }
     let mut offset: usize = 0;
-    let mut result = Vec::new();
-    // RPython: heaptracker.get_fielddescr_index_in() — counts non-Void fields.
-    let mut index_in_parent: u32 = 0;
+    let mut field_specs = Vec::new();
     for (_i, (field_name, field_type_str)) in fields.iter().enumerate() {
         let (flag, field_type, field_size) = get_type_flag(field_type_str);
         if field_type == majit_ir::value::Type::Void {
@@ -2228,24 +2230,19 @@ fn all_interiorfielddescrs(
         if align > 0 {
             offset = (offset + align - 1) & !(align - 1);
         }
-        let is_signed = flag == majit_ir::descr::ArrayFlag::Signed;
-        let fd = std::sync::Arc::new(majit_ir::descr::SimpleFieldDescr::new_with_name(
-            index_in_parent,
+        let index_in_parent = field_specs.len();
+        field_specs.push(majit_ir::descr::SimpleFieldDescrSpec {
+            index: index_in_parent as u32,
+            name: format!("{}.{}", struct_name, field_name),
             offset,
             field_size,
             field_type,
-            false,
-            is_signed,
-            format!("{}.{}", struct_name, field_name),
-        ));
-        let ifd = majit_ir::descr::SimpleInteriorFieldDescr::new(
+            is_immutable: false,
+            is_signed: flag == majit_ir::descr::ArrayFlag::Signed,
+            virtualizable: false,
             index_in_parent,
-            array_descr.clone(),
-            fd,
-        );
-        result.push(std::sync::Arc::new(ifd) as majit_ir::descr::DescrRef);
+        });
         offset += field_size;
-        index_in_parent += 1;
     }
     let max_align = fields
         .iter()
@@ -2258,6 +2255,17 @@ fn all_interiorfielddescrs(
     } else {
         0
     };
+    let group = majit_ir::descr::make_simple_descr_group(0, item_size, 0, 0, &field_specs);
+    let mut result = Vec::new();
+    for (index_in_parent, fd) in group.field_descrs.iter().enumerate() {
+        let ifd = majit_ir::descr::SimpleInteriorFieldDescr::new_with_owner(
+            index_in_parent as u32,
+            array_descr.clone(),
+            fd.clone(),
+            group.size_descr.clone(),
+        );
+        result.push(std::sync::Arc::new(ifd) as majit_ir::descr::DescrRef);
+    }
     (result, item_size)
 }
 

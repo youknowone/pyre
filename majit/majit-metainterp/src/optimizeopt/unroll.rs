@@ -1820,6 +1820,13 @@ impl TargetToken {
         }
     }
 
+    pub fn new_loop(token_id: u64) -> Self {
+        let mut token = Self::new();
+        token.token_id = token_id;
+        token.jump_target_descr = Arc::new(LoopTargetDescr::new(token_id, false));
+        token
+    }
+
     pub fn new_preamble(token_id: u64) -> Self {
         let mut token = Self::new();
         token.token_id = token_id;
@@ -3187,7 +3194,18 @@ impl OptUnroll {
                         }
                     }
                     ctx.replace_op(source, value);
-                    let descr_idx = descr.index();
+                    // Prefer parent-local index when the FieldDescr is wired
+                    // up to a SizeDescr; otherwise (lib-test fixtures or
+                    // descrs constructed without parent_descr) fall back to
+                    // the raw descr.index() so cache lookups stay stable.
+                    let descr_idx = descr
+                        .as_field_descr()
+                        .and_then(|field_descr| {
+                            field_descr
+                                .get_parent_descr()
+                                .map(|_| field_descr.index_in_parent() as u32)
+                        })
+                        .unwrap_or_else(|| descr.index());
                     let obj_resolved = ctx.get_box_replacement(obj);
                     // shortpreamble.py:66-68: HeapOp.produce_op
                     // if g.getarg(0) in exported_infos:
@@ -3206,31 +3224,22 @@ impl OptUnroll {
                         resolved: value,
                         invented_name,
                     };
-                    // RPython shortpreamble.py:72: ensure_ptr_info_arg0(g)
-                    // → get_box_replacement(g.getarg(0)) → set PtrInfo on
-                    // the final Box in the forwarding chain.
+                    let mut getfield_op =
+                        majit_ir::Op::new(OpCode::getfield_for_type(result_type), &[obj_resolved]);
+                    getfield_op.descr = Some(descr.clone());
+                    // RPython shortpreamble.py:72-79:
+                    //   opinfo = ensure_ptr_info_arg0(g)
+                    //   opinfo.setfield(..., pop, ...)
                     //
-                    // In majit, obj_resolved follows forwarding from obj.
-                    // Set preamble_field on obj_resolved (the forwarding
-                    // target) so Phase 2's heap pass finds it via the same
-                    // get_box_replacement chain.
-                    //
-                    // RPython shortpreamble.py:72-81: ensure_ptr_info_arg0(g)
-                    // sets PtrInfo on get_box_replacement(g.getarg(0)),
-                    // then opinfo.setfield stores PreambleOp in _fields.
-                    //
-                    // Set preamble_field on obj_resolved (original const
-                    // object) for const_info lookup, AND on source itself
-                    // (the preamble_op OpRef) because Phase 2 trace ops
-                    // may reference source directly. source's forwarding
-                    // (Op → value) may be overwritten by Info during
-                    // import_state/setinfo_from_preamble, so the PtrInfo
-                    // on source's Info needs the preamble_field too.
+                    // Preserve the existing const-info lookup because majit's
+                    // heap import still routes ConstPtr preamble fields via
+                    // const_infos before the full ConstPtrInfo.setfield port
+                    // lands.
                     if let Some(info) = ctx.get_const_info_mut(obj_resolved) {
                         info.set_preamble_field(descr_idx, pop.clone());
                     }
-                    ctx.ensure_ptr_info(obj_resolved);
-                    if let Some(info) = ctx.get_ptr_info_mut(obj_resolved) {
+                    let mut struct_info = ctx.ensure_ptr_info_arg0(&getfield_op);
+                    if let Some(info) = struct_info.as_mut() {
                         info.set_preamble_field(descr_idx, pop.clone());
                     }
                     if crate::optimizeopt::majit_log_enabled() {
@@ -3293,6 +3302,22 @@ impl OptUnroll {
                     // get_box_replacement so the key matches heap.py lookup
                     // which also canonicalizes array via get_box_replacement.
                     let obj_resolved = ctx.get_box_replacement(obj);
+                    let index_const = ctx.make_constant_int(index as i64);
+                    let mut getarrayitem_op = majit_ir::Op::new(
+                        OpCode::getarrayitem_for_type(result_type),
+                        &[obj_resolved, index_const],
+                    );
+                    getarrayitem_op.descr = Some(descr.clone());
+                    let mut array_info = ctx.ensure_ptr_info_arg0(&getarrayitem_op);
+                    if let Some(crate::optimizeopt::info::PtrInfo::Array(info)) =
+                        array_info.as_mut()
+                    {
+                        let _ = info.lenbound.make_gt_const(index as i64);
+                        if index as usize >= info.items.len() {
+                            info.items.resize(index as usize + 1, OpRef::NONE);
+                        }
+                        info.items[index as usize] = value;
+                    }
                     ctx.imported_short_arrayitems
                         .insert((obj_resolved, descr_idx, index), value);
                     ctx.imported_short_arrayitem_descrs
@@ -3414,6 +3439,28 @@ fn build_imported_virtuals_from_state(
     state: &ExportedState,
 ) -> Vec<crate::optimizeopt::optimizer::ImportedVirtual> {
     use crate::optimizeopt::virtualstate::VirtualStateInfo;
+
+    /// virtualstate.py:158-165 AbstractVirtualStructStateInfo.generate_guards
+    /// parity: walk `fielddescrs` in parent-local slot order, looking up
+    /// the matching field state via descr.get_index() (= field_idx in pyre).
+    fn ordered_fields(
+        field_descrs: &[majit_ir::DescrRef],
+        fields: &[(u32, std::rc::Rc<VirtualStateInfo>)],
+    ) -> Vec<(majit_ir::DescrRef, VirtualStateInfo)> {
+        field_descrs
+            .iter()
+            .filter_map(|field_descr| {
+                let field_idx = field_descr
+                    .as_field_descr()
+                    .map(|fd| fd.index_in_parent() as u32)?;
+                fields
+                    .iter()
+                    .find(|(idx, _)| *idx == field_idx)
+                    .map(|(_, field_value)| (field_descr.clone(), (**field_value).clone()))
+            })
+            .collect()
+    }
+
     let mut result = Vec::new();
     for (idx, info) in state.virtual_state.state.iter().enumerate() {
         match &**info {
@@ -3430,11 +3477,7 @@ fn build_imported_virtuals_from_state(
                     kind: crate::optimizeopt::optimizer::ImportedVirtualKind::Instance {
                         known_class: *known_class,
                     },
-                    fields: field_descrs
-                        .iter()
-                        .zip(fields.iter())
-                        .map(|((_, fd), (_, fv))| (fd.clone(), (**fv).clone()))
-                        .collect(),
+                    fields: ordered_fields(field_descrs, fields),
                     head_load_descr_index: None,
                 });
             }
@@ -3447,11 +3490,7 @@ fn build_imported_virtuals_from_state(
                     inputarg_index: idx,
                     size_descr: descr.clone(),
                     kind: crate::optimizeopt::optimizer::ImportedVirtualKind::Struct,
-                    fields: field_descrs
-                        .iter()
-                        .zip(fields.iter())
-                        .map(|((_, fd), (_, fv))| (fd.clone(), (**fv).clone()))
-                        .collect(),
+                    fields: ordered_fields(field_descrs, fields),
                     head_load_descr_index: None,
                 });
             }

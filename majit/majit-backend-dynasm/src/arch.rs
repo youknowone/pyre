@@ -20,9 +20,10 @@ pub const IS_X86_64: bool = false;
 //        |      space         |                           |     |
 //        +--------------------+    <== aligned to 16 -----' ----'
 
-// All the rest of the data is in a GC-managed variable-size "frame".
-// This frame object's address is always stored in the register RBP.
-// A frame is jit.backend.llsupport.llmodel.JITFRAME = GcArray(Signed).
+// All the rest of the data is in a GC-managed variable-size jitframe.
+// This jitframe object's address is always stored in the frame register.
+// The object layout itself lives in llsupport/jitframe.py; arch.py only
+// defines the managed-register prefix inside `jf_frame`.
 
 /// arch.py:46 — rbp + rbx + r12 + r13 + r14 + r15 + threadlocal + 12 extra = 19
 #[cfg(target_arch = "x86_64")]
@@ -54,13 +55,3 @@ pub const THREADLOCAL_OFS: usize = 0;
 pub const DEFAULT_FRAME_BYTES: usize = (1 + FRAME_FIXED_SIZE) * WORD;
 #[cfg(target_arch = "aarch64")]
 pub const DEFAULT_FRAME_BYTES: usize = 0;
-
-// aarch64 arch constants (when target is aarch64)
-// TODO: read from rpython/jit/backend/aarch64/arch.py
-
-/// jitframe.py: offset of jf_descr in JITFRAME (in WORD units).
-/// RPython: JITFRAME header layout is fixed by GC.
-pub const JF_DESCR_OFS: usize = 0;
-
-/// jitframe.py: offset of first frame item (jf_frame[0]).
-pub const JF_FRAME_ITEM0_OFS: usize = 1;

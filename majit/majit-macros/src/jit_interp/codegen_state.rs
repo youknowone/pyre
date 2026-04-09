@@ -808,31 +808,15 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
         ) {
             quote! {
                 fn node_size_descr(&self) -> Option<majit_ir::DescrRef> {
-                    Some(majit_ir::descr::make_size_descr(#node_size))
+                    Some(self.node_descr_group().size_descr.clone())
                 }
 
                 fn node_value_descr(&self) -> Option<majit_ir::DescrRef> {
-                    Some(std::sync::Arc::new(
-                        majit_ir::descr::SimpleFieldDescr::new(
-                            0x8000_0001, // unique tag for value field
-                            #value_offset,
-                            8,
-                            majit_ir::Type::Int,
-                            true, // immutable: once set in New, value doesn't change
-                        ),
-                    ))
+                    Some(self.node_descr_group().field_descrs[0].clone())
                 }
 
                 fn node_next_descr(&self) -> Option<majit_ir::DescrRef> {
-                    Some(std::sync::Arc::new(
-                        majit_ir::descr::SimpleFieldDescr::new(
-                            0x8000_0002, // unique tag for next field
-                            #next_offset,
-                            8,
-                            majit_ir::Type::Ref,
-                            false,
-                        ),
-                    ))
+                    Some(self.node_descr_group().field_descrs[1].clone())
                 }
             }
         } else {
@@ -914,6 +898,18 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
     // RPython parity: live state carries stacksize + storage ref + selected.
     // Stack heads and sizes live on GC-managed shadow stack objects.
     if storage.linked_list_node_size.is_some() {
+        let node_size = storage
+            .linked_list_node_size
+            .as_ref()
+            .expect("linked_list mode requires linked_list_node_size");
+        let value_offset = storage
+            .linked_list_value_offset
+            .as_ref()
+            .expect("linked_list mode requires linked_list_value_offset");
+        let next_offset = storage
+            .linked_list_next_offset
+            .as_ref()
+            .expect("linked_list mode requires linked_list_next_offset");
         let pool_ref_field =
             pool_ref_field.expect("linked_list mode requires storage.pool_ref as a GcRef field");
         let selected_ref_field = selected_ref_field
@@ -957,6 +953,7 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                 linked_list_stack_refs: std::collections::HashMap<usize, majit_ir::OpRef>,
                 linked_list_heads: std::collections::HashMap<usize, majit_ir::OpRef>,
                 linked_list_tails: std::collections::HashMap<usize, majit_ir::OpRef>,
+                node_descr_group: std::sync::OnceLock<majit_ir::descr::SimpleDescrGroup>,
                 // Keep symbolic stacks for fallback (non-linked-list storages)
                 stacks: std::collections::HashMap<usize, majit_metainterp::SymbolicStack>,
             }
@@ -965,6 +962,41 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
             impl __JitSym {
                 fn total_slots(&self) -> usize {
                     0 // No flattened slots in linked list mode
+                }
+
+                fn node_descr_group(&self) -> &majit_ir::descr::SimpleDescrGroup {
+                    self.node_descr_group.get_or_init(|| {
+                        majit_ir::descr::make_simple_descr_group(
+                            0,
+                            #node_size,
+                            0,
+                            0,
+                            &[
+                                majit_ir::descr::SimpleFieldDescrSpec {
+                                    index: 0x8000_0001,
+                                    name: "linked_list_node.value".to_string(),
+                                    offset: #value_offset,
+                                    field_size: 8,
+                                    field_type: majit_ir::Type::Int,
+                                    is_immutable: true,
+                                    is_signed: true,
+                                    virtualizable: false,
+                                    index_in_parent: 0,
+                                },
+                                majit_ir::descr::SimpleFieldDescrSpec {
+                                    index: 0x8000_0002,
+                                    name: "linked_list_node.next".to_string(),
+                                    offset: #next_offset,
+                                    field_size: 8,
+                                    field_type: majit_ir::Type::Ref,
+                                    is_immutable: false,
+                                    is_signed: false,
+                                    virtualizable: false,
+                                    index_in_parent: 1,
+                                },
+                            ],
+                        )
+                    })
                 }
             }
 
@@ -1306,15 +1338,16 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                         current_selected_ref: Some(majit_ir::OpRef(3)),
                         storage_layout: meta.storage_layout.clone(),
                         loop_header_pc: header_pc,
-                        header_selected: meta.initial_selected,
-                        trace_started: false,
-                        meta_storage_count: meta.storage_layout.len(),
-                        linked_list_stack_refs: std::collections::HashMap::new(),
-                        linked_list_heads: std::collections::HashMap::new(),
-                        linked_list_tails: std::collections::HashMap::new(),
-                        stacks: std::collections::HashMap::new(),
+                            header_selected: meta.initial_selected,
+                            trace_started: false,
+                            meta_storage_count: meta.storage_layout.len(),
+                            linked_list_stack_refs: std::collections::HashMap::new(),
+                            linked_list_heads: std::collections::HashMap::new(),
+                            linked_list_tails: std::collections::HashMap::new(),
+                            node_descr_group: std::sync::OnceLock::new(),
+                            stacks: std::collections::HashMap::new(),
+                        }
                     }
-                }
 
                 fn is_compatible(&self, meta: &__JitMeta) -> bool {
                     meta.initial_selected == self.#sel_field

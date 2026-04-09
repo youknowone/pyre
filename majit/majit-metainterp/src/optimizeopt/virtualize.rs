@@ -1,4 +1,3 @@
-use std::cell::RefCell;
 /// Virtualize optimization pass: remove heap allocations for non-escaping objects.
 ///
 /// Translated from rpython/jit/metainterp/optimizeopt/virtualize.py.
@@ -401,7 +400,7 @@ impl OptVirtualize {
             let value_ref = ctx.get_box_replacement(value_ref);
             let mut set_op = Op::new(OpCode::SetfieldGc, &[alloc_ref, value_ref]);
             set_op.descr = Some(
-                get_field_descr(&vinfo.field_descrs, field_idx)
+                get_struct_field_descr(&vinfo.field_descrs, field_idx)
                     .unwrap_or_else(|| make_field_index_descr(field_idx)),
             );
             ctx.emit_extra(ctx.current_pass_idx, set_op);
@@ -483,7 +482,7 @@ impl OptVirtualize {
         for (field_idx, value_ref) in &vinfo.fields {
             let value_ref = self.force_virtual(*value_ref, ctx);
             let value_ref = ctx.get_box_replacement(value_ref);
-            let descr = get_field_descr(&vinfo.field_descrs, *field_idx)
+            let descr = get_struct_field_descr(&vinfo.field_descrs, *field_idx)
                 .unwrap_or_else(|| make_field_index_descr(*field_idx));
             let mut set_op = Op::new(OpCode::SetfieldGc, &[alloc_ref, value_ref]);
             set_op.descr = Some(descr);
@@ -732,6 +731,11 @@ impl OptVirtualize {
         let struct_ref = ctx.get_box_replacement(op.arg(0));
         let value_ref = ctx.get_box_replacement(op.arg(1));
         let field_idx = descr_index(&op.descr);
+        let parent_descr = op
+            .descr
+            .as_ref()
+            .and_then(|descr| descr.as_field_descr())
+            .and_then(|field_descr| field_descr.get_parent_descr());
         let is_raw_op = matches!(op.opcode, OpCode::SetfieldRaw);
         // Pre-extract constant value before mutable borrow of ptr_info.
         // Class pointer may be stored as Value::Int OR Value::Ref.
@@ -755,6 +759,9 @@ impl OptVirtualize {
 
         if let Some(info) = ctx.get_ptr_info_mut(struct_ref) {
             if info.is_virtual() {
+                if let Some(parent_descr) = parent_descr.clone() {
+                    info.init_fields(parent_descr, field_idx as usize);
+                }
                 match info {
                     PtrInfo::Virtual(vinfo) => {
                         // info.py:203-206 AbstractStructPtrInfo.setfield:
@@ -776,8 +783,19 @@ impl OptVirtualize {
                             return OptimizationResult::Remove;
                         }
                         set_field(&mut vinfo.fields, field_idx, value_ref);
-                        if let Some(descr) = &op.descr {
-                            set_field_descr(&mut vinfo.field_descrs, field_idx, descr.clone());
+                        // Preserve the original op.descr for force_box: even
+                        // when init_fields couldn't seed field_descrs from the
+                        // parent SizeDescr (e.g., test fixtures or descrs
+                        // missing parent_descr), we still need the immutability
+                        // / offset metadata to round-trip through the SetfieldGc
+                        // emitted by force_virtual_instance. Pad the slot vec
+                        // sparsely with synthetic placeholders.
+                        if let Some(orig) = op.descr.clone() {
+                            ensure_field_descr_slot(
+                                &mut vinfo.field_descrs,
+                                field_idx as usize,
+                                orig,
+                            );
                         }
                         debug_assert_no_typeptr_in_virtual_fields(
                             &vinfo.fields,
@@ -787,8 +805,12 @@ impl OptVirtualize {
                     }
                     PtrInfo::VirtualStruct(vinfo) => {
                         set_field(&mut vinfo.fields, field_idx, value_ref);
-                        if let Some(descr) = &op.descr {
-                            set_field_descr(&mut vinfo.field_descrs, field_idx, descr.clone());
+                        if let Some(orig) = op.descr.clone() {
+                            ensure_field_descr_slot(
+                                &mut vinfo.field_descrs,
+                                field_idx as usize,
+                                orig,
+                            );
                         }
                         return OptimizationResult::Remove;
                     }
@@ -1896,8 +1918,24 @@ pub(crate) fn debug_assert_no_typeptr_in_virtual_fields(
     );
 }
 
+/// Ensure the slot-indexed `field_descrs` vector has an entry at `slot`,
+/// padding earlier slots with a no-op placeholder so the original descr
+/// can be recovered later (e.g. by `force_virtual_instance`'s SetfieldGc
+/// emission). Used when test fixtures or short-trace ops carry a
+/// FieldDescr without `parent_descr`, so `init_fields` cannot seed the
+/// vec from `SizeDescr.all_field_descrs()`.
+fn ensure_field_descr_slot(field_descrs: &mut Vec<DescrRef>, slot: usize, descr: DescrRef) {
+    while field_descrs.len() < slot {
+        field_descrs.push(Arc::new(majit_ir::descr::SimpleSizeDescr::new(0, 0, 0)) as DescrRef);
+    }
+    if field_descrs.len() == slot {
+        field_descrs.push(descr);
+    } else {
+        field_descrs[slot] = descr;
+    }
+}
+
 fn set_field_descr(field_descrs: &mut Vec<(u32, DescrRef)>, field_idx: u32, descr: DescrRef) {
-    FIELD_DESCR_REGISTRY.with(|r| r.borrow_mut().insert(field_idx, descr.clone()));
     for entry in field_descrs.iter_mut() {
         if entry.0 == field_idx {
             entry.1 = descr;
@@ -1914,8 +1952,8 @@ fn get_field_descr(field_descrs: &[(u32, DescrRef)], field_idx: u32) -> Option<D
         .map(|(_, descr)| descr.clone())
 }
 
-thread_local! {
-    static FIELD_DESCR_REGISTRY: RefCell<HashMap<u32, DescrRef>> = RefCell::new(HashMap::new());
+fn get_struct_field_descr(field_descrs: &[DescrRef], field_idx: u32) -> Option<DescrRef> {
+    field_descrs.get(field_idx as usize).cloned()
 }
 
 fn get_field(fields: &[(u32, OpRef)], field_idx: u32) -> Option<OpRef> {
@@ -1927,7 +1965,15 @@ fn get_field(fields: &[(u32, OpRef)], field_idx: u32) -> Option<OpRef> {
 
 /// Extract the descriptor index used as a field identifier.
 fn descr_index(descr: &Option<DescrRef>) -> u32 {
-    descr.as_ref().map_or(0, |d| d.index())
+    descr.as_ref().map_or(0, |d| {
+        d.as_field_descr()
+            .and_then(|field_descr| {
+                field_descr
+                    .get_parent_descr()
+                    .map(|_| field_descr.index_in_parent() as u32)
+            })
+            .unwrap_or_else(|| d.index())
+    })
 }
 
 // ── Minimal descriptor for field identification in forced setfield ops ──
@@ -1974,9 +2020,6 @@ impl FieldDescr for FieldIndexDescr {
 }
 
 pub(crate) fn make_field_index_descr(idx: u32) -> DescrRef {
-    if let Some(descr) = FIELD_DESCR_REGISTRY.with(|r| r.borrow().get(&idx).cloned()) {
-        return descr;
-    }
     Arc::new(FieldIndexDescr(idx))
 }
 
@@ -2075,7 +2118,7 @@ mod tests {
     }
 
     impl FieldDescr for TestFieldDescr {
-        fn parent_descr(&self) -> Option<DescrRef> {
+        fn get_parent_descr(&self) -> Option<DescrRef> {
             Some(size_descr(0xFFFF_0000))
         }
         fn offset(&self) -> usize {
@@ -2115,7 +2158,7 @@ mod tests {
         // parent (matches the test setup for TestFieldDescr above).
         Arc::new(
             majit_ir::SimpleFieldDescr::new(idx, idx as usize * 8, 8, Type::Ref, false)
-                .with_parent_descr(size_descr(0xFFFF_0000)),
+                .with_parent_descr(size_descr(0xFFFF_0000), 0),
         )
     }
 
@@ -2355,17 +2398,24 @@ mod tests {
     }
 
     #[test]
-    fn test_make_field_index_descr_reuses_registered_real_descr() {
-        let field_idx = 0x1234_5678;
-        let real_descr = majit_ir::make_field_descr(0, 8, Type::Ref, false);
-        let mut field_descrs = Vec::new();
-        set_field_descr(&mut field_descrs, field_idx, real_descr.clone());
-
-        let descr = make_field_index_descr(field_idx);
-        let fd = descr.as_field_descr().expect("field descr");
-        assert_eq!(fd.field_size(), 8);
-        assert_eq!(fd.field_type(), Type::Ref);
-        assert_eq!(fd.offset(), 0);
+    fn test_descr_index_prefers_parent_local_field_slot() {
+        let parent = majit_ir::make_size_descr_full(100, 16, 1);
+        // Keep `parent` alive across the assertion: with_parent_descr stores
+        // only a Weak<DescrRef>, so the local Arc must outlive descr_index().
+        let descr: DescrRef = Arc::new(
+            majit_ir::descr::SimpleFieldDescr::new_with_name(
+                200,
+                8,
+                8,
+                Type::Ref,
+                false,
+                false,
+                "T.x".to_string(),
+            )
+            .with_parent_descr(parent.clone(), 3),
+        );
+        assert_eq!(descr_index(&Some(descr as DescrRef)), 3);
+        drop(parent);
     }
 
     #[test]
@@ -2492,6 +2542,61 @@ mod tests {
             "all ops should be removed; got {} ops: {:?}",
             result.len(),
             result.iter().map(|o| o.opcode).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_setfield_initializes_parent_backed_fielddescrs() {
+        let group = majit_ir::descr::make_simple_descr_group(
+            1,
+            24,
+            1,
+            0,
+            &[majit_ir::descr::SimpleFieldDescrSpec {
+                index: 10,
+                name: "Node.value".to_string(),
+                offset: 16,
+                field_size: 8,
+                field_type: Type::Int,
+                is_immutable: false,
+                is_signed: true,
+                virtualizable: false,
+                index_in_parent: 0,
+            }],
+        );
+        let sd = group.size_descr.clone() as DescrRef;
+        let fd = group.field_descrs[0].clone() as DescrRef;
+
+        let mut ctx = OptContext::new(2);
+        let mut pass = OptVirtualize::new();
+        pass.setup();
+
+        let mut new_op = Op::with_descr(OpCode::NewWithVtable, &[], sd);
+        new_op.pos = OpRef(0);
+        assert!(matches!(
+            pass.propagate_forward(&new_op, &mut ctx),
+            OptimizationResult::Remove
+        ));
+
+        let mut set_op = Op::with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(100)], fd);
+        set_op.pos = OpRef(1);
+        assert!(matches!(
+            pass.propagate_forward(&set_op, &mut ctx),
+            OptimizationResult::Remove
+        ));
+
+        let info = ctx.get_ptr_info(OpRef(0)).expect("virtual info missing");
+        let PtrInfo::Virtual(vinfo) = info else {
+            panic!("expected Virtual ptr info, got {info:?}");
+        };
+        assert_eq!(vinfo.fields, vec![(0, OpRef(100))]);
+        assert_eq!(vinfo.field_descrs.len(), 1);
+        assert_eq!(
+            vinfo.field_descrs[0]
+                .as_field_descr()
+                .expect("field descr")
+                .index_in_parent(),
+            0
         );
     }
 

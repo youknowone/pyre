@@ -1243,6 +1243,8 @@ impl OptHeap {
             }
         }
 
+        let struct_ref = ctx.ensure_ptr_info_arg0(op);
+
         // heap.py:103-120: getfield_from_cache — 3-way aliasing check.
         let (raw_obj, field_idx) = key;
         // heap.py:645
@@ -1572,6 +1574,13 @@ impl OptHeap {
     }
 
     fn optimize_getarrayitem(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+        // Install ArrayPtrInfo via ensure_ptr_info_arg0 (return value
+        // unused — we re-borrow further down via a fresh call so the
+        // intermediate cache mutations can take &mut ctx without
+        // tripping the borrow checker).
+        let _ = ctx.ensure_ptr_info_arg0(op);
+        let array_ref = ctx.get_box_replacement(op.arg(0));
+
         // Try constant-index cache first.
         if let Some(key) = Self::arrayitem_key(op, ctx) {
             let (array, descr_idx, const_index) = key;
@@ -1650,7 +1659,7 @@ impl OptHeap {
         // — variable-index cache via per-arraydescr submap.
         if let Some(descr) = op.descr.as_ref() {
             let descr_idx = descr.index();
-            let arrayinfo = ctx.get_box_replacement(op.arg(0));
+            let arrayinfo = array_ref;
             let indexbox = ctx.get_box_replacement(op.arg(1));
             if let Some(submap) = self.cached_arrayitems.get(&descr_idx) {
                 if let Some(cached) = submap.lookup_cached(arrayinfo, indexbox, ctx) {
@@ -1663,10 +1672,8 @@ impl OptHeap {
         }
 
         // heap.py line 701: make_nonnull(op.getarg(0))
-        vb_set(
-            &mut self.known_nonnull,
-            ctx.get_box_replacement(op.arg(0)).0,
-        );
+        vb_set(&mut self.known_nonnull, array_ref.0);
+        ctx.make_nonnull(op.arg(0));
         OptimizationResult::Emit(op.clone())
     }
 
@@ -2643,7 +2650,7 @@ mod tests {
     }
 
     impl FieldDescr for TestDescr {
-        fn parent_descr(&self) -> Option<DescrRef> {
+        fn get_parent_descr(&self) -> Option<DescrRef> {
             Some(test_parent_descr())
         }
         fn offset(&self) -> usize {
@@ -2676,7 +2683,7 @@ mod tests {
     }
 
     impl FieldDescr for ImmutableDescr {
-        fn parent_descr(&self) -> Option<DescrRef> {
+        fn get_parent_descr(&self) -> Option<DescrRef> {
             Some(test_parent_descr())
         }
         fn offset(&self) -> usize {

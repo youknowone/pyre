@@ -481,7 +481,7 @@ impl VirtualizableInfo {
             Some(parent) => std::sync::Arc::new(
                 majit_ir::SimpleFieldDescr::new(0, offset, field_size, field_type, false)
                     .with_signed(signed)
-                    .with_parent_descr(parent.clone()),
+                    .with_parent_descr(parent.clone(), 0),
             ),
             None => make_field_descr(offset, field_size, field_type, signed),
         }

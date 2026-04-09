@@ -962,6 +962,55 @@ impl OptIntBounds {
     }
 
     fn propagate_bounds_backward_op(&mut self, op: &Op, ctx: &mut OptContext) {
+        // RPython parity guard: every arm below calls getintbound(op.pos) on
+        // the op's result. RPython's Box.type is intrinsic so this is always
+        // int-typed. pyre's trace pipeline can leave stale Ref/Void typed
+        // entries in `value_types` for ops surviving cut_trace_from / Phase 2
+        // import. Skip backward propagation when the result is non-Int.
+        let pos_tp = ctx.opref_type(ctx.get_box_replacement(op.pos));
+        if pos_tp.is_some() && pos_tp != Some(majit_ir::Type::Int) {
+            return;
+        }
+        // For arms that ALSO call getintbound on args (arithmetic int ops),
+        // verify args are int-typed. Ops that take a Ref obj as arg
+        // (GetfieldGcI etc.) call getintbound only on op.pos so they don't
+        // need this check.
+        let arms_with_int_args = matches!(
+            op.opcode,
+            OpCode::IntAdd
+                | OpCode::IntAddOvf
+                | OpCode::IntSub
+                | OpCode::IntSubOvf
+                | OpCode::IntMul
+                | OpCode::IntMulOvf
+                | OpCode::IntAnd
+                | OpCode::IntOr
+                | OpCode::IntXor
+                | OpCode::IntLshift
+                | OpCode::IntRshift
+                | OpCode::UintRshift
+                | OpCode::IntFloorDiv
+                | OpCode::IntMod
+                | OpCode::IntNeg
+                | OpCode::IntInvert
+                | OpCode::IntForceGeZero
+                | OpCode::IntSignext
+                | OpCode::IntLt
+                | OpCode::IntLe
+                | OpCode::IntGt
+                | OpCode::IntGe
+                | OpCode::IntEq
+                | OpCode::IntNe
+        );
+        if arms_with_int_args {
+            for &a in op.args.iter() {
+                let resolved = ctx.get_box_replacement(a);
+                let t = ctx.opref_type(resolved);
+                if t.is_some() && t != Some(majit_ir::Type::Int) {
+                    return;
+                }
+            }
+        }
         match op.opcode {
             // intbounds.py:701-712 propagate_bounds_INT_ADD
             //
@@ -1299,6 +1348,43 @@ impl Default for OptIntBounds {
 
 impl Optimization for OptIntBounds {
     fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+        // RPython parity guard: optimize_int_* / optimize_uint_* / overflow
+        // arms call getintbound on op args. RPython's Box.type is intrinsic,
+        // so all args of an int op are guaranteed to be int-typed. pyre's
+        // trace pipeline (cut_trace_from / Phase 2 import) can leave stale
+        // arg references where the resolved OpRef has a Void or Ref entry
+        // in `value_types` from a previous trace position. Skip the
+        // dispatch when any arg fails this invariant — passing through
+        // emit() preserves the op for the backend without polluting
+        // intbound state with mismatched types.
+        let int_op_takes_int_args = matches!(
+            op.opcode,
+            OpCode::IntLt
+                | OpCode::IntLe
+                | OpCode::IntGt
+                | OpCode::IntGe
+                | OpCode::IntEq
+                | OpCode::IntNe
+                | OpCode::UintLt
+                | OpCode::UintLe
+                | OpCode::UintGt
+                | OpCode::UintGe
+                | OpCode::IntSignext
+                | OpCode::IntAddOvf
+                | OpCode::IntSubOvf
+                | OpCode::IntMulOvf
+                | OpCode::GuardTrue
+                | OpCode::GuardFalse
+        );
+        if int_op_takes_int_args {
+            for &a in op.args.iter() {
+                let resolved = ctx.get_box_replacement(a);
+                let t = ctx.opref_type(resolved);
+                if t.is_some() && t != Some(majit_ir::Type::Int) {
+                    return OptimizationResult::PassOn;
+                }
+            }
+        }
         let result = match op.opcode {
             // ── Comparisons ──
             OpCode::IntLt => self.optimize_int_lt(op, ctx),

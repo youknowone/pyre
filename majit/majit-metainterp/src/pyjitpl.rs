@@ -2157,6 +2157,7 @@ impl<M: Clone> MetaInterp<M> {
             result
         }));
         constant_types = updated_constant_types;
+        let mut retried_without_unroll = false;
         let (optimized_ops, final_num_inputs) = match optimize_result {
             Ok(result) => result,
             Err(payload) => {
@@ -2229,9 +2230,7 @@ impl<M: Clone> MetaInterp<M> {
                                         green_key
                                     );
                                 }
-                                // compile.py:236-245 compile_simple_loop parity:
-                                unroll_opt.target_tokens =
-                                    vec![crate::optimizeopt::unroll::TargetToken::new_preamble(0)];
+                                retried_without_unroll = true;
                                 constants = retry_constants;
                                 let ni = simple_opt.final_num_inputs();
                                 (retry_ops, ni)
@@ -2279,13 +2278,13 @@ impl<M: Clone> MetaInterp<M> {
         // `vable_*` operations keep the hot path on boxes instead of
         // re-materializing `GetfieldRaw*`/`GetarrayitemRaw*` entry ops.
         let (inputargs, optimized_ops) = (inputargs, optimized_ops);
-        let mut optimized_ops =
+        let mut compiled_ops =
             compile::normalize_closing_jump_args(optimized_ops, &constants, final_num_inputs);
 
         if crate::majit_log_enabled() {
             eprintln!("--- trace (after opt) ---");
-            eprint!("{}", majit_ir::format_trace(&optimized_ops, &constants));
-            for op in &optimized_ops {
+            eprint!("{}", majit_ir::format_trace(&compiled_ops, &constants));
+            for op in &compiled_ops {
                 if op.opcode == majit_ir::OpCode::GuardNotInvalidated {
                     if let Some(ref fa) = op.fail_args {
                         let raw: Vec<String> =
@@ -2303,7 +2302,7 @@ impl<M: Clone> MetaInterp<M> {
         //
         // TODO: implement GUARD_NOT_INVALIDATED + signal-based invalidation
         // for periodic exit from compiled loops.
-        let has_guard = optimized_ops.iter().any(|op| op.opcode.is_guard());
+        let has_guard = compiled_ops.iter().any(|op| op.opcode.is_guard());
         if !has_guard {
             if crate::majit_log_enabled() {
                 eprintln!("[jit] abort: guardless loop (no interrupt support)");
@@ -2338,12 +2337,37 @@ impl<M: Clone> MetaInterp<M> {
         self.backend.set_next_trace_id(trace_id);
         self.backend.set_next_header_pc(green_key);
 
+        let front_target_tokens = if retried_without_unroll {
+            let target_token = crate::optimizeopt::unroll::TargetToken::new_loop(token_num);
+            if let Some(jump_op) = compiled_ops
+                .last_mut()
+                .filter(|op| op.opcode == OpCode::Jump)
+            {
+                jump_op.descr = Some(target_token.as_jump_target_descr());
+            }
+            let mut label_op = majit_ir::Op::new(
+                majit_ir::OpCode::Label,
+                &inputargs
+                    .iter()
+                    .map(|ia| majit_ir::OpRef(ia.index))
+                    .collect::<Vec<_>>(),
+            );
+            label_op.pos = majit_ir::OpRef::NONE;
+            label_op.descr = Some(target_token.as_jump_target_descr());
+            compiled_ops.insert(0, label_op);
+            vec![target_token]
+        } else if unroll_opt.target_tokens.is_empty() {
+            prior_front_target_tokens.clone()
+        } else {
+            unroll_opt.target_tokens.clone()
+        };
+
         // virtualizable.py:86 read_boxes: set num_scalar_inputargs on token
         // so the backend can find the first local in force_fn paths.
         token.num_scalar_inputargs = self.num_scalar_inputargs;
         let compile_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.backend
-                .compile_loop(&inputargs, &optimized_ops, &mut token)
+                .compile_loop(&inputargs, &compiled_ops, &mut token)
         }));
         let compile_result = match compile_result {
             Ok(r) => r,
@@ -2396,13 +2420,13 @@ impl<M: Clone> MetaInterp<M> {
                 let (resume_data, guard_op_indices, mut exit_layouts) =
                     compile::build_guard_metadata(
                         &inputargs,
-                        &optimized_ops,
+                        &compiled_ops,
                         green_key,
                         &compiled_constants,
                         &compiled_constant_types,
                     );
                 let mut terminal_exit_layouts =
-                    compile::build_terminal_exit_layouts(&inputargs, &optimized_ops);
+                    compile::build_terminal_exit_layouts(&inputargs, &compiled_ops);
                 if let Some(backend_layouts) = self.backend.compiled_fail_descr_layouts(&token) {
                     compile::merge_backend_exit_layouts(&mut exit_layouts, &backend_layouts);
                 }
@@ -2439,7 +2463,7 @@ impl<M: Clone> MetaInterp<M> {
                     let pos_to_fail: HashMap<u32, u32> = guard_op_indices
                         .iter()
                         .filter_map(|(&fi, &op_idx)| {
-                            optimized_ops.get(op_idx).map(|op| (op.pos.0, fi))
+                            compiled_ops.get(op_idx).map(|op| (op.pos.0, fi))
                         })
                         .collect();
                     let mut result: HashMap<
@@ -2459,7 +2483,7 @@ impl<M: Clone> MetaInterp<M> {
                     CompiledTrace {
                         inputargs: inputargs.clone(),
                         resume_data,
-                        ops: optimized_ops,
+                        ops: compiled_ops,
                         constants: compiled_constants,
                         constant_types: compiled_constant_types.clone(),
                         guard_op_indices,
@@ -2498,11 +2522,7 @@ impl<M: Clone> MetaInterp<M> {
                         token,
                         num_inputs: inputargs.len(),
                         meta,
-                        front_target_tokens: if unroll_opt.target_tokens.is_empty() {
-                            prior_front_target_tokens
-                        } else {
-                            unroll_opt.target_tokens.clone()
-                        },
+                        front_target_tokens,
                         retraced_count: unroll_opt.retraced_count,
                         root_trace_id: trace_id,
                         traces,
@@ -2621,7 +2641,24 @@ impl<M: Clone> MetaInterp<M> {
         finish_args: &[OpRef],
         bridge_origin: Option<(u64, u32)>,
     ) -> CompileOutcome {
-        self.compile_trace_inner(green_key, finish_args, bridge_origin, None)
+        self.compile_trace_inner(green_key, finish_args, bridge_origin, None, None)
+    }
+
+    /// compile.py:1002-1021 ResumeFromInterpDescr parity.
+    pub fn compile_trace_from_interp(
+        &mut self,
+        green_key: u64,
+        finish_args: &[OpRef],
+        original_green_key: u64,
+        entry_meta: M,
+    ) -> CompileOutcome {
+        self.compile_trace_inner(
+            green_key,
+            finish_args,
+            None,
+            None,
+            Some((original_green_key, entry_meta)),
+        )
     }
 
     /// compile_trace with ends_with_jump=false (FINISH).
@@ -2632,7 +2669,13 @@ impl<M: Clone> MetaInterp<M> {
         bridge_origin: Option<(u64, u32)>,
         finish_descr: majit_ir::DescrRef,
     ) -> CompileOutcome {
-        self.compile_trace_inner(green_key, finish_args, bridge_origin, Some(finish_descr))
+        self.compile_trace_inner(
+            green_key,
+            finish_args,
+            bridge_origin,
+            Some(finish_descr),
+            None,
+        )
     }
 
     fn compile_trace_inner(
@@ -2641,6 +2684,7 @@ impl<M: Clone> MetaInterp<M> {
         finish_args: &[OpRef],
         bridge_origin: Option<(u64, u32)>,
         finish_descr: Option<majit_ir::DescrRef>,
+        entry_bridge: Option<(u64, M)>,
     ) -> CompileOutcome {
         let ends_with_jump = finish_descr.is_none();
         let ctx = match self.tracing.as_mut() {
@@ -2656,7 +2700,16 @@ impl<M: Clone> MetaInterp<M> {
         if let Some(descr) = finish_descr {
             ctx.recorder.finish(finish_args, descr);
         } else {
-            ctx.recorder.close_loop(finish_args);
+            let jump_descr = self
+                .compiled_loops
+                .get(&green_key)
+                .and_then(|compiled| compiled.front_target_tokens.first())
+                .map(|target_token| target_token.as_jump_target_descr());
+            let Some(jump_descr) = jump_descr else {
+                return CompileOutcome::Cancelled;
+            };
+            ctx.recorder
+                .close_loop_with_descr(finish_args, Some(jump_descr));
         }
 
         // Snapshot the trace ops (including JUMP) for bridge compilation.
@@ -2736,16 +2789,16 @@ impl<M: Clone> MetaInterp<M> {
                 }
             }
             None => {
-                // compile.py:1006-1022 — ResumeFromInterpDescr path: entry
-                // bridge. Compile as a fresh entry and attach to interpreter.
-                let fail_descr_types: Vec<Type> = bridge_inputargs.iter().map(|a| a.tp).collect();
-                let fail_descr_ref =
-                    crate::fail_descr::make_fail_descr_typed_with_index(0, fail_descr_types);
-                let fail_descr: &dyn majit_ir::FailDescr = fail_descr_ref.as_fail_descr().unwrap();
-                let success = self.compile_bridge(
+                // compile.py:1006-1022 — ResumeFromInterpDescr path:
+                // compile a fresh entry bridge and attach it to the
+                // original interpreter green key.
+                let Some((original_green_key, entry_meta)) = entry_bridge else {
+                    return CompileOutcome::Cancelled;
+                };
+                let success = self.compile_entry_bridge(
                     green_key,
-                    0,
-                    fail_descr,
+                    original_green_key,
+                    entry_meta,
                     &bridge_ops,
                     &bridge_inputargs,
                     constants,
@@ -2758,7 +2811,7 @@ impl<M: Clone> MetaInterp<M> {
                 );
                 if success {
                     CompileOutcome::Compiled {
-                        green_key: 0,
+                        green_key: original_green_key,
                         from_retry: false,
                     }
                 } else {
@@ -3741,6 +3794,28 @@ impl<M: Clone> MetaInterp<M> {
             });
         }
 
+        // compile.py:236-245 parity: simple-loop compilation owns a real
+        // TargetToken, prepends LABEL(descr=target_token), and patches the
+        // closing JUMP to the same token.
+        let target_token = crate::optimizeopt::unroll::TargetToken::new_loop(token_num);
+        let mut compiled_ops = optimized_ops.clone();
+        if let Some(jump_op) = compiled_ops
+            .last_mut()
+            .filter(|op| op.opcode == OpCode::Jump)
+        {
+            jump_op.descr = Some(target_token.as_jump_target_descr());
+        }
+        let mut label_op = majit_ir::Op::new(
+            majit_ir::OpCode::Label,
+            &inputargs
+                .iter()
+                .map(|ia| majit_ir::OpRef(ia.index))
+                .collect::<Vec<_>>(),
+        );
+        label_op.pos = majit_ir::OpRef::NONE;
+        label_op.descr = Some(target_token.as_jump_target_descr());
+        compiled_ops.insert(0, label_op);
+
         let compiled_constants = constants.clone();
         let compiled_constant_types = constant_types.clone();
         self.backend.set_constants(constants);
@@ -3748,20 +3823,20 @@ impl<M: Clone> MetaInterp<M> {
 
         match self
             .backend
-            .compile_loop(&inputargs, &optimized_ops, &mut token)
+            .compile_loop(&inputargs, &compiled_ops, &mut token)
         {
             Ok(_) => {
                 self.assign_guard_hashes(&token);
                 let (resume_data, guard_op_indices, mut exit_layouts) =
                     compile::build_guard_metadata(
                         &inputargs,
-                        &optimized_ops,
+                        &compiled_ops,
                         green_key,
                         &compiled_constants,
                         &compiled_constant_types,
                     );
                 let mut terminal_exit_layouts =
-                    compile::build_terminal_exit_layouts(&inputargs, &optimized_ops);
+                    compile::build_terminal_exit_layouts(&inputargs, &compiled_ops);
                 if let Some(backend_layouts) = self.backend.compiled_fail_descr_layouts(&token) {
                     compile::merge_backend_exit_layouts(&mut exit_layouts, &backend_layouts);
                 }
@@ -3830,7 +3905,7 @@ impl<M: Clone> MetaInterp<M> {
                         snapshots: Vec::new(),
                         inputargs: trace.inputargs.clone(),
                         resume_data,
-                        ops: optimized_ops,
+                        ops: compiled_ops,
                         constants: compiled_constants,
                         constant_types: compiled_constant_types,
                         guard_op_indices,
@@ -3840,10 +3915,6 @@ impl<M: Clone> MetaInterp<M> {
                         jitcode: None,
                     },
                 );
-                // compile.py:236-245 parity: create TargetToken with
-                // front_target_tokens so has_compiled_targets() returns true.
-                // This is the LABEL that bridges can close back to.
-                let target_token = crate::optimizeopt::unroll::TargetToken::new_preamble(token_num);
                 let mut previous_tokens: Vec<JitCellToken> = Vec::new();
                 if let Some(old_entry) = self.compiled_loops.remove(&green_key) {
                     previous_tokens.push(old_entry.token);
@@ -5547,6 +5618,327 @@ impl<M: Clone> MetaInterp<M> {
         let (_, trace_data) = Self::trace_for_exit(compiled, trace_id)?;
         let exit_layout = trace_data.exit_layouts.get(&fail_index)?;
         exit_layout.rd_virtuals.clone()
+    }
+
+    /// compile.py:1002-1021 ResumeFromInterpDescr.compile_and_attach parity.
+    ///
+    /// Optimize against the already-compiled loop at `green_key`, then
+    /// compile the result as a fresh interpreter entry under
+    /// `original_green_key`.
+    pub fn compile_entry_bridge(
+        &mut self,
+        green_key: u64,
+        original_green_key: u64,
+        meta: M,
+        bridge_ops: &[majit_ir::Op],
+        bridge_inputargs: &[majit_ir::InputArg],
+        constants: HashMap<u32, i64>,
+        mut constant_types: HashMap<u32, Type>,
+        snapshot_boxes: HashMap<i32, Vec<majit_ir::OpRef>>,
+        snapshot_frame_sizes: HashMap<i32, Vec<usize>>,
+        snapshot_vable_boxes: HashMap<i32, Vec<majit_ir::OpRef>>,
+        snapshot_frame_pcs: HashMap<i32, Vec<(i32, i32)>>,
+        snapshot_box_types: HashMap<u32, Type>,
+    ) -> bool {
+        if !self.compiled_loops.contains_key(&green_key) {
+            return false;
+        }
+
+        let mut optimizer = self.make_optimizer();
+        let mut constants = constants;
+        optimizer.constant_types = constant_types.clone();
+        for arg in bridge_inputargs {
+            optimizer.constant_types.insert(arg.index, arg.tp);
+        }
+        optimizer.snapshot_boxes = snapshot_boxes;
+        optimizer.snapshot_frame_sizes = snapshot_frame_sizes;
+        optimizer.snapshot_vable_boxes = snapshot_vable_boxes;
+        optimizer.snapshot_frame_pcs = snapshot_frame_pcs;
+        optimizer.snapshot_box_types = snapshot_box_types;
+        optimizer.trace_inputarg_types = bridge_inputargs.iter().map(|ia| ia.tp).collect();
+
+        let (retraced_count, loop_num_inputs) = {
+            let compiled = self.compiled_loops.get(&green_key).unwrap();
+            if let Some(source_trace) = compiled.traces.get(&compiled.root_trace_id) {
+                for (&idx, &tp) in &source_trace.constant_types {
+                    optimizer.constant_types.entry(idx).or_insert(tp);
+                }
+            }
+            (compiled.retraced_count, compiled.num_inputs)
+        };
+        let retrace_limit = 5u32;
+        let bridge_optimize_result = {
+            let compiled = self.compiled_loops.get_mut(&green_key).unwrap();
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                optimizer.optimize_bridge(
+                    bridge_ops,
+                    &mut constants,
+                    bridge_inputargs.len(),
+                    &mut compiled.front_target_tokens,
+                    true,
+                    retraced_count,
+                    retrace_limit,
+                    None,
+                    Some(loop_num_inputs),
+                )
+            }))
+        };
+        let (optimized_ops, retrace_requested) = match bridge_optimize_result {
+            Ok(result) => result,
+            Err(payload) => {
+                if payload
+                    .downcast_ref::<crate::optimize::InvalidLoop>()
+                    .is_some()
+                {
+                    if crate::majit_log_enabled() {
+                        eprintln!(
+                            "[jit] compile_entry_bridge: InvalidLoop target={} original={}",
+                            green_key, original_green_key
+                        );
+                    }
+                    return false;
+                }
+                std::panic::resume_unwind(payload);
+            }
+        };
+        for (&idx, &(val, tp)) in &optimizer.bridge_preamble_constants {
+            constants.entry(idx).or_insert(val);
+            constant_types.entry(idx).or_insert(tp);
+        }
+        {
+            let compiled = self.compiled_loops.get(&green_key).unwrap();
+            if let Some(source_trace) = compiled.traces.get(&compiled.root_trace_id) {
+                let mut defined: std::collections::HashSet<u32> = std::collections::HashSet::new();
+                for i in 0..bridge_inputargs.len() {
+                    defined.insert(i as u32);
+                }
+                for op in &optimized_ops {
+                    if !op.pos.is_none() {
+                        defined.insert(op.pos.0);
+                    }
+                }
+                let mut missing: Vec<u32> = Vec::new();
+                for op in &optimized_ops {
+                    for &arg in &op.args {
+                        let idx = arg.0;
+                        if !defined.contains(&idx) && !constants.contains_key(&idx) {
+                            missing.push(idx);
+                        }
+                    }
+                    if let Some(ref fa) = op.fail_args {
+                        for &arg in fa {
+                            let idx = arg.0;
+                            if !defined.contains(&idx) && !constants.contains_key(&idx) {
+                                missing.push(idx);
+                            }
+                        }
+                    }
+                }
+                for idx in missing {
+                    if let Some(&val) = source_trace.constants.get(&idx) {
+                        constants.insert(idx, val);
+                        if let Some(&tp) = source_trace.constant_types.get(&idx) {
+                            constant_types.insert(idx, tp);
+                        }
+                    }
+                }
+            }
+        }
+        if retrace_requested {
+            if let Some(compiled) = self.compiled_loops.get_mut(&green_key) {
+                compiled.retraced_count += 1;
+            }
+            if let Some(es) = optimizer.exported_loop_state.take() {
+                let renamed_inputargs: Vec<InputArg> = es
+                    .renamed_inputargs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &opref)| {
+                        let tp = es
+                            .renamed_inputarg_types
+                            .get(i)
+                            .copied()
+                            .unwrap_or(Type::Int);
+                        InputArg::from_type(tp, opref.0)
+                    })
+                    .collect();
+                self.retrace_needed(
+                    green_key,
+                    optimized_ops.clone(),
+                    renamed_inputargs,
+                    constants,
+                    es,
+                );
+            }
+            self.retrace_after_bridge = true;
+            return false;
+        }
+
+        let optimized_ops = compile::strip_stray_overflow_guards(optimized_ops);
+        let num_optimized_ops = optimized_ops.len();
+        let compiled_constants = constants.clone();
+        let compiled_constant_types = constant_types.clone();
+        let trace_id = self.alloc_trace_id();
+
+        if crate::majit_log_enabled() {
+            eprintln!(
+                "[jit][entry-bridge] original_key={} target_key={} inputs={:?}",
+                original_green_key, green_key, bridge_inputargs
+            );
+            for (i, op) in optimized_ops.iter().enumerate() {
+                eprintln!(
+                    "[jit][entry-bridge] op[{i}] {:?} pos={:?} args={:?} descr={:?}",
+                    op.opcode, op.pos, op.args, op.descr
+                );
+            }
+        }
+
+        self.backend.set_constants(constants);
+        self.backend.set_next_trace_id(trace_id);
+        self.backend.set_next_header_pc(original_green_key);
+
+        let mut token = JitCellToken::new(self.warm_state.alloc_token_number());
+        token.green_key = original_green_key;
+        token.num_scalar_inputargs = self.num_scalar_inputargs;
+
+        let compile_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.backend
+                .compile_loop(bridge_inputargs, &optimized_ops, &mut token)
+        }));
+        let compile_result = match compile_result {
+            Ok(r) => r,
+            Err(_) => return false,
+        };
+
+        match compile_result {
+            Ok(_) => {
+                self.assign_guard_hashes(&token);
+                let (resume_data, guard_op_indices, mut exit_layouts) =
+                    compile::build_guard_metadata(
+                        bridge_inputargs,
+                        &optimized_ops,
+                        original_green_key,
+                        &compiled_constants,
+                        &compiled_constant_types,
+                    );
+                let mut terminal_exit_layouts =
+                    compile::build_terminal_exit_layouts(bridge_inputargs, &optimized_ops);
+                if let Some(backend_layouts) = self.backend.compiled_fail_descr_layouts(&token) {
+                    compile::merge_backend_exit_layouts(&mut exit_layouts, &backend_layouts);
+                }
+                if let Some(backend_layouts) = self.backend.compiled_terminal_exit_layouts(&token) {
+                    compile::merge_backend_terminal_exit_layouts(
+                        &mut terminal_exit_layouts,
+                        &backend_layouts,
+                    );
+                }
+                let trace_info = self.backend.compiled_trace_info(&token, trace_id);
+                let mut resume_data = resume_data;
+                compile::enrich_guard_resume_layouts_for_trace(
+                    &mut resume_data,
+                    &mut exit_layouts,
+                    trace_id,
+                    bridge_inputargs,
+                    trace_info.as_ref(),
+                );
+                compile::patch_backend_guard_recovery_layouts_for_trace(
+                    &mut self.backend,
+                    &token,
+                    trace_id,
+                    &mut exit_layouts,
+                );
+                compile::patch_backend_terminal_recovery_layouts_for_trace(
+                    &mut self.backend,
+                    &token,
+                    trace_id,
+                    &mut terminal_exit_layouts,
+                );
+                let bridge_optimizer_knowledge = {
+                    let pos_to_fail: HashMap<u32, u32> = guard_op_indices
+                        .iter()
+                        .filter_map(|(&fi, &op_idx)| {
+                            optimized_ops.get(op_idx).map(|op| (op.pos.0, fi))
+                        })
+                        .collect();
+                    let mut result: HashMap<u32, OptimizerKnowledge> = HashMap::new();
+                    for (guard_pos, knowledge) in &optimizer.per_guard_knowledge {
+                        if let Some(&fi) = pos_to_fail.get(&guard_pos.0) {
+                            result.insert(fi, knowledge.clone());
+                        }
+                    }
+                    result
+                };
+                let mut traces = HashMap::new();
+                traces.insert(
+                    trace_id,
+                    CompiledTrace {
+                        snapshots: Vec::new(),
+                        inputargs: bridge_inputargs.to_vec(),
+                        resume_data,
+                        ops: optimized_ops,
+                        constants: compiled_constants,
+                        constant_types: compiled_constant_types,
+                        guard_op_indices,
+                        exit_layouts,
+                        terminal_exit_layouts,
+                        optimizer_knowledge: bridge_optimizer_knowledge,
+                        jitcode: None,
+                    },
+                );
+
+                let front_target_tokens = self
+                    .compiled_loops
+                    .get(&original_green_key)
+                    .map(|c| c.front_target_tokens.clone())
+                    .unwrap_or_else(|| {
+                        if original_green_key == green_key {
+                            self.compiled_loops
+                                .get(&green_key)
+                                .map(|c| c.front_target_tokens.clone())
+                                .unwrap_or_default()
+                        } else {
+                            Vec::new()
+                        }
+                    });
+                let retraced_count = self
+                    .compiled_loops
+                    .get(&original_green_key)
+                    .map(|c| c.retraced_count)
+                    .unwrap_or(0);
+                let mut previous_tokens: Vec<JitCellToken> = Vec::new();
+                if let Some(old_entry) = self.compiled_loops.remove(&original_green_key) {
+                    self.backend.migrate_bridges(&old_entry.token, &token);
+                    previous_tokens.push(old_entry.token);
+                    previous_tokens.extend(old_entry.previous_tokens);
+                    for (tid, ct) in old_entry.traces {
+                        traces.entry(tid).or_insert(ct);
+                    }
+                }
+                self.compiled_loops.insert(
+                    original_green_key,
+                    CompiledEntry {
+                        token,
+                        num_inputs: bridge_inputargs.len(),
+                        meta,
+                        front_target_tokens,
+                        retraced_count,
+                        root_trace_id: trace_id,
+                        traces,
+                        previous_tokens,
+                    },
+                );
+                let install_num = self.warm_state.alloc_token_number();
+                let install_token = JitCellToken::new(install_num);
+                self.warm_state
+                    .attach_procedure_to_interp(original_green_key, install_token);
+                self.stats.loops_compiled += 1;
+                if let Some(ref hook) = self.hooks.on_compile_loop {
+                    hook(original_green_key, bridge_ops.len(), num_optimized_ops);
+                }
+                true
+            }
+            Err(_) => false,
+        }
     }
 
     /// Compile a bridge from a guard failure point.

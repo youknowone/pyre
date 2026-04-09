@@ -344,13 +344,12 @@ pub struct OptContext {
 #[inline(always)]
 pub(crate) fn is_typeptr_field(
     field_idx: u32,
-    field_descrs: &[(u32, majit_ir::DescrRef)],
+    field_descrs: &[majit_ir::DescrRef],
     _descr: &majit_ir::DescrRef,
 ) -> bool {
     field_descrs
-        .iter()
-        .find(|(di, _)| *di == field_idx)
-        .and_then(|(_, d)| d.as_field_descr())
+        .get(field_idx as usize)
+        .and_then(|d| d.as_field_descr())
         .map(|fd| fd.is_typeptr())
         .unwrap_or(false)
 }
@@ -565,9 +564,8 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
                     .map(|(fi, _)| {
                         let fd = vi
                             .field_descrs
-                            .iter()
-                            .find(|(di, _)| *di == *fi)
-                            .and_then(|(_, d)| d.as_field_descr());
+                            .get(*fi as usize)
+                            .and_then(|d| d.as_field_descr());
                         majit_ir::FieldDescrInfo {
                             index: *fi,
                             offset: fd.map(|f| f.offset()).unwrap_or(0),
@@ -599,9 +597,8 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
                     .map(|(fi, _)| {
                         let fd = vi
                             .field_descrs
-                            .iter()
-                            .find(|(di, _)| *di == *fi)
-                            .and_then(|(_, d)| d.as_field_descr());
+                            .get(*fi as usize)
+                            .and_then(|d| d.as_field_descr());
                         majit_ir::FieldDescrInfo {
                             index: *fi,
                             offset: fd.map(|f| f.offset()).unwrap_or(0),
@@ -1693,6 +1690,11 @@ impl OptContext {
     /// Used by exporters that take `&OptContext` and cannot mutate.
     pub fn peek_intbound(&self, opref: OpRef) -> Option<crate::optimizeopt::intutils::IntBound> {
         use crate::optimizeopt::info::Forwarded;
+        // optimizer.py:99-100: assert op.type == 'i'. Allow `None` (unknown
+        // type) so test fixtures with positionally-defined OpRefs that lack
+        // explicit type metadata can still query intbounds — RPython's
+        // intrinsic Box.type would always be 'i' here, but pyre's flat
+        // OpRef model has tests that don't seed `value_types`.
         debug_assert!(
             matches!(self.opref_type(opref), Some(majit_ir::Type::Int) | None),
             "peek_intbound: expected 'i'-typed OpRef, got {:?}",
@@ -1704,6 +1706,11 @@ impl OptContext {
                 *v as i64,
             ));
         }
+        assert!(
+            matches!(self.opref_type(replaced), Some(majit_ir::Type::Int) | None),
+            "peek_intbound: replaced opref must be int or unknown, got {:?}",
+            self.opref_type(replaced)
+        );
         if replaced.is_constant() {
             return None;
         }
@@ -1721,7 +1728,8 @@ impl OptContext {
     /// it in forwarded[].
     pub fn getintbound(&mut self, opref: OpRef) -> crate::optimizeopt::intutils::IntBound {
         use crate::optimizeopt::info::Forwarded;
-        // optimizer.py:100: assert op.type == 'i'
+        // optimizer.py:100: assert op.type == 'i'. See peek_intbound for the
+        // allow-`None` rationale.
         debug_assert!(
             matches!(self.opref_type(opref), Some(majit_ir::Type::Int) | None),
             "getintbound: expected 'i'-typed OpRef, got {:?}",
@@ -1732,6 +1740,11 @@ impl OptContext {
         if let Some(Value::Int(v)) = self.get_constant(replaced) {
             return crate::optimizeopt::intutils::IntBound::from_constant(*v as i64);
         }
+        assert!(
+            matches!(self.opref_type(replaced), Some(majit_ir::Type::Int) | None),
+            "getintbound: replaced opref must be int or unknown, got {:?}",
+            self.opref_type(replaced)
+        );
         if replaced.is_constant() {
             return crate::optimizeopt::intutils::IntBound::unbounded();
         }
@@ -1760,13 +1773,19 @@ impl OptContext {
     /// bound with new bound, or set if none exists.
     pub fn setintbound(&mut self, opref: OpRef, bound: &crate::optimizeopt::intutils::IntBound) {
         use crate::optimizeopt::info::Forwarded;
-        // optimizer.py:116: assert op.type == 'i'
+        // optimizer.py:116: assert op.type == 'i'. See peek_intbound for the
+        // allow-`None` rationale.
         debug_assert!(
             matches!(self.opref_type(opref), Some(majit_ir::Type::Int) | None),
             "setintbound: expected 'i'-typed OpRef, got {:?}",
             self.opref_type(opref)
         );
         let replaced = self.get_box_replacement(opref);
+        assert!(
+            matches!(self.opref_type(replaced), Some(majit_ir::Type::Int) | None),
+            "setintbound: replaced opref must be int or unknown, got {:?}",
+            self.opref_type(replaced)
+        );
         if replaced.is_constant() || self.get_constant(replaced).is_some() {
             return;
         }
@@ -1808,6 +1827,7 @@ impl OptContext {
         F: FnOnce(&mut crate::optimizeopt::intutils::IntBound) -> R,
     {
         use crate::optimizeopt::info::Forwarded;
+        // See peek_intbound for the allow-`None` rationale.
         debug_assert!(
             matches!(self.opref_type(opref), Some(majit_ir::Type::Int) | None),
             "with_intbound_mut: expected 'i'-typed OpRef, got {:?}",
@@ -1818,6 +1838,11 @@ impl OptContext {
             let mut tmp = crate::optimizeopt::intutils::IntBound::from_constant(*v as i64);
             return f(&mut tmp);
         }
+        assert!(
+            matches!(self.opref_type(replaced), Some(majit_ir::Type::Int) | None),
+            "with_intbound_mut: replaced opref must be int or unknown, got {:?}",
+            self.opref_type(replaced)
+        );
         if replaced.is_constant() {
             let mut tmp = crate::optimizeopt::intutils::IntBound::unbounded();
             return f(&mut tmp);
@@ -2208,11 +2233,13 @@ impl OptContext {
     /// guard_value(bool) into guard_true/guard_false.
     fn maybe_replace_guard_value(&self, op: &mut Op) {
         let arg0 = op.arg(0);
-        // optimizer.py:755: op.getarg(0).type == 'i'
-        if !matches!(self.opref_type(arg0), Some(majit_ir::Type::Int)) {
+        // optimizer.py:755: if op.getarg(0).type == 'i'
+        let arg0_resolved = self.get_box_replacement(arg0);
+        if self.opref_type(arg0_resolved) != Some(majit_ir::Type::Int) {
             return;
         }
-        let Some(bound) = self.get_int_bound(arg0) else {
+        // optimizer.py:756: b = self.getintbound(op.getarg(0))
+        let Some(bound) = self.get_int_bound(arg0_resolved) else {
             return;
         };
         if !bound.is_bool() {
@@ -3198,17 +3225,12 @@ impl OptContext {
                 .as_ref()
                 .and_then(|d| d.as_field_descr())
                 .expect("ensure_ptr_info_arg0: field op without FieldDescr");
-            let parent_descr = field_descr.parent_descr().expect(
-                "ensure_ptr_info_arg0: FieldDescr.parent_descr() returned None — \
-                 the FieldDescr implementation must override parent_descr() \
+            let parent_descr = field_descr.get_parent_descr().expect(
+                "ensure_ptr_info_arg0: FieldDescr.get_parent_descr() returned None — \
+                 the FieldDescr implementation must override get_parent_descr() \
                  for orthodox parity with optimizer.py:478",
             );
             // optimizer.py:480-484: parent_descr.is_object() decides Instance vs Struct.
-            // info.py:180-188 init_fields(parent_descr, index) sets self.descr
-            // and pre-allocates _fields. The Rust port stores fields as
-            // `Vec<(idx, OpRef)>` which grows on demand, so the only durable
-            // effect of init_fields is `self.descr = parent_descr` — already
-            // captured here by the Instance/Struct constructors.
             //
             // PyPy unconditionally calls `parent_descr.is_object()` (raises
             // AttributeError if parent_descr isn't a SizeDescr). The Rust
@@ -3217,13 +3239,18 @@ impl OptContext {
             // false.
             let is_object = parent_descr
                 .as_size_descr()
-                .expect("ensure_ptr_info_arg0: FieldDescr.parent_descr() must point at a SizeDescr")
+                .expect("ensure_ptr_info_arg0: FieldDescr.get_parent_descr() must point at a SizeDescr")
                 .is_object();
-            if is_object {
-                PtrInfo::instance(Some(parent_descr), None)
+            let mut new_info = if is_object {
+                PtrInfo::instance(Some(parent_descr.clone()), None)
             } else {
-                PtrInfo::struct_ptr(parent_descr)
-            }
+                PtrInfo::struct_ptr(parent_descr.clone())
+            };
+            // optimizer.py:484: opinfo.init_fields(parent_descr, descr.get_index())
+            // info.py:180-188 init_fields(parent_descr, index) sets self.descr
+            // and pre-allocates _fields by parent slot count.
+            new_info.init_fields(parent_descr, field_descr.index_in_parent());
+            new_info
         } else if op.opcode.is_getarrayitem()
             || op.opcode == OpCode::SetarrayitemGc
             || op.opcode == OpCode::ArraylenGc
@@ -3716,8 +3743,9 @@ mod ensure_ptr_info_arg0_tests {
     }
 
     fn field_op_with_parent(parent: DescrRef) -> Op {
-        let descr: DescrRef =
-            Arc::new(SimpleFieldDescr::new(0, 0, 8, Type::Int, false).with_parent_descr(parent));
+        let descr: DescrRef = Arc::new(
+            SimpleFieldDescr::new(0, 0, 8, Type::Int, false).with_parent_descr(parent, 0),
+        );
         let mut op = Op::with_descr(OpCode::GetfieldGcI, &[OpRef(0)], descr);
         op.pos = OpRef(1);
         op
@@ -3956,5 +3984,30 @@ mod ensure_ptr_info_arg0_tests {
             Some(PtrInfo::Instance(_)) => {} // unchanged
             other => panic!("expected Instance preserved, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod intbound_invariant_tests {
+    use super::*;
+    use crate::optimizeopt::intutils::IntBound;
+    use majit_ir::{GcRef, OpRef, Value};
+
+    #[test]
+    #[should_panic]
+    fn getintbound_rejects_non_int_boxes() {
+        let mut ctx = OptContext::new(0);
+        let opref = OpRef(20_000);
+        ctx.seed_constant(opref, Value::Ref(GcRef(0xdead_beef)));
+        let _ = ctx.getintbound(opref);
+    }
+
+    #[test]
+    #[should_panic]
+    fn setintbound_rejects_non_int_boxes() {
+        let mut ctx = OptContext::new(0);
+        let opref = OpRef(20_001);
+        ctx.seed_constant(opref, Value::Ref(GcRef(0xcafe_babe)));
+        ctx.setintbound(opref, &IntBound::nonnegative());
     }
 }

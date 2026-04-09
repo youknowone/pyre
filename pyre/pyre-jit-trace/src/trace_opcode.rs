@@ -364,7 +364,39 @@ impl MIFrame {
         if value.is_none() {
             return Type::Ref;
         }
-        self.sym().value_type_of(value)
+        // Prefer transient_value_types and symbolic_locals/stack types over
+        // raw recorder lookup so func-entry / unbox promotions remain visible.
+        // For op-result OpRefs that have no transient/locals/stack entry,
+        // fall back to the recorder's intrinsic type (op.result_type() or
+        // inputarg.tp). RPython parity: Box.type is intrinsic — without
+        // this fallback, op-result Boxes default to Type::Ref and silently
+        // mistype Int/Float results, producing GUARD_VALUE / IntLt with
+        // the wrong constant pool slot.
+        let sym = self.sym();
+        if let Some(value_type) = sym.transient_value_types.get(&value).copied() {
+            return value_type;
+        }
+        if let Some(idx) = sym.symbolic_locals.iter().position(|&slot| slot == value) {
+            return sym
+                .symbolic_local_types
+                .get(idx)
+                .copied()
+                .unwrap_or(Type::Ref);
+        }
+        let stack_only = sym.stack_only_depth().min(sym.symbolic_stack.len());
+        if let Some(idx) = sym.symbolic_stack[..stack_only]
+            .iter()
+            .position(|&slot| slot == value)
+        {
+            return sym
+                .symbolic_stack_types
+                .get(idx)
+                .copied()
+                .unwrap_or(Type::Ref);
+        }
+        // Fall back to recorder's intrinsic type — matches RPython Box.type.
+        let ctx_ref: &TraceCtx = unsafe { &*self.ctx };
+        ctx_ref.get_opref_type(value).unwrap_or(Type::Ref)
     }
 
     /// RPython Box push: symbolic OpRef + concrete value together.
@@ -3844,6 +3876,16 @@ pub(crate) fn trace_step_result_to_action(
 ) -> TraceAction {
     match result {
         Ok(pyre_interpreter::StepResult::Continue) => {
+            let compile_trace_succeeded = {
+                let (driver, _) = crate::driver::driver_pair();
+                driver.compile_trace_success_pending()
+            };
+            if compile_trace_succeeded {
+                if majit_metainterp::majit_log_enabled() {
+                    eprintln!("[jit][compile-trace] pending success seen in trace_step_result");
+                }
+                return TraceAction::CompileTrace;
+            }
             if state.ctx().is_too_long() {
                 let green_key = state.ctx().green_key();
                 let root_green_key = state.with_ctx(|_, ctx| ctx.root_green_key());

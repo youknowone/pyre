@@ -2053,14 +2053,20 @@ pub fn trace_and_compile_from_bridge(
     use crate::jit::state::PyreEnv;
     use crate::jit::trace::trace_bytecode;
 
-    let (driver, info) = crate::eval::driver_pair();
+    let info = {
+        let (_, info) = crate::eval::driver_pair();
+        info
+    };
 
     // pyjitpl.py:2890-2911 handle_guard_failure parity:
     // RPython creates a fresh MetaInterp and calls
     // initialize_state_from_guard_failure(resumedescr, deadframe)
     // which internally calls rebuild_from_resumedata (resume.py:1042).
     // This restores the complete frame stack INSIDE the bridge function.
-    let meta = driver.meta_interp().get_compiled_meta(green_key).cloned();
+    let meta = {
+        let (driver, _) = crate::eval::driver_pair();
+        driver.meta_interp().get_compiled_meta(green_key).cloned()
+    };
     let mut jit_state_local = build_jit_state(frame, info);
     let resume_pc = if let Some(ref meta) = meta {
         if let Some((_, pc)) = crate::eval::decode_and_restore_guard_failure(
@@ -2103,15 +2109,19 @@ pub fn trace_and_compile_from_bridge(
     }
 
     // compile.py:714: start_retrace_from_guard + set bridge_info.
-    if !driver.start_bridge_tracing(
-        green_key,
-        trace_id,
-        fail_index,
-        &mut jit_state,
-        &env,
-        resume_pc,
-        loop_header_pc,
-    ) {
+    let started = {
+        let (driver, _) = crate::eval::driver_pair();
+        driver.start_bridge_tracing(
+            green_key,
+            trace_id,
+            fail_index,
+            &mut jit_state,
+            &env,
+            resume_pc,
+            loop_header_pc,
+        )
+    };
+    if !started {
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
                 "[jit][bridge-trace] start_bridge_tracing failed key={} trace={} fail={}",
@@ -2127,7 +2137,11 @@ pub fn trace_and_compile_from_bridge(
     // emit SAVE_EXC_CLASS + SAVE_EXCEPTION at trace start, then
     // RESTORE_EXCEPTION before the guard. The exception class/value
     // are read from the TLS exception state set by Cranelift codegen.
-    if driver.last_bridge_is_exception_guard {
+    let last_bridge_is_exception_guard = {
+        let (driver, _) = crate::eval::driver_pair();
+        driver.last_bridge_is_exception_guard
+    };
+    if last_bridge_is_exception_guard {
         #[cfg(feature = "cranelift")]
         let exc_class = majit_backend_cranelift::jit_exc_class_raw();
         #[cfg(not(feature = "cranelift"))]
@@ -2139,9 +2153,12 @@ pub fn trace_and_compile_from_bridge(
         if exc_class != 0 {
             // RPython pyjitpl.py:3125-3126 + 3138:
             // SAVE_EXC_CLASS, SAVE_EXCEPTION, RESTORE_EXCEPTION
-            driver
-                .meta_interp_mut()
-                .emit_exception_bridge_prologue(exc_class, exc_value);
+            {
+                let (driver, _) = crate::eval::driver_pair();
+                driver
+                    .meta_interp_mut()
+                    .emit_exception_bridge_prologue(exc_class, exc_value);
+            }
             if majit_metainterp::majit_log_enabled() {
                 eprintln!(
                     "[jit][bridge-exc] exception guard bridge: class={:#x} value={:#x}",
@@ -2149,6 +2166,7 @@ pub fn trace_and_compile_from_bridge(
                 );
             }
         }
+        let (driver, _) = crate::eval::driver_pair();
         driver.last_bridge_is_exception_guard = false;
     }
 
@@ -2164,19 +2182,22 @@ pub fn trace_and_compile_from_bridge(
         }
 
         // Feed one bytecode to the active trace via merge_point.
-        let outcome = driver.jit_merge_point_keyed(
-            green_key,
-            pc,
-            &mut jit_state,
-            &env,
-            || {},
-            |ctx, sym| {
-                // Bridge tracing: create a per-step snapshot.
-                let snapshot = trace_frame.snapshot_for_tracing();
-                let (action, _executed) = trace_bytecode(ctx, sym, code, pc, snapshot);
-                action
-            },
-        );
+        let outcome = {
+            let (driver, _) = crate::eval::driver_pair();
+            driver.jit_merge_point_keyed(
+                green_key,
+                pc,
+                &mut jit_state,
+                &env,
+                || {},
+                |ctx, sym| {
+                    // Bridge tracing: create a per-step snapshot.
+                    let snapshot = trace_frame.snapshot_for_tracing();
+                    let (action, _executed) = trace_bytecode(ctx, sym, code, pc, snapshot);
+                    action
+                },
+            )
+        };
 
         // merge_point handles Finish/CloseLoop via bridge_info.
         // If it returns an outcome, the bridge was compiled.
@@ -2190,13 +2211,45 @@ pub fn trace_and_compile_from_bridge(
             return true;
         }
 
+        // pyjitpl.py:2982-2983 / 3095-3099 parity:
+        // compile_trace() "raises in case it works". In pyre the bridge can
+        // already be attached during this step even if jit_merge_point_keyed()
+        // did not surface DetailedDriverRunOutcome::Jump yet. Stop tracing as
+        // soon as the backend metadata shows that the bridge is attached.
+        let compiled = {
+            let (driver, _) = crate::eval::driver_pair();
+            driver
+                .meta_interp()
+                .bridge_was_compiled(green_key, trace_id, fail_index)
+        };
+        if compiled {
+            let (driver, _) = crate::eval::driver_pair();
+            if driver.is_tracing() {
+                driver.meta_interp_mut().abort_trace(false);
+            }
+            if majit_metainterp::majit_log_enabled() {
+                eprintln!(
+                    "[jit][bridge-trace] compiled at step={} pc={} key={} (attached)",
+                    step, pc, green_key
+                );
+            }
+            return true;
+        }
+
         // If the driver is no longer tracing, the bridge was compiled
         // (or aborted) inside merge_point. Check whether a bridge was
         // actually attached to distinguish success from abort.
-        if !driver.is_tracing() {
-            let compiled = driver
-                .meta_interp()
-                .bridge_was_compiled(green_key, trace_id, fail_index);
+        let tracing_active = {
+            let (driver, _) = crate::eval::driver_pair();
+            driver.is_tracing()
+        };
+        if !tracing_active {
+            let compiled = {
+                let (driver, _) = crate::eval::driver_pair();
+                driver
+                    .meta_interp()
+                    .bridge_was_compiled(green_key, trace_id, fail_index)
+            };
             if majit_metainterp::majit_log_enabled() {
                 eprintln!(
                     "[jit][bridge-trace] trace ended at step={} pc={} key={} compiled={}",
@@ -2213,13 +2266,18 @@ pub fn trace_and_compile_from_bridge(
     }
 
     // Trace didn't converge — abort.
-    if driver.is_tracing() {
+    let tracing_active = {
+        let (driver, _) = crate::eval::driver_pair();
+        driver.is_tracing()
+    };
+    if tracing_active {
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
                 "[jit][bridge-trace] abort: too many ops key={} trace={} fail={}",
                 green_key, trace_id, fail_index
             );
         }
+        let (driver, _) = crate::eval::driver_pair();
         driver.meta_interp_mut().abort_trace(false);
     }
     false

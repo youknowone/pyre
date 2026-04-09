@@ -27,8 +27,9 @@ use majit_ir::{FailDescr, InputArg, LoopTargetDescr, Op, OpCode, OpRef, TargetAr
 
 use crate::arch::*;
 use crate::codebuf;
+use crate::gcmap::{allocate_gcmap, gcmap_set_bit};
 use crate::guard::DynasmFailDescr;
-use crate::jitframe::{FIRST_ITEM_OFFSET, JF_DESCR_OFS};
+use crate::jitframe::{FIRST_ITEM_OFFSET, JF_DESCR_OFS, JF_FRAME_OFS, JF_GCMAP_OFS};
 use crate::regalloc::{RegAlloc, RegAllocOp};
 use crate::regloc::Loc;
 
@@ -173,6 +174,27 @@ fn all_float_regs() -> &'static [crate::regloc::RegLoc] {
     }
 }
 
+fn core_reg_position(reg: crate::regloc::RegLoc) -> Option<usize> {
+    all_gen_regs()
+        .iter()
+        .position(|candidate| *candidate == reg)
+}
+
+fn float_reg_position(reg: crate::regloc::RegLoc) -> Option<usize> {
+    all_float_regs()
+        .iter()
+        .position(|candidate| *candidate == reg)
+        .map(|idx| all_gen_regs().len() + idx)
+}
+
+fn reg_position_in_jitframe(reg: crate::regloc::RegLoc) -> Option<usize> {
+    if reg.is_xmm {
+        float_reg_position(reg)
+    } else {
+        core_reg_position(reg)
+    }
+}
+
 // ── Abstract condition codes ──
 // Architecture-independent CC values used throughout the assembler.
 // Converted to arch-specific encoding at emission time.
@@ -222,8 +244,6 @@ pub struct Assembler386 {
     pending_guard_tokens: Vec<GuardToken>,
     /// Frame depth (in WORD units) for the current trace.
     frame_depth: usize,
-    /// Base slot index of the guard-recovery register save area.
-    save_area_base: usize,
     /// Fail descriptors built during assembly.
     fail_descrs: Vec<Arc<DynasmFailDescr>>,
     /// trace_id for this compilation.
@@ -267,6 +287,10 @@ pub struct Assembler386 {
     /// Maps call_target_token → compiled code address for CALL_ASSEMBLER.
     /// Populated by the runner before compilation, from registered loop targets.
     call_assembler_targets: HashMap<u64, usize>,
+    /// opassembler.py:1177 _finish_gcmap.
+    finish_gcmap: Option<*mut usize>,
+    /// opassembler.py:1215 gcmap_for_finish.
+    gcmap_for_finish: *mut usize,
 }
 
 /// assembler.py GuardToken — represents a pending guard needing
@@ -288,6 +312,8 @@ struct GuardToken {
     /// Constants to store in frame during recovery.
     /// Each entry: (frame_slot_index, constant_value).
     const_stores: Vec<(usize, i64)>,
+    /// opassembler.py:515 GuardToken.gcmap.
+    gcmap: *mut usize,
 }
 
 /// Compiled output from assemble_loop/assemble_bridge.
@@ -323,7 +349,6 @@ impl Assembler386 {
             mc: Assembler::new().unwrap(),
             pending_guard_tokens: Vec::new(),
             frame_depth: JITFRAME_FIXED_SIZE,
-            save_area_base: 0,
             fail_descrs: Vec::new(),
             trace_id,
             header_pc,
@@ -340,6 +365,12 @@ impl Assembler386 {
             classptr_to_typeid,
             self_entry_label: None,
             call_assembler_targets: HashMap::new(),
+            finish_gcmap: None,
+            gcmap_for_finish: {
+                let gcmap = allocate_gcmap(1, JITFRAME_FIXED_SIZE);
+                gcmap_set_bit(gcmap, 0);
+                gcmap
+            },
         }
     }
 
@@ -348,10 +379,11 @@ impl Assembler386 {
     // ----------------------------------------------------------------
 
     /// Frame-pointer-relative byte offset for a given slot index.
-    /// jf_ptr[0] = descr, jf_ptr[1..] = frame slots.
-    /// slot 0 → [fp + 8], slot 1 → [fp + 16], etc.
+    /// Slots are absolute jf_frame indices, including the fixed
+    /// JITFRAME-managed prefix. FIRST_ITEM_OFFSET accounts for the object
+    /// header and array-length word that precede jf_frame[0].
     fn slot_offset(slot: usize) -> i32 {
-        ((1 + slot) * 8) as i32
+        FIRST_ITEM_OFFSET as i32 + (slot * WORD) as i32
     }
 
     /// Resolve an OpRef to either a frame slot offset or an immediate constant.
@@ -1091,6 +1123,81 @@ impl Assembler386 {
         );
     }
 
+    /// assembler.py:993 push_gcmap.
+    fn push_gcmap(&mut self, gcmap: *mut usize) {
+        let gcmap_ptr = gcmap as i64;
+        #[cfg(target_arch = "x86_64")]
+        {
+            let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+            dynasm!(self.mc ; .arch x64
+                ; mov Rq(scratch), QWORD gcmap_ptr
+                ; mov [rbp + JF_GCMAP_OFS], Rq(scratch)
+            );
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            self.emit_mov_imm64(0, gcmap_ptr);
+            dynasm!(self.mc ; .arch aarch64
+                ; str x0, [x29, JF_GCMAP_OFS as u32]
+            );
+        }
+    }
+
+    /// assembler.py:1000 pop_gcmap.
+    fn pop_gcmap(&mut self) {
+        #[cfg(target_arch = "x86_64")]
+        dynasm!(self.mc ; .arch x64
+            ; mov QWORD [rbp + JF_GCMAP_OFS], 0
+        );
+        #[cfg(target_arch = "aarch64")]
+        dynasm!(self.mc ; .arch aarch64
+            ; str xzr, [x29, JF_GCMAP_OFS as u32]
+        );
+    }
+
+    fn guard_gcmap_from_faillocs(
+        &self,
+        fail_arg_types: &[Type],
+        faillocs: &[Option<Loc>],
+    ) -> *mut usize {
+        let frame_depth = self.frame_depth.saturating_sub(JITFRAME_FIXED_SIZE);
+        let gcmap = allocate_gcmap(frame_depth, JITFRAME_FIXED_SIZE);
+        for (tp, loc) in fail_arg_types.iter().zip(faillocs.iter()) {
+            if *tp != Type::Ref {
+                continue;
+            }
+            match loc {
+                Some(Loc::Reg(r)) => {
+                    if let Some(position) = reg_position_in_jitframe(*r) {
+                        gcmap_set_bit(gcmap, position);
+                    }
+                }
+                Some(Loc::Frame(f)) => {
+                    gcmap_set_bit(gcmap, f.position + JITFRAME_FIXED_SIZE);
+                }
+                _ => {}
+            }
+        }
+        gcmap
+    }
+
+    fn gcmap_from_fail_arg_locs(
+        &self,
+        fail_arg_types: &[Type],
+        fail_arg_locs: &[Option<usize>],
+    ) -> *mut usize {
+        let frame_depth = self.frame_depth.saturating_sub(JITFRAME_FIXED_SIZE);
+        let gcmap = allocate_gcmap(frame_depth, JITFRAME_FIXED_SIZE);
+        for (tp, loc) in fail_arg_types.iter().zip(fail_arg_locs.iter()) {
+            if *tp == Type::Ref {
+                if let Some(position) = loc {
+                    gcmap_set_bit(gcmap, *position);
+                }
+            }
+        }
+        gcmap
+    }
+
     // ----------------------------------------------------------------
     // assembler.py:501 assemble_loop
     // ----------------------------------------------------------------
@@ -1256,7 +1363,6 @@ impl Assembler386 {
         let ra_ops = ra.walk_operations(inputargs, ops);
         let frame_slot_depth = input_slot_depth.max(ra.get_final_frame_depth());
         self.frame_depth = self.frame_depth.max(frame_slot_depth + JITFRAME_FIXED_SIZE);
-        self.save_area_base = frame_slot_depth;
 
         // Sync regalloc frame positions to opref_to_slot for backward
         // compatibility with genop_call/genop_call_assembler which still
@@ -2110,7 +2216,7 @@ impl Assembler386 {
                 if let Some(result) = arglocs.first() {
                     let slot0 = Loc::Frame(crate::regloc::FrameLoc::new(
                         0,
-                        crate::regalloc::get_ebp_ofs(0, 0),
+                        crate::jitframe::FIRST_ITEM_OFFSET as i32,
                         result_type == Type::Float,
                     ));
                     self.regalloc_mov(result, &slot0);
@@ -2129,6 +2235,19 @@ impl Assembler386 {
                 {
                     self.emit_mov_imm64(0, global_descr_ptr);
                     dynasm!(self.mc ; .arch aarch64 ; str x0, [x29, JF_DESCR_OFS as u32]);
+                }
+
+                if result_type == Type::Ref {
+                    if let Some(gcmap) = self.finish_gcmap {
+                        gcmap_set_bit(gcmap, 0);
+                        self.push_gcmap(gcmap);
+                    } else {
+                        self.push_gcmap(self.gcmap_for_finish);
+                    }
+                } else if let Some(gcmap) = self.finish_gcmap {
+                    self.push_gcmap(gcmap);
+                } else {
+                    self.pop_gcmap();
                 }
 
                 self._call_footer();
@@ -2187,9 +2306,7 @@ impl Assembler386 {
             | OpCode::CallReleaseGilR
             | OpCode::CallReleaseGilF
             | OpCode::CallReleaseGilN => {
-                // Save registers to frame before call (regalloc already handled this
-                // via before_call / Move ops). Use existing genop_call.
-                self.genop_call(op);
+                self.genop_call_with_arglocs(op, arglocs);
             }
             OpCode::CallAssemblerI
             | OpCode::CallAssemblerR
@@ -2531,33 +2648,24 @@ impl Assembler386 {
             false,
         ));
 
-        // Convert regalloc faillocs to frame slot indices for the descr.
-        // Reg locs: register save area at the reserved frame tail.
-        // Frame locs: use position directly.
-        // Immed locs: allocate a frame slot and store the constant in the
-        // recovery stub. RPython uses rd_locs with JITFRAME encoding.
+        // Convert regalloc faillocs to absolute jf_frame slots for the
+        // helper/runner. This matches the fixed-slot-inclusive coordinate
+        // system used by get_fp_offset() and compiled_loop_token._ll_initial_locs
+        // in RPython.
         let mut const_stores: Vec<(usize, i64)> = Vec::new();
-        let save_area_base = self.save_area_base;
         let gpr_regs = all_gen_regs();
         let float_regs = all_float_regs();
-        let float_reg_base = save_area_base + gpr_regs.len();
         let fail_arg_locs: Vec<Option<usize>> = faillocs
             .iter()
             .map(|fl| match fl {
                 Some(Loc::Reg(r)) => {
                     if r.is_xmm {
-                        float_regs
-                            .iter()
-                            .position(|reg| *reg == *r)
-                            .map(|idx| float_reg_base + idx)
+                        float_reg_position(*r)
                     } else {
-                        gpr_regs
-                            .iter()
-                            .position(|reg| *reg == *r)
-                            .map(|idx| save_area_base + idx)
+                        core_reg_position(*r)
                     }
                 }
-                Some(Loc::Frame(f)) => Some(f.position),
+                Some(Loc::Frame(f)) => Some(f.position + JITFRAME_FIXED_SIZE),
                 Some(Loc::Immed(i)) => {
                     // Allocate a slot for this constant in the save area.
                     let slot = self.frame_depth;
@@ -2619,6 +2727,7 @@ impl Assembler386 {
             descr_mut.rd_pendingfields = op.rd_pendingfields.clone();
             *descr_mut.recovery_layout.get_mut() = Some(recovery_layout);
         }
+        let gcmap = self.guard_gcmap_from_faillocs(&descr.fail_arg_types, faillocs);
 
         self.pending_guard_tokens.push(GuardToken {
             jump_offset: self.mc.offset(),
@@ -2631,7 +2740,11 @@ impl Assembler386 {
                 .unwrap_or_default(),
             opref_to_slot_snapshot: self.opref_to_slot.clone(),
             const_stores,
+            gcmap,
         });
+        if op.opcode == OpCode::GuardNotForced2 {
+            self.finish_gcmap = Some(gcmap);
+        }
         self.fail_descrs.push(descr);
     }
 
@@ -2647,7 +2760,10 @@ impl Assembler386 {
                     if opref.is_none() || opref.is_constant() {
                         None
                     } else {
-                        self.opref_to_slot.get(&opref.0).copied()
+                        self.opref_to_slot
+                            .get(&opref.0)
+                            .copied()
+                            .map(|slot| slot + JITFRAME_FIXED_SIZE)
                     }
                 })
                 .collect();
@@ -2664,9 +2780,8 @@ impl Assembler386 {
 
     /// assembler.py:982 generate_quick_failure.
     ///
-    /// Dynasm still uses the regalloc save-area model, so the quick failure
-    /// stub first flushes register-backed failargs into the jitframe tail via
-    /// the shared save routine before publishing jf_descr and returning.
+    /// RPython parity: the quick-failure stub saves managed registers into the
+    /// fixed jitframe prefix before publishing jf_descr and returning.
     fn generate_quick_failure(
         &mut self,
         guard_token: GuardToken,
@@ -2702,9 +2817,10 @@ impl Assembler386 {
                 ; str x0, [x29, JF_DESCR_OFS as u32]
             );
         }
+        self.push_gcmap(guard_token.gcmap);
 
         for &(slot, val) in &guard_token.const_stores {
-            let ofs = ((1 + slot) * 8) as i32;
+            let ofs = Self::slot_offset(slot);
             #[cfg(target_arch = "x86_64")]
             {
                 let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
@@ -2734,13 +2850,12 @@ impl Assembler386 {
         {
             dynasm!(self.mc ; .arch x64 ; =>save_regs_label);
             use crate::regloc::*;
-            let save_area_base = self.save_area_base;
             let gprs = [
                 ECX, EAX, EDX, EBX, ESI, EDI, R8, R9, R10, R12, R13, R14, R15,
             ];
             for &reg in &gprs {
-                let save_slot = save_area_base + reg.value as usize;
-                let ofs = ((1 + save_slot) * 8) as i32;
+                let save_slot = core_reg_position(reg).expect("managed x86_64 GPR");
+                let ofs = Self::slot_offset(save_slot);
                 dynasm!(self.mc ; .arch x64 ; mov [rbp + ofs], Rq(reg.value));
             }
             let xmms = [
@@ -2748,9 +2863,8 @@ impl Assembler386 {
                 XMM13, XMM14,
             ];
             for &reg in &xmms {
-                // Keep x86_64 in sync with fail_arg_locs encoding.
-                let save_slot = save_area_base + 16 + reg.value as usize;
-                let ofs = ((1 + save_slot) * 8) as i32;
+                let save_slot = float_reg_position(reg).expect("managed x86_64 XMM");
+                let ofs = Self::slot_offset(save_slot);
                 dynasm!(self.mc ; .arch x64 ; movsd [rbp + ofs], Rx(reg.value));
             }
             dynasm!(self.mc ; .arch x64 ; ret);
@@ -2758,17 +2872,16 @@ impl Assembler386 {
         #[cfg(target_arch = "aarch64")]
         {
             dynasm!(self.mc ; .arch aarch64 ; =>save_regs_label);
-            let save_area_base = self.save_area_base;
             let gprs = all_gen_regs();
-            for (i, &reg) in gprs.iter().enumerate() {
-                let save_slot = save_area_base + i;
-                let ofs = ((1 + save_slot) * 8) as u32;
+            for &reg in gprs.iter() {
+                let save_slot = core_reg_position(reg).expect("managed aarch64 GPR");
+                let ofs = Self::slot_offset(save_slot) as u32;
                 dynasm!(self.mc ; .arch aarch64 ; str X(reg.value), [x29, ofs]);
             }
             let fprs = all_float_regs();
-            for (i, &reg) in fprs.iter().enumerate() {
-                let save_slot = save_area_base + gprs.len() + i;
-                let ofs = ((1 + save_slot) * 8) as u32;
+            for &reg in fprs.iter() {
+                let save_slot = float_reg_position(reg).expect("managed aarch64 VFP");
+                let ofs = Self::slot_offset(save_slot) as u32;
                 dynasm!(self.mc ; .arch aarch64 ; str D(reg.value), [x29, ofs]);
             }
             dynasm!(self.mc ; .arch aarch64 ; ret);
@@ -3455,8 +3568,44 @@ impl Assembler386 {
 
     /// Infer fail_arg_types from value_types or op.fail_arg_types.
     fn infer_fail_arg_types(&self, op: &Op) -> Vec<Type> {
+        if op.opcode == OpCode::Finish || op.opcode == OpCode::Jump {
+            if let Some(descr_types) = op
+                .descr
+                .as_ref()
+                .and_then(|d| d.as_fail_descr())
+                .map(|fd| fd.fail_arg_types().to_vec())
+            {
+                if !descr_types.is_empty() {
+                    return descr_types;
+                }
+            }
+        }
         if let Some(ref ts) = op.fail_arg_types {
-            ts.clone()
+            let expected_len = if op.opcode == OpCode::Finish || op.opcode == OpCode::Jump {
+                op.args.len()
+            } else {
+                op.fail_args.as_ref().map(|fa| fa.len()).unwrap_or(0)
+            };
+            if ts.len() == expected_len {
+                ts.clone()
+            } else if op.opcode == OpCode::Finish || op.opcode == OpCode::Jump {
+                op.args
+                    .iter()
+                    .map(|opref| self.value_types.get(&opref.0).copied().unwrap_or(Type::Int))
+                    .collect()
+            } else if let Some(ref fa) = op.fail_args {
+                fa.iter()
+                    .map(|opref| {
+                        if opref.is_none() {
+                            Type::Ref
+                        } else {
+                            self.value_types.get(&opref.0).copied().unwrap_or(Type::Ref)
+                        }
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            }
         } else if let Some(ref fa) = op.fail_args {
             fa.iter()
                 .map(|opref| {
@@ -3481,21 +3630,25 @@ impl Assembler386 {
             .as_ref()
             .map(|fa| fa.to_vec())
             .unwrap_or_default();
-        // assembler.py:238-270 store_info_on_descr parity: fail_arg_locs
-        // maps each fail_arg to its jitframe slot. None = 0xFFFF (virtual).
+        // Dynasm helper parity: fail_arg_locs are absolute jf_frame slots
+        // consumed via JitFrame::get_int_value(). None = virtual/unmapped.
         let fail_arg_locs: Vec<Option<usize>> = fail_args
             .iter()
             .map(|opref| {
                 if opref.is_none() || opref.is_constant() {
                     None
                 } else {
-                    self.opref_to_slot.get(&opref.0).copied()
+                    self.opref_to_slot
+                        .get(&opref.0)
+                        .copied()
+                        .map(|slot| slot + JITFRAME_FIXED_SIZE)
                 }
             })
             .collect();
         let mut descr = DynasmFailDescr::new(fail_index, self.trace_id, fail_arg_types, false);
         descr.fail_arg_locs = fail_arg_locs;
         let descr = Arc::new(descr);
+        let gcmap = self.gcmap_from_fail_arg_locs(&descr.fail_arg_types, &descr.fail_arg_locs);
         let jump_offset = self.mc.offset();
         self.pending_guard_tokens.push(GuardToken {
             jump_offset,
@@ -3504,7 +3657,11 @@ impl Assembler386 {
             fail_args,
             opref_to_slot_snapshot: self.opref_to_slot.clone(),
             const_stores: Vec::new(),
+            gcmap,
         });
+        if op.opcode == OpCode::GuardNotForced2 {
+            self.finish_gcmap = Some(gcmap);
+        }
         self.fail_descrs.push(descr);
     }
 
@@ -3922,18 +4079,23 @@ impl Assembler386 {
 
     /// FINISH: store result (if any), store descr ptr, return jf_ptr.
     fn genop_finish(&mut self, op: &Op, fail_index: u32) {
-        // Infer fail_arg_types for FINISH result (same as guard inference).
-        let fail_arg_types = if let Some(ref ts) = op.fail_arg_types {
-            ts.clone()
-        } else if op.num_args() > 0 {
-            vec![
-                self.value_types
-                    .get(&op.arg(0).0)
-                    .copied()
-                    .unwrap_or(Type::Int),
-            ]
+        // compiler.rs:9667-9681 parity: trust explicit FINISH types only when
+        // they match the actual result arity; otherwise infer from the op args.
+        let finish_refs: Vec<OpRef> = op.args.iter().copied().collect();
+        let fail_arg_types = if let Some(ref explicit) = op.fail_arg_types {
+            if explicit.len() == finish_refs.len() {
+                explicit.clone()
+            } else {
+                finish_refs
+                    .iter()
+                    .map(|opref| self.value_types.get(&opref.0).copied().unwrap_or(Type::Int))
+                    .collect()
+            }
         } else {
-            Vec::new()
+            finish_refs
+                .iter()
+                .map(|opref| self.value_types.get(&opref.0).copied().unwrap_or(Type::Int))
+                .collect()
         };
         // compile.py:618-669 parity: use type-specific global singleton.
         let descr = Arc::new(DynasmFailDescr::new(
@@ -3998,6 +4160,19 @@ impl Assembler386 {
             dynasm!(self.mc ; .arch aarch64
                 ; str x0, [x29, JF_DESCR_OFS as u32]
             );
+        }
+
+        if result_type == Type::Ref {
+            if let Some(gcmap) = self.finish_gcmap {
+                gcmap_set_bit(gcmap, 0);
+                self.push_gcmap(gcmap);
+            } else {
+                self.push_gcmap(self.gcmap_for_finish);
+            }
+        } else if let Some(gcmap) = self.finish_gcmap {
+            self.push_gcmap(gcmap);
+        } else {
+            self.pop_gcmap();
         }
 
         // Emit epilogue (return jf_ptr).
@@ -4585,6 +4760,13 @@ impl Assembler386 {
     // x86/assembler.py:2230 _genop_call
     // ----------------------------------------------------------------
 
+    fn argloc_imm(arglocs: &[Loc], index: usize) -> i64 {
+        match arglocs.get(index) {
+            Some(Loc::Immed(i)) => i.value,
+            _ => 0,
+        }
+    }
+
     /// Emit a function call. `func_arg` is the index of the function
     /// pointer arg; call arguments start at `func_arg + 1`.
     fn emit_call(&mut self, op: &Op, func_arg: usize) {
@@ -4671,15 +4853,218 @@ impl Assembler386 {
         dynasm!(self.mc ; .arch aarch64 ; ldp x29, x30, [sp], #16);
     }
 
+    /// aarch64/opassembler.py:1036 _emit_call.
+    /// arglocs = [resloc, size, sign, func, args...] for normal CALLs and
+    /// [resloc, size, sign, saveerr, func, args...] for CALL_RELEASE_GIL.
+    fn emit_call_from_arglocs(&mut self, arglocs: &[Loc], func_index: usize) {
+        let arg_count = arglocs.len();
+
+        #[cfg(target_arch = "x86_64")]
+        dynasm!(self.mc ; .arch x64 ; push rbp);
+        #[cfg(target_arch = "aarch64")]
+        dynasm!(self.mc ; .arch aarch64 ; stp x29, x30, [sp, #-16]!);
+
+        for i in (func_index + 1)..arg_count.min(func_index + 7) {
+            let abi_idx = i - func_index - 1;
+            let arg = &arglocs[i];
+            match arg {
+                Loc::Frame(f) => {
+                    let offset = f.ebp_loc.value;
+                    #[cfg(target_arch = "x86_64")]
+                    match abi_idx {
+                        0 => dynasm!(self.mc ; .arch x64 ; mov rdi, [rbp + offset]),
+                        1 => dynasm!(self.mc ; .arch x64 ; mov rsi, [rbp + offset]),
+                        2 => dynasm!(self.mc ; .arch x64 ; mov rdx, [rbp + offset]),
+                        3 => dynasm!(self.mc ; .arch x64 ; mov rcx, [rbp + offset]),
+                        4 => dynasm!(self.mc ; .arch x64 ; mov r8, [rbp + offset]),
+                        5 => dynasm!(self.mc ; .arch x64 ; mov r9, [rbp + offset]),
+                        _ => {}
+                    }
+                    #[cfg(target_arch = "aarch64")]
+                    {
+                        let reg = abi_idx as u8;
+                        if f.ebp_loc.is_float {
+                            dynasm!(self.mc ; .arch aarch64 ; ldr D(reg), [x29, offset as u32]);
+                        } else {
+                            dynasm!(self.mc ; .arch aarch64 ; ldr X(reg), [x29, offset as u32]);
+                        }
+                    }
+                }
+                Loc::Reg(r) => {
+                    #[cfg(target_arch = "x86_64")]
+                    match abi_idx {
+                        0 => dynasm!(self.mc ; .arch x64 ; mov rdi, Rq(r.value)),
+                        1 => dynasm!(self.mc ; .arch x64 ; mov rsi, Rq(r.value)),
+                        2 => dynasm!(self.mc ; .arch x64 ; mov rdx, Rq(r.value)),
+                        3 => dynasm!(self.mc ; .arch x64 ; mov rcx, Rq(r.value)),
+                        4 => dynasm!(self.mc ; .arch x64 ; mov r8, Rq(r.value)),
+                        5 => dynasm!(self.mc ; .arch x64 ; mov r9, Rq(r.value)),
+                        _ => {}
+                    }
+                    #[cfg(target_arch = "aarch64")]
+                    {
+                        let reg = abi_idx as u8;
+                        if r.is_xmm {
+                            dynasm!(self.mc ; .arch aarch64 ; fmov D(reg), D(r.value));
+                        } else {
+                            dynasm!(self.mc ; .arch aarch64 ; mov X(reg), X(r.value));
+                        }
+                    }
+                }
+                Loc::Immed(i) => {
+                    let val = i.value;
+                    #[cfg(target_arch = "x86_64")]
+                    match abi_idx {
+                        0 => dynasm!(self.mc ; .arch x64 ; mov rdi, QWORD val),
+                        1 => dynasm!(self.mc ; .arch x64 ; mov rsi, QWORD val),
+                        2 => dynasm!(self.mc ; .arch x64 ; mov rdx, QWORD val),
+                        3 => dynasm!(self.mc ; .arch x64 ; mov rcx, QWORD val),
+                        4 => dynasm!(self.mc ; .arch x64 ; mov r8, QWORD val),
+                        5 => dynasm!(self.mc ; .arch x64 ; mov r9, QWORD val),
+                        _ => {}
+                    }
+                    #[cfg(target_arch = "aarch64")]
+                    {
+                        let reg = abi_idx as u32;
+                        self.emit_mov_imm64(reg, val);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        match arglocs.get(func_index) {
+            Some(Loc::Frame(f)) => {
+                let offset = f.ebp_loc.value;
+                #[cfg(target_arch = "x86_64")]
+                dynasm!(self.mc ; .arch x64
+                    ; mov rax, [rbp + offset]
+                    ; call rax
+                );
+                #[cfg(target_arch = "aarch64")]
+                dynasm!(self.mc ; .arch aarch64
+                    ; ldr x8, [x29, offset as u32]
+                    ; blr x8
+                );
+            }
+            Some(Loc::Reg(r)) => {
+                #[cfg(target_arch = "x86_64")]
+                dynasm!(self.mc ; .arch x64
+                    ; mov rax, Rq(r.value)
+                    ; call rax
+                );
+                #[cfg(target_arch = "aarch64")]
+                dynasm!(self.mc ; .arch aarch64
+                    ; mov x8, X(r.value)
+                    ; blr x8
+                );
+            }
+            Some(Loc::Immed(i)) => {
+                let val = i.value;
+                #[cfg(target_arch = "x86_64")]
+                dynasm!(self.mc ; .arch x64
+                    ; mov rax, QWORD val
+                    ; call rax
+                );
+                #[cfg(target_arch = "aarch64")]
+                {
+                    self.emit_mov_imm64(8, val);
+                    dynasm!(self.mc ; .arch aarch64 ; blr x8);
+                }
+            }
+            _ => {}
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        dynasm!(self.mc ; .arch x64 ; pop rbp);
+        #[cfg(target_arch = "aarch64")]
+        dynasm!(self.mc ; .arch aarch64 ; ldp x29, x30, [sp], #16);
+    }
+
+    fn ensure_call_result_bit_extension(&mut self, arglocs: &[Loc]) {
+        let size = Self::argloc_imm(arglocs, 1) as usize;
+        let signed = Self::argloc_imm(arglocs, 2) != 0;
+        if size >= WORD {
+            return;
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        match size {
+            4 => {
+                if signed {
+                    dynasm!(self.mc ; .arch x64 ; shl rax, 32 ; sar rax, 32);
+                } else {
+                    dynasm!(self.mc ; .arch x64 ; shl rax, 32 ; shr rax, 32);
+                }
+            }
+            2 => {
+                if signed {
+                    dynasm!(self.mc ; .arch x64 ; shl rax, 48 ; sar rax, 48);
+                } else {
+                    dynasm!(self.mc ; .arch x64 ; and rax, 0xFFFF);
+                }
+            }
+            1 => {
+                if signed {
+                    dynasm!(self.mc ; .arch x64 ; shl rax, 56 ; sar rax, 56);
+                } else {
+                    dynasm!(self.mc ; .arch x64 ; and rax, 0xFF);
+                }
+            }
+            _ => {}
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        match size {
+            4 => {
+                if signed {
+                    dynasm!(self.mc ; .arch aarch64 ; lsl x0, x0, 32 ; asr x0, x0, 32);
+                } else {
+                    dynasm!(self.mc ; .arch aarch64 ; lsl x0, x0, 32 ; lsr x0, x0, 32);
+                }
+            }
+            2 => {
+                if signed {
+                    dynasm!(self.mc ; .arch aarch64 ; lsl x0, x0, 48 ; asr x0, x0, 48);
+                } else {
+                    dynasm!(self.mc ; .arch aarch64 ; and x0, x0, 0xFFFF);
+                }
+            }
+            1 => {
+                if signed {
+                    dynasm!(self.mc ; .arch aarch64 ; lsl x0, x0, 56 ; asr x0, x0, 56);
+                } else {
+                    dynasm!(self.mc ; .arch aarch64 ; and x0, x0, 0xFF);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// assembler.py:2176 _genop_call — internal call implementation.
     fn _genop_call(&mut self, op: &Op) {
         self.emit_call(op, 0);
+    }
+
+    fn _genop_call_with_arglocs(&mut self, op: &Op, arglocs: &[Loc]) {
+        let func_index = 3 + usize::from(op.opcode.is_call_release_gil());
+        self.emit_call_from_arglocs(arglocs, func_index);
+        if op.opcode.result_type() == Type::Int {
+            self.ensure_call_result_bit_extension(arglocs);
+        }
     }
 
     /// assembler.py:2169-2174 _genop_real_call.
     /// genop_call_i = genop_call_r = genop_call_f = genop_call_n
     fn genop_call(&mut self, op: &Op) {
         self._genop_call(op);
+        if !op.pos.is_none() {
+            self.store_rax_to_result(op.pos);
+        }
+    }
+
+    fn genop_call_with_arglocs(&mut self, op: &Op, arglocs: &[Loc]) {
+        self._genop_call_with_arglocs(op, arglocs);
         if !op.pos.is_none() {
             self.store_rax_to_result(op.pos);
         }
@@ -4705,8 +5090,9 @@ impl Assembler386 {
         // llmodel.py:298 malloc_jitframe parity: callee needs frame_depth
         // slots (frame-slot model stores ALL intermediates in jitframe).
         let jf_slots = self.frame_depth.max(num_args);
-        let jf_alloc_bytes = ((1 + jf_slots) * 8) as i64;
-        let malloc_ptr = libc::malloc as *const () as i64;
+        let jf_alloc_bytes = crate::jitframe::JitFrame::alloc_size(jf_slots) as i64;
+        let jf_frame_len = jf_slots as i64;
+        let calloc_ptr = libc::calloc as *const () as i64;
         let free_ptr = libc::free as *const () as i64;
 
         // Save caller's jf_ptr before clobbering rbp/x29.
@@ -4719,21 +5105,23 @@ impl Assembler386 {
             ; mov x19, x29            // save caller's jf_ptr
         );
 
-        // Allocate callee jitframe on heap via malloc.
+        // Allocate callee jitframe on heap via calloc.
         // Stack alignment: after prologue (push rbp + push r12) + return
         // addr, rsp ≡ -8 (mod 16). sub 8 aligns to 16 for ABI call.
         #[cfg(target_arch = "x86_64")]
         dynasm!(self.mc ; .arch x64
             ; sub rsp, 8                        // align to 16
-            ; mov rdi, QWORD jf_alloc_bytes     // malloc size
-            ; mov rax, QWORD malloc_ptr
+            ; mov rdi, 1                        // calloc nmemb
+            ; mov rsi, QWORD jf_alloc_bytes     // calloc size
+            ; mov rax, QWORD calloc_ptr
             ; call rax                          // rax = heap jf_ptr
             ; add rsp, 8                        // unalign
         );
         #[cfg(target_arch = "aarch64")]
         {
-            self.emit_mov_imm64(0, jf_alloc_bytes);
-            self.emit_mov_imm64(2, malloc_ptr);
+            self.emit_mov_imm64(0, 1);
+            self.emit_mov_imm64(1, jf_alloc_bytes);
+            self.emit_mov_imm64(2, calloc_ptr);
             dynasm!(self.mc ; .arch aarch64
                 ; sub sp, sp, 16                // align
                 ; blr x2                        // x0 = heap jf_ptr
@@ -4748,17 +5136,25 @@ impl Assembler386 {
         #[cfg(target_arch = "x86_64")]
         dynasm!(self.mc ; .arch x64
             ; mov rdx, rax            // rdx = heap jf_ptr
-            ; mov QWORD [rdx], 0      // zero jf_descr
+            ; mov QWORD [rdx + JF_DESCR_OFS], 0
+            ; mov QWORD [rdx + JF_FRAME_OFS as i32], jf_frame_len
         );
         #[cfg(target_arch = "aarch64")]
         dynasm!(self.mc ; .arch aarch64
             ; mov x20, x0             // x20 = heap jf_ptr
-            ; str xzr, [x20]          // zero jf_descr
+            ; str xzr, [x20, JF_DESCR_OFS as u32]
         );
+        #[cfg(target_arch = "aarch64")]
+        {
+            self.emit_mov_imm64(0, jf_frame_len);
+            dynasm!(self.mc ; .arch aarch64
+                ; str x0, [x20, JF_FRAME_OFS as u32]
+            );
+        }
 
-        // Store callee args at jf_frame[i] = heap_jf + (1+i)*8.
+        // Store callee args at jf_frame[i].
         for (i, &arg_ref) in op.args.iter().enumerate() {
-            let dest_offset = ((1 + i) * 8) as i32;
+            let dest_offset = (FIRST_ITEM_OFFSET + i * 8) as i32;
             self.load_arg_to_rax(arg_ref); // reads from [rbp+...], doesn't clobber rdx
             #[cfg(target_arch = "x86_64")]
             dynasm!(self.mc ; .arch x64
@@ -4808,14 +5204,14 @@ impl Assembler386 {
             // detects null code_ptr and calls force_fn(inputs[0]) where
             // inputs[0] = the callee's frame pointer (a PyFrame).
             //
-            // In dynasm, args[0] was stored at jf_frame[0] = [rdx + 8].
+            // RPython uses the first argument slot of the callee jitframe.
             // Read it, free the heap jf, then call force_fn(frame_ptr).
             let force_addr = crate::call_assembler_force_fn_addr() as i64;
             #[cfg(target_arch = "x86_64")]
             {
                 if force_addr != 0 {
                     dynasm!(self.mc ; .arch x64
-                        ; mov r13, [rdx + 8]            // r13 = jf_frame[0] = args[0] (PyFrame ptr)
+                        ; mov r13, [rdx + FIRST_ITEM_OFFSET as i32]
                         ; mov rdi, rdx                   // free(heap_jf)
                         ; sub rsp, 8
                         ; mov rax, QWORD free_ptr
@@ -4845,7 +5241,7 @@ impl Assembler386 {
             {
                 if force_addr != 0 {
                     dynasm!(self.mc ; .arch aarch64
-                        ; ldr x21, [x20, 8]             // x21 = jf_frame[0] (PyFrame ptr)
+                        ; ldr x21, [x20, FIRST_ITEM_OFFSET as u32]
                     );
                     self.emit_mov_imm64(2, free_ptr);
                     dynasm!(self.mc ; .arch aarch64
@@ -4923,7 +5319,7 @@ impl Assembler386 {
                 let fast_path = self.mc.new_dynamic_label();
                 let merge = self.mc.new_dynamic_label();
                 dynasm!(self.mc ; .arch x64
-                    ; mov rcx, [rdx]                    // rcx = jf_descr
+                    ; mov rcx, [rdx + JF_DESCR_OFS]     // rcx = jf_descr
                     ; mov rax, QWORD done_descr_ptr
                     ; cmp rcx, rax
                     ; je =>fast_path
@@ -4947,7 +5343,7 @@ impl Assembler386 {
                 );
                 if result_type == Type::Float {
                     dynasm!(self.mc ; .arch x64
-                        ; movsd xmm0, [rdx + 8]        // xmm0 = jf_frame[0] (float)
+                        ; movsd xmm0, [rdx + FIRST_ITEM_OFFSET as i32]
                         ; movq r12, xmm0               // preserve bits across free
                         ; mov rdi, rdx                  // free(callee_jf)
                         ; sub rsp, 8
@@ -4959,7 +5355,7 @@ impl Assembler386 {
                     );
                 } else {
                     dynasm!(self.mc ; .arch x64
-                        ; mov r12, [rdx + 8]            // r12 = jf_frame[0] (result)
+                        ; mov r12, [rdx + FIRST_ITEM_OFFSET as i32]
                         ; mov rdi, rdx                  // free(callee_jf)
                         ; sub rsp, 8
                         ; mov rax, QWORD free_ptr
@@ -4976,7 +5372,7 @@ impl Assembler386 {
                 let merge = self.mc.new_dynamic_label();
                 self.emit_mov_imm64(2, done_descr_ptr);
                 dynasm!(self.mc ; .arch aarch64
-                    ; ldr x1, [x20]                     // x1 = jf_descr
+                    ; ldr x1, [x20, JF_DESCR_OFS as u32]
                     ; cmp x1, x2
                     ; b.eq =>fast_path
                 );
@@ -4994,7 +5390,7 @@ impl Assembler386 {
                 {
                     dynasm!(self.mc ; .arch aarch64
                         ; =>fast_path
-                        ; ldr x19, [x20, 8]             // x19 = result
+                        ; ldr x19, [x20, FIRST_ITEM_OFFSET as u32]
                     );
                     self.emit_mov_imm64(2, free_ptr);
                     dynasm!(self.mc ; .arch aarch64

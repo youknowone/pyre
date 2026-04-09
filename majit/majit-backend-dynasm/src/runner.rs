@@ -14,6 +14,7 @@ use majit_backend::{
 };
 use majit_ir::{FailDescr, GcRef, InputArg, Op, Type, Value};
 
+use crate::arch;
 use crate::assembler::{Assembler386, CompiledCode};
 use crate::codebuf;
 use crate::frame::FrameData;
@@ -145,6 +146,10 @@ impl DynasmBackend {
             .expect("token has no compiled code")
             .downcast_ref::<CompiledCode>()
             .expect("compiled data is not CompiledCode")
+    }
+
+    fn input_slot(position: usize) -> usize {
+        arch::JITFRAME_FIXED_SIZE + position
     }
 
     /// llmodel.py:412 get_latest_descr parity: resolve a raw jf_descr
@@ -388,7 +393,7 @@ impl Backend for DynasmBackend {
             .max(64);
         let jf_ptr = unsafe { libc::calloc(1, JitFrame::alloc_size(num_slots)) as *mut JitFrame };
         assert!(!jf_ptr.is_null(), "execute_token: calloc failed");
-        unsafe { JitFrame::init(jf_ptr, num_slots) };
+        unsafe { JitFrame::init(jf_ptr, std::ptr::null(), num_slots) };
 
         for (i, arg) in args.iter().enumerate() {
             let raw = match arg {
@@ -397,12 +402,12 @@ impl Backend for DynasmBackend {
                 Value::Float(f) => f.to_bits() as i64,
                 Value::Void => 0,
             };
-            unsafe { JitFrame::set_int_value(jf_ptr, i, raw) };
+            unsafe { JitFrame::set_int_value(jf_ptr, Self::input_slot(i), raw) };
         }
 
         if std::env::var_os("MAJIT_LOG").is_some() {
             for (i, arg) in args.iter().enumerate() {
-                let raw = unsafe { JitFrame::get_int_value(jf_ptr, i) };
+                let raw = unsafe { JitFrame::get_int_value(jf_ptr, Self::input_slot(i)) };
                 eprintln!("[dynasm]   arg[{}] = {:#018x} ({:?})", i, raw as u64, arg);
             }
             eprintln!(
@@ -512,10 +517,10 @@ impl Backend for DynasmBackend {
             .max(64);
         let jf_ptr = unsafe { libc::calloc(1, JitFrame::alloc_size(num_slots)) as *mut JitFrame };
         assert!(!jf_ptr.is_null(), "execute_token_ints_raw: calloc failed");
-        unsafe { JitFrame::init(jf_ptr, num_slots) };
+        unsafe { JitFrame::init(jf_ptr, std::ptr::null(), num_slots) };
 
         for (i, &val) in args.iter().enumerate() {
-            unsafe { JitFrame::set_int_value(jf_ptr, i, val) };
+            unsafe { JitFrame::set_int_value(jf_ptr, Self::input_slot(i), val) };
         }
 
         let func: unsafe extern "C" fn(*mut JitFrame) -> *mut JitFrame =
