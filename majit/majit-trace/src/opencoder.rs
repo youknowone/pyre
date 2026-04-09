@@ -872,10 +872,25 @@ impl<'a> TraceIterator<'a> {
                 *arg = self._untag(*arg);
             }
         }
-        // if res.type != 'v':
-        //     self._cache[self._index] = res
-        //     self._index += 1
-        if !src.pos.is_none() && src.opcode.result_type() != majit_ir::Type::Void {
+        // RPython opencoder.py:399-401:
+        //     res = ResOperation(opnum, args, descr)   # fresh cls() object
+        //     if res.type != 'v':
+        //         self._cache[self._index] = res
+        //         self._index += 1
+        //
+        // RPython allocates a fresh `cls()` ResOperation Python object on
+        // EVERY visited op (void or non-void); only non-void results land
+        // in `_cache`, but the freshness is unconditional. majit's
+        // analogue of "fresh cls()" is the `_fresh` OpRef counter, so we
+        // must advance `_fresh` for void ops too — otherwise a non-void
+        // op processed after a void op gets a fresh OpRef that collides
+        // with the void op's raw `pos`. With this in place,
+        // `start_fresh = 0` over a recorder-emitted trace produces a
+        // bit-identical sequence of OpRefs (every op `i` gets
+        // `OpRef(num_inputs + i)`, matching `recorder.record_op`'s
+        // monotonic `op_count`).
+        let is_void_result = src.pos.is_none() || src.opcode.result_type() == majit_ir::Type::Void;
+        if !is_void_result {
             let orig = src.pos.0 as usize;
             if orig >= self._cache.len() {
                 self._cache.resize(orig + 1, None);
@@ -883,9 +898,6 @@ impl<'a> TraceIterator<'a> {
             let fresh = if let Some(existing) = self._cache[orig] {
                 existing
             } else {
-                // majit fresh OpRef allocation: allocate from `_fresh`
-                // (independent of `_index` so phase 2 can start above
-                // phase 1's high water).
                 let f = OpRef(self._fresh);
                 self._fresh += 1;
                 self._cache[orig] = Some(f);
@@ -899,6 +911,15 @@ impl<'a> TraceIterator<'a> {
             // directly to keep `_cache[_index - 1]` (`replace_last_cached`)
             // pointing at the slot we just wrote.
             self._index = orig as u32 + 1;
+        } else if !src.pos.is_none() {
+            // Void op carrying a raw trace position: still allocate a
+            // fresh OpRef so the `_fresh` counter stays in lockstep with
+            // the raw trace position counter. The op is not cached
+            // (RPython doesn't cache void results either), so later args
+            // never reference it.
+            let f = OpRef(self._fresh);
+            self._fresh += 1;
+            res.pos = f;
         } else {
             res.pos = src.pos;
         }

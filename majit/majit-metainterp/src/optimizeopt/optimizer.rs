@@ -535,10 +535,32 @@ impl Optimizer {
             .as_ref()
             .map(|s| &s.virtual_state.state[..])
             .unwrap_or(&[]);
+        // virtualstate.py:111-116 `enum` parity: a single visited map
+        // tracked via `Rc::as_ptr` dedups shared subtrees across all
+        // top-level state entries, matching the
+        // `build_sequential_slot_schedule` dedup so `label_slot` advances
+        // by the same number of leaves as `imported_label_args.len()`.
+        // The map value caches the imported Phase 2 OpRef for the first
+        // visit so subsequent revisits resolve to the same box (mirroring
+        // RPython's setinfo_from_preamble.get_forwarded sharing).
+        let mut walk_visited: std::collections::HashMap<usize, OpRef> =
+            std::collections::HashMap::new();
         for (state_idx, state_info) in all_states.iter().enumerate() {
             if let Some(iv) = iv_map.get(&state_idx) {
                 // Virtual state: process fields recursively, consuming slots
                 // for non-virtual leaf fields.
+                //
+                // Top-level Rc dedup: if two top-level state entries are
+                // aliased (same Rc), the second visit should not advance
+                // label_slot or allocate a new VirtualEntry. Mark the
+                // top-level Rc identity as visited so subsequent revisits
+                // (including nested-field references back to the same Rc)
+                // short-circuit through walk_visited.
+                let top_key = std::rc::Rc::as_ptr(state_info) as usize;
+                if walk_visited.contains_key(&top_key) {
+                    continue;
+                }
+                walk_visited.insert(top_key, OpRef::NONE);
                 //
                 // `iv.inputarg_index` is the virtualizable state's index
                 // within `next_iteration_args`, which corresponds to
@@ -552,6 +574,7 @@ impl Optimizer {
                 // still works.
                 let raw = OpRef(ctx.inputarg_base + iv.inputarg_index as u32);
                 let virtual_head = ctx.get_box_replacement(raw);
+                walk_visited.insert(top_key, virtual_head);
                 let mut fields = Vec::new();
                 let mut field_descrs = Vec::new();
                 for (descr, field_info) in &iv.fields {
@@ -560,6 +583,7 @@ impl Optimizer {
                         imported_label_args,
                         &mut label_slot,
                         ctx,
+                        &mut walk_visited,
                     );
                     let field_idx = fields.len();
                     if ctx.skip_flush_mode
@@ -585,8 +609,12 @@ impl Optimizer {
                 });
             } else {
                 // Non-virtual state: advance label_slot to match RPython's
-                // position_in_notvirtuals enumeration order.
-                let count = crate::optimizeopt::virtualstate::VirtualState::count_forced_boxes_for_entry_static(state_info);
+                // position_in_notvirtuals enumeration order. Top-level Rc
+                // dedup is handled inside count_forced_boxes_for_entry_static.
+                let count = crate::optimizeopt::virtualstate::VirtualState::count_forced_boxes_for_entry_static(
+                    state_info,
+                    &mut walk_visited,
+                );
                 label_slot += count;
             }
         }
@@ -672,11 +700,43 @@ impl Optimizer {
         }
     }
 
+    /// virtualstate.py:712-728 `VirtualStateConstructor.create_state` cache
+    /// parity for the import side: dedup nested `Rc<VirtualStateInfo>`
+    /// references via pointer identity, returning the previously imported
+    /// Phase 2 OpRef on revisits so shared substates collapse onto a
+    /// single Phase 2 box (matching RPython's setinfo_from_preamble
+    /// `if op.get_forwarded() is not None: return` semantics).
+    fn import_virtual_state_from_label_args_recurse(
+        rc: &std::rc::Rc<crate::optimizeopt::virtualstate::VirtualStateInfo>,
+        imported_label_args: &[OpRef],
+        label_slot: &mut usize,
+        ctx: &mut OptContext,
+        walk_visited: &mut std::collections::HashMap<usize, OpRef>,
+    ) -> OpRef {
+        let key = std::rc::Rc::as_ptr(rc) as usize;
+        if let Some(&cached) = walk_visited.get(&key) {
+            return cached;
+        }
+        // Insert a placeholder NONE to break cycles, then overwrite with
+        // the real OpRef once import_virtual_state_from_label_args returns.
+        walk_visited.insert(key, OpRef::NONE);
+        let opref = Self::import_virtual_state_from_label_args(
+            rc,
+            imported_label_args,
+            label_slot,
+            ctx,
+            walk_visited,
+        );
+        walk_visited.insert(key, opref);
+        opref
+    }
+
     fn import_virtual_state_from_label_args(
         info: &crate::optimizeopt::virtualstate::VirtualStateInfo,
         imported_label_args: &[OpRef],
         label_slot: &mut usize,
         ctx: &mut OptContext,
+        walk_visited: &mut std::collections::HashMap<usize, OpRef>,
     ) -> OpRef {
         use crate::optimizeopt::virtualstate::VirtualStateInfo;
 
@@ -693,11 +753,12 @@ impl Optimizer {
                 let imported_fields: Vec<(u32, OpRef)> = fields
                     .iter()
                     .map(|(field_idx, field_info)| {
-                        let field_ref = Self::import_virtual_state_from_label_args(
+                        let field_ref = Self::import_virtual_state_from_label_args_recurse(
                             field_info,
                             imported_label_args,
                             label_slot,
                             ctx,
+                            walk_visited,
                         );
                         let offset = field_descrs
                             .iter()
@@ -730,11 +791,12 @@ impl Optimizer {
                 let imported_items = items
                     .iter()
                     .map(|item_info| {
-                        Self::import_virtual_state_from_label_args(
+                        Self::import_virtual_state_from_label_args_recurse(
                             item_info,
                             imported_label_args,
                             label_slot,
                             ctx,
+                            walk_visited,
                         )
                     })
                     .collect();
@@ -762,11 +824,12 @@ impl Optimizer {
                     .map(|(field_idx, field_info)| {
                         (
                             *field_idx,
-                            Self::import_virtual_state_from_label_args(
+                            Self::import_virtual_state_from_label_args_recurse(
                                 field_info,
                                 imported_label_args,
                                 label_slot,
                                 ctx,
+                                walk_visited,
                             ),
                         )
                     })
@@ -797,11 +860,12 @@ impl Optimizer {
                             .map(|(field_idx, field_info)| {
                                 (
                                     *field_idx,
-                                    Self::import_virtual_state_from_label_args(
+                                    Self::import_virtual_state_from_label_args_recurse(
                                         field_info,
                                         imported_label_args,
                                         label_slot,
                                         ctx,
+                                        walk_visited,
                                     ),
                                 )
                             })
@@ -829,11 +893,12 @@ impl Optimizer {
                         (
                             *offset,
                             *length,
-                            Self::import_virtual_state_from_label_args(
+                            Self::import_virtual_state_from_label_args_recurse(
                                 entry_info,
                                 imported_label_args,
                                 label_slot,
                                 ctx,
+                                walk_visited,
                             ),
                         )
                     })
@@ -1634,7 +1699,13 @@ impl Optimizer {
             }
         }
 
-        if let Some(exported_state) = self.imported_loop_state.as_ref() {
+        // Take ownership of imported_loop_state for the duration of
+        // this block: import_state needs `&mut self` (force_box dispatch
+        // through the optimizer pass), so we cannot keep an immutable
+        // borrow of `self.imported_loop_state` simultaneously. The state
+        // is restored at the end of the block.
+        let imported_loop_state_taken = self.imported_loop_state.take();
+        if let Some(ref exported_state) = imported_loop_state_taken {
             // opencoder.py:259 + unroll.py:479-504 parity: RPython's
             // TraceIterator allocates fresh InputArg Box objects for
             // each iteration, and `import_state` asserts
@@ -1681,12 +1752,21 @@ impl Optimizer {
                     }
                 })
                 .collect();
-            let (label_args, source_slots) =
-                crate::optimizeopt::unroll::import_state_with_source_slots(
-                    &targetargs,
-                    exported_state,
-                    &mut ctx,
-                );
+            // unroll.py:493-494: label_args = virtual_state.make_inputargs(targetargs, optimizer)
+            let label_args = crate::optimizeopt::unroll::import_state(
+                &targetargs,
+                exported_state,
+                self,
+                &mut ctx,
+            );
+            // majit-only sibling: derive the per-non-virtual inputarg
+            // source-slot array used by `assemble_peeled_trace_with_jump_args`
+            // to map body source references back onto LABEL slots.
+            let source_slots = crate::optimizeopt::unroll::make_imported_label_source_slots(
+                &targetargs,
+                exported_state,
+                &ctx,
+            );
             if crate::optimizeopt::majit_log_enabled() {
                 if let Some((base, ref sa)) = ctx.imported_virtual_args {
                     eprintln!(
@@ -1700,6 +1780,8 @@ impl Optimizer {
             self.imported_label_args = Some(label_args);
             self.imported_label_source_slots = Some(source_slots);
         }
+        // Restore the temporarily-taken imported_loop_state.
+        self.imported_loop_state = imported_loop_state_taken;
 
         if !self.imported_virtuals.is_empty() {
             self.install_imported_virtuals(&mut ctx);
@@ -1732,35 +1814,39 @@ impl Optimizer {
             self.flush(&mut ctx);
         }
 
-        // RPython unroll.py:457: get_virtual_state(end_args)
-        // Capture virtual state BEFORE any forcing. JUMP is never sent
-        // through passes (flush=False parity), so virtual info is preserved.
-        let pre_jump_virtual_state =
+        // RPython unroll.py:454-457:
+        //     end_args = [self.optimizer.force_box_for_end_of_preamble(a)
+        //                 for a in original_label_args]
+        //     self.optimizer.flush()
+        //     virtual_state = self.get_virtual_state(end_args)
+        //
+        // The virtual state is captured AFTER force_box_for_end_of_preamble
+        // and AFTER flush, so its `Virtual` / `VStruct` entries correspond
+        // exactly to the boxes whose `info.is_virtual()` is still true at
+        // that moment (e.g. virtualizables that the force pass intentionally
+        // leaves virtual). This invariant is what `make_inputargs` /
+        // `make_inputargs_and_virtuals` rely on when they call
+        // `enum_forced_boxes` — the validating walker raises
+        // `VirtualStatesCantMatch` if a `Virtual` entry's resolved opref
+        // is not actually virtual.
+        //
+        // Capture is performed below, *after* the terminal_op force pass
+        // and `flush()` have run inside the `exported_loop_state` map
+        // closure, mirroring RPython's order. The pre-force resolved
+        // jump args are still recorded here so the closure can stash them
+        // for downstream consumers (e.g. the unroll.rs assembly path that
+        // wants the original incoming OpRefs for source-slot mapping).
+        let pre_jump_resolved_args =
             last_op
                 .as_ref()
                 .filter(|op| op.opcode == OpCode::Jump)
                 .map(|jump_op| {
-                    let resolved_args: Vec<OpRef> = jump_op
+                    jump_op
                         .args
                         .iter()
                         .map(|&arg| ctx.get_box_replacement(arg))
-                        .collect();
-                    (
-                        crate::optimizeopt::virtualstate::export_state(
-                            &resolved_args,
-                            &ctx,
-                            &ctx.forwarded,
-                        ),
-                        resolved_args,
-                    )
+                        .collect::<Vec<OpRef>>()
                 });
-
-        // Set pre_force_virtual_state for export_state_with_bounds to use.
-        // This replaces the previous approach where OptVirtualize's JUMP handler set it.
-        if let Some((ref vs, ref args)) = pre_jump_virtual_state {
-            ctx.pre_force_virtual_state = Some(vs.clone());
-            ctx.pre_force_jump_args = Some(args.clone());
-        }
 
         // RPython optimizer.py:552-556 (_propagate_all_forward):
         //     if flush:
@@ -1872,18 +1958,17 @@ impl Optimizer {
                     .filter(|op| op.opcode == OpCode::Jump)
             });
         self.exported_loop_state = jump.map(|jump| {
-            // Use pre-JUMP virtual state captured before passes forced virtuals.
-            // RPython unroll.py:457: get_virtual_state(end_args) — computed
-            // after force_at_the_end_of_preamble but before final JUMP emission.
-            let (pre_vs, pre_args) = pre_jump_virtual_state.clone()
+            // RPython unroll.py:454-457 order:
+            //   end_args = [force_box_for_end_of_preamble(a) for a ...]
+            //   self.optimizer.flush()
+            //   virtual_state = self.get_virtual_state(end_args)
+            // — VS captured AFTER force + flush.
+            let original_jump_args = pre_jump_resolved_args.clone()
                 .unwrap_or_else(|| {
-                    let args: Vec<OpRef> = jump.args.iter()
+                    jump.args.iter()
                         .map(|&a| ctx.get_box_replacement(a))
-                        .collect();
-                    let vs = crate::optimizeopt::virtualstate::export_state(&args, &ctx, &ctx.forwarded);
-                    (vs, args)
+                        .collect()
                 });
-            let original_jump_args = pre_args;
             let mut resolved_args = original_jump_args.clone();
             // Dedup: two cases require SameAs allocation at end of preamble.
             //
@@ -1995,21 +2080,34 @@ impl Optimizer {
             self.flush(&mut ctx);
 
             // Now force all resolved (and dedup'd) args.
+            // unroll.py:454 `end_args = [force_box_for_end_of_preamble(a)
+            // for a in original_label_args]`.
             ctx.preamble_end_args = Some(
                 resolved_args
                     .iter()
                     .map(|&arg| self.force_at_the_end_of_preamble(arg, &mut ctx))
                     .collect(),
             );
-            // RPython parity: nested virtuals in output ops should be
-            // forced by force_at_the_end_of_preamble's recursive walk.
-            // Additional force is handled by the undefined-ref cleanup below
-            // which drops ops referencing un-forced virtual OpRefs.
-            // Virtual state was captured before JUMP went through passes.
-            let preview_virtual_state = pre_vs;
-            let vs_args = &original_jump_args;
-            let (preview_label_args, preview_virtuals) =
-                preview_virtual_state.make_inputargs_and_virtuals(vs_args, &ctx);
+            // unroll.py:457 `virtual_state = self.get_virtual_state(end_args)`.
+            // VS is captured AFTER force + flush so its `Virtual` /
+            // `VStruct` entries match the `info.is_virtual()` predicate
+            // that `enum_forced_boxes` asserts. Virtuals that were
+            // forced into concrete instances by `force_at_the_end_of_preamble`
+            // come back as `NotVirtualStateInfo` here, exactly as they
+            // do in RPython.
+            let post_force_args: Vec<OpRef> = resolved_args
+                .iter()
+                .map(|&a| ctx.get_box_replacement(a))
+                .collect();
+            let preview_virtual_state = crate::optimizeopt::virtualstate::export_state(
+                &post_force_args,
+                &ctx,
+                &ctx.forwarded,
+            );
+            let vs_args = &post_force_args;
+            let (preview_label_args, preview_virtuals) = preview_virtual_state
+                .make_inputargs_and_virtuals(vs_args, self, &mut ctx, false)
+                .expect("preview make_inputargs_and_virtuals failed");
             let mut preview_short_args = preview_label_args.clone();
             preview_short_args.extend(preview_virtuals);
             let mut short_boxes =
@@ -2082,7 +2180,8 @@ impl Optimizer {
             crate::optimizeopt::unroll::export_state(
                 &original_jump_args,
                 &renamed_inputargs,
-                &ctx,
+                self,
+                &mut ctx,
                 Some(&exported_int_bounds),
             )
         });
@@ -2376,6 +2475,47 @@ impl Optimizer {
 
         // Preserve final context for jump_to_existing_trace.
         let ops = std::mem::take(&mut ctx.new_operations);
+        // resume.py:204-207 + regalloc.py:1206 parity:
+        // RPython's `_gettagged` tags `isinstance(box, Const)` arguments
+        // as TAGCONST, so they never appear in `liveboxes` (the backend's
+        // failargs equivalent). RPython's `Const` is a separate type from
+        // `Box`, so a `Box` whose `_forwarded` was set to a `Const` by
+        // `make_constant` is still a `Box` and the regalloc check passes.
+        //
+        // majit's flat OpRef model conflates the two: every entry in the
+        // `constants` HashMap (both true constant-pool refs >=
+        // OpRef::CONST_BASE and trace-result refs that became
+        // `Forwarded::Const` via `make_constant`) makes the backend's
+        // `regalloc.py:1206` fail_args check trip. We can't drop
+        // make-constant'd OpRefs from `constants` wholesale — codegen for
+        // ops that take them as args still needs to fold the immediate.
+        //
+        // Filter fail_args here, AFTER all `propagate_postprocess`
+        // passes have completed, so any `make_constant` that fired in
+        // OptRewrite postprocess (rewrite.py:352-371 / 303-305) is
+        // visible. Replacing the constant fail_arg with `OpRef::NONE`
+        // mirrors RPython's `liveboxes[i] = None` for non-TAGBOX entries
+        // (resume.py:411-412); the actual value is recoverable via
+        // rd_consts when the snapshot path runs, or via the inputarg
+        // load slot for no-snapshot test guards.
+        let mut filtered_ops = ops;
+        for op in filtered_ops.iter_mut() {
+            if !op.opcode.is_guard() {
+                continue;
+            }
+            let Some(ref mut fail_args) = op.fail_args else {
+                continue;
+            };
+            for fa in fail_args.iter_mut() {
+                if fa.is_none() {
+                    continue;
+                }
+                if constants.contains_key(&fa.0) {
+                    *fa = OpRef::NONE;
+                }
+            }
+        }
+        let ops = filtered_ops;
         if crate::optimizeopt::majit_log_enabled() {
             let cmf_count = ops.iter().filter(|o| o.opcode.is_call_may_force()).count();
             let gnf_count = ops
