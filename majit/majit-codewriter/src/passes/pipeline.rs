@@ -52,14 +52,6 @@ pub struct PipelineOpcodeArm {
     /// Inlined + jtransform'd + flattened output.
     /// None if the opcode handler was too trivial or unsupported.
     pub flattened: Option<SSARepr>,
-    /// Per-opcode JitCode bytes assembled from `flattened`.
-    ///
-    /// Phase C of the eval-loop automation plan: pre-assembled per-opcode
-    /// jitcode that the trace recorder will eventually dispatch through
-    /// `BlackholeInterpreter::dispatch_one()` instead of going through the
-    /// `OpcodeHandler` trait. None when `flattened` is None or when
-    /// register allocation / assembly fails.
-    pub jitcode: Option<crate::assembler::JitCode>,
 }
 
 /// Result of running the pipeline on a full program.

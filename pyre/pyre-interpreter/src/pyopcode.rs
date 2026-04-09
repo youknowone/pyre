@@ -1584,12 +1584,6 @@ where
             Ok(StepResult::Continue)
         }
 
-        // ── Generators ──
-        Instruction::YieldValue { .. } => {
-            let value = executor.pop_value()?;
-            Ok(StepResult::Yield(value))
-        }
-
         // ── Import ──
         Instruction::ImportName { namei } => {
             let name_idx = namei.get(op_arg) as usize;
@@ -1811,12 +1805,6 @@ where
         }
         Instruction::LoadLocals => {
             executor.load_locals()?;
-            Ok(StepResult::Continue)
-        }
-        Instruction::Copy { i } => {
-            let depth = i.get(op_arg) as usize;
-            let val = executor.peek_at(depth - 1)?;
-            executor.push_value(val)?;
             Ok(StepResult::Continue)
         }
 
