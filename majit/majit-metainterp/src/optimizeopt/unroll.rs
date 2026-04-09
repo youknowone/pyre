@@ -18,7 +18,7 @@
 /// OpRefs in the peeled iteration are remapped to new positions so they
 /// don't collide with the original ops.
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Type, Value};
 
@@ -1805,6 +1805,7 @@ pub struct TargetToken {
     /// token currently being finalized.
     pub short_preamble_producer:
         Option<crate::optimizeopt::shortpreamble::ExtendedShortPreambleBuilder>,
+    jump_target_descr: Arc<LoopTargetDescr>,
 }
 
 impl TargetToken {
@@ -1815,6 +1816,7 @@ impl TargetToken {
             virtual_state: None,
             short_preamble: None,
             short_preamble_producer: None,
+            jump_target_descr: Arc::new(LoopTargetDescr::new(0, false)),
         }
     }
 
@@ -1822,21 +1824,36 @@ impl TargetToken {
         let mut token = Self::new();
         token.token_id = token_id;
         token.is_preamble_target = true;
+        token.jump_target_descr = Arc::new(LoopTargetDescr::new(token_id, true));
         token
     }
 
     pub fn as_jump_target_descr(&self) -> majit_ir::DescrRef {
-        Arc::new(LoopTargetDescr {
-            token_id: self.token_id,
-            is_preamble_target: self.is_preamble_target,
-        })
+        self.jump_target_descr.clone()
     }
+}
+
+#[derive(Debug, Default)]
+struct LoopTargetDescrState {
+    ll_loop_code: usize,
+    target_arglocs: Vec<majit_ir::TargetArgLoc>,
 }
 
 #[derive(Debug)]
 struct LoopTargetDescr {
     token_id: u64,
     is_preamble_target: bool,
+    state: Mutex<LoopTargetDescrState>,
+}
+
+impl LoopTargetDescr {
+    fn new(token_id: u64, is_preamble_target: bool) -> Self {
+        Self {
+            token_id,
+            is_preamble_target,
+            state: Mutex::new(LoopTargetDescrState::default()),
+        }
+    }
 }
 
 impl majit_ir::Descr for LoopTargetDescr {
@@ -1850,6 +1867,36 @@ impl majit_ir::Descr for LoopTargetDescr {
         } else {
             format!("LoopTargetDescr({})", self.token_id)
         }
+    }
+
+    fn as_loop_target_descr(&self) -> Option<&dyn majit_ir::LoopTargetDescr> {
+        Some(self)
+    }
+}
+
+impl majit_ir::LoopTargetDescr for LoopTargetDescr {
+    fn token_id(&self) -> u64 {
+        self.token_id
+    }
+
+    fn is_preamble_target(&self) -> bool {
+        self.is_preamble_target
+    }
+
+    fn ll_loop_code(&self) -> usize {
+        self.state.lock().unwrap().ll_loop_code
+    }
+
+    fn set_ll_loop_code(&self, loop_code: usize) {
+        self.state.lock().unwrap().ll_loop_code = loop_code;
+    }
+
+    fn target_arglocs(&self) -> Vec<majit_ir::TargetArgLoc> {
+        self.state.lock().unwrap().target_arglocs.clone()
+    }
+
+    fn set_target_arglocs(&self, arglocs: Vec<majit_ir::TargetArgLoc>) {
+        self.state.lock().unwrap().target_arglocs = arglocs;
     }
 }
 
@@ -2030,6 +2077,7 @@ impl OptUnroll {
     ) -> TargetToken {
         let mut target_token = TargetToken::new();
         target_token.token_id = token_id;
+        target_token.jump_target_descr = Arc::new(LoopTargetDescr::new(token_id, false));
         target_token.virtual_state = Some(virtual_state);
         target_token.short_preamble = Some(short_preamble);
         target_token.short_preamble_producer = short_preamble_builder.map(|builder| {
@@ -4509,6 +4557,7 @@ mod tests {
             ])),
             short_preamble: None,
             short_preamble_producer: None,
+            jump_target_descr: Arc::new(LoopTargetDescr::new(3, false)),
         };
         unroll.target_tokens.push(regular);
 

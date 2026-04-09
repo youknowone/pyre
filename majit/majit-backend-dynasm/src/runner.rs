@@ -18,6 +18,7 @@ use crate::assembler::{Assembler386, CompiledCode};
 use crate::codebuf;
 use crate::frame::FrameData;
 use crate::guard::DynasmFailDescr;
+use crate::jitframe::JitFrame;
 
 /// Global CALL_ASSEMBLER target registry.
 ///
@@ -333,17 +334,7 @@ impl Backend for DynasmBackend {
         let mut asm = Assembler386::new(trace_id, 0, constants, self.vtable_offset, typeid_table);
         asm.set_call_assembler_targets(Self::call_assembler_targets_snapshot());
 
-        // assembler.py closing_jump parity: set the bridge's JUMP target
         let orig_compiled = Self::get_compiled(original_token);
-        if orig_compiled.label_addr != 0 {
-            asm.set_jump_target_addr(orig_compiled.label_addr);
-        }
-        // regalloc.py:1308 `descr._x86_arglocs` parity: pass the main
-        // loop's LABEL arglocs to the bridge so its closing JUMP places
-        // arguments in the locations the body code expects.
-        if !orig_compiled.loop_arglocs.is_empty() {
-            asm.set_loop_arglocs(orig_compiled.loop_arglocs.clone());
-        }
 
         // assembler.py:638 rebuild_faillocs_from_descr(faildescr, inputargs)
         // RPython uses the exact faildescr object. We find the matching
@@ -354,16 +345,8 @@ impl Backend for DynasmBackend {
             fail_descr.trace_id(),
             fail_descr.fail_index(),
         );
-        // assembler.py:201 rebuild_faillocs_from_descr parity:
-        // iterate rd_locs and SKIP 0xFFFF entries (virtual/unmapped).
-        // Bridge inputargs exclude virtual failargs, so source_slots
-        // must also exclude None entries to maintain 1:1 correspondence.
-        let source_slots: Vec<usize> = guard_descr
-            .fail_arg_locs
-            .iter()
-            .filter_map(|loc| *loc)
-            .collect();
-        let compiled = asm.assemble_bridge(fail_descr, inputargs, ops, &source_slots)?;
+        let arglocs = Assembler386::rebuild_faillocs_from_descr(&guard_descr, inputargs);
+        let compiled = asm.assemble_bridge(fail_descr, inputargs, ops, &arglocs)?;
 
         let bridge_addr = codebuf::buffer_ptr(&compiled.buffer) as usize;
         let code_size = compiled.buffer.len();
@@ -398,18 +381,15 @@ impl Backend for DynasmBackend {
         let compiled = Self::get_compiled(token);
         let entry = codebuf::buffer_ptr(&compiled.buffer);
 
-        // llmodel.py:298 malloc_jitframe → allocate jitframe
-        // jf_ptr layout: [jf_descr, jf_frame[0], jf_frame[1], ...]
         let num_slots = args
             .len()
             .max(compiled.fail_descrs.len() * 4)
             .max(compiled.frame_depth.load(Ordering::Acquire))
             .max(64);
-        let jf_total = 1 + num_slots;
-        let mut jf: Vec<i64> = vec![0i64; jf_total];
-        let jf_ptr = jf.as_mut_ptr();
+        let jf_ptr = unsafe { libc::calloc(1, JitFrame::alloc_size(num_slots)) as *mut JitFrame };
+        assert!(!jf_ptr.is_null(), "execute_token: calloc failed");
+        unsafe { JitFrame::init(jf_ptr, num_slots) };
 
-        // Copy input values to jf_frame[0..n]
         for (i, arg) in args.iter().enumerate() {
             let raw = match arg {
                 Value::Int(v) => *v,
@@ -417,12 +397,12 @@ impl Backend for DynasmBackend {
                 Value::Float(f) => f.to_bits() as i64,
                 Value::Void => 0,
             };
-            unsafe { *jf_ptr.add(1 + i) = raw };
+            unsafe { JitFrame::set_int_value(jf_ptr, i, raw) };
         }
 
         if std::env::var_os("MAJIT_LOG").is_some() {
             for (i, arg) in args.iter().enumerate() {
-                let raw = unsafe { *jf_ptr.add(1 + i) };
+                let raw = unsafe { JitFrame::get_int_value(jf_ptr, i) };
                 eprintln!("[dynasm]   arg[{}] = {:#018x} ({:?})", i, raw as u64, arg);
             }
             eprintln!(
@@ -454,7 +434,7 @@ impl Backend for DynasmBackend {
         }
 
         // llmodel.py:323: ll_frame = func(ll_frame)
-        let func: unsafe extern "C" fn(*mut i64) -> *mut i64 =
+        let func: unsafe extern "C" fn(*mut JitFrame) -> *mut JitFrame =
             unsafe { std::mem::transmute(entry) };
         let result_jf = unsafe { func(jf_ptr) };
 
@@ -471,7 +451,7 @@ impl Backend for DynasmBackend {
         // RPython resolves jf_descr via AbstractDescr.show() which
         // works for any descr from any loop or bridge. We search root
         // loop fail_descrs + all bridge fail_descrs in asmmemmgr_blocks.
-        let jf_descr_raw = unsafe { *result_jf.add(0) };
+        let jf_descr_raw = unsafe { JitFrame::get_latest_descr(result_jf) as i64 };
         let descr = Self::find_descr_by_ptr(token, jf_descr_raw as usize);
 
         if std::env::var_os("MAJIT_LOG").is_some() {
@@ -491,7 +471,7 @@ impl Backend for DynasmBackend {
             if i < n_locs {
                 match descr.fail_arg_locs[i] {
                     Some(slot) => {
-                        let val = unsafe { *result_jf.add(1 + slot) };
+                        let val = unsafe { JitFrame::get_int_value(result_jf, slot) };
                         if std::env::var_os("MAJIT_LOG").is_some() && i < 10 {
                             eprintln!(
                                 "[dynasm] fail_arg[{}]: slot={} val={:#018x}",
@@ -503,11 +483,11 @@ impl Backend for DynasmBackend {
                     None => raw_values.push(0),
                 }
             } else {
-                raw_values.push(unsafe { *result_jf.add(1 + i) });
+                raw_values.push(unsafe { JitFrame::get_int_value(result_jf, i) });
             }
         }
 
-        drop(jf);
+        unsafe { libc::free(jf_ptr as *mut std::ffi::c_void) };
 
         DeadFrame {
             data: Box::new(FrameData::new(raw_values, descr)),
@@ -530,19 +510,19 @@ impl Backend for DynasmBackend {
             .max(compiled.fail_descrs.len() * 4)
             .max(compiled.frame_depth.load(Ordering::Acquire))
             .max(64);
-        let jf_total = 1 + num_slots;
-        let mut jf: Vec<i64> = vec![0i64; jf_total];
-        let jf_ptr = jf.as_mut_ptr();
+        let jf_ptr = unsafe { libc::calloc(1, JitFrame::alloc_size(num_slots)) as *mut JitFrame };
+        assert!(!jf_ptr.is_null(), "execute_token_ints_raw: calloc failed");
+        unsafe { JitFrame::init(jf_ptr, num_slots) };
 
         for (i, &val) in args.iter().enumerate() {
-            unsafe { *jf_ptr.add(1 + i) = val };
+            unsafe { JitFrame::set_int_value(jf_ptr, i, val) };
         }
 
-        let func: unsafe extern "C" fn(*mut i64) -> *mut i64 =
+        let func: unsafe extern "C" fn(*mut JitFrame) -> *mut JitFrame =
             unsafe { std::mem::transmute(entry) };
         let result_jf = unsafe { func(jf_ptr) };
 
-        let jf_descr_raw = unsafe { *result_jf.add(0) };
+        let jf_descr_raw = unsafe { JitFrame::get_latest_descr(result_jf) as i64 };
         let descr = Self::find_descr_by_ptr(token, jf_descr_raw as usize);
 
         // RPython parity: typed_outputs correspond to fail_arg_types.
@@ -551,7 +531,7 @@ impl Backend for DynasmBackend {
         let num_fail_args = descr.fail_arg_types.len();
         let mut outputs = Vec::with_capacity(num_slots);
         for i in 0..num_slots {
-            outputs.push(unsafe { *result_jf.add(1 + i) });
+            outputs.push(unsafe { JitFrame::get_int_value(result_jf, i) });
         }
         let mut typed_outputs = Vec::with_capacity(num_fail_args);
         for i in 0..num_fail_args {
@@ -568,7 +548,7 @@ impl Backend for DynasmBackend {
         }
         let exit_layout = Some(descr.layout());
 
-        drop(jf);
+        unsafe { libc::free(jf_ptr as *mut std::ffi::c_void) };
 
         majit_backend::RawExecResult {
             outputs,
@@ -649,6 +629,46 @@ impl Backend for DynasmBackend {
             if let Some(descr) = compiled.fail_descrs.get(i) {
                 if !descr.is_finish && descr.get_status() == 0 {
                     descr.store_hash(hash);
+                }
+            }
+        }
+    }
+
+    fn get_guard_status(
+        &self,
+        token: &JitCellToken,
+        trace_id: u64,
+        fail_index: u32,
+    ) -> (u64, usize) {
+        let descr = Self::find_descr(token, trace_id, fail_index);
+        (descr.get_status(), Arc::as_ptr(&descr) as usize)
+    }
+
+    fn store_bridge_guard_hashes(
+        &self,
+        token: &JitCellToken,
+        source_trace_id: u64,
+        source_fail_index: u32,
+        hashes: &[u64],
+    ) {
+        let source_descr = Self::find_descr(token, source_trace_id, source_fail_index);
+        let bridge_addr = source_descr.bridge_addr();
+        if bridge_addr == 0 {
+            return;
+        }
+        let blocks = token.asmmemmgr_blocks.lock();
+        for block in blocks.iter() {
+            if let Some(bridge) = block.downcast_ref::<CompiledCode>() {
+                let addr = codebuf::buffer_ptr(&bridge.buffer) as usize;
+                if addr == bridge_addr {
+                    for (i, &hash) in hashes.iter().enumerate() {
+                        if let Some(descr) = bridge.fail_descrs.get(i) {
+                            if !descr.is_finish && descr.get_status() == 0 {
+                                descr.store_hash(hash);
+                            }
+                        }
+                    }
+                    return;
                 }
             }
         }
@@ -763,6 +783,29 @@ impl Backend for DynasmBackend {
         for block in blocks.iter() {
             if let Some(bridge) = block.downcast_ref::<CompiledCode>() {
                 if bridge.trace_id == trace_id {
+                    return Some(bridge.fail_descrs.iter().map(|d| d.layout()).collect());
+                }
+            }
+        }
+        None
+    }
+
+    fn compiled_bridge_fail_descr_layouts(
+        &self,
+        original_token: &JitCellToken,
+        source_trace_id: u64,
+        source_fail_index: u32,
+    ) -> Option<Vec<majit_backend::FailDescrLayout>> {
+        let source_descr = Self::find_descr(original_token, source_trace_id, source_fail_index);
+        let bridge_addr = source_descr.bridge_addr();
+        if bridge_addr == 0 {
+            return None;
+        }
+        let blocks = original_token.asmmemmgr_blocks.lock();
+        for block in blocks.iter() {
+            if let Some(bridge) = block.downcast_ref::<CompiledCode>() {
+                let addr = codebuf::buffer_ptr(&bridge.buffer) as usize;
+                if addr == bridge_addr {
                     return Some(bridge.fail_descrs.iter().map(|d| d.layout()).collect());
                 }
             }

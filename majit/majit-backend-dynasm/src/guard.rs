@@ -21,6 +21,8 @@ pub struct DynasmFailDescr {
     /// regalloc parity: fail_locs — maps fail_args[i] to jitframe slot.
     /// None = virtual/unmapped (not in jitframe).
     pub fail_arg_locs: Vec<Option<usize>>,
+    /// llsupport/assembler.py: rd_locs parity.
+    pub rd_locs: Vec<u16>,
 
     /// Trace op index of the guard that produced this exit.
     pub source_op_index: Option<usize>,
@@ -75,6 +77,7 @@ impl DynasmFailDescr {
             fail_arg_types,
             is_finish,
             fail_arg_locs: Vec::new(),
+            rd_locs: Vec::new(),
             source_op_index: None,
             rd_numb: None,
             rd_consts: None,

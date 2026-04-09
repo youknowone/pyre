@@ -18,6 +18,7 @@ pub mod callbuilder;
 pub mod codebuf;
 pub mod frame;
 pub mod guard;
+pub mod jitframe;
 pub mod jump;
 pub mod regalloc;
 pub mod regloc;
@@ -139,24 +140,30 @@ pub fn register_call_assembler_unbox_int(f: UnboxIntFn) {
 /// Output: rax/x0 = result value (0 if void/unhandled)
 ///
 /// Always frees the callee jitframe before returning.
-pub extern "C" fn call_assembler_helper_trampoline(callee_jf_ptr: *mut i64, green_key: u64) -> i64 {
+pub extern "C" fn call_assembler_helper_trampoline(
+    callee_jf_ptr: *mut jitframe::JitFrame,
+    green_key: u64,
+) -> i64 {
     if callee_jf_ptr.is_null() {
         return 0;
     }
 
     unsafe fn execute_dynasm_bridge(
         bridge_addr: usize,
-        jf_ptr: *mut i64,
-    ) -> (*mut i64, Option<i64>) {
-        let func: unsafe extern "C" fn(*mut i64) -> *mut i64 =
+        jf_ptr: *mut jitframe::JitFrame,
+    ) -> (*mut jitframe::JitFrame, Option<i64>) {
+        let func: unsafe extern "C" fn(*mut jitframe::JitFrame) -> *mut jitframe::JitFrame =
             unsafe { std::mem::transmute(bridge_addr) };
         let result_jf = unsafe { func(jf_ptr) };
         if result_jf.is_null() {
             return (jf_ptr, None);
         }
-        let result_descr = unsafe { *result_jf } as usize;
+        let result_descr = unsafe { jitframe::JitFrame::get_latest_descr(result_jf) };
         if guard::is_done_with_this_frame_descr(result_descr) {
-            return (result_jf, Some(unsafe { *result_jf.add(1) }));
+            return (
+                result_jf,
+                Some(unsafe { jitframe::JitFrame::get_int_value(result_jf, 0) }),
+            );
         }
         (result_jf, None)
     }
@@ -165,7 +172,7 @@ pub extern "C" fn call_assembler_helper_trampoline(callee_jf_ptr: *mut i64, gree
     let mut result = 0i64;
 
     // Read jf_descr — raw pointer to DynasmFailDescr
-    let mut descr_raw = unsafe { *current_jf_ptr } as usize;
+    let mut descr_raw = unsafe { jitframe::JitFrame::get_latest_descr(current_jf_ptr) };
 
     if descr_raw != 0 && !guard::is_done_with_this_frame_descr(descr_raw) {
         let descr = unsafe { &*(descr_raw as *const guard::DynasmFailDescr) };
@@ -179,7 +186,7 @@ pub extern "C" fn call_assembler_helper_trampoline(callee_jf_ptr: *mut i64, gree
                 unsafe { libc::free(current_jf_ptr as *mut std::ffi::c_void) };
                 return value;
             }
-            descr_raw = unsafe { *current_jf_ptr } as usize;
+            descr_raw = unsafe { jitframe::JitFrame::get_latest_descr(current_jf_ptr) };
         }
 
         if descr_raw != 0 && !guard::is_done_with_this_frame_descr(descr_raw) {
@@ -193,7 +200,7 @@ pub extern "C" fn call_assembler_helper_trampoline(callee_jf_ptr: *mut i64, gree
             let mut raw_values: Vec<i64> = Vec::with_capacity(n_fail_args);
             for i in 0..n_fail_args {
                 let slot = descr.fail_arg_locs.get(i).and_then(|l| *l).unwrap_or(i);
-                raw_values.push(unsafe { *current_jf_ptr.add(1 + slot) });
+                raw_values.push(unsafe { jitframe::JitFrame::get_int_value(current_jf_ptr, slot) });
             }
 
             // compile.py:701-717 handle_fail — try bridge tracing first.
@@ -218,7 +225,7 @@ pub extern "C" fn call_assembler_helper_trampoline(callee_jf_ptr: *mut i64, gree
                     unsafe { libc::free(current_jf_ptr as *mut std::ffi::c_void) };
                     return value;
                 }
-                descr_raw = unsafe { *current_jf_ptr } as usize;
+                descr_raw = unsafe { jitframe::JitFrame::get_latest_descr(current_jf_ptr) };
             }
 
             // Bridge-on-bridge case: use the latest returned descr for
@@ -235,7 +242,8 @@ pub extern "C" fn call_assembler_helper_trampoline(callee_jf_ptr: *mut i64, gree
                         .get(i)
                         .and_then(|l| *l)
                         .unwrap_or(i);
-                    latest_raw_values.push(unsafe { *current_jf_ptr.add(1 + slot) });
+                    latest_raw_values
+                        .push(unsafe { jitframe::JitFrame::get_int_value(current_jf_ptr, slot) });
                 }
 
                 // resume.py:1312 blackhole_from_resumedata parity.
@@ -251,7 +259,7 @@ pub extern "C" fn call_assembler_helper_trampoline(callee_jf_ptr: *mut i64, gree
                     )
                     .unwrap_or(0);
                 } else if let Some(force_fn) = CA_FORCE_FN.get() {
-                    let frame_ptr = unsafe { *current_jf_ptr.add(1) };
+                    let frame_ptr = unsafe { jitframe::JitFrame::get_int_value(current_jf_ptr, 0) };
                     result = force_fn(frame_ptr);
                 }
             }
