@@ -9839,7 +9839,7 @@ fn collect_guards(
             let fvc_ref: Option<&dyn Fn(i32, i32) -> usize> =
                 fvc.as_ref().map(|f| f as &dyn Fn(i32, i32) -> usize);
             let (_num_failargs, _vable_values, _vref_values, frames) =
-                rebuild_from_numbering(rd_numb_bytes, rd_consts_data, fvc_ref);
+                rebuild_from_numbering(rd_numb_bytes, rd_consts_data, &fail_arg_types, fvc_ref);
 
             // Rebuild frame slots from rd_numb values.
             // Track Virtual(vidx) → slot_idx for target_slot in virtual_layouts.
@@ -9849,7 +9849,7 @@ fn collect_guards(
             for frame in &frames {
                 for val in &frame.values {
                     new_slots.push(match val {
-                        RebuiltValue::Box(idx) => ExitValueSourceLayout::ExitValue(*idx),
+                        RebuiltValue::Box(idx, _) => ExitValueSourceLayout::ExitValue(*idx),
                         RebuiltValue::Virtual(vidx) => {
                             vidx_to_slot.insert(*vidx, new_slots.len());
                             ExitValueSourceLayout::Virtual(*vidx)
