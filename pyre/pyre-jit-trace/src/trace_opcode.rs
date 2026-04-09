@@ -4036,6 +4036,16 @@ pub(crate) fn trace_step_result_to_action(
                     }
                 }
             };
+            // pyjitpl.py:3199-3236 compile_done_with_this_frame ->
+            // store_token_in_vable parity: record the vable_token write
+            // and GUARD_NOT_FORCED_2 right before the trace closes, so
+            // the guard captures fresh resumedata via generate_guard at
+            // the current framestack position.
+            state.with_ctx(|this, ctx| {
+                if ctx.store_token_in_vable_setfield() {
+                    this.generate_guard(ctx, OpCode::GuardNotForced2, &[]);
+                }
+            });
             TraceAction::Finish {
                 finish_args: vec![finish_value],
                 finish_arg_types: vec![finish_type],
@@ -4047,6 +4057,13 @@ pub(crate) fn trace_step_result_to_action(
                 Type::Float => Type::Float,
                 Type::Ref | Type::Void => Type::Ref,
             };
+            // pyjitpl.py:3199 compile_done_with_this_frame parity for
+            // generator yield exits — same as the return path above.
+            state.with_ctx(|this, ctx| {
+                if ctx.store_token_in_vable_setfield() {
+                    this.generate_guard(ctx, OpCode::GuardNotForced2, &[]);
+                }
+            });
             TraceAction::Finish {
                 finish_args: vec![fop.opref],
                 finish_arg_types: vec![finish_type],

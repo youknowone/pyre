@@ -983,36 +983,27 @@ impl TraceCtx {
     ///                          None, descr=vinfo.vable_token_descr)
     ///     self.generate_guard(rop.GUARD_NOT_FORCED_2)
     /// ```
-    pub fn store_token_in_vable(&mut self) {
+    pub fn store_token_in_vable_setfield(&mut self) -> bool {
         let info = match self.virtualizable_info.clone() {
             Some(info) => info,
-            None => return,
+            None => return false,
         };
         let vbox = match self.standard_virtualizable_box() {
             Some(b) => b,
-            None => return,
+            None => return false,
         };
         if self.forced_virtualizable == Some(vbox) {
-            return;
+            return false;
         }
         let force_token = self.recorder.record_op(OpCode::ForceToken, &[]);
         let token_descr = info.token_field_descr();
         self.vable_setfield_descr(vbox, force_token, token_descr);
         // pyjitpl.py:3236 self.generate_guard(rop.GUARD_NOT_FORCED_2)
-        self.record_guard(OpCode::GuardNotForced2, &[], 0);
-        // pyjitpl.py:2558-2602 generate_guard / capture_resumedata parity:
-        // RPython's generate_guard always captures resumedata at the
-        // current framestack pc. `gen_store_back_in_vable` doesn't change
-        // the framestack between the previous guard and this one, so the
-        // most recently captured snapshot (from the trailing guard, e.g.
-        // GuardNoOverflow on the IntAddOvf result) describes the same
-        // active boxes that this GUARD_NOT_FORCED_2 needs for recovery.
-        // Inherit it so `store_final_boxes_in_guard` can finalize this
-        // guard's resume data without falling back to the panic branch.
-        let snapshot_id = self.recorder.snapshots().len() as i32 - 1;
-        if snapshot_id >= 0 {
-            self.recorder.set_last_op_resume_position(snapshot_id);
-        }
+        // is recorded by the caller via the proper guard generation
+        // path (`MIFrame::generate_guard` in the pyre frontend) so the
+        // guard captures fresh resumedata at the current framestack
+        // position, matching RPython's gen_store_back_in_vable.
+        true
     }
 
     /// pyjitpl.py:3465-3497 `MetaInterp.gen_store_back_in_vable(box)`.
