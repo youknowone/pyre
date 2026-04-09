@@ -2698,16 +2698,13 @@ impl OptUnroll {
     /// `exported_state.short_boxes` calling `produce_op`.  In majit the
     /// equivalent is `import_short_preamble_ops` (a serialized form of
     /// the per-PreambleOp `produce_op` body) plus
-    /// `initialize_imported_short_preamble_builder` (a serialized form
-    /// of the `ShortPreambleBuilder` constructor).  Both consume the
-    /// same `short_args = label_args + virtuals` slot space that
-    /// `export_state` used to build `ExportedShortOp` (see
+    /// `initialize_imported_short_preamble_builder_from_exported_ops`
+    /// (a serialized form of the `ShortPreambleBuilder` constructor).
+    /// Both consume the same `short_args = label_args + virtuals` slot
+    /// space that `export_state` used to build `ExportedShortOp` (see
     /// `collect_exported_short_ops`); the slot indices are the
-    /// majit-only stand-in for RPython's Box-keyed
-    /// `produced_short_boxes` dict.  The dual `_from_exported_ops`
-    /// initializer is the preferred path; it falls back to
-    /// `initialize_imported_short_preamble_builder` for short ops that
-    /// the serialized form does not yet handle (Calls).
+    /// majit-only stand-in for RPython's Box-keyed `produced_short_boxes`
+    /// dict.
     pub fn import_state(
         &self,
         targetargs: &[OpRef],
@@ -2750,16 +2747,12 @@ impl OptUnroll {
         //     exported_state.short_inputargs, exported_state.exported_infos,
         //     self.optimizer)
         //
-        // majit's `ShortPreambleBuilder` constructor is split into
-        // `initialize_imported_short_preamble_builder*`. The majit
-        // serialization keys short ops by slot index over the combined
-        // `label_args + virtuals` slot space (the same space
-        // `collect_exported_short_ops` built against), so we compute the
-        // virtuals tail inline before calling the initializer. The dual
-        // initializer paths (`_from_exported_ops` preferred, legacy
-        // fallback for short ops the serialization doesn't yet handle)
-        // are an outstanding RPython divergence pending Call support in
-        // `ExportedShortOp`.
+        // majit's `ShortPreambleBuilder` constructor is the
+        // `initialize_imported_short_preamble_builder_from_exported_ops`
+        // call below. The majit serialization keys short ops by slot index
+        // over the combined `label_args + virtuals` slot space (the same
+        // space `collect_exported_short_ops` built against), so we compute
+        // the virtuals tail inline before calling the initializer.
         let virtuals: Vec<OpRef> = exported_state
             .virtual_state
             .state
@@ -2773,18 +2766,24 @@ impl OptUnroll {
         // for produced_op in exported_state.short_boxes:
         //     produced_op.produce_op(self, exported_state.exported_infos)
         self.import_short_preamble_ops(&short_args, exported_state, ctx);
+        // unroll.py:486-489 ShortPreambleBuilder constructor parity:
+        // initialize from the serialized ExportedShortOp form. Now that
+        // collect_exported_short_ops + from_exported_ops jointly cover
+        // every PreambleOpKind that the import-time consumers can replay
+        // (Pure including Calls, HeapField, HeapArrayItem, LoopInvariant),
+        // there is no fallback.
         let from_exported = ctx.initialize_imported_short_preamble_builder_from_exported_ops(
             &short_args,
             &exported_state.short_inputargs,
             &exported_state.exported_short_ops,
         );
-        if !from_exported {
-            ctx.initialize_imported_short_preamble_builder(
-                &label_args,
-                &exported_state.short_inputargs,
-                &exported_state.exported_short_boxes,
-            );
-        }
+        debug_assert!(
+            from_exported,
+            "initialize_imported_short_preamble_builder_from_exported_ops returned false: \
+             the serialized short-preamble import path failed to handle some entry. \
+             This was previously masked by the legacy initialize_imported_short_preamble_builder \
+             fallback path, which is now removed for RPython parity."
+        );
         // return label_args
         label_args
     }

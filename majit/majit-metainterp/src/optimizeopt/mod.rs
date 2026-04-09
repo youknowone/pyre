@@ -1061,6 +1061,30 @@ impl OptContext {
             }
         };
 
+        // shortpreamble.py:PreambleOp.add_op_to_short — Pure ops whose
+        // opcode is a Call get rewritten to the CallPure* equivalent so the
+        // short preamble can replay the cached call without re-executing
+        // arbitrary side effects.
+        let pure_call_opcode = |op: OpCode| -> OpCode {
+            match op {
+                OpCode::CallI => OpCode::CallPureI,
+                OpCode::CallR => OpCode::CallPureR,
+                OpCode::CallF => OpCode::CallPureF,
+                OpCode::CallN => OpCode::CallPureN,
+                other => other,
+            }
+        };
+        // shortpreamble.py:PreambleOp.add_op_to_short — LoopInvariant ops
+        // become CallLoopinvariant* so the short preamble re-executes the
+        // call exactly once per loop iteration.
+        let loop_invariant_opcode = |result_type: majit_ir::Type| -> OpCode {
+            match result_type {
+                majit_ir::Type::Int => OpCode::CallLoopinvariantI,
+                majit_ir::Type::Ref => OpCode::CallLoopinvariantR,
+                majit_ir::Type::Float => OpCode::CallLoopinvariantF,
+                majit_ir::Type::Void => OpCode::CallLoopinvariantN,
+            }
+        };
         for entry in exported_short_ops {
             match entry {
                 ExportedShortOp::Pure {
@@ -1072,9 +1096,6 @@ impl OptContext {
                     invented_name,
                     same_as_source,
                 } => {
-                    if opcode.is_call() {
-                        return false;
-                    }
                     let Some(result_opref) = imported_result_for_source(*source, self)
                         .or_else(|| resolve_result(result, self))
                     else {
@@ -1102,7 +1123,7 @@ impl OptContext {
                         };
                         resolved_args.push(resolved);
                     }
-                    let mut op = Op::new(*opcode, &resolved_args);
+                    let mut op = Op::new(pure_call_opcode(*opcode), &resolved_args);
                     op.pos = result_opref;
                     op.descr = descr.clone();
                     let produced_op = ProducedShortOp {
@@ -1167,7 +1188,94 @@ impl OptContext {
                     }
                     produced_results.push(result_opref);
                 }
-                _ => return false,
+                ExportedShortOp::HeapArrayItem {
+                    source,
+                    object,
+                    descr,
+                    index,
+                    result_type,
+                    result,
+                    invented_name,
+                    same_as_source,
+                } => {
+                    let Some(result_opref) = imported_result_for_source(*source, self)
+                        .or_else(|| resolve_result(result, self))
+                    else {
+                        return false;
+                    };
+                    let obj = match object {
+                        ExportedShortArg::Slot(slot) => short_args.get(*slot).copied(),
+                        ExportedShortArg::Const { source, .. } => Some(*source),
+                        ExportedShortArg::Produced(_) => None,
+                    };
+                    let Some(obj) = obj else {
+                        return false;
+                    };
+                    let opcode = match result_type {
+                        majit_ir::Type::Int => OpCode::GetarrayitemGcI,
+                        majit_ir::Type::Ref => OpCode::GetarrayitemGcR,
+                        majit_ir::Type::Float => OpCode::GetarrayitemGcF,
+                        majit_ir::Type::Void => return false,
+                    };
+                    let index_opref = {
+                        let opref = self.alloc_op_position();
+                        self.make_constant(opref, majit_ir::Value::Int(*index));
+                        opref
+                    };
+                    let mut op = Op::new(opcode, &[obj, index_opref]);
+                    op.pos = result_opref;
+                    op.descr = Some(descr.clone());
+                    let produced_op = ProducedShortOp {
+                        kind: PreambleOpKind::Heap,
+                        preamble_op: op,
+                        invented_name: *invented_name,
+                        same_as_source: *same_as_source,
+                    };
+                    produced.push((*source, produced_op.clone()));
+                    if *source != result_opref {
+                        produced.push((result_opref, produced_op));
+                    }
+                    produced_results.push(result_opref);
+                }
+                ExportedShortOp::LoopInvariant {
+                    source,
+                    func_ptr,
+                    result_type,
+                    result,
+                    invented_name,
+                    same_as_source,
+                } => {
+                    let Some(result_opref) = imported_result_for_source(*source, self)
+                        .or_else(|| resolve_result(result, self))
+                    else {
+                        return false;
+                    };
+                    // shortpreamble.py LoopInvariantOp replays the call with
+                    // its original func_ptr argument. The serialization only
+                    // carries the func ptr — the call had no other args
+                    // (collect_exported_short_ops only emits LoopInvariant
+                    // for zero-arg calls today). Synthesize the func_ptr
+                    // constant from the serialized value.
+                    let func_opref = {
+                        let opref = self.alloc_op_position();
+                        self.make_constant(opref, majit_ir::Value::Int(*func_ptr));
+                        opref
+                    };
+                    let opcode = loop_invariant_opcode(*result_type);
+                    let mut op = Op::new(opcode, &[func_opref]);
+                    op.pos = result_opref;
+                    let produced_op = ProducedShortOp {
+                        kind: PreambleOpKind::LoopInvariant,
+                        preamble_op: op,
+                        invented_name: *invented_name,
+                        same_as_source: *same_as_source,
+                    };
+                    produced.push((*source, produced_op.clone()));
+                    if *source != result_opref {
+                        produced.push((result_opref, produced_op));
+                    }
+                    produced_results.push(result_opref);
+                }
             }
         }
 
