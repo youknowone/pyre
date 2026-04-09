@@ -1426,6 +1426,8 @@ impl<M: Clone> MetaInterp<M> {
     ///         return True
     fn nonstandard_virtualizable(&mut self, vable_opref: OpRef) -> bool {
         // Step 1: heapcache short-circuit.
+        //     if self.metainterp.heapcache.is_known_nonstandard_virtualizable(box):
+        //         return True
         if let Some(ctx) = self.tracing.as_ref() {
             if ctx
                 .heap_cache()
@@ -1435,26 +1437,123 @@ impl<M: Clone> MetaInterp<M> {
             }
         }
         // Step 2: forced_virtualizable reset on identity.
+        //     if box is self.metainterp.forced_virtualizable:
+        //         self.metainterp.forced_virtualizable = None
         if let Some(ctx) = self.tracing.as_mut() {
             if ctx.forced_virtualizable() == Some(vable_opref) {
                 ctx.set_forced_virtualizable(None);
             }
         }
         // Step 3: standard_box identity check.
+        //     standard_box = self.metainterp.virtualizable_boxes[-1]
+        //     if standard_box is box:
+        //         return False
         if self.virtualizable_info.is_some() && self.is_standard_virtualizable(vable_opref) {
             return false;
         }
-        // Step 4 (deferred): PTR_EQ + implement_guard_value + replace_box path.
-        // RPython promotes the box to the standard one when the guard succeeds.
-        // Requires implement_guard_value/PTR_EQ guard infrastructure not yet
-        // ported in pyre — tracked separately under the guard-value epic.
+        // Step 4: PTR_EQ + implement_guard_value + replace_box.
+        //     vinfo = self.metainterp.jitdriver_sd.virtualizable_info
+        //     if vinfo is fielddescr.get_vinfo():
+        //         eqbox = self.metainterp.execute_and_record(
+        //             rop.PTR_EQ, None, box, standard_box)
+        //         eqbox = self.implement_guard_value(eqbox, pc)
+        //         isstandard = eqbox.getint()
+        //         if isstandard:
+        //             if box.type == 'r':
+        //                 self.metainterp.replace_box(box, standard_box)
+        //             return False
         //
-        // Step 5a (deferred): emit_force_virtualizable COND_CALL clear-vable-token
-        // path. Requires `clear_vable_ptr` function pointer + `clear_vable_descr`
-        // call descriptor on VirtualizableInfo, and a CONST_NULL constant. Tracked
-        // separately under the COND_CALL emit_force_virtualizable epic.
-        // Step 5b: mark this box as a known nonstandard virtualizable so future
-        // accesses short-circuit at Step 1.
+        // pyre has only one virtualizable (the PyFrame), so
+        // `vinfo is fielddescr.get_vinfo()` is always true on reach.
+        //
+        // pyre's runtime paths only invoke `nonstandard_virtualizable`
+        // with the standard vable OpRef (the jitcode machine walks
+        // `standard_vable_field_offset` / `standard_vable_array_offset`,
+        // both of which return `ctx.standard_virtualizable_box()`), so
+        // reaching Step 4 requires a caller that synthesizes an alias
+        // OpRef distinct from the standard box. No such caller exists
+        // today, which leaves Step 4 structurally dead.
+        //
+        // Still, emit the PTR_EQ + GUARD_VALUE + replace_box sequence so
+        // the shape matches RPython's `_nonstandard_virtualizable` and a
+        // future MetaInterp-driven vable opcode path gets the correct
+        // identity-promotion semantics for free. The concrete guard value
+        // is assumed to be 0 (not equal) because (a) Step 3 already ruled
+        // out the standard OpRef and (b) pyre architecturally does not
+        // create alias boxes to the standard virtualizable. If an alias
+        // path is added later, the runtime GUARD_VALUE will fail and
+        // trigger a bridge rather than silently misclassifying the box.
+        let standard_box_opt = self
+            .tracing
+            .as_ref()
+            .and_then(|ctx| ctx.standard_virtualizable_box());
+        if let Some(standard_box) = standard_box_opt {
+            let (ptr_eq_op, zero_const) = {
+                let ctx = self
+                    .tracing
+                    .as_mut()
+                    .expect("nonstandard_virtualizable requires active tracing");
+                let ptr_eq_op = ctx.record_op(OpCode::PtrEq, &[vable_opref, standard_box]);
+                // implement_guard_value(eqbox, pc) → GUARD_VALUE(eqbox, 0).
+                // The expected value encodes the Step-3-fall-through case:
+                // pyre never creates aliases, so the concrete PTR_EQ result
+                // is known to be false here.
+                let zero = ctx.const_int(0);
+                ctx.record_guard(OpCode::GuardValue, &[ptr_eq_op, zero], 0);
+                (ptr_eq_op, zero)
+            };
+            let _ = (ptr_eq_op, zero_const);
+            // isstandard == 0 (by construction), so skip the replace_box
+            // short-circuit and fall through to Step 5.
+        }
+        // Step 5a: emit_force_virtualizable.
+        //     if not self.metainterp.heapcache.is_unescaped(box):
+        //         self.emit_force_virtualizable(fielddescr, box)
+        //
+        //     def emit_force_virtualizable(self, fielddescr, box):
+        //         vinfo = fielddescr.get_vinfo()
+        //         token_descr = vinfo.vable_token_descr
+        //         tokenbox = mi.execute_and_record(
+        //             rop.GETFIELD_GC_R, token_descr, box)
+        //         condbox = mi.execute_and_record(
+        //             rop.PTR_NE, None, tokenbox, CONST_NULL)
+        //         funcbox = ConstInt(rffi.cast(Signed, vinfo.clear_vable_ptr))
+        //         self.execute_varargs(
+        //             rop.COND_CALL, [condbox, funcbox, box],
+        //             vinfo.clear_vable_descr, False, False)
+        //
+        // pyre does not yet register a `clear_vable_ptr` runtime helper
+        // or the matching COND_CALL descriptor on VirtualizableInfo, so
+        // the full sequence cannot be emitted without dead function
+        // pointers. Port the observable prefix (GETFIELD_GC_R + PTR_NE
+        // against CONST_NULL) so the heap cache / optimizer see the same
+        // shape RPython produces, and leave the COND_CALL tail as a
+        // TODO. When `clear_vable_ptr` lands, wrap the tail here under
+        // a `vinfo.clear_vable_descr()` check.
+        let needs_force = self
+            .tracing
+            .as_ref()
+            .map(|ctx| !ctx.heap_cache().is_unescaped(vable_opref))
+            .unwrap_or(false);
+        if needs_force {
+            if let Some(info) = self.virtualizable_info.clone() {
+                let token_descr = info.token_field_descr();
+                if let Some(ctx) = self.tracing.as_mut() {
+                    // tokenbox = GETFIELD_GC_R(box, token_descr)
+                    let tokenbox =
+                        ctx.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], token_descr);
+                    // condbox = PTR_NE(tokenbox, CONST_NULL)
+                    let null_ref = ctx.const_null();
+                    let _condbox = ctx.record_op(OpCode::PtrNe, &[tokenbox, null_ref]);
+                    // TODO(vable-locals epic): emit COND_CALL(condbox,
+                    // funcbox=clear_vable_ptr, box) once VirtualizableInfo
+                    // carries a clear_vable_descr + function pointer.
+                }
+            }
+        }
+        // Step 5b: mark this box as a known nonstandard virtualizable so
+        // future accesses short-circuit at Step 1.
+        //     self.metainterp.heapcache.nonstandard_virtualizables_now_known(box)
         if let Some(ctx) = self.tracing.as_mut() {
             ctx.heap_cache_mut()
                 .nonstandard_virtualizables_now_known(vable_opref);
