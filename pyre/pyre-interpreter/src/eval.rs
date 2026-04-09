@@ -714,10 +714,10 @@ impl OpcodeStepExecutor for PyFrame {
                 crate::typedef::gettypeobject(&pyre_object::pyobject::TUPLE_TYPE)
             }
             CommonConstant::BuiltinAll => {
-                crate::make_builtin_function("all", crate::builtins::builtin_all_fn)
+                crate::make_module_builtin_function("all", crate::builtins::builtin_all_fn)
             }
             CommonConstant::BuiltinAny => {
-                crate::make_builtin_function("any", crate::builtins::builtin_any_fn)
+                crate::make_module_builtin_function("any", crate::builtins::builtin_any_fn)
             }
             CommonConstant::BuiltinList => {
                 crate::typedef::gettypeobject(&pyre_object::pyobject::LIST_TYPE)
@@ -1471,18 +1471,22 @@ impl OpcodeStepExecutor for PyFrame {
                     Some(d) if pyre_object::is_type(d) => PY_NULL,
                     Some(d) if pyre_object::is_property(d) => PY_NULL,
                     Some(d) if pyre_object::is_member(d) => PY_NULL,
-                    Some(d)
-                        if crate::is_function(d)
+                    Some(d) if crate::is_function(d) => {
+                        let ob_type = (*d).ob_type;
+                        if std::ptr::eq(ob_type, &crate::BUILTIN_FUNCTION_TYPE as *const _) {
+                            // BuiltinFunction has no __get__ in PyPy.
+                            PY_NULL
+                        } else if std::ptr::eq(ob_type, &crate::FUNCTION_TYPE as *const _)
                             && crate::is_builtin_code(
                                 crate::function_get_code(d) as pyre_object::PyObjectRef
-                            ) =>
-                    {
-                        // FunctionWithFixedCode (interp2app) on a builtin
-                        // type — `dict.get` etc. — needs self bound.  Pure
-                        // user-class-level builtin function attributes are
-                        // already a non-issue because they go through
-                        // call_callable on the same dispatch path.
-                        obj
+                            )
+                        {
+                            // FunctionWithFixedCode (interp2app) on a builtin
+                            // type — `dict.get` etc. — binds like a method.
+                            obj
+                        } else {
+                            obj
+                        }
                     }
                     Some(_) => obj, // found in type MRO → bind self (method)
                     None => {

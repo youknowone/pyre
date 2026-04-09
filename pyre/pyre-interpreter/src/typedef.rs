@@ -287,6 +287,20 @@ pub fn init_typeobjects() {
         function_type as usize,
     );
 
+    // builtin_function — PyPy: typedef.py BuiltinFunction.typedef
+    // Mirrors Function.typedef except `__get__` is intentionally absent.
+    let builtin_function_type =
+        new_typeobject_with_base("builtin_function", init_builtin_function_type, object_type);
+    unsafe { pyre_object::w_type_set_acceptable_as_base_class(builtin_function_type, false) };
+    unsafe {
+        pyre_object::w_type_set_hasdict(builtin_function_type, true);
+        pyre_object::w_type_set_weakrefable(builtin_function_type, true);
+    }
+    reg.insert(
+        &crate::BUILTIN_FUNCTION_TYPE as *const PyType as usize,
+        builtin_function_type as usize,
+    );
+
     // builtin-code — PyPy: BuiltinCode.typedef = TypeDef('builtin-code', ...)
     reg.insert(
         &crate::BUILTIN_CODE_TYPE as *const PyType as usize,
@@ -684,6 +698,8 @@ fn dict_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 descr_new_wrapper!(bool_descr_new, crate::builtins::builtin_bool);
 descr_new_wrapper!(list_descr_new, crate::builtins::builtin_list_ctor);
 descr_new_wrapper!(tuple_descr_new, crate::builtins::builtin_tuple);
+descr_new_wrapper!(set_descr_new, crate::builtins::builtin_set_ctor);
+descr_new_wrapper!(frozenset_descr_new, crate::builtins::builtin_frozenset_ctor);
 // dict_new handled by dict_descr_new above (supports dict subclasses)
 
 // ── List TypeDef ─────────────────────────────────────────────────────
@@ -1772,7 +1788,25 @@ fn init_type_type(ns: &mut PyNamespace) {
 
 /// function/builtin_function_or_method — PyPy: function.py Function typedef
 /// descr_function_get (function.py:462): always returns a Method.
+/// PyPy: shared `Function.typedef.rawdict` entries that BuiltinFunction.typedef
+/// inherits via `TypeDef("builtin_function", **Function.typedef.rawdict)`.
+///
+/// Slots that exist on `Function.typedef` *and* on `BuiltinFunction.typedef`
+/// belong here so the two initializers stay structurally aligned with PyPy's
+/// `**rawdict` pattern. Function-only slots (currently just `__get__`) and
+/// BuiltinFunction-only overrides (`__new__`, `__self__`, `__repr__`,
+/// `__doc__`) live in their respective wrappers.
+fn init_function_type_common(_ns: &mut PyNamespace) {
+    // Pyre does not yet model the rest of Function.typedef
+    // (`__call__`, `__name__`, `__qualname__`, `__doc__`, `__module__`,
+    // `__globals__`, `__closure__`, `__defaults__`, `__kwdefaults__`,
+    // `__code__`, `__dict__`, `__class__`, ...).
+    // They will be installed here when ported, so they automatically
+    // propagate to BuiltinFunction.typedef.
+}
+
 fn init_function_type(ns: &mut PyNamespace) {
+    init_function_type_common(ns);
     namespace_store(
         ns,
         "__get__",
@@ -1806,6 +1840,28 @@ fn init_function_type(ns: &mut PyNamespace) {
             }
         }),
     );
+}
+
+/// PyPy typedef.py:813-820:
+///
+///     BuiltinFunction.typedef = TypeDef("builtin_function",
+///                                       **Function.typedef.rawdict)
+///     BuiltinFunction.typedef.rawdict.update({
+///         '__new__': interp2app(BuiltinFunction.descr_builtinfunction__new__.im_func),
+///         '__self__': GetSetProperty(always_none, cls=BuiltinFunction),
+///         '__repr__': interp2app(BuiltinFunction.descr_function_repr),
+///         '__doc__': getset_func_doc,
+///     })
+///     del BuiltinFunction.typedef.rawdict['__get__']
+///
+/// `init_function_type_common` provides the shared `**rawdict` slots; the
+/// missing `namespace_store(ns, "__get__", ...)` call after it expresses the
+/// `del rawdict['__get__']` step. The `update({...})` overrides go below as
+/// pyre starts modeling them.
+fn init_builtin_function_type(ns: &mut PyNamespace) {
+    init_function_type_common(ns);
+    // BuiltinFunction-specific overrides (__new__, __self__, __repr__,
+    // __doc__) belong here when pyre models them.
 }
 
 /// BuiltinCode.typedef (typedef.py) — code object attributes for builtins.
@@ -2865,6 +2921,7 @@ fn set_method_ge(
 }
 
 fn init_set_type(ns: &mut PyNamespace) {
+    namespace_store(ns, "__new__", make_new_descr(set_descr_new));
     init_setlike_common(ns);
     namespace_store(
         ns,
@@ -2956,6 +3013,7 @@ fn init_set_type(ns: &mut PyNamespace) {
 }
 
 fn init_frozenset_type(ns: &mut PyNamespace) {
+    namespace_store(ns, "__new__", make_new_descr(frozenset_descr_new));
     init_setlike_common(ns);
 }
 

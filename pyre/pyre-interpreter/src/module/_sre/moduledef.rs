@@ -2,7 +2,7 @@
 //!
 //! Uses sre-engine crate (RustPython's SRE bytecode interpreter).
 
-use crate::{PyNamespace, make_builtin_function, namespace_store};
+use crate::{PyNamespace, make_builtin_function, make_module_builtin_function, namespace_store};
 use pyre_object::*;
 use sre_engine::engine::{Request, State, StrDrive};
 use std::cell::RefCell;
@@ -19,11 +19,17 @@ pub fn init(ns: &mut PyNamespace) {
     namespace_store(ns, "CODESIZE", w_int_new(sre_engine::CODESIZE as i64));
     namespace_store(ns, "MAXREPEAT", w_int_new(sre_engine::MAXREPEAT as i64));
     namespace_store(ns, "MAXGROUPS", w_int_new(sre_engine::MAXGROUPS as i64));
-    namespace_store(ns, "compile", make_builtin_function("compile", sre_compile));
+    // _sre module-level functions: PyPy mixedmodule.py:111-116 wraps these
+    // as BuiltinFunction so storing them on a user class does not bind self.
+    namespace_store(
+        ns,
+        "compile",
+        make_module_builtin_function("compile", sre_compile),
+    );
     namespace_store(
         ns,
         "ascii_iscased",
-        make_builtin_function("ascii_iscased", |args| {
+        make_module_builtin_function("ascii_iscased", |args| {
             if args.is_empty() {
                 return Ok(w_bool_from(false));
             }
@@ -34,7 +40,7 @@ pub fn init(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "unicode_iscased",
-        make_builtin_function("unicode_iscased", |args| {
+        make_module_builtin_function("unicode_iscased", |args| {
             if args.is_empty() {
                 return Ok(w_bool_from(false));
             }
@@ -45,7 +51,7 @@ pub fn init(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "ascii_tolower",
-        make_builtin_function("ascii_tolower", |args| {
+        make_module_builtin_function("ascii_tolower", |args| {
             if args.is_empty() {
                 return Ok(w_int_new(0));
             }
@@ -57,7 +63,7 @@ pub fn init(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "unicode_tolower",
-        make_builtin_function("unicode_tolower", |args| {
+        make_module_builtin_function("unicode_tolower", |args| {
             if args.is_empty() {
                 return Ok(w_int_new(0));
             }
@@ -68,14 +74,14 @@ pub fn init(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "getcodesize",
-        make_builtin_function("getcodesize", |_| {
+        make_module_builtin_function("getcodesize", |_| {
             Ok(w_int_new(sre_engine::CODESIZE as i64))
         }),
     );
     namespace_store(
         ns,
         "getlower",
-        make_builtin_function("getlower", |args| {
+        make_module_builtin_function("getlower", |args| {
             if args.is_empty() {
                 return Ok(w_int_new(0));
             }

@@ -46,7 +46,7 @@ pub use frame_array::*;
 pub use function::*;
 pub use gateway::{
     BUILTIN_CODE_TYPE, BuiltinCode, BuiltinCodeFn, builtin_code_get, builtin_code_name,
-    builtin_code_new, is_builtin_code, make_builtin_function,
+    builtin_code_new, is_builtin_code, make_builtin_function, make_module_builtin_function,
 };
 pub use malachite_bigint::BigInt as PyBigInt;
 pub use opcode_ops::*;
@@ -78,6 +78,10 @@ pub fn all_foreign_pytypes() -> &'static [(
     )] = &[
         (&crate::pycode::CODE_TYPE, &pyre_object::INSTANCE_TYPE),
         (&crate::function::FUNCTION_TYPE, &pyre_object::INSTANCE_TYPE),
+        (
+            &crate::function::BUILTIN_FUNCTION_TYPE,
+            &pyre_object::INSTANCE_TYPE,
+        ),
         (
             &crate::gateway::BUILTIN_CODE_TYPE,
             &pyre_object::INSTANCE_TYPE,

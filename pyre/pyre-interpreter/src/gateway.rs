@@ -305,3 +305,12 @@ pub fn make_builtin_function(name: &'static str, func: BuiltinCodeFn) -> PyObjec
     let code = builtin_code_new(name, func);
     crate::function_new_with_fixed_code(code as *const (), name.to_string(), std::ptr::null_mut())
 }
+
+/// mixedmodule.py:116 parity — wrap a BuiltinCodeFn as BuiltinFunction.
+///
+/// Module-level builtins are not descriptors: storing them on a user class
+/// must not synthesize a bound method.
+pub fn make_module_builtin_function(name: &'static str, func: BuiltinCodeFn) -> PyObjectRef {
+    let code = builtin_code_new(name, func);
+    crate::function_new_builtin(code as *const (), name.to_string(), std::ptr::null_mut())
+}
