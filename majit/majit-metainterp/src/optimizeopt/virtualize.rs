@@ -2143,6 +2143,52 @@ mod tests {
         fn field_type(&self) -> majit_ir::Type {
             majit_ir::Type::Int
         }
+        /// virtualize.rs::descr_index routes GetfieldGc lookups through
+        /// `index_in_parent()` when a parent is attached. The test
+        /// fixtures use the raw `idx` as the virtual's field key (e.g.
+        /// `VREF_FORCED_FIELD_INDEX`), so this override keeps the
+        /// recorder / lookup keys in lockstep.
+        fn index_in_parent(&self) -> usize {
+            self.idx as usize
+        }
+    }
+
+    /// Ref-typed counterpart to `TestFieldDescr`. Identical semantics
+    /// except `field_type() == Type::Ref`; used by test fixtures that
+    /// need a Ref-valued field (e.g. a `next` pointer in a linked
+    /// node). Both implementations override `get_parent_descr` to
+    /// return a fresh SizeDescr each call so the test doesn't need to
+    /// keep a Weak parent alive.
+    #[derive(Debug)]
+    struct TestRefFieldDescr {
+        idx: u32,
+    }
+
+    impl Descr for TestRefFieldDescr {
+        fn index(&self) -> u32 {
+            self.idx
+        }
+        fn as_field_descr(&self) -> Option<&dyn FieldDescr> {
+            Some(self)
+        }
+    }
+
+    impl FieldDescr for TestRefFieldDescr {
+        fn get_parent_descr(&self) -> Option<DescrRef> {
+            Some(size_descr(0xFFFF_0000))
+        }
+        fn offset(&self) -> usize {
+            self.idx as usize * 8
+        }
+        fn field_size(&self) -> usize {
+            8
+        }
+        fn field_type(&self) -> majit_ir::Type {
+            majit_ir::Type::Ref
+        }
+        fn index_in_parent(&self) -> usize {
+            self.idx as usize
+        }
     }
 
     #[derive(Debug)]
@@ -2197,6 +2243,12 @@ mod tests {
     }
 
     fn ref_field_descr(idx: u32) -> DescrRef {
+        // ensure_ptr_info_arg0 (mod.rs:3082) requires field descrs flowing
+        // into GETFIELD/SETFIELD to carry a parent_descr backreference per
+        // optimizer.py:478. TestRefFieldDescr mirrors TestFieldDescr but
+        // for Ref-typed slots, returning a fresh parent SizeDescr on each
+        // `get_parent_descr()` call so the test doesn't need to keep a
+        // Weak parent alive across the test body.
         Arc::new(TestRefFieldDescr { idx })
     }
 

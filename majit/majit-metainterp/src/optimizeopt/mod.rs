@@ -4213,7 +4213,13 @@ mod ensure_ptr_info_arg0_tests {
     #[test]
     fn ensure_ptr_info_arg0_constructs_struct_for_non_object_field() {
         let mut ctx = OptContext::with_num_inputs(4, 1);
-        let op = field_op_with_parent(struct_parent_descr());
+        // Keep a strong reference to the parent alive for the duration
+        // of the test: `SimpleFieldDescr::parent_descr` is a
+        // `Weak<DescrRef>` (breaks the cycle between SizeDescr.all_field_descrs
+        // and FieldDescr.parent_descr), so the test must hold the parent
+        // Arc until `get_parent_descr()` has been called.
+        let _parent = struct_parent_descr();
+        let op = field_op_with_parent(_parent.clone());
         let mut info = ctx.ensure_ptr_info_arg0(&op);
         let pi = info.as_mut().expect("Forwarded variant expected");
         assert!(matches!(pi, PtrInfo::Struct(_)));
@@ -4224,7 +4230,8 @@ mod ensure_ptr_info_arg0_tests {
     #[test]
     fn ensure_ptr_info_arg0_constructs_instance_for_object_field() {
         let mut ctx = OptContext::with_num_inputs(4, 1);
-        let op = field_op_with_parent(instance_parent_descr());
+        let _parent = instance_parent_descr();
+        let op = field_op_with_parent(_parent.clone());
         let mut info = ctx.ensure_ptr_info_arg0(&op);
         let pi = info.as_mut().expect("Forwarded variant expected");
         assert!(matches!(pi, PtrInfo::Instance(_)));
@@ -4309,7 +4316,8 @@ mod ensure_ptr_info_arg0_tests {
         let mut ctx = OptContext::with_num_inputs(4, 1);
         // Pre-install a NonNullPtrInfo with a specific last_guard_pos.
         ctx.set_ptr_info(OpRef(0), PtrInfo::NonNull { last_guard_pos: 7 });
-        let op = field_op_with_parent(struct_parent_descr());
+        let _parent = struct_parent_descr();
+        let op = field_op_with_parent(_parent.clone());
         let mut info = ctx.ensure_ptr_info_arg0(&op);
         match info.as_mut() {
             Some(pi @ PtrInfo::Struct(_)) => {
