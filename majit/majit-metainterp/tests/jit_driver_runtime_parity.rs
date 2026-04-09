@@ -39,6 +39,43 @@ macro_rules! close_loop_with_increment_guard_failure {
     }};
 }
 
+fn start_guard_failure_trace<S>(driver: &mut JitDriver<S>, key: u64, state: &mut S)
+where
+    S: JitState<Env = (), Sym = Vec<OpRef>>,
+{
+    assert!(
+        driver
+            .back_edge_keyed(key, key as usize, state, &(), || {})
+            .is_none()
+    );
+    if !driver.is_tracing() {
+        assert!(
+            driver
+                .back_edge_keyed(key, key as usize, state, &(), || {})
+                .is_none()
+        );
+    }
+    assert!(driver.is_tracing());
+    driver.merge_point(|ctx, sym| close_loop_with_increment_guard_failure!(ctx, sym));
+}
+
+fn assert_guard_failure_blackhole_outcome<S>(driver: &mut JitDriver<S>, key: u64, state: &mut S)
+where
+    S: JitState<Env = ()>,
+{
+    match driver.run_compiled_with_blackhole_fallback_keyed(key, state, || {}) {
+        DriverRunOutcome::GuardFailure {
+            restored,
+            via_blackhole,
+            ..
+        } => {
+            assert!(restored);
+            assert!(via_blackhole);
+        }
+        other => panic!("expected GuardFailure outcome, got {other:?}"),
+    }
+}
+
 #[jit_driver(greens = [pc, code], reds = [frame, stack], virtualizable = frame)]
 struct DeclarativeDriver;
 
@@ -1606,7 +1643,7 @@ fn declarative_driver_guard_failure_restores_from_reconstructed_resume_frame() {
     let descriptor =
         ResumeMappedDriver::descriptor(&[Type::Int, Type::Int], &[Type::Ref, Type::Int, Type::Int])
             .expect("descriptor should build");
-    let mut driver = JitDriver::<ResumeMappedState>::with_descriptor(2, descriptor);
+    let mut driver = JitDriver::<ResumeMappedState>::with_descriptor(1, descriptor);
     let frame_ptr = 0x4444usize;
     let mut state = ResumeMappedState {
         frame: frame_ptr,
@@ -1614,17 +1651,7 @@ fn declarative_driver_guard_failure_restores_from_reconstructed_resume_frame() {
         top: 5,
     };
 
-    assert!(
-        driver
-            .back_edge_keyed(444, 444, &mut state, &(), || {})
-            .is_none()
-    );
-    assert!(
-        driver
-            .back_edge_keyed(444, 444, &mut state, &(), || {})
-            .is_none()
-    );
-    driver.merge_point(|ctx, sym| close_loop_with_increment_guard_failure!(ctx, sym));
+    start_guard_failure_trace(&mut driver, 444, &mut state);
 
     let mut resume = ResumeDataVirtualAdder::new();
     resume.push_frame(0, 444);
@@ -1638,17 +1665,7 @@ fn declarative_driver_guard_failure_restores_from_reconstructed_resume_frame() {
     state.frame = 0;
     state.stackpos = 1;
     state.top = -10;
-    match driver.run_compiled_with_blackhole_fallback_keyed(444, &mut state, || {}) {
-        DriverRunOutcome::GuardFailure {
-            restored,
-            via_blackhole,
-            ..
-        } => {
-            assert!(restored);
-            assert!(via_blackhole);
-        }
-        other => panic!("expected GuardFailure outcome, got {other:?}"),
-    }
+    assert_guard_failure_blackhole_outcome(&mut driver, 444, &mut state);
 
     assert_eq!(state.frame, frame_ptr);
     assert_eq!(state.stackpos, 2);
@@ -1660,7 +1677,7 @@ fn declarative_driver_guard_failure_materializes_virtual_ref_from_resume_state()
     let descriptor =
         VirtualResumeDriver::descriptor(&[Type::Int, Type::Int], &[Type::Ref, Type::Int])
             .expect("descriptor should build");
-    let mut driver = JitDriver::<VirtualResumeState>::with_descriptor(2, descriptor);
+    let mut driver = JitDriver::<VirtualResumeState>::with_descriptor(1, descriptor);
     let mut state = VirtualResumeState {
         obj: 0,
         flag: 0,
@@ -1668,17 +1685,7 @@ fn declarative_driver_guard_failure_materializes_virtual_ref_from_resume_state()
         materialize_calls: 0,
     };
 
-    assert!(
-        driver
-            .back_edge_keyed(555, 555, &mut state, &(), || {})
-            .is_none()
-    );
-    assert!(
-        driver
-            .back_edge_keyed(555, 555, &mut state, &(), || {})
-            .is_none()
-    );
-    driver.merge_point(|ctx, sym| close_loop_with_increment_guard_failure!(ctx, sym));
+    start_guard_failure_trace(&mut driver, 555, &mut state);
 
     let mut resume = ResumeDataVirtualAdder::new();
     resume.push_frame(0, 555);
@@ -1699,17 +1706,7 @@ fn declarative_driver_guard_failure_materializes_virtual_ref_from_resume_state()
     state.obj = 0;
     state.obj = 0;
     state.flag = 1;
-    match driver.run_compiled_with_blackhole_fallback_keyed(555, &mut state, || {}) {
-        DriverRunOutcome::GuardFailure {
-            restored,
-            via_blackhole,
-            ..
-        } => {
-            assert!(restored);
-            assert!(via_blackhole);
-        }
-        other => panic!("expected GuardFailure outcome, got {other:?}"),
-    }
+    assert_guard_failure_blackhole_outcome(&mut driver, 555, &mut state);
 
     assert_eq!(state.obj, 0xfeedusize);
     assert_eq!(state.flag, 2);
@@ -1819,24 +1816,14 @@ fn declarative_driver_guard_failure_replays_pending_field_writes() {
     let descriptor =
         PendingWriteDriver::descriptor(&[Type::Int, Type::Int], &[Type::Ref, Type::Int])
             .expect("descriptor should build");
-    let mut driver = JitDriver::<PendingWriteState>::with_descriptor(2, descriptor);
+    let mut driver = JitDriver::<PendingWriteState>::with_descriptor(1, descriptor);
     let mut cell = PendingWriteCell { field: 11 };
     let mut state = PendingWriteState {
         obj: (&mut cell as *mut PendingWriteCell) as usize,
         flag: 0,
     };
 
-    assert!(
-        driver
-            .back_edge_keyed(666, 666, &mut state, &(), || {})
-            .is_none()
-    );
-    assert!(
-        driver
-            .back_edge_keyed(666, 666, &mut state, &(), || {})
-            .is_none()
-    );
-    driver.merge_point(|ctx, sym| close_loop_with_increment_guard_failure!(ctx, sym));
+    start_guard_failure_trace(&mut driver, 666, &mut state);
 
     let mut resume = ResumeDataVirtualAdder::new();
     resume.push_frame(0, 666);
@@ -1853,17 +1840,7 @@ fn declarative_driver_guard_failure_replays_pending_field_writes() {
 
     state.obj = 0;
     state.flag = 1;
-    match driver.run_compiled_with_blackhole_fallback_keyed(666, &mut state, || {}) {
-        DriverRunOutcome::GuardFailure {
-            restored,
-            via_blackhole,
-            ..
-        } => {
-            assert!(restored);
-            assert!(via_blackhole);
-        }
-        other => panic!("expected GuardFailure outcome, got {other:?}"),
-    }
+    assert_guard_failure_blackhole_outcome(&mut driver, 666, &mut state);
 
     assert_eq!(state.flag, 2);
     assert_eq!(cell.field, 77);
@@ -1874,24 +1851,14 @@ fn declarative_driver_guard_failure_replays_pending_array_writes_via_layout_hook
     let descriptor =
         PendingArrayWriteDriver::descriptor(&[Type::Int, Type::Int], &[Type::Ref, Type::Int])
             .expect("descriptor should build");
-    let mut driver = JitDriver::<PendingArrayWriteState>::with_descriptor(2, descriptor);
+    let mut driver = JitDriver::<PendingArrayWriteState>::with_descriptor(1, descriptor);
     let mut array = vec![10_i64, 20_i64, 30_i64];
     let mut state = PendingArrayWriteState {
         array: array.as_mut_ptr() as usize,
         flag: 0,
     };
 
-    assert!(
-        driver
-            .back_edge_keyed(888, 888, &mut state, &(), || {})
-            .is_none()
-    );
-    assert!(
-        driver
-            .back_edge_keyed(888, 888, &mut state, &(), || {})
-            .is_none()
-    );
-    driver.merge_point(|ctx, sym| close_loop_with_increment_guard_failure!(ctx, sym));
+    start_guard_failure_trace(&mut driver, 888, &mut state);
 
     let mut resume = ResumeDataVirtualAdder::new();
     resume.push_frame(0, 888);
@@ -1909,17 +1876,7 @@ fn declarative_driver_guard_failure_replays_pending_array_writes_via_layout_hook
 
     state.array = 0;
     state.flag = 1;
-    match driver.run_compiled_with_blackhole_fallback_keyed(888, &mut state, || {}) {
-        DriverRunOutcome::GuardFailure {
-            restored,
-            via_blackhole,
-            ..
-        } => {
-            assert!(restored);
-            assert!(via_blackhole);
-        }
-        other => panic!("expected GuardFailure outcome, got {other:?}"),
-    }
+    assert_guard_failure_blackhole_outcome(&mut driver, 888, &mut state);
 
     assert_eq!(state.flag, 2);
     assert_eq!(array, vec![10, 88, 30]);
@@ -1929,7 +1886,7 @@ fn declarative_driver_guard_failure_replays_pending_array_writes_via_layout_hook
 fn declarative_driver_guard_failure_can_restore_multi_frame_resume_state() {
     let descriptor = MultiFrameDriver::descriptor(&[Type::Int, Type::Int], &[Type::Ref, Type::Int])
         .expect("descriptor should build");
-    let mut driver = JitDriver::<MultiFrameResumeState>::with_descriptor(2, descriptor);
+    let mut driver = JitDriver::<MultiFrameResumeState>::with_descriptor(1, descriptor);
     let frame_ptr = 0xabcusize;
     let mut state = MultiFrameResumeState {
         frame: frame_ptr,
@@ -1937,17 +1894,7 @@ fn declarative_driver_guard_failure_can_restore_multi_frame_resume_state() {
         restored_pcs: Vec::new(),
     };
 
-    assert!(
-        driver
-            .back_edge_keyed(777, 777, &mut state, &(), || {})
-            .is_none()
-    );
-    assert!(
-        driver
-            .back_edge_keyed(777, 777, &mut state, &(), || {})
-            .is_none()
-    );
-    driver.merge_point(|ctx, sym| close_loop_with_increment_guard_failure!(ctx, sym));
+    start_guard_failure_trace(&mut driver, 777, &mut state);
 
     let mut resume = ResumeDataVirtualAdder::new();
     resume.push_frame(0, 100);
@@ -1962,17 +1909,7 @@ fn declarative_driver_guard_failure_can_restore_multi_frame_resume_state() {
 
     state.frame = 0;
     state.flag = 1;
-    match driver.run_compiled_with_blackhole_fallback_keyed(777, &mut state, || {}) {
-        DriverRunOutcome::GuardFailure {
-            restored,
-            via_blackhole,
-            ..
-        } => {
-            assert!(restored);
-            assert!(via_blackhole);
-        }
-        other => panic!("expected GuardFailure outcome, got {other:?}"),
-    }
+    assert_guard_failure_blackhole_outcome(&mut driver, 777, &mut state);
 
     assert_eq!(state.frame, frame_ptr);
     assert_eq!(state.flag, 2);
@@ -1984,7 +1921,7 @@ fn declarative_driver_guard_failure_can_restore_multi_frame_state_via_generic_fr
     let descriptor =
         GenericMultiFrameDriver::descriptor(&[Type::Int, Type::Int], &[Type::Ref, Type::Int])
             .expect("descriptor should build");
-    let mut driver = JitDriver::<GenericMultiFrameResumeState>::with_descriptor(2, descriptor);
+    let mut driver = JitDriver::<GenericMultiFrameResumeState>::with_descriptor(1, descriptor);
     let materialized_ref = 0xfeedusize;
     let mut state = GenericMultiFrameResumeState {
         frame: 0,
@@ -1995,17 +1932,7 @@ fn declarative_driver_guard_failure_can_restore_multi_frame_state_via_generic_fr
         materialize_calls: 0,
     };
 
-    assert!(
-        driver
-            .back_edge_keyed(778, 778, &mut state, &(), || {})
-            .is_none()
-    );
-    assert!(
-        driver
-            .back_edge_keyed(778, 778, &mut state, &(), || {})
-            .is_none()
-    );
-    driver.merge_point(|ctx, sym| close_loop_with_increment_guard_failure!(ctx, sym));
+    start_guard_failure_trace(&mut driver, 778, &mut state);
 
     let mut resume = ResumeDataVirtualAdder::new();
     resume.push_frame(0, 300);
@@ -2020,17 +1947,7 @@ fn declarative_driver_guard_failure_can_restore_multi_frame_state_via_generic_fr
         .attach_resume_data(778, 1, resume.build());
 
     state.flag = 1;
-    match driver.run_compiled_with_blackhole_fallback_keyed(778, &mut state, || {}) {
-        DriverRunOutcome::GuardFailure {
-            restored,
-            via_blackhole,
-            ..
-        } => {
-            assert!(restored);
-            assert!(via_blackhole);
-        }
-        other => panic!("expected GuardFailure outcome, got {other:?}"),
-    }
+    assert_guard_failure_blackhole_outcome(&mut driver, 778, &mut state);
 
     assert_eq!(state.frame, materialized_ref);
     assert_eq!(state.flag, 2);
@@ -2047,7 +1964,7 @@ fn declarative_driver_generic_multi_frame_restore_reuses_virtual_cache_for_pendi
     let descriptor =
         GenericMultiFrameDriver::descriptor(&[Type::Int, Type::Int], &[Type::Ref, Type::Int])
             .expect("descriptor should build");
-    let mut driver = JitDriver::<GenericMultiFrameResumeState>::with_descriptor(2, descriptor);
+    let mut driver = JitDriver::<GenericMultiFrameResumeState>::with_descriptor(1, descriptor);
     let mut cell = PendingWriteCell { field: 0 };
     let cell_ptr = (&mut cell as *mut PendingWriteCell) as usize;
     let mut state = GenericMultiFrameResumeState {
@@ -2059,17 +1976,7 @@ fn declarative_driver_generic_multi_frame_restore_reuses_virtual_cache_for_pendi
         materialize_calls: 0,
     };
 
-    assert!(
-        driver
-            .back_edge_keyed(779, 779, &mut state, &(), || {})
-            .is_none()
-    );
-    assert!(
-        driver
-            .back_edge_keyed(779, 779, &mut state, &(), || {})
-            .is_none()
-    );
-    driver.merge_point(|ctx, sym| close_loop_with_increment_guard_failure!(ctx, sym));
+    start_guard_failure_trace(&mut driver, 779, &mut state);
 
     let mut resume = ResumeDataVirtualAdder::new();
     resume.push_frame(0, 500);
@@ -2089,17 +1996,7 @@ fn declarative_driver_generic_multi_frame_restore_reuses_virtual_cache_for_pendi
         .attach_resume_data(779, 1, resume.build());
 
     state.flag = 1;
-    match driver.run_compiled_with_blackhole_fallback_keyed(779, &mut state, || {}) {
-        DriverRunOutcome::GuardFailure {
-            restored,
-            via_blackhole,
-            ..
-        } => {
-            assert!(restored);
-            assert!(via_blackhole);
-        }
-        other => panic!("expected GuardFailure outcome, got {other:?}"),
-    }
+    assert_guard_failure_blackhole_outcome(&mut driver, 779, &mut state);
 
     assert_eq!(state.materialize_calls, 1);
     assert_eq!(cell.field, 77);
@@ -2110,7 +2007,7 @@ fn declarative_driver_guard_failure_uses_resume_layout_slot_types_for_generic_re
     let descriptor =
         LayoutTypedFrameDriver::descriptor(&[Type::Int, Type::Int], &[Type::Ref, Type::Int])
             .expect("descriptor should build");
-    let mut driver = JitDriver::<LayoutTypedFrameRestoreState>::with_descriptor(2, descriptor);
+    let mut driver = JitDriver::<LayoutTypedFrameRestoreState>::with_descriptor(1, descriptor);
     let frame_ptr = 0xfaceusize;
     let mut state = LayoutTypedFrameRestoreState {
         frame: frame_ptr,
@@ -2120,17 +2017,7 @@ fn declarative_driver_guard_failure_uses_resume_layout_slot_types_for_generic_re
         restored_frames: Vec::new(),
     };
 
-    assert!(
-        driver
-            .back_edge_keyed(780, 780, &mut state, &(), || {})
-            .is_none()
-    );
-    assert!(
-        driver
-            .back_edge_keyed(780, 780, &mut state, &(), || {})
-            .is_none()
-    );
-    driver.merge_point(|ctx, sym| close_loop_with_increment_guard_failure!(ctx, sym));
+    start_guard_failure_trace(&mut driver, 780, &mut state);
 
     let mut resume = ResumeDataVirtualAdder::new();
     resume.push_frame(0, 780);
@@ -2142,17 +2029,7 @@ fn declarative_driver_guard_failure_uses_resume_layout_slot_types_for_generic_re
 
     state.frame = 0;
     state.flag = 1;
-    match driver.run_compiled_with_blackhole_fallback_keyed(780, &mut state, || {}) {
-        DriverRunOutcome::GuardFailure {
-            restored,
-            via_blackhole,
-            ..
-        } => {
-            assert!(restored);
-            assert!(via_blackhole);
-        }
-        other => panic!("expected GuardFailure outcome, got {other:?}"),
-    }
+    assert_guard_failure_blackhole_outcome(&mut driver, 780, &mut state);
 
     assert_eq!(state.frame, frame_ptr);
     assert_eq!(state.flag, 2);

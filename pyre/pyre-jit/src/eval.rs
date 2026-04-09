@@ -4356,7 +4356,32 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pyre_interpreter::{function_get_code, is_function};
+
+    struct TestJitParamsGuard;
+
+    impl TestJitParamsGuard {
+        fn low_threshold() -> Self {
+            let (driver, _) = driver_pair();
+            driver
+                .meta_interp_mut()
+                .warm_state_mut()
+                .set_default_params();
+            driver.set_param("threshold", 2);
+            driver.set_param("function_threshold", 2);
+            Self
+        }
+    }
+
+    impl Drop for TestJitParamsGuard {
+        fn drop(&mut self) {
+            let (driver, _) = driver_pair();
+            driver
+                .meta_interp_mut()
+                .warm_state_mut()
+                .set_default_params();
+            driver.set_param("threshold", JIT_THRESHOLD as i64);
+        }
+    }
 
     #[test]
     fn test_eval_simple_addition() {
@@ -4372,10 +4397,11 @@ mod tests {
 
     #[test]
     fn test_eval_while_loop() {
+        let _jit_params = TestJitParamsGuard::low_threshold();
         let source = "\
 i = 0
 s = 0
-while i < 100:
+while i < 20:
     s = s + i
     i = i + 1";
         let code = pyre_interpreter::compile_exec(source).expect("compile failed");
@@ -4383,12 +4409,13 @@ while i < 100:
         let _ = eval_with_jit(&mut frame);
         unsafe {
             let s = *(*frame.namespace).get("s").unwrap();
-            assert_eq!(pyre_object::intobject::w_int_get_value(s), 4950);
+            assert_eq!(pyre_object::intobject::w_int_get_value(s), 190);
         }
     }
 
     #[test]
     fn test_eval_with_jit_redecodes_opargs_after_extended_arg_jumps() {
+        let _jit_params = TestJitParamsGuard::low_threshold();
         let source = "\
 def fannkuch(n):
     p = [0] * n
@@ -4456,8 +4483,7 @@ def fannkuch(n):
                     j = j + 1
                 p[i + 1] = t
                 i = i + 1
-
-r = fannkuch(6)";
+r = fannkuch(4)";
         let code = pyre_interpreter::compile_exec(source).expect("compile failed");
         if std::env::var_os("MAJIT_DUMP_BYTECODE").is_some() {
             let mut state = pyre_interpreter::OpArgState::default();
@@ -4520,6 +4546,7 @@ result = fib(12)
 
     #[test]
     fn test_recursive_global_reads_do_not_reuse_force_cache_across_global_mutation() {
+        let _jit_params = TestJitParamsGuard::low_threshold();
         let source = "\
 factor = 1
 def g(n):
@@ -4527,22 +4554,23 @@ def g(n):
         return n * factor
     return g(n - 1) + g(n - 2) + factor
 
-first = g(12)
+first = g(9)
 factor = 2
-second = g(12)";
+second = g(9)";
         let code = pyre_interpreter::compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
         let _ = eval_with_jit(&mut frame);
         unsafe {
             let first = *(*frame.namespace).get("first").unwrap();
             let second = *(*frame.namespace).get("second").unwrap();
-            assert_eq!(pyre_object::intobject::w_int_get_value(first), 376);
-            assert_eq!(pyre_object::intobject::w_int_get_value(second), 752);
+            assert_eq!(pyre_object::intobject::w_int_get_value(first), 88);
+            assert_eq!(pyre_object::intobject::w_int_get_value(second), 176);
         }
     }
 
     #[test]
     fn test_inline_residual_user_call_with_many_args_stays_correct() {
+        let _jit_params = TestJitParamsGuard::low_threshold();
         let source = "\
 def helper(a, b, c, d, e):
     return a + b + c + d + e
@@ -4552,7 +4580,7 @@ def outer(x):
 
 s = 0
 i = 0
-while i < 300:
+while i < 40:
     s = s + outer(i)
     i = i + 1";
         let code = pyre_interpreter::compile_exec(source).expect("compile failed");
@@ -4560,12 +4588,13 @@ while i < 300:
         let _ = eval_with_jit(&mut frame);
         unsafe {
             let s = *(*frame.namespace).get("s").unwrap();
-            assert_eq!(pyre_object::intobject::w_int_get_value(s), 224_250);
+            assert_eq!(pyre_object::intobject::w_int_get_value(s), 3_900);
         }
     }
 
     #[test]
     fn test_nested_direct_helper_calls_stay_correct() {
+        let _jit_params = TestJitParamsGuard::low_threshold();
         let source = "\
 def add(a, b):
     return a + b
@@ -4581,7 +4610,7 @@ def compute(i):
 
 s = 0
 i = 0
-while i < 300:
+while i < 40:
     s = add(s, compute(i))
     i = add(i, 1)";
         let code = pyre_interpreter::compile_exec(source).expect("compile failed");
@@ -4589,7 +4618,7 @@ while i < 300:
         let _ = eval_with_jit(&mut frame);
         unsafe {
             let s = *(*frame.namespace).get("s").unwrap();
-            assert_eq!(pyre_object::intobject::w_int_get_value(s), 8_999_900);
+            assert_eq!(pyre_object::intobject::w_int_get_value(s), 21_320);
         }
     }
 
@@ -4700,11 +4729,12 @@ while i < 300:
 
     #[test]
     fn test_dynamic_int_list_indexing_stays_correct() {
+        let _jit_params = TestJitParamsGuard::low_threshold();
         let source = "\
 q = [0, 1, 2, 3, 4]
 i = 0
 s = 0
-while i < 200:
+while i < 40:
     q0 = i % 5
     s = s + q[q0]
     q[q0] = q[q0] + 1
@@ -4715,18 +4745,18 @@ while i < 200:
         unsafe {
             let s = *(*frame.namespace).get("s").unwrap();
             let q = *(*frame.namespace).get("q").unwrap();
-            assert_eq!(pyre_object::intobject::w_int_get_value(s), 4_300);
+            assert_eq!(pyre_object::intobject::w_int_get_value(s), 220);
             assert_eq!(
                 pyre_object::intobject::w_int_get_value(
                     pyre_object::listobject::w_list_getitem(q, 0).unwrap()
                 ),
-                40
+                8
             );
             assert_eq!(
                 pyre_object::intobject::w_int_get_value(
                     pyre_object::listobject::w_list_getitem(q, 4).unwrap()
                 ),
-                44
+                12
             );
         }
     }

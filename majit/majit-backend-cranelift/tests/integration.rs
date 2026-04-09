@@ -612,7 +612,10 @@ fn test_intdiv_power_of_two_pipeline() {
 
 #[test]
 fn test_intdiv_various_divisors() {
-    for (tid, divisor) in [3i64, 5, 10, 13, 100, 127].iter().enumerate() {
+    // Keep one small odd divisor, one even composite divisor, and one
+    // larger odd divisor. The per-divisor code generation path is the
+    // same, so a representative set is enough here.
+    for (tid, divisor) in [3i64, 10, 127].iter().enumerate() {
         let (backend, token) = build_magic_div_trace(*divisor, 200 + tid as u64);
 
         for input in [

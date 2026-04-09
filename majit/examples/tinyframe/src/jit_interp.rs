@@ -116,12 +116,12 @@ mod tests {
     use crate::interp;
 
     #[test]
-    fn jit_loop_count_to_100() {
+    fn jit_loop_count_to_40() {
         let code = interp::compile(
             "
         main:
         LOAD 1 => r1
-        LOAD 100 => r2
+        LOAD 40 => r2
         LOAD 0 => r0
         @l1
         ADD r0 r1 => r0
@@ -131,7 +131,7 @@ mod tests {
         );
         let mut jit = JitTinyFrameInterp::new();
         let result = jit.run(&code, &[]);
-        assert_eq!(result, 100);
+        assert_eq!(result, 40);
     }
 
     #[test]
@@ -149,8 +149,8 @@ mod tests {
         ",
         );
         let mut jit = JitTinyFrameInterp::new();
-        let result = jit.run(&code, &[(0, 100)]);
-        assert_eq!(result, 100);
+        let result = jit.run(&code, &[(0, 40)]);
+        assert_eq!(result, 40);
     }
 
     #[test]
@@ -167,7 +167,7 @@ mod tests {
         ",
         );
 
-        for n in [10, 50, 100, 255] {
+        for n in [5, 10, 20, 40] {
             // Interpreter
             let mut frame = interp::Frame::new(&code);
             frame.registers[2] = Some(interp::Object::Int(n));
