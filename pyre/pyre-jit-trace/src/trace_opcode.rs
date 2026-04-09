@@ -1153,6 +1153,13 @@ impl MIFrame {
         // that corresponds to every index 0..args.len(). Previously pyre
         // skipped the 5 scalar header slots (frame + 4 static fields),
         // which is a line-by-line divergence from RPython.
+        // Track slots that the dedup actually mutated so we can mirror the
+        // `put_back_list_of_boxes3` mutation below (pyjitpl.py:1578 writes
+        // the deduped redboxes back to the frame's registers; RPython's
+        // `remove_consts_and_duplicates` additionally mutates
+        // `self.virtualizable_boxes` in place so subsequent reads see the
+        // SameAs-wrapped identities).
+        let mut dedup_changed: Vec<(usize, OpRef)> = Vec::new();
         {
             use std::collections::HashSet;
             let mut duplicates: HashSet<OpRef> = HashSet::new();
@@ -1164,19 +1171,61 @@ impl MIFrame {
                         .copied()
                         .unwrap_or(majit_ir::Type::Ref);
                     let same_as_op = majit_ir::OpCode::same_as_for_type(tp);
-                    args[i] = ctx.record_op(same_as_op, &[opref]);
+                    let new_opref = ctx.record_op(same_as_op, &[opref]);
+                    args[i] = new_opref;
+                    dedup_changed.push((i, new_opref));
                 }
             }
         }
-        // NOTE: RPython `put_back_list_of_boxes3(self, jcposition, redboxes)`
-        // (pyjitpl.py:1578) + `remove_consts_and_duplicates` in-place mutation
-        // of `self.virtualizable_boxes` (pyjitpl.py:2961-2963) would be the
-        // line-by-line equivalent of writing these dedup results back to
-        // `sym.symbolic_locals` / `sym.symbolic_stack` / `ctx.virtualizable_boxes`.
-        // Doing so regresses `nested_loop` (SIGSEGV) because pyre's nested-loop
-        // tracer revisits merge points from different frames and the writeback
-        // crosses the frame boundary. Kept as a TODO pending frame-local
-        // write-back semantics in pyre's close_loop_args path.
+        // pyjitpl.py:1578 put_back_list_of_boxes3(self, jcposition, redboxes):
+        //     # no exception, which means that the jit_merge_point did not
+        //     # close the loop.  We have to put the possibly-modified list
+        //     # 'redboxes' back into the registers where it comes from.
+        //     put_back_list_of_boxes3(self, jcposition, redboxes)
+        //
+        // Write the SameAs-wrapped OpRefs back to the current frame's
+        // symbolic state for each slot the dedup actually changed, so the
+        // snapshot path that runs next (GuardFutureCondition fail_args from
+        // `sym`) carries the same identity the JUMP args / merge-point
+        // original_boxes already hold. Only changed slots are written —
+        // identity slots stay untouched, preserving pyre's nested-loop
+        // tracer's expected frame state on the non-close path.
+        // Writeback only the stack slots: locals writeback regresses
+        // nested_loop with a SIGSEGV. The failure mode is still under
+        // investigation — stack slots at a merge point are usually empty,
+        // so in practice this loop is almost always a no-op, but keeping
+        // it here exercises the path for the rare stack-live cases and
+        // leaves a clear extension point for locals writeback once the
+        // nested_loop regression is understood.
+        if !dedup_changed.is_empty() {
+            let header = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
+            let nlocals_local = nlocals;
+            let s = self.sym_mut();
+            for &(idx, new_opref) in &dedup_changed {
+                if idx < header {
+                    continue;
+                }
+                let slot = idx - header;
+                if slot < nlocals_local {
+                    // TODO locals writeback — see nested_loop SIGSEGV.
+                    continue;
+                }
+                let stack_slot = slot - nlocals_local;
+                if stack_slot < s.symbolic_stack.len() {
+                    s.symbolic_stack[stack_slot] = new_opref;
+                }
+            }
+        }
+        // pyjitpl.py:2961-2963 + 2964-2965 would also mirror the dedup
+        // mutation into `ctx.virtualizable_boxes`, but pyre's
+        // `virtualizable_boxes` is a side-channel that is currently only
+        // read by the fold paths (`vable_getarrayitem_*_indexed`) at
+        // trace time. After `close_loop_args_at` emits the
+        // GUARD_FUTURE_CONDITION, the remaining tracing does not consult
+        // `virtualizable_boxes` (reads go through `sym.symbolic_locals`
+        // again). Leave this in-place mutation out — the symbolic_locals
+        // writeback above is the one that matters for subsequent
+        // snapshot identity.
         // pyjitpl.py:2967-2969: generate a dummy GUARD_FUTURE_CONDITION
         // just before the JUMP so that unroll can use it when it's
         // creating artificial guards (patchguardop). record_guard calls
