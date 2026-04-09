@@ -2160,6 +2160,7 @@ mod tests {
                     "Add",
                 ])),
                 flattened: None,
+                jitcode: None,
             }],
             jitcodes: Vec::new(),
             total_blocks: 0,

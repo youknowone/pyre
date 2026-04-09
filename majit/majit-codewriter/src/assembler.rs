@@ -9,6 +9,8 @@
 
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
+
 use crate::model::ValueId;
 use crate::passes::flatten::{FlatOp, Label, RegKind, SSARepr};
 use crate::regalloc::RegAllocResult;
@@ -18,7 +20,7 @@ use crate::regalloc::RegAllocResult;
 /// RPython: `jitcode.py::JitCode` — contains bytecode, constants, and
 /// register counts for the meta-interpreter to execute.
 /// RPython: `jitcode.py::JitCode.setup()` (jitcode.py:22-34).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JitCode {
     /// RPython: JitCode.name
     pub name: String,

@@ -52,6 +52,14 @@ pub struct PipelineOpcodeArm {
     /// Inlined + jtransform'd + flattened output.
     /// None if the opcode handler was too trivial or unsupported.
     pub flattened: Option<SSARepr>,
+    /// Per-opcode JitCode bytes assembled from `flattened`.
+    ///
+    /// Phase C of the eval-loop automation plan: pre-assembled per-opcode
+    /// jitcode that the trace recorder will eventually dispatch through
+    /// `BlackholeInterpreter::dispatch_one()` instead of going through the
+    /// `OpcodeHandler` trait. None when `flattened` is None or when
+    /// register allocation / assembly fails.
+    pub jitcode: Option<crate::assembler::JitCode>,
 }
 
 /// Result of running the pipeline on a full program.
@@ -61,7 +69,6 @@ pub struct ProgramPipelineResult {
     pub opcode_dispatch: Vec<PipelineOpcodeArm>,
     /// RPython: all_jitcodes returned by CodeWriter.make_jitcodes() (codewriter.py:89).
     /// Assembled JitCode bytecode for each transformed graph.
-    #[serde(skip)]
     pub jitcodes: Vec<crate::assembler::JitCode>,
     pub total_blocks: usize,
     pub total_ops: usize,

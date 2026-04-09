@@ -469,6 +469,11 @@ fn build_canonical_opcode_dispatch(
     // Phase 2: majit-specific arm processing (SSARepr for PipelineOpcodeArm).
     // get_jitcode() calls are idempotent for already-known callees;
     // new callees are added to the pending queue.
+    //
+    // For each arm we additionally run register allocation + assembler so
+    // that `arm.jitcode` carries pre-assembled bytecode bytes. This is the
+    // input that `MIFrame` will eventually consume via
+    // `BlackholeInterpreter::dispatch_one()`. Phase C of the eval-loop plan.
     let dispatch: Vec<passes::PipelineOpcodeArm> = opcode_arms
         .into_iter()
         .map(|arm| {
@@ -480,19 +485,32 @@ fn build_canonical_opcode_dispatch(
                 &receiver_traits,
             );
 
-            let flattened = arm.body_graph.as_ref().map(|handler_graph| {
+            let flatten_and_assemble = arm.body_graph.as_ref().map(|handler_graph| {
                 let annotations = passes::annotate_graph(handler_graph);
                 let type_state = passes::resolve_types(handler_graph, &annotations);
                 let mut transformer = passes::Transformer::new(&pipeline_config.transform)
                     .with_callcontrol(&mut *call_control)
                     .with_type_state(&type_state);
                 let rewritten = transformer.transform(handler_graph);
-                passes::flatten_with_types(&rewritten.graph, &type_state)
+                let mut ssarepr = passes::flatten_with_types(&rewritten.graph, &type_state);
+                let value_kinds = passes::rtype::build_value_kinds(&type_state);
+                let regallocs = crate::regalloc::perform_all_register_allocations(
+                    &rewritten.graph,
+                    &value_kinds,
+                );
+                let jitcode = codewriter.assembler.assemble(&mut ssarepr, &regallocs);
+                (ssarepr, jitcode)
             });
+
+            let (flattened, jitcode) = match flatten_and_assemble {
+                Some((s, j)) => (Some(s), Some(j)),
+                None => (None, None),
+            };
 
             passes::PipelineOpcodeArm {
                 selector: arm.selector,
                 flattened,
+                jitcode,
             }
         })
         .collect();
