@@ -463,7 +463,7 @@ impl MIFrame {
         args: &[OpRef],
         call_pc: usize,
     ) {
-        let null = ctx.const_int(pyre_object::PY_NULL as i64);
+        let null = ctx.const_ref(pyre_object::PY_NULL as i64);
         self.push_value(ctx, callable, ConcreteValue::Null);
         self.push_value(ctx, null, ConcreteValue::Ref(pyre_object::PY_NULL));
         for &arg in args {
@@ -1465,11 +1465,15 @@ impl MIFrame {
             majit_trace::recorder::SnapshotTagged::Const(0, majit_ir::Type::Ref)
         } else if ctx.constant_value(opref).is_some() {
             let val = ctx.constant_value(opref).unwrap_or(0);
-            let tp = ctx.const_type(opref).unwrap_or(majit_ir::Type::Int);
+            let tp = ctx
+                .const_type(opref)
+                .unwrap_or_else(|| panic!("missing snapshot const type for {:?}", opref));
             majit_trace::recorder::SnapshotTagged::Const(val, tp)
         } else {
             // resume.py:211,214: box.type for _number_boxes TAGVIRTUAL/TAGBOX.
-            let tp = ctx.get_opref_type(opref).unwrap_or(majit_ir::Type::Int);
+            let tp = ctx
+                .get_opref_type(opref)
+                .unwrap_or_else(|| panic!("missing snapshot box type for {:?}", opref));
             majit_trace::recorder::SnapshotTagged::Box(opref.0, tp)
         }
     }
@@ -1618,10 +1622,14 @@ impl MIFrame {
                     majit_trace::recorder::SnapshotTagged::Const(0, majit_ir::Type::Ref)
                 } else if ctx.constant_value(opref).is_some() {
                     let val = ctx.constant_value(opref).unwrap_or(0);
-                    let tp = ctx.const_type(opref).unwrap_or(majit_ir::Type::Int);
+                    let tp = ctx
+                        .const_type(opref)
+                        .unwrap_or_else(|| panic!("missing fail-arg const type for {:?}", opref));
                     majit_trace::recorder::SnapshotTagged::Const(val, tp)
                 } else {
-                    let tp = types.get(i).copied().unwrap_or(majit_ir::Type::Ref);
+                    let tp = types.get(i).copied().unwrap_or_else(|| {
+                        panic!("missing fail-arg box type at index {} for {:?}", i, opref)
+                    });
                     majit_trace::recorder::SnapshotTagged::Box(opref.0, tp)
                 }
             })
@@ -2536,7 +2544,7 @@ impl MIFrame {
                         Ok(pending) => {
                             self.pending_inline_frame = Some(pending);
                             return self
-                                .with_ctx(|_, ctx| Ok(ctx.const_int(pyre_object::PY_NULL as i64)));
+                                .with_ctx(|_, ctx| Ok(ctx.const_ref(pyre_object::PY_NULL as i64)));
                         }
                         Err(err) => {
                             if majit_metainterp::majit_log_enabled() {
@@ -2714,7 +2722,7 @@ impl MIFrame {
                                 Ok(pending) => {
                                     self.pending_inline_frame = Some(pending);
                                     return self.with_ctx(|_, ctx| {
-                                        Ok(ctx.const_int(pyre_object::PY_NULL as i64))
+                                        Ok(ctx.const_ref(pyre_object::PY_NULL as i64))
                                     });
                                 }
                                 Err(err) => {

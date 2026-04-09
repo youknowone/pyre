@@ -1737,7 +1737,7 @@ impl<M: Clone> MetaInterp<M> {
         let is_vref = vref_ptr != 0 && unsafe { vref_info.is_virtual_ref(vref_ptr as *const u8) };
         if is_vref {
             // pyjitpl.py:3371: VIRTUAL_REF_FINISH(vrefbox, NULL)
-            let null = ctx.const_int(0);
+            let null = ctx.const_ref(0);
             let _ = ctx.record_op(OpCode::VirtualRefFinish, &[vref, null]);
         }
         if self.virtualref_boxes.len() >= 2 {
@@ -1924,6 +1924,7 @@ impl<M: Clone> MetaInterp<M> {
             .filter(|op| !op.pos.is_none())
             .map(|op| (op.pos.0, op.result_type()))
             .collect();
+        let pre_cut_trace_op_types_for_retry = pre_cut_trace_op_types.clone();
 
         // compile.py:269-270: cut trace at cross-loop merge point.
         // When the trace was retargeted to a different loop header, record
@@ -2038,6 +2039,7 @@ impl<M: Clone> MetaInterp<M> {
                 &mut constants,
                 &mut constant_types,
             );
+        let retry_sbt = sbt.clone();
         unroll_opt.snapshot_boxes = snapshot_map.clone();
         unroll_opt.snapshot_frame_sizes = snapshot_frame_size_map.clone();
         unroll_opt.snapshot_vable_boxes = snapshot_vable_map.clone();
@@ -2087,10 +2089,40 @@ impl<M: Clone> MetaInterp<M> {
                         let mut retry_constants = constants_snapshot;
                         let mut simple_opt = Optimizer::default_pipeline();
                         simple_opt.constant_types = constant_types.clone();
+                        simple_opt.numbering_type_overrides = numbering_overrides.clone();
+                        let reconciled_inputarg_types: Vec<majit_ir::Type> = {
+                            let first_guard_types = trace_ops_snapshot
+                                .iter()
+                                .find(|op| op.opcode.is_guard())
+                                .and_then(|op| {
+                                    op.descr
+                                        .as_ref()
+                                        .and_then(|d| d.as_fail_descr())
+                                        .map(|fd| fd.fail_arg_types().to_vec())
+                                });
+                            trace
+                                .inputargs
+                                .iter()
+                                .enumerate()
+                                .map(|(i, ia)| {
+                                    first_guard_types
+                                        .as_ref()
+                                        .and_then(|t| t.get(i).copied())
+                                        .unwrap_or(ia.tp)
+                                })
+                                .collect()
+                        };
+                        simple_opt.trace_inputarg_types = reconciled_inputarg_types.clone();
+                        for (i, &tp) in reconciled_inputarg_types.iter().enumerate() {
+                            simple_opt.constant_types.insert(i as u32, tp);
+                        }
+                        simple_opt.original_trace_op_types =
+                            pre_cut_trace_op_types_for_retry.clone();
                         simple_opt.snapshot_boxes = snapshot_map.clone();
                         simple_opt.snapshot_frame_sizes = snapshot_frame_size_map.clone();
                         simple_opt.snapshot_vable_boxes = snapshot_vable_map.clone();
                         simple_opt.snapshot_frame_pcs = snapshot_pc_map.clone();
+                        simple_opt.snapshot_box_types = retry_sbt.clone();
                         let retry_result =
                             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                 simple_opt.optimize_with_constants_and_inputs(
@@ -3268,7 +3300,6 @@ impl<M: Clone> MetaInterp<M> {
         self.backend.set_next_trace_id(trace_id);
         self.backend.set_next_header_pc(green_key);
 
-        // Extend inputargs if the optimizer added virtual inputs (virtualizable)
         let final_num_inputs = optimizer.final_num_inputs();
         let mut inputargs = trace.inputargs.clone();
         while inputargs.len() < final_num_inputs {
@@ -3287,9 +3318,6 @@ impl<M: Clone> MetaInterp<M> {
             .iter()
             .find(|op| op.opcode.is_guard())
             .and_then(|op| {
-                // Read from descr (original trace types, full-length).
-                // NOT from op.fail_arg_types which may be compact after
-                // snapshot-based numbering reduces fail_args to liveboxes.
                 op.descr
                     .as_ref()
                     .and_then(|d| d.as_fail_descr())
@@ -5675,19 +5703,22 @@ impl<M: Clone> MetaInterp<M> {
                 // compile.py:1075-1084: new_trace.inputargs = info.renamed_inputargs.
                 // Types come from ExportedState.renamed_inputarg_types, populated
                 // by Optimizer from trace_inputarg_types (RPython Box type parity).
-                let renamed_inputargs: Vec<InputArg> = es
-                    .renamed_inputargs
-                    .iter()
-                    .enumerate()
-                    .map(|(i, &opref)| {
-                        let tp = es
-                            .renamed_inputarg_types
-                            .get(i)
-                            .copied()
-                            .unwrap_or(Type::Int);
-                        InputArg::from_type(tp, opref.0)
-                    })
-                    .collect();
+                let renamed_inputargs: Vec<InputArg> =
+                    es.renamed_inputargs
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &opref)| {
+                            let tp = es.renamed_inputarg_types.get(i).copied().unwrap_or_else(
+                                || {
+                                    panic!(
+                                        "missing renamed_inputarg_types entry for retrace input {}",
+                                        i
+                                    )
+                                },
+                            );
+                            InputArg::from_type(tp, opref.0)
+                        })
+                        .collect();
                 self.retrace_needed(
                     green_key,
                     optimized_ops.clone(),
