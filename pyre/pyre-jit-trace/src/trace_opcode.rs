@@ -1169,6 +1169,17 @@ impl MIFrame {
             self.orgpc = pc;
         }
         self.generate_guard(ctx, majit_ir::OpCode::GuardFutureCondition, &[]);
+        // pyjitpl.py:2971 assert len(self.virtualref_boxes) == 0,
+        //     "missing virtual_ref_finish()?"
+        // Reached loop header must not have dangling virtualrefs — they
+        // should have been finished by prior vrefs_after_residual_call /
+        // stop_tracking_virtualref. pyre's equivalent is sym.virtualref_boxes.
+        debug_assert!(
+            self.sym().virtualref_boxes.is_empty(),
+            "missing virtual_ref_finish()? close_loop_args_at reached with \
+             virtualref_boxes={:?}",
+            self.sym().virtualref_boxes.len()
+        );
         args
     }
 
