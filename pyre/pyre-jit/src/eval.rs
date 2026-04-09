@@ -1313,14 +1313,6 @@ fn handle_fail(
     _info: &majit_metainterp::virtualizable::VirtualizableInfo,
 ) -> HandleFailOutcome {
     // compile.py:702-703: must_compile() AND not stack_almost_full()
-    // [dynasm-known-issue] Bridge compilation is gated for dynasm because
-    // multi-target_token loops (preamble + body) require per-label arglocs
-    // tracking in the backend before bridge JUMP can land in the right
-    // location. The regalloc + single-label loop_arglocs propagation is in
-    // place; the remaining work is per-TargetToken arglocs storage on
-    // CompiledCode and the bridge optimizer's JUMP descr routing.
-    #[cfg(feature = "dynasm")]
-    let should_bridge = false;
     if should_bridge && !stack_almost_full() {
         let is_tracing = {
             let (driver, _) = driver_pair();

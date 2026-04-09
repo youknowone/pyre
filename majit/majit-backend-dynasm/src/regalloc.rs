@@ -1861,9 +1861,13 @@ impl RegAlloc {
                 locs.push(Some(Loc::Immed(crate::regloc::ImmedLoc::new(val))));
                 continue;
             }
-            if let Some(reg) = self.rm.reg_bindings_get(arg, &self.longevity) {
-                locs.push(Some(Loc::Reg(reg)));
-            } else if let Some(reg) = self.xrm.reg_bindings_get(arg, &self.longevity) {
+            let tp = self.tp(arg);
+            let reg_loc = if tp == Type::Float {
+                self.xrm.reg_bindings_get(arg, &self.longevity)
+            } else {
+                self.rm.reg_bindings_get(arg, &self.longevity)
+            };
+            if let Some(reg) = reg_loc {
                 locs.push(Some(Loc::Reg(reg)));
             } else if let Some(floc) = self.fm.get(arg, &self.longevity) {
                 locs.push(Some(Loc::Frame(floc)));
