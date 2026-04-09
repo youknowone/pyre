@@ -1344,11 +1344,144 @@ pub fn divmod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     Err(binary_builtin_type_error("divmod()", a, b))
 }
 
-/// pypy/module/__builtin__/abstractinst.py:91-126
+/// abstractinst.py:18-31 `_get_bases(space, w_cls)`.
+/// Returns `Some(bases_tuple)` when `getattr(w_cls, "__bases__")` exists
+/// and is a tuple, `None` when the attribute is missing or not a tuple.
+/// AttributeError is swallowed; other errors propagate.
+fn _get_bases(w_cls: PyObjectRef) -> Result<Option<PyObjectRef>, PyError> {
+    let w_bases = match getattr(w_cls, "__bases__") {
+        Ok(b) => b,
+        Err(e) if e.kind == PyErrorKind::AttributeError => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    if w_bases.is_null() {
+        return Ok(None);
+    }
+    if unsafe { is_tuple(w_bases) } {
+        Ok(Some(w_bases))
+    } else {
+        Ok(None)
+    }
+}
+
+/// abstractinst.py:33-34 `abstract_isclass_w(space, w_obj)`.
+fn abstract_isclass_w(w_obj: PyObjectRef) -> Result<bool, PyError> {
+    Ok(_get_bases(w_obj)?.is_some())
+}
+
+/// abstractinst.py:36-38 `check_class(space, w_obj, msg)`. Raises
+/// `TypeError(msg)` when `w_obj` lacks a tuple-valued `__bases__`.
+fn check_class(w_obj: PyObjectRef, msg: &str) -> Result<(), PyError> {
+    if !abstract_isclass_w(w_obj)? {
+        return Err(PyError::type_error(msg.to_string()));
+    }
+    Ok(())
+}
+
+/// abstractinst.py:74-88 `p_recursive_isinstance_type_w`. Assumes
+/// `w_type` is a real type object: tries the MRO walk via `isinstance_w`
+/// first, then consults `w_inst.__class__` to honour any custom class
+/// override.
+unsafe fn p_recursive_isinstance_type_w(
+    w_inst: PyObjectRef,
+    w_type: PyObjectRef,
+) -> Result<bool, PyError> {
+    if isinstance_w(w_inst, w_type) {
+        return Ok(true);
+    }
+    let w_abstractclass = match getattr(w_inst, "__class__") {
+        Ok(cls) => cls,
+        Err(e) if e.kind == PyErrorKind::AttributeError => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    let w_inst_type = crate::typedef::r#type(w_inst).unwrap_or(pyre_object::PY_NULL);
+    if !std::ptr::eq(w_abstractclass, w_inst_type) && is_type(w_abstractclass) {
+        return Ok(issubtype_w(w_abstractclass, w_type));
+    }
+    Ok(false)
+}
+
+/// abstractinst.py:53-72 `p_recursive_isinstance_w`. The Py3 port drops
+/// the `W_ClassObject`/`W_InstanceObject` Py2 fast path. Validates
+/// `w_cls` via `check_class()` before falling back to the abstract
+/// `__class__` / `__bases__` walk.
+unsafe fn p_recursive_isinstance_w(
+    w_inst: PyObjectRef,
+    w_cls: PyObjectRef,
+) -> Result<bool, PyError> {
+    if is_type(w_cls) {
+        return p_recursive_isinstance_type_w(w_inst, w_cls);
+    }
+    check_class(
+        w_cls,
+        "isinstance() arg 2 must be a type, a tuple of types, or a union",
+    )?;
+    let w_abstractclass = match getattr(w_inst, "__class__") {
+        Ok(cls) => cls,
+        Err(e) if e.kind == PyErrorKind::AttributeError => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    p_abstract_issubclass_w(w_abstractclass, w_cls)
+}
+
+/// abstractinst.py:127-147 `p_abstract_issubclass_w`. Walks
+/// `w_derived.__bases__` looking for an identity match with `w_cls`.
+/// Recursion is bounded by avoiding the last entry of each `__bases__`
+/// tuple — that one is followed by re-entering the loop.
+fn p_abstract_issubclass_w(w_derived: PyObjectRef, w_cls: PyObjectRef) -> Result<bool, PyError> {
+    let mut w_derived = w_derived;
+    loop {
+        if is_w(w_derived, w_cls) {
+            return Ok(true);
+        }
+        let w_bases = match _get_bases(w_derived)? {
+            Some(b) => b,
+            None => return Ok(false),
+        };
+        let n = unsafe { w_tuple_len(w_bases) };
+        if n == 0 {
+            return Ok(false);
+        }
+        let last_index = n - 1;
+        for i in 0..last_index {
+            let base = match unsafe { w_tuple_getitem(w_bases, i as i64) } {
+                Some(b) => b,
+                None => return Ok(false),
+            };
+            if p_abstract_issubclass_w(base, w_cls)? {
+                return Ok(true);
+            }
+        }
+        w_derived = match unsafe { w_tuple_getitem(w_bases, last_index as i64) } {
+            Some(b) => b,
+            None => return Ok(false),
+        };
+    }
+}
+
+/// abstractinst.py:150-169 `p_recursive_issubclass_w`. The both-types
+/// fast path is the common case; otherwise both arguments are validated
+/// via `check_class()` before entering the abstract walk.
+unsafe fn p_recursive_issubclass_w(
+    w_derived: PyObjectRef,
+    w_cls: PyObjectRef,
+) -> Result<bool, PyError> {
+    if is_type(w_cls) && is_type(w_derived) {
+        return Ok(issubtype_w(w_derived, w_cls));
+    }
+    check_class(w_derived, "issubclass() arg 1 must be a class")?;
+    check_class(
+        w_cls,
+        "issubclass() arg 2 must be a class or tuple of classes",
+    )?;
+    p_abstract_issubclass_w(w_derived, w_cls)
+}
+
+/// pypy/module/__builtin__/abstractinst.py:91-122
 /// `abstract_isinstance_w(space, w_obj, w_klass_or_tuple, allow_override=True)`.
 /// Handles tuple/union recursion, the `__instancecheck__` override
 /// looked up via `space.lookup(w_klass_or_tuple, "__instancecheck__")`,
-/// then the recursive type-MRO walk default.
+/// then the abstract `__class__`/`__bases__` walk.
 pub fn isinstance(obj: PyObjectRef, classinfo: PyObjectRef) -> Result<bool, PyError> {
     let obj = unwrap_cell(obj);
     let classinfo = unwrap_cell(classinfo);
@@ -1396,8 +1529,8 @@ pub fn isinstance(obj: PyObjectRef, classinfo: PyObjectRef) -> Result<bool, PyEr
         // proxy's typedef wrapper installed via `proxy_typedef_dict`
         // visible. For real type objects pyre's `type` does not yet
         // install an `__instancecheck__` slot, so this falls through
-        // to `isinstance_w` below — semantics-equivalent to PyPy's
-        // `type.__instancecheck__` slot calling back into
+        // to `p_recursive_isinstance_w` below — semantics-equivalent to
+        // PyPy's `type.__instancecheck__` slot calling back into
         // `p_recursive_isinstance_type_w`.
         if let Some(cls_type) = crate::typedef::r#type(classinfo) {
             if let Some(check) = lookup_in_type(cls_type, "__instancecheck__") {
@@ -1405,20 +1538,19 @@ pub fn isinstance(obj: PyObjectRef, classinfo: PyObjectRef) -> Result<bool, PyEr
                 return Ok(is_true(result));
             }
         }
-        // abstractinst.py:74-88 — p_recursive_isinstance_type_w default.
-        Ok(isinstance_w(obj, classinfo))
+        p_recursive_isinstance_w(obj, classinfo)
     }
 }
 
-/// pypy/module/__builtin__/abstractinst.py:172-200
+/// pypy/module/__builtin__/abstractinst.py:169-198
 /// `abstract_issubclass_w(space, w_derived, w_klass_or_tuple, allow_override=True)`.
 /// Tuple/union recursion, `__subclasscheck__` override looked up on
-/// `type(classinfo)`, then the recursive type-MRO walk default.
+/// `type(classinfo)`, then the abstract `__bases__` walk.
 pub fn issubclass(derived: PyObjectRef, classinfo: PyObjectRef) -> Result<bool, PyError> {
     let derived = unwrap_cell(derived);
     let classinfo = unwrap_cell(classinfo);
     unsafe {
-        // abstractinst.py:184-188 — tuple recursion.
+        // abstractinst.py:181-187 — tuple recursion.
         if is_tuple(classinfo) {
             let n = w_tuple_len(classinfo);
             for i in 0..n {
@@ -1442,7 +1574,7 @@ pub fn issubclass(derived: PyObjectRef, classinfo: PyObjectRef) -> Result<bool, 
             }
             return Ok(false);
         }
-        // abstractinst.py:191-198 — `__subclasscheck__` override.
+        // abstractinst.py:190-196 — `__subclasscheck__` override.
         // Same `lookup_in_type(type(classinfo), …)` rationale as
         // `isinstance` above.
         if let Some(cls_type) = crate::typedef::r#type(classinfo) {
@@ -1451,8 +1583,7 @@ pub fn issubclass(derived: PyObjectRef, classinfo: PyObjectRef) -> Result<bool, 
                 return Ok(is_true(result));
             }
         }
-        // p_recursive_issubclass_w default — abstractinst.py:155-169.
-        Ok(issubtype_w(derived, classinfo))
+        p_recursive_issubclass_w(derived, classinfo)
     }
 }
 
@@ -4952,6 +5083,79 @@ mod tests {
         }
         let result = super::contains(list, needle).expect("contains failed");
         assert!(result, "1 should be in [1, 2, 3]");
+    }
+
+    /// abstractinst.py:53-72 — `isinstance(5, 6)` must raise TypeError
+    /// from `check_class()`, not silently return False from a naive
+    /// `isinstance_w` walk. PyPy test: `test_builtin.py:605`.
+    #[test]
+    fn test_isinstance_non_class_arg2_raises_typeerror() {
+        crate::typedef::init_typeobjects();
+        let err = super::isinstance(w_int_new(5), w_int_new(6)).unwrap_err();
+        assert!(matches!(err.kind, PyErrorKind::TypeError));
+        assert!(err.message.contains("isinstance() arg 2"));
+    }
+
+    /// abstractinst.py:108-114 + 53-72 — when one tuple element is not a
+    /// class the recursion must surface the TypeError from `check_class`.
+    #[test]
+    fn test_isinstance_tuple_with_non_class_raises_typeerror() {
+        crate::typedef::init_typeobjects();
+        let float_type = unsafe { crate::typedef::r#type(w_float_new(0.0)).unwrap() };
+        let bad = w_tuple_new(vec![float_type, w_int_new(6)]);
+        let err = super::isinstance(w_int_new(5), bad).unwrap_err();
+        assert!(matches!(err.kind, PyErrorKind::TypeError));
+    }
+
+    /// abstractinst.py:150-169 — `issubclass(5, int)` must raise
+    /// TypeError because the first argument is not a class.
+    #[test]
+    fn test_issubclass_non_class_arg1_raises_typeerror() {
+        crate::typedef::init_typeobjects();
+        let int_type = unsafe { crate::typedef::r#type(w_int_new(0)).unwrap() };
+        let err = super::issubclass(w_int_new(5), int_type).unwrap_err();
+        assert!(matches!(err.kind, PyErrorKind::TypeError));
+        assert!(err.message.contains("issubclass() arg 1"));
+    }
+
+    /// abstractinst.py:150-169 — `issubclass(int, 6)` must raise
+    /// TypeError because the second argument is not a class.
+    #[test]
+    fn test_issubclass_non_class_arg2_raises_typeerror() {
+        crate::typedef::init_typeobjects();
+        let int_type = unsafe { crate::typedef::r#type(w_int_new(0)).unwrap() };
+        let err = super::issubclass(int_type, w_int_new(6)).unwrap_err();
+        assert!(matches!(err.kind, PyErrorKind::TypeError));
+        assert!(err.message.contains("issubclass() arg 2"));
+    }
+
+    /// abstractinst.py:127-147 — `p_abstract_issubclass_w` must walk
+    /// `__bases__` for pseudo-classes (any object that exposes a tuple
+    /// `__bases__` attribute), not just real type objects. We construct
+    /// `outer` whose `__bases__` is `(inner,)` and `inner` whose
+    /// `__bases__` is the empty tuple, then verify
+    /// `issubclass(outer, inner)` returns True via the abstract walk.
+    #[test]
+    fn test_issubclass_pseudo_class_via_bases() {
+        crate::typedef::init_typeobjects();
+        let inner_type = crate::typedef::make_builtin_type("PseudoInner", |ns| {
+            crate::namespace_store(ns, "__bases__", w_tuple_new(vec![]));
+        });
+        let inner = pyre_object::instanceobject::w_instance_new(inner_type);
+        let outer_type = crate::typedef::make_builtin_type("PseudoOuter", |ns| {
+            // closure capture is fine — make_builtin_type runs init eagerly.
+        });
+        // Stash __bases__ on outer's type dict pointing at the inner instance.
+        crate::namespace_store(
+            unsafe {
+                &mut *(pyre_object::w_type_get_dict_ptr(outer_type) as *mut crate::PyNamespace)
+            },
+            "__bases__",
+            w_tuple_new(vec![inner]),
+        );
+        let outer = pyre_object::instanceobject::w_instance_new(outer_type);
+        let yes = super::issubclass(outer, inner).expect("issubclass should succeed");
+        assert!(yes);
     }
 }
 
