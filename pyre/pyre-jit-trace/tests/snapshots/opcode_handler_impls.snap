@@ -1,18 +1,27 @@
-// `OpcodeHandler` trait impls for `MIFrame` — template form.
+// `OpcodeHandler` trait impls for `MIFrame` — variant section, part 1.
 //
-// `pyre/pyre-jit-trace/build.rs` reads this file and writes it verbatim to
-// `OUT_DIR/jit_trace_trait_impls.rs`, which `lib.rs` then `include!`s once at
-// crate root. The generated path goes through OUT_DIR (instead of being a
-// regular `mod ...;` here) so that future phases of the eval-loop automation
-// (per-opcode jitcode emission, MIFrame jitcode dispatch) can swap in
-// codegen-derived content without disturbing the include path.
+// `pyre/pyre-jit-trace/build.rs` assembles `OUT_DIR/jit_trace_trait_impls.rs`
+// from THREE pieces:
 //
-// **drift warning**: this file is currently a *transcription* of what the
-// hand-written impls in trace_opcode.rs used to look like. helpers it calls
-// (e.g. `MIFrame::push_value`, `crate::state::namespace_slot_direct`) live in
-// the same crate; if you change those, you almost certainly need to change
-// the matching impl block here too. `tests/trait_impls_snapshot.rs` guards
-// against unintended drift by comparing against a checked-in snapshot.
+//   1. this file (`opcode_handler_impls_pre.template.rs`) — header +
+//      `SharedOpcodeHandler` impl. Variant trait, hand-maintained.
+//   2. `majit_codewriter::handler_spec::emit_simple_trait_impls()` — the 5
+//      simple traits (`Constant/Stack/Truth/Iter/Local`) emitted from the
+//      spec table in `majit-codewriter/src/handler_spec.rs`.
+//   3. `opcode_handler_impls_post.template.rs` — the remaining variant
+//      traits (`ControlFlow/Branch/Namespace/Arithmetic`).
+//
+// `lib.rs` `include!`s the assembled file once at crate root. Phase D will
+// replace the simple-trait emit with codegen-derived dispatch through
+// `BlackholeInterpreter::dispatch_one()` against the per-opcode jitcode
+// produced by Phase C.
+//
+// **drift warning**: this file is a *transcription* of variant `MIFrame`
+// helper logic. The helpers it calls (e.g. `MIFrame::push_value`,
+// `MIFrame::call_callable_value`) live in the same crate; if you change
+// those, you almost certainly need to change the matching impl block here
+// too. `tests/trait_impls_snapshot.rs` guards against unintended drift by
+// comparing the assembled output against a checked-in snapshot.
 
 impl pyre_interpreter::SharedOpcodeHandler for crate::state::MIFrame {
     type Value = crate::state::FrontendOp;
