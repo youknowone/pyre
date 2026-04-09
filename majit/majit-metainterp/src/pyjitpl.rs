@@ -3148,10 +3148,12 @@ impl<M: Clone> MetaInterp<M> {
         self.force_finish_trace = false;
         let mut ctx = self.tracing.take().unwrap();
         ctx.apply_replacements();
-        // pyjitpl.py:3199 compile_done_with_this_frame: store_token_in_vable
-        // is recorded BEFORE the FINISH op so the JIT-compiled exit path
-        // sets the vable token and emits GUARD_NOT_FORCED_2.
-        ctx.store_token_in_vable();
+        // pyjitpl.py:3199 compile_done_with_this_frame parity:
+        // `store_token_in_vable` (SetfieldGc on vable_token + the
+        // accompanying GUARD_NOT_FORCED_2) is recorded by the pyre
+        // frontend right before TraceAction::Finish is emitted, so the
+        // guard captures fresh resumedata via the proper
+        // `MIFrame::generate_guard` path.
         let green_key = ctx.green_key;
 
         let mut recorder = ctx.recorder;
