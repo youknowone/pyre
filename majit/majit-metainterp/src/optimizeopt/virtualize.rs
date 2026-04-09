@@ -549,10 +549,20 @@ impl OptVirtualize {
 
     /// virtualize.py:60-65 make_virtual_raw_slice
     ///
-    /// Create a `RawSlicePtrInfo` aliasing `parent` at byte offset `offset`.
-    /// `source_op` is the trace op (typically `INT_ADD`) whose result becomes
-    /// the slice. PtrInfo is set on `source_op.pos` and the slice is treated
-    /// as virtual until forced.
+    ///     def make_virtual_raw_slice(self, offset, parent, source_op):
+    ///         opinfo = info.RawSlicePtrInfo(offset, parent)
+    ///         newop = self.replace_op_with(source_op, source_op.getopnum(),
+    ///                                    args=[source_op.getarg(0), ConstInt(offset)])
+    ///         newop.set_forwarded(opinfo)
+    ///         return opinfo
+    ///
+    /// `parent` is the *immediate* predecessor (a `RawBufferPtrInfo` or
+    /// another `RawSlicePtrInfo`) — RPython stores the PtrInfo object
+    /// directly; majit stores its `OpRef` and resolves through
+    /// `ctx.get_ptr_info`. Slice offsets are NOT flattened at creation;
+    /// `info.RawSlicePtrInfo.getitem_raw` recursively delegates via
+    /// `self.parent.getitem_raw(self.offset + offset, ...)`, so the
+    /// equivalent walk happens at access time in `resolve_raw_slice`.
     fn make_virtual_raw_slice(
         &mut self,
         offset: usize,
@@ -1131,10 +1141,23 @@ impl OptVirtualize {
 
     /// virtualize.py:255-266 optimize_INT_ADD
     ///
-    /// Detect `INT_ADD(rawbuf_or_slice, constant_offset)` against a virtual
-    /// raw buffer (or an existing slice into one) and replace it with a
-    /// new `RawSlicePtrInfo` so subsequent reads/writes through the result
-    /// fold against the parent buffer.
+    ///     def optimize_INT_ADD(self, op):
+    ///         opinfo = getrawptrinfo(op.getarg(0))
+    ///         offsetbox = self.get_constant_box(op.getarg(1))
+    ///         if opinfo and opinfo.is_virtual() and offsetbox is not None:
+    ///             offset = offsetbox.getint()
+    ///             if (isinstance(opinfo, info.RawBufferPtrInfo) or
+    ///                 isinstance(opinfo, info.RawSlicePtrInfo)):
+    ///                 self.make_virtual_raw_slice(offset, opinfo, op)
+    ///                 return
+    ///         return self.emit(op)
+    ///
+    /// `parent` is the immediate predecessor's PtrInfo (RPython) — in
+    /// majit we pass the immediate predecessor's `OpRef`. The slice does
+    /// NOT flatten the offset chain at creation time; subsequent
+    /// raw_load/store walk the chain via `resolve_raw_slice` and
+    /// accumulate offsets. This matches `info.RawSlicePtrInfo.getitem_raw`,
+    /// which delegates to `self.parent.getitem_raw(self.offset + offset, ...)`.
     fn optimize_int_add(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         if op.num_args() < 2 {
             return OptimizationResult::PassOn;
@@ -1145,22 +1168,8 @@ impl OptVirtualize {
         };
         let info = ctx.get_ptr_info(arg0).cloned();
         match info {
-            Some(PtrInfo::VirtualRawBuffer(_)) => {
-                if offset < 0 {
-                    return OptimizationResult::PassOn;
-                }
+            Some(PtrInfo::VirtualRawBuffer(_)) | Some(PtrInfo::VirtualRawSlice(_)) => {
                 self.make_virtual_raw_slice(offset as usize, arg0, op, ctx);
-                OptimizationResult::Remove
-            }
-            Some(PtrInfo::VirtualRawSlice(slice)) => {
-                if offset < 0 {
-                    return OptimizationResult::PassOn;
-                }
-                let total = slice
-                    .offset
-                    .checked_add(offset as usize)
-                    .unwrap_or(slice.offset);
-                self.make_virtual_raw_slice(total, slice.parent, op, ctx);
                 OptimizationResult::Remove
             }
             _ => OptimizationResult::PassOn,

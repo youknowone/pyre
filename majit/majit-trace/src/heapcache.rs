@@ -317,8 +317,10 @@ pub struct HeapCache {
     /// 0 = unknown, 1 = non-null, 2 = null.
     known_nullity: Vec<u8>,
 
-    /// heapcache.py: cached_arraylen — cached array lengths.
-    cached_arraylen: HashMap<(OpRef, u32), OpRef>,
+    /// heapcache.py:589-596 arraylen_now_known stores the length in
+    /// `box._heapc_deps[0]`. majit keeps a per-box map keyed only by the
+    /// array OpRef — the array length is independent of descr.
+    cached_arraylen: HashMap<OpRef, OpRef>,
 
     /// RPython: FrontendOp flag. Vec<bool> indexed by OpRef.0.
     likely_virtual: Vec<bool>,
@@ -700,14 +702,24 @@ impl HeapCache {
         vb_insert(&mut self.seen_allocation, opref);
     }
 
-    /// heapcache.py: new_array(box, lengthbox)
-    /// Record a new array allocation. Constant-length arrays are also
-    /// marked as likely_virtual.
-    pub fn new_array(&mut self, opref: OpRef, length_is_const: bool) {
+    /// heapcache.py:508-516 new_array
+    ///
+    ///     def new_array(self, box, lengthbox):
+    ///         assert isinstance(box, RefFrontendOp)
+    ///         self.update_version(box)
+    ///         flags = HF_SEEN_ALLOCATION | HF_KNOWN_NULLITY
+    ///         if isinstance(lengthbox, Const):
+    ///             # only constant-length arrays are virtuals
+    ///             flags |= HF_LIKELY_VIRTUAL | HF_IS_UNESCAPED
+    ///         add_flags(box, flags)
+    ///         self.arraylen_now_known(box, lengthbox)
+    pub fn new_array(&mut self, opref: OpRef, lengthbox: OpRef, length_is_const: bool) {
         if opref.is_constant() {
             return;
         }
-        vb_insert(&mut self.is_unescaped, opref);
+        // RPython sets HF_SEEN_ALLOCATION | HF_KNOWN_NULLITY unconditionally,
+        // and adds HF_LIKELY_VIRTUAL | HF_IS_UNESCAPED only when the length
+        // is a constant (so the optimizer can virtualize it).
         vb_insert(&mut self.seen_allocation, opref);
         {
             let _i = opref.0 as usize;
@@ -718,7 +730,10 @@ impl HeapCache {
         };
         if length_is_const {
             vb_insert(&mut self.likely_virtual, opref);
+            vb_insert(&mut self.is_unescaped, opref);
         }
+        // heapcache.py:516: self.arraylen_now_known(box, lengthbox)
+        self.arraylen_now_known(opref, lengthbox);
     }
 
     /// heapcache.py: nonstandard_virtualizables_now_known(box)
@@ -1015,6 +1030,196 @@ impl HeapCache {
         self.invalidate_caches_varargs(opnum, _descr, argboxes);
     }
 
+    /// heapcache.py:378-381 _clear_caches_arraycopy
+    ///
+    ///     def _clear_caches_arraycopy(self, opnum, descr, argboxes, effectinfo):
+    ///         self._clear_caches_arrayop(argboxes[1], argboxes[2],
+    ///                                    argboxes[3], argboxes[4], argboxes[5],
+    ///                                    effectinfo)
+    pub fn _clear_caches_arraycopy(
+        &mut self,
+        _opnum: OpCode,
+        _descr: Option<()>,
+        argboxes: &[OpRef],
+        single_write_descr_array: Option<u32>,
+    ) {
+        // argboxes layout from RPython oopspec ll_arraycopy:
+        //   [func, src, dst, srcstart, dststart, length]
+        if argboxes.len() < 6 {
+            self.reset_keep_likely_virtuals();
+            return;
+        }
+        self._clear_caches_arrayop(
+            argboxes[1],
+            argboxes[2],
+            argboxes[3],
+            argboxes[4],
+            argboxes[5],
+            single_write_descr_array,
+        );
+    }
+
+    /// heapcache.py:383-386 _clear_caches_arraymove
+    ///
+    ///     def _clear_caches_arraymove(self, opnum, descr, argboxes, effectinfo):
+    ///         self._clear_caches_arrayop(argboxes[1], argboxes[1],
+    ///                                    argboxes[2], argboxes[3], argboxes[4],
+    ///                                    effectinfo)
+    pub fn _clear_caches_arraymove(
+        &mut self,
+        _opnum: OpCode,
+        _descr: Option<()>,
+        argboxes: &[OpRef],
+        single_write_descr_array: Option<u32>,
+    ) {
+        // argboxes layout from RPython oopspec ll_arraymove:
+        //   [func, arr, srcstart, dststart, length]
+        if argboxes.len() < 5 {
+            self.reset_keep_likely_virtuals();
+            return;
+        }
+        self._clear_caches_arrayop(
+            argboxes[1],
+            argboxes[1],
+            argboxes[2],
+            argboxes[3],
+            argboxes[4],
+            single_write_descr_array,
+        );
+    }
+
+    /// heapcache.py:388-447 _clear_caches_arrayop
+    ///
+    ///     def _clear_caches_arrayop(self, source_box, dest_box,
+    ///                               source_start_box, dest_start_box, length_box,
+    ///                               effectinfo):
+    ///         seen_allocation_of_target = self._check_flag(dest_box,
+    ///                                                      HF_SEEN_ALLOCATION)
+    ///         if (isinstance(source_start_box, ConstInt) and
+    ///             isinstance(dest_start_box, ConstInt) and
+    ///             isinstance(length_box, ConstInt) and
+    ///             effectinfo.single_write_descr_array is not None):
+    ///             ...per-index copy from source to dest...
+    ///             return
+    ///         elif effectinfo.single_write_descr_array is not None:
+    ///             ...wholesale clear of dest descr submap...
+    ///             return
+    ///         self.reset_keep_likely_virtuals()
+    ///
+    /// `const_value` resolves a constant-namespace OpRef to its raw `i64`.
+    /// RPython reads `box.getint()` directly from the ConstInt; majit needs
+    /// a callback because HeapCache has no constant pool of its own.
+    pub fn _clear_caches_arrayop_with_consts(
+        &mut self,
+        source_box: OpRef,
+        dest_box: OpRef,
+        source_start_box: OpRef,
+        dest_start_box: OpRef,
+        length_box: OpRef,
+        single_write_descr_array: Option<u32>,
+        const_value: impl Fn(OpRef) -> Option<i64>,
+    ) {
+        let seen_allocation_of_target = self.saw_allocation(dest_box);
+        let srcstart = const_value(source_start_box);
+        let dststart = const_value(dest_start_box);
+        let length = const_value(length_box);
+        if let (Some(srcstart), Some(dststart), Some(length), Some(descr)) =
+            (srcstart, dststart, length, single_write_descr_array)
+        {
+            // heapcache.py:405-411: pick iteration direction.
+            // ARRAYMOVE with srcstart < dststart needs reverse-order to
+            // avoid clobbering values it still needs to read.
+            let (mut index_current, index_delta, index_stop): (i64, i64, i64) =
+                if srcstart < dststart {
+                    (length - 1, -1, -1)
+                } else {
+                    (0, 1, length)
+                };
+            while index_current != index_stop {
+                let i = index_current;
+                index_current += index_delta;
+                debug_assert!(i >= 0);
+                // heapcache.py:418-422: read the source value...
+                let value = self
+                    .heap_array_cache
+                    .get(&descr)
+                    .and_then(|m| m.get(&((srcstart + i) as u32)))
+                    .and_then(|entry| {
+                        // RPython: indexcache.read(box) — looks up `box`
+                        // in cache_anything / cache_seen_allocation.
+                        let saw = self.saw_allocation(source_box);
+                        if saw {
+                            entry.cache_seen_allocation.get(&source_box).copied()
+                        } else {
+                            entry.cache_anything.get(&source_box).copied()
+                        }
+                    });
+                // heapcache.py:423-429: ...and write it to the dest cell.
+                if let Some(value) = value {
+                    let dst_index = (dststart + i) as u32;
+                    let entry = self
+                        .heap_array_cache
+                        .entry(descr)
+                        .or_default()
+                        .entry(dst_index)
+                        .or_insert_with(CacheEntry::new);
+                    // RPython setarrayitem -> indexcache.do_write_with_aliasing.
+                    // We approximate by writing into the appropriate sub-map.
+                    if seen_allocation_of_target {
+                        entry.cache_seen_allocation.insert(dest_box, value);
+                    } else {
+                        entry.cache_anything.insert(dest_box, value);
+                    }
+                } else {
+                    // heapcache.py:430-436: source had no cached value, so
+                    // the dest's existing entry must be invalidated.
+                    if let Some(idx_cache) = self
+                        .heap_array_cache
+                        .get_mut(&descr)
+                        .and_then(|m| m.get_mut(&((dststart + i) as u32)))
+                    {
+                        idx_cache._clear_cache_on_write(seen_allocation_of_target);
+                    }
+                }
+            }
+            return;
+        }
+        // heapcache.py:438-446: known descr but non-constant indexes — clear
+        // the entire dest descr submap.
+        if let Some(descr) = single_write_descr_array {
+            if let Some(submap) = self.heap_array_cache.get_mut(&descr) {
+                for entry in submap.values_mut() {
+                    entry._clear_cache_on_write(seen_allocation_of_target);
+                }
+            }
+            return;
+        }
+        // heapcache.py:447: total fallback.
+        self.reset_keep_likely_virtuals();
+    }
+
+    /// Convenience entrypoint with no constant resolution — falls through
+    /// to `reset_keep_likely_virtuals` whenever indices cannot be evaluated.
+    pub fn _clear_caches_arrayop(
+        &mut self,
+        source_box: OpRef,
+        dest_box: OpRef,
+        source_start_box: OpRef,
+        dest_start_box: OpRef,
+        length_box: OpRef,
+        single_write_descr_array: Option<u32>,
+    ) {
+        self._clear_caches_arrayop_with_consts(
+            source_box,
+            dest_box,
+            source_start_box,
+            dest_start_box,
+            length_box,
+            single_write_descr_array,
+            |_| None,
+        );
+    }
+
     /// Alias kept for parity with older callsites.
     pub fn invalidate_caches_varargs_alias(
         &mut self,
@@ -1166,16 +1371,36 @@ impl HeapCache {
 
     // ── Array length caching (heapcache.py arraylen_now_known / arraylen) ──
 
-    /// Record a known array length.
-    /// heapcache.py: arraylen_now_known(array, length)
-    pub fn arraylen_now_known(&mut self, array: OpRef, descr: u32, length: OpRef) {
-        self.cached_arraylen.insert((array, descr), length);
+    /// heapcache.py:579-586 arraylen
+    ///
+    ///     def arraylen(self, box):
+    ///         if (isinstance(box, RefFrontendOp) and
+    ///             self.test_head_version(box) and
+    ///             box._heapc_deps is not None):
+    ///             res_box = box._heapc_deps[0]
+    ///             if res_box is not None:
+    ///                 return maybe_replace_with_const(res_box)
+    ///         return None
+    pub fn arraylen(&self, array: OpRef) -> Option<OpRef> {
+        self.cached_arraylen.get(&array).copied()
     }
 
-    /// Look up a cached array length.
-    /// heapcache.py: arraylen(array)
-    pub fn arraylen(&self, array: OpRef, descr: u32) -> Option<OpRef> {
-        self.cached_arraylen.get(&(array, descr)).copied()
+    /// heapcache.py:588-596 arraylen_now_known
+    ///
+    ///     def arraylen_now_known(self, box, lengthbox):
+    ///         # we store in '_heapc_deps' a list of boxes: the *first* box
+    ///         # is the known length or None, and the remaining boxes are
+    ///         # the regular dependencies.
+    ///         if isinstance(box, Const):
+    ///             return
+    ///         deps = self._get_deps(box)
+    ///         assert deps is not None
+    ///         deps[0] = lengthbox
+    pub fn arraylen_now_known(&mut self, array: OpRef, length: OpRef) {
+        if array.is_constant() {
+            return;
+        }
+        self.cached_arraylen.insert(array, length);
     }
 
     // ── Likely virtual tracking (heapcache.py is_likely_virtual) ──
@@ -1240,10 +1465,47 @@ impl HeapCache {
 
     // ── Reset variants ──
 
-    /// Reset the entire cache state.
+    /// heapcache.py:163-181 reset
+    ///
+    ///     def reset(self):
+    ///         # Global reset of all flags. Update both version numbers so
+    ///         # that any access to '_heapc_flags' will be marked as outdated.
+    ///         assert self.head_version < _HF_VERSION_MAX
+    ///         self.head_version += _HF_VERSION_INC
+    ///         self.likely_virtual_version = self.head_version
+    ///         #
+    ///         # heap cache
+    ///         self.heap_cache = {}
+    ///         self.heap_array_cache = {}
+    ///         self.need_guard_not_invalidated = True
+    ///         #
+    ///         # result of one loop invariant call
+    ///         self.loop_invariant_result = None
+    ///         self.loop_invariant_descr = None
+    ///         self.loop_invariant_arg0int = -1
+    ///
+    /// majit also clears the standalone `Vec<bool>` flags
+    /// (`is_unescaped`/`seen_allocation`/...) because those are NOT version-
+    /// gated like RPython's `_heapc_flags` — version bump alone would not
+    /// invalidate them.
     pub fn reset(&mut self) {
+        // heapcache.py:166-168: bump head_version, sync likely_virtual_version.
+        assert!(self.head_version < HF_VERSION_MAX);
+        self.head_version += HF_VERSION_INC;
+        self.likely_virtual_version = self.head_version;
+        // heapcache.py:172-175: clear heap_cache + heap_array_cache.
         self.field_cache.clear();
         self.array_cache.clear();
+        self.heap_cache.clear();
+        self.heap_array_cache.clear();
+        // heapcache.py:176: need_guard_not_invalidated = True
+        self.need_guard_not_invalidated = true;
+        // heapcache.py:179-181: loop_invariant_result/descr/arg0int reset.
+        self.loopinvariant_descr = None;
+        self.loopinvariant_arg0 = None;
+        self.loopinvariant_result = None;
+        // majit-only: standalone Vec<bool> flags are not version-gated, so
+        // a version bump cannot invalidate them. Clear them explicitly.
         self.known_class.clear();
         self.quasi_immut_known.clear();
         self.is_unescaped.clear();
@@ -1251,11 +1513,7 @@ impl HeapCache {
         self.known_nullity.clear();
         self.cached_arraylen.clear();
         self.likely_virtual.clear();
-        self.loopinvariant_descr = None;
-        self.loopinvariant_arg0 = None;
-        self.loopinvariant_result = None;
         self.escape_deps.clear();
-        self.need_guard_not_invalidated = true;
     }
 
     /// heapcache.py:176: check and consume need_guard_not_invalidated.
@@ -1271,21 +1529,27 @@ impl HeapCache {
         self.need_guard_not_invalidated
     }
 
-    /// heapcache.py: reset_keep_likely_virtuals — clear caches but
-    /// preserve likely_virtual flags and loopinvariant results.
+    /// heapcache.py:183-189 reset_keep_likely_virtuals
     ///
-    /// In RPython, called after non-elidable calls that release the GIL.
-    /// pyre has no GIL (no-GIL Python), so this method has no production
-    /// call site — kept for API parity and potential future use.
+    ///     def reset_keep_likely_virtuals(self):
+    ///         # Update only 'head_version', but 'likely_virtual_version'
+    ///         # remains at its older value.
+    ///         assert self.head_version < _HF_VERSION_MAX
+    ///         self.head_version += _HF_VERSION_INC
+    ///         self.heap_cache = {}
+    ///         self.heap_array_cache = {}
+    ///
+    /// `likely_virtual`, `loopinvariant_*`, `escape_deps`, and
+    /// `need_guard_not_invalidated` are intentionally preserved (a residual
+    /// call that releases the GIL invalidates heap caches but the JIT can
+    /// still trust prior allocation/likely-virtual hints).
     pub fn reset_keep_likely_virtuals(&mut self) {
         assert!(self.head_version < HF_VERSION_MAX);
-        self.bump_head_version();
+        self.head_version += HF_VERSION_INC;
         self.field_cache.clear();
         self.array_cache.clear();
         self.heap_cache.clear();
         self.heap_array_cache.clear();
-        // RPython: likely_virtual, loopinvariant_call_cache, escape_deps,
-        // need_guard_not_invalidated are NOT cleared.
     }
 
     /// RPython-compatible alias kept for existing codepaths.
@@ -1515,11 +1779,10 @@ mod tests {
     fn test_arraylen_caching() {
         let mut cache = HeapCache::new();
         let arr = OpRef(5);
-        let descr = 42;
 
-        assert_eq!(cache.arraylen(arr, descr), None);
-        cache.arraylen_now_known(arr, descr, OpRef(100));
-        assert_eq!(cache.arraylen(arr, descr), Some(OpRef(100)));
+        assert_eq!(cache.arraylen(arr), None);
+        cache.arraylen_now_known(arr, OpRef(100));
+        assert_eq!(cache.arraylen(arr), Some(OpRef(100)));
     }
 
     #[test]
