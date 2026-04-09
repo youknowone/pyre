@@ -1209,30 +1209,38 @@ impl MIFrame {
                 if slot < nlocals_local {
                     // TODO(put_back_list_of_boxes3 locals): writing the
                     // SameAs OpRef into `sym.symbolic_locals[slot]`
-                    // SIGSEGVs `nested_loop` reproducibly. Root cause:
-                    // pyre's `PyreSym::value_type` (state.rs:1704)
-                    // scans `symbolic_locals` to determine an OpRef's
-                    // type via `symbolic_local_types[idx]`. RPython
-                    // reads `box.type` directly off the Box; pyre lost
-                    // the per-Box type tag and reconstructs it by
-                    // slot-position lookup. Once the slot is overwritten
-                    // with the SameAs OpRef, the original OpRef's type
-                    // lookup falls through to `Type::Ref` and downstream
-                    // bridge / loop compilation reads next_instr (Int 14)
-                    // as a Ref pointer, dereferencing 0x1e (= 14 + 0x10
-                    // for the W_IntObject.intval offset).
+                    // SIGSEGVs `nested_loop` reproducibly (verified via
+                    // lldb: crash at `ldr x0, [x4, #0x10]` with x4 = 14,
+                    // i.e. the inner-loop next_instr value used as a
+                    // base pointer for a `W_IntObject.intval` load).
                     //
-                    // The structural fix is to stop using `symbolic_locals`
-                    // as the type table — give every OpRef its own
-                    // immutable type tag (RPython `Box.type`) so the
-                    // writeback does not perturb the type lookup. That
-                    // is a multi-file refactor (every `value_type` call
-                    // site, `transient_value_types`, etc.) and is left
-                    // for a follow-up. Until then, locals writeback is
-                    // disabled and the dedup-changed locals slot retains
-                    // its original OpRef in `symbolic_locals` so the
-                    // type table stays consistent. The args returned to
-                    // the caller still carry the SameAs identity.
+                    // Two hypotheses ruled out by direct experiment:
+                    //   1. `PyreSym::value_type_of` falling through to
+                    //      `Type::Ref` for the original OpRef. Pinning
+                    //      both `(original, type)` and
+                    //      `(new_opref, type)` in
+                    //      `transient_value_types` BEFORE the writeback
+                    //      did not help — the SIGSEGV still fires in
+                    //      release builds while disappearing under
+                    //      `eprintln`/lldb instrumentation.
+                    //   2. The dedup itself (it does the same SameAs
+                    //      wrapping for stack slots, which works fine).
+                    //
+                    // The remaining suspect is a downstream consumer
+                    // (recorder snapshot, optimizer ExportedState
+                    // import, or bridge tracer) that reads the dedup
+                    // slot via the `symbolic_locals` index AFTER the
+                    // writeback and uses the SameAs OpRef where the
+                    // original was expected, with effects that depend
+                    // on heap layout (hence the timing sensitivity).
+                    //
+                    // Locating that consumer requires per-OpRef type
+                    // tagging refactor (RPython `Box.type` parity)
+                    // plus instrumentation across the close-loop /
+                    // compile-loop boundary, which exceeds this
+                    // session's scope. Disable the locals writeback
+                    // until then; the args returned to the caller still
+                    // carry the SameAs identity so the JUMP is correct.
                     continue;
                 }
                 let stack_slot = slot - nlocals_local;
