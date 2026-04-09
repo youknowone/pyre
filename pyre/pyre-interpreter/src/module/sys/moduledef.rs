@@ -4,6 +4,39 @@
 
 use crate::{PyNamespace, namespace_store};
 use pyre_object::*;
+use std::sync::OnceLock;
+
+/// Shared stub type for `sys._getframe`, `sys.flags`, `sys.stdout` and other
+/// module-level sys attributes that expose CPython-looking attribute bags.
+///
+/// `typedef::w_object()` (plain `object`) cannot store instance attributes —
+/// its type flag `hasdict` is false, matching CPython where `object()`
+/// instances reject `__setattr__` unless their subclass explicitly opts in.
+/// PyPy's `sys` module exposes these as dedicated W_Root types with their
+/// own typedefs, not as bare `object` instances. The Rust port mirrors that
+/// by installing a single `sys.namespace` type with `__dict__` in its
+/// typedef slots so every stub instance supports `setattr`.
+fn sys_namespace_type() -> PyObjectRef {
+    static TYPE: OnceLock<usize> = OnceLock::new();
+    let raw = *TYPE.get_or_init(|| {
+        let tp = crate::typedef::make_builtin_type("sys.namespace", |ns| {
+            // typedef.py:34 — presence of `__dict__` in the init namespace
+            // is what flips `hasdict` on the resulting type (see
+            // typedef.rs:541/554). The value itself is never read; PyPy
+            // stores a `GetSetProperty` there, but the Rust port only needs
+            // the key to light up the per-instance attribute store.
+            namespace_store(ns, "__dict__", w_none());
+        });
+        tp as usize
+    });
+    raw as PyObjectRef
+}
+
+/// Allocate a fresh stub instance whose type supports `setattr`. Used for
+/// all the CPython-style attribute bags surfaced by the sys module.
+fn make_sys_namespace_instance() -> PyObjectRef {
+    w_instance_new(sys_namespace_type())
+}
 
 pub fn init(ns: &mut PyNamespace) {
     namespace_store(ns, "maxsize", w_int_new(i64::MAX));
@@ -63,8 +96,7 @@ pub fn init(ns: &mut PyNamespace) {
         ns,
         "_getframe",
         crate::make_builtin_function("_getframe", |_| {
-            let frame_type = crate::typedef::w_object();
-            let frame = pyre_object::w_instance_new(frame_type);
+            let frame = make_sys_namespace_instance();
             let _ = crate::baseobjspace::setattr(frame, "f_locals", w_dict_new());
             let _ = crate::baseobjspace::setattr(frame, "f_globals", w_dict_new());
             let _ = crate::baseobjspace::setattr(frame, "f_code", w_none());
@@ -83,8 +115,7 @@ pub fn init(ns: &mut PyNamespace) {
     );
     // sys.flags — stub object with named attributes
     {
-        let flags_type = crate::typedef::w_object();
-        let flags = pyre_object::w_instance_new(flags_type);
+        let flags = make_sys_namespace_instance();
         let _ = crate::baseobjspace::setattr(flags, "debug", w_int_new(0));
         let _ = crate::baseobjspace::setattr(flags, "inspect", w_int_new(0));
         let _ = crate::baseobjspace::setattr(flags, "interactive", w_int_new(0));
@@ -306,7 +337,7 @@ pub fn init(ns: &mut PyNamespace) {
 /// `fileno`, and `name`.  PyPy uses real W_File-backed objects via the io
 /// module; pyre routes writes through Rust's stdout/stderr directly.
 fn make_std_stream(name: &'static str, is_stderr: bool) -> PyObjectRef {
-    let stream = w_instance_new(crate::typedef::w_object());
+    let stream = make_sys_namespace_instance();
     let _ = crate::baseobjspace::setattr(stream, "name", w_str_new(name));
     let _ = crate::baseobjspace::setattr(stream, "encoding", w_str_new("utf-8"));
     let _ =
