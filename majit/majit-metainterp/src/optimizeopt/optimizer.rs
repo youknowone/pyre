@@ -2475,47 +2475,11 @@ impl Optimizer {
 
         // Preserve final context for jump_to_existing_trace.
         let ops = std::mem::take(&mut ctx.new_operations);
-        // resume.py:204-207 + regalloc.py:1206 parity:
-        // RPython's `_gettagged` tags `isinstance(box, Const)` arguments
-        // as TAGCONST, so they never appear in `liveboxes` (the backend's
-        // failargs equivalent). RPython's `Const` is a separate type from
-        // `Box`, so a `Box` whose `_forwarded` was set to a `Const` by
-        // `make_constant` is still a `Box` and the regalloc check passes.
-        //
-        // majit's flat OpRef model conflates the two: every entry in the
-        // `constants` HashMap (both true constant-pool refs >=
-        // OpRef::CONST_BASE and trace-result refs that became
-        // `Forwarded::Const` via `make_constant`) makes the backend's
-        // `regalloc.py:1206` fail_args check trip. We can't drop
-        // make-constant'd OpRefs from `constants` wholesale — codegen for
-        // ops that take them as args still needs to fold the immediate.
-        //
-        // Filter fail_args here, AFTER all `propagate_postprocess`
-        // passes have completed, so any `make_constant` that fired in
-        // OptRewrite postprocess (rewrite.py:352-371 / 303-305) is
-        // visible. Replacing the constant fail_arg with `OpRef::NONE`
-        // mirrors RPython's `liveboxes[i] = None` for non-TAGBOX entries
-        // (resume.py:411-412); the actual value is recoverable via
-        // rd_consts when the snapshot path runs, or via the inputarg
-        // load slot for no-snapshot test guards.
-        let mut filtered_ops = ops;
-        for op in filtered_ops.iter_mut() {
-            if !op.opcode.is_guard() {
-                continue;
-            }
-            let Some(ref mut fail_args) = op.fail_args else {
-                continue;
-            };
-            for fa in fail_args.iter_mut() {
-                if fa.is_none() {
-                    continue;
-                }
-                if constants.contains_key(&fa.0) {
-                    *fa = OpRef::NONE;
-                }
-            }
-        }
-        let ops = filtered_ops;
+        // resume.py:411-417 parity: store_final_boxes_in_guard
+        // (mod.rs:2261) already replaces TAGCONST/TAGVIRTUAL fail_args
+        // entries with OpRef::NONE via the snapshot-driven numbering pass
+        // (`liveboxes = [None] * n; liveboxes[i] = box for TAGBOX`).
+        // No additional const filtering is needed here.
         if crate::optimizeopt::majit_log_enabled() {
             let cmf_count = ops.iter().filter(|o| o.opcode.is_call_may_force()).count();
             let gnf_count = ops

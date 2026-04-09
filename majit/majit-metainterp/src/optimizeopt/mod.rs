@@ -2295,6 +2295,16 @@ impl OptContext {
                 self.finalize_guard_resume_data(op);
                 return;
             }
+            // resume.py:396-397: RPython asserts resume_position >= 0.
+            // Without a snapshot AND without a patchguardop fallback, the
+            // guard has no resume context and the runtime guard-fail path
+            // cannot recover. Drop the guard's resume data so the backend
+            // emits a sentinel descr that triggers loop invalidation
+            // instead of running undefined resume code.
+            //
+            // Phase A (snapshot wiring through finish_and_compile) +
+            // patchguardop fallback should make this branch dead in
+            // practice; flag it via MAJIT_LOG so any regression surfaces.
             if std::env::var_os("MAJIT_LOG").is_some() {
                 eprintln!(
                     "[jit][drop] no-snapshot guard {:?} pos={:?} resume_pos={}",
