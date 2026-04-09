@@ -79,6 +79,17 @@ fn main() {
     let out_dir = std::env::var("OUT_DIR").unwrap();
     std::fs::write(format!("{out_dir}/jit_trace_gen.rs"), &code).unwrap();
 
+    // Trait impls go in a separate file because lib.rs `include!`s
+    // jit_trace_gen.rs twice (once at crate root and once inside
+    // `pub mod generated`). Trait impls would conflict (E0119) under double
+    // inclusion, so they live in their own file included only once.
+    let trait_impls_code = majit_codewriter::generate_trait_impls_string();
+    std::fs::write(
+        format!("{out_dir}/jit_trace_trait_impls.rs"),
+        &trait_impls_code,
+    )
+    .unwrap();
+
     // JSON metadata for debugging
     let json = serde_json::to_string_pretty(&pipeline).unwrap();
     std::fs::write(format!("{out_dir}/jit_metadata.json"), &json).unwrap();
