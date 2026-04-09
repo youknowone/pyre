@@ -1000,6 +1000,19 @@ impl TraceCtx {
         self.vable_setfield_descr(vbox, force_token, token_descr);
         // pyjitpl.py:3236 self.generate_guard(rop.GUARD_NOT_FORCED_2)
         self.record_guard(OpCode::GuardNotForced2, &[], 0);
+        // pyjitpl.py:2558-2602 generate_guard / capture_resumedata parity:
+        // RPython's generate_guard always captures resumedata at the
+        // current framestack pc. `gen_store_back_in_vable` doesn't change
+        // the framestack between the previous guard and this one, so the
+        // most recently captured snapshot (from the trailing guard, e.g.
+        // GuardNoOverflow on the IntAddOvf result) describes the same
+        // active boxes that this GUARD_NOT_FORCED_2 needs for recovery.
+        // Inherit it so `store_final_boxes_in_guard` can finalize this
+        // guard's resume data without falling back to the panic branch.
+        let snapshot_id = self.recorder.snapshots().len() as i32 - 1;
+        if snapshot_id >= 0 {
+            self.recorder.set_last_op_resume_position(snapshot_id);
+        }
     }
 
     /// pyjitpl.py:3465-3497 `MetaInterp.gen_store_back_in_vable(box)`.
