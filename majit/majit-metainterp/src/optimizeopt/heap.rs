@@ -473,10 +473,6 @@ pub struct OptHeap {
     field_descr_map: HashMap<u32, DescrRef>,
     /// heap.py: cached array lengths.
     cached_arraylens: HashMap<(OpRef, u32), OpRef>,
-    /// heap.py: arrayinfo.getlenbound() — minimum known array lengths.
-    /// When GETARRAYITEM_GC with constant index N is seen, the array
-    /// must have length >= N+1. Tracked per array OpRef.
-    array_min_lengths: HashMap<OpRef, i64>,
 }
 
 impl OptHeap {
@@ -498,8 +494,26 @@ impl OptHeap {
             quasi_immut_cache: HashMap::new(),
             field_descr_map: HashMap::new(),
             cached_arraylens: HashMap::new(),
-            array_min_lengths: HashMap::new(),
         }
+    }
+
+    /// heap.py:674-681 / 725-732 / 749-756
+    /// `arrayinfo = self.ensure_ptr_info_arg0(op)` followed by
+    /// `arrayinfo.getlenbound(None).make_gt_const(index)`.
+    fn ensure_ptr_info_arg0(&mut self, op: &Op, ctx: &mut OptContext) -> OpRef {
+        let array = ctx.get_box_replacement(op.arg(0));
+        if ctx.get_ptr_info(array).is_none() {
+            if let Some(descr) = op.descr.clone() {
+                ctx.set_ptr_info(
+                    array,
+                    crate::optimizeopt::info::PtrInfo::array(
+                        descr,
+                        crate::optimizeopt::intutils::IntBound::nonnegative(),
+                    ),
+                );
+            }
+        }
+        array
     }
 
     /// heapcache.py:295-309 _escape_box: escape a box and transitively
@@ -1591,15 +1605,14 @@ impl OptHeap {
                 }
             }
             // heap.py line 701: make_nonnull(op.getarg(0))
-            let array_ref = ctx.get_box_replacement(op.arg(0));
+            let array_ref = self.ensure_ptr_info_arg0(op, ctx);
             vb_set(&mut self.known_nonnull, array_ref.0);
             // heap.py line 681: arrayinfo.getlenbound(None).make_gt_const(index)
-            // Record that array length >= index + 1
             if const_index >= 0 {
-                let min_len = const_index + 1;
-                let entry = self.array_min_lengths.entry(array_ref).or_insert(0);
-                if min_len > *entry {
-                    *entry = min_len;
+                if let Some(crate::optimizeopt::info::PtrInfo::Array(arrayinfo)) =
+                    ctx.get_ptr_info_mut(array_ref)
+                {
+                    let _ = arrayinfo.lenbound.make_gt_const(const_index);
                 }
             }
             if let Some(info) = ctx.get_ptr_info_mut(array_ref) {
@@ -1651,7 +1664,6 @@ impl OptHeap {
                         submap.invalidate_index(index);
                     }
                 }
-                self.array_min_lengths.clear();
                 // heap.py:316-317 cache_varindex_write -- cache this write so that
                 // a subsequent read with the same variable index can hit.
                 if let Some(descr) = op.descr.as_ref() {
@@ -1952,16 +1964,6 @@ impl OptHeap {
                     return OptimizationResult::Remove;
                 }
                 self.cached_arraylens.insert((array, descr_idx), op.pos);
-                // heap.py: transfer array length bound to the ARRAYLEN result
-                // by writing it onto the box's _forwarded slot directly
-                // (optimizer.py:115-125 setintbound). intbounds reads this
-                // through ctx.getintbound and uses it to eliminate length
-                // guards.
-                if let Some(&min_len) = self.array_min_lengths.get(&array) {
-                    let mut bound = crate::optimizeopt::intutils::IntBound::unbounded();
-                    let _ = bound.make_ge_const(min_len);
-                    ctx.setintbound(op.pos, &bound);
-                }
                 OptimizationResult::Emit(op.clone())
             }
 
@@ -2253,7 +2255,6 @@ impl Optimization for OptHeap {
         self.prior_emitted_was_removed = false;
         self.quasi_immut_cache.clear();
         self.cached_arraylens.clear();
-        self.array_min_lengths.clear();
     }
 
     fn flush(&mut self, ctx: &mut OptContext) {
