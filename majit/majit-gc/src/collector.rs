@@ -447,6 +447,20 @@ impl MiniMarkGC {
             }
         });
 
+        // incminimark parity: during an active marking cycle, old objects
+        // remembered by the write barrier may already be black. Requeue
+        // those black objects so the major collector rescans their new
+        // outgoing references before sweep.
+        if self.incr_state.marking_in_progress {
+            let remembered_now: Vec<usize> = self.remembered_set.iter().copied().collect();
+            for obj_addr in remembered_now {
+                let hdr = unsafe { header_of(obj_addr) };
+                if hdr.has_flag(flags::VISITED) {
+                    self.incr_state.gray_stack.push(obj_addr);
+                }
+            }
+        }
+
         // Phase 2: Process remembered set and transitive closure.
         let mut idx = 0;
         loop {
