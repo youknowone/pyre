@@ -1197,6 +1197,26 @@ impl MIFrame {
         // it here exercises the path for the rare stack-live cases and
         // leaves a clear extension point for locals writeback once the
         // nested_loop regression is understood.
+        // pyjitpl.py:1578 put_back_list_of_boxes3(self, jcposition, redboxes):
+        //     # no exception, which means that the jit_merge_point did not
+        //     # close the loop.  We have to put the possibly-modified list
+        //     # 'redboxes' back into the registers where it comes from.
+        //     put_back_list_of_boxes3(self, jcposition, redboxes)
+        //
+        // Write the SameAs-wrapped OpRefs back to the current frame's
+        // symbolic state for each slot the dedup actually changed, so the
+        // snapshot path that runs next (GuardFutureCondition fail_args from
+        // `sym`) carries the same identity the JUMP args / merge-point
+        // original_boxes already hold. Only changed slots are written —
+        // identity slots stay untouched, preserving pyre's nested-loop
+        // tracer's expected frame state on the non-close path.
+        // Writeback only the stack slots: locals writeback regresses
+        // nested_loop with a SIGSEGV. The failure mode is still under
+        // investigation — stack slots at a merge point are usually empty,
+        // so in practice this loop is almost always a no-op, but keeping
+        // it here exercises the path for the rare stack-live cases and
+        // leaves a clear extension point for locals writeback once the
+        // nested_loop regression is understood.
         if !dedup_changed.is_empty() {
             let header = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
             let nlocals_local = nlocals;
@@ -1209,56 +1229,14 @@ impl MIFrame {
                 if slot < nlocals_local {
                     // TODO(put_back_list_of_boxes3 locals): writing the
                     // SameAs OpRef into `sym.symbolic_locals[slot]`
-                    // SIGSEGVs `nested_loop` reproducibly. Investigation
-                    // notes from this session:
-                    //
-                    // *Per-slot bisect*: writing back ONLY locals[0]
-                    // (the running sum `s`) reproduces the SIGSEGV;
-                    // writing back ONLY locals[2] (the inner counter
-                    // `j`) keeps the test passing. The dedup OpRefs are
-                    // both Ref-typed constants (`OpRef(2147483657)` for
-                    // s, `OpRef(2147483648)` for j), wrapped in
-                    // `SameAsR`, with the same target type as
-                    // `inputarg_types[5]` / `inputarg_types[7]`. The
-                    // type-mismatch hypothesis is therefore ruled out.
-                    //
-                    // *Write-then-restore experiment*: writing the
-                    // new OpRef and immediately restoring the original
-                    // does NOT crash, ruling out allocation-ordering
-                    // side effects on `Vec` storage.
-                    //
-                    // *Cause*: a downstream consumer of
-                    // `sym.symbolic_locals[0]` reads the slot AFTER the
-                    // writeback and uses the SameAsR OpRef where the
-                    // pre-dedup constant was expected. Likely
-                    // candidates: the GuardFutureCondition snapshot
-                    // captured immediately after this loop reads
-                    // `sym.symbolic_locals` via
-                    // `build_virtualizable_boxes` /
-                    // `get_list_of_active_boxes`, and the resulting
-                    // resume identity drift only manifests when the
-                    // post-dedup OpRef is `s` because `s` is the only
-                    // local that flows back into the next iteration's
-                    // loop label inputarg. (Slot 2 = `j` is reset to
-                    // const 0 at the inner loop entry, so its dedup
-                    // wrapping never reaches the outer loop.)
-                    //
-                    // The proper fix requires the snapshot path to
-                    // honour the dedup mapping (RPython parity:
-                    // remove_consts_and_duplicates' in-place
-                    // mutation of self.virtualizable_boxes is followed
-                    // by a fresh capture_resumedata in
-                    // `generate_guard(GUARD_FUTURE_CONDITION)`, which
-                    // sees the SameAs identities directly). Pyre's
-                    // snapshot path is structurally similar but the
-                    // resume-side decoder evidently treats the SameAs
-                    // wrapping as a fresh value rather than a synonym.
-                    // Locating that decoder requires per-OpRef type tag
-                    // refactor (RPython `Box.type` parity) plus
-                    // resume-data instrumentation, which exceeds this
-                    // session's scope. Disable the locals writeback
-                    // until then; the args returned to the caller still
-                    // carry the SameAs identity so the JUMP is correct.
+                    // SIGSEGVs `nested_loop` reproducibly. Both eager
+                    // (pre-GuardFutureCondition) and deferred
+                    // (post-snapshot) writeback positions reproduce the
+                    // crash, ruling out the snapshot capture path as
+                    // the sole consumer. Per-slot bisect localises the
+                    // failure to slot 0 (running sum `s`); slot 2 (`j`)
+                    // alone is safe. Detailed diagnosis is in commit
+                    // 27c3206048.
                     continue;
                 }
                 let stack_slot = slot - nlocals_local;
