@@ -28,10 +28,6 @@ pub struct OptIntBounds {
     /// (e.g., INT_OR with non-overlapping ranges = INT_ADD).
     /// Key: (opcode, arg0, arg1), Value: result OpRef.
     pure_from_args_cache: Vec<(OpCode, OpRef, OpRef, OpRef)>,
-    /// Deferred guard bounds propagation. When a guard's comparison op
-    /// is postponed by the heap pass, find_producing_op can't find it.
-    /// Store (cond_ref, is_guard_true) and retry on next op.
-    pending_guard_bounds: Option<(OpRef, bool)>,
 }
 
 impl OptIntBounds {
@@ -42,26 +38,6 @@ impl OptIntBounds {
             last_emitted_opcode: None,
             last_emitted_args: Vec::new(),
             last_emitted_ref: OpRef::NONE,
-            pending_guard_bounds: None,
-        }
-    }
-
-    /// Retry deferred guard bounds propagation. By the time the next op
-    /// arrives, the heap pass has flushed the postponed comparison.
-    fn flush_pending_guard_bounds(&mut self, ctx: &mut OptContext) {
-        let pending = match self.pending_guard_bounds.take() {
-            Some(p) => p,
-            None => return,
-        };
-        let (cond_ref, is_true) = pending;
-        if let Some(producing_op) = self.find_producing_op(cond_ref, ctx) {
-            if producing_op.opcode.returns_bool() {
-                if is_true {
-                    self.setintbound(cond_ref, IntBound::from_constant(1));
-                }
-                let producing_op = producing_op.clone();
-                self.propagate_bounds_from_comparison(&producing_op, is_true, ctx);
-            }
         }
     }
 
@@ -786,240 +762,6 @@ impl OptIntBounds {
         ctx.new_operations.iter().rfind(|op| op.pos == cond_ref)
     }
 
-    /// Propagate bounds backward after GUARD_TRUE.
-    /// The condition (cond_ref) is known to produce a nonzero value (true).
-    fn propagate_bounds_from_guard_true(&mut self, cond_ref: OpRef, ctx: &mut OptContext) {
-        if let Some(producing_op) = self.find_producing_op(cond_ref, ctx) {
-            if producing_op.opcode.returns_bool() {
-                self.setintbound(cond_ref, IntBound::from_constant(1));
-                let producing_op = producing_op.clone();
-                self.propagate_bounds_from_comparison(&producing_op, true, ctx);
-                return;
-            }
-        } else if ctx.imported_label_args.is_some() {
-            // Defer only in Phase 2 (has imported_label_args) where the
-            // comparison is postponed by the heap pass and bounds
-            // propagation is needed for overflow elimination in loop bodies.
-            // Phase 1 (preamble) also has skip_flush but doesn't need
-            // deferred propagation.
-            self.pending_guard_bounds = Some((cond_ref, true));
-        }
-
-        let b0 = self.getintbound(cond_ref, ctx);
-        if b0.known_nonnegative() {
-            let _ = self.get_bound_mut(cond_ref).make_gt_const(0);
-        } else if b0.known_le_const(0) {
-            let _ = self.get_bound_mut(cond_ref).make_lt_const(0);
-        }
-    }
-
-    /// Propagate bounds backward after GUARD_FALSE.
-    /// The condition is known to produce 0 (false).
-    fn propagate_bounds_from_guard_false(&mut self, cond_ref: OpRef, ctx: &mut OptContext) {
-        self.setintbound(cond_ref, IntBound::from_constant(0));
-
-        if let Some(producing_op) = self.find_producing_op(cond_ref, ctx) {
-            if producing_op.opcode.returns_bool() {
-                let producing_op = producing_op.clone();
-                self.propagate_bounds_from_comparison(&producing_op, false, ctx);
-            }
-        } else if ctx.imported_label_args.is_some() {
-            self.pending_guard_bounds = Some((cond_ref, false));
-        }
-    }
-
-    /// Given that a comparison op produced `is_true`, narrow the bounds of its arguments.
-    fn propagate_bounds_from_comparison(&mut self, op: &Op, is_true: bool, ctx: &mut OptContext) {
-        // RPython intbounds.py parity: resolve through get_box_replacement
-        // so bounds are stored on the canonical OpRef. Without this, SameAs
-        // forwarding (e.g. OpRef(44) → OpRef(39)) causes bounds to be set
-        // on the stale OpRef while subsequent lookups resolve to the
-        // canonical one, losing the bound information.
-        let arg0 = ctx.get_box_replacement(op.arg(0));
-
-        // Handle unary ops
-        match op.opcode {
-            OpCode::IntIsTrue => {
-                if is_true {
-                    // nonzero
-                    let b0 = self.getintbound(arg0, ctx);
-                    if b0.known_nonnegative() {
-                        let _ = self.get_bound_mut(arg0).make_gt_const(0);
-                    } else if b0.known_le_const(0) {
-                        let _ = self.get_bound_mut(arg0).make_lt_const(0);
-                    }
-                } else {
-                    // zero
-                    let _ = self.get_bound_mut(arg0).make_eq_const(0);
-                }
-                return;
-            }
-            OpCode::IntIsZero => {
-                if is_true {
-                    // the value is zero
-                    let _ = self.get_bound_mut(arg0).make_eq_const(0);
-                } else {
-                    // the value is nonzero
-                    let b0 = self.getintbound(arg0, ctx);
-                    if b0.known_nonnegative() {
-                        let _ = self.get_bound_mut(arg0).make_gt_const(0);
-                    } else if b0.known_le_const(0) {
-                        let _ = self.get_bound_mut(arg0).make_lt_const(0);
-                    }
-                }
-                return;
-            }
-            _ => {}
-        }
-
-        let arg1 = if op.num_args() > 1 {
-            ctx.get_box_replacement(op.arg(1))
-        } else {
-            return;
-        };
-
-        match op.opcode {
-            OpCode::IntLt => {
-                if is_true {
-                    self.make_int_lt(arg0, arg1, ctx);
-                } else {
-                    self.make_int_ge(arg0, arg1, ctx);
-                }
-            }
-            OpCode::IntLe => {
-                if is_true {
-                    self.make_int_le(arg0, arg1, ctx);
-                } else {
-                    self.make_int_gt(arg0, arg1, ctx);
-                }
-            }
-            OpCode::IntGt => {
-                if is_true {
-                    self.make_int_gt(arg0, arg1, ctx);
-                } else {
-                    self.make_int_le(arg0, arg1, ctx);
-                }
-            }
-            OpCode::IntGe => {
-                if is_true {
-                    self.make_int_ge(arg0, arg1, ctx);
-                } else {
-                    self.make_int_lt(arg0, arg1, ctx);
-                }
-            }
-            OpCode::IntEq => {
-                if is_true {
-                    self.make_eq(arg0, arg1, ctx);
-                } else {
-                    self.make_ne(arg0, arg1, ctx);
-                }
-            }
-            OpCode::IntNe => {
-                if is_true {
-                    self.make_ne(arg0, arg1, ctx);
-                } else {
-                    self.make_eq(arg0, arg1, ctx);
-                }
-            }
-            OpCode::UintLt => {
-                if is_true {
-                    self.make_unsigned_lt(arg0, arg1, ctx);
-                } else {
-                    self.make_unsigned_ge(arg0, arg1, ctx);
-                }
-            }
-            OpCode::UintLe => {
-                if is_true {
-                    self.make_unsigned_le(arg0, arg1, ctx);
-                } else {
-                    self.make_unsigned_gt(arg0, arg1, ctx);
-                }
-            }
-            OpCode::UintGt => {
-                if is_true {
-                    self.make_unsigned_gt(arg0, arg1, ctx);
-                } else {
-                    self.make_unsigned_le(arg0, arg1, ctx);
-                }
-            }
-            OpCode::UintGe => {
-                if is_true {
-                    self.make_unsigned_ge(arg0, arg1, ctx);
-                } else {
-                    self.make_unsigned_lt(arg0, arg1, ctx);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// Narrow bounds from a comparison without calling propagate_bounds_backward.
-    /// Safe to call from propagate_postprocess — avoids cascading
-    /// make_constant_int / send_extra_operation side effects.
-    fn narrow_bounds_from_comparison(&mut self, op: &Op, is_true: bool, ctx: &mut OptContext) {
-        let arg0 = ctx.get_box_replacement(op.arg(0));
-        let arg1 = if op.num_args() > 1 {
-            ctx.get_box_replacement(op.arg(1))
-        } else {
-            return;
-        };
-        match op.opcode {
-            OpCode::IntLt => {
-                if is_true {
-                    let b1 = self.getintbound(arg1, ctx);
-                    let _ = self.get_bound_mut(arg0).make_lt(&b1);
-                    let b0 = self.getintbound(arg0, ctx);
-                    let _ = self.get_bound_mut(arg1).make_gt(&b0);
-                } else {
-                    let b0 = self.getintbound(arg0, ctx);
-                    let _ = self.get_bound_mut(arg1).make_le(&b0);
-                    let b1 = self.getintbound(arg1, ctx);
-                    let _ = self.get_bound_mut(arg0).make_ge(&b1);
-                }
-            }
-            OpCode::IntLe => {
-                if is_true {
-                    let b1 = self.getintbound(arg1, ctx);
-                    let _ = self.get_bound_mut(arg0).make_le(&b1);
-                    let b0 = self.getintbound(arg0, ctx);
-                    let _ = self.get_bound_mut(arg1).make_ge(&b0);
-                } else {
-                    let b0 = self.getintbound(arg0, ctx);
-                    let _ = self.get_bound_mut(arg1).make_lt(&b0);
-                    let b1 = self.getintbound(arg1, ctx);
-                    let _ = self.get_bound_mut(arg0).make_gt(&b1);
-                }
-            }
-            OpCode::IntGt => {
-                if is_true {
-                    let b1 = self.getintbound(arg1, ctx);
-                    let _ = self.get_bound_mut(arg0).make_gt(&b1);
-                    let b0 = self.getintbound(arg0, ctx);
-                    let _ = self.get_bound_mut(arg1).make_lt(&b0);
-                } else {
-                    let b0 = self.getintbound(arg0, ctx);
-                    let _ = self.get_bound_mut(arg1).make_ge(&b0);
-                    let b1 = self.getintbound(arg1, ctx);
-                    let _ = self.get_bound_mut(arg0).make_le(&b1);
-                }
-            }
-            OpCode::IntGe => {
-                if is_true {
-                    let b1 = self.getintbound(arg1, ctx);
-                    let _ = self.get_bound_mut(arg0).make_ge(&b1);
-                    let b0 = self.getintbound(arg0, ctx);
-                    let _ = self.get_bound_mut(arg1).make_le(&b0);
-                } else {
-                    let b0 = self.getintbound(arg0, ctx);
-                    let _ = self.get_bound_mut(arg1).make_gt(&b0);
-                    let b1 = self.getintbound(arg1, ctx);
-                    let _ = self.get_bound_mut(arg0).make_lt(&b1);
-                }
-            }
-            _ => {}
-        }
-    }
-
     // ── Bound narrowing helpers ──
 
     /// intbounds.py:564-570 make_int_lt
@@ -1563,9 +1305,6 @@ impl Default for OptIntBounds {
 
 impl Optimization for OptIntBounds {
     fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        // RPython emit-then-propagate parity: retry deferred guard bounds.
-        self.flush_pending_guard_bounds(ctx);
-
         let result = match op.opcode {
             // ── Comparisons ──
             OpCode::IntLt => self.optimize_int_lt(op, ctx),
@@ -2669,15 +2408,14 @@ mod tests {
 
     /// RPython postprocess_GUARD_TRUE parity test:
     /// GuardTrue(IntLt(i, len)) should tighten i's upper bound so that
-    /// IntAddOvf(i, 1) is converted to IntAdd.
-    ///
-    /// This pattern occurs in the nbody inner loop. Currently requires
-    /// the `propagate_postprocess` mechanism (RPython optimizer.py) which
-    /// majit does not yet implement. The deferred propagation workaround
-    /// (pending_guard_bounds) works for Phase 2 only. This test is marked
-    /// `ignore` until `propagate_postprocess` is ported.
+    /// IntAddOvf(i, 1) is converted to IntAdd. This is the nbody inner
+    /// loop pattern. Currently fails because the full propagate_postprocess
+    /// chain that ports intbounds.py:608-651 is not yet wired through the
+    /// default pipeline driver — the existing has_postprocess() path only
+    /// covers `propagate_bounds_backward`, not the comparison-narrowing
+    /// `make_int_lt/le/gt/ge/eq/ne` callbacks.
     #[test]
-    #[ignore = "requires narrow_bounds_from_comparison in postprocess — causes nbody hang"]
+    #[ignore = "needs full intbounds.py:608-651 propagate_bounds_INT_LT/LE/GT/GE/EQ/NE wiring through propagate_postprocess"]
     fn test_guard_true_int_lt_enables_add_ovf_removal() {
         use crate::optimizeopt::optimizer::Optimizer;
 
