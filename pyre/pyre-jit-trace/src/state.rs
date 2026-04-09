@@ -2219,7 +2219,12 @@ impl JitState for PyreJitState {
         );
     }
 
-    fn setup_bridge_sym(sym: &mut Self::Sym, resume_data: &majit_metainterp::ResumeDataResult) {
+    fn setup_bridge_sym(
+        sym: &mut Self::Sym,
+        _ctx: &mut majit_metainterp::TraceCtx,
+        resume_data: &majit_metainterp::ResumeDataResult,
+        _rd_virtuals: Option<&[majit_ir::RdVirtualInfo]>,
+    ) {
         use majit_ir::resumedata::RebuiltValue;
 
         let Some(frame) = resume_data.frames.first() else {
