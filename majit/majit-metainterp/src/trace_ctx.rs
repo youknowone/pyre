@@ -966,21 +966,23 @@ impl TraceCtx {
 
     /// pyjitpl.py:3222-3236 `MetaInterp.store_token_in_vable()`.
     ///
-    ///     def store_token_in_vable(self):
-    ///         vinfo = self.jitdriver_sd.virtualizable_info
-    ///         if vinfo is None:
-    ///             return
-    ///         vbox = self.virtualizable_boxes[-1]
-    ///         if vbox is self.forced_virtualizable:
-    ///             return # we already forced it by hand
-    ///         # in case the force_token has not been recorded, record it here
-    ///         # to make sure we know the virtualizable can be broken. However,
-    ///         # the contents of the virtualizable should be generally correct
-    ///         force_token = self.history.record0(rop.FORCE_TOKEN,
-    ///                                            lltype.nullptr(llmemory.GCREF.TO))
-    ///         self.history.record2(rop.SETFIELD_GC, vbox, force_token,
-    ///                              None, descr=vinfo.vable_token_descr)
-    ///         self.generate_guard(rop.GUARD_NOT_FORCED_2)
+    /// ```text
+    /// def store_token_in_vable(self):
+    ///     vinfo = self.jitdriver_sd.virtualizable_info
+    ///     if vinfo is None:
+    ///         return
+    ///     vbox = self.virtualizable_boxes[-1]
+    ///     if vbox is self.forced_virtualizable:
+    ///         return # we already forced it by hand
+    ///     # in case the force_token has not been recorded, record it here
+    ///     # to make sure we know the virtualizable can be broken. However,
+    ///     # the contents of the virtualizable should be generally correct
+    ///     force_token = self.history.record0(rop.FORCE_TOKEN,
+    ///                                        lltype.nullptr(llmemory.GCREF.TO))
+    ///     self.history.record2(rop.SETFIELD_GC, vbox, force_token,
+    ///                          None, descr=vinfo.vable_token_descr)
+    ///     self.generate_guard(rop.GUARD_NOT_FORCED_2)
+    /// ```
     pub fn store_token_in_vable(&mut self) {
         let info = match self.virtualizable_info.clone() {
             Some(info) => info,
@@ -1002,23 +1004,25 @@ impl TraceCtx {
 
     /// pyjitpl.py:3465-3497 `MetaInterp.gen_store_back_in_vable(box)`.
     ///
-    ///     def gen_store_back_in_vable(self, box):
-    ///         vinfo = self.jitdriver_sd.virtualizable_info
-    ///         if vinfo is not None:
-    ///             # xxx only write back the fields really modified
-    ///             vbox = self.virtualizable_boxes[-1]
-    ///             if vbox is not box:
-    ///                 # ignore the hint on non-standard virtualizable
-    ///                 # specifically, ignore it on a virtual
-    ///                 return
-    ///             if self.forced_virtualizable is not None:
-    ///                 # this can happen only in strange cases, but we don't care
-    ///                 # it was already forced
-    ///                 return
-    ///             self.forced_virtualizable = vbox
-    ///             ...emit SETFIELD_GC for each static field...
-    ///             ...emit SETARRAYITEM_GC for each array item...
-    ///             ...emit final SETFIELD_GC(vbox, NULL, vable_token_descr)...
+    /// ```text
+    /// def gen_store_back_in_vable(self, box):
+    ///     vinfo = self.jitdriver_sd.virtualizable_info
+    ///     if vinfo is not None:
+    ///         # xxx only write back the fields really modified
+    ///         vbox = self.virtualizable_boxes[-1]
+    ///         if vbox is not box:
+    ///             # ignore the hint on non-standard virtualizable
+    ///             # specifically, ignore it on a virtual
+    ///             return
+    ///         if self.forced_virtualizable is not None:
+    ///             # this can happen only in strange cases, but we don't care
+    ///             # it was already forced
+    ///             return
+    ///         self.forced_virtualizable = vbox
+    ///         ...emit SETFIELD_GC for each static field...
+    ///         ...emit SETARRAYITEM_GC for each array item...
+    ///         ...emit final SETFIELD_GC(vbox, NULL, vable_token_descr)...
+    /// ```
     pub fn gen_store_back_in_vable(&mut self, vable_opref: OpRef) {
         let (info, boxes, lengths) = match (
             self.virtualizable_info.clone(),
