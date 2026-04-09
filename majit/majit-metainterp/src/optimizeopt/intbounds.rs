@@ -1201,17 +1201,7 @@ impl OptIntBounds {
     fn propagate_bounds_backward(&mut self, opref: OpRef, ctx: &mut OptContext) {
         let b = self.getintbound(opref, ctx);
         if b.is_constant() {
-            // RPython make_constant_int raises InvalidLoop on bounds
-            // conflict (optimizer.py:420). In majit, shared condition
-            // OpRefs from OptPure CSE can cause conflicts that RPython
-            // never sees. Guard the call to avoid rejecting valid traces.
-            let replaced = ctx.get_box_replacement(opref);
-            let existing = self.getintbound(replaced, ctx);
-            if existing.is_unbounded() || existing.contains(b.get_constant()) {
-                self.make_constant_int_ref(opref, b.get_constant(), ctx);
-            }
-            // If bounds conflict, skip make_constant_int but continue
-            // with backward propagation below.
+            self.make_constant_int_ref(opref, b.get_constant(), ctx);
         }
         if let Some(producing_op) = self.find_producing_op(opref, ctx) {
             let producing_op = producing_op.clone();
