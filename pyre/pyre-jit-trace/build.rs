@@ -104,15 +104,52 @@ fn main() {
     let json = serde_json::to_string_pretty(&pipeline).unwrap();
     std::fs::write(format!("{out_dir}/jit_metadata.json"), &json).unwrap();
 
+    // ── Per-opcode JitCode artifact (Phase C of eval-loop plan) ──
+    //
+    // Each PipelineOpcodeArm has a `jitcode: Option<JitCode>` produced by
+    // assembling its flattened SSARepr. We serialize the per-opcode jitcodes
+    // as a separate JSON file so the runtime loader (`jitcode_table.rs`)
+    // can `include_str!` it without pulling in the full pipeline metadata.
+    //
+    // Format: `[ {"selector": "...", "jitcode": {...}}, ... ]`
+    // The JitCode payload follows the assembler's serde derive.
+    #[derive(serde::Serialize)]
+    struct OpcodeJitCodeEntry<'a> {
+        selector: String,
+        jitcode: &'a majit_codewriter::assembler::JitCode,
+    }
+    let opcode_jitcode_entries: Vec<OpcodeJitCodeEntry<'_>> = pipeline
+        .opcode_dispatch
+        .iter()
+        .filter_map(|arm| {
+            arm.jitcode.as_ref().map(|jc| OpcodeJitCodeEntry {
+                selector: arm.selector.canonical_key(),
+                jitcode: jc,
+            })
+        })
+        .collect();
+    let opcode_jitcodes_json = serde_json::to_string(&opcode_jitcode_entries).unwrap();
+    std::fs::write(
+        format!("{out_dir}/pyre_opcode_jitcodes.json"),
+        &opcode_jitcodes_json,
+    )
+    .unwrap();
+    let total_jitcode_bytes: usize = opcode_jitcode_entries
+        .iter()
+        .map(|e| e.jitcode.code.len())
+        .sum();
+
     // Report
     eprintln!(
-        "[pyre-jit-trace build.rs] canonical analysis: {} opcode arms ({} flattened), {} functions, {} blocks, {} flat ops, generated {} bytes",
+        "[pyre-jit-trace build.rs] canonical analysis: {} opcode arms ({} flattened, {} jitcoded, {} jitcode bytes), {} functions, {} blocks, {} flat ops, generated {} bytes",
         pipeline.opcode_dispatch.len(),
         pipeline
             .opcode_dispatch
             .iter()
             .filter(|arm| arm.flattened.is_some())
             .count(),
+        opcode_jitcode_entries.len(),
+        total_jitcode_bytes,
         pipeline.functions.len(),
         pipeline.total_blocks,
         pipeline.total_ops,
