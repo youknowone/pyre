@@ -4074,15 +4074,22 @@ mod tests {
         numb_state.writer.patch(1, numb_state.num_boxes);
         let rd_numb = numb_state.create_numbering();
 
+        let fail_arg_types = vec![majit_ir::Type::Int, majit_ir::Type::Int];
         let (num_failargs, _vable_values, _vref_values, rebuilt_frames) =
-            rebuild_from_numbering(&rd_numb, memo.consts(), None);
+            rebuild_from_numbering(&rd_numb, memo.consts(), &fail_arg_types, None);
         assert_eq!(num_failargs, 2);
         assert_eq!(rebuilt_frames.len(), 1);
         assert_eq!(rebuilt_frames[0].pc, 8);
         assert_eq!(rebuilt_frames[0].values.len(), 3);
         assert_eq!(rebuilt_frames[0].values[0], RebuiltValue::Int(42));
-        assert_eq!(rebuilt_frames[0].values[1], RebuiltValue::Box(0));
-        assert_eq!(rebuilt_frames[0].values[2], RebuiltValue::Box(1));
+        assert_eq!(
+            rebuilt_frames[0].values[1],
+            RebuiltValue::Box(0, majit_ir::Type::Int)
+        );
+        assert_eq!(
+            rebuilt_frames[0].values[2],
+            RebuiltValue::Box(1, majit_ir::Type::Int)
+        );
     }
 
     #[test]
@@ -4099,13 +4106,20 @@ mod tests {
         numb_state.writer.patch(1, numb_state.num_boxes);
         let rd_numb = numb_state.create_numbering();
 
+        let fail_arg_types = vec![majit_ir::Type::Int, majit_ir::Type::Int];
         let (num_failargs, _vable_values, _vref_values, rebuilt_frames) =
-            rebuild_from_numbering(&rd_numb, memo.consts(), None);
+            rebuild_from_numbering(&rd_numb, memo.consts(), &fail_arg_types, None);
         assert_eq!(num_failargs, 2); // OpRef(1) and OpRef(3) are boxes
         assert_eq!(rebuilt_frames[0].values.len(), 3);
-        assert_eq!(rebuilt_frames[0].values[0], RebuiltValue::Box(0));
+        assert_eq!(
+            rebuilt_frames[0].values[0],
+            RebuiltValue::Box(0, majit_ir::Type::Int)
+        );
         assert_eq!(rebuilt_frames[0].values[1], RebuiltValue::Virtual(0));
-        assert_eq!(rebuilt_frames[0].values[2], RebuiltValue::Box(1));
+        assert_eq!(
+            rebuilt_frames[0].values[2],
+            RebuiltValue::Box(1, majit_ir::Type::Int)
+        );
     }
 
     #[test]
@@ -4182,8 +4196,13 @@ mod tests {
                 _ => 0,
             }
         };
+        let fail_arg_types = vec![
+            majit_ir::Type::Int,
+            majit_ir::Type::Int,
+            majit_ir::Type::Int,
+        ];
         let (num_failargs, _vable_values, _vref_values, rebuilt_frames) =
-            rebuild_from_numbering(&rd_numb, &rd_consts, Some(&frame_count));
+            rebuild_from_numbering(&rd_numb, &rd_consts, &fail_arg_types, Some(&frame_count));
         assert_eq!(num_failargs, 3);
         assert_eq!(rebuilt_frames.len(), 2);
         assert_eq!(rebuilt_frames[0].jitcode_index, 0);
@@ -4216,14 +4235,21 @@ mod tests {
         assert_eq!(liveboxes[1], OpRef(3)); // box #1
 
         // rd_numb should be valid
+        let fail_arg_types = vec![majit_ir::Type::Int, majit_ir::Type::Int];
         let (num_failargs, _vable_values, _vref_values, rebuilt_frames) =
-            rebuild_from_numbering(&rd_numb, &rd_consts, None);
+            rebuild_from_numbering(&rd_numb, &rd_consts, &fail_arg_types, None);
         assert_eq!(num_failargs, 2);
         assert_eq!(rebuilt_frames.len(), 1);
         assert_eq!(rebuilt_frames[0].values[0], RebuiltValue::Int(42));
-        assert_eq!(rebuilt_frames[0].values[1], RebuiltValue::Box(0));
+        assert_eq!(
+            rebuilt_frames[0].values[1],
+            RebuiltValue::Box(0, majit_ir::Type::Int)
+        );
         assert_eq!(rebuilt_frames[0].values[2], RebuiltValue::Virtual(0));
-        assert_eq!(rebuilt_frames[0].values[3], RebuiltValue::Box(1));
+        assert_eq!(
+            rebuilt_frames[0].values[3],
+            RebuiltValue::Box(1, majit_ir::Type::Int)
+        );
     }
 }
 

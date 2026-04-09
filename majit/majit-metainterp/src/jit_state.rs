@@ -100,10 +100,16 @@ impl DeoptMaterializationCache {
 /// (Box/Const/Int/Virtual/Unassigned). `constants` holds constant OpRef
 /// entries for the optimizer constant pool (no RPython equivalent —
 /// RPython uses ConstBox objects natively in the trace recording).
+///
+/// resume.py:1245 `decode_box(num, kind)` parity: each
+/// `RebuiltValue::Box(idx, kind)` carries its own kind, sourced from the
+/// parent guard's `fail_arg_types` at `decode_tagged` time. Consumers
+/// read the kind directly from the variant — no parallel
+/// `fail_arg_types` field on this struct is needed.
 #[derive(Debug, Clone)]
 pub struct ResumeDataResult {
     /// resume.py:1057: per-frame decoded values from rd_numb.
-    /// Each RebuiltValue::Box(i) → liveboxes[i] in RPython.
+    /// Each RebuiltValue::Box(i, kind) → liveboxes[i] in RPython.
     pub frames: Vec<majit_ir::resumedata::RebuiltFrame>,
     /// resume.py:1045: virtualizable boxes (decoded from vable section).
     pub virtualizable_values: Vec<majit_ir::resumedata::RebuiltValue>,
@@ -113,20 +119,6 @@ pub struct ResumeDataResult {
     /// No RPython equivalent (RPython uses ConstBox natively).
     /// Each entry: (OpRef index >= 10000, raw value, type).
     pub constants: Vec<(u32, i64, Type)>,
-    /// resume.py:1245 decode_box parity: per-livebox kind. RPython's
-    /// `load_box_from_cpu(num, kind)` creates IntFrontendOp/RefFrontendOp/
-    /// FloatFrontendOp by index, where `kind` is determined by the
-    /// callback (`_callback_i/_callback_r/_callback_f`) dispatched through
-    /// `enumerate_vars(info, liveness_info, ...)`. The callback origin IS
-    /// the box `.type`.
-    ///
-    /// In majit/pyre this is the parent guard's `fail_arg_types`
-    /// (`ResumeGuardDescr.fail_arg_types`, compile.py:797), keyed by
-    /// liveboxes index. setup_bridge_sym uses this to type the bridge
-    /// inputarg slots correctly — without it the bridge falls back to
-    /// concrete_slot_types which always returns Type::Ref for W_IntObject
-    /// locals and triggers a spurious unbox path in RETURN_VALUE.
-    pub fail_arg_types: Vec<Type>,
     /// resume.py:1042 num_failargs read from rd_numb header.
     /// Needed by `materialize_bridge_virtual` to translate negative TAGBOX
     /// numbers in `rd_virtuals` fieldnums (resume.py:1556-1564 decode_box:

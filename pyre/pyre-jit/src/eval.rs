@@ -2837,7 +2837,7 @@ fn rebuild_typed_from_rd_numb(
     use majit_ir::resumedata::{RebuiltValue, rebuild_from_numbering};
 
     let (_num_failargs, vable_values, _vref_values, frames) =
-        rebuild_from_numbering(rd_numb, rd_consts, None);
+        rebuild_from_numbering(rd_numb, rd_consts, &exit_layout.exit_types, None);
 
     // resume.py:1045 consume_vref_and_vable_boxes parity.
     // vable_array format: [frame_ptr, ni, code, vsd, ns, locals..., stack...]
@@ -2865,7 +2865,9 @@ fn rebuild_typed_from_rd_numb(
     ) -> Value {
         use majit_ir::resumedata::RebuiltValue;
         match rv {
-            RebuiltValue::Box(idx) => dead_frame_typed.get(*idx).cloned().unwrap_or(Value::Int(0)),
+            RebuiltValue::Box(idx, _) => {
+                dead_frame_typed.get(*idx).cloned().unwrap_or(Value::Int(0))
+            }
             RebuiltValue::Int(i) => Value::Int(*i as i64),
             RebuiltValue::Const(c, tp) => match tp {
                 majit_ir::Type::Int => Value::Int(*c),
@@ -2963,7 +2965,7 @@ fn build_resumed_frames(
     // decoder reads jitcode liveness at the frame's resume pc.
     let cb = pyre_jit_trace::state::frame_value_count_at;
     let (_num_failargs, vable_values, _vref_values, frames) =
-        rebuild_from_numbering(rd_numb, rd_consts, Some(&cb));
+        rebuild_from_numbering(rd_numb, rd_consts, &exit_layout.exit_types, Some(&cb));
 
     let dead_frame_typed = decode_exit_layout_values(raw_values, exit_layout);
     if majit_metainterp::majit_log_enabled() {
@@ -2987,7 +2989,9 @@ fn build_resumed_frames(
     ) -> Value {
         use majit_ir::resumedata::RebuiltValue;
         match rv {
-            RebuiltValue::Box(idx) => dead_frame_typed.get(*idx).cloned().unwrap_or(Value::Int(0)),
+            RebuiltValue::Box(idx, _) => {
+                dead_frame_typed.get(*idx).cloned().unwrap_or(Value::Int(0))
+            }
             RebuiltValue::Int(i) => Value::Int(*i as i64),
             RebuiltValue::Const(c, tp) => match tp {
                 majit_ir::Type::Int => Value::Int(*c),
@@ -3335,7 +3339,9 @@ fn _prepare_next_section(
     let num_failargs = exit_layout.exit_types.len() as i32;
     for val in &frame.values {
         typed.push(match val {
-            RebuiltValue::Box(idx) => dead_frame_typed.get(*idx).cloned().unwrap_or(Value::Int(0)),
+            RebuiltValue::Box(idx, _) => {
+                dead_frame_typed.get(*idx).cloned().unwrap_or(Value::Int(0))
+            }
             RebuiltValue::Const(c, tp) => match tp {
                 majit_ir::Type::Int => Value::Int(*c),
                 majit_ir::Type::Ref => Value::Ref(majit_ir::GcRef(*c as usize)),

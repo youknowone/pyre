@@ -403,8 +403,14 @@ impl ResumeDataLoopMemo {
 /// Decoded value from rd_numb.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RebuiltValue {
-    /// TAGBOX(n): value from deadframe slot n.
-    Box(usize),
+    /// TAGBOX(n, kind): value from deadframe slot n with the kind that
+    /// the parent guard's `fail_arg_types[n]` recorded at numbering time.
+    /// resume.py:1245 `decode_box(num, kind)` parity — RPython resolves
+    /// the kind at decode time from the callback (i/r/f) that the encoder
+    /// dispatched through `enumerate_vars(info, liveness_info, ...)`. The
+    /// box's `.type` matches that kind. majit stores the kind on the
+    /// variant so consumers don't need a parallel `fail_arg_types` lookup.
+    Box(usize, Type),
     /// TAGCONST: compile-time constant with type.
     Const(i64, Type),
     /// TAGINT: small integer encoded inline.
@@ -423,7 +429,12 @@ pub struct RebuiltFrame {
     pub values: Vec<RebuiltValue>,
 }
 
-fn decode_tagged(tagged: i16, num_failargs: i32, rd_consts: &[(i64, Type)]) -> RebuiltValue {
+fn decode_tagged(
+    tagged: i16,
+    num_failargs: i32,
+    rd_consts: &[(i64, Type)],
+    fail_arg_types: &[Type],
+) -> RebuiltValue {
     let (val, tagbits) = untag(tagged);
     match tagbits {
         TAGINT => RebuiltValue::Int(val),
@@ -444,7 +455,12 @@ fn decode_tagged(tagged: i16, num_failargs: i32, rd_consts: &[(i64, Type)]) -> R
             } else {
                 val as usize
             };
-            RebuiltValue::Box(index)
+            // resume.py:1245 decode_box(num, kind) parity — pull the
+            // box's `.type` from the parent guard's fail_arg_types,
+            // which `_number_boxes` populated when encoding via
+            // `env.get_type(opref)`.
+            let kind = fail_arg_types.get(index).copied().unwrap_or(Type::Ref);
+            RebuiltValue::Box(index, kind)
         }
         TAGVIRTUAL => RebuiltValue::Virtual(val as usize),
         _ => RebuiltValue::Unassigned,
@@ -463,9 +479,15 @@ fn decode_tagged(tagged: i16, num_failargs: i32, rd_consts: &[(i64, Type)]) -> R
 /// driven decode). When `None`, all remaining items after `(jitcode_index,
 /// pc)` are consumed as a single frame (backward-compat for callers that
 /// only ever see single-frame data).
+///
+/// `fail_arg_types`: parent guard's per-failarg type vector. resume.py:1245
+/// `decode_box(num, kind)` parity — TAGBOX values use this to fill in their
+/// kind so the resulting `RebuiltValue::Box` carries its own type and
+/// downstream consumers don't need a parallel side channel.
 pub fn rebuild_from_numbering(
     rd_numb: &[u8],
     rd_consts: &[(i64, Type)],
+    fail_arg_types: &[Type],
     frame_value_count: Option<&dyn Fn(i32, i32) -> usize>,
 ) -> (i32, Vec<RebuiltValue>, Vec<RebuiltValue>, Vec<RebuiltFrame>) {
     let mut reader = resumecode::Reader::new(rd_numb);
@@ -481,7 +503,12 @@ pub fn rebuild_from_numbering(
             break;
         }
         let tagged = reader.next_item() as i16;
-        vable_values.push(decode_tagged(tagged, num_failargs, rd_consts));
+        vable_values.push(decode_tagged(
+            tagged,
+            num_failargs,
+            rd_consts,
+            fail_arg_types,
+        ));
     }
 
     // resume.py:1045: virtualref array (pairs).
@@ -492,7 +519,12 @@ pub fn rebuild_from_numbering(
             break;
         }
         let tagged = reader.next_item() as i16;
-        vref_values.push(decode_tagged(tagged, num_failargs, rd_consts));
+        vref_values.push(decode_tagged(
+            tagged,
+            num_failargs,
+            rd_consts,
+            fail_arg_types,
+        ));
     }
 
     // resume.py:1049-1055: frame section — jitcode_index, pc, [tagged_values...].
@@ -518,7 +550,12 @@ pub fn rebuild_from_numbering(
                 break;
             }
             let tagged = reader.next_item() as i16;
-            values.push(decode_tagged(tagged, num_failargs, rd_consts));
+            values.push(decode_tagged(
+                tagged,
+                num_failargs,
+                rd_consts,
+                fail_arg_types,
+            ));
         }
         frames.push(RebuiltFrame {
             jitcode_index,
