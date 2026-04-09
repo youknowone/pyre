@@ -1700,26 +1700,17 @@ impl OptContext {
         }
     }
 
-    /// optimizer.py:99-113 `getintbound(op)` parity assertion: `assert op.type == 'i'`.
-    /// Centralized so getintbound/setintbound/with_intbound_mut/peek_intbound
-    /// all enforce the same type contract as PyPy.
-    fn debug_assert_int_type(&self, opref: OpRef) {
-        debug_assert!(
-            matches!(self.opref_type(opref), Some(majit_ir::Type::Int) | None),
-            "IntBound API called on non-int OpRef: {:?} type={:?}",
-            opref,
-            self.opref_type(opref)
-        );
-    }
-
     /// Read-only variant of `getintbound` — returns the IntBound stored on
     /// `box._forwarded` without materializing an unbounded one on first
     /// access. Returns `None` for boxes that have no IntBound forwarding.
     /// Used by exporters that take `&OptContext` and cannot mutate.
     pub fn peek_intbound(&self, opref: OpRef) -> Option<crate::optimizeopt::intutils::IntBound> {
         use crate::optimizeopt::info::Forwarded;
-        // optimizer.py:100 / 116: assert op.type == 'i'
-        self.debug_assert_int_type(opref);
+        debug_assert!(
+            matches!(self.opref_type(opref), Some(majit_ir::Type::Int) | None),
+            "peek_intbound: expected 'i'-typed OpRef, got {:?}",
+            self.opref_type(opref)
+        );
         let replaced = self.get_box_replacement(opref);
         if let Some(Value::Int(v)) = self.get_constant(replaced) {
             return Some(crate::optimizeopt::intutils::IntBound::from_constant(
@@ -1744,7 +1735,11 @@ impl OptContext {
     pub fn getintbound(&mut self, opref: OpRef) -> crate::optimizeopt::intutils::IntBound {
         use crate::optimizeopt::info::Forwarded;
         // optimizer.py:100: assert op.type == 'i'
-        self.debug_assert_int_type(opref);
+        debug_assert!(
+            matches!(self.opref_type(opref), Some(majit_ir::Type::Int) | None),
+            "getintbound: expected 'i'-typed OpRef, got {:?}",
+            self.opref_type(opref)
+        );
         let replaced = self.get_box_replacement(opref);
         // optimizer.py:102-103: if isinstance(op, ConstInt): return from_constant
         if let Some(Value::Int(v)) = self.get_constant(replaced) {
@@ -1779,7 +1774,11 @@ impl OptContext {
     pub fn setintbound(&mut self, opref: OpRef, bound: &crate::optimizeopt::intutils::IntBound) {
         use crate::optimizeopt::info::Forwarded;
         // optimizer.py:116: assert op.type == 'i'
-        self.debug_assert_int_type(opref);
+        debug_assert!(
+            matches!(self.opref_type(opref), Some(majit_ir::Type::Int) | None),
+            "setintbound: expected 'i'-typed OpRef, got {:?}",
+            self.opref_type(opref)
+        );
         let replaced = self.get_box_replacement(opref);
         if replaced.is_constant() || self.get_constant(replaced).is_some() {
             return;
@@ -1822,8 +1821,11 @@ impl OptContext {
         F: FnOnce(&mut crate::optimizeopt::intutils::IntBound) -> R,
     {
         use crate::optimizeopt::info::Forwarded;
-        // optimizer.py:100 / 116: assert op.type == 'i'
-        self.debug_assert_int_type(opref);
+        debug_assert!(
+            matches!(self.opref_type(opref), Some(majit_ir::Type::Int) | None),
+            "with_intbound_mut: expected 'i'-typed OpRef, got {:?}",
+            self.opref_type(opref)
+        );
         let replaced = self.get_box_replacement(opref);
         if let Some(Value::Int(v)) = self.get_constant(replaced) {
             let mut tmp = crate::optimizeopt::intutils::IntBound::from_constant(*v as i64);
@@ -3005,6 +3007,135 @@ impl OptContext {
         }
         // optimizer.py:448: op.set_forwarded(info.NonNullPtrInfo())
         self.set_ptr_info(resolved, PtrInfo::NonNull { last_guard_pos: -1 });
+    }
+
+    /// optimizer.py:461-499: ensure_ptr_info_arg0(op)
+    ///
+    /// ```python
+    /// def ensure_ptr_info_arg0(self, op):
+    ///     from rpython.jit.metainterp.optimizeopt import vstring
+    ///     arg0 = self.get_box_replacement(op.getarg(0))
+    ///     if arg0.is_constant():
+    ///         return info.ConstPtrInfo(arg0)
+    ///     opinfo = arg0.get_forwarded()
+    ///     if isinstance(opinfo, info.AbstractVirtualPtrInfo):
+    ///         return opinfo
+    ///     elif opinfo is not None:
+    ///         last_guard_pos = opinfo.get_last_guard_pos()
+    ///     else:
+    ///         last_guard_pos = -1
+    ///     assert opinfo is None or opinfo.__class__ is info.NonNullPtrInfo
+    ///     opnum = op.opnum
+    ///     if (rop.is_getfield(opnum) or opnum == rop.SETFIELD_GC or
+    ///         opnum == rop.QUASIIMMUT_FIELD):
+    ///         descr = op.getdescr()
+    ///         parent_descr = descr.get_parent_descr()
+    ///         if parent_descr.is_object():
+    ///             opinfo = info.InstancePtrInfo(parent_descr)
+    ///         else:
+    ///             opinfo = info.StructPtrInfo(parent_descr)
+    ///         opinfo.init_fields(parent_descr, descr.get_index())
+    ///     elif (rop.is_getarrayitem(opnum) or opnum == rop.SETARRAYITEM_GC or
+    ///           opnum == rop.ARRAYLEN_GC):
+    ///         opinfo = info.ArrayPtrInfo(op.getdescr())
+    ///     elif opnum in (rop.GUARD_CLASS, rop.GUARD_NONNULL_CLASS):
+    ///         opinfo = info.InstancePtrInfo()
+    ///     elif opnum in (rop.STRLEN,):
+    ///         opinfo = vstring.StrPtrInfo(vstring.mode_string)
+    ///     elif opnum in (rop.UNICODELEN,):
+    ///         opinfo = vstring.StrPtrInfo(vstring.mode_unicode)
+    ///     else:
+    ///         assert False, "operations %s unsupported" % op
+    ///     assert isinstance(opinfo, info.NonNullPtrInfo)
+    ///     opinfo.last_guard_pos = last_guard_pos
+    ///     arg0.set_forwarded(opinfo)
+    ///     return opinfo
+    /// ```
+    ///
+    /// Returns the resolved arg0 OpRef so callers can fetch the
+    /// freshly-installed PtrInfo via `get_ptr_info(_mut)`. Borrow-checker
+    /// constraint: the PtrInfo lives in `self.forwarded` and would
+    /// otherwise force `&mut self` to extend through the call site.
+    pub fn ensure_ptr_info_arg0(&mut self, op: &Op) -> OpRef {
+        use crate::optimizeopt::info::Forwarded;
+        let arg0 = self.get_box_replacement(op.arg(0));
+        // optimizer.py:464-466: arg0.is_constant() → return ConstPtrInfo(arg0).
+        // Constant arg0s are read-only — no mutation needed; callers fetch
+        // the synthesized ConstPtrInfo via getptrinfo() which materializes a
+        // fresh ConstPtrInfo on demand. Return early so we don't overwrite
+        // the constant slot.
+        if arg0.is_constant() {
+            return arg0;
+        }
+        // optimizer.py:467-473: virtual ptr info → return as-is; non-virtual
+        // PtrInfo → preserve last_guard_pos for the upgrade.
+        let last_guard_pos = match self.get_ptr_info(arg0) {
+            Some(info) if info.is_virtual() => return arg0,
+            Some(info) => info.last_guard_pos().unwrap_or(-1),
+            None => -1,
+        };
+        // optimizer.py:475-495: dispatch on opcode to construct the right
+        // PtrInfo class. The Rust port reuses PtrInfo factory constructors
+        // (`PtrInfo::array`, `PtrInfo::instance`, `PtrInfo::struct_ptr`,
+        // and the StrPtrInfo struct literal).
+        let mut new_info = if op.opcode.is_getfield()
+            || op.opcode == OpCode::SetfieldGc
+            || op.opcode == OpCode::QuasiimmutField
+        {
+            // optimizer.py:476-484: getfield / setfield_gc / quasiimmut_field
+            // → InstancePtrInfo or StructPtrInfo with init_fields. The Rust
+            // port elides parent_descr.is_object() dispatch — majit's
+            // FieldDescr trait does not yet expose `parent_descr`, and
+            // current call sites only need the array branches. Field call
+            // sites construct PtrInfo eagerly via OptVirtualize.
+            //
+            // For parity scaffolding we still install an empty InstancePtrInfo
+            // here so the dispatch shape matches RPython.
+            PtrInfo::instance(op.descr.clone(), None)
+        } else if op.opcode.is_getarrayitem()
+            || op.opcode == OpCode::SetarrayitemGc
+            || op.opcode == OpCode::ArraylenGc
+        {
+            // optimizer.py:485-487: getarrayitem / setarrayitem_gc / arraylen_gc
+            // → ArrayPtrInfo(op.getdescr())
+            let descr = op
+                .descr
+                .clone()
+                .expect("ensure_ptr_info_arg0: array op without descr");
+            PtrInfo::array(descr, crate::optimizeopt::intutils::IntBound::nonnegative())
+        } else if op.opcode == OpCode::GuardClass || op.opcode == OpCode::GuardNonnullClass {
+            // optimizer.py:488-489: guard_class / guard_nonnull_class
+            // → InstancePtrInfo()
+            PtrInfo::instance(None, None)
+        } else if op.opcode == OpCode::Strlen {
+            // optimizer.py:490-491: strlen → StrPtrInfo(mode_string)
+            PtrInfo::Str(crate::optimizeopt::info::StrPtrInfo {
+                lenbound: None,
+                mode: 0,
+                length: -1,
+                last_guard_pos: -1,
+            })
+        } else if op.opcode == OpCode::Unicodelen {
+            // optimizer.py:492-493: unicodelen → StrPtrInfo(mode_unicode)
+            PtrInfo::Str(crate::optimizeopt::info::StrPtrInfo {
+                lenbound: None,
+                mode: 1,
+                length: -1,
+                last_guard_pos: -1,
+            })
+        } else {
+            // optimizer.py:494-495: assert False, "operations %s unsupported"
+            panic!("ensure_ptr_info_arg0: opcode {:?} unsupported", op.opcode);
+        };
+        // optimizer.py:497: opinfo.last_guard_pos = last_guard_pos
+        new_info.set_last_guard_pos(last_guard_pos);
+        // optimizer.py:498: arg0.set_forwarded(opinfo)
+        let idx = arg0.0 as usize;
+        if idx >= self.forwarded.len() {
+            self.forwarded.resize(idx + 1, Forwarded::None);
+        }
+        self.forwarded[idx] = Forwarded::Info(new_info);
+        arg0
     }
 
     /// optimizer.py:453-459: make_nonnull_str — record StrPtrInfo on a string box.
