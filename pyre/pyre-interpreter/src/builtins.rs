@@ -72,50 +72,16 @@ pub fn install_default_builtins(namespace: &mut PyNamespace) {
             crate::call::real_build_class(args)
         })
     });
-    // Type stubs for missing builtin types
+    // bytearrayobject.py W_BytearrayObject — register the real type
+    // (callable as a constructor and usable in isinstance(x, bytearray)).
     namespace.get_or_insert_with("bytearray", || {
-        make_builtin_function("bytearray", |args| {
-            if args.is_empty() {
-                return Ok(pyre_object::bytearrayobject::w_bytearray_new(0));
-            }
-            let arg = args[0];
-            unsafe {
-                if pyre_object::is_int(arg) {
-                    let n = pyre_object::w_int_get_value(arg) as usize;
-                    return Ok(pyre_object::bytearrayobject::w_bytearray_new(n));
-                }
-                if pyre_object::is_str(arg) {
-                    let s = pyre_object::w_str_get_value(arg);
-                    return Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(
-                        s.as_bytes(),
-                    ));
-                }
-            }
-            Ok(pyre_object::bytearrayobject::w_bytearray_new(0))
-        })
+        crate::typedef::gettypeobject(&pyre_object::bytearrayobject::BYTEARRAY_TYPE)
     });
+    // pyre lacks a separate bytes type — alias `bytes` to bytearray so
+    // `isinstance(x, bytes)` succeeds for byte literals (which are also
+    // materialised as bytearray; see ConstantData::Bytes handling).
     namespace.get_or_insert_with("bytes", || {
-        make_builtin_function("bytes", |args| {
-            if args.is_empty() {
-                return Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(&[]));
-            }
-            let arg = args[0];
-            unsafe {
-                if pyre_object::is_int(arg) {
-                    let n = pyre_object::w_int_get_value(arg) as usize;
-                    return Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(
-                        &vec![0u8; n],
-                    ));
-                }
-                if pyre_object::is_str(arg) {
-                    let s = pyre_object::w_str_get_value(arg);
-                    return Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(
-                        s.as_bytes(),
-                    ));
-                }
-            }
-            Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(&[]))
-        })
+        crate::typedef::gettypeobject(&pyre_object::bytearrayobject::BYTEARRAY_TYPE)
     });
     namespace.get_or_insert_with("slice", || {
         // The slice type object, for isinstance(x, slice) checks.
@@ -141,23 +107,7 @@ pub fn install_default_builtins(namespace: &mut PyNamespace) {
         })
     });
     namespace.get_or_insert_with("property", || {
-        make_builtin_function("property", |args| {
-            if args.is_empty() {
-                return Ok(w_none());
-            }
-            let fget = args[0];
-            let fset = if args.len() > 1 {
-                args[1]
-            } else {
-                pyre_object::PY_NULL
-            };
-            let fdel = if args.len() > 2 {
-                args[2]
-            } else {
-                pyre_object::PY_NULL
-            };
-            Ok(pyre_object::w_property_new(fget, fset, fdel))
-        })
+        crate::typedef::gettypeobject(&pyre_object::propertyobject::PROPERTY_TYPE)
     });
     namespace.get_or_insert_with("staticmethod", || {
         crate::typedef::gettypeobject(&pyre_object::propertyobject::STATICMETHOD_TYPE)
@@ -167,8 +117,110 @@ pub fn install_default_builtins(namespace: &mut PyNamespace) {
     });
     namespace.get_or_insert_with("Ellipsis", || w_none());
     namespace.get_or_insert_with("__debug__", || w_bool_from(true));
+    // memoryview stub: pyre doesn't model real buffer protocol, but
+    // re._compiler._bytes_to_codes wants `memoryview(b).cast('I').tolist()`.
+    // We register `memoryview` as a real type whose __new__ stores the
+    // backing bytearray on the instance; .cast('I') and .tolist() do the
+    // little-endian unpack inline.
     namespace.get_or_insert_with("memoryview", || {
-        make_builtin_function("memoryview", |_| Ok(w_none()))
+        crate::typedef::make_builtin_type("memoryview", |ns| {
+            crate::namespace_store(
+                ns,
+                "__new__",
+                make_builtin_function("__new__", |args| {
+                    // args[0] = cls (memoryview), args[1] = buffer-like
+                    let cls = args.get(0).copied().unwrap_or(w_none());
+                    let buf = args.get(1).copied().unwrap_or(w_none());
+                    let inst = pyre_object::w_instance_new(cls);
+                    crate::baseobjspace::setattr(inst, "__pyre_buf__", buf)?;
+                    crate::baseobjspace::setattr(inst, "__pyre_fmt__", w_str_new("B"))?;
+                    crate::baseobjspace::setattr(inst, "__pyre_itemsize__", w_int_new(1))?;
+                    Ok(inst)
+                }),
+            );
+            crate::namespace_store(
+                ns,
+                "cast",
+                make_builtin_function("cast", |args| {
+                    let mv = args.get(0).copied().unwrap_or(w_none());
+                    let fmt_obj = args.get(1).copied().unwrap_or(w_none());
+                    let fmt = if unsafe { pyre_object::is_str(fmt_obj) } {
+                        unsafe { pyre_object::w_str_get_value(fmt_obj) }
+                    } else {
+                        "B"
+                    };
+                    let itemsize: i64 = match fmt {
+                        "I" | "i" | "L" | "l" | "f" => 4,
+                        "Q" | "q" | "d" => 8,
+                        "H" | "h" => 2,
+                        _ => 1,
+                    };
+                    let buf = crate::baseobjspace::getattr(mv, "__pyre_buf__")?;
+                    let cls = crate::typedef::r#type(mv).unwrap_or(pyre_object::PY_NULL);
+                    let inst = pyre_object::w_instance_new(cls);
+                    crate::baseobjspace::setattr(inst, "__pyre_buf__", buf)?;
+                    crate::baseobjspace::setattr(inst, "__pyre_fmt__", w_str_new(fmt))?;
+                    crate::baseobjspace::setattr(inst, "__pyre_itemsize__", w_int_new(itemsize))?;
+                    Ok(inst)
+                }),
+            );
+            crate::namespace_store(
+                ns,
+                "tolist",
+                make_builtin_function("tolist", |args| {
+                    let mv = args.get(0).copied().unwrap_or(w_none());
+                    let buf = crate::baseobjspace::getattr(mv, "__pyre_buf__")?;
+                    let itemsize_obj = crate::baseobjspace::getattr(mv, "__pyre_itemsize__")?;
+                    let itemsize = unsafe { pyre_object::w_int_get_value(itemsize_obj) } as usize;
+                    let data = if unsafe { pyre_object::bytearrayobject::is_bytearray(buf) } {
+                        unsafe { pyre_object::bytearrayobject::w_bytearray_data(buf) }
+                    } else {
+                        return Ok(w_list_new(vec![]));
+                    };
+                    let mut items = Vec::with_capacity(data.len() / itemsize.max(1));
+                    let mut i = 0;
+                    while i + itemsize <= data.len() {
+                        let mut val: i64 = 0;
+                        for j in 0..itemsize {
+                            val |= (data[i + j] as i64) << (8 * j);
+                        }
+                        items.push(w_int_new(val));
+                        i += itemsize;
+                    }
+                    Ok(w_list_new(items))
+                }),
+            );
+            crate::namespace_store(
+                ns,
+                "__len__",
+                make_builtin_function("__len__", |args| {
+                    let mv = args.get(0).copied().unwrap_or(w_none());
+                    let buf = crate::baseobjspace::getattr(mv, "__pyre_buf__")?;
+                    let itemsize_obj = crate::baseobjspace::getattr(mv, "__pyre_itemsize__")?;
+                    let itemsize = unsafe { pyre_object::w_int_get_value(itemsize_obj) } as usize;
+                    let n = if unsafe { pyre_object::bytearrayobject::is_bytearray(buf) } {
+                        unsafe { pyre_object::bytearrayobject::w_bytearray_len(buf) }
+                    } else {
+                        0
+                    };
+                    Ok(w_int_new((n / itemsize.max(1)) as i64))
+                }),
+            );
+            // memoryview.itemsize attribute — read from the per-instance
+            // __pyre_itemsize__ slot via property descriptor.
+            crate::namespace_store(
+                ns,
+                "itemsize",
+                pyre_object::w_property_new(
+                    make_builtin_function("itemsize", |args| {
+                        let mv = args.get(0).copied().unwrap_or(w_none());
+                        crate::baseobjspace::getattr(mv, "__pyre_itemsize__")
+                    }),
+                    pyre_object::PY_NULL,
+                    pyre_object::PY_NULL,
+                ),
+            );
+        })
     });
     namespace.get_or_insert_with("globals", || {
         make_builtin_function("globals", builtin_globals)
@@ -187,10 +239,26 @@ pub fn install_default_builtins(namespace: &mut PyNamespace) {
             if args.len() < 2 {
                 return Ok(w_list_new(vec![]));
             }
+            let func = args[0];
             let items = collect_iterable(args[1])?;
-            // Without a frame we cannot call the predicate here; return all items.
-            // Proper implementation lives in the call-capable path below.
-            Ok(w_list_new(items))
+            let mut out = Vec::new();
+            let func_is_none = unsafe { pyre_object::is_none(func) };
+            for item in items {
+                let keep = if func_is_none {
+                    crate::baseobjspace::is_true(item)
+                } else {
+                    let result = crate::call_function(func, &[item]);
+                    if result.is_null() {
+                        false
+                    } else {
+                        crate::baseobjspace::is_true(result)
+                    }
+                };
+                if keep {
+                    out.push(item);
+                }
+            }
+            Ok(w_list_new(out))
         })
     });
     namespace.get_or_insert_with("input", || {
@@ -201,30 +269,313 @@ pub fn install_default_builtins(namespace: &mut PyNamespace) {
             Err(crate::PyError::type_error("open() not implemented"))
         })
     });
-    namespace.get_or_insert_with("BaseException", || crate::typedef::w_object());
-    namespace.get_or_insert_with("Exception", || crate::typedef::w_object());
-    namespace.get_or_insert_with("StopIteration", || crate::typedef::w_object());
-    namespace.get_or_insert_with("GeneratorExit", || crate::typedef::w_object());
-    namespace.get_or_insert_with("StopAsyncIteration", || crate::typedef::w_object());
-    namespace.get_or_insert_with("Warning", || crate::typedef::w_object());
-    namespace.get_or_insert_with("UserWarning", || crate::typedef::w_object());
-    namespace.get_or_insert_with("DeprecationWarning", || crate::typedef::w_object());
-    namespace.get_or_insert_with("PendingDeprecationWarning", || crate::typedef::w_object());
-    namespace.get_or_insert_with("RuntimeWarning", || crate::typedef::w_object());
-    namespace.get_or_insert_with("FutureWarning", || crate::typedef::w_object());
-    namespace.get_or_insert_with("ImportWarning", || crate::typedef::w_object());
-    namespace.get_or_insert_with("UnicodeWarning", || crate::typedef::w_object());
-    namespace.get_or_insert_with("BytesWarning", || crate::typedef::w_object());
-    namespace.get_or_insert_with("ResourceWarning", || crate::typedef::w_object());
-    namespace.get_or_insert_with("SyntaxWarning", || crate::typedef::w_object());
-    namespace.get_or_insert_with("EncodingWarning", || crate::typedef::w_object());
-    namespace.get_or_insert_with("LookupError", || crate::typedef::w_object());
-    namespace.get_or_insert_with("OSError", || crate::typedef::w_object());
-    namespace.get_or_insert_with("IOError", || crate::typedef::w_object());
-    namespace.get_or_insert_with("FileNotFoundError", || crate::typedef::w_object());
-    namespace.get_or_insert_with("SystemExit", || crate::typedef::w_object());
-    namespace.get_or_insert_with("KeyboardInterrupt", || crate::typedef::w_object());
-    namespace.get_or_insert_with("RecursionError", || crate::typedef::w_object());
+    // Exception hierarchy — exceptions are real types so they can be
+    // subclassed (`class FrozenInstanceError(AttributeError): pass`).
+    // Built in dependency order: each subclass refers to its already-built
+    // parent. PyPy: each typedef.py W_<Exception>.typedef registers a real
+    // W_TypeObject in space.builtin.
+    let base_exc = make_exc_type(
+        "BaseException",
+        exc_base_exception_new,
+        crate::typedef::w_object(),
+    );
+    crate::namespace_store(namespace, "BaseException", base_exc);
+
+    let exception = make_exc_type("Exception", exc_exception_new, base_exc);
+    crate::namespace_store(namespace, "Exception", exception);
+
+    let arithmetic = make_exc_type("ArithmeticError", exc_arithmetic_error_new, exception);
+    crate::namespace_store(namespace, "ArithmeticError", arithmetic);
+    crate::namespace_store(
+        namespace,
+        "ZeroDivisionError",
+        make_exc_type("ZeroDivisionError", exc_zero_division_new, arithmetic),
+    );
+    crate::namespace_store(
+        namespace,
+        "OverflowError",
+        make_exc_type("OverflowError", exc_overflow_error_new, arithmetic),
+    );
+    crate::namespace_store(
+        namespace,
+        "FloatingPointError",
+        make_exc_type("FloatingPointError", exc_arithmetic_error_new, arithmetic),
+    );
+
+    let lookup_error = make_exc_type("LookupError", exc_exception_new, exception);
+    crate::namespace_store(namespace, "LookupError", lookup_error);
+    crate::namespace_store(
+        namespace,
+        "IndexError",
+        make_exc_type("IndexError", exc_index_error_new, lookup_error),
+    );
+    crate::namespace_store(
+        namespace,
+        "KeyError",
+        make_exc_type("KeyError", exc_key_error_new, lookup_error),
+    );
+
+    crate::namespace_store(
+        namespace,
+        "AttributeError",
+        make_exc_type("AttributeError", exc_attribute_error_new, exception),
+    );
+    crate::namespace_store(
+        namespace,
+        "TypeError",
+        make_exc_type("TypeError", exc_type_error_new, exception),
+    );
+    crate::namespace_store(
+        namespace,
+        "ValueError",
+        make_exc_type("ValueError", exc_value_error_new, exception),
+    );
+    crate::namespace_store(
+        namespace,
+        "NameError",
+        make_exc_type("NameError", exc_name_error_new, exception),
+    );
+
+    let runtime_error = make_exc_type("RuntimeError", exc_runtime_error_new, exception);
+    crate::namespace_store(namespace, "RuntimeError", runtime_error);
+    crate::namespace_store(
+        namespace,
+        "NotImplementedError",
+        make_exc_type(
+            "NotImplementedError",
+            exc_not_implemented_error_new,
+            runtime_error,
+        ),
+    );
+    crate::namespace_store(
+        namespace,
+        "RecursionError",
+        make_exc_type("RecursionError", exc_runtime_error_new, runtime_error),
+    );
+
+    crate::namespace_store(
+        namespace,
+        "StopIteration",
+        make_exc_type("StopIteration", exc_stop_iteration_new, exception),
+    );
+    crate::namespace_store(
+        namespace,
+        "StopAsyncIteration",
+        make_exc_type("StopAsyncIteration", exc_exception_new, exception),
+    );
+    crate::namespace_store(
+        namespace,
+        "GeneratorExit",
+        make_exc_type("GeneratorExit", exc_base_exception_new, base_exc),
+    );
+    crate::namespace_store(
+        namespace,
+        "SystemExit",
+        make_exc_type("SystemExit", exc_base_exception_new, base_exc),
+    );
+    crate::namespace_store(
+        namespace,
+        "KeyboardInterrupt",
+        make_exc_type("KeyboardInterrupt", exc_base_exception_new, base_exc),
+    );
+
+    crate::namespace_store(
+        namespace,
+        "ImportError",
+        make_exc_type("ImportError", exc_import_error_new, exception),
+    );
+    crate::namespace_store(
+        namespace,
+        "ModuleNotFoundError",
+        make_exc_type("ModuleNotFoundError", exc_import_error_new, exception),
+    );
+    crate::namespace_store(
+        namespace,
+        "AssertionError",
+        make_exc_type("AssertionError", exc_assertion_error_new, exception),
+    );
+
+    let os_error = make_exc_type("OSError", exc_exception_new, exception);
+    crate::namespace_store(namespace, "OSError", os_error);
+    crate::namespace_store(namespace, "IOError", os_error);
+    crate::namespace_store(
+        namespace,
+        "FileNotFoundError",
+        make_exc_type("FileNotFoundError", exc_exception_new, os_error),
+    );
+    crate::namespace_store(
+        namespace,
+        "FileExistsError",
+        make_exc_type("FileExistsError", exc_exception_new, os_error),
+    );
+    crate::namespace_store(
+        namespace,
+        "PermissionError",
+        make_exc_type("PermissionError", exc_exception_new, os_error),
+    );
+    crate::namespace_store(
+        namespace,
+        "NotADirectoryError",
+        make_exc_type("NotADirectoryError", exc_exception_new, os_error),
+    );
+    crate::namespace_store(
+        namespace,
+        "IsADirectoryError",
+        make_exc_type("IsADirectoryError", exc_exception_new, os_error),
+    );
+
+    let warning = make_exc_type("Warning", exc_exception_new, exception);
+    crate::namespace_store(namespace, "Warning", warning);
+    for warn_name in [
+        "UserWarning",
+        "DeprecationWarning",
+        "PendingDeprecationWarning",
+        "RuntimeWarning",
+        "FutureWarning",
+        "ImportWarning",
+        "UnicodeWarning",
+        "BytesWarning",
+        "ResourceWarning",
+        "SyntaxWarning",
+        "EncodingWarning",
+    ] {
+        crate::namespace_store(
+            namespace,
+            warn_name,
+            make_exc_type(warn_name, exc_exception_new, warning),
+        );
+    }
+
+    crate::namespace_store(
+        namespace,
+        "UnicodeError",
+        make_exc_type("UnicodeError", exc_value_error_new, exception),
+    );
+    crate::namespace_store(
+        namespace,
+        "UnicodeDecodeError",
+        make_exc_type("UnicodeDecodeError", exc_value_error_new, exception),
+    );
+    crate::namespace_store(
+        namespace,
+        "UnicodeEncodeError",
+        make_exc_type("UnicodeEncodeError", exc_value_error_new, exception),
+    );
+    crate::namespace_store(
+        namespace,
+        "UnicodeTranslateError",
+        make_exc_type("UnicodeTranslateError", exc_value_error_new, exception),
+    );
+
+    crate::namespace_store(
+        namespace,
+        "BufferError",
+        make_exc_type("BufferError", exc_exception_new, exception),
+    );
+    crate::namespace_store(
+        namespace,
+        "MemoryError",
+        make_exc_type("MemoryError", exc_exception_new, exception),
+    );
+    crate::namespace_store(
+        namespace,
+        "ReferenceError",
+        make_exc_type("ReferenceError", exc_exception_new, exception),
+    );
+    crate::namespace_store(
+        namespace,
+        "SystemError",
+        make_exc_type("SystemError", exc_exception_new, exception),
+    );
+    crate::namespace_store(
+        namespace,
+        "EOFError",
+        make_exc_type("EOFError", exc_exception_new, exception),
+    );
+    crate::namespace_store(
+        namespace,
+        "SyntaxError",
+        make_exc_type("SyntaxError", exc_exception_new, exception),
+    );
+    crate::namespace_store(
+        namespace,
+        "IndentationError",
+        make_exc_type("IndentationError", exc_exception_new, exception),
+    );
+    crate::namespace_store(
+        namespace,
+        "TabError",
+        make_exc_type("TabError", exc_exception_new, exception),
+    );
+    crate::namespace_store(
+        namespace,
+        "BlockingIOError",
+        make_exc_type("BlockingIOError", exc_exception_new, os_error),
+    );
+    crate::namespace_store(
+        namespace,
+        "ChildProcessError",
+        make_exc_type("ChildProcessError", exc_exception_new, os_error),
+    );
+    crate::namespace_store(
+        namespace,
+        "ConnectionError",
+        make_exc_type("ConnectionError", exc_exception_new, os_error),
+    );
+    crate::namespace_store(
+        namespace,
+        "BrokenPipeError",
+        make_exc_type("BrokenPipeError", exc_exception_new, os_error),
+    );
+    crate::namespace_store(
+        namespace,
+        "ConnectionAbortedError",
+        make_exc_type("ConnectionAbortedError", exc_exception_new, os_error),
+    );
+    crate::namespace_store(
+        namespace,
+        "ConnectionRefusedError",
+        make_exc_type("ConnectionRefusedError", exc_exception_new, os_error),
+    );
+    crate::namespace_store(
+        namespace,
+        "ConnectionResetError",
+        make_exc_type("ConnectionResetError", exc_exception_new, os_error),
+    );
+    crate::namespace_store(
+        namespace,
+        "InterruptedError",
+        make_exc_type("InterruptedError", exc_exception_new, os_error),
+    );
+    crate::namespace_store(
+        namespace,
+        "ProcessLookupError",
+        make_exc_type("ProcessLookupError", exc_exception_new, os_error),
+    );
+    crate::namespace_store(
+        namespace,
+        "TimeoutError",
+        make_exc_type("TimeoutError", exc_exception_new, os_error),
+    );
+    crate::namespace_store(
+        namespace,
+        "BaseExceptionGroup",
+        make_exc_type("BaseExceptionGroup", exc_base_exception_new, base_exc),
+    );
+    crate::namespace_store(
+        namespace,
+        "ExceptionGroup",
+        make_exc_type("ExceptionGroup", exc_exception_new, exception),
+    );
+    crate::namespace_store(
+        namespace,
+        "PythonFinalizationError",
+        make_exc_type(
+            "PythonFinalizationError",
+            exc_runtime_error_new,
+            runtime_error,
+        ),
+    );
     namespace.get_or_insert_with("any", || make_builtin_function("any", builtin_any));
     namespace.get_or_insert_with("all", || make_builtin_function("all", builtin_all));
     namespace.get_or_insert_with("sum", || make_builtin_function("sum", builtin_sum));
@@ -242,60 +593,9 @@ pub fn install_default_builtins(namespace: &mut PyNamespace) {
         make_builtin_function("__import__", builtin_import_stub)
     });
 
-    // Exception type constructors — callable for `raise ValueError("msg")`
-    // and identifiable by name for CHECK_EXC_MATCH.
-    namespace.get_or_insert_with("BaseException", || {
-        make_builtin_function("BaseException", exc_base_exception)
-    });
-    namespace.get_or_insert_with("Exception", || {
-        make_builtin_function("Exception", exc_exception)
-    });
-    namespace.get_or_insert_with("ArithmeticError", || {
-        make_builtin_function("ArithmeticError", exc_arithmetic_error)
-    });
-    namespace.get_or_insert_with("ZeroDivisionError", || {
-        make_builtin_function("ZeroDivisionError", exc_zero_division)
-    });
-    namespace.get_or_insert_with("TypeError", || {
-        make_builtin_function("TypeError", exc_type_error)
-    });
-    namespace.get_or_insert_with("ValueError", || {
-        make_builtin_function("ValueError", exc_value_error)
-    });
-    namespace.get_or_insert_with("KeyError", || {
-        make_builtin_function("KeyError", exc_key_error)
-    });
-    namespace.get_or_insert_with("IndexError", || {
-        make_builtin_function("IndexError", exc_index_error)
-    });
-    namespace.get_or_insert_with("AttributeError", || {
-        make_builtin_function("AttributeError", exc_attribute_error)
-    });
-    namespace.get_or_insert_with("NameError", || {
-        make_builtin_function("NameError", exc_name_error)
-    });
-    namespace.get_or_insert_with("RuntimeError", || {
-        make_builtin_function("RuntimeError", exc_runtime_error)
-    });
-    namespace.get_or_insert_with("StopIteration", || {
-        make_builtin_function("StopIteration", exc_stop_iteration)
-    });
-    namespace.get_or_insert_with("OverflowError", || {
-        make_builtin_function("OverflowError", exc_overflow_error)
-    });
-    namespace.get_or_insert_with("ImportError", || {
-        make_builtin_function("ImportError", exc_import_error)
-    });
-    namespace.get_or_insert_with("NotImplementedError", || {
-        make_builtin_function("NotImplementedError", exc_not_implemented_error)
-    });
-    namespace.get_or_insert_with("AssertionError", || {
-        make_builtin_function("AssertionError", exc_assertion_error)
-    });
-
     // Descriptor types
     namespace.get_or_insert_with("property", || {
-        make_builtin_function("property", builtin_property)
+        crate::typedef::gettypeobject(&pyre_object::propertyobject::PROPERTY_TYPE)
     });
     // staticmethod/classmethod registered as types for isinstance() support.
     // The type's __new__ creates the descriptor wrapper.
@@ -865,6 +1165,49 @@ exc_constructor!(
     exc_assertion_error,
     pyre_object::excobject::ExcKind::AssertionError
 );
+
+/// `cls.__new__` wrapper that strips `cls` and calls an exception constructor.
+/// PyPy: each exception type's descr__new__ creates a W_<Kind>Object.
+macro_rules! exc_new_wrapper {
+    ($wrapper:ident, $ctor:ident) => {
+        fn $wrapper(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+            let rest: &[PyObjectRef] = if args.is_empty() { args } else { &args[1..] };
+            $ctor(rest)
+        }
+    };
+}
+
+exc_new_wrapper!(exc_base_exception_new, exc_base_exception);
+exc_new_wrapper!(exc_exception_new, exc_exception);
+exc_new_wrapper!(exc_arithmetic_error_new, exc_arithmetic_error);
+exc_new_wrapper!(exc_zero_division_new, exc_zero_division);
+exc_new_wrapper!(exc_type_error_new, exc_type_error);
+exc_new_wrapper!(exc_value_error_new, exc_value_error);
+exc_new_wrapper!(exc_key_error_new, exc_key_error);
+exc_new_wrapper!(exc_index_error_new, exc_index_error);
+exc_new_wrapper!(exc_attribute_error_new, exc_attribute_error);
+exc_new_wrapper!(exc_name_error_new, exc_name_error);
+exc_new_wrapper!(exc_runtime_error_new, exc_runtime_error);
+exc_new_wrapper!(exc_stop_iteration_new, exc_stop_iteration);
+exc_new_wrapper!(exc_overflow_error_new, exc_overflow_error);
+exc_new_wrapper!(exc_import_error_new, exc_import_error);
+exc_new_wrapper!(exc_not_implemented_error_new, exc_not_implemented_error);
+exc_new_wrapper!(exc_assertion_error_new, exc_assertion_error);
+
+/// Build a builtin exception type with the given name, base, and __new__ wrapper.
+fn make_exc_type(
+    name: &'static str,
+    new_fn: crate::gateway::BuiltinCodeFn,
+    base: PyObjectRef,
+) -> PyObjectRef {
+    crate::typedef::make_builtin_type_with_base(
+        name,
+        move |ns| {
+            crate::namespace_store(ns, "__new__", make_builtin_function("__new__", new_fn));
+        },
+        base,
+    )
+}
 
 /// `__build_class__(body, name, *bases)` — class creation.
 ///
@@ -2162,7 +2505,30 @@ fn builtin_format(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(w_str_new(&s))
 }
 
-/// `__import__()` — PyPy: pyopcode.py IMPORT_NAME invokes this
-fn builtin_import_stub(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    panic!("__import__() not callable directly — use import statement");
+/// `__import__(name, globals=None, locals=None, fromlist=(), level=0)`
+/// — PyPy: pypy/module/__builtin__/interp_import.importhook.
+fn builtin_import_stub(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let name_obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    let name = if !name_obj.is_null() && unsafe { pyre_object::is_str(name_obj) } {
+        unsafe { pyre_object::w_str_get_value(name_obj) }
+    } else {
+        ""
+    };
+    let globals = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+    let fromlist = args.get(3).copied().unwrap_or(pyre_object::PY_NULL);
+    let level = args
+        .get(4)
+        .copied()
+        .filter(|&a| unsafe { pyre_object::is_int(a) })
+        .map(|a| unsafe { pyre_object::w_int_get_value(a) })
+        .unwrap_or(0);
+    let exec_ctx = crate::eval::CURRENT_FRAME.with(|current| {
+        let frame = current.get();
+        if frame.is_null() {
+            std::ptr::null::<crate::PyExecutionContext>()
+        } else {
+            unsafe { (*frame).execution_context }
+        }
+    });
+    crate::importing::importhook(name, globals, fromlist, level, exec_ctx)
 }

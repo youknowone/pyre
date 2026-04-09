@@ -363,6 +363,21 @@ impl IterOpcodeHandler for PyFrame {
                 self.locals_cells_stack_w[self.valuestackdepth - 1] = seq_iter;
                 return Ok(());
             }
+            // bytearray → list of int → seq_iter
+            // bytearrayobject.py W_BytearrayObject.descr_iter
+            if pyre_object::bytearrayobject::is_bytearray(iter) {
+                let len = pyre_object::bytearrayobject::w_bytearray_len(iter);
+                let mut items = Vec::with_capacity(len);
+                for i in 0..len {
+                    items.push(pyre_object::w_int_new(
+                        pyre_object::bytearrayobject::w_bytearray_getitem(iter, i) as i64,
+                    ));
+                }
+                let list = pyre_object::w_list_new(items);
+                let seq_iter = pyre_object::w_seq_iter_new(list, len);
+                self.locals_cells_stack_w[self.valuestackdepth - 1] = seq_iter;
+                return Ok(());
+            }
             // dict → iterate over keys (PyPy: dictobject.py __iter__ → dict_keys)
             if pyre_object::is_dict(iter) {
                 let d = &*(iter as *const pyre_object::dictobject::W_DictObject);
@@ -576,6 +591,10 @@ impl ConstantOpcodeHandler for PyFrame {
         Ok(box_str_constant(value))
     }
 
+    fn bytes_constant(&mut self, value: &[u8]) -> Result<Self::Value, PyError> {
+        Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(value))
+    }
+
     fn code_constant(
         &mut self,
         code: &crate::bytecode::CodeObject,
@@ -621,6 +640,53 @@ impl OpcodeStepExecutor for PyFrame {
         if namespace_load(ns, "__annotations__").is_err() {
             namespace_store(ns, "__annotations__", pyre_object::w_dict_new());
         }
+        Ok(())
+    }
+
+    /// CPython 3.14 ceval.c:WITH_EXCEPT_START
+    ///
+    /// Stack layout the bytecode emits (bottom → top):
+    ///   exit_func, exit_self, lasti, exc_info_prev, val
+    ///
+    /// pyre's PUSH_EXC_INFO mirrors CPython here. We scan downward from TOS
+    /// looking for the first callable to use as exit_func instead of relying
+    /// on a fixed offset, because the exact slot count depends on whether
+    /// LOAD_SPECIAL preserved a NULL placeholder for the cm self.
+    fn with_except_start(&mut self) -> Result<(), Self::Error> {
+        let depth = self.valuestackdepth;
+        if depth < 1 {
+            return Err(PyError::type_error("WITH_EXCEPT_START on empty stack"));
+        }
+        let val = self.locals_cells_stack_w[depth - 1];
+        // Find exit_func: walk down from TOS-1 looking for the first
+        // callable. CPython's static layout puts it at TOS-4, but pyre's
+        // SWAP path may leave a NULL or different offset.
+        let mut exit_func = pyre_object::PY_NULL;
+        for offset in 2..=depth.min(8) {
+            let candidate = self.locals_cells_stack_w[depth - offset];
+            if candidate.is_null() {
+                continue;
+            }
+            unsafe {
+                if crate::is_function(candidate)
+                    || pyre_object::is_method(candidate)
+                    || pyre_object::is_type(candidate)
+                {
+                    exit_func = candidate;
+                    break;
+                }
+            }
+        }
+        if exit_func.is_null() {
+            // Nothing to call — push True (suppress nothing).
+            self.push(pyre_object::w_bool_from(false));
+            return Ok(());
+        }
+        let exc_type = unsafe { crate::typedef::r#type(val) }.unwrap_or(pyre_object::w_none());
+        let exc_tb =
+            crate::baseobjspace::getattr(val, "__traceback__").unwrap_or(pyre_object::w_none());
+        let res = crate::call_function(exit_func, &[exc_type, val, exc_tb]);
+        self.push(res);
         Ok(())
     }
 
@@ -1398,15 +1464,25 @@ impl OpcodeStepExecutor for PyFrame {
                     Some(d) if pyre_object::is_staticmethod(d) => PY_NULL,
                     // PyPy: ClassMethod.__get__ → Method(func, klass)
                     Some(d) if pyre_object::is_classmethod(d) => w_type,
+                    // Type / property / member descriptors stored as class
+                    // attributes are NOT methods — invoking them must not
+                    // prepend self.  e.g. `class L: inner = list; L().inner(x)`
+                    // calls list(x), not list(L(), x).
+                    Some(d) if pyre_object::is_type(d) => PY_NULL,
+                    Some(d) if pyre_object::is_property(d) => PY_NULL,
+                    Some(d) if pyre_object::is_member(d) => PY_NULL,
                     Some(d)
                         if crate::is_function(d)
                             && crate::is_builtin_code(
                                 crate::function_get_code(d) as pyre_object::PyObjectRef
                             ) =>
                     {
-                        // Builtin functions stored on a user class behave like plain
-                        // callable attributes here; do not prepend `self`.
-                        PY_NULL
+                        // FunctionWithFixedCode (interp2app) on a builtin
+                        // type — `dict.get` etc. — needs self bound.  Pure
+                        // user-class-level builtin function attributes are
+                        // already a non-issue because they go through
+                        // call_callable on the same dispatch path.
+                        obj
                     }
                     Some(_) => obj, // found in type MRO → bind self (method)
                     None => {

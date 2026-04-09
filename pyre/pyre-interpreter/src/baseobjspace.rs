@@ -815,6 +815,36 @@ pub fn mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         if is_int(a) && is_list(b) {
             return list_repeat(b, a);
         }
+        // tuple * int
+        if is_tuple(a) && is_int(b) {
+            let n = w_int_get_value(b).max(0) as usize;
+            let len = w_tuple_len(a);
+            let mut items = Vec::with_capacity(n * len);
+            for _ in 0..n {
+                for i in 0..len {
+                    if let Some(item) = w_tuple_getitem(a, i as i64) {
+                        items.push(item);
+                    }
+                }
+            }
+            return Ok(w_tuple_new(items));
+        }
+        if is_int(a) && is_tuple(b) {
+            return mul(b, a);
+        }
+        // bytearray * int — bytearrayobject.py descr_mul
+        if pyre_object::bytearrayobject::is_bytearray(a) && is_int(b) {
+            let data = pyre_object::bytearrayobject::w_bytearray_data(a);
+            let n = w_int_get_value(b).max(0) as usize;
+            let mut buf = Vec::with_capacity(data.len() * n);
+            for _ in 0..n {
+                buf.extend_from_slice(data);
+            }
+            return Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(&buf));
+        }
+        if is_int(a) && pyre_object::bytearrayobject::is_bytearray(b) {
+            return mul(b, a);
+        }
         if let Some(result) = try_instance_binop(a, b, "__mul__") {
             return result;
         }
@@ -1856,7 +1886,13 @@ pub fn getitem(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
             // Python 3.9+ generic subscript: type[X] → __class_getitem__(X)
             // PyPy: typeobject.py type.__class_getitem__
             if let Some(method) = lookup_in_type_where(obj, "__class_getitem__") {
-                return Ok(crate::call_function(method, &[obj, index]));
+                let result = crate::call_function(method, &[obj, index]);
+                // Fallback if the user-defined __class_getitem__ raised
+                // a stub error or returned NULL — return the type so
+                // `class Foo(Generic[T]): pass` keeps working.
+                if !result.is_null() {
+                    return Ok(result);
+                }
             }
             // Default: return the type itself (stub for GenericAlias)
             Ok(obj)
@@ -2364,6 +2400,18 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
             // Special attributes — PyPy: descroperation.py
             if name == "__class__" {
                 return Ok(w_type);
+            }
+
+            // descroperation.py descr__getattribute__: on AttributeError,
+            // check the type for `__getattr__` and call it.  Used by every
+            // wrapper class that delegates attribute lookup to a backing
+            // stream/buffer (unittest._WritelnDecorator, pathlib, etc.).
+            if let Some(getattr_fn) = lookup_in_type_where(w_type, "__getattr__") {
+                let name_obj = w_str_new(name);
+                let result = crate::call_function(getattr_fn, &[obj, name_obj]);
+                if !result.is_null() {
+                    return Ok(result);
+                }
             }
 
             return Err(PyError::new(
@@ -3012,13 +3060,24 @@ unsafe fn get(
         return Ok(None);
     }
 
-    // PyPy removes __get__ from BuiltinFunction.typedef. Builtin functions
-    // stored on user classes therefore stay plain callables instead of
-    // binding `self` like Python functions do.
+    // function.py: Function.typedef has __get__ (descr_function_get → bound
+    // method). interp2app(...) installed on a TypeDef builds a
+    // FunctionWithFixedCode, which inherits Function.typedef and therefore
+    // binds via __get__. pyre's `make_builtin_function` is the equivalent of
+    // FunctionWithFixedCode, so type-method dispatch must wrap descr+obj
+    // in a Method here.
+    //
+    // (BuiltinFunction is a separate class whose typedef explicitly removes
+    // __get__ — pyre does not yet model that distinction; the few top-level
+    // builtins that should not bind are accessed via the module namespace
+    // path, never through this descriptor route.)
     if crate::is_function(descr)
         && crate::is_builtin_code(crate::function_get_code(descr) as pyre_object::PyObjectRef)
     {
-        return Ok(None);
+        if obj.is_null() || is_none(obj) {
+            return Ok(Some(descr));
+        }
+        return Ok(Some(pyre_object::w_method_new(descr, obj, w_type)));
     }
 
     // property: PyPy W_Property.get → call fget(obj)
