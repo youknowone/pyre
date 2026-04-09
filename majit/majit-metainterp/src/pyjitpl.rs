@@ -1403,20 +1403,22 @@ impl<M: Clone> MetaInterp<M> {
 
     /// pyjitpl.py:3499-3512 `MetaInterp.replace_box(oldbox, newbox)`.
     ///
-    ///     def replace_box(self, oldbox, newbox):
-    ///         for frame in self.framestack:
-    ///             frame.replace_active_box_in_frame(oldbox, newbox)
-    ///         boxes = self.virtualref_boxes
+    /// ```text
+    /// def replace_box(self, oldbox, newbox):
+    ///     for frame in self.framestack:
+    ///         frame.replace_active_box_in_frame(oldbox, newbox)
+    ///     boxes = self.virtualref_boxes
+    ///     for i in range(len(boxes)):
+    ///         if boxes[i] is oldbox:
+    ///             boxes[i] = newbox
+    ///     if (self.jitdriver_sd.virtualizable_info is not None or
+    ///         self.jitdriver_sd.greenfield_info is not None):
+    ///         boxes = self.virtualizable_boxes
     ///         for i in range(len(boxes)):
     ///             if boxes[i] is oldbox:
     ///                 boxes[i] = newbox
-    ///         if (self.jitdriver_sd.virtualizable_info is not None or
-    ///             self.jitdriver_sd.greenfield_info is not None):
-    ///             boxes = self.virtualizable_boxes
-    ///             for i in range(len(boxes)):
-    ///                 if boxes[i] is oldbox:
-    ///                     boxes[i] = newbox
-    ///         self.heapcache.replace_box(oldbox, newbox)
+    ///     self.heapcache.replace_box(oldbox, newbox)
+    /// ```
     ///
     /// RPython rewrites every place where `oldbox` may appear during
     /// tracing — frame registers, virtualref pairs, the standard
@@ -1466,11 +1468,13 @@ impl<M: Clone> MetaInterp<M> {
 
     /// pyjitpl.py:3446-3450 `MetaInterp.synchronize_virtualizable()`.
     ///
-    ///     def synchronize_virtualizable(self):
-    ///         vinfo = self.jitdriver_sd.virtualizable_info
-    ///         virtualizable_box = self.virtualizable_boxes[-1]
-    ///         virtualizable = vinfo.unwrap_virtualizable_box(virtualizable_box)
-    ///         vinfo.write_boxes(virtualizable, self.virtualizable_boxes)
+    /// ```text
+    /// def synchronize_virtualizable(self):
+    ///     vinfo = self.jitdriver_sd.virtualizable_info
+    ///     virtualizable_box = self.virtualizable_boxes[-1]
+    ///     virtualizable = vinfo.unwrap_virtualizable_box(virtualizable_box)
+    ///     vinfo.write_boxes(virtualizable, self.virtualizable_boxes)
+    /// ```
     ///
     /// RPython mirrors the `virtualizable_boxes` model into the C-level
     /// virtualizable struct so that subsequent runtime reads see the new
@@ -1687,8 +1691,10 @@ impl<M: Clone> MetaInterp<M> {
 
     /// pyjitpl.py:1064-1073 `opimpl_hint_force_virtualizable(box)`.
     ///
-    ///     def opimpl_hint_force_virtualizable(self, box):
-    ///         self.metainterp.gen_store_back_in_vable(box)
+    /// ```text
+    /// def opimpl_hint_force_virtualizable(self, box):
+    ///     self.metainterp.gen_store_back_in_vable(box)
+    /// ```
     ///
     /// RPython's `gen_store_back_in_vable` (pyjitpl.py:3465) handles the
     /// nonstandard / forced_virtualizable gating internally and emits the
