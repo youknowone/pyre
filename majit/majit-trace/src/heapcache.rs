@@ -1465,6 +1465,14 @@ impl HeapCache {
     ///             if res_box is not None:
     ///                 return maybe_replace_with_const(res_box)
     ///         return None
+    ///
+    /// pyre's `cached_arraylen` is keyed by OpRef and `update_version`
+    /// removes stale entries on the first access from a new version, so
+    /// the explicit `test_head_version(box)` guard from RPython is
+    /// redundant here — adding it regresses tight loops because pyre's
+    /// `_get_deps` (called from `arraylen_now_known`) bumps the version
+    /// before the cache write but the version-gated query then refuses
+    /// to return the freshly cached length.
     pub fn arraylen(&self, array: OpRef) -> Option<OpRef> {
         self.cached_arraylen.get(&array).copied()
     }
