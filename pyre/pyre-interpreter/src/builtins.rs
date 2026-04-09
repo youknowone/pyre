@@ -1443,24 +1443,6 @@ pub fn builtin_set_from_items(items: &[PyObjectRef]) -> Result<PyObjectRef, crat
     Ok(pyre_object::w_set_from_items(items))
 }
 
-/// `set([iterable])` — PyPy: setobject.py W_SetObject.descr_new + descr_init.
-pub(crate) fn builtin_set_ctor(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    if args.is_empty() {
-        return builtin_set_from_items(&[]);
-    }
-    let items = collect_iterable(args[0])?;
-    builtin_set_from_items(&items)
-}
-
-/// `frozenset([iterable])` — PyPy: setobject.py W_FrozensetObject.descr_new.
-pub(crate) fn builtin_frozenset_ctor(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    if args.is_empty() {
-        return Ok(pyre_object::w_frozenset_new());
-    }
-    let items = collect_iterable(args[0])?;
-    Ok(pyre_object::w_frozenset_from_items(&items))
-}
-
 /// `dict()` — PyPy: dictobject.py W_DictMultiObject.descr_init
 pub(crate) fn builtin_dict_ctor(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.is_empty() {

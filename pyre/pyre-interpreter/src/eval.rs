@@ -3810,6 +3810,194 @@ result = c.f([1, 2, 3])";
     }
 
     #[test]
+    fn test_builtin_function_typedef_overrides_match_pypy() {
+        // The `__doc__` slot routes through `getset_func_doc` which falls
+        // back to `BuiltinCode.getdocstring` (function.py:395-398). pyre's
+        // `len` is registered without a docstring so the access path
+        // returns whatever code.getdocstring yields — the test only checks
+        // that the lookup does not crash and that mutation/deletion fire
+        // the orthodox `_check_code_mutable` TypeError.
+        let source = "\
+doc_value = len.__doc__
+self_is_none = len.__self__ is None
+repr_result = len.__repr__()
+new_err = ''
+try:
+    type(len)()
+except TypeError as e:
+    new_err = str(e)
+set_err = ''
+try:
+    len.__doc__ = 'x'
+except TypeError as e:
+    set_err = str(e)
+del_err = ''
+try:
+    del len.__doc__
+except TypeError as e:
+    del_err = str(e)";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("builtin_function typedef overrides failed");
+        unsafe {
+            let _doc_value = *(*frame.namespace).get("doc_value").unwrap();
+            let self_is_none = *(*frame.namespace).get("self_is_none").unwrap();
+            let repr_result = *(*frame.namespace).get("repr_result").unwrap();
+            let new_err = *(*frame.namespace).get("new_err").unwrap();
+            let set_err = *(*frame.namespace).get("set_err").unwrap();
+            let del_err = *(*frame.namespace).get("del_err").unwrap();
+            assert!(w_bool_get_value(self_is_none));
+            assert_eq!(w_str_get_value(repr_result), "<built-in function len>");
+            assert_eq!(
+                w_str_get_value(new_err),
+                "cannot create 'builtin_function' instances"
+            );
+            assert!(
+                w_str_get_value(set_err).contains("func_doc"),
+                "len.__doc__ = 'x' should raise TypeError, got: {:?}",
+                w_str_get_value(set_err)
+            );
+            assert!(
+                w_str_get_value(del_err).contains("func_doc"),
+                "del len.__doc__ should raise TypeError, got: {:?}",
+                w_str_get_value(del_err)
+            );
+        }
+    }
+
+    #[test]
+    fn test_set_subtype_and_init_follow_pypy_constructor_protocol() {
+        let source = "\
+class S(set):
+    pass
+s = S([1, 2, 3])
+manual = set()
+set.__init__(manual, [4, 5])
+is_subtype = type(s) is S
+result = len(s)
+manual_result = len(manual)";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("set constructor parity failed");
+        unsafe {
+            let is_subtype = *(*frame.namespace).get("is_subtype").unwrap();
+            let result = *(*frame.namespace).get("result").unwrap();
+            let manual_result = *(*frame.namespace).get("manual_result").unwrap();
+            assert!(w_bool_get_value(is_subtype));
+            assert_eq!(w_int_get_value(result), 3);
+            assert_eq!(w_int_get_value(manual_result), 2);
+        }
+    }
+
+    #[test]
+    fn test_frozenset_constructor_exact_and_subtype_paths_match_pypy() {
+        let source = "\
+class F(frozenset):
+    pass
+seed = frozenset([1, 2])
+same = frozenset(seed) is seed
+sub = F([1, 2, 3])
+is_subtype = type(sub) is F
+result = len(sub)";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("frozenset constructor parity failed");
+        unsafe {
+            let same = *(*frame.namespace).get("same").unwrap();
+            let is_subtype = *(*frame.namespace).get("is_subtype").unwrap();
+            let result = *(*frame.namespace).get("result").unwrap();
+            assert!(w_bool_get_value(same));
+            assert!(w_bool_get_value(is_subtype));
+            assert_eq!(w_int_get_value(result), 3);
+        }
+    }
+
+    #[test]
+    fn test_set_constructors_reject_extra_positionals_like_pypy() {
+        // setobject.py:160 W_SetObject.descr_init parses against
+        // `init_signature = Signature(['some_iterable'])`, so anything
+        // beyond `(self, iterable)` is a TypeError; setobject.py:631
+        // W_FrozensetObject.descr_new2 has the gateway-level fixed maxargs
+        // for `(space, w_frozensettype, w_iterable=None)`.
+        let source = "\
+init_err = ''
+try:
+    set([1], 2)
+except TypeError as e:
+    init_err = str(e)
+init_direct_err = ''
+try:
+    s = set()
+    set.__init__(s, [1], 2)
+except TypeError as e:
+    init_direct_err = str(e)
+frozen_err = ''
+try:
+    frozenset([1], 2)
+except TypeError as e:
+    frozen_err = str(e)
+frozen_new_err = ''
+try:
+    frozenset.__new__(frozenset, [1], 2)
+except TypeError as e:
+    frozen_new_err = str(e)";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("set/frozenset arity enforcement failed");
+        unsafe {
+            let init_err = *(*frame.namespace).get("init_err").unwrap();
+            let init_direct_err = *(*frame.namespace).get("init_direct_err").unwrap();
+            let frozen_err = *(*frame.namespace).get("frozen_err").unwrap();
+            let frozen_new_err = *(*frame.namespace).get("frozen_new_err").unwrap();
+            assert!(
+                !w_str_get_value(init_err).is_empty(),
+                "set([1], 2) should raise TypeError"
+            );
+            assert!(
+                !w_str_get_value(init_direct_err).is_empty(),
+                "set.__init__(s, [1], 2) should raise TypeError"
+            );
+            assert!(
+                !w_str_get_value(frozen_err).is_empty(),
+                "frozenset([1], 2) should raise TypeError"
+            );
+            assert!(
+                !w_str_get_value(frozen_new_err).is_empty(),
+                "frozenset.__new__(frozenset, [1], 2) should raise TypeError"
+            );
+        }
+    }
+
+    #[test]
+    fn test_set_new_rejects_foreign_layout_typedef() {
+        // typeobject.py:520-523 W_TypeObject.check_user_subclass refuses
+        // `set.__new__(int)` (and similar cross-layout calls) before the
+        // base allocator runs. pyre's `check_user_subclass` enforces the
+        // same layout-typedef identity guard.
+        let source = "\
+err = ''
+try:
+    set.__new__(int)
+except TypeError as e:
+    err = str(e)
+frozen_err = ''
+try:
+    frozenset.__new__(int, [1, 2])
+except TypeError as e:
+    frozen_err = str(e)";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("layout safety check failed");
+        unsafe {
+            let err = *(*frame.namespace).get("err").unwrap();
+            let frozen_err = *(*frame.namespace).get("frozen_err").unwrap();
+            assert!(
+                !w_str_get_value(err).is_empty(),
+                "set.__new__(int) should raise TypeError"
+            );
+            assert!(
+                !w_str_get_value(frozen_err).is_empty(),
+                "frozenset.__new__(int, [1, 2]) should raise TypeError"
+            );
+        }
+    }
+
+    #[test]
     fn test_metaclass_method_materialized_by_attribute_access() {
         let source = "\
 class Meta(type):
