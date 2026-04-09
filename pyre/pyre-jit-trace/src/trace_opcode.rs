@@ -1209,35 +1209,53 @@ impl MIFrame {
                 if slot < nlocals_local {
                     // TODO(put_back_list_of_boxes3 locals): writing the
                     // SameAs OpRef into `sym.symbolic_locals[slot]`
-                    // SIGSEGVs `nested_loop` reproducibly (verified via
-                    // lldb: crash at `ldr x0, [x4, #0x10]` with x4 = 14,
-                    // i.e. the inner-loop next_instr value used as a
-                    // base pointer for a `W_IntObject.intval` load).
+                    // SIGSEGVs `nested_loop` reproducibly. Investigation
+                    // notes from this session:
                     //
-                    // Two hypotheses ruled out by direct experiment:
-                    //   1. `PyreSym::value_type_of` falling through to
-                    //      `Type::Ref` for the original OpRef. Pinning
-                    //      both `(original, type)` and
-                    //      `(new_opref, type)` in
-                    //      `transient_value_types` BEFORE the writeback
-                    //      did not help — the SIGSEGV still fires in
-                    //      release builds while disappearing under
-                    //      `eprintln`/lldb instrumentation.
-                    //   2. The dedup itself (it does the same SameAs
-                    //      wrapping for stack slots, which works fine).
+                    // *Per-slot bisect*: writing back ONLY locals[0]
+                    // (the running sum `s`) reproduces the SIGSEGV;
+                    // writing back ONLY locals[2] (the inner counter
+                    // `j`) keeps the test passing. The dedup OpRefs are
+                    // both Ref-typed constants (`OpRef(2147483657)` for
+                    // s, `OpRef(2147483648)` for j), wrapped in
+                    // `SameAsR`, with the same target type as
+                    // `inputarg_types[5]` / `inputarg_types[7]`. The
+                    // type-mismatch hypothesis is therefore ruled out.
                     //
-                    // The remaining suspect is a downstream consumer
-                    // (recorder snapshot, optimizer ExportedState
-                    // import, or bridge tracer) that reads the dedup
-                    // slot via the `symbolic_locals` index AFTER the
-                    // writeback and uses the SameAs OpRef where the
-                    // original was expected, with effects that depend
-                    // on heap layout (hence the timing sensitivity).
+                    // *Write-then-restore experiment*: writing the
+                    // new OpRef and immediately restoring the original
+                    // does NOT crash, ruling out allocation-ordering
+                    // side effects on `Vec` storage.
                     //
-                    // Locating that consumer requires per-OpRef type
-                    // tagging refactor (RPython `Box.type` parity)
-                    // plus instrumentation across the close-loop /
-                    // compile-loop boundary, which exceeds this
+                    // *Cause*: a downstream consumer of
+                    // `sym.symbolic_locals[0]` reads the slot AFTER the
+                    // writeback and uses the SameAsR OpRef where the
+                    // pre-dedup constant was expected. Likely
+                    // candidates: the GuardFutureCondition snapshot
+                    // captured immediately after this loop reads
+                    // `sym.symbolic_locals` via
+                    // `build_virtualizable_boxes` /
+                    // `get_list_of_active_boxes`, and the resulting
+                    // resume identity drift only manifests when the
+                    // post-dedup OpRef is `s` because `s` is the only
+                    // local that flows back into the next iteration's
+                    // loop label inputarg. (Slot 2 = `j` is reset to
+                    // const 0 at the inner loop entry, so its dedup
+                    // wrapping never reaches the outer loop.)
+                    //
+                    // The proper fix requires the snapshot path to
+                    // honour the dedup mapping (RPython parity:
+                    // remove_consts_and_duplicates' in-place
+                    // mutation of self.virtualizable_boxes is followed
+                    // by a fresh capture_resumedata in
+                    // `generate_guard(GUARD_FUTURE_CONDITION)`, which
+                    // sees the SameAs identities directly). Pyre's
+                    // snapshot path is structurally similar but the
+                    // resume-side decoder evidently treats the SameAs
+                    // wrapping as a fresh value rather than a synonym.
+                    // Locating that decoder requires per-OpRef type tag
+                    // refactor (RPython `Box.type` parity) plus
+                    // resume-data instrumentation, which exceeds this
                     // session's scope. Disable the locals writeback
                     // until then; the args returned to the caller still
                     // carry the SameAs identity so the JUMP is correct.
