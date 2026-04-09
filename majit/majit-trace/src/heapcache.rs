@@ -986,7 +986,37 @@ impl HeapCache {
         self.clear_caches_varargs(opnum, descr, argboxes);
     }
 
-    /// Internal helper for the small set of opcodes that keep caches valid in RPython.
+    /// heapcache.py:312-336
+    ///
+    ///     def clear_caches_not_necessary(self, opnum, descr):
+    ///         if (opnum == rop.SETFIELD_GC or
+    ///             opnum == rop.SETARRAYITEM_GC or
+    ///             opnum == rop.SETFIELD_RAW or
+    ///             opnum == rop.SETARRAYITEM_RAW or
+    ///             opnum == rop.SETINTERIORFIELD_GC or
+    ///             opnum == rop.COPYSTRCONTENT or
+    ///             opnum == rop.COPYUNICODECONTENT or
+    ///             opnum == rop.STRSETITEM or
+    ///             opnum == rop.UNICODESETITEM or
+    ///             opnum == rop.SETFIELD_RAW or
+    ///             opnum == rop.SETARRAYITEM_RAW or
+    ///             opnum == rop.SETINTERIORFIELD_RAW or
+    ///             opnum == rop.RECORD_EXACT_CLASS or
+    ///             opnum == rop.RAW_STORE or
+    ///             opnum == rop.ASSERT_NOT_NONE or
+    ///             opnum == rop.RECORD_EXACT_CLASS or
+    ///             opnum == rop.RECORD_EXACT_VALUE_I or
+    ///             opnum == rop.RECORD_EXACT_VALUE_R):
+    ///             return True
+    ///         if (rop._OVF_FIRST <= opnum <= rop._OVF_LAST or
+    ///             rop._NOSIDEEFFECT_FIRST <= opnum <= rop._NOSIDEEFFECT_LAST or
+    ///             rop._GUARD_FIRST <= opnum <= rop._GUARD_LAST):
+    ///             return True
+    ///         return False
+    ///
+    /// CALL_* opcodes are deliberately NOT in this set — RPython invalidates
+    /// caches whenever a residual call runs, since the callee could mutate
+    /// fields the optimizer thinks are still cached.
     fn _clear_caches_not_necessary(opnum: OpCode, _descr: Option<()>) -> bool {
         let _ = _descr;
         matches!(
@@ -1006,33 +1036,6 @@ impl HeapCache {
                 | OpCode::RecordExactValueI
                 | OpCode::RawStore
                 | OpCode::AssertNotNone
-                | OpCode::CallI
-                | OpCode::CallR
-                | OpCode::CallF
-                | OpCode::CallN
-                | OpCode::CallPureI
-                | OpCode::CallPureR
-                | OpCode::CallPureF
-                | OpCode::CallPureN
-                | OpCode::CallAssemblerI
-                | OpCode::CallAssemblerR
-                | OpCode::CallAssemblerF
-                | OpCode::CallAssemblerN
-                | OpCode::CallMayForceI
-                | OpCode::CallMayForceR
-                | OpCode::CallMayForceF
-                | OpCode::CallMayForceN
-                | OpCode::CallReleaseGilI
-                | OpCode::CallReleaseGilR
-                | OpCode::CallReleaseGilF
-                | OpCode::CallReleaseGilN
-                | OpCode::CallLoopinvariantI
-                | OpCode::CallLoopinvariantR
-                | OpCode::CallLoopinvariantF
-                | OpCode::CallLoopinvariantN
-                | OpCode::CondCallN
-                | OpCode::CondCallValueI
-                | OpCode::CondCallValueR
         ) || opnum.is_ovf()
             || opnum.has_no_side_effect()
             || opnum.is_guard()
