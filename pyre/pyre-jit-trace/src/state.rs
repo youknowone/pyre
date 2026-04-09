@@ -443,6 +443,19 @@ pub struct PyreSym {
     /// of the vable_array_base-based layout. This ensures bridge traces see
     /// frame locals as symbolic InputArgs, not concrete values.
     pub(crate) bridge_local_oprefs: Option<Vec<OpRef>>,
+    /// Bridge-specific override for symbolic_local_types.
+    /// resume.py:1245 decode_box parity: each slot's `.type` is fixed by
+    /// which `_callback_i/_callback_r/_callback_f` the encoder dispatched
+    /// through `enumerate_vars(info, liveness_info, ...)`. RPython's
+    /// `IntFrontendOp/RefFrontendOp/FloatFrontendOp` carries this kind on
+    /// `box.type`. pyre's `setup_bridge_sym` walks `live_i_regs +
+    /// live_r_regs + live_f_regs` and records `Type::Int/Ref/Float` per
+    /// slot here. Without this, init_symbolic falls into the
+    /// `concrete_slot_types` path which always returns `Type::Ref` for
+    /// W_IntObject locals, and `RETURN_VALUE` then takes the
+    /// `trace_guarded_int_payload` unbox path that the optimizer
+    /// constant-folds — producing `Finish(constant 0)` bridges.
+    pub(crate) bridge_local_types: Option<Vec<Type>>,
     // virtualizable.py:86-93: ALL static fields in declared order.
     // RPython's unroll_static_fields includes every field from
     // _virtualizable_; ALL must be inputarg (not info_only).
@@ -1480,6 +1493,7 @@ impl PyreSym {
             nlocals: 0,
             symbolic_initialized: false,
             bridge_local_oprefs: None,
+            bridge_local_types: None,
             vable_next_instr: OpRef::NONE,
             vable_code: OpRef::NONE,
             vable_valuestackdepth: OpRef::NONE,
@@ -1580,6 +1594,17 @@ impl PyreSym {
                         .unwrap_or(Type::Ref)
                 })
                 .collect();
+        } else if let Some(ref overrides) = self.bridge_local_types {
+            // resume.py:1245 decode_box parity: bridge inputarg types are
+            // determined by which jitcode liveness list (live_i_regs /
+            // live_r_regs / live_f_regs) the slot belongs to at the resume
+            // PC. setup_bridge_sym walks these lists in encoder order and
+            // populates `bridge_local_types[reg_idx] = Type::Int/Ref/Float`.
+            // Use that override here so RETURN_VALUE sees the correct
+            // type and skips the trace_guarded_int_payload unbox path.
+            let mut types = overrides.clone();
+            types.resize(nlocals, Type::Ref);
+            self.symbolic_local_types = types;
         } else if let Some((ref local_types, _)) = inputarg_slot_types {
             // Bridge/root traces resume from the JIT inputarg contract.
             // Re-deriving slot kinds from the concrete frame would turn boxed
@@ -2250,6 +2275,38 @@ impl JitState for PyreJitState {
 
         let nlocals = sym.nlocals;
         let mut bridge_locals = vec![OpRef::NONE; nlocals];
+        // resume.py:1245 decode_box parity: each slot's `.type` is the
+        // `kind` argument to `decode_box`, which is fixed by which
+        // _callback_i/_callback_r/_callback_f the encoder dispatched
+        // through `enumerate_vars(info, liveness_info, ...)`. RPython's
+        // `load_box_from_cpu(num, kind)` creates the box as
+        // IntFrontendOp/RefFrontendOp/FloatFrontendOp accordingly so
+        // `box.type` matches the slot's kind.
+        //
+        // For Box(idx) values: the kind is `parent_fail_arg_types[idx]`
+        // because RPython's `liveboxes[i] = box` is set by
+        // `_callback_<kind>` which already encoded the kind into the box
+        // type. majit's parity is the parent's
+        // `ResumeGuardDescr.fail_arg_types`, propagated here via
+        // `resume_data.fail_arg_types`. Using the liveness-origin type
+        // (live_i_regs vs live_r_regs vs live_f_regs) is wrong because
+        // pyre's jitcode liveness reflects the JITCODE-LEVEL type
+        // (PyObjectRef = Ref for Python locals), while the parent
+        // optimizer may have unboxed Ref→Int and the deadframe slot
+        // carries the unboxed kind. Without the parent type lookup, the
+        // bridge inherits Ref for W_IntObject locals, RETURN_VALUE takes
+        // the trace_guarded_int_payload unbox path, and the optimizer
+        // constant-folds the result into Finish(0).
+        let mut bridge_local_types = vec![Type::Ref; nlocals];
+        let parent_types = &resume_data.fail_arg_types;
+        let type_for_value = |v: &RebuiltValue| -> Type {
+            match v {
+                RebuiltValue::Box(n) => parent_types.get(*n as usize).copied().unwrap_or(Type::Ref),
+                RebuiltValue::Int(_) => Type::Int,
+                RebuiltValue::Const(_, tp) => *tp,
+                _ => Type::Ref,
+            }
+        };
         if let Some(info) = liveness {
             let mut value_iter = frame.values.iter();
             // Encoder order: live_i_regs, live_r_regs, live_f_regs.
@@ -2260,10 +2317,12 @@ impl JitState for PyreJitState {
                 .chain(info.live_f_regs.iter())
             {
                 let Some(v) = value_iter.next() else { break };
+                let slot_type = type_for_value(v);
                 let resolved = resolve(v, &mut frame_const_cursor);
                 let idx = reg_idx as usize;
                 if idx < nlocals {
                     bridge_locals[idx] = resolved;
+                    bridge_local_types[idx] = slot_type;
                 }
                 // Stack-region register indices (idx >= nlocals) are
                 // ignored here — bridge_local_oprefs covers locals
@@ -2277,16 +2336,60 @@ impl JitState for PyreJitState {
                 if i >= nlocals {
                     break;
                 }
+                bridge_local_types[i] = type_for_value(v);
                 bridge_locals[i] = resolve(v, &mut frame_const_cursor);
             }
         }
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
-                "[jit][bridge-sym] frame.values={:?} → bridge_locals={:?}",
-                frame.values, bridge_locals,
+                "[jit][bridge-sym] frame.values={:?} → bridge_locals={:?} types={:?}",
+                frame.values, bridge_locals, bridge_local_types,
             );
         }
+        // Override sym.symbolic_locals AND sym.symbolic_local_types so
+        // subsequent LOAD_FAST / RETURN_VALUE see the bridge inputarg
+        // OpRefs and their resume-data-derived types, not the parent's
+        // vable_array_base+i OpRefs / concrete_slot_types fallback that
+        // init_symbolic seeded before setup_bridge_sym ran.
+        //
+        // pyre's start_bridge_tracing calls initialize_sym() (which runs
+        // init_symbolic) BEFORE setup_bridge_sym, so init_symbolic sees
+        // bridge_local_oprefs == None and falls into the vable_array_base
+        // branch (init_vable_indices hard-codes vable_array_base = 5 for
+        // pyre's 5-slot virtualizable header). That branch produces
+        // OpRef(base+i) values from the PARENT trace's namespace, leaving
+        // stale parent OpRefs in symbolic_locals after we set
+        // bridge_local_oprefs here.
+        //
+        // The TYPES override is critical: without it, the bridge's
+        // RETURN_VALUE handler sees `value_type(OpRef(1)) == Type::Ref`,
+        // calls `trace_guarded_int_payload`, and emits a guard_class +
+        // getfield_gc_pure_i sequence whose result the optimizer
+        // constant-folds — producing a bridge that always returns
+        // Finish(constant 0) instead of Finish(n).
+        sym.symbolic_locals = {
+            let mut locals = bridge_locals.clone();
+            locals.resize(sym.nlocals, OpRef::NONE);
+            locals
+        };
+        sym.symbolic_local_types = {
+            let mut types = bridge_local_types.clone();
+            types.resize(sym.nlocals, Type::Ref);
+            types
+        };
+        // The bridge inputs do NOT have the 5-slot scalar header that
+        // init_vable_indices assumes. Clear vable_array_base so any later
+        // LOAD_FAST falling through to the vable_array_base branch uses
+        // the heap-array path instead of synthesizing parent OpRefs.
+        sym.vable_array_base = None;
+        // The bridge symbolic_stack must also be reset — init_symbolic
+        // seeded it with `OpRef(stack_base + i)` from the parent's
+        // vable_array_base. For a bridge resuming at RETURN_VALUE, the
+        // stack is empty until the trace pushes the return value via
+        // LOAD_FAST.
+        sym.symbolic_stack = vec![OpRef::NONE; sym.symbolic_stack.len()];
         sym.bridge_local_oprefs = Some(bridge_locals);
+        sym.bridge_local_types = Some(bridge_local_types);
 
         // pyjitpl.py:3281-3288 parity: bridge vable scalar fields must
         // reflect the bridge's InputArg layout, NOT the loop trace's layout.
@@ -2333,7 +2436,7 @@ impl JitState for PyreJitState {
     /// `get_list_of_active_boxes`.
     fn rebuild_from_resumedata(
         _meta: &mut Self::Meta,
-        _fail_arg_types: &[Type],
+        fail_arg_types: &[Type],
         rd_numb: Option<&[u8]>,
         rd_consts: Option<&[(i64, Type)]>,
     ) -> Option<majit_metainterp::ResumeDataResult> {
@@ -2403,6 +2506,10 @@ impl JitState for PyreJitState {
             virtualizable_values: vable_values,
             virtualref_values: vref_values,
             constants,
+            // resume.py:1245 decode_box parity: propagate parent guard's
+            // fail_arg_types so setup_bridge_sym can type bridge inputarg
+            // slots correctly.
+            fail_arg_types: fail_arg_types.to_vec(),
         })
     }
 
