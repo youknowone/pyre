@@ -442,9 +442,6 @@ pub struct MetaInterp<M: Clone> {
     pub(crate) vable_ptr: *const u8,
     /// Virtualizable array lengths for trace-entry box layout.
     pub(crate) vable_array_lengths: Vec<usize>,
-    /// RPython parity: standard virtualizable that was just forced via
-    /// `hint_force_virtualizable` / `gen_store_back_in_vable`.
-    pub(crate) forced_virtualizable: Option<OpRef>,
     /// warmspot.py:449 jd.result_type — per-driver static result type.
     pub(crate) result_type: Type,
     /// Helper function pointers that box raw ints into interpreter objects.
@@ -881,7 +878,6 @@ impl<M: Clone> MetaInterp<M> {
             stats: JitStatsCounters::default(),
             vable_ptr: std::ptr::null(),
             vable_array_lengths: Vec::new(),
-            forced_virtualizable: None,
             result_type: Type::Ref,
             raw_int_box_helpers: HashSet::new(),
             create_frame_raw_map: HashMap::new(),
@@ -1214,7 +1210,6 @@ impl<M: Clone> MetaInterp<M> {
                 }
                 // pyjitpl.py:3290 initialize_virtualizable parity.
                 self.initialize_virtualizable(&mut ctx, live_values);
-                self.forced_virtualizable = None;
                 self.force_finish_trace = self.warm_state.take_force_finish_tracing(green_key);
                 ctx.set_force_finish(self.force_finish_trace);
                 let num_inputs = ctx.recorder.num_inputargs();
@@ -1345,7 +1340,6 @@ impl<M: Clone> MetaInterp<M> {
         // pyjitpl.py:3290 initialize_virtualizable parity.
         self.initialize_virtualizable(&mut ctx, live_values);
 
-        self.forced_virtualizable = None;
         self.force_finish_trace = self.warm_state.take_force_finish_tracing(green_key);
         // pyjitpl.py:2411: propagate force_finish_trace to TraceCtx
         // so the proc-macro merge_fn closure can read it.
@@ -1417,8 +1411,10 @@ impl<M: Clone> MetaInterp<M> {
             }
         }
         // Step 2: forced_virtualizable reset on identity.
-        if self.forced_virtualizable == Some(vable_opref) {
-            self.forced_virtualizable = None;
+        if let Some(ctx) = self.tracing.as_mut() {
+            if ctx.forced_virtualizable() == Some(vable_opref) {
+                ctx.set_forced_virtualizable(None);
+            }
         }
         // Step 3: standard_box identity check.
         if self.virtualizable_info.is_some() && self.is_standard_virtualizable(vable_opref) {
@@ -1474,14 +1470,23 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
-    /// RPython equivalent: `synchronize_virtualizable()`.
+    /// pyjitpl.py:3446-3450 `MetaInterp.synchronize_virtualizable()`.
     ///
-    /// Standard virtualizable writes are materialized back to heap state through
-    /// the existing trace-time store-back path.
-    pub fn synchronize_virtualizable(&mut self, vable_opref: OpRef) {
-        if let Some(ctx) = self.tracing.as_mut() {
-            ctx.gen_store_back_in_vable(vable_opref);
-        }
+    ///     def synchronize_virtualizable(self):
+    ///         vinfo = self.jitdriver_sd.virtualizable_info
+    ///         virtualizable_box = self.virtualizable_boxes[-1]
+    ///         virtualizable = vinfo.unwrap_virtualizable_box(virtualizable_box)
+    ///         vinfo.write_boxes(virtualizable, self.virtualizable_boxes)
+    ///
+    /// RPython mirrors the `virtualizable_boxes` model into the C-level
+    /// virtualizable struct so that subsequent runtime reads see the new
+    /// values. pyre's `virtualizable_boxes` (on TraceCtx) is the single
+    /// source of truth — there is no separate C struct to mirror into —
+    /// so this is a no-op. Kept as a named seam to make the call sites
+    /// at `_opimpl_setfield_vable` (pyjitpl.py:1194) and
+    /// `_opimpl_setarrayitem_vable` (pyjitpl.py:1246) line up structurally.
+    pub fn synchronize_virtualizable(&mut self, _vable_opref: OpRef) {
+        // intentionally empty — see doc comment.
     }
 
     /// RPython equivalent: `opimpl_getfield_vable_i(box, fielddescr, pc)`.
@@ -1772,25 +1777,20 @@ impl<M: Clone> MetaInterp<M> {
             .const_int(length as i64)
     }
 
-    /// RPython equivalent: `emit_force_virtualizable()`.
+    /// pyjitpl.py:1064-1073 `opimpl_hint_force_virtualizable(box)`.
     ///
-    /// Standard virtualizables are flushed back to heap state once per
-    /// trace-side force point. Nonstandard virtualizables are ignored here
-    /// and continue through the normal heap fallback path.
-    pub fn emit_force_virtualizable(&mut self, vable_opref: OpRef) {
-        if !self.is_standard_virtualizable(vable_opref) {
-            return;
-        }
-        if self.forced_virtualizable.is_some() {
-            return;
-        }
-        self.forced_virtualizable = Some(vable_opref);
-        self.synchronize_virtualizable(vable_opref);
-    }
-
-    /// RPython equivalent: `opimpl_hint_force_virtualizable(box)`
+    ///     def opimpl_hint_force_virtualizable(self, box):
+    ///         self.metainterp.gen_store_back_in_vable(box)
+    ///
+    /// RPython's `gen_store_back_in_vable` (pyjitpl.py:3465) handles the
+    /// nonstandard / forced_virtualizable gating internally and emits the
+    /// SETFIELD_GC + SETARRAYITEM_GC + token-clear flush. pyre's TraceCtx
+    /// hosts the same gating now (see TraceCtx::gen_store_back_in_vable),
+    /// so this is a thin forward.
     pub fn opimpl_hint_force_virtualizable(&mut self, vable_opref: OpRef) {
-        self.emit_force_virtualizable(vable_opref);
+        if let Some(ctx) = self.tracing.as_mut() {
+            ctx.gen_store_back_in_vable(vable_opref);
+        }
     }
 
     /// pyjitpl.py:1789-1814 opimpl_virtual_ref parity.
@@ -1863,7 +1863,6 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         finish_args: &[OpRef],
     ) -> Option<(TreeLoop, HashMap<u32, i64>)> {
-        self.forced_virtualizable = None;
         self.force_finish_trace = false;
         let ctx = self.tracing.take()?;
         let green_key = ctx.green_key;
@@ -1967,7 +1966,6 @@ impl<M: Clone> MetaInterp<M> {
         }
 
         let vable_config = self.current_virtualizable_optimizer_config();
-        self.forced_virtualizable = None;
         self.force_finish_trace = false;
         let mut ctx = self.tracing.take().unwrap();
         ctx.apply_replacements();
@@ -2833,7 +2831,6 @@ impl<M: Clone> MetaInterp<M> {
         };
 
         let vable_config = self.current_virtualizable_optimizer_config();
-        self.forced_virtualizable = None;
         self.force_finish_trace = false;
         let mut ctx = match self.tracing.take() {
             Some(ctx) => ctx,
@@ -3150,7 +3147,6 @@ impl<M: Clone> MetaInterp<M> {
     ///
     /// If `permanent` is true, this location will never be traced again.
     pub fn abort_trace(&mut self, permanent: bool) {
-        self.forced_virtualizable = None;
         self.force_finish_trace = false;
         self.clear_retrace_state();
         if let Some(ctx) = self.tracing.take() {
@@ -3182,7 +3178,6 @@ impl<M: Clone> MetaInterp<M> {
     ) {
         // Cache vable_config before take() clears self.tracing.
         let vable_config = self.current_virtualizable_optimizer_config();
-        self.forced_virtualizable = None;
         self.force_finish_trace = false;
         let mut ctx = self.tracing.take().unwrap();
         ctx.apply_replacements();
@@ -3616,7 +3611,6 @@ impl<M: Clone> MetaInterp<M> {
     /// attach_procedure_to_interp), None on failure.
     pub fn compile_simple_loop(&mut self, meta: M) -> Option<u64> {
         let vable_config = self.current_virtualizable_optimizer_config();
-        self.forced_virtualizable = None;
         self.force_finish_trace = false;
         let mut ctx = match self.tracing.take() {
             Some(ctx) => ctx,
@@ -6075,7 +6069,6 @@ impl<M: Clone> MetaInterp<M> {
         // bridge_fail_descr_proxy already prefers backend types.
         let bridge_input_types = fail_descr.fail_arg_types();
         let recorder = self.warm_state.start_retrace(bridge_input_types);
-        self.forced_virtualizable = None;
         self.force_finish_trace = false;
         self.tracing = Some(crate::trace_ctx::TraceCtx::new(recorder, green_key));
 

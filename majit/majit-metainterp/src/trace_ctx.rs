@@ -85,6 +85,13 @@ pub struct TraceCtx {
     /// GUARD_NOT_INVALIDATED with full snapshot at the field read's orgpc.
     /// Stores Some(orgpc) when pending.
     pending_guard_not_invalidated_pc: Option<usize>,
+    /// pyjitpl.py:2394 `MetaInterp.forced_virtualizable` parity. Tracks the
+    /// vbox handed to `gen_store_back_in_vable` so the second
+    /// `opimpl_hint_force_virtualizable` of the same trace can be skipped.
+    /// RPython resets this in `MetaInterp.__init__`; pyre keeps it on
+    /// TraceCtx because TraceCtx is freshly created per trace and the
+    /// MetaInterp is reused across traces.
+    forced_virtualizable: Option<OpRef>,
 }
 
 /// pyjitpl.py:2989 — a visited loop header with its trace position.
@@ -276,6 +283,7 @@ impl TraceCtx {
             last_traced_pc: 0,
             initial_inputarg_consts: vec![],
             pending_guard_not_invalidated_pc: None,
+            forced_virtualizable: None,
         }
     }
 
@@ -316,6 +324,7 @@ impl TraceCtx {
             last_traced_pc: 0,
             initial_inputarg_consts: vec![],
             pending_guard_not_invalidated_pc: None,
+            forced_virtualizable: None,
         }
     }
 
@@ -855,6 +864,16 @@ impl TraceCtx {
         self.virtualizable_array_lengths.as_deref()
     }
 
+    /// pyjitpl.py:2394 `forced_virtualizable` accessor.
+    pub fn forced_virtualizable(&self) -> Option<OpRef> {
+        self.forced_virtualizable
+    }
+
+    /// pyjitpl.py:1126-1127 / 3478 `forced_virtualizable` mutator.
+    pub fn set_forced_virtualizable(&mut self, value: Option<OpRef>) {
+        self.forced_virtualizable = value;
+    }
+
     // ── hint API consumption (RPython annotator/codewriter equivalent) ──
 
     /// Consume `hint(frame, access_directly=True)` during tracing.
@@ -881,17 +900,25 @@ impl TraceCtx {
         // GuardValue(token, 0) at loop entry for freshly created frames.
     }
 
-    /// Consume `hint(frame, force_virtualizable=True)` during tracing.
+    /// pyjitpl.py:3465-3497 `MetaInterp.gen_store_back_in_vable(box)`.
     ///
-    /// RPython equivalent: `MetaInterp.gen_store_back_in_vable(box)`
-    ///
-    /// Emits SETFIELD_GC for each static field + SETARRAYITEM_GC for each
-    /// array element to flush virtualizable boxes back to the heap.
-    /// Finally emits SETFIELD_GC(vable_token, NULL) to clear the token.
-    ///
-    /// Only operates on the standard virtualizable (identified by
-    /// `vable_opref` matching the frame reference in boxes). Nonstandard
-    /// or virtual virtualizables are ignored (RPython parity).
+    ///     def gen_store_back_in_vable(self, box):
+    ///         vinfo = self.jitdriver_sd.virtualizable_info
+    ///         if vinfo is not None:
+    ///             # xxx only write back the fields really modified
+    ///             vbox = self.virtualizable_boxes[-1]
+    ///             if vbox is not box:
+    ///                 # ignore the hint on non-standard virtualizable
+    ///                 # specifically, ignore it on a virtual
+    ///                 return
+    ///             if self.forced_virtualizable is not None:
+    ///                 # this can happen only in strange cases, but we don't care
+    ///                 # it was already forced
+    ///                 return
+    ///             self.forced_virtualizable = vbox
+    ///             ...emit SETFIELD_GC for each static field...
+    ///             ...emit SETARRAYITEM_GC for each array item...
+    ///             ...emit final SETFIELD_GC(vbox, NULL, vable_token_descr)...
     pub fn gen_store_back_in_vable(&mut self, vable_opref: OpRef) {
         let (info, boxes, lengths) = match (
             self.virtualizable_info.clone(),
@@ -902,9 +929,18 @@ impl TraceCtx {
             _ => return,
         };
 
+        // pyjitpl.py:3469 vbox = self.virtualizable_boxes[-1]
+        // pyjitpl.py:3470-3473 if vbox is not box: return  (ignore nonstandard)
         if boxes.last().copied() != Some(vable_opref) {
             return;
         }
+
+        // pyjitpl.py:3474-3477 if forced_virtualizable is not None: return
+        if self.forced_virtualizable.is_some() {
+            return;
+        }
+        // pyjitpl.py:3478 self.forced_virtualizable = vbox
+        self.forced_virtualizable = Some(vable_opref);
 
         for field_index in 0..info.static_fields.len() {
             if let Some(&value) = boxes.get(field_index) {
