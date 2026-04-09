@@ -1590,39 +1590,6 @@ impl OptRewrite {
             }
         }
 
-        // optimizer.py:754-778 _maybe_replace_guard_value parity:
-        // Hack: turn guard_value(bool) into guard_true/guard_false. This
-        // is done after the operation is emitted to let
-        // store_final_boxes_in_guard set the guard_opnum field of the
-        // descr to the original GUARD_VALUE.
-        //
-        // RPython calls self.replace_op_with(op, opnum, [op.getarg(0)],
-        // descr) → optimizer.py:400 → op.copy_and_change(newopnum, args, descr)
-        // → resoperation.py:498-503 GuardResOp.copy_and_change which
-        // automatically copies fail_args AND rd_resume_position.
-        if let Some(expected) = ctx.get_constant_int(arg1) {
-            // RPython: GuardValue makes arg0 a known constant in the
-            // optimizer context. Also set on the resolved target so
-            // export_state picks it up regardless of forwarding.
-            ctx.make_constant(arg0, majit_ir::Value::Int(expected));
-            let resolved_arg0 = ctx.get_box_replacement(arg0);
-            ctx.make_constant(resolved_arg0, majit_ir::Value::Int(expected));
-            // optimizer.py:776 self.replace_op_with(op, opnum, [op.getarg(0)], descr)
-            // → resoperation.py:498-503 GuardResOp.copy_and_change preserves
-            // failargs AND rd_resume_position. Without rd_resume_position the
-            // bridge optimizer's store_final_boxes_in_guard would skip this
-            // guard and leave constants in fail_args (regalloc.py:1206).
-            // copy_and_change preserves `pos` automatically.
-            if expected == 0 {
-                let new_op = op.copy_and_change(OpCode::GuardFalse, Some(&[arg0]), None);
-                return OptimizationResult::Replace(new_op);
-            }
-            if expected == 1 {
-                let new_op = op.copy_and_change(OpCode::GuardTrue, Some(&[arg0]), None);
-                return OptimizationResult::Replace(new_op);
-            }
-        }
-
         // rewrite.py postprocess_GUARD_VALUE:
         //   box = get_box_replacement(op.getarg(0))
         //   self.make_constant(box, op.getarg(1))
