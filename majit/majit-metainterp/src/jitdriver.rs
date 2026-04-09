@@ -3201,7 +3201,11 @@ mod tests {
     fn run_compiled_detailed_keyed_uses_typed_live_inputs() {
         let mut driver = JitDriver::<TypedInputState>::new(2);
         let key = 11u64;
-        let typed_live_values = vec![Value::Ref(GcRef(0x1234)), Value::Float(3.5)];
+        // Input 0 is Int (used as GuardFalse condition); inputs 1/2 are
+        // Ref/Float so the typed restore path still exercises mixed types.
+        // GUARD_TRUE/FALSE in RPython are typed 'i' (resoperation.py
+        // arglist_types) — the guard condition must be Int.
+        let typed_live_values = vec![Value::Int(1), Value::Ref(GcRef(0x1234)), Value::Float(3.5)];
 
         assert!(matches!(
             driver
@@ -3216,19 +3220,25 @@ mod tests {
             BackEdgeAction::StartedTracing
         ));
 
-        // Use input arg directly as guard condition. Input 0 is Ref(0x1234)
-        // which is nonzero, so GuardFalse fails at runtime. Optimizer cannot
-        // constant-fold an input arg.
+        // Input 0 is Int(1) — nonzero so GuardFalse fails at runtime.
+        // Optimizer cannot constant-fold an input arg.
         {
             let ctx = driver.meta.trace_ctx().expect("trace ctx should exist");
             let i0 = OpRef(0);
-            ctx.record_guard_with_fail_args(OpCode::GuardFalse, &[i0], 0, &[OpRef(0), OpRef(1)]);
+            ctx.record_guard_with_fail_args(
+                OpCode::GuardFalse,
+                &[i0],
+                0,
+                &[OpRef(0), OpRef(1), OpRef(2)],
+            );
         };
-        driver.meta.compile_loop(&[OpRef(0), OpRef(1)], ());
+        driver
+            .meta
+            .compile_loop(&[OpRef(0), OpRef(1), OpRef(2)], ());
         assert!(driver.has_compiled_loop(key));
 
         let mut state = TypedInputState {
-            raw_live_values: vec![0, 0],
+            raw_live_values: vec![1, 0, 0],
             typed_live_values: typed_live_values.clone(),
             ..Default::default()
         };
@@ -3247,7 +3257,11 @@ mod tests {
     fn blackhole_fallback_uses_typed_live_inputs() {
         let mut driver = JitDriver::<TypedInputState>::new(2);
         let key = 12u64;
-        let typed_live_values = vec![Value::Ref(GcRef(0x5678)), Value::Float(6.25)];
+        // Input 0 is Int (used as GuardFalse condition); inputs 1/2 are
+        // Ref/Float so the typed restore path still exercises mixed types.
+        // GUARD_TRUE/FALSE in RPython are typed 'i' (resoperation.py
+        // arglist_types) — the guard condition must be Int.
+        let typed_live_values = vec![Value::Int(1), Value::Ref(GcRef(0x5678)), Value::Float(6.25)];
 
         assert!(matches!(
             driver
@@ -3262,18 +3276,24 @@ mod tests {
             BackEdgeAction::StartedTracing
         ));
 
-        // Use input arg directly. Input 0 is Ref(0x5678) which is nonzero,
-        // so GuardFalse fails at runtime.
+        // Input 0 is Int(1) — nonzero so GuardFalse fails at runtime.
         {
             let ctx = driver.meta.trace_ctx().expect("trace ctx should exist");
             let i0 = OpRef(0);
-            ctx.record_guard_with_fail_args(OpCode::GuardFalse, &[i0], 0, &[OpRef(0), OpRef(1)]);
+            ctx.record_guard_with_fail_args(
+                OpCode::GuardFalse,
+                &[i0],
+                0,
+                &[OpRef(0), OpRef(1), OpRef(2)],
+            );
         };
-        driver.meta.compile_loop(&[OpRef(0), OpRef(1)], ());
+        driver
+            .meta
+            .compile_loop(&[OpRef(0), OpRef(1), OpRef(2)], ());
         assert!(driver.has_compiled_loop(key));
 
         let mut state = TypedInputState {
-            raw_live_values: vec![0, 0],
+            raw_live_values: vec![1, 0, 0],
             typed_live_values: typed_live_values.clone(),
             ..Default::default()
         };
