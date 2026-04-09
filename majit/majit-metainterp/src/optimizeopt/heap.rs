@@ -451,20 +451,18 @@ pub struct OptHeap {
     /// all its dependencies are transitively escaped.
     heapc_deps: HashMap<u32, Vec<OpRef>>,
 
-    /// heap.py:27 OptHeap inherits Optimization.last_emitted_operation,
-    /// which is set to REMOVED by `_optimize_CALL_DICT_LOOKUP`
-    /// (heap.py:527) when a folded CALL_PURE collapses into its cached
-    /// result. `optimize_GUARD_NO_EXCEPTION` (heap.py:530-533) reads the
-    /// flag and skips emitting the trailing guard. majit models the
-    /// REMOVED state as a per-pass boolean — set true on the explicit
-    /// removal paths, false on every other dispatch entry.
-    last_emitted_was_removed: bool,
-    /// Snapshot of `last_emitted_was_removed` taken at the start of every
-    /// `propagate_forward` call so that handlers (e.g.,
-    /// `optimize_GUARD_NO_EXCEPTION`) read the *previous* op's outcome
-    /// rather than their own reset state.
-    prior_emitted_was_removed: bool,
-
+    // heap.py:27 OptHeap inherits Optimization.last_emitted_operation,
+    // which is set to REMOVED by `_optimize_CALL_DICT_LOOKUP`
+    // (heap.py:527) when a folded CALL_PURE collapses into its cached
+    // result. `optimize_GUARD_NO_EXCEPTION` (heap.py:530-533) reads the
+    // flag and skips emitting the trailing guard.
+    //
+    // _optimize_CALL_DICT_LOOKUP is not yet ported — it depends on
+    // `extradescrs` on EffectInfo (rpython rordereddict descriptor
+    // pairing) which majit-ir does not carry. Until that lands the
+    // OptHeap REMOVED setter does not exist, so the corresponding
+    // reader is omitted in optimize_GUARD_NO_EXCEPTION rather than
+    // installed as dead code.
     /// Fields known to be quasi-immutable: (obj, field_idx) -> cached value OpRef.
     /// Populated by QUASIIMMUT_FIELD, consumed by subsequent GETFIELD_GC_*.
     /// Survives calls (guarded by GUARD_NOT_INVALIDATED).
@@ -489,8 +487,6 @@ impl OptHeap {
             unescaped: Vec::new(),
             known_nonnull: Vec::new(),
             heapc_deps: HashMap::new(),
-            last_emitted_was_removed: false,
-            prior_emitted_was_removed: false,
             quasi_immut_cache: HashMap::new(),
             field_descr_map: HashMap::new(),
             cached_arraylens: HashMap::new(),
@@ -2140,21 +2136,24 @@ impl OptHeap {
             //         return self.emit(op)
             //     optimize_GUARD_EXCEPTION = optimize_GUARD_NO_EXCEPTION
             //
-            // The REMOVED check fires only on paths that explicitly set
-            // self.last_emitted_operation = REMOVED — currently just
-            // _optimize_CALL_DICT_LOOKUP (heap.py:527). emit() flushes the
-            // postponed op and runs emitting_operation, which delegates
-            // force_lazy_sets_for_guard via the guard branch.
+            // The REMOVED check is the only path the upstream guard arm
+            // shortcuts on. last_emitted_operation is set to REMOVED only
+            // by _optimize_CALL_DICT_LOOKUP (heap.py:527), which majit
+            // does not yet port (see the field comment near the top of
+            // OptHeap). Until that helper lands the REMOVED branch has no
+            // producer, so the unconditional emit is the structurally
+            // correct port.
+            //
+            // Returning Emit hands the guard back to the propagate_forward
+            // wrapper, which (1) flushes self.postponed_op via the standard
+            // emit() override and (2) routes the guard through
+            // emit_operation. emit_operation then invokes
+            // emitting_operation for OptHeap, whose guard branch
+            // (heap.py:432-435) calls force_lazy_sets_for_guard — preserving
+            // immutable cache entries and writing the lazy sets only into
+            // the guard's pendingfields, never as new ops in the trace.
             OpCode::GuardNoException | OpCode::GuardException => {
-                if self.prior_emitted_was_removed {
-                    return OptimizationResult::Remove;
-                }
-                // emit() override: flush postponed op before the guard.
-                if let Some(postponed) = self.postponed_op.take() {
-                    ctx.emit_extra(ctx.current_pass_idx, postponed);
-                }
-                self.force_all_lazy_sets(ctx.current_pass_idx, ctx);
-                return OptimizationResult::Emit(op.clone());
+                OptimizationResult::Emit(op.clone())
             }
 
             // ── GUARD_NOT_INVALIDATED deduplication ──
@@ -2252,15 +2251,6 @@ impl Default for OptHeap {
 
 impl Optimization for OptHeap {
     fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        // optimizer.py:84-92 base emit/emit_result reset
-        // last_emitted_operation to the current op on every emit. RPython's
-        // `last_emitted is REMOVED` check therefore reads the prior op's
-        // outcome — model that by snapshotting the flag at entry and
-        // resetting it. Removal paths set the flag back to true before
-        // returning Remove. dispatch_propagate reads the snapshot via
-        // self.prior_emitted_was_removed.
-        self.prior_emitted_was_removed = self.last_emitted_was_removed;
-        self.last_emitted_was_removed = false;
         let result = self.dispatch_propagate(op, ctx);
         // RPython heap.py:417-425 emit() override parity:
         // Before emitting any new op, flush the postponed op. Then
@@ -2291,8 +2281,6 @@ impl Optimization for OptHeap {
         self.seen_allocation.clear();
         self.unescaped.clear();
         self.known_nonnull.clear();
-        self.last_emitted_was_removed = false;
-        self.prior_emitted_was_removed = false;
         self.quasi_immut_cache.clear();
         self.cached_arraylens.clear();
     }
@@ -2435,10 +2423,7 @@ impl Optimization for OptHeap {
         // info.py:262: op = get_box_replacement(self._fields[fielddescr.get_index()])
         for (&field_idx, cf) in &self.cached_fields {
             // heap.py:53: assert self._lazy_set is None
-            debug_assert!(
-                cf.lazy_set.is_none(),
-                "lazy_set must be flushed before produce_potential_short_preamble_ops"
-            );
+            debug_assert!(cf.lazy_set.is_none());
             for i in 0..cf.cached_structs.len() {
                 // heap.py:55: structbox = get_box_replacement(self.cached_structs[i])
                 let obj = ctx.get_box_replacement(cf.cached_structs[i]);
