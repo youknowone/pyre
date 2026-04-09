@@ -79,8 +79,12 @@ fn loop_target_descr(op: &Op) -> Option<&dyn LoopTargetDescr> {
         .and_then(majit_ir::Descr::as_loop_target_descr)
 }
 
-fn loop_target_index(op: &Op) -> Option<u32> {
-    op.descr.as_ref().map(|d| d.index())
+/// Pointer-identity key for `target_tokens_currently_compiling`. PyPy
+/// x86/assembler.py:93 keys it by the descr Python object itself; we use
+/// the underlying allocation address of the `Arc<dyn Descr>` so two
+/// distinct TargetToken descriptors are never confused.
+fn loop_target_id(op: &Op) -> Option<usize> {
+    op.descr.as_ref().map(majit_ir::descr_identity)
 }
 
 fn target_argloc_from_loc(loc: Loc) -> TargetArgLoc {
@@ -271,8 +275,9 @@ pub struct Assembler386 {
     /// consumed by a following GUARD_TRUE/GUARD_FALSE.
     /// Stores an abstract condition code (CC_* constants).
     guard_success_cc: Option<u8>,
-    /// arm/assembler.py: target_tokens_currently_compiling parity.
-    target_tokens_currently_compiling: HashMap<u32, DynamicLabel>,
+    /// x86/assembler.py:93 target_tokens_currently_compiling parity.
+    /// Keyed by descriptor pointer identity (PyPy uses Python `is`).
+    target_tokens_currently_compiling: HashMap<usize, DynamicLabel>,
     compiled_target_tokens: Vec<majit_ir::DescrRef>,
     /// llmodel.py:64-69 self.vtable_offset — typeptr field byte offset.
     /// `None` corresponds to RPython's gcremovetypeptr config.
@@ -2170,7 +2175,7 @@ impl Assembler386 {
                     &dst_locations2,
                     tmpreg2,
                 );
-                if let Some(label) = loop_target_index(op)
+                if let Some(label) = loop_target_id(op)
                     .and_then(|k| self.target_tokens_currently_compiling.get(&k).copied())
                 {
                     #[cfg(target_arch = "x86_64")]
@@ -2269,8 +2274,8 @@ impl Assembler386 {
                             .collect(),
                     );
                     descr.set_ll_loop_code(self.mc.offset().0);
-                    if let Some(index) = loop_target_index(op) {
-                        self.target_tokens_currently_compiling.insert(index, label);
+                    if let Some(id) = loop_target_id(op) {
+                        self.target_tokens_currently_compiling.insert(id, label);
                     }
                     if let Some(descr_ref) = op.descr.as_ref() {
                         self.compiled_target_tokens.push(descr_ref.clone());
@@ -3897,8 +3902,8 @@ impl Assembler386 {
         dynasm!(self.mc ; .arch aarch64 ; =>label);
         if let Some(descr) = loop_target_descr(op) {
             descr.set_ll_loop_code(self.mc.offset().0);
-            if let Some(index) = loop_target_index(op) {
-                self.target_tokens_currently_compiling.insert(index, label);
+            if let Some(id) = loop_target_id(op) {
+                self.target_tokens_currently_compiling.insert(id, label);
             }
             if let Some(descr_ref) = op.descr.as_ref() {
                 self.compiled_target_tokens.push(descr_ref.clone());
@@ -4050,8 +4055,8 @@ impl Assembler386 {
         }
 
         let jump_descr = loop_target_descr(op);
-        if let Some(label) = loop_target_index(op)
-            .and_then(|k| self.target_tokens_currently_compiling.get(&k).copied())
+        if let Some(label) =
+            loop_target_id(op).and_then(|k| self.target_tokens_currently_compiling.get(&k).copied())
         {
             // Same-buffer jump (loop body)
             #[cfg(target_arch = "x86_64")]

@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use crate::arch::*;
 use crate::gcmap::{allocate_gcmap, gcmap_set_bit};
 use crate::regloc::*;
-use majit_ir::{InputArg, LoopTargetDescr, Op, OpCode, OpRef, TargetArgLoc, Type};
+use majit_ir::{InputArg, LoopTargetDescr, Op, OpCode, OpRef, TargetArgLoc, Type, descr_identity};
 
 // ── Constants ──────────────────────────────────────────────────────
 
@@ -1621,10 +1621,14 @@ pub struct RegAlloc {
     pub pending_moves: Vec<(Loc, Loc)>,
     /// OpRef → Type mapping for type dispatch.
     pub value_types: HashMap<u32, Type>,
-    /// arm/regalloc.py: self.jump_target_descr
-    jump_target_descr: Option<u32>,
-    /// arm/regalloc.py: self.final_jump_op
-    final_jump_args: Option<(u32, Vec<OpRef>)>,
+    /// x86/regalloc.py:1305 self.jump_target_descr — TargetToken descriptor
+    /// of the closing JUMP. PyPy keys it by Python object identity; we use
+    /// the underlying `Arc<dyn Descr>` allocation address.
+    jump_target_descr: Option<usize>,
+    /// x86/regalloc.py:1407 self.final_jump_op — paired (descr identity,
+    /// jump arglist) so consider_label can recognize a self-loop and emit
+    /// frame position hints via add_frame_pos_hint.
+    final_jump_args: Option<(usize, Vec<OpRef>)>,
 }
 
 impl RegAlloc {
@@ -3031,11 +3035,10 @@ impl RegAlloc {
 
     /// x86/regalloc.py:1303 consider_jump
     fn consider_jump(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
-        self.final_jump_args = op
-            .descr
-            .as_ref()
-            .map(|descr| (descr.index(), op.args.to_vec()));
-        self.jump_target_descr = op.descr.as_ref().map(|descr| descr.index());
+        // x86/regalloc.py:1306-1309: descr = op.getdescr(); self.jump_target_descr = descr
+        let descr_id = op.descr.as_ref().map(descr_identity);
+        self.final_jump_args = descr_id.map(|id| (id, op.args.to_vec()));
+        self.jump_target_descr = descr_id;
         let mut locs = Vec::new();
         for &arg in &op.args {
             let tp = self.tp(arg);
@@ -3069,15 +3072,12 @@ impl RegAlloc {
             locs.push(loc);
         }
 
-        if let Some(loop_descr) = op
-            .descr
-            .as_deref()
-            .and_then(majit_ir::Descr::as_loop_target_descr)
-        {
+        // x86/regalloc.py:1407-1409: if jump_op.getdescr() is descr → hints
+        if let Some(label_id) = op.descr.as_ref().map(descr_identity) {
             if self
                 .final_jump_args
                 .as_ref()
-                .is_some_and(|(descr_index, _)| *descr_index == loop_descr.index())
+                .is_some_and(|(jump_id, _)| *jump_id == label_id)
             {
                 if let Some((_, jump_args)) = &self.final_jump_args {
                     for (iarg, target_loc) in jump_args.iter().zip(locs.iter()) {

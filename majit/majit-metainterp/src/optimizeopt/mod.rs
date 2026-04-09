@@ -3239,7 +3239,9 @@ impl OptContext {
             // false.
             let is_object = parent_descr
                 .as_size_descr()
-                .expect("ensure_ptr_info_arg0: FieldDescr.get_parent_descr() must point at a SizeDescr")
+                .expect(
+                    "ensure_ptr_info_arg0: FieldDescr.get_parent_descr() must point at a SizeDescr",
+                )
                 .is_object();
             let mut new_info = if is_object {
                 PtrInfo::instance(Some(parent_descr.clone()), None)
@@ -3743,9 +3745,8 @@ mod ensure_ptr_info_arg0_tests {
     }
 
     fn field_op_with_parent(parent: DescrRef) -> Op {
-        let descr: DescrRef = Arc::new(
-            SimpleFieldDescr::new(0, 0, 8, Type::Int, false).with_parent_descr(parent, 0),
-        );
+        let descr: DescrRef =
+            Arc::new(SimpleFieldDescr::new(0, 0, 8, Type::Int, false).with_parent_descr(parent, 0));
         let mut op = Op::with_descr(OpCode::GetfieldGcI, &[OpRef(0)], descr);
         op.pos = OpRef(1);
         op

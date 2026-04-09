@@ -15,6 +15,15 @@ use serde::{Deserialize, Serialize};
 /// Opaque reference to a descriptor, shared across the JIT pipeline.
 pub type DescrRef = Arc<dyn Descr>;
 
+/// history.py: TargetToken / JitCellToken identity. PyPy keys
+/// `target_tokens_currently_compiling` and `consider_jump`'s
+/// `jump_target_descr` by descriptor object identity (Python's default
+/// `dict[obj]`). Mirror that here by hashing on the underlying allocation
+/// address of the `Arc<dyn Descr>`.
+pub fn descr_identity(descr: &DescrRef) -> usize {
+    Arc::as_ptr(descr) as *const () as usize
+}
+
 /// backend/*/regalloc.py: LABEL/JUMP arg location payload attached to
 /// TargetToken descriptors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

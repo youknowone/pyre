@@ -1791,7 +1791,8 @@ impl PartialEq for ExportedShortOp {
 #[derive(Clone, Debug)]
 pub struct TargetToken {
     /// RPython history.py: identity of this target token within the current
-    /// JitCellToken.target_tokens list.
+    /// JitCellToken.target_tokens list. Debug-display only — backend identity
+    /// is the `jump_target_descr` Arc address.
     pub token_id: u64,
     /// compile.py: start_descr — the preamble target token has no virtual
     /// state and lives at target_tokens[0].
