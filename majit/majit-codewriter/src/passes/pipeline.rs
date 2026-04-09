@@ -43,14 +43,30 @@ pub struct PipelineResult {
 
 /// Canonical opcode dispatch metadata.
 ///
-/// RPython: each opcode handler's graph is transformed and flattened
-/// into a JitCode instruction sequence. The `flattened` field holds
-/// the result of inline → jtransform → flatten.
+/// RPython parity: PyPy's interpreter has one Python method per opcode
+/// (e.g. `def LOAD_FAST(self, varindex, next_instr)`), and each method
+/// is registered with `CallControl.get_jitcode(graph)` which assigns it
+/// a slot in `all_jitcodes[]`. pyre's interpreter does the same dispatch
+/// inside one big `match` instead of separate methods, so the parser
+/// extracts each match arm body as its own synthetic graph and the
+/// canonical pipeline registers it under
+/// `CallPath::["__opcode_dispatch__", "<selector>#<arm_id>"]`. The result
+/// is the same: each arm gets its own indexed jitcode.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipelineOpcodeArm {
+    /// Sequential id assigned at extract time. Stable across runs.
+    /// Identity for cross-references; selector string is display only.
+    pub arm_id: usize,
+    /// Display label only. Multi-pattern arms keep their `A | B` shape;
+    /// the manifest layer expands variants downstream.
     pub selector: OpcodeDispatchSelector,
-    /// Inlined + jtransform'd + flattened output.
-    /// None if the opcode handler was too trivial or unsupported.
+    /// Index into `ProgramPipelineResult.jitcodes` once the arm has been
+    /// processed by `CodeWriter::drain_pending_graphs`. None if the arm
+    /// has no body graph (rare).
+    pub entry_jitcode_index: Option<usize>,
+    /// Flattened SSARepr — kept for debug / snapshot diff. The orthodox
+    /// pipeline produces its own flattened repr inside
+    /// `transform_graph_to_jitcode`; this field is the parser-level view.
     pub flattened: Option<SSARepr>,
 }
 

@@ -425,16 +425,26 @@ fn analyze_pipeline_from_parsed(
 
 /// Build opcode dispatch arms and produce JitCodes for discovered callee graphs.
 ///
-/// RPython: the portal graph is processed by `CodeWriter.make_jitcodes()`.
-/// In majit, opcode arm body_graphs are NOT portal graphs — they're extracted
-/// match arm bodies. They go through annotate → rtype → jtransform → flatten
-/// to produce SSARepr for the flattened field. During jtransform, callee
-/// functions may be discovered via `CallControl.get_jitcode()` and added to
-/// the pending queue.
+/// RPython parity (`rpython/jit/codewriter/codewriter.py:74-89` `make_jitcodes`):
 ///
-/// After all arms are processed, `CodeWriter.make_jitcodes()` processes the
-/// pending queue to produce JitCodes — this is the RPython-orthodox path
-/// (codewriter.py:74-89). Opcode arms themselves do NOT become JitCodes.
+/// ```python
+/// def make_jitcodes(self, verbose=False):
+///     self.callcontrol.grab_initial_jitcodes()
+///     all_jitcodes = []
+///     for graph, jitcode in self.callcontrol.enum_pending_graphs():
+///         self.transform_graph_to_jitcode(graph, jitcode, verbose, len(all_jitcodes))
+///         all_jitcodes.append(jitcode)
+///     self.assembler.finished(self.callcontrol.callinfocollection)
+///     return all_jitcodes
+/// ```
+///
+/// PyPy registers each opcode handler as its own Python method, so PyPy's
+/// codewriter naturally gets one jitcode per opcode via the discovery loop.
+/// pyre's interpreter dispatches inside one big match instead of separate
+/// methods, so we register each match arm body as a synthetic graph here
+/// (`CallPath::["__opcode_dispatch__", "<selector>#<arm_id>"]`) and the
+/// orthodox `drain_pending_graphs` loop picks them up exactly the same way
+/// it picks up callee graphs discovered during jtransform.
 fn build_canonical_opcode_dispatch(
     parsed_files: &[parse::ParsedInterpreter],
     trait_impls: &[TraitImplInfo],
@@ -464,44 +474,70 @@ fn build_canonical_opcode_dispatch(
     let mut jitcodes: Vec<Option<assembler::JitCode>> = Vec::new();
 
     // Phase 1: RPython grab_initial_jitcodes + drain portal + callees.
+    // RPython call.py:145-148.
     call_control.grab_initial_jitcodes();
     codewriter.drain_pending_graphs(call_control, &pipeline_config.transform, &mut jitcodes);
 
-    // Phase 2: majit-specific arm processing (SSARepr for PipelineOpcodeArm).
-    // get_jitcode() calls are idempotent for already-known callees;
-    // new callees are added to the pending queue.
-    let dispatch: Vec<passes::PipelineOpcodeArm> = opcode_arms
-        .into_iter()
-        .map(|arm| {
-            let _resolved_calls = resolve_handler_calls(
-                &arm.handler_calls,
-                trait_impls,
-                inherent_methods,
-                function_graphs,
-                &receiver_traits,
-            );
+    // Phase 2: register each opcode arm body as a synthetic graph.
+    //
+    // PyPy's interpreter has one Python method per opcode and `find_all_graphs`
+    // discovers them naturally; pyre dispatches inside one match, so we walk
+    // the parser-extracted arms and call `register_function_graph` +
+    // `get_jitcode` ourselves. Each arm gets a stable `arm_id` (extract order)
+    // and a synthetic `CallPath::["__opcode_dispatch__", "<selector>#<arm_id>"]`
+    // which decouples display label (selector) from identity (path/index).
+    //
+    // The parser-level `flattened` field is computed eagerly here so existing
+    // snapshot tests / debug dumps keep working. The orthodox pipeline inside
+    // `drain_pending_graphs` will recompute its own SSARepr+JitCode below
+    // and place the result at `jitcodes[entry_jitcode_index]`.
+    let mut dispatch: Vec<passes::PipelineOpcodeArm> = Vec::with_capacity(opcode_arms.len());
+    for (arm_id, arm) in opcode_arms.into_iter().enumerate() {
+        let _resolved_calls = resolve_handler_calls(
+            &arm.handler_calls,
+            trait_impls,
+            inherent_methods,
+            function_graphs,
+            &receiver_traits,
+        );
 
-            let flattened = arm.body_graph.as_ref().map(|handler_graph| {
-                let annotations = passes::annotate_graph(handler_graph);
-                let type_state = passes::resolve_types(handler_graph, &annotations);
-                let mut transformer = passes::Transformer::new(&pipeline_config.transform)
-                    .with_callcontrol(&mut *call_control)
-                    .with_type_state(&type_state);
-                let rewritten = transformer.transform(handler_graph);
-                passes::flatten_with_types(&rewritten.graph, &type_state)
-            });
+        // Parser-level flatten — kept for snapshot tests / debug.
+        let flattened = arm.body_graph.as_ref().map(|handler_graph| {
+            let annotations = passes::annotate_graph(handler_graph);
+            let type_state = passes::resolve_types(handler_graph, &annotations);
+            let mut transformer = passes::Transformer::new(&pipeline_config.transform)
+                .with_callcontrol(&mut *call_control)
+                .with_type_state(&type_state);
+            let rewritten = transformer.transform(handler_graph);
+            passes::flatten_with_types(&rewritten.graph, &type_state)
+        });
 
-            passes::PipelineOpcodeArm {
-                selector: arm.selector,
-                flattened,
-            }
-        })
-        .collect();
+        // Register the arm body in CallControl + reserve a jitcode slot.
+        // RPython call.py:155-172 `get_jitcode(graph)`.
+        let entry_jitcode_index = arm.body_graph.map(|body_graph| {
+            let synthetic_path = synthetic_opcode_arm_path(&arm.selector, arm_id);
+            call_control.register_function_graph(synthetic_path.clone(), body_graph);
+            call_control.get_jitcode(&synthetic_path)
+        });
 
-    // Phase 3: Drain any NEW callees from Phase 2, into the SAME jitcodes vec.
+        dispatch.push(passes::PipelineOpcodeArm {
+            arm_id,
+            selector: arm.selector,
+            entry_jitcode_index,
+            flattened,
+        });
+    }
+
+    // Phase 3: Drain pending graphs.
+    //
+    // RPython codewriter.py:79-84: `for graph, jitcode in enum_pending_graphs()`.
+    // After Phase 2 every opcode arm body is on `unfinished_graphs`, plus any
+    // callees discovered during the parser-level transform pass above. Each
+    // gets transformed → assembled in turn, and any *new* callees they reach
+    // are added to the queue and picked up by the same loop.
     codewriter.drain_pending_graphs(call_control, &pipeline_config.transform, &mut jitcodes);
 
-    // RPython: self.assembler.finished(callinfocollection) (codewriter.py:85)
+    // RPython codewriter.py:85: self.assembler.finished(callinfocollection).
     codewriter
         .assembler
         .finished(&call_control.callinfocollection);
@@ -510,6 +546,26 @@ fn build_canonical_opcode_dispatch(
     let jitcodes = jitcodes.into_iter().flatten().collect();
 
     (dispatch, jitcodes)
+}
+
+/// Synthetic CallPath for an opcode-dispatch arm body.
+///
+/// PyPy uses `graph.name` (which is the Python method name) as the
+/// debug label and `graph` object identity as the dict key in
+/// `CallControl.jitcodes`. pyre uses `CallPath` as the dict key, so we
+/// build a 2-segment synthetic path:
+///   `["__opcode_dispatch__", "<selector_canonical>#<arm_id>"]`
+/// The `#<arm_id>` suffix guarantees collision-free keys even if two
+/// arms shared a selector string (parser already rejects that, but the
+/// suffix makes the invariant local to this function).
+fn synthetic_opcode_arm_path(
+    selector: &parse::OpcodeDispatchSelector,
+    arm_id: usize,
+) -> parse::CallPath {
+    parse::CallPath::from_segments([
+        "__opcode_dispatch__".to_string(),
+        format!("{}#{}", selector.canonical_key(), arm_id),
+    ])
 }
 
 /// Classify a resolved call by jtransform-rewriting its graph.

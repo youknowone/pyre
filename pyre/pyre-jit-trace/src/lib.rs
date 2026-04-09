@@ -7,6 +7,7 @@
 
 pub mod callbacks;
 pub mod descr;
+pub mod dispatch_manifest;
 pub mod driver;
 pub mod frame_layout;
 pub mod helpers;
