@@ -1445,7 +1445,11 @@ impl<S: JitState> JitDriver<S> {
         if !self.sync_before(state, &meta, descriptor.as_ref()) {
             return;
         }
-        let live_values = state.extract_live_values(&meta);
+        // history.py:_make_op parity: function-entry traces record
+        // typed inputargs from the start (Int / Float / Ref) so the
+        // optimizer reads the kind directly from the box. See
+        // `JitState::extract_live_values_for_entry`.
+        let live_values = state.extract_live_values_for_entry(&meta);
         if !Self::live_values_match_descriptor(descriptor.as_ref(), &live_values) {
             return;
         }

@@ -2626,6 +2626,33 @@ impl JitState for PyreJitState {
         )
     }
 
+    /// history.py:_make_op parity: pyre pre-unboxes Python locals at
+    /// the JIT entry boundary for function-entry traces, so the
+    /// recorder records each inputarg with the post-unbox kind exactly
+    /// as RPython's `wrap` produces typed FrontendOps from the start.
+    /// Loop traces still call `extract_live_values` directly because
+    /// the loop preamble peeling assumes boxed locals at the loop
+    /// header (the recorder emits `guard_class` + `getfield_gc_pure_*`
+    /// inside the trace).
+    fn extract_live_values_for_entry(&self, meta: &Self::Meta) -> Vec<Value> {
+        let mut values = self.extract_live_values(meta);
+        let scalar_count = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
+        let total_slots = meta.valuestackdepth;
+        for slot_idx in 0..total_slots {
+            let value_idx = scalar_count + slot_idx;
+            let Some(value) = values.get_mut(value_idx) else {
+                break;
+            };
+            let raw = match value {
+                Value::Ref(r) => r.as_usize() as PyObjectRef,
+                _ => continue,
+            };
+            let slot_type = concrete_value_type(raw);
+            *value = extract_concrete_typed_value(slot_type, raw);
+        }
+        values
+    }
+
     fn live_value_types(&self, meta: &Self::Meta) -> Vec<Type> {
         crate::virtualizable_gen::virt_live_value_types(meta.slot_types.len())
     }

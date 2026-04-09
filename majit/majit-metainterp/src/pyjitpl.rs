@@ -2098,30 +2098,12 @@ impl<M: Clone> MetaInterp<M> {
                         let mut simple_opt = Optimizer::default_pipeline();
                         simple_opt.constant_types = constant_types.clone();
                         simple_opt.numbering_type_overrides = numbering_overrides.clone();
-                        let reconciled_inputarg_types: Vec<majit_ir::Type> = {
-                            let first_guard_types = trace_ops_snapshot
-                                .iter()
-                                .find(|op| op.opcode.is_guard())
-                                .and_then(|op| {
-                                    op.descr
-                                        .as_ref()
-                                        .and_then(|d| d.as_fail_descr())
-                                        .map(|fd| fd.fail_arg_types().to_vec())
-                                });
-                            trace
-                                .inputargs
-                                .iter()
-                                .enumerate()
-                                .map(|(i, ia)| {
-                                    first_guard_types
-                                        .as_ref()
-                                        .and_then(|t| t.get(i).copied())
-                                        .unwrap_or(ia.tp)
-                                })
-                                .collect()
-                        };
-                        simple_opt.trace_inputarg_types = reconciled_inputarg_types.clone();
-                        for (i, &tp) in reconciled_inputarg_types.iter().enumerate() {
+                        // history.py:_make_op parity — see the
+                        // function-entry compile path below.
+                        let inputarg_types: Vec<majit_ir::Type> =
+                            trace.inputargs.iter().map(|ia| ia.tp).collect();
+                        simple_opt.trace_inputarg_types = inputarg_types.clone();
+                        for (i, &tp) in inputarg_types.iter().enumerate() {
                             simple_opt.constant_types.insert(i as u32, tp);
                         }
                         simple_opt.original_trace_op_types =
@@ -3209,67 +3191,19 @@ impl<M: Clone> MetaInterp<M> {
         };
         optimizer.constant_types = constant_types.clone();
         optimizer.numbering_type_overrides = numbering_overrides;
-        // RPython Box.type parity: pyre's recorder records each inputarg
-        // with the JITCODE-LEVEL type (Python locals are PyObjectRef so all
-        // Python locals come in as Type::Ref). The actual post-unbox type
-        // is recorded on each guard's MetaFailDescr.fail_arg_types when the
-        // recorder emits the guard (state.rs::record_current_state_guard
-        // / generate_guard_core derives fail_arg_types from
-        // build_fail_arg_types_for_active_boxes which inspects the
-        // symbolic stack types).
-        //
-        // The optimizer needs the unboxed types so OptBoxEnv::get_type
-        // returns Int for an unboxed local; otherwise store_final_boxes
-        // populates livebox_types with the source Ref type and the
-        // bridge tracer inherits the wrong type for its symbolic_locals.
-        //
-        // RPython has no equivalent because RPython's recorder produces
-        // typed boxes directly (IntFrontendOp, RefFrontendOp,
-        // FloatFrontendOp), and the optimizer reads `box.type` from the
-        // box object.  pyre carries the type on the FailDescr because the
-        // recorder cannot retroactively change the inputarg's type once
-        // a slot has been observed.
-        //
-        // Reconcile inputarg types from the FIRST guard's fail_arg_types
-        // BEFORE seeding the optimizer state. The first guard in the
-        // recorded trace is `GuardFalse(IntLt(v_n, 2))` for fib, with
-        // `fail_arg_types = [Ref, Int, Ref, Int, Ref, Int]` — the
-        // post-unbox view that the optimizer should use.
-        //
-        // Read from `trace_ops` (post-fold_box_into_create_frame /
-        // elide_create_frame_for_call_assembler) so the lookup matches
-        // what the optimizer actually sees. Those transforms only fold
-        // call helpers and never insert/remove guards, so the first
-        // guard's MetaFailDescr is unchanged, but reading from the same
-        // op slice keeps any future invariant we add to those passes
-        // honest.
-        let reconciled_inputarg_types: Vec<majit_ir::Type> = {
-            let first_guard_types =
-                trace_ops
-                    .iter()
-                    .find(|op| op.opcode.is_guard())
-                    .and_then(|op| {
-                        op.descr
-                            .as_ref()
-                            .and_then(|d| d.as_fail_descr())
-                            .map(|fd| fd.fail_arg_types().to_vec())
-                    });
-            trace
-                .inputargs
-                .iter()
-                .enumerate()
-                .map(|(i, ia)| {
-                    first_guard_types
-                        .as_ref()
-                        .and_then(|t| t.get(i).copied())
-                        .unwrap_or(ia.tp)
-                })
-                .collect()
-        };
-        optimizer.trace_inputarg_types = reconciled_inputarg_types.clone();
-        // RPython Box.type parity: register inputarg types in constant_types
-        // so fail_arg_types inference can resolve them.
-        for (i, &tp) in reconciled_inputarg_types.iter().enumerate() {
+        // history.py:_make_op parity: every InputArg carries its type
+        // (IntFrontendOp / RefFrontendOp / FloatFrontendOp) from the
+        // moment it was wrapped in `warmstate.py:wrap`. The optimizer
+        // reads `box.type` directly. majit's recorder mirrors this:
+        // each `trace.inputargs[i].tp` already records the kind, so we
+        // propagate the raw recorder types to the optimizer without
+        // further reconciliation. Function-entry recording goes
+        // through `JitState::extract_live_values_for_entry` so the
+        // recorder sees Int / Float for unboxed Python locals from the
+        // start.
+        let inputarg_types: Vec<majit_ir::Type> = trace.inputargs.iter().map(|ia| ia.tp).collect();
+        optimizer.trace_inputarg_types = inputarg_types.clone();
+        for (i, &tp) in inputarg_types.iter().enumerate() {
             optimizer.constant_types.insert(i as u32, tp);
         }
         optimizer.original_trace_op_types = pre_cut_trace_op_types;
