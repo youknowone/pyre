@@ -42,6 +42,7 @@ fn stable_array_index(base_size: usize, item_size: usize, item_type: Type, signe
 /// RPython FieldDescr: describes a field in a GC/raw struct.
 #[derive(Debug)]
 pub struct PyreFieldDescr {
+    parent_descr: Option<DescrRef>,
     offset: usize,
     field_size: usize,
     field_type: Type,
@@ -95,6 +96,10 @@ impl Descr for PyreArrayDescr {
 }
 
 impl FieldDescr for PyreFieldDescr {
+    fn parent_descr(&self) -> Option<DescrRef> {
+        self.parent_descr.clone()
+    }
+
     fn offset(&self) -> usize {
         self.offset
     }
@@ -142,6 +147,7 @@ pub fn make_field_descr(
     signed: bool,
 ) -> DescrRef {
     Arc::new(PyreFieldDescr {
+        parent_descr: None,
         offset,
         field_size,
         field_type,
@@ -160,6 +166,7 @@ pub fn make_field_descr_full(
     immutable: bool,
 ) -> DescrRef {
     Arc::new(PyreFieldDescr {
+        parent_descr: None,
         offset,
         field_size,
         field_type,
@@ -179,6 +186,7 @@ pub fn make_immutable_field_descr(
     signed: bool,
 ) -> DescrRef {
     Arc::new(PyreFieldDescr {
+        parent_descr: None,
         offset,
         field_size,
         field_type,
@@ -198,6 +206,7 @@ pub fn make_quasi_immutable_field_descr(
     signed: bool,
 ) -> DescrRef {
     Arc::new(PyreFieldDescr {
+        parent_descr: None,
         offset,
         field_size,
         field_type,
@@ -208,11 +217,69 @@ pub fn make_quasi_immutable_field_descr(
     })
 }
 
+pub fn make_quasi_immutable_field_descr_with_parent(
+    parent_descr: DescrRef,
+    offset: usize,
+    field_size: usize,
+    field_type: Type,
+    signed: bool,
+) -> DescrRef {
+    Arc::new(PyreFieldDescr {
+        parent_descr: Some(parent_descr),
+        offset,
+        field_size,
+        field_type,
+        signed,
+        immutable: false,
+        quasi_immutable: true,
+        name: "",
+    })
+}
+
+pub fn make_field_descr_with_parent(
+    parent_descr: DescrRef,
+    offset: usize,
+    field_size: usize,
+    field_type: Type,
+    signed: bool,
+) -> DescrRef {
+    Arc::new(PyreFieldDescr {
+        parent_descr: Some(parent_descr),
+        offset,
+        field_size,
+        field_type,
+        signed,
+        immutable: false,
+        quasi_immutable: false,
+        name: "",
+    })
+}
+
+pub fn make_immutable_field_descr_with_parent(
+    parent_descr: DescrRef,
+    offset: usize,
+    field_size: usize,
+    field_type: Type,
+    signed: bool,
+) -> DescrRef {
+    Arc::new(PyreFieldDescr {
+        parent_descr: Some(parent_descr),
+        offset,
+        field_size,
+        field_type,
+        signed,
+        immutable: true,
+        quasi_immutable: false,
+        name: "",
+    })
+}
+
 /// Concrete size descriptor for fixed-size object allocations.
 #[derive(Debug)]
 pub struct PyreSizeDescr {
     obj_size: usize,
     type_id: u32,
+    is_object: bool,
     /// descr.get_vtable() parity: ob_type pointer for NewWithVtable.
     /// optimize_new_with_vtable reads this to set VirtualInfo.known_class.
     vtable: usize,
@@ -257,6 +324,10 @@ impl SizeDescr for PyreSizeDescr {
     fn is_immutable(&self) -> bool {
         false
     }
+
+    fn is_object(&self) -> bool {
+        self.is_object
+    }
 }
 
 /// Create a size descriptor for a fixed-size object.
@@ -264,6 +335,7 @@ pub fn make_size_descr(obj_size: usize) -> DescrRef {
     Arc::new(PyreSizeDescr {
         obj_size,
         type_id: 0,
+        is_object: false,
         vtable: 0,
     })
 }
@@ -272,7 +344,17 @@ pub fn make_size_descr_with_type(obj_size: usize, type_id: u32) -> DescrRef {
     Arc::new(PyreSizeDescr {
         obj_size,
         type_id,
+        is_object: false,
         vtable: 0,
+    })
+}
+
+pub fn make_object_size_descr(obj_size: usize, type_id: u32, vtable: usize) -> DescrRef {
+    Arc::new(PyreSizeDescr {
+        obj_size,
+        type_id,
+        is_object: true,
+        vtable,
     })
 }
 
@@ -298,15 +380,16 @@ use pyre_object::floatobject::{FLOAT_FLOATVAL_OFFSET, W_FloatObject};
 use pyre_object::intobject::W_IntObject;
 use pyre_object::pyobject::OB_TYPE_OFFSET;
 use pyre_object::rangeobject::{
-    RANGE_ITER_CURRENT_OFFSET, RANGE_ITER_STEP_OFFSET, RANGE_ITER_STOP_OFFSET,
+    RANGE_ITER_CURRENT_OFFSET, RANGE_ITER_STEP_OFFSET, RANGE_ITER_STOP_OFFSET, RANGE_ITER_TYPE,
+    W_RangeIterator,
 };
 use pyre_object::{
     BOOL_BOOLVAL_OFFSET, DICT_LEN_OFFSET, FLOAT_ARRAY_HEAP_CAP_OFFSET, FLOAT_ARRAY_LEN_OFFSET,
     FLOAT_ARRAY_PTR_OFFSET, INT_ARRAY_HEAP_CAP_OFFSET, INT_ARRAY_LEN_OFFSET, INT_ARRAY_PTR_OFFSET,
     INT_INTVAL_OFFSET, PYOBJECT_ARRAY_HEAP_CAP_OFFSET, PYOBJECT_ARRAY_LEN_OFFSET, STR_LEN_OFFSET,
-    W_ListObject, W_TupleObject,
+    W_DictObject, W_ListObject, W_TupleObject,
 };
-use pyre_object::{FLOAT_TYPE, INT_TYPE};
+use pyre_object::{DICT_TYPE, FLOAT_TYPE, INT_TYPE, LIST_TYPE, TUPLE_TYPE};
 
 /// Field descriptor for `PyObject.w_class` (Ref, mutable).
 ///
@@ -319,7 +402,13 @@ use pyre_object::{FLOAT_TYPE, INT_TYPE};
 ///
 /// Mutable because __class__ assignment can change it.
 pub fn w_class_descr() -> DescrRef {
-    make_field_descr(pyre_object::pyobject::W_CLASS_OFFSET, 8, Type::Ref, false)
+    make_field_descr_with_parent(
+        pyobject_size_descr(),
+        pyre_object::pyobject::W_CLASS_OFFSET,
+        8,
+        Type::Ref,
+        false,
+    )
 }
 
 /// Alias for backward compatibility — same as w_class_descr().
@@ -329,21 +418,40 @@ pub fn instance_w_type_descr() -> DescrRef {
 
 /// Field descriptor for `W_RangeIterator.current` (i64, signed).
 pub fn range_iter_current_descr() -> DescrRef {
-    make_field_descr(RANGE_ITER_CURRENT_OFFSET, 8, Type::Int, true)
+    make_field_descr_with_parent(
+        w_range_iter_size_descr(),
+        RANGE_ITER_CURRENT_OFFSET,
+        8,
+        Type::Int,
+        true,
+    )
 }
 
 /// Field descriptor for `W_RangeIterator.stop` (i64, signed).
 pub fn range_iter_stop_descr() -> DescrRef {
-    make_field_descr(RANGE_ITER_STOP_OFFSET, 8, Type::Int, true)
+    make_field_descr_with_parent(
+        w_range_iter_size_descr(),
+        RANGE_ITER_STOP_OFFSET,
+        8,
+        Type::Int,
+        true,
+    )
 }
 
 /// Field descriptor for `W_RangeIterator.step` (i64, signed).
 pub fn range_iter_step_descr() -> DescrRef {
-    make_field_descr(RANGE_ITER_STEP_OFFSET, 8, Type::Int, true)
+    make_field_descr_with_parent(
+        w_range_iter_size_descr(),
+        RANGE_ITER_STEP_OFFSET,
+        8,
+        Type::Int,
+        true,
+    )
 }
 
 pub fn list_items_ptr_descr() -> DescrRef {
-    make_field_descr(
+    make_field_descr_with_parent(
+        w_list_size_descr(),
         std::mem::offset_of!(W_ListObject, items),
         8,
         Type::Int,
@@ -356,7 +464,8 @@ pub fn list_strategy_descr() -> DescrRef {
     // Marking immutable lets the heap cache survive calls (boxing etc.),
     // eliminating repeated GetfieldGcI(strategy) + GuardValue(strategy)
     // within the same loop body.
-    make_immutable_field_descr(
+    make_immutable_field_descr_with_parent(
+        w_list_size_descr(),
         std::mem::offset_of!(W_ListObject, strategy),
         1,
         Type::Int,
@@ -365,7 +474,8 @@ pub fn list_strategy_descr() -> DescrRef {
 }
 
 pub fn list_items_len_descr() -> DescrRef {
-    make_field_descr(
+    make_field_descr_with_parent(
+        w_list_size_descr(),
         std::mem::offset_of!(W_ListObject, items) + PYOBJECT_ARRAY_LEN_OFFSET,
         8,
         Type::Int,
@@ -374,7 +484,8 @@ pub fn list_items_len_descr() -> DescrRef {
 }
 
 pub fn list_int_items_ptr_descr() -> DescrRef {
-    make_field_descr(
+    make_field_descr_with_parent(
+        w_list_size_descr(),
         std::mem::offset_of!(W_ListObject, int_items) + INT_ARRAY_PTR_OFFSET,
         8,
         Type::Int,
@@ -383,7 +494,8 @@ pub fn list_int_items_ptr_descr() -> DescrRef {
 }
 
 pub fn list_int_items_len_descr() -> DescrRef {
-    make_field_descr(
+    make_field_descr_with_parent(
+        w_list_size_descr(),
         std::mem::offset_of!(W_ListObject, int_items) + INT_ARRAY_LEN_OFFSET,
         8,
         Type::Int,
@@ -392,7 +504,8 @@ pub fn list_int_items_len_descr() -> DescrRef {
 }
 
 pub fn list_int_items_heap_cap_descr() -> DescrRef {
-    make_field_descr(
+    make_field_descr_with_parent(
+        w_list_size_descr(),
         std::mem::offset_of!(W_ListObject, int_items) + INT_ARRAY_HEAP_CAP_OFFSET,
         8,
         Type::Int,
@@ -401,7 +514,8 @@ pub fn list_int_items_heap_cap_descr() -> DescrRef {
 }
 
 pub fn list_float_items_ptr_descr() -> DescrRef {
-    make_field_descr(
+    make_field_descr_with_parent(
+        w_list_size_descr(),
         std::mem::offset_of!(W_ListObject, float_items) + FLOAT_ARRAY_PTR_OFFSET,
         8,
         Type::Int,
@@ -410,7 +524,8 @@ pub fn list_float_items_ptr_descr() -> DescrRef {
 }
 
 pub fn list_float_items_len_descr() -> DescrRef {
-    make_field_descr(
+    make_field_descr_with_parent(
+        w_list_size_descr(),
         std::mem::offset_of!(W_ListObject, float_items) + FLOAT_ARRAY_LEN_OFFSET,
         8,
         Type::Int,
@@ -419,7 +534,8 @@ pub fn list_float_items_len_descr() -> DescrRef {
 }
 
 pub fn list_float_items_heap_cap_descr() -> DescrRef {
-    make_field_descr(
+    make_field_descr_with_parent(
+        w_list_size_descr(),
         std::mem::offset_of!(W_ListObject, float_items) + FLOAT_ARRAY_HEAP_CAP_OFFSET,
         8,
         Type::Int,
@@ -428,7 +544,8 @@ pub fn list_float_items_heap_cap_descr() -> DescrRef {
 }
 
 pub fn tuple_items_ptr_descr() -> DescrRef {
-    make_immutable_field_descr(
+    make_immutable_field_descr_with_parent(
+        w_tuple_size_descr(),
         std::mem::offset_of!(W_TupleObject, items),
         8,
         Type::Int,
@@ -437,7 +554,8 @@ pub fn tuple_items_ptr_descr() -> DescrRef {
 }
 
 pub fn tuple_items_len_descr() -> DescrRef {
-    make_immutable_field_descr(
+    make_immutable_field_descr_with_parent(
+        w_tuple_size_descr(),
         std::mem::offset_of!(W_TupleObject, items) + PYOBJECT_ARRAY_LEN_OFFSET,
         8,
         Type::Int,
@@ -446,7 +564,8 @@ pub fn tuple_items_len_descr() -> DescrRef {
 }
 
 pub fn list_items_heap_cap_descr() -> DescrRef {
-    make_field_descr(
+    make_field_descr_with_parent(
+        w_list_size_descr(),
         std::mem::offset_of!(W_ListObject, items) + PYOBJECT_ARRAY_HEAP_CAP_OFFSET,
         8,
         Type::Int,
@@ -455,31 +574,67 @@ pub fn list_items_heap_cap_descr() -> DescrRef {
 }
 
 pub fn int_intval_descr() -> DescrRef {
-    make_immutable_field_descr(INT_INTVAL_OFFSET, 8, Type::Int, true)
+    make_immutable_field_descr_with_parent(
+        w_int_size_descr(),
+        INT_INTVAL_OFFSET,
+        8,
+        Type::Int,
+        true,
+    )
 }
 
 pub fn bool_boolval_descr() -> DescrRef {
-    make_immutable_field_descr(BOOL_BOOLVAL_OFFSET, 1, Type::Int, false)
+    make_immutable_field_descr_with_parent(
+        w_int_size_descr(),
+        BOOL_BOOLVAL_OFFSET,
+        1,
+        Type::Int,
+        false,
+    )
 }
 
 pub fn float_floatval_descr() -> DescrRef {
-    make_immutable_field_descr(FLOAT_FLOATVAL_OFFSET, 8, Type::Float, false)
+    make_immutable_field_descr_with_parent(
+        w_float_size_descr(),
+        FLOAT_FLOATVAL_OFFSET,
+        8,
+        Type::Float,
+        false,
+    )
 }
 
 pub fn str_len_descr() -> DescrRef {
-    make_immutable_field_descr(STR_LEN_OFFSET, 8, Type::Int, false)
+    make_immutable_field_descr_with_parent(
+        pyobject_size_descr(),
+        STR_LEN_OFFSET,
+        8,
+        Type::Int,
+        false,
+    )
 }
 
 pub fn dict_len_descr() -> DescrRef {
-    make_field_descr(DICT_LEN_OFFSET, 8, Type::Int, false)
+    make_field_descr_with_parent(w_dict_size_descr(), DICT_LEN_OFFSET, 8, Type::Int, false)
 }
 
 pub fn namespace_values_ptr_descr() -> DescrRef {
-    make_field_descr(PYNAMESPACE_VALUES_OFFSET, 8, Type::Int, false)
+    make_field_descr_with_parent(
+        pynamespace_size_descr(),
+        PYNAMESPACE_VALUES_OFFSET,
+        8,
+        Type::Int,
+        false,
+    )
 }
 
 pub fn namespace_values_len_descr() -> DescrRef {
-    make_field_descr(PYNAMESPACE_VALUES_LEN_OFFSET, 8, Type::Int, false)
+    make_field_descr_with_parent(
+        pynamespace_size_descr(),
+        PYNAMESPACE_VALUES_LEN_OFFSET,
+        8,
+        Type::Int,
+        false,
+    )
 }
 
 // ── Object header & allocation descriptors ──────────────────────────
@@ -488,6 +643,7 @@ pub fn namespace_values_len_descr() -> DescrRef {
 /// heaptracker.py:66: `if name == 'typeptr': continue`
 pub fn ob_type_descr() -> DescrRef {
     Arc::new(PyreFieldDescr {
+        parent_descr: Some(pyobject_size_descr()),
         offset: OB_TYPE_OFFSET,
         field_size: 8,
         field_type: Type::Int,
@@ -501,21 +657,65 @@ pub fn ob_type_descr() -> DescrRef {
 /// Size descriptor for W_IntObject allocation via NewWithVtable.
 /// vtable = &INT_TYPE (ob_type for virtual materialization).
 pub fn w_int_size_descr() -> DescrRef {
-    Arc::new(PyreSizeDescr {
-        obj_size: std::mem::size_of::<W_IntObject>(),
-        type_id: W_INT_GC_TYPE_ID,
-        vtable: &INT_TYPE as *const _ as usize,
-    })
+    make_object_size_descr(
+        std::mem::size_of::<W_IntObject>(),
+        W_INT_GC_TYPE_ID,
+        &INT_TYPE as *const _ as usize,
+    )
 }
 
 /// Size descriptor for W_FloatObject allocation via NewWithVtable.
 /// vtable = &FLOAT_TYPE (ob_type for virtual materialization).
 pub fn w_float_size_descr() -> DescrRef {
-    Arc::new(PyreSizeDescr {
-        obj_size: std::mem::size_of::<W_FloatObject>(),
-        type_id: W_FLOAT_GC_TYPE_ID,
-        vtable: &FLOAT_TYPE as *const _ as usize,
-    })
+    make_object_size_descr(
+        std::mem::size_of::<W_FloatObject>(),
+        W_FLOAT_GC_TYPE_ID,
+        &FLOAT_TYPE as *const _ as usize,
+    )
+}
+
+pub fn pyobject_size_descr() -> DescrRef {
+    make_object_size_descr(
+        std::mem::size_of::<pyre_object::pyobject::PyObject>(),
+        OBJECT_GC_TYPE_ID,
+        &pyre_object::pyobject::INSTANCE_TYPE as *const _ as usize,
+    )
+}
+
+pub fn w_list_size_descr() -> DescrRef {
+    make_object_size_descr(
+        std::mem::size_of::<W_ListObject>(),
+        OBJECT_GC_TYPE_ID,
+        &LIST_TYPE as *const _ as usize,
+    )
+}
+
+pub fn w_tuple_size_descr() -> DescrRef {
+    make_object_size_descr(
+        std::mem::size_of::<W_TupleObject>(),
+        OBJECT_GC_TYPE_ID,
+        &TUPLE_TYPE as *const _ as usize,
+    )
+}
+
+pub fn w_dict_size_descr() -> DescrRef {
+    make_object_size_descr(
+        std::mem::size_of::<W_DictObject>(),
+        OBJECT_GC_TYPE_ID,
+        &DICT_TYPE as *const _ as usize,
+    )
+}
+
+pub fn w_range_iter_size_descr() -> DescrRef {
+    make_object_size_descr(
+        std::mem::size_of::<W_RangeIterator>(),
+        OBJECT_GC_TYPE_ID,
+        &RANGE_ITER_TYPE as *const _ as usize,
+    )
+}
+
+pub fn pynamespace_size_descr() -> DescrRef {
+    make_size_descr(std::mem::size_of::<pyre_interpreter::PyNamespace>())
 }
 
 #[cfg(test)]
@@ -540,5 +740,31 @@ mod tests {
 
         assert_eq!(a.index(), b.index());
         assert_ne!(a.index(), c.index());
+    }
+
+    #[test]
+    fn test_pyre_field_descr_parent_descr_for_object_field() {
+        let parent = list_strategy_descr()
+            .as_field_descr()
+            .and_then(|d| d.parent_descr())
+            .expect("list_strategy_descr must carry parent_descr");
+        let size = parent
+            .as_size_descr()
+            .expect("parent_descr must be a SizeDescr");
+
+        assert!(size.is_object());
+    }
+
+    #[test]
+    fn test_pyre_field_descr_parent_descr_for_struct_field() {
+        let parent = crate::state::frame_next_instr_descr()
+            .as_field_descr()
+            .and_then(|d| d.parent_descr())
+            .expect("frame_next_instr_descr must carry parent_descr");
+        let size = parent
+            .as_size_descr()
+            .expect("parent_descr must be a SizeDescr");
+
+        assert!(!size.is_object());
     }
 }

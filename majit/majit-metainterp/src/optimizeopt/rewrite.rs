@@ -1256,8 +1256,8 @@ impl OptRewrite {
             // rewrite.py:550-553: non-instance array pointer comparison.
             // If both are ArrayPtrInfo with known-different length bounds,
             // they cannot be the same object.
-            let lb0 = info0.as_ref().and_then(|i| i.getlenbound().cloned());
-            let lb1 = info1.as_ref().and_then(|i| i.getlenbound().cloned());
+            let lb0 = info0.clone().and_then(|i| i.into_owned().getlenbound(None));
+            let lb1 = info1.clone().and_then(|i| i.into_owned().getlenbound(None));
             if let (Some(lb0), Some(lb1)) = (lb0, lb1) {
                 if lb0.known_ne(&lb1) {
                     ctx.make_constant(op.pos, Value::Int(expect_isnot as i64));

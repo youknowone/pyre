@@ -52,9 +52,9 @@ enum JitAction {
 use crate::jit::descr::{
     JITFRAME_GC_TYPE_ID, OBJECT_GC_TYPE_ID, W_FLOAT_GC_TYPE_ID, W_INT_GC_TYPE_ID,
 };
-use crate::jit::virtualizable_gen::build_virtualizable_info;
 use majit_gc::collector::MiniMarkGC;
 use majit_metainterp::JitDriver;
+use pyre_jit_trace::frame_layout::build_pyframe_virtualizable_info;
 use pyre_object::floatobject::{FLOAT_FLOATVAL_OFFSET, W_FloatObject};
 use pyre_object::intobject::{INT_INTVAL_OFFSET, W_IntObject};
 use pyre_object::{w_bool_from, w_int_new, w_none, w_str_new, w_tuple_new};
@@ -67,7 +67,7 @@ type JitDriverPair = (
 
 thread_local! {
     static JIT_DRIVER: UnsafeCell<JitDriverPair> = UnsafeCell::new({
-        let info = build_virtualizable_info();
+        let info = build_pyframe_virtualizable_info();
         let mut d = JitDriver::new(JIT_THRESHOLD);
         d.set_virtualizable_info(info.clone());
         d.meta_interp_mut().num_scalar_inputargs =
@@ -3095,7 +3095,7 @@ fn build_resumed_frames(
     // its own vable view.
     if !vable_frame_ptr.is_null() && consume_vable {
         let frame_u8 = vable_frame_ptr as *mut u8;
-        let vinfo = pyre_jit_trace::virtualizable_gen::build_virtualizable_info();
+        let vinfo = pyre_jit_trace::frame_layout::build_pyframe_virtualizable_info();
         unsafe {
             // resume.py:1407 reset_token_gcref
             vinfo.reset_vable_token(frame_u8);
