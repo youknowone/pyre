@@ -2616,7 +2616,15 @@ impl JitState for PyreJitState {
             .get(crate::virtualizable_gen::SYM_VALUESTACKDEPTH_IDX as usize)
             .map(value_to_usize)
         {
-            self.set_valuestackdepth(vsd);
+            // Sanity check: vsd must not exceed the frame's total capacity
+            // (nlocals + stacksize). A bad vsd from stale guard recovery
+            // values can corrupt the frame and crash in as_mut_slice.
+            let max_vsd = self
+                .locals_cells_stack_array()
+                .map(|arr| arr.len())
+                .unwrap_or(0);
+            let safe_vsd = vsd.min(max_vsd);
+            self.set_valuestackdepth(safe_vsd);
         }
         if let Some(ns) = values
             .get(crate::virtualizable_gen::SYM_NAMESPACE_IDX as usize)
