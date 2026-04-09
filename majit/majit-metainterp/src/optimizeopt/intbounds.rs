@@ -699,6 +699,10 @@ impl OptIntBounds {
             }
         }
 
+        if !matches!(ctx.opref_type(cond_ref), Some(majit_ir::Type::Int)) {
+            return OptimizationResult::PassOn;
+        }
+
         // Bound check: if bound proves always nonzero, remove guard.
         let b = self.getintbound(cond_ref, ctx);
         if b.known_gt_const(0) {
@@ -715,6 +719,10 @@ impl OptIntBounds {
             if val == 0 {
                 return OptimizationResult::Remove;
             }
+        }
+
+        if !matches!(ctx.opref_type(cond_ref), Some(majit_ir::Type::Int)) {
+            return OptimizationResult::PassOn;
         }
 
         let b = self.getintbound(cond_ref, ctx);

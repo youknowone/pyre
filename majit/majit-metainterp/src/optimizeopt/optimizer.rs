@@ -2173,18 +2173,19 @@ impl Optimizer {
                 Some(&exported_int_bounds),
             )
         });
-        // Populate renamed_inputarg_types from trace_inputarg_types.
-        // RPython Box objects carry type intrinsically; we store it separately.
+        // Populate renamed_inputarg_types from the exported input boxes'
+        // actual optimizer-visible types. In RPython each renamed inputarg
+        // is a Box whose `.type` is already fixed; falling back to a pyre-only
+        // default like Int can silently corrupt retrace input typing.
         if let Some(ref mut es) = self.exported_loop_state {
-            if es.renamed_inputarg_types.is_empty() && !self.trace_inputarg_types.is_empty() {
+            if es.renamed_inputarg_types.is_empty() {
                 es.renamed_inputarg_types = es
                     .renamed_inputargs
                     .iter()
                     .map(|&opref| {
-                        self.trace_inputarg_types
-                            .get(opref.0 as usize)
-                            .copied()
-                            .unwrap_or(Type::Int)
+                        ctx.opref_type(opref).unwrap_or_else(|| {
+                            panic!("missing type for exported renamed inputarg {:?}", opref)
+                        })
                     })
                     .collect();
             }
@@ -2965,7 +2966,7 @@ impl Optimizer {
         // optimizer.py:598-602:
         //     if rop.returns_bool_result(op.opnum):
         //         self.getintbound(op).make_bool()
-        if op.opcode.returns_bool() {
+        if op.opcode.returns_bool() && matches!(ctx.opref_type(op.pos), Some(Type::Int)) {
             ctx.with_intbound_mut(op.pos, |bound| bound.make_bool());
         }
         let emitted = ctx.emit(op.clone());
@@ -3242,10 +3243,9 @@ impl Optimizer {
     fn _maybe_replace_guard_value(op: Op, ctx: &mut OptContext) -> Op {
         // optimizer.py:755: if op.getarg(0).type == 'i'
         let arg0 = op.arg(0);
-        // GuardValue's first arg is the value being guarded; only int values
-        // can be `bool`-shaped, so the int-type filter is implicit when we
-        // ask `IntBound.is_bool()` on a non-int OpRef (the bound is empty
-        // and `is_bool()` returns false).
+        if !matches!(ctx.opref_type(arg0), Some(Type::Int)) {
+            return op;
+        }
         // optimizer.py:756-757: b = self.getintbound(op.getarg(0)); if b.is_bool()
         let b = ctx.getintbound(ctx.get_box_replacement(arg0));
         if !b.is_bool() {
@@ -3851,6 +3851,31 @@ mod tests {
         let ctx = OptContext::new(result.len());
         // Just verify the counting methods work
         assert_eq!(Optimizer::get_count_of_ops(&ctx), 0); // empty ctx
+    }
+
+    #[test]
+    fn test_ref_guard_value_is_not_bool_specialized() {
+        let mut opt = Optimizer::new();
+        let ops = vec![
+            Op::new(OpCode::New, &[]),
+            Op::new(OpCode::New, &[]),
+            Op::new(OpCode::GuardValue, &[OpRef(0), OpRef(1)]),
+            Op::new(OpCode::Finish, &[]),
+        ];
+
+        let result =
+            opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 0);
+
+        assert!(
+            result.iter().any(|op| op.opcode == OpCode::GuardValue),
+            "ref-typed GuardValue should remain GuardValue"
+        );
+        assert!(
+            !result
+                .iter()
+                .any(|op| op.opcode == OpCode::GuardTrue || op.opcode == OpCode::GuardFalse),
+            "ref-typed GuardValue must not be rewritten as a bool guard"
+        );
     }
 
     #[test]

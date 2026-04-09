@@ -447,7 +447,12 @@ impl TraceCtx {
 
     /// Return the type of a constant OpRef, if recorded.
     pub fn const_type(&self, opref: OpRef) -> Option<majit_ir::Type> {
-        self.constants.constant_type(opref)
+        self.constants.constant_type(opref).or_else(|| {
+            self.constants
+                .numbering_type_overrides()
+                .get(&opref.0)
+                .copied()
+        })
     }
 
     /// Return the concrete value for a constant OpRef, if it is a pooled constant.
@@ -2173,6 +2178,15 @@ mod tests {
     use majit_ir::Type;
 
     extern "C" fn dummy_call_target() {}
+
+    #[test]
+    fn const_type_honors_resume_data_override() {
+        let mut ctx = TraceCtx::for_test(0);
+        let c = ctx.const_int(0);
+        assert_eq!(ctx.const_type(c), None);
+        ctx.mark_const_type(c, Type::Ref);
+        assert_eq!(ctx.const_type(c), Some(Type::Ref));
+    }
 
     #[derive(Clone, Copy)]
     struct TestSyncField {

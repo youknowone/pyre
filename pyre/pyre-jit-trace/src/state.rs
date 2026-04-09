@@ -1514,7 +1514,7 @@ pub(crate) fn synthesize_fresh_callee_entry_args(
         ctx.const_ref(callee_namespace_ptr as i64), // namespace
     ];
     ca_args.extend(args.iter().copied().take(callee_nlocals));
-    let null = ctx.const_int(PY_NULL as i64);
+    let null = ctx.const_ref(PY_NULL as i64);
     while ca_args.len() < crate::virtualizable_gen::NUM_SCALAR_INPUTARGS + callee_nlocals {
         ca_args.push(null);
     }
@@ -1808,7 +1808,7 @@ pub(crate) fn opimpl_virtual_ref_finish(ctx: &mut TraceCtx, sym: &mut PyreSym, v
     let is_vref = vref_ptr != 0 && unsafe { vref_info.is_virtual_ref(vref_ptr as *const u8) };
     if is_vref {
         // pyjitpl.py:1832: VIRTUAL_REF_FINISH(vrefbox, nullbox)
-        let null = ctx.const_int(0);
+        let null = ctx.const_ref(0);
         let _ = ctx.record_op(OpCode::VirtualRefFinish, &[vref_opref, null]);
     }
 }

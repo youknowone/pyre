@@ -2199,6 +2199,9 @@ impl OptContext {
     fn maybe_replace_guard_value(&self, op: &mut Op) {
         let arg0 = op.arg(0);
         // optimizer.py:755: op.getarg(0).type == 'i'
+        if !matches!(self.opref_type(arg0), Some(majit_ir::Type::Int)) {
+            return;
+        }
         let Some(bound) = self.get_int_bound(arg0) else {
             return;
         };
