@@ -2137,6 +2137,200 @@ impl PyreJitState {
     }
 }
 
+/// resume.py:945-956 getvirtual_ptr parity, trace-time variant.
+///
+/// `materialize_virtual_from_rd` (eval.rs) does the same job at *runtime*
+/// for the blackhole resume path: walks the `RdVirtualInfo` for `vidx`
+/// and allocates a real heap object. This function does the same walk
+/// at *trace* time, emitting `NEW_WITH_VTABLE` + `SETFIELD_GC` ops into
+/// the bridge's trace via `ctx`. Returns the OpRef of the materialized
+/// virtual.
+///
+/// Mirrors RPython's `ResumeDataBoxReader.consume_boxes` →
+/// `rd_virtuals[i].allocate(decoder, i)` where `decoder.allocate_with_vtable`
+/// is `metainterp.execute_new_with_vtable` (resume.py:1111-1112). The
+/// recorded ops appear at the start of the bridge trace, before any
+/// python interpreter opcodes are recorded — so when the bridge tracer
+/// encounters the first `LOAD_FAST` of a previously-virtual local, it
+/// sees the materialized OpRef in `bridge_local_oprefs` instead of
+/// falling through to a stale vable-array read.
+///
+/// Currently unused: setup_bridge_sym still routes Virtual entries via
+/// the existing vable scalar override path. The helper is added now so
+/// future setup_bridge_sym work can drop the OpRef::NONE fallback for
+/// RebuiltValue::Virtual without re-deriving the materialization logic.
+#[allow(dead_code)]
+fn materialize_bridge_virtual(
+    ctx: &mut majit_metainterp::TraceCtx,
+    vidx: usize,
+    rd_virtuals: Option<&[majit_ir::RdVirtualInfo]>,
+    resume_data: &majit_metainterp::ResumeDataResult,
+    cache: &mut std::collections::HashMap<usize, OpRef>,
+) -> OpRef {
+    use majit_ir::OpCode;
+    use majit_ir::resumedata::{TAG_CONST_OFFSET, TAGBOX, TAGCONST, TAGINT, TAGVIRTUAL, untag};
+
+    // resume.py:951 virtuals_cache.get_ptr(index): hit → return cached.
+    if let Some(&cached) = cache.get(&vidx) {
+        return cached;
+    }
+
+    let Some(virtuals) = rd_virtuals else {
+        if majit_metainterp::majit_log_enabled() {
+            eprintln!(
+                "[jit][bridge-virtual] missing rd_virtuals (vidx={}), abort materialization",
+                vidx
+            );
+        }
+        return OpRef::NONE;
+    };
+    let Some(entry) = virtuals.get(vidx) else {
+        return OpRef::NONE;
+    };
+
+    // resume.py:1556-1564 decode_box parity for fieldnums (i16 tagged).
+    fn decode_fieldnum(
+        ctx: &mut majit_metainterp::TraceCtx,
+        tagged: i16,
+        rd_virtuals: Option<&[majit_ir::RdVirtualInfo]>,
+        resume_data: &majit_metainterp::ResumeDataResult,
+        cache: &mut std::collections::HashMap<usize, OpRef>,
+    ) -> OpRef {
+        if tagged == majit_ir::resumedata::UNINITIALIZED_TAG {
+            return OpRef::NONE;
+        }
+        let (val, tagbits) = untag(tagged);
+        match tagbits {
+            TAGBOX => {
+                // resume.py:1556-1564 decode_box parity:
+                //   if num < 0: num += len(liveboxes)
+                //   return liveboxes[num]
+                // Negative `val` is Python-style indexing into the parent
+                // guard's liveboxes array (`num_failargs` long). For
+                // bridges, the boxes are inputargs at OpRef(0..n_inputargs).
+                let idx = if val < 0 {
+                    val + resume_data.num_failargs
+                } else {
+                    val
+                };
+                if idx < 0 {
+                    OpRef::NONE
+                } else {
+                    OpRef(idx as u32)
+                }
+            }
+            TAGINT => ctx.const_int(val as i64),
+            TAGCONST => {
+                // resume.py:1247-1251 decode_box parity:
+                //   if tag == TAGCONST:
+                //       if tagged_eq(tagged, NULLREF):
+                //           box = CONST_NULL
+                //       else:
+                //           box = self.consts[num - TAG_CONST_OFFSET]
+                if tagged == majit_ir::resumedata::NULLREF {
+                    return ctx.const_null();
+                }
+                let ci = (val - TAG_CONST_OFFSET) as usize;
+                // resume_data.constants is the rebuilt mirror of `self.consts`,
+                // keyed by the OpRef the encoder assigned at numbering time
+                // (`OpRef::from_const(ci)`). Look it up by that key.
+                let opref = majit_ir::OpRef::from_const(ci as u32);
+                if let Some((_, raw, tp)) = resume_data
+                    .constants
+                    .iter()
+                    .find(|(idx, _, _)| *idx == opref.0)
+                {
+                    match tp {
+                        majit_ir::Type::Ref => ctx.const_ref(*raw),
+                        majit_ir::Type::Float => ctx.const_float(*raw),
+                        _ => ctx.const_int(*raw),
+                    }
+                } else {
+                    opref
+                }
+            }
+            TAGVIRTUAL => {
+                materialize_bridge_virtual(ctx, val as usize, rd_virtuals, resume_data, cache)
+            }
+            _ => OpRef::NONE,
+        }
+    }
+
+    // resume.py:643-760 dispatch by virtual kind. Pyre currently emits
+    // bridge materialization only for VirtualInfo (the W_IntObject /
+    // generic gc-struct case). Other variants (VStruct/VArray/VRawBuffer)
+    // would follow the same recipe — port them when a benchmark needs them.
+    match entry {
+        majit_ir::RdVirtualInfo::VirtualInfo {
+            descr,
+            fielddescrs,
+            fieldnums,
+            ..
+        } => {
+            let Some(size_descr) = descr.clone() else {
+                return OpRef::NONE;
+            };
+            // resume.py:619-625 allocate_with_vtable + setfields.
+            // jtransform.py:908-911: rewrite_op_setfield skips typeptr field —
+            // NEW_WITH_VTABLE writes ob_type during GC rewrite.
+            let new_op = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], size_descr);
+            ctx.heap_cache_mut().new_object(new_op);
+            // resume.py:654 cache BEFORE filling — recursive/shared virtuals
+            // may reference this vidx during element decoding.
+            cache.insert(vidx, new_op);
+
+            // Walk fielddescrs in lock-step with fieldnums to emit per-field
+            // SETFIELD_GC ops. The encoder side (optimizer's
+            // make_rd_virtual_info) filters out the typeptr field, so the
+            // length of fielddescrs already excludes it.
+            for (fd_info, &fnum) in fielddescrs.iter().zip(fieldnums.iter()) {
+                let value = decode_fieldnum(ctx, fnum, rd_virtuals, resume_data, cache);
+                if value.is_none() {
+                    continue;
+                }
+                // Reconstruct a fresh PyreFieldDescr from the FieldDescrInfo.
+                // The original DescrRef was lost when rd_virtuals serialized
+                // (only `index, offset, field_size, field_type` survive),
+                // but for SETFIELD_GC the runtime semantics depend solely
+                // on offset/size/type — immutable/signed only affect
+                // optimizer hints which can be re-derived per-bridge.
+                let signed = matches!(
+                    fd_info.field_type,
+                    majit_ir::Type::Int | majit_ir::Type::Float
+                );
+                let field_descr = crate::descr::make_field_descr(
+                    fd_info.offset,
+                    fd_info.field_size,
+                    fd_info.field_type,
+                    signed,
+                );
+                ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, value], field_descr.clone());
+                ctx.heap_cache_mut()
+                    .setfield_cached(new_op, fd_info.index, value);
+            }
+
+            if majit_metainterp::majit_log_enabled() {
+                eprintln!(
+                    "[jit][bridge-virtual] vidx={} → OpRef({}) (n_fields={})",
+                    vidx,
+                    new_op.0,
+                    fielddescrs.len(),
+                );
+            }
+            new_op
+        }
+        _ => {
+            if majit_metainterp::majit_log_enabled() {
+                eprintln!(
+                    "[jit][bridge-virtual] unsupported variant for vidx={}, abort",
+                    vidx
+                );
+            }
+            OpRef::NONE
+        }
+    }
+}
+
 impl JitState for PyreJitState {
     type Meta = PyreMeta;
     type Sym = PyreSym;
