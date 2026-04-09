@@ -14,6 +14,45 @@ use serde::{Deserialize, Serialize};
 /// Opaque reference to a descriptor, shared across the JIT pipeline.
 pub type DescrRef = Arc<dyn Descr>;
 
+/// backend/*/regalloc.py: LABEL/JUMP arg location payload attached to
+/// TargetToken descriptors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TargetArgLoc {
+    Reg {
+        regnum: u8,
+        is_xmm: bool,
+    },
+    Frame {
+        position: usize,
+        ebp_offset: i32,
+        is_float: bool,
+    },
+    Ebp {
+        ebp_offset: i32,
+        is_float: bool,
+    },
+    Immed {
+        value: i64,
+        is_float: bool,
+    },
+    Addr {
+        base: u8,
+        index: u8,
+        scale: u8,
+        offset: i32,
+    },
+}
+
+/// history.py: TargetToken backend-visible state.
+pub trait LoopTargetDescr: Descr {
+    fn token_id(&self) -> u64;
+    fn is_preamble_target(&self) -> bool;
+    fn ll_loop_code(&self) -> usize;
+    fn set_ll_loop_code(&self, loop_code: usize);
+    fn target_arglocs(&self) -> Vec<TargetArgLoc>;
+    fn set_target_arglocs(&self, arglocs: Vec<TargetArgLoc>);
+}
+
 /// Base trait for all descriptors.
 ///
 /// Mirrors rpython/jit/metainterp/history.py AbstractDescr.
@@ -55,6 +94,9 @@ pub trait Descr: Send + Sync + std::fmt::Debug {
         None
     }
     fn as_interior_field_descr(&self) -> Option<&dyn InteriorFieldDescr> {
+        None
+    }
+    fn as_loop_target_descr(&self) -> Option<&dyn LoopTargetDescr> {
         None
     }
 

@@ -15,8 +15,9 @@
 use std::collections::HashMap;
 
 use crate::arch::*;
+use crate::jitframe::FIRST_ITEM_OFFSET;
 use crate::regloc::*;
-use majit_ir::{InputArg, Op, OpCode, OpRef, Type};
+use majit_ir::{InputArg, LoopTargetDescr, Op, OpCode, OpRef, TargetArgLoc, Type};
 
 // ── Constants ──────────────────────────────────────────────────────
 
@@ -668,15 +669,117 @@ impl FrameManager {
 /// RPython: rbp points past the frame header, slots grow downward:
 ///   -(position+1)*WORD + base_ofs
 ///
-/// Dynasm: rbp points to jitframe start, slots grow upward:
-///   (1+position)*WORD + base_ofs
-///   jf_ptr[0] = jf_descr, jf_ptr[1+position] = frame slot
-///
-/// The sign difference is because RPython's GC-managed JITFRAME has
-/// rbp pointing to the interior (after gc header + fixed fields),
-/// while dynasm's malloc'd jitframe has rbp at the base.
+/// Dynasm uses the same fixed-header/trailing-array JitFrame structure:
+/// slots live in `jf_frame[position]`, starting at FIRST_ITEM_OFFSET bytes
+/// from the frame pointer.
 pub fn get_ebp_ofs(base_ofs: i32, position: usize) -> i32 {
-    ((1 + position) as i32 * WORD as i32) + base_ofs
+    FIRST_ITEM_OFFSET as i32 + (position as i32 * WORD as i32) + base_ofs
+}
+
+#[cfg(target_arch = "x86_64")]
+fn all_core_regs() -> Vec<RegLoc> {
+    vec![
+        ECX, EAX, EDX, EBX, ESI, EDI, R8, R9, R10, R12, R13, R14, R15,
+    ]
+}
+
+#[cfg(target_arch = "aarch64")]
+fn all_core_regs() -> Vec<RegLoc> {
+    vec![
+        RegLoc::new(0, false),
+        RegLoc::new(1, false),
+        RegLoc::new(2, false),
+        RegLoc::new(3, false),
+        RegLoc::new(4, false),
+        RegLoc::new(5, false),
+        RegLoc::new(6, false),
+        RegLoc::new(7, false),
+        RegLoc::new(8, false),
+        RegLoc::new(9, false),
+        RegLoc::new(10, false),
+        RegLoc::new(11, false),
+        RegLoc::new(12, false),
+        RegLoc::new(13, false),
+        RegLoc::new(19, false),
+        RegLoc::new(20, false),
+    ]
+}
+
+#[cfg(target_arch = "x86_64")]
+fn save_around_call_core_regs() -> Vec<RegLoc> {
+    vec![EAX, ECX, EDX, ESI, EDI, R8, R9, R10]
+}
+
+#[cfg(target_arch = "aarch64")]
+fn save_around_call_core_regs() -> Vec<RegLoc> {
+    vec![
+        RegLoc::new(0, false),
+        RegLoc::new(1, false),
+        RegLoc::new(2, false),
+        RegLoc::new(3, false),
+        RegLoc::new(4, false),
+        RegLoc::new(5, false),
+        RegLoc::new(6, false),
+        RegLoc::new(7, false),
+        RegLoc::new(8, false),
+        RegLoc::new(9, false),
+        RegLoc::new(10, false),
+        RegLoc::new(11, false),
+        RegLoc::new(12, false),
+        RegLoc::new(13, false),
+    ]
+}
+
+#[cfg(target_arch = "x86_64")]
+fn all_float_regs() -> Vec<RegLoc> {
+    vec![
+        XMM0, XMM1, XMM2, XMM3, XMM4, XMM5, XMM6, XMM7, XMM8, XMM9, XMM10, XMM11, XMM12, XMM13,
+        XMM14,
+    ]
+}
+
+#[cfg(target_arch = "aarch64")]
+fn all_float_regs() -> Vec<RegLoc> {
+    vec![
+        RegLoc::new(0, true),
+        RegLoc::new(1, true),
+        RegLoc::new(2, true),
+        RegLoc::new(3, true),
+        RegLoc::new(4, true),
+        RegLoc::new(5, true),
+        RegLoc::new(6, true),
+        RegLoc::new(7, true),
+    ]
+}
+
+#[cfg(target_arch = "x86_64")]
+fn frame_reg() -> RegLoc {
+    EBP
+}
+
+#[cfg(target_arch = "aarch64")]
+fn frame_reg() -> RegLoc {
+    RegLoc::new(29, false)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn call_result_gpr() -> RegLoc {
+    EAX
+}
+
+#[cfg(target_arch = "aarch64")]
+fn call_result_gpr() -> RegLoc {
+    RegLoc::new(0, false)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn call_result_fpr() -> RegLoc {
+    XMM0
+}
+
+#[cfg(target_arch = "aarch64")]
+fn call_result_fpr() -> RegLoc {
+    RegLoc::new(0, true)
 }
 
 // ── RegisterManager ────────────────────────────────────────────────
@@ -1499,6 +1602,10 @@ pub struct RegAlloc {
     pub pending_moves: Vec<(Loc, Loc)>,
     /// OpRef → Type mapping for type dispatch.
     pub value_types: HashMap<u32, Type>,
+    /// arm/regalloc.py: self.jump_target_descr
+    jump_target_descr: Option<u32>,
+    /// arm/regalloc.py: self.final_jump_op
+    final_jump_args: Option<(u32, Vec<OpRef>)>,
 }
 
 impl RegAlloc {
@@ -1517,49 +1624,40 @@ impl RegAlloc {
             constants,
             pending_moves: Vec::new(),
             value_types: HashMap::new(),
+            jump_target_descr: None,
+            final_jump_args: None,
         }
     }
 
     /// x86/regalloc.py:65-75 X86_64_RegisterManager configuration.
     fn make_gpr_manager() -> RegisterManager {
-        // x86/regalloc.py:67
-        let all_regs = vec![
-            ECX, EAX, EDX, EBX, ESI, EDI, R8, R9, R10, R12, R13, R14, R15,
-        ];
+        let all_regs = all_core_regs();
         // x86/regalloc.py:71
         let no_lower_byte_regs = vec![];
-        // x86/regalloc.py:72
-        let save_around_call_regs = vec![EAX, ECX, EDX, ESI, EDI, R8, R9, R10];
-        let frame_reg = EBP;
+        let save_around_call_regs = save_around_call_core_regs();
+        let frame_reg = frame_reg();
         RegisterManager::new(
             all_regs,
             no_lower_byte_regs,
             save_around_call_regs,
             frame_reg,
             Some(vec![Type::Int, Type::Ref]),
-            EAX, // x86/regalloc.py:52 call_result_location → eax
+            call_result_gpr(),
         )
     }
 
     /// x86/regalloc.py:77-121,123-128 X86_64_XMMRegisterManager configuration.
     fn make_xmm_manager() -> RegisterManager {
-        // x86/regalloc.py:79 all_regs = [xmm0..xmm7]
-        // x86/regalloc.py:123-128 X86_64_XMMRegisterManager extends to xmm15,
-        // but xmm15 is reserved for scratch.
-        let all_regs = vec![
-            XMM0, XMM1, XMM2, XMM3, XMM4, XMM5, XMM6, XMM7, XMM8, XMM9, XMM10, XMM11, XMM12, XMM13,
-            XMM14,
-        ];
-        // x86/regalloc.py:81 save_around_call_regs = all_regs
+        let all_regs = all_float_regs();
         let save_around_call_regs = all_regs.clone();
-        let frame_reg = EBP;
+        let frame_reg = frame_reg();
         RegisterManager::new(
             all_regs,
             vec![],
             save_around_call_regs,
             frame_reg,
             Some(vec![Type::Float]),
-            XMM0, // x86/regalloc.py:120 call_result_location → xmm0
+            call_result_fpr(),
         )
     }
 
@@ -1571,6 +1669,8 @@ impl RegAlloc {
         self.rm = Self::make_gpr_manager();
         self.xrm = Self::make_xmm_manager();
         self.value_types.clear();
+        self.jump_target_descr = None;
+        self.final_jump_args = None;
         for iarg in inputargs {
             self.value_types.insert(iarg.index, iarg.tp);
         }
@@ -1621,7 +1721,7 @@ impl RegAlloc {
                     if tp == Type::Float {
                         self.xrm.reg_bindings_set(v, *reg, &mut self.longevity);
                         used.insert(*reg, ());
-                    } else if *reg == EBP {
+                    } else if *reg == self.rm.frame_reg {
                         // x86/regalloc.py:305-307
                         debug_assert!(self.rm.box_currently_in_frame_reg.is_none());
                         self.rm.box_currently_in_frame_reg = Some(v);
@@ -1935,6 +2035,14 @@ impl RegAlloc {
                 self.possibly_free_var(arg, tp);
             }
         }
+        if let Some(fail_args) = &op.fail_args {
+            for &arg in fail_args {
+                if !arg.is_constant() && !arg.is_none() {
+                    let tp = self.tp(arg);
+                    self.possibly_free_var(arg, tp);
+                }
+            }
+        }
         // Free the result itself if it's dead
         if !op.pos.is_none() && !op.pos.is_constant() {
             let tp = op.opcode.result_type();
@@ -1968,7 +2076,7 @@ impl RegAlloc {
             OpCode::IntAdd | OpCode::NurseryPtrIncrement => {
                 self.consider_int_add(op, i, output);
             }
-            // ── Shifts (need ecx) ──
+            // ── Shifts ──
             OpCode::IntLshift | OpCode::IntRshift | OpCode::UintRshift => {
                 self.consider_int_lshift(op, i, output);
             }
@@ -2003,7 +2111,7 @@ impl RegAlloc {
             OpCode::IntFloorDiv | OpCode::IntMod => {
                 self.consider_binop(op, i, output);
             }
-            // x86/regalloc.py:591 consider_uint_mul_high — uses eax and edx
+            // x86: uses eax/edx. arm/aarch64: same shape as int_mul.
             OpCode::UintMulHigh => {
                 self.consider_uint_mul_high(op, i, output);
             }
@@ -2354,7 +2462,13 @@ impl RegAlloc {
     }
 
     /// x86/regalloc.py:624 consider_int_lshift (shift operations need ecx)
+    /// arm/regalloc.py:493-497 prepare_op_{int,uint}_rshift/int_lshift
+    /// use the regular RI path with no fixed register.
     fn consider_int_lshift(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
+        #[cfg(target_arch = "aarch64")]
+        {
+            return self.consider_binop(op, i, output);
+        }
         let y = op.args[1];
         let loc2 = if y.is_constant() {
             self.rm.convert_to_imm(y, &self.constants)
@@ -2392,7 +2506,12 @@ impl RegAlloc {
     }
 
     /// x86/regalloc.py:591 consider_uint_mul_high
+    /// arm/regalloc.py:477 prepare_op_uint_mul_high = prepare_op_int_mul
     fn consider_uint_mul_high(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
+        #[cfg(target_arch = "aarch64")]
+        {
+            return self.consider_binop_symm(op, i, output);
+        }
         let mut arg1 = op.args[0];
         let mut arg2 = op.args[1];
         // x86/regalloc.py:594 — optimized for (box, const)
@@ -2786,6 +2905,11 @@ impl RegAlloc {
 
     /// x86/regalloc.py:1303 consider_jump
     fn consider_jump(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
+        self.final_jump_args = op
+            .descr
+            .as_ref()
+            .map(|descr| (descr.index(), op.args.to_vec()));
+        self.jump_target_descr = op.descr.as_ref().map(|descr| descr.index());
         let mut locs = Vec::new();
         for &arg in &op.args {
             let tp = self.tp(arg);
@@ -2796,10 +2920,48 @@ impl RegAlloc {
 
     /// x86/regalloc.py:1360 consider_label
     fn consider_label(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
+        let position = self.rm.position;
+        for &arg in &op.args {
+            let tp = self.tp(arg);
+            if self
+                .longevity
+                .get(arg)
+                .is_some_and(|lt| lt.is_last_real_use_before(position))
+            {
+                self.force_spill_var(arg, tp);
+            }
+        }
+
         let mut locs = Vec::new();
         for &arg in &op.args {
             let tp = self.tp(arg);
-            locs.push(self.loc(arg, tp));
+            let loc = self.loc(arg, tp);
+            match loc {
+                Loc::Reg(_) => self.fm.mark_as_free(arg, tp, &mut self.longevity),
+                _ => {}
+            }
+            locs.push(loc);
+        }
+
+        if let Some(loop_descr) = op
+            .descr
+            .as_deref()
+            .and_then(majit_ir::Descr::as_loop_target_descr)
+        {
+            if self
+                .final_jump_args
+                .as_ref()
+                .is_some_and(|(descr_index, _)| *descr_index == loop_descr.index())
+            {
+                if let Some((_, jump_args)) = &self.final_jump_args {
+                    for (iarg, target_loc) in jump_args.iter().zip(locs.iter()) {
+                        if let Loc::Frame(frame_loc) = *target_loc {
+                            self.fm
+                                .add_frame_pos_hint(*iarg, frame_loc, &mut self.longevity);
+                        }
+                    }
+                }
+            }
         }
         self.perform(i, locs, None, output);
     }
