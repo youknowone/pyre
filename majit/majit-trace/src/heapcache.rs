@@ -817,9 +817,16 @@ impl HeapCache {
         self.mark_escaped_box(opref);
     }
 
-    /// Record that the class of an object is now known (e.g., after GUARD_CLASS).
-    /// heapcache.py:470-473: class_now_known sets both class AND nullity.
-    ///   self._set_flag(box, HF_KNOWN_CLASS | HF_KNOWN_NULLITY)
+    /// heapcache.py:470-473
+    ///
+    ///     def class_now_known(self, box):
+    ///         if isinstance(box, Const):
+    ///             return
+    ///         self._set_flag(box, HF_KNOWN_CLASS | HF_KNOWN_NULLITY)
+    ///
+    /// pyre additionally remembers the concrete class pointer in the
+    /// `known_class` Vec because OpRef carries no static type token —
+    /// RPython retrieves the class via box.getref_base().
     pub fn class_now_known(&mut self, opref: OpRef, class: GcRef) {
         if opref.is_constant() {
             return;
@@ -829,7 +836,11 @@ impl HeapCache {
             self.known_class.resize(i + 1, None);
         }
         self.known_class[i] = Some(class);
-        // HF_KNOWN_NULLITY: knowing the class implies nonnull.
+        // RPython _set_flag(box, HF_KNOWN_CLASS | HF_KNOWN_NULLITY).
+        self._set_flag(opref, HF_KNOWN_CLASS);
+        // RPython also writes HF_KNOWN_NULLITY in the same _set_flag call;
+        // route through nullity_now_known so the Vec<u8> value mirror also
+        // captures non-null.
         self.nullity_now_known(opref, true);
     }
 
@@ -1366,19 +1377,27 @@ impl HeapCache {
 
     // ── Nullity tracking (heapcache.py nullity_now_known / is_nullity_known) ──
 
-    /// Record that a value's nullity is known.
-    /// heapcache.py: nullity_now_known(box, is_nonnull)
+    /// heapcache.py:480-483
+    ///
+    ///     def nullity_now_known(self, box):
+    ///         if isinstance(box, Const):
+    ///             return
+    ///         self._set_flag(box, HF_KNOWN_NULLITY)
+    ///
+    /// pyre additionally tracks WHICH side of the nullity is known (1 =
+    /// non-null, 2 = null) in the `known_nullity` Vec — RPython does not
+    /// need this because callers re-read box.getref_base() at consume time.
     pub fn nullity_now_known(&mut self, opref: OpRef, is_nonnull: bool) {
         if opref.is_constant() {
             return;
         }
-        {
-            let _i = opref.0 as usize;
-            if _i >= self.known_nullity.len() {
-                self.known_nullity.resize(_i + 1, 0);
-            }
-            self.known_nullity[_i] = if is_nonnull { 1 } else { 2 };
-        };
+        let i = opref.0 as usize;
+        if i >= self.known_nullity.len() {
+            self.known_nullity.resize(i + 1, 0);
+        }
+        self.known_nullity[i] = if is_nonnull { 1 } else { 2 };
+        // RPython _set_flag(box, HF_KNOWN_NULLITY).
+        self._set_flag(opref, HF_KNOWN_NULLITY);
     }
 
     /// Check if a value's nullity is known.
