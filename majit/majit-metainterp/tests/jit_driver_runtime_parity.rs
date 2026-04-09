@@ -7,6 +7,38 @@ use majit_metainterp::{
     virtualizable::VirtualizableInfo,
 };
 
+macro_rules! close_loop_with_increment_guard_failure {
+    ($ctx:expr, $sym:expr) => {{
+        let null = $ctx.const_null();
+        let frame_is_null = $ctx.record_op(OpCode::PtrEq, &[$sym[0], null]);
+        $ctx.record_guard_typed_with_fail_args(
+            OpCode::GuardFalse,
+            &[frame_is_null],
+            vec![Type::Ref, Type::Int],
+            &[$sym[0], $sym[1]],
+        );
+        let one = $ctx.const_int(1);
+        let incremented = $ctx.record_op(OpCode::IntAdd, &[$sym[1], one]);
+        let two = $ctx.const_int(2);
+        let reached_second_guard = $ctx.record_op(OpCode::IntEq, &[incremented, two]);
+        $ctx.record_guard_with_fail_args(
+            OpCode::GuardFalse,
+            &[reached_second_guard],
+            1,
+            &[incremented],
+        );
+        let finish_args = $sym.clone();
+        let finish_arg_types = finish_args
+            .iter()
+            .map(|opref| $ctx.get_opref_type(*opref).unwrap_or(Type::Int))
+            .collect();
+        TraceAction::Finish {
+            finish_args,
+            finish_arg_types,
+        }
+    }};
+}
+
 #[jit_driver(greens = [pc, code], reds = [frame, stack], virtualizable = frame)]
 struct DeclarativeDriver;
 
@@ -1592,13 +1624,7 @@ fn declarative_driver_guard_failure_restores_from_reconstructed_resume_frame() {
             .back_edge_keyed(444, 444, &mut state, &(), || {})
             .is_none()
     );
-    driver.merge_point(|ctx, sym| {
-        ctx.record_guard_with_fail_args(OpCode::GuardFalse, &[sym[1]], 1, &[sym[1]]);
-        let one = ctx.const_int(1);
-        sym[1] = ctx.record_op(OpCode::IntAdd, &[sym[1], one]);
-        ctx.record_guard_with_fail_args(OpCode::GuardFalse, &[sym[1]], 1, &[sym[1]]);
-        TraceAction::CloseLoop
-    });
+    driver.merge_point(|ctx, sym| close_loop_with_increment_guard_failure!(ctx, sym));
 
     let mut resume = ResumeDataVirtualAdder::new();
     resume.push_frame(0, 444);
@@ -1652,13 +1678,7 @@ fn declarative_driver_guard_failure_materializes_virtual_ref_from_resume_state()
             .back_edge_keyed(555, 555, &mut state, &(), || {})
             .is_none()
     );
-    driver.merge_point(|ctx, sym| {
-        ctx.record_guard_with_fail_args(OpCode::GuardFalse, &[sym[1]], 1, &[sym[1]]);
-        let one = ctx.const_int(1);
-        sym[1] = ctx.record_op(OpCode::IntAdd, &[sym[1], one]);
-        ctx.record_guard_with_fail_args(OpCode::GuardFalse, &[sym[1]], 1, &[sym[1]]);
-        TraceAction::CloseLoop
-    });
+    driver.merge_point(|ctx, sym| close_loop_with_increment_guard_failure!(ctx, sym));
 
     let mut resume = ResumeDataVirtualAdder::new();
     resume.push_frame(0, 555);
@@ -1676,6 +1696,7 @@ fn declarative_driver_guard_failure_materializes_virtual_ref_from_resume_state()
         .meta_interp_mut()
         .attach_resume_data(555, 1, resume.build());
 
+    state.obj = 0;
     state.obj = 0;
     state.flag = 1;
     match driver.run_compiled_with_blackhole_fallback_keyed(555, &mut state, || {}) {
@@ -1815,13 +1836,7 @@ fn declarative_driver_guard_failure_replays_pending_field_writes() {
             .back_edge_keyed(666, 666, &mut state, &(), || {})
             .is_none()
     );
-    driver.merge_point(|ctx, sym| {
-        ctx.record_guard_with_fail_args(OpCode::GuardFalse, &[sym[1]], 1, &[sym[1]]);
-        let one = ctx.const_int(1);
-        sym[1] = ctx.record_op(OpCode::IntAdd, &[sym[1], one]);
-        ctx.record_guard_with_fail_args(OpCode::GuardFalse, &[sym[1]], 1, &[sym[1]]);
-        TraceAction::CloseLoop
-    });
+    driver.merge_point(|ctx, sym| close_loop_with_increment_guard_failure!(ctx, sym));
 
     let mut resume = ResumeDataVirtualAdder::new();
     resume.push_frame(0, 666);
@@ -1836,6 +1851,7 @@ fn declarative_driver_guard_failure_replays_pending_field_writes() {
         .meta_interp_mut()
         .attach_resume_data(666, 1, resume.build());
 
+    state.obj = 0;
     state.flag = 1;
     match driver.run_compiled_with_blackhole_fallback_keyed(666, &mut state, || {}) {
         DriverRunOutcome::GuardFailure {
@@ -1875,13 +1891,7 @@ fn declarative_driver_guard_failure_replays_pending_array_writes_via_layout_hook
             .back_edge_keyed(888, 888, &mut state, &(), || {})
             .is_none()
     );
-    driver.merge_point(|ctx, sym| {
-        ctx.record_guard_with_fail_args(OpCode::GuardFalse, &[sym[1]], 1, &[sym[1]]);
-        let one = ctx.const_int(1);
-        sym[1] = ctx.record_op(OpCode::IntAdd, &[sym[1], one]);
-        ctx.record_guard_with_fail_args(OpCode::GuardFalse, &[sym[1]], 1, &[sym[1]]);
-        TraceAction::CloseLoop
-    });
+    driver.merge_point(|ctx, sym| close_loop_with_increment_guard_failure!(ctx, sym));
 
     let mut resume = ResumeDataVirtualAdder::new();
     resume.push_frame(0, 888);
@@ -1897,6 +1907,7 @@ fn declarative_driver_guard_failure_replays_pending_array_writes_via_layout_hook
         .meta_interp_mut()
         .attach_resume_data(888, 1, resume.build());
 
+    state.array = 0;
     state.flag = 1;
     match driver.run_compiled_with_blackhole_fallback_keyed(888, &mut state, || {}) {
         DriverRunOutcome::GuardFailure {
@@ -1936,13 +1947,7 @@ fn declarative_driver_guard_failure_can_restore_multi_frame_resume_state() {
             .back_edge_keyed(777, 777, &mut state, &(), || {})
             .is_none()
     );
-    driver.merge_point(|ctx, sym| {
-        ctx.record_guard_with_fail_args(OpCode::GuardFalse, &[sym[1]], 1, &[sym[1]]);
-        let one = ctx.const_int(1);
-        sym[1] = ctx.record_op(OpCode::IntAdd, &[sym[1], one]);
-        ctx.record_guard_with_fail_args(OpCode::GuardFalse, &[sym[1]], 1, &[sym[1]]);
-        TraceAction::CloseLoop
-    });
+    driver.merge_point(|ctx, sym| close_loop_with_increment_guard_failure!(ctx, sym));
 
     let mut resume = ResumeDataVirtualAdder::new();
     resume.push_frame(0, 100);
@@ -2000,13 +2005,7 @@ fn declarative_driver_guard_failure_can_restore_multi_frame_state_via_generic_fr
             .back_edge_keyed(778, 778, &mut state, &(), || {})
             .is_none()
     );
-    driver.merge_point(|ctx, sym| {
-        ctx.record_guard_with_fail_args(OpCode::GuardFalse, &[sym[1]], 1, &[sym[1]]);
-        let one = ctx.const_int(1);
-        sym[1] = ctx.record_op(OpCode::IntAdd, &[sym[1], one]);
-        ctx.record_guard_with_fail_args(OpCode::GuardFalse, &[sym[1]], 1, &[sym[1]]);
-        TraceAction::CloseLoop
-    });
+    driver.merge_point(|ctx, sym| close_loop_with_increment_guard_failure!(ctx, sym));
 
     let mut resume = ResumeDataVirtualAdder::new();
     resume.push_frame(0, 300);
@@ -2070,13 +2069,7 @@ fn declarative_driver_generic_multi_frame_restore_reuses_virtual_cache_for_pendi
             .back_edge_keyed(779, 779, &mut state, &(), || {})
             .is_none()
     );
-    driver.merge_point(|ctx, sym| {
-        ctx.record_guard_with_fail_args(OpCode::GuardFalse, &[sym[1]], 1, &[sym[1]]);
-        let one = ctx.const_int(1);
-        sym[1] = ctx.record_op(OpCode::IntAdd, &[sym[1], one]);
-        ctx.record_guard_with_fail_args(OpCode::GuardFalse, &[sym[1]], 1, &[sym[1]]);
-        TraceAction::CloseLoop
-    });
+    driver.merge_point(|ctx, sym| close_loop_with_increment_guard_failure!(ctx, sym));
 
     let mut resume = ResumeDataVirtualAdder::new();
     resume.push_frame(0, 500);
@@ -2137,13 +2130,7 @@ fn declarative_driver_guard_failure_uses_resume_layout_slot_types_for_generic_re
             .back_edge_keyed(780, 780, &mut state, &(), || {})
             .is_none()
     );
-    driver.merge_point(|ctx, sym| {
-        ctx.record_guard_with_fail_args(OpCode::GuardFalse, &[sym[1]], 1, &[sym[1]]);
-        let one = ctx.const_int(1);
-        sym[1] = ctx.record_op(OpCode::IntAdd, &[sym[1], one]);
-        ctx.record_guard_with_fail_args(OpCode::GuardFalse, &[sym[1]], 1, &[sym[1]]);
-        TraceAction::CloseLoop
-    });
+    driver.merge_point(|ctx, sym| close_loop_with_increment_guard_failure!(ctx, sym));
 
     let mut resume = ResumeDataVirtualAdder::new();
     resume.push_frame(0, 780);
