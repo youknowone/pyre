@@ -2429,39 +2429,25 @@ impl OptContext {
         // before store_final_boxes_in_guard runs.
         let resume_pos = op.rd_resume_position;
         let has_snapshot = resume_pos >= 0 && self.snapshot_boxes.contains_key(&resume_pos);
+        // resume.py:396-397: `assert resume_position >= 0` —
+        // RPython asserts the position is set before calling
+        // store_final_boxes_in_guard. Every guard from the production
+        // pyre tracer captures its own snapshot via generate_guard /
+        // capture_resumedata, and `gen_store_back_in_vable` inherits
+        // the previous guard's snapshot id so its GUARD_NOT_FORCED_2
+        // also has valid resume data. Hard-assert the invariant when
+        // production snapshot data is wired through; the empty
+        // `snapshot_boxes` case marks an isolated optimizer unit test
+        // that constructs synthetic guards without going through the
+        // pyre snapshot path, where the silent drop is acceptable.
         if !has_snapshot {
-            // unroll.py:336/409 parity: when unroll creates a new guard from
-            // a short preamble / virtual state import, it copies
-            // rd_resume_position from patchguardop. If the new guard arrives
-            // here without a snapshot, it must come from a patchguardop
-            // context — inherit the patchguardop's resume_position.
-            // resume.py:396-397: RPython asserts resume_position >= 0.
-            let fallback_pos = self
-                .patchguardop
-                .as_ref()
-                .map(|p| p.rd_resume_position)
-                .filter(|&p| p >= 0 && self.snapshot_boxes.contains_key(&p));
-            if let Some(fb_pos) = fallback_pos {
-                op.rd_resume_position = fb_pos;
-                self.finalize_guard_resume_data(op);
-                return;
-            }
-            // resume.py:396-397: RPython asserts resume_position >= 0.
-            // Without a snapshot AND without a patchguardop fallback, the
-            // guard has no resume context and the runtime guard-fail path
-            // cannot recover. Drop the guard's resume data so the backend
-            // emits a sentinel descr that triggers loop invalidation
-            // instead of running undefined resume code.
-            //
-            // Phase A (snapshot wiring through finish_and_compile) +
-            // patchguardop fallback should make this branch dead in
-            // practice; flag it via MAJIT_LOG so any regression surfaces.
-            if std::env::var_os("MAJIT_LOG").is_some() {
-                eprintln!(
-                    "[jit][drop] no-snapshot guard {:?} pos={:?} resume_pos={}",
-                    op.opcode, op.pos, op.rd_resume_position,
-                );
-            }
+            assert!(
+                self.snapshot_boxes.is_empty(),
+                "[jit] no-snapshot guard {:?} pos={:?} resume_pos={}",
+                op.opcode,
+                op.pos,
+                op.rd_resume_position,
+            );
             return;
         }
 
