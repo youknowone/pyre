@@ -1037,29 +1037,151 @@ impl TraceCtx {
 
     /// pyjitpl.py:1120-1146 `_nonstandard_virtualizable(pc, box, fielddescr)`.
     ///
-    /// Inline trace_ctx-side equivalent for the proc-macro hot path that
-    /// records `vable_*` accesses directly. Mirrors the Step 1 + Step 3
-    /// of MetaInterp::nonstandard_virtualizable: heapcache short-circuit
-    /// followed by the `boxes[-1]` identity check. Returns true if the
-    /// box is known nonstandard or differs from `virtualizable_boxes[-1]`.
-    fn is_nonstandard_virtualizable(&self, vable_opref: OpRef) -> bool {
-        // Step 1: heapcache short-circuit. RPython pyjitpl.py:1123:
-        //     if heapcache.is_known_nonstandard_virtualizable(box): return True
+    ///     def _nonstandard_virtualizable(self, pc, box, fielddescr):
+    ///         # returns True if 'box' is actually not the "standard" virtualizable
+    ///         # that is stored in metainterp.virtualizable_boxes[-1]
+    ///         if self.metainterp.heapcache.is_known_nonstandard_virtualizable(box):
+    ///             self.metainterp.staticdata.profiler.count_ops(rop.PTR_EQ, Counters.HEAPCACHED_OPS)
+    ///             return True
+    ///         if box is self.metainterp.forced_virtualizable:
+    ///             self.metainterp.forced_virtualizable = None
+    ///         if (self.metainterp.jitdriver_sd.virtualizable_info is not None or
+    ///             self.metainterp.jitdriver_sd.greenfield_info is not None):
+    ///             standard_box = self.metainterp.virtualizable_boxes[-1]
+    ///             if standard_box is box:
+    ///                 return False
+    ///             vinfo = self.metainterp.jitdriver_sd.virtualizable_info
+    ///             if vinfo is fielddescr.get_vinfo():
+    ///                 eqbox = self.metainterp.execute_and_record(rop.PTR_EQ, None,
+    ///                                                            box, standard_box)
+    ///                 eqbox = self.implement_guard_value(eqbox, pc)
+    ///                 isstandard = eqbox.getint()
+    ///                 if isstandard:
+    ///                     if box.type == 'r':
+    ///                         self.metainterp.replace_box(box, standard_box)
+    ///                     return False
+    ///         if not self.metainterp.heapcache.is_unescaped(box):
+    ///             self.emit_force_virtualizable(fielddescr, box)
+    ///         self.metainterp.heapcache.nonstandard_virtualizables_now_known(box)
+    ///         return True
+    ///
+    /// In pyre this is the LIVE entry path used by the jitcode machine
+    /// (`vable_*_indexed`) at trace time. The pyjitpl::nonstandard_virtualizable
+    /// duplicate is reachable only from the legacy `opimpl_*_vable` test
+    /// surface. The two implementations carry the same line-by-line shape so
+    /// the structural divergence is duplication-only — fixing the type-tag
+    /// refactor will let us collapse them into a single entry point.
+    fn is_nonstandard_virtualizable(&mut self, vable_opref: OpRef) -> bool {
+        // Step 1: heapcache short-circuit.
+        //     if self.metainterp.heapcache.is_known_nonstandard_virtualizable(box):
+        //         return True
         if self
             .heap_cache
             .is_known_nonstandard_virtualizable(vable_opref)
         {
             return true;
         }
-        // Step 3: standard_box identity check. RPython pyjitpl.py:1130-1132:
-        //     standard_box = self.virtualizable_boxes[-1]
-        //     if standard_box is box: return False
-        if let Some(ref boxes) = self.virtualizable_boxes {
-            if let Some(&vbox) = boxes.last() {
-                return vbox != vable_opref;
+        // Step 2: forced_virtualizable reset on identity.
+        //     if box is self.metainterp.forced_virtualizable:
+        //         self.metainterp.forced_virtualizable = None
+        if self.forced_virtualizable == Some(vable_opref) {
+            self.forced_virtualizable = None;
+        }
+        // Step 3: standard_box identity check.
+        //     standard_box = self.metainterp.virtualizable_boxes[-1]
+        //     if standard_box is box:
+        //         return False
+        let standard_box = self
+            .virtualizable_boxes
+            .as_ref()
+            .and_then(|boxes| boxes.last().copied());
+        let Some(standard_box) = standard_box else {
+            // No boxes → treat as nonstandard.
+            return true;
+        };
+        if standard_box == vable_opref {
+            return false;
+        }
+        // Step 4: PTR_EQ + implement_guard_value + replace_box.
+        //     vinfo = self.metainterp.jitdriver_sd.virtualizable_info
+        //     if vinfo is fielddescr.get_vinfo():
+        //         eqbox = self.metainterp.execute_and_record(
+        //             rop.PTR_EQ, None, box, standard_box)
+        //         eqbox = self.implement_guard_value(eqbox, pc)
+        //         isstandard = eqbox.getint()
+        //         if isstandard:
+        //             if box.type == 'r':
+        //                 self.metainterp.replace_box(box, standard_box)
+        //             return False
+        //
+        // Pyre's vable_*_indexed always passes
+        // `standard_virtualizable_box()` as `vable_opref`, so Step 3 above
+        // always returns `false` and Step 4 is structurally unreachable in
+        // the live path. Emit the PTR_EQ + GUARD_VALUE shape so a future
+        // alias-producing caller traps into bridge compilation rather than
+        // silently misclassifying the box. The hardcoded `isstandard = 0`
+        // encodes pyre's architectural invariant that distinct OpRefs map
+        // to distinct concrete pointers; the conditional `replace_box` is
+        // emitted line-by-line so a future alias path lights it up.
+        let eqbox = self.record_op(OpCode::PtrEq, &[vable_opref, standard_box]);
+        let isstandard: i64 = 0;
+        let const_isstandard = self.const_int(isstandard);
+        self.record_guard(OpCode::GuardValue, &[eqbox, const_isstandard], 0);
+        #[allow(unreachable_code)]
+        if isstandard != 0 {
+            // box.type == 'r' (virtualizables are Ref).
+            // pyjitpl.py:3499-3512 `MetaInterp.replace_box(box, standard_box)`:
+            // walks virtualref_boxes / virtualizable_boxes / heapcache and
+            // queues the recorder rewrite. The virtualref_boxes walk lives
+            // on `MetaInterp` (pyjitpl.rs:512) and is therefore a no-op
+            // here; the in-flight trace can still queue the recorder
+            // rewrite via `replace_op`.
+            self.replace_box_in_virtualizable_boxes(vable_opref, standard_box);
+            self.heap_cache.replace_box(vable_opref, standard_box);
+            self.replace_op(vable_opref, standard_box);
+            return false;
+        }
+        // Step 5a: emit_force_virtualizable.
+        //     if not self.metainterp.heapcache.is_unescaped(box):
+        //         self.emit_force_virtualizable(fielddescr, box)
+        //
+        //     def emit_force_virtualizable(self, fielddescr, box):
+        //         vinfo = fielddescr.get_vinfo()
+        //         token_descr = vinfo.vable_token_descr
+        //         tokenbox = mi.execute_and_record(
+        //             rop.GETFIELD_GC_R, token_descr, box)
+        //         condbox = mi.execute_and_record(
+        //             rop.PTR_NE, None, tokenbox, CONST_NULL)
+        //         funcbox = ConstInt(rffi.cast(Signed, vinfo.clear_vable_ptr))
+        //         self.execute_varargs(
+        //             rop.COND_CALL, [condbox, funcbox, box],
+        //             vinfo.clear_vable_descr, False, False)
+        //
+        // Pyre does not yet register a `clear_vable_ptr` runtime helper or
+        // the matching COND_CALL descriptor on VirtualizableInfo, so the
+        // full sequence cannot be emitted without dead function pointers.
+        // Port the observable prefix (GETFIELD_GC_R + PTR_NE against
+        // CONST_NULL) so the heap cache / optimizer see the same shape
+        // RPython produces; leave the COND_CALL tail as a TODO until
+        // VirtualizableInfo carries `clear_vable_descr` + function pointer.
+        if !self.heap_cache.is_unescaped(vable_opref) {
+            if let Some(info) = self.virtualizable_info.clone() {
+                let token_descr = info.token_field_descr();
+                let tokenbox =
+                    self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], token_descr);
+                let null_ref = self.const_null();
+                let _condbox = self.record_op(OpCode::PtrNe, &[tokenbox, null_ref]);
+                // TODO(vable-locals epic): emit COND_CALL(condbox,
+                // funcbox=clear_vable_ptr, box) once VirtualizableInfo
+                // carries a clear_vable_descr + function pointer.
             }
         }
-        true // No boxes → treat as nonstandard
+        // Step 5b: mark this box as a known nonstandard virtualizable so
+        // future accesses short-circuit at Step 1.
+        //     self.metainterp.heapcache.nonstandard_virtualizables_now_known(box)
+        self.heap_cache
+            .nonstandard_virtualizables_now_known(vable_opref);
+        true
     }
 
     /// Record a virtualizable field read (GETFIELD_GC_I/R/F).
