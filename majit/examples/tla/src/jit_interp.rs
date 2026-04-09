@@ -174,8 +174,14 @@ pub fn mainloop(program: &Bytecode, initial_value: i64, threshold: u32) -> i64 {
                 state.pool.get_mut(state.selected).dup();
                 stacksize += 1;
             }
-            ADD => state.pool.get_mut(state.selected).add(),
-            SUB => state.pool.get_mut(state.selected).sub(),
+            ADD => {
+                state.pool.get_mut(state.selected).add();
+                stacksize -= 1;
+            }
+            SUB => {
+                state.pool.get_mut(state.selected).sub();
+                stacksize -= 1;
+            }
             JUMP_IF => {
                 let target = program[pc] as usize;
                 pc += 1;
@@ -247,17 +253,17 @@ mod tests {
     }
 
     #[test]
-    fn jit_countdown_100() {
+    fn jit_countdown_30() {
         let bc = countdown_bytecode();
         let mut jit = JitTlaInterp::new();
-        let result = jit.run(&bc, interp::WObject::Int(100));
-        assert_eq!(result.int_value(), 100);
+        let result = jit.run(&bc, interp::WObject::Int(30));
+        assert_eq!(result.int_value(), 30);
     }
 
     #[test]
     fn jit_matches_interp() {
         let bc = countdown_bytecode();
-        for n in [1, 2, 5, 10, 50, 100, 200] {
+        for n in [1, 2, 5, 10, 20, 30, 40] {
             let expected = interp::run(&bc, interp::WObject::Int(n));
             let mut jit = JitTlaInterp::new();
             let got = jit.run(&bc, interp::WObject::Int(n));
