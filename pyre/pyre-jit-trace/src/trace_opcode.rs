@@ -1092,17 +1092,41 @@ impl MIFrame {
                 self.materialize_fail_arg_slot(ctx, value, target_type, nlocals + stack_idx);
             args.push(self.materialize_loop_carried_value(ctx, value, target_type));
         }
-        // pyjitpl.py:2934-2940 remove_consts_and_duplicates:
-        // Replace constant or duplicate OpRefs with SameAs to give each
-        // JUMP arg slot a unique identity. The optimizer's unroll pass
-        // needs distinct identities to track values independently.
+        // pyjitpl.py:2934-2965 remove_consts_and_duplicates:
+        //     def remove_consts_and_duplicates(self, boxes, endindex, duplicates):
+        //         for i in range(endindex):
+        //             box = boxes[i]
+        //             if isinstance(box, Const) or box in duplicates:
+        //                 boxes[i] = self.history.record_same_as(box)
+        //             else:
+        //                 duplicates[box] = None
+        //
+        //     def reached_loop_header(self, greenboxes, redboxes):
+        //         duplicates = {}
+        //         self.remove_consts_and_duplicates(redboxes, len(redboxes),
+        //                                           duplicates)
+        //         live_arg_boxes = greenboxes + redboxes
+        //         if self.jitdriver_sd.virtualizable_info is not None:
+        //             self.remove_consts_and_duplicates(
+        //                 self.virtualizable_boxes,
+        //                 len(self.virtualizable_boxes)-1,
+        //                 duplicates)
+        //             live_arg_boxes += self.virtualizable_boxes
+        //             live_arg_boxes.pop()
+        //
+        // RPython dedups ALL of redboxes (1 = vable_box = frame) AND
+        // ALL of virtualizable_boxes[:-1] (static_fields + array_items),
+        // sharing one `duplicates` dict across both calls. In pyre's flat
+        // layout `args = [frame, ni, code, vsd, ns, locals..., stack...]`,
+        // that corresponds to every index 0..args.len(). Previously pyre
+        // skipped the 5 scalar header slots (frame + 4 static fields),
+        // which is a line-by-line divergence from RPython.
         {
             use std::collections::HashSet;
-            let header_len = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
-            let mut seen = HashSet::new();
-            for i in header_len..args.len() {
+            let mut duplicates: HashSet<OpRef> = HashSet::new();
+            for i in 0..args.len() {
                 let opref = args[i];
-                if opref.is_constant() || !seen.insert(opref) {
+                if opref.is_constant() || !duplicates.insert(opref) {
                     let tp = inputarg_types
                         .get(i)
                         .copied()
