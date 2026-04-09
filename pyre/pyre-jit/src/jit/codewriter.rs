@@ -68,16 +68,24 @@ pub struct PyJitCode {
     pub has_abort: bool,
 }
 
-fn liveness_regs_to_u8_sorted(regs: &[u16]) -> Vec<u8> {
+/// rpython/jit/codewriter/liveness.py:139 "we encode the bitsets of which of
+/// the 256 registers are live" — PyPy's compact liveness encoding treats a
+/// register index as a single byte. JitCodes whose register files overflow
+/// this must not reach liveness encoding; the codewriter instead emits a
+/// permanent abort so the JIT driver falls back to the interpreter.
+///
+/// Returns `None` if any register in `regs` exceeds `u8::MAX`; the caller is
+/// expected to have already set `has_abort` and will skip liveness emission
+/// for that jitcode.
+fn liveness_regs_to_u8_sorted(regs: &[u16]) -> Option<Vec<u8>> {
     let mut bytes = Vec::with_capacity(regs.len());
     for &reg in regs {
-        let reg = u8::try_from(reg)
-            .unwrap_or_else(|_| panic!("liveness register {} exceeds 8-bit encoding", reg));
+        let reg = u8::try_from(reg).ok()?;
         bytes.push(reg);
     }
     bytes.sort_unstable();
     bytes.dedup();
-    bytes
+    Some(bytes)
 }
 
 impl PyJitCode {
@@ -916,15 +924,31 @@ impl CodeWriter {
             // live_i_regs / live_f_regs are always empty in pyre (all
             // Python values are PyObjectRef → ref bank only), so
             // encoding stays symmetric across the three kinds.
+            //
+            // rpython/jit/codewriter/liveness.py:139 comment: "we encode the
+            // bitsets of which of the 256 registers are live". Any entry
+            // whose live_r_regs overflows u8 forces a permanent abort — the
+            // compiled jitcode can no longer encode its own liveness
+            // truthfully. We set has_abort on the jitcode so the outer
+            // driver (call_jit.rs:1819) falls back to the interpreter.
             let mut liveness_info: Vec<u8> = Vec::new();
             let mut liveness_offsets: std::collections::HashMap<u32, u32> =
                 std::collections::HashMap::new();
+            let mut liveness_overflow = false;
             for entry in &jitcode.liveness {
                 let offset = liveness_info.len() as u32;
                 liveness_offsets.insert(entry.pc as u32, offset);
                 let live_i_bytes = liveness_regs_to_u8_sorted(&entry.live_i_regs);
                 let live_r_bytes = liveness_regs_to_u8_sorted(&entry.live_r_regs);
                 let live_f_bytes = liveness_regs_to_u8_sorted(&entry.live_f_regs);
+                let (live_i_bytes, live_r_bytes, live_f_bytes) =
+                    match (live_i_bytes, live_r_bytes, live_f_bytes) {
+                        (Some(i), Some(r), Some(f)) => (i, r, f),
+                        _ => {
+                            liveness_overflow = true;
+                            break;
+                        }
+                    };
                 // liveness.py:144 header: three lengths.
                 liveness_info.push(live_i_bytes.len() as u8);
                 liveness_info.push(live_r_bytes.len() as u8);
@@ -934,8 +958,16 @@ impl CodeWriter {
                 liveness_info.extend(encode_liveness(&live_r_bytes));
                 liveness_info.extend(encode_liveness(&live_f_bytes));
             }
-            jitcode.liveness_info = liveness_info;
-            jitcode.liveness_offsets = liveness_offsets;
+            if liveness_overflow {
+                // Mark the jitcode as unexecutable and clear partial state
+                // so the outer driver treats it as an unconditional abort.
+                jitcode.has_abort = true;
+                jitcode.liveness_info.clear();
+                jitcode.liveness_offsets.clear();
+            } else {
+                jitcode.liveness_info = liveness_info;
+                jitcode.liveness_offsets = liveness_offsets;
+            }
         }
 
         // RPython parity: forward PC map (py_pc → jitcode_pc) so
@@ -1150,12 +1182,24 @@ mod tests {
 
     #[test]
     fn liveness_regs_to_u8_sorted_sorts_and_dedups() {
-        assert_eq!(liveness_regs_to_u8_sorted(&[7, 1, 7, 3]), vec![1, 3, 7]);
+        assert_eq!(
+            liveness_regs_to_u8_sorted(&[7, 1, 7, 3]),
+            Some(vec![1, 3, 7])
+        );
     }
 
+    /// rpython/jit/codewriter/liveness.py:139 enforces a 256-register cap.
+    /// Register indices `>= 256` cannot be encoded and the helper must
+    /// surface an overflow sentinel so the outer codewriter can fall back
+    /// to `BC_ABORT` instead of panicking at runtime.
     #[test]
-    #[should_panic(expected = "liveness register 256 exceeds 8-bit encoding")]
     fn liveness_regs_to_u8_sorted_rejects_out_of_range_registers() {
-        let _ = liveness_regs_to_u8_sorted(&[255, 256]);
+        assert_eq!(liveness_regs_to_u8_sorted(&[255, 256]), None);
+    }
+
+    /// Boundary: exactly 255 is still valid (u8::MAX).
+    #[test]
+    fn liveness_regs_to_u8_sorted_accepts_u8_max() {
+        assert_eq!(liveness_regs_to_u8_sorted(&[255]), Some(vec![255]));
     }
 }
