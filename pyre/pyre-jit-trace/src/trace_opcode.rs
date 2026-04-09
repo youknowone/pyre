@@ -1136,6 +1136,15 @@ impl MIFrame {
                 }
             }
         }
+        // NOTE: RPython `put_back_list_of_boxes3(self, jcposition, redboxes)`
+        // (pyjitpl.py:1578) + `remove_consts_and_duplicates` in-place mutation
+        // of `self.virtualizable_boxes` (pyjitpl.py:2961-2963) would be the
+        // line-by-line equivalent of writing these dedup results back to
+        // `sym.symbolic_locals` / `sym.symbolic_stack` / `ctx.virtualizable_boxes`.
+        // Doing so regresses `nested_loop` (SIGSEGV) because pyre's nested-loop
+        // tracer revisits merge points from different frames and the writeback
+        // crosses the frame boundary. Kept as a TODO pending frame-local
+        // write-back semantics in pyre's close_loop_args path.
         // pyjitpl.py:2967-2969: generate a dummy GUARD_FUTURE_CONDITION
         // just before the JUMP so that unroll can use it when it's
         // creating artificial guards (patchguardop). record_guard calls
