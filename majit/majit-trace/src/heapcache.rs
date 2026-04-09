@@ -439,7 +439,12 @@ impl HeapCache {
         }
         self.set_flags_for_ref(opref, flags);
         // RPython: ref_frontend_op._heapc_deps = None
+        // pyre splits _heapc_deps across two HashMaps: `escape_deps` for the
+        // SETFIELD/SETARRAYITEM dep chain (RPython's deps[1:]) and
+        // `cached_arraylen` for the array length (RPython's deps[0]). Clearing
+        // _heapc_deps in RPython invalidates BOTH, so we mirror that here.
         self.escape_deps.remove(&opref);
+        self.cached_arraylen.remove(&opref);
     }
 
     /// RPython: _check_flag(box, flag)
