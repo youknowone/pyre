@@ -3240,30 +3240,11 @@ impl<M: Clone> MetaInterp<M> {
             eprint!("{}", majit_ir::format_trace(&optimized_ops, &constants));
         }
 
-        // Skip compilation if any guard has unrecoverable NONE in fail_args.
-        {
-            let has_unrecoverable_none = optimized_ops.iter().any(|op| {
-                if op.opcode.is_guard() {
-                    if let Some(ref fa) = op.fail_args {
-                        let none_count = fa.iter().skip(3).filter(|a| **a == OpRef::NONE).count();
-                        if none_count > 0 {
-                            let last_none = fa.iter().rposition(|a| *a == OpRef::NONE).unwrap();
-                            let trailing = fa.len() - last_none - 1;
-                            return trailing < none_count * 2;
-                        }
-                    }
-                }
-                false
-            });
-            if has_unrecoverable_none {
-                if crate::majit_log_enabled() {
-                    eprintln!("[jit] abort finish: guard NONE without sufficient trailing fields");
-                }
-                self.warm_state.abort_tracing(green_key, true);
-                return;
-            }
-        }
-
+        // resume.py:411-417 parity: NONE entries in guard fail_args are
+        // valid (TAGCONST/TAGVIRTUAL slots that resume reconstructs from
+        // rd_consts/rd_virtuals). RPython has no compile-time abort
+        // heuristic — runtime guard-fail recovery handles unrecoverable
+        // cases via clear_compiled_loops.
         let mut optimized_ops = compile::strip_stray_overflow_guards(optimized_ops);
 
         if crate::majit_log_enabled() {
