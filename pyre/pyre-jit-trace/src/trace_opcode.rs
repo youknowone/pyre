@@ -1465,9 +1465,13 @@ impl MIFrame {
             majit_trace::recorder::SnapshotTagged::Const(0, majit_ir::Type::Ref)
         } else if ctx.constant_value(opref).is_some() {
             let val = ctx.constant_value(opref).unwrap_or(0);
-            let tp = ctx
-                .const_type(opref)
-                .unwrap_or_else(|| panic!("missing snapshot const type for {:?}", opref));
+            // resume.py:157-183 `getconst(const)` dispatches on
+            // `const.type` — every Const is typed (ConstInt, ConstPtr,
+            // ConstFloat). pyre's plain `const_int(v)` creates a pool
+            // entry without an explicit type slot, matching RPython's
+            // ConstInt whose intrinsic type is INT; fall back to Int
+            // here rather than requiring callers to tag every integer.
+            let tp = ctx.const_type(opref).unwrap_or(majit_ir::Type::Int);
             majit_trace::recorder::SnapshotTagged::Const(val, tp)
         } else {
             // resume.py:211,214: box.type for _number_boxes TAGVIRTUAL/TAGBOX.
@@ -1622,9 +1626,10 @@ impl MIFrame {
                     majit_trace::recorder::SnapshotTagged::Const(0, majit_ir::Type::Ref)
                 } else if ctx.constant_value(opref).is_some() {
                     let val = ctx.constant_value(opref).unwrap_or(0);
-                    let tp = ctx
-                        .const_type(opref)
-                        .unwrap_or_else(|| panic!("missing fail-arg const type for {:?}", opref));
+                    // resume.py:157-183 `getconst(const)` dispatches on
+                    // `const.type`; pyre's plain `const_int(v)` has an
+                    // intrinsic INT type (see `opref_to_snapshot_tagged`).
+                    let tp = ctx.const_type(opref).unwrap_or(majit_ir::Type::Int);
                     majit_trace::recorder::SnapshotTagged::Const(val, tp)
                 } else {
                     let tp = types.get(i).copied().unwrap_or_else(|| {

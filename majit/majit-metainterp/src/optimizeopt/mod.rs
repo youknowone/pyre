@@ -2098,6 +2098,16 @@ impl OptContext {
         })
     }
 
+    /// history.py:361 CONST_NULL = ConstPtr(ConstPtr.value).
+    /// True iff `opref` is a Ref-typed null constant, mirroring
+    /// `CONST_NULL.same_constant(box)` in RPython.
+    pub fn is_const_null(&self, opref: OpRef) -> bool {
+        matches!(
+            self.get_constant(opref),
+            Some(Value::Ref(r)) if r.0 == 0
+        )
+    }
+
     /// optimizer.py:705-711: is_call_pure_pure_canraise — a CallPure op whose
     /// effectinfo says check_can_raise(ignore_memoryerror=True). These ops are
     /// formally side-effect-free (has_no_side_effect), but their potential to

@@ -1310,6 +1310,9 @@ mod tests {
         assign_positions(&mut ops, 100);
 
         let mut opt = Optimizer::default_pipeline();
+        // Overflow guards and IntMulOvf work on Int-typed args — override
+        // the test default so renamed_inputarg_types sees Int, not Ref.
+        opt.trace_inputarg_types = vec![majit_ir::Type::Int; 1024];
         let result = opt.optimize_with_constants_and_inputs(
             &ops,
             &mut std::collections::HashMap::new(),

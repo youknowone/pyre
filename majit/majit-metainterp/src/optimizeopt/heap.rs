@@ -2731,10 +2731,19 @@ mod tests {
     /// Uses num_inputs=1024 so that high-numbered OpRef values used as
     /// input arguments in tests (e.g. OpRef(100), OpRef(500)) are treated
     /// as valid defined positions by the optimizer's undefined-ref filter.
+    ///
+    /// In production every recorded Box carries its intrinsic type via
+    /// `trace_inputarg_types`, so the preamble exporter can recover a
+    /// renamed inputarg's type without guessing. Unit-test inputs are
+    /// anonymous stand-ins, so we seed Ref for every slot — the only
+    /// use of the type in these tests is to populate
+    /// `renamed_inputarg_types`, and Ref keeps heap/aliasing tests on
+    /// the same path RPython exercises for pointer Boxes.
     fn run_heap_opt(ops: &mut [Op]) -> Vec<Op> {
         assign_positions(ops);
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptHeap::new()));
+        opt.trace_inputarg_types = vec![Type::Ref; 1024];
         opt.optimize_with_constants_and_inputs(ops, &mut std::collections::HashMap::new(), 1024)
     }
 

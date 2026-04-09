@@ -4412,6 +4412,11 @@ mod tests {
     fn run_unroll_pass(ops: &[Op]) -> Vec<Op> {
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptUnroll::new()));
+        // See `run_heap_opt` in heap.rs for the 1024-slot Ref seed
+        // rationale — the preamble exporter needs an intrinsic type
+        // for every renamed inputarg, which production derives from
+        // the recorder's trace_inputarg_types.
+        opt.trace_inputarg_types = vec![majit_ir::Type::Ref; 1024];
         opt.optimize_with_constants_and_inputs(ops, &mut std::collections::HashMap::new(), 1024)
     }
 
@@ -4823,6 +4828,7 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptUnroll::new()));
+        opt.trace_inputarg_types = vec![majit_ir::Type::Ref; 1024];
         let result = opt.optimize_with_constants_and_inputs(
             &ops,
             &mut std::collections::HashMap::new(),
@@ -4925,6 +4931,10 @@ mod tests {
     #[test]
     fn test_unroll_optimizer_optimize_trace() {
         let mut unroll_opt = UnrollOptimizer::new();
+        // IntAdd operates on Int-typed inputs — seed the inner phase1/2
+        // optimizers' trace_inputarg_types via UnrollOptimizer so the
+        // intbounds pass sees Int on OpRef(0), OpRef(1).
+        unroll_opt.trace_inputarg_types = vec![majit_ir::Type::Int; 2];
         // Use optimize_trace_with_constants_and_inputs to properly set
         // num_inputs so input args don't collide with op positions.
         let mut ops = vec![
