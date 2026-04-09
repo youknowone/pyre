@@ -36,15 +36,29 @@ const ATTR_W_OBJ_WEAK: &str = "w_obj_weak";
 const ATTR_W_CALLABLE: &str = "w_callable";
 const ATTR_W_HASH: &str = "w_hash";
 
+/// Read a per-instance slot from the underlying `INSTANCE_DICT` directly,
+/// bypassing the public `getattr` path. The proxy fast-path in
+/// `baseobjspace::getattr` would otherwise force the receiver and recurse
+/// indefinitely while the proxy is reading its OWN `w_obj_weak`/etc.
 fn read_attr(obj: PyObjectRef, name: &str) -> PyObjectRef {
-    crate::baseobjspace::getattr(obj, name)
-        .ok()
-        .filter(|v| !v.is_null() && unsafe { !pyre_object::is_none(*v) })
-        .unwrap_or(PY_NULL)
+    let w_dict = crate::baseobjspace::getdict(obj);
+    if w_dict.is_null() {
+        return PY_NULL;
+    }
+    let value = unsafe { pyre_object::w_dict_getitem_str(w_dict, name) }.unwrap_or(PY_NULL);
+    if value.is_null() || unsafe { pyre_object::is_none(value) } {
+        return PY_NULL;
+    }
+    value
 }
 
+/// Mirror of `read_attr` for writes — direct dict access keeps lifeline /
+/// proxy / weakref bookkeeping out of the fast-path's force loop.
 fn write_attr(obj: PyObjectRef, name: &str, value: PyObjectRef) {
-    let _ = crate::baseobjspace::setattr(obj, name, value);
+    let w_dict = crate::baseobjspace::getdict(obj);
+    if !w_dict.is_null() {
+        unsafe { pyre_object::w_dict_setitem_str(w_dict, name, value) };
+    }
 }
 
 // ── Type registration ─────────────────────────────────────────────────
@@ -140,6 +154,8 @@ fn init_proxy_type(ns: &mut PyNamespace) {
         "__repr__",
         make_builtin_function("__repr__", descr__repr__),
     );
+    // **proxy_typedef_dict — interp__weakref.py:409.
+    register_proxy_typedef_dict(ns, /*include_comparisons=*/ true);
 }
 
 pub fn proxy_type() -> PyObjectRef {
@@ -187,6 +203,10 @@ fn init_callable_proxy_type(ns: &mut PyNamespace) {
         "__call__",
         make_builtin_function("__call__", callable_proxy_descr__call__),
     );
+    // **callable_proxy_typedef_dict — interp__weakref.py:417. Comparison
+    // ops are excluded (interp__weakref.py:390-391 only writes them to
+    // `proxy_typedef_dict`).
+    register_proxy_typedef_dict(ns, /*include_comparisons=*/ false);
 }
 
 pub fn callable_proxy_type() -> PyObjectRef {
@@ -888,13 +908,560 @@ pub fn force(proxy: PyObjectRef) -> Result<PyObjectRef, PyError> {
     Ok(w_obj)
 }
 
-fn is_w_abstract_proxy(obj: PyObjectRef) -> bool {
+pub fn is_w_abstract_proxy(obj: PyObjectRef) -> bool {
     if obj.is_null() {
         return false;
     }
     match crate::typedef::r#type(obj) {
         Some(tp) => std::ptr::eq(tp, proxy_type()) || std::ptr::eq(tp, callable_proxy_type()),
         None => false,
+    }
+}
+
+// ── proxy_typedef_dict / callable_proxy_typedef_dict ──────────────────
+//
+// pypy/module/_weakref/interp__weakref.py:356-402
+//
+// ```python
+// proxy_typedef_dict = {}
+// callable_proxy_typedef_dict = {}
+// special_ops = {'repr': True, 'hash': True}
+//
+// for opname, _, arity, special_methods in ObjSpace.MethodTable:
+//     if opname in special_ops or not special_methods:
+//         continue
+//     ...
+//     for i in range(forcing_count):
+//         code += "    w_obj%s = force(space, w_obj%s)\n" % (i, i)
+//     code += "    return space.%s(%s)" % (opname, nonspaceargs)
+//     exec py.code.Source(code).compile()
+//     ...
+// ```
+//
+// PyPy generates one wrapper per `(opname, special_methods)` row by
+// `exec`'ing a string template. pyre cannot synthesize functions at
+// runtime — `BuiltinCodeFn` is a fixed `fn(&[PyObjectRef])` pointer —
+// so we mirror the loop statically below, one Rust function per
+// generated row. Pyre's space op surface is the Python-3 subset of
+// PyPy's MethodTable, so the Py-2-only rows (`getslice`, `coerce`,
+// `__hex__`, …) are skipped exactly as Python 3 would.
+
+/// Helper used by every proxy wrapper to call a dunder via getattr +
+/// `call_function_impl_result`. Used for ops where pyre has no direct
+/// `crate::baseobjspace` entry (e.g. `__pos__`, `__abs__`, `__int__`).
+fn forward_to_dunder(
+    w_obj: PyObjectRef,
+    methname: &str,
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, PyError> {
+    let method = crate::baseobjspace::getattr(w_obj, methname)?;
+    crate::call::call_function_impl_result(method, args)
+}
+
+// Forwarding wrappers — `force(args[i])` then dispatch to the named
+// `crate::baseobjspace` op. The macro arms cover the common arities and
+// keep the per-op definitions a single line each, mirroring PyPy's
+// generated source.
+
+macro_rules! proxy_unary {
+    ($name:ident, $space_op:path) => {
+        pub fn $name(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+            let w_obj0 = force(args[0])?;
+            $space_op(w_obj0)
+        }
+    };
+}
+
+macro_rules! proxy_binary {
+    ($name:ident, $space_op:path) => {
+        pub fn $name(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+            let w_obj0 = force(args[0])?;
+            let w_obj1 = force(args[1])?;
+            $space_op(w_obj0, w_obj1)
+        }
+    };
+}
+
+macro_rules! proxy_binary_reflected {
+    ($name:ident, $space_op:path) => {
+        pub fn $name(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+            // interp__weakref.py:382-385 — reflected wrappers swap the
+            // operands before calling the space op:
+            //   `code = code.replace("(w_obj0, w_obj1)", "(w_obj1, w_obj0)")`
+            let w_obj0 = force(args[0])?;
+            let w_obj1 = force(args[1])?;
+            $space_op(w_obj1, w_obj0)
+        }
+    };
+}
+
+// Forward + reflected binary ops — interp__weakref.py:376-389.
+proxy_binary!(proxy_add, crate::baseobjspace::add);
+proxy_binary_reflected!(proxy_radd, crate::baseobjspace::add);
+proxy_binary!(proxy_sub, crate::baseobjspace::sub);
+proxy_binary_reflected!(proxy_rsub, crate::baseobjspace::sub);
+proxy_binary!(proxy_mul, crate::baseobjspace::mul);
+proxy_binary_reflected!(proxy_rmul, crate::baseobjspace::mul);
+proxy_binary!(proxy_truediv, crate::baseobjspace::truediv);
+proxy_binary_reflected!(proxy_rtruediv, crate::baseobjspace::truediv);
+proxy_binary!(proxy_floordiv, crate::baseobjspace::floordiv);
+proxy_binary_reflected!(proxy_rfloordiv, crate::baseobjspace::floordiv);
+proxy_binary!(proxy_mod, crate::baseobjspace::mod_);
+proxy_binary_reflected!(proxy_rmod, crate::baseobjspace::mod_);
+proxy_binary!(proxy_pow, crate::baseobjspace::pow);
+proxy_binary_reflected!(proxy_rpow, crate::baseobjspace::pow);
+proxy_binary!(proxy_lshift, crate::baseobjspace::lshift);
+proxy_binary_reflected!(proxy_rlshift, crate::baseobjspace::lshift);
+proxy_binary!(proxy_rshift, crate::baseobjspace::rshift);
+proxy_binary_reflected!(proxy_rrshift, crate::baseobjspace::rshift);
+proxy_binary!(proxy_and, crate::baseobjspace::and_);
+proxy_binary_reflected!(proxy_rand, crate::baseobjspace::and_);
+proxy_binary!(proxy_or, crate::baseobjspace::or_);
+proxy_binary_reflected!(proxy_ror, crate::baseobjspace::or_);
+proxy_binary!(proxy_xor, crate::baseobjspace::xor);
+proxy_binary_reflected!(proxy_rxor, crate::baseobjspace::xor);
+
+// Inplace ops — interp__weakref.py:367-369. PyPy forces every operand
+// (`forcing_count = arity`) and dispatches to `space.inplace_X`. pyre
+// has no separate `inplace_` space ops; the regular forward op is the
+// closest equivalent and matches the runtime fall-back PyPy uses for
+// any type without an in-place specialization.
+proxy_binary!(proxy_iadd, crate::baseobjspace::add);
+proxy_binary!(proxy_isub, crate::baseobjspace::sub);
+proxy_binary!(proxy_imul, crate::baseobjspace::mul);
+proxy_binary!(proxy_itruediv, crate::baseobjspace::truediv);
+proxy_binary!(proxy_ifloordiv, crate::baseobjspace::floordiv);
+proxy_binary!(proxy_imod, crate::baseobjspace::mod_);
+proxy_binary!(proxy_ipow, crate::baseobjspace::pow);
+proxy_binary!(proxy_ilshift, crate::baseobjspace::lshift);
+proxy_binary!(proxy_irshift, crate::baseobjspace::rshift);
+proxy_binary!(proxy_iand, crate::baseobjspace::and_);
+proxy_binary!(proxy_ior, crate::baseobjspace::or_);
+proxy_binary!(proxy_ixor, crate::baseobjspace::xor);
+
+// 1-arg unary ops with a direct pyre space op.
+proxy_unary!(proxy_len, crate::baseobjspace::len);
+proxy_unary!(proxy_neg, crate::baseobjspace::neg);
+proxy_unary!(proxy_invert, crate::baseobjspace::invert);
+proxy_unary!(proxy_iter, crate::baseobjspace::iter);
+proxy_unary!(proxy_next, crate::baseobjspace::next);
+
+// 1-arg unary ops without a direct space op — fall through to the
+// equivalent dunder so the proxy still delegates to the referent.
+pub fn proxy_pos(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    let w_obj0 = force(args[0])?;
+    forward_to_dunder(w_obj0, "__pos__", &[])
+}
+
+pub fn proxy_abs(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    let w_obj0 = force(args[0])?;
+    forward_to_dunder(w_obj0, "__abs__", &[])
+}
+
+pub fn proxy_int(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    let w_obj0 = force(args[0])?;
+    forward_to_dunder(w_obj0, "__int__", &[])
+}
+
+pub fn proxy_float(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    let w_obj0 = force(args[0])?;
+    forward_to_dunder(w_obj0, "__float__", &[])
+}
+
+pub fn proxy_index(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    let w_obj0 = force(args[0])?;
+    forward_to_dunder(w_obj0, "__index__", &[])
+}
+
+pub fn proxy_trunc(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    let w_obj0 = force(args[0])?;
+    forward_to_dunder(w_obj0, "__trunc__", &[])
+}
+
+pub fn proxy_str(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    let w_obj0 = force(args[0])?;
+    Ok(pyre_object::w_str_new(&unsafe { crate::py_str(w_obj0) }))
+}
+
+pub fn proxy_bool(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    // interp__weakref.py:360 MethodTable row `('nonzero', ..., ['__nonzero__'])`.
+    // pyre uses Python-3 truth dispatch (`is_true`) so the wrapper bridges
+    // to that and returns the boxed bool.
+    let w_obj0 = force(args[0])?;
+    Ok(pyre_object::w_bool_from(crate::baseobjspace::is_true(
+        w_obj0,
+    )))
+}
+
+// 2-/3-arg attribute ops with name-string conversion.
+pub fn proxy_getattribute(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    let w_obj0 = force(args[0])?;
+    let name = unsafe { pyre_object::w_str_get_value(args[1]) };
+    crate::baseobjspace::getattr(w_obj0, name)
+}
+
+pub fn proxy_setattr(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    let w_obj0 = force(args[0])?;
+    let name = unsafe { pyre_object::w_str_get_value(args[1]) };
+    crate::baseobjspace::setattr(w_obj0, name, args[2])
+}
+
+pub fn proxy_delattr(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    let w_obj0 = force(args[0])?;
+    let name = unsafe { pyre_object::w_str_get_value(args[1]) };
+    crate::baseobjspace::delattr(w_obj0, name)
+}
+
+// Item ops.
+pub fn proxy_getitem(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    let w_obj0 = force(args[0])?;
+    let w_obj1 = force(args[1])?;
+    crate::baseobjspace::getitem(w_obj0, w_obj1)
+}
+
+pub fn proxy_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    let w_obj0 = force(args[0])?;
+    let w_obj1 = force(args[1])?;
+    let w_obj2 = force(args[2])?;
+    crate::baseobjspace::setitem(w_obj0, w_obj1, w_obj2)
+}
+
+pub fn proxy_delitem(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    let w_obj0 = force(args[0])?;
+    let w_obj1 = force(args[1])?;
+    crate::baseobjspace::delitem(w_obj0, w_obj1)?;
+    Ok(pyre_object::w_none())
+}
+
+// __format__(self, format_spec).
+pub fn proxy_format(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    let w_obj0 = force(args[0])?;
+    let w_obj1 = force(args[1])?;
+    forward_to_dunder(w_obj0, "__format__", &[w_obj1])
+}
+
+// __contains__(self, needle) — pyre's contains returns Result<bool>.
+pub fn proxy_contains(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    let w_obj0 = force(args[0])?;
+    let w_obj1 = force(args[1])?;
+    let result = crate::baseobjspace::contains(w_obj0, w_obj1)?;
+    Ok(pyre_object::w_bool_from(result))
+}
+
+// Comparison ops — interp__weakref.py:390-391:
+//   elif opname in ["lt", "le", "gt", "ge", "eq", "ne"]:
+//       proxy_typedef_dict[special_methods[0]] = interp2app(func)
+// Each opname's first special method (e.g. `__lt__` for `lt`) is the
+// only one registered, and the wrapper dispatches via the matching
+// `CompareOp` variant.
+pub fn proxy_lt(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    let w_obj0 = force(args[0])?;
+    let w_obj1 = force(args[1])?;
+    crate::baseobjspace::compare(w_obj0, w_obj1, crate::baseobjspace::CompareOp::Lt)
+}
+
+pub fn proxy_le(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    let w_obj0 = force(args[0])?;
+    let w_obj1 = force(args[1])?;
+    crate::baseobjspace::compare(w_obj0, w_obj1, crate::baseobjspace::CompareOp::Le)
+}
+
+pub fn proxy_gt(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    let w_obj0 = force(args[0])?;
+    let w_obj1 = force(args[1])?;
+    crate::baseobjspace::compare(w_obj0, w_obj1, crate::baseobjspace::CompareOp::Gt)
+}
+
+pub fn proxy_ge(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    let w_obj0 = force(args[0])?;
+    let w_obj1 = force(args[1])?;
+    crate::baseobjspace::compare(w_obj0, w_obj1, crate::baseobjspace::CompareOp::Ge)
+}
+
+pub fn proxy_eq(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    let w_obj0 = force(args[0])?;
+    let w_obj1 = force(args[1])?;
+    crate::baseobjspace::compare(w_obj0, w_obj1, crate::baseobjspace::CompareOp::Eq)
+}
+
+pub fn proxy_ne(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    let w_obj0 = force(args[0])?;
+    let w_obj1 = force(args[1])?;
+    crate::baseobjspace::compare(w_obj0, w_obj1, crate::baseobjspace::CompareOp::Ne)
+}
+
+// Descriptor protocol — `get`/`set`/`delete` rows in MethodTable.
+pub fn proxy_get(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    let w_obj0 = force(args[0])?;
+    let w_obj1 = force(args[1])?;
+    let w_obj2 = force(args[2])?;
+    forward_to_dunder(w_obj0, "__get__", &[w_obj1, w_obj2])
+}
+
+pub fn proxy_set(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    let w_obj0 = force(args[0])?;
+    let w_obj1 = force(args[1])?;
+    let w_obj2 = force(args[2])?;
+    forward_to_dunder(w_obj0, "__set__", &[w_obj1, w_obj2])
+}
+
+pub fn proxy_delete(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    let w_obj0 = force(args[0])?;
+    let w_obj1 = force(args[1])?;
+    forward_to_dunder(w_obj0, "__delete__", &[w_obj1])
+}
+
+/// pypy/module/_weakref/interp__weakref.py:356-395 register the entries
+/// of `proxy_typedef_dict` (and, with `include_comparisons=true`, the
+/// six comparison ops registered only on `proxy_typedef_dict`).
+///
+/// Called from `init_proxy_type` (`include_comparisons=true`) and
+/// `init_callable_proxy_type` (`include_comparisons=false`) so the two
+/// typedefs end up with the same set of methods PyPy generates.
+fn register_proxy_typedef_dict(ns: &mut PyNamespace, include_comparisons: bool) {
+    // Forward + reflected binary arithmetic — interp__weakref.py:376-389.
+    namespace_store(ns, "__add__", make_builtin_function("__add__", proxy_add));
+    namespace_store(
+        ns,
+        "__radd__",
+        make_builtin_function("__radd__", proxy_radd),
+    );
+    namespace_store(ns, "__sub__", make_builtin_function("__sub__", proxy_sub));
+    namespace_store(
+        ns,
+        "__rsub__",
+        make_builtin_function("__rsub__", proxy_rsub),
+    );
+    namespace_store(ns, "__mul__", make_builtin_function("__mul__", proxy_mul));
+    namespace_store(
+        ns,
+        "__rmul__",
+        make_builtin_function("__rmul__", proxy_rmul),
+    );
+    namespace_store(
+        ns,
+        "__truediv__",
+        make_builtin_function("__truediv__", proxy_truediv),
+    );
+    namespace_store(
+        ns,
+        "__rtruediv__",
+        make_builtin_function("__rtruediv__", proxy_rtruediv),
+    );
+    namespace_store(
+        ns,
+        "__floordiv__",
+        make_builtin_function("__floordiv__", proxy_floordiv),
+    );
+    namespace_store(
+        ns,
+        "__rfloordiv__",
+        make_builtin_function("__rfloordiv__", proxy_rfloordiv),
+    );
+    namespace_store(ns, "__mod__", make_builtin_function("__mod__", proxy_mod));
+    namespace_store(
+        ns,
+        "__rmod__",
+        make_builtin_function("__rmod__", proxy_rmod),
+    );
+    namespace_store(ns, "__pow__", make_builtin_function("__pow__", proxy_pow));
+    namespace_store(
+        ns,
+        "__rpow__",
+        make_builtin_function("__rpow__", proxy_rpow),
+    );
+    namespace_store(
+        ns,
+        "__lshift__",
+        make_builtin_function("__lshift__", proxy_lshift),
+    );
+    namespace_store(
+        ns,
+        "__rlshift__",
+        make_builtin_function("__rlshift__", proxy_rlshift),
+    );
+    namespace_store(
+        ns,
+        "__rshift__",
+        make_builtin_function("__rshift__", proxy_rshift),
+    );
+    namespace_store(
+        ns,
+        "__rrshift__",
+        make_builtin_function("__rrshift__", proxy_rrshift),
+    );
+    namespace_store(ns, "__and__", make_builtin_function("__and__", proxy_and));
+    namespace_store(
+        ns,
+        "__rand__",
+        make_builtin_function("__rand__", proxy_rand),
+    );
+    namespace_store(ns, "__or__", make_builtin_function("__or__", proxy_or));
+    namespace_store(ns, "__ror__", make_builtin_function("__ror__", proxy_ror));
+    namespace_store(ns, "__xor__", make_builtin_function("__xor__", proxy_xor));
+    namespace_store(
+        ns,
+        "__rxor__",
+        make_builtin_function("__rxor__", proxy_rxor),
+    );
+
+    // Inplace ops — interp__weakref.py:367-369.
+    namespace_store(
+        ns,
+        "__iadd__",
+        make_builtin_function("__iadd__", proxy_iadd),
+    );
+    namespace_store(
+        ns,
+        "__isub__",
+        make_builtin_function("__isub__", proxy_isub),
+    );
+    namespace_store(
+        ns,
+        "__imul__",
+        make_builtin_function("__imul__", proxy_imul),
+    );
+    namespace_store(
+        ns,
+        "__itruediv__",
+        make_builtin_function("__itruediv__", proxy_itruediv),
+    );
+    namespace_store(
+        ns,
+        "__ifloordiv__",
+        make_builtin_function("__ifloordiv__", proxy_ifloordiv),
+    );
+    namespace_store(
+        ns,
+        "__imod__",
+        make_builtin_function("__imod__", proxy_imod),
+    );
+    namespace_store(
+        ns,
+        "__ipow__",
+        make_builtin_function("__ipow__", proxy_ipow),
+    );
+    namespace_store(
+        ns,
+        "__ilshift__",
+        make_builtin_function("__ilshift__", proxy_ilshift),
+    );
+    namespace_store(
+        ns,
+        "__irshift__",
+        make_builtin_function("__irshift__", proxy_irshift),
+    );
+    namespace_store(
+        ns,
+        "__iand__",
+        make_builtin_function("__iand__", proxy_iand),
+    );
+    namespace_store(ns, "__ior__", make_builtin_function("__ior__", proxy_ior));
+    namespace_store(
+        ns,
+        "__ixor__",
+        make_builtin_function("__ixor__", proxy_ixor),
+    );
+
+    // Single-dunder rows — interp__weakref.py:393-395.
+    namespace_store(
+        ns,
+        "__format__",
+        make_builtin_function("__format__", proxy_format),
+    );
+    namespace_store(ns, "__str__", make_builtin_function("__str__", proxy_str));
+    namespace_store(ns, "__len__", make_builtin_function("__len__", proxy_len));
+    namespace_store(
+        ns,
+        "__getattribute__",
+        make_builtin_function("__getattribute__", proxy_getattribute),
+    );
+    namespace_store(
+        ns,
+        "__setattr__",
+        make_builtin_function("__setattr__", proxy_setattr),
+    );
+    namespace_store(
+        ns,
+        "__delattr__",
+        make_builtin_function("__delattr__", proxy_delattr),
+    );
+    namespace_store(
+        ns,
+        "__getitem__",
+        make_builtin_function("__getitem__", proxy_getitem),
+    );
+    namespace_store(
+        ns,
+        "__setitem__",
+        make_builtin_function("__setitem__", proxy_setitem),
+    );
+    namespace_store(
+        ns,
+        "__delitem__",
+        make_builtin_function("__delitem__", proxy_delitem),
+    );
+    namespace_store(
+        ns,
+        "__trunc__",
+        make_builtin_function("__trunc__", proxy_trunc),
+    );
+    namespace_store(ns, "__pos__", make_builtin_function("__pos__", proxy_pos));
+    namespace_store(ns, "__neg__", make_builtin_function("__neg__", proxy_neg));
+    namespace_store(
+        ns,
+        "__bool__",
+        make_builtin_function("__bool__", proxy_bool),
+    );
+    namespace_store(ns, "__abs__", make_builtin_function("__abs__", proxy_abs));
+    namespace_store(
+        ns,
+        "__invert__",
+        make_builtin_function("__invert__", proxy_invert),
+    );
+    namespace_store(ns, "__int__", make_builtin_function("__int__", proxy_int));
+    namespace_store(
+        ns,
+        "__index__",
+        make_builtin_function("__index__", proxy_index),
+    );
+    namespace_store(
+        ns,
+        "__float__",
+        make_builtin_function("__float__", proxy_float),
+    );
+    namespace_store(
+        ns,
+        "__contains__",
+        make_builtin_function("__contains__", proxy_contains),
+    );
+    namespace_store(
+        ns,
+        "__iter__",
+        make_builtin_function("__iter__", proxy_iter),
+    );
+    namespace_store(
+        ns,
+        "__next__",
+        make_builtin_function("__next__", proxy_next),
+    );
+    namespace_store(ns, "__get__", make_builtin_function("__get__", proxy_get));
+    namespace_store(ns, "__set__", make_builtin_function("__set__", proxy_set));
+    namespace_store(
+        ns,
+        "__delete__",
+        make_builtin_function("__delete__", proxy_delete),
+    );
+
+    // interp__weakref.py:390-391 — comparison ops are registered only on
+    // `proxy_typedef_dict`, not `callable_proxy_typedef_dict`.
+    if include_comparisons {
+        namespace_store(ns, "__lt__", make_builtin_function("__lt__", proxy_lt));
+        namespace_store(ns, "__le__", make_builtin_function("__le__", proxy_le));
+        namespace_store(ns, "__gt__", make_builtin_function("__gt__", proxy_gt));
+        namespace_store(ns, "__ge__", make_builtin_function("__ge__", proxy_ge));
+        namespace_store(ns, "__eq__", make_builtin_function("__eq__", proxy_eq));
+        namespace_store(ns, "__ne__", make_builtin_function("__ne__", proxy_ne));
     }
 }
 
@@ -913,5 +1480,104 @@ mod tests {
         let err = force(proxy).unwrap_err();
         assert_eq!(err.kind, crate::PyErrorKind::ReferenceError);
         assert_eq!(err.message, "weakly referenced object no longer exists");
+    }
+
+    /// `len(proxy)` must dispatch through `proxy_typedef_dict["__len__"]`,
+    /// which forces the receiver and calls `space.len(referent)`.
+    #[test]
+    fn test_proxy_len_delegates_to_referent() {
+        crate::typedef::init_typeobjects();
+        let referent = pyre_object::w_list_new(vec![
+            pyre_object::w_int_new(1),
+            pyre_object::w_int_new(2),
+            pyre_object::w_int_new(3),
+        ]);
+        let proxy = W_Proxy_new(referent, PY_NULL);
+        let result = crate::baseobjspace::len(proxy).unwrap();
+        assert_eq!(unsafe { pyre_object::w_int_get_value(result) }, 3);
+    }
+
+    /// `proxy + x` must call `proxy_typedef_dict["__add__"]` which forces
+    /// every operand and dispatches to `space.add(referent, x)`.
+    #[test]
+    fn test_proxy_add_delegates_to_referent() {
+        crate::typedef::init_typeobjects();
+        let referent = pyre_object::w_int_new(40);
+        let proxy = W_Proxy_new(referent, PY_NULL);
+        let result = crate::baseobjspace::add(proxy, pyre_object::w_int_new(2)).unwrap();
+        assert_eq!(unsafe { pyre_object::w_int_get_value(result) }, 42);
+    }
+
+    /// `proxy.attr` must call the `__getattribute__` wrapper which forces
+    /// the receiver and reads the attribute off the referent.
+    #[test]
+    fn test_proxy_getattr_delegates_to_referent() {
+        crate::typedef::init_typeobjects();
+        // Use a hasdict instance so the underlying object stores
+        // attributes in INSTANCE_DICT.
+        let user_type = crate::typedef::make_builtin_type("ProxyTarget", |_| {});
+        unsafe { pyre_object::w_type_set_hasdict(user_type, true) };
+        let referent = pyre_object::instanceobject::w_instance_new(user_type);
+        crate::baseobjspace::setattr(referent, "x", pyre_object::w_int_new(7)).unwrap();
+
+        let proxy = W_Proxy_new(referent, PY_NULL);
+        let result = crate::baseobjspace::getattr(proxy, "x").unwrap();
+        assert_eq!(unsafe { pyre_object::w_int_get_value(result) }, 7);
+    }
+
+    /// `proxy.attr = value` must delegate to the referent's dict.
+    #[test]
+    fn test_proxy_setattr_delegates_to_referent() {
+        crate::typedef::init_typeobjects();
+        let user_type = crate::typedef::make_builtin_type("ProxyTarget2", |_| {});
+        unsafe { pyre_object::w_type_set_hasdict(user_type, true) };
+        let referent = pyre_object::instanceobject::w_instance_new(user_type);
+
+        let proxy = W_Proxy_new(referent, PY_NULL);
+        crate::baseobjspace::setattr(proxy, "y", pyre_object::w_int_new(11)).unwrap();
+
+        // Read back via the referent directly to confirm the write
+        // landed there, not on the proxy itself.
+        let result = crate::baseobjspace::getattr(referent, "y").unwrap();
+        assert_eq!(unsafe { pyre_object::w_int_get_value(result) }, 11);
+    }
+
+    /// `force()` must be a no-op for any non-proxy operand. Otherwise the
+    /// `getattr` / `setattr` fast-path would impose proxy semantics on
+    /// every Python value.
+    #[test]
+    fn test_force_is_noop_for_non_proxy() {
+        crate::typedef::init_typeobjects();
+        let plain = pyre_object::w_int_new(99);
+        let result = force(plain).unwrap();
+        assert!(std::ptr::eq(result, plain));
+    }
+
+    /// pypy/module/_weakref/interp__weakref.py:390-391 — comparison ops
+    /// land on `proxy_typedef_dict` only, never on
+    /// `callable_proxy_typedef_dict`. `__lt__`/`__le__`/`__gt__`/`__ge__`
+    /// are not on `object`, so an MRO lookup is enough to tell the two
+    /// typedefs apart. (`__eq__`/`__ne__` are inherited from `object`
+    /// regardless and so cannot be tested by name lookup alone.)
+    #[test]
+    fn test_comparison_ops_only_on_weakproxy() {
+        crate::typedef::init_typeobjects();
+        let weakproxy = proxy_type();
+        let callable = callable_proxy_type();
+        unsafe {
+            assert!(crate::baseobjspace::lookup_in_type(weakproxy, "__lt__").is_some());
+            assert!(crate::baseobjspace::lookup_in_type(weakproxy, "__le__").is_some());
+            assert!(crate::baseobjspace::lookup_in_type(weakproxy, "__gt__").is_some());
+            assert!(crate::baseobjspace::lookup_in_type(weakproxy, "__ge__").is_some());
+            assert!(crate::baseobjspace::lookup_in_type(callable, "__lt__").is_none());
+            assert!(crate::baseobjspace::lookup_in_type(callable, "__le__").is_none());
+            assert!(crate::baseobjspace::lookup_in_type(callable, "__gt__").is_none());
+            assert!(crate::baseobjspace::lookup_in_type(callable, "__ge__").is_none());
+            // Forwarded ops should land on both typedefs.
+            assert!(crate::baseobjspace::lookup_in_type(weakproxy, "__add__").is_some());
+            assert!(crate::baseobjspace::lookup_in_type(callable, "__add__").is_some());
+            assert!(crate::baseobjspace::lookup_in_type(weakproxy, "__len__").is_some());
+            assert!(crate::baseobjspace::lookup_in_type(callable, "__len__").is_some());
+        }
     }
 }

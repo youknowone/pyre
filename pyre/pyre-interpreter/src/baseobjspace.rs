@@ -2359,6 +2359,16 @@ fn namespace_to_dict(ns_ptr: *const crate::PyNamespace) -> PyObjectRef {
 pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
     let obj = unwrap_cell(obj);
 
+    // pypy/module/_weakref/interp__weakref.py:356-394 — proxy_typedef_dict
+    // wraps every space op in `force(space, w_obj)`. PyPy then dispatches
+    // through the type's `__getattribute__` slot at the C level, so the
+    // proxy's wrapper runs before any inline path. pyre's `getattr` does
+    // not consult the type's `__getattribute__`, so we apply the same
+    // effect by forcing the receiver here. `force()` is a no-op for any
+    // non-proxy operand, costing only one ptr-equality check on the hot
+    // path.
+    let obj = crate::module::_weakref::interp_weakref::force(obj)?;
+
     // super proxy — PyPy: superobject.py super_getattro
     // Looks up `name` in cls's MRO starting AFTER super_type.
     unsafe {
@@ -3560,6 +3570,10 @@ fn descr_set___class__(w_obj: PyObjectRef, w_newcls: PyObjectRef) -> PyResult {
 pub fn setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult {
     let obj = unwrap_cell(obj);
     let value = unwrap_cell(value);
+    // pypy/module/_weakref/interp__weakref.py:356-394 — proxy delegation.
+    // Mirrors the `__setattr__` entry that `register_proxy_typedef_dict`
+    // installs on the proxy types: force the receiver, then delegate.
+    let obj = crate::module::_weakref::interp_weakref::force(obj)?;
     // Module objects: store directly in the module namespace so `sys.ps1 = ...`
     // and similar interactive mutations are visible through module getattr/import.
     unsafe {
@@ -3669,6 +3683,10 @@ fn raiseattrerror(obj: PyObjectRef, name: &str) -> PyError {
 /// PyPy: descroperation.py descr__delattr__
 pub fn delattr(obj: PyObjectRef, name: &str) -> PyResult {
     let obj = unwrap_cell(obj);
+    // pypy/module/_weakref/interp__weakref.py:356-394 — proxy delegation
+    // (matches the `__delattr__` entry installed by
+    // `register_proxy_typedef_dict`).
+    let obj = crate::module::_weakref::interp_weakref::force(obj)?;
     unsafe {
         if is_module(obj) {
             let ns_ptr = w_module_get_dict_ptr(obj) as *mut crate::PyNamespace;
