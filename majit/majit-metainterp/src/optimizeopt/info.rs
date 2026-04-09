@@ -1430,7 +1430,7 @@ impl PtrInfo {
 ///   returns early on `offset == Some(0)` before calling `set_field`.
 /// - `virtualize.rs force_virtual_instance`: `debug_assert_no_typeptr`
 ///   at the entry of the field-emit loop.
-/// - `virtualstate.rs export_single_value` / `import_single_value`:
+/// - `virtualstate.rs export_single_value`:
 ///   `debug_assert_no_typeptr` on the fields collection boundary.
 #[derive(Clone, Debug)]
 pub struct VirtualInfo {

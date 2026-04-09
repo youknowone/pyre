@@ -682,8 +682,52 @@ const BUILTIN_STRING_BASE_SIZE: usize = BUILTIN_STRING_LEN_OFFSET + std::mem::si
 // Helpers (free functions to avoid borrow conflicts)
 // ---------------------------------------------------------------------------
 
+thread_local! {
+    /// regalloc.py:140-181 RegisterManager.{reg_bindings, longevity} parity:
+    /// RPython tracks an explicit Box → register/spill-slot dict so the
+    /// allocator can hand out fresh slots for each Box independently of any
+    /// underlying numbering. majit's `OpRef` is a position rather than an
+    /// identity, so when Phase 2 OpRefs end up sparse (Box identity put
+    /// Phase 2 starting at `phase1_high_water`) the previous
+    /// `Variable::from_u32(opref.0)` mapping inflated Cranelift's Variable
+    /// space with dummy declarations to fill the gaps. The thread-local
+    /// map below replaces that with a sparse-OpRef → dense-Variable lookup
+    /// populated during `do_compile`'s declaration loop.
+    static OPREF_VAR_MAP: std::cell::RefCell<Option<std::collections::HashMap<u32, Variable>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// RAII guard that restores `OPREF_VAR_MAP` on Drop, so nested compiles
+/// (bridge compilation re-entry) don't leak the inner compile's mapping
+/// past its scope. The early-return branches in do_compile then don't
+/// need explicit cleanup hooks.
+struct OprefVarMapGuard {
+    saved: Option<std::collections::HashMap<u32, Variable>>,
+}
+
+impl Drop for OprefVarMapGuard {
+    fn drop(&mut self) {
+        let saved = self.saved.take();
+        OPREF_VAR_MAP.with(|cell| {
+            *cell.borrow_mut() = saved;
+        });
+    }
+}
+
 fn var(idx: u32) -> Variable {
-    Variable::from_u32(idx)
+    OPREF_VAR_MAP.with(|cell| {
+        if let Some(map) = cell.borrow().as_ref() {
+            if let Some(&v) = map.get(&idx) {
+                return v;
+            }
+        }
+        // Pre-declaration fallback: callers that materialise a Variable
+        // before do_compile populates the map (e.g. test fixtures, helper
+        // utilities) keep the legacy dense mapping. This branch is also
+        // taken in the do_compile pre-declaration window before the loop
+        // below installs OPREF_VAR_MAP.
+        Variable::from_u32(idx)
+    })
 }
 
 /// Convert a slice of Values to a Vec of BlockArgs for Cranelift 0.130 branch instructions.
@@ -5546,16 +5590,29 @@ impl CraneliftBackend {
             }
         }
 
-        // Cranelift 0.130: declare_var(ty) returns auto-assigned Variable
-        // indices (0, 1, 2, ...). Declare sequentially from 0 to max_index,
-        // using the collected type or I64 for gap indices.
-        if let Some(&max_idx) = var_types.keys().max() {
-            for i in 0..=max_idx {
-                let ty = var_types.get(&i).copied().unwrap_or(cl_types::I64);
-                let returned_var = builder.declare_var(ty);
-                debug_assert_eq!(returned_var, var(i));
-            }
+        // regalloc.py:140-181 RegisterManager parity: build a sparse
+        // OpRef → Variable map by declaring exactly the OpRefs that
+        // var_types contains. Cranelift 0.130 declare_var(ty) issues
+        // sequential Variable indices (0, 1, 2, ...) regardless of the
+        // OpRef value, so we capture the returned Variable per OpRef into
+        // OPREF_VAR_MAP. Iterate keys in sorted order so the resulting
+        // index assignment is deterministic across runs.
+        let mut var_keys: Vec<u32> = var_types.keys().copied().collect();
+        var_keys.sort_unstable();
+        let mut opref_var_map: std::collections::HashMap<u32, Variable> =
+            std::collections::HashMap::with_capacity(var_keys.len());
+        for opref_idx in var_keys {
+            let ty = var_types.get(&opref_idx).copied().unwrap_or(cl_types::I64);
+            let returned_var = builder.declare_var(ty);
+            opref_var_map.insert(opref_idx, returned_var);
         }
+        // Install the map BEFORE any var() lookup so subsequent calls
+        // (jf_ptr_var, def_var loops, helper functions) see the dense
+        // assignment. The Drop guard restores the previous mapping on
+        // every return path so nested compiles (bridge compilation
+        // re-entry) keep their own scoped maps.
+        let saved_map = OPREF_VAR_MAP.with(|cell| cell.borrow_mut().replace(opref_var_map));
+        let _opref_var_guard = OprefVarMapGuard { saved: saved_map };
 
         // RPython parity: EBP holds the jitframe pointer throughout the
         // assembled trace. After every collecting call, _reload_frame_if_necessary

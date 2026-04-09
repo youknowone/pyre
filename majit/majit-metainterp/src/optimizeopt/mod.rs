@@ -250,12 +250,6 @@ pub struct OptContext {
     /// RPython optimizer.py: `patchguardop` — the last GUARD_FUTURE_CONDITION op.
     /// Used by unroll to attach resume data to extra guards from short preamble.
     pub patchguardop: Option<Op>,
-    /// RPython unroll.py:454-457: virtual state captured BEFORE force at JUMP.
-    /// Used by export_state to produce a VirtualState that includes virtuals
-    /// (which are forced by the time exported_loop_state is computed).
-    pub pre_force_virtual_state: Option<crate::optimizeopt::virtualstate::VirtualState>,
-    /// JUMP args captured BEFORE force (corresponding to pre_force_virtual_state).
-    pub pre_force_jump_args: Option<Vec<OpRef>>,
     /// RPython optimizer.py: end_args after force_at_the_end_of_preamble().
     /// export_state() prefers this over a raw get_replacement() snapshot.
     pub preamble_end_args: Option<Vec<OpRef>>,
@@ -737,8 +731,6 @@ impl OptContext {
             imported_label_args: None,
             can_replace_guards: true,
             patchguardop: None,
-            pre_force_virtual_state: None,
-            pre_force_jump_args: None,
             preamble_end_args: None,
             skip_flush_mode: false,
             current_pass_idx: 0,
@@ -817,8 +809,6 @@ impl OptContext {
             imported_label_args: None,
             can_replace_guards: true,
             patchguardop: None,
-            pre_force_virtual_state: None,
-            pre_force_jump_args: None,
             preamble_end_args: None,
             skip_flush_mode: false,
             current_pass_idx: 0,
@@ -1438,14 +1428,6 @@ impl OptContext {
                 // unroll.py:47: self.setinfo_from_preamble(item, i, infos)
                 if let Some(ref ptr_info) = info.ptr_info {
                     self.setinfo_from_preamble(item, ptr_info, Some(exported_infos));
-                } else if let Some(cls) = info.known_class {
-                    // ExportedValueInfo has known_class but no full PtrInfo.
-                    // RPython: the info IS the PtrInfo (always non-None when key exists).
-                    let synth = PtrInfo::known_class(cls, info.nonnull);
-                    self.setinfo_from_preamble(item, &synth, Some(exported_infos));
-                } else if info.nonnull {
-                    let synth = PtrInfo::nonnull();
-                    self.setinfo_from_preamble(item, &synth, Some(exported_infos));
                 }
                 // int_bound: unroll.py:93-96 — handled by setinfo_from_preamble
                 // when we add IntBound dispatch there.
