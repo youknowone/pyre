@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -29,6 +30,42 @@ use crate::jitframe::JitFrame;
 static CALL_ASSEMBLER_TARGETS: LazyLock<Mutex<HashMap<u64, usize>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+thread_local! {
+    /// llmodel.py self.gc_ll_descr — owned by the active dynasm
+    /// backend on this thread. Stored as a thread-local so the
+    /// backend-agnostic `majit_gc::ActiveGcGuardHooks` shims can
+    /// reach the live allocator without taking a dynasm dependency.
+    static DYNASM_ACTIVE_GC: RefCell<Option<Box<dyn majit_gc::GcAllocator>>> =
+        const { RefCell::new(None) };
+}
+
+fn with_dynasm_active_gc<R>(f: impl FnOnce(&dyn majit_gc::GcAllocator) -> R) -> Option<R> {
+    DYNASM_ACTIVE_GC.with(|cell| {
+        let guard = cell.borrow();
+        guard.as_deref().map(f)
+    })
+}
+
+fn dynasm_check_is_object(gcref: GcRef) -> bool {
+    with_dynasm_active_gc(|gc| gc.check_is_object(gcref)).unwrap_or(false)
+}
+
+fn dynasm_get_actual_typeid(gcref: GcRef) -> Option<u32> {
+    with_dynasm_active_gc(|gc| gc.get_actual_typeid(gcref)).flatten()
+}
+
+fn dynasm_subclass_range(classptr: usize) -> Option<(i64, i64)> {
+    with_dynasm_active_gc(|gc| gc.subclass_range(classptr)).flatten()
+}
+
+fn dynasm_typeid_subclass_range(typeid: u32) -> Option<(i64, i64)> {
+    with_dynasm_active_gc(|gc| gc.typeid_subclass_range(typeid)).flatten()
+}
+
+fn dynasm_typeid_is_object(typeid: u32) -> Option<bool> {
+    with_dynasm_active_gc(|gc| gc.typeid_is_object(typeid)).flatten()
+}
+
 /// runner.py:23 AbstractX86CPU — concrete Backend implementation.
 pub struct DynasmBackend {
     /// Next unique trace ID.
@@ -40,9 +77,6 @@ pub struct DynasmBackend {
     /// llmodel.py:64-69 self.vtable_offset — byte offset of the typeptr
     /// field inside instance objects. None when gcremovetypeptr is enabled.
     vtable_offset: Option<usize>,
-    /// llmodel.py self.gc_ll_descr — GC layer used by bh_new and the
-    /// gcremovetypeptr branch of `_cmp_guard_class` to look up typeids.
-    gc_ll_descr: Option<Box<dyn majit_gc::GcAllocator>>,
 }
 
 impl DynasmBackend {
@@ -52,7 +86,6 @@ impl DynasmBackend {
             next_header_pc: 0,
             constants: std::collections::HashMap::new(),
             vtable_offset: None,
-            gc_ll_descr: None,
         }
     }
 
@@ -83,10 +116,22 @@ impl DynasmBackend {
     pub fn set_gc_runtime_id(&mut self, _id: u64) {}
 
     /// llmodel.py:53-54: store gc_ll_descr on the cpu instance.
-    /// dynasm has no allocator codegen yet, but the gc_ll_descr is still
-    /// needed by the gcremovetypeptr branch of _cmp_guard_class.
-    pub fn set_gc_allocator(&mut self, gc: Box<dyn majit_gc::GcAllocator>) {
-        self.gc_ll_descr = Some(gc);
+    ///
+    /// Dynasm does not have cranelift's runtime-id indirection, so it
+    /// mirrors wasm: the live allocator is stored in a thread-local and
+    /// exposed through backend-agnostic `majit_gc::ActiveGcGuardHooks`.
+    pub fn set_gc_allocator(&mut self, mut gc: Box<dyn majit_gc::GcAllocator>) {
+        gc.freeze_types();
+        let supports_guard_gc_type = gc.supports_guard_gc_type();
+        DYNASM_ACTIVE_GC.with(|cell| *cell.borrow_mut() = Some(gc));
+        majit_gc::set_active_gc_guard_hooks(majit_gc::ActiveGcGuardHooks {
+            check_is_object: Some(dynasm_check_is_object),
+            get_actual_typeid: Some(dynasm_get_actual_typeid),
+            subclass_range: Some(dynasm_subclass_range),
+            typeid_subclass_range: Some(dynasm_typeid_subclass_range),
+            typeid_is_object: Some(dynasm_typeid_is_object),
+            supports_guard_gc_type,
+        });
     }
 
     /// llmodel.py:64-69 self.vtable_offset configuration.
@@ -100,11 +145,8 @@ impl DynasmBackend {
     /// installed gc_ll_descr (the GC backend supplied through
     /// set_gc_allocator).
     pub fn lookup_typeid_from_classptr(&self, classptr: usize) -> Option<u32> {
-        self.gc_ll_descr
-            .as_ref()
-            .and_then(|gc: &Box<dyn majit_gc::GcAllocator>| {
-                gc.get_typeid_from_classptr_if_gcremovetypeptr(classptr)
-            })
+        with_dynasm_active_gc(|gc| gc.get_typeid_from_classptr_if_gcremovetypeptr(classptr))
+            .flatten()
     }
 
     /// Pre-compute classptr → expected_typeid pairs for every GuardClass /
@@ -118,7 +160,7 @@ impl DynasmBackend {
         constants: &std::collections::HashMap<u32, i64>,
     ) -> std::collections::HashMap<i64, u32> {
         let mut table = std::collections::HashMap::new();
-        if self.vtable_offset.is_some() || self.gc_ll_descr.is_none() {
+        if self.vtable_offset.is_some() || DYNASM_ACTIVE_GC.with(|cell| cell.borrow().is_none()) {
             // vtable_offset path doesn't need typeid lookups; without a
             // gc_ll_descr there is nothing to resolve anyway.
             return table;
@@ -847,5 +889,20 @@ mod tests {
         assert_eq!(resolved, Some(int_tid));
         let unknown = backend.get_typeid_from_classptr_if_gcremovetypeptr(0xCAFE_F00D);
         assert_eq!(unknown, None);
+    }
+
+    #[test]
+    fn test_backend_installs_active_gc_guard_hooks() {
+        let mut gc = MiniMarkGC::new();
+        let obj_tid = gc.register_type(TypeInfo::object(16));
+        let obj = gc.alloc_with_type(obj_tid, 16);
+
+        let mut backend = DynasmBackend::new();
+        backend.set_gc_allocator(Box::new(gc));
+
+        assert!(majit_gc::supports_guard_gc_type());
+        assert!(majit_gc::check_is_object(obj));
+        assert_eq!(majit_gc::get_actual_typeid(obj), Some(obj_tid));
+        assert_eq!(majit_gc::typeid_is_object(obj_tid), Some(true));
     }
 }
