@@ -4627,6 +4627,10 @@ fn run_compiled_code_inner(
     for (i, &val) in inputs.iter().enumerate() {
         unsafe { *jf_ptr.add(header_words + i) = val };
     }
+    if std::env::var_os("MAJIT_LOG").is_some() {
+        let preview: Vec<i64> = inputs.iter().copied().take(10).collect();
+        eprintln!("[pre-call-inputs] {:?}", preview);
+    }
     // Debug: verify first input (frame ptr) is valid
     if std::env::var_os("MAJIT_VERIFY").is_some() && !inputs.is_empty() {
         let frame_ptr = inputs[0];
@@ -4712,6 +4716,14 @@ fn run_compiled_code_inner(
         });
         (fi, arc)
     };
+    if std::env::var_os("MAJIT_LOG").is_some() {
+        eprintln!(
+            "[post-call-descr] raw={:#x} fail_index={} matched_local={}",
+            jf_descr_raw,
+            fail_index,
+            direct_descr.is_some()
+        );
+    }
 
     // llgraph/runner.py:1184-1191 — bridge dispatch is handled by the
     // caller (execute_with_inputs) in a flat loop, matching RPython's
@@ -9655,6 +9667,16 @@ impl CraneliftBackend {
         self.module.finalize_definitions().unwrap();
 
         let code_ptr = self.module.get_finalized_function(func_id);
+        if std::env::var_os("MAJIT_LOG").is_some() {
+            let fail_descr_preview: Vec<(u32, usize)> = fail_descrs
+                .iter()
+                .map(|descr| (descr.fail_index, Arc::as_ptr(descr) as usize))
+                .collect();
+            eprintln!(
+                "[jit][compile-loop] trace_id={} header_pc={} code_ptr={:p} fail_descrs={:?}",
+                trace_id, header_pc, code_ptr, fail_descr_preview
+            );
+        }
 
         let trace_info = CompiledTraceInfo {
             trace_id,
