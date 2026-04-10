@@ -15,8 +15,9 @@ pub use codegen::{
     VirtualizableCodegenConfig, generate_jitcode,
 };
 
-use crate::assembler::{Assembler, JitCode};
+use crate::assembler::Assembler;
 use crate::call::CallControl;
+use crate::jitcode::JitCode;
 use crate::model::FunctionGraph;
 use crate::passes::GraphTransformConfig;
 use crate::passes::flatten::SSARepr;
@@ -105,9 +106,9 @@ impl CodeWriter {
                 jitcode.name,
                 ssarepr.insns.len(),
                 jitcode.code.len(),
-                jitcode.num_regs_i,
-                jitcode.num_regs_r,
-                jitcode.num_regs_f,
+                jitcode.num_regs_i(),
+                jitcode.num_regs_r(),
+                jitcode.num_regs_f(),
             );
         }
 

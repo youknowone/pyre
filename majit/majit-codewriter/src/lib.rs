@@ -18,6 +18,7 @@ pub mod front;
 pub mod handler_spec;
 pub mod hints;
 pub mod inline;
+pub mod jitcode;
 pub mod liveness;
 pub mod model;
 mod parse;
@@ -452,7 +453,7 @@ fn build_canonical_opcode_dispatch(
     function_graphs: &std::collections::HashMap<parse::CallPath, model::FunctionGraph>,
     pipeline_config: &passes::PipelineConfig,
     call_control: &mut call::CallControl,
-) -> (Vec<passes::PipelineOpcodeArm>, Vec<assembler::JitCode>) {
+) -> (Vec<passes::PipelineOpcodeArm>, Vec<jitcode::JitCode>) {
     let mut opcode_arms = Vec::new();
     let mut receiver_traits = parse::ReceiverTraitBindings::default();
 
@@ -471,7 +472,7 @@ fn build_canonical_opcode_dispatch(
     // Indexed by alloc_index from get_jitcode(), guaranteeing
     // all_jitcodes[i].index == i (RPython codewriter.py:80 invariant).
     let mut codewriter = codewriter::CodeWriter::new();
-    let mut jitcodes: Vec<Option<assembler::JitCode>> = Vec::new();
+    let mut jitcodes: Vec<Option<jitcode::JitCode>> = Vec::new();
 
     // Phase 1: RPython grab_initial_jitcodes + drain portal + callees.
     // RPython call.py:145-148.
@@ -970,9 +971,9 @@ mod tests {
                 i,
                 jitcode.name,
                 jitcode.code.len(),
-                jitcode.num_regs_i,
-                jitcode.num_regs_r,
-                jitcode.num_regs_f,
+                jitcode.num_regs_i(),
+                jitcode.num_regs_r(),
+                jitcode.num_regs_f(),
             );
         }
         assert!(

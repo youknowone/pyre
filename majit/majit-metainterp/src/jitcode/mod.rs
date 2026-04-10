@@ -136,59 +136,38 @@ impl LivenessInfo {
     }
 }
 
-/// RPython jitcode.py:146-167 `enumerate_vars(offset, all_liveness,
-/// callback_i, callback_r, callback_f, spec)`.
+/// Re-export of the canonical `enumerate_vars` function so existing
+/// metainterp callers can keep using `crate::jitcode::enumerate_vars`.
 ///
-/// Reads the `[len_i][len_r][len_f]` header at `offset`, then walks the
-/// three packed bitsets (int, ref, float) via `LivenessIterator`,
-/// invoking the matching callback for each live register index.
-pub fn enumerate_vars(
-    mut offset: usize,
-    all_liveness: &[u8],
-    mut callback_i: impl FnMut(u32),
-    mut callback_r: impl FnMut(u32),
-    mut callback_f: impl FnMut(u32),
-) {
-    use majit_codewriter::liveness::LivenessIterator;
-    // jitcode.py:149-151
-    let length_i = all_liveness[offset] as u32;
-    let length_r = all_liveness[offset + 1] as u32;
-    let length_f = all_liveness[offset + 2] as u32;
-    // jitcode.py:152
-    offset += 3;
-    // jitcode.py:153-157
-    if length_i != 0 {
-        let mut it = LivenessIterator::new(offset, length_i, all_liveness);
-        for index in &mut it {
-            callback_i(index);
-        }
-        offset = it.offset;
-    }
-    // jitcode.py:158-162
-    if length_r != 0 {
-        let mut it = LivenessIterator::new(offset, length_r, all_liveness);
-        for index in &mut it {
-            callback_r(index);
-        }
-        offset = it.offset;
-    }
-    // jitcode.py:163-166
-    if length_f != 0 {
-        let mut it = LivenessIterator::new(offset, length_f, all_liveness);
-        for index in &mut it {
-            callback_f(index);
-        }
-    }
-}
+/// RPython places this function in `rpython/jit/codewriter/jitcode.py`,
+/// not in metainterp. majit follows the same module placement: the
+/// definition lives in `majit_codewriter::jitcode::enumerate_vars`.
+pub use majit_codewriter::jitcode::enumerate_vars;
 
 /// Serialized interpreter step description, mirroring RPython's `JitCode`
 /// at a much smaller subset for the current proc-macro tracing surface.
+///
+/// Field names follow `rpython/jit/codewriter/jitcode.py` (`c_num_regs_i`
+/// etc). RPython packs each count into `chr(int)` for a 0..=255 range;
+/// pyre needs u16 because some Python codes legitimately exceed 255
+/// registers per kind (see pyre/pyre-jit/src/jit/codewriter.rs
+/// `liveness_regs_to_u8_sorted` for the companion fallback). The name
+/// matches RPython even though the representation is wider.
 #[derive(Clone, Debug, Default)]
 pub struct JitCode {
+    /// RPython `jitcode.py:15` `self.name = name` — symbolic name for
+    /// debugging/logging. RPython takes this as the first `__init__`
+    /// argument; pyre's runtime JitCodeBuilder currently leaves it
+    /// empty until each compile site wires it through.
+    pub name: String,
     /// Encoded bytecode stream.
     pub code: Vec<u8>,
-    /// Number of registers by kind: int/ref/float.
-    pub num_regs: [u16; 3],
+    /// RPython `jitcode.py:37` `self.c_num_regs_i = chr(num_regs_i)`.
+    pub c_num_regs_i: u16,
+    /// RPython `jitcode.py:38` `self.c_num_regs_r = chr(num_regs_r)`.
+    pub c_num_regs_r: u16,
+    /// RPython `jitcode.py:39` `self.c_num_regs_f = chr(num_regs_f)`.
+    pub c_num_regs_f: u16,
     /// RPython: `jitcode.constants_i` — integer constant pool.
     pub constants_i: Vec<i64>,
     /// RPython: `jitcode.constants_r` — reference constant pool.
@@ -254,9 +233,6 @@ pub struct JitCode {
     /// without it the runtime would need a separate runtime_stacks Vec
     /// (which RPython jitcodes never use).
     pub depth_at_py_pc: Vec<u16>,
-    /// True if BC_ABORT was emitted (not BC_ABORT_PERMANENT).
-    /// Set by JitCodeBuilder::abort(), not by raw byte scan.
-    pub has_abort: bool,
 }
 
 /// blackhole.py catch_exception: pre-computed exception handler for a JitCode PC range.
@@ -302,34 +278,34 @@ impl JitCode {
         }
     }
 
-    /// RPython: `JitCode.num_regs_i()`
+    /// RPython `jitcode.py:47-48` `def num_regs_i(self): return ord(self.c_num_regs_i)`.
     pub fn num_regs_i(&self) -> u16 {
-        self.num_regs[0]
+        self.c_num_regs_i
     }
 
-    /// RPython: `JitCode.num_regs_r()`
+    /// RPython `jitcode.py:50-51` `def num_regs_r(self): return ord(self.c_num_regs_r)`.
     pub fn num_regs_r(&self) -> u16 {
-        self.num_regs[1]
+        self.c_num_regs_r
     }
 
-    /// RPython: `JitCode.num_regs_f()`
+    /// RPython `jitcode.py:53-54` `def num_regs_f(self): return ord(self.c_num_regs_f)`.
     pub fn num_regs_f(&self) -> u16 {
-        self.num_regs[2]
+        self.c_num_regs_f
     }
 
-    /// RPython: `JitCode.num_regs_and_consts_i()`
+    /// RPython `jitcode.py:56-57` `def num_regs_and_consts_i(self): return ord(self.c_num_regs_i) + len(self.constants_i)`.
     pub fn num_regs_and_consts_i(&self) -> usize {
-        self.num_regs[0] as usize + self.constants_i.len()
+        self.c_num_regs_i as usize + self.constants_i.len()
     }
 
-    /// RPython: `JitCode.num_regs_and_consts_r()`
+    /// RPython `jitcode.py:59-60` `def num_regs_and_consts_r(self): return ord(self.c_num_regs_r) + len(self.constants_r)`.
     pub fn num_regs_and_consts_r(&self) -> usize {
-        self.num_regs[1] as usize + self.constants_r.len()
+        self.c_num_regs_r as usize + self.constants_r.len()
     }
 
-    /// RPython: `JitCode.num_regs_and_consts_f()`
+    /// RPython `jitcode.py:62-63` `def num_regs_and_consts_f(self): return ord(self.c_num_regs_f) + len(self.constants_f)`.
     pub fn num_regs_and_consts_f(&self) -> usize {
-        self.num_regs[2] as usize + self.constants_f.len()
+        self.c_num_regs_f as usize + self.constants_f.len()
     }
 
     /// RPython jitcode.py:82-93 `get_live_vars_info(self, pc, op_live)`.
@@ -362,14 +338,22 @@ impl JitCode {
         (self.code[pos] as usize) | ((self.code[pos + 1] as usize) << 8)
     }
 
-    /// RPython: `JitCode.dump()`
+    /// RPython `jitcode.py:114-119` `def dump(self)`.
     pub fn dump(&self) -> String {
         format!(
-            "<JitCode: {} bytes, {} int regs, {} consts>",
+            "<JitCode {:?}: {} bytes, {} int regs, {} consts>",
+            self.name,
             self.code.len(),
-            self.num_regs[0],
+            self.c_num_regs_i,
             self.constants_i.len()
         )
+    }
+}
+
+// RPython `jitcode.py:121-122` `def __repr__(self): return '<JitCode %r>' % self.name`.
+impl std::fmt::Display for JitCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "<JitCode {:?}>", self.name)
     }
 }
 

@@ -66,28 +66,30 @@ pub const HF_VERSION_MAX: u32 = 0xffff_ffff - HF_VERSION_INC;
 const _HF_VERSION_INC: u32 = HF_VERSION_INC;
 const _HF_VERSION_MAX: u32 = HF_VERSION_MAX;
 
-/// heapcache.py: add_flags(ref_frontend_op, flags)
-pub fn add_flags(ref_frontend_op: OpRef, flags: u8) {
-    // Stored only in `heapc_flags`; version bits are preserved by callers via
-    // `update_version`.
-    let _ = ref_frontend_op;
-    let _ = flags;
-}
+// RPython `heapcache.py:27-41` defines module-level helpers
+// `add_flags`, `remove_flags`, `test_flags` that mutate per-op storage
+// (`ref_frontend_op._heapc_flags`). pyre routes the same logic through
+// `HeapCache::_set_flag` / `_remove_flag` / `_check_flag` because pyre's
+// `OpRef` is a bare index with no associated storage outside `HeapCache`'s
+// own `heapc_flags: Vec<u32>` table. The standalone helpers therefore
+// cannot exist as standalone functions and would be misleading stubs.
 
-/// heapcache.py: remove_flags(ref_frontend_op, flags)
-pub fn remove_flags(ref_frontend_op: OpRef, flags: u8) {
-    let _ = ref_frontend_op;
-    let _ = flags;
-}
-
-/// heapcache.py: test_flags(ref_frontend_op, flags)
-pub fn test_flags(ref_frontend_op: OpRef, flags: u8) -> bool {
-    let _ = ref_frontend_op;
-    let _ = flags;
-    false
-}
-
-/// heapcache.py: maybe_replace_with_const(box)
+/// heapcache.py:43-47 `maybe_replace_with_const(box)`:
+///
+/// ```python
+/// def maybe_replace_with_const(box):
+///     if not isinstance(box, Const) and box.is_replaced_with_const():
+///         return constant_from_op(box)
+///     else:
+///         return box
+/// ```
+///
+/// pyre's `OpRef` is a bare index without `is_replaced_with_const()`
+/// metadata. The replacement machinery lives on `box._forwarded` in the
+/// optimizer pipeline and is not visible at the heap-cache layer here.
+/// Until the optimizer surfaces a `replaced-with-const` query that
+/// heap-cache reads can consult, this function is a pass-through and the
+/// `read()` callsite below documents the gap.
 pub fn maybe_replace_with_const(opref: OpRef) -> OpRef {
     opref
 }
