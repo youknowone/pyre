@@ -949,6 +949,9 @@ pub struct BlackholeInterpreter {
     ///   calldescr = jitdriver_sd.mainjitcode.calldescr
     /// pyre: single jitdriver. portal_runner_ptr is the fnptr.
     pub portal_runner_ptr: Option<fn(i64) -> i64>,
+    /// RPython: `jitdriver_sd.mainjitcode.calldescr` — CallDescr of the portal
+    /// function. Returned by `get_portal_runner()` for `bhimpl_recursive_call_*`.
+    pub mainjitcode_calldescr: BhCallDescr,
 }
 
 /// blackhole.py: last exception value from a residual call.
@@ -999,6 +1002,7 @@ impl BlackholeInterpreter {
             virtualizable_info: std::ptr::null(),
             virtualizable_stack_base: 0,
             portal_runner_ptr: None,
+            mainjitcode_calldescr: BhCallDescr::default(),
         }
     }
 
@@ -1070,13 +1074,13 @@ impl BlackholeInterpreter {
     ///   fnptr = adr2int(jitdriver_sd.portal_runner_adr)
     ///   calldescr = jitdriver_sd.mainjitcode.calldescr
     ///   return fnptr, calldescr
-    /// pyre: single jitdriver. Returns (fnptr_as_i64, calldescr=()).
+    /// pyre: single jitdriver. mainjitcode_calldescr set during blackhole setup.
     pub fn get_portal_runner(&self, _jdindex: usize) -> (i64, BhCallDescr) {
         let fnptr = self
             .portal_runner_ptr
             .map(|f| f as usize as i64)
             .unwrap_or(0);
-        (fnptr, BhCallDescr::default())
+        (fnptr, self.mainjitcode_calldescr.clone())
     }
 
     /// Resolve field descriptor offsets in this interpreter's descrs table.
@@ -6841,9 +6845,12 @@ fn handler_newlist(
     let result = cpu.bh_new(structdescr);
     // blackhole.py:1164: cpu.bh_setfield_gc_i(result, length, lengthdescr)
     cpu.bh_setfield_gc_i(result, length, lengthdescr);
-    // blackhole.py:1165-1169: bh_new_array_clear when arraydescr.is_array_of_structs()
-    // or is_array_of_pointers(). Always clear for safety.
-    let items = cpu.bh_new_array_clear(length, arraydescr);
+    // blackhole.py:1165-1169: bh_new_array_clear when is_array_of_structs or is_array_of_pointers
+    let items = if arraydescr.is_array_of_structs() || arraydescr.is_array_of_pointers() {
+        cpu.bh_new_array_clear(length, arraydescr)
+    } else {
+        cpu.bh_new_array(length, arraydescr)
+    };
     // blackhole.py:1170: cpu.bh_setfield_gc_r(result, items, itemsdescr)
     cpu.bh_setfield_gc_r(result, majit_ir::GcRef(items as usize), itemsdescr);
     bh.registers_r[code[p] as usize] = result;
@@ -6884,7 +6891,12 @@ fn handler_newlist_hint(
     let result = cpu.bh_new(structdescr);
     // blackhole.py:1186: cpu.bh_setfield_gc_i(result, 0, lengthdescr)
     cpu.bh_setfield_gc_i(result, 0, lengthdescr);
-    let items = cpu.bh_new_array(lengthhint, arraydescr);
+    // blackhole.py:1187-1191: bh_new_array_clear when is_array_of_structs or is_array_of_pointers
+    let items = if arraydescr.is_array_of_structs() || arraydescr.is_array_of_pointers() {
+        cpu.bh_new_array_clear(lengthhint, arraydescr)
+    } else {
+        cpu.bh_new_array(lengthhint, arraydescr)
+    };
     cpu.bh_setfield_gc_r(result, majit_ir::GcRef(items as usize), itemsdescr);
     bh.registers_r[code[p] as usize] = result;
     Ok(p + 1)

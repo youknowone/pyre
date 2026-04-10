@@ -683,12 +683,25 @@ extern "C" fn jit_force_callee_frame_interp(frame_ptr: i64) -> i64 {
 /// Called by `bh.resolve_field_offsets()` after `setposition()`.
 fn resolve_field_offset(owner: &str, field_name: &str) -> usize {
     use pyre_interpreter::pyframe::PyFrame;
-    match (owner, field_name) {
-        (_, "namespace") => std::mem::offset_of!(PyFrame, namespace),
-        (_, "code") => pyre_interpreter::pyframe::PYFRAME_CODE_OFFSET,
-        (_, "next_instr") | (_, "f_lasti") => pyre_interpreter::pyframe::PYFRAME_NEXT_INSTR_OFFSET,
-        (_, "vable_token") => pyre_interpreter::pyframe::PYFRAME_VABLE_TOKEN_OFFSET,
-        _ => 0, // Unresolved — Phase D will add more field mappings
+    // RPython: FieldDescr.offset is bound at rtyper time via symbolic.get_field_token.
+    // pyre: Rust struct layouts are resolved here via std::mem::offset_of!.
+    match field_name {
+        "execution_context" => std::mem::offset_of!(PyFrame, execution_context),
+        "code" => std::mem::offset_of!(PyFrame, code),
+        "locals_cells_stack_w" => std::mem::offset_of!(PyFrame, locals_cells_stack_w),
+        "valuestackdepth" => std::mem::offset_of!(PyFrame, valuestackdepth),
+        "next_instr" | "f_lasti" => std::mem::offset_of!(PyFrame, next_instr),
+        "namespace" => std::mem::offset_of!(PyFrame, namespace),
+        "vable_token" => std::mem::offset_of!(PyFrame, vable_token),
+        _ => {
+            if majit_metainterp::majit_log_enabled() {
+                eprintln!(
+                    "[jit][blackhole] WARNING: unresolved field offset owner={:?} name={:?}",
+                    owner, field_name
+                );
+            }
+            0
+        }
     }
 }
 
@@ -696,7 +709,7 @@ fn resolve_field_offset(owner: &str, field_name: &str) -> usize {
 /// Callback for bhimpl_recursive_call. Receives a frame pointer, executes
 /// the frame through the JIT-enabled interpreter (eval_loop_jit), and
 /// returns the result. This enables JIT re-entry at recursive portal depth.
-fn bh_portal_runner(frame_ptr: i64) -> i64 {
+pub(crate) fn bh_portal_runner(frame_ptr: i64) -> i64 {
     if frame_ptr == 0 {
         return pyre_object::PY_NULL as i64;
     }
@@ -1082,14 +1095,22 @@ pub fn resume_in_blackhole(
         // blackhole.py:1095 get_portal_runner parity:
         // Set portal_runner_ptr for bhimpl_recursive_call.
         bh.portal_runner_ptr = Some(bh_portal_runner);
+        // RPython: calldescr = jitdriver_sd.mainjitcode.calldescr
+        // blackhole.py:1098: calldescr from the portal's mainjitcode.
+        bh.mainjitcode_calldescr = pyjitcode.jitcode.calldescr.clone();
 
+        // RPython warmspot.py: jitcode.fnaddr = getfunctionptr(graph).
+        // pyre: all Python functions go through the single portal runner.
+        // Set per-jitcode fnaddr on both the jitcode itself and its descrs.
+        bh.jitcode.fnaddr = bh_portal_runner as usize as i64;
         // RPython: descrs carry FieldDescr.offset (byte offset from rtyper).
         // pyre: field offsets are resolved from Rust struct layout at runtime.
-        // This is a no-op until the codewriter populates descrs (Phase D).
         bh.resolve_field_offsets(resolve_field_offset);
         bh.resolve_jitcode_fnaddrs(|_jitcode_index| {
-            // RPython: JitCode.fnaddr set by warmspot.py after compilation.
-            // pyre: callee function addresses resolved here.
+            // RPython: each callee has its own fnaddr from getfunctionptr().
+            // pyre: single-portal architecture — all callees share the same
+            // portal_runner address. The blackhole's inline_call reads fnaddr
+            // from BhDescr::JitCode and calls bh_call_*(fnaddr, ...).
             bh_portal_runner as usize as i64
         });
 
@@ -1915,6 +1936,9 @@ pub fn blackhole_resume_via_rd_numb(
     }
     // blackhole.py:1095 get_portal_runner parity
     bh.portal_runner_ptr = Some(bh_portal_runner);
+    // RPython: calldescr = jitdriver_sd.mainjitcode.calldescr
+    // blackhole.py:1098: calldescr from the portal's mainjitcode.
+    bh.mainjitcode_calldescr = bh.jitcode.calldescr.clone();
 
     if majit_metainterp::majit_log_enabled() {
         eprintln!("[blackhole-resume] rd_numb path, chain built, running _run_forever",);

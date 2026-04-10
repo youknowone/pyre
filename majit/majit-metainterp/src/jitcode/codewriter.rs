@@ -1122,6 +1122,8 @@ impl JitCodeBuilder {
             depth_at_py_pc: Vec::new(),
             jitdriver_sd: None,
             descrs: Vec::new(),
+            fnaddr: 0,
+            calldescr: majit_codewriter::jitcode::BhCallDescr::default(),
         }
     }
 

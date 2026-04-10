@@ -238,6 +238,14 @@ pub struct JitCode {
     /// pyre: stored per-jitcode. Loaded into `BlackholeInterpreter.descrs`
     /// by `setposition()`. Empty until the codewriter populates it.
     pub descrs: Vec<majit_codewriter::jitcode::BhDescr>,
+    /// RPython `jitcode.py:16` `self.fnaddr` — function address for `bh_call_*`.
+    /// Set by warmspot.py/call.py from `getfunctionptr(graph)`.
+    /// pyre: set at JitCode creation time to the portal runner address.
+    pub fnaddr: i64,
+    /// RPython `jitcode.py:17` `self.calldescr` — calling convention descriptor.
+    /// Set by `call.py:get_jitcode_calldescr(graph)` from the function's type.
+    /// Used by `get_portal_runner()` to return `mainjitcode.calldescr`.
+    pub calldescr: majit_codewriter::jitcode::BhCallDescr,
 }
 
 /// blackhole.py catch_exception: pre-computed exception handler for a JitCode PC range.

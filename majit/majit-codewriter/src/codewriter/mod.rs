@@ -100,6 +100,25 @@ impl CodeWriter {
         // RPython: jitcode.index = index (codewriter.py:68)
         jitcode.index = index;
 
+        // call.py:174-187 get_jitcode_calldescr:
+        // Compute calldescr from the function's argument and result types.
+        {
+            let start_block = rewritten.graph.block(rewritten.graph.startblock);
+            let mut arg_classes = String::new();
+            for arg_id in &start_block.inputargs {
+                match ssarepr.value_kinds.get(arg_id) {
+                    Some(crate::passes::flatten::RegKind::Int) => arg_classes.push('i'),
+                    Some(crate::passes::flatten::RegKind::Ref) => arg_classes.push('r'),
+                    Some(crate::passes::flatten::RegKind::Float) => arg_classes.push('f'),
+                    None => arg_classes.push('i'),
+                }
+            }
+            jitcode.calldescr = crate::jitcode::BhCallDescr {
+                arg_classes,
+                result_type: 'v', // default; overridden by portal setup
+            };
+        }
+
         if self.debug {
             eprintln!(
                 "[CodeWriter] {} → {} ops, {} bytes, regs i={} r={} f={}",
