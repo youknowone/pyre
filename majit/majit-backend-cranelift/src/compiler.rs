@@ -2327,6 +2327,29 @@ extern "C" fn call_assembler_guard_failure(
     outputs_ptr: *const i64,
     inputs_ptr: *const i64,
 ) -> i64 {
+    // warmspot.py:1021-1028 assembler_call_helper parity:
+    // This function is the Rust equivalent of RPython's assembler_call_helper.
+    // It handles ALL non-finish cases: bridge dispatch, bridge compilation,
+    // and blackhole resume. Deep recursion via CALL_ASSEMBLER chains needs
+    // stack growth protection (rstack.stack_almost_full parity).
+    stacker::maybe_grow(512 * 1024, 8 * 1024 * 1024, || {
+        call_assembler_guard_failure_inner(
+            token_number,
+            fail_descr_ptr,
+            frame_ptr,
+            outputs_ptr,
+            inputs_ptr,
+        )
+    })
+}
+
+fn call_assembler_guard_failure_inner(
+    token_number: u64,
+    fail_descr_ptr: i64,
+    frame_ptr: i64,
+    outputs_ptr: *const i64,
+    inputs_ptr: *const i64,
+) -> i64 {
     // Handle deadframe sentinel (nested CALL_ASSEMBLER propagation).
     if fail_descr_ptr == CALL_ASSEMBLER_DEADFRAME_SENTINEL as i64 {
         let frame = take_call_assembler_deadframe_from_outputs(unsafe {
@@ -3414,16 +3437,43 @@ fn build_ref_root_slots(
         }
     }
 
+    // RPython regalloc parity: only track ref roots that are actually
+    // LIVE at some GC-triggering call site. Ref inputargs that the
+    // optimizer replaced with constants (e.g. guard_value'd code/namespace)
+    // are never referenced by ops — they don't need GC root slots.
+    // Build the set of inputarg indices actually used in ops.
+    let mut used_inputargs: HashSet<u32> = HashSet::new();
+    for op in ops.iter() {
+        for &arg in op
+            .args
+            .iter()
+            .chain(op.fail_args.iter().flat_map(|fa| fa.iter()))
+        {
+            let idx = arg.0;
+            if idx < inputargs.len() as u32 {
+                used_inputargs.insert(idx);
+            }
+        }
+    }
     for input in inputargs {
         if input.tp == Type::Ref
             && !force_tokens.contains(&input.index)
             && !non_ref_at_backedge.contains(&input.index)
+            && used_inputargs.contains(&input.index)
             && seen.insert(input.index)
         {
             if std::env::var_os("MAJIT_LOG").is_some() {
                 eprintln!("[ref-root] inputarg idx={} tp={:?}", input.index, input.tp);
             }
             slots.push((input.index, slots.len()));
+        } else if input.tp == Type::Ref
+            && !used_inputargs.contains(&input.index)
+            && std::env::var_os("MAJIT_LOG").is_some()
+        {
+            eprintln!(
+                "[ref-root] SKIP inputarg idx={}: not referenced by ops (constant-folded)",
+                input.index
+            );
         }
     }
 
@@ -3820,13 +3870,15 @@ fn spill_ref_roots(
     defined_ref_vars: &HashSet<u32>,
     ref_root_base_ofs: i32,
 ) {
+    // Only spill DEFINED ref vars. Undefined slots were zeroed at
+    // function entry and remain zero (no def_var overwrites them),
+    // so GC sees NULL — no stale pointer risk.
     for &(var_idx, slot) in ref_root_slots {
+        if !defined_ref_vars.contains(&var_idx) {
+            continue;
+        }
         let offset = ref_root_base_ofs + (slot as i32) * 8;
-        let val = if defined_ref_vars.contains(&var_idx) {
-            builder.use_var(var(var_idx))
-        } else {
-            builder.ins().iconst(cl_types::I64, 0)
-        };
+        let val = builder.use_var(var(var_idx));
         // Do NOT use MemFlags::trusted() — the GC reads these slots
         // via jitframe_custom_trace during collection, so the stores
         // must be visible before the collecting call.
@@ -3916,23 +3968,23 @@ fn compute_per_call_gcmap(max_output_slots: usize, num_ref_roots: usize) -> i64 
 fn emit_reload_frame_if_necessary(
     builder: &mut FunctionBuilder,
     ptr_type: cranelift_codegen::ir::Type,
-    call_conv: cranelift_codegen::isa::CallConv,
+    _call_conv: cranelift_codegen::isa::CallConv,
 ) -> CValue {
-    // _reload_frame_if_necessary (assembler.py:405-412):
+    // _reload_frame_if_necessary (assembler.py:1369-1377):
     //   MOV ecx, [rootstacktop]
     //   MOV ebp, [ecx - WORD]
     //
     // After a collecting call, the GC may have moved the jitframe.
-    // Read the updated jf_ptr from the shadow stack top.
-    emit_host_call(
-        builder,
+    // Read the GC-updated jf_ptr from the global CURRENT_TOP_JF_PTR.
+    // This is a single inline load (vs the old extern "C" call through
+    // TLS + RefCell + Vec::last), matching RPython's 2-MOV pattern.
+    let global_addr = builder.ins().iconst(
         ptr_type,
-        call_conv,
-        majit_gc::shadow_stack::majit_jf_shadow_stack_get_top_jf_ptr as *const () as usize,
-        &[],
-        Some(ptr_type),
-    )
-    .expect("reload returns jf_ptr")
+        majit_gc::shadow_stack::current_top_jf_ptr_addr() as i64,
+    );
+    builder
+        .ins()
+        .load(ptr_type, MemFlags::trusted(), global_addr, 0)
 }
 
 /// RPython push_gcmap (assembler.py:2017-2022, callbuilder.py:93-107):
@@ -5674,6 +5726,16 @@ impl CraneliftBackend {
         // No per-call registration/unregistration inside the compiled code.
         // Per-call spill/reload keeps the roots array up-to-date.
 
+        // Zero-init all ref root slots once at function entry so that GC
+        // sees NULL (not stale stack data) for slots whose variables haven't
+        // been defined yet. This allows spill_ref_roots to skip zero-writes
+        // for undefined vars on every subsequent call.
+        for &(_var_idx, slot) in &ref_root_slots {
+            let offset = ref_root_base_ofs + (slot as i32) * 8;
+            let zero = builder.ins().iconst(cl_types::I64, 0);
+            builder.ins().store(MemFlags::new(), zero, jf_ptr, offset);
+        }
+
         // RPython compile.py sends loops to the backend as:
         // [start_label] + preamble_ops + [loop_label] + body_ops
         // and JUMPs target LABEL descrs. Model that directly by creating
@@ -7176,34 +7238,25 @@ impl CraneliftBackend {
                             builder
                                 .ins()
                                 .icmp(IntCC::Equal, fail_idx_raw, runtime_finish_descr);
-                        // RPython call_assembler (llsupport/assembler.py:295-359):
-                        //   Path B: CMP [eax+jf_descr], done_descr → JE → load result
-                        //   Path A: CALL assembler_helper_adr([jf_frame, vloc])
-                        //
-                        // Path A: 2 sub-paths (bridge inline + extern helper).
-                        // Deadframe sentinel handled inside call_assembler_guard_failure.
+                        // assembler.py:295-360 call_assembler parity:
+                        //   Path B: JE done_descr → load result from frame[0]
+                        //   Path A: CALL assembler_helper_adr(deadframe, vloc)
+                        // Bridge dispatch happens inside the helper (Rust code),
+                        // NOT inlined in assembly. This matches RPython where
+                        // assembler_call_helper calls fail_descr.handle_fail().
                         let direct_finish_block = builder.create_block();
-                        let nonfinish_block = if CALL_ASSEMBLER_FORCE_FN.get().is_some() {
-                            Some(builder.create_block())
-                        } else {
-                            None
-                        };
-                        let nonfinish_target = nonfinish_block.unwrap_or(shim_fallback_block);
+                        let helper_block = builder.create_block();
                         builder.ins().brif(
                             is_direct_finish,
                             direct_finish_block,
                             &[],
-                            nonfinish_target,
+                            helper_block,
                             &[],
                         );
 
                         // ── Path B: finish — load result from frame[0] ──
-                        // assembler.py:2303 _call_assembler_load_result:
-                        //   MOV eax, [eax + ofs]  — load from RETURNED frame
-                        // result_jf is the callee's returned jitframe pointer.
-                        // After shadow stack reload inside the callee, the
-                        // callee may write results to a different jf_ptr than
-                        // the passed args_ptr. Always read from result_jf.
+                        // _call_assembler_load_result (assembler.py:2303):
+                        //   MOV eax, [eax + ofs] — load from RETURNED frame.
                         builder.switch_to_block(direct_finish_block);
                         builder.seal_block(direct_finish_block);
                         let direct_result = builder.ins().load(
@@ -7216,136 +7269,34 @@ impl CraneliftBackend {
                             .ins()
                             .jump(ca_merge_block, &[BlockArg::from(direct_result)]);
 
-                        // ── Path A: non-finish — bridge or assembler_helper ──
-                        if let Some(nonfinish_block) = nonfinish_block {
-                            builder.switch_to_block(nonfinish_block);
-                            builder.seal_block(nonfinish_block);
-
-                            // redirect_call_assembler parity: check bridge inline.
-                            let bridge_ptr_val = builder.ins().load(
-                                ptr_type,
-                                MemFlags::trusted(),
-                                entry_ptr,
-                                16, // guard_bridge_ptr in CaDispatchEntry
-                            );
-                            let bridge_null = builder.ins().iconst(ptr_type, 0);
-                            let has_bridge =
-                                builder
-                                    .ins()
-                                    .icmp(IntCC::NotEqual, bridge_ptr_val, bridge_null);
-                            let inline_bridge_block = builder.create_block();
-                            let extern_helper_block = builder.create_block();
-                            builder.ins().brif(
-                                has_bridge,
-                                inline_bridge_block,
-                                &[],
-                                extern_helper_block,
-                                &[],
-                            );
-
-                            // ── Inline bridge dispatch (hot) ──
-                            // assembler.py:295-360 _call_assembler parity:
-                            // call bridge → check jf_descr → if finish, load
-                            // result; if not, fall through to extern helper.
-                            builder.switch_to_block(inline_bridge_block);
-                            builder.seal_block(inline_bridge_block);
-
-                            // assembler.py GC parity: bridge call may
-                            // trigger GC — same spill/reload pattern as
-                            // the direct call path above.
-                            jf_ptr = builder.use_var(jf_ptr_var);
-                            spill_ref_roots(
-                                &mut builder,
-                                jf_ptr,
-                                &ref_root_slots,
-                                &defined_ref_vars,
-                                ref_root_base_ofs,
-                            );
-                            emit_push_gcmap(&mut builder, jf_ptr, per_call_gcmap);
-
-                            let mut bridge_sig = Signature::new(call_conv);
-                            bridge_sig.params.push(AbiParam::new(ptr_type));
-                            bridge_sig.returns.push(AbiParam::new(ptr_type));
-                            let bridge_sig_ref = builder.import_signature(bridge_sig);
-                            let bridge_call = builder.ins().call_indirect(
-                                bridge_sig_ref,
-                                bridge_ptr_val,
-                                &[args_ptr],
-                            );
-                            let bridge_result_jf = builder.inst_results(bridge_call)[0];
-
-                            jf_ptr =
-                                emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
-                            builder.def_var(jf_ptr_var, jf_ptr);
-                            emit_pop_gcmap(&mut builder, jf_ptr, per_call_gcmap);
-                            reload_ref_roots(
-                                &mut builder,
-                                jf_ptr,
-                                &ref_root_slots,
-                                &defined_ref_vars,
-                                ref_root_base_ofs,
-                            );
-                            // _call_assembler_check_descr parity:
-                            // CMP [result_jf + jf_descr_ofs], done_descr
-                            let bridge_jf_descr = builder.ins().load(
-                                cl_types::I64,
-                                MemFlags::trusted(),
-                                bridge_result_jf,
-                                JF_DESCR_OFS,
-                            );
-                            let bridge_is_finish = builder.ins().icmp(
-                                IntCC::Equal,
-                                bridge_jf_descr,
-                                runtime_finish_descr,
-                            );
-                            let bridge_finish_block = builder.create_block();
-                            builder.ins().brif(
-                                bridge_is_finish,
-                                bridge_finish_block,
-                                &[],
-                                extern_helper_block,
-                                &[],
-                            );
-                            // x86/assembler.py:2291-2303 _call_assembler_load_result:
-                            // MOV eax, [eax + ofs] — load from RETURNED frame.
-                            builder.switch_to_block(bridge_finish_block);
-                            builder.seal_block(bridge_finish_block);
-                            let bridge_result = builder.ins().load(
-                                cl_types::I64,
-                                MemFlags::trusted(),
-                                bridge_result_jf,
-                                JF_FRAME_ITEM0_OFS,
-                            );
-                            builder
-                                .ins()
-                                .jump(ca_merge_block, &[BlockArg::from(bridge_result)]);
-
-                            // ── assembler_helper (cold: no bridge yet) ──
-                            builder.switch_to_block(extern_helper_block);
-                            builder.seal_block(extern_helper_block);
-                            let frame_ptr = saved_frame_ptr;
-                            let result_jf_data =
-                                builder.ins().iadd_imm(result_jf, JF_FRAME_ITEM0_OFS as i64);
-                            let result_jf_data_i64 =
-                                ptr_arg_as_i64(&mut builder, result_jf_data, ptr_type);
-                            let force_result = emit_host_call(
-                                &mut builder,
-                                ptr_type,
-                                call_conv,
-                                call_assembler_guard_failure as *const () as usize,
-                                &[
-                                    target_token,
-                                    fail_idx_raw,
-                                    frame_ptr,
-                                    result_jf_data_i64,
-                                    args_ptr_i64,
-                                ],
-                                Some(cl_types::I64),
-                            );
-                            builder
-                                .ins()
-                                .jump(ca_merge_block, &[BlockArg::from(force_result.unwrap())]);
-                        }
+                        // ── Path A: assembler_helper (handles bridges + blackhole) ──
+                        // warmspot.py:1021-1028 assembler_call_helper parity:
+                        //   fail_descr.handle_fail(deadframe, metainterp_sd, jd)
+                        builder.switch_to_block(helper_block);
+                        builder.seal_block(helper_block);
+                        builder.set_cold_block(helper_block);
+                        let frame_ptr = saved_frame_ptr;
+                        let result_jf_data =
+                            builder.ins().iadd_imm(result_jf, JF_FRAME_ITEM0_OFS as i64);
+                        let result_jf_data_i64 =
+                            ptr_arg_as_i64(&mut builder, result_jf_data, ptr_type);
+                        let force_result = emit_host_call(
+                            &mut builder,
+                            ptr_type,
+                            call_conv,
+                            call_assembler_guard_failure as *const () as usize,
+                            &[
+                                target_token,
+                                fail_idx_raw,
+                                frame_ptr,
+                                result_jf_data_i64,
+                                args_ptr_i64,
+                            ],
+                            Some(cl_types::I64),
+                        );
+                        builder
+                            .ins()
+                            .jump(ca_merge_block, &[BlockArg::from(force_result.unwrap())]);
 
                         // ── Fallback: null code_ptr, unknown finish, or deadframe ──
                         builder.switch_to_block(shim_fallback_block);
