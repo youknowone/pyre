@@ -1,57 +1,20 @@
-//! JitCode assembler — scaffold for converting SSARepr to JitCode bytecode.
+//! Assembler — converts flattened SSARepr into a `JitCode`.
 //!
-//! RPython equivalent: `rpython/jit/codewriter/assembler.py` class `Assembler`.
+//! RPython equivalent: `rpython/jit/codewriter/assembler.py` class
+//! `Assembler`. The `JitCode` struct itself lives in `crate::jitcode`
+//! (RPython parity: `rpython/jit/codewriter/jitcode.py`).
 //!
-//! **Status: scaffold only.** Currently produces metadata-only JitCode (register
-//! counts, name). Full bytecode encoding (`write_insn`, `fix_labels`, liveness
-//! encoding) is not yet implemented — RPython assembler.py does ~300 lines of
-//! instruction encoding that this module does not replicate.
+//! **Status: partial port.** `write_insn`, `fix_labels`, and the
+//! `all_liveness` shared table are implemented in pyre-relevant subset.
+//! Full RPython parity for descriptors, `IndirectCallTargets`, and
+//! `SwitchDictDescr` is pending.
 
 use std::collections::HashMap;
 
-use serde::{Deserialize, Serialize};
-
+use crate::jitcode::JitCode;
 use crate::model::ValueId;
 use crate::passes::flatten::{FlatOp, Label, RegKind, SSARepr};
 use crate::regalloc::RegAllocResult;
-
-/// Assembled JitCode — the output of the assembler.
-///
-/// RPython: `jitcode.py::JitCode` — contains bytecode, constants, and
-/// register counts for the meta-interpreter to execute.
-/// RPython: `jitcode.py::JitCode.setup()` (jitcode.py:22-34).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct JitCode {
-    /// RPython: JitCode.name
-    pub name: String,
-    /// RPython: JitCode.code — bytecode bytes
-    pub code: Vec<u8>,
-    /// RPython: JitCode.constants_i
-    pub constants_i: Vec<i64>,
-    /// RPython: JitCode.constants_r
-    pub constants_r: Vec<u64>,
-    /// RPython: JitCode.constants_f
-    pub constants_f: Vec<f64>,
-    /// RPython: num_regs_i, num_regs_r, num_regs_f
-    pub num_regs_i: usize,
-    pub num_regs_r: usize,
-    pub num_regs_f: usize,
-    /// RPython: jitcode.py:30 — set of bytecode offsets where instructions start.
-    /// Used for debugging and verification.
-    pub startpoints: std::collections::HashSet<usize>,
-    /// RPython: jitcode.py:31 — set of bytecode offsets that are label targets.
-    pub alllabels: std::collections::HashSet<usize>,
-    /// RPython: jitcode.py:32 — map from bytecode offset to result type char.
-    pub resulttypes: HashMap<usize, char>,
-    /// RPython: jitcode.py:24 — sequential index assigned by CodeWriter.
-    /// Used by InlineCall to reference callee JitCode.
-    pub index: usize,
-    /// RPython: jitcode.py:18 — `self.jitdriver_sd = None`.
-    /// None for non-portals. Set by `grab_initial_jitcodes()` for portal JitCodes.
-    pub jitdriver_sd: Option<usize>,
-    /// Total flat ops (for statistics)
-    pub num_ops: usize,
-}
 
 /// Assembler — converts SSARepr to JitCode.
 ///
@@ -159,22 +122,25 @@ impl Assembler {
         }
 
         // RPython assembler.py:271-281: jitcode.setup(code, ...)
-        let jitcode = JitCode {
-            name: ssarepr.name.clone(),
-            code: state.code,
-            constants_i: state.constants_i,
-            constants_r: Vec::new(),
-            constants_f: Vec::new(),
-            num_regs_i,
-            num_regs_r,
-            num_regs_f,
-            startpoints: state.startpoints,
-            alllabels: state.alllabels,
-            resulttypes: state.resulttypes,
-            index: 0,           // set by CodeWriter after assembly
-            jitdriver_sd: None, // RPython jitcode.py:18 — None for non-portals
-            num_ops: ssarepr.insns.len(),
-        };
+        // Equivalent of `jitcode.setup(...)` in `make_jitcode` — populate
+        // the JitCode shell with the assembled bytecode + register layout.
+        let mut jitcode = JitCode::new(ssarepr.name.clone());
+        jitcode.code = state.code;
+        jitcode.constants_i = state.constants_i;
+        // RPython jitcode.py:36 `assert num_regs_i < 256 and ...`. The
+        // assembler limits register pressure via the same invariant.
+        assert!(
+            num_regs_i < 256 && num_regs_r < 256 && num_regs_f < 256,
+            "too many registers (i={num_regs_i} r={num_regs_r} f={num_regs_f})"
+        );
+        jitcode.c_num_regs_i = num_regs_i as u8;
+        jitcode.c_num_regs_r = num_regs_r as u8;
+        jitcode.c_num_regs_f = num_regs_f as u8;
+        jitcode.startpoints = state.startpoints;
+        jitcode.alllabels = state.alllabels;
+        jitcode.resulttypes = state.resulttypes;
+        // index + jitdriver_sd are set by CodeWriter after assembly
+        // (RPython codewriter.py:68 `jitcode.index = index`).
 
         self.count_jitcodes += 1;
         jitcode
@@ -849,9 +815,9 @@ mod tests {
         let jitcode = asm.assemble(&mut flat, &regallocs);
 
         assert_eq!(jitcode.name, "test");
-        assert_eq!(jitcode.num_regs_i, 0);
-        assert_eq!(jitcode.num_regs_r, 0);
-        assert_eq!(jitcode.num_regs_f, 0);
+        assert_eq!(jitcode.num_regs_i(), 0);
+        assert_eq!(jitcode.num_regs_r(), 0);
+        assert_eq!(jitcode.num_regs_f(), 0);
         assert_eq!(asm.count_jitcodes(), 1);
     }
 
@@ -912,8 +878,8 @@ mod tests {
         let jitcode = asm.assemble(&mut flat, &regallocs);
 
         // v0 dies when v1 is defined → they share a register → 1 int reg
-        assert_eq!(jitcode.num_regs_i, 1);
-        assert_eq!(jitcode.num_regs_r, 1);
-        assert_eq!(jitcode.num_regs_f, 0);
+        assert_eq!(jitcode.num_regs_i(), 1);
+        assert_eq!(jitcode.num_regs_r(), 1);
+        assert_eq!(jitcode.num_regs_f(), 0);
     }
 }

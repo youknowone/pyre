@@ -213,8 +213,11 @@ impl CodeWriter {
         // stack register (stack_base + depth) is the current TOS.
         let mut current_depth: u16 = 0;
 
-        // RPython: self.assembler = Assembler()
+        // RPython: self.assembler = Assembler() + JitCode(graph.name, ...)
+        // (rpython/jit/codewriter/jitcode.py:14-15 takes name as the first
+        // __init__ argument; majit's JitCodeBuilder::set_name mirrors that).
         let mut assembler = JitCodeBuilder::default();
+        assembler.set_name(code.obj_name.to_string());
 
         // RPython regalloc.py: keep kind-separated register files.
         assembler.ensure_r_regs(null_ref_reg + 1);
@@ -863,12 +866,14 @@ impl CodeWriter {
 
         // RPython: assembler.assemble() → jitcode via make_jitcode()
         let assembler_code_len = assembler.current_pos();
-        let mut jitcode = assembler.finish();
         // RPython parity: JitCodeBuilder tracks has_abort via abort() calls
         // (BC_ABORT=13). abort_permanent() (BC_ABORT_PERMANENT=14) does not
         // set has_abort. This codewriter only uses abort_permanent() for
         // unsupported bytecodes, so has_abort comes from the assembler.
-        let has_abort = jitcode.has_abort;
+        // The flag lives on the builder, not on the finished JitCode —
+        // matching RPython jitcode.py which has no has_abort field.
+        let mut has_abort = assembler.has_abort_flag();
+        let mut jitcode = assembler.finish();
 
         // liveness.py parity: generate LivenessInfo at each bytecode PC.
         // RPython: compute_liveness() runs backward dataflow on SSARepr,
@@ -974,7 +979,9 @@ impl CodeWriter {
             if liveness_overflow {
                 // Mark the jitcode as unexecutable and clear partial state
                 // so the outer driver treats it as an unconditional abort.
-                jitcode.has_abort = true;
+                // has_abort lives on PyJitCode, not JitCode (RPython parity
+                // — rpython/jit/codewriter/jitcode.py has no such field).
+                has_abort = true;
                 jitcode.liveness_info.clear();
                 jitcode.liveness_offsets.clear();
             } else {

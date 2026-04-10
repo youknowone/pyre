@@ -25,10 +25,10 @@ fn jit_inline_ref_identity_generates_valid_jitcode() {
         return_reg, 0,
         "return register should be the parameter register"
     );
-    // num_regs: [int, ref, float]
-    assert_eq!(jitcode.num_regs[0], 0, "no int registers needed");
-    assert!(jitcode.num_regs[1] >= 1, "at least 1 ref register needed");
-    assert_eq!(jitcode.num_regs[2], 0, "no float registers needed");
+    // RPython jitcode.py:37-39 c_num_regs_i/r/f
+    assert_eq!(jitcode.c_num_regs_i, 0, "no int registers needed");
+    assert!(jitcode.c_num_regs_r >= 1, "at least 1 ref register needed");
+    assert_eq!(jitcode.c_num_regs_f, 0, "no float registers needed");
     // Body is empty (identity returns parameter directly)
     assert!(
         jitcode.code.is_empty(),
@@ -45,9 +45,12 @@ fn jit_inline_float_identity_generates_valid_jitcode() {
         return_reg, 0,
         "return register should be the parameter register"
     );
-    assert_eq!(jitcode.num_regs[0], 0, "no int registers needed");
-    assert_eq!(jitcode.num_regs[1], 0, "no ref registers needed");
-    assert!(jitcode.num_regs[2] >= 1, "at least 1 float register needed");
+    assert_eq!(jitcode.c_num_regs_i, 0, "no int registers needed");
+    assert_eq!(jitcode.c_num_regs_r, 0, "no ref registers needed");
+    assert!(
+        jitcode.c_num_regs_f >= 1,
+        "at least 1 float register needed"
+    );
     assert!(
         jitcode.code.is_empty(),
         "identity helper should have empty bytecode"
@@ -93,7 +96,7 @@ fn jit_inline_ref_identity_works_through_jitcode_builder() {
 
     // Verify the JitCode was built without panics and has correct structure
     assert!(
-        jitcode.num_regs[1] >= 2,
+        jitcode.c_num_regs_r >= 2,
         "caller needs at least 2 ref registers"
     );
     assert_eq!(
@@ -125,7 +128,7 @@ fn jit_inline_float_identity_works_through_jitcode_builder() {
     let jitcode = builder.finish();
 
     assert!(
-        jitcode.num_regs[2] >= 2,
+        jitcode.c_num_regs_f >= 2,
         "caller needs at least 2 float registers"
     );
     assert_eq!(

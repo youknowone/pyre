@@ -23,7 +23,7 @@ Tracks equivalence between majit (Rust, 81k LOC) and the in-tree RPython JIT sou
 | GC rewriter | `rewrite.py` | `implemented` | Nursery/write-barrier rewriting, pending zero flush. |
 | GC runtime | `incminimark.py` | `implemented` | Nursery + oldgen + incremental marking + card marking. 93 tests. |
 | Driver macros | `rlib/jit.py` | `implemented` | `#[jit_interp]`, `#[jit_driver]`, `#[jit_module]`, JitHookInterface. |
-| Static analyzer | `codewriter/*` | `partial` | Graph-based pipeline with canonical CallDescriptor table. Remaining: full descriptor/effectinfo object parity. |
+| Static analyzer | `codewriter/*` | `partial` | Graph-based pipeline with canonical CallDescriptor table + per-opcode dispatch via synthetic graphs (Phase C v2). `JitCode` now lives in its own `jitcode.rs` module (RPython filename parity) with `get_live_vars_info`/`follow_jump`/`num_regs_*`/`enumerate_vars`/`SwitchDictDescr`/`MissingLiveness` ported. Remaining: full descriptor/effectinfo object parity, runtime `BlackholeInterpreter::setup_insns` infrastructure. |
 
 ## File-Level Parity (optimizeopt/)
 
@@ -82,7 +82,7 @@ Tracks equivalence between majit (Rust, 81k LOC) and the in-tree RPython JIT sou
 | compile.rs | compile.py | 1,163 | — | guard metadata, exit layouts, unboxing |
 | executor.rs | executor.py | 731 | — | execute_one (blackhole에서 분리) |
 | jitdriver.rs | jitdriver.py + warmspot.py | 2,527 | 70% | — |
-| jitcode.rs | jitcode.py | (module) | Different | Rust=interpreter+builder |
+| jitcode.rs | jitcode.py | (module) | Different | Rust=interpreter+builder. NOTE: `majit-codewriter::jitcode::JitCode` (codewriter side, RPython orthodox encoding) is now separate from `majit-metainterp::jitcode::JitCode` (runtime side, BC_* opcodes). RPython has a single shared type; Phase D will unify these. |
 | jitexc.rs | jitexc.py | 58 | — | JIT exception enums |
 | greenfield.rs | greenfield.py | 38 | — | scaffold |
 | trace_ctx.rs | (majit-specific) | 2,714 | — | — |

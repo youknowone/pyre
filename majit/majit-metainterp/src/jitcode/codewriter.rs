@@ -32,6 +32,10 @@ use super::{
 
 #[derive(Default)]
 pub struct JitCodeBuilder {
+    /// RPython `jitcode.py:15` `self.name = name`. Propagated to the
+    /// finished `JitCode` by `finish()`; empty by default until a
+    /// caller provides the source function name via `set_name`.
+    name: String,
     code: Vec<u8>,
     num_regs_i: u16,
     num_regs_r: u16,
@@ -49,6 +53,34 @@ pub struct JitCodeBuilder {
 impl JitCodeBuilder {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// RPython `jitcode.py:14-15` `__init__(name, ...)`: set the symbolic
+    /// name used by `dump()` / `Display`. Callers that know the source
+    /// function name should call this before `finish()`.
+    pub fn set_name(&mut self, name: impl Into<String>) {
+        self.name = name.into();
+    }
+
+    /// Whether `abort()` was called on this builder.
+    ///
+    /// pyre-specific: when true the caller should treat the resulting
+    /// JitCode as non-executable and fall back to the interpreter.
+    /// RPython has no equivalent because a translator that emits a bad
+    /// bytecode crashes the build via AssertionError instead. Keeping
+    /// this flag on the builder (not on `JitCode` itself) lets the
+    /// metainterp-side `JitCode` stay aligned with RPython jitcode.py.
+    pub fn has_abort_flag(&self) -> bool {
+        self.has_abort
+    }
+
+    /// Pyre-specific: force-set the abort flag from an outer pipeline
+    /// step (e.g. liveness overflow after `finish()` has already packed
+    /// the JitCode). Updates the builder state but since finish() has
+    /// consumed self, callers use this before finish() or on a new
+    /// tracking variable.
+    pub fn set_abort_flag(&mut self, v: bool) {
+        self.has_abort = v;
     }
 
     /// Current bytecode emission position.
@@ -1067,8 +1099,11 @@ impl JitCodeBuilder {
     pub fn finish(mut self) -> JitCode {
         self.patch_labels();
         JitCode {
+            name: self.name,
             code: self.code,
-            num_regs: [self.num_regs_i, self.num_regs_r, self.num_regs_f],
+            c_num_regs_i: self.num_regs_i,
+            c_num_regs_r: self.num_regs_r,
+            c_num_regs_f: self.num_regs_f,
             constants_i: self.constants_i,
             constants_r: Vec::new(),
             constants_f: Vec::new(),
@@ -1085,7 +1120,6 @@ impl JitCodeBuilder {
             nlocals: 0,
             stack_base: 0,
             depth_at_py_pc: Vec::new(),
-            has_abort: self.has_abort,
             jitdriver_sd: None,
         }
     }

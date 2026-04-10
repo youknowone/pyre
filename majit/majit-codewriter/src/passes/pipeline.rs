@@ -77,7 +77,7 @@ pub struct ProgramPipelineResult {
     pub opcode_dispatch: Vec<PipelineOpcodeArm>,
     /// RPython: all_jitcodes returned by CodeWriter.make_jitcodes() (codewriter.py:89).
     /// Assembled JitCode bytecode for each transformed graph.
-    pub jitcodes: Vec<crate::assembler::JitCode>,
+    pub jitcodes: Vec<crate::jitcode::JitCode>,
     pub total_blocks: usize,
     pub total_ops: usize,
     pub total_vable_rewrites: usize,
