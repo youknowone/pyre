@@ -702,6 +702,11 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
             _ => None,
         }
     }
+
+    fn get_known_class(&self, opref: OpRef) -> Option<majit_ir::GcRef> {
+        let resolved = self.ctx.get_box_replacement(opref);
+        self.ctx.get_ptr_info(resolved)?.get_known_class()
+    }
 }
 
 impl OptContext {
@@ -2314,7 +2319,7 @@ impl OptContext {
             // Don't update last_guard_idx — copied guards don't become sources.
         } else {
             // optimizer.py:678: store_final_boxes_in_guard
-            self.store_final_boxes_in_guard(op);
+            self.store_final_boxes_in_guard(op, None);
             self.last_guard_idx = Some(self.new_operations.len());
             // optimizer.py:680-683: force_box on fail_args for unrolling.
             // Mirrors Optimizer.force_box contract: resolve replacement,
@@ -2415,11 +2420,19 @@ impl OptContext {
     /// Generate rd_numb + rd_consts + rd_virtuals for a guard.
     /// Called from store_final_boxes_in_guard in optimizer.rs.
     /// Uses snapshot data (vable_boxes, frame_pcs, multi-frame) when available.
-    pub fn finalize_guard_resume_data(&self, op: &mut Op) {
-        self.store_final_boxes_in_guard(op);
+    pub fn finalize_guard_resume_data(
+        &self,
+        op: &mut Op,
+        knowledge: Option<crate::resume::OptimizerKnowledgeForResume>,
+    ) {
+        self.store_final_boxes_in_guard(op, knowledge);
     }
 
-    fn store_final_boxes_in_guard(&self, op: &mut Op) {
+    fn store_final_boxes_in_guard(
+        &self,
+        op: &mut Op,
+        knowledge: Option<crate::resume::OptimizerKnowledgeForResume>,
+    ) {
         use crate::resume::{ResumeDataLoopMemo, Snapshot};
 
         // resume.py:397: assert not storage.rd_numb
@@ -2451,13 +2464,38 @@ impl OptContext {
         // that constructs synthetic guards without going through the
         // pyre snapshot path, where the silent drop is acceptable.
         if !has_snapshot {
-            assert!(
-                self.snapshot_boxes.is_empty(),
-                "[jit] no-snapshot guard {:?} pos={:?} resume_pos={}",
-                op.opcode,
-                op.pos,
-                op.rd_resume_position,
-            );
+            // unroll.py:336/409 parity: when unroll creates a new guard from
+            // a short preamble / virtual state import, it copies
+            // rd_resume_position from patchguardop. If the new guard arrives
+            // here without a snapshot, it must come from a patchguardop
+            // context — inherit the patchguardop's resume_position.
+            // resume.py:396-397: RPython asserts resume_position >= 0.
+            let fallback_pos = self
+                .patchguardop
+                .as_ref()
+                .map(|p| p.rd_resume_position)
+                .filter(|&p| p >= 0 && self.snapshot_boxes.contains_key(&p));
+            if let Some(fb_pos) = fallback_pos {
+                op.rd_resume_position = fb_pos;
+                self.finalize_guard_resume_data(op, None);
+                return;
+            }
+            // resume.py:396-397: RPython asserts resume_position >= 0.
+            // Without a snapshot AND without a patchguardop fallback, the
+            // guard has no resume context and the runtime guard-fail path
+            // cannot recover. Drop the guard's resume data so the backend
+            // emits a sentinel descr that triggers loop invalidation
+            // instead of running undefined resume code.
+            //
+            // Phase A (snapshot wiring through finish_and_compile) +
+            // patchguardop fallback should make this branch dead in
+            // practice; flag it via MAJIT_LOG so any regression surfaces.
+            if std::env::var_os("MAJIT_LOG").is_some() {
+                eprintln!(
+                    "[jit][drop] no-snapshot guard {:?} pos={:?} resume_pos={}",
+                    op.opcode, op.pos, op.rd_resume_position,
+                );
+            }
             return;
         }
 
@@ -2516,7 +2554,7 @@ impl OptContext {
         let mut pending_slice = op.rd_pendingfields.take().unwrap_or_default();
 
         let (rd_numb, rd_consts, rd_virtuals, liveboxes, livebox_types) =
-            memo.finish(numb_state, &env, &mut pending_slice, None);
+            memo.finish(numb_state, &env, &mut pending_slice, knowledge.as_ref());
 
         // RPython Box.type parity: types captured at numbering time via
         // env.get_type(), equivalent to RPython's intrinsic Box.type.

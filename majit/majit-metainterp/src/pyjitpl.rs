@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
-use crate::optimizeopt::optimizer::{Optimizer, OptimizerKnowledge};
+use crate::optimizeopt::optimizer::Optimizer;
 use majit_backend::{
     Backend, CompiledTraceInfo, ExitFrameLayout, ExitRecoveryLayout, FailDescrLayout, JitCellToken,
     TerminalExitLayout,
@@ -16,6 +16,7 @@ pub(crate) use majit_backend_wasm::WasmBackend as BackendImpl;
 #[cfg(not(any(feature = "cranelift", feature = "dynasm", target_arch = "wasm32")))]
 compile_error!("majit-metainterp requires a backend: enable feature \"cranelift\" or \"dynasm\"");
 
+use majit_ir::descr::DescrRef;
 use majit_ir::{FailDescr, GcRef, InputArg, Op, OpCode, OpRef, Type, Value};
 use majit_trace::history::TreeLoop;
 use majit_trace::warmstate::{HotResult, WarmEnterState};
@@ -113,10 +114,6 @@ pub(crate) struct CompiledTrace {
     /// Indexed by the guard's rd_resume_position. Used for snapshot-based
     /// resume data reconstruction (independent of optimizer's fail_args).
     pub(crate) snapshots: Vec<majit_trace::recorder::Snapshot>,
-    /// bridgeopt.py: serialized optimizer knowledge per guard, keyed by fail_index.
-    /// Each guard gets the optimizer knowledge state at its point in the trace.
-    /// Used by deserialize_optimizer_knowledge when compiling a bridge.
-    pub(crate) optimizer_knowledge: HashMap<u32, OptimizerKnowledge>,
     /// JitCode for blackhole fallback. RPython stores jitcodes globally;
     /// in majit the JitCode is produced by #[jit_interp] lowering and
     /// stored per-trace so BlackholeInterpreter can execute from guard
@@ -521,6 +518,19 @@ pub struct MetaInterp<M: Clone> {
     /// compile.py:288-290 parity: preamble target tokens saved from Phase 1
     /// even when Phase 2 raises InvalidLoop.
     pending_preamble_tokens: HashMap<u64, Vec<crate::optimizeopt::unroll::TargetToken>>,
+    /// pyjitpl.py:2287-2290 metainterp_sd.all_descrs: global descriptor
+    /// registry mapping descr_index → DescrRef. Populated as descriptors
+    /// are encountered during tracing/optimization. Used by
+    /// deserialize_optimizer_knowledge to recover DescrRef from rd_numb.
+    pub(crate) all_descrs: HashMap<u32, DescrRef>,
+    /// bridgeopt.py:124 frontend_boxes parity: runtime values from the
+    /// guard failure DeadFrame. Saved by start_retrace_from_guard, used
+    /// by compile_bridge for cls_of_box during deserialize_optimizer_knowledge.
+    pending_frontend_boxes: Option<Vec<i64>>,
+    /// model.py:199-201 cpu.cls_of_box parity: callback that reads
+    /// the class/vtable pointer from a runtime Ref object.
+    /// Registered by the interpreter at JIT init.
+    pub(crate) cls_of_box: Option<fn(i64) -> i64>,
 }
 
 /// Internal mutable counters for JIT compilation statistics.
@@ -906,6 +916,9 @@ impl<M: Clone> MetaInterp<M> {
             retrace_after_bridge: false,
             virtualref_boxes: Vec::new(),
             pending_preamble_tokens: HashMap::new(),
+            all_descrs: HashMap::new(),
+            pending_frontend_boxes: None,
+            cls_of_box: None,
         }
     }
 
@@ -918,6 +931,17 @@ impl<M: Clone> MetaInterp<M> {
     /// warmspot.py:449 — the per-driver static result_type.
     pub fn result_type(&self) -> Type {
         self.result_type
+    }
+
+    /// pyjitpl.py:2287-2290 finish_setup_descrs: register descriptors into
+    /// the global all_descrs registry for rd_numb deserialization.
+    pub(crate) fn register_all_descrs(&mut self, descrs: impl IntoIterator<Item = DescrRef>) {
+        for descr in descrs {
+            let idx = descr.index();
+            if idx != u32::MAX {
+                self.all_descrs.insert(idx, descr);
+            }
+        }
     }
 
     /// Cache the current virtualizable object pointer for trace-entry setup.
@@ -2357,26 +2381,7 @@ impl<M: Clone> MetaInterp<M> {
                     trace_id,
                     &mut terminal_exit_layouts,
                 );
-                // resume.py:570-574 _add_optimizer_sections parity:
-                // serialize per-guard knowledge from unroll optimizer.
-                let optimizer_knowledge = {
-                    let pos_to_fail: HashMap<u32, u32> = guard_op_indices
-                        .iter()
-                        .filter_map(|(&fi, &op_idx)| {
-                            compiled_ops.get(op_idx).map(|op| (op.pos.0, fi))
-                        })
-                        .collect();
-                    let mut result: HashMap<
-                        u32,
-                        crate::optimizeopt::optimizer::OptimizerKnowledge,
-                    > = HashMap::new();
-                    for (guard_pos, knowledge) in &unroll_opt.per_guard_knowledge {
-                        if let Some(&fi) = pos_to_fail.get(&guard_pos.0) {
-                            result.insert(fi, knowledge.clone());
-                        }
-                    }
-                    result
-                };
+                self.register_all_descrs(unroll_opt.used_descrs.drain(..));
                 let mut traces = HashMap::new();
                 traces.insert(
                     trace_id,
@@ -2390,7 +2395,6 @@ impl<M: Clone> MetaInterp<M> {
                         exit_layouts,
                         terminal_exit_layouts,
                         snapshots: trace_snapshots,
-                        optimizer_knowledge,
                         jitcode: None,
                     },
                 );
@@ -3022,22 +3026,7 @@ impl<M: Clone> MetaInterp<M> {
                     trace_id,
                     &mut terminal_exit_layouts,
                 );
-                // resume.py:570 parity: serialize per_guard_knowledge.
-                let optimizer_knowledge = {
-                    let pos_to_fail: HashMap<u32, u32> = guard_op_indices
-                        .iter()
-                        .filter_map(|(&fi, &op_idx)| {
-                            combined_ops.get(op_idx).map(|op| (op.pos.0, fi))
-                        })
-                        .collect();
-                    let mut result: HashMap<u32, OptimizerKnowledge> = HashMap::new();
-                    for (guard_pos, knowledge) in &unroll_opt.per_guard_knowledge {
-                        if let Some(&fi) = pos_to_fail.get(&guard_pos.0) {
-                            result.insert(fi, knowledge.clone());
-                        }
-                    }
-                    result
-                };
+                self.register_all_descrs(unroll_opt.used_descrs.drain(..));
                 let mut traces = HashMap::new();
                 traces.insert(
                     trace_id,
@@ -3051,7 +3040,6 @@ impl<M: Clone> MetaInterp<M> {
                         guard_op_indices,
                         exit_layouts,
                         terminal_exit_layouts,
-                        optimizer_knowledge,
                         jitcode: None,
                     },
                 );
@@ -3403,26 +3391,7 @@ impl<M: Clone> MetaInterp<M> {
                     trace_id,
                     &mut terminal_exit_layouts,
                 );
-                // RPython resume.py:570-574: per-guard knowledge captured
-                // during optimization at each guard emit point. PyPy runs
-                // serialize_optimizer_knowledge per-guard with that guard's
-                // available_boxes — there is no global end-of-optimization
-                // fallback. Guards without per-guard knowledge have none.
-                let per_guard_knowledge = {
-                    let pos_to_fail: HashMap<u32, u32> = guard_op_indices
-                        .iter()
-                        .filter_map(|(&fi, &op_idx)| {
-                            optimized_ops.get(op_idx).map(|op| (op.pos.0, fi))
-                        })
-                        .collect();
-                    let mut result: HashMap<u32, OptimizerKnowledge> = HashMap::new();
-                    for (guard_pos, knowledge) in &optimizer.per_guard_knowledge {
-                        if let Some(&fi) = pos_to_fail.get(&guard_pos.0) {
-                            result.insert(fi, knowledge.clone());
-                        }
-                    }
-                    result
-                };
+                self.register_all_descrs(optimizer.used_descrs.drain(..));
                 let mut traces = HashMap::new();
                 traces.insert(
                     trace_id,
@@ -3436,7 +3405,6 @@ impl<M: Clone> MetaInterp<M> {
                         guard_op_indices,
                         exit_layouts,
                         terminal_exit_layouts,
-                        optimizer_knowledge: per_guard_knowledge,
                         jitcode: None,
                     },
                 );
@@ -3722,21 +3690,7 @@ impl<M: Clone> MetaInterp<M> {
                     trace_id,
                     &mut terminal_exit_layouts,
                 );
-                let per_guard_knowledge = {
-                    let pos_to_fail: HashMap<u32, u32> = guard_op_indices
-                        .iter()
-                        .filter_map(|(&fi, &op_idx)| {
-                            optimized_ops.get(op_idx).map(|op| (op.pos.0, fi))
-                        })
-                        .collect();
-                    let mut result: HashMap<u32, OptimizerKnowledge> = HashMap::new();
-                    for (guard_pos, knowledge) in &optimizer.per_guard_knowledge {
-                        if let Some(&fi) = pos_to_fail.get(&guard_pos.0) {
-                            result.insert(fi, knowledge.clone());
-                        }
-                    }
-                    result
-                };
+                self.register_all_descrs(optimizer.used_descrs.drain(..));
                 let mut traces = HashMap::new();
                 traces.insert(
                     trace_id,
@@ -3750,7 +3704,6 @@ impl<M: Clone> MetaInterp<M> {
                         guard_op_indices,
                         exit_layouts,
                         terminal_exit_layouts,
-                        optimizer_knowledge: per_guard_knowledge,
                         jitcode: None,
                     },
                 );
@@ -5692,21 +5645,7 @@ impl<M: Clone> MetaInterp<M> {
                     trace_id,
                     &mut terminal_exit_layouts,
                 );
-                let bridge_optimizer_knowledge = {
-                    let pos_to_fail: HashMap<u32, u32> = guard_op_indices
-                        .iter()
-                        .filter_map(|(&fi, &op_idx)| {
-                            optimized_ops.get(op_idx).map(|op| (op.pos.0, fi))
-                        })
-                        .collect();
-                    let mut result: HashMap<u32, OptimizerKnowledge> = HashMap::new();
-                    for (guard_pos, knowledge) in &optimizer.per_guard_knowledge {
-                        if let Some(&fi) = pos_to_fail.get(&guard_pos.0) {
-                            result.insert(fi, knowledge.clone());
-                        }
-                    }
-                    result
-                };
+                self.register_all_descrs(optimizer.used_descrs.drain(..));
                 let mut traces = HashMap::new();
                 traces.insert(
                     trace_id,
@@ -5720,7 +5659,6 @@ impl<M: Clone> MetaInterp<M> {
                         guard_op_indices,
                         exit_layouts,
                         terminal_exit_layouts,
-                        optimizer_knowledge: bridge_optimizer_knowledge,
                         jitcode: None,
                     },
                 );
@@ -5837,11 +5775,10 @@ impl<M: Clone> MetaInterp<M> {
         // match. Without this, bridges fall back to preamble (causing
         // infinite guard failure loops on preamble guards).
         let retrace_limit = 5u32;
-        // bridgeopt.py: retrieve optimizer knowledge from the source trace
-        // and remap OpRefs from the source trace's numbering to the bridge's
-        // inputarg numbering. The bridge inputargs correspond to the guard's
-        // fail_args in order, so source_opref -> bridge_inputarg_index.
-        let bridge_knowledge: Option<OptimizerKnowledge> = {
+        // bridgeopt.py:124-185 deserialize_optimizer_knowledge:
+        // Retrieve guard's rd_numb + frontend_boxes for deserialization.
+        use crate::optimizeopt::optimizer::PendingBridgeRd;
+        let pending_bridge_rd: Option<PendingBridgeRd> = {
             let source_trace_id = {
                 let tid = fail_descr.trace_id();
                 if tid == 0 {
@@ -5851,34 +5788,27 @@ impl<M: Clone> MetaInterp<M> {
                 }
             };
             compiled.traces.get(&source_trace_id).and_then(|trace| {
-                let knowledge = trace.optimizer_knowledge.get(&fail_index)?;
-                if knowledge.is_empty() {
-                    return None;
-                }
-                // Build mapping: source_trace_opref -> bridge_inputarg_index.
-                // The guard's fail_args list which source-trace OpRefs are
-                // saved; the bridge's inputargs are OpRef(0..n) in that order.
                 let guard_op_idx = trace.guard_op_indices.get(&fail_index)?;
                 let guard_op = trace.ops.get(*guard_op_idx)?;
-                let fail_args = guard_op.fail_args.as_ref()?;
-                let mut remap: HashMap<majit_ir::OpRef, majit_ir::OpRef> = HashMap::new();
-                for (i, &src_ref) in fail_args.iter().enumerate() {
-                    if !src_ref.is_none() {
-                        remap.insert(src_ref, majit_ir::OpRef(i as u32));
-                    }
-                }
-                // Also map constants: they keep their original OpRef
-                // (constants are in the bridge's constant pool too).
-                for (&idx, _) in trace.constants.iter() {
-                    let opref = majit_ir::OpRef(idx);
-                    remap.entry(opref).or_insert(opref);
-                }
-                let remapped = knowledge.remap(&remap);
-                if remapped.is_empty() {
-                    None
-                } else {
-                    Some(remapped)
-                }
+                let rd_numb = guard_op.rd_numb.as_ref()?.clone();
+                let rd_consts = guard_op.rd_consts.as_ref()?.clone();
+                let liveboxes: Vec<OpRef> = (0..bridge_inputargs.len())
+                    .map(|i| OpRef(i as u32))
+                    .collect();
+                let livebox_types: Vec<Type> = bridge_inputargs.iter().map(|ia| ia.tp).collect();
+                // bridgeopt.py:124: frontend_boxes = runtime values from
+                // guard failure. RPython passes Box objects; majit passes
+                // raw i64 values from the DeadFrame.
+                let frontend_boxes = self.pending_frontend_boxes.take().unwrap_or_default();
+                Some(PendingBridgeRd {
+                    rd_numb,
+                    rd_consts,
+                    frontend_boxes,
+                    liveboxes,
+                    livebox_types,
+                    all_descrs: self.all_descrs.clone(),
+                    cls_of_box: self.cls_of_box,
+                })
             })
         };
         // Store bridge inputarg types so export_state can propagate them
@@ -5926,7 +5856,7 @@ impl<M: Clone> MetaInterp<M> {
                 inline_short_preamble,
                 retraced_count,
                 retrace_limit,
-                bridge_knowledge.as_ref(),
+                pending_bridge_rd,
                 Some(loop_num_inputs),
             )
         }));
@@ -6201,22 +6131,6 @@ impl<M: Clone> MetaInterp<M> {
                         bridge_trace_id,
                         &mut terminal_exit_layouts,
                     );
-                    // resume.py:570 parity: serialize bridge per_guard_knowledge.
-                    let bridge_optimizer_knowledge = {
-                        let pos_to_fail: HashMap<u32, u32> = guard_op_indices
-                            .iter()
-                            .filter_map(|(&fi, &op_idx)| {
-                                optimized_ops.get(op_idx).map(|op| (op.pos.0, fi))
-                            })
-                            .collect();
-                        let mut result: HashMap<u32, OptimizerKnowledge> = HashMap::new();
-                        for (guard_pos, knowledge) in &optimizer.per_guard_knowledge {
-                            if let Some(&fi) = pos_to_fail.get(&guard_pos.0) {
-                                result.insert(fi, knowledge.clone());
-                            }
-                        }
-                        result
-                    };
                     compiled.traces.insert(
                         bridge_trace_id,
                         CompiledTrace {
@@ -6229,11 +6143,11 @@ impl<M: Clone> MetaInterp<M> {
                             guard_op_indices,
                             exit_layouts,
                             terminal_exit_layouts,
-                            optimizer_knowledge: bridge_optimizer_knowledge,
                             jitcode: None,
                         },
                     );
                 }
+                self.register_all_descrs(optimizer.used_descrs.drain(..));
                 self.warm_state.log_bridge_compile(fail_index);
                 self.stats.bridges_compiled += 1;
 
@@ -6274,9 +6188,12 @@ impl<M: Clone> MetaInterp<M> {
         green_key: u64,
         trace_id: u64,
         fail_index: u32,
-        _fail_values: &[i64],
+        fail_values: &[i64],
         _live_types: &[Type],
     ) -> Option<BridgeRetraceResult> {
+        // bridgeopt.py:124 parity: save runtime values (frontend_boxes)
+        // for cls_of_box during bridge deserialization.
+        self.pending_frontend_boxes = Some(fail_values.to_vec());
         let compiled = match self.compiled_loops.get(&green_key) {
             Some(c) => c,
             None => return None,
@@ -7807,7 +7724,6 @@ mod tests {
                 guard_op_indices,
                 exit_layouts,
                 terminal_exit_layouts,
-                optimizer_knowledge: HashMap::new(),
                 jitcode: None,
                 snapshots: Vec::new(),
             },

@@ -78,13 +78,8 @@ pub struct UnrollOptimizer {
     /// RPython box.type parity: each snapshot Box carries its type from tracing.
     /// Used by InlineBoxEnv.get_type() for correct _number_boxes virtual detection.
     pub snapshot_box_types: std::collections::HashMap<u32, majit_ir::Type>,
-    /// resume.py:570-574 _add_optimizer_sections: per-guard optimizer
-    /// knowledge collected during optimization. Propagated to CompiledTrace
-    /// for bridge compilation.
-    pub per_guard_knowledge: Vec<(
-        majit_ir::OpRef,
-        crate::optimizeopt::optimizer::OptimizerKnowledge,
-    )>,
+    /// DescrRefs collected during optimization for all_descrs registration.
+    pub used_descrs: Vec<majit_ir::descr::DescrRef>,
     /// RPython parity: GcRef constants that need Ref type for resume data.
     pub numbering_type_overrides: std::collections::HashMap<u32, majit_ir::Type>,
     /// RPython Box type parity: trace inputarg types from recorder.
@@ -137,7 +132,7 @@ impl UnrollOptimizer {
             snapshot_vable_boxes: std::collections::HashMap::new(),
             snapshot_frame_pcs: std::collections::HashMap::new(),
             snapshot_box_types: std::collections::HashMap::new(),
-            per_guard_knowledge: Vec::new(),
+            used_descrs: Vec::new(),
             trace_inputarg_types: Vec::new(),
             original_trace_op_types: std::collections::HashMap::new(),
             phase1_value_types: std::collections::HashMap::new(),
@@ -416,9 +411,7 @@ impl UnrollOptimizer {
                         self.phase1_patchguardop = opt_p1.patchguardop.clone();
                     }
                     state.patchguardop = opt_p1.patchguardop.clone();
-                    // resume.py:570-574: collect Phase 1 per-guard knowledge.
-                    self.per_guard_knowledge
-                        .extend(opt_p1.per_guard_knowledge.drain(..));
+                    self.used_descrs.extend(opt_p1.used_descrs.drain(..));
                     (state, consts_p1, p1_ops)
                 }
                 None => {
@@ -716,9 +709,7 @@ impl UnrollOptimizer {
         }
         let body_terminal_op = opt_p2.terminal_op.clone();
         let p2_ni = opt_p2.final_num_inputs();
-        // resume.py:570-574: collect per-guard optimizer knowledge from both phases.
-        self.per_guard_knowledge
-            .extend(opt_p2.per_guard_knowledge.drain(..));
+        self.used_descrs.extend(opt_p2.used_descrs.drain(..));
         let label_args = opt_p2
             .imported_label_args
             .clone()
