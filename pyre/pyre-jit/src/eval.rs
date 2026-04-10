@@ -1410,11 +1410,7 @@ fn handle_fail(
 ///
 /// RPython: resume_in_blackhole → blackhole_from_resumedata →
 /// consume_one_section → _run_forever → raises.
-/// pyre: build_resumed_frames → resume_in_blackhole → returns result.
 ///
-/// The RPython orthodox path (blackhole_resume_via_rd_numb →
-/// consume_one_section) is not yet compatible with pyre's JitCode
-/// liveness format. Use pyre's build_resumed_frames path.
 fn resume_in_blackhole_from_exit_layout(
     frame: &mut PyFrame,
     raw_values: &[i64],
@@ -1475,6 +1471,22 @@ fn execute_assembler(
     env: &PyreEnv,
 ) -> Option<LoopResult> {
     frame.next_instr = entry_pc;
+
+    if majit_metainterp::majit_log_enabled() {
+        let locals: Vec<(usize, Option<i64>)> = (0..frame.locals_cells_stack_w.len().min(5))
+            .map(|i| {
+                let value = frame.locals_cells_stack_w[i];
+                let decoded = if value.is_null() || !unsafe { pyre_object::pyobject::is_int(value) }
+                {
+                    None
+                } else {
+                    Some(unsafe { pyre_object::intobject::w_int_get_value(value) })
+                };
+                (value as usize, decoded)
+            })
+            .collect();
+        eprintln!("[jit][execute-assembler][locals] {:?}", locals);
+    }
 
     let mut jit_state = build_jit_state(frame, info);
 
@@ -1616,11 +1628,24 @@ fn bound_reached(
     env: &PyreEnv,
 ) -> Option<LoopResult> {
     if majit_metainterp::majit_log_enabled() {
+        let locals: Vec<(usize, Option<i64>)> = (0..frame.locals_cells_stack_w.len().min(5))
+            .map(|i| {
+                let value = frame.locals_cells_stack_w[i];
+                let decoded = if value.is_null() || !unsafe { pyre_object::pyobject::is_int(value) }
+                {
+                    None
+                } else {
+                    Some(unsafe { pyre_object::intobject::w_int_get_value(value) })
+                };
+                (value as usize, decoded)
+            })
+            .collect();
         eprintln!(
-            "[jit][bound-reached] key={} pc={} arg0={:?}",
+            "[jit][bound-reached] key={} pc={} arg0={:?} locals={:?}",
             green_key,
             loop_header_pc,
             debug_first_arg_int(frame),
+            locals,
         );
     }
     // warmstate.py:429: jitcounter.decay_all_counters()
@@ -3162,6 +3187,12 @@ fn build_resumed_frames(
             )
         })
         .collect();
+    if majit_metainterp::majit_log_enabled() {
+        eprintln!(
+            "[jit][resume][vable-values] rebuilt={:?} resolved={:?}",
+            vable_values, resolved_vable
+        );
+    }
 
     let mut vable_frame_ptr = resolved_vable
         .first()
