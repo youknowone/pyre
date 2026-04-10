@@ -1143,70 +1143,166 @@ pub trait Backend: Send {
     // back from JIT-compiled code. The backend implements these
     // to read/write memory at known addresses.
 
-    /// model.py: bh_getfield_gc_i(struct_ptr, descr)
-    fn bh_getfield_gc_i(&self, _struct_ptr: i64, _offset: usize) -> i64 {
+    // ── model.py:216-228 field operations ──
+    /// model.py:216 bh_getfield_gc_i(struct, fielddescr)
+    fn bh_getfield_gc_i(
+        &self,
+        _struct_ptr: i64,
+        _fielddescr: &majit_codewriter::jitcode::BhDescr,
+    ) -> i64 {
         0
     }
-    /// model.py: bh_getfield_gc_r(struct_ptr, descr)
-    fn bh_getfield_gc_r(&self, _struct_ptr: i64, _offset: usize) -> GcRef {
+    /// model.py:217 bh_getfield_gc_r(struct, fielddescr)
+    fn bh_getfield_gc_r(
+        &self,
+        _struct_ptr: i64,
+        _fielddescr: &majit_codewriter::jitcode::BhDescr,
+    ) -> GcRef {
         GcRef::NULL
     }
-    /// model.py: bh_getfield_gc_f(struct_ptr, descr)
-    fn bh_getfield_gc_f(&self, _struct_ptr: i64, _offset: usize) -> f64 {
+    /// model.py:218 bh_getfield_gc_f(struct, fielddescr)
+    fn bh_getfield_gc_f(
+        &self,
+        _struct_ptr: i64,
+        _fielddescr: &majit_codewriter::jitcode::BhDescr,
+    ) -> f64 {
         0.0
     }
-    /// model.py: bh_setfield_gc_i(struct_ptr, value, descr)
-    fn bh_setfield_gc_i(&self, _struct_ptr: i64, _offset: usize, _value: i64) {}
-    /// model.py: bh_setfield_gc_r(struct_ptr, value, descr)
-    fn bh_setfield_gc_r(&self, _struct_ptr: i64, _offset: usize, _value: GcRef) {}
-    /// model.py: bh_setfield_gc_f(struct_ptr, value, descr)
-    fn bh_setfield_gc_f(&self, _struct_ptr: i64, _offset: usize, _value: f64) {}
-    /// model.py: bh_getarrayitem_gc_i(array_ptr, index, descr)
-    fn bh_getarrayitem_gc_i(&self, _array_ptr: i64, _index: i64, _item_size: usize) -> i64 {
+    /// model.py:222 bh_setfield_gc_i(struct, newvalue, fielddescr)
+    fn bh_setfield_gc_i(
+        &self,
+        _struct_ptr: i64,
+        _newvalue: i64,
+        _fielddescr: &majit_codewriter::jitcode::BhDescr,
+    ) {
+    }
+    /// model.py:223 bh_setfield_gc_r(struct, newvalue, fielddescr)
+    fn bh_setfield_gc_r(
+        &self,
+        _struct_ptr: i64,
+        _newvalue: GcRef,
+        _fielddescr: &majit_codewriter::jitcode::BhDescr,
+    ) {
+    }
+    /// model.py:224 bh_setfield_gc_f(struct, newvalue, fielddescr)
+    fn bh_setfield_gc_f(
+        &self,
+        _struct_ptr: i64,
+        _newvalue: f64,
+        _fielddescr: &majit_codewriter::jitcode::BhDescr,
+    ) {
+    }
+
+    // ── model.py:209-215, 247-253 array operations ──
+    /// model.py:209 bh_getarrayitem_gc_i(array, index, arraydescr)
+    fn bh_getarrayitem_gc_i(
+        &self,
+        _array_ptr: i64,
+        _index: i64,
+        _arraydescr: &majit_codewriter::jitcode::BhDescr,
+    ) -> i64 {
         0
     }
-    /// model.py: bh_getarrayitem_gc_r(array_ptr, index, descr)
-    fn bh_getarrayitem_gc_r(&self, _array_ptr: i64, _index: i64, _item_size: usize) -> GcRef {
+    /// model.py:210 bh_getarrayitem_gc_r(array, index, arraydescr)
+    fn bh_getarrayitem_gc_r(
+        &self,
+        _array_ptr: i64,
+        _index: i64,
+        _arraydescr: &majit_codewriter::jitcode::BhDescr,
+    ) -> GcRef {
         GcRef::NULL
     }
-    /// model.py: bh_setarrayitem_gc_i(array_ptr, index, value, descr)
-    fn bh_setarrayitem_gc_i(&self, _array_ptr: i64, _index: i64, _item_size: usize, _value: i64) {}
-    /// model.py: bh_setarrayitem_gc_r(array_ptr, index, value, descr)
-    fn bh_setarrayitem_gc_r(&self, _array_ptr: i64, _index: i64, _item_size: usize, _value: GcRef) {
-    }
-    /// model.py: bh_getarrayitem_gc_f(array_ptr, index, descr)
-    fn bh_getarrayitem_gc_f(&self, _array_ptr: i64, _index: i64, _item_size: usize) -> f64 {
+    /// model.py:211 bh_getarrayitem_gc_f(array, index, arraydescr)
+    fn bh_getarrayitem_gc_f(
+        &self,
+        _array_ptr: i64,
+        _index: i64,
+        _arraydescr: &majit_codewriter::jitcode::BhDescr,
+    ) -> f64 {
         0.0
     }
-    /// model.py: bh_setarrayitem_gc_f(array_ptr, index, value, descr)
-    fn bh_setarrayitem_gc_f(&self, _array_ptr: i64, _index: i64, _item_size: usize, _value: f64) {}
-    /// model.py: bh_getarrayitem_raw_i(array, index, arraydescr)
-    fn bh_getarrayitem_raw_i(&self, _array: i64, _index: i64, _item_size: usize) -> i64 {
+    /// model.py:247 bh_setarrayitem_gc_i(array, index, newvalue, arraydescr)
+    fn bh_setarrayitem_gc_i(
+        &self,
+        _array_ptr: i64,
+        _index: i64,
+        _newvalue: i64,
+        _arraydescr: &majit_codewriter::jitcode::BhDescr,
+    ) {
+    }
+    /// model.py:248 bh_setarrayitem_gc_r(array, index, newvalue, arraydescr)
+    fn bh_setarrayitem_gc_r(
+        &self,
+        _array_ptr: i64,
+        _index: i64,
+        _newvalue: GcRef,
+        _arraydescr: &majit_codewriter::jitcode::BhDescr,
+    ) {
+    }
+    /// model.py:249 bh_setarrayitem_gc_f(array, index, newvalue, arraydescr)
+    fn bh_setarrayitem_gc_f(
+        &self,
+        _array_ptr: i64,
+        _index: i64,
+        _newvalue: f64,
+        _arraydescr: &majit_codewriter::jitcode::BhDescr,
+    ) {
+    }
+
+    // ── model.py: raw array operations ──
+    /// model.py:212 bh_getarrayitem_raw_i(array, index, arraydescr)
+    fn bh_getarrayitem_raw_i(
+        &self,
+        _array: i64,
+        _index: i64,
+        _arraydescr: &majit_codewriter::jitcode::BhDescr,
+    ) -> i64 {
         0
     }
-    /// model.py: bh_getarrayitem_raw_f(array, index, arraydescr)
-    fn bh_getarrayitem_raw_f(&self, _array: i64, _index: i64, _item_size: usize) -> f64 {
+    /// model.py:214 bh_getarrayitem_raw_f(array, index, arraydescr)
+    fn bh_getarrayitem_raw_f(
+        &self,
+        _array: i64,
+        _index: i64,
+        _arraydescr: &majit_codewriter::jitcode::BhDescr,
+    ) -> f64 {
         0.0
     }
-    /// model.py: bh_setarrayitem_raw_i(array, index, newvalue, arraydescr)
-    fn bh_setarrayitem_raw_i(&self, _array: i64, _index: i64, _item_size: usize, _value: i64) {}
-    /// model.py: bh_setarrayitem_raw_f(array, index, newvalue, arraydescr)
-    fn bh_setarrayitem_raw_f(&self, _array: i64, _index: i64, _item_size: usize, _value: f64) {}
-    /// model.py: bh_arraylen_gc(array_ptr, descr)
-    fn bh_arraylen_gc(&self, _array_ptr: i64, _len_offset: usize) -> i64 {
+    /// model.py:250 bh_setarrayitem_raw_i(array, index, newvalue, arraydescr)
+    fn bh_setarrayitem_raw_i(
+        &self,
+        _array: i64,
+        _index: i64,
+        _newvalue: i64,
+        _arraydescr: &majit_codewriter::jitcode::BhDescr,
+    ) {
+    }
+    /// model.py:252 bh_setarrayitem_raw_f(array, index, newvalue, arraydescr)
+    fn bh_setarrayitem_raw_f(
+        &self,
+        _array: i64,
+        _index: i64,
+        _newvalue: f64,
+        _arraydescr: &majit_codewriter::jitcode::BhDescr,
+    ) {
+    }
+
+    /// model.py:254 bh_arraylen_gc(array, arraydescr)
+    fn bh_arraylen_gc(
+        &self,
+        _array_ptr: i64,
+        _arraydescr: &majit_codewriter::jitcode::BhDescr,
+    ) -> i64 {
         0
     }
-    /// llmodel.py:775 bh_new(sizedescr).
-    fn bh_new(&self, _sizedescr: &dyn majit_ir::SizeDescr) -> i64 {
+
+    // ── model.py:230-236 allocation ──
+    /// model.py:230 / llmodel.py:775 bh_new(sizedescr)
+    fn bh_new(&self, _sizedescr: &majit_codewriter::jitcode::BhDescr) -> i64 {
         0
     }
-    /// bh_new from raw size — used when only the struct size is available
-    /// (no SizeDescr object). Newlist/newlist_clear/newlist_hint use this.
-    fn bh_new_with_size(&self, _size: usize) -> i64 {
-        0
-    }
-    /// llmodel.py:778 bh_new_with_vtable(sizedescr).
-    fn bh_new_with_vtable(&self, _sizedescr: &dyn majit_ir::SizeDescr) -> i64 {
+    /// model.py:231 / llmodel.py:778 bh_new_with_vtable(sizedescr)
+    fn bh_new_with_vtable(&self, _sizedescr: &majit_codewriter::jitcode::BhDescr) -> i64 {
         0
     }
 
@@ -1221,12 +1317,16 @@ pub trait Backend: Send {
     fn get_typeid_from_classptr_if_gcremovetypeptr(&self, _classptr: usize) -> Option<u32> {
         None
     }
-    /// model.py: bh_new_array(length, descr)
-    fn bh_new_array(&self, _length: i64, _item_size: usize, _type_id: u32) -> i64 {
+    /// model.py:233 bh_new_array(length, arraydescr)
+    fn bh_new_array(&self, _length: i64, _arraydescr: &majit_codewriter::jitcode::BhDescr) -> i64 {
         0
     }
-    /// model.py: bh_new_array_clear(length, descr)
-    fn bh_new_array_clear(&self, _length: i64, _item_size: usize, _type_id: u32) -> i64 {
+    /// model.py:234 bh_new_array_clear(length, arraydescr)
+    fn bh_new_array_clear(
+        &self,
+        _length: i64,
+        _arraydescr: &majit_codewriter::jitcode::BhDescr,
+    ) -> i64 {
         0
     }
     /// model.py: bh_strlen(string_ptr)
@@ -1329,20 +1429,61 @@ pub trait Backend: Send {
     }
     /// model.py: bh_raw_store_i(ptr, offset, value, descr)
     fn bh_raw_store_i(&self, _ptr: i64, _offset: i64, _value: i64) {}
+    // ── model.py: interior field access ──
     /// model.py: bh_getinteriorfield_gc_i(array, index, descr)
-    fn bh_getinteriorfield_gc_i(&self, _array: i64, _index: i64, _offset: usize) -> i64 {
+    fn bh_getinteriorfield_gc_i(
+        &self,
+        _array: i64,
+        _index: i64,
+        _descr: &majit_codewriter::jitcode::BhDescr,
+    ) -> i64 {
         0
     }
-    /// model.py: bh_setinteriorfield_gc_i(array, index, value, descr)
-    fn bh_setinteriorfield_gc_i(&self, _array: i64, _index: i64, _offset: usize, _value: i64) {}
-    fn bh_getinteriorfield_gc_r(&self, _array: i64, _index: i64, _offset: usize) -> GcRef {
+    /// model.py: bh_getinteriorfield_gc_r(array, index, descr)
+    fn bh_getinteriorfield_gc_r(
+        &self,
+        _array: i64,
+        _index: i64,
+        _descr: &majit_codewriter::jitcode::BhDescr,
+    ) -> GcRef {
         GcRef::NULL
     }
-    fn bh_getinteriorfield_gc_f(&self, _array: i64, _index: i64, _offset: usize) -> f64 {
+    /// model.py: bh_getinteriorfield_gc_f(array, index, descr)
+    fn bh_getinteriorfield_gc_f(
+        &self,
+        _array: i64,
+        _index: i64,
+        _descr: &majit_codewriter::jitcode::BhDescr,
+    ) -> f64 {
         0.0
     }
-    fn bh_setinteriorfield_gc_r(&self, _array: i64, _index: i64, _offset: usize, _value: GcRef) {}
-    fn bh_setinteriorfield_gc_f(&self, _array: i64, _index: i64, _offset: usize, _value: f64) {}
+    /// model.py: bh_setinteriorfield_gc_i(array, index, newvalue, descr)
+    fn bh_setinteriorfield_gc_i(
+        &self,
+        _array: i64,
+        _index: i64,
+        _newvalue: i64,
+        _descr: &majit_codewriter::jitcode::BhDescr,
+    ) {
+    }
+    /// model.py: bh_setinteriorfield_gc_r(array, index, newvalue, descr)
+    fn bh_setinteriorfield_gc_r(
+        &self,
+        _array: i64,
+        _index: i64,
+        _newvalue: GcRef,
+        _descr: &majit_codewriter::jitcode::BhDescr,
+    ) {
+    }
+    /// model.py: bh_setinteriorfield_gc_f(array, index, newvalue, descr)
+    fn bh_setinteriorfield_gc_f(
+        &self,
+        _array: i64,
+        _index: i64,
+        _newvalue: f64,
+        _descr: &majit_codewriter::jitcode::BhDescr,
+    ) {
+    }
     fn bh_gc_load_indexed_i(
         &self,
         _addr: i64,
@@ -1390,17 +1531,41 @@ pub trait Backend: Send {
     }
     fn bh_raw_store_f(&self, _ptr: i64, _offset: i64, _value: f64) {}
     // ── model.py: raw field access ──
-    fn bh_getfield_raw_i(&self, _struct_ptr: i64, _offset: usize) -> i64 {
+    fn bh_getfield_raw_i(
+        &self,
+        _struct_ptr: i64,
+        _fielddescr: &majit_codewriter::jitcode::BhDescr,
+    ) -> i64 {
         0
     }
-    fn bh_getfield_raw_r(&self, _struct_ptr: i64, _offset: usize) -> GcRef {
+    fn bh_getfield_raw_r(
+        &self,
+        _struct_ptr: i64,
+        _fielddescr: &majit_codewriter::jitcode::BhDescr,
+    ) -> GcRef {
         GcRef::NULL
     }
-    fn bh_getfield_raw_f(&self, _struct_ptr: i64, _offset: usize) -> f64 {
+    fn bh_getfield_raw_f(
+        &self,
+        _struct_ptr: i64,
+        _fielddescr: &majit_codewriter::jitcode::BhDescr,
+    ) -> f64 {
         0.0
     }
-    fn bh_setfield_raw_i(&self, _struct_ptr: i64, _offset: usize, _value: i64) {}
-    fn bh_setfield_raw_f(&self, _struct_ptr: i64, _offset: usize, _value: f64) {}
+    fn bh_setfield_raw_i(
+        &self,
+        _struct_ptr: i64,
+        _newvalue: i64,
+        _fielddescr: &majit_codewriter::jitcode::BhDescr,
+    ) {
+    }
+    fn bh_setfield_raw_f(
+        &self,
+        _struct_ptr: i64,
+        _newvalue: f64,
+        _fielddescr: &majit_codewriter::jitcode::BhDescr,
+    ) {
+    }
 
     /// model.py: bh_classof(obj_ptr)
     fn bh_classof(&self, _obj_ptr: i64) -> i64 {
