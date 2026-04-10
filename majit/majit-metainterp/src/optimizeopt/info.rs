@@ -1837,6 +1837,30 @@ impl RawBufferDescr {
     pub fn is_compatible(&self, other: &Self) -> bool {
         self.itemsize == other.itemsize && self.is_signed == other.is_signed
     }
+
+    /// virtualize.py:351 `_unpack_raw_load_store_op`:
+    /// Extract RawBufferDescr from an Op's ArrayDescr.
+    /// RPython: `descr = op.getdescr(); itemsize = cpu.unpack_arraydescr_size(descr)[1]`
+    pub fn from_op_descr(descr: &Option<majit_ir::DescrRef>) -> Self {
+        descr
+            .as_ref()
+            .and_then(|d| d.as_array_descr())
+            .map(|ad| {
+                let kind = if ad.is_array_of_pointers() {
+                    0
+                } else if ad.is_array_of_floats() {
+                    2
+                } else {
+                    1
+                };
+                RawBufferDescr {
+                    itemsize: ad.item_size(),
+                    is_signed: ad.is_item_signed(),
+                    kind,
+                }
+            })
+            .unwrap_or_default()
+    }
 }
 
 impl Default for RawBufferDescr {
@@ -2050,55 +2074,115 @@ mod tests {
     #[test]
     fn rawbuffer_write_and_read() {
         let mut buf = make_buf(32);
-        buf.write_value(0, 8, OpRef(10), 0).unwrap();
-        buf.write_value(8, 4, OpRef(20), 0).unwrap();
-        buf.write_value(16, 8, OpRef(30), 0).unwrap();
+        buf.write_value(0, 8, OpRef(10), RawBufferDescr::default())
+            .unwrap();
+        buf.write_value(
+            8,
+            4,
+            OpRef(20),
+            RawBufferDescr {
+                itemsize: 4,
+                ..RawBufferDescr::default()
+            },
+        )
+        .unwrap();
+        buf.write_value(16, 8, OpRef(30), RawBufferDescr::default())
+            .unwrap();
 
-        assert_eq!(buf.read_value(0, 8).unwrap(), OpRef(10));
-        assert_eq!(buf.read_value(8, 4).unwrap(), OpRef(20));
-        assert_eq!(buf.read_value(16, 8).unwrap(), OpRef(30));
+        assert_eq!(
+            buf.read_value(0, 8, &RawBufferDescr::default()).unwrap(),
+            OpRef(10)
+        );
+        assert_eq!(
+            buf.read_value(
+                8,
+                4,
+                &RawBufferDescr {
+                    itemsize: 4,
+                    ..RawBufferDescr::default()
+                }
+            )
+            .unwrap(),
+            OpRef(20)
+        );
+        assert_eq!(
+            buf.read_value(16, 8, &RawBufferDescr::default()).unwrap(),
+            OpRef(30)
+        );
     }
 
     #[test]
     fn rawbuffer_update_same_offset() {
         let mut buf = make_buf(16);
-        buf.write_value(0, 8, OpRef(10), 0).unwrap();
-        buf.write_value(0, 8, OpRef(99), 0).unwrap();
+        buf.write_value(0, 8, OpRef(10), RawBufferDescr::default())
+            .unwrap();
+        buf.write_value(0, 8, OpRef(99), RawBufferDescr::default())
+            .unwrap();
 
-        assert_eq!(buf.read_value(0, 8).unwrap(), OpRef(99));
+        assert_eq!(
+            buf.read_value(0, 8, &RawBufferDescr::default()).unwrap(),
+            OpRef(99)
+        );
         assert_eq!(buf.entries.len(), 1);
     }
 
     #[test]
     fn rawbuffer_overlap_next() {
         let mut buf = make_buf(32);
-        buf.write_value(8, 8, OpRef(10), 0).unwrap();
+        buf.write_value(8, 8, OpRef(10), RawBufferDescr::default())
+            .unwrap();
         // Write at offset 4 with length 8 overlaps [8, 16)
-        let err = buf.write_value(4, 8, OpRef(20), 0).unwrap_err();
+        let err = buf
+            .write_value(4, 8, OpRef(20), RawBufferDescr::default())
+            .unwrap_err();
         assert!(matches!(err, RawBufferError::OverlappingWrite { .. }));
     }
 
     #[test]
     fn rawbuffer_overlap_prev() {
         let mut buf = make_buf(32);
-        buf.write_value(0, 8, OpRef(10), 0).unwrap();
+        buf.write_value(0, 8, OpRef(10), RawBufferDescr::default())
+            .unwrap();
         // Write at offset 4 overlaps with [0, 8)
-        let err = buf.write_value(4, 4, OpRef(20), 0).unwrap_err();
+        let err = buf
+            .write_value(
+                4,
+                4,
+                OpRef(20),
+                RawBufferDescr {
+                    itemsize: 4,
+                    ..RawBufferDescr::default()
+                },
+            )
+            .unwrap_err();
         assert!(matches!(err, RawBufferError::OverlappingWrite { .. }));
     }
 
     #[test]
     fn rawbuffer_incompatible_length_at_same_offset() {
         let mut buf = make_buf(16);
-        buf.write_value(0, 8, OpRef(10), 0).unwrap();
-        let err = buf.write_value(0, 4, OpRef(20), 0).unwrap_err();
+        buf.write_value(0, 8, OpRef(10), RawBufferDescr::default())
+            .unwrap();
+        let err = buf
+            .write_value(
+                0,
+                4,
+                OpRef(20),
+                RawBufferDescr {
+                    itemsize: 4,
+                    ..RawBufferDescr::default()
+                },
+            )
+            .unwrap_err();
         assert!(matches!(err, RawBufferError::OverlappingWrite { .. }));
     }
 
     #[test]
     fn rawbuffer_uninitialized_read() {
         let buf = make_buf(16);
-        let err = buf.read_value(0, 8).unwrap_err();
+        let err = buf
+            .read_value(0, 8, &RawBufferDescr::default())
+            .unwrap_err();
         assert_eq!(
             err,
             RawBufferError::UninitializedRead {
@@ -2111,8 +2195,18 @@ mod tests {
     #[test]
     fn rawbuffer_incompatible_read_length() {
         let mut buf = make_buf(16);
-        buf.write_value(0, 8, OpRef(10), 0).unwrap();
-        let err = buf.read_value(0, 4).unwrap_err();
+        buf.write_value(0, 8, OpRef(10), RawBufferDescr::default())
+            .unwrap();
+        let err = buf
+            .read_value(
+                0,
+                4,
+                &RawBufferDescr {
+                    itemsize: 4,
+                    ..RawBufferDescr::default()
+                },
+            )
+            .unwrap_err();
         assert_eq!(
             err,
             RawBufferError::IncompatibleRead {
@@ -2126,8 +2220,10 @@ mod tests {
     #[test]
     fn rawbuffer_read_fully_covered() {
         let mut buf = make_buf(32);
-        buf.write_value(0, 8, OpRef(10), 0).unwrap();
-        buf.write_value(8, 8, OpRef(20), 0).unwrap();
+        buf.write_value(0, 8, OpRef(10), RawBufferDescr::default())
+            .unwrap();
+        buf.write_value(8, 8, OpRef(20), RawBufferDescr::default())
+            .unwrap();
 
         // [0, 16) is fully covered by [0,8) + [8,16)
         assert!(buf.is_read_fully_covered(0, 16));
@@ -2140,8 +2236,26 @@ mod tests {
     #[test]
     fn rawbuffer_read_partially_covered_fails() {
         let mut buf = make_buf(32);
-        buf.write_value(0, 4, OpRef(10), 0).unwrap();
-        buf.write_value(8, 4, OpRef(20), 0).unwrap();
+        buf.write_value(
+            0,
+            4,
+            OpRef(10),
+            RawBufferDescr {
+                itemsize: 4,
+                ..RawBufferDescr::default()
+            },
+        )
+        .unwrap();
+        buf.write_value(
+            8,
+            4,
+            OpRef(20),
+            RawBufferDescr {
+                itemsize: 4,
+                ..RawBufferDescr::default()
+            },
+        )
+        .unwrap();
 
         // Bytes 4..8 are not covered by any write
         assert!(!buf.is_read_fully_covered(0, 8));
@@ -2152,8 +2266,26 @@ mod tests {
     #[test]
     fn rawbuffer_overwritten_write_detected() {
         let mut buf = make_buf(32);
-        buf.write_value(4, 4, OpRef(10), 0).unwrap();
-        buf.write_value(12, 4, OpRef(20), 0).unwrap();
+        buf.write_value(
+            4,
+            4,
+            OpRef(10),
+            RawBufferDescr {
+                itemsize: 4,
+                ..RawBufferDescr::default()
+            },
+        )
+        .unwrap();
+        buf.write_value(
+            12,
+            4,
+            OpRef(20),
+            RawBufferDescr {
+                itemsize: 4,
+                ..RawBufferDescr::default()
+            },
+        )
+        .unwrap();
 
         // A write [4, 12) fully contains [4, 8)
         assert_eq!(buf.find_overwritten_write(4, 8), Some(0));
@@ -2168,9 +2300,36 @@ mod tests {
     #[test]
     fn rawbuffer_sorted_insertion() {
         let mut buf = make_buf(32);
-        buf.write_value(16, 4, OpRef(30), 0).unwrap();
-        buf.write_value(0, 4, OpRef(10), 0).unwrap();
-        buf.write_value(8, 4, OpRef(20), 0).unwrap();
+        buf.write_value(
+            16,
+            4,
+            OpRef(30),
+            RawBufferDescr {
+                itemsize: 4,
+                ..RawBufferDescr::default()
+            },
+        )
+        .unwrap();
+        buf.write_value(
+            0,
+            4,
+            OpRef(10),
+            RawBufferDescr {
+                itemsize: 4,
+                ..RawBufferDescr::default()
+            },
+        )
+        .unwrap();
+        buf.write_value(
+            8,
+            4,
+            OpRef(20),
+            RawBufferDescr {
+                itemsize: 4,
+                ..RawBufferDescr::default()
+            },
+        )
+        .unwrap();
 
         // Entries should be sorted by offset
         assert_eq!(buf.entries[0].0, 0);
