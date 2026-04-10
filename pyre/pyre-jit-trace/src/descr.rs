@@ -166,6 +166,47 @@ pub fn make_field_descr(
     })
 }
 
+/// Create a field descr with an explicit parent SizeDescr.
+///
+/// RPython parity: `fielddescr.get_parent_descr()` returns the owning
+/// struct's SizeDescr, enabling `info.py:180 init_fields(parent_descr,
+/// index)`. Without parent_descr, `descr_index()` falls back to
+/// `stable_field_index` (a hash) instead of `index_in_parent` (a small
+/// sequential index), causing OOM in `ensure_field_descr_slot`.
+///
+/// The `index_in_parent` is computed by scanning the parent SizeDescr's
+/// `all_field_descrs` for a matching offset.
+pub fn make_field_descr_with_parent(
+    parent: DescrRef,
+    offset: usize,
+    field_size: usize,
+    field_type: Type,
+    signed: bool,
+) -> DescrRef {
+    // Derive index_in_parent from the parent SizeDescr's field list.
+    let index = parent
+        .as_size_descr()
+        .and_then(|sd| {
+            sd.all_field_descrs()
+                .iter()
+                .enumerate()
+                .find(|(_, fd)| fd.as_field_descr().map_or(false, |f| f.offset() == offset))
+                .map(|(i, _)| i)
+        })
+        .unwrap_or(0);
+    Arc::new(PyreFieldDescr {
+        offset,
+        field_size,
+        field_type,
+        signed,
+        immutable: false,
+        quasi_immutable: false,
+        name: "",
+        index_in_parent: index,
+        parent_descr: Some(Arc::downgrade(&parent)),
+    })
+}
+
 pub fn make_field_descr_full(
     _index: u32,
     offset: usize,
