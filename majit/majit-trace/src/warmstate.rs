@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use majit_backend::JitCellToken;
 use majit_ir::Type;
+use std::sync::Arc;
 
 use crate::counter::JitCounter;
 use crate::logger::Logger;
@@ -73,7 +74,7 @@ pub struct BaseJitCell {
     /// Used to detect stale tracing sessions.
     pub tracing_generation: u64,
     /// Compiled loop token, if compilation has completed.
-    pub loop_token: Option<JitCellToken>,
+    pub loop_token: Option<Arc<JitCellToken>>,
     /// Number of times tracing was aborted for this key.
     ///
     /// Kept for diagnostics only. In RPython, `retrace_limit` is handled by
@@ -108,13 +109,14 @@ impl BaseJitCell {
 
     /// Get the procedure token, returning None if the token has been
     /// invalidated (mirrors BaseBaseJitCell.get_procedure_token).
-    pub fn get_procedure_token(&self) -> Option<&JitCellToken> {
+    pub fn get_procedure_token(&self) -> Option<&Arc<JitCellToken>> {
         self.loop_token.as_ref().filter(|t| !t.is_invalidated())
     }
 
     /// Set the procedure token and update ownership state.
     /// If `tmp` is true, sets the TEMPORARY flag (CALL_ASSEMBLER fallback).
-    pub fn set_procedure_token(&mut self, loop_token: JitCellToken, tmp: bool) {
+    pub fn set_procedure_token(&mut self, loop_token: impl Into<Arc<JitCellToken>>, tmp: bool) {
+        let loop_token = loop_token.into();
         self.token = Some(loop_token.number);
         self.loop_token = Some(loop_token);
         if tmp {
@@ -161,7 +163,7 @@ pub enum CellJitState {
     /// Actively recording a trace.
     Tracing(Trace),
     /// A compiled loop exists for this green key.
-    Compiled(JitCellToken),
+    Compiled(Arc<JitCellToken>),
 }
 
 pub use crate::memmgr::LoopAging;
@@ -439,6 +441,12 @@ impl WarmEnterState {
         }
     }
 
+    pub fn clear_all_loop_tokens(&mut self) {
+        for cell in self.cells.values_mut() {
+            cell.loop_token = None;
+        }
+    }
+
     pub fn mark_dont_trace(&mut self, green_key_hash: u64) {
         self.disable_noninlinable_function(green_key_hash);
     }
@@ -619,7 +627,12 @@ impl WarmEnterState {
     ///
     /// The cell transitions to Compiled state and takes ownership of
     /// the procedure token.
-    pub fn attach_procedure_to_interp(&mut self, green_key_hash: u64, token: JitCellToken) {
+    pub fn attach_procedure_to_interp(
+        &mut self,
+        green_key_hash: u64,
+        token: impl Into<Arc<JitCellToken>>,
+    ) {
+        let token = token.into();
         let cell = self
             .cells
             .entry(green_key_hash)
@@ -628,8 +641,14 @@ impl WarmEnterState {
         cell.set_procedure_token(token, false);
     }
 
+    pub fn take_procedure_token(&mut self, green_key_hash: u64) -> Option<Arc<JitCellToken>> {
+        self.cells
+            .get_mut(&green_key_hash)
+            .and_then(|cell| cell.loop_token.take())
+    }
+
     /// Get a reference to the compiled loop token for a green key.
-    pub fn get_compiled(&self, green_key_hash: u64) -> Option<&JitCellToken> {
+    pub fn get_compiled(&self, green_key_hash: u64) -> Option<&Arc<JitCellToken>> {
         self.cells
             .get(&green_key_hash)
             .and_then(|cell| cell.loop_token.as_ref())

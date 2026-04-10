@@ -895,14 +895,14 @@ impl<'a> TraceIterator<'a> {
             if orig >= self._cache.len() {
                 self._cache.resize(orig + 1, None);
             }
-            let fresh = if let Some(existing) = self._cache[orig] {
-                existing
-            } else {
-                let f = OpRef(self._fresh);
-                self._fresh += 1;
-                self._cache[orig] = Some(f);
-                f
-            };
+            // opencoder.py:399-401 always allocates a fresh ResOperation
+            // instance and then overwrites `_cache[self._index]` with it.
+            // Reusing an existing cache entry collapses distinct box
+            // identities when a raw op slot collides with an inputarg or
+            // earlier phase-local box.
+            let fresh = OpRef(self._fresh);
+            self._fresh += 1;
+            self._cache[orig] = Some(fresh);
             res.pos = fresh;
             // RPython `_index` parity: advance past the cache slot we
             // just wrote. In RPython this happens via `_index += 1`
@@ -2076,6 +2076,36 @@ mod tests {
         let fa = r2.fail_args.as_ref().unwrap();
         assert_eq!(fa[0], OpRef(10));
         assert_eq!(fa[1], OpRef(11));
+    }
+
+    #[test]
+    fn test_trace_iterator_overwrites_inputarg_cache_slot_with_fresh_result() {
+        // RPython next() allocates a fresh result box even when the raw trace
+        // position collides with an already-seeded inputarg cache slot.
+        let ops = vec![
+            op_at(3, majit_ir::OpCode::GetfieldRawI, &[OpRef(0)]),
+            op_at(1, majit_ir::OpCode::GetarrayitemGcR, &[OpRef(3), OpRef(1)]),
+            majit_ir::Op::new(majit_ir::OpCode::Finish, &[OpRef(1)]),
+        ];
+        let mut iter = TraceIterator::new(&ops, 0, ops.len(), None, 4, 100);
+
+        assert_eq!(
+            iter.inputargs,
+            vec![OpRef(100), OpRef(101), OpRef(102), OpRef(103)]
+        );
+        assert_eq!(iter._cache[1], Some(OpRef(101)));
+
+        let op0 = iter.next().unwrap();
+        assert_eq!(op0.pos, OpRef(104));
+        assert_eq!(op0.args.as_slice(), &[OpRef(100)]);
+
+        let op1 = iter.next().unwrap();
+        assert_eq!(op1.args.as_slice(), &[OpRef(104), OpRef(101)]);
+        assert_eq!(op1.pos, OpRef(105));
+        assert_eq!(iter._cache[1], Some(OpRef(105)));
+
+        let finish = iter.next().unwrap();
+        assert_eq!(finish.args.as_slice(), &[OpRef(105)]);
     }
 
     #[test]
