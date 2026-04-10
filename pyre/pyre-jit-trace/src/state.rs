@@ -3550,6 +3550,45 @@ mod tests {
     use pyre_object::OB_TYPE_OFFSET;
     use pyre_object::floatobject::w_float_get_value;
     use pyre_object::listobject::w_list_getitem;
+    use std::cell::{Cell, UnsafeCell};
+
+    thread_local! {
+        static TEST_CALLBACKS_INIT: Cell<bool> = const { Cell::new(false) };
+        static TEST_JIT_DRIVER: UnsafeCell<crate::driver::JitDriverPair> = UnsafeCell::new({
+            let info = crate::frame_layout::build_pyframe_virtualizable_info();
+            let mut driver = majit_metainterp::JitDriver::new(1);
+            driver.set_virtualizable_info(info.clone());
+            driver.meta_interp_mut().num_scalar_inputargs =
+                crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
+            (driver, info)
+        });
+    }
+
+    fn ensure_test_callbacks() {
+        TEST_CALLBACKS_INIT.with(|init| {
+            if init.get() {
+                return;
+            }
+            init.set(true);
+            let cb = Box::leak(Box::new(crate::callbacks::CallJitCallbacks {
+                callee_frame_helper: |_| None,
+                callable_prefers_function_entry: |_| false,
+                recursive_force_cache_safe: |_| false,
+                jit_drop_callee_frame: std::ptr::null(),
+                jit_force_callee_frame: std::ptr::null(),
+                jit_force_recursive_call_1: std::ptr::null(),
+                jit_force_recursive_call_argraw_boxed_1: std::ptr::null(),
+                jit_force_self_recursive_call_argraw_boxed_1: std::ptr::null(),
+                jit_create_callee_frame_1: std::ptr::null(),
+                jit_create_callee_frame_1_raw_int: std::ptr::null(),
+                jit_create_self_recursive_callee_frame_1: std::ptr::null(),
+                jit_create_self_recursive_callee_frame_1_raw_int: std::ptr::null(),
+                driver_pair: || TEST_JIT_DRIVER.with(|cell| cell.get() as *mut u8),
+                ensure_majit_jitcode: |_, _| {},
+            }));
+            crate::callbacks::init(cb);
+        });
+    }
 
     fn empty_meta() -> PyreMeta {
         PyreMeta {
@@ -4770,13 +4809,14 @@ mod tests {
 
     #[test]
     fn test_close_loop_args_at_target_pc_uses_locals_only_jump_contract() {
-        let mut ctx = TraceCtx::for_test(3);
-        let frame_ref = OpRef(0);
-        let code_ref = OpRef(1);
-        let namespace_ref = OpRef(2);
-        let local0 = OpRef(10);
-        let stack0 = OpRef(11);
-        let stack1 = OpRef(12);
+        ensure_test_callbacks();
+        let mut ctx = TraceCtx::for_test(0);
+        let frame_ref = ctx.const_ref(0x1000);
+        let code_ref = ctx.const_ref(0x2000);
+        let namespace_ref = ctx.const_ref(0x3000);
+        let local0 = ctx.const_ref(0x4000);
+        let stack0 = ctx.const_ref(0x5000);
+        let stack1 = ctx.const_ref(0x6000);
 
         let mut sym = PyreSym::new_uninit(frame_ref);
         sym.symbolic_initialized = true;
