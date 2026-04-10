@@ -139,6 +139,8 @@ impl Assembler {
         jitcode.startpoints = state.startpoints;
         jitcode.alllabels = state.alllabels;
         jitcode.resulttypes = state.resulttypes;
+        // RPython assembler.py:49 `jitcode._ssarepr = ssarepr`
+        jitcode._ssarepr = Some(ssarepr.clone());
         // index + jitdriver_sd are set by CodeWriter after assembly
         // (RPython codewriter.py:68 `jitcode.index = index`).
 

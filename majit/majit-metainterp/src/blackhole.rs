@@ -802,6 +802,25 @@ use crate::jitcode::{
     BC_STORE_STATE_VARRAY, BC_SWAP_STACK, JitArgKind, JitCode, LivenessInfo, MIFrame, MIFrameStack,
 };
 
+// ── BlackholeInterpBuilder: setup_insns infrastructure ──────────────
+//
+// RPython `blackhole.py:52-103` `class BlackholeInterpBuilder` combines
+// pool management AND dispatch setup. pyre's existing
+// `BlackholeInterpBuilder` (below, at the pool management section) is the
+// pool manager. The `setup_insns` infrastructure (opcode table + dispatch
+// table) is being added incrementally as Phase D of the RPython parity
+// plan. Handler function pointers and `dispatch_loop` will be wired in
+// as `bhimpl_*` methods are ported one by one.
+
+/// Handler function signature for the codewriter-orthodox dispatch table.
+///
+/// RPython `blackhole.py:107` `handler(self, code, position) -> position`.
+/// Each handler decodes operands from `code[position..]` based on its
+/// argcodes, calls the corresponding `bhimpl_*` method on `bh`, writes
+/// results, and returns the updated position.
+pub type BhOpcodeHandler =
+    fn(bh: &mut BlackholeInterpreter, code: &[u8], position: usize) -> Result<usize, DispatchError>;
+
 /// Return type of a blackhole frame.
 ///
 /// RPython: `BlackholeInterpreter._return_type`
@@ -816,6 +835,7 @@ pub enum BhReturnType {
 /// Signal from dispatch_one to run().
 ///
 /// RPython: `LeaveFrame` exception + `except Exception` in blackhole.py run()
+#[derive(Debug)]
 enum DispatchError {
     /// Normal return from frame (RPython: LeaveFrame).
     LeaveFrame,
@@ -830,8 +850,27 @@ enum DispatchError {
 /// represents one execution frame. Frame chain is linked via
 /// `nextblackholeinterp`.
 ///
-/// RPython: `BlackholeInterpreter` class in blackhole.py
+/// RPython: `BlackholeInterpreter` class in blackhole.py:282-306.
+///
+/// RPython `__init__` receives `builder` and stores:
+///   self.cpu = builder.cpu
+///   self.dispatch_loop = builder.dispatch_loop
+///   self.descrs = builder.descrs
+///   self.op_catch_exception = builder.op_catch_exception
 pub struct BlackholeInterpreter {
+    /// RPython `blackhole.py:286` `self.cpu = builder.cpu`.
+    /// Reference to the backend trait for `bh_*` concrete execution.
+    /// Raw pointer because the interpreter is pool-managed and
+    /// the Backend outlives all interpreter instances.
+    /// RPython `blackhole.py:286/56` `self.cpu = builder.cpu`.
+    /// Backend trait for `bh_*` concrete execution. None until set.
+    pub cpu: Option<&'static dyn majit_backend::Backend>,
+    /// RPython `blackhole.py:288` `self.descrs = builder.descrs`.
+    /// Descriptor table from the assembler. In RPython, `descrs` is a list
+    /// of `AbstractDescr` objects carrying field offsets, array item sizes,
+    /// etc. In pyre, we store raw offsets (usize) as a simplification —
+    /// descriptor-index argcode ('d', 2 bytes) indexes into this table.
+    pub descrs: Vec<usize>,
     /// Integer register bank.
     /// Indices 0..num_regs_i are working registers.
     /// Indices num_regs_i..num_regs_i+constants_i.len() hold constants.
@@ -927,6 +966,8 @@ impl Default for BlackholeInterpreter {
 impl BlackholeInterpreter {
     pub fn new() -> Self {
         Self {
+            cpu: None,
+            descrs: Vec::new(),
             registers_i: Vec::new(),
             registers_r: Vec::new(),
             registers_f: Vec::new(),
@@ -2185,11 +2226,35 @@ impl BlackholeInterpreter {
     }
 }
 
-/// Pool manager for blackhole interpreters.
+/// Pool manager + dispatch builder for blackhole interpreters.
 ///
-/// RPython: `BlackholeInterpBuilder` class in blackhole.py
+/// RPython `blackhole.py:52-103` `class BlackholeInterpBuilder`.
+///
+/// Combines two responsibilities:
+/// 1. Interpreter pool management (acquire/release/release_chain).
+/// 2. Codewriter-orthodox dispatch setup (`setup_insns` → dispatch table
+///    + `dispatch_loop`). Phase D incrementally wires this up as
+///    `bhimpl_*` methods are ported from RPython.
 pub struct BlackholeInterpBuilder {
     pool: Vec<BlackholeInterpreter>,
+    /// RPython `blackhole.py:56` `self.cpu = codewriter.cpu`.
+    /// Stored as raw pointer; the Backend outlives the builder.
+    /// RPython `blackhole.py:286/56` `self.cpu = builder.cpu`.
+    /// Backend trait for `bh_*` concrete execution. None until set.
+    pub cpu: Option<&'static dyn majit_backend::Backend>,
+    /// RPython `blackhole.py:68` `self._insns`: opcode byte → "opname/argcodes".
+    /// Populated by `setup_insns`; empty until called.
+    pub _insns: Vec<String>,
+    /// RPython `blackhole.py:72` `self.op_live = insns.get('live/', -1)`.
+    pub op_live: u8,
+    /// RPython `blackhole.py:73` `self.op_catch_exception`.
+    pub op_catch_exception: u8,
+    /// RPython `blackhole.py:103` `self.descrs`.
+    pub descrs: Vec<String>,
+    /// Dispatch table: opcode byte → handler fn pointer.
+    /// RPython builds `dispatch_loop` closure via `unrolling_iterable`;
+    /// Rust uses indirect call through this table.
+    pub dispatch_table: Vec<BhOpcodeHandler>,
 }
 
 impl Default for BlackholeInterpBuilder {
@@ -2200,14 +2265,134 @@ impl Default for BlackholeInterpBuilder {
 
 impl BlackholeInterpBuilder {
     pub fn new() -> Self {
-        Self { pool: Vec::new() }
+        Self {
+            pool: Vec::new(),
+            cpu: None,
+            _insns: Vec::new(),
+            op_live: u8::MAX,
+            op_catch_exception: u8::MAX,
+            descrs: Vec::new(),
+            dispatch_table: Vec::new(),
+        }
+    }
+
+    /// RPython `blackhole.py:66-100` `setup_insns(insns)`.
+    ///
+    /// ```python
+    /// def setup_insns(self, insns):
+    ///     assert len(insns) <= 256, "too many instructions!"
+    ///     self._insns = [None] * len(insns)
+    ///     for key, value in insns.items():
+    ///         assert self._insns[value] is None
+    ///         self._insns[value] = key
+    ///     self.op_live = insns.get('live/', -1)
+    ///     self.op_catch_exception = insns.get('catch_exception/L', -1)
+    /// ```
+    ///
+    /// Builds the reverse opcode table and dispatch function table from the
+    /// assembler's `insns` dict. For now, all dispatch table entries are
+    /// placeholder handlers — real `bhimpl_*` methods are wired in
+    /// incrementally as Phase D progresses.
+    pub fn setup_insns(&mut self, insns: &std::collections::HashMap<String, u8>) {
+        assert!(insns.len() <= 256, "too many instructions!");
+        // RPython blackhole.py:68-71: build reverse table
+        self._insns = vec![String::new(); insns.len()];
+        for (key, &value) in insns {
+            assert!(
+                self._insns[value as usize].is_empty(),
+                "duplicate opcode {value} for key {key:?}"
+            );
+            self._insns[value as usize] = key.clone();
+        }
+        // RPython blackhole.py:72-74: resolve well-known opcodes
+        self.op_live = insns.get("live/").copied().unwrap_or(u8::MAX);
+        self.op_catch_exception = insns.get("catch_exception/L").copied().unwrap_or(u8::MAX);
+        // RPython blackhole.py:76-80: build handler table.
+        //
+        // RPython immediately calls _get_method(name, argcodes) for every
+        // insns key and panics if the corresponding bhimpl_* is missing.
+        // We match that behavior: the default handler panics with the
+        // opname so missing bhimpl_* methods surface at dispatch time
+        // instead of being silently swallowed.
+        self.dispatch_table = self
+            ._insns
+            .iter()
+            .map(|key| {
+                // Default: panic identifying the unimplemented opcode.
+                // RPython would raise AttributeError at setup time; we
+                // defer to dispatch time but with the same crash semantics.
+                (|_bh: &mut BlackholeInterpreter,
+                  _code: &[u8],
+                  _position: usize|
+                 -> Result<usize, DispatchError> {
+                    panic!("missing bhimpl for opcode (use wire_handler to register)")
+                }) as BhOpcodeHandler
+            })
+            .collect();
+    }
+
+    /// RPython `blackhole.py:102-103` `setup_descrs(descrs)`.
+    pub fn setup_descrs(&mut self, descrs: Vec<String>) {
+        self.descrs = descrs;
+    }
+
+    /// RPython `blackhole.py:83-100` `dispatch_loop(self, code, position)`.
+    ///
+    /// Runs the codewriter-orthodox bytecode dispatch loop. Each iteration
+    /// reads one opcode byte, looks up the handler in `dispatch_table`,
+    /// and calls it to advance position.
+    pub fn dispatch_loop(
+        &self,
+        bh: &mut BlackholeInterpreter,
+        code: &[u8],
+        mut position: usize,
+    ) -> Result<(), DispatchError> {
+        loop {
+            let opcode = code[position] as usize;
+            position += 1;
+            if opcode >= self.dispatch_table.len() {
+                panic!("bad opcode {opcode} at position {}", position - 1);
+            }
+            position = self.dispatch_table[opcode](bh, code, position)?;
+        }
+    }
+
+    /// Wire a handler for a specific opname/argcodes key into the dispatch table.
+    ///
+    /// RPython `blackhole.py:76-80`: iterates `_insns` and calls
+    /// `_get_method(name, argcodes)` for each. In Rust we wire specific
+    /// opnames one by one during Phase D migration. Returns false if
+    /// the opname is not present in the insns table.
+    pub fn wire_handler(&mut self, opname_key: &str, handler: BhOpcodeHandler) -> bool {
+        for (i, key) in self._insns.iter().enumerate() {
+            if key == opname_key {
+                self.dispatch_table[i] = handler;
+                return true;
+            }
+        }
+        false
     }
 
     /// Acquire an interpreter from the pool or create a new one.
     ///
-    /// RPython: `BlackholeInterpBuilder.acquire_interp()`
+    /// RPython `blackhole.py:245-251`:
+    /// ```python
+    /// def acquire_interp(self):
+    ///     res = self.blackholeinterps
+    ///     if res is not None:
+    ///         self.blackholeinterps = res.back
+    ///         return res
+    ///     else:
+    ///         return BlackholeInterpreter(self)
+    /// ```
+    /// Note: RPython's `BlackholeInterpreter(self)` passes `builder` to
+    /// `__init__`, which stores `self.cpu = builder.cpu`. We propagate
+    /// the `cpu` field from the builder to each acquired interpreter.
     pub fn acquire_interp(&mut self) -> BlackholeInterpreter {
-        self.pool.pop().unwrap_or_default()
+        let mut bh = self.pool.pop().unwrap_or_default();
+        // RPython blackhole.py:286: self.cpu = builder.cpu
+        bh.cpu = self.cpu;
+        bh
     }
 
     /// blackhole.py:253 release_interp
@@ -3614,5 +3799,2866 @@ mod tests {
 
             assert_eq!(bh.registers_i[1], 42);
         }
+
+        /// Integration test: build bytecode manually with known opcode
+        /// assignments and run it through the orthodox dispatch_loop.
+        ///
+        /// This validates the Phase D setup_insns → dispatch_loop → bhimpl
+        /// pipeline end-to-end without depending on SSARepr assembly.
+        ///
+        /// RPython equivalent: the setup_insns + dispatch_loop closure + bhimpl
+        /// flow described in blackhole.py:52-103 and 452-460.
+        #[test]
+        fn test_orthodox_dispatch_loop_int_add() {
+            // Build a minimal insns dict (as if the assembler had produced it).
+            // Opcode 0 = "live/" (liveness marker, skip 2 bytes)
+            // Opcode 1 = "int_add/ii>i" (3 register bytes: a, b, dst)
+            // Opcode 2 = "int_return/i" (1 register byte)
+            let mut insns = HashMap::new();
+            insns.insert("live/".to_string(), 0u8);
+            insns.insert("int_add/ii>i".to_string(), 1u8);
+            insns.insert("int_return/i".to_string(), 2u8);
+
+            // Setup builder
+            let mut builder = BlackholeInterpBuilder::new();
+            builder.setup_insns(&insns);
+            super::wire_bhimpl_handlers(&mut builder);
+
+            // Hand-assemble bytecode: live + int_add(r0, r1) → r2 + int_return(r2)
+            let code: Vec<u8> = vec![
+                0, 0, 0, // opcode 0 = live/, 2 bytes liveness offset (skipped)
+                1, 0, 1, 2, // opcode 1 = int_add, a=r0, b=r1, dst=r2
+                2, 2, // opcode 2 = int_return, src=r2
+            ];
+
+            // Create BlackholeInterpreter with 3 int regs
+            let mut bh = BlackholeInterpreter::new();
+            bh.registers_i = vec![0i64; 3];
+            bh.registers_i[0] = 10; // r0 = 10
+            bh.registers_i[1] = 32; // r1 = 32
+
+            // Run dispatch_loop
+            let result = builder.dispatch_loop(&mut bh, &code, 0);
+
+            // Should leave frame with LeaveFrame
+            assert!(matches!(result, Err(DispatchError::LeaveFrame)));
+            // tmpreg_i should hold 10 + 32 = 42
+            assert_eq!(bh.tmpreg_i, 42, "int_add(10, 32) should produce 42");
+            assert_eq!(bh.return_type, BhReturnType::Int);
+        }
     }
+}
+
+// ── bhimpl_* methods (RPython blackhole.py:452+) ────────────────────
+//
+// RPython defines each bhimpl_* as a static method decorated with
+// @arguments("i", "i", returns="i") etc. The handler closure generated
+// by _get_method decodes args from the bytecode stream and calls the
+// bhimpl method.
+//
+// In Rust we define each bhimpl as a standalone fn and generate
+// BhOpcodeHandler wrappers. The handler decodes operands, calls the
+// bhimpl fn, stores the result, and returns the updated position.
+
+// ── handler generators for common patterns ──────────────────────────
+
+/// Decode pattern `@arguments("i", "i", returns="i")` — argcodes `"ii>i"`.
+///
+/// Read 2 int-register indices, call bhimpl fn, write result, advance by 3.
+/// Each concrete handler is its own fn (not a closure) so it can be stored
+/// as a bare BhOpcodeHandler fn pointer.
+macro_rules! bhhandler_ii_i {
+    ($name:ident, $bhimpl:ident) => {
+        fn $name(
+            bh: &mut BlackholeInterpreter,
+            code: &[u8],
+            position: usize,
+        ) -> Result<usize, DispatchError> {
+            let a = bh.registers_i[code[position] as usize];
+            let b = bh.registers_i[code[position + 1] as usize];
+            bh.registers_i[code[position + 2] as usize] = $bhimpl(a, b);
+            Ok(position + 3)
+        }
+    };
+}
+
+/// Decode pattern `@arguments("i", returns="i")` — argcodes `"i>i"`.
+macro_rules! bhhandler_i_i {
+    ($name:ident, $bhimpl:ident) => {
+        fn $name(
+            bh: &mut BlackholeInterpreter,
+            code: &[u8],
+            position: usize,
+        ) -> Result<usize, DispatchError> {
+            let a = bh.registers_i[code[position] as usize];
+            bh.registers_i[code[position + 1] as usize] = $bhimpl(a);
+            Ok(position + 2)
+        }
+    };
+}
+
+// ── bhimpl methods (line-by-line from RPython blackhole.py) ─────────
+
+/// blackhole.py:454-456 `bhimpl_int_same_as`.
+fn bhimpl_int_same_as(a: i64) -> i64 {
+    a
+}
+
+/// blackhole.py:458-460 `bhimpl_int_add(a, b): return intmask(a + b)`.
+fn bhimpl_int_add(a: i64, b: i64) -> i64 {
+    a.wrapping_add(b)
+}
+
+/// blackhole.py:462-464 `bhimpl_int_sub(a, b): return intmask(a - b)`.
+fn bhimpl_int_sub(a: i64, b: i64) -> i64 {
+    a.wrapping_sub(b)
+}
+
+/// blackhole.py:466-468 `bhimpl_int_mul(a, b): return intmask(a * b)`.
+fn bhimpl_int_mul(a: i64, b: i64) -> i64 {
+    a.wrapping_mul(b)
+}
+
+/// blackhole.py:499-501 `bhimpl_int_and(a, b): return a & b`.
+fn bhimpl_int_and(a: i64, b: i64) -> i64 {
+    a & b
+}
+
+/// blackhole.py:503-505 `bhimpl_int_or(a, b): return a | b`.
+fn bhimpl_int_or(a: i64, b: i64) -> i64 {
+    a | b
+}
+
+/// blackhole.py:507-509 `bhimpl_int_xor(a, b): return a ^ b`.
+fn bhimpl_int_xor(a: i64, b: i64) -> i64 {
+    a ^ b
+}
+
+/// blackhole.py:511-513 `bhimpl_int_rshift(a, b): return a >> b`.
+fn bhimpl_int_rshift(a: i64, b: i64) -> i64 {
+    a >> (b & 63)
+}
+
+/// blackhole.py:516-518 `bhimpl_int_lshift(a, b): return intmask(a << b)`.
+fn bhimpl_int_lshift(a: i64, b: i64) -> i64 {
+    a.wrapping_shl((b & 63) as u32)
+}
+
+/// blackhole.py:521-524 `bhimpl_uint_rshift(a, b): return intmask(r_uint(a) >> r_uint(b))`.
+fn bhimpl_uint_rshift(a: i64, b: i64) -> i64 {
+    ((a as u64) >> ((b as u64) & 63)) as i64
+}
+
+/// blackhole.py:527-529 `bhimpl_int_neg(a): return intmask(-a)`.
+fn bhimpl_int_neg(a: i64) -> i64 {
+    a.wrapping_neg()
+}
+
+/// blackhole.py:531-533 `bhimpl_int_invert(a): return ~a`.
+fn bhimpl_int_invert(a: i64) -> i64 {
+    !a
+}
+
+/// blackhole.py:535 `bhimpl_int_lt(a, b): return int(a < b)`.
+fn bhimpl_int_lt(a: i64, b: i64) -> i64 {
+    (a < b) as i64
+}
+
+/// blackhole.py:539 `bhimpl_int_le(a, b): return int(a <= b)`.
+fn bhimpl_int_le(a: i64, b: i64) -> i64 {
+    (a <= b) as i64
+}
+
+/// blackhole.py:543 `bhimpl_int_eq(a, b): return int(a == b)`.
+fn bhimpl_int_eq(a: i64, b: i64) -> i64 {
+    (a == b) as i64
+}
+
+/// blackhole.py:547 `bhimpl_int_ne(a, b): return int(a != b)`.
+fn bhimpl_int_ne(a: i64, b: i64) -> i64 {
+    (a != b) as i64
+}
+
+/// blackhole.py:551 `bhimpl_int_gt(a, b): return int(a > b)`.
+fn bhimpl_int_gt(a: i64, b: i64) -> i64 {
+    (a > b) as i64
+}
+
+/// blackhole.py:555 `bhimpl_int_ge(a, b): return int(a >= b)`.
+fn bhimpl_int_ge(a: i64, b: i64) -> i64 {
+    (a >= b) as i64
+}
+
+/// blackhole.py:559 `bhimpl_int_is_true(a): return int(bool(a))`.
+fn bhimpl_int_is_true(a: i64) -> i64 {
+    (a != 0) as i64
+}
+
+/// blackhole.py:563 `bhimpl_int_is_zero(a): return int(not a)`.
+fn bhimpl_int_is_zero(a: i64) -> i64 {
+    (a == 0) as i64
+}
+
+/// blackhole.py:567 `bhimpl_int_force_ge_zero(a): if a < 0: return 0; return a`.
+fn bhimpl_int_force_ge_zero(a: i64) -> i64 {
+    if a < 0 { 0 } else { a }
+}
+
+// Generate handler fns from bhimpl methods via macros.
+// @arguments("i", returns="i") → argcodes "i>i" → 1 src reg + 1 dst reg = 2 bytes
+bhhandler_i_i!(handler_int_same_as, bhimpl_int_same_as);
+bhhandler_i_i!(handler_int_neg, bhimpl_int_neg);
+bhhandler_i_i!(handler_int_invert, bhimpl_int_invert);
+bhhandler_i_i!(handler_int_is_true, bhimpl_int_is_true);
+bhhandler_i_i!(handler_int_is_zero, bhimpl_int_is_zero);
+bhhandler_i_i!(handler_int_force_ge_zero, bhimpl_int_force_ge_zero);
+
+// @arguments("i", "i", returns="i") → argcodes "ii>i" → 2 src regs + 1 dst reg = 3 bytes
+bhhandler_ii_i!(handler_int_add, bhimpl_int_add);
+bhhandler_ii_i!(handler_int_sub, bhimpl_int_sub);
+bhhandler_ii_i!(handler_int_mul, bhimpl_int_mul);
+bhhandler_ii_i!(handler_int_and, bhimpl_int_and);
+bhhandler_ii_i!(handler_int_or, bhimpl_int_or);
+bhhandler_ii_i!(handler_int_xor, bhimpl_int_xor);
+bhhandler_ii_i!(handler_int_rshift, bhimpl_int_rshift);
+bhhandler_ii_i!(handler_int_lshift, bhimpl_int_lshift);
+bhhandler_ii_i!(handler_uint_rshift, bhimpl_uint_rshift);
+bhhandler_ii_i!(handler_int_lt, bhimpl_int_lt);
+bhhandler_ii_i!(handler_int_le, bhimpl_int_le);
+bhhandler_ii_i!(handler_int_eq, bhimpl_int_eq);
+bhhandler_ii_i!(handler_int_ne, bhimpl_int_ne);
+bhhandler_ii_i!(handler_int_gt, bhimpl_int_gt);
+bhhandler_ii_i!(handler_int_ge, bhimpl_int_ge);
+
+// ── control flow + copy handlers ─────────────────────────────────────
+
+/// blackhole.py:638-640 `bhimpl_int_copy(a): return a` — @arguments("i", returns="i").
+/// Decoded as `i>i` (same as int_same_as). Already have handler_int_same_as.
+/// Wire as alias.
+bhhandler_i_i!(handler_int_copy, bhimpl_int_same_as);
+
+/// Handler for `live/` — liveness marker. Argcodes: empty, but the assembler
+/// emits a 2-byte offset after the opcode. Skip those 2 bytes.
+/// RPython blackhole.py:146-158 (inside _get_method for `-live-` ops).
+fn handler_live(
+    _bh: &mut BlackholeInterpreter,
+    _code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    // Skip the 2-byte liveness offset (RPython: OFFSET_SIZE = 2).
+    Ok(position + 2)
+}
+
+/// Handler for `goto/L` — unconditional jump. Argcodes: `L` (2-byte label).
+/// RPython blackhole.py:950-952: `def bhimpl_goto(target): return target`.
+/// Returns="L" means the handler returns the label value as new position.
+fn handler_goto(
+    _bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let target = (code[position] as usize) | ((code[position + 1] as usize) << 8);
+    Ok(target)
+}
+
+/// Handler for `goto_if_not/iL` — conditional jump.
+/// RPython blackhole.py:864-869:
+/// ```python
+/// @arguments("i", "L", "pc", returns="L")
+/// def bhimpl_goto_if_not(a, target, pc):
+///     if a: return pc
+///     else: return target
+/// ```
+/// "pc" means the current position AFTER decoding all operands.
+fn handler_goto_if_not(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let a = bh.registers_i[code[position] as usize];
+    let target = (code[position + 1] as usize) | ((code[position + 2] as usize) << 8);
+    let pc = position + 3; // position after all operands
+    if a != 0 {
+        Ok(pc) // condition true: fall through
+    } else {
+        Ok(target) // condition false: jump to target
+    }
+}
+
+/// Handler for `int_return/i` — RPython blackhole.py:841-845.
+/// @arguments("self", "i"): read one int register, store in tmpreg_i,
+/// raise LeaveFrame.
+fn handler_int_return(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let a = bh.registers_i[code[position] as usize];
+    bh.tmpreg_i = a;
+    bh.return_type = BhReturnType::Int;
+    Err(DispatchError::LeaveFrame)
+}
+
+/// Handler for `ref_return/r` — RPython blackhole.py:847-851.
+fn handler_ref_return(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let a = bh.registers_r[code[position] as usize];
+    bh.tmpreg_r = a;
+    bh.return_type = BhReturnType::Ref;
+    Err(DispatchError::LeaveFrame)
+}
+
+/// Handler for `void_return/` — RPython blackhole.py:859-862.
+fn handler_void_return(
+    bh: &mut BlackholeInterpreter,
+    _code: &[u8],
+    _position: usize,
+) -> Result<usize, DispatchError> {
+    bh.return_type = BhReturnType::Void;
+    Err(DispatchError::LeaveFrame)
+}
+
+// ── float bhimpl methods (RPython blackhole.py:676-808) ─────────────
+
+// RPython stores floats as longlong (i64 bits). pyre stores f64 in
+// registers_f directly. The bhimpl methods work on f64 values.
+
+fn bhimpl_float_neg(a: f64) -> f64 {
+    -a
+}
+fn bhimpl_float_abs(a: f64) -> f64 {
+    a.abs()
+}
+fn bhimpl_float_add(a: f64, b: f64) -> f64 {
+    a + b
+}
+fn bhimpl_float_sub(a: f64, b: f64) -> f64 {
+    a - b
+}
+fn bhimpl_float_mul(a: f64, b: f64) -> f64 {
+    a * b
+}
+fn bhimpl_float_truediv(a: f64, b: f64) -> f64 {
+    a / b
+}
+
+/// Decode pattern `@arguments("f", "f", returns="f")` — argcodes `"ff>f"`.
+macro_rules! bhhandler_ff_f {
+    ($name:ident, $bhimpl:ident) => {
+        fn $name(
+            bh: &mut BlackholeInterpreter,
+            code: &[u8],
+            position: usize,
+        ) -> Result<usize, DispatchError> {
+            let a = f64::from_bits(bh.registers_f[code[position] as usize] as u64);
+            let b = f64::from_bits(bh.registers_f[code[position + 1] as usize] as u64);
+            bh.registers_f[code[position + 2] as usize] = $bhimpl(a, b).to_bits() as i64;
+            Ok(position + 3)
+        }
+    };
+}
+
+/// Decode pattern `@arguments("f", returns="f")` — argcodes `"f>f"`.
+macro_rules! bhhandler_f_f {
+    ($name:ident, $bhimpl:ident) => {
+        fn $name(
+            bh: &mut BlackholeInterpreter,
+            code: &[u8],
+            position: usize,
+        ) -> Result<usize, DispatchError> {
+            let a = f64::from_bits(bh.registers_f[code[position] as usize] as u64);
+            bh.registers_f[code[position + 1] as usize] = $bhimpl(a).to_bits() as i64;
+            Ok(position + 2)
+        }
+    };
+}
+
+/// Decode pattern `@arguments("f", "f", returns="i")` — argcodes `"ff>i"`.
+macro_rules! bhhandler_ff_i {
+    ($name:ident, $cmp:expr) => {
+        fn $name(
+            bh: &mut BlackholeInterpreter,
+            code: &[u8],
+            position: usize,
+        ) -> Result<usize, DispatchError> {
+            let a = f64::from_bits(bh.registers_f[code[position] as usize] as u64);
+            let b = f64::from_bits(bh.registers_f[code[position + 1] as usize] as u64);
+            bh.registers_i[code[position + 2] as usize] = $cmp(a, b) as i64;
+            Ok(position + 3)
+        }
+    };
+}
+
+bhhandler_ff_f!(handler_float_add, bhimpl_float_add);
+bhhandler_ff_f!(handler_float_sub, bhimpl_float_sub);
+bhhandler_ff_f!(handler_float_mul, bhimpl_float_mul);
+bhhandler_ff_f!(handler_float_truediv, bhimpl_float_truediv);
+bhhandler_f_f!(handler_float_neg, bhimpl_float_neg);
+bhhandler_f_f!(handler_float_abs, bhimpl_float_abs);
+bhhandler_ff_i!(handler_float_lt, |a: f64, b: f64| a < b);
+bhhandler_ff_i!(handler_float_le, |a: f64, b: f64| a <= b);
+bhhandler_ff_i!(handler_float_eq, |a: f64, b: f64| a == b);
+bhhandler_ff_i!(handler_float_ne, |a: f64, b: f64| a != b);
+bhhandler_ff_i!(handler_float_gt, |a: f64, b: f64| a > b);
+bhhandler_ff_i!(handler_float_ge, |a: f64, b: f64| a >= b);
+
+// ── unsigned comparison bhimpl (RPython blackhole.py:571-582) ────────
+
+fn bhimpl_uint_lt(a: i64, b: i64) -> i64 {
+    ((a as u64) < (b as u64)) as i64
+}
+fn bhimpl_uint_le(a: i64, b: i64) -> i64 {
+    ((a as u64) <= (b as u64)) as i64
+}
+fn bhimpl_uint_gt(a: i64, b: i64) -> i64 {
+    ((a as u64) > (b as u64)) as i64
+}
+fn bhimpl_uint_ge(a: i64, b: i64) -> i64 {
+    ((a as u64) >= (b as u64)) as i64
+}
+
+bhhandler_ii_i!(handler_uint_lt, bhimpl_uint_lt);
+bhhandler_ii_i!(handler_uint_le, bhimpl_uint_le);
+bhhandler_ii_i!(handler_uint_gt, bhimpl_uint_gt);
+bhhandler_ii_i!(handler_uint_ge, bhimpl_uint_ge);
+
+// ── goto_if_not_int_* conditionals (RPython blackhole.py:871-920) ───
+
+/// Decode pattern `@arguments("i", "i", "L", "pc", returns="L")`.
+/// Read 2 int registers + 2-byte label; compare; return target or pc.
+macro_rules! bhhandler_goto_if_not_ii {
+    ($name:ident, $cmp:expr) => {
+        fn $name(
+            bh: &mut BlackholeInterpreter,
+            code: &[u8],
+            position: usize,
+        ) -> Result<usize, DispatchError> {
+            let a = bh.registers_i[code[position] as usize];
+            let b = bh.registers_i[code[position + 1] as usize];
+            let target = (code[position + 2] as usize) | ((code[position + 3] as usize) << 8);
+            let pc = position + 4;
+            if $cmp(a, b) { Ok(pc) } else { Ok(target) }
+        }
+    };
+}
+
+bhhandler_goto_if_not_ii!(handler_goto_if_not_int_lt, |a: i64, b: i64| a < b);
+bhhandler_goto_if_not_ii!(handler_goto_if_not_int_le, |a: i64, b: i64| a <= b);
+bhhandler_goto_if_not_ii!(handler_goto_if_not_int_eq, |a: i64, b: i64| a == b);
+bhhandler_goto_if_not_ii!(handler_goto_if_not_int_ne, |a: i64, b: i64| a != b);
+bhhandler_goto_if_not_ii!(handler_goto_if_not_int_gt, |a: i64, b: i64| a > b);
+bhhandler_goto_if_not_ii!(handler_goto_if_not_int_ge, |a: i64, b: i64| a >= b);
+
+// ── ref operations (RPython blackhole.py:584-610) ───────────────────
+
+fn bhimpl_ptr_eq(a: i64, b: i64) -> i64 {
+    (a == b) as i64
+}
+fn bhimpl_ptr_ne(a: i64, b: i64) -> i64 {
+    (a != b) as i64
+}
+fn bhimpl_ptr_iszero(a: i64) -> i64 {
+    (a == 0) as i64
+}
+fn bhimpl_ptr_nonzero(a: i64) -> i64 {
+    (a != 0) as i64
+}
+
+/// `@arguments("r", "r", returns="i")` — rr>i: read 2 ref regs, result int.
+macro_rules! bhhandler_rr_i {
+    ($name:ident, $bhimpl:ident) => {
+        fn $name(
+            bh: &mut BlackholeInterpreter,
+            code: &[u8],
+            position: usize,
+        ) -> Result<usize, DispatchError> {
+            let a = bh.registers_r[code[position] as usize];
+            let b = bh.registers_r[code[position + 1] as usize];
+            bh.registers_i[code[position + 2] as usize] = $bhimpl(a, b);
+            Ok(position + 3)
+        }
+    };
+}
+
+/// `@arguments("r", returns="i")` — r>i: read 1 ref reg, result int.
+macro_rules! bhhandler_r_i {
+    ($name:ident, $bhimpl:ident) => {
+        fn $name(
+            bh: &mut BlackholeInterpreter,
+            code: &[u8],
+            position: usize,
+        ) -> Result<usize, DispatchError> {
+            let a = bh.registers_r[code[position] as usize];
+            bh.registers_i[code[position + 1] as usize] = $bhimpl(a);
+            Ok(position + 2)
+        }
+    };
+}
+
+bhhandler_rr_i!(handler_ptr_eq, bhimpl_ptr_eq);
+bhhandler_rr_i!(handler_ptr_ne, bhimpl_ptr_ne);
+bhhandler_rr_i!(handler_instance_ptr_eq, bhimpl_ptr_eq);
+bhhandler_rr_i!(handler_instance_ptr_ne, bhimpl_ptr_ne);
+bhhandler_r_i!(handler_ptr_iszero, bhimpl_ptr_iszero);
+bhhandler_r_i!(handler_ptr_nonzero, bhimpl_ptr_nonzero);
+
+// ref/float copy (blackhole.py:641-645)
+fn handler_ref_copy(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    bh.registers_r[code[position + 1] as usize] = bh.registers_r[code[position] as usize];
+    Ok(position + 2)
+}
+fn handler_float_copy(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    bh.registers_f[code[position + 1] as usize] = bh.registers_f[code[position] as usize];
+    Ok(position + 2)
+}
+
+// float_return (blackhole.py:853-857)
+fn handler_float_return(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    bh.tmpreg_f = bh.registers_f[code[position] as usize];
+    bh.return_type = BhReturnType::Float;
+    Err(DispatchError::LeaveFrame)
+}
+
+// ── guard_value — no-op in blackhole (blackhole.py:648-656) ─────────
+fn handler_int_guard_value(
+    _bh: &mut BlackholeInterpreter,
+    _code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    Ok(position + 1)
+}
+fn handler_ref_guard_value(
+    _bh: &mut BlackholeInterpreter,
+    _code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    Ok(position + 1)
+}
+fn handler_float_guard_value(
+    _bh: &mut BlackholeInterpreter,
+    _code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    Ok(position + 1)
+}
+
+// ── push/pop (blackhole.py:661-679) ─────────────────────────────────
+fn handler_int_push(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    bh.tmpreg_i = bh.registers_i[code[position] as usize];
+    Ok(position + 1)
+}
+fn handler_ref_push(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    bh.tmpreg_r = bh.registers_r[code[position] as usize];
+    Ok(position + 1)
+}
+fn handler_float_push(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    bh.tmpreg_f = bh.registers_f[code[position] as usize];
+    Ok(position + 1)
+}
+fn handler_int_pop(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    bh.registers_i[code[position] as usize] = bh.tmpreg_i;
+    Ok(position + 1)
+}
+fn handler_ref_pop(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    bh.registers_r[code[position] as usize] = bh.tmpreg_r;
+    Ok(position + 1)
+}
+fn handler_float_pop(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    bh.registers_f[code[position] as usize] = bh.tmpreg_f;
+    Ok(position + 1)
+}
+
+// ── record_exact_class/value — no-op (blackhole.py:616-636) ─────────
+fn handler_record_exact_class(
+    _bh: &mut BlackholeInterpreter,
+    _code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    Ok(position + 2)
+}
+fn handler_record_exact_value_r(
+    _bh: &mut BlackholeInterpreter,
+    _code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    Ok(position + 2)
+}
+fn handler_record_exact_value_i(
+    _bh: &mut BlackholeInterpreter,
+    _code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    Ok(position + 2)
+}
+
+// ── cast operations (blackhole.py:800-831) ──────────────────────────
+fn handler_cast_float_to_int(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let a = f64::from_bits(bh.registers_f[code[position] as usize] as u64);
+    bh.registers_i[code[position + 1] as usize] = a as i64;
+    Ok(position + 2)
+}
+fn handler_cast_int_to_float(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let a = bh.registers_i[code[position] as usize];
+    bh.registers_f[code[position + 1] as usize] = (a as f64).to_bits() as i64;
+    Ok(position + 2)
+}
+
+// ── int_signext (blackhole.py:566-569) ──────────────────────────────
+fn handler_int_signext(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let a = bh.registers_i[code[position] as usize];
+    let numbytes = bh.registers_i[code[position + 1] as usize];
+    let result = match numbytes {
+        1 => (a as i8) as i64,
+        2 => (a as i16) as i64,
+        4 => (a as i32) as i64,
+        _ => a,
+    };
+    bh.registers_i[code[position + 2] as usize] = result;
+    Ok(position + 3)
+}
+
+// ── overflow ops (blackhole.py:478-497) ─────────────────────────────
+
+fn handler_int_add_jump_if_ovf(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let target = (code[position] as usize) | ((code[position + 1] as usize) << 8);
+    let a = bh.registers_i[code[position + 2] as usize];
+    let b = bh.registers_i[code[position + 3] as usize];
+    let pc = position + 5;
+    match a.checked_add(b) {
+        Some(result) => {
+            bh.registers_i[code[position + 4] as usize] = result;
+            Ok(pc)
+        }
+        None => Ok(target),
+    }
+}
+fn handler_int_sub_jump_if_ovf(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let target = (code[position] as usize) | ((code[position + 1] as usize) << 8);
+    let a = bh.registers_i[code[position + 2] as usize];
+    let b = bh.registers_i[code[position + 3] as usize];
+    let pc = position + 5;
+    match a.checked_sub(b) {
+        Some(result) => {
+            bh.registers_i[code[position + 4] as usize] = result;
+            Ok(pc)
+        }
+        None => Ok(target),
+    }
+}
+fn handler_int_mul_jump_if_ovf(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let target = (code[position] as usize) | ((code[position + 1] as usize) << 8);
+    let a = bh.registers_i[code[position + 2] as usize];
+    let b = bh.registers_i[code[position + 3] as usize];
+    let pc = position + 5;
+    match a.checked_mul(b) {
+        Some(result) => {
+            bh.registers_i[code[position + 4] as usize] = result;
+            Ok(pc)
+        }
+        None => Ok(target),
+    }
+}
+
+// ── misc simple ops ─────────────────────────────────────────────────
+
+fn handler_assert_not_none(
+    _bh: &mut BlackholeInterpreter,
+    _code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    Ok(position + 1)
+}
+
+fn handler_virtual_ref(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    bh.registers_r[code[position + 1] as usize] = bh.registers_r[code[position] as usize];
+    Ok(position + 2)
+}
+fn handler_virtual_ref_finish(
+    _bh: &mut BlackholeInterpreter,
+    _code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    Ok(position + 1)
+}
+fn handler_loop_header(
+    _bh: &mut BlackholeInterpreter,
+    _code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    Ok(position + 1)
+}
+fn handler_ref_isconstant(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    bh.registers_i[code[position + 1] as usize] = 0;
+    Ok(position + 2)
+}
+fn handler_ref_isvirtual(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    bh.registers_i[code[position + 1] as usize] = 0;
+    Ok(position + 2)
+}
+fn handler_goto_if_not_int_is_zero(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let a = bh.registers_i[code[position] as usize];
+    let target = (code[position + 1] as usize) | ((code[position + 2] as usize) << 8);
+    let pc = position + 3;
+    if a == 0 { Ok(pc) } else { Ok(target) }
+}
+fn handler_goto_if_not_ptr_iszero(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let a = bh.registers_r[code[position] as usize];
+    let target = (code[position + 1] as usize) | ((code[position + 2] as usize) << 8);
+    let pc = position + 3;
+    if a == 0 { Ok(pc) } else { Ok(target) }
+}
+fn handler_goto_if_not_ptr_nonzero(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let a = bh.registers_r[code[position] as usize];
+    let target = (code[position + 1] as usize) | ((code[position + 2] as usize) << 8);
+    let pc = position + 3;
+    if a != 0 { Ok(pc) } else { Ok(target) }
+}
+fn handler_unreachable(
+    _bh: &mut BlackholeInterpreter,
+    _code: &[u8],
+    _position: usize,
+) -> Result<usize, DispatchError> {
+    panic!("bhimpl_unreachable reached");
+}
+
+// ── cpu-dependent field/array operations ─────────────────────────────
+//
+// RPython blackhole.py:1432-1481: bhimpl_getfield_gc_*/setfield_gc_*
+// These call `cpu.bh_getfield_gc_i(struct_ptr, descr)` etc.
+// The 'd' argcode is a 2-byte descriptor index into `bh.descrs`.
+// In pyre, descrs[index] resolves to a field offset (usize).
+
+/// Helper: read a 2-byte descriptor index from bytecode and resolve to offset.
+#[inline]
+fn read_descr_offset(bh: &BlackholeInterpreter, code: &[u8], pos: usize) -> (usize, usize) {
+    let descr_idx = (code[pos] as usize) | ((code[pos + 1] as usize) << 8);
+    let offset = bh.descrs.get(descr_idx).copied().unwrap_or(0);
+    (offset, pos + 2)
+}
+
+// bhimpl_getfield_gc_i: @arguments("cpu", "r", "d", returns="i")
+fn handler_getfield_gc_i(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let struct_ptr = bh.registers_r[code[position] as usize];
+    let (offset, pos) = read_descr_offset(bh, code, position + 1);
+    let cpu = bh.cpu.expect("cpu not set");
+    let result = cpu.bh_getfield_gc_i(struct_ptr, offset);
+    bh.registers_i[code[pos] as usize] = result;
+    Ok(pos + 1)
+}
+fn handler_getfield_gc_r(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let struct_ptr = bh.registers_r[code[position] as usize];
+    let (offset, pos) = read_descr_offset(bh, code, position + 1);
+    let cpu = bh.cpu.expect("cpu not set");
+    let result = cpu.bh_getfield_gc_r(struct_ptr, offset);
+    bh.registers_r[code[pos] as usize] = result.0 as i64;
+    Ok(pos + 1)
+}
+fn handler_getfield_gc_f(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let struct_ptr = bh.registers_r[code[position] as usize];
+    let (offset, pos) = read_descr_offset(bh, code, position + 1);
+    let cpu = bh.cpu.expect("cpu not set");
+    let result = cpu.bh_getfield_gc_f(struct_ptr, offset);
+    bh.registers_f[code[pos] as usize] = result.to_bits() as i64;
+    Ok(pos + 1)
+}
+
+// bhimpl_setfield_gc_i: @arguments("cpu", "r", "i", "d")
+fn handler_setfield_gc_i(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let struct_ptr = bh.registers_r[code[position] as usize];
+    let value = bh.registers_i[code[position + 1] as usize];
+    let (offset, pos) = read_descr_offset(bh, code, position + 2);
+    let cpu = bh.cpu.expect("cpu not set");
+    cpu.bh_setfield_gc_i(struct_ptr, offset, value);
+    Ok(pos)
+}
+fn handler_setfield_gc_r(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let struct_ptr = bh.registers_r[code[position] as usize];
+    let value = bh.registers_r[code[position + 1] as usize];
+    let (offset, pos) = read_descr_offset(bh, code, position + 2);
+    let cpu = bh.cpu.expect("cpu not set");
+    cpu.bh_setfield_gc_r(struct_ptr, offset, majit_ir::GcRef(value as usize));
+    Ok(pos)
+}
+fn handler_setfield_gc_f(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let struct_ptr = bh.registers_r[code[position] as usize];
+    let value = f64::from_bits(bh.registers_f[code[position + 1] as usize] as u64);
+    let (offset, pos) = read_descr_offset(bh, code, position + 2);
+    let cpu = bh.cpu.expect("cpu not set");
+    cpu.bh_setfield_gc_f(struct_ptr, offset, value);
+    Ok(pos)
+}
+
+// bhimpl_arraylen_gc: @arguments("cpu", "r", "d", returns="i")
+fn handler_arraylen_gc(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let array_ptr = bh.registers_r[code[position] as usize];
+    let (len_offset, pos) = read_descr_offset(bh, code, position + 1);
+    let cpu = bh.cpu.expect("cpu not set");
+    let result = cpu.bh_arraylen_gc(array_ptr, len_offset);
+    bh.registers_i[code[pos] as usize] = result;
+    Ok(pos + 1)
+}
+
+// ── getarrayitem_gc (blackhole.py:1329-1341) ────────────────────────
+// @arguments("cpu", "r", "i", "d", returns="X")
+
+fn handler_getarrayitem_gc_i(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let array = bh.registers_r[code[position] as usize];
+    let index = bh.registers_i[code[position + 1] as usize];
+    let (item_size, pos) = read_descr_offset(bh, code, position + 2);
+    let cpu = bh.cpu.expect("cpu not set");
+    bh.registers_i[code[pos] as usize] = cpu.bh_getarrayitem_gc_i(array, index, item_size);
+    Ok(pos + 1)
+}
+fn handler_getarrayitem_gc_r(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let array = bh.registers_r[code[position] as usize];
+    let index = bh.registers_i[code[position + 1] as usize];
+    let (item_size, pos) = read_descr_offset(bh, code, position + 2);
+    let cpu = bh.cpu.expect("cpu not set");
+    bh.registers_r[code[pos] as usize] = cpu.bh_getarrayitem_gc_r(array, index, item_size).0 as i64;
+    Ok(pos + 1)
+}
+
+// ── setarrayitem_gc (blackhole.py:1350-1358) ────────────────────────
+// @arguments("cpu", "r", "i", "X", "d")
+
+fn handler_setarrayitem_gc_i(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let array = bh.registers_r[code[position] as usize];
+    let index = bh.registers_i[code[position + 1] as usize];
+    let value = bh.registers_i[code[position + 2] as usize];
+    let (item_size, pos) = read_descr_offset(bh, code, position + 3);
+    let cpu = bh.cpu.expect("cpu not set");
+    cpu.bh_setarrayitem_gc_i(array, index, item_size, value);
+    Ok(pos)
+}
+fn handler_setarrayitem_gc_r(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let array = bh.registers_r[code[position] as usize];
+    let index = bh.registers_i[code[position + 1] as usize];
+    let value = bh.registers_r[code[position + 2] as usize];
+    let (item_size, pos) = read_descr_offset(bh, code, position + 3);
+    let cpu = bh.cpu.expect("cpu not set");
+    cpu.bh_setarrayitem_gc_r(array, index, item_size, majit_ir::GcRef(value as usize));
+    Ok(pos)
+}
+
+// ── getfield_raw (blackhole.py:1464-1472) ───────────────────────────
+fn handler_getfield_raw_i(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let struct_ptr = bh.registers_i[code[position] as usize]; // raw ptr is int
+    let (offset, pos) = read_descr_offset(bh, code, position + 1);
+    let cpu = bh.cpu.expect("cpu not set");
+    bh.registers_i[code[pos] as usize] = cpu.bh_getfield_raw_i(struct_ptr, offset);
+    Ok(pos + 1)
+}
+fn handler_getfield_raw_f(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let struct_ptr = bh.registers_i[code[position] as usize];
+    let (offset, pos) = read_descr_offset(bh, code, position + 1);
+    let cpu = bh.cpu.expect("cpu not set");
+    bh.registers_f[code[pos] as usize] = cpu.bh_getfield_raw_f(struct_ptr, offset).to_bits() as i64;
+    Ok(pos + 1)
+}
+
+// ── setfield_raw (blackhole.py:1497-1502) ───────────────────────────
+fn handler_setfield_raw_i(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let struct_ptr = bh.registers_i[code[position] as usize];
+    let value = bh.registers_i[code[position + 1] as usize];
+    let (offset, pos) = read_descr_offset(bh, code, position + 2);
+    let cpu = bh.cpu.expect("cpu not set");
+    cpu.bh_setfield_raw_i(struct_ptr, offset, value);
+    Ok(pos)
+}
+fn handler_setfield_raw_f(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let struct_ptr = bh.registers_i[code[position] as usize];
+    let value = f64::from_bits(bh.registers_f[code[position + 1] as usize] as u64);
+    let (offset, pos) = read_descr_offset(bh, code, position + 2);
+    let cpu = bh.cpu.expect("cpu not set");
+    cpu.bh_setfield_raw_f(struct_ptr, offset, value);
+    Ok(pos)
+}
+
+// ── new / new_with_vtable / new_array (blackhole.py:1301-1327) ──────
+// These need SizeDescr which pyre doesn't fully have yet.
+// Stub handlers that read the descriptor and call cpu.bh_new etc.
+
+fn handler_new(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    // @arguments("cpu", "d", returns="r")
+    let (_descr_offset, pos) = read_descr_offset(bh, code, position);
+    // TODO: resolve SizeDescr from descr table and call cpu.bh_new(descr)
+    bh.registers_r[code[pos] as usize] = 0; // placeholder null
+    Ok(pos + 1)
+}
+fn handler_new_with_vtable(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let (_descr_offset, pos) = read_descr_offset(bh, code, position);
+    bh.registers_r[code[pos] as usize] = 0;
+    Ok(pos + 1)
+}
+fn handler_new_array(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    // @arguments("cpu", "i", "d", returns="r")
+    let _length = bh.registers_i[code[position] as usize];
+    let (_descr_offset, pos) = read_descr_offset(bh, code, position + 1);
+    bh.registers_r[code[pos] as usize] = 0;
+    Ok(pos + 1)
+}
+fn handler_new_array_clear(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let _length = bh.registers_i[code[position] as usize];
+    let (_descr_offset, pos) = read_descr_offset(bh, code, position + 1);
+    bh.registers_r[code[pos] as usize] = 0;
+    Ok(pos + 1)
+}
+
+// ── string operations (blackhole.py:1200-1283) ──────────────────────
+fn handler_strlen(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let s = bh.registers_r[code[position] as usize];
+    let cpu = bh.cpu.expect("cpu not set");
+    bh.registers_i[code[position + 1] as usize] = cpu.bh_strlen(s);
+    Ok(position + 2)
+}
+fn handler_strgetitem(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let s = bh.registers_r[code[position] as usize];
+    let index = bh.registers_i[code[position + 1] as usize];
+    let cpu = bh.cpu.expect("cpu not set");
+    bh.registers_i[code[position + 2] as usize] = cpu.bh_strgetitem(s, index);
+    Ok(position + 3)
+}
+fn handler_strsetitem(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let s = bh.registers_r[code[position] as usize];
+    let index = bh.registers_i[code[position + 1] as usize];
+    let value = bh.registers_i[code[position + 2] as usize];
+    let cpu = bh.cpu.expect("cpu not set");
+    cpu.bh_strsetitem(s, index, value);
+    Ok(position + 3)
+}
+fn handler_newstr(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let length = bh.registers_i[code[position] as usize];
+    let cpu = bh.cpu.expect("cpu not set");
+    bh.registers_r[code[position + 1] as usize] = cpu.bh_newstr(length);
+    Ok(position + 2)
+}
+fn handler_unicodelen(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let s = bh.registers_r[code[position] as usize];
+    let cpu = bh.cpu.expect("cpu not set");
+    bh.registers_i[code[position + 1] as usize] = cpu.bh_unicodelen(s);
+    Ok(position + 2)
+}
+fn handler_unicodegetitem(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let s = bh.registers_r[code[position] as usize];
+    let index = bh.registers_i[code[position + 1] as usize];
+    let cpu = bh.cpu.expect("cpu not set");
+    bh.registers_i[code[position + 2] as usize] = cpu.bh_unicodegetitem(s, index);
+    Ok(position + 3)
+}
+fn handler_unicodesetitem(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let s = bh.registers_r[code[position] as usize];
+    let index = bh.registers_i[code[position + 1] as usize];
+    let value = bh.registers_i[code[position + 2] as usize];
+    let cpu = bh.cpu.expect("cpu not set");
+    cpu.bh_unicodesetitem(s, index, value);
+    Ok(position + 3)
+}
+fn handler_newunicode(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let length = bh.registers_i[code[position] as usize];
+    let cpu = bh.cpu.expect("cpu not set");
+    bh.registers_r[code[position + 1] as usize] = cpu.bh_newunicode(length);
+    Ok(position + 2)
+}
+
+// ── exception handling (blackhole.py:969-1009) ──────────────────────
+fn handler_catch_exception(
+    _bh: &mut BlackholeInterpreter,
+    _code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    // @arguments("L") — no-op, skip 2-byte label
+    Ok(position + 2)
+}
+
+// ── misc no-ops (blackhole.py:1017-1049) ────────────────────────────
+fn handler_jit_debug(
+    _bh: &mut BlackholeInterpreter,
+    _code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    // @arguments("r", "i", "i", "i", "i") = 1 ref + 4 int = 5 regs
+    Ok(position + 5)
+}
+fn handler_jit_enter_portal_frame(
+    _bh: &mut BlackholeInterpreter,
+    _code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    // @arguments("i") = 1 int
+    Ok(position + 1)
+}
+fn handler_jit_leave_portal_frame(
+    _bh: &mut BlackholeInterpreter,
+    _code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    Ok(position)
+}
+
+// ── interiorfield_gc (blackhole.py:1411-1429) ───────────────────────
+// @arguments("cpu", "r", "i", "d", returns="X")
+fn handler_getinteriorfield_gc_i(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let array = bh.registers_r[code[position] as usize];
+    let index = bh.registers_i[code[position + 1] as usize];
+    let (descr_offset, pos) = read_descr_offset(bh, code, position + 2);
+    let cpu = bh.cpu.expect("cpu not set");
+    bh.registers_i[code[pos] as usize] = cpu.bh_getinteriorfield_gc_i(array, index, descr_offset);
+    Ok(pos + 1)
+}
+fn handler_setinteriorfield_gc_i(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let array = bh.registers_r[code[position] as usize];
+    let index = bh.registers_i[code[position + 1] as usize];
+    let value = bh.registers_i[code[position + 2] as usize];
+    let (descr_offset, pos) = read_descr_offset(bh, code, position + 3);
+    let cpu = bh.cpu.expect("cpu not set");
+    cpu.bh_setinteriorfield_gc_i(array, index, descr_offset, value);
+    Ok(pos)
+}
+
+// ── call operations (blackhole.py:1224-1276) ────────────────────────
+
+#[inline]
+fn read_list_i(bh: &BlackholeInterpreter, code: &[u8], pos: usize) -> (Vec<i64>, usize) {
+    let count = code[pos] as usize;
+    let values: Vec<i64> = (0..count)
+        .map(|i| bh.registers_i[code[pos + 1 + i] as usize])
+        .collect();
+    (values, pos + 1 + count)
+}
+#[inline]
+fn read_list_r(bh: &BlackholeInterpreter, code: &[u8], pos: usize) -> (Vec<i64>, usize) {
+    let count = code[pos] as usize;
+    let values: Vec<i64> = (0..count)
+        .map(|i| bh.registers_r[code[pos + 1 + i] as usize])
+        .collect();
+    (values, pos + 1 + count)
+}
+#[inline]
+fn read_list_f(bh: &BlackholeInterpreter, code: &[u8], pos: usize) -> (Vec<i64>, usize) {
+    let count = code[pos] as usize;
+    let values: Vec<i64> = (0..count)
+        .map(|i| bh.registers_f[code[pos + 1 + i] as usize])
+        .collect();
+    (values, pos + 1 + count)
+}
+fn flatten_args(a: &[i64], b: &[i64], c: &[i64]) -> Vec<i64> {
+    let mut all = Vec::with_capacity(a.len() + b.len() + c.len());
+    all.extend_from_slice(a);
+    all.extend_from_slice(b);
+    all.extend_from_slice(c);
+    all
+}
+
+// residual_call_irf_*
+fn handler_residual_call_irf_i(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let func = bh.registers_i[code[position] as usize];
+    let (ai, p) = read_list_i(bh, code, position + 1);
+    let (ar, p) = read_list_r(bh, code, p);
+    let (af, p) = read_list_f(bh, code, p);
+    let (_, p) = read_descr_offset(bh, code, p);
+    let all = flatten_args(&ai, &ar, &af);
+    bh.registers_i[code[p] as usize] = bh.cpu.expect("cpu").bh_call_i(func, &all);
+    Ok(p + 1)
+}
+fn handler_residual_call_irf_r(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let func = bh.registers_i[code[position] as usize];
+    let (ai, p) = read_list_i(bh, code, position + 1);
+    let (ar, p) = read_list_r(bh, code, p);
+    let (af, p) = read_list_f(bh, code, p);
+    let (_, p) = read_descr_offset(bh, code, p);
+    let all = flatten_args(&ai, &ar, &af);
+    bh.registers_r[code[p] as usize] = bh.cpu.expect("cpu").bh_call_r(func, &all).0 as i64;
+    Ok(p + 1)
+}
+fn handler_residual_call_irf_f(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let func = bh.registers_i[code[position] as usize];
+    let (ai, p) = read_list_i(bh, code, position + 1);
+    let (ar, p) = read_list_r(bh, code, p);
+    let (af, p) = read_list_f(bh, code, p);
+    let (_, p) = read_descr_offset(bh, code, p);
+    let all = flatten_args(&ai, &ar, &af);
+    bh.registers_f[code[p] as usize] = bh.cpu.expect("cpu").bh_call_f(func, &all).to_bits() as i64;
+    Ok(p + 1)
+}
+fn handler_residual_call_irf_v(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let func = bh.registers_i[code[position] as usize];
+    let (ai, p) = read_list_i(bh, code, position + 1);
+    let (ar, p) = read_list_r(bh, code, p);
+    let (af, p) = read_list_f(bh, code, p);
+    let (_, p) = read_descr_offset(bh, code, p);
+    let all = flatten_args(&ai, &ar, &af);
+    bh.cpu.expect("cpu").bh_call_v(func, &all);
+    Ok(p)
+}
+// residual_call_ir_*
+fn handler_residual_call_ir_i(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let func = bh.registers_i[code[position] as usize];
+    let (ai, p) = read_list_i(bh, code, position + 1);
+    let (ar, p) = read_list_r(bh, code, p);
+    let (_, p) = read_descr_offset(bh, code, p);
+    let all = flatten_args(&ai, &ar, &[]);
+    bh.registers_i[code[p] as usize] = bh.cpu.expect("cpu").bh_call_i(func, &all);
+    Ok(p + 1)
+}
+fn handler_residual_call_ir_r(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let func = bh.registers_i[code[position] as usize];
+    let (ai, p) = read_list_i(bh, code, position + 1);
+    let (ar, p) = read_list_r(bh, code, p);
+    let (_, p) = read_descr_offset(bh, code, p);
+    let all = flatten_args(&ai, &ar, &[]);
+    bh.registers_r[code[p] as usize] = bh.cpu.expect("cpu").bh_call_r(func, &all).0 as i64;
+    Ok(p + 1)
+}
+fn handler_residual_call_ir_v(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let func = bh.registers_i[code[position] as usize];
+    let (ai, p) = read_list_i(bh, code, position + 1);
+    let (ar, p) = read_list_r(bh, code, p);
+    let (_, p) = read_descr_offset(bh, code, p);
+    let all = flatten_args(&ai, &ar, &[]);
+    bh.cpu.expect("cpu").bh_call_v(func, &all);
+    Ok(p)
+}
+// residual_call_r_*
+fn handler_residual_call_r_i(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let func = bh.registers_i[code[position] as usize];
+    let (ar, p) = read_list_r(bh, code, position + 1);
+    let (_, p) = read_descr_offset(bh, code, p);
+    bh.registers_i[code[p] as usize] = bh.cpu.expect("cpu").bh_call_i(func, &ar);
+    Ok(p + 1)
+}
+fn handler_residual_call_r_r(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let func = bh.registers_i[code[position] as usize];
+    let (ar, p) = read_list_r(bh, code, position + 1);
+    let (_, p) = read_descr_offset(bh, code, p);
+    bh.registers_r[code[p] as usize] = bh.cpu.expect("cpu").bh_call_r(func, &ar).0 as i64;
+    Ok(p + 1)
+}
+fn handler_residual_call_r_v(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let func = bh.registers_i[code[position] as usize];
+    let (ar, p) = read_list_r(bh, code, position + 1);
+    let (_, p) = read_descr_offset(bh, code, p);
+    bh.cpu.expect("cpu").bh_call_v(func, &ar);
+    Ok(p)
+}
+
+/// Wire all currently-ported bhimpl methods into a `BlackholeInterpBuilder`'s
+/// dispatch table. Called once after `setup_insns`.
+///
+/// RPython builds all handlers in `setup_insns` via `_get_method`; pyre
+/// wires them incrementally as methods are ported from RPython.
+pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
+    // @arguments("i", returns="i") pattern
+    builder.wire_handler("int_same_as/i>i", handler_int_same_as);
+    builder.wire_handler("int_neg/i>i", handler_int_neg);
+    builder.wire_handler("int_invert/i>i", handler_int_invert);
+    builder.wire_handler("int_is_true/i>i", handler_int_is_true);
+    builder.wire_handler("int_is_zero/i>i", handler_int_is_zero);
+    builder.wire_handler("int_force_ge_zero/i>i", handler_int_force_ge_zero);
+
+    // @arguments("i", "i", returns="i") pattern
+    builder.wire_handler("int_add/ii>i", handler_int_add);
+    builder.wire_handler("int_sub/ii>i", handler_int_sub);
+    builder.wire_handler("int_mul/ii>i", handler_int_mul);
+    builder.wire_handler("int_and/ii>i", handler_int_and);
+    builder.wire_handler("int_or/ii>i", handler_int_or);
+    builder.wire_handler("int_xor/ii>i", handler_int_xor);
+    builder.wire_handler("int_rshift/ii>i", handler_int_rshift);
+    builder.wire_handler("int_lshift/ii>i", handler_int_lshift);
+    builder.wire_handler("uint_rshift/ii>i", handler_uint_rshift);
+    builder.wire_handler("int_lt/ii>i", handler_int_lt);
+    builder.wire_handler("int_le/ii>i", handler_int_le);
+    builder.wire_handler("int_eq/ii>i", handler_int_eq);
+    builder.wire_handler("int_ne/ii>i", handler_int_ne);
+    builder.wire_handler("int_gt/ii>i", handler_int_gt);
+    builder.wire_handler("int_ge/ii>i", handler_int_ge);
+
+    // Copy operations
+    builder.wire_handler("int_copy/i>i", handler_int_copy);
+
+    // Control flow
+    builder.wire_handler("live/", handler_live);
+    builder.wire_handler("goto/L", handler_goto);
+    builder.wire_handler("goto_if_not/iL", handler_goto_if_not);
+
+    // Unsigned comparisons (blackhole.py:571-582)
+    builder.wire_handler("uint_lt/ii>i", handler_uint_lt);
+    builder.wire_handler("uint_le/ii>i", handler_uint_le);
+    builder.wire_handler("uint_gt/ii>i", handler_uint_gt);
+    builder.wire_handler("uint_ge/ii>i", handler_uint_ge);
+
+    // Float arithmetic (blackhole.py:676-718)
+    builder.wire_handler("float_neg/f>f", handler_float_neg);
+    builder.wire_handler("float_abs/f>f", handler_float_abs);
+    builder.wire_handler("float_add/ff>f", handler_float_add);
+    builder.wire_handler("float_sub/ff>f", handler_float_sub);
+    builder.wire_handler("float_mul/ff>f", handler_float_mul);
+    builder.wire_handler("float_truediv/ff>f", handler_float_truediv);
+
+    // Float comparisons → int result (blackhole.py:720-749)
+    builder.wire_handler("float_lt/ff>i", handler_float_lt);
+    builder.wire_handler("float_le/ff>i", handler_float_le);
+    builder.wire_handler("float_eq/ff>i", handler_float_eq);
+    builder.wire_handler("float_ne/ff>i", handler_float_ne);
+    builder.wire_handler("float_gt/ff>i", handler_float_gt);
+    builder.wire_handler("float_ge/ff>i", handler_float_ge);
+
+    // Ref operations (blackhole.py:584-610)
+    builder.wire_handler("ptr_eq/rr>i", handler_ptr_eq);
+    builder.wire_handler("ptr_ne/rr>i", handler_ptr_ne);
+    builder.wire_handler("instance_ptr_eq/rr>i", handler_instance_ptr_eq);
+    builder.wire_handler("instance_ptr_ne/rr>i", handler_instance_ptr_ne);
+    builder.wire_handler("ptr_iszero/r>i", handler_ptr_iszero);
+    builder.wire_handler("ptr_nonzero/r>i", handler_ptr_nonzero);
+
+    // Copy operations (ref + float)
+    builder.wire_handler("ref_copy/r>r", handler_ref_copy);
+    builder.wire_handler("float_copy/f>f", handler_float_copy);
+
+    // Conditional jumps (blackhole.py:871-920)
+    builder.wire_handler("goto_if_not_int_lt/iiL", handler_goto_if_not_int_lt);
+    builder.wire_handler("goto_if_not_int_le/iiL", handler_goto_if_not_int_le);
+    builder.wire_handler("goto_if_not_int_eq/iiL", handler_goto_if_not_int_eq);
+    builder.wire_handler("goto_if_not_int_ne/iiL", handler_goto_if_not_int_ne);
+    builder.wire_handler("goto_if_not_int_gt/iiL", handler_goto_if_not_int_gt);
+    builder.wire_handler("goto_if_not_int_ge/iiL", handler_goto_if_not_int_ge);
+    // goto_if_not_int_is_true = goto_if_not (alias, blackhole.py:913)
+    builder.wire_handler("goto_if_not_int_is_true/iL", handler_goto_if_not);
+
+    // Guard values — no-op in blackhole (blackhole.py:648-656)
+    builder.wire_handler("int_guard_value/i", handler_int_guard_value);
+    builder.wire_handler("ref_guard_value/r", handler_ref_guard_value);
+    builder.wire_handler("float_guard_value/f", handler_float_guard_value);
+
+    // Push/pop tmpreg (blackhole.py:661-679)
+    builder.wire_handler("int_push/i", handler_int_push);
+    builder.wire_handler("ref_push/r", handler_ref_push);
+    builder.wire_handler("float_push/f", handler_float_push);
+    builder.wire_handler("int_pop/>i", handler_int_pop);
+    builder.wire_handler("ref_pop/>r", handler_ref_pop);
+    builder.wire_handler("float_pop/>f", handler_float_pop);
+
+    // Record — no-op (blackhole.py:616-636)
+    builder.wire_handler("record_exact_class/ri", handler_record_exact_class);
+    builder.wire_handler("record_exact_value_r/rr", handler_record_exact_value_r);
+    builder.wire_handler("record_exact_value_i/ii", handler_record_exact_value_i);
+
+    // Cast operations (blackhole.py:800-831)
+    builder.wire_handler("cast_float_to_int/f>i", handler_cast_float_to_int);
+    builder.wire_handler("cast_int_to_float/i>f", handler_cast_int_to_float);
+
+    // int_signext (blackhole.py:566-569)
+    builder.wire_handler("int_signext/ii>i", handler_int_signext);
+
+    // Overflow ops (blackhole.py:478-497)
+    builder.wire_handler("int_add_jump_if_ovf/Lii>i", handler_int_add_jump_if_ovf);
+    builder.wire_handler("int_sub_jump_if_ovf/Lii>i", handler_int_sub_jump_if_ovf);
+    builder.wire_handler("int_mul_jump_if_ovf/Lii>i", handler_int_mul_jump_if_ovf);
+
+    // Misc simple ops
+    builder.wire_handler("assert_not_none/r", handler_assert_not_none);
+    builder.wire_handler("virtual_ref/r>r", handler_virtual_ref);
+    builder.wire_handler("virtual_ref_finish/r", handler_virtual_ref_finish);
+    builder.wire_handler("loop_header/i", handler_loop_header);
+    builder.wire_handler("ref_isconstant/r>i", handler_ref_isconstant);
+    builder.wire_handler("ref_isvirtual/r>i", handler_ref_isvirtual);
+    builder.wire_handler(
+        "goto_if_not_int_is_zero/iL",
+        handler_goto_if_not_int_is_zero,
+    );
+    builder.wire_handler("goto_if_not_ptr_iszero/rL", handler_goto_if_not_ptr_iszero);
+    builder.wire_handler(
+        "goto_if_not_ptr_nonzero/rL",
+        handler_goto_if_not_ptr_nonzero,
+    );
+    builder.wire_handler("unreachable/", handler_unreachable);
+
+    // Field operations via cpu.bh_* (blackhole.py:1432-1481)
+    builder.wire_handler("getfield_gc_i/rd>i", handler_getfield_gc_i);
+    builder.wire_handler("getfield_gc_r/rd>r", handler_getfield_gc_r);
+    builder.wire_handler("getfield_gc_f/rd>f", handler_getfield_gc_f);
+    builder.wire_handler("getfield_gc_i_pure/rd>i", handler_getfield_gc_i); // alias
+    builder.wire_handler("getfield_gc_r_pure/rd>r", handler_getfield_gc_r);
+    builder.wire_handler("getfield_gc_f_pure/rd>f", handler_getfield_gc_f);
+    builder.wire_handler("setfield_gc_i/rid", handler_setfield_gc_i);
+    builder.wire_handler("setfield_gc_r/rrd", handler_setfield_gc_r);
+    builder.wire_handler("setfield_gc_f/rfd", handler_setfield_gc_f);
+    builder.wire_handler("arraylen_gc/rd>i", handler_arraylen_gc);
+
+    // Array item operations (blackhole.py:1329-1365)
+    builder.wire_handler("getarrayitem_gc_i/rid>i", handler_getarrayitem_gc_i);
+    builder.wire_handler("getarrayitem_gc_r/rid>r", handler_getarrayitem_gc_r);
+    builder.wire_handler("getarrayitem_gc_i_pure/rid>i", handler_getarrayitem_gc_i);
+    builder.wire_handler("getarrayitem_gc_r_pure/rid>r", handler_getarrayitem_gc_r);
+    builder.wire_handler("setarrayitem_gc_i/riid", handler_setarrayitem_gc_i);
+    builder.wire_handler("setarrayitem_gc_r/rird", handler_setarrayitem_gc_r);
+
+    // Raw field operations (blackhole.py:1464-1502)
+    builder.wire_handler("getfield_raw_i/id>i", handler_getfield_raw_i);
+    builder.wire_handler("getfield_raw_f/id>f", handler_getfield_raw_f);
+    builder.wire_handler("setfield_raw_i/iid", handler_setfield_raw_i);
+    builder.wire_handler("setfield_raw_f/ifd", handler_setfield_raw_f);
+
+    // Greenfield aliases
+    builder.wire_handler("getfield_gc_i_greenfield/rd>i", handler_getfield_gc_i);
+    builder.wire_handler("getfield_gc_r_greenfield/rd>r", handler_getfield_gc_r);
+    builder.wire_handler("getfield_gc_f_greenfield/rd>f", handler_getfield_gc_f);
+
+    // New operations (blackhole.py:1301-1327)
+    builder.wire_handler("new/d>r", handler_new);
+    builder.wire_handler("new_with_vtable/d>r", handler_new_with_vtable);
+    builder.wire_handler("new_array/id>r", handler_new_array);
+    builder.wire_handler("new_array_clear/id>r", handler_new_array_clear);
+
+    // String operations (blackhole.py:1200-1283)
+    builder.wire_handler("strlen/r>i", handler_strlen);
+    builder.wire_handler("strgetitem/ri>i", handler_strgetitem);
+    builder.wire_handler("strsetitem/rii", handler_strsetitem);
+    builder.wire_handler("newstr/i>r", handler_newstr);
+    builder.wire_handler("unicodelen/r>i", handler_unicodelen);
+    builder.wire_handler("unicodegetitem/ri>i", handler_unicodegetitem);
+    builder.wire_handler("unicodesetitem/rii", handler_unicodesetitem);
+    builder.wire_handler("newunicode/i>r", handler_newunicode);
+
+    // Exception handling (blackhole.py:969-975)
+    builder.wire_handler("catch_exception/L", handler_catch_exception);
+
+    // Interior field operations (blackhole.py:1411-1429)
+    // _r/_f deferred until Backend gains those variants.
+    builder.wire_handler("getinteriorfield_gc_i/rid>i", handler_getinteriorfield_gc_i);
+    builder.wire_handler("setinteriorfield_gc_i/riid", handler_setinteriorfield_gc_i);
+
+    // Residual call operations (blackhole.py:1224-1255)
+    builder.wire_handler("residual_call_irf_i/iIRFd>i", handler_residual_call_irf_i);
+    builder.wire_handler("residual_call_irf_r/iIRFd>r", handler_residual_call_irf_r);
+    builder.wire_handler("residual_call_irf_f/iIRFd>f", handler_residual_call_irf_f);
+    builder.wire_handler("residual_call_irf_v/iIRFd", handler_residual_call_irf_v);
+    builder.wire_handler("residual_call_ir_i/iIRd>i", handler_residual_call_ir_i);
+    builder.wire_handler("residual_call_ir_r/iIRd>r", handler_residual_call_ir_r);
+    builder.wire_handler("residual_call_ir_v/iIRd", handler_residual_call_ir_v);
+    builder.wire_handler("residual_call_r_i/iRd>i", handler_residual_call_r_i);
+    builder.wire_handler("residual_call_r_r/iRd>r", handler_residual_call_r_r);
+    builder.wire_handler("residual_call_r_v/iRd", handler_residual_call_r_v);
+
+    // Misc no-ops (blackhole.py:1017-1049)
+    builder.wire_handler("jit_debug/riiii", handler_jit_debug);
+    builder.wire_handler("jit_enter_portal_frame/i", handler_jit_enter_portal_frame);
+    builder.wire_handler("jit_leave_portal_frame/", handler_jit_leave_portal_frame);
+
+    // Float conditional jumps (blackhole.py:751-798)
+    builder.wire_handler("goto_if_not_float_lt/ffL", handler_goto_if_not_float_lt);
+    builder.wire_handler("goto_if_not_float_le/ffL", handler_goto_if_not_float_le);
+    builder.wire_handler("goto_if_not_float_eq/ffL", handler_goto_if_not_float_eq);
+    builder.wire_handler("goto_if_not_float_ne/ffL", handler_goto_if_not_float_ne);
+    builder.wire_handler("goto_if_not_float_gt/ffL", handler_goto_if_not_float_gt);
+    builder.wire_handler("goto_if_not_float_ge/ffL", handler_goto_if_not_float_ge);
+    builder.wire_handler("goto_if_not_ptr_eq/rrL", handler_goto_if_not_ptr_eq);
+    builder.wire_handler("goto_if_not_ptr_ne/rrL", handler_goto_if_not_ptr_ne);
+
+    // Assert/isconstant (no-ops in blackhole)
+    builder.wire_handler("int_assert_green/i", handler_int_assert_green);
+    builder.wire_handler("ref_assert_green/r", handler_ref_assert_green);
+    builder.wire_handler("float_assert_green/f", handler_float_assert_green);
+    builder.wire_handler("int_isconstant/i>i", handler_int_isconstant);
+    builder.wire_handler("float_isconstant/f>i", handler_float_isconstant);
+
+    // Misc integer ops
+    builder.wire_handler("uint_mul_high/ii>i", handler_uint_mul_high);
+    builder.wire_handler("int_between/iii>i", handler_int_between);
+
+    // String hashing (stubs)
+    builder.wire_handler("strhash/r>i", handler_strhash);
+    builder.wire_handler("unicodehash/r>i", handler_unicodehash);
+
+    // Float <-> longlong / singlefloat conversions
+    builder.wire_handler(
+        "convert_float_bytes_to_longlong/f>i",
+        handler_convert_float_bytes_to_longlong,
+    );
+    builder.wire_handler(
+        "convert_longlong_bytes_to_float/i>f",
+        handler_convert_longlong_bytes_to_float,
+    );
+    builder.wire_handler(
+        "cast_float_to_singlefloat/f>i",
+        handler_cast_float_to_singlefloat,
+    );
+    builder.wire_handler(
+        "cast_singlefloat_to_float/i>f",
+        handler_cast_singlefloat_to_float,
+    );
+
+    // Misc
+    builder.wire_handler(
+        "hint_force_virtualizable/rd",
+        handler_hint_force_virtualizable,
+    );
+    builder.wire_handler("guard_class/ri", handler_guard_class);
+    builder.wire_handler(
+        "record_quasiimmut_field/rd",
+        handler_record_quasiimmut_field,
+    );
+    builder.wire_handler(
+        "jit_force_quasi_immutable/rd",
+        handler_jit_force_quasi_immutable,
+    );
+    builder.wire_handler(
+        "record_known_result_i_ir_v/iiIRd",
+        handler_record_known_result_i_ir_v,
+    );
+    builder.wire_handler(
+        "record_known_result_r_ir_v/riIRd",
+        handler_record_known_result_r_ir_v,
+    );
+    builder.wire_handler("str_guard_value/rid>r", handler_str_guard_value);
+    builder.wire_handler("rvmprof_code/ii", handler_rvmprof_code);
+    builder.wire_handler("copystrcontent/rrii i", handler_copystrcontent);
+    builder.wire_handler("copyunicodecontent/rriii", handler_copyunicodecontent);
+    builder.wire_handler("current_trace_length/>i", handler_current_trace_length);
+
+    // Exception ops (blackhole.py:976-1009)
+    builder.wire_handler("raise/r", handler_raise);
+    builder.wire_handler("reraise/", handler_reraise);
+    builder.wire_handler("last_exception/>i", handler_last_exception);
+    builder.wire_handler("last_exc_value/>r", handler_last_exc_value);
+    builder.wire_handler(
+        "goto_if_exception_mismatch/iL",
+        handler_goto_if_exception_mismatch,
+    );
+    builder.wire_handler("debug_fatalerror/r", handler_debug_fatalerror);
+
+    // Cast ptr<->int (blackhole.py:603-610)
+    builder.wire_handler("cast_ptr_to_int/r>i", handler_cast_ptr_to_int);
+    builder.wire_handler("cast_int_to_ptr/i>r", handler_cast_int_to_ptr);
+
+    // Vable field operations
+    builder.wire_handler("getfield_vable_i/rd>i", handler_getfield_vable_i);
+    builder.wire_handler("getfield_vable_r/rd>r", handler_getfield_vable_r);
+    builder.wire_handler("getfield_vable_f/rd>f", handler_getfield_vable_f);
+    builder.wire_handler("setfield_vable_i/rid", handler_setfield_vable_i);
+    builder.wire_handler("setfield_vable_r/rrd", handler_setfield_vable_r);
+    builder.wire_handler("setfield_vable_f/rfd", handler_setfield_vable_f);
+    builder.wire_handler("getarrayitem_vable_i/ridd>i", handler_getarrayitem_vable_i);
+    builder.wire_handler("getarrayitem_vable_r/ridd>r", handler_getarrayitem_vable_r);
+    builder.wire_handler("setarrayitem_vable_i/riidd", handler_setarrayitem_vable_i);
+    builder.wire_handler("setarrayitem_vable_r/rirdd", handler_setarrayitem_vable_r);
+    builder.wire_handler("arraylen_vable/rdd>i", handler_arraylen_vable);
+    builder.wire_handler("getarrayitem_raw_i/iid>i", handler_getarrayitem_raw_i);
+    builder.wire_handler("setarrayitem_raw_i/iiid", handler_setarrayitem_raw_i);
+    builder.wire_handler("conditional_call_ir_v/iiIRd", handler_conditional_call_ir_v);
+    builder.wire_handler(
+        "conditional_call_value_ir_i/iiIRd>i",
+        handler_conditional_call_value_ir_i,
+    );
+    builder.wire_handler(
+        "conditional_call_value_ir_r/riIRd>r",
+        handler_conditional_call_value_ir_r,
+    );
+    builder.wire_handler("getlistitem_gc_i/ridd>i", handler_getlistitem_gc_i);
+    builder.wire_handler("getlistitem_gc_r/ridd>r", handler_getlistitem_gc_r);
+    builder.wire_handler("setlistitem_gc_i/riidd", handler_setlistitem_gc_i);
+    builder.wire_handler("setlistitem_gc_r/rirdd", handler_setlistitem_gc_r);
+    builder.wire_handler("switch/id", handler_switch);
+    builder.wire_handler("getlistitem_gc_f/ridd>f", handler_getlistitem_gc_f);
+    builder.wire_handler("setlistitem_gc_f/rifdd", handler_setlistitem_gc_f);
+    builder.wire_handler("check_neg_index/rid>i", handler_check_neg_index);
+    builder.wire_handler(
+        "check_resizable_neg_index/rid>i",
+        handler_check_resizable_neg_index,
+    );
+
+    // Float/raw array ops
+    builder.wire_handler("getarrayitem_gc_f/rid>f", handler_getarrayitem_gc_f);
+    builder.wire_handler("getarrayitem_gc_f_pure/rid>f", handler_getarrayitem_gc_f);
+    builder.wire_handler("setarrayitem_gc_f/rifd", handler_setarrayitem_gc_f);
+    builder.wire_handler("getarrayitem_raw_f/iid>f", handler_getarrayitem_raw_f);
+    builder.wire_handler("setarrayitem_raw_f/iifd", handler_setarrayitem_raw_f);
+    builder.wire_handler("getfield_raw_r/id>r", handler_getfield_raw_r);
+    builder.wire_handler("getinteriorfield_gc_f/rid>f", handler_getinteriorfield_gc_f);
+    builder.wire_handler("getinteriorfield_gc_r/rid>r", handler_getinteriorfield_gc_r);
+    builder.wire_handler("setinteriorfield_gc_f/rifd", handler_setinteriorfield_gc_f);
+    builder.wire_handler("setinteriorfield_gc_r/rird", handler_setinteriorfield_gc_r);
+    builder.wire_handler("gc_load_indexed_i/riiiii>i", handler_gc_load_indexed_i);
+    builder.wire_handler("gc_load_indexed_f/riiiii>f", handler_gc_load_indexed_f);
+    builder.wire_handler("gc_store_indexed_i/riiiid", handler_gc_store_indexed_i);
+    builder.wire_handler("gc_store_indexed_f/rifiid", handler_gc_store_indexed_f);
+    builder.wire_handler("raw_store_i/iiid", handler_raw_store_i);
+    builder.wire_handler("raw_store_f/iifd", handler_raw_store_f);
+    builder.wire_handler("raw_load_i/iid>i", handler_raw_load_i);
+    builder.wire_handler("raw_load_f/iid>f", handler_raw_load_f);
+    builder.wire_handler("newlist/idddd>r", handler_newlist);
+    builder.wire_handler("newlist_clear/idddd>r", handler_newlist_clear);
+    builder.wire_handler("newlist_hint/idddd>r", handler_newlist_hint);
+    builder.wire_handler("getarrayitem_vable_f/ridd>f", handler_getarrayitem_vable_f);
+    builder.wire_handler("setarrayitem_vable_f/rifdd", handler_setarrayitem_vable_f);
+
+    // Inline call (stub — needs frame-chain)
+    builder.wire_handler("inline_call_irf_i/jIRF>i", handler_inline_call_irf_i);
+    builder.wire_handler("inline_call_irf_r/jIRF>r", handler_inline_call_irf_r);
+    builder.wire_handler("inline_call_irf_f/jIRF>f", handler_inline_call_irf_f);
+    builder.wire_handler("inline_call_irf_v/jIRF", handler_inline_call_irf_v);
+    builder.wire_handler("inline_call_ir_i/jIR>i", handler_inline_call_ir_i);
+    builder.wire_handler("inline_call_ir_r/jIR>r", handler_inline_call_ir_r);
+    builder.wire_handler("inline_call_ir_v/jIR", handler_inline_call_ir_v);
+    builder.wire_handler("inline_call_r_i/jR>i", handler_inline_call_r_i);
+    builder.wire_handler("inline_call_r_r/jR>r", handler_inline_call_r_r);
+    builder.wire_handler("inline_call_r_v/jR", handler_inline_call_r_v);
+
+    // Recursive call (stub — needs portal runner)
+    builder.wire_handler("recursive_call_i/cIRFIRF>i", handler_recursive_call_i);
+    builder.wire_handler("recursive_call_r/cIRFIRF>r", handler_recursive_call_r);
+    builder.wire_handler("recursive_call_f/cIRFIRF>f", handler_recursive_call_f);
+    builder.wire_handler("recursive_call_v/cIRFIRF", handler_recursive_call_v);
+
+    // Returns
+    builder.wire_handler("int_return/i", handler_int_return);
+    builder.wire_handler("ref_return/r", handler_ref_return);
+    builder.wire_handler("float_return/f", handler_float_return);
+    builder.wire_handler("void_return/", handler_void_return);
+}
+
+// ── goto_if_not_float (blackhole.py:751-798) ────────────────────────
+macro_rules! bhhandler_goto_if_not_ff {
+    ($name:ident, $cmp:expr) => {
+        fn $name(
+            bh: &mut BlackholeInterpreter,
+            code: &[u8],
+            position: usize,
+        ) -> Result<usize, DispatchError> {
+            let a = f64::from_bits(bh.registers_f[code[position] as usize] as u64);
+            let b = f64::from_bits(bh.registers_f[code[position + 1] as usize] as u64);
+            let target = (code[position + 2] as usize) | ((code[position + 3] as usize) << 8);
+            let pc = position + 4;
+            if $cmp(a, b) { Ok(pc) } else { Ok(target) }
+        }
+    };
+}
+bhhandler_goto_if_not_ff!(handler_goto_if_not_float_lt, |a: f64, b: f64| a < b);
+bhhandler_goto_if_not_ff!(handler_goto_if_not_float_le, |a: f64, b: f64| a <= b);
+bhhandler_goto_if_not_ff!(handler_goto_if_not_float_eq, |a: f64, b: f64| a == b);
+bhhandler_goto_if_not_ff!(handler_goto_if_not_float_ne, |a: f64, b: f64| a != b);
+bhhandler_goto_if_not_ff!(handler_goto_if_not_float_gt, |a: f64, b: f64| a > b);
+bhhandler_goto_if_not_ff!(handler_goto_if_not_float_ge, |a: f64, b: f64| a >= b);
+
+// goto_if_not_ptr_eq/ne (reuse ii macro with ref registers)
+fn handler_goto_if_not_ptr_eq(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let a = bh.registers_r[code[position] as usize];
+    let b = bh.registers_r[code[position + 1] as usize];
+    let target = (code[position + 2] as usize) | ((code[position + 3] as usize) << 8);
+    if a == b { Ok(position + 4) } else { Ok(target) }
+}
+fn handler_goto_if_not_ptr_ne(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let a = bh.registers_r[code[position] as usize];
+    let b = bh.registers_r[code[position + 1] as usize];
+    let target = (code[position + 2] as usize) | ((code[position + 3] as usize) << 8);
+    if a != b { Ok(position + 4) } else { Ok(target) }
+}
+
+// assert_green / isconstant — no-ops
+fn handler_int_assert_green(
+    _bh: &mut BlackholeInterpreter,
+    _code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    Ok(p + 1)
+}
+fn handler_ref_assert_green(
+    _bh: &mut BlackholeInterpreter,
+    _code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    Ok(p + 1)
+}
+fn handler_float_assert_green(
+    _bh: &mut BlackholeInterpreter,
+    _code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    Ok(p + 1)
+}
+fn handler_int_isconstant(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    bh.registers_i[code[p + 1] as usize] = 0;
+    Ok(p + 2)
+}
+fn handler_float_isconstant(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    bh.registers_i[code[p + 1] as usize] = 0;
+    Ok(p + 2)
+}
+
+// misc
+fn handler_uint_mul_high(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let a = bh.registers_i[code[p] as usize] as u64;
+    let b = bh.registers_i[code[p + 1] as usize] as u64;
+    bh.registers_i[code[p + 2] as usize] = ((a as u128 * b as u128) >> 64) as i64;
+    Ok(p + 3)
+}
+fn handler_int_between(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let a = bh.registers_i[code[p] as usize];
+    let b = bh.registers_i[code[p + 1] as usize];
+    let c = bh.registers_i[code[p + 2] as usize];
+    bh.registers_i[code[p + 3] as usize] = (a <= b && b < c) as i64;
+    Ok(p + 4)
+}
+fn handler_strhash(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    bh.registers_i[code[p + 1] as usize] = 0;
+    Ok(p + 2)
+}
+fn handler_unicodehash(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    bh.registers_i[code[p + 1] as usize] = 0;
+    Ok(p + 2)
+}
+fn handler_convert_float_bytes_to_longlong(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    bh.registers_i[code[p + 1] as usize] = bh.registers_f[code[p] as usize];
+    Ok(p + 2)
+}
+fn handler_convert_longlong_bytes_to_float(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    bh.registers_f[code[p + 1] as usize] = bh.registers_i[code[p] as usize];
+    Ok(p + 2)
+}
+fn handler_cast_float_to_singlefloat(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let f = f64::from_bits(bh.registers_f[code[p] as usize] as u64);
+    bh.registers_i[code[p + 1] as usize] = (f as f32).to_bits() as i64;
+    Ok(p + 2)
+}
+fn handler_cast_singlefloat_to_float(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let f = f32::from_bits(bh.registers_i[code[p] as usize] as u32) as f64;
+    bh.registers_f[code[p + 1] as usize] = f.to_bits() as i64;
+    Ok(p + 2)
+}
+fn handler_hint_force_virtualizable(
+    _bh: &mut BlackholeInterpreter,
+    _code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    Ok(p + 3)
+}
+fn handler_guard_class(
+    _bh: &mut BlackholeInterpreter,
+    _code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    Ok(p + 2)
+}
+fn handler_record_quasiimmut_field(
+    _bh: &mut BlackholeInterpreter,
+    _code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    Ok(p + 3)
+}
+fn handler_jit_force_quasi_immutable(
+    _bh: &mut BlackholeInterpreter,
+    _code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    Ok(p + 3)
+}
+fn handler_record_known_result_i_ir_v(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let p = position + 2;
+    let (_, p) = read_list_i(bh, code, p);
+    let (_, p) = read_list_r(bh, code, p);
+    let (_, p) = read_descr_offset(bh, code, p);
+    Ok(p)
+}
+fn handler_record_known_result_r_ir_v(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let p = position + 2;
+    let (_, p) = read_list_i(bh, code, p);
+    let (_, p) = read_list_r(bh, code, p);
+    let (_, p) = read_descr_offset(bh, code, p);
+    Ok(p)
+}
+fn handler_str_guard_value(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let r = bh.registers_r[code[position] as usize];
+    let (_, p) = read_descr_offset(bh, code, position + 2);
+    bh.registers_r[code[p] as usize] = r;
+    Ok(p + 1)
+}
+fn handler_rvmprof_code(
+    _bh: &mut BlackholeInterpreter,
+    _code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    Ok(p + 2)
+}
+fn handler_copystrcontent(
+    _bh: &mut BlackholeInterpreter,
+    _code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    Ok(p + 5)
+}
+fn handler_copyunicodecontent(
+    _bh: &mut BlackholeInterpreter,
+    _code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    Ok(p + 5)
+}
+fn handler_raise(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    Err(DispatchError::RaiseException(
+        bh.registers_r[code[p] as usize],
+    ))
+}
+fn handler_reraise(
+    bh: &mut BlackholeInterpreter,
+    _code: &[u8],
+    _p: usize,
+) -> Result<usize, DispatchError> {
+    Err(DispatchError::RaiseException(bh.exception_last_value))
+}
+fn handler_last_exception(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    bh.registers_i[code[p] as usize] = bh.exception_last_value;
+    Ok(p + 1)
+}
+fn handler_last_exc_value(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    bh.registers_r[code[p] as usize] = bh.exception_last_value;
+    Ok(p + 1)
+}
+fn handler_goto_if_exception_mismatch(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let _vtable = bh.registers_i[code[p] as usize];
+    let target = (code[p + 1] as usize) | ((code[p + 2] as usize) << 8);
+    Ok(p + 3) // stub: always match
+}
+fn handler_debug_fatalerror(
+    _bh: &mut BlackholeInterpreter,
+    _code: &[u8],
+    _p: usize,
+) -> Result<usize, DispatchError> {
+    panic!("bhimpl_debug_fatalerror");
+}
+fn handler_cast_ptr_to_int(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    bh.registers_i[code[p + 1] as usize] = bh.registers_r[code[p] as usize];
+    Ok(p + 2)
+}
+fn handler_cast_int_to_ptr(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    bh.registers_r[code[p + 1] as usize] = bh.registers_i[code[p] as usize];
+    Ok(p + 2)
+}
+fn handler_current_trace_length(
+    _bh: &mut BlackholeInterpreter,
+    _code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    Ok(p + 1)
+}
+
+// ── vable field operations — delegates to cpu.bh_getfield_gc + clear_vable_token ──
+// For now, stubs that skip the correct number of bytes.
+// Full implementation needs VirtualizableInfo::clear_vable_token.
+
+fn handler_getfield_vable_i(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let struct_ptr = bh.registers_r[code[p] as usize];
+    let (offset, p) = read_descr_offset(bh, code, p + 1);
+    let cpu = bh.cpu.expect("cpu not set");
+    bh.registers_i[code[p] as usize] = cpu.bh_getfield_gc_i(struct_ptr, offset);
+    Ok(p + 1)
+}
+fn handler_getfield_vable_r(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let struct_ptr = bh.registers_r[code[p] as usize];
+    let (offset, p) = read_descr_offset(bh, code, p + 1);
+    let cpu = bh.cpu.expect("cpu not set");
+    bh.registers_r[code[p] as usize] = cpu.bh_getfield_gc_r(struct_ptr, offset).0 as i64;
+    Ok(p + 1)
+}
+fn handler_getfield_vable_f(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let struct_ptr = bh.registers_r[code[p] as usize];
+    let (offset, p) = read_descr_offset(bh, code, p + 1);
+    let cpu = bh.cpu.expect("cpu not set");
+    bh.registers_f[code[p] as usize] = cpu.bh_getfield_gc_f(struct_ptr, offset).to_bits() as i64;
+    Ok(p + 1)
+}
+fn handler_setfield_vable_i(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let struct_ptr = bh.registers_r[code[p] as usize];
+    let value = bh.registers_i[code[p + 1] as usize];
+    let (offset, p) = read_descr_offset(bh, code, p + 2);
+    let cpu = bh.cpu.expect("cpu not set");
+    cpu.bh_setfield_gc_i(struct_ptr, offset, value);
+    Ok(p)
+}
+fn handler_setfield_vable_r(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let struct_ptr = bh.registers_r[code[p] as usize];
+    let value = bh.registers_r[code[p + 1] as usize];
+    let (offset, p) = read_descr_offset(bh, code, p + 2);
+    let cpu = bh.cpu.expect("cpu not set");
+    cpu.bh_setfield_gc_r(struct_ptr, offset, majit_ir::GcRef(value as usize));
+    Ok(p)
+}
+fn handler_setfield_vable_f(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let struct_ptr = bh.registers_r[code[p] as usize];
+    let value = f64::from_bits(bh.registers_f[code[p + 1] as usize] as u64);
+    let (offset, p) = read_descr_offset(bh, code, p + 2);
+    let cpu = bh.cpu.expect("cpu not set");
+    cpu.bh_setfield_gc_f(struct_ptr, offset, value);
+    Ok(p)
+}
+
+// ── vable array operations (blackhole.py:1374-1409) ─────────────────
+// @arguments("cpu", "r", "i", "d", "d", returns="X")
+// Uses two descriptors: field descr + array descr.
+fn handler_getarrayitem_vable_i(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let vable = bh.registers_r[code[p] as usize];
+    let index = bh.registers_i[code[p + 1] as usize];
+    let (field_offset, p) = read_descr_offset(bh, code, p + 2);
+    let (array_item_size, p) = read_descr_offset(bh, code, p);
+    let cpu = bh.cpu.expect("cpu not set");
+    let array = cpu.bh_getfield_gc_r(vable, field_offset).0 as i64;
+    bh.registers_i[code[p] as usize] = cpu.bh_getarrayitem_gc_i(array, index, array_item_size);
+    Ok(p + 1)
+}
+fn handler_getarrayitem_vable_r(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let vable = bh.registers_r[code[p] as usize];
+    let index = bh.registers_i[code[p + 1] as usize];
+    let (field_offset, p) = read_descr_offset(bh, code, p + 2);
+    let (array_item_size, p) = read_descr_offset(bh, code, p);
+    let cpu = bh.cpu.expect("cpu not set");
+    let array = cpu.bh_getfield_gc_r(vable, field_offset).0 as i64;
+    bh.registers_r[code[p] as usize] =
+        cpu.bh_getarrayitem_gc_r(array, index, array_item_size).0 as i64;
+    Ok(p + 1)
+}
+fn handler_setarrayitem_vable_i(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let vable = bh.registers_r[code[p] as usize];
+    let index = bh.registers_i[code[p + 1] as usize];
+    let value = bh.registers_i[code[p + 2] as usize];
+    let (field_offset, p) = read_descr_offset(bh, code, p + 3);
+    let (array_item_size, p) = read_descr_offset(bh, code, p);
+    let cpu = bh.cpu.expect("cpu not set");
+    let array = cpu.bh_getfield_gc_r(vable, field_offset).0 as i64;
+    cpu.bh_setarrayitem_gc_i(array, index, array_item_size, value);
+    Ok(p)
+}
+fn handler_setarrayitem_vable_r(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let vable = bh.registers_r[code[p] as usize];
+    let index = bh.registers_i[code[p + 1] as usize];
+    let value = bh.registers_r[code[p + 2] as usize];
+    let (field_offset, p) = read_descr_offset(bh, code, p + 3);
+    let (array_item_size, p) = read_descr_offset(bh, code, p);
+    let cpu = bh.cpu.expect("cpu not set");
+    let array = cpu.bh_getfield_gc_r(vable, field_offset).0 as i64;
+    cpu.bh_setarrayitem_gc_r(
+        array,
+        index,
+        array_item_size,
+        majit_ir::GcRef(value as usize),
+    );
+    Ok(p)
+}
+fn handler_arraylen_vable(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let vable = bh.registers_r[code[p] as usize];
+    let (field_offset, p) = read_descr_offset(bh, code, p + 1);
+    let (array_len_offset, p) = read_descr_offset(bh, code, p);
+    let cpu = bh.cpu.expect("cpu not set");
+    let array = cpu.bh_getfield_gc_r(vable, field_offset).0 as i64;
+    bh.registers_i[code[p] as usize] = cpu.bh_arraylen_gc(array, array_len_offset);
+    Ok(p + 1)
+}
+
+// ── getarrayitem_raw / setarrayitem_raw (blackhole.py:1343-1365) ────
+fn handler_getarrayitem_raw_i(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let array = bh.registers_i[code[p] as usize]; // raw ptr as int
+    let index = bh.registers_i[code[p + 1] as usize];
+    let (item_size, p) = read_descr_offset(bh, code, p + 2);
+    let cpu = bh.cpu.expect("cpu not set");
+    bh.registers_i[code[p] as usize] = cpu.bh_getarrayitem_gc_i(array, index, item_size);
+    Ok(p + 1)
+}
+fn handler_setarrayitem_raw_i(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let array = bh.registers_i[code[p] as usize];
+    let index = bh.registers_i[code[p + 1] as usize];
+    let value = bh.registers_i[code[p + 2] as usize];
+    let (item_size, p) = read_descr_offset(bh, code, p + 3);
+    let cpu = bh.cpu.expect("cpu not set");
+    cpu.bh_setarrayitem_gc_i(array, index, item_size, value);
+    Ok(p)
+}
+
+// ── conditional call (blackhole.py:1257-1276) ───────────────────────
+fn handler_conditional_call_ir_v(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let condition = bh.registers_i[code[p] as usize];
+    let func = bh.registers_i[code[p + 1] as usize];
+    let (ai, p) = read_list_i(bh, code, p + 2);
+    let (ar, p) = read_list_r(bh, code, p);
+    let (_, p) = read_descr_offset(bh, code, p);
+    if condition != 0 {
+        let all = flatten_args(&ai, &ar, &[]);
+        bh.cpu.expect("cpu").bh_call_v(func, &all);
+    }
+    Ok(p)
+}
+fn handler_conditional_call_value_ir_i(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let mut value = bh.registers_i[code[p] as usize];
+    let func = bh.registers_i[code[p + 1] as usize];
+    let (ai, p) = read_list_i(bh, code, p + 2);
+    let (ar, p) = read_list_r(bh, code, p);
+    let (_, p) = read_descr_offset(bh, code, p);
+    if value == 0 {
+        let all = flatten_args(&ai, &ar, &[]);
+        value = bh.cpu.expect("cpu").bh_call_i(func, &all);
+    }
+    bh.registers_i[code[p] as usize] = value;
+    Ok(p + 1)
+}
+fn handler_conditional_call_value_ir_r(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let mut value = bh.registers_r[code[p] as usize];
+    let func = bh.registers_i[code[p + 1] as usize];
+    let (ai, p) = read_list_i(bh, code, p + 2);
+    let (ar, p) = read_list_r(bh, code, p);
+    let (_, p) = read_descr_offset(bh, code, p);
+    if value == 0 {
+        let all = flatten_args(&ai, &ar, &[]);
+        value = bh.cpu.expect("cpu").bh_call_r(func, &all).0 as i64;
+    }
+    bh.registers_r[code[p] as usize] = value;
+    Ok(p + 1)
+}
+
+// ── list ops (blackhole.py:1195-1219) — compound: getfield_gc_r + getarrayitem ──
+fn handler_getlistitem_gc_i(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let lst = bh.registers_r[code[p] as usize];
+    let index = bh.registers_i[code[p + 1] as usize];
+    let (items_offset, p) = read_descr_offset(bh, code, p + 2);
+    let (array_item_size, p) = read_descr_offset(bh, code, p);
+    let cpu = bh.cpu.expect("cpu not set");
+    let items = cpu.bh_getfield_gc_r(lst, items_offset).0 as i64;
+    bh.registers_i[code[p] as usize] = cpu.bh_getarrayitem_gc_i(items, index, array_item_size);
+    Ok(p + 1)
+}
+fn handler_getlistitem_gc_r(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let lst = bh.registers_r[code[p] as usize];
+    let index = bh.registers_i[code[p + 1] as usize];
+    let (items_offset, p) = read_descr_offset(bh, code, p + 2);
+    let (array_item_size, p) = read_descr_offset(bh, code, p);
+    let cpu = bh.cpu.expect("cpu not set");
+    let items = cpu.bh_getfield_gc_r(lst, items_offset).0 as i64;
+    bh.registers_r[code[p] as usize] =
+        cpu.bh_getarrayitem_gc_r(items, index, array_item_size).0 as i64;
+    Ok(p + 1)
+}
+fn handler_setlistitem_gc_i(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let lst = bh.registers_r[code[p] as usize];
+    let index = bh.registers_i[code[p + 1] as usize];
+    let value = bh.registers_i[code[p + 2] as usize];
+    let (items_offset, p) = read_descr_offset(bh, code, p + 3);
+    let (array_item_size, p) = read_descr_offset(bh, code, p);
+    let cpu = bh.cpu.expect("cpu not set");
+    let items = cpu.bh_getfield_gc_r(lst, items_offset).0 as i64;
+    cpu.bh_setarrayitem_gc_i(items, index, array_item_size, value);
+    Ok(p)
+}
+fn handler_setlistitem_gc_r(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let lst = bh.registers_r[code[p] as usize];
+    let index = bh.registers_i[code[p + 1] as usize];
+    let value = bh.registers_r[code[p + 2] as usize];
+    let (items_offset, p) = read_descr_offset(bh, code, p + 3);
+    let (array_item_size, p) = read_descr_offset(bh, code, p);
+    let cpu = bh.cpu.expect("cpu not set");
+    let items = cpu.bh_getfield_gc_r(lst, items_offset).0 as i64;
+    cpu.bh_setarrayitem_gc_r(
+        items,
+        index,
+        array_item_size,
+        majit_ir::GcRef(value as usize),
+    );
+    Ok(p)
+}
+
+// ── switch (blackhole.py:954-960) ───────────────────────────────────
+fn handler_switch(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let _switchvalue = bh.registers_i[code[p] as usize];
+    let (_, p) = read_descr_offset(bh, code, p + 1);
+    // stub: fall through (RPython looks up in SwitchDictDescr)
+    Ok(p)
+}
+
+// ── check_neg_index / check_resizable_neg_index (blackhole.py:1148-1158) ─
+fn handler_check_neg_index(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let array = bh.registers_r[code[p] as usize];
+    let mut index = bh.registers_i[code[p + 1] as usize];
+    let (len_offset, p) = read_descr_offset(bh, code, p + 2);
+    if index < 0 {
+        let cpu = bh.cpu.expect("cpu not set");
+        index += cpu.bh_arraylen_gc(array, len_offset);
+    }
+    bh.registers_i[code[p] as usize] = index;
+    Ok(p + 1)
+}
+fn handler_check_resizable_neg_index(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let lst = bh.registers_r[code[p] as usize];
+    let mut index = bh.registers_i[code[p + 1] as usize];
+    let (len_descr, p) = read_descr_offset(bh, code, p + 2);
+    if index < 0 {
+        let cpu = bh.cpu.expect("cpu not set");
+        index += cpu.bh_getfield_gc_i(lst, len_descr);
+    }
+    bh.registers_i[code[p] as usize] = index;
+    Ok(p + 1)
+}
+
+// ── getarrayitem_gc_f / setarrayitem_gc_f ───────────────────────────
+fn handler_getarrayitem_gc_f(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let array = bh.registers_r[code[p] as usize];
+    let index = bh.registers_i[code[p + 1] as usize];
+    let (item_size, p) = read_descr_offset(bh, code, p + 2);
+    let cpu = bh.cpu.expect("cpu not set");
+    // TODO: bh_getarrayitem_gc_f not in Backend trait yet; stub
+    let _ = (cpu, array, index, item_size);
+    bh.registers_f[code[p] as usize] = 0;
+    Ok(p + 1)
+}
+fn handler_setarrayitem_gc_f(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let _array = bh.registers_r[code[p] as usize];
+    let _index = bh.registers_i[code[p + 1] as usize];
+    let _value = bh.registers_f[code[p + 2] as usize];
+    let (_item_size, p) = read_descr_offset(bh, code, p + 3);
+    Ok(p)
+}
+// getarrayitem_raw_f / setarrayitem_raw_f
+fn handler_getarrayitem_raw_f(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let _array = bh.registers_i[code[p] as usize];
+    let _index = bh.registers_i[code[p + 1] as usize];
+    let (_, p) = read_descr_offset(bh, code, p + 2);
+    bh.registers_f[code[p] as usize] = 0;
+    Ok(p + 1)
+}
+fn handler_setarrayitem_raw_f(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let _array = bh.registers_i[code[p] as usize];
+    let _index = bh.registers_i[code[p + 1] as usize];
+    let _value = bh.registers_f[code[p + 2] as usize];
+    let (_, p) = read_descr_offset(bh, code, p + 3);
+    Ok(p)
+}
+// getfield_raw_r (pure only, blackhole.py:1467-1469)
+fn handler_getfield_raw_r(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let struct_ptr = bh.registers_i[code[p] as usize];
+    let (offset, p) = read_descr_offset(bh, code, p + 1);
+    let cpu = bh.cpu.expect("cpu not set");
+    bh.registers_r[code[p] as usize] = cpu.bh_getfield_raw_r(struct_ptr, offset).0 as i64;
+    Ok(p + 1)
+}
+// getinteriorfield_gc_f / setinteriorfield_gc_f / setinteriorfield_gc_r
+fn handler_getinteriorfield_gc_f(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let _array = bh.registers_r[code[p] as usize];
+    let _index = bh.registers_i[code[p + 1] as usize];
+    let (_, p) = read_descr_offset(bh, code, p + 2);
+    bh.registers_f[code[p] as usize] = 0; // stub
+    Ok(p + 1)
+}
+fn handler_getinteriorfield_gc_r(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let _array = bh.registers_r[code[p] as usize];
+    let _index = bh.registers_i[code[p + 1] as usize];
+    let (_, p) = read_descr_offset(bh, code, p + 2);
+    bh.registers_r[code[p] as usize] = 0; // stub
+    Ok(p + 1)
+}
+fn handler_setinteriorfield_gc_f(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let _array = bh.registers_r[code[p] as usize];
+    let _index = bh.registers_i[code[p + 1] as usize];
+    let _value = bh.registers_f[code[p + 2] as usize];
+    let (_, p) = read_descr_offset(bh, code, p + 3);
+    Ok(p)
+}
+fn handler_setinteriorfield_gc_r(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let _array = bh.registers_r[code[p] as usize];
+    let _index = bh.registers_i[code[p + 1] as usize];
+    let _value = bh.registers_r[code[p + 2] as usize];
+    let (_, p) = read_descr_offset(bh, code, p + 3);
+    Ok(p)
+}
+// gc_load_indexed_i/f, gc_store_indexed_i/f (blackhole.py:1518-1540)
+fn handler_gc_load_indexed_i(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    // @arguments("cpu", "r", "i", "i", "i", "i", returns="i") — 1r + 4i + result
+    let _addr = bh.registers_r[code[p] as usize];
+    bh.registers_i[code[p + 5] as usize] = 0; // stub
+    Ok(p + 6)
+}
+fn handler_gc_load_indexed_f(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let _addr = bh.registers_r[code[p] as usize];
+    bh.registers_f[code[p + 5] as usize] = 0; // stub
+    Ok(p + 6)
+}
+fn handler_gc_store_indexed_i(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    // @arguments("cpu", "r", "i", "i", "i", "i", "i", "d") — 1r + 5i + descr
+    let p = p + 6;
+    let (_, p) = read_descr_offset(bh, code, p);
+    Ok(p)
+}
+fn handler_gc_store_indexed_f(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    // @arguments("cpu", "r", "i", "f", "i", "i", "i", "d") — 1r + 1i + 1f + 3i + descr
+    let p = p + 6;
+    let (_, p) = read_descr_offset(bh, code, p);
+    Ok(p)
+}
+// raw_store_i/f, raw_load_i/f (blackhole.py:1504-1516)
+fn handler_raw_store_i(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    // @arguments("cpu", "i", "i", "i", "d") — 3i + descr
+    let (_descr, p) = read_descr_offset(bh, code, p + 3);
+    Ok(p)
+}
+fn handler_raw_store_f(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    // @arguments("cpu", "i", "i", "f", "d") — 2i + 1f + descr
+    let (_descr, p) = read_descr_offset(bh, code, p + 3);
+    Ok(p)
+}
+fn handler_raw_load_i(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    // @arguments("cpu", "i", "i", "d", returns="i") — 2i + descr + result
+    let (_descr, p) = read_descr_offset(bh, code, p + 2);
+    bh.registers_i[code[p] as usize] = 0; // stub
+    Ok(p + 1)
+}
+fn handler_raw_load_f(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let (_descr, p) = read_descr_offset(bh, code, p + 2);
+    bh.registers_f[code[p] as usize] = 0; // stub
+    Ok(p + 1)
+}
+// newlist / newlist_clear / newlist_hint (blackhole.py:1160-1189) — complex compound ops
+fn handler_newlist(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    // @arguments("cpu", "i", "d", "d", "d", "d", returns="r")
+    let _length = bh.registers_i[code[p] as usize];
+    let (_, p) = read_descr_offset(bh, code, p + 1);
+    let (_, p) = read_descr_offset(bh, code, p);
+    let (_, p) = read_descr_offset(bh, code, p);
+    let (_, p) = read_descr_offset(bh, code, p);
+    bh.registers_r[code[p] as usize] = 0; // stub
+    Ok(p + 1)
+}
+fn handler_newlist_clear(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let _length = bh.registers_i[code[p] as usize];
+    let (_, p) = read_descr_offset(bh, code, p + 1);
+    let (_, p) = read_descr_offset(bh, code, p);
+    let (_, p) = read_descr_offset(bh, code, p);
+    let (_, p) = read_descr_offset(bh, code, p);
+    bh.registers_r[code[p] as usize] = 0;
+    Ok(p + 1)
+}
+fn handler_newlist_hint(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let _length = bh.registers_i[code[p] as usize];
+    let (_, p) = read_descr_offset(bh, code, p + 1);
+    let (_, p) = read_descr_offset(bh, code, p);
+    let (_, p) = read_descr_offset(bh, code, p);
+    let (_, p) = read_descr_offset(bh, code, p);
+    bh.registers_r[code[p] as usize] = 0;
+    Ok(p + 1)
+}
+// getarrayitem_vable_f / setarrayitem_vable_f / getlistitem_gc_f / setlistitem_gc_f
+fn handler_getarrayitem_vable_f(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let _vable = bh.registers_r[code[p] as usize];
+    let _index = bh.registers_i[code[p + 1] as usize];
+    let (_, p) = read_descr_offset(bh, code, p + 2);
+    let (_, p) = read_descr_offset(bh, code, p);
+    bh.registers_f[code[p] as usize] = 0;
+    Ok(p + 1)
+}
+fn handler_setarrayitem_vable_f(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let _vable = bh.registers_r[code[p] as usize];
+    let _index = bh.registers_i[code[p + 1] as usize];
+    let _value = bh.registers_f[code[p + 2] as usize];
+    let (_, p) = read_descr_offset(bh, code, p + 3);
+    let (_, p) = read_descr_offset(bh, code, p);
+    Ok(p)
+}
+fn handler_getlistitem_gc_f(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let _lst = bh.registers_r[code[p] as usize];
+    let _index = bh.registers_i[code[p + 1] as usize];
+    let (_, p) = read_descr_offset(bh, code, p + 2);
+    let (_, p) = read_descr_offset(bh, code, p);
+    bh.registers_f[code[p] as usize] = 0;
+    Ok(p + 1)
+}
+fn handler_setlistitem_gc_f(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let _lst = bh.registers_r[code[p] as usize];
+    let _index = bh.registers_i[code[p + 1] as usize];
+    let _value = bh.registers_f[code[p + 2] as usize];
+    let (_, p) = read_descr_offset(bh, code, p + 3);
+    let (_, p) = read_descr_offset(bh, code, p);
+    Ok(p)
+}
+// inline_call — stub: reads jitcode descriptor + arg lists, calls bh_call
+// Full implementation requires frame-chain push/pop.
+fn handler_inline_call_irf_i(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let (_jc_idx, p) = read_descr_offset(bh, code, p); // 'j' argcode
+    let (ai, p) = read_list_i(bh, code, p);
+    let (ar, p) = read_list_r(bh, code, p);
+    let (af, p) = read_list_f(bh, code, p);
+    let all = flatten_args(&ai, &ar, &af);
+    bh.registers_i[code[p] as usize] = bh.cpu.map(|c| c.bh_call_i(0, &all)).unwrap_or(0);
+    Ok(p + 1)
+}
+fn handler_inline_call_irf_r(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let (_, p) = read_descr_offset(bh, code, p);
+    let (ai, p) = read_list_i(bh, code, p);
+    let (ar, p) = read_list_r(bh, code, p);
+    let (af, p) = read_list_f(bh, code, p);
+    let all = flatten_args(&ai, &ar, &af);
+    bh.registers_r[code[p] as usize] = bh.cpu.map(|c| c.bh_call_r(0, &all).0 as i64).unwrap_or(0);
+    Ok(p + 1)
+}
+fn handler_inline_call_irf_f(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let (_, p) = read_descr_offset(bh, code, p);
+    let (ai, p) = read_list_i(bh, code, p);
+    let (ar, p) = read_list_r(bh, code, p);
+    let (af, p) = read_list_f(bh, code, p);
+    let _ = flatten_args(&ai, &ar, &af);
+    bh.registers_f[code[p] as usize] = 0;
+    Ok(p + 1)
+}
+fn handler_inline_call_irf_v(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let (_, p) = read_descr_offset(bh, code, p);
+    let (_, p) = read_list_i(bh, code, p);
+    let (_, p) = read_list_r(bh, code, p);
+    let (_, p) = read_list_f(bh, code, p);
+    Ok(p)
+}
+fn handler_inline_call_ir_i(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let (_, p) = read_descr_offset(bh, code, p);
+    let (ai, p) = read_list_i(bh, code, p);
+    let (ar, p) = read_list_r(bh, code, p);
+    let all = flatten_args(&ai, &ar, &[]);
+    bh.registers_i[code[p] as usize] = bh.cpu.map(|c| c.bh_call_i(0, &all)).unwrap_or(0);
+    Ok(p + 1)
+}
+fn handler_inline_call_ir_r(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let (_, p) = read_descr_offset(bh, code, p);
+    let (ai, p) = read_list_i(bh, code, p);
+    let (ar, p) = read_list_r(bh, code, p);
+    let all = flatten_args(&ai, &ar, &[]);
+    bh.registers_r[code[p] as usize] = bh.cpu.map(|c| c.bh_call_r(0, &all).0 as i64).unwrap_or(0);
+    Ok(p + 1)
+}
+fn handler_inline_call_ir_v(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let (_, p) = read_descr_offset(bh, code, p);
+    let (_, p) = read_list_i(bh, code, p);
+    let (_, p) = read_list_r(bh, code, p);
+    Ok(p)
+}
+fn handler_inline_call_r_i(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let (_, p) = read_descr_offset(bh, code, p);
+    let (ar, p) = read_list_r(bh, code, p);
+    bh.registers_i[code[p] as usize] = bh.cpu.map(|c| c.bh_call_i(0, &ar)).unwrap_or(0);
+    Ok(p + 1)
+}
+fn handler_inline_call_r_r(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let (_, p) = read_descr_offset(bh, code, p);
+    let (ar, p) = read_list_r(bh, code, p);
+    bh.registers_r[code[p] as usize] = bh.cpu.map(|c| c.bh_call_r(0, &ar).0 as i64).unwrap_or(0);
+    Ok(p + 1)
+}
+fn handler_inline_call_r_v(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let (_, p) = read_descr_offset(bh, code, p);
+    let (_, p) = read_list_r(bh, code, p);
+    Ok(p)
+}
+// recursive_call — stub (needs portal runner)
+fn handler_recursive_call_i(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let _jdindex = code[p]; // 'c' short constant
+    let p = p + 1;
+    let (_, p) = read_list_i(bh, code, p);
+    let (_, p) = read_list_r(bh, code, p);
+    let (_, p) = read_list_f(bh, code, p);
+    let (_, p) = read_list_i(bh, code, p);
+    let (_, p) = read_list_r(bh, code, p);
+    let (_, p) = read_list_f(bh, code, p);
+    bh.registers_i[code[p] as usize] = 0;
+    Ok(p + 1)
+}
+fn handler_recursive_call_r(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let p = p + 1;
+    let (_, p) = read_list_i(bh, code, p);
+    let (_, p) = read_list_r(bh, code, p);
+    let (_, p) = read_list_f(bh, code, p);
+    let (_, p) = read_list_i(bh, code, p);
+    let (_, p) = read_list_r(bh, code, p);
+    let (_, p) = read_list_f(bh, code, p);
+    bh.registers_r[code[p] as usize] = 0;
+    Ok(p + 1)
+}
+fn handler_recursive_call_f(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let p = p + 1;
+    let (_, p) = read_list_i(bh, code, p);
+    let (_, p) = read_list_r(bh, code, p);
+    let (_, p) = read_list_f(bh, code, p);
+    let (_, p) = read_list_i(bh, code, p);
+    let (_, p) = read_list_r(bh, code, p);
+    let (_, p) = read_list_f(bh, code, p);
+    bh.registers_f[code[p] as usize] = 0;
+    Ok(p + 1)
+}
+fn handler_recursive_call_v(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let p = p + 1;
+    let (_, p) = read_list_i(bh, code, p);
+    let (_, p) = read_list_r(bh, code, p);
+    let (_, p) = read_list_f(bh, code, p);
+    let (_, p) = read_list_i(bh, code, p);
+    let (_, p) = read_list_r(bh, code, p);
+    let (_, p) = read_list_f(bh, code, p);
+    Ok(p)
 }
