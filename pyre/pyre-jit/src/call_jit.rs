@@ -677,6 +677,21 @@ extern "C" fn jit_force_callee_frame_interp(frame_ptr: i64) -> i64 {
     }
 }
 
+/// RPython: FieldDescr.offset is resolved at rtyper time. In pyre, Rust struct
+/// layout determines field offsets. This resolver maps (owner_type, field_name)
+/// to byte offsets for BhDescr::Field resolution in the blackhole.
+/// Called by `bh.resolve_field_offsets()` after `setposition()`.
+fn resolve_field_offset(owner: &str, field_name: &str) -> usize {
+    use pyre_interpreter::pyframe::PyFrame;
+    match (owner, field_name) {
+        (_, "namespace") => std::mem::offset_of!(PyFrame, namespace),
+        (_, "code") => pyre_interpreter::pyframe::PYFRAME_CODE_OFFSET,
+        (_, "next_instr") | (_, "f_lasti") => pyre_interpreter::pyframe::PYFRAME_NEXT_INSTR_OFFSET,
+        (_, "vable_token") => pyre_interpreter::pyframe::PYFRAME_VABLE_TOKEN_OFFSET,
+        _ => 0, // Unresolved — Phase D will add more field mappings
+    }
+}
+
 /// blackhole.py:1095 get_portal_runner / warmspot.py portal_runner parity:
 /// Callback for bhimpl_recursive_call. Receives a frame pointer, executes
 /// the frame through the JIT-enabled interpreter (eval_loop_jit), and
@@ -1067,6 +1082,16 @@ pub fn resume_in_blackhole(
         // blackhole.py:1095 get_portal_runner parity:
         // Set portal_runner_ptr for bhimpl_recursive_call.
         bh.portal_runner_ptr = Some(bh_portal_runner);
+
+        // RPython: descrs carry FieldDescr.offset (byte offset from rtyper).
+        // pyre: field offsets are resolved from Rust struct layout at runtime.
+        // This is a no-op until the codewriter populates descrs (Phase D).
+        bh.resolve_field_offsets(resolve_field_offset);
+        bh.resolve_jitcode_fnaddrs(|_jitcode_index| {
+            // RPython: JitCode.fnaddr set by warmspot.py after compilation.
+            // pyre: callee function addresses resolved here.
+            bh_portal_runner as usize as i64
+        });
 
         if majit_metainterp::majit_log_enabled() {
             eprintln!(

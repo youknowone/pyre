@@ -97,6 +97,13 @@ pub struct JitCode {
     /// `Assembler.assemble` (assembler.py:49 `jitcode._ssarepr = ssarepr`).
     #[serde(skip)]
     pub _ssarepr: Option<crate::passes::flatten::SSARepr>,
+    /// RPython: `BlackholeInterpBuilder.descrs` is a shared list of AbstractDescr
+    /// objects, populated once via `setup_descrs(asm.descrs)`. All JitCodes share
+    /// the same global descrs table.
+    /// pyre: per-jitcode Assembler produces per-jitcode descrs, so we store them
+    /// directly on the JitCode. The blackhole loads them via `setposition()`.
+    #[serde(skip)]
+    pub descrs: Vec<BhDescr>,
 }
 
 impl JitCode {
@@ -128,6 +135,7 @@ impl JitCode {
             index: 0,
             _called_from: None,
             _ssarepr: None,
+            descrs: Vec::new(),
         }
     }
 
