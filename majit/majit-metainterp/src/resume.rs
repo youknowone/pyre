@@ -4555,8 +4555,8 @@ pub trait BlackholeAllocator {
     /// `descr_index` identifies the type, `descr_size` is the live
     /// `sizedescr.size()` (RPython passes the full descr; pyre carries
     /// only what blackhole resume needs).
-    fn allocate_with_vtable(&self, descr_index: u32, descr_size: usize) -> i64 {
-        let _ = (descr_index, descr_size);
+    fn allocate_with_vtable(&self, descr_index: u32, descr_size: usize, vtable: usize) -> i64 {
+        let _ = (descr_index, descr_size, vtable);
         0
     }
     /// resume.py:1441-1442 allocate_struct → cpu.bh_new(typedescr) →
@@ -4656,10 +4656,15 @@ impl VirtualInfo {
                 fields,
                 fielddescrs,
                 descr_size,
+                descr,
+                known_class,
                 ..
             } => {
                 // resume.py:619 allocate_with_vtable(descr=self.descr)
-                let obj = allocator.allocate_with_vtable(*type_id, *descr_size);
+                // llmodel.py:780 sizedescr.get_vtable() → vtable pointer.
+                // known_class (info.py:318) carries the vtable from optimize_new_with_vtable.
+                let vtable = known_class.unwrap_or(0) as usize;
+                let obj = allocator.allocate_with_vtable(*type_id, *descr_size, vtable);
                 decoder.virtuals_cache.set_ptr(index, obj);
                 for (i, (field_descr, source)) in fields.iter().enumerate() {
                     let fd = fielddescrs.get(i);

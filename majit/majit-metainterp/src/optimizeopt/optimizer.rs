@@ -401,6 +401,7 @@ impl Optimizer {
                             *offset,
                             *length,
                             Self::import_virtual_state_value(entry_info, ctx),
+                            0u8,
                         )
                     })
                     .collect();
@@ -875,6 +876,7 @@ impl Optimizer {
                                 ctx,
                                 walk_visited,
                             ),
+                            0u8,
                         )
                     })
                     .collect();

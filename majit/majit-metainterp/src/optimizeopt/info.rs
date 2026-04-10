@@ -842,7 +842,7 @@ impl PtrInfo {
                 .iter()
                 .flat_map(|fields| fields.iter().map(|(_, r)| *r))
                 .collect(),
-            PtrInfo::VirtualRawBuffer(v) => v.entries.iter().map(|(_, _, r)| *r).collect(),
+            PtrInfo::VirtualRawBuffer(v) => v.entries.iter().map(|(_, _, r, _)| *r).collect(),
             PtrInfo::Virtualizable(v) => {
                 let mut refs: Vec<OpRef> = v.fields.iter().map(|(_, r)| *r).collect();
                 for (_, items) in &v.arrays {
@@ -896,7 +896,7 @@ impl PtrInfo {
                 }
             }
             PtrInfo::VirtualRawBuffer(v) => {
-                for (_, _, field) in &mut v.entries {
+                for (_, _, field, _) in &mut v.entries {
                     if !field.is_none() {
                         *field = recurse(*field);
                     }
@@ -1830,11 +1830,12 @@ pub struct VirtualRawBufferInfo {
     pub func: i64,
     /// Size of the buffer in bytes.
     pub size: usize,
-    /// Values stored at byte offsets: (offset, length, value_opref).
+    /// Values stored at byte offsets: (offset, length, value_opref, kind).
+    /// kind: 0=int, 1=ref, 2=float (RPython descr.is_array_of_*/is_float_field parity).
     ///
     /// Sorted by offset. Invariant: `entries[i].0 + entries[i].1 <= entries[i+1].0`
     /// (no overlapping writes).
-    pub entries: Vec<(usize, usize, OpRef)>,
+    pub entries: Vec<(usize, usize, OpRef, u8)>,
     /// info.py:91-92
     pub last_guard_pos: i32,
 }
@@ -1870,9 +1871,10 @@ impl VirtualRawBufferInfo {
         offset: usize,
         length: usize,
         value: OpRef,
+        kind: u8,
     ) -> Result<(), RawBufferError> {
         let mut insert_pos = 0;
-        for (i, &(wo, wl, _)) in self.entries.iter().enumerate() {
+        for (i, &(wo, wl, _, _)) in self.entries.iter().enumerate() {
             if wo == offset {
                 if wl != length {
                     return Err(RawBufferError::OverlappingWrite {
@@ -1884,6 +1886,7 @@ impl VirtualRawBufferInfo {
                 }
                 // Same offset and length: update in place.
                 self.entries[i].2 = value;
+                self.entries[i].3 = kind;
                 return Ok(());
             } else if wo > offset {
                 break;
@@ -1892,7 +1895,7 @@ impl VirtualRawBufferInfo {
         }
         // Check overlap with next entry.
         if insert_pos < self.entries.len() {
-            let (next_off, _, _) = self.entries[insert_pos];
+            let (next_off, _, _, _) = self.entries[insert_pos];
             if offset + length > next_off {
                 return Err(RawBufferError::OverlappingWrite {
                     new_offset: offset,
@@ -1904,7 +1907,7 @@ impl VirtualRawBufferInfo {
         }
         // Check overlap with previous entry.
         if insert_pos > 0 {
-            let (prev_off, prev_len, _) = self.entries[insert_pos - 1];
+            let (prev_off, prev_len, _, _) = self.entries[insert_pos - 1];
             if prev_off + prev_len > offset {
                 return Err(RawBufferError::OverlappingWrite {
                     new_offset: offset,
@@ -1914,7 +1917,8 @@ impl VirtualRawBufferInfo {
                 });
             }
         }
-        self.entries.insert(insert_pos, (offset, length, value));
+        self.entries
+            .insert(insert_pos, (offset, length, value, kind));
         Ok(())
     }
 
@@ -1923,7 +1927,7 @@ impl VirtualRawBufferInfo {
     /// Returns `Err(UninitializedRead)` if no write exists at that offset,
     /// or `Err(IncompatibleRead)` if the length doesn't match.
     pub fn read_value(&self, offset: usize, length: usize) -> Result<OpRef, RawBufferError> {
-        for &(wo, wl, val) in &self.entries {
+        for &(wo, wl, val, _) in &self.entries {
             if wo == offset {
                 if wl != length {
                     return Err(RawBufferError::IncompatibleRead {
@@ -1947,7 +1951,7 @@ impl VirtualRawBufferInfo {
             let byte = offset + i;
             self.entries
                 .iter()
-                .any(|&(wo, wl, _)| byte >= wo && byte < wo + wl)
+                .any(|&(wo, wl, _, _)| byte >= wo && byte < wo + wl)
         })
     }
 
@@ -1959,7 +1963,7 @@ impl VirtualRawBufferInfo {
     pub fn find_overwritten_write(&self, offset: usize, size: usize) -> Option<usize> {
         self.entries
             .iter()
-            .position(|&(wo, wl, _)| offset <= wo && offset + size >= wo + wl)
+            .position(|&(wo, wl, _, _)| offset <= wo && offset + size >= wo + wl)
     }
 }
 
@@ -2009,9 +2013,9 @@ mod tests {
     #[test]
     fn rawbuffer_write_and_read() {
         let mut buf = make_buf(32);
-        buf.write_value(0, 8, OpRef(10)).unwrap();
-        buf.write_value(8, 4, OpRef(20)).unwrap();
-        buf.write_value(16, 8, OpRef(30)).unwrap();
+        buf.write_value(0, 8, OpRef(10), 0).unwrap();
+        buf.write_value(8, 4, OpRef(20), 0).unwrap();
+        buf.write_value(16, 8, OpRef(30), 0).unwrap();
 
         assert_eq!(buf.read_value(0, 8).unwrap(), OpRef(10));
         assert_eq!(buf.read_value(8, 4).unwrap(), OpRef(20));
@@ -2021,8 +2025,8 @@ mod tests {
     #[test]
     fn rawbuffer_update_same_offset() {
         let mut buf = make_buf(16);
-        buf.write_value(0, 8, OpRef(10)).unwrap();
-        buf.write_value(0, 8, OpRef(99)).unwrap();
+        buf.write_value(0, 8, OpRef(10), 0).unwrap();
+        buf.write_value(0, 8, OpRef(99), 0).unwrap();
 
         assert_eq!(buf.read_value(0, 8).unwrap(), OpRef(99));
         assert_eq!(buf.entries.len(), 1);
@@ -2031,26 +2035,26 @@ mod tests {
     #[test]
     fn rawbuffer_overlap_next() {
         let mut buf = make_buf(32);
-        buf.write_value(8, 8, OpRef(10)).unwrap();
+        buf.write_value(8, 8, OpRef(10), 0).unwrap();
         // Write at offset 4 with length 8 overlaps [8, 16)
-        let err = buf.write_value(4, 8, OpRef(20)).unwrap_err();
+        let err = buf.write_value(4, 8, OpRef(20), 0).unwrap_err();
         assert!(matches!(err, RawBufferError::OverlappingWrite { .. }));
     }
 
     #[test]
     fn rawbuffer_overlap_prev() {
         let mut buf = make_buf(32);
-        buf.write_value(0, 8, OpRef(10)).unwrap();
+        buf.write_value(0, 8, OpRef(10), 0).unwrap();
         // Write at offset 4 overlaps with [0, 8)
-        let err = buf.write_value(4, 4, OpRef(20)).unwrap_err();
+        let err = buf.write_value(4, 4, OpRef(20), 0).unwrap_err();
         assert!(matches!(err, RawBufferError::OverlappingWrite { .. }));
     }
 
     #[test]
     fn rawbuffer_incompatible_length_at_same_offset() {
         let mut buf = make_buf(16);
-        buf.write_value(0, 8, OpRef(10)).unwrap();
-        let err = buf.write_value(0, 4, OpRef(20)).unwrap_err();
+        buf.write_value(0, 8, OpRef(10), 0).unwrap();
+        let err = buf.write_value(0, 4, OpRef(20), 0).unwrap_err();
         assert!(matches!(err, RawBufferError::OverlappingWrite { .. }));
     }
 
@@ -2070,7 +2074,7 @@ mod tests {
     #[test]
     fn rawbuffer_incompatible_read_length() {
         let mut buf = make_buf(16);
-        buf.write_value(0, 8, OpRef(10)).unwrap();
+        buf.write_value(0, 8, OpRef(10), 0).unwrap();
         let err = buf.read_value(0, 4).unwrap_err();
         assert_eq!(
             err,
@@ -2085,8 +2089,8 @@ mod tests {
     #[test]
     fn rawbuffer_read_fully_covered() {
         let mut buf = make_buf(32);
-        buf.write_value(0, 8, OpRef(10)).unwrap();
-        buf.write_value(8, 8, OpRef(20)).unwrap();
+        buf.write_value(0, 8, OpRef(10), 0).unwrap();
+        buf.write_value(8, 8, OpRef(20), 0).unwrap();
 
         // [0, 16) is fully covered by [0,8) + [8,16)
         assert!(buf.is_read_fully_covered(0, 16));
@@ -2099,8 +2103,8 @@ mod tests {
     #[test]
     fn rawbuffer_read_partially_covered_fails() {
         let mut buf = make_buf(32);
-        buf.write_value(0, 4, OpRef(10)).unwrap();
-        buf.write_value(8, 4, OpRef(20)).unwrap();
+        buf.write_value(0, 4, OpRef(10), 0).unwrap();
+        buf.write_value(8, 4, OpRef(20), 0).unwrap();
 
         // Bytes 4..8 are not covered by any write
         assert!(!buf.is_read_fully_covered(0, 8));
@@ -2111,8 +2115,8 @@ mod tests {
     #[test]
     fn rawbuffer_overwritten_write_detected() {
         let mut buf = make_buf(32);
-        buf.write_value(4, 4, OpRef(10)).unwrap();
-        buf.write_value(12, 4, OpRef(20)).unwrap();
+        buf.write_value(4, 4, OpRef(10), 0).unwrap();
+        buf.write_value(12, 4, OpRef(20), 0).unwrap();
 
         // A write [4, 12) fully contains [4, 8)
         assert_eq!(buf.find_overwritten_write(4, 8), Some(0));
@@ -2127,9 +2131,9 @@ mod tests {
     #[test]
     fn rawbuffer_sorted_insertion() {
         let mut buf = make_buf(32);
-        buf.write_value(16, 4, OpRef(30)).unwrap();
-        buf.write_value(0, 4, OpRef(10)).unwrap();
-        buf.write_value(8, 4, OpRef(20)).unwrap();
+        buf.write_value(16, 4, OpRef(30), 0).unwrap();
+        buf.write_value(0, 4, OpRef(10), 0).unwrap();
+        buf.write_value(8, 4, OpRef(20), 0).unwrap();
 
         // Entries should be sorted by offset
         assert_eq!(buf.entries[0].0, 0);

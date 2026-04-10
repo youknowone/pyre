@@ -599,7 +599,7 @@ impl OptVirtualize {
         }
 
         // Emit RAW_STORE for each tracked entry
-        for (offset, _length, value_ref) in &vinfo.entries {
+        for (offset, _length, value_ref, _kind) in &vinfo.entries {
             let value_ref = self.force_virtual(*value_ref, ctx);
             let value_ref = ctx.get_box_replacement(value_ref);
             let offset_ref = self.emit_constant_int(ctx, *offset as i64);
@@ -1205,10 +1205,10 @@ impl OptVirtualize {
             };
             if let Some(PtrInfo::VirtualRawBuffer(vinfo)) = ctx.get_ptr_info(parent) {
                 let lookup_offset = base_offset + offset as usize;
-                if let Some((_, _, val_ref)) = vinfo
+                if let Some((_, _, val_ref, _)) = vinfo
                     .entries
                     .iter()
-                    .find(|(off, _, _)| *off == lookup_offset)
+                    .find(|(off, _, _, _)| *off == lookup_offset)
                 {
                     ctx.replace_op(op.pos, *val_ref);
                     return OptimizationResult::Remove;
@@ -1241,11 +1241,11 @@ impl OptVirtualize {
                 if let Some(entry) = vinfo
                     .entries
                     .iter_mut()
-                    .find(|(off, _, _)| *off == store_offset)
+                    .find(|(off, _, _, _)| *off == store_offset)
                 {
                     entry.2 = value_ref;
                 } else {
-                    let _ = vinfo.write_value(store_offset, 8, value_ref);
+                    let _ = vinfo.write_value(store_offset, 8, value_ref, 0);
                 }
                 return OptimizationResult::Remove;
             }
