@@ -631,10 +631,26 @@ impl PyreMetaInterp {
             }
 
             // Root frame with no handler → compile_exit_frame_with_exception
-            // pyjitpl.py:2532-2538: FINISH op with exception value.
+            // pyjitpl.py:3238-3242 compile_exit_frame_with_exception:
+            //   self.store_token_in_vable()
+            //   token = sd.exit_frame_with_exception_descr_ref
+            //   self.history.record1(rop.FINISH, valuebox, None, descr=token)
             let exc_opref = sym.last_exc_box;
             if majit_metainterp::majit_log_enabled() {
                 eprintln!("[jit][finishframe_exception] root frame, no handler → FINISH");
+            }
+            // pyjitpl.py:3239: self.store_token_in_vable()
+            // Record SetfieldGc on vable_token + GUARD_NOT_FORCED_2 with
+            // proper resumedata, matching the return/yield path in
+            // trace_step_result_to_action.
+            {
+                let sym_mut = unsafe { &mut *top.sym };
+                let concrete_frame = sym_mut.concrete_vable_ptr as usize;
+                let pc = sym_mut.pending_next_instr.unwrap_or(0);
+                let mut mi = super::state::MIFrame::from_sym(ctx, sym_mut, concrete_frame, pc, pc);
+                if ctx.store_token_in_vable_setfield() {
+                    mi.generate_guard(ctx, majit_ir::OpCode::GuardNotForced2, &[]);
+                }
             }
             return Some(LoopAction::Return(TraceAction::Finish {
                 finish_args: vec![exc_opref],
