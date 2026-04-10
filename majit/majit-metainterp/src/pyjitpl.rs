@@ -2667,6 +2667,20 @@ impl<M: Clone> MetaInterp<M> {
             Some((trace_id, fail_index)) => {
                 // compile.py:1082 — ResumeGuardDescr path: attach bridge
                 // to the existing guard that failed.
+                // Prevent double-compilation: if a bridge was already compiled
+                // and attached to this guard, skip. RPython's
+                // raise_continue_running_normally stops the trace entirely,
+                // so this path is never re-entered; pyre's trace may continue
+                // and re-enter, so guard explicitly.
+                if self.bridge_was_compiled(green_key, trace_id, fail_index) {
+                    if crate::majit_log_enabled() {
+                        eprintln!("[jit] skip bridge: guard {} already has bridge", fail_index);
+                    }
+                    return CompileOutcome::Compiled {
+                        green_key: 0,
+                        from_retry: false,
+                    };
+                }
                 let fail_descr = {
                     let compiled = match self.compiled_loops.get(&green_key) {
                         Some(c) => c,
