@@ -459,6 +459,7 @@ impl Optimizer {
                     opref,
                     crate::optimizeopt::info::PtrInfo::VirtualRawBuffer(
                         crate::optimizeopt::info::VirtualRawBufferInfo {
+                            func: 0,
                             size: *size,
                             entries: imported_entries,
                             last_guard_pos: -1,
@@ -928,6 +929,7 @@ impl Optimizer {
                     opref,
                     crate::optimizeopt::info::PtrInfo::VirtualRawBuffer(
                         crate::optimizeopt::info::VirtualRawBufferInfo {
+                            func: 0,
                             size: *size,
                             entries: imported_entries,
                             last_guard_pos: -1,

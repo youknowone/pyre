@@ -2246,6 +2246,7 @@ fn materialize_virtual_from_rd(
             offsets,
             entry_sizes,
             fieldnums,
+            ..
         } => {
             // resume.py:701-708: allocate_raw_buffer + setrawbuffer_item
             let buffer = unsafe {

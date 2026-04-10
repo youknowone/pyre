@@ -115,8 +115,10 @@ pub enum RdVirtualInfo {
         field_sizes: Vec<usize>,
         fieldnums: Vec<i16>,
     },
-    /// resume.py:692: VRawBufferInfo
+    /// resume.py:692: VRawBufferInfo(func, size, offsets, descrs)
     VRawBufferInfo {
+        /// resume.py:695: self.func — raw malloc function pointer.
+        func: i64,
         size: usize,
         offsets: Vec<usize>,
         entry_sizes: Vec<usize>,
@@ -229,18 +231,20 @@ impl PartialEq for RdVirtualInfo {
             }
             (
                 Self::VRawBufferInfo {
+                    func: a0,
                     size: a1,
                     offsets: a2,
                     entry_sizes: a3,
                     fieldnums: a4,
                 },
                 Self::VRawBufferInfo {
+                    func: b0,
                     size: b1,
                     offsets: b2,
                     entry_sizes: b3,
                     fieldnums: b4,
                 },
-            ) => a1 == b1 && a2 == b2 && a3 == b3 && a4 == b4,
+            ) => a0 == b0 && a1 == b1 && a2 == b2 && a3 == b3 && a4 == b4,
             (
                 Self::VRawSliceInfo {
                     offset: a1,

@@ -691,6 +691,7 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
                 let offsets: Vec<usize> = vi.entries.iter().map(|(o, _, _)| *o).collect();
                 let entry_sizes: Vec<usize> = vi.entries.iter().map(|(_, len, _)| *len).collect();
                 Some(majit_ir::RdVirtualInfo::VRawBufferInfo {
+                    func: vi.func,
                     size: vi.size,
                     offsets,
                     entry_sizes,

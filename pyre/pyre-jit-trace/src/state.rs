@@ -2446,17 +2446,52 @@ fn materialize_bridge_virtual(
             new_op
         }
         // resume.py:700-709 VRawBufferInfo.allocate_int
-        // decoder.allocate_raw_buffer(self.func, self.size) → CALL_I(func, size)
-        // requires callinfocollection.callinfo_for_oopspec which pyre doesn't
-        // have. Log and return NONE for now — raw buffers are rare in Python.
-        majit_ir::RdVirtualInfo::VRawBufferInfo { .. } => {
-            if majit_metainterp::majit_log_enabled() {
-                eprintln!(
-                    "[jit][bridge-virtual] vidx={} VRawBufferInfo (CALL_I not yet ported)",
-                    vidx
+        majit_ir::RdVirtualInfo::VRawBufferInfo {
+            func,
+            size,
+            offsets,
+            entry_sizes,
+            fieldnums,
+        } => {
+            // resume.py:703: buffer = decoder.allocate_raw_buffer(self.func, self.size)
+            // resume.py:1124-1132: ResumeDataBoxReader.allocate_raw_buffer →
+            //   execute_and_record_varargs(rop.CALL_I, [ConstInt(func), ConstInt(size)], calldescr)
+            let func_ref = ctx.const_int(*func);
+            let size_ref = ctx.const_int(*size as i64);
+            // calldescr: RPython uses callinfo_for_oopspec(OS_RAW_MALLOC_VARSIZE_CHAR).
+            // pyre: use a minimal int-returning call descr (no GC effects).
+            let calldescr = crate::descr::make_call_descr_int();
+            let buffer = ctx.record_op_with_descr(OpCode::CallI, &[func_ref, size_ref], calldescr);
+            // resume.py:704: decoder.virtuals_cache.set_int(index, buffer)
+            cache.insert(vidx, buffer);
+            // resume.py:705-708: setrawbuffer_item for each offset/descr
+            for (i, (&off, &fnum)) in offsets.iter().zip(fieldnums.iter()).enumerate() {
+                if fnum == majit_ir::resumedata::UNINITIALIZED_TAG {
+                    continue;
+                }
+                // resume.py:1232: itembox = self.decode_box(fieldnum, kind)
+                let item = decode_fieldnum(ctx, fnum, rd_virtuals, resume_data, cache);
+                if item.is_none() {
+                    continue;
+                }
+                // resume.py:1233-1234: execute_raw_store(arraydescr, buffer, offset, item)
+                let offset_ref = ctx.const_int(off as i64);
+                let item_size = entry_sizes.get(i).copied().unwrap_or(8);
+                let store_descr =
+                    crate::descr::make_array_descr(0, item_size, majit_ir::Type::Int, false);
+                ctx.record_op_with_descr(
+                    OpCode::RawStore,
+                    &[buffer, offset_ref, item],
+                    store_descr,
                 );
             }
-            OpRef::NONE
+            if majit_metainterp::majit_log_enabled() {
+                eprintln!(
+                    "[jit][bridge-virtual] vidx={} VRawBufferInfo(func={:#x}, size={}) → OpRef({})",
+                    vidx, func, size, buffer.0,
+                );
+            }
+            buffer
         }
         // resume.py:722-728 VRawSliceInfo.allocate_int
         majit_ir::RdVirtualInfo::VRawSliceInfo { offset, fieldnums } => {

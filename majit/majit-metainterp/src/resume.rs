@@ -1595,6 +1595,7 @@ pub fn rd_virtual_to_virtual_info(
             offsets,
             entry_sizes,
             fieldnums,
+            ..
         } => {
             let entries = offsets
                 .iter()

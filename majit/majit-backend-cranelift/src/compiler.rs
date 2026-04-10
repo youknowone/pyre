@@ -10018,6 +10018,7 @@ fn collect_guards(
                             offsets,
                             entry_sizes,
                             fieldnums,
+                            ..
                         } => ExitVirtualLayout::RawBuffer {
                             size: *size,
                             entries: fieldnums
