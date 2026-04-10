@@ -3473,7 +3473,7 @@ impl PyreJitState {
             | MaterializedVirtual::Obj { fields, .. } => {
                 self.materialize_virtual_object(fields, materialized_refs)
             }
-            MaterializedVirtual::RawBuffer { size, entries } => {
+            MaterializedVirtual::RawBuffer { size, entries, .. } => {
                 materialize_virtual_raw_buffer(*size, entries, materialized_refs)
             }
             _ => None,
@@ -3557,7 +3557,11 @@ impl PyreJitState {
 
 fn materialize_virtual_raw_buffer(
     size: usize,
-    entries: &[(usize, usize, majit_metainterp::resume::MaterializedValue)],
+    entries: &[(
+        usize,
+        majit_metainterp::optimizeopt::info::RawBufferDescr,
+        majit_metainterp::resume::MaterializedValue,
+    )],
     materialized_refs: &[Option<majit_ir::GcRef>],
 ) -> Option<majit_ir::GcRef> {
     use std::alloc::{Layout, alloc_zeroed};
@@ -3568,11 +3572,12 @@ fn materialize_virtual_raw_buffer(
         return None;
     }
 
-    for (offset, length, value) in entries {
+    for (offset, descr, value) in entries {
         let concrete = value.resolve_with_refs(materialized_refs)?;
+        // resume.py:1543-1550 setrawbuffer_item: dispatch by descr
         unsafe {
             let slot = ptr.add(*offset);
-            match *length {
+            match descr.itemsize {
                 1 => slot.write(concrete as u8),
                 2 => (slot as *mut u16).write_unaligned(concrete as u16),
                 4 => (slot as *mut u32).write_unaligned(concrete as u32),
