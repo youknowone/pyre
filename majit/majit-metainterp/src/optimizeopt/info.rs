@@ -1818,9 +1818,41 @@ pub struct VirtualRawSliceInfo {
     pub last_guard_pos: i32,
 }
 
+/// rawbuffer.py:83-87 `_descrs_are_compatible`: two arraydescrs are
+/// compatible iff `cpu.unpack_arraydescr_size` yields the same
+/// `(basesize, itemsize, sign)`. For raw (length-less) arrays basesize
+/// is always 0, so we store `(itemsize, is_signed, kind)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RawBufferDescr {
+    /// descr.py ArrayDescr.itemsize — element width in bytes (1, 2, 4, 8).
+    pub itemsize: usize,
+    /// descr.py ArrayDescr.is_item_signed() — FLAG_SIGNED vs FLAG_UNSIGNED.
+    pub is_signed: bool,
+    /// 0=ref (is_array_of_pointers), 1=int, 2=float (is_array_of_floats).
+    pub kind: u8,
+}
+
+impl RawBufferDescr {
+    /// rawbuffer.py:85 `unpack(d1) == unpack(d2)` — RPython compat check.
+    pub fn is_compatible(&self, other: &Self) -> bool {
+        self.itemsize == other.itemsize && self.is_signed == other.is_signed
+    }
+}
+
+impl Default for RawBufferDescr {
+    fn default() -> Self {
+        Self {
+            itemsize: 8,
+            is_signed: true,
+            kind: 1, // int
+        }
+    }
+}
+
 /// A virtual raw memory buffer.
 ///
-/// Mirrors RPython's VRawBufferInfo for virtualized raw_malloc allocations.
+/// Mirrors RPython's RawBuffer (rawbuffer.py) / VRawBufferInfo for
+/// virtualized raw_malloc allocations.
 /// Tracks writes to byte offsets within the buffer. Entries are kept sorted
 /// by offset and must never overlap (matching RPython's RawBuffer invariant).
 #[derive(Clone, Debug)]
@@ -1830,12 +1862,12 @@ pub struct VirtualRawBufferInfo {
     pub func: i64,
     /// Size of the buffer in bytes.
     pub size: usize,
-    /// Values stored at byte offsets: (offset, length, value_opref, kind).
-    /// kind: 0=int, 1=ref, 2=float (RPython descr.is_array_of_*/is_float_field parity).
+    /// rawbuffer.py:17-20: parallel arrays offsets/lengths/descrs/values.
+    /// Each entry: (offset, length, value_opref, descr).
     ///
     /// Sorted by offset. Invariant: `entries[i].0 + entries[i].1 <= entries[i+1].0`
     /// (no overlapping writes).
-    pub entries: Vec<(usize, usize, OpRef, u8)>,
+    pub entries: Vec<(usize, usize, OpRef, RawBufferDescr)>,
     /// info.py:91-92
     pub last_guard_pos: i32,
 }
@@ -1861,22 +1893,22 @@ pub enum RawBufferError {
 }
 
 impl VirtualRawBufferInfo {
-    /// Write a value at `(offset, length)`. Maintains sorted order by offset.
+    /// rawbuffer.py:89-118 write_value(offset, length, descr, value).
     ///
-    /// If a write already exists at the same offset with the same length,
+    /// If a write already exists at the same offset with a compatible descr,
     /// updates the value. Returns `Err` on overlapping writes or
-    /// incompatible length at the same offset.
+    /// incompatible descr at the same offset.
     pub fn write_value(
         &mut self,
         offset: usize,
         length: usize,
         value: OpRef,
-        kind: u8,
+        descr: RawBufferDescr,
     ) -> Result<(), RawBufferError> {
         let mut insert_pos = 0;
-        for (i, &(wo, wl, _, _)) in self.entries.iter().enumerate() {
+        for (i, &(wo, wl, _, ref wd)) in self.entries.iter().enumerate() {
             if wo == offset {
-                if wl != length {
+                if wl != length || !wd.is_compatible(&descr) {
                     return Err(RawBufferError::OverlappingWrite {
                         new_offset: offset,
                         new_length: length,
@@ -1884,9 +1916,9 @@ impl VirtualRawBufferInfo {
                         existing_length: wl,
                     });
                 }
-                // Same offset and length: update in place.
+                // Same offset, compatible descr: update in place.
                 self.entries[i].2 = value;
-                self.entries[i].3 = kind;
+                self.entries[i].3 = descr;
                 return Ok(());
             } else if wo > offset {
                 break;
@@ -1918,18 +1950,23 @@ impl VirtualRawBufferInfo {
             }
         }
         self.entries
-            .insert(insert_pos, (offset, length, value, kind));
+            .insert(insert_pos, (offset, length, value, descr));
         Ok(())
     }
 
-    /// Read the value at `(offset, length)`.
+    /// rawbuffer.py:120-134 read_value(offset, length, descr).
     ///
     /// Returns `Err(UninitializedRead)` if no write exists at that offset,
-    /// or `Err(IncompatibleRead)` if the length doesn't match.
-    pub fn read_value(&self, offset: usize, length: usize) -> Result<OpRef, RawBufferError> {
-        for &(wo, wl, val, _) in &self.entries {
+    /// or `Err(IncompatibleRead)` if the length or descr doesn't match.
+    pub fn read_value(
+        &self,
+        offset: usize,
+        length: usize,
+        descr: &RawBufferDescr,
+    ) -> Result<OpRef, RawBufferError> {
+        for &(wo, wl, val, ref wd) in &self.entries {
             if wo == offset {
-                if wl != length {
+                if wl != length || !wd.is_compatible(descr) {
                     return Err(RawBufferError::IncompatibleRead {
                         offset,
                         read_length: length,

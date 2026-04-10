@@ -173,7 +173,13 @@ pub enum VirtualStateInfo {
         /// info.py:389: self.func — the malloc function pointer.
         func: i64,
         size: usize,
-        entries: Vec<(usize, usize, Rc<VirtualStateInfo>)>,
+        /// rawbuffer.py:17-20: (offset, length, state, descr).
+        entries: Vec<(
+            usize,
+            usize,
+            Rc<VirtualStateInfo>,
+            super::info::RawBufferDescr,
+        )>,
     },
     /// Value has a known class (non-null).
     KnownClass { class_ptr: GcRef },
@@ -337,7 +343,7 @@ impl VirtualStateInfo {
                 }
                 e1.iter()
                     .zip(e2.iter())
-                    .all(|((off1, len1, v1), (off2, len2, v2))| {
+                    .all(|((off1, len1, v1, _), (off2, len2, v2, _))| {
                         off1 == off2 && len1 == len2 && v1.is_compatible(v2)
                     })
             }
@@ -513,7 +519,7 @@ impl VirtualState {
                 .sum(),
             VirtualStateInfo::VirtualRawBuffer { entries, .. } => entries
                 .iter()
-                .map(|(_, _, child)| Self::count_forced_boxes_for_entry_rc(child, visited))
+                .map(|(_, _, child, _)| Self::count_forced_boxes_for_entry_rc(child, visited))
                 .sum(),
             VirtualStateInfo::KnownClass { .. }
             | VirtualStateInfo::NonNull
@@ -886,7 +892,7 @@ impl VirtualState {
                 if !is_virtual {
                     return Err(());
                 }
-                for (index, (_, _, entry_state)) in entries.iter().enumerate() {
+                for (index, (_, _, entry_state, _)) in entries.iter().enumerate() {
                     let entry_ref = ctx
                         .get_ptr_info(resolved)
                         .and_then(|info| match info {
@@ -1816,9 +1822,9 @@ fn export_single_value_inner(
                 let entries = vinfo
                     .entries
                     .iter()
-                    .map(|(offset, length, value_ref, _kind)| {
+                    .map(|(offset, length, value_ref, descr)| {
                         let val_state = export_single_value(*value_ref, ctx, cache);
-                        (*offset, *length, val_state)
+                        (*offset, *length, val_state, *descr)
                     })
                     .collect();
                 return VirtualStateInfo::VirtualRawBuffer {
@@ -1929,7 +1935,7 @@ fn append_sequential_slots(
             }
         }
         VirtualStateInfo::VirtualRawBuffer { entries, .. } => {
-            for (_, _, child) in entries {
+            for (_, _, child, _) in entries {
                 append_sequential_slots_rc(child, schedule, next_slot, visited);
             }
         }
