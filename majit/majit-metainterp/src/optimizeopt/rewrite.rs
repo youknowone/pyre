@@ -3004,7 +3004,7 @@ impl Optimization for OptRewrite {
     fn produce_potential_short_preamble_ops(
         &self,
         sb: &mut crate::optimizeopt::shortpreamble::ShortBoxes,
-        _ctx: &OptContext,
+        _ctx: &mut OptContext,
     ) {
         for op in self.loop_invariant_producer.values() {
             sb.add_loopinvariant_op(op.clone());

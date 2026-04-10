@@ -1048,7 +1048,7 @@ impl Optimizer {
     /// bridgeopt.py:63-122: serialize_optimizer_knowledge
     /// Export the optimizer's heap cache, known class, and loopinvariant knowledge
     /// for storage in guard resume data. Called after optimization.
-    pub fn serialize_optimizer_knowledge(&self, ctx: &OptContext) -> OptimizerKnowledge {
+    pub fn serialize_optimizer_knowledge(&self, ctx: &mut OptContext) -> OptimizerKnowledge {
         let mut knowledge = OptimizerKnowledge::new();
 
         // heap.py:826-868 serialize_optheap: struct fields + array items
@@ -1207,7 +1207,7 @@ impl Optimizer {
     pub fn produce_potential_short_preamble_ops(
         &self,
         sb: &mut crate::optimizeopt::shortpreamble::ShortBoxes,
-        ctx: &OptContext,
+        ctx: &mut OptContext,
     ) {
         for pass in &self.passes {
             pass.produce_potential_short_preamble_ops(sb, ctx);
@@ -1217,7 +1217,7 @@ impl Optimizer {
     /// Collect all cached field entries from all passes.
     pub fn export_all_cached_fields(
         &self,
-        ctx: &OptContext,
+        ctx: &mut OptContext,
     ) -> Vec<(OpRef, majit_ir::DescrRef, OpRef)> {
         let mut result = Vec::new();
         for pass in &self.passes {
@@ -1229,7 +1229,7 @@ impl Optimizer {
     /// Collect all cached array item entries from all passes.
     pub fn export_all_cached_arrayitems(
         &self,
-        ctx: &OptContext,
+        ctx: &mut OptContext,
     ) -> Vec<(OpRef, i64, majit_ir::DescrRef, OpRef)> {
         let mut result = Vec::new();
         for pass in &self.passes {
@@ -2226,7 +2226,7 @@ impl Optimizer {
                 }
                 short_boxes.add_short_input_arg(arg, raw_type);
             }
-            self.produce_potential_short_preamble_ops(&mut short_boxes, &ctx);
+            self.produce_potential_short_preamble_ops(&mut short_boxes, &mut ctx);
             let produced = short_boxes.produced_ops();
             ctx.exported_short_boxes = produced
                 .into_iter()
@@ -2267,7 +2267,7 @@ impl Optimizer {
                     );
                 }
             }
-            let exported_int_bounds = self.collect_exported_int_bounds(&jump.args, &ctx);
+            let exported_int_bounds = self.collect_exported_int_bounds(&jump.args, &mut ctx);
             // RPython unroll.py passes optimize_preamble()'s inputargs here,
             // i.e. the external loop-entry contract, not the optimizer's
             // internal position base (`ctx.num_inputs`), which may be widened
@@ -2845,7 +2845,7 @@ impl Optimizer {
     fn collect_exported_int_bounds(
         &self,
         args: &[OpRef],
-        ctx: &OptContext,
+        ctx: &mut OptContext,
     ) -> std::collections::HashMap<OpRef, crate::optimizeopt::intutils::IntBound> {
         let mut exported = std::collections::HashMap::new();
         for pass in &self.passes {

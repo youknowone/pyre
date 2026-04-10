@@ -1060,7 +1060,7 @@ impl Optimization for OptPure {
     fn produce_potential_short_preamble_ops(
         &self,
         sb: &mut crate::optimizeopt::shortpreamble::ShortBoxes,
-        _ctx: &OptContext,
+        _ctx: &mut OptContext,
     ) {
         for op in &self.short_preamble_pure_ops {
             sb.add_pure_op(op.clone());
@@ -1977,7 +1977,7 @@ mod tests {
             OpRef(1),
             OpRef(2),
         ]);
-        pass.produce_potential_short_preamble_ops(&mut sb, &ctx);
+        pass.produce_potential_short_preamble_ops(&mut sb, &mut ctx);
         let collected = sb.produced_ops();
         assert_eq!(collected.len(), 1);
         assert!(matches!(
@@ -2016,7 +2016,7 @@ mod tests {
             OpRef(2),
             OpRef(100),
         ]);
-        pass.produce_potential_short_preamble_ops(&mut sb, &ctx);
+        pass.produce_potential_short_preamble_ops(&mut sb, &mut ctx);
         let collected = sb.produced_ops();
         assert_eq!(collected.len(), 1);
         assert!(matches!(
@@ -2064,7 +2064,7 @@ mod tests {
             OpRef(2),
             OpRef(100),
         ]);
-        rewrite.produce_potential_short_preamble_ops(&mut sb, &ctx);
+        rewrite.produce_potential_short_preamble_ops(&mut sb, &mut ctx);
         let collected = sb.produced_ops();
         assert_eq!(collected.len(), 1);
         assert!(matches!(

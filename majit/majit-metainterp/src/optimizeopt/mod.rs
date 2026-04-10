@@ -193,11 +193,6 @@ pub struct OptContext {
     // (preamble import) maps were a majit-only divergence from RPython's
     // single source of truth. They've been merged into Forwarded::IntBound
     // at write time so reads naturally see all sources via getintbound.
-    /// RPython shortpreamble.py / heap.py: imported cached constant-index array
-    /// reads from the preamble.
-    pub imported_short_arrayitems: HashMap<(OpRef, u32, i64), OpRef>,
-    /// Real descriptors for imported cached constant-index array reads.
-    pub imported_short_arrayitem_descrs: HashMap<(OpRef, u32, i64), DescrRef>,
     /// RPython shortpreamble.py / pure.py: imported pure-operation results from
     /// the preamble. Phase 2 uses these as cross-iteration CSE facts.
     pub imported_short_pure_ops: Vec<ImportedShortPureOp>,
@@ -722,8 +717,6 @@ impl OptContext {
             extra_operations_after: VecDeque::new(),
             pending_guard_class_postprocess: None,
             pending_mark_last_guard: None,
-            imported_short_arrayitems: HashMap::new(),
-            imported_short_arrayitem_descrs: HashMap::new(),
             imported_short_pure_ops: Vec::new(),
             imported_short_aliases: Vec::new(),
             imported_virtual_args: None,
@@ -801,8 +794,6 @@ impl OptContext {
             extra_operations_after: VecDeque::new(),
             pending_guard_class_postprocess: None,
             pending_mark_last_guard: None,
-            imported_short_arrayitems: HashMap::new(),
-            imported_short_arrayitem_descrs: HashMap::new(),
             imported_short_pure_ops: Vec::new(),
             imported_short_aliases: Vec::new(),
             imported_virtual_args: None,
@@ -2027,6 +2018,7 @@ impl OptContext {
                         descr,
                         lenbound,
                         items: Vec::new(),
+                        preamble_items: Vec::new(),
                         last_guard_pos: -1,
                     })
                 });
@@ -2043,6 +2035,7 @@ impl OptContext {
                         descr,
                         lenbound: IntBound::from_constant(len),
                         items: Vec::new(),
+                        preamble_items: Vec::new(),
                         last_guard_pos: -1,
                     })
                 });
@@ -3007,24 +3000,6 @@ impl OptContext {
     /// The trace was constant-folding through a null base pointer, which
     /// is an impossible execution path; the optimizer aborts so the JIT
     /// can retry with a different shape.
-    /// Read-only sibling of `get_const_info_mut`. Looks up the existing
-    /// `const_infos[gcref]` slot for a constant pointer base WITHOUT
-    /// inserting a new `StructPtrInfo` on a miss. Returns `None` if
-    /// `opref` is not a constant pointer or if the slot has not yet been
-    /// populated. Used by heap.rs read paths that consult PtrInfo as the
-    /// source of truth without mutating it.
-    pub fn get_const_info(&self, opref: OpRef) -> Option<&crate::optimizeopt::info::PtrInfo> {
-        use crate::optimizeopt::info::PtrInfo;
-        let gcref = match self.getptrinfo(opref).as_deref() {
-            Some(PtrInfo::Constant(g)) => *g,
-            _ => return None,
-        };
-        if gcref.is_null() {
-            return None;
-        }
-        self.const_infos.get(&gcref.0)
-    }
-
     /// Like `get_const_info_mut` but does NOT create an entry on miss.
     /// Returns `None` when:
     /// - `opref` is not a constant pointer
@@ -3048,14 +3023,21 @@ impl OptContext {
         self.const_infos.get_mut(&gcref.0)
     }
 
+    /// info.py:715-726 `ConstPtrInfo._get_info(descr, optheap)` parity.
+    ///
+    /// `parent_descr` is the parent SizeDescr, passed so that the
+    /// vacant-slot case creates `StructPtrInfo(descr)` (info.py:724)
+    /// rather than a bare `PtrInfo::instance(None, None)`. Callers
+    /// that don't have the parent descr (e.g. the field read path)
+    /// extract it from the field descr via
+    /// `descr.as_field_descr().get_parent_descr()`.
     pub fn get_const_info_mut(
         &mut self,
         opref: OpRef,
+        parent_descr: Option<DescrRef>,
     ) -> Option<&mut crate::optimizeopt::info::PtrInfo> {
         use crate::optimizeopt::info::PtrInfo;
         // info.py:719: ref = self._const.getref_base()
-        // Honor the RPython op.type dispatch via getptrinfo so a plain
-        // Value::Int (no Type::Ref override) is rejected here too.
         let gcref = match self.getptrinfo(opref).as_deref() {
             Some(PtrInfo::Constant(g)) => *g,
             _ => return None,
@@ -3070,10 +3052,16 @@ impl OptContext {
         use std::collections::hash_map::Entry;
         match self.const_infos.entry(addr) {
             // info.py:722-725: info = optheap.const_infos.get(ref, None)
-            //                  if info is None: info = StructPtrInfo(descr); ...
+            //                  if info is None: info = StructPtrInfo(descr)
+            //                  optheap.const_infos[ref] = info
             Entry::Occupied(e) => Some(e.into_mut()),
             Entry::Vacant(e) => {
-                Some(e.insert(crate::optimizeopt::info::PtrInfo::instance(None, None)))
+                // info.py:724: StructPtrInfo(descr)
+                let info = match parent_descr {
+                    Some(d) => PtrInfo::struct_ptr(d),
+                    None => PtrInfo::instance(None, None),
+                };
+                Some(e.insert(info))
             }
         }
     }
@@ -3152,8 +3140,13 @@ impl OptContext {
     pub fn structinfo_setfield(&mut self, op: &Op, field_idx: u32, value: OpRef) {
         let arg0 = self.get_box_replacement(op.arg(0));
         if arg0.is_constant() || self.get_constant(arg0).is_some() {
-            // info.py:750-752 ConstPtrInfo.setfield → const_infos route.
-            if let Some(info) = self.get_const_info_mut(arg0) {
+            // info.py:750-752 ConstPtrInfo.setfield → _get_info(parent_descr, optheap)
+            let parent_descr = op
+                .descr
+                .as_ref()
+                .and_then(|d| d.as_field_descr())
+                .and_then(|fd| fd.get_parent_descr());
+            if let Some(info) = self.get_const_info_mut(arg0, parent_descr) {
                 info.setfield(field_idx, value);
             }
             return;
@@ -3612,14 +3605,16 @@ pub trait Optimization {
     fn produce_potential_short_preamble_ops(
         &self,
         _sb: &mut crate::optimizeopt::shortpreamble::ShortBoxes,
-        _ctx: &OptContext,
+        _ctx: &mut OptContext,
     ) {
         // Default: no contribution
     }
 
-    /// Export all cached field entries from this pass.
-    /// Used to propagate heap cache from Phase 1 to Phase 2 via ExportedState.
-    fn export_cached_fields(&self, _ctx: &OptContext) -> Vec<(OpRef, majit_ir::DescrRef, OpRef)> {
+    /// heap.py:825-846 serialize_optheap — export struct field triples.
+    fn export_cached_fields(
+        &self,
+        _ctx: &mut OptContext,
+    ) -> Vec<(OpRef, majit_ir::DescrRef, OpRef)> {
         Vec::new()
     }
 
@@ -3634,7 +3629,7 @@ pub trait Optimization {
     /// heap.py:847-868 serialize_optheap — export array item triples.
     fn export_cached_arrayitems(
         &self,
-        _ctx: &OptContext,
+        _ctx: &mut OptContext,
     ) -> Vec<(OpRef, i64, majit_ir::DescrRef, OpRef)> {
         Vec::new()
     }
@@ -3796,14 +3791,14 @@ mod constant_ptr_info_tests {
         // then mark a known class so the second lookup observes it.
         {
             let info = ctx
-                .get_const_info_mut(opref)
+                .get_const_info_mut(opref, None)
                 .expect("Ref constant should have const_infos slot");
             *info = PtrInfo::known_class(GcRef(0x1111_2222), true);
         }
         // Second lookup: the slot must contain the previously written
         // PtrInfo, not a freshly minted Instance.
         let info = ctx
-            .get_const_info_mut(opref)
+            .get_const_info_mut(opref, None)
             .expect("Ref constant should still have const_infos slot");
         match info {
             PtrInfo::Instance(iinfo) => {
@@ -3832,14 +3827,14 @@ mod constant_ptr_info_tests {
         // Mutate via the Ref-typed constant.
         {
             let info = ctx
-                .get_const_info_mut(ref_op)
+                .get_const_info_mut(ref_op, None)
                 .expect("Ref constant should resolve");
             *info = PtrInfo::known_class(GcRef(0xc0de_cafe), true);
         }
         // Read back via the typed-Int alias — must observe the same
         // PtrInfo because both keys hash to the same const_infos entry.
         let info = ctx
-            .get_const_info_mut(int_op)
+            .get_const_info_mut(int_op, None)
             .expect("typed-Int alias should resolve to the same slot");
         match info {
             PtrInfo::Instance(iinfo) => {
@@ -3864,7 +3859,7 @@ mod constant_ptr_info_tests {
             let mut ctx = OptContext::new(0);
             let ref_null = OpRef(10_007);
             ctx.seed_constant(ref_null, Value::Ref(GcRef(0)));
-            let _ = ctx.get_const_info_mut(ref_null);
+            let _ = ctx.get_const_info_mut(ref_null, None);
         }));
         let err = result.expect_err("expected InvalidLoop panic");
         let invalid = err
@@ -3884,7 +3879,7 @@ mod constant_ptr_info_tests {
             ctx.seed_constant(int_null, Value::Int(0));
             ctx.constant_types_for_numbering
                 .insert(int_null.0, Type::Ref);
-            let _ = ctx.get_const_info_mut(int_null);
+            let _ = ctx.get_const_info_mut(int_null, None);
         }));
         let err = result.expect_err("expected InvalidLoop panic");
         let invalid = err
@@ -3903,7 +3898,7 @@ mod constant_ptr_info_tests {
         let opref = OpRef(10_010);
         ctx.seed_constant(opref, Value::Int(0));
         // No constant_types_for_numbering entry → no Ref override.
-        assert!(ctx.get_const_info_mut(opref).is_none());
+        assert!(ctx.get_const_info_mut(opref, None).is_none());
     }
 }
 
