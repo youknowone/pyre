@@ -379,6 +379,12 @@ struct RegisteredLoopTarget {
     num_inputs: usize,
     num_ref_roots: usize,
     max_output_slots: usize,
+    /// Total jitframe depth = max_output_slots + num_ref_roots.
+    /// RPython: regalloc.py JITFRAME_FIXED_SIZE + depth. Used by
+    /// CallAssemblerI to allocate a large enough callee jitframe
+    /// that ref root spill slots (after max_output_slots) don't
+    /// overflow the allocation.
+    frame_depth: usize,
     inputarg_types: Vec<Type>,
     /// virtualizable.py:86 read_boxes: number of scalar inputargs
     /// (frame + static fields). First local is at this index.
@@ -1905,6 +1911,7 @@ fn register_call_assembler_target(
         num_inputs: compiled.num_inputs,
         num_ref_roots: compiled.num_ref_roots,
         max_output_slots: compiled.max_output_slots,
+        frame_depth: compiled.max_output_slots + compiled.num_ref_roots,
         inputarg_types: token.inputarg_types.clone(),
         // virtualizable.py:86 read_boxes: header = frame + static fields.
         // If token doesn't have this set, derive from inputarg_types:
@@ -1971,6 +1978,7 @@ pub fn register_pending_call_assembler_target(
         num_inputs,
         num_ref_roots: 0,
         max_output_slots: 1,
+        frame_depth: 1,
         inputarg_types,
         num_scalar_inputargs,
     };
@@ -6985,10 +6993,15 @@ impl CraneliftBackend {
                     }
 
                     // args_slot has JF header (64B) + items. Shared for inputs AND outputs.
-                    let out_slots = resolved_target
+                    // RPython jitframe layout: fail_args occupy [0..max_output_slots),
+                    // ref root spill slots occupy [max_output_slots..frame_depth).
+                    // The callee jitframe must be large enough for BOTH, otherwise
+                    // ref root writes (at ref_root_base_ofs + i*8) overflow the
+                    // stack allocation.
+                    let callee_depth = resolved_target
                         .as_ref()
-                        .map_or(16, |t| t.max_output_slots.max(1));
-                    let jf_depth = call_descr.arg_types().len().max(out_slots).max(1);
+                        .map_or(16, |t| t.frame_depth.max(t.max_output_slots).max(1));
+                    let jf_depth = call_descr.arg_types().len().max(callee_depth).max(1);
                     let jf_bytes = (JF_FRAME_ITEM0_OFS as u32) + (jf_depth as u32) * 8;
                     let args_slot = builder.create_sized_stack_slot(StackSlotData::new(
                         StackSlotKind::ExplicitSlot,
