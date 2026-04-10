@@ -545,12 +545,11 @@ impl ShortBoxes {
     }
 
     pub fn note_known_constants_from_ctx(&mut self, ctx: &crate::optimizeopt::OptContext) {
-        // Only register true Const objects that survive across iterations.
-        // Optimizer-known constants on ordinary OpRefs (for example, values
-        // learned from GUARD_VALUE / GUARD_TRUE / GUARD_FALSE) are trace-local
-        // facts, not invariant Const boxes. Treating them as short-preamble
-        // constants leaks per-iteration specialization into the next loop
-        // import and can turn valid guards into stale constant guards.
+        // RPython shortpreamble.py only exposes real `Const` objects here.
+        // In majit those live in the constant namespace (`OpRef::from_const`).
+        // Ordinary OpRefs that happen to be known-constant for the current
+        // iteration must stay trace-local boxes, or short-preamble import can
+        // leak one iteration's guard knowledge into the next.
         for (&const_idx, _) in &ctx.const_pool {
             self.note_known_constant(OpRef::from_const(const_idx));
         }
