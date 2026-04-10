@@ -601,10 +601,8 @@ impl Optimizer {
             // letting it through reaches `same_as_for_type(Void)`, which is
             // `unreachable!` and panics with a clear message.
             let tp = ctx
-                .value_types
-                .get(&label_arg.0)
-                .copied()
-                .unwrap_or(majit_ir::Type::Int);
+                .opref_type(*label_arg)
+                .expect("imported virtual leaf missing box.type");
             let same_as_op = majit_ir::OpCode::same_as_for_type(tp);
             let mut op = majit_ir::Op::new(same_as_op, &[*label_arg]);
             op.pos = ctx.reserve_pos();
@@ -2082,10 +2080,8 @@ impl Optimizer {
                 // wraps a runtime value. Look up the OpRef's type from
                 // `value_types` (maintained per op result type by emit()).
                 let raw_type = ctx
-                    .value_types
-                    .get(&arg.0)
-                    .copied()
-                    .unwrap_or(majit_ir::Type::Int);
+                    .opref_type(arg)
+                    .expect("preview short arg missing box.type");
                 if raw_type == majit_ir::Type::Void {
                     // Upstream collision: a previously-virtual OpRef whose
                     // position was reused as a Phase 2 constant slot — its
