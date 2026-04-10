@@ -142,6 +142,10 @@ impl Assembler {
         jitcode.resulttypes = state.resulttypes;
         // RPython assembler.py:49 `jitcode._ssarepr = ssarepr`
         jitcode._ssarepr = Some(ssarepr.clone());
+        // RPython: descrs are stored on the builder and shared across jitcodes.
+        // pyre: per-jitcode assembler, so descrs are stored on the jitcode itself.
+        // The blackhole loads them via setposition().
+        jitcode.descrs = std::mem::take(&mut self.descrs);
         // index + jitdriver_sd are set by CodeWriter after assembly
         // (RPython codewriter.py:68 `jitcode.index = index`).
 

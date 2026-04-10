@@ -1051,6 +1051,11 @@ impl BlackholeInterpreter {
         }
 
         // blackhole.py:336-337
+        // RPython: descrs are shared on the builder (setup_descrs).
+        // pyre: per-jitcode descrs, loaded here.
+        if !jitcode.descrs.is_empty() {
+            self.descrs = jitcode.descrs.clone();
+        }
         self.jitcode = jitcode;
         self.position = position;
         self.aborted = false;
@@ -1072,6 +1077,38 @@ impl BlackholeInterpreter {
             .map(|f| f as usize as i64)
             .unwrap_or(0);
         (fnptr, ())
+    }
+
+    /// Resolve field descriptor offsets in this interpreter's descrs table.
+    /// Delegates to the same logic as BlackholeInterpBuilder::resolve_field_offsets.
+    pub fn resolve_field_offsets(&mut self, resolver: impl Fn(&str, &str) -> usize) {
+        for descr in &mut self.descrs {
+            if let BhDescr::Field {
+                offset,
+                name,
+                owner,
+            } = descr
+            {
+                if *offset == 0 && !name.is_empty() {
+                    *offset = resolver(owner, name);
+                }
+            }
+        }
+    }
+
+    /// Resolve JitCode fnaddr values in this interpreter's descrs table.
+    pub fn resolve_jitcode_fnaddrs(&mut self, resolver: impl Fn(usize) -> i64) {
+        for descr in &mut self.descrs {
+            if let BhDescr::JitCode {
+                jitcode_index,
+                fnaddr,
+            } = descr
+            {
+                if *fnaddr == 0 {
+                    *fnaddr = resolver(*jitcode_index);
+                }
+            }
+        }
     }
 
     /// blackhole.py:1109-1116 bhimpl_recursive_call_r:

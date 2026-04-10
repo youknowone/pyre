@@ -233,6 +233,11 @@ pub struct JitCode {
     /// without it the runtime would need a separate runtime_stacks Vec
     /// (which RPython jitcodes never use).
     pub depth_at_py_pc: Vec<u16>,
+    /// RPython: `BlackholeInterpBuilder.descrs` — shared descriptor table for
+    /// 'd'/'j' argcode resolution (blackhole.py:102-103 `setup_descrs`).
+    /// pyre: stored per-jitcode. Loaded into `BlackholeInterpreter.descrs`
+    /// by `setposition()`. Empty until the codewriter populates it.
+    pub descrs: Vec<majit_codewriter::jitcode::BhDescr>,
 }
 
 /// blackhole.py catch_exception: pre-computed exception handler for a JitCode PC range.

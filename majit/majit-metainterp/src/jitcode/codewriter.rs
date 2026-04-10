@@ -1121,6 +1121,7 @@ impl JitCodeBuilder {
             stack_base: 0,
             depth_at_py_pc: Vec::new(),
             jitdriver_sd: None,
+            descrs: Vec::new(),
         }
     }
 
