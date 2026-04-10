@@ -1756,8 +1756,11 @@ impl Optimization for OptVirtualize {
                             //   self.last_emitted_operation = REMOVED
                             if op.num_args() >= 2 {
                                 if let Some(size) = ctx.get_constant_int(op.arg(1)) {
+                                    // resume.py:694: self.func = source_op.getarg(0).getint()
+                                    let func = ctx.get_constant_int(op.arg(0)).unwrap_or(0);
                                     let info = PtrInfo::VirtualRawBuffer(
                                         crate::optimizeopt::info::VirtualRawBufferInfo {
+                                            func,
                                             size: size as usize,
                                             entries: Vec::new(),
                                             last_guard_pos: -1,

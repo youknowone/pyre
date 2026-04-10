@@ -542,6 +542,7 @@ pub(crate) fn build_guard_metadata(
                                     offsets,
                                     entry_sizes,
                                     fieldnums,
+                                    ..
                                 } => {
                                     let entries = fieldnums
                                         .iter()

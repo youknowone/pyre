@@ -1769,6 +1769,9 @@ pub struct VirtualRawSliceInfo {
 /// by offset and must never overlap (matching RPython's RawBuffer invariant).
 #[derive(Clone, Debug)]
 pub struct VirtualRawBufferInfo {
+    /// resume.py:695: self.func — raw malloc function pointer.
+    /// Used by allocate_raw_buffer to emit CALL_I(func, size).
+    pub func: i64,
     /// Size of the buffer in bytes.
     pub size: usize,
     /// Values stored at byte offsets: (offset, length, value_opref).
