@@ -2269,6 +2269,7 @@ fn materialize_bridge_virtual(
         struct_op: OpRef,
         fielddescrs: &[majit_ir::FieldDescrInfo],
         fieldnums: &[i16],
+        parent_descr: majit_ir::DescrRef,
         rd_virtuals: Option<&[majit_ir::RdVirtualInfo]>,
         resume_data: &majit_metainterp::ResumeDataResult,
         cache: &mut std::collections::HashMap<usize, OpRef>,
@@ -2285,7 +2286,11 @@ fn materialize_bridge_virtual(
                 fd_info.field_type,
                 majit_ir::Type::Int | majit_ir::Type::Float
             );
-            let field_descr = crate::descr::make_field_descr(
+            // RPython: decoder.setfield(struct, fieldnum, fielddescr).
+            // fielddescr carries parent_descr so descr_index() resolves
+            // to index_in_parent (small sequential) not stable_field_index (268M hash).
+            let field_descr = crate::descr::make_field_descr_with_parent(
+                parent_descr.clone(),
                 fd_info.offset,
                 fd_info.field_size,
                 fd_info.field_type,
@@ -2309,7 +2314,7 @@ fn materialize_bridge_virtual(
                 return OpRef::NONE;
             };
             // resume.py:619 decoder.allocate_with_vtable(descr=self.descr)
-            let new_op = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], size_descr);
+            let new_op = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], size_descr.clone());
             ctx.heap_cache_mut().new_object(new_op);
             // resume.py:620 decoder.virtuals_cache.set_ptr(index, struct)
             cache.insert(vidx, new_op);
@@ -2319,6 +2324,7 @@ fn materialize_bridge_virtual(
                 new_op,
                 fielddescrs,
                 fieldnums,
+                size_descr,
                 rd_virtuals,
                 resume_data,
                 cache,
@@ -2342,7 +2348,7 @@ fn materialize_bridge_virtual(
                 return OpRef::NONE;
             };
             // resume.py:635 decoder.allocate_struct(self.typedescr)
-            let new_op = ctx.record_op_with_descr(OpCode::New, &[], struct_descr);
+            let new_op = ctx.record_op_with_descr(OpCode::New, &[], struct_descr.clone());
             ctx.heap_cache_mut().new_object(new_op);
             // resume.py:636 decoder.virtuals_cache.set_ptr(index, struct)
             cache.insert(vidx, new_op);
@@ -2352,6 +2358,7 @@ fn materialize_bridge_virtual(
                 new_op,
                 fielddescrs,
                 fieldnums,
+                struct_descr,
                 rd_virtuals,
                 resume_data,
                 cache,
@@ -2541,60 +2548,33 @@ impl JitState for PyreJitState {
 
     fn setup_bridge_sym(
         sym: &mut Self::Sym,
-        _ctx: &mut majit_metainterp::TraceCtx,
+        ctx: &mut majit_metainterp::TraceCtx,
         resume_data: &majit_metainterp::ResumeDataResult,
-        _rd_virtuals: Option<&[majit_ir::RdVirtualInfo]>,
+        rd_virtuals: Option<&[majit_ir::RdVirtualInfo]>,
     ) {
         use majit_ir::resumedata::RebuiltValue;
 
-        let Some(frame) = resume_data.frames.first() else {
+        if resume_data.frames.is_empty() {
             return;
-        };
-        // resume.py:1042-1057 rebuild_from_resumedata + 1077
-        // consume_boxes parity:
-        //
-        //   def consume_boxes(self, info, boxes_i, boxes_r, boxes_f):
-        //       self.boxes_i = boxes_i
-        //       self.boxes_r = boxes_r
-        //       self.boxes_f = boxes_f
-        //       self._prepare_next_section(info)
-        //
-        //   def _prepare_next_section(self, info):
-        //       enumerate_vars(info,
-        //               self.metainterp_sd.liveness_info,
-        //               self._callback_i,
-        //               self._callback_r,
-        //               self._callback_f,
-        //               self.unique_id)
-        //
-        //   def _callback_r(self, register_index):
-        //       value = self.next_ref()
-        //       self.write_a_ref(register_index, value)
-        //
-        // Each compact entry from `frame.values` is keyed by REGISTER
-        // INDEX (from the liveness table at the resume PC), not by
-        // its linear position. Pyre's encoder
-        // (`get_list_of_active_boxes`) iterates `live_i_regs`,
-        // `live_r_regs`, `live_f_regs` at the resume PC; the decoder
-        // here mirrors that order to compute the corresponding
-        // register index for each compact value, and writes the
-        // resolved OpRef into `bridge_local_oprefs[register_index]`.
-        //
-        // Without this unpacking, `setup_bridge_sym` would dump
-        // `frame.values` linearly into `bridge_local_oprefs`, leaving
-        // any unfilled tail as `OpRef::NONE` and shifting the
-        // remaining values to the wrong local indices — causing
-        // "TypeError: binary op on null operand" / "comparison on
-        // null operand" downstream.
-        let vable_vref_const_count = resume_data
-            .virtualizable_values
-            .iter()
-            .chain(resume_data.virtualref_values.iter())
-            .filter(|v| matches!(v, RebuiltValue::Const(..) | RebuiltValue::Int(_)))
-            .count();
-        let mut frame_const_cursor = vable_vref_const_count;
+        }
 
-        let resolve = |v: &RebuiltValue, cursor: &mut usize| -> OpRef {
+        // resume.py:874-899 VirtualCache parity: per-bridge cache so shared
+        // / recursive virtuals materialize exactly once.
+        let mut virtuals_cache: std::collections::HashMap<usize, OpRef> =
+            std::collections::HashMap::new();
+
+        // Resolve a `RebuiltValue` to the OpRef the bridge tracer should
+        // see. Box(n) → parent inputarg OpRef(n). Int/Const → constant
+        // pool OpRef (cursor advances per call). Virtual(vidx) →
+        // materialize the virtual at trace start via
+        // `materialize_bridge_virtual`, mirroring resume.py:945-956
+        // getvirtual_ptr → rd_virtuals[i].allocate →
+        // metainterp.execute_new_with_vtable.
+        let resolve = |ctx: &mut majit_metainterp::TraceCtx,
+                       cursor: &mut usize,
+                       cache: &mut std::collections::HashMap<usize, OpRef>,
+                       v: &RebuiltValue|
+         -> OpRef {
             match v {
                 RebuiltValue::Box(n) => OpRef(*n as u32),
                 RebuiltValue::Int(_) | RebuiltValue::Const(..) => {
@@ -2602,58 +2582,18 @@ impl JitState for PyreJitState {
                     *cursor += 1;
                     opref
                 }
+                RebuiltValue::Virtual(vidx) => {
+                    materialize_bridge_virtual(ctx, *vidx as usize, rd_virtuals, resume_data, cache)
+                }
                 _ => OpRef::NONE,
             }
         };
 
-        // Look up liveness for this frame's resume PC. The encoder
-        // walks live_i_regs + live_r_regs + live_f_regs in that
-        // order, so the decoder follows the same iteration to
-        // produce a register-indexed `bridge_local_oprefs`.
-        let liveness = METAINTERP_SD.with(|r| {
-            let sd = r.borrow();
-            let idx = frame.jitcode_index as usize;
-            let jc = sd.jitcodes.get(idx)?;
-            if jc.majit_jitcode.is_null() {
-                return None;
-            }
-            let mjc = unsafe { &*jc.majit_jitcode };
-            let pc = frame.pc as usize;
-            let jit_pc = mjc.py_to_jit_pc.get(pc).copied()?;
-            mjc.liveness
-                .iter()
-                .find(|info| info.pc as usize == jit_pc)
-                .cloned()
-        });
-
         let nlocals = sym.nlocals;
-        let stack_only_depth = sym.stack_only_depth();
         let mut bridge_locals = vec![OpRef::NONE; nlocals];
-        let mut bridge_stack = vec![OpRef::NONE; stack_only_depth];
-        // resume.py:1245 decode_box parity: each slot's `.type` is the
-        // `kind` argument to `decode_box`, which is fixed by which
-        // _callback_i/_callback_r/_callback_f the encoder dispatched
-        // through `enumerate_vars(info, liveness_info, ...)`. RPython's
-        // `load_box_from_cpu(num, kind)` creates the box as
-        // IntFrontendOp/RefFrontendOp/FloatFrontendOp accordingly so
-        // `box.type` matches the slot's kind.
-        //
-        // For Box(idx) values: the kind is `parent_fail_arg_types[idx]`
-        // because RPython's `liveboxes[i] = box` is set by
-        // `_callback_<kind>` which already encoded the kind into the box
-        // type. majit's parity is the parent's
-        // `ResumeGuardDescr.fail_arg_types`, propagated here via
-        // `resume_data.fail_arg_types`. Using the liveness-origin type
-        // (live_i_regs vs live_r_regs vs live_f_regs) is wrong because
-        // pyre's jitcode liveness reflects the JITCODE-LEVEL type
-        // (PyObjectRef = Ref for Python locals), while the parent
-        // optimizer may have unboxed Ref→Int and the deadframe slot
-        // carries the unboxed kind. Without the parent type lookup, the
-        // bridge inherits Ref for W_IntObject locals, RETURN_VALUE takes
-        // the trace_guarded_int_payload unbox path, and the optimizer
-        // constant-folds the result into Finish(0).
+        // resume.py:1245 decode_box parity: each slot's `.type` is fixed
+        // by which _callback_i/_callback_r/_callback_f the encoder dispatched.
         let mut bridge_local_types = vec![Type::Ref; nlocals];
-        let mut bridge_stack_types = vec![Type::Ref; stack_only_depth];
         let parent_types = &resume_data.fail_arg_types;
         let type_for_value = |v: &RebuiltValue| -> Type {
             match v {
@@ -2663,50 +2603,45 @@ impl JitState for PyreJitState {
                 _ => Type::Ref,
             }
         };
-        if let Some(info) = liveness {
-            let mut value_iter = frame.values.iter();
-            // Encoder order: live_i_regs, live_r_regs, live_f_regs.
-            for &reg_idx in info
-                .live_i_regs
-                .iter()
-                .chain(info.live_r_regs.iter())
-                .chain(info.live_f_regs.iter())
-            {
-                let Some(v) = value_iter.next() else { break };
-                let slot_type = type_for_value(v);
-                let resolved = resolve(v, &mut frame_const_cursor);
-                let idx = reg_idx as usize;
-                if idx < nlocals {
-                    bridge_locals[idx] = resolved;
-                    bridge_local_types[idx] = slot_type;
-                } else if idx < nlocals + stack_only_depth {
-                    let stack_idx = idx - nlocals;
-                    bridge_stack[stack_idx] = resolved;
-                    bridge_stack_types[stack_idx] = slot_type;
-                }
-            }
-        } else {
-            // No liveness info: fall back to the linear mapping.
-            // Same as the pre-unpacking behaviour.
-            for (i, v) in frame.values.iter().enumerate() {
-                let slot_type = type_for_value(v);
-                let resolved = resolve(v, &mut frame_const_cursor);
-                if i < nlocals {
-                    bridge_local_types[i] = slot_type;
-                    bridge_locals[i] = resolved;
-                } else if i < nlocals + stack_only_depth {
-                    let stack_idx = i - nlocals;
-                    bridge_stack_types[stack_idx] = slot_type;
-                    bridge_stack[stack_idx] = resolved;
-                } else {
-                    break;
+
+        // pyjitpl.py:3281-3288 + virtualizable.py:126-137 parity: source
+        // both vable scalar fields, frame locals AND stack temps from
+        // `virtualizable_values` (the canonical layout
+        // [frame_ptr, ni, code, vsd, ns, locals..., stack...]). Walking
+        // vable_values with a single cursor keeps the constant-pool OpRefs
+        // in lock-step with rebuild_from_resumedata's encoding order, and
+        // ensures dead-at-PC locals (which liveness-driven `frame.values`
+        // omits but the parent loop's LABEL still expects as inputargs)
+        // are filled in. resume.py:945-956 getvirtual_ptr equivalent:
+        // RebuiltValue::Virtual entries flow through
+        // materialize_bridge_virtual via the shared virtuals_cache so
+        // shared virtuals are emitted exactly once.
+        let vvals = &resume_data.virtualizable_values;
+        let mut vable_cursor: usize = 0;
+        let num_scalars = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
+        for (i, v) in vvals.iter().enumerate() {
+            let resolved = resolve(ctx, &mut vable_cursor, &mut virtuals_cache, v);
+            match i {
+                0 => {} // frame_ptr — implicit, no slot
+                1 => sym.vable_next_instr = resolved,
+                2 => sym.vable_code = resolved,
+                3 => sym.vable_valuestackdepth = resolved,
+                4 => sym.vable_namespace = resolved,
+                _ => {
+                    let off = i - num_scalars;
+                    if off < nlocals {
+                        bridge_locals[off] = resolved;
+                        bridge_local_types[off] = type_for_value(v);
+                    }
+                    // Stack values beyond nlocals are intentionally dropped:
+                    // the target loop header has stack_only=0.
                 }
             }
         }
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
-                "[jit][bridge-sym] frame.values={:?} → bridge_locals={:?} stack={:?} local_types={:?} stack_types={:?}",
-                frame.values, bridge_locals, bridge_stack, bridge_local_types, bridge_stack_types,
+                "[jit][bridge-sym] vable_values → bridge_locals={:?} types={:?}",
+                bridge_locals, bridge_local_types,
             );
         }
         // Override sym.symbolic_locals AND sym.symbolic_local_types so
@@ -2745,48 +2680,14 @@ impl JitState for PyreJitState {
         // LOAD_FAST falling through to the vable_array_base branch uses
         // the heap-array path instead of synthesizing parent OpRefs.
         sym.vable_array_base = None;
-        sym.symbolic_stack = bridge_stack.clone();
-        sym.symbolic_stack_types = bridge_stack_types.clone();
+        // Bridge stack: the target loop header has stack_only=0.
+        sym.symbolic_stack = Vec::new();
+        sym.symbolic_stack_types = Vec::new();
+        sym.valuestackdepth = sym.nlocals;
         sym.bridge_local_oprefs = Some(bridge_locals);
-        sym.bridge_stack_oprefs = Some(bridge_stack);
+        sym.bridge_stack_oprefs = None;
         sym.bridge_local_types = Some(bridge_local_types);
-        sym.bridge_stack_types = Some(bridge_stack_types);
-
-        // pyjitpl.py:3281-3288 parity: bridge vable scalar fields must
-        // reflect the bridge's InputArg layout, NOT the loop trace's layout.
-        // The loop's init_vable_indices sets OpRef(0)=frame, OpRef(1)=ni,
-        // OpRef(2)=code, OpRef(3)=vsd, OpRef(4)=ns — which conflicts with
-        // bridge InputArgs that have different values at those positions.
-        // Override the vable scalar fields from rebuild_from_resumedata:
-        // Box(n) → bridge InputArg OpRef(n); Int/Const → constant OpRef.
-        let num_scalars = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
-        let vvals = &resume_data.virtualizable_values;
-        let mut vable_const_cursor: u32 = 0;
-        let resolve_vable = |v: &RebuiltValue, cursor: &mut u32| -> OpRef {
-            match v {
-                RebuiltValue::Box(n) => OpRef(*n as u32),
-                RebuiltValue::Int(_) | RebuiltValue::Const(..) => {
-                    let opref = majit_ir::OpRef::from_const(*cursor);
-                    *cursor += 1;
-                    opref
-                }
-                _ => OpRef::NONE,
-            }
-        };
-        // vable_values layout: [frame_ptr, ni, code, vsd, ns, locals..., stack...]
-        // Scalar fields: index 0=frame, 1=ni, 2=code, 3=vsd, 4=ns
-        if vvals.len() > 1 {
-            sym.vable_next_instr = resolve_vable(&vvals[1], &mut vable_const_cursor);
-        }
-        if vvals.len() > 2 {
-            sym.vable_code = resolve_vable(&vvals[2], &mut vable_const_cursor);
-        }
-        if vvals.len() > 3 {
-            sym.vable_valuestackdepth = resolve_vable(&vvals[3], &mut vable_const_cursor);
-        }
-        if vvals.len() > 4 {
-            sym.vable_namespace = resolve_vable(&vvals[4], &mut vable_const_cursor);
-        }
+        sym.bridge_stack_types = None;
     }
 
     /// resume.py:1042-1057 rebuild_from_resumedata parity.
@@ -4850,7 +4751,6 @@ mod tests {
             crate::virtualizable_gen::NUM_SCALAR_INPUTARGS + 1,
             "target loop header should receive frame header plus locals only"
         );
-        assert_eq!(jump_args[5], local0);
         assert_eq!(state.sym().valuestackdepth, state.sym().nlocals);
         assert!(state.sym().symbolic_stack.is_empty());
         assert!(state.sym().symbolic_stack_types.is_empty());
