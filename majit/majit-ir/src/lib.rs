@@ -9,8 +9,8 @@ pub use descr::{
     AccumVectorInfo, ArrayDescr, CallDescr, DebugMergePointDescr, DebugMergePointInfo, Descr,
     DescrRef, EffectInfo, ExtraEffect, FailDescr, FieldDescr, InteriorFieldDescr, LoopTargetDescr,
     OopSpecIndex, SimpleCallDescr, SimpleFailDescr, SimpleFieldDescr, SizeDescr, TargetArgLoc,
-    descr_identity, make_array_descr, make_field_descr, make_size_descr_full,
-    make_size_descr_with_vtable, unpack_fielddescr,
+    descr_identity, make_array_descr, make_field_descr, make_loop_target_descr,
+    make_size_descr_full, make_size_descr_with_vtable, unpack_fielddescr,
 };
 pub use resoperation::{
     BoxEnv, FieldDescrInfo, GuardPendingFieldEntry, OPCODE_COUNT, Op, OpCode, OpRef, RdVirtualInfo,

@@ -1296,12 +1296,7 @@ impl OptVirtualize {
         // of unrelated virtuals when the vref struct is forced.
         ctx.set_ptr_info(token_ref, PtrInfo::nonnull());
 
-        // Use a sentinel OpRef for the NULL constant in the `forced` field.
-        // We don't emit it now; when the virtual struct is forced, the
-        // constant 0 is emitted lazily. Using OpRef::NONE here is safe
-        // because force_virtual checks whether a field value is virtual
-        // before forcing it, and OpRef::NONE is never virtual.
-        let null_ref = OpRef::NONE;
+        let null_ref = self.emit_constant_ref(ctx, majit_ir::GcRef::NULL);
 
         let fields = vec![
             (VREF_VIRTUAL_TOKEN_FIELD_INDEX, token_ref),
@@ -1310,7 +1305,10 @@ impl OptVirtualize {
         let vinfo = VirtualStructInfo {
             descr: vref_descr,
             fields,
-            field_descrs: Vec::new(),
+            field_descrs: vec![
+                make_field_index_descr(VREF_VIRTUAL_TOKEN_FIELD_INDEX),
+                make_field_index_descr(VREF_FORCED_FIELD_INDEX),
+            ],
             last_guard_pos: -1,
         };
         ctx.set_ptr_info(op.pos, PtrInfo::VirtualStruct(vinfo));
@@ -1953,7 +1951,12 @@ fn get_field_descr(field_descrs: &[(u32, DescrRef)], field_idx: u32) -> Option<D
 }
 
 fn get_struct_field_descr(field_descrs: &[DescrRef], field_idx: u32) -> Option<DescrRef> {
-    field_descrs.get(field_idx as usize).cloned()
+    field_descrs.get(field_idx as usize).cloned().or_else(|| {
+        field_descrs
+            .iter()
+            .find(|descr| descr.index() == field_idx)
+            .cloned()
+    })
 }
 
 fn get_field(fields: &[(u32, OpRef)], field_idx: u32) -> Option<OpRef> {
@@ -2121,6 +2124,9 @@ mod tests {
         fn get_parent_descr(&self) -> Option<DescrRef> {
             Some(size_descr(0xFFFF_0000))
         }
+        fn index_in_parent(&self) -> usize {
+            self.idx as usize
+        }
         fn offset(&self) -> usize {
             self.idx as usize * 8
         }
@@ -2135,6 +2141,38 @@ mod tests {
     #[derive(Debug)]
     struct TestArrayDescr {
         idx: u32,
+    }
+
+    #[derive(Debug)]
+    struct TestRefFieldDescr {
+        idx: u32,
+    }
+
+    impl Descr for TestRefFieldDescr {
+        fn index(&self) -> u32 {
+            self.idx
+        }
+        fn as_field_descr(&self) -> Option<&dyn FieldDescr> {
+            Some(self)
+        }
+    }
+
+    impl FieldDescr for TestRefFieldDescr {
+        fn get_parent_descr(&self) -> Option<DescrRef> {
+            Some(size_descr(0xFFFF_0000))
+        }
+        fn index_in_parent(&self) -> usize {
+            self.idx as usize
+        }
+        fn offset(&self) -> usize {
+            self.idx as usize * 8
+        }
+        fn field_size(&self) -> usize {
+            8
+        }
+        fn field_type(&self) -> majit_ir::Type {
+            majit_ir::Type::Ref
+        }
     }
 
     impl Descr for TestArrayDescr {
@@ -2152,14 +2190,7 @@ mod tests {
     }
 
     fn ref_field_descr(idx: u32) -> DescrRef {
-        // ensure_ptr_info_arg0 (mod.rs:3082) requires field descrs flowing
-        // into GETFIELD/SETFIELD to carry a parent_descr backreference per
-        // optimizer.py:478. Wrap the SimpleFieldDescr with a synthetic Struct
-        // parent (matches the test setup for TestFieldDescr above).
-        Arc::new(
-            majit_ir::SimpleFieldDescr::new(idx, idx as usize * 8, 8, Type::Ref, false)
-                .with_parent_descr(size_descr(0xFFFF_0000), 0),
-        )
+        Arc::new(TestRefFieldDescr { idx })
     }
 
     fn array_descr(idx: u32) -> DescrRef {
@@ -3132,21 +3163,21 @@ mod tests {
     #[test]
     fn test_virtual_ref_getfield_on_virtual_vref() {
         // vref = virtual_ref_r(obj, token)
-        // i0 = getfield_gc_i(vref, descr=vref_forced_field)
+        // p0 = getfield_gc_r(vref, descr=vref_forced_field)
         //
         // The vref is virtual, so getfield should return the virtual field value.
-        let forced_descr = field_descr(super::VREF_FORCED_FIELD_INDEX);
+        let forced_descr = ref_field_descr(super::VREF_FORCED_FIELD_INDEX);
 
         let mut ops = vec![
             Op::new(OpCode::VirtualRefR, &[OpRef(100), OpRef(101)]), // pos=0
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(0)], forced_descr), // pos=1
+            Op::with_descr(OpCode::GetfieldGcR, &[OpRef(0)], forced_descr), // pos=1
         ];
         assign_positions(&mut ops);
 
         let result = run_pass(&ops);
 
         // The getfield should be removed (the forced field is a known constant 0)
-        let has_getfield = result.iter().any(|o| o.opcode == OpCode::GetfieldGcI);
+        let has_getfield = result.iter().any(|o| o.opcode == OpCode::GetfieldGcR);
         assert!(
             !has_getfield,
             "getfield on virtual vref should be removed; got: {:?}",

@@ -2077,11 +2077,14 @@ impl<M: Clone> MetaInterp<M> {
                         );
                     }
                     self.cancel_count += 1;
-                    // pyjitpl.py:3021-3030: try without unrolling.
-                    // RPython retries after cancel_count > max_unroll_loops because
-                    // RPython's tracer continues after InvalidLoop (same MetaInterp).
-                    // pyre's tracer resets cancel_count each session, so we retry
-                    // immediately on FIRST InvalidLoop to avoid infinite retry loops.
+                    // pyjitpl.py:3021-3030: only after the retry budget is
+                    // exhausted do we try one last time without unrolling.
+                    if !self.cancelled_too_many_times() {
+                        self.warm_state.abort_tracing(green_key, false);
+                        self.exported_state = None;
+                        self.warm_state.reset_function_counts();
+                        return CompileOutcome::Cancelled;
+                    }
                     {
                         let mut retry_constants = constants_snapshot;
                         let mut simple_opt = Optimizer::default_pipeline();
@@ -2143,6 +2146,7 @@ impl<M: Clone> MetaInterp<M> {
                             }
                             Err(_) => {
                                 self.warm_state.abort_tracing(green_key, false);
+                                self.exported_state = None;
                                 self.warm_state.reset_function_counts();
                                 return CompileOutcome::Aborted;
                             }

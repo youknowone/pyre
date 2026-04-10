@@ -1023,7 +1023,6 @@ impl OptContext {
             &produced,
             short_inputargs,
         );
-        // Only true Const objects survive across iterations.
         for (&const_idx, _) in &self.const_pool {
             builder.note_known_constant(OpRef::from_const(const_idx));
         }
@@ -1175,7 +1174,6 @@ impl OptContext {
         }
 
         let mut builder = ShortPreambleBuilder::new(short_args, &produced, short_inputargs);
-        // Only true Const objects survive across iterations.
         for (&const_idx, _) in &self.const_pool {
             builder.note_known_constant(OpRef::from_const(const_idx));
         }
@@ -3906,9 +3904,41 @@ mod ensure_ptr_info_arg0_tests {
         })
     }
 
+    #[derive(Debug)]
+    struct TestFieldDescr {
+        index: u32,
+        parent: DescrRef,
+    }
+
+    impl Descr for TestFieldDescr {
+        fn index(&self) -> u32 {
+            self.index
+        }
+        fn as_field_descr(&self) -> Option<&dyn majit_ir::FieldDescr> {
+            Some(self)
+        }
+    }
+
+    impl majit_ir::FieldDescr for TestFieldDescr {
+        fn offset(&self) -> usize {
+            0
+        }
+        fn field_size(&self) -> usize {
+            8
+        }
+        fn field_type(&self) -> majit_ir::Type {
+            majit_ir::Type::Int
+        }
+        fn index_in_parent(&self) -> usize {
+            0
+        }
+        fn get_parent_descr(&self) -> Option<DescrRef> {
+            Some(self.parent.clone())
+        }
+    }
+
     fn field_op_with_parent(parent: DescrRef) -> Op {
-        let descr: DescrRef =
-            Arc::new(SimpleFieldDescr::new(0, 0, 8, Type::Int, false).with_parent_descr(parent, 0));
+        let descr: DescrRef = Arc::new(TestFieldDescr { index: 0, parent });
         let mut op = Op::with_descr(OpCode::GetfieldGcI, &[OpRef(0)], descr);
         op.pos = OpRef(1);
         op

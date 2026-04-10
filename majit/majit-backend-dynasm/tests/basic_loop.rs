@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 
 use majit_backend::{Backend, JitCellToken};
-use majit_ir::{InputArg, Op, OpCode, OpRef, Type, Value};
+use majit_ir::{InputArg, Op, OpCode, OpRef, Type, Value, make_loop_target_descr};
 
 use majit_backend_dynasm::runner::DynasmBackend;
 
@@ -187,9 +187,11 @@ fn test_guard_and_loop() {
         tp: Type::Int,
         index: 0,
     }];
+    let loop_descr = make_loop_target_descr(token.number, false);
 
     let mut label_op = Op::new(OpCode::Label, &[OpRef(0)]);
     label_op.pos = OpRef(100);
+    label_op.descr = Some(loop_descr.clone());
 
     let mut add_op = Op::new(OpCode::IntAdd, &[OpRef(0), OpRef::from_const(1)]);
     add_op.pos = OpRef(1);
@@ -204,6 +206,7 @@ fn test_guard_and_loop() {
 
     let mut jump_op = Op::new(OpCode::Jump, &[OpRef(1)]);
     jump_op.pos = OpRef(4);
+    jump_op.descr = Some(loop_descr);
 
     let ops = vec![label_op, add_op, lt_op, guard_op, jump_op];
 
@@ -243,9 +246,11 @@ fn test_float_loop_carried_across_jump() {
             index: 1,
         },
     ];
+    let loop_descr = make_loop_target_descr(token.number, false);
 
     let mut label_op = Op::new(OpCode::Label, &[OpRef(0), OpRef(1)]);
     label_op.pos = OpRef(100);
+    label_op.descr = Some(loop_descr.clone());
 
     let mut lt_op = Op::new(OpCode::IntLt, &[OpRef(1), OpRef::from_const(5)]);
     lt_op.pos = OpRef(2);
@@ -269,6 +274,7 @@ fn test_float_loop_carried_across_jump() {
 
     let mut jump_op = Op::new(OpCode::Jump, &[OpRef(6), OpRef(7)]);
     jump_op.pos = OpRef(8);
+    jump_op.descr = Some(loop_descr);
 
     let ops = vec![
         label_op, lt_op, guard_op, cast_op, mul_op, add_op, inc_op, jump_op,

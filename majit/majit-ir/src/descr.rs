@@ -6,6 +6,7 @@
 /// Descriptors carry type metadata needed by the optimizer and backend
 /// for field access, array access, function calls, and guard failures.
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::Weak;
 
 use crate::OpRef;
@@ -61,6 +62,73 @@ pub trait LoopTargetDescr: Descr {
     fn set_ll_loop_code(&self, loop_code: usize);
     fn target_arglocs(&self) -> Vec<TargetArgLoc>;
     fn set_target_arglocs(&self, arglocs: Vec<TargetArgLoc>);
+}
+
+#[derive(Debug, Default)]
+struct BasicLoopTargetDescrState {
+    ll_loop_code: usize,
+    target_arglocs: Vec<TargetArgLoc>,
+}
+
+#[derive(Debug)]
+struct BasicLoopTargetDescr {
+    token_id: u64,
+    is_preamble_target: bool,
+    state: Mutex<BasicLoopTargetDescrState>,
+}
+
+impl BasicLoopTargetDescr {
+    fn new(token_id: u64, is_preamble_target: bool) -> Self {
+        Self {
+            token_id,
+            is_preamble_target,
+            state: Mutex::new(BasicLoopTargetDescrState::default()),
+        }
+    }
+}
+
+impl Descr for BasicLoopTargetDescr {
+    fn index(&self) -> u32 {
+        self.token_id as u32
+    }
+
+    fn repr(&self) -> String {
+        if self.is_preamble_target {
+            format!("LoopTargetDescr(start:{})", self.token_id)
+        } else {
+            format!("LoopTargetDescr({})", self.token_id)
+        }
+    }
+
+    fn as_loop_target_descr(&self) -> Option<&dyn LoopTargetDescr> {
+        Some(self)
+    }
+}
+
+impl LoopTargetDescr for BasicLoopTargetDescr {
+    fn token_id(&self) -> u64 {
+        self.token_id
+    }
+
+    fn is_preamble_target(&self) -> bool {
+        self.is_preamble_target
+    }
+
+    fn ll_loop_code(&self) -> usize {
+        self.state.lock().unwrap().ll_loop_code
+    }
+
+    fn set_ll_loop_code(&self, loop_code: usize) {
+        self.state.lock().unwrap().ll_loop_code = loop_code;
+    }
+
+    fn target_arglocs(&self) -> Vec<TargetArgLoc> {
+        self.state.lock().unwrap().target_arglocs.clone()
+    }
+
+    fn set_target_arglocs(&self, arglocs: Vec<TargetArgLoc>) {
+        self.state.lock().unwrap().target_arglocs = arglocs;
+    }
 }
 
 /// Base trait for all descriptors.
@@ -2061,6 +2129,11 @@ pub fn make_fail_descr(fail_index: u32, fail_arg_types: Vec<Type>) -> DescrRef {
 /// Create a finish descriptor.
 pub fn make_finish_descr(fail_index: u32, fail_arg_types: Vec<Type>) -> DescrRef {
     std::sync::Arc::new(SimpleFailDescr::finish(0, fail_index, fail_arg_types))
+}
+
+/// Create a loop TargetToken descriptor.
+pub fn make_loop_target_descr(token_id: u64, is_preamble_target: bool) -> DescrRef {
+    std::sync::Arc::new(BasicLoopTargetDescr::new(token_id, is_preamble_target))
 }
 
 // ── descr.py: unpack helpers ──
