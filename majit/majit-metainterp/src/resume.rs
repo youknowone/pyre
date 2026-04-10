@@ -1621,17 +1621,19 @@ pub fn rd_virtual_to_virtual_info(
             offsets,
             entry_sizes,
             entry_types,
+            entry_signed,
             fieldnums,
         } => {
             let entries = offsets
                 .iter()
                 .zip(entry_sizes.iter())
                 .zip(entry_types.iter())
+                .zip(entry_signed.iter())
                 .zip(fieldnums.iter())
-                .map(|(((&off, &sz), &kind), &tagged)| {
+                .map(|((((&off, &sz), &kind), &signed), &tagged)| {
                     let descr = crate::optimizeopt::info::RawBufferDescr {
                         itemsize: sz,
-                        is_signed: kind == 1, // int entries are signed
+                        is_signed: signed,
                         kind,
                     };
                     (off, descr, tagged_to_source(tagged, consts, count))

@@ -115,16 +115,22 @@ pub enum RdVirtualInfo {
         field_sizes: Vec<usize>,
         fieldnums: Vec<i16>,
     },
-    /// resume.py:692: VRawBufferInfo(func, size, offsets, descrs)
+    /// resume.py:692: VRawBufferInfo(func, size, offsets, descrs).
+    /// descrs are serialized as parallel arrays: entry_sizes (itemsize),
+    /// entry_types (kind: 0=ref, 1=int, 2=float), entry_signed.
     VRawBufferInfo {
-        /// resume.py:695: self.func — raw malloc function pointer.
+        /// resume.py:694: self.func — raw malloc function pointer.
         func: i64,
+        /// resume.py:695: self.size.
         size: usize,
+        /// resume.py:696: self.offsets.
         offsets: Vec<usize>,
+        /// descr.itemsize per entry.
         entry_sizes: Vec<usize>,
-        /// resume.py:698: self.descrs — per-entry ArrayDescr kind.
         /// 0=ref (is_array_of_pointers), 1=int, 2=float (is_array_of_floats).
         entry_types: Vec<u8>,
+        /// descr.is_item_signed() per entry.
+        entry_signed: Vec<bool>,
         fieldnums: Vec<i16>,
     },
     /// resume.py:717: VRawSliceInfo
@@ -239,6 +245,7 @@ impl PartialEq for RdVirtualInfo {
                     offsets: a2,
                     entry_sizes: a3,
                     entry_types: a3t,
+                    entry_signed: a3s,
                     fieldnums: a4,
                 },
                 Self::VRawBufferInfo {
@@ -247,9 +254,12 @@ impl PartialEq for RdVirtualInfo {
                     offsets: b2,
                     entry_sizes: b3,
                     entry_types: b3t,
+                    entry_signed: b3s,
                     fieldnums: b4,
                 },
-            ) => a0 == b0 && a1 == b1 && a2 == b2 && a3 == b3 && a3t == b3t && a4 == b4,
+            ) => {
+                a0 == b0 && a1 == b1 && a2 == b2 && a3 == b3 && a3t == b3t && a3s == b3s && a4 == b4
+            }
             (
                 Self::VRawSliceInfo {
                     offset: a1,
