@@ -25,8 +25,9 @@ use crate::regalloc::RegAllocResult;
 pub struct Assembler {
     /// RPython: Assembler.insns — map {opcode_key: opcode_number}
     insns: HashMap<String, u8>,
-    /// RPython: Assembler.descrs — list of descriptors
-    descrs: Vec<String>,
+    /// RPython: Assembler.descrs — list of descriptors.
+    /// RPython stores AbstractDescr objects; pyre uses BhDescr enum.
+    descrs: Vec<crate::jitcode::BhDescr>,
     /// RPython: Assembler.indirectcalltargets — set of JitCode indices.
     /// RPython: set of JitCode objects. In majit: set of jitcode indices.
     pub indirectcalltargets: std::collections::HashSet<usize>,
@@ -306,10 +307,15 @@ impl Assembler {
                 result_kind,
                 ..
             } => {
-                // RPython: [jitcode] + sublists (only needed kinds)
-                // jitcode index as descr-like 2-byte value
-                state.code.push((*jitcode_index & 0xFF) as u8);
-                state.code.push((*jitcode_index >> 8) as u8);
+                // RPython assembler.py:197-207: jitcode → descrs[index]
+                // The JitCode object IS the descriptor for inline_call.
+                let descr_idx = self.descrs.len();
+                self.descrs.push(crate::jitcode::BhDescr::JitCode {
+                    jitcode_index: *jitcode_index,
+                    fnaddr: 0, // resolved at runtime from all_jitcodes[jitcode_index]
+                });
+                state.code.push((descr_idx & 0xFF) as u8);
+                state.code.push((descr_idx >> 8) as u8);
                 argcodes.push('d');
                 // RPython jtransform.py:422-431: rewrite_call
                 // Only emit the kind sublists that are in 'kinds'.
@@ -411,7 +417,7 @@ impl Assembler {
                 };
                 // RPython assembler.py:197-207: descriptor as 2-byte index
                 let descr_idx = self.descrs.len();
-                self.descrs.push(format!("{}", descriptor.target));
+                self.descrs.push(crate::jitcode::BhDescr::Call);
                 state.code.push((descr_idx & 0xFF) as u8);
                 state.code.push((descr_idx >> 8) as u8);
                 argcodes.push('d');
@@ -460,7 +466,188 @@ impl Assembler {
                 state.code[startposition] = opnum;
             }
 
-            // Default: encode operand registers + result register
+            // Field/array operations: encode registers + descriptor.
+            // RPython assembler.py:197-207: AbstractDescr → 2-byte index.
+            // Field operations: register + descriptor.
+            // RPython assembler.py:197-207: AbstractDescr → 2-byte index.
+            OpKind::FieldRead { base, .. } => {
+                let (reg, kc) = self.lookup_reg_with_kind(*base, regallocs);
+                state.code.push(reg);
+                argcodes.push(kc);
+                let descr_idx = self.descrs.len();
+                self.descrs
+                    .push(crate::jitcode::BhDescr::Field { offset: 0 });
+                state.code.push((descr_idx & 0xFF) as u8);
+                state.code.push((descr_idx >> 8) as u8);
+                argcodes.push('d');
+                if let Some(result) = op.result {
+                    argcodes.push('>');
+                    let (reg, kc) = self.lookup_reg_with_kind(result, regallocs);
+                    argcodes.push(kc);
+                    state.code.push(reg);
+                }
+                let opname = op_kind_to_opname(&op.kind);
+                let key = format!("{opname}/{argcodes}");
+                let opnum = self.get_opnum(&key);
+                state.code[startposition] = opnum;
+            }
+            OpKind::FieldWrite { base, value, .. } => {
+                let (reg, kc) = self.lookup_reg_with_kind(*base, regallocs);
+                state.code.push(reg);
+                argcodes.push(kc);
+                let (reg, kc) = self.lookup_reg_with_kind(*value, regallocs);
+                state.code.push(reg);
+                argcodes.push(kc);
+                let descr_idx = self.descrs.len();
+                self.descrs
+                    .push(crate::jitcode::BhDescr::Field { offset: 0 });
+                state.code.push((descr_idx & 0xFF) as u8);
+                state.code.push((descr_idx >> 8) as u8);
+                argcodes.push('d');
+                let opname = op_kind_to_opname(&op.kind);
+                let key = format!("{opname}/{argcodes}");
+                let opnum = self.get_opnum(&key);
+                state.code[startposition] = opnum;
+            }
+            OpKind::ArrayRead { base, index, .. } => {
+                let (reg, kc) = self.lookup_reg_with_kind(*base, regallocs);
+                state.code.push(reg);
+                argcodes.push(kc);
+                let (reg, kc) = self.lookup_reg_with_kind(*index, regallocs);
+                state.code.push(reg);
+                argcodes.push(kc);
+                let descr_idx = self.descrs.len();
+                self.descrs
+                    .push(crate::jitcode::BhDescr::Array { itemsize: 8 });
+                state.code.push((descr_idx & 0xFF) as u8);
+                state.code.push((descr_idx >> 8) as u8);
+                argcodes.push('d');
+                if let Some(result) = op.result {
+                    argcodes.push('>');
+                    let (reg, kc) = self.lookup_reg_with_kind(result, regallocs);
+                    argcodes.push(kc);
+                    state.code.push(reg);
+                }
+                let opname = op_kind_to_opname(&op.kind);
+                let key = format!("{opname}/{argcodes}");
+                let opnum = self.get_opnum(&key);
+                state.code[startposition] = opnum;
+            }
+            OpKind::ArrayWrite {
+                base, index, value, ..
+            } => {
+                let (reg, kc) = self.lookup_reg_with_kind(*base, regallocs);
+                state.code.push(reg);
+                argcodes.push(kc);
+                let (reg, kc) = self.lookup_reg_with_kind(*index, regallocs);
+                state.code.push(reg);
+                argcodes.push(kc);
+                let (reg, kc) = self.lookup_reg_with_kind(*value, regallocs);
+                state.code.push(reg);
+                argcodes.push(kc);
+                let descr_idx = self.descrs.len();
+                self.descrs
+                    .push(crate::jitcode::BhDescr::Array { itemsize: 8 });
+                state.code.push((descr_idx & 0xFF) as u8);
+                state.code.push((descr_idx >> 8) as u8);
+                argcodes.push('d');
+                let opname = op_kind_to_opname(&op.kind);
+                let key = format!("{opname}/{argcodes}");
+                let opnum = self.get_opnum(&key);
+                state.code[startposition] = opnum;
+            }
+            // Vable field/array: encode field_index as descriptor.
+            // These don't have a base register (vable is implicit).
+            OpKind::VableFieldRead { field_index, .. } => {
+                // RPython: field_index → descriptor index
+                let descr_idx = self.descrs.len();
+                self.descrs.push(crate::jitcode::BhDescr::Field {
+                    offset: *field_index,
+                });
+                state.code.push((descr_idx & 0xFF) as u8);
+                state.code.push((descr_idx >> 8) as u8);
+                argcodes.push('d');
+                if let Some(result) = op.result {
+                    argcodes.push('>');
+                    let (reg, kc) = self.lookup_reg_with_kind(result, regallocs);
+                    argcodes.push(kc);
+                    state.code.push(reg);
+                }
+                let opname = op_kind_to_opname(&op.kind);
+                let key = format!("{opname}/{argcodes}");
+                let opnum = self.get_opnum(&key);
+                state.code[startposition] = opnum;
+            }
+            OpKind::VableFieldWrite {
+                field_index, value, ..
+            } => {
+                let (reg, kc) = self.lookup_reg_with_kind(*value, regallocs);
+                state.code.push(reg);
+                argcodes.push(kc);
+                let descr_idx = self.descrs.len();
+                self.descrs.push(crate::jitcode::BhDescr::Field {
+                    offset: *field_index,
+                });
+                state.code.push((descr_idx & 0xFF) as u8);
+                state.code.push((descr_idx >> 8) as u8);
+                argcodes.push('d');
+                let opname = op_kind_to_opname(&op.kind);
+                let key = format!("{opname}/{argcodes}");
+                let opnum = self.get_opnum(&key);
+                state.code[startposition] = opnum;
+            }
+            OpKind::VableArrayRead {
+                array_index,
+                elem_index,
+                ..
+            } => {
+                let (reg, kc) = self.lookup_reg_with_kind(*elem_index, regallocs);
+                state.code.push(reg);
+                argcodes.push(kc);
+                let descr_idx = self.descrs.len();
+                self.descrs.push(crate::jitcode::BhDescr::Array {
+                    itemsize: *array_index,
+                });
+                state.code.push((descr_idx & 0xFF) as u8);
+                state.code.push((descr_idx >> 8) as u8);
+                argcodes.push('d');
+                if let Some(result) = op.result {
+                    argcodes.push('>');
+                    let (reg, kc) = self.lookup_reg_with_kind(result, regallocs);
+                    argcodes.push(kc);
+                    state.code.push(reg);
+                }
+                let opname = op_kind_to_opname(&op.kind);
+                let key = format!("{opname}/{argcodes}");
+                let opnum = self.get_opnum(&key);
+                state.code[startposition] = opnum;
+            }
+            OpKind::VableArrayWrite {
+                array_index,
+                elem_index,
+                value,
+                ..
+            } => {
+                let (reg, kc) = self.lookup_reg_with_kind(*elem_index, regallocs);
+                state.code.push(reg);
+                argcodes.push(kc);
+                let (reg, kc) = self.lookup_reg_with_kind(*value, regallocs);
+                state.code.push(reg);
+                argcodes.push(kc);
+                let descr_idx = self.descrs.len();
+                self.descrs.push(crate::jitcode::BhDescr::Array {
+                    itemsize: *array_index,
+                });
+                state.code.push((descr_idx & 0xFF) as u8);
+                state.code.push((descr_idx >> 8) as u8);
+                argcodes.push('d');
+                let opname = op_kind_to_opname(&op.kind);
+                let key = format!("{opname}/{argcodes}");
+                let opnum = self.get_opnum(&key);
+                state.code[startposition] = opnum;
+            }
+
+            // Default: encode operand registers + result register (no descriptor)
             other => {
                 for v in crate::inline::op_value_refs(other) {
                     let (reg, kind_char) = self.lookup_reg_with_kind(v, regallocs);
@@ -473,8 +660,6 @@ impl Assembler {
                     argcodes.push(kind_char);
                     state.code.push(reg);
                 }
-                // RPython: jtransform already produces typed opnames like
-                // getfield_vable_i. op_kind_to_opname approximates this.
                 let opname = op_kind_to_opname(other);
                 let key = format!("{opname}/{argcodes}");
                 let opnum = self.get_opnum(&key);
@@ -752,6 +937,18 @@ impl Assembler {
     /// RPython's `see_raw_object` extracts `func.ptr._obj._name` to build
     /// `list_of_addr2name`. In majit, names are registered at `add()` time
     /// via `register_func_name()`.
+    /// RPython: Assembler.insns — the opcode table. Needed by
+    /// BlackholeInterpBuilder::setup_insns() to build the dispatch table.
+    pub fn insns(&self) -> &HashMap<String, u8> {
+        &self.insns
+    }
+
+    /// RPython: Assembler.descrs — the descriptor table. Needed by
+    /// BlackholeInterpBuilder::setup_descrs() for 'd'/'j' argcode resolution.
+    pub fn descrs(&self) -> &[crate::jitcode::BhDescr] {
+        &self.descrs
+    }
+
     pub fn finished(&mut self, callinfocollection: &CallInfoCollection) {
         for func_addr in callinfocollection.all_function_addresses() {
             // RPython: see_raw_object(func.ptr)

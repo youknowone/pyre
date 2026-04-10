@@ -832,6 +832,11 @@ pub enum BhReturnType {
     Void,
 }
 
+/// Re-export BhDescr from codewriter::jitcode — shared descriptor type
+/// between codewriter assembler and blackhole interpreter.
+/// RPython `history.py:AbstractDescr` parity.
+pub use majit_codewriter::jitcode::BhDescr;
+
 /// Signal from dispatch_one to run().
 ///
 /// RPython: `LeaveFrame` exception + `except Exception` in blackhole.py run()
@@ -870,7 +875,11 @@ pub struct BlackholeInterpreter {
     /// of `AbstractDescr` objects carrying field offsets, array item sizes,
     /// etc. In pyre, we store raw offsets (usize) as a simplification —
     /// descriptor-index argcode ('d', 2 bytes) indexes into this table.
-    pub descrs: Vec<usize>,
+    /// RPython `blackhole.py:288` `self.descrs = builder.descrs`.
+    /// Descriptor table — heterogeneous like RPython AbstractDescr list.
+    pub descrs: Vec<BhDescr>,
+    /// RPython `blackhole.py:289` `self.op_catch_exception = builder.op_catch_exception`.
+    pub op_catch_exception: u8,
     /// Integer register bank.
     /// Indices 0..num_regs_i are working registers.
     /// Indices num_regs_i..num_regs_i+constants_i.len() hold constants.
@@ -968,6 +977,7 @@ impl BlackholeInterpreter {
         Self {
             cpu: None,
             descrs: Vec::new(),
+            op_catch_exception: u8::MAX,
             registers_i: Vec::new(),
             registers_r: Vec::new(),
             registers_f: Vec::new(),
@@ -2250,7 +2260,8 @@ pub struct BlackholeInterpBuilder {
     /// RPython `blackhole.py:73` `self.op_catch_exception`.
     pub op_catch_exception: u8,
     /// RPython `blackhole.py:103` `self.descrs`.
-    pub descrs: Vec<String>,
+    /// Populated by `setup_descrs()` from the assembler's descriptor table.
+    pub descrs: Vec<BhDescr>,
     /// Dispatch table: opcode byte → handler fn pointer.
     /// RPython builds `dispatch_loop` closure via `unrolling_iterable`;
     /// Rust uses indirect call through this table.
@@ -2332,7 +2343,7 @@ impl BlackholeInterpBuilder {
     }
 
     /// RPython `blackhole.py:102-103` `setup_descrs(descrs)`.
-    pub fn setup_descrs(&mut self, descrs: Vec<String>) {
+    pub fn setup_descrs(&mut self, descrs: Vec<BhDescr>) {
         self.descrs = descrs;
     }
 
@@ -2363,6 +2374,11 @@ impl BlackholeInterpBuilder {
     /// `_get_method(name, argcodes)` for each. In Rust we wire specific
     /// opnames one by one during Phase D migration. Returns false if
     /// the opname is not present in the insns table.
+    /// Wire a handler for a specific opname/argcodes key.
+    ///
+    /// Returns true if the key was found in the insns table.
+    /// Callers in wire_bhimpl_handlers use `try_wire_handler` for optional
+    /// keys (aliases that may not exist in all assembler configurations).
     pub fn wire_handler(&mut self, opname_key: &str, handler: BhOpcodeHandler) -> bool {
         for (i, key) in self._insns.iter().enumerate() {
             if key == opname_key {
@@ -2371,6 +2387,18 @@ impl BlackholeInterpBuilder {
             }
         }
         false
+    }
+
+    /// Wire a handler, panicking if the key is not found.
+    /// Use for mandatory opcodes that MUST exist in every assembler
+    /// configuration. Matches RPython's _get_method raising AttributeError.
+    pub fn wire_handler_required(&mut self, opname_key: &str, handler: BhOpcodeHandler) {
+        if !self.wire_handler(opname_key, handler) {
+            panic!(
+                "wire_handler_required: opname {:?} not found in insns table",
+                opname_key
+            );
+        }
     }
 
     /// Acquire an interpreter from the pool or create a new one.
@@ -2390,8 +2418,15 @@ impl BlackholeInterpBuilder {
     /// the `cpu` field from the builder to each acquired interpreter.
     pub fn acquire_interp(&mut self) -> BlackholeInterpreter {
         let mut bh = self.pool.pop().unwrap_or_default();
-        // RPython blackhole.py:286: self.cpu = builder.cpu
+        // RPython blackhole.py:284-289:
+        //   self.cpu = builder.cpu
+        //   self.dispatch_loop = builder.dispatch_loop
+        //   self.descrs = builder.descrs
+        //   self.op_catch_exception = builder.op_catch_exception
         bh.cpu = self.cpu;
+        // RPython blackhole.py:288: self.descrs = builder.descrs
+        bh.descrs = self.descrs.clone();
+        bh.op_catch_exception = self.op_catch_exception;
         bh
     }
 
@@ -4615,12 +4650,23 @@ fn handler_unreachable(
 // The 'd' argcode is a 2-byte descriptor index into `bh.descrs`.
 // In pyre, descrs[index] resolves to a field offset (usize).
 
-/// Helper: read a 2-byte descriptor index from bytecode and resolve to offset.
+/// RPython `blackhole.py:150-157`: read a 2-byte descriptor index from
+/// bytecode and return `(descr_object, new_position)`.
+///
+/// In RPython: `value = self.descrs[index]`. In pyre: returns the
+/// `BhDescr` enum variant.
+#[inline]
+fn read_descr<'a>(bh: &'a BlackholeInterpreter, code: &[u8], pos: usize) -> (&'a BhDescr, usize) {
+    let descr_idx = (code[pos] as usize) | ((code[pos + 1] as usize) << 8);
+    let descr = &bh.descrs[descr_idx]; // RPython: no fallback, index must be valid
+    (descr, pos + 2)
+}
+
+/// Convenience: read descriptor and extract offset (for field/array ops).
 #[inline]
 fn read_descr_offset(bh: &BlackholeInterpreter, code: &[u8], pos: usize) -> (usize, usize) {
-    let descr_idx = (code[pos] as usize) | ((code[pos + 1] as usize) << 8);
-    let offset = bh.descrs.get(descr_idx).copied().unwrap_or(0);
-    (offset, pos + 2)
+    let (descr, pos) = read_descr(bh, code, pos);
+    (descr.as_offset(), pos)
 }
 
 // bhimpl_getfield_gc_i: @arguments("cpu", "r", "d", returns="i")
@@ -5454,7 +5500,7 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     );
     builder.wire_handler("str_guard_value/rid>r", handler_str_guard_value);
     builder.wire_handler("rvmprof_code/ii", handler_rvmprof_code);
-    builder.wire_handler("copystrcontent/rrii i", handler_copystrcontent);
+    builder.wire_handler("copystrcontent/rriii", handler_copystrcontent);
     builder.wire_handler("copyunicodecontent/rriii", handler_copyunicodecontent);
     builder.wire_handler("current_trace_length/>i", handler_current_trace_length);
 
@@ -5535,16 +5581,16 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     builder.wire_handler("setarrayitem_vable_f/rifdd", handler_setarrayitem_vable_f);
 
     // Inline call (stub — needs frame-chain)
-    builder.wire_handler("inline_call_irf_i/jIRF>i", handler_inline_call_irf_i);
-    builder.wire_handler("inline_call_irf_r/jIRF>r", handler_inline_call_irf_r);
-    builder.wire_handler("inline_call_irf_f/jIRF>f", handler_inline_call_irf_f);
-    builder.wire_handler("inline_call_irf_v/jIRF", handler_inline_call_irf_v);
-    builder.wire_handler("inline_call_ir_i/jIR>i", handler_inline_call_ir_i);
-    builder.wire_handler("inline_call_ir_r/jIR>r", handler_inline_call_ir_r);
-    builder.wire_handler("inline_call_ir_v/jIR", handler_inline_call_ir_v);
-    builder.wire_handler("inline_call_r_i/jR>i", handler_inline_call_r_i);
-    builder.wire_handler("inline_call_r_r/jR>r", handler_inline_call_r_r);
-    builder.wire_handler("inline_call_r_v/jR", handler_inline_call_r_v);
+    builder.wire_handler("inline_call_irf_i/dIRF>i", handler_inline_call_irf_i);
+    builder.wire_handler("inline_call_irf_r/dIRF>r", handler_inline_call_irf_r);
+    builder.wire_handler("inline_call_irf_f/dIRF>f", handler_inline_call_irf_f);
+    builder.wire_handler("inline_call_irf_v/dIRF", handler_inline_call_irf_v);
+    builder.wire_handler("inline_call_ir_i/dIR>i", handler_inline_call_ir_i);
+    builder.wire_handler("inline_call_ir_r/dIR>r", handler_inline_call_ir_r);
+    builder.wire_handler("inline_call_ir_v/dIR", handler_inline_call_ir_v);
+    builder.wire_handler("inline_call_r_i/dR>i", handler_inline_call_r_i);
+    builder.wire_handler("inline_call_r_r/dR>r", handler_inline_call_r_r);
+    builder.wire_handler("inline_call_r_v/dR", handler_inline_call_r_v);
 
     // Recursive call (stub — needs portal runner)
     builder.wire_handler("recursive_call_i/cIRFIRF>i", handler_recursive_call_i);
@@ -5782,18 +5828,36 @@ fn handler_rvmprof_code(
 ) -> Result<usize, DispatchError> {
     Ok(p + 2)
 }
+/// RPython `blackhole.py:1575-1578` `bhimpl_copystrcontent`.
 fn handler_copystrcontent(
-    _bh: &mut BlackholeInterpreter,
-    _code: &[u8],
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
+    let src = bh.registers_r[code[p] as usize];
+    let dst = bh.registers_r[code[p + 1] as usize];
+    let srcstart = bh.registers_i[code[p + 2] as usize];
+    let dststart = bh.registers_i[code[p + 3] as usize];
+    let length = bh.registers_i[code[p + 4] as usize];
+    if let Some(cpu) = bh.cpu {
+        cpu.bh_copystrcontent(src, dst, srcstart, dststart, length);
+    }
     Ok(p + 5)
 }
+/// RPython `blackhole.py:1580-1583` `bhimpl_copyunicodecontent`.
 fn handler_copyunicodecontent(
-    _bh: &mut BlackholeInterpreter,
-    _code: &[u8],
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
+    let src = bh.registers_r[code[p] as usize];
+    let dst = bh.registers_r[code[p + 1] as usize];
+    let srcstart = bh.registers_i[code[p + 2] as usize];
+    let dststart = bh.registers_i[code[p + 3] as usize];
+    let length = bh.registers_i[code[p + 4] as usize];
+    if let Some(cpu) = bh.cpu {
+        cpu.bh_copyunicodecontent(src, dst, srcstart, dststart, length);
+    }
     Ok(p + 5)
 }
 fn handler_raise(
@@ -5812,14 +5876,37 @@ fn handler_reraise(
 ) -> Result<usize, DispatchError> {
     Err(DispatchError::RaiseException(bh.exception_last_value))
 }
+/// RPython `blackhole.py:987-991`:
+/// ```python
+/// @arguments("self", returns="i")
+/// def bhimpl_last_exception(self):
+///     real_instance = self.exception_last_value
+///     assert real_instance
+///     return ptr2int(real_instance.typeptr)
+/// ```
+/// Returns the CLASS POINTER (typeptr) of the caught exception, not the
+/// exception object itself. Uses `cpu.bh_classof(obj)` to get the typeptr.
 fn handler_last_exception(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    bh.registers_i[code[p] as usize] = bh.exception_last_value;
+    let exc_obj = bh.exception_last_value;
+    // RPython: ptr2int(real_instance.typeptr) — get class pointer
+    let typeptr = if let Some(cpu) = bh.cpu {
+        cpu.bh_classof(exc_obj)
+    } else {
+        exc_obj // fallback: use object pointer as-is if no cpu
+    };
+    bh.registers_i[code[p] as usize] = typeptr;
     Ok(p + 1)
 }
+/// RPython `blackhole.py:993-997`:
+/// ```python
+/// @arguments("self", returns="r")
+/// def bhimpl_last_exc_value(self):
+///     return cast_opaque_ptr(GCREF, self.exception_last_value)
+/// ```
 fn handler_last_exc_value(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
@@ -5828,14 +5915,46 @@ fn handler_last_exc_value(
     bh.registers_r[code[p] as usize] = bh.exception_last_value;
     Ok(p + 1)
 }
+/// RPython `blackhole.py:976-985`:
+/// ```python
+/// @arguments("self", "i", "L", "pc", returns="L")
+/// def bhimpl_goto_if_exception_mismatch(self, vtable, target, pc):
+///     bounding_class = cast_adr_to_ptr(int2adr(vtable), CLASSTYPE)
+///     real_instance = self.exception_last_value
+///     if rclass.ll_issubclass(real_instance.typeptr, bounding_class):
+///         return pc  # match → fall through
+///     else:
+///         return target  # mismatch → jump
+/// ```
+/// Uses `cpu.bh_classof` to get the exception's typeptr and compares
+/// against the bounding class vtable. For now uses pointer equality
+/// (correct for exact match; subclass check needs rclass infrastructure).
 fn handler_goto_if_exception_mismatch(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let _vtable = bh.registers_i[code[p] as usize];
+    let bounding_vtable = bh.registers_i[code[p] as usize];
     let target = (code[p + 1] as usize) | ((code[p + 2] as usize) << 8);
-    Ok(p + 3) // stub: always match
+    let pc = p + 3;
+    let exc_obj = bh.exception_last_value;
+    let exc_typeptr = if let Some(cpu) = bh.cpu {
+        cpu.bh_classof(exc_obj)
+    } else {
+        exc_obj
+    };
+    // RPython: rclass.ll_issubclass(real_instance.typeptr, bounding_class).
+    // Uses Backend::bh_issubclass for the subclass check.
+    let is_match = if let Some(cpu) = bh.cpu {
+        cpu.bh_issubclass(exc_typeptr, bounding_vtable)
+    } else {
+        exc_typeptr == bounding_vtable
+    };
+    if is_match {
+        Ok(pc) // match → fall through
+    } else {
+        Ok(target) // mismatch → jump to target
+    }
 }
 fn handler_debug_fatalerror(
     _bh: &mut BlackholeInterpreter,
@@ -5878,6 +5997,12 @@ fn handler_getfield_vable_i(
     p: usize,
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_r[code[p] as usize];
+    // RPython: fielddescr.get_vinfo().clear_vable_token(struct)
+    if !bh.virtualizable_info.is_null() {
+        let vinfo = unsafe { &*bh.virtualizable_info };
+        let ptr = struct_ptr as *mut u8;
+        unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, ptr) };
+    }
     let (offset, p) = read_descr_offset(bh, code, p + 1);
     let cpu = bh.cpu.expect("cpu not set");
     bh.registers_i[code[p] as usize] = cpu.bh_getfield_gc_i(struct_ptr, offset);
@@ -5889,6 +6014,12 @@ fn handler_getfield_vable_r(
     p: usize,
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_r[code[p] as usize];
+    // RPython: fielddescr.get_vinfo().clear_vable_token(struct)
+    if !bh.virtualizable_info.is_null() {
+        let vinfo = unsafe { &*bh.virtualizable_info };
+        let ptr = struct_ptr as *mut u8;
+        unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, ptr) };
+    }
     let (offset, p) = read_descr_offset(bh, code, p + 1);
     let cpu = bh.cpu.expect("cpu not set");
     bh.registers_r[code[p] as usize] = cpu.bh_getfield_gc_r(struct_ptr, offset).0 as i64;
@@ -5900,6 +6031,12 @@ fn handler_getfield_vable_f(
     p: usize,
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_r[code[p] as usize];
+    // RPython: fielddescr.get_vinfo().clear_vable_token(struct)
+    if !bh.virtualizable_info.is_null() {
+        let vinfo = unsafe { &*bh.virtualizable_info };
+        let ptr = struct_ptr as *mut u8;
+        unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, ptr) };
+    }
     let (offset, p) = read_descr_offset(bh, code, p + 1);
     let cpu = bh.cpu.expect("cpu not set");
     bh.registers_f[code[p] as usize] = cpu.bh_getfield_gc_f(struct_ptr, offset).to_bits() as i64;
@@ -5912,6 +6049,12 @@ fn handler_setfield_vable_i(
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_r[code[p] as usize];
     let value = bh.registers_i[code[p + 1] as usize];
+    // RPython: fielddescr.get_vinfo().clear_vable_token(struct)
+    if !bh.virtualizable_info.is_null() {
+        let vinfo = unsafe { &*bh.virtualizable_info };
+        let ptr = struct_ptr as *mut u8;
+        unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, ptr) };
+    }
     let (offset, p) = read_descr_offset(bh, code, p + 2);
     let cpu = bh.cpu.expect("cpu not set");
     cpu.bh_setfield_gc_i(struct_ptr, offset, value);
@@ -5924,6 +6067,12 @@ fn handler_setfield_vable_r(
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_r[code[p] as usize];
     let value = bh.registers_r[code[p + 1] as usize];
+    // RPython: fielddescr.get_vinfo().clear_vable_token(struct)
+    if !bh.virtualizable_info.is_null() {
+        let vinfo = unsafe { &*bh.virtualizable_info };
+        let ptr = struct_ptr as *mut u8;
+        unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, ptr) };
+    }
     let (offset, p) = read_descr_offset(bh, code, p + 2);
     let cpu = bh.cpu.expect("cpu not set");
     cpu.bh_setfield_gc_r(struct_ptr, offset, majit_ir::GcRef(value as usize));
@@ -5936,6 +6085,12 @@ fn handler_setfield_vable_f(
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_r[code[p] as usize];
     let value = f64::from_bits(bh.registers_f[code[p + 1] as usize] as u64);
+    // RPython: fielddescr.get_vinfo().clear_vable_token(struct)
+    if !bh.virtualizable_info.is_null() {
+        let vinfo = unsafe { &*bh.virtualizable_info };
+        let ptr = struct_ptr as *mut u8;
+        unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, ptr) };
+    }
     let (offset, p) = read_descr_offset(bh, code, p + 2);
     let cpu = bh.cpu.expect("cpu not set");
     cpu.bh_setfield_gc_f(struct_ptr, offset, value);
@@ -6024,29 +6179,34 @@ fn handler_arraylen_vable(
 }
 
 // ── getarrayitem_raw / setarrayitem_raw (blackhole.py:1343-1365) ────
+/// RPython `blackhole.py:1343-1345` `bhimpl_getarrayitem_raw_i`:
+/// `return cpu.bh_getarrayitem_raw_i(array, index, arraydescr)`.
+/// Raw memory access — NOT GC-managed. Uses unsafe direct read.
 fn handler_getarrayitem_raw_i(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let array = bh.registers_i[code[p] as usize]; // raw ptr as int
-    let index = bh.registers_i[code[p + 1] as usize];
+    let array = bh.registers_i[code[p] as usize] as usize; // raw ptr
+    let index = bh.registers_i[code[p + 1] as usize] as usize;
     let (item_size, p) = read_descr_offset(bh, code, p + 2);
-    let cpu = bh.cpu.expect("cpu not set");
-    bh.registers_i[code[p] as usize] = cpu.bh_getarrayitem_gc_i(array, index, item_size);
+    let offset = index * item_size.max(1);
+    let value = unsafe { *((array + offset) as *const i64) };
+    bh.registers_i[code[p] as usize] = value;
     Ok(p + 1)
 }
+/// RPython `blackhole.py:1360-1362` `bhimpl_setarrayitem_raw_i`.
 fn handler_setarrayitem_raw_i(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let array = bh.registers_i[code[p] as usize];
-    let index = bh.registers_i[code[p + 1] as usize];
+    let array = bh.registers_i[code[p] as usize] as usize;
+    let index = bh.registers_i[code[p + 1] as usize] as usize;
     let value = bh.registers_i[code[p + 2] as usize];
     let (item_size, p) = read_descr_offset(bh, code, p + 3);
-    let cpu = bh.cpu.expect("cpu not set");
-    cpu.bh_setarrayitem_gc_i(array, index, item_size, value);
+    let offset = index * item_size.max(1);
+    unsafe { *((array + offset) as *mut i64) = value };
     Ok(p)
 }
 
@@ -6169,15 +6329,34 @@ fn handler_setlistitem_gc_r(
 }
 
 // ── switch (blackhole.py:954-960) ───────────────────────────────────
+/// RPython `blackhole.py:954-960`:
+/// ```python
+/// @arguments("i", "d", "pc", returns="L")
+/// def bhimpl_switch(switchvalue, switchdict, pc):
+///     assert isinstance(switchdict, SwitchDictDescr)
+///     try:
+///         return switchdict.dict[switchvalue]
+///     except KeyError:
+///         return pc
+/// ```
+/// TODO: resolve descr index to a SwitchDictDescr table. Currently falls
+/// through (returns pc) which matches the KeyError fallback path but never
+/// takes the dict-hit branch.
 fn handler_switch(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let _switchvalue = bh.registers_i[code[p] as usize];
-    let (_, p) = read_descr_offset(bh, code, p + 1);
-    // stub: fall through (RPython looks up in SwitchDictDescr)
-    Ok(p)
+    let switchvalue = bh.registers_i[code[p] as usize];
+    let (descr, pos) = read_descr(bh, code, p + 1);
+    // RPython blackhole.py:954-960:
+    //   try: return switchdict.dict[switchvalue]
+    //   except KeyError: return pc
+    if let Some(target) = descr.switch_lookup(switchvalue) {
+        Ok(target)
+    } else {
+        Ok(pos) // fallthrough (KeyError path)
+    }
 }
 
 // ── check_neg_index / check_resizable_neg_index (blackhole.py:1148-1158) ─
@@ -6274,15 +6453,19 @@ fn handler_getfield_raw_r(
     Ok(p + 1)
 }
 // getinteriorfield_gc_f / setinteriorfield_gc_f / setinteriorfield_gc_r
+/// RPython `blackhole.py:1417-1419`:
+/// `return cpu.bh_getinteriorfield_gc_f(array, index, descr)`
 fn handler_getinteriorfield_gc_f(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let _array = bh.registers_r[code[p] as usize];
-    let _index = bh.registers_i[code[p + 1] as usize];
-    let (_, p) = read_descr_offset(bh, code, p + 2);
-    bh.registers_f[code[p] as usize] = 0; // stub
+    let array = bh.registers_r[code[p] as usize];
+    let index = bh.registers_i[code[p + 1] as usize];
+    let (offset, p) = read_descr_offset(bh, code, p + 2);
+    let cpu = bh.cpu.expect("cpu not set");
+    bh.registers_f[code[p] as usize] =
+        cpu.bh_getinteriorfield_gc_f(array, index, offset).to_bits() as i64;
     Ok(p + 1)
 }
 fn handler_getinteriorfield_gc_r(
@@ -6290,10 +6473,11 @@ fn handler_getinteriorfield_gc_r(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let _array = bh.registers_r[code[p] as usize];
-    let _index = bh.registers_i[code[p + 1] as usize];
-    let (_, p) = read_descr_offset(bh, code, p + 2);
-    bh.registers_r[code[p] as usize] = 0; // stub
+    let array = bh.registers_r[code[p] as usize];
+    let index = bh.registers_i[code[p + 1] as usize];
+    let (offset, p) = read_descr_offset(bh, code, p + 2);
+    let cpu = bh.cpu.expect("cpu not set");
+    bh.registers_r[code[p] as usize] = cpu.bh_getinteriorfield_gc_r(array, index, offset).0 as i64;
     Ok(p + 1)
 }
 fn handler_setinteriorfield_gc_f(
@@ -6301,10 +6485,12 @@ fn handler_setinteriorfield_gc_f(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let _array = bh.registers_r[code[p] as usize];
-    let _index = bh.registers_i[code[p + 1] as usize];
-    let _value = bh.registers_f[code[p + 2] as usize];
-    let (_, p) = read_descr_offset(bh, code, p + 3);
+    let array = bh.registers_r[code[p] as usize];
+    let index = bh.registers_i[code[p + 1] as usize];
+    let value = f64::from_bits(bh.registers_f[code[p + 2] as usize] as u64);
+    let (offset, p) = read_descr_offset(bh, code, p + 3);
+    let cpu = bh.cpu.expect("cpu not set");
+    cpu.bh_setinteriorfield_gc_f(array, index, offset, value);
     Ok(p)
 }
 fn handler_setinteriorfield_gc_r(
@@ -6312,10 +6498,12 @@ fn handler_setinteriorfield_gc_r(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let _array = bh.registers_r[code[p] as usize];
-    let _index = bh.registers_i[code[p + 1] as usize];
-    let _value = bh.registers_r[code[p + 2] as usize];
-    let (_, p) = read_descr_offset(bh, code, p + 3);
+    let array = bh.registers_r[code[p] as usize];
+    let index = bh.registers_i[code[p + 1] as usize];
+    let value = bh.registers_r[code[p + 2] as usize];
+    let (offset, p) = read_descr_offset(bh, code, p + 3);
+    let cpu = bh.cpu.expect("cpu not set");
+    cpu.bh_setinteriorfield_gc_r(array, index, offset, majit_ir::GcRef(value as usize));
     Ok(p)
 }
 // gc_load_indexed_i/f, gc_store_indexed_i/f (blackhole.py:1518-1540)
@@ -6324,9 +6512,14 @@ fn handler_gc_load_indexed_i(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    // @arguments("cpu", "r", "i", "i", "i", "i", returns="i") — 1r + 4i + result
-    let _addr = bh.registers_r[code[p] as usize];
-    bh.registers_i[code[p + 5] as usize] = 0; // stub
+    let addr = bh.registers_r[code[p] as usize];
+    let index = bh.registers_i[code[p + 1] as usize];
+    let scale = bh.registers_i[code[p + 2] as usize];
+    let base_ofs = bh.registers_i[code[p + 3] as usize];
+    let bytes = bh.registers_i[code[p + 4] as usize];
+    let cpu = bh.cpu.expect("cpu not set");
+    bh.registers_i[code[p + 5] as usize] =
+        cpu.bh_gc_load_indexed_i(addr, index, scale, base_ofs, bytes);
     Ok(p + 6)
 }
 fn handler_gc_load_indexed_f(
@@ -6334,8 +6527,15 @@ fn handler_gc_load_indexed_f(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let _addr = bh.registers_r[code[p] as usize];
-    bh.registers_f[code[p + 5] as usize] = 0; // stub
+    let addr = bh.registers_r[code[p] as usize];
+    let index = bh.registers_i[code[p + 1] as usize];
+    let scale = bh.registers_i[code[p + 2] as usize];
+    let base_ofs = bh.registers_i[code[p + 3] as usize];
+    let bytes = bh.registers_i[code[p + 4] as usize];
+    let cpu = bh.cpu.expect("cpu not set");
+    bh.registers_f[code[p + 5] as usize] = cpu
+        .bh_gc_load_indexed_f(addr, index, scale, base_ofs, bytes)
+        .to_bits() as i64;
     Ok(p + 6)
 }
 fn handler_gc_store_indexed_i(
@@ -6382,9 +6582,11 @@ fn handler_raw_load_i(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    // @arguments("cpu", "i", "i", "d", returns="i") — 2i + descr + result
-    let (_descr, p) = read_descr_offset(bh, code, p + 2);
-    bh.registers_i[code[p] as usize] = 0; // stub
+    let addr = bh.registers_i[code[p] as usize];
+    let offset = bh.registers_i[code[p + 1] as usize];
+    let (_, p) = read_descr_offset(bh, code, p + 2);
+    let cpu = bh.cpu.expect("cpu not set");
+    bh.registers_i[code[p] as usize] = cpu.bh_raw_load_i(addr, offset);
     Ok(p + 1)
 }
 fn handler_raw_load_f(
@@ -6392,23 +6594,44 @@ fn handler_raw_load_f(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let (_descr, p) = read_descr_offset(bh, code, p + 2);
-    bh.registers_f[code[p] as usize] = 0; // stub
+    let addr = bh.registers_i[code[p] as usize];
+    let offset = bh.registers_i[code[p + 1] as usize];
+    let (_, p) = read_descr_offset(bh, code, p + 2);
+    let cpu = bh.cpu.expect("cpu not set");
+    bh.registers_f[code[p] as usize] = cpu.bh_raw_load_f(addr, offset).to_bits() as i64;
     Ok(p + 1)
 }
 // newlist / newlist_clear / newlist_hint (blackhole.py:1160-1189) — complex compound ops
+/// RPython `blackhole.py:1160-1171` `bhimpl_newlist`:
+/// ```python
+/// result = cpu.bh_new(structdescr)
+/// cpu.bh_setfield_gc_i(result, length, lengthdescr)
+/// items = cpu.bh_new_array(length, arraydescr)
+/// cpu.bh_setfield_gc_r(result, items, itemsdescr)
+/// return result
+/// ```
+/// Compound allocation: struct + set length + alloc array + set items field.
+/// Requires 4 descriptors from descrs table. Uses offsets from BhDescr.
 fn handler_newlist(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    // @arguments("cpu", "i", "d", "d", "d", "d", returns="r")
-    let _length = bh.registers_i[code[p] as usize];
-    let (_, p) = read_descr_offset(bh, code, p + 1);
-    let (_, p) = read_descr_offset(bh, code, p);
-    let (_, p) = read_descr_offset(bh, code, p);
-    let (_, p) = read_descr_offset(bh, code, p);
-    bh.registers_r[code[p] as usize] = 0; // stub
+    let length = bh.registers_i[code[p] as usize];
+    let (_struct_descr, p) = read_descr_offset(bh, code, p + 1);
+    let (length_offset, p) = read_descr_offset(bh, code, p);
+    let (items_offset, p) = read_descr_offset(bh, code, p);
+    let (array_itemsize, p) = read_descr_offset(bh, code, p);
+    let cpu = bh.cpu.expect("cpu not set");
+    // Allocate list struct (simplified: no SizeDescr yet)
+    let result = cpu.bh_new_array(length, array_itemsize, 0);
+    // Set length field
+    cpu.bh_setfield_gc_i(result, length_offset, length);
+    // Allocate items array
+    let items = cpu.bh_new_array(length, array_itemsize, 0);
+    // Set items field
+    cpu.bh_setfield_gc_r(result, items_offset, majit_ir::GcRef(items as usize));
+    bh.registers_r[code[p] as usize] = result;
     Ok(p + 1)
 }
 fn handler_newlist_clear(
@@ -6416,12 +6639,17 @@ fn handler_newlist_clear(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let _length = bh.registers_i[code[p] as usize];
+    let length = bh.registers_i[code[p] as usize];
     let (_, p) = read_descr_offset(bh, code, p + 1);
-    let (_, p) = read_descr_offset(bh, code, p);
-    let (_, p) = read_descr_offset(bh, code, p);
-    let (_, p) = read_descr_offset(bh, code, p);
-    bh.registers_r[code[p] as usize] = 0;
+    let (length_offset, p) = read_descr_offset(bh, code, p);
+    let (items_offset, p) = read_descr_offset(bh, code, p);
+    let (array_itemsize, p) = read_descr_offset(bh, code, p);
+    let cpu = bh.cpu.expect("cpu not set");
+    let result = cpu.bh_new_array(length, array_itemsize, 0);
+    cpu.bh_setfield_gc_i(result, length_offset, length);
+    let items = cpu.bh_new_array(length, array_itemsize, 0);
+    cpu.bh_setfield_gc_r(result, items_offset, majit_ir::GcRef(items as usize));
+    bh.registers_r[code[p] as usize] = result;
     Ok(p + 1)
 }
 fn handler_newlist_hint(
@@ -6429,12 +6657,17 @@ fn handler_newlist_hint(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let _length = bh.registers_i[code[p] as usize];
+    let lengthhint = bh.registers_i[code[p] as usize];
     let (_, p) = read_descr_offset(bh, code, p + 1);
-    let (_, p) = read_descr_offset(bh, code, p);
-    let (_, p) = read_descr_offset(bh, code, p);
-    let (_, p) = read_descr_offset(bh, code, p);
-    bh.registers_r[code[p] as usize] = 0;
+    let (length_offset, p) = read_descr_offset(bh, code, p);
+    let (items_offset, p) = read_descr_offset(bh, code, p);
+    let (array_itemsize, p) = read_descr_offset(bh, code, p);
+    let cpu = bh.cpu.expect("cpu not set");
+    let result = cpu.bh_new_array(lengthhint, array_itemsize, 0);
+    cpu.bh_setfield_gc_i(result, length_offset, 0); // length = 0 for hint
+    let items = cpu.bh_new_array(lengthhint, array_itemsize, 0);
+    cpu.bh_setfield_gc_r(result, items_offset, majit_ir::GcRef(items as usize));
+    bh.registers_r[code[p] as usize] = result;
     Ok(p + 1)
 }
 // getarrayitem_vable_f / setarrayitem_vable_f / getlistitem_gc_f / setlistitem_gc_f
@@ -6493,12 +6726,13 @@ fn handler_inline_call_irf_i(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let (_jc_idx, p) = read_descr_offset(bh, code, p); // 'j' argcode
+    let (jc_descr, p) = read_descr(bh, code, p); // 'j' argcode
+    let fnaddr = jc_descr.as_jitcode_fnaddr();
     let (ai, p) = read_list_i(bh, code, p);
     let (ar, p) = read_list_r(bh, code, p);
     let (af, p) = read_list_f(bh, code, p);
     let all = flatten_args(&ai, &ar, &af);
-    bh.registers_i[code[p] as usize] = bh.cpu.map(|c| c.bh_call_i(0, &all)).unwrap_or(0);
+    bh.registers_i[code[p] as usize] = bh.cpu.map(|c| c.bh_call_i(fnaddr, &all)).unwrap_or(0);
     Ok(p + 1)
 }
 fn handler_inline_call_irf_r(
@@ -6506,12 +6740,16 @@ fn handler_inline_call_irf_r(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let (_, p) = read_descr_offset(bh, code, p);
+    let (jc_descr, p) = read_descr(bh, code, p);
+    let fnaddr = jc_descr.as_jitcode_fnaddr();
     let (ai, p) = read_list_i(bh, code, p);
     let (ar, p) = read_list_r(bh, code, p);
     let (af, p) = read_list_f(bh, code, p);
     let all = flatten_args(&ai, &ar, &af);
-    bh.registers_r[code[p] as usize] = bh.cpu.map(|c| c.bh_call_r(0, &all).0 as i64).unwrap_or(0);
+    bh.registers_r[code[p] as usize] = bh
+        .cpu
+        .map(|c| c.bh_call_r(fnaddr, &all).0 as i64)
+        .unwrap_or(0);
     Ok(p + 1)
 }
 fn handler_inline_call_irf_f(
@@ -6519,12 +6757,16 @@ fn handler_inline_call_irf_f(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let (_, p) = read_descr_offset(bh, code, p);
+    let (jc_descr, p) = read_descr(bh, code, p);
+    let fnaddr = jc_descr.as_jitcode_fnaddr();
     let (ai, p) = read_list_i(bh, code, p);
     let (ar, p) = read_list_r(bh, code, p);
     let (af, p) = read_list_f(bh, code, p);
-    let _ = flatten_args(&ai, &ar, &af);
-    bh.registers_f[code[p] as usize] = 0;
+    let all = flatten_args(&ai, &ar, &af);
+    bh.registers_f[code[p] as usize] = bh
+        .cpu
+        .map(|c| c.bh_call_f(fnaddr, &all).to_bits() as i64)
+        .unwrap_or(0);
     Ok(p + 1)
 }
 fn handler_inline_call_irf_v(
@@ -6532,10 +6774,15 @@ fn handler_inline_call_irf_v(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let (_, p) = read_descr_offset(bh, code, p);
-    let (_, p) = read_list_i(bh, code, p);
-    let (_, p) = read_list_r(bh, code, p);
-    let (_, p) = read_list_f(bh, code, p);
+    let (jc_descr, p) = read_descr(bh, code, p);
+    let fnaddr = jc_descr.as_jitcode_fnaddr();
+    let (ai, p) = read_list_i(bh, code, p);
+    let (ar, p) = read_list_r(bh, code, p);
+    let (af, p) = read_list_f(bh, code, p);
+    let all = flatten_args(&ai, &ar, &af);
+    if let Some(cpu) = bh.cpu {
+        cpu.bh_call_v(fnaddr, &all);
+    }
     Ok(p)
 }
 fn handler_inline_call_ir_i(
@@ -6543,11 +6790,12 @@ fn handler_inline_call_ir_i(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let (_, p) = read_descr_offset(bh, code, p);
+    let (jc_descr, p) = read_descr(bh, code, p);
+    let fnaddr = jc_descr.as_jitcode_fnaddr();
     let (ai, p) = read_list_i(bh, code, p);
     let (ar, p) = read_list_r(bh, code, p);
     let all = flatten_args(&ai, &ar, &[]);
-    bh.registers_i[code[p] as usize] = bh.cpu.map(|c| c.bh_call_i(0, &all)).unwrap_or(0);
+    bh.registers_i[code[p] as usize] = bh.cpu.map(|c| c.bh_call_i(fnaddr, &all)).unwrap_or(0);
     Ok(p + 1)
 }
 fn handler_inline_call_ir_r(
@@ -6555,11 +6803,15 @@ fn handler_inline_call_ir_r(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let (_, p) = read_descr_offset(bh, code, p);
+    let (jc_descr, p) = read_descr(bh, code, p);
+    let fnaddr = jc_descr.as_jitcode_fnaddr();
     let (ai, p) = read_list_i(bh, code, p);
     let (ar, p) = read_list_r(bh, code, p);
     let all = flatten_args(&ai, &ar, &[]);
-    bh.registers_r[code[p] as usize] = bh.cpu.map(|c| c.bh_call_r(0, &all).0 as i64).unwrap_or(0);
+    bh.registers_r[code[p] as usize] = bh
+        .cpu
+        .map(|c| c.bh_call_r(fnaddr, &all).0 as i64)
+        .unwrap_or(0);
     Ok(p + 1)
 }
 fn handler_inline_call_ir_v(
@@ -6567,9 +6819,14 @@ fn handler_inline_call_ir_v(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let (_, p) = read_descr_offset(bh, code, p);
-    let (_, p) = read_list_i(bh, code, p);
-    let (_, p) = read_list_r(bh, code, p);
+    let (jc_descr, p) = read_descr(bh, code, p);
+    let fnaddr = jc_descr.as_jitcode_fnaddr();
+    let (ai, p) = read_list_i(bh, code, p);
+    let (ar, p) = read_list_r(bh, code, p);
+    let all = flatten_args(&ai, &ar, &[]);
+    if let Some(cpu) = bh.cpu {
+        cpu.bh_call_v(fnaddr, &all);
+    }
     Ok(p)
 }
 fn handler_inline_call_r_i(
@@ -6577,9 +6834,10 @@ fn handler_inline_call_r_i(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let (_, p) = read_descr_offset(bh, code, p);
+    let (jc_descr, p) = read_descr(bh, code, p);
+    let fnaddr = jc_descr.as_jitcode_fnaddr();
     let (ar, p) = read_list_r(bh, code, p);
-    bh.registers_i[code[p] as usize] = bh.cpu.map(|c| c.bh_call_i(0, &ar)).unwrap_or(0);
+    bh.registers_i[code[p] as usize] = bh.cpu.map(|c| c.bh_call_i(fnaddr, &ar)).unwrap_or(0);
     Ok(p + 1)
 }
 fn handler_inline_call_r_r(
@@ -6587,9 +6845,13 @@ fn handler_inline_call_r_r(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let (_, p) = read_descr_offset(bh, code, p);
+    let (jc_descr, p) = read_descr(bh, code, p);
+    let fnaddr = jc_descr.as_jitcode_fnaddr();
     let (ar, p) = read_list_r(bh, code, p);
-    bh.registers_r[code[p] as usize] = bh.cpu.map(|c| c.bh_call_r(0, &ar).0 as i64).unwrap_or(0);
+    bh.registers_r[code[p] as usize] = bh
+        .cpu
+        .map(|c| c.bh_call_r(fnaddr, &ar).0 as i64)
+        .unwrap_or(0);
     Ok(p + 1)
 }
 fn handler_inline_call_r_v(
@@ -6597,11 +6859,27 @@ fn handler_inline_call_r_v(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let (_, p) = read_descr_offset(bh, code, p);
-    let (_, p) = read_list_r(bh, code, p);
+    let (jc_descr, p) = read_descr(bh, code, p);
+    let fnaddr = jc_descr.as_jitcode_fnaddr();
+    let (ar, p) = read_list_r(bh, code, p);
+    if let Some(cpu) = bh.cpu {
+        cpu.bh_call_v(fnaddr, &ar);
+    }
     Ok(p)
 }
 // recursive_call — stub (needs portal runner)
+/// RPython `blackhole.py:1095-1099` `get_portal_runner(jdindex)`:
+/// Returns (fnptr, calldescr) from jitdrivers_sd[jdindex].
+/// pyre: uses portal_runner_ptr directly (single jitdriver).
+///
+/// RPython `blackhole.py:1101-1132`:
+/// ```python
+/// def bhimpl_recursive_call_i(self, jdindex, greens_i, greens_r, greens_f,
+///                                            reds_i, reds_r, reds_f):
+///     fnptr, calldescr = self.get_portal_runner(jdindex)
+///     return self.cpu.bh_call_i(fnptr, greens_i+reds_i, greens_r+reds_r,
+///                               greens_f+reds_f, calldescr)
+/// ```
 fn handler_recursive_call_i(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
@@ -6609,13 +6887,29 @@ fn handler_recursive_call_i(
 ) -> Result<usize, DispatchError> {
     let _jdindex = code[p]; // 'c' short constant
     let p = p + 1;
-    let (_, p) = read_list_i(bh, code, p);
-    let (_, p) = read_list_r(bh, code, p);
-    let (_, p) = read_list_f(bh, code, p);
-    let (_, p) = read_list_i(bh, code, p);
-    let (_, p) = read_list_r(bh, code, p);
-    let (_, p) = read_list_f(bh, code, p);
-    bh.registers_i[code[p] as usize] = 0;
+    let (greens_i, p) = read_list_i(bh, code, p);
+    let (greens_r, p) = read_list_r(bh, code, p);
+    let (greens_f, p) = read_list_f(bh, code, p);
+    let (reds_i, p) = read_list_i(bh, code, p);
+    let (reds_r, p) = read_list_r(bh, code, p);
+    let (reds_f, p) = read_list_f(bh, code, p);
+    // RPython: greens + reds merged per kind
+    let mut all = Vec::new();
+    all.extend(&greens_i);
+    all.extend(&reds_i);
+    all.extend(&greens_r);
+    all.extend(&reds_r);
+    all.extend(&greens_f);
+    all.extend(&reds_f);
+    // get_portal_runner: use portal_runner_ptr
+    let result = if let Some(runner) = bh.portal_runner_ptr {
+        runner(all.first().copied().unwrap_or(0))
+    } else if let Some(cpu) = bh.cpu {
+        cpu.bh_call_i(0, &all)
+    } else {
+        0
+    };
+    bh.registers_i[code[p] as usize] = result;
     Ok(p + 1)
 }
 fn handler_recursive_call_r(
@@ -6624,13 +6918,24 @@ fn handler_recursive_call_r(
     p: usize,
 ) -> Result<usize, DispatchError> {
     let p = p + 1;
-    let (_, p) = read_list_i(bh, code, p);
-    let (_, p) = read_list_r(bh, code, p);
-    let (_, p) = read_list_f(bh, code, p);
-    let (_, p) = read_list_i(bh, code, p);
-    let (_, p) = read_list_r(bh, code, p);
-    let (_, p) = read_list_f(bh, code, p);
-    bh.registers_r[code[p] as usize] = 0;
+    let (gi, p) = read_list_i(bh, code, p);
+    let (gr, p) = read_list_r(bh, code, p);
+    let (gf, p) = read_list_f(bh, code, p);
+    let (ri, p) = read_list_i(bh, code, p);
+    let (rr, p) = read_list_r(bh, code, p);
+    let (rf, p) = read_list_f(bh, code, p);
+    let mut all = Vec::new();
+    all.extend(&gi);
+    all.extend(&ri);
+    all.extend(&gr);
+    all.extend(&rr);
+    all.extend(&gf);
+    all.extend(&rf);
+    let result = bh
+        .cpu
+        .map(|cpu| cpu.bh_call_r(0, &all).0 as i64)
+        .unwrap_or(0);
+    bh.registers_r[code[p] as usize] = result;
     Ok(p + 1)
 }
 fn handler_recursive_call_f(
@@ -6639,13 +6944,24 @@ fn handler_recursive_call_f(
     p: usize,
 ) -> Result<usize, DispatchError> {
     let p = p + 1;
-    let (_, p) = read_list_i(bh, code, p);
-    let (_, p) = read_list_r(bh, code, p);
-    let (_, p) = read_list_f(bh, code, p);
-    let (_, p) = read_list_i(bh, code, p);
-    let (_, p) = read_list_r(bh, code, p);
-    let (_, p) = read_list_f(bh, code, p);
-    bh.registers_f[code[p] as usize] = 0;
+    let (gi, p) = read_list_i(bh, code, p);
+    let (gr, p) = read_list_r(bh, code, p);
+    let (gf, p) = read_list_f(bh, code, p);
+    let (ri, p) = read_list_i(bh, code, p);
+    let (rr, p) = read_list_r(bh, code, p);
+    let (rf, p) = read_list_f(bh, code, p);
+    let mut all = Vec::new();
+    all.extend(&gi);
+    all.extend(&ri);
+    all.extend(&gr);
+    all.extend(&rr);
+    all.extend(&gf);
+    all.extend(&rf);
+    let result = bh
+        .cpu
+        .map(|cpu| cpu.bh_call_f(0, &all).to_bits() as i64)
+        .unwrap_or(0);
+    bh.registers_f[code[p] as usize] = result;
     Ok(p + 1)
 }
 fn handler_recursive_call_v(
@@ -6654,11 +6970,21 @@ fn handler_recursive_call_v(
     p: usize,
 ) -> Result<usize, DispatchError> {
     let p = p + 1;
-    let (_, p) = read_list_i(bh, code, p);
-    let (_, p) = read_list_r(bh, code, p);
-    let (_, p) = read_list_f(bh, code, p);
-    let (_, p) = read_list_i(bh, code, p);
-    let (_, p) = read_list_r(bh, code, p);
-    let (_, p) = read_list_f(bh, code, p);
+    let (gi, p) = read_list_i(bh, code, p);
+    let (gr, p) = read_list_r(bh, code, p);
+    let (gf, p) = read_list_f(bh, code, p);
+    let (ri, p) = read_list_i(bh, code, p);
+    let (rr, p) = read_list_r(bh, code, p);
+    let (rf, p) = read_list_f(bh, code, p);
+    let mut all = Vec::new();
+    all.extend(&gi);
+    all.extend(&ri);
+    all.extend(&gr);
+    all.extend(&rr);
+    all.extend(&gf);
+    all.extend(&rf);
+    if let Some(cpu) = bh.cpu {
+        cpu.bh_call_v(0, &all);
+    }
     Ok(p)
 }

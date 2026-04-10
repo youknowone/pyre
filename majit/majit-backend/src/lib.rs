@@ -1174,6 +1174,12 @@ pub trait Backend: Send {
     /// model.py: bh_setarrayitem_gc_r(array_ptr, index, value, descr)
     fn bh_setarrayitem_gc_r(&self, _array_ptr: i64, _index: i64, _item_size: usize, _value: GcRef) {
     }
+    /// model.py: bh_getarrayitem_gc_f(array_ptr, index, descr)
+    fn bh_getarrayitem_gc_f(&self, _array_ptr: i64, _index: i64, _item_size: usize) -> f64 {
+        0.0
+    }
+    /// model.py: bh_setarrayitem_gc_f(array_ptr, index, value, descr)
+    fn bh_setarrayitem_gc_f(&self, _array_ptr: i64, _index: i64, _item_size: usize, _value: f64) {}
     /// model.py: bh_arraylen_gc(array_ptr, descr)
     fn bh_arraylen_gc(&self, _array_ptr: i64, _len_offset: usize) -> i64 {
         0
@@ -1279,6 +1285,38 @@ pub trait Backend: Send {
     }
     /// model.py: bh_setinteriorfield_gc_i(array, index, value, descr)
     fn bh_setinteriorfield_gc_i(&self, _array: i64, _index: i64, _offset: usize, _value: i64) {}
+    fn bh_getinteriorfield_gc_r(&self, _array: i64, _index: i64, _offset: usize) -> GcRef {
+        GcRef::NULL
+    }
+    fn bh_getinteriorfield_gc_f(&self, _array: i64, _index: i64, _offset: usize) -> f64 {
+        0.0
+    }
+    fn bh_setinteriorfield_gc_r(&self, _array: i64, _index: i64, _offset: usize, _value: GcRef) {}
+    fn bh_setinteriorfield_gc_f(&self, _array: i64, _index: i64, _offset: usize, _value: f64) {}
+    fn bh_gc_load_indexed_i(
+        &self,
+        _addr: i64,
+        _index: i64,
+        _scale: i64,
+        _base_ofs: i64,
+        _bytes: i64,
+    ) -> i64 {
+        0
+    }
+    fn bh_gc_load_indexed_f(
+        &self,
+        _addr: i64,
+        _index: i64,
+        _scale: i64,
+        _base_ofs: i64,
+        _bytes: i64,
+    ) -> f64 {
+        0.0
+    }
+    fn bh_raw_load_f(&self, _ptr: i64, _offset: i64) -> f64 {
+        0.0
+    }
+    fn bh_raw_store_f(&self, _ptr: i64, _offset: i64, _value: f64) {}
     // ── model.py: raw field access ──
     fn bh_getfield_raw_i(&self, _struct_ptr: i64, _offset: usize) -> i64 {
         0
@@ -1295,6 +1333,11 @@ pub trait Backend: Send {
     /// model.py: bh_classof(obj_ptr)
     fn bh_classof(&self, _obj_ptr: i64) -> i64 {
         0
+    }
+    /// RPython rclass.ll_issubclass(typeptr, bounding_class).
+    /// Returns true if `typeptr` is a subclass of `bounding_class`.
+    fn bh_issubclass(&self, _typeptr: i64, _bounding_class: i64) -> bool {
+        _typeptr == _bounding_class // default: exact match only
     }
 
     /// model.py: setup_once() — called once when the backend is first used.
