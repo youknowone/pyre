@@ -54,23 +54,45 @@ impl OptimizerKnowledge {
     }
 
     /// Remap OpRefs from source-trace numbering to bridge inputarg numbering.
+    ///
+    /// bridgeopt.py:38-42 tag_box parity: in PyPy, serialize_optheap and
+    /// serialize_optrewrite pre-filter entries by available_boxes, then
+    /// tag_box asserts that every remaining non-const box exists in
+    /// liveboxes_from_env. The per-guard capture in emit_guard_operation
+    /// now applies the same available_boxes filter, so entries reaching
+    /// remap() should all be mappable. Unmappable entries are dropped with
+    /// a debug_assert warning (was previously a silent drop).
     pub fn remap(&self, remap: &std::collections::HashMap<OpRef, OpRef>) -> Self {
         let heap_fields = self
             .heap_fields
             .iter()
             .filter_map(|(obj, descr, val)| {
-                let new_obj = remap.get(obj)?;
-                let new_val = remap.get(val)?;
-                Some((*new_obj, descr.clone(), *new_val))
+                let new_obj = remap.get(obj);
+                let new_val = remap.get(val);
+                debug_assert!(
+                    new_obj.is_some() && new_val.is_some(),
+                    "remap: heap_field entry ({:?}, {:?}) not in remap table \
+                     — should have been filtered by available_boxes",
+                    obj,
+                    val,
+                );
+                Some((*new_obj?, descr.clone(), *new_val?))
             })
             .collect();
         let heap_arrayitems = self
             .heap_arrayitems
             .iter()
             .filter_map(|(obj, index, descr, val)| {
-                let new_obj = remap.get(obj)?;
-                let new_val = remap.get(val)?;
-                Some((*new_obj, *index, descr.clone(), *new_val))
+                let new_obj = remap.get(obj);
+                let new_val = remap.get(val);
+                debug_assert!(
+                    new_obj.is_some() && new_val.is_some(),
+                    "remap: heap_arrayitem entry ({:?}, {:?}) not in remap table \
+                     — should have been filtered by available_boxes",
+                    obj,
+                    val,
+                );
+                Some((*new_obj?, *index, descr.clone(), *new_val?))
             })
             .collect();
         let known_classes = self
@@ -85,8 +107,14 @@ impl OptimizerKnowledge {
             .loopinvariant_results
             .iter()
             .filter_map(|&(func_ptr, result)| {
-                let new_result = remap.get(&result)?;
-                Some((func_ptr, *new_result))
+                let new_result = remap.get(&result);
+                debug_assert!(
+                    new_result.is_some(),
+                    "remap: loopinvariant result {:?} not in remap table \
+                     — should have been filtered by available_boxes",
+                    result,
+                );
+                Some((func_ptr, *new_result?))
             })
             .collect();
         OptimizerKnowledge {
@@ -1043,39 +1071,6 @@ impl Optimizer {
     /// Look up a previously recorded CALL_PURE result.
     pub fn get_call_pure_result(&self, args: &[majit_ir::OpRef]) -> Option<&majit_ir::Value> {
         self.call_pure_results.get(args)
-    }
-
-    /// bridgeopt.py:63-122: serialize_optimizer_knowledge
-    /// Export the optimizer's heap cache, known class, and loopinvariant knowledge
-    /// for storage in guard resume data. Called after optimization.
-    pub fn serialize_optimizer_knowledge(&self, ctx: &mut OptContext) -> OptimizerKnowledge {
-        let mut knowledge = OptimizerKnowledge::new();
-
-        // heap.py:826-868 serialize_optheap: struct fields + array items
-        for pass in &self.passes {
-            knowledge.heap_fields.extend(pass.export_cached_fields(ctx));
-            knowledge
-                .heap_arrayitems
-                .extend(pass.export_cached_arrayitems(ctx));
-        }
-
-        // bridgeopt.py:74-88: known classes from ptr_info
-        for (idx, fwd) in ctx.forwarded.iter().enumerate() {
-            if let crate::optimizeopt::info::Forwarded::Info(info) = fwd {
-                if let Some(class_ptr) = info.get_known_class() {
-                    knowledge.known_classes.push((OpRef(idx as u32), class_ptr));
-                }
-            }
-        }
-
-        // bridgeopt.py:113-122: loopinvariant results from OptRewrite
-        for pass in &self.passes {
-            knowledge
-                .loopinvariant_results
-                .extend(pass.serialize_optrewrite());
-        }
-
-        knowledge
     }
 
     /// bridgeopt.py:124-185: deserialize_optimizer_knowledge
@@ -3200,6 +3195,17 @@ impl Optimizer {
         // this inside store_final_boxes_in_guard via ResumeDataVirtualAdder;
         // majit holds it adjacent to keep store_final_boxes_in_guard pure.
         {
+            // bridgeopt.py:64-67: build available_boxes from guard fail_args.
+            // Only boxes that appear in fail_args (or are constants) can be
+            // encoded in the guard's resume data. PyPy builds this set in
+            // serialize_optimizer_knowledge and passes it to serialize_optheap
+            // and serialize_optrewrite as a filter.
+            let available_boxes: std::collections::HashSet<OpRef> = op
+                .fail_args
+                .as_ref()
+                .map(|fa| fa.iter().copied().filter(|r| !r.is_none()).collect())
+                .unwrap_or_default();
+
             let mut heap_fields = Vec::new();
             let mut heap_arrayitems = Vec::new();
             for pass in &self.passes {
@@ -3211,6 +3217,39 @@ impl Optimizer {
                     break;
                 }
             }
+            // heap.py:836-845: filter struct fields by available_boxes.
+            // box1 must be constant or in available_boxes (raw).
+            // box2: apply get_box_replacement first, then check the *replaced*
+            // value against constant/available_boxes (heap.py:843-845).
+            heap_fields.retain(|&(obj, _, val)| {
+                let obj_ok = ctx.is_constant(obj) || available_boxes.contains(&obj);
+                let replaced_val = ctx.get_box_replacement(val);
+                let val_ok =
+                    ctx.is_constant(replaced_val) || available_boxes.contains(&replaced_val);
+                obj_ok && val_ok
+            });
+            // heap.py:854-867: filter array items by available_boxes (same rule).
+            heap_arrayitems.retain(|&(obj, _, _, val)| {
+                let obj_ok = ctx.is_constant(obj) || available_boxes.contains(&obj);
+                let replaced_val = ctx.get_box_replacement(val);
+                let val_ok =
+                    ctx.is_constant(replaced_val) || available_boxes.contains(&replaced_val);
+                obj_ok && val_ok
+            });
+
+            // bridgeopt.py:113-122: loopinvariant results filtered per-guard.
+            // rewrite.py:831-833: result box after get_box_replacement must
+            // be in available_boxes (constants excluded — bridge will refold).
+            let mut loopinvariant_results = Vec::new();
+            for pass in &self.passes {
+                for (func_ptr, result) in pass.serialize_optrewrite() {
+                    let replaced = ctx.get_box_replacement(result);
+                    if available_boxes.contains(&replaced) {
+                        loopinvariant_results.push((func_ptr, replaced));
+                    }
+                }
+            }
+
             let mut known_classes = Vec::new();
             if let Some(ref fa) = op.fail_args {
                 for &farg in fa {
@@ -3225,14 +3264,18 @@ impl Optimizer {
                     }
                 }
             }
-            if !heap_fields.is_empty() || !heap_arrayitems.is_empty() || !known_classes.is_empty() {
+            if !heap_fields.is_empty()
+                || !heap_arrayitems.is_empty()
+                || !known_classes.is_empty()
+                || !loopinvariant_results.is_empty()
+            {
                 self.per_guard_knowledge.push((
                     op.pos,
                     OptimizerKnowledge {
                         heap_fields,
                         heap_arrayitems,
                         known_classes,
-                        loopinvariant_results: Vec::new(),
+                        loopinvariant_results,
                     },
                 ));
             }

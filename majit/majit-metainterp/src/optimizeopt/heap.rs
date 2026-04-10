@@ -1364,63 +1364,90 @@ impl OptHeap {
         // function (emitting_operation line 460: !has_random_effects → return).
         // No special handling needed here.
 
-        // heapcache.py:362-370: Only invalidate entries for escaped objects.
-        // Unescaped allocations survive the call because the callee cannot
-        // access them. Snapshot unescaped bitset to avoid borrow conflicts.
-        let unescaped_snapshot = self.unescaped.clone();
+        // heap.py:542-558 force_from_effectinfo field/array loops.
+        // Each descr is checked for readonly and write effects.
+        // cf.force_lazy_set(optheap, descr, can_cache) is the core:
+        //   can_cache=True  (readonly): invalidate → emit → put_field_back_to_info
+        //   can_cache=False (write):    invalidate → emit → return (no put_back)
+        //                               if no lazy_set: just invalidate
+        // heap.py:189-191: invalidate checks descr.is_always_pure()
 
-        // Force/invalidate field caches based on read/write bitstrings
+        // heap.py:542-552: for fielddescr, cf in self.cached_fields.items()
         let field_indices: Vec<u32> = self.cached_fields.keys().copied().collect();
         for field_idx in field_indices {
             if ei.check_readonly_descr_field(field_idx) {
-                // Call reads this field → force lazy set (but keep cache)
-                if let Some(cf) = self.cached_fields.get_mut(&field_idx) {
-                    if let Some((_, mut lazy_op)) = cf.lazy_set.take() {
-                        Self::emit_lazy_setfield(&mut lazy_op, ctx, true);
-                    }
-                }
-            }
-            if ei.check_write_descr_field(field_idx) {
-                // heap.py:545-546: force_lazy_set(can_cache=False)
-                // Call writes this field → force lazy set AND invalidate cache.
-                // heapcache.py:362-370: only invalidate escaped entries.
-                // For unescaped objects, re-cache the value after forcing the
-                // lazy set so later reads can still be optimized away.
+                // heap.py:543-544: cf.force_lazy_set(self, fielddescr) [can_cache=True]
                 let lazy_info = self
                     .cached_fields
                     .get_mut(&field_idx)
                     .and_then(|cf| cf.lazy_set.take());
                 if let Some((obj, mut lazy_op)) = lazy_info {
-                    // heap.py:139: put_field_back_to_info for unescaped
-                    // objects: the callee cannot modify them, so re-cache
-                    // after emitting.
-                    let re_cache_value = if vb_get(&unescaped_snapshot, obj.0) {
-                        Some((obj, lazy_op.arg(1), lazy_op.descr.clone()))
-                    } else {
-                        None
-                    };
-                    Self::emit_lazy_setfield(&mut lazy_op, ctx, true);
-                    if let Some((obj, value, descr)) = re_cache_value {
-                        let cf = self.field_cache(field_idx);
-                        cf.register_info(obj);
-                        ctx.structinfo_setfield(&lazy_op, field_idx, value);
+                    // heap.py:129: self.invalidate(descr)
+                    if !vb_get(&self.immutable_field_descrs, field_idx) {
+                        if let Some(cf) = self.cached_fields.get_mut(&field_idx) {
+                            cf.invalidate(field_idx, ctx);
+                        }
                     }
+                    // heap.py:131-135: emit postponed if referenced
+                    let needs_postponed = self
+                        .postponed_op
+                        .as_ref()
+                        .map_or(false, |p| lazy_op.args.iter().any(|a| *a == p.pos));
+                    if needs_postponed {
+                        if let Some(p) = self.postponed_op.take() {
+                            ctx.emit_extra(ctx.current_pass_idx, p);
+                        }
+                    }
+                    // heap.py:136: emit_extra(op, emit=False)
+                    for arg in lazy_op.args.iter_mut() {
+                        *arg = ctx.get_box_replacement(*arg);
+                    }
+                    let final_value = lazy_op.arg(1);
+                    let put_back_op = lazy_op.clone();
+                    Self::emit_lazy_setfield(&mut lazy_op, ctx, true);
+                    // heap.py:142-143: put_field_back_to_info
+                    self.cache_field(obj, field_idx, put_back_op.descr.as_ref());
+                    ctx.structinfo_setfield(&put_back_op, field_idx, final_value);
                 }
-                if !vb_get(&self.immutable_field_descrs, field_idx) {
-                    // heapcache.py:365-366: cache.invalidate_unescaped()
-                    if let Some(cf) = self.cached_fields.get_mut(&field_idx) {
-                        cf.invalidate_unescaped(&unescaped_snapshot, field_idx, ctx);
+            }
+            if ei.check_write_descr_field(field_idx) {
+                // heap.py:545-546: cf.force_lazy_set(self, fielddescr, can_cache=False)
+                let lazy_info = self
+                    .cached_fields
+                    .get_mut(&field_idx)
+                    .and_then(|cf| cf.lazy_set.take());
+                if let Some((_obj, mut lazy_op)) = lazy_info {
+                    // heap.py:129: self.invalidate(descr)
+                    if !vb_get(&self.immutable_field_descrs, field_idx) {
+                        if let Some(cf) = self.cached_fields.get_mut(&field_idx) {
+                            cf.invalidate(field_idx, ctx);
+                        }
+                    }
+                    // heap.py:131-135: emit postponed if referenced
+                    let needs_postponed = self
+                        .postponed_op
+                        .as_ref()
+                        .map_or(false, |p| lazy_op.args.iter().any(|a| *a == p.pos));
+                    if needs_postponed {
+                        if let Some(p) = self.postponed_op.take() {
+                            ctx.emit_extra(ctx.current_pass_idx, p);
+                        }
+                    }
+                    // heap.py:136: emit_extra(op, emit=False)
+                    Self::emit_lazy_setfield(&mut lazy_op, ctx, true);
+                    // heap.py:137-138: can_cache=False → no put_field_back_to_info
+                } else {
+                    // heap.py:144-145: elif not can_cache: self.invalidate(descr)
+                    if !vb_get(&self.immutable_field_descrs, field_idx) {
+                        if let Some(cf) = self.cached_fields.get_mut(&field_idx) {
+                            cf.invalidate(field_idx, ctx);
+                        }
                     }
                 }
             }
         }
 
-        // heap.py:554-558: per-arraydescr force/invalidate.
-        //   for arraydescr, submap in self.cached_arrayitems.items():
-        //       if effectinfo.check_readonly_descr_array(arraydescr):
-        //           self.force_lazy_setarrayitem_submap(submap)
-        //       if effectinfo.check_write_descr_array(arraydescr):
-        //           self.force_lazy_setarrayitem_submap(submap, can_cache=False)
+        // heap.py:554-558: for arraydescr, submap in self.cached_arrayitems.items()
         let array_descrs: Vec<u32> = self.cached_arrayitems.keys().copied().collect();
         for descr_idx in array_descrs {
             let read = ei.check_readonly_descr_array(descr_idx);
@@ -1428,58 +1455,94 @@ impl OptHeap {
             if !read && !write {
                 continue;
             }
-            // Snapshot the indexes so we can iterate without holding a long
-            // borrow on the submap (the lazy_setfield path mutates ctx).
             let indexes: Vec<i64> = match self.cached_arrayitems.get(&descr_idx) {
                 Some(submap) => submap.const_indexes.keys().copied().collect(),
                 None => continue,
             };
             for index in indexes {
                 if read {
-                    if let Some(cai) = self
-                        .cached_arrayitems
-                        .get_mut(&descr_idx)
-                        .and_then(|s| s.const_indexes.get_mut(&index))
-                    {
-                        if let Some((_, mut lazy_op)) = cai.lazy_set.take() {
-                            Self::emit_lazy_setfield(&mut lazy_op, ctx, true);
-                        }
-                    }
-                }
-                if write {
+                    // heap.py:555-556: force_lazy_setarrayitem_submap(submap) [can_cache=True]
+                    // → cf.force_lazy_set(self, None, can_cache=True)
                     let lazy_info = self
                         .cached_arrayitems
                         .get_mut(&descr_idx)
                         .and_then(|s| s.const_indexes.get_mut(&index))
                         .and_then(|cai| cai.lazy_set.take());
                     if let Some((arr, mut lazy_op)) = lazy_info {
-                        let re_cache_value = if vb_get(&unescaped_snapshot, arr.0) {
-                            Some((arr, lazy_op.arg(2), lazy_op.descr.clone()))
-                        } else {
-                            None
-                        };
+                        // heap.py:129: self.invalidate(descr)
+                        if let Some(cai) = self
+                            .cached_arrayitems
+                            .get_mut(&descr_idx)
+                            .and_then(|s| s.const_indexes.get_mut(&index))
+                        {
+                            cai.invalidate(ctx);
+                        }
+                        // heap.py:131-135: emit postponed if referenced
+                        let needs_postponed = self
+                            .postponed_op
+                            .as_ref()
+                            .map_or(false, |p| lazy_op.args.iter().any(|a| *a == p.pos));
+                        if needs_postponed {
+                            if let Some(p) = self.postponed_op.take() {
+                                ctx.emit_extra(ctx.current_pass_idx, p);
+                            }
+                        }
+                        // heap.py:136: emit_extra(op, emit=False)
+                        for arg in lazy_op.args.iter_mut() {
+                            *arg = ctx.get_box_replacement(*arg);
+                        }
+                        let final_value = lazy_op.arg(2);
                         let put_back_op = lazy_op.clone();
                         Self::emit_lazy_setfield(&mut lazy_op, ctx, true);
-                        if let Some((arr, value, descr)) = re_cache_value {
-                            let cai = self.arrayitem_cache(descr_idx, index);
-                            cai.register_info(arr);
-                            // info.py: ArrayPtrInfo.setitem — keep PtrInfo in sync.
-                            ctx.arrayinfo_setitem(&put_back_op, index as usize, value);
-                        }
+                        // heap.py:142-143: put_field_back_to_info
+                        self.cache_arrayitem(arr, descr_idx, index, put_back_op.descr.as_ref());
+                        ctx.arrayinfo_setitem(&put_back_op, index as usize, final_value);
                     }
-                    // heapcache.py:367-369: cache.invalidate_unescaped()
-                    if let Some(cai) = self
+                }
+                if write {
+                    // heap.py:557-558: force_lazy_setarrayitem_submap(submap, can_cache=False)
+                    // → cf.force_lazy_set(self, None, can_cache=False)
+                    let lazy_info = self
                         .cached_arrayitems
                         .get_mut(&descr_idx)
                         .and_then(|s| s.const_indexes.get_mut(&index))
-                    {
-                        cai.invalidate_unescaped(&unescaped_snapshot, ctx);
+                        .and_then(|cai| cai.lazy_set.take());
+                    if let Some((_arr, mut lazy_op)) = lazy_info {
+                        // heap.py:129: self.invalidate(descr)
+                        if let Some(cai) = self
+                            .cached_arrayitems
+                            .get_mut(&descr_idx)
+                            .and_then(|s| s.const_indexes.get_mut(&index))
+                        {
+                            cai.invalidate(ctx);
+                        }
+                        // heap.py:131-135: emit postponed if referenced
+                        let needs_postponed = self
+                            .postponed_op
+                            .as_ref()
+                            .map_or(false, |p| lazy_op.args.iter().any(|a| *a == p.pos));
+                        if needs_postponed {
+                            if let Some(p) = self.postponed_op.take() {
+                                ctx.emit_extra(ctx.current_pass_idx, p);
+                            }
+                        }
+                        // heap.py:136: emit_extra(op, emit=False)
+                        Self::emit_lazy_setfield(&mut lazy_op, ctx, true);
+                        // can_cache=False → no put_field_back_to_info
+                    } else {
+                        // heap.py:144-145: elif not can_cache: self.invalidate(descr)
+                        if let Some(cai) = self
+                            .cached_arrayitems
+                            .get_mut(&descr_idx)
+                            .and_then(|s| s.const_indexes.get_mut(&index))
+                        {
+                            cai.invalidate(ctx);
+                        }
                     }
                 }
             }
             if write {
-                // heap.py:266 ArrayCachedItem.invalidate → parent.clear_varindex().
-                // A write through this descr can clobber any varindex triple.
+                // heap.py:266 ArrayCachedItem.invalidate → parent.clear_varindex()
                 if let Some(submap) = self.cached_arrayitems.get_mut(&descr_idx) {
                     submap.clear_varindex();
                 }
@@ -2873,17 +2936,6 @@ impl Optimization for OptHeap {
                 }
             }
         }
-        // Immutable field entries (always-pure fields surviving calls).
-        for (&(obj, descr_idx), &val) in &self.immutable_cached_fields {
-            if val.is_none() {
-                continue;
-            }
-            let descr = match self.field_descr_map.get(&descr_idx) {
-                Some(d) => d.clone(),
-                None => continue,
-            };
-            result.push((obj, descr, val));
-        }
         result
     }
 
@@ -4043,11 +4095,14 @@ mod tests {
     // ── Test 26: Unescaped allocation's cache survives call ──
 
     #[test]
-    fn test_unescaped_survives_call() {
+    fn test_unescaped_invalidated_by_call_write() {
         // p0 = new()
         // setfield_gc(p0, i10, descr=d0)
         // call_n(some_func)               <- p0 NOT passed to call
-        // i1 = getfield_gc_i(p0, descr=d0) <- still cached (p0 is unescaped)
+        // i1 = getfield_gc_i(p0, descr=d0) <- must re-emit
+        //
+        // heap.py:545-546: check_write_descr_field → force_lazy_set(can_cache=False)
+        // PyPy does a full invalidate on write, regardless of escape status.
         let d = descr(0);
         let mut ops = vec![
             Op::new(OpCode::New, &[]), // pos=0 -> p0
@@ -4058,12 +4113,17 @@ mod tests {
         ];
         let result = run_heap_opt(&mut ops);
 
-        // NEW + SETFIELD(forced by call) + CALL + Jump.
-        // GETFIELD eliminated (unescaped object cache survives call).
-        let opcodes: Vec<_> = result.iter().map(|o| o.opcode).collect();
-        assert!(
-            !opcodes.contains(&OpCode::GetfieldGcI),
-            "GETFIELD should be eliminated for unescaped object, got: {opcodes:?}"
+        // heap.py: force_lazy_set(can_cache=False) invalidates ALL entries.
+        // GETFIELD must be re-emitted after call that writes the field.
+        let get_count = result
+            .iter()
+            .filter(|o| o.opcode == OpCode::GetfieldGcI)
+            .count();
+        assert_eq!(
+            get_count,
+            1,
+            "GETFIELD must be re-emitted after call writes field (full invalidate), got: {:?}",
+            result.iter().map(|o| o.opcode).collect::<Vec<_>>()
         );
     }
 
@@ -4159,11 +4219,14 @@ mod tests {
     // ── Test 31: Unescaped array cache survives call ──
 
     #[test]
-    fn test_unescaped_array_survives_call() {
+    fn test_unescaped_array_invalidated_by_call_write() {
         // p0 = new_array(5)
         // setarrayitem_gc(p0, idx, i10, descr=d0)
         // call_n(some_func)                <- p0 not passed
-        // i1 = getarrayitem_gc_i(p0, idx, descr=d0) <- still cached
+        // i1 = getarrayitem_gc_i(p0, idx, descr=d0) <- must re-emit
+        //
+        // heap.py:557-558: check_write_descr_array → force_lazy_setarrayitem_submap(can_cache=False)
+        // PyPy does a full invalidate on write, regardless of escape status.
         let d = descr(0);
         let idx = OpRef(50);
         let mut ops = vec![
@@ -4208,21 +4271,27 @@ mod tests {
         }
 
         let opcodes: Vec<_> = ctx.new_operations.iter().map(|o| o.opcode).collect();
-        assert!(
-            !opcodes.contains(&OpCode::GetarrayitemGcI),
-            "GETARRAYITEM should be eliminated for unescaped array, got: {opcodes:?}"
+        let get_count = opcodes
+            .iter()
+            .filter(|&&o| o == OpCode::GetarrayitemGcI)
+            .count();
+        assert_eq!(
+            get_count, 1,
+            "GETARRAYITEM must be re-emitted after call writes array (full invalidate), got: {opcodes:?}"
         );
     }
 
     // ── Test 32: Multiple calls — unescaped object stays cached ──
 
     #[test]
-    fn test_unescaped_survives_multiple_calls() {
+    fn test_unescaped_invalidated_by_multiple_calls() {
         // p0 = new()
         // setfield_gc(p0, i10, descr=d0)
         // call_n(f1)
         // call_n(f2)
-        // i1 = getfield_gc_i(p0, descr=d0) <- still cached
+        // i1 = getfield_gc_i(p0, descr=d0) <- must re-emit
+        //
+        // heap.py: full invalidate on write call, regardless of escape status.
         let d = descr(0);
         let mut ops = vec![
             Op::new(OpCode::New, &[]),
@@ -4234,10 +4303,15 @@ mod tests {
         ];
         let result = run_heap_opt(&mut ops);
 
-        let opcodes: Vec<_> = result.iter().map(|o| o.opcode).collect();
-        assert!(
-            !opcodes.contains(&OpCode::GetfieldGcI),
-            "GETFIELD should be eliminated for unescaped object across multiple calls, got: {opcodes:?}"
+        let get_count = result
+            .iter()
+            .filter(|o| o.opcode == OpCode::GetfieldGcI)
+            .count();
+        assert_eq!(
+            get_count,
+            1,
+            "GETFIELD must be re-emitted after calls that write field (full invalidate), got: {:?}",
+            result.iter().map(|o| o.opcode).collect::<Vec<_>>()
         );
     }
 

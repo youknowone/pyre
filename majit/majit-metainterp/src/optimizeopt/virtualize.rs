@@ -3208,6 +3208,7 @@ mod tests {
             ctx.set_ptr_info(
                 opref,
                 PtrInfo::VirtualRawBuffer(VirtualRawBufferInfo {
+                    func: 0,
                     size,
                     entries: Vec::new(),
                     last_guard_pos: -1,
