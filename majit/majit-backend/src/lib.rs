@@ -1334,6 +1334,28 @@ pub trait Backend: Send {
     ) -> f64 {
         0.0
     }
+    /// blackhole.py:1525-1529 bhimpl_gc_store_indexed_i
+    fn bh_gc_store_indexed_i(
+        &self,
+        _addr: i64,
+        _index: i64,
+        _value: i64,
+        _scale: i64,
+        _base_ofs: i64,
+        _bytes: i64,
+    ) {
+    }
+    /// blackhole.py:1531-1535 bhimpl_gc_store_indexed_f
+    fn bh_gc_store_indexed_f(
+        &self,
+        _addr: i64,
+        _index: i64,
+        _value: f64,
+        _scale: i64,
+        _base_ofs: i64,
+        _bytes: i64,
+    ) {
+    }
     fn bh_raw_load_f(&self, _ptr: i64, _offset: i64) -> f64 {
         0.0
     }

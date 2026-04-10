@@ -4714,23 +4714,45 @@ fn read_descr_offset(bh: &BlackholeInterpreter, code: &[u8], pos: usize) -> (usi
     (descr.as_offset(), pos)
 }
 
-/// Read a VableField descriptor and return the field index.
-/// RPython passes fielddescr to cpu.bh_getfield_gc_* — the descriptor carries the byte offset.
-/// In pyre, VableField.index is the index into VirtualizableInfo.static_fields;
-/// resolving to a byte offset requires vinfo.static_fields[index].offset (not yet wired).
+/// Read a VableField descriptor and resolve to byte offset via VirtualizableInfo.
+/// RPython: fielddescr carries byte offset directly.
+/// pyre: VableField.index → vinfo.static_fields[index].offset.
 #[inline]
 fn read_descr_vable_field(bh: &BlackholeInterpreter, code: &[u8], pos: usize) -> (usize, usize) {
     let (descr, pos) = read_descr(bh, code, pos);
-    (descr.as_vable_field_index(), pos)
+    let field_index = descr.as_vable_field_index();
+    // Resolve field_index → byte offset via VirtualizableInfo.
+    let offset = if !bh.virtualizable_info.is_null() {
+        let vinfo = unsafe { &*bh.virtualizable_info };
+        vinfo
+            .static_fields
+            .get(field_index)
+            .map(|f| f.offset)
+            .unwrap_or(field_index)
+    } else {
+        field_index
+    };
+    (offset, pos)
 }
 
-/// Read a VableArray descriptor and return the array index.
-/// RPython passes fielddescr to cpu.bh_getfield_gc_r to get the array ref from the vable.
-/// In pyre, VableArray.index is the index into VirtualizableInfo.array_fields.
+/// Read a VableArray descriptor and resolve to field_offset via VirtualizableInfo.
+/// RPython: fielddescr carries byte offset for the array pointer field.
+/// pyre: VableArray.index → vinfo.array_fields[index].field_offset.
 #[inline]
 fn read_descr_vable_array(bh: &BlackholeInterpreter, code: &[u8], pos: usize) -> (usize, usize) {
     let (descr, pos) = read_descr(bh, code, pos);
-    (descr.as_vable_array_index(), pos)
+    let array_index = descr.as_vable_array_index();
+    let offset = if !bh.virtualizable_info.is_null() {
+        let vinfo = unsafe { &*bh.virtualizable_info };
+        vinfo
+            .array_fields
+            .get(array_index)
+            .map(|a| a.field_offset)
+            .unwrap_or(array_index)
+    } else {
+        array_index
+    };
+    (offset, pos)
 }
 
 // bhimpl_getfield_gc_i: @arguments("cpu", "r", "d", returns="i")
@@ -6051,9 +6073,10 @@ fn handler_current_trace_length(
     Ok(p + 1)
 }
 
-// ── vable field operations — delegates to cpu.bh_getfield_gc + clear_vable_token ──
-// For now, stubs that skip the correct number of bytes.
-// Full implementation needs VirtualizableInfo::clear_vable_token.
+// ── vable field operations (blackhole.py:1446-1495) ─────────────────
+// RPython: fielddescr.get_vinfo().clear_vable_token(struct)
+//          return cpu.bh_getfield_gc_*(struct, fielddescr)
+// pyre: read_descr_vable_field resolves VableField.index → byte offset via VirtualizableInfo.
 
 fn handler_getfield_vable_i(
     bh: &mut BlackholeInterpreter,
@@ -6061,17 +6084,13 @@ fn handler_getfield_vable_i(
     p: usize,
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_r[code[p] as usize];
-    // RPython blackhole.py:1446: fielddescr.get_vinfo().clear_vable_token(struct)
     if !bh.virtualizable_info.is_null() {
         let vinfo = unsafe { &*bh.virtualizable_info };
-        let ptr = struct_ptr as *mut u8;
-        unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, ptr) };
+        unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, struct_ptr as *mut u8) };
     }
-    let (field_index, p) = read_descr_vable_field(bh, code, p + 1);
+    let (offset, p) = read_descr_vable_field(bh, code, p + 1);
     let cpu = bh.cpu.expect("cpu not set");
-    // RPython: cpu.bh_getfield_gc_i(struct, fielddescr) — fielddescr carries byte offset.
-    // pyre: field_index used as offset placeholder until VirtualizableInfo resolution.
-    bh.registers_i[code[p] as usize] = cpu.bh_getfield_gc_i(struct_ptr, field_index);
+    bh.registers_i[code[p] as usize] = cpu.bh_getfield_gc_i(struct_ptr, offset);
     Ok(p + 1)
 }
 fn handler_getfield_vable_r(
@@ -6082,12 +6101,11 @@ fn handler_getfield_vable_r(
     let struct_ptr = bh.registers_r[code[p] as usize];
     if !bh.virtualizable_info.is_null() {
         let vinfo = unsafe { &*bh.virtualizable_info };
-        let ptr = struct_ptr as *mut u8;
-        unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, ptr) };
+        unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, struct_ptr as *mut u8) };
     }
-    let (field_index, p) = read_descr_vable_field(bh, code, p + 1);
+    let (offset, p) = read_descr_vable_field(bh, code, p + 1);
     let cpu = bh.cpu.expect("cpu not set");
-    bh.registers_r[code[p] as usize] = cpu.bh_getfield_gc_r(struct_ptr, field_index).0 as i64;
+    bh.registers_r[code[p] as usize] = cpu.bh_getfield_gc_r(struct_ptr, offset).0 as i64;
     Ok(p + 1)
 }
 fn handler_getfield_vable_f(
@@ -6098,13 +6116,11 @@ fn handler_getfield_vable_f(
     let struct_ptr = bh.registers_r[code[p] as usize];
     if !bh.virtualizable_info.is_null() {
         let vinfo = unsafe { &*bh.virtualizable_info };
-        let ptr = struct_ptr as *mut u8;
-        unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, ptr) };
+        unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, struct_ptr as *mut u8) };
     }
-    let (field_index, p) = read_descr_vable_field(bh, code, p + 1);
+    let (offset, p) = read_descr_vable_field(bh, code, p + 1);
     let cpu = bh.cpu.expect("cpu not set");
-    bh.registers_f[code[p] as usize] =
-        cpu.bh_getfield_gc_f(struct_ptr, field_index).to_bits() as i64;
+    bh.registers_f[code[p] as usize] = cpu.bh_getfield_gc_f(struct_ptr, offset).to_bits() as i64;
     Ok(p + 1)
 }
 fn handler_setfield_vable_i(
@@ -6116,12 +6132,11 @@ fn handler_setfield_vable_i(
     let value = bh.registers_i[code[p + 1] as usize];
     if !bh.virtualizable_info.is_null() {
         let vinfo = unsafe { &*bh.virtualizable_info };
-        let ptr = struct_ptr as *mut u8;
-        unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, ptr) };
+        unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, struct_ptr as *mut u8) };
     }
-    let (field_index, p) = read_descr_vable_field(bh, code, p + 2);
+    let (offset, p) = read_descr_vable_field(bh, code, p + 2);
     let cpu = bh.cpu.expect("cpu not set");
-    cpu.bh_setfield_gc_i(struct_ptr, field_index, value);
+    cpu.bh_setfield_gc_i(struct_ptr, offset, value);
     Ok(p)
 }
 fn handler_setfield_vable_r(
@@ -6133,12 +6148,11 @@ fn handler_setfield_vable_r(
     let value = bh.registers_r[code[p + 1] as usize];
     if !bh.virtualizable_info.is_null() {
         let vinfo = unsafe { &*bh.virtualizable_info };
-        let ptr = struct_ptr as *mut u8;
-        unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, ptr) };
+        unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, struct_ptr as *mut u8) };
     }
-    let (field_index, p) = read_descr_vable_field(bh, code, p + 2);
+    let (offset, p) = read_descr_vable_field(bh, code, p + 2);
     let cpu = bh.cpu.expect("cpu not set");
-    cpu.bh_setfield_gc_r(struct_ptr, field_index, majit_ir::GcRef(value as usize));
+    cpu.bh_setfield_gc_r(struct_ptr, offset, majit_ir::GcRef(value as usize));
     Ok(p)
 }
 fn handler_setfield_vable_f(
@@ -6150,12 +6164,11 @@ fn handler_setfield_vable_f(
     let value = f64::from_bits(bh.registers_f[code[p + 1] as usize] as u64);
     if !bh.virtualizable_info.is_null() {
         let vinfo = unsafe { &*bh.virtualizable_info };
-        let ptr = struct_ptr as *mut u8;
-        unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, ptr) };
+        unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, struct_ptr as *mut u8) };
     }
-    let (field_index, p) = read_descr_vable_field(bh, code, p + 2);
+    let (offset, p) = read_descr_vable_field(bh, code, p + 2);
     let cpu = bh.cpu.expect("cpu not set");
-    cpu.bh_setfield_gc_f(struct_ptr, field_index, value);
+    cpu.bh_setfield_gc_f(struct_ptr, offset, value);
     Ok(p)
 }
 
@@ -6636,34 +6649,55 @@ fn handler_gc_load_indexed_f(
         .to_bits() as i64;
     Ok(p + 6)
 }
+// blackhole.py:1525-1529 bhimpl_gc_store_indexed_i
 fn handler_gc_store_indexed_i(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    // @arguments("cpu", "r", "i", "i", "i", "i", "i", "d") — 1r + 5i + descr
-    let p = p + 6;
-    let (_, p) = read_descr_offset(bh, code, p);
+    // @arguments("cpu", "r", "i", "i", "i", "i", "i", "d")
+    let addr = bh.registers_r[code[p] as usize];
+    let index = bh.registers_i[code[p + 1] as usize];
+    let value = bh.registers_i[code[p + 2] as usize];
+    let scale = bh.registers_i[code[p + 3] as usize];
+    let base_ofs = bh.registers_i[code[p + 4] as usize];
+    let bytes = bh.registers_i[code[p + 5] as usize];
+    let (_, p) = read_descr_offset(bh, code, p + 6);
+    let cpu = bh.cpu.expect("cpu not set");
+    cpu.bh_gc_store_indexed_i(addr, index, value, scale, base_ofs, bytes);
     Ok(p)
 }
+// blackhole.py:1531-1535 bhimpl_gc_store_indexed_f
 fn handler_gc_store_indexed_f(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    // @arguments("cpu", "r", "i", "f", "i", "i", "i", "d") — 1r + 1i + 1f + 3i + descr
-    let p = p + 6;
-    let (_, p) = read_descr_offset(bh, code, p);
+    // @arguments("cpu", "r", "i", "f", "i", "i", "i", "d")
+    let addr = bh.registers_r[code[p] as usize];
+    let index = bh.registers_i[code[p + 1] as usize];
+    let value = f64::from_bits(bh.registers_f[code[p + 2] as usize] as u64);
+    let scale = bh.registers_i[code[p + 3] as usize];
+    let base_ofs = bh.registers_i[code[p + 4] as usize];
+    let bytes = bh.registers_i[code[p + 5] as usize];
+    let (_, p) = read_descr_offset(bh, code, p + 6);
+    let cpu = bh.cpu.expect("cpu not set");
+    cpu.bh_gc_store_indexed_f(addr, index, value, scale, base_ofs, bytes);
     Ok(p)
 }
-// raw_store_i/f, raw_load_i/f (blackhole.py:1504-1516)
+// blackhole.py:1504-1509 bhimpl_raw_store_i/f
 fn handler_raw_store_i(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    // @arguments("cpu", "i", "i", "i", "d") — 3i + descr
-    let (_descr, p) = read_descr_offset(bh, code, p + 3);
+    // @arguments("cpu", "i", "i", "i", "d")
+    let addr = bh.registers_i[code[p] as usize];
+    let offset = bh.registers_i[code[p + 1] as usize];
+    let value = bh.registers_i[code[p + 2] as usize];
+    let (_, p) = read_descr_offset(bh, code, p + 3);
+    let cpu = bh.cpu.expect("cpu not set");
+    cpu.bh_raw_store_i(addr, offset, value);
     Ok(p)
 }
 fn handler_raw_store_f(
@@ -6671,8 +6705,13 @@ fn handler_raw_store_f(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    // @arguments("cpu", "i", "i", "f", "d") — 2i + 1f + descr
-    let (_descr, p) = read_descr_offset(bh, code, p + 3);
+    // @arguments("cpu", "i", "i", "f", "d")
+    let addr = bh.registers_i[code[p] as usize];
+    let offset = bh.registers_i[code[p + 1] as usize];
+    let value = f64::from_bits(bh.registers_f[code[p + 2] as usize] as u64);
+    let (_, p) = read_descr_offset(bh, code, p + 3);
+    let cpu = bh.cpu.expect("cpu not set");
+    cpu.bh_raw_store_f(addr, offset, value);
     Ok(p)
 }
 fn handler_raw_load_i(
@@ -6717,8 +6756,10 @@ fn handler_newlist(
     let result = cpu.bh_new_with_size(struct_size);
     // blackhole.py:1164: cpu.bh_setfield_gc_i(result, length, lengthdescr)
     cpu.bh_setfield_gc_i(result, length_offset, length);
-    // blackhole.py:1165-1169: items = cpu.bh_new_array[_clear](length, arraydescr)
-    let items = cpu.bh_new_array(length, array_itemsize, 0);
+    // blackhole.py:1165-1169: bh_new_array_clear when arraydescr.is_array_of_structs()
+    // or is_array_of_pointers(). pyre: always clear for safety (prevents GC scanning
+    // uninitialized pointers).
+    let items = cpu.bh_new_array_clear(length, array_itemsize, 0);
     // blackhole.py:1170: cpu.bh_setfield_gc_r(result, items, itemsdescr)
     cpu.bh_setfield_gc_r(result, items_offset, majit_ir::GcRef(items as usize));
     bh.registers_r[code[p] as usize] = result;
