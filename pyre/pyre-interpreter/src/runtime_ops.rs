@@ -103,13 +103,12 @@ fn call_user_function_with_args(frame_ptr: i64, callable: i64, args: &[i64]) -> 
 }
 
 fn call_callable_with_args(frame_ptr: i64, callable: i64, args: &[i64]) -> i64 {
+    let _ = frame_ptr;
     let callable_ref = callable as PyObjectRef;
-    match dispatch_callable(
-        callable_ref,
-        |_callable| Ok(call_builtin_with_args(callable, args)),
-        |_callable| Ok(call_user_function_with_args(frame_ptr, callable, args)),
-    ) {
-        Ok(result) => result,
+    let arg_slice =
+        unsafe { std::slice::from_raw_parts(args.as_ptr() as *const PyObjectRef, args.len()) };
+    match crate::call::call_function_impl_result(callable_ref, arg_slice) {
+        Ok(result) => result as i64,
         Err(err) => panic!("jit callable dispatch failed: {err}"),
     }
 }
