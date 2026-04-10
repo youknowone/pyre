@@ -386,7 +386,10 @@ impl UnrollOptimizer {
                             .collect();
                     }
                     // Export Phase 1's heap cache for Phase 2.
-                    state.preamble_heap_cache = opt_p1.export_all_cached_fields();
+                    if let Some(c) = opt_p1.final_ctx.as_ref() {
+                        state.preamble_heap_cache = opt_p1.export_all_cached_fields(c);
+                        state.preamble_heap_array_cache = opt_p1.export_all_cached_arrayitems(c);
+                    }
                     // opencoder.py:271 _index parity: Phase 2's TraceIterator
                     // must allocate fresh boxes ABOVE Phase 1's high water
                     // mark so the two phases' OpRef namespaces are disjoint
@@ -1259,11 +1262,15 @@ pub struct ExportedState {
     /// Types of end_args as determined by Phase 1 optimization.
     /// Used by Phase 2 import_state to propagate unboxed types.
     pub end_arg_types: Vec<Type>,
-    /// Phase 1 heap cache: (obj, descr_idx, cached_value) entries
-    /// for ALL fields cached during preamble optimization.
-    /// Phase 2 import_state uses this to pre-populate its heap cache
-    /// for inputargs that the preamble already read fields from.
-    pub preamble_heap_cache: Vec<(OpRef, u32, OpRef)>,
+    /// Phase 1 heap cache: `(obj, descr, cached_value)` triples for
+    /// ALL fields cached during preamble optimization. Phase 2
+    /// `import_state` uses this to pre-populate its heap cache for
+    /// inputargs that the preamble already read fields from. Mirrors
+    /// `serialize_optheap` (heap.py:825-846) which returns
+    /// `[(box1, descr, box2)]`.
+    pub preamble_heap_cache: Vec<(OpRef, majit_ir::DescrRef, OpRef)>,
+    /// heap.py:847-868: array item cache from Phase 1.
+    pub preamble_heap_array_cache: Vec<(OpRef, i64, majit_ir::DescrRef, OpRef)>,
     /// Virtual state at the loop boundary.
     pub virtual_state: crate::optimizeopt::virtualstate::VirtualState,
     /// unroll.py: exported_infos — optimizer knowledge from preamble.
@@ -1409,6 +1416,7 @@ impl ExportedState {
             next_iteration_args,
             end_arg_types: Vec::new(),
             preamble_heap_cache: Vec::new(),
+            preamble_heap_array_cache: Vec::new(),
             virtual_state,
             exported_infos,
             exported_short_ops,
@@ -1649,6 +1657,7 @@ impl Clone for ExportedState {
             next_iteration_args: self.next_iteration_args.clone(),
             end_arg_types: self.end_arg_types.clone(),
             preamble_heap_cache: self.preamble_heap_cache.clone(),
+            preamble_heap_array_cache: self.preamble_heap_array_cache.clone(),
             virtual_state: self.virtual_state.clone(),
             exported_infos: self.exported_infos.clone(),
             exported_short_ops: self.exported_short_ops.clone(),

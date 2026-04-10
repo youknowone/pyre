@@ -3007,6 +3007,47 @@ impl OptContext {
     /// The trace was constant-folding through a null base pointer, which
     /// is an impossible execution path; the optimizer aborts so the JIT
     /// can retry with a different shape.
+    /// Read-only sibling of `get_const_info_mut`. Looks up the existing
+    /// `const_infos[gcref]` slot for a constant pointer base WITHOUT
+    /// inserting a new `StructPtrInfo` on a miss. Returns `None` if
+    /// `opref` is not a constant pointer or if the slot has not yet been
+    /// populated. Used by heap.rs read paths that consult PtrInfo as the
+    /// source of truth without mutating it.
+    pub fn get_const_info(&self, opref: OpRef) -> Option<&crate::optimizeopt::info::PtrInfo> {
+        use crate::optimizeopt::info::PtrInfo;
+        let gcref = match self.getptrinfo(opref).as_deref() {
+            Some(PtrInfo::Constant(g)) => *g,
+            _ => return None,
+        };
+        if gcref.is_null() {
+            return None;
+        }
+        self.const_infos.get(&gcref.0)
+    }
+
+    /// Like `get_const_info_mut` but does NOT create an entry on miss.
+    /// Returns `None` when:
+    /// - `opref` is not a constant pointer
+    /// - The constant is null
+    /// - No `const_infos` entry has been created yet
+    ///
+    /// Used by array invalidation paths that only need to clear existing
+    /// items, not install new PtrInfo variants.
+    pub fn get_const_info_mut_if_exists(
+        &mut self,
+        opref: OpRef,
+    ) -> Option<&mut crate::optimizeopt::info::PtrInfo> {
+        use crate::optimizeopt::info::PtrInfo;
+        let gcref = match self.getptrinfo(opref).as_deref() {
+            Some(PtrInfo::Constant(g)) => *g,
+            _ => return None,
+        };
+        if gcref.is_null() {
+            return None;
+        }
+        self.const_infos.get_mut(&gcref.0)
+    }
+
     pub fn get_const_info_mut(
         &mut self,
         opref: OpRef,
@@ -3578,12 +3619,33 @@ pub trait Optimization {
 
     /// Export all cached field entries from this pass.
     /// Used to propagate heap cache from Phase 1 to Phase 2 via ExportedState.
-    fn export_cached_fields(&self) -> Vec<(OpRef, u32, OpRef)> {
+    fn export_cached_fields(&self, _ctx: &OptContext) -> Vec<(OpRef, majit_ir::DescrRef, OpRef)> {
         Vec::new()
     }
 
-    /// heap.py: deserialize_optheap — import cached fields into this pass.
-    fn import_cached_fields(&mut self, _entries: &[(OpRef, u32, OpRef)]) {}
+    /// heap.py:870-883 deserialize_optheap — import struct fields.
+    fn import_cached_fields(
+        &mut self,
+        _entries: &[(OpRef, majit_ir::DescrRef, OpRef)],
+        _ctx: &mut OptContext,
+    ) {
+    }
+
+    /// heap.py:847-868 serialize_optheap — export array item triples.
+    fn export_cached_arrayitems(
+        &self,
+        _ctx: &OptContext,
+    ) -> Vec<(OpRef, i64, majit_ir::DescrRef, OpRef)> {
+        Vec::new()
+    }
+
+    /// heap.py:885-894 deserialize_optheap — import array item triples.
+    fn import_cached_arrayitems(
+        &mut self,
+        _entries: &[(OpRef, i64, majit_ir::DescrRef, OpRef)],
+        _ctx: &mut OptContext,
+    ) {
+    }
 
     /// rewrite.py:828-834 serialize_optrewrite
     fn serialize_optrewrite(&self) -> Vec<(i64, OpRef)> {

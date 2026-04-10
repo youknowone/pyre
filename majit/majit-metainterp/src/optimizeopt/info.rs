@@ -1496,6 +1496,26 @@ impl PtrInfo {
         }
     }
 
+    /// heap.py:257-262: ArrayCachedItem.invalidate clears
+    /// `opinfo._items[self.index] = None` for cached_infos. The Rust
+    /// port mirrors that by writing `OpRef::NONE` into the slot —
+    /// matching `clear_field` semantics for struct fields.
+    pub fn clear_item(&mut self, index: usize) {
+        match self {
+            PtrInfo::Array(v) => {
+                if index < v.items.len() {
+                    v.items[index] = OpRef::NONE;
+                }
+            }
+            PtrInfo::VirtualArray(v) => {
+                if index < v.items.len() {
+                    v.items[index] = OpRef::NONE;
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// info.py:651-656: _compute_index(index, fielddescr)
     /// Computes flat index into VirtualArrayStruct's element_fields.
     fn compute_interior_index(

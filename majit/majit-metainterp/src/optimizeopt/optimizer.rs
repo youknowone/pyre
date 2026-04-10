@@ -21,10 +21,18 @@ use crate::optimizeopt::info::PtrInfo;
 /// Captures the optimizer's knowledge at each guard point so that bridges
 /// compiled from guard failures can inherit heap cache, known class, and
 /// loopinvariant call result information.
+///
+/// `heap_fields` mirrors PyPy `serialize_optheap` (heap.py:825-846), which
+/// returns `[(box1, descr, box2)]` triples. The Rust port includes the
+/// `DescrRef` so `deserialize_optheap` can call `descr.get_parent_descr()`
+/// when synthesising `InstancePtrInfo` for non-virtual struct bases that
+/// have no forwarded info yet (heap.py:870-883).
 #[derive(Clone, Debug, Default)]
 pub struct OptimizerKnowledge {
-    /// Heap cache: (object, field_descr_index, value) triples.
-    pub heap_fields: Vec<(OpRef, u32, OpRef)>,
+    /// heap.py:826 result_getfield: (struct box, field descr, value) triples.
+    pub heap_fields: Vec<(OpRef, majit_ir::DescrRef, OpRef)>,
+    /// heap.py:847 result_array: (array box, const index, array descr, value) triples.
+    pub heap_arrayitems: Vec<(OpRef, i64, majit_ir::DescrRef, OpRef)>,
     /// Known classes: (box, class_ptr) pairs.
     /// bridgeopt.py:74-88: serialize known class bitfield.
     pub known_classes: Vec<(OpRef, GcRef)>,
@@ -40,6 +48,7 @@ impl OptimizerKnowledge {
 
     pub fn is_empty(&self) -> bool {
         self.heap_fields.is_empty()
+            && self.heap_arrayitems.is_empty()
             && self.known_classes.is_empty()
             && self.loopinvariant_results.is_empty()
     }
@@ -49,10 +58,19 @@ impl OptimizerKnowledge {
         let heap_fields = self
             .heap_fields
             .iter()
-            .filter_map(|&(obj, field_idx, val)| {
-                let new_obj = remap.get(&obj)?;
-                let new_val = remap.get(&val)?;
-                Some((*new_obj, field_idx, *new_val))
+            .filter_map(|(obj, descr, val)| {
+                let new_obj = remap.get(obj)?;
+                let new_val = remap.get(val)?;
+                Some((*new_obj, descr.clone(), *new_val))
+            })
+            .collect();
+        let heap_arrayitems = self
+            .heap_arrayitems
+            .iter()
+            .filter_map(|(obj, index, descr, val)| {
+                let new_obj = remap.get(obj)?;
+                let new_val = remap.get(val)?;
+                Some((*new_obj, *index, descr.clone(), *new_val))
             })
             .collect();
         let known_classes = self
@@ -73,6 +91,7 @@ impl OptimizerKnowledge {
             .collect();
         OptimizerKnowledge {
             heap_fields,
+            heap_arrayitems,
             known_classes,
             loopinvariant_results,
         }
@@ -1032,9 +1051,12 @@ impl Optimizer {
     pub fn serialize_optimizer_knowledge(&self, ctx: &OptContext) -> OptimizerKnowledge {
         let mut knowledge = OptimizerKnowledge::new();
 
-        // Heap fields: exported from OptHeap pass
+        // heap.py:826-868 serialize_optheap: struct fields + array items
         for pass in &self.passes {
-            knowledge.heap_fields.extend(pass.export_cached_fields());
+            knowledge.heap_fields.extend(pass.export_cached_fields(ctx));
+            knowledge
+                .heap_arrayitems
+                .extend(pass.export_cached_arrayitems(ctx));
         }
 
         // bridgeopt.py:74-88: known classes from ptr_info
@@ -1064,10 +1086,15 @@ impl Optimizer {
         knowledge: &OptimizerKnowledge,
         ctx: &mut OptContext,
     ) {
-        // Heap fields -> OptHeap
+        // heap.py:870-894 deserialize_optheap: struct fields + array items
         if !knowledge.heap_fields.is_empty() {
             for pass in &mut self.passes {
-                pass.import_cached_fields(&knowledge.heap_fields);
+                pass.import_cached_fields(&knowledge.heap_fields, ctx);
+            }
+        }
+        if !knowledge.heap_arrayitems.is_empty() {
+            for pass in &mut self.passes {
+                pass.import_cached_arrayitems(&knowledge.heap_arrayitems, ctx);
             }
         }
 
@@ -1188,10 +1215,25 @@ impl Optimizer {
     }
 
     /// Collect all cached field entries from all passes.
-    pub fn export_all_cached_fields(&self) -> Vec<(OpRef, u32, OpRef)> {
+    pub fn export_all_cached_fields(
+        &self,
+        ctx: &OptContext,
+    ) -> Vec<(OpRef, majit_ir::DescrRef, OpRef)> {
         let mut result = Vec::new();
         for pass in &self.passes {
-            result.extend(pass.export_cached_fields());
+            result.extend(pass.export_cached_fields(ctx));
+        }
+        result
+    }
+
+    /// Collect all cached array item entries from all passes.
+    pub fn export_all_cached_arrayitems(
+        &self,
+        ctx: &OptContext,
+    ) -> Vec<(OpRef, i64, majit_ir::DescrRef, OpRef)> {
+        let mut result = Vec::new();
+        for pass in &self.passes {
+            result.extend(pass.export_cached_arrayitems(ctx));
         }
         result
     }
@@ -1702,16 +1744,11 @@ impl Optimizer {
         // RPython calls deserialize_optimizer_knowledge before propagate_all_forward
         // but after the optimizer is constructed (setup already done at __init__).
         if let Some(knowledge) = self.pending_bridge_knowledge.take() {
-            // heap.py:870-894: deserialize_optheap — import into passes AND
-            // set PtrInfo fields so other passes see the cached values.
+            // heap.py:870-894: deserialize_optheap routes through OptHeap's
+            // import_cached_fields which itself creates InstancePtrInfo for
+            // non-virtual struct bases and writes the imported value into
+            // PtrInfo / const_infos. No additional restore loop is needed.
             self.deserialize_optimizer_knowledge(&knowledge, &mut ctx);
-            for &(obj, field_idx, val) in &knowledge.heap_fields {
-                if !obj.is_none() && !val.is_none() {
-                    if let Some(info) = ctx.get_ptr_info_mut(obj) {
-                        info.setfield(field_idx, val);
-                    }
-                }
-            }
         }
 
         // optimizer.py: inject call_pure_results into OptPure so it can
@@ -3164,10 +3201,13 @@ impl Optimizer {
         // majit holds it adjacent to keep store_final_boxes_in_guard pure.
         {
             let mut heap_fields = Vec::new();
+            let mut heap_arrayitems = Vec::new();
             for pass in &self.passes {
-                let fields = pass.export_cached_fields();
-                if !fields.is_empty() {
+                let fields = pass.export_cached_fields(ctx);
+                let items = pass.export_cached_arrayitems(ctx);
+                if !fields.is_empty() || !items.is_empty() {
                     heap_fields = fields;
+                    heap_arrayitems = items;
                     break;
                 }
             }
@@ -3185,11 +3225,12 @@ impl Optimizer {
                     }
                 }
             }
-            if !heap_fields.is_empty() || !known_classes.is_empty() {
+            if !heap_fields.is_empty() || !heap_arrayitems.is_empty() || !known_classes.is_empty() {
                 self.per_guard_knowledge.push((
                     op.pos,
                     OptimizerKnowledge {
                         heap_fields,
+                        heap_arrayitems,
                         known_classes,
                         loopinvariant_results: Vec::new(),
                     },
