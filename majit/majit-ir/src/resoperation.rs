@@ -343,6 +343,13 @@ pub trait BoxEnv {
     fn make_rd_virtual_info(&self, _opref: OpRef, _fieldnums: Vec<i16>) -> Option<RdVirtualInfo> {
         None
     }
+    /// bridgeopt.py:76-78 getptrinfo(box).get_known_class() parity.
+    ///
+    /// Returns the known class pointer (GcRef) for the given OpRef,
+    /// following the forwarding chain (get_box_replacement).
+    fn get_known_class(&self, _opref: OpRef) -> Option<GcRef> {
+        None
+    }
 }
 
 /// A single IR operation.

@@ -863,3 +863,150 @@ mod tests {
         assert!(deserialized.is_empty());
     }
 }
+
+/// bridgeopt.py:124-185 deserialize_optimizer_knowledge.
+///
+/// Read optimizer knowledge from the guard's rd_numb and apply it
+/// directly to the optimizer passes. RPython parity: the function
+/// takes the optimizer and applies knowledge inline, never returning
+/// an intermediate struct.
+/// bridgeopt.py:124 signature:
+/// deserialize_optimizer_knowledge(optimizer, resumestorage, frontend_boxes, liveboxes)
+///
+/// `frontend_boxes`: runtime values from guard failure (RPython Box objects
+///   with concrete references). Used by cls_of_box to read vtable.
+/// `cls_of_box`: model.py:199-201 cpu.cls_of_box(box) — reads typeptr from
+///   a runtime Ref object. Returns the class pointer as i64.
+pub fn deserialize_optimizer_knowledge(
+    rd_numb: &[u8],
+    rd_consts: &[(i64, majit_ir::Type)],
+    frontend_boxes: &[i64],
+    liveboxes: &[OpRef],
+    livebox_types: &[majit_ir::Type],
+    all_descrs: &HashMap<u32, majit_ir::descr::DescrRef>,
+    cls_of_box: Option<fn(i64) -> i64>,
+    optimizer: &mut super::optimizer::Optimizer,
+    ctx: &mut OptContext,
+) {
+    use crate::resume::{DecodedBox, decode_box};
+    use majit_ir::resumecode::Reader;
+
+    let mut reader = Reader::new(rd_numb);
+    debug_assert!(frontend_boxes.len() == liveboxes.len() || frontend_boxes.is_empty());
+
+    // bridgeopt.py:130-131: skip resume section
+    let startcount = reader.next_item();
+    reader.jump((startcount - 1) as usize);
+
+    // bridgeopt.py:133-146: class knowledge
+    let mut bitfield: i32 = 0;
+    let mut mask: i32 = 0;
+    for (i, &livebox) in liveboxes.iter().enumerate() {
+        let tp = livebox_types.get(i).copied().unwrap_or(majit_ir::Type::Int);
+        if tp != majit_ir::Type::Ref {
+            continue;
+        }
+        if mask == 0 {
+            bitfield = reader.next_item();
+            mask = 0b100000;
+        }
+        let class_known = (bitfield & mask) != 0;
+        mask >>= 1;
+        if class_known {
+            // bridgeopt.py:145: cls = optimizer.cpu.cls_of_box(frontend_boxes[i])
+            // bridgeopt.py:146: optimizer.make_constant_class(box, cls)
+            if let Some(cls_fn) = cls_of_box {
+                if let Some(&raw_value) = frontend_boxes.get(i) {
+                    if raw_value != 0 {
+                        let cls = cls_fn(raw_value);
+                        super::optimizer::Optimizer::make_constant_class(ctx, livebox, cls, true);
+                    }
+                }
+            }
+        }
+    }
+
+    // bridgeopt.py:148-158: heap knowledge (struct fields)
+    let length = reader.next_item();
+    let mut result_struct = Vec::new();
+    for _ in 0..length {
+        let tagged = reader.next_item() as i16;
+        let box1 = decode_box(tagged, rd_consts, liveboxes);
+        let descr_index = reader.next_item() as u32;
+        let tagged2 = reader.next_item() as i16;
+        let box2 = decode_box(tagged2, rd_consts, liveboxes);
+        if let Some(descr) = all_descrs.get(&descr_index) {
+            let opref1 = decoded_box_to_opref(&box1, ctx);
+            let opref2 = decoded_box_to_opref(&box2, ctx);
+            result_struct.push((opref1, descr.clone(), opref2));
+        }
+    }
+    // bridgeopt.py:159-169: heap knowledge (array items)
+    let length = reader.next_item();
+    let mut result_array = Vec::new();
+    for _ in 0..length {
+        let tagged = reader.next_item() as i16;
+        let box1 = decode_box(tagged, rd_consts, liveboxes);
+        let index = reader.next_item() as i64;
+        let descr_index = reader.next_item() as u32;
+        let tagged2 = reader.next_item() as i16;
+        let box2 = decode_box(tagged2, rd_consts, liveboxes);
+        if let Some(descr) = all_descrs.get(&descr_index) {
+            let opref1 = decoded_box_to_opref(&box1, ctx);
+            let opref2 = decoded_box_to_opref(&box2, ctx);
+            result_array.push((opref1, index, descr.clone(), opref2));
+        }
+    }
+    // bridgeopt.py:170-171: optimizer.optheap.deserialize_optheap(...)
+    if !result_struct.is_empty() || !result_array.is_empty() {
+        optimizer.import_heap_knowledge(&result_struct, &result_array, ctx);
+    }
+
+    // bridgeopt.py:173-185: call_loopinvariant knowledge
+    let length = reader.next_item();
+    let mut result_loopinvariant = Vec::new();
+    for _ in 0..length {
+        let tagged1 = reader.next_item() as i16;
+        let const_box = decode_box(tagged1, rd_consts, liveboxes);
+        // bridgeopt.py:179: assert isinstance(const, ConstInt)
+        // bridgeopt.py:180: i = const.getint()
+        let const_int = match &const_box {
+            DecodedBox::ConstInt(v) => *v,
+            DecodedBox::Const(v, _) => *v,
+            _ => {
+                // skip malformed entry, still consume tagged2
+                let _tagged2 = reader.next_item();
+                continue;
+            }
+        };
+        let tagged2 = reader.next_item() as i16;
+        let box2 = decode_box(tagged2, rd_consts, liveboxes);
+        let opref2 = decoded_box_to_opref(&box2, ctx);
+        // bridgeopt.py:183: result_loopinvariant.append((i, box))
+        // No sentinel check — ConstInt(0) is a valid func_ptr value.
+        result_loopinvariant.push((const_int, opref2));
+    }
+    // bridgeopt.py:184-185: optimizer.optrewrite.deserialize_optrewrite(...)
+    if !result_loopinvariant.is_empty() {
+        optimizer.import_loopinvariant_knowledge(&result_loopinvariant);
+    }
+}
+
+/// Convert a DecodedBox to an OpRef for the bridge optimizer context.
+///
+/// RPython's deserialize path passes Const/Box objects directly. In majit,
+/// constants must be registered in the optimizer's context to get an OpRef.
+fn decoded_box_to_opref(decoded: &crate::resume::DecodedBox, ctx: &mut OptContext) -> OpRef {
+    use crate::resume::DecodedBox;
+    match decoded {
+        DecodedBox::LiveBox(opref) => *opref,
+        DecodedBox::ConstInt(val) => ctx.make_constant_int(*val),
+        DecodedBox::Const(val, tp) => match tp {
+            majit_ir::Type::Int => ctx.make_constant_int(*val),
+            majit_ir::Type::Ref => ctx.make_constant_ref(GcRef(*val as usize)),
+            majit_ir::Type::Float => ctx.make_constant_float(f64::from_bits(*val as u64)),
+            _ => ctx.make_constant_int(*val),
+        },
+        DecodedBox::NullRef => ctx.make_constant_ref(GcRef(0)),
+    }
+}

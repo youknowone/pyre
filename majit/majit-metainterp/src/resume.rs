@@ -3588,8 +3588,21 @@ impl ResumeDataLoopMemo {
 
         // resume.py:449: _add_optimizer_sections(numb_state, ...)
         // bridgeopt.py:63-122: serialize_optimizer_knowledge
-        if let Some(knowledge) = optimizer_knowledge {
-            // Known classes bitfield (bridgeopt.py:74-88)
+        // RPython ALWAYS calls this — even guards without heap knowledge
+        // get the bitfield + zero counts. The deserializer relies on this.
+        {
+            // bridgeopt.py:64-67: available_boxes = liveboxes ∩ liveboxes_from_env
+            let available_boxes: std::collections::HashSet<u32> = liveboxes
+                .iter()
+                .filter_map(|opt| *opt)
+                .filter(|opref| numb_state.liveboxes.contains_key(opref.0))
+                .map(|opref| opref.0)
+                .collect();
+
+            // bridgeopt.py:74-88: known classes bitfield
+            // RPython stores only a bitfield (1=class known, 0=unknown).
+            // The actual class pointer is recovered at deserialization time
+            // via cpu.cls_of_box(frontend_boxes[i]).
             let mut bitfield: i32 = 0;
             let mut shifts = 0;
             for livebox in &liveboxes {
@@ -3598,7 +3611,7 @@ impl ResumeDataLoopMemo {
                         continue;
                     }
                     bitfield <<= 1;
-                    if knowledge.known_classes.contains(&opref.0) {
+                    if env.get_known_class(*opref).is_some() {
                         bitfield |= 1;
                     }
                     shifts += 1;
@@ -3613,54 +3626,87 @@ impl ResumeDataLoopMemo {
                 numb_state.append_int(bitfield << (6 - shifts));
             }
 
-            // Heap field triples (bridgeopt.py:90-108)
-            numb_state.append_int(knowledge.heap_fields.len() as i32);
-            for &(obj, descr_idx, val) in &knowledge.heap_fields {
-                numb_state.writer.append_short(self._gettagged(
-                    obj,
-                    env,
-                    &numb_state.liveboxes,
-                    &new_liveboxes,
-                ) as i32);
-                numb_state.append_int(descr_idx as i32);
-                numb_state.writer.append_short(self._gettagged(
-                    val,
-                    env,
-                    &numb_state.liveboxes,
-                    &new_liveboxes,
-                ) as i32);
-            }
-            // Heap array item quads (bridgeopt.py:102-108)
-            numb_state.append_int(knowledge.heap_arrayitems.len() as i32);
-            for &(obj, index, descr_idx, val) in &knowledge.heap_arrayitems {
-                numb_state.writer.append_short(self._gettagged(
-                    obj,
-                    env,
-                    &numb_state.liveboxes,
-                    &new_liveboxes,
-                ) as i32);
-                numb_state.append_int(index as i32);
-                numb_state.append_int(descr_idx as i32);
-                numb_state.writer.append_short(self._gettagged(
-                    val,
-                    env,
-                    &numb_state.liveboxes,
-                    &new_liveboxes,
-                ) as i32);
-            }
+            // bridgeopt.py:92-111: heap knowledge
+            if let Some(knowledge) = optimizer_knowledge {
+                // bridgeopt.py:93: triples_struct, triples_array = optimizer.optheap.serialize_optheap(available_boxes)
+                let filtered_fields: Vec<_> = knowledge
+                    .heap_fields
+                    .iter()
+                    .filter(|&&(obj, _, val)| {
+                        let obj_ok = env.is_const(obj) || available_boxes.contains(&obj.0);
+                        let val_ok = env.is_const(val) || available_boxes.contains(&val.0);
+                        obj_ok && val_ok
+                    })
+                    .collect();
+                numb_state.append_int(filtered_fields.len() as i32);
+                for &&(obj, descr_idx, val) in &filtered_fields {
+                    numb_state.writer.append_short(self._gettagged(
+                        obj,
+                        env,
+                        &numb_state.liveboxes,
+                        &new_liveboxes,
+                    ) as i32);
+                    numb_state.append_int(descr_idx as i32);
+                    numb_state.writer.append_short(self._gettagged(
+                        val,
+                        env,
+                        &numb_state.liveboxes,
+                        &new_liveboxes,
+                    ) as i32);
+                }
+                // bridgeopt.py:102-108: array items
+                let filtered_arrayitems: Vec<_> = knowledge
+                    .heap_arrayitems
+                    .iter()
+                    .filter(|&&(obj, _, _, val)| {
+                        let obj_ok = env.is_const(obj) || available_boxes.contains(&obj.0);
+                        let val_ok = env.is_const(val) || available_boxes.contains(&val.0);
+                        obj_ok && val_ok
+                    })
+                    .collect();
+                numb_state.append_int(filtered_arrayitems.len() as i32);
+                for &&(obj, index, descr_idx, val) in &filtered_arrayitems {
+                    numb_state.writer.append_short(self._gettagged(
+                        obj,
+                        env,
+                        &numb_state.liveboxes,
+                        &new_liveboxes,
+                    ) as i32);
+                    numb_state.append_int(index as i32);
+                    numb_state.append_int(descr_idx as i32);
+                    numb_state.writer.append_short(self._gettagged(
+                        val,
+                        env,
+                        &numb_state.liveboxes,
+                        &new_liveboxes,
+                    ) as i32);
+                }
 
-            // Loop-invariant results (bridgeopt.py:113-122)
-            numb_state.append_int(knowledge.loopinvariant_results.len() as i32);
-            for &(const_ptr, result) in &knowledge.loopinvariant_results {
-                numb_state
-                    .writer
-                    .append_short(self.getconst_int(const_ptr) as i32);
-                numb_state.writer.append_short(self._gettagged(
-                    result,
-                    env,
-                    &numb_state.liveboxes,
-                    &new_liveboxes,
-                ) as i32);
+                // bridgeopt.py:113-122: loopinvariant results
+                let filtered_loopinvariant: Vec<_> = knowledge
+                    .loopinvariant_results
+                    .iter()
+                    .filter(|&&(_, result)| {
+                        env.is_const(result) || available_boxes.contains(&result.0)
+                    })
+                    .collect();
+                numb_state.append_int(filtered_loopinvariant.len() as i32);
+                for &&(const_ptr, result) in &filtered_loopinvariant {
+                    numb_state
+                        .writer
+                        .append_short(self.getconst_int(const_ptr) as i32);
+                    numb_state.writer.append_short(self._gettagged(
+                        result,
+                        env,
+                        &numb_state.liveboxes,
+                        &new_liveboxes,
+                    ) as i32);
+                }
+            } else {
+                // bridgeopt.py:109-111,121-122: no optheap/optrewrite → zeros
+                numb_state.append_int(0); // struct fields count
+                numb_state.append_int(0); // array items count
+                numb_state.append_int(0); // loopinvariant count
             }
         }
 
@@ -3902,9 +3948,10 @@ pub struct TaggedPendingField {
 
 /// bridgeopt.py:63 — optimizer knowledge for resume data encoding.
 /// Passed into finish() for _add_optimizer_sections.
+/// Class knowledge is NOT stored here — it is encoded as a bitfield
+/// directly from the live optimizer state via env.get_known_class(),
+/// matching RPython's serialize_optimizer_knowledge flow.
 pub struct OptimizerKnowledgeForResume {
-    /// OpRef IDs with known class.
-    pub known_classes: std::collections::HashSet<u32>,
     /// (obj_opref, descr_index, val_opref) heap field triples.
     /// bridgeopt.py:96-101
     pub heap_fields: Vec<(majit_ir::OpRef, u32, majit_ir::OpRef)>,
@@ -3913,6 +3960,80 @@ pub struct OptimizerKnowledgeForResume {
     pub heap_arrayitems: Vec<(majit_ir::OpRef, i64, u32, majit_ir::OpRef)>,
     /// (const_func_ptr, result_opref) loop-invariant call results.
     pub loopinvariant_results: Vec<(i64, majit_ir::OpRef)>,
+}
+
+impl OptimizerKnowledgeForResume {
+    pub fn is_empty(&self) -> bool {
+        self.heap_fields.is_empty()
+            && self.heap_arrayitems.is_empty()
+            && self.loopinvariant_results.is_empty()
+    }
+}
+
+/// bridgeopt.py:44-61 decode_box return type.
+///
+/// RPython's decode_box returns actual Const/Box objects. Rust uses this
+/// enum to preserve the distinction between constants and live boxes,
+/// matching RPython's Const vs Box class hierarchy.
+#[derive(Clone, Debug, PartialEq)]
+pub enum DecodedBox {
+    /// TAGBOX → liveboxes[num] (bridge inputarg / optimizer box)
+    LiveBox(majit_ir::OpRef),
+    /// TAGINT → ConstInt(num) — signed inline integer
+    ConstInt(i64),
+    /// TAGCONST → rd_consts[idx] constant (value, type)
+    Const(i64, majit_ir::Type),
+    /// NULLREF → CONST_NULL
+    NullRef,
+}
+
+/// bridgeopt.py:44-61 decode_box: untag a tagged value from rd_numb.
+///
+/// Line-by-line port of PyPy's decode_box(). Returns DecodedBox to
+/// preserve the Const vs Box distinction that RPython encodes via
+/// Python class hierarchy.
+pub fn decode_box(
+    tagged: i16,
+    rd_consts: &[(i64, majit_ir::Type)],
+    liveboxes: &[majit_ir::OpRef],
+) -> DecodedBox {
+    let (num, tag_type) = untag(tagged);
+    // NB: the TAGVIRTUAL case can't happen here, because this code runs after
+    // virtuals are already forced again
+    match tag_type {
+        TAGCONST => {
+            if tagged_eq(tagged, NULLREF) {
+                // bridgeopt.py:51: box = CONST_NULL
+                DecodedBox::NullRef
+            } else {
+                // bridgeopt.py:54: box = resumestorage.rd_consts[num - TAG_CONST_OFFSET]
+                let idx = (num - TAG_CONST_OFFSET) as usize;
+                if idx < rd_consts.len() {
+                    let (val, tp) = rd_consts[idx];
+                    DecodedBox::Const(val, tp)
+                } else {
+                    DecodedBox::NullRef
+                }
+            }
+        }
+        TAGINT => {
+            // bridgeopt.py:56: box = ConstInt(num)
+            DecodedBox::ConstInt(num as i64)
+        }
+        TAGBOX => {
+            // bridgeopt.py:58: box = liveboxes[num]
+            if (num as usize) < liveboxes.len() {
+                DecodedBox::LiveBox(liveboxes[num as usize])
+            } else {
+                DecodedBox::NullRef
+            }
+        }
+        _ => {
+            // bridgeopt.py:60: raise AssertionError("unreachable")
+            debug_assert!(false, "decode_box: unexpected tag type {}", tag_type);
+            DecodedBox::NullRef
+        }
+    }
 }
 
 // VirtualFieldInfo removed: replaced by majit_ir::VirtualFieldsInfo.
