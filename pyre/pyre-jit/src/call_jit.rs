@@ -2016,7 +2016,9 @@ fn handle_blackhole_result(bh_result: BlackholeResult, fail_values: &[i64]) -> O
     match bh_result {
         BlackholeResult::DoneWithThisFrame(Ok(result)) => {
             // blackhole.py:1673 / warmspot.py:986: DoneWithThisFrameRef
-            // always carries a GCREF. No heuristic detection needed.
+            // always carries a GCREF, but the self-recursive Int variant
+            // unboxes here so the caller (CALL_ASSEMBLER_I) consumes a
+            // raw int directly.
             let raw = if !result.is_null() && unsafe { is_int(result) } {
                 unsafe { w_int_get_value(result) }
             } else {

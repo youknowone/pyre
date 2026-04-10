@@ -3329,7 +3329,10 @@ impl MIFrame {
                     let result = if let Some(token_number) = ca_token {
                         // RPython: CALL_ASSEMBLER_I — compiled code calls
                         // compiled callee directly. Bridge handles guard
-                        // failures (base cases).
+                        // failures (base cases). Self-recursive Int variant
+                        // skips wrapint + locals fill via the raw_int helper
+                        // (matches PyPy's virtualizable optimization that
+                        // keeps locals in registers, not in the heap frame).
                         let (helper, helper_arg_types) =
                             one_arg_callee_frame_helper(Type::Int, true);
                         let callee_frame =
@@ -4016,17 +4019,11 @@ pub(crate) fn trace_step_result_to_action(
             loop_header_pc: Some(loop_header_pc),
         },
         Ok(pyre_interpreter::StepResult::Return(fop)) => {
-            // RPython DoneWithThisFrameDescrInt parity: unbox W_IntObject
-            // to raw Int for the Finish descriptor.
+            // RPython DoneWithThisFrameDescrInt parity: keep raw Int as
+            // the FINISH slot type when value_type is Int, so the
+            // self-recursive CALL_ASSEMBLER_I caller consumes it directly
+            // without guard_class + getfield_gc_i.
             let value = fop.opref;
-            // history.py:_make_op parity: use the CONCRETE value
-            // from the FrontendOp to determine the result type.
-            // When value_type_of returns Ref (because the OpRef was
-            // produced by a heap-array read in the bridge trace and
-            // isn't tracked in symbolic_locals), check the concrete
-            // value directly. This handles the case where bridge
-            // setup_bridge_sym cleared vable_array_base and LOAD_FAST
-            // went through GetarrayitemGcR instead of the vable path.
             let concrete_from_fop = match fop.concrete {
                 crate::state::ConcreteValue::Int(_) => None,
                 crate::state::ConcreteValue::Ref(v) if !v.is_null() => Some(v),
@@ -4051,10 +4048,7 @@ pub(crate) fn trace_step_result_to_action(
                 }
             };
             // pyjitpl.py:3199-3236 compile_done_with_this_frame ->
-            // store_token_in_vable parity: record the vable_token write
-            // and GUARD_NOT_FORCED_2 right before the trace closes, so
-            // the guard captures fresh resumedata via generate_guard at
-            // the current framestack position.
+            // store_token_in_vable parity.
             state.with_ctx(|this, ctx| {
                 if ctx.store_token_in_vable_setfield() {
                     this.generate_guard(ctx, OpCode::GuardNotForced2, &[]);

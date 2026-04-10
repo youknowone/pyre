@@ -2727,9 +2727,10 @@ fn call_assembler_shim_inner(
     );
 
     if std::env::var_os("MAJIT_LOG").is_some() {
+        let i0 = input_slice.first().copied().unwrap_or(-1);
         eprintln!(
-            "[ca-shim] entering trace_id={} num_inputs={}",
-            target.trace_id, target.num_inputs
+            "[ca-shim] entering trace_id={} num_inputs={} input0={:#x}",
+            target.trace_id, target.num_inputs, i0
         );
     }
     let mut frame = execute_registered_loop_target(target, input_slice);

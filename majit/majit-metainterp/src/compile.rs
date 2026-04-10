@@ -1474,19 +1474,13 @@ pub(crate) fn fold_box_into_create_frame(
 /// and raw_arg from inputs[3], creates callee frame lazily.
 pub(crate) fn elide_create_frame_for_call_assembler(
     ops: Vec<Op>,
-    _constants: &HashMap<u32, i64>,
-    _create_frame_raw_map: &HashMap<i64, i64>,
+    constants: &HashMap<u32, i64>,
+    create_frame_raw_map: &HashMap<i64, i64>,
 ) -> (Vec<Op>, HashMap<u32, u32>) {
-    // RPython parity: elide frame creation for self-recursive calls.
-    // Force_fn uses PENDING_FORCE_LOCAL0 for lazy callee frame creation.
-
-    #[allow(unreachable_code)]
     {
         use majit_ir::OpCode;
 
         let mut ops = ops;
-        let constants = _constants;
-        let create_frame_raw_map = _create_frame_raw_map;
 
         if create_frame_raw_map.is_empty() {
             return (ops, HashMap::new());

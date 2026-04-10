@@ -154,8 +154,9 @@ pub trait JitState: Sized {
             .collect()
     }
 
-    /// Function-entry tracing hook. The default implementation records
-    /// the same live values as ordinary tracing.
+    /// virtualizable.py:86 read_boxes() + warmstate.py:73 wrap() parity:
+    /// function-entry live values carry their natural types from wrap().
+    /// GC pointers (Python locals) → RefFrontendOp, raw ints → IntFrontendOp.
     fn extract_live_values_for_entry(&self, meta: &Self::Meta) -> Vec<Value> {
         self.extract_live_values(meta)
     }
