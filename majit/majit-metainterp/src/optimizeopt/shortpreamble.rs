@@ -1692,14 +1692,28 @@ impl ExtendedShortPreambleBuilder {
         Some(preamble_op)
     }
 
-    /// shortpreamble.py:432-440: add_preamble_op(preamble_op)
+    /// shortpreamble.py:465-476: add_preamble_op(preamble_op)
+    ///
+    /// RPython: `op = preamble_op.op.get_box_replacement()` — canonicalizes
+    /// through forwarding BEFORE appending to label_args. This collapses
+    /// aliases so the same logical value doesn't appear as multiple
+    /// distinct label_args entries (which would cause spurious growth of
+    /// short_jump_args in inline_short_preamble's inner force loop).
     pub fn add_preamble_op_from_pop(
         &mut self,
         preamble_op: &crate::optimizeopt::info::PreambleOp,
-        _resolved_op: OpRef,
+        resolved_op: OpRef,
     ) {
-        if let Some(produced) = self.produced_short_boxes.get(&preamble_op.op).cloned() {
-            self.add_tracked_preamble_op(preamble_op.op, &produced);
+        // RPython: preamble_op.op.get_box_replacement() → resolved_op
+        // Use resolved_op for the lookup AND for label_args, matching RPython.
+        let lookup_key = if self.produced_short_boxes.contains_key(&resolved_op) {
+            resolved_op
+        } else {
+            // Fallback: try the raw key (pre-resolution) for backward compat
+            preamble_op.op
+        };
+        if let Some(produced) = self.produced_short_boxes.get(&lookup_key).cloned() {
+            self.add_tracked_preamble_op(resolved_op, &produced);
         }
     }
 
