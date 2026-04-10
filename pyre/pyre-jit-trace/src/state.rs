@@ -2507,6 +2507,7 @@ fn materialize_bridge_virtual(
             offsets,
             entry_sizes,
             entry_types,
+            entry_signed,
             fieldnums,
         } => {
             // resume.py:703: buffer = decoder.allocate_raw_buffer(self.func, self.size)
@@ -2530,16 +2531,16 @@ fn materialize_bridge_virtual(
                 if item.is_none() {
                     continue;
                 }
-                // resume.py:1225-1234 setrawbuffer_item: dispatch by arraydescr kind
+                // resume.py:1543-1550 setrawbuffer_item: dispatch by descr
                 let entry_type = entry_types.get(i).copied().unwrap_or(1);
                 let item_size = entry_sizes.get(i).copied().unwrap_or(8);
+                let signed = entry_signed.get(i).copied().unwrap_or(true);
                 let tp = match entry_type {
                     0 => majit_ir::Type::Ref,
                     2 => majit_ir::Type::Float,
                     _ => majit_ir::Type::Int,
                 };
-                let store_descr =
-                    crate::descr::make_array_descr(0, item_size, tp, tp == majit_ir::Type::Int);
+                let store_descr = crate::descr::make_array_descr(0, item_size, tp, signed);
                 let offset_ref = ctx.const_int(off as i64);
                 // resume.py:1233: execute_raw_store(arraydescr, buffer, ConstInt(offset), itembox)
                 ctx.record_op_with_descr(
