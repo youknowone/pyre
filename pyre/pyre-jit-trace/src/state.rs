@@ -2445,20 +2445,40 @@ fn materialize_bridge_virtual(
             }
             new_op
         }
-        // resume.py:700-709 VRawBufferInfo.allocate_int — int-typed virtual
-        // resume.py:722-728 VRawSliceInfo.allocate_int — int-typed virtual
-        // These produce raw int values, not GC-ref pointers.
-        // Bridge trace materialization for raw buffers requires CALL_I
-        // infrastructure not yet ported; log and return NONE.
-        majit_ir::RdVirtualInfo::VRawBufferInfo { .. }
-        | majit_ir::RdVirtualInfo::VRawSliceInfo { .. } => {
+        // resume.py:700-709 VRawBufferInfo.allocate_int
+        // decoder.allocate_raw_buffer(self.func, self.size) → CALL_I(func, size)
+        // requires callinfocollection.callinfo_for_oopspec which pyre doesn't
+        // have. Log and return NONE for now — raw buffers are rare in Python.
+        majit_ir::RdVirtualInfo::VRawBufferInfo { .. } => {
             if majit_metainterp::majit_log_enabled() {
                 eprintln!(
-                    "[jit][bridge-virtual] vidx={} raw buffer/slice (int-typed, not yet ported)",
+                    "[jit][bridge-virtual] vidx={} VRawBufferInfo (CALL_I not yet ported)",
                     vidx
                 );
             }
             OpRef::NONE
+        }
+        // resume.py:722-728 VRawSliceInfo.allocate_int
+        majit_ir::RdVirtualInfo::VRawSliceInfo { offset, fieldnums } => {
+            // resume.py:724: assert len(self.fieldnums) == 1
+            assert!(
+                fieldnums.len() == 1,
+                "VRawSliceInfo must have exactly 1 fieldnum"
+            );
+            // resume.py:725: base_buffer = decoder.decode_int(self.fieldnums[0])
+            let base_buffer = decode_fieldnum(ctx, fieldnums[0], rd_virtuals, resume_data, cache);
+            // resume.py:726: buffer = decoder.int_add_const(base_buffer, self.offset)
+            let offset_ref = ctx.const_int(*offset as i64);
+            let buffer = ctx.record_op(OpCode::IntAdd, &[base_buffer, offset_ref]);
+            // resume.py:727: decoder.virtuals_cache.set_int(index, buffer)
+            cache.insert(vidx, buffer);
+            if majit_metainterp::majit_log_enabled() {
+                eprintln!(
+                    "[jit][bridge-virtual] vidx={} VRawSliceInfo(offset={}) → OpRef({})",
+                    vidx, offset, buffer.0,
+                );
+            }
+            buffer
         }
         majit_ir::RdVirtualInfo::Empty => OpRef::NONE,
     }
