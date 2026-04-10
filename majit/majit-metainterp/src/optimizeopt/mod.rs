@@ -685,11 +685,17 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
             PtrInfo::VirtualRawBuffer(vi) => {
                 let offsets: Vec<usize> = vi.entries.iter().map(|(o, _, _)| *o).collect();
                 let entry_sizes: Vec<usize> = vi.entries.iter().map(|(_, len, _)| *len).collect();
+                // resume.py:698 self.descrs — per-entry ArrayDescr kind.
+                // RawBuffer.descrs[i] determines is_array_of_pointers/floats.
+                // TODO: VirtualRawBufferInfo entries should carry per-entry type
+                // from the optimizer. Default to Int (kind=1) for now.
+                let entry_types: Vec<u8> = vec![1u8; offsets.len()];
                 Some(majit_ir::RdVirtualInfo::VRawBufferInfo {
                     func: vi.func,
                     size: vi.size,
                     offsets,
                     entry_sizes,
+                    entry_types,
                     fieldnums,
                 })
             }

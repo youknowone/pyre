@@ -122,6 +122,9 @@ pub enum RdVirtualInfo {
         size: usize,
         offsets: Vec<usize>,
         entry_sizes: Vec<usize>,
+        /// resume.py:698: self.descrs — per-entry ArrayDescr kind.
+        /// 0=ref (is_array_of_pointers), 1=int, 2=float (is_array_of_floats).
+        entry_types: Vec<u8>,
         fieldnums: Vec<i16>,
     },
     /// resume.py:717: VRawSliceInfo
@@ -235,6 +238,7 @@ impl PartialEq for RdVirtualInfo {
                     size: a1,
                     offsets: a2,
                     entry_sizes: a3,
+                    entry_types: a3t,
                     fieldnums: a4,
                 },
                 Self::VRawBufferInfo {
@@ -242,9 +246,10 @@ impl PartialEq for RdVirtualInfo {
                     size: b1,
                     offsets: b2,
                     entry_sizes: b3,
+                    entry_types: b3t,
                     fieldnums: b4,
                 },
-            ) => a0 == b0 && a1 == b1 && a2 == b2 && a3 == b3 && a4 == b4,
+            ) => a0 == b0 && a1 == b1 && a2 == b2 && a3 == b3 && a3t == b3t && a4 == b4,
             (
                 Self::VRawSliceInfo {
                     offset: a1,

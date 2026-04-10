@@ -928,3 +928,42 @@ mod tests {
 pub fn make_call_descr_int() -> DescrRef {
     make_array_descr(0, 8, Type::Int, false)
 }
+
+/// descr.py InteriorFieldDescr for SETINTERIORFIELD_GC.
+/// resume.py:1200-1209: setinteriorfield dispatches by field type.
+/// llmodel.py:648-665: bh_setinteriorfield_gc_{i,r,f} computes
+/// offset = arraydescr.basesize + itemindex * itemsize + fielddescr.offset.
+pub fn make_interior_field_descr(
+    array_descr_index: u32,
+    item_size: usize,
+    field_offset: usize,
+    field_size: usize,
+    field_type: u8, // 0=ref, 1=int, 2=float
+    field_descr_index: u32,
+) -> DescrRef {
+    use majit_ir::descr::{SimpleArrayDescr, SimpleFieldDescr, SimpleInteriorFieldDescr};
+    let tp = match field_type {
+        0 => Type::Ref,
+        2 => Type::Float,
+        _ => Type::Int,
+    };
+    let array_descr = Arc::new(SimpleArrayDescr::new(
+        array_descr_index,
+        0, // base_size: array header handled by allocate_array
+        item_size,
+        0, // type_id
+        tp,
+    ));
+    let field_descr = Arc::new(SimpleFieldDescr::new(
+        field_descr_index,
+        field_offset,
+        field_size,
+        tp,
+        true, // immutable (struct fields in array-of-struct)
+    ));
+    Arc::new(SimpleInteriorFieldDescr::new(
+        field_descr_index,
+        array_descr,
+        field_descr,
+    ))
+}
