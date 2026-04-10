@@ -2143,14 +2143,6 @@ mod tests {
         fn field_type(&self) -> majit_ir::Type {
             majit_ir::Type::Int
         }
-        /// virtualize.rs::descr_index routes GetfieldGc lookups through
-        /// `index_in_parent()` when a parent is attached. The test
-        /// fixtures use the raw `idx` as the virtual's field key (e.g.
-        /// `VREF_FORCED_FIELD_INDEX`), so this override keeps the
-        /// recorder / lookup keys in lockstep.
-        fn index_in_parent(&self) -> usize {
-            self.idx as usize
-        }
     }
 
     /// Ref-typed counterpart to `TestFieldDescr`. Identical semantics
@@ -2194,38 +2186,6 @@ mod tests {
     #[derive(Debug)]
     struct TestArrayDescr {
         idx: u32,
-    }
-
-    #[derive(Debug)]
-    struct TestRefFieldDescr {
-        idx: u32,
-    }
-
-    impl Descr for TestRefFieldDescr {
-        fn index(&self) -> u32 {
-            self.idx
-        }
-        fn as_field_descr(&self) -> Option<&dyn FieldDescr> {
-            Some(self)
-        }
-    }
-
-    impl FieldDescr for TestRefFieldDescr {
-        fn get_parent_descr(&self) -> Option<DescrRef> {
-            Some(size_descr(0xFFFF_0000))
-        }
-        fn index_in_parent(&self) -> usize {
-            self.idx as usize
-        }
-        fn offset(&self) -> usize {
-            self.idx as usize * 8
-        }
-        fn field_size(&self) -> usize {
-            8
-        }
-        fn field_type(&self) -> majit_ir::Type {
-            majit_ir::Type::Ref
-        }
     }
 
     impl Descr for TestArrayDescr {

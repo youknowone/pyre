@@ -2911,14 +2911,16 @@ fn bh_call_fn_impl(callable: PyObjectRef, args: &[PyObjectRef]) -> i64 {
         majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(err.to_exc_object() as i64));
         return 0;
     }
-    // blackhole.py bhimpl_residual_call: parent frame from BH_VABLE_PTR.
-    // `call_user_function` is pyre's portal runner equivalent — it routes
-    // through the JIT-aware EVAL_OVERRIDE so nested calls re-enter compiled
-    // code, matching RPython `cpu.bh_call_*(portal_runner_adr, ...)`.
+    // blackhole.py:1224-1249 bhimpl_residual_call parity: residual calls
+    // in the blackhole go through cpu.bh_call_* which is a plain call, NOT
+    // through the portal runner. Only bhimpl_recursive_call_* (line 1095)
+    // uses the portal runner to re-enter JIT. call_user_function_plain
+    // uses eval_frame_plain (no EVAL_OVERRIDE/JIT re-entry), matching
+    // RPython's cpu.bh_call_* semantics for residual blackhole calls.
     let parent_frame_ptr =
         majit_metainterp::blackhole::BH_VABLE_PTR.with(|c| c.get()) as *const PyFrame;
     let parent_frame = unsafe { &*parent_frame_ptr };
-    match pyre_interpreter::call::call_user_function(parent_frame, callable, args) {
+    match pyre_interpreter::call::call_user_function_plain(parent_frame, callable, args) {
         Ok(result) => result as i64,
         Err(err) => {
             let exc_obj = err.to_exc_object();
