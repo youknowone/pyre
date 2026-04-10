@@ -2443,30 +2443,59 @@ fn materialize_bridge_virtual(
         }
         // resume.py:747-760 VArrayStructInfo.allocate
         majit_ir::RdVirtualInfo::VArrayStructInfo {
-            size, fieldnums, ..
+            descr_index,
+            size,
+            fielddescr_indices,
+            field_types,
+            item_size,
+            field_offsets,
+            field_sizes,
+            fieldnums,
         } => {
             let len_ref = ctx.const_int(*size as i64);
-            let array_descr = pyobject_array_descr();
             // resume.py:749 decoder.allocate_array(self.size, self.arraydescr, clear=True)
+            let array_descr = array_descr_for_kind(0, *descr_index); // array-of-structs = ref-ptr array
             let new_op =
                 ctx.record_op_with_descr(OpCode::NewArrayClear, &[len_ref], array_descr.clone());
             ctx.heap_cache_mut().new_object(new_op);
+            // resume.py:751 decoder.virtuals_cache.set_ptr(index, array)
             cache.insert(vidx, new_op);
-            // resume.py:752-759 nested loop over elements × fields
-            // Simplified: decode all fieldnums sequentially
-            for &fnum in fieldnums.iter() {
-                if fnum == majit_ir::resumedata::UNINITIALIZED_TAG {
-                    continue;
+            // resume.py:752-759 nested (element, field) loop with setinteriorfield
+            let num_fields = fielddescr_indices.len();
+            let mut p = 0;
+            for i in 0..*size {
+                for j in 0..num_fields {
+                    let fnum = fieldnums[p];
+                    p += 1;
+                    if fnum == majit_ir::resumedata::UNINITIALIZED_TAG {
+                        continue;
+                    }
+                    // resume.py:1200-1209 setinteriorfield: dispatch by field type
+                    let value = decode_fieldnum(ctx, fnum, rd_virtuals, resume_data, cache);
+                    if value.is_none() {
+                        continue;
+                    }
+                    let idx_ref = ctx.const_int(i as i64);
+                    // resume.py:1208 execute_setinteriorfield_gc(descr, array, ConstInt(index), fieldbox)
+                    let field_descr = crate::descr::make_interior_field_descr(
+                        *descr_index,
+                        *item_size,
+                        field_offsets.get(j).copied().unwrap_or(0),
+                        field_sizes.get(j).copied().unwrap_or(8),
+                        field_types.get(j).copied().unwrap_or(1),
+                        fielddescr_indices.get(j).copied().unwrap_or(0),
+                    );
+                    ctx.record_op_with_descr(
+                        OpCode::SetinteriorfieldGc,
+                        &[new_op, idx_ref, value],
+                        field_descr,
+                    );
                 }
-                // Decode but don't emit setinteriorfield — pyre doesn't have
-                // interior field ops yet. The decode still recurses into
-                // nested virtuals so the cache is properly populated.
-                let _value = decode_fieldnum(ctx, fnum, rd_virtuals, resume_data, cache);
             }
             if majit_metainterp::majit_log_enabled() {
                 eprintln!(
-                    "[jit][bridge-virtual] vidx={} VArrayStructInfo → OpRef({})",
-                    vidx, new_op.0,
+                    "[jit][bridge-virtual] vidx={} VArrayStructInfo(size={}, fields={}) → OpRef({})",
+                    vidx, size, num_fields, new_op.0,
                 );
             }
             new_op
@@ -2477,34 +2506,42 @@ fn materialize_bridge_virtual(
             size,
             offsets,
             entry_sizes,
+            entry_types,
             fieldnums,
         } => {
             // resume.py:703: buffer = decoder.allocate_raw_buffer(self.func, self.size)
-            // resume.py:1124-1132: ResumeDataBoxReader.allocate_raw_buffer →
-            //   execute_and_record_varargs(rop.CALL_I, [ConstInt(func), ConstInt(size)], calldescr)
+            // resume.py:1124-1132: allocate_raw_buffer →
+            //   calldescr = callinfo_for_oopspec(OS_RAW_MALLOC_VARSIZE_CHAR)
+            //   execute_and_record_varargs(CALL_I, [ConstInt(func), ConstInt(size)], calldescr)
             let func_ref = ctx.const_int(*func);
             let size_ref = ctx.const_int(*size as i64);
-            // calldescr: RPython uses callinfo_for_oopspec(OS_RAW_MALLOC_VARSIZE_CHAR).
-            // pyre: use a minimal int-returning call descr (no GC effects).
             let calldescr = crate::descr::make_call_descr_int();
             let buffer = ctx.record_op_with_descr(OpCode::CallI, &[func_ref, size_ref], calldescr);
             // resume.py:704: decoder.virtuals_cache.set_int(index, buffer)
             cache.insert(vidx, buffer);
-            // resume.py:705-708: setrawbuffer_item for each offset/descr
+            // resume.py:705-708: for i in range(len(self.offsets)):
+            //     offset = self.offsets[i]; descr = self.descrs[i]
+            //     decoder.setrawbuffer_item(buffer, self.fieldnums[i], offset, descr)
             for (i, (&off, &fnum)) in offsets.iter().zip(fieldnums.iter()).enumerate() {
                 if fnum == majit_ir::resumedata::UNINITIALIZED_TAG {
                     continue;
                 }
-                // resume.py:1232: itembox = self.decode_box(fieldnum, kind)
                 let item = decode_fieldnum(ctx, fnum, rd_virtuals, resume_data, cache);
                 if item.is_none() {
                     continue;
                 }
-                // resume.py:1233-1234: execute_raw_store(arraydescr, buffer, offset, item)
-                let offset_ref = ctx.const_int(off as i64);
+                // resume.py:1225-1234 setrawbuffer_item: dispatch by arraydescr kind
+                let entry_type = entry_types.get(i).copied().unwrap_or(1);
                 let item_size = entry_sizes.get(i).copied().unwrap_or(8);
+                let tp = match entry_type {
+                    0 => majit_ir::Type::Ref,
+                    2 => majit_ir::Type::Float,
+                    _ => majit_ir::Type::Int,
+                };
                 let store_descr =
-                    crate::descr::make_array_descr(0, item_size, majit_ir::Type::Int, false);
+                    crate::descr::make_array_descr(0, item_size, tp, tp == majit_ir::Type::Int);
+                let offset_ref = ctx.const_int(off as i64);
+                // resume.py:1233: execute_raw_store(arraydescr, buffer, ConstInt(offset), itembox)
                 ctx.record_op_with_descr(
                     OpCode::RawStore,
                     &[buffer, offset_ref, item],
