@@ -317,6 +317,7 @@ impl Assembler {
                 self.descrs.push(crate::jitcode::BhDescr::JitCode {
                     jitcode_index: *jitcode_index,
                     fnaddr: 0, // resolved at runtime from all_jitcodes[jitcode_index]
+                    calldescr: crate::jitcode::BhCallDescr::default(),
                 });
                 state.code.push((descr_idx & 0xFF) as u8);
                 state.code.push((descr_idx >> 8) as u8);
@@ -421,7 +422,9 @@ impl Assembler {
                 };
                 // RPython assembler.py:197-207: descriptor as 2-byte index
                 let descr_idx = self.descrs.len();
-                self.descrs.push(crate::jitcode::BhDescr::Call);
+                self.descrs.push(crate::jitcode::BhDescr::Call {
+                    calldescr: crate::jitcode::BhCallDescr::default(),
+                });
                 state.code.push((descr_idx & 0xFF) as u8);
                 state.code.push((descr_idx >> 8) as u8);
                 argcodes.push('d');
