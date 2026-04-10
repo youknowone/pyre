@@ -154,17 +154,8 @@ pub trait JitState: Sized {
             .collect()
     }
 
-    /// history.py:_make_op parity for **function-entry** traces: each
-    /// inputarg's recorded type matches the concrete value kind so that
-    /// `wrap` would have produced an Int/Float/Ref FrontendOp from the
-    /// start. Used by `force_start_tracing` and `bound_reached` (the
-    /// function-entry compile paths) to record typed inputargs without
-    /// the post-hoc fail_arg_types reconciliation shim.
-    ///
-    /// Default implementation falls back to `extract_live_values` so
-    /// interpreters that don't pre-unbox at the JIT entry boundary keep
-    /// their existing behaviour. pyre overrides it to type each frame
-    /// slot from `concrete_value_type` of the underlying PyObjectRef.
+    /// Function-entry tracing hook. The default implementation records
+    /// the same live values as ordinary tracing.
     fn extract_live_values_for_entry(&self, meta: &Self::Meta) -> Vec<Value> {
         self.extract_live_values(meta)
     }
