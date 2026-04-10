@@ -1205,13 +1205,15 @@ impl OptVirtualize {
             };
             if let Some(PtrInfo::VirtualRawBuffer(vinfo)) = ctx.get_ptr_info(parent) {
                 let lookup_offset = base_offset + offset as usize;
-                if let Some((_, _, val_ref, _)) = vinfo
-                    .entries
-                    .iter()
-                    .find(|(off, _, _, _)| *off == lookup_offset)
-                {
-                    ctx.replace_op(op.pos, *val_ref);
-                    return OptimizationResult::Remove;
+                // virtualize.py:366 _unpack_raw_load_store_op → descr, itemsize
+                let op_descr = crate::optimizeopt::info::RawBufferDescr::from_op_descr(&op.descr);
+                // rawbuffer.py:120 read_value(offset, itemsize, descr)
+                match vinfo.read_value(lookup_offset, op_descr.itemsize, &op_descr) {
+                    Ok(val_ref) => {
+                        ctx.replace_op(op.pos, val_ref);
+                        return OptimizationResult::Remove;
+                    }
+                    Err(_) => {} // InvalidRawOperation → emit
                 }
             }
         }
@@ -1238,20 +1240,10 @@ impl OptVirtualize {
             };
             if let Some(PtrInfo::VirtualRawBuffer(vinfo)) = ctx.get_ptr_info_mut(parent) {
                 let store_offset = base_offset + offset as usize;
-                if let Some(entry) = vinfo
-                    .entries
-                    .iter_mut()
-                    .find(|(off, _, _, _)| *off == store_offset)
-                {
-                    entry.2 = value_ref;
-                } else {
-                    let _ = vinfo.write_value(
-                        store_offset,
-                        8,
-                        value_ref,
-                        crate::optimizeopt::info::RawBufferDescr::default(),
-                    );
-                }
+                // virtualize.py:381 _unpack_raw_load_store_op → descr, itemsize
+                let op_descr = crate::optimizeopt::info::RawBufferDescr::from_op_descr(&op.descr);
+                // rawbuffer.py:89 write_value(offset, itemsize, descr, value)
+                let _ = vinfo.write_value(store_offset, op_descr.itemsize, value_ref, op_descr);
                 return OptimizationResult::Remove;
             }
         }

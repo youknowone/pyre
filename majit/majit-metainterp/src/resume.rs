@@ -440,7 +440,9 @@ pub enum ResumeVirtualLayoutSummary {
     },
     RawBuffer {
         size: usize,
-        entries: Vec<(usize, usize, ResumeValueLayoutSummary)>,
+        /// resume.py:698: (offset, itemsize, source, kind).
+        /// kind: 0=ref, 1=int, 2=float.
+        entries: Vec<(usize, usize, ResumeValueLayoutSummary, u8)>,
     },
 }
 
@@ -673,8 +675,8 @@ impl ResumeVirtualLayoutSummary {
                 size: *size,
                 entries: entries
                     .iter()
-                    .map(|(offset, size_in_bytes, source)| {
-                        (*offset, *size_in_bytes, source.to_resume_source(), 1u8) // default int
+                    .map(|(offset, size_in_bytes, source, kind)| {
+                        (*offset, *size_in_bytes, source.to_resume_source(), *kind)
                     })
                     .collect(),
             },
@@ -761,7 +763,7 @@ impl ResumeVirtualLayoutSummary {
                     size: *size,
                     entries: entries
                         .iter()
-                        .map(|(offset, size_in_bytes, source)| {
+                        .map(|(offset, size_in_bytes, source, _kind)| {
                             (
                                 *offset,
                                 *size_in_bytes,
@@ -1420,8 +1422,8 @@ impl VirtualInfo {
                 size: *size,
                 entries: entries
                     .iter()
-                    .map(|(offset, size_in_bytes, source, _)| {
-                        (*offset, *size_in_bytes, source.layout_summary())
+                    .map(|(offset, size_in_bytes, source, kind)| {
+                        (*offset, *size_in_bytes, source.layout_summary(), *kind)
                     })
                     .collect(),
             },

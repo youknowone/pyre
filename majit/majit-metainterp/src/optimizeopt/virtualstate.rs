@@ -343,8 +343,8 @@ impl VirtualStateInfo {
                 }
                 e1.iter()
                     .zip(e2.iter())
-                    .all(|((off1, len1, v1, _), (off2, len2, v2, _))| {
-                        off1 == off2 && len1 == len2 && v1.is_compatible(v2)
+                    .all(|((off1, len1, v1, d1), (off2, len2, v2, d2))| {
+                        off1 == off2 && len1 == len2 && d1.is_compatible(d2) && v1.is_compatible(v2)
                     })
             }
 
