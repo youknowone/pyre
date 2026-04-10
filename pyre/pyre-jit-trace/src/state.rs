@@ -4769,6 +4769,54 @@ mod tests {
     }
 
     #[test]
+    fn test_close_loop_args_at_target_pc_uses_locals_only_jump_contract() {
+        let mut ctx = TraceCtx::for_test(3);
+        let frame_ref = OpRef(0);
+        let code_ref = OpRef(1);
+        let namespace_ref = OpRef(2);
+        let local0 = OpRef(10);
+        let stack0 = OpRef(11);
+        let stack1 = OpRef(12);
+
+        let mut sym = PyreSym::new_uninit(frame_ref);
+        sym.symbolic_initialized = true;
+        sym.nlocals = 1;
+        sym.valuestackdepth = 3;
+        sym.vable_next_instr = ctx.const_int(33);
+        sym.vable_code = code_ref;
+        sym.vable_valuestackdepth = ctx.const_int(3);
+        sym.vable_namespace = namespace_ref;
+        sym.symbolic_locals = vec![local0];
+        sym.symbolic_local_types = vec![Type::Ref];
+        sym.symbolic_stack = vec![stack0, stack1];
+        sym.symbolic_stack_types = vec![Type::Ref, Type::Ref];
+        sym.concrete_stack = vec![ConcreteValue::Null, ConcreteValue::Null];
+
+        let mut state = MIFrame {
+            ctx: &mut ctx,
+            sym: &mut sym,
+            ob_type_fd: trace_ob_type_descr(),
+            fallthrough_pc: 0,
+            parent_frames: Vec::new(),
+            pending_inline_frame: None,
+            orgpc: 0,
+            concrete_frame_addr: 0,
+        };
+
+        let jump_args = state.with_ctx(|this, ctx| this.close_loop_args_at(ctx, Some(77)));
+
+        assert_eq!(
+            jump_args.len(),
+            crate::virtualizable_gen::NUM_SCALAR_INPUTARGS + 1,
+            "target loop header should receive frame header plus locals only"
+        );
+        assert_eq!(jump_args[5], local0);
+        assert_eq!(state.sym().valuestackdepth, state.sym().nlocals);
+        assert!(state.sym().symbolic_stack.is_empty());
+        assert!(state.sym().symbolic_stack_types.is_empty());
+    }
+
+    #[test]
     fn test_direct_len_value_returns_typed_raw_len_for_integer_list() {
         use pyre_interpreter::compile_exec;
         use pyre_interpreter::pyframe::PyFrame;

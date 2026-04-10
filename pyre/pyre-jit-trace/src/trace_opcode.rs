@@ -1027,8 +1027,21 @@ impl MIFrame {
         // pyjitpl.py:2973: at a merge point, next_instr should be the TARGET
         // PC, not the last bytecode's orgpc. flush_to_frame sets
         // vable_next_instr from orgpc; override it here.
+        //
+        // close_loop_args(target_pc) is only used for loop-closing back-edges.
+        // The target loop header expects locals-only live state, so discard the
+        // transient operand stack and reset vsd to nlocals before materializing
+        // JUMP args. Carrying the current stack here produces bridge JUMPs whose
+        // runtime argument layout no longer matches the target LABEL contract.
         if let Some(pc) = target_pc {
-            self.sym_mut().vable_next_instr = ctx.const_int(pc as i64);
+            let target_vsd = self.sym().nlocals;
+            let s = self.sym_mut();
+            s.vable_next_instr = ctx.const_int(pc as i64);
+            s.valuestackdepth = target_vsd;
+            s.vable_valuestackdepth = ctx.const_int(target_vsd as i64);
+            s.symbolic_stack.clear();
+            s.symbolic_stack_types.clear();
+            s.concrete_stack.clear();
         }
         // If nlocals was lost (e.g., inline tracing reset symbolic_initialized),
         // re-derive from concrete frame. RPython keeps virtualizable_boxes in
