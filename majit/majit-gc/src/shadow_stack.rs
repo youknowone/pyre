@@ -12,11 +12,30 @@
 ///   GC: walk_jf_roots → read jf_gcmap → trace ref slots
 ///   Exit: pop_jf_to(depth)   — _call_footer_shadowstack
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use majit_ir::GcRef;
 
 /// Maximum shadow stack depth. RPython uses a fixed-size stack.
 const MAX_SHADOW_STACK_DEPTH: usize = 8192;
+
+/// RPython rootstacktop parity: a global pointer holding the current
+/// top jitframe's jf_ptr. Compiled code reads this directly with a
+/// single MOV instruction instead of calling through TLS + RefCell.
+///
+/// assembler.py:1369-1377 _reload_frame_if_necessary:
+///   MOV ecx, [rootstacktop]
+///   MOV ebp, [ecx - WORD]
+///
+/// We flatten both loads into a single load from this global because
+/// our shadow stack stores jf_ptr directly (not a pointer-to-pointer).
+/// Updated by push_jf, pop_jf_to, and walk_jf_roots (after GC move).
+static CURRENT_TOP_JF_PTR: AtomicUsize = AtomicUsize::new(0);
+
+/// Return the address of the global jf_ptr for inline Cranelift loads.
+pub fn current_top_jf_ptr_addr() -> usize {
+    &CURRENT_TOP_JF_PTR as *const AtomicUsize as usize
+}
 
 thread_local! {
     /// Thread-local shadow stack for individual GcRef roots.
@@ -127,7 +146,7 @@ struct JfShadowEntry {
 ///
 /// Returns the depth for later pop.
 pub fn push_jf(jf_ptr: GcRef) -> usize {
-    JF_SHADOW_STACK.with(|ss| {
+    let depth = JF_SHADOW_STACK.with(|ss| {
         let mut ss = ss.borrow_mut();
         let depth = ss.len();
         assert!(depth < MAX_SHADOW_STACK_DEPTH, "jf shadow stack overflow");
@@ -136,7 +155,10 @@ pub fn push_jf(jf_ptr: GcRef) -> usize {
             jf_ptr,
         });
         depth
-    })
+    });
+    // Update global so compiled code can read jf_ptr with a single load.
+    CURRENT_TOP_JF_PTR.store(jf_ptr.0, Ordering::Release);
+    depth
 }
 
 /// Read the GC-updated jf_ptr from the shadow stack at the given depth.
@@ -160,7 +182,11 @@ pub fn peek_jf(depth: usize) -> GcRef {
 ///   SUB [rootstacktop], 2*WORD
 pub fn pop_jf_to(depth: usize) {
     JF_SHADOW_STACK.with(|ss| {
-        ss.borrow_mut().truncate(depth);
+        let mut ss = ss.borrow_mut();
+        ss.truncate(depth);
+        // Update global to new top (or null if stack is empty).
+        let new_top = ss.last().map(|e| e.jf_ptr.0).unwrap_or(0);
+        CURRENT_TOP_JF_PTR.store(new_top, Ordering::Release);
     });
 }
 
@@ -187,6 +213,11 @@ pub fn walk_jf_roots(mut visitor: impl FnMut(&mut GcRef)) {
             if !entry.jf_ptr.is_null() {
                 visitor(&mut entry.jf_ptr);
             }
+        }
+        // GC may have moved the top jitframe — update the global pointer
+        // so compiled code reads the forwarded address on next reload.
+        if let Some(top) = ss.last() {
+            CURRENT_TOP_JF_PTR.store(top.jf_ptr.0, Ordering::Release);
         }
     });
 }
