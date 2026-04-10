@@ -5215,15 +5215,14 @@ impl CraneliftBackend {
             // bridge tracer saw via rebuild_from_resumedata (resume.py:1042).
             let bridge_guard = fail_descr.bridge_ref();
             if let Some(ref bridge) = *bridge_guard {
-                // llgraph/runner.py:1184-1191 parity: bridge receives the
-                // guard's raw fail_arg values (self.env[box] in RPython).
-                // NOTE: rebuild_state_after_failure replaces outputs with
-                // frame-section values; for bridge dispatch, start from raw
-                // outputs and let rebuild EXTEND (not replace) if needed.
-                // The bridge's num_inputs may be smaller than outputs.len();
-                // use outputs directly — they already have fail_args in order.
                 let n = bridge.num_inputs.min(outputs.len());
                 let bridge_inputs = outputs[..n].to_vec();
+                if std::env::var_os("MAJIT_LOG").is_some() {
+                    eprintln!(
+                        "[bridge-dispatch] fail_idx={} n={} bridge_inputs={:?} types={:?}",
+                        fail_index, n, &bridge_inputs, &bridge.input_types
+                    );
+                }
                 cur_code_ptr = bridge.code_ptr;
                 cur_fail_descrs = bridge.fail_descrs.clone();
                 cur_gc_runtime_id = bridge.gc_runtime_id;
@@ -5693,10 +5692,17 @@ impl CraneliftBackend {
 
         // RPython backend: Label ops define loop blocks.
         // Linear traces (no Label, no Jump) stay in the entry block.
+        // Bridge traces (source_guard.is_some()) never self-loop — their
+        // JUMP targets a different trace (the main loop). RPython compiles
+        // bridges as linear code with a tail-call to the loop entry; no
+        // separate loop block is needed. Creating an unnecessary loop_block
+        // with padded zero parameters (for positions num_inputs..JUMP-args)
+        // causes block-parameter transfer issues in the register allocator.
         let has_jump = ops.iter().any(|op| op.opcode == OpCode::Jump);
+        let is_bridge = source_guard.is_some();
         let loop_block = if !label_blocks.is_empty() {
             label_blocks.last().map(|(_, block)| *block).unwrap()
-        } else if has_jump {
+        } else if has_jump && !is_bridge {
             // Legacy no-Label trace with Jump: need a loop block
             let block = builder.create_block();
             for _ in 0..loop_param_count {
@@ -5704,7 +5710,7 @@ impl CraneliftBackend {
             }
             block
         } else {
-            // Linear trace: no loop block needed, stay in entry_block
+            // Linear trace or bridge: no loop block needed, stay in entry_block
             entry_block
         };
 
@@ -5769,7 +5775,7 @@ impl CraneliftBackend {
                     }
                 }
             }
-        } else if has_jump {
+        } else if has_jump && loop_block != entry_block {
             let zero = builder.ins().iconst(cl_types::I64, 0);
             let vals: Vec<CValue> = (0..loop_param_count)
                 .map(|i| {
