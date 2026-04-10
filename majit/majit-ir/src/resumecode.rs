@@ -88,8 +88,9 @@ impl Writer {
     }
 
     /// resumecode.py: append_int
+    #[track_caller]
     pub fn append_int(&mut self, item: i32) {
-        debug_assert!(
+        assert!(
             item >= i16::MIN as i32 && item <= i16::MAX as i32,
             "append_int: value {item} out of i16 range"
         );
