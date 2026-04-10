@@ -891,7 +891,7 @@ impl VirtualState {
                         .get_ptr_info(resolved)
                         .and_then(|info| match info {
                             PtrInfo::VirtualRawBuffer(vinfo) => {
-                                vinfo.entries.get(index).map(|(_, _, value)| *value)
+                                vinfo.entries.get(index).map(|(_, _, value, _)| *value)
                             }
                             _ => None,
                         })
@@ -1816,7 +1816,7 @@ fn export_single_value_inner(
                 let entries = vinfo
                     .entries
                     .iter()
-                    .map(|(offset, length, value_ref)| {
+                    .map(|(offset, length, value_ref, _kind)| {
                         let val_state = export_single_value(*value_ref, ctx, cache);
                         (*offset, *length, val_state)
                     })
