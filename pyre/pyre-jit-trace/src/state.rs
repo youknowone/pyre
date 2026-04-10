@@ -652,6 +652,16 @@ pub(crate) fn float_array_descr() -> DescrRef {
     make_array_descr(0, 8, Type::Float, false)
 }
 
+/// resume.py:656 arraydescr kind dispatch for virtual array materialization.
+/// kind: 0=ref (is_array_of_pointers), 1=int, 2=float (is_array_of_floats).
+pub(crate) fn array_descr_for_kind(kind: u8, _descr_index: u32) -> DescrRef {
+    match kind {
+        0 => pyobject_array_descr(),
+        2 => float_array_descr(),
+        _ => int_array_descr(),
+    }
+}
+
 /// `descr.py SizeDescr` for the host `PyFrame` virtualizable struct.
 ///
 /// All `PyFrame` field descriptors point at this SizeDescr via
@@ -2372,9 +2382,21 @@ fn materialize_bridge_virtual(
             new_op
         }
         // resume.py:649-671 AbstractVArrayInfo.allocate (clear=True or False)
-        majit_ir::RdVirtualInfo::VArrayInfoClear { fieldnums, .. }
-        | majit_ir::RdVirtualInfo::VArrayInfoNotClear { fieldnums, .. } => {
+        majit_ir::RdVirtualInfo::VArrayInfoClear {
+            fieldnums,
+            kind,
+            descr_index,
+            ..
+        }
+        | majit_ir::RdVirtualInfo::VArrayInfoNotClear {
+            fieldnums,
+            kind,
+            descr_index,
+            ..
+        } => {
             let clear = matches!(entry, majit_ir::RdVirtualInfo::VArrayInfoClear { .. });
+            let kind = *kind;
+            let descr_index = *descr_index;
             let length = fieldnums.len();
             let len_ref = ctx.const_int(length as i64);
             // resume.py:653 decoder.allocate_array(length, arraydescr, self.clear)
@@ -2383,14 +2405,18 @@ fn materialize_bridge_virtual(
             } else {
                 OpCode::NewArray
             };
-            // Note: arraydescr is not carried on the serialized RdVirtualInfo;
-            // pyre uses a generic pyobject_array_descr for GC-ref arrays.
-            let array_descr = pyobject_array_descr();
+            let array_descr = array_descr_for_kind(kind, descr_index);
             let new_op = ctx.record_op_with_descr(alloc_opcode, &[len_ref], array_descr.clone());
             ctx.heap_cache_mut().new_object(new_op);
             // resume.py:654 decoder.virtuals_cache.set_ptr(index, array)
             cache.insert(vidx, new_op);
             // resume.py:656-670 element loop: dispatch by arraydescr kind
+            // NB. the check for the kind of array elements is moved out of the loop
+            let set_opcode = match kind {
+                0 => OpCode::SetarrayitemGc, // arraydescr.is_array_of_pointers()
+                2 => OpCode::SetarrayitemGc, // arraydescr.is_array_of_floats() — TODO: SetarrayitemRaw/Float
+                _ => OpCode::SetarrayitemGc, // int
+            };
             for (i, &fnum) in fieldnums.iter().enumerate() {
                 if fnum == majit_ir::resumedata::UNINITIALIZED_TAG {
                     continue;
@@ -2400,9 +2426,9 @@ fn materialize_bridge_virtual(
                     continue;
                 }
                 let idx_ref = ctx.const_int(i as i64);
-                // resume.py:660 decoder.setarrayitem_ref(array, i, num, arraydescr)
+                // resume.py:660/665/670 setarrayitem_{ref,float,int}
                 ctx.record_op_with_descr(
-                    OpCode::SetarrayitemGc,
+                    set_opcode,
                     &[new_op, idx_ref, value],
                     array_descr.clone(),
                 );
