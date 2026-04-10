@@ -2735,7 +2735,9 @@ impl JitState for PyreJitState {
         };
 
         let nlocals = sym.nlocals;
+        let stack_only_depth = sym.stack_only_depth();
         let mut bridge_locals = vec![OpRef::NONE; nlocals];
+        let mut bridge_stack = vec![OpRef::NONE; stack_only_depth];
         // resume.py:1245 decode_box parity: each slot's `.type` is fixed
         // by which _callback_i/_callback_r/_callback_f the encoder dispatched.
         let mut bridge_local_types = vec![Type::Ref; nlocals];

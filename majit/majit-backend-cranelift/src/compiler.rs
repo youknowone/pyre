@@ -144,20 +144,14 @@ const JITFRAME_GC_TYPE_ID: u32 = 2;
 unsafe fn jitframe_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut GcRef)) {
     let jf_ptr = obj_addr as *const u8;
 
-    // jitframe.py:105-109: trace header ref fields.
-    for &ofs in &[
-        JF_DESCR_OFS,
-        JF_FORCE_DESCR_OFS,
-        JF_SAVEDATA_OFS,
-        JF_GUARD_EXC_OFS,
-        JF_FORWARD_OFS,
-    ] {
-        let slot_ptr = unsafe { jf_ptr.add(ofs as usize) as *mut GcRef };
-        let gcref = unsafe { *slot_ptr };
-        if !gcref.is_null() {
-            f(slot_ptr);
-        }
-    }
+    // jitframe.py:105-109 parity: RPython traces header ref fields
+    // (jf_descr, jf_force_descr, jf_savedata, jf_guard_exc, jf_forward)
+    // because in RPython these are GC-managed ResOperation/ResumeGuard
+    // objects. In majit, these fields hold RAW Rust pointers
+    // (Arc<CraneliftFailDescr> addresses, fail_index encodings) that
+    // are NOT on the GC heap. Tracing them as GcRef would corrupt
+    // the pointers when their bit pattern accidentally falls within
+    // the nursery address range. Skip header tracing entirely.
 
     // jitframe.py:115: gcmap = (obj_addr + getofs('jf_gcmap')).address[0]
     let gcmap_ptr = unsafe { *(jf_ptr.add(JF_GCMAP_OFS as usize) as *const *const u8) };
@@ -7131,6 +7125,22 @@ impl CraneliftBackend {
                             JF_FRAME_ITEM0_OFS,
                         );
 
+                        // assembler.py GC parity: the callee may trigger
+                        // GC (via CallMallocNursery inside its body), so
+                        // the caller's live GC refs must be in the
+                        // jitframe before the call and reloaded after.
+                        // The shim path already does this; the direct
+                        // call must do the same.
+                        jf_ptr = builder.use_var(jf_ptr_var);
+                        spill_ref_roots(
+                            &mut builder,
+                            jf_ptr,
+                            &ref_root_slots,
+                            &defined_ref_vars,
+                            ref_root_base_ofs,
+                        );
+                        emit_push_gcmap(&mut builder, jf_ptr, per_call_gcmap);
+
                         // fn(jf_ptr) → jf_ptr  (_call_footer parity)
                         let mut sig = Signature::new(call_conv);
                         sig.params.push(AbiParam::new(ptr_type)); // jf_ptr
@@ -7139,6 +7149,19 @@ impl CraneliftBackend {
                         let call_inst =
                             builder.ins().call_indirect(sig_ref, code_addr, &[args_ptr]);
                         let result_jf = builder.inst_results(call_inst)[0];
+
+                        // _reload_frame_if_necessary: GC may have moved
+                        // the caller's jitframe during the call.
+                        jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                        builder.def_var(jf_ptr_var, jf_ptr);
+                        emit_pop_gcmap(&mut builder, jf_ptr, per_call_gcmap);
+                        reload_ref_roots(
+                            &mut builder,
+                            jf_ptr,
+                            &ref_root_slots,
+                            &defined_ref_vars,
+                            ref_root_base_ofs,
+                        );
                         // _call_assembler_check_descr (assembler.py:2274-2278):
                         //   CMP [eax + jf_descr_ofs], done_with_this_frame_descr
                         let fail_idx_raw = builder.ins().load(
@@ -7226,6 +7249,20 @@ impl CraneliftBackend {
                             // result; if not, fall through to extern helper.
                             builder.switch_to_block(inline_bridge_block);
                             builder.seal_block(inline_bridge_block);
+
+                            // assembler.py GC parity: bridge call may
+                            // trigger GC — same spill/reload pattern as
+                            // the direct call path above.
+                            jf_ptr = builder.use_var(jf_ptr_var);
+                            spill_ref_roots(
+                                &mut builder,
+                                jf_ptr,
+                                &ref_root_slots,
+                                &defined_ref_vars,
+                                ref_root_base_ofs,
+                            );
+                            emit_push_gcmap(&mut builder, jf_ptr, per_call_gcmap);
+
                             let mut bridge_sig = Signature::new(call_conv);
                             bridge_sig.params.push(AbiParam::new(ptr_type));
                             bridge_sig.returns.push(AbiParam::new(ptr_type));
@@ -7236,6 +7273,18 @@ impl CraneliftBackend {
                                 &[args_ptr],
                             );
                             let bridge_result_jf = builder.inst_results(bridge_call)[0];
+
+                            jf_ptr =
+                                emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                            builder.def_var(jf_ptr_var, jf_ptr);
+                            emit_pop_gcmap(&mut builder, jf_ptr, per_call_gcmap);
+                            reload_ref_roots(
+                                &mut builder,
+                                jf_ptr,
+                                &ref_root_slots,
+                                &defined_ref_vars,
+                                ref_root_base_ofs,
+                            );
                             // _call_assembler_check_descr parity:
                             // CMP [result_jf + jf_descr_ofs], done_descr
                             let bridge_jf_descr = builder.ins().load(

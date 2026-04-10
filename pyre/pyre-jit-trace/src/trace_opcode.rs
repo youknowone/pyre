@@ -4019,11 +4019,25 @@ pub(crate) fn trace_step_result_to_action(
             // RPython DoneWithThisFrameDescrInt parity: unbox W_IntObject
             // to raw Int for the Finish descriptor.
             let value = fop.opref;
+            // history.py:_make_op parity: use the CONCRETE value
+            // from the FrontendOp to determine the result type.
+            // When value_type_of returns Ref (because the OpRef was
+            // produced by a heap-array read in the bridge trace and
+            // isn't tracked in symbolic_locals), check the concrete
+            // value directly. This handles the case where bridge
+            // setup_bridge_sym cleared vable_array_base and LOAD_FAST
+            // went through GetarrayitemGcR instead of the vable path.
+            let concrete_from_fop = match fop.concrete {
+                crate::state::ConcreteValue::Int(_) => None,
+                crate::state::ConcreteValue::Ref(v) if !v.is_null() => Some(v),
+                _ => None,
+            };
             let (finish_value, finish_type) = match state.value_type(value) {
                 Type::Int => (value, Type::Int),
                 Type::Float => (value, Type::Float),
                 Type::Ref | Type::Void => {
-                    let concrete = state.concrete_stack_value_at_return();
+                    let concrete =
+                        concrete_from_fop.or_else(|| state.concrete_stack_value_at_return());
                     let is_int = concrete.map_or(false, |v| {
                         !v.is_null() && unsafe { pyre_object::pyobject::is_int(v) }
                     });
