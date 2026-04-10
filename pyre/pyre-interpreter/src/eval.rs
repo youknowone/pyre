@@ -66,6 +66,14 @@ pub fn install_current_frame(frame: &mut PyFrame) -> CurrentFrameGuard {
     CurrentFrameGuard { previous }
 }
 
+pub fn get_current_exception() -> PyObjectRef {
+    CURRENT_EXCEPTION.with(|current| current.get())
+}
+
+pub fn set_current_exception(exc: PyObjectRef) {
+    CURRENT_EXCEPTION.with(|current| current.set(exc));
+}
+
 /// Try to dispatch an exception using the exception table or block stack.
 ///
 /// Returns `true` if a handler was found (frame.next_instr updated to handler),
