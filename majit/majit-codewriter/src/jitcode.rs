@@ -466,6 +466,23 @@ impl BhDescr {
         }
     }
 
+    /// Extract itemsize for ArrayDescr.
+    pub fn as_itemsize(&self) -> usize {
+        match self {
+            BhDescr::Array { itemsize } => *itemsize,
+            _ => panic!("BhDescr::as_itemsize called on {:?}", self),
+        }
+    }
+
+    /// ArrayDescr: true when the array items are GC pointers.
+    /// Default true for safety (always clear).
+    pub fn is_array_of_pointers(&self) -> bool {
+        match self {
+            BhDescr::Array { itemsize } => *itemsize == std::mem::size_of::<usize>(),
+            _ => false,
+        }
+    }
+
     /// Get field name (for runtime offset resolution).
     pub fn field_name(&self) -> &str {
         match self {

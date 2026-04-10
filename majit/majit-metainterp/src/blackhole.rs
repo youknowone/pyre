@@ -4746,18 +4746,12 @@ fn read_descr<'a>(bh: &'a BlackholeInterpreter, code: &[u8], pos: usize) -> (&'a
     (descr, pos + 2)
 }
 
-/// Convenience: read descriptor and extract offset (for field/array ops).
+/// Read a VableField descriptor and resolve to a synthesized BhDescr::Field
+/// with the resolved byte offset via VirtualizableInfo.
+/// RPython: fielddescr carries byte offset directly; pyre VableField.index
+/// needs vinfo.static_fields[index].offset resolution.
 #[inline]
-fn read_descr_offset(bh: &BlackholeInterpreter, code: &[u8], pos: usize) -> (usize, usize) {
-    let (descr, pos) = read_descr(bh, code, pos);
-    (descr.as_offset(), pos)
-}
-
-/// Read a VableField descriptor and resolve to byte offset via VirtualizableInfo.
-/// RPython: fielddescr carries byte offset directly.
-/// pyre: VableField.index → vinfo.static_fields[index].offset.
-#[inline]
-fn read_descr_vable_field(bh: &BlackholeInterpreter, code: &[u8], pos: usize) -> (usize, usize) {
+fn read_descr_vable_field(bh: &BlackholeInterpreter, code: &[u8], pos: usize) -> (BhDescr, usize) {
     let (descr, pos) = read_descr(bh, code, pos);
     let field_index = descr.as_vable_field_index();
     // Resolve field_index → byte offset via VirtualizableInfo.
@@ -4771,14 +4765,22 @@ fn read_descr_vable_field(bh: &BlackholeInterpreter, code: &[u8], pos: usize) ->
     } else {
         field_index
     };
-    (offset, pos)
+    (
+        BhDescr::Field {
+            offset,
+            name: String::new(),
+            owner: String::new(),
+        },
+        pos,
+    )
 }
 
-/// Read a VableArray descriptor and resolve to field_offset via VirtualizableInfo.
+/// Read a VableArray descriptor and resolve to a synthesized BhDescr::Field
+/// with the resolved field_offset via VirtualizableInfo.
 /// RPython: fielddescr carries byte offset for the array pointer field.
 /// pyre: VableArray.index → vinfo.array_fields[index].field_offset.
 #[inline]
-fn read_descr_vable_array(bh: &BlackholeInterpreter, code: &[u8], pos: usize) -> (usize, usize) {
+fn read_descr_vable_array(bh: &BlackholeInterpreter, code: &[u8], pos: usize) -> (BhDescr, usize) {
     let (descr, pos) = read_descr(bh, code, pos);
     let array_index = descr.as_vable_array_index();
     let offset = if !bh.virtualizable_info.is_null() {
@@ -4791,7 +4793,14 @@ fn read_descr_vable_array(bh: &BlackholeInterpreter, code: &[u8], pos: usize) ->
     } else {
         array_index
     };
-    (offset, pos)
+    (
+        BhDescr::Field {
+            offset,
+            name: String::new(),
+            owner: String::new(),
+        },
+        pos,
+    )
 }
 
 // bhimpl_getfield_gc_i: @arguments("cpu", "r", "d", returns="i")
@@ -4801,9 +4810,9 @@ fn handler_getfield_gc_i(
     position: usize,
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_r[code[position] as usize];
-    let (offset, pos) = read_descr_offset(bh, code, position + 1);
+    let (descr, pos) = read_descr(bh, code, position + 1);
     let cpu = bh.cpu.expect("cpu not set");
-    let result = cpu.bh_getfield_gc_i(struct_ptr, offset);
+    let result = cpu.bh_getfield_gc_i(struct_ptr, descr);
     bh.registers_i[code[pos] as usize] = result;
     Ok(pos + 1)
 }
@@ -4813,9 +4822,9 @@ fn handler_getfield_gc_r(
     position: usize,
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_r[code[position] as usize];
-    let (offset, pos) = read_descr_offset(bh, code, position + 1);
+    let (descr, pos) = read_descr(bh, code, position + 1);
     let cpu = bh.cpu.expect("cpu not set");
-    let result = cpu.bh_getfield_gc_r(struct_ptr, offset);
+    let result = cpu.bh_getfield_gc_r(struct_ptr, descr);
     bh.registers_r[code[pos] as usize] = result.0 as i64;
     Ok(pos + 1)
 }
@@ -4825,9 +4834,9 @@ fn handler_getfield_gc_f(
     position: usize,
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_r[code[position] as usize];
-    let (offset, pos) = read_descr_offset(bh, code, position + 1);
+    let (descr, pos) = read_descr(bh, code, position + 1);
     let cpu = bh.cpu.expect("cpu not set");
-    let result = cpu.bh_getfield_gc_f(struct_ptr, offset);
+    let result = cpu.bh_getfield_gc_f(struct_ptr, descr);
     bh.registers_f[code[pos] as usize] = result.to_bits() as i64;
     Ok(pos + 1)
 }
@@ -4840,9 +4849,9 @@ fn handler_setfield_gc_i(
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_r[code[position] as usize];
     let value = bh.registers_i[code[position + 1] as usize];
-    let (offset, pos) = read_descr_offset(bh, code, position + 2);
+    let (descr, pos) = read_descr(bh, code, position + 2);
     let cpu = bh.cpu.expect("cpu not set");
-    cpu.bh_setfield_gc_i(struct_ptr, offset, value);
+    cpu.bh_setfield_gc_i(struct_ptr, value, descr);
     Ok(pos)
 }
 fn handler_setfield_gc_r(
@@ -4852,9 +4861,9 @@ fn handler_setfield_gc_r(
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_r[code[position] as usize];
     let value = bh.registers_r[code[position + 1] as usize];
-    let (offset, pos) = read_descr_offset(bh, code, position + 2);
+    let (descr, pos) = read_descr(bh, code, position + 2);
     let cpu = bh.cpu.expect("cpu not set");
-    cpu.bh_setfield_gc_r(struct_ptr, offset, majit_ir::GcRef(value as usize));
+    cpu.bh_setfield_gc_r(struct_ptr, majit_ir::GcRef(value as usize), descr);
     Ok(pos)
 }
 fn handler_setfield_gc_f(
@@ -4864,9 +4873,9 @@ fn handler_setfield_gc_f(
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_r[code[position] as usize];
     let value = f64::from_bits(bh.registers_f[code[position + 1] as usize] as u64);
-    let (offset, pos) = read_descr_offset(bh, code, position + 2);
+    let (descr, pos) = read_descr(bh, code, position + 2);
     let cpu = bh.cpu.expect("cpu not set");
-    cpu.bh_setfield_gc_f(struct_ptr, offset, value);
+    cpu.bh_setfield_gc_f(struct_ptr, value, descr);
     Ok(pos)
 }
 
@@ -4877,9 +4886,9 @@ fn handler_arraylen_gc(
     position: usize,
 ) -> Result<usize, DispatchError> {
     let array_ptr = bh.registers_r[code[position] as usize];
-    let (len_offset, pos) = read_descr_offset(bh, code, position + 1);
+    let (descr, pos) = read_descr(bh, code, position + 1);
     let cpu = bh.cpu.expect("cpu not set");
-    let result = cpu.bh_arraylen_gc(array_ptr, len_offset);
+    let result = cpu.bh_arraylen_gc(array_ptr, descr);
     bh.registers_i[code[pos] as usize] = result;
     Ok(pos + 1)
 }
@@ -4894,9 +4903,9 @@ fn handler_getarrayitem_gc_i(
 ) -> Result<usize, DispatchError> {
     let array = bh.registers_r[code[position] as usize];
     let index = bh.registers_i[code[position + 1] as usize];
-    let (item_size, pos) = read_descr_offset(bh, code, position + 2);
+    let (descr, pos) = read_descr(bh, code, position + 2);
     let cpu = bh.cpu.expect("cpu not set");
-    bh.registers_i[code[pos] as usize] = cpu.bh_getarrayitem_gc_i(array, index, item_size);
+    bh.registers_i[code[pos] as usize] = cpu.bh_getarrayitem_gc_i(array, index, descr);
     Ok(pos + 1)
 }
 fn handler_getarrayitem_gc_r(
@@ -4906,9 +4915,9 @@ fn handler_getarrayitem_gc_r(
 ) -> Result<usize, DispatchError> {
     let array = bh.registers_r[code[position] as usize];
     let index = bh.registers_i[code[position + 1] as usize];
-    let (item_size, pos) = read_descr_offset(bh, code, position + 2);
+    let (descr, pos) = read_descr(bh, code, position + 2);
     let cpu = bh.cpu.expect("cpu not set");
-    bh.registers_r[code[pos] as usize] = cpu.bh_getarrayitem_gc_r(array, index, item_size).0 as i64;
+    bh.registers_r[code[pos] as usize] = cpu.bh_getarrayitem_gc_r(array, index, descr).0 as i64;
     Ok(pos + 1)
 }
 
@@ -4923,9 +4932,9 @@ fn handler_setarrayitem_gc_i(
     let array = bh.registers_r[code[position] as usize];
     let index = bh.registers_i[code[position + 1] as usize];
     let value = bh.registers_i[code[position + 2] as usize];
-    let (item_size, pos) = read_descr_offset(bh, code, position + 3);
+    let (descr, pos) = read_descr(bh, code, position + 3);
     let cpu = bh.cpu.expect("cpu not set");
-    cpu.bh_setarrayitem_gc_i(array, index, item_size, value);
+    cpu.bh_setarrayitem_gc_i(array, index, value, descr);
     Ok(pos)
 }
 fn handler_setarrayitem_gc_r(
@@ -4936,9 +4945,9 @@ fn handler_setarrayitem_gc_r(
     let array = bh.registers_r[code[position] as usize];
     let index = bh.registers_i[code[position + 1] as usize];
     let value = bh.registers_r[code[position + 2] as usize];
-    let (item_size, pos) = read_descr_offset(bh, code, position + 3);
+    let (descr, pos) = read_descr(bh, code, position + 3);
     let cpu = bh.cpu.expect("cpu not set");
-    cpu.bh_setarrayitem_gc_r(array, index, item_size, majit_ir::GcRef(value as usize));
+    cpu.bh_setarrayitem_gc_r(array, index, majit_ir::GcRef(value as usize), descr);
     Ok(pos)
 }
 
@@ -4949,9 +4958,9 @@ fn handler_getfield_raw_i(
     position: usize,
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_i[code[position] as usize]; // raw ptr is int
-    let (offset, pos) = read_descr_offset(bh, code, position + 1);
+    let (descr, pos) = read_descr(bh, code, position + 1);
     let cpu = bh.cpu.expect("cpu not set");
-    bh.registers_i[code[pos] as usize] = cpu.bh_getfield_raw_i(struct_ptr, offset);
+    bh.registers_i[code[pos] as usize] = cpu.bh_getfield_raw_i(struct_ptr, descr);
     Ok(pos + 1)
 }
 fn handler_getfield_raw_f(
@@ -4960,9 +4969,9 @@ fn handler_getfield_raw_f(
     position: usize,
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_i[code[position] as usize];
-    let (offset, pos) = read_descr_offset(bh, code, position + 1);
+    let (descr, pos) = read_descr(bh, code, position + 1);
     let cpu = bh.cpu.expect("cpu not set");
-    bh.registers_f[code[pos] as usize] = cpu.bh_getfield_raw_f(struct_ptr, offset).to_bits() as i64;
+    bh.registers_f[code[pos] as usize] = cpu.bh_getfield_raw_f(struct_ptr, descr).to_bits() as i64;
     Ok(pos + 1)
 }
 
@@ -4974,9 +4983,9 @@ fn handler_setfield_raw_i(
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_i[code[position] as usize];
     let value = bh.registers_i[code[position + 1] as usize];
-    let (offset, pos) = read_descr_offset(bh, code, position + 2);
+    let (descr, pos) = read_descr(bh, code, position + 2);
     let cpu = bh.cpu.expect("cpu not set");
-    cpu.bh_setfield_raw_i(struct_ptr, offset, value);
+    cpu.bh_setfield_raw_i(struct_ptr, value, descr);
     Ok(pos)
 }
 fn handler_setfield_raw_f(
@@ -4986,9 +4995,9 @@ fn handler_setfield_raw_f(
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_i[code[position] as usize];
     let value = f64::from_bits(bh.registers_f[code[position + 1] as usize] as u64);
-    let (offset, pos) = read_descr_offset(bh, code, position + 2);
+    let (descr, pos) = read_descr(bh, code, position + 2);
     let cpu = bh.cpu.expect("cpu not set");
-    cpu.bh_setfield_raw_f(struct_ptr, offset, value);
+    cpu.bh_setfield_raw_f(struct_ptr, value, descr);
     Ok(pos)
 }
 
@@ -5002,9 +5011,9 @@ fn handler_new(
     position: usize,
 ) -> Result<usize, DispatchError> {
     // @arguments("cpu", "d", returns="r")
-    let (_descr_offset, pos) = read_descr_offset(bh, code, position);
-    // TODO: resolve SizeDescr from descr table and call cpu.bh_new(descr)
-    bh.registers_r[code[pos] as usize] = 0; // placeholder null
+    let (descr, pos) = read_descr(bh, code, position);
+    let cpu = bh.cpu.expect("cpu not set");
+    bh.registers_r[code[pos] as usize] = cpu.bh_new(descr);
     Ok(pos + 1)
 }
 fn handler_new_with_vtable(
@@ -5012,8 +5021,9 @@ fn handler_new_with_vtable(
     code: &[u8],
     position: usize,
 ) -> Result<usize, DispatchError> {
-    let (_descr_offset, pos) = read_descr_offset(bh, code, position);
-    bh.registers_r[code[pos] as usize] = 0;
+    let (descr, pos) = read_descr(bh, code, position);
+    let cpu = bh.cpu.expect("cpu not set");
+    bh.registers_r[code[pos] as usize] = cpu.bh_new_with_vtable(descr);
     Ok(pos + 1)
 }
 fn handler_new_array(
@@ -5022,9 +5032,10 @@ fn handler_new_array(
     position: usize,
 ) -> Result<usize, DispatchError> {
     // @arguments("cpu", "i", "d", returns="r")
-    let _length = bh.registers_i[code[position] as usize];
-    let (_descr_offset, pos) = read_descr_offset(bh, code, position + 1);
-    bh.registers_r[code[pos] as usize] = 0;
+    let length = bh.registers_i[code[position] as usize];
+    let (descr, pos) = read_descr(bh, code, position + 1);
+    let cpu = bh.cpu.expect("cpu not set");
+    bh.registers_r[code[pos] as usize] = cpu.bh_new_array(length, descr);
     Ok(pos + 1)
 }
 fn handler_new_array_clear(
@@ -5032,9 +5043,10 @@ fn handler_new_array_clear(
     code: &[u8],
     position: usize,
 ) -> Result<usize, DispatchError> {
-    let _length = bh.registers_i[code[position] as usize];
-    let (_descr_offset, pos) = read_descr_offset(bh, code, position + 1);
-    bh.registers_r[code[pos] as usize] = 0;
+    let length = bh.registers_i[code[position] as usize];
+    let (descr, pos) = read_descr(bh, code, position + 1);
+    let cpu = bh.cpu.expect("cpu not set");
+    bh.registers_r[code[pos] as usize] = cpu.bh_new_array_clear(length, descr);
     Ok(pos + 1)
 }
 
@@ -5170,9 +5182,9 @@ fn handler_getinteriorfield_gc_i(
 ) -> Result<usize, DispatchError> {
     let array = bh.registers_r[code[position] as usize];
     let index = bh.registers_i[code[position + 1] as usize];
-    let (descr_offset, pos) = read_descr_offset(bh, code, position + 2);
+    let (descr, pos) = read_descr(bh, code, position + 2);
     let cpu = bh.cpu.expect("cpu not set");
-    bh.registers_i[code[pos] as usize] = cpu.bh_getinteriorfield_gc_i(array, index, descr_offset);
+    bh.registers_i[code[pos] as usize] = cpu.bh_getinteriorfield_gc_i(array, index, descr);
     Ok(pos + 1)
 }
 fn handler_setinteriorfield_gc_i(
@@ -5183,9 +5195,9 @@ fn handler_setinteriorfield_gc_i(
     let array = bh.registers_r[code[position] as usize];
     let index = bh.registers_i[code[position + 1] as usize];
     let value = bh.registers_i[code[position + 2] as usize];
-    let (descr_offset, pos) = read_descr_offset(bh, code, position + 3);
+    let (descr, pos) = read_descr(bh, code, position + 3);
     let cpu = bh.cpu.expect("cpu not set");
-    cpu.bh_setinteriorfield_gc_i(array, index, descr_offset, value);
+    cpu.bh_setinteriorfield_gc_i(array, index, value, descr);
     Ok(pos)
 }
 
@@ -5957,7 +5969,7 @@ fn handler_record_known_result_i_ir_v(
     let p = position + 2;
     let (_, p) = read_list_i(bh, code, p);
     let (_, p) = read_list_r(bh, code, p);
-    let (_, p) = read_descr_offset(bh, code, p);
+    let (_, p) = read_descr(bh, code, p);
     Ok(p)
 }
 fn handler_record_known_result_r_ir_v(
@@ -5968,7 +5980,7 @@ fn handler_record_known_result_r_ir_v(
     let p = position + 2;
     let (_, p) = read_list_i(bh, code, p);
     let (_, p) = read_list_r(bh, code, p);
-    let (_, p) = read_descr_offset(bh, code, p);
+    let (_, p) = read_descr(bh, code, p);
     Ok(p)
 }
 fn handler_str_guard_value(
@@ -5977,7 +5989,7 @@ fn handler_str_guard_value(
     position: usize,
 ) -> Result<usize, DispatchError> {
     let r = bh.registers_r[code[position] as usize];
-    let (_, p) = read_descr_offset(bh, code, position + 2);
+    let (_, p) = read_descr(bh, code, position + 2);
     bh.registers_r[code[p] as usize] = r;
     Ok(p + 1)
 }
@@ -6162,9 +6174,9 @@ fn handler_getfield_vable_i(
         let vinfo = unsafe { &*bh.virtualizable_info };
         unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, struct_ptr as *mut u8) };
     }
-    let (offset, p) = read_descr_vable_field(bh, code, p + 1);
+    let (descr, p) = read_descr_vable_field(bh, code, p + 1);
     let cpu = bh.cpu.expect("cpu not set");
-    bh.registers_i[code[p] as usize] = cpu.bh_getfield_gc_i(struct_ptr, offset);
+    bh.registers_i[code[p] as usize] = cpu.bh_getfield_gc_i(struct_ptr, &descr);
     Ok(p + 1)
 }
 fn handler_getfield_vable_r(
@@ -6177,9 +6189,9 @@ fn handler_getfield_vable_r(
         let vinfo = unsafe { &*bh.virtualizable_info };
         unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, struct_ptr as *mut u8) };
     }
-    let (offset, p) = read_descr_vable_field(bh, code, p + 1);
+    let (descr, p) = read_descr_vable_field(bh, code, p + 1);
     let cpu = bh.cpu.expect("cpu not set");
-    bh.registers_r[code[p] as usize] = cpu.bh_getfield_gc_r(struct_ptr, offset).0 as i64;
+    bh.registers_r[code[p] as usize] = cpu.bh_getfield_gc_r(struct_ptr, &descr).0 as i64;
     Ok(p + 1)
 }
 fn handler_getfield_vable_f(
@@ -6192,9 +6204,9 @@ fn handler_getfield_vable_f(
         let vinfo = unsafe { &*bh.virtualizable_info };
         unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, struct_ptr as *mut u8) };
     }
-    let (offset, p) = read_descr_vable_field(bh, code, p + 1);
+    let (descr, p) = read_descr_vable_field(bh, code, p + 1);
     let cpu = bh.cpu.expect("cpu not set");
-    bh.registers_f[code[p] as usize] = cpu.bh_getfield_gc_f(struct_ptr, offset).to_bits() as i64;
+    bh.registers_f[code[p] as usize] = cpu.bh_getfield_gc_f(struct_ptr, &descr).to_bits() as i64;
     Ok(p + 1)
 }
 fn handler_setfield_vable_i(
@@ -6208,9 +6220,9 @@ fn handler_setfield_vable_i(
         let vinfo = unsafe { &*bh.virtualizable_info };
         unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, struct_ptr as *mut u8) };
     }
-    let (offset, p) = read_descr_vable_field(bh, code, p + 2);
+    let (descr, p) = read_descr_vable_field(bh, code, p + 2);
     let cpu = bh.cpu.expect("cpu not set");
-    cpu.bh_setfield_gc_i(struct_ptr, offset, value);
+    cpu.bh_setfield_gc_i(struct_ptr, value, &descr);
     Ok(p)
 }
 fn handler_setfield_vable_r(
@@ -6224,9 +6236,9 @@ fn handler_setfield_vable_r(
         let vinfo = unsafe { &*bh.virtualizable_info };
         unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, struct_ptr as *mut u8) };
     }
-    let (offset, p) = read_descr_vable_field(bh, code, p + 2);
+    let (descr, p) = read_descr_vable_field(bh, code, p + 2);
     let cpu = bh.cpu.expect("cpu not set");
-    cpu.bh_setfield_gc_r(struct_ptr, offset, majit_ir::GcRef(value as usize));
+    cpu.bh_setfield_gc_r(struct_ptr, majit_ir::GcRef(value as usize), &descr);
     Ok(p)
 }
 fn handler_setfield_vable_f(
@@ -6240,9 +6252,9 @@ fn handler_setfield_vable_f(
         let vinfo = unsafe { &*bh.virtualizable_info };
         unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, struct_ptr as *mut u8) };
     }
-    let (offset, p) = read_descr_vable_field(bh, code, p + 2);
+    let (descr, p) = read_descr_vable_field(bh, code, p + 2);
     let cpu = bh.cpu.expect("cpu not set");
-    cpu.bh_setfield_gc_f(struct_ptr, offset, value);
+    cpu.bh_setfield_gc_f(struct_ptr, value, &descr);
     Ok(p)
 }
 
@@ -6264,11 +6276,11 @@ fn handler_getarrayitem_vable_i(
         let ptr = vable as *mut u8;
         unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, ptr) };
     }
-    let (field_index, p) = read_descr_vable_array(bh, code, p + 2);
-    let (array_item_size, p) = read_descr_offset(bh, code, p);
+    let (field_descr, p) = read_descr_vable_array(bh, code, p + 2);
+    let (array_descr, p) = read_descr(bh, code, p);
     let cpu = bh.cpu.expect("cpu not set");
-    let array = cpu.bh_getfield_gc_r(vable, field_index).0 as i64;
-    bh.registers_i[code[p] as usize] = cpu.bh_getarrayitem_gc_i(array, index, array_item_size);
+    let array = cpu.bh_getfield_gc_r(vable, &field_descr).0 as i64;
+    bh.registers_i[code[p] as usize] = cpu.bh_getarrayitem_gc_i(array, index, array_descr);
     Ok(p + 1)
 }
 fn handler_getarrayitem_vable_r(
@@ -6283,12 +6295,11 @@ fn handler_getarrayitem_vable_r(
         let ptr = vable as *mut u8;
         unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, ptr) };
     }
-    let (field_index, p) = read_descr_vable_array(bh, code, p + 2);
-    let (array_item_size, p) = read_descr_offset(bh, code, p);
+    let (field_descr, p) = read_descr_vable_array(bh, code, p + 2);
+    let (array_descr, p) = read_descr(bh, code, p);
     let cpu = bh.cpu.expect("cpu not set");
-    let array = cpu.bh_getfield_gc_r(vable, field_index).0 as i64;
-    bh.registers_r[code[p] as usize] =
-        cpu.bh_getarrayitem_gc_r(array, index, array_item_size).0 as i64;
+    let array = cpu.bh_getfield_gc_r(vable, &field_descr).0 as i64;
+    bh.registers_r[code[p] as usize] = cpu.bh_getarrayitem_gc_r(array, index, array_descr).0 as i64;
     Ok(p + 1)
 }
 fn handler_setarrayitem_vable_i(
@@ -6304,11 +6315,11 @@ fn handler_setarrayitem_vable_i(
         let ptr = vable as *mut u8;
         unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, ptr) };
     }
-    let (field_index, p) = read_descr_vable_array(bh, code, p + 3);
-    let (array_item_size, p) = read_descr_offset(bh, code, p);
+    let (field_descr, p) = read_descr_vable_array(bh, code, p + 3);
+    let (array_descr, p) = read_descr(bh, code, p);
     let cpu = bh.cpu.expect("cpu not set");
-    let array = cpu.bh_getfield_gc_r(vable, field_index).0 as i64;
-    cpu.bh_setarrayitem_gc_i(array, index, array_item_size, value);
+    let array = cpu.bh_getfield_gc_r(vable, &field_descr).0 as i64;
+    cpu.bh_setarrayitem_gc_i(array, index, value, array_descr);
     Ok(p)
 }
 fn handler_setarrayitem_vable_r(
@@ -6324,16 +6335,11 @@ fn handler_setarrayitem_vable_r(
         let ptr = vable as *mut u8;
         unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, ptr) };
     }
-    let (field_index, p) = read_descr_vable_array(bh, code, p + 3);
-    let (array_item_size, p) = read_descr_offset(bh, code, p);
+    let (field_descr, p) = read_descr_vable_array(bh, code, p + 3);
+    let (array_descr, p) = read_descr(bh, code, p);
     let cpu = bh.cpu.expect("cpu not set");
-    let array = cpu.bh_getfield_gc_r(vable, field_index).0 as i64;
-    cpu.bh_setarrayitem_gc_r(
-        array,
-        index,
-        array_item_size,
-        majit_ir::GcRef(value as usize),
-    );
+    let array = cpu.bh_getfield_gc_r(vable, &field_descr).0 as i64;
+    cpu.bh_setarrayitem_gc_r(array, index, majit_ir::GcRef(value as usize), array_descr);
     Ok(p)
 }
 fn handler_arraylen_vable(
@@ -6347,11 +6353,11 @@ fn handler_arraylen_vable(
         let ptr = vable as *mut u8;
         unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, ptr) };
     }
-    let (field_index, p) = read_descr_vable_array(bh, code, p + 1);
-    let (array_len_offset, p) = read_descr_offset(bh, code, p);
+    let (field_descr, p) = read_descr_vable_array(bh, code, p + 1);
+    let (array_len_descr, p) = read_descr(bh, code, p);
     let cpu = bh.cpu.expect("cpu not set");
-    let array = cpu.bh_getfield_gc_r(vable, field_index).0 as i64;
-    bh.registers_i[code[p] as usize] = cpu.bh_arraylen_gc(array, array_len_offset);
+    let array = cpu.bh_getfield_gc_r(vable, &field_descr).0 as i64;
+    bh.registers_i[code[p] as usize] = cpu.bh_arraylen_gc(array, array_len_descr);
     Ok(p + 1)
 }
 
@@ -6366,7 +6372,8 @@ fn handler_getarrayitem_raw_i(
 ) -> Result<usize, DispatchError> {
     let array = bh.registers_i[code[p] as usize] as usize; // raw ptr
     let index = bh.registers_i[code[p + 1] as usize] as usize;
-    let (item_size, p) = read_descr_offset(bh, code, p + 2);
+    let (descr, p) = read_descr(bh, code, p + 2);
+    let item_size = descr.as_offset();
     let offset = index * item_size.max(1);
     let value = unsafe { *((array + offset) as *const i64) };
     bh.registers_i[code[p] as usize] = value;
@@ -6381,7 +6388,8 @@ fn handler_setarrayitem_raw_i(
     let array = bh.registers_i[code[p] as usize] as usize;
     let index = bh.registers_i[code[p + 1] as usize] as usize;
     let value = bh.registers_i[code[p + 2] as usize];
-    let (item_size, p) = read_descr_offset(bh, code, p + 3);
+    let (descr, p) = read_descr(bh, code, p + 3);
+    let item_size = descr.as_offset();
     let offset = index * item_size.max(1);
     unsafe { *((array + offset) as *mut i64) = value };
     Ok(p)
@@ -6456,11 +6464,11 @@ fn handler_getlistitem_gc_i(
 ) -> Result<usize, DispatchError> {
     let lst = bh.registers_r[code[p] as usize];
     let index = bh.registers_i[code[p + 1] as usize];
-    let (items_offset, p) = read_descr_offset(bh, code, p + 2);
-    let (array_item_size, p) = read_descr_offset(bh, code, p);
+    let (items_descr, p) = read_descr(bh, code, p + 2);
+    let (array_descr, p) = read_descr(bh, code, p);
     let cpu = bh.cpu.expect("cpu not set");
-    let items = cpu.bh_getfield_gc_r(lst, items_offset).0 as i64;
-    bh.registers_i[code[p] as usize] = cpu.bh_getarrayitem_gc_i(items, index, array_item_size);
+    let items = cpu.bh_getfield_gc_r(lst, items_descr).0 as i64;
+    bh.registers_i[code[p] as usize] = cpu.bh_getarrayitem_gc_i(items, index, array_descr);
     Ok(p + 1)
 }
 fn handler_getlistitem_gc_r(
@@ -6470,12 +6478,11 @@ fn handler_getlistitem_gc_r(
 ) -> Result<usize, DispatchError> {
     let lst = bh.registers_r[code[p] as usize];
     let index = bh.registers_i[code[p + 1] as usize];
-    let (items_offset, p) = read_descr_offset(bh, code, p + 2);
-    let (array_item_size, p) = read_descr_offset(bh, code, p);
+    let (items_descr, p) = read_descr(bh, code, p + 2);
+    let (array_descr, p) = read_descr(bh, code, p);
     let cpu = bh.cpu.expect("cpu not set");
-    let items = cpu.bh_getfield_gc_r(lst, items_offset).0 as i64;
-    bh.registers_r[code[p] as usize] =
-        cpu.bh_getarrayitem_gc_r(items, index, array_item_size).0 as i64;
+    let items = cpu.bh_getfield_gc_r(lst, items_descr).0 as i64;
+    bh.registers_r[code[p] as usize] = cpu.bh_getarrayitem_gc_r(items, index, array_descr).0 as i64;
     Ok(p + 1)
 }
 fn handler_setlistitem_gc_i(
@@ -6486,11 +6493,11 @@ fn handler_setlistitem_gc_i(
     let lst = bh.registers_r[code[p] as usize];
     let index = bh.registers_i[code[p + 1] as usize];
     let value = bh.registers_i[code[p + 2] as usize];
-    let (items_offset, p) = read_descr_offset(bh, code, p + 3);
-    let (array_item_size, p) = read_descr_offset(bh, code, p);
+    let (items_descr, p) = read_descr(bh, code, p + 3);
+    let (array_descr, p) = read_descr(bh, code, p);
     let cpu = bh.cpu.expect("cpu not set");
-    let items = cpu.bh_getfield_gc_r(lst, items_offset).0 as i64;
-    cpu.bh_setarrayitem_gc_i(items, index, array_item_size, value);
+    let items = cpu.bh_getfield_gc_r(lst, items_descr).0 as i64;
+    cpu.bh_setarrayitem_gc_i(items, index, value, array_descr);
     Ok(p)
 }
 fn handler_setlistitem_gc_r(
@@ -6501,16 +6508,11 @@ fn handler_setlistitem_gc_r(
     let lst = bh.registers_r[code[p] as usize];
     let index = bh.registers_i[code[p + 1] as usize];
     let value = bh.registers_r[code[p + 2] as usize];
-    let (items_offset, p) = read_descr_offset(bh, code, p + 3);
-    let (array_item_size, p) = read_descr_offset(bh, code, p);
+    let (items_descr, p) = read_descr(bh, code, p + 3);
+    let (array_descr, p) = read_descr(bh, code, p);
     let cpu = bh.cpu.expect("cpu not set");
-    let items = cpu.bh_getfield_gc_r(lst, items_offset).0 as i64;
-    cpu.bh_setarrayitem_gc_r(
-        items,
-        index,
-        array_item_size,
-        majit_ir::GcRef(value as usize),
-    );
+    let items = cpu.bh_getfield_gc_r(lst, items_descr).0 as i64;
+    cpu.bh_setarrayitem_gc_r(items, index, majit_ir::GcRef(value as usize), array_descr);
     Ok(p)
 }
 
@@ -6553,10 +6555,10 @@ fn handler_check_neg_index(
 ) -> Result<usize, DispatchError> {
     let array = bh.registers_r[code[p] as usize];
     let mut index = bh.registers_i[code[p + 1] as usize];
-    let (len_offset, p) = read_descr_offset(bh, code, p + 2);
+    let (descr, p) = read_descr(bh, code, p + 2);
     if index < 0 {
         let cpu = bh.cpu.expect("cpu not set");
-        index += cpu.bh_arraylen_gc(array, len_offset);
+        index += cpu.bh_arraylen_gc(array, descr);
     }
     bh.registers_i[code[p] as usize] = index;
     Ok(p + 1)
@@ -6568,10 +6570,10 @@ fn handler_check_resizable_neg_index(
 ) -> Result<usize, DispatchError> {
     let lst = bh.registers_r[code[p] as usize];
     let mut index = bh.registers_i[code[p + 1] as usize];
-    let (len_descr, p) = read_descr_offset(bh, code, p + 2);
+    let (descr, p) = read_descr(bh, code, p + 2);
     if index < 0 {
         let cpu = bh.cpu.expect("cpu not set");
-        index += cpu.bh_getfield_gc_i(lst, len_descr);
+        index += cpu.bh_getfield_gc_i(lst, descr);
     }
     bh.registers_i[code[p] as usize] = index;
     Ok(p + 1)
@@ -6586,10 +6588,10 @@ fn handler_getarrayitem_gc_f(
 ) -> Result<usize, DispatchError> {
     let array = bh.registers_r[code[p] as usize];
     let index = bh.registers_i[code[p + 1] as usize];
-    let (item_size, p) = read_descr_offset(bh, code, p + 2);
+    let (descr, p) = read_descr(bh, code, p + 2);
     let cpu = bh.cpu.expect("cpu not set");
     bh.registers_f[code[p] as usize] =
-        cpu.bh_getarrayitem_gc_f(array, index, item_size).to_bits() as i64;
+        cpu.bh_getarrayitem_gc_f(array, index, descr).to_bits() as i64;
     Ok(p + 1)
 }
 // blackhole.py:1357-1358 bhimpl_setarrayitem_gc_f
@@ -6601,9 +6603,9 @@ fn handler_setarrayitem_gc_f(
     let array = bh.registers_r[code[p] as usize];
     let index = bh.registers_i[code[p + 1] as usize];
     let value = f64::from_bits(bh.registers_f[code[p + 2] as usize] as u64);
-    let (item_size, p) = read_descr_offset(bh, code, p + 3);
+    let (descr, p) = read_descr(bh, code, p + 3);
     let cpu = bh.cpu.expect("cpu not set");
-    cpu.bh_setarrayitem_gc_f(array, index, item_size, value);
+    cpu.bh_setarrayitem_gc_f(array, index, value, descr);
     Ok(p)
 }
 // blackhole.py:1347-1348 bhimpl_getarrayitem_raw_f
@@ -6614,10 +6616,10 @@ fn handler_getarrayitem_raw_f(
 ) -> Result<usize, DispatchError> {
     let array = bh.registers_i[code[p] as usize];
     let index = bh.registers_i[code[p + 1] as usize];
-    let (item_size, p) = read_descr_offset(bh, code, p + 2);
+    let (descr, p) = read_descr(bh, code, p + 2);
     let cpu = bh.cpu.expect("cpu not set");
     bh.registers_f[code[p] as usize] =
-        cpu.bh_getarrayitem_raw_f(array, index, item_size).to_bits() as i64;
+        cpu.bh_getarrayitem_raw_f(array, index, descr).to_bits() as i64;
     Ok(p + 1)
 }
 // blackhole.py:1363-1364 bhimpl_setarrayitem_raw_f
@@ -6629,9 +6631,9 @@ fn handler_setarrayitem_raw_f(
     let array = bh.registers_i[code[p] as usize];
     let index = bh.registers_i[code[p + 1] as usize];
     let value = f64::from_bits(bh.registers_f[code[p + 2] as usize] as u64);
-    let (item_size, p) = read_descr_offset(bh, code, p + 3);
+    let (descr, p) = read_descr(bh, code, p + 3);
     let cpu = bh.cpu.expect("cpu not set");
-    cpu.bh_setarrayitem_raw_f(array, index, item_size, value);
+    cpu.bh_setarrayitem_raw_f(array, index, value, descr);
     Ok(p)
 }
 // getfield_raw_r (pure only, blackhole.py:1467-1469)
@@ -6641,9 +6643,9 @@ fn handler_getfield_raw_r(
     p: usize,
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_i[code[p] as usize];
-    let (offset, p) = read_descr_offset(bh, code, p + 1);
+    let (descr, p) = read_descr(bh, code, p + 1);
     let cpu = bh.cpu.expect("cpu not set");
-    bh.registers_r[code[p] as usize] = cpu.bh_getfield_raw_r(struct_ptr, offset).0 as i64;
+    bh.registers_r[code[p] as usize] = cpu.bh_getfield_raw_r(struct_ptr, descr).0 as i64;
     Ok(p + 1)
 }
 // getinteriorfield_gc_f / setinteriorfield_gc_f / setinteriorfield_gc_r
@@ -6656,10 +6658,10 @@ fn handler_getinteriorfield_gc_f(
 ) -> Result<usize, DispatchError> {
     let array = bh.registers_r[code[p] as usize];
     let index = bh.registers_i[code[p + 1] as usize];
-    let (offset, p) = read_descr_offset(bh, code, p + 2);
+    let (descr, p) = read_descr(bh, code, p + 2);
     let cpu = bh.cpu.expect("cpu not set");
     bh.registers_f[code[p] as usize] =
-        cpu.bh_getinteriorfield_gc_f(array, index, offset).to_bits() as i64;
+        cpu.bh_getinteriorfield_gc_f(array, index, descr).to_bits() as i64;
     Ok(p + 1)
 }
 fn handler_getinteriorfield_gc_r(
@@ -6669,9 +6671,9 @@ fn handler_getinteriorfield_gc_r(
 ) -> Result<usize, DispatchError> {
     let array = bh.registers_r[code[p] as usize];
     let index = bh.registers_i[code[p + 1] as usize];
-    let (offset, p) = read_descr_offset(bh, code, p + 2);
+    let (descr, p) = read_descr(bh, code, p + 2);
     let cpu = bh.cpu.expect("cpu not set");
-    bh.registers_r[code[p] as usize] = cpu.bh_getinteriorfield_gc_r(array, index, offset).0 as i64;
+    bh.registers_r[code[p] as usize] = cpu.bh_getinteriorfield_gc_r(array, index, descr).0 as i64;
     Ok(p + 1)
 }
 fn handler_setinteriorfield_gc_f(
@@ -6682,9 +6684,9 @@ fn handler_setinteriorfield_gc_f(
     let array = bh.registers_r[code[p] as usize];
     let index = bh.registers_i[code[p + 1] as usize];
     let value = f64::from_bits(bh.registers_f[code[p + 2] as usize] as u64);
-    let (offset, p) = read_descr_offset(bh, code, p + 3);
+    let (descr, p) = read_descr(bh, code, p + 3);
     let cpu = bh.cpu.expect("cpu not set");
-    cpu.bh_setinteriorfield_gc_f(array, index, offset, value);
+    cpu.bh_setinteriorfield_gc_f(array, index, value, descr);
     Ok(p)
 }
 fn handler_setinteriorfield_gc_r(
@@ -6695,9 +6697,9 @@ fn handler_setinteriorfield_gc_r(
     let array = bh.registers_r[code[p] as usize];
     let index = bh.registers_i[code[p + 1] as usize];
     let value = bh.registers_r[code[p + 2] as usize];
-    let (offset, p) = read_descr_offset(bh, code, p + 3);
+    let (descr, p) = read_descr(bh, code, p + 3);
     let cpu = bh.cpu.expect("cpu not set");
-    cpu.bh_setinteriorfield_gc_r(array, index, offset, majit_ir::GcRef(value as usize));
+    cpu.bh_setinteriorfield_gc_r(array, index, majit_ir::GcRef(value as usize), descr);
     Ok(p)
 }
 // gc_load_indexed_i/f, gc_store_indexed_i/f (blackhole.py:1518-1540)
@@ -6745,7 +6747,7 @@ fn handler_gc_store_indexed_i(
     let scale = bh.registers_i[code[p + 3] as usize];
     let base_ofs = bh.registers_i[code[p + 4] as usize];
     let bytes = bh.registers_i[code[p + 5] as usize];
-    let (_, p) = read_descr_offset(bh, code, p + 6);
+    let (_, p) = read_descr(bh, code, p + 6);
     let cpu = bh.cpu.expect("cpu not set");
     cpu.bh_gc_store_indexed_i(addr, index, value, scale, base_ofs, bytes);
     Ok(p)
@@ -6763,7 +6765,7 @@ fn handler_gc_store_indexed_f(
     let scale = bh.registers_i[code[p + 3] as usize];
     let base_ofs = bh.registers_i[code[p + 4] as usize];
     let bytes = bh.registers_i[code[p + 5] as usize];
-    let (_, p) = read_descr_offset(bh, code, p + 6);
+    let (_, p) = read_descr(bh, code, p + 6);
     let cpu = bh.cpu.expect("cpu not set");
     cpu.bh_gc_store_indexed_f(addr, index, value, scale, base_ofs, bytes);
     Ok(p)
@@ -6778,7 +6780,7 @@ fn handler_raw_store_i(
     let addr = bh.registers_i[code[p] as usize];
     let offset = bh.registers_i[code[p + 1] as usize];
     let value = bh.registers_i[code[p + 2] as usize];
-    let (_, p) = read_descr_offset(bh, code, p + 3);
+    let (_, p) = read_descr(bh, code, p + 3);
     let cpu = bh.cpu.expect("cpu not set");
     cpu.bh_raw_store_i(addr, offset, value);
     Ok(p)
@@ -6792,7 +6794,7 @@ fn handler_raw_store_f(
     let addr = bh.registers_i[code[p] as usize];
     let offset = bh.registers_i[code[p + 1] as usize];
     let value = f64::from_bits(bh.registers_f[code[p + 2] as usize] as u64);
-    let (_, p) = read_descr_offset(bh, code, p + 3);
+    let (_, p) = read_descr(bh, code, p + 3);
     let cpu = bh.cpu.expect("cpu not set");
     cpu.bh_raw_store_f(addr, offset, value);
     Ok(p)
@@ -6804,7 +6806,7 @@ fn handler_raw_load_i(
 ) -> Result<usize, DispatchError> {
     let addr = bh.registers_i[code[p] as usize];
     let offset = bh.registers_i[code[p + 1] as usize];
-    let (_, p) = read_descr_offset(bh, code, p + 2);
+    let (_, p) = read_descr(bh, code, p + 2);
     let cpu = bh.cpu.expect("cpu not set");
     bh.registers_i[code[p] as usize] = cpu.bh_raw_load_i(addr, offset);
     Ok(p + 1)
@@ -6816,7 +6818,7 @@ fn handler_raw_load_f(
 ) -> Result<usize, DispatchError> {
     let addr = bh.registers_i[code[p] as usize];
     let offset = bh.registers_i[code[p + 1] as usize];
-    let (_, p) = read_descr_offset(bh, code, p + 2);
+    let (_, p) = read_descr(bh, code, p + 2);
     let cpu = bh.cpu.expect("cpu not set");
     bh.registers_f[code[p] as usize] = cpu.bh_raw_load_f(addr, offset).to_bits() as i64;
     Ok(p + 1)
@@ -6830,21 +6832,20 @@ fn handler_newlist(
     p: usize,
 ) -> Result<usize, DispatchError> {
     let length = bh.registers_i[code[p] as usize];
-    let (struct_size, p) = read_descr_offset(bh, code, p + 1);
-    let (length_offset, p) = read_descr_offset(bh, code, p);
-    let (items_offset, p) = read_descr_offset(bh, code, p);
-    let (array_itemsize, p) = read_descr_offset(bh, code, p);
+    let (structdescr, p) = read_descr(bh, code, p + 1);
+    let (lengthdescr, p) = read_descr(bh, code, p);
+    let (itemsdescr, p) = read_descr(bh, code, p);
+    let (arraydescr, p) = read_descr(bh, code, p);
     let cpu = bh.cpu.expect("cpu not set");
     // blackhole.py:1163: result = cpu.bh_new(structdescr)
-    let result = cpu.bh_new_with_size(struct_size);
+    let result = cpu.bh_new(structdescr);
     // blackhole.py:1164: cpu.bh_setfield_gc_i(result, length, lengthdescr)
-    cpu.bh_setfield_gc_i(result, length_offset, length);
+    cpu.bh_setfield_gc_i(result, length, lengthdescr);
     // blackhole.py:1165-1169: bh_new_array_clear when arraydescr.is_array_of_structs()
-    // or is_array_of_pointers(). pyre: always clear for safety (prevents GC scanning
-    // uninitialized pointers).
-    let items = cpu.bh_new_array_clear(length, array_itemsize, 0);
+    // or is_array_of_pointers(). Always clear for safety.
+    let items = cpu.bh_new_array_clear(length, arraydescr);
     // blackhole.py:1170: cpu.bh_setfield_gc_r(result, items, itemsdescr)
-    cpu.bh_setfield_gc_r(result, items_offset, majit_ir::GcRef(items as usize));
+    cpu.bh_setfield_gc_r(result, majit_ir::GcRef(items as usize), itemsdescr);
     bh.registers_r[code[p] as usize] = result;
     Ok(p + 1)
 }
@@ -6855,16 +6856,16 @@ fn handler_newlist_clear(
     p: usize,
 ) -> Result<usize, DispatchError> {
     let length = bh.registers_i[code[p] as usize];
-    let (struct_size, p) = read_descr_offset(bh, code, p + 1);
-    let (length_offset, p) = read_descr_offset(bh, code, p);
-    let (items_offset, p) = read_descr_offset(bh, code, p);
-    let (array_itemsize, p) = read_descr_offset(bh, code, p);
+    let (structdescr, p) = read_descr(bh, code, p + 1);
+    let (lengthdescr, p) = read_descr(bh, code, p);
+    let (itemsdescr, p) = read_descr(bh, code, p);
+    let (arraydescr, p) = read_descr(bh, code, p);
     let cpu = bh.cpu.expect("cpu not set");
-    let result = cpu.bh_new_with_size(struct_size);
-    cpu.bh_setfield_gc_i(result, length_offset, length);
+    let result = cpu.bh_new(structdescr);
+    cpu.bh_setfield_gc_i(result, length, lengthdescr);
     // blackhole.py:1178: items = cpu.bh_new_array_clear(length, arraydescr)
-    let items = cpu.bh_new_array_clear(length, array_itemsize, 0);
-    cpu.bh_setfield_gc_r(result, items_offset, majit_ir::GcRef(items as usize));
+    let items = cpu.bh_new_array_clear(length, arraydescr);
+    cpu.bh_setfield_gc_r(result, majit_ir::GcRef(items as usize), itemsdescr);
     bh.registers_r[code[p] as usize] = result;
     Ok(p + 1)
 }
@@ -6875,16 +6876,16 @@ fn handler_newlist_hint(
     p: usize,
 ) -> Result<usize, DispatchError> {
     let lengthhint = bh.registers_i[code[p] as usize];
-    let (struct_size, p) = read_descr_offset(bh, code, p + 1);
-    let (length_offset, p) = read_descr_offset(bh, code, p);
-    let (items_offset, p) = read_descr_offset(bh, code, p);
-    let (array_itemsize, p) = read_descr_offset(bh, code, p);
+    let (structdescr, p) = read_descr(bh, code, p + 1);
+    let (lengthdescr, p) = read_descr(bh, code, p);
+    let (itemsdescr, p) = read_descr(bh, code, p);
+    let (arraydescr, p) = read_descr(bh, code, p);
     let cpu = bh.cpu.expect("cpu not set");
-    let result = cpu.bh_new_with_size(struct_size);
+    let result = cpu.bh_new(structdescr);
     // blackhole.py:1186: cpu.bh_setfield_gc_i(result, 0, lengthdescr)
-    cpu.bh_setfield_gc_i(result, length_offset, 0);
-    let items = cpu.bh_new_array(lengthhint, array_itemsize, 0);
-    cpu.bh_setfield_gc_r(result, items_offset, majit_ir::GcRef(items as usize));
+    cpu.bh_setfield_gc_i(result, 0, lengthdescr);
+    let items = cpu.bh_new_array(lengthhint, arraydescr);
+    cpu.bh_setfield_gc_r(result, majit_ir::GcRef(items as usize), itemsdescr);
     bh.registers_r[code[p] as usize] = result;
     Ok(p + 1)
 }
@@ -6901,12 +6902,12 @@ fn handler_getarrayitem_vable_f(
         let ptr = vable as *mut u8;
         unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, ptr) };
     }
-    let (field_index, p) = read_descr_vable_array(bh, code, p + 2);
-    let (array_item_size, p) = read_descr_offset(bh, code, p);
+    let (field_descr, p) = read_descr_vable_array(bh, code, p + 2);
+    let (array_descr, p) = read_descr(bh, code, p);
     let cpu = bh.cpu.expect("cpu not set");
-    let array = cpu.bh_getfield_gc_r(vable, field_index).0 as i64;
+    let array = cpu.bh_getfield_gc_r(vable, &field_descr).0 as i64;
     bh.registers_f[code[p] as usize] = cpu
-        .bh_getarrayitem_gc_f(array, index, array_item_size)
+        .bh_getarrayitem_gc_f(array, index, array_descr)
         .to_bits() as i64;
     Ok(p + 1)
 }
@@ -6924,11 +6925,11 @@ fn handler_setarrayitem_vable_f(
         let ptr = vable as *mut u8;
         unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, ptr) };
     }
-    let (field_index, p) = read_descr_vable_array(bh, code, p + 3);
-    let (array_item_size, p) = read_descr_offset(bh, code, p);
+    let (field_descr, p) = read_descr_vable_array(bh, code, p + 3);
+    let (array_descr, p) = read_descr(bh, code, p);
     let cpu = bh.cpu.expect("cpu not set");
-    let array = cpu.bh_getfield_gc_r(vable, field_index).0 as i64;
-    cpu.bh_setarrayitem_gc_f(array, index, array_item_size, value);
+    let array = cpu.bh_getfield_gc_r(vable, &field_descr).0 as i64;
+    cpu.bh_setarrayitem_gc_f(array, index, value, array_descr);
     Ok(p)
 }
 // blackhole.py:1204-1206 bhimpl_getlistitem_gc_f
@@ -6939,12 +6940,12 @@ fn handler_getlistitem_gc_f(
 ) -> Result<usize, DispatchError> {
     let lst = bh.registers_r[code[p] as usize];
     let index = bh.registers_i[code[p + 1] as usize];
-    let (items_offset, p) = read_descr_offset(bh, code, p + 2);
-    let (array_item_size, p) = read_descr_offset(bh, code, p);
+    let (items_descr, p) = read_descr(bh, code, p + 2);
+    let (array_descr, p) = read_descr(bh, code, p);
     let cpu = bh.cpu.expect("cpu not set");
-    let items = cpu.bh_getfield_gc_r(lst, items_offset).0 as i64;
+    let items = cpu.bh_getfield_gc_r(lst, items_descr).0 as i64;
     bh.registers_f[code[p] as usize] = cpu
-        .bh_getarrayitem_gc_f(items, index, array_item_size)
+        .bh_getarrayitem_gc_f(items, index, array_descr)
         .to_bits() as i64;
     Ok(p + 1)
 }
@@ -6957,11 +6958,11 @@ fn handler_setlistitem_gc_f(
     let lst = bh.registers_r[code[p] as usize];
     let index = bh.registers_i[code[p + 1] as usize];
     let value = f64::from_bits(bh.registers_f[code[p + 2] as usize] as u64);
-    let (items_offset, p) = read_descr_offset(bh, code, p + 3);
-    let (array_item_size, p) = read_descr_offset(bh, code, p);
+    let (items_descr, p) = read_descr(bh, code, p + 3);
+    let (array_descr, p) = read_descr(bh, code, p);
     let cpu = bh.cpu.expect("cpu not set");
-    let items = cpu.bh_getfield_gc_r(lst, items_offset).0 as i64;
-    cpu.bh_setarrayitem_gc_f(items, index, array_item_size, value);
+    let items = cpu.bh_getfield_gc_r(lst, items_descr).0 as i64;
+    cpu.bh_setarrayitem_gc_f(items, index, value, array_descr);
     Ok(p)
 }
 // inline_call — RPython blackhole.py:1278-1319

@@ -2040,14 +2040,26 @@ fn handle_jit_outcome(
 
 /// resume.py:1441-1442 allocate_struct(typedescr) → cpu.bh_new(typedescr).
 fn allocate_struct(typedescr: &dyn majit_ir::SizeDescr) -> usize {
+    let size = typedescr.size();
+    let descr = majit_codewriter::jitcode::BhDescr::Field {
+        offset: size,
+        name: String::new(),
+        owner: String::new(),
+    };
     let (driver, _) = driver_pair();
-    driver.meta_interp().backend().bh_new(typedescr) as usize
+    driver.meta_interp().backend().bh_new(&descr) as usize
 }
 
 /// resume.py:1437-1439 allocate_with_vtable(descr) → exec_new_with_vtable(cpu, descr).
 fn allocate_with_vtable(descr: &dyn majit_ir::SizeDescr) -> usize {
+    let size = descr.size();
+    let bh_descr = majit_codewriter::jitcode::BhDescr::Field {
+        offset: size,
+        name: String::new(),
+        owner: String::new(),
+    };
     let (driver, _) = driver_pair();
-    driver.meta_interp().backend().bh_new_with_vtable(descr) as usize
+    driver.meta_interp().backend().bh_new_with_vtable(&bh_descr) as usize
 }
 
 /// resume.py:945-956 getvirtual_ptr parity.
@@ -3949,12 +3961,14 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
     fn allocate_struct(&self, descr_index: u32, descr_size: usize) -> i64 {
         // resume.py:1441-1442 allocate_struct → cpu.bh_new(typedescr)
         // llmodel.py:775-776 bh_new(sizedescr): plain malloc, no vtable.
-        let descr = majit_ir::descr::make_size_descr_full(0, descr_size, descr_index);
-        let sd = descr
-            .as_size_descr()
-            .expect("synthesized SizeDescr must implement SizeDescr");
+        let _ = descr_index;
+        let bh_descr = majit_codewriter::jitcode::BhDescr::Field {
+            offset: descr_size,
+            name: String::new(),
+            owner: String::new(),
+        };
         let (driver, _) = driver_pair();
-        driver.meta_interp().backend().bh_new(sd)
+        driver.meta_interp().backend().bh_new(&bh_descr)
     }
 
     fn allocate_with_vtable(&self, descr_index: u32, descr_size: usize) -> i64 {
@@ -3992,12 +4006,13 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
                 Box::into_raw(obj) as i64
             }
             _ => {
-                let descr = majit_ir::descr::make_size_descr_full(0, descr_size, descr_index);
-                let sd = descr
-                    .as_size_descr()
-                    .expect("synthesized SizeDescr must implement SizeDescr");
+                let bh_descr = majit_codewriter::jitcode::BhDescr::Field {
+                    offset: descr_size,
+                    name: String::new(),
+                    owner: String::new(),
+                };
                 let (driver, _) = driver_pair();
-                driver.meta_interp().backend().bh_new_with_vtable(sd)
+                driver.meta_interp().backend().bh_new_with_vtable(&bh_descr)
             }
         }
     }

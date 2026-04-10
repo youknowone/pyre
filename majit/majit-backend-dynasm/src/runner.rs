@@ -736,8 +736,8 @@ impl Backend for DynasmBackend {
         descr.done_compiling();
     }
 
-    fn bh_new(&self, sizedescr: &dyn majit_ir::SizeDescr) -> i64 {
-        let size = sizedescr.size();
+    fn bh_new(&self, sizedescr: &majit_codewriter::jitcode::BhDescr) -> i64 {
+        let size = sizedescr.as_offset();
         let ptr = unsafe { libc::malloc(size) };
         if !ptr.is_null() {
             unsafe { libc::memset(ptr, 0, size) };
@@ -745,18 +745,15 @@ impl Backend for DynasmBackend {
         ptr as i64
     }
 
-    fn bh_new_with_vtable(&self, sizedescr: &dyn majit_ir::SizeDescr) -> i64 {
-        let size = sizedescr.size();
-        let vtable = sizedescr.vtable();
+    fn bh_new_with_vtable(&self, sizedescr: &majit_codewriter::jitcode::BhDescr) -> i64 {
+        let size = sizedescr.as_offset();
         let ptr = unsafe { libc::malloc(size) };
         if !ptr.is_null() {
             unsafe {
                 libc::memset(ptr, 0, size);
                 // llmodel.py:778-782 bh_new_with_vtable: write_int_at_mem(
                 //     res, self.vtable_offset, WORD, sizedescr.get_vtable())
-                if let Some(off) = self.vtable_offset {
-                    *((ptr as *mut u8).add(off) as *mut usize) = vtable;
-                }
+                // TODO: vtable from BhDescr when available
             }
         }
         ptr as i64
@@ -769,20 +766,42 @@ impl Backend for DynasmBackend {
         self.lookup_typeid_from_classptr(classptr)
     }
 
-    fn bh_setfield_gc_i(&self, struct_ptr: i64, offset: usize, value: i64) {
-        unsafe { *((struct_ptr as *mut u8).add(offset) as *mut i64) = value };
-    }
-
-    fn bh_setfield_gc_r(&self, struct_ptr: i64, offset: usize, value: GcRef) {
-        unsafe { *((struct_ptr as *mut u8).add(offset) as *mut usize) = value.0 };
-    }
-
-    fn bh_getfield_gc_i(&self, struct_ptr: i64, offset: usize) -> i64 {
+    fn bh_getfield_gc_i(
+        &self,
+        struct_ptr: i64,
+        fielddescr: &majit_codewriter::jitcode::BhDescr,
+    ) -> i64 {
+        let offset = fielddescr.as_offset();
         unsafe { *((struct_ptr as *const u8).add(offset) as *const i64) }
     }
 
-    fn bh_getfield_gc_r(&self, struct_ptr: i64, offset: usize) -> GcRef {
+    fn bh_getfield_gc_r(
+        &self,
+        struct_ptr: i64,
+        fielddescr: &majit_codewriter::jitcode::BhDescr,
+    ) -> GcRef {
+        let offset = fielddescr.as_offset();
         GcRef(unsafe { *((struct_ptr as *const u8).add(offset) as *const usize) })
+    }
+
+    fn bh_setfield_gc_i(
+        &self,
+        struct_ptr: i64,
+        value: i64,
+        fielddescr: &majit_codewriter::jitcode::BhDescr,
+    ) {
+        let offset = fielddescr.as_offset();
+        unsafe { *((struct_ptr as *mut u8).add(offset) as *mut i64) = value };
+    }
+
+    fn bh_setfield_gc_r(
+        &self,
+        struct_ptr: i64,
+        value: GcRef,
+        fielddescr: &majit_codewriter::jitcode::BhDescr,
+    ) {
+        let offset = fielddescr.as_offset();
+        unsafe { *((struct_ptr as *mut u8).add(offset) as *mut usize) = value.0 };
     }
 
     /// compile_tmp_callback parity: register a placeholder for a pending

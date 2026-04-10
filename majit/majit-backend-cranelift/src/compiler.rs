@@ -11104,44 +11104,28 @@ impl majit_backend::Backend for CraneliftBackend {
     }
 
     /// llmodel.py:775 bh_new(sizedescr) → gc_ll_descr.gc_malloc(sizedescr).
-    fn bh_new(&self, sizedescr: &dyn majit_ir::SizeDescr) -> i64 {
-        let size = sizedescr.size();
-        let type_id = sizedescr.type_id();
+    fn bh_new(&self, sizedescr: &majit_codewriter::jitcode::BhDescr) -> i64 {
+        let size = sizedescr.as_offset();
         let Some(runtime_id) = self.gc_runtime_id else {
             let layout = std::alloc::Layout::from_size_align(size, 8)
                 .unwrap_or(std::alloc::Layout::new::<u8>());
             return unsafe { std::alloc::alloc_zeroed(layout) as i64 };
         };
-        with_gc_runtime(runtime_id, |gc| {
-            gc.alloc_nursery_typed(type_id, size).0 as i64
-        })
+        with_gc_runtime(runtime_id, |gc| gc.alloc_nursery_typed(0, size).0 as i64)
     }
 
     /// llmodel.py:778-782 bh_new_with_vtable(sizedescr).
     /// gc_malloc(sizedescr) + write vtable at vtable_offset.
-    fn bh_new_with_vtable(&self, sizedescr: &dyn majit_ir::SizeDescr) -> i64 {
-        let size = sizedescr.size();
-        let type_id = sizedescr.type_id();
-        let vtable = sizedescr.vtable();
+    fn bh_new_with_vtable(&self, sizedescr: &majit_codewriter::jitcode::BhDescr) -> i64 {
+        let size = sizedescr.as_offset();
         let Some(runtime_id) = self.gc_runtime_id else {
             let layout = std::alloc::Layout::from_size_align(size, 8)
                 .unwrap_or(std::alloc::Layout::new::<u8>());
             let ptr = unsafe { std::alloc::alloc_zeroed(layout) as *mut u8 };
-            if !ptr.is_null() {
-                if let Some(off) = self.vtable_offset {
-                    unsafe { *((ptr.add(off)) as *mut usize) = vtable };
-                }
-            }
+            // TODO: vtable from BhDescr when available
             return ptr as i64;
         };
-        let ptr = with_gc_runtime(runtime_id, |gc| {
-            gc.alloc_nursery_typed(type_id, size).0 as i64
-        });
-        if ptr != 0 {
-            if let Some(off) = self.vtable_offset {
-                unsafe { *((ptr as *mut u8).add(off) as *mut usize) = vtable };
-            }
-        }
+        let ptr = with_gc_runtime(runtime_id, |gc| gc.alloc_nursery_typed(0, size).0 as i64);
         ptr
     }
 
