@@ -1245,7 +1245,12 @@ impl OptVirtualize {
                 {
                     entry.2 = value_ref;
                 } else {
-                    let _ = vinfo.write_value(store_offset, 8, value_ref, 0);
+                    let _ = vinfo.write_value(
+                        store_offset,
+                        8,
+                        value_ref,
+                        crate::optimizeopt::info::RawBufferDescr::default(),
+                    );
                 }
                 return OptimizationResult::Remove;
             }

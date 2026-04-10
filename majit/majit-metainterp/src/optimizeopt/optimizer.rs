@@ -397,12 +397,12 @@ impl Optimizer {
             } => {
                 let imported_entries = entries
                     .iter()
-                    .map(|(offset, length, entry_info)| {
+                    .map(|(offset, length, entry_info, descr)| {
                         (
                             *offset,
                             *length,
                             Self::import_virtual_state_value(entry_info, ctx),
-                            0u8,
+                            *descr,
                         )
                     })
                     .collect();
@@ -864,7 +864,7 @@ impl Optimizer {
                 let opref = ctx.alloc_op_position();
                 let imported_entries = entries
                     .iter()
-                    .map(|(offset, length, entry_info)| {
+                    .map(|(offset, length, entry_info, descr)| {
                         (
                             *offset,
                             *length,
@@ -875,7 +875,7 @@ impl Optimizer {
                                 ctx,
                                 walk_visited,
                             ),
-                            0u8,
+                            *descr,
                         )
                     })
                     .collect();

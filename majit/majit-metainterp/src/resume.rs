@@ -674,7 +674,7 @@ impl ResumeVirtualLayoutSummary {
                 entries: entries
                     .iter()
                     .map(|(offset, size_in_bytes, source)| {
-                        (*offset, *size_in_bytes, source.to_resume_source())
+                        (*offset, *size_in_bytes, source.to_resume_source(), 1u8) // default int
                     })
                     .collect(),
             },
@@ -1197,8 +1197,9 @@ pub enum VirtualInfo {
     VRawBuffer {
         /// Size of the buffer in bytes.
         size: usize,
-        /// Values stored at byte offsets: (offset, size_in_bytes, source).
-        entries: Vec<(usize, usize, VirtualFieldSource)>,
+        /// resume.py:698 self.descrs — per-entry (offset, size, source, kind).
+        /// kind: 0=ref, 1=int, 2=float (from ArrayDescr flags).
+        entries: Vec<(usize, usize, VirtualFieldSource, u8)>,
     },
     /// resume.py: VRawSliceInfo — a slice into a virtual raw buffer.
     VRawSlice {
@@ -1310,7 +1311,7 @@ impl VirtualInfo {
                 .flat_map(|el| el.iter().map(|(_, src)| src))
                 .collect(),
             VirtualInfo::VRawBuffer { entries, .. } => {
-                entries.iter().map(|(_, _, src)| src).collect()
+                entries.iter().map(|(_, _, src, _)| src).collect()
             }
             VirtualInfo::VRawSlice { parent, .. } => vec![parent],
             VirtualInfo::VStrPlain { chars } | VirtualInfo::VUniPlain { chars } => {
@@ -1419,7 +1420,7 @@ impl VirtualInfo {
                 size: *size,
                 entries: entries
                     .iter()
-                    .map(|(offset, size_in_bytes, source)| {
+                    .map(|(offset, size_in_bytes, source, _)| {
                         (*offset, *size_in_bytes, source.layout_summary())
                     })
                     .collect(),
@@ -1591,17 +1592,21 @@ pub fn rd_virtual_to_virtual_info(
             }
         }
         majit_ir::RdVirtualInfo::VRawBufferInfo {
+            func: _,
             size,
             offsets,
             entry_sizes,
+            entry_types,
             fieldnums,
-            ..
         } => {
             let entries = offsets
                 .iter()
                 .zip(entry_sizes.iter())
+                .zip(entry_types.iter())
                 .zip(fieldnums.iter())
-                .map(|((&off, &sz), &tagged)| (off, sz, tagged_to_source(tagged, consts, count)))
+                .map(|(((&off, &sz), &kind), &tagged)| {
+                    (off, sz, tagged_to_source(tagged, consts, count), kind)
+                })
                 .collect();
             VirtualInfo::VRawBuffer {
                 size: *size,
@@ -2430,7 +2435,7 @@ impl MaterializedVirtual {
             ) => {
                 *entries = src_entries
                     .iter()
-                    .map(|(off, sz, src)| {
+                    .map(|(off, sz, src, _)| {
                         (
                             *off,
                             *sz,
@@ -2684,7 +2689,7 @@ impl ResumeDataVirtualAdder {
     pub fn add_virtual_raw_buffer(
         &mut self,
         size: usize,
-        entries: Vec<(usize, usize, VirtualFieldSource)>,
+        entries: Vec<(usize, usize, VirtualFieldSource, u8)>,
     ) -> usize {
         self.add_virtual(VirtualInfo::VRawBuffer { size, entries })
     }
@@ -4660,8 +4665,13 @@ impl VirtualInfo {
             } => {
                 // resume.py:619 allocate_with_vtable(descr=self.descr)
                 // llmodel.py:780 sizedescr.get_vtable() → vtable pointer.
-                // known_class (info.py:318) carries the vtable from optimize_new_with_vtable.
-                let vtable = known_class.unwrap_or(0) as usize;
+                // RPython uses descr.get_vtable(); known_class is a fallback
+                // when descr is unavailable (pyre bridge path).
+                let vtable = descr
+                    .as_ref()
+                    .and_then(|d| d.as_size_descr())
+                    .map(|sd| sd.vtable())
+                    .unwrap_or_else(|| known_class.unwrap_or(0) as usize);
                 let obj = allocator.allocate_with_vtable(*type_id, *descr_size, vtable);
                 decoder.virtuals_cache.set_ptr(index, obj);
                 for (i, (field_descr, source)) in fields.iter().enumerate() {
@@ -4740,9 +4750,9 @@ impl VirtualInfo {
                 // resume.py:704
                 decoder.virtuals_cache.set_int(index, buffer);
                 // resume.py:705-708
-                for (offset, _size_bytes, source) in entries {
+                for (offset, _size_bytes, source, kind) in entries {
                     let value = decoder.decode_field_source(source);
-                    allocator.setrawbuffer_item(buffer, *offset, value, 0);
+                    allocator.setrawbuffer_item(buffer, *offset, value, *kind as u32);
                 }
                 buffer
             }
