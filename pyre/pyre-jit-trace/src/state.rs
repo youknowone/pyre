@@ -2256,11 +2256,49 @@ fn materialize_bridge_virtual(
         }
     }
 
-    // resume.py:643-760 dispatch by virtual kind. Pyre currently emits
-    // bridge materialization only for VirtualInfo (the W_IntObject /
-    // generic gc-struct case). Other variants (VStruct/VArray/VRawBuffer)
-    // would follow the same recipe — port them when a benchmark needs them.
+    // resume.py:612-760 dispatch by virtual kind.
+    // RPython: rd_virtuals[index].allocate(self, index) — polymorphic on
+    // the AbstractVirtualInfo subclass. Rust equivalent: match on
+    // RdVirtualInfo enum variant.
+
+    /// resume.py:591-603 AbstractVirtualStructInfo.setfields helper.
+    /// Walks fielddescrs in lock-step with fieldnums, decoding each
+    /// fieldnum and emitting SETFIELD_GC.
+    fn setfields(
+        ctx: &mut majit_metainterp::TraceCtx,
+        struct_op: OpRef,
+        fielddescrs: &[majit_ir::FieldDescrInfo],
+        fieldnums: &[i16],
+        rd_virtuals: Option<&[majit_ir::RdVirtualInfo]>,
+        resume_data: &majit_metainterp::ResumeDataResult,
+        cache: &mut std::collections::HashMap<usize, OpRef>,
+    ) {
+        for (fd_info, &fnum) in fielddescrs.iter().zip(fieldnums.iter()) {
+            if fnum == majit_ir::resumedata::UNINITIALIZED_TAG {
+                continue;
+            }
+            let value = decode_fieldnum(ctx, fnum, rd_virtuals, resume_data, cache);
+            if value.is_none() {
+                continue;
+            }
+            let signed = matches!(
+                fd_info.field_type,
+                majit_ir::Type::Int | majit_ir::Type::Float
+            );
+            let field_descr = crate::descr::make_field_descr(
+                fd_info.offset,
+                fd_info.field_size,
+                fd_info.field_type,
+                signed,
+            );
+            ctx.record_op_with_descr(OpCode::SetfieldGc, &[struct_op, value], field_descr.clone());
+            ctx.heap_cache_mut()
+                .setfield_cached(struct_op, fd_info.index, value);
+        }
+    }
+
     match entry {
+        // resume.py:612-621 VirtualInfo.allocate
         majit_ir::RdVirtualInfo::VirtualInfo {
             descr,
             fielddescrs,
@@ -2270,64 +2308,152 @@ fn materialize_bridge_virtual(
             let Some(size_descr) = descr.clone() else {
                 return OpRef::NONE;
             };
-            // resume.py:619-625 allocate_with_vtable + setfields.
-            // jtransform.py:908-911: rewrite_op_setfield skips typeptr field —
-            // NEW_WITH_VTABLE writes ob_type during GC rewrite.
+            // resume.py:619 decoder.allocate_with_vtable(descr=self.descr)
             let new_op = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], size_descr);
             ctx.heap_cache_mut().new_object(new_op);
-            // resume.py:654 cache BEFORE filling — recursive/shared virtuals
-            // may reference this vidx during element decoding.
+            // resume.py:620 decoder.virtuals_cache.set_ptr(index, struct)
             cache.insert(vidx, new_op);
-
-            // Walk fielddescrs in lock-step with fieldnums to emit per-field
-            // SETFIELD_GC ops. The encoder side (optimizer's
-            // make_rd_virtual_info) filters out the typeptr field, so the
-            // length of fielddescrs already excludes it.
-            for (fd_info, &fnum) in fielddescrs.iter().zip(fieldnums.iter()) {
-                let value = decode_fieldnum(ctx, fnum, rd_virtuals, resume_data, cache);
-                if value.is_none() {
-                    continue;
-                }
-                // Reconstruct a fresh PyreFieldDescr from the FieldDescrInfo.
-                // The original DescrRef was lost when rd_virtuals serialized
-                // (only `index, offset, field_size, field_type` survive),
-                // but for SETFIELD_GC the runtime semantics depend solely
-                // on offset/size/type — immutable/signed only affect
-                // optimizer hints which can be re-derived per-bridge.
-                let signed = matches!(
-                    fd_info.field_type,
-                    majit_ir::Type::Int | majit_ir::Type::Float
-                );
-                let field_descr = crate::descr::make_field_descr(
-                    fd_info.offset,
-                    fd_info.field_size,
-                    fd_info.field_type,
-                    signed,
-                );
-                ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, value], field_descr.clone());
-                ctx.heap_cache_mut()
-                    .setfield_cached(new_op, fd_info.index, value);
-            }
-
+            // resume.py:621 self.setfields(decoder, struct)
+            setfields(
+                ctx,
+                new_op,
+                fielddescrs,
+                fieldnums,
+                rd_virtuals,
+                resume_data,
+                cache,
+            );
             if majit_metainterp::majit_log_enabled() {
                 eprintln!(
-                    "[jit][bridge-virtual] vidx={} → OpRef({}) (n_fields={})",
-                    vidx,
-                    new_op.0,
-                    fielddescrs.len(),
+                    "[jit][bridge-virtual] vidx={} VirtualInfo → OpRef({})",
+                    vidx, new_op.0,
                 );
             }
             new_op
         }
-        _ => {
+        // resume.py:628-637 VStructInfo.allocate
+        majit_ir::RdVirtualInfo::VStructInfo {
+            typedescr,
+            fielddescrs,
+            fieldnums,
+            ..
+        } => {
+            let Some(struct_descr) = typedescr.clone() else {
+                return OpRef::NONE;
+            };
+            // resume.py:635 decoder.allocate_struct(self.typedescr)
+            let new_op = ctx.record_op_with_descr(OpCode::New, &[], struct_descr);
+            ctx.heap_cache_mut().new_object(new_op);
+            // resume.py:636 decoder.virtuals_cache.set_ptr(index, struct)
+            cache.insert(vidx, new_op);
+            // resume.py:637 self.setfields(decoder, struct)
+            setfields(
+                ctx,
+                new_op,
+                fielddescrs,
+                fieldnums,
+                rd_virtuals,
+                resume_data,
+                cache,
+            );
             if majit_metainterp::majit_log_enabled() {
                 eprintln!(
-                    "[jit][bridge-virtual] unsupported variant for vidx={}, abort",
+                    "[jit][bridge-virtual] vidx={} VStructInfo → OpRef({})",
+                    vidx, new_op.0,
+                );
+            }
+            new_op
+        }
+        // resume.py:649-671 AbstractVArrayInfo.allocate (clear=True or False)
+        majit_ir::RdVirtualInfo::VArrayInfoClear { fieldnums, .. }
+        | majit_ir::RdVirtualInfo::VArrayInfoNotClear { fieldnums, .. } => {
+            let clear = matches!(entry, majit_ir::RdVirtualInfo::VArrayInfoClear { .. });
+            let length = fieldnums.len();
+            let len_ref = ctx.const_int(length as i64);
+            // resume.py:653 decoder.allocate_array(length, arraydescr, self.clear)
+            let alloc_opcode = if clear {
+                OpCode::NewArrayClear
+            } else {
+                OpCode::NewArray
+            };
+            // Note: arraydescr is not carried on the serialized RdVirtualInfo;
+            // pyre uses a generic pyobject_array_descr for GC-ref arrays.
+            let array_descr = pyobject_array_descr();
+            let new_op = ctx.record_op_with_descr(alloc_opcode, &[len_ref], array_descr.clone());
+            ctx.heap_cache_mut().new_object(new_op);
+            // resume.py:654 decoder.virtuals_cache.set_ptr(index, array)
+            cache.insert(vidx, new_op);
+            // resume.py:656-670 element loop: dispatch by arraydescr kind
+            for (i, &fnum) in fieldnums.iter().enumerate() {
+                if fnum == majit_ir::resumedata::UNINITIALIZED_TAG {
+                    continue;
+                }
+                let value = decode_fieldnum(ctx, fnum, rd_virtuals, resume_data, cache);
+                if value.is_none() {
+                    continue;
+                }
+                let idx_ref = ctx.const_int(i as i64);
+                // resume.py:660 decoder.setarrayitem_ref(array, i, num, arraydescr)
+                ctx.record_op_with_descr(
+                    OpCode::SetarrayitemGc,
+                    &[new_op, idx_ref, value],
+                    array_descr.clone(),
+                );
+            }
+            if majit_metainterp::majit_log_enabled() {
+                eprintln!(
+                    "[jit][bridge-virtual] vidx={} VArrayInfo(clear={}) → OpRef({})",
+                    vidx, clear, new_op.0,
+                );
+            }
+            new_op
+        }
+        // resume.py:747-760 VArrayStructInfo.allocate
+        majit_ir::RdVirtualInfo::VArrayStructInfo {
+            size, fieldnums, ..
+        } => {
+            let len_ref = ctx.const_int(*size as i64);
+            let array_descr = pyobject_array_descr();
+            // resume.py:749 decoder.allocate_array(self.size, self.arraydescr, clear=True)
+            let new_op =
+                ctx.record_op_with_descr(OpCode::NewArrayClear, &[len_ref], array_descr.clone());
+            ctx.heap_cache_mut().new_object(new_op);
+            cache.insert(vidx, new_op);
+            // resume.py:752-759 nested loop over elements × fields
+            // Simplified: decode all fieldnums sequentially
+            for &fnum in fieldnums.iter() {
+                if fnum == majit_ir::resumedata::UNINITIALIZED_TAG {
+                    continue;
+                }
+                // Decode but don't emit setinteriorfield — pyre doesn't have
+                // interior field ops yet. The decode still recurses into
+                // nested virtuals so the cache is properly populated.
+                let _value = decode_fieldnum(ctx, fnum, rd_virtuals, resume_data, cache);
+            }
+            if majit_metainterp::majit_log_enabled() {
+                eprintln!(
+                    "[jit][bridge-virtual] vidx={} VArrayStructInfo → OpRef({})",
+                    vidx, new_op.0,
+                );
+            }
+            new_op
+        }
+        // resume.py:700-709 VRawBufferInfo.allocate_int — int-typed virtual
+        // resume.py:722-728 VRawSliceInfo.allocate_int — int-typed virtual
+        // These produce raw int values, not GC-ref pointers.
+        // Bridge trace materialization for raw buffers requires CALL_I
+        // infrastructure not yet ported; log and return NONE.
+        majit_ir::RdVirtualInfo::VRawBufferInfo { .. }
+        | majit_ir::RdVirtualInfo::VRawSliceInfo { .. } => {
+            if majit_metainterp::majit_log_enabled() {
+                eprintln!(
+                    "[jit][bridge-virtual] vidx={} raw buffer/slice (int-typed, not yet ported)",
                     vidx
                 );
             }
             OpRef::NONE
         }
+        majit_ir::RdVirtualInfo::Empty => OpRef::NONE,
     }
 }
 
