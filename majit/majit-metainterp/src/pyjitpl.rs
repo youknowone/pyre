@@ -3182,15 +3182,8 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.constant_types = constant_types.clone();
         optimizer.numbering_type_overrides = numbering_overrides;
         // history.py:_make_op parity: every InputArg carries its type
-        // (IntFrontendOp / RefFrontendOp / FloatFrontendOp) from the
-        // moment it was wrapped in `warmstate.py:wrap`. The optimizer
-        // reads `box.type` directly. majit's recorder mirrors this:
-        // each `trace.inputargs[i].tp` already records the kind, so we
-        // propagate the raw recorder types to the optimizer without
-        // further reconciliation. Function-entry recording goes
-        // through `JitState::extract_live_values_for_entry` so the
-        // recorder sees Int / Float for unboxed Python locals from the
-        // start.
+        // from the recorder. Propagate those raw recorder types to the
+        // optimizer without further reconciliation.
         let inputarg_types: Vec<majit_ir::Type> = trace.inputargs.iter().map(|ia| ia.tp).collect();
         optimizer.trace_inputarg_types = inputarg_types.clone();
         for (i, &tp) in inputarg_types.iter().enumerate() {

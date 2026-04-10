@@ -574,3 +574,62 @@ pub fn rebuild_from_numbering(
     }
     (num_failargs, vable_values, vref_values, frames)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::resoperation::BoxEnv;
+
+    struct TestEnv;
+
+    impl BoxEnv for TestEnv {
+        fn get_box_replacement(&self, opref: OpRef) -> OpRef {
+            opref
+        }
+
+        fn is_const(&self, _opref: OpRef) -> bool {
+            false
+        }
+
+        fn get_const(&self, _opref: OpRef) -> (i64, Type) {
+            unreachable!("test env has no const boxes")
+        }
+
+        fn get_type(&self, _opref: OpRef) -> Type {
+            Type::Ref
+        }
+
+        fn is_virtual_ref(&self, _opref: OpRef) -> bool {
+            false
+        }
+
+        fn is_virtual_raw(&self, _opref: OpRef) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn number_virtualizable_boxes_share_livebox_identity_with_frames() {
+        let shared = OpRef(7);
+        let snapshot = Snapshot {
+            vable_array: vec![shared],
+            vref_array: Vec::new(),
+            framestack: vec![SnapshotFrame {
+                jitcode_index: 0,
+                pc: 0,
+                boxes: vec![shared],
+            }],
+        };
+
+        let mut memo = ResumeDataLoopMemo::new();
+        let numb_state = memo.number(&snapshot, &TestEnv).unwrap();
+        let numbering = numb_state.create_numbering();
+        let (_, vable_values, _, frames) =
+            rebuild_from_numbering(&numbering, memo.consts(), &[Type::Ref, Type::Ref], None);
+
+        assert_eq!(numb_state.num_boxes, 1);
+        assert_eq!(vable_values, vec![RebuiltValue::Box(0, Type::Ref)]);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].values, vec![RebuiltValue::Box(0, Type::Ref)]);
+    }
+}
