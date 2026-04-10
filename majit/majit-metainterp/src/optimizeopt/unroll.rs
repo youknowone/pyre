@@ -386,9 +386,13 @@ impl UnrollOptimizer {
                             .collect();
                     }
                     // Export Phase 1's heap cache for Phase 2.
-                    if let Some(c) = opt_p1.final_ctx.as_ref() {
-                        state.preamble_heap_cache = opt_p1.export_all_cached_fields(c);
-                        state.preamble_heap_array_cache = opt_p1.export_all_cached_arrayitems(c);
+                    // Temporarily take ctx out to avoid borrow conflict between
+                    // &mut final_ctx and &self.passes in export_all_*.
+                    if let Some(mut final_ctx) = opt_p1.final_ctx.take() {
+                        state.preamble_heap_cache = opt_p1.export_all_cached_fields(&mut final_ctx);
+                        state.preamble_heap_array_cache =
+                            opt_p1.export_all_cached_arrayitems(&mut final_ctx);
+                        opt_p1.final_ctx = Some(final_ctx);
                     }
                     // opencoder.py:271 _index parity: Phase 2's TraceIterator
                     // must allocate fresh boxes ABOVE Phase 1's high water
@@ -3290,7 +3294,12 @@ impl OptUnroll {
                     // heap import still routes ConstPtr preamble fields via
                     // const_infos before the full ConstPtrInfo.setfield port
                     // lands.
-                    if let Some(info) = ctx.get_const_info_mut(obj_resolved) {
+                    let parent_descr = getfield_op
+                        .descr
+                        .as_ref()
+                        .and_then(|d| d.as_field_descr())
+                        .and_then(|fd| fd.get_parent_descr());
+                    if let Some(info) = ctx.get_const_info_mut(obj_resolved, parent_descr) {
                         info.set_preamble_field(descr_idx, pop.clone());
                     }
                     let mut struct_info = ctx.ensure_ptr_info_arg0(&getfield_op);
@@ -3363,20 +3372,31 @@ impl OptUnroll {
                         &[obj_resolved, index_const],
                     );
                     getarrayitem_op.descr = Some(descr.clone());
-                    let mut array_info = ctx.ensure_ptr_info_arg0(&getarrayitem_op);
-                    if let Some(crate::optimizeopt::info::PtrInfo::Array(info)) =
-                        array_info.as_mut()
-                    {
-                        let _ = info.lenbound.make_gt_const(index as i64);
-                        if index as usize >= info.items.len() {
-                            info.items.resize(index as usize + 1, OpRef::NONE);
+                    let pop = crate::optimizeopt::info::PreambleOp {
+                        op: source,
+                        resolved: value,
+                        invented_name,
+                    };
+                    if obj_resolved.is_constant() || ctx.get_constant(obj_resolved).is_some() {
+                        if let Some(info) =
+                            ctx.get_const_info_array_mut(obj_resolved, descr.clone())
+                        {
+                            info.set_preamble_item(index as usize, pop.clone());
                         }
-                        info.items[index as usize] = value;
+                    } else {
+                        let mut array_info = ctx.ensure_ptr_info_arg0(&getarrayitem_op);
+                        if let Some(info) = array_info.as_mut() {
+                            if let crate::optimizeopt::info::PtrInfo::Array(array_info) = info {
+                                let _ = array_info.lenbound.make_gt_const(index as i64);
+                                array_info
+                                    .preamble_items
+                                    .retain(|(k, _)| *k != index as usize);
+                                array_info
+                                    .preamble_items
+                                    .push((index as usize, pop.clone()));
+                            }
+                        }
                     }
-                    ctx.imported_short_arrayitems
-                        .insert((obj_resolved, descr_idx, index), value);
-                    ctx.imported_short_arrayitem_descrs
-                        .insert((obj_resolved, descr_idx, index), descr.clone());
                     ctx.imported_short_sources
                         .push(crate::optimizeopt::ImportedShortSource {
                             result: value,

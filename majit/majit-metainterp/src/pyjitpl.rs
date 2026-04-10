@@ -3476,11 +3476,13 @@ impl<M: Clone> MetaInterp<M> {
                             result.insert(fi, knowledge.clone());
                         }
                     }
-                    let end_knowledge = optimizer
-                        .final_ctx
-                        .as_ref()
-                        .map(|c| optimizer.serialize_optimizer_knowledge(c))
-                        .unwrap_or_default();
+                    let end_knowledge = if let Some(mut fc) = optimizer.final_ctx.take() {
+                        let k = optimizer.serialize_optimizer_knowledge(&mut fc);
+                        optimizer.final_ctx = Some(fc);
+                        k
+                    } else {
+                        OptimizerKnowledge::default()
+                    };
                     for (_, k) in result.iter_mut() {
                         if k.known_classes.is_empty() {
                             k.known_classes = end_knowledge.known_classes.clone();
@@ -3806,11 +3808,13 @@ impl<M: Clone> MetaInterp<M> {
                             result.insert(fi, knowledge.clone());
                         }
                     }
-                    let end_knowledge = optimizer
-                        .final_ctx
-                        .as_ref()
-                        .map(|c| optimizer.serialize_optimizer_knowledge(c))
-                        .unwrap_or_default();
+                    let end_knowledge = if let Some(mut fc) = optimizer.final_ctx.take() {
+                        let k = optimizer.serialize_optimizer_knowledge(&mut fc);
+                        optimizer.final_ctx = Some(fc);
+                        k
+                    } else {
+                        OptimizerKnowledge::default()
+                    };
                     for (_, k) in result.iter_mut() {
                         if k.known_classes.is_empty() {
                             k.known_classes = end_knowledge.known_classes.clone();

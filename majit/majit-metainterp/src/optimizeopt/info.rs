@@ -494,6 +494,7 @@ impl PtrInfo {
             descr,
             lenbound,
             items: Vec::new(),
+            preamble_items: Vec::new(),
             last_guard_pos: -1,
         })
     }
@@ -1357,6 +1358,16 @@ impl PtrInfo {
         }
     }
 
+    /// shortpreamble.py:80-85 stores `PreambleOp` in array `_items[index]`.
+    /// Rust keeps these separate from `items` for the same reason as fields:
+    /// `PreambleOp` is not an `OpRef`.
+    pub fn set_preamble_item(&mut self, index: usize, pop: PreambleOp) {
+        if let PtrInfo::Array(v) = self {
+            v.preamble_items.retain(|(k, _)| *k != index);
+            v.preamble_items.push((index, pop));
+        }
+    }
+
     /// heap.py:177-187: CachedField._getfield detects PreambleOp in _fields.
     /// Returns and removes the PreambleOp if present for this field.
     /// RPython: `isinstance(res, PreambleOp)` check in _getfield.
@@ -1372,6 +1383,21 @@ impl PtrInfo {
             PtrInfo::Struct(v) => {
                 if let Some(pos) = v.preamble_fields.iter().position(|(k, _)| *k == field_idx) {
                     Some(v.preamble_fields.remove(pos).1)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// heap.py:238-250: ArrayCachedItem._getfield detects `PreambleOp` in
+    /// `_items[index]`, forces it, and writes the resolved result back.
+    pub fn take_preamble_item(&mut self, index: usize) -> Option<PreambleOp> {
+        match self {
+            PtrInfo::Array(v) => {
+                if let Some(pos) = v.preamble_items.iter().position(|(k, _)| *k == index) {
+                    Some(v.preamble_items.remove(pos).1)
                 } else {
                     None
                 }
@@ -1506,6 +1532,7 @@ impl PtrInfo {
                 if index < v.items.len() {
                     v.items[index] = OpRef::NONE;
                 }
+                v.preamble_items.retain(|(k, _)| *k != index);
             }
             PtrInfo::VirtualArray(v) => {
                 if index < v.items.len() {
@@ -1729,6 +1756,9 @@ pub struct ArrayPtrInfo {
     pub lenbound: IntBound,
     /// Cached item values for constant indices.
     pub items: Vec<OpRef>,
+    /// shortpreamble.py:11-49: PreambleOp wrappers stored during Phase 2
+    /// import for constant-index array reads.
+    pub preamble_items: Vec<(usize, PreambleOp)>,
     /// info.py:91-92
     pub last_guard_pos: i32,
 }
