@@ -387,6 +387,24 @@ impl std::fmt::Display for SwitchDictDescr {
     }
 }
 
+/// RPython `descr.py:450` CallDescr — describes calling convention for
+/// `bh_call_*`. `arg_classes` is a string of 'i','r','f' per argument.
+/// `result_type` is 'i','r','f','v'.
+#[derive(Debug, Clone)]
+pub struct BhCallDescr {
+    pub arg_classes: String,
+    pub result_type: char,
+}
+
+impl Default for BhCallDescr {
+    fn default() -> Self {
+        Self {
+            arg_classes: String::new(),
+            result_type: 'v',
+        }
+    }
+}
+
 /// RPython `history.py:AbstractDescr` — base class for all descriptor
 /// objects stored in the assembler's `descrs` list. Read at runtime via
 /// 'd'/'j' argcodes in the blackhole interpreter.
@@ -412,7 +430,7 @@ pub enum BhDescr {
     Array { itemsize: usize },
     /// Call descriptor: for residual_call. Carries calling convention.
     /// RPython: `CallDescr`.
-    Call,
+    Call { calldescr: BhCallDescr },
     /// JitCode descriptor: for inline_call_*.
     /// RPython: `JitCode(AbstractDescr)` — carries `fnaddr` + `calldescr`.
     /// `jitcode_index` indexes into `all_jitcodes[]` (set by CodeWriter).
@@ -423,6 +441,8 @@ pub enum BhDescr {
         jitcode_index: usize,
         /// Function address for cpu.bh_call_*. Resolved at runtime.
         fnaddr: i64,
+        /// CallDescr for cpu.bh_call_* dispatch.
+        calldescr: BhCallDescr,
     },
     /// SwitchDictDescr: maps int values to bytecode positions.
     Switch {
@@ -491,6 +511,15 @@ impl BhDescr {
         match self {
             BhDescr::JitCode { fnaddr, .. } => *fnaddr,
             _ => 0,
+        }
+    }
+
+    /// Extract calldescr from Call or JitCode descriptor.
+    pub fn as_calldescr(&self) -> &BhCallDescr {
+        match self {
+            BhDescr::Call { calldescr } => calldescr,
+            BhDescr::JitCode { calldescr, .. } => calldescr,
+            _ => panic!("BhDescr::as_calldescr called on {:?}", self),
         }
     }
 

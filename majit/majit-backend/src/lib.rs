@@ -1243,20 +1243,49 @@ pub trait Backend: Send {
     fn bh_newstr(&self, _length: i64) -> i64 {
         0
     }
-    /// model.py: bh_call_i(func_ptr, args, calldescr)
-    fn bh_call_i(&self, _func_ptr: i64, _args: &[i64]) -> i64 {
+    /// model.py:266 bh_call_i(func, args_i, args_r, args_f, calldescr)
+    fn bh_call_i(
+        &self,
+        _func: i64,
+        _args_i: Option<&[i64]>,
+        _args_r: Option<&[i64]>,
+        _args_f: Option<&[i64]>,
+        _calldescr: &majit_codewriter::jitcode::BhCallDescr,
+    ) -> i64 {
         0
     }
-    /// model.py: bh_call_r(func_ptr, args, calldescr)
-    fn bh_call_r(&self, _func_ptr: i64, _args: &[i64]) -> GcRef {
+    /// model.py:268 bh_call_r(func, args_i, args_r, args_f, calldescr)
+    fn bh_call_r(
+        &self,
+        _func: i64,
+        _args_i: Option<&[i64]>,
+        _args_r: Option<&[i64]>,
+        _args_f: Option<&[i64]>,
+        _calldescr: &majit_codewriter::jitcode::BhCallDescr,
+    ) -> GcRef {
         GcRef::NULL
     }
-    /// model.py: bh_call_f(func_ptr, args, calldescr)
-    fn bh_call_f(&self, _func_ptr: i64, _args: &[i64]) -> f64 {
+    /// model.py:270 bh_call_f(func, args_i, args_r, args_f, calldescr)
+    fn bh_call_f(
+        &self,
+        _func: i64,
+        _args_i: Option<&[i64]>,
+        _args_r: Option<&[i64]>,
+        _args_f: Option<&[i64]>,
+        _calldescr: &majit_codewriter::jitcode::BhCallDescr,
+    ) -> f64 {
         0.0
     }
-    /// model.py: bh_call_v(func_ptr, args, calldescr)
-    fn bh_call_v(&self, _func_ptr: i64, _args: &[i64]) {}
+    /// model.py:272 bh_call_v(func, args_i, args_r, args_f, calldescr)
+    fn bh_call_v(
+        &self,
+        _func: i64,
+        _args_i: Option<&[i64]>,
+        _args_r: Option<&[i64]>,
+        _args_f: Option<&[i64]>,
+        _calldescr: &majit_codewriter::jitcode::BhCallDescr,
+    ) {
+    }
 
     // ── model.py: additional bh_* helpers ──
 

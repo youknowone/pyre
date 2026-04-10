@@ -835,7 +835,7 @@ pub enum BhReturnType {
 /// Re-export BhDescr from codewriter::jitcode — shared descriptor type
 /// between codewriter assembler and blackhole interpreter.
 /// RPython `history.py:AbstractDescr` parity.
-pub use majit_codewriter::jitcode::BhDescr;
+pub use majit_codewriter::jitcode::{BhCallDescr, BhDescr};
 
 /// Signal from dispatch_one to run().
 ///
@@ -1071,12 +1071,12 @@ impl BlackholeInterpreter {
     ///   calldescr = jitdriver_sd.mainjitcode.calldescr
     ///   return fnptr, calldescr
     /// pyre: single jitdriver. Returns (fnptr_as_i64, calldescr=()).
-    pub fn get_portal_runner(&self, _jdindex: usize) -> (i64, ()) {
+    pub fn get_portal_runner(&self, _jdindex: usize) -> (i64, BhCallDescr) {
         let fnptr = self
             .portal_runner_ptr
             .map(|f| f as usize as i64)
             .unwrap_or(0);
-        (fnptr, ())
+        (fnptr, BhCallDescr::default())
     }
 
     /// Resolve field descriptor offsets in this interpreter's descrs table.
@@ -1102,6 +1102,7 @@ impl BlackholeInterpreter {
             if let BhDescr::JitCode {
                 jitcode_index,
                 fnaddr,
+                ..
             } = descr
             {
                 if *fnaddr == 0 {
@@ -2401,6 +2402,7 @@ impl BlackholeInterpBuilder {
             if let BhDescr::JitCode {
                 jitcode_index,
                 fnaddr,
+                ..
             } = descr
             {
                 if *fnaddr == 0 {
@@ -5213,6 +5215,7 @@ fn read_list_f(bh: &BlackholeInterpreter, code: &[u8], pos: usize) -> (Vec<i64>,
         .collect();
     (values, pos + 1 + count)
 }
+#[allow(dead_code)]
 fn flatten_args(a: &[i64], b: &[i64], c: &[i64]) -> Vec<i64> {
     let mut all = Vec::with_capacity(a.len() + b.len() + c.len());
     all.extend_from_slice(a);
@@ -5231,9 +5234,12 @@ fn handler_residual_call_irf_i(
     let (ai, p) = read_list_i(bh, code, position + 1);
     let (ar, p) = read_list_r(bh, code, p);
     let (af, p) = read_list_f(bh, code, p);
-    let (_, p) = read_descr_offset(bh, code, p);
-    let all = flatten_args(&ai, &ar, &af);
-    bh.registers_i[code[p] as usize] = bh.cpu.expect("cpu").bh_call_i(func, &all);
+    let (calldescr, p) = read_descr(bh, code, p);
+    let calldescr = calldescr.as_calldescr().clone();
+    bh.registers_i[code[p] as usize] =
+        bh.cpu
+            .expect("cpu")
+            .bh_call_i(func, Some(&ai), Some(&ar), Some(&af), &calldescr);
     Ok(p + 1)
 }
 fn handler_residual_call_irf_r(
@@ -5245,9 +5251,13 @@ fn handler_residual_call_irf_r(
     let (ai, p) = read_list_i(bh, code, position + 1);
     let (ar, p) = read_list_r(bh, code, p);
     let (af, p) = read_list_f(bh, code, p);
-    let (_, p) = read_descr_offset(bh, code, p);
-    let all = flatten_args(&ai, &ar, &af);
-    bh.registers_r[code[p] as usize] = bh.cpu.expect("cpu").bh_call_r(func, &all).0 as i64;
+    let (calldescr, p) = read_descr(bh, code, p);
+    let calldescr = calldescr.as_calldescr().clone();
+    bh.registers_r[code[p] as usize] = bh
+        .cpu
+        .expect("cpu")
+        .bh_call_r(func, Some(&ai), Some(&ar), Some(&af), &calldescr)
+        .0 as i64;
     Ok(p + 1)
 }
 fn handler_residual_call_irf_f(
@@ -5259,9 +5269,13 @@ fn handler_residual_call_irf_f(
     let (ai, p) = read_list_i(bh, code, position + 1);
     let (ar, p) = read_list_r(bh, code, p);
     let (af, p) = read_list_f(bh, code, p);
-    let (_, p) = read_descr_offset(bh, code, p);
-    let all = flatten_args(&ai, &ar, &af);
-    bh.registers_f[code[p] as usize] = bh.cpu.expect("cpu").bh_call_f(func, &all).to_bits() as i64;
+    let (calldescr, p) = read_descr(bh, code, p);
+    let calldescr = calldescr.as_calldescr().clone();
+    bh.registers_f[code[p] as usize] = bh
+        .cpu
+        .expect("cpu")
+        .bh_call_f(func, Some(&ai), Some(&ar), Some(&af), &calldescr)
+        .to_bits() as i64;
     Ok(p + 1)
 }
 fn handler_residual_call_irf_v(
@@ -5273,9 +5287,11 @@ fn handler_residual_call_irf_v(
     let (ai, p) = read_list_i(bh, code, position + 1);
     let (ar, p) = read_list_r(bh, code, p);
     let (af, p) = read_list_f(bh, code, p);
-    let (_, p) = read_descr_offset(bh, code, p);
-    let all = flatten_args(&ai, &ar, &af);
-    bh.cpu.expect("cpu").bh_call_v(func, &all);
+    let (calldescr, p) = read_descr(bh, code, p);
+    let calldescr = calldescr.as_calldescr().clone();
+    bh.cpu
+        .expect("cpu")
+        .bh_call_v(func, Some(&ai), Some(&ar), Some(&af), &calldescr);
     Ok(p)
 }
 // residual_call_ir_*
@@ -5287,9 +5303,12 @@ fn handler_residual_call_ir_i(
     let func = bh.registers_i[code[position] as usize];
     let (ai, p) = read_list_i(bh, code, position + 1);
     let (ar, p) = read_list_r(bh, code, p);
-    let (_, p) = read_descr_offset(bh, code, p);
-    let all = flatten_args(&ai, &ar, &[]);
-    bh.registers_i[code[p] as usize] = bh.cpu.expect("cpu").bh_call_i(func, &all);
+    let (calldescr, p) = read_descr(bh, code, p);
+    let calldescr = calldescr.as_calldescr().clone();
+    bh.registers_i[code[p] as usize] =
+        bh.cpu
+            .expect("cpu")
+            .bh_call_i(func, Some(&ai), Some(&ar), None, &calldescr);
     Ok(p + 1)
 }
 fn handler_residual_call_ir_r(
@@ -5300,9 +5319,13 @@ fn handler_residual_call_ir_r(
     let func = bh.registers_i[code[position] as usize];
     let (ai, p) = read_list_i(bh, code, position + 1);
     let (ar, p) = read_list_r(bh, code, p);
-    let (_, p) = read_descr_offset(bh, code, p);
-    let all = flatten_args(&ai, &ar, &[]);
-    bh.registers_r[code[p] as usize] = bh.cpu.expect("cpu").bh_call_r(func, &all).0 as i64;
+    let (calldescr, p) = read_descr(bh, code, p);
+    let calldescr = calldescr.as_calldescr().clone();
+    bh.registers_r[code[p] as usize] = bh
+        .cpu
+        .expect("cpu")
+        .bh_call_r(func, Some(&ai), Some(&ar), None, &calldescr)
+        .0 as i64;
     Ok(p + 1)
 }
 fn handler_residual_call_ir_v(
@@ -5313,9 +5336,11 @@ fn handler_residual_call_ir_v(
     let func = bh.registers_i[code[position] as usize];
     let (ai, p) = read_list_i(bh, code, position + 1);
     let (ar, p) = read_list_r(bh, code, p);
-    let (_, p) = read_descr_offset(bh, code, p);
-    let all = flatten_args(&ai, &ar, &[]);
-    bh.cpu.expect("cpu").bh_call_v(func, &all);
+    let (calldescr, p) = read_descr(bh, code, p);
+    let calldescr = calldescr.as_calldescr().clone();
+    bh.cpu
+        .expect("cpu")
+        .bh_call_v(func, Some(&ai), Some(&ar), None, &calldescr);
     Ok(p)
 }
 // residual_call_r_*
@@ -5326,8 +5351,12 @@ fn handler_residual_call_r_i(
 ) -> Result<usize, DispatchError> {
     let func = bh.registers_i[code[position] as usize];
     let (ar, p) = read_list_r(bh, code, position + 1);
-    let (_, p) = read_descr_offset(bh, code, p);
-    bh.registers_i[code[p] as usize] = bh.cpu.expect("cpu").bh_call_i(func, &ar);
+    let (calldescr, p) = read_descr(bh, code, p);
+    let calldescr = calldescr.as_calldescr().clone();
+    bh.registers_i[code[p] as usize] =
+        bh.cpu
+            .expect("cpu")
+            .bh_call_i(func, None, Some(&ar), None, &calldescr);
     Ok(p + 1)
 }
 fn handler_residual_call_r_r(
@@ -5337,8 +5366,13 @@ fn handler_residual_call_r_r(
 ) -> Result<usize, DispatchError> {
     let func = bh.registers_i[code[position] as usize];
     let (ar, p) = read_list_r(bh, code, position + 1);
-    let (_, p) = read_descr_offset(bh, code, p);
-    bh.registers_r[code[p] as usize] = bh.cpu.expect("cpu").bh_call_r(func, &ar).0 as i64;
+    let (calldescr, p) = read_descr(bh, code, p);
+    let calldescr = calldescr.as_calldescr().clone();
+    bh.registers_r[code[p] as usize] = bh
+        .cpu
+        .expect("cpu")
+        .bh_call_r(func, None, Some(&ar), None, &calldescr)
+        .0 as i64;
     Ok(p + 1)
 }
 fn handler_residual_call_r_v(
@@ -5348,8 +5382,11 @@ fn handler_residual_call_r_v(
 ) -> Result<usize, DispatchError> {
     let func = bh.registers_i[code[position] as usize];
     let (ar, p) = read_list_r(bh, code, position + 1);
-    let (_, p) = read_descr_offset(bh, code, p);
-    bh.cpu.expect("cpu").bh_call_v(func, &ar);
+    let (calldescr, p) = read_descr(bh, code, p);
+    let calldescr = calldescr.as_calldescr().clone();
+    bh.cpu
+        .expect("cpu")
+        .bh_call_v(func, None, Some(&ar), None, &calldescr);
     Ok(p)
 }
 
@@ -6360,10 +6397,12 @@ fn handler_conditional_call_ir_v(
     let func = bh.registers_i[code[p + 1] as usize];
     let (ai, p) = read_list_i(bh, code, p + 2);
     let (ar, p) = read_list_r(bh, code, p);
-    let (_, p) = read_descr_offset(bh, code, p);
+    let (calldescr, p) = read_descr(bh, code, p);
+    let calldescr = calldescr.as_calldescr().clone();
     if condition != 0 {
-        let all = flatten_args(&ai, &ar, &[]);
-        bh.cpu.expect("cpu").bh_call_v(func, &all);
+        bh.cpu
+            .expect("cpu")
+            .bh_call_v(func, Some(&ai), Some(&ar), None, &calldescr);
     }
     Ok(p)
 }
@@ -6376,10 +6415,13 @@ fn handler_conditional_call_value_ir_i(
     let func = bh.registers_i[code[p + 1] as usize];
     let (ai, p) = read_list_i(bh, code, p + 2);
     let (ar, p) = read_list_r(bh, code, p);
-    let (_, p) = read_descr_offset(bh, code, p);
+    let (calldescr, p) = read_descr(bh, code, p);
+    let calldescr = calldescr.as_calldescr().clone();
     if value == 0 {
-        let all = flatten_args(&ai, &ar, &[]);
-        value = bh.cpu.expect("cpu").bh_call_i(func, &all);
+        value = bh
+            .cpu
+            .expect("cpu")
+            .bh_call_i(func, Some(&ai), Some(&ar), None, &calldescr);
     }
     bh.registers_i[code[p] as usize] = value;
     Ok(p + 1)
@@ -6393,10 +6435,14 @@ fn handler_conditional_call_value_ir_r(
     let func = bh.registers_i[code[p + 1] as usize];
     let (ai, p) = read_list_i(bh, code, p + 2);
     let (ar, p) = read_list_r(bh, code, p);
-    let (_, p) = read_descr_offset(bh, code, p);
+    let (calldescr, p) = read_descr(bh, code, p);
+    let calldescr = calldescr.as_calldescr().clone();
     if value == 0 {
-        let all = flatten_args(&ai, &ar, &[]);
-        value = bh.cpu.expect("cpu").bh_call_r(func, &all).0 as i64;
+        value = bh
+            .cpu
+            .expect("cpu")
+            .bh_call_r(func, Some(&ai), Some(&ar), None, &calldescr)
+            .0 as i64;
     }
     bh.registers_r[code[p] as usize] = value;
     Ok(p + 1)
@@ -6927,24 +6973,29 @@ fn read_inline_call_jitcode(
     bh: &BlackholeInterpreter,
     code: &[u8],
     p: usize,
-) -> (usize, i64, usize) {
+) -> (usize, i64, BhCallDescr, usize) {
     let (jc_descr, p) = read_descr(bh, code, p);
-    let jitcode_index = jc_descr.as_jitcode_index();
-    let fnaddr = jc_descr.as_jitcode_fnaddr();
-    (jitcode_index, fnaddr, p)
+    match jc_descr {
+        BhDescr::JitCode {
+            jitcode_index,
+            fnaddr,
+            calldescr,
+        } => (*jitcode_index, *fnaddr, calldescr.clone(), p),
+        _ => panic!("expected JitCode descriptor"),
+    }
 }
 fn handler_inline_call_irf_i(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let (_jitcode_index, fnaddr, p) = read_inline_call_jitcode(bh, code, p);
+    let (_jitcode_index, fnaddr, calldescr, p) = read_inline_call_jitcode(bh, code, p);
     let (ai, p) = read_list_i(bh, code, p);
     let (ar, p) = read_list_r(bh, code, p);
     let (af, p) = read_list_f(bh, code, p);
-    let all = flatten_args(&ai, &ar, &af);
     let cpu = bh.cpu.expect("cpu not set");
-    bh.registers_i[code[p] as usize] = cpu.bh_call_i(fnaddr, &all);
+    bh.registers_i[code[p] as usize] =
+        cpu.bh_call_i(fnaddr, Some(&ai), Some(&ar), Some(&af), &calldescr);
     Ok(p + 1)
 }
 fn handler_inline_call_irf_r(
@@ -6952,13 +7003,14 @@ fn handler_inline_call_irf_r(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let (_jitcode_index, fnaddr, p) = read_inline_call_jitcode(bh, code, p);
+    let (_jitcode_index, fnaddr, calldescr, p) = read_inline_call_jitcode(bh, code, p);
     let (ai, p) = read_list_i(bh, code, p);
     let (ar, p) = read_list_r(bh, code, p);
     let (af, p) = read_list_f(bh, code, p);
-    let all = flatten_args(&ai, &ar, &af);
     let cpu = bh.cpu.expect("cpu not set");
-    bh.registers_r[code[p] as usize] = cpu.bh_call_r(fnaddr, &all).0 as i64;
+    bh.registers_r[code[p] as usize] = cpu
+        .bh_call_r(fnaddr, Some(&ai), Some(&ar), Some(&af), &calldescr)
+        .0 as i64;
     Ok(p + 1)
 }
 fn handler_inline_call_irf_f(
@@ -6966,13 +7018,14 @@ fn handler_inline_call_irf_f(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let (_jitcode_index, fnaddr, p) = read_inline_call_jitcode(bh, code, p);
+    let (_jitcode_index, fnaddr, calldescr, p) = read_inline_call_jitcode(bh, code, p);
     let (ai, p) = read_list_i(bh, code, p);
     let (ar, p) = read_list_r(bh, code, p);
     let (af, p) = read_list_f(bh, code, p);
-    let all = flatten_args(&ai, &ar, &af);
     let cpu = bh.cpu.expect("cpu not set");
-    bh.registers_f[code[p] as usize] = cpu.bh_call_f(fnaddr, &all).to_bits() as i64;
+    bh.registers_f[code[p] as usize] = cpu
+        .bh_call_f(fnaddr, Some(&ai), Some(&ar), Some(&af), &calldescr)
+        .to_bits() as i64;
     Ok(p + 1)
 }
 fn handler_inline_call_irf_v(
@@ -6980,13 +7033,12 @@ fn handler_inline_call_irf_v(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let (_jitcode_index, fnaddr, p) = read_inline_call_jitcode(bh, code, p);
+    let (_jitcode_index, fnaddr, calldescr, p) = read_inline_call_jitcode(bh, code, p);
     let (ai, p) = read_list_i(bh, code, p);
     let (ar, p) = read_list_r(bh, code, p);
     let (af, p) = read_list_f(bh, code, p);
-    let all = flatten_args(&ai, &ar, &af);
     let cpu = bh.cpu.expect("cpu not set");
-    cpu.bh_call_v(fnaddr, &all);
+    cpu.bh_call_v(fnaddr, Some(&ai), Some(&ar), Some(&af), &calldescr);
     Ok(p)
 }
 fn handler_inline_call_ir_i(
@@ -6994,12 +7046,12 @@ fn handler_inline_call_ir_i(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let (_jitcode_index, fnaddr, p) = read_inline_call_jitcode(bh, code, p);
+    let (_jitcode_index, fnaddr, calldescr, p) = read_inline_call_jitcode(bh, code, p);
     let (ai, p) = read_list_i(bh, code, p);
     let (ar, p) = read_list_r(bh, code, p);
-    let all = flatten_args(&ai, &ar, &[]);
     let cpu = bh.cpu.expect("cpu not set");
-    bh.registers_i[code[p] as usize] = cpu.bh_call_i(fnaddr, &all);
+    bh.registers_i[code[p] as usize] =
+        cpu.bh_call_i(fnaddr, Some(&ai), Some(&ar), None, &calldescr);
     Ok(p + 1)
 }
 fn handler_inline_call_ir_r(
@@ -7007,12 +7059,13 @@ fn handler_inline_call_ir_r(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let (_jitcode_index, fnaddr, p) = read_inline_call_jitcode(bh, code, p);
+    let (_jitcode_index, fnaddr, calldescr, p) = read_inline_call_jitcode(bh, code, p);
     let (ai, p) = read_list_i(bh, code, p);
     let (ar, p) = read_list_r(bh, code, p);
-    let all = flatten_args(&ai, &ar, &[]);
     let cpu = bh.cpu.expect("cpu not set");
-    bh.registers_r[code[p] as usize] = cpu.bh_call_r(fnaddr, &all).0 as i64;
+    bh.registers_r[code[p] as usize] = cpu
+        .bh_call_r(fnaddr, Some(&ai), Some(&ar), None, &calldescr)
+        .0 as i64;
     Ok(p + 1)
 }
 fn handler_inline_call_ir_v(
@@ -7020,12 +7073,11 @@ fn handler_inline_call_ir_v(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let (_jitcode_index, fnaddr, p) = read_inline_call_jitcode(bh, code, p);
+    let (_jitcode_index, fnaddr, calldescr, p) = read_inline_call_jitcode(bh, code, p);
     let (ai, p) = read_list_i(bh, code, p);
     let (ar, p) = read_list_r(bh, code, p);
-    let all = flatten_args(&ai, &ar, &[]);
     let cpu = bh.cpu.expect("cpu not set");
-    cpu.bh_call_v(fnaddr, &all);
+    cpu.bh_call_v(fnaddr, Some(&ai), Some(&ar), None, &calldescr);
     Ok(p)
 }
 fn handler_inline_call_r_i(
@@ -7033,10 +7085,10 @@ fn handler_inline_call_r_i(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let (_jitcode_index, fnaddr, p) = read_inline_call_jitcode(bh, code, p);
+    let (_jitcode_index, fnaddr, calldescr, p) = read_inline_call_jitcode(bh, code, p);
     let (ar, p) = read_list_r(bh, code, p);
     let cpu = bh.cpu.expect("cpu not set");
-    bh.registers_i[code[p] as usize] = cpu.bh_call_i(fnaddr, &ar);
+    bh.registers_i[code[p] as usize] = cpu.bh_call_i(fnaddr, None, Some(&ar), None, &calldescr);
     Ok(p + 1)
 }
 fn handler_inline_call_r_r(
@@ -7044,10 +7096,11 @@ fn handler_inline_call_r_r(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let (_jitcode_index, fnaddr, p) = read_inline_call_jitcode(bh, code, p);
+    let (_jitcode_index, fnaddr, calldescr, p) = read_inline_call_jitcode(bh, code, p);
     let (ar, p) = read_list_r(bh, code, p);
     let cpu = bh.cpu.expect("cpu not set");
-    bh.registers_r[code[p] as usize] = cpu.bh_call_r(fnaddr, &ar).0 as i64;
+    bh.registers_r[code[p] as usize] =
+        cpu.bh_call_r(fnaddr, None, Some(&ar), None, &calldescr).0 as i64;
     Ok(p + 1)
 }
 fn handler_inline_call_r_v(
@@ -7055,10 +7108,10 @@ fn handler_inline_call_r_v(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let (_jitcode_index, fnaddr, p) = read_inline_call_jitcode(bh, code, p);
+    let (_jitcode_index, fnaddr, calldescr, p) = read_inline_call_jitcode(bh, code, p);
     let (ar, p) = read_list_r(bh, code, p);
     let cpu = bh.cpu.expect("cpu not set");
-    cpu.bh_call_v(fnaddr, &ar);
+    cpu.bh_call_v(fnaddr, None, Some(&ar), None, &calldescr);
     Ok(p)
 }
 // recursive_call — stub (needs portal runner)
@@ -7075,12 +7128,12 @@ fn handler_inline_call_r_v(
 ///                               greens_f+reds_f, calldescr)
 /// ```
 /// Read recursive_call args and merge greens+reds per kind.
-/// Returns (jdindex, all_merged, next_position).
+/// Returns (jdindex, all_i, all_r, all_f, next_position).
 fn read_recursive_call_args(
     bh: &BlackholeInterpreter,
     code: &[u8],
     p: usize,
-) -> (usize, Vec<i64>, usize) {
+) -> (usize, Vec<i64>, Vec<i64>, Vec<i64>, usize) {
     let jdindex = code[p] as usize; // 'c' short constant
     let p = p + 1;
     let (greens_i, p) = read_list_i(bh, code, p);
@@ -7096,8 +7149,7 @@ fn read_recursive_call_args(
     all_r.extend(&reds_r);
     let mut all_f = greens_f;
     all_f.extend(&reds_f);
-    let all = flatten_args(&all_i, &all_r, &all_f);
-    (jdindex, all, p)
+    (jdindex, all_i, all_r, all_f, p)
 }
 // blackhole.py:1101-1108 bhimpl_recursive_call_i
 fn handler_recursive_call_i(
@@ -7105,10 +7157,11 @@ fn handler_recursive_call_i(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let (jdindex, all, p) = read_recursive_call_args(bh, code, p);
-    let (fnptr, _calldescr) = bh.get_portal_runner(jdindex);
+    let (jdindex, all_i, all_r, all_f, p) = read_recursive_call_args(bh, code, p);
+    let (fnptr, calldescr) = bh.get_portal_runner(jdindex);
     let cpu = bh.cpu.expect("cpu not set");
-    bh.registers_i[code[p] as usize] = cpu.bh_call_i(fnptr, &all);
+    bh.registers_i[code[p] as usize] =
+        cpu.bh_call_i(fnptr, Some(&all_i), Some(&all_r), Some(&all_f), &calldescr);
     Ok(p + 1)
 }
 // blackhole.py:1109-1116 bhimpl_recursive_call_r
@@ -7117,10 +7170,12 @@ fn handler_recursive_call_r(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let (jdindex, all, p) = read_recursive_call_args(bh, code, p);
-    let (fnptr, _calldescr) = bh.get_portal_runner(jdindex);
+    let (jdindex, all_i, all_r, all_f, p) = read_recursive_call_args(bh, code, p);
+    let (fnptr, calldescr) = bh.get_portal_runner(jdindex);
     let cpu = bh.cpu.expect("cpu not set");
-    bh.registers_r[code[p] as usize] = cpu.bh_call_r(fnptr, &all).0 as i64;
+    bh.registers_r[code[p] as usize] = cpu
+        .bh_call_r(fnptr, Some(&all_i), Some(&all_r), Some(&all_f), &calldescr)
+        .0 as i64;
     Ok(p + 1)
 }
 // blackhole.py:1117-1124 bhimpl_recursive_call_f
@@ -7129,10 +7184,12 @@ fn handler_recursive_call_f(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let (jdindex, all, p) = read_recursive_call_args(bh, code, p);
-    let (fnptr, _calldescr) = bh.get_portal_runner(jdindex);
+    let (jdindex, all_i, all_r, all_f, p) = read_recursive_call_args(bh, code, p);
+    let (fnptr, calldescr) = bh.get_portal_runner(jdindex);
     let cpu = bh.cpu.expect("cpu not set");
-    bh.registers_f[code[p] as usize] = cpu.bh_call_f(fnptr, &all).to_bits() as i64;
+    bh.registers_f[code[p] as usize] = cpu
+        .bh_call_f(fnptr, Some(&all_i), Some(&all_r), Some(&all_f), &calldescr)
+        .to_bits() as i64;
     Ok(p + 1)
 }
 // blackhole.py:1125-1132 bhimpl_recursive_call_v
@@ -7141,9 +7198,9 @@ fn handler_recursive_call_v(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let (jdindex, all, p) = read_recursive_call_args(bh, code, p);
-    let (fnptr, _calldescr) = bh.get_portal_runner(jdindex);
+    let (jdindex, all_i, all_r, all_f, p) = read_recursive_call_args(bh, code, p);
+    let (fnptr, calldescr) = bh.get_portal_runner(jdindex);
     let cpu = bh.cpu.expect("cpu not set");
-    cpu.bh_call_v(fnptr, &all);
+    cpu.bh_call_v(fnptr, Some(&all_i), Some(&all_r), Some(&all_f), &calldescr);
     Ok(p)
 }
