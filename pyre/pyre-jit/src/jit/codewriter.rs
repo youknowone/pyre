@@ -1005,6 +1005,13 @@ impl CodeWriter {
         // call.py:148 grab_initial_jitcodes: jd.mainjitcode.jitdriver_sd = jd
         // pyre uses index 0 (single jitdriver) for portal jitcodes.
         jitcode.jitdriver_sd = if is_portal { Some(0) } else { None };
+        // call.py:174-187 get_jitcode_calldescr: calldescr from function type.
+        // pyre portal: bh_portal_runner(frame_ptr: ref) -> ref.
+        // All Python functions share the same calling convention.
+        jitcode.calldescr = majit_codewriter::jitcode::BhCallDescr {
+            arg_classes: "r".to_string(),
+            result_type: 'r',
+        };
         jitcode.nlocals = code.varnames.len();
         // Per-jitcode stack base in `locals_cells_stack_w`. Each jitcode in
         // a blackhole chain owns its own value (different functions have
@@ -1070,6 +1077,10 @@ impl CodeWriter {
 
         // Store reverse map on JitCode for handle_exception_in_frame lasti lookup.
         jitcode.jit_to_py_pc = jit_to_py_pc.clone();
+
+        // call.py:167-169 jitcode.fnaddr = getfunctionptr(graph).
+        // pyre: all Python functions go through the single portal runner.
+        jitcode.fnaddr = crate::call_jit::bh_portal_runner as *const () as usize as i64;
 
         PyJitCode {
             jitcode,
