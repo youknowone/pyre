@@ -1993,6 +1993,7 @@ mod tests {
 
     fn make_buf(size: usize) -> VirtualRawBufferInfo {
         VirtualRawBufferInfo {
+            func: 0,
             size,
             entries: Vec::new(),
             last_guard_pos: -1,

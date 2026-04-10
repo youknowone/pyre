@@ -3462,7 +3462,10 @@ impl<M: Clone> MetaInterp<M> {
                     &mut terminal_exit_layouts,
                 );
                 // RPython resume.py:570-574: per-guard knowledge captured
-                // during optimization at each guard emit point.
+                // during optimization at each guard emit point. PyPy runs
+                // serialize_optimizer_knowledge per-guard with that guard's
+                // available_boxes — there is no global end-of-optimization
+                // fallback. Guards without per-guard knowledge have none.
                 let per_guard_knowledge = {
                     let pos_to_fail: HashMap<u32, u32> = guard_op_indices
                         .iter()
@@ -3475,24 +3478,6 @@ impl<M: Clone> MetaInterp<M> {
                         if let Some(&fi) = pos_to_fail.get(&guard_pos.0) {
                             result.insert(fi, knowledge.clone());
                         }
-                    }
-                    let end_knowledge = if let Some(mut fc) = optimizer.final_ctx.take() {
-                        let k = optimizer.serialize_optimizer_knowledge(&mut fc);
-                        optimizer.final_ctx = Some(fc);
-                        k
-                    } else {
-                        OptimizerKnowledge::default()
-                    };
-                    for (_, k) in result.iter_mut() {
-                        if k.known_classes.is_empty() {
-                            k.known_classes = end_knowledge.known_classes.clone();
-                        }
-                        if k.loopinvariant_results.is_empty() {
-                            k.loopinvariant_results = end_knowledge.loopinvariant_results.clone();
-                        }
-                    }
-                    for &fi in guard_op_indices.keys() {
-                        result.entry(fi).or_insert_with(|| end_knowledge.clone());
                     }
                     result
                 };
@@ -3807,24 +3792,6 @@ impl<M: Clone> MetaInterp<M> {
                         if let Some(&fi) = pos_to_fail.get(&guard_pos.0) {
                             result.insert(fi, knowledge.clone());
                         }
-                    }
-                    let end_knowledge = if let Some(mut fc) = optimizer.final_ctx.take() {
-                        let k = optimizer.serialize_optimizer_knowledge(&mut fc);
-                        optimizer.final_ctx = Some(fc);
-                        k
-                    } else {
-                        OptimizerKnowledge::default()
-                    };
-                    for (_, k) in result.iter_mut() {
-                        if k.known_classes.is_empty() {
-                            k.known_classes = end_knowledge.known_classes.clone();
-                        }
-                        if k.loopinvariant_results.is_empty() {
-                            k.loopinvariant_results = end_knowledge.loopinvariant_results.clone();
-                        }
-                    }
-                    for &fi in guard_op_indices.keys() {
-                        result.entry(fi).or_insert_with(|| end_knowledge.clone());
                     }
                     result
                 };

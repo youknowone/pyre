@@ -3630,7 +3630,24 @@ impl ResumeDataLoopMemo {
                     &new_liveboxes,
                 ) as i32);
             }
-            numb_state.append_int(0); // array items (empty)
+            // Heap array item quads (bridgeopt.py:102-108)
+            numb_state.append_int(knowledge.heap_arrayitems.len() as i32);
+            for &(obj, index, descr_idx, val) in &knowledge.heap_arrayitems {
+                numb_state.writer.append_short(self._gettagged(
+                    obj,
+                    env,
+                    &numb_state.liveboxes,
+                    &new_liveboxes,
+                ) as i32);
+                numb_state.append_int(index as i32);
+                numb_state.append_int(descr_idx as i32);
+                numb_state.writer.append_short(self._gettagged(
+                    val,
+                    env,
+                    &numb_state.liveboxes,
+                    &new_liveboxes,
+                ) as i32);
+            }
 
             // Loop-invariant results (bridgeopt.py:113-122)
             numb_state.append_int(knowledge.loopinvariant_results.len() as i32);
@@ -3889,7 +3906,11 @@ pub struct OptimizerKnowledgeForResume {
     /// OpRef IDs with known class.
     pub known_classes: std::collections::HashSet<u32>,
     /// (obj_opref, descr_index, val_opref) heap field triples.
+    /// bridgeopt.py:96-101
     pub heap_fields: Vec<(majit_ir::OpRef, u32, majit_ir::OpRef)>,
+    /// (array_opref, index, descr_index, val_opref) heap array item quads.
+    /// bridgeopt.py:102-108
+    pub heap_arrayitems: Vec<(majit_ir::OpRef, i64, u32, majit_ir::OpRef)>,
     /// (const_func_ptr, result_opref) loop-invariant call results.
     pub loopinvariant_results: Vec<(i64, majit_ir::OpRef)>,
 }
