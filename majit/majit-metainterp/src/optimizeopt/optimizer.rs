@@ -444,7 +444,11 @@ impl Optimizer {
                     ),
                 );
             }
-            VirtualStateInfo::VirtualRawBuffer { size, entries } => {
+            VirtualStateInfo::VirtualRawBuffer {
+                func,
+                size,
+                entries,
+            } => {
                 let imported_entries = entries
                     .iter()
                     .map(|(offset, length, entry_info)| {
@@ -459,7 +463,7 @@ impl Optimizer {
                     opref,
                     crate::optimizeopt::info::PtrInfo::VirtualRawBuffer(
                         crate::optimizeopt::info::VirtualRawBufferInfo {
-                            func: 0,
+                            func: *func,
                             size: *size,
                             entries: imported_entries,
                             last_guard_pos: -1,
@@ -907,7 +911,11 @@ impl Optimizer {
                 );
                 opref
             }
-            VirtualStateInfo::VirtualRawBuffer { size, entries } => {
+            VirtualStateInfo::VirtualRawBuffer {
+                func,
+                size,
+                entries,
+            } => {
                 let opref = ctx.alloc_op_position();
                 let imported_entries = entries
                     .iter()
@@ -929,7 +937,7 @@ impl Optimizer {
                     opref,
                     crate::optimizeopt::info::PtrInfo::VirtualRawBuffer(
                         crate::optimizeopt::info::VirtualRawBufferInfo {
-                            func: 0,
+                            func: *func,
                             size: *size,
                             entries: imported_entries,
                             last_guard_pos: -1,

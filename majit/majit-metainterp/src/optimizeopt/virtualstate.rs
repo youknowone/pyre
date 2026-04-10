@@ -168,8 +168,10 @@ pub enum VirtualStateInfo {
         descr: DescrRef,
         element_fields: Vec<Vec<(u32, Rc<VirtualStateInfo>)>>,
     },
-    /// Value is a virtual raw buffer.
+    /// Value is a virtual raw buffer (info.py:389 RawBufferPtrInfo).
     VirtualRawBuffer {
+        /// info.py:389: self.func — the malloc function pointer.
+        func: i64,
         size: usize,
         entries: Vec<(usize, usize, Rc<VirtualStateInfo>)>,
     },
@@ -322,10 +324,12 @@ impl VirtualStateInfo {
                 VirtualStateInfo::VirtualRawBuffer {
                     size: s1,
                     entries: e1,
+                    ..
                 },
                 VirtualStateInfo::VirtualRawBuffer {
                     size: s2,
                     entries: e2,
+                    ..
                 },
             ) => {
                 if s1 != s2 || e1.len() != e2.len() {
@@ -1974,6 +1978,7 @@ fn export_single_value_inner(
                 };
             }
             PtrInfo::VirtualRawBuffer(vinfo) => {
+                // info.py:445: visitor.visit_vrawbuffer(self.func, self.size, ...)
                 let entries = vinfo
                     .entries
                     .iter()
@@ -1983,6 +1988,7 @@ fn export_single_value_inner(
                     })
                     .collect();
                 return VirtualStateInfo::VirtualRawBuffer {
+                    func: vinfo.func,
                     size: vinfo.size,
                     entries,
                 };
