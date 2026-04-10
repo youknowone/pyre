@@ -4319,6 +4319,23 @@ fn assemble_peeled_trace_with_jump_args(
                 );
             }
         }
+        // RPython parity: each guard in the assembled trace must have a
+        // unique fail_descr. In RPython, the unroll optimizer creates fresh
+        // ResumeGuardDescr objects for body guards during Phase 2, giving
+        // each a globally unique index. pyre's body ops inherit the original
+        // tracing-time descrs with the same fail_indices as the preamble
+        // copies. Clone the descr here to assign a new fail_index, preventing
+        // fail_index collisions between preamble and body guards. Without
+        // this, HashMap<fail_index, ...> lookups (exit_layouts, fail_descrs)
+        // confuse preamble and body guards, causing bridge attachment and
+        // resume data to target the wrong guard.
+        if new_op.opcode.is_guard() {
+            if let Some(ref descr) = new_op.descr {
+                if let Some(cloned) = descr.clone_descr() {
+                    new_op.descr = Some(cloned);
+                }
+            }
+        }
         result.push(new_op);
         if op.opcode == OpCode::Label {
             current_inner_label_index = Some(result.len() - 1);

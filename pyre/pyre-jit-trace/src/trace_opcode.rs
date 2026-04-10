@@ -1231,6 +1231,37 @@ impl MIFrame {
             let vb_idx = idx - 1;
             ctx.set_virtualizable_box_at(vb_idx, new_opref);
         }
+        // pyjitpl.py:1578 put_back_list_of_boxes3: write dedup'd values back
+        // to frame symbolic state so subsequent tracing sees the SameAs-wrapped
+        // identities. RPython runs this on the "continue tracing" path after
+        // reached_loop_header returns without closing. Harmless on the "close
+        // loop" path since the frame won't be reused.
+        {
+            let num_scalars = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
+            let s = self.sym_mut();
+            for &(idx, new_opref) in &dedup_changed {
+                if idx < num_scalars {
+                    match idx {
+                        0 => s.frame = new_opref,
+                        1 => s.vable_next_instr = new_opref,
+                        2 => s.vable_code = new_opref,
+                        3 => s.vable_valuestackdepth = new_opref,
+                        4 => s.vable_namespace = new_opref,
+                        _ => {}
+                    }
+                } else {
+                    let local_idx = idx - num_scalars;
+                    if local_idx < nlocals {
+                        s.symbolic_locals[local_idx] = new_opref;
+                    } else {
+                        let stack_idx = local_idx - nlocals;
+                        if stack_idx < s.symbolic_stack.len() {
+                            s.symbolic_stack[stack_idx] = new_opref;
+                        }
+                    }
+                }
+            }
+        }
         // pyjitpl.py:2967-2969: generate a dummy GUARD_FUTURE_CONDITION
         // just before the JUMP so that unroll can use it when it's
         // creating artificial guards (patchguardop). record_guard calls
