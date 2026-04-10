@@ -379,6 +379,99 @@ impl std::fmt::Display for SwitchDictDescr {
     }
 }
 
+/// RPython `history.py:AbstractDescr` — base class for all descriptor
+/// objects stored in the assembler's `descrs` list. Read at runtime via
+/// 'd'/'j' argcodes in the blackhole interpreter.
+///
+/// RPython uses a class hierarchy (`FieldDescr`, `ArrayDescr`, `CallDescr`,
+/// `JitCode(AbstractDescr)`, `SwitchDictDescr`). pyre uses an enum to
+/// represent the same heterogeneous list, shared between the codewriter
+/// assembler and the metainterp blackhole.
+#[derive(Debug, Clone)]
+pub enum BhDescr {
+    /// Field descriptor: byte offset into struct for getfield/setfield.
+    /// RPython: `FieldDescr` with `offset` attribute.
+    Field { offset: usize },
+    /// Array descriptor: item size for getarrayitem/setarrayitem/arraylen.
+    /// RPython: `ArrayDescr` with `itemsize`, `basesize` attributes.
+    Array { itemsize: usize },
+    /// Call descriptor: for residual_call. Carries calling convention.
+    /// RPython: `CallDescr`.
+    Call,
+    /// JitCode descriptor: for inline_call_*.
+    /// RPython: `JitCode(AbstractDescr)` — carries `fnaddr` + `calldescr`.
+    /// In pyre, `jitcode_index` is the index into `all_jitcodes[]`
+    /// (set by CodeWriter) and `fnaddr` is resolved later at runtime.
+    JitCode {
+        /// Index into all_jitcodes[]. Used by the blackhole to find the
+        /// callee's bytecode for frame-chain push.
+        jitcode_index: usize,
+        /// Function address for cpu.bh_call_* fallback.
+        fnaddr: i64,
+    },
+    /// SwitchDictDescr: maps int values to bytecode positions.
+    Switch {
+        dict: std::collections::HashMap<i64, usize>,
+    },
+    /// Virtualizable field descriptor: index into VirtualizableInfo.static_fields.
+    /// NOT a byte offset — the blackhole resolves it via `vinfo.static_fields[index].offset`.
+    VableField { index: usize },
+    /// Virtualizable array descriptor: index into VirtualizableInfo.array_fields.
+    VableArray { index: usize },
+}
+
+impl BhDescr {
+    /// Extract byte offset for field/array operations (FieldDescr/ArrayDescr).
+    /// Panics on VableField/VableArray — those must use `as_vable_field_index`.
+    pub fn as_offset(&self) -> usize {
+        match self {
+            BhDescr::Field { offset } => *offset,
+            BhDescr::Array { itemsize } => *itemsize,
+            _ => panic!("BhDescr::as_offset called on {:?}", self),
+        }
+    }
+
+    /// Extract virtualizable field index.
+    pub fn as_vable_field_index(&self) -> usize {
+        match self {
+            BhDescr::VableField { index } => *index,
+            _ => panic!("BhDescr::as_vable_field_index called on {:?}", self),
+        }
+    }
+
+    /// Extract virtualizable array index.
+    pub fn as_vable_array_index(&self) -> usize {
+        match self {
+            BhDescr::VableArray { index } => *index,
+            _ => panic!("BhDescr::as_vable_array_index called on {:?}", self),
+        }
+    }
+
+    /// Extract JitCode index for inline_call.
+    pub fn as_jitcode_index(&self) -> usize {
+        match self {
+            BhDescr::JitCode { jitcode_index, .. } => *jitcode_index,
+            _ => panic!("BhDescr::as_jitcode_index called on {:?}", self),
+        }
+    }
+
+    /// Extract function address for inline_call cpu.bh_call_* fallback.
+    pub fn as_jitcode_fnaddr(&self) -> i64 {
+        match self {
+            BhDescr::JitCode { fnaddr, .. } => *fnaddr,
+            _ => 0,
+        }
+    }
+
+    /// Lookup switch value → position.
+    pub fn switch_lookup(&self, value: i64) -> Option<usize> {
+        match self {
+            BhDescr::Switch { dict } => dict.get(&value).copied(),
+            _ => None,
+        }
+    }
+}
+
 /// RPython `format.py:12-80` `format_assembler(ssarepr)`.
 ///
 /// Minimal port: formats each FlatOp in the SSARepr into human-readable
