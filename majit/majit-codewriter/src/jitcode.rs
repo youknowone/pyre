@@ -389,24 +389,31 @@ impl std::fmt::Display for SwitchDictDescr {
 /// assembler and the metainterp blackhole.
 #[derive(Debug, Clone)]
 pub enum BhDescr {
-    /// Field descriptor: byte offset into struct for getfield/setfield.
-    /// RPython: `FieldDescr` with `offset` attribute.
-    Field { offset: usize },
-    /// Array descriptor: item size for getarrayitem/setarrayitem/arraylen.
+    /// Field descriptor: for getfield/setfield.
+    /// RPython: `FieldDescr(AbstractDescr)` — carries `offset`, `field_size`.
+    /// `name` + `owner` identify the field for runtime offset resolution.
+    /// `offset` is populated when known (0 = unresolved placeholder).
+    Field {
+        offset: usize,
+        name: String,
+        owner: String,
+    },
+    /// Array descriptor: for getarrayitem/setarrayitem/arraylen.
     /// RPython: `ArrayDescr` with `itemsize`, `basesize` attributes.
+    /// `itemsize` is populated when known (8 = default placeholder).
     Array { itemsize: usize },
     /// Call descriptor: for residual_call. Carries calling convention.
     /// RPython: `CallDescr`.
     Call,
     /// JitCode descriptor: for inline_call_*.
     /// RPython: `JitCode(AbstractDescr)` — carries `fnaddr` + `calldescr`.
-    /// In pyre, `jitcode_index` is the index into `all_jitcodes[]`
-    /// (set by CodeWriter) and `fnaddr` is resolved later at runtime.
+    /// `jitcode_index` indexes into `all_jitcodes[]` (set by CodeWriter).
+    /// `fnaddr` is resolved at runtime from the callee's function address.
     JitCode {
         /// Index into all_jitcodes[]. Used by the blackhole to find the
         /// callee's bytecode for frame-chain push.
         jitcode_index: usize,
-        /// Function address for cpu.bh_call_* fallback.
+        /// Function address for cpu.bh_call_*. Resolved at runtime.
         fnaddr: i64,
     },
     /// SwitchDictDescr: maps int values to bytecode positions.
@@ -425,9 +432,25 @@ impl BhDescr {
     /// Panics on VableField/VableArray — those must use `as_vable_field_index`.
     pub fn as_offset(&self) -> usize {
         match self {
-            BhDescr::Field { offset } => *offset,
+            BhDescr::Field { offset, .. } => *offset,
             BhDescr::Array { itemsize } => *itemsize,
             _ => panic!("BhDescr::as_offset called on {:?}", self),
+        }
+    }
+
+    /// Get field name (for runtime offset resolution).
+    pub fn field_name(&self) -> &str {
+        match self {
+            BhDescr::Field { name, .. } => name,
+            _ => panic!("BhDescr::field_name called on {:?}", self),
+        }
+    }
+
+    /// Get field owner type name.
+    pub fn field_owner(&self) -> &str {
+        match self {
+            BhDescr::Field { owner, .. } => owner,
+            _ => panic!("BhDescr::field_owner called on {:?}", self),
         }
     }
 

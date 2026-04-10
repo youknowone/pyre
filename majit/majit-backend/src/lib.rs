@@ -1180,12 +1180,29 @@ pub trait Backend: Send {
     }
     /// model.py: bh_setarrayitem_gc_f(array_ptr, index, value, descr)
     fn bh_setarrayitem_gc_f(&self, _array_ptr: i64, _index: i64, _item_size: usize, _value: f64) {}
+    /// model.py: bh_getarrayitem_raw_i(array, index, arraydescr)
+    fn bh_getarrayitem_raw_i(&self, _array: i64, _index: i64, _item_size: usize) -> i64 {
+        0
+    }
+    /// model.py: bh_getarrayitem_raw_f(array, index, arraydescr)
+    fn bh_getarrayitem_raw_f(&self, _array: i64, _index: i64, _item_size: usize) -> f64 {
+        0.0
+    }
+    /// model.py: bh_setarrayitem_raw_i(array, index, newvalue, arraydescr)
+    fn bh_setarrayitem_raw_i(&self, _array: i64, _index: i64, _item_size: usize, _value: i64) {}
+    /// model.py: bh_setarrayitem_raw_f(array, index, newvalue, arraydescr)
+    fn bh_setarrayitem_raw_f(&self, _array: i64, _index: i64, _item_size: usize, _value: f64) {}
     /// model.py: bh_arraylen_gc(array_ptr, descr)
     fn bh_arraylen_gc(&self, _array_ptr: i64, _len_offset: usize) -> i64 {
         0
     }
     /// llmodel.py:775 bh_new(sizedescr).
     fn bh_new(&self, _sizedescr: &dyn majit_ir::SizeDescr) -> i64 {
+        0
+    }
+    /// bh_new from raw size — used when only the struct size is available
+    /// (no SizeDescr object). Newlist/newlist_clear/newlist_hint use this.
+    fn bh_new_with_size(&self, _size: usize) -> i64 {
         0
     }
     /// llmodel.py:778 bh_new_with_vtable(sizedescr).
@@ -1206,6 +1223,10 @@ pub trait Backend: Send {
     }
     /// model.py: bh_new_array(length, descr)
     fn bh_new_array(&self, _length: i64, _item_size: usize, _type_id: u32) -> i64 {
+        0
+    }
+    /// model.py: bh_new_array_clear(length, descr)
+    fn bh_new_array_clear(&self, _length: i64, _item_size: usize, _type_id: u32) -> i64 {
         0
     }
     /// model.py: bh_strlen(string_ptr)
