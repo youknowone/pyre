@@ -87,6 +87,16 @@ pub struct JitCode {
     /// position in `all_jitcodes[]`. Set by `CodeWriter` after assembly.
     /// Used by `inline_call` ops to reference callee jitcode by index.
     pub index: usize,
+    /// RPython `jitcode.py:19` `self._called_from = called_from` — debug:
+    /// which call graph first triggered this jitcode's creation. In RPython
+    /// this is a graph object; pyre uses an optional CallPath string.
+    #[serde(default, skip_serializing)]
+    pub _called_from: Option<String>,
+    /// RPython `jitcode.py:20` `self._ssarepr = None` — debug: the
+    /// flattened SSA representation, kept for `dump()` output. Set by
+    /// `Assembler.assemble` (assembler.py:49 `jitcode._ssarepr = ssarepr`).
+    #[serde(skip)]
+    pub _ssarepr: Option<crate::passes::flatten::SSARepr>,
 }
 
 impl JitCode {
@@ -116,6 +126,25 @@ impl JitCode {
             alllabels: HashSet::new(),
             resulttypes: HashMap::new(),
             index: 0,
+            _called_from: None,
+            _ssarepr: None,
+        }
+    }
+
+    /// RPython `jitcode.py:114-119` `def dump(self)`:
+    ///
+    /// ```python
+    /// def dump(self):
+    ///     if self._ssarepr is None:
+    ///         return '<no dump available for %r>' % (self.name,)
+    ///     else:
+    ///         from rpython.jit.codewriter.format import format_assembler
+    ///         return format_assembler(self._ssarepr)
+    /// ```
+    pub fn dump(&self) -> String {
+        match &self._ssarepr {
+            None => format!("<no dump available for {:?}>", self.name),
+            Some(ssarepr) => format_assembler(ssarepr),
         }
     }
 
@@ -348,4 +377,54 @@ impl std::fmt::Display for SwitchDictDescr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "<SwitchDictDescr {:?}>", self.dict)
     }
+}
+
+/// RPython `format.py:12-80` `format_assembler(ssarepr)`.
+///
+/// Minimal port: formats each FlatOp in the SSARepr into human-readable
+/// text. RPython uses this for debug output and testing.
+///
+/// ```python
+/// def format_assembler(ssarepr):
+///     """For testing: format a SSARepr as a multiline string."""
+///     ...
+///     return buf.getvalue()
+/// ```
+pub fn format_assembler(ssarepr: &crate::passes::flatten::SSARepr) -> String {
+    use crate::passes::flatten::FlatOp;
+    use std::fmt::Write;
+
+    let mut out = String::new();
+    writeln!(out, "{}", ssarepr.name).ok();
+    for op in &ssarepr.insns {
+        match op {
+            FlatOp::Label(label) => {
+                writeln!(out, "L{}:", label.0).ok();
+            }
+            FlatOp::Live { live_values } => {
+                let regs: Vec<String> = live_values.iter().map(|v| format!("%i{}", v.0)).collect();
+                writeln!(out, "  -live- {}", regs.join(", ")).ok();
+            }
+            FlatOp::Unreachable => {
+                writeln!(out, "  ---").ok();
+            }
+            FlatOp::Op(space_op) => {
+                let result = space_op
+                    .result
+                    .map(|v| format!(" -> %i{}", v.0))
+                    .unwrap_or_default();
+                writeln!(out, "  {:?}{result}", space_op.kind).ok();
+            }
+            FlatOp::Jump(label) => {
+                writeln!(out, "  goto L{}", label.0).ok();
+            }
+            FlatOp::GotoIfNot { cond, target } => {
+                writeln!(out, "  goto_if_not %i{}, L{}", cond.0, target.0).ok();
+            }
+            FlatOp::Move { dst, src } => {
+                writeln!(out, "  %i{} = %i{}", dst.0, src.0).ok();
+            }
+        }
+    }
+    out
 }

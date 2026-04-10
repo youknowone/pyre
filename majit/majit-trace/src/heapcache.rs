@@ -84,13 +84,20 @@ const _HF_VERSION_MAX: u32 = HF_VERSION_MAX;
 ///         return box
 /// ```
 ///
-/// pyre's `OpRef` is a bare index without `is_replaced_with_const()`
-/// metadata. The replacement machinery lives on `box._forwarded` in the
-/// optimizer pipeline and is not visible at the heap-cache layer here.
-/// Until the optimizer surfaces a `replaced-with-const` query that
-/// heap-cache reads can consult, this function is a pass-through and the
-/// `read()` callsite below documents the gap.
+/// RPython's `box.is_replaced_with_const()` checks `box._forwarded`
+/// directly (per-FrontendOp storage). pyre's `OpRef` is a bare u32
+/// index; forwarding state lives in `OptContext.forwarded` (optimizer)
+/// or doesn't exist at all during tracing. The heap cache is used in
+/// BOTH phases but cannot access `OptContext` from here.
+///
+/// **Structural gap**: to match RPython, either `OpRef` needs per-op
+/// forwarding storage (like FrontendOp._forwarded), or `CacheEntry::read`
+/// needs an `&OptContext` parameter. Current impact: performance-only
+/// (missed constant-folding in cached reads); correctness is preserved
+/// because the non-constant OpRef still refers to the correct value.
 pub fn maybe_replace_with_const(opref: OpRef) -> OpRef {
+    // TODO(structural-parity): implement once OpRef carries forwarding
+    // state or heapcache receives optimizer context.
     opref
 }
 
