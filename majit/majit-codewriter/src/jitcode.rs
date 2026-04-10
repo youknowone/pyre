@@ -52,6 +52,15 @@ use serde::{Deserialize, Serialize};
 pub struct JitCode {
     /// RPython `jitcode.py:15` `self.name = name`.
     pub name: String,
+    /// RPython `jitcode.py:16` `self.fnaddr = fnaddr`.
+    /// Function address for `cpu.bh_call_*`. Set at JitCode creation time
+    /// (call.py:167 `getfunctionptr(graph)`).
+    #[serde(default, skip_serializing)]
+    pub fnaddr: i64,
+    /// RPython `jitcode.py:17` `self.calldescr = calldescr`.
+    /// Describes the function's calling convention (arg types + return type).
+    /// Set by the codewriter from the function graph's type signature.
+    pub calldescr: BhCallDescr,
     /// RPython `jitcode.py:18` `self.jitdriver_sd = None`.
     /// `Some(index)` for portal jitcodes (set by `grab_initial_jitcodes`).
     pub jitdriver_sd: Option<usize>,
@@ -115,12 +124,14 @@ impl JitCode {
     /// `constants_*`, `c_num_regs_*`, `startpoints`, etc. via the
     /// assembler.
     ///
-    /// `fnaddr`, `calldescr`, `_called_from`, and `_ssarepr` from RPython
-    /// are not yet ported (pyre lacks lltype function pointers and uses
-    /// `CallPath` instead of `funcptr._obj.graph`).
+    /// `_called_from` and `_ssarepr` from RPython are stored as
+    /// `Option<String>` / `Option<SSARepr>` respectively (RPython uses
+    /// a graph object and `CallPath` string).
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
+            fnaddr: 0,
+            calldescr: BhCallDescr::default(),
             jitdriver_sd: None,
             code: Vec::new(),
             constants_i: Vec::new(),
@@ -390,7 +401,7 @@ impl std::fmt::Display for SwitchDictDescr {
 /// RPython `descr.py:450` CallDescr — describes calling convention for
 /// `bh_call_*`. `arg_classes` is a string of 'i','r','f' per argument.
 /// `result_type` is 'i','r','f','v'.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BhCallDescr {
     pub arg_classes: String,
     pub result_type: char,
@@ -427,7 +438,19 @@ pub enum BhDescr {
     /// Array descriptor: for getarrayitem/setarrayitem/arraylen.
     /// RPython: `ArrayDescr` with `itemsize`, `basesize` attributes.
     /// `itemsize` is populated when known (8 = default placeholder).
-    Array { itemsize: usize },
+    Array {
+        itemsize: usize,
+        is_array_of_pointers: bool,
+        is_array_of_structs: bool,
+    },
+    /// Size descriptor: for bh_new/bh_new_with_vtable allocation.
+    /// RPython: `SizeDescr(AbstractDescr)` — carries `size`, `tid`, `get_vtable()`.
+    /// descr.py:101 `get_type_id()` → gc.py:492 `gc_malloc(sizedescr)` uses tid.
+    Size {
+        size: usize,
+        type_id: u32,
+        vtable: usize,
+    },
     /// Call descriptor: for residual_call. Carries calling convention.
     /// RPython: `CallDescr`.
     Call { calldescr: BhCallDescr },
@@ -461,24 +484,66 @@ impl BhDescr {
     pub fn as_offset(&self) -> usize {
         match self {
             BhDescr::Field { offset, .. } => *offset,
-            BhDescr::Array { itemsize } => *itemsize,
+            BhDescr::Array { itemsize, .. } => *itemsize,
             _ => panic!("BhDescr::as_offset called on {:?}", self),
+        }
+    }
+
+    /// Extract allocation size from SizeDescr (or FieldDescr for backward compat).
+    /// RPython: `sizedescr.size` in llmodel.py:775-782.
+    pub fn as_size(&self) -> usize {
+        match self {
+            BhDescr::Size { size, .. } => *size,
+            BhDescr::Field { offset, .. } => *offset, // backward compat
+            _ => panic!("BhDescr::as_size called on {:?}", self),
+        }
+    }
+
+    /// Extract vtable pointer from SizeDescr.
+    /// RPython: `sizedescr.get_vtable()` in llmodel.py:780.
+    pub fn get_vtable(&self) -> usize {
+        match self {
+            BhDescr::Size { vtable, .. } => *vtable,
+            _ => 0,
+        }
+    }
+
+    /// Extract GC type_id from SizeDescr.
+    /// RPython: `descr.py:101 get_type_id()` → `gc.py:492 gc_malloc(sizedescr)`.
+    pub fn get_type_id(&self) -> u32 {
+        match self {
+            BhDescr::Size { type_id, .. } => *type_id,
+            _ => 0,
         }
     }
 
     /// Extract itemsize for ArrayDescr.
     pub fn as_itemsize(&self) -> usize {
         match self {
-            BhDescr::Array { itemsize } => *itemsize,
+            BhDescr::Array { itemsize, .. } => *itemsize,
             _ => panic!("BhDescr::as_itemsize called on {:?}", self),
         }
     }
 
     /// ArrayDescr: true when the array items are GC pointers.
-    /// Default true for safety (always clear).
     pub fn is_array_of_pointers(&self) -> bool {
         match self {
-            BhDescr::Array { itemsize } => *itemsize == std::mem::size_of::<usize>(),
+            BhDescr::Array {
+                is_array_of_pointers,
+                ..
+            } => *is_array_of_pointers,
+            _ => false,
+        }
+    }
+
+    /// ArrayDescr: true when the array items are structs (GC objects).
+    /// RPython: `arraydescr.is_array_of_structs()` in blackhole.py:1165.
+    pub fn is_array_of_structs(&self) -> bool {
+        match self {
+            BhDescr::Array {
+                is_array_of_structs,
+                ..
+            } => *is_array_of_structs,
             _ => false,
         }
     }

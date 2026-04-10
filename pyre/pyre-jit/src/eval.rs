@@ -2041,22 +2041,24 @@ fn handle_jit_outcome(
 /// resume.py:1441-1442 allocate_struct(typedescr) → cpu.bh_new(typedescr).
 fn allocate_struct(typedescr: &dyn majit_ir::SizeDescr) -> usize {
     let size = typedescr.size();
-    let descr = majit_codewriter::jitcode::BhDescr::Field {
-        offset: size,
-        name: String::new(),
-        owner: String::new(),
+    let descr = majit_codewriter::jitcode::BhDescr::Size {
+        size,
+        type_id: typedescr.type_id(),
+        vtable: 0,
     };
     let (driver, _) = driver_pair();
     driver.meta_interp().backend().bh_new(&descr) as usize
 }
 
 /// resume.py:1437-1439 allocate_with_vtable(descr) → exec_new_with_vtable(cpu, descr).
+/// llmodel.py:778-782: bh_new_with_vtable uses sizedescr.get_vtable().
 fn allocate_with_vtable(descr: &dyn majit_ir::SizeDescr) -> usize {
     let size = descr.size();
-    let bh_descr = majit_codewriter::jitcode::BhDescr::Field {
-        offset: size,
-        name: String::new(),
-        owner: String::new(),
+    let vtable = descr.vtable();
+    let bh_descr = majit_codewriter::jitcode::BhDescr::Size {
+        size,
+        type_id: descr.type_id(),
+        vtable,
     };
     let (driver, _) = driver_pair();
     driver.meta_interp().backend().bh_new_with_vtable(&bh_descr) as usize
@@ -3961,17 +3963,16 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
     fn allocate_struct(&self, descr_index: u32, descr_size: usize) -> i64 {
         // resume.py:1441-1442 allocate_struct → cpu.bh_new(typedescr)
         // llmodel.py:775-776 bh_new(sizedescr): plain malloc, no vtable.
-        let _ = descr_index;
-        let bh_descr = majit_codewriter::jitcode::BhDescr::Field {
-            offset: descr_size,
-            name: String::new(),
-            owner: String::new(),
+        let bh_descr = majit_codewriter::jitcode::BhDescr::Size {
+            size: descr_size,
+            type_id: descr_index,
+            vtable: 0,
         };
         let (driver, _) = driver_pair();
         driver.meta_interp().backend().bh_new(&bh_descr)
     }
 
-    fn allocate_with_vtable(&self, descr_index: u32, descr_size: usize) -> i64 {
+    fn allocate_with_vtable(&self, descr_index: u32, descr_size: usize, vtable: usize) -> i64 {
         // resume.py:1437-1439 allocate_with_vtable →
         //   exec_new_with_vtable(self.cpu, descr)
         // llmodel.py:778-782 bh_new_with_vtable: allocate AND set vtable.
@@ -4006,10 +4007,10 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
                 Box::into_raw(obj) as i64
             }
             _ => {
-                let bh_descr = majit_codewriter::jitcode::BhDescr::Field {
-                    offset: descr_size,
-                    name: String::new(),
-                    owner: String::new(),
+                let bh_descr = majit_codewriter::jitcode::BhDescr::Size {
+                    size: descr_size,
+                    type_id: descr_index,
+                    vtable,
                 };
                 let (driver, _) = driver_pair();
                 driver.meta_interp().backend().bh_new_with_vtable(&bh_descr)

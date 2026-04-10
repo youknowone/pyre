@@ -314,10 +314,14 @@ impl Assembler {
                 // RPython assembler.py:197-207: jitcode → descrs[index]
                 // The JitCode object IS the descriptor for inline_call.
                 let descr_idx = self.descrs.len();
+                let calldescr = crate::jitcode::BhCallDescr {
+                    arg_classes: self.kinds_suffix(args_i, args_r, args_f).to_string(),
+                    result_type: *result_kind,
+                };
                 self.descrs.push(crate::jitcode::BhDescr::JitCode {
                     jitcode_index: *jitcode_index,
                     fnaddr: 0, // resolved at runtime from all_jitcodes[jitcode_index]
-                    calldescr: crate::jitcode::BhCallDescr::default(),
+                    calldescr,
                 });
                 state.code.push((descr_idx & 0xFF) as u8);
                 state.code.push((descr_idx >> 8) as u8);
@@ -422,9 +426,12 @@ impl Assembler {
                 };
                 // RPython assembler.py:197-207: descriptor as 2-byte index
                 let descr_idx = self.descrs.len();
-                self.descrs.push(crate::jitcode::BhDescr::Call {
-                    calldescr: crate::jitcode::BhCallDescr::default(),
-                });
+                let calldescr = crate::jitcode::BhCallDescr {
+                    arg_classes: self.kinds_suffix(args_i, args_r, args_f).to_string(),
+                    result_type: *result_kind,
+                };
+                self.descrs
+                    .push(crate::jitcode::BhDescr::Call { calldescr });
                 state.code.push((descr_idx & 0xFF) as u8);
                 state.code.push((descr_idx >> 8) as u8);
                 argcodes.push('d');
@@ -524,7 +531,12 @@ impl Assembler {
                 let opnum = self.get_opnum(&key);
                 state.code[startposition] = opnum;
             }
-            OpKind::ArrayRead { base, index, .. } => {
+            OpKind::ArrayRead {
+                base,
+                index,
+                item_ty,
+                ..
+            } => {
                 let (reg, kc) = self.lookup_reg_with_kind(*base, regallocs);
                 state.code.push(reg);
                 argcodes.push(kc);
@@ -532,8 +544,11 @@ impl Assembler {
                 state.code.push(reg);
                 argcodes.push(kc);
                 let descr_idx = self.descrs.len();
-                self.descrs
-                    .push(crate::jitcode::BhDescr::Array { itemsize: 8 });
+                self.descrs.push(crate::jitcode::BhDescr::Array {
+                    itemsize: value_type_to_itemsize(item_ty),
+                    is_array_of_pointers: matches!(item_ty, crate::model::ValueType::Ref),
+                    is_array_of_structs: false,
+                });
                 state.code.push((descr_idx & 0xFF) as u8);
                 state.code.push((descr_idx >> 8) as u8);
                 argcodes.push('d');
@@ -549,7 +564,11 @@ impl Assembler {
                 state.code[startposition] = opnum;
             }
             OpKind::ArrayWrite {
-                base, index, value, ..
+                base,
+                index,
+                value,
+                item_ty,
+                ..
             } => {
                 let (reg, kc) = self.lookup_reg_with_kind(*base, regallocs);
                 state.code.push(reg);
@@ -561,8 +580,11 @@ impl Assembler {
                 state.code.push(reg);
                 argcodes.push(kc);
                 let descr_idx = self.descrs.len();
-                self.descrs
-                    .push(crate::jitcode::BhDescr::Array { itemsize: 8 });
+                self.descrs.push(crate::jitcode::BhDescr::Array {
+                    itemsize: value_type_to_itemsize(item_ty),
+                    is_array_of_pointers: matches!(item_ty, crate::model::ValueType::Ref),
+                    is_array_of_structs: false,
+                });
                 state.code.push((descr_idx & 0xFF) as u8);
                 state.code.push((descr_idx >> 8) as u8);
                 argcodes.push('d');
@@ -614,6 +636,7 @@ impl Assembler {
             OpKind::VableArrayRead {
                 array_index,
                 elem_index,
+                item_ty,
                 ..
             } => {
                 let (reg, kc) = self.lookup_reg_with_kind(*elem_index, regallocs);
@@ -627,10 +650,13 @@ impl Assembler {
                 state.code.push((descr_idx & 0xFF) as u8);
                 state.code.push((descr_idx >> 8) as u8);
                 argcodes.push('d');
-                // Second descriptor: array items descriptor (placeholder).
+                // Second descriptor: array items descriptor.
                 let descr_idx2 = self.descrs.len();
-                self.descrs
-                    .push(crate::jitcode::BhDescr::Array { itemsize: 8 });
+                self.descrs.push(crate::jitcode::BhDescr::Array {
+                    itemsize: value_type_to_itemsize(item_ty),
+                    is_array_of_pointers: matches!(item_ty, crate::model::ValueType::Ref),
+                    is_array_of_structs: false,
+                });
                 state.code.push((descr_idx2 & 0xFF) as u8);
                 state.code.push((descr_idx2 >> 8) as u8);
                 argcodes.push('d');
@@ -649,6 +675,7 @@ impl Assembler {
                 array_index,
                 elem_index,
                 value,
+                item_ty,
                 ..
             } => {
                 let (reg, kc) = self.lookup_reg_with_kind(*elem_index, regallocs);
@@ -665,10 +692,13 @@ impl Assembler {
                 state.code.push((descr_idx & 0xFF) as u8);
                 state.code.push((descr_idx >> 8) as u8);
                 argcodes.push('d');
-                // Second descriptor: array items descriptor (placeholder).
+                // Second descriptor: array items descriptor.
                 let descr_idx2 = self.descrs.len();
-                self.descrs
-                    .push(crate::jitcode::BhDescr::Array { itemsize: 8 });
+                self.descrs.push(crate::jitcode::BhDescr::Array {
+                    itemsize: value_type_to_itemsize(item_ty),
+                    is_array_of_pointers: matches!(item_ty, crate::model::ValueType::Ref),
+                    is_array_of_structs: false,
+                });
                 state.code.push((descr_idx2 & 0xFF) as u8);
                 state.code.push((descr_idx2 >> 8) as u8);
                 argcodes.push('d');
@@ -832,6 +862,17 @@ fn value_type_to_kind(ty: &crate::model::ValueType) -> char {
         ValueType::Ref => 'r',
         ValueType::Float => 'f',
         ValueType::Void | ValueType::State | ValueType::Unknown => 'v',
+    }
+}
+
+/// Map ValueType to itemsize in bytes (used for ArrayDescr).
+fn value_type_to_itemsize(ty: &crate::model::ValueType) -> usize {
+    use crate::model::ValueType;
+    match ty {
+        ValueType::Int => 8,   // i64
+        ValueType::Ref => 8,   // pointer
+        ValueType::Float => 8, // f64
+        _ => 8,                // default
     }
 }
 

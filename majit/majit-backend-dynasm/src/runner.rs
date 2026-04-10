@@ -737,7 +737,7 @@ impl Backend for DynasmBackend {
     }
 
     fn bh_new(&self, sizedescr: &majit_codewriter::jitcode::BhDescr) -> i64 {
-        let size = sizedescr.as_offset();
+        let size = sizedescr.as_size();
         let ptr = unsafe { libc::malloc(size) };
         if !ptr.is_null() {
             unsafe { libc::memset(ptr, 0, size) };
@@ -746,14 +746,19 @@ impl Backend for DynasmBackend {
     }
 
     fn bh_new_with_vtable(&self, sizedescr: &majit_codewriter::jitcode::BhDescr) -> i64 {
-        let size = sizedescr.as_offset();
+        let size = sizedescr.as_size();
+        let vtable = sizedescr.get_vtable();
         let ptr = unsafe { libc::malloc(size) };
         if !ptr.is_null() {
             unsafe {
                 libc::memset(ptr, 0, size);
-                // llmodel.py:778-782 bh_new_with_vtable: write_int_at_mem(
-                //     res, self.vtable_offset, WORD, sizedescr.get_vtable())
-                // TODO: vtable from BhDescr when available
+                // llmodel.py:780-782: if self.vtable_offset is not None:
+                //   self.write_int_at_mem(res, self.vtable_offset, WORD, sizedescr.get_vtable())
+                if let Some(vt_off) = self.vtable_offset {
+                    if vtable != 0 {
+                        *((ptr as *mut u8).add(vt_off) as *mut usize) = vtable;
+                    }
+                }
             }
         }
         ptr as i64
