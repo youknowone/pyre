@@ -7,6 +7,7 @@
 /// for field access, array access, function calls, and guard failures.
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::sync::Weak;
 
 use crate::OpRef;
@@ -15,6 +16,38 @@ use serde::{Deserialize, Serialize};
 
 /// Opaque reference to a descriptor, shared across the JIT pipeline.
 pub type DescrRef = Arc<dyn Descr>;
+
+static ALL_DESCRS: OnceLock<Mutex<Vec<Option<DescrRef>>>> = OnceLock::new();
+
+fn all_descrs() -> &'static Mutex<Vec<Option<DescrRef>>> {
+    ALL_DESCRS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// pyjitpl.py:2288-2290 `metainterp_sd.all_descrs`.
+///
+/// RPython resolves heap descr indices during bridgeopt/resume decoding
+/// through `metainterp_sd.all_descrs[descr_index]`. majit uses `Descr::index()`
+/// as the stable descriptor index and stores the first descriptor created for
+/// each index in a global table matching that lookup shape.
+pub fn register_descr(descr: DescrRef) -> DescrRef {
+    let index = descr.index() as usize;
+    let mut descrs = all_descrs().lock().unwrap();
+    if index >= descrs.len() {
+        descrs.resize(index + 1, None);
+    }
+    if descrs[index].is_none() {
+        descrs[index] = Some(descr.clone());
+    }
+    descr
+}
+
+pub fn get_descr(index: u32) -> Option<DescrRef> {
+    all_descrs()
+        .lock()
+        .unwrap()
+        .get(index as usize)
+        .and_then(|descr| descr.clone())
+}
 
 /// history.py: TargetToken / JitCellToken identity. PyPy keys
 /// `target_tokens_currently_compiling` and `consider_jump`'s
@@ -2042,23 +2075,25 @@ pub fn make_field_descr_full(
     field_type: Type,
     is_immutable: bool,
 ) -> DescrRef {
-    std::sync::Arc::new(SimpleFieldDescr::new(
+    register_descr(std::sync::Arc::new(SimpleFieldDescr::new(
         index,
         offset,
         field_size,
         field_type,
         is_immutable,
-    ))
+    )))
 }
 
 /// Create a size descriptor.
 pub fn make_size_descr(size: usize) -> DescrRef {
-    std::sync::Arc::new(SimpleSizeDescr::new(0, size, 0))
+    register_descr(std::sync::Arc::new(SimpleSizeDescr::new(0, size, 0)))
 }
 
 /// Create a size descriptor with explicit index and type_id.
 pub fn make_size_descr_full(index: u32, size: usize, type_id: u32) -> DescrRef {
-    std::sync::Arc::new(SimpleSizeDescr::new(index, size, type_id))
+    register_descr(std::sync::Arc::new(SimpleSizeDescr::new(
+        index, size, type_id,
+    )))
 }
 
 /// Create a size descriptor with vtable (for NEW_WITH_VTABLE objects).
@@ -2068,12 +2103,16 @@ pub fn make_size_descr_with_vtable(
     type_id: u32,
     vtable: usize,
 ) -> DescrRef {
-    std::sync::Arc::new(SimpleSizeDescr::with_vtable(index, size, type_id, vtable))
+    register_descr(std::sync::Arc::new(SimpleSizeDescr::with_vtable(
+        index, size, type_id, vtable,
+    )))
 }
 
 /// Create an array descriptor.
 pub fn make_array_descr(base_size: usize, item_size: usize, item_type: Type) -> DescrRef {
-    std::sync::Arc::new(SimpleArrayDescr::new(0, base_size, item_size, 0, item_type))
+    register_descr(std::sync::Arc::new(SimpleArrayDescr::new(
+        0, base_size, item_size, 0, item_type,
+    )))
 }
 
 /// Create an array descriptor with explicit index and type_id.
@@ -2084,14 +2123,14 @@ pub fn make_array_descr_full(
     type_id: u32,
     item_type: Type,
 ) -> DescrRef {
-    std::sync::Arc::new(SimpleArrayDescr::new(
+    register_descr(std::sync::Arc::new(SimpleArrayDescr::new(
         index, base_size, item_size, type_id, item_type,
-    ))
+    )))
 }
 
 /// Create a call descriptor.
 pub fn make_call_descr(arg_types: Vec<Type>, result_type: Type, effect: EffectInfo) -> DescrRef {
-    std::sync::Arc::new(SimpleCallDescr::new(
+    register_descr(std::sync::Arc::new(SimpleCallDescr::new(
         0,
         arg_types,
         result_type,
@@ -2101,7 +2140,7 @@ pub fn make_call_descr(arg_types: Vec<Type>, result_type: Type, effect: EffectIn
             Type::Void => 0,
         },
         effect,
-    ))
+    )))
 }
 
 /// Create a call descriptor with explicit index.
@@ -2112,28 +2151,39 @@ pub fn make_call_descr_full(
     result_size: usize,
     effect: EffectInfo,
 ) -> DescrRef {
-    std::sync::Arc::new(SimpleCallDescr::new(
+    register_descr(std::sync::Arc::new(SimpleCallDescr::new(
         index,
         arg_types,
         result_type,
         result_size,
         effect,
-    ))
+    )))
 }
 
 /// Create a fail descriptor.
 pub fn make_fail_descr(fail_index: u32, fail_arg_types: Vec<Type>) -> DescrRef {
-    std::sync::Arc::new(SimpleFailDescr::new(0, fail_index, fail_arg_types))
+    register_descr(std::sync::Arc::new(SimpleFailDescr::new(
+        0,
+        fail_index,
+        fail_arg_types,
+    )))
 }
 
 /// Create a finish descriptor.
 pub fn make_finish_descr(fail_index: u32, fail_arg_types: Vec<Type>) -> DescrRef {
-    std::sync::Arc::new(SimpleFailDescr::finish(0, fail_index, fail_arg_types))
+    register_descr(std::sync::Arc::new(SimpleFailDescr::finish(
+        0,
+        fail_index,
+        fail_arg_types,
+    )))
 }
 
 /// Create a loop TargetToken descriptor.
 pub fn make_loop_target_descr(token_id: u64, is_preamble_target: bool) -> DescrRef {
-    std::sync::Arc::new(BasicLoopTargetDescr::new(token_id, is_preamble_target))
+    register_descr(std::sync::Arc::new(BasicLoopTargetDescr::new(
+        token_id,
+        is_preamble_target,
+    )))
 }
 
 // ── descr.py: unpack helpers ──
