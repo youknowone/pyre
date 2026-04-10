@@ -470,13 +470,16 @@ impl Assembler {
             // RPython assembler.py:197-207: AbstractDescr → 2-byte index.
             // Field operations: register + descriptor.
             // RPython assembler.py:197-207: AbstractDescr → 2-byte index.
-            OpKind::FieldRead { base, .. } => {
+            OpKind::FieldRead { base, field, .. } => {
                 let (reg, kc) = self.lookup_reg_with_kind(*base, regallocs);
                 state.code.push(reg);
                 argcodes.push(kc);
                 let descr_idx = self.descrs.len();
-                self.descrs
-                    .push(crate::jitcode::BhDescr::Field { offset: 0 });
+                self.descrs.push(crate::jitcode::BhDescr::Field {
+                    offset: 0,
+                    name: field.name.clone(),
+                    owner: field.owner_root.clone().unwrap_or_default(),
+                });
                 state.code.push((descr_idx & 0xFF) as u8);
                 state.code.push((descr_idx >> 8) as u8);
                 argcodes.push('d');
@@ -491,7 +494,9 @@ impl Assembler {
                 let opnum = self.get_opnum(&key);
                 state.code[startposition] = opnum;
             }
-            OpKind::FieldWrite { base, value, .. } => {
+            OpKind::FieldWrite {
+                base, value, field, ..
+            } => {
                 let (reg, kc) = self.lookup_reg_with_kind(*base, regallocs);
                 state.code.push(reg);
                 argcodes.push(kc);
@@ -499,8 +504,11 @@ impl Assembler {
                 state.code.push(reg);
                 argcodes.push(kc);
                 let descr_idx = self.descrs.len();
-                self.descrs
-                    .push(crate::jitcode::BhDescr::Field { offset: 0 });
+                self.descrs.push(crate::jitcode::BhDescr::Field {
+                    offset: 0,
+                    name: field.name.clone(),
+                    owner: field.owner_root.clone().unwrap_or_default(),
+                });
                 state.code.push((descr_idx & 0xFF) as u8);
                 state.code.push((descr_idx >> 8) as u8);
                 argcodes.push('d');
@@ -559,10 +567,10 @@ impl Assembler {
             // Vable field/array: encode field_index as descriptor.
             // These don't have a base register (vable is implicit).
             OpKind::VableFieldRead { field_index, .. } => {
-                // RPython: field_index → descriptor index
+                // RPython: vable field → VableField descriptor (index, not byte offset).
                 let descr_idx = self.descrs.len();
-                self.descrs.push(crate::jitcode::BhDescr::Field {
-                    offset: *field_index,
+                self.descrs.push(crate::jitcode::BhDescr::VableField {
+                    index: *field_index,
                 });
                 state.code.push((descr_idx & 0xFF) as u8);
                 state.code.push((descr_idx >> 8) as u8);
@@ -585,8 +593,8 @@ impl Assembler {
                 state.code.push(reg);
                 argcodes.push(kc);
                 let descr_idx = self.descrs.len();
-                self.descrs.push(crate::jitcode::BhDescr::Field {
-                    offset: *field_index,
+                self.descrs.push(crate::jitcode::BhDescr::VableField {
+                    index: *field_index,
                 });
                 state.code.push((descr_idx & 0xFF) as u8);
                 state.code.push((descr_idx >> 8) as u8);
@@ -604,12 +612,20 @@ impl Assembler {
                 let (reg, kc) = self.lookup_reg_with_kind(*elem_index, regallocs);
                 state.code.push(reg);
                 argcodes.push(kc);
+                // RPython: two descriptors — fielddescr (vable array field) + arraydescr.
                 let descr_idx = self.descrs.len();
-                self.descrs.push(crate::jitcode::BhDescr::Array {
-                    itemsize: *array_index,
+                self.descrs.push(crate::jitcode::BhDescr::VableArray {
+                    index: *array_index,
                 });
                 state.code.push((descr_idx & 0xFF) as u8);
                 state.code.push((descr_idx >> 8) as u8);
+                argcodes.push('d');
+                // Second descriptor: array items descriptor (placeholder).
+                let descr_idx2 = self.descrs.len();
+                self.descrs
+                    .push(crate::jitcode::BhDescr::Array { itemsize: 8 });
+                state.code.push((descr_idx2 & 0xFF) as u8);
+                state.code.push((descr_idx2 >> 8) as u8);
                 argcodes.push('d');
                 if let Some(result) = op.result {
                     argcodes.push('>');
@@ -634,12 +650,20 @@ impl Assembler {
                 let (reg, kc) = self.lookup_reg_with_kind(*value, regallocs);
                 state.code.push(reg);
                 argcodes.push(kc);
+                // RPython: two descriptors — fielddescr (vable array field) + arraydescr.
                 let descr_idx = self.descrs.len();
-                self.descrs.push(crate::jitcode::BhDescr::Array {
-                    itemsize: *array_index,
+                self.descrs.push(crate::jitcode::BhDescr::VableArray {
+                    index: *array_index,
                 });
                 state.code.push((descr_idx & 0xFF) as u8);
                 state.code.push((descr_idx >> 8) as u8);
+                argcodes.push('d');
+                // Second descriptor: array items descriptor (placeholder).
+                let descr_idx2 = self.descrs.len();
+                self.descrs
+                    .push(crate::jitcode::BhDescr::Array { itemsize: 8 });
+                state.code.push((descr_idx2 & 0xFF) as u8);
+                state.code.push((descr_idx2 >> 8) as u8);
                 argcodes.push('d');
                 let opname = op_kind_to_opname(&op.kind);
                 let key = format!("{opname}/{argcodes}");
