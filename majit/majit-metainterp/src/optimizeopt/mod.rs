@@ -1203,9 +1203,19 @@ impl OptContext {
                     else {
                         return false;
                     };
+                    // shortpreamble.py:128 sb.produce_arg() parity: all args
+                    // (including const base objects) go through the same
+                    // import-local constant path so the builder tracks them.
                     let obj = match object {
                         ExportedShortArg::Slot(slot) => short_args.get(*slot).copied(),
-                        ExportedShortArg::Const { source, .. } => Some(*source),
+                        ExportedShortArg::Const { source, value } => {
+                            let opref = imported_constants.entry(*source).or_insert_with(|| {
+                                let opref = self.alloc_op_position();
+                                self.make_constant(opref, value.clone());
+                                opref
+                            });
+                            Some(*opref)
+                        }
                         ExportedShortArg::Produced(_) => None,
                     };
                     let Some(obj) = obj else {

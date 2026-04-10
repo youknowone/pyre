@@ -458,8 +458,17 @@ fn decode_tagged(
             // resume.py:1245 decode_box(num, kind) parity — pull the
             // box's `.type` from the parent guard's fail_arg_types,
             // which `_number_boxes` populated when encoding via
-            // `env.get_type(opref)`.
-            let kind = fail_arg_types.get(index).copied().unwrap_or(Type::Ref);
+            // `env.get_type(opref)`. resume.py:1264 asserts
+            // `box.type == kind`; a mismatch here means the
+            // fail_arg_types vector is shorter than expected (encoder/
+            // decoder count disagreement).
+            let kind = fail_arg_types.get(index).copied().unwrap_or_else(|| {
+                panic!(
+                    "decode_tagged: TAGBOX index {} out of fail_arg_types (len {})",
+                    index,
+                    fail_arg_types.len()
+                )
+            });
             RebuiltValue::Box(index, kind)
         }
         TAGVIRTUAL => RebuiltValue::Virtual(val as usize),
