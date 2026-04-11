@@ -2256,22 +2256,20 @@ fn materialize_virtual_from_rd(
             return result;
         }
         majit_ir::RdVirtualInfo::VRawBufferInfo {
+            func,
             size,
             offsets,
             entry_sizes,
+            entry_types,
+            entry_signed,
             fieldnums,
-            ..
         } => {
-            // resume.py:701-708: allocate_raw_buffer + setrawbuffer_item
-            let buffer = unsafe {
-                std::alloc::alloc_zeroed(
-                    std::alloc::Layout::from_size_align(*size, 8)
-                        .unwrap_or(std::alloc::Layout::new::<u8>()),
-                )
-            };
+            // resume.py:701-703: buffer = decoder.allocate_raw_buffer(self.func, self.size)
+            let buffer = allocate_raw_buffer_by_func(*func, *size);
             // resume.py:704: cache BEFORE filling fields.
             let result = Value::Int(buffer as i64);
             virtuals_cache.insert(vidx, result.clone());
+            // resume.py:705-708: setrawbuffer_item per entry
             for (i, &fnum) in fieldnums.iter().enumerate() {
                 if let Some(val) = decode_tagged_fieldnum(
                     fnum,
@@ -2282,22 +2280,17 @@ fn materialize_virtual_from_rd(
                     virtuals_cache,
                 ) {
                     let offset = offsets.get(i).copied().unwrap_or(i * 8);
-                    let esz = entry_sizes.get(i).copied().unwrap_or(8);
-                    if offset + esz <= *size {
-                        let raw = match val {
-                            Value::Int(n) => n,
-                            Value::Float(f) => f.to_bits() as i64,
-                            _ => 0,
-                        };
-                        unsafe {
-                            match esz {
-                                1 => *(buffer.add(offset) as *mut u8) = raw as u8,
-                                2 => *(buffer.add(offset) as *mut u16) = raw as u16,
-                                4 => *(buffer.add(offset) as *mut u32) = raw as u32,
-                                _ => *(buffer.add(offset) as *mut i64) = raw,
-                            }
-                        }
-                    }
+                    let descr = majit_ir::RawBufferDescr {
+                        itemsize: entry_sizes.get(i).copied().unwrap_or(8),
+                        is_signed: entry_signed.get(i).copied().unwrap_or(true),
+                        kind: entry_types.get(i).copied().unwrap_or(1),
+                    };
+                    let raw = match val {
+                        Value::Int(n) => n,
+                        Value::Float(f) => f.to_bits() as i64,
+                        _ => 0,
+                    };
+                    write_rawbuffer_item(buffer, offset, raw, &descr);
                 }
             }
             return result;

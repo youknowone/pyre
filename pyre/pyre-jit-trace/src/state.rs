@@ -3474,9 +3474,11 @@ impl PyreJitState {
             | MaterializedVirtual::Obj { fields, .. } => {
                 self.materialize_virtual_object(fields, materialized_refs)
             }
-            MaterializedVirtual::RawBuffer { size, entries, .. } => {
-                materialize_virtual_raw_buffer(*size, entries, materialized_refs)
-            }
+            MaterializedVirtual::RawBuffer {
+                func,
+                size,
+                entries,
+            } => materialize_virtual_raw_buffer(*func, *size, entries, materialized_refs),
             _ => None,
         }
     }
@@ -3556,39 +3558,70 @@ impl PyreJitState {
     }
 }
 
+/// resume.py:701-708 VRawBufferInfo.allocate_int parity.
 fn materialize_virtual_raw_buffer(
+    func: i64,
     size: usize,
     entries: &[(
         usize,
-        majit_metainterp::optimizeopt::info::RawBufferDescr,
+        majit_ir::RawBufferDescr,
         majit_metainterp::resume::MaterializedValue,
     )],
     materialized_refs: &[Option<majit_ir::GcRef>],
 ) -> Option<majit_ir::GcRef> {
-    use std::alloc::{Layout, alloc_zeroed};
-
-    let layout = Layout::from_size_align(size.max(1), 8).ok()?;
-    let ptr = unsafe { alloc_zeroed(layout) };
+    // resume.py:703: buffer = decoder.allocate_raw_buffer(self.func, self.size)
+    let ptr = allocate_raw_buffer_by_func(func, size);
     if ptr.is_null() {
         return None;
     }
 
+    // resume.py:705-708: setrawbuffer_item per entry
     for (offset, descr, value) in entries {
         let concrete = value.resolve_with_refs(materialized_refs)?;
-        // resume.py:1543-1550 setrawbuffer_item: dispatch by descr
-        unsafe {
-            let slot = ptr.add(*offset);
-            match descr.itemsize {
-                1 => slot.write(concrete as u8),
-                2 => (slot as *mut u16).write_unaligned(concrete as u16),
-                4 => (slot as *mut u32).write_unaligned(concrete as u32),
-                8 => (slot as *mut u64).write_unaligned(concrete as u64),
-                _ => return None,
-            }
-        }
+        write_rawbuffer_item(ptr, *offset, concrete, descr);
     }
 
     Some(majit_ir::GcRef(ptr as usize))
+}
+
+/// resume.py:1124-1132 allocate_raw_buffer(func, size).
+fn allocate_raw_buffer_by_func(func: i64, size: usize) -> *mut u8 {
+    if func != 0 {
+        let f: fn(usize) -> *mut u8 = unsafe { std::mem::transmute(func as usize) };
+        let ptr = f(size);
+        if !ptr.is_null() {
+            return ptr;
+        }
+    }
+    unsafe {
+        std::alloc::alloc_zeroed(
+            std::alloc::Layout::from_size_align(size.max(1), 8)
+                .unwrap_or(std::alloc::Layout::new::<u8>()),
+        )
+    }
+}
+
+/// resume.py:1543-1550 setrawbuffer_item: write raw value by descr.
+fn write_rawbuffer_item(ptr: *mut u8, offset: usize, raw: i64, descr: &majit_ir::RawBufferDescr) {
+    debug_assert!(descr.kind != 0, "raw buffer entry cannot be pointer");
+    unsafe {
+        let slot = ptr.add(offset);
+        if descr.kind == 2 {
+            match descr.itemsize {
+                8 => (slot as *mut u64).write_unaligned(raw as u64),
+                4 => (slot as *mut u32).write_unaligned(raw as u32),
+                _ => unreachable!("float itemsize must be 4 or 8"),
+            }
+        } else {
+            match descr.itemsize {
+                1 => slot.write(raw as u8),
+                2 => (slot as *mut u16).write_unaligned(raw as u16),
+                4 => (slot as *mut u32).write_unaligned(raw as u32),
+                8 => (slot as *mut u64).write_unaligned(raw as u64),
+                _ => unreachable!("int itemsize must be 1/2/4/8"),
+            }
+        }
+    }
 }
 
 fn value_to_ptr(value: &Value) -> PyObjectRef {

@@ -2283,6 +2283,18 @@ impl RawBufferDescr {
             })
             .unwrap_or_default()
     }
+
+    /// Reconstruct a DescrRef (ArrayDescr) from this summary.
+    /// Used when emitting RAW_STORE ops during _force_elements
+    /// (info.py:420: ResOperation(rop.RAW_STORE, ..., descr=descr)).
+    pub fn to_descr_ref(&self) -> DescrRef {
+        let item_type = match self.kind {
+            0 => crate::Type::Ref,
+            2 => crate::Type::Float,
+            _ => crate::Type::Int,
+        };
+        make_array_descr(0, self.itemsize, item_type)
+    }
 }
 
 impl Default for RawBufferDescr {
