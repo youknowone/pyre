@@ -6,29 +6,8 @@ use crate::optimizeopt::intutils::IntBound;
 /// pointer info, virtual object state).
 use majit_ir::{Descr, DescrRef, GcRef, Op, OpCode, OpRef, Value};
 
-fn lookup_field_descr(
-    owner_descr: &DescrRef,
-    field_descrs: &[DescrRef],
-    field_idx: u32,
-) -> Option<DescrRef> {
-    if let Some(size_descr) = owner_descr.as_size_descr() {
-        if let Some(field_descr) = size_descr.all_field_descrs().get(field_idx as usize) {
-            return Some(field_descr.clone() as DescrRef);
-        }
-    }
-    // Slot-indexed lookup matching the parent-local layout.
-    if let Some(d) = field_descrs.get(field_idx as usize).cloned() {
-        return Some(d);
-    }
-    // Backward compat for sparse / legacy fixtures: search by descr.index().
-    // Real pyjitpl traces always populate field_descrs as a dense slot
-    // vector, but some lib-test fixtures store a single entry per field
-    // without padding. Falling back to descr.index() lets those fixtures
-    // continue to round-trip force_box correctly.
-    field_descrs
-        .iter()
-        .find(|d| d.index() == field_idx)
-        .cloned()
+fn lookup_field_descr(field_descrs: &[DescrRef], field_idx: u32) -> Option<DescrRef> {
+    field_descrs.get(field_idx as usize).cloned()
 }
 
 /// resoperation.py: AbstractResOpOrInputArg._forwarded
@@ -1192,8 +1171,7 @@ impl PtrInfo {
                         for &(field_idx, val_ref) in fields.iter() {
                             let resolved = ctx.get_box_replacement(val_ref);
                             if let Some(value) = ctx.get_constant(resolved) {
-                                if let Some(fd) = lookup_field_descr(descr, field_descrs, field_idx)
-                                {
+                                if let Some(fd) = lookup_field_descr(field_descrs, field_idx) {
                                     if let Some(field_d) = fd.as_field_descr() {
                                         let offset = field_d.offset();
                                         match value {
@@ -1248,18 +1226,19 @@ impl PtrInfo {
                 }
                 for (field_idx, value_ref) in std::mem::take(&mut vinfo.fields) {
                     let value_ref = force_child(value_ref, ctx);
-                    let descr = lookup_field_descr(&vinfo.descr, &vinfo.field_descrs, field_idx);
+                    let descr = lookup_field_descr(&vinfo.field_descrs, field_idx);
                     debug_assert!(
                         descr.is_some(),
                         "force_box: field_idx={} has value but no descriptor \
                          — field_descrs out of sync with fields",
                         field_idx,
                     );
-                    if let Some(descr) = descr {
-                        let mut set_op = Op::new(OpCode::SetfieldGc, &[alloc_ref, value_ref]);
-                        set_op.descr = Some(descr);
-                        emit_op(ctx, set_op);
-                    }
+                    let descr = descr.expect(
+                        "force_box: field_idx must resolve through descr.get_all_fielddescrs()[i]",
+                    );
+                    let mut set_op = Op::new(OpCode::SetfieldGc, &[alloc_ref, value_ref]);
+                    set_op.descr = Some(descr);
+                    emit_op(ctx, set_op);
                 }
                 alloc_ref
             }
@@ -1285,18 +1264,13 @@ impl PtrInfo {
                 }
                 for (field_idx, value_ref) in std::mem::take(&mut vinfo.fields) {
                     let value_ref = force_child(value_ref, ctx);
-                    let descr = lookup_field_descr(&vinfo.descr, &vinfo.field_descrs, field_idx);
-                    // RPython: descriptors always exist — _fields[i] maps
-                    // to descr.get_all_fielddescrs()[i]. Real pyjitpl traces
-                    // always supply the descr; lib-test fixtures sometimes
-                    // omit it because they only exercise the structural
-                    // shape. Skip the SetfieldGc emission silently in that
-                    // case so tests can run without bespoke descr plumbing.
-                    if let Some(descr) = descr {
-                        let mut set_op = Op::new(OpCode::SetfieldGc, &[alloc_ref, value_ref]);
-                        set_op.descr = Some(descr);
-                        emit_op(ctx, set_op);
-                    }
+                    let descr = lookup_field_descr(&vinfo.field_descrs, field_idx);
+                    let descr = descr.expect(
+                        "force_box: field_idx must resolve through descr.get_all_fielddescrs()[i]",
+                    );
+                    let mut set_op = Op::new(OpCode::SetfieldGc, &[alloc_ref, value_ref]);
+                    set_op.descr = Some(descr);
+                    emit_op(ctx, set_op);
                 }
                 alloc_ref
             }
@@ -1726,39 +1700,43 @@ impl PtrInfo {
             .collect();
         match self {
             PtrInfo::Instance(v) => {
-                v.descr = Some(descr);
-                if index >= all_field_descrs.len() {
-                    return;
-                }
-                if v.field_descrs.len() < all_field_descrs.len() {
+                if v.field_descrs.is_empty() {
+                    v.descr = Some(descr);
                     v.field_descrs = all_field_descrs;
+                } else if index >= v.field_descrs.len() {
+                    v.descr = Some(descr);
+                    v.field_descrs
+                        .extend(all_field_descrs.into_iter().skip(v.field_descrs.len()));
                 }
             }
             PtrInfo::Struct(v) => {
-                v.descr = descr;
-                if index >= all_field_descrs.len() {
-                    return;
-                }
-                if v.field_descrs.len() < all_field_descrs.len() {
+                if v.field_descrs.is_empty() {
+                    v.descr = descr;
                     v.field_descrs = all_field_descrs;
+                } else if index >= v.field_descrs.len() {
+                    v.descr = descr;
+                    v.field_descrs
+                        .extend(all_field_descrs.into_iter().skip(v.field_descrs.len()));
                 }
             }
             PtrInfo::Virtual(v) => {
-                v.descr = descr;
-                if index >= all_field_descrs.len() {
-                    return;
-                }
-                if v.field_descrs.len() < all_field_descrs.len() {
+                if v.field_descrs.is_empty() {
+                    v.descr = descr;
                     v.field_descrs = all_field_descrs;
+                } else if index >= v.field_descrs.len() {
+                    v.descr = descr;
+                    v.field_descrs
+                        .extend(all_field_descrs.into_iter().skip(v.field_descrs.len()));
                 }
             }
             PtrInfo::VirtualStruct(v) => {
-                v.descr = descr;
-                if index >= all_field_descrs.len() {
-                    return;
-                }
-                if v.field_descrs.len() < all_field_descrs.len() {
+                if v.field_descrs.is_empty() {
+                    v.descr = descr;
                     v.field_descrs = all_field_descrs;
+                } else if index >= v.field_descrs.len() {
+                    v.descr = descr;
+                    v.field_descrs
+                        .extend(all_field_descrs.into_iter().skip(v.field_descrs.len()));
                 }
             }
             _ => {}
@@ -2113,26 +2091,18 @@ impl PtrInfo {
         if let PtrInfo::Virtual(v) = self {
             for &(field_idx, value) in &v.fields {
                 if !value.is_none() {
-                    if let Some(descr) = lookup_field_descr(&v.descr, &v.field_descrs, field_idx) {
-                        result.push(Op::with_descr(
-                            OpCode::GetfieldGcI,
-                            &[structbox],
-                            descr.clone(),
-                        ));
-                    }
+                    let descr = lookup_field_descr(&v.field_descrs, field_idx)
+                        .expect("produce_short_preamble_ops: virtual field descr missing");
+                    result.push(Op::with_descr(OpCode::GetfieldGcI, &[structbox], descr));
                 }
             }
         }
         if let PtrInfo::VirtualStruct(v) = self {
             for &(field_idx, value) in &v.fields {
                 if !value.is_none() {
-                    if let Some(descr) = lookup_field_descr(&v.descr, &v.field_descrs, field_idx) {
-                        result.push(Op::with_descr(
-                            OpCode::GetfieldGcI,
-                            &[structbox],
-                            descr.clone(),
-                        ));
-                    }
+                    let descr = lookup_field_descr(&v.field_descrs, field_idx)
+                        .expect("produce_short_preamble_ops: virtual struct field descr missing");
+                    result.push(Op::with_descr(OpCode::GetfieldGcI, &[structbox], descr));
                 }
             }
         }
