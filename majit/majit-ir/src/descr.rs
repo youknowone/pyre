@@ -5,6 +5,8 @@
 ///
 /// Descriptors carry type metadata needed by the optimizer and backend
 /// for field access, array access, function calls, and guard failures.
+///
+/// RawBufferDescr: rawbuffer.py per-entry ArrayDescr summary.
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
@@ -2237,4 +2239,58 @@ pub fn unpack_interiorfielddescr(descr: &DescrRef) -> Option<(usize, usize, usiz
         fd.field_size(),
         fd.field_type(),
     ))
+}
+
+/// rawbuffer.py:83-87 `_descrs_are_compatible`: two arraydescrs are
+/// compatible iff `cpu.unpack_arraydescr_size` yields the same
+/// `(basesize, itemsize, sign)`. For raw (length-less) arrays basesize
+/// is always 0, so we store `(itemsize, is_signed, kind)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RawBufferDescr {
+    /// descr.py ArrayDescr.itemsize — element width in bytes (1, 2, 4, 8).
+    pub itemsize: usize,
+    /// descr.py ArrayDescr.is_item_signed() — FLAG_SIGNED vs FLAG_UNSIGNED.
+    pub is_signed: bool,
+    /// 0=ref (is_array_of_pointers), 1=int, 2=float (is_array_of_floats).
+    pub kind: u8,
+}
+
+impl RawBufferDescr {
+    /// rawbuffer.py:85 `unpack(d1) == unpack(d2)` — RPython compat check.
+    pub fn is_compatible(&self, other: &Self) -> bool {
+        self.itemsize == other.itemsize && self.is_signed == other.is_signed
+    }
+
+    /// virtualize.py:351 `_unpack_raw_load_store_op`:
+    /// Extract RawBufferDescr from an Op's ArrayDescr.
+    pub fn from_op_descr(descr: &Option<DescrRef>) -> Self {
+        descr
+            .as_ref()
+            .and_then(|d| d.as_array_descr())
+            .map(|ad| {
+                let kind = if ad.is_array_of_pointers() {
+                    0
+                } else if ad.is_array_of_floats() {
+                    2
+                } else {
+                    1
+                };
+                RawBufferDescr {
+                    itemsize: ad.item_size(),
+                    is_signed: ad.is_item_signed(),
+                    kind,
+                }
+            })
+            .unwrap_or_default()
+    }
+}
+
+impl Default for RawBufferDescr {
+    fn default() -> Self {
+        Self {
+            itemsize: 8,
+            is_signed: true,
+            kind: 1, // int
+        }
+    }
 }

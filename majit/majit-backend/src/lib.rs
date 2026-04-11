@@ -138,9 +138,17 @@ pub enum ExitVirtualLayout {
         offset: usize,
         base: ExitValueSourceLayout,
     },
+    /// resume.py:692 VRawBufferInfo(func, size, offsets, descrs).
     RawBuffer {
+        /// resume.py:694
+        func: i64,
+        /// resume.py:695
         size: usize,
-        entries: Vec<(usize, usize, ExitValueSourceLayout)>,
+        /// resume.py:696 self.offsets
+        offsets: Vec<usize>,
+        /// resume.py:697 self.descrs
+        descrs: Vec<majit_ir::RawBufferDescr>,
+        sources: Vec<ExitValueSourceLayout>,
     },
 }
 
@@ -234,17 +242,20 @@ impl ExitVirtualLayout {
                     })
                     .collect(),
             },
-            Self::RawBuffer { size, entries } => Self::RawBuffer {
+            Self::RawBuffer {
+                func,
+                size,
+                offsets,
+                descrs,
+                sources,
+            } => Self::RawBuffer {
+                func: *func,
                 size: *size,
-                entries: entries
+                offsets: offsets.clone(),
+                descrs: descrs.clone(),
+                sources: sources
                     .iter()
-                    .map(|(offset, entry_size, source)| {
-                        (
-                            *offset,
-                            *entry_size,
-                            source.shifted_virtuals(virtual_offset),
-                        )
-                    })
+                    .map(|s| s.shifted_virtuals(virtual_offset))
                     .collect(),
             },
         }
@@ -341,14 +352,20 @@ impl PartialEq for ExitVirtualLayout {
             ) => a1 == b1 && a2 == b2,
             (
                 Self::RawBuffer {
+                    func: af,
                     size: a1,
-                    entries: a2,
+                    offsets: a2,
+                    descrs: a3,
+                    sources: a4,
                 },
                 Self::RawBuffer {
+                    func: bf,
                     size: b1,
-                    entries: b2,
+                    offsets: b2,
+                    descrs: b3,
+                    sources: b4,
                 },
-            ) => a1 == b1 && a2 == b2,
+            ) => af == bf && a1 == b1 && a2 == b2 && a3 == b3 && a4 == b4,
             _ => false,
         }
     }

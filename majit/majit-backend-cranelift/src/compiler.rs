@@ -10033,23 +10033,29 @@ fn collect_guards(
                             }
                         }
                         majit_ir::RdVirtualInfo::VRawBufferInfo {
+                            func,
                             size,
                             offsets,
                             entry_sizes,
+                            entry_types,
+                            entry_signed,
                             fieldnums,
-                            ..
                         } => ExitVirtualLayout::RawBuffer {
+                            func: *func,
                             size: *size,
-                            entries: fieldnums
+                            offsets: offsets.clone(),
+                            descrs: entry_sizes
                                 .iter()
                                 .enumerate()
-                                .map(|(i, &fnum)| {
-                                    (
-                                        offsets.get(i).copied().unwrap_or(i * 8),
-                                        entry_sizes.get(i).copied().unwrap_or(8),
-                                        resolve_fieldnum(fnum),
-                                    )
+                                .map(|(i, &itemsize)| majit_ir::RawBufferDescr {
+                                    itemsize,
+                                    is_signed: entry_signed.get(i).copied().unwrap_or(true),
+                                    kind: entry_types.get(i).copied().unwrap_or(1),
                                 })
+                                .collect(),
+                            sources: fieldnums
+                                .iter()
+                                .map(|&fnum| resolve_fieldnum(fnum))
                                 .collect(),
                         },
                         majit_ir::RdVirtualInfo::VRawSliceInfo { offset, fieldnums } => {

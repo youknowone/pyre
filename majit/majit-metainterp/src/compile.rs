@@ -538,47 +538,59 @@ pub(crate) fn build_guard_metadata(
                                     }
                                 }
                                 majit_ir::RdVirtualInfo::VRawBufferInfo {
+                                    func,
                                     size,
                                     offsets,
                                     entry_sizes,
+                                    entry_types,
+                                    entry_signed,
                                     fieldnums,
-                                    ..
                                 } => {
-                                    let entries = fieldnums
-                                        .iter()
-                                        .enumerate()
-                                        .map(|(i, &fnum)| {
-                                            let offset = offsets.get(i).copied().unwrap_or(i * 8);
-                                            let esz = entry_sizes.get(i).copied().unwrap_or(8);
-                                            let (val, tagbits) = majit_ir::resumedata::untag(fnum);
-                                            let source = match tagbits {
-                                                majit_ir::resumedata::TAGBOX => {
-                                                    ExitValueSourceLayout::ExitValue(val as usize)
-                                                }
-                                                majit_ir::resumedata::TAGVIRTUAL => {
-                                                    ExitValueSourceLayout::Virtual(val as usize)
-                                                }
-                                                majit_ir::resumedata::TAGINT => {
-                                                    ExitValueSourceLayout::Constant(val as i64)
-                                                }
-                                                majit_ir::resumedata::TAGCONST => {
-                                                    let idx = (val
-                                                        - majit_ir::resumedata::TAG_CONST_OFFSET)
-                                                        as usize;
-                                                    let c = rd_consts_ref
-                                                        .get(idx)
-                                                        .map(|(v, _)| *v)
-                                                        .unwrap_or(0);
-                                                    ExitValueSourceLayout::Constant(c)
-                                                }
-                                                _ => ExitValueSourceLayout::Constant(0),
-                                            };
-                                            (offset, esz, source)
-                                        })
-                                        .collect();
+                                    let mut out_offsets = Vec::new();
+                                    let mut out_descrs = Vec::new();
+                                    let mut out_sources = Vec::new();
+                                    for (i, &fnum) in fieldnums.iter().enumerate() {
+                                        let offset = offsets.get(i).copied().unwrap_or(i * 8);
+                                        let itemsize = entry_sizes.get(i).copied().unwrap_or(8);
+                                        let kind = entry_types.get(i).copied().unwrap_or(1);
+                                        let signed = entry_signed.get(i).copied().unwrap_or(true);
+                                        let (val, tagbits) = majit_ir::resumedata::untag(fnum);
+                                        let source = match tagbits {
+                                            majit_ir::resumedata::TAGBOX => {
+                                                ExitValueSourceLayout::ExitValue(val as usize)
+                                            }
+                                            majit_ir::resumedata::TAGVIRTUAL => {
+                                                ExitValueSourceLayout::Virtual(val as usize)
+                                            }
+                                            majit_ir::resumedata::TAGINT => {
+                                                ExitValueSourceLayout::Constant(val as i64)
+                                            }
+                                            majit_ir::resumedata::TAGCONST => {
+                                                let idx = (val
+                                                    - majit_ir::resumedata::TAG_CONST_OFFSET)
+                                                    as usize;
+                                                let c = rd_consts_ref
+                                                    .get(idx)
+                                                    .map(|(v, _)| *v)
+                                                    .unwrap_or(0);
+                                                ExitValueSourceLayout::Constant(c)
+                                            }
+                                            _ => ExitValueSourceLayout::Constant(0),
+                                        };
+                                        out_offsets.push(offset);
+                                        out_descrs.push(majit_ir::RawBufferDescr {
+                                            itemsize,
+                                            is_signed: signed,
+                                            kind,
+                                        });
+                                        out_sources.push(source);
+                                    }
                                     majit_backend::ExitVirtualLayout::RawBuffer {
+                                        func: *func,
                                         size: *size,
-                                        entries,
+                                        offsets: out_offsets,
+                                        descrs: out_descrs,
+                                        sources: out_sources,
                                     }
                                 }
                                 majit_ir::RdVirtualInfo::VRawSliceInfo { offset, fieldnums } => {
