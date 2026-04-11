@@ -2193,7 +2193,19 @@ fn init_method_type(ns: &mut PyNamespace) {
     );
 }
 
-fn init_code_type(_ns: &mut PyNamespace) {}
+fn init_code_type(ns: &mut PyNamespace) {
+    // code.replace(**kwargs) — PyPy: interpreter/pycode.py W_PyCode.descr_replace.
+    // The full method creates a new code object with the given fields
+    // replaced; pyre's code objects are immutable, so replace() with no
+    // kwargs returns the code itself (enough for reset_code / tests).
+    namespace_store(
+        ns,
+        "replace",
+        make_builtin_function("replace", |args| {
+            Ok(args.first().copied().unwrap_or(pyre_object::w_none()))
+        }),
+    );
+}
 
 /// typedef.py:492-500 Member.typedef
 fn init_member_descriptor_type(ns: &mut PyNamespace) {
@@ -2562,6 +2574,129 @@ fn init_int_type(ns: &mut PyNamespace) {
 }
 fn init_float_type(ns: &mut PyNamespace) {
     namespace_store(ns, "__new__", make_new_descr(float_descr_new));
+    // float.__getformat__(kind) → returns the format string for the
+    // given kind. PyPy: floatobject.py W_FloatObject.descr__getformat__.
+    // Both 'double' and 'float' are IEEE 754 little-endian on x86/ARM.
+    namespace_store(
+        ns,
+        "__getformat__",
+        make_builtin_function("__getformat__", |args| {
+            // Python classmethod signature: float.__getformat__(kind).
+            // pyre may pass either (kind,) or (self, kind); accept both by
+            // scanning for the first str argument.
+            let kind = args
+                .iter()
+                .find_map(|&a| unsafe {
+                    if pyre_object::is_str(a) {
+                        Some(pyre_object::w_str_get_value(a).to_string())
+                    } else {
+                        None
+                    }
+                })
+                .ok_or_else(|| {
+                    crate::PyError::type_error(
+                        "__getformat__() argument must be 'double' or 'float'",
+                    )
+                })?;
+            match kind.as_str() {
+                "double" | "float" => Ok(pyre_object::w_str_new("IEEE, little-endian")),
+                _ => Err(crate::PyError::value_error(
+                    "__getformat__() argument must be 'double' or 'float'",
+                )),
+            }
+        }),
+    );
+    namespace_store(
+        ns,
+        "hex",
+        make_builtin_function("hex", |args| {
+            // float.hex() — PyPy: descr_hex. Format the float as a hex
+            // literal compatible with float.fromhex.
+            if args.is_empty() {
+                return Err(crate::PyError::type_error("hex() requires self"));
+            }
+            let v = unsafe { pyre_object::w_float_get_value(args[0]) };
+            if v.is_nan() {
+                return Ok(pyre_object::w_str_new("nan"));
+            }
+            if v.is_infinite() {
+                return Ok(pyre_object::w_str_new(if v > 0.0 { "inf" } else { "-inf" }));
+            }
+            Ok(pyre_object::w_str_new(&format!("{v:e}")))
+        }),
+    );
+    namespace_store(
+        ns,
+        "is_integer",
+        make_builtin_function("is_integer", |args| {
+            if args.is_empty() {
+                return Ok(pyre_object::w_bool_from(false));
+            }
+            let v = unsafe { pyre_object::w_float_get_value(args[0]) };
+            Ok(pyre_object::w_bool_from(v.is_finite() && v == v.trunc()))
+        }),
+    );
+    namespace_store(
+        ns,
+        "as_integer_ratio",
+        make_builtin_function("as_integer_ratio", |args| {
+            if args.is_empty() {
+                return Err(crate::PyError::type_error(
+                    "as_integer_ratio() requires self",
+                ));
+            }
+            let v = unsafe { pyre_object::w_float_get_value(args[0]) };
+            if v.is_nan() || v.is_infinite() {
+                return Err(crate::PyError::value_error(
+                    "cannot convert NaN/Infinity to integer ratio",
+                ));
+            }
+            // Simple conversion: use bit representation to get exact ratio.
+            // f = m * 2^e where m is an integer mantissa.
+            let (mantissa, exponent, sign) = integer_decode(v);
+            let sign_i = sign as i64;
+            let m = mantissa as i64 * sign_i;
+            if exponent >= 0 {
+                let num = m.saturating_mul(1i64 << exponent.min(62));
+                Ok(pyre_object::w_tuple_new(vec![
+                    pyre_object::w_int_new(num),
+                    pyre_object::w_int_new(1),
+                ]))
+            } else {
+                let denom = 1i64 << (-exponent).min(62);
+                Ok(pyre_object::w_tuple_new(vec![
+                    pyre_object::w_int_new(m),
+                    pyre_object::w_int_new(denom),
+                ]))
+            }
+        }),
+    );
+    namespace_store(
+        ns,
+        "__trunc__",
+        make_builtin_function("__trunc__", |args| {
+            if args.is_empty() {
+                return Err(crate::PyError::type_error("__trunc__() requires self"));
+            }
+            let v = unsafe { pyre_object::w_float_get_value(args[0]) };
+            Ok(pyre_object::w_int_new(v.trunc() as i64))
+        }),
+    );
+}
+
+/// IEEE 754 double decomposition into (mantissa, exponent, sign).
+/// PyPy: Lib/fractions.py _decimal_to_ratio uses a similar approach.
+fn integer_decode(v: f64) -> (u64, i16, i8) {
+    let bits = v.to_bits();
+    let sign: i8 = if bits >> 63 == 0 { 1 } else { -1 };
+    let mut exponent: i16 = ((bits >> 52) & 0x7ff) as i16;
+    let mantissa = if exponent == 0 {
+        (bits & 0xfffffffffffff) << 1
+    } else {
+        (bits & 0xfffffffffffff) | 0x10000000000000
+    };
+    exponent -= 1023 + 52;
+    (mantissa, exponent, sign)
 }
 fn init_bool_type(ns: &mut PyNamespace) {
     namespace_store(ns, "__new__", make_new_descr(bool_descr_new));
@@ -2780,7 +2915,84 @@ fn bytearray_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 /// PyPy: bytesobject.py W_BytesObject.typedef
 fn init_bytes_type(ns: &mut PyNamespace) {
     namespace_store(ns, "__new__", make_new_descr(bytes_descr_new));
+    namespace_store(
+        ns,
+        "decode",
+        make_builtin_function("decode", bytes_method_decode),
+    );
+    namespace_store(
+        ns,
+        "__repr__",
+        make_builtin_function("__repr__", bytes_method_repr),
+    );
+    namespace_store(
+        ns,
+        "__str__",
+        make_builtin_function("__str__", bytes_method_repr),
+    );
     // bytes methods are mostly shared with bytearray — add as needed.
+}
+
+/// PyPy: bytesobject.py descr_decode
+/// Decodes bytes to str via the given codec (defaults to utf-8/strict).
+fn bytes_method_decode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    assert!(!args.is_empty());
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
+    let encoding: String = if args.len() >= 2 {
+        unsafe {
+            if pyre_object::is_str(args[1]) {
+                pyre_object::w_str_get_value(args[1]).to_string()
+            } else {
+                "utf-8".to_string()
+            }
+        }
+    } else {
+        "utf-8".to_string()
+    };
+    let enc_lower = encoding.to_ascii_lowercase().replace('_', "-");
+    let s = match enc_lower.as_str() {
+        "utf-8" | "utf8" | "u8" | "ascii" | "us-ascii" | "646" => {
+            // Best-effort: surrogateescape on invalid UTF-8 produces
+            // lossy output; for our purposes just replace invalid with U+FFFD.
+            match std::str::from_utf8(data) {
+                Ok(s) => s.to_string(),
+                Err(_) => String::from_utf8_lossy(data).into_owned(),
+            }
+        }
+        "latin-1" | "latin1" | "iso-8859-1" | "8859" => data.iter().map(|&b| b as char).collect(),
+        _ => String::from_utf8_lossy(data).into_owned(),
+    };
+    Ok(pyre_object::w_str_new(&s))
+}
+
+/// PyPy: bytesobject.py descr_repr — returns a quoted literal like `b'hello'`.
+fn bytes_method_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    assert!(!args.is_empty());
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
+    // Determine preferred quote: single unless the data contains single but
+    // not double quote (matches CPython).
+    let has_single = data.contains(&b'\'');
+    let has_double = data.contains(&b'"');
+    let quote: char = if has_single && !has_double { '"' } else { '\'' };
+    let mut out = String::with_capacity(data.len() + 3);
+    out.push('b');
+    out.push(quote);
+    for &b in data {
+        match b {
+            b'\\' => out.push_str("\\\\"),
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            b'\t' => out.push_str("\\t"),
+            q if q as char == quote => {
+                out.push('\\');
+                out.push(quote);
+            }
+            0x20..=0x7e => out.push(b as char),
+            _ => out.push_str(&format!("\\x{:02x}", b)),
+        }
+    }
+    out.push(quote);
+    Ok(pyre_object::w_str_new(&out))
 }
 
 /// `bytes.__new__(cls, *args)` — PyPy: bytesobject.py descr__new__

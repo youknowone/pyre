@@ -402,12 +402,50 @@ fn format_with_spec(val: PyObjectRef, spec: &str) -> String {
     }
 }
 
-/// PyPy: unicodeobject.py descr_encode
-/// W_BytesObject not yet implemented — returns str as placeholder.
+/// PyPy: unicodeobject.py descr_encode → encode_object.
+/// For the common 'utf-8' / 'ascii' fast paths, returns the UTF-8 bytes
+/// of the string. Other codecs fall through to a best-effort UTF-8 encoding.
 pub fn str_method_encode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty());
-    // Stub: bytes type not yet implemented
-    Ok(args[0])
+    let s = unsafe { w_str_get_value(args[0]) };
+    // encoding arg (optional, default utf-8)
+    let encoding: String = if args.len() >= 2 {
+        unsafe {
+            if pyre_object::is_str(args[1]) {
+                w_str_get_value(args[1]).to_string()
+            } else {
+                "utf-8".to_string()
+            }
+        }
+    } else {
+        "utf-8".to_string()
+    };
+    let enc_lower = encoding.to_ascii_lowercase().replace('_', "-");
+    match enc_lower.as_str() {
+        "utf-8" | "utf8" | "u8" => Ok(pyre_object::w_bytes_from_bytes(s.as_bytes())),
+        "ascii" | "us-ascii" | "646" => {
+            if s.is_ascii() {
+                Ok(pyre_object::w_bytes_from_bytes(s.as_bytes()))
+            } else {
+                Err(crate::PyError::value_error(
+                    "'ascii' codec can't encode character: ordinal not in range(128)",
+                ))
+            }
+        }
+        "latin-1" | "latin1" | "iso-8859-1" | "8859" => {
+            let mut out = Vec::with_capacity(s.len());
+            for ch in s.chars() {
+                if (ch as u32) > 0xFF {
+                    return Err(crate::PyError::value_error(
+                        "'latin-1' codec can't encode character: ordinal not in range(256)",
+                    ));
+                }
+                out.push(ch as u8);
+            }
+            Ok(pyre_object::w_bytes_from_bytes(&out))
+        }
+        _ => Ok(pyre_object::w_bytes_from_bytes(s.as_bytes())),
+    }
 }
 
 pub fn str_method_isdigit(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {

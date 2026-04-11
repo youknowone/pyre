@@ -33,6 +33,16 @@ pub enum ExcKind {
     /// `oefmt(space.w_ReferenceError, "weakly referenced object no longer exists")`.
     ReferenceError = 16,
     GeneratorExit = 17,
+    /// Base class for all operating-system errors
+    /// (formerly IOError / WindowsError / EnvironmentError in Python 2).
+    /// pypy/module/exceptions/interp_exceptions.py W_OSError.
+    OSError = 18,
+    /// Subclass of OSError raised when a file or directory is not found.
+    FileNotFoundError = 19,
+    /// Subclass of ValueError raised by codecs on invalid input.
+    UnicodeDecodeError = 20,
+    /// Subclass of ValueError raised by codecs on invalid input.
+    UnicodeEncodeError = 21,
 }
 
 /// Layout: `[ob_type: *const PyType | kind: ExcKind | message: *mut String]`
@@ -108,6 +118,10 @@ pub fn exc_kind_name(kind: ExcKind) -> &'static str {
         ExcKind::AssertionError => "AssertionError",
         ExcKind::ReferenceError => "ReferenceError",
         ExcKind::GeneratorExit => "GeneratorExit",
+        ExcKind::OSError => "OSError",
+        ExcKind::FileNotFoundError => "FileNotFoundError",
+        ExcKind::UnicodeDecodeError => "UnicodeDecodeError",
+        ExcKind::UnicodeEncodeError => "UnicodeEncodeError",
     }
 }
 
@@ -125,6 +139,18 @@ pub fn exc_kind_matches(kind: ExcKind, type_name: &str) -> bool {
         return matches!(
             kind,
             ExcKind::ArithmeticError | ExcKind::ZeroDivisionError | ExcKind::OverflowError
+        );
+    }
+    // OSError hierarchy — FileNotFoundError is-a OSError is-a Exception.
+    // IOError / EnvironmentError are aliases for OSError in Python 3.
+    if type_name == "OSError" || type_name == "IOError" || type_name == "EnvironmentError" {
+        return matches!(kind, ExcKind::OSError | ExcKind::FileNotFoundError);
+    }
+    // Unicode errors are subclasses of ValueError.
+    if type_name == "ValueError" {
+        return matches!(
+            kind,
+            ExcKind::ValueError | ExcKind::UnicodeDecodeError | ExcKind::UnicodeEncodeError
         );
     }
     exc_kind_name(kind) == type_name
@@ -151,6 +177,10 @@ pub fn exc_kind_from_name(name: &str) -> Option<ExcKind> {
         "AssertionError" => Some(ExcKind::AssertionError),
         "ReferenceError" => Some(ExcKind::ReferenceError),
         "GeneratorExit" => Some(ExcKind::GeneratorExit),
+        "OSError" | "IOError" | "EnvironmentError" => Some(ExcKind::OSError),
+        "FileNotFoundError" => Some(ExcKind::FileNotFoundError),
+        "UnicodeDecodeError" => Some(ExcKind::UnicodeDecodeError),
+        "UnicodeEncodeError" => Some(ExcKind::UnicodeEncodeError),
         _ => None,
     }
 }

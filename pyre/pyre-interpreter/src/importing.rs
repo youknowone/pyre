@@ -88,16 +88,34 @@ pub fn install_builtin_modules() {
     register_builtin_module("importlib.abc", init_importlib_abc);
     register_builtin_module("_signal", init_signal_stub);
     register_builtin_module("atexit", init_atexit);
+    register_builtin_module("pwd", init_pwd);
+    register_builtin_module("_locale", init_locale);
+    register_builtin_module("_random", init_random);
+    register_builtin_module("_struct", init_struct);
+    // `_sysconfigdata_{abiflags}_{platform}_{multiarch}` is a generated
+    // Python module containing `build_time_vars = {...}` that sysconfig
+    // imports from `_init_posix`. We stub it out with an empty dict so
+    // `sysconfig.get_config_vars()` returns an empty mapping.
+    // PyPy equivalent: pypy/tool/build_cffi_imports.py creates the same
+    // file during translation.
+    register_builtin_module("_sysconfigdata__darwin_", init_sysconfigdata_empty);
+    register_builtin_module("_sysconfigdata__linux_", init_sysconfigdata_empty);
+    register_builtin_module(
+        "_sysconfigdata__linux_x86_64-linux-gnu",
+        init_sysconfigdata_empty,
+    );
+    register_builtin_module(
+        "_sysconfigdata__linux_aarch64-linux-gnu",
+        init_sysconfigdata_empty,
+    );
     // _opcode_metadata.py exists in the stdlib; load the real file instead.
     for name in &[
         "_string",
-        "_locale",
         "_warnings",
         "_heapq",
         "_tokenize",
         "_typing",
         "_bisect",
-        "_struct",
         "binascii",
         "_hashlib",
         "_sha2",
@@ -105,7 +123,6 @@ pub fn install_builtin_modules() {
         "_sha1",
         "_sha3",
         "_blake2",
-        "_random",
         "_decimal",
         "_pickle",
         "_datetime",
@@ -114,7 +131,6 @@ pub fn install_builtin_modules() {
         "marshal",
         "fcntl",
         "grp",
-        "pwd",
         "select",
         "_socket",
         "_tracemalloc",
@@ -131,6 +147,669 @@ pub fn install_builtin_modules() {
 
 /// Empty module initializer for C-extension stubs.
 fn empty_module_init(_ns: &mut PyNamespace) {}
+
+/// `_struct` C-extension stub — PyPy: pypy/module/struct/interp_struct.py.
+///
+/// Implements just enough to let `struct.py` load: `pack`, `unpack`,
+/// `calcsize`, `_clearcache`, and the `error` type. Each packer handles
+/// the format codes pyre actually uses during import (`<q`, `<d`, etc.).
+fn init_struct(ns: &mut PyNamespace) {
+    fn parse_format(fmt: &str) -> (char, Vec<char>) {
+        // Returns (byte_order, codes).
+        let mut chars = fmt.chars();
+        let first = chars.clone().next().unwrap_or('@');
+        let (endian, rest) = if matches!(first, '<' | '>' | '!' | '=' | '@') {
+            (first, chars.skip(1).collect::<String>())
+        } else {
+            ('@', fmt.to_string())
+        };
+        (
+            endian,
+            rest.chars().filter(|c| !c.is_ascii_whitespace()).collect(),
+        )
+    }
+    fn code_size(c: char) -> usize {
+        match c {
+            'b' | 'B' | 'c' | '?' | 'x' => 1,
+            'h' | 'H' => 2,
+            'i' | 'I' | 'l' | 'L' | 'f' => 4,
+            'q' | 'Q' | 'd' | 'n' | 'N' => 8,
+            'e' => 2,
+            _ => 0,
+        }
+    }
+    crate::namespace_store(
+        ns,
+        "_clearcache",
+        crate::make_builtin_function("_clearcache", |_| Ok(pyre_object::w_none())),
+    );
+    crate::namespace_store(ns, "error", crate::typedef::w_object());
+    crate::namespace_store(
+        ns,
+        "calcsize",
+        crate::make_builtin_function("calcsize", |args| {
+            if args.is_empty() {
+                return Ok(pyre_object::w_int_new(0));
+            }
+            let fmt = unsafe {
+                if pyre_object::is_str(args[0]) {
+                    pyre_object::w_str_get_value(args[0]).to_string()
+                } else if pyre_object::bytesobject::is_bytes_like(args[0]) {
+                    let data = pyre_object::bytesobject::bytes_like_data(args[0]);
+                    String::from_utf8_lossy(data).into_owned()
+                } else {
+                    return Err(crate::PyError::type_error("calcsize: format must be str"));
+                }
+            };
+            let (_, codes) = parse_format(&fmt);
+            let total: usize = codes.iter().copied().map(code_size).sum();
+            Ok(pyre_object::w_int_new(total as i64))
+        }),
+    );
+    crate::namespace_store(
+        ns,
+        "pack",
+        crate::make_builtin_function("pack", |args| {
+            if args.is_empty() {
+                return Ok(pyre_object::w_bytes_from_bytes(&[]));
+            }
+            let fmt = unsafe {
+                if pyre_object::is_str(args[0]) {
+                    pyre_object::w_str_get_value(args[0]).to_string()
+                } else {
+                    return Err(crate::PyError::type_error("pack: format must be str"));
+                }
+            };
+            let (endian, codes) = parse_format(&fmt);
+            let little = matches!(endian, '<' | '=' | '@');
+            let mut out = Vec::new();
+            for (i, code) in codes.iter().enumerate() {
+                let arg = args.get(i + 1).copied().unwrap_or(pyre_object::w_none());
+                match *code {
+                    'b' | 'B' => {
+                        let v = unsafe { pyre_object::w_int_get_value(arg) } as i8;
+                        out.push(v as u8);
+                    }
+                    'h' | 'H' => {
+                        let v = unsafe { pyre_object::w_int_get_value(arg) } as i16;
+                        let bytes = if little {
+                            v.to_le_bytes()
+                        } else {
+                            v.to_be_bytes()
+                        };
+                        out.extend_from_slice(&bytes);
+                    }
+                    'i' | 'I' | 'l' | 'L' => {
+                        let v = unsafe { pyre_object::w_int_get_value(arg) } as i32;
+                        let bytes = if little {
+                            v.to_le_bytes()
+                        } else {
+                            v.to_be_bytes()
+                        };
+                        out.extend_from_slice(&bytes);
+                    }
+                    'q' | 'Q' | 'n' | 'N' => {
+                        let v = unsafe { pyre_object::w_int_get_value(arg) };
+                        let bytes = if little {
+                            v.to_le_bytes()
+                        } else {
+                            v.to_be_bytes()
+                        };
+                        out.extend_from_slice(&bytes);
+                    }
+                    'f' => {
+                        let v = unsafe {
+                            if pyre_object::is_float(arg) {
+                                pyre_object::w_float_get_value(arg) as f32
+                            } else {
+                                pyre_object::w_int_get_value(arg) as f32
+                            }
+                        };
+                        let bytes = if little {
+                            v.to_le_bytes()
+                        } else {
+                            v.to_be_bytes()
+                        };
+                        out.extend_from_slice(&bytes);
+                    }
+                    'd' => {
+                        let v = unsafe {
+                            if pyre_object::is_float(arg) {
+                                pyre_object::w_float_get_value(arg)
+                            } else {
+                                pyre_object::w_int_get_value(arg) as f64
+                            }
+                        };
+                        let bytes = if little {
+                            v.to_le_bytes()
+                        } else {
+                            v.to_be_bytes()
+                        };
+                        out.extend_from_slice(&bytes);
+                    }
+                    _ => {}
+                }
+            }
+            Ok(pyre_object::w_bytes_from_bytes(&out))
+        }),
+    );
+    crate::namespace_store(
+        ns,
+        "unpack",
+        crate::make_builtin_function("unpack", |args| {
+            if args.len() < 2 {
+                return Err(crate::PyError::type_error("unpack requires (fmt, buffer)"));
+            }
+            let fmt = unsafe { pyre_object::w_str_get_value(args[0]).to_string() };
+            let buf = unsafe {
+                if pyre_object::bytesobject::is_bytes_like(args[1]) {
+                    pyre_object::bytesobject::bytes_like_data(args[1]).to_vec()
+                } else {
+                    return Err(crate::PyError::type_error(
+                        "unpack: buffer must be bytes-like",
+                    ));
+                }
+            };
+            let (endian, codes) = parse_format(&fmt);
+            let little = matches!(endian, '<' | '=' | '@');
+            let mut out = Vec::new();
+            let mut pos = 0usize;
+            for code in codes {
+                match code {
+                    'b' | 'B' => {
+                        if pos >= buf.len() {
+                            break;
+                        }
+                        out.push(pyre_object::w_int_new(buf[pos] as i8 as i64));
+                        pos += 1;
+                    }
+                    'h' | 'H' => {
+                        if pos + 2 > buf.len() {
+                            break;
+                        }
+                        let chunk = [buf[pos], buf[pos + 1]];
+                        let v = if little {
+                            i16::from_le_bytes(chunk)
+                        } else {
+                            i16::from_be_bytes(chunk)
+                        };
+                        out.push(pyre_object::w_int_new(v as i64));
+                        pos += 2;
+                    }
+                    'i' | 'I' | 'l' | 'L' => {
+                        if pos + 4 > buf.len() {
+                            break;
+                        }
+                        let chunk = [buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]];
+                        let v = if little {
+                            i32::from_le_bytes(chunk)
+                        } else {
+                            i32::from_be_bytes(chunk)
+                        };
+                        out.push(pyre_object::w_int_new(v as i64));
+                        pos += 4;
+                    }
+                    'q' | 'Q' | 'n' | 'N' => {
+                        if pos + 8 > buf.len() {
+                            break;
+                        }
+                        let chunk: [u8; 8] = buf[pos..pos + 8].try_into().unwrap();
+                        let v = if little {
+                            i64::from_le_bytes(chunk)
+                        } else {
+                            i64::from_be_bytes(chunk)
+                        };
+                        out.push(pyre_object::w_int_new(v));
+                        pos += 8;
+                    }
+                    'f' => {
+                        if pos + 4 > buf.len() {
+                            break;
+                        }
+                        let chunk = [buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]];
+                        let v = if little {
+                            f32::from_le_bytes(chunk)
+                        } else {
+                            f32::from_be_bytes(chunk)
+                        };
+                        out.push(pyre_object::w_float_new(v as f64));
+                        pos += 4;
+                    }
+                    'd' => {
+                        if pos + 8 > buf.len() {
+                            break;
+                        }
+                        let chunk: [u8; 8] = buf[pos..pos + 8].try_into().unwrap();
+                        let v = if little {
+                            f64::from_le_bytes(chunk)
+                        } else {
+                            f64::from_be_bytes(chunk)
+                        };
+                        out.push(pyre_object::w_float_new(v));
+                        pos += 8;
+                    }
+                    _ => {}
+                }
+            }
+            Ok(pyre_object::w_tuple_new(out))
+        }),
+    );
+    crate::namespace_store(
+        ns,
+        "unpack_from",
+        crate::make_builtin_function("unpack_from", |_| Ok(pyre_object::w_tuple_new(vec![]))),
+    );
+    crate::namespace_store(
+        ns,
+        "iter_unpack",
+        crate::make_builtin_function("iter_unpack", |_| Ok(pyre_object::w_list_new(vec![]))),
+    );
+    // Struct class — minimal constructor returning instance with format
+    // attribute. Used by struct.Struct(fmt).pack/unpack.
+    crate::namespace_store(
+        ns,
+        "Struct",
+        crate::make_builtin_function("Struct", |args| {
+            let fmt = args.first().copied().unwrap_or(pyre_object::w_str_new(""));
+            let obj = pyre_object::w_instance_new(crate::typedef::w_object());
+            let _ = crate::baseobjspace::setattr(obj, "format", fmt);
+            Ok(obj)
+        }),
+    );
+}
+
+/// `_random` C-extension stub — PyPy: pypy/module/_random/interp_random.py.
+///
+/// Provides a minimal `Random` class that wraps a very small linear
+/// congruential generator. Good enough for `random.py` to construct a
+/// `random._inst` at module import time; real tests can then use the
+/// Python `random.Random` subclass as a drop-in.
+fn init_random(ns: &mut PyNamespace) {
+    fn random_type() -> PyObjectRef {
+        thread_local! {
+            static RANDOM_TYPE: std::cell::OnceCell<PyObjectRef> = const { std::cell::OnceCell::new() };
+        }
+        RANDOM_TYPE.with(|c| {
+            *c.get_or_init(|| {
+                let tp = crate::typedef::make_builtin_type("_random.Random", |ns| {
+                    // random_method_* are defined in importing.rs; routing
+                    // through make_builtin_function binds them as unbound
+                    // methods so `rand.random()` calls pass `self` as args[0].
+                    crate::namespace_store(
+                        ns,
+                        "__init__",
+                        crate::make_builtin_function("__init__", |args| {
+                            let seed = if args.len() >= 2 {
+                                unsafe {
+                                    if pyre_object::is_int(args[1]) {
+                                        pyre_object::w_int_get_value(args[1]) as u64
+                                    } else {
+                                        0x1234_5678
+                                    }
+                                }
+                            } else {
+                                0x1234_5678
+                            };
+                            let _ = crate::baseobjspace::setattr(
+                                args[0],
+                                "__rand_state__",
+                                pyre_object::w_int_new(seed as i64),
+                            );
+                            Ok(pyre_object::w_none())
+                        }),
+                    );
+                    crate::namespace_store(
+                        ns,
+                        "seed",
+                        crate::make_builtin_function("seed", |args| {
+                            let seed = if args.len() >= 2 {
+                                unsafe {
+                                    if pyre_object::is_int(args[1]) {
+                                        pyre_object::w_int_get_value(args[1]) as u64
+                                    } else {
+                                        0x1234_5678
+                                    }
+                                }
+                            } else {
+                                0x1234_5678
+                            };
+                            let _ = crate::baseobjspace::setattr(
+                                args[0],
+                                "__rand_state__",
+                                pyre_object::w_int_new(seed as i64),
+                            );
+                            Ok(pyre_object::w_none())
+                        }),
+                    );
+                    crate::namespace_store(
+                        ns,
+                        "random",
+                        crate::make_builtin_function("random", |args| {
+                            // Tiny xorshift PRNG — ok for import-time construction.
+                            let self_obj = args[0];
+                            let state = crate::baseobjspace::getattr(self_obj, "__rand_state__")
+                                .ok()
+                                .map(|v| unsafe { pyre_object::w_int_get_value(v) as u64 })
+                                .unwrap_or(0x1234_5678);
+                            let mut x = state;
+                            x ^= x << 13;
+                            x ^= x >> 7;
+                            x ^= x << 17;
+                            let _ = crate::baseobjspace::setattr(
+                                self_obj,
+                                "__rand_state__",
+                                pyre_object::w_int_new(x as i64),
+                            );
+                            Ok(pyre_object::w_float_new((x as f64) / (u64::MAX as f64)))
+                        }),
+                    );
+                    crate::namespace_store(
+                        ns,
+                        "getrandbits",
+                        crate::make_builtin_function("getrandbits", |args| {
+                            let k = if args.len() >= 2 {
+                                unsafe { pyre_object::w_int_get_value(args[1]) as u32 }
+                            } else {
+                                32
+                            };
+                            let state = crate::baseobjspace::getattr(args[0], "__rand_state__")
+                                .ok()
+                                .map(|v| unsafe { pyre_object::w_int_get_value(v) as u64 })
+                                .unwrap_or(0x1234_5678);
+                            let mut x = state;
+                            x ^= x << 13;
+                            x ^= x >> 7;
+                            x ^= x << 17;
+                            let _ = crate::baseobjspace::setattr(
+                                args[0],
+                                "__rand_state__",
+                                pyre_object::w_int_new(x as i64),
+                            );
+                            let mask = if k >= 64 { u64::MAX } else { (1u64 << k) - 1 };
+                            Ok(pyre_object::w_int_new((x & mask) as i64))
+                        }),
+                    );
+                    crate::namespace_store(
+                        ns,
+                        "getstate",
+                        crate::make_builtin_function("getstate", |args| {
+                            let state = crate::baseobjspace::getattr(args[0], "__rand_state__")
+                                .unwrap_or_else(|_| pyre_object::w_int_new(0));
+                            Ok(pyre_object::w_tuple_new(vec![state]))
+                        }),
+                    );
+                    crate::namespace_store(
+                        ns,
+                        "setstate",
+                        crate::make_builtin_function("setstate", |args| {
+                            if args.len() >= 2 {
+                                unsafe {
+                                    if pyre_object::is_tuple(args[1])
+                                        && pyre_object::w_tuple_len(args[1]) >= 1
+                                    {
+                                        if let Some(state) =
+                                            pyre_object::w_tuple_getitem(args[1], 0)
+                                        {
+                                            let _ = crate::baseobjspace::setattr(
+                                                args[0],
+                                                "__rand_state__",
+                                                state,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(pyre_object::w_none())
+                        }),
+                    );
+                });
+                unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
+                tp
+            })
+        })
+    }
+    crate::namespace_store(ns, "Random", random_type());
+}
+
+/// `_locale` C-extension stub — PyPy: pypy/module/_locale/.
+///
+/// Provides the 'C' locale defaults so locale.py's `from _locale import *`
+/// succeeds and Lib/locale.py exposes working `localeconv`/`setlocale`.
+/// This mirrors the `except ImportError` fallback in the stdlib's
+/// `locale` module, but routed through pyre's builtin-module registry
+/// so a single import succeeds.
+fn init_locale(ns: &mut PyNamespace) {
+    // Locale category constants — match POSIX values.
+    crate::namespace_store(ns, "LC_CTYPE", pyre_object::w_int_new(0));
+    crate::namespace_store(ns, "LC_NUMERIC", pyre_object::w_int_new(1));
+    crate::namespace_store(ns, "LC_TIME", pyre_object::w_int_new(2));
+    crate::namespace_store(ns, "LC_COLLATE", pyre_object::w_int_new(3));
+    crate::namespace_store(ns, "LC_MONETARY", pyre_object::w_int_new(4));
+    crate::namespace_store(ns, "LC_MESSAGES", pyre_object::w_int_new(5));
+    crate::namespace_store(ns, "LC_ALL", pyre_object::w_int_new(6));
+    crate::namespace_store(ns, "CHAR_MAX", pyre_object::w_int_new(127));
+    // Error alias — locale.py does `Error = ValueError` when _locale is
+    // missing; here we expose a real placeholder that is a str so that
+    // `except _locale.Error` still compiles (match falls through).
+    crate::namespace_store(ns, "Error", pyre_object::w_str_new("Error"));
+
+    // localeconv() — returns the 'C' locale parameters as a dict.
+    crate::namespace_store(
+        ns,
+        "localeconv",
+        crate::make_builtin_function("localeconv", |_| {
+            let d = pyre_object::w_dict_new();
+            unsafe {
+                pyre_object::w_dict_setitem_str(
+                    d,
+                    "grouping",
+                    pyre_object::w_list_new(vec![pyre_object::w_int_new(127)]),
+                );
+                pyre_object::w_dict_setitem_str(d, "currency_symbol", pyre_object::w_str_new(""));
+                pyre_object::w_dict_setitem_str(d, "n_sign_posn", pyre_object::w_int_new(127));
+                pyre_object::w_dict_setitem_str(d, "p_cs_precedes", pyre_object::w_int_new(127));
+                pyre_object::w_dict_setitem_str(d, "n_cs_precedes", pyre_object::w_int_new(127));
+                pyre_object::w_dict_setitem_str(d, "mon_grouping", pyre_object::w_list_new(vec![]));
+                pyre_object::w_dict_setitem_str(d, "n_sep_by_space", pyre_object::w_int_new(127));
+                pyre_object::w_dict_setitem_str(d, "decimal_point", pyre_object::w_str_new("."));
+                pyre_object::w_dict_setitem_str(d, "negative_sign", pyre_object::w_str_new(""));
+                pyre_object::w_dict_setitem_str(d, "positive_sign", pyre_object::w_str_new(""));
+                pyre_object::w_dict_setitem_str(d, "p_sep_by_space", pyre_object::w_int_new(127));
+                pyre_object::w_dict_setitem_str(d, "int_curr_symbol", pyre_object::w_str_new(""));
+                pyre_object::w_dict_setitem_str(d, "p_sign_posn", pyre_object::w_int_new(127));
+                pyre_object::w_dict_setitem_str(d, "thousands_sep", pyre_object::w_str_new(""));
+                pyre_object::w_dict_setitem_str(d, "mon_thousands_sep", pyre_object::w_str_new(""));
+                pyre_object::w_dict_setitem_str(d, "frac_digits", pyre_object::w_int_new(127));
+                pyre_object::w_dict_setitem_str(d, "mon_decimal_point", pyre_object::w_str_new(""));
+                pyre_object::w_dict_setitem_str(d, "int_frac_digits", pyre_object::w_int_new(127));
+            }
+            Ok(d)
+        }),
+    );
+    crate::namespace_store(
+        ns,
+        "setlocale",
+        crate::make_builtin_function("setlocale", |_| Ok(pyre_object::w_str_new("C"))),
+    );
+    crate::namespace_store(
+        ns,
+        "nl_langinfo",
+        crate::make_builtin_function("nl_langinfo", |_| Ok(pyre_object::w_str_new(""))),
+    );
+    crate::namespace_store(
+        ns,
+        "strcoll",
+        crate::make_builtin_function("strcoll", |args| {
+            if args.len() < 2 {
+                return Ok(pyre_object::w_int_new(0));
+            }
+            unsafe {
+                if pyre_object::is_str(args[0]) && pyre_object::is_str(args[1]) {
+                    let a = pyre_object::w_str_get_value(args[0]);
+                    let b = pyre_object::w_str_get_value(args[1]);
+                    return Ok(pyre_object::w_int_new(a.cmp(b) as i64));
+                }
+            }
+            Ok(pyre_object::w_int_new(0))
+        }),
+    );
+    crate::namespace_store(
+        ns,
+        "strxfrm",
+        crate::make_builtin_function("strxfrm", |args| {
+            Ok(args.first().copied().unwrap_or(pyre_object::w_str_new("")))
+        }),
+    );
+    crate::namespace_store(
+        ns,
+        "getencoding",
+        crate::make_builtin_function("getencoding", |_| Ok(pyre_object::w_str_new("utf-8"))),
+    );
+}
+
+/// `_sysconfigdata_*` stub — sysconfig imports this generated module to
+/// read the CPython build variables. We expose a minimal `build_time_vars`
+/// dict that lets sysconfig initialize without crashing.
+fn init_sysconfigdata_empty(ns: &mut PyNamespace) {
+    let vars = pyre_object::w_dict_new();
+    // A few keys are load-bearing — sysconfig.get_config_vars() populates
+    // them, but an import-time crash hits on 'Py_GIL_DISABLED' and
+    // similar. Leave the dict empty; .get('X') returns None for unknown
+    // keys which every caller already handles.
+    crate::namespace_store(ns, "build_time_vars", vars);
+}
+
+/// Shared `posix.stat_result` builtin type — a plain instance bag with
+/// hasdict so that `st_mode`, `st_ino`, etc. attributes can be set from
+/// Rust when building stat results. PyPy builds a structseq subclass with
+/// named fields; this is the pyre approximation.
+fn stat_result_type() -> PyObjectRef {
+    thread_local! {
+        static STAT_RESULT_TYPE: std::cell::OnceCell<PyObjectRef> = const { std::cell::OnceCell::new() };
+    }
+    STAT_RESULT_TYPE.with(|c| {
+        *c.get_or_init(|| {
+            let tp = crate::typedef::make_builtin_type("stat_result", |_ns| {});
+            unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
+            tp
+        })
+    })
+}
+
+/// pwd module — PyPy: pypy/module/pwd/interp_pwd.py.
+///
+/// getpwuid / getpwnam return a struct_passwd tuple with named fields via
+/// libc's getpwuid(3) / getpwnam(3). The result has the same layout as
+/// CPython's pwd.struct_passwd: (pw_name, pw_passwd, pw_uid, pw_gid,
+/// pw_gecos, pw_dir, pw_shell).
+fn init_pwd(ns: &mut PyNamespace) {
+    #[cfg(unix)]
+    unsafe extern "C" {
+        fn getpwuid(uid: u32) -> *mut Passwd;
+        fn getpwnam(name: *const std::os::raw::c_char) -> *mut Passwd;
+    }
+    #[cfg(unix)]
+    #[repr(C)]
+    struct Passwd {
+        pw_name: *const std::os::raw::c_char,
+        pw_passwd: *const std::os::raw::c_char,
+        pw_uid: u32,
+        pw_gid: u32,
+        pw_change: i64,
+        pw_class: *const std::os::raw::c_char,
+        pw_gecos: *const std::os::raw::c_char,
+        pw_dir: *const std::os::raw::c_char,
+        pw_shell: *const std::os::raw::c_char,
+        pw_expire: i64,
+    }
+    #[cfg(unix)]
+    unsafe fn c_str(ptr: *const std::os::raw::c_char) -> String {
+        if ptr.is_null() {
+            return String::new();
+        }
+        let cstr = std::ffi::CStr::from_ptr(ptr);
+        cstr.to_string_lossy().into_owned()
+    }
+    #[cfg(unix)]
+    unsafe fn make_struct_passwd(pw: *mut Passwd) -> pyre_object::PyObjectRef {
+        unsafe {
+            let pw = &*pw;
+            pyre_object::w_tuple_new(vec![
+                pyre_object::w_str_new(&c_str(pw.pw_name)),
+                pyre_object::w_str_new(&c_str(pw.pw_passwd)),
+                pyre_object::w_int_new(pw.pw_uid as i64),
+                pyre_object::w_int_new(pw.pw_gid as i64),
+                pyre_object::w_str_new(&c_str(pw.pw_gecos)),
+                pyre_object::w_str_new(&c_str(pw.pw_dir)),
+                pyre_object::w_str_new(&c_str(pw.pw_shell)),
+            ])
+        }
+    }
+    crate::namespace_store(
+        ns,
+        "getpwuid",
+        crate::make_builtin_function("getpwuid", |args| {
+            if args.is_empty() {
+                return Err(crate::PyError::type_error("getpwuid() missing argument"));
+            }
+            #[cfg(unix)]
+            unsafe {
+                if !pyre_object::is_int(args[0]) {
+                    return Err(crate::PyError::type_error(
+                        "getpwuid(): uid should be an integer",
+                    ));
+                }
+                let uid = pyre_object::w_int_get_value(args[0]) as u32;
+                let pw = getpwuid(uid);
+                if pw.is_null() {
+                    return Err(crate::PyError::key_error(format!(
+                        "getpwuid(): uid not found: {}",
+                        uid
+                    )));
+                }
+                return Ok(make_struct_passwd(pw));
+            }
+            #[cfg(not(unix))]
+            Err(crate::PyError::key_error("getpwuid(): uid not found"))
+        }),
+    );
+    crate::namespace_store(
+        ns,
+        "getpwnam",
+        crate::make_builtin_function("getpwnam", |args| {
+            if args.is_empty() {
+                return Err(crate::PyError::type_error("getpwnam() missing argument"));
+            }
+            #[cfg(unix)]
+            unsafe {
+                if !pyre_object::is_str(args[0]) {
+                    return Err(crate::PyError::type_error(
+                        "getpwnam(): name should be a string",
+                    ));
+                }
+                let name = pyre_object::w_str_get_value(args[0]);
+                let cname = std::ffi::CString::new(name).map_err(|_| {
+                    crate::PyError::value_error("getpwnam(): embedded null character in name")
+                })?;
+                let pw = getpwnam(cname.as_ptr());
+                if pw.is_null() {
+                    return Err(crate::PyError::key_error(format!(
+                        "getpwnam(): name not found: {}",
+                        name
+                    )));
+                }
+                return Ok(make_struct_passwd(pw));
+            }
+            #[cfg(not(unix))]
+            Err(crate::PyError::key_error("getpwnam(): name not found"))
+        }),
+    );
+    crate::namespace_store(
+        ns,
+        "getpwall",
+        crate::make_builtin_function("getpwall", |_| Ok(pyre_object::w_list_new(vec![]))),
+    );
+}
 
 /// atexit stub — PyPy: pypy/module/atexit/. Single-threaded pyre doesn't
 /// actually run the registered callbacks on shutdown yet; `register` accepts
@@ -932,8 +1611,28 @@ fn local_type() -> PyObjectRef {
 /// Provides the minimal surface that os.py module init needs to succeed.
 /// Real posix calls are not implemented — they raise or return defaults.
 fn init_posix(ns: &mut PyNamespace) {
-    // environ — empty dict
-    crate::namespace_store(ns, "environ", pyre_object::w_dict_new());
+    // environ — dict populated from the host environment.
+    // PyPy equivalent: posix.State.startup → _convertenviron copies
+    // os.environ.items() into w_environ at interpreter startup.
+    let w_environ = pyre_object::w_dict_new();
+    #[cfg(feature = "host_env")]
+    {
+        // On POSIX, posix.environ stores bytes → bytes. os.py's
+        // _create_environ_mapping wraps this dict in an _Environ object that
+        // encodes/decodes via surrogateescape when accessed.
+        for (key, value) in std::env::vars_os() {
+            let k_bytes = key.as_encoded_bytes();
+            let v_bytes = value.as_encoded_bytes();
+            unsafe {
+                pyre_object::w_dict_store(
+                    w_environ,
+                    pyre_object::w_bytes_from_bytes(k_bytes),
+                    pyre_object::w_bytes_from_bytes(v_bytes),
+                );
+            }
+        }
+    }
+    crate::namespace_store(ns, "environ", w_environ);
     // _have_functions — list of HAVE_* macro names that were defined at
     // build time. os.py uses this to populate the supports_* capability
     // sets. Advertising a representative subset lets os.py module init
@@ -1166,11 +1865,19 @@ fn init_posix(ns: &mut PyNamespace) {
         "waitstatus_to_exitcode",
         "_exit",
         "_cpu_count",
+        "register_at_fork",
+        "abort",
+        "spawnv",
+        "spawnve",
+        "spawnvp",
+        "spawnvpe",
+        "system",
+        "popen",
     ] {
         crate::namespace_store(
             ns,
             name,
-            crate::make_builtin_function(name, |_| Ok(pyre_object::w_int_new(0))),
+            crate::make_builtin_function(name, |_| Ok(pyre_object::w_none())),
         );
     }
     // os.fspath() — PyPy: posixmodule.c posix_fspath. Returns the argument
@@ -1195,6 +1902,326 @@ fn init_posix(ns: &mut PyNamespace) {
                 }
             }
             Ok(arg)
+        }),
+    );
+    // os.stat / os.lstat / os.fstat — return stat_result structseq.
+    // PyPy: posixmodule.c posix_do_stat → build_stat_result.
+    //
+    // The returned object is a tuple subclass with named attributes
+    // (st_mode, st_ino, ...). We expose it as a plain instance with
+    // attributes so that both `os.stat(p).st_mode` and
+    // `os.stat(p)[0]` work.
+    fn make_stat_result(meta: &std::fs::Metadata) -> pyre_object::PyObjectRef {
+        use std::os::unix::fs::MetadataExt;
+        let tuple = pyre_object::w_tuple_new(vec![
+            pyre_object::w_int_new(meta.mode() as i64),
+            pyre_object::w_int_new(meta.ino() as i64),
+            pyre_object::w_int_new(meta.dev() as i64),
+            pyre_object::w_int_new(meta.nlink() as i64),
+            pyre_object::w_int_new(meta.uid() as i64),
+            pyre_object::w_int_new(meta.gid() as i64),
+            pyre_object::w_int_new(meta.size() as i64),
+            pyre_object::w_int_new(meta.atime()),
+            pyre_object::w_int_new(meta.mtime()),
+            pyre_object::w_int_new(meta.ctime()),
+        ]);
+        // Attach st_* attributes via a wrapping instance.
+        let wrapper = pyre_object::w_instance_new(stat_result_type());
+        let _ = crate::baseobjspace::setattr(wrapper, "__tuple__", tuple);
+        let _ = crate::baseobjspace::setattr(
+            wrapper,
+            "st_mode",
+            pyre_object::w_int_new(meta.mode() as i64),
+        );
+        let _ = crate::baseobjspace::setattr(
+            wrapper,
+            "st_ino",
+            pyre_object::w_int_new(meta.ino() as i64),
+        );
+        let _ = crate::baseobjspace::setattr(
+            wrapper,
+            "st_dev",
+            pyre_object::w_int_new(meta.dev() as i64),
+        );
+        let _ = crate::baseobjspace::setattr(
+            wrapper,
+            "st_nlink",
+            pyre_object::w_int_new(meta.nlink() as i64),
+        );
+        let _ = crate::baseobjspace::setattr(
+            wrapper,
+            "st_uid",
+            pyre_object::w_int_new(meta.uid() as i64),
+        );
+        let _ = crate::baseobjspace::setattr(
+            wrapper,
+            "st_gid",
+            pyre_object::w_int_new(meta.gid() as i64),
+        );
+        let _ = crate::baseobjspace::setattr(
+            wrapper,
+            "st_size",
+            pyre_object::w_int_new(meta.size() as i64),
+        );
+        let _ = crate::baseobjspace::setattr(
+            wrapper,
+            "st_atime",
+            pyre_object::w_float_new(meta.atime() as f64),
+        );
+        let _ = crate::baseobjspace::setattr(
+            wrapper,
+            "st_mtime",
+            pyre_object::w_float_new(meta.mtime() as f64),
+        );
+        let _ = crate::baseobjspace::setattr(
+            wrapper,
+            "st_ctime",
+            pyre_object::w_float_new(meta.ctime() as f64),
+        );
+        let _ = crate::baseobjspace::setattr(
+            wrapper,
+            "st_atime_ns",
+            pyre_object::w_int_new(meta.atime() * 1_000_000_000 + meta.atime_nsec()),
+        );
+        let _ = crate::baseobjspace::setattr(
+            wrapper,
+            "st_mtime_ns",
+            pyre_object::w_int_new(meta.mtime() * 1_000_000_000 + meta.mtime_nsec()),
+        );
+        let _ = crate::baseobjspace::setattr(
+            wrapper,
+            "st_ctime_ns",
+            pyre_object::w_int_new(meta.ctime() * 1_000_000_000 + meta.ctime_nsec()),
+        );
+        wrapper
+    }
+    fn stat_impl(
+        args: &[pyre_object::PyObjectRef],
+        follow_symlinks: bool,
+    ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+        if args.is_empty() {
+            return Err(crate::PyError::type_error("stat() missing argument"));
+        }
+        let path_obj = args[0];
+        let path_str = unsafe {
+            if pyre_object::is_str(path_obj) {
+                pyre_object::w_str_get_value(path_obj).to_string()
+            } else if pyre_object::bytesobject::is_bytes_like(path_obj) {
+                let data = pyre_object::bytesobject::bytes_like_data(path_obj);
+                String::from_utf8_lossy(data).into_owned()
+            } else if let Ok(fspath) = crate::baseobjspace::getattr(path_obj, "__fspath__") {
+                let result = crate::call_function(fspath, &[path_obj]);
+                if !result.is_null() && pyre_object::is_str(result) {
+                    pyre_object::w_str_get_value(result).to_string()
+                } else {
+                    return Err(crate::PyError::type_error(
+                        "stat: path should be string, bytes, os.PathLike",
+                    ));
+                }
+            } else {
+                return Err(crate::PyError::type_error(
+                    "stat: path should be string, bytes, os.PathLike",
+                ));
+            }
+        };
+        let meta = if follow_symlinks {
+            std::fs::metadata(&path_str)
+        } else {
+            std::fs::symlink_metadata(&path_str)
+        };
+        match meta {
+            Ok(m) => Ok(make_stat_result(&m)),
+            Err(e) => {
+                let kind = e.raw_os_error().unwrap_or(2);
+                Err(crate::PyError::os_error_with_errno(
+                    kind,
+                    format!("{}: '{}'", e, path_str),
+                ))
+            }
+        }
+    }
+    // os.uname() — returns structseq (sysname, nodename, release, version, machine).
+    crate::namespace_store(
+        ns,
+        "uname",
+        crate::make_builtin_function("uname", |_| {
+            let wrapper = pyre_object::w_instance_new(stat_result_type());
+            let sysname = std::env::consts::OS.to_string();
+            let machine = std::env::consts::ARCH.to_string();
+            let _ =
+                crate::baseobjspace::setattr(wrapper, "sysname", pyre_object::w_str_new(&sysname));
+            let _ = crate::baseobjspace::setattr(wrapper, "nodename", pyre_object::w_str_new(""));
+            let _ = crate::baseobjspace::setattr(wrapper, "release", pyre_object::w_str_new(""));
+            let _ = crate::baseobjspace::setattr(wrapper, "version", pyre_object::w_str_new(""));
+            let _ =
+                crate::baseobjspace::setattr(wrapper, "machine", pyre_object::w_str_new(&machine));
+            Ok(wrapper)
+        }),
+    );
+    crate::namespace_store(
+        ns,
+        "stat",
+        crate::make_builtin_function("stat", |args| stat_impl(args, true)),
+    );
+    crate::namespace_store(
+        ns,
+        "lstat",
+        crate::make_builtin_function("lstat", |args| stat_impl(args, false)),
+    );
+    crate::namespace_store(
+        ns,
+        "fstat",
+        crate::make_builtin_function("fstat", |args| {
+            if args.is_empty() {
+                return Err(crate::PyError::type_error("fstat() missing argument"));
+            }
+            let fd = unsafe { pyre_object::w_int_get_value(args[0]) } as i32;
+            #[cfg(unix)]
+            {
+                use std::os::unix::io::FromRawFd;
+                let f = unsafe { std::fs::File::from_raw_fd(fd) };
+                let meta = f.metadata();
+                let _ = std::mem::ManuallyDrop::new(f); // don't close
+                match meta {
+                    Ok(m) => Ok(make_stat_result(&m)),
+                    Err(e) => Err(crate::PyError::os_error_with_errno(
+                        e.raw_os_error().unwrap_or(9),
+                        format!("{}", e),
+                    )),
+                }
+            }
+            #[cfg(not(unix))]
+            Err(crate::PyError::os_error_with_errno(
+                9,
+                "fstat unsupported".to_string(),
+            ))
+        }),
+    );
+    // stat_result type — simple instance with hasdict so setattr works.
+    // Exported so that `posix.stat_result` can be looked up.
+    crate::namespace_store(ns, "stat_result", stat_result_type());
+    // os.getcwd() — PyPy: posixmodule.c posix_getcwd.
+    crate::namespace_store(
+        ns,
+        "getcwd",
+        crate::make_builtin_function("getcwd", |_| {
+            #[cfg(feature = "host_env")]
+            {
+                if let Ok(cwd) = std::env::current_dir() {
+                    return Ok(pyre_object::w_str_new(&cwd.to_string_lossy()));
+                }
+            }
+            Ok(pyre_object::w_str_new(""))
+        }),
+    );
+    // os.getcwdb() — bytes form of getcwd.
+    crate::namespace_store(
+        ns,
+        "getcwdb",
+        crate::make_builtin_function("getcwdb", |_| {
+            #[cfg(feature = "host_env")]
+            {
+                if let Ok(cwd) = std::env::current_dir() {
+                    return Ok(pyre_object::w_bytes_from_bytes(
+                        cwd.as_os_str().as_encoded_bytes(),
+                    ));
+                }
+            }
+            Ok(pyre_object::w_bytes_from_bytes(b""))
+        }),
+    );
+    // os.getuid / geteuid / getgid / getegid — real syscalls.
+    #[cfg(unix)]
+    unsafe extern "C" {
+        fn getuid() -> u32;
+        fn geteuid() -> u32;
+        fn getgid() -> u32;
+        fn getegid() -> u32;
+    }
+    crate::namespace_store(
+        ns,
+        "getuid",
+        crate::make_builtin_function("getuid", |_| {
+            #[cfg(unix)]
+            unsafe {
+                return Ok(pyre_object::w_int_new(getuid() as i64));
+            }
+            #[cfg(not(unix))]
+            Ok(pyre_object::w_int_new(0))
+        }),
+    );
+    crate::namespace_store(
+        ns,
+        "geteuid",
+        crate::make_builtin_function("geteuid", |_| {
+            #[cfg(unix)]
+            unsafe {
+                return Ok(pyre_object::w_int_new(geteuid() as i64));
+            }
+            #[cfg(not(unix))]
+            Ok(pyre_object::w_int_new(0))
+        }),
+    );
+    crate::namespace_store(
+        ns,
+        "getgid",
+        crate::make_builtin_function("getgid", |_| {
+            #[cfg(unix)]
+            unsafe {
+                return Ok(pyre_object::w_int_new(getgid() as i64));
+            }
+            #[cfg(not(unix))]
+            Ok(pyre_object::w_int_new(0))
+        }),
+    );
+    crate::namespace_store(
+        ns,
+        "getegid",
+        crate::make_builtin_function("getegid", |_| {
+            #[cfg(unix)]
+            unsafe {
+                return Ok(pyre_object::w_int_new(getegid() as i64));
+            }
+            #[cfg(not(unix))]
+            Ok(pyre_object::w_int_new(0))
+        }),
+    );
+    // os.getpid — std::process::id.
+    crate::namespace_store(
+        ns,
+        "getpid",
+        crate::make_builtin_function("getpid", |_| {
+            Ok(pyre_object::w_int_new(std::process::id() as i64))
+        }),
+    );
+    // os.environ lookups from setenv / unsetenv / putenv / getenv — mutate
+    // posix.environ (the dict) rather than calling libc; os.py writes back
+    // into that dict in its _Environ wrapper.
+    crate::namespace_store(
+        ns,
+        "getenv",
+        crate::make_builtin_function("getenv", |args| {
+            if args.is_empty() {
+                return Ok(pyre_object::w_none());
+            }
+            let key = unsafe {
+                if pyre_object::is_str(args[0]) {
+                    pyre_object::w_str_get_value(args[0]).to_string()
+                } else {
+                    return Ok(pyre_object::w_none());
+                }
+            };
+            #[cfg(feature = "host_env")]
+            {
+                if let Ok(value) = std::env::var(&key) {
+                    return Ok(pyre_object::w_str_new(&value));
+                }
+            }
+            if args.len() >= 2 {
+                Ok(args[1])
+            } else {
+                Ok(pyre_object::w_none())
+            }
         }),
     );
     crate::namespace_store(ns, "error", crate::typedef::w_object());
@@ -1639,10 +2666,31 @@ fn init_opcode_metadata(ns: &mut PyNamespace) {
 /// Avoid loading the real importlib.__init__ since it drags in
 /// _bootstrap and _bootstrap_external.
 fn init_importlib_pkg(ns: &mut PyNamespace) {
+    // importlib.import_module(name, package=None) — return an imported
+    // module by name. PyPy: Lib/importlib/__init__.py import_module →
+    // _bootstrap._gcd_import. We defer to the interpreter's importhook
+    // since it handles both builtins and source modules.
     crate::namespace_store(
         ns,
         "import_module",
-        crate::make_builtin_function("import_module", |_| Ok(pyre_object::w_none())),
+        crate::make_builtin_function("import_module", |args| {
+            let name = args.first().copied().unwrap_or(pyre_object::w_none());
+            unsafe {
+                if !pyre_object::is_str(name) {
+                    return Err(crate::PyError::type_error(
+                        "import_module: name must be str",
+                    ));
+                }
+                let name_str = pyre_object::w_str_get_value(name).to_string();
+                crate::importing::importhook(
+                    &name_str,
+                    pyre_object::w_none(),
+                    pyre_object::w_list_new(vec![pyre_object::w_str_new("*")]),
+                    0,
+                    std::ptr::null(),
+                )
+            }
+        }),
     );
     crate::namespace_store(
         ns,

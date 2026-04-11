@@ -278,9 +278,7 @@ pub fn install_default_builtins(namespace: &mut PyNamespace) {
         make_module_builtin_function("input", |_| Ok(pyre_object::w_str_new("")))
     });
     namespace.get_or_insert_with("open", || {
-        make_module_builtin_function("open", |_| {
-            Err(crate::PyError::type_error("open() not implemented"))
-        })
+        make_module_builtin_function("open", builtin_open)
     });
     // Exception hierarchy — exceptions are real types so they can be
     // subclassed (`class FrozenInstanceError(AttributeError): pass`).
@@ -715,7 +713,7 @@ fn builtin_len(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 }
 
 /// `abs(x)` — return the absolute value of a number.
-fn builtin_abs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn builtin_abs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() == 1, "abs() takes exactly one argument");
     let obj = args[0];
     unsafe {
@@ -2339,6 +2337,337 @@ fn builtin_any(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
 /// `all(iterable)` — PyPy: operation.py all
 /// `all(iterable)` — PyPy: baseobjspace.py all_w
+/// Shared file wrapper type — plain instance with hasdict so that
+/// open() can attach `__file_data__` / `__file_pos__` / `__file_mode__`
+/// as instance attributes, matching the PyPy FileIO/TextIOWrapper
+/// duck-typing surface without a dedicated W_FileObject.
+pub fn file_wrapper_type() -> PyObjectRef {
+    thread_local! {
+        static FILE_WRAPPER_TYPE: std::cell::OnceCell<PyObjectRef> = const { std::cell::OnceCell::new() };
+    }
+    FILE_WRAPPER_TYPE.with(|c| {
+        *c.get_or_init(|| {
+            let tp = crate::typedef::make_builtin_type("_io.TextIOWrapper", init_file_wrapper_type);
+            unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
+            tp
+        })
+    })
+}
+
+/// PyPy: pypy/module/_io/interp_iobase.py W_IOBase.
+fn init_file_wrapper_type(ns: &mut PyNamespace) {
+    crate::namespace_store(ns, "read", make_builtin_function("read", file_method_read));
+    crate::namespace_store(
+        ns,
+        "readline",
+        make_builtin_function("readline", file_method_readline),
+    );
+    crate::namespace_store(
+        ns,
+        "readlines",
+        make_builtin_function("readlines", file_method_readlines),
+    );
+    crate::namespace_store(
+        ns,
+        "write",
+        make_builtin_function("write", file_method_write),
+    );
+    crate::namespace_store(
+        ns,
+        "close",
+        make_builtin_function("close", file_method_close),
+    );
+    crate::namespace_store(
+        ns,
+        "flush",
+        make_builtin_function("flush", file_method_close),
+    );
+    crate::namespace_store(
+        ns,
+        "__enter__",
+        make_builtin_function("__enter__", |args| Ok(args[0])),
+    );
+    crate::namespace_store(
+        ns,
+        "__exit__",
+        make_builtin_function("__exit__", |args| {
+            // Call close on exit.
+            let _ = file_method_close(&args[..1]);
+            Ok(w_none())
+        }),
+    );
+    crate::namespace_store(
+        ns,
+        "__iter__",
+        make_builtin_function("__iter__", |args| Ok(args[0])),
+    );
+    crate::namespace_store(
+        ns,
+        "__next__",
+        make_builtin_function("__next__", |args| {
+            let line = file_method_readline(args)?;
+            unsafe {
+                let s = pyre_object::w_str_get_value(line);
+                if s.is_empty() {
+                    return Err(crate::PyError::stop_iteration());
+                }
+            }
+            Ok(line)
+        }),
+    );
+    crate::namespace_store(
+        ns,
+        "seek",
+        make_builtin_function("seek", |args| {
+            if args.len() >= 2 {
+                let _ = crate::baseobjspace::setattr(args[0], "__file_pos__", args[1]);
+            }
+            Ok(w_none())
+        }),
+    );
+    crate::namespace_store(
+        ns,
+        "tell",
+        make_builtin_function("tell", |args| {
+            if let Ok(pos) = crate::baseobjspace::getattr(args[0], "__file_pos__") {
+                Ok(pos)
+            } else {
+                Ok(w_int_new(0))
+            }
+        }),
+    );
+}
+
+fn file_get_data(self_obj: PyObjectRef) -> String {
+    crate::baseobjspace::getattr(self_obj, "__file_data__")
+        .ok()
+        .and_then(|d| unsafe {
+            if pyre_object::is_str(d) {
+                Some(pyre_object::w_str_get_value(d).to_string())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default()
+}
+
+fn file_get_pos(self_obj: PyObjectRef) -> usize {
+    crate::baseobjspace::getattr(self_obj, "__file_pos__")
+        .ok()
+        .and_then(|p| unsafe {
+            if pyre_object::is_int(p) {
+                Some(pyre_object::w_int_get_value(p) as usize)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0)
+}
+
+fn file_set_pos(self_obj: PyObjectRef, pos: usize) {
+    let _ = crate::baseobjspace::setattr(self_obj, "__file_pos__", w_int_new(pos as i64));
+}
+
+fn file_method_read(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.is_empty() {
+        return Err(crate::PyError::type_error("read() requires self"));
+    }
+    let data = file_get_data(args[0]);
+    let pos = file_get_pos(args[0]);
+    let remaining = &data[pos.min(data.len())..];
+    let n = if args.len() >= 2 {
+        let n_val = unsafe { pyre_object::w_int_get_value(args[1]) };
+        if n_val < 0 {
+            remaining.len()
+        } else {
+            (n_val as usize).min(remaining.len())
+        }
+    } else {
+        remaining.len()
+    };
+    // Slice at char boundaries — count by bytes.
+    let end = n.min(remaining.len());
+    let chunk = &remaining[..end];
+    file_set_pos(args[0], pos + end);
+    Ok(w_str_new(chunk))
+}
+
+fn file_method_readline(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.is_empty() {
+        return Err(crate::PyError::type_error("readline() requires self"));
+    }
+    let data = file_get_data(args[0]);
+    let pos = file_get_pos(args[0]);
+    if pos >= data.len() {
+        return Ok(w_str_new(""));
+    }
+    let rest = &data[pos..];
+    let end = rest.find('\n').map(|i| i + 1).unwrap_or(rest.len());
+    let line = &rest[..end];
+    file_set_pos(args[0], pos + end);
+    Ok(w_str_new(line))
+}
+
+fn file_method_readlines(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.is_empty() {
+        return Err(crate::PyError::type_error("readlines() requires self"));
+    }
+    let mut lines = Vec::new();
+    loop {
+        let line = file_method_readline(args)?;
+        let s = unsafe { pyre_object::w_str_get_value(line) };
+        if s.is_empty() {
+            break;
+        }
+        lines.push(line);
+    }
+    Ok(w_list_new(lines))
+}
+
+fn file_method_write(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.len() < 2 {
+        return Err(crate::PyError::type_error("write() requires (self, data)"));
+    }
+    // Append to __file_data__ and update on close.
+    unsafe {
+        let prev = file_get_data(args[0]);
+        let s = if pyre_object::is_str(args[1]) {
+            pyre_object::w_str_get_value(args[1]).to_string()
+        } else if pyre_object::bytesobject::is_bytes_like(args[1]) {
+            let data = pyre_object::bytesobject::bytes_like_data(args[1]);
+            String::from_utf8_lossy(data).into_owned()
+        } else {
+            return Err(crate::PyError::type_error("write() expects str or bytes"));
+        };
+        let new_data = format!("{prev}{s}");
+        let len = s.len();
+        let _ = crate::baseobjspace::setattr(args[0], "__file_data__", w_str_new(&new_data));
+        let _ = crate::baseobjspace::setattr(args[0], "__file_dirty__", w_bool_from(true));
+        Ok(w_int_new(len as i64))
+    }
+}
+
+fn file_method_close(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.is_empty() {
+        return Ok(w_none());
+    }
+    // If the file was opened in a writable mode, flush the in-memory
+    // buffer to disk.
+    let dirty = crate::baseobjspace::getattr(args[0], "__file_dirty__")
+        .ok()
+        .map(|v| unsafe { pyre_object::is_bool(v) && pyre_object::w_bool_get_value(v) })
+        .unwrap_or(false);
+    if dirty {
+        if let (Ok(name), Ok(mode)) = (
+            crate::baseobjspace::getattr(args[0], "__file_name__"),
+            crate::baseobjspace::getattr(args[0], "__file_mode__"),
+        ) {
+            let name_s = unsafe { pyre_object::w_str_get_value(name).to_string() };
+            let mode_s = unsafe { pyre_object::w_str_get_value(mode).to_string() };
+            let data = file_get_data(args[0]);
+            let append = mode_s.contains('a');
+            let write_res = if append {
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .create(true)
+                    .open(&name_s)
+                    .and_then(|mut f| std::io::Write::write_all(&mut f, data.as_bytes()))
+            } else {
+                std::fs::write(&name_s, data.as_bytes())
+            };
+            if let Err(e) = write_res {
+                return Err(crate::PyError::os_error_with_errno(
+                    e.raw_os_error().unwrap_or(5),
+                    format!("{e}: '{name_s}'"),
+                ));
+            }
+            let _ = crate::baseobjspace::setattr(args[0], "__file_dirty__", w_bool_from(false));
+        }
+    }
+    Ok(w_none())
+}
+
+/// builtins.open(file, mode='r', ...) — PyPy: io.open → FileIO + TextIOWrapper.
+/// Minimal implementation that loads the entire file into memory and
+/// returns a file wrapper instance.
+pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.is_empty() {
+        return Err(crate::PyError::type_error("open() missing 'file' argument"));
+    }
+    let path_obj = args[0];
+    let path = unsafe {
+        if pyre_object::is_str(path_obj) {
+            pyre_object::w_str_get_value(path_obj).to_string()
+        } else if pyre_object::bytesobject::is_bytes_like(path_obj) {
+            let data = pyre_object::bytesobject::bytes_like_data(path_obj);
+            String::from_utf8_lossy(data).into_owned()
+        } else if let Ok(fspath) = crate::baseobjspace::getattr(path_obj, "__fspath__") {
+            let result = crate::call_function(fspath, &[path_obj]);
+            if !result.is_null() && pyre_object::is_str(result) {
+                pyre_object::w_str_get_value(result).to_string()
+            } else {
+                return Err(crate::PyError::type_error(
+                    "open(): path should be str, bytes, os.PathLike",
+                ));
+            }
+        } else {
+            return Err(crate::PyError::type_error(
+                "open(): path should be str, bytes, os.PathLike",
+            ));
+        }
+    };
+    let mode: String = if args.len() >= 2 {
+        unsafe {
+            if pyre_object::is_str(args[1]) {
+                pyre_object::w_str_get_value(args[1]).to_string()
+            } else {
+                "r".to_string()
+            }
+        }
+    } else {
+        "r".to_string()
+    };
+
+    let binary = mode.contains('b');
+    let writing = mode.contains('w') || mode.contains('a') || mode.contains('x');
+    let reading = mode.contains('r') || !writing;
+
+    let data: String = if reading && !mode.contains('w') && !mode.contains('x') {
+        match std::fs::read(&path) {
+            Ok(bytes) => {
+                if binary {
+                    // Store bytes-as-string for now; we only support ASCII binary.
+                    String::from_utf8_lossy(&bytes).into_owned()
+                } else {
+                    match String::from_utf8(bytes) {
+                        Ok(s) => s,
+                        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+                    }
+                }
+            }
+            Err(e) if writing => String::new(),
+            Err(e) => {
+                return Err(crate::PyError::os_error_with_errno(
+                    e.raw_os_error().unwrap_or(2),
+                    format!("{e}: '{path}'"),
+                ));
+            }
+        }
+    } else {
+        String::new()
+    };
+
+    let wrapper = pyre_object::w_instance_new(file_wrapper_type());
+    let _ = crate::baseobjspace::setattr(wrapper, "__file_data__", w_str_new(&data));
+    let _ = crate::baseobjspace::setattr(wrapper, "__file_pos__", w_int_new(0));
+    let _ = crate::baseobjspace::setattr(wrapper, "__file_name__", w_str_new(&path));
+    let _ = crate::baseobjspace::setattr(wrapper, "__file_mode__", w_str_new(&mode));
+    let _ = crate::baseobjspace::setattr(wrapper, "name", w_str_new(&path));
+    let _ = crate::baseobjspace::setattr(wrapper, "mode", w_str_new(&mode));
+    let _ = crate::baseobjspace::setattr(wrapper, "closed", w_bool_from(false));
+    Ok(wrapper)
+}
+
 pub fn builtin_all_fn(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     builtin_all(args)
 }
@@ -2355,31 +2684,20 @@ fn builtin_all(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
 /// `sum(iterable, start=0)` — PyPy: operation.py sum
 fn builtin_sum(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty(), "sum() takes at least one argument");
+    if args.is_empty() {
+        return Err(crate::PyError::type_error(
+            "sum() takes at least one argument",
+        ));
+    }
     let iterable = args[0];
     let start = args.get(1).copied().unwrap_or_else(|| w_int_new(0));
     let mut acc = start;
-    unsafe {
-        if is_list(iterable) {
-            let n = w_list_len(iterable);
-            for i in 0..n {
-                if let Some(item) = w_list_getitem(iterable, i as i64) {
-                    acc = crate::baseobjspace::add(acc, item).expect("sum: unsupported type");
-                }
-            }
-            return Ok(acc);
-        }
-        if is_tuple(iterable) {
-            let n = w_tuple_len(iterable);
-            for i in 0..n {
-                if let Some(item) = w_tuple_getitem(iterable, i as i64) {
-                    acc = crate::baseobjspace::add(acc, item).expect("sum: unsupported type");
-                }
-            }
-            return Ok(acc);
-        }
+    // Use the generic iterator protocol so sum() works with any iterable
+    // (generators, ranges, sets, dict views, ...), matching PyPy.
+    for item in crate::builtins::collect_iterable(iterable)? {
+        acc = crate::baseobjspace::add(acc, item)?;
     }
-    panic!("sum() argument must be list or tuple");
+    Ok(acc)
 }
 
 /// `round(number, ndigits=None)` — PyPy: operation.py round

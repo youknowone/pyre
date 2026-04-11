@@ -193,14 +193,67 @@ pub fn init(ns: &mut PyNamespace) {
             })
         }),
     );
-    // sys.implementation
-    namespace_store(ns, "implementation", w_none());
-    // sys.hash_info
-    namespace_store(ns, "hash_info", w_none());
-    // sys.float_info
-    namespace_store(ns, "float_info", w_none());
-    // sys.int_info
-    namespace_store(ns, "int_info", w_none());
+    // sys.implementation — structseq-like namespace with name, version, ...
+    {
+        let impl_obj = make_sys_namespace_instance();
+        let _ = crate::baseobjspace::setattr(impl_obj, "name", w_str_new("pyre"));
+        let _ = crate::baseobjspace::setattr(
+            impl_obj,
+            "version",
+            w_tuple_new(vec![
+                w_int_new(3),
+                w_int_new(13),
+                w_int_new(0),
+                w_str_new("final"),
+                w_int_new(0),
+            ]),
+        );
+        let _ = crate::baseobjspace::setattr(impl_obj, "hexversion", w_int_new(0x030d00f0));
+        let _ = crate::baseobjspace::setattr(impl_obj, "cache_tag", w_str_new("pyre-3.13"));
+        let _ = crate::baseobjspace::setattr(impl_obj, "_multiarch", w_str_new(""));
+        namespace_store(ns, "implementation", impl_obj);
+    }
+    // sys.hash_info — structseq with width/modulus/... fields.
+    // PyPy: pypy/module/sys/state.py W_HashInfoStructSeq.
+    {
+        let hash_info = make_sys_namespace_instance();
+        let _ = crate::baseobjspace::setattr(hash_info, "width", w_int_new(64));
+        let _ = crate::baseobjspace::setattr(hash_info, "modulus", w_int_new((1i64 << 61) - 1));
+        let _ = crate::baseobjspace::setattr(hash_info, "inf", w_int_new(314159));
+        let _ = crate::baseobjspace::setattr(hash_info, "nan", w_int_new(0));
+        let _ = crate::baseobjspace::setattr(hash_info, "imag", w_int_new(1000003));
+        let _ = crate::baseobjspace::setattr(hash_info, "algorithm", w_str_new("siphash13"));
+        let _ = crate::baseobjspace::setattr(hash_info, "hash_bits", w_int_new(64));
+        let _ = crate::baseobjspace::setattr(hash_info, "seed_bits", w_int_new(128));
+        let _ = crate::baseobjspace::setattr(hash_info, "cutoff", w_int_new(0));
+        namespace_store(ns, "hash_info", hash_info);
+    }
+    // sys.float_info — structseq with IEEE 754 double metadata.
+    // PyPy: pypy/module/sys/state.py W_FloatInfoStructSeq.
+    {
+        let fi = make_sys_namespace_instance();
+        let _ = crate::baseobjspace::setattr(fi, "max", w_float_new(f64::MAX));
+        let _ = crate::baseobjspace::setattr(fi, "max_exp", w_int_new(1024));
+        let _ = crate::baseobjspace::setattr(fi, "max_10_exp", w_int_new(308));
+        let _ = crate::baseobjspace::setattr(fi, "min", w_float_new(f64::MIN_POSITIVE));
+        let _ = crate::baseobjspace::setattr(fi, "min_exp", w_int_new(-1021));
+        let _ = crate::baseobjspace::setattr(fi, "min_10_exp", w_int_new(-307));
+        let _ = crate::baseobjspace::setattr(fi, "dig", w_int_new(15));
+        let _ = crate::baseobjspace::setattr(fi, "mant_dig", w_int_new(53));
+        let _ = crate::baseobjspace::setattr(fi, "epsilon", w_float_new(f64::EPSILON));
+        let _ = crate::baseobjspace::setattr(fi, "radix", w_int_new(2));
+        let _ = crate::baseobjspace::setattr(fi, "rounds", w_int_new(1));
+        namespace_store(ns, "float_info", fi);
+    }
+    // sys.int_info — structseq with int implementation details.
+    {
+        let ii = make_sys_namespace_instance();
+        let _ = crate::baseobjspace::setattr(ii, "bits_per_digit", w_int_new(30));
+        let _ = crate::baseobjspace::setattr(ii, "sizeof_digit", w_int_new(4));
+        let _ = crate::baseobjspace::setattr(ii, "default_max_str_digits", w_int_new(4300));
+        let _ = crate::baseobjspace::setattr(ii, "str_digits_check_threshold", w_int_new(640));
+        namespace_store(ns, "int_info", ii);
+    }
     // sys.executable
     namespace_store(ns, "executable", w_str_new("pyre"));
     // sys.prefix / exec_prefix
@@ -210,6 +263,25 @@ pub fn init(ns: &mut PyNamespace) {
     namespace_store(ns, "base_exec_prefix", w_str_new(""));
     // sys._framework — macOS framework name (empty string on non-framework builds)
     namespace_store(ns, "_framework", w_str_new(""));
+    // sys._jit — namespace with is_enabled/is_available methods.
+    // Python 3.14+ introduced sys._jit for CPython tier-2 JIT support checks.
+    {
+        let jit = make_sys_namespace_instance();
+        let _ = crate::baseobjspace::setattr(
+            jit,
+            "is_enabled",
+            crate::make_builtin_function("is_enabled", |_| Ok(w_bool_from(false))),
+        );
+        let _ = crate::baseobjspace::setattr(
+            jit,
+            "is_available",
+            crate::make_builtin_function("is_available", |_| Ok(w_bool_from(false))),
+        );
+        namespace_store(ns, "_jit", jit);
+    }
+    // sys.platlibdir — typically "lib" on POSIX; used by sysconfig to
+    // construct install paths.
+    namespace_store(ns, "platlibdir", w_str_new("lib"));
     // sys.abiflags
     namespace_store(ns, "abiflags", w_str_new(""));
     // sys.argv

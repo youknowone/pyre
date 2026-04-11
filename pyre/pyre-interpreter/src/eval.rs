@@ -74,6 +74,46 @@ pub fn set_current_exception(exc: PyObjectRef) {
     CURRENT_EXCEPTION.with(|current| current.set(exc));
 }
 
+/// Test whether `exc_value` matches the exception type specification
+/// `exc_type` — a single exception class, a class name string, or a tuple
+/// of classes (for `except (A, B)` clauses). PyPy: pyopcode.py
+/// `CHECK_EXC_MATCH` → `_exception_match`.
+pub fn check_exc_match_against(exc_value: PyObjectRef, exc_type: PyObjectRef) -> bool {
+    unsafe {
+        if !pyre_object::is_exception(exc_value) {
+            return true;
+        }
+        // Tuple of exception classes — match any.
+        if pyre_object::is_tuple(exc_type) {
+            let n = pyre_object::w_tuple_len(exc_type) as i64;
+            for i in 0..n {
+                if let Some(elem) = pyre_object::w_tuple_getitem(exc_type, i) {
+                    if check_exc_match_against(exc_value, elem) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+        let kind = pyre_object::w_exception_get_kind(exc_value);
+        if pyre_object::is_str(exc_type) {
+            let type_name = pyre_object::w_str_get_value(exc_type);
+            return pyre_object::exc_kind_matches(kind, type_name);
+        }
+        if crate::is_function(exc_type)
+            && crate::is_builtin_code(crate::getcode(exc_type) as pyre_object::PyObjectRef)
+        {
+            let type_name = crate::function_get_name(exc_type);
+            return pyre_object::exc_kind_matches(kind, type_name);
+        }
+        if pyre_object::is_type(exc_type) {
+            let type_name = pyre_object::w_type_get_name(exc_type);
+            return pyre_object::exc_kind_matches(kind, type_name);
+        }
+        false
+    }
+}
+
 /// Try to dispatch an exception using the exception table or block stack.
 ///
 /// Returns `true` if a handler was found (frame.next_instr updated to handler),
@@ -1105,27 +1145,7 @@ impl OpcodeStepExecutor for PyFrame {
     fn check_exc_match(&mut self) -> Result<(), Self::Error> {
         let exc_type = self.pop();
         let exc_value = self.peek();
-        let matched = unsafe {
-            if !pyre_object::is_exception(exc_value) {
-                true // not a proper exception object — match everything
-            } else {
-                let kind = pyre_object::w_exception_get_kind(exc_value);
-                if pyre_object::is_str(exc_type) {
-                    let type_name = pyre_object::w_str_get_value(exc_type);
-                    pyre_object::exc_kind_matches(kind, type_name)
-                } else if crate::is_function(exc_type)
-                    && crate::is_builtin_code(crate::getcode(exc_type) as pyre_object::PyObjectRef)
-                {
-                    let type_name = crate::function_get_name(exc_type);
-                    pyre_object::exc_kind_matches(kind, type_name)
-                } else if pyre_object::is_type(exc_type) {
-                    let type_name = pyre_object::w_type_get_name(exc_type);
-                    pyre_object::exc_kind_matches(kind, type_name)
-                } else {
-                    false
-                }
-            }
-        };
+        let matched = check_exc_match_against(exc_value, exc_type);
         self.push(pyre_object::w_bool_from(matched));
         Ok(())
     }
@@ -1256,12 +1276,13 @@ impl OpcodeStepExecutor for PyFrame {
     // ── SetAdd ──
     // PyPy: SET_ADD; CPython: SET_ADD
     // set = STACK[-i]; set.add(TOS); pop value
-    // Phase 1: set is backed by list, so we use list_append.
     fn set_add(&mut self, i: usize) -> Result<(), Self::Error> {
         let value = self.pop();
         let set = PyFrame::peek_at(self, i - 1);
         unsafe {
-            if pyre_object::is_list(set) {
+            if pyre_object::is_set_or_frozenset(set) {
+                pyre_object::w_set_add(set, value);
+            } else if pyre_object::is_list(set) {
                 pyre_object::w_list_append(set, value);
             }
         }

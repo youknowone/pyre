@@ -1796,6 +1796,18 @@ pub fn or_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
                 pyre_object::w_set_from_items(&items)
             });
         }
+        // dict | dict — PEP 584 merge. PyPy: dictmultiobject.py descr_or.
+        // Returns a new dict built from `a`'s items, then updated with `b`'s.
+        if pyre_object::is_dict(a) && pyre_object::is_dict(b) {
+            let new_dict = pyre_object::w_dict_new();
+            for (k, v) in pyre_object::w_dict_items(a) {
+                pyre_object::w_dict_store(new_dict, k, v);
+            }
+            for (k, v) in pyre_object::w_dict_items(b) {
+                pyre_object::w_dict_store(new_dict, k, v);
+            }
+            return Ok(new_dict);
+        }
         if let Some(result) = try_instance_binop(a, b, "__or__") {
             return result;
         }

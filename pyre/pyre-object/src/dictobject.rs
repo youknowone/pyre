@@ -93,6 +93,10 @@ pub(crate) unsafe fn dict_keys_equal(a: PyObjectRef, b: PyObjectRef) -> bool {
     if crate::is_str(a) && crate::is_str(b) {
         return crate::w_str_get_value(a) == crate::w_str_get_value(b);
     }
+    // Bytes keys — compare byte contents.
+    if crate::bytesobject::is_bytes(a) && crate::bytesobject::is_bytes(b) {
+        return crate::bytesobject::w_bytes_data(a) == crate::bytesobject::w_bytes_data(b);
+    }
     // Tuple keys — element-wise compare via dict_keys_equal recursively.
     if crate::is_tuple(a) && crate::is_tuple(b) {
         let la = crate::w_tuple_len(a);

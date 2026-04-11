@@ -89,6 +89,11 @@ pub enum PyErrorKind {
     /// Internal: RETURN_GENERATOR unwind signal (not a real exception).
     /// Carries the generator PyObjectRef as message.
     GeneratorReturn,
+    /// Base class for all operating-system errors.
+    /// pypy/module/exceptions/interp_exceptions.py W_OSError.
+    OSError,
+    /// Subclass of OSError raised when a file or directory is not found.
+    FileNotFoundError,
     /// pypy/interpreter/baseobjspace.py:419-420 DescrMismatch.
     ///
     /// ```python
@@ -152,6 +157,37 @@ impl PyError {
         }
     }
 
+    pub fn key_error(msg: impl Into<String>) -> Self {
+        PyError {
+            kind: PyErrorKind::KeyError,
+            message: msg.into(),
+            exc_object: std::ptr::null_mut(),
+        }
+    }
+
+    pub fn os_error(msg: impl Into<String>) -> Self {
+        PyError {
+            kind: PyErrorKind::OSError,
+            message: msg.into(),
+            exc_object: std::ptr::null_mut(),
+        }
+    }
+
+    /// Raise an OSError (or FileNotFoundError when errno is ENOENT) with
+    /// a platform-style error message.
+    pub fn os_error_with_errno(errno: i32, msg: impl Into<String>) -> Self {
+        let kind = if errno == 2 {
+            PyErrorKind::FileNotFoundError
+        } else {
+            PyErrorKind::OSError
+        };
+        PyError {
+            kind,
+            message: msg.into(),
+            exc_object: std::ptr::null_mut(),
+        }
+    }
+
     /// pypy/module/_weakref/interp__weakref.py:347 — raised by `force()`
     /// when the referent of a proxy is no longer alive.
     pub fn reference_error(msg: impl Into<String>) -> Self {
@@ -198,6 +234,8 @@ impl PyError {
             PyErrorKind::ReferenceError => ExcKind::ReferenceError,
             PyErrorKind::GeneratorExit => ExcKind::GeneratorExit,
             PyErrorKind::GeneratorReturn => ExcKind::RuntimeError,
+            PyErrorKind::OSError => ExcKind::OSError,
+            PyErrorKind::FileNotFoundError => ExcKind::FileNotFoundError,
             // DescrMismatch is a control-flow exception caught by
             // GetSetProperty.descr_property_get/set/del. If it ever escapes
             // to user code without being converted to TypeError it surfaces
@@ -239,6 +277,11 @@ impl PyError {
             ExcKind::ReferenceError => PyErrorKind::ReferenceError,
             ExcKind::GeneratorExit => PyErrorKind::GeneratorExit,
             ExcKind::BaseException | ExcKind::Exception => PyErrorKind::RuntimeError,
+            ExcKind::OSError => PyErrorKind::OSError,
+            ExcKind::FileNotFoundError => PyErrorKind::FileNotFoundError,
+            // Unicode errors don't have a dedicated PyErrorKind; they
+            // flow through the general ValueError handler.
+            ExcKind::UnicodeDecodeError | ExcKind::UnicodeEncodeError => PyErrorKind::ValueError,
         }
     }
 

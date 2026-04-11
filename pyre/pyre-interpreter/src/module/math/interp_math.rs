@@ -58,6 +58,12 @@ fn map_err(r: pymath::Result<f64>) -> PyResult {
 macro_rules! pm1 {
     ($name:ident) => {
         pub fn $name(args: &[PyObjectRef]) -> PyResult {
+            if args.is_empty() {
+                return Err(crate::PyError::type_error(concat!(
+                    stringify!($name),
+                    "() takes exactly one argument (0 given)"
+                )));
+            }
             map_err(pymath::math::$name(get_double(args[0])))
         }
     };
@@ -66,6 +72,12 @@ macro_rules! pm1 {
 macro_rules! pm1_plain {
     ($name:ident) => {
         pub fn $name(args: &[PyObjectRef]) -> PyResult {
+            if args.is_empty() {
+                return Err(crate::PyError::type_error(concat!(
+                    stringify!($name),
+                    "() takes exactly one argument (0 given)"
+                )));
+            }
             Ok(floatobject::w_float_new(pymath::math::$name(get_double(
                 args[0],
             ))))
@@ -112,6 +124,12 @@ pm1_plain!(ulp);
 macro_rules! pm2 {
     ($name:ident) => {
         pub fn $name(args: &[PyObjectRef]) -> PyResult {
+            if args.len() < 2 {
+                return Err(crate::PyError::type_error(concat!(
+                    stringify!($name),
+                    "() takes exactly 2 arguments"
+                )));
+            }
             map_err(pymath::math::$name(
                 get_double(args[0]),
                 get_double(args[1]),
@@ -126,6 +144,11 @@ pm2!(copysign);
 pm2!(remainder);
 
 pub fn atan2(args: &[PyObjectRef]) -> PyResult {
+    if args.len() < 2 {
+        return Err(crate::PyError::type_error(
+            "atan2() takes exactly 2 arguments",
+        ));
+    }
     map_err(pymath::math::atan2(
         get_double(args[0]),
         get_double(args[1]),
@@ -149,26 +172,51 @@ pub fn dist(args: &[PyObjectRef]) -> PyResult {
         .iter()
         .map(|&a| get_double(a))
         .collect();
+    if p.len() != q.len() {
+        return Err(crate::PyError::value_error(
+            "both points must have the same number of dimensions",
+        ));
+    }
     Ok(floatobject::w_float_new(pymath::math::dist(&p, &q)))
 }
 
 // ── Integer-returning functions ──────────────────────────────────────
 
 pub fn floor(args: &[PyObjectRef]) -> PyResult {
+    if args.is_empty() {
+        return Err(crate::PyError::type_error(
+            "floor() takes exactly 1 argument",
+        ));
+    }
     Ok(w_int_new(get_double(args[0]).floor() as i64))
 }
 
 pub fn ceil(args: &[PyObjectRef]) -> PyResult {
+    if args.is_empty() {
+        return Err(crate::PyError::type_error(
+            "ceil() takes exactly 1 argument",
+        ));
+    }
     Ok(w_int_new(get_double(args[0]).ceil() as i64))
 }
 
 pub fn trunc(args: &[PyObjectRef]) -> PyResult {
+    if args.is_empty() {
+        return Err(crate::PyError::type_error(
+            "trunc() takes exactly 1 argument",
+        ));
+    }
     Ok(w_int_new(get_double(args[0]).trunc() as i64))
 }
 
 // ── Special signatures ──────────────────────────────────────────────
 
 pub fn log(args: &[PyObjectRef]) -> PyResult {
+    if args.is_empty() {
+        return Err(crate::PyError::type_error(
+            "log() takes at least 1 argument",
+        ));
+    }
     let base = if args.len() >= 2 {
         Some(get_double(args[1]))
     } else {
@@ -178,26 +226,51 @@ pub fn log(args: &[PyObjectRef]) -> PyResult {
 }
 
 pub fn degrees(args: &[PyObjectRef]) -> PyResult {
+    if args.is_empty() {
+        return Err(crate::PyError::type_error(
+            "degrees() takes exactly 1 argument",
+        ));
+    }
     Ok(floatobject::w_float_new(pymath::math::degrees(get_double(
         args[0],
     ))))
 }
 
 pub fn radians(args: &[PyObjectRef]) -> PyResult {
+    if args.is_empty() {
+        return Err(crate::PyError::type_error(
+            "radians() takes exactly 1 argument",
+        ));
+    }
     Ok(floatobject::w_float_new(pymath::math::radians(get_double(
         args[0],
     ))))
 }
 
 pub fn isinf(args: &[PyObjectRef]) -> PyResult {
+    if args.is_empty() {
+        return Err(crate::PyError::type_error(
+            "isinf() takes exactly 1 argument",
+        ));
+    }
     Ok(w_bool_from(pymath::math::isinf(get_double(args[0]))))
 }
 
 pub fn isnan(args: &[PyObjectRef]) -> PyResult {
+    if args.is_empty() {
+        return Err(crate::PyError::type_error(
+            "isnan() takes exactly 1 argument",
+        ));
+    }
     Ok(w_bool_from(pymath::math::isnan(get_double(args[0]))))
 }
 
 pub fn isfinite(args: &[PyObjectRef]) -> PyResult {
+    if args.is_empty() {
+        return Err(crate::PyError::type_error(
+            "isfinite() takes exactly 1 argument",
+        ));
+    }
     Ok(w_bool_from(pymath::math::isfinite(get_double(args[0]))))
 }
 
@@ -214,6 +287,11 @@ pub fn isclose(args: &[PyObjectRef]) -> PyResult {
 }
 
 pub fn factorial(args: &[PyObjectRef]) -> PyResult {
+    if args.is_empty() {
+        return Err(crate::PyError::type_error(
+            "factorial() takes exactly 1 argument",
+        ));
+    }
     let n = get_int(args[0]);
     match pymath::math::integer::factorial(n) {
         Ok(v) => {
@@ -252,6 +330,9 @@ pub fn lcm(args: &[PyObjectRef]) -> PyResult {
 }
 
 pub fn comb(args: &[PyObjectRef]) -> PyResult {
+    if args.len() < 2 {
+        return Err(crate::PyError::type_error("comb() takes 2 arguments"));
+    }
     let n = get_int(args[0]);
     let k = get_int(args[1]);
     match pymath::math::integer::comb(n, k) {
@@ -267,6 +348,11 @@ pub fn comb(args: &[PyObjectRef]) -> PyResult {
 }
 
 pub fn perm(args: &[PyObjectRef]) -> PyResult {
+    if args.is_empty() {
+        return Err(crate::PyError::type_error(
+            "perm() takes at least 1 argument",
+        ));
+    }
     let n = get_int(args[0]);
     let k = if args.len() >= 2 {
         Some(get_int(args[1]))
@@ -287,6 +373,11 @@ pub fn perm(args: &[PyObjectRef]) -> PyResult {
 
 pub fn isqrt(args: &[PyObjectRef]) -> PyResult {
     use malachite_bigint::BigInt;
+    if args.is_empty() {
+        return Err(crate::PyError::type_error(
+            "isqrt() takes exactly 1 argument",
+        ));
+    }
     let n = BigInt::from(get_int(args[0]));
     match pymath::math::integer::isqrt(&n) {
         Ok(v) => {
@@ -310,6 +401,11 @@ pub fn fsum(args: &[PyObjectRef]) -> PyResult {
 }
 
 pub fn prod(args: &[PyObjectRef]) -> PyResult {
+    if args.is_empty() {
+        return Err(crate::PyError::type_error(
+            "prod() takes at least 1 argument",
+        ));
+    }
     let items = crate::builtins::collect_iterable(args[0])?;
     let floats: Vec<f64> = items.iter().map(|&a| get_double(a)).collect();
     let start = args.get(1).map(|&a| get_double(a));
@@ -317,6 +413,11 @@ pub fn prod(args: &[PyObjectRef]) -> PyResult {
 }
 
 pub fn frexp(args: &[PyObjectRef]) -> PyResult {
+    if args.is_empty() {
+        return Err(crate::PyError::type_error(
+            "frexp() takes exactly 1 argument",
+        ));
+    }
     let (m, e) = pymath::math::frexp(get_double(args[0]));
     Ok(w_tuple_new(vec![
         floatobject::w_float_new(m),
@@ -325,6 +426,11 @@ pub fn frexp(args: &[PyObjectRef]) -> PyResult {
 }
 
 pub fn ldexp(args: &[PyObjectRef]) -> PyResult {
+    if args.len() < 2 {
+        return Err(crate::PyError::type_error(
+            "ldexp() takes exactly 2 arguments",
+        ));
+    }
     map_err(pymath::math::ldexp(
         get_double(args[0]),
         get_int(args[1]) as i32,
@@ -332,6 +438,11 @@ pub fn ldexp(args: &[PyObjectRef]) -> PyResult {
 }
 
 pub fn modf(args: &[PyObjectRef]) -> PyResult {
+    if args.is_empty() {
+        return Err(crate::PyError::type_error(
+            "modf() takes exactly 1 argument",
+        ));
+    }
     let (frac, integer) = pymath::math::modf(get_double(args[0]));
     Ok(w_tuple_new(vec![
         floatobject::w_float_new(frac),
@@ -340,6 +451,11 @@ pub fn modf(args: &[PyObjectRef]) -> PyResult {
 }
 
 pub fn nextafter(args: &[PyObjectRef]) -> PyResult {
+    if args.len() < 2 {
+        return Err(crate::PyError::type_error(
+            "nextafter() takes at least 2 arguments",
+        ));
+    }
     Ok(floatobject::w_float_new(pymath::math::nextafter(
         get_double(args[0]),
         get_double(args[1]),
@@ -348,6 +464,11 @@ pub fn nextafter(args: &[PyObjectRef]) -> PyResult {
 }
 
 pub fn fma(args: &[PyObjectRef]) -> PyResult {
+    if args.len() < 3 {
+        return Err(crate::PyError::type_error(
+            "fma() takes exactly 3 arguments",
+        ));
+    }
     map_err(pymath::math::fma(
         get_double(args[0]),
         get_double(args[1]),
