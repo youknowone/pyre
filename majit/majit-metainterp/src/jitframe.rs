@@ -365,14 +365,19 @@ unsafe fn jitframe_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir
 /// GC must know the varsize layout to copy the full object (header + array).
 ///
 /// Layout: [JitFrame header (56 bytes)] [length: Signed] [items: Signed...]
-/// - base_size = JITFRAME_FIXED_SIZE (56) — the fixed header
+/// - base_size = JITFRAME_FIXED_SIZE + SIGN_SIZE (64) — the fixed header
+///   plus the 8-byte jf_frame_length field that precedes the items.
+///   `TypeInfo::total_instance_size(length)` computes
+///   `base_size + item_size * length`, so base_size MUST include every
+///   byte before item[0], otherwise the GC copy is 8 bytes short and the
+///   last jf_frame slot is lost across every minor collection.
 /// - item_size = SIZEOFSIGNED (8) — each jf_frame slot is one Signed
 /// - length_offset = JITFRAME_FIXED_SIZE (56) from obj start
 pub fn jitframe_type_info() -> majit_gc::trace::TypeInfo {
     majit_gc::trace::TypeInfo::varsize_with_custom_trace(
-        JITFRAME_FIXED_SIZE, // base_size
-        SIZEOFSIGNED,        // item_size: each array slot is 8 bytes
-        JITFRAME_FIXED_SIZE, // length_offset: jf_frame.length at header end
+        JITFRAME_FIXED_SIZE + SIGN_SIZE, // base_size (header + length field)
+        SIZEOFSIGNED,                    // item_size: each array slot is 8 bytes
+        JITFRAME_FIXED_SIZE,             // length_offset: jf_frame.length at header end
         jitframe_custom_trace,
     )
 }

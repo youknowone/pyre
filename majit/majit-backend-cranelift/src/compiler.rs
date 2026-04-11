@@ -128,9 +128,29 @@ const JF_FRAME_LENGTH_OFS: i32 = 56;
 const JF_FRAME_ITEM0_OFS: i32 = 64; // 56 + 8
 /// Number of fixed header fields in JITFRAME (regalloc.py:1094, 1106).
 const JITFRAME_FIXED_SIZE: u32 = 7;
-/// GC type id for JitFrame objects.
-/// RPython parity: rgc.register_custom_trace_hook(JITFRAME, jitframe_trace).
-const JITFRAME_GC_TYPE_ID: u32 = 2;
+/// GC type id for JitFrame objects, assigned at runtime by the frontend
+/// that owns the GC type registry (pyre-jit registers OBJECT / W_INT /
+/// W_FLOAT before JITFRAME, so the JITFRAME id depends on that ordering
+/// and cannot be hard-coded here).
+///
+/// `u32::MAX` means "not yet registered"; the backend uses this in
+/// `ensure_jitframe_type_registered` to set it up lazily with its own
+/// custom trace hook, and in `alloc_nursery_no_collect_typed` to pass
+/// the correct id to the allocator.
+static JITFRAME_GC_TYPE_ID: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// Override the JITFRAME type id explicitly. Called from the frontend
+/// after it has registered its own types so that our nursery allocations
+/// (gc.alloc_nursery_no_collect_typed) use the same id that the frontend
+/// assigned to the JITFRAME TypeInfo (jitframe.py:48-52).
+pub fn set_jitframe_gc_type_id(id: u32) {
+    JITFRAME_GC_TYPE_ID.store(id, std::sync::atomic::Ordering::Release);
+}
+
+fn jitframe_gc_type_id() -> u32 {
+    JITFRAME_GC_TYPE_ID.load(std::sync::atomic::Ordering::Acquire)
+}
 
 /// Custom trace function for GC-managed jitframes.
 ///
@@ -181,21 +201,21 @@ unsafe fn jitframe_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut GcRef)) 
     }
 }
 
-/// Ensure the JITFRAME GC type (type_id=2) is registered.
+/// Ensure the JITFRAME GC type is registered, and that
+/// `JITFRAME_GC_TYPE_ID` reflects the id the GC assigned to it.
 ///
 /// RPython: rgc.register_custom_trace_hook(JITFRAME, jitframe_trace)
 /// called from jitframe_allocate (jitframe.py:49).
+///
+/// Lazy path (no frontend registration): register JITFRAME directly and
+/// remember the resulting id.
 fn ensure_jitframe_type_registered(gc: &mut dyn GcAllocator) {
     use majit_gc::TypeInfo;
-    let current_count = gc.type_count();
-    if current_count == 0 {
+    if gc.type_count() == 0 {
         return; // Stub GC (TrackingGc), no type registry
     }
-    if current_count > JITFRAME_GC_TYPE_ID as usize {
-        return; // Already registered
-    }
-    while gc.type_count() < JITFRAME_GC_TYPE_ID as usize {
-        gc.register_type(TypeInfo::simple(8)); // placeholder type ids 0, 1
+    if jitframe_gc_type_id() != u32::MAX {
+        return; // Frontend already registered and told us the id
     }
     // JITFRAME is a varsize GC struct:
     //   base_size = 64 (7 header fields × 8 + length field 8)
@@ -211,7 +231,7 @@ fn ensure_jitframe_type_registered(gc: &mut dyn GcAllocator) {
     info.has_gc_ptrs = true;
     info.custom_trace = Some(jitframe_custom_trace);
     let id = gc.register_type(info);
-    debug_assert_eq!(id, JITFRAME_GC_TYPE_ID);
+    set_jitframe_gc_type_id(id);
 }
 
 /// Follow jf_forward chain to get the final jitframe address.
@@ -4608,8 +4628,16 @@ fn run_compiled_code_inner(
         .unwrap_or(false);
     let (jf_gcref, heap_owner): (GcRef, Option<Vec<i64>>) = if use_gc_alloc {
         let runtime_id = gc_runtime_id.unwrap();
+        let type_id = jitframe_gc_type_id();
+        assert_ne!(
+            type_id,
+            u32::MAX,
+            "JITFRAME GC type id not registered — frontend must call \
+             set_jitframe_gc_type_id() or ensure_jitframe_type_registered() \
+             before running compiled code"
+        );
         let gcref = with_gc_runtime(runtime_id, |gc| {
-            gc.alloc_nursery_no_collect_typed(JITFRAME_GC_TYPE_ID, payload_bytes)
+            gc.alloc_nursery_no_collect_typed(type_id, payload_bytes)
         });
         unsafe {
             *((gcref.0 + JF_FRAME_LENGTH_OFS as usize) as *mut usize) = frame_depth;

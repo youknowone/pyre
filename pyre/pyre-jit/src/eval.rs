@@ -153,6 +153,17 @@ thread_local! {
         // jitframe.py:49 — rgc.register_custom_trace_hook(JITFRAME, jitframe_trace)
         let jitframe_tid = gc.register_type(majit_metainterp::jitframe::jitframe_type_info());
         debug_assert_eq!(jitframe_tid, JITFRAME_GC_TYPE_ID);
+        // Tell the cranelift backend which type id to use for the
+        // nursery allocations that it issues for jitframes. Without
+        // this, the backend's default u32::MAX sentinel would trip the
+        // allocation assert in run_compiled_code_inner, or — worse,
+        // before this fix — the backend's stale hard-coded `2` would
+        // collide with W_FLOAT_GC_TYPE_ID and GC would copy jitframes
+        // with the wrong TypeInfo (24-byte float payload instead of
+        // the real 64 + 8*depth layout), silently truncating every
+        // ref root slot past the first three bytes.
+        #[cfg(feature = "cranelift")]
+        majit_backend_cranelift::set_jitframe_gc_type_id(jitframe_tid);
         // llsupport/gc.py:563 vtable→typeid mapping. RPython derives the
         // typeid arithmetically from gc_get_type_info_group; pyre keeps an
         // explicit table because every PyType is a static global
