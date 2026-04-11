@@ -1339,6 +1339,12 @@ impl OpcodeStepExecutor for PyFrame {
     // PyPy: UNARY_POSITIVE → space.pos(w_value)
     fn unary_positive(&mut self, val: PyObjectRef) -> Result<PyObjectRef, Self::Error> {
         unsafe {
+            if pyre_object::is_bool(val) {
+                // +True → 1, +False → 0 (int, not bool)
+                return Ok(pyre_object::w_int_new(
+                    pyre_object::w_bool_get_value(val) as i64
+                ));
+            }
             if pyre_object::is_int(val) || pyre_object::is_float(val) {
                 return Ok(val);
             }

@@ -245,7 +245,7 @@ pub fn install_default_builtins(namespace: &mut PyNamespace) {
         make_module_builtin_function("compile", builtin_compile)
     });
     namespace.get_or_insert_with("complex", || {
-        make_module_builtin_function("complex", |_| Ok(w_none()))
+        make_module_builtin_function("complex", builtin_complex)
     });
     namespace.get_or_insert_with("filter", || {
         make_module_builtin_function("filter", |args| {
@@ -717,6 +717,9 @@ pub fn builtin_abs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     assert!(args.len() == 1, "abs() takes exactly one argument");
     let obj = args[0];
     unsafe {
+        if is_bool(obj) {
+            return Ok(w_int_new(w_bool_get_value(obj) as i64));
+        }
         if is_int(obj) {
             let v = w_int_get_value(obj);
             // i64::MIN.abs() overflows; promote to long
@@ -742,7 +745,7 @@ pub fn builtin_abs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
             }
         }
     }
-    panic!("bad operand type for abs()")
+    Err(crate::PyError::type_error("bad operand type for abs()"))
 }
 
 /// Convert an int or long object to BigInt for comparison.
@@ -1413,12 +1416,51 @@ pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     ))
 }
 
-/// `bool(obj)` — PyPy: operation.py bool → space.is_true
+/// `bool(obj)` — PyPy: boolobject.py descr_new → space.is_true
+///
+/// Takes at most 1 positional argument. Validates __bool__ return type.
 pub(crate) fn builtin_bool(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.len() > 1 {
+        return Err(crate::PyError::type_error(
+            "bool expected at most 1 argument, got more",
+        ));
+    }
     if args.is_empty() {
         return Ok(w_bool_from(false));
     }
-    Ok(w_bool_from(crate::baseobjspace::is_true(args[0])))
+    let obj = args[0];
+    // Strict __bool__ check: must return bool, not int.
+    // boolobject.py descr_new calls space.is_true(w_obj) which validates.
+    unsafe {
+        if pyre_object::is_instance(obj) {
+            let w_type = pyre_object::w_instance_get_type(obj);
+            // __bool__ = None → TypeError ("not supported")
+            if let Some(method) = crate::baseobjspace::lookup_in_type(w_type, "__bool__") {
+                if pyre_object::is_none(method) {
+                    return Err(crate::PyError::type_error(
+                        "object of this type has no len() or __bool__",
+                    ));
+                }
+                let result = crate::call_function(method, &[obj]);
+                if !result.is_null() && !is_bool(result) {
+                    let tp_name = (*(*result).ob_type).name;
+                    return Err(crate::PyError::type_error(format!(
+                        "__bool__ should return bool, returned {}",
+                        tp_name,
+                    )));
+                }
+            }
+            // __len__ = None → TypeError
+            if let Some(len_method) = crate::baseobjspace::lookup_in_type(w_type, "__len__") {
+                if pyre_object::is_none(len_method) {
+                    return Err(crate::PyError::type_error(
+                        "object of this type has no len() or __bool__",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(w_bool_from(crate::baseobjspace::is_true(obj)))
 }
 
 /// `hasattr(obj, name)` → bool — direct call (no callback needed after merge)
@@ -2860,10 +2902,102 @@ fn builtin_bin(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(w_str_new(&s))
 }
 
+/// `complex(real=0, imag=0)` — PyPy: complexobject.py descr__new__
+fn builtin_complex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    use pyre_object::*;
+    let real = if args.is_empty() {
+        0.0
+    } else {
+        unsafe {
+            let a = args[0];
+            if is_bool(a) {
+                w_bool_get_value(a) as i64 as f64
+            } else if is_int(a) {
+                w_int_get_value(a) as f64
+            } else if is_float(a) {
+                w_float_get_value(a)
+            } else if is_str(a) {
+                let s = crate::py_str(a);
+                s.trim().parse::<f64>().map_err(|_| {
+                    crate::PyError::new(
+                        crate::PyErrorKind::ValueError,
+                        format!("could not convert string to complex: '{s}'"),
+                    )
+                })?
+            } else {
+                0.0
+            }
+        }
+    };
+    let imag = if args.len() > 1 {
+        unsafe {
+            let a = args[1];
+            if is_bool(a) {
+                w_bool_get_value(a) as i64 as f64
+            } else if is_int(a) {
+                w_int_get_value(a) as f64
+            } else if is_float(a) {
+                w_float_get_value(a)
+            } else {
+                0.0
+            }
+        }
+    } else {
+        0.0
+    };
+    // No complex type yet — return float as approximation
+    if imag == 0.0 {
+        Ok(pyre_object::w_float_new(real))
+    } else {
+        Err(crate::PyError::type_error(
+            "complex numbers not yet supported",
+        ))
+    }
+}
+
 /// `format(value, format_spec='')` — PyPy: operation.py format
 fn builtin_format(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty(), "format() takes at least one argument");
-    // Simplified: format without format_spec returns str(value)
+    let value = args[0];
+    let spec = if args.len() > 1 {
+        unsafe { crate::py_str(args[1]) }
+    } else {
+        String::new()
+    };
+    // With format_spec: delegate to __format__ or handle basic int specs
+    if !spec.is_empty() {
+        unsafe {
+            let int_val = if pyre_object::is_bool(value) {
+                Some(pyre_object::w_bool_get_value(value) as i64)
+            } else if pyre_object::is_int(value) {
+                Some(pyre_object::w_int_get_value(value))
+            } else {
+                None
+            };
+            if let Some(v) = int_val {
+                let s = match spec.as_str() {
+                    "d" => format!("{v}"),
+                    "b" => format!("{v:b}"),
+                    "o" => format!("{v:o}"),
+                    "x" => format!("{v:x}"),
+                    "X" => format!("{v:X}"),
+                    "n" => format!("{v}"),
+                    _ => format!("{v}"),
+                };
+                return Ok(w_str_new(&s));
+            }
+            if pyre_object::is_float(value) {
+                let fv = pyre_object::w_float_get_value(value);
+                let s = match spec.as_str() {
+                    "f" => format!("{fv:.6}"),
+                    "e" => format!("{fv:e}"),
+                    "g" => format!("{fv}"),
+                    _ => format!("{fv}"),
+                };
+                return Ok(w_str_new(&s));
+            }
+        }
+    }
     let s = unsafe { crate::py_str(args[0]) };
     Ok(w_str_new(&s))
 }

@@ -882,6 +882,17 @@ pub fn call_with_kwargs(
     // For type objects: allocate via __new__ then call __init__ with kwargs.
     // PyPy: typeobject.py descr_call → __new__ + __init__
     if unsafe { pyre_object::is_type(callable) } {
+        // Types with acceptable_as_base_class=false (bool, NoneType) reject kwargs.
+        // PyPy: boolobject.py descr_new uses @unwrap_spec (positional only).
+        if !kwargs.is_empty()
+            && !unsafe { pyre_object::w_type_get_acceptable_as_base_class(callable) }
+        {
+            let type_name = unsafe { pyre_object::w_type_get_name(callable) };
+            return Err(crate::PyError::type_error(format!(
+                "{}() takes no keyword arguments",
+                type_name,
+            )));
+        }
         // Calculate the winning metaclass from bases.
         // type(name, bases, dict, **kw) needs to find the correct metaclass
         // and call its __new__ with the kwargs.

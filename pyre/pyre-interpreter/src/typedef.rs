@@ -631,9 +631,14 @@ fn int_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     } else {
         args[0]
     };
+    // intobject.py _new_int → check_user_subclass
+    if !cls.is_null() && unsafe { pyre_object::is_type(cls) } {
+        if let Some(w_int) = gettypefor(&pyre_object::INT_TYPE) {
+            check_user_subclass(w_int, cls)?;
+        }
+    }
     let value = crate::builtins::builtin_int(&args[1..])?;
     // If cls is int itself (or null), return a plain int.
-    // Compare against both the static &INT_TYPE and the W_TypeObject for int.
     if cls.is_null() || !unsafe { pyre_object::is_type(cls) } {
         return Ok(value);
     }
@@ -761,7 +766,77 @@ fn dict_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     }
     Ok(instance)
 }
-descr_new_wrapper!(bool_descr_new, crate::builtins::builtin_bool);
+/// boolobject.py descr_new — bool.__new__(cls, obj=False)
+///
+/// check_user_subclass prevents subclassing (acceptable_as_base_class=False).
+/// Only positional obj argument accepted.
+fn bool_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    // args[0] = w_booltype (cls)
+    let w_booltype = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    if let Some(w_bool) = gettypefor(&pyre_object::BOOL_TYPE) {
+        check_user_subclass(w_bool, w_booltype)?;
+    }
+    // boolobject.py: descr_new(space, w_booltype, w_obj)
+    // Takes exactly (cls) or (cls, obj). No extra args, no kwargs.
+    if args.len() > 2 {
+        return Err(crate::PyError::type_error(
+            "bool expected at most 1 argument, got more",
+        ));
+    }
+    // args[1] = w_obj (default: False)
+    let w_obj = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+    if w_obj.is_null() {
+        return Ok(pyre_object::w_bool_from(false));
+    }
+    // Validate __bool__ return type and handle __bool__=None / __len__=None.
+    // PyPy: space.is_true validates these conditions.
+    // Use space.lookup (resolves type via type(obj)) — works for both
+    // W_InstanceObject and int/float subclass instances.
+    unsafe {
+        if let Some(w_type) = crate::typedef::r#type(w_obj) {
+            if let Some(method) = crate::baseobjspace::lookup_in_type(w_type, "__bool__") {
+                if pyre_object::is_none(method) {
+                    return Err(crate::PyError::type_error(
+                        "object of this type has no bool()",
+                    ));
+                }
+                let result = crate::call_function(method, &[w_obj]);
+                if !result.is_null() {
+                    if !pyre_object::is_bool(result) {
+                        let tp_name = (*(*result).ob_type).name;
+                        return Err(crate::PyError::type_error(format!(
+                            "__bool__ should return bool, returned {}",
+                            tp_name,
+                        )));
+                    }
+                    return Ok(result);
+                }
+            }
+            if let Some(len_m) = crate::baseobjspace::lookup_in_type(w_type, "__len__") {
+                if pyre_object::is_none(len_m) {
+                    return Err(crate::PyError::type_error(
+                        "object of this type has no len()",
+                    ));
+                }
+                // __len__ returning negative → ValueError
+                let len_result = crate::call_function(len_m, &[w_obj]);
+                if !len_result.is_null() && pyre_object::is_int(len_result) {
+                    let v = pyre_object::w_int_get_value(len_result);
+                    if v < 0 {
+                        return Err(crate::PyError::new(
+                            crate::PyErrorKind::ValueError,
+                            "__len__() should return >= 0".to_string(),
+                        ));
+                    }
+                    return Ok(pyre_object::w_bool_from(v != 0));
+                }
+            }
+        }
+    }
+    Ok(pyre_object::w_bool_from(crate::baseobjspace::is_true(
+        w_obj,
+    )))
+}
 descr_new_wrapper!(list_descr_new, crate::builtins::builtin_list_ctor);
 descr_new_wrapper!(tuple_descr_new, crate::builtins::builtin_tuple);
 // dict_new handled by dict_descr_new above (supports dict subclasses)
@@ -1077,6 +1152,21 @@ fn init_str_type(ns: &mut PyNamespace) {
         ns,
         "isdigit",
         make_builtin_function("isdigit", crate::type_methods::str_method_isdigit),
+    );
+    namespace_store(
+        ns,
+        "isdecimal",
+        make_builtin_function("isdecimal", crate::type_methods::str_method_isdecimal),
+    );
+    namespace_store(
+        ns,
+        "isnumeric",
+        make_builtin_function("isnumeric", crate::type_methods::str_method_isnumeric),
+    );
+    namespace_store(
+        ns,
+        "istitle",
+        make_builtin_function("istitle", crate::type_methods::str_method_istitle),
     );
     namespace_store(
         ns,
@@ -2638,25 +2728,46 @@ fn init_int_type(ns: &mut PyNamespace) {
             Ok(args.first().copied().unwrap_or(pyre_object::w_int_new(0)))
         }),
     );
-    // int.real / int.imag — return value or 0
+    // int.real / int.imag / int.numerator — properties
+    // True.real → 1 (int, not bool), False.real → 0
     namespace_store(
         ns,
         "real",
-        make_builtin_function("real", |args| {
-            Ok(args.first().copied().unwrap_or(pyre_object::w_int_new(0)))
-        }),
+        pyre_object::w_property_new(
+            make_builtin_function("real", |args| {
+                let obj = args.first().copied().unwrap_or(pyre_object::w_int_new(0));
+                unsafe {
+                    if pyre_object::is_bool(obj) {
+                        return Ok(pyre_object::w_int_new(
+                            pyre_object::w_bool_get_value(obj) as i64
+                        ));
+                    }
+                }
+                Ok(obj)
+            }),
+            pyre_object::PY_NULL,
+            pyre_object::PY_NULL,
+        ),
     );
     namespace_store(
         ns,
         "imag",
-        make_builtin_function("imag", |_| Ok(pyre_object::w_int_new(0))),
+        pyre_object::w_property_new(
+            make_builtin_function("imag", |_| Ok(pyre_object::w_int_new(0))),
+            pyre_object::PY_NULL,
+            pyre_object::PY_NULL,
+        ),
     );
     namespace_store(
         ns,
         "numerator",
-        make_builtin_function("numerator", |args| {
-            Ok(args.first().copied().unwrap_or(pyre_object::w_int_new(0)))
-        }),
+        pyre_object::w_property_new(
+            make_builtin_function("numerator", |args| {
+                Ok(args.first().copied().unwrap_or(pyre_object::w_int_new(0)))
+            }),
+            pyre_object::PY_NULL,
+            pyre_object::PY_NULL,
+        ),
     );
     namespace_store(
         ns,

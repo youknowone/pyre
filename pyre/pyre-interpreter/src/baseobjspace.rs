@@ -151,6 +151,8 @@ pub fn unwrap_cell(obj: PyObjectRef) -> PyObjectRef {
 unsafe fn as_bigint(obj: PyObjectRef) -> BigInt {
     if is_int(obj) {
         BigInt::from(w_int_get_value(obj))
+    } else if is_bool(obj) {
+        BigInt::from(w_bool_get_value(obj) as i64)
     } else {
         w_long_get_value(obj).clone()
     }
@@ -178,8 +180,8 @@ fn bigint_result(value: BigInt) -> PyObjectRef {
 ///   New(W_IntObject) + SetfieldGcI(result)
 
 unsafe fn int_add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    let va = w_int_get_value(a);
-    let vb = w_int_get_value(b);
+    let va = int_value(a);
+    let vb = int_value(b);
     match va.checked_add(vb) {
         Some(r) => Ok(w_int_new(r)),
         None => Ok(w_long_new(BigInt::from(va) + BigInt::from(vb))),
@@ -187,8 +189,8 @@ unsafe fn int_add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 }
 
 unsafe fn int_sub(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    let va = w_int_get_value(a);
-    let vb = w_int_get_value(b);
+    let va = int_value(a);
+    let vb = int_value(b);
     match va.checked_sub(vb) {
         Some(r) => Ok(w_int_new(r)),
         None => Ok(w_long_new(BigInt::from(va) - BigInt::from(vb))),
@@ -196,8 +198,8 @@ unsafe fn int_sub(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 }
 
 unsafe fn int_mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    let va = w_int_get_value(a);
-    let vb = w_int_get_value(b);
+    let va = int_value(a);
+    let vb = int_value(b);
     match va.checked_mul(vb) {
         Some(r) => Ok(w_int_new(r)),
         None => Ok(w_long_new(BigInt::from(va) * BigInt::from(vb))),
@@ -205,8 +207,8 @@ unsafe fn int_mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 }
 
 unsafe fn int_floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    let va = w_int_get_value(a);
-    let vb = w_int_get_value(b);
+    let va = int_value(a);
+    let vb = int_value(b);
     if vb == 0 {
         return Err(PyError::zero_division("integer division or modulo by zero"));
     }
@@ -218,8 +220,8 @@ unsafe fn int_floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 }
 
 unsafe fn int_mod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    let va = w_int_get_value(a);
-    let vb = w_int_get_value(b);
+    let va = int_value(a);
+    let vb = int_value(b);
     if vb == 0 {
         return Err(PyError::zero_division("integer division or modulo by zero"));
     }
@@ -363,8 +365,8 @@ fn float_divmod_w(x: f64, y: f64) -> Result<(f64, f64), PyError> {
 // ── Power ────────────────────────────────────────────────────────────
 
 unsafe fn int_pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    let va = w_int_get_value(a);
-    let vb = w_int_get_value(b);
+    let va = int_value(a);
+    let vb = int_value(b);
     if vb < 0 {
         // Negative exponent → float result
         return Ok(w_float_new((va as f64).powf(vb as f64)));
@@ -390,8 +392,8 @@ unsafe fn long_pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 // ── Shift operations ─────────────────────────────────────────────────
 
 unsafe fn int_lshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    let va = w_int_get_value(a);
-    let vb = w_int_get_value(b);
+    let va = int_value(a);
+    let vb = int_value(b);
     if vb < 0 {
         return Err(PyError::type_error("negative shift count"));
     }
@@ -404,8 +406,8 @@ unsafe fn int_lshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 }
 
 unsafe fn int_rshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    let va = w_int_get_value(a);
-    let vb = w_int_get_value(b);
+    let va = int_value(a);
+    let vb = int_value(b);
     if vb < 0 {
         return Err(PyError::type_error("negative shift count"));
     }
@@ -431,18 +433,49 @@ unsafe fn long_rshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     Ok(bigint_result(as_bigint(a) >> shift))
 }
 
+// ── bool-as-int helpers ──────────────────────────────────────────────
+
+/// True when obj is int or bool (bool is a subclass of int in Python).
+#[inline]
+unsafe fn is_int_like(obj: PyObjectRef) -> bool {
+    is_int(obj) || is_bool(obj)
+}
+
+/// Extract i64 from an int or bool object.
+#[inline]
+unsafe fn int_value(obj: PyObjectRef) -> i64 {
+    if is_bool(obj) {
+        w_bool_get_value(obj) as i64
+    } else {
+        w_int_get_value(obj)
+    }
+}
+
 // ── Bitwise operations ───────────────────────────────────────────────
 
 unsafe fn int_bitand(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    Ok(w_int_new(w_int_get_value(a) & w_int_get_value(b)))
+    let r = int_value(a) & int_value(b);
+    // bool & bool → bool
+    if is_bool(a) && is_bool(b) {
+        return Ok(w_bool_from(r != 0));
+    }
+    Ok(w_int_new(r))
 }
 
 unsafe fn int_bitor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    Ok(w_int_new(w_int_get_value(a) | w_int_get_value(b)))
+    let r = int_value(a) | int_value(b);
+    if is_bool(a) && is_bool(b) {
+        return Ok(w_bool_from(r != 0));
+    }
+    Ok(w_int_new(r))
 }
 
 unsafe fn int_bitxor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    Ok(w_int_new(w_int_get_value(a) ^ w_int_get_value(b)))
+    let r = int_value(a) ^ int_value(b);
+    if is_bool(a) && is_bool(b) {
+        return Ok(w_bool_from(r != 0));
+    }
+    Ok(w_int_new(r))
 }
 
 unsafe fn long_bitand(a: PyObjectRef, b: PyObjectRef) -> PyResult {
@@ -531,27 +564,27 @@ unsafe fn list_repeat(list: PyObjectRef, n: PyObjectRef) -> PyResult {
 // ── Comparison operations ─────────────────────────────────────────────
 
 unsafe fn int_lt(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    Ok(w_bool_from(w_int_get_value(a) < w_int_get_value(b)))
+    Ok(w_bool_from(int_value(a) < int_value(b)))
 }
 
 unsafe fn int_le(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    Ok(w_bool_from(w_int_get_value(a) <= w_int_get_value(b)))
+    Ok(w_bool_from(int_value(a) <= int_value(b)))
 }
 
 unsafe fn int_gt(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    Ok(w_bool_from(w_int_get_value(a) > w_int_get_value(b)))
+    Ok(w_bool_from(int_value(a) > int_value(b)))
 }
 
 unsafe fn int_ge(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    Ok(w_bool_from(w_int_get_value(a) >= w_int_get_value(b)))
+    Ok(w_bool_from(int_value(a) >= int_value(b)))
 }
 
 unsafe fn int_eq(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    Ok(w_bool_from(w_int_get_value(a) == w_int_get_value(b)))
+    Ok(w_bool_from(int_value(a) == int_value(b)))
 }
 
 unsafe fn int_ne(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    Ok(w_bool_from(w_int_get_value(a) != w_int_get_value(b)))
+    Ok(w_bool_from(int_value(a) != int_value(b)))
 }
 
 unsafe fn float_lt(a: PyObjectRef, b: PyObjectRef) -> PyResult {
@@ -729,7 +762,7 @@ pub fn add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     let b = unwrap_cell(b);
     unsafe {
-        if is_int(a) && is_int(b) {
+        if is_int_like(a) && is_int_like(b) {
             return int_add(a, b);
         }
         if is_int_or_long(a) && is_int_or_long(b) {
@@ -778,7 +811,7 @@ pub fn sub(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     let b = unwrap_cell(b);
     unsafe {
-        if is_int(a) && is_int(b) {
+        if is_int_like(a) && is_int_like(b) {
             return int_sub(a, b);
         }
         if is_int_or_long(a) && is_int_or_long(b) {
@@ -816,7 +849,7 @@ pub fn mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     let b = unwrap_cell(b);
     unsafe {
-        if is_int(a) && is_int(b) {
+        if is_int_like(a) && is_int_like(b) {
             return int_mul(a, b);
         }
         if is_int_or_long(a) && is_int_or_long(b) {
@@ -887,7 +920,7 @@ pub fn floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     let b = unwrap_cell(b);
     unsafe {
-        if is_int(a) && is_int(b) {
+        if is_int_like(a) && is_int_like(b) {
             return int_floordiv(a, b);
         }
         if is_int_or_long(a) && is_int_or_long(b) {
@@ -911,7 +944,7 @@ pub fn mod_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     let b = unwrap_cell(b);
     unsafe {
-        if is_int(a) && is_int(b) {
+        if is_int_like(a) && is_int_like(b) {
             return int_mod(a, b);
         }
         if is_int_or_long(a) && is_int_or_long(b) {
@@ -1016,8 +1049,8 @@ unsafe fn str_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> PyResult {
                     result.push_str(&crate::py_repr(arg));
                 }
                 'd' | 'i' => {
-                    if is_int(arg) {
-                        let val = w_int_get_value(arg);
+                    if is_int_like(arg) {
+                        let val = int_value(arg);
                         if width.is_empty() {
                             result.push_str(&format!("{val}"));
                         } else {
@@ -1037,8 +1070,8 @@ unsafe fn str_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> PyResult {
                 'f' => {
                     let val = if is_float(arg) {
                         pyre_object::floatobject::w_float_get_value(arg)
-                    } else if is_int(arg) {
-                        w_int_get_value(arg) as f64
+                    } else if is_int_like(arg) {
+                        int_value(arg) as f64
                     } else {
                         0.0
                     };
@@ -1054,13 +1087,18 @@ unsafe fn str_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> PyResult {
                     }
                 }
                 'x' => {
-                    if is_int(arg) {
-                        result.push_str(&format!("{:x}", w_int_get_value(arg)));
+                    if is_int_like(arg) {
+                        result.push_str(&format!("{:x}", int_value(arg)));
+                    }
+                }
+                'X' => {
+                    if is_int_like(arg) {
+                        result.push_str(&format!("{:X}", int_value(arg)));
                     }
                 }
                 'o' => {
-                    if is_int(arg) {
-                        result.push_str(&format!("{:o}", w_int_get_value(arg)));
+                    if is_int_like(arg) {
+                        result.push_str(&format!("{:o}", int_value(arg)));
                     }
                 }
                 _ => {
@@ -1104,7 +1142,7 @@ pub fn pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     let b = unwrap_cell(b);
     unsafe {
-        if is_int(a) && is_int(b) {
+        if is_int_like(a) && is_int_like(b) {
             return int_pow(a, b);
         }
         if is_int_or_long(a) && is_int_or_long(b) {
@@ -1737,7 +1775,7 @@ pub fn lshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     let b = unwrap_cell(b);
     unsafe {
-        if is_int(a) && is_int(b) {
+        if is_int_like(a) && is_int_like(b) {
             return int_lshift(a, b);
         }
         if is_int_or_long(a) && is_int_or_long(b) {
@@ -1760,7 +1798,7 @@ pub fn rshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     let b = unwrap_cell(b);
     unsafe {
-        if is_int(a) && is_int(b) {
+        if is_int_like(a) && is_int_like(b) {
             return int_rshift(a, b);
         }
         if is_int_or_long(a) && is_int_or_long(b) {
@@ -1783,7 +1821,7 @@ pub fn and_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     let b = unwrap_cell(b);
     unsafe {
-        if is_int(a) && is_int(b) {
+        if is_int_like(a) && is_int_like(b) {
             return int_bitand(a, b);
         }
         if is_int_or_long(a) && is_int_or_long(b) {
@@ -1828,7 +1866,7 @@ pub fn or_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     let b = unwrap_cell(b);
     unsafe {
-        if is_int(a) && is_int(b) {
+        if is_int_like(a) && is_int_like(b) {
             return int_bitor(a, b);
         }
         if is_int_or_long(a) && is_int_or_long(b) {
@@ -1883,7 +1921,7 @@ pub fn xor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     let b = unwrap_cell(b);
     unsafe {
-        if is_int(a) && is_int(b) {
+        if is_int_like(a) && is_int_like(b) {
             return int_bitxor(a, b);
         }
         if is_int_or_long(a) && is_int_or_long(b) {
@@ -1906,7 +1944,7 @@ pub fn compare(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
     let a = unwrap_cell(a);
     let b = unwrap_cell(b);
     unsafe {
-        if is_int(a) && is_int(b) {
+        if is_int_like(a) && is_int_like(b) {
             return match op {
                 CompareOp::Lt => int_lt(a, b),
                 CompareOp::Le => int_le(a, b),
@@ -2108,8 +2146,14 @@ pub fn is_true(obj: PyObjectRef) -> bool {
             // Try __bool__ first (type MRO)
             if let Some(method) = lookup_in_type_where(w_type, "__bool__") {
                 let result = crate::call_function(method, &[obj]);
-                if !result.is_null() && is_bool(result) {
-                    return w_bool_get_value(result);
+                if !result.is_null() {
+                    if is_bool(result) {
+                        return w_bool_get_value(result);
+                    }
+                    if is_int(result) {
+                        return w_int_get_value(result) != 0;
+                    }
+                    return true; // non-null → truthy fallback
                 }
             }
             // Then __len__ (type MRO) — nonzero length = truthy
@@ -2136,8 +2180,8 @@ pub fn is_true(obj: PyObjectRef) -> bool {
 pub fn neg(a: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     unsafe {
-        if is_int(a) {
-            let v = w_int_get_value(a);
+        if is_int(a) || is_bool(a) {
+            let v = int_value(a);
             return match v.checked_neg() {
                 Some(r) => Ok(w_int_new(r)),
                 None => Ok(w_long_new(-BigInt::from(v))),
@@ -2170,8 +2214,8 @@ pub fn neg(a: PyObjectRef) -> PyResult {
 pub fn invert(a: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     unsafe {
-        if is_int(a) {
-            return Ok(w_int_new(!w_int_get_value(a)));
+        if is_int(a) || is_bool(a) {
+            return Ok(w_int_new(!int_value(a)));
         }
         if is_long(a) {
             return Ok(bigint_result(!w_long_get_value(a).clone()));
@@ -5571,7 +5615,7 @@ fn eq_w(a: PyObjectRef, b: PyObjectRef) -> bool {
     }
     unsafe {
         use pyre_object::*;
-        if is_int(a) && is_int(b) {
+        if is_int_like(a) && is_int_like(b) {
             return w_int_get_value(a) == w_int_get_value(b);
         }
         if is_str(a) && is_str(b) {

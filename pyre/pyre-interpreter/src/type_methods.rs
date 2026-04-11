@@ -459,6 +459,47 @@ pub fn str_method_isdigit(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     ))
 }
 
+pub fn str_method_isdecimal(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    assert!(!args.is_empty());
+    let s = unsafe { w_str_get_value(args[0]) };
+    Ok(w_bool_from(
+        !s.is_empty() && s.chars().all(|c| c.is_ascii_digit() || c.is_numeric()),
+    ))
+}
+
+pub fn str_method_isnumeric(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    assert!(!args.is_empty());
+    let s = unsafe { w_str_get_value(args[0]) };
+    Ok(w_bool_from(
+        !s.is_empty() && s.chars().all(|c| c.is_numeric()),
+    ))
+}
+
+pub fn str_method_istitle(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    assert!(!args.is_empty());
+    let s = unsafe { w_str_get_value(args[0]) };
+    let mut cased = false;
+    let mut prev_cased = false;
+    for c in s.chars() {
+        if c.is_uppercase() {
+            if prev_cased {
+                return Ok(w_bool_from(false));
+            }
+            prev_cased = true;
+            cased = true;
+        } else if c.is_lowercase() {
+            if !prev_cased {
+                return Ok(w_bool_from(false));
+            }
+            prev_cased = true;
+            cased = true;
+        } else {
+            prev_cased = false;
+        }
+    }
+    Ok(w_bool_from(cased))
+}
+
 pub fn str_method_isalpha(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty());
     let s = unsafe { w_str_get_value(args[0]) };
