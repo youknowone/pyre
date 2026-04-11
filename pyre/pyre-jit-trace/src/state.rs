@@ -2516,7 +2516,7 @@ fn materialize_bridge_virtual(
             // resume.py:703: buffer = decoder.allocate_raw_buffer(self.func, self.size)
             let func_ref = ctx.const_int(*func);
             let size_ref = ctx.const_int(*size as i64);
-            let calldescr = crate::descr::make_call_descr_int();
+            let calldescr = crate::descr::make_raw_malloc_calldescr();
             let buffer = ctx.record_op_with_descr(OpCode::CallI, &[func_ref, size_ref], calldescr);
             // resume.py:704: decoder.virtuals_cache.set_int(index, buffer)
             cache.insert(vidx, buffer);
@@ -2532,15 +2532,10 @@ fn materialize_bridge_virtual(
                     continue;
                 }
                 // resume.py:1225-1234: setrawbuffer_item (direct reader).
-                // rawbuffer.py:55: write_value asserts not is_array_of_pointers().
-                // Raw buffers never hold GC-managed pointers — this is an
-                // optimizer invariant, not a decode-time decision.
+                // Dispatches pointer/float/int via arraydescr — all types allowed.
                 let di = &descrs[i];
-                assert!(
-                    di.item_type != 0,
-                    "raw buffer entry must not be pointer type"
-                );
                 let tp = match di.item_type {
+                    0 => majit_ir::Type::Ref,
                     2 => majit_ir::Type::Float,
                     _ => majit_ir::Type::Int,
                 };

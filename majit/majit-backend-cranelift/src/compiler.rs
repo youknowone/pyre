@@ -11625,6 +11625,63 @@ unsafe fn bh_call_i_dispatch(func: usize, int_args: &[i64], float_args: &[f64]) 
             let f: unsafe extern "C" fn(I, I, I, F) -> I = std::mem::transmute(func);
             f(int_args[0], int_args[1], int_args[2], float_args[0])
         }
+        (4, 1) => {
+            let f: unsafe extern "C" fn(I, I, I, I, F) -> I = std::mem::transmute(func);
+            f(
+                int_args[0],
+                int_args[1],
+                int_args[2],
+                int_args[3],
+                float_args[0],
+            )
+        }
+        (3, 2) => {
+            let f: unsafe extern "C" fn(I, I, I, F, F) -> I = std::mem::transmute(func);
+            f(
+                int_args[0],
+                int_args[1],
+                int_args[2],
+                float_args[0],
+                float_args[1],
+            )
+        }
+        (0, 3) => {
+            let f: unsafe extern "C" fn(F, F, F) -> I = std::mem::transmute(func);
+            f(float_args[0], float_args[1], float_args[2])
+        }
+        (0, 4) => {
+            let f: unsafe extern "C" fn(F, F, F, F) -> I = std::mem::transmute(func);
+            f(float_args[0], float_args[1], float_args[2], float_args[3])
+        }
+        (1, 3) => {
+            let f: unsafe extern "C" fn(I, F, F, F) -> I = std::mem::transmute(func);
+            f(int_args[0], float_args[0], float_args[1], float_args[2])
+        }
+        (7, 0) => {
+            let f: unsafe extern "C" fn(I, I, I, I, I, I, I) -> I = std::mem::transmute(func);
+            f(
+                int_args[0],
+                int_args[1],
+                int_args[2],
+                int_args[3],
+                int_args[4],
+                int_args[5],
+                int_args[6],
+            )
+        }
+        (8, 0) => {
+            let f: unsafe extern "C" fn(I, I, I, I, I, I, I, I) -> I = std::mem::transmute(func);
+            f(
+                int_args[0],
+                int_args[1],
+                int_args[2],
+                int_args[3],
+                int_args[4],
+                int_args[5],
+                int_args[6],
+                int_args[7],
+            )
+        }
         (ni, nf) => {
             panic!(
                 "bh_call_i: unsupported arg combination ({ni} ints, {nf} floats); \

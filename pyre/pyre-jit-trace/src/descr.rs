@@ -920,13 +920,10 @@ mod tests {
     }
 }
 
-/// Minimal call descriptor for CALL_I (int-returning function call).
-/// resume.py:1124-1132: allocate_raw_buffer uses callinfo_for_oopspec
-/// to get a calldescr for OS_RAW_MALLOC_VARSIZE_CHAR. pyre uses a
-/// simple array-descr-shaped descriptor since the backend only needs
-/// to know the return type (Int) and argument layout.
-pub fn make_call_descr_int() -> DescrRef {
-    make_array_descr(0, 8, Type::Int, false)
+/// resume.py:1124-1132: allocate_raw_buffer uses
+/// callinfo_for_oopspec(OS_RAW_MALLOC_VARSIZE_CHAR) to get the calldescr.
+pub fn make_raw_malloc_calldescr() -> DescrRef {
+    majit_ir::make_raw_malloc_calldescr()
 }
 
 /// descr.py:273 ArrayDescr for array-of-structs (FLAG_STRUCT).

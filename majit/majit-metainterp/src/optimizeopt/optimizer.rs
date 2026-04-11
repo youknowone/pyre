@@ -414,7 +414,8 @@ impl Optimizer {
                             descrs: descrs.clone(),
                             values,
                             last_guard_pos: -1,
-                            calldescr: None,
+                            // resume.py:1452: calldescr from callinfo_for_oopspec
+                            calldescr: Some(majit_ir::make_raw_malloc_calldescr()),
                         },
                     ),
                 );
@@ -889,7 +890,8 @@ impl Optimizer {
                             descrs: descrs.clone(),
                             values,
                             last_guard_pos: -1,
-                            calldescr: None,
+                            // resume.py:1452: calldescr from callinfo_for_oopspec
+                            calldescr: Some(majit_ir::make_raw_malloc_calldescr()),
                         },
                     ),
                 );

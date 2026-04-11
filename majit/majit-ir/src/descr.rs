@@ -1595,6 +1595,25 @@ impl CallDescr for SimpleCallDescr {
     }
 }
 
+/// resume.py:1124-1132: callinfo_for_oopspec(OS_RAW_MALLOC_VARSIZE_CHAR).
+/// Returns a CallDescr for CALL_I(func, size) → int (raw pointer).
+pub fn make_raw_malloc_calldescr() -> DescrRef {
+    use std::sync::Arc;
+    static NEXT_IDX: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x4000_0000);
+    let idx = NEXT_IDX.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let effect = EffectInfo {
+        oopspec_index: OopSpecIndex::RawMallocVarsizeChar,
+        ..EffectInfo::default()
+    };
+    Arc::new(SimpleCallDescr::new(
+        idx,
+        vec![crate::Type::Int],
+        crate::Type::Int,
+        8,
+        effect,
+    ))
+}
+
 /// Simple concrete FailDescr for guard failure descriptors.
 #[derive(Debug)]
 pub struct SimpleFailDescr {
