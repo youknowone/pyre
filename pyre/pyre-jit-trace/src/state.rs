@@ -4,6 +4,7 @@
 //! infrastructure. It extracts live values from the frame, restores them
 //! after compiled code runs, and provides the meta/sym types for tracing.
 
+use majit_backend::Backend;
 use majit_ir::{DescrRef, OpCode, OpRef, Type, Value};
 use majit_metainterp::virtualizable::VirtualizableInfo;
 use majit_metainterp::{
@@ -2447,6 +2448,7 @@ fn materialize_bridge_virtual(
             size,
             fielddescr_indices,
             field_types,
+            base_size,
             item_size,
             field_offsets,
             field_sizes,
@@ -2454,7 +2456,9 @@ fn materialize_bridge_virtual(
         } => {
             let len_ref = ctx.const_int(*size as i64);
             // resume.py:749 decoder.allocate_array(self.size, self.arraydescr, clear=True)
-            let array_descr = array_descr_for_kind(0, *descr_index); // array-of-structs = ref-ptr array
+            // descr.py:384: arraydescr.flag == FLAG_STRUCT
+            let array_descr =
+                crate::descr::make_struct_array_descr(*descr_index, *base_size, *item_size);
             let new_op =
                 ctx.record_op_with_descr(OpCode::NewArrayClear, &[len_ref], array_descr.clone());
             ctx.heap_cache_mut().new_object(new_op);
@@ -2479,6 +2483,7 @@ fn materialize_bridge_virtual(
                     // resume.py:1208 execute_setinteriorfield_gc(descr, array, ConstInt(index), fieldbox)
                     let field_descr = crate::descr::make_interior_field_descr(
                         *descr_index,
+                        *base_size,
                         *item_size,
                         field_offsets.get(j).copied().unwrap_or(0),
                         field_sizes.get(j).copied().unwrap_or(8),
@@ -2505,15 +2510,10 @@ fn materialize_bridge_virtual(
             func,
             size,
             offsets,
-            entry_sizes,
-            entry_types,
-            entry_signed,
+            descrs,
             fieldnums,
         } => {
             // resume.py:703: buffer = decoder.allocate_raw_buffer(self.func, self.size)
-            // resume.py:1124-1132: allocate_raw_buffer →
-            //   calldescr = callinfo_for_oopspec(OS_RAW_MALLOC_VARSIZE_CHAR)
-            //   execute_and_record_varargs(CALL_I, [ConstInt(func), ConstInt(size)], calldescr)
             let func_ref = ctx.const_int(*func);
             let size_ref = ctx.const_int(*size as i64);
             let calldescr = crate::descr::make_call_descr_int();
@@ -2531,18 +2531,17 @@ fn materialize_bridge_virtual(
                 if item.is_none() {
                     continue;
                 }
-                // resume.py:1543-1550 setrawbuffer_item: dispatch by descr
-                let entry_type = entry_types.get(i).copied().unwrap_or(1);
-                let item_size = entry_sizes.get(i).copied().unwrap_or(8);
-                let signed = entry_signed.get(i).copied().unwrap_or(true);
-                let tp = match entry_type {
+                // resume.py:1225-1234: setrawbuffer_item (direct reader).
+                // Dispatches pointer/float/int via arraydescr — all types allowed.
+                let di = &descrs[i];
+                let tp = match di.item_type {
                     0 => majit_ir::Type::Ref,
                     2 => majit_ir::Type::Float,
                     _ => majit_ir::Type::Int,
                 };
-                let store_descr = crate::descr::make_array_descr(0, item_size, tp, signed);
+                let store_descr =
+                    crate::descr::make_array_descr(di.base_size, di.item_size, tp, di.is_signed);
                 let offset_ref = ctx.const_int(off as i64);
-                // resume.py:1233: execute_raw_store(arraydescr, buffer, ConstInt(offset), itembox)
                 ctx.record_op_with_descr(
                     OpCode::RawStore,
                     &[buffer, offset_ref, item],
@@ -3477,8 +3476,17 @@ impl PyreJitState {
             MaterializedVirtual::RawBuffer {
                 func,
                 size,
-                entries,
-            } => materialize_virtual_raw_buffer(*func, *size, entries, materialized_refs),
+                offsets,
+                descrs,
+                values,
+            } => materialize_virtual_raw_buffer(
+                *func,
+                *size,
+                offsets,
+                descrs,
+                values,
+                materialized_refs,
+            ),
             _ => None,
         }
     }
@@ -3558,70 +3566,55 @@ impl PyreJitState {
     }
 }
 
-/// resume.py:701-708 VRawBufferInfo.allocate_int parity.
 fn materialize_virtual_raw_buffer(
     func: i64,
     size: usize,
-    entries: &[(
-        usize,
-        majit_ir::RawBufferDescr,
-        majit_metainterp::resume::MaterializedValue,
-    )],
+    offsets: &[usize],
+    descrs: &[majit_ir::ArrayDescrInfo],
+    values: &[majit_metainterp::resume::MaterializedValue],
     materialized_refs: &[Option<majit_ir::GcRef>],
 ) -> Option<majit_ir::GcRef> {
-    // resume.py:703: buffer = decoder.allocate_raw_buffer(self.func, self.size)
-    let ptr = allocate_raw_buffer_by_func(func, size);
-    if ptr.is_null() {
+    assert_eq!(offsets.len(), descrs.len());
+    assert_eq!(offsets.len(), values.len());
+
+    // resume.py:703: buffer = decoder.allocate_raw_buffer(func, size)
+    let (driver, _) = crate::driver::driver_pair();
+    let calldescr = majit_codewriter::jitcode::BhCallDescr {
+        arg_classes: "i".into(),
+        result_type: 'i',
+    };
+    let buffer = driver.meta_interp().backend().bh_call_i(
+        func,
+        Some(&[size as i64]),
+        None,
+        None,
+        &calldescr,
+    );
+    if buffer == 0 {
         return None;
     }
 
-    // resume.py:705-708: setrawbuffer_item per entry
-    for (offset, descr, value) in entries {
-        let concrete = value.resolve_with_refs(materialized_refs)?;
-        write_rawbuffer_item(ptr, *offset, concrete, descr);
-    }
-
-    Some(majit_ir::GcRef(ptr as usize))
-}
-
-/// resume.py:1124-1132 allocate_raw_buffer(func, size).
-fn allocate_raw_buffer_by_func(func: i64, size: usize) -> *mut u8 {
-    if func != 0 {
-        let f: fn(usize) -> *mut u8 = unsafe { std::mem::transmute(func as usize) };
-        let ptr = f(size);
-        if !ptr.is_null() {
-            return ptr;
-        }
-    }
-    unsafe {
-        std::alloc::alloc_zeroed(
-            std::alloc::Layout::from_size_align(size.max(1), 8)
-                .unwrap_or(std::alloc::Layout::new::<u8>()),
-        )
-    }
-}
-
-/// resume.py:1543-1550 setrawbuffer_item: write raw value by descr.
-fn write_rawbuffer_item(ptr: *mut u8, offset: usize, raw: i64, descr: &majit_ir::RawBufferDescr) {
-    debug_assert!(descr.kind != 0, "raw buffer entry cannot be pointer");
-    unsafe {
-        let slot = ptr.add(offset);
-        if descr.kind == 2 {
-            match descr.itemsize {
-                8 => (slot as *mut u64).write_unaligned(raw as u64),
-                4 => (slot as *mut u32).write_unaligned(raw as u32),
-                _ => unreachable!("float itemsize must be 4 or 8"),
-            }
+    let backend = driver.meta_interp().backend();
+    // resume.py:705-708: per-item bh_raw_store_i/f
+    for i in 0..offsets.len() {
+        let concrete = values[i].resolve_with_refs(materialized_refs)?;
+        let di = &descrs[i];
+        // resume.py:1544: assert not descr.is_array_of_pointers()
+        assert!(
+            di.item_type != 0,
+            "raw buffer entry must not be pointer type"
+        );
+        let offset = offsets[i] as i64;
+        if di.item_type == 2 {
+            // resume.py:1545-1547: descr.is_array_of_floats() → bh_raw_store_f
+            backend.bh_raw_store_f(buffer, offset, f64::from_bits(concrete as u64));
         } else {
-            match descr.itemsize {
-                1 => slot.write(raw as u8),
-                2 => (slot as *mut u16).write_unaligned(raw as u16),
-                4 => (slot as *mut u32).write_unaligned(raw as u32),
-                8 => (slot as *mut u64).write_unaligned(raw as u64),
-                _ => unreachable!("int itemsize must be 1/2/4/8"),
-            }
+            // resume.py:1548-1550: else → bh_raw_store_i
+            backend.bh_raw_store_i(buffer, offset, concrete, di.item_size);
         }
     }
+
+    Some(majit_ir::GcRef(buffer as usize))
 }
 
 fn value_to_ptr(value: &Value) -> PyObjectRef {
@@ -3906,10 +3899,28 @@ mod tests {
         let second = w_int_new(4);
 
         let raw_items = MaterializedVirtual::RawBuffer {
+            func: 0,
             size: 16,
-            entries: vec![
-                (0, 8, MaterializedValue::Value(first as i64)),
-                (8, 8, MaterializedValue::Value(second as i64)),
+            offsets: vec![0, 8],
+            descrs: vec![
+                majit_ir::ArrayDescrInfo {
+                    index: 0,
+                    base_size: 0,
+                    item_size: 8,
+                    item_type: 1,
+                    is_signed: false,
+                },
+                majit_ir::ArrayDescrInfo {
+                    index: 0,
+                    base_size: 0,
+                    item_size: 8,
+                    item_type: 1,
+                    is_signed: false,
+                },
+            ],
+            values: vec![
+                MaterializedValue::Value(first as i64),
+                MaterializedValue::Value(second as i64),
             ],
         };
         let raw_ptr = <PyreJitState as JitState>::materialize_virtual_ref_with_refs(

@@ -10007,6 +10007,7 @@ fn collect_guards(
                             size,
                             fielddescr_indices,
                             field_types,
+                            base_size: _,
                             item_size,
                             field_offsets,
                             field_sizes,
@@ -10036,24 +10037,14 @@ fn collect_guards(
                             func,
                             size,
                             offsets,
-                            entry_sizes,
-                            entry_types,
-                            entry_signed,
+                            descrs,
                             fieldnums,
                         } => ExitVirtualLayout::RawBuffer {
                             func: *func,
                             size: *size,
                             offsets: offsets.clone(),
-                            descrs: entry_sizes
-                                .iter()
-                                .enumerate()
-                                .map(|(i, &itemsize)| majit_ir::RawBufferDescr {
-                                    itemsize,
-                                    is_signed: entry_signed.get(i).copied().unwrap_or(true),
-                                    kind: entry_types.get(i).copied().unwrap_or(1),
-                                })
-                                .collect(),
-                            sources: fieldnums
+                            descrs: descrs.clone(),
+                            values: fieldnums
                                 .iter()
                                 .map(|&fnum| resolve_fieldnum(fnum))
                                 .collect(),
@@ -11146,6 +11137,106 @@ impl majit_backend::Backend for CraneliftBackend {
             }
         }
         ptr
+    }
+
+    /// llmodel.py:816-820 bh_call_i(func, args_i, args_r, args_f, calldescr)
+    /// Generic call: calldescr.call_stub_i(func, args_i, args_r, args_f).
+    /// Flattens args per calldescr.arg_classes order, calls func, returns i64.
+    fn bh_call_i(
+        &self,
+        func: i64,
+        args_i: Option<&[i64]>,
+        args_r: Option<&[i64]>,
+        args_f: Option<&[i64]>,
+        calldescr: &majit_codewriter::jitcode::BhCallDescr,
+    ) -> i64 {
+        if func == 0 {
+            return 0;
+        }
+        // llmodel.py:820: calldescr.call_stub_i(func, args_i, args_r, args_f)
+        // Flatten args in arg_classes order into a flat i64 array.
+        let mut flat_args: Vec<i64> = Vec::new();
+        let mut ii = 0usize;
+        let mut ri = 0usize;
+        let mut fi = 0usize;
+        for c in calldescr.arg_classes.chars() {
+            match c {
+                'i' => {
+                    flat_args.push(args_i.and_then(|a| a.get(ii).copied()).unwrap_or(0));
+                    ii += 1;
+                }
+                'r' => {
+                    flat_args.push(args_r.and_then(|a| a.get(ri).copied()).unwrap_or(0));
+                    ri += 1;
+                }
+                'f' => {
+                    flat_args.push(args_f.and_then(|a| a.get(fi).copied()).unwrap_or(0));
+                    fi += 1;
+                }
+                _ => {}
+            }
+        }
+        // Dispatch by arg count.
+        unsafe {
+            match flat_args.len() {
+                0 => {
+                    let f: unsafe extern "C" fn() -> i64 = std::mem::transmute(func as usize);
+                    f()
+                }
+                1 => {
+                    let f: unsafe extern "C" fn(i64) -> i64 = std::mem::transmute(func as usize);
+                    f(flat_args[0])
+                }
+                2 => {
+                    let f: unsafe extern "C" fn(i64, i64) -> i64 =
+                        std::mem::transmute(func as usize);
+                    f(flat_args[0], flat_args[1])
+                }
+                3 => {
+                    let f: unsafe extern "C" fn(i64, i64, i64) -> i64 =
+                        std::mem::transmute(func as usize);
+                    f(flat_args[0], flat_args[1], flat_args[2])
+                }
+                4 => {
+                    let f: unsafe extern "C" fn(i64, i64, i64, i64) -> i64 =
+                        std::mem::transmute(func as usize);
+                    f(flat_args[0], flat_args[1], flat_args[2], flat_args[3])
+                }
+                n => {
+                    panic!("bh_call_i: unsupported arg count {n}");
+                }
+            }
+        }
+    }
+
+    /// llmodel.py:739-742 bh_raw_store_i(addr, offset, newvalue, descr)
+    /// llmodel.py:481-488 write_int_at_mem(addr, offset, size, newvalue)
+    fn bh_raw_store_i(&self, addr: i64, offset: i64, value: i64, size: usize) {
+        if addr == 0 {
+            return;
+        }
+        unsafe {
+            let ptr = (addr as *mut u8).offset(offset as isize);
+            // llmodel.py:482-488: cast by itemsize
+            match size {
+                1 => *(ptr as *mut u8) = value as u8,
+                2 => (ptr as *mut u16).write_unaligned(value as u16),
+                4 => (ptr as *mut u32).write_unaligned(value as u32),
+                _ => (ptr as *mut i64).write_unaligned(value),
+            }
+        }
+    }
+
+    /// llmodel.py:744 bh_raw_store_f(addr, offset, newvalue, descr)
+    /// llmodel.py:504 write_float_at_mem: raw_store float.
+    fn bh_raw_store_f(&self, addr: i64, offset: i64, value: f64) {
+        if addr == 0 {
+            return;
+        }
+        unsafe {
+            let ptr = (addr as *mut u8).offset(offset as isize);
+            (ptr as *mut f64).write_unaligned(value);
+        }
     }
 
     /// llsupport/gc.py:563 GcLLDescr_framework
