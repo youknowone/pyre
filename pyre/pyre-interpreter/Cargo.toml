@@ -24,3 +24,4 @@ num-traits = { workspace = true }
 num-integer = { workspace = true }
 pymath = { version = "0.2.0", features = ["malachite-bigint"] }
 sre-engine = { package = "rustpython-sre_engine", version = "0.5.0" }
+libc = "0.2"

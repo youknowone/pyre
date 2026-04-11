@@ -610,8 +610,13 @@ unsafe fn try_instance_binop(a: PyObjectRef, b: PyObjectRef, dunder: &str) -> Op
         let rdunder = reverse_dunder(dunder).unwrap();
         let w_type = w_instance_get_type(b);
         if let Some(method) = lookup_in_type_where(w_type, rdunder) {
+            crate::call::clear_call_error();
             let result = crate::call_function(method, &[b, a]);
-            if !is_not_implemented(result) {
+            if result.is_null() {
+                if let Some(err) = crate::call::take_call_error() {
+                    return Some(Err(err));
+                }
+            } else if !is_not_implemented(result) {
                 return Some(Ok(result));
             }
         }
@@ -621,15 +626,25 @@ unsafe fn try_instance_binop(a: PyObjectRef, b: PyObjectRef, dunder: &str) -> Op
     if a_is_inst {
         let w_type = w_instance_get_type(a);
         if let Some(method) = lookup_in_type_where(w_type, dunder) {
+            crate::call::clear_call_error();
             let result = crate::call_function(method, &[a, b]);
-            if !is_not_implemented(result) {
+            if result.is_null() {
+                if let Some(err) = crate::call::take_call_error() {
+                    return Some(Err(err));
+                }
+            } else if !is_not_implemented(result) {
                 return Some(Ok(result));
             }
         }
         // Also check per-instance attributes (ATTR_TABLE)
         if let Ok(method) = getattr(a, dunder) {
+            crate::call::clear_call_error();
             let result = crate::call_function(method, &[a, b]);
-            if !is_not_implemented(result) {
+            if result.is_null() {
+                if let Some(err) = crate::call::take_call_error() {
+                    return Some(Err(err));
+                }
+            } else if !is_not_implemented(result) {
                 return Some(Ok(result));
             }
         }
@@ -640,8 +655,13 @@ unsafe fn try_instance_binop(a: PyObjectRef, b: PyObjectRef, dunder: &str) -> Op
         if let Some(rdunder) = reverse_dunder(dunder) {
             let w_type = w_instance_get_type(b);
             if let Some(method) = lookup_in_type_where(w_type, rdunder) {
+                crate::call::clear_call_error();
                 let result = crate::call_function(method, &[b, a]);
-                if !is_not_implemented(result) {
+                if result.is_null() {
+                    if let Some(err) = crate::call::take_call_error() {
+                        return Some(Err(err));
+                    }
+                } else if !is_not_implemented(result) {
                     return Some(Ok(result));
                 }
             }

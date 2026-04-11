@@ -378,6 +378,8 @@ impl IterOpcodeHandler for PyFrame {
             if pyre_object::is_range_iter(iter)
                 || pyre_object::is_seq_iter(iter)
                 || pyre_object::generatorobject::is_generator(iter)
+                || pyre_object::itertoolsmodule::is_repeat(iter)
+                || pyre_object::itertoolsmodule::is_count(iter)
             {
                 return Ok(());
             }
@@ -501,6 +503,22 @@ impl IterOpcodeHandler for PyFrame {
                     Err(e) => return Err(e),
                 }
             }
+            // itertools iterators — delegate to baseobjspace::next
+            if pyre_object::itertoolsmodule::is_repeat(iter)
+                || pyre_object::itertoolsmodule::is_count(iter)
+            {
+                match crate::baseobjspace::next(iter) {
+                    Ok(result) => {
+                        USER_ITER_NEXT_CACHE.with(|c| c.set(result));
+                        return Ok(true);
+                    }
+                    Err(e) if e.kind == PyErrorKind::StopIteration => {
+                        USER_ITER_NEXT_CACHE.with(|c| c.set(PY_NULL));
+                        return Ok(false);
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
             // User-defined iterator with __next__
             if pyre_object::is_instance(iter) {
                 let w_type = pyre_object::w_instance_get_type(iter);
@@ -524,9 +542,12 @@ impl IterOpcodeHandler for PyFrame {
 
     /// PyPy: space.next(w_iterator) → returns cached value from concrete_iter_continues.
     fn iter_next_value(&mut self, iter: Self::Value) -> Result<Self::Value, PyError> {
-        // Generator/user-defined iterator: return cached value
+        // Generator/user-defined/itertools iterator: return cached value
         if unsafe {
-            pyre_object::generatorobject::is_generator(iter) || pyre_object::is_instance(iter)
+            pyre_object::generatorobject::is_generator(iter)
+                || pyre_object::is_instance(iter)
+                || pyre_object::itertoolsmodule::is_repeat(iter)
+                || pyre_object::itertoolsmodule::is_count(iter)
         } {
             let cached = USER_ITER_NEXT_CACHE.with(|c| c.get());
             if !cached.is_null() {
@@ -1663,9 +1684,23 @@ impl OpcodeStepExecutor for PyFrame {
             args.insert(0, self_or_null);
         }
 
+        // Unwrap bound methods: load_method pushes (method, PY_NULL) for
+        // bound methods. Extract the underlying function and prepend the
+        // receiver so resolve_kwargs sees the correct function signature.
+        let callable_unwrapped = crate::baseobjspace::unwrap_cell(callable);
+        let callable_unwrapped = if unsafe { pyre_object::is_method(callable_unwrapped) } {
+            let func = unsafe { pyre_object::w_method_get_func(callable_unwrapped) };
+            let receiver = unsafe { pyre_object::w_method_get_self(callable_unwrapped) };
+            if !receiver.is_null() && !unsafe { pyre_object::is_none(receiver) } {
+                args.insert(0, receiver);
+            }
+            func
+        } else {
+            callable_unwrapped
+        };
+
         // For type objects with kwargs: use call_with_kwargs which handles
         // __new__/__init__ kwargs forwarding correctly.
-        let callable_unwrapped = crate::baseobjspace::unwrap_cell(callable);
         if unsafe { pyre_object::is_type(callable_unwrapped) } {
             let nkw = if unsafe { pyre_object::is_tuple(kwarg_names) } {
                 unsafe { pyre_object::w_tuple_len(kwarg_names) }
@@ -1735,7 +1770,7 @@ impl OpcodeStepExecutor for PyFrame {
                 args.clone()
             }
         } else {
-            crate::call::resolve_kwargs(callable, &args, kwarg_names)
+            crate::call::resolve_kwargs(callable_unwrapped, &args, kwarg_names)
         };
         let result = call_callable(self, callable_unwrapped, &resolved)?;
         self.push(result);

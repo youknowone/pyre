@@ -222,26 +222,36 @@ fn math_unary_int(args: &[PyObjectRef], dunder: &str, fname: &str) -> PyResult {
             "{fname}() takes exactly 1 argument",
         )));
     }
-    if let Ok(method) = crate::baseobjspace::getattr(args[0], dunder) {
-        let result = crate::call_function(method, &[args[0]]);
-        if !result.is_null() {
-            return Ok(result);
+    // Prefer the dunder so subclasses of float with `__ceil__` use their
+    // override even when the parent float path would also succeed. If the
+    // descriptor itself raises (e.g. BadDescr.__get__ → ValueError),
+    // propagate that error rather than silently falling back to float.
+    match crate::baseobjspace::getattr(args[0], dunder) {
+        Ok(method) => {
+            crate::call::clear_call_error();
+            let result = crate::call_function(method, &[args[0]]);
+            if !result.is_null() {
+                return Ok(result);
+            }
+            if let Some(err) = crate::call::take_call_error() {
+                return Err(err);
+            }
         }
-    }
-    // Float fast path — numeric types only.
-    unsafe {
-        if is_int(args[0]) || is_float(args[0]) || is_bool(args[0]) || is_long(args[0]) {
-            let v = get_double(args[0]);
-            return Ok(w_int_new(match dunder {
-                "__ceil__" => v.ceil() as i64,
-                "__floor__" => v.floor() as i64,
-                _ => v.trunc() as i64,
-            }));
+        Err(err) if err.kind != crate::PyErrorKind::AttributeError => {
+            return Err(err);
         }
+        _ => {}
     }
-    Err(crate::PyError::type_error(format!(
-        "type has no {fname}() method",
-    )))
+    // Fall back to `__float__` coercion — mathmodule.c uses PyNumber_Float
+    // in math_1_impl for this role. `try_get_double` raises TypeError
+    // when the operand has no numeric interpretation.
+    let v = try_get_double(args[0])
+        .map_err(|_| crate::PyError::type_error(format!("type has no {fname}() method")))?;
+    Ok(w_int_new(match dunder {
+        "__ceil__" => v.ceil() as i64,
+        "__floor__" => v.floor() as i64,
+        _ => v.trunc() as i64,
+    }))
 }
 
 pub fn floor(args: &[PyObjectRef]) -> PyResult {
