@@ -2476,7 +2476,7 @@ impl OptContext {
                 .filter(|&p| p >= 0 && self.snapshot_boxes.contains_key(&p));
             if let Some(fb_pos) = fallback_pos {
                 op.rd_resume_position = fb_pos;
-                self.finalize_guard_resume_data(op, None);
+                self.finalize_guard_resume_data(op, knowledge);
                 return;
             }
             // resume.py:396-397: RPython asserts resume_position >= 0.
@@ -2557,17 +2557,22 @@ impl OptContext {
 
         // RPython Box.type parity: types captured at numbering time via
         // env.get_type(), equivalent to RPython's intrinsic Box.type.
-        // Replaces the fragile 7-level type resolution cascade.
+        // resume.py:1042 parity: RPython filters holes (None) from
+        // trace.inputargs before deserialization. Holes must NOT get
+        // Type::Ref — the class bitfield serializer skips holes
+        // (if let Some(opref)), so the deserializer must also skip them.
+        // Type::Int ensures the bitfield iteration doesn't read bits
+        // for hole positions.
         let new_types: Vec<majit_ir::Type> = liveboxes
             .iter()
             .map(|opref| {
                 if opref.is_none() {
-                    return majit_ir::Type::Ref;
+                    return majit_ir::Type::Int;
                 }
-                livebox_types
-                    .get(&opref.0)
-                    .copied()
-                    .unwrap_or(majit_ir::Type::Ref)
+                livebox_types.get(&opref.0).copied().unwrap_or_else(|| {
+                    use majit_ir::BoxEnv;
+                    env.get_type(*opref)
+                })
             })
             .collect();
 

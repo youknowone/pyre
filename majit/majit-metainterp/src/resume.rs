@@ -3682,13 +3682,11 @@ impl ResumeDataLoopMemo {
                     ) as i32);
                 }
 
-                // bridgeopt.py:113-122: loopinvariant results
+                // rewrite.py:828-833 serialize_optrewrite: only result in available_boxes
                 let filtered_loopinvariant: Vec<_> = knowledge
                     .loopinvariant_results
                     .iter()
-                    .filter(|&&(_, result)| {
-                        env.is_const(result) || available_boxes.contains(&result.0)
-                    })
+                    .filter(|&&(_, result)| available_boxes.contains(&result.0))
                     .collect();
                 numb_state.append_int(filtered_loopinvariant.len() as i32);
                 for &&(const_ptr, result) in &filtered_loopinvariant {

@@ -875,8 +875,9 @@ mod tests {
 ///
 /// `frontend_boxes`: runtime values from guard failure (RPython Box objects
 ///   with concrete references). Used by cls_of_box to read vtable.
-/// `cls_of_box`: model.py:199-201 cpu.cls_of_box(box) — reads typeptr from
-///   a runtime Ref object. Returns the class pointer as i64.
+/// bridgeopt.py:124-185 deserialize_optimizer_knowledge.
+/// `cls_of_box`: model.py:199-201 cpu.cls_of_box(box) — backend callback
+/// for reading the class pointer from a runtime Ref object.
 pub fn deserialize_optimizer_knowledge(
     rd_numb: &[u8],
     rd_consts: &[(i64, majit_ir::Type)],
@@ -884,7 +885,7 @@ pub fn deserialize_optimizer_knowledge(
     liveboxes: &[OpRef],
     livebox_types: &[majit_ir::Type],
     all_descrs: &HashMap<u32, majit_ir::descr::DescrRef>,
-    cls_of_box: Option<fn(i64) -> i64>,
+    cls_of_box: fn(i64) -> i64,
     optimizer: &mut super::optimizer::Optimizer,
     ctx: &mut OptContext,
 ) {
@@ -892,7 +893,8 @@ pub fn deserialize_optimizer_knowledge(
     use majit_ir::resumecode::Reader;
 
     let mut reader = Reader::new(rd_numb);
-    debug_assert!(frontend_boxes.len() == liveboxes.len() || frontend_boxes.is_empty());
+    // bridgeopt.py:126: assert len(frontend_boxes) == len(liveboxes)
+    assert_eq!(frontend_boxes.len(), liveboxes.len());
 
     // bridgeopt.py:130-131: skip resume section
     let startcount = reader.next_item();
@@ -914,15 +916,9 @@ pub fn deserialize_optimizer_knowledge(
         mask >>= 1;
         if class_known {
             // bridgeopt.py:145: cls = optimizer.cpu.cls_of_box(frontend_boxes[i])
+            let cls = cls_of_box(frontend_boxes[i]);
             // bridgeopt.py:146: optimizer.make_constant_class(box, cls)
-            if let Some(cls_fn) = cls_of_box {
-                if let Some(&raw_value) = frontend_boxes.get(i) {
-                    if raw_value != 0 {
-                        let cls = cls_fn(raw_value);
-                        super::optimizer::Optimizer::make_constant_class(ctx, livebox, cls, true);
-                    }
-                }
-            }
+            super::optimizer::Optimizer::make_constant_class(ctx, livebox, cls, true);
         }
     }
 
@@ -933,13 +929,13 @@ pub fn deserialize_optimizer_knowledge(
         let tagged = reader.next_item() as i16;
         let box1 = decode_box(tagged, rd_consts, liveboxes);
         let descr_index = reader.next_item() as u32;
+        // bridgeopt.py:155: descr = metainterp_sd.all_descrs[descr_index]
+        let descr = all_descrs[&descr_index].clone();
         let tagged2 = reader.next_item() as i16;
         let box2 = decode_box(tagged2, rd_consts, liveboxes);
-        if let Some(descr) = all_descrs.get(&descr_index) {
-            let opref1 = decoded_box_to_opref(&box1, ctx);
-            let opref2 = decoded_box_to_opref(&box2, ctx);
-            result_struct.push((opref1, descr.clone(), opref2));
-        }
+        let opref1 = decoded_box_to_opref(&box1, ctx);
+        let opref2 = decoded_box_to_opref(&box2, ctx);
+        result_struct.push((opref1, descr, opref2));
     }
     // bridgeopt.py:159-169: heap knowledge (array items)
     let length = reader.next_item();
@@ -949,13 +945,13 @@ pub fn deserialize_optimizer_knowledge(
         let box1 = decode_box(tagged, rd_consts, liveboxes);
         let index = reader.next_item() as i64;
         let descr_index = reader.next_item() as u32;
+        // bridgeopt.py:166: descr = metainterp_sd.all_descrs[descr_index]
+        let descr = all_descrs[&descr_index].clone();
         let tagged2 = reader.next_item() as i16;
         let box2 = decode_box(tagged2, rd_consts, liveboxes);
-        if let Some(descr) = all_descrs.get(&descr_index) {
-            let opref1 = decoded_box_to_opref(&box1, ctx);
-            let opref2 = decoded_box_to_opref(&box2, ctx);
-            result_array.push((opref1, index, descr.clone(), opref2));
-        }
+        let opref1 = decoded_box_to_opref(&box1, ctx);
+        let opref2 = decoded_box_to_opref(&box2, ctx);
+        result_array.push((opref1, index, descr, opref2));
     }
     // bridgeopt.py:170-171: optimizer.optheap.deserialize_optheap(...)
     if !result_struct.is_empty() || !result_array.is_empty() {
@@ -972,12 +968,10 @@ pub fn deserialize_optimizer_knowledge(
         // bridgeopt.py:180: i = const.getint()
         let const_int = match &const_box {
             DecodedBox::ConstInt(v) => *v,
-            DecodedBox::Const(v, _) => *v,
-            _ => {
-                // skip malformed entry, still consume tagged2
-                let _tagged2 = reader.next_item();
-                continue;
-            }
+            other => panic!(
+                "bridgeopt.py:179: assert isinstance(const, ConstInt), got {:?}",
+                other
+            ),
         };
         let tagged2 = reader.next_item() as i16;
         let box2 = decode_box(tagged2, rd_consts, liveboxes);

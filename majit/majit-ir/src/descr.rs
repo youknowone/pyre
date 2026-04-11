@@ -49,6 +49,24 @@ pub fn get_descr(index: u32) -> Option<DescrRef> {
         .and_then(|descr| descr.clone())
 }
 
+/// descr.py:25-47 parity: allocate the next sequential descr index.
+/// Each descriptor gets `len(all_descrs)` as its index, then is appended.
+fn next_descr_index() -> u32 {
+    let descrs = all_descrs().lock().unwrap();
+    descrs.len() as u32
+}
+
+/// llsupport/descr.py:25-47 cpu.setup_descrs():
+/// Returns all registered descriptors with valid indices.
+pub fn setup_descrs() -> Vec<DescrRef> {
+    let descrs = all_descrs().lock().unwrap();
+    assert!(
+        descrs.len() < (1 << 15),
+        "descr.py:47: len(all_descrs) < 2**15"
+    );
+    descrs.iter().filter_map(|opt| opt.clone()).collect()
+}
+
 /// history.py: TargetToken / JitCellToken identity. PyPy keys
 /// `target_tokens_currently_compiling` and `consider_jump`'s
 /// `jump_target_descr` by descriptor object identity (Python's default
@@ -2056,15 +2074,19 @@ mod tests {
 // ── Factory functions (descr.py: get_field_descr, get_size_descr, etc.) ──
 
 /// Create a field descriptor with the given layout.
+/// descr.py:25-47 parity: allocates a fresh sequential index from the
+/// global registry (like setup_descrs assigns `len(all_descrs)`), not
+/// a hardcoded 0.
 pub fn make_field_descr(
     offset: usize,
     field_size: usize,
     field_type: Type,
     signed: bool,
 ) -> DescrRef {
-    std::sync::Arc::new(
-        SimpleFieldDescr::new(0, offset, field_size, field_type, false).with_signed(signed),
-    )
+    let index = next_descr_index();
+    register_descr(std::sync::Arc::new(
+        SimpleFieldDescr::new(index, offset, field_size, field_type, false).with_signed(signed),
+    ))
 }
 
 /// Create a field descriptor with explicit index and immutability.
