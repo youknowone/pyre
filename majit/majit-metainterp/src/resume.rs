@@ -14,6 +14,23 @@ use majit_backend::{
 };
 use majit_ir::{GcRef, Type};
 
+/// resume.py:656-670: element kind from arraydescr.
+/// 0=ref (is_array_of_pointers), 1=int, 2=float (is_array_of_floats).
+fn array_kind_from_descr(arraydescr: Option<&majit_ir::DescrRef>) -> u8 {
+    arraydescr
+        .and_then(|d| d.as_array_descr())
+        .map(|ad| {
+            if ad.is_array_of_pointers() {
+                0u8
+            } else if ad.is_array_of_floats() {
+                2u8
+            } else {
+                1u8
+            }
+        })
+        .unwrap_or(0)
+}
+
 // ═══════════════════════════════════════════════════════════════
 // RPython resume.py:96-139 — structural port (i16 tags).
 // ═══════════════════════════════════════════════════════════════
@@ -757,14 +774,15 @@ impl ResumeVirtualLayoutSummary {
                 descr_size: *descr_size,
             },
             ResumeVirtualLayoutSummary::Array {
-                arraydescr: _,
+                arraydescr,
                 descr_index,
                 clear,
                 items,
             } => ExitVirtualLayout::Array {
                 descr_index: *descr_index,
                 clear: *clear,
-                kind: 0, // default ref
+                // resume.py:656-670: element type from arraydescr
+                kind: array_kind_from_descr(arraydescr.as_ref()),
                 items: items
                     .iter()
                     .map(|source| source.to_exit_source(virtual_offset))
@@ -1331,16 +1349,16 @@ impl PartialEq for VirtualInfo {
                 VirtualInfo::VArray {
                     arraydescr: _,
                     descr_index: a1,
-                    clear: _,
+                    clear: a_clear,
                     items: a2,
                 },
                 VirtualInfo::VArray {
                     arraydescr: _,
                     descr_index: b1,
-                    clear: _,
+                    clear: b_clear,
                     items: b2,
                 },
-            ) => a1 == b1 && a2 == b2,
+            ) => a1 == b1 && a_clear == b_clear && a2 == b2,
             _ => false,
         }
     }
@@ -4833,18 +4851,38 @@ impl VirtualInfo {
                 obj
             }
             VirtualInfo::VArray {
-                arraydescr: _,
+                arraydescr,
                 descr_index,
-                clear: _,
+                clear,
                 items,
             } => {
                 let length = items.len();
-                let array = allocator.allocate_array(length, *descr_index, true);
+                // resume.py:653: array = decoder.allocate_array(length, arraydescr, self.clear)
+                let array = allocator.allocate_array(length, *descr_index, *clear);
                 decoder.virtuals_cache.set_ptr(index, array);
+                // resume.py:656-670: dispatch by arraydescr element type
+                let is_pointers = arraydescr
+                    .as_ref()
+                    .and_then(|d| d.as_array_descr())
+                    .map_or(false, |ad| ad.is_array_of_pointers());
+                let is_floats = arraydescr
+                    .as_ref()
+                    .and_then(|d| d.as_array_descr())
+                    .map_or(false, |ad| ad.is_array_of_floats());
                 for (i, source) in items.iter().enumerate() {
-                    let value = decoder.decode_field_source(source);
-                    // resume.py:656-676 — dispatch by arraydescr type
-                    allocator.setarrayitem_typed(array, i, value, *descr_index);
+                    if is_pointers {
+                        // resume.py:659: decoder.setarrayitem_ref(array, i, num, arraydescr)
+                        let value = decoder.decode_field_source(source);
+                        allocator.setarrayitem_ref(array, i, value, *descr_index);
+                    } else if is_floats {
+                        // resume.py:664: decoder.setarrayitem_float(array, i, num, arraydescr)
+                        let value = decoder.decode_field_source_float(source);
+                        allocator.setarrayitem_float(array, i, value, *descr_index);
+                    } else {
+                        // resume.py:669: decoder.setarrayitem_int(array, i, num, arraydescr)
+                        let value = decoder.decode_field_source_int(source);
+                        allocator.setarrayitem_int(array, i, value, *descr_index);
+                    }
                 }
                 array
             }
