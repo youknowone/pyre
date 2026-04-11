@@ -8,13 +8,13 @@ pub mod value;
 pub use descr::{
     AccumVectorInfo, ArrayDescr, CallDescr, DebugMergePointDescr, DebugMergePointInfo, Descr,
     DescrRef, EffectInfo, ExtraEffect, FailDescr, FieldDescr, InteriorFieldDescr, LoopTargetDescr,
-    OopSpecIndex, RawBufferDescr, SimpleCallDescr, SimpleFailDescr, SimpleFieldDescr, SizeDescr,
-    TargetArgLoc, descr_identity, make_array_descr, make_field_descr, make_loop_target_descr,
+    OopSpecIndex, SimpleCallDescr, SimpleFailDescr, SimpleFieldDescr, SizeDescr, TargetArgLoc,
+    descr_identity, make_array_descr, make_field_descr, make_loop_target_descr,
     make_size_descr_full, make_size_descr_with_vtable, unpack_fielddescr,
 };
 pub use resoperation::{
-    BoxEnv, FieldDescrInfo, GuardPendingFieldEntry, OPCODE_COUNT, Op, OpCode, OpRef, RdVirtualInfo,
-    VectorizationInfo, VirtualFieldsInfo, format_trace,
+    ArrayDescrInfo, BoxEnv, FieldDescrInfo, GuardPendingFieldEntry, OPCODE_COUNT, Op, OpCode,
+    OpRef, RdVirtualInfo, VectorizationInfo, VirtualFieldsInfo, format_trace,
 };
 pub use value::{
     Const, FAILARGS_LIMIT, GcRef, GreenKey, InputArg, JitDriverVar, Type, Value, VarKind,

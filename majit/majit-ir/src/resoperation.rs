@@ -58,6 +58,26 @@ pub struct FieldDescrInfo {
     pub field_size: usize,
 }
 
+/// Serializable snapshot of an ArrayDescr.
+///
+/// RPython's resume.py:692 VRawBufferInfo carries live ArrayDescr objects,
+/// but we cannot put `Arc<dyn Descr>` in the IR serialization boundary.
+/// This captures the fields needed by `_descrs_are_compatible()` (rawbuffer.py:83)
+/// and `setrawbuffer_item()` dispatch (resume.py:1543).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArrayDescrInfo {
+    /// Descriptor registry index.
+    pub index: u32,
+    /// descr.py:273 ArrayDescr.basesize.
+    pub base_size: usize,
+    /// descr.py:274 ArrayDescr.itemsize.
+    pub item_size: usize,
+    /// Item type: 0=ref, 1=int, 2=float.
+    pub item_type: u8,
+    /// descr.py:241-254 FLAG_SIGNED.
+    pub is_signed: bool,
+}
+
 /// AbstractVirtualInfo hierarchy (VirtualInfo, VStructInfo, VArrayInfo, etc.).
 #[derive(Clone, Debug)]
 pub enum RdVirtualInfo {
@@ -107,6 +127,8 @@ pub enum RdVirtualInfo {
         /// resume.py:757: fielddescrs[j].is_pointer_field/is_float_field dispatch.
         /// Per-field type within each element: 0=ref, 1=int, 2=float.
         field_types: Vec<u8>,
+        /// descr.py:273 ArrayDescr.basesize — fixed header before array items.
+        base_size: usize,
         /// llmodel.py:648: arraydescr.itemsize — bytes per struct element.
         item_size: usize,
         /// llmodel.py:649: fielddescr.offset — per-field byte offset within struct.
@@ -115,22 +137,16 @@ pub enum RdVirtualInfo {
         field_sizes: Vec<usize>,
         fieldnums: Vec<i16>,
     },
-    /// resume.py:692: VRawBufferInfo(func, size, offsets, descrs).
-    /// descrs are serialized as parallel arrays: entry_sizes (itemsize),
-    /// entry_types (kind: 0=ref, 1=int, 2=float), entry_signed.
+    /// resume.py:692: VRawBufferInfo(func, size, offsets, descrs)
     VRawBufferInfo {
-        /// resume.py:694: self.func — raw malloc function pointer.
+        /// resume.py:695: self.func — raw malloc function pointer.
         func: i64,
-        /// resume.py:695: self.size.
         size: usize,
-        /// resume.py:696: self.offsets.
+        /// resume.py:696: self.offsets — byte offsets of stored values.
         offsets: Vec<usize>,
-        /// descr.itemsize per entry.
-        entry_sizes: Vec<usize>,
-        /// 0=ref (is_array_of_pointers), 1=int, 2=float (is_array_of_floats).
-        entry_types: Vec<u8>,
-        /// descr.is_item_signed() per entry.
-        entry_signed: Vec<bool>,
+        /// resume.py:697: self.descrs — per-entry ArrayDescr snapshots.
+        /// RPython carries live ArrayDescr objects; we carry serializable snapshots.
+        descrs: Vec<ArrayDescrInfo>,
         fieldnums: Vec<i16>,
     },
     /// resume.py:717: VRawSliceInfo
@@ -213,6 +229,7 @@ impl PartialEq for RdVirtualInfo {
                     size: a2,
                     fielddescr_indices: a3,
                     field_types: a4,
+                    base_size: a4b,
                     item_size: a5,
                     field_offsets: a6,
                     field_sizes: a7,
@@ -223,6 +240,7 @@ impl PartialEq for RdVirtualInfo {
                     size: b2,
                     fielddescr_indices: b3,
                     field_types: b4,
+                    base_size: b4b,
                     item_size: b5,
                     field_offsets: b6,
                     field_sizes: b7,
@@ -233,6 +251,7 @@ impl PartialEq for RdVirtualInfo {
                     && a2 == b2
                     && a3 == b3
                     && a4 == b4
+                    && a4b == b4b
                     && a5 == b5
                     && a6 == b6
                     && a7 == b7
@@ -243,23 +262,17 @@ impl PartialEq for RdVirtualInfo {
                     func: a0,
                     size: a1,
                     offsets: a2,
-                    entry_sizes: a3,
-                    entry_types: a3t,
-                    entry_signed: a3s,
+                    descrs: a3,
                     fieldnums: a4,
                 },
                 Self::VRawBufferInfo {
                     func: b0,
                     size: b1,
                     offsets: b2,
-                    entry_sizes: b3,
-                    entry_types: b3t,
-                    entry_signed: b3s,
+                    descrs: b3,
                     fieldnums: b4,
                 },
-            ) => {
-                a0 == b0 && a1 == b1 && a2 == b2 && a3 == b3 && a3t == b3t && a3s == b3s && a4 == b4
-            }
+            ) => a0 == b0 && a1 == b1 && a2 == b2 && a3 == b3 && a4 == b4,
             (
                 Self::VRawSliceInfo {
                     offset: a1,

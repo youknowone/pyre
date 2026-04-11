@@ -173,13 +173,10 @@ pub enum VirtualStateInfo {
         /// info.py:389: self.func — the malloc function pointer.
         func: i64,
         size: usize,
-        /// rawbuffer.py:17-20: (offset, length, state, descr).
-        entries: Vec<(
-            usize,
-            usize,
-            Rc<VirtualStateInfo>,
-            super::info::RawBufferDescr,
-        )>,
+        /// rawbuffer.py:14-16: offsets, lengths, per-entry child state.
+        entries: Vec<(usize, usize, Rc<VirtualStateInfo>)>,
+        /// rawbuffer.py:16: self.descrs — per-entry ArrayDescr.
+        descrs: Vec<DescrRef>,
     },
     /// Value has a known class (non-null).
     KnownClass { class_ptr: GcRef },
@@ -326,25 +323,38 @@ impl VirtualStateInfo {
             }
 
             // Virtual raw buffer
+            // resume.py:335,694: visit_vrawbuffer(func, size, offsets, descrs)
+            // — func and descrs are part of raw-buffer identity.
             (
                 VirtualStateInfo::VirtualRawBuffer {
+                    func: f1,
                     size: s1,
                     entries: e1,
-                    ..
+                    descrs: d1,
                 },
                 VirtualStateInfo::VirtualRawBuffer {
+                    func: f2,
                     size: s2,
                     entries: e2,
-                    ..
+                    descrs: d2,
                 },
             ) => {
-                if s1 != s2 || e1.len() != e2.len() {
+                if f1 != f2 || s1 != s2 || e1.len() != e2.len() {
+                    return false;
+                }
+                // descrs compatibility: same index (same arraydescr identity)
+                if d1.len() != d2.len()
+                    || !d1
+                        .iter()
+                        .zip(d2.iter())
+                        .all(|(a, b)| a.index() == b.index())
+                {
                     return false;
                 }
                 e1.iter()
                     .zip(e2.iter())
-                    .all(|((off1, len1, v1, d1), (off2, len2, v2, d2))| {
-                        off1 == off2 && len1 == len2 && d1.is_compatible(d2) && v1.is_compatible(v2)
+                    .all(|((off1, len1, v1), (off2, len2, v2))| {
+                        off1 == off2 && len1 == len2 && v1.is_compatible(v2)
                     })
             }
 
@@ -519,7 +529,7 @@ impl VirtualState {
                 .sum(),
             VirtualStateInfo::VirtualRawBuffer { entries, .. } => entries
                 .iter()
-                .map(|(_, _, child, _)| Self::count_forced_boxes_for_entry_rc(child, visited))
+                .map(|(_, _, child)| Self::count_forced_boxes_for_entry_rc(child, visited))
                 .sum(),
             VirtualStateInfo::KnownClass { .. }
             | VirtualStateInfo::NonNull
@@ -892,13 +902,11 @@ impl VirtualState {
                 if !is_virtual {
                     return Err(());
                 }
-                for (index, (_, _, entry_state, _)) in entries.iter().enumerate() {
+                for (index, (_, _, entry_state)) in entries.iter().enumerate() {
                     let entry_ref = ctx
                         .get_ptr_info(resolved)
                         .and_then(|info| match info {
-                            PtrInfo::VirtualRawBuffer(vinfo) => {
-                                vinfo.entries.get(index).map(|(_, _, value, _)| *value)
-                            }
+                            PtrInfo::VirtualRawBuffer(vinfo) => vinfo.values.get(index).copied(),
                             _ => None,
                         })
                         .unwrap_or(OpRef::NONE);
@@ -1820,17 +1828,20 @@ fn export_single_value_inner(
             PtrInfo::VirtualRawBuffer(vinfo) => {
                 // info.py:445: visitor.visit_vrawbuffer(self.func, self.size, ...)
                 let entries = vinfo
-                    .entries
+                    .offsets
                     .iter()
-                    .map(|(offset, length, value_ref, descr)| {
-                        let val_state = export_single_value(*value_ref, ctx, cache);
-                        (*offset, *length, val_state, *descr)
+                    .zip(vinfo.lengths.iter())
+                    .zip(vinfo.values.iter())
+                    .map(|((&offset, &length), &value_ref)| {
+                        let val_state = export_single_value(value_ref, ctx, cache);
+                        (offset, length, val_state)
                     })
                     .collect();
                 return VirtualStateInfo::VirtualRawBuffer {
                     func: vinfo.func,
                     size: vinfo.size,
                     entries,
+                    descrs: vinfo.descrs.clone(),
                 };
             }
             PtrInfo::VirtualRawSlice(_) => {
@@ -1935,7 +1946,7 @@ fn append_sequential_slots(
             }
         }
         VirtualStateInfo::VirtualRawBuffer { entries, .. } => {
-            for (_, _, child, _) in entries {
+            for (_, _, child) in entries {
                 append_sequential_slots_rc(child, schedule, next_slot, visited);
             }
         }

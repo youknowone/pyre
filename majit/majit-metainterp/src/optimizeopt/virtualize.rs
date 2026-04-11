@@ -598,14 +598,13 @@ impl OptVirtualize {
             ctx.replace_op(opref, alloc_ref);
         }
 
-        // info.py:414-420 _force_elements: emit RAW_STORE with descr
-        for (offset, _length, value_ref, descr) in &vinfo.entries {
-            let value_ref = self.force_virtual(*value_ref, ctx);
+        // info.py:420: _force_elements — emit RAW_STORE with stored descr.
+        for i in 0..vinfo.offsets.len() {
+            let value_ref = self.force_virtual(vinfo.values[i], ctx);
             let value_ref = ctx.get_box_replacement(value_ref);
-            let offset_ref = self.emit_constant_int(ctx, *offset as i64);
+            let offset_ref = self.emit_constant_int(ctx, vinfo.offsets[i] as i64);
             let mut set_op = Op::new(OpCode::RawStore, &[alloc_ref, offset_ref, value_ref]);
-            // info.py:420: ResOperation(rop.RAW_STORE, ..., descr=descr)
-            set_op.descr = Some(descr.to_descr_ref());
+            set_op.descr = Some(vinfo.descrs[i].clone());
             ctx.emit_extra(ctx.current_pass_idx, set_op);
         }
 
@@ -1207,15 +1206,21 @@ impl OptVirtualize {
             };
             if let Some(PtrInfo::VirtualRawBuffer(vinfo)) = ctx.get_ptr_info(parent) {
                 let lookup_offset = base_offset + offset as usize;
-                // virtualize.py:366 _unpack_raw_load_store_op → descr, itemsize
-                let op_descr = crate::optimizeopt::info::RawBufferDescr::from_op_descr(&op.descr);
-                // rawbuffer.py:120 read_value(offset, itemsize, descr)
-                match vinfo.read_value(lookup_offset, op_descr.itemsize, &op_descr) {
-                    Ok(val_ref) => {
-                        ctx.replace_op(op.pos, val_ref);
-                        return OptimizationResult::Remove;
-                    }
-                    Err(_) => {} // InvalidRawOperation → emit
+                // rawbuffer.py:120: read_value(offset, length, descr)
+                let (item_len, descr) = op
+                    .descr
+                    .as_ref()
+                    .and_then(|d| d.as_array_descr())
+                    .map(|ad| (ad.item_size(), op.descr.clone().unwrap()))
+                    .unwrap_or_else(|| {
+                        (
+                            8,
+                            majit_ir::descr::make_array_descr(0, 8, majit_ir::Type::Int),
+                        )
+                    });
+                if let Ok(val_ref) = vinfo.read_value(lookup_offset, item_len, &descr) {
+                    ctx.replace_op(op.pos, val_ref);
+                    return OptimizationResult::Remove;
                 }
             }
         }
@@ -1242,11 +1247,29 @@ impl OptVirtualize {
             };
             if let Some(PtrInfo::VirtualRawBuffer(vinfo)) = ctx.get_ptr_info_mut(parent) {
                 let store_offset = base_offset + offset as usize;
-                // virtualize.py:381 _unpack_raw_load_store_op → descr, itemsize
-                let op_descr = crate::optimizeopt::info::RawBufferDescr::from_op_descr(&op.descr);
-                // rawbuffer.py:89 write_value(offset, itemsize, descr, value)
-                let _ = vinfo.write_value(store_offset, op_descr.itemsize, value_ref, op_descr);
-                return OptimizationResult::Remove;
+                // rawbuffer.py:89: write_value(offset, length, descr, value).
+                // Pass op.descr directly — RPython passes the actual arraydescr.
+                let (item_len, descr) = op
+                    .descr
+                    .as_ref()
+                    .and_then(|d| d.as_array_descr())
+                    .map(|ad| (ad.item_size(), op.descr.clone().unwrap()))
+                    .unwrap_or_else(|| {
+                        (
+                            8,
+                            majit_ir::descr::make_array_descr(0, 8, majit_ir::Type::Int),
+                        )
+                    });
+                // virtualize.py:374-381: try setitem_raw → return (remove);
+                // except InvalidRawOperation → pass → emit(op)
+                if vinfo
+                    .write_value(store_offset, item_len, descr, value_ref)
+                    .is_ok()
+                {
+                    return OptimizationResult::Remove;
+                }
+                // write_value failed (overlap, incompatible descr) → emit original op
+                return OptimizationResult::PassOn;
             }
         }
         OptimizationResult::PassOn
@@ -1765,7 +1788,10 @@ impl Optimization for OptVirtualize {
                                         crate::optimizeopt::info::VirtualRawBufferInfo {
                                             func,
                                             size: size as usize,
-                                            entries: Vec::new(),
+                                            offsets: Vec::new(),
+                                            lengths: Vec::new(),
+                                            descrs: Vec::new(),
+                                            values: Vec::new(),
                                             last_guard_pos: -1,
                                         },
                                     );
@@ -3225,7 +3251,10 @@ mod tests {
                 PtrInfo::VirtualRawBuffer(VirtualRawBufferInfo {
                     func: 0,
                     size,
-                    entries: Vec::new(),
+                    offsets: Vec::new(),
+                    lengths: Vec::new(),
+                    descrs: Vec::new(),
+                    values: Vec::new(),
                     last_guard_pos: -1,
                 }),
             );

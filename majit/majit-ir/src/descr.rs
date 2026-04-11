@@ -5,8 +5,6 @@
 ///
 /// Descriptors carry type metadata needed by the optimizer and backend
 /// for field access, array access, function calls, and guard failures.
-///
-/// RawBufferDescr: rawbuffer.py per-entry ArrayDescr summary.
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
@@ -49,24 +47,6 @@ pub fn get_descr(index: u32) -> Option<DescrRef> {
         .unwrap()
         .get(index as usize)
         .and_then(|descr| descr.clone())
-}
-
-/// descr.py:25-47 parity: allocate the next sequential descr index.
-/// Each descriptor gets `len(all_descrs)` as its index, then is appended.
-fn next_descr_index() -> u32 {
-    let descrs = all_descrs().lock().unwrap();
-    descrs.len() as u32
-}
-
-/// llsupport/descr.py:25-47 cpu.setup_descrs():
-/// Returns all registered descriptors with valid indices.
-pub fn setup_descrs() -> Vec<DescrRef> {
-    let descrs = all_descrs().lock().unwrap();
-    assert!(
-        descrs.len() < (1 << 15),
-        "descr.py:47: len(all_descrs) < 2**15"
-    );
-    descrs.iter().filter_map(|opt| opt.clone()).collect()
 }
 
 /// history.py: TargetToken / JitCellToken identity. PyPy keys
@@ -2076,19 +2056,15 @@ mod tests {
 // ── Factory functions (descr.py: get_field_descr, get_size_descr, etc.) ──
 
 /// Create a field descriptor with the given layout.
-/// descr.py:25-47 parity: allocates a fresh sequential index from the
-/// global registry (like setup_descrs assigns `len(all_descrs)`), not
-/// a hardcoded 0.
 pub fn make_field_descr(
     offset: usize,
     field_size: usize,
     field_type: Type,
     signed: bool,
 ) -> DescrRef {
-    let index = next_descr_index();
-    register_descr(std::sync::Arc::new(
-        SimpleFieldDescr::new(index, offset, field_size, field_type, false).with_signed(signed),
-    ))
+    std::sync::Arc::new(
+        SimpleFieldDescr::new(0, offset, field_size, field_type, false).with_signed(signed),
+    )
 }
 
 /// Create a field descriptor with explicit index and immutability.
@@ -2239,70 +2215,4 @@ pub fn unpack_interiorfielddescr(descr: &DescrRef) -> Option<(usize, usize, usiz
         fd.field_size(),
         fd.field_type(),
     ))
-}
-
-/// rawbuffer.py:83-87 `_descrs_are_compatible`: two arraydescrs are
-/// compatible iff `cpu.unpack_arraydescr_size` yields the same
-/// `(basesize, itemsize, sign)`. For raw (length-less) arrays basesize
-/// is always 0, so we store `(itemsize, is_signed, kind)`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RawBufferDescr {
-    /// descr.py ArrayDescr.itemsize — element width in bytes (1, 2, 4, 8).
-    pub itemsize: usize,
-    /// descr.py ArrayDescr.is_item_signed() — FLAG_SIGNED vs FLAG_UNSIGNED.
-    pub is_signed: bool,
-    /// 0=ref (is_array_of_pointers), 1=int, 2=float (is_array_of_floats).
-    pub kind: u8,
-}
-
-impl RawBufferDescr {
-    /// rawbuffer.py:85 `unpack(d1) == unpack(d2)` — RPython compat check.
-    pub fn is_compatible(&self, other: &Self) -> bool {
-        self.itemsize == other.itemsize && self.is_signed == other.is_signed
-    }
-
-    /// virtualize.py:351 `_unpack_raw_load_store_op`:
-    /// Extract RawBufferDescr from an Op's ArrayDescr.
-    pub fn from_op_descr(descr: &Option<DescrRef>) -> Self {
-        descr
-            .as_ref()
-            .and_then(|d| d.as_array_descr())
-            .map(|ad| {
-                let kind = if ad.is_array_of_pointers() {
-                    0
-                } else if ad.is_array_of_floats() {
-                    2
-                } else {
-                    1
-                };
-                RawBufferDescr {
-                    itemsize: ad.item_size(),
-                    is_signed: ad.is_item_signed(),
-                    kind,
-                }
-            })
-            .unwrap_or_default()
-    }
-
-    /// Reconstruct a DescrRef (ArrayDescr) from this summary.
-    /// Used when emitting RAW_STORE ops during _force_elements
-    /// (info.py:420: ResOperation(rop.RAW_STORE, ..., descr=descr)).
-    pub fn to_descr_ref(&self) -> DescrRef {
-        let item_type = match self.kind {
-            0 => crate::Type::Ref,
-            2 => crate::Type::Float,
-            _ => crate::Type::Int,
-        };
-        make_array_descr(0, self.itemsize, item_type)
-    }
-}
-
-impl Default for RawBufferDescr {
-    fn default() -> Self {
-        Self {
-            itemsize: 8,
-            is_signed: true,
-            kind: 1, // int
-        }
-    }
 }

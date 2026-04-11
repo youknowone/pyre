@@ -102,8 +102,6 @@ impl CodeWriter {
 
         // call.py:174-187 get_jitcode_calldescr:
         // Compute calldescr from the function's argument and result types.
-        // RPython: NON_VOID_ARGS = [ARG for ARG in FUNC.ARGS if ARG is not Void]
-        //          calldescr = cpu.calldescrof(FUNC, NON_VOID_ARGS, FUNC.RESULT, ...)
         {
             let start_block = rewritten.graph.block(rewritten.graph.startblock);
             let mut arg_classes = String::new();
@@ -115,28 +113,9 @@ impl CodeWriter {
                     None => arg_classes.push('i'),
                 }
             }
-            // call.py:186: FUNC.RESULT → result_type 'i'/'r'/'f'/'v'.
-            // Scan return terminators for the result kind.
-            let result_type = rewritten
-                .graph
-                .blocks
-                .iter()
-                .find_map(|block| {
-                    if let crate::model::Terminator::Return(Some(val)) = &block.terminator {
-                        match ssarepr.value_kinds.get(val) {
-                            Some(crate::passes::flatten::RegKind::Ref) => Some('r'),
-                            Some(crate::passes::flatten::RegKind::Float) => Some('f'),
-                            Some(crate::passes::flatten::RegKind::Int) => Some('i'),
-                            None => Some('i'),
-                        }
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or('v');
             jitcode.calldescr = crate::jitcode::BhCallDescr {
                 arg_classes,
-                result_type,
+                result_type: 'v', // default; overridden by portal setup
             };
         }
 

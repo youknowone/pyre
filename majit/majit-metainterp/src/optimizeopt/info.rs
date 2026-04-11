@@ -822,7 +822,7 @@ impl PtrInfo {
             PtrInfo::VirtualArray(v) => v.items.len(),
             PtrInfo::VirtualStruct(v) => v.fields.len(),
             PtrInfo::VirtualArrayStruct(v) => v.element_fields.len(),
-            PtrInfo::VirtualRawBuffer(v) => v.entries.len(),
+            PtrInfo::VirtualRawBuffer(v) => v.offsets.len(),
             _ => 0,
         }
     }
@@ -842,7 +842,7 @@ impl PtrInfo {
                 .iter()
                 .flat_map(|fields| fields.iter().map(|(_, r)| *r))
                 .collect(),
-            PtrInfo::VirtualRawBuffer(v) => v.entries.iter().map(|(_, _, r, _)| *r).collect(),
+            PtrInfo::VirtualRawBuffer(v) => v.values.clone(),
             PtrInfo::Virtualizable(v) => {
                 let mut refs: Vec<OpRef> = v.fields.iter().map(|(_, r)| *r).collect();
                 for (_, items) in &v.arrays {
@@ -896,7 +896,7 @@ impl PtrInfo {
                 }
             }
             PtrInfo::VirtualRawBuffer(v) => {
-                for (_, _, field, _) in &mut v.entries {
+                for field in &mut v.values {
                     if !field.is_none() {
                         *field = recurse(*field);
                     }
@@ -1818,29 +1818,24 @@ pub struct VirtualRawSliceInfo {
     pub last_guard_pos: i32,
 }
 
-/// Re-export from majit_ir::descr where RawBufferDescr now lives
-/// (RPython: descr.py ArrayDescr fields serialized for rawbuffer.py).
-pub use majit_ir::RawBufferDescr;
-
 /// A virtual raw memory buffer.
 ///
-/// Mirrors RPython's RawBuffer (rawbuffer.py) / VRawBufferInfo for
-/// virtualized raw_malloc allocations.
-/// Tracks writes to byte offsets within the buffer. Entries are kept sorted
-/// by offset and must never overlap (matching RPython's RawBuffer invariant).
+/// rawbuffer.py:13 RawBuffer — 4 parallel lists: offsets, lengths, descrs, values.
+/// Sorted by offset. Invariant: offsets[i]+lengths[i] <= offsets[i+1].
 #[derive(Clone, Debug)]
 pub struct VirtualRawBufferInfo {
     /// resume.py:695: self.func — raw malloc function pointer.
-    /// Used by allocate_raw_buffer to emit CALL_I(func, size).
     pub func: i64,
     /// Size of the buffer in bytes.
     pub size: usize,
-    /// rawbuffer.py:17-20: parallel arrays offsets/lengths/descrs/values.
-    /// Each entry: (offset, length, value_opref, descr).
-    ///
-    /// Sorted by offset. Invariant: `entries[i].0 + entries[i].1 <= entries[i+1].0`
-    /// (no overlapping writes).
-    pub entries: Vec<(usize, usize, OpRef, RawBufferDescr)>,
+    /// rawbuffer.py:14: self.offsets
+    pub offsets: Vec<usize>,
+    /// rawbuffer.py:15: self.lengths
+    pub lengths: Vec<usize>,
+    /// rawbuffer.py:16: self.descrs — per-entry ArrayDescr.
+    pub descrs: Vec<DescrRef>,
+    /// rawbuffer.py:17: self.values
+    pub values: Vec<OpRef>,
     /// info.py:91-92
     pub last_guard_pos: i32,
 }
@@ -1866,22 +1861,35 @@ pub enum RawBufferError {
 }
 
 impl VirtualRawBufferInfo {
-    /// rawbuffer.py:89-118 write_value(offset, length, descr, value).
-    ///
-    /// If a write already exists at the same offset with a compatible descr,
-    /// updates the value. Returns `Err` on overlapping writes or
-    /// incompatible descr at the same offset.
+    /// rawbuffer.py:83: _descrs_are_compatible(d1, d2)
+    /// Two arraydescrs are compatible if they have the same basesize,
+    /// itemsize and sign.
+    fn descrs_are_compatible(d1: &DescrRef, d2: &DescrRef) -> bool {
+        let (Some(a1), Some(a2)) = (d1.as_array_descr(), d2.as_array_descr()) else {
+            return false;
+        };
+        a1.base_size() == a2.base_size()
+            && a1.item_size() == a2.item_size()
+            && a1.is_item_signed() == a2.is_item_signed()
+    }
+
+    /// rawbuffer.py:89: write_value(offset, length, descr, value).
+    /// Maintains sorted order by offset. Same-offset update only
+    /// replaces value (rawbuffer.py:102), never descr.
     pub fn write_value(
         &mut self,
         offset: usize,
         length: usize,
+        descr: DescrRef,
         value: OpRef,
-        descr: RawBufferDescr,
     ) -> Result<(), RawBufferError> {
         let mut insert_pos = 0;
-        for (i, &(wo, wl, _, ref wd)) in self.entries.iter().enumerate() {
+        for i in 0..self.offsets.len() {
+            let wo = self.offsets[i];
+            let wl = self.lengths[i];
             if wo == offset {
-                if wl != length || !wd.is_compatible(&descr) {
+                // rawbuffer.py:94-95: length and descr must be compatible.
+                if wl != length || !Self::descrs_are_compatible(&descr, &self.descrs[i]) {
                     return Err(RawBufferError::OverlappingWrite {
                         new_offset: offset,
                         new_length: length,
@@ -1889,30 +1897,30 @@ impl VirtualRawBufferInfo {
                         existing_length: wl,
                     });
                 }
-                // Same offset, compatible descr: update in place.
-                self.entries[i].2 = value;
-                self.entries[i].3 = descr;
+                // rawbuffer.py:102: only replace value, keep existing descr.
+                self.values[i] = value;
                 return Ok(());
             } else if wo > offset {
                 break;
             }
             insert_pos = i + 1;
         }
-        // Check overlap with next entry.
-        if insert_pos < self.entries.len() {
-            let (next_off, _, _, _) = self.entries[insert_pos];
+        // rawbuffer.py:108: check overlap with next entry.
+        if insert_pos < self.offsets.len() {
+            let next_off = self.offsets[insert_pos];
             if offset + length > next_off {
                 return Err(RawBufferError::OverlappingWrite {
                     new_offset: offset,
                     new_length: length,
                     existing_offset: next_off,
-                    existing_length: self.entries[insert_pos].1,
+                    existing_length: self.lengths[insert_pos],
                 });
             }
         }
-        // Check overlap with previous entry.
+        // rawbuffer.py:111: check overlap with previous entry.
         if insert_pos > 0 {
-            let (prev_off, prev_len, _, _) = self.entries[insert_pos - 1];
+            let prev_off = self.offsets[insert_pos - 1];
+            let prev_len = self.lengths[insert_pos - 1];
             if prev_off + prev_len > offset {
                 return Err(RawBufferError::OverlappingWrite {
                     new_offset: offset,
@@ -1922,58 +1930,55 @@ impl VirtualRawBufferInfo {
                 });
             }
         }
-        self.entries
-            .insert(insert_pos, (offset, length, value, descr));
+        // rawbuffer.py:115-118: insert new entry.
+        self.offsets.insert(insert_pos, offset);
+        self.lengths.insert(insert_pos, length);
+        self.descrs.insert(insert_pos, descr);
+        self.values.insert(insert_pos, value);
         Ok(())
     }
 
-    /// rawbuffer.py:120-134 read_value(offset, length, descr).
-    ///
-    /// Returns `Err(UninitializedRead)` if no write exists at that offset,
-    /// or `Err(IncompatibleRead)` if the length or descr doesn't match.
+    /// rawbuffer.py:120: read_value(offset, length, descr).
     pub fn read_value(
         &self,
         offset: usize,
         length: usize,
-        descr: &RawBufferDescr,
+        descr: &DescrRef,
     ) -> Result<OpRef, RawBufferError> {
-        for &(wo, wl, val, ref wd) in &self.entries {
-            if wo == offset {
-                if wl != length || !wd.is_compatible(descr) {
+        for i in 0..self.offsets.len() {
+            if self.offsets[i] == offset {
+                if self.lengths[i] != length || !Self::descrs_are_compatible(descr, &self.descrs[i])
+                {
                     return Err(RawBufferError::IncompatibleRead {
                         offset,
                         read_length: length,
-                        write_length: wl,
+                        write_length: self.lengths[i],
                     });
                 }
-                return Ok(val);
+                return Ok(self.values[i]);
             }
         }
         Err(RawBufferError::UninitializedRead { offset, length })
     }
 
     /// Check if a read at `(offset, size)` is fully covered by previous writes.
-    ///
-    /// Every byte in `[offset, offset+size)` must fall within at least one
-    /// existing write region.
     pub fn is_read_fully_covered(&self, offset: usize, size: usize) -> bool {
         (0..size).all(|i| {
             let byte = offset + i;
-            self.entries
+            self.offsets
                 .iter()
-                .any(|&(wo, wl, _, _)| byte >= wo && byte < wo + wl)
+                .zip(self.lengths.iter())
+                .any(|(&wo, &wl)| byte >= wo && byte < wo + wl)
         })
     }
 
     /// Find the index of an existing write that is completely overwritten
     /// by a new write at `(offset, size)`.
-    ///
-    /// Returns the index of the first entry fully contained within
-    /// `[offset, offset+size)`.
     pub fn find_overwritten_write(&self, offset: usize, size: usize) -> Option<usize> {
-        self.entries
+        self.offsets
             .iter()
-            .position(|&(wo, wl, _, _)| offset <= wo && offset + size >= wo + wl)
+            .zip(self.lengths.iter())
+            .position(|(&wo, &wl)| offset <= wo && offset + size >= wo + wl)
     }
 }
 
@@ -2011,11 +2016,24 @@ mod tests {
     struct TestDescr;
     impl Descr for TestDescr {}
 
+    /// Create an int ArrayDescr for tests (base_size=0, item_size=8, Int).
+    fn int_descr() -> DescrRef {
+        majit_ir::descr::make_array_descr(0, 8, majit_ir::Type::Int)
+    }
+
+    /// Create an int ArrayDescr with specified item_size for tests.
+    fn int_descr_sz(item_size: usize) -> DescrRef {
+        majit_ir::descr::make_array_descr(0, item_size, majit_ir::Type::Int)
+    }
+
     fn make_buf(size: usize) -> VirtualRawBufferInfo {
         VirtualRawBufferInfo {
             func: 0,
             size,
-            entries: Vec::new(),
+            offsets: Vec::new(),
+            lengths: Vec::new(),
+            descrs: Vec::new(),
+            values: Vec::new(),
             last_guard_pos: -1,
         }
     }
@@ -2023,115 +2041,64 @@ mod tests {
     #[test]
     fn rawbuffer_write_and_read() {
         let mut buf = make_buf(32);
-        buf.write_value(0, 8, OpRef(10), RawBufferDescr::default())
-            .unwrap();
-        buf.write_value(
-            8,
-            4,
-            OpRef(20),
-            RawBufferDescr {
-                itemsize: 4,
-                ..RawBufferDescr::default()
-            },
-        )
-        .unwrap();
-        buf.write_value(16, 8, OpRef(30), RawBufferDescr::default())
-            .unwrap();
+        let d = int_descr();
+        let d4 = int_descr_sz(4);
+        buf.write_value(0, 8, d.clone(), OpRef(10)).unwrap();
+        buf.write_value(8, 4, d4.clone(), OpRef(20)).unwrap();
+        buf.write_value(16, 8, d.clone(), OpRef(30)).unwrap();
 
-        assert_eq!(
-            buf.read_value(0, 8, &RawBufferDescr::default()).unwrap(),
-            OpRef(10)
-        );
-        assert_eq!(
-            buf.read_value(
-                8,
-                4,
-                &RawBufferDescr {
-                    itemsize: 4,
-                    ..RawBufferDescr::default()
-                }
-            )
-            .unwrap(),
-            OpRef(20)
-        );
-        assert_eq!(
-            buf.read_value(16, 8, &RawBufferDescr::default()).unwrap(),
-            OpRef(30)
-        );
+        assert_eq!(buf.read_value(0, 8, &d).unwrap(), OpRef(10));
+        assert_eq!(buf.read_value(8, 4, &d4).unwrap(), OpRef(20));
+        assert_eq!(buf.read_value(16, 8, &d).unwrap(), OpRef(30));
     }
 
     #[test]
     fn rawbuffer_update_same_offset() {
         let mut buf = make_buf(16);
-        buf.write_value(0, 8, OpRef(10), RawBufferDescr::default())
-            .unwrap();
-        buf.write_value(0, 8, OpRef(99), RawBufferDescr::default())
-            .unwrap();
+        let d = int_descr();
+        buf.write_value(0, 8, d.clone(), OpRef(10)).unwrap();
+        buf.write_value(0, 8, d.clone(), OpRef(99)).unwrap();
 
-        assert_eq!(
-            buf.read_value(0, 8, &RawBufferDescr::default()).unwrap(),
-            OpRef(99)
-        );
-        assert_eq!(buf.entries.len(), 1);
+        assert_eq!(buf.read_value(0, 8, &d).unwrap(), OpRef(99));
+        assert_eq!(buf.offsets.len(), 1);
     }
 
     #[test]
     fn rawbuffer_overlap_next() {
         let mut buf = make_buf(32);
-        buf.write_value(8, 8, OpRef(10), RawBufferDescr::default())
-            .unwrap();
+        let d = int_descr();
+        buf.write_value(8, 8, d.clone(), OpRef(10)).unwrap();
         // Write at offset 4 with length 8 overlaps [8, 16)
-        let err = buf
-            .write_value(4, 8, OpRef(20), RawBufferDescr::default())
-            .unwrap_err();
+        let err = buf.write_value(4, 8, d.clone(), OpRef(20)).unwrap_err();
         assert!(matches!(err, RawBufferError::OverlappingWrite { .. }));
     }
 
     #[test]
     fn rawbuffer_overlap_prev() {
         let mut buf = make_buf(32);
-        buf.write_value(0, 8, OpRef(10), RawBufferDescr::default())
-            .unwrap();
+        let d = int_descr();
+        let d4 = int_descr_sz(4);
+        buf.write_value(0, 8, d.clone(), OpRef(10)).unwrap();
         // Write at offset 4 overlaps with [0, 8)
-        let err = buf
-            .write_value(
-                4,
-                4,
-                OpRef(20),
-                RawBufferDescr {
-                    itemsize: 4,
-                    ..RawBufferDescr::default()
-                },
-            )
-            .unwrap_err();
+        let err = buf.write_value(4, 4, d4, OpRef(20)).unwrap_err();
         assert!(matches!(err, RawBufferError::OverlappingWrite { .. }));
     }
 
     #[test]
     fn rawbuffer_incompatible_length_at_same_offset() {
         let mut buf = make_buf(16);
-        buf.write_value(0, 8, OpRef(10), RawBufferDescr::default())
-            .unwrap();
-        let err = buf
-            .write_value(
-                0,
-                4,
-                OpRef(20),
-                RawBufferDescr {
-                    itemsize: 4,
-                    ..RawBufferDescr::default()
-                },
-            )
-            .unwrap_err();
+        let d = int_descr();
+        let d4 = int_descr_sz(4);
+        buf.write_value(0, 8, d, OpRef(10)).unwrap();
+        let err = buf.write_value(0, 4, d4, OpRef(20)).unwrap_err();
         assert!(matches!(err, RawBufferError::OverlappingWrite { .. }));
     }
 
     #[test]
     fn rawbuffer_uninitialized_read() {
         let buf = make_buf(16);
-        let err = buf
-            .read_value(0, 8, &RawBufferDescr::default())
-            .unwrap_err();
+        let d = int_descr();
+        let err = buf.read_value(0, 8, &d).unwrap_err();
         assert_eq!(
             err,
             RawBufferError::UninitializedRead {
@@ -2144,18 +2111,10 @@ mod tests {
     #[test]
     fn rawbuffer_incompatible_read_length() {
         let mut buf = make_buf(16);
-        buf.write_value(0, 8, OpRef(10), RawBufferDescr::default())
-            .unwrap();
-        let err = buf
-            .read_value(
-                0,
-                4,
-                &RawBufferDescr {
-                    itemsize: 4,
-                    ..RawBufferDescr::default()
-                },
-            )
-            .unwrap_err();
+        let d = int_descr();
+        let d4 = int_descr_sz(4);
+        buf.write_value(0, 8, d, OpRef(10)).unwrap();
+        let err = buf.read_value(0, 4, &d4).unwrap_err();
         assert_eq!(
             err,
             RawBufferError::IncompatibleRead {
@@ -2169,10 +2128,9 @@ mod tests {
     #[test]
     fn rawbuffer_read_fully_covered() {
         let mut buf = make_buf(32);
-        buf.write_value(0, 8, OpRef(10), RawBufferDescr::default())
-            .unwrap();
-        buf.write_value(8, 8, OpRef(20), RawBufferDescr::default())
-            .unwrap();
+        let d = int_descr();
+        buf.write_value(0, 8, d.clone(), OpRef(10)).unwrap();
+        buf.write_value(8, 8, d.clone(), OpRef(20)).unwrap();
 
         // [0, 16) is fully covered by [0,8) + [8,16)
         assert!(buf.is_read_fully_covered(0, 16));
@@ -2185,26 +2143,9 @@ mod tests {
     #[test]
     fn rawbuffer_read_partially_covered_fails() {
         let mut buf = make_buf(32);
-        buf.write_value(
-            0,
-            4,
-            OpRef(10),
-            RawBufferDescr {
-                itemsize: 4,
-                ..RawBufferDescr::default()
-            },
-        )
-        .unwrap();
-        buf.write_value(
-            8,
-            4,
-            OpRef(20),
-            RawBufferDescr {
-                itemsize: 4,
-                ..RawBufferDescr::default()
-            },
-        )
-        .unwrap();
+        let d4 = int_descr_sz(4);
+        buf.write_value(0, 4, d4.clone(), OpRef(10)).unwrap();
+        buf.write_value(8, 4, d4.clone(), OpRef(20)).unwrap();
 
         // Bytes 4..8 are not covered by any write
         assert!(!buf.is_read_fully_covered(0, 8));
@@ -2215,26 +2156,9 @@ mod tests {
     #[test]
     fn rawbuffer_overwritten_write_detected() {
         let mut buf = make_buf(32);
-        buf.write_value(
-            4,
-            4,
-            OpRef(10),
-            RawBufferDescr {
-                itemsize: 4,
-                ..RawBufferDescr::default()
-            },
-        )
-        .unwrap();
-        buf.write_value(
-            12,
-            4,
-            OpRef(20),
-            RawBufferDescr {
-                itemsize: 4,
-                ..RawBufferDescr::default()
-            },
-        )
-        .unwrap();
+        let d4 = int_descr_sz(4);
+        buf.write_value(4, 4, d4.clone(), OpRef(10)).unwrap();
+        buf.write_value(12, 4, d4.clone(), OpRef(20)).unwrap();
 
         // A write [4, 12) fully contains [4, 8)
         assert_eq!(buf.find_overwritten_write(4, 8), Some(0));
@@ -2249,41 +2173,72 @@ mod tests {
     #[test]
     fn rawbuffer_sorted_insertion() {
         let mut buf = make_buf(32);
-        buf.write_value(
-            16,
-            4,
-            OpRef(30),
-            RawBufferDescr {
-                itemsize: 4,
-                ..RawBufferDescr::default()
-            },
-        )
-        .unwrap();
-        buf.write_value(
-            0,
-            4,
-            OpRef(10),
-            RawBufferDescr {
-                itemsize: 4,
-                ..RawBufferDescr::default()
-            },
-        )
-        .unwrap();
-        buf.write_value(
-            8,
-            4,
-            OpRef(20),
-            RawBufferDescr {
-                itemsize: 4,
-                ..RawBufferDescr::default()
-            },
-        )
-        .unwrap();
+        let d4 = int_descr_sz(4);
+        buf.write_value(16, 4, d4.clone(), OpRef(30)).unwrap();
+        buf.write_value(0, 4, d4.clone(), OpRef(10)).unwrap();
+        buf.write_value(8, 4, d4.clone(), OpRef(20)).unwrap();
 
         // Entries should be sorted by offset
-        assert_eq!(buf.entries[0].0, 0);
-        assert_eq!(buf.entries[1].0, 8);
-        assert_eq!(buf.entries[2].0, 16);
+        assert_eq!(buf.offsets[0], 0);
+        assert_eq!(buf.offsets[1], 8);
+        assert_eq!(buf.offsets[2], 16);
+    }
+
+    /// test_rawbuffer.py:66 test_unpack_descrs
+    /// Two different descr objects with same (basesize, itemsize, signed)
+    /// must be compatible. Different signed-ness must be incompatible.
+    #[test]
+    fn test_unpack_descrs() {
+        use majit_ir::descr::SimpleArrayDescr;
+
+        // ArrayS_8_1 and ArrayS_8_2: same (base=0, item=8, signed=true)
+        let array_s_8_1: DescrRef = std::sync::Arc::new(SimpleArrayDescr::with_flag(
+            0,
+            0,
+            8,
+            0,
+            majit_ir::Type::Int,
+            majit_ir::descr::ArrayFlag::Signed,
+        ));
+        let array_s_8_2: DescrRef = std::sync::Arc::new(SimpleArrayDescr::with_flag(
+            1,
+            0,
+            8,
+            0,
+            majit_ir::Type::Int,
+            majit_ir::descr::ArrayFlag::Signed,
+        ));
+        // ArrayU_8: same size but unsigned
+        let array_u_8: DescrRef = std::sync::Arc::new(SimpleArrayDescr::with_flag(
+            2,
+            0,
+            8,
+            0,
+            majit_ir::Type::Int,
+            majit_ir::descr::ArrayFlag::Unsigned,
+        ));
+
+        assert!(!std::sync::Arc::ptr_eq(&array_s_8_1, &array_s_8_2));
+
+        let mut buf = make_buf(16);
+
+        // Write with ArrayS_8_1
+        buf.write_value(0, 4, array_s_8_1.clone(), OpRef(10))
+            .unwrap();
+
+        // Read with same descr
+        assert_eq!(buf.read_value(0, 4, &array_s_8_1).unwrap(), OpRef(10));
+        // Read with non-identical but compatible descr
+        assert_eq!(buf.read_value(0, 4, &array_s_8_2).unwrap(), OpRef(10));
+
+        // Overwrite with non-identical compatible descr
+        buf.write_value(0, 4, array_s_8_2.clone(), OpRef(20))
+            .unwrap();
+        assert_eq!(buf.read_value(0, 4, &array_s_8_1).unwrap(), OpRef(20));
+
+        // Incompatible descr (unsigned) must fail
+        assert!(buf.read_value(0, 4, &array_u_8).is_err());
+        assert!(buf.write_value(0, 4, array_u_8, OpRef(30)).is_err());
     }
 
     #[test]

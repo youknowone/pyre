@@ -138,17 +138,16 @@ pub enum ExitVirtualLayout {
         offset: usize,
         base: ExitValueSourceLayout,
     },
-    /// resume.py:692 VRawBufferInfo(func, size, offsets, descrs).
     RawBuffer {
-        /// resume.py:694
+        /// resume.py:694: self.func
         func: i64,
-        /// resume.py:695
         size: usize,
-        /// resume.py:696 self.offsets
+        /// resume.py:695: self.offsets
         offsets: Vec<usize>,
-        /// resume.py:697 self.descrs
-        descrs: Vec<majit_ir::RawBufferDescr>,
-        sources: Vec<ExitValueSourceLayout>,
+        /// resume.py:697: self.descrs
+        descrs: Vec<majit_ir::ArrayDescrInfo>,
+        /// resume.py:693: fieldnums (decoded)
+        values: Vec<ExitValueSourceLayout>,
     },
 }
 
@@ -247,15 +246,15 @@ impl ExitVirtualLayout {
                 size,
                 offsets,
                 descrs,
-                sources,
+                values,
             } => Self::RawBuffer {
                 func: *func,
                 size: *size,
                 offsets: offsets.clone(),
                 descrs: descrs.clone(),
-                sources: sources
+                values: values
                     .iter()
-                    .map(|s| s.shifted_virtuals(virtual_offset))
+                    .map(|source| source.shifted_virtuals(virtual_offset))
                     .collect(),
             },
         }
@@ -352,20 +351,18 @@ impl PartialEq for ExitVirtualLayout {
             ) => a1 == b1 && a2 == b2,
             (
                 Self::RawBuffer {
-                    func: af,
                     size: a1,
                     offsets: a2,
-                    descrs: a3,
-                    sources: a4,
+                    values: a3,
+                    ..
                 },
                 Self::RawBuffer {
-                    func: bf,
                     size: b1,
                     offsets: b2,
-                    descrs: b3,
-                    sources: b4,
+                    values: b3,
+                    ..
                 },
-            ) => af == bf && a1 == b1 && a2 == b2 && a3 == b3 && a4 == b4,
+            ) => a1 == b1 && a2 == b2 && a3 == b3,
             _ => false,
         }
     }
@@ -1440,26 +1437,13 @@ pub trait Backend: Send {
         _length: i64,
     ) {
     }
-    /// llmodel.py:748 bh_raw_load_i(addr, offset, arraydescr).
-    /// Backend uses descr.as_itemsize() for element width and
-    /// descr.is_item_signed() for sign extension.
-    fn bh_raw_load_i(
-        &self,
-        _ptr: i64,
-        _offset: i64,
-        _descr: &majit_codewriter::jitcode::BhDescr,
-    ) -> i64 {
+    /// model.py: bh_raw_load_i(ptr, offset, descr)
+    fn bh_raw_load_i(&self, _ptr: i64, _offset: i64) -> i64 {
         0
     }
-    /// llmodel.py:739 bh_raw_store_i(addr, offset, value, arraydescr).
-    fn bh_raw_store_i(
-        &self,
-        _ptr: i64,
-        _offset: i64,
-        _value: i64,
-        _descr: &majit_codewriter::jitcode::BhDescr,
-    ) {
-    }
+    /// model.py: bh_raw_store_i(ptr, offset, value, descr)
+    /// llmodel.py:739-742: unpack_arraydescr_size(descr) → write_int_at_mem(addr, offset, size, newvalue)
+    fn bh_raw_store_i(&self, _ptr: i64, _offset: i64, _value: i64, _size: usize) {}
     // ── model.py: interior field access ──
     /// model.py: bh_getinteriorfield_gc_i(array, index, descr)
     fn bh_getinteriorfield_gc_i(
@@ -1557,24 +1541,10 @@ pub trait Backend: Send {
         _bytes: i64,
     ) {
     }
-    /// llmodel.py:753 bh_raw_load_f(addr, offset, arraydescr).
-    fn bh_raw_load_f(
-        &self,
-        _ptr: i64,
-        _offset: i64,
-        _descr: &majit_codewriter::jitcode::BhDescr,
-    ) -> f64 {
+    fn bh_raw_load_f(&self, _ptr: i64, _offset: i64) -> f64 {
         0.0
     }
-    /// llmodel.py:742 bh_raw_store_f(addr, offset, value, arraydescr).
-    fn bh_raw_store_f(
-        &self,
-        _ptr: i64,
-        _offset: i64,
-        _value: f64,
-        _descr: &majit_codewriter::jitcode::BhDescr,
-    ) {
-    }
+    fn bh_raw_store_f(&self, _ptr: i64, _offset: i64, _value: f64) {}
     // ── model.py: raw field access ──
     fn bh_getfield_raw_i(
         &self,
@@ -1656,28 +1626,6 @@ pub trait Backend: Send {
     /// model.py: cast_gcref_to_int(ref)
     fn cast_gcref_to_int(&self, gcref: GcRef) -> i64 {
         gcref.as_usize() as i64
-    }
-
-    /// model.py:199-201 cpu.cls_of_box(box):
-    ///   obj = lltype.cast_opaque_ptr(OBJECTPTR, box.getref_base())
-    ///   return ConstInt(ptr2int(obj.typeptr))
-    ///
-    /// Read the class pointer (typeptr/vtable) from a runtime Ref object.
-    /// Default reads offset 0 (standard RPython object layout).
-    /// Backends with different object models (e.g. gcremovetypeptr)
-    /// should override.
-    fn cls_of_box(&self, raw_ref: i64) -> i64 {
-        debug_assert!(raw_ref != 0, "cls_of_box: null ref");
-        unsafe { *(raw_ref as *const usize) as i64 }
-    }
-
-    /// Return cls_of_box as a function pointer (Rust adaptation for
-    /// passing through PendingBridgeRd without lifetime issues).
-    fn cls_of_box_fn(&self) -> fn(i64) -> i64 {
-        |raw_ref: i64| -> i64 {
-            debug_assert!(raw_ref != 0, "cls_of_box: null ref");
-            unsafe { *(raw_ref as *const usize) as i64 }
-        }
     }
 }
 

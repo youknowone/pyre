@@ -929,30 +929,49 @@ pub fn make_call_descr_int() -> DescrRef {
     make_array_descr(0, 8, Type::Int, false)
 }
 
-/// descr.py InteriorFieldDescr for SETINTERIORFIELD_GC.
-/// resume.py:1200-1209: setinteriorfield dispatches by field type.
+/// descr.py:273 ArrayDescr for array-of-structs (FLAG_STRUCT).
+/// resume.py:749: allocate_array(self.size, self.arraydescr, clear=True).
+pub fn make_struct_array_descr(descr_index: u32, base_size: usize, item_size: usize) -> DescrRef {
+    use majit_ir::descr::{ArrayFlag, SimpleArrayDescr};
+    Arc::new(SimpleArrayDescr::with_flag(
+        descr_index,
+        base_size,
+        item_size,
+        0,
+        Type::Void,
+        ArrayFlag::Struct,
+    ))
+}
+
+/// descr.py:384 InteriorFieldDescr for SETINTERIORFIELD_GC.
+/// assert arraydescr.flag == FLAG_STRUCT.
 /// llmodel.py:648-665: bh_setinteriorfield_gc_{i,r,f} computes
 /// offset = arraydescr.basesize + itemindex * itemsize + fielddescr.offset.
 pub fn make_interior_field_descr(
     array_descr_index: u32,
+    base_size: usize,
     item_size: usize,
     field_offset: usize,
     field_size: usize,
     field_type: u8, // 0=ref, 1=int, 2=float
     field_descr_index: u32,
 ) -> DescrRef {
-    use majit_ir::descr::{SimpleArrayDescr, SimpleFieldDescr, SimpleInteriorFieldDescr};
+    use majit_ir::descr::{
+        ArrayFlag, SimpleArrayDescr, SimpleFieldDescr, SimpleInteriorFieldDescr,
+    };
     let tp = match field_type {
         0 => Type::Ref,
         2 => Type::Float,
         _ => Type::Int,
     };
-    let array_descr = Arc::new(SimpleArrayDescr::new(
+    // descr.py:387: assert arraydescr.flag == FLAG_STRUCT
+    let array_descr = Arc::new(SimpleArrayDescr::with_flag(
         array_descr_index,
-        0, // base_size: array header handled by allocate_array
+        base_size,
         item_size,
-        0, // type_id
-        tp,
+        0,
+        Type::Void,
+        ArrayFlag::Struct,
     ));
     let field_descr = Arc::new(SimpleFieldDescr::new(
         field_descr_index,

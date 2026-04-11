@@ -534,9 +534,9 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
                 descr: None,
                 known_class: None,
                 field_oprefs: vi
-                    .entries
+                    .values
                     .iter()
-                    .map(|(_, _, vref, _)| self.ctx.get_box_replacement(*vref))
+                    .map(|vref| self.ctx.get_box_replacement(*vref))
                     .collect(),
             }),
             _ => None,
@@ -671,11 +671,17 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
                 if ft.is_empty() {
                     ft = vec![0u8; fielddescr_indices.len()];
                 }
+                let bs = vi
+                    .descr
+                    .as_array_descr()
+                    .map(|ad| ad.base_size())
+                    .unwrap_or(0);
                 Some(majit_ir::RdVirtualInfo::VArrayStructInfo {
                     descr_index: vi.descr.index(),
                     size: vi.element_fields.len(),
                     fielddescr_indices,
                     field_types: ft,
+                    base_size: bs,
                     item_size: is,
                     field_offsets: fo,
                     field_sizes: fs,
@@ -683,19 +689,36 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
                 })
             }
             PtrInfo::VirtualRawBuffer(vi) => {
-                let offsets: Vec<usize> = vi.entries.iter().map(|(o, _, _, _)| *o).collect();
-                let entry_sizes: Vec<usize> =
-                    vi.entries.iter().map(|(_, len, _, _)| *len).collect();
-                let entry_types: Vec<u8> = vi.entries.iter().map(|(_, _, _, d)| d.kind).collect();
-                let entry_signed: Vec<bool> =
-                    vi.entries.iter().map(|(_, _, _, d)| d.is_signed).collect();
+                // info.py:445: visitor_dispatch_virtual_type →
+                // visit_vrawbuffer(func, size, offsets[:], descrs[:])
+                let offsets = vi.offsets.clone();
+                let descrs: Vec<majit_ir::ArrayDescrInfo> = vi
+                    .descrs
+                    .iter()
+                    .map(|d| {
+                        let ad = d.as_array_descr();
+                        majit_ir::ArrayDescrInfo {
+                            index: d.index(),
+                            base_size: ad.map_or(0, |a| a.base_size()),
+                            item_size: ad.map_or(8, |a| a.item_size()),
+                            item_type: ad.map_or(1, |a| {
+                                if a.is_array_of_pointers() {
+                                    0
+                                } else if a.is_array_of_floats() {
+                                    2
+                                } else {
+                                    1
+                                }
+                            }),
+                            is_signed: ad.map_or(true, |a| a.is_item_signed()),
+                        }
+                    })
+                    .collect();
                 Some(majit_ir::RdVirtualInfo::VRawBufferInfo {
                     func: vi.func,
                     size: vi.size,
                     offsets,
-                    entry_sizes,
-                    entry_types,
-                    entry_signed,
+                    descrs,
                     fieldnums,
                 })
             }
@@ -1477,9 +1500,7 @@ impl OptContext {
                         .iter()
                         .flat_map(|row| row.iter().map(|(_, r)| *r))
                         .collect(),
-                    PtrInfo::VirtualRawBuffer(r) => {
-                        r.entries.iter().map(|(_, _, v, _)| *v).collect()
-                    }
+                    PtrInfo::VirtualRawBuffer(r) => r.values.clone(),
                     _ => Vec::new(),
                 };
                 self.setinfo_from_preamble_list(&items, infos);
@@ -2479,7 +2500,7 @@ impl OptContext {
                 .filter(|&p| p >= 0 && self.snapshot_boxes.contains_key(&p));
             if let Some(fb_pos) = fallback_pos {
                 op.rd_resume_position = fb_pos;
-                self.finalize_guard_resume_data(op, knowledge);
+                self.finalize_guard_resume_data(op, None);
                 return;
             }
             // resume.py:396-397: RPython asserts resume_position >= 0.
@@ -2560,22 +2581,17 @@ impl OptContext {
 
         // RPython Box.type parity: types captured at numbering time via
         // env.get_type(), equivalent to RPython's intrinsic Box.type.
-        // resume.py:1042 parity: RPython filters holes (None) from
-        // trace.inputargs before deserialization. Holes must NOT get
-        // Type::Ref — the class bitfield serializer skips holes
-        // (if let Some(opref)), so the deserializer must also skip them.
-        // Type::Int ensures the bitfield iteration doesn't read bits
-        // for hole positions.
+        // Replaces the fragile 7-level type resolution cascade.
         let new_types: Vec<majit_ir::Type> = liveboxes
             .iter()
             .map(|opref| {
                 if opref.is_none() {
-                    return majit_ir::Type::Int;
+                    return majit_ir::Type::Ref;
                 }
-                livebox_types.get(&opref.0).copied().unwrap_or_else(|| {
-                    use majit_ir::BoxEnv;
-                    env.get_type(*opref)
-                })
+                livebox_types
+                    .get(&opref.0)
+                    .copied()
+                    .unwrap_or(majit_ir::Type::Ref)
             })
             .collect();
 

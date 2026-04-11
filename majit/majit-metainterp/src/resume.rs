@@ -439,16 +439,15 @@ pub enum ResumeVirtualLayoutSummary {
         element_fields: Vec<Vec<(u32, ResumeValueLayoutSummary)>>,
     },
     RawBuffer {
-        /// resume.py:694
+        /// resume.py:694: self.func
         func: i64,
-        /// resume.py:695
         size: usize,
-        /// resume.py:696-697: (offset, descr, source).
-        entries: Vec<(
-            usize,
-            crate::optimizeopt::info::RawBufferDescr,
-            ResumeValueLayoutSummary,
-        )>,
+        /// resume.py:695: self.offsets
+        offsets: Vec<usize>,
+        /// resume.py:697: self.descrs
+        descrs: Vec<majit_ir::ArrayDescrInfo>,
+        /// resume.py:693: fieldnums (decoded)
+        values: Vec<ResumeValueLayoutSummary>,
     },
 }
 
@@ -680,13 +679,17 @@ impl ResumeVirtualLayoutSummary {
             ResumeVirtualLayoutSummary::RawBuffer {
                 func,
                 size,
-                entries,
+                offsets,
+                descrs,
+                values,
             } => VirtualInfo::VRawBuffer {
                 func: *func,
                 size: *size,
-                entries: entries
+                offsets: offsets.clone(),
+                descrs: descrs.clone(),
+                values: values
                     .iter()
-                    .map(|(offset, descr, source)| (*offset, *descr, source.to_resume_source()))
+                    .map(|source| source.to_resume_source())
                     .collect(),
             },
         }
@@ -770,15 +773,17 @@ impl ResumeVirtualLayoutSummary {
             ResumeVirtualLayoutSummary::RawBuffer {
                 func,
                 size,
-                entries,
+                offsets,
+                descrs,
+                values,
             } => ExitVirtualLayout::RawBuffer {
                 func: *func,
                 size: *size,
-                offsets: entries.iter().map(|(off, _, _)| *off).collect(),
-                descrs: entries.iter().map(|(_, descr, _)| *descr).collect(),
-                sources: entries
+                offsets: offsets.clone(),
+                descrs: descrs.clone(),
+                values: values
                     .iter()
-                    .map(|(_, _, src)| src.to_exit_source(virtual_offset))
+                    .map(|source| source.to_exit_source(virtual_offset))
                     .collect(),
             },
         }
@@ -1205,17 +1210,16 @@ pub enum VirtualInfo {
     },
     /// resume.py:692 VRawBufferInfo(func, size, offsets, descrs).
     VRawBuffer {
-        /// resume.py:694 self.func — raw malloc function pointer.
+        /// resume.py:694: self.func — raw malloc function pointer.
         func: i64,
-        /// resume.py:695 self.size — buffer size in bytes.
+        /// Size of the buffer in bytes.
         size: usize,
-        /// resume.py:696-697 self.offsets + self.descrs merged:
-        /// (offset, descr, source) per entry.
-        entries: Vec<(
-            usize,
-            crate::optimizeopt::info::RawBufferDescr,
-            VirtualFieldSource,
-        )>,
+        /// resume.py:695: self.offsets — byte offsets for each stored value.
+        offsets: Vec<usize>,
+        /// resume.py:697: self.descrs — per-entry ArrayDescr snapshots.
+        descrs: Vec<majit_ir::ArrayDescrInfo>,
+        /// resume.py:693: fieldnums — per-entry source (decoded from tagged fieldnums).
+        values: Vec<VirtualFieldSource>,
     },
     /// resume.py: VRawSliceInfo — a slice into a virtual raw buffer.
     VRawSlice {
@@ -1326,9 +1330,7 @@ impl VirtualInfo {
                 .iter()
                 .flat_map(|el| el.iter().map(|(_, src)| src))
                 .collect(),
-            VirtualInfo::VRawBuffer { entries, .. } => {
-                entries.iter().map(|(_, _, src)| src).collect()
-            }
+            VirtualInfo::VRawBuffer { values, .. } => values.iter().collect(),
             VirtualInfo::VRawSlice { parent, .. } => vec![parent],
             VirtualInfo::VStrPlain { chars } | VirtualInfo::VUniPlain { chars } => {
                 chars.iter().collect()
@@ -1435,14 +1437,15 @@ impl VirtualInfo {
             VirtualInfo::VRawBuffer {
                 func,
                 size,
-                entries,
+                offsets,
+                descrs,
+                values,
             } => ResumeVirtualLayoutSummary::RawBuffer {
                 func: *func,
                 size: *size,
-                entries: entries
-                    .iter()
-                    .map(|(offset, descr, source)| (*offset, *descr, source.layout_summary()))
-                    .collect(),
+                offsets: offsets.clone(),
+                descrs: descrs.clone(),
+                values: values.iter().map(|src| src.layout_summary()).collect(),
             },
             // String/unicode virtual infos — represented as structs
             // with synthetic field indices for reconstruction.
@@ -1614,30 +1617,21 @@ pub fn rd_virtual_to_virtual_info(
             func,
             size,
             offsets,
-            entry_sizes,
-            entry_types,
-            entry_signed,
+            descrs,
             fieldnums,
         } => {
-            let entries = offsets
+            assert_eq!(offsets.len(), descrs.len());
+            assert_eq!(offsets.len(), fieldnums.len());
+            let values = fieldnums
                 .iter()
-                .zip(entry_sizes.iter())
-                .zip(entry_types.iter())
-                .zip(entry_signed.iter())
-                .zip(fieldnums.iter())
-                .map(|((((&off, &sz), &kind), &signed), &tagged)| {
-                    let descr = crate::optimizeopt::info::RawBufferDescr {
-                        itemsize: sz,
-                        is_signed: signed,
-                        kind,
-                    };
-                    (off, descr, tagged_to_source(tagged, consts, count))
-                })
+                .map(|&tagged| tagged_to_source(tagged, consts, count))
                 .collect();
             VirtualInfo::VRawBuffer {
                 func: *func,
                 size: *size,
-                entries,
+                offsets: offsets.clone(),
+                descrs: descrs.clone(),
+                values,
             }
         }
         majit_ir::RdVirtualInfo::VRawSliceInfo { offset, fieldnums } => {
@@ -2340,12 +2334,9 @@ pub enum MaterializedVirtual {
     RawBuffer {
         func: i64,
         size: usize,
-        /// (offset, descr, value).
-        entries: Vec<(
-            usize,
-            crate::optimizeopt::info::RawBufferDescr,
-            MaterializedValue,
-        )>,
+        offsets: Vec<usize>,
+        descrs: Vec<majit_ir::ArrayDescrInfo>,
+        values: Vec<MaterializedValue>,
     },
 }
 
@@ -2382,10 +2373,18 @@ impl MaterializedVirtual {
                 descr_index: *descr_index,
                 elements: vec![Vec::new(); element_fields.len()],
             },
-            VirtualInfo::VRawBuffer { func, size, .. } => MaterializedVirtual::RawBuffer {
+            VirtualInfo::VRawBuffer {
+                func,
+                size,
+                offsets,
+                descrs,
+                ..
+            } => MaterializedVirtual::RawBuffer {
                 func: *func,
                 size: *size,
-                entries: Vec::new(),
+                offsets: offsets.clone(),
+                descrs: descrs.clone(),
+                values: vec![MaterializedValue::Value(0); offsets.len()],
             },
             VirtualInfo::VRawSlice { .. }
             | VirtualInfo::VStrPlain { .. }
@@ -2460,21 +2459,14 @@ impl MaterializedVirtual {
                     .collect();
             }
             (
-                MaterializedVirtual::RawBuffer { entries, .. },
+                MaterializedVirtual::RawBuffer { values, .. },
                 VirtualInfo::VRawBuffer {
-                    entries: src_entries,
-                    ..
+                    values: src_values, ..
                 },
             ) => {
-                *entries = src_entries
+                *values = src_values
                     .iter()
-                    .map(|(off, descr, src)| {
-                        (
-                            *off,
-                            *descr,
-                            ResumeData::resolve_materialized_source(src, fail_values),
-                        )
-                    })
+                    .map(|src| ResumeData::resolve_materialized_source(src, fail_values))
                     .collect();
             }
             _ => {} // type mismatch — should not happen
@@ -2556,17 +2548,19 @@ impl MaterializedVirtual {
             MaterializedVirtual::RawBuffer {
                 func,
                 size,
-                entries,
+                offsets,
+                descrs,
+                values,
             } => Some(MaterializedVirtual::RawBuffer {
                 func: *func,
                 size: *size,
-                entries: entries
+                offsets: offsets.clone(),
+                descrs: descrs.clone(),
+                values: values
                     .iter()
-                    .map(|(offset, descr, value)| {
-                        Some((
-                            *offset,
-                            *descr,
-                            MaterializedValue::Value(value.resolve_with_refs(materialized_refs)?),
+                    .map(|value| {
+                        Some(MaterializedValue::Value(
+                            value.resolve_with_refs(materialized_refs)?,
                         ))
                     })
                     .collect::<Option<Vec<_>>>()?,
@@ -2719,21 +2713,21 @@ impl ResumeDataVirtualAdder {
         })
     }
 
-    /// resume.py:335-336 visit_vrawbuffer(func, size, offsets, descrs).
+    /// Convenience: add a virtual raw buffer.
     pub fn add_virtual_raw_buffer(
         &mut self,
         func: i64,
         size: usize,
-        entries: Vec<(
-            usize,
-            crate::optimizeopt::info::RawBufferDescr,
-            VirtualFieldSource,
-        )>,
+        offsets: Vec<usize>,
+        descrs: Vec<majit_ir::ArrayDescrInfo>,
+        values: Vec<VirtualFieldSource>,
     ) -> usize {
         self.add_virtual(VirtualInfo::VRawBuffer {
             func,
             size,
-            entries,
+            offsets,
+            descrs,
+            values,
         })
     }
 
@@ -3730,11 +3724,13 @@ impl ResumeDataLoopMemo {
                     ) as i32);
                 }
 
-                // rewrite.py:828-833 serialize_optrewrite: only result in available_boxes
+                // bridgeopt.py:113-122: loopinvariant results
                 let filtered_loopinvariant: Vec<_> = knowledge
                     .loopinvariant_results
                     .iter()
-                    .filter(|&&(_, result)| available_boxes.contains(&result.0))
+                    .filter(|&&(_, result)| {
+                        env.is_const(result) || available_boxes.contains(&result.0)
+                    })
                     .collect();
                 numb_state.append_int(filtered_loopinvariant.len() as i32);
                 for &&(const_ptr, result) in &filtered_loopinvariant {
@@ -4632,19 +4628,18 @@ pub trait BlackholeAllocator {
     fn setarrayitem_float(&self, array: i64, index: usize, value: i64, descr: u32) {
         let _ = (array, index, value, descr);
     }
-    /// resume.py:1124-1132 allocate_raw_buffer(func, size).
+    /// resume.py:1452 allocate_raw_buffer(func, size)
     fn allocate_raw_buffer(&self, func: i64, size: usize) -> i64 {
         let _ = (func, size);
         0
     }
-    /// resume.py:1543-1550 setrawbuffer_item(buffer, fieldnum, offset, descr).
-    /// descr carries itemsize/is_signed/kind for bh_raw_store_i/f dispatch.
+    /// resume.py:1543 setrawbuffer_item(buffer, fieldnum, offset, descr)
     fn setrawbuffer_item(
         &self,
         buffer: i64,
         offset: usize,
         value: i64,
-        descr: &crate::optimizeopt::info::RawBufferDescr,
+        descr: &majit_ir::ArrayDescrInfo,
     ) {
         let _ = (buffer, offset, value, descr);
     }
@@ -4715,13 +4710,8 @@ impl VirtualInfo {
             } => {
                 // resume.py:619 allocate_with_vtable(descr=self.descr)
                 // llmodel.py:780 sizedescr.get_vtable() → vtable pointer.
-                // RPython uses descr.get_vtable(); known_class is a fallback
-                // when descr is unavailable (pyre bridge path).
-                let vtable = descr
-                    .as_ref()
-                    .and_then(|d| d.as_size_descr())
-                    .map(|sd| sd.vtable())
-                    .unwrap_or_else(|| known_class.unwrap_or(0) as usize);
+                // known_class (info.py:318) carries the vtable from optimize_new_with_vtable.
+                let vtable = known_class.unwrap_or(0) as usize;
                 let obj = allocator.allocate_with_vtable(*type_id, *descr_size, vtable);
                 decoder.virtuals_cache.set_ptr(index, obj);
                 for (i, (field_descr, source)) in fields.iter().enumerate() {
@@ -4797,26 +4787,35 @@ impl VirtualInfo {
             VirtualInfo::VRawBuffer {
                 func,
                 size,
-                entries,
+                offsets,
+                descrs,
+                values,
             } => {
-                // resume.py:703 buffer = decoder.allocate_raw_buffer(self.func, self.size)
+                assert_eq!(offsets.len(), descrs.len());
+                assert_eq!(offsets.len(), values.len());
+                // resume.py:703: buffer = decoder.allocate_raw_buffer(self.func, self.size)
                 let buffer = allocator.allocate_raw_buffer(*func, *size);
                 // resume.py:704
                 decoder.virtuals_cache.set_int(index, buffer);
-                // resume.py:705-708
-                for (offset, descr, source) in entries {
-                    // resume.py:1543-1550 setrawbuffer_item(buffer, fieldnum, offset, descr)
-                    // assert not descr.is_array_of_pointers()
-                    debug_assert!(descr.kind != 0, "raw buffer entry cannot be pointer");
-                    if descr.kind == 2 {
-                        // descr.is_array_of_floats() → decode_float + bh_raw_store_f
-                        let value = decoder.decode_field_source_float(source);
-                        allocator.setrawbuffer_item(buffer, *offset, value, descr);
+                // resume.py:705-708: for i in range(len(self.offsets)):
+                //     offset = self.offsets[i]; descr = self.descrs[i]
+                //     decoder.setrawbuffer_item(buffer, fieldnums[i], offset, descr)
+                for i in 0..offsets.len() {
+                    let descr = &descrs[i];
+                    let source = &values[i];
+                    // resume.py:1543-1550: dispatch by descr kind
+                    assert!(
+                        descr.item_type != 0,
+                        "raw buffer entry must not be pointer type"
+                    );
+                    let value = if descr.item_type == 2 {
+                        // resume.py:1545: descr.is_array_of_floats() → decode_float
+                        decoder.decode_field_source_float(source)
                     } else {
-                        // default: decode_int + bh_raw_store_i
-                        let value = decoder.decode_field_source_int(source);
-                        allocator.setrawbuffer_item(buffer, *offset, value, descr);
-                    }
+                        // resume.py:1549: else → decode_int
+                        decoder.decode_field_source_int(source)
+                    };
+                    allocator.setrawbuffer_item(buffer, offsets[i], value, descr);
                 }
                 buffer
             }

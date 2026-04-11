@@ -2141,6 +2141,55 @@ fn materialize_virtual_from_rd(
             _ => Value::Int(0),
         })
     }
+    /// resume.py:1549 decode_int(fieldnum)
+    /// Returns the raw i64 value for integer-typed fields.
+    fn decode_tagged_fieldnum_int(
+        tagged: i16,
+        dead_frame: &[Value],
+        num_failargs: i32,
+        rd_consts: &[(i64, majit_ir::Type)],
+        rd_virtuals: Option<&[majit_ir::RdVirtualInfo]>,
+        virtuals_cache: &mut HashMap<usize, Value>,
+    ) -> i64 {
+        match decode_tagged_fieldnum(
+            tagged,
+            dead_frame,
+            num_failargs,
+            rd_consts,
+            rd_virtuals,
+            virtuals_cache,
+        ) {
+            Some(Value::Int(n)) => n,
+            Some(Value::Float(f)) => f.to_bits() as i64,
+            Some(Value::Ref(gc)) => gc.0 as i64,
+            _ => 0,
+        }
+    }
+
+    /// resume.py:1546 decode_float(fieldnum)
+    /// Returns the raw f64 value for float-typed fields.
+    fn decode_tagged_fieldnum_float(
+        tagged: i16,
+        dead_frame: &[Value],
+        num_failargs: i32,
+        rd_consts: &[(i64, majit_ir::Type)],
+        rd_virtuals: Option<&[majit_ir::RdVirtualInfo]>,
+        virtuals_cache: &mut HashMap<usize, Value>,
+    ) -> f64 {
+        match decode_tagged_fieldnum(
+            tagged,
+            dead_frame,
+            num_failargs,
+            rd_consts,
+            rd_virtuals,
+            virtuals_cache,
+        ) {
+            Some(Value::Float(f)) => f,
+            Some(Value::Int(n)) => f64::from_bits(n as u64),
+            _ => 0.0,
+        }
+    }
+
     fn box_opt_value(v: &Option<Value>) -> pyre_object::PyObjectRef {
         match v {
             Some(Value::Ref(gc)) => gc.0 as pyre_object::PyObjectRef,
@@ -2259,38 +2308,64 @@ fn materialize_virtual_from_rd(
             func,
             size,
             offsets,
-            entry_sizes,
-            entry_types,
-            entry_signed,
+            descrs,
             fieldnums,
         } => {
-            // resume.py:701-703: buffer = decoder.allocate_raw_buffer(self.func, self.size)
-            let buffer = allocate_raw_buffer_by_func(*func, *size);
+            assert_eq!(offsets.len(), descrs.len());
+            assert_eq!(offsets.len(), fieldnums.len());
+            // resume.py:701-703: buffer = decoder.allocate_raw_buffer(func, size)
+            let (driver, _) = driver_pair();
+            let calldescr = majit_codewriter::jitcode::BhCallDescr {
+                arg_classes: "i".into(),
+                result_type: 'i',
+            };
+            let buffer = driver.meta_interp().backend().bh_call_i(
+                *func,
+                Some(&[*size as i64]),
+                None,
+                None,
+                &calldescr,
+            );
             // resume.py:704: cache BEFORE filling fields.
-            let result = Value::Int(buffer as i64);
+            let result = Value::Int(buffer);
             virtuals_cache.insert(vidx, result.clone());
-            // resume.py:705-708: setrawbuffer_item per entry
+            let backend = driver.meta_interp().backend();
+            // resume.py:705-708: for i in range(len(self.offsets)):
+            //     offset = self.offsets[i]; descr = self.descrs[i]
+            //     decoder.setrawbuffer_item(buffer, fieldnums[i], offset, descr)
             for (i, &fnum) in fieldnums.iter().enumerate() {
-                if let Some(val) = decode_tagged_fieldnum(
-                    fnum,
-                    dead_frame,
-                    num_failargs,
-                    rd_consts,
-                    rd_virtuals,
-                    virtuals_cache,
-                ) {
-                    let offset = offsets.get(i).copied().unwrap_or(i * 8);
-                    let descr = majit_ir::RawBufferDescr {
-                        itemsize: entry_sizes.get(i).copied().unwrap_or(8),
-                        is_signed: entry_signed.get(i).copied().unwrap_or(true),
-                        kind: entry_types.get(i).copied().unwrap_or(1),
-                    };
-                    let raw = match val {
-                        Value::Int(n) => n,
-                        Value::Float(f) => f.to_bits() as i64,
-                        _ => 0,
-                    };
-                    write_rawbuffer_item(buffer, offset, raw, &descr);
+                let di = &descrs[i];
+                // resume.py:1544: assert not descr.is_array_of_pointers()
+                assert!(
+                    di.item_type != 0,
+                    "raw buffer entry must not be pointer type"
+                );
+                let offset = offsets[i] as i64;
+                // resume.py:1545-1550: descr drives decode AND store
+                if di.item_type == 2 {
+                    // resume.py:1546: newvalue = self.decode_float(fieldnum)
+                    let fval = decode_tagged_fieldnum_float(
+                        fnum,
+                        dead_frame,
+                        num_failargs,
+                        rd_consts,
+                        rd_virtuals,
+                        virtuals_cache,
+                    );
+                    // resume.py:1547: self.cpu.bh_raw_store_f(buffer, offset, newvalue, descr)
+                    backend.bh_raw_store_f(buffer, offset, fval);
+                } else {
+                    // resume.py:1549: newvalue = self.decode_int(fieldnum)
+                    let ival = decode_tagged_fieldnum_int(
+                        fnum,
+                        dead_frame,
+                        num_failargs,
+                        rd_consts,
+                        rd_virtuals,
+                        virtuals_cache,
+                    );
+                    // resume.py:1550: self.cpu.bh_raw_store_i(buffer, offset, newvalue, descr)
+                    backend.bh_raw_store_i(buffer, offset, ival, di.item_size);
                 }
             }
             return result;
@@ -3512,6 +3587,8 @@ fn rebuild_state_after_failure_from_recovery_layout(
 ) -> bool {
     let w_int_type = &pyre_object::pyobject::INT_TYPE as *const _ as usize;
     let w_float_type = &pyre_object::pyobject::FLOAT_TYPE as *const _ as usize;
+    let (driver, _) = driver_pair();
+    let backend = driver.meta_interp().backend();
 
     // resume.py parity: resolve field values from deadframe (raw_values),
     // not from rd_numb-decoded typed array. Virtual field values live at
@@ -3776,20 +3853,29 @@ fn rebuild_state_after_failure_from_recovery_layout(
                 size,
                 offsets,
                 descrs,
-                sources,
+                values,
             } => {
-                // resume.py:701-703 allocate_raw_buffer(self.func, self.size)
-                // resume.py:1124-1132: func selects the malloc variant
-                // (zero/non-zero, memory-pressure or not, etc.)
-                let buffer = allocate_raw_buffer_by_func(*func, *size);
-                for (i, src) in sources.iter().enumerate() {
+                // resume.py:703: buffer = decoder.allocate_raw_buffer(func, size)
+                let calldescr = majit_codewriter::jitcode::BhCallDescr {
+                    arg_classes: "i".into(),
+                    result_type: 'i',
+                };
+                let buffer =
+                    backend.bh_call_i(*func, Some(&[*size as i64]), None, None, &calldescr);
+                // resume.py:705-708: per-item bh_raw_store_i/f
+                for (i, src) in values.iter().enumerate() {
                     if let Some(val) = resolve_value(src, &materialized) {
-                        let offset = offsets.get(i).copied().unwrap_or(0);
-                        let descr = descrs
-                            .get(i)
-                            .copied()
-                            .unwrap_or(majit_ir::RawBufferDescr::default());
-                        write_rawbuffer_item(buffer, offset, val, &descr);
+                        let di = &descrs[i];
+                        assert!(
+                            di.item_type != 0,
+                            "raw buffer entry must not be pointer type"
+                        );
+                        let offset = offsets[i] as i64;
+                        if di.item_type == 2 {
+                            backend.bh_raw_store_f(buffer, offset, f64::from_bits(val as u64));
+                        } else {
+                            backend.bh_raw_store_i(buffer, offset, val, di.item_size);
+                        }
                     }
                 }
                 materialized.push(buffer as usize);
@@ -3848,60 +3934,6 @@ fn rebuild_state_after_failure_from_recovery_layout(
         }
     }
     replaced > 0 || materialized.is_empty()
-}
-
-/// resume.py:1124-1132 allocate_raw_buffer(func, size).
-/// RPython comment: "Can't use 'func' from callinfo_for_oopspec(), because
-/// we have several variants (zero/non-zero, memory-pressure or not, etc.)
-/// and we have to pick the correct one here; that's why we save it in the
-/// VRawBufferInfo."
-///
-/// In pyre, `func` is the raw malloc function pointer saved during tracing.
-/// We call it directly if non-zero; otherwise fall back to alloc_zeroed.
-fn allocate_raw_buffer_by_func(func: i64, size: usize) -> *mut u8 {
-    if func != 0 {
-        // resume.py:1131: execute_and_record_varargs(CALL_I, [ConstInt(func), ConstInt(size)], ...)
-        // In blackhole replay, this becomes cpu.bh_call_i(func, [size], calldescr).
-        // Pyre: call the function pointer directly.
-        let f: fn(usize) -> *mut u8 = unsafe { std::mem::transmute(func as usize) };
-        let ptr = f(size);
-        if !ptr.is_null() {
-            return ptr;
-        }
-    }
-    // Fallback: zero-initialized allocation.
-    unsafe {
-        std::alloc::alloc_zeroed(
-            std::alloc::Layout::from_size_align(size.max(1), 8)
-                .unwrap_or(std::alloc::Layout::new::<u8>()),
-        )
-    }
-}
-
-/// resume.py:1543-1550 setrawbuffer_item: write raw value by descr.
-/// llmodel.py:739-753: bh_raw_store_i/f dispatches by descr itemsize/kind.
-fn write_rawbuffer_item(ptr: *mut u8, offset: usize, raw: i64, descr: &majit_ir::RawBufferDescr) {
-    debug_assert!(descr.kind != 0, "raw buffer entry cannot be pointer");
-    unsafe {
-        let slot = ptr.add(offset);
-        if descr.kind == 2 {
-            // float: bh_raw_store_f
-            match descr.itemsize {
-                8 => (slot as *mut u64).write_unaligned(raw as u64),
-                4 => (slot as *mut u32).write_unaligned(raw as u32),
-                _ => unreachable!("float itemsize must be 4 or 8"),
-            }
-        } else {
-            // int: bh_raw_store_i
-            match descr.itemsize {
-                1 => slot.write(raw as u8),
-                2 => (slot as *mut u16).write_unaligned(raw as u16),
-                4 => (slot as *mut u32).write_unaligned(raw as u32),
-                8 => (slot as *mut u64).write_unaligned(raw as u64),
-                _ => unreachable!("int itemsize must be 1/2/4/8"),
-            }
-        }
-    }
 }
 
 fn decode_recovery_payload_from_source(
@@ -4101,6 +4133,49 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
                 let ptr = base.add(index * item_size) as *mut i64;
                 ptr.write(value);
             }
+        }
+    }
+
+    /// resume.py:1452-1456 allocate_raw_buffer(func, size)
+    /// Concrete reader: cpu.bh_call_i(func, [size], None, None, calldescr)
+    fn allocate_raw_buffer(&self, func: i64, size: usize) -> i64 {
+        let (driver, _) = driver_pair();
+        let calldescr = majit_codewriter::jitcode::BhCallDescr {
+            arg_classes: "i".into(),
+            result_type: 'i',
+        };
+        driver
+            .meta_interp()
+            .backend()
+            .bh_call_i(func, Some(&[size as i64]), None, None, &calldescr)
+    }
+
+    /// resume.py:1543-1550 setrawbuffer_item
+    /// Concrete reader: descr-driven dispatch to cpu.bh_raw_store_f/i
+    fn setrawbuffer_item(
+        &self,
+        buffer: i64,
+        offset: usize,
+        value: i64,
+        descr: &majit_ir::ArrayDescrInfo,
+    ) {
+        // resume.py:1544: assert not descr.is_array_of_pointers()
+        assert!(
+            descr.item_type != 0,
+            "raw buffer entry must not be pointer type"
+        );
+        let (driver, _) = driver_pair();
+        let backend = driver.meta_interp().backend();
+        if descr.item_type == 2 {
+            // resume.py:1545-1547: descr.is_array_of_floats()
+            //   newvalue = self.decode_float(fieldnum)
+            //   self.cpu.bh_raw_store_f(buffer, offset, newvalue, descr)
+            backend.bh_raw_store_f(buffer, offset as i64, f64::from_bits(value as u64));
+        } else {
+            // resume.py:1548-1550: else (int)
+            //   newvalue = self.decode_int(fieldnum)
+            //   self.cpu.bh_raw_store_i(buffer, offset, newvalue, descr)
+            backend.bh_raw_store_i(buffer, offset as i64, value, descr.item_size);
         }
     }
 
