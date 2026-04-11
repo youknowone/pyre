@@ -771,21 +771,16 @@ impl ResumeVirtualLayoutSummary {
                 func,
                 size,
                 entries,
-            } => {
-                ExitVirtualLayout::RawBuffer {
-                    size: *size,
-                    entries: entries
-                        .iter()
-                        .map(|(offset, _descr, source)| {
-                            (
-                                *offset,
-                                0usize, // ExitVirtualLayout uses fixed format
-                                source.to_exit_source(virtual_offset),
-                            )
-                        })
-                        .collect(),
-                }
-            }
+            } => ExitVirtualLayout::RawBuffer {
+                func: *func,
+                size: *size,
+                offsets: entries.iter().map(|(off, _, _)| *off).collect(),
+                descrs: entries.iter().map(|(_, descr, _)| *descr).collect(),
+                sources: entries
+                    .iter()
+                    .map(|(_, _, src)| src.to_exit_source(virtual_offset))
+                    .collect(),
+            },
         }
     }
 }

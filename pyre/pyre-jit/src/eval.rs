@@ -3778,25 +3778,27 @@ fn rebuild_state_after_failure_from_recovery_layout(
                 }
                 materialized.push(array as usize);
             }
-            majit_backend::ExitVirtualLayout::RawBuffer { size, entries } => {
+            majit_backend::ExitVirtualLayout::RawBuffer {
+                size,
+                offsets,
+                descrs,
+                sources,
+                ..
+            } => {
                 let buffer = unsafe {
                     std::alloc::alloc_zeroed(
                         std::alloc::Layout::from_size_align(*size, 8)
                             .unwrap_or(std::alloc::Layout::new::<u8>()),
                     )
                 };
-                for &(offset, esz, ref src) in entries {
+                for (i, src) in sources.iter().enumerate() {
                     if let Some(val) = resolve_value(src, &materialized) {
-                        if offset + esz <= *size {
-                            unsafe {
-                                match esz {
-                                    1 => *(buffer.add(offset) as *mut u8) = val as u8,
-                                    2 => *(buffer.add(offset) as *mut u16) = val as u16,
-                                    4 => *(buffer.add(offset) as *mut u32) = val as u32,
-                                    _ => *(buffer.add(offset) as *mut i64) = val,
-                                }
-                            }
-                        }
+                        let offset = offsets.get(i).copied().unwrap_or(0);
+                        let descr = descrs
+                            .get(i)
+                            .copied()
+                            .unwrap_or(majit_ir::RawBufferDescr::default());
+                        write_rawbuffer_item(buffer, offset, val, &descr);
                     }
                 }
                 materialized.push(buffer as usize);
@@ -3855,6 +3857,32 @@ fn rebuild_state_after_failure_from_recovery_layout(
         }
     }
     replaced > 0 || materialized.is_empty()
+}
+
+/// resume.py:1543-1550 setrawbuffer_item: write raw value by descr.
+/// llmodel.py:739-753: bh_raw_store_i/f dispatches by descr itemsize/kind.
+fn write_rawbuffer_item(ptr: *mut u8, offset: usize, raw: i64, descr: &majit_ir::RawBufferDescr) {
+    debug_assert!(descr.kind != 0, "raw buffer entry cannot be pointer");
+    unsafe {
+        let slot = ptr.add(offset);
+        if descr.kind == 2 {
+            // float: bh_raw_store_f
+            match descr.itemsize {
+                8 => (slot as *mut u64).write_unaligned(raw as u64),
+                4 => (slot as *mut u32).write_unaligned(raw as u32),
+                _ => unreachable!("float itemsize must be 4 or 8"),
+            }
+        } else {
+            // int: bh_raw_store_i
+            match descr.itemsize {
+                1 => slot.write(raw as u8),
+                2 => (slot as *mut u16).write_unaligned(raw as u16),
+                4 => (slot as *mut u32).write_unaligned(raw as u32),
+                8 => (slot as *mut u64).write_unaligned(raw as u64),
+                _ => unreachable!("int itemsize must be 1/2/4/8"),
+            }
+        }
+    }
 }
 
 fn decode_recovery_payload_from_source(
