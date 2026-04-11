@@ -2404,7 +2404,7 @@ pub fn getitem(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
         } else if is_instance(obj) {
             // PyPy: descroperation.py __getitem__
             if let Some(method) = lookup_in_type_where(w_instance_get_type(obj), "__getitem__") {
-                return Ok(crate::call_function(method, &[obj, index]));
+                return crate::call::call_function_impl_result(method, &[obj, index]);
             }
             Err(PyError::type_error(format!(
                 "'{}' object is not subscriptable",

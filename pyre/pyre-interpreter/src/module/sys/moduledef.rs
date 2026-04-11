@@ -105,12 +105,21 @@ pub fn init(ns: &mut PyNamespace) {
             Ok(frame)
         }),
     );
-    // sys.exc_info — stub
+    // sys.exc_info() → (type, value, traceback)
     namespace_store(
         ns,
         "exc_info",
         crate::make_builtin_function("exc_info", |_| {
-            Ok(w_tuple_new(vec![w_none(), w_none(), w_none()]))
+            let exc = crate::eval::get_current_exception();
+            unsafe {
+                if exc.is_null() || pyre_object::is_none(exc) || !pyre_object::is_exception(exc) {
+                    Ok(w_tuple_new(vec![w_none(), w_none(), w_none()]))
+                } else {
+                    let w_class = (*exc).w_class;
+                    let exc_type = if w_class.is_null() { w_none() } else { w_class };
+                    Ok(w_tuple_new(vec![exc_type, exc, w_none()]))
+                }
+            }
         }),
     );
     // sys.flags — pypy/module/sys/app.py:99-119 `class sysflags` with
@@ -199,6 +208,10 @@ pub fn init(ns: &mut PyNamespace) {
     namespace_store(ns, "exec_prefix", w_str_new(""));
     namespace_store(ns, "base_prefix", w_str_new(""));
     namespace_store(ns, "base_exec_prefix", w_str_new(""));
+    // sys._framework — macOS framework name (empty string on non-framework builds)
+    namespace_store(ns, "_framework", w_str_new(""));
+    // sys.abiflags
+    namespace_store(ns, "abiflags", w_str_new(""));
     // sys.argv
     namespace_store(ns, "argv", w_list_new(vec![]));
     // sys.warnoptions

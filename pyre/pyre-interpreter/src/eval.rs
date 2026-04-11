@@ -907,6 +907,12 @@ impl OpcodeStepExecutor for PyFrame {
                     }
                 }
             }
+            2 => {
+                // raise X from Y — pop cause, then handle like argc=1
+                // __cause__ chaining is not yet implemented; just pop and discard.
+                let _cause = self.pop();
+                self.raise_varargs(1)
+            }
             _ => Err(PyError::type_error("too many arguments for raise")),
         }
     }
@@ -1112,8 +1118,11 @@ impl OpcodeStepExecutor for PyFrame {
                 {
                     let type_name = crate::function_get_name(exc_type);
                     pyre_object::exc_kind_matches(kind, type_name)
+                } else if pyre_object::is_type(exc_type) {
+                    let type_name = pyre_object::w_type_get_name(exc_type);
+                    pyre_object::exc_kind_matches(kind, type_name)
                 } else {
-                    true
+                    false
                 }
             }
         };

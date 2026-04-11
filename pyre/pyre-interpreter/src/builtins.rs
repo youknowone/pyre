@@ -1107,8 +1107,17 @@ exc_constructor!(
 macro_rules! exc_new_wrapper {
     ($wrapper:ident, $ctor:ident) => {
         fn $wrapper(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+            let cls = args.first().copied();
             let rest: &[PyObjectRef] = if args.is_empty() { args } else { &args[1..] };
-            $ctor(rest)
+            let exc = $ctor(rest)?;
+            // Set the exception's w_class to the actual exception type (e.g. AssertionError)
+            // so that `type(e) is AssertionError` holds and `except ExcType` via isinstance works.
+            if let Some(cls) = cls {
+                unsafe {
+                    (*(exc as *mut pyre_object::PyObject)).w_class = cls;
+                }
+            }
+            Ok(exc)
         }
     };
 }
