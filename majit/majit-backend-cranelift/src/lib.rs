@@ -14,5 +14,6 @@ pub use compiler::{
     register_call_assembler_bridge, register_call_assembler_force,
     register_call_assembler_unbox_int, register_inline_frame_arena,
     register_pending_call_assembler_target, register_rebuild_state_after_failure, set_gil_hooks,
-    set_savedata_ref_on_deadframe, take_pending_force_local0, take_pending_frame_restore,
+    set_jitframe_gc_type_id, set_savedata_ref_on_deadframe, take_pending_force_local0,
+    take_pending_frame_restore,
 };
