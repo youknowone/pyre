@@ -356,17 +356,6 @@ impl OptPure {
             .lookup2(opcode, arg0, arg1, descr_index, commutative, same_box)
     }
 
-    /// Record a CALL_PURE result from a RECORD_KNOWN_RESULT hint.
-    /// pure.py: optimize_RECORD_KNOWN_RESULT
-    pub fn record_known_result(&mut self, args: &[OpRef], result: OpRef) {
-        let key = PureOpKey {
-            opcode: OpCode::CallPureI,
-            args: args.to_vec(),
-            descr_index: None,
-        };
-        self.known_result_call_pure.push((key, result));
-    }
-
     /// Get the positions of emitted CALL_PURE ops (for short preamble generation).
     /// pure.py: call_pure_positions
     pub fn call_pure_positions(&self) -> &[usize] {
@@ -831,14 +820,16 @@ impl Optimization for OptPure {
             return OptimizationResult::PassOn;
         }
 
-        // pure.py: RECORD_KNOWN_RESULT — record for later CALL_PURE lookup.
+        // pure.py:211-220: RECORD_KNOWN_RESULT — record for later CALL_PURE lookup.
+        // resoperation.py:1165: RECORD_KNOWN_RESULT/*d — carries calldescr.
+        // pure.py:215: `if op.getdescr() is not known_result_op.getdescr(): continue`
         if op.opcode == OpCode::RecordKnownResult {
             if op.num_args() >= 2 {
                 let result = op.arg(0);
                 let key = PureOpKey {
                     opcode: OpCode::call_pure_for_type(ctx.opref_type(result).unwrap_or(Type::Int)),
                     args: op.args[1..].to_vec(),
-                    descr_index: None,
+                    descr_index: op.descr.as_ref().map(|d| d.index()),
                 };
                 self.known_result_call_pure.push((key, result));
             }
