@@ -53,13 +53,9 @@ pub struct JitCode {
     /// RPython `jitcode.py:15` `self.name = name`.
     pub name: String,
     /// RPython `jitcode.py:16` `self.fnaddr = fnaddr`.
-    /// Function address for `cpu.bh_call_*`. Set at JitCode creation time
-    /// (call.py:167 `getfunctionptr(graph)`).
     #[serde(default, skip_serializing)]
     pub fnaddr: i64,
     /// RPython `jitcode.py:17` `self.calldescr = calldescr`.
-    /// Describes the function's calling convention (arg types + return type).
-    /// Set by the codewriter from the function graph's type signature.
     pub calldescr: BhCallDescr,
     /// RPython `jitcode.py:18` `self.jitdriver_sd = None`.
     /// `Some(index)` for portal jitcodes (set by `grab_initial_jitcodes`).
@@ -106,13 +102,6 @@ pub struct JitCode {
     /// `Assembler.assemble` (assembler.py:49 `jitcode._ssarepr = ssarepr`).
     #[serde(skip)]
     pub _ssarepr: Option<crate::passes::flatten::SSARepr>,
-    /// RPython: `BlackholeInterpBuilder.descrs` is a shared list of AbstractDescr
-    /// objects, populated once via `setup_descrs(asm.descrs)`. All JitCodes share
-    /// the same global descrs table.
-    /// pyre: per-jitcode Assembler produces per-jitcode descrs, so we store them
-    /// directly on the JitCode. The blackhole loads them via `setposition()`.
-    #[serde(skip)]
-    pub descrs: Vec<BhDescr>,
 }
 
 impl JitCode {
@@ -124,9 +113,9 @@ impl JitCode {
     /// `constants_*`, `c_num_regs_*`, `startpoints`, etc. via the
     /// assembler.
     ///
-    /// `_called_from` and `_ssarepr` from RPython are stored as
-    /// `Option<String>` / `Option<SSARepr>` respectively (RPython uses
-    /// a graph object and `CallPath` string).
+    /// `fnaddr`, `calldescr`, `_called_from`, and `_ssarepr` from RPython
+    /// are not yet ported (pyre lacks lltype function pointers and uses
+    /// `CallPath` instead of `funcptr._obj.graph`).
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
@@ -146,7 +135,6 @@ impl JitCode {
             index: 0,
             _called_from: None,
             _ssarepr: None,
-            descrs: Vec::new(),
         }
     }
 
@@ -398,9 +386,14 @@ impl std::fmt::Display for SwitchDictDescr {
     }
 }
 
-/// RPython `descr.py:450` CallDescr — describes calling convention for
-/// `bh_call_*`. `arg_classes` is a string of 'i','r','f' per argument.
-/// `result_type` is 'i','r','f','v'.
+/// RPython `history.py:AbstractDescr` — base class for all descriptor
+/// objects stored in the assembler's `descrs` list. Read at runtime via
+/// 'd'/'j' argcodes in the blackhole interpreter.
+///
+/// RPython uses a class hierarchy (`FieldDescr`, `ArrayDescr`, `CallDescr`,
+/// `JitCode(AbstractDescr)`, `SwitchDictDescr`). pyre uses an enum to
+/// represent the same heterogeneous list, shared between the codewriter
+/// assembler and the metainterp blackhole.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BhCallDescr {
     pub arg_classes: String,
@@ -416,14 +409,6 @@ impl Default for BhCallDescr {
     }
 }
 
-/// RPython `history.py:AbstractDescr` — base class for all descriptor
-/// objects stored in the assembler's `descrs` list. Read at runtime via
-/// 'd'/'j' argcodes in the blackhole interpreter.
-///
-/// RPython uses a class hierarchy (`FieldDescr`, `ArrayDescr`, `CallDescr`,
-/// `JitCode(AbstractDescr)`, `SwitchDictDescr`). pyre uses an enum to
-/// represent the same heterogeneous list, shared between the codewriter
-/// assembler and the metainterp blackhole.
 #[derive(Debug, Clone)]
 pub enum BhDescr {
     /// Field descriptor: for getfield/setfield.
@@ -443,9 +428,6 @@ pub enum BhDescr {
         is_array_of_pointers: bool,
         is_array_of_structs: bool,
     },
-    /// Size descriptor: for bh_new/bh_new_with_vtable allocation.
-    /// RPython: `SizeDescr(AbstractDescr)` — carries `size`, `tid`, `get_vtable()`.
-    /// descr.py:101 `get_type_id()` → gc.py:492 `gc_malloc(sizedescr)` uses tid.
     Size {
         size: usize,
         type_id: u32,
@@ -489,18 +471,14 @@ impl BhDescr {
         }
     }
 
-    /// Extract allocation size from SizeDescr (or FieldDescr for backward compat).
-    /// RPython: `sizedescr.size` in llmodel.py:775-782.
     pub fn as_size(&self) -> usize {
         match self {
             BhDescr::Size { size, .. } => *size,
-            BhDescr::Field { offset, .. } => *offset, // backward compat
+            BhDescr::Field { offset, .. } => *offset,
             _ => panic!("BhDescr::as_size called on {:?}", self),
         }
     }
 
-    /// Extract vtable pointer from SizeDescr.
-    /// RPython: `sizedescr.get_vtable()` in llmodel.py:780.
     pub fn get_vtable(&self) -> usize {
         match self {
             BhDescr::Size { vtable, .. } => *vtable,
@@ -508,8 +486,6 @@ impl BhDescr {
         }
     }
 
-    /// Extract GC type_id from SizeDescr.
-    /// RPython: `descr.py:101 get_type_id()` → `gc.py:492 gc_malloc(sizedescr)`.
     pub fn get_type_id(&self) -> u32 {
         match self {
             BhDescr::Size { type_id, .. } => *type_id,
@@ -517,7 +493,6 @@ impl BhDescr {
         }
     }
 
-    /// Extract itemsize for ArrayDescr.
     pub fn as_itemsize(&self) -> usize {
         match self {
             BhDescr::Array { itemsize, .. } => *itemsize,
@@ -525,7 +500,6 @@ impl BhDescr {
         }
     }
 
-    /// ArrayDescr: true when the array items are GC pointers.
     pub fn is_array_of_pointers(&self) -> bool {
         match self {
             BhDescr::Array {
@@ -536,8 +510,6 @@ impl BhDescr {
         }
     }
 
-    /// ArrayDescr: true when the array items are structs (GC objects).
-    /// RPython: `arraydescr.is_array_of_structs()` in blackhole.py:1165.
     pub fn is_array_of_structs(&self) -> bool {
         match self {
             BhDescr::Array {
@@ -596,7 +568,6 @@ impl BhDescr {
         }
     }
 
-    /// Extract calldescr from Call or JitCode descriptor.
     pub fn as_calldescr(&self) -> &BhCallDescr {
         match self {
             BhDescr::Call { calldescr } => calldescr,

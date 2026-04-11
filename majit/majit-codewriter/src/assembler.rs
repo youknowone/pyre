@@ -142,10 +142,6 @@ impl Assembler {
         jitcode.resulttypes = state.resulttypes;
         // RPython assembler.py:49 `jitcode._ssarepr = ssarepr`
         jitcode._ssarepr = Some(ssarepr.clone());
-        // RPython: descrs are stored on the builder and shared across jitcodes.
-        // pyre: per-jitcode assembler, so descrs are stored on the jitcode itself.
-        // The blackhole loads them via setposition().
-        jitcode.descrs = std::mem::take(&mut self.descrs);
         // index + jitdriver_sd are set by CodeWriter after assembly
         // (RPython codewriter.py:68 `jitcode.index = index`).
 
@@ -650,7 +646,7 @@ impl Assembler {
                 state.code.push((descr_idx & 0xFF) as u8);
                 state.code.push((descr_idx >> 8) as u8);
                 argcodes.push('d');
-                // Second descriptor: array items descriptor.
+                // Second descriptor: array items descriptor (placeholder).
                 let descr_idx2 = self.descrs.len();
                 self.descrs.push(crate::jitcode::BhDescr::Array {
                     itemsize: value_type_to_itemsize(item_ty),
@@ -692,7 +688,7 @@ impl Assembler {
                 state.code.push((descr_idx & 0xFF) as u8);
                 state.code.push((descr_idx >> 8) as u8);
                 argcodes.push('d');
-                // Second descriptor: array items descriptor.
+                // Second descriptor: array items descriptor (placeholder).
                 let descr_idx2 = self.descrs.len();
                 self.descrs.push(crate::jitcode::BhDescr::Array {
                     itemsize: value_type_to_itemsize(item_ty),
@@ -865,14 +861,13 @@ fn value_type_to_kind(ty: &crate::model::ValueType) -> char {
     }
 }
 
-/// Map ValueType to itemsize in bytes (used for ArrayDescr).
 fn value_type_to_itemsize(ty: &crate::model::ValueType) -> usize {
     use crate::model::ValueType;
     match ty {
-        ValueType::Int => 8,   // i64
-        ValueType::Ref => 8,   // pointer
-        ValueType::Float => 8, // f64
-        _ => 8,                // default
+        ValueType::Int => 8,
+        ValueType::Ref => 8,
+        ValueType::Float => 8,
+        _ => 8,
     }
 }
 
