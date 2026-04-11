@@ -3240,18 +3240,12 @@ impl OptUnroll {
                     // Register type for the new OpRef (RPython Box.type parity).
                     ctx.value_types.insert(value.0, result_type);
                     ctx.replace_op(source, value);
-                    // Prefer parent-local index when the FieldDescr is wired
-                    // up to a SizeDescr; otherwise (lib-test fixtures or
-                    // descrs constructed without parent_descr) fall back to
-                    // the raw descr.index() so cache lookups stay stable.
                     let descr_idx = descr
                         .as_field_descr()
-                        .and_then(|field_descr| {
-                            field_descr
-                                .get_parent_descr()
-                                .map(|_| field_descr.index_in_parent() as u32)
-                        })
-                        .unwrap_or_else(|| descr.index());
+                        .map(|field_descr| field_descr.index_in_parent() as u32)
+                        .expect(
+                            "HeapOp.produce_op: field descrs must carry parent-local index parity",
+                        );
                     let obj_resolved = ctx.get_box_replacement(obj);
                     // shortpreamble.py:66-68: HeapOp.produce_op
                     // if g.getarg(0) in exported_infos:
