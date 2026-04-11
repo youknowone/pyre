@@ -371,14 +371,13 @@ impl IterOpcodeHandler for PyFrame {
                 self.locals_cells_stack_w[self.valuestackdepth - 1] = seq_iter;
                 return Ok(());
             }
-            // bytearray → list of int → seq_iter
-            // bytearrayobject.py W_BytearrayObject.descr_iter
-            if pyre_object::bytearrayobject::is_bytearray(iter) {
-                let len = pyre_object::bytearrayobject::w_bytearray_len(iter);
+            // bytes/bytearray → list of int → seq_iter
+            if pyre_object::bytesobject::is_bytes_like(iter) {
+                let len = pyre_object::bytesobject::bytes_like_len(iter);
                 let mut items = Vec::with_capacity(len);
                 for i in 0..len {
                     items.push(pyre_object::w_int_new(
-                        pyre_object::bytearrayobject::w_bytearray_getitem(iter, i) as i64,
+                        pyre_object::bytesobject::bytes_like_getitem(iter, i) as i64,
                     ));
                 }
                 let list = pyre_object::w_list_new(items);
@@ -600,7 +599,7 @@ impl ConstantOpcodeHandler for PyFrame {
     }
 
     fn bytes_constant(&mut self, value: &[u8]) -> Result<Self::Value, PyError> {
-        Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(value))
+        Ok(pyre_object::bytesobject::w_bytes_from_bytes(value))
     }
 
     fn code_constant(

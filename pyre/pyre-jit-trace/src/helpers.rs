@@ -462,7 +462,7 @@ pub trait TraceHelperAccess {
     }
 
     fn trace_bytes_constant(&mut self, value: &[u8]) -> Result<OpRef, PyError> {
-        let r = pyre_object::bytearrayobject::w_bytearray_from_bytes(value);
+        let r = pyre_object::bytesobject::w_bytes_from_bytes(value);
         self.with_trace_ctx(|ctx| Ok(ctx.const_ref(r as i64)))
     }
 

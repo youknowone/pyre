@@ -23,6 +23,9 @@ pub struct W_GeneratorObject {
     pub started: bool,
     /// Whether the generator is exhausted.
     pub exhausted: bool,
+    /// Whether the generator is currently executing (prevents reentrant calls).
+    /// PyPy: GeneratorIterator.running
+    pub running: bool,
 }
 
 pub fn w_generator_new(frame_ptr: *mut u8) -> PyObjectRef {
@@ -34,6 +37,7 @@ pub fn w_generator_new(frame_ptr: *mut u8) -> PyObjectRef {
         frame_ptr,
         started: false,
         exhausted: false,
+        running: false,
     });
     Box::into_raw(obj) as PyObjectRef
 }
@@ -61,4 +65,12 @@ pub unsafe fn w_generator_is_started(obj: PyObjectRef) -> bool {
 
 pub unsafe fn w_generator_set_started(obj: PyObjectRef) {
     (*(obj as *mut W_GeneratorObject)).started = true;
+}
+
+pub unsafe fn w_generator_is_running(obj: PyObjectRef) -> bool {
+    (*(obj as *const W_GeneratorObject)).running
+}
+
+pub unsafe fn w_generator_set_running(obj: PyObjectRef, val: bool) {
+    (*(obj as *mut W_GeneratorObject)).running = val;
 }

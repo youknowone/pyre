@@ -4,7 +4,8 @@
 
 use crate::{PyNamespace, make_builtin_function, make_module_builtin_function, namespace_store};
 use pyre_object::*;
-use sre_engine::engine::{Request, State, StrDrive};
+use sre_engine::engine::{Request, State};
+use sre_engine::string::StrDrive;
 use std::cell::RefCell;
 
 thread_local! {
@@ -85,7 +86,7 @@ pub fn init(ns: &mut PyNamespace) {
             if args.is_empty() {
                 return Ok(w_int_new(0));
             }
-            Ok(w_int_new(sre_engine::engine::lower_unicode(
+            Ok(w_int_new(sre_engine::string::lower_unicode(
                 unsafe { w_int_get_value(args[0]) } as u32
             ) as i64))
         }),
@@ -93,8 +94,10 @@ pub fn init(ns: &mut PyNamespace) {
     // Create SRE_Pattern and SRE_Match types.
     // PyPy: interp_sre.py W_SRE_Pattern, W_SRE_Match
     let pat_type = crate::typedef::make_builtin_type("re.Pattern", init_sre_pattern_type);
+    unsafe { pyre_object::typeobject::w_type_set_hasdict(pat_type, true) };
     SRE_PATTERN_TYPE.with(|t| *t.borrow_mut() = pat_type);
     let match_type = crate::typedef::make_builtin_type("re.Match", init_sre_match_type);
+    unsafe { pyre_object::typeobject::w_type_set_hasdict(match_type, true) };
     SRE_MATCH_TYPE.with(|t| *t.borrow_mut() = match_type);
 }
 
@@ -136,7 +139,20 @@ fn init_sre_pattern_type(ns: &mut PyNamespace) {
     );
 }
 
-fn init_sre_match_type(_ns: &mut PyNamespace) {}
+fn init_sre_match_type(ns: &mut PyNamespace) {
+    // Register methods on the type so `m.group()` goes through the descriptor
+    // protocol and binds `m` as the first positional argument. PyPy:
+    // interp_sre.W_SRE_Match typedef — same layout.
+    for (name, func) in [
+        ("group", sre_match_group as fn(&[PyObjectRef]) -> _),
+        ("groups", sre_match_groups),
+        ("start", sre_match_start),
+        ("end", sre_match_end),
+        ("span", sre_match_span),
+    ] {
+        namespace_store(ns, name, make_builtin_function(name, func));
+    }
+}
 
 /// _sre.compile(pattern, flags, code, groups, groupindex, indexgroup)
 fn sre_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -245,26 +261,26 @@ fn do_match(
     };
 
     let req = Request::new(s, pos, endpos, code, match_all);
-    let mut state = State::<&str>::default();
+    let mut state = State::default();
 
-    if search {
-        state.search(req);
+    let matched = if search {
+        state.search(req)
     } else {
-        state.pymatch(req);
-    }
+        state.py_match(&req)
+    };
 
-    if state.has_matched {
+    if matched {
         Ok(make_match(pat, string, &state, s))
     } else {
         Ok(w_none())
     }
 }
 
-fn make_match(pat: PyObjectRef, string: PyObjectRef, state: &State<&str>, s: &str) -> PyObjectRef {
+fn make_match(pat: PyObjectRef, string: PyObjectRef, state: &State, s: &str) -> PyObjectRef {
     let match_type = SRE_MATCH_TYPE.with(|t| *t.borrow());
     let m = w_instance_new(match_type);
     let start = state.start;
-    let end = state.string_position;
+    let end = state.cursor.position;
 
     crate::baseobjspace::ATTR_TABLE.with(|t| {
         let mut t = t.borrow_mut();
@@ -287,7 +303,7 @@ fn make_match(pat: PyObjectRef, string: PyObjectRef, state: &State<&str>, s: &st
     });
 
     // Group spans
-    let num_groups = state.marks.len() / 2;
+    let num_groups = state.marks.raw().len() / 2;
     let mut spans = vec![w_tuple_new(vec![
         w_int_new(start as i64),
         w_int_new(end as i64),
@@ -301,16 +317,6 @@ fn make_match(pat: PyObjectRef, string: PyObjectRef, state: &State<&str>, s: &st
         spans.push(span);
     }
     let _ = crate::baseobjspace::setattr(m, "_spans", w_list_new(spans));
-
-    for (name, func) in [
-        ("group", sre_match_group as fn(&[PyObjectRef]) -> _),
-        ("groups", sre_match_groups),
-        ("start", sre_match_start),
-        ("end", sre_match_end),
-        ("span", sre_match_span),
-    ] {
-        let _ = crate::baseobjspace::setattr(m, name, make_builtin_function(name, func));
-    }
     m
 }
 
@@ -335,11 +341,11 @@ fn sre_pattern_findall(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     let code = get_code(pat).ok_or_else(|| crate::PyError::type_error("no code"))?;
 
     let req = Request::new(s, 0, s.len(), code, false);
-    let state = State::<&str>::default();
+    let state = State::default();
     let mut results = Vec::new();
     let mut iter = sre_engine::engine::SearchIter { req, state };
     while iter.next().is_some() {
-        let matched = &s[iter.state.start..iter.state.string_position];
+        let matched = &s[iter.state.start..iter.state.cursor.position];
         results.push(w_str_new(matched));
     }
     Ok(w_list_new(results))
@@ -361,14 +367,14 @@ fn sre_pattern_sub(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     let code = get_code(pat).ok_or_else(|| crate::PyError::type_error("no code"))?;
 
     let req = Request::new(s, 0, s.len(), code, false);
-    let state = State::<&str>::default();
+    let state = State::default();
     let mut result = String::new();
     let mut last = 0;
     let mut iter = sre_engine::engine::SearchIter { req, state };
     while iter.next().is_some() {
         result.push_str(&s[last..iter.state.start]);
         result.push_str(r);
-        last = iter.state.string_position;
+        last = iter.state.cursor.position;
     }
     result.push_str(&s[last..]);
     Ok(w_str_new(&result))

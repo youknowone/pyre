@@ -388,6 +388,12 @@ pub fn init_typeobjects() {
         new_typeobject_with_base("bytearray", init_bytearray_type, object_type) as usize,
     );
 
+    // bytes — PyPy: bytesobject.py W_BytesObject, bases=(object,)
+    reg.insert(
+        &pyre_object::bytesobject::BYTES_TYPE as *const PyType as usize,
+        new_typeobject_with_base("bytes", init_bytes_type, object_type) as usize,
+    );
+
     // set / frozenset — PyPy: setobject.py, bases=(object,).
     // Both carry their own layout typedef so check_user_subclass's layout
     // safety check (typeobject.py:520-523) can reject foreign-layout
@@ -670,7 +676,10 @@ fn str_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     }
     let s_owned = unsafe { pyre_object::w_str_get_value(value) }.to_string();
     let obj = pyre_object::w_str_new(&s_owned);
-    let _ = crate::baseobjspace::setattr(obj, "__class__", cls);
+    // Tag with subclass type so type(obj) returns cls.
+    unsafe {
+        (*(obj as *mut pyre_object::PyObject)).w_class = cls;
+    }
     Ok(obj)
 }
 
@@ -2482,8 +2491,8 @@ fn init_int_type(ns: &mut PyNamespace) {
                 pyre_object::w_str_new("big")
             };
             let bytes: Vec<u8> = unsafe {
-                if pyre_object::bytearrayobject::is_bytearray(data_arg) {
-                    pyre_object::bytearrayobject::w_bytearray_data(data_arg).to_vec()
+                if pyre_object::bytesobject::is_bytes_like(data_arg) {
+                    pyre_object::bytesobject::bytes_like_data(data_arg).to_vec()
                 } else if pyre_object::is_str(data_arg) {
                     pyre_object::w_str_get_value(data_arg).as_bytes().to_vec()
                 } else {
@@ -2743,8 +2752,8 @@ fn bytearray_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
             let n = pyre_object::w_int_get_value(arg).max(0) as usize;
             return Ok(pyre_object::bytearrayobject::w_bytearray_new(n));
         }
-        if pyre_object::bytearrayobject::is_bytearray(arg) {
-            let data = pyre_object::bytearrayobject::w_bytearray_data(arg);
+        if pyre_object::bytesobject::is_bytes_like(arg) {
+            let data = pyre_object::bytesobject::bytes_like_data(arg);
             return Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(data));
         }
         if pyre_object::is_str(arg) {
@@ -2766,6 +2775,48 @@ fn bytearray_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
         return Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(&buf));
     }
     Ok(pyre_object::bytearrayobject::w_bytearray_new(0))
+}
+
+/// PyPy: bytesobject.py W_BytesObject.typedef
+fn init_bytes_type(ns: &mut PyNamespace) {
+    namespace_store(ns, "__new__", make_new_descr(bytes_descr_new));
+    // bytes methods are mostly shared with bytearray — add as needed.
+}
+
+/// `bytes.__new__(cls, *args)` — PyPy: bytesobject.py descr__new__
+fn bytes_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    // args[0] = cls (ignored for now)
+    // bytes()           → empty
+    // bytes(int)        → zero-filled
+    // bytes(bytes-like) → copy
+    // bytes(str)        → UTF-8 encode
+    // bytes(iterable)   → collect bytes
+    if args.len() <= 1 {
+        return Ok(pyre_object::bytesobject::w_bytes_empty());
+    }
+    let arg = args[1];
+    unsafe {
+        if pyre_object::is_int(arg) {
+            let n = pyre_object::w_int_get_value(arg).max(0) as usize;
+            return Ok(pyre_object::bytesobject::w_bytes_from_bytes(&vec![0u8; n]));
+        }
+        if pyre_object::bytesobject::is_bytes_like(arg) {
+            let data = pyre_object::bytesobject::bytes_like_data(arg);
+            return Ok(pyre_object::bytesobject::w_bytes_from_bytes(data));
+        }
+        if pyre_object::is_str(arg) {
+            let s = pyre_object::w_str_get_value(arg);
+            return Ok(pyre_object::bytesobject::w_bytes_from_bytes(s.as_bytes()));
+        }
+    }
+    // Iterable of ints
+    let items = crate::builtins::collect_iterable(arg)?;
+    let mut buf = Vec::with_capacity(items.len());
+    for item in items {
+        let val = unsafe { pyre_object::w_int_get_value(item) };
+        buf.push(val as u8);
+    }
+    Ok(pyre_object::bytesobject::w_bytes_from_bytes(&buf))
 }
 
 /// PyPy: bytearrayobject.py W_BytearrayObject.typedef
@@ -2799,9 +2850,9 @@ fn init_bytearray_type(ns: &mut PyNamespace) {
             let a = args[0];
             let b = args[1];
             unsafe {
-                let a_data = pyre_object::bytearrayobject::w_bytearray_data(a);
-                let b_data = if pyre_object::bytearrayobject::is_bytearray(b) {
-                    pyre_object::bytearrayobject::w_bytearray_data(b).to_vec()
+                let a_data = pyre_object::bytesobject::bytes_like_data(a);
+                let b_data = if pyre_object::bytesobject::is_bytes_like(b) {
+                    pyre_object::bytesobject::bytes_like_data(b).to_vec()
                 } else {
                     vec![]
                 };
@@ -2821,8 +2872,8 @@ fn init_bytearray_type(ns: &mut PyNamespace) {
             let ba = args[0];
             let other = args[1];
             unsafe {
-                if pyre_object::bytearrayobject::is_bytearray(other) {
-                    let data = pyre_object::bytearrayobject::w_bytearray_data(other).to_vec();
+                if pyre_object::bytesobject::is_bytes_like(other) {
+                    let data = pyre_object::bytesobject::bytes_like_data(other).to_vec();
                     pyre_object::bytearrayobject::w_bytearray_extend(ba, &data);
                 }
             }
@@ -2837,12 +2888,10 @@ fn init_bytearray_type(ns: &mut PyNamespace) {
             let ba = args[0];
             let table = args[1];
             unsafe {
-                let data = pyre_object::bytearrayobject::w_bytearray_data(ba);
-                // Translation table may be bytes/bytearray, or str (because
-                // pyre treats `b'...'` literals as str). Accept both.
+                let data = pyre_object::bytesobject::bytes_like_data(ba);
                 let table_bytes_owned;
-                let table_data: &[u8] = if pyre_object::bytearrayobject::is_bytearray(table) {
-                    pyre_object::bytearrayobject::w_bytearray_data(table)
+                let table_data: &[u8] = if pyre_object::bytesobject::is_bytes_like(table) {
+                    pyre_object::bytesobject::bytes_like_data(table)
                 } else if pyre_object::is_str(table) {
                     table_bytes_owned = pyre_object::w_str_get_value(table).as_bytes();
                     table_bytes_owned

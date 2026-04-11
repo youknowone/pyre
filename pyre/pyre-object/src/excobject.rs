@@ -32,6 +32,7 @@ pub enum ExcKind {
     /// referent has been collected — pypy/module/_weakref/interp__weakref.py:347
     /// `oefmt(space.w_ReferenceError, "weakly referenced object no longer exists")`.
     ReferenceError = 16,
+    GeneratorExit = 17,
 }
 
 /// Layout: `[ob_type: *const PyType | kind: ExcKind | message: *mut String]`
@@ -106,6 +107,7 @@ pub fn exc_kind_name(kind: ExcKind) -> &'static str {
         ExcKind::NotImplementedError => "NotImplementedError",
         ExcKind::AssertionError => "AssertionError",
         ExcKind::ReferenceError => "ReferenceError",
+        ExcKind::GeneratorExit => "GeneratorExit",
     }
 }
 
@@ -117,7 +119,7 @@ pub fn exc_kind_matches(kind: ExcKind, type_name: &str) -> bool {
         return true;
     }
     if type_name == "Exception" {
-        return kind != ExcKind::BaseException;
+        return !matches!(kind, ExcKind::BaseException | ExcKind::GeneratorExit);
     }
     if type_name == "ArithmeticError" {
         return matches!(
@@ -148,6 +150,7 @@ pub fn exc_kind_from_name(name: &str) -> Option<ExcKind> {
         "NotImplementedError" => Some(ExcKind::NotImplementedError),
         "AssertionError" => Some(ExcKind::AssertionError),
         "ReferenceError" => Some(ExcKind::ReferenceError),
+        "GeneratorExit" => Some(ExcKind::GeneratorExit),
         _ => None,
     }
 }

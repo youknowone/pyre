@@ -95,11 +95,9 @@ pub fn install_default_builtins(namespace: &mut PyNamespace) {
     namespace.get_or_insert_with("bytearray", || {
         crate::typedef::gettypeobject(&pyre_object::bytearrayobject::BYTEARRAY_TYPE)
     });
-    // pyre lacks a separate bytes type — alias `bytes` to bytearray so
-    // `isinstance(x, bytes)` succeeds for byte literals (which are also
-    // materialised as bytearray; see ConstantData::Bytes handling).
+    // bytesobject.py W_BytesObject — immutable bytes type.
     namespace.get_or_insert_with("bytes", || {
-        crate::typedef::gettypeobject(&pyre_object::bytearrayobject::BYTEARRAY_TYPE)
+        crate::typedef::gettypeobject(&pyre_object::bytesobject::BYTES_TYPE)
     });
     namespace.get_or_insert_with("slice", || {
         // The slice type object, for isinstance(x, slice) checks.
@@ -129,7 +127,7 @@ pub fn install_default_builtins(namespace: &mut PyNamespace) {
     // backing bytearray on the instance; .cast('I') and .tolist() do the
     // little-endian unpack inline.
     namespace.get_or_insert_with("memoryview", || {
-        crate::typedef::make_builtin_type("memoryview", |ns| {
+        let tp = crate::typedef::make_builtin_type("memoryview", |ns| {
             crate::namespace_store(
                 ns,
                 "__new__",
@@ -178,8 +176,8 @@ pub fn install_default_builtins(namespace: &mut PyNamespace) {
                     let buf = crate::baseobjspace::getattr(mv, "__pyre_buf__")?;
                     let itemsize_obj = crate::baseobjspace::getattr(mv, "__pyre_itemsize__")?;
                     let itemsize = unsafe { pyre_object::w_int_get_value(itemsize_obj) } as usize;
-                    let data = if unsafe { pyre_object::bytearrayobject::is_bytearray(buf) } {
-                        unsafe { pyre_object::bytearrayobject::w_bytearray_data(buf) }
+                    let data = if unsafe { pyre_object::bytesobject::is_bytes_like(buf) } {
+                        unsafe { pyre_object::bytesobject::bytes_like_data(buf) }
                     } else {
                         return Ok(w_list_new(vec![]));
                     };
@@ -204,8 +202,8 @@ pub fn install_default_builtins(namespace: &mut PyNamespace) {
                     let buf = crate::baseobjspace::getattr(mv, "__pyre_buf__")?;
                     let itemsize_obj = crate::baseobjspace::getattr(mv, "__pyre_itemsize__")?;
                     let itemsize = unsafe { pyre_object::w_int_get_value(itemsize_obj) } as usize;
-                    let n = if unsafe { pyre_object::bytearrayobject::is_bytearray(buf) } {
-                        unsafe { pyre_object::bytearrayobject::w_bytearray_len(buf) }
+                    let n = if unsafe { pyre_object::bytesobject::is_bytes_like(buf) } {
+                        unsafe { pyre_object::bytesobject::bytes_like_len(buf) }
                     } else {
                         0
                     };
@@ -226,7 +224,10 @@ pub fn install_default_builtins(namespace: &mut PyNamespace) {
                     pyre_object::PY_NULL,
                 ),
             );
-        })
+        });
+        // Store per-instance __pyre_buf__/__pyre_fmt__/__pyre_itemsize__ slots.
+        unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
+        tp
     });
     namespace.get_or_insert_with("globals", || {
         make_module_builtin_function("globals", builtin_globals)
@@ -1234,8 +1235,8 @@ pub(crate) fn builtin_int(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             10
         };
         // bytearray/bytes input is treated like a string of ASCII digits.
-        if pyre_object::bytearrayobject::is_bytearray(obj) {
-            let data = pyre_object::bytearrayobject::w_bytearray_data(obj);
+        if pyre_object::bytesobject::is_bytes_like(obj) {
+            let data = pyre_object::bytesobject::bytes_like_data(obj);
             let s_owned = String::from_utf8_lossy(data).into_owned();
             let s = s_owned.trim();
             let cleaned: String = s.chars().filter(|&c| c != '_').collect();
@@ -1448,10 +1449,10 @@ pub(crate) fn builtin_dict_ctor(args: &[PyObjectRef]) -> Result<PyObjectRef, cra
     if args.is_empty() {
         return Ok(w_dict_new());
     }
+    let src = args[0];
     unsafe {
-        if is_dict(args[0]) {
+        if is_dict(src) {
             // PyPy: descr_init → shallow copy when first arg is a dict
-            let src = args[0];
             let dict = w_dict_new();
             for (k, v) in pyre_object::w_dict_items(src) {
                 w_dict_store(dict, k, v);
@@ -1459,9 +1460,21 @@ pub(crate) fn builtin_dict_ctor(args: &[PyObjectRef]) -> Result<PyObjectRef, cra
             return Ok(dict);
         }
     }
+    // PyPy: dictobject.py update1 → update1_dict_dict (mapping) or update1_pairs (seq)
+    //
+    // Mapping protocol: if arg has `keys()`, iterate keys and use __getitem__.
+    // This handles dict subclasses (e.g. enum.EnumDict) where is_dict() is false.
+    if let Ok(keys_method) = crate::baseobjspace::getattr(src, "keys") {
+        let dict = w_dict_new();
+        let keys_obj = crate::call_function(keys_method, &[]);
+        let keys = collect_iterable(keys_obj)?;
+        for key in keys {
+            let val = crate::baseobjspace::getitem(src, key)?;
+            unsafe { w_dict_store(dict, key, val) };
+        }
+        return Ok(dict);
+    }
     // Construct from iterable of (key, value) pairs.
-    // PyPy: dictobject.py W_DictMultiObject.descr_init → update1_seq
-    let src = args[0];
     let dict = w_dict_new();
     let items = collect_iterable(src)?;
     for pair in items {
@@ -1659,9 +1672,8 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     let source_str = unsafe {
         if pyre_object::is_str(source) {
             pyre_object::w_str_get_value(source).to_string()
-        } else if pyre_object::bytearrayobject::is_bytearray(source) {
-            String::from_utf8_lossy(pyre_object::bytearrayobject::w_bytearray_data(source))
-                .into_owned()
+        } else if pyre_object::bytesobject::is_bytes_like(source) {
+            String::from_utf8_lossy(pyre_object::bytesobject::bytes_like_data(source)).into_owned()
         } else {
             return Err(crate::PyError::type_error(
                 "compile() arg 1 must be a string or bytes",

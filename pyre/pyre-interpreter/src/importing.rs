@@ -87,6 +87,7 @@ pub fn install_builtin_modules() {
     register_builtin_module("importlib.util", init_importlib_util);
     register_builtin_module("importlib.abc", init_importlib_abc);
     register_builtin_module("_signal", init_signal_stub);
+    register_builtin_module("atexit", init_atexit);
     // _opcode_metadata.py exists in the stdlib; load the real file instead.
     for name in &[
         "_string",
@@ -96,7 +97,6 @@ pub fn install_builtin_modules() {
         "_tokenize",
         "_typing",
         "_bisect",
-        "atexit",
         "_struct",
         "binascii",
         "_hashlib",
@@ -131,6 +131,40 @@ pub fn install_builtin_modules() {
 
 /// Empty module initializer for C-extension stubs.
 fn empty_module_init(_ns: &mut PyNamespace) {}
+
+/// atexit stub — PyPy: pypy/module/atexit/. Single-threaded pyre doesn't
+/// actually run the registered callbacks on shutdown yet; `register` accepts
+/// any callable and returns it so `@atexit.register` decorators work.
+fn init_atexit(ns: &mut PyNamespace) {
+    crate::namespace_store(
+        ns,
+        "register",
+        crate::make_builtin_function("register", |args| {
+            // Return the function so `@atexit.register` decorator form works.
+            Ok(args.first().copied().unwrap_or(pyre_object::w_none()))
+        }),
+    );
+    crate::namespace_store(
+        ns,
+        "unregister",
+        crate::make_builtin_function("unregister", |_| Ok(pyre_object::w_none())),
+    );
+    crate::namespace_store(
+        ns,
+        "_run_exitfuncs",
+        crate::make_builtin_function("_run_exitfuncs", |_| Ok(pyre_object::w_none())),
+    );
+    crate::namespace_store(
+        ns,
+        "_clear",
+        crate::make_builtin_function("_clear", |_| Ok(pyre_object::w_none())),
+    );
+    crate::namespace_store(
+        ns,
+        "_ncallbacks",
+        crate::make_builtin_function("_ncallbacks", |_| Ok(pyre_object::w_int_new(0))),
+    );
+}
 
 /// _signal module stub — PyPy: pypy/module/signal/. Provides the signal()
 /// function and SIG_DFL/SIG_IGN constants that signal.py wraps.
@@ -253,17 +287,46 @@ fn init_itertools(ns: &mut PyNamespace) {
         "starmap",
         crate::make_builtin_function("starmap", |_| Ok(pyre_object::w_list_new(vec![]))),
     );
-    // count(start=0, step=1)
+    // count(start=0, step=1) — PyPy: W_Count___new__
+    //
+    //     def W_Count___new__(space, w_subtype, w_start=0, w_step=1):
+    //         return W_Count(space, w_start, w_step)
     crate::namespace_store(
         ns,
         "count",
-        crate::make_builtin_function("count", |_| Ok(pyre_object::w_none())),
+        crate::make_builtin_function("count", |args| {
+            let w_start = args.first().copied().unwrap_or(pyre_object::w_int_new(0));
+            let w_step = args.get(1).copied().unwrap_or(pyre_object::w_int_new(1));
+            Ok(pyre_object::itertoolsmodule::w_count_new(w_start, w_step))
+        }),
     );
-    // repeat
+    // repeat(obj, times=None) — PyPy: W_Repeat___new__
+    //
+    //     def W_Repeat___new__(space, w_subtype, w_obj, w_times=None):
+    //         return W_Repeat(space, w_obj, w_times)
     crate::namespace_store(
         ns,
         "repeat",
-        crate::make_builtin_function("repeat", |_| Ok(pyre_object::w_none())),
+        crate::make_builtin_function("repeat", |args| {
+            if args.is_empty() {
+                return Err(crate::PyError::type_error(
+                    "repeat() missing 'object' argument",
+                ));
+            }
+            let w_obj = args[0];
+            let w_times = if args.len() >= 2 {
+                unsafe {
+                    if pyre_object::is_int(args[1]) {
+                        Some(pyre_object::w_int_get_value(args[1]))
+                    } else {
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            Ok(pyre_object::itertoolsmodule::w_repeat_new(w_obj, w_times))
+        }),
     );
     // islice
     crate::namespace_store(
@@ -585,54 +648,166 @@ fn init_functools(ns: &mut PyNamespace) {
     );
 }
 
-/// Dummy lock methods — acquire/release no-op, __enter__/__exit__ for `with`.
-/// PyPy: pypy/module/thread/os_lock.py W_Lock / W_RLock
+/// Lock methods — PyPy: pypy/module/thread/os_lock.py W_Lock / W_RLock
+///
+/// Single-threaded pyre: state lives in the instance dict as `_locked_count`.
+/// Methods increment/decrement this counter so Condition/RLock ownership
+/// checks see the correct state.
 fn init_lock_type(ns: &mut PyNamespace) {
     crate::namespace_store(
         ns,
         "__enter__",
         crate::make_builtin_function("__enter__", |args| {
-            Ok(if args.is_empty() {
-                pyre_object::w_none()
-            } else {
-                args[0]
-            })
+            if let Some(&obj) = args.first() {
+                lock_acquire_impl(obj)?;
+            }
+            Ok(args.first().copied().unwrap_or(pyre_object::w_none()))
         }),
     );
     crate::namespace_store(
         ns,
         "__exit__",
-        crate::make_builtin_function("__exit__", |_| Ok(pyre_object::w_bool_from(false))),
+        crate::make_builtin_function("__exit__", |args| {
+            if let Some(&obj) = args.first() {
+                lock_release_impl(obj)?;
+            }
+            Ok(pyre_object::w_bool_from(false))
+        }),
     );
+    // descr_lock_acquire — PyPy: os_lock.Lock.descr_lock_acquire
     crate::namespace_store(
         ns,
         "acquire",
-        crate::make_builtin_function("acquire", |_| Ok(pyre_object::w_bool_from(true))),
+        crate::make_builtin_function("acquire", |args| {
+            let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+            lock_acquire_impl(obj)?;
+            Ok(pyre_object::w_bool_from(true))
+        }),
     );
+    // descr_lock_release — PyPy: os_lock.Lock.descr_lock_release
     crate::namespace_store(
         ns,
         "release",
-        crate::make_builtin_function("release", |_| Ok(pyre_object::w_none())),
+        crate::make_builtin_function("release", |args| {
+            let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+            lock_release_impl(obj)?;
+            Ok(pyre_object::w_none())
+        }),
     );
+    // descr_lock_locked — PyPy: os_lock.Lock.descr_lock_locked
     crate::namespace_store(
         ns,
         "locked",
-        crate::make_builtin_function("locked", |_| Ok(pyre_object::w_bool_from(false))),
+        crate::make_builtin_function("locked", |args| {
+            let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+            Ok(pyre_object::w_bool_from(lock_count(obj) > 0))
+        }),
     );
+    // _is_owned — used by RLock/Condition in threading.py
     crate::namespace_store(
         ns,
         "_is_owned",
-        crate::make_builtin_function("_is_owned", |_| Ok(pyre_object::w_bool_from(false))),
+        crate::make_builtin_function("_is_owned", |args| {
+            let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+            Ok(pyre_object::w_bool_from(lock_count(obj) > 0))
+        }),
     );
+    // _at_fork_reinit — PyPy: os_lock.Lock._at_fork_reinit (reset to unlocked)
+    crate::namespace_store(
+        ns,
+        "_at_fork_reinit",
+        crate::make_builtin_function("_at_fork_reinit", |args| {
+            if let Some(&obj) = args.first() {
+                lock_set_count(obj, 0);
+            }
+            Ok(pyre_object::w_none())
+        }),
+    );
+}
+
+/// Read the lock's internal count. Single-threaded: 0 = unlocked, >0 = locked.
+fn lock_count(obj: pyre_object::PyObjectRef) -> i64 {
+    let w_dict = crate::baseobjspace::getdict(obj);
+    if w_dict.is_null() {
+        return 0;
+    }
+    if let Some(v) = unsafe { pyre_object::w_dict_getitem_str(w_dict, "_locked_count") } {
+        unsafe {
+            if pyre_object::is_int(v) {
+                return pyre_object::w_int_get_value(v);
+            }
+        }
+    }
+    0
+}
+
+fn lock_set_count(obj: pyre_object::PyObjectRef, v: i64) {
+    let w_dict = crate::baseobjspace::getdict(obj);
+    if w_dict.is_null() {
+        return;
+    }
+    unsafe {
+        pyre_object::w_dict_setitem_str(w_dict, "_locked_count", pyre_object::w_int_new(v));
+    }
+}
+
+fn lock_acquire_impl(obj: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
+    lock_set_count(obj, lock_count(obj) + 1);
+    Ok(())
+}
+
+fn lock_release_impl(obj: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
+    let cur = lock_count(obj);
+    if cur <= 0 {
+        return Err(crate::PyError::runtime_error("release unlocked lock"));
+    }
+    lock_set_count(obj, cur - 1);
+    Ok(())
 }
 
 thread_local! {
     static LOCK_TYPE_OBJ: std::cell::OnceCell<PyObjectRef> = const { std::cell::OnceCell::new() };
+    static THREAD_HANDLE_TYPE_OBJ: std::cell::OnceCell<PyObjectRef> = const { std::cell::OnceCell::new() };
 }
 
 fn lock_type() -> PyObjectRef {
-    LOCK_TYPE_OBJ
-        .with(|c| *c.get_or_init(|| crate::typedef::make_builtin_type("lock", init_lock_type)))
+    LOCK_TYPE_OBJ.with(|c| {
+        *c.get_or_init(|| {
+            let tp = crate::typedef::make_builtin_type("lock", init_lock_type);
+            // Store per-instance `_locked_count` in the instance dict.
+            unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
+            tp
+        })
+    })
+}
+
+fn thread_handle_type() -> PyObjectRef {
+    THREAD_HANDLE_TYPE_OBJ.with(|c| {
+        *c.get_or_init(|| {
+            crate::typedef::make_builtin_type("_ThreadHandle", |ns| {
+                crate::namespace_store(
+                    ns,
+                    "is_done",
+                    crate::make_builtin_function("is_done", |_| Ok(pyre_object::w_bool_from(true))),
+                );
+                crate::namespace_store(
+                    ns,
+                    "join",
+                    crate::make_builtin_function("join", |_| Ok(pyre_object::w_none())),
+                );
+                crate::namespace_store(
+                    ns,
+                    "set_result",
+                    crate::make_builtin_function("set_result", |_| Ok(pyre_object::w_none())),
+                );
+                crate::namespace_store(
+                    ns,
+                    "_set_done",
+                    crate::make_builtin_function("_set_done", |_| Ok(pyre_object::w_none())),
+                );
+            })
+        })
+    })
 }
 
 /// _thread stub
@@ -663,6 +838,93 @@ fn init_thread(ns: &mut PyNamespace) {
     );
     crate::namespace_store(ns, "TIMEOUT_MAX", pyre_object::w_float_new(f64::MAX));
     crate::namespace_store(ns, "error", crate::typedef::w_object());
+    crate::namespace_store(
+        ns,
+        "start_joinable_thread",
+        crate::make_builtin_function("start_joinable_thread", |_| Ok(pyre_object::w_int_new(0))),
+    );
+    crate::namespace_store(
+        ns,
+        "_set_sentinel",
+        crate::make_builtin_function("_set_sentinel", |_| {
+            Ok(pyre_object::w_instance_new(lock_type()))
+        }),
+    );
+    crate::namespace_store(
+        ns,
+        "stack_size",
+        crate::make_builtin_function("stack_size", |_| Ok(pyre_object::w_int_new(0))),
+    );
+    crate::namespace_store(
+        ns,
+        "_is_main_interpreter",
+        crate::make_builtin_function("_is_main_interpreter", |_| {
+            Ok(pyre_object::w_bool_from(true))
+        }),
+    );
+    crate::namespace_store(
+        ns,
+        "daemon_threads_allowed",
+        crate::make_builtin_function("daemon_threads_allowed", |_| {
+            Ok(pyre_object::w_bool_from(true))
+        }),
+    );
+    crate::namespace_store(
+        ns,
+        "_shutdown",
+        crate::make_builtin_function("_shutdown", |_| Ok(pyre_object::w_none())),
+    );
+    // _make_thread_handle / _ThreadHandle — threading.py:40-41
+    crate::namespace_store(ns, "_ThreadHandle", thread_handle_type());
+    crate::namespace_store(
+        ns,
+        "_make_thread_handle",
+        crate::make_builtin_function("_make_thread_handle", |_| {
+            Ok(pyre_object::w_instance_new(thread_handle_type()))
+        }),
+    );
+    // _get_main_thread_ident — threading.py:43
+    crate::namespace_store(
+        ns,
+        "_get_main_thread_ident",
+        crate::make_builtin_function("_get_main_thread_ident", |_| Ok(pyre_object::w_int_new(1))),
+    );
+    // get_native_id — threading.py:46
+    crate::namespace_store(
+        ns,
+        "get_native_id",
+        crate::make_builtin_function("get_native_id", |_| Ok(pyre_object::w_int_new(1))),
+    );
+    // set_name — threading.py:52
+    crate::namespace_store(
+        ns,
+        "set_name",
+        crate::make_builtin_function("set_name", |_| Ok(pyre_object::w_none())),
+    );
+    // _excepthook — threading.py:1262
+    crate::namespace_store(
+        ns,
+        "_excepthook",
+        crate::make_builtin_function("_excepthook", |_| Ok(pyre_object::w_none())),
+    );
+    // _local — PyPy: pypy/module/thread/os_local.py Local
+    // Thread-local data. Single-threaded: equivalent to a plain object with dict.
+    crate::namespace_store(ns, "_local", local_type());
+}
+
+fn local_type() -> PyObjectRef {
+    thread_local! {
+        static LOCAL_TYPE_OBJ: std::cell::OnceCell<PyObjectRef> = const { std::cell::OnceCell::new() };
+    }
+    LOCAL_TYPE_OBJ.with(|c| {
+        *c.get_or_init(|| {
+            let tp = crate::typedef::make_builtin_type("_local", |_ns| {});
+            // Instances need __dict__ for per-thread attribute storage.
+            // PyPy: os_local.py Local has getdict(space) → w_dict
+            unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
+            tp
+        })
+    })
 }
 
 /// posix stub — PyPy: pypy/module/posix/ interp_posix.py
@@ -921,7 +1183,7 @@ fn init_posix(ns: &mut PyNamespace) {
         crate::make_builtin_function("fspath", |args| {
             let arg = args.first().copied().unwrap_or(pyre_object::w_none());
             unsafe {
-                if pyre_object::is_str(arg) || pyre_object::bytearrayobject::is_bytearray(arg) {
+                if pyre_object::is_str(arg) || pyre_object::bytesobject::is_bytes_like(arg) {
                     return Ok(arg);
                 }
             }

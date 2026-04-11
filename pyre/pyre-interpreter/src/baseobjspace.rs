@@ -728,16 +728,20 @@ pub fn add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         if is_tuple(a) && is_tuple(b) {
             return tuple_concat(a, b);
         }
-        if pyre_object::bytearrayobject::is_bytearray(a)
-            && pyre_object::bytearrayobject::is_bytearray(b)
+        if pyre_object::bytesobject::is_bytes_like(a) && pyre_object::bytesobject::is_bytes_like(b)
         {
-            let a_data = pyre_object::bytearrayobject::w_bytearray_data(a);
-            let b_data = pyre_object::bytearrayobject::w_bytearray_data(b);
+            let a_data = pyre_object::bytesobject::bytes_like_data(a);
+            let b_data = pyre_object::bytesobject::bytes_like_data(b);
             let mut result = a_data.to_vec();
             result.extend_from_slice(b_data);
-            return Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(
-                &result,
-            ));
+            // bytes + bytes → bytes; anything with bytearray → bytearray
+            return Ok(
+                if pyre_object::bytesobject::is_bytes(a) && pyre_object::bytesobject::is_bytes(b) {
+                    pyre_object::bytesobject::w_bytes_from_bytes(&result)
+                } else {
+                    pyre_object::bytearrayobject::w_bytearray_from_bytes(&result)
+                },
+            );
         }
         // Instance dunder dispatch: __add__
         if let Some(result) = try_instance_binop(a, b, "__add__") {
@@ -832,17 +836,21 @@ pub fn mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         if is_int(a) && is_tuple(b) {
             return mul(b, a);
         }
-        // bytearray * int — bytearrayobject.py descr_mul
-        if pyre_object::bytearrayobject::is_bytearray(a) && is_int(b) {
-            let data = pyre_object::bytearrayobject::w_bytearray_data(a);
+        // bytes/bytearray * int — bytesobject.py descr_mul / bytearrayobject.py descr_mul
+        if pyre_object::bytesobject::is_bytes_like(a) && is_int(b) {
+            let data = pyre_object::bytesobject::bytes_like_data(a);
             let n = w_int_get_value(b).max(0) as usize;
             let mut buf = Vec::with_capacity(data.len() * n);
             for _ in 0..n {
                 buf.extend_from_slice(data);
             }
-            return Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(&buf));
+            return Ok(if pyre_object::bytesobject::is_bytes(a) {
+                pyre_object::bytesobject::w_bytes_from_bytes(&buf)
+            } else {
+                pyre_object::bytearrayobject::w_bytearray_from_bytes(&buf)
+            });
         }
-        if is_int(a) && pyre_object::bytearrayobject::is_bytearray(b) {
+        if is_int(a) && pyre_object::bytesobject::is_bytes_like(b) {
             return mul(b, a);
         }
         if let Some(result) = try_instance_binop(a, b, "__mul__") {
@@ -2308,24 +2316,26 @@ pub fn getitem(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
             } else {
                 Err(PyError::type_error("string indices must be integers"))
             }
-        } else if pyre_object::bytearrayobject::is_bytearray(obj) {
+        } else if pyre_object::bytesobject::is_bytes_like(obj) {
+            let is_bytes = pyre_object::bytesobject::is_bytes(obj);
             if is_int(index) {
                 let idx = w_int_get_value(index);
-                let len = pyre_object::bytearrayobject::w_bytearray_len(obj) as i64;
+                let len = pyre_object::bytesobject::bytes_like_len(obj) as i64;
                 let actual = if idx < 0 { len + idx } else { idx };
                 if actual >= 0 && actual < len {
-                    return Ok(w_int_new(
-                        pyre_object::bytearrayobject::w_bytearray_getitem(obj, actual as usize)
-                            as i64,
-                    ));
+                    return Ok(w_int_new(pyre_object::bytesobject::bytes_like_getitem(
+                        obj,
+                        actual as usize,
+                    ) as i64));
                 }
+                let name = if is_bytes { "bytes" } else { "bytearray" };
                 return Err(PyError::new(
                     PyErrorKind::IndexError,
-                    "bytearray index out of range",
+                    format!("{name} index out of range"),
                 ));
             }
             if is_slice(index) {
-                let len = pyre_object::bytearrayobject::w_bytearray_len(obj) as i64;
+                let len = pyre_object::bytesobject::bytes_like_len(obj) as i64;
                 let start = w_slice_get_start(index);
                 let stop = w_slice_get_stop(index);
                 let step = w_slice_get_step(index);
@@ -2351,7 +2361,7 @@ pub fn getitem(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
                 if step_val > 0 {
                     while i < e_val {
                         if i >= 0 && i < len {
-                            result.push(pyre_object::bytearrayobject::w_bytearray_getitem(
+                            result.push(pyre_object::bytesobject::bytes_like_getitem(
                                 obj, i as usize,
                             ));
                         }
@@ -2360,18 +2370,23 @@ pub fn getitem(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
                 } else if step_val < 0 {
                     while i > e_val {
                         if i >= 0 && i < len {
-                            result.push(pyre_object::bytearrayobject::w_bytearray_getitem(
+                            result.push(pyre_object::bytesobject::bytes_like_getitem(
                                 obj, i as usize,
                             ));
                         }
                         i += step_val;
                     }
                 }
-                return Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(
-                    &result,
-                ));
+                return Ok(if is_bytes {
+                    pyre_object::bytesobject::w_bytes_from_bytes(&result)
+                } else {
+                    pyre_object::bytearrayobject::w_bytearray_from_bytes(&result)
+                });
             }
-            return Err(PyError::type_error("bytearray indices must be integers"));
+            let name = if is_bytes { "bytes" } else { "bytearray" };
+            return Err(PyError::type_error(format!(
+                "{name} indices must be integers"
+            )));
         } else if is_type(obj) {
             // Python 3.9+ generic subscript: type[X] → __class_getitem__(X)
             // PyPy: typeobject.py type.__class_getitem__
@@ -2666,9 +2681,9 @@ pub fn len(obj: PyObjectRef) -> PyResult {
             Ok(w_int_new(pyre_object::w_set_len(obj) as i64))
         } else if is_str(obj) {
             Ok(w_int_new(w_str_len(obj) as i64))
-        } else if pyre_object::bytearrayobject::is_bytearray(obj) {
+        } else if pyre_object::bytesobject::is_bytes_like(obj) {
             Ok(w_int_new(
-                pyre_object::bytearrayobject::w_bytearray_len(obj) as i64,
+                pyre_object::bytesobject::bytes_like_len(obj) as i64
             ))
         } else if is_instance(obj) {
             // Instance __len__ — descroperation.py len → space.lookup(obj, '__len__')
@@ -2901,11 +2916,45 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
     }
 
     // Generator/coroutine methods — PyPy: generator.py GeneratorIterator
+    //
+    // Return W_Method(func, gen) so the generator is passed as args[0].
     unsafe {
         if pyre_object::generatorobject::is_generator(obj) {
+            let (sname, func): (&str, fn(&[PyObjectRef]) -> PyResult) = match name {
+                "send" => ("send", generator_send_method),
+                "throw" => ("throw", generator_throw_method),
+                "close" => ("close", generator_close_method),
+                "__next__" => ("__next__", generator_next_method),
+                "__iter__" => return Ok(obj),
+                _ => ("", generator_next_method), // sentinel — won't match
+            };
+            if !sname.is_empty() {
+                let func_obj = crate::make_builtin_function(sname, func);
+                return Ok(pyre_object::w_method_new(
+                    func_obj,
+                    obj,
+                    pyre_object::PY_NULL,
+                ));
+            }
+        }
+    }
+
+    // itertools.count / itertools.repeat methods — PyPy interp_itertools.py
+    // Expose `__next__` and `__iter__` so `_count(1).__next__` and
+    // `iter(counter)` work.
+    unsafe {
+        if pyre_object::itertoolsmodule::is_count(obj)
+            || pyre_object::itertoolsmodule::is_repeat(obj)
+        {
             match name {
-                "close" | "send" | "throw" | "__next__" | "__iter__" => {
-                    return Ok(crate::make_builtin_function("gen_method", gen_stub_method));
+                "__iter__" => return Ok(obj),
+                "__next__" => {
+                    let func_obj = crate::make_builtin_function("__next__", iter_next_method);
+                    return Ok(pyre_object::w_method_new(
+                        func_obj,
+                        obj,
+                        pyre_object::PY_NULL,
+                    ));
                 }
                 _ => {}
             }
@@ -2938,6 +2987,16 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
                 "fget" => return Ok(w_property_get_fget(obj)),
                 "fset" => return Ok(w_property_get_fset(obj)),
                 "fdel" => return Ok(w_property_get_fdel(obj)),
+                "__doc__" => {
+                    // Try INSTANCE_DICT first (set via property.__doc__ = "...")
+                    let w_dict = crate::objspace::std::mapdict::_obj_getdict(obj);
+                    if let Some(v) =
+                        pyre_object::w_dict_lookup(w_dict, pyre_object::w_str_new("__doc__"))
+                    {
+                        return Ok(v);
+                    }
+                    return Ok(w_none());
+                }
                 _ => {}
             }
         }
@@ -4155,6 +4214,15 @@ pub fn setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult {
     if setdictvalue(obj, name, value) {
         return Ok(w_none());
     }
+    // Property and similar non-instance objects: store via INSTANCE_DICT.
+    // property.__doc__ = "..." is common in stdlib (dis.py, etc.)
+    unsafe {
+        if is_property(obj) || pyre_object::memberobject::is_member(obj) {
+            let w_dict = crate::objspace::std::mapdict::_obj_getdict(obj);
+            pyre_object::w_dict_setitem_str(w_dict, name, value);
+            return Ok(w_none());
+        }
+    }
     Err(raiseattrerror(obj, name))
 }
 
@@ -4487,13 +4555,12 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
             let len = w_str_get_value(obj).len();
             return Ok(pyre_object::w_seq_iter_new(obj, len));
         }
-        if pyre_object::bytearrayobject::is_bytearray(obj) {
-            let len = pyre_object::bytearrayobject::w_bytearray_len(obj);
-            // Convert to list of ints for iteration
+        if pyre_object::bytesobject::is_bytes_like(obj) {
+            let len = pyre_object::bytesobject::bytes_like_len(obj);
             let mut items = Vec::with_capacity(len);
             for i in 0..len {
                 items.push(w_int_new(
-                    pyre_object::bytearrayobject::w_bytearray_getitem(obj, i) as i64,
+                    pyre_object::bytesobject::bytes_like_getitem(obj, i) as i64,
                 ));
             }
             let list = pyre_object::w_list_new(items);
@@ -4518,6 +4585,13 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         }
         // Already an iterator
         if is_range_iter(obj) || is_seq_iter(obj) || pyre_object::generatorobject::is_generator(obj)
+        {
+            return Ok(obj);
+        }
+        // itertools.count / itertools.repeat — iter_w returns self.
+        // PyPy: W_Count.iter_w / W_Repeat.iter_w
+        if pyre_object::itertoolsmodule::is_count(obj)
+            || pyre_object::itertoolsmodule::is_repeat(obj)
         {
             return Ok(obj);
         }
@@ -4673,6 +4747,36 @@ pub fn next(obj: PyObjectRef) -> PyResult {
         if pyre_object::generatorobject::is_generator(obj) {
             return generator_next(obj);
         }
+        // itertools.count.next_w — PyPy interp_itertools.py W_Count.next_w
+        //
+        //     def next_w(self):
+        //         w_c = self.w_c
+        //         self.w_c = self.space.add(w_c, self.w_step)
+        //         return w_c
+        if pyre_object::itertoolsmodule::is_count(obj) {
+            let w_c = pyre_object::itertoolsmodule::w_count_get_c(obj);
+            let w_step = pyre_object::itertoolsmodule::w_count_get_step(obj);
+            let new_c = add(w_c, w_step)?;
+            pyre_object::itertoolsmodule::w_count_set_c(obj, new_c);
+            return Ok(w_c);
+        }
+        // itertools.repeat.next_w — PyPy interp_itertools.py W_Repeat.next_w
+        //
+        //     def next_w(self):
+        //         if self.counting:
+        //             if self.count <= 0:
+        //                 raise OperationError(self.space.w_StopIteration, self.space.w_None)
+        //             self.count -= 1
+        //         return self.w_obj
+        if pyre_object::itertoolsmodule::is_repeat(obj) {
+            if pyre_object::itertoolsmodule::w_repeat_get_counting(obj) {
+                if pyre_object::itertoolsmodule::w_repeat_get_count(obj) <= 0 {
+                    return Err(PyError::stop_iteration());
+                }
+                pyre_object::itertoolsmodule::w_repeat_dec_count(obj);
+            }
+            return Ok(pyre_object::itertoolsmodule::w_repeat_get_obj(obj));
+        }
         // Instance __next__
         if is_instance(obj) {
             let w_type = w_instance_get_type(obj);
@@ -4684,7 +4788,6 @@ pub fn next(obj: PyObjectRef) -> PyResult {
     Err(PyError::type_error("not an iterator"))
 }
 
-/// Stub method for generator.close/send/throw — no-op.
 /// Property setter/getter/deleter helpers — PyPy: W_Property.setter/getter/deleter.
 /// args[0] is the owning property (bound via W_Method), args[1] is the new fn.
 fn property_setter_impl(args: &[PyObjectRef]) -> PyResult {
@@ -4717,54 +4820,77 @@ fn property_deleter_impl(args: &[PyObjectRef]) -> PyResult {
     }
 }
 
-fn gen_stub_method(args: &[PyObjectRef]) -> PyResult {
-    // close(): mark exhausted
-    if !args.is_empty() {
-        unsafe {
-            if pyre_object::generatorobject::is_generator(args[0]) {
-                pyre_object::generatorobject::w_generator_set_exhausted(args[0]);
-            }
-        }
-    }
-    Ok(w_none())
-}
+// ── Generator methods ────────────────────────────────────────────────
+//
+// PyPy: pypy/interpreter/generator.py GeneratorIterator
+//
+// send_ex(w_arg, operr) is the core resume path.
+// - __next__() → send_ex(None, None)
+// - send(v)    → send_ex(v, None)
+// - throw(t,v) → send_ex(None, OperationError(t,v))
+// - close()    → throw(GeneratorExit) then check result
 
-/// Resume a generator frame until YIELD_VALUE or RETURN_VALUE.
+/// PyPy: GeneratorIterator._send_ex(w_arg, operr)
 ///
-/// PyPy: generator.py GeneratorIterator.next() → execute_frame()
-fn generator_next(gen_obj: PyObjectRef) -> PyResult {
+/// Resume a generator frame: push w_arg (for send/next) or inject operr
+/// (for throw), then run the frame until YIELD_VALUE or RETURN_VALUE.
+fn generator_send_ex(gen_obj: PyObjectRef, w_arg: PyObjectRef, operr: Option<PyError>) -> PyResult {
     use pyre_object::generatorobject::*;
     unsafe {
-        if w_generator_is_exhausted(gen_obj) {
-            return Err(PyError {
-                kind: PyErrorKind::StopIteration,
-                message: "".to_string(),
-                exc_object: std::ptr::null_mut(),
-            });
+        if w_generator_is_running(gen_obj) {
+            return Err(PyError::value_error("generator already executing"));
         }
+
+        if w_generator_is_exhausted(gen_obj) {
+            if let Some(err) = operr {
+                return Err(err);
+            }
+            return Err(PyError::stop_iteration());
+        }
+
         let frame_ptr = w_generator_get_frame(gen_obj) as *mut crate::pyframe::PyFrame;
         if frame_ptr.is_null() {
             w_generator_set_exhausted(gen_obj);
-            return Err(PyError {
-                kind: PyErrorKind::StopIteration,
-                message: "".to_string(),
-                exc_object: std::ptr::null_mut(),
-            });
+            if let Some(err) = operr {
+                return Err(err);
+            }
+            return Err(PyError::stop_iteration());
         }
         let frame = &mut *frame_ptr;
+        let already_started = w_generator_is_started(gen_obj);
 
-        // On resume (not first call), push the sent value (None for __next__).
-        // CPython: YIELD_VALUE pops value, RESUME+POP_TOP expects sent value on stack.
-        if w_generator_is_started(gen_obj) {
-            frame.push(w_none());
+        if !already_started {
+            if operr.is_none() && !w_arg.is_null() && !is_none(w_arg) {
+                return Err(PyError::type_error(
+                    "can't send non-None value to a just-started generator",
+                ));
+            }
         }
         w_generator_set_started(gen_obj);
+        w_generator_set_running(gen_obj, true);
 
-        // Resume the frame from where it left off (frame.next_instr is preserved)
-        match crate::eval::eval_loop_for_force(frame) {
+        let result = if let Some(err) = operr {
+            // throw path: inject exception via handle_exception
+            if crate::eval::handle_exception(frame, &err) {
+                // Handler found — resume from the handler
+                crate::eval::eval_loop_for_force(frame)
+            } else {
+                // No handler — propagate the exception
+                Err(err)
+            }
+        } else {
+            // send/next path: push w_arg on resume (not first call)
+            if already_started {
+                frame.push(w_arg);
+            }
+            crate::eval::eval_loop_for_force(frame)
+        };
+
+        w_generator_set_running(gen_obj, false);
+
+        match result {
             Ok(value) => {
-                // Distinguish yield vs return: if the frame is at a YIELD_VALUE
-                // instruction (pc-1), it's a yield. Otherwise it's a return.
+                // Distinguish yield vs return
                 let code = &*crate::pyframe_get_pycode(&*frame);
                 let pc = frame.next_instr;
                 let is_yield = if pc > 0 && pc <= code.instructions.len() {
@@ -4779,11 +4905,7 @@ fn generator_next(gen_obj: PyObjectRef) -> PyResult {
                     Ok(value)
                 } else {
                     w_generator_set_exhausted(gen_obj);
-                    Err(PyError {
-                        kind: PyErrorKind::StopIteration,
-                        message: "".to_string(),
-                        exc_object: std::ptr::null_mut(),
-                    })
+                    Err(PyError::stop_iteration())
                 }
             }
             Err(e) => {
@@ -4791,6 +4913,111 @@ fn generator_next(gen_obj: PyObjectRef) -> PyResult {
                 Err(e)
             }
         }
+    }
+}
+
+/// PyPy: GeneratorIterator.next() — equivalent to __next__
+fn generator_next(gen_obj: PyObjectRef) -> PyResult {
+    generator_send_ex(gen_obj, w_none(), None)
+}
+
+/// __next__ method wrapper
+fn generator_next_method(args: &[PyObjectRef]) -> PyResult {
+    let gen_obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    generator_next(gen_obj)
+}
+
+/// Generic __next__ wrapper for iterators that delegate to `next()`.
+/// Used for itertools count/repeat etc.
+fn iter_next_method(args: &[PyObjectRef]) -> PyResult {
+    let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    next(obj)
+}
+
+/// PyPy: GeneratorIterator.descr_send(w_arg)
+fn generator_send_method(args: &[PyObjectRef]) -> PyResult {
+    let gen_obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    let value = args.get(1).copied().unwrap_or(w_none());
+    generator_send_ex(gen_obj, value, None)
+}
+
+/// PyPy: GeneratorIterator.descr_throw(w_type, w_val=None, w_tb=None)
+fn generator_throw_method(args: &[PyObjectRef]) -> PyResult {
+    let gen_obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    let w_type = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+    let w_val = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
+    // w_tb (args[3]) ignored for now — traceback not yet supported
+
+    let err = normalize_throw_args(w_type, w_val);
+    generator_send_ex(gen_obj, w_none(), Some(err))
+}
+
+/// PyPy: GeneratorIterator.descr_close()
+fn generator_close_method(args: &[PyObjectRef]) -> PyResult {
+    let gen_obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    unsafe {
+        use pyre_object::generatorobject::*;
+        if w_generator_is_exhausted(gen_obj) {
+            return Ok(w_none());
+        }
+        if !w_generator_is_started(gen_obj) {
+            w_generator_set_exhausted(gen_obj);
+            return Ok(w_none());
+        }
+    }
+    let err = PyError {
+        kind: PyErrorKind::GeneratorExit,
+        message: String::new(),
+        exc_object: std::ptr::null_mut(),
+    };
+    match generator_send_ex(gen_obj, w_none(), Some(err)) {
+        Ok(_) => {
+            // Generator yielded after GeneratorExit — RuntimeError
+            Err(PyError::runtime_error("generator ignored GeneratorExit"))
+        }
+        Err(e) if e.kind == PyErrorKind::StopIteration || e.kind == PyErrorKind::GeneratorExit => {
+            Ok(w_none())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Normalize throw() arguments into a PyError.
+///
+/// PyPy: generator.py throw() → OperationError(w_type, w_val, tb) + normalize
+///
+/// Handles:
+///   throw(TypeError)         — type → creates instance
+///   throw(TypeError("msg"))  — instance → derives type
+///   throw(TypeError, "msg")  — type + value → creates instance
+fn normalize_throw_args(w_type: PyObjectRef, w_val: PyObjectRef) -> PyError {
+    unsafe {
+        // If w_type is an exception instance, use it directly
+        if !w_type.is_null() && pyre_object::excobject::is_exception(w_type) {
+            return PyError::from_exc_object(w_type);
+        }
+
+        // If w_type is a type (class), try to create exception from it
+        if !w_type.is_null() && pyre_object::is_type(w_type) {
+            let type_name = pyre_object::w_type_get_name(w_type);
+            if let Some(kind) = pyre_object::excobject::exc_kind_from_name(type_name) {
+                let msg = if w_val.is_null() || pyre_object::is_none(w_val) {
+                    String::new()
+                } else if pyre_object::is_str(w_val) {
+                    pyre_object::w_str_get_value(w_val).to_string()
+                } else {
+                    String::new()
+                };
+                return PyError {
+                    kind: PyError::kind_from_exc(kind),
+                    message: msg,
+                    exc_object: std::ptr::null_mut(),
+                };
+            }
+        }
+
+        // Fallback: TypeError
+        PyError::type_error("exceptions must be classes or instances deriving from BaseException")
     }
 }
 

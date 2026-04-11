@@ -83,6 +83,9 @@ pub enum PyErrorKind {
     /// pypy/module/_weakref/interp__weakref.py:347
     /// `oefmt(space.w_ReferenceError, "weakly referenced object no longer exists")`.
     ReferenceError,
+    /// BaseException subclass — raised inside generators by gen.close().
+    /// Not a subclass of Exception, so `except Exception` does not catch it.
+    GeneratorExit,
     /// Internal: RETURN_GENERATOR unwind signal (not a real exception).
     /// Carries the generator PyObjectRef as message.
     GeneratorReturn,
@@ -193,6 +196,7 @@ impl PyError {
             PyErrorKind::NotImplementedError => ExcKind::NotImplementedError,
             PyErrorKind::AssertionError => ExcKind::AssertionError,
             PyErrorKind::ReferenceError => ExcKind::ReferenceError,
+            PyErrorKind::GeneratorExit => ExcKind::GeneratorExit,
             PyErrorKind::GeneratorReturn => ExcKind::RuntimeError,
             // DescrMismatch is a control-flow exception caught by
             // GetSetProperty.descr_property_get/set/del. If it ever escapes
@@ -216,7 +220,7 @@ impl PyError {
         }
     }
 
-    fn kind_from_exc(kind: ExcKind) -> PyErrorKind {
+    pub fn kind_from_exc(kind: ExcKind) -> PyErrorKind {
         match kind {
             ExcKind::TypeError => PyErrorKind::TypeError,
             ExcKind::ValueError => PyErrorKind::ValueError,
@@ -233,6 +237,7 @@ impl PyError {
             ExcKind::NotImplementedError => PyErrorKind::NotImplementedError,
             ExcKind::AssertionError => PyErrorKind::AssertionError,
             ExcKind::ReferenceError => PyErrorKind::ReferenceError,
+            ExcKind::GeneratorExit => PyErrorKind::GeneratorExit,
             ExcKind::BaseException | ExcKind::Exception => PyErrorKind::RuntimeError,
         }
     }
