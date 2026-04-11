@@ -22,12 +22,32 @@ use crate::optimizeopt::info::{
 };
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
 
-/// Maximum constant string length we will virtualize.
+/// vstring.py:18 MAX_CONST_LEN
 const MAX_CONST_LEN: usize = 100;
 
 /// vstring.py mode_string / mode_unicode discriminators.
 pub const mode_string: u8 = 0;
 pub const mode_unicode: u8 = 1;
+
+/// history.py:377-387 get_const_ptr_for_string(s)
+///
+/// Creates a constant GcRef from byte-string character values.
+/// Returns None when the runtime hook is not installed.
+pub fn get_const_ptr_for_string(chars: &[i64], ctx: &OptContext) -> Option<majit_ir::GcRef> {
+    let alloc_fn = ctx.string_constant_alloc.as_ref()?;
+    let gcref = alloc_fn(chars, false);
+    if gcref.is_null() { None } else { Some(gcref) }
+}
+
+/// history.py:390-402 get_const_ptr_for_unicode(s)
+///
+/// Creates a constant GcRef from unicode character values.
+/// Returns None when the runtime hook is not installed.
+pub fn get_const_ptr_for_unicode(chars: &[i64], ctx: &OptContext) -> Option<majit_ir::GcRef> {
+    let alloc_fn = ctx.string_constant_alloc.as_ref()?;
+    let gcref = alloc_fn(chars, true);
+    if gcref.is_null() { None } else { Some(gcref) }
+}
 /// vstring.py:371-381 _int_add(optstring, box1, box2)
 ///
 /// Constant-folding INT_ADD: folds add-0 and const+const at the optimizer
@@ -985,10 +1005,11 @@ impl OptString {
         mode: u8,
         ctx: &mut OptContext,
     ) -> Option<OptimizationResult> {
-        // vstring.py:792-794: l2box = i2.getstrlen(arg2, self, mode)
+        // vstring.py:792-794: l2box = i2.getstrlen(arg1, self, mode)
+        // RPython calls getstrlen on i2 (arg2's info) with arg1 as the op.
         let i2 = ctx.getptrinfo(arg2).is_some();
         let l2box = if i2 {
-            Some(ctx.getstrlen_opref(arg2, mode))
+            Some(ctx.getstrlen_for(arg2, arg1, mode))
         } else {
             None
         };
@@ -2039,22 +2060,14 @@ mod tests {
         );
     }
 
-    /// After force_box materializes a virtual string, STRLEN on the forced
-    /// result must return the cached lgtop (set during force_box), not emit
-    /// a redundant STRLEN op.
-    /// vstring.py:789-814 handle_str_equal_level2 parity:
-    /// When arg2 is a non-virtual base StrPtrInfo (Ptr variant, lgtop=None),
-    /// getstrlen_opref must emit STRLEN(arg2), not STRLEN(arg1).
-    /// RPython had a bug at vstring.py:794 passing arg1 instead of arg2;
-    /// this test ensures the majit fix is correct.
+    /// vstring.py:110-119 getstrlen_opref parity:
+    /// getstrlen_opref(opref, mode) looks up info from opref and emits
+    /// STRLEN(opref) on cache miss. Cached lgtop is returned on second call.
     #[test]
-    fn test_getstrlen_opref_on_nonvirtual_uses_correct_arg() {
+    fn test_getstrlen_opref_on_nonvirtual() {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(10, 0, 0, 50);
-        let arg1 = OpRef(0); // first string
-        let arg2 = OpRef(1); // second string — non-virtual base StrPtrInfo
+        let arg2 = OpRef(1);
 
-        // Attach a base StrPtrInfo(Ptr) to arg2, simulating make_nonnull_str.
-        // lgtop=None so getstrlen_opref will emit STRLEN.
         ctx.set_ptr_info(
             arg2,
             PtrInfo::Str(StrPtrInfo {
@@ -2067,10 +2080,47 @@ mod tests {
             }),
         );
 
-        // getstrlen_opref(arg2, 0) must emit STRLEN(arg2), not STRLEN(arg1).
         let strlen_ref = ctx.getstrlen_opref(arg2, 0);
 
-        // The emitted STRLEN should have arg2 as its operand.
+        let (_pass_idx, strlen_op) = ctx
+            .extra_operations_after
+            .back()
+            .expect("should have emitted STRLEN");
+        assert_eq!(strlen_op.opcode, OpCode::Strlen);
+        assert_eq!(strlen_op.args.as_slice(), &[arg2]);
+        assert_eq!(strlen_ref, strlen_op.pos);
+
+        // Subsequent call must return the cached lgtop.
+        let strlen_ref2 = ctx.getstrlen_opref(arg2, 0);
+        assert_eq!(strlen_ref, strlen_ref2);
+    }
+
+    /// vstring.py:794 handle_str_equal_level2 parity:
+    /// i2.getstrlen(arg1, self, mode) — info from arg2, fallback STRLEN(arg1).
+    /// getstrlen_for(arg2, arg1, mode) must use arg2's info but emit
+    /// STRLEN(arg1) when lgtop is not cached.
+    #[test]
+    fn test_getstrlen_for_level2_uses_arg1_as_fallback() {
+        let mut ctx = OptContext::with_num_inputs_and_start_pos(10, 0, 0, 50);
+        let arg1 = OpRef(0);
+        let arg2 = OpRef(1);
+
+        // Attach non-virtual StrPtrInfo to arg2 with lgtop=None.
+        ctx.set_ptr_info(
+            arg2,
+            PtrInfo::Str(StrPtrInfo {
+                lenbound: None,
+                lgtop: None,
+                mode: 0,
+                length: -1,
+                variant: VStringVariant::Ptr,
+                last_guard_pos: -1,
+            }),
+        );
+
+        // getstrlen_for(arg2, arg1, 0): info from arg2, STRLEN fallback on arg1.
+        let strlen_ref = ctx.getstrlen_for(arg2, arg1, 0);
+
         let (_pass_idx, strlen_op) = ctx
             .extra_operations_after
             .back()
@@ -2078,17 +2128,14 @@ mod tests {
         assert_eq!(strlen_op.opcode, OpCode::Strlen);
         assert_eq!(
             strlen_op.args.as_slice(),
-            &[arg2],
-            "STRLEN must use arg2, not arg1"
+            &[arg1],
+            "STRLEN must use arg1 (op), not arg2 (info source)"
         );
         assert_eq!(strlen_ref, strlen_op.pos);
 
-        // Subsequent call must return the cached lgtop, not emit again.
-        let strlen_ref2 = ctx.getstrlen_opref(arg2, 0);
-        assert_eq!(
-            strlen_ref, strlen_ref2,
-            "lgtop must be cached after first STRLEN"
-        );
+        // lgtop is cached on arg2's info — second call returns cached value.
+        let strlen_ref2 = ctx.getstrlen_for(arg2, arg1, 0);
+        assert_eq!(strlen_ref, strlen_ref2);
     }
 
     #[test]

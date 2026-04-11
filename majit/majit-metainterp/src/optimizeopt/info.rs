@@ -1352,6 +1352,9 @@ impl PtrInfo {
             }
             PtrInfo::VirtualArrayStruct(vinfo) => {
                 // info.py:670-684 ArrayStructInfo._force_elements
+                // virtualize.py:31: assert clear — ArrayStruct is always
+                // created with clear=True, so the original op is always
+                // NEW_ARRAY_CLEAR.
                 let num_elements = vinfo.element_fields.len();
                 ctx.set_ptr_info(opref, PtrInfo::nonnull());
 
@@ -1434,17 +1437,26 @@ impl PtrInfo {
                 let mode = sinfo.mode;
                 let is_unicode = mode != 0;
 
-                // vstring.py:79-90: try get_constant_string_spec first
-                // (constant-fold the entire virtual string to a ConstPtr).
-                if let Some(chars) = sinfo.get_constant_string_spec(&*ctx, mode) {
-                    if let Some(ref alloc_fn) = ctx.string_constant_alloc {
-                        let gcref = alloc_fn(&chars, is_unicode);
-                        if !gcref.is_null() {
-                            // vstring.py:83: get_box_replacement(op).set_forwarded(c_s)
-                            ctx.make_constant(opref, Value::Ref(gcref));
-                            return opref;
-                        }
-                    }
+                // vstring.py:79-90: if self.mode is mode_string / else
+                let c_s = if mode == crate::optimizeopt::vstring::mode_string {
+                    // vstring.py:80-84
+                    sinfo
+                        .get_constant_string_spec(&*ctx, mode)
+                        .and_then(|chars| {
+                            crate::optimizeopt::vstring::get_const_ptr_for_string(&chars, ctx)
+                        })
+                } else {
+                    // vstring.py:86-90
+                    sinfo
+                        .get_constant_string_spec(&*ctx, mode)
+                        .and_then(|chars| {
+                            crate::optimizeopt::vstring::get_const_ptr_for_unicode(&chars, ctx)
+                        })
+                };
+                if let Some(gcref) = c_s {
+                    // vstring.py:83: get_box_replacement(op).set_forwarded(c_s)
+                    ctx.make_constant(opref, Value::Ref(gcref));
+                    return opref;
                 }
 
                 // vstring.py:91: self._is_virtual = False

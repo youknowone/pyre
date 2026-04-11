@@ -957,8 +957,22 @@ impl OptContext {
     /// Per-subclass getstrlen() dispatch — returns a cached lgtop OpRef if
     /// available, or computes/emits the length and caches in StrPtrInfo.lgtop.
     /// Always returns a box (OpRef), never an i64 summary.
+    ///
+    /// Delegates to `getstrlen_for(opref, opref, mode)`.
     pub fn getstrlen_opref(&mut self, opref: OpRef, mode: u8) -> OpRef {
-        let resolved = self.get_box_replacement(opref);
+        self.getstrlen_for(opref, opref, mode)
+    }
+
+    /// vstring.py:110-119 StrPtrInfo.getstrlen(op, optstring, mode)
+    ///
+    /// Matches RPython's method dispatch where `self` (info) and `op` may
+    /// differ: info lookup comes from `info_opref`, but the fallback STRLEN
+    /// emission uses `op_opref`.  Cached lgtop is stored on `info_opref`'s
+    /// PtrInfo.
+    ///
+    /// When both are the same, use `getstrlen_opref(opref, mode)` instead.
+    pub fn getstrlen_for(&mut self, info_opref: OpRef, op_opref: OpRef, mode: u8) -> OpRef {
+        let resolved = self.get_box_replacement(info_opref);
         // vstring.py:112/283: if self.lgtop is not None: return self.lgtop
         if let Some(info) = self.getptrinfo(resolved) {
             if let Some(lgtop) = info.as_ref().get_cached_lgtop() {
@@ -988,20 +1002,23 @@ impl OptContext {
         });
         if let Some((vleft, vright)) = concat_children {
             // vstring.py:286-293
-            let left_len = self.getstrlen_opref(vleft, mode);
-            let right_len = self.getstrlen_opref(vright, mode);
+            let left_len = self.getstrlen_for(vleft, vleft, mode);
+            let right_len = self.getstrlen_for(vright, vright, mode);
             let result = crate::optimizeopt::vstring::_int_add(left_len, right_len, self);
             // vstring.py:293: self.lgtop = _int_add(optstring, len1box, len2box)
             self.set_str_lgtop(resolved, result);
             return result;
         }
         // vstring.py:115-118: base StrPtrInfo — emit STRLEN/UNICODELEN
+        // RPython: lengthop = ResOperation(mode.STRLEN, [op])
+        // `op` comes from op_opref (the first arg to getstrlen in RPython).
+        let op_resolved = self.get_box_replacement(op_opref);
         let strlen_opcode = if mode != 0 {
             majit_ir::OpCode::Unicodelen
         } else {
             majit_ir::OpCode::Strlen
         };
-        let strlen_op = majit_ir::Op::new(strlen_opcode, &[resolved]);
+        let strlen_op = majit_ir::Op::new(strlen_opcode, &[op_resolved]);
         let result = self.emit_extra(self.current_pass_idx, strlen_op);
         // vstring.py:116: lengthop.set_forwarded(self.getlenbound(mode))
         let lenbound = self.get_str_lenbound(resolved);

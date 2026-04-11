@@ -913,23 +913,12 @@ pub fn deserialize_optimizer_knowledge(
         let class_known = (bitfield & mask) != 0;
         mask >>= 1;
         if class_known {
-            // bridgeopt.py:145: cls = optimizer.cpu.cls_of_box(frontend_boxes[i])
-            // bridgeopt.py:146: optimizer.make_constant_class(box, cls)
-            // RPython always calls cpu.cls_of_box here; in Rust the callback
-            // is optional because it requires runtime registration by pyre.
-            if let Some(cls_fn) = cls_of_box {
-                if let Some(&raw_value) = frontend_boxes.get(i) {
-                    if raw_value != 0 {
-                        let cls = cls_fn(raw_value);
-                        super::optimizer::Optimizer::make_constant_class(ctx, livebox, cls, true);
-                    }
-                }
-            } else if std::env::var_os("MAJIT_LOG").is_some() {
-                eprintln!(
-                    "[jit][bridge] class_known bit set for livebox {:?} but cls_of_box not registered",
-                    livebox
-                );
-            }
+            // bridgeopt.py:145-146:
+            //   cls = optimizer.cpu.cls_of_box(frontend_boxes[i])
+            //   optimizer.make_constant_class(box, cls)
+            let cls_fn = cls_of_box.expect("bridgeopt.py:145: cpu.cls_of_box must be registered");
+            let cls = cls_fn(frontend_boxes[i]);
+            super::optimizer::Optimizer::make_constant_class(ctx, livebox, cls, true);
         }
     }
 
