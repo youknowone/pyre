@@ -31,10 +31,15 @@ pub const LONG_VALUE_OFFSET: usize = std::mem::offset_of!(W_LongObject, value);
 /// Phase 1: uses `Box::leak` (objects are never freed).
 pub fn w_long_new(value: BigInt) -> PyObjectRef {
     let inner = Box::into_raw(Box::new(value));
+    // W_LongObject shares the `int` type with W_IntObject — the two only
+    // differ in their storage layout, not their Python-level identity
+    // (PyPy does the same via W_AbstractIntObject's typedef). Wire
+    // `w_class` to INT_TYPE.instantiate so `type(x) is int` and
+    // `isinstance(x, int)` both hold for long integers.
     let obj = Box::new(W_LongObject {
         ob_header: PyObject {
             ob_type: &LONG_TYPE as *const PyType,
-            w_class: get_instantiate(&LONG_TYPE),
+            w_class: get_instantiate(&INT_TYPE),
         },
         value: inner,
     });

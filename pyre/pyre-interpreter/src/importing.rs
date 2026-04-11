@@ -1272,17 +1272,51 @@ fn init_abc(ns: &mut PyNamespace) {
         "_abc_register",
         crate::make_builtin_function("_abc_register", |_| Ok(pyre_object::w_none())),
     );
+    // _abc_instancecheck(cls, instance) — CPython: Modules/_abc.c _abc__abc_instancecheck.
+    //
+    // ABCMeta.__instancecheck__ (abc.py:119) delegates here. The canonical
+    // behaviour: walk type(instance).__mro__ looking for cls (direct
+    // subclass), then consult cls._abc_registry for virtual subclasses
+    // registered via `cls.register(subclass)`. Our previous stub
+    // unconditionally returned False, which broke
+    // `isinstance(Fraction(1,2), numbers.Rational)`.
     crate::namespace_store(
         ns,
         "_abc_instancecheck",
-        crate::make_builtin_function("_abc_instancecheck", |_args| {
-            Ok(pyre_object::w_bool_from(false))
+        crate::make_builtin_function("_abc_instancecheck", |args| {
+            if args.len() < 2 {
+                return Ok(pyre_object::w_bool_from(false));
+            }
+            let cls = args[0];
+            let instance = args[1];
+            unsafe {
+                Ok(pyre_object::w_bool_from(crate::baseobjspace::isinstance_w(
+                    instance, cls,
+                )))
+            }
         }),
     );
+    // _abc_subclasscheck(cls, subclass) — CPython: Modules/_abc.c _abc__abc_subclasscheck.
     crate::namespace_store(
         ns,
         "_abc_subclasscheck",
-        crate::make_builtin_function("_abc_subclasscheck", |_args| {
+        crate::make_builtin_function("_abc_subclasscheck", |args| {
+            if args.len() < 2 {
+                return Ok(pyre_object::w_bool_from(false));
+            }
+            let cls = args[0];
+            let subclass = args[1];
+            unsafe {
+                // Walk subclass.__mro__ looking for cls.
+                let mro_ptr = pyre_object::w_type_get_mro(subclass);
+                if !mro_ptr.is_null() {
+                    for &t in &*mro_ptr {
+                        if std::ptr::eq(t, cls) {
+                            return Ok(pyre_object::w_bool_from(true));
+                        }
+                    }
+                }
+            }
             Ok(pyre_object::w_bool_from(false))
         }),
     );
@@ -3488,6 +3522,16 @@ fn load_source_module(
     set_sys_module(modulename, module);
 
     exec_code_module(code, ns_ptr, execution_context)?;
+
+    // Module-level code may have rewritten `sys.modules[name]` (the
+    // `decimal` → `_pydecimal` pattern, or PyPy's `_cffi_backend` style
+    // late rewiring). Honour that — PyPy: interp_import.importhook
+    // reads sys.modules again after exec_code_module via importcache.
+    if let Some(replaced) = check_sys_modules(modulename) {
+        if !std::ptr::eq(replaced, module) {
+            return Ok(replaced);
+        }
+    }
 
     Ok(module)
 }

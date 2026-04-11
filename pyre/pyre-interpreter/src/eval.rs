@@ -1599,15 +1599,25 @@ impl OpcodeStepExecutor for PyFrame {
         let _null = self.pop();
         let callable = self.pop();
 
+        // Unpack the positional-args tuple/list regardless of the list
+        // strategy (object/int/float storage) — we can't read `items`
+        // directly because the Integer/Float strategies keep the live
+        // values in `int_items` / `float_items` instead.
         let mut args: Vec<PyObjectRef> = unsafe {
             if pyre_object::is_tuple(args_obj) {
-                let t = &*(args_obj as *const pyre_object::tupleobject::W_TupleObject);
-                t.items.as_slice().to_vec()
+                let n = pyre_object::w_tuple_len(args_obj);
+                (0..n as i64)
+                    .filter_map(|i| pyre_object::w_tuple_getitem(args_obj, i))
+                    .collect()
             } else if pyre_object::is_list(args_obj) {
-                let l = &*(args_obj as *const pyre_object::listobject::W_ListObject);
-                l.items.as_slice().to_vec()
+                let n = pyre_object::w_list_len(args_obj);
+                (0..n as i64)
+                    .filter_map(|i| pyre_object::w_list_getitem(args_obj, i))
+                    .collect()
             } else {
-                vec![]
+                // Fall back to the iterator protocol for arbitrary
+                // iterables passed to `f(*iter)`.
+                crate::builtins::collect_iterable(args_obj).unwrap_or_default()
             }
         };
 

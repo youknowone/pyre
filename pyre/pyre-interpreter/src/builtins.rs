@@ -1143,13 +1143,38 @@ fn make_exc_type(
     new_fn: crate::gateway::BuiltinCodeFn,
     base: PyObjectRef,
 ) -> PyObjectRef {
-    crate::typedef::make_builtin_type_with_base(
+    let cls = crate::typedef::make_builtin_type_with_base(
         name,
         move |ns| {
             crate::namespace_store(ns, "__new__", make_builtin_function("__new__", new_fn));
         },
         base,
-    )
+    );
+    // Record the class so typedef::r#type can map a raised exception
+    // back to its specific builtin class (TypeError, ValueError, ...).
+    register_exc_class(name, cls);
+    cls
+}
+
+/// Thread-local registry from exception class name (as used by
+/// `ExcKind → exc_kind_name`) to the W_TypeObject exposed in the builtins
+/// namespace. Populated at init-builtins time via `make_exc_type`.
+fn register_exc_class(name: &'static str, cls: PyObjectRef) {
+    EXC_CLASS_REGISTRY.with(|r| {
+        r.borrow_mut().insert(name, cls);
+    });
+}
+
+/// Look up a builtin exception class by its `ExcKind` name. Returns
+/// `None` if the registry hasn't been populated yet (e.g. before
+/// install_default_builtins).
+pub fn lookup_exc_class(name: &str) -> Option<PyObjectRef> {
+    EXC_CLASS_REGISTRY.with(|r| r.borrow().get(name).copied())
+}
+
+thread_local! {
+    static EXC_CLASS_REGISTRY: std::cell::RefCell<std::collections::HashMap<&'static str, PyObjectRef>>
+        = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
 /// `__build_class__(body, name, *bases)` — class creation.
@@ -1316,7 +1341,16 @@ pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     if args.is_empty() {
         return Ok(floatobject::w_float_new(0.0));
     }
-    let obj = args[0];
+    // Skip `cls` if called via `float.__new__(cls, value)`.
+    let value_idx = if args.len() >= 2 && unsafe { pyre_object::is_type(args[0]) } {
+        1
+    } else {
+        0
+    };
+    if value_idx >= args.len() {
+        return Ok(floatobject::w_float_new(0.0));
+    }
+    let obj = args[value_idx];
     unsafe {
         if is_float(obj) {
             return Ok(obj);
@@ -1324,14 +1358,59 @@ pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
         if is_int(obj) {
             return Ok(floatobject::w_float_new(w_int_get_value(obj) as f64));
         }
+        if is_bool(obj) {
+            return Ok(floatobject::w_float_new(if w_bool_get_value(obj) {
+                1.0
+            } else {
+                0.0
+            }));
+        }
+        if pyre_object::is_long(obj) {
+            use num_traits::ToPrimitive;
+            return Ok(floatobject::w_float_new(
+                pyre_object::w_long_get_value(obj)
+                    .to_f64()
+                    .unwrap_or(f64::NAN),
+            ));
+        }
         if is_str(obj) {
             let s = w_str_get_value(obj);
             if let Ok(v) = s.trim().parse::<f64>() {
                 return Ok(floatobject::w_float_new(v));
             }
+            return Err(crate::PyError::value_error(format!(
+                "could not convert string to float: {s:?}"
+            )));
         }
     }
-    Ok(floatobject::w_float_new(0.0))
+    // Fall back to __float__ dunder — PyPy: descroperation.py float.
+    if let Ok(method) = crate::baseobjspace::getattr(obj, "__float__") {
+        let result = crate::call_function(method, &[obj]);
+        if !result.is_null() {
+            unsafe {
+                if is_float(result) {
+                    return Ok(result);
+                }
+                if is_int(result) {
+                    return Ok(floatobject::w_float_new(w_int_get_value(result) as f64));
+                }
+            }
+        }
+    }
+    // __index__ dunder — integer-like objects.
+    if let Ok(method) = crate::baseobjspace::getattr(obj, "__index__") {
+        let result = crate::call_function(method, &[obj]);
+        if !result.is_null() {
+            unsafe {
+                if is_int(result) {
+                    return Ok(floatobject::w_float_new(w_int_get_value(result) as f64));
+                }
+            }
+        }
+    }
+    Err(crate::PyError::type_error(
+        "float() argument must be a string or a real number",
+    ))
 }
 
 /// `bool(obj)` — PyPy: operation.py bool → space.is_true
@@ -2293,9 +2372,14 @@ fn builtin_reversed(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
             }
         }
     }
-    Err(crate::PyError::type_error(
-        "argument to reversed() must be a sequence",
-    ))
+    // Fallback: collect any iterable (range, dict views, etc.) and reverse.
+    // PyPy: operation.py reversed falls back to __reversed__ then __getitem__/
+    // __len__. Our iterator protocol covers sequences via collect_iterable.
+    let items = collect_iterable(obj)?;
+    let mut rev = items;
+    rev.reverse();
+    let n = rev.len();
+    Ok(pyre_object::w_seq_iter_new(pyre_object::w_list_new(rev), n))
 }
 
 /// `sorted(iterable)` — PyPy: listobject.py listsort

@@ -395,13 +395,12 @@ unsafe fn int_lshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     if vb < 0 {
         return Err(PyError::type_error("negative shift count"));
     }
-    let vb = vb as u32;
-    if vb < 63 {
-        if let Some(r) = va.checked_shl(vb) {
-            return Ok(w_int_new(r));
-        }
-    }
-    Ok(w_long_new(BigInt::from(va) << vb))
+    // `i64::checked_shl` only fails when the shift amount is >= 64, so it
+    // happily returns a wrapped result when the VALUE overflows (e.g.
+    // `(10**18) << 4`). Detect real value overflow by computing the shift
+    // in BigInt and demoting to i64 only when the result fits.
+    let big = BigInt::from(va) << (vb as usize);
+    Ok(bigint_result(big))
 }
 
 unsafe fn int_rshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
@@ -1296,7 +1295,13 @@ pub(crate) fn binary_builtin_type_error(
 /// `w_type.mro_w`. Uses the cached MRO when present, otherwise
 /// recomputes via `compute_default_mro`.
 pub(crate) unsafe fn issubtype_w(w_type: PyObjectRef, cls: PyObjectRef) -> bool {
-    if w_type.is_null() || !is_type(w_type) {
+    if w_type.is_null() {
+        return false;
+    }
+    // Accept metaclass-created classes (ABCMeta) as well — the cached
+    // MRO lives on the W_TypeObject regardless of whether `ob_type` is
+    // exactly `TYPE_TYPE`.
+    if !is_type(w_type) && !w_type_is_classlike(w_type) {
         return false;
     }
     let mro_ptr = w_type_get_mro(w_type);
@@ -1420,6 +1425,15 @@ unsafe fn p_recursive_isinstance_w(
     if is_type(w_cls) {
         return p_recursive_isinstance_type_w(w_inst, w_cls);
     }
+    // PyPy's `is_type` would recognise any `type`-subclass (including
+    // ABCMeta-created classes) because CPython's PyType_Check walks the
+    // metaclass chain. pyre's `is_type` only matches exact W_TypeObject
+    // layout, so metaclass-created classes with non-trivial `ob_type`
+    // fall through here. Route them back through the MRO walk instead of
+    // the slow `__bases__` recursion when they still carry a cached MRO.
+    if w_type_is_classlike(w_cls) {
+        return p_recursive_isinstance_type_w(w_inst, w_cls);
+    }
     check_class(
         w_cls,
         "isinstance() arg 2 must be a type, a tuple of types, or a union",
@@ -1430,6 +1444,22 @@ unsafe fn p_recursive_isinstance_w(
         Err(e) => return Err(e),
     };
     p_abstract_issubclass_w(w_abstractclass, w_cls)
+}
+
+/// pypy/objspace/std/typeobject.py: classes created via metaclass
+/// (`type(cls)` != `type`) still satisfy `PyType_Check` because CPython
+/// walks the metaclass hierarchy. pyre's `is_type` only matches the
+/// singleton `TYPE_TYPE`, so this helper catches metaclass-created
+/// classes by looking for a cached MRO. When present, we can safely use
+/// the MRO-based `p_recursive_isinstance_type_w` path.
+unsafe fn w_type_is_classlike(obj: PyObjectRef) -> bool {
+    if obj.is_null() {
+        return false;
+    }
+    // Any W_TypeObject-backed class carries a cached MRO (populated by
+    // `make_builtin_type` / user class creation). Instances never have
+    // one, so this filters out non-classes.
+    !pyre_object::w_type_get_mro(obj).is_null()
 }
 
 /// abstractinst.py:127-147 `p_abstract_issubclass_w`. Walks
@@ -3668,10 +3698,13 @@ unsafe fn compute_mro(w_type: PyObjectRef) -> Vec<PyObjectRef> {
     }
 
     // Build candidate lists: [base.mro() for base in bases] + [list(bases)]
+    // Accept metaclass-created classes too, not just `is_type` ones —
+    // ABCMeta's `class Rational(Real): pass` still produces a proper
+    // W_TypeObject layout, just with a non-default `ob_type`.
     let mut lists: Vec<Vec<PyObjectRef>> = Vec::with_capacity(n + 1);
     for i in 0..n {
         if let Some(base) = w_tuple_getitem(bases, i as i64) {
-            if is_type(base) {
+            if is_type(base) || w_type_is_classlike(base) {
                 lists.push(compute_mro(base));
             }
         }

@@ -192,6 +192,11 @@ pub fn init(ns: &mut PyNamespace) {
     // ── Aggregation ─────────────────────────────────────────────────
     namespace_store(ns, "fsum", make_builtin_function("fsum", interp_math::fsum));
     namespace_store(ns, "prod", make_builtin_function("prod", interp_math::prod));
+    namespace_store(
+        ns,
+        "sumprod",
+        make_builtin_function("sumprod", interp_math::sumprod),
+    );
 
     // ── Integer math ────────────────────────────────────────────────
     namespace_store(

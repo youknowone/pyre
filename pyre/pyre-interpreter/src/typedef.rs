@@ -172,6 +172,20 @@ pub fn r#type(obj: PyObjectRef) -> Option<PyObjectRef> {
         return None;
     }
     unsafe {
+        // Exception instances share a single W_ExceptionObject layout
+        // but carry an `ExcKind` tag that names the real Python class.
+        // Resolve that tag to the class registered by
+        // `install_default_builtins`'s `make_exc_type` so
+        // `type(TypeError)`, `isinstance(exc, TypeError)` and the
+        // `with assertRaises(TypeError): ...` context manager all see
+        // the correct class instead of the shared "exception" stub.
+        if pyre_object::is_exception(obj) {
+            let kind = pyre_object::w_exception_get_kind(obj);
+            let name = pyre_object::excobject::exc_kind_name(kind);
+            if let Some(cls) = crate::builtins::lookup_exc_class(name) {
+                return Some(cls);
+            }
+        }
         let w_class = (*obj).w_class;
         if !w_class.is_null() {
             return Some(w_class);
@@ -639,7 +653,35 @@ fn int_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(obj)
 }
 
-descr_new_wrapper!(float_descr_new, crate::builtins::builtin_float);
+/// `float.__new__(cls, *args)` — PyPy: floatobject.py descr__new__.
+///
+/// If cls is the builtin float type, returns a plain W_FloatObject.
+/// If cls is a float subclass (e.g. test_math's `class FloatCeil(float)`),
+/// returns a fresh W_FloatObject with `w_class = cls` so `type(obj) == cls`
+/// and `__ceil__`/`__floor__`/`__trunc__` dunders on the subclass dispatch.
+fn float_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let cls = if args.is_empty() {
+        pyre_object::PY_NULL
+    } else {
+        args[0]
+    };
+    let value = crate::builtins::builtin_float(&args[1..])?;
+    if cls.is_null() || !unsafe { pyre_object::is_type(cls) } {
+        return Ok(value);
+    }
+    let float_typeobj = gettypefor(&pyre_object::FLOAT_TYPE);
+    if float_typeobj.map_or(false, |t| std::ptr::eq(cls, t)) {
+        return Ok(value);
+    }
+    // Subclass path — allocate a fresh W_FloatObject so setattr/w_class
+    // on it don't clobber the value-cached singleton.
+    let float_val = unsafe { pyre_object::w_float_get_value(value) };
+    let obj = pyre_object::w_float_new(float_val);
+    unsafe {
+        (*obj).w_class = cls;
+    }
+    Ok(obj)
+}
 
 /// Wrap a `__new__` builtin function in a staticmethod descriptor.
 ///
@@ -2623,6 +2665,80 @@ fn init_float_type(ns: &mut PyNamespace) {
                 return Ok(pyre_object::w_str_new(if v > 0.0 { "inf" } else { "-inf" }));
             }
             Ok(pyre_object::w_str_new(&format!("{v:e}")))
+        }),
+    );
+    namespace_store(
+        ns,
+        "fromhex",
+        make_builtin_function("fromhex", |args| {
+            // float.fromhex(s) — PyPy: floatobject.py descr_fromhex.
+            // Parse hexadecimal floating-point literals like '0x1.8p3'.
+            let s_arg = args
+                .iter()
+                .find_map(|&a| unsafe {
+                    if pyre_object::is_str(a) {
+                        Some(pyre_object::w_str_get_value(a).to_string())
+                    } else {
+                        None
+                    }
+                })
+                .ok_or_else(|| {
+                    crate::PyError::type_error("fromhex() requires a string argument")
+                })?;
+            let s = s_arg.trim();
+            let lower = s.to_ascii_lowercase();
+            match lower.as_str() {
+                "inf" | "infinity" | "+inf" | "+infinity" => {
+                    return Ok(pyre_object::w_float_new(f64::INFINITY));
+                }
+                "-inf" | "-infinity" => {
+                    return Ok(pyre_object::w_float_new(f64::NEG_INFINITY));
+                }
+                "nan" | "+nan" | "-nan" => {
+                    return Ok(pyre_object::w_float_new(f64::NAN));
+                }
+                _ => {}
+            }
+            let (sign_s, rest) = if let Some(r) = s.strip_prefix('-') {
+                (-1.0f64, r)
+            } else if let Some(r) = s.strip_prefix('+') {
+                (1.0f64, r)
+            } else {
+                (1.0f64, s)
+            };
+            let rest = rest
+                .strip_prefix("0x")
+                .or_else(|| rest.strip_prefix("0X"))
+                .unwrap_or(rest);
+            let (body, exp_str) = if let Some(i) = rest.find(|c| c == 'p' || c == 'P') {
+                (&rest[..i], &rest[i + 1..])
+            } else {
+                (rest, "0")
+            };
+            let (int_part, frac_part) = if let Some(i) = body.find('.') {
+                (&body[..i], &body[i + 1..])
+            } else {
+                (body, "")
+            };
+            let int_val = if int_part.is_empty() {
+                0u64
+            } else {
+                u64::from_str_radix(int_part, 16).map_err(|_| {
+                    crate::PyError::value_error("invalid hexadecimal floating-point literal")
+                })?
+            };
+            let mut frac_val = 0f64;
+            for (i, ch) in frac_part.chars().enumerate() {
+                let d = ch.to_digit(16).ok_or_else(|| {
+                    crate::PyError::value_error("invalid hexadecimal floating-point literal")
+                })? as f64;
+                frac_val += d / 16f64.powi(i as i32 + 1);
+            }
+            let exp: i32 = exp_str.parse().map_err(|_| {
+                crate::PyError::value_error("invalid hexadecimal floating-point literal")
+            })?;
+            let mantissa = int_val as f64 + frac_val;
+            Ok(pyre_object::w_float_new(sign_s * mantissa * 2f64.powi(exp)))
         }),
     );
     namespace_store(
