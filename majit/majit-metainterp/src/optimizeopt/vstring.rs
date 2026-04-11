@@ -100,9 +100,11 @@ pub fn copy_str_content(
     // vstring.py:341-347: determine inline threshold M using intbound
     let srcoffset_bound = ctx.getintbound(srcoffsetbox);
     let lgt_bound = ctx.getintbound(lengthbox);
+    // vstring.py:343: isinstance(srcbox, ConstPtr)
+    // getconst handles constant_types_for_numbering.
     let src_is_const = ctx
-        .get_constant(srcbox)
-        .is_some_and(|v| matches!(v, Value::Ref(_)));
+        .getconst(srcbox)
+        .is_some_and(|(_, tp)| tp == majit_ir::Type::Ref);
     let m = if src_is_const && srcoffset_bound.is_constant() {
         5
     } else {
@@ -139,13 +141,15 @@ pub fn copy_str_content(
                     if let Some(ch) = from_info {
                         ch
                     } else if let Some(idx) = resolved_idx {
-                        // vstring.py:394: ConstPtr + ConstInt → constant char
-                        let from_const = match ctx.get_constant(srcbox) {
-                            Some(Value::Ref(r)) if r.0 != 0 => ctx
-                                .string_content_resolver
-                                .as_deref()
-                                .and_then(|resolver| resolver(*r, mode))
-                                .and_then(|chars| chars.get(idx as usize).copied()),
+                        // vstring.py:394: isinstance(strbox, ConstPtr) + ConstInt
+                        let from_const = match ctx.getconst(srcbox) {
+                            Some((raw, majit_ir::Type::Ref)) if raw != 0 => {
+                                let r = majit_ir::GcRef(raw as usize);
+                                ctx.string_content_resolver
+                                    .as_deref()
+                                    .and_then(|resolver| resolver(r, mode))
+                                    .and_then(|chars| chars.get(idx as usize).copied())
+                            }
                             _ => None,
                         };
                         if let Some(ch_val) = from_const {
@@ -463,11 +467,11 @@ impl OptString {
         if from_virtual.is_some() {
             return from_virtual;
         }
-        // vstring.py:393-403 _strgetitem: ConstPtr + ConstInt → constant char
+        // vstring.py:393-403 _strgetitem: isinstance(strbox, ConstPtr)
         let mode = self.get_mode(resolved, ctx);
-        match ctx.get_constant(resolved) {
-            Some(Value::Ref(r)) if r.0 != 0 => {
-                let r = *r;
+        match ctx.getconst(resolved) {
+            Some((raw, majit_ir::Type::Ref)) if raw != 0 => {
+                let r = majit_ir::GcRef(raw as usize);
                 let ch_val = ctx
                     .string_content_resolver
                     .as_deref()

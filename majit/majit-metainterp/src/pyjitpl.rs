@@ -469,6 +469,10 @@ pub struct MetaInterp<M: Clone> {
     /// to `Optimizer::string_length_resolver` inside `make_optimizer`, then
     /// on to `OptContext::string_length_resolver` for each optimizer run.
     pub(crate) string_length_resolver: Option<crate::optimizeopt::info::StringLengthResolver>,
+    /// info.py:788-790 `ConstPtrInfo._unpack_str(mode)` runtime hook.
+    pub(crate) string_content_resolver: Option<crate::optimizeopt::info::StringContentResolver>,
+    /// history.py:377 `get_const_ptr_for_string(s)` runtime hook.
+    pub(crate) string_constant_alloc: Option<crate::optimizeopt::info::StringConstantAllocator>,
     /// pyjitpl.py:2389: partial trace from a failed bridge compilation attempt.
     /// When bridge optimization returns "not final" (retrace needed), the
     /// partial optimized ops are saved here so compile_retrace can append
@@ -902,6 +906,8 @@ impl<M: Clone> MetaInterp<M> {
             force_finish_trace: false,
             callinfocollection: None,
             string_length_resolver: None,
+            string_content_resolver: None,
+            string_constant_alloc: None,
             partial_trace: None,
             retracing_from: None,
             exported_state: None,
@@ -1142,6 +1148,8 @@ impl<M: Clone> MetaInterp<M> {
         // can fold to an exact `IntBound::from_constant(len)` during
         // intbounds postprocessing.
         opt.string_length_resolver = self.string_length_resolver.clone();
+        opt.string_content_resolver = self.string_content_resolver.clone();
+        opt.string_constant_alloc = self.string_constant_alloc.clone();
         opt
     }
 
@@ -1155,6 +1163,31 @@ impl<M: Clone> MetaInterp<M> {
         resolver: crate::optimizeopt::info::StringLengthResolver,
     ) {
         self.string_length_resolver = Some(resolver);
+    }
+
+    /// Install the host-runtime `_unpack_str(mode)` resolver.
+    /// info.py:788-790 ConstPtrInfo._unpack_str — extracts character values
+    /// from a constant string GcRef.
+    pub fn set_string_content_resolver(
+        &mut self,
+        resolver: crate::optimizeopt::info::StringContentResolver,
+    ) {
+        self.string_content_resolver = Some(resolver);
+    }
+
+    /// Install the host-runtime `get_const_ptr_for_string(s)` allocator.
+    /// history.py:377-387 — creates a constant GcRef from character values.
+    pub fn set_string_constant_alloc(
+        &mut self,
+        alloc: crate::optimizeopt::info::StringConstantAllocator,
+    ) {
+        self.string_constant_alloc = Some(alloc);
+    }
+
+    /// model.py:199-201 cpu.cls_of_box — install the callback that reads
+    /// the class/vtable pointer from a runtime Ref object.
+    pub fn set_cls_of_box(&mut self, f: fn(i64) -> i64) {
+        self.cls_of_box = Some(f);
     }
 
     /// Set a callback for loop compilation events.

@@ -916,9 +916,12 @@ pub fn deserialize_optimizer_knowledge(
             // bridgeopt.py:145-146:
             //   cls = optimizer.cpu.cls_of_box(frontend_boxes[i])
             //   optimizer.make_constant_class(box, cls)
-            let cls_fn = cls_of_box.expect("bridgeopt.py:145: cpu.cls_of_box must be registered");
-            let cls = cls_fn(frontend_boxes[i]);
-            super::optimizer::Optimizer::make_constant_class(ctx, livebox, cls, true);
+            // RPython: cpu.cls_of_box is always available (model.py:199).
+            // Rust: requires runtime registration via set_cls_of_box.
+            if let Some(cls_fn) = cls_of_box {
+                let cls = cls_fn(frontend_boxes[i]);
+                super::optimizer::Optimizer::make_constant_class(ctx, livebox, cls, true);
+            }
         }
     }
 

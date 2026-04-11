@@ -1327,15 +1327,13 @@ impl PtrInfo {
                     if item_ref == OpRef::NONE {
                         continue;
                     }
-                    // info.py:542-548: const = new_const_item(descr); same_constant
+                    // info.py:543: const = optforce.optimizer.new_const_item(self.descr)
+                    // info.py:546-548: if self._clear and const.same_constant(item)
+                    // new_const_item returns CONST_0/CONST_NULL/CONST_ZERO_FLOAT
+                    // (all raw=0). getconst handles constant_types_for_numbering.
                     if clear {
                         let resolved = ctx.get_box_replacement(item_ref);
-                        let is_default = match ctx.get_constant(resolved) {
-                            Some(Value::Int(0)) => true,
-                            Some(Value::Ref(r)) if r.0 == 0 => true,
-                            Some(Value::Float(f)) if *f == 0.0 => true,
-                            _ => false,
-                        };
+                        let is_default = matches!(ctx.getconst(resolved), Some((0, _)));
                         if is_default {
                             continue;
                         }
