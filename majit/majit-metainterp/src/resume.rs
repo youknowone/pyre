@@ -3645,6 +3645,7 @@ impl ResumeDataLoopMemo {
             // RPython stores only a bitfield (1=class known, 0=unknown).
             // The actual class pointer is recovered at deserialization time
             // via cpu.cls_of_box(frontend_boxes[i]).
+            let known_classes = optimizer_knowledge.map(|k| &k.known_classes);
             let mut bitfield: i32 = 0;
             let mut shifts = 0;
             for livebox in &liveboxes {
@@ -3653,7 +3654,7 @@ impl ResumeDataLoopMemo {
                         continue;
                     }
                     bitfield <<= 1;
-                    if env.get_known_class(*opref).is_some() {
+                    if known_classes.map_or(false, |kc| kc.contains(opref)) {
                         bitfield |= 1;
                     }
                     shifts += 1;
@@ -3990,9 +3991,6 @@ pub struct TaggedPendingField {
 
 /// bridgeopt.py:63 — optimizer knowledge for resume data encoding.
 /// Passed into finish() for _add_optimizer_sections.
-/// Class knowledge is NOT stored here — it is encoded as a bitfield
-/// directly from the live optimizer state via env.get_known_class(),
-/// matching RPython's serialize_optimizer_knowledge flow.
 pub struct OptimizerKnowledgeForResume {
     /// (obj_opref, descr_index, val_opref) heap field triples.
     /// bridgeopt.py:96-101
@@ -4002,6 +4000,8 @@ pub struct OptimizerKnowledgeForResume {
     pub heap_arrayitems: Vec<(majit_ir::OpRef, i64, i32, majit_ir::OpRef)>,
     /// (const_func_ptr, result_opref) loop-invariant call results.
     pub loopinvariant_results: Vec<(i64, majit_ir::OpRef)>,
+    /// bridgeopt.py:74-88: OpRefs with known class (from PtrInfo).
+    pub known_classes: std::collections::HashSet<majit_ir::OpRef>,
 }
 
 impl OptimizerKnowledgeForResume {
@@ -4009,6 +4009,7 @@ impl OptimizerKnowledgeForResume {
         self.heap_fields.is_empty()
             && self.heap_arrayitems.is_empty()
             && self.loopinvariant_results.is_empty()
+            && self.known_classes.is_empty()
     }
 }
 

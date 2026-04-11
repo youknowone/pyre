@@ -458,11 +458,13 @@ pub(crate) fn build_guard_metadata(
                                     }
                                 }
                                 majit_ir::RdVirtualInfo::VArrayInfoClear {
+                                    arraydescr: _,
                                     descr_index,
                                     kind,
                                     fieldnums,
                                 }
                                 | majit_ir::RdVirtualInfo::VArrayInfoNotClear {
+                                    arraydescr: _,
                                     descr_index,
                                     kind,
                                     fieldnums,
@@ -507,6 +509,7 @@ pub(crate) fn build_guard_metadata(
                                     }
                                 }
                                 majit_ir::RdVirtualInfo::VArrayStructInfo {
+                                    arraydescr: _,
                                     descr_index,
                                     size,
                                     fielddescr_indices,

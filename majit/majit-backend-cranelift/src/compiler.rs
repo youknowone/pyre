@@ -10078,6 +10078,7 @@ fn collect_guards(
                             }
                         }
                         majit_ir::RdVirtualInfo::VArrayInfoClear {
+                            arraydescr: _,
                             descr_index,
                             kind,
                             fieldnums,
@@ -10091,6 +10092,7 @@ fn collect_guards(
                                 .collect(),
                         },
                         majit_ir::RdVirtualInfo::VArrayInfoNotClear {
+                            arraydescr: _,
                             descr_index,
                             kind,
                             fieldnums,
@@ -10104,6 +10106,7 @@ fn collect_guards(
                                 .collect(),
                         },
                         majit_ir::RdVirtualInfo::VArrayStructInfo {
+                            arraydescr: _,
                             descr_index,
                             size,
                             fielddescr_indices,

@@ -2446,6 +2446,7 @@ fn materialize_bridge_virtual(
         }
         // resume.py:747-760 VArrayStructInfo.allocate
         majit_ir::RdVirtualInfo::VArrayStructInfo {
+            arraydescr: _,
             descr_index,
             size,
             fielddescr_indices,

@@ -634,12 +634,14 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
                     .unwrap_or(0);
                 if vi.clear {
                     Some(majit_ir::RdVirtualInfo::VArrayInfoClear {
+                        arraydescr: None,
                         descr_index: vi.descr.index(),
                         kind,
                         fieldnums,
                     })
                 } else {
                     Some(majit_ir::RdVirtualInfo::VArrayInfoNotClear {
+                        arraydescr: None,
                         descr_index: vi.descr.index(),
                         kind,
                         fieldnums,
@@ -685,6 +687,7 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
                     .map(|ad| ad.base_size())
                     .unwrap_or(0);
                 Some(majit_ir::RdVirtualInfo::VArrayStructInfo {
+                    arraydescr: None,
                     descr_index: vi.descr.index(),
                     size: vi.element_fields.len(),
                     fielddescr_indices,
@@ -732,11 +735,6 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
             }
             _ => None,
         }
-    }
-
-    fn get_known_class(&self, opref: OpRef) -> Option<majit_ir::GcRef> {
-        let resolved = self.ctx.get_box_replacement(opref);
-        self.ctx.get_ptr_info(resolved)?.get_known_class()
     }
 }
 

@@ -106,6 +106,8 @@ pub enum RdVirtualInfo {
     },
     /// resume.py:680: VArrayInfoClear (clear=True)
     VArrayInfoClear {
+        /// resume.py:646 self.arraydescr — live ArrayDescr reference.
+        arraydescr: Option<crate::DescrRef>,
         descr_index: u32,
         /// resume.py:656: arraydescr element kind (ref/int/float).
         kind: u8, // 0=ref, 1=int, 2=float (ArrayDescr.flag parity)
@@ -113,6 +115,8 @@ pub enum RdVirtualInfo {
     },
     /// resume.py:683: VArrayInfoNotClear (clear=False)
     VArrayInfoNotClear {
+        /// resume.py:646 self.arraydescr — live ArrayDescr reference.
+        arraydescr: Option<crate::DescrRef>,
         descr_index: u32,
         /// resume.py:656: arraydescr element kind (ref/int/float).
         kind: u8, // 0=ref, 1=int, 2=float (ArrayDescr.flag parity)
@@ -120,6 +124,8 @@ pub enum RdVirtualInfo {
     },
     /// resume.py:736: VArrayStructInfo
     VArrayStructInfo {
+        /// resume.py:739 self.arraydescr — live ArrayDescr reference.
+        arraydescr: Option<crate::DescrRef>,
         descr_index: u32,
         size: usize,
         /// resume.py VArrayStructInfo.fielddescrs — per-field descriptor indices.
@@ -201,11 +207,13 @@ impl PartialEq for RdVirtualInfo {
             ) => a1 == b1 && a2 == b2 && a3 == b3 && a4 == b4 && a5 == b5,
             (
                 Self::VArrayInfoClear {
+                    arraydescr: _,
                     descr_index: a1,
                     kind: a2,
                     fieldnums: a3,
                 },
                 Self::VArrayInfoClear {
+                    arraydescr: _,
                     descr_index: b1,
                     kind: b2,
                     fieldnums: b3,
@@ -213,11 +221,13 @@ impl PartialEq for RdVirtualInfo {
             ) => a1 == b1 && a2 == b2 && a3 == b3,
             (
                 Self::VArrayInfoNotClear {
+                    arraydescr: _,
                     descr_index: a1,
                     kind: a2,
                     fieldnums: a3,
                 },
                 Self::VArrayInfoNotClear {
+                    arraydescr: _,
                     descr_index: b1,
                     kind: b2,
                     fieldnums: b3,
@@ -225,6 +235,7 @@ impl PartialEq for RdVirtualInfo {
             ) => a1 == b1 && a2 == b2 && a3 == b3,
             (
                 Self::VArrayStructInfo {
+                    arraydescr: _,
                     descr_index: a1,
                     size: a2,
                     fielddescr_indices: a3,
@@ -236,6 +247,7 @@ impl PartialEq for RdVirtualInfo {
                     fieldnums: a8,
                 },
                 Self::VArrayStructInfo {
+                    arraydescr: _,
                     descr_index: b1,
                     size: b2,
                     fielddescr_indices: b3,
@@ -364,13 +376,6 @@ pub trait BoxEnv {
     /// to produce the correct variant — matching RPython's
     /// `info.visitor_dispatch_virtual_type(self)` + `vinfo.set_content(fieldnums)`.
     fn make_rd_virtual_info(&self, _opref: OpRef, _fieldnums: Vec<i16>) -> Option<RdVirtualInfo> {
-        None
-    }
-    /// bridgeopt.py:76-78 getptrinfo(box).get_known_class() parity.
-    ///
-    /// Returns the known class pointer (GcRef) for the given OpRef,
-    /// following the forwarding chain (get_box_replacement).
-    fn get_known_class(&self, _opref: OpRef) -> Option<GcRef> {
         None
     }
 }
