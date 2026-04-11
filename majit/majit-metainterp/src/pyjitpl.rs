@@ -518,11 +518,9 @@ pub struct MetaInterp<M: Clone> {
     /// compile.py:288-290 parity: preamble target tokens saved from Phase 1
     /// even when Phase 2 raises InvalidLoop.
     pending_preamble_tokens: HashMap<u64, Vec<crate::optimizeopt::unroll::TargetToken>>,
-    /// pyjitpl.py:2287-2290 metainterp_sd.all_descrs: global descriptor
-    /// registry mapping descr_index → DescrRef. Populated as descriptors
-    /// are encountered during tracing/optimization. Used by
-    /// deserialize_optimizer_knowledge to recover DescrRef from rd_numb.
-    pub(crate) all_descrs: HashMap<u32, DescrRef>,
+    /// pyjitpl.py:2289: self.all_descrs = self.cpu.setup_descrs()
+    /// descr.py:25-47: dense list indexed by descr_index.
+    pub(crate) all_descrs: Vec<DescrRef>,
     /// bridgeopt.py:124 frontend_boxes parity: runtime values from the
     /// guard failure DeadFrame. Saved by start_retrace_from_guard, used
     /// by compile_bridge for cls_of_box during deserialize_optimizer_knowledge.
@@ -916,7 +914,7 @@ impl<M: Clone> MetaInterp<M> {
             retrace_after_bridge: false,
             virtualref_boxes: Vec::new(),
             pending_preamble_tokens: HashMap::new(),
-            all_descrs: HashMap::new(),
+            all_descrs: Vec::new(),
             pending_frontend_boxes: None,
             cls_of_box: None,
         }
@@ -933,15 +931,11 @@ impl<M: Clone> MetaInterp<M> {
         self.result_type
     }
 
-    /// pyjitpl.py:2287-2290 finish_setup_descrs: register descriptors into
-    /// the global all_descrs registry for rd_numb deserialization.
-    pub(crate) fn register_all_descrs(&mut self, descrs: impl IntoIterator<Item = DescrRef>) {
-        for descr in descrs {
-            let idx = descr.index();
-            if idx != u32::MAX {
-                self.all_descrs.insert(idx, descr);
-            }
-        }
+    /// pyjitpl.py:2289 / descr.py:25-47 parity: take back all_descrs from
+    /// optimizer after compilation. Optimizer.ensure_descr_index() assigns
+    /// sequential descr_index during collect_optimizer_knowledge_for_resume().
+    pub(crate) fn take_back_all_descrs(&mut self, all_descrs: Vec<DescrRef>) {
+        self.all_descrs = all_descrs;
     }
 
     /// Cache the current virtualizable object pointer for trace-entry setup.
@@ -2025,6 +2019,7 @@ impl<M: Clone> MetaInterp<M> {
             .or_else(|| self.pending_preamble_tokens.remove(&green_key))
             .unwrap_or_default();
         let mut unroll_opt = crate::optimizeopt::unroll::UnrollOptimizer::new();
+        unroll_opt.all_descrs = std::mem::take(&mut self.all_descrs);
         unroll_opt.target_tokens = prior_front_target_tokens.clone();
         // history.py: carry retraced_count across recompilations
         let prior_retraced_count = self
@@ -2381,7 +2376,7 @@ impl<M: Clone> MetaInterp<M> {
                     trace_id,
                     &mut terminal_exit_layouts,
                 );
-                self.register_all_descrs(unroll_opt.used_descrs.drain(..));
+                self.take_back_all_descrs(std::mem::take(&mut unroll_opt.all_descrs));
                 let mut traces = HashMap::new();
                 traces.insert(
                     trace_id,
@@ -2841,6 +2836,7 @@ impl<M: Clone> MetaInterp<M> {
             .or_else(|| self.pending_preamble_tokens.remove(&green_key))
             .unwrap_or_default();
         let mut unroll_opt = crate::optimizeopt::unroll::UnrollOptimizer::new();
+        unroll_opt.all_descrs = std::mem::take(&mut self.all_descrs);
         unroll_opt.target_tokens = prior_front_target_tokens.clone();
         unroll_opt.retraced_count = self
             .compiled_loops
@@ -3026,7 +3022,7 @@ impl<M: Clone> MetaInterp<M> {
                     trace_id,
                     &mut terminal_exit_layouts,
                 );
-                self.register_all_descrs(unroll_opt.used_descrs.drain(..));
+                self.take_back_all_descrs(std::mem::take(&mut unroll_opt.all_descrs));
                 let mut traces = HashMap::new();
                 traces.insert(
                     trace_id,
@@ -3179,6 +3175,7 @@ impl<M: Clone> MetaInterp<M> {
         } else {
             Optimizer::default_pipeline()
         };
+        optimizer.all_descrs = std::mem::take(&mut self.all_descrs);
         optimizer.constant_types = constant_types.clone();
         optimizer.numbering_type_overrides = numbering_overrides;
         // history.py:_make_op parity: every InputArg carries its type
@@ -3384,7 +3381,7 @@ impl<M: Clone> MetaInterp<M> {
                     trace_id,
                     &mut terminal_exit_layouts,
                 );
-                self.register_all_descrs(optimizer.used_descrs.drain(..));
+                self.take_back_all_descrs(std::mem::take(&mut optimizer.all_descrs));
                 let mut traces = HashMap::new();
                 traces.insert(
                     trace_id,
@@ -3529,6 +3526,7 @@ impl<M: Clone> MetaInterp<M> {
         } else {
             Optimizer::default_pipeline()
         };
+        optimizer.all_descrs = std::mem::take(&mut self.all_descrs);
         optimizer.constant_types = constant_types.clone();
         optimizer.numbering_type_overrides = numbering_overrides;
         // RPython Box.type parity: register inputarg types.
@@ -3683,7 +3681,7 @@ impl<M: Clone> MetaInterp<M> {
                     trace_id,
                     &mut terminal_exit_layouts,
                 );
-                self.register_all_descrs(optimizer.used_descrs.drain(..));
+                self.take_back_all_descrs(std::mem::take(&mut optimizer.all_descrs));
                 let mut traces = HashMap::new();
                 traces.insert(
                     trace_id,
@@ -5430,6 +5428,7 @@ impl<M: Clone> MetaInterp<M> {
         }
 
         let mut optimizer = self.make_optimizer();
+        optimizer.all_descrs = std::mem::take(&mut self.all_descrs);
         let mut constants = constants;
         optimizer.constant_types = constant_types.clone();
         for arg in bridge_inputargs {
@@ -5638,7 +5637,7 @@ impl<M: Clone> MetaInterp<M> {
                     trace_id,
                     &mut terminal_exit_layouts,
                 );
-                self.register_all_descrs(optimizer.used_descrs.drain(..));
+                self.take_back_all_descrs(std::mem::take(&mut optimizer.all_descrs));
                 let mut traces = HashMap::new();
                 traces.insert(
                     trace_id,
@@ -5743,6 +5742,7 @@ impl<M: Clone> MetaInterp<M> {
 
         // RPython unroll.py:183-236: Optimizer.optimize_bridge()
         let mut optimizer = self.make_optimizer();
+        optimizer.all_descrs = std::mem::take(&mut self.all_descrs);
         let mut constants = constants;
         optimizer.constant_types = constant_types.clone();
         // RPython Box.type parity: inputargs carry their types implicitly
@@ -6140,7 +6140,7 @@ impl<M: Clone> MetaInterp<M> {
                         },
                     );
                 }
-                self.register_all_descrs(optimizer.used_descrs.drain(..));
+                self.take_back_all_descrs(std::mem::take(&mut optimizer.all_descrs));
                 self.warm_state.log_bridge_compile(fail_index);
                 self.stats.bridges_compiled += 1;
 

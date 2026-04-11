@@ -2908,8 +2908,11 @@ impl Optimization for OptHeap {
                 Some(d) => d.clone(),
                 None => continue,
             };
-            // heap.py:828-834:
-            //     if descr.get_descr_index() == -1: continue
+            // heap.py:828: if descr.get_descr_index() == -1: continue
+            if descr.get_descr_index() == -1 {
+                continue;
+            }
+            // heap.py:833-834:
             //     parent_descr = descr.get_parent_descr()
             //     if not parent_descr.is_object(): continue
             let parent = descr.as_field_descr().and_then(|fd| fd.get_parent_descr());
@@ -2997,6 +3000,10 @@ impl Optimization for OptHeap {
                 Some(d) => d.clone(),
                 None => continue,
             };
+            // heap.py:849: if descr.get_descr_index() == -1: continue
+            if descr.get_descr_index() == -1 {
+                continue;
+            }
             for (&index, cai) in &submap.const_indexes {
                 // heap.py:852: if cf._lazy_set: continue
                 if cai.lazy_set.is_some() {

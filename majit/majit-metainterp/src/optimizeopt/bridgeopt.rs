@@ -883,7 +883,7 @@ pub fn deserialize_optimizer_knowledge(
     frontend_boxes: &[i64],
     liveboxes: &[OpRef],
     livebox_types: &[majit_ir::Type],
-    all_descrs: &HashMap<u32, majit_ir::descr::DescrRef>,
+    all_descrs: &[majit_ir::descr::DescrRef],
     cls_of_box: Option<fn(i64) -> i64>,
     optimizer: &mut super::optimizer::Optimizer,
     ctx: &mut OptContext,
@@ -932,14 +932,14 @@ pub fn deserialize_optimizer_knowledge(
     for _ in 0..length {
         let tagged = reader.next_item() as i16;
         let box1 = decode_box(tagged, rd_consts, liveboxes);
-        let descr_index = reader.next_item() as u32;
+        let descr_index = reader.next_item();
         let tagged2 = reader.next_item() as i16;
         let box2 = decode_box(tagged2, rd_consts, liveboxes);
-        if let Some(descr) = all_descrs.get(&descr_index) {
-            let opref1 = decoded_box_to_opref(&box1, ctx);
-            let opref2 = decoded_box_to_opref(&box2, ctx);
-            result_struct.push((opref1, descr.clone(), opref2));
-        }
+        // bridgeopt.py:155: descr = metainterp_sd.all_descrs[descr_index]
+        let descr = &all_descrs[descr_index as usize];
+        let opref1 = decoded_box_to_opref(&box1, ctx);
+        let opref2 = decoded_box_to_opref(&box2, ctx);
+        result_struct.push((opref1, descr.clone(), opref2));
     }
     // bridgeopt.py:159-169: heap knowledge (array items)
     let length = reader.next_item();
@@ -948,14 +948,14 @@ pub fn deserialize_optimizer_knowledge(
         let tagged = reader.next_item() as i16;
         let box1 = decode_box(tagged, rd_consts, liveboxes);
         let index = reader.next_item() as i64;
-        let descr_index = reader.next_item() as u32;
+        let descr_index = reader.next_item();
         let tagged2 = reader.next_item() as i16;
         let box2 = decode_box(tagged2, rd_consts, liveboxes);
-        if let Some(descr) = all_descrs.get(&descr_index) {
-            let opref1 = decoded_box_to_opref(&box1, ctx);
-            let opref2 = decoded_box_to_opref(&box2, ctx);
-            result_array.push((opref1, index, descr.clone(), opref2));
-        }
+        // bridgeopt.py:166: descr = metainterp_sd.all_descrs[descr_index]
+        let descr = &all_descrs[descr_index as usize];
+        let opref1 = decoded_box_to_opref(&box1, ctx);
+        let opref2 = decoded_box_to_opref(&box2, ctx);
+        result_array.push((opref1, index, descr.clone(), opref2));
     }
     // bridgeopt.py:170-171: optimizer.optheap.deserialize_optheap(...)
     if !result_struct.is_empty() || !result_array.is_empty() {

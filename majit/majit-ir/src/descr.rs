@@ -7,8 +7,8 @@
 /// for field access, array access, function calls, and guard failures.
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::OnceLock;
 use std::sync::Weak;
+use std::sync::atomic::{AtomicI32, Ordering};
 
 use crate::OpRef;
 use crate::value::Type;
@@ -16,38 +16,6 @@ use serde::{Deserialize, Serialize};
 
 /// Opaque reference to a descriptor, shared across the JIT pipeline.
 pub type DescrRef = Arc<dyn Descr>;
-
-static ALL_DESCRS: OnceLock<Mutex<Vec<Option<DescrRef>>>> = OnceLock::new();
-
-fn all_descrs() -> &'static Mutex<Vec<Option<DescrRef>>> {
-    ALL_DESCRS.get_or_init(|| Mutex::new(Vec::new()))
-}
-
-/// pyjitpl.py:2288-2290 `metainterp_sd.all_descrs`.
-///
-/// RPython resolves heap descr indices during bridgeopt/resume decoding
-/// through `metainterp_sd.all_descrs[descr_index]`. majit uses `Descr::index()`
-/// as the stable descriptor index and stores the first descriptor created for
-/// each index in a global table matching that lookup shape.
-pub fn register_descr(descr: DescrRef) -> DescrRef {
-    let index = descr.index() as usize;
-    let mut descrs = all_descrs().lock().unwrap();
-    if index >= descrs.len() {
-        descrs.resize(index + 1, None);
-    }
-    if descrs[index].is_none() {
-        descrs[index] = Some(descr.clone());
-    }
-    descr
-}
-
-pub fn get_descr(index: u32) -> Option<DescrRef> {
-    all_descrs()
-        .lock()
-        .unwrap()
-        .get(index as usize)
-        .and_then(|descr| descr.clone())
-}
 
 /// history.py: TargetToken / JitCellToken identity. PyPy keys
 /// `target_tokens_currently_compiling` and `consider_jump`'s
@@ -173,6 +141,16 @@ pub trait Descr: Send + Sync + std::fmt::Debug {
     fn index(&self) -> u32 {
         u32::MAX
     }
+
+    /// history.py:95-101: AbstractDescr.get_descr_index()
+    /// Returns -1 if not yet assigned by setup_descrs().
+    fn get_descr_index(&self) -> i32 {
+        -1
+    }
+
+    /// descr.py:28: v.descr_index = len(all_descrs)
+    /// Called by setup_descrs() to assign a sequential index.
+    fn set_descr_index(&self, _index: i32) {}
 
     /// Human-readable representation for debugging.
     fn repr(&self) -> String {
@@ -1103,9 +1081,11 @@ impl EffectInfo {
 
 /// Simple concrete FieldDescr for use by pyre-jit and tests.
 /// RPython: `FieldDescr(name, offset, size, flag, index_in_parent, is_pure)`.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SimpleFieldDescr {
     index: u32,
+    /// history.py:1092: BackendDescr.descr_index = -1
+    descr_index: AtomicI32,
     /// RPython: FieldDescr.name — e.g. "MyStruct.field_name"
     name: String,
     offset: usize,
@@ -1126,6 +1106,24 @@ pub struct SimpleFieldDescr {
     parent_descr: Option<Weak<dyn Descr>>,
 }
 
+impl Clone for SimpleFieldDescr {
+    fn clone(&self) -> Self {
+        SimpleFieldDescr {
+            index: self.index,
+            descr_index: AtomicI32::new(self.descr_index.load(Ordering::Relaxed)),
+            name: self.name.clone(),
+            offset: self.offset,
+            field_size: self.field_size,
+            field_type: self.field_type,
+            is_immutable: self.is_immutable,
+            is_signed: self.is_signed,
+            virtualizable: self.virtualizable,
+            index_in_parent: self.index_in_parent,
+            parent_descr: self.parent_descr.clone(),
+        }
+    }
+}
+
 impl SimpleFieldDescr {
     pub fn new(
         index: u32,
@@ -1136,6 +1134,7 @@ impl SimpleFieldDescr {
     ) -> Self {
         SimpleFieldDescr {
             index,
+            descr_index: AtomicI32::new(-1),
             name: String::new(),
             offset,
             field_size,
@@ -1162,6 +1161,7 @@ impl SimpleFieldDescr {
     ) -> Self {
         SimpleFieldDescr {
             index,
+            descr_index: AtomicI32::new(-1),
             name,
             offset,
             field_size,
@@ -1198,6 +1198,12 @@ impl SimpleFieldDescr {
 impl Descr for SimpleFieldDescr {
     fn index(&self) -> u32 {
         self.index
+    }
+    fn get_descr_index(&self) -> i32 {
+        self.descr_index.load(Ordering::Relaxed)
+    }
+    fn set_descr_index(&self, index: i32) {
+        self.descr_index.store(index, Ordering::Relaxed);
     }
     fn is_always_pure(&self) -> bool {
         self.is_immutable
@@ -1238,9 +1244,11 @@ impl FieldDescr for SimpleFieldDescr {
 }
 
 /// Simple concrete SizeDescr.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SimpleSizeDescr {
     index: u32,
+    /// history.py:1092: BackendDescr.descr_index = -1
+    descr_index: AtomicI32,
     size: usize,
     type_id: u32,
     is_immutable: bool,
@@ -1248,10 +1256,25 @@ pub struct SimpleSizeDescr {
     all_field_descrs: Vec<Arc<dyn FieldDescr>>,
 }
 
+impl Clone for SimpleSizeDescr {
+    fn clone(&self) -> Self {
+        SimpleSizeDescr {
+            index: self.index,
+            descr_index: AtomicI32::new(self.descr_index.load(Ordering::Relaxed)),
+            size: self.size,
+            type_id: self.type_id,
+            is_immutable: self.is_immutable,
+            vtable: self.vtable,
+            all_field_descrs: self.all_field_descrs.clone(),
+        }
+    }
+}
+
 impl SimpleSizeDescr {
     pub fn new(index: u32, size: usize, type_id: u32) -> Self {
         SimpleSizeDescr {
             index,
+            descr_index: AtomicI32::new(-1),
             size,
             type_id,
             is_immutable: false,
@@ -1263,6 +1286,7 @@ impl SimpleSizeDescr {
     pub fn with_vtable(index: u32, size: usize, type_id: u32, vtable: usize) -> Self {
         SimpleSizeDescr {
             index,
+            descr_index: AtomicI32::new(-1),
             size,
             type_id,
             is_immutable: false,
@@ -1280,6 +1304,12 @@ impl SimpleSizeDescr {
 impl Descr for SimpleSizeDescr {
     fn index(&self) -> u32 {
         self.index
+    }
+    fn get_descr_index(&self) -> i32 {
+        self.descr_index.load(Ordering::Relaxed)
+    }
+    fn set_descr_index(&self, index: i32) {
+        self.descr_index.store(index, Ordering::Relaxed);
     }
     fn as_size_descr(&self) -> Option<&dyn SizeDescr> {
         Some(self)
@@ -1342,6 +1372,7 @@ pub fn make_simple_descr_group(
             .map(|spec| {
                 Arc::new(SimpleFieldDescr {
                     index: spec.index,
+                    descr_index: AtomicI32::new(-1),
                     name: spec.name.clone(),
                     offset: spec.offset,
                     field_size: spec.field_size,
@@ -1362,6 +1393,7 @@ pub fn make_simple_descr_group(
             .collect();
         SimpleSizeDescr {
             index,
+            descr_index: AtomicI32::new(-1),
             size,
             type_id,
             is_immutable: false,
@@ -1377,9 +1409,11 @@ pub fn make_simple_descr_group(
 }
 
 /// Simple concrete ArrayDescr.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SimpleArrayDescr {
     index: u32,
+    /// history.py:1092: BackendDescr.descr_index = -1
+    descr_index: AtomicI32,
     base_size: usize,
     item_size: usize,
     type_id: u32,
@@ -1389,6 +1423,21 @@ pub struct SimpleArrayDescr {
     /// RPython: descr.py ArrayDescr.all_interiorfielddescrs.
     /// For array-of-structs, contains interior field descriptors.
     all_interiorfielddescrs: Option<Vec<DescrRef>>,
+}
+
+impl Clone for SimpleArrayDescr {
+    fn clone(&self) -> Self {
+        SimpleArrayDescr {
+            index: self.index,
+            descr_index: AtomicI32::new(self.descr_index.load(Ordering::Relaxed)),
+            base_size: self.base_size,
+            item_size: self.item_size,
+            type_id: self.type_id,
+            item_type: self.item_type,
+            flag: self.flag,
+            all_interiorfielddescrs: self.all_interiorfielddescrs.clone(),
+        }
+    }
 }
 
 impl SimpleArrayDescr {
@@ -1402,6 +1451,7 @@ impl SimpleArrayDescr {
         let flag = ArrayFlag::from_item_type(item_type, false);
         SimpleArrayDescr {
             index,
+            descr_index: AtomicI32::new(-1),
             base_size,
             item_size,
             type_id,
@@ -1422,6 +1472,7 @@ impl SimpleArrayDescr {
     ) -> Self {
         SimpleArrayDescr {
             index,
+            descr_index: AtomicI32::new(-1),
             base_size,
             item_size,
             type_id,
@@ -1440,6 +1491,12 @@ impl SimpleArrayDescr {
 impl Descr for SimpleArrayDescr {
     fn index(&self) -> u32 {
         self.index
+    }
+    fn get_descr_index(&self) -> i32 {
+        self.descr_index.load(Ordering::Relaxed)
+    }
+    fn set_descr_index(&self, index: i32) {
+        self.descr_index.store(index, Ordering::Relaxed);
     }
     fn as_array_descr(&self) -> Option<&dyn ArrayDescr> {
         Some(self)
@@ -1488,12 +1545,26 @@ impl ArrayDescr for SimpleArrayDescr {
 }
 
 /// Simple concrete InteriorFieldDescr.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SimpleInteriorFieldDescr {
     index: u32,
+    /// history.py:1092: BackendDescr.descr_index = -1
+    descr_index: AtomicI32,
     array_descr: std::sync::Arc<SimpleArrayDescr>,
     field_descr: std::sync::Arc<SimpleFieldDescr>,
     owner_size_descr: Option<std::sync::Arc<SimpleSizeDescr>>,
+}
+
+impl Clone for SimpleInteriorFieldDescr {
+    fn clone(&self) -> Self {
+        SimpleInteriorFieldDescr {
+            index: self.index,
+            descr_index: AtomicI32::new(self.descr_index.load(Ordering::Relaxed)),
+            array_descr: self.array_descr.clone(),
+            field_descr: self.field_descr.clone(),
+            owner_size_descr: self.owner_size_descr.clone(),
+        }
+    }
 }
 
 impl SimpleInteriorFieldDescr {
@@ -1504,6 +1575,7 @@ impl SimpleInteriorFieldDescr {
     ) -> Self {
         SimpleInteriorFieldDescr {
             index,
+            descr_index: AtomicI32::new(-1),
             array_descr,
             field_descr,
             owner_size_descr: None,
@@ -1518,6 +1590,7 @@ impl SimpleInteriorFieldDescr {
     ) -> Self {
         SimpleInteriorFieldDescr {
             index,
+            descr_index: AtomicI32::new(-1),
             array_descr,
             field_descr,
             owner_size_descr: Some(owner_size_descr),
@@ -1528,6 +1601,12 @@ impl SimpleInteriorFieldDescr {
 impl Descr for SimpleInteriorFieldDescr {
     fn index(&self) -> u32 {
         self.index
+    }
+    fn get_descr_index(&self) -> i32 {
+        self.descr_index.load(Ordering::Relaxed)
+    }
+    fn set_descr_index(&self, index: i32) {
+        self.descr_index.store(index, Ordering::Relaxed);
     }
     fn as_interior_field_descr(&self) -> Option<&dyn InteriorFieldDescr> {
         Some(self)
@@ -1544,13 +1623,28 @@ impl InteriorFieldDescr for SimpleInteriorFieldDescr {
 }
 
 /// Simple concrete CallDescr for non-test use.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SimpleCallDescr {
     index: u32,
+    /// history.py:1092: BackendDescr.descr_index = -1
+    descr_index: AtomicI32,
     arg_types: Vec<Type>,
     result_type: Type,
     result_size: usize,
     effect: EffectInfo,
+}
+
+impl Clone for SimpleCallDescr {
+    fn clone(&self) -> Self {
+        SimpleCallDescr {
+            index: self.index,
+            descr_index: AtomicI32::new(self.descr_index.load(Ordering::Relaxed)),
+            arg_types: self.arg_types.clone(),
+            result_type: self.result_type,
+            result_size: self.result_size,
+            effect: self.effect.clone(),
+        }
+    }
 }
 
 impl SimpleCallDescr {
@@ -1563,6 +1657,7 @@ impl SimpleCallDescr {
     ) -> Self {
         SimpleCallDescr {
             index,
+            descr_index: AtomicI32::new(-1),
             arg_types,
             result_type,
             result_size,
@@ -1574,6 +1669,12 @@ impl SimpleCallDescr {
 impl Descr for SimpleCallDescr {
     fn index(&self) -> u32 {
         self.index
+    }
+    fn get_descr_index(&self) -> i32 {
+        self.descr_index.load(Ordering::Relaxed)
+    }
+    fn set_descr_index(&self, index: i32) {
+        self.descr_index.store(index, Ordering::Relaxed);
     }
     fn as_call_descr(&self) -> Option<&dyn CallDescr> {
         Some(self)
@@ -2094,25 +2195,23 @@ pub fn make_field_descr_full(
     field_type: Type,
     is_immutable: bool,
 ) -> DescrRef {
-    register_descr(std::sync::Arc::new(SimpleFieldDescr::new(
+    std::sync::Arc::new(SimpleFieldDescr::new(
         index,
         offset,
         field_size,
         field_type,
         is_immutable,
-    )))
+    ))
 }
 
 /// Create a size descriptor.
 pub fn make_size_descr(size: usize) -> DescrRef {
-    register_descr(std::sync::Arc::new(SimpleSizeDescr::new(0, size, 0)))
+    std::sync::Arc::new(SimpleSizeDescr::new(0, size, 0))
 }
 
 /// Create a size descriptor with explicit index and type_id.
 pub fn make_size_descr_full(index: u32, size: usize, type_id: u32) -> DescrRef {
-    register_descr(std::sync::Arc::new(SimpleSizeDescr::new(
-        index, size, type_id,
-    )))
+    std::sync::Arc::new(SimpleSizeDescr::new(index, size, type_id))
 }
 
 /// Create a size descriptor with vtable (for NEW_WITH_VTABLE objects).
@@ -2122,16 +2221,12 @@ pub fn make_size_descr_with_vtable(
     type_id: u32,
     vtable: usize,
 ) -> DescrRef {
-    register_descr(std::sync::Arc::new(SimpleSizeDescr::with_vtable(
-        index, size, type_id, vtable,
-    )))
+    std::sync::Arc::new(SimpleSizeDescr::with_vtable(index, size, type_id, vtable))
 }
 
 /// Create an array descriptor.
 pub fn make_array_descr(base_size: usize, item_size: usize, item_type: Type) -> DescrRef {
-    register_descr(std::sync::Arc::new(SimpleArrayDescr::new(
-        0, base_size, item_size, 0, item_type,
-    )))
+    std::sync::Arc::new(SimpleArrayDescr::new(0, base_size, item_size, 0, item_type))
 }
 
 /// Create an array descriptor with explicit index and type_id.
@@ -2142,14 +2237,14 @@ pub fn make_array_descr_full(
     type_id: u32,
     item_type: Type,
 ) -> DescrRef {
-    register_descr(std::sync::Arc::new(SimpleArrayDescr::new(
+    std::sync::Arc::new(SimpleArrayDescr::new(
         index, base_size, item_size, type_id, item_type,
-    )))
+    ))
 }
 
 /// Create a call descriptor.
 pub fn make_call_descr(arg_types: Vec<Type>, result_type: Type, effect: EffectInfo) -> DescrRef {
-    register_descr(std::sync::Arc::new(SimpleCallDescr::new(
+    std::sync::Arc::new(SimpleCallDescr::new(
         0,
         arg_types,
         result_type,
@@ -2159,7 +2254,7 @@ pub fn make_call_descr(arg_types: Vec<Type>, result_type: Type, effect: EffectIn
             Type::Void => 0,
         },
         effect,
-    )))
+    ))
 }
 
 /// Create a call descriptor with explicit index.
@@ -2170,39 +2265,28 @@ pub fn make_call_descr_full(
     result_size: usize,
     effect: EffectInfo,
 ) -> DescrRef {
-    register_descr(std::sync::Arc::new(SimpleCallDescr::new(
+    std::sync::Arc::new(SimpleCallDescr::new(
         index,
         arg_types,
         result_type,
         result_size,
         effect,
-    )))
+    ))
 }
 
 /// Create a fail descriptor.
 pub fn make_fail_descr(fail_index: u32, fail_arg_types: Vec<Type>) -> DescrRef {
-    register_descr(std::sync::Arc::new(SimpleFailDescr::new(
-        0,
-        fail_index,
-        fail_arg_types,
-    )))
+    std::sync::Arc::new(SimpleFailDescr::new(0, fail_index, fail_arg_types))
 }
 
 /// Create a finish descriptor.
 pub fn make_finish_descr(fail_index: u32, fail_arg_types: Vec<Type>) -> DescrRef {
-    register_descr(std::sync::Arc::new(SimpleFailDescr::finish(
-        0,
-        fail_index,
-        fail_arg_types,
-    )))
+    std::sync::Arc::new(SimpleFailDescr::finish(0, fail_index, fail_arg_types))
 }
 
 /// Create a loop TargetToken descriptor.
 pub fn make_loop_target_descr(token_id: u64, is_preamble_target: bool) -> DescrRef {
-    register_descr(std::sync::Arc::new(BasicLoopTargetDescr::new(
-        token_id,
-        is_preamble_target,
-    )))
+    std::sync::Arc::new(BasicLoopTargetDescr::new(token_id, is_preamble_target))
 }
 
 // ── descr.py: unpack helpers ──

@@ -3688,7 +3688,7 @@ impl ResumeDataLoopMemo {
                         &numb_state.liveboxes,
                         &new_liveboxes,
                     ) as i32);
-                    numb_state.append_int(descr_idx as i32);
+                    numb_state.append_int(descr_idx);
                     numb_state.writer.append_short(self._gettagged(
                         val,
                         env,
@@ -3715,7 +3715,7 @@ impl ResumeDataLoopMemo {
                         &new_liveboxes,
                     ) as i32);
                     numb_state.append_int(index as i32);
-                    numb_state.append_int(descr_idx as i32);
+                    numb_state.append_int(descr_idx);
                     numb_state.writer.append_short(self._gettagged(
                         val,
                         env,
@@ -3996,10 +3996,10 @@ pub struct TaggedPendingField {
 pub struct OptimizerKnowledgeForResume {
     /// (obj_opref, descr_index, val_opref) heap field triples.
     /// bridgeopt.py:96-101
-    pub heap_fields: Vec<(majit_ir::OpRef, u32, majit_ir::OpRef)>,
+    pub heap_fields: Vec<(majit_ir::OpRef, i32, majit_ir::OpRef)>,
     /// (array_opref, index, descr_index, val_opref) heap array item quads.
     /// bridgeopt.py:102-108
-    pub heap_arrayitems: Vec<(majit_ir::OpRef, i64, u32, majit_ir::OpRef)>,
+    pub heap_arrayitems: Vec<(majit_ir::OpRef, i64, i32, majit_ir::OpRef)>,
     /// (const_func_ptr, result_opref) loop-invariant call results.
     pub loopinvariant_results: Vec<(i64, majit_ir::OpRef)>,
 }
