@@ -894,10 +894,25 @@ impl<S: JitState> JitDriver<S> {
                             provisional_meta
                         }
                     };
-                    // pyjitpl.py:2993-3007: compile_loop checks
-                    // has_partial_trace internally and dispatches to
-                    // compile_retrace when appropriate.
-                    self.meta.compile_loop(&jump_args, meta);
+                    // pyjitpl.py:3015-3030 compile_loop + raise_if_successful.
+                    let meta_backup = meta.clone();
+                    let outcome = self.meta.compile_loop(&jump_args, meta);
+                    match outcome {
+                        crate::CompileOutcome::Compiled { .. } => {
+                            // pyjitpl.py:3095 raise_if_successful → done
+                        }
+                        crate::CompileOutcome::Cancelled => {
+                            // pyjitpl.py:3018-3019 cancel_count incremented inside
+                            // compile_loop. Tracing continues — next loop header
+                            // will retry compile_loop with accumulated cancel_count.
+                            self.trace_meta = Some(meta_backup);
+                            return;
+                        }
+                        crate::CompileOutcome::Aborted => {
+                            // pyjitpl.py:3028 SwitchToBlackhole(ABORT_BAD_LOOP)
+                            self.meta.abort_trace(false);
+                        }
+                    }
                 } else {
                     if crate::majit_log_enabled() {
                         eprintln!("[mp] abort:validate_close");
@@ -977,10 +992,23 @@ impl<S: JitState> JitDriver<S> {
                             provisional_meta
                         }
                     };
-                    // pyjitpl.py:2993-3007: compile_loop checks
-                    // has_partial_trace internally and dispatches to
-                    // compile_retrace when appropriate.
-                    self.meta.compile_loop(&jump_args, meta);
+                    // pyjitpl.py:3015-3030 compile_loop + raise_if_successful.
+                    let meta_backup = meta.clone();
+                    let outcome = self.meta.compile_loop(&jump_args, meta);
+                    match outcome {
+                        crate::CompileOutcome::Compiled { .. } => {
+                            // pyjitpl.py:3095 raise_if_successful → done
+                        }
+                        crate::CompileOutcome::Cancelled => {
+                            // pyjitpl.py:3018-3019 tracing continues.
+                            self.trace_meta = Some(meta_backup);
+                            return;
+                        }
+                        crate::CompileOutcome::Aborted => {
+                            // pyjitpl.py:3028 SwitchToBlackhole
+                            self.meta.abort_trace(false);
+                        }
+                    }
                 } else {
                     if crate::majit_log_enabled() {
                         eprintln!(

@@ -2447,12 +2447,12 @@ impl<M: Clone> MetaInterp<M> {
                         );
                     }
                     self.cancel_count += 1;
-                    // pyjitpl.py:3021-3030: only after the retry budget is
-                    // exhausted do we try one last time without unrolling.
+                    // pyjitpl.py:3018-3029: RPython increments cancel_count
+                    // and falls through (tracing continues). compile_loop is
+                    // re-invoked on the next reached_loop_header. Do NOT call
+                    // abort_tracing — TRACING flag must stay active.
                     if !self.cancelled_too_many_times() {
-                        self.warm_state.abort_tracing(green_key, false);
                         self.exported_state = None;
-                        self.warm_state.reset_function_counts();
                         return CompileOutcome::Cancelled;
                     }
                     {
