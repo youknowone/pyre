@@ -92,6 +92,12 @@ pub struct TraceCtx {
     /// TraceCtx because TraceCtx is freshly created per trace and the
     /// MetaInterp is reused across traces.
     forced_virtualizable: Option<OpRef>,
+    /// compile.py:1028 runtime_boxes parity: runtime values from guard
+    /// failure (DeadFrame). Set by the frontend after start_bridge_tracing
+    /// using DeadFrame raw_values. Equivalent to RPython's trace.inputargs
+    /// (boxes rebuilt from deadframe via rebuild_from_resumedata).
+    /// Read in compile_trace_inner, passed to compile_bridge.
+    pub(crate) runtime_boxes: Option<Vec<i64>>,
 }
 
 /// pyjitpl.py:2989 — a visited loop header with its trace position.
@@ -284,6 +290,7 @@ impl TraceCtx {
             initial_inputarg_consts: vec![],
             pending_guard_not_invalidated_pc: None,
             forced_virtualizable: None,
+            runtime_boxes: None,
         }
     }
 
@@ -325,6 +332,7 @@ impl TraceCtx {
             initial_inputarg_consts: vec![],
             pending_guard_not_invalidated_pc: None,
             forced_virtualizable: None,
+            runtime_boxes: None,
         }
     }
 

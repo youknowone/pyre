@@ -2182,6 +2182,14 @@ pub fn trace_and_compile_from_bridge(
         return false;
     }
 
+    // compile.py:1028 runtime_boxes parity: DeadFrame values = guard's
+    // fail_args in backend order. RPython's trace.inputargs = boxes
+    // rebuilt from deadframe via rebuild_from_resumedata.
+    {
+        let (driver, _) = crate::eval::driver_pair();
+        driver.meta_interp_mut().set_trace_runtime_boxes(raw_values);
+    }
+
     // RPython pyjitpl.py:3101 _prepare_exception_resumption +
     // pyjitpl.py:3132 prepare_resume_from_failure parity:
     // For exception guard bridges (GUARD_EXCEPTION / GUARD_NO_EXCEPTION),

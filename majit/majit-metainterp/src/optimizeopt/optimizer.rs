@@ -25,7 +25,11 @@ pub(crate) struct PendingBridgeRd {
     pub liveboxes: Vec<OpRef>,
     pub livebox_types: Vec<Type>,
     pub all_descrs: std::collections::HashMap<u32, majit_ir::descr::DescrRef>,
-    pub cls_of_box: Option<fn(i64) -> i64>,
+    /// model.py:199-201 cpu.cls_of_box(box): backend abstraction for reading
+    /// the class pointer from a runtime Ref object. RPython calls
+    /// optimizer.cpu.cls_of_box(); majit routes through this callback so
+    /// the metainterp layer does not hardcode object layout assumptions.
+    pub cls_of_box: fn(i64) -> i64,
 }
 
 /// The optimizer: chains passes and runs them over a trace.
@@ -119,9 +123,6 @@ pub struct Optimizer {
     /// after setup(). RPython calls deserialize_optimizer_knowledge after the
     /// optimizer is constructed.
     pending_bridge_rd: Option<PendingBridgeRd>,
-    /// DescrRefs encountered during optimizer knowledge collection.
-    /// Drained by compile_loop/compile_bridge into MetaInterp.all_descrs.
-    pub used_descrs: Vec<DescrRef>,
     /// optimizer.py:787: constant_fold allocator for compile-time object creation.
     pub constant_fold_alloc: Option<crate::optimizeopt::ConstantFoldAllocFn>,
     /// info.py:810-822 `ConstPtrInfo.getstrlen1(mode)` runtime hook —
@@ -944,7 +945,6 @@ impl Optimizer {
             terminal_op: None,
             final_ctx: None,
             pending_bridge_rd: None,
-            used_descrs: Vec::new(),
             constant_fold_alloc: None,
             string_length_resolver: None,
             callinfocollection: None,
@@ -3059,9 +3059,7 @@ impl Optimizer {
             // Rust adaptation: collect BEFORE the call (borrow checker) and pass
             // as parameter. available_boxes filtering happens inside
             // memo.finish() using liveboxes ∩ liveboxes_from_env.
-            let (knowledge_for_resume, used_descrs) =
-                self.collect_optimizer_knowledge_for_resume(ctx);
-            self.used_descrs.extend(used_descrs);
+            let knowledge_for_resume = self.collect_optimizer_knowledge_for_resume(ctx);
             let knowledge = if knowledge_for_resume.is_empty() {
                 None
             } else {
@@ -3206,13 +3204,10 @@ impl Optimizer {
     /// memo.finish() during the actual serialization, matching RPython's
     /// flow where serialize_optheap/serialize_optrewrite receive
     /// available_boxes computed from liveboxes ∩ liveboxes_from_env.
-    ///
-    /// Returns (OptimizerKnowledgeForResume, Vec<DescrRef>) where the
-    /// second element contains DescrRefs for all_descrs registration.
     fn collect_optimizer_knowledge_for_resume(
         &self,
         ctx: &mut OptContext,
-    ) -> (crate::resume::OptimizerKnowledgeForResume, Vec<DescrRef>) {
+    ) -> crate::resume::OptimizerKnowledgeForResume {
         let mut heap_fields_raw = Vec::new();
         let mut heap_arrayitems_raw = Vec::new();
         for pass in &self.passes {
@@ -3232,13 +3227,11 @@ impl Optimizer {
             }
         }
 
-        // Convert DescrRef → u32 and collect DescrRefs for all_descrs.
         // heap.py:828: if descr.get_descr_index() == -1: continue
         // RPython filters descriptors not reachable via all_descrs.
-        // RPython descr.py:47 asserts len(all_descrs) < 2**15.
+        // descr.py:47 asserts len(all_descrs) < 2**15.
         // In majit, index() == u32::MAX means not registered;
         // index >= 2^15 exceeds the rd_numb varint encoding limit.
-        let mut used_descrs = Vec::new();
         let heap_fields: Vec<(OpRef, u32, OpRef)> = heap_fields_raw
             .into_iter()
             .filter_map(|(obj, descr, val)| {
@@ -3246,7 +3239,6 @@ impl Optimizer {
                 if idx == u32::MAX || idx >= (1 << 15) {
                     return None;
                 }
-                used_descrs.push(descr);
                 Some((obj, idx, val))
             })
             .collect();
@@ -3257,17 +3249,15 @@ impl Optimizer {
                 if idx == u32::MAX || idx >= (1 << 15) {
                     return None;
                 }
-                used_descrs.push(descr);
                 Some((obj, index, idx, val))
             })
             .collect();
 
-        let knowledge = crate::resume::OptimizerKnowledgeForResume {
+        crate::resume::OptimizerKnowledgeForResume {
             heap_fields,
             heap_arrayitems,
             loopinvariant_results,
-        };
-        (knowledge, used_descrs)
+        }
     }
 
     /// optimizer.py:754-778 _maybe_replace_guard_value

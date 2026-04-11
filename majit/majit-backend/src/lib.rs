@@ -1612,6 +1612,28 @@ pub trait Backend: Send {
     fn cast_gcref_to_int(&self, gcref: GcRef) -> i64 {
         gcref.as_usize() as i64
     }
+
+    /// model.py:199-201 cpu.cls_of_box(box):
+    ///   obj = lltype.cast_opaque_ptr(OBJECTPTR, box.getref_base())
+    ///   return ConstInt(ptr2int(obj.typeptr))
+    ///
+    /// Read the class pointer (typeptr/vtable) from a runtime Ref object.
+    /// Default reads offset 0 (standard RPython object layout).
+    /// Backends with different object models (e.g. gcremovetypeptr)
+    /// should override.
+    fn cls_of_box(&self, raw_ref: i64) -> i64 {
+        debug_assert!(raw_ref != 0, "cls_of_box: null ref");
+        unsafe { *(raw_ref as *const usize) as i64 }
+    }
+
+    /// Return cls_of_box as a function pointer (Rust adaptation for
+    /// passing through PendingBridgeRd without lifetime issues).
+    fn cls_of_box_fn(&self) -> fn(i64) -> i64 {
+        |raw_ref: i64| -> i64 {
+            debug_assert!(raw_ref != 0, "cls_of_box: null ref");
+            unsafe { *(raw_ref as *const usize) as i64 }
+        }
+    }
 }
 
 /// Errors from the backend.

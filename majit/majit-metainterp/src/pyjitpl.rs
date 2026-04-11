@@ -412,6 +412,10 @@ pub(crate) struct PendingDoneBridge {
     pub snapshot_vable_boxes: HashMap<i32, Vec<majit_ir::OpRef>>,
     pub snapshot_frame_pcs: HashMap<i32, Vec<(i32, i32)>>,
     pub snapshot_box_types: HashMap<u32, majit_ir::Type>,
+    /// compile.py:1057-1060 BridgeCompileData runtime_boxes parity:
+    /// runtime values from guard failure. Captured at
+    /// compile_done_with_this_frame time for deferred compilation.
+    pub runtime_boxes: Option<Vec<i64>>,
 }
 
 pub struct MetaInterp<M: Clone> {
@@ -523,14 +527,9 @@ pub struct MetaInterp<M: Clone> {
     /// are encountered during tracing/optimization. Used by
     /// deserialize_optimizer_knowledge to recover DescrRef from rd_numb.
     pub(crate) all_descrs: HashMap<u32, DescrRef>,
-    /// bridgeopt.py:124 frontend_boxes parity: runtime values from the
-    /// guard failure DeadFrame. Saved by start_retrace_from_guard, used
-    /// by compile_bridge for cls_of_box during deserialize_optimizer_knowledge.
-    pending_frontend_boxes: Option<Vec<i64>>,
-    /// model.py:199-201 cpu.cls_of_box parity: callback that reads
-    /// the class/vtable pointer from a runtime Ref object.
-    /// Registered by the interpreter at JIT init.
-    pub(crate) cls_of_box: Option<fn(i64) -> i64>,
+    // compile.py:1028 runtime_boxes: carried on TraceCtx (trace.inputargs
+    // parity), not on MetaInterp. Set by the frontend via
+    // set_trace_runtime_boxes(); read in compile_trace_inner.
 }
 
 /// Internal mutable counters for JIT compilation statistics.
@@ -917,8 +916,6 @@ impl<M: Clone> MetaInterp<M> {
             virtualref_boxes: Vec::new(),
             pending_preamble_tokens: HashMap::new(),
             all_descrs: HashMap::new(),
-            pending_frontend_boxes: None,
-            cls_of_box: None,
         }
     }
 
@@ -933,14 +930,31 @@ impl<M: Clone> MetaInterp<M> {
         self.result_type
     }
 
-    /// pyjitpl.py:2287-2290 finish_setup_descrs: register descriptors into
-    /// the global all_descrs registry for rd_numb deserialization.
-    pub(crate) fn register_all_descrs(&mut self, descrs: impl IntoIterator<Item = DescrRef>) {
-        for descr in descrs {
+    /// pyjitpl.py:2287-2290 finish_setup_descrs:
+    ///   self.all_descrs = self.cpu.setup_descrs()
+    ///
+    /// Populates all_descrs from the global descriptor registry.
+    /// RPython calls this once at JIT warmup; majit refreshes before
+    /// each optimization because descriptors are registered dynamically.
+    /// Goal: move to a single setup-time call once descriptor registration
+    /// is consolidated.
+    pub(crate) fn finish_setup_descrs(&mut self) {
+        for descr in majit_ir::descr::setup_descrs() {
             let idx = descr.index();
             if idx != u32::MAX {
                 self.all_descrs.insert(idx, descr);
             }
+        }
+    }
+
+    /// compile.py:1028 / history.py set_inputargs parity:
+    /// Set runtime_boxes on the active TraceCtx from DeadFrame values.
+    /// Called by the frontend (call_jit.rs) after start_bridge_tracing.
+    /// RPython equivalent: history.set_inputargs(inputargs) where inputargs
+    /// come from rebuild_from_resumedata(deadframe).
+    pub fn set_trace_runtime_boxes(&mut self, raw_values: &[i64]) {
+        if let Some(ref mut ctx) = self.tracing {
+            ctx.runtime_boxes = Some(raw_values.to_vec());
         }
     }
 
@@ -2078,6 +2092,9 @@ impl<M: Clone> MetaInterp<M> {
         // Phase 2 InvalidLoop. Phase 1 writes to phase1_out on the caller's
         // stack BEFORE Phase 2 starts. If Phase 2 panics, phase1_out still
         // holds the Phase 1 results.
+        // pyjitpl.py:2287-2290 finish_setup_descrs
+        self.finish_setup_descrs();
+
         let mut phase1_out: Option<(Vec<Op>, crate::optimizeopt::unroll::ExportedState)> = None;
         let mut updated_constant_types = constant_types.clone();
         let optimize_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -2381,7 +2398,6 @@ impl<M: Clone> MetaInterp<M> {
                     trace_id,
                     &mut terminal_exit_layouts,
                 );
-                self.register_all_descrs(unroll_opt.used_descrs.drain(..));
                 let mut traces = HashMap::new();
                 traces.insert(
                     trace_id,
@@ -2640,6 +2656,12 @@ impl<M: Clone> MetaInterp<M> {
             &mut constant_types,
         );
 
+        // compile.py:1028 compile_trace parity: extract runtime_boxes
+        // (= trace.inputargs = DeadFrame values) from the TraceCtx before
+        // the trace context is consumed. Passed through compile_bridge →
+        // optimize_bridge → deserialize_optimizer_knowledge.
+        let runtime_boxes = ctx.runtime_boxes.take();
+
         // pyjitpl.py:3195 finally: always cut — pop the tentative JUMP/FINISH.
         ctx.recorder.unfinalize();
         ctx.recorder.cut(cut_at);
@@ -2696,6 +2718,8 @@ impl<M: Clone> MetaInterp<M> {
                     snapshot_vable_boxes,
                     snapshot_frame_pcs,
                     snapshot_box_types.clone(),
+                    true, // ends_with_jump: BridgeCompileData path
+                    runtime_boxes.clone(),
                 );
                 if success {
                     CompileOutcome::Compiled {
@@ -2872,6 +2896,9 @@ impl<M: Clone> MetaInterp<M> {
         // optimizer can continue from where it left off.
         unroll_opt.imported_state = Some(start_state);
 
+        // pyjitpl.py:2287-2290 finish_setup_descrs parity
+        self.finish_setup_descrs();
+
         let mut updated_constant_types = constant_types.clone();
         let optimize_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let result = unroll_opt.optimize_trace_with_constants_and_inputs_vable(
@@ -3026,7 +3053,6 @@ impl<M: Clone> MetaInterp<M> {
                     trace_id,
                     &mut terminal_exit_layouts,
                 );
-                self.register_all_descrs(unroll_opt.used_descrs.drain(..));
                 let mut traces = HashMap::new();
                 traces.insert(
                     trace_id,
@@ -3384,7 +3410,6 @@ impl<M: Clone> MetaInterp<M> {
                     trace_id,
                     &mut terminal_exit_layouts,
                 );
-                self.register_all_descrs(optimizer.used_descrs.drain(..));
                 let mut traces = HashMap::new();
                 traces.insert(
                     trace_id,
@@ -3547,6 +3572,9 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.snapshot_vable_boxes = snapshot_vable_map;
         optimizer.snapshot_frame_pcs = snapshot_pc_map;
 
+        // pyjitpl.py:2287-2290 finish_setup_descrs parity
+        self.finish_setup_descrs();
+
         let mut updated_constant_types = constant_types.clone();
         let optimize_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let result = optimizer.optimize_with_constants_and_inputs(
@@ -3683,7 +3711,6 @@ impl<M: Clone> MetaInterp<M> {
                     trace_id,
                     &mut terminal_exit_layouts,
                 );
-                self.register_all_descrs(optimizer.used_descrs.drain(..));
                 let mut traces = HashMap::new();
                 traces.insert(
                     trace_id,
@@ -5201,6 +5228,12 @@ impl<M: Clone> MetaInterp<M> {
             }
         };
 
+        // compile.py:1057-1060 parity: capture runtime_boxes from the
+        // active TraceCtx so deferred compilation retains access.
+        let runtime_boxes_captured = self
+            .tracing
+            .as_mut()
+            .and_then(|ctx| ctx.runtime_boxes.take());
         let pb = PendingDoneBridge {
             green_key,
             trace_id,
@@ -5214,6 +5247,7 @@ impl<M: Clone> MetaInterp<M> {
             snapshot_vable_boxes: HashMap::new(),
             snapshot_frame_pcs: HashMap::new(),
             snapshot_box_types: HashMap::new(),
+            runtime_boxes: runtime_boxes_captured,
         };
 
         if self.compiled_loops.contains_key(&green_key) {
@@ -5236,6 +5270,10 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// Compile a pending done_with_this_frame bridge using saved trace data.
+    /// compile.py:1057-1060 SimpleCompileData parity: done_with_this_frame
+    /// bridges end with FINISH, not JUMP. RPython uses SimpleCompileData
+    /// (ends_with_jump=False) which does NOT call optimize_bridge /
+    /// deserialize_optimizer_knowledge.
     fn compile_pending_done_bridge(&mut self, pending: PendingDoneBridge) {
         let fail_descr = {
             let compiled = match self.compiled_loops.get(&pending.green_key) {
@@ -5253,6 +5291,8 @@ impl<M: Clone> MetaInterp<M> {
                 pending.green_key, pending.fail_index,
             );
         }
+        // Restore runtime_boxes captured at compile_done_with_this_frame time.
+        // For done bridges (SimpleCompileData), this is typically None.
         self.compile_bridge(
             pending.green_key,
             pending.fail_index,
@@ -5266,6 +5306,8 @@ impl<M: Clone> MetaInterp<M> {
             pending.snapshot_vable_boxes,
             pending.snapshot_frame_pcs,
             pending.snapshot_box_types,
+            false, // ends_with_jump=false: SimpleCompileData path
+            pending.runtime_boxes,
         );
     }
 
@@ -5452,6 +5494,8 @@ impl<M: Clone> MetaInterp<M> {
             (compiled.retraced_count, compiled.num_inputs)
         };
         let retrace_limit = 5u32;
+        // pyjitpl.py:2287-2290 finish_setup_descrs parity
+        self.finish_setup_descrs();
         let bridge_optimize_result = {
             let compiled = self.compiled_loops.get_mut(&green_key).unwrap();
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -5638,7 +5682,6 @@ impl<M: Clone> MetaInterp<M> {
                     trace_id,
                     &mut terminal_exit_layouts,
                 );
-                self.register_all_descrs(optimizer.used_descrs.drain(..));
                 let mut traces = HashMap::new();
                 traces.insert(
                     trace_id,
@@ -5722,6 +5765,10 @@ impl<M: Clone> MetaInterp<M> {
     /// `fail_descr` is the FailDescr from the guard that failed.
     /// `bridge_ops` are the recorded bridge trace operations.
     /// `bridge_inputargs` are the input arguments for the bridge.
+    /// compile.py:1028-1073 compile_trace parity.
+    /// `ends_with_jump`: true for BridgeCompileData (normal bridge, JUMP at end),
+    /// false for SimpleCompileData (done bridge, FINISH at end).
+    /// Only BridgeCompileData paths call deserialize_optimizer_knowledge.
     pub fn compile_bridge(
         &mut self,
         green_key: u64,
@@ -5736,6 +5783,10 @@ impl<M: Clone> MetaInterp<M> {
         snapshot_vable_boxes: HashMap<i32, Vec<majit_ir::OpRef>>,
         snapshot_frame_pcs: HashMap<i32, Vec<(i32, i32)>>,
         snapshot_box_types: HashMap<u32, Type>,
+        ends_with_jump: bool,
+        // compile.py:1028 compile_trace(metainterp, resumekey, runtime_boxes)
+        // parity: DeadFrame values passed through the call chain.
+        runtime_boxes: Option<Vec<i64>>,
     ) -> bool {
         if !self.compiled_loops.contains_key(&green_key) {
             return false;
@@ -5761,6 +5812,8 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.snapshot_box_types = snapshot_box_types;
         // compile.py:1035-1038: isinstance(resumekey, ResumeAtPositionDescr)
         let inline_short_preamble = !fail_descr.is_resume_at_position();
+        // pyjitpl.py:2287-2290 finish_setup_descrs parity
+        self.finish_setup_descrs();
         let compiled = self.compiled_loops.get_mut(&green_key).unwrap();
         let retraced_count = compiled.retraced_count;
         // RPython warmspot.py:93 retrace_limit=5: allow bridge to create
@@ -5769,9 +5822,11 @@ impl<M: Clone> MetaInterp<M> {
         // infinite guard failure loops on preamble guards).
         let retrace_limit = 5u32;
         // bridgeopt.py:124-185 deserialize_optimizer_knowledge:
-        // Retrieve guard's rd_numb + frontend_boxes for deserialization.
+        // Only BridgeCompileData paths (ends_with_jump=true) deserialize
+        // optimizer knowledge. SimpleCompileData (ends_with_jump=false)
+        // does not call optimize_bridge / deserialize_optimizer_knowledge.
         use crate::optimizeopt::optimizer::PendingBridgeRd;
-        let pending_bridge_rd: Option<PendingBridgeRd> = {
+        let pending_bridge_rd: Option<PendingBridgeRd> = if ends_with_jump {
             let source_trace_id = {
                 let tid = fail_descr.trace_id();
                 if tid == 0 {
@@ -5789,10 +5844,24 @@ impl<M: Clone> MetaInterp<M> {
                     .map(|i| OpRef(i as u32))
                     .collect();
                 let livebox_types: Vec<Type> = bridge_inputargs.iter().map(|ia| ia.tp).collect();
-                // bridgeopt.py:124: frontend_boxes = runtime values from
-                // guard failure. RPython passes Box objects; majit passes
-                // raw i64 values from the DeadFrame.
-                let frontend_boxes = self.pending_frontend_boxes.take().unwrap_or_default();
+                // compile.py:1028 compile_trace(metainterp, resumekey, runtime_boxes)
+                // parity: runtime_boxes passed through the call chain.
+                // unroll.py:186: frontend_inputargs = trace.inputargs
+                let frontend_boxes = runtime_boxes
+                    .as_ref()
+                    .expect(
+                        "BridgeCompileData path requires runtime_boxes \
+                             (DeadFrame values from guard failure)",
+                    )
+                    .clone();
+                // bridgeopt.py:126: assert len(frontend_boxes) == len(liveboxes)
+                assert_eq!(
+                    frontend_boxes.len(),
+                    liveboxes.len(),
+                    "runtime_boxes ({}) must match liveboxes ({})",
+                    frontend_boxes.len(),
+                    liveboxes.len(),
+                );
                 Some(PendingBridgeRd {
                     rd_numb,
                     rd_consts,
@@ -5800,9 +5869,14 @@ impl<M: Clone> MetaInterp<M> {
                     liveboxes,
                     livebox_types,
                     all_descrs: self.all_descrs.clone(),
-                    cls_of_box: self.cls_of_box,
+                    // model.py:199-201 cpu.cls_of_box: from backend
+                    cls_of_box: self.backend.cls_of_box_fn(),
                 })
             })
+        } else {
+            // compile.py:1061-1063 SimpleCompileData: no optimize_bridge,
+            // no deserialize_optimizer_knowledge.
+            None
         };
         // Store bridge inputarg types so export_state can propagate them
         // to ExportedState.renamed_inputarg_types (RPython Box type parity).
@@ -6140,7 +6214,6 @@ impl<M: Clone> MetaInterp<M> {
                         },
                     );
                 }
-                self.register_all_descrs(optimizer.used_descrs.drain(..));
                 self.warm_state.log_bridge_compile(fail_index);
                 self.stats.bridges_compiled += 1;
 
@@ -6184,9 +6257,6 @@ impl<M: Clone> MetaInterp<M> {
         fail_values: &[i64],
         _live_types: &[Type],
     ) -> Option<BridgeRetraceResult> {
-        // bridgeopt.py:124 parity: save runtime values (frontend_boxes)
-        // for cls_of_box during bridge deserialization.
-        self.pending_frontend_boxes = Some(fail_values.to_vec());
         let compiled = match self.compiled_loops.get(&green_key) {
             Some(c) => c,
             None => return None,
@@ -6213,6 +6283,11 @@ impl<M: Clone> MetaInterp<M> {
         // fail_descr has the UPDATED types (may include virtual field boxes).
         // bridge_fail_descr_proxy already prefers backend types.
         let bridge_input_types = fail_descr.fail_arg_types();
+
+        // compile.py:1028 parity: runtime_boxes are set on TraceCtx by
+        // the frontend (call_jit.rs set_trace_runtime_boxes) using the
+        // DeadFrame's raw_values. Equivalent to RPython's
+        // history.set_inputargs(inputargs) from rebuild_from_resumedata.
         let recorder = self.warm_state.start_retrace(bridge_input_types);
         self.force_finish_trace = false;
         self.tracing = Some(crate::trace_ctx::TraceCtx::new(recorder, green_key));
