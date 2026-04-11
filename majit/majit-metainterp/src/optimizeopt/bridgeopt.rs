@@ -973,11 +973,10 @@ pub fn deserialize_optimizer_knowledge(
         let const_int = match &const_box {
             DecodedBox::ConstInt(v) => *v,
             DecodedBox::Const(v, _) => *v,
-            _ => {
-                // skip malformed entry, still consume tagged2
-                let _tagged2 = reader.next_item();
-                continue;
-            }
+            _ => panic!(
+                "bridgeopt: loopinvariant entry must be ConstInt, got {:?}",
+                const_box
+            ),
         };
         let tagged2 = reader.next_item() as i16;
         let box2 = decode_box(tagged2, rd_consts, liveboxes);

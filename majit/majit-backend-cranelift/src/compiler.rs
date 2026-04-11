@@ -11240,20 +11240,7 @@ impl majit_backend::Backend for CraneliftBackend {
         ptr
     }
 
-    /// llmodel.py:816 bh_call_i: ABI-correct dispatch.
-    ///
-    /// ARM64/x86-64 C ABI assigns integer and float args to independent register
-    /// files (x0-x7 + d0-d7 on ARM64; rdi,rsi,… + xmm0-xmm7 on x86-64).
-    /// We construct `fn(ints…, floats…) -> i64` which places each group in the
-    /// correct register file regardless of their original interleaving order.
-    ///
-    /// llmodel.py:816-820 bh_call_i(func, args_i, args_r, args_f, calldescr)
-    /// calldescr.call_stub_i(func, args_i, args_r, args_f).
-    ///
-    /// On ARM64/x86-64, the C ABI assigns integer and floating-point args to
-    /// independent register files (x0-x7 / d0-d7 on ARM64; rdi,rsi,... /
-    /// xmm0-xmm7 on x86-64). So we can always construct the function pointer
-    /// as `fn(ints..., floats...) -> i64` and get the correct register layout.
+    /// llmodel.py:816-820
     fn bh_call_i(
         &self,
         func: i64,
@@ -11262,34 +11249,48 @@ impl majit_backend::Backend for CraneliftBackend {
         args_f: Option<&[i64]>,
         calldescr: &majit_codewriter::jitcode::BhCallDescr,
     ) -> i64 {
-        if func == 0 {
-            return 0;
-        }
-        // Separate integer (i+r) and float (f) args in arg_classes order.
-        let mut int_args: Vec<i64> = Vec::new();
-        let mut float_args: Vec<f64> = Vec::new();
-        let mut ii = 0usize;
-        let mut ri = 0usize;
-        let mut fi = 0usize;
-        for c in calldescr.arg_classes.chars() {
-            match c {
-                'i' => {
-                    int_args.push(args_i.and_then(|a| a.get(ii).copied()).unwrap_or(0));
-                    ii += 1;
-                }
-                'r' => {
-                    int_args.push(args_r.and_then(|a| a.get(ri).copied()).unwrap_or(0));
-                    ri += 1;
-                }
-                'f' => {
-                    let bits = args_f.and_then(|a| a.get(fi).copied()).unwrap_or(0);
-                    float_args.push(f64::from_bits(bits as u64));
-                    fi += 1;
-                }
-                _ => {}
-            }
-        }
-        unsafe { bh_call_i_dispatch(func as usize, &int_args, &float_args) }
+        // llmodel.py:820: return calldescr.call_stub_i(func, args_i, args_r, args_f)
+        call_stub_i(calldescr, func, args_i, args_r, args_f)
+    }
+
+    /// llmodel.py:822-826
+    fn bh_call_r(
+        &self,
+        func: i64,
+        args_i: Option<&[i64]>,
+        args_r: Option<&[i64]>,
+        args_f: Option<&[i64]>,
+        calldescr: &majit_codewriter::jitcode::BhCallDescr,
+    ) -> GcRef {
+        // llmodel.py:826: return calldescr.call_stub_r(func, args_i, args_r, args_f)
+        call_stub_r(calldescr, func, args_i, args_r, args_f)
+    }
+
+    /// llmodel.py:828-832
+    fn bh_call_f(
+        &self,
+        func: i64,
+        args_i: Option<&[i64]>,
+        args_r: Option<&[i64]>,
+        args_f: Option<&[i64]>,
+        calldescr: &majit_codewriter::jitcode::BhCallDescr,
+    ) -> f64 {
+        // llmodel.py:832: return calldescr.call_stub_f(func, args_i, args_r, args_f)
+        call_stub_f(calldescr, func, args_i, args_r, args_f)
+    }
+
+    /// llmodel.py:834-839
+    fn bh_call_v(
+        &self,
+        func: i64,
+        args_i: Option<&[i64]>,
+        args_r: Option<&[i64]>,
+        args_f: Option<&[i64]>,
+        calldescr: &majit_codewriter::jitcode::BhCallDescr,
+    ) {
+        // llmodel.py:839: the 'i' return value is ignored (and nonsense anyway)
+        // llmodel.py:839: calldescr.call_stub_i(func, args_i, args_r, args_f)
+        let _ = call_stub_i(calldescr, func, args_i, args_r, args_f);
     }
 
     /// llmodel.py:739-742 bh_raw_store_i(addr, offset, newvalue, descr)
@@ -11545,151 +11546,375 @@ fn emit_inline_arena_put(
     builder.seal_block(done_block);
 }
 
-/// llmodel.py:816 call_stub_i: ABI-correct dispatch with separate int/float
-/// register files. On ARM64/x86-64, integer args go to x0-x7 / rdi,rsi,... and
-/// float args go to d0-d7 / xmm0-xmm7 independently.
+// ---------------------------------------------------------------------------
+// descr.py:540-612 call_stub_i / call_stub_r / call_stub_f
+//
+// RPython pre-generates per-calldescr stubs via create_call_stub() that cast
+// func to the exact FUNC type and let the C compiler handle ABI.
+// In Rust we cannot generate typed function pointers at runtime, so we
+// replicate the same semantics generically: extract args from args_i/args_r/
+// args_f in arg_classes order and dispatch via platform-specific inline asm.
+// ---------------------------------------------------------------------------
+
+/// descr.py:540-612 call_stub_i — integer/void return variant.
+fn call_stub_i(
+    calldescr: &majit_codewriter::jitcode::BhCallDescr,
+    func: i64,
+    args_i: Option<&[i64]>,
+    args_r: Option<&[i64]>,
+    args_f: Option<&[i64]>,
+) -> i64 {
+    debug_assert!(func != 0, "call_stub_i: null function pointer");
+    let (int_args, float_args, stack_args) = prepare_call_args(calldescr, args_i, args_r, args_f);
+    unsafe { call_stub_asm_i(func as usize, &int_args, &float_args, &stack_args) }
+}
+
+/// descr.py:540-612 call_stub_r — reference return variant.
+/// cast_opaque_ptr(GCREF, res): pointer returns use the integer return
+/// register (x0/rax), same ABI as call_stub_i.
+fn call_stub_r(
+    calldescr: &majit_codewriter::jitcode::BhCallDescr,
+    func: i64,
+    args_i: Option<&[i64]>,
+    args_r: Option<&[i64]>,
+    args_f: Option<&[i64]>,
+) -> GcRef {
+    let raw = call_stub_i(calldescr, func, args_i, args_r, args_f);
+    GcRef(raw as usize)
+}
+
+/// descr.py:540-612 call_stub_f — float return variant.
+/// getfloatstorage(res): float returns use d0/xmm0.
+fn call_stub_f(
+    calldescr: &majit_codewriter::jitcode::BhCallDescr,
+    func: i64,
+    args_i: Option<&[i64]>,
+    args_r: Option<&[i64]>,
+    args_f: Option<&[i64]>,
+) -> f64 {
+    debug_assert!(func != 0, "call_stub_f: null function pointer");
+    let (int_args, float_args, stack_args) = prepare_call_args(calldescr, args_i, args_r, args_f);
+    unsafe { call_stub_asm_f(func as usize, &int_args, &float_args, &stack_args) }
+}
+
+/// Extract args from args_i/args_r/args_f in calldescr.arg_classes order,
+/// tracking register assignment for ABI stack overflow.
 ///
-/// Safety: func must be a valid function pointer matching the described ABI.
-unsafe fn bh_call_i_dispatch(func: usize, int_args: &[i64], float_args: &[f64]) -> i64 {
-    type I = i64;
-    type F = f64;
-    match (int_args.len(), float_args.len()) {
-        // No float args — integer-only calls.
-        (0, 0) => {
-            let f: unsafe extern "C" fn() -> I = std::mem::transmute(func);
-            f()
-        }
-        (1, 0) => {
-            let f: unsafe extern "C" fn(I) -> I = std::mem::transmute(func);
-            f(int_args[0])
-        }
-        (2, 0) => {
-            let f: unsafe extern "C" fn(I, I) -> I = std::mem::transmute(func);
-            f(int_args[0], int_args[1])
-        }
-        (3, 0) => {
-            let f: unsafe extern "C" fn(I, I, I) -> I = std::mem::transmute(func);
-            f(int_args[0], int_args[1], int_args[2])
-        }
-        (4, 0) => {
-            let f: unsafe extern "C" fn(I, I, I, I) -> I = std::mem::transmute(func);
-            f(int_args[0], int_args[1], int_args[2], int_args[3])
-        }
-        (5, 0) => {
-            let f: unsafe extern "C" fn(I, I, I, I, I) -> I = std::mem::transmute(func);
-            f(
-                int_args[0],
-                int_args[1],
-                int_args[2],
-                int_args[3],
-                int_args[4],
-            )
-        }
-        (6, 0) => {
-            let f: unsafe extern "C" fn(I, I, I, I, I, I) -> I = std::mem::transmute(func);
-            f(
-                int_args[0],
-                int_args[1],
-                int_args[2],
-                int_args[3],
-                int_args[4],
-                int_args[5],
-            )
-        }
-        // Float-only calls.
-        (0, 1) => {
-            let f: unsafe extern "C" fn(F) -> I = std::mem::transmute(func);
-            f(float_args[0])
-        }
-        (0, 2) => {
-            let f: unsafe extern "C" fn(F, F) -> I = std::mem::transmute(func);
-            f(float_args[0], float_args[1])
-        }
-        // Mixed int + float calls.
-        (1, 1) => {
-            let f: unsafe extern "C" fn(I, F) -> I = std::mem::transmute(func);
-            f(int_args[0], float_args[0])
-        }
-        (2, 1) => {
-            let f: unsafe extern "C" fn(I, I, F) -> I = std::mem::transmute(func);
-            f(int_args[0], int_args[1], float_args[0])
-        }
-        (1, 2) => {
-            let f: unsafe extern "C" fn(I, F, F) -> I = std::mem::transmute(func);
-            f(int_args[0], float_args[0], float_args[1])
-        }
-        (2, 2) => {
-            let f: unsafe extern "C" fn(I, I, F, F) -> I = std::mem::transmute(func);
-            f(int_args[0], int_args[1], float_args[0], float_args[1])
-        }
-        (3, 1) => {
-            let f: unsafe extern "C" fn(I, I, I, F) -> I = std::mem::transmute(func);
-            f(int_args[0], int_args[1], int_args[2], float_args[0])
-        }
-        (4, 1) => {
-            let f: unsafe extern "C" fn(I, I, I, I, F) -> I = std::mem::transmute(func);
-            f(
-                int_args[0],
-                int_args[1],
-                int_args[2],
-                int_args[3],
-                float_args[0],
-            )
-        }
-        (3, 2) => {
-            let f: unsafe extern "C" fn(I, I, I, F, F) -> I = std::mem::transmute(func);
-            f(
-                int_args[0],
-                int_args[1],
-                int_args[2],
-                float_args[0],
-                float_args[1],
-            )
-        }
-        (0, 3) => {
-            let f: unsafe extern "C" fn(F, F, F) -> I = std::mem::transmute(func);
-            f(float_args[0], float_args[1], float_args[2])
-        }
-        (0, 4) => {
-            let f: unsafe extern "C" fn(F, F, F, F) -> I = std::mem::transmute(func);
-            f(float_args[0], float_args[1], float_args[2], float_args[3])
-        }
-        (1, 3) => {
-            let f: unsafe extern "C" fn(I, F, F, F) -> I = std::mem::transmute(func);
-            f(int_args[0], float_args[0], float_args[1], float_args[2])
-        }
-        (7, 0) => {
-            let f: unsafe extern "C" fn(I, I, I, I, I, I, I) -> I = std::mem::transmute(func);
-            f(
-                int_args[0],
-                int_args[1],
-                int_args[2],
-                int_args[3],
-                int_args[4],
-                int_args[5],
-                int_args[6],
-            )
-        }
-        (8, 0) => {
-            let f: unsafe extern "C" fn(I, I, I, I, I, I, I, I) -> I = std::mem::transmute(func);
-            f(
-                int_args[0],
-                int_args[1],
-                int_args[2],
-                int_args[3],
-                int_args[4],
-                int_args[5],
-                int_args[6],
-                int_args[7],
-            )
-        }
-        (ni, nf) => {
-            panic!(
-                "bh_call_i: unsupported arg combination ({ni} ints, {nf} floats); \
-                 needs libffi for general dispatch"
-            );
+/// Returns (int_args, float_args, stack_args) where stack_args is in the
+/// correct argument order per AAPCS64 / SysV ABI rules.
+fn prepare_call_args(
+    calldescr: &majit_codewriter::jitcode::BhCallDescr,
+    args_i: Option<&[i64]>,
+    args_r: Option<&[i64]>,
+    args_f: Option<&[i64]>,
+) -> (Vec<i64>, Vec<f64>, Vec<u64>) {
+    #[cfg(target_arch = "aarch64")]
+    const MAX_INT_REGS: usize = 8;
+    #[cfg(target_arch = "x86_64")]
+    const MAX_INT_REGS: usize = 6;
+    const MAX_FLOAT_REGS: usize = 8;
+
+    let mut int_args: Vec<i64> = Vec::new();
+    let mut float_args: Vec<f64> = Vec::new();
+    let mut stack_args: Vec<u64> = Vec::new();
+    let mut ii = 0usize;
+    let mut ri = 0usize;
+    let mut fi = 0usize;
+    let mut ngrn = 0usize; // next general register number
+    let mut nsrn = 0usize; // next SIMD/float register number
+    for c in calldescr.arg_classes.chars() {
+        match c {
+            'i' => {
+                let val = args_i.and_then(|a| a.get(ii).copied()).unwrap_or(0);
+                int_args.push(val);
+                if ngrn >= MAX_INT_REGS {
+                    stack_args.push(val as u64);
+                }
+                ngrn += 1;
+                ii += 1;
+            }
+            'r' => {
+                let val = args_r.and_then(|a| a.get(ri).copied()).unwrap_or(0);
+                int_args.push(val);
+                if ngrn >= MAX_INT_REGS {
+                    stack_args.push(val as u64);
+                }
+                ngrn += 1;
+                ri += 1;
+            }
+            'f' => {
+                let bits = args_f.and_then(|a| a.get(fi).copied()).unwrap_or(0);
+                let fval = f64::from_bits(bits as u64);
+                float_args.push(fval);
+                if nsrn >= MAX_FLOAT_REGS {
+                    stack_args.push(fval.to_bits());
+                }
+                nsrn += 1;
+                fi += 1;
+            }
+            _ => {}
         }
     }
+    (int_args, float_args, stack_args)
+}
+
+// ---------------------------------------------------------------------------
+// Platform-specific ABI dispatch via inline asm.
+//
+// No direct RPython equivalent — RPython's create_call_stub generates typed
+// C function calls; the C compiler handles ABI.  In Rust we use inline asm
+// to load all arg registers and spill overflow to the stack.
+//
+// ARM64 AAPCS64: x0-x7 integer, d0-d7 float; overflow on stack.
+// x86-64 SysV:   rdi,rsi,rdx,rcx,r8,r9 integer, xmm0-7 float; overflow on stack.
+// ---------------------------------------------------------------------------
+
+// ── call_stub_asm_i: integer/pointer return (x0 / rax) ──
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn call_stub_asm_i(
+    func: usize,
+    int_args: &[i64],
+    float_args: &[f64],
+    stack_args: &[u64],
+) -> i64 {
+    use core::arch::asm;
+    let i = |n: usize| -> i64 { int_args.get(n).copied().unwrap_or(0) };
+    let f = |n: usize| -> f64 { float_args.get(n).copied().unwrap_or(0.0) };
+    let result: i64;
+
+    if stack_args.is_empty() {
+        asm!(
+            "blr {func}",
+            func = in(reg) func,
+            inlateout("x0") i(0) => result,
+            in("x1") i(1), in("x2") i(2), in("x3") i(3),
+            in("x4") i(4), in("x5") i(5), in("x6") i(6), in("x7") i(7),
+            in("d0") f(0), in("d1") f(1), in("d2") f(2), in("d3") f(3),
+            in("d4") f(4), in("d5") f(5), in("d6") f(6), in("d7") f(7),
+            clobber_abi("C"),
+        );
+    } else {
+        let n_slots = (stack_args.len() + 1) & !1;
+        let stack_bytes = (n_slots * 8) as u64;
+        let buf_ptr = stack_args.as_ptr();
+        let n_copy = stack_args.len() as u64;
+        asm!(
+            "sub sp, sp, {sb}",
+            "cbz {nc}, 2f",
+            "mov x9, #0",
+            "1:",
+            "ldr x10, [{bp}, x9, lsl #3]",
+            "str x10, [sp, x9, lsl #3]",
+            "add x9, x9, #1",
+            "cmp x9, {nc}",
+            "b.lo 1b",
+            "2:",
+            "blr {func}",
+            "add sp, sp, {sb}",
+            func = in(reg) func,
+            sb = in(reg) stack_bytes,
+            nc = in(reg) n_copy,
+            bp = in(reg) buf_ptr,
+            out("x9") _,
+            out("x10") _,
+            inlateout("x0") i(0) => result,
+            in("x1") i(1), in("x2") i(2), in("x3") i(3),
+            in("x4") i(4), in("x5") i(5), in("x6") i(6), in("x7") i(7),
+            in("d0") f(0), in("d1") f(1), in("d2") f(2), in("d3") f(3),
+            in("d4") f(4), in("d5") f(5), in("d6") f(6), in("d7") f(7),
+            clobber_abi("C"),
+        );
+    }
+    result
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn call_stub_asm_i(
+    func: usize,
+    int_args: &[i64],
+    float_args: &[f64],
+    stack_args: &[u64],
+) -> i64 {
+    use core::arch::asm;
+    let i = |n: usize| -> i64 { int_args.get(n).copied().unwrap_or(0) };
+    let f = |n: usize| -> f64 { float_args.get(n).copied().unwrap_or(0.0) };
+    let n_xmm = float_args.len().min(8) as i64;
+    let result: i64;
+
+    if stack_args.is_empty() {
+        asm!(
+            "call {func}",
+            func = in(reg) func,
+            in("rdi") i(0), in("rsi") i(1), in("rdx") i(2),
+            in("rcx") i(3), in("r8") i(4), in("r9") i(5),
+            in("xmm0") f(0), in("xmm1") f(1), in("xmm2") f(2),
+            in("xmm3") f(3), in("xmm4") f(4), in("xmm5") f(5),
+            in("xmm6") f(6), in("xmm7") f(7),
+            inlateout("rax") n_xmm => result,
+            clobber_abi("C"),
+        );
+    } else {
+        let n_slots = (stack_args.len() + 1) & !1;
+        let stack_bytes = (n_slots * 8) as i64;
+        let buf_ptr = stack_args.as_ptr();
+        let n_copy = stack_args.len() as i64;
+        asm!(
+            "sub rsp, {sb}",
+            "test {nc}, {nc}",
+            "jz 2f",
+            "xor r10, r10",
+            "1:",
+            "mov r11, [{bp} + r10 * 8]",
+            "mov [rsp + r10 * 8], r11",
+            "inc r10",
+            "cmp r10, {nc}",
+            "jb 1b",
+            "2:",
+            "call {func}",
+            "add rsp, {sb}",
+            func = in(reg) func,
+            sb = in(reg) stack_bytes,
+            nc = in(reg) n_copy,
+            bp = in(reg) buf_ptr,
+            out("r10") _,
+            out("r11") _,
+            in("rdi") i(0), in("rsi") i(1), in("rdx") i(2),
+            in("rcx") i(3), in("r8") i(4), in("r9") i(5),
+            in("xmm0") f(0), in("xmm1") f(1), in("xmm2") f(2),
+            in("xmm3") f(3), in("xmm4") f(4), in("xmm5") f(5),
+            in("xmm6") f(6), in("xmm7") f(7),
+            inlateout("rax") n_xmm => result,
+            clobber_abi("C"),
+        );
+    }
+    result
+}
+
+// ── call_stub_asm_f: float return (d0 / xmm0) ──
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn call_stub_asm_f(
+    func: usize,
+    int_args: &[i64],
+    float_args: &[f64],
+    stack_args: &[u64],
+) -> f64 {
+    use core::arch::asm;
+    let i = |n: usize| -> i64 { int_args.get(n).copied().unwrap_or(0) };
+    let f = |n: usize| -> f64 { float_args.get(n).copied().unwrap_or(0.0) };
+    let result: f64;
+
+    if stack_args.is_empty() {
+        asm!(
+            "blr {func}",
+            func = in(reg) func,
+            in("x0") i(0),
+            in("x1") i(1), in("x2") i(2), in("x3") i(3),
+            in("x4") i(4), in("x5") i(5), in("x6") i(6), in("x7") i(7),
+            inlateout("d0") f(0) => result,
+            in("d1") f(1), in("d2") f(2), in("d3") f(3),
+            in("d4") f(4), in("d5") f(5), in("d6") f(6), in("d7") f(7),
+            clobber_abi("C"),
+        );
+    } else {
+        let n_slots = (stack_args.len() + 1) & !1;
+        let stack_bytes = (n_slots * 8) as u64;
+        let buf_ptr = stack_args.as_ptr();
+        let n_copy = stack_args.len() as u64;
+        asm!(
+            "sub sp, sp, {sb}",
+            "cbz {nc}, 2f",
+            "mov x9, #0",
+            "1:",
+            "ldr x10, [{bp}, x9, lsl #3]",
+            "str x10, [sp, x9, lsl #3]",
+            "add x9, x9, #1",
+            "cmp x9, {nc}",
+            "b.lo 1b",
+            "2:",
+            "blr {func}",
+            "add sp, sp, {sb}",
+            func = in(reg) func,
+            sb = in(reg) stack_bytes,
+            nc = in(reg) n_copy,
+            bp = in(reg) buf_ptr,
+            out("x9") _,
+            out("x10") _,
+            in("x0") i(0),
+            in("x1") i(1), in("x2") i(2), in("x3") i(3),
+            in("x4") i(4), in("x5") i(5), in("x6") i(6), in("x7") i(7),
+            inlateout("d0") f(0) => result,
+            in("d1") f(1), in("d2") f(2), in("d3") f(3),
+            in("d4") f(4), in("d5") f(5), in("d6") f(6), in("d7") f(7),
+            clobber_abi("C"),
+        );
+    }
+    result
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn call_stub_asm_f(
+    func: usize,
+    int_args: &[i64],
+    float_args: &[f64],
+    stack_args: &[u64],
+) -> f64 {
+    use core::arch::asm;
+    let i = |n: usize| -> i64 { int_args.get(n).copied().unwrap_or(0) };
+    let f = |n: usize| -> f64 { float_args.get(n).copied().unwrap_or(0.0) };
+    let n_xmm = float_args.len().min(8) as i64;
+    let result: f64;
+
+    if stack_args.is_empty() {
+        asm!(
+            "call {func}",
+            func = in(reg) func,
+            in("rdi") i(0), in("rsi") i(1), in("rdx") i(2),
+            in("rcx") i(3), in("r8") i(4), in("r9") i(5),
+            inlateout("xmm0") f(0) => result,
+            in("xmm1") f(1), in("xmm2") f(2),
+            in("xmm3") f(3), in("xmm4") f(4), in("xmm5") f(5),
+            in("xmm6") f(6), in("xmm7") f(7),
+            in("rax") n_xmm,
+            clobber_abi("C"),
+        );
+    } else {
+        let n_slots = (stack_args.len() + 1) & !1;
+        let stack_bytes = (n_slots * 8) as i64;
+        let buf_ptr = stack_args.as_ptr();
+        let n_copy = stack_args.len() as i64;
+        asm!(
+            "sub rsp, {sb}",
+            "test {nc}, {nc}",
+            "jz 2f",
+            "xor r10, r10",
+            "1:",
+            "mov r11, [{bp} + r10 * 8]",
+            "mov [rsp + r10 * 8], r11",
+            "inc r10",
+            "cmp r10, {nc}",
+            "jb 1b",
+            "2:",
+            "call {func}",
+            "add rsp, {sb}",
+            func = in(reg) func,
+            sb = in(reg) stack_bytes,
+            nc = in(reg) n_copy,
+            bp = in(reg) buf_ptr,
+            out("r10") _,
+            out("r11") _,
+            in("rdi") i(0), in("rsi") i(1), in("rdx") i(2),
+            in("rcx") i(3), in("r8") i(4), in("r9") i(5),
+            inlateout("xmm0") f(0) => result,
+            in("xmm1") f(1), in("xmm2") f(2),
+            in("xmm3") f(3), in("xmm4") f(4), in("xmm5") f(5),
+            in("xmm6") f(6), in("xmm7") f(7),
+            in("rax") n_xmm,
+            clobber_abi("C"),
+        );
+    }
+    result
 }
 
 // Tests
