@@ -257,6 +257,22 @@ impl OptPure {
         )
     }
 
+    /// PyPy RecentPureOps stores AbstractResOp / Const boxes directly, so a
+    /// reused result necessarily carries the same `box.type` as the query op.
+    /// majit's imported preamble caches store only OpRefs, so recover the
+    /// typed-constant path first (`ConstPtr(NULL)` etc.) before falling back
+    /// to opref_type metadata.
+    fn matches_result_type(op: &Op, result: OpRef, ctx: &OptContext) -> bool {
+        let result = ctx.get_box_replacement(result);
+        if let Some((_raw, result_type)) = ctx.getconst(result) {
+            return result_type == op.result_type();
+        }
+        match ctx.opref_type(result) {
+            Some(result_type) => result_type == op.result_type(),
+            None => false,
+        }
+    }
+
     /// Try to find a cached result for this operation, considering commutativity.
     fn lookup_pure(&self, key: &PureOpKey) -> Option<OpRef> {
         if let Some(result) = self.cache.lookup(key) {
@@ -361,7 +377,7 @@ impl OptPure {
     fn lookup_known_result(&self, key: &PureOpKey) -> Option<OpRef> {
         // Check known_result_call_pure first (from RECORD_KNOWN_RESULT)
         for (k, result) in &self.known_result_call_pure {
-            if k.args == key.args {
+            if k.opcode == key.opcode && k.descr_index == key.descr_index && k.args == key.args {
                 return Some(*result);
             }
         }
@@ -371,7 +387,7 @@ impl OptPure {
                 ExtraCallPureEntry::Direct { key, result } => (key, *result),
                 ExtraCallPureEntry::Preamble { key, pop } => (key, pop.resolved),
             };
-            if k.args == key.args {
+            if k.opcode == key.opcode && k.descr_index == key.descr_index && k.args == key.args {
                 return Some(result);
             }
         }
@@ -426,9 +442,15 @@ impl OptPure {
             if args_match {
                 // pure.py:50-55: force_preamble_op — isinstance check → force → replace
                 if let Some(result) = entry.forced_result {
-                    return Some(result);
+                    if Self::matches_result_type(op, result, ctx) {
+                        return Some(result);
+                    }
+                    continue;
                 }
                 let forced = ctx.force_op_from_preamble(entry.pop.resolved);
+                if !Self::matches_result_type(op, forced, ctx) {
+                    continue;
+                }
                 entry.forced_result = Some(forced);
                 return Some(forced);
             }
@@ -463,7 +485,11 @@ impl OptPure {
                     }
                 }
             }
-            Some(entry.result)
+            if Self::matches_result_type(op, entry.result, ctx) {
+                Some(entry.result)
+            } else {
+                None
+            }
         })
     }
 
@@ -489,12 +515,13 @@ impl OptPure {
     /// RPython shortpreamble.py:122-123: optpure.extra_call_pure.append(PreambleOp(...))
     pub fn extra_call_pure_preamble(
         &mut self,
+        opcode: OpCode,
         args: Vec<OpRef>,
         descr_index: Option<u32>,
         pop: PreambleOp,
     ) {
         let key = PureOpKey {
-            opcode: OpCode::CallPureI,
+            opcode,
             args,
             descr_index,
         };
@@ -809,7 +836,7 @@ impl Optimization for OptPure {
             if op.num_args() >= 2 {
                 let result = op.arg(0);
                 let key = PureOpKey {
-                    opcode: OpCode::CallPureI,
+                    opcode: OpCode::call_pure_for_type(ctx.opref_type(result).unwrap_or(Type::Int)),
                     args: op.args[1..].to_vec(),
                     descr_index: None,
                 };
@@ -894,17 +921,17 @@ impl Optimization for OptPure {
             }
             // pure.py:204-210 — iterate extra_call_pure entries.
             for entry in &self.extra_call_pure {
-                let (entry_args, entry_descr_index, entry_result) = match entry {
+                let (entry_opcode, entry_args, entry_descr_index, entry_result) = match entry {
                     ExtraCallPureEntry::Direct { key, result } => {
-                        (key.args.clone(), key.descr_index, *result)
+                        (key.opcode, key.args.clone(), key.descr_index, *result)
                     }
                     ExtraCallPureEntry::Preamble { key, pop } => {
-                        (key.args.clone(), key.descr_index, pop.resolved)
+                        (key.opcode, key.args.clone(), key.descr_index, pop.resolved)
                     }
                 };
                 if Self::optimize_call_pure_old(
                     op,
-                    OpCode::CallPureI,
+                    entry_opcode,
                     &entry_args,
                     entry_descr_index,
                     op_descr_index,
@@ -1049,7 +1076,7 @@ impl Optimization for OptPure {
             };
             if entry.opcode.is_call_pure() || entry.opcode.is_call() {
                 // shortpreamble.py:122-123: optpure.extra_call_pure.append(PreambleOp(...))
-                self.extra_call_pure_preamble(resolved_args, descr_index, pop);
+                self.extra_call_pure_preamble(entry.opcode, resolved_args, descr_index, pop);
             } else {
                 // shortpreamble.py:124-126: opt.pure(opnum, PreambleOp(...))
                 self.pure_preamble(entry.opcode, resolved_args, descr_index, pop);

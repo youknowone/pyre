@@ -483,11 +483,12 @@ impl OptVirtualize {
         let struct_ref = ctx.get_box_replacement(op.arg(0));
         let value_ref = ctx.get_box_replacement(op.arg(1));
         let field_idx = descr_index(&op.descr);
-        let parent_descr = op
+        let field_descr = op
             .descr
             .as_ref()
             .and_then(|descr| descr.as_field_descr())
-            .and_then(|field_descr| field_descr.get_parent_descr());
+            .expect("optimize_setfield_gc: field op without FieldDescr");
+        let offset = extract_field_offset(field_idx);
         let is_raw_op = matches!(op.opcode, OpCode::SetfieldRaw);
         // Pre-extract constant value before mutable borrow of ptr_info.
         // Class pointer may be stored as Value::Int OR Value::Ref.
@@ -511,8 +512,11 @@ impl OptVirtualize {
 
         if let Some(info) = ctx.get_ptr_info_mut(struct_ref) {
             if info.is_virtual() {
-                if let Some(parent_descr) = parent_descr.clone() {
-                    info.init_fields(parent_descr, field_idx as usize);
+                if offset != Some(0) {
+                    let parent_descr = field_descr.get_parent_descr().expect(
+                        "optimize_setfield_gc: non-typeptr FieldDescr.get_parent_descr() returned None",
+                    );
+                    info.init_fields(parent_descr.clone(), field_idx as usize);
                 }
                 match info {
                     PtrInfo::Virtual(vinfo) => {
@@ -525,7 +529,6 @@ impl OptVirtualize {
                         // (jtransform.py:908-911 parity in helpers.rs), so this
                         // branch should not observe offset=0. Defensively capture
                         // known_class if an offset-0 setfield still arrives.
-                        let offset = extract_field_offset(field_idx);
                         if offset == Some(0) {
                             if vinfo.known_class.is_none() {
                                 if let Some(class_val) = value_as_constant {
@@ -535,20 +538,7 @@ impl OptVirtualize {
                             return OptimizationResult::Remove;
                         }
                         set_field(&mut vinfo.fields, field_idx, value_ref);
-                        // Preserve the original op.descr for force_box: even
-                        // when init_fields couldn't seed field_descrs from the
-                        // parent SizeDescr (e.g., test fixtures or descrs
-                        // missing parent_descr), we still need the immutability
-                        // / offset metadata to round-trip through the SetfieldGc
-                        // emitted by force_virtual_instance. Pad the slot vec
-                        // sparsely with synthetic placeholders.
-                        if let Some(orig) = op.descr.clone() {
-                            ensure_field_descr_slot(
-                                &mut vinfo.field_descrs,
-                                field_idx as usize,
-                                orig,
-                            );
-                        }
+                        debug_assert!((field_idx as usize) < vinfo.field_descrs.len());
                         debug_assert_no_typeptr_in_virtual_fields(
                             &vinfo.fields,
                             "optimize_setfield_gc::Virtual",
@@ -557,13 +547,7 @@ impl OptVirtualize {
                     }
                     PtrInfo::VirtualStruct(vinfo) => {
                         set_field(&mut vinfo.fields, field_idx, value_ref);
-                        if let Some(orig) = op.descr.clone() {
-                            ensure_field_descr_slot(
-                                &mut vinfo.field_descrs,
-                                field_idx as usize,
-                                orig,
-                            );
-                        }
+                        debug_assert!((field_idx as usize) < vinfo.field_descrs.len());
                         return OptimizationResult::Remove;
                     }
                     PtrInfo::Virtualizable(vstate) => {
@@ -1699,23 +1683,6 @@ pub(crate) fn debug_assert_no_typeptr_in_virtual_fields(
     );
 }
 
-/// Ensure the slot-indexed `field_descrs` vector has an entry at `slot`,
-/// padding earlier slots with a no-op placeholder so the original descr
-/// can be recovered later (e.g. by `force_virtual_instance`'s SetfieldGc
-/// emission). Used when test fixtures or short-trace ops carry a
-/// FieldDescr without `parent_descr`, so `init_fields` cannot seed the
-/// vec from `SizeDescr.all_field_descrs()`.
-fn ensure_field_descr_slot(field_descrs: &mut Vec<DescrRef>, slot: usize, descr: DescrRef) {
-    while field_descrs.len() < slot {
-        field_descrs.push(Arc::new(majit_ir::descr::SimpleSizeDescr::new(0, 0, 0)) as DescrRef);
-    }
-    if field_descrs.len() == slot {
-        field_descrs.push(descr);
-    } else {
-        field_descrs[slot] = descr;
-    }
-}
-
 fn set_field_descr(field_descrs: &mut Vec<(u32, DescrRef)>, field_idx: u32, descr: DescrRef) {
     for entry in field_descrs.iter_mut() {
         if entry.0 == field_idx {
@@ -1751,15 +1718,11 @@ fn get_field(fields: &[(u32, OpRef)], field_idx: u32) -> Option<OpRef> {
 
 /// Extract the descriptor index used as a field identifier.
 fn descr_index(descr: &Option<DescrRef>) -> u32 {
-    descr.as_ref().map_or(0, |d| {
-        d.as_field_descr()
-            .and_then(|field_descr| {
-                field_descr
-                    .get_parent_descr()
-                    .map(|_| field_descr.index_in_parent() as u32)
-            })
-            .unwrap_or_else(|| d.index())
-    })
+    descr
+        .as_ref()
+        .and_then(|descr| descr.as_field_descr())
+        .map(|field_descr| field_descr.index_in_parent() as u32)
+        .expect("descr_index: field operations must carry a FieldDescr with parent-local index")
 }
 
 // ── Minimal descriptor for field identification in forced setfield ops ──

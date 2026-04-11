@@ -1594,11 +1594,11 @@ impl OptRewrite {
         //   box = get_box_replacement(op.getarg(0))
         //   self.make_constant(box, op.getarg(1))
         let box_ref = ctx.get_box_replacement(arg0);
-        if let Some(v) = ctx.get_constant(arg1).cloned() {
-            ctx.make_constant(box_ref, v);
-        } else {
-            ctx.replace_op(box_ref, arg1);
-        }
+        let v = ctx
+            .get_constant(arg1)
+            .cloned()
+            .expect("postprocess_GUARD_VALUE requires const arg1");
+        ctx.make_constant(box_ref, v);
         OptimizationResult::PassOn
     }
 
