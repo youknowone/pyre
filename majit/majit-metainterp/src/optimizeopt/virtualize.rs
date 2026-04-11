@@ -598,12 +598,14 @@ impl OptVirtualize {
             ctx.replace_op(opref, alloc_ref);
         }
 
-        // Emit RAW_STORE for each tracked entry
-        for (offset, _length, value_ref, _kind) in &vinfo.entries {
+        // info.py:414-420 _force_elements: emit RAW_STORE with descr
+        for (offset, _length, value_ref, descr) in &vinfo.entries {
             let value_ref = self.force_virtual(*value_ref, ctx);
             let value_ref = ctx.get_box_replacement(value_ref);
             let offset_ref = self.emit_constant_int(ctx, *offset as i64);
-            let set_op = Op::new(OpCode::RawStore, &[alloc_ref, offset_ref, value_ref]);
+            let mut set_op = Op::new(OpCode::RawStore, &[alloc_ref, offset_ref, value_ref]);
+            // info.py:420: ResOperation(rop.RAW_STORE, ..., descr=descr)
+            set_op.descr = Some(descr.to_descr_ref());
             ctx.emit_extra(ctx.current_pass_idx, set_op);
         }
 
