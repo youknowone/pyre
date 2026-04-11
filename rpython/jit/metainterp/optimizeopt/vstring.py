@@ -791,7 +791,7 @@ class OptString(Optimization):
         i2 = getptrinfo(arg2)
         l2box = None
         if i2:
-            l2box = i2.getstrlen(arg1, self, mode)
+            l2box = i2.getstrlen(arg2, self, mode)
         if l2box:
             l2info = self.getintbound(l2box)
             if l2info.is_constant():
