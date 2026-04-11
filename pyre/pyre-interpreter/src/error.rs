@@ -106,6 +106,8 @@ pub enum PyErrorKind {
     /// class. Caught by `GetSetProperty.descr_property_get/set/del` which
     /// then re-raises a user-visible TypeError via `descr_call_mismatch`.
     DescrMismatch,
+    /// Raised by sys.exit(). Not a subclass of Exception.
+    SystemExit,
 }
 
 impl PyError {
@@ -241,6 +243,7 @@ impl PyError {
             // to user code without being converted to TypeError it surfaces
             // as a TypeError, matching PyPy's eventual descr_call_mismatch.
             PyErrorKind::DescrMismatch => ExcKind::TypeError,
+            PyErrorKind::SystemExit => ExcKind::SystemExit,
         }
     }
 
@@ -282,6 +285,7 @@ impl PyError {
             // Unicode errors don't have a dedicated PyErrorKind; they
             // flow through the general ValueError handler.
             ExcKind::UnicodeDecodeError | ExcKind::UnicodeEncodeError => PyErrorKind::ValueError,
+            ExcKind::SystemExit => PyErrorKind::SystemExit,
         }
     }
 

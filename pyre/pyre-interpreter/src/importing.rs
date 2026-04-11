@@ -3766,6 +3766,30 @@ pub fn set_sys_module(name: &str, module: PyObjectRef) {
 /// Set the Python-visible sys.modules dict reference. Called during sys
 /// module initialization so subsequent set_sys_module calls keep it in sync.
 /// Also copies all previously cached modules into the dict.
+/// Set sys.argv from a list of strings.
+/// Must be called after the first `import sys` has run (e.g. after
+/// `run_source` compiles the module-level code).
+pub fn set_sys_argv(args: &[String]) {
+    let items: Vec<pyre_object::PyObjectRef> =
+        args.iter().map(|s| pyre_object::w_str_new(s)).collect();
+    let argv = pyre_object::w_list_new(items);
+    SYS_ARGV_PENDING.with(|p| p.set(argv));
+}
+
+thread_local! {
+    static SYS_ARGV_PENDING: std::cell::Cell<pyre_object::PyObjectRef> =
+        const { std::cell::Cell::new(pyre_object::PY_NULL) };
+}
+
+/// Called from sys module init to pick up any pending argv.
+pub fn take_pending_sys_argv() -> pyre_object::PyObjectRef {
+    SYS_ARGV_PENDING.with(|p| {
+        let v = p.get();
+        p.set(pyre_object::PY_NULL);
+        v
+    })
+}
+
 pub fn set_sys_modules_dict(dict: PyObjectRef) {
     SYS_MODULES_DICT.with(|d| d.set(dict));
     // Populate with all modules already in the cache.

@@ -111,6 +111,7 @@ fn real_main() {
             // Initialize sys.path with CWD for -c mode.
             let cwd = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
             importing::init_sys_path(&cwd);
+            importing::set_sys_argv(&["-c".to_string()]);
             run_source(&cmd, Mode::Exec);
             if inspect {
                 repl::run_repl(true);
@@ -131,6 +132,10 @@ fn real_main() {
                 .canonicalize()
                 .unwrap_or_else(|_| Path::new(".").to_path_buf());
             importing::init_sys_path(&script_dir);
+            // Collect remaining CLI args for sys.argv.
+            let mut argv = vec![path.clone()];
+            // lexopt consumed script name; remaining values go to sys.argv[1:]
+            importing::set_sys_argv(&argv);
             run_source(&source, Mode::Exec);
             if inspect {
                 repl::run_repl(true);
@@ -176,6 +181,10 @@ fn run_source(source: &str, mode: Mode) {
             }
         }
         Err(e) => {
+            if e.kind == pyre_interpreter::PyErrorKind::SystemExit {
+                let code: i32 = e.message.parse().unwrap_or(0);
+                std::process::exit(code);
+            }
             pyre_interpreter::eprint_exception(&e, true);
             std::process::exit(1);
         }

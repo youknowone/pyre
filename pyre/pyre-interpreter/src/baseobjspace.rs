@@ -2964,8 +2964,33 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
                         continue;
                     }
                     if is_type(t) {
-                        if let Some(method) = lookup_in_type_where(t, name) {
-                            return Ok(method);
+                        // Look in this class's own dict only (not its MRO),
+                        // since we are already iterating the full MRO ourselves.
+                        let ns_ptr = w_type_get_dict_ptr(t) as *mut crate::PyNamespace;
+                        let found = if !ns_ptr.is_null() {
+                            (*ns_ptr).get(name).copied()
+                        } else {
+                            None
+                        };
+                        if let Some(attr) = found {
+                            // Apply descriptor __get__ for user functions so that
+                            // `super().__init__` returns a bound method.
+                            // __new__ is implicitly static (type wraps it) — never bind.
+                            if name != "__new__"
+                                && crate::is_function(attr)
+                                && !is_staticmethod(attr)
+                                && !is_classmethod(attr)
+                            {
+                                let code = crate::function_get_code(attr);
+                                let is_builtin =
+                                    !code.is_null() && crate::is_builtin_code(code as PyObjectRef);
+                                if !is_builtin {
+                                    return Ok(pyre_object::w_method_new(
+                                        attr, bound_obj, w_obj_type,
+                                    ));
+                                }
+                            }
+                            return Ok(attr);
                         }
                     }
                 }

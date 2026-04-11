@@ -43,6 +43,8 @@ pub enum ExcKind {
     UnicodeDecodeError = 20,
     /// Subclass of ValueError raised by codecs on invalid input.
     UnicodeEncodeError = 21,
+    /// Raised by sys.exit(). Subclass of BaseException, not Exception.
+    SystemExit = 22,
 }
 
 /// Layout: `[ob_type: *const PyType | kind: ExcKind | message: *mut String]`
@@ -122,6 +124,7 @@ pub fn exc_kind_name(kind: ExcKind) -> &'static str {
         ExcKind::FileNotFoundError => "FileNotFoundError",
         ExcKind::UnicodeDecodeError => "UnicodeDecodeError",
         ExcKind::UnicodeEncodeError => "UnicodeEncodeError",
+        ExcKind::SystemExit => "SystemExit",
     }
 }
 
@@ -133,7 +136,10 @@ pub fn exc_kind_matches(kind: ExcKind, type_name: &str) -> bool {
         return true;
     }
     if type_name == "Exception" {
-        return !matches!(kind, ExcKind::BaseException | ExcKind::GeneratorExit);
+        return !matches!(
+            kind,
+            ExcKind::BaseException | ExcKind::GeneratorExit | ExcKind::SystemExit
+        );
     }
     if type_name == "ArithmeticError" {
         return matches!(
@@ -181,6 +187,7 @@ pub fn exc_kind_from_name(name: &str) -> Option<ExcKind> {
         "FileNotFoundError" => Some(ExcKind::FileNotFoundError),
         "UnicodeDecodeError" => Some(ExcKind::UnicodeDecodeError),
         "UnicodeEncodeError" => Some(ExcKind::UnicodeEncodeError),
+        "SystemExit" => Some(ExcKind::SystemExit),
         _ => None,
     }
 }

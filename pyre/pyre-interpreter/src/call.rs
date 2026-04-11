@@ -1015,9 +1015,10 @@ pub fn call_function_impl_result(
             }
         }
     }
-    panic!("call_function: '{}' object is not callable", unsafe {
-        (*(*callable).ob_type).name
-    });
+    Err(PyError::type_error(format!(
+        "'{}' object is not callable",
+        unsafe { (*(*callable).ob_type).name }
+    )))
 }
 
 /// CPython: typeobject.c calculate_metaclass

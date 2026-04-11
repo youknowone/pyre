@@ -282,10 +282,42 @@ pub fn init(ns: &mut PyNamespace) {
     // sys.platlibdir — typically "lib" on POSIX; used by sysconfig to
     // construct install paths.
     namespace_store(ns, "platlibdir", w_str_new("lib"));
+    // sys.exit(code=0) — raise SystemExit
+    namespace_store(
+        ns,
+        "exit",
+        crate::make_builtin_function("exit", |args| {
+            let code = if args.is_empty() {
+                0i64
+            } else {
+                unsafe {
+                    if pyre_object::is_none(args[0]) {
+                        0
+                    } else if pyre_object::is_int(args[0]) || pyre_object::is_bool(args[0]) {
+                        pyre_object::w_int_get_value(args[0])
+                    } else {
+                        // Non-integer arg: print it to stderr and exit 1
+                        0
+                    }
+                }
+            };
+            Err(crate::PyError {
+                kind: crate::PyErrorKind::SystemExit,
+                message: code.to_string(),
+                exc_object: std::ptr::null_mut(),
+            })
+        }),
+    );
     // sys.abiflags
     namespace_store(ns, "abiflags", w_str_new(""));
-    // sys.argv
-    namespace_store(ns, "argv", w_list_new(vec![]));
+    // sys.argv — pick up pending argv from set_sys_argv if available.
+    let pending = crate::importing::take_pending_sys_argv();
+    let argv = if pending.is_null() {
+        w_list_new(vec![])
+    } else {
+        pending
+    };
+    namespace_store(ns, "argv", argv);
     // sys.warnoptions
     namespace_store(ns, "warnoptions", w_list_new(vec![]));
     // sys.builtin_module_names — tuple of names of modules compiled into
