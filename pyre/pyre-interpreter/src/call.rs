@@ -339,6 +339,56 @@ fn call_user_function_with_eval(
     eval_fn(&mut func_frame)
 }
 
+/// Call a user function with pre-resolved args (scope already packed by
+/// resolve_kwargs). Skips defaults-fill and pack_varargs — the caller
+/// (call_kw) already produced the final scope via resolve_kwargs which
+/// mirrors PyPy's Arguments.parse_into_scope.
+pub fn call_user_function_resolved(
+    frame: &PyFrame,
+    callable: PyObjectRef,
+    args: &[PyObjectRef],
+) -> PyResult {
+    CALL_DEPTH.with(|d| d.set(d.get() + 1));
+    let _depth_guard = CallDepthGuard;
+
+    let w_code = unsafe { crate::getcode(callable) };
+    let globals = unsafe { function_get_globals(callable) };
+    let closure = unsafe { function_get_closure(callable) };
+    let func_code = unsafe {
+        crate::w_code_get_ptr(w_code as pyre_object::PyObjectRef) as *const crate::CodeObject
+    };
+    let code_ref = unsafe { &*func_code };
+
+    // Generator function
+    if code_ref
+        .flags
+        .intersects(crate::CodeFlags::GENERATOR | crate::CodeFlags::COROUTINE)
+    {
+        let mut gen_frame = PyFrame::new_for_call_with_closure(
+            w_code,
+            args,
+            globals,
+            frame.execution_context,
+            closure,
+        );
+        gen_frame.fix_array_ptrs();
+        let frame_ptr = Box::into_raw(Box::new(gen_frame)) as *mut u8;
+        return Ok(pyre_object::generatorobject::w_generator_new(frame_ptr));
+    }
+
+    let plain_mode = FORCE_PLAIN_EVAL.with(|c| c.get() > 0);
+    let eval_fn = if plain_mode {
+        eval_frame_plain
+    } else {
+        EVAL_OVERRIDE.get().copied().unwrap_or(eval_frame_plain)
+    };
+
+    let mut func_frame =
+        PyFrame::new_for_call_with_closure(w_code, args, globals, frame.execution_context, closure);
+    func_frame.fix_array_ptrs();
+    eval_fn(&mut func_frame)
+}
+
 pub fn call_callable(frame: &mut PyFrame, callable: PyObjectRef, args: &[PyObjectRef]) -> PyResult {
     let callable = crate::baseobjspace::unwrap_cell(callable);
     if unsafe { pyre_object::is_method(callable) } {
@@ -647,7 +697,8 @@ pub(crate) fn resolve_kwargs(
         }
     }
 
-    // Pack *args (extra positional args beyond named params)
+    // Pack *args and **kwargs into scope — PyPy _match_signature lines 207-259.
+    // This produces the final scope_w that maps directly to frame locals.
     if has_varargs {
         let extra_pos: Vec<PyObjectRef> = if n_pos > nparams {
             args[nparams..n_pos].to_vec()
@@ -656,8 +707,6 @@ pub(crate) fn resolve_kwargs(
         };
         result.push(pyre_object::w_tuple_new(extra_pos));
     }
-
-    // Pack **kwargs (unmatched keyword args)
     if has_varkw {
         let kw_dict = pyre_object::w_dict_new();
         for (key, value) in &extra_kwargs {
@@ -682,6 +731,18 @@ pub fn call_with_kwargs(
     kwargs: &[(String, PyObjectRef)],
 ) -> PyResult {
     let callable = crate::baseobjspace::unwrap_cell(callable);
+
+    // Unwrap bound methods: prepend receiver to pos_args.
+    if unsafe { pyre_object::is_method(callable) } {
+        let func = unsafe { pyre_object::w_method_get_func(callable) };
+        let receiver = unsafe { pyre_object::w_method_get_self(callable) };
+        let mut full_args = Vec::with_capacity(1 + pos_args.len());
+        if !receiver.is_null() && !unsafe { pyre_object::is_none(receiver) } {
+            full_args.push(receiver);
+        }
+        full_args.extend_from_slice(pos_args);
+        return call_with_kwargs(frame, func, &full_args, kwargs);
+    }
 
     if unsafe { crate::is_function(callable) } {
         let code = unsafe { crate::getcode(callable) };

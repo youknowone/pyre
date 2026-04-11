@@ -1340,6 +1340,56 @@ fn init_str_type(ns: &mut PyNamespace) {
 
 fn init_dict_type(ns: &mut PyNamespace) {
     namespace_store(ns, "__new__", make_new_descr(dict_descr_new));
+    // dict.__init__(self, mapping_or_iterable=None, **kwargs)
+    // PyPy: W_DictMultiObject.descr_init
+    namespace_store(
+        ns,
+        "__init__",
+        make_builtin_function("__init__", |args| {
+            if args.is_empty() {
+                return Ok(pyre_object::w_none());
+            }
+            let self_dict = args[0];
+            // Process positional arg (mapping or iterable of pairs)
+            // Process each arg: may be positional mapping/iterable or kwargs dict
+            for arg_idx in 1..args.len() {
+                let src = args[arg_idx];
+                unsafe {
+                    if pyre_object::is_dict(src) {
+                        let marker =
+                            pyre_object::w_dict_lookup(src, pyre_object::w_str_new("__pyre_kw__"));
+                        if marker.is_some() {
+                            // kwargs dict — merge excluding marker
+                            for (k, v) in pyre_object::w_dict_items(src) {
+                                if pyre_object::is_str(k)
+                                    && pyre_object::w_str_get_value(k) == "__pyre_kw__"
+                                {
+                                    continue;
+                                }
+                                pyre_object::w_dict_store(self_dict, k, v);
+                            }
+                        } else {
+                            for (k, v) in pyre_object::w_dict_items(src) {
+                                pyre_object::w_dict_store(self_dict, k, v);
+                            }
+                        }
+                    } else {
+                        if let Ok(keys_method) = crate::baseobjspace::getattr(src, "keys") {
+                            let keys_obj = crate::call_function(keys_method, &[]);
+                            if let Ok(keys) = crate::builtins::collect_iterable(keys_obj) {
+                                for key in keys {
+                                    if let Ok(val) = crate::baseobjspace::getitem(src, key) {
+                                        pyre_object::w_dict_store(self_dict, key, val);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(pyre_object::w_none())
+        }),
+    );
     namespace_store(
         ns,
         "get",

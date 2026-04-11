@@ -2973,22 +2973,16 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
                             None
                         };
                         if let Some(attr) = found {
-                            // Apply descriptor __get__ for user functions so that
-                            // `super().__init__` returns a bound method.
-                            // __new__ is implicitly static (type wraps it) — never bind.
+                            // superobject.py super_getattro:
+                            // Invoke descriptor __get__ protocol.
+                            // function.__get__(obj, type) → bound method
+                            // __new__ is implicitly static — never bind.
                             if name != "__new__"
                                 && crate::is_function(attr)
-                                && !is_staticmethod(attr)
-                                && !is_classmethod(attr)
+                                && !pyre_object::is_staticmethod(attr)
+                                && !pyre_object::is_classmethod(attr)
                             {
-                                let code = crate::function_get_code(attr);
-                                let is_builtin =
-                                    !code.is_null() && crate::is_builtin_code(code as PyObjectRef);
-                                if !is_builtin {
-                                    return Ok(pyre_object::w_method_new(
-                                        attr, bound_obj, w_obj_type,
-                                    ));
-                                }
+                                return Ok(pyre_object::w_method_new(attr, bound_obj, w_obj_type));
                             }
                             return Ok(attr);
                         }

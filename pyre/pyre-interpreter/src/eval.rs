@@ -108,7 +108,27 @@ pub fn check_exc_match_against(exc_value: PyObjectRef, exc_type: PyObjectRef) ->
         }
         if pyre_object::is_type(exc_type) {
             let type_name = pyre_object::w_type_get_name(exc_type);
-            return pyre_object::exc_kind_matches(kind, type_name);
+            if pyre_object::exc_kind_matches(kind, type_name) {
+                return true;
+            }
+            // ExcKind may not reflect the actual Python class hierarchy
+            // (e.g. FileNotFoundError created with ExcKind::Exception).
+            // Fall back to checking the exception's w_class MRO.
+            let w_class = (*exc_value).w_class;
+            if !w_class.is_null() && pyre_object::is_type(w_class) {
+                if std::ptr::eq(w_class, exc_type) {
+                    return true;
+                }
+                let mro = pyre_object::w_type_get_mro(w_class);
+                if !mro.is_null() {
+                    for &t in &*mro {
+                        if std::ptr::eq(t, exc_type) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            return false;
         }
         false
     }
@@ -1479,12 +1499,20 @@ impl OpcodeStepExecutor for PyFrame {
         // is an unbound method (needs self binding) or a staticmethod /
         // classmethod (no self binding / bind class).
         if is_method {
-            // Check the raw descriptor in MRO to decide binding.
-            let null_or_self =
-                unsafe { crate::baseobjspace::super_lookup_binding(cls, self_obj, name) };
-            self.push(result);
-            self.push(null_or_self);
+            // getattr now returns a bound method via descriptor protocol.
+            // Unwrap for the (func, self) pattern that CALL expects.
+            if unsafe { pyre_object::is_method(result) } {
+                let func = unsafe { pyre_object::w_method_get_func(result) };
+                let recv = unsafe { pyre_object::w_method_get_self(result) };
+                self.push(func);
+                self.push(recv);
+            } else {
+                // staticmethod or classmethod — no self binding
+                self.push(result);
+                self.push(PY_NULL);
+            }
         } else {
+            // is_method=false: getattr already returned a bound method.
             self.push(result);
         }
         Ok(())
@@ -1549,15 +1577,8 @@ impl OpcodeStepExecutor for PyFrame {
                     Some(_) => obj, // found in type MRO → bind self (method)
                     None => {
                         // Not found in type MRO → found in instance __dict__.
-                        // PyPy: instance __dict__ attrs bypass descriptor protocol.
-                        // User functions in instance dict: no binding.
-                        // Builtin functions stored per-instance (e.g. set methods
-                        // stored via ATTR_TABLE): bind self.
-                        if crate::is_function(attr) {
-                            PY_NULL
-                        } else {
-                            obj
-                        }
+                        // Instance __dict__ attrs bypass descriptor protocol.
+                        PY_NULL
                     }
                 }
             } else if pyre_object::is_type(obj) {
@@ -1772,7 +1793,15 @@ impl OpcodeStepExecutor for PyFrame {
         } else {
             crate::call::resolve_kwargs(callable_unwrapped, &args, kwarg_names)
         };
-        let result = call_callable(self, callable_unwrapped, &resolved)?;
+        // resolve_kwargs produces a fully-packed scope (like PyPy's
+        // _match_signature + parse_into_scope). Skip the normal
+        // call_callable → call_user_function path which would re-apply
+        // defaults and pack_varargs.
+        let result = if !is_builtin && unsafe { crate::is_function(callable_unwrapped) } {
+            crate::call::call_user_function_resolved(self, callable_unwrapped, &resolved)?
+        } else {
+            call_callable(self, callable_unwrapped, &resolved)?
+        };
         self.push(result);
         Ok(())
     }

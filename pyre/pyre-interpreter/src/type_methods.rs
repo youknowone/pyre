@@ -178,7 +178,10 @@ pub fn list_method_remove(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     assert!(args.len() >= 2, "remove() takes exactly 1 argument");
     unsafe {
         if !pyre_object::listobject::w_list_remove(args[0], args[1]) {
-            panic!("ValueError: list.remove(x): x not in list");
+            return Err(crate::PyError::new(
+                crate::PyErrorKind::ValueError,
+                "list.remove(x): x not in list".to_string(),
+            ));
         }
     }
     Ok(w_none())
@@ -930,11 +933,22 @@ pub fn dict_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     if !dict.is_null() {
         unsafe {
             if let Some(val) = w_dict_lookup(dict, key) {
+                // Delete the key after lookup — PyPy: W_DictMultiObject.descr_pop
+                if pyre_object::is_str(key) {
+                    pyre_object::dictobject::w_dict_delitem_str(
+                        dict,
+                        pyre_object::w_str_get_value(key),
+                    );
+                }
                 return Ok(val);
             }
         }
     }
-    Ok(default.unwrap_or_else(|| panic!("KeyError")))
+    if let Some(d) = default {
+        Ok(d)
+    } else {
+        Err(crate::PyError::key_error("dict.pop(): key not found"))
+    }
 }
 
 pub fn dict_method_setdefault(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {

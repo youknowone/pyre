@@ -1997,7 +1997,7 @@ fn init_posix(ns: &mut PyNamespace) {
         "set_inheritable",
         "get_blocking",
         "set_blocking",
-        "get_terminal_size",
+        // "get_terminal_size" — implemented below
         "cpu_count",
         "getloadavg",
         "kill",
@@ -2335,6 +2335,75 @@ fn init_posix(ns: &mut PyNamespace) {
                 }
             }
             Ok(pyre_object::w_bytes_from_bytes(&buf))
+        }),
+    );
+    // os.terminal_size — namedtuple-like type with columns/lines.
+    // Uses stat_result_type (hasdict instance) so setattr works.
+    fn make_terminal_size(cols: i64, lines: i64) -> pyre_object::PyObjectRef {
+        let instance = pyre_object::w_instance_new(stat_result_type());
+        let _ = crate::baseobjspace::setattr(instance, "columns", pyre_object::w_int_new(cols));
+        let _ = crate::baseobjspace::setattr(instance, "lines", pyre_object::w_int_new(lines));
+        instance
+    }
+    let terminal_size_type = crate::typedef::make_builtin_type("terminal_size", |ns| {
+        crate::namespace_store(
+            ns,
+            "__new__",
+            crate::make_builtin_function("__new__", |args| {
+                let (cols, rows) = if args.len() >= 2 {
+                    let seq = args[1];
+                    unsafe {
+                        if pyre_object::is_tuple(seq) {
+                            let c = pyre_object::w_tuple_getitem(seq, 0)
+                                .map(|v| pyre_object::w_int_get_value(v))
+                                .unwrap_or(80);
+                            let r = pyre_object::w_tuple_getitem(seq, 1)
+                                .map(|v| pyre_object::w_int_get_value(v))
+                                .unwrap_or(24);
+                            (c, r)
+                        } else {
+                            (80, 24)
+                        }
+                    }
+                } else {
+                    (80, 24)
+                };
+                Ok(make_terminal_size(cols, rows))
+            }),
+        );
+    });
+    crate::namespace_store(ns, "terminal_size", terminal_size_type);
+
+    // ── posix.get_terminal_size(fd=1) → os.terminal_size(columns, lines) ──
+    crate::namespace_store(
+        ns,
+        "get_terminal_size",
+        crate::make_builtin_function("get_terminal_size", |_args| {
+            let (cols, rows) = {
+                #[cfg(unix)]
+                {
+                    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+                    let ret = unsafe { libc::ioctl(1, libc::TIOCGWINSZ, &mut ws) };
+                    if ret == 0 && ws.ws_col > 0 {
+                        (ws.ws_col as i64, ws.ws_row as i64)
+                    } else {
+                        (80, 24)
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    (80, 24)
+                }
+            };
+            let result = pyre_object::w_tuple_new(vec![
+                pyre_object::w_int_new(cols),
+                pyre_object::w_int_new(rows),
+            ]);
+            let wrapper = pyre_object::w_instance_new(stat_result_type());
+            let _ = crate::baseobjspace::setattr(wrapper, "columns", pyre_object::w_int_new(cols));
+            let _ = crate::baseobjspace::setattr(wrapper, "lines", pyre_object::w_int_new(rows));
+            let _ = crate::baseobjspace::setattr(wrapper, "__tuple__", result);
+            Ok(wrapper)
         }),
     );
     // os.fspath() — PyPy: posixmodule.c posix_fspath. Returns the argument
