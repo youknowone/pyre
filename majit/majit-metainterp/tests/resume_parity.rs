@@ -31,7 +31,9 @@ fn resume_py_public_encoding_uses_tagged_numbering() {
             ],
         }],
         virtuals: vec![VirtualInfo::VArray {
+            arraydescr: None,
             descr_index: 9,
+            clear: false,
             items: vec![VirtualFieldSource::Constant(large_const)],
         }],
         pending_fields: Vec::new(),

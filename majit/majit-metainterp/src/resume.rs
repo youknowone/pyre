@@ -428,11 +428,19 @@ pub enum ResumeVirtualLayoutSummary {
         fielddescrs: Vec<majit_ir::FieldDescrInfo>,
         descr_size: usize,
     },
+    /// resume.py:643-684 AbstractVArrayInfo
     Array {
+        /// resume.py:646: self.arraydescr
+        arraydescr: Option<majit_ir::DescrRef>,
         descr_index: u32,
+        /// resume.py:680-683: VArrayInfoClear.clear=True / VArrayInfoNotClear.clear=False
+        clear: bool,
         items: Vec<ResumeValueLayoutSummary>,
     },
+    /// resume.py:736 VArrayStructInfo
     ArrayStruct {
+        /// resume.py:739: self.arraydescr
+        arraydescr: Option<majit_ir::DescrRef>,
         descr_index: u32,
         /// Per-field type within each element: 0=ref, 1=int, 2=float.
         field_types: Vec<u8>,
@@ -653,18 +661,27 @@ impl ResumeVirtualLayoutSummary {
                 fielddescrs: fielddescrs.clone(),
                 descr_size: *descr_size,
             },
-            ResumeVirtualLayoutSummary::Array { descr_index, items } => VirtualInfo::VArray {
+            ResumeVirtualLayoutSummary::Array {
+                arraydescr,
+                descr_index,
+                clear,
+                items,
+            } => VirtualInfo::VArray {
+                arraydescr: arraydescr.clone(),
                 descr_index: *descr_index,
+                clear: *clear,
                 items: items
                     .iter()
                     .map(|source| source.to_resume_source())
                     .collect(),
             },
             ResumeVirtualLayoutSummary::ArrayStruct {
+                arraydescr,
                 descr_index,
                 element_fields,
                 ..
             } => VirtualInfo::VArrayStruct {
+                arraydescr: arraydescr.clone(),
                 descr_index: *descr_index,
                 element_fields: element_fields
                     .iter()
@@ -739,9 +756,14 @@ impl ResumeVirtualLayoutSummary {
                 fielddescrs: fielddescrs.clone(),
                 descr_size: *descr_size,
             },
-            ResumeVirtualLayoutSummary::Array { descr_index, items } => ExitVirtualLayout::Array {
+            ResumeVirtualLayoutSummary::Array {
+                arraydescr: _,
+                descr_index,
+                clear,
+                items,
+            } => ExitVirtualLayout::Array {
                 descr_index: *descr_index,
-                clear: false,
+                clear: *clear,
                 kind: 0, // default ref
                 items: items
                     .iter()
@@ -749,6 +771,7 @@ impl ResumeVirtualLayoutSummary {
                     .collect(),
             },
             ResumeVirtualLayoutSummary::ArrayStruct {
+                arraydescr: _,
                 descr_index,
                 field_types,
                 element_fields,
@@ -1191,19 +1214,22 @@ pub enum VirtualInfo {
         fielddescrs: Vec<majit_ir::FieldDescrInfo>,
         descr_size: usize,
     },
-    /// Virtual array (from NEW_ARRAY).
+    /// resume.py:643-684 AbstractVArrayInfo (from NEW_ARRAY).
     VArray {
-        /// Array descriptor index.
+        /// resume.py:646: self.arraydescr
+        arraydescr: Option<majit_ir::DescrRef>,
+        /// Array descriptor index (serialization compat).
         descr_index: u32,
+        /// resume.py:680-683: VArrayInfoClear.clear / VArrayInfoNotClear.clear
+        clear: bool,
         /// Element values.
         items: Vec<VirtualFieldSource>,
     },
-    /// Virtual array of structs (from arrays with interior field access).
-    ///
-    /// Each element is a struct with multiple fields. Mirrors RPython's
-    /// VArrayStructInfo where each array slot contains a fixed-size struct.
+    /// resume.py:736 VArrayStructInfo (from arrays with interior field access).
     VArrayStruct {
-        /// Array descriptor index.
+        /// resume.py:739: self.arraydescr
+        arraydescr: Option<majit_ir::DescrRef>,
+        /// Array descriptor index (serialization compat).
         descr_index: u32,
         /// Per-element fields: outer Vec = elements, inner Vec = (field_index, source).
         element_fields: Vec<Vec<(u32, VirtualFieldSource)>>,
@@ -1303,11 +1329,15 @@ impl PartialEq for VirtualInfo {
             ) => a1 == b1 && a2 == b2 && a3 == b3 && a4 == b4 && a5 == b5,
             (
                 VirtualInfo::VArray {
+                    arraydescr: _,
                     descr_index: a1,
+                    clear: _,
                     items: a2,
                 },
                 VirtualInfo::VArray {
+                    arraydescr: _,
                     descr_index: b1,
+                    clear: _,
                     items: b2,
                 },
             ) => a1 == b1 && a2 == b2,
@@ -1409,16 +1439,25 @@ impl VirtualInfo {
                 fielddescrs: fielddescrs.clone(),
                 descr_size: *descr_size,
             },
-            VirtualInfo::VArray { descr_index, items } => ResumeVirtualLayoutSummary::Array {
+            VirtualInfo::VArray {
+                arraydescr,
+                descr_index,
+                clear,
+                items,
+            } => ResumeVirtualLayoutSummary::Array {
+                arraydescr: arraydescr.clone(),
                 descr_index: *descr_index,
+                clear: *clear,
                 items: items.iter().map(|source| source.layout_summary()).collect(),
             },
             VirtualInfo::VArrayStruct {
+                arraydescr,
                 descr_index,
                 element_fields,
             } => {
                 let fpe = element_fields.first().map(|ef| ef.len()).unwrap_or(0);
                 ResumeVirtualLayoutSummary::ArrayStruct {
+                    arraydescr: arraydescr.clone(),
                     descr_index: *descr_index,
                     field_types: vec![0u8; fpe],
                     element_fields: element_fields
@@ -1568,11 +1607,7 @@ pub fn rd_virtual_to_virtual_info(
             }
         }
         majit_ir::RdVirtualInfo::VArrayInfoClear {
-            descr_index,
-            fieldnums,
-            ..
-        }
-        | majit_ir::RdVirtualInfo::VArrayInfoNotClear {
+            arraydescr,
             descr_index,
             fieldnums,
             ..
@@ -1582,11 +1617,31 @@ pub fn rd_virtual_to_virtual_info(
                 .map(|&tagged| tagged_to_source(tagged, consts, count))
                 .collect();
             VirtualInfo::VArray {
+                arraydescr: arraydescr.clone(),
                 descr_index: *descr_index,
+                clear: true,
+                items,
+            }
+        }
+        majit_ir::RdVirtualInfo::VArrayInfoNotClear {
+            arraydescr,
+            descr_index,
+            fieldnums,
+            ..
+        } => {
+            let items = fieldnums
+                .iter()
+                .map(|&tagged| tagged_to_source(tagged, consts, count))
+                .collect();
+            VirtualInfo::VArray {
+                arraydescr: arraydescr.clone(),
+                descr_index: *descr_index,
+                clear: false,
                 items,
             }
         }
         majit_ir::RdVirtualInfo::VArrayStructInfo {
+            arraydescr,
             descr_index,
             size,
             fielddescr_indices,
@@ -1609,6 +1664,7 @@ pub fn rd_virtual_to_virtual_info(
                 }
             }
             VirtualInfo::VArrayStruct {
+                arraydescr: arraydescr.clone(),
                 descr_index: *descr_index,
                 element_fields,
             }
@@ -2362,11 +2418,17 @@ impl MaterializedVirtual {
                 descr_index: *descr_index,
                 fields: Vec::new(),
             },
-            VirtualInfo::VArray { descr_index, items } => MaterializedVirtual::Array {
+            VirtualInfo::VArray {
+                arraydescr: _,
+                descr_index,
+                clear: _,
+                items,
+            } => MaterializedVirtual::Array {
                 descr_index: *descr_index,
                 items: vec![MaterializedValue::Value(0); items.len()],
             },
             VirtualInfo::VArrayStruct {
+                arraydescr: _,
                 descr_index,
                 element_fields,
             } => MaterializedVirtual::ArrayStruct {
@@ -2697,17 +2759,30 @@ impl ResumeDataVirtualAdder {
     }
 
     /// Convenience: add a virtual array (NEW_ARRAY).
-    pub fn add_virtual_array(&mut self, descr_index: u32, items: Vec<VirtualFieldSource>) -> usize {
-        self.add_virtual(VirtualInfo::VArray { descr_index, items })
+    pub fn add_virtual_array(
+        &mut self,
+        arraydescr: Option<majit_ir::DescrRef>,
+        descr_index: u32,
+        clear: bool,
+        items: Vec<VirtualFieldSource>,
+    ) -> usize {
+        self.add_virtual(VirtualInfo::VArray {
+            arraydescr,
+            descr_index,
+            clear,
+            items,
+        })
     }
 
     /// Convenience: add a virtual array of structs.
     pub fn add_virtual_array_struct(
         &mut self,
+        arraydescr: Option<majit_ir::DescrRef>,
         descr_index: u32,
         element_fields: Vec<Vec<(u32, VirtualFieldSource)>>,
     ) -> usize {
         self.add_virtual(VirtualInfo::VArrayStruct {
+            arraydescr,
             descr_index,
             element_fields,
         })
@@ -3642,10 +3717,9 @@ impl ResumeDataLoopMemo {
                 .collect();
 
             // bridgeopt.py:74-88: known classes bitfield
-            // RPython stores only a bitfield (1=class known, 0=unknown).
+            // RPython: for each livebox, call getptrinfo(box).get_known_class(cpu).
             // The actual class pointer is recovered at deserialization time
             // via cpu.cls_of_box(frontend_boxes[i]).
-            let known_classes = optimizer_knowledge.map(|k| &k.known_classes);
             let mut bitfield: i32 = 0;
             let mut shifts = 0;
             for livebox in &liveboxes {
@@ -3654,7 +3728,9 @@ impl ResumeDataLoopMemo {
                         continue;
                     }
                     bitfield <<= 1;
-                    if known_classes.map_or(false, |kc| kc.contains(opref)) {
+                    // bridgeopt.py:79-80: info = getptrinfo(box)
+                    // known_class = info is not None and info.get_known_class(cpu) is not None
+                    if env.has_known_class(*opref) {
                         bitfield |= 1;
                     }
                     shifts += 1;
@@ -4000,8 +4076,6 @@ pub struct OptimizerKnowledgeForResume {
     pub heap_arrayitems: Vec<(majit_ir::OpRef, i64, i32, majit_ir::OpRef)>,
     /// (const_func_ptr, result_opref) loop-invariant call results.
     pub loopinvariant_results: Vec<(i64, majit_ir::OpRef)>,
-    /// bridgeopt.py:74-88: OpRefs with known class (from PtrInfo).
-    pub known_classes: std::collections::HashSet<majit_ir::OpRef>,
 }
 
 impl OptimizerKnowledgeForResume {
@@ -4009,7 +4083,6 @@ impl OptimizerKnowledgeForResume {
         self.heap_fields.is_empty()
             && self.heap_arrayitems.is_empty()
             && self.loopinvariant_results.is_empty()
-            && self.known_classes.is_empty()
     }
 }
 
@@ -4759,7 +4832,12 @@ impl VirtualInfo {
                 }
                 obj
             }
-            VirtualInfo::VArray { descr_index, items } => {
+            VirtualInfo::VArray {
+                arraydescr: _,
+                descr_index,
+                clear: _,
+                items,
+            } => {
                 let length = items.len();
                 let array = allocator.allocate_array(length, *descr_index, true);
                 decoder.virtuals_cache.set_ptr(index, array);

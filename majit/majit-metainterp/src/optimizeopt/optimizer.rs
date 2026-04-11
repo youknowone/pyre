@@ -3255,21 +3255,14 @@ impl Optimizer {
             })
             .collect();
 
-        // bridgeopt.py:74-88: collect oprefs with known class.
-        let mut known_classes = std::collections::HashSet::new();
-        for (idx, fwd) in ctx.forwarded.iter().enumerate() {
-            if let crate::optimizeopt::info::Forwarded::Info(info) = fwd {
-                if info.get_known_class().is_some() {
-                    known_classes.insert(OpRef(idx as u32));
-                }
-            }
-        }
+        // bridgeopt.py:74-88: known_classes bitfield is now computed
+        // directly at serialization time in resume.rs via env.has_known_class(),
+        // matching RPython's per-livebox getptrinfo(box).get_known_class(cpu).
 
         crate::resume::OptimizerKnowledgeForResume {
             heap_fields,
             heap_arrayitems,
             loopinvariant_results,
-            known_classes,
         }
     }
 

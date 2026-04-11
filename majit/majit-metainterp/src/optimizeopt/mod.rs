@@ -493,6 +493,15 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
         false
     }
 
+    fn has_known_class(&self, opref: OpRef) -> bool {
+        // bridgeopt.py:79-80: getptrinfo(box).get_known_class(cpu) is not None
+        let resolved = self.ctx.get_box_replacement(opref);
+        self.ctx
+            .get_ptr_info(resolved)
+            .and_then(|info| info.get_known_class())
+            .is_some()
+    }
+
     fn get_virtual_fields(&self, opref: OpRef) -> Option<majit_ir::VirtualFieldsInfo> {
         let resolved = self.ctx.get_box_replacement(opref);
         let info = self.ctx.get_ptr_info(resolved)?;
@@ -632,17 +641,24 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
                         _ => 0u8,
                     })
                     .unwrap_or(0);
+                // resume.py:326-330: VArrayInfoClear/NotClear(arraydescr)
+                let ad = Some(vi.descr.clone());
+                let descr_index = vi.descr.index();
+                debug_assert!(
+                    ad.as_ref().map(|d| d.index()) == Some(descr_index),
+                    "arraydescr.index() != descr_index"
+                );
                 if vi.clear {
                     Some(majit_ir::RdVirtualInfo::VArrayInfoClear {
-                        arraydescr: None,
-                        descr_index: vi.descr.index(),
+                        arraydescr: ad,
+                        descr_index,
                         kind,
                         fieldnums,
                     })
                 } else {
                     Some(majit_ir::RdVirtualInfo::VArrayInfoNotClear {
-                        arraydescr: None,
-                        descr_index: vi.descr.index(),
+                        arraydescr: ad,
+                        descr_index,
                         kind,
                         fieldnums,
                     })
@@ -686,8 +702,14 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
                     .as_array_descr()
                     .map(|ad| ad.base_size())
                     .unwrap_or(0);
+                // resume.py:332: VArrayStructInfo(arraydescr, size, fielddescrs)
+                let struct_ad = Some(vi.descr.clone());
+                debug_assert!(
+                    struct_ad.as_ref().map(|d| d.index()) == Some(vi.descr.index()),
+                    "VArrayStructInfo: arraydescr.index() != descr_index"
+                );
                 Some(majit_ir::RdVirtualInfo::VArrayStructInfo {
-                    arraydescr: None,
+                    arraydescr: struct_ad,
                     descr_index: vi.descr.index(),
                     size: vi.element_fields.len(),
                     fielddescr_indices,

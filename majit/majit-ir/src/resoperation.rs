@@ -369,6 +369,11 @@ pub trait BoxEnv {
     fn get_virtual_fields(&self, _opref: OpRef) -> Option<VirtualFieldsInfo> {
         None
     }
+    /// bridgeopt.py:79-80: getptrinfo(box).get_known_class(cpu) is not None.
+    /// Returns true if the optimizer knows the class of the given OpRef.
+    fn has_known_class(&self, _opref: OpRef) -> bool {
+        false
+    }
     /// resume.py:307-315 make_virtual_info(info, fieldnums) parity.
     ///
     /// Creates an `RdVirtualInfo` for a virtual OpRef with given fieldnums.
