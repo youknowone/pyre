@@ -586,19 +586,26 @@ impl OptVirtualize {
         vinfo: VirtualRawBufferInfo,
         ctx: &mut OptContext,
     ) -> OpRef {
+        // info.py:420-436: RawBufferPtrInfo._force_elements()
         // Mark as no longer virtual FIRST
         ctx.set_ptr_info(opref, PtrInfo::nonnull());
 
-        // Emit CALL_MALLOC_NURSERY or equivalent raw allocation
+        // info.py:148: emit CALL_I(func, ConstInt(size), descr=calldescr)
+        let func_ref = self.emit_constant_int(ctx, vinfo.func);
         let size_ref = self.emit_constant_int(ctx, vinfo.size as i64);
-        let alloc_op = Op::new(OpCode::CallMallocNursery, &[size_ref]);
-        let alloc_ref = ctx.emit_extra(ctx.current_pass_idx, alloc_op);
+        let mut call_op = Op::new(OpCode::CallI, &[func_ref, size_ref]);
+        call_op.descr = vinfo.calldescr;
+        let alloc_ref = ctx.emit_extra(ctx.current_pass_idx, call_op);
 
         if opref != alloc_ref {
             ctx.replace_op(opref, alloc_ref);
         }
 
-        // info.py:420: _force_elements — emit RAW_STORE with stored descr.
+        // info.py:425: CHECK_MEMORY_ERROR
+        let check_op = Op::new(OpCode::CheckMemoryError, &[alloc_ref]);
+        ctx.emit_extra(ctx.current_pass_idx, check_op);
+
+        // info.py:429-436: emit RAW_STORE for each buffered write
         for i in 0..vinfo.offsets.len() {
             let value_ref = self.force_virtual(vinfo.values[i], ctx);
             let value_ref = ctx.get_box_replacement(value_ref);
@@ -1793,6 +1800,7 @@ impl Optimization for OptVirtualize {
                                             descrs: Vec::new(),
                                             values: Vec::new(),
                                             last_guard_pos: -1,
+                                            calldescr: op.descr.clone(),
                                         },
                                     );
                                     ctx.set_ptr_info(op.pos, info);
@@ -3256,6 +3264,7 @@ mod tests {
                     descrs: Vec::new(),
                     values: Vec::new(),
                     last_guard_pos: -1,
+                    calldescr: None,
                 }),
             );
         }

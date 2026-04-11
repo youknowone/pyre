@@ -1069,6 +1069,69 @@ impl PtrInfo {
                 }
                 alloc_ref
             }
+            PtrInfo::VirtualRawBuffer(vinfo) => {
+                // info.py:420-436: RawBufferPtrInfo._force_elements()
+                // 1. Emit CALL_I(func, ConstInt(size), descr=calldescr)
+                // 2. Emit CHECK_MEMORY_ERROR
+                // 3. Emit RAW_STORE for each buffered write
+
+                // info.py:421: self.size = -1 (mark as no longer virtual)
+                let offsets = std::mem::take(&mut vinfo.offsets);
+                let descrs = std::mem::take(&mut vinfo.descrs);
+                let values = std::mem::take(&mut vinfo.values);
+                let func = vinfo.func;
+                let size = vinfo.size;
+                let calldescr = vinfo.calldescr.take();
+
+                // info.py:148: optforce.emit_extra(op) — emit the CALL_I
+                let func_ref = {
+                    let pos = ctx.reserve_pos();
+                    let mut op = Op::new(OpCode::SameAsI, &[pos]);
+                    op.pos = pos;
+                    let r = emit_op(ctx, op);
+                    ctx.make_constant(r, majit_ir::Value::Int(func));
+                    r
+                };
+                let size_ref = {
+                    let pos = ctx.reserve_pos();
+                    let mut op = Op::new(OpCode::SameAsI, &[pos]);
+                    op.pos = pos;
+                    let r = emit_op(ctx, op);
+                    ctx.make_constant(r, majit_ir::Value::Int(size as i64));
+                    r
+                };
+                let mut call_op = Op::new(OpCode::CallI, &[func_ref, size_ref]);
+                call_op.descr = calldescr;
+                let alloc_ref = emit_op(ctx, call_op);
+
+                ctx.set_ptr_info(alloc_ref, PtrInfo::nonnull());
+                if opref != alloc_ref {
+                    ctx.replace_op(opref, alloc_ref);
+                }
+
+                // info.py:425: CHECK_MEMORY_ERROR
+                let check_op = Op::new(OpCode::CheckMemoryError, &[alloc_ref]);
+                emit_op(ctx, check_op);
+
+                // info.py:429-436: emit RAW_STORE for each buffered write
+                for i in 0..offsets.len() {
+                    let value_ref = force_child(values[i], ctx);
+                    let offset_ref = {
+                        let pos = ctx.reserve_pos();
+                        let mut op = Op::new(OpCode::SameAsI, &[pos]);
+                        op.pos = pos;
+                        let r = emit_op(ctx, op);
+                        ctx.make_constant(r, majit_ir::Value::Int(offsets[i] as i64));
+                        r
+                    };
+                    let mut store_op =
+                        Op::new(OpCode::RawStore, &[alloc_ref, offset_ref, value_ref]);
+                    store_op.descr = Some(descrs[i].clone());
+                    emit_op(ctx, store_op);
+                }
+
+                alloc_ref
+            }
             _ => opref,
         }
     }
@@ -1838,6 +1901,9 @@ pub struct VirtualRawBufferInfo {
     pub values: Vec<OpRef>,
     /// info.py:91-92
     pub last_guard_pos: i32,
+    /// info.py:420: calldescr for CALL_I(func, size) raw malloc.
+    /// Saved from the original CALL_I op during virtualization.
+    pub calldescr: Option<DescrRef>,
 }
 
 /// Error returned when a raw buffer operation violates invariants.
@@ -2035,6 +2101,7 @@ mod tests {
             descrs: Vec::new(),
             values: Vec::new(),
             last_guard_pos: -1,
+            calldescr: None,
         }
     }
 

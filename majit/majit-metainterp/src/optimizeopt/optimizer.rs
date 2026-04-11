@@ -414,6 +414,7 @@ impl Optimizer {
                             descrs: descrs.clone(),
                             values,
                             last_guard_pos: -1,
+                            calldescr: None,
                         },
                     ),
                 );
@@ -888,6 +889,7 @@ impl Optimizer {
                             descrs: descrs.clone(),
                             values,
                             last_guard_pos: -1,
+                            calldescr: None,
                         },
                     ),
                 );

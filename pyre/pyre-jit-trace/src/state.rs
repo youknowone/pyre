@@ -2532,10 +2532,15 @@ fn materialize_bridge_virtual(
                     continue;
                 }
                 // resume.py:1225-1234: setrawbuffer_item (direct reader).
-                // Dispatches pointer/float/int via arraydescr — all types allowed.
+                // rawbuffer.py:55: write_value asserts not is_array_of_pointers().
+                // Raw buffers never hold GC-managed pointers — this is an
+                // optimizer invariant, not a decode-time decision.
                 let di = &descrs[i];
+                assert!(
+                    di.item_type != 0,
+                    "raw buffer entry must not be pointer type"
+                );
                 let tp = match di.item_type {
-                    0 => majit_ir::Type::Ref,
                     2 => majit_ir::Type::Float,
                     _ => majit_ir::Type::Int,
                 };

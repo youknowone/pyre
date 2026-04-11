@@ -11239,9 +11239,20 @@ impl majit_backend::Backend for CraneliftBackend {
         ptr
     }
 
+    /// llmodel.py:816 bh_call_i: ABI-correct dispatch.
+    ///
+    /// ARM64/x86-64 C ABI assigns integer and float args to independent register
+    /// files (x0-x7 + d0-d7 on ARM64; rdi,rsi,… + xmm0-xmm7 on x86-64).
+    /// We construct `fn(ints…, floats…) -> i64` which places each group in the
+    /// correct register file regardless of their original interleaving order.
+    ///
     /// llmodel.py:816-820 bh_call_i(func, args_i, args_r, args_f, calldescr)
-    /// Generic call: calldescr.call_stub_i(func, args_i, args_r, args_f).
-    /// Flattens args per calldescr.arg_classes order, calls func, returns i64.
+    /// calldescr.call_stub_i(func, args_i, args_r, args_f).
+    ///
+    /// On ARM64/x86-64, the C ABI assigns integer and floating-point args to
+    /// independent register files (x0-x7 / d0-d7 on ARM64; rdi,rsi,... /
+    /// xmm0-xmm7 on x86-64). So we can always construct the function pointer
+    /// as `fn(ints..., floats...) -> i64` and get the correct register layout.
     fn bh_call_i(
         &self,
         func: i64,
@@ -11253,60 +11264,31 @@ impl majit_backend::Backend for CraneliftBackend {
         if func == 0 {
             return 0;
         }
-        // llmodel.py:820: calldescr.call_stub_i(func, args_i, args_r, args_f)
-        // Flatten args in arg_classes order into a flat i64 array.
-        let mut flat_args: Vec<i64> = Vec::new();
+        // Separate integer (i+r) and float (f) args in arg_classes order.
+        let mut int_args: Vec<i64> = Vec::new();
+        let mut float_args: Vec<f64> = Vec::new();
         let mut ii = 0usize;
         let mut ri = 0usize;
         let mut fi = 0usize;
         for c in calldescr.arg_classes.chars() {
             match c {
                 'i' => {
-                    flat_args.push(args_i.and_then(|a| a.get(ii).copied()).unwrap_or(0));
+                    int_args.push(args_i.and_then(|a| a.get(ii).copied()).unwrap_or(0));
                     ii += 1;
                 }
                 'r' => {
-                    flat_args.push(args_r.and_then(|a| a.get(ri).copied()).unwrap_or(0));
+                    int_args.push(args_r.and_then(|a| a.get(ri).copied()).unwrap_or(0));
                     ri += 1;
                 }
                 'f' => {
-                    flat_args.push(args_f.and_then(|a| a.get(fi).copied()).unwrap_or(0));
+                    let bits = args_f.and_then(|a| a.get(fi).copied()).unwrap_or(0);
+                    float_args.push(f64::from_bits(bits as u64));
                     fi += 1;
                 }
                 _ => {}
             }
         }
-        // Dispatch by arg count.
-        unsafe {
-            match flat_args.len() {
-                0 => {
-                    let f: unsafe extern "C" fn() -> i64 = std::mem::transmute(func as usize);
-                    f()
-                }
-                1 => {
-                    let f: unsafe extern "C" fn(i64) -> i64 = std::mem::transmute(func as usize);
-                    f(flat_args[0])
-                }
-                2 => {
-                    let f: unsafe extern "C" fn(i64, i64) -> i64 =
-                        std::mem::transmute(func as usize);
-                    f(flat_args[0], flat_args[1])
-                }
-                3 => {
-                    let f: unsafe extern "C" fn(i64, i64, i64) -> i64 =
-                        std::mem::transmute(func as usize);
-                    f(flat_args[0], flat_args[1], flat_args[2])
-                }
-                4 => {
-                    let f: unsafe extern "C" fn(i64, i64, i64, i64) -> i64 =
-                        std::mem::transmute(func as usize);
-                    f(flat_args[0], flat_args[1], flat_args[2], flat_args[3])
-                }
-                n => {
-                    panic!("bh_call_i: unsupported arg count {n}");
-                }
-            }
-        }
+        unsafe { bh_call_i_dispatch(func as usize, &int_args, &float_args) }
     }
 
     /// llmodel.py:739-742 bh_raw_store_i(addr, offset, newvalue, descr)
@@ -11560,6 +11542,96 @@ fn emit_inline_arena_put(
 
     builder.switch_to_block(done_block);
     builder.seal_block(done_block);
+}
+
+/// llmodel.py:816 call_stub_i: ABI-correct dispatch with separate int/float
+/// register files. On ARM64/x86-64, integer args go to x0-x7 / rdi,rsi,... and
+/// float args go to d0-d7 / xmm0-xmm7 independently.
+///
+/// Safety: func must be a valid function pointer matching the described ABI.
+unsafe fn bh_call_i_dispatch(func: usize, int_args: &[i64], float_args: &[f64]) -> i64 {
+    type I = i64;
+    type F = f64;
+    match (int_args.len(), float_args.len()) {
+        // No float args — integer-only calls.
+        (0, 0) => {
+            let f: unsafe extern "C" fn() -> I = std::mem::transmute(func);
+            f()
+        }
+        (1, 0) => {
+            let f: unsafe extern "C" fn(I) -> I = std::mem::transmute(func);
+            f(int_args[0])
+        }
+        (2, 0) => {
+            let f: unsafe extern "C" fn(I, I) -> I = std::mem::transmute(func);
+            f(int_args[0], int_args[1])
+        }
+        (3, 0) => {
+            let f: unsafe extern "C" fn(I, I, I) -> I = std::mem::transmute(func);
+            f(int_args[0], int_args[1], int_args[2])
+        }
+        (4, 0) => {
+            let f: unsafe extern "C" fn(I, I, I, I) -> I = std::mem::transmute(func);
+            f(int_args[0], int_args[1], int_args[2], int_args[3])
+        }
+        (5, 0) => {
+            let f: unsafe extern "C" fn(I, I, I, I, I) -> I = std::mem::transmute(func);
+            f(
+                int_args[0],
+                int_args[1],
+                int_args[2],
+                int_args[3],
+                int_args[4],
+            )
+        }
+        (6, 0) => {
+            let f: unsafe extern "C" fn(I, I, I, I, I, I) -> I = std::mem::transmute(func);
+            f(
+                int_args[0],
+                int_args[1],
+                int_args[2],
+                int_args[3],
+                int_args[4],
+                int_args[5],
+            )
+        }
+        // Float-only calls.
+        (0, 1) => {
+            let f: unsafe extern "C" fn(F) -> I = std::mem::transmute(func);
+            f(float_args[0])
+        }
+        (0, 2) => {
+            let f: unsafe extern "C" fn(F, F) -> I = std::mem::transmute(func);
+            f(float_args[0], float_args[1])
+        }
+        // Mixed int + float calls.
+        (1, 1) => {
+            let f: unsafe extern "C" fn(I, F) -> I = std::mem::transmute(func);
+            f(int_args[0], float_args[0])
+        }
+        (2, 1) => {
+            let f: unsafe extern "C" fn(I, I, F) -> I = std::mem::transmute(func);
+            f(int_args[0], int_args[1], float_args[0])
+        }
+        (1, 2) => {
+            let f: unsafe extern "C" fn(I, F, F) -> I = std::mem::transmute(func);
+            f(int_args[0], float_args[0], float_args[1])
+        }
+        (2, 2) => {
+            let f: unsafe extern "C" fn(I, I, F, F) -> I = std::mem::transmute(func);
+            f(int_args[0], int_args[1], float_args[0], float_args[1])
+        }
+        (3, 1) => {
+            let f: unsafe extern "C" fn(I, I, I, F) -> I = std::mem::transmute(func);
+            f(int_args[0], int_args[1], int_args[2], float_args[0])
+        }
+        (ni, nf) => {
+            panic!(
+                "bh_call_i: unsupported arg combination ({ni} ints, {nf} floats); \
+                 needs libffi for general dispatch"
+            );
+        }
+    }
 }
 
 // Tests
