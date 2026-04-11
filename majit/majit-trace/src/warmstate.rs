@@ -150,6 +150,10 @@ impl BaseJitCell {
             // Remove only if we had a token that is now dead.
             return self.has_seen_a_procedure_token();
         }
+        // warmstate.py:222-225
+        if self.flags & jc_flags::FORCE_FINISH != 0 {
+            return false;
+        }
         true
     }
 }
@@ -2601,6 +2605,11 @@ mod tests {
         cell.flags |= jc_flags::DONT_TRACE_HERE;
         cell.token = Some(42); // historical record of past token
         assert!(cell.should_remove_jitcell());
+
+        // warmstate.py:222-225: FORCE_FINISH must NOT be removed
+        let mut cell = BaseJitCell::new();
+        cell.flags |= jc_flags::FORCE_FINISH;
+        assert!(!cell.should_remove_jitcell());
     }
 
     #[test]
