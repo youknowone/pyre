@@ -3779,18 +3779,16 @@ fn rebuild_state_after_failure_from_recovery_layout(
                 materialized.push(array as usize);
             }
             majit_backend::ExitVirtualLayout::RawBuffer {
+                func,
                 size,
                 offsets,
                 descrs,
                 sources,
-                ..
             } => {
-                let buffer = unsafe {
-                    std::alloc::alloc_zeroed(
-                        std::alloc::Layout::from_size_align(*size, 8)
-                            .unwrap_or(std::alloc::Layout::new::<u8>()),
-                    )
-                };
+                // resume.py:701-703 allocate_raw_buffer(self.func, self.size)
+                // resume.py:1124-1132: func selects the malloc variant
+                // (zero/non-zero, memory-pressure or not, etc.)
+                let buffer = allocate_raw_buffer_by_func(*func, *size);
                 for (i, src) in sources.iter().enumerate() {
                     if let Some(val) = resolve_value(src, &materialized) {
                         let offset = offsets.get(i).copied().unwrap_or(0);
@@ -3857,6 +3855,34 @@ fn rebuild_state_after_failure_from_recovery_layout(
         }
     }
     replaced > 0 || materialized.is_empty()
+}
+
+/// resume.py:1124-1132 allocate_raw_buffer(func, size).
+/// RPython comment: "Can't use 'func' from callinfo_for_oopspec(), because
+/// we have several variants (zero/non-zero, memory-pressure or not, etc.)
+/// and we have to pick the correct one here; that's why we save it in the
+/// VRawBufferInfo."
+///
+/// In pyre, `func` is the raw malloc function pointer saved during tracing.
+/// We call it directly if non-zero; otherwise fall back to alloc_zeroed.
+fn allocate_raw_buffer_by_func(func: i64, size: usize) -> *mut u8 {
+    if func != 0 {
+        // resume.py:1131: execute_and_record_varargs(CALL_I, [ConstInt(func), ConstInt(size)], ...)
+        // In blackhole replay, this becomes cpu.bh_call_i(func, [size], calldescr).
+        // Pyre: call the function pointer directly.
+        let f: fn(usize) -> *mut u8 = unsafe { std::mem::transmute(func as usize) };
+        let ptr = f(size);
+        if !ptr.is_null() {
+            return ptr;
+        }
+    }
+    // Fallback: zero-initialized allocation.
+    unsafe {
+        std::alloc::alloc_zeroed(
+            std::alloc::Layout::from_size_align(size.max(1), 8)
+                .unwrap_or(std::alloc::Layout::new::<u8>()),
+        )
+    }
 }
 
 /// resume.py:1543-1550 setrawbuffer_item: write raw value by descr.
