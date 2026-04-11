@@ -136,6 +136,10 @@ pub struct Optimizer {
     /// `Arc` rather than `Box` because the resolver is shared across
     /// multiple optimizer runs (propagation is a `clone()`, not a `take()`).
     pub string_length_resolver: Option<crate::optimizeopt::info::StringLengthResolver>,
+    /// info.py:788-790 ConstPtrInfo._unpack_str(mode) — runtime hook.
+    pub string_content_resolver: Option<crate::optimizeopt::info::StringContentResolver>,
+    /// history.py:377 get_const_ptr_for_string(s) — runtime hook.
+    pub string_constant_alloc: Option<crate::optimizeopt::info::StringConstantAllocator>,
     /// RPython metainterp_sd.callinfocollection parity.
     /// Propagated to OptContext for generate_modified_call (vstring.py:853).
     pub callinfocollection: Option<std::sync::Arc<majit_ir::descr::CallInfoCollection>>,
@@ -956,6 +960,8 @@ impl Optimizer {
             all_descrs: Vec::new(),
             constant_fold_alloc: None,
             string_length_resolver: None,
+            string_content_resolver: None,
+            string_constant_alloc: None,
             callinfocollection: None,
             resumedata_memo: crate::resume::ResumeDataLoopMemo::new(),
             snapshot_boxes: std::collections::HashMap::new(),
@@ -1308,36 +1314,6 @@ impl Optimizer {
         ctx.new_operations.last()
     }
 
-    /// optimizer.py: new_const(fieldvalue) — create a new constant OpRef.
-    /// Emits a SameAs op with the given constant value.
-    pub fn new_const_int(ctx: &mut OptContext, value: i64) -> OpRef {
-        let op = Op::new(OpCode::SameAsI, &[]);
-        let opref = ctx.emit(op);
-        ctx.make_constant(opref, majit_ir::Value::Int(value));
-        opref
-    }
-
-    /// optimizer.py: new_const_item(arraydescr) — create a default value
-    /// for an array item (0 for int, null for ref, 0.0 for float).
-    pub fn new_const_item(ctx: &mut OptContext, item_type: majit_ir::Type) -> OpRef {
-        match item_type {
-            majit_ir::Type::Int => Self::new_const_int(ctx, 0),
-            majit_ir::Type::Ref => {
-                let op = Op::new(OpCode::SameAsR, &[]);
-                let opref = ctx.emit(op);
-                ctx.make_constant(opref, majit_ir::Value::Ref(majit_ir::GcRef::NULL));
-                opref
-            }
-            majit_ir::Type::Float => {
-                let op = Op::new(OpCode::SameAsF, &[]);
-                let opref = ctx.emit(op);
-                ctx.make_constant(opref, majit_ir::Value::Float(0.0));
-                opref
-            }
-            majit_ir::Type::Void => OpRef::NONE,
-        }
-    }
-
     /// optimizer.py: _clean_optimization_info(ops)
     /// Reset forwarding pointers on all ops before re-optimization.
     /// Called when re-optimizing a trace (e.g., retrace).
@@ -1543,6 +1519,8 @@ impl Optimizer {
         ctx.skip_flush_mode = self.skip_flush;
         ctx.constant_fold_alloc = self.constant_fold_alloc.take();
         ctx.string_length_resolver = self.string_length_resolver.clone();
+        ctx.string_content_resolver = self.string_content_resolver.clone();
+        ctx.string_constant_alloc = self.string_constant_alloc.clone();
         ctx.callinfocollection = self.callinfocollection.clone();
         // RPython resume.py parity: Phase 2 optimizer needs imported_label_args
         // to resolve NONE positions in fail_args inherited from Phase 1.

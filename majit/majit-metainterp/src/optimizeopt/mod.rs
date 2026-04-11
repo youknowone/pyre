@@ -137,6 +137,7 @@ pub type ConstantFoldAllocFn = Box<dyn Fn(usize) -> majit_ir::GcRef>;
 /// `Arc<dyn Fn(GcRef, u8) -> Option<i64> + Send + Sync>`. See
 /// `info::EnsuredPtrInfo::getlenbound` for the consumer side.
 pub use crate::optimizeopt::info::StringLengthResolver;
+pub use crate::optimizeopt::info::{StringConstantAllocator, StringContentResolver};
 
 /// Context provided to optimization passes.
 ///
@@ -292,6 +293,13 @@ pub struct OptContext {
     /// `None`, `EnsuredPtrInfo::getlenbound(Some(_))` falls back to
     /// `IntBound::nonnegative()`.
     pub string_length_resolver: Option<StringLengthResolver>,
+    /// info.py:788-790 `ConstPtrInfo._unpack_str(mode)` — runtime hook for
+    /// extracting character data from a constant string GcRef.
+    pub string_content_resolver: Option<StringContentResolver>,
+    /// history.py:377 `get_const_ptr_for_string(s)` — runtime hook for
+    /// creating a constant string GcRef from char values (used by
+    /// force_box constant-folding path, vstring.py:79-90).
+    pub string_constant_alloc: Option<StringConstantAllocator>,
     /// True while optimizer.py:_emit_operation equivalent is forcing args
     /// just before final emission. In this phase, virtual forcing must emit
     /// directly into new_operations instead of re-entering the pass chain.
@@ -780,6 +788,8 @@ impl OptContext {
             pending_pure_from_args2: Vec::new(),
             constant_fold_alloc: None,
             string_length_resolver: None,
+            string_content_resolver: None,
+            string_constant_alloc: None,
             quasi_immutable_deps: HashSet::new(),
             snapshot_boxes: HashMap::new(),
             snapshot_frame_sizes: HashMap::new(),
@@ -857,6 +867,8 @@ impl OptContext {
             pending_pure_from_args2: Vec::new(),
             constant_fold_alloc: None,
             string_length_resolver: None,
+            string_content_resolver: None,
+            string_constant_alloc: None,
             quasi_immutable_deps: HashSet::new(),
             snapshot_boxes: HashMap::new(),
             snapshot_frame_sizes: HashMap::new(),
@@ -885,6 +897,16 @@ impl OptContext {
         let opref = OpRef::from_const(self.next_const_idx);
         self.next_const_idx += 1;
         opref
+    }
+
+    /// info.py:148,226 emit during force_box: routes through emit_extra
+    /// normally, or direct emit when in_final_emission is true.
+    pub fn emit_for_force(&mut self, op: Op) -> OpRef {
+        if self.in_final_emission {
+            self.emit(op)
+        } else {
+            self.emit_extra(self.current_pass_idx, op)
+        }
     }
 
     /// Emit a boxed integer constant through the optimizer pipeline and return
@@ -920,11 +942,114 @@ impl OptContext {
         opref
     }
 
-    pub fn emit_default_value_for_type(&mut self, item_type: Type) -> OpRef {
+    /// optimizer.py:509-515 new_const_item(arraydescr) — default value for
+    /// the given item type. Uses emit_extra (downstream-only) so this is
+    /// safe to call during force_box / force_virtual.
+    pub fn new_const_item(&mut self, item_type: Type) -> OpRef {
         match item_type {
             Type::Int | Type::Void => self.emit_constant_int(0),
             Type::Ref => self.emit_constant_ref(GcRef::NULL),
             Type::Float => self.emit_constant_float(0.0),
+        }
+    }
+
+    /// vstring.py:110-119 / 171-175 / 251-253 / 281-295
+    /// Per-subclass getstrlen() dispatch — returns a cached lgtop OpRef if
+    /// available, or computes/emits the length and caches in StrPtrInfo.lgtop.
+    /// Always returns a box (OpRef), never an i64 summary.
+    pub fn getstrlen_opref(&mut self, opref: OpRef, mode: u8) -> OpRef {
+        let resolved = self.get_box_replacement(opref);
+        // vstring.py:112/283: if self.lgtop is not None: return self.lgtop
+        if let Some(info) = self.getptrinfo(resolved) {
+            if let Some(lgtop) = info.as_ref().get_cached_lgtop() {
+                return lgtop;
+            }
+        }
+        // vstring.py:174/253: constant or structurally-known length
+        let known_len = self
+            .getptrinfo(resolved)
+            .and_then(|info| info.as_ref().get_known_str_length(self, mode));
+        if let Some(len) = known_len {
+            let len_opref = self.make_constant_int(len);
+            self.set_str_lgtop(resolved, len_opref);
+            return len_opref;
+        }
+        // vstring.py:281-295: VStringConcatInfo.getstrlen — recursive
+        // dispatch: getstrlen on each child, then _int_add.
+        // Borrow-checker adaptation: extract vleft/vright before &mut self calls.
+        let concat_children = self.getptrinfo(resolved).and_then(|info| {
+            use crate::optimizeopt::info::VStringVariant;
+            if let PtrInfo::Str(sinfo) = info.as_ref() {
+                if let VStringVariant::Concat(c) = &sinfo.variant {
+                    return Some((c.vleft, c.vright));
+                }
+            }
+            None
+        });
+        if let Some((vleft, vright)) = concat_children {
+            // vstring.py:286-293
+            let left_len = self.getstrlen_opref(vleft, mode);
+            let right_len = self.getstrlen_opref(vright, mode);
+            let result = crate::optimizeopt::vstring::_int_add(left_len, right_len, self);
+            // vstring.py:293: self.lgtop = _int_add(optstring, len1box, len2box)
+            self.set_str_lgtop(resolved, result);
+            return result;
+        }
+        // vstring.py:115-118: base StrPtrInfo — emit STRLEN/UNICODELEN
+        let strlen_opcode = if mode != 0 {
+            majit_ir::OpCode::Unicodelen
+        } else {
+            majit_ir::OpCode::Strlen
+        };
+        let strlen_op = majit_ir::Op::new(strlen_opcode, &[resolved]);
+        let result = self.emit_extra(self.current_pass_idx, strlen_op);
+        // vstring.py:116: lengthop.set_forwarded(self.getlenbound(mode))
+        let lenbound = self.get_str_lenbound(resolved);
+        if let Some(bound) = lenbound {
+            self.setintbound(result, &bound);
+        }
+        // vstring.py:117: self.lgtop = lengthop
+        self.set_str_lgtop(resolved, result);
+        result
+    }
+
+    /// vstring.py:117 — cache the length box in StrPtrInfo.lgtop.
+    /// Borrow-checker adaptation: direct forwarded[] mutation because
+    /// RPython mutates self.lgtop directly (vstring.py:117, 174, 293).
+    pub(crate) fn set_str_lgtop(&mut self, opref: OpRef, lgtop: OpRef) {
+        use crate::optimizeopt::info::Forwarded;
+        let resolved = self.get_box_replacement(opref);
+        if resolved.is_constant() {
+            return;
+        }
+        let idx = resolved.0 as usize;
+        if let Some(Forwarded::Info(PtrInfo::Str(si))) = self.forwarded.get_mut(idx) {
+            si.lgtop = Some(lgtop);
+        }
+    }
+
+    /// vstring.py:62-70 StrPtrInfo.getlenbound(mode) — get lenbound from
+    /// StrPtrInfo, lazily initializing it from self.length.
+    /// Borrow-checker adaptation: direct forwarded[] access.
+    fn get_str_lenbound(&mut self, opref: OpRef) -> Option<crate::optimizeopt::intutils::IntBound> {
+        use crate::optimizeopt::info::Forwarded;
+        let resolved = self.get_box_replacement(opref);
+        if resolved.is_constant() {
+            return None;
+        }
+        let idx = resolved.0 as usize;
+        if let Some(Forwarded::Info(PtrInfo::Str(si))) = self.forwarded.get_mut(idx) {
+            // vstring.py:65-70
+            if si.lenbound.is_none() {
+                si.lenbound = Some(if si.length == -1 {
+                    crate::optimizeopt::intutils::IntBound::nonnegative()
+                } else {
+                    crate::optimizeopt::intutils::IntBound::from_constant(si.length as i64)
+                });
+            }
+            si.lenbound.clone()
+        } else {
+            None
         }
     }
 
@@ -1589,9 +1714,13 @@ impl OptContext {
         if let PtrInfo::Str(sinfo) = preamble_info {
             let mut new_info = crate::optimizeopt::info::StrPtrInfo {
                 lenbound: sinfo.lenbound.clone(),
+                lgtop: None,
                 mode: sinfo.mode,
                 length: -1,
-                variant: sinfo.variant.clone(),
+                // unroll.py:86: StrPtrInfo(preamble_info.mode) — always
+                // rebuild a plain non-virtual StrPtrInfo; never carry
+                // the previous iteration's virtual variant across.
+                variant: crate::optimizeopt::info::VStringVariant::Ptr,
                 last_guard_pos: -1,
             };
             if new_info.lenbound.is_none() {
@@ -1741,6 +1870,12 @@ impl OptContext {
     /// Consumed by OptPure at flush time.
     pub fn register_pure_from_args1(&mut self, opcode: OpCode, result: OpRef, arg0: OpRef) {
         self.pending_pure_from_args.push((opcode, result, arg0));
+    }
+
+    /// info.py:557 pure_from_args(ARRAYLEN_GC, [op], ConstInt(len))
+    pub fn pure_from_args_arraylen(&mut self, array_ref: OpRef, length: i64) {
+        let len_ref = self.emit_constant_int(length);
+        self.register_pure_from_args1(OpCode::ArraylenGc, array_ref, len_ref);
     }
 
     /// optimizer.py: pure_from_args2 parity.
@@ -2309,6 +2444,18 @@ impl OptContext {
         })
     }
 
+    /// vstring.py:237 `optstring.getintbound(box).is_constant()` pattern.
+    /// Returns the constant value if known either from the constant pool
+    /// or from IntBound analysis.
+    pub fn get_constant_int_or_bound(&self, opref: OpRef) -> Option<i64> {
+        let resolved = self.get_box_replacement(opref);
+        self.get_constant_int(resolved).or_else(|| {
+            self.get_int_bound(resolved)
+                .filter(|b| b.is_constant())
+                .map(|b| b.get_constant())
+        })
+    }
+
     /// history.py:361 CONST_NULL = ConstPtr(ConstPtr.value).
     /// True iff `opref` is a Ref-typed null constant, mirroring
     /// `CONST_NULL.same_constant(box)` in RPython.
@@ -2542,7 +2689,12 @@ impl OptContext {
                 .filter(|&p| p >= 0 && self.snapshot_boxes.contains_key(&p));
             if let Some(fb_pos) = fallback_pos {
                 op.rd_resume_position = fb_pos;
-                self.finalize_guard_resume_data(op, None);
+                // resume.py:570 _add_optimizer_sections: forward knowledge
+                // to the patchguardop snapshot so heap/class/loopinvariant
+                // sections are serialized into rd_numb. RPython's finish()
+                // always serializes current optimizer knowledge regardless
+                // of which snapshot provides the frame boxes.
+                self.finalize_guard_resume_data(op, knowledge);
                 return;
             }
             // resume.py:396-397: RPython asserts resume_position >= 0.
@@ -3595,43 +3747,28 @@ impl OptContext {
                 .as_ref()
                 .and_then(|d| d.as_field_descr())
                 .expect("ensure_ptr_info_arg0: field op without FieldDescr");
-            if let Some(parent_descr) = field_descr.get_parent_descr() {
-                // optimizer.py:480-484: parent_descr.is_object() decides Instance vs Struct.
-                //
-                // PyPy unconditionally calls `parent_descr.is_object()` (raises
-                // AttributeError if parent_descr isn't a SizeDescr). The Rust
-                // port mirrors this strict contract when the backreference is
-                // present.
-                let is_object = parent_descr
-                    .as_size_descr()
-                    .expect(
-                        "ensure_ptr_info_arg0: FieldDescr.get_parent_descr() must point at a SizeDescr",
-                    )
-                    .is_object();
-                let mut new_info = if is_object {
-                    PtrInfo::instance(Some(parent_descr.clone()), None)
-                } else {
-                    PtrInfo::struct_ptr(parent_descr.clone())
-                };
-                // optimizer.py:484: opinfo.init_fields(parent_descr, descr.get_index())
-                // info.py:180-188 init_fields(parent_descr, index) sets self.descr
-                // and pre-allocates _fields by parent slot count.
-                new_info.init_fields(parent_descr, field_descr.index_in_parent());
-                new_info
+            // optimizer.py:479-484: parent_descr.is_object() decides Instance vs Struct.
+            let parent_descr = field_descr.get_parent_descr().expect(
+                "ensure_ptr_info_arg0: FieldDescr.get_parent_descr() returned None — \
+                 the FieldDescr implementation must override get_parent_descr() \
+                 for parity with optimizer.py:478",
+            );
+            let is_object = parent_descr
+                .as_size_descr()
+                .expect(
+                    "ensure_ptr_info_arg0: FieldDescr.get_parent_descr() must point at a SizeDescr",
+                )
+                .is_object();
+            let mut new_info = if is_object {
+                PtrInfo::instance(Some(parent_descr.clone()), None)
             } else {
-                // Some synthetic descriptors used by tests and imported short
-                // preambles do not retain a live parent_descr backreference.
-                // Keep the same field-cache behavior by installing a generic
-                // struct holder; the caller already chose the fallback field
-                // index (`descr.index()` vs `index_in_parent()`).
-                PtrInfo::Struct(crate::optimizeopt::info::StructPtrInfo {
-                    descr: std::sync::Arc::new(majit_ir::descr::SimpleSizeDescr::new(0, 0, 0)),
-                    fields: Vec::new(),
-                    field_descrs: Vec::new(),
-                    preamble_fields: Vec::new(),
-                    last_guard_pos,
-                })
-            }
+                PtrInfo::struct_ptr(parent_descr.clone())
+            };
+            // optimizer.py:484: opinfo.init_fields(parent_descr, descr.get_index())
+            // info.py:180-188 init_fields(parent_descr, index) sets self.descr
+            // and pre-allocates _fields by parent slot count.
+            new_info.init_fields(parent_descr, field_descr.index_in_parent());
+            new_info
         } else if op.opcode.is_getarrayitem()
             || op.opcode == OpCode::SetarrayitemGc
             || op.opcode == OpCode::ArraylenGc
@@ -3651,6 +3788,7 @@ impl OptContext {
             // optimizer.py:490-491: strlen → StrPtrInfo(mode_string)
             PtrInfo::Str(crate::optimizeopt::info::StrPtrInfo {
                 lenbound: None,
+                lgtop: None,
                 mode: 0,
                 length: -1,
                 variant: crate::optimizeopt::info::VStringVariant::Ptr,
@@ -3660,6 +3798,7 @@ impl OptContext {
             // optimizer.py:492-493: unicodelen → StrPtrInfo(mode_unicode)
             PtrInfo::Str(crate::optimizeopt::info::StrPtrInfo {
                 lenbound: None,
+                lgtop: None,
                 mode: 1,
                 length: -1,
                 variant: crate::optimizeopt::info::VStringVariant::Ptr,
@@ -3702,6 +3841,7 @@ impl OptContext {
             resolved,
             PtrInfo::Str(crate::optimizeopt::info::StrPtrInfo {
                 lenbound: None,
+                lgtop: None,
                 mode,
                 length: -1,
                 variant: crate::optimizeopt::info::VStringVariant::Ptr,
@@ -4143,9 +4283,14 @@ mod constant_ptr_info_tests {
         ctx.set_ptr_info(
             parent,
             PtrInfo::VirtualRawBuffer(VirtualRawBufferInfo {
+                func: 0,
                 size: 32,
-                entries: Vec::new(),
+                offsets: Vec::new(),
+                lengths: Vec::new(),
+                descrs: Vec::new(),
+                values: Vec::new(),
                 last_guard_pos: -1,
+                calldescr: None,
             }),
         );
         ctx.set_ptr_info(

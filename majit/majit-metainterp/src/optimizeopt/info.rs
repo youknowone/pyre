@@ -221,14 +221,16 @@ pub enum PtrInfo {
 pub struct StrPtrInfo {
     /// vstring.py: self.lenbound — IntBound for string length.
     pub lenbound: Option<IntBound>,
+    /// vstring.py:53 self.lgtop — cached length OpRef (set by getstrlen).
+    /// After force_box, this preserves the computed length so subsequent
+    /// STRLEN queries reuse it instead of emitting a new STRLEN op.
+    pub lgtop: Option<OpRef>,
     /// vstring.py: self.mode — 0 = mode_string, 1 = mode_unicode.
     pub mode: u8,
     /// vstring.py: self.length — known exact length (-1 if unknown).
     pub length: i32,
     /// vstring.py: subclass-specific state
     /// (`VStringPlainInfo` / `VStringSliceInfo` / `VStringConcatInfo`).
-    /// Phase 1a keeps existing callers on the non-virtual `Ptr` path
-    /// while later sub-phases move `vstring.rs` state here.
     pub variant: VStringVariant,
     /// info.py:91-92: last_guard_pos
     pub last_guard_pos: i32,
@@ -241,6 +243,17 @@ pub struct StrPtrInfo {
 /// `getlenbound(Some(mode))` for constant string args without re-borrowing
 /// `OptContext`.
 pub type StringLengthResolver = std::sync::Arc<dyn Fn(GcRef, u8) -> Option<i64> + Send + Sync>;
+
+/// info.py:788-790 `ConstPtrInfo._unpack_str(mode)` — runtime hook for
+/// extracting characters from a constant string GcRef. Returns the char
+/// values as `Vec<i64>`. Set by the host runtime (pyre etc.).
+pub type StringContentResolver =
+    std::sync::Arc<dyn Fn(GcRef, u8) -> Option<Vec<i64>> + Send + Sync>;
+
+/// history.py:377-387 `get_const_ptr_for_string(s)` — runtime hook for
+/// creating a constant string GcRef from char values. The bool indicates
+/// unicode (true) vs byte-string (false). Set by the host runtime.
+pub type StringConstantAllocator = std::sync::Arc<dyn Fn(&[i64], bool) -> GcRef + Send + Sync>;
 
 /// Result of `OptContext::ensure_ptr_info_arg0(op)` — direct line-by-line
 /// equivalent of PyPy's `ensure_ptr_info_arg0` return value
@@ -404,28 +417,32 @@ impl StrPtrInfo {
         }
     }
 
-    /// vstring.py:103 / 168 / 249 `getstrlen()` on the string ptrinfo classes.
+    /// vstring.py:110/171/251/281 `getstrlen()` on the string ptrinfo classes.
     ///
-    /// RPython returns a box here; majit lifts the structurally-known constant
-    /// length into `Option<i64>` and lets `OptString` decide whether it should
-    /// materialize a constant OpRef or emit `STRLEN` / `UNICODELEN`.
+    /// Returns the structurally-known constant length for virtual variants
+    /// (Plain/Slice/Concat). For the non-virtual `Ptr` variant, returns
+    /// `None` — RPython's base StrPtrInfo.getstrlen() (vstring.py:110-119)
+    /// always emits STRLEN and attaches lenbound as metadata; it never
+    /// extracts a constant from lenbound directly.
     pub fn getstrlen(&self, ctx: &crate::optimizeopt::OptContext, mode: u8) -> Option<i64> {
+        // vstring.py:112: if self.lgtop is not None: return self.lgtop
+        if let Some(lgtop) = self.lgtop {
+            return ctx.get_constant_int(lgtop).or_else(|| {
+                ctx.get_int_bound(lgtop)
+                    .filter(|b| b.is_constant())
+                    .map(|b| b.get_constant())
+            });
+        }
         match &self.variant {
-            VStringVariant::Ptr => {
-                if self.length >= 0 {
-                    Some(self.length as i64)
-                } else {
-                    self.lenbound
-                        .as_ref()
-                        .filter(|bound| bound.is_constant())
-                        .map(IntBound::get_constant)
-                }
-            }
+            // vstring.py:110-119: base StrPtrInfo.getstrlen always emits
+            // STRLEN and caches in lgtop; never returns a constant from
+            // lenbound. The caller (getstrlen_opref) handles STRLEN emission.
+            VStringVariant::Ptr => None,
+            // vstring.py:171-175: VStringPlainInfo.getstrlen
             VStringVariant::Plain(info) => Some(info._chars.len() as i64),
-            VStringVariant::Slice(info) => {
-                let lgtop = ctx.get_box_replacement(info.lgtop);
-                ctx.get_constant_int(lgtop)
-            }
+            // vstring.py:251-253: VStringSliceInfo.getstrlen → self.lgtop
+            VStringVariant::Slice(info) => ctx.get_constant_int_or_bound(info.lgtop),
+            // vstring.py:281-295: VStringConcatInfo.getstrlen
             VStringVariant::Concat(info) => {
                 let left = ctx.getptrinfo(info.vleft)?;
                 let right = ctx.getptrinfo(info.vright)?;
@@ -460,14 +477,11 @@ impl StrPtrInfo {
                 Some(chars)
             }
             VStringVariant::Slice(info) => {
+                // vstring.py:236-248: use getintbound().is_constant()
                 let source = ctx.getptrinfo(info.s)?;
                 let source_chars = source.as_ref().get_constant_string_spec(ctx, mode)?;
-                let start =
-                    usize::try_from(ctx.get_constant_int(ctx.get_box_replacement(info.start))?)
-                        .ok()?;
-                let length =
-                    usize::try_from(ctx.get_constant_int(ctx.get_box_replacement(info.lgtop))?)
-                        .ok()?;
+                let start = usize::try_from(ctx.get_constant_int_or_bound(info.start)?).ok()?;
+                let length = usize::try_from(ctx.get_constant_int_or_bound(info.lgtop)?).ok()?;
                 let stop = start.checked_add(length)?;
                 if stop > source_chars.len() {
                     return None;
@@ -492,7 +506,9 @@ impl StrPtrInfo {
             VStringVariant::Ptr => None,
             VStringVariant::Plain(info) => info._chars.get(index).copied().flatten(),
             VStringVariant::Slice(info) => {
-                let start = ctx.get_constant_int(ctx.get_box_replacement(info.start))?;
+                // vstring.py:491: index = _int_add(sinfo.start, index)
+                // Accept intbound-constant starts, not just literal constants.
+                let start = ctx.get_constant_int_or_bound(info.start)?;
                 let source = ctx.getptrinfo(info.s)?;
                 source.as_ref().strgetitem(index as i64 + start, ctx)
             }
@@ -938,6 +954,14 @@ impl PtrInfo {
         }
     }
 
+    /// vstring.py:112: return self.lgtop — cached length OpRef if available.
+    pub fn get_cached_lgtop(&self) -> Option<OpRef> {
+        match self {
+            PtrInfo::Str(info) => info.lgtop,
+            _ => None,
+        }
+    }
+
     /// info.py:74-75 / vstring.py:103-105 / 249-258 — common string-length
     /// query across `ConstPtrInfo` and `StrPtrInfo`.
     pub fn get_known_str_length(
@@ -947,13 +971,18 @@ impl PtrInfo {
     ) -> Option<i64> {
         match self {
             PtrInfo::Str(info) => info.getstrlen(ctx, mode),
-            PtrInfo::Constant(_) => self.getstrlen(mode, |_, _| None),
+            // info.py:804-808 ConstPtrInfo.getstrlen — delegate to
+            // the runtime resolver for constant string pointers.
+            PtrInfo::Constant(gcref) if !gcref.is_null() => ctx
+                .string_length_resolver
+                .as_deref()
+                .and_then(|resolver| resolver(*gcref, mode)),
             _ => None,
         }
     }
 
-    /// info.py:87 / 793 and vstring.py:178 / 236 / 298 — recursive constant
-    /// string extraction.
+    /// info.py:793 ConstPtrInfo.get_constant_string_spec and
+    /// vstring.py:178 / 236 / 298 — recursive constant string extraction.
     pub fn get_constant_string_spec(
         &self,
         ctx: &crate::optimizeopt::OptContext,
@@ -961,12 +990,21 @@ impl PtrInfo {
     ) -> Option<Vec<i64>> {
         match self {
             PtrInfo::Str(info) => info.get_constant_string_spec(ctx, mode),
+            // info.py:793: ConstPtrInfo.get_constant_string_spec
+            // delegates to _unpack_str(mode) → extracts chars from the
+            // constant GcRef.
+            PtrInfo::Constant(gcref) if !gcref.is_null() => ctx
+                .string_content_resolver
+                .as_deref()
+                .and_then(|resolver| resolver(*gcref, mode)),
             PtrInfo::Constant(_) => None,
             _ => None,
         }
     }
 
-    /// vstring.py:172 / 230 `strgetitem()` on string ptrinfo.
+    /// vstring.py:172 / 230 `strgetitem()` on string ptrinfo — virtual dispatch only.
+    /// ConstPtr constant resolution is handled by `OptString::strgetitem`
+    /// (vstring.py:393-403 `_strgetitem`), which needs `&mut OptContext`.
     pub fn strgetitem(&self, index: i64, ctx: &crate::optimizeopt::OptContext) -> Option<OpRef> {
         match self {
             PtrInfo::Str(info) => info.strgetitem(index, ctx),
@@ -1262,12 +1300,85 @@ impl PtrInfo {
                 }
                 alloc_ref
             }
+            PtrInfo::VirtualArray(vinfo) => {
+                // info.py:540-558 ArrayPtrInfo._force_elements
+                let len = vinfo.items.len();
+                ctx.set_ptr_info(opref, PtrInfo::nonnull());
+
+                let len_ref = ctx.emit_constant_int(len as i64);
+                let alloc_opcode = if vinfo.clear {
+                    OpCode::NewArrayClear
+                } else {
+                    OpCode::NewArray
+                };
+                let mut alloc_op = Op::new(alloc_opcode, &[len_ref]);
+                alloc_op.descr = Some(vinfo.descr.clone());
+                let alloc_ref = emit_op(ctx, alloc_op);
+                if opref != alloc_ref {
+                    ctx.replace_op(opref, alloc_ref);
+                }
+
+                // info.py:542: const = optforce.optimizer.new_const_item(self.descr)
+                // info.py:546-548: skip items equal to the default when _clear=True
+                let items = std::mem::take(&mut vinfo.items);
+                let clear = vinfo.clear;
+                let descr = vinfo.descr.clone();
+                for (i, item_ref) in items.into_iter().enumerate() {
+                    if item_ref == OpRef::NONE {
+                        continue;
+                    }
+                    // info.py:542-548: const = new_const_item(descr); same_constant
+                    if clear {
+                        let resolved = ctx.get_box_replacement(item_ref);
+                        let is_default = match ctx.get_constant(resolved) {
+                            Some(Value::Int(0)) => true,
+                            Some(Value::Ref(r)) if r.0 == 0 => true,
+                            Some(Value::Float(f)) if *f == 0.0 => true,
+                            _ => false,
+                        };
+                        if is_default {
+                            continue;
+                        }
+                    }
+                    let subbox = force_child(item_ref, ctx);
+                    let idx_ref = ctx.emit_constant_int(i as i64);
+                    let mut set_op = Op::new(OpCode::SetarrayitemGc, &[alloc_ref, idx_ref, subbox]);
+                    set_op.descr = Some(descr.clone());
+                    emit_op(ctx, set_op);
+                }
+                // info.py:557: optforce.pure_from_args(ARRAYLEN_GC, [op], ConstInt(len))
+                ctx.pure_from_args_arraylen(alloc_ref, len as i64);
+                alloc_ref
+            }
+            PtrInfo::VirtualArrayStruct(vinfo) => {
+                // info.py:670-684 ArrayStructInfo._force_elements
+                let num_elements = vinfo.element_fields.len();
+                ctx.set_ptr_info(opref, PtrInfo::nonnull());
+
+                let len_ref = ctx.emit_constant_int(num_elements as i64);
+                let mut alloc_op = Op::new(OpCode::NewArrayClear, &[len_ref]);
+                alloc_op.descr = Some(vinfo.descr.clone());
+                let alloc_ref = emit_op(ctx, alloc_op);
+                if opref != alloc_ref {
+                    ctx.replace_op(opref, alloc_ref);
+                }
+
+                let element_fields = std::mem::take(&mut vinfo.element_fields);
+                let fielddescrs = vinfo.fielddescrs.clone();
+                for (elem_idx, fields) in element_fields.into_iter().enumerate() {
+                    let idx_ref = ctx.emit_constant_int(elem_idx as i64);
+                    for (field_idx, value_ref) in fields {
+                        let subbox = force_child(value_ref, ctx);
+                        let mut set_op =
+                            Op::new(OpCode::SetinteriorfieldGc, &[alloc_ref, idx_ref, subbox]);
+                        set_op.descr = fielddescrs.get(field_idx as usize).cloned();
+                        emit_op(ctx, set_op);
+                    }
+                }
+                alloc_ref
+            }
             PtrInfo::VirtualRawBuffer(vinfo) => {
                 // info.py:420-436: RawBufferPtrInfo._force_elements()
-                // 1. Emit CALL_I(func, ConstInt(size), descr=calldescr)
-                // 2. Emit CHECK_MEMORY_ERROR
-                // 3. Emit RAW_STORE for each buffered write
-
                 // info.py:421: self.size = -1 (mark as no longer virtual)
                 let offsets = std::mem::take(&mut vinfo.offsets);
                 let descrs = std::mem::take(&mut vinfo.descrs);
@@ -1276,23 +1387,9 @@ impl PtrInfo {
                 let size = vinfo.size;
                 let calldescr = vinfo.calldescr.take();
 
-                // info.py:148: optforce.emit_extra(op) — emit the CALL_I
-                let func_ref = {
-                    let pos = ctx.reserve_pos();
-                    let mut op = Op::new(OpCode::SameAsI, &[pos]);
-                    op.pos = pos;
-                    let r = emit_op(ctx, op);
-                    ctx.make_constant(r, majit_ir::Value::Int(func));
-                    r
-                };
-                let size_ref = {
-                    let pos = ctx.reserve_pos();
-                    let mut op = Op::new(OpCode::SameAsI, &[pos]);
-                    op.pos = pos;
-                    let r = emit_op(ctx, op);
-                    ctx.make_constant(r, majit_ir::Value::Int(size as i64));
-                    r
-                };
+                // info.py:148: emit CALL_I(func, ConstInt(size), descr=calldescr)
+                let func_ref = ctx.emit_constant_int(func);
+                let size_ref = ctx.emit_constant_int(size as i64);
                 let mut call_op = Op::new(OpCode::CallI, &[func_ref, size_ref]);
                 call_op.descr = calldescr;
                 let alloc_ref = emit_op(ctx, call_op);
@@ -1309,14 +1406,7 @@ impl PtrInfo {
                 // info.py:429-436: emit RAW_STORE for each buffered write
                 for i in 0..offsets.len() {
                     let value_ref = force_child(values[i], ctx);
-                    let offset_ref = {
-                        let pos = ctx.reserve_pos();
-                        let mut op = Op::new(OpCode::SameAsI, &[pos]);
-                        op.pos = pos;
-                        let r = emit_op(ctx, op);
-                        ctx.make_constant(r, majit_ir::Value::Int(offsets[i] as i64));
-                        r
-                    };
+                    let offset_ref = ctx.emit_constant_int(offsets[i] as i64);
                     let mut store_op =
                         Op::new(OpCode::RawStore, &[alloc_ref, offset_ref, value_ref]);
                     store_op.descr = Some(descrs[i].clone());
@@ -1324,6 +1414,130 @@ impl PtrInfo {
                 }
 
                 alloc_ref
+            }
+            PtrInfo::VirtualRawSlice(slice) => {
+                // info.py:473-476 RawSlicePtrInfo._force_elements
+                // Force the parent first.
+                let parent_forced = force_child(slice.parent, ctx);
+                let parent_forced = ctx.get_box_replacement(parent_forced);
+                let offset_ref = ctx.emit_constant_int(slice.offset as i64);
+                let add_op = Op::new(OpCode::IntAdd, &[parent_forced, offset_ref]);
+                let new_ref = emit_op(ctx, add_op);
+                ctx.set_ptr_info(new_ref, PtrInfo::nonnull());
+                if opref != new_ref {
+                    ctx.replace_op(opref, new_ref);
+                }
+                new_ref
+            }
+            PtrInfo::Str(sinfo) if sinfo.is_virtual() => {
+                // vstring.py:76-103 StrPtrInfo.force_box
+                let mode = sinfo.mode;
+                let is_unicode = mode != 0;
+
+                // vstring.py:79-90: try get_constant_string_spec first
+                // (constant-fold the entire virtual string to a ConstPtr).
+                if let Some(chars) = sinfo.get_constant_string_spec(&*ctx, mode) {
+                    if let Some(ref alloc_fn) = ctx.string_constant_alloc {
+                        let gcref = alloc_fn(&chars, is_unicode);
+                        if !gcref.is_null() {
+                            // vstring.py:83: get_box_replacement(op).set_forwarded(c_s)
+                            ctx.make_constant(opref, Value::Ref(gcref));
+                            return opref;
+                        }
+                    }
+                }
+
+                // vstring.py:91: self._is_virtual = False
+                let sinfo_full = match std::mem::replace(self, PtrInfo::nonnull()) {
+                    PtrInfo::Str(s) => s,
+                    _ => unreachable!(),
+                };
+                let variant = sinfo_full.variant;
+
+                // vstring.py:92: lengthbox = self.getstrlen(op, optstring, mode)
+                let lengthbox = match &variant {
+                    VStringVariant::Plain(info) => ctx.emit_constant_int(info._chars.len() as i64),
+                    VStringVariant::Slice(info) => ctx.get_box_replacement(info.lgtop),
+                    VStringVariant::Concat(info) => {
+                        let left_len = ctx.getstrlen_opref(info.vleft, mode);
+                        let right_len = ctx.getstrlen_opref(info.vright, mode);
+                        crate::optimizeopt::vstring::_int_add(left_len, right_len, ctx)
+                    }
+                    VStringVariant::Ptr => unreachable!(),
+                };
+
+                // vstring.py:93-96: newop = ResOperation(mode.NEWSTR, [lengthbox])
+                let new_opcode = if is_unicode {
+                    OpCode::Newunicode
+                } else {
+                    OpCode::Newstr
+                };
+                let newstr_op = Op::new(new_opcode, &[lengthbox]);
+                let newop = emit_op(ctx, newstr_op);
+
+                // vstring.py:98: newop.set_forwarded(self)
+                ctx.set_ptr_info(
+                    newop,
+                    PtrInfo::Str(StrPtrInfo {
+                        lenbound: sinfo_full.lenbound,
+                        lgtop: Some(lengthbox), // vstring.py:98 preserve computed length
+                        mode: sinfo_full.mode,
+                        length: sinfo_full.length,
+                        variant: VStringVariant::Ptr, // non-virtual
+                        last_guard_pos: sinfo_full.last_guard_pos,
+                    }),
+                );
+
+                // vstring.py:99-100: op.set_forwarded(newop)
+                if opref != newop {
+                    ctx.replace_op(opref, newop);
+                }
+
+                // vstring.py:101-102: initialize_forced_string(op, optstring, op, CONST_0, mode)
+                let zero = ctx.emit_constant_int(0);
+                let set_opcode = if is_unicode {
+                    OpCode::Unicodesetitem
+                } else {
+                    OpCode::Strsetitem
+                };
+
+                match variant {
+                    VStringVariant::Plain(info) => {
+                        // vstring.py:194-205 VStringPlainInfo.initialize_forced_string
+                        let mut offset = zero;
+                        let one = ctx.emit_constant_int(1);
+                        for ch in &info._chars {
+                            if let Some(ch_ref) = ch {
+                                let ch_resolved = ctx.get_box_replacement(*ch_ref);
+                                let setitem_op = Op::new(set_opcode, &[newop, offset, ch_resolved]);
+                                emit_op(ctx, setitem_op);
+                            }
+                            offset = crate::optimizeopt::vstring::_int_add(offset, one, ctx);
+                        }
+                    }
+                    VStringVariant::Concat(info) => {
+                        // vstring.py:309-317 VStringConcatInfo.string_copy_parts
+                        let offset = crate::optimizeopt::vstring::string_copy_parts(
+                            info.vleft, newop, zero, mode, ctx,
+                        );
+                        crate::optimizeopt::vstring::string_copy_parts(
+                            info.vright,
+                            newop,
+                            offset,
+                            mode,
+                            ctx,
+                        );
+                    }
+                    VStringVariant::Slice(info) => {
+                        // vstring.py:230-233 VStringSliceInfo.string_copy_parts
+                        crate::optimizeopt::vstring::copy_str_content(
+                            ctx, info.s, newop, info.start, zero, info.lgtop, mode, true,
+                        );
+                    }
+                    VStringVariant::Ptr => unreachable!(),
+                }
+
+                newop
             }
             _ => opref,
         }
@@ -2553,6 +2767,7 @@ mod tests {
     fn test_str_ptr_info_virtual_variants() {
         let plain = PtrInfo::Str(StrPtrInfo {
             lenbound: None,
+            lgtop: None,
             mode: 0,
             length: 2,
             variant: VStringVariant::Plain(VStringPlainInfo {
@@ -2564,6 +2779,7 @@ mod tests {
 
         let slice = PtrInfo::Str(StrPtrInfo {
             lenbound: None,
+            lgtop: Some(OpRef(3)), // vstring.py:223: self.lgtop = length
             mode: 0,
             length: -1,
             variant: VStringVariant::Slice(VStringSliceInfo {
@@ -2577,6 +2793,7 @@ mod tests {
 
         let concat = PtrInfo::Str(StrPtrInfo {
             lenbound: None,
+            lgtop: None,
             mode: 0,
             length: -1,
             variant: VStringVariant::Concat(VStringConcatInfo {
@@ -2590,6 +2807,7 @@ mod tests {
 
         let ptr = PtrInfo::Str(StrPtrInfo {
             lenbound: None,
+            lgtop: None,
             mode: 0,
             length: -1,
             variant: VStringVariant::Ptr,
@@ -2607,6 +2825,7 @@ mod tests {
 
         let info = PtrInfo::Str(StrPtrInfo {
             lenbound: None,
+            lgtop: None,
             mode: 0,
             length: 3,
             variant: VStringVariant::Plain(VStringPlainInfo {
@@ -2637,6 +2856,7 @@ mod tests {
             source,
             PtrInfo::Str(StrPtrInfo {
                 lenbound: None,
+                lgtop: None,
                 mode: 0,
                 length: 3,
                 variant: VStringVariant::Plain(VStringPlainInfo {
@@ -2648,6 +2868,7 @@ mod tests {
 
         let slice = PtrInfo::Str(StrPtrInfo {
             lenbound: None,
+            lgtop: Some(OpRef(21)), // vstring.py:223: self.lgtop = length
             mode: 0,
             length: -1,
             variant: VStringVariant::Slice(VStringSliceInfo {
@@ -2663,6 +2884,7 @@ mod tests {
 
         let concat = PtrInfo::Str(StrPtrInfo {
             lenbound: None,
+            lgtop: None,
             mode: 0,
             length: -1,
             variant: VStringVariant::Concat(VStringConcatInfo {
@@ -2676,6 +2898,7 @@ mod tests {
             OpRef(2),
             PtrInfo::Str(StrPtrInfo {
                 lenbound: None,
+                lgtop: None,
                 mode: 0,
                 length: 2,
                 variant: VStringVariant::Plain(VStringPlainInfo {

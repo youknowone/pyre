@@ -2885,6 +2885,14 @@ impl OptUnroll {
         ctx: &OptContext,
     ) -> Vec<ExportedShortOp> {
         fn exported_const_arg(ctx: &OptContext, arg: OpRef) -> Option<ExportedShortArg> {
+            // shortpreamble.py:288 isinstance(op, Const) — only true Const
+            // objects cross iterations.  A loop box that merely has
+            // Forwarded::Const metadata for the current iteration must stay
+            // a box; exporting it as Const leaks one iteration's guard
+            // knowledge into the next.
+            if !arg.is_constant() {
+                return None;
+            }
             ctx.get_constant(arg)
                 .cloned()
                 .map(|value| ExportedShortArg::Const { source: arg, value })

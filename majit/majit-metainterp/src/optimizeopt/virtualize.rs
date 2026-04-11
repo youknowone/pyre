@@ -248,45 +248,37 @@ impl OptVirtualize {
 
     /// Force a virtual to become concrete: emit the allocation + setfield ops.
     /// Returns the OpRef of the emitted allocation.
+    ///
+    /// info.py:137-160 force_box() — master dispatcher delegates to
+    /// PtrInfo::force_box for all standard virtual variants.
+    /// Virtualizable is Rust-specific and stays here.
     fn force_virtual(&mut self, opref: OpRef, ctx: &mut OptContext) -> OpRef {
         let resolved = ctx.get_box_replacement(opref);
         let info = match ctx.get_ptr_info(resolved) {
-            Some(info) if info.is_virtual() => info.clone(),
+            Some(info) if info.is_virtual() => info,
             _ => return resolved, // not virtual, nothing to do
         };
 
-        match info {
-            PtrInfo::Virtual(vinfo) => self.force_virtual_instance(resolved, vinfo, ctx),
-            PtrInfo::VirtualArray(vinfo) => self.force_virtual_array(resolved, vinfo, ctx),
-            PtrInfo::VirtualStruct(vinfo) => self.force_virtual_struct(resolved, vinfo, ctx),
-            PtrInfo::VirtualArrayStruct(vinfo) => {
-                self.force_virtual_array_struct(resolved, vinfo, ctx)
-            }
-            PtrInfo::VirtualRawBuffer(vinfo) => self.force_virtual_raw_buffer(resolved, vinfo, ctx),
-            PtrInfo::VirtualRawSlice(slice) => {
-                // Force the parent buffer first, then emit an INT_ADD that
-                // re-creates the slice pointer concretely. RPython does the
-                // same in info.RawSlicePtrInfo.force_box.
-                let parent_forced = self.force_virtual(slice.parent, ctx);
-                let parent_forced = ctx.get_box_replacement(parent_forced);
-                let offset_ref = ctx.emit_constant_int(slice.offset as i64);
-                let add_op = Op::new(OpCode::IntAdd, &[parent_forced, offset_ref]);
-                let new_ref = ctx.emit_extra(ctx.current_pass_idx, add_op);
-                ctx.set_ptr_info(resolved, PtrInfo::nonnull());
-                if resolved != new_ref {
-                    ctx.replace_op(resolved, new_ref);
-                }
-                new_ref
-            }
-            PtrInfo::Virtualizable(vinfo) => {
-                if self.is_standard_virtualizable_ref(resolved, ctx) {
-                    resolved
-                } else {
-                    self.force_virtualizable(resolved, vinfo, ctx)
-                }
-            }
-            _ => resolved,
+        // Virtualizable is not a standard PtrInfo virtual — it represents
+        // an existing heap object with tracked fields, not a deferred alloc.
+        if matches!(info, PtrInfo::Virtualizable(_)) {
+            let vinfo = match ctx.take_ptr_info(resolved) {
+                Some(PtrInfo::Virtualizable(v)) => v,
+                _ => unreachable!(),
+            };
+            return if self.is_standard_virtualizable_ref(resolved, ctx) {
+                resolved
+            } else {
+                self.force_virtualizable(resolved, vinfo, ctx)
+            };
         }
+
+        // All other virtual variants: delegate to PtrInfo::force_box
+        // (info.py:137-160 AbstractVirtualPtrInfo.force_box + per-subclass
+        // _force_elements).
+        let mut info = ctx.take_ptr_info(resolved).unwrap();
+        let result = info.force_box(resolved, ctx);
+        ctx.get_box_replacement(result)
     }
 
     /// Force a virtualizable: emit SETFIELD_RAW ops to write tracked
@@ -341,7 +333,7 @@ impl OptVirtualize {
                     .and_then(|config| config.array_item_types.get(array_idx as usize).copied())
                     .unwrap_or(Type::Int);
                 let elem_ref = if elem_ref.is_none() {
-                    ctx.emit_default_value_for_type(item_type)
+                    ctx.new_const_item(item_type)
                 } else {
                     let forced = self.force_virtual(elem_ref, ctx);
                     ctx.get_box_replacement(forced)
@@ -354,179 +346,6 @@ impl OptVirtualize {
         }
 
         opref
-    }
-
-    fn force_virtual_instance(
-        &mut self,
-        opref: OpRef,
-        vinfo: VirtualInfo,
-        ctx: &mut OptContext,
-    ) -> OpRef {
-        // RPython info.py:137-156: _is_virtual = False.
-        // info.py:225: self._fields[i] = None before emit_extra(setfieldop).
-        // Clear field values so heap cache doesn't suppress SetfieldGc.
-        let preserved = PtrInfo::Instance(crate::optimizeopt::info::InstancePtrInfo {
-            descr: Some(vinfo.descr.clone()),
-            known_class: vinfo.known_class,
-            fields: Vec::new(),
-            field_descrs: vinfo.field_descrs.clone(),
-            preamble_fields: Vec::new(),
-            last_guard_pos: -1,
-        });
-        // Mark as no longer virtual FIRST (avoids infinite recursion)
-        ctx.set_ptr_info(opref, PtrInfo::nonnull());
-
-        // Emit the NEW_WITH_VTABLE
-        let mut alloc_op = Op::new(OpCode::NewWithVtable, &[]);
-        alloc_op.descr = Some(vinfo.descr.clone());
-        let alloc_ref = ctx.emit_extra(ctx.current_pass_idx, alloc_op);
-
-        // RPython: newop.set_forwarded(self) — preserved info on alloc_ref
-        ctx.set_ptr_info(alloc_ref, preserved);
-
-        // Set forwarding only when the refs differ (avoids self-loop)
-        if opref != alloc_ref {
-            ctx.replace_op(opref, alloc_ref);
-        }
-
-        // info.py:216-226 InstancePtrInfo._force_elements: iterates
-        // descr.get_all_fielddescrs() which excludes typeptr
-        // (heaptracker.py:66-67), so typeptr is NOT emitted from the
-        // force path. The vtable is written by the GC rewriter's
-        // handle_malloc_operation via fielddescr_vtable (rewrite.py:479-484).
-        debug_assert_no_typeptr_in_virtual_fields(&vinfo.fields, "force_virtual_instance");
-        for (field_idx, value_ref) in vinfo.fields {
-            let value_ref = self.force_virtual(value_ref, ctx);
-            let value_ref = ctx.get_box_replacement(value_ref);
-            let mut set_op = Op::new(OpCode::SetfieldGc, &[alloc_ref, value_ref]);
-            set_op.descr = Some(
-                get_struct_field_descr(&vinfo.field_descrs, field_idx)
-                    .unwrap_or_else(|| make_field_index_descr(field_idx)),
-            );
-            ctx.emit_extra(ctx.current_pass_idx, set_op);
-        }
-
-        alloc_ref
-    }
-
-    fn force_virtual_array(
-        &mut self,
-        opref: OpRef,
-        vinfo: VirtualArrayInfo,
-        ctx: &mut OptContext,
-    ) -> OpRef {
-        let len = vinfo.items.len();
-
-        // Mark as no longer virtual FIRST (avoids infinite recursion)
-        ctx.set_ptr_info(opref, PtrInfo::nonnull());
-
-        // Emit the length constant and NEW_ARRAY
-        let len_ref = ctx.emit_constant_int(len as i64);
-        let mut alloc_op = Op::new(OpCode::NewArray, &[len_ref]);
-        alloc_op.descr = Some(vinfo.descr.clone());
-        let alloc_ref = ctx.emit_extra(ctx.current_pass_idx, alloc_op);
-
-        if opref != alloc_ref {
-            ctx.replace_op(opref, alloc_ref);
-        }
-
-        // Emit SETARRAYITEM_GC for each item
-        for (i, item_ref) in vinfo.items.iter().enumerate() {
-            let item_ref = self.force_virtual(*item_ref, ctx);
-            let item_ref = ctx.get_box_replacement(item_ref);
-            let idx_ref = ctx.emit_constant_int(i as i64);
-            let mut set_op = Op::new(OpCode::SetarrayitemGc, &[alloc_ref, idx_ref, item_ref]);
-            set_op.descr = Some(vinfo.descr.clone());
-            ctx.emit_extra(ctx.current_pass_idx, set_op);
-        }
-
-        alloc_ref
-    }
-
-    fn force_virtual_struct(
-        &mut self,
-        opref: OpRef,
-        vinfo: VirtualStructInfo,
-        ctx: &mut OptContext,
-    ) -> OpRef {
-        // RPython info.py:147-156: _is_virtual = False, _fields retained.
-        // newop.set_forwarded(self) — the same PtrInfo (now non-virtual)
-        // stays accessible via get_ptr_info(alloc_ref).
-        // RPython info.py:147-156: _is_virtual = False, _fields retained
-        // BUT info.py:225: self._fields[i] = None before emit_extra(setfieldop).
-        // Preserve descr+field_descrs for type resolution, but clear field VALUES
-        // so the heap cache doesn't suppress the SetfieldGc emissions.
-        let preserved = PtrInfo::Struct(crate::optimizeopt::info::StructPtrInfo {
-            descr: vinfo.descr.clone(),
-            fields: Vec::new(),
-            field_descrs: vinfo.field_descrs.clone(),
-            preamble_fields: Vec::new(),
-            last_guard_pos: -1,
-        });
-        // Mark as no longer virtual FIRST (avoids infinite recursion)
-        ctx.set_ptr_info(opref, PtrInfo::nonnull());
-
-        // Emit NEW
-        let mut alloc_op = Op::new(OpCode::New, &[]);
-        alloc_op.descr = Some(vinfo.descr.clone());
-        let alloc_ref = ctx.emit_extra(ctx.current_pass_idx, alloc_op);
-
-        // RPython: newop.set_forwarded(self) — preserved info on alloc_ref
-        ctx.set_ptr_info(alloc_ref, preserved);
-
-        if opref != alloc_ref {
-            ctx.replace_op(opref, alloc_ref);
-        }
-
-        // RPython info.py:226: optforce.emit_extra(setfieldop)
-        for (field_idx, value_ref) in &vinfo.fields {
-            let value_ref = self.force_virtual(*value_ref, ctx);
-            let value_ref = ctx.get_box_replacement(value_ref);
-            let descr = get_struct_field_descr(&vinfo.field_descrs, *field_idx)
-                .unwrap_or_else(|| make_field_index_descr(*field_idx));
-            let mut set_op = Op::new(OpCode::SetfieldGc, &[alloc_ref, value_ref]);
-            set_op.descr = Some(descr);
-            ctx.emit_extra(ctx.current_pass_idx, set_op);
-        }
-
-        alloc_ref
-    }
-
-    fn force_virtual_array_struct(
-        &mut self,
-        opref: OpRef,
-        vinfo: VirtualArrayStructInfo,
-        ctx: &mut OptContext,
-    ) -> OpRef {
-        let num_elements = vinfo.element_fields.len();
-
-        // Mark as no longer virtual FIRST
-        ctx.set_ptr_info(opref, PtrInfo::nonnull());
-
-        // Emit NEW_ARRAY for the outer array
-        let len_ref = ctx.emit_constant_int(num_elements as i64);
-        let mut alloc_op = Op::new(OpCode::NewArray, &[len_ref]);
-        alloc_op.descr = Some(vinfo.descr.clone());
-        let alloc_ref = ctx.emit_extra(ctx.current_pass_idx, alloc_op);
-
-        if opref != alloc_ref {
-            ctx.replace_op(opref, alloc_ref);
-        }
-
-        // Emit SETINTERIORFIELD_GC for each element's fields
-        for (elem_idx, fields) in vinfo.element_fields.iter().enumerate() {
-            let idx_ref = ctx.emit_constant_int(elem_idx as i64);
-            for (field_idx, value_ref) in fields {
-                let value_ref = self.force_virtual(*value_ref, ctx);
-                let value_ref = ctx.get_box_replacement(value_ref);
-                let mut set_op =
-                    Op::new(OpCode::SetinteriorfieldGc, &[alloc_ref, idx_ref, value_ref]);
-                set_op.descr = Some(make_field_index_descr(*field_idx));
-                ctx.emit_extra(ctx.current_pass_idx, set_op);
-            }
-        }
-
-        alloc_ref
     }
 
     /// virtualize.py:60-65 make_virtual_raw_slice
@@ -578,44 +397,6 @@ impl OptVirtualize {
                 _ => return None,
             }
         }
-    }
-
-    fn force_virtual_raw_buffer(
-        &mut self,
-        opref: OpRef,
-        vinfo: VirtualRawBufferInfo,
-        ctx: &mut OptContext,
-    ) -> OpRef {
-        // info.py:420-436: RawBufferPtrInfo._force_elements()
-        // Mark as no longer virtual FIRST
-        ctx.set_ptr_info(opref, PtrInfo::nonnull());
-
-        // info.py:148: emit CALL_I(func, ConstInt(size), descr=calldescr)
-        let func_ref = self.emit_constant_int(ctx, vinfo.func);
-        let size_ref = self.emit_constant_int(ctx, vinfo.size as i64);
-        let mut call_op = Op::new(OpCode::CallI, &[func_ref, size_ref]);
-        call_op.descr = vinfo.calldescr;
-        let alloc_ref = ctx.emit_extra(ctx.current_pass_idx, call_op);
-
-        if opref != alloc_ref {
-            ctx.replace_op(opref, alloc_ref);
-        }
-
-        // info.py:425: CHECK_MEMORY_ERROR
-        let check_op = Op::new(OpCode::CheckMemoryError, &[alloc_ref]);
-        ctx.emit_extra(ctx.current_pass_idx, check_op);
-
-        // info.py:429-436: emit RAW_STORE for each buffered write
-        for i in 0..vinfo.offsets.len() {
-            let value_ref = self.force_virtual(vinfo.values[i], ctx);
-            let value_ref = ctx.get_box_replacement(value_ref);
-            let offset_ref = self.emit_constant_int(ctx, vinfo.offsets[i] as i64);
-            let mut set_op = Op::new(OpCode::RawStore, &[alloc_ref, offset_ref, value_ref]);
-            set_op.descr = Some(vinfo.descrs[i].clone());
-            ctx.emit_extra(ctx.current_pass_idx, set_op);
-        }
-
-        alloc_ref
     }
 
     /// Force all arguments that are virtual.
