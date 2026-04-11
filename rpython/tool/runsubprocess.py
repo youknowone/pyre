@@ -92,25 +92,31 @@ if sys.platform != 'win32' and hasattr(os, 'fork') and not os.getenv("PYPY_DONT_
                                         write_through=True)
             child_stdout = TextIOWrapper(_child.stdout,
                                          newline=sys.stdout.newlines)
-    spawn_subprocess()
+    try:
+        spawn_subprocess()
+    except (OSError, OverflowError):
+        # On some platforms (e.g. macOS + PyPy), close_fds=True triggers
+        # OverflowError when RLIMIT_NOFILE exceeds 32-bit range.
+        # Fall back to the direct _run() defined above.
+        pass
+    else:
+        def cleanup_subprocess():
+            global _child, child_stdin, child_stdout
+            _child = None
+            child_stdin = None
+            child_stdout = None
+        import atexit; atexit.register(cleanup_subprocess)
 
-    def cleanup_subprocess():
-        global _child, child_stdin, child_stdout
-        _child = None
-        child_stdin = None
-        child_stdout = None
-    import atexit; atexit.register(cleanup_subprocess)
-
-    def _run(*args):
-        try:
-            child_stdin.write('%r\n' % (args,))
-        except (OSError, IOError):
-            # lost the child.  Try again...
-            spawn_subprocess()
-            child_stdin.write('%r\n' % (args,))
-        results = child_stdout.readline()
-        assert results.startswith('(')
-        results = eval(results)
-        if results[0] is None:
-            raise OSError('%s: %s\nargs=%r' % (args[0], results[1], args))
-        return results
+        def _run(*args):
+            try:
+                child_stdin.write('%r\n' % (args,))
+            except (OSError, IOError):
+                # lost the child.  Try again...
+                spawn_subprocess()
+                child_stdin.write('%r\n' % (args,))
+            results = child_stdout.readline()
+            assert results.startswith('(')
+            results = eval(results)
+            if results[0] is None:
+                raise OSError('%s: %s\nargs=%r' % (args[0], results[1], args))
+            return results
