@@ -139,6 +139,7 @@ const JITFRAME_FIXED_SIZE: u32 = 7;
 /// the correct id to the allocator.
 static JITFRAME_GC_TYPE_ID: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(u32::MAX);
+static JITFRAME_GC_TYPE_ID_IS_EXPLICIT: AtomicBool = AtomicBool::new(false);
 
 /// Override the JITFRAME type id explicitly. Called from the frontend
 /// after it has registered its own types so that our nursery allocations
@@ -146,10 +147,20 @@ static JITFRAME_GC_TYPE_ID: std::sync::atomic::AtomicU32 =
 /// assigned to the JITFRAME TypeInfo (jitframe.py:48-52).
 pub fn set_jitframe_gc_type_id(id: u32) {
     JITFRAME_GC_TYPE_ID.store(id, std::sync::atomic::Ordering::Release);
+    JITFRAME_GC_TYPE_ID_IS_EXPLICIT.store(true, std::sync::atomic::Ordering::Release);
 }
 
 fn jitframe_gc_type_id() -> u32 {
     JITFRAME_GC_TYPE_ID.load(std::sync::atomic::Ordering::Acquire)
+}
+
+fn set_jitframe_gc_type_id_lazy(id: u32) {
+    JITFRAME_GC_TYPE_ID.store(id, std::sync::atomic::Ordering::Release);
+    JITFRAME_GC_TYPE_ID_IS_EXPLICIT.store(false, std::sync::atomic::Ordering::Release);
+}
+
+fn jitframe_gc_type_id_is_explicit() -> bool {
+    JITFRAME_GC_TYPE_ID_IS_EXPLICIT.load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// Custom trace function for GC-managed jitframes.
@@ -207,15 +218,17 @@ unsafe fn jitframe_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut GcRef)) 
 /// RPython: rgc.register_custom_trace_hook(JITFRAME, jitframe_trace)
 /// called from jitframe_allocate (jitframe.py:49).
 ///
-/// Lazy path (no frontend registration): register JITFRAME directly and
-/// remember the resulting id.
-fn ensure_jitframe_type_registered(gc: &mut dyn GcAllocator) {
+/// Lazy path (no frontend registration): register JITFRAME directly on
+/// each allocator and return the runtime-local type id.
+fn ensure_jitframe_type_registered(gc: &mut dyn GcAllocator) -> Option<u32> {
     use majit_gc::TypeInfo;
     if gc.type_count() == 0 {
-        return; // Stub GC (TrackingGc), no type registry
+        return None; // Stub GC (TrackingGc), no type registry
     }
-    if jitframe_gc_type_id() != u32::MAX {
-        return; // Frontend already registered and told us the id
+    if jitframe_gc_type_id_is_explicit() {
+        let id = jitframe_gc_type_id();
+        assert_ne!(id, u32::MAX, "explicit JITFRAME GC type id missing");
+        return Some(id);
     }
     // JITFRAME is a varsize GC struct:
     //   base_size = 64 (7 header fields × 8 + length field 8)
@@ -231,7 +244,8 @@ fn ensure_jitframe_type_registered(gc: &mut dyn GcAllocator) {
     info.has_gc_ptrs = true;
     info.custom_trace = Some(jitframe_custom_trace);
     let id = gc.register_type(info);
-    set_jitframe_gc_type_id(id);
+    set_jitframe_gc_type_id_lazy(id);
+    Some(id)
 }
 
 /// Follow jf_forward chain to get the final jitframe address.
@@ -913,6 +927,11 @@ thread_local! {
     /// RPython's GC has no lock on allocator lookup (GIL-protected).
     static GC_RUNTIMES: RefCell<HashMap<u64, Box<dyn GcAllocator>>> =
         RefCell::new(HashMap::new());
+    /// Runtime-local JITFRAME type ids. Lazy registration is per allocator,
+    /// so a stale type id from a previous MiniMarkGC must not leak into a
+    /// later runtime.
+    static GC_RUNTIME_JITFRAME_TYPE_IDS: RefCell<HashMap<u64, u32>> =
+        RefCell::new(HashMap::new());
     /// Currently active GC runtime for virtual materialization during guard failure.
     /// Set by compiled code exit handler, read by materialize_virtual_recursive.
     static ACTIVE_GC_RUNTIME_ID: Cell<Option<u64>> = const { Cell::new(None) };
@@ -930,6 +949,22 @@ fn replace_gc_runtime(id: u64, gc: Box<dyn GcAllocator>) {
 
 fn unregister_gc_runtime(id: u64) {
     GC_RUNTIMES.with(|r| r.borrow_mut().remove(&id));
+}
+
+fn set_runtime_jitframe_type_id(runtime_id: u64, type_id: u32) {
+    GC_RUNTIME_JITFRAME_TYPE_IDS.with(|r| {
+        r.borrow_mut().insert(runtime_id, type_id);
+    });
+}
+
+fn runtime_jitframe_type_id(runtime_id: u64) -> Option<u32> {
+    GC_RUNTIME_JITFRAME_TYPE_IDS.with(|r| r.borrow().get(&runtime_id).copied())
+}
+
+fn clear_runtime_jitframe_type_id(runtime_id: u64) {
+    GC_RUNTIME_JITFRAME_TYPE_IDS.with(|r| {
+        r.borrow_mut().remove(&runtime_id);
+    });
 }
 
 fn with_gc_runtime<R>(id: u64, f: impl FnOnce(&mut dyn GcAllocator) -> R) -> R {
@@ -4628,11 +4663,17 @@ fn run_compiled_code_inner(
         .unwrap_or(false);
     let (jf_gcref, heap_owner): (GcRef, Option<Vec<i64>>) = if use_gc_alloc {
         let runtime_id = gc_runtime_id.unwrap();
-        let type_id = jitframe_gc_type_id();
+        let type_id = runtime_jitframe_type_id(runtime_id).unwrap_or_else(|| {
+            if jitframe_gc_type_id_is_explicit() {
+                jitframe_gc_type_id()
+            } else {
+                u32::MAX
+            }
+        });
         assert_ne!(
             type_id,
             u32::MAX,
-            "JITFRAME GC type id not registered — frontend must call \
+            "JITFRAME GC type id not registered for runtime {runtime_id} — frontend must call \
              set_jitframe_gc_type_id() or ensure_jitframe_type_registered() \
              before running compiled code"
         );
@@ -5114,7 +5155,7 @@ impl CraneliftBackend {
     }
 
     pub fn set_gc_allocator(&mut self, mut gc: Box<dyn GcAllocator>) {
-        ensure_jitframe_type_registered(gc.as_mut());
+        let jitframe_type_id = ensure_jitframe_type_registered(gc.as_mut());
         // gctypelayout.encode_type_shapes_now parity: close the
         // type-registration phase before any compile embeds the
         // type_info_group base address. After this, register_type
@@ -5122,10 +5163,18 @@ impl CraneliftBackend {
         // in by the preorder walk in assign_inheritance_ids.
         gc.freeze_types();
         let supports_guard_gc_type = gc.supports_guard_gc_type();
-        if let Some(runtime_id) = self.gc_runtime_id {
+        let runtime_id = if let Some(runtime_id) = self.gc_runtime_id {
             replace_gc_runtime(runtime_id, gc);
+            runtime_id
         } else {
-            self.gc_runtime_id = Some(register_gc_runtime(gc));
+            let runtime_id = register_gc_runtime(gc);
+            self.gc_runtime_id = Some(runtime_id);
+            runtime_id
+        };
+        if let Some(type_id) = jitframe_type_id {
+            set_runtime_jitframe_type_id(runtime_id, type_id);
+        } else {
+            clear_runtime_jitframe_type_id(runtime_id);
         }
         // Publish the backend's GC-guard seam on a thread-local so
         // the backend-agnostic optimizer (majit-metainterp) and
@@ -9746,6 +9795,7 @@ impl Drop for CraneliftBackend {
         let _ = NEXT_CALL_ASSEMBLER_DEADFRAME_HANDLE.try_with(|cell| cell.set(1));
         if let Some(runtime_id) = self.gc_runtime_id.take() {
             unregister_gc_runtime(runtime_id);
+            clear_runtime_jitframe_type_id(runtime_id);
         }
     }
 }
