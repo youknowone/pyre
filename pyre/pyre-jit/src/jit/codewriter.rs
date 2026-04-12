@@ -1160,14 +1160,14 @@ pub fn get_jitcode(
         if !cache.contains_key(&key) {
             let pyjitcode = writer.make_jitcode(code);
             cache.insert(key, pyjitcode);
-            // RPython parity: link state::JitCode to majit JitCode so
-            // get_list_of_active_boxes uses the same liveness data as
-            // consume_one_section (resume.py all_liveness parity).
+            // RPython parity: clone JitCode into state::JitCode (which is
+            // Box'd in MetaInterpStaticData.jitcodes — stable address).
+            // Skip when has_abort (liveness overflow cleared the data);
+            // get_list_of_active_boxes falls back to LiveVars analysis.
             let entry = cache.get(&key).unwrap();
-            pyre_jit_trace::set_majit_jitcode(
-                w_code,
-                &entry.jitcode as *const majit_metainterp::jitcode::JitCode,
-            );
+            if !entry.has_abort {
+                pyre_jit_trace::set_majit_jitcode(w_code, entry.jitcode.clone());
+            }
         }
         let entry = cache.get(&key).unwrap();
         // SAFETY: thread-local cache lives for thread lifetime

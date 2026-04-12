@@ -2175,6 +2175,35 @@ pub fn is_true(obj: PyObjectRef) -> bool {
     }
 }
 
+/// Unary positive (`+a`).
+
+pub fn pos(a: PyObjectRef) -> PyResult {
+    let a = unwrap_cell(a);
+    unsafe {
+        if is_int(a) || is_bool(a) {
+            return Ok(w_int_new(int_value(a)));
+        }
+        if is_long(a) {
+            return Ok(bigint_result(w_long_get_value(a).clone()));
+        }
+        if is_float(a) {
+            return Ok(w_float_new(w_float_get_value(a)));
+        }
+        if let Some(result) = try_instance_unaryop(a, "__pos__") {
+            return result;
+        }
+        if a.is_null() {
+            return Err(PyError::type_error(
+                "bad operand type for unary +: 'NoneType'",
+            ));
+        }
+        Err(PyError::type_error(format!(
+            "bad operand type for unary +: '{}'",
+            (*(*a).ob_type).name,
+        )))
+    }
+}
+
 /// Unary negation.
 
 pub fn neg(a: PyObjectRef) -> PyResult {

@@ -109,7 +109,7 @@ pub fn init(ns: &mut PyNamespace) {
         "pos",
         make_builtin_function("pos", |args| {
             assert!(args.len() == 1);
-            Ok(args[0])
+            crate::baseobjspace::pos(args[0])
         }),
     );
     namespace_store(
@@ -172,9 +172,7 @@ pub fn init(ns: &mut PyNamespace) {
         ns,
         "not_",
         make_builtin_function("not_", |args| {
-            if args.is_empty() {
-                return Ok(w_bool_from(true));
-            }
+            assert!(args.len() == 1);
             Ok(w_bool_from(!crate::baseobjspace::is_true(args[0])))
         }),
     );

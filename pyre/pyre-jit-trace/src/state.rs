@@ -44,11 +44,13 @@ pub(crate) struct JitCode {
     pub code: *const (),
     /// codewriter.py:68: jitcode.index = len(all_jitcodes).
     pub index: i32,
-    /// RPython parity: pointer to majit JitCode (liveness, bytecodes).
+    /// RPython parity: owned majit JitCode (liveness, bytecodes).
     /// Set by codewriter via set_majit_jitcode(). Used by
     /// get_list_of_active_boxes to access the same LivenessInfo
     /// that consume_one_section uses (all_liveness parity).
-    pub majit_jitcode: *const majit_metainterp::jitcode::JitCode,
+    /// Owned here (inside Box<JitCode> in MetaInterpStaticData.jitcodes)
+    /// so the address is stable — matches RPython's GC-heap JitCode.
+    pub majit_jitcode: Option<majit_metainterp::jitcode::JitCode>,
 }
 
 impl JitCode {
@@ -97,7 +99,7 @@ impl MetaInterpStaticData {
         let jitcode = Box::new(JitCode {
             code,
             index,
-            majit_jitcode: std::ptr::null(),
+            majit_jitcode: None,
         });
         let ptr = &*jitcode as *const JitCode;
         self.by_code.insert(key, self.jitcodes.len());
@@ -126,23 +128,22 @@ pub(crate) fn jitcode_for(code: *const ()) -> *const JitCode {
     METAINTERP_SD.with(|r| r.borrow_mut().jitcode_for(code))
 }
 
-/// RPython parity: link state::JitCode to its majit JitCode.
+/// RPython parity: store owned majit JitCode into state::JitCode.
 /// Called by codewriter after PyJitCode compilation so that
 /// get_list_of_active_boxes can look up LivenessInfo from the same
 /// data source as consume_one_section (RPython all_liveness parity).
-pub fn set_majit_jitcode(
-    code: *const (),
-    majit_jitcode: *const majit_metainterp::jitcode::JitCode,
-) {
+/// The JitCode is cloned into the Box'd state::JitCode (stable heap
+/// address), matching RPython where JitCode is a GC-heap object in
+/// MetaInterpStaticData.jitcodes.
+pub fn set_majit_jitcode(code: *const (), majit_jitcode: majit_metainterp::jitcode::JitCode) {
     METAINTERP_SD.with(|r| {
         let mut sd = r.borrow_mut();
         // Ensure the JitCode entry exists.
         let _ = sd.jitcode_for(code);
         let key = code as usize;
         if let Some(&idx) = sd.by_code.get(&key) {
-            // SAFETY: jitcode is Box'd and never removed from the vec.
             let jc = &mut *sd.jitcodes[idx];
-            jc.majit_jitcode = majit_jitcode;
+            jc.majit_jitcode = Some(majit_jitcode);
         }
     });
 }
@@ -172,8 +173,7 @@ pub fn frame_value_count_at(jitcode_index: i32, pc: i32) -> usize {
             None => return 0,
         };
         // Primary: JitCode liveness (same path as get_list_of_active_boxes).
-        if !jc.majit_jitcode.is_null() {
-            let mjc = unsafe { &*jc.majit_jitcode };
+        if let Some(mjc) = jc.majit_jitcode.as_ref() {
             if let Some(&jit_pc) = mjc.py_to_jit_pc.get(pc as usize) {
                 if let Some(info) = mjc.liveness.iter().find(|i| i.pc as usize == jit_pc) {
                     // pyjitpl.py:212: total = length_i + length_r + length_f
@@ -209,7 +209,7 @@ pub fn frame_value_count_at(jitcode_index: i32, pc: i32) -> usize {
 static NULL_JITCODE: JitCode = JitCode {
     code: std::ptr::null(),
     index: -1,
-    majit_jitcode: std::ptr::null(),
+    majit_jitcode: None,
 };
 
 /// Traced value — RPython `FrontendOp(position, _resint/_resref/_resfloat)` parity.

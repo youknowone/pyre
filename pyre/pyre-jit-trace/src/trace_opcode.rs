@@ -210,7 +210,10 @@ impl MIFrame {
                 let stack_only = s.stack_only_depth();
                 s.symbolic_stack[..stack_only.min(s.symbolic_stack.len())].to_vec()
             };
-            let mjc = unsafe { (*s.jitcode).majit_jitcode };
+            // state::JitCode is Box'd in MetaInterpStaticData.jitcodes,
+            // so the Option<JitCode> inside has a stable heap address.
+            let mjc: Option<&majit_metainterp::jitcode::JitCode> =
+                unsafe { (*s.jitcode).majit_jitcode.as_ref() };
             (s.nlocals, s.symbolic_locals.clone(), stack_values, mjc)
         };
         // pyjitpl.py:194: in_a_call or after_residual_call → self.pc
@@ -232,29 +235,31 @@ impl MIFrame {
         // the pyre-jit-trace LiveVars analysis. Pyre's call.py parity
         // work will make every tracing frame carry a valid JitCode so
         // this branch can be removed.
-        if majit_jitcode.is_null() {
-            let raw_code_ptr = unsafe { (*self.sym().jitcode).raw_code() };
-            let live = if !raw_code_ptr.is_null() {
-                Some(liveness_for(raw_code_ptr))
-            } else {
-                None
-            };
-            let mut boxes = Vec::with_capacity(nlocals + stack_values.len());
-            for (idx, slot) in local_values.iter().enumerate() {
-                let is_live = live.map_or(!slot.is_none(), |lv| lv.is_local_live(live_pc, idx));
-                if is_live {
-                    boxes.push(*slot);
+        let jc = match majit_jitcode {
+            Some(jc) => jc,
+            None => {
+                let raw_code_ptr = unsafe { (*self.sym().jitcode).raw_code() };
+                let live = if !raw_code_ptr.is_null() {
+                    Some(liveness_for(raw_code_ptr))
+                } else {
+                    None
+                };
+                let mut boxes = Vec::with_capacity(nlocals + stack_values.len());
+                for (idx, slot) in local_values.iter().enumerate() {
+                    let is_live = live.map_or(!slot.is_none(), |lv| lv.is_local_live(live_pc, idx));
+                    if is_live {
+                        boxes.push(*slot);
+                    }
                 }
-            }
-            for (idx, slot) in stack_values.iter().enumerate() {
-                let is_live = live.map_or(!slot.is_none(), |lv| lv.is_stack_live(live_pc, idx));
-                if is_live {
-                    boxes.push(*slot);
+                for (idx, slot) in stack_values.iter().enumerate() {
+                    let is_live = live.map_or(!slot.is_none(), |lv| lv.is_stack_live(live_pc, idx));
+                    if is_live {
+                        boxes.push(*slot);
+                    }
                 }
+                return boxes;
             }
-            return boxes;
-        }
-        let jc = unsafe { &*majit_jitcode };
+        };
         let jit_pc = jc.py_to_jit_pc.get(live_pc).copied().unwrap_or_else(|| {
             panic!(
                 "get_list_of_active_boxes: no pc_map entry for live_pc={}",

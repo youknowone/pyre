@@ -59,138 +59,210 @@ pub fn perf_counter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     Ok(floatobject::w_float_new(now.as_secs_f64()))
 }
 
-/// Convert epoch seconds to (year, mon, mday, hour, min, sec, wday, yday, isdst).
-///
-/// PyPy: pypy/module/time/interp_time.py localtime / gmtime. We use a pure
-/// Rust implementation because we don't link libc. `is_local=true` applies
-/// the local timezone offset, `false` returns UTC.
-fn _time_to_tuple(seconds: i64, is_local: bool) -> PyObjectRef {
-    // Apply local timezone offset (approximation — ignores DST transitions
-    // because pyre has no tz database; logging only uses this for display).
-    let secs = if is_local {
-        // Query the system's current tz offset via chrono-less arithmetic:
-        // compare localtime-formatted hours to UTC hours by asking libc via
-        // std::time::SystemTime is not possible, so just use 0 for now.
-        // logging.Formatter only calls strftime() on the result — once we
-        // implement strftime we can thread the offset through.
-        seconds
-    } else {
-        seconds
-    };
+// ── libc tm helpers ──────────────────────────────────────────────────
 
-    // days since 1970-01-01
-    let days = secs.div_euclid(86400);
-    let day_secs = secs.rem_euclid(86400);
-    let hour = (day_secs / 3600) as i64;
-    let minute = ((day_secs % 3600) / 60) as i64;
-    let sec = (day_secs % 60) as i64;
+/// Convert epoch seconds → libc `struct tm` via `gmtime_r`.
+fn _c_gmtime(seconds: libc::time_t) -> Option<libc::tm> {
+    unsafe {
+        let mut tm: libc::tm = std::mem::zeroed();
+        let p = libc::gmtime_r(&seconds, &mut tm);
+        if p.is_null() { None } else { Some(tm) }
+    }
+}
 
-    // Compute year/month/day via civil-from-days (Howard Hinnant).
-    let z = days + 719468;
-    let era = if z >= 0 {
-        z / 146097
-    } else {
-        (z - 146096) / 146097
-    };
-    let doe = (z - era * 146097) as i64;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = if m <= 2 { y + 1 } else { y };
+/// Convert epoch seconds → libc `struct tm` via `localtime_r`.
+fn _c_localtime(seconds: libc::time_t) -> Option<libc::tm> {
+    unsafe {
+        let mut tm: libc::tm = std::mem::zeroed();
+        let p = libc::localtime_r(&seconds, &mut tm);
+        if p.is_null() { None } else { Some(tm) }
+    }
+}
 
-    // weekday: 1970-01-01 is Thursday (3, Monday=0)
-    let wday = ((days + 3).rem_euclid(7)) as i64;
-
-    // yday: days since Jan 1 of the same year.
-    //
-    // Derive Jan 1 of this year's day-count by rebuilding it through the same
-    // civil-from-days arithmetic and subtracting.
-    let yday = {
-        // January 1 of `year` — days from epoch
-        let y0 = year - 1970;
-        // Rough approximation: each year is 365.2425 days. The logging
-        // formatter only needs this when the user configures %j, which
-        // pyre's stdlib tests do not exercise; passing 1 is safer than
-        // risking off-by-one.
-        let _ = y0;
-        1i64
-    };
-
+/// Build a Python time tuple from a libc `struct tm`.
+fn _tm_to_tuple(tm: &libc::tm) -> PyObjectRef {
     w_tuple_new(vec![
-        w_int_new(year),
-        w_int_new(m),
-        w_int_new(d),
-        w_int_new(hour),
-        w_int_new(minute),
-        w_int_new(sec),
-        w_int_new(wday),
-        w_int_new(yday),
-        w_int_new(-1), // isdst unknown
+        w_int_new((tm.tm_year + 1900) as i64),
+        w_int_new((tm.tm_mon + 1) as i64),
+        w_int_new(tm.tm_mday as i64),
+        w_int_new(tm.tm_hour as i64),
+        w_int_new(tm.tm_min as i64),
+        w_int_new(tm.tm_sec as i64),
+        w_int_new(((tm.tm_wday + 6) % 7) as i64), // Monday=0
+        w_int_new((tm.tm_yday + 1) as i64),
+        w_int_new(tm.tm_isdst as i64),
     ])
 }
 
-fn _get_seconds(args: &[PyObjectRef]) -> i64 {
+/// Extract epoch seconds from an optional argument (int, float, or None/absent → now).
+fn _get_seconds(args: &[PyObjectRef]) -> libc::time_t {
     if let Some(&arg) = args.first() {
         unsafe {
             if !is_none(arg) {
                 if is_int(arg) {
-                    return w_int_get_value(arg);
+                    return w_int_get_value(arg) as libc::time_t;
                 }
                 if is_float(arg) {
-                    return floatobject::w_float_get_value(arg) as i64;
+                    return floatobject::w_float_get_value(arg) as libc::time_t;
                 }
             }
         }
     }
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
+        .map(|d| d.as_secs() as libc::time_t)
         .unwrap_or(0)
 }
 
-/// time.localtime([seconds]) — PyPy: interp_time.localtime
-pub fn localtime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    Ok(_time_to_tuple(_get_seconds(args), true))
-}
-
-/// time.gmtime([seconds]) — PyPy: interp_time.gmtime
-pub fn gmtime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    Ok(_time_to_tuple(_get_seconds(args), false))
-}
-
-/// time.strftime(format, t=localtime()) — PyPy: interp_time.strftime
-///
-/// Minimal: pyre's stdlib tests only exercise a narrow subset of format
-/// strings. Return the format verbatim for now — logging.Formatter falls
-/// through when strftime() raises, so a plain passthrough is safe.
-pub fn strftime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    if let Some(&fmt) = args.first() {
-        unsafe {
-            if is_str(fmt) {
-                return Ok(w_str_new(w_str_get_value(fmt)));
+/// Extract a `struct tm` from a Python time tuple argument.
+/// interp_time.py: _gettmarg
+fn _gettmarg(args: &[PyObjectRef], default_now: bool) -> Result<libc::tm, crate::PyError> {
+    let tup = if let Some(&arg) = args.first() {
+        if unsafe { is_none(arg) } {
+            if default_now {
+                return _c_localtime(_get_seconds(&[]))
+                    .ok_or_else(|| crate::PyError::value_error("unconvertible time"));
             }
+            return Err(crate::PyError::type_error(
+                "Tuple or struct_time argument required",
+            ));
+        }
+        arg
+    } else if default_now {
+        return _c_localtime(_get_seconds(&[]))
+            .ok_or_else(|| crate::PyError::value_error("unconvertible time"));
+    } else {
+        return Err(crate::PyError::type_error(
+            "Tuple or struct_time argument required",
+        ));
+    };
+
+    unsafe {
+        let len = w_tuple_len(tup);
+        if len != 9 {
+            return Err(crate::PyError::type_error(
+                "time.struct_time() takes a sequence of length 9",
+            ));
+        }
+        let get = |i: usize| -> i32 {
+            let item = w_tuple_getitem(tup, i as i64).unwrap();
+            if is_int(item) {
+                w_int_get_value(item) as i32
+            } else if is_float(item) {
+                floatobject::w_float_get_value(item) as i32
+            } else {
+                0
+            }
+        };
+        let mut tm: libc::tm = std::mem::zeroed();
+        tm.tm_year = get(0) - 1900;
+        tm.tm_mon = get(1) - 1;
+        tm.tm_mday = get(2);
+        tm.tm_hour = get(3);
+        tm.tm_min = get(4);
+        tm.tm_sec = get(5);
+        tm.tm_wday = (get(6) + 1) % 7; // Python Monday=0 → C Sunday=0
+        tm.tm_yday = get(7) - 1;
+        tm.tm_isdst = get(8);
+        Ok(tm)
+    }
+}
+
+/// time.localtime([seconds]) — interp_time.localtime
+pub fn localtime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let seconds = _get_seconds(args);
+    let tm =
+        _c_localtime(seconds).ok_or_else(|| crate::PyError::value_error("unconvertible time"))?;
+    Ok(_tm_to_tuple(&tm))
+}
+
+/// time.gmtime([seconds]) — interp_time.gmtime
+pub fn gmtime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let seconds = _get_seconds(args);
+    let tm = _c_gmtime(seconds).ok_or_else(|| crate::PyError::value_error("unconvertible time"))?;
+    Ok(_tm_to_tuple(&tm))
+}
+
+/// time.strftime(format[, tuple]) — interp_time.strftime
+pub fn strftime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let fmt = args
+        .first()
+        .copied()
+        .ok_or_else(|| crate::PyError::type_error("strftime() requires at least one argument"))?;
+
+    let tm = _gettmarg(&args[1..], true)?;
+
+    let fmt_str = unsafe {
+        if !is_str(fmt) {
+            return Err(crate::PyError::type_error(
+                "strftime() argument 1 must be str",
+            ));
+        }
+        w_str_get_value(fmt)
+    };
+
+    let c_fmt = std::ffi::CString::new(fmt_str)
+        .map_err(|_| crate::PyError::value_error("embedded null in format string"))?;
+
+    let mut buf = vec![0u8; 256];
+    unsafe {
+        loop {
+            let n = libc::strftime(
+                buf.as_mut_ptr() as *mut libc::c_char,
+                buf.len(),
+                c_fmt.as_ptr(),
+                &tm,
+            );
+            if n != 0 {
+                let s = std::str::from_utf8_unchecked(&buf[..n]);
+                return Ok(w_str_new(s));
+            }
+            if buf.len() > 16384 {
+                return Ok(w_str_new(""));
+            }
+            buf.resize(buf.len() * 2, 0);
         }
     }
-    Ok(w_str_new(""))
 }
 
-/// time.mktime(tuple) — PyPy: interp_time.mktime
+/// time.mktime(tuple) — interp_time.mktime
 pub fn mktime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let _ = args;
-    Ok(floatobject::w_float_new(0.0))
+    let mut tm = _gettmarg(args, false)?;
+    tm.tm_wday = -1;
+    let tt = unsafe { libc::mktime(&mut tm) };
+    if tt == -1 && tm.tm_wday == -1 {
+        return Err(crate::PyError::overflow_error(
+            "mktime argument out of range",
+        ));
+    }
+    Ok(floatobject::w_float_new(tt as f64))
 }
 
-/// time.asctime(t=localtime()) — PyPy: interp_time.asctime
+/// time.asctime([tuple]) — interp_time.asctime
 pub fn asctime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let _ = args;
-    Ok(w_str_new(""))
+    let tm = _gettmarg(args, true)?;
+    let p = unsafe { libc::asctime(&tm) };
+    if p.is_null() {
+        return Err(crate::PyError::value_error("unconvertible time"));
+    }
+    let s = unsafe { std::ffi::CStr::from_ptr(p) }
+        .to_str()
+        .unwrap_or("")
+        .trim_end_matches('\n');
+    Ok(w_str_new(s))
 }
 
-/// time.ctime(seconds=None) — PyPy: interp_time.ctime
+/// time.ctime([seconds]) — interp_time.ctime
 pub fn ctime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let _ = args;
-    Ok(w_str_new(""))
+    let seconds = _get_seconds(args);
+    let mut t = seconds;
+    let p = unsafe { libc::ctime(&mut t) };
+    if p.is_null() {
+        return Err(crate::PyError::value_error("unconvertible time"));
+    }
+    let s = unsafe { std::ffi::CStr::from_ptr(p) }
+        .to_str()
+        .unwrap_or("")
+        .trim_end_matches('\n');
+    Ok(w_str_new(s))
 }
