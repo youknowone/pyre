@@ -5350,6 +5350,7 @@ mod tests {
             77,
             vec![majit_ir::Type::Int, majit_ir::Type::Int],
             majit_ir::Type::Int,
+            true,
             8,
             majit_ir::EffectInfo::elidable(),
         );
@@ -5983,7 +5984,12 @@ mod tests {
             {
                 let mut op = Op::new(OpCode::GetfieldGcPureI, &[OpRef(50)]);
                 op.pos = OpRef(1);
-                op.descr = Some(majit_ir::make_field_descr(0, 8, majit_ir::Type::Int, true));
+                op.descr = Some(majit_ir::make_field_descr(
+                    0,
+                    8,
+                    majit_ir::Type::Int,
+                    majit_ir::ArrayFlag::Signed,
+                ));
                 op
             },
             Op::new(OpCode::Jump, &[OpRef(10), OpRef(50)]),

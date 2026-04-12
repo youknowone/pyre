@@ -3225,6 +3225,7 @@ mod tests {
             idx,
             vec![],
             majit_ir::Type::Void,
+            false,
             0,
             EffectInfo {
                 // Write all fields/arrays so invalidation is triggered
@@ -3990,7 +3991,8 @@ mod tests {
 
     #[test]
     fn test_short_preamble_ref_field_preserves_getfield_opcode() {
-        let descr = majit_ir::make_field_descr(55, 8, majit_ir::Type::Ref, false);
+        let descr =
+            majit_ir::make_field_descr(55, 8, majit_ir::Type::Ref, majit_ir::ArrayFlag::Pointer);
         let mut pass = OptHeap::new();
         let key = (OpRef(100), descr.index());
         pass.cache_field(OpRef(100), descr.index(), Some(&descr));

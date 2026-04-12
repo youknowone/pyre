@@ -47,9 +47,19 @@ pub fn generate_vable_info_fn(decl: &VirtualizableDecl) -> TokenStream {
         .map(|a| {
             let name = a.name.to_string();
             let tp = type_token(&a.item_type);
+            // symbolic.py:get_array_token → (basesize, itemsize, ofs_length)
+            // item_size derived from item_type at runtime:
+            //   Int/Ref/Float → 8 on 64-bit, Void → 0.
+            // This matches RPython's sizeof(ARRAY.OF) for standard types.
+            // symbolic.py:get_array_token → itemsize = sizeof(ARRAY.OF)
+            // Standard types: Int/Ref/Float → 8 bytes on 64-bit platforms.
+            let item_size_expr = quote! { 8usize };
             match &a.layout {
                 VableArrayLayoutDecl::Direct { field_offset } => quote! {
-                    __info.add_array_field(#name, #tp, #field_offset);
+                    __info.add_array_field(
+                        #name, #tp, #field_offset, 0, 0,
+                        majit_ir::make_array_descr(0, #item_size_expr, #tp),
+                    );
                 },
                 VableArrayLayoutDecl::Embedded {
                     field_offset,
@@ -57,13 +67,14 @@ pub fn generate_vable_info_fn(decl: &VirtualizableDecl) -> TokenStream {
                     length_offset,
                     items_offset,
                 } => quote! {
-                    __info.add_embedded_array_field_with_layout(
+                    __info.add_embedded_array_field(
                         #name,
                         #tp,
                         #field_offset,
                         #ptr_offset,
                         #length_offset,
                         #items_offset,
+                        majit_ir::make_array_descr(#items_offset, #item_size_expr, #tp),
                     );
                 },
             }
@@ -102,9 +113,15 @@ pub fn generate_vable_info_pub_fn(decl: &VirtualizableDecl) -> TokenStream {
         .map(|a| {
             let aname = a.name.to_string();
             let tp = type_token(&a.item_type);
+            // symbolic.py:get_array_token → itemsize = sizeof(ARRAY.OF)
+            // Standard types: Int/Ref/Float → 8 bytes on 64-bit platforms.
+            let item_size_expr = quote! { 8usize };
             match &a.layout {
                 VableArrayLayoutDecl::Direct { field_offset } => quote! {
-                    __info.add_array_field(#aname, #tp, #field_offset);
+                    __info.add_array_field(
+                        #aname, #tp, #field_offset, 0, 0,
+                        majit_ir::make_array_descr(0, #item_size_expr, #tp),
+                    );
                 },
                 VableArrayLayoutDecl::Embedded {
                     field_offset,
@@ -112,13 +129,14 @@ pub fn generate_vable_info_pub_fn(decl: &VirtualizableDecl) -> TokenStream {
                     length_offset,
                     items_offset,
                 } => quote! {
-                    __info.add_embedded_array_field_with_layout(
+                    __info.add_embedded_array_field(
                         #aname,
                         #tp,
                         #field_offset,
                         #ptr_offset,
                         #length_offset,
                         #items_offset,
+                        majit_ir::make_array_descr(#items_offset, #item_size_expr, #tp),
                     );
                 },
             }

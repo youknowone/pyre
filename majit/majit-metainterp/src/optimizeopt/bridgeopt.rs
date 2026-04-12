@@ -917,10 +917,12 @@ pub fn deserialize_optimizer_knowledge(
             //   cls = optimizer.cpu.cls_of_box(frontend_boxes[i])
             //   optimizer.make_constant_class(box, cls)
             // RPython: cpu.cls_of_box is always available (model.py:199).
-            // Rust: requires runtime registration via set_cls_of_box.
             if let Some(cls_fn) = cls_of_box {
-                let cls = cls_fn(frontend_boxes[i]);
-                super::optimizer::Optimizer::make_constant_class(ctx, livebox, cls, true);
+                let raw_ref = frontend_boxes.get(i).copied().unwrap_or(0);
+                if raw_ref != 0 {
+                    let cls = cls_fn(raw_ref);
+                    super::optimizer::Optimizer::make_constant_class(ctx, livebox, cls, true);
+                }
             }
         }
     }

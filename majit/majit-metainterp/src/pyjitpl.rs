@@ -414,6 +414,15 @@ pub(crate) struct PendingDoneBridge {
     pub snapshot_box_types: HashMap<u32, majit_ir::Type>,
 }
 
+/// model.py:199-201 cpu.cls_of_box(box) default implementation:
+///   obj = lltype.cast_opaque_ptr(OBJECTPTR, box.getref_base())
+///   return ConstInt(ptr2int(obj.typeptr))
+/// Reads the first word of the object (typeptr/vtable pointer).
+fn default_cls_of_box(raw_ref: i64) -> i64 {
+    debug_assert!(raw_ref != 0, "cls_of_box: null ref");
+    unsafe { *(raw_ref as *const usize) as i64 }
+}
+
 pub struct MetaInterp<M: Clone> {
     pub(crate) warm_state: WarmEnterState,
     pub(crate) backend: BackendImpl,
@@ -531,7 +540,8 @@ pub struct MetaInterp<M: Clone> {
     pending_frontend_boxes: Option<Vec<i64>>,
     /// model.py:199-201 cpu.cls_of_box parity: callback that reads
     /// the class/vtable pointer from a runtime Ref object.
-    /// Registered by the interpreter at JIT init.
+    /// Default: `Some(default_cls_of_box)` — reads typeptr at offset 0,
+    /// matching backend/model.py:199-201.
     pub(crate) cls_of_box: Option<fn(i64) -> i64>,
 }
 
@@ -1184,8 +1194,9 @@ impl<M: Clone> MetaInterp<M> {
         self.string_constant_alloc = Some(alloc);
     }
 
-    /// model.py:199-201 cpu.cls_of_box — install the callback that reads
-    /// the class/vtable pointer from a runtime Ref object.
+    /// model.py:199-201 cpu.cls_of_box — override the default callback
+    /// for reading the class/vtable pointer from a runtime Ref object.
+    /// The default reads the first word at offset 0 (typeptr).
     pub fn set_cls_of_box(&mut self, f: fn(i64) -> i64) {
         self.cls_of_box = Some(f);
     }
@@ -7810,7 +7821,14 @@ mod tests {
 
     fn test_vable_info_with_array() -> VirtualizableInfo {
         let mut info = VirtualizableInfo::new(0);
-        info.add_array_field_with_layout("stack", Type::Int, 24, 0, 0);
+        info.add_array_field(
+            "stack",
+            Type::Int,
+            24,
+            0,
+            0,
+            majit_ir::make_array_descr(0, 8, Type::Int),
+        );
         info.set_parent_descr(majit_ir::descr::make_size_descr(64));
         info
     }
@@ -7854,13 +7872,17 @@ mod tests {
     #[test]
     fn trace_entry_vable_lengths_prefers_cached_fallback_over_heap_lengths() {
         let mut info = VirtualizableInfo::new(0);
-        info.add_array_field_with_layout(
-            "arr",
-            Type::Int,
-            std::mem::offset_of!(TraceEntryObj, arr),
-            0,
-            std::mem::size_of::<usize>(),
-        );
+        {
+            let items_offset = std::mem::size_of::<usize>();
+            info.add_array_field(
+                "arr",
+                Type::Int,
+                std::mem::offset_of!(TraceEntryObj, arr),
+                0,
+                items_offset,
+                majit_ir::make_array_descr(items_offset, 8, Type::Int),
+            );
+        }
         info.set_parent_descr(majit_ir::descr::make_size_descr(64));
 
         let array = TraceEntryArray {

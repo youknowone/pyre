@@ -14,7 +14,6 @@
 //!
 //! This module provides the Rust equivalent of RPython's `virtualizable.py`.
 
-use majit_ir::descr::make_array_descr;
 use majit_ir::{DescrRef, Type};
 
 /// Sentinel value for TOKEN_TRACING_RESCALL.
@@ -115,7 +114,7 @@ pub enum VableArrayStorage {
 ///
 /// This tells the JIT how to read/write the virtualizable's fields
 /// from both heap and JIT representations.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct VirtualizableInfo {
     /// jitdriver_sd.virtualizable name (interp_jit.py:25).
     pub name: String,
@@ -141,6 +140,23 @@ pub struct VirtualizableInfo {
     /// back to bare layout — only safe for code paths that bypass
     /// `ensure_ptr_info_arg0`.
     pub parent_descr: Option<DescrRef>,
+    /// virtualizable.py:58: self.array_descrs = [cpu.arraydescrof(...)]
+    /// Populated at init from array_fields, one per array field.
+    pub array_descrs: Vec<DescrRef>,
+}
+
+impl Clone for VirtualizableInfo {
+    fn clone(&self) -> Self {
+        VirtualizableInfo {
+            name: self.name.clone(),
+            static_fields: self.static_fields.clone(),
+            array_fields: self.array_fields.clone(),
+            token_offset: self.token_offset,
+            num_static_extra_boxes: self.num_static_extra_boxes,
+            parent_descr: self.parent_descr.clone(),
+            array_descrs: self.array_descrs.clone(),
+        }
+    }
 }
 
 impl VirtualizableInfo {
@@ -153,6 +169,7 @@ impl VirtualizableInfo {
             token_offset,
             num_static_extra_boxes: 0,
             parent_descr: None,
+            array_descrs: Vec::new(),
         }
     }
 
@@ -184,27 +201,20 @@ impl VirtualizableInfo {
         self.num_static_extra_boxes = self.static_fields.len();
     }
 
-    /// Add an array field with default layout (no header — items start at offset 0).
+    /// virtualizable.py:58: self.array_descrs = [cpu.arraydescrof(...)]
     ///
-    /// Use `add_array_field_with_layout` for arrays with a length header.
-    /// RPython uses translator-known descriptors for array layout, not defaults.
+    /// Add an array field with a pre-built descriptor.
+    /// The descriptor must come from the GcCache (= cpu.arraydescrof)
+    /// for production use. Test code may pass descriptors from
+    /// `make_array_descr()`.
     pub fn add_array_field(
-        &mut self,
-        name: impl Into<String>,
-        item_type: Type,
-        field_offset: usize,
-    ) {
-        self.add_array_field_with_layout(name, item_type, field_offset, 0, 0);
-    }
-
-    /// Add an array field with explicit layout offsets.
-    pub fn add_array_field_with_layout(
         &mut self,
         name: impl Into<String>,
         item_type: Type,
         field_offset: usize,
         length_offset: usize,
         items_offset: usize,
+        array_descr: DescrRef,
     ) {
         self.array_fields.push(VableArrayInfo {
             name: name.into(),
@@ -214,14 +224,16 @@ impl VirtualizableInfo {
             length_offset,
             items_offset,
         });
+        self.array_descrs.push(array_descr);
     }
 
-    /// Add an embedded array field with explicit pointer/length/data layout.
+    /// Add an embedded array field with a pre-built descriptor.
     ///
-    /// This matches Rust containers embedded by value inside the virtualizable
-    /// object, where the logical data pointer and length live in the container
-    /// rather than in a separate heap array header.
-    pub fn add_embedded_array_field_with_layout(
+    /// Embedded arrays live inside the virtualizable object by value
+    /// (e.g. Rust Vec-like containers). The `ptr_offset` is relative
+    /// to `field_offset` and locates the data pointer within the
+    /// container.
+    pub fn add_embedded_array_field(
         &mut self,
         name: impl Into<String>,
         item_type: Type,
@@ -229,6 +241,7 @@ impl VirtualizableInfo {
         ptr_offset: usize,
         length_offset: usize,
         items_offset: usize,
+        array_descr: DescrRef,
     ) {
         self.array_fields.push(VableArrayInfo {
             name: name.into(),
@@ -238,6 +251,7 @@ impl VirtualizableInfo {
             length_offset,
             items_offset,
         });
+        self.array_descrs.push(array_descr);
     }
 
     /// Total number of static fields.
@@ -439,17 +453,27 @@ impl VirtualizableInfo {
     /// SETFIELD op to `InstancePtrInfo` / `StructPtrInfo`.
     pub fn static_field_descr(&self, field_index: usize) -> DescrRef {
         let field = &self.static_fields[field_index];
+        // descr.py:226: flag = get_type_flag(FIELDTYPE)
+        let flag = majit_ir::ArrayFlag::from_field_type(field.field_type);
         self.field_descr_with_parent(
             field.offset,
             item_size_for_type(field.field_type),
             field.field_type,
-            field.field_type != Type::Ref,
+            flag,
         )
     }
 
     /// Descriptor for the token field on the virtualizable object.
+    /// virtualizable.py:28: vable_token_descr = cpu.fielddescrof(VTYPE, 'vable_token')
+    /// Token stores a raw pointer-sized value (force_token or sentinel).
+    /// Kept Unsigned to preserve pre-existing backend sign-extension behavior.
     pub fn token_field_descr(&self) -> DescrRef {
-        self.field_descr_with_parent(self.token_offset, 8, Type::Int, false)
+        self.field_descr_with_parent(
+            self.token_offset,
+            8,
+            Type::Int,
+            majit_ir::ArrayFlag::Unsigned,
+        )
     }
 
     /// Descriptor for the field that yields the backing array pointer.
@@ -462,7 +486,8 @@ impl VirtualizableInfo {
             VableArrayStorage::DirectPointer => array.field_offset,
             VableArrayStorage::EmbeddedArray { ptr_offset } => array.field_offset + ptr_offset,
         };
-        self.field_descr_with_parent(offset, 8, Type::Ref, false)
+        // Array pointer field is Type::Ref → FLAG_POINTER
+        self.field_descr_with_parent(offset, 8, Type::Ref, majit_ir::ArrayFlag::Pointer)
     }
 
     /// Internal helper: build a field descriptor that carries
@@ -484,7 +509,7 @@ impl VirtualizableInfo {
         offset: usize,
         field_size: usize,
         field_type: Type,
-        signed: bool,
+        flag: majit_ir::ArrayFlag,
     ) -> DescrRef {
         let parent = self.parent_descr.as_ref().unwrap_or_else(|| {
             panic!(
@@ -499,19 +524,15 @@ impl VirtualizableInfo {
         });
         std::sync::Arc::new(
             majit_ir::SimpleFieldDescr::new(0, offset, field_size, field_type, false)
-                .with_signed(signed)
+                .with_flag(flag)
                 .with_parent_descr(parent.clone(), 0),
         )
     }
 
-    /// Descriptor for array element accesses on a virtualizable array field.
+    /// virtualizable.py:58: self.array_descrs[array_index]
+    /// Returns the pre-built array descriptor for the given array field.
     pub fn array_item_descr(&self, array_index: usize) -> DescrRef {
-        let array = &self.array_fields[array_index];
-        make_array_descr(
-            array.items_offset,
-            item_size_for_type(array.item_type),
-            array.item_type,
-        )
+        self.array_descrs[array_index].clone()
     }
 
     /// Minimum number of boxes needed (static fields only, no arrays).
@@ -1018,8 +1039,9 @@ unsafe fn read_virtualizable_array(
     values
 }
 
+/// symbolic.py:get_array_token → itemsize = sizeof(ARRAY.OF).
 /// Returns the byte size of a single item for the given type.
-fn item_size_for_type(ty: Type) -> usize {
+pub fn item_size_for_type(ty: Type) -> usize {
     match ty {
         Type::Int | Type::Ref | Type::Float => 8,
         Type::Void => 0,
@@ -1115,12 +1137,57 @@ pub type FieldSetter = Box<dyn Fn(*mut u8, i64) + Send + Sync>;
 mod tests {
     use super::*;
 
+    /// Test helper: add an array field with a fresh descriptor.
+    /// Production code should use GcCache-sourced descriptors.
+    fn test_add_array_field(
+        info: &mut VirtualizableInfo,
+        name: &str,
+        item_type: Type,
+        field_offset: usize,
+        length_offset: usize,
+        items_offset: usize,
+    ) {
+        let item_size = item_size_for_type(item_type);
+        let descr = majit_ir::make_array_descr(items_offset, item_size, item_type);
+        info.add_array_field(
+            name,
+            item_type,
+            field_offset,
+            length_offset,
+            items_offset,
+            descr,
+        );
+    }
+
+    /// Test helper: add an embedded array field with a fresh descriptor.
+    fn test_add_embedded_array_field(
+        info: &mut VirtualizableInfo,
+        name: &str,
+        item_type: Type,
+        field_offset: usize,
+        ptr_offset: usize,
+        length_offset: usize,
+        items_offset: usize,
+    ) {
+        let item_size = item_size_for_type(item_type);
+        let descr = majit_ir::make_array_descr(items_offset, item_size, item_type);
+        info.add_embedded_array_field(
+            name,
+            item_type,
+            field_offset,
+            ptr_offset,
+            length_offset,
+            items_offset,
+            descr,
+        );
+    }
+
     #[test]
     fn test_virtualizable_info_creation() {
         let mut info = VirtualizableInfo::new(0);
         info.add_field("x", Type::Int, 8);
         info.add_field("y", Type::Int, 16);
-        info.add_array_field("stack", Type::Int, 24);
+        test_add_array_field(&mut info, "stack", Type::Int, 24, 0, 0);
 
         assert_eq!(info.num_fields(), 2);
         assert_eq!(info.num_arrays(), 1);
@@ -1203,8 +1270,8 @@ mod tests {
     #[test]
     fn test_array_field_index_lookup() {
         let mut info = VirtualizableInfo::new(0);
-        info.add_array_field("locals", Type::Ref, 32);
-        info.add_array_field("stack", Type::Int, 40);
+        test_add_array_field(&mut info, "locals", Type::Ref, 32, 0, 0);
+        test_add_array_field(&mut info, "stack", Type::Int, 40, 0, 0);
 
         assert_eq!(info.array_field_index(32), Some(0));
         assert_eq!(info.array_field_index(40), Some(1));
@@ -1216,8 +1283,8 @@ mod tests {
         let mut info = VirtualizableInfo::new(0);
         info.add_field("x", Type::Int, 8);
         info.add_field("y", Type::Int, 16);
-        info.add_array_field("locals", Type::Ref, 24);
-        info.add_array_field("stack", Type::Int, 32);
+        test_add_array_field(&mut info, "locals", Type::Ref, 24, 0, 0);
+        test_add_array_field(&mut info, "stack", Type::Int, 32, 0, 0);
 
         // 2 static + 5 + 3 = 10
         assert_eq!(info.get_total_size(&[5, 3]), 10);
@@ -1232,8 +1299,8 @@ mod tests {
         let mut info = VirtualizableInfo::new(0);
         info.add_field("x", Type::Int, 8);
         info.add_field("y", Type::Int, 16);
-        info.add_array_field("locals", Type::Ref, 24);
-        info.add_array_field("stack", Type::Int, 32);
+        test_add_array_field(&mut info, "locals", Type::Ref, 24, 0, 0);
+        test_add_array_field(&mut info, "stack", Type::Int, 32, 0, 0);
 
         let lens = &[5, 3];
         // array 0, item 0 => 2 static + 0 = 2
@@ -1251,7 +1318,7 @@ mod tests {
         let mut info = VirtualizableInfo::new(0);
         info.add_field("x", Type::Int, 8);
         info.add_field("y", Type::Int, 16);
-        info.add_array_field("locals", Type::Ref, 24);
+        test_add_array_field(&mut info, "locals", Type::Ref, 24, 0, 0);
 
         let lens = &[3usize];
         // total = 2 + 3 = 5
@@ -1314,8 +1381,8 @@ mod tests {
         }
 
         let mut info = VirtualizableInfo::new(0);
-        info.add_array_field("locals", Type::Ref, 8);
-        info.add_array_field_with_layout("stack", Type::Int, 16, 0, 8);
+        test_add_array_field(&mut info, "locals", Type::Ref, 8, 0, 0);
+        test_add_array_field(&mut info, "stack", Type::Int, 16, 0, 8);
 
         let lengths = unsafe { read_array_lengths(&info, obj.as_ptr()) };
         assert_eq!(lengths, vec![3, 5]);
@@ -1330,7 +1397,7 @@ mod tests {
         }
 
         let mut info = VirtualizableInfo::new(0);
-        info.add_array_field("locals", Type::Ref, 8);
+        test_add_array_field(&mut info, "locals", Type::Ref, 8, 0, 0);
 
         let lengths = unsafe { read_array_lengths(&info, obj.as_ptr()) };
         assert_eq!(lengths, vec![0]);
@@ -1360,7 +1427,8 @@ mod tests {
         };
 
         let mut info = VirtualizableInfo::new(0);
-        info.add_embedded_array_field_with_layout(
+        test_add_embedded_array_field(
+            &mut info,
             "arr",
             Type::Int,
             std::mem::offset_of!(Obj, arr),
@@ -1408,7 +1476,7 @@ mod tests {
         let mut info = VirtualizableInfo::new(0);
         info.add_field("x", Type::Int, 8);
         info.add_field("y", Type::Int, 16);
-        info.add_array_field_with_layout("stack", Type::Int, 24, 0, 8);
+        test_add_array_field(&mut info, "stack", Type::Int, 24, 0, 8);
 
         // Use read_array_lengths + read_all_virtualizable_boxes (the auto path)
         let lengths = unsafe { read_array_lengths(&info, obj.as_ptr()) };
@@ -1439,7 +1507,7 @@ mod tests {
         }
 
         let mut info = VirtualizableInfo::new(0);
-        info.add_array_field_with_layout("data", Type::Int, 8, 16, 24);
+        test_add_array_field(&mut info, "data", Type::Int, 8, 16, 24);
 
         let lengths = unsafe { read_array_lengths(&info, obj.as_ptr()) };
         assert_eq!(lengths, vec![3]);
@@ -1494,7 +1562,7 @@ mod tests {
 
         let mut info = VirtualizableInfo::new(0);
         info.add_field("pc", Type::Int, 8);
-        info.add_array_field_with_layout("stack", Type::Int, 16, 0, 8);
+        test_add_array_field(&mut info, "stack", Type::Int, 16, 0, 8);
 
         // Read all boxes
         let lengths = unsafe { read_array_lengths(&info, obj.as_ptr()) };
@@ -1541,7 +1609,7 @@ mod tests {
         }
 
         let mut info = VirtualizableInfo::new(0);
-        info.add_array_field_with_layout("locals_w", Type::Ref, 8, 0, 8);
+        test_add_array_field(&mut info, "locals_w", Type::Ref, 8, 0, 8);
 
         let (boxes, lengths) = unsafe { info.load_list_of_boxes(obj.as_ptr()) };
         assert_eq!(lengths, vec![3]);
@@ -1620,7 +1688,7 @@ mod tests {
         let mut info = VirtualizableInfo::new(0);
         info.add_field("a", Type::Int, 8);
         info.add_field("b", Type::Int, 16);
-        info.add_array_field_with_layout("vals", Type::Int, 24, 0, 8);
+        test_add_array_field(&mut info, "vals", Type::Int, 24, 0, 8);
 
         // sync_before_jit: read from heap
         let lengths = unsafe { read_array_lengths(&info, obj.as_ptr()) };
@@ -1658,8 +1726,8 @@ mod tests {
         info.add_field("x", Type::Int, 8);
         info.add_field("y", Type::Float, 24);
         info.add_field("z", Type::Ref, 40);
-        info.add_array_field("locals", Type::Ref, 48);
-        info.add_array_field("stack", Type::Int, 56);
+        test_add_array_field(&mut info, "locals", Type::Ref, 48, 0, 0);
+        test_add_array_field(&mut info, "stack", Type::Int, 56, 0, 0);
 
         let config = info.to_optimizer_config();
 
@@ -1740,7 +1808,7 @@ mod tests {
         let mut info = VirtualizableInfo::new(0);
         info.add_field("x", Type::Int, 8);
         // Array at offset 16, length at offset 0, items at offset 8 (after length)
-        info.add_array_field_with_layout("arr", Type::Int, 16, 0, 8);
+        test_add_array_field(&mut info, "arr", Type::Int, 16, 0, 8);
 
         let obj = &frame as *const Frame as *const u8;
         unsafe {
@@ -1782,7 +1850,7 @@ mod tests {
 
         let mut info = VirtualizableInfo::new(0);
         info.add_field("x", Type::Int, 8);
-        info.add_array_field_with_layout("arr", Type::Int, 16, 0, 8);
+        test_add_array_field(&mut info, "arr", Type::Int, 16, 0, 8);
 
         let obj = &mut frame as *mut Frame as *mut u8;
         // RPython: boxes = [x, arr[0], arr[1], vable_box]
@@ -2014,8 +2082,8 @@ mod tests {
         let mut info = VirtualizableInfo::new(0);
         info.add_field("a", Type::Int, 8);
         info.add_field("b", Type::Int, 16);
-        info.add_array_field("arr0", Type::Int, 24);
-        info.add_array_field("arr1", Type::Int, 32);
+        test_add_array_field(&mut info, "arr0", Type::Int, 24, 0, 0);
+        test_add_array_field(&mut info, "arr1", Type::Int, 32, 0, 0);
 
         let lens = &[3usize, 5];
 

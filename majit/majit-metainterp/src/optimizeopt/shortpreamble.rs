@@ -2459,7 +2459,7 @@ mod tests {
         let mut heap = Op::with_descr(
             OpCode::GetfieldGcI,
             &[OpRef(100)],
-            majit_ir::make_field_descr(0, 8, majit_ir::Type::Int, true),
+            majit_ir::make_field_descr(0, 8, majit_ir::Type::Int, majit_ir::ArrayFlag::Signed),
         );
         heap.pos = OpRef(102);
         builder.add_heap_op(heap);
@@ -2477,7 +2477,7 @@ mod tests {
         let mut heap = Op::with_descr(
             OpCode::GetfieldGcI,
             &[OpRef(10)],
-            majit_ir::make_field_descr(0, 8, majit_ir::Type::Int, true),
+            majit_ir::make_field_descr(0, 8, majit_ir::Type::Int, majit_ir::ArrayFlag::Signed),
         );
         heap.pos = OpRef(21);
         sb.add_heap_op(heap);
@@ -2525,7 +2525,7 @@ mod tests {
         let mut heap = Op::with_descr(
             OpCode::GetfieldGcI,
             &[OpRef(30)],
-            majit_ir::make_field_descr(0, 8, majit_ir::Type::Int, true),
+            majit_ir::make_field_descr(0, 8, majit_ir::Type::Int, majit_ir::ArrayFlag::Signed),
         );
         heap.pos = OpRef(10);
         sb.add_potential_op(Some(0), heap, PreambleOpKind::Heap);
@@ -2560,7 +2560,7 @@ mod tests {
         let mut heap = Op::with_descr(
             OpCode::GetfieldGcI,
             &[OpRef(30)],
-            majit_ir::make_field_descr(0, 8, majit_ir::Type::Int, true),
+            majit_ir::make_field_descr(0, 8, majit_ir::Type::Int, majit_ir::ArrayFlag::Signed),
         );
         heap.pos = OpRef(20);
         sb.add_potential_op(Some(0), heap, PreambleOpKind::Heap);
@@ -2604,7 +2604,7 @@ mod tests {
         let mut heap = Op::with_descr(
             OpCode::GetfieldGcI,
             &[OpRef(30)],
-            majit_ir::make_field_descr(0, 8, majit_ir::Type::Int, true),
+            majit_ir::make_field_descr(0, 8, majit_ir::Type::Int, majit_ir::ArrayFlag::Signed),
         );
         heap.pos = OpRef(10);
         sb.add_heap_op(heap);
@@ -2659,7 +2659,7 @@ mod tests {
         let mut heap = Op::with_descr(
             OpCode::GetfieldGcI,
             &[OpRef(30)],
-            majit_ir::make_field_descr(0, 8, majit_ir::Type::Int, true),
+            majit_ir::make_field_descr(0, 8, majit_ir::Type::Int, majit_ir::ArrayFlag::Signed),
         );
         heap.pos = OpRef(20);
         sb.add_potential_op(Some(0), heap, PreambleOpKind::Heap);

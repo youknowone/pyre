@@ -3192,7 +3192,14 @@ mod tests {
     fn make_test_vable_info() -> VirtualizableInfo {
         let mut info = VirtualizableInfo::new(0);
         info.add_field("pc", Type::Int, 8);
-        info.add_array_field("stack", Type::Int, 24);
+        info.add_array_field(
+            "stack",
+            Type::Int,
+            24,
+            0,
+            0,
+            majit_ir::make_array_descr(0, 8, Type::Int),
+        );
         info.set_parent_descr(majit_ir::descr::make_size_descr(64));
         info
     }

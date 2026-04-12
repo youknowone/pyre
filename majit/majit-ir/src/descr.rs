@@ -5,6 +5,7 @@
 ///
 /// Descriptors carry type metadata needed by the optimizer and backend
 /// for field access, array access, function calls, and guard failures.
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::Weak;
@@ -17,6 +18,427 @@ use serde::{Deserialize, Serialize};
 /// Opaque reference to a descriptor, shared across the JIT pipeline.
 pub type DescrRef = Arc<dyn Descr>;
 
+/// descr.py: GcCache dict keys.
+///
+/// RPython uses the actual lltype object (STRUCT, ARRAY_OR_STRUCT,
+/// FuncType) as dict key — identity-based for type objects. In Rust
+/// we use opaque u64 handles assigned by the host/translator, so two
+/// distinct type definitions always get distinct keys even if they
+/// share a name or layout. For call descriptors, PyPy uses a
+/// structural tuple key (descr.py:665).
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub enum LLType {
+    /// descr.py:109: cache[STRUCT].
+    /// Opaque handle for a STRUCT/GcStruct type definition.
+    /// The host assigns a unique u64 per distinct type.
+    Struct(u64),
+    /// descr.py:350: cache[ARRAY_OR_STRUCT].
+    /// Opaque handle for an ARRAY/GcArray type definition.
+    Array(u64),
+    /// descr.py:665: (arg_classes, result_type, result_signed,
+    ///   RESULT_ERASED, extrainfo).
+    /// Structural key — two calls with the same signature + effects
+    /// share one CallDescr.
+    Func {
+        arg_classes: String,
+        result_type: Type,
+        /// descr.py:664: result_signed = get_type_flag(RESULT) == FLAG_SIGNED
+        result_signed: bool,
+        /// descr.py:662: result_size = symbolic.get_size(RESULT_ERASED, tsc)
+        result_size: usize,
+        extra_effect: u8,
+        oopspec_index: u16,
+        readonly_descrs_fields: u64,
+        write_descrs_fields: u64,
+        readonly_descrs_arrays: u64,
+        write_descrs_arrays: u64,
+        /// effectinfo.py: bitstring_readonly_descrs_interiorfields
+        readonly_descrs_interiorfields: u64,
+        /// effectinfo.py: bitstring_write_descrs_interiorfields
+        write_descrs_interiorfields: u64,
+        can_invalidate: bool,
+        can_collect: bool,
+    },
+}
+
+impl LLType {
+    /// descr.py:109: cache[STRUCT] — STRUCT type identity.
+    pub fn struct_key(type_id: u64) -> Self {
+        LLType::Struct(type_id)
+    }
+    /// descr.py:350: cache[ARRAY_OR_STRUCT] — array type identity.
+    pub fn array_key(type_id: u64) -> Self {
+        LLType::Array(type_id)
+    }
+    /// descr.py:665: get_call_descr key tuple.
+    pub fn func_key(
+        arg_types: &[Type],
+        result_type: Type,
+        result_signed: bool,
+        result_size: usize,
+        effect: &EffectInfo,
+    ) -> Self {
+        let mut arg_classes = String::new();
+        for t in arg_types {
+            arg_classes.push(match t {
+                Type::Int => 'i',
+                Type::Ref => 'r',
+                Type::Float => 'f',
+                Type::Void => 'v',
+            });
+        }
+        LLType::Func {
+            arg_classes,
+            result_type,
+            result_signed,
+            result_size,
+            extra_effect: effect.extra_effect as u8,
+            oopspec_index: effect.oopspec_index as u16,
+            readonly_descrs_fields: effect.readonly_descrs_fields,
+            write_descrs_fields: effect.write_descrs_fields,
+            readonly_descrs_arrays: effect.readonly_descrs_arrays,
+            write_descrs_arrays: effect.write_descrs_arrays,
+            readonly_descrs_interiorfields: effect.readonly_descrs_interiorfields,
+            write_descrs_interiorfields: effect.write_descrs_interiorfields,
+            can_invalidate: effect.can_invalidate,
+            can_collect: effect.can_collect,
+        }
+    }
+}
+
+/// descr.py:14-23 GcCache.
+///
+/// Per-type descriptor caches keyed by LLType (structural equality).
+/// Factory functions (get_size_descr, get_field_descr, etc.) check
+/// the cache first and return the existing object on hit.
+///
+/// setup_descrs() iterates caches in RPython's fixed order:
+///   _cache_size, _cache_field, _cache_array, _cache_arraylen,
+///   _cache_call, _cache_interiorfield
+pub struct GcCache {
+    /// descr.py:18: _cache_size[STRUCT]
+    pub _cache_size: HashMap<LLType, DescrRef>,
+    /// descr.py:19: _cache_field[STRUCT][fieldname]
+    pub _cache_field: HashMap<LLType, HashMap<String, DescrRef>>,
+    /// descr.py:20: _cache_array[ARRAY_OR_STRUCT]
+    pub _cache_array: HashMap<LLType, DescrRef>,
+    /// descr.py:21: _cache_arraylen[ARRAY_OR_STRUCT]
+    pub _cache_arraylen: HashMap<LLType, DescrRef>,
+    /// descr.py:22: _cache_call[(arg_classes, ...)]
+    pub _cache_call: HashMap<LLType, DescrRef>,
+    /// descr.py:23: _cache_interiorfield[(ARRAY, name, arrayfieldname)]
+    pub _cache_interiorfield: HashMap<(LLType, String, String), DescrRef>,
+
+    // ── Creation-order tracking ──
+    // Rust HashMap iteration is non-deterministic. setup_descrs()
+    // must iterate in creation order to match PyPy's dict iteration.
+    // Each Vec records descriptors in insertion order.
+    _cache_size_order: Vec<DescrRef>,
+    _cache_field_order: Vec<DescrRef>,
+    _cache_array_order: Vec<DescrRef>,
+    _cache_arraylen_order: Vec<DescrRef>,
+    _cache_call_order: Vec<DescrRef>,
+    _cache_interiorfield_order: Vec<DescrRef>,
+}
+
+impl GcCache {
+    pub fn new() -> Self {
+        GcCache {
+            _cache_size: HashMap::new(),
+            _cache_field: HashMap::new(),
+            _cache_array: HashMap::new(),
+            _cache_arraylen: HashMap::new(),
+            _cache_call: HashMap::new(),
+            _cache_interiorfield: HashMap::new(),
+            _cache_size_order: Vec::new(),
+            _cache_field_order: Vec::new(),
+            _cache_array_order: Vec::new(),
+            _cache_arraylen_order: Vec::new(),
+            _cache_call_order: Vec::new(),
+            _cache_interiorfield_order: Vec::new(),
+        }
+    }
+
+    /// descr.py:25-47 setup_descrs().
+    ///
+    /// Iterates per-type caches in fixed group order (size, field, array,
+    /// arraylen, call, interiorfield), and within each group in creation
+    /// order (insertion order). Assigns sequential descr_index.
+    pub fn setup_descrs(&self) -> Vec<DescrRef> {
+        let mut all_descrs: Vec<DescrRef> = Vec::new();
+        // descr.py:27-29: _cache_size
+        for v in &self._cache_size_order {
+            v.set_descr_index(all_descrs.len() as i32);
+            all_descrs.push(v.clone());
+        }
+        // descr.py:30-33: _cache_field (nested)
+        for v in &self._cache_field_order {
+            v.set_descr_index(all_descrs.len() as i32);
+            all_descrs.push(v.clone());
+        }
+        // descr.py:34-36: _cache_array
+        for v in &self._cache_array_order {
+            v.set_descr_index(all_descrs.len() as i32);
+            all_descrs.push(v.clone());
+        }
+        // descr.py:37-39: _cache_arraylen
+        for v in &self._cache_arraylen_order {
+            v.set_descr_index(all_descrs.len() as i32);
+            all_descrs.push(v.clone());
+        }
+        // descr.py:40-42: _cache_call
+        for v in &self._cache_call_order {
+            v.set_descr_index(all_descrs.len() as i32);
+            all_descrs.push(v.clone());
+        }
+        // descr.py:43-45: _cache_interiorfield
+        for v in &self._cache_interiorfield_order {
+            v.set_descr_index(all_descrs.len() as i32);
+            all_descrs.push(v.clone());
+        }
+        assert!(
+            all_descrs.len() < (1 << 15),
+            "descr.py:46: assert len(all_descrs) < 2**15"
+        );
+        all_descrs
+    }
+
+    /// descr.py:49-50 init_size_descr(self, STRUCT, sizedescr).
+    /// Hook for subclass overrides (e.g. GcLLDescr_framework sets tid).
+    ///
+    /// gc.py:536-542: GcLLDescr_framework.init_size_descr sets
+    /// `descr.tid = combine_ushort(type_id, 0)`. Called BEFORE
+    /// wrapping in Arc.
+    pub fn init_size_descr(&self, _key: &LLType, _sizedescr: &mut SimpleSizeDescr) {
+        // Base class does nothing — matches descr.py:50 `pass`.
+    }
+
+    /// descr.py:52-54 init_array_descr(self, ARRAY, arraydescr).
+    /// Hook for subclass overrides (e.g. GcLLDescr_framework sets tid).
+    ///
+    /// gc.py:544-549: GcLLDescr_framework.init_array_descr sets
+    /// `descr.tid = combine_ushort(type_id, 0)`. The `&mut` reference
+    /// allows the hook to mutate the descriptor BEFORE it is wrapped
+    /// in Arc, matching RPython's mutable-object semantics.
+    pub fn init_array_descr(&self, _key: &LLType, _arraydescr: &mut SimpleArrayDescr) {
+        // Base class: assert only — matches descr.py:53-54.
+    }
+}
+
+// descr.py:105-127, 218-239, 256-267, 348-378, 647-675:
+// get_size_descr, get_field_descr, get_field_arraylen_descr,
+// get_array_descr, get_call_descr are methods on GcCache (see below).
+// PyPy passes `gccache` as the first argument to these free functions;
+// in Rust they are &mut self methods on GcCache.
+
+impl GcCache {
+    /// descr.py:105-127 get_size_descr(gccache, STRUCT, vtable).
+    ///
+    /// `key`: LLType::Struct — STRUCT identity (no vtable in key).
+    /// `vtable` is a payload/assertion parameter, not part of the key.
+    /// `immutable_flag`: descr.py:112 heaptracker.is_immutable_struct(STRUCT).
+    pub fn get_size_descr(
+        &mut self,
+        key: LLType,
+        size: usize,
+        type_id: u32,
+        vtable: usize,
+        immutable_flag: bool,
+    ) -> DescrRef {
+        // descr.py:108-109: cache hit
+        if let Some(descr) = self._cache_size.get(&key) {
+            return descr.clone();
+        }
+        // descr.py:117-118: SizeDescr(size, vtable=vtable, immutable_flag=immutable_flag)
+        let mut sd = if vtable != 0 {
+            SimpleSizeDescr::with_vtable(u32::MAX, size, type_id, vtable)
+        } else {
+            SimpleSizeDescr::new(u32::MAX, size, type_id)
+        };
+        sd.is_immutable = immutable_flag;
+        // descr.py:119: gccache.init_size_descr(STRUCT, sizedescr)
+        // gc.py:536-542: sets descr.tid — must happen BEFORE Arc wrap.
+        self.init_size_descr(&key, &mut sd);
+        let descr: DescrRef = Arc::new(sd);
+        // descr.py:120: cache[STRUCT] = sizedescr
+        self._cache_size.insert(key, descr.clone());
+        self._cache_size_order.push(descr.clone());
+        // descr.py:123-126: gc_fielddescrs / all_fielddescrs
+        // populated externally via SimpleSizeDescr::with_all_field_descrs
+        // since we lack the heaptracker to auto-discover fields.
+        descr
+    }
+
+    /// descr.py:218-239 get_field_descr(gccache, STRUCT, fieldname).
+    ///
+    /// `struct_key`: LLType::Struct — the owning type identity.
+    /// `index_in_parent`: descr.py:228 heaptracker.get_fielddescr_index_in(STRUCT, fieldname).
+    ///   The structural slot number within the parent struct's field list.
+    ///   Caller must provide this — Rust has no heaptracker auto-discovery.
+    /// `flag`: descr.py:226 get_type_flag(FIELDTYPE).
+    ///
+    /// descr.py:234-238: parent_descr = get_size_descr(gccache, STRUCT, vtable).
+    /// Looked up from _cache_size[STRUCT]. Caller must ensure get_size_descr
+    /// was called first (matches RPython's call at descr.py:238).
+    pub fn get_field_descr(
+        &mut self,
+        struct_key: LLType,
+        field_name: &str,
+        offset: usize,
+        field_size: usize,
+        field_type: Type,
+        is_immutable: bool,
+        flag: ArrayFlag,
+        index_in_parent: usize,
+    ) -> DescrRef {
+        // descr.py:220-221: cache[STRUCT][fieldname]
+        if let Some(inner) = self._cache_field.get(&struct_key) {
+            if let Some(descr) = inner.get(field_name) {
+                return descr.clone();
+            }
+        }
+        // descr.py:227: name = '%s.%s' % (STRUCT._name, fieldname)
+        let type_id = match &struct_key {
+            LLType::Struct(id) => *id,
+            _ => 0,
+        };
+        let name = format!("T{type_id}.{field_name}");
+        // descr.py:234-238: parent_descr = get_size_descr(gccache, STRUCT, vtable)
+        let parent = self._cache_size.get(&struct_key).cloned();
+        // descr.py:230-231: FieldDescr(name, offset, size, flag, index_in_parent, is_pure)
+        let mut fd = SimpleFieldDescr::new_with_name(
+            u32::MAX,
+            offset,
+            field_size,
+            field_type,
+            is_immutable,
+            flag,
+            name,
+        );
+        // descr.py:228: index_in_parent (from heaptracker)
+        fd.index_in_parent = index_in_parent;
+        // descr.py:238: fielddescr.parent_descr = get_size_descr(gccache, STRUCT, vtable)
+        if let Some(ref p) = parent {
+            fd.parent_descr = Some(Arc::downgrade(p));
+        }
+        let descr: DescrRef = Arc::new(fd);
+        // descr.py:232-233: cachedict = cache.setdefault(STRUCT, {})
+        let inner = self._cache_field.entry(struct_key).or_default();
+        inner.insert(field_name.to_string(), descr.clone());
+        self._cache_field_order.push(descr.clone());
+        descr
+    }
+
+    /// descr.py:256-267 get_field_arraylen_descr(gccache, ARRAY_OR_STRUCT).
+    ///
+    /// Creates a FieldDescr("len", ofs, WORD_SIZE, FLAG_SIGNED) for the
+    /// length field of an array. parent_descr = None.
+    pub fn get_field_arraylen_descr(&mut self, key: LLType, length_offset: usize) -> DescrRef {
+        // descr.py:258-259: cache hit
+        if let Some(descr) = self._cache_arraylen.get(&key) {
+            return descr.clone();
+        }
+        // descr.py:263: size = symbolic.get_size(lltype.Signed, tsc)
+        let word_size = std::mem::size_of::<usize>();
+        // descr.py:264: FieldDescr("len", ofs, size, get_type_flag(lltype.Signed))
+        let descr: DescrRef = Arc::new(SimpleFieldDescr::new_with_name(
+            u32::MAX,
+            length_offset,
+            word_size,
+            Type::Int,
+            false,
+            ArrayFlag::Signed, // descr.py:264: get_type_flag(lltype.Signed)
+            "len".to_string(),
+        ));
+        // descr.py:265: result.parent_descr = None (no parent)
+        self._cache_arraylen.insert(key, descr.clone());
+        self._cache_arraylen_order.push(descr.clone());
+        descr
+    }
+
+    /// descr.py:348-378 get_array_descr(gccache, ARRAY_OR_STRUCT).
+    ///
+    /// `key`: LLType::Array — opaque array type identity.
+    /// `flag`: descr.py:363 get_type_flag(ARRAY_INSIDE.OF) — element type
+    ///   classification. Caller must compute this from the actual element type
+    ///   (signed vs unsigned integer, pointer, float, struct).
+    /// `item_type`: IR-level element type (for ArrayDescr::item_type()).
+    /// `nolength`: descr.py:359 ARRAY_INSIDE._hints.get('nolength', False).
+    /// `length_offset`: offset of the length field (only used when !nolength).
+    /// `is_pure`: descr.py:364 bool(ARRAY_INSIDE._immutable_field(None)).
+    /// `concrete_type`: descr.py:366-370 '\x00' or 'f' for Float/SingleFloat.
+    pub fn get_array_descr(
+        &mut self,
+        key: LLType,
+        base_size: usize,
+        item_size: usize,
+        flag: ArrayFlag,
+        item_type: Type,
+        nolength: bool,
+        length_offset: usize,
+        is_pure: bool,
+        concrete_type: char,
+    ) -> DescrRef {
+        // descr.py:350-351: cache hit
+        if let Some(descr) = self._cache_array.get(&key) {
+            return descr.clone();
+        }
+        // descr.py:359-362: lendescr
+        let lendescr = if nolength {
+            None
+        } else {
+            Some(self.get_field_arraylen_descr(key.clone(), length_offset))
+        };
+        // descr.py:365: ArrayDescr(basesize, itemsize, lendescr, flag, is_pure, concrete_type)
+        let mut ad =
+            SimpleArrayDescr::with_flag(u32::MAX, base_size, item_size, 0, item_type, flag);
+        ad.lendescr = lendescr;
+        ad.is_pure = is_pure;
+        ad.concrete_type = concrete_type;
+        // descr.py:377: gccache.init_array_descr(ARRAY_OR_STRUCT, arraydescr)
+        // gc.py:544-549: sets descr.tid — must happen BEFORE Arc wrap.
+        self.init_array_descr(&key, &mut ad);
+        let descr: DescrRef = Arc::new(ad);
+        // descr.py:371: cache[ARRAY_OR_STRUCT] = arraydescr
+        self._cache_array.insert(key, descr.clone());
+        self._cache_array_order.push(descr.clone());
+        // descr.py:372-375: all_interiorfielddescrs for struct arrays
+        // — set externally via SimpleArrayDescr::set_all_interiorfielddescrs
+        descr
+    }
+
+    /// descr.py:647-675 get_call_descr(gccache, ARGS, RESULT, extrainfo).
+    ///
+    /// descr.py:665: key = (arg_classes, result_type, result_signed,
+    ///   RESULT_ERASED, extrainfo)
+    pub fn get_call_descr(
+        &mut self,
+        arg_types: Vec<Type>,
+        result_type: Type,
+        result_signed: bool,
+        result_size: usize,
+        effect: EffectInfo,
+    ) -> DescrRef {
+        let key = LLType::func_key(&arg_types, result_type, result_signed, result_size, &effect);
+        // descr.py:667-668: cache hit
+        if let Some(descr) = self._cache_call.get(&key) {
+            return descr.clone();
+        }
+        // descr.py:670-671: CallDescr(arg_classes, result_type, result_signed,
+        //   result_size, extrainfo)
+        let descr: DescrRef = Arc::new(SimpleCallDescr::new(
+            u32::MAX,
+            arg_types,
+            result_type,
+            result_signed,
+            result_size,
+            effect,
+        ));
+        self._cache_call.insert(key, descr.clone());
+        self._cache_call_order.push(descr.clone());
+        descr
+    }
+}
 /// history.py: TargetToken / JitCellToken identity. PyPy keys
 /// `target_tokens_currently_compiling` and `consider_jump`'s
 /// `jump_target_descr` by descriptor object identity (Python's default
@@ -517,6 +939,21 @@ impl ArrayFlag {
             // (descr.py:254). Callers with concrete type info should use
             // get_type_flag() for FLAG_SIGNED/FLAG_UNSIGNED distinction.
             Type::Int => ArrayFlag::Unsigned,
+            Type::Void => ArrayFlag::Void,
+        }
+    }
+
+    /// descr.py:241-254: get_type_flag(FIELDTYPE) for FieldDescr.
+    ///
+    /// For fields, `Type::Int` maps to `Signed` — RPython's default
+    /// integer type is `lltype.Signed` which gets FLAG_SIGNED. This
+    /// differs from arrays where the default is FLAG_UNSIGNED.
+    pub fn from_field_type(field_type: Type) -> Self {
+        match field_type {
+            Type::Ref => ArrayFlag::Pointer,
+            Type::Float => ArrayFlag::Float,
+            // RPython: Signed → FLAG_SIGNED (descr.py:248)
+            Type::Int => ArrayFlag::Signed,
             Type::Void => ArrayFlag::Void,
         }
     }
@@ -1092,18 +1529,20 @@ pub struct SimpleFieldDescr {
     field_size: usize,
     field_type: Type,
     is_immutable: bool,
-    is_signed: bool,
+    /// descr.py:151: FieldDescr.flag — type classification from get_type_flag().
+    /// FLAG_POINTER, FLAG_FLOAT, FLAG_SIGNED, FLAG_UNSIGNED, FLAG_STRUCT, FLAG_VOID.
+    flag: ArrayFlag,
     virtualizable: bool,
-    /// descr.py: FieldDescr.index_in_parent — slot position within the
+    /// descr.py:158 FieldDescr.index — slot position within the
     /// parent struct's `all_field_descrs`.
-    index_in_parent: usize,
-    /// descr.py: FieldDescr.parent_descr — backreference to the SizeDescr
+    pub index_in_parent: usize,
+    /// descr.py:238 FieldDescr.parent_descr — backreference to the SizeDescr
     /// of the containing struct/object. Required by
     /// `OptContext::ensure_ptr_info_arg0` to dispatch Instance vs Struct
     /// PtrInfo per `optimizer.py:478-484`. Stored as `Weak` to break the
     /// SizeDescr → FieldDescr → SizeDescr Arc cycle introduced by
     /// `make_simple_descr_group`.
-    parent_descr: Option<Weak<dyn Descr>>,
+    pub parent_descr: Option<Weak<dyn Descr>>,
 }
 
 impl Clone for SimpleFieldDescr {
@@ -1116,7 +1555,7 @@ impl Clone for SimpleFieldDescr {
             field_size: self.field_size,
             field_type: self.field_type,
             is_immutable: self.is_immutable,
-            is_signed: self.is_signed,
+            flag: self.flag,
             virtualizable: self.virtualizable,
             index_in_parent: self.index_in_parent,
             parent_descr: self.parent_descr.clone(),
@@ -1132,6 +1571,9 @@ impl SimpleFieldDescr {
         field_type: Type,
         is_immutable: bool,
     ) -> Self {
+        // descr.py:241-254: get_type_flag(FIELDTYPE) — derive flag from IR type.
+        // Default: Int→Signed (RPython Signed), Ref→Pointer, Float→Float.
+        let flag = ArrayFlag::from_field_type(field_type);
         SimpleFieldDescr {
             index,
             descr_index: AtomicI32::new(-1),
@@ -1140,7 +1582,7 @@ impl SimpleFieldDescr {
             field_size,
             field_type,
             is_immutable,
-            is_signed: true,
+            flag,
             virtualizable: false,
             index_in_parent: 0,
             parent_descr: None,
@@ -1149,14 +1591,14 @@ impl SimpleFieldDescr {
 
     /// RPython: FieldDescr(name, offset, size, flag, index_in_parent, is_pure).
     /// `name` format: `"STRUCT.fieldname"` (descr.py:227).
-    /// `is_signed`: RPython flag == FLAG_SIGNED (descr.py:241-254).
+    /// `flag`: descr.py:226 get_type_flag(FIELDTYPE).
     pub fn new_with_name(
         index: u32,
         offset: usize,
         field_size: usize,
         field_type: Type,
         is_immutable: bool,
-        is_signed: bool,
+        flag: ArrayFlag,
         name: String,
     ) -> Self {
         SimpleFieldDescr {
@@ -1167,15 +1609,26 @@ impl SimpleFieldDescr {
             field_size,
             field_type,
             is_immutable,
-            is_signed,
+            flag,
             virtualizable: false,
             index_in_parent: 0,
             parent_descr: None,
         }
     }
 
+    /// descr.py:151: set flag directly.
+    pub fn with_flag(mut self, flag: ArrayFlag) -> Self {
+        self.flag = flag;
+        self
+    }
+
+    /// Compat shim: with_signed(true) → FLAG_SIGNED, with_signed(false) → FLAG_UNSIGNED.
     pub fn with_signed(mut self, signed: bool) -> Self {
-        self.is_signed = signed;
+        self.flag = if signed {
+            ArrayFlag::Signed
+        } else {
+            ArrayFlag::Unsigned
+        };
         self
     }
 
@@ -1226,8 +1679,17 @@ impl FieldDescr for SimpleFieldDescr {
     fn field_type(&self) -> Type {
         self.field_type
     }
+    /// descr.py:173: is_pointer_field() → self.flag == FLAG_POINTER
+    fn is_pointer_field(&self) -> bool {
+        self.flag == ArrayFlag::Pointer
+    }
+    /// descr.py:176: is_float_field() → self.flag == FLAG_FLOAT
+    fn is_float_field(&self) -> bool {
+        self.flag == ArrayFlag::Float
+    }
+    /// descr.py:179: is_field_signed() → self.flag == FLAG_SIGNED
     fn is_field_signed(&self) -> bool {
-        self.is_signed
+        self.flag == ArrayFlag::Signed
     }
     fn is_immutable(&self) -> bool {
         self.is_immutable
@@ -1251,7 +1713,8 @@ pub struct SimpleSizeDescr {
     descr_index: AtomicI32,
     size: usize,
     type_id: u32,
-    is_immutable: bool,
+    /// descr.py:64,112: SizeDescr.immutable_flag
+    pub is_immutable: bool,
     vtable: usize,
     all_field_descrs: Vec<Arc<dyn FieldDescr>>,
 }
@@ -1299,6 +1762,12 @@ impl SimpleSizeDescr {
         self.all_field_descrs = all_field_descrs;
         self
     }
+
+    /// gc.py:541: descr.tid = llop.combine_ushort(lltype.Signed, type_id, 0)
+    /// Called by init_size_descr hook before Arc wrapping.
+    pub fn set_type_id(&mut self, type_id: u32) {
+        self.type_id = type_id;
+    }
 }
 
 impl Descr for SimpleSizeDescr {
@@ -1345,7 +1814,8 @@ pub struct SimpleFieldDescrSpec {
     pub field_size: usize,
     pub field_type: Type,
     pub is_immutable: bool,
-    pub is_signed: bool,
+    /// descr.py:151: FieldDescr.flag — get_type_flag(FIELDTYPE).
+    pub flag: ArrayFlag,
     pub virtualizable: bool,
     pub index_in_parent: usize,
 }
@@ -1378,7 +1848,7 @@ pub fn make_simple_descr_group(
                     field_size: spec.field_size,
                     field_type: spec.field_type,
                     is_immutable: spec.is_immutable,
-                    is_signed: spec.is_signed,
+                    flag: spec.flag,
                     virtualizable: spec.virtualizable,
                     index_in_parent: spec.index_in_parent,
                     parent_descr: Some(parent_descr.clone()),
@@ -1418,9 +1888,15 @@ pub struct SimpleArrayDescr {
     item_size: usize,
     type_id: u32,
     item_type: Type,
-    /// RPython: descr.py ArrayDescr.flag — element type classification.
+    /// descr.py:277,286: ArrayDescr.lendescr — length field descriptor, or None.
+    pub lendescr: Option<DescrRef>,
+    /// descr.py:278: ArrayDescr.flag — element type classification.
     flag: ArrayFlag,
-    /// RPython: descr.py ArrayDescr.all_interiorfielddescrs.
+    /// descr.py:288: ArrayDescr._is_pure
+    pub is_pure: bool,
+    /// descr.py:281,289: ArrayDescr.concrete_type — '\x00' or 'f' for Float.
+    pub concrete_type: char,
+    /// descr.py:280: ArrayDescr.all_interiorfielddescrs.
     /// For array-of-structs, contains interior field descriptors.
     all_interiorfielddescrs: Option<Vec<DescrRef>>,
 }
@@ -1434,7 +1910,10 @@ impl Clone for SimpleArrayDescr {
             item_size: self.item_size,
             type_id: self.type_id,
             item_type: self.item_type,
+            lendescr: self.lendescr.clone(),
             flag: self.flag,
+            is_pure: self.is_pure,
+            concrete_type: self.concrete_type,
             all_interiorfielddescrs: self.all_interiorfielddescrs.clone(),
         }
     }
@@ -1456,7 +1935,10 @@ impl SimpleArrayDescr {
             item_size,
             type_id,
             item_type,
+            lendescr: None,
             flag,
+            is_pure: false,
+            concrete_type: '\x00',
             all_interiorfielddescrs: None,
         }
     }
@@ -1477,7 +1959,10 @@ impl SimpleArrayDescr {
             item_size,
             type_id,
             item_type,
+            lendescr: None,
             flag,
+            is_pure: false,
+            concrete_type: '\x00',
             all_interiorfielddescrs: None,
         }
     }
@@ -1485,6 +1970,12 @@ impl SimpleArrayDescr {
     /// RPython: arraydescr.all_interiorfielddescrs = descrs
     pub fn set_all_interiorfielddescrs(&mut self, descrs: Vec<DescrRef>) {
         self.all_interiorfielddescrs = Some(descrs);
+    }
+
+    /// gc.py:548: descr.tid = llop.combine_ushort(lltype.Signed, type_id, 0)
+    /// Called by init_array_descr hook before Arc wrapping.
+    pub fn set_type_id(&mut self, type_id: u32) {
+        self.type_id = type_id;
     }
 }
 
@@ -1500,6 +1991,10 @@ impl Descr for SimpleArrayDescr {
     }
     fn as_array_descr(&self) -> Option<&dyn ArrayDescr> {
         Some(self)
+    }
+    /// descr.py:295: ArrayDescr.is_always_pure()
+    fn is_always_pure(&self) -> bool {
+        self.is_pure
     }
 }
 
@@ -1537,6 +2032,10 @@ impl ArrayDescr for SimpleArrayDescr {
             self.flag,
             ArrayFlag::Float | ArrayFlag::Signed | ArrayFlag::Unsigned
         )
+    }
+    /// descr.py:277,286: ArrayDescr.lendescr
+    fn len_descr(&self) -> Option<&dyn FieldDescr> {
+        self.lendescr.as_ref().and_then(|d| d.as_field_descr())
     }
     /// RPython: descr.py ArrayDescr.get_all_interiorfielddescrs()
     fn get_all_interiorfielddescrs(&self) -> Option<&[DescrRef]> {
@@ -1623,6 +2122,8 @@ impl InteriorFieldDescr for SimpleInteriorFieldDescr {
 }
 
 /// Simple concrete CallDescr for non-test use.
+/// descr.py:450-493: CallDescr(arg_classes, result_type, result_signed,
+///   result_size, extrainfo, ffi_flags).
 #[derive(Debug)]
 pub struct SimpleCallDescr {
     index: u32,
@@ -1631,6 +2132,9 @@ pub struct SimpleCallDescr {
     arg_types: Vec<Type>,
     result_type: Type,
     result_size: usize,
+    /// descr.py:453: CallDescr.result_flag — computed from result_type +
+    /// result_signed in __init__ (descr.py:478-493).
+    result_flag: ArrayFlag,
     effect: EffectInfo,
 }
 
@@ -1642,25 +2146,44 @@ impl Clone for SimpleCallDescr {
             arg_types: self.arg_types.clone(),
             result_type: self.result_type,
             result_size: self.result_size,
+            result_flag: self.result_flag,
             effect: self.effect.clone(),
         }
     }
 }
 
 impl SimpleCallDescr {
+    /// descr.py:456-493: CallDescr(arg_classes, result_type, result_signed,
+    ///   result_size, extrainfo, ffi_flags).
+    /// `result_signed` is used to compute `result_flag`.
     pub fn new(
         index: u32,
         arg_types: Vec<Type>,
         result_type: Type,
+        result_signed: bool,
         result_size: usize,
         effect: EffectInfo,
     ) -> Self {
+        // descr.py:478-493: compute result_flag from result_type + result_signed
+        let result_flag = match result_type {
+            Type::Void => ArrayFlag::Void,
+            Type::Int => {
+                if result_signed {
+                    ArrayFlag::Signed
+                } else {
+                    ArrayFlag::Unsigned
+                }
+            }
+            Type::Ref => ArrayFlag::Pointer,
+            Type::Float => ArrayFlag::Float,
+        };
         SimpleCallDescr {
             index,
             descr_index: AtomicI32::new(-1),
             arg_types,
             result_type,
             result_size,
+            result_flag,
             effect,
         }
     }
@@ -1688,6 +2211,10 @@ impl CallDescr for SimpleCallDescr {
     fn result_type(&self) -> Type {
         self.result_type
     }
+    /// descr.py:537-538: is_result_signed() → result_flag == FLAG_SIGNED
+    fn is_result_signed(&self) -> bool {
+        self.result_flag == ArrayFlag::Signed
+    }
     fn result_size(&self) -> usize {
         self.result_size
     }
@@ -1706,10 +2233,12 @@ pub fn make_raw_malloc_calldescr() -> DescrRef {
         oopspec_index: OopSpecIndex::RawMallocVarsizeChar,
         ..EffectInfo::default()
     };
+    // Raw malloc returns unsigned pointer (not signed)
     Arc::new(SimpleCallDescr::new(
         idx,
         vec![crate::Type::Int],
         crate::Type::Int,
+        false,
         8,
         effect,
     ))
@@ -2176,15 +2705,15 @@ mod tests {
 // ── Factory functions (descr.py: get_field_descr, get_size_descr, etc.) ──
 
 /// Create a field descriptor with the given layout.
+/// Fresh constructor — does NOT go through GcCache.
+/// For cached descriptors, use GcCache::get_field_descr().
 pub fn make_field_descr(
     offset: usize,
     field_size: usize,
     field_type: Type,
-    signed: bool,
+    flag: ArrayFlag,
 ) -> DescrRef {
-    std::sync::Arc::new(
-        SimpleFieldDescr::new(0, offset, field_size, field_type, false).with_signed(signed),
-    )
+    Arc::new(SimpleFieldDescr::new(0, offset, field_size, field_type, false).with_flag(flag))
 }
 
 /// Create a field descriptor with explicit index and immutability.
@@ -2205,8 +2734,9 @@ pub fn make_field_descr_full(
 }
 
 /// Create a size descriptor.
+/// Fresh constructor — does NOT go through GcCache.
 pub fn make_size_descr(size: usize) -> DescrRef {
-    std::sync::Arc::new(SimpleSizeDescr::new(0, size, 0))
+    Arc::new(SimpleSizeDescr::new(0, size, 0))
 }
 
 /// Create a size descriptor with explicit index and type_id.
@@ -2225,8 +2755,9 @@ pub fn make_size_descr_with_vtable(
 }
 
 /// Create an array descriptor.
+/// Fresh constructor — does NOT go through GcCache.
 pub fn make_array_descr(base_size: usize, item_size: usize, item_type: Type) -> DescrRef {
-    std::sync::Arc::new(SimpleArrayDescr::new(0, base_size, item_size, 0, item_type))
+    Arc::new(SimpleArrayDescr::new(0, base_size, item_size, 0, item_type))
 }
 
 /// Create an array descriptor with explicit index and type_id.
@@ -2243,16 +2774,25 @@ pub fn make_array_descr_full(
 }
 
 /// Create a call descriptor.
+/// Fresh constructor — does NOT go through GcCache.
+/// descr.py:647-675: get_call_descr(gccache, ARGS, RESULT, extrainfo).
+/// `result_signed` defaults to true for Int results (RPython Signed type),
+/// false for all others.
 pub fn make_call_descr(arg_types: Vec<Type>, result_type: Type, effect: EffectInfo) -> DescrRef {
-    std::sync::Arc::new(SimpleCallDescr::new(
+    let result_size = match result_type {
+        Type::Int | Type::Ref => 8,
+        Type::Float => 8,
+        Type::Void => 0,
+    };
+    // descr.py:664: result_signed = get_type_flag(RESULT) == FLAG_SIGNED
+    // For Signed (default int), this is true.
+    let result_signed = result_type == Type::Int;
+    Arc::new(SimpleCallDescr::new(
         0,
         arg_types,
         result_type,
-        match result_type {
-            Type::Int | Type::Ref => 8,
-            Type::Float => 8,
-            Type::Void => 0,
-        },
+        result_signed,
+        result_size,
         effect,
     ))
 }
@@ -2262,6 +2802,7 @@ pub fn make_call_descr_full(
     index: u32,
     arg_types: Vec<Type>,
     result_type: Type,
+    result_signed: bool,
     result_size: usize,
     effect: EffectInfo,
 ) -> DescrRef {
@@ -2269,6 +2810,7 @@ pub fn make_call_descr_full(
         index,
         arg_types,
         result_type,
+        result_signed,
         result_size,
         effect,
     ))

@@ -2184,7 +2184,7 @@ fn all_interiorfielddescrs(
                 field_size: fl.size,
                 field_type: fl.field_type,
                 is_immutable: false,
-                is_signed: fl.flag == majit_ir::descr::ArrayFlag::Signed,
+                flag: fl.flag,
                 virtualizable: false,
                 index_in_parent,
             });
@@ -2238,7 +2238,7 @@ fn all_interiorfielddescrs(
             field_size,
             field_type,
             is_immutable: false,
-            is_signed: flag == majit_ir::descr::ArrayFlag::Signed,
+            flag,
             virtualizable: false,
             index_in_parent,
         });

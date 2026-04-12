@@ -2198,7 +2198,7 @@ mod tests {
                 8,
                 Type::Ref,
                 false,
-                false,
+                majit_ir::ArrayFlag::Pointer,
                 "T.x".to_string(),
             )
             .with_parent_descr(parent.clone(), 3),
@@ -2348,7 +2348,7 @@ mod tests {
                 field_size: 8,
                 field_type: Type::Int,
                 is_immutable: false,
-                is_signed: true,
+                flag: majit_ir::ArrayFlag::Signed,
                 virtualizable: false,
                 index_in_parent: 0,
             }],

@@ -26,6 +26,7 @@ pub(crate) struct PendingBridgeRd {
     pub livebox_types: Vec<Type>,
     /// pyjitpl.py:2289 all_descrs: dense list indexed by descr_index.
     pub all_descrs: Vec<majit_ir::descr::DescrRef>,
+    /// model.py:199-201 cpu.cls_of_box — always available via MetaInterp.
     pub cls_of_box: Option<fn(i64) -> i64>,
 }
 
@@ -4159,7 +4160,7 @@ mod tests {
     fn test_optimizer_encodes_direct_virtual_guard_fail_args_as_rd_numb() {
         let mut opt = Optimizer::default_pipeline();
         let size_descr = make_size_descr(16);
-        let field_descr = majit_ir::make_field_descr(8, 8, Type::Int, true);
+        let field_descr = majit_ir::make_field_descr(8, 8, Type::Int, majit_ir::ArrayFlag::Signed);
 
         let mut guard = Op::new(OpCode::GuardTrue, &[OpRef(10)]);
         guard.fail_args = Some(vec![OpRef(0)].into());

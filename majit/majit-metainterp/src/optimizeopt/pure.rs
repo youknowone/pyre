@@ -1951,6 +1951,7 @@ mod tests {
             77,
             vec![majit_ir::Type::Int, majit_ir::Type::Int],
             majit_ir::Type::Int,
+            true,
             8,
             majit_ir::EffectInfo::elidable(),
         );

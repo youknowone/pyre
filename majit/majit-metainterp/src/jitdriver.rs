@@ -3487,7 +3487,14 @@ mod tests {
             fn __build_virtualizable_info() -> Option<crate::virtualizable::VirtualizableInfo> {
                 let mut info = crate::virtualizable::VirtualizableInfo::new(24);
                 info.add_field("pc", Type::Int, 8);
-                info.add_array_field("locals_w", Type::Ref, 16);
+                info.add_array_field(
+                    "locals_w",
+                    Type::Ref,
+                    16,
+                    0,
+                    0,
+                    majit_ir::make_array_descr(0, 8, Type::Ref),
+                );
                 info.set_parent_descr(majit_ir::descr::make_size_descr(64));
                 Some(info)
             }
