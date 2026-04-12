@@ -741,6 +741,32 @@ impl GcRewriterImpl {
     }
 }
 
+impl GcRewriterImpl {
+    /// rewrite.py:988-1001 remove_bridge_exception: check a common
+    /// case where SaveExcClass + SaveException + RestoreException
+    /// appear at the start of a bridge and are unused. Strip them.
+    fn remove_bridge_exception(ops: &[Op]) -> Vec<Op> {
+        let mut start = 0;
+        if ops
+            .first()
+            .map_or(false, |op| op.opcode == OpCode::IncrementDebugCounter)
+        {
+            start = 1;
+        }
+        if ops.len() >= start + 3
+            && ops[start].opcode == OpCode::SaveExcClass
+            && ops[start + 1].opcode == OpCode::SaveException
+            && ops[start + 2].opcode == OpCode::RestoreException
+        {
+            let mut result = Vec::with_capacity(ops.len() - 3);
+            result.extend_from_slice(&ops[..start]);
+            result.extend_from_slice(&ops[start + 3..]);
+            return result;
+        }
+        ops.to_vec()
+    }
+}
+
 impl GcRewriter for GcRewriterImpl {
     fn rewrite_for_gc(&self, ops: &[Op]) -> Vec<Op> {
         self.rewrite_for_gc_with_constants(ops, &HashMap::new()).0
@@ -751,6 +777,11 @@ impl GcRewriter for GcRewriterImpl {
         ops: &[Op],
         constants: &HashMap<u32, i64>,
     ) -> (Vec<Op>, HashMap<u32, i64>) {
+        // rewrite.py:988-1001 remove_bridge_exception: strip a
+        // SaveExcClass+SaveException+RestoreException prefix that is
+        // a no-op (common in bridges).
+        let ops = Self::remove_bridge_exception(ops);
+
         let next_pos = ops
             .iter()
             .filter_map(|op| (!op.pos.is_none()).then_some(op.pos.0))
@@ -758,7 +789,7 @@ impl GcRewriter for GcRewriterImpl {
             .map_or(0, |max_pos| max_pos.saturating_add(1));
         let mut st = RewriteState::with_constants(ops.len(), next_pos, constants.clone());
 
-        for op in ops {
+        for op in &ops {
             if !matches!(
                 op.opcode,
                 OpCode::SetarrayitemGc | OpCode::CondCallGcWbArray | OpCode::DebugMergePoint
