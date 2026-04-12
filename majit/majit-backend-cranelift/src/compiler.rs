@@ -7054,45 +7054,50 @@ impl CraneliftBackend {
 
                 // ── Exception operations ──
                 OpCode::SaveException => {
-                    // Returns the current exception value as a Ref.
-                    let exc_val = emit_host_call(
-                        &mut builder,
-                        ptr_type,
-                        call_conv,
-                        jit_exc_get_value as *const () as usize,
-                        &[],
-                        Some(cl_types::I64),
-                    )
-                    .expect("jit_exc_get_value must return a value");
+                    // x86/assembler.py:1820-1821 genop_save_exception:
+                    //   _store_and_reset_exception → resloc = [pos_exc_value];
+                    //   [pos_exception] = 0; [pos_exc_value] = 0
+                    let exc_val_addr = builder.ins().iconst(ptr_type, jit_exc_value_addr() as i64);
+                    let exc_val =
+                        builder
+                            .ins()
+                            .load(cl_types::I64, MemFlags::trusted(), exc_val_addr, 0);
+                    let exc_type_addr = builder.ins().iconst(ptr_type, jit_exc_type_addr() as i64);
+                    let zero = builder.ins().iconst(cl_types::I64, 0);
+                    builder
+                        .ins()
+                        .store(MemFlags::trusted(), zero, exc_type_addr, 0);
+                    builder
+                        .ins()
+                        .store(MemFlags::trusted(), zero, exc_val_addr, 0);
                     let vi = op_var_index(op, op_idx, inputargs.len());
                     builder.def_var(var(vi as u32), exc_val);
                 }
                 OpCode::SaveExcClass => {
-                    // Returns the current exception class as an Int.
-                    let exc_type = emit_host_call(
-                        &mut builder,
-                        ptr_type,
-                        call_conv,
-                        jit_exc_get_type as *const () as usize,
-                        &[],
-                        Some(cl_types::I64),
-                    )
-                    .expect("jit_exc_get_type must return a value");
+                    // x86/assembler.py:1817-1818 genop_save_exc_class:
+                    //   MOV resloc, [pos_exception]
+                    let exc_type_addr = builder.ins().iconst(ptr_type, jit_exc_type_addr() as i64);
+                    let exc_type =
+                        builder
+                            .ins()
+                            .load(cl_types::I64, MemFlags::trusted(), exc_type_addr, 0);
                     let vi = op_var_index(op, op_idx, inputargs.len());
                     builder.def_var(var(vi as u32), exc_type);
                 }
                 OpCode::RestoreException => {
-                    // args[0] = exception class, args[1] = exception value
+                    // x86/assembler.py:1845-1850 _restore_exception:
+                    //   MOV [pos_exc_value], excvalloc
+                    //   MOV [pos_exception], exctploc
                     let exc_type = resolve_opref(&mut builder, &constants, op.args[0]);
                     let value = resolve_opref(&mut builder, &constants, op.args[1]);
-                    let _ = emit_host_call(
-                        &mut builder,
-                        ptr_type,
-                        call_conv,
-                        jit_exc_restore as *const () as usize,
-                        &[value, exc_type],
-                        None,
-                    );
+                    let exc_val_addr = builder.ins().iconst(ptr_type, jit_exc_value_addr() as i64);
+                    let exc_type_addr = builder.ins().iconst(ptr_type, jit_exc_type_addr() as i64);
+                    builder
+                        .ins()
+                        .store(MemFlags::trusted(), value, exc_val_addr, 0);
+                    builder
+                        .ins()
+                        .store(MemFlags::trusted(), exc_type, exc_type_addr, 0);
                 }
                 OpCode::CheckMemoryError => {
                     // args[0] = pointer to check. If null (0), abort via trap.
