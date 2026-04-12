@@ -14,22 +14,6 @@ use majit_ir::{GcRef, Op, OpCode, OpRef, Value};
 
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
 
-/// Check whether an i64 value looks like a valid heap-allocated GC pointer.
-///
-/// RPython's GcRef type system guarantees all Ref values are valid GC pointers.
-/// Our raw i64 encoding has no such guarantee — live-value types can be
-/// misclassified (e.g. an Int value recorded as Ref). This heuristic rejects
-/// obviously non-pointer values before cls_of_box dereferences them.
-///
-/// A valid heap pointer on 64-bit should be:
-/// - Above the null page (> 0x1000)
-/// - Word-aligned (divisible by 8)
-#[inline]
-fn is_plausible_heap_ptr(raw: i64) -> bool {
-    let u = raw as u64;
-    u > 0x1000 && (u & 7) == 0
-}
-
 /// Known facts about values at bridge entry.
 #[derive(Clone, Debug)]
 pub struct BridgeKnowledge {
@@ -932,16 +916,10 @@ pub fn deserialize_optimizer_knowledge(
             // bridgeopt.py:145-146:
             //   cls = optimizer.cpu.cls_of_box(frontend_boxes[i])
             //   optimizer.make_constant_class(box, cls)
-            // RPython: cpu.cls_of_box is always available (model.py:199).
-            // RPython's GcRef type system guarantees the value is a valid
-            // heap pointer. Our raw i64 encoding has no such guarantee, so
-            // we validate the pointer before dereferencing.
             if let Some(cls_fn) = cls_of_box {
-                let raw_ref = frontend_boxes.get(i).copied().unwrap_or(0);
-                if raw_ref != 0 && is_plausible_heap_ptr(raw_ref) {
-                    let cls = cls_fn(raw_ref);
-                    super::optimizer::Optimizer::make_constant_class(ctx, livebox, cls, true);
-                }
+                let raw_ref = frontend_boxes[i];
+                let cls = cls_fn(raw_ref);
+                super::optimizer::Optimizer::make_constant_class(ctx, livebox, cls, true);
             }
         }
     }

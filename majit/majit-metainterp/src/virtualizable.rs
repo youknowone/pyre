@@ -216,7 +216,7 @@ impl VirtualizableInfo {
         self.vable_token_descr = Some(Self::build_field_descr(
             &descr,
             self.token_offset,
-            8,
+            item_size_for_type(Type::Int),
             Type::Int,
             majit_ir::ArrayFlag::Unsigned,
         ));
@@ -236,6 +236,9 @@ impl VirtualizableInfo {
             })
             .collect();
         // virtualizable.py:73-74: self.array_field_descrs = [cpu.fielddescrof(VTYPE, name) ...]
+        // RPython uses DirectPointer only: field offset IS the pointer offset.
+        // EmbeddedArray (Rust-only): the actual pointer lives at field_offset + ptr_offset,
+        // so the descriptor offset must account for that to match GETFIELD_GC_R semantics.
         self._array_field_descrs = self
             .array_fields
             .iter()
@@ -244,8 +247,13 @@ impl VirtualizableInfo {
                     VableArrayStorage::DirectPointer => a.field_offset,
                     VableArrayStorage::EmbeddedArray { ptr_offset } => a.field_offset + ptr_offset,
                 };
-                // Array pointer field is Type::Ref → FLAG_POINTER
-                Self::build_field_descr(&descr, offset, 8, Type::Ref, majit_ir::ArrayFlag::Pointer)
+                Self::build_field_descr(
+                    &descr,
+                    offset,
+                    std::mem::size_of::<usize>(),
+                    Type::Ref,
+                    majit_ir::ArrayFlag::Pointer,
+                )
             })
             .collect();
         // virtualizable.py:81-82: self.static_field_by_descrs = {descr: i ...}
@@ -442,20 +450,20 @@ impl VirtualizableInfo {
         &self._array_field_descrs
     }
 
-    /// RPython equivalent: `vinfo.static_field_by_descrs[descr]`.
-    pub fn static_field_by_descr_offset(&self, offset: usize) -> Option<(usize, &VableFieldInfo)> {
-        self.static_fields
-            .iter()
-            .enumerate()
-            .find(|(_, field)| field.offset == offset)
+    /// virtualizable.py:81: vinfo.static_field_by_descrs[fielddescr]
+    /// Descriptor-identity lookup (O(1) via HashMap).
+    pub fn static_field_by_descr(&self, descr: &DescrRef) -> Option<usize> {
+        self.static_field_by_descrs
+            .get(&descr_identity(descr))
+            .copied()
     }
 
-    /// RPython equivalent: `vinfo.array_field_by_descrs[descr]`.
-    pub fn array_field_by_descr_offset(&self, offset: usize) -> Option<(usize, &VableArrayInfo)> {
-        self.array_fields
-            .iter()
-            .enumerate()
-            .find(|(_, field)| field.field_offset == offset)
+    /// virtualizable.py:83: vinfo.array_field_by_descrs[arrayfielddescr]
+    /// Descriptor-identity lookup (O(1) via HashMap).
+    pub fn array_field_by_descr(&self, descr: &DescrRef) -> Option<usize> {
+        self.array_field_by_descrs
+            .get(&descr_identity(descr))
+            .copied()
     }
 
     /// RPython parity surface: reset the virtualizable token to TOKEN_NONE.
@@ -514,12 +522,10 @@ impl VirtualizableInfo {
         }
     }
 
-    /// Get the index of a static field by its descriptor offset.
-    ///
-    /// RPython equivalent: `vinfo.static_field_by_descrs[descr]`
-    pub fn static_field_index(&self, offset: usize) -> Option<usize> {
-        self.static_field_by_descr_offset(offset)
-            .map(|(idx, _)| idx)
+    /// Get the index of a static field by byte offset (fallback path).
+    /// Prefer `static_field_by_descr()` for RPython parity.
+    pub fn static_field_index_by_offset(&self, offset: usize) -> Option<usize> {
+        self.static_fields.iter().position(|f| f.offset == offset)
     }
 
     /// Get the index of a static field by name.
@@ -527,12 +533,12 @@ impl VirtualizableInfo {
         self.static_fields.iter().position(|f| f.name == name)
     }
 
-    /// Get the index of an array field by its field offset.
-    ///
-    /// RPython equivalent: `vinfo.array_field_by_descrs[descr]`
-    pub fn array_field_index(&self, field_offset: usize) -> Option<usize> {
-        self.array_field_by_descr_offset(field_offset)
-            .map(|(idx, _)| idx)
+    /// Get the index of an array field by byte offset (fallback path).
+    /// Prefer `array_field_by_descr()` for RPython parity.
+    pub fn array_field_index_by_offset(&self, field_offset: usize) -> Option<usize> {
+        self.array_fields
+            .iter()
+            .position(|a| a.field_offset == field_offset)
     }
 
     /// Get the index of an array field by name.
@@ -1091,10 +1097,17 @@ unsafe fn read_virtualizable_array(
 }
 
 /// symbolic.py:get_array_token → itemsize = sizeof(ARRAY.OF).
-/// Returns the byte size of a single item for the given type.
+///
+/// Returns the byte size of a single item for the given JIT type, matching
+/// RPython's `llmemory.sizeof(ARRAY.OF)` / `ctypes.sizeof(...)` for
+/// standard types.
 pub fn item_size_for_type(ty: Type) -> usize {
     match ty {
-        Type::Int | Type::Ref | Type::Float => 8,
+        // symbolic.py:get_size → sizeof(Signed) / sizeof(Ptr)
+        Type::Int => std::mem::size_of::<i64>(),
+        Type::Ref => std::mem::size_of::<usize>(),
+        // symbolic.py:get_size → sizeof(Float) (C double)
+        Type::Float => std::mem::size_of::<f64>(),
         Type::Void => 0,
     }
 }
@@ -1312,10 +1325,10 @@ mod tests {
         info.add_field("y", Type::Int, 16);
         info.add_field("z", Type::Float, 24);
 
-        assert_eq!(info.static_field_index(8), Some(0));
-        assert_eq!(info.static_field_index(16), Some(1));
-        assert_eq!(info.static_field_index(24), Some(2));
-        assert_eq!(info.static_field_index(999), None);
+        assert_eq!(info.static_field_index_by_offset(8), Some(0));
+        assert_eq!(info.static_field_index_by_offset(16), Some(1));
+        assert_eq!(info.static_field_index_by_offset(24), Some(2));
+        assert_eq!(info.static_field_index_by_offset(999), None);
     }
 
     #[test]
@@ -1324,9 +1337,9 @@ mod tests {
         test_add_array_field(&mut info, "locals", Type::Ref, 32, 0, 0);
         test_add_array_field(&mut info, "stack", Type::Int, 40, 0, 0);
 
-        assert_eq!(info.array_field_index(32), Some(0));
-        assert_eq!(info.array_field_index(40), Some(1));
-        assert_eq!(info.array_field_index(999), None);
+        assert_eq!(info.array_field_index_by_offset(32), Some(0));
+        assert_eq!(info.array_field_index_by_offset(40), Some(1));
+        assert_eq!(info.array_field_index_by_offset(999), None);
     }
 
     #[test]
