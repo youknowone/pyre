@@ -2985,8 +2985,64 @@ impl RegAlloc {
         self.perform(i, arglocs, result_loc, output);
     }
 
+    /// llsupport/regalloc.py:894 locs_for_call_assembler parity.
+    /// RPython syncs args to stack, then before_call spills everything.
+    /// We force-sync register args to frame first via _sync_var_to_stack,
+    /// then before_call spills remaining. arglocs after before_call are
+    /// all Frame or Immed — no register-clobber issues during calloc.
     fn consider_call_assembler(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
-        self.consider_raw_call_like(op, i, output, SAVE_ALL_REGS);
+        // llsupport/regalloc.py:897: self.rm._sync_var_to_stack(op.getarg(k))
+        // Force all register-held args to frame before before_call.
+        for &arg in &op.args {
+            if arg.is_constant() {
+                continue;
+            }
+            let tp = self.tp(arg);
+            if tp == Type::Float {
+                self.xrm
+                    ._sync_var_to_stack(arg, tp, &mut self.longevity, &mut self.fm);
+            } else {
+                self.rm
+                    ._sync_var_to_stack(arg, tp, &mut self.longevity, &mut self.fm);
+            }
+        }
+
+        self.rm.before_call(
+            &[],
+            SAVE_ALL_REGS,
+            &mut self.longevity,
+            &mut self.fm,
+            &mut self.pending_moves,
+            &self.value_types,
+        );
+        self.xrm.before_call(
+            &[],
+            SAVE_ALL_REGS,
+            &mut self.longevity,
+            &mut self.fm,
+            &mut self.pending_moves,
+            &self.value_types,
+        );
+
+        // After before_call, all args are in Frame or Const — safe for calloc.
+        let mut arglocs: Vec<Loc> = Vec::new();
+        for &arg in &op.args {
+            let tp = self.tp(arg);
+            arglocs.push(self.loc(arg, tp));
+        }
+
+        let result_tp = op.opcode.result_type();
+        let result_loc = if result_tp != Type::Void {
+            let r = if result_tp == Type::Float {
+                self.xrm.after_call(op.pos, &mut self.longevity)
+            } else {
+                self.rm.after_call(op.pos, &mut self.longevity)
+            };
+            Some(Loc::Reg(r))
+        } else {
+            None
+        };
+        self.perform(i, arglocs, result_loc, output);
     }
 
     fn consider_raw_call_like(

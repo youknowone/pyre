@@ -243,7 +243,7 @@ fn invert_cc(cc: u8) -> u8 {
 /// not a long-lived object like RPython's.
 pub struct Assembler386 {
     /// The dynasm assembler (rx86.py + codebuf.py combined).
-    mc: Assembler,
+    pub(crate) mc: Assembler,
     /// assembler.py:83 pending_guard_tokens — guards awaiting recovery stubs.
     pending_guard_tokens: Vec<GuardToken>,
     /// Frame depth (in WORD units) for the current trace.
@@ -426,7 +426,7 @@ impl Assembler386 {
 
     /// assembler.py:1145 regalloc_mov(from_loc, to_loc).
     /// Emit a move between any two locations: reg↔reg, reg↔frame, imm→reg, imm→frame.
-    fn regalloc_mov(&mut self, src: &Loc, dst: &Loc) {
+    pub(crate) fn regalloc_mov(&mut self, src: &Loc, dst: &Loc) {
         match (src, dst) {
             (Loc::Reg(s), Loc::Reg(d)) if s == d => {}
             (Loc::Reg(s), Loc::Reg(d)) => {
@@ -1014,6 +1014,30 @@ impl Assembler386 {
                 #[cfg(target_arch = "aarch64")]
                 self.emit_mov_imm64(0, val);
             }
+        }
+    }
+
+    /// Emit: load a regalloc Loc into RAX (x64) / X0 (aarch64).
+    /// Unlike load_arg_to_rax, this uses the regalloc-determined location
+    /// instead of resolve_opref(), so register-carried values are preserved.
+    fn emit_load_to_rax(&mut self, loc: Loc) {
+        let rax = Loc::Reg(crate::regloc::RegLoc {
+            value: 0,
+            is_xmm: false,
+        });
+        match loc {
+            Loc::Reg(r) if r.value == 0 && !r.is_xmm => {
+                // already in rax/x0
+            }
+            Loc::Immed(imm) => {
+                #[cfg(target_arch = "x86_64")]
+                dynasm!(self.mc ; .arch x64
+                    ; mov rax, QWORD imm.value as i64
+                );
+                #[cfg(target_arch = "aarch64")]
+                self.emit_mov_imm64(0, imm.value);
+            }
+            _ => self.regalloc_mov(&loc, &rax),
         }
     }
 
@@ -2028,7 +2052,7 @@ impl Assembler386 {
                     }
                 }
             }
-            // ── Memory stores: setfield pattern ──
+            // ── Memory stores: opassembler.rs emit_op_setfield_regalloc ──
             OpCode::SetfieldGc | OpCode::SetfieldRaw => {
                 if let (Some(Loc::Reg(base)), Some(val_loc)) = (arglocs.first(), arglocs.get(1)) {
                     let ofs = op
@@ -2043,37 +2067,12 @@ impl Assembler386 {
                         .and_then(|d| d.as_field_descr())
                         .map(|fd| fd.field_size())
                         .unwrap_or(8);
-                    match val_loc {
-                        Loc::Reg(v) if v.is_xmm => {
-                            dynasm!(self.mc ; .arch x64 ; movsd [Rq(base.value) + ofs], Rx(v.value));
-                        }
-                        Loc::Reg(v) => match field_size {
-                            1 => {
-                                dynasm!(self.mc ; .arch x64 ; mov BYTE [Rq(base.value) + ofs], Rb(v.value));
-                            }
-                            2 => {
-                                dynasm!(self.mc ; .arch x64 ; mov WORD [Rq(base.value) + ofs], Rw(v.value));
-                            }
-                            4 => {
-                                dynasm!(self.mc ; .arch x64 ; mov DWORD [Rq(base.value) + ofs], Rd(v.value));
-                            }
-                            _ => {
-                                dynasm!(self.mc ; .arch x64 ; mov [Rq(base.value) + ofs], Rq(v.value));
-                            }
-                        },
-                        _ => {
-                            // val in frame/immed → move to scratch first
-                            let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-                            self.regalloc_mov(
-                                val_loc,
-                                &Loc::Reg(crate::regloc::X86_64_SCRATCH_REG),
-                            );
-                            dynasm!(self.mc ; .arch x64 ; mov [Rq(base.value) + ofs], Rq(scratch));
-                        }
-                    }
+                    self.emit_op_setfield_regalloc(base, val_loc, ofs, field_size);
+                } else {
+                    self.genop_discard_setfield(op);
                 }
             }
-            // ── GC load / raw load ──
+            // ── GC load / raw load: opassembler.rs emit_op_gcload_regalloc ──
             OpCode::GcLoadI
             | OpCode::GcLoadR
             | OpCode::GcLoadF
@@ -2082,42 +2081,16 @@ impl Assembler386 {
                 if let (Some(Loc::Reg(base)), Some(ofs_loc), Some(Loc::Reg(dst))) =
                     (arglocs.first(), arglocs.get(1), result_loc)
                 {
-                    match ofs_loc {
-                        Loc::Immed(i) => {
-                            let o = i.value as i32;
-                            if dst.is_xmm {
-                                dynasm!(self.mc ; .arch x64 ; movsd Rx(dst.value), [Rq(base.value) + o]);
-                            } else {
-                                dynasm!(self.mc ; .arch x64 ; mov Rq(dst.value), [Rq(base.value) + o]);
-                            }
-                        }
-                        Loc::Reg(ofs_r) => {
-                            if dst.is_xmm {
-                                dynasm!(self.mc ; .arch x64 ; movsd Rx(dst.value), [Rq(base.value) + Rq(ofs_r.value)]);
-                            } else {
-                                dynasm!(self.mc ; .arch x64 ; mov Rq(dst.value), [Rq(base.value) + Rq(ofs_r.value)]);
-                            }
-                        }
-                        _ => {}
-                    }
+                    self.emit_op_gcload_regalloc(base, ofs_loc, dst);
                 }
             }
-            // ── GC store / raw store ──
+            // ── GC store / raw store: opassembler.rs emit_op_gcstore_regalloc ──
             OpCode::GcStore | OpCode::RawStore => {
                 if arglocs.len() >= 3 {
                     if let (Some(Loc::Reg(base)), Some(Loc::Reg(val))) =
                         (arglocs.first(), arglocs.get(2))
                     {
-                        match &arglocs[1] {
-                            Loc::Immed(i) => {
-                                let o = i.value as i32;
-                                dynasm!(self.mc ; .arch x64 ; mov [Rq(base.value) + o], Rq(val.value));
-                            }
-                            Loc::Reg(ofs_r) => {
-                                dynasm!(self.mc ; .arch x64 ; mov [Rq(base.value) + Rq(ofs_r.value)], Rq(val.value));
-                            }
-                            _ => {}
-                        }
+                        self.emit_op_gcstore_regalloc(base, &arglocs[1], val);
                     }
                 }
             }
@@ -2317,7 +2290,7 @@ impl Assembler386 {
             | OpCode::CallAssemblerR
             | OpCode::CallAssemblerF
             | OpCode::CallAssemblerN => {
-                self.genop_call_assembler(op);
+                self.genop_call_assembler(op, arglocs);
             }
             OpCode::CondCallN => self.genop_discard_cond_call(op),
             OpCode::CondCallValueI | OpCode::CondCallValueR => {
@@ -5090,7 +5063,10 @@ impl Assembler386 {
     /// We use malloc for parity: the callee's frame-slot model needs
     /// frame_depth slots (not just num_args), and heap allocation avoids
     /// stack overflow on deep recursion.
-    fn genop_call_assembler(&mut self, op: &Op) {
+    /// assembler.py:295-360 call_assembler parity.
+    /// Uses regalloc-provided arglocs to load callee arguments instead of
+    /// resolve_opref(), which drops register-carried values to Const(0).
+    fn genop_call_assembler(&mut self, op: &Op, arglocs: &[Loc]) {
         let _descr = op.descr.as_ref().and_then(|d| d.as_call_descr());
 
         let num_args = op.args.len();
@@ -5102,14 +5078,19 @@ impl Assembler386 {
         let calloc_ptr = libc::calloc as *const () as i64;
         let free_ptr = libc::free as *const () as i64;
 
-        // Save caller's jf_ptr before clobbering rbp/x29.
+        // Save callee-saved regs used as scratch by this sequence.
+        // genop_call_assembler uses x19 (caller jf_ptr) and x20 (callee jf_ptr)
+        // across calloc/call/free. These are callee-saved by ABI and saved
+        // in _call_header, but the regalloc may have assigned them to
+        // live variables. Push/pop to preserve the outer state.
         #[cfg(target_arch = "x86_64")]
         dynasm!(self.mc ; .arch x64
             ; mov r12, rbp            // save caller's jf_ptr in r12
         );
         #[cfg(target_arch = "aarch64")]
         dynasm!(self.mc ; .arch aarch64
-            ; mov x19, x29            // save caller's jf_ptr
+            ; stp x19, x20, [sp, #-16]!  // save x19/x20 on stack
+            ; mov x19, x29               // x19 = caller's jf_ptr
         );
 
         // Allocate callee jitframe on heap via calloc.
@@ -5160,9 +5141,11 @@ impl Assembler386 {
         }
 
         // Store callee args at jf_frame[i].
-        for (i, &arg_ref) in op.args.iter().enumerate() {
+        // arglocs are all Frame/Immed (regalloc synced to stack).
+        for (i, loc) in arglocs.iter().enumerate() {
             let dest_offset = (FIRST_ITEM_OFFSET + i * 8) as i32;
-            self.load_arg_to_rax(arg_ref); // reads from [rbp+...], doesn't clobber rdx
+            // Load value from the regalloc-determined location into rax/x0.
+            self.emit_load_to_rax(*loc);
             #[cfg(target_arch = "x86_64")]
             dynasm!(self.mc ; .arch x64
                 ; mov [rdx + dest_offset], rax
@@ -5410,10 +5393,16 @@ impl Assembler386 {
             }
         } // end if is_resolved
 
-        // Store result to the output slot.
+        // Store result to the output slot (rax/x0 holds result).
         if !op.pos.is_none() {
             self.store_rax_to_result(op.pos);
         }
+
+        // Restore callee-saved regs clobbered by this sequence.
+        #[cfg(target_arch = "aarch64")]
+        dynasm!(self.mc ; .arch aarch64
+            ; ldp x19, x20, [sp], #16    // restore x19/x20
+        );
     }
 
     // ----------------------------------------------------------------

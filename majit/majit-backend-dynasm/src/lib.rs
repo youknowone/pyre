@@ -10,6 +10,7 @@
 ///   callbuilder.py → callbuilder.rs (FFI call ABI)
 ///   codebuf.py → codebuf.rs (code buffer management)
 ///   jump.py    → jump.rs    (frame layout remapping)
+///   opassembler.py → opassembler.rs (arch-specific emit_op_*)
 ///
 /// guard.rs and frame.rs are from compile.py / jitframe.py.
 pub mod arch;
@@ -21,6 +22,7 @@ pub mod gcmap;
 pub mod guard;
 pub mod jitframe;
 pub mod jump;
+pub mod opassembler;
 pub mod regalloc;
 pub mod regloc;
 pub mod runner;
