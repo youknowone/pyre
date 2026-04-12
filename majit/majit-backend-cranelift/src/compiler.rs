@@ -8002,17 +8002,21 @@ impl CraneliftBackend {
 
                 // ── GC allocation calls ──
                 OpCode::CallMallocNursery => {
-                    // DEBUG: count inline attempts per compilation
-                    // x86/assembler.py:2567 malloc_cond parity: inline nursery
-                    // bump alloc for loop traces. Bridge traces use the host
-                    // call path — bridge compilation has a different ref-root
-                    // layout that interacts poorly with the inline fast/slow
-                    // block structure (Cranelift SSA Variable resolution issue
-                    // when inline blocks are combined with bridge guard setup).
-                    let use_inline = !is_bridge && gc_runtime_id.is_some();
+                    // x86/assembler.py:2556-2565 malloc_cond parity.
+                    // RPython: inline nursery bump alloc for BOTH loops and
+                    // bridges — there is no loop-vs-bridge distinction.
+                    // The x86 slow path (_build_malloc_slowpath) does
+                    // _push_all_regs_to_frame / _pop_all_regs_from_frame,
+                    // so the caller never sees register changes.
+                    //
+                    // Cranelift equivalent: spill ref roots BEFORE brif,
+                    // reload AFTER merge. No SSA variable redefinitions
+                    // inside fast_block or slow_block — avoids phi issues.
+                    let use_inline = gc_runtime_id.is_some();
 
                     if use_inline {
-                        // x86/assembler.py:2567 inline nursery bump alloc
+                        // x86/assembler.py:2556-2565 malloc_cond parity:
+                        // inline nursery bump alloc for both loops and bridges.
                         let (nf_addr, nt_addr) = majit_gc::nursery::nursery_global_addrs();
                         let flags = MemFlags::trusted();
                         let size_imm = resolve_rewriter_immediate_i64(&constants, op.arg(0));
@@ -8026,6 +8030,20 @@ impl CraneliftBackend {
                             builder
                                 .ins()
                                 .icmp(IntCC::UnsignedLessThanOrEqual, new_free, top);
+
+                        // _push_all_regs_to_frame parity: spill ref roots
+                        // before the branch so both paths have consistent
+                        // jf_frame contents. The fast path wastes one spill
+                        // but avoids SSA variable splits across blocks.
+                        spill_ref_roots(
+                            &mut builder,
+                            jf_ptr,
+                            &ref_root_slots,
+                            &defined_ref_vars,
+                            ref_root_base_ofs,
+                        );
+                        emit_push_gcmap(&mut builder, jf_ptr, per_call_gcmap);
+
                         let fast_block = builder.create_block();
                         let slow_block = builder.create_block();
                         let merge_block = builder.create_block();
@@ -8042,43 +8060,44 @@ impl CraneliftBackend {
                         let obj = builder.ins().iadd(free, hdr_sz);
                         builder.ins().jump(merge_block, &[BlockArg::from(obj)]);
 
-                        // slow: host call, may trigger GC
+                        // slow: host call (malloc_slowpath), may trigger GC.
+                        // Refs already spilled and gcmap pushed above.
                         builder.switch_to_block(slow_block);
                         builder.seal_block(slow_block);
                         builder.set_cold_block(slow_block);
                         let rid = gc_runtime_id.ok_or_else(|| missing_gc_runtime(op.opcode))?;
                         let rid_v = builder.ins().iconst(cl_types::I64, rid as i64);
                         let ps = builder.ins().iadd_imm(size_total, -(GcHeader::SIZE as i64));
-                        let slow_r = emit_collecting_gc_call(
+                        let slow_r = emit_host_call(
                             &mut builder,
                             ptr_type,
                             call_conv,
-                            jf_ptr,
-                            &ref_root_slots,
-                            &defined_ref_vars,
-                            ref_root_base_ofs,
-                            per_call_gcmap,
-                            rid_v,
                             gc_alloc_nursery_shim as *const () as usize,
-                            &[ps],
+                            &[rid_v, ps],
                             Some(cl_types::I64),
                         )
                         .expect("alloc");
                         builder.ins().jump(merge_block, &[BlockArg::from(slow_r)]);
 
+                        // _pop_all_regs_from_frame parity: reload jf_ptr,
+                        // pop gcmap, reload ref roots after merge.
                         builder.switch_to_block(merge_block);
                         builder.seal_block(merge_block);
                         let result = builder.block_params(merge_block)[0];
-                        // Always reload jf_ptr from shadow stack after merge.
-                        // Do NOT use block params for jf_ptr — deep phi chains
-                        // across multiple inline allocs + CallAssemblerR blocks
-                        // cause Cranelift SSA corruption.
                         jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                        emit_pop_gcmap(&mut builder, jf_ptr, per_call_gcmap);
+                        reload_ref_roots(
+                            &mut builder,
+                            jf_ptr,
+                            &ref_root_slots,
+                            &defined_ref_vars,
+                            ref_root_base_ofs,
+                        );
                         outputs_ptr = jf_ptr;
                         builder.def_var(jf_ptr_var, jf_ptr);
                         builder.def_var(var(vi), result);
                     } else {
-                        // host call fallback
+                        // no GC runtime — host call fallback (test-only path)
                         let runtime_id =
                             gc_runtime_id.ok_or_else(|| missing_gc_runtime(op.opcode))?;
                         let runtime_id = builder.ins().iconst(cl_types::I64, runtime_id as i64);
