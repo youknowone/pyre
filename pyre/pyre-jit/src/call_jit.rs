@@ -27,32 +27,6 @@ thread_local! {
         const { UnsafeCell::new(None) };
     static SELF_RECURSIVE_DISPATCH_CACHE: UnsafeCell<Option<(u64, FinishProtocol, Option<u64>)>> =
         const { UnsafeCell::new(None) };
-    /// Stash Python exceptions from blackhole/force paths that cross
-    /// FFI boundaries (compiled code → callback → exception).
-    static LAST_CA_EXCEPTION: std::cell::RefCell<Option<pyre_interpreter::error::PyError>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-/// Take stashed exception from blackhole/force FFI paths.
-pub fn take_ca_exception() -> Option<pyre_interpreter::error::PyError> {
-    LAST_CA_EXCEPTION.with(|c| c.borrow_mut().take())
-}
-
-/// warmspot.py:998 parity: retrieve stashed exception and raise.
-/// RPython's assembler_call_helper re-raises the exception, which
-/// RPython's C convention stores in exception TLS. The compiled code's
-/// GUARD_NO_EXCEPTION (checking JIT_EXC_VALUE) fires on the next guard.
-/// Returns Some(0) when exception was stashed, None if no stashed exception.
-fn take_ca_exception_for_backend() -> Option<i64> {
-    let exc = take_ca_exception()?;
-    let exc_obj = exc.exc_object;
-    if exc_obj != pyre_object::PY_NULL {
-        // warmspot.py:998 raise value → sets JIT_EXC_VALUE so
-        // GUARD_NO_EXCEPTION fires in compiled code.
-        #[cfg(feature = "cranelift")]
-        majit_backend_cranelift::jit_exc_raise(exc_obj as i64);
-    }
-    Some(0)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1762,10 +1736,6 @@ pub fn install_jit_call_bridge() {
                 jit_blackhole_resume_from_guard,
             );
             majit_backend_cranelift::register_inline_frame_arena(arena_global_info());
-            majit_backend_cranelift::register_call_assembler_unbox_int(unbox_int_for_force);
-            majit_backend_cranelift::register_call_assembler_take_exception(
-                take_ca_exception_for_backend,
-            );
         }
         #[cfg(feature = "dynasm")]
         {
@@ -1773,10 +1743,6 @@ pub fn install_jit_call_bridge() {
             majit_backend_dynasm::register_call_assembler_bridge(jit_ca_handle_guard_failure);
             majit_backend_dynasm::register_call_assembler_blackhole(
                 jit_blackhole_resume_from_guard,
-            );
-            majit_backend_dynasm::register_call_assembler_unbox_int(unbox_int_for_force);
-            majit_backend_dynasm::register_call_assembler_take_exception(
-                take_ca_exception_for_backend,
             );
         }
         majit_metainterp::set_ref_unbox_int_fn(unbox_int_for_force);
@@ -1862,7 +1828,7 @@ fn jit_blackhole_resume_from_guard(
             rd_virtuals_ref,
             deadframe_types.as_deref(),
         );
-        return handle_blackhole_result(result, fail_values);
+        return handle_blackhole_result(result, fail_values, actual_green_key);
     }
 
     // RPython: every guard has rd_numb from capture_resumedata +
@@ -2088,11 +2054,21 @@ pub fn blackhole_resume_via_rd_numb(
     }
 }
 
-/// warmspot.py:985-1007 handle_jitexception parity.
+/// warmspot.py:961-1007 handle_jitexception parity.
 ///
-/// Dispatches on typed BlackholeResult variants. Each DoneWithThisFrame*
-/// carries the value in its native type — no boxing/unboxing heuristic.
-fn handle_blackhole_result(bh_result: BlackholeResult, fail_values: &[i64]) -> Option<i64> {
+/// RPython's handle_jitexception is a closure capturing result_kind
+/// (warmspot.py:913). It returns typed values matching the portal's
+/// return type. In pyre, the portal always returns PyObjectRef (Ref),
+/// but CALL_ASSEMBLER may expect Int (when the trace optimizer unboxed
+/// the return value). normalize_direct_finish_result handles this
+/// pyre-specific mismatch — RPython doesn't need it because
+/// result_kind always matches CALL_ASSEMBLER's op.type.
+fn handle_blackhole_result(
+    bh_result: BlackholeResult,
+    fail_values: &[i64],
+    green_key: u64,
+) -> Option<i64> {
+    let protocol = finish_protocol(green_key);
     match bh_result {
         // warmspot.py:985-987: DoneWithThisFrameVoid → return None
         BlackholeResult::DoneWithThisFrameVoid => {
@@ -2113,7 +2089,7 @@ fn handle_blackhole_result(bh_result: BlackholeResult, fail_values: &[i64]) -> O
             if majit_metainterp::majit_log_enabled() {
                 eprintln!("[blackhole-resume] DoneWithThisFrameRef({:?})", r);
             }
-            Some(r as i64)
+            Some(normalize_direct_finish_result(protocol, r as i64))
         }
         // warmspot.py:994-996: DoneWithThisFrameFloat → return e.result
         BlackholeResult::DoneWithThisFrameFloat(f) => {
@@ -2122,20 +2098,27 @@ fn handle_blackhole_result(bh_result: BlackholeResult, fail_values: &[i64]) -> O
             }
             Some(f.to_bits() as i64)
         }
-        // warmspot.py:998-1005: ExitFrameWithExceptionRef → raise.
-        // RPython raises here; pyre stashes in TLS so the callback
-        // caller can retrieve it instead of re-executing via force_fn.
+        // warmspot.py:998-1005: ExitFrameWithExceptionRef → raise value.
+        // RPython: raise value → C compiler → set rpy_exc_info + return garbage.
+        // Pyre: jit_exc_raise sets JIT_EXC_VALUE, GUARD_NO_EXCEPTION fires.
         BlackholeResult::ExitFrameWithExceptionRef(err) => {
             if majit_metainterp::majit_log_enabled() {
-                eprintln!("[blackhole-resume] ExitFrameWithExceptionRef → stash");
+                eprintln!("[blackhole-resume] ExitFrameWithExceptionRef → raise");
             }
-            LAST_CA_EXCEPTION.with(|c| *c.borrow_mut() = Some(err));
-            None
+            let exc_obj = err.exc_object;
+            if exc_obj != pyre_object::PY_NULL {
+                #[cfg(feature = "cranelift")]
+                majit_backend_cranelift::jit_exc_raise(exc_obj as i64);
+            }
+            Some(0) // garbage return — GUARD_NO_EXCEPTION will fire
         }
         // warmspot.py:970-983: ContinueRunningNormally → call portal_ptr(*args).
-        // RPython calls the typed portal function directly; pyre calls
-        // eval_frame_plain which returns PyObjectRef. The result must be
-        // returned as raw i64 for the compiled CALL_ASSEMBLER caller.
+        // warmspot.py:981-982: if result_kind != 'void': result = unspecialize_value(result)
+        // RPython handle_jitexception captures result_kind in closure;
+        // unspecialize_value casts portal result to {Signed, GCREF, FLOATSTORAGE}.
+        // pyre portal returns PyObjectRef. unspecialize_value(PyObjectRef) = GCREF
+        // (identity). The compiled CALL_ASSEMBLER merge point may expect a
+        // different type (e.g. raw int for _I), so apply normalize here.
         BlackholeResult::ContinueRunningNormally => {
             let callee_frame_ptr = fail_values[0] as *mut PyFrame;
             if callee_frame_ptr.is_null() {
@@ -2150,11 +2133,17 @@ fn handle_blackhole_result(bh_result: BlackholeResult, fail_values: &[i64]) -> O
             }
             let _plain_guard = pyre_interpreter::call::force_plain_eval();
             match pyre_interpreter::eval::eval_frame_plain(callee_frame) {
-                Ok(result) => Some(result as i64),
+                // warmspot.py:982: return unspecialize_value(result)
+                Ok(result) => Some(normalize_direct_finish_result(protocol, result as i64)),
                 Err(err) => {
-                    // warmspot.py:979 parity: portal raises → propagate.
-                    LAST_CA_EXCEPTION.with(|c| *c.borrow_mut() = Some(err));
-                    None
+                    // Regular exception from portal_ptr (not JitException).
+                    // RPython: propagates as C-level exception (rpy_exc_info).
+                    let exc_obj = err.exc_object;
+                    if exc_obj != pyre_object::PY_NULL {
+                        #[cfg(feature = "cranelift")]
+                        majit_backend_cranelift::jit_exc_raise(exc_obj as i64);
+                    }
+                    Some(0) // garbage return — GUARD_NO_EXCEPTION will fire
                 }
             }
         }

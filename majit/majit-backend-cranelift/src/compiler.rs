@@ -1458,14 +1458,6 @@ static CALL_ASSEMBLER_FORCE_FN: OnceLock<extern "C" fn(i64) -> i64> = OnceLock::
 /// and executes the remaining IR ops from the guard point to Finish.
 /// bh_fn(green_key, trace_id, fail_index, rebuilt_values, num_rebuilt, raw_deadframe, num_raw)
 /// Unbox a Ref (boxed int pointer) to a raw i64 int value.
-/// Used by call_assembler_guard_failure's FALLBACK path when the
-/// first local is a Ref type (boxed int) instead of raw Int.
-static CALL_ASSEMBLER_UNBOX_INT_FN: OnceLock<fn(i64) -> i64> = OnceLock::new();
-
-/// warmspot.py:998 parity: take stashed exception from blackhole FFI path.
-/// Returns Some(result_sentinel) when exception is stashed, None otherwise.
-static CALL_ASSEMBLER_TAKE_EXCEPTION_FN: OnceLock<fn() -> Option<i64>> = OnceLock::new();
-
 static CALL_ASSEMBLER_BLACKHOLE_FN: OnceLock<
     fn(u64, u64, u32, *const i64, usize, *const i64, usize) -> Option<i64>,
 > = OnceLock::new();
@@ -1709,16 +1701,6 @@ pub fn register_call_assembler_force(f: extern "C" fn(i64) -> i64) {
 ///
 /// This is used by jit_force_callee_frame to avoid the eval_with_jit →
 /// try_function_entry_jit → run_compiled → execute_token indirection chain.
-/// Register an unbox-int callback for CALL_ASSEMBLER's FALLBACK path.
-pub fn register_call_assembler_unbox_int(f: fn(i64) -> i64) {
-    let _ = CALL_ASSEMBLER_UNBOX_INT_FN.set(f);
-}
-
-/// Register exception-take callback for blackhole FFI exception stash.
-pub fn register_call_assembler_take_exception(f: fn() -> Option<i64>) {
-    let _ = CALL_ASSEMBLER_TAKE_EXCEPTION_FN.set(f);
-}
-
 pub fn execute_call_assembler_direct(
     token_number: u64,
     inputs: &[i64],
@@ -2516,22 +2498,13 @@ fn call_assembler_guard_failure_inner(
             outputs_ptr,
             raw_num,
         ) {
-            // pyre: blackhole always returns DoneWithThisFrameRef (Python
-            // functions return PyObjectRef). CALL_ASSEMBLER_I expects raw
-            // int. Apply unbox_int_for_force — same conversion as the
-            // compiled fast path's _call_assembler_load_result.
-            // RPython: unnecessary because _return_type='i' produces
-            // DoneWithThisFrameInt directly.
-            if let Some(unbox_fn) = CALL_ASSEMBLER_UNBOX_INT_FN.get() {
-                return unbox_fn(result);
-            }
+            // warmspot.py:988-996: DoneWithThisFrame{Int,Ref,Float} returns
+            // e.result as-is. warmspot.py:982: ContinueRunningNormally
+            // applies unspecialize_value (identity for GCREF portal).
+            // warmspot.py:998: ExitFrameWithExceptionRef sets JIT_EXC_VALUE
+            // inside handle_blackhole_result; value here is garbage.
+            // No backend-side conversion — handle_jitexception handles all types.
             return result;
-        }
-        // warmspot.py:998 parity: blackhole stashed exception → skip force_fn
-        if let Some(exc_fn) = CALL_ASSEMBLER_TAKE_EXCEPTION_FN.get() {
-            if let Some(exc_result) = exc_fn() {
-                return exc_result;
-            }
         }
     }
     // Fallback: force_fn re-executes the callee from scratch.
@@ -2539,24 +2512,7 @@ fn call_assembler_guard_failure_inner(
     let first_local_idx = target.num_scalar_inputargs;
     if !inputs_ptr.is_null() && target.inputarg_types.len() > first_local_idx {
         let raw = unsafe { *inputs_ptr.add(first_local_idx) };
-        // The fail_args type at first_local_idx may be Ref (boxed int
-        // from the unoptimized trace). jit_force_self_recursive_call_raw_1
-        // expects a RAW int. Unbox if needed.
-        let unboxed = if target.inputarg_types.get(first_local_idx).copied() == Some(Type::Ref) {
-            let obj_ptr = raw as usize as *const u8;
-            if !obj_ptr.is_null() {
-                if let Some(unbox_fn) = CALL_ASSEMBLER_UNBOX_INT_FN.get() {
-                    unbox_fn(raw)
-                } else {
-                    raw
-                }
-            } else {
-                raw
-            }
-        } else {
-            raw
-        };
-        PENDING_FORCE_LOCAL0.with(|c| c.set(Some(unboxed)));
+        PENDING_FORCE_LOCAL0.with(|c| c.set(Some(raw)));
     }
     let result = CALL_ASSEMBLER_FORCE_FN.get().map_or(0, |f| f(frame_ptr));
     result
@@ -2704,23 +2660,9 @@ fn call_assembler_fast_path_heap(
                 *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
                 *outcome.add(1) = 0;
             }
-            // warmspot.py:982 unspecialize_value parity
-            let result = if let Some(unbox_fn) = CALL_ASSEMBLER_UNBOX_INT_FN.get() {
-                unbox_fn(result)
-            } else {
-                result
-            };
+            // warmspot.py:988-996: DoneWithThisFrame* returns typed result as-is.
+            // warmspot.py:998: exception already raised via jit_exc_raise.
             return result as u64;
-        }
-        // warmspot.py:998 parity: blackhole stashed exception → skip force_fn
-        if let Some(exc_fn) = CALL_ASSEMBLER_TAKE_EXCEPTION_FN.get() {
-            if let Some(exc_result) = exc_fn() {
-                unsafe {
-                    *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
-                    *outcome.add(1) = 0;
-                }
-                return exc_result as u64;
-            }
         }
     }
 
@@ -2835,23 +2777,8 @@ fn call_assembler_shim_inner(
                 *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
                 *outcome.add(1) = 0;
             }
-            // warmspot.py:982 unspecialize_value parity
-            let result = if let Some(unbox_fn) = CALL_ASSEMBLER_UNBOX_INT_FN.get() {
-                unbox_fn(result)
-            } else {
-                result
-            };
+            // warmspot.py:988-996: typed result as-is.
             return result as u64;
-        }
-        // warmspot.py:998 parity: blackhole stashed exception → skip force_fn
-        if let Some(exc_fn) = CALL_ASSEMBLER_TAKE_EXCEPTION_FN.get() {
-            if let Some(exc_result) = exc_fn() {
-                unsafe {
-                    *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
-                    *outcome.add(1) = 0;
-                }
-                return exc_result as u64;
-            }
         }
     }
     // Fallback: force_fn re-executes from scratch.
