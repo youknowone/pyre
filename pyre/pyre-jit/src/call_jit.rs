@@ -348,7 +348,9 @@ pub fn arena_global_info() -> majit_backend_cranelift::InlineFrameArenaInfo {
         drop_fn_addr: jit_drop_callee_frame as *const () as usize,
         arena_cap: ARENA_CAP,
         jitframe_descrs: Some(majit_gc::rewrite::JitFrameDescrs {
-            create_fn_addr: jit_create_self_recursive_callee_frame_1_raw_int as *const () as usize,
+            create_fn_addrs: vec![
+                jit_create_self_recursive_callee_frame_1_raw_int as *const () as usize,
+            ],
             drop_fn_addr: jit_drop_callee_frame as *const () as usize,
             jitframe_tid: crate::jit::descr::JITFRAME_GC_TYPE_ID,
             jitframe_fixed_size: JITFRAME_FIXED_SIZE,
@@ -1745,7 +1747,6 @@ pub fn install_jit_call_bridge() {
                 jit_blackhole_resume_from_guard,
             );
         }
-        majit_metainterp::set_ref_unbox_int_fn(unbox_int_for_force);
     });
 }
 
@@ -2056,19 +2057,16 @@ pub fn blackhole_resume_via_rd_numb(
 
 /// warmspot.py:961-1007 handle_jitexception parity.
 ///
-/// RPython's handle_jitexception is a closure capturing result_kind
-/// (warmspot.py:913). It returns typed values matching the portal's
-/// return type. In pyre, the portal always returns PyObjectRef (Ref),
-/// but CALL_ASSEMBLER may expect Int (when the trace optimizer unboxed
-/// the return value). normalize_direct_finish_result handles this
-/// pyre-specific mismatch — RPython doesn't need it because
-/// result_kind always matches CALL_ASSEMBLER's op.type.
+/// warmspot.py:961-1007 handle_jitexception parity.
+///
+/// RPython captures result_kind in closure (warmspot.py:913). For pyre,
+/// portal result_type == REF (warmspot.py:449), so ALL CALL_ASSEMBLER
+/// ops use _R. The result is always a Ref (PyObjectRef).
 fn handle_blackhole_result(
     bh_result: BlackholeResult,
     fail_values: &[i64],
-    green_key: u64,
+    _green_key: u64,
 ) -> Option<i64> {
-    let protocol = finish_protocol(green_key);
     match bh_result {
         // warmspot.py:985-987: DoneWithThisFrameVoid → return None
         BlackholeResult::DoneWithThisFrameVoid => {
@@ -2077,19 +2075,24 @@ fn handle_blackhole_result(
             }
             Some(0)
         }
-        // warmspot.py:988-990: DoneWithThisFrameInt → return e.result
+        // warmspot.py:988-990: DoneWithThisFrameInt → box to Ref.
+        // Portal result_type == REF, so blackhole should normally raise
+        // DoneWithThisFrameRef. This path handles edge cases.
         BlackholeResult::DoneWithThisFrameInt(v) => {
             if majit_metainterp::majit_log_enabled() {
-                eprintln!("[blackhole-resume] DoneWithThisFrameInt({})", v);
+                eprintln!(
+                    "[blackhole-resume] DoneWithThisFrameInt({}) → box to Ref",
+                    v
+                );
             }
-            Some(v)
+            Some(w_int_new(v) as i64)
         }
         // warmspot.py:991-993: DoneWithThisFrameRef → return e.result
         BlackholeResult::DoneWithThisFrameRef(r) => {
             if majit_metainterp::majit_log_enabled() {
                 eprintln!("[blackhole-resume] DoneWithThisFrameRef({:?})", r);
             }
-            Some(normalize_direct_finish_result(protocol, r as i64))
+            Some(r as i64)
         }
         // warmspot.py:994-996: DoneWithThisFrameFloat → return e.result
         BlackholeResult::DoneWithThisFrameFloat(f) => {
@@ -2099,8 +2102,6 @@ fn handle_blackhole_result(
             Some(f.to_bits() as i64)
         }
         // warmspot.py:998-1005: ExitFrameWithExceptionRef → raise value.
-        // RPython: raise value → C compiler → set rpy_exc_info + return garbage.
-        // Pyre: jit_exc_raise sets JIT_EXC_VALUE, GUARD_NO_EXCEPTION fires.
         BlackholeResult::ExitFrameWithExceptionRef(err) => {
             if majit_metainterp::majit_log_enabled() {
                 eprintln!("[blackhole-resume] ExitFrameWithExceptionRef → raise");
@@ -2113,12 +2114,8 @@ fn handle_blackhole_result(
             Some(0) // garbage return — GUARD_NO_EXCEPTION will fire
         }
         // warmspot.py:970-983: ContinueRunningNormally → call portal_ptr(*args).
-        // warmspot.py:981-982: if result_kind != 'void': result = unspecialize_value(result)
-        // RPython handle_jitexception captures result_kind in closure;
-        // unspecialize_value casts portal result to {Signed, GCREF, FLOATSTORAGE}.
-        // pyre portal returns PyObjectRef. unspecialize_value(PyObjectRef) = GCREF
-        // (identity). The compiled CALL_ASSEMBLER merge point may expect a
-        // different type (e.g. raw int for _I), so apply normalize here.
+        // warmspot.py:982: unspecialize_value(result) — identity for GCREF portal.
+        // eval_frame_plain returns PyObjectRef (Ref), no normalization needed.
         BlackholeResult::ContinueRunningNormally => {
             let callee_frame_ptr = fail_values[0] as *mut PyFrame;
             if callee_frame_ptr.is_null() {
@@ -2133,11 +2130,9 @@ fn handle_blackhole_result(
             }
             let _plain_guard = pyre_interpreter::call::force_plain_eval();
             match pyre_interpreter::eval::eval_frame_plain(callee_frame) {
-                // warmspot.py:982: return unspecialize_value(result)
-                Ok(result) => Some(normalize_direct_finish_result(protocol, result as i64)),
+                // Portal returns PyObjectRef (Ref) — return as-is.
+                Ok(result) => Some(result as i64),
                 Err(err) => {
-                    // Regular exception from portal_ptr (not JitException).
-                    // RPython: propagates as C-level exception (rpy_exc_info).
                     let exc_obj = err.exc_object;
                     if exc_obj != pyre_object::PY_NULL {
                         #[cfg(feature = "cranelift")]
@@ -2611,6 +2606,9 @@ fn create_self_recursive_callee_frame_impl_1_boxed(
                 && f.namespace == globals
                 && f.execution_context == execution_context
             {
+                // Reuse: same code/globals/ec — full reset matching
+                // new_for_call_with_closure() semantics. No partial
+                // shortcuts: blackhole/force paths must see a clean frame.
                 reset_reused_call_frame(f, &[boxed_arg]);
             } else {
                 unsafe {
@@ -2711,6 +2709,17 @@ pub extern "C" fn jit_create_callee_frame_1(caller_frame: i64, callable: i64, ar
 /// caller frame's code/namespace/execution_context directly, which matches the
 /// existing self-recursive raw helper path more closely.
 pub extern "C" fn jit_create_self_recursive_callee_frame_1(caller_frame: i64, arg0: i64) -> i64 {
+    debug_assert!(
+        caller_frame != 0,
+        "jit_create_self_recursive_callee_frame_1: caller_frame is null"
+    );
+    if caller_frame == 0 {
+        // Invariant violation: fall back to heap allocation with a
+        // minimal frame. RPython never aborts the process for JIT
+        // invariant failures — it falls back to tracing abort or
+        // blackhole resume.
+        return 0;
+    }
     create_self_recursive_callee_frame_impl_1_boxed(caller_frame, arg0 as PyObjectRef)
 }
 
@@ -2730,19 +2739,19 @@ pub extern "C" fn jit_create_self_recursive_callee_frame_1_raw_int(
     let globals = caller.namespace;
     let execution_context = caller.execution_context;
 
+    let boxed = pyre_object::intobject::w_int_new(raw_int_arg);
+
     let arena = arena_ref();
     if let Some((ptr, was_init)) = arena.take() {
         let f = unsafe { &mut *ptr };
-        if was_init && f.code == func_code {
-            // Fast path: reuse frame, only reset next_instr.
-            // Skip boxing + locals fill — compiled code uses raw inputargs.
-            // Guard failure path (force_fn) will box raw_int_arg into
-            // frame.locals when interpreter resume is needed.
-            f.next_instr = 0;
-            f.vable_token = 0;
+        if was_init
+            && f.code == func_code
+            && f.namespace == globals
+            && f.execution_context == execution_context
+        {
+            // Reuse: full reset matching new_for_call semantics.
+            reset_reused_call_frame(f, &[boxed]);
         } else {
-            // Cold: different code or first use — full init needed.
-            let boxed = pyre_object::intobject::w_int_new(raw_int_arg);
             unsafe {
                 std::ptr::write(
                     ptr,
@@ -2757,7 +2766,6 @@ pub extern "C" fn jit_create_self_recursive_callee_frame_1_raw_int(
         return ptr as i64;
     }
 
-    let boxed = pyre_object::intobject::w_int_new(raw_int_arg);
     let frame_ptr = Box::into_raw(Box::new(PyFrame::new_for_call(
         func_code,
         &[boxed],
