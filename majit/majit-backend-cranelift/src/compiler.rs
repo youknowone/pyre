@@ -6488,21 +6488,25 @@ impl CraneliftBackend {
                 }
 
                 OpCode::GuardException => {
+                    // x86/assembler.py:1808-1815 genop_guard_guard_exception:
+                    //   MOV loc1, [pos_exception]
+                    //   CMP loc1, expected
+                    //   guard on E (equal)
+                    //   _store_and_reset_exception → resloc = [pos_exc_value];
+                    //     [pos_exception] = 0; [pos_exc_value] = 0
+                    // All inline loads/stores, no host calls.
                     let info = &guard_infos[guard_idx];
                     guard_idx += 1;
 
                     let expected_type = resolve_opref(&mut builder, &constants, op.arg(0));
-                    let is_match = emit_host_call(
-                        &mut builder,
-                        ptr_type,
-                        call_conv,
-                        jit_exc_type_matches as *const () as usize,
-                        &[expected_type],
-                        Some(cl_types::I64),
-                    )
-                    .expect("jit_exc_type_matches must return a value");
-                    let zero = builder.ins().iconst(cl_types::I64, 0);
-                    let mismatch = builder.ins().icmp(IntCC::Equal, is_match, zero);
+                    // Inline: load pos_exception (exc type)
+                    let exc_type_addr = builder.ins().iconst(ptr_type, jit_exc_type_addr() as i64);
+                    let exc_type =
+                        builder
+                            .ins()
+                            .load(cl_types::I64, MemFlags::trusted(), exc_type_addr, 0);
+                    // CMP exc_type, expected
+                    let mismatch = builder.ins().icmp(IntCC::NotEqual, exc_type, expected_type);
                     let exit_block = builder.create_block();
                     builder.set_cold_block(exit_block);
                     let cont_block = builder.create_block();
@@ -6521,15 +6525,22 @@ impl CraneliftBackend {
                     builder.switch_to_block(cont_block);
                     builder.seal_block(cont_block);
 
-                    let exc_val = emit_host_call(
-                        &mut builder,
-                        ptr_type,
-                        call_conv,
-                        jit_exc_clear_and_get_value as *const () as usize,
-                        &[],
-                        Some(cl_types::I64),
-                    )
-                    .expect("jit_exc_clear_and_get_value must return a value");
+                    // _store_and_reset_exception parity (inline):
+                    //   resloc = [pos_exc_value]
+                    //   [pos_exception] = 0
+                    //   [pos_exc_value] = 0
+                    let exc_val_addr = builder.ins().iconst(ptr_type, jit_exc_value_addr() as i64);
+                    let exc_val =
+                        builder
+                            .ins()
+                            .load(cl_types::I64, MemFlags::trusted(), exc_val_addr, 0);
+                    let zero = builder.ins().iconst(cl_types::I64, 0);
+                    builder
+                        .ins()
+                        .store(MemFlags::trusted(), zero, exc_type_addr, 0);
+                    builder
+                        .ins()
+                        .store(MemFlags::trusted(), zero, exc_val_addr, 0);
                     let vi = op_var_index(op, op_idx, inputargs.len());
                     builder.def_var(var(vi as u32), exc_val);
                 }
