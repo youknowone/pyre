@@ -377,9 +377,13 @@ impl __extend__ {
         _ec: *const PyExecutionContext,
     ) -> PyResult {
         frame.next_instr = next_instr;
-        match eval_loop_jit(frame) {
-            LoopResult::Done(result) => result,
-            LoopResult::ContinueRunningNormally => Ok(w_none()),
+        // interp_jit.py:83-99: dispatch() only exits on Yield/ExitFrame.
+        // ContinueRunningNormally restarts the loop (like portal_runner).
+        loop {
+            match eval_loop_jit(frame) {
+                LoopResult::Done(result) => return result,
+                LoopResult::ContinueRunningNormally => continue,
+            }
         }
     }
 
@@ -1090,17 +1094,6 @@ fn debug_first_arg_int(frame: &PyFrame) -> Option<i64> {
     Some(unsafe { pyre_object::intobject::w_int_get_value(value) })
 }
 
-/// JIT-enabled evaluation loop (PyPy interp_jit.py dispatch()).
-///
-/// Calls merge_point on EVERY iteration (PyPy line 85-87), not just
-/// when tracing. This matches PyPy's jit_merge_point placement.
-/// RPython interp_jit.py dispatch() parity.
-///
-/// The hot loop mirrors RPython's structure exactly:
-///   while True:
-///       jit_merge_point(...)      # thin inline check
-///       next_instr = handle_bytecode(...)
-///
 /// warmspot.py portal_runner parity: execute a frame through the JIT-enabled
 /// interpreter. Used by bhimpl_recursive_call (blackhole.py:1074-1093) for
 /// recursive portal depth. Returns PyObjectRef (NULL on void/exception).
@@ -1122,18 +1115,42 @@ fn trace_jit_bytecode(_pc: usize, _instruction_name: &str) {
     // Debug logging disabled — per-bytecode eprintln causes O(n) slowdown.
 }
 
-/// JIT hooks are thin inline checks; all heavy logic is in #[cold] helpers.
+/// Thin wrapper kept for call-site compatibility.
+/// Delegates to dispatch() (interp_jit.py:79-99).
 fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
+    dispatch(frame)
+}
+
+/// interp_jit.py:79-99 dispatch().
+///
+/// RPython:
+///   self = hint(self, access_directly=True)
+///   next_instr = r_uint(next_instr)
+///   is_being_profiled = self.get_is_being_profiled()
+///   try:
+///       while True:
+///           pypyjitdriver.jit_merge_point(...)
+///           co_code = pycode.co_code
+///           self.valuestackdepth = hint(self.valuestackdepth, promote=True)
+///           next_instr = self.handle_bytecode(co_code, next_instr, ec)
+///           is_being_profiled = self.get_is_being_profiled()
+///   except Yield: ...
+///   except ExitFrame: ...
+///
+/// Divergences from RPython:
+/// - `is_being_profiled` (green key in RPython): pyre does not track profiling
+///   state as a green key; omitted.
+/// - `hint(self.valuestackdepth, promote=True)`: RPython JIT hint to treat
+///   stack depth as compile-time constant. pyre uses Vec-based stack with no
+///   equivalent hint mechanism; omitted.
+/// - `hint(self, access_directly=True)`: RPython virtualizable hint for direct
+///   field access; pyre handles this via VirtualizableInfo; omitted.
+fn dispatch(frame: &mut PyFrame) -> LoopResult {
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
     let env = PyreEnv;
     let (driver, info) = driver_pair();
     // jitcode.py:18: jitdriver_sd is not None for portals.
-    // Inline check matches JitCode.is_portal set by codewriter.
-    // Cannot call codewriter::is_portal() here as it triggers
-    // lazy jitcode compilation which interferes with JIT state.
     let is_portal: bool = &*code.obj_name != "<module>";
-    // interp_jit.py:66 — next_instr, pycode are greens (managed by jit_merge_point).
-    // No explicit promote needed; the JitDriver green-key mechanism handles this.
 
     loop {
         if frame.next_instr >= code.instructions.len() {
@@ -1145,8 +1162,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
             return LoopResult::Done(Ok(w_none()));
         };
 
-        // ── jit_merge_point (RPython interp_jit.py:85-87) ──
-        // Runtime no-op. Only handles trace feed when tracing is active.
+        // ── jit_merge_point (interp_jit.py:85-87) ──
         if is_portal {
             let tracing_depth = driver.meta_interp().tracing_call_depth;
             if let Some(depth) = tracing_depth {
@@ -1158,7 +1174,6 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                     }
                 }
             } else if driver.is_tracing() {
-                // First merge_point after trace start — depth not yet set.
                 if let Some(loop_result) = jit_merge_point_hook(frame, code, pc, driver, info, &env)
                 {
                     return loop_result;
@@ -1166,59 +1181,106 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
             }
         }
 
-        // ── inline replay (tracing bookkeeping) ──
-        if frame.pending_inline_resume_pc == Some(pc) {
-            if matches!(
-                instruction,
-                pyre_interpreter::bytecode::Instruction::Call { .. }
-            ) {
-                frame.pending_inline_resume_pc = None;
-                continue;
-            }
+        // ── handle_bytecode (interp_jit.py:90) ──
+        match handle_bytecode(
+            frame,
+            code,
+            instruction,
+            op_arg,
+            pc,
+            is_portal,
+            driver,
+            info,
+            &env,
+        ) {
+            HandleBytecodeResult::Continue => {}
+            HandleBytecodeResult::LoopDone(result) => return result,
         }
-        if let pyre_interpreter::bytecode::Instruction::Call { argc } = instruction {
-            if !frame.pending_inline_results.is_empty() {
-                frame.next_instr = pc + 1;
-                if pyre_interpreter::call::replay_pending_inline_call(
-                    frame,
-                    argc.get(op_arg) as usize,
-                ) {
-                    continue;
-                }
-                frame.next_instr = pc;
-            }
-        }
+    }
+}
 
-        // ── handle_bytecode (RPython interp_jit.py:90) ──
-        trace_jit_bytecode(pc, "");
-        frame.next_instr += 1;
-        let next_instr = frame.next_instr;
-        if let pyre_interpreter::bytecode::Instruction::Call { argc } = instruction {
+/// Outcome of a single handle_bytecode() call.
+enum HandleBytecodeResult {
+    /// Keep iterating the dispatch loop.
+    Continue,
+    /// Exit the dispatch loop with this result.
+    LoopDone(LoopResult),
+}
+
+/// pyopcode.py:68-88 handle_bytecode().
+///
+/// RPython handle_bytecode is a thin try/except wrapper around
+/// dispatch_bytecode. This pyre version additionally contains:
+/// - inline-replay logic (pending_inline_resume_pc / pending_inline_results)
+///   which has no RPython counterpart — pyre-specific tracing bookkeeping.
+/// - can_enter_jit back-edge detection (interp_jit.py:114), which in RPython
+///   lives inside jump_absolute, not handle_bytecode.
+fn handle_bytecode(
+    frame: &mut PyFrame,
+    code: &pyre_interpreter::CodeObject,
+    instruction: pyre_interpreter::bytecode::Instruction,
+    op_arg: pyre_interpreter::bytecode::OpArg,
+    pc: usize,
+    is_portal: bool,
+    driver: &mut JitDriver<PyreJitState>,
+    info: &majit_metainterp::virtualizable::VirtualizableInfo,
+    env: &PyreEnv,
+) -> HandleBytecodeResult {
+    // ── inline replay (tracing bookkeeping) ──
+    if frame.pending_inline_resume_pc == Some(pc) {
+        if matches!(
+            instruction,
+            pyre_interpreter::bytecode::Instruction::Call { .. }
+        ) {
+            frame.pending_inline_resume_pc = None;
+            return HandleBytecodeResult::Continue;
+        }
+    }
+    if let pyre_interpreter::bytecode::Instruction::Call { argc } = instruction {
+        if !frame.pending_inline_results.is_empty() {
+            frame.next_instr = pc + 1;
             if pyre_interpreter::call::replay_pending_inline_call(frame, argc.get(op_arg) as usize)
             {
-                continue;
+                return HandleBytecodeResult::Continue;
             }
+            frame.next_instr = pc;
         }
-        match execute_opcode_step(frame, code, instruction, op_arg, next_instr) {
-            Ok(StepResult::Continue) => {}
-            Ok(StepResult::CloseLoop { loop_header_pc, .. }) if is_portal => {
-                // ── can_enter_jit (RPython interp_jit.py:114) ──
-                // RPython interp_jit.py:114 → warmstate.py:446
-                let green_key = make_green_key(frame.code, loop_header_pc);
-                if let Some(loop_result) =
-                    maybe_compile_and_run(frame, green_key, loop_header_pc, driver, info, &env)
-                {
-                    return loop_result;
-                }
+    }
+
+    // ── dispatch_bytecode (pyopcode.py:146) ──
+    trace_jit_bytecode(pc, "");
+    frame.next_instr += 1;
+    let next_instr = frame.next_instr;
+    if let pyre_interpreter::bytecode::Instruction::Call { argc } = instruction {
+        if pyre_interpreter::call::replay_pending_inline_call(frame, argc.get(op_arg) as usize) {
+            return HandleBytecodeResult::Continue;
+        }
+    }
+    match execute_opcode_step(frame, code, instruction, op_arg, next_instr) {
+        Ok(StepResult::Continue) => HandleBytecodeResult::Continue,
+        Ok(StepResult::CloseLoop { loop_header_pc, .. }) if is_portal => {
+            // ── can_enter_jit (interp_jit.py:114) ──
+            let green_key = make_green_key(frame.code, loop_header_pc);
+            if let Some(loop_result) =
+                maybe_compile_and_run(frame, green_key, loop_header_pc, driver, info, env)
+            {
+                return HandleBytecodeResult::LoopDone(loop_result);
             }
-            Ok(StepResult::CloseLoop { .. }) => {}
-            Ok(StepResult::Return(result)) => return LoopResult::Done(Ok(result)),
-            Ok(StepResult::Yield(result)) => return LoopResult::Done(Ok(result)),
-            Err(err) => {
-                if pyre_interpreter::eval::handle_exception(frame, &err) {
-                    continue;
-                }
-                return LoopResult::Done(Err(err));
+            HandleBytecodeResult::Continue
+        }
+        Ok(StepResult::CloseLoop { .. }) => HandleBytecodeResult::Continue,
+        Ok(StepResult::Return(result)) => {
+            HandleBytecodeResult::LoopDone(LoopResult::Done(Ok(result)))
+        }
+        Ok(StepResult::Yield(result)) => {
+            HandleBytecodeResult::LoopDone(LoopResult::Done(Ok(result)))
+        }
+        // pyopcode.py:71-88 — exception handling in handle_bytecode
+        Err(err) => {
+            if pyre_interpreter::eval::handle_exception(frame, &err) {
+                HandleBytecodeResult::Continue
+            } else {
+                HandleBytecodeResult::LoopDone(LoopResult::Done(Err(err)))
             }
         }
     }
