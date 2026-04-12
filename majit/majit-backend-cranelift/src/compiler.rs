@@ -4238,17 +4238,6 @@ fn emit_indirect_call_from_parts(
         }
     }
 
-    if call_descr.effect_info().can_raise() {
-        let _ = emit_host_call(
-            builder,
-            ptr_type,
-            call_conv,
-            jit_exc_clear as *const () as usize,
-            &[],
-            None,
-        );
-    }
-
     // RPython callbuilder.py parity:
     //   emit() [can_collect]: spill + push_gcmap + CALL + pop_gcmap + reload
     //   emit_no_collect(): bare CALL only
@@ -7558,16 +7547,6 @@ impl CraneliftBackend {
 
                     // Shim call (always present as fallback, or sole path
                     // when target isn't resolved or has non-primitive result)
-                    if call_descr.effect_info().can_raise() {
-                        let _ = emit_host_call(
-                            &mut builder,
-                            ptr_type,
-                            call_conv,
-                            jit_exc_clear as *const () as usize,
-                            &[],
-                            None,
-                        );
-                    }
 
                     // After switch_to_block(shim_fallback_block), the cached
                     // jf_ptr local may correspond to a value defined in a
@@ -7789,17 +7768,6 @@ impl CraneliftBackend {
                     let call_descr = descr
                         .as_call_descr()
                         .expect("call_release_gil descriptor must be a CallDescr");
-
-                    if call_descr.effect_info().can_raise() {
-                        let _ = emit_host_call(
-                            &mut builder,
-                            ptr_type,
-                            call_conv,
-                            jit_exc_clear as *const () as usize,
-                            &[],
-                            None,
-                        );
-                    }
 
                     // Spill GC roots before the call
                     spill_ref_roots(
