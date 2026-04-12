@@ -8130,14 +8130,10 @@ impl CraneliftBackend {
                     builder.def_var(var(vi), result);
                 }
                 OpCode::CallMallocNurseryVarsizeFrame => {
-                    // RPython x86/assembler.py:2567 malloc_cond_varsize_frame:
-                    // Inline nursery bump allocation.
-                    //   ecx = load(nursery_free_adr)
-                    //   edx = ecx + size
-                    //   cmp edx, load(nursery_top_adr)
-                    //   ja slow_path
-                    //   store(nursery_free_adr, edx)
-                    //   ; ecx = allocated pointer
+                    // x86/assembler.py:2567-2582 malloc_cond_varsize_frame:
+                    // inline nursery bump alloc with variable size.
+                    // Same spill-before-brif / reload-after-merge pattern
+                    // as CallMallocNursery for bridge parity.
                     let (nf_addr, nt_addr) = majit_gc::nursery::nursery_global_addrs();
                     let flags = MemFlags::trusted();
                     let size_total =
@@ -8152,72 +8148,63 @@ impl CraneliftBackend {
                         .ins()
                         .icmp(IntCC::UnsignedLessThanOrEqual, new_free, top);
 
+                    spill_ref_roots(
+                        &mut builder,
+                        jf_ptr,
+                        &ref_root_slots,
+                        &defined_ref_vars,
+                        ref_root_base_ofs,
+                    );
+                    emit_push_gcmap(&mut builder, jf_ptr, per_call_gcmap);
+
                     let fast_block = builder.create_block();
                     let slow_block = builder.create_block();
                     let merge_block = builder.create_block();
-                    builder.append_block_param(merge_block, ptr_type); // alloc result
-                    builder.append_block_param(merge_block, ptr_type); // jf_ptr
+                    builder.append_block_param(merge_block, ptr_type); // alloc result only
 
                     builder.ins().brif(fits, fast_block, &[], slow_block, &[]);
 
-                    // fast: bump free pointer, return old free
+                    // fast: bump free pointer, zero GcHeader, return payload
                     builder.switch_to_block(fast_block);
                     builder.seal_block(fast_block);
                     builder.ins().store(flags, new_free, nf_ptr, 0);
-                    // rewrite.py:557-563 + alloc_with_type parity: the slow
-                    // path goes through alloc_with_type which calls
-                    // init_nursery_object to write a fresh GcHeader at the
-                    // payload base. The inline fast path was previously
-                    // writing the new free pointer but skipping the header
-                    // init, leaving whatever bytes were left over in the
-                    // nursery from a prior allocation. The next minor GC
-                    // would then read garbage tid_and_flags through
-                    // copy_nursery_object and panic with `invalid type_id`.
-                    // Mirror init_nursery_object here so the inline path
-                    // produces an object whose header matches what
-                    // alloc_with_type would have written.
                     let zero_hdr = builder.ins().iconst(cl_types::I64, 0);
                     builder.ins().store(MemFlags::trusted(), zero_hdr, free, 0);
-                    // Return pointer past GC header
                     let header_size = builder.ins().iconst(ptr_type, GcHeader::SIZE as i64);
                     let obj_ptr = builder.ins().iadd(free, header_size);
-                    builder.ins().jump(
-                        merge_block,
-                        &[BlockArg::from(obj_ptr), BlockArg::from(jf_ptr)],
-                    );
+                    builder.ins().jump(merge_block, &[BlockArg::from(obj_ptr)]);
 
-                    // slow: call shim (triggers minor collection)
+                    // slow: host call (malloc_slowpath), may trigger GC.
                     builder.switch_to_block(slow_block);
                     builder.seal_block(slow_block);
                     let runtime_id = gc_runtime_id.ok_or_else(|| missing_gc_runtime(op.opcode))?;
                     let runtime_id_val = builder.ins().iconst(cl_types::I64, runtime_id as i64);
                     let size = builder.ins().iadd_imm(size_total, -(GcHeader::SIZE as i64));
-                    let slow_result = emit_collecting_gc_call(
+                    let slow_result = emit_host_call(
                         &mut builder,
                         ptr_type,
                         call_conv,
-                        jf_ptr,
-                        &ref_root_slots,
-                        &defined_ref_vars,
-                        ref_root_base_ofs,
-                        per_call_gcmap,
-                        runtime_id_val,
                         gc_alloc_nursery_shim as *const () as usize,
-                        &[size],
+                        &[runtime_id_val, size],
                         Some(cl_types::I64),
                     )
                     .expect("GC frame allocation helper must return a value");
-                    let reloaded_jf =
-                        emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
-                    builder.ins().jump(
-                        merge_block,
-                        &[BlockArg::from(slow_result), BlockArg::from(reloaded_jf)],
-                    );
+                    builder
+                        .ins()
+                        .jump(merge_block, &[BlockArg::from(slow_result)]);
 
                     builder.switch_to_block(merge_block);
                     builder.seal_block(merge_block);
                     let result = builder.block_params(merge_block)[0];
-                    jf_ptr = builder.block_params(merge_block)[1];
+                    jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                    emit_pop_gcmap(&mut builder, jf_ptr, per_call_gcmap);
+                    reload_ref_roots(
+                        &mut builder,
+                        jf_ptr,
+                        &ref_root_slots,
+                        &defined_ref_vars,
+                        ref_root_base_ofs,
+                    );
                     outputs_ptr = jf_ptr;
                     builder.def_var(jf_ptr_var, jf_ptr);
                     builder.def_var(var(vi), result);
