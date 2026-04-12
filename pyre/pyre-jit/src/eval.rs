@@ -1661,12 +1661,9 @@ fn execute_assembler(
                     // compile.py:710-716 / pyjitpl.py:2906 SwitchToBlackhole
                     let bh_result =
                         resume_in_blackhole_from_exit_layout(frame, raw_values, exit_layout);
-                    match bh_result {
+                    match &bh_result {
                         crate::call_jit::BlackholeResult::ContinueRunningNormally => {
                             Some(LoopResult::ContinueRunningNormally)
-                        }
-                        crate::call_jit::BlackholeResult::DoneWithThisFrame(r) => {
-                            Some(LoopResult::Done(r))
                         }
                         crate::call_jit::BlackholeResult::Failed => {
                             if majit_metainterp::majit_log_enabled() {
@@ -1678,6 +1675,7 @@ fn execute_assembler(
                             driver.invalidate_loop(green_key);
                             None
                         }
+                        _ => bh_result.to_pyresult().map(LoopResult::Done),
                     }
                 }
             }
@@ -1831,14 +1829,18 @@ fn bound_reached(
                     return Some(LoopResult::ContinueRunningNormally);
                 }
                 HandleFailOutcome::ResumeInBlackhole => {
-                    match resume_in_blackhole_from_exit_layout(frame, raw_values, exit_layout) {
+                    let bh_result =
+                        resume_in_blackhole_from_exit_layout(frame, raw_values, exit_layout);
+                    match &bh_result {
                         crate::call_jit::BlackholeResult::ContinueRunningNormally => {
                             return Some(LoopResult::ContinueRunningNormally);
                         }
-                        crate::call_jit::BlackholeResult::DoneWithThisFrame(r) => {
-                            return Some(LoopResult::Done(r));
-                        }
                         crate::call_jit::BlackholeResult::Failed => {}
+                        _ => {
+                            if let Some(r) = bh_result.to_pyresult() {
+                                return Some(LoopResult::Done(r));
+                            }
+                        }
                     }
                 }
             }
@@ -1972,10 +1974,9 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
                     // Fall through to eval_loop_jit below.
                 }
                 HandleFailOutcome::ResumeInBlackhole => {
-                    match resume_in_blackhole_from_exit_layout(frame, raw_values, exit_layout) {
-                        crate::call_jit::BlackholeResult::DoneWithThisFrame(r) => {
-                            return Some(r);
-                        }
+                    let bh_result =
+                        resume_in_blackhole_from_exit_layout(frame, raw_values, exit_layout);
+                    match &bh_result {
                         crate::call_jit::BlackholeResult::ContinueRunningNormally => {
                             // Fall through to eval_loop_jit
                         }
@@ -1988,6 +1989,11 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
                             }
                             let (driver, _) = driver_pair();
                             driver.invalidate_loop(green_key);
+                        }
+                        _ => {
+                            if let Some(r) = bh_result.to_pyresult() {
+                                return Some(r);
+                            }
                         }
                     }
                 }

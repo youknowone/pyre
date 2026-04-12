@@ -969,15 +969,12 @@ pub fn deserialize_optimizer_knowledge(
     for _ in 0..length {
         let tagged1 = reader.next_item() as i16;
         let const_box = decode_box(tagged1, rd_consts, liveboxes);
-        // bridgeopt.py:179: assert isinstance(const, ConstInt)
-        // bridgeopt.py:180: i = const.getint()
-        let const_int = match &const_box {
-            DecodedBox::ConstInt(v) => *v,
-            DecodedBox::Const(v, _) => *v,
-            _ => panic!(
+        // bridgeopt.py:179-180: assert isinstance(const, ConstInt); i = const.getint()
+        let DecodedBox::ConstInt(const_int) = const_box else {
+            panic!(
                 "bridgeopt: loopinvariant entry must be ConstInt, got {:?}",
                 const_box
-            ),
+            );
         };
         let tagged2 = reader.next_item() as i16;
         let box2 = decode_box(tagged2, rd_consts, liveboxes);

@@ -38,6 +38,23 @@ pub fn take_ca_exception() -> Option<pyre_interpreter::error::PyError> {
     LAST_CA_EXCEPTION.with(|c| c.borrow_mut().take())
 }
 
+/// warmspot.py:998 parity: retrieve stashed exception and raise.
+/// RPython's assembler_call_helper re-raises the exception, which
+/// RPython's C convention stores in exception TLS. The compiled code's
+/// GUARD_NO_EXCEPTION (checking JIT_EXC_VALUE) fires on the next guard.
+/// Returns Some(0) when exception was stashed, None if no stashed exception.
+fn take_ca_exception_for_backend() -> Option<i64> {
+    let exc = take_ca_exception()?;
+    let exc_obj = exc.exc_object;
+    if exc_obj != pyre_object::PY_NULL {
+        // warmspot.py:998 raise value → sets JIT_EXC_VALUE so
+        // GUARD_NO_EXCEPTION fires in compiled code.
+        #[cfg(feature = "cranelift")]
+        majit_backend_cranelift::jit_exc_raise(exc_obj as i64);
+    }
+    Some(0)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FinishProtocol {
     RawInt,
@@ -536,7 +553,13 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
     let _plain_guard = pyre_interpreter::call::force_plain_eval();
     let result = match pyre_interpreter::eval::eval_frame_plain(&mut func_frame) {
         Ok(r) => r,
-        Err(_) => pyre_object::PY_NULL,
+        Err(err) => {
+            // warmspot.py:998 parity: assembler_call_helper re-raises.
+            // Set JIT_EXC_VALUE so GUARD_NO_EXCEPTION fires.
+            #[cfg(feature = "cranelift")]
+            majit_backend_cranelift::jit_exc_raise(err.exc_object as i64);
+            pyre_object::PY_NULL
+        }
     };
 
     match protocol {
@@ -640,7 +663,12 @@ fn jit_force_callee_frame_raw(frame_ptr: i64) -> i64 {
             };
             value
         }
-        Err(err) => panic!("jit force callee frame raw failed: {err}"),
+        Err(err) => {
+            // warmspot.py:998 parity: propagate exception via JIT_EXC_VALUE.
+            #[cfg(feature = "cranelift")]
+            majit_backend_cranelift::jit_exc_raise(err.exc_object as i64);
+            0
+        }
     }
 }
 
@@ -664,7 +692,12 @@ extern "C" fn jit_force_callee_frame_interp(frame_ptr: i64) -> i64 {
         Some(r) => r,
         None => match pyre_interpreter::eval::eval_frame_plain(frame) {
             Ok(r) => r,
-            Err(_) => pyre_object::PY_NULL,
+            Err(err) => {
+                // warmspot.py:998 parity: propagate exception.
+                #[cfg(feature = "cranelift")]
+                majit_backend_cranelift::jit_exc_raise(err.exc_object as i64);
+                pyre_object::PY_NULL
+            }
         },
     };
 
@@ -892,47 +925,65 @@ pub enum JitException {
     ExitFrameWithExceptionRef(pyre_interpreter::error::PyError),
 }
 
-/// RPython blackhole.py _run_forever + jitexc.py parity.
+/// RPython jitexc.py parity: typed exception channels for blackhole result.
 ///
-/// TODO(epic phase 6): replace with direct use of [`JitException`]
-/// once every `Failed` return site has been migrated.
+/// Each variant matches an RPython JitException subclass 1:1.
+/// The value is carried in its native type — no boxing into PyObjectRef.
 pub enum BlackholeResult {
-    /// RPython jitexc.py:53 ContinueRunningNormally: blackhole reached
-    /// the merge point → restart portal to re-enter compiled code.
+    /// jitexc.py:52 ContinueRunningNormally
     ContinueRunningNormally,
-    /// RPython jitexc.py:68 DoneWithThisFrame: blackhole ran the
-    /// function to completion (RETURN_VALUE).
-    DoneWithThisFrame(PyResult),
-    /// Blackhole couldn't run (bad resume data, BC_ABORT, etc).
+    /// jitexc.py:16 DoneWithThisFrameVoid
+    DoneWithThisFrameVoid,
+    /// jitexc.py:20 DoneWithThisFrameInt(result: Signed)
+    DoneWithThisFrameInt(i64),
+    /// jitexc.py:28 DoneWithThisFrameRef(result: GCREF)
+    DoneWithThisFrameRef(PyObjectRef),
+    /// jitexc.py:36 DoneWithThisFrameFloat(result: FLOATSTORAGE)
+    DoneWithThisFrameFloat(f64),
+    /// jitexc.py:44 ExitFrameWithExceptionRef(value: GCREF)
+    ExitFrameWithExceptionRef(pyre_interpreter::error::PyError),
+    /// pyre-only: resume couldn't run (bad resume data, BC_ABORT, etc).
     Failed,
 }
 
 impl From<JitException> for BlackholeResult {
-    /// Non-`Failed` projection of a `JitException` onto the legacy
-    /// `BlackholeResult`. Used during the Phase 0→6 migration window.
-    ///
-    /// Every variant must map to `ContinueRunningNormally` or
-    /// `DoneWithThisFrame(..)` — mapping to `Failed` is forbidden by
-    /// construction so callers cannot silently re-introduce the
-    /// loop-invalidation fallback.
+    /// 1:1 projection of JitException onto BlackholeResult.
+    /// No boxing — each typed value passes through in its native type.
     fn from(exc: JitException) -> Self {
         match exc {
             JitException::ContinueRunningNormally { .. } => {
                 BlackholeResult::ContinueRunningNormally
             }
-            JitException::DoneWithThisFrameVoid => {
-                BlackholeResult::DoneWithThisFrame(Ok(pyre_object::PY_NULL))
-            }
-            JitException::DoneWithThisFrameInt(v) => BlackholeResult::DoneWithThisFrame(Ok(
-                pyre_object::intobject::w_int_new(v) as PyObjectRef,
-            )),
-            JitException::DoneWithThisFrameRef(r) => BlackholeResult::DoneWithThisFrame(Ok(r)),
-            JitException::DoneWithThisFrameFloat(f) => BlackholeResult::DoneWithThisFrame(Ok(
-                pyre_object::floatobject::w_float_new(f) as PyObjectRef,
-            )),
+            JitException::DoneWithThisFrameVoid => BlackholeResult::DoneWithThisFrameVoid,
+            JitException::DoneWithThisFrameInt(v) => BlackholeResult::DoneWithThisFrameInt(v),
+            JitException::DoneWithThisFrameRef(r) => BlackholeResult::DoneWithThisFrameRef(r),
+            JitException::DoneWithThisFrameFloat(f) => BlackholeResult::DoneWithThisFrameFloat(f),
             JitException::ExitFrameWithExceptionRef(err) => {
-                BlackholeResult::DoneWithThisFrame(Err(err))
+                BlackholeResult::ExitFrameWithExceptionRef(err)
             }
+        }
+    }
+}
+
+impl BlackholeResult {
+    /// warmspot.py:985-1005: convert typed DoneWithThisFrame* result to PyResult.
+    ///
+    /// This is the warmspot boundary where the typed JIT exception value
+    /// is converted back into a Python-level result. RPython's warmspot
+    /// does this implicitly via result_kind dispatch; pyre boxes here.
+    pub fn to_pyresult(&self) -> Option<PyResult> {
+        match self {
+            BlackholeResult::DoneWithThisFrameVoid => Some(Ok(pyre_object::PY_NULL)),
+            BlackholeResult::DoneWithThisFrameInt(v) => {
+                Some(Ok(pyre_object::intobject::w_int_new(*v) as PyObjectRef))
+            }
+            BlackholeResult::DoneWithThisFrameRef(r) => Some(Ok(*r)),
+            BlackholeResult::DoneWithThisFrameFloat(f) => {
+                Some(Ok(pyre_object::floatobject::w_float_new(*f) as PyObjectRef))
+            }
+            // warmspot.py:998-1005: raise the exception
+            BlackholeResult::ExitFrameWithExceptionRef(err) => Some(Err(err.clone())),
+            _ => None,
         }
     }
 }
@@ -1295,15 +1346,9 @@ pub fn resume_in_blackhole(
                 }
                 let ncells = pyre_interpreter::pyframe::ncells(code);
                 let stack_base = nlocals + ncells;
-                // flatten.py / regalloc.py parity: read value-stack
-                // temporaries from `registers_r[nlocals + d]` (where the
-                // codewriter parks them via `move_r`), not from a runtime
-                // stack. The previous `runtime_stack_drain(0)` always
-                // returned an empty Vec because pyre's codewriter never
-                // emits BC_PUSH_R / BC_POP_R against runtime_stacks; the
-                // call was a no-op. The number of stack registers to read
-                // is `depth_at_py_pc[merge_py_pc]`, recorded by the
-                // codewriter for each Python PC.
+                // resume.py:1593 parity: value-stack temporaries live at
+                // registers_r[nlocals + d] (codewriter parks them via
+                // move_r). depth_at_py_pc[merge_py_pc] gives the count.
                 let depth = bh.jitcode.depth_at_py_pc.get(py_pc).copied().unwrap_or(0) as usize;
                 frame.valuestackdepth = stack_base + depth;
                 for d in 0..depth {
@@ -1401,20 +1446,35 @@ pub fn resume_in_blackhole(
             continue;
         }
 
-        // blackhole.py:1636-1640: get_tmpreg_r() for ref return.
-        let return_value = bh.get_tmpreg_r();
+        // blackhole.py:1632-1644: pass return value to caller by _return_type.
+        use majit_metainterp::blackhole::BhReturnType;
+        let rt = bh.return_type;
         let next = bh.nextblackholeinterp.take();
-        builder.release_interp(bh);
 
         let Some(mut caller_bh) = next.map(|b| *b) else {
-            // blackhole.py:1664-1672 _done_with_this_frame
-            return BlackholeResult::DoneWithThisFrame(
-                Ok(return_value as pyre_object::PyObjectRef),
-            );
+            // blackhole.py:1664-1677 _done_with_this_frame
+            let result = match rt {
+                BhReturnType::Void => BlackholeResult::DoneWithThisFrameVoid,
+                BhReturnType::Int => BlackholeResult::DoneWithThisFrameInt(bh.get_tmpreg_i()),
+                BhReturnType::Ref => {
+                    BlackholeResult::DoneWithThisFrameRef(bh.get_tmpreg_r() as PyObjectRef)
+                }
+                BhReturnType::Float => BlackholeResult::DoneWithThisFrameFloat(f64::from_bits(
+                    bh.get_tmpreg_f() as u64,
+                )),
+            };
+            builder.release_interp(bh);
+            return result;
         };
 
-        // blackhole.py:1657-1659 _setup_return_value_r
-        caller_bh.setup_return_value_r(return_value);
+        // blackhole.py:1637-1644: dispatch by _return_type
+        match rt {
+            BhReturnType::Int => caller_bh.setup_return_value_i(bh.get_tmpreg_i()),
+            BhReturnType::Ref => caller_bh.setup_return_value_r(bh.get_tmpreg_r()),
+            BhReturnType::Float => caller_bh.setup_return_value_f(bh.get_tmpreg_f()),
+            BhReturnType::Void => {}
+        }
+        builder.release_interp(bh);
 
         bh = caller_bh;
     }
@@ -1703,6 +1763,9 @@ pub fn install_jit_call_bridge() {
             );
             majit_backend_cranelift::register_inline_frame_arena(arena_global_info());
             majit_backend_cranelift::register_call_assembler_unbox_int(unbox_int_for_force);
+            majit_backend_cranelift::register_call_assembler_take_exception(
+                take_ca_exception_for_backend,
+            );
         }
         #[cfg(feature = "dynasm")]
         {
@@ -1712,6 +1775,9 @@ pub fn install_jit_call_bridge() {
                 jit_blackhole_resume_from_guard,
             );
             majit_backend_dynasm::register_call_assembler_unbox_int(unbox_int_for_force);
+            majit_backend_dynasm::register_call_assembler_take_exception(
+                take_ca_exception_for_backend,
+            );
         }
         majit_metainterp::set_ref_unbox_int_fn(unbox_int_for_force);
     });
@@ -1961,10 +2027,22 @@ pub fn blackhole_resume_via_rd_numb(
             let next = bh.nextblackholeinterp.take();
             builder.release_interp(bh);
             let Some(mut caller_bh) = next.map(|b| *b) else {
-                return BlackholeResult::DoneWithThisFrame(Err(pyre_interpreter::PyError::new(
-                    pyre_interpreter::PyErrorKind::RuntimeError,
-                    "blackhole exception",
-                )));
+                // blackhole.py:1679-1682 _exit_frame_with_exception:
+                //   e = cast_opaque_ptr(GCREF, e)
+                //   raise ExitFrameWithExceptionRef(e)
+                let err = if exc_value != 0 {
+                    unsafe {
+                        pyre_interpreter::PyError::from_exc_object(
+                            exc_value as pyre_object::PyObjectRef,
+                        )
+                    }
+                } else {
+                    pyre_interpreter::PyError::new(
+                        pyre_interpreter::PyErrorKind::RuntimeError,
+                        "blackhole exception (null exc_value)",
+                    )
+                };
+                return BlackholeResult::ExitFrameWithExceptionRef(err);
             };
             caller_bh.last_opcode_position = caller_bh.position;
             if caller_bh.handle_exception_in_frame(exc_value) {
@@ -1985,18 +2063,17 @@ pub fn blackhole_resume_via_rd_numb(
         if caller.is_none() {
             // blackhole.py:1664-1677 _done_with_this_frame
             let result = match rt {
-                BhReturnType::Int => pyre_object::intobject::w_int_new(bh.get_tmpreg_i()),
-                BhReturnType::Ref => bh.get_tmpreg_r() as pyre_object::PyObjectRef,
-                BhReturnType::Float => {
-                    // blackhole.py:1674-1675: DoneWithThisFrameFloat(get_tmpreg_f())
-                    // pyre: box float bits into W_FloatObject
-                    let bits = bh.get_tmpreg_f() as u64;
-                    pyre_object::floatobject::w_float_new(f64::from_bits(bits))
+                BhReturnType::Void => BlackholeResult::DoneWithThisFrameVoid,
+                BhReturnType::Int => BlackholeResult::DoneWithThisFrameInt(bh.get_tmpreg_i()),
+                BhReturnType::Ref => {
+                    BlackholeResult::DoneWithThisFrameRef(bh.get_tmpreg_r() as PyObjectRef)
                 }
-                BhReturnType::Void => pyre_object::PY_NULL,
+                BhReturnType::Float => BlackholeResult::DoneWithThisFrameFloat(f64::from_bits(
+                    bh.get_tmpreg_f() as u64,
+                )),
             };
             builder.release_interp(bh);
-            return BlackholeResult::DoneWithThisFrame(Ok(result));
+            return result;
         }
         let mut caller_bh = caller.unwrap();
         // blackhole.py:1637-1644: dispatch by _return_type
@@ -2011,37 +2088,55 @@ pub fn blackhole_resume_via_rd_numb(
     }
 }
 
-/// Common result handling for both rd_numb and heuristic paths.
+/// warmspot.py:985-1007 handle_jitexception parity.
+///
+/// Dispatches on typed BlackholeResult variants. Each DoneWithThisFrame*
+/// carries the value in its native type — no boxing/unboxing heuristic.
 fn handle_blackhole_result(bh_result: BlackholeResult, fail_values: &[i64]) -> Option<i64> {
     match bh_result {
-        BlackholeResult::DoneWithThisFrame(Ok(result)) => {
-            // blackhole.py:1673 / warmspot.py:986: DoneWithThisFrameRef
-            // always carries a GCREF, but the self-recursive Int variant
-            // unboxes here so the caller (CALL_ASSEMBLER_I) consumes a
-            // raw int directly.
-            let raw = if !result.is_null() && unsafe { is_int(result) } {
-                unsafe { w_int_get_value(result) }
-            } else {
-                result as i64
-            };
+        // warmspot.py:985-987: DoneWithThisFrameVoid → return None
+        BlackholeResult::DoneWithThisFrameVoid => {
             if majit_metainterp::majit_log_enabled() {
-                eprintln!("[blackhole-resume] DoneWithThisFrame result={}", raw);
+                eprintln!("[blackhole-resume] DoneWithThisFrameVoid");
             }
-            Some(raw)
+            Some(0)
         }
-        BlackholeResult::DoneWithThisFrame(Err(_)) => {
+        // warmspot.py:988-990: DoneWithThisFrameInt → return e.result
+        BlackholeResult::DoneWithThisFrameInt(v) => {
             if majit_metainterp::majit_log_enabled() {
-                eprintln!("[blackhole-resume] DoneWithThisFrame exception");
+                eprintln!("[blackhole-resume] DoneWithThisFrameInt({})", v);
             }
+            Some(v)
+        }
+        // warmspot.py:991-993: DoneWithThisFrameRef → return e.result
+        BlackholeResult::DoneWithThisFrameRef(r) => {
+            if majit_metainterp::majit_log_enabled() {
+                eprintln!("[blackhole-resume] DoneWithThisFrameRef({:?})", r);
+            }
+            Some(r as i64)
+        }
+        // warmspot.py:994-996: DoneWithThisFrameFloat → return e.result
+        BlackholeResult::DoneWithThisFrameFloat(f) => {
+            if majit_metainterp::majit_log_enabled() {
+                eprintln!("[blackhole-resume] DoneWithThisFrameFloat({})", f);
+            }
+            Some(f.to_bits() as i64)
+        }
+        // warmspot.py:998-1005: ExitFrameWithExceptionRef → raise.
+        // RPython raises here; pyre stashes in TLS so the callback
+        // caller can retrieve it instead of re-executing via force_fn.
+        BlackholeResult::ExitFrameWithExceptionRef(err) => {
+            if majit_metainterp::majit_log_enabled() {
+                eprintln!("[blackhole-resume] ExitFrameWithExceptionRef → stash");
+            }
+            LAST_CA_EXCEPTION.with(|c| *c.borrow_mut() = Some(err));
             None
         }
+        // warmspot.py:970-983: ContinueRunningNormally → call portal_ptr(*args).
+        // RPython calls the typed portal function directly; pyre calls
+        // eval_frame_plain which returns PyObjectRef. The result must be
+        // returned as raw i64 for the compiled CALL_ASSEMBLER caller.
         BlackholeResult::ContinueRunningNormally => {
-            // warmspot.py:970-983 handle_jitexception:
-            // ContinueRunningNormally → call portal_ptr(*args) directly.
-            // RPython calls the interpreter (not JIT) to avoid re-entering
-            // compiled code that would fail at the same guard again.
-            // force_plain_eval ensures nested function calls also use the
-            // interpreter, not the JIT (prevents recursive guard failures).
             let callee_frame_ptr = fail_values[0] as *mut PyFrame;
             if callee_frame_ptr.is_null() {
                 return None;
@@ -2055,15 +2150,12 @@ fn handle_blackhole_result(bh_result: BlackholeResult, fail_values: &[i64]) -> O
             }
             let _plain_guard = pyre_interpreter::call::force_plain_eval();
             match pyre_interpreter::eval::eval_frame_plain(callee_frame) {
-                Ok(result) => {
-                    let raw = if !result.is_null() && unsafe { is_int(result) } {
-                        unsafe { w_int_get_value(result) }
-                    } else {
-                        result as i64
-                    };
-                    Some(raw)
+                Ok(result) => Some(result as i64),
+                Err(err) => {
+                    // warmspot.py:979 parity: portal raises → propagate.
+                    LAST_CA_EXCEPTION.with(|c| *c.borrow_mut() = Some(err));
+                    None
                 }
-                Err(_) => None,
             }
         }
         BlackholeResult::Failed => {

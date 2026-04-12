@@ -1462,6 +1462,10 @@ static CALL_ASSEMBLER_FORCE_FN: OnceLock<extern "C" fn(i64) -> i64> = OnceLock::
 /// first local is a Ref type (boxed int) instead of raw Int.
 static CALL_ASSEMBLER_UNBOX_INT_FN: OnceLock<fn(i64) -> i64> = OnceLock::new();
 
+/// warmspot.py:998 parity: take stashed exception from blackhole FFI path.
+/// Returns Some(result_sentinel) when exception is stashed, None otherwise.
+static CALL_ASSEMBLER_TAKE_EXCEPTION_FN: OnceLock<fn() -> Option<i64>> = OnceLock::new();
+
 static CALL_ASSEMBLER_BLACKHOLE_FN: OnceLock<
     fn(u64, u64, u32, *const i64, usize, *const i64, usize) -> Option<i64>,
 > = OnceLock::new();
@@ -1708,6 +1712,11 @@ pub fn register_call_assembler_force(f: extern "C" fn(i64) -> i64) {
 /// Register an unbox-int callback for CALL_ASSEMBLER's FALLBACK path.
 pub fn register_call_assembler_unbox_int(f: fn(i64) -> i64) {
     let _ = CALL_ASSEMBLER_UNBOX_INT_FN.set(f);
+}
+
+/// Register exception-take callback for blackhole FFI exception stash.
+pub fn register_call_assembler_take_exception(f: fn() -> Option<i64>) {
+    let _ = CALL_ASSEMBLER_TAKE_EXCEPTION_FN.set(f);
 }
 
 pub fn execute_call_assembler_direct(
@@ -2507,7 +2516,22 @@ fn call_assembler_guard_failure_inner(
             outputs_ptr,
             raw_num,
         ) {
+            // pyre: blackhole always returns DoneWithThisFrameRef (Python
+            // functions return PyObjectRef). CALL_ASSEMBLER_I expects raw
+            // int. Apply unbox_int_for_force — same conversion as the
+            // compiled fast path's _call_assembler_load_result.
+            // RPython: unnecessary because _return_type='i' produces
+            // DoneWithThisFrameInt directly.
+            if let Some(unbox_fn) = CALL_ASSEMBLER_UNBOX_INT_FN.get() {
+                return unbox_fn(result);
+            }
             return result;
+        }
+        // warmspot.py:998 parity: blackhole stashed exception → skip force_fn
+        if let Some(exc_fn) = CALL_ASSEMBLER_TAKE_EXCEPTION_FN.get() {
+            if let Some(exc_result) = exc_fn() {
+                return exc_result;
+            }
         }
     }
     // Fallback: force_fn re-executes the callee from scratch.
@@ -2680,7 +2704,23 @@ fn call_assembler_fast_path_heap(
                 *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
                 *outcome.add(1) = 0;
             }
+            // warmspot.py:982 unspecialize_value parity
+            let result = if let Some(unbox_fn) = CALL_ASSEMBLER_UNBOX_INT_FN.get() {
+                unbox_fn(result)
+            } else {
+                result
+            };
             return result as u64;
+        }
+        // warmspot.py:998 parity: blackhole stashed exception → skip force_fn
+        if let Some(exc_fn) = CALL_ASSEMBLER_TAKE_EXCEPTION_FN.get() {
+            if let Some(exc_result) = exc_fn() {
+                unsafe {
+                    *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
+                    *outcome.add(1) = 0;
+                }
+                return exc_result as u64;
+            }
         }
     }
 
@@ -2795,7 +2835,23 @@ fn call_assembler_shim_inner(
                 *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
                 *outcome.add(1) = 0;
             }
+            // warmspot.py:982 unspecialize_value parity
+            let result = if let Some(unbox_fn) = CALL_ASSEMBLER_UNBOX_INT_FN.get() {
+                unbox_fn(result)
+            } else {
+                result
+            };
             return result as u64;
+        }
+        // warmspot.py:998 parity: blackhole stashed exception → skip force_fn
+        if let Some(exc_fn) = CALL_ASSEMBLER_TAKE_EXCEPTION_FN.get() {
+            if let Some(exc_result) = exc_fn() {
+                unsafe {
+                    *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
+                    *outcome.add(1) = 0;
+                }
+                return exc_result as u64;
+            }
         }
     }
     // Fallback: force_fn re-executes from scratch.

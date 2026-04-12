@@ -97,6 +97,7 @@ static CA_BLACKHOLE_FN: OnceLock<BlackholeFn> = OnceLock::new();
 static CA_BRIDGE_FN: OnceLock<BridgeFn> = OnceLock::new();
 static CA_FORCE_FN: OnceLock<ForceFn> = OnceLock::new();
 static CA_UNBOX_INT_FN: OnceLock<UnboxIntFn> = OnceLock::new();
+static CA_TAKE_EXCEPTION_FN: OnceLock<fn() -> Option<i64>> = OnceLock::new();
 
 /// Register blackhole resume handler (same API as Cranelift).
 pub fn register_call_assembler_blackhole(f: BlackholeFn) {
@@ -122,6 +123,11 @@ pub fn call_assembler_force_fn_addr() -> usize {
 /// Register int unbox handler (same API as Cranelift).
 pub fn register_call_assembler_unbox_int(f: UnboxIntFn) {
     CA_UNBOX_INT_FN.set(f).ok();
+}
+
+/// Register exception-take callback (same API as Cranelift).
+pub fn register_call_assembler_take_exception(f: fn() -> Option<i64>) {
+    CA_TAKE_EXCEPTION_FN.set(f).ok();
 }
 
 /// assembler.py:345 assembler_helper_adr parity:
@@ -183,7 +189,7 @@ pub extern "C" fn call_assembler_helper_trampoline(
 
         // resume.py:1312 blackhole_from_resumedata parity.
         if let Some(blackhole) = CA_BLACKHOLE_FN.get() {
-            result = blackhole(
+            if let Some(bh_result) = blackhole(
                 green_key,
                 trace_id,
                 fail_index,
@@ -191,8 +197,21 @@ pub extern "C" fn call_assembler_helper_trampoline(
                 raw_values.len(),
                 raw_values.as_ptr(),
                 raw_values.len(),
-            )
-            .unwrap_or(0);
+            ) {
+                // warmspot.py:982 unspecialize_value parity:
+                // blackhole returns PyObjectRef (Ref). CALL_ASSEMBLER_I
+                // expects raw int. Apply unbox_int_for_force.
+                result = if let Some(unbox_fn) = CA_UNBOX_INT_FN.get() {
+                    unbox_fn(bh_result)
+                } else {
+                    bh_result
+                };
+            } else if let Some(exc_fn) = CA_TAKE_EXCEPTION_FN.get() {
+                // warmspot.py:998 parity: blackhole stashed exception
+                if let Some(exc_result) = exc_fn() {
+                    result = exc_result;
+                }
+            }
         } else if let Some(force_fn) = CA_FORCE_FN.get() {
             let frame_ptr = unsafe { jitframe::JitFrame::get_int_value(callee_jf_ptr, 0) };
             result = force_fn(frame_ptr);
