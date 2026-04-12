@@ -57,6 +57,34 @@ pub struct WriteBarrierDescr {
     pub jit_wb_card_page_shift: u32,
 }
 
+impl WriteBarrierDescr {
+    /// gc.py:285-293 extract_flag_byte: find the non-zero byte in the
+    /// header-shifted flag word and return (byte_offset, byte_mask).
+    pub fn extract_flag_byte(flag: u64) -> (usize, u8) {
+        let shifted = flag << crate::header::FLAG_SHIFT;
+        let bytes = shifted.to_le_bytes();
+        for (i, &b) in bytes.iter().enumerate() {
+            if b != 0 {
+                return (i, b);
+            }
+        }
+        (0, 0)
+    }
+
+    /// Build a descriptor with correct byte offsets for the current
+    /// header layout. gc.py:259-293 WriteBarrierDescr.__init__.
+    pub fn for_current_gc() -> Self {
+        let (byteofs, singlebyte) = Self::extract_flag_byte(flags::TRACK_YOUNG_PTRS);
+        WriteBarrierDescr {
+            jit_wb_if_flag: flags::TRACK_YOUNG_PTRS,
+            jit_wb_if_flag_byteofs: byteofs,
+            jit_wb_if_flag_singlebyte: singlebyte,
+            jit_wb_cards_set: flags::CARDS_SET,
+            jit_wb_card_page_shift: 0, // TODO: card page shift from GC config
+        }
+    }
+}
+
 /// GC allocator interface.
 ///
 /// Provides allocation and collection primitives.

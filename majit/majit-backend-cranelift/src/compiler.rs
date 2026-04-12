@@ -5262,13 +5262,7 @@ impl CraneliftBackend {
             // The Cranelift backend currently lowers WB ops through runtime
             // helper calls instead of inlining flag checks, but the rewriter
             // still expects a descriptor-shaped config object.
-            wb_descr: WriteBarrierDescr {
-                jit_wb_if_flag: gc_flags::TRACK_YOUNG_PTRS,
-                jit_wb_if_flag_byteofs: 0,
-                jit_wb_if_flag_singlebyte: gc_flags::TRACK_YOUNG_PTRS as u8,
-                jit_wb_cards_set: gc_flags::CARDS_SET,
-                jit_wb_card_page_shift: 0,
-            },
+            wb_descr: WriteBarrierDescr::for_current_gc(),
             jitframe_info: INLINE_ARENA
                 .get()
                 .and_then(|arena| arena.jitframe_descrs.clone()),
@@ -8228,17 +8222,54 @@ impl CraneliftBackend {
 
                 // ── GC write barriers ──
                 OpCode::CondCallGcWb | OpCode::CondCallGcWbArray => {
-                    let runtime_id = gc_runtime_id.ok_or_else(|| missing_gc_runtime(op.opcode))?;
-                    let runtime_id = builder.ins().iconst(cl_types::I64, runtime_id as i64);
+                    // x86/assembler.py:2388-2436 _write_barrier_fastpath:
+                    //   TEST8 [obj + jit_wb_if_flag_byteofs], mask
+                    //   JNZ slow  (WriteBarrierSlowPath)
+                    // Fast path: flag not set → nothing to do.
+                    // Slow path: call jit_remember_young_pointer.
+                    //
+                    // The flag byte offset is computed from GcHeader layout:
+                    // header at obj - GcHeader::SIZE; TRACK_YOUNG_PTRS is at
+                    // bit FLAG_SHIFT in the u64 word → byte 4 on little-endian.
                     let obj = resolve_opref(&mut builder, &constants, op.arg(0));
+                    let flag_byte_ofs = -(majit_gc::header::GcHeader::SIZE as i32)
+                        + WriteBarrierDescr::extract_flag_byte(gc_flags::TRACK_YOUNG_PTRS).0 as i32;
+                    let mask = WriteBarrierDescr::extract_flag_byte(gc_flags::TRACK_YOUNG_PTRS).1;
+
+                    let flag_byte =
+                        builder
+                            .ins()
+                            .load(cl_types::I8, MemFlags::trusted(), obj, flag_byte_ofs);
+                    let flag_ext = builder.ins().uextend(cl_types::I64, flag_byte);
+                    let mask_v = builder.ins().iconst(cl_types::I64, mask as i64);
+                    let test = builder.ins().band(flag_ext, mask_v);
+                    let zero = builder.ins().iconst(cl_types::I64, 0);
+                    let needs_barrier = builder.ins().icmp(IntCC::NotEqual, test, zero);
+
+                    let slow_block = builder.create_block();
+                    builder.set_cold_block(slow_block);
+                    let cont_block = builder.create_block();
+                    builder
+                        .ins()
+                        .brif(needs_barrier, slow_block, &[], cont_block, &[]);
+
+                    // WriteBarrierSlowPath: call gc_write_barrier_shim
+                    builder.switch_to_block(slow_block);
+                    builder.seal_block(slow_block);
+                    let runtime_id = gc_runtime_id.ok_or_else(|| missing_gc_runtime(op.opcode))?;
+                    let runtime_id_v = builder.ins().iconst(cl_types::I64, runtime_id as i64);
                     let _ = emit_host_call(
                         &mut builder,
                         ptr_type,
                         call_conv,
                         gc_write_barrier_shim as *const () as usize,
-                        &[runtime_id, obj],
+                        &[runtime_id_v, obj],
                         None,
                     );
+                    builder.ins().jump(cont_block, &[]);
+
+                    builder.switch_to_block(cont_block);
+                    builder.seal_block(cont_block);
                 }
 
                 // ── Generic GC/raw memory loads ──
