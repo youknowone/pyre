@@ -366,6 +366,7 @@ pub struct EncodedResumeData {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DecodedResumeLayout {
     vable_array: Vec<ResumeValueSource>,
+    vref_array: Vec<ResumeValueSource>,
     frames: Vec<FrameInfo>,
     virtuals: Vec<VirtualInfo>,
     pending_fields: Vec<PendingFieldInfo>,
@@ -859,6 +860,7 @@ impl ResumeLayoutSummary {
     pub fn to_resume_data(&self) -> ResumeData {
         ResumeData {
             vable_array: Vec::new(),
+            vref_array: Vec::new(),
             frames: self
                 .frame_layouts
                 .iter()
@@ -887,6 +889,8 @@ impl ResumeLayoutSummary {
     ) -> ExitRecoveryLayout {
         if self.frame_layouts.is_empty() {
             return caller_prefix.cloned().unwrap_or(ExitRecoveryLayout {
+                vable_array: Vec::new(),
+                vref_array: Vec::new(),
                 frames: Vec::new(),
                 virtual_layouts: Vec::new(),
                 pending_field_layouts: Vec::new(),
@@ -934,6 +938,8 @@ impl ResumeLayoutSummary {
         );
 
         ExitRecoveryLayout {
+            vable_array: Vec::new(),
+            vref_array: Vec::new(),
             frames,
             virtual_layouts,
             pending_field_layouts,
@@ -1111,6 +1117,8 @@ pub struct FrameInfo {
 pub struct ResumeData {
     /// resume.py: snapshot_iter.vable_array / virtualizable_boxes
     pub vable_array: Vec<ResumeValueSource>,
+    /// resume.py: snapshot_iter.vref_array / virtualref_boxes
+    pub vref_array: Vec<ResumeValueSource>,
     /// Stack of frames, outermost first.
     /// For a simple non-inlined trace, this has exactly one entry.
     pub frames: Vec<FrameInfo>,
@@ -1784,6 +1792,7 @@ impl EncodedResumeData {
     pub fn encode(rd: &ResumeData) -> Self {
         Self::from_semantic(
             &rd.vable_array,
+            &rd.vref_array,
             &rd.frames,
             &rd.virtuals,
             &rd.pending_fields,
@@ -1796,6 +1805,7 @@ impl EncodedResumeData {
     /// TAGBOX numbers to unique liveboxes (resume.py:199-226).
     fn from_semantic(
         vable_array: &[ResumeValueSource],
+        vref_array: &[ResumeValueSource],
         frames: &[FrameInfo],
         virtuals: &[VirtualInfo],
         pending_fields: &[PendingFieldInfo],
@@ -1822,8 +1832,22 @@ impl EncodedResumeData {
             );
             rd_numb.push(tagged);
         }
-        // resume.py:243-247: vref_array (pairs). No vrefs in this path.
-        rd_numb.push(encode_len(0));
+        // resume.py:243-247: vref_array (pairs).
+        assert!(
+            vref_array.len() % 2 == 0,
+            "vref_array must have even length (pairs)"
+        );
+        rd_numb.push(encode_len(vref_array.len() / 2));
+        for source in vref_array {
+            let tagged = encode_tagged_source(
+                source,
+                &mut rd_consts,
+                &mut const_indices,
+                &mut liveboxes,
+                &mut box_map,
+            );
+            rd_numb.push(tagged);
+        }
 
         // resume.py:249-253: per-frame encoding via _number_boxes.
         // Per-frame: jitcode_index, pc, [tagged_values...].
@@ -1918,8 +1942,9 @@ impl EncodedResumeData {
             vable_array.push(self.decode_box(self.next_word(&mut cursor)));
         }
         let vref_count = decode_len(self.next_word(&mut cursor));
+        let mut vref_array = Vec::with_capacity(vref_count * 2);
         for _ in 0..(vref_count * 2) {
-            let _ = self.decode_box(self.next_word(&mut cursor));
+            vref_array.push(self.decode_box(self.next_word(&mut cursor)));
         }
         // resume.py:1049-1055: frame section.
         // Per-frame: jitcode_index, pc, [tagged_values...].
@@ -1970,6 +1995,7 @@ impl EncodedResumeData {
             .collect();
         DecodedResumeLayout {
             vable_array,
+            vref_array,
             frames,
             virtuals,
             pending_fields,
@@ -2019,6 +2045,7 @@ impl EncodedResumeData {
         let layout = self.decode_layout();
         ResumeData {
             vable_array: layout.vable_array,
+            vref_array: layout.vref_array,
             frames: layout.frames,
             virtuals: layout.virtuals,
             pending_fields: layout.pending_fields,
@@ -2129,6 +2156,7 @@ impl ResumeData {
         let slot_map: Vec<FrameSlotSource> = (0..num_slots).map(FrameSlotSource::FailArg).collect();
         ResumeData {
             vable_array: Vec::new(),
+            vref_array: Vec::new(),
             frames: vec![FrameInfo {
                 jitcode_index: 0,
                 pc,
@@ -2143,6 +2171,7 @@ impl ResumeData {
     pub fn encode(&self) -> EncodedResumeData {
         EncodedResumeData::from_semantic(
             &self.vable_array,
+            &self.vref_array,
             &self.frames,
             &self.virtuals,
             &self.pending_fields,
@@ -2659,6 +2688,7 @@ impl MaterializedVirtual {
 /// - `store_final_boxes_in_guard` (optimizer.rs) — virtual expansion + rd_virtuals
 pub struct ResumeDataVirtualAdder {
     vable_array: Vec<ResumeValueSource>,
+    vref_array: Vec<ResumeValueSource>,
     frames: Vec<FrameInfoBuilder>,
     virtuals: Vec<VirtualInfo>,
     pending_fields: Vec<PendingFieldInfo>,
@@ -2675,6 +2705,7 @@ impl ResumeDataVirtualAdder {
     pub fn new() -> Self {
         ResumeDataVirtualAdder {
             vable_array: Vec::new(),
+            vref_array: Vec::new(),
             frames: Vec::new(),
             virtuals: Vec::new(),
             pending_fields: Vec::new(),
@@ -2931,6 +2962,7 @@ impl ResumeDataVirtualAdder {
     pub fn build(self) -> ResumeData {
         ResumeData {
             vable_array: self.vable_array,
+            vref_array: self.vref_array,
             frames: self
                 .frames
                 .into_iter()
@@ -3904,8 +3936,22 @@ impl ResumeDataLoopMemo {
             );
             rd_numb.push(tagged);
         }
-        // resume.py:243-247: vref_array (pairs). No vrefs in this path.
-        rd_numb.push(encode_len(0));
+        // resume.py:243-247: vref_array (pairs).
+        assert!(
+            rd.vref_array.len() % 2 == 0,
+            "vref_array must have even length (pairs)"
+        );
+        rd_numb.push(encode_len(rd.vref_array.len() / 2));
+        for source in &rd.vref_array {
+            let tagged = encode_tagged_source(
+                source,
+                &mut self.rd_consts_pool,
+                &mut self.const_indices,
+                &mut liveboxes,
+                &mut box_map,
+            );
+            rd_numb.push(tagged);
+        }
 
         // resume.py:249-253: per-frame: jitcode_index, pc, [tagged_values...].
         let mut frame_sizes = Vec::with_capacity(rd.frames.len());
@@ -4214,6 +4260,7 @@ mod tests {
             }],
             virtuals: Vec::new(),
             vable_array: Vec::new(),
+            vref_array: Vec::new(),
             pending_fields: Vec::new(),
         };
         let fail_values = vec![10, 20, 30];
@@ -4246,6 +4293,7 @@ mod tests {
             ],
             virtuals: Vec::new(),
             vable_array: Vec::new(),
+            vref_array: Vec::new(),
             pending_fields: Vec::new(),
         };
         let fail_values = vec![1, 2, 3, 4];
@@ -4688,41 +4736,36 @@ pub struct ResumeDataDirectReader<'a> {
 /// ResumeDataDirectReader calls these methods when TAGVIRTUAL values
 /// need to be lazily allocated during decode_ref/decode_int.
 pub trait BlackholeAllocator {
-    /// resume.py:1437-1439 allocate_with_vtable →
-    ///   exec_new_with_vtable(self.cpu, descr) →
-    ///   llmodel.py:778 bh_new_with_vtable(sizedescr)
-    /// `descr_index` identifies the type, `descr_size` is the live
-    /// `sizedescr.size()` (RPython passes the full descr; pyre carries
-    /// only what blackhole resume needs).
-    fn allocate_with_vtable(&self, descr_index: u32, descr_size: usize, vtable: usize) -> i64 {
-        let _ = (descr_index, descr_size, vtable);
+    /// resume.py:1437-1439 allocate_with_vtable(known_class, descr) →
+    ///   exec_new_with_vtable(self.cpu, descr)
+    fn allocate_with_vtable(&self, descr: &majit_ir::DescrRef, vtable: usize) -> i64 {
+        let _ = (descr, vtable);
         0
     }
-    /// resume.py:1441-1442 allocate_struct → cpu.bh_new(typedescr) →
-    /// llmodel.py:775 bh_new(sizedescr).
-    fn allocate_struct(&self, descr_index: u32, descr_size: usize) -> i64 {
-        let _ = (descr_index, descr_size);
+    /// resume.py:1441-1442 allocate_struct(typedescr) → cpu.bh_new(typedescr)
+    fn allocate_struct(&self, typedescr: &majit_ir::DescrRef) -> i64 {
+        let _ = typedescr;
         0
     }
-    /// resume.py:1444 allocate_array
-    fn allocate_array(&self, length: usize, descr_index: u32, clear: bool) -> i64 {
-        let _ = (length, descr_index, clear);
+    /// resume.py:1444 allocate_array(length, arraydescr, clear)
+    fn allocate_array(&self, length: usize, arraydescr: &majit_ir::DescrRef, clear: bool) -> i64 {
+        let _ = (length, arraydescr, clear);
         0
     }
     /// resume.py:1509 setfield
     fn setfield(&self, struct_ptr: i64, field_descr: u32, value: i64) {
         let _ = (struct_ptr, field_descr, value);
     }
-    /// resume.py:1531 setarrayitem_int
-    fn setarrayitem_int(&self, array: i64, index: usize, value: i64, descr: u32) {
+    /// resume.py:1531 setarrayitem_int(array, i, value, arraydescr)
+    fn setarrayitem_int(&self, array: i64, index: usize, value: i64, descr: &majit_ir::DescrRef) {
         let _ = (array, index, value, descr);
     }
-    /// resume.py:1535 setarrayitem_ref
-    fn setarrayitem_ref(&self, array: i64, index: usize, value: i64, descr: u32) {
+    /// resume.py:1535 setarrayitem_ref(array, i, value, arraydescr)
+    fn setarrayitem_ref(&self, array: i64, index: usize, value: i64, descr: &majit_ir::DescrRef) {
         let _ = (array, index, value, descr);
     }
-    /// resume.py:1539 setarrayitem_float
-    fn setarrayitem_float(&self, array: i64, index: usize, value: i64, descr: u32) {
+    /// resume.py:1539 setarrayitem_float(array, i, value, arraydescr)
+    fn setarrayitem_float(&self, array: i64, index: usize, value: i64, descr: &majit_ir::DescrRef) {
         let _ = (array, index, value, descr);
     }
     /// resume.py:1520-1529 setinteriorfield(index, array, fieldnum, descr)
@@ -4781,9 +4824,9 @@ pub trait BlackholeAllocator {
         let _ = (field_offset, field_size);
         self.setfield(struct_ptr, descr, value);
     }
-    /// resume.py:1009-1015 setarrayitem dispatch by descr type.
+    /// pendingfields: setarrayitem dispatch by descr_index (legacy u32 path).
     fn setarrayitem_typed(&self, array: i64, index: usize, value: i64, descr: u32) {
-        self.setarrayitem_int(array, index, value, descr);
+        let _ = (array, index, value, descr);
     }
     /// Pyre-specific: box a raw int to a PyObject ref.
     ///
@@ -4826,19 +4869,18 @@ impl VirtualInfo {
     ) -> i64 {
         match self {
             VirtualInfo::VirtualObj {
-                type_id,
                 fields,
                 fielddescrs,
-                descr_size,
                 descr,
                 known_class,
                 ..
             } => {
                 // resume.py:619 allocate_with_vtable(descr=self.descr)
-                // llmodel.py:780 sizedescr.get_vtable() → vtable pointer.
-                // known_class (info.py:318) carries the vtable from optimize_new_with_vtable.
                 let vtable = known_class.unwrap_or(0) as usize;
-                let obj = allocator.allocate_with_vtable(*type_id, *descr_size, vtable);
+                let obj = descr
+                    .as_ref()
+                    .map(|d| allocator.allocate_with_vtable(d, vtable))
+                    .unwrap_or(0);
                 decoder.virtuals_cache.set_ptr(index, obj);
                 for (i, (field_descr, source)) in fields.iter().enumerate() {
                     let fd = fielddescrs.get(i);
@@ -4861,14 +4903,16 @@ impl VirtualInfo {
                 obj
             }
             VirtualInfo::VStruct {
-                type_id,
+                typedescr,
                 fields,
                 fielddescrs,
-                descr_size,
                 ..
             } => {
                 // resume.py:635 allocate_struct(self.typedescr)
-                let obj = allocator.allocate_struct(*type_id, *descr_size);
+                let obj = typedescr
+                    .as_ref()
+                    .map(|d| allocator.allocate_struct(d))
+                    .unwrap_or(0);
                 decoder.virtuals_cache.set_ptr(index, obj);
                 for (i, (field_descr, source)) in fields.iter().enumerate() {
                     let fd = fielddescrs.get(i);
@@ -4886,13 +4930,16 @@ impl VirtualInfo {
             }
             VirtualInfo::VArray {
                 arraydescr,
-                descr_index,
                 clear,
                 items,
+                ..
             } => {
                 let length = items.len();
                 // resume.py:653: array = decoder.allocate_array(length, arraydescr, self.clear)
-                let array = allocator.allocate_array(length, *descr_index, *clear);
+                let array = arraydescr
+                    .as_ref()
+                    .map(|d| allocator.allocate_array(length, d, *clear))
+                    .unwrap_or(0);
                 decoder.virtuals_cache.set_ptr(index, array);
                 // resume.py:656-670: dispatch by arraydescr element type
                 let is_pointers = arraydescr
@@ -4903,33 +4950,38 @@ impl VirtualInfo {
                     .as_ref()
                     .and_then(|d| d.as_array_descr())
                     .map_or(false, |ad| ad.is_array_of_floats());
-                for (i, source) in items.iter().enumerate() {
-                    if is_pointers {
-                        // resume.py:659: decoder.setarrayitem_ref(array, i, num, arraydescr)
-                        let value = decoder.decode_field_source(source);
-                        allocator.setarrayitem_ref(array, i, value, *descr_index);
-                    } else if is_floats {
-                        // resume.py:664: decoder.setarrayitem_float(array, i, num, arraydescr)
-                        let value = decoder.decode_field_source_float(source);
-                        allocator.setarrayitem_float(array, i, value, *descr_index);
-                    } else {
-                        // resume.py:669: decoder.setarrayitem_int(array, i, num, arraydescr)
-                        let value = decoder.decode_field_source_int(source);
-                        allocator.setarrayitem_int(array, i, value, *descr_index);
+                if let Some(ad) = arraydescr.as_ref() {
+                    for (i, source) in items.iter().enumerate() {
+                        if is_pointers {
+                            // resume.py:659: decoder.setarrayitem_ref(array, i, num, arraydescr)
+                            let value = decoder.decode_field_source(source);
+                            allocator.setarrayitem_ref(array, i, value, ad);
+                        } else if is_floats {
+                            // resume.py:664: decoder.setarrayitem_float(array, i, num, arraydescr)
+                            let value = decoder.decode_field_source_float(source);
+                            allocator.setarrayitem_float(array, i, value, ad);
+                        } else {
+                            // resume.py:669: decoder.setarrayitem_int(array, i, num, arraydescr)
+                            let value = decoder.decode_field_source_int(source);
+                            allocator.setarrayitem_int(array, i, value, ad);
+                        }
                     }
                 }
                 array
             }
             // resume.py:748-760: VArrayStructInfo.allocate
             VirtualInfo::VArrayStruct {
-                arraydescr: _,
-                descr_index,
+                arraydescr,
                 fielddescrs,
                 element_fields,
+                ..
             } => {
                 let size = element_fields.len();
                 // resume.py:749: array = decoder.allocate_array(self.size, self.arraydescr, clear=True)
-                let array = allocator.allocate_array(size, *descr_index, true);
+                let array = arraydescr
+                    .as_ref()
+                    .map(|d| allocator.allocate_array(size, d, true))
+                    .unwrap_or(0);
                 decoder.virtuals_cache.set_ptr(index, array);
                 // resume.py:752-759:
                 //   for i in range(self.size):

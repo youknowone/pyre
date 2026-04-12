@@ -4168,27 +4168,25 @@ fn extract_interior_field_info(descr: &majit_ir::DescrRef) -> (usize, usize, u8)
 pub(crate) struct PyreBlackholeAllocator;
 
 impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
-    fn allocate_struct(&self, descr_index: u32, descr_size: usize) -> i64 {
+    fn allocate_struct(&self, typedescr: &majit_ir::DescrRef) -> i64 {
         // resume.py:1441-1442 allocate_struct → cpu.bh_new(typedescr)
-        // llmodel.py:775-776 bh_new(sizedescr): plain malloc, no vtable.
+        let descr_size = typedescr.as_size_descr().map(|sd| sd.size()).unwrap_or(0);
+        let type_id = typedescr.index();
         let bh_descr = majit_codewriter::jitcode::BhDescr::Size {
             size: descr_size,
-            type_id: descr_index,
+            type_id: type_id as u32,
             vtable: 0,
         };
         let (driver, _) = driver_pair();
         driver.meta_interp().backend().bh_new(&bh_descr)
     }
 
-    fn allocate_with_vtable(&self, descr_index: u32, descr_size: usize, vtable: usize) -> i64 {
-        // resume.py:1437-1439 allocate_with_vtable →
+    fn allocate_with_vtable(&self, descr: &majit_ir::DescrRef, vtable: usize) -> i64 {
+        // resume.py:1437-1439 allocate_with_vtable(known_class, descr) →
         //   exec_new_with_vtable(self.cpu, descr)
-        // llmodel.py:778-782 bh_new_with_vtable: allocate AND set vtable.
-        // pyre's W_IntObject/W_FloatObject objects use Rust struct layout
-        // and embed the type pointer directly via Box::leak. For other GC
-        // types we delegate to the backend's bh_new_with_vtable, mirroring
-        // RPython's cpu.bh_new_with_vtable contract.
         use pyre_jit_trace::descr::{W_FLOAT_GC_TYPE_ID, W_INT_GC_TYPE_ID};
+        let descr_index = descr.index() as u32;
+        let descr_size = descr.as_size_descr().map(|sd| sd.size()).unwrap_or(0);
         match descr_index {
             W_INT_GC_TYPE_ID => {
                 let obj = Box::new(pyre_object::intobject::W_IntObject {
