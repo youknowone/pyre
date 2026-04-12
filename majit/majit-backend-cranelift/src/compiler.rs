@@ -5933,6 +5933,7 @@ impl CraneliftBackend {
 
         let mut guard_idx: usize = 0;
         let mut last_ovf_flag: Option<CValue> = None;
+        let _nursery_inline_count: usize = 0; // reserved for future bridge inline support
 
         // RPython x86 backend parity: preamble runs ONCE per trace entry;
         // body runs many times. Mark preamble blocks cold so Cranelift
@@ -8001,32 +8002,111 @@ impl CraneliftBackend {
 
                 // ── GC allocation calls ──
                 OpCode::CallMallocNursery => {
-                    let runtime_id = gc_runtime_id.ok_or_else(|| missing_gc_runtime(op.opcode))?;
-                    let runtime_id = builder.ins().iconst(cl_types::I64, runtime_id as i64);
-                    let size_total = builder.ins().iconst(
-                        cl_types::I64,
-                        resolve_rewriter_immediate_i64(&constants, op.arg(0)),
-                    );
-                    let size = builder.ins().iadd_imm(size_total, -(GcHeader::SIZE as i64));
-                    let result = emit_collecting_gc_call(
-                        &mut builder,
-                        ptr_type,
-                        call_conv,
-                        jf_ptr,
-                        &ref_root_slots,
-                        &defined_ref_vars,
-                        ref_root_base_ofs,
-                        per_call_gcmap,
-                        runtime_id,
-                        gc_alloc_nursery_shim as *const () as usize,
-                        &[size],
-                        Some(cl_types::I64),
-                    )
-                    .expect("GC allocation helper must return a value");
-                    jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
-                    outputs_ptr = jf_ptr;
-                    builder.def_var(jf_ptr_var, jf_ptr);
-                    builder.def_var(var(vi), result);
+                    // DEBUG: count inline attempts per compilation
+                    // x86/assembler.py:2567 malloc_cond parity: inline nursery
+                    // bump alloc for loop traces. Bridge traces use the host
+                    // call path — bridge compilation has a different ref-root
+                    // layout that interacts poorly with the inline fast/slow
+                    // block structure (Cranelift SSA Variable resolution issue
+                    // when inline blocks are combined with bridge guard setup).
+                    let use_inline = !is_bridge && gc_runtime_id.is_some();
+
+                    if use_inline {
+                        // x86/assembler.py:2567 inline nursery bump alloc
+                        let (nf_addr, nt_addr) = majit_gc::nursery::nursery_global_addrs();
+                        let flags = MemFlags::trusted();
+                        let size_imm = resolve_rewriter_immediate_i64(&constants, op.arg(0));
+                        let size_total = builder.ins().iconst(cl_types::I64, size_imm);
+                        let nf_ptr = builder.ins().iconst(ptr_type, nf_addr as i64);
+                        let nt_ptr = builder.ins().iconst(ptr_type, nt_addr as i64);
+                        let free = builder.ins().load(ptr_type, flags, nf_ptr, 0);
+                        let new_free = builder.ins().iadd(free, size_total);
+                        let top = builder.ins().load(ptr_type, flags, nt_ptr, 0);
+                        let fits =
+                            builder
+                                .ins()
+                                .icmp(IntCC::UnsignedLessThanOrEqual, new_free, top);
+                        let fast_block = builder.create_block();
+                        let slow_block = builder.create_block();
+                        let merge_block = builder.create_block();
+                        builder.append_block_param(merge_block, ptr_type); // result only
+                        builder.ins().brif(fits, fast_block, &[], slow_block, &[]);
+
+                        // fast: inline bump alloc, no GC
+                        builder.switch_to_block(fast_block);
+                        builder.seal_block(fast_block);
+                        builder.ins().store(flags, new_free, nf_ptr, 0);
+                        let zero_hdr = builder.ins().iconst(cl_types::I64, 0);
+                        builder.ins().store(MemFlags::trusted(), zero_hdr, free, 0);
+                        let hdr_sz = builder.ins().iconst(ptr_type, GcHeader::SIZE as i64);
+                        let obj = builder.ins().iadd(free, hdr_sz);
+                        builder.ins().jump(merge_block, &[BlockArg::from(obj)]);
+
+                        // slow: host call, may trigger GC
+                        builder.switch_to_block(slow_block);
+                        builder.seal_block(slow_block);
+                        builder.set_cold_block(slow_block);
+                        let rid = gc_runtime_id.ok_or_else(|| missing_gc_runtime(op.opcode))?;
+                        let rid_v = builder.ins().iconst(cl_types::I64, rid as i64);
+                        let ps = builder.ins().iadd_imm(size_total, -(GcHeader::SIZE as i64));
+                        let slow_r = emit_collecting_gc_call(
+                            &mut builder,
+                            ptr_type,
+                            call_conv,
+                            jf_ptr,
+                            &ref_root_slots,
+                            &defined_ref_vars,
+                            ref_root_base_ofs,
+                            per_call_gcmap,
+                            rid_v,
+                            gc_alloc_nursery_shim as *const () as usize,
+                            &[ps],
+                            Some(cl_types::I64),
+                        )
+                        .expect("alloc");
+                        builder.ins().jump(merge_block, &[BlockArg::from(slow_r)]);
+
+                        builder.switch_to_block(merge_block);
+                        builder.seal_block(merge_block);
+                        let result = builder.block_params(merge_block)[0];
+                        // Always reload jf_ptr from shadow stack after merge.
+                        // Do NOT use block params for jf_ptr — deep phi chains
+                        // across multiple inline allocs + CallAssemblerR blocks
+                        // cause Cranelift SSA corruption.
+                        jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                        outputs_ptr = jf_ptr;
+                        builder.def_var(jf_ptr_var, jf_ptr);
+                        builder.def_var(var(vi), result);
+                    } else {
+                        // host call fallback
+                        let runtime_id =
+                            gc_runtime_id.ok_or_else(|| missing_gc_runtime(op.opcode))?;
+                        let runtime_id = builder.ins().iconst(cl_types::I64, runtime_id as i64);
+                        let size_total = builder.ins().iconst(
+                            cl_types::I64,
+                            resolve_rewriter_immediate_i64(&constants, op.arg(0)),
+                        );
+                        let size = builder.ins().iadd_imm(size_total, -(GcHeader::SIZE as i64));
+                        let result = emit_collecting_gc_call(
+                            &mut builder,
+                            ptr_type,
+                            call_conv,
+                            jf_ptr,
+                            &ref_root_slots,
+                            &defined_ref_vars,
+                            ref_root_base_ofs,
+                            per_call_gcmap,
+                            runtime_id,
+                            gc_alloc_nursery_shim as *const () as usize,
+                            &[size],
+                            Some(cl_types::I64),
+                        )
+                        .expect("alloc");
+                        jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                        outputs_ptr = jf_ptr;
+                        builder.def_var(jf_ptr_var, jf_ptr);
+                        builder.def_var(var(vi), result);
+                    }
                 }
                 OpCode::CallMallocNurseryVarsize => {
                     let runtime_id = gc_runtime_id.ok_or_else(|| missing_gc_runtime(op.opcode))?;
