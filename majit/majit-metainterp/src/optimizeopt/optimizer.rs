@@ -1538,15 +1538,20 @@ impl Optimizer {
         for (&k, &v) in &self.original_trace_op_types {
             ctx.value_types.insert(k, v);
         }
-        // 2. Transformed trace ops (optimizer input)
+        // 2. Previous phase's emitted op types (Phase 1 → Phase 2 carry)
+        //
+        // These are only fallback types for carried-over OpRefs that do not
+        // appear in the current transformed trace. The current trace's own
+        // ops must win, matching PyPy's intrinsic Box.type on the current
+        // ResOperation objects.
+        for (&k, &v) in &self.prev_phase_value_types {
+            ctx.value_types.insert(k, v);
+        }
+        // 3. Transformed trace ops (optimizer input)
         for op in ops {
             if !op.pos.is_none() && op.result_type() != majit_ir::Type::Void {
                 ctx.value_types.insert(op.pos.0, op.result_type());
             }
-        }
-        // 3. Previous phase's emitted op types (Phase 1 → Phase 2 carry)
-        for (&k, &v) in &self.prev_phase_value_types {
-            ctx.value_types.insert(k, v);
         }
         // 4. Inputarg types (from recorder — RPython InputArgInt/Ref/Float)
         //    Highest priority — override all others. Inputargs occupy
@@ -1883,6 +1888,7 @@ impl Optimizer {
 
         // RPython Box type parity: preserve value_types from this phase
         // so the next phase can resolve types for carried-over OpRefs.
+        self.prev_phase_value_types.clear();
         self.prev_phase_value_types
             .extend(ctx.value_types.iter().map(|(&k, &v)| (k, v)));
 
@@ -2944,21 +2950,39 @@ impl Optimizer {
         // optimizer.py:598-602:
         //     if rop.returns_bool_result(op.opnum):
         //         self.getintbound(op).make_bool()
-        //
-        // RPython parity guard: returns_bool implies result is int-typed in
-        // RPython because Box.type is intrinsic. pyre's trace pipeline can
-        // leave value_types[op.pos] tagged with a stale type from a removed
-        // op (cut_trace_from / Phase 2 import). Only call into intbound
-        // mutation when the resolved opref is actually int-typed; otherwise
-        // skip silently to avoid corrupting the bound store.
         if op.opcode.returns_bool() {
-            let resolved = ctx.get_box_replacement(op.pos);
-            let resolved_tp = ctx.opref_type(resolved);
-            if resolved_tp.is_none() || resolved_tp == Some(majit_ir::Type::Int) {
-                ctx.with_intbound_mut(op.pos, |bound| bound.make_bool());
-            }
+            assert_eq!(
+                op.result_type(),
+                majit_ir::Type::Int,
+                "returns_bool op must have int result: {:?} pos={:?} args={:?}",
+                op.opcode,
+                op.pos,
+                op.args
+            );
+            // RPython parity: the current ResOp already carries type 'i'.
+            // majit's OpRef type cache can still hold stale None/Void/Float
+            // from an earlier position reuse until emit() commits the op.
+            // Stamp the current op's authoritative result type before the
+            // getintbound/with_intbound_mut path reads box.type.
+            ctx.value_types.insert(op.pos.0, majit_ir::Type::Int);
+            ctx.with_intbound_mut(op.pos, |bound| bound.make_bool());
         }
         let emitted = ctx.emit(op.clone());
+        // optimizer.py:603-611: after emit, promote IntBound→Const.
+        //   op = self.get_box_replacement(op)
+        //   if op.type == 'i':
+        //       opinfo = op.get_forwarded()  # IntBound
+        //       if opinfo is not None and opinfo.is_constant():
+        //           op.set_forwarded(ConstInt(opinfo.get_constant_int()))
+        if op.result_type() == majit_ir::Type::Int {
+            let replaced = ctx.get_box_replacement(emitted);
+            if let Some(bound) = ctx.peek_intbound(replaced) {
+                if bound.is_constant() {
+                    let const_val = bound.get_constant();
+                    ctx.make_constant(replaced, majit_ir::Value::Int(const_val));
+                }
+            }
+        }
         if std::env::var_os("MAJIT_LOG").is_some()
             && matches!(
                 op.opcode,

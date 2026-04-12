@@ -258,6 +258,16 @@ pub(crate) fn build_guard_metadata(
                     })
                     .collect::<Vec<_>>();
                 builder.set_vable_array(vable_array);
+                let vref_array = _vref_values
+                    .iter()
+                    .map(|val| match val {
+                        RebuiltValue::Box(idx, _) => ResumeValueSource::FailArg(*idx),
+                        RebuiltValue::Const(c, _tp) => ResumeValueSource::Constant(*c),
+                        RebuiltValue::Int(i) => ResumeValueSource::Constant(*i as i64),
+                        RebuiltValue::Virtual(vidx) => ResumeValueSource::Virtual(*vidx),
+                        RebuiltValue::Unassigned => ResumeValueSource::Unavailable,
+                    })
+                    .collect::<Vec<_>>();
                 let add_slot =
                     |builder: &mut ResumeDataVirtualAdder, slot_idx: usize, val: &RebuiltValue| {
                         match val {
@@ -321,19 +331,17 @@ pub(crate) fn build_guard_metadata(
             // Consumer switchover path: rd_numb contains the full frame encoding.
             // Build recovery_layout from rd_numb + rd_virtuals.
             use majit_backend::{ExitRecoveryLayout, ExitValueSourceLayout};
-            let frames_layout =
+            let (num_failargs, vable_layout, vref_layout, frames_layout) =
                 if let (Some(rd_numb_bytes), Some(rd_consts_data)) = (&op.rd_numb, &op.rd_consts) {
                     use majit_ir::resumedata::{RebuiltValue, rebuild_from_numbering};
                     let fvc = majit_ir::resumedata::get_frame_value_count_fn();
                     let fvc_ref: Option<&dyn Fn(i32, i32) -> usize> =
                         fvc.as_ref().map(|f| f as &dyn Fn(i32, i32) -> usize);
-                    let (_num_failargs, _vable_values, vref_values, frames) =
+                    let (num_failargs, vable_values, vref_values, frames) =
                         rebuild_from_numbering(rd_numb_bytes, rd_consts_data, &exit_types, fvc_ref);
-                    // TODO: vref_array parity (resume.py:1386,1431).
-                    // pyre does not yet use virtual references.
                     debug_assert!(
-                        vref_values.is_empty(),
-                        "vref_values not empty ({} entries) but vref recovery is not implemented",
+                        vref_values.len() & 1 == 0,
+                        "vref_values length must be even, got {}",
                         vref_values.len(),
                     );
                     let to_exit_source = |val: &RebuiltValue| match val {
@@ -343,26 +351,31 @@ pub(crate) fn build_guard_metadata(
                         RebuiltValue::Int(i) => ExitValueSourceLayout::Constant(*i as i64),
                         RebuiltValue::Unassigned => ExitValueSourceLayout::Uninitialized,
                     };
-                    frames
-                        .iter()
-                        .enumerate()
-                        .rev()
-                        .map(|(orig_idx, frame)| {
-                            let mut slots = Vec::new();
-                            slots.extend(frame.values.iter().map(to_exit_source));
-                            let slot_types = derive_slot_types(&slots, &exit_types);
-                            majit_backend::ExitFrameLayout {
-                                trace_id: None,
-                                header_pc: Some(frame.pc as u64),
-                                source_guard: None,
-                                pc: frame.pc as u64,
-                                slots,
-                                slot_types: Some(slot_types),
-                            }
-                        })
-                        .collect::<Vec<_>>()
+                    (
+                        num_failargs,
+                        vable_values.iter().map(to_exit_source).collect::<Vec<_>>(),
+                        vref_values.iter().map(to_exit_source).collect::<Vec<_>>(),
+                        frames
+                            .iter()
+                            .enumerate()
+                            .rev()
+                            .map(|(orig_idx, frame)| {
+                                let mut slots = Vec::new();
+                                slots.extend(frame.values.iter().map(to_exit_source));
+                                let slot_types = derive_slot_types(&slots, &exit_types);
+                                majit_backend::ExitFrameLayout {
+                                    trace_id: None,
+                                    header_pc: Some(frame.pc as u64),
+                                    source_guard: None,
+                                    pc: frame.pc as u64,
+                                    slots,
+                                    slot_types: Some(slot_types),
+                                }
+                            })
+                            .collect::<Vec<_>>(),
+                    )
                 } else {
-                    vec![]
+                    (exit_types.len() as i32, vec![], vec![], vec![])
                 };
             // Collect slots from ALL frames for virtual target_slot lookup.
             // RPython resolves virtuals across the entire frame stack, not
@@ -373,6 +386,29 @@ pub(crate) fn build_guard_metadata(
                 .collect();
             // resume.py:576-860 parity: resolve fieldnums tags for recovery.
             let rd_consts_ref = op.rd_consts.as_deref().unwrap_or(&[]);
+            let resolve_tagged_source = |tagged: i16| -> ExitValueSourceLayout {
+                let (val, tagbits) = majit_ir::resumedata::untag(tagged);
+                match tagbits {
+                    majit_ir::resumedata::TAGBOX => {
+                        let idx = if val >= 0 {
+                            val as usize
+                        } else {
+                            (num_failargs + val) as usize
+                        };
+                        ExitValueSourceLayout::ExitValue(idx)
+                    }
+                    majit_ir::resumedata::TAGVIRTUAL => {
+                        ExitValueSourceLayout::Virtual(val as usize)
+                    }
+                    majit_ir::resumedata::TAGINT => ExitValueSourceLayout::Constant(val as i64),
+                    majit_ir::resumedata::TAGCONST => {
+                        let idx = (val - majit_ir::resumedata::TAG_CONST_OFFSET) as usize;
+                        let c = rd_consts_ref.get(idx).map(|(v, _)| *v).unwrap_or(0);
+                        ExitValueSourceLayout::Constant(c)
+                    }
+                    _ => ExitValueSourceLayout::Constant(0),
+                }
+            };
             let resolve_fieldnums = |fieldnums: &[i16],
                                      fielddescr_indices: &[u32]|
              -> Vec<(u32, ExitValueSourceLayout)> {
@@ -381,25 +417,7 @@ pub(crate) fn build_guard_metadata(
                     .enumerate()
                     .map(|(fi, &fnum)| {
                         let fdi = fielddescr_indices.get(fi).copied().unwrap_or(fi as u32);
-                        let (val, tagbits) = majit_ir::resumedata::untag(fnum);
-                        let source = match tagbits {
-                            majit_ir::resumedata::TAGBOX => {
-                                ExitValueSourceLayout::ExitValue(val as usize)
-                            }
-                            majit_ir::resumedata::TAGVIRTUAL => {
-                                ExitValueSourceLayout::Virtual(val as usize)
-                            }
-                            majit_ir::resumedata::TAGINT => {
-                                ExitValueSourceLayout::Constant(val as i64)
-                            }
-                            majit_ir::resumedata::TAGCONST => {
-                                let idx = (val - majit_ir::resumedata::TAG_CONST_OFFSET) as usize;
-                                let c = rd_consts_ref.get(idx).map(|(v, _)| *v).unwrap_or(0);
-                                ExitValueSourceLayout::Constant(c)
-                            }
-                            _ => ExitValueSourceLayout::Constant(0),
-                        };
-                        (fdi, source)
+                        (fdi, resolve_tagged_source(fnum))
                     })
                     .collect()
             };
@@ -475,31 +493,7 @@ pub(crate) fn build_guard_metadata(
                                     );
                                     let items = fieldnums
                                         .iter()
-                                        .map(|&fnum| {
-                                            let (val, tagbits) = majit_ir::resumedata::untag(fnum);
-                                            match tagbits {
-                                                majit_ir::resumedata::TAGBOX => {
-                                                    ExitValueSourceLayout::ExitValue(val as usize)
-                                                }
-                                                majit_ir::resumedata::TAGVIRTUAL => {
-                                                    ExitValueSourceLayout::Virtual(val as usize)
-                                                }
-                                                majit_ir::resumedata::TAGINT => {
-                                                    ExitValueSourceLayout::Constant(val as i64)
-                                                }
-                                                majit_ir::resumedata::TAGCONST => {
-                                                    let idx = (val
-                                                        - majit_ir::resumedata::TAG_CONST_OFFSET)
-                                                        as usize;
-                                                    let c = rd_consts_ref
-                                                        .get(idx)
-                                                        .map(|(v, _)| *v)
-                                                        .unwrap_or(0);
-                                                    ExitValueSourceLayout::Constant(c)
-                                                }
-                                                _ => ExitValueSourceLayout::Constant(0),
-                                            }
-                                        })
+                                        .map(|&fnum| resolve_tagged_source(fnum))
                                         .collect();
                                     majit_backend::ExitVirtualLayout::Array {
                                         descr_index: *descr_index,
@@ -545,31 +539,7 @@ pub(crate) fn build_guard_metadata(
                                 } => {
                                     let values = fieldnums
                                         .iter()
-                                        .map(|&fnum| {
-                                            let (val, tagbits) = majit_ir::resumedata::untag(fnum);
-                                            match tagbits {
-                                                majit_ir::resumedata::TAGBOX => {
-                                                    ExitValueSourceLayout::ExitValue(val as usize)
-                                                }
-                                                majit_ir::resumedata::TAGVIRTUAL => {
-                                                    ExitValueSourceLayout::Virtual(val as usize)
-                                                }
-                                                majit_ir::resumedata::TAGINT => {
-                                                    ExitValueSourceLayout::Constant(val as i64)
-                                                }
-                                                majit_ir::resumedata::TAGCONST => {
-                                                    let idx = (val
-                                                        - majit_ir::resumedata::TAG_CONST_OFFSET)
-                                                        as usize;
-                                                    let c = rd_consts_ref
-                                                        .get(idx)
-                                                        .map(|(v, _)| *v)
-                                                        .unwrap_or(0);
-                                                    ExitValueSourceLayout::Constant(c)
-                                                }
-                                                _ => ExitValueSourceLayout::Constant(0),
-                                            }
-                                        })
+                                        .map(|&fnum| resolve_tagged_source(fnum))
                                         .collect();
                                     majit_backend::ExitVirtualLayout::RawBuffer {
                                         func: *func,
@@ -583,18 +553,7 @@ pub(crate) fn build_guard_metadata(
                                     // resume.py:717: VRawSliceInfo — base_buffer + offset.
                                     let base = fieldnums
                                         .first()
-                                        .map(|&fnum| {
-                                            let (val, tagbits) = majit_ir::resumedata::untag(fnum);
-                                            match tagbits {
-                                                majit_ir::resumedata::TAGBOX => {
-                                                    ExitValueSourceLayout::ExitValue(val as usize)
-                                                }
-                                                majit_ir::resumedata::TAGVIRTUAL => {
-                                                    ExitValueSourceLayout::Virtual(val as usize)
-                                                }
-                                                _ => ExitValueSourceLayout::Constant(val as i64),
-                                            }
-                                        })
+                                        .map(|&fnum| resolve_tagged_source(fnum))
                                         .unwrap_or(ExitValueSourceLayout::Constant(0));
                                     majit_backend::ExitVirtualLayout::RawSlice {
                                         offset: *offset,
@@ -617,28 +576,6 @@ pub(crate) fn build_guard_metadata(
                     entries
                         .iter()
                         .map(|pf| {
-                            let resolve_tagged = |tagged: i16| -> ExitValueSourceLayout {
-                                let (val, tagbits) = majit_ir::resumedata::untag(tagged);
-                                match tagbits {
-                                    majit_ir::resumedata::TAGBOX => {
-                                        ExitValueSourceLayout::ExitValue(val as usize)
-                                    }
-                                    majit_ir::resumedata::TAGVIRTUAL => {
-                                        ExitValueSourceLayout::Virtual(val as usize)
-                                    }
-                                    majit_ir::resumedata::TAGINT => {
-                                        ExitValueSourceLayout::Constant(val as i64)
-                                    }
-                                    majit_ir::resumedata::TAGCONST => {
-                                        let idx =
-                                            (val - majit_ir::resumedata::TAG_CONST_OFFSET) as usize;
-                                        let c =
-                                            rd_consts_ref.get(idx).map(|(v, _)| *v).unwrap_or(0);
-                                        ExitValueSourceLayout::Constant(c)
-                                    }
-                                    _ => ExitValueSourceLayout::Constant(0),
-                                }
-                            };
                             // field_offset is precomputed for array items
                             // (base_size + item_index * item_size), so do NOT
                             // pass item_index to the consumer — it would
@@ -649,8 +586,8 @@ pub(crate) fn build_guard_metadata(
                                 descr_index: pf.descr_index,
                                 item_index: None,
                                 is_array_item: false,
-                                target: resolve_tagged(pf.target_tagged),
-                                value: resolve_tagged(pf.value_tagged),
+                                target: resolve_tagged_source(pf.target_tagged),
+                                value: resolve_tagged_source(pf.value_tagged),
                                 field_offset: pf.field_offset,
                                 field_size: pf.field_size,
                                 field_type: pf.field_type,
@@ -660,8 +597,8 @@ pub(crate) fn build_guard_metadata(
                 })
                 .unwrap_or_default();
             Some(ExitRecoveryLayout {
-                vable_array: Vec::new(),
-                vref_array: Vec::new(),
+                vable_array: vable_layout,
+                vref_array: vref_layout,
                 frames: frames_layout,
                 virtual_layouts,
                 pending_field_layouts,
@@ -674,8 +611,8 @@ pub(crate) fn build_guard_metadata(
                 .map(majit_backend::ExitValueSourceLayout::ExitValue)
                 .collect();
             Some(ExitRecoveryLayout {
-                vable_array: Vec::new(),
-                vref_array: Vec::new(),
+                vable_array: vec![],
+                vref_array: vec![],
                 frames: vec![majit_backend::ExitFrameLayout {
                     trace_id: None,
                     header_pc: Some(pc),

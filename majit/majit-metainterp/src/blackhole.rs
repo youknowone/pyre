@@ -799,7 +799,7 @@ use crate::jitcode::{
     BC_RERAISE, BC_RESIDUAL_CALL_VOID, BC_SET_SELECTED, BC_SETARRAYITEM_VABLE_F,
     BC_SETARRAYITEM_VABLE_I, BC_SETARRAYITEM_VABLE_R, BC_SETFIELD_VABLE_F, BC_SETFIELD_VABLE_I,
     BC_SETFIELD_VABLE_R, BC_STORE_DOWN, BC_STORE_STATE_ARRAY, BC_STORE_STATE_FIELD,
-    BC_STORE_STATE_VARRAY, BC_SWAP_STACK, JitArgKind, JitCode, LivenessInfo, MIFrame, MIFrameStack,
+    BC_STORE_STATE_VARRAY, BC_SWAP_STACK, JitArgKind, JitCode, MIFrame, MIFrameStack,
 };
 
 // ── BlackholeInterpBuilder: setup_insns infrastructure ──────────────
@@ -880,6 +880,8 @@ pub struct BlackholeInterpreter {
     pub descrs: Vec<BhDescr>,
     /// RPython `blackhole.py:289` `self.op_catch_exception = builder.op_catch_exception`.
     pub op_catch_exception: u8,
+    /// RPython `blackhole.py:289` `self.op_live = builder.op_live`.
+    pub op_live: u8,
     /// Integer register bank.
     /// Indices 0..num_regs_i are working registers.
     /// Indices num_regs_i..num_regs_i+constants_i.len() hold constants.
@@ -981,6 +983,7 @@ impl BlackholeInterpreter {
             cpu: None,
             descrs: Vec::new(),
             op_catch_exception: u8::MAX,
+            op_live: u8::MAX,
             registers_i: Vec::new(),
             registers_r: Vec::new(),
             registers_f: Vec::new(),
@@ -1056,10 +1059,6 @@ impl BlackholeInterpreter {
 
         // blackhole.py:336-337
         // RPython: descrs are shared on the builder (setup_descrs).
-        // pyre: per-jitcode descrs, loaded here.
-        if !jitcode.descrs.is_empty() {
-            self.descrs = jitcode.descrs.clone();
-        }
         self.jitcode = jitcode;
         self.position = position;
         self.aborted = false;
@@ -1279,22 +1278,7 @@ impl BlackholeInterpreter {
     /// consumers pair it with `enumerate_vars(offset, all_liveness, ...)`
     /// matching `resume.py:1017-1026`.
     pub fn get_current_position_info(&self) -> usize {
-        // TODO: thread `metainterp_sd.op_live` through the builder once
-        // the bytecode stream embeds `-live-` opcodes.
-        self.jitcode.get_live_vars_info(self.position, 0)
-    }
-
-    /// Transitional helper: look up the per-entry `LivenessInfo` that
-    /// matches the current `bh.position`. Upstream has no such lookup —
-    /// consumers should read live-register bits via `enumerate_vars`
-    /// over the packed `liveness_info` bytes. This exists only so the
-    /// pyre-specific non-live-register seeding in `call_jit` can keep
-    /// compiling until Phase D removes it.
-    pub fn get_current_position_info_legacy(&self) -> Option<&LivenessInfo> {
-        self.jitcode
-            .liveness
-            .iter()
-            .find(|info| info.pc as usize == self.position)
+        self.jitcode.get_live_vars_info(self.position, self.op_live)
     }
 
     /// blackhole.py:1653 _setup_return_value_i
@@ -2515,6 +2499,8 @@ impl BlackholeInterpBuilder {
         // RPython blackhole.py:288: self.descrs = builder.descrs
         bh.descrs = self.descrs.clone();
         bh.op_catch_exception = self.op_catch_exception;
+        //   self.op_live = builder.op_live
+        bh.op_live = self.op_live;
         bh
     }
 
@@ -2568,15 +2554,10 @@ fn handle_jitexception_dispatch(
         JitException::ExitFrameWithExceptionRef(_) => Err(exc),
         // warmspot.py:970-983
         JitException::ContinueRunningNormally { .. } => {
-            if let Some(runner) = portal_runner {
-                // warmspot.py:976-978: result = portal_ptr(*args)
-                // May raise JitException → Err propagated for re-dispatch.
-                runner(&exc)
-            } else {
-                // No portal runner registered — treat as void return.
-                // This is a graceful degradation for non-pyre callers.
-                Ok((BhReturnType::Void, 0))
-            }
+            // warmspot.py:976-978: result = portal_ptr(*args)
+            // May raise JitException → Err propagated for re-dispatch.
+            let runner = portal_runner.expect("ContinueRunningNormally requires portal_runner");
+            runner(&exc)
         }
     }
 }
@@ -5231,7 +5212,6 @@ fn read_list_f(bh: &BlackholeInterpreter, code: &[u8], pos: usize) -> (Vec<i64>,
         .collect();
     (values, pos + 1 + count)
 }
-#[allow(dead_code)]
 fn flatten_args(a: &[i64], b: &[i64], c: &[i64]) -> Vec<i64> {
     let mut all = Vec::with_capacity(a.len() + b.len() + c.len());
     all.extend_from_slice(a);
@@ -6277,8 +6257,7 @@ fn handler_getarrayitem_vable_i(
     let index = bh.registers_i[code[p + 1] as usize];
     if !bh.virtualizable_info.is_null() {
         let vinfo = unsafe { &*bh.virtualizable_info };
-        let ptr = vable as *mut u8;
-        unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, ptr) };
+        unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, vable as *mut u8) };
     }
     let (field_descr, p) = read_descr_vable_array(bh, code, p + 2);
     let (array_descr, p) = read_descr(bh, code, p);
@@ -6296,8 +6275,7 @@ fn handler_getarrayitem_vable_r(
     let index = bh.registers_i[code[p + 1] as usize];
     if !bh.virtualizable_info.is_null() {
         let vinfo = unsafe { &*bh.virtualizable_info };
-        let ptr = vable as *mut u8;
-        unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, ptr) };
+        unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, vable as *mut u8) };
     }
     let (field_descr, p) = read_descr_vable_array(bh, code, p + 2);
     let (array_descr, p) = read_descr(bh, code, p);
@@ -6316,8 +6294,7 @@ fn handler_setarrayitem_vable_i(
     let value = bh.registers_i[code[p + 2] as usize];
     if !bh.virtualizable_info.is_null() {
         let vinfo = unsafe { &*bh.virtualizable_info };
-        let ptr = vable as *mut u8;
-        unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, ptr) };
+        unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, vable as *mut u8) };
     }
     let (field_descr, p) = read_descr_vable_array(bh, code, p + 3);
     let (array_descr, p) = read_descr(bh, code, p);
@@ -6336,8 +6313,7 @@ fn handler_setarrayitem_vable_r(
     let value = bh.registers_r[code[p + 2] as usize];
     if !bh.virtualizable_info.is_null() {
         let vinfo = unsafe { &*bh.virtualizable_info };
-        let ptr = vable as *mut u8;
-        unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, ptr) };
+        unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, vable as *mut u8) };
     }
     let (field_descr, p) = read_descr_vable_array(bh, code, p + 3);
     let (array_descr, p) = read_descr(bh, code, p);
@@ -6354,8 +6330,7 @@ fn handler_arraylen_vable(
     let vable = bh.registers_r[code[p] as usize];
     if !bh.virtualizable_info.is_null() {
         let vinfo = unsafe { &*bh.virtualizable_info };
-        let ptr = vable as *mut u8;
-        unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, ptr) };
+        unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, vable as *mut u8) };
     }
     let (field_descr, p) = read_descr_vable_array(bh, code, p + 1);
     let (array_len_descr, p) = read_descr(bh, code, p);
@@ -6914,8 +6889,7 @@ fn handler_getarrayitem_vable_f(
     let index = bh.registers_i[code[p + 1] as usize];
     if !bh.virtualizable_info.is_null() {
         let vinfo = unsafe { &*bh.virtualizable_info };
-        let ptr = vable as *mut u8;
-        unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, ptr) };
+        unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, vable as *mut u8) };
     }
     let (field_descr, p) = read_descr_vable_array(bh, code, p + 2);
     let (array_descr, p) = read_descr(bh, code, p);
@@ -6937,8 +6911,7 @@ fn handler_setarrayitem_vable_f(
     let value = f64::from_bits(bh.registers_f[code[p + 2] as usize] as u64);
     if !bh.virtualizable_info.is_null() {
         let vinfo = unsafe { &*bh.virtualizable_info };
-        let ptr = vable as *mut u8;
-        unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, ptr) };
+        unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, vable as *mut u8) };
     }
     let (field_descr, p) = read_descr_vable_array(bh, code, p + 3);
     let (array_descr, p) = read_descr(bh, code, p);
