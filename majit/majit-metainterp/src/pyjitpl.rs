@@ -932,11 +932,7 @@ impl<M: Clone> MetaInterp<M> {
             pending_preamble_tokens: HashMap::new(),
             all_descrs: Vec::new(),
             pending_frontend_boxes: None,
-            // cls_of_box requires frontend_boxes to include virtualizable
-            // state values (RPython unroll.py:183 trace.inputargs has ALL
-            // inputargs). Our pending_frontend_boxes only has guard fail_args.
-            // Disabled until frontend_boxes reconstruction is complete.
-            cls_of_box: None,
+            cls_of_box: Some(default_cls_of_box),
         }
     }
 
@@ -956,6 +952,14 @@ impl<M: Clone> MetaInterp<M> {
     /// sequential descr_index during collect_optimizer_knowledge_for_resume().
     pub(crate) fn take_back_all_descrs(&mut self, all_descrs: Vec<DescrRef>) {
         self.all_descrs = all_descrs;
+    }
+
+    /// bridgeopt.py:124 parity: set frontend_boxes (raw dead frame values)
+    /// for cls_of_box during bridge deserialization.
+    /// Must be called with dead frame values (guard exit_types order),
+    /// NOT with extract_live values (virtualizable field order).
+    pub fn set_pending_frontend_boxes(&mut self, raw_values: &[i64]) {
+        self.pending_frontend_boxes = Some(raw_values.to_vec());
     }
 
     /// Cache the current virtualizable object pointer for trace-entry setup.
@@ -5803,6 +5807,12 @@ impl<M: Clone> MetaInterp<M> {
                 // Our fail_values (dead frame) may be shorter than bridge_inputargs
                 // when virtualizable state extends the inputargs beyond fail_args.
                 // Pad to match liveboxes length (RPython bridgeopt.py:126 assert).
+                // unroll.py:183-188: frontend_inputargs = trace.inputargs
+                // RPython's frontend_boxes = trace.inputargs always matches
+                // liveboxes = trace.get_iter().inputargs in length.
+                // Our pending_frontend_boxes (from extract_live) may be longer
+                // (includes virtualizable array items beyond guard fail_args) or
+                // shorter. Resize to match liveboxes (bridgeopt.py:126 assert).
                 let mut frontend_boxes = self.pending_frontend_boxes.take().unwrap_or_default();
                 frontend_boxes.resize(liveboxes.len(), 0);
                 Some(PendingBridgeRd {
@@ -6196,9 +6206,12 @@ impl<M: Clone> MetaInterp<M> {
         fail_values: &[i64],
         _live_types: &[Type],
     ) -> Option<BridgeRetraceResult> {
-        // bridgeopt.py:124 parity: save runtime values (frontend_boxes)
-        // for cls_of_box during bridge deserialization.
-        self.pending_frontend_boxes = Some(fail_values.to_vec());
+        // bridgeopt.py:124 parity: if the caller hasn't set pending_frontend_boxes
+        // via set_pending_frontend_boxes (with dead frame values in exit_types order),
+        // fall back to extract_live values. The caller should always set them first.
+        if self.pending_frontend_boxes.is_none() {
+            self.pending_frontend_boxes = Some(fail_values.to_vec());
+        }
         let compiled = match self.compiled_loops.get(&green_key) {
             Some(c) => c,
             None => return None,

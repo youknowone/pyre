@@ -2242,6 +2242,17 @@ pub fn trace_and_compile_from_bridge(
         );
     }
 
+    // bridgeopt.py:124 parity: frontend_boxes = raw dead frame values
+    // (aligned with guard exit_types order, not virtualizable field order).
+    // Must be set BEFORE start_bridge_tracing, which internally calls
+    // start_retrace_from_guard that overwrites pending_frontend_boxes with
+    // extract_live values (wrong order for cls_of_box).
+    {
+        let (driver, _) = crate::eval::driver_pair();
+        driver
+            .meta_interp_mut()
+            .set_pending_frontend_boxes(raw_values);
+    }
     // compile.py:714: start_retrace_from_guard + set bridge_info.
     let started = {
         let (driver, _) = crate::eval::driver_pair();
