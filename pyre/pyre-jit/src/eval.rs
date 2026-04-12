@@ -254,15 +254,6 @@ thread_local! {
         //     rclass.OBJECT, 'typeptr', translate_support_code)
         // pyre's PyObject.ob_type is the equivalent of RPython's typeptr.
         d.set_vtable_offset(Some(pyre_object::pyobject::OB_TYPE_OFFSET));
-        d.register_raw_int_box_helper(pyre_object::intobject::jit_w_int_new as *const ());
-        d.register_create_frame_raw(
-            crate::call_jit::jit_create_callee_frame_1 as *const (),
-            crate::call_jit::jit_create_callee_frame_1_raw_int as *const (),
-        );
-        d.register_create_frame_raw(
-            crate::call_jit::jit_create_self_recursive_callee_frame_1 as *const (),
-            crate::call_jit::jit_create_self_recursive_callee_frame_1_raw_int as *const (),
-        );
         // resume.py:1367 — BlackholeAllocator for virtual materialization.
         d.register_blackhole_allocator(PyreBlackholeAllocator);
         // warmspot.py:1039 handle_jitexception_from_blackhole parity:
@@ -272,11 +263,9 @@ thread_local! {
         // PyPy interp_jit.py:75 — JitDriver(is_recursive=True)
         d.set_is_recursive(true);
         // warmstate.py:259 trace_eagerness=200 (RPython default).
-        // warmspot.py:449 — portal function returns a Python object (int).
-        // pyre's portal always returns PyObjectRef, but the JIT unboxes
-        // int results to raw i64 via unbox_finish_result, so the static
-        // result_type is Int.
-        d.set_result_type(majit_ir::Type::Int);
+        // warmspot.py:449 — portal result_type = getkind(portal.getreturnvar()).
+        // PyPy portal returns W_Root (REF). pyre portal returns PyObjectRef (REF).
+        d.set_result_type(majit_ir::Type::Ref);
         (d, info)
     });
 }
@@ -4512,6 +4501,38 @@ def fib(n):
         unsafe {
             let fib = *(*frame.namespace).get("fib").unwrap();
             assert!(crate::call_jit::callable_prefers_function_entry(fib));
+        }
+    }
+
+    /// Regression test for the recursive portal Ref ABI.
+    ///
+    /// RPython portal return type is always REF (warmspot.py:449).
+    /// The self-recursive call uses CALL_ASSEMBLER_R, FINISH records with
+    /// done_with_this_frame_descr_ref, and the caller unboxes via
+    /// GuardNonnullClass + GetfieldGcPureI (pyjitpl.py:3198-3220).
+    ///
+    /// A previous bug used CALL_ASSEMBLER_I + FINISH(Int) + forced unbox
+    /// at the blackhole boundary, causing pointer-like-integer corruption
+    /// in the recursive return path.
+    #[test]
+    fn test_recursive_fib_returns_correct_result_through_jit() {
+        let source = "\
+def fib(n):
+    if n < 2:
+        return n
+    return fib(n - 1) + fib(n - 2)
+result = fib(12)
+";
+        let code = pyre_interpreter::compile_exec(source).expect("compile failed");
+        let mut frame = PyFrame::new(code);
+        let _ = eval_with_jit(&mut frame);
+        unsafe {
+            let result = *(*frame.namespace).get("result").unwrap();
+            assert_eq!(
+                pyre_object::intobject::w_int_get_value(result),
+                144,
+                "fib(12) should be 144 — recursive portal Ref ABI regression"
+            );
         }
     }
 

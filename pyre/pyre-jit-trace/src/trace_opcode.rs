@@ -2849,7 +2849,8 @@ impl MIFrame {
                             );
                             let ca_arg_types =
                                 frame_entry_arg_types_from_slot_types(&callee_slot_types);
-                            let result = ctx.call_assembler_int_by_number_typed(
+                            // warmspot.py:449 portal result_type == REF → CALL_ASSEMBLER_R
+                            let ca_result = ctx.call_assembler_ref_by_number_typed(
                                 token_number,
                                 &ca_args,
                                 &ca_arg_types,
@@ -2858,10 +2859,12 @@ impl MIFrame {
                                 crate::callbacks::get().jit_drop_callee_frame,
                                 &[callee_frame],
                             );
+                            this.remember_value_type(ca_result, Type::Ref);
                             let result = if inline_framestack_active {
-                                wrapint(ctx, result)
+                                ca_result // already Ref — no unbox+rebox needed
                             } else {
-                                result
+                                // Caller unboxes: guard_class + getfield_gc_i
+                                this.trace_guarded_int_payload(ctx, ca_result)
                             };
                             Ok(result)
                         });
@@ -3026,7 +3029,8 @@ impl MIFrame {
                                 };
                                 let ca_arg_types =
                                     frame_entry_arg_types_from_slot_types(&callee_meta.slot_types);
-                                let result = ctx.call_assembler_int_by_number_typed(
+                                // warmspot.py:449 portal result_type == REF → CALL_ASSEMBLER_R
+                                let ca_result = ctx.call_assembler_ref_by_number_typed(
                                     token_number,
                                     &ca_args,
                                     &ca_arg_types,
@@ -3035,12 +3039,12 @@ impl MIFrame {
                                     crate::callbacks::get().jit_drop_callee_frame,
                                     &[callee_frame],
                                 );
-                                let result = if inline_framestack_active
-                                    && driver.has_raw_int_finish(callee_key)
-                                {
-                                    wrapint(ctx, result)
+                                this.remember_value_type(ca_result, Type::Ref);
+                                let result = if inline_framestack_active {
+                                    ca_result // already Ref
                                 } else {
-                                    result
+                                    // Caller unboxes: guard_class + getfield_gc_i
+                                    this.trace_guarded_int_payload(ctx, ca_result)
                                 };
                                 Ok(result)
                             });
@@ -3334,47 +3338,57 @@ impl MIFrame {
                         None
                     };
                     let result = if let Some(token_number) = ca_token {
-                        // RPython: CALL_ASSEMBLER_I — compiled code calls
-                        // compiled callee directly. Bridge handles guard
-                        // failures (base cases). Self-recursive Int variant
-                        // skips wrapint + locals fill via the raw_int helper
-                        // (matches PyPy's virtualizable optimization that
-                        // keeps locals in registers, not in the heap frame).
-                        let (helper, helper_arg_types) =
-                            one_arg_callee_frame_helper(Type::Int, true);
-                        let callee_frame =
-                            ctx.call_ref_typed(helper, &[this.frame(), raw_arg], &helper_arg_types);
+                        // pyjitpl.py:3589-3609 direct_assembler_call parity:
+                        // CALL_ASSEMBLER takes [caller_frame, boxed_arg].
+                        // No CallR(create_frame) host function call.
+                        // Backend reads code/ns from caller_frame via
+                        // VableExpansion, uses const_overrides for ni/vsd,
+                        // and arg_overrides for locals[0] = boxed_arg.
+                        let boxed_arg = wrapint(ctx, raw_arg);
                         let callee_nlocals = unsafe {
                             let code_ptr = pyre_interpreter::get_pycode(concrete_callable)
                                 as *const pyre_interpreter::CodeObject;
                             (&*code_ptr).varnames.len()
                         };
-                        // RPython pyjitpl.py:3583: pass raw Int arg, return raw Int.
-                        let ca_code = unsafe { function_get_code(concrete_callable) } as usize;
-                        let ca_ns = unsafe { function_get_globals(concrete_callable) } as usize;
-                        let ca_args = synthesize_fresh_callee_entry_args(
-                            ctx,
-                            callee_frame,
-                            &[raw_arg],
-                            callee_nlocals,
-                            ca_code,
-                            ca_ns,
-                        );
-                        let callee_slot_types =
-                            pending_entry_slot_types_from_args(&[Type::Int], callee_nlocals, 0);
-                        let ca_arg_types =
-                            frame_entry_arg_types_from_slot_types(&callee_slot_types);
-                        let ca_result = ctx.call_assembler_int_by_number_typed(
+                        let first_array_slot = 1 + 4; // frame + 4 scalars
+                        let expansion = majit_ir::VableExpansion {
+                            scalar_fields: vec![
+                                (crate::frame_layout::PYFRAME_NEXT_INSTR_OFFSET, Type::Int),
+                                (crate::frame_layout::PYFRAME_CODE_OFFSET, Type::Ref),
+                                (
+                                    crate::frame_layout::PYFRAME_VALUESTACKDEPTH_OFFSET,
+                                    Type::Int,
+                                ),
+                                (crate::frame_layout::PYFRAME_NAMESPACE_OFFSET, Type::Ref),
+                            ],
+                            array_struct_offset:
+                                crate::frame_layout::PYFRAME_LOCALS_CELLS_STACK_OFFSET,
+                            array_ptr_offset: pyre_object::PYOBJECT_ARRAY_PTR_OFFSET,
+                            num_array_items: callee_nlocals,
+                            // Callee entry: next_instr=0, vsd=nlocals
+                            const_overrides: vec![
+                                (1, 0),                     // slot 1 = next_instr = 0
+                                (3, callee_nlocals as i64), // slot 3 = vsd = nlocals
+                            ],
+                            // locals[0] = boxed_arg (CALL_ASSEMBLER arg[1])
+                            arg_overrides: vec![(first_array_slot, 1)],
+                        };
+                        let ca_result = ctx.call_assembler_with_vable_expansion_args(
                             token_number,
-                            &ca_args,
-                            &ca_arg_types,
+                            &[this.frame(), boxed_arg],
+                            &[Type::Ref, Type::Ref],
+                            Type::Ref,
+                            expansion,
                         );
-                        ctx.call_void(
-                            crate::callbacks::get().jit_drop_callee_frame,
-                            &[callee_frame],
-                        );
-                        this.remember_value_type(ca_result, Type::Int);
-                        ca_result
+                        // pyjitpl.py:2079: GUARD_NOT_FORCED
+                        this.push_call_replay_stack(ctx, callable, args, call_pc);
+                        this.generate_guard(ctx, OpCode::GuardNotForced, &[]);
+                        ctx.heap_cache_mut().invalidate_caches_for_escaped();
+                        this.pop_call_replay_stack(ctx, args.len())?;
+                        this.remember_value_type(ca_result, Type::Ref);
+                        // Caller unboxes: guard_class + getfield_gc_i
+                        let unboxed = this.trace_guarded_int_payload(ctx, ca_result);
+                        unboxed
                     } else if force_fn
                         == crate::callbacks::get().jit_force_self_recursive_call_argraw_boxed_1
                     {
@@ -3395,7 +3409,7 @@ impl MIFrame {
                     // pyjitpl.py:2078: vable_after_residual_call
                     this.vable_after_residual_call()?;
                     if ca_token.is_none() {
-                        // pyjitpl.py:2079: GUARD_NOT_FORCED
+                        // CALL_MAY_FORCE path: GUARD_NOT_FORCED
                         this.push_call_replay_stack(ctx, callable, args, call_pc);
                         this.generate_guard(ctx, OpCode::GuardNotForced, &[]);
                         ctx.heap_cache_mut().invalidate_caches_for_escaped();
@@ -3931,10 +3945,22 @@ impl MIFrame {
             }
         }
         let action = match step_result {
-            Ok(pyre_interpreter::StepResult::Return(value)) => TraceAction::Finish {
-                finish_args: vec![value.opref],
-                finish_arg_types: vec![self.value_type(value.opref)],
-            },
+            Ok(pyre_interpreter::StepResult::Return(value)) => {
+                // warmspot.py:449 portal result_type == REF: FINISH stores Ref.
+                // If the traced value is Int (optimizer unboxed), box it before
+                // FINISH so done_with_this_frame_descr_ref is used.
+                let vtype = self.value_type(value.opref);
+                let (farg, ftype) = if vtype == Type::Int {
+                    let boxed = self.with_ctx(|_this, ctx| wrapint(ctx, value.opref));
+                    (boxed, Type::Ref)
+                } else {
+                    (value.opref, vtype)
+                };
+                TraceAction::Finish {
+                    finish_args: vec![farg],
+                    finish_arg_types: vec![ftype],
+                }
+            }
             Err(_) => TraceAction::Abort,
             other => self.into_trace_action(other),
         };
@@ -4026,33 +4052,21 @@ pub(crate) fn trace_step_result_to_action(
             loop_header_pc: Some(loop_header_pc),
         },
         Ok(pyre_interpreter::StepResult::Return(fop)) => {
-            // RPython DoneWithThisFrameDescrInt parity: keep raw Int as
-            // the FINISH slot type when value_type is Int, so the
-            // self-recursive CALL_ASSEMBLER_I caller consumes it directly
-            // without guard_class + getfield_gc_i.
+            // pyjitpl.py:3198-3220 compile_done_with_this_frame parity:
+            //   result_type = jitdriver_sd.result_type
+            //   if result_type == history.REF:
+            //       token = sd.done_with_this_frame_descr_ref
+            //
+            // warmspot.py:449: result_type = getkind(portal.getreturnvar())
+            // PyPy portal returns W_Root → REF. FINISH always uses
+            // done_with_this_frame_descr_ref.
             let value = fop.opref;
-            let concrete_from_fop = match fop.concrete {
-                crate::state::ConcreteValue::Int(_) => None,
-                crate::state::ConcreteValue::Ref(v) if !v.is_null() => Some(v),
-                _ => None,
-            };
-            let (finish_value, finish_type) = match state.value_type(value) {
-                Type::Int => (value, Type::Int),
-                Type::Float => (value, Type::Float),
-                Type::Ref | Type::Void => {
-                    let concrete =
-                        concrete_from_fop.or_else(|| state.concrete_stack_value_at_return());
-                    let is_int = concrete.map_or(false, |v| {
-                        !v.is_null() && unsafe { pyre_object::pyobject::is_int(v) }
-                    });
-                    if is_int {
-                        let unboxed =
-                            state.with_ctx(|this, ctx| this.trace_guarded_int_payload(ctx, value));
-                        (unboxed, Type::Int)
-                    } else {
-                        (value, Type::Ref)
-                    }
-                }
+            let vt = state.value_type(value);
+            let finish_value = if vt == Type::Int {
+                // Re-box Int → Ref (portal result_type = REF).
+                state.with_ctx(|this, ctx| wrapint(ctx, value))
+            } else {
+                value
             };
             // pyjitpl.py:3199-3236 compile_done_with_this_frame ->
             // store_token_in_vable parity.
@@ -4063,7 +4077,7 @@ pub(crate) fn trace_step_result_to_action(
             });
             TraceAction::Finish {
                 finish_args: vec![finish_value],
-                finish_arg_types: vec![finish_type],
+                finish_arg_types: vec![Type::Ref],
             }
         }
         Ok(pyre_interpreter::StepResult::Yield(fop)) => {

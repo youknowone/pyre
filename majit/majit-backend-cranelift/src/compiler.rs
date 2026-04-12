@@ -175,15 +175,6 @@ fn jitframe_gc_type_id_is_explicit() -> bool {
 unsafe fn jitframe_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut GcRef)) {
     let jf_ptr = obj_addr as *const u8;
 
-    // jitframe.py:105-109 parity: RPython traces header ref fields
-    // (jf_descr, jf_force_descr, jf_savedata, jf_guard_exc, jf_forward)
-    // because in RPython these are GC-managed ResOperation/ResumeGuard
-    // objects. In majit, these fields hold RAW Rust pointers
-    // (Arc<CraneliftFailDescr> addresses, fail_index encodings) that
-    // are NOT on the GC heap. Tracing them as GcRef would corrupt
-    // the pointers when their bit pattern accidentally falls within
-    // the nursery address range. Skip header tracing entirely.
-
     // jitframe.py:115: gcmap = (obj_addr + getofs('jf_gcmap')).address[0]
     let gcmap_ptr = unsafe { *(jf_ptr.add(JF_GCMAP_OFS as usize) as *const *const u8) };
     if gcmap_ptr.is_null() {
@@ -2364,6 +2355,72 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
 /// This avoids the full shim → execute_registered_loop_target overhead
 /// while still supporting bridge dispatch.
 /// RPython assembler_call_helper parity: handle guard failure from
+/// assembler.py:1122-1128 _call_header_shadowstack — inline Cranelift IR.
+///
+/// Emits 5 inline instructions matching RPython's x86 sequence:
+///   MOV ebx, [root_stack_top_addr]     // load top pointer
+///   MOV [ebx], 1                       // is_minor marker
+///   MOV [ebx + WORD], ebp              // jf_ptr
+///   ADD ebx, 2*WORD                    // advance
+///   MOV [root_stack_top_addr], ebx     // store new top
+fn emit_call_header_shadowstack(
+    builder: &mut FunctionBuilder,
+    ptr_type: cranelift_codegen::ir::Type,
+    jf_ptr: CValue,
+) {
+    let word = std::mem::size_of::<usize>() as i64;
+    let rst_addr_val = builder.ins().iconst(
+        ptr_type,
+        majit_gc::shadow_stack::get_root_stack_top_addr() as i64,
+    );
+    // MOV ebx, [root_stack_top_addr]
+    let rst = builder
+        .ins()
+        .load(ptr_type, MemFlags::trusted(), rst_addr_val, 0);
+    // MOV [ebx], 1   — is_minor marker
+    let one = builder.ins().iconst(ptr_type, 1);
+    builder.ins().store(MemFlags::trusted(), one, rst, 0);
+    // MOV [ebx + WORD], ebp
+    let jf_as_ptr = if builder.func.dfg.value_type(jf_ptr) != ptr_type {
+        builder.ins().ireduce(ptr_type, jf_ptr)
+    } else {
+        jf_ptr
+    };
+    builder
+        .ins()
+        .store(MemFlags::trusted(), jf_as_ptr, rst, word as i32);
+    // ADD ebx, 2*WORD
+    let new_rst = builder.ins().iadd_imm(rst, 2 * word);
+    // MOV [root_stack_top_addr], ebx
+    builder
+        .ins()
+        .store(MemFlags::trusted(), new_rst, rst_addr_val, 0);
+}
+
+/// assembler.py:1130-1136 _call_footer_shadowstack — inline Cranelift IR.
+///
+/// Emits 3 inline instructions matching RPython's x86 sequence:
+///   MOV ebx, [root_stack_top_addr]     // load (or reuse known addr)
+///   SUB ebx, 2*WORD                    // decrement
+///   MOV [root_stack_top_addr], ebx     // store
+fn emit_call_footer_shadowstack(
+    builder: &mut FunctionBuilder,
+    ptr_type: cranelift_codegen::ir::Type,
+) {
+    let word = std::mem::size_of::<usize>() as i64;
+    let rst_addr_val = builder.ins().iconst(
+        ptr_type,
+        majit_gc::shadow_stack::get_root_stack_top_addr() as i64,
+    );
+    let rst = builder
+        .ins()
+        .load(ptr_type, MemFlags::trusted(), rst_addr_val, 0);
+    let new_rst = builder.ins().iadd_imm(rst, -(2 * word));
+    builder
+        .ins()
+        .store(MemFlags::trusted(), new_rst, rst_addr_val, 0);
+}
+
 /// direct call_assembler path. Ultra-lightweight: just increments
 /// fail count, checks bridge (atomic + mutex only when bridge exists),
 /// and defers bridge compilation. Falls back to force_fn.
@@ -2404,20 +2461,14 @@ fn call_assembler_guard_failure_inner(
             std::slice::from_raw_parts(outputs_ptr, 16)
         });
         let handle = store_call_assembler_deadframe(frame);
-        // Return via PENDING_FORCE_LOCAL0 — caller will detect deadframe.
         return handle as i64;
     }
 
-    let target = unsafe { &*fast_lookup_ca_target(token_number) };
-    // RPython get_latest_descr parity: jf_descr is a FailDescr pointer.
+    // Fast path: read bridge_code_ptr directly from the fail_descr
+    // pointer (which IS jf_descr from the callee's guard exit). Skip
+    // target lookup and fail_count increment when bridge is available.
     let fail_descr_ref = unsafe { &*(fail_descr_ptr as *const CraneliftFailDescr) };
-    let fail_index = fail_descr_ref.fail_index();
-    let fail_descr = &target.fail_descrs[fail_index as usize];
-    let _fail_count = fail_descr.increment_fail_count();
-
-    // assembler.py:295-360 call_assembler parity:
-    // dispatch to bridge, check jf_descr, load result from returned frame.
-    let bridge_ptr = fail_descr.bridge_code_ptr();
+    let bridge_ptr = fail_descr_ref.bridge_code_ptr();
     if !bridge_ptr.is_null() {
         let func: unsafe extern "C" fn(*mut i64) -> *mut i64 =
             unsafe { std::mem::transmute(bridge_ptr) };
@@ -2439,6 +2490,12 @@ fn call_assembler_guard_failure_inner(
         }
         // Bridge didn't finish — fall through to blackhole/force.
     }
+
+    // Slow path: target lookup + fail_count increment.
+    let target = unsafe { &*fast_lookup_ca_target(token_number) };
+    let fail_index = fail_descr_ref.fail_index();
+    let fail_descr = &target.fail_descrs[fail_index as usize];
+    let _fail_count = fail_descr.increment_fail_count();
 
     // compile.py:701-717 handle_fail → must_compile → bridge tracing.
     // Check jitcounter threshold; if reached, trace alternate path and
@@ -3944,6 +4001,8 @@ fn reload_ref_roots(
         let val = builder
             .ins()
             .load(cl_types::I64, MemFlags::trusted(), jf_ptr, offset);
+        // TODO: re-enable nursery jitframe allocation once inline nursery
+        // bump tracking is fixed (use_gc_alloc currently forced to false).
         builder.def_var(var(var_idx), val);
     }
 }
@@ -3999,9 +4058,9 @@ fn compute_per_call_gcmap(max_output_slots: usize, num_ref_roots: usize) -> i64 
     ptr as i64
 }
 
-/// RPython _reload_frame_if_necessary (assembler.py:405-412):
-///   MOV ecx, [rootstacktop]
-///   MOV ebp, [ecx - WORD]    // reload jf_ptr from shadow stack
+/// assembler.py:1369-1377 _reload_frame_if_necessary:
+///   MOV ecx, [rootstacktop]      // load shadow stack top pointer
+///   MOV ebp, [ecx - WORD]        // load jf_ptr from topmost entry
 ///
 /// After a collecting call, the GC may have copied the jitframe from
 /// nursery to old gen. The shadow stack entry was updated by the GC.
@@ -4011,21 +4070,19 @@ fn emit_reload_frame_if_necessary(
     ptr_type: cranelift_codegen::ir::Type,
     _call_conv: cranelift_codegen::isa::CallConv,
 ) -> CValue {
-    // _reload_frame_if_necessary (assembler.py:1369-1377):
-    //   MOV ecx, [rootstacktop]
-    //   MOV ebp, [ecx - WORD]
-    //
-    // After a collecting call, the GC may have moved the jitframe.
-    // Read the GC-updated jf_ptr from the global CURRENT_TOP_JF_PTR.
-    // This is a single inline load (vs the old extern "C" call through
-    // TLS + RefCell + Vec::last), matching RPython's 2-MOV pattern.
-    let global_addr = builder.ins().iconst(
+    let word = std::mem::size_of::<usize>() as i32;
+    // MOV ecx, [rootstacktop]
+    let rst_addr = builder.ins().iconst(
         ptr_type,
-        majit_gc::shadow_stack::current_top_jf_ptr_addr() as i64,
+        majit_gc::shadow_stack::get_root_stack_top_addr() as i64,
     );
+    let rst = builder
+        .ins()
+        .load(ptr_type, MemFlags::trusted(), rst_addr, 0);
+    // MOV ebp, [ecx - WORD]  — jf_ptr is at top - WORD
     builder
         .ins()
-        .load(ptr_type, MemFlags::trusted(), global_addr, 0)
+        .load(ptr_type, MemFlags::trusted(), rst, -word)
 }
 
 /// RPython push_gcmap (assembler.py:2017-2022, callbuilder.py:93-107):
@@ -4327,6 +4384,8 @@ fn emit_guard_exit(
     constants: &HashMap<u32, i64>,
     jf_ptr: CValue,
     info: &GuardInfo,
+    ptr_type: cranelift_codegen::ir::Type,
+    _call_conv: cranelift_codegen::isa::CallConv,
 ) {
     // _push_all_regs_to_frame / save_into_mem parity:
     // store fail_args to jf_frame[slot]
@@ -4430,6 +4489,9 @@ fn emit_guard_exit(
     builder
         .ins()
         .store(MemFlags::trusted(), descr_val, jf_ptr, JF_DESCR_OFS); // #2105
+    // assembler.py:1101 _call_footer → _call_footer_shadowstack:
+    // SUB [rootstacktop], 2*WORD — inline, no function call.
+    emit_call_footer_shadowstack(builder, ptr_type);
     // _call_footer (assembler.py:1097): mov eax, ebp; ret
     builder.ins().return_(&[jf_ptr]);
 }
@@ -4644,9 +4706,16 @@ fn run_compiled_code_inner(
     // JITFRAME type_id so the GC can copy+trace it correctly. The shadow
     // stack holds a GcRef that the GC updates in place when copying.
     // When GC is a stub (TrackingGc) or absent, fall back to Vec<i64>.
-    let use_gc_alloc = gc_runtime_id
-        .map(|id| with_gc_runtime(id, |gc| gc.type_count() > 0))
-        .unwrap_or(false);
+    // jitframe_allocate (jitframe.py:48) allocates from the nursery
+    // via rgc.malloc. Nursery::alloc syncs from NURSERY_FREE_ADDR
+    // (incminimark.py:676 gc_adr_of_nursery_free parity) so JIT
+    // inline bumps and GC allocations share the same free pointer.
+    // jitframe.py:48 parity: allocate jitframes from nursery when GC
+    // type registry is available. The gcmap marks ref_root_slots, which
+    // are spilled/reloaded around collecting calls. Input slots are read
+    // once at entry (before any GC point) and their values live in
+    // SSA/ref_root_slots afterward.
+    let use_gc_alloc = gc_runtime_id.is_some();
     let (jf_gcref, heap_owner): (GcRef, Option<Vec<i64>>) = if use_gc_alloc {
         let runtime_id = gc_runtime_id.unwrap();
         let type_id = runtime_jitframe_type_id(runtime_id).unwrap_or_else(|| {
@@ -4667,6 +4736,10 @@ fn run_compiled_code_inner(
             gc.alloc_nursery_no_collect_typed(type_id, payload_bytes)
         });
         unsafe {
+            // jitframe.py:48 parity: zero the header so jf_descr starts
+            // as NULL (GuardNotForced checks jf_descr != 0).
+            // RPython's nursery allocation zeros memory; ours may not.
+            std::ptr::write_bytes(gcref.0 as *mut u8, 0, JF_FRAME_ITEM0_OFS as usize);
             *((gcref.0 + JF_FRAME_LENGTH_OFS as usize) as *mut usize) = frame_depth;
         }
         (gcref, None)
@@ -4705,11 +4778,9 @@ fn run_compiled_code_inner(
 
     let _jitted_guard = majit_backend::JittedGuard::enter();
 
-    // _call_header_shadowstack (assembler.py:1122-1128) parity:
-    // Push jf_ptr as GcRef onto the jitframe shadow stack. The GC
-    // treats this as a root: if in nursery, copies jitframe to old gen
-    // and updates the GcRef in place.
-    let jf_shadow_depth = majit_gc::shadow_stack::push_jf(jf_gcref);
+    // assembler.py:1074 _call_header_shadowstack and assembler.py:1101
+    // _call_footer_shadowstack are emitted as inline MOVs in compiled
+    // code's prologue/epilogue. The caller does NOT touch root_stack_top.
 
     if std::env::var_os("MAJIT_LOG").is_some() {
         eprintln!(
@@ -4725,9 +4796,6 @@ fn run_compiled_code_inner(
     if std::env::var_os("MAJIT_LOG").is_some() {
         eprintln!("[post-call] result_jf={:p}", result_jf);
     }
-
-    // _call_footer_shadowstack (assembler.py:1130-1136) parity:
-    majit_gc::shadow_stack::pop_jf_to(jf_shadow_depth);
 
     // jitframe_resolve (jitframe.py:54-57):
     // Follow jf_forward chain — the compiled code may return the old
@@ -5006,9 +5074,6 @@ pub struct CraneliftBackend {
     module: JITModule,
     func_ctx: FunctionBuilderContext,
     constants: HashMap<u32, i64>,
-    /// rewrite.py:930 parity: OpRef → Type for constants, so the GC rewriter
-    /// can check `v.type == 'r'` on ConstPtr values.
-    constant_types: HashMap<u32, Type>,
     func_counter: u32,
     gc_runtime_id: Option<u64>,
     trace_counter: u64,
@@ -5104,7 +5169,6 @@ impl CraneliftBackend {
             module,
             func_ctx,
             constants: HashMap::new(),
-            constant_types: HashMap::new(),
             func_counter: 0,
             gc_runtime_id: None,
             trace_counter: 1,
@@ -5189,10 +5253,6 @@ impl CraneliftBackend {
         self.constants = constants;
     }
 
-    pub fn set_constant_types(&mut self, constant_types: HashMap<u32, Type>) {
-        self.constant_types = constant_types;
-    }
-
     /// Force the next compile call to assign a specific trace id to all exits.
     pub fn set_next_trace_id(&mut self, trace_id: u64) {
         self.next_trace_id = Some(trace_id);
@@ -5235,11 +5295,8 @@ impl CraneliftBackend {
         let mut normalized = normalize_ops_for_codegen_simple(inputargs, ops);
         inject_builtin_string_descrs(&mut normalized);
         if let Some(rewriter) = self.gc_rewriter() {
-            let (result, new_constants) = rewriter.rewrite_for_gc_with_constants_typed(
-                &normalized,
-                constants,
-                &self.constant_types,
-            );
+            let (result, new_constants) =
+                rewriter.rewrite_for_gc_with_constants(&normalized, constants);
             // Merge GC rewriter's new constants into self.constants
             for (k, v) in new_constants {
                 self.constants.entry(k).or_insert(v);
@@ -5596,6 +5653,14 @@ impl CraneliftBackend {
         let mut jf_ptr = builder.block_params(entry_block)[0];
         let inputs_ptr = jf_ptr; // alias for entry loading
         let mut outputs_ptr = jf_ptr; // alias for guard exit stores (updated after reload)
+
+        // assembler.py:1074 _call_header_shadowstack — inline MOVs:
+        //   MOV ebx, [root_stack_top_addr]
+        //   MOV [ebx], 1            // is_minor marker
+        //   MOV [ebx + WORD], ebp   // jf_ptr
+        //   ADD ebx, 2*WORD
+        //   MOV [root_stack_top_addr], ebx
+        emit_call_header_shadowstack(&mut builder, ptr_type, jf_ptr);
         // Ref root slots live in jf_frame after output/fail_args area.
         // RPython: refs are always in jf_frame; gcmap marks which slots
         // are live at each GC point (regalloc.py get_gcmap).
@@ -6283,7 +6348,7 @@ impl CraneliftBackend {
                     builder.switch_to_block(exit_block);
                     builder.seal_block(exit_block);
                     let cur_jf = builder.use_var(jf_ptr_var);
-                    emit_guard_exit(&mut builder, &constants, cur_jf, info);
+                    emit_guard_exit(&mut builder, &constants, cur_jf, info, ptr_type, call_conv);
 
                     builder.switch_to_block(cont_block);
                     builder.seal_block(cont_block);
@@ -6307,7 +6372,7 @@ impl CraneliftBackend {
                     builder.switch_to_block(exit_block);
                     builder.seal_block(exit_block);
                     let cur_jf = builder.use_var(jf_ptr_var);
-                    emit_guard_exit(&mut builder, &constants, cur_jf, info);
+                    emit_guard_exit(&mut builder, &constants, cur_jf, info, ptr_type, call_conv);
 
                     builder.switch_to_block(cont_block);
                     builder.seal_block(cont_block);
@@ -6348,7 +6413,7 @@ impl CraneliftBackend {
                     builder.switch_to_block(exit_block);
                     builder.seal_block(exit_block);
                     let cur_jf = builder.use_var(jf_ptr_var);
-                    emit_guard_exit(&mut builder, &constants, cur_jf, info);
+                    emit_guard_exit(&mut builder, &constants, cur_jf, info, ptr_type, call_conv);
 
                     builder.switch_to_block(cont_block);
                     builder.seal_block(cont_block);
@@ -6391,7 +6456,7 @@ impl CraneliftBackend {
                     builder.switch_to_block(exit_block);
                     builder.seal_block(exit_block);
                     let cur_jf = builder.use_var(jf_ptr_var);
-                    emit_guard_exit(&mut builder, &constants, cur_jf, info);
+                    emit_guard_exit(&mut builder, &constants, cur_jf, info, ptr_type, call_conv);
 
                     builder.switch_to_block(cont_block);
                     builder.seal_block(cont_block);
@@ -6426,7 +6491,7 @@ impl CraneliftBackend {
                     builder.switch_to_block(exit_block);
                     builder.seal_block(exit_block);
                     let cur_jf = builder.use_var(jf_ptr_var);
-                    emit_guard_exit(&mut builder, &constants, cur_jf, info);
+                    emit_guard_exit(&mut builder, &constants, cur_jf, info, ptr_type, call_conv);
 
                     builder.switch_to_block(cont_block);
                     builder.seal_block(cont_block);
@@ -6461,7 +6526,7 @@ impl CraneliftBackend {
                     builder.switch_to_block(exit_block);
                     builder.seal_block(exit_block);
                     let cur_jf = builder.use_var(jf_ptr_var);
-                    emit_guard_exit(&mut builder, &constants, cur_jf, info);
+                    emit_guard_exit(&mut builder, &constants, cur_jf, info, ptr_type, call_conv);
 
                     builder.switch_to_block(cont_block);
                     builder.seal_block(cont_block);
@@ -6508,7 +6573,7 @@ impl CraneliftBackend {
                     builder.switch_to_block(exit_block);
                     builder.seal_block(exit_block);
                     let cur_jf = builder.use_var(jf_ptr_var);
-                    emit_guard_exit(&mut builder, &constants, cur_jf, info);
+                    emit_guard_exit(&mut builder, &constants, cur_jf, info, ptr_type, call_conv);
 
                     builder.switch_to_block(cont_block);
                     builder.seal_block(cont_block);
@@ -6538,7 +6603,7 @@ impl CraneliftBackend {
                     builder.switch_to_block(exit_block);
                     builder.seal_block(exit_block);
                     let cur_jf = builder.use_var(jf_ptr_var);
-                    emit_guard_exit(&mut builder, &constants, cur_jf, info);
+                    emit_guard_exit(&mut builder, &constants, cur_jf, info, ptr_type, call_conv);
 
                     builder.switch_to_block(cont_block);
                     builder.seal_block(cont_block);
@@ -6576,7 +6641,7 @@ impl CraneliftBackend {
                     builder.switch_to_block(exit_block);
                     builder.seal_block(exit_block);
                     let cur_jf = builder.use_var(jf_ptr_var);
-                    emit_guard_exit(&mut builder, &constants, cur_jf, info);
+                    emit_guard_exit(&mut builder, &constants, cur_jf, info, ptr_type, call_conv);
 
                     builder.switch_to_block(cont_block);
                     builder.seal_block(cont_block);
@@ -6646,7 +6711,14 @@ impl CraneliftBackend {
                         builder.switch_to_block(exit_block);
                         builder.seal_block(exit_block);
                         let cur_jf = builder.use_var(jf_ptr_var);
-                        emit_guard_exit(&mut builder, &constants, cur_jf, info);
+                        emit_guard_exit(
+                            &mut builder,
+                            &constants,
+                            cur_jf,
+                            info,
+                            ptr_type,
+                            call_conv,
+                        );
 
                         builder.switch_to_block(cont_block);
                         builder.seal_block(cont_block);
@@ -6675,7 +6747,7 @@ impl CraneliftBackend {
                     builder.switch_to_block(exit_block);
                     builder.seal_block(exit_block);
                     let cur_jf = builder.use_var(jf_ptr_var);
-                    emit_guard_exit(&mut builder, &constants, cur_jf, info);
+                    emit_guard_exit(&mut builder, &constants, cur_jf, info, ptr_type, call_conv);
 
                     builder.switch_to_block(cont_block);
                     builder.seal_block(cont_block);
@@ -6687,7 +6759,7 @@ impl CraneliftBackend {
                     guard_idx += 1;
 
                     let cur_jf = builder.use_var(jf_ptr_var);
-                    emit_guard_exit(&mut builder, &constants, cur_jf, info);
+                    emit_guard_exit(&mut builder, &constants, cur_jf, info, ptr_type, call_conv);
 
                     // Create a continuation block for subsequent ops (dead code).
                     let dead_block = builder.create_block();
@@ -6729,7 +6801,7 @@ impl CraneliftBackend {
                     builder.switch_to_block(exit_block);
                     builder.seal_block(exit_block);
                     let cur_jf = builder.use_var(jf_ptr_var);
-                    emit_guard_exit(&mut builder, &constants, cur_jf, info);
+                    emit_guard_exit(&mut builder, &constants, cur_jf, info, ptr_type, call_conv);
 
                     builder.switch_to_block(cont_block);
                     builder.seal_block(cont_block);
@@ -6825,7 +6897,7 @@ impl CraneliftBackend {
                     builder.switch_to_block(exit_block);
                     builder.seal_block(exit_block);
                     let cur_jf = builder.use_var(jf_ptr_var);
-                    emit_guard_exit(&mut builder, &constants, cur_jf, info);
+                    emit_guard_exit(&mut builder, &constants, cur_jf, info, ptr_type, call_conv);
 
                     builder.switch_to_block(cont_block);
                     builder.seal_block(cont_block);
@@ -6973,7 +7045,7 @@ impl CraneliftBackend {
                     builder.switch_to_block(exit_block);
                     builder.seal_block(exit_block);
                     let cur_jf = builder.use_var(jf_ptr_var);
-                    emit_guard_exit(&mut builder, &constants, cur_jf, info);
+                    emit_guard_exit(&mut builder, &constants, cur_jf, info, ptr_type, call_conv);
 
                     builder.switch_to_block(cont_block);
                     builder.seal_block(cont_block);
@@ -7064,29 +7136,12 @@ impl CraneliftBackend {
                 | OpCode::CallLoopinvariantR
                 | OpCode::CallLoopinvariantF
                 | OpCode::CallLoopinvariantN => {
-                    // Inline arena take/put: replace create_frame/drop_frame
-                    // indirect calls with inline loads/stores when possible.
-                    if let Some(arena) = INLINE_ARENA.get() {
-                        let func_addr_key = op.arg(0).0;
-                        let func_addr = constants.get(&func_addr_key).copied().unwrap_or(-1);
-
-                        if op.opcode == OpCode::CallR && func_addr == arena.create_fn_addr as i64 {
-                            let result = emit_inline_arena_take(
-                                &mut builder,
-                                &constants,
-                                arena,
-                                op,
-                                ptr_type,
-                            );
-                            builder.def_var(var(vi), result);
-                            continue;
-                        }
-
-                        if op.opcode == OpCode::CallN && func_addr == arena.drop_fn_addr as i64 {
-                            emit_inline_arena_put(&mut builder, &constants, arena, op, ptr_type);
-                            continue;
-                        }
-                    }
+                    // DISABLED: emit_inline_arena_take/put bypasses
+                    // spill_ref_roots / reload_ref_roots / defined_ref_vars
+                    // tracking, causing GC to miss ref roots during subsequent
+                    // collecting calls. RPython parity: create_frame/drop_frame
+                    // are regular calls handled by emit_indirect_call_from_parts
+                    // with full GC support.
 
                     let descr = op.descr.as_ref().expect("call op must have a descriptor");
                     let call_descr = descr
@@ -7129,37 +7184,138 @@ impl CraneliftBackend {
                         )
                     })?;
                     let resolved_target = resolve_call_assembler_target(op.opcode, call_descr)?;
-                    if op.args.len() != call_descr.arg_types().len() {
+                    if call_descr.vable_expansion().is_none()
+                        && op.args.len() != call_descr.arg_types().len()
+                    {
                         return Err(unsupported_semantics(
                             op.opcode,
                             "call-assembler argument count does not match the descriptor",
                         ));
                     }
 
-                    // args_slot has JF header (64B) + items. Shared for inputs AND outputs.
-                    // RPython jitframe layout: fail_args occupy [0..max_output_slots),
-                    // ref root spill slots occupy [max_output_slots..frame_depth).
-                    // The callee jitframe must be large enough for BOTH, otherwise
-                    // ref root writes (at ref_root_base_ofs + i*8) overflow the
-                    // stack allocation.
+                    // x86/assembler.py:2260 _store_force_index(ops[pos+1]):
+                    // If next op is GUARD_NOT_FORCED, store its fail descr
+                    // to jf_force_descr BEFORE the call. GC rewriter elides
+                    // CallN(drop_frame), so GUARD_NOT_FORCED is ops[idx+1].
+                    if let Some(next) = ops.get(op_idx + 1) {
+                        if next.opcode == OpCode::GuardNotForced
+                            || next.opcode == OpCode::GuardNotForced2
+                        {
+                            let info = &guard_infos[guard_idx];
+                            let descr_val =
+                                builder.ins().iconst(cl_types::I64, info.fail_descr_ptr);
+                            let cur_jf = builder.use_var(jf_ptr_var);
+                            builder.ins().store(
+                                MemFlags::trusted(),
+                                descr_val,
+                                cur_jf,
+                                JF_FORCE_DESCR_OFS,
+                            );
+                            // Reset jf_descr to 0: a previous guard exit
+                            // (e.g., base-case bridge) may have left jf_descr
+                            // non-zero. RPython's _call_header resets it.
+                            let zero = builder.ins().iconst(cl_types::I64, 0);
+                            builder
+                                .ins()
+                                .store(MemFlags::trusted(), zero, cur_jf, JF_DESCR_OFS);
+                        }
+                    }
+
+                    // rewrite.py:613-653 gen_malloc_frame parity:
+                    // Allocate callee jitframe from nursery (heap), not stack.
+                    // The callee's prologue pushes jf_ptr onto shadow stack,
+                    // so GC tracks it during callee execution. After return,
+                    // we use result_jf (not args_ptr) for all reads.
                     let callee_depth = resolved_target
                         .as_ref()
                         .map_or(16, |t| t.frame_depth.max(t.max_output_slots).max(1));
-                    let jf_depth = call_descr.arg_types().len().max(callee_depth).max(1);
+                    let num_expanded_items = if let Some(exp) = call_descr.vable_expansion() {
+                        1 + exp.scalar_fields.len() + exp.num_array_items
+                    } else {
+                        call_descr.arg_types().len()
+                    };
+                    let jf_depth = num_expanded_items.max(callee_depth).max(1);
                     let jf_bytes = (JF_FRAME_ITEM0_OFS as u32) + (jf_depth as u32) * 8;
+
+                    // rewrite.py:613-653 gen_malloc_frame: ideally nursery alloc,
+                    // but nursery jitframes get collected during guard failure
+                    // (the callee pops shadow stack before returning; the guard
+                    // handler's raw pointer is not a GC root). Stack alloc is
+                    // safe because stack memory is never moved by GC.
+                    // TODO: nursery alloc + push callee jf_ptr onto shadow
+                    // stack before calling guard failure handler.
                     let args_slot = builder.create_sized_stack_slot(StackSlotData::new(
                         StackSlotKind::ExplicitSlot,
                         jf_bytes,
                         3,
                     ));
-                    for (index, &arg_ref) in op.args.iter().enumerate() {
-                        let raw = resolve_opref(&mut builder, &constants, arg_ref);
-                        let ofs = JF_FRAME_ITEM0_OFS + (index as i32) * 8;
-                        builder.ins().stack_store(raw, args_slot, ofs);
-                    }
-                    // jf_ptr = start of jitframe (header + items)
                     let args_ptr = builder.ins().stack_addr(ptr_type, args_slot, 0);
-                    // data_ptr = start of items area (for shim which expects flat i64 array)
+                    // rewrite.py:665-695 handle_call_assembler: store inputargs
+                    // into callee jitframe. VableExpansion reads from the frame
+                    // arg (op.args[0]), with const/arg overrides for callee entry.
+                    if let Some(expansion) = call_descr.vable_expansion() {
+                        let frame_val = resolve_opref(&mut builder, &constants, op.args[0]);
+                        // Slot 0: frame reference
+                        builder
+                            .ins()
+                            .stack_store(frame_val, args_slot, JF_FRAME_ITEM0_OFS);
+                        // Slots 1..N: scalar fields from frame
+                        for (i, &(offset, _tp)) in expansion.scalar_fields.iter().enumerate() {
+                            let slot = i + 1;
+                            let ofs = JF_FRAME_ITEM0_OFS + (slot as i32) * 8;
+                            // Check for const override
+                            if let Some(&(_, cval)) =
+                                expansion.const_overrides.iter().find(|(s, _)| *s == slot)
+                            {
+                                let cv = builder.ins().iconst(cl_types::I64, cval);
+                                builder.ins().stack_store(cv, args_slot, ofs);
+                            } else {
+                                let val = builder.ins().load(
+                                    cl_types::I64,
+                                    MemFlags::trusted(),
+                                    frame_val,
+                                    offset as i32,
+                                );
+                                builder.ins().stack_store(val, args_slot, ofs);
+                            }
+                        }
+                        // Slots N+1..: array items from frame
+                        let num_scalars_with_frame = 1 + expansion.scalar_fields.len();
+                        let arr_struct_addr = builder
+                            .ins()
+                            .iadd_imm(frame_val, expansion.array_struct_offset as i64);
+                        let arr_data_ptr_val = builder.ins().load(
+                            ptr_type,
+                            MemFlags::trusted(),
+                            arr_struct_addr,
+                            expansion.array_ptr_offset as i32,
+                        );
+                        for i in 0..expansion.num_array_items {
+                            let slot = num_scalars_with_frame + i;
+                            let ofs = JF_FRAME_ITEM0_OFS + (slot as i32) * 8;
+                            // Check for arg override
+                            if let Some(&(_, arg_idx)) =
+                                expansion.arg_overrides.iter().find(|(s, _)| *s == slot)
+                            {
+                                let val = resolve_opref(&mut builder, &constants, op.args[arg_idx]);
+                                builder.ins().stack_store(val, args_slot, ofs);
+                            } else {
+                                let val = builder.ins().load(
+                                    cl_types::I64,
+                                    MemFlags::trusted(),
+                                    arr_data_ptr_val,
+                                    (i * 8) as i32,
+                                );
+                                builder.ins().stack_store(val, args_slot, ofs);
+                            }
+                        }
+                    } else {
+                        for (index, &arg_ref) in op.args.iter().enumerate() {
+                            let raw = resolve_opref(&mut builder, &constants, arg_ref);
+                            let ofs = JF_FRAME_ITEM0_OFS + (index as i32) * 8;
+                            builder.ins().stack_store(raw, args_slot, ofs);
+                        }
+                    }
                     let args_data_ptr =
                         builder
                             .ins()
@@ -7216,7 +7372,7 @@ impl CraneliftBackend {
                     };
 
                     let has_primitive_result = finish_descr.is_some() || resolved_target.is_none();
-                    let use_direct = dispatch_slot_addr.is_some() && has_primitive_result;
+                    let use_direct = dispatch_slot_addr.is_some();
 
                     if use_direct {
                         let slot_addr = dispatch_slot_addr.unwrap();
@@ -7275,12 +7431,12 @@ impl CraneliftBackend {
                             JF_FRAME_ITEM0_OFS,
                         );
 
-                        // assembler.py GC parity: the callee may trigger
-                        // GC (via CallMallocNursery inside its body), so
-                        // the caller's live GC refs must be in the
-                        // jitframe before the call and reloaded after.
-                        // The shim path already does this; the direct
-                        // call must do the same.
+                        // assembler.py:2267-2269 _call_assembler_emit_call:
+                        // Spill caller's GC refs, then direct-call the callee.
+                        // The callee's prologue pushes its own shadow stack
+                        // entry (_call_header_shadowstack), and its epilogue
+                        // pops it (_call_footer_shadowstack). The caller does
+                        // NOT touch the shadow stack here.
                         jf_ptr = builder.use_var(jf_ptr_var);
                         spill_ref_roots(
                             &mut builder,
@@ -7291,7 +7447,7 @@ impl CraneliftBackend {
                         );
                         emit_push_gcmap(&mut builder, jf_ptr, per_call_gcmap);
 
-                        // fn(jf_ptr) → jf_ptr  (_call_footer parity)
+                        // fn(jf_ptr) → jf_ptr  (simple_call parity)
                         let mut sig = Signature::new(call_conv);
                         sig.params.push(AbiParam::new(ptr_type)); // jf_ptr
                         sig.returns.push(AbiParam::new(ptr_type)); // returned jf_ptr
@@ -7368,6 +7524,10 @@ impl CraneliftBackend {
                             builder.ins().iadd_imm(result_jf, JF_FRAME_ITEM0_OFS as i64);
                         let result_jf_data_i64 =
                             ptr_arg_as_i64(&mut builder, result_jf_data, ptr_type);
+                        // RPython assembler.py:349-350: assembler_helper(tmploc, vloc).
+                        // tmploc = eax = returned jitframe. Use result_jf_data
+                        // (not args_ptr) because GC may have moved the nursery
+                        // jitframe during the callee's execution.
                         let force_result = emit_host_call(
                             &mut builder,
                             ptr_type,
@@ -7378,10 +7538,14 @@ impl CraneliftBackend {
                                 fail_idx_raw,
                                 frame_ptr,
                                 result_jf_data_i64,
-                                args_ptr_i64,
+                                result_jf_data_i64,
                             ],
                             Some(cl_types::I64),
                         );
+                        // _reload_frame_if_necessary: GC may have moved
+                        // the caller's jitframe during the helper call.
+                        jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                        builder.def_var(jf_ptr_var, jf_ptr);
                         builder
                             .ins()
                             .jump(ca_merge_block, &[BlockArg::from(force_result.unwrap())]);
@@ -7477,12 +7641,21 @@ impl CraneliftBackend {
                     builder
                         .ins()
                         .store(MemFlags::trusted(), sentinel, outputs_ptr, JF_DESCR_OFS);
+                    // assembler.py:1130-1136 _call_footer_shadowstack — inline SUB
+                    emit_call_footer_shadowstack(&mut builder, ptr_type);
                     builder.ins().return_(&[outputs_ptr]);
 
                     // ── Merge: result from cache or shim ──
                     builder.switch_to_block(ca_merge_block);
                     builder.seal_block(ca_merge_block);
                     let merged_result = builder.block_params(ca_merge_block)[0];
+
+                    // _reload_frame_if_necessary parity: refresh jf_ptr after
+                    // the merge so GuardNotForced (and subsequent ops) read
+                    // from the correct caller jitframe, not a stale SSA value
+                    // from one of the predecessor blocks.
+                    jf_ptr = builder.use_var(jf_ptr_var);
+                    outputs_ptr = jf_ptr;
 
                     if op.result_type() != Type::Void {
                         builder.def_var(var(vi), merged_result);
@@ -7984,138 +8157,18 @@ impl CraneliftBackend {
                 }
 
                 // ── GC write barriers ──
-                // aarch64/opassembler.py:912-1019 _write_barrier_fastpath parity:
-                // Inline flag check → skip if flag not set → slow path call.
-                // CondCallGcWbArray: additionally checks card marking flag
-                // (descr.jit_wb_cards_set) and sets card bit inline if possible.
                 OpCode::CondCallGcWb | OpCode::CondCallGcWbArray => {
-                    let runtime_id_val =
-                        gc_runtime_id.ok_or_else(|| missing_gc_runtime(op.opcode))?;
+                    let runtime_id = gc_runtime_id.ok_or_else(|| missing_gc_runtime(op.opcode))?;
+                    let runtime_id = builder.ins().iconst(cl_types::I64, runtime_id as i64);
                     let obj = resolve_opref(&mut builder, &constants, op.arg(0));
-                    let is_array = op.opcode == OpCode::CondCallGcWbArray;
-
-                    // Load flag byte from object header.
-                    // aarch64: LDRB_ri(ip0, loc_base, jit_wb_if_flag_byteofs)
-                    let rw = self.gc_rewriter();
-                    let wb_byteofs = rw
-                        .as_ref()
-                        .map(|r| r.wb_descr.jit_wb_if_flag_byteofs as i32)
-                        .unwrap_or(0);
-                    let wb_mask_raw = rw
-                        .as_ref()
-                        .map(|r| r.wb_descr.jit_wb_if_flag_singlebyte)
-                        .unwrap_or(0);
-                    let wb_cards_set = rw
-                        .as_ref()
-                        .map(|r| r.wb_descr.jit_wb_cards_set)
-                        .unwrap_or(0);
-                    let wb_card_shift = rw
-                        .as_ref()
-                        .map(|r| r.wb_descr.jit_wb_card_page_shift)
-                        .unwrap_or(0);
-                    drop(rw);
-
-                    // aarch64/opassembler.py:921-929: mask includes CARDS_SET for array ops.
-                    let wb_mask = if is_array && wb_cards_set != 0 {
-                        (wb_mask_raw as i64) | (-0x80i64) // jit_wb_if_flag_singlebyte | -0x80
-                    } else {
-                        wb_mask_raw as i64
-                    };
-
-                    let flag_byte =
-                        builder
-                            .ins()
-                            .load(cl_types::I8, MemFlags::trusted(), obj, wb_byteofs);
-                    let flag_ext = builder.ins().uextend(cl_types::I64, flag_byte);
-                    let mask_val = builder.ins().iconst(cl_types::I64, wb_mask & 0xFF);
-                    let test = builder.ins().band(flag_ext, mask_val);
-                    let zero = builder.ins().iconst(cl_types::I64, 0);
-                    let needs_wb = builder.ins().icmp(IntCC::NotEqual, test, zero);
-
-                    // Branch: if flag not set, skip entirely.
-                    let slow_block = builder.create_block();
-                    let cont_block = builder.create_block();
-                    builder
-                        .ins()
-                        .brif(needs_wb, slow_block, &[], cont_block, &[]);
-
-                    // Slow path block.
-                    builder.switch_to_block(slow_block);
-                    builder.seal_block(slow_block);
-
-                    if is_array && wb_cards_set != 0 {
-                        // aarch64/opassembler.py:944-946: card marking fast path.
-                        // Test GCFLAG_CARDS_SET separately.
-                        let cards_mask = builder.ins().iconst(cl_types::I64, 0x80);
-                        let cards_test = builder.ins().band(flag_ext, cards_mask);
-                        let has_cards = builder.ins().icmp(IntCC::NotEqual, cards_test, zero);
-
-                        let wb_call_block = builder.create_block();
-                        let card_block = builder.create_block();
-                        builder
-                            .ins()
-                            .brif(has_cards, card_block, &[], wb_call_block, &[]);
-
-                        // Write barrier call (no cards set yet).
-                        builder.switch_to_block(wb_call_block);
-                        builder.seal_block(wb_call_block);
-                        let runtime_id = builder.ins().iconst(cl_types::I64, runtime_id_val as i64);
-                        let _ = emit_host_call(
-                            &mut builder,
-                            ptr_type,
-                            call_conv,
-                            gc_write_barrier_shim as *const () as usize,
-                            &[runtime_id, obj],
-                            None,
-                        );
-                        builder.ins().jump(cont_block, &[]);
-
-                        // aarch64/opassembler.py:996-1015: card bit setting.
-                        // byteofs = ~(index >> (card_page_shift + 3))
-                        // bit_index = (index >> card_page_shift) & 7
-                        // obj[byteofs] |= (1 << bit_index)
-                        builder.switch_to_block(card_block);
-                        builder.seal_block(card_block);
-                        let index = resolve_opref(&mut builder, &constants, op.arg(1));
-                        let shift_plus_3 = (wb_card_shift + 3) as i64;
-                        let shifted = builder.ins().ushr_imm(index, shift_plus_3);
-                        let byteofs = builder.ins().bnot(shifted);
-                        // bit_index = (index >> card_page_shift) & 7
-                        let bit_idx = builder.ins().ushr_imm(index, wb_card_shift as i64);
-                        let seven = builder.ins().iconst(cl_types::I64, 7);
-                        let bit_idx = builder.ins().band(bit_idx, seven);
-                        let one = builder.ins().iconst(cl_types::I64, 1);
-                        let bit_mask = builder.ins().ishl(one, bit_idx);
-                        // Load existing card byte, OR, store back.
-                        let card_addr = builder.ins().iadd(obj, byteofs);
-                        let card_byte =
-                            builder
-                                .ins()
-                                .load(cl_types::I8, MemFlags::trusted(), card_addr, 0);
-                        let card_ext = builder.ins().uextend(cl_types::I64, card_byte);
-                        let card_new = builder.ins().bor(card_ext, bit_mask);
-                        let card_trunc = builder.ins().ireduce(cl_types::I8, card_new);
-                        builder
-                            .ins()
-                            .store(MemFlags::trusted(), card_trunc, card_addr, 0);
-                        builder.ins().jump(cont_block, &[]);
-                    } else {
-                        // Simple write barrier (no card marking).
-                        let runtime_id = builder.ins().iconst(cl_types::I64, runtime_id_val as i64);
-                        let _ = emit_host_call(
-                            &mut builder,
-                            ptr_type,
-                            call_conv,
-                            gc_write_barrier_shim as *const () as usize,
-                            &[runtime_id, obj],
-                            None,
-                        );
-                        builder.ins().jump(cont_block, &[]);
-                    }
-
-                    // Continue after the conditional barrier.
-                    builder.switch_to_block(cont_block);
-                    builder.seal_block(cont_block);
+                    let _ = emit_host_call(
+                        &mut builder,
+                        ptr_type,
+                        call_conv,
+                        gc_write_barrier_shim as *const () as usize,
+                        &[runtime_id, obj],
+                        None,
+                    );
                 }
 
                 // ── Generic GC/raw memory loads ──
@@ -8899,7 +8952,14 @@ impl CraneliftBackend {
                         let info = &guard_infos[guard_idx];
                         guard_idx += 1;
                         let cur_jf = builder.use_var(jf_ptr_var);
-                        emit_guard_exit(&mut builder, &constants, cur_jf, info);
+                        emit_guard_exit(
+                            &mut builder,
+                            &constants,
+                            cur_jf,
+                            info,
+                            ptr_type,
+                            call_conv,
+                        );
                     }
                 }
 
@@ -8907,7 +8967,7 @@ impl CraneliftBackend {
                     let info = &guard_infos[guard_idx];
                     guard_idx += 1;
                     let cur_jf = builder.use_var(jf_ptr_var);
-                    emit_guard_exit(&mut builder, &constants, cur_jf, info);
+                    emit_guard_exit(&mut builder, &constants, cur_jf, info, ptr_type, call_conv);
                 }
 
                 OpCode::Label => {}
@@ -9037,7 +9097,7 @@ impl CraneliftBackend {
                     builder.switch_to_block(exit_block);
                     builder.seal_block(exit_block);
                     let cur_jf = builder.use_var(jf_ptr_var);
-                    emit_guard_exit(&mut builder, &constants, cur_jf, info);
+                    emit_guard_exit(&mut builder, &constants, cur_jf, info, ptr_type, call_conv);
                     builder.switch_to_block(cont_block);
                     builder.seal_block(cont_block);
                 }
@@ -9059,7 +9119,7 @@ impl CraneliftBackend {
                     builder.switch_to_block(exit_block);
                     builder.seal_block(exit_block);
                     let cur_jf = builder.use_var(jf_ptr_var);
-                    emit_guard_exit(&mut builder, &constants, cur_jf, info);
+                    emit_guard_exit(&mut builder, &constants, cur_jf, info, ptr_type, call_conv);
                     builder.switch_to_block(cont_block);
                     builder.seal_block(cont_block);
                 }
@@ -11356,7 +11416,20 @@ impl majit_backend::Backend for CraneliftBackend {
         ptr
     }
 
-    /// llmodel.py:816-820
+    /// llmodel.py:816 bh_call_i: ABI-correct dispatch.
+    ///
+    /// ARM64/x86-64 C ABI assigns integer and float args to independent register
+    /// files (x0-x7 + d0-d7 on ARM64; rdi,rsi,… + xmm0-xmm7 on x86-64).
+    /// We construct `fn(ints…, floats…) -> i64` which places each group in the
+    /// correct register file regardless of their original interleaving order.
+    ///
+    /// llmodel.py:816-820 bh_call_i(func, args_i, args_r, args_f, calldescr)
+    /// calldescr.call_stub_i(func, args_i, args_r, args_f).
+    ///
+    /// On ARM64/x86-64, the C ABI assigns integer and floating-point args to
+    /// independent register files (x0-x7 / d0-d7 on ARM64; rdi,rsi,... /
+    /// xmm0-xmm7 on x86-64). So we can always construct the function pointer
+    /// as `fn(ints..., floats...) -> i64` and get the correct register layout.
     fn bh_call_i(
         &self,
         func: i64,
@@ -11365,48 +11438,34 @@ impl majit_backend::Backend for CraneliftBackend {
         args_f: Option<&[i64]>,
         calldescr: &majit_codewriter::jitcode::BhCallDescr,
     ) -> i64 {
-        // llmodel.py:820: return calldescr.call_stub_i(func, args_i, args_r, args_f)
-        call_stub_i(calldescr, func, args_i, args_r, args_f)
-    }
-
-    /// llmodel.py:822-826
-    fn bh_call_r(
-        &self,
-        func: i64,
-        args_i: Option<&[i64]>,
-        args_r: Option<&[i64]>,
-        args_f: Option<&[i64]>,
-        calldescr: &majit_codewriter::jitcode::BhCallDescr,
-    ) -> GcRef {
-        // llmodel.py:826: return calldescr.call_stub_r(func, args_i, args_r, args_f)
-        call_stub_r(calldescr, func, args_i, args_r, args_f)
-    }
-
-    /// llmodel.py:828-832
-    fn bh_call_f(
-        &self,
-        func: i64,
-        args_i: Option<&[i64]>,
-        args_r: Option<&[i64]>,
-        args_f: Option<&[i64]>,
-        calldescr: &majit_codewriter::jitcode::BhCallDescr,
-    ) -> f64 {
-        // llmodel.py:832: return calldescr.call_stub_f(func, args_i, args_r, args_f)
-        call_stub_f(calldescr, func, args_i, args_r, args_f)
-    }
-
-    /// llmodel.py:834-839
-    fn bh_call_v(
-        &self,
-        func: i64,
-        args_i: Option<&[i64]>,
-        args_r: Option<&[i64]>,
-        args_f: Option<&[i64]>,
-        calldescr: &majit_codewriter::jitcode::BhCallDescr,
-    ) {
-        // llmodel.py:839: the 'i' return value is ignored (and nonsense anyway)
-        // llmodel.py:839: calldescr.call_stub_i(func, args_i, args_r, args_f)
-        let _ = call_stub_i(calldescr, func, args_i, args_r, args_f);
+        if func == 0 {
+            return 0;
+        }
+        // Separate integer (i+r) and float (f) args in arg_classes order.
+        let mut int_args: Vec<i64> = Vec::new();
+        let mut float_args: Vec<f64> = Vec::new();
+        let mut ii = 0usize;
+        let mut ri = 0usize;
+        let mut fi = 0usize;
+        for c in calldescr.arg_classes.chars() {
+            match c {
+                'i' => {
+                    int_args.push(args_i.and_then(|a| a.get(ii).copied()).unwrap_or(0));
+                    ii += 1;
+                }
+                'r' => {
+                    int_args.push(args_r.and_then(|a| a.get(ri).copied()).unwrap_or(0));
+                    ri += 1;
+                }
+                'f' => {
+                    let bits = args_f.and_then(|a| a.get(fi).copied()).unwrap_or(0);
+                    float_args.push(f64::from_bits(bits as u64));
+                    fi += 1;
+                }
+                _ => {}
+            }
+        }
+        unsafe { bh_call_i_dispatch(func as usize, &int_args, &float_args) }
     }
 
     /// llmodel.py:739-742 bh_raw_store_i(addr, offset, newvalue, descr)
@@ -11662,375 +11721,151 @@ fn emit_inline_arena_put(
     builder.seal_block(done_block);
 }
 
-// ---------------------------------------------------------------------------
-// descr.py:540-612 call_stub_i / call_stub_r / call_stub_f
-//
-// RPython pre-generates per-calldescr stubs via create_call_stub() that cast
-// func to the exact FUNC type and let the C compiler handle ABI.
-// In Rust we cannot generate typed function pointers at runtime, so we
-// replicate the same semantics generically: extract args from args_i/args_r/
-// args_f in arg_classes order and dispatch via platform-specific inline asm.
-// ---------------------------------------------------------------------------
-
-/// descr.py:540-612 call_stub_i — integer/void return variant.
-fn call_stub_i(
-    calldescr: &majit_codewriter::jitcode::BhCallDescr,
-    func: i64,
-    args_i: Option<&[i64]>,
-    args_r: Option<&[i64]>,
-    args_f: Option<&[i64]>,
-) -> i64 {
-    debug_assert!(func != 0, "call_stub_i: null function pointer");
-    let (int_args, float_args, stack_args) = prepare_call_args(calldescr, args_i, args_r, args_f);
-    unsafe { call_stub_asm_i(func as usize, &int_args, &float_args, &stack_args) }
-}
-
-/// descr.py:540-612 call_stub_r — reference return variant.
-/// cast_opaque_ptr(GCREF, res): pointer returns use the integer return
-/// register (x0/rax), same ABI as call_stub_i.
-fn call_stub_r(
-    calldescr: &majit_codewriter::jitcode::BhCallDescr,
-    func: i64,
-    args_i: Option<&[i64]>,
-    args_r: Option<&[i64]>,
-    args_f: Option<&[i64]>,
-) -> GcRef {
-    let raw = call_stub_i(calldescr, func, args_i, args_r, args_f);
-    GcRef(raw as usize)
-}
-
-/// descr.py:540-612 call_stub_f — float return variant.
-/// getfloatstorage(res): float returns use d0/xmm0.
-fn call_stub_f(
-    calldescr: &majit_codewriter::jitcode::BhCallDescr,
-    func: i64,
-    args_i: Option<&[i64]>,
-    args_r: Option<&[i64]>,
-    args_f: Option<&[i64]>,
-) -> f64 {
-    debug_assert!(func != 0, "call_stub_f: null function pointer");
-    let (int_args, float_args, stack_args) = prepare_call_args(calldescr, args_i, args_r, args_f);
-    unsafe { call_stub_asm_f(func as usize, &int_args, &float_args, &stack_args) }
-}
-
-/// Extract args from args_i/args_r/args_f in calldescr.arg_classes order,
-/// tracking register assignment for ABI stack overflow.
+/// llmodel.py:816 call_stub_i: ABI-correct dispatch with separate int/float
+/// register files. On ARM64/x86-64, integer args go to x0-x7 / rdi,rsi,... and
+/// float args go to d0-d7 / xmm0-xmm7 independently.
 ///
-/// Returns (int_args, float_args, stack_args) where stack_args is in the
-/// correct argument order per AAPCS64 / SysV ABI rules.
-fn prepare_call_args(
-    calldescr: &majit_codewriter::jitcode::BhCallDescr,
-    args_i: Option<&[i64]>,
-    args_r: Option<&[i64]>,
-    args_f: Option<&[i64]>,
-) -> (Vec<i64>, Vec<f64>, Vec<u64>) {
-    #[cfg(target_arch = "aarch64")]
-    const MAX_INT_REGS: usize = 8;
-    #[cfg(target_arch = "x86_64")]
-    const MAX_INT_REGS: usize = 6;
-    const MAX_FLOAT_REGS: usize = 8;
-
-    let mut int_args: Vec<i64> = Vec::new();
-    let mut float_args: Vec<f64> = Vec::new();
-    let mut stack_args: Vec<u64> = Vec::new();
-    let mut ii = 0usize;
-    let mut ri = 0usize;
-    let mut fi = 0usize;
-    let mut ngrn = 0usize; // next general register number
-    let mut nsrn = 0usize; // next SIMD/float register number
-    for c in calldescr.arg_classes.chars() {
-        match c {
-            'i' => {
-                let val = args_i.and_then(|a| a.get(ii).copied()).unwrap_or(0);
-                int_args.push(val);
-                if ngrn >= MAX_INT_REGS {
-                    stack_args.push(val as u64);
-                }
-                ngrn += 1;
-                ii += 1;
-            }
-            'r' => {
-                let val = args_r.and_then(|a| a.get(ri).copied()).unwrap_or(0);
-                int_args.push(val);
-                if ngrn >= MAX_INT_REGS {
-                    stack_args.push(val as u64);
-                }
-                ngrn += 1;
-                ri += 1;
-            }
-            'f' => {
-                let bits = args_f.and_then(|a| a.get(fi).copied()).unwrap_or(0);
-                let fval = f64::from_bits(bits as u64);
-                float_args.push(fval);
-                if nsrn >= MAX_FLOAT_REGS {
-                    stack_args.push(fval.to_bits());
-                }
-                nsrn += 1;
-                fi += 1;
-            }
-            _ => {}
+/// Safety: func must be a valid function pointer matching the described ABI.
+unsafe fn bh_call_i_dispatch(func: usize, int_args: &[i64], float_args: &[f64]) -> i64 {
+    type I = i64;
+    type F = f64;
+    match (int_args.len(), float_args.len()) {
+        // No float args — integer-only calls.
+        (0, 0) => {
+            let f: unsafe extern "C" fn() -> I = std::mem::transmute(func);
+            f()
+        }
+        (1, 0) => {
+            let f: unsafe extern "C" fn(I) -> I = std::mem::transmute(func);
+            f(int_args[0])
+        }
+        (2, 0) => {
+            let f: unsafe extern "C" fn(I, I) -> I = std::mem::transmute(func);
+            f(int_args[0], int_args[1])
+        }
+        (3, 0) => {
+            let f: unsafe extern "C" fn(I, I, I) -> I = std::mem::transmute(func);
+            f(int_args[0], int_args[1], int_args[2])
+        }
+        (4, 0) => {
+            let f: unsafe extern "C" fn(I, I, I, I) -> I = std::mem::transmute(func);
+            f(int_args[0], int_args[1], int_args[2], int_args[3])
+        }
+        (5, 0) => {
+            let f: unsafe extern "C" fn(I, I, I, I, I) -> I = std::mem::transmute(func);
+            f(
+                int_args[0],
+                int_args[1],
+                int_args[2],
+                int_args[3],
+                int_args[4],
+            )
+        }
+        (6, 0) => {
+            let f: unsafe extern "C" fn(I, I, I, I, I, I) -> I = std::mem::transmute(func);
+            f(
+                int_args[0],
+                int_args[1],
+                int_args[2],
+                int_args[3],
+                int_args[4],
+                int_args[5],
+            )
+        }
+        // Float-only calls.
+        (0, 1) => {
+            let f: unsafe extern "C" fn(F) -> I = std::mem::transmute(func);
+            f(float_args[0])
+        }
+        (0, 2) => {
+            let f: unsafe extern "C" fn(F, F) -> I = std::mem::transmute(func);
+            f(float_args[0], float_args[1])
+        }
+        // Mixed int + float calls.
+        (1, 1) => {
+            let f: unsafe extern "C" fn(I, F) -> I = std::mem::transmute(func);
+            f(int_args[0], float_args[0])
+        }
+        (2, 1) => {
+            let f: unsafe extern "C" fn(I, I, F) -> I = std::mem::transmute(func);
+            f(int_args[0], int_args[1], float_args[0])
+        }
+        (1, 2) => {
+            let f: unsafe extern "C" fn(I, F, F) -> I = std::mem::transmute(func);
+            f(int_args[0], float_args[0], float_args[1])
+        }
+        (2, 2) => {
+            let f: unsafe extern "C" fn(I, I, F, F) -> I = std::mem::transmute(func);
+            f(int_args[0], int_args[1], float_args[0], float_args[1])
+        }
+        (3, 1) => {
+            let f: unsafe extern "C" fn(I, I, I, F) -> I = std::mem::transmute(func);
+            f(int_args[0], int_args[1], int_args[2], float_args[0])
+        }
+        (4, 1) => {
+            let f: unsafe extern "C" fn(I, I, I, I, F) -> I = std::mem::transmute(func);
+            f(
+                int_args[0],
+                int_args[1],
+                int_args[2],
+                int_args[3],
+                float_args[0],
+            )
+        }
+        (3, 2) => {
+            let f: unsafe extern "C" fn(I, I, I, F, F) -> I = std::mem::transmute(func);
+            f(
+                int_args[0],
+                int_args[1],
+                int_args[2],
+                float_args[0],
+                float_args[1],
+            )
+        }
+        (0, 3) => {
+            let f: unsafe extern "C" fn(F, F, F) -> I = std::mem::transmute(func);
+            f(float_args[0], float_args[1], float_args[2])
+        }
+        (0, 4) => {
+            let f: unsafe extern "C" fn(F, F, F, F) -> I = std::mem::transmute(func);
+            f(float_args[0], float_args[1], float_args[2], float_args[3])
+        }
+        (1, 3) => {
+            let f: unsafe extern "C" fn(I, F, F, F) -> I = std::mem::transmute(func);
+            f(int_args[0], float_args[0], float_args[1], float_args[2])
+        }
+        (7, 0) => {
+            let f: unsafe extern "C" fn(I, I, I, I, I, I, I) -> I = std::mem::transmute(func);
+            f(
+                int_args[0],
+                int_args[1],
+                int_args[2],
+                int_args[3],
+                int_args[4],
+                int_args[5],
+                int_args[6],
+            )
+        }
+        (8, 0) => {
+            let f: unsafe extern "C" fn(I, I, I, I, I, I, I, I) -> I = std::mem::transmute(func);
+            f(
+                int_args[0],
+                int_args[1],
+                int_args[2],
+                int_args[3],
+                int_args[4],
+                int_args[5],
+                int_args[6],
+                int_args[7],
+            )
+        }
+        (ni, nf) => {
+            panic!(
+                "bh_call_i: unsupported arg combination ({ni} ints, {nf} floats); \
+                 needs libffi for general dispatch"
+            );
         }
     }
-    (int_args, float_args, stack_args)
-}
-
-// ---------------------------------------------------------------------------
-// Platform-specific ABI dispatch via inline asm.
-//
-// No direct RPython equivalent — RPython's create_call_stub generates typed
-// C function calls; the C compiler handles ABI.  In Rust we use inline asm
-// to load all arg registers and spill overflow to the stack.
-//
-// ARM64 AAPCS64: x0-x7 integer, d0-d7 float; overflow on stack.
-// x86-64 SysV:   rdi,rsi,rdx,rcx,r8,r9 integer, xmm0-7 float; overflow on stack.
-// ---------------------------------------------------------------------------
-
-// ── call_stub_asm_i: integer/pointer return (x0 / rax) ──
-
-#[cfg(target_arch = "aarch64")]
-unsafe fn call_stub_asm_i(
-    func: usize,
-    int_args: &[i64],
-    float_args: &[f64],
-    stack_args: &[u64],
-) -> i64 {
-    use core::arch::asm;
-    let i = |n: usize| -> i64 { int_args.get(n).copied().unwrap_or(0) };
-    let f = |n: usize| -> f64 { float_args.get(n).copied().unwrap_or(0.0) };
-    let result: i64;
-
-    if stack_args.is_empty() {
-        asm!(
-            "blr {func}",
-            func = in(reg) func,
-            inlateout("x0") i(0) => result,
-            in("x1") i(1), in("x2") i(2), in("x3") i(3),
-            in("x4") i(4), in("x5") i(5), in("x6") i(6), in("x7") i(7),
-            in("d0") f(0), in("d1") f(1), in("d2") f(2), in("d3") f(3),
-            in("d4") f(4), in("d5") f(5), in("d6") f(6), in("d7") f(7),
-            clobber_abi("C"),
-        );
-    } else {
-        let n_slots = (stack_args.len() + 1) & !1;
-        let stack_bytes = (n_slots * 8) as u64;
-        let buf_ptr = stack_args.as_ptr();
-        let n_copy = stack_args.len() as u64;
-        asm!(
-            "sub sp, sp, {sb}",
-            "cbz {nc}, 2f",
-            "mov x9, #0",
-            "1:",
-            "ldr x10, [{bp}, x9, lsl #3]",
-            "str x10, [sp, x9, lsl #3]",
-            "add x9, x9, #1",
-            "cmp x9, {nc}",
-            "b.lo 1b",
-            "2:",
-            "blr {func}",
-            "add sp, sp, {sb}",
-            func = in(reg) func,
-            sb = in(reg) stack_bytes,
-            nc = in(reg) n_copy,
-            bp = in(reg) buf_ptr,
-            out("x9") _,
-            out("x10") _,
-            inlateout("x0") i(0) => result,
-            in("x1") i(1), in("x2") i(2), in("x3") i(3),
-            in("x4") i(4), in("x5") i(5), in("x6") i(6), in("x7") i(7),
-            in("d0") f(0), in("d1") f(1), in("d2") f(2), in("d3") f(3),
-            in("d4") f(4), in("d5") f(5), in("d6") f(6), in("d7") f(7),
-            clobber_abi("C"),
-        );
-    }
-    result
-}
-
-#[cfg(target_arch = "x86_64")]
-unsafe fn call_stub_asm_i(
-    func: usize,
-    int_args: &[i64],
-    float_args: &[f64],
-    stack_args: &[u64],
-) -> i64 {
-    use core::arch::asm;
-    let i = |n: usize| -> i64 { int_args.get(n).copied().unwrap_or(0) };
-    let f = |n: usize| -> f64 { float_args.get(n).copied().unwrap_or(0.0) };
-    let n_xmm = float_args.len().min(8) as i64;
-    let result: i64;
-
-    if stack_args.is_empty() {
-        asm!(
-            "call {func}",
-            func = in(reg) func,
-            in("rdi") i(0), in("rsi") i(1), in("rdx") i(2),
-            in("rcx") i(3), in("r8") i(4), in("r9") i(5),
-            in("xmm0") f(0), in("xmm1") f(1), in("xmm2") f(2),
-            in("xmm3") f(3), in("xmm4") f(4), in("xmm5") f(5),
-            in("xmm6") f(6), in("xmm7") f(7),
-            inlateout("rax") n_xmm => result,
-            clobber_abi("C"),
-        );
-    } else {
-        let n_slots = (stack_args.len() + 1) & !1;
-        let stack_bytes = (n_slots * 8) as i64;
-        let buf_ptr = stack_args.as_ptr();
-        let n_copy = stack_args.len() as i64;
-        asm!(
-            "sub rsp, {sb}",
-            "test {nc}, {nc}",
-            "jz 2f",
-            "xor r10, r10",
-            "1:",
-            "mov r11, [{bp} + r10 * 8]",
-            "mov [rsp + r10 * 8], r11",
-            "inc r10",
-            "cmp r10, {nc}",
-            "jb 1b",
-            "2:",
-            "call {func}",
-            "add rsp, {sb}",
-            func = in(reg) func,
-            sb = in(reg) stack_bytes,
-            nc = in(reg) n_copy,
-            bp = in(reg) buf_ptr,
-            out("r10") _,
-            out("r11") _,
-            in("rdi") i(0), in("rsi") i(1), in("rdx") i(2),
-            in("rcx") i(3), in("r8") i(4), in("r9") i(5),
-            in("xmm0") f(0), in("xmm1") f(1), in("xmm2") f(2),
-            in("xmm3") f(3), in("xmm4") f(4), in("xmm5") f(5),
-            in("xmm6") f(6), in("xmm7") f(7),
-            inlateout("rax") n_xmm => result,
-            clobber_abi("C"),
-        );
-    }
-    result
-}
-
-// ── call_stub_asm_f: float return (d0 / xmm0) ──
-
-#[cfg(target_arch = "aarch64")]
-unsafe fn call_stub_asm_f(
-    func: usize,
-    int_args: &[i64],
-    float_args: &[f64],
-    stack_args: &[u64],
-) -> f64 {
-    use core::arch::asm;
-    let i = |n: usize| -> i64 { int_args.get(n).copied().unwrap_or(0) };
-    let f = |n: usize| -> f64 { float_args.get(n).copied().unwrap_or(0.0) };
-    let result: f64;
-
-    if stack_args.is_empty() {
-        asm!(
-            "blr {func}",
-            func = in(reg) func,
-            in("x0") i(0),
-            in("x1") i(1), in("x2") i(2), in("x3") i(3),
-            in("x4") i(4), in("x5") i(5), in("x6") i(6), in("x7") i(7),
-            inlateout("d0") f(0) => result,
-            in("d1") f(1), in("d2") f(2), in("d3") f(3),
-            in("d4") f(4), in("d5") f(5), in("d6") f(6), in("d7") f(7),
-            clobber_abi("C"),
-        );
-    } else {
-        let n_slots = (stack_args.len() + 1) & !1;
-        let stack_bytes = (n_slots * 8) as u64;
-        let buf_ptr = stack_args.as_ptr();
-        let n_copy = stack_args.len() as u64;
-        asm!(
-            "sub sp, sp, {sb}",
-            "cbz {nc}, 2f",
-            "mov x9, #0",
-            "1:",
-            "ldr x10, [{bp}, x9, lsl #3]",
-            "str x10, [sp, x9, lsl #3]",
-            "add x9, x9, #1",
-            "cmp x9, {nc}",
-            "b.lo 1b",
-            "2:",
-            "blr {func}",
-            "add sp, sp, {sb}",
-            func = in(reg) func,
-            sb = in(reg) stack_bytes,
-            nc = in(reg) n_copy,
-            bp = in(reg) buf_ptr,
-            out("x9") _,
-            out("x10") _,
-            in("x0") i(0),
-            in("x1") i(1), in("x2") i(2), in("x3") i(3),
-            in("x4") i(4), in("x5") i(5), in("x6") i(6), in("x7") i(7),
-            inlateout("d0") f(0) => result,
-            in("d1") f(1), in("d2") f(2), in("d3") f(3),
-            in("d4") f(4), in("d5") f(5), in("d6") f(6), in("d7") f(7),
-            clobber_abi("C"),
-        );
-    }
-    result
-}
-
-#[cfg(target_arch = "x86_64")]
-unsafe fn call_stub_asm_f(
-    func: usize,
-    int_args: &[i64],
-    float_args: &[f64],
-    stack_args: &[u64],
-) -> f64 {
-    use core::arch::asm;
-    let i = |n: usize| -> i64 { int_args.get(n).copied().unwrap_or(0) };
-    let f = |n: usize| -> f64 { float_args.get(n).copied().unwrap_or(0.0) };
-    let n_xmm = float_args.len().min(8) as i64;
-    let result: f64;
-
-    if stack_args.is_empty() {
-        asm!(
-            "call {func}",
-            func = in(reg) func,
-            in("rdi") i(0), in("rsi") i(1), in("rdx") i(2),
-            in("rcx") i(3), in("r8") i(4), in("r9") i(5),
-            inlateout("xmm0") f(0) => result,
-            in("xmm1") f(1), in("xmm2") f(2),
-            in("xmm3") f(3), in("xmm4") f(4), in("xmm5") f(5),
-            in("xmm6") f(6), in("xmm7") f(7),
-            in("rax") n_xmm,
-            clobber_abi("C"),
-        );
-    } else {
-        let n_slots = (stack_args.len() + 1) & !1;
-        let stack_bytes = (n_slots * 8) as i64;
-        let buf_ptr = stack_args.as_ptr();
-        let n_copy = stack_args.len() as i64;
-        asm!(
-            "sub rsp, {sb}",
-            "test {nc}, {nc}",
-            "jz 2f",
-            "xor r10, r10",
-            "1:",
-            "mov r11, [{bp} + r10 * 8]",
-            "mov [rsp + r10 * 8], r11",
-            "inc r10",
-            "cmp r10, {nc}",
-            "jb 1b",
-            "2:",
-            "call {func}",
-            "add rsp, {sb}",
-            func = in(reg) func,
-            sb = in(reg) stack_bytes,
-            nc = in(reg) n_copy,
-            bp = in(reg) buf_ptr,
-            out("r10") _,
-            out("r11") _,
-            in("rdi") i(0), in("rsi") i(1), in("rdx") i(2),
-            in("rcx") i(3), in("r8") i(4), in("r9") i(5),
-            inlateout("xmm0") f(0) => result,
-            in("xmm1") f(1), in("xmm2") f(2),
-            in("xmm3") f(3), in("xmm4") f(4), in("xmm5") f(5),
-            in("xmm6") f(6), in("xmm7") f(7),
-            in("rax") n_xmm,
-            clobber_abi("C"),
-        );
-    }
-    result
 }
 
 // Tests

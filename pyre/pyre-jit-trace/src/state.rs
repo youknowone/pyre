@@ -1238,27 +1238,9 @@ pub(crate) fn record_current_state_guard(
     ctx.record_guard_typed_with_fail_args(opcode, args, fail_arg_types, &fail_args);
 }
 
-pub(crate) fn concrete_value_type(value: PyObjectRef) -> Type {
-    if value.is_null() {
-        return Type::Ref;
-    }
-    if !looks_like_heap_ref(value) {
-        // Non-heap value (e.g. PY_NULL sentinel or leaked raw int)
-        return Type::Int;
-    }
-    if unsafe { is_int(value) } {
-        return Type::Int;
-    }
-    if unsafe { is_float(value) } {
-        return Type::Float;
-    }
-    Type::Ref
-}
-
 /// pyre slots are always GCREF (Ref) at the concrete frame level.
 /// Even W_IntObject values are stored as Ref pointers — the trace
-/// unboxes via GetfieldGcPureI. adapt_live_values_to_trace_types
-/// converts Ref→Int at compiled entry to match trace-internal types.
+/// unboxes via GetfieldGcPureI.
 pub(crate) fn concrete_virtualizable_slot_type(_value: PyObjectRef) -> Type {
     Type::Ref
 }
@@ -1616,17 +1598,9 @@ impl PyreSym {
             (locals, stack)
         });
         if self.is_function_entry_trace {
-            // RPython MIFrame parity: function-entry traces use concrete
-            // value types (W_IntObject → Int) so the optimizer reads
-            // box.type directly. Self-recursive Int callees need this
-            // typing to match raw-int CALL_ASSEMBLER_I inputargs.
-            self.symbolic_local_types = (0..nlocals)
-                .map(|i| {
-                    concrete_stack_value(concrete_frame, i)
-                        .map(concrete_value_type)
-                        .unwrap_or(Type::Ref)
-                })
-                .collect();
+            // virtualizable.py:86 read_boxes() parity: all array items
+            // are GC pointers → Ref. No pre-unboxing at function entry.
+            self.symbolic_local_types = vec![Type::Ref; nlocals];
         } else if let Some(ref overrides) = self.bridge_local_types {
             // resume.py:1245 decode_box parity: bridge inputarg types are
             // determined by which jitcode liveness list (live_i_regs /
@@ -2627,28 +2601,11 @@ impl JitState for PyreJitState {
         )
     }
 
-    /// history.py:_make_op parity: pyre pre-unboxes Python locals at
-    /// the JIT entry boundary for function-entry traces, so the
-    /// recorder records each inputarg with the post-unbox kind exactly
-    /// as RPython's `wrap` produces typed FrontendOps from the start.
-    fn extract_live_values_for_entry(&self, meta: &Self::Meta) -> Vec<Value> {
-        let mut values = self.extract_live_values(meta);
-        let scalar_count = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
-        let total_slots = meta.valuestackdepth;
-        for slot_idx in 0..total_slots {
-            let value_idx = scalar_count + slot_idx;
-            let Some(value) = values.get_mut(value_idx) else {
-                break;
-            };
-            let raw = match value {
-                Value::Ref(r) => r.as_usize() as PyObjectRef,
-                _ => continue,
-            };
-            let slot_type = concrete_value_type(raw);
-            *value = extract_concrete_typed_value(slot_type, raw);
-        }
-        values
-    }
+    // virtualizable.py:86 read_boxes() + warmstate.py:73 wrap() parity:
+    // Array items (locals_cells_stack_w) are GC pointers → RefFrontendOp.
+    // No pre-unboxing at function entry. Unboxing happens during tracing
+    // via guard_class + getfield_gc_i when arithmetic/compare handlers
+    // encounter Ref-typed operands.
 
     fn live_value_types(&self, meta: &Self::Meta) -> Vec<Type> {
         crate::virtualizable_gen::virt_live_value_types(meta.slot_types.len())

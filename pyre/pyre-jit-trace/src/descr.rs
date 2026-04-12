@@ -54,10 +54,6 @@ pub struct PyreFieldDescr {
     /// When read during tracing, emits QUASIIMMUT_FIELD + GUARD_NOT_INVALIDATED.
     /// If mutated at runtime, invalidates all compiled loops watching this field.
     quasi_immutable: bool,
-    /// virtualizable.py:76-79: descr.vinfo = self.
-    /// Set for fields declared in VirtualizableInfo so the optimizer can
-    /// detect virtualizable-specific paths (heap.rs, force_lazy_sets).
-    virtualizable: bool,
     /// RPython descr.py:227 — field name for heaptracker.py:66 filtering.
     name: &'static str,
     index_in_parent: usize,
@@ -89,11 +85,6 @@ impl Descr for PyreFieldDescr {
 
     fn is_quasi_immutable(&self) -> bool {
         self.quasi_immutable
-    }
-
-    /// virtualizable.py:76-79: descr.vinfo = self
-    fn is_virtualizable(&self) -> bool {
-        self.virtualizable
     }
 }
 
@@ -169,7 +160,6 @@ pub fn make_field_descr(
         signed,
         immutable: false,
         quasi_immutable: false,
-        virtualizable: false,
         name: "",
         index_in_parent: 0,
         parent_descr: None,
@@ -211,7 +201,6 @@ pub fn make_field_descr_with_parent(
         signed,
         immutable: false,
         quasi_immutable: false,
-        virtualizable: false,
         name: "",
         index_in_parent: index,
         parent_descr: Some(Arc::downgrade(&parent)),
@@ -232,7 +221,6 @@ pub fn make_field_descr_full(
         signed: false,
         immutable,
         quasi_immutable: false,
-        virtualizable: false,
         name: "",
         index_in_parent: 0,
         parent_descr: None,
@@ -254,7 +242,6 @@ pub fn make_immutable_field_descr(
         signed,
         immutable: true,
         quasi_immutable: false,
-        virtualizable: false,
         name: "",
         index_in_parent: 0,
         parent_descr: None,
@@ -276,7 +263,6 @@ pub fn make_quasi_immutable_field_descr(
         signed,
         immutable: false,
         quasi_immutable: true,
-        virtualizable: false,
         name: "",
         index_in_parent: 0,
         parent_descr: None,
@@ -329,27 +315,6 @@ fn build_object_descr_group(
     vtable: usize,
     fields: &[(&'static str, usize, usize, Type, bool, bool, bool)],
 ) -> PyreObjectDescrGroup {
-    // Convert 7-tuple to 8-tuple with virtualizable=false.
-    let fields8: Vec<FieldSpec> = fields
-        .iter()
-        .map(|&(name, offset, fs, ft, signed, imm, qi)| {
-            (name, offset, fs, ft, signed, imm, qi, false)
-        })
-        .collect();
-    build_object_descr_group_vable(obj_size, type_id, vtable, &fields8)
-}
-
-/// Field spec: (name, offset, field_size, field_type, signed, immutable, quasi_immutable, virtualizable).
-type FieldSpec = (&'static str, usize, usize, Type, bool, bool, bool, bool);
-
-/// Build a descr group with per-field virtualizable flag.
-/// virtualizable.py:76-79: descr.vinfo = self (only on static_field_descrs/array_field_descrs).
-fn build_object_descr_group_vable(
-    obj_size: usize,
-    type_id: u32,
-    vtable: usize,
-    fields: &[FieldSpec],
-) -> PyreObjectDescrGroup {
     let size_descr = Arc::new_cyclic(|weak_size: &Weak<PyreSizeDescr>| {
         let parent_descr: Weak<dyn Descr> = weak_size.clone();
         let all_field_descrs: Vec<Arc<dyn FieldDescr>> = fields
@@ -358,16 +323,7 @@ fn build_object_descr_group_vable(
             .map(
                 |(
                     index_in_parent,
-                    &(
-                        name,
-                        offset,
-                        field_size,
-                        field_type,
-                        signed,
-                        immutable,
-                        quasi_immutable,
-                        virtualizable,
-                    ),
+                    &(name, offset, field_size, field_type, signed, immutable, quasi_immutable),
                 )| {
                     Arc::new(PyreFieldDescr {
                         offset,
@@ -376,7 +332,6 @@ fn build_object_descr_group_vable(
                         signed,
                         immutable,
                         quasi_immutable,
-                        virtualizable,
                         name,
                         index_in_parent,
                         parent_descr: Some(parent_descr.clone()),
@@ -638,31 +593,20 @@ static PYNAMESPACE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|
     )
 });
 
-/// Canonical field descriptors for PyFrame — virtualizable.py:71-79.
-/// virtualizable.py:76-79: descr.vinfo = self on static/array field descrs.
-/// vable_token_descr does NOT get descr.vinfo (virtualizable=false).
-/// Indices: 0=locals_cells_stack_w, 1=valuestackdepth, 2=next_instr,
-///          3=code, 4=namespace, 5=vable_token.
 static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
-    build_object_descr_group_vable(
+    build_object_descr_group(
         std::mem::size_of::<pyre_interpreter::pyframe::PyFrame>(),
         0,
         0,
         &[
-            // virtualizable.py:73: cpu.fielddescrof(VTYPE, 'locals_cells_stack_w')
-            // EmbeddedArray adaptation: the GETFIELD_GC_R reads the data pointer
-            // at field_offset + ptr_offset, not the container start.
-            // Type::Ref because pyjitpl.py:1221 uses GETFIELD_GC_R to load it.
             (
                 "PyFrame.locals_cells_stack_w",
-                crate::frame_layout::PYFRAME_LOCALS_CELLS_STACK_OFFSET
-                    + pyre_object::PYOBJECT_ARRAY_PTR_OFFSET,
+                crate::frame_layout::PYFRAME_LOCALS_CELLS_STACK_OFFSET,
                 8,
-                Type::Ref,
+                Type::Int,
                 false,
                 false,
                 false,
-                true, // virtualizable
             ),
             (
                 "PyFrame.valuestackdepth",
@@ -672,7 +616,6 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 true,
                 false,
                 false,
-                true, // virtualizable
             ),
             (
                 "PyFrame.next_instr",
@@ -682,7 +625,6 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 true,
                 false,
                 false,
-                true, // virtualizable
             ),
             (
                 "PyFrame.code",
@@ -692,7 +634,6 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 true,
                 false,
                 false,
-                true, // virtualizable
             ),
             (
                 "PyFrame.namespace",
@@ -702,20 +643,6 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
                 false,
                 false,
-                true, // virtualizable
-            ),
-            // rvirtualizable.py:29: ('vable_token', llmemory.GCREF)
-            // virtualizable.py:28: cpu.fielddescrof(VTYPE, 'vable_token')
-            // virtualizable.py:76-79: descr.vinfo NOT set on vable_token
-            (
-                "PyFrame.vable_token",
-                crate::frame_layout::PYFRAME_VABLE_TOKEN_OFFSET,
-                8,
-                Type::Ref,
-                false,
-                false,
-                false,
-                false, // NOT virtualizable — no descr.vinfo
             ),
         ],
     )
@@ -932,7 +859,6 @@ pub fn ob_type_descr() -> DescrRef {
         signed: false,
         immutable: true,
         quasi_immutable: false,
-        virtualizable: false,
         name: "typeptr",
         index_in_parent: 0,
         parent_descr: None,
@@ -969,30 +895,6 @@ pub fn pyframe_code_descr() -> DescrRef {
 
 pub fn pyframe_namespace_descr() -> DescrRef {
     field_descr_from_group(&PYFRAME_DESCR_GROUP, 4)
-}
-
-/// virtualizable.py:28: cpu.fielddescrof(VTYPE, 'vable_token')
-/// rvirtualizable.py:29: ('vable_token', llmemory.GCREF) — Type::Ref.
-pub fn pyframe_vable_token_descr() -> DescrRef {
-    field_descr_from_group(&PYFRAME_DESCR_GROUP, 5)
-}
-
-/// virtualizable.py:58: cpu.arraydescrof(VTYPE.locals_cells_stack_w)
-/// Canonical array descriptor for the locals_cells_stack_w array items.
-/// EmbeddedArray: items start at offset 0 from the data pointer,
-/// item_size = sizeof(usize) = 8, item_type = Ref (PyObjectRef).
-pub fn pyframe_locals_array_descr() -> DescrRef {
-    static DESCR: LazyLock<DescrRef> = LazyLock::new(|| {
-        // base_size=0: items start directly at the data pointer.
-        // item_size=8: sizeof(PyObjectRef) = sizeof(usize).
-        make_array_descr(0, std::mem::size_of::<usize>(), Type::Ref, false)
-    });
-    DESCR.clone()
-}
-
-/// SizeDescr for PyFrame (parent_descr for all virtualizable field descriptors).
-pub fn pyframe_size_descr_canonical() -> DescrRef {
-    PYFRAME_DESCR_GROUP.size_descr.clone()
 }
 
 #[cfg(test)]
