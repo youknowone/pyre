@@ -932,7 +932,11 @@ impl<M: Clone> MetaInterp<M> {
             pending_preamble_tokens: HashMap::new(),
             all_descrs: Vec::new(),
             pending_frontend_boxes: None,
-            cls_of_box: Some(default_cls_of_box),
+            // cls_of_box requires frontend_boxes to include virtualizable
+            // state values (RPython unroll.py:183 trace.inputargs has ALL
+            // inputargs). Our pending_frontend_boxes only has guard fail_args.
+            // Disabled until frontend_boxes reconstruction is complete.
+            cls_of_box: None,
         }
     }
 
@@ -5793,10 +5797,14 @@ impl<M: Clone> MetaInterp<M> {
                     .map(|i| OpRef(i as u32))
                     .collect();
                 let livebox_types: Vec<Type> = bridge_inputargs.iter().map(|ia| ia.tp).collect();
-                // bridgeopt.py:124: frontend_boxes = runtime values from
-                // guard failure. RPython passes Box objects; majit passes
-                // raw i64 values from the DeadFrame.
-                let frontend_boxes = self.pending_frontend_boxes.take().unwrap_or_default();
+                // unroll.py:183-188: frontend_inputargs = trace.inputargs
+                // RPython's frontend_boxes and liveboxes are both derived from
+                // the same trace, so they always have the same length.
+                // Our fail_values (dead frame) may be shorter than bridge_inputargs
+                // when virtualizable state extends the inputargs beyond fail_args.
+                // Pad to match liveboxes length (RPython bridgeopt.py:126 assert).
+                let mut frontend_boxes = self.pending_frontend_boxes.take().unwrap_or_default();
+                frontend_boxes.resize(liveboxes.len(), 0);
                 Some(PendingBridgeRd {
                     rd_numb,
                     rd_consts,

@@ -892,7 +892,13 @@ pub fn deserialize_optimizer_knowledge(
     use majit_ir::resumecode::Reader;
 
     let mut reader = Reader::new(rd_numb);
-    debug_assert!(frontend_boxes.len() == liveboxes.len() || frontend_boxes.is_empty());
+    // bridgeopt.py:126: assert len(frontend_boxes) == len(liveboxes)
+    assert!(
+        frontend_boxes.len() == liveboxes.len(),
+        "frontend_boxes.len()={} != liveboxes.len()={}",
+        frontend_boxes.len(),
+        liveboxes.len(),
+    );
 
     // bridgeopt.py:130-131: skip resume section
     let startcount = reader.next_item();
@@ -916,10 +922,16 @@ pub fn deserialize_optimizer_knowledge(
             // bridgeopt.py:145-146:
             //   cls = optimizer.cpu.cls_of_box(frontend_boxes[i])
             //   optimizer.make_constant_class(box, cls)
+            // RPython's type system guarantees frontend_boxes[i] is a valid
+            // GcRef when box.type == "r" and class_known is set. Our raw i64
+            // encoding requires a nonnull check (RPython's box.nonnull()
+            // equivalent, info.py:763).
             if let Some(cls_fn) = cls_of_box {
                 let raw_ref = frontend_boxes[i];
-                let cls = cls_fn(raw_ref);
-                super::optimizer::Optimizer::make_constant_class(ctx, livebox, cls, true);
+                if raw_ref != 0 {
+                    let cls = cls_fn(raw_ref);
+                    super::optimizer::Optimizer::make_constant_class(ctx, livebox, cls, true);
+                }
             }
         }
     }
