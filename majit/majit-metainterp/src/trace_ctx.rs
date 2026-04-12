@@ -8,7 +8,10 @@ use majit_trace::recorder::{Trace, TracePosition};
 use majit_backend::JitCellToken;
 
 use crate::TraceAction;
-use crate::call_descr::{make_call_assembler_descr, make_call_descr, make_call_may_force_descr};
+use crate::call_descr::{
+    make_call_assembler_descr, make_call_assembler_descr_with_vable, make_call_descr,
+    make_call_may_force_descr,
+};
 use crate::constant_pool::ConstantPool;
 use crate::fail_descr::{make_fail_descr, make_fail_descr_typed};
 use crate::jitdriver::JitDriverStaticData;
@@ -1072,9 +1075,7 @@ impl TraceCtx {
             }
         }
 
-        // pyjitpl.py:3456: SETFIELD_GC(box, ConstPtr(lltype.nullptr(llmemory.GCREF.TO)),
-        //                              descr=vable_token_descr)
-        let null = self.const_null();
+        let null = self.const_int(0);
         self.vable_setfield_descr(vable_opref, null, info.token_field_descr());
     }
 
@@ -1416,18 +1417,13 @@ impl TraceCtx {
         index: OpRef,
         index_runtime_value: i64,
         fdescr: DescrRef,
-        adescr: DescrRef,
     ) -> OpRef {
         if self.is_nonstandard_virtualizable(vable_opref) {
             // arraybox = self.opimpl_getfield_gc_r(box, fdescr)
+            // return self.opimpl_getarrayitem_gc_i(arraybox, indexbox, adescr)
             let array_opref =
                 self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], fdescr);
-            // return self.opimpl_getarrayitem_gc_i(arraybox, indexbox, adescr)
-            return self.record_op_with_descr(
-                OpCode::GetarrayitemGcI,
-                &[array_opref, index],
-                adescr,
-            );
+            return self.vable_getarrayitem_int(array_opref, index);
         }
         // index = self._get_arrayitem_vable_index(pc, fdescr, indexbox)
         // return self.metainterp.virtualizable_boxes[index]
@@ -1440,7 +1436,11 @@ impl TraceCtx {
         // Fallback: vable layout missing — go through getfield + arrayitem.
         let array_opref =
             self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], fdescr.clone());
-        self.record_op_with_descr(OpCode::GetarrayitemGcI, &[array_opref, index], adescr)
+        if let Ok(item_index) = usize::try_from(index_runtime_value) {
+            self.vable_getarrayitem_int_vable(array_opref, &fdescr, item_index)
+        } else {
+            self.vable_getarrayitem_int(array_opref, index)
+        }
     }
 
     /// Standard virtualizable array item read (ref).
@@ -1467,17 +1467,11 @@ impl TraceCtx {
         index: OpRef,
         index_runtime_value: i64,
         fdescr: DescrRef,
-        adescr: DescrRef,
     ) -> OpRef {
         if self.is_nonstandard_virtualizable(vable_opref) {
             let array_opref =
                 self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], fdescr);
-            // adescr.is_array_of_pointers() → GETARRAYITEM_GC_R
-            return self.record_op_with_descr(
-                OpCode::GetarrayitemGcR,
-                &[array_opref, index],
-                adescr,
-            );
+            return self.vable_getarrayitem_ref(array_opref, index);
         }
         if let Some(flat_idx) = self.get_arrayitem_vable_index(index, index_runtime_value, &fdescr)
         {
@@ -1487,7 +1481,11 @@ impl TraceCtx {
         }
         let array_opref =
             self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], fdescr.clone());
-        self.record_op_with_descr(OpCode::GetarrayitemGcR, &[array_opref, index], adescr)
+        if let Ok(item_index) = usize::try_from(index_runtime_value) {
+            self.vable_getarrayitem_ref_vable(array_opref, &fdescr, item_index)
+        } else {
+            self.vable_getarrayitem_ref(array_opref, index)
+        }
     }
 
     /// Standard virtualizable array item read (float).
@@ -1514,17 +1512,11 @@ impl TraceCtx {
         index: OpRef,
         index_runtime_value: i64,
         fdescr: DescrRef,
-        adescr: DescrRef,
     ) -> OpRef {
         if self.is_nonstandard_virtualizable(vable_opref) {
             let array_opref =
                 self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], fdescr);
-            // adescr.is_array_of_floats() → GETARRAYITEM_GC_F
-            return self.record_op_with_descr(
-                OpCode::GetarrayitemGcF,
-                &[array_opref, index],
-                adescr,
-            );
+            return self.vable_getarrayitem_float(array_opref, index);
         }
         if let Some(flat_idx) = self.get_arrayitem_vable_index(index, index_runtime_value, &fdescr)
         {
@@ -1534,7 +1526,11 @@ impl TraceCtx {
         }
         let array_opref =
             self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], fdescr.clone());
-        self.record_op_with_descr(OpCode::GetarrayitemGcF, &[array_opref, index], adescr)
+        if let Ok(item_index) = usize::try_from(index_runtime_value) {
+            self.vable_getarrayitem_float_vable(array_opref, &fdescr, item_index)
+        } else {
+            self.vable_getarrayitem_float(array_opref, index)
+        }
     }
 
     /// Standard virtualizable array item write.
@@ -1566,15 +1562,12 @@ impl TraceCtx {
         index: OpRef,
         index_runtime_value: i64,
         fdescr: DescrRef,
-        adescr: DescrRef,
         value: OpRef,
     ) {
         if self.is_nonstandard_virtualizable(vable_opref) {
-            // arraybox = self.opimpl_getfield_gc_r(box, fdescr)
             let array_opref =
                 self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], fdescr);
-            // self._opimpl_setarrayitem_gc_any(arraybox, indexbox, valuebox, adescr)
-            self.record_op_with_descr(OpCode::SetarrayitemGc, &[array_opref, index, value], adescr);
+            self.vable_setarrayitem(array_opref, index, value);
             return;
         }
         if let Some(flat_idx) = self.get_arrayitem_vable_index(index, index_runtime_value, &fdescr)
@@ -1587,7 +1580,11 @@ impl TraceCtx {
         }
         let array_opref =
             self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], fdescr.clone());
-        self.record_op_with_descr(OpCode::SetarrayitemGc, &[array_opref, index, value], adescr);
+        if let Ok(item_index) = usize::try_from(index_runtime_value) {
+            self.vable_setarrayitem_vable(array_opref, &fdescr, item_index, value);
+        } else {
+            self.vable_setarrayitem(array_opref, index, value);
+        }
     }
 
     /// pyjitpl.py:1253-1263 `opimpl_arraylen_vable(box, fdescr, adescr, pc)`.
@@ -1602,18 +1599,13 @@ impl TraceCtx {
     ///         arrayindex = vinfo.array_field_by_descrs[fdescr]
     ///         result = vinfo.get_array_length(virtualizable, arrayindex)
     ///         return ConstInt(result)
-    pub fn vable_arraylen_vable(
-        &mut self,
-        vable_opref: OpRef,
-        fdescr: DescrRef,
-        adescr: DescrRef,
-    ) -> OpRef {
+    pub fn vable_arraylen_vable(&mut self, vable_opref: OpRef, fdescr: DescrRef) -> OpRef {
         if self.is_nonstandard_virtualizable(vable_opref) {
             // arraybox = self.opimpl_getfield_gc_r(box, fdescr)
+            // return self.opimpl_arraylen_gc(arraybox, adescr)
             let array_opref =
                 self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], fdescr);
-            // return self.opimpl_arraylen_gc(arraybox, adescr)
-            return self.record_op_with_descr(OpCode::ArraylenGc, &[array_opref], adescr);
+            return self.record_op(OpCode::ArraylenGc, &[array_opref]);
         }
         // arrayindex = vinfo.array_field_by_descrs[fdescr]
         // result = vinfo.get_array_length(virtualizable, arrayindex)
@@ -1629,7 +1621,7 @@ impl TraceCtx {
         }
         // Fallback when the layout is unavailable.
         let array_opref = self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], fdescr);
-        self.record_op_with_descr(OpCode::ArraylenGc, &[array_opref], adescr)
+        self.record_op(OpCode::ArraylenGc, &[array_opref])
     }
 
     /// Compute the flat index into virtualizable_boxes for an array element.
@@ -2300,6 +2292,48 @@ impl TraceCtx {
     ) -> OpRef {
         let descr = make_call_assembler_descr(target_number, arg_types, Type::Ref);
         self.record_op_with_descr(OpCode::CallAssemblerR, args, descr)
+    }
+
+    /// rewrite.py:665-695 handle_call_assembler parity.
+    /// Emit CALL_ASSEMBLER with only the frame reference as arg; the backend
+    /// expands to the full callee inputarg layout via `VableExpansion`.
+    pub fn call_assembler_with_vable_expansion(
+        &mut self,
+        target_number: u64,
+        frame_arg: OpRef,
+        result_type: Type,
+        expansion: majit_ir::VableExpansion,
+    ) -> OpRef {
+        self.call_assembler_with_vable_expansion_args(
+            target_number,
+            &[frame_arg],
+            &[Type::Ref],
+            result_type,
+            expansion,
+        )
+    }
+
+    /// pyjitpl.py:3589-3609 direct_assembler_call parity.
+    /// Emit CALL_ASSEMBLER with multiple red args + VableExpansion.
+    /// The backend reads some fields from args[0] (frame) and uses
+    /// arg_overrides/const_overrides for callee-specific values.
+    pub fn call_assembler_with_vable_expansion_args(
+        &mut self,
+        target_number: u64,
+        args: &[OpRef],
+        arg_types: &[Type],
+        result_type: Type,
+        expansion: majit_ir::VableExpansion,
+    ) -> OpRef {
+        let opcode = match result_type {
+            Type::Int => OpCode::CallAssemblerI,
+            Type::Ref => OpCode::CallAssemblerR,
+            Type::Float => OpCode::CallAssemblerF,
+            Type::Void => OpCode::CallAssemblerN,
+        };
+        let descr =
+            make_call_assembler_descr_with_vable(target_number, arg_types, result_type, expansion);
+        self.record_op_with_descr(opcode, args, descr)
     }
 
     /// Emit CALL_ASSEMBLER_N (void). Assumes all args are `Type::Int`.

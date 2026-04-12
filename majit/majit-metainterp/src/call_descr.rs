@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use majit_ir::{CallDescr, DescrRef, EffectInfo, ExtraEffect, OopSpecIndex, Type};
+use majit_ir::{CallDescr, DescrRef, EffectInfo, ExtraEffect, OopSpecIndex, Type, VableExpansion};
 
 /// Generic CallDescr for function call operations.
 ///
@@ -17,6 +17,7 @@ struct MetaCallAssemblerDescr {
     arg_types: Vec<Type>,
     result_type: Type,
     target_token: u64,
+    vable_expansion: Option<VableExpansion>,
 }
 
 impl majit_ir::Descr for MetaCallDescr {
@@ -75,6 +76,9 @@ impl CallDescr for MetaCallAssemblerDescr {
     fn effect_info(&self) -> &EffectInfo {
         static INFO: EffectInfo = EffectInfo::const_new(ExtraEffect::CanRaise, OopSpecIndex::None);
         &INFO
+    }
+    fn vable_expansion(&self) -> Option<&VableExpansion> {
+        self.vable_expansion.as_ref()
     }
 }
 
@@ -139,5 +143,23 @@ pub fn make_call_assembler_descr(
         arg_types: arg_types.to_vec(),
         result_type,
         target_token,
+        vable_expansion: None,
+    })
+}
+
+/// rewrite.py:665-695 handle_call_assembler: create a CallDescr that carries
+/// virtualizable expansion info. The backend reads fields from the frame
+/// reference to populate the callee's full inputarg jitframe layout.
+pub fn make_call_assembler_descr_with_vable(
+    target_token: u64,
+    arg_types: &[Type],
+    result_type: Type,
+    expansion: VableExpansion,
+) -> DescrRef {
+    Arc::new(MetaCallAssemblerDescr {
+        arg_types: arg_types.to_vec(),
+        result_type,
+        target_token,
+        vable_expansion: Some(expansion),
     })
 }

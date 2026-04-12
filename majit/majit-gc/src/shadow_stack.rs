@@ -7,11 +7,17 @@
 /// 2. JitFrame shadow stack — jitframe pointers (RPython _call_header_shadowstack)
 ///
 /// Protocol for jitframe shadow stack (assembler.py:1122-1136):
-///   Entry: push_jf(jf_ptr)   — _call_header_shadowstack
+///   Entry: inline MOVs push [is_minor=1, jf_ptr] to root stack
 ///   Per-call: push_gcmap writes jf_gcmap; pop_gcmap clears it
 ///   GC: walk_jf_roots → read jf_gcmap → trace ref slots
-///   Exit: pop_jf_to(depth)   — _call_footer_shadowstack
+///   Exit: inline SUB decrements root_stack_top by 2*WORD
+///
+/// The jitframe shadow stack uses a flat memory array with a global
+/// root_stack_top pointer, matching RPython's ShadowStackPool.
+/// Compiled code manipulates root_stack_top with inline load/store
+/// instructions (no function calls), exactly as in assembler.py:1122-1136.
 use std::cell::RefCell;
+use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use majit_ir::GcRef;
@@ -19,33 +25,62 @@ use majit_ir::GcRef;
 /// Maximum shadow stack depth. RPython uses a fixed-size stack.
 const MAX_SHADOW_STACK_DEPTH: usize = 8192;
 
-/// RPython rootstacktop parity: a global pointer holding the current
-/// top jitframe's jf_ptr. Compiled code reads this directly with a
-/// single MOV instruction instead of calling through TLS + RefCell.
-///
-/// assembler.py:1369-1377 _reload_frame_if_necessary:
-///   MOV ecx, [rootstacktop]
-///   MOV ebp, [ecx - WORD]
-///
-/// We flatten both loads into a single load from this global because
-/// our shadow stack stores jf_ptr directly (not a pointer-to-pointer).
-/// Updated by push_jf, pop_jf_to, and walk_jf_roots (after GC move).
-static CURRENT_TOP_JF_PTR: AtomicUsize = AtomicUsize::new(0);
+/// WORD size (bytes). RPython: arch.py WORD.
+const WORD: usize = std::mem::size_of::<usize>();
 
-/// Return the address of the global jf_ptr for inline Cranelift loads.
-pub fn current_top_jf_ptr_addr() -> usize {
-    &CURRENT_TOP_JF_PTR as *const AtomicUsize as usize
+// ── Flat jitframe shadow stack (ShadowStackPool parity) ─────────
+//
+// RPython's ShadowStackPool pre-allocates a contiguous array. Each
+// entry is [is_minor_marker: WORD, jf_ptr: WORD] = 2*WORD bytes.
+// root_stack_top points past the last entry (next free slot).
+//
+// assembler.py:1122-1128 _call_header_shadowstack:
+//   MOV ebx, [root_stack_top_addr]    // load top pointer
+//   MOV [ebx], 1                      // is_minor marker
+//   MOV [ebx + WORD], ebp             // jf_ptr
+//   ADD ebx, 2*WORD                   // advance
+//   MOV [root_stack_top_addr], ebx    // store new top
+//
+// assembler.py:1130-1136 _call_footer_shadowstack:
+//   SUB [root_stack_top_addr], 2*WORD  // decrement top
+
+/// Sync wrapper for the flat shadow stack buffer.
+struct RootStackBuf {
+    data: UnsafeCell<[usize; MAX_SHADOW_STACK_DEPTH * 2]>,
+}
+// SAFETY: JIT execution is single-threaded; buffer accessed only from
+// the thread that owns the compiled code.
+unsafe impl Sync for RootStackBuf {}
+
+/// Pre-allocated flat array for jitframe shadow stack entries.
+static JF_ROOT_STACK: RootStackBuf = RootStackBuf {
+    data: UnsafeCell::new([0; MAX_SHADOW_STACK_DEPTH * 2]),
+};
+
+/// gc.py:255 root_stack_top — pointer into JF_ROOT_STACK.
+/// Compiled code reads/writes this with inline MOV instructions.
+/// Initialized to point at the start of JF_ROOT_STACK.
+static ROOT_STACK_TOP: AtomicUsize = AtomicUsize::new(0);
+
+/// Ensure ROOT_STACK_TOP is initialized to point at JF_ROOT_STACK base.
+fn ensure_root_stack_init() {
+    if ROOT_STACK_TOP.load(Ordering::Acquire) == 0 {
+        let base = JF_ROOT_STACK.data.get() as usize;
+        ROOT_STACK_TOP.store(base, Ordering::Release);
+    }
+}
+
+/// gc.py:255-257 get_root_stack_top_addr()
+/// Returns the ADDRESS of the root_stack_top variable (not its value).
+/// Compiled code uses this to emit inline loads/stores.
+pub fn get_root_stack_top_addr() -> usize {
+    ensure_root_stack_init();
+    &ROOT_STACK_TOP as *const AtomicUsize as usize
 }
 
 thread_local! {
     /// Thread-local shadow stack for individual GcRef roots.
     static SHADOW_STACK: RefCell<ShadowStack> = RefCell::new(ShadowStack::new());
-
-    /// Thread-local jitframe shadow stack.
-    /// RPython: _call_header_shadowstack pushes [category, jf_ptr] pairs.
-    /// category=1 is the is_minor marker (incminimark.py optimization).
-    /// GC walks this to find jitframes and trace their ref slots via jf_gcmap.
-    static JF_SHADOW_STACK: RefCell<Vec<JfShadowEntry>> = RefCell::new(Vec::with_capacity(16));
 
     /// Thread-local stack of blackhole interpreter register banks.
     /// blackhole.py BlackholeInterpreter.registers_r parity: each active
@@ -117,82 +152,76 @@ pub fn depth() -> usize {
 /// Clear both shadow stacks.
 pub fn clear() {
     SHADOW_STACK.with(|ss| ss.borrow_mut().entries.clear());
-    JF_SHADOW_STACK.with(|ss| ss.borrow_mut().clear());
+    // Reset root_stack_top to base of flat array.
+    ensure_root_stack_init();
+    let base = JF_ROOT_STACK.data.get() as usize;
+    ROOT_STACK_TOP.store(base, Ordering::Release);
 }
 
 // ── JitFrame shadow stack (assembler.py:1122-1136) ───────────────
+//
+// Flat memory array with entries: [is_minor(usize), jf_ptr(usize)].
+// root_stack_top points past the last entry. Compiled code manipulates
+// root_stack_top directly with inline load/store instructions.
 
-/// RPython shadow stack entry: [category, jf_ptr].
-/// assembler.py:1125: MOV [ebx], 1  — the `1` is_minor marker.
-/// assembler.py:1126: MOV [ebx+WORD], ebp — the jf_ptr.
+/// Push a jitframe GcRef onto the flat shadow stack.
 ///
-/// `jf_ptr` is a GcRef: the GC may copy the jitframe during minor
-/// collection and update jf_ptr in-place (RPython root_walker semantics).
-#[derive(Clone, Copy)]
-struct JfShadowEntry {
-    /// is_minor marker. RPython uses 1 to indicate jitframe entry.
-    _category: usize,
-    /// GcRef to the jitframe. Updated by the GC when the jitframe is
-    /// copied from nursery to old gen (root_walker semantics).
-    jf_ptr: GcRef,
-}
-
-/// Push a jitframe GcRef onto the jitframe shadow stack.
-///
-/// RPython _call_header_shadowstack (assembler.py:1122-1128):
-///   MOV [shadowstack_top], 1       // is_minor marker
-///   MOV [shadowstack_top+WORD], ebp  // jf_ptr
-///   ADD shadowstack_top, 2*WORD
-///
-/// Returns the depth for later pop.
+/// assembler.py:1122-1128 _call_header_shadowstack:
+///   MOV [top], 1           // is_minor marker
+///   MOV [top + WORD], ebp  // jf_ptr
+///   ADD top, 2*WORD        // advance
 pub fn push_jf(jf_ptr: GcRef) -> usize {
-    let depth = JF_SHADOW_STACK.with(|ss| {
-        let mut ss = ss.borrow_mut();
-        let depth = ss.len();
+    ensure_root_stack_init();
+    unsafe {
+        let base = JF_ROOT_STACK.data.get() as *mut usize;
+        let top = ROOT_STACK_TOP.load(Ordering::Acquire) as *mut usize;
+        let depth = (top as usize - base as usize) / (2 * WORD);
         assert!(depth < MAX_SHADOW_STACK_DEPTH, "jf shadow stack overflow");
-        ss.push(JfShadowEntry {
-            _category: 1,
-            jf_ptr,
-        });
+        // assembler.py:1125: MOV [ebx], 1
+        *top = 1;
+        // assembler.py:1126: MOV [ebx + WORD], ebp
+        *top.add(1) = jf_ptr.0;
+        // assembler.py:1127: ADD ebx, 2*WORD
+        let new_top = top.add(2);
+        ROOT_STACK_TOP.store(new_top as usize, Ordering::Release);
         depth
-    });
-    // Update global so compiled code can read jf_ptr with a single load.
-    CURRENT_TOP_JF_PTR.store(jf_ptr.0, Ordering::Release);
-    depth
+    }
 }
 
 /// Read the GC-updated jf_ptr from the shadow stack at the given depth.
 ///
-/// RPython _call_footer_shadowstack (assembler.py:1130-1136):
-///   MOV eax, [rootstacktop - WORD]  // read GC-updated jf_ptr
-///   SUB rootstacktop, 2*WORD
-///
-/// The GC may have forwarded the nursery jitframe to old gen and updated
-/// the shadow stack entry in place. This returns the forwarded address.
+/// assembler.py:1369-1377 _reload_frame_if_necessary:
+///   MOV ecx, [rootstacktop]
+///   MOV ebp, [ecx - WORD]
 pub fn peek_jf(depth: usize) -> GcRef {
-    JF_SHADOW_STACK.with(|ss| {
-        let ss = ss.borrow();
-        ss[depth].jf_ptr
-    })
+    unsafe {
+        let base = JF_ROOT_STACK.data.get() as *const usize;
+        // entry at `depth`: base[depth*2] = is_minor, base[depth*2+1] = jf_ptr
+        GcRef(*base.add(depth * 2 + 1))
+    }
 }
 
 /// Pop jitframe entries back to the given depth.
 ///
-/// RPython _call_footer_shadowstack (assembler.py:1130-1136):
+/// assembler.py:1130-1136 _call_footer_shadowstack:
 ///   SUB [rootstacktop], 2*WORD
 pub fn pop_jf_to(depth: usize) {
-    JF_SHADOW_STACK.with(|ss| {
-        let mut ss = ss.borrow_mut();
-        ss.truncate(depth);
-        // Update global to new top (or null if stack is empty).
-        let new_top = ss.last().map(|e| e.jf_ptr.0).unwrap_or(0);
-        CURRENT_TOP_JF_PTR.store(new_top, Ordering::Release);
-    });
+    ensure_root_stack_init();
+    unsafe {
+        let base = JF_ROOT_STACK.data.get() as *mut usize;
+        let new_top = base.add(depth * 2);
+        ROOT_STACK_TOP.store(new_top as usize, Ordering::Release);
+    }
 }
 
 /// Current depth of the jitframe shadow stack.
 pub fn jf_depth() -> usize {
-    JF_SHADOW_STACK.with(|ss| ss.borrow().len())
+    ensure_root_stack_init();
+    unsafe {
+        let base = JF_ROOT_STACK.data.get() as usize;
+        let top = ROOT_STACK_TOP.load(Ordering::Acquire);
+        (top - base) / (2 * WORD)
+    }
 }
 
 /// Walk jitframe shadow stack entries as GC roots.
@@ -207,35 +236,43 @@ pub fn jf_depth() -> usize {
 /// copies the jitframe, and then `jitframe_trace` (custom_trace hook)
 /// traces the gcmap-indicated ref slots during Phase 2.
 pub fn walk_jf_roots(mut visitor: impl FnMut(&mut GcRef)) {
-    JF_SHADOW_STACK.with(|ss| {
-        let mut ss = ss.borrow_mut();
-        for entry in ss.iter_mut() {
-            if !entry.jf_ptr.is_null() {
-                visitor(&mut entry.jf_ptr);
+    ensure_root_stack_init();
+    unsafe {
+        let base = JF_ROOT_STACK.data.get() as *mut usize;
+        let top = ROOT_STACK_TOP.load(Ordering::Acquire) as *mut usize;
+        let mut ptr = base;
+        while ptr < top {
+            // ptr[0] = is_minor marker, ptr[1] = jf_ptr
+            let jf_ref = &mut *(ptr.add(1) as *mut GcRef);
+            if !jf_ref.is_null() {
+                visitor(jf_ref);
             }
+            ptr = ptr.add(2);
         }
-        // GC may have moved the top jitframe — update the global pointer
-        // so compiled code reads the forwarded address on next reload.
-        if let Some(top) = ss.last() {
-            CURRENT_TOP_JF_PTR.store(top.jf_ptr.0, Ordering::Release);
-        }
-    });
+    }
 }
 
 /// Read the jf_ptr of the top shadow stack entry.
 ///
-/// RPython _reload_frame_if_necessary (assembler.py:405-412):
+/// assembler.py:1369-1377 _reload_frame_if_necessary:
 ///   MOV ecx, [rootstacktop]
-///   MOV ebp, [ecx - WORD]        // ebp = *(top - WORD) = jf_ptr
+///   MOV ebp, [ecx - WORD]
 ///
 /// After a collecting call, the GC may have copied the jitframe. The
 /// shadow stack entry has been updated. Compiled code reloads jf_ptr
 /// from here to get the (possibly new) address.
 pub fn jf_top_ptr() -> GcRef {
-    JF_SHADOW_STACK.with(|ss| {
-        let ss = ss.borrow();
-        ss.last().map(|e| e.jf_ptr).unwrap_or(GcRef::NULL)
-    })
+    ensure_root_stack_init();
+    unsafe {
+        let base = JF_ROOT_STACK.data.get() as usize;
+        let top = ROOT_STACK_TOP.load(Ordering::Acquire);
+        if top <= base {
+            return GcRef::NULL;
+        }
+        // top points past the last entry; jf_ptr is at top - WORD
+        let jf_ptr_addr = (top - WORD) as *const usize;
+        GcRef(*jf_ptr_addr)
+    }
 }
 
 // ── Blackhole register bank shadow stack ────────────────────────
@@ -367,21 +404,22 @@ pub extern "C" fn majit_shadow_stack_set_depth(new_depth: i64) {
 
 /// Read the top jf_ptr from the jitframe shadow stack.
 ///
-/// Called from compiled code as `_reload_frame_if_necessary`
-/// (assembler.py:405-412): after a collecting call, the GC may have
-/// moved the jitframe. Reload jf_ptr from the shadow stack.
+/// assembler.py:1369-1377 _reload_frame_if_necessary:
+///   MOV ecx, [rootstacktop]; MOV ebp, [ecx - WORD]
 #[unsafe(no_mangle)]
 pub extern "C" fn majit_jf_shadow_stack_get_top_jf_ptr() -> i64 {
     jf_top_ptr().0 as i64
 }
 
-/// _call_header_shadowstack (assembler.py:1122-1128) parity.
+/// _call_header_shadowstack (assembler.py:1122-1128).
+/// Non-compiled callers use this; compiled code uses inline MOVs.
 #[unsafe(no_mangle)]
 pub extern "C" fn majit_jf_shadow_stack_push(jf_ptr_raw: i64) -> i64 {
     push_jf(crate::GcRef(jf_ptr_raw as usize)) as i64
 }
 
-/// _call_footer_shadowstack (assembler.py:1130-1136) parity.
+/// _call_footer_shadowstack (assembler.py:1130-1136).
+/// Non-compiled callers use this; compiled code uses inline SUB.
 #[unsafe(no_mangle)]
 pub extern "C" fn majit_jf_shadow_stack_pop_to(depth: i64) {
     pop_jf_to(depth as usize);
@@ -390,9 +428,15 @@ pub extern "C" fn majit_jf_shadow_stack_pop_to(depth: i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    // The flat JF shadow stack is global (not thread-local), matching
+    // RPython's single root_stack_top. Tests must not run concurrently.
+    static TEST_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_push_pop_roundtrip() {
+        let _lock = TEST_MUTEX.lock().unwrap();
         clear();
         let a = GcRef(0x1000);
         let b = GcRef(0x2000);
@@ -410,6 +454,7 @@ mod tests {
 
     #[test]
     fn test_walk_roots_updates() {
+        let _lock = TEST_MUTEX.lock().unwrap();
         clear();
         push(GcRef(0x1000));
         push(GcRef(0x2000));
@@ -426,6 +471,7 @@ mod tests {
 
     #[test]
     fn test_extern_c_interface() {
+        let _lock = TEST_MUTEX.lock().unwrap();
         clear();
         let depth = majit_shadow_stack_push(0x3000);
         assert_eq!(depth, 0);
@@ -442,19 +488,23 @@ mod tests {
 
     #[test]
     fn test_jf_shadow_stack_push_pop() {
+        let _lock = TEST_MUTEX.lock().unwrap();
         clear();
         assert_eq!(jf_depth(), 0);
         let depth = push_jf(GcRef(0x1000));
         assert_eq!(depth, 0);
         assert_eq!(jf_depth(), 1);
+        assert_eq!(peek_jf(0), GcRef(0x1000));
         push_jf(GcRef(0x2000));
         assert_eq!(jf_depth(), 2);
+        assert_eq!(peek_jf(1), GcRef(0x2000));
         pop_jf_to(depth);
         assert_eq!(jf_depth(), 0);
     }
 
     #[test]
     fn test_walk_jf_roots_updates_gcref() {
+        let _lock = TEST_MUTEX.lock().unwrap();
         clear();
         push_jf(GcRef(0x1000));
         push_jf(GcRef(0x2000));
@@ -464,13 +514,15 @@ mod tests {
             gcref.0 += 0x100;
         });
 
-        // After walk, top entry should be updated
+        // After walk, entries should be updated in-place
+        assert_eq!(peek_jf(0), GcRef(0x1100));
         assert_eq!(jf_top_ptr(), GcRef(0x2100));
         pop_jf_to(0);
     }
 
     #[test]
     fn test_jf_top_ptr_reload() {
+        let _lock = TEST_MUTEX.lock().unwrap();
         clear();
         push_jf(GcRef(0xABCD));
         assert_eq!(jf_top_ptr(), GcRef(0xABCD));
@@ -482,6 +534,25 @@ mod tests {
         });
         assert_eq!(jf_top_ptr(), GcRef(0xDEAD));
         assert_eq!(majit_jf_shadow_stack_get_top_jf_ptr(), 0xDEAD as i64);
+        pop_jf_to(0);
+    }
+
+    #[test]
+    fn test_jf_flat_array_layout() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+        // Verify the flat array layout matches RPython's [is_minor, jf_ptr] pairs
+        clear();
+        push_jf(GcRef(0xAAAA));
+        push_jf(GcRef(0xBBBB));
+        unsafe {
+            let base = JF_ROOT_STACK.data.get() as *const usize;
+            // Entry 0: [1, 0xAAAA]
+            assert_eq!(*base, 1);
+            assert_eq!(*base.add(1), 0xAAAA);
+            // Entry 1: [1, 0xBBBB]
+            assert_eq!(*base.add(2), 1);
+            assert_eq!(*base.add(3), 0xBBBB);
+        }
         pop_jf_to(0);
     }
 }

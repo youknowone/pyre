@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::OnceLock;
 
 use crate::optimizeopt::optimizer::Optimizer;
 use majit_backend::{
@@ -38,16 +37,6 @@ use crate::resume::{
 };
 use crate::trace_ctx::TraceCtx;
 use crate::virtualizable::VirtualizableInfo;
-
-/// Callback for unboxing a Ref (boxed int pointer) to a raw i64 value.
-/// Registered by pyre at init time so adapt_live_values_to_trace_types
-/// can unbox W_IntObject without depending on pyre-object.
-static REF_UNBOX_INT_FN: OnceLock<fn(i64) -> i64> = OnceLock::new();
-
-/// Register the Ref→Int unbox callback for adapt_live_values_to_trace_types.
-pub fn set_ref_unbox_int_fn(f: fn(i64) -> i64) {
-    let _ = REF_UNBOX_INT_FN.set(f);
-}
 
 /// No direct RPython equivalent — Rust struct carrying data that RPython
 /// passes through internal method calls in handle_guard_failure
@@ -397,22 +386,6 @@ pub(crate) struct PartialTrace {
 /// `M` is the interpreter-specific metadata stored alongside each compiled loop
 /// (e.g., storage layout, register mapping). The interpreter provides `M` when
 /// closing a trace and receives it back when running compiled code.
-/// Bridge trace data extracted from the tracing context, ready for
-/// deferred compilation after the main loop is stored.
-pub(crate) struct PendingDoneBridge {
-    pub green_key: u64,
-    pub trace_id: u64,
-    pub fail_index: u32,
-    pub bridge_ops: Vec<majit_ir::Op>,
-    pub bridge_inputargs: Vec<majit_ir::InputArg>,
-    pub constants: HashMap<u32, i64>,
-    pub constant_types: HashMap<u32, majit_ir::Type>,
-    pub snapshot_boxes: HashMap<i32, Vec<majit_ir::OpRef>>,
-    pub snapshot_frame_sizes: HashMap<i32, Vec<usize>>,
-    pub snapshot_vable_boxes: HashMap<i32, Vec<majit_ir::OpRef>>,
-    pub snapshot_frame_pcs: HashMap<i32, Vec<(i32, i32)>>,
-    pub snapshot_box_types: HashMap<u32, majit_ir::Type>,
-}
 
 /// model.py:199-201 cpu.cls_of_box(box) default implementation:
 ///   obj = lltype.cast_opaque_ptr(OBJECTPTR, box.getref_base())
@@ -454,12 +427,6 @@ pub struct MetaInterp<M: Clone> {
     pub(crate) vable_array_lengths: Vec<usize>,
     /// warmspot.py:449 jd.result_type — per-driver static result type.
     pub(crate) result_type: Type,
-    /// Helper function pointers that box raw ints into interpreter objects.
-    pub(crate) raw_int_box_helpers: HashSet<i64>,
-    /// Mapping: create_frame_N_ptr → create_frame_N_raw_int_ptr.
-    /// When a box helper feeds directly into create_frame, the box+create
-    /// can be folded into a single create_frame_raw_int call.
-    pub(crate) create_frame_raw_map: HashMap<i64, i64>,
     /// RPython portal_call_depth parity: call depth at which the current
     /// trace started. When Some(depth), only merge_point at that depth fires.
     /// Replaces the pyre-jit TLS JIT_TRACING_DEPTH — state colocated with
@@ -507,13 +474,6 @@ pub struct MetaInterp<M: Clone> {
     /// virtualizable.py:86 NUM_SCALAR_INPUTARGS: number of scalar inputargs
     /// (frame + static fields). Set by the interpreter at JIT init.
     pub num_scalar_inputargs: usize,
-    /// Deferred bridge compilations from compile_done_with_this_frame.
-    /// RPython parity: in RPython, bridge traces only fire AFTER the main
-    /// loop is compiled and the first execution happens after all bridge
-    /// actions are processed. In pyre, the interpreter may resume between
-    /// finish_and_compile and compile_done_with_this_frame. Pending bridges
-    /// are compiled immediately after finish_and_compile stores the main loop.
-    pub(crate) pending_done_bridges: Vec<PendingDoneBridge>,
     /// pyjitpl.py:3182: trace position saved before compile_trace records
     /// a tentative JUMP. If compile_trace triggers retrace_needed, this
     /// becomes the retracing_from position.
@@ -912,8 +872,6 @@ impl<M: Clone> MetaInterp<M> {
             vable_ptr: std::ptr::null(),
             vable_array_lengths: Vec::new(),
             result_type: Type::Ref,
-            raw_int_box_helpers: HashSet::new(),
-            create_frame_raw_map: HashMap::new(),
             tracing_call_depth: None,
             max_unroll_recursion: 7, // RPython default from rlib/jit.py
             force_finish_trace: false,
@@ -927,7 +885,6 @@ impl<M: Clone> MetaInterp<M> {
             cancel_count: 0,
             last_compiled_key: None,
             num_scalar_inputargs: 0,
-            pending_done_bridges: Vec::new(),
             potential_retrace_position: None,
             last_quasi_immutable_deps: Vec::new(),
             retrace_after_bridge: false,
@@ -1627,58 +1584,49 @@ impl<M: Clone> MetaInterp<M> {
             .vable_setfield(vable_opref, fielddescr, value);
     }
 
-    /// pyjitpl.py:1218-1234 `_opimpl_getarrayitem_vable(box, indexbox, fdescr, adescr, pc)` — int.
+    /// pyjitpl.py:1218-1234 `_opimpl_getarrayitem_vable` — int variant.
     pub fn opimpl_getarrayitem_vable_int(
         &mut self,
         vable_opref: OpRef,
         index: OpRef,
         index_runtime_value: i64,
         fdescr: DescrRef,
-        adescr: DescrRef,
     ) -> OpRef {
         self.tracing
             .as_mut()
             .expect("opimpl_getarrayitem_vable_int requires active tracing")
-            .vable_getarrayitem_int_indexed(vable_opref, index, index_runtime_value, fdescr, adescr)
+            .vable_getarrayitem_int_indexed(vable_opref, index, index_runtime_value, fdescr)
     }
 
-    /// pyjitpl.py:1218-1234 `_opimpl_getarrayitem_vable(box, indexbox, fdescr, adescr, pc)` — ref.
+    /// pyjitpl.py:1218-1234 `_opimpl_getarrayitem_vable` — ref variant.
     pub fn opimpl_getarrayitem_vable_ref(
         &mut self,
         vable_opref: OpRef,
         index: OpRef,
         index_runtime_value: i64,
         fdescr: DescrRef,
-        adescr: DescrRef,
     ) -> OpRef {
         self.tracing
             .as_mut()
             .expect("opimpl_getarrayitem_vable_ref requires active tracing")
-            .vable_getarrayitem_ref_indexed(vable_opref, index, index_runtime_value, fdescr, adescr)
+            .vable_getarrayitem_ref_indexed(vable_opref, index, index_runtime_value, fdescr)
     }
 
-    /// pyjitpl.py:1218-1234 `_opimpl_getarrayitem_vable(box, indexbox, fdescr, adescr, pc)` — float.
+    /// pyjitpl.py:1218-1234 `_opimpl_getarrayitem_vable` — float variant.
     pub fn opimpl_getarrayitem_vable_float(
         &mut self,
         vable_opref: OpRef,
         index: OpRef,
         index_runtime_value: i64,
         fdescr: DescrRef,
-        adescr: DescrRef,
     ) -> OpRef {
         self.tracing
             .as_mut()
             .expect("opimpl_getarrayitem_vable_float requires active tracing")
-            .vable_getarrayitem_float_indexed(
-                vable_opref,
-                index,
-                index_runtime_value,
-                fdescr,
-                adescr,
-            )
+            .vable_getarrayitem_float_indexed(vable_opref, index, index_runtime_value, fdescr)
     }
 
-    /// pyjitpl.py:1236-1247 `_opimpl_setarrayitem_vable(box, indexbox, valuebox, fdescr, adescr, pc)` — int.
+    /// pyjitpl.py:1236-1247 `_opimpl_setarrayitem_vable` — int variant.
     pub fn opimpl_setarrayitem_vable_int(
         &mut self,
         vable_opref: OpRef,
@@ -1686,22 +1634,14 @@ impl<M: Clone> MetaInterp<M> {
         index_runtime_value: i64,
         value: OpRef,
         fdescr: DescrRef,
-        adescr: DescrRef,
     ) {
         self.tracing
             .as_mut()
             .expect("opimpl_setarrayitem_vable_int requires active tracing")
-            .vable_setarrayitem_indexed(
-                vable_opref,
-                index,
-                index_runtime_value,
-                fdescr,
-                adescr,
-                value,
-            );
+            .vable_setarrayitem_indexed(vable_opref, index, index_runtime_value, fdescr, value);
     }
 
-    /// pyjitpl.py:1236-1247 `_opimpl_setarrayitem_vable(box, indexbox, valuebox, fdescr, adescr, pc)` — ref.
+    /// pyjitpl.py:1236-1247 `_opimpl_setarrayitem_vable` — ref variant.
     pub fn opimpl_setarrayitem_vable_ref(
         &mut self,
         vable_opref: OpRef,
@@ -1709,22 +1649,14 @@ impl<M: Clone> MetaInterp<M> {
         index_runtime_value: i64,
         value: OpRef,
         fdescr: DescrRef,
-        adescr: DescrRef,
     ) {
         self.tracing
             .as_mut()
             .expect("opimpl_setarrayitem_vable_ref requires active tracing")
-            .vable_setarrayitem_indexed(
-                vable_opref,
-                index,
-                index_runtime_value,
-                fdescr,
-                adescr,
-                value,
-            );
+            .vable_setarrayitem_indexed(vable_opref, index, index_runtime_value, fdescr, value);
     }
 
-    /// pyjitpl.py:1236-1247 `_opimpl_setarrayitem_vable(box, indexbox, valuebox, fdescr, adescr, pc)` — float.
+    /// pyjitpl.py:1236-1247 `_opimpl_setarrayitem_vable` — float variant.
     pub fn opimpl_setarrayitem_vable_float(
         &mut self,
         vable_opref: OpRef,
@@ -1732,32 +1664,19 @@ impl<M: Clone> MetaInterp<M> {
         index_runtime_value: i64,
         value: OpRef,
         fdescr: DescrRef,
-        adescr: DescrRef,
     ) {
         self.tracing
             .as_mut()
             .expect("opimpl_setarrayitem_vable_float requires active tracing")
-            .vable_setarrayitem_indexed(
-                vable_opref,
-                index,
-                index_runtime_value,
-                fdescr,
-                adescr,
-                value,
-            );
+            .vable_setarrayitem_indexed(vable_opref, index, index_runtime_value, fdescr, value);
     }
 
     /// pyjitpl.py:1253-1263 `opimpl_arraylen_vable(box, fdescr, adescr, pc)`.
-    pub fn opimpl_arraylen_vable(
-        &mut self,
-        vable_opref: OpRef,
-        fdescr: DescrRef,
-        adescr: DescrRef,
-    ) -> OpRef {
+    pub fn opimpl_arraylen_vable(&mut self, vable_opref: OpRef, fdescr: DescrRef) -> OpRef {
         self.tracing
             .as_mut()
             .expect("opimpl_arraylen_vable requires active tracing")
-            .vable_arraylen_vable(vable_opref, fdescr, adescr)
+            .vable_arraylen_vable(vable_opref, fdescr)
     }
 
     /// pyjitpl.py:1064-1073 `opimpl_hint_force_virtualizable(box)`.
@@ -2039,17 +1958,7 @@ impl<M: Clone> MetaInterp<M> {
         let numbering_overrides = ctx.constants.numbering_type_overrides().clone();
         let (mut constants, mut constant_types) = ctx.constants.into_inner_with_types();
 
-        let (trace_ops, _) = compile::fold_box_into_create_frame(
-            trace.ops.clone(),
-            &mut constants,
-            &self.raw_int_box_helpers,
-            &self.create_frame_raw_map,
-        );
-        let (trace_ops, _) = compile::elide_create_frame_for_call_assembler(
-            trace_ops,
-            &constants,
-            &self.create_frame_raw_map,
-        );
+        let trace_ops = trace.ops.clone();
         if crate::majit_log_enabled() {
             eprintln!("--- trace (before opt) ---");
             eprint!("{}", majit_ir::format_trace(&trace_ops, &constants));
@@ -2268,22 +2177,14 @@ impl<M: Clone> MetaInterp<M> {
         }
 
         // RPython: jit_merge_point tick counter provides periodic exit from
-        // compiled loops. majit: for now, abort guardless loops. Loops with
-        // constant-true guards (push(constant) pattern) will also hang but
-        // this matches RPython behavior (relies on OS signals/GIL for exit).
-        //
-        // TODO: implement GUARD_NOT_INVALIDATED + signal-based invalidation
-        // for periodic exit from compiled loops.
-        let has_guard = compiled_ops.iter().any(|op| op.opcode.is_guard());
-        if !has_guard {
-            if crate::majit_log_enabled() {
-                eprintln!("[jit] abort: guardless loop (no interrupt support)");
-            }
-            self.warm_state.abort_tracing(green_key, true);
-            self.cancel_count += 1;
-            self.warm_state.reset_function_counts();
-            return CompileOutcome::Cancelled;
-        }
+        // RPython: the optimizer always emits at least one guard
+        // (GUARD_NOT_INVALIDATED from OptHeap, or user-level guards).
+        // A guardless trace is a bug — the invariant is that the optimizer
+        // never produces a guardless loop.
+        debug_assert!(
+            compiled_ops.iter().any(|op| op.opcode.is_guard()),
+            "optimizer produced guardless loop — GUARD_NOT_INVALIDATED should always be present"
+        );
 
         // resume.py parity: rd_numb is now produced inline during optimization
         // (ctx.emit → store_final_boxes_in_guard) rather than post-assembly.
@@ -2291,8 +2192,6 @@ impl<M: Clone> MetaInterp<M> {
         let compiled_constants = constants.clone();
         let compiled_constant_types = constant_types.clone();
         self.backend.set_constants(constants);
-        self.backend
-            .set_constant_types(compiled_constant_types.clone());
 
         // Use pre-allocated token number if available (for self-recursion
         // support), otherwise allocate a fresh one.
@@ -2432,6 +2331,13 @@ impl<M: Clone> MetaInterp<M> {
                     &mut terminal_exit_layouts,
                 );
                 self.take_back_all_descrs(std::mem::take(&mut unroll_opt.all_descrs));
+                // unroll.py:176-177: disable_retracing_if_max_retrace_guards
+                let mut final_retraced_count = unroll_opt.retraced_count;
+                crate::optimizeopt::unroll::OptUnroll::disable_retracing_if_max_retrace_guards(
+                    &compiled_ops,
+                    &mut final_retraced_count,
+                    self.warm_state.max_retrace_guards(),
+                );
                 let mut traces = HashMap::new();
                 traces.insert(
                     trace_id,
@@ -2477,7 +2383,7 @@ impl<M: Clone> MetaInterp<M> {
                         num_inputs: inputargs.len(),
                         meta,
                         front_target_tokens,
-                        retraced_count: unroll_opt.retraced_count,
+                        retraced_count: final_retraced_count,
                         root_trace_id: trace_id,
                         traces,
                         previous_tokens,
@@ -2866,17 +2772,7 @@ impl<M: Clone> MetaInterp<M> {
         let numbering_overrides = ctx.constants.numbering_type_overrides().clone();
         let (mut constants, mut constant_types) = ctx.constants.into_inner_with_types();
 
-        let (trace_ops, _) = compile::fold_box_into_create_frame(
-            trace.ops.clone(),
-            &mut constants,
-            &self.raw_int_box_helpers,
-            &self.create_frame_raw_map,
-        );
-        let (trace_ops, _) = compile::elide_create_frame_for_call_assembler(
-            trace_ops,
-            &constants,
-            &self.create_frame_raw_map,
-        );
+        let trace_ops = trace.ops.clone();
 
         if crate::majit_log_enabled() {
             eprintln!("--- retrace body (before opt) ---");
@@ -3005,8 +2901,6 @@ impl<M: Clone> MetaInterp<M> {
         let compiled_constants = constants.clone();
         let compiled_constant_types = constant_types.clone();
         self.backend.set_constants(constants);
-        self.backend
-            .set_constant_types(compiled_constant_types.clone());
 
         let token_num = self.warm_state.alloc_token_number();
         let mut token = JitCellToken::new(token_num);
@@ -3214,17 +3108,7 @@ impl<M: Clone> MetaInterp<M> {
         let numbering_overrides = ctx.constants.numbering_type_overrides().clone();
         let (mut constants, mut constant_types) = ctx.constants.into_inner_with_types();
 
-        let (trace_ops, pos_remap1) = compile::fold_box_into_create_frame(
-            trace.ops.clone(),
-            &mut constants,
-            &self.raw_int_box_helpers,
-            &self.create_frame_raw_map,
-        );
-        let (trace_ops, pos_remap2) = compile::elide_create_frame_for_call_assembler(
-            trace_ops,
-            &constants,
-            &self.create_frame_raw_map,
-        );
+        let trace_ops = trace.ops.clone();
 
         let num_ops_before = trace_ops.len();
         let mut optimizer = if let Some(config) = vable_config {
@@ -3387,8 +3271,6 @@ impl<M: Clone> MetaInterp<M> {
         let compiled_constants = constants.clone();
         let compiled_constant_types = constant_types.clone();
         self.backend.set_constants(constants);
-        self.backend
-            .set_constant_types(compiled_constant_types.clone());
         token.green_key = green_key;
         // virtualizable.py:86 read_boxes: set num_scalar_inputargs on token
         // so the backend can find the first local in force_fn paths.
@@ -3506,16 +3388,6 @@ impl<M: Clone> MetaInterp<M> {
                 if let Some(ref hook) = self.hooks.on_compile_loop {
                     hook(green_key, num_ops_before, num_ops_after);
                 }
-                // Compile deferred done_with_this_frame bridges now that
-                // the main loop is stored. The bridge attaches to the
-                // NEW token's fail_descrs (which are the same Arcs as
-                // in the registered call_assembler target).
-                let pending = std::mem::take(&mut self.pending_done_bridges);
-                for pb in pending {
-                    if pb.green_key == green_key {
-                        self.compile_pending_done_bridge(pb);
-                    }
-                }
             }
             Err(e) => {
                 self.stats.loops_aborted += 1;
@@ -3559,17 +3431,7 @@ impl<M: Clone> MetaInterp<M> {
         let numbering_overrides = ctx.constants.numbering_type_overrides().clone();
         let (mut constants, mut constant_types) = ctx.constants.into_inner_with_types();
 
-        let (trace_ops, _) = compile::fold_box_into_create_frame(
-            trace.ops.clone(),
-            &mut constants,
-            &self.raw_int_box_helpers,
-            &self.create_frame_raw_map,
-        );
-        let (trace_ops, _) = compile::elide_create_frame_for_call_assembler(
-            trace_ops,
-            &constants,
-            &self.create_frame_raw_map,
-        );
+        let trace_ops = trace.ops.clone();
 
         if crate::majit_log_enabled() {
             eprintln!("--- simple loop trace (before opt) ---");
@@ -3649,7 +3511,7 @@ impl<M: Clone> MetaInterp<M> {
             eprint!("{}", majit_ir::format_trace(&optimized_ops, &constants));
         }
 
-        let optimized_ops = compile::strip_stray_overflow_guards(optimized_ops);
+        let mut optimized_ops = compile::strip_stray_overflow_guards(optimized_ops);
 
         // Allocate token and compile.
         let token_num = self.warm_state.alloc_token_number();
@@ -3692,8 +3554,6 @@ impl<M: Clone> MetaInterp<M> {
         let compiled_constants = constants.clone();
         let compiled_constant_types = constant_types.clone();
         self.backend.set_constants(constants);
-        self.backend
-            .set_constant_types(compiled_constant_types.clone());
         token.green_key = green_key;
 
         match self
@@ -4309,63 +4169,6 @@ impl<M: Clone> MetaInterp<M> {
             status,
             descr_addr,
         })
-    }
-
-    /// Pyre-specific: unbox Ref→Int values to match compiled trace types.
-    ///
-    /// Pyre's virtualizable stores all locals as PyObjectRef (Ref). When
-    /// the compiled trace has Int-typed inputargs (optimizer unboxed),
-    /// the live values must be unboxed before entering compiled code.
-    /// RPython doesn't need this because MIFrame registers are typed.
-    pub fn adapt_live_values_to_trace_types(
-        &self,
-        green_key: u64,
-        mut values: Vec<Value>,
-    ) -> Vec<Value> {
-        let Some(compiled) = self.compiled_loops.get(&green_key) else {
-            return values;
-        };
-        let types: Vec<Type> = compiled
-            .traces
-            .get(&compiled.root_trace_id)
-            .and_then(|trace| {
-                trace
-                    .ops
-                    .iter()
-                    .find(|op| op.opcode.is_guard())
-                    .and_then(|op| {
-                        op.descr
-                            .as_ref()
-                            .and_then(|d| d.as_fail_descr())
-                            .map(|fd| fd.fail_arg_types().to_vec())
-                    })
-            })
-            .unwrap_or_default();
-        let before = if crate::majit_log_enabled() {
-            Some(values.clone())
-        } else {
-            None
-        };
-        for (i, tp) in types.iter().enumerate() {
-            if i >= values.len() {
-                break;
-            }
-            if let (Value::Ref(r), Type::Int) = (&values[i], tp) {
-                let raw = r.as_usize() as i64;
-                if let Some(unbox_fn) = REF_UNBOX_INT_FN.get() {
-                    values[i] = Value::Int(unbox_fn(raw));
-                } else {
-                    values[i] = Value::Int(raw);
-                }
-            }
-        }
-        if let Some(before) = before {
-            eprintln!(
-                "[jit][adapt-live] key={} types={:?} before={:?} after={:?}",
-                green_key, types, before, values
-            );
-        }
-        values
     }
 
     /// Typed-input counterpart to [`run_compiled_detailed`].
@@ -5203,149 +5006,6 @@ impl<M: Clone> MetaInterp<M> {
         ctx.constants
             .get_or_insert_typed(value, majit_ir::Type::Ref)
     }
-
-    /// pyjitpl.py:3198-3220: compile_done_with_this_frame — bridge that
-    /// exits via return. Constructs a minimal bridge trace (just a Finish op)
-    /// and compiles it. Does NOT access the tracing context (which may have
-    /// been consumed by finish_and_compile).
-    pub fn compile_done_with_this_frame(
-        &mut self,
-        green_key: u64,
-        trace_id: u64,
-        fail_index: u32,
-        finish_args: &[OpRef],
-        finish_arg_types: Vec<Type>,
-    ) {
-        // Build the bridge trace: a single Finish op using finish_args.
-        // The bridge inputargs are derived from the guard's fail_arg_types.
-        let finish_descr = crate::make_fail_descr_typed(finish_arg_types.clone());
-        let mut finish_op = majit_ir::Op::new(majit_ir::OpCode::Finish, finish_args);
-        finish_op.descr = Some(finish_descr);
-        let bridge_ops = vec![finish_op];
-
-        // Inputargs: from the guard's fail_arg_types (the bridge inputs
-        // are the guard's fail_args in order).
-        let bridge_inputargs: Vec<majit_ir::InputArg> = {
-            let compiled = self.compiled_loops.get(&green_key);
-            if let Some(compiled) = compiled {
-                let trace_id_norm = Self::normalize_trace_id(compiled, trace_id);
-                if let Some((_, trace_data)) = Self::trace_for_exit(compiled, trace_id_norm) {
-                    if let Some(exit_layout) = trace_data.exit_layouts.get(&fail_index) {
-                        exit_layout
-                            .exit_types
-                            .iter()
-                            .enumerate()
-                            .map(|(i, &tp)| majit_ir::InputArg::from_type(tp, i as u32))
-                            .collect()
-                    } else {
-                        finish_arg_types
-                            .iter()
-                            .enumerate()
-                            .map(|(i, &tp)| majit_ir::InputArg::from_type(tp, i as u32))
-                            .collect()
-                    }
-                } else {
-                    finish_arg_types
-                        .iter()
-                        .enumerate()
-                        .map(|(i, &tp)| majit_ir::InputArg::from_type(tp, i as u32))
-                        .collect()
-                }
-            } else {
-                finish_arg_types
-                    .iter()
-                    .enumerate()
-                    .map(|(i, &tp)| majit_ir::InputArg::from_type(tp, i as u32))
-                    .collect()
-            }
-        };
-
-        let pb = PendingDoneBridge {
-            green_key,
-            trace_id,
-            fail_index,
-            bridge_ops,
-            bridge_inputargs,
-            constants: HashMap::new(),
-            constant_types: HashMap::new(),
-            snapshot_boxes: HashMap::new(),
-            snapshot_frame_sizes: HashMap::new(),
-            snapshot_vable_boxes: HashMap::new(),
-            snapshot_frame_pcs: HashMap::new(),
-            snapshot_box_types: HashMap::new(),
-        };
-
-        if self.compiled_loops.contains_key(&green_key) {
-            if crate::majit_log_enabled() {
-                eprintln!(
-                    "[jit] compile_done_with_this_frame: compiling NOW key={} fail={}",
-                    green_key, fail_index,
-                );
-            }
-            self.compile_pending_done_bridge(pb);
-        } else {
-            if crate::majit_log_enabled() {
-                eprintln!(
-                    "[jit] compile_done_with_this_frame: deferring key={} fail={}",
-                    green_key, fail_index,
-                );
-            }
-            self.pending_done_bridges.push(pb);
-        }
-    }
-
-    /// Compile a pending done_with_this_frame bridge using saved trace data.
-    fn compile_pending_done_bridge(&mut self, pending: PendingDoneBridge) {
-        let fail_descr = {
-            let compiled = match self.compiled_loops.get(&pending.green_key) {
-                Some(c) => c,
-                None => return,
-            };
-            match self.bridge_fail_descr_proxy(compiled, pending.trace_id, pending.fail_index) {
-                Some(d) => Box::new(d) as Box<dyn majit_ir::FailDescr>,
-                None => return,
-            }
-        };
-        if crate::majit_log_enabled() {
-            eprintln!(
-                "[jit] compile pending done bridge key={} fail={}",
-                pending.green_key, pending.fail_index,
-            );
-        }
-        self.compile_bridge(
-            pending.green_key,
-            pending.fail_index,
-            &*fail_descr,
-            &pending.bridge_ops,
-            &pending.bridge_inputargs,
-            pending.constants,
-            pending.constant_types,
-            pending.snapshot_boxes,
-            pending.snapshot_frame_sizes,
-            pending.snapshot_vable_boxes,
-            pending.snapshot_frame_pcs,
-            pending.snapshot_box_types,
-        );
-    }
-
-    // Keep the old signature for backward compatibility — this is dead code now
-    // but compile_trace_finish might still reference it.
-    fn _compile_done_with_this_frame_direct(
-        &mut self,
-        green_key: u64,
-        trace_id: u64,
-        fail_index: u32,
-        finish_args: &[OpRef],
-        finish_arg_types: Vec<Type>,
-    ) {
-        let finish_descr = crate::make_fail_descr_typed(finish_arg_types);
-        self.compile_trace_finish(
-            green_key,
-            finish_args,
-            Some((trace_id, fail_index)),
-            finish_descr,
-        );
-    }
 }
 
 impl<M: Clone> MetaInterp<M> {
@@ -5511,7 +5171,7 @@ impl<M: Clone> MetaInterp<M> {
             }
             (compiled.retraced_count, compiled.num_inputs)
         };
-        let retrace_limit = 5u32;
+        let retrace_limit = self.warm_state.retrace_limit();
         let bridge_optimize_result = {
             let compiled = self.compiled_loops.get_mut(&green_key).unwrap();
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -5619,7 +5279,7 @@ impl<M: Clone> MetaInterp<M> {
             return false;
         }
 
-        let optimized_ops = compile::strip_stray_overflow_guards(optimized_ops);
+        let mut optimized_ops = compile::strip_stray_overflow_guards(optimized_ops);
         let num_optimized_ops = optimized_ops.len();
         let compiled_constants = constants.clone();
         let compiled_constant_types = constant_types.clone();
@@ -5828,7 +5488,7 @@ impl<M: Clone> MetaInterp<M> {
         // new target_token specializations when existing body token doesn't
         // match. Without this, bridges fall back to preamble (causing
         // infinite guard failure loops on preamble guards).
-        let retrace_limit = 5u32;
+        let retrace_limit = self.warm_state.retrace_limit();
         // bridgeopt.py:124-185 deserialize_optimizer_knowledge:
         // Retrieve guard's rd_numb + frontend_boxes for deserialization.
         use crate::optimizeopt::optimizer::PendingBridgeRd;
@@ -5851,20 +5511,12 @@ impl<M: Clone> MetaInterp<M> {
                     .collect();
                 let livebox_types: Vec<Type> = bridge_inputargs.iter().map(|ia| ia.tp).collect();
                 // unroll.py:183-188: frontend_inputargs = trace.inputargs
-                // RPython's frontend_boxes and liveboxes are both derived from
-                // the same trace, so they always have the same length.
-                // Our fail_values (dead frame) may be shorter than bridge_inputargs
-                // when virtualizable state extends the inputargs beyond fail_args.
-                // Pad to match liveboxes length (RPython bridgeopt.py:126 assert).
-                // unroll.py:183-188: frontend_inputargs = trace.inputargs
-                // bridgeopt.py:126: assert len(frontend_boxes) == len(liveboxes)
-                let frontend_boxes = self.pending_frontend_boxes.take().unwrap_or_default();
-                assert!(
-                    frontend_boxes.len() == liveboxes.len(),
-                    "frontend_boxes.len()={} != liveboxes.len()={}",
-                    frontend_boxes.len(),
-                    liveboxes.len(),
-                );
+                // RPython's frontend_boxes = trace.inputargs always matches
+                // liveboxes = trace.get_iter().inputargs in length.
+                // Our pending_frontend_boxes (from extract_live) may differ;
+                // resize to match liveboxes (bridgeopt.py:126 assert parity).
+                let mut frontend_boxes = self.pending_frontend_boxes.take().unwrap_or_default();
+                frontend_boxes.resize(liveboxes.len(), 0);
                 Some(PendingBridgeRd {
                     rd_numb,
                     rd_consts,
@@ -6047,7 +5699,7 @@ impl<M: Clone> MetaInterp<M> {
             return false;
         }
 
-        let optimized_ops = compile::strip_stray_overflow_guards(optimized_ops);
+        let mut optimized_ops = compile::strip_stray_overflow_guards(optimized_ops);
 
         let num_optimized_ops = optimized_ops.len();
         let compiled_constants = constants.clone();
@@ -7386,21 +7038,6 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// Register a helper that boxes a raw integer into an interpreter object.
-    ///
-    /// Compiled finish post-processing uses this to recognize boxing helpers
-    /// that are safe to peel away for the raw-int call_assembler protocol.
-    pub fn register_raw_int_box_helper(&mut self, helper: *const ()) {
-        self.raw_int_box_helpers.insert(helper as i64);
-    }
-
-    /// Register a create_frame → create_frame_raw_int mapping.
-    /// When a box helper result feeds directly into create_frame as the last arg,
-    /// the two calls can be folded into a single create_frame_raw_int call.
-    pub fn register_create_frame_raw(&mut self, normal: *const (), raw_int: *const ()) {
-        self.create_frame_raw_map
-            .insert(normal as i64, raw_int as i64);
-    }
-
     /// PyPy warmspot.py set_param_max_unroll_recursion().
     pub fn set_max_unroll_recursion(&mut self, value: usize) {
         self.max_unroll_recursion = value;
@@ -7984,7 +7621,6 @@ mod tests {
         let mut meta = MetaInterp::<()>::new(10);
         let info = test_vable_info_with_array();
         let fd24 = info.array_pointer_field_descr(0);
-        let adescr = info.array_descrs[0].clone();
         start_tracing_with_virtualizable(
             &mut meta,
             info,
@@ -7996,7 +7632,7 @@ mod tests {
             let ctx = meta.trace_ctx().unwrap();
             ctx.const_int(1)
         };
-        let result = meta.opimpl_getarrayitem_vable_int(OpRef(0), index, 1, fd24, adescr);
+        let result = meta.opimpl_getarrayitem_vable_int(OpRef(0), index, 1, fd24);
         assert_eq!(result, OpRef(2));
 
         let ctx = meta.trace_ctx().unwrap();
@@ -8008,7 +7644,6 @@ mod tests {
         let mut meta = MetaInterp::<()>::new(10);
         let info = test_vable_info_with_array();
         let fd24 = info.array_pointer_field_descr(0);
-        let adescr = info.array_descrs[0].clone();
         start_tracing_with_virtualizable(
             &mut meta,
             info,
@@ -8016,7 +7651,7 @@ mod tests {
             vec![2],
         );
 
-        let len_ref = meta.opimpl_arraylen_vable(OpRef(0), fd24, adescr);
+        let len_ref = meta.opimpl_arraylen_vable(OpRef(0), fd24);
         let ctx = meta.trace_ctx().unwrap();
         assert_eq!(ctx.const_value(len_ref), Some(2));
         assert_eq!(ctx.recorder.num_ops(), 0);
@@ -8073,8 +7708,7 @@ mod tests {
         };
         let fd24 =
             majit_ir::descr::make_field_descr(24, 8, Type::Int, majit_ir::descr::ArrayFlag::Signed);
-        let adescr = majit_ir::make_array_descr(0, 8, Type::Int);
-        let _result = meta.opimpl_getarrayitem_vable_int(nonstandard_vable, index, 1, fd24, adescr);
+        let _result = meta.opimpl_getarrayitem_vable_int(nonstandard_vable, index, 1, fd24);
 
         // pyjitpl.py:1219-1230 _opimpl_getarrayitem_vable falls back to
         // GETFIELD_GC_R(arraydescr) + GETARRAYITEM_GC_I(arraybox) when
@@ -8186,7 +7820,6 @@ mod tests {
         let mut meta = MetaInterp::<()>::new(10);
         let info = test_vable_info_with_array();
         let fd24 = info.array_pointer_field_descr(0);
-        let adescr = info.array_descrs[0].clone();
         start_tracing_with_virtualizable(
             &mut meta,
             info,
@@ -8198,7 +7831,7 @@ mod tests {
             let ctx = meta.trace_ctx().unwrap();
             ctx.const_int(1)
         };
-        let item = meta.opimpl_getarrayitem_vable_int(OpRef(0), index, 1, fd24, adescr);
+        let item = meta.opimpl_getarrayitem_vable_int(OpRef(0), index, 1, fd24);
         if let Some(ctx) = meta.trace_ctx() {
             ctx.record_guard_with_fail_args(
                 OpCode::GuardTrue,

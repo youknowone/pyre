@@ -548,19 +548,16 @@ where
         Some((vable_opref, descr))
     }
 
-    /// pyjitpl.py: standard virtualizable → (vable_box, fdescr, adescr).
-    /// Converts a bytecode array_idx to the cached array field DescrRef + array item DescrRef.
-    /// RPython pyjitpl.py:1218: `_opimpl_getarrayitem_vable(box, indexbox, fdescr, adescr, pc)`.
+    /// pyjitpl.py: standard virtualizable → (vable_box, array_field_descr).
+    /// Converts a bytecode array_idx to the cached array field DescrRef.
     fn standard_vable_array_field_descr(
         ctx: &TraceCtx,
         array_idx: usize,
-    ) -> Option<(OpRef, majit_ir::DescrRef, majit_ir::DescrRef)> {
+    ) -> Option<(OpRef, majit_ir::DescrRef)> {
         let vable_opref = ctx.standard_virtualizable_box()?;
         let info = ctx.virtualizable_info()?;
-        let fdescr = info.array_field_descrs().get(array_idx)?.clone();
-        // virtualizable.py:58: self.array_descrs = [cpu.arraydescrof(...)]
-        let adescr = info.array_descrs.get(array_idx)?.clone();
-        Some((vable_opref, fdescr, adescr))
+        let descr = info.array_field_descrs().get(array_idx)?.clone();
+        Some((vable_opref, descr))
     }
 
     fn compact_load_raw(ctx: &mut TraceCtx, ptr: OpRef, index: OpRef) -> OpRef {
@@ -1507,128 +1504,92 @@ where
                 let array_idx = self.frames.current_mut().next_u16() as usize;
                 let index_reg = self.frames.current_mut().next_u16() as usize;
                 let dest = self.frames.current_mut().next_u16() as usize;
-                let Some((vable_opref, fdescr, adescr)) =
+                let Some((vable_opref, fdescr)) =
                     Self::standard_vable_array_field_descr(ctx, array_idx)
                 else {
                     return TraceAction::Abort;
                 };
                 let (index, index_value) = self.read_int_reg(index_reg);
-                let result = ctx.vable_getarrayitem_int_indexed(
-                    vable_opref,
-                    index,
-                    index_value,
-                    fdescr,
-                    adescr,
-                );
+                let result =
+                    ctx.vable_getarrayitem_int_indexed(vable_opref, index, index_value, fdescr);
                 self.set_int_reg(dest, Some(result), Some(0));
             }
             BC_GETARRAYITEM_VABLE_R => {
                 let array_idx = self.frames.current_mut().next_u16() as usize;
                 let index_reg = self.frames.current_mut().next_u16() as usize;
                 let dest = self.frames.current_mut().next_u16() as usize;
-                let Some((vable_opref, fdescr, adescr)) =
+                let Some((vable_opref, fdescr)) =
                     Self::standard_vable_array_field_descr(ctx, array_idx)
                 else {
                     return TraceAction::Abort;
                 };
                 let (index, index_value) = self.read_int_reg(index_reg);
-                let result = ctx.vable_getarrayitem_ref_indexed(
-                    vable_opref,
-                    index,
-                    index_value,
-                    fdescr,
-                    adescr,
-                );
+                let result =
+                    ctx.vable_getarrayitem_ref_indexed(vable_opref, index, index_value, fdescr);
                 self.set_ref_reg(dest, Some(result), Some(0));
             }
             BC_GETARRAYITEM_VABLE_F => {
                 let array_idx = self.frames.current_mut().next_u16() as usize;
                 let index_reg = self.frames.current_mut().next_u16() as usize;
                 let dest = self.frames.current_mut().next_u16() as usize;
-                let Some((vable_opref, fdescr, adescr)) =
+                let Some((vable_opref, fdescr)) =
                     Self::standard_vable_array_field_descr(ctx, array_idx)
                 else {
                     return TraceAction::Abort;
                 };
                 let (index, index_value) = self.read_int_reg(index_reg);
-                let result = ctx.vable_getarrayitem_float_indexed(
-                    vable_opref,
-                    index,
-                    index_value,
-                    fdescr,
-                    adescr,
-                );
+                let result =
+                    ctx.vable_getarrayitem_float_indexed(vable_opref, index, index_value, fdescr);
                 self.set_float_reg(dest, Some(result), Some(0));
             }
             BC_SETARRAYITEM_VABLE_I => {
                 let array_idx = self.frames.current_mut().next_u16() as usize;
                 let index_reg = self.frames.current_mut().next_u16() as usize;
                 let src = self.frames.current_mut().next_u16() as usize;
-                let Some((vable_opref, fdescr, adescr)) =
+                let Some((vable_opref, fdescr)) =
                     Self::standard_vable_array_field_descr(ctx, array_idx)
                 else {
                     return TraceAction::Abort;
                 };
                 let (index, index_value) = self.read_int_reg(index_reg);
                 let (value, _) = self.read_int_reg(src);
-                ctx.vable_setarrayitem_indexed(
-                    vable_opref,
-                    index,
-                    index_value,
-                    fdescr,
-                    adescr,
-                    value,
-                );
+                ctx.vable_setarrayitem_indexed(vable_opref, index, index_value, fdescr, value);
             }
             BC_SETARRAYITEM_VABLE_R => {
                 let array_idx = self.frames.current_mut().next_u16() as usize;
                 let index_reg = self.frames.current_mut().next_u16() as usize;
                 let src = self.frames.current_mut().next_u16() as usize;
-                let Some((vable_opref, fdescr, adescr)) =
+                let Some((vable_opref, fdescr)) =
                     Self::standard_vable_array_field_descr(ctx, array_idx)
                 else {
                     return TraceAction::Abort;
                 };
                 let (index, index_value) = self.read_int_reg(index_reg);
                 let (value, _) = self.read_ref_reg(src);
-                ctx.vable_setarrayitem_indexed(
-                    vable_opref,
-                    index,
-                    index_value,
-                    fdescr,
-                    adescr,
-                    value,
-                );
+                ctx.vable_setarrayitem_indexed(vable_opref, index, index_value, fdescr, value);
             }
             BC_SETARRAYITEM_VABLE_F => {
                 let array_idx = self.frames.current_mut().next_u16() as usize;
                 let index_reg = self.frames.current_mut().next_u16() as usize;
                 let src = self.frames.current_mut().next_u16() as usize;
-                let Some((vable_opref, fdescr, adescr)) =
+                let Some((vable_opref, fdescr)) =
                     Self::standard_vable_array_field_descr(ctx, array_idx)
                 else {
                     return TraceAction::Abort;
                 };
                 let (index, index_value) = self.read_int_reg(index_reg);
                 let (value, _) = self.read_float_reg(src);
-                ctx.vable_setarrayitem_indexed(
-                    vable_opref,
-                    index,
-                    index_value,
-                    fdescr,
-                    adescr,
-                    value,
-                );
+                ctx.vable_setarrayitem_indexed(vable_opref, index, index_value, fdescr, value);
             }
             BC_ARRAYLEN_VABLE => {
                 let array_idx = self.frames.current_mut().next_u16() as usize;
                 let dest = self.frames.current_mut().next_u16() as usize;
-                let Some((vable_opref, fdescr, adescr)) =
+                let Some((vable_opref, fdescr)) =
                     Self::standard_vable_array_field_descr(ctx, array_idx)
                 else {
                     return TraceAction::Abort;
                 };
-                let result = ctx.vable_arraylen_vable(vable_opref, fdescr, adescr);
+                let result = ctx.vable_arraylen_vable(vable_opref, fdescr);
                 self.set_int_reg(dest, Some(result), Some(0));
             }
             BC_HINT_FORCE_VIRTUALIZABLE => {

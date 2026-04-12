@@ -48,8 +48,8 @@ pub struct GcRewriterImpl {
 /// rewrite.py:666 — `descrs = self.gc_ll_descr.getframedescrs(self.cpu)`
 #[derive(Clone)]
 pub struct JitFrameDescrs {
-    /// Address of `jit_create_self_recursive_callee_frame_1_raw_int`.
-    pub create_fn_addr: usize,
+    /// Addresses of all `jit_create_*_callee_frame_*` variants.
+    pub create_fn_addrs: Vec<usize>,
     /// Address of `jit_drop_callee_frame`.
     pub drop_fn_addr: usize,
     /// GC type id for JitFrame (from gc.register_type).
@@ -107,11 +107,6 @@ struct RewriteState {
     next_pos: u32,
     /// Constant pool (from optimizer) — maps OpRef key → i64 value.
     constants: HashMap<u32, i64>,
-    /// rewrite.py:930 parity: track result types per OpRef so we can
-    /// check `v.type == 'r'` on the stored value, not the descriptor.
-    result_types: HashMap<u32, Type>,
-    /// Constant type annotations (from optimizer) — maps OpRef key → Type.
-    constant_types: HashMap<u32, Type>,
 
     // ── Nursery batching ──
     /// The index in `out` of the current CALL_MALLOC_NURSERY op, if any.
@@ -163,8 +158,6 @@ impl RewriteState {
             out: Vec::with_capacity(hint + hint / 4),
             next_pos,
             constants: HashMap::new(),
-            result_types: HashMap::new(),
-            constant_types: HashMap::new(),
             pending_malloc_idx: None,
             pending_malloc_total: 0,
             previous_size: 0,
@@ -252,24 +245,6 @@ impl RewriteState {
 
     fn wb_already_applied(&self, r: OpRef) -> bool {
         self.wb_applied.contains(&r.0)
-    }
-
-    /// rewrite.py:930 parity: `v.type` — get the result type of an OpRef.
-    fn result_type_of(&self, r: OpRef) -> Option<Type> {
-        self.result_types
-            .get(&r.0)
-            .copied()
-            .or_else(|| self.constant_types.get(&r.0).copied())
-    }
-
-    /// rewrite.py:930 parity: `isinstance(v, ConstPtr) and not needs_write_barrier(v.value)`.
-    /// A null ConstPtr never needs a write barrier.
-    fn is_null_constant(&self, r: OpRef) -> bool {
-        if let Some(&val) = self.constants.get(&r.0) {
-            val == 0
-        } else {
-            false
-        }
     }
 
     fn resolve(&self, r: OpRef) -> OpRef {
@@ -520,15 +495,15 @@ impl GcRewriterImpl {
             }
         }
 
-        // rewrite.py:930-931: check the stored VALUE's type, not the descriptor.
-        //   v = op.getarg(1)
-        //   if (v.type == 'r' and (not isinstance(v, ConstPtr) or
-        //       rgc.needs_write_barrier(v.value))):
-        let val = rewritten.arg(1);
-        let val_is_ref = st.result_type_of(val) == Some(Type::Ref);
-        let is_null_const = val_is_ref && st.is_null_constant(val);
+        // Determine whether the stored value is a Ref type from the field descriptor.
+        let is_ref_store = op
+            .descr
+            .as_ref()
+            .and_then(|d| d.as_field_descr())
+            .map(|fd| fd.is_pointer_field())
+            .unwrap_or(false);
 
-        if val_is_ref && !is_null_const && !st.wb_already_applied(obj) {
+        if is_ref_store && !st.wb_already_applied(obj) {
             // Emit COND_CALL_GC_WB(obj) before the store.
             let wb_op = Op::new(OpCode::CondCallGcWb, &[obj]);
             st.emit(wb_op);
@@ -672,14 +647,19 @@ impl GcRewriterImpl {
 
     // ── rewrite.py:665-695 handle_call_assembler helpers ──────────
 
-    /// Check if a CallR op is a call to the create_frame helper.
+    /// Check if a CallR op is a call to any create_frame helper variant.
     fn is_create_frame_call(&self, op: &Op, st: &RewriteState) -> bool {
         let Some(ref descrs) = self.jitframe_info else {
             return false;
         };
         let func_addr_key = op.arg(0).0;
-        let func_addr = st.resolve_constant(func_addr_key);
-        func_addr == Some(descrs.create_fn_addr as i64)
+        let Some(func_addr) = st.resolve_constant(func_addr_key) else {
+            return false;
+        };
+        descrs
+            .create_fn_addrs
+            .iter()
+            .any(|&addr| func_addr == addr as i64)
     }
 
     /// Check if a CallN op is a call to the drop_frame helper.
@@ -771,29 +751,12 @@ impl GcRewriter for GcRewriterImpl {
         ops: &[Op],
         constants: &HashMap<u32, i64>,
     ) -> (Vec<Op>, HashMap<u32, i64>) {
-        self.rewrite_for_gc_with_constants_typed(ops, constants, &HashMap::new())
-    }
-
-    fn rewrite_for_gc_with_constants_typed(
-        &self,
-        ops: &[Op],
-        constants: &HashMap<u32, i64>,
-        constant_types: &HashMap<u32, Type>,
-    ) -> (Vec<Op>, HashMap<u32, i64>) {
         let next_pos = ops
             .iter()
             .filter_map(|op| (!op.pos.is_none()).then_some(op.pos.0))
             .max()
             .map_or(0, |max_pos| max_pos.saturating_add(1));
         let mut st = RewriteState::with_constants(ops.len(), next_pos, constants.clone());
-        st.constant_types = constant_types.clone();
-        // Build result_types map from input ops (rewrite.py:930 parity for v.type).
-        for op in ops {
-            let rt = op.result_type();
-            if rt != Type::Void && !op.pos.is_none() {
-                st.result_types.insert(op.pos.0, rt);
-            }
-        }
 
         for op in ops {
             if !matches!(

@@ -494,16 +494,6 @@ impl<S: JitState> JitDriver<S> {
             .get_merge_point_pc(green_key, trace_id, fail_index)
     }
 
-    /// Register an interpreter boxing helper for the raw-int finish protocol.
-    pub fn register_raw_int_box_helper(&mut self, helper: *const ()) {
-        self.meta.register_raw_int_box_helper(helper);
-    }
-
-    /// Register a create_frame_N → create_frame_N_raw_int mapping for box folding.
-    pub fn register_create_frame_raw(&mut self, normal: *const (), raw_int: *const ()) {
-        self.meta.register_create_frame_raw(normal, raw_int);
-    }
-
     /// Attach a GC allocator to the active backend.
     pub fn set_gc_allocator(&mut self, gc: Box<dyn GcAllocator>) {
         self.meta.backend_mut().set_gc_allocator(gc);
@@ -932,35 +922,33 @@ impl<S: JitState> JitDriver<S> {
                 finish_args,
                 finish_arg_types,
             } => {
-                // compile.py:714: bridge tracing that exits via return
-                // closes as a bridge with Finish, not a standalone loop.
+                // pyjitpl.py:3198-3220 compile_done_with_this_frame:
+                //   self.history.record(rop.FINISH, exits, None, descr=token)
+                //   target_token = compile.compile_trace(self, self.resumekey, exits)
+                //
+                // Bridge tracing that exits via return: record FINISH into the
+                // bridge's own TraceCtx (created fresh by start_retrace_from_guard)
+                // and compile via compile_trace's normal bridge path.
                 if let Some((bridge_key, bridge_trace_id, bridge_fail_index, _bridge_code)) =
                     self.bridge_info.take()
                 {
                     if crate::majit_log_enabled() {
                         eprintln!(
-                            "[jit][bridge-finish] compile_done_with_this_frame key={} trace={} fail={} args={:?}",
+                            "[jit][bridge-finish] compile_trace_finish key={} trace={} fail={} args={:?}",
                             bridge_key, bridge_trace_id, bridge_fail_index, finish_args
                         );
                     }
-                    // Save bridge data for compilation after finish_and_compile.
-                    // RPython parity: in RPython, bridge traces only fire AFTER
-                    // the main loop is compiled. In pyre, the bridge action is
-                    // processed after the main trace action, so we need to save
-                    // the data now (while the tracing context is still alive)
-                    // and compile after the main loop is stored.
-                    self.meta.compile_done_with_this_frame(
+                    // pyjitpl.py:3217: record FINISH + compile via compile_trace.
+                    let finish_descr = crate::make_fail_descr_typed(finish_arg_types.clone());
+                    let _outcome = self.meta.compile_trace_finish(
                         bridge_key,
-                        bridge_trace_id,
-                        bridge_fail_index,
                         &finish_args,
-                        finish_arg_types,
+                        Some((bridge_trace_id, bridge_fail_index)),
+                        finish_descr,
                     );
                     self.sym = None;
                     self.trace_meta = None;
                     self.meta.abort_trace(false);
-                    // DON'T return — fall through to process pending bridges
-                    // in the main trace action below.
                     return;
                 }
                 let meta = self.trace_meta.take().unwrap();
@@ -1446,7 +1434,7 @@ impl<S: JitState> JitDriver<S> {
         if !self.sync_before(state, &meta, descriptor.as_ref()) {
             return;
         }
-        let live_values = state.extract_live_values_for_entry(&meta);
+        let live_values = state.extract_live_values(&meta);
         if !Self::live_values_match_descriptor(descriptor.as_ref(), &live_values) {
             return;
         }
@@ -2112,16 +2100,6 @@ impl<S: JitState> JitDriver<S> {
                 .collect();
             eprintln!("[jit] BRIDGE live_values: {}", vals.join(", "));
         }
-        // Pyre-specific: unbox Ref→Int to match compiled trace types.
-        // RPython has no adapt-live because MIFrame registers are typed.
-        // In pyre, all locals are Ref — the compiled trace may expect Int
-        // at positions where the optimizer unboxed.
-        let live_values = if target_pc == 0 {
-            self.meta
-                .adapt_live_values_to_trace_types(green_key, live_values)
-        } else {
-            live_values
-        };
         if !Self::live_values_match_descriptor(descriptor.as_ref(), &live_values) {
             if crate::majit_log_enabled() {
                 eprintln!(
@@ -2490,15 +2468,9 @@ impl<S: JitState> JitDriver<S> {
         index: OpRef,
         index_runtime_value: i64,
         fdescr: DescrRef,
-        adescr: DescrRef,
     ) -> OpRef {
-        self.meta.opimpl_getarrayitem_vable_int(
-            vable_opref,
-            index,
-            index_runtime_value,
-            fdescr,
-            adescr,
-        )
+        self.meta
+            .opimpl_getarrayitem_vable_int(vable_opref, index, index_runtime_value, fdescr)
     }
 
     pub fn opimpl_getarrayitem_vable_ref(
@@ -2507,15 +2479,9 @@ impl<S: JitState> JitDriver<S> {
         index: OpRef,
         index_runtime_value: i64,
         fdescr: DescrRef,
-        adescr: DescrRef,
     ) -> OpRef {
-        self.meta.opimpl_getarrayitem_vable_ref(
-            vable_opref,
-            index,
-            index_runtime_value,
-            fdescr,
-            adescr,
-        )
+        self.meta
+            .opimpl_getarrayitem_vable_ref(vable_opref, index, index_runtime_value, fdescr)
     }
 
     pub fn opimpl_getarrayitem_vable_float(
@@ -2524,15 +2490,9 @@ impl<S: JitState> JitDriver<S> {
         index: OpRef,
         index_runtime_value: i64,
         fdescr: DescrRef,
-        adescr: DescrRef,
     ) -> OpRef {
-        self.meta.opimpl_getarrayitem_vable_float(
-            vable_opref,
-            index,
-            index_runtime_value,
-            fdescr,
-            adescr,
-        )
+        self.meta
+            .opimpl_getarrayitem_vable_float(vable_opref, index, index_runtime_value, fdescr)
     }
 
     pub fn opimpl_setarrayitem_vable_int(
@@ -2542,7 +2502,6 @@ impl<S: JitState> JitDriver<S> {
         index_runtime_value: i64,
         value: OpRef,
         fdescr: DescrRef,
-        adescr: DescrRef,
     ) {
         self.meta.opimpl_setarrayitem_vable_int(
             vable_opref,
@@ -2550,7 +2509,6 @@ impl<S: JitState> JitDriver<S> {
             index_runtime_value,
             value,
             fdescr,
-            adescr,
         );
     }
 
@@ -2561,7 +2519,6 @@ impl<S: JitState> JitDriver<S> {
         index_runtime_value: i64,
         value: OpRef,
         fdescr: DescrRef,
-        adescr: DescrRef,
     ) {
         self.meta.opimpl_setarrayitem_vable_ref(
             vable_opref,
@@ -2569,7 +2526,6 @@ impl<S: JitState> JitDriver<S> {
             index_runtime_value,
             value,
             fdescr,
-            adescr,
         );
     }
 
@@ -2580,7 +2536,6 @@ impl<S: JitState> JitDriver<S> {
         index_runtime_value: i64,
         value: OpRef,
         fdescr: DescrRef,
-        adescr: DescrRef,
     ) {
         self.meta.opimpl_setarrayitem_vable_float(
             vable_opref,
@@ -2588,17 +2543,11 @@ impl<S: JitState> JitDriver<S> {
             index_runtime_value,
             value,
             fdescr,
-            adescr,
         );
     }
 
-    pub fn opimpl_arraylen_vable(
-        &mut self,
-        vable_opref: OpRef,
-        fdescr: DescrRef,
-        adescr: DescrRef,
-    ) -> OpRef {
-        self.meta.opimpl_arraylen_vable(vable_opref, fdescr, adescr)
+    pub fn opimpl_arraylen_vable(&mut self, vable_opref: OpRef, fdescr: DescrRef) -> OpRef {
+        self.meta.opimpl_arraylen_vable(vable_opref, fdescr)
     }
 
     /// Start bridge tracing from a guard failure point.

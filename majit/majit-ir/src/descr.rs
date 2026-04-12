@@ -1100,6 +1100,44 @@ pub trait CallDescr: Descr {
             self.result_type()
         )
     }
+
+    /// rewrite.py:665-695 handle_call_assembler: virtualizable expansion info.
+    /// When present, the backend expands a single frame reference arg into the
+    /// callee's full inputarg layout by reading fields from the frame object.
+    fn vable_expansion(&self) -> Option<&VableExpansion> {
+        None
+    }
+}
+
+/// rewrite.py:665-695 handle_call_assembler expansion recipe.
+///
+/// Describes how to expand a single virtualizable (frame) reference into the
+/// full set of inputargs expected by the callee's compiled loop. The backend
+/// reads scalar fields and array items from the frame object at the specified
+/// byte offsets.
+///
+/// Layout: `[frame_ref, scalar_0, scalar_1, ..., array_item_0, array_item_1, ...]`
+#[derive(Debug, Clone)]
+pub struct VableExpansion {
+    /// Scalar fields: `[(byte_offset_in_frame, type)]`.
+    /// e.g. `[(NI_OFS, Int), (CODE_OFS, Ref), (VSD_OFS, Int), (NS_OFS, Ref)]`
+    pub scalar_fields: Vec<(usize, Type)>,
+    /// Byte offset of the array struct within the frame object.
+    pub array_struct_offset: usize,
+    /// Byte offset of the data pointer within the array struct.
+    pub array_ptr_offset: usize,
+    /// Number of array items to read.
+    pub num_array_items: usize,
+    /// rewrite.py:674-683 handle_call_assembler arg overrides.
+    /// Each `(jitframe_slot, call_assembler_arg_index)` pair tells the
+    /// backend: instead of reading from the frame, use CALL_ASSEMBLER
+    /// arg[arg_index] for jitframe slot `jitframe_slot`.
+    /// jitframe_slot is 0-based index in the items area (0 = frame_ref,
+    /// 1 = first scalar, NUM_SCALARS+1 = first array item, etc).
+    pub arg_overrides: Vec<(usize, usize)>,
+    /// Constant overrides: `(jitframe_slot, value)`.
+    /// The backend stores this constant instead of reading from the frame.
+    pub const_overrides: Vec<(usize, i64)>,
 }
 
 /// Descriptor for `DebugMergePoint` operations — carries source position

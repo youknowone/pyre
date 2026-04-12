@@ -1189,9 +1189,6 @@ pub(crate) fn normalize_closing_jump_args(
         if defined.contains(arg) {
             continue;
         }
-        // compile.py closes the loop against the label namespace. If a stale
-        // pre-normalization box leaks into the final Jump, replace it with the
-        // corresponding label slot before handing the trace to the backend.
         *arg = label_args[idx];
     }
 
@@ -1200,332 +1197,38 @@ pub(crate) fn normalize_closing_jump_args(
 
 /// RPython dependency.py requires GUARD_(NO_)OVERFLOW to be scheduled only
 /// when there is a live preceding INT_*_OVF operation to consume.
-/// If a late optimizer/retrace path leaves a stray overflow guard in the final
-/// trace, drop it conservatively before backend codegen.
+/// intbounds.py:231-242: optimizer raises InvalidLoop for stray overflow
+/// guards. This function is a post-optimization safety net: if any stray
+/// guard survived, strip it to prevent backend panic.
 pub(crate) fn strip_stray_overflow_guards(ops: Vec<Op>) -> Vec<Op> {
     use majit_ir::OpCode;
 
     let mut pending_ovf = false;
-    let mut out = Vec::with_capacity(ops.len());
+    let mut result = Vec::with_capacity(ops.len());
     for op in ops {
         match op.opcode {
             OpCode::IntAddOvf | OpCode::IntSubOvf | OpCode::IntMulOvf => {
                 pending_ovf = true;
-                out.push(op);
+                result.push(op);
             }
             OpCode::GuardNoOverflow | OpCode::GuardOverflow => {
                 if pending_ovf {
-                    pending_ovf = false;
-                    out.push(op);
+                    result.push(op);
                 }
+                // else: stray guard — strip it (intbounds.py:231 InvalidLoop
+                // should have caught it; this is a safety net).
+                pending_ovf = false;
             }
             OpCode::Label | OpCode::Jump | OpCode::Finish => {
                 pending_ovf = false;
-                out.push(op);
+                result.push(op);
             }
-            _ => out.push(op),
-        }
-    }
-    out
-}
-
-/// Fold boxing into create_frame: when a box helper result feeds directly
-/// into create_frame as the last argument, replace with create_frame_raw_int.
-///
-/// Pattern: `vB = CallI(box_fn, raw) ... vF = CallI(create_frame, ..., vB)`
-/// Result:  `vF = CallI(create_frame_raw, ..., raw)` + remove vB
-/// Returns (transformed_ops, position_remap).
-/// position_remap maps old op.pos → new op.pos for ops whose position
-/// changed due to removal. OpRefs in snapshot_boxes must be remapped
-/// through this table.
-pub(crate) fn fold_box_into_create_frame(
-    mut ops: Vec<Op>,
-    constants: &mut HashMap<u32, i64>,
-    box_helpers: &HashSet<i64>,
-    create_frame_raw_map: &HashMap<i64, i64>,
-) -> (Vec<Op>, HashMap<u32, u32>) {
-    use majit_ir::OpCode;
-
-    #[derive(Clone)]
-    struct Replacement {
-        create_idx: usize,
-        boxed_ref: OpRef,
-        raw_val: OpRef,
-        removable_indices: Vec<usize>,
-    }
-
-    if box_helpers.is_empty() || create_frame_raw_map.is_empty() {
-        return (ops, HashMap::new());
-    }
-
-    let mut replacements: Vec<Replacement> = Vec::new();
-
-    for (ci, create_op) in ops.iter().enumerate() {
-        if create_op.opcode != OpCode::CallI {
-            continue;
-        }
-        // Check if this is a known create_frame helper
-        let create_fn_ptr = create_op
-            .args
-            .first()
-            .and_then(|func| constants.get(&func.0))
-            .copied();
-        let raw_fn = create_fn_ptr.and_then(|p| create_frame_raw_map.get(&p).copied());
-        let Some(raw_fn_ptr) = raw_fn else {
-            continue;
-        };
-
-        // Last arg of create_frame should be a boxed value
-        let last_arg = match create_op.args.last() {
-            Some(a) => *a,
-            None => continue,
-        };
-
-        let mut replacement = None;
-
-        // Pattern 1: CallI(box_fn, raw)
-        for (bi, box_op) in ops[..ci].iter().enumerate().rev() {
-            if box_op.pos != last_arg {
-                continue;
-            }
-            if box_op.opcode == OpCode::CallI {
-                let box_fn_ptr = box_op
-                    .args
-                    .first()
-                    .and_then(|func| constants.get(&func.0))
-                    .copied();
-                if box_fn_ptr.is_some_and(|p| box_helpers.contains(&p)) && box_op.args.len() >= 2 {
-                    replacement = Some(Replacement {
-                        create_idx: ci,
-                        boxed_ref: last_arg,
-                        raw_val: box_op.args[1],
-                        removable_indices: vec![bi],
-                    });
-                }
-                break;
-            }
-
-            // Pattern 2: New()/NewWithVtable() + SetfieldGc(box, raw)
-            if box_op.opcode == OpCode::New || box_op.opcode == OpCode::NewWithVtable {
-                let mut raw_val = None;
-                let mut removable_indices = vec![bi];
-                for (si, set_op) in ops[bi + 1..ci].iter().enumerate() {
-                    let idx = bi + 1 + si;
-                    if set_op.opcode != OpCode::SetfieldGc || set_op.args.first() != Some(&last_arg)
-                    {
-                        continue;
-                    }
-                    removable_indices.push(idx);
-                    if let Some(ref d) = set_op.descr {
-                        let ds = format!("{d:?}");
-                        if ds.contains("offset: 8") && ds.contains("signed: true") {
-                            raw_val = set_op.args.get(1).copied();
-                        }
-                    }
-                }
-                if let Some(raw_val) = raw_val {
-                    replacement = Some(Replacement {
-                        create_idx: ci,
-                        boxed_ref: last_arg,
-                        raw_val,
-                        removable_indices,
-                    });
-                }
-                break;
-            }
-        }
-
-        if let Some(repl) = replacement {
-            replacements.push(repl);
-        }
-    }
-
-    // Apply replacements in reverse order
-    for repl in replacements.iter().rev() {
-        let create_fn_ptr = match ops[repl.create_idx]
-            .args
-            .first()
-            .and_then(|func| constants.get(&func.0))
-            .copied()
-        {
-            Some(p) => p,
-            None => continue,
-        };
-        let raw_fn_ptr = match create_frame_raw_map.get(&create_fn_ptr) {
-            Some(&p) => p,
-            None => continue, // already replaced in a previous iteration
-        };
-
-        // Replace last arg of create_frame with raw_val
-        let nargs = ops[repl.create_idx].args.len();
-        ops[repl.create_idx].args[nargs - 1] = repl.raw_val;
-
-        // Replace function pointer: create_frame → create_frame_raw_int
-        let func_ref = ops[repl.create_idx].args[0];
-        constants.insert(func_ref.0, raw_fn_ptr);
-
-        // Remove the boxing ops only if they are now dead. The raw helper
-        // rewrite is still valuable even when the boxed object remains live
-        // for later virtual field reads.
-        let still_used = ops.iter().enumerate().any(|(i, op)| {
-            if repl.removable_indices.contains(&i) || i == repl.create_idx {
-                return false;
-            }
-            op.args.contains(&repl.boxed_ref)
-                || op
-                    .fail_args
-                    .as_ref()
-                    .is_some_and(|fa| fa.contains(&repl.boxed_ref))
-        });
-        if !still_used {
-            for &idx in repl.removable_indices.iter().rev() {
-                ops.remove(idx);
+            _ => {
+                result.push(op);
             }
         }
     }
-
-    // Build position remap: old op.pos → new op.pos.
-    // After removals, surviving ops shift down. Record each op's
-    // original pos (stored in op.pos) and its new index.
-    let mut remap = HashMap::new();
-    for (new_idx, op) in ops.iter().enumerate() {
-        if op.pos != OpRef::NONE {
-            remap.insert(op.pos.0, new_idx as u32);
-        }
-    }
-    (ops, remap)
-}
-
-/// RPython parity: elide create_frame + drop_frame around CallAssemblerI
-/// for self-recursive raw-int calls. The callee frame is created lazily
-/// on guard failure (in force_fn), not before every recursive call.
-///
-/// Pattern:
-///   v_frame = CallI(create_frame_raw_fn, caller_frame, raw_arg)
-///   v_result = CallAssemblerI(v_frame, 0, 1, raw_arg)
-///   CallN(drop_frame_fn, v_frame)
-///
-/// Result:
-///   v_result = CallAssemblerI(caller_frame, 0, 1, raw_arg)
-///   (CallI and CallN removed)
-///
-/// Guard failure path: force_fn receives caller_frame from inputs[0]
-/// and raw_arg from inputs[3], creates callee frame lazily.
-pub(crate) fn elide_create_frame_for_call_assembler(
-    ops: Vec<Op>,
-    constants: &HashMap<u32, i64>,
-    create_frame_raw_map: &HashMap<i64, i64>,
-) -> (Vec<Op>, HashMap<u32, u32>) {
-    {
-        use majit_ir::OpCode;
-
-        let mut ops = ops;
-
-        if create_frame_raw_map.is_empty() {
-            return (ops, HashMap::new());
-        }
-
-        // Collect all create_frame function pointers (keys AND values of the map)
-        // Keys = original create_frame, Values = create_frame_raw variant
-        let raw_frame_fns: HashSet<i64> = create_frame_raw_map
-            .keys()
-            .copied()
-            .chain(create_frame_raw_map.values().copied())
-            .collect();
-
-        // Find CallI(create_frame_raw) → CallAssemblerI → CallN(drop) triples
-        let mut removals: Vec<(usize, usize, OpRef, OpRef)> = Vec::new(); // (create_idx, drop_idx, frame_ref, caller_frame)
-
-        for (ci, op) in ops.iter().enumerate() {
-            if !matches!(op.opcode, OpCode::CallI | OpCode::CallR) {
-                continue;
-            }
-            let fn_ptr = op.args.first().and_then(|f| constants.get(&f.0)).copied();
-            let Some(fn_ptr) = fn_ptr else { continue };
-            if !raw_frame_fns.contains(&fn_ptr) {
-                continue;
-            }
-            // This is a create_frame_raw call
-            let frame_ref = op.pos; // v_frame
-            let caller_frame = if op.args.len() >= 2 {
-                op.args[1]
-            } else {
-                continue;
-            };
-
-            // Find the CallAssemblerI that uses frame_ref as first arg
-            let ca_idx = ops[ci + 1..].iter().position(|o| {
-                matches!(
-                    o.opcode,
-                    OpCode::CallAssemblerI
-                        | OpCode::CallAssemblerR
-                        | OpCode::CallAssemblerF
-                        | OpCode::CallAssemblerN
-                ) && o.args.first() == Some(&frame_ref)
-            });
-            let Some(ca_offset) = ca_idx else { continue };
-            let ca_idx = ci + 1 + ca_offset;
-
-            // Find the CallN(drop_frame) that uses frame_ref
-            let drop_idx = ops[ca_idx + 1..].iter().position(|o| {
-                o.opcode == OpCode::CallN && o.args.len() >= 2 && o.args[1] == frame_ref
-            });
-            let Some(drop_offset) = drop_idx else {
-                continue;
-            };
-            let drop_idx = ca_idx + 1 + drop_offset;
-
-            // Check frame_ref is not used elsewhere (only in create, CA, drop)
-            let other_use = ops.iter().enumerate().any(|(i, o)| {
-                if i == ci || i == ca_idx || i == drop_idx {
-                    return false;
-                }
-                o.args.contains(&frame_ref)
-                    || o.fail_args
-                        .as_ref()
-                        .is_some_and(|fa| fa.contains(&frame_ref))
-            });
-            if other_use {
-                continue;
-            }
-
-            removals.push((ci, drop_idx, frame_ref, caller_frame));
-        }
-
-        // Apply in reverse order
-        for (create_idx, drop_idx, frame_ref, caller_frame) in removals.iter().rev() {
-            // Replace CallAssemblerI's first arg: frame_ref → caller_frame
-            for op in ops.iter_mut() {
-                if matches!(
-                    op.opcode,
-                    OpCode::CallAssemblerI
-                        | OpCode::CallAssemblerR
-                        | OpCode::CallAssemblerF
-                        | OpCode::CallAssemblerN
-                ) && op.args.first() == Some(frame_ref)
-                {
-                    op.args[0] = *caller_frame;
-                }
-            }
-            // Remove drop first (higher index), then create
-            ops.remove(*drop_idx);
-            // Adjust create_idx if drop was before it (shouldn't happen)
-            let ci = if *drop_idx < *create_idx {
-                create_idx - 1
-            } else {
-                *create_idx
-            };
-            ops.remove(ci);
-        }
-
-        let mut remap = HashMap::new();
-        for (new_idx, op) in ops.iter().enumerate() {
-            if op.pos != OpRef::NONE {
-                remap.insert(op.pos.0, new_idx as u32);
-            }
-        }
-        (ops, remap)
-    }
+    result
 }
 
 pub(crate) fn enrich_guard_resume_layouts_for_trace(

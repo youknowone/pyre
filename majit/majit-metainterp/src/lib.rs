@@ -41,7 +41,9 @@ pub mod virtualizable;
 pub mod virtualref;
 pub mod walkvirtual;
 
-pub use call_descr::{make_call_assembler_descr, make_call_descr};
+pub use call_descr::{
+    make_call_assembler_descr, make_call_assembler_descr_with_vable, make_call_descr,
+};
 pub use constant_pool::ConstantPool;
 pub use fail_descr::{make_fail_descr, make_fail_descr_typed};
 pub use io_buffer::{
@@ -64,7 +66,6 @@ pub use pyjitpl::{
     BackEdgeAction, BlackholeRunResult, BridgeRetraceResult, CompileOutcome, CompiledExitLayout,
     CompiledTerminalExitLayout, CompiledTraceLayout, DeadFrameArtifacts, DetailedDriverRunOutcome,
     DriverRunOutcome, InlineDecision, JitHooks, JitStats, MetaInterp, RawCompileResult,
-    set_ref_unbox_int_fn,
 };
 pub use quasiimmut::QuasiImmut;
 pub use symbolic_stack::SymbolicStack;

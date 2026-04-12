@@ -1933,6 +1933,22 @@ impl UnrollInfo {
 }
 
 impl OptUnroll {
+    /// unroll.py:264-272 disable_retracing_if_max_retrace_guards.
+    ///
+    /// When the peeled body contains more guards than `max_retrace_guards`,
+    /// set `retraced_count = u32::MAX` on the targeting JitCellToken so that
+    /// future bridges jump to the preamble instead of requesting a retrace.
+    pub fn disable_retracing_if_max_retrace_guards(
+        ops: &[majit_ir::Op],
+        retraced_count: &mut u32,
+        max_retrace_guards: u32,
+    ) {
+        let guard_count = ops.iter().filter(|op| op.opcode.is_guard()).count();
+        if guard_count > max_retrace_guards as usize {
+            *retraced_count = u32::MAX;
+        }
+    }
+
     /// unroll.py: export_state — capture optimizer state at end of preamble.
     ///
     /// After the preamble is optimized, snapshot:

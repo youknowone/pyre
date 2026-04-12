@@ -878,9 +878,9 @@ impl OptHeap {
             let put_back_op = op.clone();
             // heap.py:136: emit_extra(op, emit=False) — route after heap
             ctx.emit_extra(heap_pass_idx, op);
-            // heap.py:142-143: put_field_back_to_info
-            // → opinfo.setfield(descr, struct, arg, optheap, cf=self)
-            // → cf.register_info(struct, self)  (info.py:210)
+            // heap.py:142-143: put_field_back_to_info — restore cache +
+            // structinfo. The orthodox helper handles both the Forwarded
+            // path (regular box) and the constant path (const_infos).
             self.cache_field(obj, field_idx, descr.as_ref());
             ctx.structinfo_setfield(&put_back_op, field_idx, final_value);
         }
@@ -978,8 +978,7 @@ impl OptHeap {
             // RPython: self.next_optimization — always starts AFTER heap,
             // regardless of which pass emitted the guard that triggered this.
             ctx.emit_extra(self_pass_idx, op);
-            // heap.py:142-143: put_field_back_to_info
-            // → opinfo.setfield(descr, struct, arg, optheap, cf=self)
+            // heap.py:142-143: put_field_back_to_info — restore cache + PtrInfo
             self.cache_field(obj, field_idx, descr.as_ref());
             ctx.structinfo_setfield(&put_back_op, field_idx, final_value);
         }
@@ -1886,11 +1885,10 @@ impl OptHeap {
                 }
                 // 3. emit the setfield
                 Self::emit_lazy_setfield(&mut lazy_op, ctx, true);
-                // 4. put_field_back_to_info: heap.py:142-143
-                //    opinfo = optheap.ensure_ptr_info_arg0(op)
-                //    self.put_field_back_to_info(op, opinfo, optheap)
-                //    → opinfo.setfield(descr, struct, arg, optheap, cf=self)
-                //    → cf.register_info(struct, self)
+                // 4. put_field_back_to_info: heap.py:122 calls
+                //    `opinfo.setfield(...)` on the structinfo of lazy_obj.
+                //    Constant struct bases route through `const_infos`
+                //    via `info.py:750-752 ConstPtrInfo.setfield`.
                 let final_value = lazy_op.arg(1);
                 let descr = lazy_op.descr.clone();
                 self.cache_field(lazy_obj, field_idx, descr.as_ref());
@@ -2731,7 +2729,6 @@ impl Optimization for OptHeap {
             let descr = op.descr.clone();
             let put_back_op = op.clone();
             ctx.emit(op);
-            // heap.py:142-143: put_field_back_to_info
             self.cache_field(obj, field_idx, descr.as_ref());
             ctx.structinfo_setfield(&put_back_op, field_idx, final_value);
         }

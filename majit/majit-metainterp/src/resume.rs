@@ -5605,17 +5605,18 @@ impl<'a> ResumeDataDirectReader<'a> {
                     .unwrap_or(majit_ir::Type::Ref)
                 {
                     majit_ir::Type::Ref => value,
+                    // RPython: decode_ref + TAGBOX always returns a GC
+                    // pointer via cpu.get_ref_value(). These Int/Float
+                    // branches are needed because the optimizer may
+                    // unbox Ref→Int in deadframe slots.
                     majit_ir::Type::Int => self.allocator.box_int(value),
                     majit_ir::Type::Float => self.allocator.box_float(value),
                     majit_ir::Type::Void => value,
                 }
             }
             TAGINT => {
-                // pyre parity: all values are in ref registers (no typed
-                // register files). Optimizer may unbox Ref→Int, producing
-                // TAGINT in snapshot numbering for a ref-register slot.
-                // Box the int back to a PyObject because ref registers
-                // store pointers. The allocator handles boxing.
+                // RPython: decode_ref never sees TAGINT (assert tag == TAGBOX).
+                // Fires when optimizer produces TAGINT in ref-register snapshot.
                 self.allocator.box_int(num as i64)
             }
             _ => {
