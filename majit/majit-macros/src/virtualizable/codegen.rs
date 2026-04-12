@@ -47,13 +47,12 @@ pub fn generate_vable_info_fn(decl: &VirtualizableDecl) -> TokenStream {
         .map(|a| {
             let name = a.name.to_string();
             let tp = type_token(&a.item_type);
-            // symbolic.py:get_array_token → (basesize, itemsize, ofs_length)
-            // item_size derived from item_type at runtime:
-            //   Int/Ref/Float → 8 on 64-bit, Void → 0.
-            // This matches RPython's sizeof(ARRAY.OF) for standard types.
             // symbolic.py:get_array_token → itemsize = sizeof(ARRAY.OF)
-            // Standard types: Int/Ref/Float → 8 bytes on 64-bit platforms.
-            let item_size_expr = quote! { 8usize };
+            // Computed at runtime via item_size_for_type() to match
+            // RPython's symbolic.get_array_token layout calculation.
+            let item_size_expr = quote! {
+                majit_metainterp::virtualizable::item_size_for_type(#tp)
+            };
             match &a.layout {
                 VableArrayLayoutDecl::Direct { field_offset } => quote! {
                     __info.add_array_field(
@@ -114,8 +113,11 @@ pub fn generate_vable_info_pub_fn(decl: &VirtualizableDecl) -> TokenStream {
             let aname = a.name.to_string();
             let tp = type_token(&a.item_type);
             // symbolic.py:get_array_token → itemsize = sizeof(ARRAY.OF)
-            // Standard types: Int/Ref/Float → 8 bytes on 64-bit platforms.
-            let item_size_expr = quote! { 8usize };
+            // Computed at runtime via item_size_for_type() to match
+            // RPython's symbolic.get_array_token layout calculation.
+            let item_size_expr = quote! {
+                majit_metainterp::virtualizable::item_size_for_type(#tp)
+            };
             match &a.layout {
                 VableArrayLayoutDecl::Direct { field_offset } => quote! {
                     __info.add_array_field(

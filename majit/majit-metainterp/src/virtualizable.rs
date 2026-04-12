@@ -14,7 +14,9 @@
 //!
 //! This module provides the Rust equivalent of RPython's `virtualizable.py`.
 
-use majit_ir::{DescrRef, Type};
+use std::collections::HashMap;
+
+use majit_ir::{DescrRef, Type, descr::descr_identity};
 
 /// Sentinel value for TOKEN_TRACING_RESCALL.
 ///
@@ -143,6 +145,21 @@ pub struct VirtualizableInfo {
     /// virtualizable.py:58: self.array_descrs = [cpu.arraydescrof(...)]
     /// Populated at init from array_fields, one per array field.
     pub array_descrs: Vec<DescrRef>,
+    /// virtualizable.py:28: self.vable_token_descr = cpu.fielddescrof(VTYPE, 'vable_token')
+    /// Built by set_parent_descr(); None until then.
+    pub vable_token_descr: Option<DescrRef>,
+    /// virtualizable.py:71-72: self.static_field_descrs = [cpu.fielddescrof(VTYPE, name) ...]
+    /// Built by set_parent_descr(); empty until then.
+    _static_field_descrs: Vec<DescrRef>,
+    /// virtualizable.py:73-74: self.array_field_descrs = [cpu.fielddescrof(VTYPE, name) ...]
+    /// Built by set_parent_descr(); empty until then.
+    _array_field_descrs: Vec<DescrRef>,
+    /// virtualizable.py:81-82: self.static_field_by_descrs = {descr: i ...}
+    /// Map from descriptor identity (Arc pointer address) to field index.
+    pub static_field_by_descrs: HashMap<usize, usize>,
+    /// virtualizable.py:83-84: self.array_field_by_descrs = {descr: i ...}
+    /// Map from descriptor identity (Arc pointer address) to array field index.
+    pub array_field_by_descrs: HashMap<usize, usize>,
 }
 
 impl Clone for VirtualizableInfo {
@@ -155,6 +172,11 @@ impl Clone for VirtualizableInfo {
             num_static_extra_boxes: self.num_static_extra_boxes,
             parent_descr: self.parent_descr.clone(),
             array_descrs: self.array_descrs.clone(),
+            vable_token_descr: self.vable_token_descr.clone(),
+            _static_field_descrs: self._static_field_descrs.clone(),
+            _array_field_descrs: self._array_field_descrs.clone(),
+            static_field_by_descrs: self.static_field_by_descrs.clone(),
+            array_field_by_descrs: self.array_field_by_descrs.clone(),
         }
     }
 }
@@ -170,6 +192,11 @@ impl VirtualizableInfo {
             num_static_extra_boxes: 0,
             parent_descr: None,
             array_descrs: Vec::new(),
+            vable_token_descr: None,
+            _static_field_descrs: Vec::new(),
+            _array_field_descrs: Vec::new(),
+            static_field_by_descrs: HashMap::new(),
+            array_field_by_descrs: HashMap::new(),
         }
     }
 
@@ -184,7 +211,73 @@ impl VirtualizableInfo {
     /// immediately after `build_virtualizable_info()`, before the
     /// JIT pipeline starts emitting field-typed ops.
     pub fn set_parent_descr(&mut self, descr: DescrRef) {
-        self.parent_descr = Some(descr);
+        self.parent_descr = Some(descr.clone());
+        // virtualizable.py:28: self.vable_token_descr = cpu.fielddescrof(VTYPE, 'vable_token')
+        self.vable_token_descr = Some(Self::build_field_descr(
+            &descr,
+            self.token_offset,
+            8,
+            Type::Int,
+            majit_ir::ArrayFlag::Unsigned,
+        ));
+        // virtualizable.py:71-72: self.static_field_descrs = [cpu.fielddescrof(VTYPE, name) ...]
+        self._static_field_descrs = self
+            .static_fields
+            .iter()
+            .map(|f| {
+                let flag = majit_ir::ArrayFlag::from_field_type(f.field_type);
+                Self::build_field_descr(
+                    &descr,
+                    f.offset,
+                    item_size_for_type(f.field_type),
+                    f.field_type,
+                    flag,
+                )
+            })
+            .collect();
+        // virtualizable.py:73-74: self.array_field_descrs = [cpu.fielddescrof(VTYPE, name) ...]
+        self._array_field_descrs = self
+            .array_fields
+            .iter()
+            .map(|a| {
+                let offset = match a.storage {
+                    VableArrayStorage::DirectPointer => a.field_offset,
+                    VableArrayStorage::EmbeddedArray { ptr_offset } => a.field_offset + ptr_offset,
+                };
+                // Array pointer field is Type::Ref → FLAG_POINTER
+                Self::build_field_descr(&descr, offset, 8, Type::Ref, majit_ir::ArrayFlag::Pointer)
+            })
+            .collect();
+        // virtualizable.py:81-82: self.static_field_by_descrs = {descr: i ...}
+        self.static_field_by_descrs = self
+            ._static_field_descrs
+            .iter()
+            .enumerate()
+            .map(|(i, d)| (descr_identity(d), i))
+            .collect();
+        // virtualizable.py:83-84: self.array_field_by_descrs = {descr: i ...}
+        self.array_field_by_descrs = self
+            ._array_field_descrs
+            .iter()
+            .enumerate()
+            .map(|(i, d)| (descr_identity(d), i))
+            .collect();
+    }
+
+    /// Build a FieldDescr carrying parent_descr.
+    /// Helper for set_parent_descr() descriptor caching.
+    fn build_field_descr(
+        parent: &DescrRef,
+        offset: usize,
+        field_size: usize,
+        field_type: Type,
+        flag: majit_ir::ArrayFlag,
+    ) -> DescrRef {
+        std::sync::Arc::new(
+            majit_ir::SimpleFieldDescr::new(0, offset, field_size, field_type, false)
+                .with_flag(flag)
+                .with_parent_descr(parent.clone(), 0),
+        )
     }
 
     /// Add a static field.
@@ -337,14 +430,16 @@ impl VirtualizableInfo {
         *token_ptr = token.to_raw();
     }
 
-    /// RPython parity surface: descriptor list for static fields.
-    pub fn static_field_descrs(&self) -> &[VableFieldInfo] {
-        &self.static_fields
+    /// virtualizable.py:71-72: self.static_field_descrs
+    /// Returns all cached static field DescrRefs.
+    pub fn static_field_descrs(&self) -> &[DescrRef] {
+        &self._static_field_descrs
     }
 
-    /// RPython parity surface: descriptor list for array fields.
-    pub fn array_field_descrs(&self) -> &[VableArrayInfo] {
-        &self.array_fields
+    /// virtualizable.py:73-74: self.array_field_descrs
+    /// Returns all cached array pointer field DescrRefs.
+    pub fn array_field_descrs(&self) -> &[DescrRef] {
+        &self._array_field_descrs
     }
 
     /// RPython equivalent: `vinfo.static_field_by_descrs[descr]`.
@@ -445,88 +540,25 @@ impl VirtualizableInfo {
         self.array_fields.iter().position(|a| a.name == name)
     }
 
-    /// Descriptor for a static virtualizable field.
-    ///
-    /// Carries `parent_descr` (the SizeDescr of the host virtualizable
-    /// struct) so the optimizer's `ensure_ptr_info_arg0` field branch
-    /// (`optimizer.py:478-484`) can dispatch the resulting GETFIELD /
-    /// SETFIELD op to `InstancePtrInfo` / `StructPtrInfo`.
+    /// virtualizable.py:71: self.static_field_descrs[field_index]
+    /// Returns the cached FieldDescr for a static field.
+    /// Descriptors are built once in set_parent_descr(), not per-call.
     pub fn static_field_descr(&self, field_index: usize) -> DescrRef {
-        let field = &self.static_fields[field_index];
-        // descr.py:226: flag = get_type_flag(FIELDTYPE)
-        let flag = majit_ir::ArrayFlag::from_field_type(field.field_type);
-        self.field_descr_with_parent(
-            field.offset,
-            item_size_for_type(field.field_type),
-            field.field_type,
-            flag,
-        )
+        self._static_field_descrs[field_index].clone()
     }
 
-    /// Descriptor for the token field on the virtualizable object.
-    /// virtualizable.py:28: vable_token_descr = cpu.fielddescrof(VTYPE, 'vable_token')
-    /// Token stores a raw pointer-sized value (force_token or sentinel).
-    /// Kept Unsigned to preserve pre-existing backend sign-extension behavior.
+    /// virtualizable.py:28: self.vable_token_descr
+    /// Returns the cached FieldDescr for the vable_token field.
     pub fn token_field_descr(&self) -> DescrRef {
-        self.field_descr_with_parent(
-            self.token_offset,
-            8,
-            Type::Int,
-            majit_ir::ArrayFlag::Unsigned,
-        )
+        self.vable_token_descr
+            .clone()
+            .expect("token_field_descr called before set_parent_descr")
     }
 
-    /// Descriptor for the field that yields the backing array pointer.
-    ///
-    /// For embedded-array containers, this is the container's internal data
-    /// pointer field, not the container field itself.
+    /// virtualizable.py:73: self.array_field_descrs[array_index]
+    /// Returns the cached FieldDescr for an array pointer field.
     pub fn array_pointer_field_descr(&self, array_index: usize) -> DescrRef {
-        let array = &self.array_fields[array_index];
-        let offset = match array.storage {
-            VableArrayStorage::DirectPointer => array.field_offset,
-            VableArrayStorage::EmbeddedArray { ptr_offset } => array.field_offset + ptr_offset,
-        };
-        // Array pointer field is Type::Ref → FLAG_POINTER
-        self.field_descr_with_parent(offset, 8, Type::Ref, majit_ir::ArrayFlag::Pointer)
-    }
-
-    /// Internal helper: build a field descriptor that carries
-    /// `self.parent_descr` so the optimizer's `ensure_ptr_info_arg0`
-    /// can resolve the parent SizeDescr without hitting the
-    /// missing-parent panic.
-    ///
-    /// PyPy `virtualizable.py:71` (`get_field_descr` /
-    /// `cpu.fielddescrof(...)`) ALWAYS returns a canonical descriptor
-    /// with a parent SizeDescr — there is no "optional parent" state
-    /// in upstream. The Rust port mirrors that strictness by panicking
-    /// if a host failed to call `set_parent_descr` before requesting
-    /// any field descriptor; the bare-make_field_descr fallback that
-    /// existed previously was a majit-only convenience and got removed
-    /// because it leaked through to `ensure_ptr_info_arg0` and broke
-    /// the orthodox FieldDescr.parent_descr() contract.
-    fn field_descr_with_parent(
-        &self,
-        offset: usize,
-        field_size: usize,
-        field_type: Type,
-        flag: majit_ir::ArrayFlag,
-    ) -> DescrRef {
-        let parent = self.parent_descr.as_ref().unwrap_or_else(|| {
-            panic!(
-                "VirtualizableInfo::field_descr_with_parent called before \
-                 set_parent_descr — every host runtime must register the \
-                 parent SizeDescr right after build_virtualizable_info() so \
-                 the resulting FieldDescr carries `descr.py FieldDescr.parent_descr` \
-                 (matching virtualizable.py:71 cpu.fielddescrof). Affected \
-                 VirtualizableInfo: {:?}",
-                self.name
-            )
-        });
-        std::sync::Arc::new(
-            majit_ir::SimpleFieldDescr::new(0, offset, field_size, field_type, false)
-                .with_flag(flag)
-                .with_parent_descr(parent.clone(), 0),
-        )
+        self._array_field_descrs[array_index].clone()
     }
 
     /// virtualizable.py:58: self.array_descrs[array_index]
@@ -574,6 +606,25 @@ impl VirtualizableInfo {
     /// Check that box array has correct size for given array lengths.
     pub fn check_boxes(&self, boxes: &[i64], array_lengths: &[usize]) -> bool {
         boxes.len() == self.get_total_size(array_lengths)
+    }
+
+    /// virtualizable.py:58: self.array_descrs = [cpu.arraydescrof(...)]
+    ///
+    /// Replace macro-generated array descriptors with GcCache-backed ones.
+    /// The host runtime calls this after constructing VirtualizableInfo
+    /// to provide descriptors from `gc_cache.get_array_descr(...)`,
+    /// matching RPython's `cpu.arraydescrof(getattr(VTYPE, name).TO)`.
+    ///
+    /// `descrs` must have exactly one entry per array field, in order.
+    pub fn replace_array_descrs(&mut self, descrs: Vec<DescrRef>) {
+        assert_eq!(
+            descrs.len(),
+            self.array_fields.len(),
+            "replace_array_descrs: expected {} descriptors, got {}",
+            self.array_fields.len(),
+            descrs.len()
+        );
+        self.array_descrs = descrs;
     }
 
     // ── RPython virtualizable.py parity: heap I/O via descriptor ──

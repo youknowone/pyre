@@ -932,7 +932,7 @@ impl<M: Clone> MetaInterp<M> {
             pending_preamble_tokens: HashMap::new(),
             all_descrs: Vec::new(),
             pending_frontend_boxes: None,
-            cls_of_box: None,
+            cls_of_box: Some(default_cls_of_box),
         }
     }
 
