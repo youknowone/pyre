@@ -1338,11 +1338,30 @@ impl PtrInfo {
                     ctx.replace_op(opref, alloc_ref);
                 }
 
+                // info.py:672: fielddescrs = op.getdescr().get_all_fielddescrs()
+                let fielddescrs: Vec<majit_ir::DescrRef> = vinfo
+                    .descr
+                    .as_array_descr()
+                    .and_then(|ad| ad.get_all_interiorfielddescrs())
+                    .map(|fds| fds.to_vec())
+                    .unwrap_or_else(|| vinfo.fielddescrs.clone());
                 let element_fields = std::mem::take(&mut vinfo.element_fields);
-                let fielddescrs = vinfo.fielddescrs.clone();
+                // info.py:673-684:
+                //   for index in range(self.length):
+                //       for fielddescr in fielddescrs:
+                //           fld = self._items[i]
+                //           if fld is not None:
+                //               subbox = optforce.optimizer.force_box(fld)
+                //               setfieldop = ResOperation(SETINTERIORFIELD_GC,
+                //                   [op, ConstInt(index), subbox], descr=fielddescr)
+                //               optforce.emit_extra(setfieldop)
+                //           i += 1
                 for (elem_idx, fields) in element_fields.into_iter().enumerate() {
                     let idx_ref = ctx.emit_constant_int(elem_idx as i64);
                     for (field_idx, value_ref) in fields {
+                        if value_ref.is_none() {
+                            continue;
+                        }
                         let subbox = force_child(value_ref, ctx);
                         let mut set_op =
                             Op::new(OpCode::SetinteriorfieldGc, &[alloc_ref, idx_ref, subbox]);

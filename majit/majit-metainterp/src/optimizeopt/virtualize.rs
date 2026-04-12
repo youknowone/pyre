@@ -460,14 +460,41 @@ impl OptVirtualize {
         if let Some(size) = ctx.get_constant_int(size_ref) {
             if size >= 0 && size <= 1024 {
                 let descr = op.descr.clone().expect("NEW_ARRAY needs descr");
-                let items = vec![OpRef::NONE; size as usize];
-                let vinfo = VirtualArrayInfo {
-                    descr,
-                    clear: matches!(op.opcode, OpCode::NewArrayClear),
-                    items,
-                    last_guard_pos: -1,
-                };
-                ctx.set_ptr_info(op.pos, PtrInfo::VirtualArray(vinfo));
+                // virtualize.py:30-32: arraydescr.is_array_of_structs()
+                let is_struct = descr
+                    .as_array_descr()
+                    .map_or(false, |ad| ad.is_array_of_structs());
+                if is_struct {
+                    // virtualize.py:31: assert clear
+                    debug_assert!(matches!(op.opcode, OpCode::NewArrayClear));
+                    // info.py:645: lgt = len(descr.get_all_fielddescrs())
+                    let fielddescrs: Vec<DescrRef> = descr
+                        .as_array_descr()
+                        .and_then(|ad| ad.get_all_interiorfielddescrs())
+                        .map(|fds| fds.to_vec())
+                        .unwrap_or_default();
+                    let lgt = fielddescrs.len();
+                    // info.py:648: self._items = [None] * (size * lgt)
+                    let element_fields = (0..size as usize)
+                        .map(|_| (0..lgt as u32).map(|j| (j, OpRef::NONE)).collect())
+                        .collect();
+                    let vinfo = VirtualArrayStructInfo {
+                        descr,
+                        fielddescrs,
+                        element_fields,
+                        last_guard_pos: -1,
+                    };
+                    ctx.set_ptr_info(op.pos, PtrInfo::VirtualArrayStruct(vinfo));
+                } else {
+                    let items = vec![OpRef::NONE; size as usize];
+                    let vinfo = VirtualArrayInfo {
+                        descr,
+                        clear: matches!(op.opcode, OpCode::NewArrayClear),
+                        items,
+                        last_guard_pos: -1,
+                    };
+                    ctx.set_ptr_info(op.pos, PtrInfo::VirtualArray(vinfo));
+                }
                 return OptimizationResult::Remove;
             }
         }
@@ -862,16 +889,12 @@ impl OptVirtualize {
         if let Some(index) = ctx.get_constant_int(index_ref) {
             if let Some(info) = ctx.get_ptr_info_mut(array_ref) {
                 if let PtrInfo::VirtualArrayStruct(vinfo) = info {
+                    // info.py:658-661: setinteriorfield_virtual
+                    // index = self._compute_index(index, fielddescr)
+                    // if index >= 0: self._items[index] = fld
                     let elem_idx = index as usize;
                     if elem_idx < vinfo.element_fields.len() {
                         set_field(&mut vinfo.element_fields[elem_idx], field_idx, value_ref);
-                        // RPython VArrayStructInfo.fielddescrs parity:
-                        // collect InteriorFieldDescr for _number_virtuals.
-                        if let Some(ref descr) = op.descr {
-                            if !vinfo.fielddescrs.iter().any(|d| d.index() == descr.index()) {
-                                vinfo.fielddescrs.push(descr.clone());
-                            }
-                        }
                         return OptimizationResult::Remove;
                     }
                 }

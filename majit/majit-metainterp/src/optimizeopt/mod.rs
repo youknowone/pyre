@@ -675,10 +675,19 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
                     .as_array_descr()
                     .map(|ad| ad.item_size())
                     .unwrap_or(0);
+                // info.py:701-704: visitor_dispatch_virtual_type
+                //   flddescrs = self.descr.get_all_fielddescrs()
+                //   return visitor.visit_varraystruct(self.descr, self.getlength(), flddescrs)
+                let canonical_fielddescrs: Vec<majit_ir::DescrRef> = vi
+                    .descr
+                    .as_array_descr()
+                    .and_then(|ad| ad.get_all_interiorfielddescrs())
+                    .map(|fds| fds.to_vec())
+                    .unwrap_or_else(|| vi.fielddescrs.clone());
                 let mut fo = Vec::new();
                 let mut fs = Vec::new();
                 let mut ft = Vec::new();
-                for fd in &vi.fielddescrs {
+                for fd in &canonical_fielddescrs {
                     if let Some(ifd) = fd.as_interior_field_descr() {
                         let fld = ifd.field_descr();
                         fo.push(fld.offset());
@@ -712,6 +721,7 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
                     arraydescr: struct_ad,
                     descr_index: vi.descr.index(),
                     size: vi.element_fields.len(),
+                    fielddescrs: canonical_fielddescrs,
                     fielddescr_indices,
                     field_types: ft,
                     base_size: bs,

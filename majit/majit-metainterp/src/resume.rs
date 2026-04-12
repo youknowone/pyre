@@ -454,13 +454,13 @@ pub enum ResumeVirtualLayoutSummary {
         clear: bool,
         items: Vec<ResumeValueLayoutSummary>,
     },
-    /// resume.py:736 VArrayStructInfo
+    /// resume.py:736 VArrayStructInfo(arraydescr, size, fielddescrs)
     ArrayStruct {
         /// resume.py:739: self.arraydescr
         arraydescr: Option<majit_ir::DescrRef>,
         descr_index: u32,
-        /// Per-field type within each element: 0=ref, 1=int, 2=float.
-        field_types: Vec<u8>,
+        /// resume.py:740: self.fielddescrs
+        fielddescrs: Vec<majit_ir::DescrRef>,
         element_fields: Vec<Vec<(u32, ResumeValueLayoutSummary)>>,
     },
     RawBuffer {
@@ -695,11 +695,13 @@ impl ResumeVirtualLayoutSummary {
             ResumeVirtualLayoutSummary::ArrayStruct {
                 arraydescr,
                 descr_index,
+                fielddescrs,
                 element_fields,
                 ..
             } => VirtualInfo::VArrayStruct {
                 arraydescr: arraydescr.clone(),
                 descr_index: *descr_index,
+                fielddescrs: fielddescrs.clone(),
                 element_fields: element_fields
                     .iter()
                     .map(|fields| {
@@ -789,16 +791,14 @@ impl ResumeVirtualLayoutSummary {
                     .collect(),
             },
             ResumeVirtualLayoutSummary::ArrayStruct {
-                arraydescr: _,
+                arraydescr,
                 descr_index,
-                field_types,
+                fielddescrs,
                 element_fields,
             } => ExitVirtualLayout::ArrayStruct {
                 descr_index: *descr_index,
-                field_types: field_types.clone(),
-                item_size: 0,
-                field_offsets: vec![],
-                field_sizes: vec![],
+                arraydescr: arraydescr.clone(),
+                fielddescrs: fielddescrs.clone(),
                 element_fields: element_fields
                     .iter()
                     .map(|fields| {
@@ -1249,6 +1249,9 @@ pub enum VirtualInfo {
         arraydescr: Option<majit_ir::DescrRef>,
         /// Array descriptor index (serialization compat).
         descr_index: u32,
+        /// resume.py:740: self.fielddescrs — live InteriorFieldDescr objects
+        /// for setinteriorfield dispatch.
+        fielddescrs: Vec<majit_ir::DescrRef>,
         /// Per-element fields: outer Vec = elements, inner Vec = (field_index, source).
         element_fields: Vec<Vec<(u32, VirtualFieldSource)>>,
     },
@@ -1471,26 +1474,22 @@ impl VirtualInfo {
             VirtualInfo::VArrayStruct {
                 arraydescr,
                 descr_index,
+                fielddescrs,
                 element_fields,
-            } => {
-                let fpe = element_fields.first().map(|ef| ef.len()).unwrap_or(0);
-                ResumeVirtualLayoutSummary::ArrayStruct {
-                    arraydescr: arraydescr.clone(),
-                    descr_index: *descr_index,
-                    field_types: vec![0u8; fpe],
-                    element_fields: element_fields
-                        .iter()
-                        .map(|fields| {
-                            fields
-                                .iter()
-                                .map(|(field_descr, source)| {
-                                    (*field_descr, source.layout_summary())
-                                })
-                                .collect()
-                        })
-                        .collect(),
-                }
-            }
+            } => ResumeVirtualLayoutSummary::ArrayStruct {
+                arraydescr: arraydescr.clone(),
+                descr_index: *descr_index,
+                fielddescrs: fielddescrs.clone(),
+                element_fields: element_fields
+                    .iter()
+                    .map(|fields| {
+                        fields
+                            .iter()
+                            .map(|(field_descr, source)| (*field_descr, source.layout_summary()))
+                            .collect()
+                    })
+                    .collect(),
+            },
             VirtualInfo::VRawBuffer {
                 func,
                 size,
@@ -1662,28 +1661,30 @@ pub fn rd_virtual_to_virtual_info(
             arraydescr,
             descr_index,
             size,
-            fielddescr_indices,
+            fielddescrs: rd_fielddescrs,
             fieldnums,
             ..
         } => {
-            let num_fields = fielddescr_indices.len().max(1);
-            let mut element_fields = Vec::new();
+            // resume.py:736-740: VArrayStructInfo(arraydescr, size, fielddescrs)
+            // fieldnums is flat: size * len(fielddescrs) entries
+            let num_fields = rd_fielddescrs.len().max(1);
+            let mut element_fields = Vec::with_capacity(*size);
             for chunk in fieldnums.chunks(num_fields) {
-                let elem: Vec<(u32, VirtualFieldSource)> = fielddescr_indices
+                // resume.py:754: for j in range(len(self.fielddescrs)):
+                let elem: Vec<(u32, VirtualFieldSource)> = chunk
                     .iter()
-                    .zip(chunk.iter())
-                    .map(|(&fd_idx, &tagged)| (fd_idx, tagged_to_source(tagged, consts, count)))
+                    .enumerate()
+                    .map(|(j, &tagged)| (j as u32, tagged_to_source(tagged, consts, count)))
                     .collect();
                 element_fields.push(elem);
             }
-            if element_fields.is_empty() {
-                for _ in 0..*size {
-                    element_fields.push(vec![]);
-                }
+            while element_fields.len() < *size {
+                element_fields.push(vec![]);
             }
             VirtualInfo::VArrayStruct {
                 arraydescr: arraydescr.clone(),
                 descr_index: *descr_index,
+                fielddescrs: rd_fielddescrs.clone(),
                 element_fields,
             }
         }
@@ -2448,6 +2449,7 @@ impl MaterializedVirtual {
             VirtualInfo::VArrayStruct {
                 arraydescr: _,
                 descr_index,
+                fielddescrs: _,
                 element_fields,
             } => MaterializedVirtual::ArrayStruct {
                 descr_index: *descr_index,
@@ -2792,16 +2794,19 @@ impl ResumeDataVirtualAdder {
         })
     }
 
-    /// Convenience: add a virtual array of structs.
+    /// resume.py:332: visit_varraystruct(arraydescr, size, fielddescrs)
+    ///                 → VArrayStructInfo(arraydescr, size, fielddescrs)
     pub fn add_virtual_array_struct(
         &mut self,
         arraydescr: Option<majit_ir::DescrRef>,
         descr_index: u32,
+        fielddescrs: Vec<majit_ir::DescrRef>,
         element_fields: Vec<Vec<(u32, VirtualFieldSource)>>,
     ) -> usize {
         self.add_virtual(VirtualInfo::VArrayStruct {
             arraydescr,
             descr_index,
+            fielddescrs,
             element_fields,
         })
     }
@@ -4720,6 +4725,35 @@ pub trait BlackholeAllocator {
     fn setarrayitem_float(&self, array: i64, index: usize, value: i64, descr: u32) {
         let _ = (array, index, value, descr);
     }
+    /// resume.py:1520-1529 setinteriorfield(index, array, fieldnum, descr)
+    /// RPython passes the live descr object; backend reads offset/size/type from it.
+    fn setinteriorfield_gc_i(
+        &self,
+        array: i64,
+        index: usize,
+        value: i64,
+        descr: &majit_ir::DescrRef,
+    ) {
+        let _ = (array, index, value, descr);
+    }
+    fn setinteriorfield_gc_r(
+        &self,
+        array: i64,
+        index: usize,
+        value: i64,
+        descr: &majit_ir::DescrRef,
+    ) {
+        let _ = (array, index, value, descr);
+    }
+    fn setinteriorfield_gc_f(
+        &self,
+        array: i64,
+        index: usize,
+        value: i64,
+        descr: &majit_ir::DescrRef,
+    ) {
+        let _ = (array, index, value, descr);
+    }
     /// resume.py:1452 allocate_raw_buffer(func, size)
     fn allocate_raw_buffer(&self, func: i64, size: usize) -> i64 {
         let _ = (func, size);
@@ -4882,6 +4916,42 @@ impl VirtualInfo {
                         // resume.py:669: decoder.setarrayitem_int(array, i, num, arraydescr)
                         let value = decoder.decode_field_source_int(source);
                         allocator.setarrayitem_int(array, i, value, *descr_index);
+                    }
+                }
+                array
+            }
+            // resume.py:748-760: VArrayStructInfo.allocate
+            VirtualInfo::VArrayStruct {
+                arraydescr: _,
+                descr_index,
+                fielddescrs,
+                element_fields,
+            } => {
+                let size = element_fields.len();
+                // resume.py:749: array = decoder.allocate_array(self.size, self.arraydescr, clear=True)
+                let array = allocator.allocate_array(size, *descr_index, true);
+                decoder.virtuals_cache.set_ptr(index, array);
+                // resume.py:752-759:
+                //   for i in range(self.size):
+                //       for j in range(len(self.fielddescrs)):
+                //           num = self.fieldnums[p]
+                //           if not tagged_eq(num, UNINITIALIZED):
+                //               decoder.setinteriorfield(i, array, num, self.fielddescrs[j])
+                //           p += 1
+                for (i, fields) in element_fields.iter().enumerate() {
+                    debug_assert_eq!(
+                        fields.len(),
+                        fielddescrs.len(),
+                        "VArrayStruct element_fields[{i}] has {} fields but {} fielddescrs",
+                        fields.len(),
+                        fielddescrs.len()
+                    );
+                    for (j, &(_, ref source)) in fields.iter().enumerate() {
+                        if matches!(source, VirtualFieldSource::Uninitialized) {
+                            continue;
+                        }
+                        // resume.py:757: decoder.setinteriorfield(i, array, num, self.fielddescrs[j])
+                        decoder.setinteriorfield(i, array, source, &fielddescrs[j], allocator);
                     }
                 }
                 array
@@ -5566,6 +5636,35 @@ impl<'a> ResumeDataDirectReader<'a> {
             }
             ResumeValueSource::Uninitialized => 0,
             ResumeValueSource::Unavailable => 0,
+        }
+    }
+
+    /// resume.py:1520-1529 setinteriorfield(index, array, fieldnum, descr)
+    ///
+    /// Dispatches by descr.is_pointer_field() / is_float_field() / else.
+    pub fn setinteriorfield(
+        &mut self,
+        index: usize,
+        array: i64,
+        source: &VirtualFieldSource,
+        descr: &majit_ir::DescrRef,
+        allocator: &dyn BlackholeAllocator,
+    ) {
+        let is_pointer = descr
+            .as_interior_field_descr()
+            .map_or(false, |ifd| ifd.field_descr().is_pointer_field());
+        let is_float = descr
+            .as_interior_field_descr()
+            .map_or(false, |ifd| ifd.field_descr().is_float_field());
+        if is_pointer {
+            let value = self.decode_field_source(source);
+            allocator.setinteriorfield_gc_r(array, index, value, descr);
+        } else if is_float {
+            let value = self.decode_field_source_float(source);
+            allocator.setinteriorfield_gc_f(array, index, value, descr);
+        } else {
+            let value = self.decode_field_source_int(source);
+            allocator.setinteriorfield_gc_i(array, index, value, descr);
         }
     }
 

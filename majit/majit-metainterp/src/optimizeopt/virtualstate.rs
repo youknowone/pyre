@@ -163,9 +163,11 @@ pub enum VirtualStateInfo {
         /// stored as a flat parent-local list.
         field_descrs: Vec<DescrRef>,
     },
-    /// virtualstate.py: VArrayStructStateInfo — virtual array of structs.
+    /// virtualstate.py:286: VArrayStructStateInfo(arraydescr, fielddescrs, length)
     VArrayStruct {
         descr: DescrRef,
+        /// virtualstate.py:289: self.fielddescrs — InteriorFieldDescr per field slot.
+        fielddescrs: Vec<DescrRef>,
         element_fields: Vec<Vec<(u32, Rc<VirtualStateInfo>)>>,
     },
     /// Value is a virtual raw buffer (info.py:389 RawBufferPtrInfo).
@@ -294,18 +296,30 @@ impl VirtualStateInfo {
             }
 
             // Virtual array struct
+            // virtualstate.py:292-306: VArrayStructStateInfo._generate_guards
             (
                 VirtualStateInfo::VArrayStruct {
                     descr: d1,
+                    fielddescrs: fd1,
                     element_fields: ef1,
                 },
                 VirtualStateInfo::VArrayStruct {
                     descr: d2,
+                    fielddescrs: fd2,
                     element_fields: ef2,
                 },
             ) => {
+                // virtualstate.py:294-304: arraydescr identity + fielddescrs length + fielddescrs identity
                 if d1.index() != d2.index() || ef1.len() != ef2.len() {
                     return false;
+                }
+                if fd1.len() != fd2.len() {
+                    return false;
+                }
+                for (a, b) in fd1.iter().zip(fd2.iter()) {
+                    if a.index() != b.index() {
+                        return false;
+                    }
                 }
                 ef1.iter().zip(ef2.iter()).all(|(fields1, fields2)| {
                     for (idx, info) in fields1 {
@@ -1832,6 +1846,7 @@ fn export_single_value_inner(
                     .collect();
                 return VirtualStateInfo::VArrayStruct {
                     descr: vinfo.descr.clone(),
+                    fielddescrs: vinfo.fielddescrs.clone(),
                     element_fields,
                 };
             }

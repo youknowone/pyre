@@ -369,6 +369,7 @@ impl Optimizer {
             }
             VirtualStateInfo::VArrayStruct {
                 descr,
+                fielddescrs,
                 element_fields,
             } => {
                 let imported_elements = element_fields
@@ -390,7 +391,7 @@ impl Optimizer {
                     crate::optimizeopt::info::PtrInfo::VirtualArrayStruct(
                         crate::optimizeopt::info::VirtualArrayStructInfo {
                             descr: descr.clone(),
-                            fielddescrs: Vec::new(),
+                            fielddescrs: fielddescrs.clone(),
                             element_fields: imported_elements,
                             last_guard_pos: -1,
                         },
@@ -830,6 +831,7 @@ impl Optimizer {
             }
             VirtualStateInfo::VArrayStruct {
                 descr,
+                fielddescrs,
                 element_fields,
             } => {
                 let opref = ctx.alloc_op_position();
@@ -858,7 +860,7 @@ impl Optimizer {
                     crate::optimizeopt::info::PtrInfo::VirtualArrayStruct(
                         crate::optimizeopt::info::VirtualArrayStructInfo {
                             descr: descr.clone(),
-                            fielddescrs: Vec::new(),
+                            fielddescrs: fielddescrs.clone(),
                             element_fields: imported_elements,
                             last_guard_pos: -1,
                         },

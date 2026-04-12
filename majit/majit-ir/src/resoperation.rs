@@ -128,6 +128,8 @@ pub enum RdVirtualInfo {
         arraydescr: Option<crate::DescrRef>,
         descr_index: u32,
         size: usize,
+        /// resume.py:740: self.fielddescrs — live InteriorFieldDescr objects.
+        fielddescrs: Vec<crate::DescrRef>,
         /// resume.py VArrayStructInfo.fielddescrs — per-field descriptor indices.
         fielddescr_indices: Vec<u32>,
         /// resume.py:757: fielddescrs[j].is_pointer_field/is_float_field dispatch.
@@ -238,6 +240,7 @@ impl PartialEq for RdVirtualInfo {
                     arraydescr: _,
                     descr_index: a1,
                     size: a2,
+                    fielddescrs: _,
                     fielddescr_indices: a3,
                     field_types: a4,
                     base_size: a4b,
@@ -250,6 +253,7 @@ impl PartialEq for RdVirtualInfo {
                     arraydescr: _,
                     descr_index: b1,
                     size: b2,
+                    fielddescrs: _,
                     fielddescr_indices: b3,
                     field_types: b4,
                     base_size: b4b,

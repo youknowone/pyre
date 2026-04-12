@@ -2446,57 +2446,55 @@ fn materialize_bridge_virtual(
         }
         // resume.py:747-760 VArrayStructInfo.allocate
         majit_ir::RdVirtualInfo::VArrayStructInfo {
-            arraydescr: _,
+            arraydescr,
             descr_index,
+            fielddescrs,
             size,
-            fielddescr_indices,
-            field_types,
             base_size,
             item_size,
-            field_offsets,
-            field_sizes,
             fieldnums,
+            ..
         } => {
             let len_ref = ctx.const_int(*size as i64);
-            // resume.py:749 decoder.allocate_array(self.size, self.arraydescr, clear=True)
-            // descr.py:384: arraydescr.flag == FLAG_STRUCT
-            let array_descr =
-                crate::descr::make_struct_array_descr(*descr_index, *base_size, *item_size);
+            // resume.py:749: array = decoder.allocate_array(self.size, self.arraydescr, clear=True)
+            let array_descr = arraydescr.clone().unwrap_or_else(|| {
+                crate::descr::make_struct_array_descr(*descr_index, *base_size, *item_size)
+            });
             let new_op =
                 ctx.record_op_with_descr(OpCode::NewArrayClear, &[len_ref], array_descr.clone());
             ctx.heap_cache_mut().new_object(new_op);
-            // resume.py:751 decoder.virtuals_cache.set_ptr(index, array)
+            // resume.py:751: decoder.virtuals_cache.set_ptr(index, array)
             cache.insert(vidx, new_op);
-            // resume.py:752-759 nested (element, field) loop with setinteriorfield
-            let num_fields = fielddescr_indices.len();
+            // resume.py:752-759:
+            //   p = 0
+            //   for i in range(self.size):
+            //       for j in range(len(self.fielddescrs)):
+            //           num = self.fieldnums[p]
+            //           if not tagged_eq(num, UNINITIALIZED):
+            //               decoder.setinteriorfield(i, array, num, self.fielddescrs[j])
+            //           p += 1
+            let num_fields = fielddescrs.len();
             let mut p = 0;
             for i in 0..*size {
                 for j in 0..num_fields {
+                    if p >= fieldnums.len() {
+                        break;
+                    }
                     let fnum = fieldnums[p];
                     p += 1;
                     if fnum == majit_ir::resumedata::UNINITIALIZED_TAG {
                         continue;
                     }
-                    // resume.py:1200-1209 setinteriorfield: dispatch by field type
                     let value = decode_fieldnum(ctx, fnum, rd_virtuals, resume_data, cache);
                     if value.is_none() {
                         continue;
                     }
                     let idx_ref = ctx.const_int(i as i64);
-                    // resume.py:1208 execute_setinteriorfield_gc(descr, array, ConstInt(index), fieldbox)
-                    let field_descr = crate::descr::make_interior_field_descr(
-                        *descr_index,
-                        *base_size,
-                        *item_size,
-                        field_offsets.get(j).copied().unwrap_or(0),
-                        field_sizes.get(j).copied().unwrap_or(8),
-                        field_types.get(j).copied().unwrap_or(1),
-                        fielddescr_indices.get(j).copied().unwrap_or(0),
-                    );
+                    // resume.py:757: decoder.setinteriorfield(i, array, num, self.fielddescrs[j])
                     ctx.record_op_with_descr(
                         OpCode::SetinteriorfieldGc,
                         &[new_op, idx_ref, value],
-                        field_descr,
+                        fielddescrs[j].clone(),
                     );
                 }
             }

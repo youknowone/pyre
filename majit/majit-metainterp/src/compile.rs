@@ -509,16 +509,13 @@ pub(crate) fn build_guard_metadata(
                                     }
                                 }
                                 majit_ir::RdVirtualInfo::VArrayStructInfo {
-                                    arraydescr: _,
+                                    arraydescr,
                                     descr_index,
+                                    fielddescrs,
                                     size,
                                     fielddescr_indices,
-                                    field_types,
-                                    base_size: _,
-                                    item_size,
-                                    field_offsets,
-                                    field_sizes,
                                     fieldnums,
+                                    ..
                                 } => {
                                     let fpe = if *size > 0 {
                                         fieldnums.len() / *size
@@ -534,10 +531,8 @@ pub(crate) fn build_guard_metadata(
                                         .collect();
                                     majit_backend::ExitVirtualLayout::ArrayStruct {
                                         descr_index: *descr_index,
-                                        field_types: field_types.clone(),
-                                        item_size: *item_size,
-                                        field_offsets: field_offsets.clone(),
-                                        field_sizes: field_sizes.clone(),
+                                        arraydescr: arraydescr.clone(),
+                                        fielddescrs: fielddescrs.clone(),
                                         element_fields,
                                     }
                                 }

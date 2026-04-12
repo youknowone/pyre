@@ -121,16 +121,13 @@ pub enum ExitVirtualLayout {
         kind: u8,
         items: Vec<ExitValueSourceLayout>,
     },
+    /// resume.py:736 VArrayStructInfo(arraydescr, size, fielddescrs)
     ArrayStruct {
         descr_index: u32,
-        /// Per-field type within each element: 0=ref, 1=int, 2=float.
-        field_types: Vec<u8>,
-        /// llmodel.py:648: arraydescr.itemsize.
-        item_size: usize,
-        /// llmodel.py:649: per-field fielddescr.offset.
-        field_offsets: Vec<usize>,
-        /// llmodel.py:649: per-field fielddescr.field_size.
-        field_sizes: Vec<usize>,
+        /// resume.py:739: self.arraydescr — live ArrayDescr for allocate_array.
+        arraydescr: Option<majit_ir::DescrRef>,
+        /// resume.py:740: self.fielddescrs — live InteriorFieldDescr per field slot.
+        fielddescrs: Vec<majit_ir::DescrRef>,
         element_fields: Vec<Vec<(u32, ExitValueSourceLayout)>>,
     },
     /// resume.py:717 VRawSliceInfo — base_buffer + offset.
@@ -218,17 +215,13 @@ impl ExitVirtualLayout {
             },
             Self::ArrayStruct {
                 descr_index,
-                field_types,
-                item_size,
-                field_offsets,
-                field_sizes,
+                arraydescr,
+                fielddescrs,
                 element_fields,
             } => Self::ArrayStruct {
                 descr_index: *descr_index,
-                field_types: field_types.clone(),
-                item_size: *item_size,
-                field_offsets: field_offsets.clone(),
-                field_sizes: field_sizes.clone(),
+                arraydescr: arraydescr.clone(),
+                fielddescrs: fielddescrs.clone(),
                 element_fields: element_fields
                     .iter()
                     .map(|element| {
@@ -324,21 +317,26 @@ impl PartialEq for ExitVirtualLayout {
             (
                 Self::ArrayStruct {
                     descr_index: a1,
-                    field_types: a2,
-                    item_size: a3,
-                    field_offsets: a4,
-                    field_sizes: a5,
-                    element_fields: a6,
+                    fielddescrs: a2,
+                    element_fields: a3,
+                    ..
                 },
                 Self::ArrayStruct {
                     descr_index: b1,
-                    field_types: b2,
-                    item_size: b3,
-                    field_offsets: b4,
-                    field_sizes: b5,
-                    element_fields: b6,
+                    fielddescrs: b2,
+                    element_fields: b3,
+                    ..
                 },
-            ) => a1 == b1 && a2 == b2 && a3 == b3 && a4 == b4 && a5 == b5 && a6 == b6,
+            ) => {
+                // virtualstate.py:298-304: arraydescr identity + per-fielddescr identity
+                a1 == b1
+                    && a2.len() == b2.len()
+                    && a2
+                        .iter()
+                        .zip(b2.iter())
+                        .all(|(a, b)| a.index() == b.index())
+                    && a3 == b3
+            }
             (
                 Self::RawSlice {
                     offset: a1,
