@@ -240,11 +240,9 @@ pub struct JitCode {
     pub descrs: Vec<majit_codewriter::jitcode::BhDescr>,
     /// RPython `jitcode.py:16` `self.fnaddr` — function address for `bh_call_*`.
     /// Set by warmspot.py/call.py from `getfunctionptr(graph)`.
-    /// pyre: set at JitCode creation time to the portal runner address.
     pub fnaddr: i64,
     /// RPython `jitcode.py:17` `self.calldescr` — calling convention descriptor.
     /// Set by `call.py:get_jitcode_calldescr(graph)` from the function's type.
-    /// Used by `get_portal_runner()` to return `mainjitcode.calldescr`.
     pub calldescr: majit_codewriter::jitcode::BhCallDescr,
 }
 

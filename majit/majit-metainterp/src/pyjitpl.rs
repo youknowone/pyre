@@ -436,6 +436,8 @@ pub struct MetaInterp<M: Clone> {
     /// 2. Write them back on guard failure (force)
     /// 3. Track field access as IR ops during tracing
     pub(crate) virtualizable_info: Option<VirtualizableInfo>,
+    /// RPython metainterp_sd.virtualref_info — shared VirtualRefInfo.
+    pub(crate) virtualref_info: crate::virtualref::VirtualRefInfo,
     /// JIT hooks for profiling and debugging.
     pub(crate) hooks: JitHooks,
     /// Pre-allocated token number for the trace currently being recorded.
@@ -903,6 +905,7 @@ impl<M: Clone> MetaInterp<M> {
             tracing: None,
             next_trace_id: 1,
             virtualizable_info: None,
+            virtualref_info: crate::virtualref::VirtualRefInfo::new(),
             hooks: JitHooks::default(),
             pending_token: None,
             stats: JitStatsCounters::default(),
@@ -6323,7 +6326,7 @@ impl<M: Clone> MetaInterp<M> {
             &rd_consts,
             fail_values,
             None, // deadframe_types
-            None, // vrefinfo — pyre has no vref mechanism
+            Some(&self.virtualref_info as &dyn crate::resume::VRefInfo),
             vinfo.map(|v| v as &dyn crate::resume::VirtualizableInfo),
             None, // ginfo — pyre has no greenfield mechanism
             &allocator,

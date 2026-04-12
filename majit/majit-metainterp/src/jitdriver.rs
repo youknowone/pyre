@@ -1360,7 +1360,7 @@ impl<S: JitState> JitDriver<S> {
                     rd_virtuals_slice,
                     None, // rd_pendingfields (PendingFieldInfo)
                     exit_layout.rd_pendingfields.as_deref(), // rd_guard_pendingfields
-                    None, // vrefinfo
+                    Some(&self.meta_interp().virtualref_info as &dyn crate::resume::VRefInfo),
                     None, // vinfo
                     None, // ginfo
                     allocator,
@@ -2918,7 +2918,7 @@ impl<S: JitState> JitDriver<S> {
                     rd_virtuals_slice,
                     None, // rd_pendingfields (PendingFieldInfo)
                     exit_layout.rd_pendingfields.as_deref(), // rd_guard_pendingfields
-                    None, // vrefinfo
+                    Some(&self.meta_interp().virtualref_info as &dyn crate::resume::VRefInfo),
                     None, // vinfo
                     None, // ginfo
                     allocator,

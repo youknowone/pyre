@@ -80,6 +80,12 @@ impl Default for VirtualRefInfo {
     }
 }
 
+impl crate::resume::VRefInfo for VirtualRefInfo {
+    fn continue_tracing(&self, _vref: i64, _virtual_ref: i64) {
+        // virtualref.py:106 continue_tracing(vref, virtual)
+    }
+}
+
 impl VirtualRefInfo {
     /// Create a VirtualRefInfo with the standard descriptor indices.
     pub fn new() -> Self {
