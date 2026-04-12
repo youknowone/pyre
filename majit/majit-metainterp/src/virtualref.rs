@@ -13,14 +13,39 @@
 //!
 //! Mirrors `rpython/jit/metainterp/virtualref.py`.
 
+use std::sync::atomic::{AtomicU32, Ordering};
+
+/// GC type id for JitVirtualRef, set by `set_vref_gc_type_id()` at startup.
+/// RPython registers JIT_VIRTUAL_REF as a real GC type; pyre does the same
+/// via `gc.register_type(TypeInfo::with_gc_ptrs(...))` in eval.rs.
+static VREF_GC_TYPE_ID: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// Set the GC type id for JitVirtualRef. Called once at startup after
+/// `gc.register_type()` returns the assigned id.
+pub fn set_vref_gc_type_id(type_id: u32) {
+    VREF_GC_TYPE_ID.store(type_id, Ordering::Relaxed);
+}
+
+/// Get the registered GC type id for JitVirtualRef.
+pub fn vref_gc_type_id() -> u32 {
+    VREF_GC_TYPE_ID.load(Ordering::Relaxed)
+}
+
 /// rpython/rlib/jit.py JitVirtualRef: heap-allocated virtual reference.
-/// Contains a force token (active JIT frame) and a forced pointer
+/// Contains a type tag for identity checking (RPython uses typeptr),
+/// a force token (active JIT frame), and a forced pointer
 /// (materialized object, initially null).
 #[repr(C)]
 pub struct JitVirtualRef {
+    /// Type identity tag — RPython equivalent of inst.typeptr == jit_virtual_ref_vtable.
+    pub type_tag: u64,
     pub virtual_token: i64,
     pub forced: *mut u8,
 }
+
+/// Magic value stored in JitVirtualRef.type_tag for type identity.
+/// virtualref.py:94-98: is_virtual_ref checks inst.typeptr == jit_virtual_ref_vtable.
+pub const VREF_TYPE_TAG: u64 = 0x4A49_5456_5245_4621; // "JITVREF!"
 
 /// Allocate a concrete JitVirtualRef on the heap.
 /// virtualref.py:85-91: virtual_ref_during_tracing(real_object).
@@ -28,6 +53,7 @@ pub struct JitVirtualRef {
 /// Returns raw pointer; caller owns the allocation.
 pub fn alloc_virtual_ref(real_object: *mut u8) -> *mut u8 {
     let vref = Box::new(JitVirtualRef {
+        type_tag: VREF_TYPE_TAG,
         virtual_token: TOKEN_NONE,
         forced: real_object,
     });
@@ -41,20 +67,21 @@ pub const TOKEN_NONE: i64 = 0;
 pub const TOKEN_TRACING_RESCALL: i64 = -1;
 
 /// Well-known field descriptor indices for JitVirtualRef fields.
-/// These are used by the optimizer to track virtual_token and forced
-/// fields when a VirtualRef becomes a virtual struct.
-pub const VREF_FIELD_VIRTUAL_TOKEN: u32 = 0x7F00;
-pub const VREF_FIELD_FORCED: u32 = 0x7F01;
+/// Properly encoded: FIELD_DESCR_TAG | (byte_offset << 4) | type_bits
+///
+/// Layout: type_tag(0) | virtual_token(8) | forced(16)
+pub const VREF_FIELD_TYPE_TAG: u32 = 0x1000_0000; // offset=0, Int
+pub const VREF_FIELD_VIRTUAL_TOKEN: u32 = 0x1000_0080; // offset=8, Int
+pub const VREF_FIELD_FORCED: u32 = 0x1000_0101; // offset=16, Ref
 
 /// Descriptor indices for the virtual ref struct fields.
-///
-/// The optimizer uses these to create and manipulate virtual JitVirtualRef
-/// structures without emitting actual allocations.
 pub mod descr {
+    /// Field descriptor index for `type_tag` (RPython typeptr equivalent).
+    pub const TYPE_TAG: u32 = super::VREF_FIELD_TYPE_TAG;
     /// Field descriptor index for `virtual_token`.
-    pub const VIRTUAL_TOKEN: u32 = 0x7F00;
+    pub const VIRTUAL_TOKEN: u32 = super::VREF_FIELD_VIRTUAL_TOKEN;
     /// Field descriptor index for `forced`.
-    pub const FORCED: u32 = 0x7F01;
+    pub const FORCED: u32 = super::VREF_FIELD_FORCED;
     /// Size descriptor index for the JitVirtualRef struct itself.
     pub const VREF_SIZE: u32 = 0x7F10;
 }
@@ -81,8 +108,18 @@ impl Default for VirtualRefInfo {
 }
 
 impl crate::resume::VRefInfo for VirtualRefInfo {
-    fn continue_tracing(&self, _vref: i64, _virtual_ref: i64) {
-        // virtualref.py:106 continue_tracing(vref, virtual)
+    fn continue_tracing(&self, vref: i64, virtual_ref: i64) {
+        // virtualref.py:122-127 continue_tracing(vref, virtual)
+        if vref == 0 {
+            return;
+        }
+        let vref_ptr = vref as *mut JitVirtualRef;
+        // vref.virtual_token = vr_virtualtoken_none
+        // vref.forced = virtual
+        unsafe {
+            (*vref_ptr).virtual_token = TOKEN_NONE;
+            (*vref_ptr).forced = virtual_ref as *mut u8;
+        }
     }
 }
 
@@ -96,13 +133,9 @@ impl VirtualRefInfo {
         }
     }
 
+    /// virtualref.py: force_virtual()
+    ///
     /// Force a virtual reference: materialize the virtual object.
-    ///
-    /// RPython virtualref.py: `force_virtual()`
-    ///
-    /// Called when non-JIT code accesses a virtual reference. The JIT
-    /// frame is forced (flushing register values to heap), and the
-    /// virtual_token is set to TOKEN_NONE.
     ///
     /// # Safety
     /// `vref_ptr` must point to a valid JitVirtualRef object.
@@ -111,25 +144,17 @@ impl VirtualRefInfo {
         vref_ptr: *mut u8,
         force_fn: impl FnOnce(i64) -> *mut u8,
     ) -> *mut u8 {
-        let token_ptr = vref_ptr.add(self.descr_virtual_token as usize * 8) as *mut i64;
-        let forced_ptr = vref_ptr.add(self.descr_forced as usize * 8) as *mut *mut u8;
-        let token = *token_ptr;
-
-        if token == TOKEN_NONE {
-            // Already forced or not in JIT
-            return *forced_ptr;
+        let vref = &mut *(vref_ptr as *mut JitVirtualRef);
+        if vref.virtual_token == TOKEN_NONE {
+            return vref.forced;
         }
-
-        if token == TOKEN_TRACING_RESCALL {
-            // In tracing — just clear
-            *token_ptr = TOKEN_NONE;
-            return *forced_ptr;
+        if vref.virtual_token == TOKEN_TRACING_RESCALL {
+            vref.virtual_token = TOKEN_NONE;
+            return vref.forced;
         }
-
-        // Active JIT frame — call force_fn to materialize
-        let materialized = force_fn(token);
-        *forced_ptr = materialized;
-        *token_ptr = TOKEN_NONE;
+        let materialized = force_fn(vref.virtual_token);
+        vref.forced = materialized;
+        vref.virtual_token = TOKEN_NONE;
         materialized
     }
 
@@ -143,57 +168,46 @@ impl VirtualRefInfo {
         alloc_virtual_ref(real_object)
     }
 
-    /// Mark a virtual ref as "in residual call" before a non-JIT call.
+    /// virtualref.py: tracing_before_residual_call(vref)
     ///
-    /// virtualref.py: `tracing_before_residual_call(vref)`
     /// Sets token to TOKEN_TRACING_RESCALL so that if the callee
     /// forces the vref, we detect it after the call.
     ///
     /// # Safety
     /// `vref_ptr` must point to a valid JitVirtualRef object.
     pub unsafe fn tracing_before_residual_call(&self, vref_ptr: *mut u8) {
-        let token_ptr = vref_ptr.add(self.descr_virtual_token as usize * 8) as *mut i64;
-        *token_ptr = TOKEN_TRACING_RESCALL;
+        let vref = &mut *(vref_ptr as *mut JitVirtualRef);
+        vref.virtual_token = TOKEN_TRACING_RESCALL;
     }
 
-    /// Check and restore a virtual ref after a residual call.
+    /// virtualref.py:107-119 tracing_after_residual_call(vref)
     ///
-    /// virtualref.py: `tracing_after_residual_call(vref)`
-    /// Returns true if the vref was forced during the residual call
-    /// (token was cleared by the callee).
+    /// Returns true if the vref was forced during the residual call.
+    /// If not forced, sets token to TOKEN_NONE (RPython clears it).
     ///
     /// # Safety
     /// `vref_ptr` must point to a valid JitVirtualRef object.
-    pub unsafe fn tracing_after_residual_call(
-        &self,
-        vref_ptr: *mut u8,
-        original_token: i64,
-    ) -> bool {
-        let token_ptr = vref_ptr.add(self.descr_virtual_token as usize * 8) as *mut i64;
-        let current_token = *token_ptr;
-
-        if current_token != TOKEN_TRACING_RESCALL {
+    pub unsafe fn tracing_after_residual_call(&self, vref_ptr: *mut u8) -> bool {
+        let vref = &mut *(vref_ptr as *mut JitVirtualRef);
+        if vref.virtual_token != TOKEN_TRACING_RESCALL {
             // Token was modified during the call — vref was forced
             return true;
         }
-
-        // Not forced: restore original token
-        *token_ptr = original_token;
+        // Not forced: clear to TOKEN_NONE (virtualref.py:118)
+        vref.virtual_token = TOKEN_NONE;
         false
     }
 
-    /// Continue tracing after a residual call that forced a vref.
+    /// virtualref.py: continue_tracing(vref, real_object)
     ///
-    /// virtualref.py: `continue_tracing(vref, real_object)`
     /// Updates the forced field and clears the token.
     ///
     /// # Safety
     /// `vref_ptr` must point to a valid JitVirtualRef object.
     pub unsafe fn continue_tracing(&self, vref_ptr: *mut u8, real_object: *mut u8) {
-        let token_ptr = vref_ptr.add(self.descr_virtual_token as usize * 8) as *mut i64;
-        let forced_ptr = vref_ptr.add(self.descr_forced as usize * 8) as *mut *mut u8;
-        *forced_ptr = real_object;
-        *token_ptr = TOKEN_NONE;
+        let vref = &mut *(vref_ptr as *mut JitVirtualRef);
+        vref.forced = real_object;
+        vref.virtual_token = TOKEN_NONE;
     }
 
     /// Check if a virtual reference is currently active (has a JIT frame token).
@@ -213,10 +227,11 @@ impl VirtualRefInfo {
         token == TOKEN_TRACING_RESCALL
     }
 
-    /// virtualref.py: is_virtual_ref(gcref)
-    /// Check if a GC pointer is a JitVirtualRef by checking its vtable.
-    /// In RPython this compares the object's typeptr against jit_virtual_ref_vtable.
-    /// Here we check a well-known marker field at a fixed offset.
+    /// virtualref.py:94-98 is_virtual_ref(gcref)
+    ///
+    /// RPython checks `inst.typeptr == jit_virtual_ref_vtable`.
+    /// pyre checks JitVirtualRef.type_tag == VREF_TYPE_TAG as the
+    /// equivalent type identity mechanism.
     ///
     /// # Safety
     /// `ptr` must point to a valid object or be null.
@@ -224,14 +239,12 @@ impl VirtualRefInfo {
         if ptr.is_null() {
             return false;
         }
-        // Read the virtual_token field — if it's a non-zero JIT frame token
-        // or TOKEN_TRACING_RESCALL, this is an active virtual ref.
-        let token_ptr = ptr.add(self.descr_virtual_token as usize * 8) as *const i64;
-        let token = *token_ptr;
-        token != TOKEN_NONE
+        let tag = *(ptr as *const u64);
+        tag == VREF_TYPE_TAG
     }
 
     /// virtualref.py: force_virtual(inst)
+    ///
     /// Force a virtual reference: materialize the virtual object if needed.
     /// This is the full force path that handles all token states.
     ///
@@ -242,26 +255,17 @@ impl VirtualRefInfo {
         vref_ptr: *mut u8,
         force_fn: impl FnOnce(i64) -> *mut u8,
     ) -> *mut u8 {
-        let token_ptr = vref_ptr.add(self.descr_virtual_token as usize * 8) as *mut i64;
-        let forced_ptr = vref_ptr.add(self.descr_forced as usize * 8) as *mut *mut u8;
-        let token = *token_ptr;
-
-        if token == TOKEN_NONE {
-            // Already forced or never active.
-            return *forced_ptr;
+        let vref = &mut *(vref_ptr as *mut JitVirtualRef);
+        if vref.virtual_token == TOKEN_NONE {
+            return vref.forced;
         }
-
-        if token == TOKEN_TRACING_RESCALL {
-            // virtualref.py: during tracing, just reset the token.
-            // The "virtual" is not truly virtual — just a marker.
-            *token_ptr = TOKEN_NONE;
-            return *forced_ptr;
+        if vref.virtual_token == TOKEN_TRACING_RESCALL {
+            vref.virtual_token = TOKEN_NONE;
+            return vref.forced;
         }
-
-        // Active JIT frame — call force_fn to materialize.
-        let materialized = force_fn(token);
-        *forced_ptr = materialized;
-        *token_ptr = TOKEN_NONE;
+        let materialized = force_fn(vref.virtual_token);
+        vref.forced = materialized;
+        vref.virtual_token = TOKEN_NONE;
         materialized
     }
 }

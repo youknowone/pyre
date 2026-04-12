@@ -50,7 +50,7 @@ enum JitAction {
 }
 
 use crate::jit::descr::{
-    JITFRAME_GC_TYPE_ID, OBJECT_GC_TYPE_ID, W_FLOAT_GC_TYPE_ID, W_INT_GC_TYPE_ID,
+    JITFRAME_GC_TYPE_ID, OBJECT_GC_TYPE_ID, VREF_GC_TYPE_ID, W_FLOAT_GC_TYPE_ID, W_INT_GC_TYPE_ID,
 };
 use majit_gc::collector::MiniMarkGC;
 use majit_metainterp::JitDriver;
@@ -153,6 +153,16 @@ thread_local! {
         // jitframe.py:49 — rgc.register_custom_trace_hook(JITFRAME, jitframe_trace)
         let jitframe_tid = gc.register_type(majit_metainterp::jitframe::jitframe_type_info());
         debug_assert_eq!(jitframe_tid, JITFRAME_GC_TYPE_ID);
+        // virtualref.py — JIT_VIRTUAL_REF as a proper GC type.
+        // Layout: type_tag(u64, offset 0) | virtual_token(i64, offset 8) | forced(Ref, offset 16)
+        // `forced` is a GC pointer → gc_ptr_offsets = [16].
+        let vref_tid = gc.register_type(majit_gc::trace::TypeInfo::with_gc_ptrs(
+            std::mem::size_of::<majit_metainterp::virtualref::JitVirtualRef>(),
+            vec![std::mem::offset_of!(majit_metainterp::virtualref::JitVirtualRef, forced)],
+        ));
+        debug_assert_eq!(vref_tid, VREF_GC_TYPE_ID);
+        // Tell the virtualref optimizer about the registered type id.
+        majit_metainterp::virtualref::set_vref_gc_type_id(vref_tid);
         // Tell the cranelift backend which type id to use for the
         // nursery allocations that it issues for jitframes. Without
         // this, the backend's default u32::MAX sentinel would trip the

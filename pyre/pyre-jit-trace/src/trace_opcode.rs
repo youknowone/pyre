@@ -922,12 +922,7 @@ impl MIFrame {
         while i < len {
             let (_, vref_ptr) = sym.virtualref_boxes[i + 1];
             if vref_ptr != 0 {
-                let forced = unsafe {
-                    vref_info.tracing_after_residual_call(
-                        vref_ptr as *mut u8,
-                        majit_metainterp::virtualref::TOKEN_TRACING_RESCALL,
-                    )
-                };
+                let forced = unsafe { vref_info.tracing_after_residual_call(vref_ptr as *mut u8) };
                 if forced {
                     Self::stop_tracking_virtualref(sym, ctx, i);
                 }

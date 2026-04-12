@@ -41,10 +41,19 @@ pub struct VirtualizableConfig {
     pub array_lengths: Vec<usize>,
 }
 
-/// Field descriptor index for the `virtual_token` field of JitVirtualRef.
-const VREF_VIRTUAL_TOKEN_FIELD_INDEX: u32 = 0x7F00;
-/// Field descriptor index for the `forced` field of JitVirtualRef.
-const VREF_FORCED_FIELD_INDEX: u32 = 0x7F01;
+/// JitVirtualRef field descriptor indices — properly encoded with byte offsets.
+///
+/// JitVirtualRef layout (#[repr(C)]):
+///   offset  0: type_tag       (u64, 8 bytes) — type identity (RPython typeptr)
+///   offset  8: virtual_token  (i64, 8 bytes)
+///   offset 16: forced         (*mut u8, 8 bytes, Ref)
+///   total: 24 bytes
+///
+/// Encoding: FIELD_DESCR_TAG | (offset << 4) | (size_bits << 1) | type_bits
+///   type_bits: 0=Int, 1=Ref;  size_bits: 0 → 8 bytes
+const VREF_TYPE_TAG_FIELD_INDEX: u32 = 0x1000_0000; // offset=0, Int
+const VREF_VIRTUAL_TOKEN_FIELD_INDEX: u32 = 0x1000_0080; // offset=8, Int
+const VREF_FORCED_FIELD_INDEX: u32 = 0x1000_0101; // offset=16, Ref
 /// Size descriptor index for the JitVirtualRef struct.
 const VREF_SIZE_DESCR_INDEX: u32 = 0x7F10;
 
@@ -1066,7 +1075,7 @@ impl OptVirtualize {
     /// allocation is eliminated entirely. If it does escape, the forcing
     /// mechanism emits the struct allocation + field writes.
     fn optimize_virtual_ref(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let vref_descr = make_field_index_descr(VREF_SIZE_DESCR_INDEX);
+        let vref_descr: DescrRef = Arc::new(VRefSizeDescr);
 
         // Emit a FORCE_TOKEN to capture the JIT frame address.
         let token_op = Op::new(OpCode::ForceToken, &[]);
@@ -1080,11 +1089,17 @@ impl OptVirtualize {
 
         let null_ref = ctx.emit_constant_ref(majit_ir::GcRef::NULL);
 
+        // RPython typeptr parity: type_tag is stored at offset 0, equivalent
+        // to the GC object header's typeptr that RPython sets automatically.
+        let type_tag_ref = ctx.emit_constant_int(crate::virtualref::VREF_TYPE_TAG as i64);
+
         let fields = vec![
+            (VREF_TYPE_TAG_FIELD_INDEX, type_tag_ref),
             (VREF_VIRTUAL_TOKEN_FIELD_INDEX, token_ref),
             (VREF_FORCED_FIELD_INDEX, null_ref),
         ];
         let field_descrs = vec![
+            make_field_index_descr(VREF_TYPE_TAG_FIELD_INDEX),
             make_field_index_descr(VREF_VIRTUAL_TOKEN_FIELD_INDEX),
             make_field_index_descr(VREF_FORCED_FIELD_INDEX),
         ];
@@ -1763,6 +1778,13 @@ impl Descr for FieldIndexDescr {
 }
 
 impl FieldDescr for FieldIndexDescr {
+    fn index_in_parent(&self) -> usize {
+        // Return the raw encoded descriptor value as the field key.
+        // VirtualStructInfo.fields stores this same value as the key,
+        // so descr_index() → index_in_parent() matches field lookups.
+        self.0 as usize
+    }
+
     fn offset(&self) -> usize {
         // Decode offset from the encoded field descriptor index.
         // Format: FIELD_DESCR_TAG | (offset << 4) | (size << 1) | (signed << 3) | type_bits
@@ -1793,6 +1815,36 @@ impl FieldDescr for FieldIndexDescr {
 
 pub(crate) fn make_field_index_descr(idx: u32) -> DescrRef {
     Arc::new(FieldIndexDescr(idx))
+}
+
+/// Size descriptor for JitVirtualRef (24 bytes = type_tag + virtual_token + forced).
+#[derive(Debug)]
+struct VRefSizeDescr;
+
+impl Descr for VRefSizeDescr {
+    fn index(&self) -> u32 {
+        VREF_SIZE_DESCR_INDEX
+    }
+    fn as_size_descr(&self) -> Option<&dyn majit_ir::SizeDescr> {
+        Some(self)
+    }
+}
+
+impl majit_ir::SizeDescr for VRefSizeDescr {
+    fn size(&self) -> usize {
+        std::mem::size_of::<crate::virtualref::JitVirtualRef>()
+    }
+    fn type_id(&self) -> u32 {
+        // virtualref.py — JIT_VIRTUAL_REF is a real GC type in RPython.
+        // pyre registers it via gc.register_type() at startup; the assigned
+        // id is stored in the global and returned here so the backend's
+        // alloc_nursery_typed() uses the correct GC type with proper
+        // gc_ptr_offsets for tracing the `forced` Ref field.
+        crate::virtualref::vref_gc_type_id()
+    }
+    fn is_immutable(&self) -> bool {
+        false
+    }
 }
 
 fn virtualizable_field_index(offset: usize) -> u32 {

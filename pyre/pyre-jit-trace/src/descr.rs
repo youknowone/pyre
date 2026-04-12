@@ -296,6 +296,8 @@ pub const W_INT_GC_TYPE_ID: u32 = 1;
 pub const W_FLOAT_GC_TYPE_ID: u32 = 2;
 /// GC type id for JitFrame (jitframe.py:49 register_custom_trace_hook).
 pub const JITFRAME_GC_TYPE_ID: u32 = 3;
+/// GC type id for JitVirtualRef (virtualref.py — JIT_VIRTUAL_REF).
+pub const VREF_GC_TYPE_ID: u32 = 4;
 
 fn field_descr_from_group(group: &PyreObjectDescrGroup, index: usize) -> DescrRef {
     let field_descr = group
