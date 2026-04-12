@@ -2337,6 +2337,8 @@ fn test_compiled_bridge_guard_failure_has_frame_stack() {
     // source guard's recovery layout to form the caller prefix, then the
     // bridge's own frame is appended, giving 2 frames total.
     let source_layout = ExitRecoveryLayout {
+        vable_array: vec![],
+        vref_array: vec![],
         frames: vec![
             ExitFrameLayout {
                 trace_id: Some(909),

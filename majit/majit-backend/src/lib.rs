@@ -436,6 +436,10 @@ impl ExitFrameLayout {
 /// Backend-neutral recovery metadata attached to an exit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExitRecoveryLayout {
+    /// resume.py:1099 consume_vref_and_vable_boxes / virtualizable_boxes.
+    pub vable_array: Vec<ExitValueSourceLayout>,
+    /// resume.py:1093 consume_virtualref_boxes — [virtual, vref, ...] pairs.
+    pub vref_array: Vec<ExitValueSourceLayout>,
     /// Reconstructed frames, outermost first.
     pub frames: Vec<ExitFrameLayout>,
     /// Materialized virtual objects referenced by the frames.
@@ -451,6 +455,19 @@ impl ExitRecoveryLayout {
         };
 
         let virtual_offset = caller_prefix.virtual_layouts.len();
+        let vable_array = if caller_prefix.vable_array.is_empty() {
+            self.vable_array.clone()
+        } else {
+            caller_prefix.vable_array.clone()
+        };
+        let vref_array = if caller_prefix.vref_array.is_empty() {
+            self.vref_array
+                .iter()
+                .map(|slot| slot.shifted_virtuals(virtual_offset))
+                .collect()
+        } else {
+            caller_prefix.vref_array.clone()
+        };
         let mut frames = caller_prefix.frames.clone();
         frames.extend(
             self.frames
@@ -473,6 +490,8 @@ impl ExitRecoveryLayout {
         );
 
         Self {
+            vable_array,
+            vref_array,
             frames,
             virtual_layouts,
             pending_field_layouts,

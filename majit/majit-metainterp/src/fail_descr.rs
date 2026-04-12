@@ -272,6 +272,7 @@ pub fn make_resume_at_position_descr() -> DescrRef {
             types: Vec::new(),
             resume_data: ResumeData {
                 vable_array: Vec::new(),
+                vref_array: Vec::new(),
                 frames: Vec::new(),
                 virtuals: Vec::new(),
                 pending_fields: Vec::new(),
@@ -394,6 +395,7 @@ pub fn make_compile_loop_version_descr_from(source_op: &majit_ir::Op) -> DescrRe
         types,
         resume_data: ResumeData {
             vable_array: Vec::new(),
+            vref_array: Vec::new(),
             frames: Vec::new(),
             virtuals: Vec::new(),
             pending_fields: Vec::new(),

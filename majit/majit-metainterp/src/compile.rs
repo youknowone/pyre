@@ -660,6 +660,8 @@ pub(crate) fn build_guard_metadata(
                 })
                 .unwrap_or_default();
             Some(ExitRecoveryLayout {
+                vable_array: Vec::new(),
+                vref_array: Vec::new(),
                 frames: frames_layout,
                 virtual_layouts,
                 pending_field_layouts,
@@ -672,6 +674,8 @@ pub(crate) fn build_guard_metadata(
                 .map(majit_backend::ExitValueSourceLayout::ExitValue)
                 .collect();
             Some(ExitRecoveryLayout {
+                vable_array: Vec::new(),
+                vref_array: Vec::new(),
                 frames: vec![majit_backend::ExitFrameLayout {
                     trace_id: None,
                     header_pc: Some(pc),

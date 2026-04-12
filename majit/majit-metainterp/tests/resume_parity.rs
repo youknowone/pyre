@@ -18,6 +18,7 @@ fn resume_py_public_encoding_uses_tagged_numbering() {
     let large_const = (1_i64 << 62) + 9;
     let rd = ResumeData {
         vable_array: Vec::new(),
+        vref_array: Vec::new(),
         frames: vec![FrameInfo {
             jitcode_index: 0,
             pc: 123,
@@ -60,6 +61,7 @@ fn resume_py_public_encoding_uses_tagged_numbering() {
 fn resume_py_public_roundtrip_recovers_virtualized_state() {
     let rd = ResumeData {
         vable_array: Vec::new(),
+        vref_array: Vec::new(),
         frames: vec![FrameInfo {
             jitcode_index: 0,
             pc: 77,
@@ -132,6 +134,7 @@ fn resume_py_count_includes_virtual_and_pending_field_failargs() {
     // FailArg(2) only in pending field — count must be 3.
     let rd = ResumeData {
         vable_array: Vec::new(),
+        vref_array: Vec::new(),
         frames: vec![FrameInfo {
             jitcode_index: 0,
             pc: 10,
@@ -164,6 +167,7 @@ fn resume_py_count_includes_virtual_and_pending_field_failargs() {
 fn resume_py_count_frame_only() {
     let rd = ResumeData {
         vable_array: Vec::new(),
+        vref_array: Vec::new(),
         frames: vec![FrameInfo {
             jitcode_index: 0,
             pc: 10,
@@ -187,6 +191,7 @@ fn resume_py_count_frame_only() {
 fn resume_py_compact_liveboxes_numbering() {
     let rd = ResumeData {
         vable_array: Vec::new(),
+        vref_array: Vec::new(),
         frames: vec![FrameInfo {
             jitcode_index: 0,
             pc: 10,
@@ -221,6 +226,7 @@ fn resume_py_compact_liveboxes_numbering() {
 fn resume_py_dedup_same_box_same_number() {
     let rd = ResumeData {
         vable_array: Vec::new(),
+        vref_array: Vec::new(),
         frames: vec![FrameInfo {
             jitcode_index: 0,
             pc: 10,

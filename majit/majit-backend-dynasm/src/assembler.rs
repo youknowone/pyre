@@ -2707,6 +2707,8 @@ impl Assembler386 {
         let recovery_layout = {
             let slot_types = &descr.fail_arg_types;
             ExitRecoveryLayout {
+                vable_array: vec![],
+                vref_array: vec![],
                 frames: vec![ExitFrameLayout {
                     trace_id: Some(self.trace_id),
                     header_pc: Some(self.header_pc),

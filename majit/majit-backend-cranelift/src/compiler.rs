@@ -476,6 +476,8 @@ fn caller_prefix_recovery_layout(
     caller_prefix_layout: Option<&ExitRecoveryLayout>,
 ) -> ExitRecoveryLayout {
     ExitRecoveryLayout {
+        vable_array: Vec::new(),
+        vref_array: Vec::new(),
         frames: vec![ExitFrameLayout {
             trace_id: Some(trace_id),
             header_pc: Some(header_pc),
@@ -4839,6 +4841,8 @@ fn identity_recovery_layout(
         slot_types: Some(slot_types.to_vec()),
     });
     ExitRecoveryLayout {
+        vable_array: Vec::new(),
+        vref_array: Vec::new(),
         frames,
         virtual_layouts: caller_layout
             .map(|layout| layout.virtual_layouts.clone())
