@@ -5006,6 +5006,9 @@ pub struct CraneliftBackend {
     module: JITModule,
     func_ctx: FunctionBuilderContext,
     constants: HashMap<u32, i64>,
+    /// rewrite.py:930 parity: OpRef → Type for constants, so the GC rewriter
+    /// can check `v.type == 'r'` on ConstPtr values.
+    constant_types: HashMap<u32, Type>,
     func_counter: u32,
     gc_runtime_id: Option<u64>,
     trace_counter: u64,
@@ -5101,6 +5104,7 @@ impl CraneliftBackend {
             module,
             func_ctx,
             constants: HashMap::new(),
+            constant_types: HashMap::new(),
             func_counter: 0,
             gc_runtime_id: None,
             trace_counter: 1,
@@ -5185,6 +5189,10 @@ impl CraneliftBackend {
         self.constants = constants;
     }
 
+    pub fn set_constant_types(&mut self, constant_types: HashMap<u32, Type>) {
+        self.constant_types = constant_types;
+    }
+
     /// Force the next compile call to assign a specific trace id to all exits.
     pub fn set_next_trace_id(&mut self, trace_id: u64) {
         self.next_trace_id = Some(trace_id);
@@ -5227,8 +5235,11 @@ impl CraneliftBackend {
         let mut normalized = normalize_ops_for_codegen_simple(inputargs, ops);
         inject_builtin_string_descrs(&mut normalized);
         if let Some(rewriter) = self.gc_rewriter() {
-            let (result, new_constants) =
-                rewriter.rewrite_for_gc_with_constants(&normalized, constants);
+            let (result, new_constants) = rewriter.rewrite_for_gc_with_constants_typed(
+                &normalized,
+                constants,
+                &self.constant_types,
+            );
             // Merge GC rewriter's new constants into self.constants
             for (k, v) in new_constants {
                 self.constants.entry(k).or_insert(v);
@@ -7973,18 +7984,138 @@ impl CraneliftBackend {
                 }
 
                 // ── GC write barriers ──
+                // aarch64/opassembler.py:912-1019 _write_barrier_fastpath parity:
+                // Inline flag check → skip if flag not set → slow path call.
+                // CondCallGcWbArray: additionally checks card marking flag
+                // (descr.jit_wb_cards_set) and sets card bit inline if possible.
                 OpCode::CondCallGcWb | OpCode::CondCallGcWbArray => {
-                    let runtime_id = gc_runtime_id.ok_or_else(|| missing_gc_runtime(op.opcode))?;
-                    let runtime_id = builder.ins().iconst(cl_types::I64, runtime_id as i64);
+                    let runtime_id_val =
+                        gc_runtime_id.ok_or_else(|| missing_gc_runtime(op.opcode))?;
                     let obj = resolve_opref(&mut builder, &constants, op.arg(0));
-                    let _ = emit_host_call(
-                        &mut builder,
-                        ptr_type,
-                        call_conv,
-                        gc_write_barrier_shim as *const () as usize,
-                        &[runtime_id, obj],
-                        None,
-                    );
+                    let is_array = op.opcode == OpCode::CondCallGcWbArray;
+
+                    // Load flag byte from object header.
+                    // aarch64: LDRB_ri(ip0, loc_base, jit_wb_if_flag_byteofs)
+                    let rw = self.gc_rewriter();
+                    let wb_byteofs = rw
+                        .as_ref()
+                        .map(|r| r.wb_descr.jit_wb_if_flag_byteofs as i32)
+                        .unwrap_or(0);
+                    let wb_mask_raw = rw
+                        .as_ref()
+                        .map(|r| r.wb_descr.jit_wb_if_flag_singlebyte)
+                        .unwrap_or(0);
+                    let wb_cards_set = rw
+                        .as_ref()
+                        .map(|r| r.wb_descr.jit_wb_cards_set)
+                        .unwrap_or(0);
+                    let wb_card_shift = rw
+                        .as_ref()
+                        .map(|r| r.wb_descr.jit_wb_card_page_shift)
+                        .unwrap_or(0);
+                    drop(rw);
+
+                    // aarch64/opassembler.py:921-929: mask includes CARDS_SET for array ops.
+                    let wb_mask = if is_array && wb_cards_set != 0 {
+                        (wb_mask_raw as i64) | (-0x80i64) // jit_wb_if_flag_singlebyte | -0x80
+                    } else {
+                        wb_mask_raw as i64
+                    };
+
+                    let flag_byte =
+                        builder
+                            .ins()
+                            .load(cl_types::I8, MemFlags::trusted(), obj, wb_byteofs);
+                    let flag_ext = builder.ins().uextend(cl_types::I64, flag_byte);
+                    let mask_val = builder.ins().iconst(cl_types::I64, wb_mask & 0xFF);
+                    let test = builder.ins().band(flag_ext, mask_val);
+                    let zero = builder.ins().iconst(cl_types::I64, 0);
+                    let needs_wb = builder.ins().icmp(IntCC::NotEqual, test, zero);
+
+                    // Branch: if flag not set, skip entirely.
+                    let slow_block = builder.create_block();
+                    let cont_block = builder.create_block();
+                    builder
+                        .ins()
+                        .brif(needs_wb, slow_block, &[], cont_block, &[]);
+
+                    // Slow path block.
+                    builder.switch_to_block(slow_block);
+                    builder.seal_block(slow_block);
+
+                    if is_array && wb_cards_set != 0 {
+                        // aarch64/opassembler.py:944-946: card marking fast path.
+                        // Test GCFLAG_CARDS_SET separately.
+                        let cards_mask = builder.ins().iconst(cl_types::I64, 0x80);
+                        let cards_test = builder.ins().band(flag_ext, cards_mask);
+                        let has_cards = builder.ins().icmp(IntCC::NotEqual, cards_test, zero);
+
+                        let wb_call_block = builder.create_block();
+                        let card_block = builder.create_block();
+                        builder
+                            .ins()
+                            .brif(has_cards, card_block, &[], wb_call_block, &[]);
+
+                        // Write barrier call (no cards set yet).
+                        builder.switch_to_block(wb_call_block);
+                        builder.seal_block(wb_call_block);
+                        let runtime_id = builder.ins().iconst(cl_types::I64, runtime_id_val as i64);
+                        let _ = emit_host_call(
+                            &mut builder,
+                            ptr_type,
+                            call_conv,
+                            gc_write_barrier_shim as *const () as usize,
+                            &[runtime_id, obj],
+                            None,
+                        );
+                        builder.ins().jump(cont_block, &[]);
+
+                        // aarch64/opassembler.py:996-1015: card bit setting.
+                        // byteofs = ~(index >> (card_page_shift + 3))
+                        // bit_index = (index >> card_page_shift) & 7
+                        // obj[byteofs] |= (1 << bit_index)
+                        builder.switch_to_block(card_block);
+                        builder.seal_block(card_block);
+                        let index = resolve_opref(&mut builder, &constants, op.arg(1));
+                        let shift_plus_3 = (wb_card_shift + 3) as i64;
+                        let shifted = builder.ins().ushr_imm(index, shift_plus_3);
+                        let byteofs = builder.ins().bnot(shifted);
+                        // bit_index = (index >> card_page_shift) & 7
+                        let bit_idx = builder.ins().ushr_imm(index, wb_card_shift as i64);
+                        let seven = builder.ins().iconst(cl_types::I64, 7);
+                        let bit_idx = builder.ins().band(bit_idx, seven);
+                        let one = builder.ins().iconst(cl_types::I64, 1);
+                        let bit_mask = builder.ins().ishl(one, bit_idx);
+                        // Load existing card byte, OR, store back.
+                        let card_addr = builder.ins().iadd(obj, byteofs);
+                        let card_byte =
+                            builder
+                                .ins()
+                                .load(cl_types::I8, MemFlags::trusted(), card_addr, 0);
+                        let card_ext = builder.ins().uextend(cl_types::I64, card_byte);
+                        let card_new = builder.ins().bor(card_ext, bit_mask);
+                        let card_trunc = builder.ins().ireduce(cl_types::I8, card_new);
+                        builder
+                            .ins()
+                            .store(MemFlags::trusted(), card_trunc, card_addr, 0);
+                        builder.ins().jump(cont_block, &[]);
+                    } else {
+                        // Simple write barrier (no card marking).
+                        let runtime_id = builder.ins().iconst(cl_types::I64, runtime_id_val as i64);
+                        let _ = emit_host_call(
+                            &mut builder,
+                            ptr_type,
+                            call_conv,
+                            gc_write_barrier_shim as *const () as usize,
+                            &[runtime_id, obj],
+                            None,
+                        );
+                        builder.ins().jump(cont_block, &[]);
+                    }
+
+                    // Continue after the conditional barrier.
+                    builder.switch_to_block(cont_block);
+                    builder.seal_block(cont_block);
                 }
 
                 // ── Generic GC/raw memory loads ──

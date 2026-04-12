@@ -107,6 +107,11 @@ struct RewriteState {
     next_pos: u32,
     /// Constant pool (from optimizer) — maps OpRef key → i64 value.
     constants: HashMap<u32, i64>,
+    /// rewrite.py:930 parity: track result types per OpRef so we can
+    /// check `v.type == 'r'` on the stored value, not the descriptor.
+    result_types: HashMap<u32, Type>,
+    /// Constant type annotations (from optimizer) — maps OpRef key → Type.
+    constant_types: HashMap<u32, Type>,
 
     // ── Nursery batching ──
     /// The index in `out` of the current CALL_MALLOC_NURSERY op, if any.
@@ -158,6 +163,8 @@ impl RewriteState {
             out: Vec::with_capacity(hint + hint / 4),
             next_pos,
             constants: HashMap::new(),
+            result_types: HashMap::new(),
+            constant_types: HashMap::new(),
             pending_malloc_idx: None,
             pending_malloc_total: 0,
             previous_size: 0,
@@ -245,6 +252,24 @@ impl RewriteState {
 
     fn wb_already_applied(&self, r: OpRef) -> bool {
         self.wb_applied.contains(&r.0)
+    }
+
+    /// rewrite.py:930 parity: `v.type` — get the result type of an OpRef.
+    fn result_type_of(&self, r: OpRef) -> Option<Type> {
+        self.result_types
+            .get(&r.0)
+            .copied()
+            .or_else(|| self.constant_types.get(&r.0).copied())
+    }
+
+    /// rewrite.py:930 parity: `isinstance(v, ConstPtr) and not needs_write_barrier(v.value)`.
+    /// A null ConstPtr never needs a write barrier.
+    fn is_null_constant(&self, r: OpRef) -> bool {
+        if let Some(&val) = self.constants.get(&r.0) {
+            val == 0
+        } else {
+            false
+        }
     }
 
     fn resolve(&self, r: OpRef) -> OpRef {
@@ -495,15 +520,15 @@ impl GcRewriterImpl {
             }
         }
 
-        // Determine whether the stored value is a Ref type from the field descriptor.
-        let is_ref_store = op
-            .descr
-            .as_ref()
-            .and_then(|d| d.as_field_descr())
-            .map(|fd| fd.is_pointer_field())
-            .unwrap_or(false);
+        // rewrite.py:930-931: check the stored VALUE's type, not the descriptor.
+        //   v = op.getarg(1)
+        //   if (v.type == 'r' and (not isinstance(v, ConstPtr) or
+        //       rgc.needs_write_barrier(v.value))):
+        let val = rewritten.arg(1);
+        let val_is_ref = st.result_type_of(val) == Some(Type::Ref);
+        let is_null_const = val_is_ref && st.is_null_constant(val);
 
-        if is_ref_store && !st.wb_already_applied(obj) {
+        if val_is_ref && !is_null_const && !st.wb_already_applied(obj) {
             // Emit COND_CALL_GC_WB(obj) before the store.
             let wb_op = Op::new(OpCode::CondCallGcWb, &[obj]);
             st.emit(wb_op);
@@ -746,12 +771,29 @@ impl GcRewriter for GcRewriterImpl {
         ops: &[Op],
         constants: &HashMap<u32, i64>,
     ) -> (Vec<Op>, HashMap<u32, i64>) {
+        self.rewrite_for_gc_with_constants_typed(ops, constants, &HashMap::new())
+    }
+
+    fn rewrite_for_gc_with_constants_typed(
+        &self,
+        ops: &[Op],
+        constants: &HashMap<u32, i64>,
+        constant_types: &HashMap<u32, Type>,
+    ) -> (Vec<Op>, HashMap<u32, i64>) {
         let next_pos = ops
             .iter()
             .filter_map(|op| (!op.pos.is_none()).then_some(op.pos.0))
             .max()
             .map_or(0, |max_pos| max_pos.saturating_add(1));
         let mut st = RewriteState::with_constants(ops.len(), next_pos, constants.clone());
+        st.constant_types = constant_types.clone();
+        // Build result_types map from input ops (rewrite.py:930 parity for v.type).
+        for op in ops {
+            let rt = op.result_type();
+            if rt != Type::Void && !op.pos.is_none() {
+                st.result_types.insert(op.pos.0, rt);
+            }
+        }
 
         for op in ops {
             if !matches!(

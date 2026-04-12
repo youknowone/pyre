@@ -385,6 +385,18 @@ pub trait GcRewriter: Send {
         ops: &[Op],
         constants: &std::collections::HashMap<u32, i64>,
     ) -> (Vec<Op>, std::collections::HashMap<u32, i64>) {
+        self.rewrite_for_gc_with_constants_typed(ops, constants, &std::collections::HashMap::new())
+    }
+    /// Rewrite with constant pool + constant type annotations.
+    /// `constant_types` maps OpRef key → Type for constants, needed for
+    /// rewrite.py:930 `v.type == 'r'` on ConstPtr values.
+    fn rewrite_for_gc_with_constants_typed(
+        &self,
+        ops: &[Op],
+        constants: &std::collections::HashMap<u32, i64>,
+        constant_types: &std::collections::HashMap<u32, majit_ir::Type>,
+    ) -> (Vec<Op>, std::collections::HashMap<u32, i64>) {
+        let _ = constant_types;
         let _ = constants;
         (self.rewrite_for_gc(ops), std::collections::HashMap::new())
     }
