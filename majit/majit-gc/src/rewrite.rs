@@ -785,6 +785,14 @@ impl GcRewriter for GcRewriterImpl {
                 // Skip debug merge points (they carry no semantics).
                 OpCode::DebugMergePoint => continue,
 
+                // rewrite.py:382+1003-1006 emit_label: reset nursery
+                // allocation merging state at basic block boundaries.
+                OpCode::Label => {
+                    st.emitting_can_collect();
+                    let rewritten = st.rewrite_op(op);
+                    st.emit_rewritten_from(op, rewritten);
+                }
+
                 // ── Allocation ──
                 OpCode::New | OpCode::NewWithVtable => {
                     self.handle_new(op, &mut st);
