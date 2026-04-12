@@ -818,6 +818,13 @@ impl MIFrame {
     /// (SwitchToBlackhole parity).
     fn vable_after_residual_call(&mut self) -> Result<(), PyError> {
         // pyjitpl.py:3350-3351: if vinfo is not None:
+        // RPython parity: use the same gate as before_residual_call
+        // (ctx.standard_virtualizable_box). If before didn't set
+        // TOKEN_TRACING_RESCALL (no vbox), after must not check it.
+        let has_vbox = self.with_ctx(|_, ctx| ctx.standard_virtualizable_box().is_some());
+        if !has_vbox {
+            return Ok(());
+        }
         let obj_ptr = self.sym().concrete_vable_ptr;
         if obj_ptr.is_null() {
             return Ok(());

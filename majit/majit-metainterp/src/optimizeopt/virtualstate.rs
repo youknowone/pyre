@@ -358,16 +358,14 @@ impl VirtualStateInfo {
                 }
                 // rawbuffer.py:83: _descrs_are_compatible — two arraydescrs are
                 // compatible if they have the same basesize, itemsize and sign,
-                // even if they are not identical.  RPython unconditionally
-                // accesses .basesize/.itemsize/.is_item_signed() on descrs.
+                // even if they are not identical (unpack_arraydescr_size parity).
                 if d1.len() != d2.len()
                     || !d1.iter().zip(d2.iter()).all(|(a, b)| {
-                        let a1 = a
-                            .as_array_descr()
-                            .expect("raw buffer descr must be ArrayDescr");
-                        let a2 = b
-                            .as_array_descr()
-                            .expect("raw buffer descr must be ArrayDescr");
+                        let (Some(a1), Some(a2)) = (a.as_array_descr(), b.as_array_descr()) else {
+                            // rawbuffer.py:86-87: unpack_arraydescr_size requires
+                            // array descrs. Non-array descrs are incompatible.
+                            return false;
+                        };
                         a1.base_size() == a2.base_size()
                             && a1.item_size() == a2.item_size()
                             && a1.is_item_signed() == a2.is_item_signed()

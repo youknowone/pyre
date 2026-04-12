@@ -81,6 +81,12 @@ impl Nursery {
     /// post-collection reset).
     #[inline]
     pub fn alloc(&mut self, total_size: usize) -> *mut u8 {
+        // incminimark.py:676 — self.nursery_free is the SAME location the
+        // JIT inline bump path writes to (gc_adr_of_nursery_free). Sync
+        // from the global before reading, so we see JIT's latest bump.
+        unsafe {
+            self.free = NURSERY_FREE_ADDR;
+        }
         // Ensure minimum size for forwarding during collection.
         let total_size = total_size.max(GcHeader::MIN_NURSERY_OBJ_SIZE);
         // Align to 8 bytes.
