@@ -665,35 +665,10 @@ impl UnrollOptimizer {
         // already in `[p2_high_water..)`, which is above both the
         // shared range `[0..body_num_inputs)` and the Phase 1 emitted
         // range `[num_inputs..next_global_opref)`, so they stay put.
-        if phase2_inputarg_base > 0 {
-            let end = phase2_inputarg_base + body_num_inputs as u32;
-            let shift_back = |opref: OpRef| -> OpRef {
-                if !opref.is_none()
-                    && !opref.is_constant()
-                    && opref.0 >= phase2_inputarg_base
-                    && opref.0 < end
-                {
-                    OpRef(opref.0 - phase2_inputarg_base)
-                } else {
-                    opref
-                }
-            };
-            for op in p2_ops.iter_mut() {
-                for arg in op.args.iter_mut() {
-                    *arg = shift_back(*arg);
-                }
-                if let Some(ref mut fa) = op.fail_args {
-                    for arg in fa.iter_mut() {
-                        *arg = shift_back(*arg);
-                    }
-                }
-            }
-            if let Some(ref mut label_args) = opt_p2.imported_label_args {
-                for arg in label_args.iter_mut() {
-                    *arg = shift_back(*arg);
-                }
-            }
-        }
+        // D2 shift_back shim removed: the assembly now natively handles
+        // disjoint Phase 2 inputarg OpRefs via the inputarg_base parameter.
+        // Phase 2 inputarg OpRefs at [phase2_inputarg_base..+body_num_inputs)
+        // flow directly into the assembly without translation.
         // Phase 2 may discover new constants via make_constant (e.g., guard
         // class pointers from collect_use_box_guards).
         // Merge back into consts_p2 so the backend can resolve them.
@@ -1205,6 +1180,7 @@ impl UnrollOptimizer {
             &sp.used_boxes,
             &sp.jump_args,
             p2_ni,
+            phase2_inputarg_base,
             jump_to_self,
             &imported_short_aliases,
             &imported_short_sources,
@@ -3665,6 +3641,7 @@ fn assemble_peeled_trace(
         extra_label_args,
         extra_label_args,
         body_num_inputs,
+        0, // inputarg_base — tests/simple cases use shared namespace
         jump_to_self,
         imported_short_aliases,
         imported_short_sources,
@@ -3684,6 +3661,7 @@ fn assemble_peeled_trace_with_jump_args(
     extra_label_args: &[OpRef],
     extra_jump_args: &[OpRef],
     body_num_inputs: usize,
+    inputarg_base: u32,
     jump_to_self: bool,
     imported_short_aliases: &[crate::optimizeopt::ImportedShortAlias],
     imported_short_sources: &[crate::optimizeopt::ImportedShortSource],
@@ -3730,7 +3708,7 @@ fn assemble_peeled_trace_with_jump_args(
     }
 
     let mut next_free_pos = |mut next: u32| {
-        next = next.max(body_num_inputs as u32);
+        next = next.max(inputarg_base + body_num_inputs as u32);
         while constants.contains_key(&next) {
             next += 1;
         }
@@ -3741,8 +3719,8 @@ fn assemble_peeled_trace_with_jump_args(
     // In the flat OpRef model, inputargs don't have a defining op in `result`,
     // so consult `inputarg_types` first and only then fall back to the emitted op.
     let derive_same_as_opcode = |source: OpRef, result: &[Op]| -> OpCode {
-        if (source.0 as usize) < body_num_inputs {
-            if let Some(tp) = inputarg_types.get(source.0 as usize) {
+        if source.0 >= inputarg_base && (source.0 - inputarg_base) < body_num_inputs as u32 {
+            if let Some(tp) = inputarg_types.get((source.0 - inputarg_base) as usize) {
                 return OpCode::same_as_for_type(*tp);
             }
         }
@@ -3776,7 +3754,7 @@ fn assemble_peeled_trace_with_jump_args(
         .map(|op| op.pos.0)
         .filter(|&p| p != u32::MAX)
         .max()
-        .unwrap_or(body_num_inputs as u32);
+        .unwrap_or(inputarg_base + body_num_inputs as u32);
     let p1_all_max = p1_ops
         .iter()
         .map(|op| op.pos.0)
@@ -3869,8 +3847,9 @@ fn assemble_peeled_trace_with_jump_args(
     // Collect preamble-defined OpRefs BEFORE adding extra label args,
     // so we can filter out virtual remnants (removed New ops).
     let preamble_defs: std::collections::HashSet<OpRef> = {
-        let mut s: std::collections::HashSet<OpRef> =
-            (0..body_num_inputs).map(|i| OpRef(i as u32)).collect();
+        let mut s: std::collections::HashSet<OpRef> = (0..body_num_inputs)
+            .map(|i| OpRef(inputarg_base + i as u32))
+            .collect();
         for op in &result {
             if !op.pos.is_none() && op.opcode != OpCode::Jump && op.result_type() != Type::Void {
                 s.insert(op.pos);
