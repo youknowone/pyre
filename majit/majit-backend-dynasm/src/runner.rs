@@ -15,15 +15,15 @@ use majit_backend::{
 };
 use majit_ir::{FailDescr, GcRef, InputArg, Op, Type, Value};
 
-use crate::arch;
 #[cfg(target_arch = "aarch64")]
 use crate::aarch64::assembler::{AssemblerARM64 as Asm, CompiledCode};
-#[cfg(target_arch = "x86_64")]
-use crate::x86::assembler::{Assembler386 as Asm, CompiledCode};
+use crate::arch;
 use crate::codebuf;
 use crate::frame::FrameData;
 use crate::guard::DynasmFailDescr;
 use crate::jitframe::JitFrame;
+#[cfg(target_arch = "x86_64")]
+use crate::x86::assembler::{Assembler386 as Asm, CompiledCode};
 
 /// Global CALL_ASSEMBLER target registry.
 ///
@@ -498,7 +498,8 @@ impl Backend for DynasmBackend {
                 if descr.bridge_addr() != 0 && descr.adr_jump_offset() == 0 {
                     eprintln!(
                         "[dynasm] bridge-patched guard fi={} bridge_addr={:#x} ajo=0 (patched)",
-                        descr.fail_index, descr.bridge_addr()
+                        descr.fail_index,
+                        descr.bridge_addr()
                     );
                 }
             }

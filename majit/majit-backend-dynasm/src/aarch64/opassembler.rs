@@ -105,55 +105,55 @@ impl AssemblerARM64 {
             return;
         }
         // Integer load with size/sign
-            if let Some(r) = ofs_reg {
-                match (size, signed) {
-                    (1, false) => {
-                        dynasm!(self.mc ; .arch aarch64 ; ldrb W(dst.value), [X(base.value), X(r.value)])
-                    }
-                    (1, true) => {
-                        dynasm!(self.mc ; .arch aarch64 ; ldrsb X(dst.value), [X(base.value), X(r.value)])
-                    }
-                    (2, false) => {
-                        dynasm!(self.mc ; .arch aarch64 ; ldrh W(dst.value), [X(base.value), X(r.value)])
-                    }
-                    (2, true) => {
-                        dynasm!(self.mc ; .arch aarch64 ; ldrsh X(dst.value), [X(base.value), X(r.value)])
-                    }
-                    (4, false) => {
-                        dynasm!(self.mc ; .arch aarch64 ; ldr W(dst.value), [X(base.value), X(r.value)])
-                    }
-                    (4, true) => {
-                        dynasm!(self.mc ; .arch aarch64 ; ldrsw X(dst.value), [X(base.value), X(r.value)])
-                    }
-                    _ => {
-                        dynasm!(self.mc ; .arch aarch64 ; ldr X(dst.value), [X(base.value), X(r.value)])
-                    }
+        if let Some(r) = ofs_reg {
+            match (size, signed) {
+                (1, false) => {
+                    dynasm!(self.mc ; .arch aarch64 ; ldrb W(dst.value), [X(base.value), X(r.value)])
                 }
-            } else {
-                match (size, signed) {
-                    (1, false) => {
-                        dynasm!(self.mc ; .arch aarch64 ; ldrb W(dst.value), [X(base.value), ofs as u32])
-                    }
-                    (1, true) => {
-                        dynasm!(self.mc ; .arch aarch64 ; ldrsb X(dst.value), [X(base.value), ofs as u32])
-                    }
-                    (2, false) => {
-                        dynasm!(self.mc ; .arch aarch64 ; ldrh W(dst.value), [X(base.value), ofs as u32])
-                    }
-                    (2, true) => {
-                        dynasm!(self.mc ; .arch aarch64 ; ldrsh X(dst.value), [X(base.value), ofs as u32])
-                    }
-                    (4, false) => {
-                        dynasm!(self.mc ; .arch aarch64 ; ldr W(dst.value), [X(base.value), ofs as u32])
-                    }
-                    (4, true) => {
-                        dynasm!(self.mc ; .arch aarch64 ; ldrsw X(dst.value), [X(base.value), ofs as u32])
-                    }
-                    _ => {
-                        dynasm!(self.mc ; .arch aarch64 ; ldr X(dst.value), [X(base.value), ofs as u32])
-                    }
+                (1, true) => {
+                    dynasm!(self.mc ; .arch aarch64 ; ldrsb X(dst.value), [X(base.value), X(r.value)])
+                }
+                (2, false) => {
+                    dynasm!(self.mc ; .arch aarch64 ; ldrh W(dst.value), [X(base.value), X(r.value)])
+                }
+                (2, true) => {
+                    dynasm!(self.mc ; .arch aarch64 ; ldrsh X(dst.value), [X(base.value), X(r.value)])
+                }
+                (4, false) => {
+                    dynasm!(self.mc ; .arch aarch64 ; ldr W(dst.value), [X(base.value), X(r.value)])
+                }
+                (4, true) => {
+                    dynasm!(self.mc ; .arch aarch64 ; ldrsw X(dst.value), [X(base.value), X(r.value)])
+                }
+                _ => {
+                    dynasm!(self.mc ; .arch aarch64 ; ldr X(dst.value), [X(base.value), X(r.value)])
                 }
             }
+        } else {
+            match (size, signed) {
+                (1, false) => {
+                    dynasm!(self.mc ; .arch aarch64 ; ldrb W(dst.value), [X(base.value), ofs as u32])
+                }
+                (1, true) => {
+                    dynasm!(self.mc ; .arch aarch64 ; ldrsb X(dst.value), [X(base.value), ofs as u32])
+                }
+                (2, false) => {
+                    dynasm!(self.mc ; .arch aarch64 ; ldrh W(dst.value), [X(base.value), ofs as u32])
+                }
+                (2, true) => {
+                    dynasm!(self.mc ; .arch aarch64 ; ldrsh X(dst.value), [X(base.value), ofs as u32])
+                }
+                (4, false) => {
+                    dynasm!(self.mc ; .arch aarch64 ; ldr W(dst.value), [X(base.value), ofs as u32])
+                }
+                (4, true) => {
+                    dynasm!(self.mc ; .arch aarch64 ; ldrsw X(dst.value), [X(base.value), ofs as u32])
+                }
+                _ => {
+                    dynasm!(self.mc ; .arch aarch64 ; ldr X(dst.value), [X(base.value), ofs as u32])
+                }
+            }
+        }
     }
 
     // ── emit_op_gc_store ──
@@ -197,36 +197,36 @@ impl AssemblerARM64 {
             }
             return;
         }
-            if let Some(r) = ofs_reg {
-                match size {
-                    1 => {
-                        dynasm!(self.mc ; .arch aarch64 ; strb W(val.value), [X(base.value), X(r.value)])
-                    }
-                    2 => {
-                        dynasm!(self.mc ; .arch aarch64 ; strh W(val.value), [X(base.value), X(r.value)])
-                    }
-                    4 => {
-                        dynasm!(self.mc ; .arch aarch64 ; str W(val.value), [X(base.value), X(r.value)])
-                    }
-                    _ => {
-                        dynasm!(self.mc ; .arch aarch64 ; str X(val.value), [X(base.value), X(r.value)])
-                    }
+        if let Some(r) = ofs_reg {
+            match size {
+                1 => {
+                    dynasm!(self.mc ; .arch aarch64 ; strb W(val.value), [X(base.value), X(r.value)])
                 }
-            } else {
-                match size {
-                    1 => {
-                        dynasm!(self.mc ; .arch aarch64 ; strb W(val.value), [X(base.value), ofs as u32])
-                    }
-                    2 => {
-                        dynasm!(self.mc ; .arch aarch64 ; strh W(val.value), [X(base.value), ofs as u32])
-                    }
-                    4 => {
-                        dynasm!(self.mc ; .arch aarch64 ; str W(val.value), [X(base.value), ofs as u32])
-                    }
-                    _ => {
-                        dynasm!(self.mc ; .arch aarch64 ; str X(val.value), [X(base.value), ofs as u32])
-                    }
+                2 => {
+                    dynasm!(self.mc ; .arch aarch64 ; strh W(val.value), [X(base.value), X(r.value)])
+                }
+                4 => {
+                    dynasm!(self.mc ; .arch aarch64 ; str W(val.value), [X(base.value), X(r.value)])
+                }
+                _ => {
+                    dynasm!(self.mc ; .arch aarch64 ; str X(val.value), [X(base.value), X(r.value)])
                 }
             }
+        } else {
+            match size {
+                1 => {
+                    dynasm!(self.mc ; .arch aarch64 ; strb W(val.value), [X(base.value), ofs as u32])
+                }
+                2 => {
+                    dynasm!(self.mc ; .arch aarch64 ; strh W(val.value), [X(base.value), ofs as u32])
+                }
+                4 => {
+                    dynasm!(self.mc ; .arch aarch64 ; str W(val.value), [X(base.value), ofs as u32])
+                }
+                _ => {
+                    dynasm!(self.mc ; .arch aarch64 ; str X(val.value), [X(base.value), ofs as u32])
+                }
+            }
+        }
     }
 }

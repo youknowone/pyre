@@ -11,7 +11,6 @@
 ///   aarch64/opassembler.py  → aarch64/opassembler.rs (ResOpAssembler)
 ///
 /// arch.rs, codebuf.rs, guard.rs, regloc.rs are from llsupport/.
-
 // ── Shared modules (llsupport/ parity) ──
 pub mod arch;
 pub mod callbuilder;
