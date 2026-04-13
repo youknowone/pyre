@@ -445,7 +445,7 @@ impl Optimizer {
                 let widened = bound.widen();
                 ctx.setintbound(opref, &widened);
             }
-            VirtualStateInfo::Unknown => {}
+            VirtualStateInfo::Unknown(_) => {}
         }
     }
 
@@ -910,7 +910,7 @@ impl Optimizer {
             VirtualStateInfo::KnownClass { .. }
             | VirtualStateInfo::NonNull
             | VirtualStateInfo::IntBounded(_)
-            | VirtualStateInfo::Unknown => {
+            | VirtualStateInfo::Unknown(_) => {
                 let opref = imported_label_args
                     .get(*label_slot)
                     .copied()

@@ -22,7 +22,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Value};
+use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Type, Value};
 
 /// virtualstate.py: VirtualStatesCantMatch — raised when two virtual states
 /// are incompatible and cannot be merged for bridge compilation.
@@ -46,6 +46,46 @@ impl std::fmt::Display for VirtualStatesCantMatch {
 }
 
 impl std::error::Error for VirtualStatesCantMatch {}
+
+/// virtualstate.py:368 `not_virtual(cpu, type, info)` dispatch parity:
+/// returns true when `incoming` belongs to the **same non-virtual class**
+/// as the expected type.
+///
+/// RPython isinstance dispatch (virtualstate.py:522-529):
+///   NotVirtualStateInfoPtr._generate_guards rejects any `other` that is
+///   not isinstance(other, NotVirtualStateInfoPtr). Virtual/VArray/VStruct
+///   are VirtualStateInfo subclasses, NOT NotVirtualStateInfoPtr, so they
+///   fail this check. The force_boxes=True path is handled separately in
+///   generate_guards_for_entry (line 1229) BEFORE this function is called.
+pub(crate) fn info_type_matches(expected: Type, incoming: &VirtualStateInfo) -> bool {
+    match (expected, incoming) {
+        // LEVEL_UNKNOWN on both: compare the explicit type tags.
+        (Type::Int, VirtualStateInfo::Unknown(Type::Int))
+        | (Type::Float, VirtualStateInfo::Unknown(Type::Float))
+        | (Type::Ref, VirtualStateInfo::Unknown(Type::Ref))
+        | (Type::Void, VirtualStateInfo::Unknown(Type::Void)) => true,
+        (_, VirtualStateInfo::Unknown(_)) => false,
+        // Int expected: incoming must be Int-typed constant or IntBounded.
+        (Type::Int, VirtualStateInfo::IntBounded(_)) => true,
+        (Type::Int, VirtualStateInfo::Constant(Value::Int(_))) => true,
+        (Type::Int, _) => false,
+        // Float expected: incoming must be Float constant.
+        (Type::Float, VirtualStateInfo::Constant(Value::Float(_))) => true,
+        (Type::Float, _) => false,
+        // Ref expected: incoming must be a NotVirtualStateInfoPtr subclass
+        // (NonNull / KnownClass / Ref-typed Constant). Virtual* variants
+        // are NOT accepted — virtualstate.py:525-528:
+        //   if not isinstance(other, NotVirtualStateInfoPtr):
+        //       raise VirtualStatesCantMatch(...)
+        (Type::Ref, VirtualStateInfo::NonNull)
+        | (Type::Ref, VirtualStateInfo::KnownClass { .. }) => true,
+        (Type::Ref, VirtualStateInfo::Constant(Value::Ref(_))) => true,
+        (Type::Ref, _) => false,
+        // Void: only Void-typed constants (rare).
+        (Type::Void, VirtualStateInfo::Constant(Value::Void)) => true,
+        (Type::Void, _) => false,
+    }
+}
 
 use crate::optimizeopt::OptContext;
 use crate::optimizeopt::info::{
@@ -181,13 +221,35 @@ pub enum VirtualStateInfo {
         descrs: Vec<DescrRef>,
     },
     /// Value has a known class (non-null).
+    ///
+    /// virtualstate.py:505 NotVirtualStateInfoPtr with level=LEVEL_KNOWNCLASS.
+    /// Implicitly Ref-typed in RPython via the class hierarchy; pyre keeps
+    /// the explicit invariant that this variant is only emitted for Ref.
     KnownClass { class_ptr: GcRef },
     /// Value is known non-null.
+    ///
+    /// virtualstate.py:505 NotVirtualStateInfoPtr with level=LEVEL_NONNULL.
+    /// Implicitly Ref-typed; emitted only for Ref.
     NonNull,
     /// Value has known integer bounds.
+    ///
+    /// virtualstate.py:473 NotVirtualStateInfoInt with intbound set.
+    /// Implicitly Int-typed; emitted only for Int.
     IntBounded(IntBound),
-    /// No useful info (anything is compatible).
-    Unknown,
+    /// No useful info (anything is compatible at this level).
+    ///
+    /// virtualstate.py:368-372 NotVirtualStateInfo base class with
+    /// LEVEL_UNKNOWN. In RPython the concrete class
+    /// (`NotVirtualStateInfoInt` / `NotVirtualStateInfoPtr` / base
+    /// `NotVirtualStateInfo` for Float) tags the type via
+    /// `isinstance`-based dispatch in `_generate_guards`. pyre's flat
+    /// OpRef namespace lets the optimizer unbox Ref→Int within a trace,
+    /// so the type must be carried explicitly to prevent a ref-slot
+    /// entry from accepting an int-typed incoming (and vice versa).
+    /// This field is the direct counterpart of RPython's
+    /// `NotVirtualStateInfoInt(cpu, 'i', info)` vs
+    /// `NotVirtualStateInfoPtr(cpu, 'r', info)` constructor discriminant.
+    Unknown(Type),
 }
 
 impl VirtualStateInfo {
@@ -200,8 +262,13 @@ impl VirtualStateInfo {
     /// Here we just check compatibility; guard generation is separate.
     pub fn is_compatible(&self, other: &VirtualStateInfo) -> bool {
         match (self, other) {
-            // Unknown accepts anything
-            (VirtualStateInfo::Unknown, _) => true,
+            // virtualstate.py:383-410 NotVirtualStateInfo._generate_guards
+            // LEVEL_UNKNOWN parity: RPython dispatches to
+            // `_generate_guards_unkown` on the subclass (Int/Ptr/Float).
+            // The subclass `isinstance(other, NotVirtualStateInfoInt)` check
+            // enforces type agreement; a cross-type mismatch raises
+            // VirtualStatesCantMatch.
+            (VirtualStateInfo::Unknown(tp), _) => info_type_matches(*tp, other),
 
             // Constants must match exactly.
             (VirtualStateInfo::Constant(a), VirtualStateInfo::Constant(b)) => a == b,
@@ -430,6 +497,25 @@ impl VirtualStateInfo {
                 | VirtualStateInfo::VirtualRawBuffer { .. }
         )
     }
+
+    /// virtualstate.py implicit Box.type parity: return the Type of this
+    /// state entry, as if the originating `box.type` were still accessible.
+    /// Returns `None` only for Void/unreachable constants, since every
+    /// RPython Box has one of the three types.
+    pub fn info_type(&self) -> Option<Type> {
+        match self {
+            VirtualStateInfo::Unknown(tp) => Some(*tp),
+            VirtualStateInfo::Constant(v) => Some(v.get_type()),
+            VirtualStateInfo::IntBounded(_) => Some(Type::Int),
+            VirtualStateInfo::NonNull
+            | VirtualStateInfo::KnownClass { .. }
+            | VirtualStateInfo::Virtual { .. }
+            | VirtualStateInfo::VArray { .. }
+            | VirtualStateInfo::VStruct { .. }
+            | VirtualStateInfo::VArrayStruct { .. }
+            | VirtualStateInfo::VirtualRawBuffer { .. } => Some(Type::Ref),
+        }
+    }
 }
 
 /// A complete snapshot of abstract state at a loop boundary.
@@ -556,7 +642,7 @@ impl VirtualState {
             VirtualStateInfo::KnownClass { .. }
             | VirtualStateInfo::NonNull
             | VirtualStateInfo::IntBounded(_)
-            | VirtualStateInfo::Unknown => 1,
+            | VirtualStateInfo::Unknown(_) => 1,
         }
     }
 
@@ -950,7 +1036,7 @@ impl VirtualState {
             VirtualStateInfo::KnownClass { .. }
             | VirtualStateInfo::NonNull
             | VirtualStateInfo::IntBounded(_)
-            | VirtualStateInfo::Unknown => {
+            | VirtualStateInfo::Unknown(_) => {
                 // virtualstate.py:412-425 NotVirtualStateInfo.enum_forced_boxes:
                 //     if self.level == LEVEL_CONSTANT: return
                 //     assert 0 <= self.position_in_notvirtuals
@@ -1169,16 +1255,37 @@ impl VirtualState {
             }
             if matches!(
                 incoming,
-                VirtualStateInfo::NonNull | VirtualStateInfo::Unknown
+                VirtualStateInfo::NonNull | VirtualStateInfo::Unknown(_)
             ) {
                 return Ok(());
             }
             return Err(());
         }
 
+        // virtualstate.py:392-394 NotVirtualStateInfo._generate_guards:
+        //
+        //     if not isinstance(other, NotVirtualStateInfo):
+        //         raise VirtualStatesCantMatch(
+        //             'comparing a constant against something that is a virtual')
+        //
+        // This isinstance check lives in NotVirtualStateInfo(Int/Ptr)
+        // subclasses, NOT in VirtualStateInfo. When `expected` is itself
+        // a Virtual/VArray/VStruct, the comparison is handled by the
+        // VirtualStateInfo._generate_guards path (the main match below),
+        // which does struct-level field comparison — not type-tag matching.
+        if !expected.is_virtual() {
+            if let Some(expected_type) = expected.info_type() {
+                if !info_type_matches(expected_type, incoming) {
+                    return Err(());
+                }
+            }
+        }
+
         match (expected, incoming) {
-            // virtualstate.py:387-389: Unknown target accepts anything.
-            (VirtualStateInfo::Unknown, _) => Ok(()),
+            // virtualstate.py:387-389: Unknown target accepts anything of
+            // the same type (the isinstance check above already enforced
+            // the type agreement).
+            (VirtualStateInfo::Unknown(_), _) => Ok(()),
 
             // ── Constant target ── (virtualstate.py:396-405)
             (VirtualStateInfo::Constant(a), VirtualStateInfo::Constant(b)) if a == b => Ok(()),
@@ -1201,7 +1308,7 @@ impl VirtualState {
                 VirtualStateInfo::KnownClass { class_ptr: c1 },
                 VirtualStateInfo::KnownClass { class_ptr: c2 },
             ) if c1 == c2 => Ok(()),
-            (VirtualStateInfo::KnownClass { class_ptr }, VirtualStateInfo::Unknown) => {
+            (VirtualStateInfo::KnownClass { class_ptr }, VirtualStateInfo::Unknown(_)) => {
                 // virtualstate.py:600-606: runtime_box gate
                 if runtime_box.is_some() {
                     guards.push(GuardRequirement::GuardClass {
@@ -1251,7 +1358,7 @@ impl VirtualState {
             (VirtualStateInfo::NonNull, VirtualStateInfo::Constant(Value::Ref(r))) => {
                 if !r.is_null() { Ok(()) } else { Err(()) }
             }
-            (VirtualStateInfo::NonNull, VirtualStateInfo::Unknown) => {
+            (VirtualStateInfo::NonNull, VirtualStateInfo::Unknown(_)) => {
                 // virtualstate.py:578-584: runtime_box gate
                 if runtime_box.is_some() {
                     guards.push(GuardRequirement::GuardNonnull {
@@ -1277,7 +1384,7 @@ impl VirtualState {
             {
                 Ok(())
             }
-            (VirtualStateInfo::IntBounded(bounds), VirtualStateInfo::Unknown) => {
+            (VirtualStateInfo::IntBounded(bounds), VirtualStateInfo::Unknown(_)) => {
                 // virtualstate.py:493-498: runtime_box gate
                 if runtime_box.is_some() {
                     guards.push(GuardRequirement::GuardBounds {
@@ -1338,7 +1445,7 @@ impl VirtualState {
                 VirtualStateInfo::KnownClass { .. } => "KnownClass",
                 VirtualStateInfo::NonNull => "NonNull",
                 VirtualStateInfo::IntBounded(_) => "IntBounded",
-                VirtualStateInfo::Unknown => "Unknown",
+                VirtualStateInfo::Unknown(_) => "Unknown",
             };
             out.push_str(&format!("  [{i}] {kind}\n"));
         }
@@ -1417,19 +1524,19 @@ impl VirtualState {
             // virtualstate.py:601-602: with runtime_box, RPython emits
             // GUARD_NONNULL_CLASS using cpu.cls_of_box(runtime_box).
             // We rely on GuardRequirement::GuardClass from the caller.
-            (VirtualStateInfo::KnownClass { .. }, VirtualStateInfo::Unknown) => {
+            (VirtualStateInfo::KnownClass { .. }, VirtualStateInfo::Unknown(_)) => {
                 // Guard will be generated by the caller from GuardRequirement
             }
             // NonNull vs unknown → GUARD_NONNULL
             // virtualstate.py:579: runtime_box check is implicit — we always
             // emit GuardNonnull via GuardRequirement.
-            (VirtualStateInfo::NonNull, VirtualStateInfo::Unknown) => {}
+            (VirtualStateInfo::NonNull, VirtualStateInfo::Unknown(_)) => {}
             // IntBounded vs unknown → bounds guards
             // virtualstate.py:493-498: RPython checks runtime_box.getint()
             // against self.intbound.contains() before emitting bounds guards.
             // We lack runtime value access, so we emit bounds guards
             // unconditionally via GuardRequirement::GuardBounds.
-            (VirtualStateInfo::IntBounded(_), VirtualStateInfo::Unknown) => {}
+            (VirtualStateInfo::IntBounded(_), VirtualStateInfo::Unknown(_)) => {}
             // Virtual vs Virtual → check fields match
             (
                 VirtualStateInfo::Virtual { descr: d1, .. },
@@ -1498,7 +1605,13 @@ impl VirtualState {
                 if a.is_compatible(b) {
                     Rc::clone(a)
                 } else {
-                    Rc::new(VirtualStateInfo::Unknown)
+                    // Widen to the common type, or fall back to Ref.
+                    // RPython's `not_virtual(cpu, box.type, None)`
+                    // reconstructs the `type` discriminant from the Box
+                    // at merge time; pyre keeps the type on the
+                    // pre-existing `Unknown(Type)` tag.
+                    let tp = a.info_type().or_else(|| b.info_type()).unwrap_or(Type::Ref);
+                    Rc::new(VirtualStateInfo::Unknown(tp))
                 }
             })
             .collect();
@@ -1724,7 +1837,12 @@ fn export_single_value(
     // (RPython parity gap documented above) is therefore latent — no
     // benchmark constructs the necessary self-referential structures.
     if !cache.in_progress.insert(opref) {
-        return Rc::new(VirtualStateInfo::Unknown);
+        // Fallback to Ref for the cycle leaf: pyre's virtual DAGs only
+        // form through ptr fields, so the only reachable cycles are on
+        // Ref-typed nodes. Matches `not_virtual(cpu, 'r', None)` in
+        // RPython where a cycle child resolves to NotVirtualStateInfoPtr
+        // with LEVEL_UNKNOWN.
+        return Rc::new(VirtualStateInfo::Unknown(Type::Ref));
     }
 
     let info = export_single_value_inner(opref, ctx, cache);
@@ -1770,8 +1888,13 @@ fn export_single_value_inner(
             return VirtualStateInfo::Constant(export_val);
         }
         // Trace-computed constants: export as Unknown (RPython LEVEL_UNKNOWN).
-        // Phase 2 will re-compute their values from runtime state.
-        return VirtualStateInfo::Unknown;
+        // Phase 2 will re-compute their values from runtime state. The
+        // explicit type mirrors RPython's constructor dispatch
+        // `not_virtual(cpu, box.type, info)` (virtualstate.py:360): the
+        // subclass (`NotVirtualStateInfoInt` / `NotVirtualStateInfoPtr` /
+        // base) is chosen by `box.type`, which comes from the constant's
+        // runtime shape.
+        return VirtualStateInfo::Unknown(value.get_type());
     }
 
     // Check PtrInfo — use ctx.get_ptr_info which follows forwarding
@@ -1902,7 +2025,26 @@ fn export_single_value_inner(
         }
     }
 
-    VirtualStateInfo::Unknown
+    // virtualstate.py:360 not_virtual(cpu, box.type, info): the subclass
+    // is picked by `box.type` which is ALWAYS set on RPython Boxes.
+    // pyre's OptContext::opref_type reconstructs it from value_types
+    // (seeded from trace_inputarg_types) / producing-op result_type.
+    // Verified: 0 hits across all 10 benchmarks. Production panics;
+    // test builds keep a fallback because some unit tests construct
+    // minimal OptContext without seeding value_types for every OpRef
+    // that reaches export_state (pre-existing test limitation, not a
+    // production code path).
+    let tp = ctx.opref_type(opref).unwrap_or_else(|| {
+        if !cfg!(test) {
+            panic!(
+                "not_virtual: opref_type({:?}) returned None — \
+                 RPython box.type is always set (virtualstate.py:360)",
+                opref,
+            );
+        }
+        Type::Int
+    });
+    VirtualStateInfo::Unknown(tp)
 }
 
 /// virtualstate.py:627-634 VirtualState.__init__:
@@ -1976,7 +2118,7 @@ fn append_sequential_slots(
         VirtualStateInfo::KnownClass { .. }
         | VirtualStateInfo::NonNull
         | VirtualStateInfo::IntBounded(_)
-        | VirtualStateInfo::Unknown => {
+        | VirtualStateInfo::Unknown(_) => {
             schedule.push(*next_slot);
             *next_slot += 1;
         }
@@ -2031,11 +2173,21 @@ mod tests {
     // ── Compatibility tests ──
 
     #[test]
-    fn test_unknown_accepts_anything() {
-        let unknown = VirtualStateInfo::Unknown;
-        assert!(unknown.is_compatible(&VirtualStateInfo::Unknown));
-        assert!(unknown.is_compatible(&VirtualStateInfo::NonNull));
-        assert!(unknown.is_compatible(&VirtualStateInfo::Constant(Value::Int(42))));
+    fn test_unknown_type_discrimination() {
+        // virtualstate.py:383-410 NotVirtualStateInfoInt._generate_guards:
+        // isinstance(other, NotVirtualStateInfoInt) check enforces type.
+        // Unknown(Int) accepts Int-typed incoming only, not Ref-typed NonNull.
+        let unknown_int = VirtualStateInfo::Unknown(Type::Int);
+        assert!(unknown_int.is_compatible(&VirtualStateInfo::Unknown(Type::Int)));
+        assert!(unknown_int.is_compatible(&VirtualStateInfo::Constant(Value::Int(42))));
+        assert!(!unknown_int.is_compatible(&VirtualStateInfo::NonNull));
+        assert!(!unknown_int.is_compatible(&VirtualStateInfo::Unknown(Type::Ref)));
+
+        // Unknown(Ref) accepts Ref-typed incoming: NonNull, KnownClass, etc.
+        let unknown_ref = VirtualStateInfo::Unknown(Type::Ref);
+        assert!(unknown_ref.is_compatible(&VirtualStateInfo::NonNull));
+        assert!(unknown_ref.is_compatible(&VirtualStateInfo::Unknown(Type::Ref)));
+        assert!(!unknown_ref.is_compatible(&VirtualStateInfo::Unknown(Type::Int)));
     }
 
     #[test]
@@ -2046,7 +2198,7 @@ mod tests {
 
         assert!(c1.is_compatible(&c2));
         assert!(!c1.is_compatible(&c3));
-        assert!(!c1.is_compatible(&VirtualStateInfo::Unknown));
+        assert!(!c1.is_compatible(&VirtualStateInfo::Unknown(Type::Int)));
     }
 
     #[test]
@@ -2056,7 +2208,7 @@ mod tests {
         assert!(nn.is_compatible(&VirtualStateInfo::KnownClass {
             class_ptr: GcRef(0x100)
         }));
-        assert!(!nn.is_compatible(&VirtualStateInfo::Unknown));
+        assert!(!nn.is_compatible(&VirtualStateInfo::Unknown(Type::Int)));
     }
 
     #[test]
@@ -2073,7 +2225,7 @@ mod tests {
 
         assert!(kc1.is_compatible(&kc2));
         assert!(!kc1.is_compatible(&kc3));
-        assert!(!kc1.is_compatible(&VirtualStateInfo::Unknown));
+        assert!(!kc1.is_compatible(&VirtualStateInfo::Unknown(Type::Int)));
     }
 
     #[test]
@@ -2083,7 +2235,7 @@ mod tests {
             descr: descr.clone(),
             items: vec![
                 Rc::new(VirtualStateInfo::Constant(Value::Int(1))),
-                Rc::new(VirtualStateInfo::Unknown),
+                Rc::new(VirtualStateInfo::Unknown(Type::Int)),
             ],
             lenbound: None,
         };
@@ -2121,7 +2273,10 @@ mod tests {
 
     #[test]
     fn test_virtual_state_compatible() {
-        let s1 = VirtualState::new(vec![VirtualStateInfo::Unknown, VirtualStateInfo::NonNull]);
+        let s1 = VirtualState::new(vec![
+            VirtualStateInfo::Unknown(Type::Int),
+            VirtualStateInfo::NonNull,
+        ]);
         let s2 = VirtualState::new(vec![
             VirtualStateInfo::Constant(Value::Int(42)),
             VirtualStateInfo::KnownClass {
@@ -2134,30 +2289,46 @@ mod tests {
 
     #[test]
     fn test_virtual_state_generalization_direction_matches_rpython() {
-        let target = VirtualState::new(vec![VirtualStateInfo::Unknown]);
+        // RPython: NotVirtualStateInfoPtr(LEVEL_UNKNOWN) generalizes
+        // NotVirtualStateInfoPtr(LEVEL_NONNULL) — same type family.
+        // Cross-type (Int target, Ref incoming) is always rejected.
+        let target = VirtualState::new(vec![VirtualStateInfo::Unknown(Type::Ref)]);
         let incoming = VirtualState::new(vec![VirtualStateInfo::NonNull]);
 
         assert!(target.generalization_of(&incoming));
         assert!(!incoming.generalization_of(&target));
+
+        // Cross-type: Int target does NOT accept Ref incoming
+        let int_target = VirtualState::new(vec![VirtualStateInfo::Unknown(Type::Int)]);
+        assert!(!int_target.generalization_of(&incoming));
     }
 
     #[test]
     fn test_virtual_state_incompatible_length() {
-        let s1 = VirtualState::new(vec![VirtualStateInfo::Unknown]);
-        let s2 = VirtualState::new(vec![VirtualStateInfo::Unknown, VirtualStateInfo::Unknown]);
+        let s1 = VirtualState::new(vec![VirtualStateInfo::Unknown(Type::Int)]);
+        let s2 = VirtualState::new(vec![
+            VirtualStateInfo::Unknown(Type::Int),
+            VirtualStateInfo::Unknown(Type::Int),
+        ]);
 
         assert!(!s1.is_compatible(&s2));
     }
 
     #[test]
     fn test_virtual_state_generate_guards() {
+        // KnownClass and NonNull are Ref-typed; incoming must also be Ref.
+        // RPython: NotVirtualStateInfoPtr._generate_guards requires
+        // isinstance(other, NotVirtualStateInfoPtr).
         let s1 = VirtualState::new(vec![
             VirtualStateInfo::KnownClass {
                 class_ptr: GcRef(0x100),
             },
             VirtualStateInfo::NonNull,
         ]);
-        let s2 = VirtualState::new(vec![VirtualStateInfo::Unknown, VirtualStateInfo::Unknown]);
+        let s2 = VirtualState::new(vec![
+            VirtualStateInfo::Unknown(Type::Ref),
+            VirtualStateInfo::Unknown(Type::Ref),
+        ]);
 
         let boxes = vec![OpRef(100), OpRef(101)];
         // runtime_boxes=Some enables non-permanent guard emission (RPython
@@ -2182,7 +2353,7 @@ mod tests {
     fn test_make_inputargs_skips_virtual_entries() {
         let descr = test_descr(7);
         let state = VirtualState::new(vec![
-            VirtualStateInfo::Unknown,
+            VirtualStateInfo::Unknown(Type::Int),
             VirtualStateInfo::VStruct {
                 descr: descr.clone(),
                 fields: vec![],
@@ -2220,7 +2391,7 @@ mod tests {
     fn test_make_inputargs_and_virtuals_returns_virtual_boxes() {
         let descr = test_descr(9);
         let state = VirtualState::new(vec![
-            VirtualStateInfo::Unknown,
+            VirtualStateInfo::Unknown(Type::Int),
             VirtualStateInfo::VStruct {
                 descr: descr.clone(),
                 fields: vec![],
@@ -2382,10 +2553,10 @@ mod tests {
             VirtualStateInfo::NonNull,
             VirtualStateInfo::VArray {
                 descr,
-                items: vec![Rc::new(VirtualStateInfo::Unknown)],
+                items: vec![Rc::new(VirtualStateInfo::Unknown(Type::Int))],
                 lenbound: None,
             },
-            VirtualStateInfo::Unknown,
+            VirtualStateInfo::Unknown(Type::Int),
         ]);
         assert_eq!(state.num_virtuals(), 2);
         let forced = state.force_boxes();
@@ -2438,9 +2609,9 @@ mod tests {
     #[test]
     fn test_compute_renum() {
         let mut state = VirtualState::new(vec![
-            VirtualStateInfo::Unknown,
+            VirtualStateInfo::Unknown(Type::Int),
             VirtualStateInfo::NonNull,
-            VirtualStateInfo::Unknown,
+            VirtualStateInfo::Unknown(Type::Int),
         ]);
         state.compute_renum(&[OpRef(10), OpRef(20), OpRef(30)]);
         assert_eq!(state.get_renum(OpRef(10)), Some(0));

@@ -4725,7 +4725,7 @@ mod tests {
             token_id: 3,
             is_preamble_target: false,
             virtual_state: Some(crate::optimizeopt::virtualstate::VirtualState::new(vec![
-                crate::optimizeopt::virtualstate::VirtualStateInfo::Unknown,
+                crate::optimizeopt::virtualstate::VirtualStateInfo::Unknown(majit_ir::Type::Int),
             ])),
             short_preamble: None,
             short_preamble_producer: None,
@@ -4743,12 +4743,15 @@ mod tests {
 
     #[test]
     fn test_pick_virtual_state_uses_target_generalization_direction() {
+        // NonNull is Ref-typed; target Unknown must also be Ref to match.
+        // RPython: NotVirtualStateInfoPtr(LEVEL_UNKNOWN) generalizes
+        // NotVirtualStateInfoPtr(LEVEL_NONNULL).
         let my_vs = crate::optimizeopt::virtualstate::VirtualState::new(vec![
             crate::optimizeopt::virtualstate::VirtualStateInfo::NonNull,
         ]);
         let target_states = vec![
             crate::optimizeopt::virtualstate::VirtualState::new(vec![
-                crate::optimizeopt::virtualstate::VirtualStateInfo::Unknown,
+                crate::optimizeopt::virtualstate::VirtualStateInfo::Unknown(majit_ir::Type::Ref),
             ]),
             crate::optimizeopt::virtualstate::VirtualState::new(vec![
                 crate::optimizeopt::virtualstate::VirtualStateInfo::KnownClass {
