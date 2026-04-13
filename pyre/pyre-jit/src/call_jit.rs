@@ -160,44 +160,6 @@ pub(crate) fn self_recursive_function_entry_candidate(frame: &PyFrame) -> bool {
 /// over caller-side trace-through.
 ///
 /// This mirrors `self_recursive_function_entry_candidate(frame)` but starts
-/// from the callee object directly so caller-side inline decisions can leave
-/// recursive pure functions on the dedicated function-entry path.
-pub(crate) fn callable_prefers_function_entry(callable: PyObjectRef) -> bool {
-    unsafe {
-        if !is_function(callable)
-            || pyre_interpreter::is_builtin_code(
-                pyre_interpreter::function_get_code(callable) as pyre_object::PyObjectRef
-            )
-            || !function_get_closure(callable).is_null()
-        {
-            return false;
-        }
-        let globals = function_get_globals(callable);
-        let Some(namespace) = (!globals.is_null()).then_some(&*globals) else {
-            return false;
-        };
-        let w_code = pyre_interpreter::getcode(callable);
-
-        for idx in 0..namespace.len() {
-            let Some(value) = namespace.get_slot(idx) else {
-                continue;
-            };
-            if value.is_null() {
-                continue;
-            }
-            let is_candidate = is_function(value)
-                && pyre_interpreter::getcode(value) == w_code
-                && function_get_globals(value) == globals
-                && function_get_closure(value).is_null();
-            if is_candidate && recursive_force_cache_safe(value) {
-                return true;
-            }
-        }
-    }
-
-    false
-}
-
 /// Inline concrete-call override used only while `inline_trace_and_execute`
 /// is running. This avoids recursing back through `call_user_function()` for
 /// closure-free recursive calls and keeps concrete execution closer to
