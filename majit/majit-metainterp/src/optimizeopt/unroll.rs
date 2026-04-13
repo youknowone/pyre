@@ -382,21 +382,11 @@ impl UnrollOptimizer {
                             .map(|&arg| op_types.get(&arg).copied().unwrap_or(Type::Ref))
                             .collect();
                     }
-                    // Export Phase 1's heap cache for Phase 2.
-                    // bridgeopt.py:64-67: available_boxes = {box: None for box in liveboxes
-                    //                     if box is not None and box in liveboxes_from_env}
-                    // Phase 1 export: end_args are the available live boxes.
-                    let available_boxes: std::collections::HashSet<OpRef> =
-                        state.end_args.iter().copied().collect();
-                    // Temporarily take ctx out to avoid borrow conflict between
-                    // &mut final_ctx and &self.passes in export_all_*.
-                    if let Some(mut final_ctx) = opt_p1.final_ctx.take() {
-                        state.preamble_heap_cache =
-                            opt_p1.export_all_cached_fields(&mut final_ctx, Some(&available_boxes));
-                        state.preamble_heap_array_cache = opt_p1
-                            .export_all_cached_arrayitems(&mut final_ctx, Some(&available_boxes));
-                        opt_p1.final_ctx = Some(final_ctx);
-                    }
+                    // RPython Phase 1 → Phase 2 heap cache transfer:
+                    // RPython does NOT serialize heap cache in ExportedState.
+                    // HeapOps in the short preamble are replayed during Phase 2's
+                    // inline_short_preamble, populating the heap cache naturally
+                    // through OptHeap. serialize_optheap is only for bridgeopt.
                     // opencoder.py:271 _index parity: Phase 2's TraceIterator
                     // must allocate fresh boxes ABOVE Phase 1's high water
                     // mark so the two phases' OpRef namespaces are disjoint
@@ -1317,9 +1307,6 @@ pub struct ExportedState {
     /// inputargs that the preamble already read fields from. Mirrors
     /// `serialize_optheap` (heap.py:825-846) which returns
     /// `[(box1, descr, box2)]`.
-    pub preamble_heap_cache: Vec<(OpRef, majit_ir::DescrRef, OpRef)>,
-    /// heap.py:847-868: array item cache from Phase 1.
-    pub preamble_heap_array_cache: Vec<(OpRef, i64, majit_ir::DescrRef, OpRef)>,
     /// Virtual state at the loop boundary.
     pub virtual_state: crate::optimizeopt::virtualstate::VirtualState,
     /// unroll.py: exported_infos — optimizer knowledge from preamble.
@@ -1464,8 +1451,6 @@ impl ExportedState {
             end_args,
             next_iteration_args,
             end_arg_types: Vec::new(),
-            preamble_heap_cache: Vec::new(),
-            preamble_heap_array_cache: Vec::new(),
             virtual_state,
             exported_infos,
             exported_short_ops,
@@ -1705,8 +1690,6 @@ impl Clone for ExportedState {
             end_args: self.end_args.clone(),
             next_iteration_args: self.next_iteration_args.clone(),
             end_arg_types: self.end_arg_types.clone(),
-            preamble_heap_cache: self.preamble_heap_cache.clone(),
-            preamble_heap_array_cache: self.preamble_heap_array_cache.clone(),
             virtual_state: self.virtual_state.clone(),
             exported_infos: self.exported_infos.clone(),
             exported_short_ops: self.exported_short_ops.clone(),
