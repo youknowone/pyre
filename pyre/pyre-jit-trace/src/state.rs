@@ -172,11 +172,23 @@ pub fn frame_value_count_at(jitcode_index: i32, pc: i32) -> usize {
             Some(jc) => jc,
             None => return 0,
         };
-        // Primary: JitCode liveness (same path as get_list_of_active_boxes).
+        // jitcode.py:147 enumerate_vars parity: read [len_i, len_r, len_f]
+        // from liveness_info + liveness_offsets — the SAME data that
+        // get_list_of_active_boxes (encoder) uses.
         if let Some(mjc) = jc.majit_jitcode.as_ref() {
             if let Some(&jit_pc) = mjc.py_to_jit_pc.get(pc as usize) {
+                if let Some(&offset) = mjc.liveness_offsets.get(&(jit_pc as u32)) {
+                    let off = offset as usize;
+                    let all_liveness = &mjc.liveness_info;
+                    if off + 2 < all_liveness.len() {
+                        let length_i = all_liveness[off] as usize;
+                        let length_r = all_liveness[off + 1] as usize;
+                        let length_f = all_liveness[off + 2] as usize;
+                        return length_i + length_r + length_f;
+                    }
+                }
+                // Fallback: LivenessInfo (merge-point only)
                 if let Some(info) = mjc.liveness.iter().find(|i| i.pc as usize == jit_pc) {
-                    // pyjitpl.py:212: total = length_i + length_r + length_f
                     return info.total_live();
                 }
             }
@@ -2474,8 +2486,8 @@ fn materialize_bridge_virtual(
             }
             if majit_metainterp::majit_log_enabled() {
                 eprintln!(
-                    "[jit][bridge-virtual] vidx={} VArrayStructInfo(size={}, fields={}) → OpRef({})",
-                    vidx, size, num_fields, new_op.0,
+                    "[jit][bridge-virtual] vidx={} VArrayStructInfo → OpRef({})",
+                    vidx, new_op.0,
                 );
             }
             new_op
@@ -2489,19 +2501,20 @@ fn materialize_bridge_virtual(
             fieldnums,
         } => {
             // resume.py:703: buffer = decoder.allocate_raw_buffer(self.func, self.size)
+            // resume.py:1124-1132: ResumeDataBoxReader.allocate_raw_buffer →
+            //   execute_and_record_varargs(rop.CALL_I, [ConstInt(func), ConstInt(size)], calldescr)
             let func_ref = ctx.const_int(*func);
             let size_ref = ctx.const_int(*size as i64);
             let calldescr = crate::descr::make_raw_malloc_calldescr();
             let buffer = ctx.record_op_with_descr(OpCode::CallI, &[func_ref, size_ref], calldescr);
             // resume.py:704: decoder.virtuals_cache.set_int(index, buffer)
             cache.insert(vidx, buffer);
-            // resume.py:705-708: for i in range(len(self.offsets)):
-            //     offset = self.offsets[i]; descr = self.descrs[i]
-            //     decoder.setrawbuffer_item(buffer, self.fieldnums[i], offset, descr)
+            // resume.py:705-708: setrawbuffer_item for each offset/descr
             for (i, (&off, &fnum)) in offsets.iter().zip(fieldnums.iter()).enumerate() {
                 if fnum == majit_ir::resumedata::UNINITIALIZED_TAG {
                     continue;
                 }
+                // resume.py:1232: itembox = self.decode_box(fieldnum, kind)
                 let item = decode_fieldnum(ctx, fnum, rd_virtuals, resume_data, cache);
                 if item.is_none() {
                     continue;
@@ -2675,7 +2688,7 @@ impl JitState for PyreJitState {
                        v: &RebuiltValue|
          -> OpRef {
             match v {
-                RebuiltValue::Box(n, _) => OpRef(*n as u32),
+                RebuiltValue::Box(n, _tp) => OpRef(*n as u32),
                 RebuiltValue::Int(_) | RebuiltValue::Const(..) => {
                     let opref = majit_ir::OpRef::from_const(*cursor as u32);
                     *cursor += 1;
@@ -2689,40 +2702,44 @@ impl JitState for PyreJitState {
         };
 
         let nlocals = sym.nlocals;
-        let stack_only_depth = sym.stack_only_depth();
         let mut bridge_locals = vec![OpRef::NONE; nlocals];
-        let mut bridge_stack = vec![OpRef::NONE; stack_only_depth];
         // resume.py:1245 decode_box parity: each slot's `.type` is fixed
         // by which _callback_i/_callback_r/_callback_f the encoder dispatched.
         let mut bridge_local_types = vec![Type::Ref; nlocals];
-        let mut bridge_stack_types = vec![Type::Ref; stack_only_depth];
-        // resume.py:1245 decode_box(num, kind) parity: each `RebuiltValue::Box`
-        // already carries its kind from the parent guard's fail_arg_types
-        // (set in `decode_tagged`), so the bridge tracer reads it directly
-        // from the box variant — no parallel `parent_types` lookup is
-        // needed and the optimizer's `livebox_types` view of the bridge
-        // inputarg slots stays consistent.
         let type_for_value = |v: &RebuiltValue| -> Type {
             match v {
-                RebuiltValue::Box(_, kind) => *kind,
+                RebuiltValue::Box(_n, tp) => *tp,
                 RebuiltValue::Int(_) => Type::Int,
                 RebuiltValue::Const(_, tp) => *tp,
                 _ => Type::Ref,
             }
         };
 
-        // pyjitpl.py:3281-3288 + virtualizable.py:126-137 parity: source
-        // both vable scalar fields, frame locals AND stack temps from
-        // `virtualizable_values` (the canonical layout
-        // [frame_ptr, ni, code, vsd, ns, locals..., stack...]). Walking
-        // vable_values with a single cursor keeps the constant-pool OpRefs
-        // in lock-step with rebuild_from_resumedata's encoding order, and
-        // ensures dead-at-PC locals (which liveness-driven `frame.values`
-        // omits but the parent loop's LABEL still expects as inputargs)
-        // are filled in. resume.py:945-956 getvirtual_ptr equivalent:
-        // RebuiltValue::Virtual entries flow through
-        // materialize_bridge_virtual via the shared virtuals_cache so
-        // shared virtuals are emitted exactly once.
+        // pyre adaptation (NOT a line-by-line port of
+        // rebuild_state_after_failure).
+        //
+        // RPython pyjitpl.py:3400 rebuild_state_after_failure returns
+        // `inputargs_and_holes` (frame state) and stores
+        // `virtualizable_boxes` separately, calling
+        // synchronize_virtualizable() to write the latter back. The
+        // frame livebox stream and the virtualizable payload are kept
+        // distinct all the way through, and virtualizable.py:139
+        // `load_list_of_boxes` reads them via typed next_box_of_type().
+        //
+        // pyre does not have that split. Bridge resume state is
+        // reconstructed from a single `virtualizable_values` list
+        // (canonical layout [frame_ptr, ni, code, vsd, ns, locals...,
+        // stack...]) that the rebuild path produces from rd_numb.
+        // This loop walks that flat list with one cursor, reusing
+        // `resolve` for constant-pool allocation and virtual
+        // materialization. Dead-at-PC locals (which liveness-driven
+        // `frame.values` omits but the parent loop's LABEL still
+        // expects as inputargs) are filled in as a side effect.
+        // resume.py:945-956 `getvirtual_ptr` is the one line-by-line
+        // parity point still visible: `RebuiltValue::Virtual` entries
+        // flow through `materialize_bridge_virtual` with a shared
+        // `virtuals_cache` so shared virtuals are emitted exactly
+        // once.
         let vvals = &resume_data.virtualizable_values;
         let mut vable_cursor: usize = 0;
         let num_scalars = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
@@ -2747,8 +2764,8 @@ impl JitState for PyreJitState {
         }
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
-                "[jit][bridge-sym] vable_values → bridge_locals={:?} types={:?} bridge_stack={:?} stack_types={:?}",
-                bridge_locals, bridge_local_types, bridge_stack, bridge_stack_types,
+                "[jit][bridge-sym] vable_values → bridge_locals={:?} types={:?}",
+                bridge_locals, bridge_local_types,
             );
         }
         // Override sym.symbolic_locals AND sym.symbolic_local_types so
@@ -2794,36 +2811,7 @@ impl JitState for PyreJitState {
         sym.bridge_local_oprefs = Some(bridge_locals);
         sym.bridge_stack_oprefs = None;
         sym.bridge_local_types = Some(bridge_local_types);
-        sym.bridge_stack_types = Some(bridge_stack_types);
-
-        // pyjitpl.py:3281-3288 parity: bridge vable scalar fields must
-        // reflect the bridge's InputArg layout, NOT the loop trace's layout.
-        let num_scalars = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
-        let vvals = &resume_data.virtualizable_values;
-        let mut vable_const_cursor: u32 = 0;
-        let resolve_vable = |v: &RebuiltValue, cursor: &mut u32| -> OpRef {
-            match v {
-                RebuiltValue::Box(n, _) => OpRef(*n as u32),
-                RebuiltValue::Int(_) | RebuiltValue::Const(..) => {
-                    let opref = majit_ir::OpRef::from_const(*cursor);
-                    *cursor += 1;
-                    opref
-                }
-                _ => OpRef::NONE,
-            }
-        };
-        if vvals.len() > 1 {
-            sym.vable_next_instr = resolve_vable(&vvals[1], &mut vable_const_cursor);
-        }
-        if vvals.len() > 2 {
-            sym.vable_code = resolve_vable(&vvals[2], &mut vable_const_cursor);
-        }
-        if vvals.len() > 3 {
-            sym.vable_valuestackdepth = resolve_vable(&vvals[3], &mut vable_const_cursor);
-        }
-        if vvals.len() > 4 {
-            sym.vable_namespace = resolve_vable(&vvals[4], &mut vable_const_cursor);
-        }
+        sym.bridge_stack_types = None;
     }
 
     /// resume.py:1042-1057 rebuild_from_resumedata parity.
@@ -2846,8 +2834,6 @@ impl JitState for PyreJitState {
         // resume.py:1049-1055 parity: consume_boxes(f.get_current_position_info())
         // RPython uses jitcode liveness via get_current_position_info; majit
         // routes the same lookup through `frame_value_count_at`.
-        // resume.py:1245 decode_box parity: each TAGBOX value carries the
-        // kind from `fail_arg_types` directly on its `RebuiltValue::Box`.
         let cb = crate::state::frame_value_count_at;
         let (num_failargs, vable_values, vref_values, frames) =
             rebuild_from_numbering(rd_numb, rd_consts, fail_arg_types, Some(&cb));
@@ -2906,6 +2892,9 @@ impl JitState for PyreJitState {
             virtualizable_values: vable_values,
             virtualref_values: vref_values,
             constants,
+            // resume.py:1042 num_failargs from rd_numb header. Used by
+            // bridge virtual materialization (resume.py:1556-1564 decode_box
+            // negative-index normalization: `num + len(liveboxes)`).
             num_failargs,
         })
     }
