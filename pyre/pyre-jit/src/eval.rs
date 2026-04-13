@@ -1635,7 +1635,17 @@ fn execute_assembler(
                     let bh_result =
                         resume_in_blackhole_from_exit_layout(frame, raw_values, exit_layout);
                     match &bh_result {
-                        crate::call_jit::BlackholeResult::ContinueRunningNormally { .. } => {
+                        crate::call_jit::BlackholeResult::ContinueRunningNormally {
+                            green_int,
+                            ..
+                        } => {
+                            // warmspot.py:961 handle_jitexception parity:
+                            // CRN carries merge-point args. Write next_instr
+                            // back to the frame so eval_loop_jit restarts at
+                            // the merge point, not the guard-failure PC.
+                            if let Some(&ni) = green_int.first() {
+                                frame.next_instr = ni as usize;
+                            }
                             Some(LoopResult::ContinueRunningNormally)
                         }
                         crate::call_jit::BlackholeResult::Failed => {
@@ -1805,7 +1815,14 @@ fn bound_reached(
                     let bh_result =
                         resume_in_blackhole_from_exit_layout(frame, raw_values, exit_layout);
                     match &bh_result {
-                        crate::call_jit::BlackholeResult::ContinueRunningNormally { .. } => {
+                        crate::call_jit::BlackholeResult::ContinueRunningNormally {
+                            green_int,
+                            ..
+                        } => {
+                            // warmspot.py:961 parity: write merge-point PC
+                            if let Some(&ni) = green_int.first() {
+                                frame.next_instr = ni as usize;
+                            }
                             return Some(LoopResult::ContinueRunningNormally);
                         }
                         crate::call_jit::BlackholeResult::Failed => {}

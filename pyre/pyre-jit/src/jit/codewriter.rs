@@ -419,6 +419,14 @@ impl CodeWriter {
                     let reg = var_num.get(op_arg).as_usize() as u16;
                     current_depth -= 1;
                     assembler.move_r(reg, stack_base + current_depth);
+                    // jtransform.py:1898 do_fixed_list_setitem vable case:
+                    // portal locals are virtualizable array items.
+                    // Shadow write: keep move_r AND write to vable array.
+                    if is_portal {
+                        assembler
+                            .load_const_i_value(int_tmp0, local_to_vable_slot(reg as usize) as i64);
+                        assembler.vable_setarrayitem_ref(0, int_tmp0, reg);
+                    }
                 }
 
                 Instruction::LoadSmallInt { i } => {
@@ -848,6 +856,19 @@ impl CodeWriter {
                     assembler.move_r(reg_a, stack_base + current_depth);
                     current_depth -= 1;
                     assembler.move_r(reg_b, stack_base + current_depth);
+                    // jtransform.py:1898 parity: shadow write both stores
+                    if is_portal {
+                        assembler.load_const_i_value(
+                            int_tmp0,
+                            local_to_vable_slot(reg_a as usize) as i64,
+                        );
+                        assembler.vable_setarrayitem_ref(0, int_tmp0, reg_a);
+                        assembler.load_const_i_value(
+                            int_tmp0,
+                            local_to_vable_slot(reg_b as usize) as i64,
+                        );
+                        assembler.vable_setarrayitem_ref(0, int_tmp0, reg_b);
+                    }
                 }
 
                 // CPython 3.13 UNPACK_SEQUENCE: pop 1 (seq), push `count`.
