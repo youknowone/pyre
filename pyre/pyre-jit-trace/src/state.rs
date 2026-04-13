@@ -2012,28 +2012,41 @@ impl PyreJitState {
     /// objects (PyObjectRef pointers). RPython uses FieldDescr at decode time
     /// to determine types; pyre uses the virtualizable layout to know that
     /// all array slots (locals + stack) are always Ref (GCREF).
-    pub fn restore_virtualizable_from_raw(&mut self, raw_values: &[i64]) -> bool {
+    pub fn restore_virtualizable_from_raw(
+        &mut self,
+        raw_values: &[i64],
+        slot_types: &[Type],
+    ) -> bool {
         if raw_values.is_empty() {
             return false;
         }
         // Fail_args layout: [frame, scalars..., active_locals..., active_stack...]
-        // This is the guard failure path — raw_values carries only ACTIVE
-        // slots, not the full backing array. RPython's full-array restore is
-        // write_from_resume_data_partial (virtualizable.py:126-137), which
-        // corresponds to import_virtualizable_state, not this function.
+        // RPython virtualizable.py:126-137 write_from_resume_data_partial:
+        // typed per-slot restore using load_next_value_of_type(ARRAYITEMTYPE).
         let mut idx = crate::virtualizable_gen::virt_restore_scalars_raw(self, raw_values);
 
         let nlocals = self.local_count();
         let stack_only = self.valuestackdepth().saturating_sub(nlocals);
         for local_idx in 0..nlocals {
             if idx < raw_values.len() {
-                let _ = self.set_local_at(local_idx, raw_values[idx] as PyObjectRef);
+                let slot_type = slot_types.get(local_idx).copied().unwrap_or(Type::Ref);
+                let _ = self.set_local_at(
+                    local_idx,
+                    boxed_slot_i64_for_type(slot_type, raw_values[idx]),
+                );
             }
             idx += 1;
         }
         for stack_idx in 0..stack_only {
             if idx < raw_values.len() {
-                let _ = self.set_stack_at(stack_idx, raw_values[idx] as PyObjectRef);
+                let slot_type = slot_types
+                    .get(nlocals + stack_idx)
+                    .copied()
+                    .unwrap_or(Type::Ref);
+                let _ = self.set_stack_at(
+                    stack_idx,
+                    boxed_slot_i64_for_type(slot_type, raw_values[idx]),
+                );
             }
             idx += 1;
         }
@@ -2120,7 +2133,7 @@ impl PyreJitState {
             return;
         }
         if meta.has_virtualizable {
-            self.restore_virtualizable_i64(values);
+            self.restore_virtualizable_i64(values, &meta.slot_types);
         } else {
             let nlocals = self.local_count();
             let stack_only = self.valuestackdepth().saturating_sub(nlocals);
@@ -2288,13 +2301,18 @@ impl PyreJitState {
     /// Carries only ACTIVE slots from current_fail_args(), not the full
     /// backing array. The full-array restore path is
     /// import_virtualizable_state (virtualizable.py:126-137 parity).
-    fn restore_virtualizable_i64(&mut self, values: &[i64]) {
+    fn restore_virtualizable_i64(&mut self, values: &[i64], slot_types: &[Type]) {
         let mut idx = crate::virtualizable_gen::virt_restore_scalars_raw(self, values);
 
+        // RPython virtualizable.py:126-137 write_from_resume_data_partial:
+        // reader.load_next_value_of_type(ARRAYITEMTYPE) — typed per slot.
+        // pyre: use slot_types from PyreMeta to re-box Int/Float values
+        // before writing to the PyObjectRef array.
         let nlocals = self.local_count();
         for i in 0..nlocals {
             if idx < values.len() {
-                let _ = self.set_local_at(i, values[idx] as PyObjectRef);
+                let slot_type = slot_types.get(i).copied().unwrap_or(Type::Ref);
+                let _ = self.set_local_at(i, boxed_slot_i64_for_type(slot_type, values[idx]));
             }
             idx += 1;
         }
@@ -2302,7 +2320,8 @@ impl PyreJitState {
         let stack_only = self.valuestackdepth().saturating_sub(nlocals);
         for i in 0..stack_only {
             if idx < values.len() {
-                let _ = self.set_stack_at(i, values[idx] as PyObjectRef);
+                let slot_type = slot_types.get(nlocals + i).copied().unwrap_or(Type::Ref);
+                let _ = self.set_stack_at(i, boxed_slot_i64_for_type(slot_type, values[idx]));
             }
             idx += 1;
         }
