@@ -3333,12 +3333,9 @@ impl OptUnroll {
                     // Register type for the new OpRef (RPython Box.type parity).
                     ctx.value_types.insert(value.0, result_type);
                     ctx.replace_op(source, value);
-                    let descr_idx = descr
-                        .as_field_descr()
-                        .map(|field_descr| field_descr.index_in_parent() as u32)
-                        .expect(
-                            "HeapOp.produce_op: field descrs must carry parent-local index parity",
-                        );
+                    // RPython: opinfo.setfield(descr, ...) uses descr as key.
+                    // majit keying: descr.index() (global unique index).
+                    let descr_idx = descr.index();
                     let obj_resolved = ctx.get_box_replacement(obj);
                     // shortpreamble.py:66-68: HeapOp.produce_op
                     // if g.getarg(0) in exported_infos:
@@ -3381,6 +3378,17 @@ impl OptUnroll {
                     let mut struct_info = ctx.ensure_ptr_info_arg0(&getfield_op);
                     if let Some(info) = struct_info.as_mut() {
                         info.set_preamble_field(descr_idx, pop.clone());
+                    }
+                    // RPython parity: in RPython, PreambleOp is stored in
+                    // _fields which is accessed via the forwarded Box identity.
+                    // In majit, forwarding chains may skip the LABEL arg where
+                    // ensure_ptr_info_arg0 stored the PreambleOp. Also store on
+                    // the original un-replaced `obj` slot so body getfield ops
+                    // that resolve to `obj` (before replacement) find it.
+                    if obj != obj_resolved {
+                        if let Some(info) = ctx.get_ptr_info_mut(obj) {
+                            info.set_preamble_field(descr_idx, pop.clone());
+                        }
                     }
                     if crate::optimizeopt::majit_log_enabled() {
                         eprintln!(

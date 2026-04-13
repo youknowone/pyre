@@ -1414,6 +1414,54 @@ impl ShortPreambleBuilder {
         ))
     }
 
+    /// RPython shortpreamble.py:382-407: use_box(box, preamble_op, optimizer)
+    /// fallback when the builder does not have a tracked ProducedShortOp for
+    /// `result`. This replays the passed-in preamble op directly instead of
+    /// dropping the short fact on the floor.
+    pub fn use_box_from_preamble_op(
+        &mut self,
+        pop: &crate::optimizeopt::info::PreambleOp,
+        arg_guards: &[Op],
+        result_guards: &[Op],
+    ) -> Op {
+        let replay_op = pop.preamble_op.clone();
+        let canonical = replay_op.pos;
+        if !self.state.short_results.contains(&canonical) {
+            let pos_to_key = build_pos_to_key(&self.produced_short_boxes);
+            for &arg in &replay_op.args {
+                if self.state.short_results.contains(&arg)
+                    || self.state.short_inputargs.contains(&arg)
+                    || self.state.known_constants.contains(&arg)
+                {
+                    continue;
+                }
+                let dep = self.produced_short_boxes.get(&arg).or_else(|| {
+                    pos_to_key
+                        .get(&arg)
+                        .and_then(|key| self.produced_short_boxes.get(key))
+                });
+                if let Some(dep) = dep {
+                    let dep_pos = dep.preamble_op.pos;
+                    if !self.state.short_results.contains(&dep_pos) {
+                        self.state.short_results.insert(dep_pos);
+                        self.state.short.push(dep.preamble_op.clone());
+                        if dep.preamble_op.opcode.is_ovf() {
+                            self.state.short.push(Op::new(OpCode::GuardNoOverflow, &[]));
+                        }
+                    }
+                }
+            }
+            self.state.short.extend_from_slice(arg_guards);
+            self.state.short_results.insert(canonical);
+            self.state.short.push(replay_op.clone());
+            if replay_op.opcode.is_ovf() {
+                self.state.short.push(Op::new(OpCode::GuardNoOverflow, &[]));
+            }
+            self.state.short.extend_from_slice(result_guards);
+        }
+        replay_op
+    }
+
     pub fn produced_short_op(&self, result: OpRef) -> Option<ProducedShortOp> {
         self.produced_short_boxes.get(&result).cloned()
     }
@@ -1871,6 +1919,56 @@ impl ExtendedShortPreambleBuilder {
             self.short.push(jump);
         }
         Some(preamble_op)
+    }
+
+    /// RPython shortpreamble.py:478-481: use_box fallback for imported
+    /// PreambleOp replay when there is no ProducedShortOp entry to look up.
+    pub fn use_box_from_preamble_op(
+        &mut self,
+        pop: &crate::optimizeopt::info::PreambleOp,
+        arg_guards: &[Op],
+        result_guards: &[Op],
+    ) -> Op {
+        let preamble_op = self.remap_op(&pop.preamble_op);
+        let canonical = preamble_op.pos;
+        let jump_op = self.short.pop();
+        if !self.short_results.contains(&canonical) {
+            let pos_to_key = build_pos_to_key(&self.produced_short_boxes);
+            for &arg in &preamble_op.args {
+                if self.short_results.contains(&arg)
+                    || self.short_inputargs.contains(&arg)
+                    || self.known_constants.contains(&arg)
+                {
+                    continue;
+                }
+                let dep = self.produced_short_boxes.get(&arg).or_else(|| {
+                    pos_to_key
+                        .get(&arg)
+                        .and_then(|key| self.produced_short_boxes.get(key))
+                });
+                if let Some(dep) = dep {
+                    let dep_pos = dep.preamble_op.pos;
+                    if !self.short_results.contains(&dep_pos) {
+                        self.short_results.insert(dep_pos);
+                        self.short.push(self.remap_op(&dep.preamble_op));
+                        if dep.preamble_op.opcode.is_ovf() {
+                            self.short.push(Op::new(OpCode::GuardNoOverflow, &[]));
+                        }
+                    }
+                }
+            }
+            self.short.extend_from_slice(arg_guards);
+            self.short_results.insert(canonical);
+            self.short.push(preamble_op.clone());
+            if preamble_op.opcode.is_ovf() {
+                self.short.push(Op::new(OpCode::GuardNoOverflow, &[]));
+            }
+            self.short.extend_from_slice(result_guards);
+        }
+        if let Some(jump) = jump_op {
+            self.short.push(jump);
+        }
+        preamble_op
     }
 
     pub fn produced_short_op(&self, result: OpRef) -> Option<ProducedShortOp> {

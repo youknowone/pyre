@@ -446,6 +446,7 @@ impl OptVirtualize {
             ob_type_descr: None,
             fields: Vec::new(),
             field_descrs: Vec::new(),
+            preamble_fields: Vec::new(),
             last_guard_pos: -1,
         };
         ctx.set_ptr_info(op.pos, PtrInfo::Virtual(vinfo));
@@ -458,6 +459,7 @@ impl OptVirtualize {
             descr,
             fields: Vec::new(),
             field_descrs: Vec::new(),
+            preamble_fields: Vec::new(),
             last_guard_pos: -1,
         };
         ctx.set_ptr_info(op.pos, PtrInfo::VirtualStruct(vinfo));
@@ -646,6 +648,25 @@ impl OptVirtualize {
                         ctx.make_constant(op.pos, majit_ir::Value::Int(class_val));
                         return OptimizationResult::Remove;
                     }
+                }
+            }
+            // RPython virtualize.py:184-195: getfield on virtual.
+            // RPython stores PreambleOp directly in _fields[]. When the body's
+            // GETFIELD accesses a virtual field that holds PreambleOp, RPython's
+            // make_equal_to(op, PreambleOp) forwards the result to PreambleOp.
+            // Later force_box detects PreambleOp and calls force_op_from_preamble.
+            // In majit, PreambleOp is stored separately in preamble_fields.
+            // Check preamble_fields BEFORE concrete fields — RPython's _fields
+            // contains the PreambleOp IN PLACE of the concrete value.
+            if matches!(&info, PtrInfo::Virtual(_) | PtrInfo::VirtualStruct(_)) {
+                if let Some(pop) = ctx
+                    .get_ptr_info_mut(struct_ref)
+                    .and_then(|info| info.take_preamble_field(field_idx))
+                {
+                    let resolved = pop.resolved;
+                    ctx.force_op_from_preamble_op(&pop);
+                    ctx.replace_op(op.pos, resolved);
+                    return OptimizationResult::Remove;
                 }
             }
             let field_val = match &info {
@@ -1107,6 +1128,7 @@ impl OptVirtualize {
             descr: vref_descr,
             fields,
             field_descrs,
+            preamble_fields: Vec::new(),
             last_guard_pos: -1,
         };
         ctx.set_ptr_info(op.pos, PtrInfo::VirtualStruct(vinfo));

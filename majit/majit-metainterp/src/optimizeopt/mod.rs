@@ -1607,23 +1607,26 @@ impl OptContext {
         if self.imported_short_preamble_used.insert(preamble_source) {
             // unroll.py:28: assert short_preamble_producer is not None
             // unroll.py:32: use_box(op, preamble_op.preamble_op, self)
-            let (arg_guards, result_guards) = self.collect_use_box_guards(preamble_source);
+            let (arg_guards, result_guards) = self.collect_use_box_guards(&preamble_op.preamble_op);
             if let Some(mut builder) = self.active_short_preamble_producer.take() {
-                builder.use_box(preamble_source, &arg_guards, &result_guards);
+                if builder.produced_short_op(preamble_source).is_some() {
+                    builder.use_box(preamble_source, &arg_guards, &result_guards);
+                } else {
+                    builder.use_box_from_preamble_op(preamble_op, &arg_guards, &result_guards);
+                }
                 self.active_short_preamble_producer = Some(builder);
             } else if let Some(mut builder) = self.imported_short_preamble_builder.take() {
-                builder.use_box(preamble_source, &arg_guards, &result_guards);
+                if builder.produced_short_op(preamble_source).is_some() {
+                    builder.use_box(preamble_source, &arg_guards, &result_guards);
+                } else {
+                    builder.use_box_from_preamble_op(preamble_op, &arg_guards, &result_guards);
+                }
                 self.imported_short_preamble_builder = Some(builder);
             } else {
-                // unroll.py:28: assert False  # unreachable code
-                // In production (UnrollOptimizer), short_preamble_producer
-                // is always set. Unit tests may omit builder setup.
-                if crate::optimizeopt::majit_log_enabled() {
-                    eprintln!(
-                        "[jit] WARNING: force_op_from_preamble_op: \
-                         short_preamble_producer is None (RPython: unreachable)"
-                    );
-                }
+                unreachable!(
+                    "force_op_from_preamble_op: short preamble builder missing \
+                     (RPython unroll.py:28: assert False # unreachable code)"
+                );
             }
             // shortpreamble.py:404: optimizer.setinfo_from_preamble(box, info, None)
             if let Some(info) = self.get_ptr_info(preamble_source).cloned() {
@@ -1689,20 +1692,7 @@ impl OptContext {
 
     /// shortpreamble.py:383-396,401-406: collect guards from PtrInfo
     /// of preamble_op's args and result.
-    fn collect_use_box_guards(&mut self, preamble_source: OpRef) -> (Vec<Op>, Vec<Op>) {
-        let produced = self
-            .imported_short_preamble_builder
-            .as_ref()
-            .and_then(|b| b.produced_short_op(preamble_source))
-            .or_else(|| {
-                self.active_short_preamble_producer
-                    .as_ref()
-                    .and_then(|b| b.produced_short_op(preamble_source))
-            });
-        let Some(produced) = produced else {
-            return (Vec::new(), Vec::new());
-        };
-
+    fn collect_use_box_guards(&mut self, preamble_op: &Op) -> (Vec<Op>, Vec<Op>) {
         // shortpreamble.py:383-396: guards for InputArg args only
         let short_inputargs: Vec<OpRef> = self
             .imported_short_preamble_builder
@@ -1716,17 +1706,16 @@ impl OptContext {
             .unwrap_or_default();
 
         // Collect (arg, PtrInfo clone) pairs to avoid borrow conflicts
-        let arg_infos: Vec<(OpRef, PtrInfo)> = produced
-            .preamble_op
+        let arg_infos: Vec<(OpRef, PtrInfo)> = preamble_op
             .args
             .iter()
             .filter(|arg| short_inputargs.contains(arg))
             .filter_map(|&arg| self.get_ptr_info(arg).cloned().map(|info| (arg, info)))
             .collect();
         let result_info = self
-            .get_ptr_info(produced.preamble_op.pos)
+            .get_ptr_info(preamble_op.pos)
             .cloned()
-            .map(|info| (produced.preamble_op.pos, info));
+            .map(|info| (preamble_op.pos, info));
 
         // Now generate guards — alloc_const directly allocates constant
         // OpRefs, matching RPython where ConstInt/ConstPtr are created inline.
@@ -1867,8 +1856,15 @@ impl OptContext {
                 if let Some(ref ptr_info) = info.ptr_info {
                     self.setinfo_from_preamble(item, ptr_info, Some(exported_infos));
                 }
-                // int_bound: unroll.py:93-96 — handled by setinfo_from_preamble
-                // when we add IntBound dispatch there.
+                // unroll.py:93-96: IntBound import with widen()
+                if let Some(ref bound) = info.int_bound {
+                    let widened = bound.widen();
+                    if widened.lower != i64::MIN || widened.upper != i64::MAX {
+                        self.with_intbound_mut(item, |bm| {
+                            let _ = bm.intersect(&widened);
+                        });
+                    }
+                }
             } else {
                 // unroll.py:49: item.set_forwarded(None)
                 // "let's not inherit stuff we don't know anything about"
@@ -4807,5 +4803,41 @@ mod intbound_invariant_tests {
         let opref = OpRef(20_001);
         ctx.seed_constant(opref, Value::Ref(GcRef(0xcafe_babe)));
         ctx.setintbound(opref, &IntBound::nonnegative());
+    }
+}
+
+#[cfg(test)]
+mod imported_short_preamble_fallback_tests {
+    use super::*;
+    use majit_ir::{Op, OpCode, OpRef};
+
+    #[test]
+    fn force_op_from_preamble_replays_pop_without_builder_lookup() {
+        let mut ctx = OptContext::with_num_inputs(16, 2);
+        ctx.initialize_imported_short_preamble_builder(
+            &[OpRef(0), OpRef(1)],
+            &[OpRef(7), OpRef(8)],
+            &[],
+        );
+
+        let mut replay_op = Op::new(OpCode::IntAdd, &[OpRef(7), OpRef(8)]);
+        replay_op.pos = OpRef(14);
+        let pop = crate::optimizeopt::info::PreambleOp {
+            op: OpRef(14),
+            resolved: OpRef(41),
+            invented_name: false,
+            preamble_op: replay_op,
+        };
+
+        let forced = ctx.force_op_from_preamble_op(&pop);
+        assert_eq!(forced, OpRef(41));
+
+        let sp = ctx
+            .build_imported_short_preamble()
+            .expect("imported short preamble builder should exist");
+        assert_eq!(sp.ops.len(), 1);
+        assert_eq!(sp.ops[0].op.opcode, OpCode::IntAdd);
+        assert_eq!(sp.ops[0].op.args.as_slice(), &[OpRef(7), OpRef(8)]);
+        assert_eq!(sp.ops[0].op.pos, OpRef(14));
     }
 }
