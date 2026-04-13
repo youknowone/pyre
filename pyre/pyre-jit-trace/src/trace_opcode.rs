@@ -2792,11 +2792,11 @@ impl MIFrame {
                     None
                 };
                 // pyjitpl.py:1376-1423 _opimpl_recursive_call parity:
-                // Compute assembler_call boolean. For self-recursive calls,
-                // InlineDecision already encodes the RPython decision:
-                //   Inline → recursive_depth < max_unroll → perform_call
-                //   CallAssembler → recursive_depth >= max_unroll, has token
-                //   ResidualCall → recursive_depth >= max_unroll, no token
+                // Compute assembler_call boolean. Note that self-recursive
+                // InlineDecision::Inline is still NOT true perform_call
+                // parity in pyre: until recursive frame switching is wired,
+                // pyre degrades that case to CALL_ASSEMBLER when a token
+                // exists and residual call otherwise.
                 let assembler_call;
                 if is_self_recursive {
                     if inline_decision == majit_metainterp::InlineDecision::Inline {
@@ -2835,8 +2835,12 @@ impl MIFrame {
                 // perform_call when callee is inlinable. RPython does NOT
                 // have a callee_prefers_function_entry heuristic — the
                 // decision is purely can_inline_callable + recursion depth.
-                // Self-recursive: disabled until Phase 3 (loop detection).
                 let can_trace_through = if is_self_recursive {
+                    // Self-recursive perform_call remains disabled until
+                    // pyre has the corresponding framestack transition.
+                    // RPython would enter the callee and later convert the
+                    // call at the callee's jit_merge_point(depth > 0)
+                    // (pyjitpl.py:1579-1602); pyre does not model that yet.
                     false
                 } else {
                     callee_inline_eligible && nargs <= 4 && !callee_has_loop
@@ -2857,8 +2861,9 @@ impl MIFrame {
                 }
 
                 if can_trace_through {
-                    // RPython perform_call: produce PendingInlineFrame for
-                    // the MetaInterp interpret loop to push onto framestack.
+                    // pyjitpl.py:1414-1416 perform_call parity for
+                    // non-self-recursive calls only. Self-recursive
+                    // perform_call is still disabled above.
                     match self.build_pending_inline_frame(
                         callable,
                         args,
