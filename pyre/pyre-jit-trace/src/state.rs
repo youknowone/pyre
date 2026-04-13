@@ -3621,7 +3621,6 @@ mod tests {
             init.set(true);
             let cb = Box::leak(Box::new(crate::callbacks::CallJitCallbacks {
                 callee_frame_helper: |_| None,
-                callable_prefers_function_entry: |_| false,
                 recursive_force_cache_safe: |_| false,
                 jit_drop_callee_frame: std::ptr::null(),
                 jit_force_callee_frame: std::ptr::null(),

@@ -15,7 +15,6 @@ use std::cell::Cell;
 pub struct CallJitCallbacks {
     // call_jit.rs helpers
     pub callee_frame_helper: fn(usize) -> Option<*const ()>,
-    pub callable_prefers_function_entry: fn(PyObjectRef) -> bool,
     pub recursive_force_cache_safe: fn(PyObjectRef) -> bool,
     pub jit_drop_callee_frame: *const (),
     pub jit_force_callee_frame: *const (),

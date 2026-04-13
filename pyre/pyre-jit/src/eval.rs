@@ -855,7 +855,6 @@ fn init_callbacks() {
             c.set(true);
             let cb = Box::leak(Box::new(CallJitCallbacks {
                 callee_frame_helper: crate::call_jit::callee_frame_helper,
-                callable_prefers_function_entry: crate::call_jit::callable_prefers_function_entry,
                 recursive_force_cache_safe: crate::call_jit::recursive_force_cache_safe,
                 jit_drop_callee_frame: crate::call_jit::jit_drop_callee_frame as *const (),
                 jit_force_callee_frame: crate::call_jit::jit_force_callee_frame as *const (),
@@ -4483,23 +4482,6 @@ r = fannkuch(6)";
         }
     }
 
-    #[test]
-    fn test_recursive_fib_callable_prefers_function_entry() {
-        let source = "\
-def fib(n):
-    if n < 2:
-        return n
-    return fib(n - 1) + fib(n - 2)
-";
-        let code = pyre_interpreter::compile_exec(source).expect("compile failed");
-        let mut frame = PyFrame::new(code);
-        let _ = eval_with_jit(&mut frame);
-        unsafe {
-            let fib = *(*frame.namespace).get("fib").unwrap();
-            assert!(crate::call_jit::callable_prefers_function_entry(fib));
-        }
-    }
-
     /// Regression test for the recursive portal Ref ABI.
     ///
     /// RPython portal return type is always REF (warmspot.py:449).
@@ -4529,21 +4511,6 @@ result = fib(12)
                 144,
                 "fib(12) should be 144 — recursive portal Ref ABI regression"
             );
-        }
-    }
-
-    #[test]
-    fn test_nonrecursive_helper_does_not_prefer_function_entry() {
-        let source = "\
-def add(a, b):
-    return a + b
-";
-        let code = pyre_interpreter::compile_exec(source).expect("compile failed");
-        let mut frame = PyFrame::new(code);
-        let _ = eval_with_jit(&mut frame);
-        unsafe {
-            let add = *(*frame.namespace).get("add").unwrap();
-            assert!(!crate::call_jit::callable_prefers_function_entry(add));
         }
     }
 
