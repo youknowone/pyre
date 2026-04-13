@@ -654,7 +654,8 @@ pub(crate) fn bh_portal_runner(all_i: &[i64], all_r: &[i64], _all_f: &[i64]) -> 
 fn blackhole_from_jit_frame(frame: &mut PyFrame) -> Option<PyObjectRef> {
     // blackhole.py:1067 bhimpl_jit_merge_point: raises
     // ContinueRunningNormally. bh_call_fn_impl dispatches user calls
-    // via call_user_function which honors EVAL_OVERRIDE for JIT re-entry.
+    // via call_user_function_plain (no JIT re-entry), matching
+    // RPython's cpu.bh_call_r plain stub semantics.
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
     let py_pc = frame.next_instr;
 
@@ -775,8 +776,8 @@ fn blackhole_from_jit_frame(frame: &mut PyFrame) -> Option<PyObjectRef> {
         }
         MJitExc::DoneWithThisFrameVoid => Some(std::ptr::null_mut()),
         MJitExc::ExitFrameWithExceptionRef(_) | MJitExc::ContinueRunningNormally { .. } => {
-            // Exception or CRN at bottommost level — caller falls back
-            // to plain interpreter.
+            // Exception or CRN at bottommost level — caller dispatches
+            // to portal_runner (JIT-aware path, not plain interpreter).
             None
         }
     }
