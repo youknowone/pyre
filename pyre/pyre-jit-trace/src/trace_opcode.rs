@@ -2635,8 +2635,6 @@ impl MIFrame {
                 } else {
                     None
                 };
-                let callee_prefers_function_entry =
-                    (crate::callbacks::get().callable_prefers_function_entry)(concrete_callable);
                 // pyjitpl.py:1376-1423 _opimpl_recursive_call parity:
                 // Compute assembler_call boolean. For self-recursive calls,
                 // InlineDecision already encodes the RPython decision:
@@ -2677,16 +2675,15 @@ impl MIFrame {
                         inline_decision == majit_metainterp::InlineDecision::CallAssembler;
                 }
 
-                // pyjitpl.py:1414-1416: perform_call when recursion under limit.
-                // Non-self calls: trace-through small acyclic helpers.
+                // pyjitpl.py:1414-1416 / pyjitpl.py:2174-2186 parity:
+                // perform_call when callee is inlinable. RPython does NOT
+                // have a callee_prefers_function_entry heuristic — the
+                // decision is purely can_inline_callable + recursion depth.
                 // Self-recursive: disabled until Phase 3 (loop detection).
                 let can_trace_through = if is_self_recursive {
                     false
                 } else {
-                    callee_inline_eligible
-                        && nargs <= 4
-                        && !callee_prefers_function_entry
-                        && !callee_has_loop
+                    callee_inline_eligible && nargs <= 4 && !callee_has_loop
                 };
 
                 if majit_metainterp::majit_log_enabled() {
@@ -2701,25 +2698,6 @@ impl MIFrame {
                         assembler_call,
                         can_trace_through,
                     );
-                }
-
-                if callee_prefers_function_entry && !is_self_recursive {
-                    let call_pc = self.fallthrough_pc.saturating_sub(1);
-                    return self.with_ctx(|this, ctx| {
-                        this.implement_guard_value(ctx, callable, concrete_callable as i64);
-                        let boxed_args = box_args_for_python_helper(this, ctx, args);
-                        let result = crate::helpers::emit_trace_call_known_function(
-                            ctx,
-                            this.frame(),
-                            callable,
-                            &boxed_args,
-                        )?;
-                        this.push_call_replay_stack(ctx, callable, args, call_pc);
-                        this.generate_guard(ctx, OpCode::GuardNotForced, &[]);
-                        ctx.heap_cache_mut().invalidate_caches_for_escaped();
-                        this.pop_call_replay_stack(ctx, args.len())?;
-                        Ok(result)
-                    });
                 }
 
                 if can_trace_through {
