@@ -37,7 +37,7 @@ pub fn w_str_new(s: &str) -> PyObjectRef {
             w_class: get_instantiate(&STR_TYPE),
         },
         value: inner,
-        len: s.len(),
+        len: s.chars().count(),
     });
     Box::into_raw(obj) as PyObjectRef
 }

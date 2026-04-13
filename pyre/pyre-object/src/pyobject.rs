@@ -120,6 +120,7 @@ pub static DICT_TYPE: PyType = new_pytype("dict");
 pub static LONG_TYPE: PyType = new_pytype("int");
 pub static NONE_TYPE: PyType = new_pytype("NoneType");
 pub static NOTIMPLEMENTED_TYPE: PyType = new_pytype("NotImplementedType");
+pub static ELLIPSIS_TYPE: PyType = new_pytype("ellipsis");
 pub static MODULE_TYPE: PyType = new_pytype("module");
 pub static TYPE_TYPE: PyType = new_pytype("type");
 pub static INSTANCE_TYPE: PyType = new_pytype("object");
@@ -266,6 +267,7 @@ pub fn all_foreign_pytypes() -> &'static [(&'static PyType, &'static PyType)] {
         (&LONG_TYPE, &INSTANCE_TYPE),
         (&NONE_TYPE, &INSTANCE_TYPE),
         (&NOTIMPLEMENTED_TYPE, &INSTANCE_TYPE),
+        (&ELLIPSIS_TYPE, &INSTANCE_TYPE),
         (&MODULE_TYPE, &INSTANCE_TYPE),
         (&TYPE_TYPE, &INSTANCE_TYPE),
         (&crate::superobject::SUPER_TYPE, &INSTANCE_TYPE),
@@ -348,4 +350,9 @@ pub unsafe fn is_none(obj: PyObjectRef) -> bool {
 #[inline]
 pub unsafe fn is_not_implemented(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &NOTIMPLEMENTED_TYPE) }
+}
+
+#[inline]
+pub unsafe fn is_ellipsis(obj: PyObjectRef) -> bool {
+    unsafe { py_type_check(obj, &ELLIPSIS_TYPE) }
 }

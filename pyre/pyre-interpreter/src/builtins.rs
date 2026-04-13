@@ -119,7 +119,7 @@ pub fn install_default_builtins(namespace: &mut PyNamespace) {
     namespace.get_or_insert_with("classmethod", || {
         crate::typedef::gettypeobject(&pyre_object::propertyobject::CLASSMETHOD_TYPE)
     });
-    namespace.get_or_insert_with("Ellipsis", || w_none());
+    namespace.get_or_insert_with("Ellipsis", || pyre_object::noneobject::w_ellipsis());
     namespace.get_or_insert_with("__debug__", || w_bool_from(true));
     // memoryview stub: pyre doesn't model real buffer protocol, but
     // re._compiler._bytes_to_codes wants `memoryview(b).cast('I').tolist()`.
@@ -336,11 +336,8 @@ pub fn install_default_builtins(namespace: &mut PyNamespace) {
         "TypeError",
         make_exc_type("TypeError", exc_type_error_new, exception),
     );
-    crate::namespace_store(
-        namespace,
-        "ValueError",
-        make_exc_type("ValueError", exc_value_error_new, exception),
-    );
+    let value_error = make_exc_type("ValueError", exc_value_error_new, exception);
+    crate::namespace_store(namespace, "ValueError", value_error);
     crate::namespace_store(
         namespace,
         "NameError",
@@ -390,15 +387,12 @@ pub fn install_default_builtins(namespace: &mut PyNamespace) {
         make_exc_type("KeyboardInterrupt", exc_base_exception_new, base_exc),
     );
 
-    crate::namespace_store(
-        namespace,
-        "ImportError",
-        make_exc_type("ImportError", exc_import_error_new, exception),
-    );
+    let import_error = make_exc_type("ImportError", exc_import_error_new, exception);
+    crate::namespace_store(namespace, "ImportError", import_error);
     crate::namespace_store(
         namespace,
         "ModuleNotFoundError",
-        make_exc_type("ModuleNotFoundError", exc_import_error_new, exception),
+        make_exc_type("ModuleNotFoundError", exc_import_error_new, import_error),
     );
     crate::namespace_store(
         namespace,
@@ -457,25 +451,22 @@ pub fn install_default_builtins(namespace: &mut PyNamespace) {
         );
     }
 
-    crate::namespace_store(
-        namespace,
-        "UnicodeError",
-        make_exc_type("UnicodeError", exc_value_error_new, exception),
-    );
+    let unicode_error = make_exc_type("UnicodeError", exc_value_error_new, value_error);
+    crate::namespace_store(namespace, "UnicodeError", unicode_error);
     crate::namespace_store(
         namespace,
         "UnicodeDecodeError",
-        make_exc_type("UnicodeDecodeError", exc_value_error_new, exception),
+        make_exc_type("UnicodeDecodeError", exc_value_error_new, unicode_error),
     );
     crate::namespace_store(
         namespace,
         "UnicodeEncodeError",
-        make_exc_type("UnicodeEncodeError", exc_value_error_new, exception),
+        make_exc_type("UnicodeEncodeError", exc_value_error_new, unicode_error),
     );
     crate::namespace_store(
         namespace,
         "UnicodeTranslateError",
-        make_exc_type("UnicodeTranslateError", exc_value_error_new, exception),
+        make_exc_type("UnicodeTranslateError", exc_value_error_new, unicode_error),
     );
 
     crate::namespace_store(
@@ -503,20 +494,14 @@ pub fn install_default_builtins(namespace: &mut PyNamespace) {
         "EOFError",
         make_exc_type("EOFError", exc_exception_new, exception),
     );
-    crate::namespace_store(
-        namespace,
-        "SyntaxError",
-        make_exc_type("SyntaxError", exc_exception_new, exception),
-    );
-    crate::namespace_store(
-        namespace,
-        "IndentationError",
-        make_exc_type("IndentationError", exc_exception_new, exception),
-    );
+    let syntax_error = make_exc_type("SyntaxError", exc_exception_new, exception);
+    crate::namespace_store(namespace, "SyntaxError", syntax_error);
+    let indentation_error = make_exc_type("IndentationError", exc_exception_new, syntax_error);
+    crate::namespace_store(namespace, "IndentationError", indentation_error);
     crate::namespace_store(
         namespace,
         "TabError",
-        make_exc_type("TabError", exc_exception_new, exception),
+        make_exc_type("TabError", exc_exception_new, indentation_error),
     );
     crate::namespace_store(
         namespace,
@@ -528,30 +513,35 @@ pub fn install_default_builtins(namespace: &mut PyNamespace) {
         "ChildProcessError",
         make_exc_type("ChildProcessError", exc_exception_new, os_error),
     );
-    crate::namespace_store(
-        namespace,
-        "ConnectionError",
-        make_exc_type("ConnectionError", exc_exception_new, os_error),
-    );
+    let connection_error = make_exc_type("ConnectionError", exc_exception_new, os_error);
+    crate::namespace_store(namespace, "ConnectionError", connection_error);
     crate::namespace_store(
         namespace,
         "BrokenPipeError",
-        make_exc_type("BrokenPipeError", exc_exception_new, os_error),
+        make_exc_type("BrokenPipeError", exc_exception_new, connection_error),
     );
     crate::namespace_store(
         namespace,
         "ConnectionAbortedError",
-        make_exc_type("ConnectionAbortedError", exc_exception_new, os_error),
+        make_exc_type(
+            "ConnectionAbortedError",
+            exc_exception_new,
+            connection_error,
+        ),
     );
     crate::namespace_store(
         namespace,
         "ConnectionRefusedError",
-        make_exc_type("ConnectionRefusedError", exc_exception_new, os_error),
+        make_exc_type(
+            "ConnectionRefusedError",
+            exc_exception_new,
+            connection_error,
+        ),
     );
     crate::namespace_store(
         namespace,
         "ConnectionResetError",
-        make_exc_type("ConnectionResetError", exc_exception_new, os_error),
+        make_exc_type("ConnectionResetError", exc_exception_new, connection_error),
     );
     crate::namespace_store(
         namespace,
@@ -759,24 +749,38 @@ pub(crate) unsafe fn obj_to_bigint(obj: PyObjectRef) -> BigInt {
     }
 }
 
-/// `min(a, b)` — return the smaller of two values.
+/// `min(*args)` / `min(iterable)` — return the smallest value.
 fn builtin_min(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() == 2, "min() takes exactly two arguments");
-    let a = args[0];
-    let b = args[1];
-    unsafe {
-        if is_int(a) && is_int(b) {
-            let va = w_int_get_value(a);
-            let vb = w_int_get_value(b);
-            return Ok(if va <= vb { a } else { b });
-        }
-        if is_int_or_long(a) && is_int_or_long(b) {
-            let va = obj_to_bigint(a);
-            let vb = obj_to_bigint(b);
-            return Ok(if va <= vb { a } else { b });
+    assert!(!args.is_empty(), "min() takes at least one argument");
+    let items: Vec<PyObjectRef> = if args.len() == 1 {
+        collect_iterable(args[0])?
+    } else {
+        args.to_vec()
+    };
+    if items.is_empty() {
+        return Err(crate::PyError::new(
+            crate::PyErrorKind::ValueError,
+            "min() iterable argument is empty",
+        ));
+    }
+    let mut best = items[0];
+    for &item in &items[1..] {
+        unsafe {
+            let new_is_less = if is_int(item) && is_int(best) {
+                w_int_get_value(item) < w_int_get_value(best)
+            } else if is_int_or_long(item) && is_int_or_long(best) {
+                obj_to_bigint(item) < obj_to_bigint(best)
+            } else if is_str(item) && is_str(best) {
+                w_str_get_value(item) < w_str_get_value(best)
+            } else {
+                false
+            };
+            if new_is_less {
+                best = item;
+            }
         }
     }
-    panic!("min() not supported for these types")
+    Ok(best)
 }
 
 /// `max(a, b)` / `max(iterable)` — return the largest of two values or an iterable.
@@ -2827,6 +2831,22 @@ fn builtin_sum(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 }
 
 /// `round(number, ndigits=None)` — PyPy: operation.py round
+/// Round half to even (banker's rounding), matching Python 3 semantics.
+fn round_half_even(v: f64) -> f64 {
+    let rounded = v.round();
+    // When exactly halfway, round to even.
+    if (v - rounded).abs() == 0.5 {
+        let truncated = v.trunc();
+        if truncated % 2.0 == 0.0 {
+            truncated
+        } else {
+            rounded
+        }
+    } else {
+        rounded
+    }
+}
+
 fn builtin_round(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty(), "round() takes at least one argument");
     let obj = args[0];
@@ -2838,9 +2858,9 @@ fn builtin_round(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 Some(nd) if is_int(*nd) => {
                     let n = w_int_get_value(*nd);
                     let factor = 10f64.powi(n as i32);
-                    floatobject::w_float_new((v * factor).round() / factor)
+                    floatobject::w_float_new(round_half_even(v * factor) / factor)
                 }
-                _ => w_int_new(v.round() as i64),
+                _ => w_int_new(round_half_even(v) as i64),
             });
         }
         if is_int(obj) {

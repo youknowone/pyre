@@ -2658,7 +2658,7 @@ fn init_int_type(ns: &mut PyNamespace) {
                 let shift = if little_endian { i } else { length - 1 - i } * 8;
                 bytes[i] = ((uval >> shift) & 0xff) as u8;
             }
-            Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(&bytes))
+            Ok(pyre_object::bytesobject::w_bytes_from_bytes(&bytes))
         }),
     );
     // int.from_bytes(bytes, byteorder='big', *, signed=False) — classmethod in CPython

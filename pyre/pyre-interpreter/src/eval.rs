@@ -979,8 +979,6 @@ impl OpcodeStepExecutor for PyFrame {
                                 "exceptions must derive from BaseException",
                             ))
                         }
-                    } else if pyre_object::is_str(exc) {
-                        Err(PyError::runtime_error(pyre_object::w_str_get_value(exc)))
                     } else {
                         Err(PyError::runtime_error(
                             "exceptions must derive from BaseException",

@@ -212,11 +212,15 @@ unsafe fn int_floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     if vb == 0 {
         return Err(PyError::zero_division("integer division or modulo by zero"));
     }
-    // i64::MIN / -1 overflows
-    match va.checked_div_euclid(vb) {
-        Some(r) => Ok(w_int_new(r)),
-        None => Ok(bigint_result(BigInt::from(va).div_floor(&BigInt::from(vb)))),
-    }
+    // Python floor division: rounds toward negative infinity.
+    // i64::MIN / -1 overflows → fall back to BigInt.
+    let (q, r) = match va.checked_div(vb) {
+        Some(q) => (q, va % vb),
+        None => return Ok(bigint_result(BigInt::from(va).div_floor(&BigInt::from(vb)))),
+    };
+    // Adjust: if remainder is nonzero and signs of operands differ, subtract 1.
+    let q = if r != 0 && (r ^ vb) < 0 { q - 1 } else { q };
+    Ok(w_int_new(q))
 }
 
 unsafe fn int_mod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
@@ -225,7 +229,10 @@ unsafe fn int_mod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     if vb == 0 {
         return Err(PyError::zero_division("integer division or modulo by zero"));
     }
-    Ok(w_int_new(va.rem_euclid(vb)))
+    // Python modulo: result has the same sign as the divisor.
+    let r = va % vb;
+    let r = if r != 0 && (r ^ vb) < 0 { r + vb } else { r };
+    Ok(w_int_new(r))
 }
 
 // ── Long (BigInt) arithmetic operations ─────────────────────────────
@@ -395,7 +402,7 @@ unsafe fn int_lshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let va = int_value(a);
     let vb = int_value(b);
     if vb < 0 {
-        return Err(PyError::type_error("negative shift count"));
+        return Err(PyError::value_error("negative shift count"));
     }
     // `i64::checked_shl` only fails when the shift amount is >= 64, so it
     // happily returns a wrapped result when the VALUE overflows (e.g.
@@ -409,7 +416,7 @@ unsafe fn int_rshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let va = int_value(a);
     let vb = int_value(b);
     if vb < 0 {
-        return Err(PyError::type_error("negative shift count"));
+        return Err(PyError::value_error("negative shift count"));
     }
     let vb = vb as u32;
     Ok(w_int_new(va >> vb.min(63)))
@@ -418,7 +425,7 @@ unsafe fn int_rshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 unsafe fn long_lshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let vb = as_bigint(b);
     if vb < BigInt::from(0) {
-        return Err(PyError::type_error("negative shift count"));
+        return Err(PyError::value_error("negative shift count"));
     }
     let shift = vb.to_u32().unwrap_or(u32::MAX);
     Ok(bigint_result(as_bigint(a) << shift))
@@ -427,7 +434,7 @@ unsafe fn long_lshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 unsafe fn long_rshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let vb = as_bigint(b);
     if vb < BigInt::from(0) {
-        return Err(PyError::type_error("negative shift count"));
+        return Err(PyError::value_error("negative shift count"));
     }
     let shift = vb.to_u32().unwrap_or(u32::MAX);
     Ok(bigint_result(as_bigint(a) >> shift))
@@ -2387,7 +2394,7 @@ pub fn getitem(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
         } else if is_str(obj) {
             let s = w_str_get_value(obj);
             if is_slice(index) {
-                let len = s.len() as i64;
+                let len = s.chars().count() as i64;
                 let start = w_slice_get_start(index);
                 let stop = w_slice_get_stop(index);
                 let step = w_slice_get_step(index);
@@ -2773,19 +2780,7 @@ pub fn exception_match(exc_type: PyObjectRef, check_class: PyObjectRef) -> bool 
         return false;
     }
 
-    if unsafe { is_list(check_class) } {
-        let len = unsafe { w_list_len(check_class) };
-        for i in 0..len {
-            let candidate = unsafe { w_list_getitem(check_class, i as i64) };
-            if let Some(candidate) = candidate {
-                if exception_match(exc_type, candidate) {
-                    return true;
-                }
-            }
-        }
-        return false;
-    }
-
+    // Python 3: except clause only accepts tuple, not list.
     if !unsafe { is_type(check_class) } {
         return false;
     }
@@ -5734,7 +5729,7 @@ fn dict_delitem(obj: PyObjectRef, key: PyObjectRef) -> Result<(), PyError> {
             }
         }
     }
-    Err(PyError::type_error("KeyError"))
+    Err(PyError::key_error("KeyError"))
 }
 
 // py_str and py_repr are defined in display.rs (with __str__/__repr__ dispatch).
