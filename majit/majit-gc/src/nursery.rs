@@ -11,114 +11,127 @@ use std::ptr;
 
 use crate::header::GcHeader;
 
-// ── Global nursery pointers for Cranelift inline bump allocation ──
+// ── Heap-allocated nursery pointers ──
 //
-// RPython x86/assembler.py:2567 malloc_cond_varsize_frame parity:
-// ecx = load(nursery_free_adr)
-// edx = ecx + size
-// cmp edx, load(nursery_top_adr)
-// ja slow_path
-// store(nursery_free_adr, edx)
+// incminimark.py:324-325 parity: nursery_free and nursery_top are fields
+// in the GC object. The JIT reads their addresses via gc_adr_of_nursery_free
+// / gc_adr_of_nursery_top (framework.py:994-997, gc.py:525-531).
 //
-// Single-threaded JIT invariant: only one thread allocates.
-static mut NURSERY_FREE_ADDR: *mut u8 = std::ptr::null_mut();
-static mut NURSERY_TOP_ADDR: *const u8 = std::ptr::null();
+// In Rust, we allocate these two pointers on the heap via Box<NurseryPtrs>.
+// The JIT and the runtime both read/write the SAME memory — no separate
+// global statics, no dual-state synchronization.
+//
+// RPython x86/assembler.py:2567 malloc_cond_varsize_frame inline path:
+//   ecx = load(nursery_free_adr)
+//   edx = ecx + size
+//   cmp edx, load(nursery_top_adr)
+//   ja slow_path
+//   store(nursery_free_adr, edx)
 
-/// Get the stable addresses of the nursery free/top pointers
+/// incminimark.py:324-325 parity: the two mutable nursery pointers
+/// live at a stable heap address so the JIT can hardcode their addresses.
+#[repr(C)]
+pub struct NurseryPtrs {
+    /// incminimark.py:324 self.nursery_free
+    pub free: *mut u8,
+    /// incminimark.py:325 self.nursery_top
+    pub top: *const u8,
+}
+
+/// framework.py:990-992 parity: pointer to the heap-allocated NurseryPtrs.
+/// Set once by Nursery::new(). nursery_global_addrs() returns field addresses
+/// from this struct, matching gc_adr_of_nursery_free / gc_adr_of_nursery_top.
+static mut NURSERY_PTRS: *mut NurseryPtrs = std::ptr::null_mut();
+
+/// gc.py:525-531 get_nursery_free_addr / get_nursery_top_addr parity.
+///
+/// Returns the stable addresses of the nursery free/top fields
 /// for Cranelift inline bump allocation.
 pub fn nursery_global_addrs() -> (usize, usize) {
-    (
-        std::ptr::addr_of!(NURSERY_FREE_ADDR) as usize,
-        std::ptr::addr_of!(NURSERY_TOP_ADDR) as usize,
-    )
+    unsafe {
+        let ptrs = NURSERY_PTRS;
+        debug_assert!(!ptrs.is_null());
+        (
+            std::ptr::addr_of!((*ptrs).free) as usize,
+            std::ptr::addr_of!((*ptrs).top) as usize,
+        )
+    }
 }
 
 /// Default nursery size: 896KB, matching incminimark's TRANSLATION_PARAMS.
 pub const DEFAULT_NURSERY_SIZE: usize = 896 * 1024;
 
 /// Nursery memory region with bump-pointer allocation.
+///
+/// incminimark.py:324-325 parity: nursery_free and nursery_top live in
+/// a heap-allocated NurseryPtrs struct at a stable address. Both the JIT
+/// inline fast path and the runtime slow path read/write the same fields.
 pub struct Nursery {
     /// Start of the nursery memory region.
     start: *mut u8,
-    /// Current allocation pointer (next free byte).
-    free: *mut u8,
-    /// End of the nursery region (one past the last byte).
-    top: *const u8,
     /// Total size of the nursery.
     size: usize,
+    /// Heap-allocated free/top pointers. The Box ensures stable addresses
+    /// that the JIT can hardcode into compiled code.
+    ptrs: Box<NurseryPtrs>,
 }
 
 // Safety: The nursery owns its memory exclusively and only one thread accesses it.
 unsafe impl Send for Nursery {}
 
 impl Nursery {
-    /// Create a new nursery of the given size (in bytes).
+    /// incminimark.py:553-560 allocate_nursery parity:
+    ///   self.nursery_free = self.nursery
+    ///   self.nursery_top = self.nursery + self.nursery_size
     pub fn new(size: usize) -> Self {
         let layout = Layout::from_size_align(size, 16).expect("invalid nursery layout");
         let start = unsafe { alloc::alloc_zeroed(layout) };
         if start.is_null() {
             alloc::handle_alloc_error(layout);
         }
-        let nursery = Nursery {
-            start,
-            free: start,
-            top: unsafe { start.add(size) },
-            size,
-        };
+        let top = unsafe { start.add(size) };
+        let ptrs = Box::new(NurseryPtrs { free: start, top });
         unsafe {
-            NURSERY_FREE_ADDR = nursery.free;
-            NURSERY_TOP_ADDR = nursery.top;
+            NURSERY_PTRS = &*ptrs as *const NurseryPtrs as *mut NurseryPtrs;
         }
-        nursery
+        Nursery { start, size, ptrs }
     }
 
-    /// Try to allocate `total_size` bytes (header + payload) from the nursery.
+    /// incminimark.py:676-680 malloc_fixedsize parity:
+    ///   result = self.nursery_free
+    ///   self.nursery_free = new_free = result + totalsize
+    ///   if new_free > self.nursery_top: collect_and_reserve()
     ///
-    /// Returns a pointer to the start of the allocated region (i.e., where
-    /// the GcHeader will be written), or null if there's not enough space.
-    ///
-    /// The allocated memory is already zero-filled (from initialization or
-    /// post-collection reset).
+    /// Returns null when the nursery is full (caller must collect & retry).
     #[inline]
     pub fn alloc(&mut self, total_size: usize) -> *mut u8 {
-        // incminimark.py:676 — self.nursery_free is the SAME location the
-        // JIT inline bump path writes to (gc_adr_of_nursery_free). Sync
-        // from the global before reading, so we see JIT's latest bump.
-        unsafe {
-            self.free = NURSERY_FREE_ADDR;
-        }
         // Ensure minimum size for forwarding during collection.
         let total_size = total_size.max(GcHeader::MIN_NURSERY_OBJ_SIZE);
         // Align to 8 bytes.
         let total_size = (total_size + 7) & !7;
 
-        let new_free = unsafe { self.free.add(total_size) };
-        if new_free as *const u8 > self.top {
+        let result = self.ptrs.free;
+        let new_free = unsafe { result.add(total_size) };
+        if new_free as *const u8 > self.ptrs.top {
             return ptr::null_mut();
         }
-        let result = self.free;
-        self.free = new_free;
-        unsafe {
-            NURSERY_FREE_ADDR = self.free;
-        }
+        self.ptrs.free = new_free;
         result
     }
 
-    /// Reset the nursery: set the free pointer back to start and zero-fill.
+    /// incminimark.py:1946 parity: reset nursery after minor collection.
+    ///   self.nursery_free = self.nursery
     pub fn reset(&mut self) {
         unsafe {
             ptr::write_bytes(self.start, 0, self.size);
         }
-        self.free = self.start;
-        unsafe {
-            NURSERY_FREE_ADDR = self.free;
-        }
+        self.ptrs.free = self.start;
     }
 
-    /// Current free pointer.
+    /// incminimark.py:676: current nursery_free.
     #[inline]
     pub fn free_ptr(&self) -> *mut u8 {
-        self.free
+        self.ptrs.free
     }
 
     /// Set the free pointer (used after collection with pinned objects).
@@ -127,14 +140,24 @@ impl Nursery {
     /// `ptr` must be within the nursery bounds.
     pub unsafe fn set_free_ptr(&mut self, ptr: *mut u8) {
         debug_assert!(ptr as usize >= self.start as usize);
-        debug_assert!(ptr as usize <= self.top as usize);
-        self.free = ptr;
+        debug_assert!(ptr as usize <= self.ptrs.top as usize);
+        self.ptrs.free = ptr;
     }
 
-    /// End of nursery (top pointer).
+    /// incminimark.py:910,1947: set nursery_top (pinned object barriers).
+    ///
+    /// # Safety
+    /// `ptr` must be within the nursery bounds.
+    pub unsafe fn set_top_ptr(&mut self, ptr: *const u8) {
+        debug_assert!(ptr as usize >= self.start as usize);
+        debug_assert!(ptr as usize <= self.start as usize + self.size);
+        self.ptrs.top = ptr;
+    }
+
+    /// incminimark.py:325: current nursery_top.
     #[inline]
     pub fn top_ptr(&self) -> *const u8 {
-        self.top
+        self.ptrs.top
     }
 
     /// Start of nursery.
@@ -152,19 +175,19 @@ impl Nursery {
     /// Bytes currently used.
     #[inline]
     pub fn used(&self) -> usize {
-        self.free as usize - self.start as usize
+        self.ptrs.free as usize - self.start as usize
     }
 
     /// Bytes remaining.
     #[inline]
     pub fn remaining(&self) -> usize {
-        self.top as usize - self.free as usize
+        self.ptrs.top as usize - self.ptrs.free as usize
     }
 
     /// Check if an address is within the nursery.
     #[inline]
     pub fn contains(&self, addr: usize) -> bool {
-        addr >= self.start as usize && addr < self.top as usize
+        addr >= self.start as usize && addr < (self.start as usize + self.size)
     }
 }
 
@@ -262,5 +285,18 @@ mod tests {
             assert!(!p.is_null());
             assert_eq!(p as usize % 8, 0); // result is 8-byte aligned
         }
+    }
+
+    #[test]
+    fn test_nursery_global_addrs_stable() {
+        let nursery = Nursery::new(4096);
+        let (free_addr, top_addr) = nursery_global_addrs();
+        // The addresses should point to the NurseryPtrs fields
+        assert_ne!(free_addr, 0);
+        assert_ne!(top_addr, 0);
+        assert_ne!(free_addr, top_addr);
+        // Reading through the address should give the current free pointer
+        let free_val = unsafe { *(free_addr as *const *mut u8) };
+        assert_eq!(free_val, nursery.free_ptr());
     }
 }
