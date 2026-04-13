@@ -7559,14 +7559,18 @@ impl CraneliftBackend {
                         builder.seal_block(helper_block);
                         builder.set_cold_block(helper_block);
                         let frame_ptr = saved_frame_ptr;
+                        // RPython assembler_call_helper receives deadframe as an
+                        // RPython function parameter → RPython's stack scanning
+                        // keeps it as a GC root. Pyre's helper is a Rust function
+                        // whose stack is NOT scanned by GC. Push the callee's
+                        // jitframe onto the shadow stack so GC can trace it during
+                        // the helper call. Pop after the helper returns.
+                        emit_call_header_shadowstack(&mut builder, ptr_type, result_jf);
                         let result_jf_data =
                             builder.ins().iadd_imm(result_jf, JF_FRAME_ITEM0_OFS as i64);
                         let result_jf_data_i64 =
                             ptr_arg_as_i64(&mut builder, result_jf_data, ptr_type);
                         // RPython assembler.py:349-350: assembler_helper(tmploc, vloc).
-                        // tmploc = eax = returned jitframe. Use result_jf_data
-                        // (not args_ptr) because GC may have moved the nursery
-                        // jitframe during the callee's execution.
                         let force_result = emit_host_call(
                             &mut builder,
                             ptr_type,
@@ -7581,6 +7585,9 @@ impl CraneliftBackend {
                             ],
                             Some(cl_types::I64),
                         );
+                        // Pop callee jf from shadow stack. _reload_frame_if_necessary
+                        // then reloads the CALLER's jitframe (which is underneath).
+                        emit_call_footer_shadowstack(&mut builder, ptr_type);
                         // _reload_frame_if_necessary: GC may have moved
                         // the caller's jitframe during the helper call.
                         jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
