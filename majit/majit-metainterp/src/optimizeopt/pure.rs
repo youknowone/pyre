@@ -160,6 +160,101 @@ impl RecentPureOps {
     }
 }
 
+struct RecentPureOpTable {
+    buckets: Vec<Option<RecentPureOps>>,
+    history_length: usize,
+}
+
+impl RecentPureOpTable {
+    fn new(limit: usize) -> Self {
+        let bucket_count = Self::bucket_count();
+        let buckets = std::iter::repeat_with(|| None).take(bucket_count).collect();
+        RecentPureOpTable {
+            buckets,
+            history_length: limit,
+        }
+    }
+
+    fn bucket_count() -> usize {
+        (OpCode::LoadEffectiveAddress as usize - OpCode::IntAdd as usize + 1) + 3
+    }
+
+    fn bucket_index(opcode: OpCode) -> Option<usize> {
+        if opcode.is_ovf() {
+            return Some(opcode as usize - OpCode::IntAddOvf as usize);
+        }
+        match opcode {
+            OpCode::GetfieldGcPureI => {
+                Some(OpCode::LoadEffectiveAddress as usize - OpCode::IntAdd as usize + 1)
+            }
+            OpCode::GetfieldGcPureR => {
+                Some(OpCode::LoadEffectiveAddress as usize - OpCode::IntAdd as usize + 2)
+            }
+            OpCode::GetfieldGcPureF => {
+                Some(OpCode::LoadEffectiveAddress as usize - OpCode::IntAdd as usize + 3)
+            }
+            _ if opcode.is_always_pure() => Some(opcode as usize - OpCode::IntAdd as usize),
+            _ => None,
+        }
+    }
+
+    fn bucket(&self, opcode: OpCode) -> Option<&RecentPureOps> {
+        let idx = Self::bucket_index(opcode)?;
+        self.buckets.get(idx)?.as_ref()
+    }
+
+    fn bucket_mut(&mut self, opcode: OpCode) -> Option<&mut RecentPureOps> {
+        let idx = Self::bucket_index(opcode)?;
+        if self.buckets[idx].is_none() {
+            self.buckets[idx] = Some(RecentPureOps::new(self.history_length));
+        }
+        self.buckets[idx].as_mut()
+    }
+
+    fn lookup(&self, key: &PureOpKey) -> Option<OpRef> {
+        self.bucket(key.opcode)?.lookup(key)
+    }
+
+    fn insert(&mut self, key: PureOpKey, result: OpRef) {
+        if let Some(bucket) = self.bucket_mut(key.opcode) {
+            bucket.insert(key, result);
+        }
+    }
+
+    fn lookup1(
+        &self,
+        opcode: OpCode,
+        arg0: OpRef,
+        descr_index: Option<u32>,
+        same_box: impl Fn(OpRef, OpRef) -> bool,
+    ) -> Option<OpRef> {
+        self.bucket(opcode)
+            .and_then(|bucket| bucket.lookup1(opcode, arg0, descr_index, same_box))
+    }
+
+    fn lookup2(
+        &self,
+        opcode: OpCode,
+        arg0: OpRef,
+        arg1: OpRef,
+        descr_index: Option<u32>,
+        commutative: bool,
+        same_box: impl Fn(OpRef, OpRef) -> bool,
+    ) -> Option<OpRef> {
+        self.bucket(opcode).and_then(|bucket| {
+            bucket.lookup2(opcode, arg0, arg1, descr_index, commutative, same_box)
+        })
+    }
+
+    fn clear(&mut self) {
+        *self = Self::new(self.history_length);
+    }
+
+    fn history_length(&self) -> usize {
+        self.history_length
+    }
+}
+
 /// The OptPure optimization pass.
 ///
 /// pure.py: OptPure class.
@@ -173,7 +268,7 @@ impl RecentPureOps {
 /// - GUARD_NO_EXCEPTION removal after eliminated CALL_PURE.
 /// - RECORD_KNOWN_RESULT for pre-recorded call_pure results.
 pub struct OptPure {
-    cache: RecentPureOps,
+    cache: RecentPureOpTable,
     /// Postponed OVF operation: INT_ADD_OVF, INT_SUB_OVF, INT_MUL_OVF.
     /// pure.py: postponed_op — deferred until GUARD_NO_OVERFLOW is seen.
     postponed_op: Option<Op>,
@@ -216,7 +311,7 @@ struct PreamblePureEntry {
 impl OptPure {
     pub fn new() -> Self {
         OptPure {
-            cache: RecentPureOps::new(4096),
+            cache: RecentPureOpTable::new(crate::jit::PARAMETERS.pureop_historylength as usize),
             postponed_op: None,
             call_pure_positions: Vec::new(),
             short_preamble_pure_ops: Vec::new(),
@@ -746,6 +841,10 @@ impl OptPure {
 }
 
 impl Optimization for OptPure {
+    fn set_pureop_historylength(&mut self, limit: usize) {
+        self.cache = RecentPureOpTable::new(limit);
+    }
+
     fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         // optimizer.py: pure_from_args1 parity — consume pending registrations
         // from rewrite pass (CAST_*, CONVERT_* reverse-pure relationships).
@@ -1045,8 +1144,8 @@ impl Optimization for OptPure {
     }
 
     fn setup(&mut self) {
-        let limit = self.cache.lst.len();
-        self.cache = RecentPureOps::new(limit);
+        let limit = self.cache.history_length();
+        self.cache = RecentPureOpTable::new(limit);
         self.postponed_op = None;
         self.call_pure_positions.clear();
         self.short_preamble_pure_ops.clear();
@@ -1434,7 +1533,7 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptPure {
-            cache: RecentPureOps::new(16),
+            cache: RecentPureOpTable::new(16),
             postponed_op: None,
             call_pure_positions: Vec::new(),
             short_preamble_pure_ops: Vec::new(),

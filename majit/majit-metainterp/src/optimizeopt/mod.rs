@@ -4076,6 +4076,10 @@ pub trait Optimization {
     /// populated. Default: no-op.
     fn set_phase2(&mut self, _phase2: bool) {}
 
+    /// warmstate.py: pureop_historylength.
+    /// Only OptPure consumes this; other passes ignore it.
+    fn set_pureop_historylength(&mut self, _limit: usize) {}
+
     /// Name of this pass (for debugging).
     fn name(&self) -> &'static str;
 

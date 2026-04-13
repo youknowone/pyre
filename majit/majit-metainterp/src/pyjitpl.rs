@@ -1108,6 +1108,7 @@ impl<M: Clone> MetaInterp<M> {
         } else {
             Optimizer::default_pipeline()
         };
+        opt.set_pureop_historylength(self.warm_state.pureop_historylength() as usize);
         // optimizer.py:787-789: constant_fold — allocate immutable objects
         // at compile time. Uses Box::leak for permanent allocation (immutable
         // objects are never freed, matching RPython's prebuilt constants).

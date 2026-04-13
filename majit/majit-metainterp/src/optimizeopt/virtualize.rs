@@ -6,7 +6,6 @@
 /// Instead of emitting the allocation, fields are tracked in the optimizer.
 /// If a virtual escapes (e.g., passed to a call or stored in a non-virtual),
 /// it gets "forced" (materialized by emitting the allocation + setfield ops).
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use majit_ir::{Descr, DescrRef, FieldDescr, OopSpecIndex, Op, OpCode, OpRef, Type, Value};
@@ -65,11 +64,6 @@ pub struct OptVirtualize {
     /// If set, frame OpRef(0) is treated as a virtualizable object
     /// whose field accesses are absorbed by the optimizer.
     vable_config: Option<VirtualizableConfig>,
-    /// Maps array pointer OpRef → (array_field_index, array_descr).
-    /// Populated when a GetfieldRawI reads an array pointer field from the frame.
-    /// The DescrRef is captured from the first SetarrayitemRaw/GetarrayitemRaw op
-    /// we absorb, so we can emit correct SetarrayitemRaw on force.
-    vable_array_ptrs: HashMap<OpRef, (usize, Option<DescrRef>)>,
     /// Whether virtualizable state has been initialized from existing trace inputs.
     vable_initialized: bool,
     /// Whether setup needs to initialize virtualizable PtrInfo on ctx.
@@ -94,7 +88,6 @@ impl OptVirtualize {
         OptVirtualize {
             is_phase2: false,
             vable_config: None,
-            vable_array_ptrs: HashMap::new(),
             vable_initialized: false,
             needs_vable_setup: false,
             last_emitted_was_removed: false,
@@ -107,7 +100,6 @@ impl OptVirtualize {
         OptVirtualize {
             is_phase2: false,
             vable_config: Some(config),
-            vable_array_ptrs: HashMap::new(),
             vable_initialized: false,
             needs_vable_setup: false,
             last_emitted_was_removed: false,
@@ -311,47 +303,6 @@ impl OptVirtualize {
             let mut set_op = Op::new(OpCode::SetfieldRaw, &[opref, value_ref]);
             set_op.descr = Some(descr);
             ctx.emit_extra(ctx.current_pass_idx, set_op);
-        }
-
-        // Emit SETARRAYITEM_RAW for each tracked array element
-        for (array_idx, elements) in vinfo.arrays {
-            // Find the stored array descr for SetarrayitemRaw
-            let array_descr = self
-                .vable_array_ptrs
-                .iter()
-                .find(|(_, (idx, _))| *idx == array_idx as usize)
-                .and_then(|(_, (_, descr))| descr.clone());
-
-            // Get the array pointer from the frame — use the stored field descr
-            let mut get_array_op = Op::new(OpCode::GetfieldRawI, &[opref]);
-            // Look up the original descr for the array pointer field read
-            if let Some(ref config) = self.vable_config {
-                if let Some(&offset) = config.array_field_offsets.get(array_idx as usize) {
-                    // Compute the field descr index for this offset
-                    let descr_idx = virtualizable_field_index(offset);
-                    get_array_op.descr = get_field_descr(&vinfo.field_descrs, descr_idx)
-                        .or_else(|| Some(make_field_index_descr(descr_idx)));
-                }
-            }
-            let array_ref = ctx.emit_extra(ctx.current_pass_idx, get_array_op);
-
-            for (i, elem_ref) in elements.into_iter().enumerate() {
-                let item_type = self
-                    .vable_config
-                    .as_ref()
-                    .and_then(|config| config.array_item_types.get(array_idx as usize).copied())
-                    .unwrap_or(Type::Int);
-                let elem_ref = if elem_ref.is_none() {
-                    ctx.new_const_item(item_type)
-                } else {
-                    let forced = self.force_virtual(elem_ref, ctx);
-                    ctx.get_box_replacement(forced)
-                };
-                let idx_ref = ctx.emit_constant_int(i as i64);
-                let mut set_op = Op::new(OpCode::SetarrayitemRaw, &[array_ref, idx_ref, elem_ref]);
-                set_op.descr = array_descr.clone();
-                ctx.emit_extra(ctx.current_pass_idx, set_op);
-            }
         }
 
         opref
@@ -700,12 +651,6 @@ impl OptVirtualize {
                     }
                 }
             }
-            // Virtualizable: first read of an untracked field.
-            // Let the op emit, but cache result for future reads
-            // and register array pointers for array tracking.
-            if let PtrInfo::Virtualizable(_) = &info {
-                return self.handle_virtualizable_first_read(op, field_idx, ctx);
-            }
         }
         // virtualize.py:192: self.make_nonnull(op.getarg(0))
         // optimizer.py:437-448: only set NonNull if no existing PtrInfo.
@@ -715,66 +660,10 @@ impl OptVirtualize {
         OptimizationResult::PassOn
     }
 
-    /// Handle first read of a virtualizable field (no cached value yet).
-    ///
-    /// Standard virtualizable traces should already have scalar fields seeded
-    /// from input boxes. The remaining legacy case here is learning which raw
-    /// frame field carries an array pointer so later Get/SetarrayitemRaw ops
-    /// can be absorbed.
-    fn handle_virtualizable_first_read(
-        &mut self,
-        op: &Op,
-        field_idx: u32,
-        ctx: &mut OptContext,
-    ) -> OptimizationResult {
-        let offset = extract_field_offset(field_idx);
-
-        // Array pointer field: remember which array this pointer came from
-        // so subsequent Get/SetarrayitemRaw can be absorbed. Do not cache
-        // the pointer itself as a tracked virtualizable field: only fields
-        // declared in VirtualizableConfig should participate in force/writeback.
-        let arr_idx = self.vable_config.as_ref().and_then(|config| {
-            offset.and_then(|off| config.array_field_offsets.iter().position(|&o| o == off))
-        });
-        if let Some(arr_idx) = arr_idx {
-            if !self.vable_initialized {
-                self.init_virtualizable(ctx);
-                self.vable_initialized = true;
-            }
-            self.vable_array_ptrs.insert(op.pos, (arr_idx, None));
-        }
-        OptimizationResult::PassOn
-    }
-
     fn optimize_setarrayitem_gc(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let array_ref = ctx.get_box_replacement(op.arg(0));
         let index_ref = op.arg(1);
         let value_ref = ctx.get_box_replacement(op.arg(2));
-
-        // Virtualizable array check
-        if !self.vable_array_ptrs.contains_key(&array_ref) {
-            self.try_register_virtualizable_array_ptr(array_ref, ctx);
-        }
-        if let Some(&mut (arr_idx, ref mut stored_descr)) =
-            self.vable_array_ptrs.get_mut(&array_ref)
-        {
-            // Capture the array descr from the first absorbed op
-            if stored_descr.is_none() {
-                *stored_descr = op.descr.clone();
-            }
-            if let Some(index) = ctx.get_constant_int(index_ref) {
-                let frame_ref = OpRef(0);
-                if let Some(PtrInfo::Virtualizable(vstate)) = ctx.get_ptr_info_mut(frame_ref) {
-                    set_array_element(
-                        &mut vstate.arrays,
-                        arr_idx as u32,
-                        index as usize,
-                        value_ref,
-                    );
-                    return OptimizationResult::Remove;
-                }
-            }
-        }
 
         if let Some(index) = ctx.get_constant_int(index_ref) {
             if let Some(info) = ctx.get_ptr_info_mut(array_ref) {
@@ -797,35 +686,6 @@ impl OptVirtualize {
     fn optimize_getarrayitem_gc(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let array_ref = ctx.get_box_replacement(op.arg(0));
         let index_ref = op.arg(1);
-
-        // Virtualizable array check
-        if !self.vable_array_ptrs.contains_key(&array_ref) {
-            self.try_register_virtualizable_array_ptr(array_ref, ctx);
-        }
-        if let Some(&mut (arr_idx, ref mut stored_descr)) =
-            self.vable_array_ptrs.get_mut(&array_ref)
-        {
-            // Capture the array descr from the first absorbed op
-            if stored_descr.is_none() {
-                *stored_descr = op.descr.clone();
-            }
-            if let Some(index) = ctx.get_constant_int(index_ref) {
-                let frame_ref = OpRef(0);
-                // Try to read cached value first
-                if let Some(PtrInfo::Virtualizable(vstate)) = ctx.get_ptr_info(frame_ref) {
-                    if let Some(val) =
-                        get_array_element(&vstate.arrays, arr_idx as u32, index as usize)
-                    {
-                        ctx.replace_op(op.pos, val);
-                        return OptimizationResult::Remove;
-                    }
-                }
-                // Cache the result of this first read
-                if let Some(PtrInfo::Virtualizable(vstate)) = ctx.get_ptr_info_mut(frame_ref) {
-                    set_array_element(&mut vstate.arrays, arr_idx as u32, index as usize, op.pos);
-                }
-            }
-        }
 
         if let Some(index) = ctx.get_constant_int(index_ref) {
             if let Some(info) = ctx.get_ptr_info(array_ref).cloned() {
@@ -1296,39 +1156,6 @@ impl OptVirtualize {
         OptimizationResult::Replace(forced)
     }
 
-    fn try_register_virtualizable_array_ptr(&mut self, array_ref: OpRef, ctx: &OptContext) {
-        if self.vable_array_ptrs.contains_key(&array_ref) {
-            return;
-        }
-        let Some(config) = &self.vable_config else {
-            return;
-        };
-        let Some(source_op) = ctx.new_operations.iter().find(|op| op.pos == array_ref) else {
-            return;
-        };
-        if !matches!(
-            source_op.opcode,
-            OpCode::GetfieldRawI | OpCode::GetfieldRawR | OpCode::GetfieldRawF
-        ) {
-            return;
-        }
-        if source_op.arg(0) != ctx.get_box_replacement(OpRef(0)) {
-            return;
-        }
-        if self.is_standard_virtualizable_ref(ctx.get_box_replacement(OpRef(0)), ctx) {
-            return;
-        }
-        let field_idx = descr_index(&source_op.descr);
-        let offset = extract_field_offset(field_idx);
-        let arr_idx = config
-            .array_field_offsets
-            .iter()
-            .position(|&o| Some(o) == offset);
-        if let Some(arr_idx) = arr_idx {
-            self.vable_array_ptrs.insert(array_ref, (arr_idx, None));
-        }
-    }
-
     fn clear_forced_field_caches(&mut self) {
         // No-op: forced field caches are handled by heap.rs cache,
         // not by separate PtrInfo variants.
@@ -1668,7 +1495,6 @@ impl Optimization for OptVirtualize {
     }
 
     fn setup(&mut self) {
-        self.vable_array_ptrs.clear();
         self.vable_initialized = false;
         // Defer virtualizable PtrInfo init to first propagate_forward
         // (setup() doesn't have access to OptContext).
@@ -1901,6 +1727,7 @@ fn set_array_element(
 mod tests {
     use super::*;
     use crate::optimizeopt::optimizer::Optimizer;
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     // ── Test descriptors ──

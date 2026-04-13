@@ -35,6 +35,7 @@ pub(crate) struct PendingBridgeRd {
 /// RPython optimizer.py: Optimizer class with pass chain and shared state.
 pub struct Optimizer {
     passes: Vec<Box<dyn Optimization>>,
+    pub pureop_historylength: usize,
     /// Final num_inputs after optimization (may increase if virtualizable
     /// adds virtual input args).
     final_num_inputs: usize,
@@ -935,6 +936,7 @@ impl Optimizer {
     pub fn new() -> Self {
         Optimizer {
             passes: Vec::new(),
+            pureop_historylength: crate::jit::PARAMETERS.pureop_historylength as usize,
             final_num_inputs: 0,
             call_pure_results: std::collections::HashMap::new(),
             last_guard_op: None,
@@ -1434,8 +1436,16 @@ impl Optimizer {
     }
 
     /// Add an optimization pass to the chain.
-    pub fn add_pass(&mut self, pass: Box<dyn Optimization>) {
+    pub fn add_pass(&mut self, mut pass: Box<dyn Optimization>) {
+        pass.set_pureop_historylength(self.pureop_historylength);
         self.passes.push(pass);
+    }
+
+    pub fn set_pureop_historylength(&mut self, limit: usize) {
+        self.pureop_historylength = limit;
+        for pass in &mut self.passes {
+            pass.set_pureop_historylength(limit);
+        }
     }
 
     /// Mark all passes as Phase 2 (loop body).
