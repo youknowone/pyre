@@ -16,7 +16,6 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-PYRE="${1:-./target/release/pyre}"
 BENCH=pyre/bench
 PASS=0
 FAIL=0
@@ -24,14 +23,27 @@ RESULTS=()
 COMPARISONS=()
 
 CARGO_EXTRA=""
+CARGO_BIN="pyre"
+PYRE_DEFAULT="./target/release/pyre"
 case "$BACKEND" in
-    dynasm)    CARGO_EXTRA="--no-default-features --features dynasm" ;;
-    cranelift|"") ;;  # cranelift is default
+    dynasm)
+        CARGO_EXTRA="--no-default-features --features dynasm"
+        CARGO_BIN="pyre-dynasm"
+        PYRE_DEFAULT="./target/release/pyre-dynasm"
+        ;;
+    cranelift)
+        CARGO_EXTRA="--no-default-features --features cranelift"
+        CARGO_BIN="pyre-cranelift"
+        PYRE_DEFAULT="./target/release/pyre-cranelift"
+        ;;
+    "")
+        ;;  # plain default build keeps using pyre
     *) echo "ERROR: unknown backend '$BACKEND' (use: dynasm, cranelift)"; exit 1 ;;
 esac
+PYRE="${1:-$PYRE_DEFAULT}"
 
-echo "Building pyre (release, backend=${BACKEND:-cranelift})..."
-cargo build --release -p pyrex $CARGO_EXTRA 2>&1 | tail -1
+echo "Building ${CARGO_BIN} (release, backend=${BACKEND:-default})..."
+cargo build --release -p pyrex --bin "$CARGO_BIN" $CARGO_EXTRA 2>&1 | tail -1
 
 if [ ! -x "$PYRE" ]; then
     echo "ERROR: build failed"

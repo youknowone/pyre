@@ -16,7 +16,10 @@ use majit_backend::{
 use majit_ir::{FailDescr, GcRef, InputArg, Op, Type, Value};
 
 use crate::arch;
-use crate::assembler::{Assembler386, CompiledCode};
+#[cfg(target_arch = "aarch64")]
+use crate::aarch64::assembler::{AssemblerARM64 as Asm, CompiledCode};
+#[cfg(target_arch = "x86_64")]
+use crate::x86::assembler::{Assembler386 as Asm, CompiledCode};
 use crate::codebuf;
 use crate::frame::FrameData;
 use crate::guard::DynasmFailDescr;
@@ -344,7 +347,7 @@ impl Backend for DynasmBackend {
 
         let constants = std::mem::take(&mut self.constants);
         let typeid_table = self.collect_classptr_typeid_table(ops, &constants);
-        let mut asm = Assembler386::new(
+        let mut asm = Asm::new(
             trace_id,
             header_pc,
             constants,
@@ -378,7 +381,7 @@ impl Backend for DynasmBackend {
 
         let constants = std::mem::take(&mut self.constants);
         let typeid_table = self.collect_classptr_typeid_table(ops, &constants);
-        let mut asm = Assembler386::new(trace_id, 0, constants, self.vtable_offset, typeid_table);
+        let mut asm = Asm::new(trace_id, 0, constants, self.vtable_offset, typeid_table);
         asm.set_call_assembler_targets(Self::call_assembler_targets_snapshot());
 
         let orig_compiled = Self::get_compiled(original_token);
@@ -392,7 +395,7 @@ impl Backend for DynasmBackend {
             fail_descr.trace_id(),
             fail_descr.fail_index(),
         );
-        let arglocs = Assembler386::rebuild_faillocs_from_descr(&guard_descr, inputargs);
+        let arglocs = Asm::rebuild_faillocs_from_descr(&guard_descr, inputargs);
         let compiled = asm.assemble_bridge(fail_descr, inputargs, ops, &arglocs)?;
 
         let bridge_addr = codebuf::buffer_ptr(&compiled.buffer) as usize;
@@ -400,8 +403,17 @@ impl Backend for DynasmBackend {
 
         // assembler.py:987 patch_jump_for_descr — redirect guard to bridge.
         // Use the exact guard descr found above, not a fail_index search.
-        if guard_descr.adr_jump_offset() != 0 {
-            Assembler386::patch_jump_for_descr(&guard_descr, bridge_addr);
+        let ajo = guard_descr.adr_jump_offset();
+        if std::env::var_os("MAJIT_LOG").is_some() {
+            eprintln!(
+                "[dynasm-bridge] patch: trace_id={} fail_index={} adr_jump_offset=0x{:x} bridge_addr=0x{:x}",
+                guard_descr.trace_id, guard_descr.fail_index, ajo, bridge_addr
+            );
+        }
+        if ajo != 0 {
+            Asm::patch_jump_for_descr(&guard_descr, bridge_addr);
+        } else if std::env::var_os("MAJIT_LOG").is_some() {
+            eprintln!("[dynasm-bridge] WARNING: adr_jump_offset=0, bridge NOT patched!");
         }
         guard_descr.set_bridge_addr(bridge_addr);
 
@@ -478,6 +490,18 @@ impl Backend for DynasmBackend {
                 }
             }
             eprintln!();
+        }
+
+        // Debug: verify bridge patches are visible
+        if std::env::var_os("MAJIT_LOG").is_some() {
+            for descr in &compiled.fail_descrs {
+                if descr.bridge_addr() != 0 && descr.adr_jump_offset() == 0 {
+                    eprintln!(
+                        "[dynasm] bridge-patched guard fi={} bridge_addr={:#x} ajo=0 (patched)",
+                        descr.fail_index, descr.bridge_addr()
+                    );
+                }
+            }
         }
 
         // llmodel.py:323: ll_frame = func(ll_frame)
@@ -663,7 +687,7 @@ impl Backend for DynasmBackend {
             .fetch_max(new_depth, Ordering::Release);
         let old_addr = codebuf::buffer_ptr(&old_compiled.buffer);
         let new_addr = codebuf::buffer_ptr(&new_compiled.buffer);
-        Assembler386::redirect_call_assembler(old_addr, new_addr);
+        Asm::redirect_call_assembler(old_addr, new_addr);
         Self::redirect_call_assembler_target(old.number, new_addr as usize);
         Ok(())
     }
@@ -882,6 +906,18 @@ impl Backend for DynasmBackend {
             }
         }
         None
+    }
+
+    fn update_fail_descr_recovery_layout(
+        &mut self,
+        token: &JitCellToken,
+        trace_id: u64,
+        fail_index: u32,
+        recovery_layout: ExitRecoveryLayout,
+    ) -> bool {
+        let descr = Self::find_descr(token, trace_id, fail_index);
+        descr.set_recovery_layout(recovery_layout);
+        true
     }
 
     fn setup_once(&mut self) {}

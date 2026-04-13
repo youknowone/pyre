@@ -1,20 +1,19 @@
-/// rpython/jit/backend/x86 + aarch64 parity:
+/// rpython/jit/backend/ parity:
 /// Direct machine code generation via dynasm-rs with in-place patching.
 ///
-/// Module structure mirrors RPython's backend/x86/:
-///   runner.py   → runner.rs  (DynasmBackend — Backend trait impl)
-///   assembler.py → assembler.rs (Assembler386 — code generation)
-///   regalloc.py → regalloc.rs (RegAlloc — register allocation)
-///   regloc.py  → regloc.rs  (register/location types)
-///   arch.py    → arch.rs    (architecture constants)
-///   callbuilder.py → callbuilder.rs (FFI call ABI)
-///   codebuf.py → codebuf.rs (code buffer management)
-///   jump.py    → jump.rs    (frame layout remapping)
-///   opassembler.py → opassembler.rs (arch-specific emit_op_*)
+/// Module structure mirrors RPython's backend directory layout:
+///   llsupport/llmodel.py    → runner.rs  (DynasmBackend)
+///   llsupport/assembler.py  → assembler.rs (BaseAssembler — shared)
+///   llsupport/regalloc.py   → regalloc.rs (BaseRegalloc — shared)
+///   llsupport/jitframe.py   → jitframe.rs
+///   x86/assembler.py        → x86/assembler.rs (Assembler386)
+///   aarch64/assembler.py    → aarch64/assembler.rs (AssemblerARM64)
+///   aarch64/opassembler.py  → aarch64/opassembler.rs (ResOpAssembler)
 ///
-/// guard.rs and frame.rs are from compile.py / jitframe.py.
+/// arch.rs, codebuf.rs, guard.rs, regloc.rs are from llsupport/.
+
+// ── Shared modules (llsupport/ parity) ──
 pub mod arch;
-pub mod assembler;
 pub mod callbuilder;
 pub mod codebuf;
 pub mod frame;
@@ -22,10 +21,15 @@ pub mod gcmap;
 pub mod guard;
 pub mod jitframe;
 pub mod jump;
-pub mod opassembler;
 pub mod regalloc;
 pub mod regloc;
 pub mod runner;
+
+// ── Architecture-specific modules ──
+#[cfg(target_arch = "aarch64")]
+pub mod aarch64;
+#[cfg(target_arch = "x86_64")]
+pub mod x86;
 
 // ── llmodel.py:194-199 JIT exception state ──
 // RPython stores exception state in thread-local (GIL-protected) globals.
@@ -124,10 +128,12 @@ pub fn call_assembler_force_fn_addr() -> usize {
 /// failure (jf_descr != done_descr). NOT called for pending/unresolved
 /// targets (those skip the callee call entirely).
 ///
-/// Dispatch order matches compile.py:701-717 handle_fail:
-///   1. try bridge tracing (if CA_BRIDGE_FN registered)
-///   2. resume in blackhole (if CA_BLACKHOLE_FN registered)
-///   3. return 0 (no handler available)
+/// Dispatch order matches Cranelift's call_assembler helper parity:
+///   1. execute an already-attached bridge, if present
+///   2. try bridge tracing/attachment (if CA_BRIDGE_FN registered)
+///   3. execute the newly-attached bridge, if present
+///   4. resume in blackhole (if CA_BLACKHOLE_FN registered)
+///   5. fall back to force_fn(frame_ptr)
 ///
 /// Input:  rdi/x0 = callee_jf_ptr (heap-allocated jitframe)
 ///         rsi/x1 = green_key (header_pc of the owning loop)
@@ -141,68 +147,93 @@ pub extern "C" fn call_assembler_helper_trampoline(
     if callee_jf_ptr.is_null() {
         return 0;
     }
-    let mut result = 0i64;
-
-    // Read jf_descr — raw pointer to DynasmFailDescr
-    let descr_raw = unsafe { jitframe::JitFrame::get_latest_descr(callee_jf_ptr) };
-
-    if descr_raw != 0 && !guard::is_done_with_this_frame_descr(descr_raw) {
-        let descr = unsafe { &*(descr_raw as *const guard::DynasmFailDescr) };
-        let trace_id = descr.trace_id;
-        let fail_index = descr.fail_index;
-
-        // Read fail_arg values from the failing frame's jf_frame slots.
-        let n_fail_args = descr.fail_arg_types.len();
-        let mut raw_values: Vec<i64> = Vec::with_capacity(n_fail_args);
-        for i in 0..n_fail_args {
-            let slot = descr.fail_arg_locs.get(i).and_then(|l| *l).unwrap_or(i);
-            raw_values.push(unsafe { jitframe::JitFrame::get_int_value(callee_jf_ptr, slot) });
-        }
-
-        // compile.py:701-717 handle_fail — decide whether to trace a bridge
-        // from THIS guard failure. The current failure still resumes through
-        // blackhole; compiled bridges are used by future failures after the
-        // guard's jump target is patched in place.
-        if let Some(bridge_fn) = CA_BRIDGE_FN.get() {
-            bridge_fn(
-                green_key,
-                trace_id,
-                fail_index,
-                raw_values.as_ptr(),
-                raw_values.len(),
-                descr_raw,
-            );
-        }
-
-        // resume.py:1312 blackhole_from_resumedata parity.
-        if let Some(blackhole) = CA_BLACKHOLE_FN.get() {
-            if let Some(bh_result) = blackhole(
-                green_key,
-                trace_id,
-                fail_index,
-                raw_values.as_ptr(),
-                raw_values.len(),
-                raw_values.as_ptr(),
-                raw_values.len(),
-            ) {
-                // warmspot.py:988-996: DoneWithThisFrame* returns typed result as-is.
-                // warmspot.py:998: exception already raised via jit_exc_raise.
-                result = bh_result;
-            }
-        } else if let Some(force_fn) = CA_FORCE_FN.get() {
-            let frame_ptr = unsafe { jitframe::JitFrame::get_int_value(callee_jf_ptr, 0) };
-            result = force_fn(frame_ptr);
-        }
+    // compile.py:701-717 handle_fail parity:
+    // RPython does "trace+attach OR blackhole" only. It NEVER re-enters
+    // a bridge from within this helper. The bridge will be found on the
+    // NEXT guard failure (patched guard or C dispatch).
+    let frame_ptr = callee_jf_ptr;
+    let descr_raw = unsafe { jitframe::JitFrame::get_latest_descr(frame_ptr) };
+    if descr_raw == 0 || guard::is_done_with_this_frame_descr(descr_raw) {
+        let result = if guard::is_done_with_this_frame_descr(descr_raw) {
+            unsafe { jitframe::JitFrame::get_int_value(frame_ptr, 0) }
+        } else {
+            0
+        };
+        unsafe { libc::free(frame_ptr as *mut std::ffi::c_void) };
+        return result;
     }
 
-    // Free the callee jitframe
-    unsafe { libc::free(callee_jf_ptr as *mut std::ffi::c_void) };
+    let descr = unsafe { &*(descr_raw as *const guard::DynasmFailDescr) };
+    let trace_id = descr.trace_id;
+    let fail_index = descr.fail_index;
+    let n_fail_args = descr.fail_arg_types.len();
+    let mut raw_values = Vec::with_capacity(n_fail_args);
+    for i in 0..n_fail_args {
+        let slot = descr.fail_arg_locs.get(i).and_then(|l| *l).unwrap_or(i);
+        raw_values.push(unsafe { jitframe::JitFrame::get_int_value(frame_ptr, slot) });
+    }
+
+    // Step 1: try bridge compilation (compile.py:701 handle_fail).
+    // Just compile+attach; do NOT execute the bridge for this failure.
+    if let Some(bridge_fn) = CA_BRIDGE_FN.get() {
+        bridge_fn(
+            green_key,
+            trace_id,
+            fail_index,
+            raw_values.as_ptr(),
+            raw_values.len(),
+            descr_raw,
+        );
+    }
+
+    // Step 2: blackhole resume (resume.py:1312 blackhole_from_resumedata).
+    let mut result = 0i64;
+    if let Some(blackhole) = CA_BLACKHOLE_FN.get() {
+        if let Some(bh_result) = blackhole(
+            green_key,
+            trace_id,
+            fail_index,
+            raw_values.as_ptr(),
+            raw_values.len(),
+            raw_values.as_ptr(),
+            raw_values.len(),
+        ) {
+            result = bh_result;
+        }
+    }
+    // compile.py:701 parity: no force_fn fallback. RPython only does
+    // "trace+attach OR blackhole". If neither registered, result stays 0.
+
+    unsafe { libc::free(frame_ptr as *mut std::ffi::c_void) };
     result
 }
 
 /// Return the address of the trampoline for embedding in generated code.
 pub fn call_assembler_helper_addr() -> usize {
     call_assembler_helper_trampoline as usize
+}
+
+/// rstack.stack_almost_full parity: CALL_ASSEMBLER recursive callee
+/// execution trampoline with stacker protection.  The JIT-generated
+/// code calls this instead of directly branching to the callee entry,
+/// so each recursion level gets stack growth when needed.
+///
+/// Input:  arg0 = callee jf_ptr, arg1 = callee entry address
+/// Output: callee's returned jf_ptr
+pub extern "C" fn call_assembler_execute_trampoline(
+    jf_ptr: *mut jitframe::JitFrame,
+    callee_addr: usize,
+) -> *mut jitframe::JitFrame {
+    stacker::maybe_grow(512 * 1024, 8 * 1024 * 1024, || {
+        let func: unsafe extern "C" fn(*mut jitframe::JitFrame) -> *mut jitframe::JitFrame =
+            unsafe { std::mem::transmute(callee_addr) };
+        unsafe { func(jf_ptr) }
+    })
+}
+
+/// Return the address of the execute trampoline.
+pub fn call_assembler_execute_addr() -> usize {
+    call_assembler_execute_trampoline as usize
 }
 
 // ── Pending CALL_ASSEMBLER targets ──
@@ -252,6 +283,14 @@ mod tests {
         ptr
     }
 
+    extern "C" fn test_bridge_finish_int(jf: *mut jitframe::JitFrame) -> *mut jitframe::JitFrame {
+        unsafe {
+            jitframe::JitFrame::set_latest_descr(jf, guard::done_with_this_frame_descr_int_ptr());
+            jitframe::JitFrame::set_int_value(jf, 0, 321);
+        }
+        jf
+    }
+
     // ── Bug 1 regression: unresolved target must not dereference result as pointer ──
     // The old code let the helper return value flow into `mov rdx, rax; mov rcx, [rdx]`
     // which dereferenced an integer as a pointer. This test verifies the trampoline
@@ -298,13 +337,16 @@ mod tests {
     }
 
     #[test]
-    fn test_helper_trampoline_does_not_execute_existing_bridge() {
+    fn test_helper_trampoline_does_not_execute_bridge() {
+        // compile.py:701 parity: helper does NOT re-enter bridges.
+        // Bridges are executed via patched guard jumps, not the helper.
         let descr = Arc::new(guard::DynasmFailDescr::new(3, 17, vec![Type::Int], false));
-        descr.set_bridge_addr(1);
+        descr.set_bridge_addr(test_bridge_finish_int as usize);
         let descr_ptr = Arc::as_ptr(&descr) as usize;
 
         let jf = unsafe { alloc_test_jitframe(descr_ptr, &[123, 0, 0, 0]) };
         let result = call_assembler_helper_trampoline(jf, 99);
+        // Helper blackhole-resumes (no blackhole registered → 0), NOT bridge result.
         assert_eq!(result, 0);
 
         drop(descr);

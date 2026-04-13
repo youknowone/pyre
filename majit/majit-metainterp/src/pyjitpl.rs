@@ -2566,6 +2566,12 @@ impl<M: Clone> MetaInterp<M> {
                 .and_then(|compiled| compiled.front_target_tokens.first())
                 .map(|target_token| target_token.as_jump_target_descr());
             let Some(jump_descr) = jump_descr else {
+                if crate::majit_log_enabled() {
+                    eprintln!(
+                        "[jit] compile_trace: no front_target_token for key={}, bridge_origin={:?}",
+                        green_key, bridge_origin
+                    );
+                }
                 return CompileOutcome::Cancelled;
             };
             ctx.recorder
@@ -2620,7 +2626,14 @@ impl<M: Clone> MetaInterp<M> {
                 // raise_continue_running_normally stops the trace entirely,
                 // so this path is never re-entered; pyre's trace may continue
                 // and re-enter, so guard explicitly.
-                if self.bridge_was_compiled(green_key, trace_id, fail_index) {
+                let already = self.bridge_was_compiled(green_key, trace_id, fail_index);
+                if crate::majit_log_enabled() {
+                    eprintln!(
+                        "[jit] bridge_was_compiled({}, {}, {}) = {}",
+                        green_key, trace_id, fail_index, already
+                    );
+                }
+                if already {
                     if crate::majit_log_enabled() {
                         eprintln!("[jit] skip bridge: guard {} already has bridge", fail_index);
                     }
@@ -2636,7 +2649,15 @@ impl<M: Clone> MetaInterp<M> {
                     };
                     match self.bridge_fail_descr_proxy(compiled, trace_id, fail_index) {
                         Some(d) => Box::new(d) as Box<dyn majit_ir::FailDescr>,
-                        None => return CompileOutcome::Cancelled,
+                        None => {
+                            if crate::majit_log_enabled() {
+                                eprintln!(
+                                    "[jit] bridge_fail_descr_proxy({}, {}) = None → Cancelled",
+                                    trace_id, fail_index
+                                );
+                            }
+                            return CompileOutcome::Cancelled;
+                        }
                     }
                 };
                 let success = self.compile_bridge(
@@ -4727,6 +4748,9 @@ impl<M: Clone> MetaInterp<M> {
     ) -> (bool, u64) {
         let owning_key = self.find_owning_key(green_key, trace_id);
         if descr_addr == 0 {
+            if crate::majit_log_enabled() {
+                eprintln!("[jit] must_compile: descr_addr=0, skip");
+            }
             return (false, owning_key);
         }
         // compile.py:741: self.status — read live status directly from the
@@ -5721,6 +5745,14 @@ impl<M: Clone> MetaInterp<M> {
             // Catch Cranelift panics to prevent crashing the process.
             let token = &compiled.token;
             let previous_tokens = &compiled.previous_tokens;
+            if crate::majit_log_enabled() {
+                eprintln!(
+                    "[jit] calling backend.compile_bridge: key={} guard={} ops={}",
+                    green_key,
+                    fail_index,
+                    optimized_ops.len()
+                );
+            }
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 self.backend.compile_bridge(
                     fail_descr,
@@ -5731,11 +5763,16 @@ impl<M: Clone> MetaInterp<M> {
                 )
             })) {
                 Ok(r) => r,
-                Err(_) => {
+                Err(e) => {
                     if crate::majit_log_enabled() {
                         eprintln!(
-                            "[jit] bridge compile_bridge panicked key={} guard={}",
-                            green_key, fail_index
+                            "[jit] bridge compile_bridge panicked key={} guard={}: {:?}",
+                            green_key,
+                            fail_index,
+                            e.downcast_ref::<String>()
+                                .map(|s| s.as_str())
+                                .or_else(|| e.downcast_ref::<&str>().copied())
+                                .unwrap_or("unknown panic")
                         );
                     }
                     Err(majit_backend::BackendError::CompilationFailed(

@@ -1258,6 +1258,15 @@ impl<S: JitState> JitDriver<S> {
             drop(result);
 
             // must_compile tick for bridge threshold counting.
+            if crate::majit_log_enabled() {
+                eprintln!(
+                    "[jit] handle_fail: fail_index={} trace_id={} descr_addr={:#x} values={}",
+                    fail_index,
+                    trace_id,
+                    descr_addr,
+                    raw_values.len()
+                );
+            }
             let guard_loop_key = if exit_layout.rd_loop_token != 0 {
                 exit_layout.rd_loop_token
             } else {

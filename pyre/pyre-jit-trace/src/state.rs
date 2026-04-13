@@ -2747,8 +2747,8 @@ impl JitState for PyreJitState {
         }
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
-                "[jit][bridge-sym] vable_values → bridge_locals={:?} types={:?}",
-                bridge_locals, bridge_local_types,
+                "[jit][bridge-sym] vable_values → bridge_locals={:?} types={:?} bridge_stack={:?} stack_types={:?}",
+                bridge_locals, bridge_local_types, bridge_stack, bridge_stack_types,
             );
         }
         // Override sym.symbolic_locals AND sym.symbolic_local_types so

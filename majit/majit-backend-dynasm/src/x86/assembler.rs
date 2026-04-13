@@ -1,8 +1,7 @@
-/// assembler.py: Assembler386 — main JIT code generation backend.
+/// x86/assembler.py: Assembler386 — x86_64 JIT code generation backend.
 ///
-/// Generates machine code from IR operations via dynasm-rs.
-/// This combines assembler.py + rx86.py (instruction encoding) since
-/// dynasm-rs handles the encoding layer.
+/// RPython: Assembler386(BaseAssembler, VectorAssemblerMixin)
+/// in x86/assembler.py.
 ///
 /// Key methods:
 ///   assemble_loop — assembler.py:501
@@ -13,12 +12,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-// On x86_64: use x64 assembler. On aarch64: use aarch64 assembler.
-// RPython has separate backend/x86/ and backend/aarch64/ directories.
-// We use cfg to select the correct instruction set.
-#[cfg(target_arch = "aarch64")]
-use dynasmrt::aarch64::Assembler;
-#[cfg(target_arch = "x86_64")]
+// x86/assembler.py parity: x86_64-only backend.
 use dynasmrt::x64::Assembler;
 use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, ExecutableBuffer, dynasm};
 
@@ -29,12 +23,12 @@ use crate::arch::*;
 use crate::codebuf;
 use crate::gcmap::{allocate_gcmap, gcmap_set_bit};
 use crate::guard::DynasmFailDescr;
-use crate::jitframe::{FIRST_ITEM_OFFSET, JF_DESCR_OFS, JF_FRAME_OFS, JF_GCMAP_OFS};
+use crate::jitframe::{
+    FIRST_ITEM_OFFSET, JF_DESCR_OFS, JF_FORCE_DESCR_OFS, JF_FORWARD_OFS, JF_FRAME_OFS, JF_GCMAP_OFS,
+};
 use crate::regalloc::{RegAlloc, RegAllocOp};
 use crate::regloc::Loc;
 
-#[cfg(target_arch = "aarch64")]
-const AARCH64_GEN_REGS: [crate::regloc::RegLoc; 16] = [
     crate::regloc::RegLoc::new(0, false),
     crate::regloc::RegLoc::new(1, false),
     crate::regloc::RegLoc::new(2, false),
@@ -53,8 +47,6 @@ const AARCH64_GEN_REGS: [crate::regloc::RegLoc; 16] = [
     crate::regloc::RegLoc::new(20, false),
 ];
 
-#[cfg(target_arch = "aarch64")]
-const AARCH64_FLOAT_REGS: [crate::regloc::RegLoc; 8] = [
     crate::regloc::RegLoc::new(0, true),
     crate::regloc::RegLoc::new(1, true),
     crate::regloc::RegLoc::new(2, true),
@@ -151,31 +143,17 @@ fn loc_from_target_argloc(loc: &TargetArgLoc) -> Loc {
 
 fn all_gen_regs() -> &'static [crate::regloc::RegLoc] {
     use crate::regloc::*;
-    #[cfg(target_arch = "x86_64")]
-    {
         &[
             ECX, EAX, EDX, EBX, ESI, EDI, R8, R9, R10, R12, R13, R14, R15,
         ]
-    }
-    #[cfg(target_arch = "aarch64")]
-    {
-        &AARCH64_GEN_REGS
-    }
 }
 
 fn all_float_regs() -> &'static [crate::regloc::RegLoc] {
     use crate::regloc::*;
-    #[cfg(target_arch = "x86_64")]
-    {
         &[
             XMM0, XMM1, XMM2, XMM3, XMM4, XMM5, XMM6, XMM7, XMM8, XMM9, XMM10, XMM11, XMM12, XMM13,
             XMM14,
         ]
-    }
-    #[cfg(target_arch = "aarch64")]
-    {
-        &AARCH64_FLOAT_REGS
-    }
 }
 
 fn core_reg_position(reg: crate::regloc::RegLoc) -> Option<usize> {
@@ -288,6 +266,9 @@ pub struct Assembler386 {
     classptr_to_typeid: HashMap<i64, u32>,
     /// Dynamic label at the function entry for self-recursive CALL_ASSEMBLER.
     self_entry_label: Option<DynamicLabel>,
+    /// Leaked pointer holding the resolved entry address for self-recursive
+    /// CALL_ASSEMBLER via the execute trampoline. Written after finalization.
+    self_entry_addr_ptr: *mut usize,
     /// assembler.py:320 descr._ll_function_addr parity:
     /// Maps call_target_token → compiled code address for CALL_ASSEMBLER.
     /// Populated by the runner before compilation, from registered loop targets.
@@ -296,6 +277,12 @@ pub struct Assembler386 {
     finish_gcmap: Option<*mut usize>,
     /// opassembler.py:1215 gcmap_for_finish.
     gcmap_for_finish: *mut usize,
+    /// assembler.py:2207 _store_force_index parity:
+    /// Pre-allocated fail descr for the next GUARD_NOT_FORCED, created
+    /// at CALL_ASSEMBLER emission time so we can store its pointer to
+    /// jf_force_descr before the call. Consumed by the subsequent
+    /// GUARD_NOT_FORCED guard emission.
+    pending_force_descr: Option<Arc<DynasmFailDescr>>,
 }
 
 /// assembler.py GuardToken — represents a pending guard needing
@@ -369,6 +356,7 @@ impl Assembler386 {
             vtable_offset,
             classptr_to_typeid,
             self_entry_label: None,
+            self_entry_addr_ptr: Box::into_raw(Box::new(0usize)),
             call_assembler_targets: HashMap::new(),
             finish_gcmap: None,
             gcmap_for_finish: {
@@ -376,6 +364,7 @@ impl Assembler386 {
                 gcmap_set_bit(gcmap, 0);
                 gcmap
             },
+            pending_force_descr: None,
         }
     }
 
@@ -430,8 +419,6 @@ impl Assembler386 {
         match (src, dst) {
             (Loc::Reg(s), Loc::Reg(d)) if s == d => {}
             (Loc::Reg(s), Loc::Reg(d)) => {
-                #[cfg(target_arch = "x86_64")]
-                {
                     if s.is_xmm && d.is_xmm {
                         dynasm!(self.mc ; .arch x64 ; movsd Rx(d.value), Rx(s.value));
                     } else if !s.is_xmm && !d.is_xmm {
@@ -441,61 +428,24 @@ impl Assembler386 {
                     } else {
                         dynasm!(self.mc ; .arch x64 ; movq Rx(d.value), Rq(s.value));
                     }
-                }
-                #[cfg(target_arch = "aarch64")]
-                {
-                    if s.is_xmm && d.is_xmm {
-                        dynasm!(self.mc ; .arch aarch64 ; fmov D(d.value), D(s.value));
-                    } else if !s.is_xmm && !d.is_xmm {
-                        dynasm!(self.mc ; .arch aarch64 ; mov X(d.value), X(s.value));
-                    } else if s.is_xmm && !d.is_xmm {
-                        dynasm!(self.mc ; .arch aarch64 ; fmov X(d.value), D(s.value));
-                    } else {
-                        dynasm!(self.mc ; .arch aarch64 ; fmov D(d.value), X(s.value));
-                    }
-                }
             }
             (Loc::Reg(s), Loc::Frame(f)) => {
                 let ofs = f.ebp_loc.value;
-                #[cfg(target_arch = "x86_64")]
-                {
                     if s.is_xmm {
                         dynasm!(self.mc ; .arch x64 ; movsd [rbp + ofs], Rx(s.value));
                     } else {
                         dynasm!(self.mc ; .arch x64 ; mov [rbp + ofs], Rq(s.value));
                     }
-                }
-                #[cfg(target_arch = "aarch64")]
-                {
-                    if s.is_xmm {
-                        dynasm!(self.mc ; .arch aarch64 ; str D(s.value), [x29, ofs as u32]);
-                    } else {
-                        dynasm!(self.mc ; .arch aarch64 ; str X(s.value), [x29, ofs as u32]);
-                    }
-                }
             }
             (Loc::Frame(f), Loc::Reg(d)) => {
                 let ofs = f.ebp_loc.value;
-                #[cfg(target_arch = "x86_64")]
-                {
                     if d.is_xmm {
                         dynasm!(self.mc ; .arch x64 ; movsd Rx(d.value), [rbp + ofs]);
                     } else {
                         dynasm!(self.mc ; .arch x64 ; mov Rq(d.value), [rbp + ofs]);
                     }
-                }
-                #[cfg(target_arch = "aarch64")]
-                {
-                    if d.is_xmm {
-                        dynasm!(self.mc ; .arch aarch64 ; ldr D(d.value), [x29, ofs as u32]);
-                    } else {
-                        dynasm!(self.mc ; .arch aarch64 ; ldr X(d.value), [x29, ofs as u32]);
-                    }
-                }
             }
             (Loc::Immed(i), Loc::Reg(d)) => {
-                #[cfg(target_arch = "x86_64")]
-                {
                     if d.is_xmm {
                         let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
                         dynasm!(self.mc ; .arch x64
@@ -505,52 +455,24 @@ impl Assembler386 {
                     } else {
                         dynasm!(self.mc ; .arch x64 ; mov Rq(d.value), QWORD i.value);
                     }
-                }
-                #[cfg(target_arch = "aarch64")]
-                {
-                    if d.is_xmm {
-                        self.emit_mov_imm64(16, i.value); // x16 = scratch
-                        dynasm!(self.mc ; .arch aarch64 ; fmov D(d.value), X(16));
-                    } else {
-                        self.emit_mov_imm64(d.value as u32, i.value);
-                    }
-                }
             }
             (Loc::Immed(i), Loc::Frame(f)) => {
                 let ofs = f.ebp_loc.value;
-                #[cfg(target_arch = "x86_64")]
-                {
                     let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
                     dynasm!(self.mc ; .arch x64
                         ; mov Rq(scratch), QWORD i.value
                         ; mov [rbp + ofs], Rq(scratch)
                     );
-                }
-                #[cfg(target_arch = "aarch64")]
-                {
-                    self.emit_mov_imm64(16, i.value);
-                    dynasm!(self.mc ; .arch aarch64 ; str x16, [x29, ofs as u32]);
-                }
             }
             (Loc::Frame(f1), Loc::Frame(f2)) if f1.position == f2.position => {}
             (Loc::Frame(f1), Loc::Frame(f2)) => {
                 let o1 = f1.ebp_loc.value;
                 let o2 = f2.ebp_loc.value;
-                #[cfg(target_arch = "x86_64")]
-                {
                     let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
                     dynasm!(self.mc ; .arch x64
                         ; mov Rq(scratch), [rbp + o1]
                         ; mov [rbp + o2], Rq(scratch)
                     );
-                }
-                #[cfg(target_arch = "aarch64")]
-                {
-                    dynasm!(self.mc ; .arch aarch64
-                        ; ldr x16, [x29, o1 as u32]
-                        ; str x16, [x29, o2 as u32]
-                    );
-                }
             }
             _ => {}
         }
@@ -578,37 +500,17 @@ impl Assembler386 {
 
     fn regalloc_push(&mut self, loc: &Loc) {
         match loc {
-            #[cfg(target_arch = "x86_64")]
             Loc::Reg(r) if r.is_xmm => {
                 dynasm!(self.mc ; .arch x64 ; sub rsp, 8 ; movsd [rsp], Rx(r.value));
             }
-            #[cfg(target_arch = "x86_64")]
             Loc::Reg(r) => {
                 dynasm!(self.mc ; .arch x64 ; push Rq(r.value));
             }
-            #[cfg(target_arch = "x86_64")]
             Loc::Frame(f) if f.ebp_loc.is_float => {
                 dynasm!(self.mc ; .arch x64 ; sub rsp, 8 ; movsd xmm15, [rbp + f.ebp_loc.value] ; movsd [rsp], xmm15);
             }
-            #[cfg(target_arch = "x86_64")]
             Loc::Frame(f) => {
                 dynasm!(self.mc ; .arch x64 ; push QWORD [rbp + f.ebp_loc.value]);
-            }
-            #[cfg(target_arch = "aarch64")]
-            Loc::Reg(r) if r.is_xmm => {
-                dynasm!(self.mc ; .arch aarch64 ; str D(r.value), [sp, #-16]!);
-            }
-            #[cfg(target_arch = "aarch64")]
-            Loc::Reg(r) => {
-                dynasm!(self.mc ; .arch aarch64 ; str X(r.value), [sp, #-16]!);
-            }
-            #[cfg(target_arch = "aarch64")]
-            Loc::Frame(f) if f.ebp_loc.is_float => {
-                dynasm!(self.mc ; .arch aarch64 ; ldr D(15), [x29, f.ebp_loc.value as u32] ; str D(15), [sp, #-16]!);
-            }
-            #[cfg(target_arch = "aarch64")]
-            Loc::Frame(f) => {
-                dynasm!(self.mc ; .arch aarch64 ; ldr x16, [x29, f.ebp_loc.value as u32] ; str x16, [sp, #-16]!);
             }
             _ => {}
         }
@@ -616,37 +518,17 @@ impl Assembler386 {
 
     fn regalloc_pop(&mut self, loc: &Loc) {
         match loc {
-            #[cfg(target_arch = "x86_64")]
             Loc::Reg(r) if r.is_xmm => {
                 dynasm!(self.mc ; .arch x64 ; movsd Rx(r.value), [rsp] ; add rsp, 8);
             }
-            #[cfg(target_arch = "x86_64")]
             Loc::Reg(r) => {
                 dynasm!(self.mc ; .arch x64 ; pop Rq(r.value));
             }
-            #[cfg(target_arch = "x86_64")]
             Loc::Frame(f) if f.ebp_loc.is_float => {
                 dynasm!(self.mc ; .arch x64 ; movsd xmm15, [rsp] ; add rsp, 8 ; movsd [rbp + f.ebp_loc.value], xmm15);
             }
-            #[cfg(target_arch = "x86_64")]
             Loc::Frame(f) => {
                 dynasm!(self.mc ; .arch x64 ; pop QWORD [rbp + f.ebp_loc.value]);
-            }
-            #[cfg(target_arch = "aarch64")]
-            Loc::Reg(r) if r.is_xmm => {
-                dynasm!(self.mc ; .arch aarch64 ; ldr D(r.value), [sp], #16);
-            }
-            #[cfg(target_arch = "aarch64")]
-            Loc::Reg(r) => {
-                dynasm!(self.mc ; .arch aarch64 ; ldr X(r.value), [sp], #16);
-            }
-            #[cfg(target_arch = "aarch64")]
-            Loc::Frame(f) if f.ebp_loc.is_float => {
-                dynasm!(self.mc ; .arch aarch64 ; ldr D(15), [sp], #16 ; str D(15), [x29, f.ebp_loc.value as u32]);
-            }
-            #[cfg(target_arch = "aarch64")]
-            Loc::Frame(f) => {
-                dynasm!(self.mc ; .arch aarch64 ; ldr x16, [sp], #16 ; str x16, [x29, f.ebp_loc.value as u32]);
             }
             _ => {}
         }
@@ -773,46 +655,6 @@ impl Assembler386 {
     /// Emit: ADD/SUB/AND/OR/XOR reg, loc
     fn emit_binop_reg_loc(&mut self, opcode: OpCode, dst_reg: u8, src: &Loc) {
         // aarch64: load src to x16 scratch if not in register
-        #[cfg(target_arch = "aarch64")]
-        {
-            let src_reg = match src {
-                Loc::Reg(s) => s.value,
-                Loc::Frame(f) => {
-                    dynasm!(self.mc ; .arch aarch64 ; ldr x16, [x29, f.ebp_loc.value as u32]);
-                    16
-                }
-                Loc::Immed(i) => {
-                    self.emit_mov_imm64(16, i.value);
-                    16
-                }
-                _ => return,
-            };
-            let d = dst_reg;
-            let s = src_reg as u8;
-            match opcode {
-                OpCode::IntAdd | OpCode::IntAddOvf | OpCode::NurseryPtrIncrement => {
-                    dynasm!(self.mc ; .arch aarch64 ; add X(d), X(d), X(s));
-                }
-                OpCode::IntSub | OpCode::IntSubOvf => {
-                    dynasm!(self.mc ; .arch aarch64 ; sub X(d), X(d), X(s));
-                }
-                OpCode::IntMul | OpCode::IntMulOvf => {
-                    dynasm!(self.mc ; .arch aarch64 ; mul X(d), X(d), X(s));
-                }
-                OpCode::IntAnd => {
-                    dynasm!(self.mc ; .arch aarch64 ; and X(d), X(d), X(s));
-                }
-                OpCode::IntOr => {
-                    dynasm!(self.mc ; .arch aarch64 ; orr X(d), X(d), X(s));
-                }
-                OpCode::IntXor => {
-                    dynasm!(self.mc ; .arch aarch64 ; eor X(d), X(d), X(s));
-                }
-                _ => {}
-            }
-            return;
-        }
-        #[cfg(target_arch = "x86_64")]
         match src {
             Loc::Reg(s) => match opcode {
                 OpCode::IntAdd | OpCode::IntAddOvf | OpCode::NurseryPtrIncrement => {
@@ -889,37 +731,6 @@ impl Assembler386 {
 
     /// Emit: CMP loc0, loc1
     fn emit_cmp_loc_loc(&mut self, loc0: &Loc, loc1: &Loc) {
-        #[cfg(target_arch = "aarch64")]
-        {
-            // Load loc0 into x16 if needed, loc1 into x17 if needed
-            let r0 = match loc0 {
-                Loc::Reg(r) => r.value,
-                Loc::Frame(f) => {
-                    dynasm!(self.mc ; .arch aarch64 ; ldr x16, [x29, f.ebp_loc.value as u32]);
-                    16
-                }
-                Loc::Immed(i) => {
-                    self.emit_mov_imm64(16, i.value);
-                    16
-                }
-                _ => return,
-            };
-            let r1 = match loc1 {
-                Loc::Reg(s) => s.value,
-                Loc::Frame(f) => {
-                    dynasm!(self.mc ; .arch aarch64 ; ldr x17, [x29, f.ebp_loc.value as u32]);
-                    17
-                }
-                Loc::Immed(i) => {
-                    self.emit_mov_imm64(17, i.value);
-                    17
-                }
-                _ => return,
-            };
-            dynasm!(self.mc ; .arch aarch64 ; cmp X(r0 as u8), X(r1 as u8));
-            return;
-        }
-        #[cfg(target_arch = "x86_64")]
         match (loc0, loc1) {
             (Loc::Reg(r), Loc::Reg(s)) => {
                 dynasm!(self.mc ; .arch x64 ; cmp Rq(r.value), Rq(s.value));
@@ -945,24 +756,6 @@ impl Assembler386 {
 
     /// Emit: TEST loc, loc (for guard_true/guard_false)
     fn emit_test_loc(&mut self, loc: &Loc) {
-        #[cfg(target_arch = "aarch64")]
-        {
-            let r = match loc {
-                Loc::Reg(r) => r.value,
-                Loc::Frame(f) => {
-                    dynasm!(self.mc ; .arch aarch64 ; ldr x16, [x29, f.ebp_loc.value as u32]);
-                    16
-                }
-                Loc::Immed(i) => {
-                    self.emit_mov_imm64(16, i.value);
-                    16
-                }
-                _ => return,
-            };
-            dynasm!(self.mc ; .arch aarch64 ; tst X(r as u8), X(r as u8));
-            return;
-        }
-        #[cfg(target_arch = "x86_64")]
         match loc {
             Loc::Reg(r) => {
                 dynasm!(self.mc ; .arch x64 ; test Rq(r.value), Rq(r.value));
@@ -979,40 +772,21 @@ impl Assembler386 {
     }
 
     // ── AArch64 helper: load a 64-bit immediate into register Xn ──
-    #[cfg(target_arch = "aarch64")]
-    fn emit_mov_imm64(&mut self, reg: u32, val: i64) {
-        let v = val as u64;
-        let r = reg as u8;
-        dynasm!(self.mc ; .arch aarch64
-            ; movz X(r), (v & 0xFFFF) as u32
-            ; movk X(r), ((v >> 16) & 0xFFFF) as u32, lsl 16
-            ; movk X(r), ((v >> 32) & 0xFFFF) as u32, lsl 32
-            ; movk X(r), ((v >> 48) & 0xFFFF) as u32, lsl 48
-        );
-    }
 
     /// Emit: load the value of `opref` into RAX (x64) / X0 (aarch64).
     fn load_arg_to_rax(&mut self, opref: OpRef) {
         match self.resolve_opref(opref) {
             ResolvedArg::Slot(offset) => {
-                #[cfg(target_arch = "x86_64")]
                 dynasm!(self.mc
                     ; .arch x64
                     ; mov rax, [rbp + offset]
                 );
-                #[cfg(target_arch = "aarch64")]
-                dynasm!(self.mc ; .arch aarch64
-                    ; ldr x0, [x29, offset as u32]
-                );
             }
             ResolvedArg::Const(val) => {
-                #[cfg(target_arch = "x86_64")]
                 dynasm!(self.mc
                     ; .arch x64
                     ; mov rax, QWORD val as i64
                 );
-                #[cfg(target_arch = "aarch64")]
-                self.emit_mov_imm64(0, val);
             }
         }
     }
@@ -1030,12 +804,9 @@ impl Assembler386 {
                 // already in rax/x0
             }
             Loc::Immed(imm) => {
-                #[cfg(target_arch = "x86_64")]
                 dynasm!(self.mc ; .arch x64
                     ; mov rax, QWORD imm.value as i64
                 );
-                #[cfg(target_arch = "aarch64")]
-                self.emit_mov_imm64(0, imm.value);
             }
             _ => self.regalloc_mov(&loc, &rax),
         }
@@ -1045,24 +816,16 @@ impl Assembler386 {
     fn load_arg_to_rcx(&mut self, opref: OpRef) {
         match self.resolve_opref(opref) {
             ResolvedArg::Slot(offset) => {
-                #[cfg(target_arch = "x86_64")]
                 dynasm!(self.mc
                     ; .arch x64
                     ; mov rcx, [rbp + offset]
                 );
-                #[cfg(target_arch = "aarch64")]
-                dynasm!(self.mc ; .arch aarch64
-                    ; ldr x1, [x29, offset as u32]
-                );
             }
             ResolvedArg::Const(val) => {
-                #[cfg(target_arch = "x86_64")]
                 dynasm!(self.mc
                     ; .arch x64
                     ; mov rcx, QWORD val as i64
                 );
-                #[cfg(target_arch = "aarch64")]
-                self.emit_mov_imm64(1, val);
             }
         }
     }
@@ -1072,14 +835,9 @@ impl Assembler386 {
     fn store_rax_to_result(&mut self, result_opref: OpRef) {
         let slot = self.allocate_slot(result_opref);
         let offset = Self::slot_offset(slot);
-        #[cfg(target_arch = "x86_64")]
         dynasm!(self.mc
             ; .arch x64
             ; mov [rbp + offset], rax
-        );
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64
-            ; str x0, [x29, offset as u32]
         );
     }
 
@@ -1113,18 +871,11 @@ impl Assembler386 {
     /// x64: System V AMD64 ABI — first arg (jf_ptr) in RDI.
     /// aarch64: AAPCS64 — first arg (jf_ptr) in X0.
     fn _call_header(&mut self, inputargs: &[InputArg]) {
-        #[cfg(target_arch = "x86_64")]
         dynasm!(self.mc
             ; .arch x64
             ; push rbp
             ; push r12               // save r12 (used by genop_call_assembler)
             ; mov rbp, rdi
-        );
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64
-            ; stp x29, x30, [sp, #-32]!
-            ; stp x19, x20, [sp, #16]   // save callee-saved regs
-            ; mov x29, x0
         );
         self.setup_input_state(inputargs);
     }
@@ -1135,7 +886,6 @@ impl Assembler386 {
 
     /// Emit the function epilogue: return jf_ptr in RAX/X0.
     fn _call_footer(&mut self) {
-        #[cfg(target_arch = "x86_64")]
         dynasm!(self.mc
             ; .arch x64
             ; mov rax, rbp
@@ -1143,11 +893,6 @@ impl Assembler386 {
             ; pop rbp
             ; ret
         );
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64
-            ; mov x0, x29
-            ; ldp x19, x20, [sp, #16]   // restore callee-saved regs
-            ; ldp x29, x30, [sp], #32
             ; ret
         );
     }
@@ -1155,33 +900,35 @@ impl Assembler386 {
     /// assembler.py:993 push_gcmap.
     fn push_gcmap(&mut self, gcmap: *mut usize) {
         let gcmap_ptr = gcmap as i64;
-        #[cfg(target_arch = "x86_64")]
-        {
             let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
             dynasm!(self.mc ; .arch x64
                 ; mov Rq(scratch), QWORD gcmap_ptr
                 ; mov [rbp + JF_GCMAP_OFS], Rq(scratch)
             );
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            self.emit_mov_imm64(0, gcmap_ptr);
-            dynasm!(self.mc ; .arch aarch64
-                ; str x0, [x29, JF_GCMAP_OFS as u32]
-            );
-        }
     }
 
     /// assembler.py:1000 pop_gcmap.
     fn pop_gcmap(&mut self) {
-        #[cfg(target_arch = "x86_64")]
         dynasm!(self.mc ; .arch x64
             ; mov QWORD [rbp + JF_GCMAP_OFS], 0
         );
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64
-            ; str xzr, [x29, JF_GCMAP_OFS as u32]
-        );
+    }
+
+    /// assembler.py:405-412 _reload_frame_if_necessary parity:
+    /// after a helper or collecting call, follow jf_forward so rbp/x29
+    /// points at the current jitframe location.
+    fn reload_frame_if_necessary(&mut self) {
+            let loop_label = self.mc.new_dynamic_label();
+            let done_label = self.mc.new_dynamic_label();
+            dynasm!(self.mc ; .arch x64
+                ; =>loop_label
+                ; mov rcx, [rbp + JF_FORWARD_OFS]
+                ; test rcx, rcx
+                ; je =>done_label
+                ; mov rbp, rcx
+                ; jmp =>loop_label
+                ; =>done_label
+            );
     }
 
     fn guard_gcmap_from_faillocs(
@@ -1269,6 +1016,10 @@ impl Assembler386 {
         let rawstart = codebuf::buffer_ptr(&buffer) as usize;
         Self::patch_pending_failure_recoveries(rawstart, &stub_offsets);
 
+        // Write resolved entry address for self-recursive CALL_ASSEMBLER
+        // trampoline. The JIT code loads from this pointer at runtime.
+        unsafe { *self.self_entry_addr_ptr = rawstart + entry.0 };
+
         for descr in &self.compiled_target_tokens {
             if let Some(loop_descr) = descr.as_loop_target_descr() {
                 loop_descr.set_ll_loop_code(loop_descr.ll_loop_code() + rawstart);
@@ -1292,6 +1043,13 @@ impl Assembler386 {
         self.call_assembler_targets = targets;
     }
 
+    /// llsupport/assembler.py:201 rebuild_faillocs_from_descr — reconstruct
+    /// the locations of bridge inputargs from the guard's recovery layout.
+    ///
+    /// patch_jump_for_descr overwrites the recovery stub with a direct
+    /// jump to the bridge, so the register-save subroutine never runs.
+    /// The bridge sees live registers exactly as they were at guard time.
+    /// Return Reg locs for register positions, matching RPython.
     pub fn rebuild_faillocs_from_descr(
         descr: &DynasmFailDescr,
         inputargs: &[InputArg],
@@ -1299,6 +1057,7 @@ impl Assembler386 {
         let mut locs = Vec::new();
         let gpr_regs = all_gen_regs();
         let float_regs = all_float_regs();
+        let base_ofs = crate::jitframe::FIRST_ITEM_OFFSET as i32;
         let mut input_i = 0usize;
         for &pos in &descr.rd_locs {
             if pos == 0xFFFF {
@@ -1306,15 +1065,18 @@ impl Assembler386 {
             }
             let pos = pos as usize;
             if pos < gpr_regs.len() {
+                // llsupport/assembler.py:211 — GPR: return register location
                 locs.push(Loc::Reg(gpr_regs[pos]));
             } else if pos < gpr_regs.len() + float_regs.len() {
+                // llsupport/assembler.py:213 — FPR: return float register
                 locs.push(Loc::Reg(float_regs[pos - gpr_regs.len()]));
             } else {
+                // llsupport/assembler.py:217 — frame slot
                 let slot = pos - JITFRAME_FIXED_SIZE;
                 let tp = inputargs.get(input_i).map(|ia| ia.tp).unwrap_or(Type::Int);
                 locs.push(Loc::Frame(crate::regloc::FrameLoc::new(
                     slot,
-                    crate::regalloc::get_ebp_ofs(0, slot),
+                    crate::regalloc::get_ebp_ofs(base_ofs, slot),
                     tp == Type::Float,
                 )));
             }
@@ -1411,6 +1173,15 @@ impl Assembler386 {
 
         let mut fail_index = 0u32;
 
+        if std::env::var_os("MAJIT_LOG").is_some() {
+            eprintln!(
+                "[dynasm] _assemble: {} ops → {} ra_ops, frame_depth={}",
+                ops.len(),
+                ra_ops.len(),
+                self.frame_depth
+            );
+        }
+
         // ── Emit code from regalloc decisions ──
         for ra_op in &ra_ops {
             match ra_op {
@@ -1441,13 +1212,14 @@ impl Assembler386 {
                             result_loc
                         );
                     }
-                    self.regalloc_perform(op, arglocs, result_loc.as_ref(), fail_index, ops);
-                    if op.opcode.is_guard() {
-                        fail_index += 1;
-                    }
-                    if op.opcode == OpCode::Finish {
-                        fail_index += 1;
-                    }
+                    self.regalloc_perform(
+                        op,
+                        *op_index,
+                        arglocs,
+                        result_loc.as_ref(),
+                        fail_index,
+                        ops,
+                    );
                     if !op.pos.is_none() {
                         self.value_types.insert(op.pos.0, op.result_type());
                     }
@@ -1490,7 +1262,10 @@ impl Assembler386 {
                     if std::env::var_os("MAJIT_LOG").is_some() {
                         eprintln!("[dynasm] discard[{}]: {:?}", op_index, op.opcode);
                     }
-                    self.regalloc_perform(op, arglocs, None, fail_index, ops);
+                    self.regalloc_perform(op, *op_index, arglocs, None, fail_index, ops);
+                    if op.opcode.is_guard() || op.opcode == OpCode::Finish {
+                        fail_index += 1;
+                    }
                 }
             }
         }
@@ -1511,19 +1286,35 @@ impl Assembler386 {
     fn regalloc_perform(
         &mut self,
         op: &Op,
+        op_index: usize,
         arglocs: &[Loc],
         result_loc: Option<&Loc>,
         fail_index: u32,
         ops: &[Op],
     ) {
         match op.opcode {
+            OpCode::IntAddOvf => {
+                if let (Some(Loc::Reg(dst)), Some(src)) = (result_loc, arglocs.get(1)) {
+                        self.emit_binop_reg_loc(op.opcode, dst.value, src);
+                        self.guard_success_cc = Some(CC_NO);
+                }
+            }
+            OpCode::IntSubOvf => {
+                if let (Some(Loc::Reg(dst)), Some(src)) = (result_loc, arglocs.get(1)) {
+                        self.emit_binop_reg_loc(op.opcode, dst.value, src);
+                        self.guard_success_cc = Some(CC_NO);
+                }
+            }
+            OpCode::IntMulOvf => {
+                if let (Some(Loc::Reg(dst)), Some(src)) = (result_loc, arglocs.get(1)) {
+                        self.emit_binop_reg_loc(op.opcode, dst.value, src);
+                        self.guard_success_cc = Some(CC_NO);
+                }
+            }
             // ── Integer binary (result_loc == arglocs[0], guaranteed by regalloc) ──
             OpCode::IntAdd
-            | OpCode::IntAddOvf
             | OpCode::IntSub
-            | OpCode::IntSubOvf
             | OpCode::IntMul
-            | OpCode::IntMulOvf
             | OpCode::IntAnd
             | OpCode::IntOr
             | OpCode::IntXor
@@ -1535,52 +1326,17 @@ impl Assembler386 {
             // ── Unary integer (result in arglocs[0] register) ──
             OpCode::IntNeg => {
                 if let Some(Loc::Reg(r)) = result_loc {
-                    #[cfg(target_arch = "x86_64")]
                     dynasm!(self.mc ; .arch x64 ; neg Rq(r.value));
-                    #[cfg(target_arch = "aarch64")]
-                    dynasm!(self.mc ; .arch aarch64 ; neg X(r.value), X(r.value));
                 }
             }
             OpCode::IntInvert => {
                 if let Some(Loc::Reg(r)) = result_loc {
-                    #[cfg(target_arch = "x86_64")]
                     dynasm!(self.mc ; .arch x64 ; not Rq(r.value));
-                    #[cfg(target_arch = "aarch64")]
-                    dynasm!(self.mc ; .arch aarch64 ; mvn X(r.value), X(r.value));
                 }
             }
             // ── Shifts ──
             OpCode::IntLshift | OpCode::IntRshift | OpCode::UintRshift => {
                 if let (Some(Loc::Reg(dst)), Some(shift_loc)) = (result_loc, arglocs.get(1)) {
-                    #[cfg(target_arch = "aarch64")]
-                    {
-                        // aarch64: 3-operand shifts, no ECX constraint
-                        let sr = match shift_loc {
-                            Loc::Reg(s) => s.value,
-                            Loc::Immed(i) => {
-                                self.emit_mov_imm64(16, i.value);
-                                16
-                            }
-                            Loc::Frame(f) => {
-                                dynasm!(self.mc ; .arch aarch64 ; ldr x16, [x29, f.ebp_loc.value as u32]);
-                                16
-                            }
-                            _ => 16,
-                        };
-                        match op.opcode {
-                            OpCode::IntLshift => {
-                                dynasm!(self.mc ; .arch aarch64 ; lsl X(dst.value), X(dst.value), X(sr as u8));
-                            }
-                            OpCode::IntRshift => {
-                                dynasm!(self.mc ; .arch aarch64 ; asr X(dst.value), X(dst.value), X(sr as u8));
-                            }
-                            OpCode::UintRshift => {
-                                dynasm!(self.mc ; .arch aarch64 ; lsr X(dst.value), X(dst.value), X(sr as u8));
-                            }
-                            _ => {}
-                        }
-                    }
-                    #[cfg(target_arch = "x86_64")]
                     match shift_loc {
                         Loc::Immed(i) => {
                             let sh = i.value as i8;
@@ -1664,7 +1420,6 @@ impl Assembler386 {
             }
             OpCode::UintMulHigh => {
                 if let Some(Loc::Reg(dst)) = result_loc {
-                    #[cfg(target_arch = "x86_64")]
                     if let Some(src) = arglocs.first() {
                         match src {
                             Loc::Reg(s) => {
@@ -1686,45 +1441,15 @@ impl Assembler386 {
                             dynasm!(self.mc ; .arch x64 ; mov Rq(dst.value), rdx);
                         }
                     }
-                    #[cfg(target_arch = "aarch64")]
-                    if arglocs.len() >= 2 {
-                        let lhs = match arglocs[0] {
-                            Loc::Reg(r) => r.value,
-                            _ => {
-                                self.regalloc_mov(
-                                    &arglocs[0],
-                                    &Loc::Reg(crate::regloc::RegLoc::new(16, false)),
-                                );
-                                16
-                            }
-                        };
-                        let rhs = match arglocs[1] {
-                            Loc::Reg(r) => r.value,
-                            _ => {
-                                self.regalloc_mov(
-                                    &arglocs[1],
-                                    &Loc::Reg(crate::regloc::RegLoc::new(17, false)),
-                                );
-                                17
-                            }
-                        };
-                        dynasm!(self.mc ; .arch aarch64 ; umulh X(dst.value), X(lhs), X(rhs));
-                    }
                 }
             }
             OpCode::IntForceGeZero => {
                 if let Some(Loc::Reg(r)) = result_loc {
-                    #[cfg(target_arch = "x86_64")]
                     dynasm!(self.mc ; .arch x64
                         ; test Rq(r.value), Rq(r.value)
                         ; jge >pos
                         ; xor Rq(r.value), Rq(r.value)
                         ; pos:
-                    );
-                    #[cfg(target_arch = "aarch64")]
-                    dynasm!(self.mc ; .arch aarch64
-                        ; cmp X(r.value), xzr
-                        ; csel X(r.value), X(r.value), xzr, ge
                     );
                 }
             }
@@ -1749,7 +1474,6 @@ impl Assembler386 {
                     } else {
                         return; // shouldn't happen
                     };
-                    #[cfg(target_arch = "x86_64")]
                     match op.opcode {
                         OpCode::FloatAdd => {
                             dynasm!(self.mc ; .arch x64 ; addsd Rx(dst.value), Rx(src_reg.value));
@@ -1765,52 +1489,26 @@ impl Assembler386 {
                         }
                         _ => {}
                     }
-                    #[cfg(target_arch = "aarch64")]
-                    match op.opcode {
-                        OpCode::FloatAdd => {
-                            dynasm!(self.mc ; .arch aarch64 ; fadd D(dst.value), D(dst.value), D(src_reg.value));
-                        }
-                        OpCode::FloatSub => {
-                            dynasm!(self.mc ; .arch aarch64 ; fsub D(dst.value), D(dst.value), D(src_reg.value));
-                        }
-                        OpCode::FloatMul => {
-                            dynasm!(self.mc ; .arch aarch64 ; fmul D(dst.value), D(dst.value), D(src_reg.value));
-                        }
-                        OpCode::FloatTrueDiv => {
-                            dynasm!(self.mc ; .arch aarch64 ; fdiv D(dst.value), D(dst.value), D(src_reg.value));
-                        }
-                        _ => {}
-                    }
                 }
             }
             OpCode::FloatNeg => {
                 if let Some(Loc::Reg(r)) = result_loc {
-                    #[cfg(target_arch = "x86_64")]
-                    {
                         let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
                         dynasm!(self.mc ; .arch x64
                             ; xorpd Rx(scratch as u8), Rx(scratch as u8)
                             ; subsd Rx(scratch as u8), Rx(r.value)
                             ; movsd Rx(r.value), Rx(scratch as u8)
                         );
-                    }
-                    #[cfg(target_arch = "aarch64")]
-                    dynasm!(self.mc ; .arch aarch64 ; fneg D(r.value), D(r.value));
                 }
             }
             OpCode::FloatAbs => {
                 if let Some(Loc::Reg(r)) = result_loc {
-                    #[cfg(target_arch = "x86_64")]
-                    {
                         let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
                         dynasm!(self.mc ; .arch x64
                             ; mov Rq(scratch), QWORD 0x7FFFFFFFFFFFFFFF_u64 as i64
                             ; movq Rx(scratch as u8), Rq(scratch)
                             ; andpd Rx(r.value), Rx(scratch as u8)
                         );
-                    }
-                    #[cfg(target_arch = "aarch64")]
-                    dynasm!(self.mc ; .arch aarch64 ; fabs D(r.value), D(r.value));
                 }
             }
             // ── Float comparisons ──
@@ -1821,10 +1519,7 @@ impl Assembler386 {
             | OpCode::FloatGt
             | OpCode::FloatGe => {
                 if let (Some(Loc::Reg(a)), Some(Loc::Reg(b))) = (arglocs.first(), arglocs.get(1)) {
-                    #[cfg(target_arch = "x86_64")]
                     dynasm!(self.mc ; .arch x64 ; ucomisd Rx(a.value), Rx(b.value));
-                    #[cfg(target_arch = "aarch64")]
-                    dynasm!(self.mc ; .arch aarch64 ; fcmp D(a.value), D(b.value));
                     if let Some(Loc::Reg(r)) = result_loc {
                         let cc = Self::float_opcode_to_cc(op.opcode);
                         self.emit_setcc(cc, r.value);
@@ -1844,18 +1539,12 @@ impl Assembler386 {
                             16
                         }
                     };
-                    #[cfg(target_arch = "x86_64")]
                     dynasm!(self.mc ; .arch x64 ; cvtsi2sd Rx(dst.value), Rq(sr));
-                    #[cfg(target_arch = "aarch64")]
-                    dynasm!(self.mc ; .arch aarch64 ; scvtf D(dst.value), X(sr));
                 }
             }
             OpCode::CastFloatToInt => {
                 if let (Some(Loc::Reg(src)), Some(Loc::Reg(dst))) = (arglocs.first(), result_loc) {
-                    #[cfg(target_arch = "x86_64")]
                     dynasm!(self.mc ; .arch x64 ; cvttsd2si Rq(dst.value), Rx(src.value));
-                    #[cfg(target_arch = "aarch64")]
-                    dynasm!(self.mc ; .arch aarch64 ; fcvtzs X(dst.value), D(src.value));
                 }
             }
             // ── Same-as / identity ──
@@ -1899,8 +1588,6 @@ impl Assembler386 {
                         .and_then(|d| d.as_field_descr())
                         .map(|fd| fd.field_size())
                         .unwrap_or(8);
-                    #[cfg(target_arch = "x86_64")]
-                    {
                         if dst.is_xmm {
                             dynasm!(self.mc ; .arch x64 ; movsd Rx(dst.value), [Rq(base.value) + ofs]);
                         } else {
@@ -1919,28 +1606,6 @@ impl Assembler386 {
                                 }
                             }
                         }
-                    }
-                    #[cfg(target_arch = "aarch64")]
-                    {
-                        if dst.is_xmm {
-                            dynasm!(self.mc ; .arch aarch64 ; ldr D(dst.value), [X(base.value), ofs as u32]);
-                        } else {
-                            match field_size {
-                                1 => {
-                                    dynasm!(self.mc ; .arch aarch64 ; ldrb W(dst.value), [X(base.value), ofs as u32]);
-                                }
-                                2 => {
-                                    dynasm!(self.mc ; .arch aarch64 ; ldrh W(dst.value), [X(base.value), ofs as u32]);
-                                }
-                                4 => {
-                                    dynasm!(self.mc ; .arch aarch64 ; ldrsw X(dst.value), [X(base.value), ofs as u32]);
-                                }
-                                _ => {
-                                    dynasm!(self.mc ; .arch aarch64 ; ldr X(dst.value), [X(base.value), ofs as u32]);
-                                }
-                            }
-                        }
-                    }
                 }
             }
             // ── Memory loads: getarrayitem pattern ──
@@ -1968,8 +1633,6 @@ impl Assembler386 {
                             )
                         })
                         .unwrap_or((0, 8, false));
-                    #[cfg(target_arch = "x86_64")]
-                    {
                         let index_reg = match index_loc {
                             Loc::Reg(r) => r.value,
                             _ => {
@@ -2007,49 +1670,6 @@ impl Assembler386 {
                                 _ => dynasm!(self.mc ; .arch x64 ; mov Rq(dst.value), [rax]),
                             }
                         }
-                    }
-                    #[cfg(target_arch = "aarch64")]
-                    {
-                        let index_reg = match index_loc {
-                            Loc::Reg(r) => r.value,
-                            _ => {
-                                self.regalloc_mov(
-                                    index_loc,
-                                    &Loc::Reg(crate::regloc::RegLoc::new(16, false)),
-                                );
-                                16
-                            }
-                        };
-                        if item_size != 1 {
-                            self.emit_mov_imm64(17, item_size as i64);
-                            dynasm!(self.mc ; .arch aarch64 ; mul x16, X(index_reg), x17);
-                        } else if index_reg != 16 {
-                            dynasm!(self.mc ; .arch aarch64 ; mov x16, X(index_reg));
-                        }
-                        if base_size != 0 {
-                            dynasm!(self.mc ; .arch aarch64 ; add x16, x16, base_size as u32);
-                        }
-                        dynasm!(self.mc ; .arch aarch64 ; add x16, X(base.value), x16);
-                        if dst.is_xmm {
-                            dynasm!(self.mc ; .arch aarch64 ; ldr D(dst.value), [x16]);
-                        } else {
-                            match item_size {
-                                1 if signed => {
-                                    dynasm!(self.mc ; .arch aarch64 ; ldrsb X(dst.value), [x16])
-                                }
-                                1 => dynasm!(self.mc ; .arch aarch64 ; ldrb W(dst.value), [x16]),
-                                2 if signed => {
-                                    dynasm!(self.mc ; .arch aarch64 ; ldrsh X(dst.value), [x16])
-                                }
-                                2 => dynasm!(self.mc ; .arch aarch64 ; ldrh W(dst.value), [x16]),
-                                4 if signed => {
-                                    dynasm!(self.mc ; .arch aarch64 ; ldrsw X(dst.value), [x16])
-                                }
-                                4 => dynasm!(self.mc ; .arch aarch64 ; ldr W(dst.value), [x16]),
-                                _ => dynasm!(self.mc ; .arch aarch64 ; ldr X(dst.value), [x16]),
-                            }
-                        }
-                    }
                 }
             }
             // ── Memory stores: opassembler.rs emit_op_setfield_regalloc ──
@@ -2081,7 +1701,21 @@ impl Assembler386 {
                 if let (Some(Loc::Reg(base)), Some(ofs_loc), Some(Loc::Reg(dst))) =
                     (arglocs.first(), arglocs.get(1), result_loc)
                 {
-                    self.emit_op_gcload_regalloc(base, ofs_loc, dst);
+                    // GcLoadI/R/F: arg[2] = size (negative = signed).
+                    // RawLoadI/F: size from descriptor.
+                    let size = if op.args.len() >= 3 {
+                        self.constants.get(&op.args[2].0).copied().unwrap_or(8)
+                    } else {
+                        op.descr
+                            .as_ref()
+                            .and_then(|d| d.as_array_descr())
+                            .map(|ad| {
+                                let s = ad.item_size() as i64;
+                                if ad.is_item_signed() { -s } else { s }
+                            })
+                            .unwrap_or(8)
+                    };
+                    self.emit_op_gcload_regalloc(base, ofs_loc, dst, size);
                 }
             }
             // ── GC store / raw store: opassembler.rs emit_op_gcstore_regalloc ──
@@ -2090,7 +1724,26 @@ impl Assembler386 {
                     if let (Some(Loc::Reg(base)), Some(Loc::Reg(val))) =
                         (arglocs.first(), arglocs.get(2))
                     {
-                        self.emit_op_gcstore_regalloc(base, &arglocs[1], val);
+                        // GcStore: arg[3] = size (if present).
+                        // RawStore: size from descriptor.
+                        let size = if arglocs.len() >= 4 {
+                            match &arglocs[3] {
+                                Loc::Immed(i) => i.value.unsigned_abs() as usize,
+                                _ => 8,
+                            }
+                        } else if op.args.len() >= 4 {
+                            self.constants
+                                .get(&op.args[3].0)
+                                .map(|v| v.unsigned_abs() as usize)
+                                .unwrap_or(8)
+                        } else {
+                            op.descr
+                                .as_ref()
+                                .and_then(|d| d.as_array_descr())
+                                .map(|ad| ad.item_size())
+                                .unwrap_or(8)
+                        };
+                        self.emit_op_gcstore_regalloc(base, &arglocs[1], val, size);
                     }
                 }
             }
@@ -2110,7 +1763,17 @@ impl Assembler386 {
                 let mut dst_locations1 = Vec::new();
                 let mut src_locations2 = Vec::new();
                 let mut dst_locations2 = Vec::new();
-                for (i, src_loc) in arglocs.iter().enumerate() {
+                // RPython: jump args count == target label args count.
+                // Bridge Jump may carry extra args beyond what the target
+                // Label expects. Only remap args that have a target location.
+                // If target_arglocs is empty (no TargetToken stored), fall
+                // back to frame-slot identity mapping for all args.
+                let remap_count = if target_arglocs.is_empty() {
+                    arglocs.len()
+                } else {
+                    arglocs.len().min(target_arglocs.len())
+                };
+                for (i, src_loc) in arglocs[..remap_count].iter().enumerate() {
                     let dst_loc = if i < target_arglocs.len() {
                         target_arglocs[i]
                     } else {
@@ -2132,14 +1795,19 @@ impl Assembler386 {
                         }
                     }
                 }
-                #[cfg(target_arch = "x86_64")]
                 let tmpreg1 = Loc::Reg(crate::regloc::X86_64_SCRATCH_REG);
-                #[cfg(target_arch = "x86_64")]
                 let tmpreg2 = Loc::Reg(crate::regloc::XMM15);
-                #[cfg(target_arch = "aarch64")]
-                let tmpreg1 = Loc::Reg(crate::regloc::RegLoc::new(16, false));
-                #[cfg(target_arch = "aarch64")]
-                let tmpreg2 = Loc::Reg(crate::regloc::RegLoc::new(15, true));
+                if std::env::var_os("MAJIT_LOG").is_some() {
+                    eprintln!(
+                        "[dynasm] Jump remap: {} int src→dst, {} float src→dst",
+                        src_locations1.len(),
+                        src_locations2.len()
+                    );
+                    for (i, (s, d)) in src_locations1.iter().zip(dst_locations1.iter()).enumerate()
+                    {
+                        eprintln!("[dynasm]   int[{}]: {:?} → {:?}", i, s, d);
+                    }
+                }
                 self.remap_frame_layout_mixed(
                     &src_locations1,
                     &dst_locations1,
@@ -2151,24 +1819,13 @@ impl Assembler386 {
                 if let Some(label) = loop_target_id(op)
                     .and_then(|k| self.target_tokens_currently_compiling.get(&k).copied())
                 {
-                    #[cfg(target_arch = "x86_64")]
                     dynasm!(self.mc ; .arch x64 ; jmp =>label);
-                    #[cfg(target_arch = "aarch64")]
-                    dynasm!(self.mc ; .arch aarch64 ; b =>label);
                 } else if let Some(target) = jump_descr.map(|descr| descr.ll_loop_code()) {
-                    #[cfg(target_arch = "x86_64")]
-                    {
                         let addr = target as i64;
                         dynasm!(self.mc ; .arch x64
                             ; mov rax, QWORD addr
                             ; jmp rax
                         );
-                    }
-                    #[cfg(target_arch = "aarch64")]
-                    {
-                        self.emit_mov_imm64(0, target as i64);
-                        dynasm!(self.mc ; .arch aarch64 ; br x0);
-                    }
                 }
             }
             OpCode::Finish => {
@@ -2201,19 +1858,11 @@ impl Assembler386 {
                 }
 
                 // Store descr ptr to jf_descr.
-                #[cfg(target_arch = "x86_64")]
-                {
                     let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
                     dynasm!(self.mc ; .arch x64
                         ; mov Rq(scratch), QWORD global_descr_ptr
                         ; mov [rbp + JF_DESCR_OFS], Rq(scratch)
                     );
-                }
-                #[cfg(target_arch = "aarch64")]
-                {
-                    self.emit_mov_imm64(0, global_descr_ptr);
-                    dynasm!(self.mc ; .arch aarch64 ; str x0, [x29, JF_DESCR_OFS as u32]);
-                }
 
                 if result_type == Type::Ref {
                     if let Some(gcmap) = self.finish_gcmap {
@@ -2290,6 +1939,10 @@ impl Assembler386 {
             | OpCode::CallAssemblerR
             | OpCode::CallAssemblerF
             | OpCode::CallAssemblerN => {
+                // assembler.py:2207 _store_force_index parity:
+                // store next GUARD_NOT_FORCED's descr ptr to jf_force_descr
+                // BEFORE the call, so forcing code knows which guard to resume.
+                self._store_force_index_if_next_guard(ops, op_index, fail_index);
                 self.genop_call_assembler(op, arglocs);
             }
             OpCode::CondCallN => self.genop_discard_cond_call(op),
@@ -2305,10 +1958,7 @@ impl Assembler386 {
             // ── Misc ──
             OpCode::ForceToken => {
                 if let Some(Loc::Reg(r)) = result_loc {
-                    #[cfg(target_arch = "x86_64")]
                     dynasm!(self.mc ; .arch x64 ; mov Rq(r.value), rbp);
-                    #[cfg(target_arch = "aarch64")]
-                    dynasm!(self.mc ; .arch aarch64 ; mov X(r.value), x29);
                 }
             }
             OpCode::SaveException => self.genop_save_exception(op),
@@ -2375,14 +2025,14 @@ impl Assembler386 {
                     );
                 }
             }
-            OpCode::GuardNoException | OpCode::GuardNoOverflow | OpCode::GuardOverflow => {
+            OpCode::GuardNoException => {
                 self.implement_guard_nojump_with_faillocs(op, op_index, fail_index, faillocs);
             }
+            OpCode::GuardNoOverflow | OpCode::GuardOverflow => {
+                self.implement_guard_with_faillocs(op, op_index, fail_index, faillocs);
+            }
             OpCode::GuardNotForced | OpCode::GuardNotForced2 => {
-                #[cfg(target_arch = "x86_64")]
                 dynasm!(self.mc ; .arch x64 ; cmp QWORD [rbp + JF_DESCR_OFS], 0);
-                #[cfg(target_arch = "aarch64")]
-                dynasm!(self.mc ; .arch aarch64 ; ldr X(16), [x29, JF_DESCR_OFS as u32] ; cmp X(16), xzr);
                 self.guard_success_cc = Some(CC_E);
                 self.implement_guard_with_faillocs(op, op_index, fail_index, faillocs);
             }
@@ -2398,8 +2048,6 @@ impl Assembler386 {
     /// Helper: guard class comparison
     fn _cmp_guard_class(&mut self, obj_loc: &Loc, class_loc: &Loc) {
         if let Loc::Reg(obj) = obj_loc {
-            #[cfg(target_arch = "x86_64")]
-            {
                 if let Some(vtable_offset) = self.vtable_offset {
                     let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
                     let ofs = vtable_offset as i32;
@@ -2420,35 +2068,11 @@ impl Assembler386 {
                     let typeid_i32 = expected_typeid as i32;
                     dynasm!(self.mc ; .arch x64 ; cmp DWORD [Rq(obj.value)], typeid_i32);
                 }
-            }
-            #[cfg(target_arch = "aarch64")]
-            {
-                if let Some(vtable_offset) = self.vtable_offset {
-                    let ofs = vtable_offset as u32;
-                    dynasm!(self.mc ; .arch aarch64 ; ldr x16, [X(obj.value), ofs]);
-                    self.regalloc_mov(class_loc, &Loc::Reg(crate::regloc::RegLoc::new(17, false)));
-                    dynasm!(self.mc ; .arch aarch64 ; cmp x16, x17);
-                } else if let Loc::Immed(i) = class_loc {
-                    let expected_typeid = self
-                        .lookup_typeid_from_classptr(i.value as usize)
-                        .expect("GuardClass: missing typeid for classptr");
-                    let typeid_w = expected_typeid as u32;
-                    dynasm!(self.mc
-                        ; .arch aarch64
-                        ; ldr w16, [X(obj.value)]
-                        ; movz w17, #(typeid_w & 0xffff)
-                        ; movk w17, #((typeid_w >> 16) & 0xffff), lsl #16
-                        ; cmp w16, w17
-                    );
-                }
-            }
         }
     }
 
     /// Emit SETcc into a register (zero-extend to 64-bit).
     fn emit_setcc(&mut self, cc: u8, dst_reg: u8) {
-        #[cfg(target_arch = "x86_64")]
-        {
             dynasm!(self.mc ; .arch x64 ; xor Rd(dst_reg), Rd(dst_reg));
             match cc {
                 CC_E => {
@@ -2497,57 +2121,6 @@ impl Assembler386 {
                     dynasm!(self.mc ; .arch x64 ; sete  Rb(dst_reg));
                 }
             }
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            match cc {
-                CC_E => {
-                    dynasm!(self.mc ; .arch aarch64 ; cset X(dst_reg), eq);
-                }
-                CC_NE => {
-                    dynasm!(self.mc ; .arch aarch64 ; cset X(dst_reg), ne);
-                }
-                CC_L => {
-                    dynasm!(self.mc ; .arch aarch64 ; cset X(dst_reg), lt);
-                }
-                CC_GE => {
-                    dynasm!(self.mc ; .arch aarch64 ; cset X(dst_reg), ge);
-                }
-                CC_LE => {
-                    dynasm!(self.mc ; .arch aarch64 ; cset X(dst_reg), le);
-                }
-                CC_G => {
-                    dynasm!(self.mc ; .arch aarch64 ; cset X(dst_reg), gt);
-                }
-                CC_B => {
-                    dynasm!(self.mc ; .arch aarch64 ; cset X(dst_reg), lo);
-                }
-                CC_AE => {
-                    dynasm!(self.mc ; .arch aarch64 ; cset X(dst_reg), hs);
-                }
-                CC_BE => {
-                    dynasm!(self.mc ; .arch aarch64 ; cset X(dst_reg), ls);
-                }
-                CC_A => {
-                    dynasm!(self.mc ; .arch aarch64 ; cset X(dst_reg), hi);
-                }
-                CC_S => {
-                    dynasm!(self.mc ; .arch aarch64 ; cset X(dst_reg), mi);
-                }
-                CC_NS => {
-                    dynasm!(self.mc ; .arch aarch64 ; cset X(dst_reg), pl);
-                }
-                CC_O => {
-                    dynasm!(self.mc ; .arch aarch64 ; cset X(dst_reg), vs);
-                }
-                CC_NO => {
-                    dynasm!(self.mc ; .arch aarch64 ; cset X(dst_reg), vc);
-                }
-                _ => {
-                    dynasm!(self.mc ; .arch aarch64 ; cset X(dst_reg), eq);
-                }
-            }
-        }
     }
 
     /// Map an integer comparison OpCode to a condition code.
@@ -2619,12 +2192,31 @@ impl Assembler386 {
         faillocs: &[Option<Loc>],
     ) {
         let fail_arg_types = self.infer_fail_arg_types(op);
-        let descr = Arc::new(DynasmFailDescr::new(
-            fail_index,
-            self.trace_id,
-            fail_arg_types,
-            false,
-        ));
+        // assembler.py:2207 _store_force_index parity:
+        // If a CALL_ASSEMBLER already pre-allocated this guard's descr
+        // (stored in pending_force_descr), reuse it — same Arc, same ptr
+        // that was written to jf_force_descr.
+        let descr = if let Some(pre) = self.pending_force_descr.take() {
+            pre
+        } else {
+            Arc::new(DynasmFailDescr::new(
+                fail_index,
+                self.trace_id,
+                fail_arg_types,
+                false,
+            ))
+        };
+        if std::env::var_os("MAJIT_LOG").is_some() {
+            eprintln!(
+                "[dynasm] guard-token: fail_index={} op_index={} opcode={:?} fail_args={:?} fail_arg_types={:?} faillocs={:?}",
+                fail_index,
+                op_index,
+                op.opcode,
+                op.fail_args.as_ref(),
+                &descr.fail_arg_types,
+                faillocs
+            );
+        }
 
         // Convert regalloc faillocs to absolute jf_frame slots for the
         // helper/runner. This matches the fixed-slot-inclusive coordinate
@@ -2707,6 +2299,12 @@ impl Assembler386 {
             descr_mut.rd_pendingfields = op.rd_pendingfields.clone();
             *descr_mut.recovery_layout.get_mut() = Some(recovery_layout);
         }
+        if std::env::var_os("MAJIT_LOG").is_some() {
+            eprintln!(
+                "[dynasm] guard-token-slots: fail_index={} fail_arg_locs={:?} rd_locs={:?}",
+                fail_index, &descr.fail_arg_locs, &descr.rd_locs
+            );
+        }
         let gcmap = self.guard_gcmap_from_faillocs(&descr.fail_arg_types, faillocs);
 
         self.pending_guard_tokens.push(GuardToken {
@@ -2773,47 +2371,25 @@ impl Assembler386 {
         if std::env::var_os("MAJIT_LOG").is_some() {
             eprintln!("[dynasm] recovery stub: binding {:?}", fail_label);
         }
-        #[cfg(target_arch = "x86_64")]
         dynasm!(self.mc ; .arch x64 ; =>fail_label);
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64 ; =>fail_label);
 
-        #[cfg(target_arch = "x86_64")]
         dynasm!(self.mc ; .arch x64 ; call =>save_regs_label);
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64 ; bl =>save_regs_label);
 
         let descr_ptr = Arc::as_ptr(&guard_token.fail_descr) as i64;
-        #[cfg(target_arch = "x86_64")]
         dynasm!(self.mc
             ; .arch x64
             ; mov rax, QWORD descr_ptr
             ; mov [rbp + JF_DESCR_OFS], rax
         );
-        #[cfg(target_arch = "aarch64")]
-        {
-            self.emit_mov_imm64(0, descr_ptr);
-            dynasm!(self.mc ; .arch aarch64
-                ; str x0, [x29, JF_DESCR_OFS as u32]
-            );
-        }
         self.push_gcmap(guard_token.gcmap);
 
         for &(slot, val) in &guard_token.const_stores {
             let ofs = Self::slot_offset(slot);
-            #[cfg(target_arch = "x86_64")]
-            {
                 let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
                 dynasm!(self.mc ; .arch x64
                     ; mov Rq(scratch), QWORD val
                     ; mov [rbp + ofs], Rq(scratch)
                 );
-            }
-            #[cfg(target_arch = "aarch64")]
-            {
-                self.emit_mov_imm64(16, val);
-                dynasm!(self.mc ; .arch aarch64 ; str x16, [x29, ofs as u32]);
-            }
         }
 
         self._call_footer();
@@ -2826,8 +2402,6 @@ impl Assembler386 {
         // Emit a shared _push_all_regs_to_frame routine once, then let each
         // generate_quick_failure() stub call it.
         let save_regs_label = self.mc.new_dynamic_label();
-        #[cfg(target_arch = "x86_64")]
-        {
             dynasm!(self.mc ; .arch x64 ; =>save_regs_label);
             use crate::regloc::*;
             let gprs = [
@@ -2848,24 +2422,6 @@ impl Assembler386 {
                 dynasm!(self.mc ; .arch x64 ; movsd [rbp + ofs], Rx(reg.value));
             }
             dynasm!(self.mc ; .arch x64 ; ret);
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            dynasm!(self.mc ; .arch aarch64 ; =>save_regs_label);
-            let gprs = all_gen_regs();
-            for &reg in gprs.iter() {
-                let save_slot = core_reg_position(reg).expect("managed aarch64 GPR");
-                let ofs = Self::slot_offset(save_slot) as u32;
-                dynasm!(self.mc ; .arch aarch64 ; str X(reg.value), [x29, ofs]);
-            }
-            let fprs = all_float_regs();
-            for &reg in fprs.iter() {
-                let save_slot = float_reg_position(reg).expect("managed aarch64 VFP");
-                let ofs = Self::slot_offset(save_slot) as u32;
-                dynasm!(self.mc ; .arch aarch64 ; str D(reg.value), [x29, ofs]);
-            }
-            dynasm!(self.mc ; .arch aarch64 ; ret);
-        }
 
         if std::env::var_os("MAJIT_LOG").is_some() {
             eprintln!(
@@ -2912,8 +2468,6 @@ impl Assembler386 {
         assert!(stub_addr != 0, "guard already patched");
 
         codebuf::with_writable(stub_addr as *mut u8, 16, || {
-            #[cfg(target_arch = "x86_64")]
-            {
                 let stub_ptr = stub_addr as *mut u8;
                 let offset = adr_new_target as isize - (stub_addr as isize + 5);
                 if offset >= i32::MIN as isize && offset <= i32::MAX as isize {
@@ -2931,19 +2485,18 @@ impl Assembler386 {
                         *stub_ptr.add(12) = 0xE3;
                     }
                 }
-            }
 
-            #[cfg(target_arch = "aarch64")]
-            {
-                let offset = adr_new_target as isize - stub_addr as isize;
-                let imm26 = ((offset >> 2) & 0x03FF_FFFF) as u32;
-                let insn = 0x9400_0000 | imm26;
-                unsafe { (stub_addr as *mut u32).write(insn) };
-            }
         });
 
-        #[cfg(target_arch = "aarch64")]
-        flush_icache(stub_addr as *const u8, 16);
+
+        // Verify patch was applied correctly
+        if std::env::var_os("MAJIT_LOG").is_some() {
+            let word = unsafe { (stub_addr as *const u32).read() };
+            eprintln!(
+                "[patch-verify] stub_addr={:#x} first_word={:#010x} target={:#x}",
+                stub_addr, word, adr_new_target
+            );
+        }
 
         // assembler.py:987
         descr.set_adr_jump_offset(0); // "patched"
@@ -2953,8 +2506,6 @@ impl Assembler386 {
     /// to JMP to new loop after retrace.
     pub fn redirect_call_assembler(old_addr: *const u8, new_addr: *const u8) {
         codebuf::with_writable(old_addr as *mut u8, 16, || {
-            #[cfg(target_arch = "x86_64")]
-            {
                 let old_ptr = old_addr as *mut u8;
                 let offset = new_addr as isize - (old_addr as isize + 5);
                 if offset >= i32::MIN as isize && offset <= i32::MAX as isize {
@@ -2972,19 +2523,9 @@ impl Assembler386 {
                         *old_ptr.add(12) = 0xE3;
                     }
                 }
-            }
 
-            #[cfg(target_arch = "aarch64")]
-            {
-                let offset = new_addr as isize - old_addr as isize;
-                let imm26 = ((offset >> 2) & 0x03FF_FFFF) as u32;
-                let insn = 0x1400_0000 | imm26;
-                unsafe { (old_addr as *mut u32).write(insn) };
-            }
         });
 
-        #[cfg(target_arch = "aarch64")]
-        flush_icache(old_addr, 4);
     }
 
     // ----------------------------------------------------------------
@@ -2995,13 +2536,10 @@ impl Assembler386 {
     fn genop_int_add(&mut self, op: &Op) {
         self.load_arg_to_rax(op.arg(0));
         self.load_arg_to_rcx(op.arg(1));
-        #[cfg(target_arch = "x86_64")]
         dynasm!(self.mc
             ; .arch x64
             ; add rax, rcx
         );
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64
             ; add x0, x0, x1
         );
         self.store_rax_to_result(op.pos);
@@ -3011,13 +2549,10 @@ impl Assembler386 {
     fn genop_int_sub(&mut self, op: &Op) {
         self.load_arg_to_rax(op.arg(0));
         self.load_arg_to_rcx(op.arg(1));
-        #[cfg(target_arch = "x86_64")]
         dynasm!(self.mc
             ; .arch x64
             ; sub rax, rcx
         );
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64
             ; sub x0, x0, x1
         );
         self.store_rax_to_result(op.pos);
@@ -3027,13 +2562,10 @@ impl Assembler386 {
     fn genop_int_mul(&mut self, op: &Op) {
         self.load_arg_to_rax(op.arg(0));
         self.load_arg_to_rcx(op.arg(1));
-        #[cfg(target_arch = "x86_64")]
         dynasm!(self.mc
             ; .arch x64
             ; imul rax, rcx
         );
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64
             ; mul x0, x0, x1
         );
         self.store_rax_to_result(op.pos);
@@ -3043,13 +2575,10 @@ impl Assembler386 {
     fn genop_int_and(&mut self, op: &Op) {
         self.load_arg_to_rax(op.arg(0));
         self.load_arg_to_rcx(op.arg(1));
-        #[cfg(target_arch = "x86_64")]
         dynasm!(self.mc
             ; .arch x64
             ; and rax, rcx
         );
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64
             ; and x0, x0, x1
         );
         self.store_rax_to_result(op.pos);
@@ -3059,13 +2588,10 @@ impl Assembler386 {
     fn genop_int_or(&mut self, op: &Op) {
         self.load_arg_to_rax(op.arg(0));
         self.load_arg_to_rcx(op.arg(1));
-        #[cfg(target_arch = "x86_64")]
         dynasm!(self.mc
             ; .arch x64
             ; or rax, rcx
         );
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64
             ; orr x0, x0, x1
         );
         self.store_rax_to_result(op.pos);
@@ -3075,13 +2601,10 @@ impl Assembler386 {
     fn genop_int_xor(&mut self, op: &Op) {
         self.load_arg_to_rax(op.arg(0));
         self.load_arg_to_rcx(op.arg(1));
-        #[cfg(target_arch = "x86_64")]
         dynasm!(self.mc
             ; .arch x64
             ; xor rax, rcx
         );
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64
             ; eor x0, x0, x1
         );
         self.store_rax_to_result(op.pos);
@@ -3090,13 +2613,10 @@ impl Assembler386 {
     /// INT_NEG: result = -arg0
     fn genop_int_neg(&mut self, op: &Op) {
         self.load_arg_to_rax(op.arg(0));
-        #[cfg(target_arch = "x86_64")]
         dynasm!(self.mc
             ; .arch x64
             ; neg rax
         );
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64
             ; neg x0, x0
         );
         self.store_rax_to_result(op.pos);
@@ -3105,13 +2625,10 @@ impl Assembler386 {
     /// INT_INVERT: result = ~arg0
     fn genop_int_invert(&mut self, op: &Op) {
         self.load_arg_to_rax(op.arg(0));
-        #[cfg(target_arch = "x86_64")]
         dynasm!(self.mc
             ; .arch x64
             ; not rax
         );
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64
             ; mvn x0, x0
         );
         self.store_rax_to_result(op.pos);
@@ -3121,13 +2638,10 @@ impl Assembler386 {
     fn genop_int_lshift(&mut self, op: &Op) {
         self.load_arg_to_rax(op.arg(0));
         self.load_arg_to_rcx(op.arg(1));
-        #[cfg(target_arch = "x86_64")]
         dynasm!(self.mc
             ; .arch x64
             ; shl rax, cl
         );
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64
             ; lsl x0, x0, x1
         );
         self.store_rax_to_result(op.pos);
@@ -3137,13 +2651,10 @@ impl Assembler386 {
     fn genop_int_rshift(&mut self, op: &Op) {
         self.load_arg_to_rax(op.arg(0));
         self.load_arg_to_rcx(op.arg(1));
-        #[cfg(target_arch = "x86_64")]
         dynasm!(self.mc
             ; .arch x64
             ; sar rax, cl
         );
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64
             ; asr x0, x0, x1
         );
         self.store_rax_to_result(op.pos);
@@ -3153,13 +2664,10 @@ impl Assembler386 {
     fn genop_uint_rshift(&mut self, op: &Op) {
         self.load_arg_to_rax(op.arg(0));
         self.load_arg_to_rcx(op.arg(1));
-        #[cfg(target_arch = "x86_64")]
         dynasm!(self.mc
             ; .arch x64
             ; shr rax, cl
         );
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64
             ; lsr x0, x0, x1
         );
         self.store_rax_to_result(op.pos);
@@ -3172,55 +2680,19 @@ impl Assembler386 {
     /// assembler.py:1856 genop_int_add_ovf — delegates to genop_int_add,
     /// then sets guard_success_cc = 'NO'. On x86, ADD always sets OF.
     fn genop_int_add_ovf(&mut self, op: &Op) {
-        #[cfg(target_arch = "x86_64")]
         self.genop_int_add(op); // ADD sets OF on x86
-        #[cfg(target_arch = "aarch64")]
-        {
-            self.load_arg_to_rax(op.arg(0));
-            self.load_arg_to_rcx(op.arg(1));
-            dynasm!(self.mc ; .arch aarch64 ; adds x0, x0, x1);
-            self.store_rax_to_result(op.pos);
-        }
         self.guard_success_cc = Some(CC_NO);
     }
 
     /// assembler.py:1860 genop_int_sub_ovf.
     fn genop_int_sub_ovf(&mut self, op: &Op) {
-        #[cfg(target_arch = "x86_64")]
         self.genop_int_sub(op);
-        #[cfg(target_arch = "aarch64")]
-        {
-            self.load_arg_to_rax(op.arg(0));
-            self.load_arg_to_rcx(op.arg(1));
-            dynasm!(self.mc ; .arch aarch64 ; subs x0, x0, x1);
-            self.store_rax_to_result(op.pos);
-        }
         self.guard_success_cc = Some(CC_NO);
     }
 
     /// assembler.py:1864 genop_int_mul_ovf.
     fn genop_int_mul_ovf(&mut self, op: &Op) {
-        #[cfg(target_arch = "x86_64")]
         self.genop_int_mul(op); // IMUL sets OF on x86
-        #[cfg(target_arch = "aarch64")]
-        {
-            // aarch64/opassembler.py multiplies, computes SMULH, and then
-            // compares the high word against the sign-extension of the low
-            // word. regalloc.py's prepare_op_guard_no_overflow then uses
-            // EQ for INT_MUL_OVF specifically.
-            self.load_arg_to_rax(op.arg(0));
-            self.load_arg_to_rcx(op.arg(1));
-            dynasm!(self.mc ; .arch aarch64
-                ; mul x2, x0, x1
-                ; smulh x3, x0, x1
-                ; asr x4, x2, 63
-                ; cmp x3, x4
-                ; mov x0, x2
-            );
-            self.store_rax_to_result(op.pos);
-            self.guard_success_cc = Some(CC_E);
-            return;
-        }
         self.guard_success_cc = Some(CC_NO);
     }
 
@@ -3236,13 +2708,10 @@ impl Assembler386 {
 
         self.load_arg_to_rax(op.arg(0));
         self.load_arg_to_rcx(op.arg(1));
-        #[cfg(target_arch = "x86_64")]
         dynasm!(self.mc
             ; .arch x64
             ; cmp rax, rcx
         );
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64
             ; cmp x0, x1
         );
 
@@ -3259,8 +2728,6 @@ impl Assembler386 {
     /// x64: SETcc AL; MOVZX EAX, AL
     /// aarch64: CSET X0, cc
     fn emit_setcc_to_result(&mut self, cc: u8, result_opref: OpRef) {
-        #[cfg(target_arch = "x86_64")]
-        {
             match cc {
                 CC_L => dynasm!(self.mc ; .arch x64 ; setl al),
                 CC_LE => dynasm!(self.mc ; .arch x64 ; setle al),
@@ -3280,40 +2747,16 @@ impl Assembler386 {
                 ; .arch x64
                 ; movzx eax, al
             );
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            // CSET Xd, cc — sets Xd to 1 if condition is true, 0 otherwise.
-            // Note: CSET Xd, cc is an alias for CSINC Xd, XZR, XZR, invert(cc).
-            match cc {
-                CC_L => dynasm!(self.mc ; .arch aarch64 ; cset x0, lt),
-                CC_LE => dynasm!(self.mc ; .arch aarch64 ; cset x0, le),
-                CC_G => dynasm!(self.mc ; .arch aarch64 ; cset x0, gt),
-                CC_GE => dynasm!(self.mc ; .arch aarch64 ; cset x0, ge),
-                CC_E => dynasm!(self.mc ; .arch aarch64 ; cset x0, eq),
-                CC_NE => dynasm!(self.mc ; .arch aarch64 ; cset x0, ne),
-                CC_B => dynasm!(self.mc ; .arch aarch64 ; cset x0, lo),
-                CC_BE => dynasm!(self.mc ; .arch aarch64 ; cset x0, ls),
-                CC_A => dynasm!(self.mc ; .arch aarch64 ; cset x0, hi),
-                CC_AE => dynasm!(self.mc ; .arch aarch64 ; cset x0, hs),
-                CC_O => dynasm!(self.mc ; .arch aarch64 ; cset x0, vs),
-                CC_NO => dynasm!(self.mc ; .arch aarch64 ; cset x0, vc),
-                _ => dynasm!(self.mc ; .arch aarch64 ; cset x0, eq),
-            }
-        }
         self.store_rax_to_result(result_opref);
     }
 
     /// INT_IS_TRUE: result = (arg0 != 0)
     fn genop_int_is_true(&mut self, op: &Op) {
         self.load_arg_to_rax(op.arg(0));
-        #[cfg(target_arch = "x86_64")]
         dynasm!(self.mc
             ; .arch x64
             ; test rax, rax
         );
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64
             ; cmp x0, 0
         );
         self.guard_success_cc = Some(CC_NE);
@@ -3325,13 +2768,10 @@ impl Assembler386 {
     /// INT_IS_ZERO: result = (arg0 == 0)
     fn genop_int_is_zero(&mut self, op: &Op) {
         self.load_arg_to_rax(op.arg(0));
-        #[cfg(target_arch = "x86_64")]
         dynasm!(self.mc
             ; .arch x64
             ; test rax, rax
         );
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64
             ; cmp x0, 0
         );
         self.guard_success_cc = Some(CC_E);
@@ -3366,24 +2806,12 @@ impl Assembler386 {
     fn _cmp_guard_class_old(&mut self, expected_classptr_imm: Option<i64>) {
         if let Some(off_usize) = self.vtable_offset {
             // x86/assembler.py:1884-1885 vtable_offset path: full classptr CMP.
-            #[cfg(target_arch = "x86_64")]
-            {
                 let off_i32 = off_usize as i32;
                 dynasm!(self.mc
                     ; .arch x64
                     ; mov rax, [rax + off_i32]
                     ; cmp rax, rcx
                 );
-            }
-            #[cfg(target_arch = "aarch64")]
-            {
-                let off_u32 = off_usize as u32;
-                dynasm!(self.mc
-                    ; .arch aarch64
-                    ; ldr x0, [x0, #off_u32]
-                    ; cmp x0, x1
-                );
-            }
         } else {
             // x86/assembler.py:1886-1891 gcremovetypeptr fallback +
             // x86/assembler.py:1893-1901 _cmp_guard_gc_type:
@@ -3398,25 +2826,11 @@ impl Assembler386 {
                      backend has no gc_ll_descr.get_typeid_from_classptr_if_\
                      gcremovetypeptr",
             );
-            #[cfg(target_arch = "x86_64")]
-            {
                 let typeid_i32 = expected_typeid as i32;
                 dynasm!(self.mc
                     ; .arch x64
                     ; cmp DWORD [rax], typeid_i32
                 );
-            }
-            #[cfg(target_arch = "aarch64")]
-            {
-                let typeid_w = expected_typeid as i32;
-                dynasm!(self.mc
-                    ; .arch aarch64
-                    ; ldr w0, [x0]
-                    ; movz w1, #(typeid_w as u32 & 0xffff)
-                    ; movk w1, #((typeid_w as u32 >> 16) & 0xffff), lsl #16
-                    ; cmp w0, w1
-                );
-            }
         }
     }
 
@@ -3431,7 +2845,6 @@ impl Assembler386 {
 
     fn emit_guard_jcc(&mut self, fail_cc: u8) -> DynamicLabel {
         let fail_label = self.mc.new_dynamic_label();
-        #[cfg(target_arch = "x86_64")]
         match fail_cc {
             CC_L => dynasm!(self.mc ; .arch x64 ; jl =>fail_label),
             CC_LE => dynasm!(self.mc ; .arch x64 ; jle =>fail_label),
@@ -3453,35 +2866,10 @@ impl Assembler386 {
         // for forward references to recovery stubs. Use inverted condition
         // + unconditional branch (26-bit / ±128MB) pattern instead:
         //   b.NOT_cond >skip ; b =>fail_label ; skip:
-        #[cfg(target_arch = "aarch64")]
-        {
-            let skip = self.mc.new_dynamic_label();
-            let inv = invert_cc(fail_cc);
-            match inv {
-                CC_L => dynasm!(self.mc ; .arch aarch64 ; b.lt =>skip),
-                CC_LE => dynasm!(self.mc ; .arch aarch64 ; b.le =>skip),
-                CC_G => dynasm!(self.mc ; .arch aarch64 ; b.gt =>skip),
-                CC_GE => dynasm!(self.mc ; .arch aarch64 ; b.ge =>skip),
-                CC_E => dynasm!(self.mc ; .arch aarch64 ; b.eq =>skip),
-                CC_NE => dynasm!(self.mc ; .arch aarch64 ; b.ne =>skip),
-                CC_B => dynasm!(self.mc ; .arch aarch64 ; b.lo =>skip),
-                CC_BE => dynasm!(self.mc ; .arch aarch64 ; b.ls =>skip),
-                CC_A => dynasm!(self.mc ; .arch aarch64 ; b.hi =>skip),
-                CC_AE => dynasm!(self.mc ; .arch aarch64 ; b.hs =>skip),
-                CC_O => dynasm!(self.mc ; .arch aarch64 ; b.vs =>skip),
-                CC_NO => dynasm!(self.mc ; .arch aarch64 ; b.vc =>skip),
-                CC_S => dynasm!(self.mc ; .arch aarch64 ; b.mi =>skip),
-                CC_NS => dynasm!(self.mc ; .arch aarch64 ; b.pl =>skip),
-                _ => dynasm!(self.mc ; .arch aarch64 ; b.eq =>skip),
-            }
-            dynasm!(self.mc ; .arch aarch64 ; b =>fail_label);
-            dynasm!(self.mc ; .arch aarch64 ; =>skip);
-        }
         fail_label
     }
 
     fn emit_jcc_to_label(&mut self, fail_cc: u8, fail_label: DynamicLabel) {
-        #[cfg(target_arch = "x86_64")]
         match fail_cc {
             CC_L => dynasm!(self.mc ; .arch x64 ; jl =>fail_label),
             CC_LE => dynasm!(self.mc ; .arch x64 ; jle =>fail_label),
@@ -3498,30 +2886,6 @@ impl Assembler386 {
             CC_S => dynasm!(self.mc ; .arch x64 ; js =>fail_label),
             CC_NS => dynasm!(self.mc ; .arch x64 ; jns =>fail_label),
             _ => dynasm!(self.mc ; .arch x64 ; je =>fail_label),
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            let skip = self.mc.new_dynamic_label();
-            let inv = invert_cc(fail_cc);
-            match inv {
-                CC_L => dynasm!(self.mc ; .arch aarch64 ; b.lt =>skip),
-                CC_LE => dynasm!(self.mc ; .arch aarch64 ; b.le =>skip),
-                CC_G => dynasm!(self.mc ; .arch aarch64 ; b.gt =>skip),
-                CC_GE => dynasm!(self.mc ; .arch aarch64 ; b.ge =>skip),
-                CC_E => dynasm!(self.mc ; .arch aarch64 ; b.eq =>skip),
-                CC_NE => dynasm!(self.mc ; .arch aarch64 ; b.ne =>skip),
-                CC_B => dynasm!(self.mc ; .arch aarch64 ; b.lo =>skip),
-                CC_BE => dynasm!(self.mc ; .arch aarch64 ; b.ls =>skip),
-                CC_A => dynasm!(self.mc ; .arch aarch64 ; b.hi =>skip),
-                CC_AE => dynasm!(self.mc ; .arch aarch64 ; b.hs =>skip),
-                CC_O => dynasm!(self.mc ; .arch aarch64 ; b.vs =>skip),
-                CC_NO => dynasm!(self.mc ; .arch aarch64 ; b.vc =>skip),
-                CC_S => dynasm!(self.mc ; .arch aarch64 ; b.mi =>skip),
-                CC_NS => dynasm!(self.mc ; .arch aarch64 ; b.pl =>skip),
-                _ => dynasm!(self.mc ; .arch aarch64 ; b.eq =>skip),
-            }
-            dynasm!(self.mc ; .arch aarch64 ; b =>fail_label);
-            dynasm!(self.mc ; .arch aarch64 ; =>skip);
         }
     }
 
@@ -3654,10 +3018,7 @@ impl Assembler386 {
     fn load_condition_into_cc(&mut self, op: &Op) {
         if self.guard_success_cc.is_none() {
             self.load_arg_to_rax(op.arg(0));
-            #[cfg(target_arch = "x86_64")]
             dynasm!(self.mc ; .arch x64 ; test rax, rax);
-            #[cfg(target_arch = "aarch64")]
-            dynasm!(self.mc ; .arch aarch64 ; cmp x0, 0);
             self.guard_success_cc = Some(CC_NE); // rx86.Conditions['NZ']
         }
     }
@@ -3683,10 +3044,7 @@ impl Assembler386 {
     fn genop_guard_guard_value(&mut self, op: &Op, fail_index: u32) {
         self.load_arg_to_rax(op.arg(0));
         self.load_arg_to_rcx(op.arg(1));
-        #[cfg(target_arch = "x86_64")]
         dynasm!(self.mc ; .arch x64 ; cmp rax, rcx);
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64 ; cmp x0, x1);
 
         self.guard_success_cc = Some(CC_E);
         self.implement_guard(op, fail_index);
@@ -3725,10 +3083,7 @@ impl Assembler386 {
     fn genop_guard_guard_nonnull_class(&mut self, op: &Op, fail_index: u32) {
         self.load_arg_to_rax(op.arg(0));
         // assembler.py:1909 CMP(locs[0], imm1) — JB catches NULL (0)
-        #[cfg(target_arch = "x86_64")]
         dynasm!(self.mc ; .arch x64 ; cmp rax, 1);
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64 ; cmp x0, 1);
 
         // assembler.py:1911 emit_forward_jump('B') — jump if below (NULL)
         let fail_label = self.emit_guard_jcc(CC_B);
@@ -3743,10 +3098,7 @@ impl Assembler386 {
 
         // assembler.py:1914 patch_forward_jump — both paths share the
         // same fail_label, so a second JNE to the same target suffices.
-        #[cfg(target_arch = "x86_64")]
         dynasm!(self.mc ; .arch x64 ; jne =>fail_label);
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64 ; b.ne =>fail_label);
 
         // assembler.py:1916-1917
         // guard_success_cc is not used here — we already emitted the jumps.
@@ -3768,10 +3120,9 @@ impl Assembler386 {
     }
 
     /// assembler.py:2207-2222 _store_force_index: before a call that may force,
-    /// zero jf_descr so GUARD_NOT_FORCED's CMP [jf_descr], 0 starts clean.
-    /// RPython stores the guard descr pointer to jf_force_descr; in our
-    /// frame layout jf_descr is used directly (zeroed here, set by force).
-    fn _store_force_index_if_next_guard(&mut self, ops: &[Op], op_idx: usize, _fail_index: u32) {
+    /// store the next GUARD_NOT_FORCED's fail descr ptr to jf_force_descr,
+    /// and zero jf_descr so GUARD_NOT_FORCED's CMP [jf_descr], 0 starts clean.
+    fn _store_force_index_if_next_guard(&mut self, ops: &[Op], op_idx: usize, fail_index: u32) {
         // assembler.py:2224-2226 _find_nearby_operation(+1)
         let next_idx = op_idx + 1;
         if next_idx >= ops.len() {
@@ -3781,14 +3132,25 @@ impl Assembler386 {
         if next_op.opcode != OpCode::GuardNotForced && next_op.opcode != OpCode::GuardNotForced2 {
             return;
         }
-        // Zero jf_descr before the call so GUARD_NOT_FORCED sees 0 (not forced).
-        #[cfg(target_arch = "x86_64")]
+        // Pre-allocate the fail descr for the next GUARD_NOT_FORCED.
+        // The full metadata (faillocs, rd_numb, etc.) will be filled in
+        // when the guard is actually emitted in append_guard_token_with_faillocs.
+        let fail_arg_types = self.infer_fail_arg_types(next_op);
+        let descr = Arc::new(DynasmFailDescr::new(
+            fail_index,
+            self.trace_id,
+            fail_arg_types,
+            false,
+        ));
+        let descr_ptr = Arc::as_ptr(&descr) as i64;
+        self.pending_force_descr = Some(descr);
+
+        // x86/assembler.py:2210-2222: store descr to jf_force_descr,
+        // zero jf_descr.
         dynasm!(self.mc ; .arch x64
+            ; mov rax, QWORD descr_ptr
+            ; mov QWORD [rbp + JF_FORCE_DESCR_OFS], rax
             ; mov QWORD [rbp + JF_DESCR_OFS], 0
-        );
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64
-            ; str xzr, [x29, JF_DESCR_OFS as u32]
         );
     }
 
@@ -3796,13 +3158,9 @@ impl Assembler386 {
     /// Check jf_descr == 0 (not forced); if non-zero, guard fails.
     fn genop_guard_guard_not_forced(&mut self, op: &Op, fail_index: u32) {
         // assembler.py:2229-2231: CMP [jf_descr], 0; guard_success_cc = 'E'
-        #[cfg(target_arch = "x86_64")]
         dynasm!(self.mc ; .arch x64
             ; cmp QWORD [rbp + JF_DESCR_OFS], 0           // jf_descr == 0?
         );
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64
-            ; ldr x0, [x29, JF_DESCR_OFS as u32]               // x0 = jf_descr
             ; cmp x0, 0
         );
         self.guard_success_cc = Some(CC_E); // guard succeeds if equal (not forced)
@@ -3832,49 +3190,26 @@ impl Assembler386 {
             let arg_ref = op.args[i];
             if arg_ref.is_none() {
                 let dst = Self::slot_offset(i);
-                #[cfg(target_arch = "x86_64")]
                 dynasm!(self.mc ; .arch x64 ; push QWORD [rbp + dst]);
-                #[cfg(target_arch = "aarch64")]
-                dynasm!(self.mc ; .arch aarch64 ; ldr x0, [x29, dst as u32] ; str x0, [sp, #-16]!);
             } else if arg_ref.is_constant() {
                 let val = self.constants.get(&arg_ref.0).copied().unwrap_or(0);
-                #[cfg(target_arch = "x86_64")]
-                {
                     dynasm!(self.mc ; .arch x64 ; mov rax, QWORD val as i64 ; push rax);
-                }
-                #[cfg(target_arch = "aarch64")]
-                {
-                    self.emit_mov_imm64(0, val);
-                    dynasm!(self.mc ; .arch aarch64 ; str x0, [sp, #-16]!);
-                }
             } else if let Some(&old_slot) = self.opref_to_slot.get(&arg_ref.0) {
                 let src = Self::slot_offset(old_slot);
-                #[cfg(target_arch = "x86_64")]
                 dynasm!(self.mc ; .arch x64 ; push QWORD [rbp + src]);
-                #[cfg(target_arch = "aarch64")]
-                dynasm!(self.mc ; .arch aarch64 ; ldr x0, [x29, src as u32] ; str x0, [sp, #-16]!);
             } else {
-                #[cfg(target_arch = "x86_64")]
                 dynasm!(self.mc ; .arch x64 ; push 0);
-                #[cfg(target_arch = "aarch64")]
-                dynasm!(self.mc ; .arch aarch64 ; str xzr, [sp, #-16]!);
             }
         }
         // Pass 2: pop in reverse into canonical slots
         for i in (0..n_label).rev() {
             let dst = Self::slot_offset(i);
-            #[cfg(target_arch = "x86_64")]
             dynasm!(self.mc ; .arch x64 ; pop QWORD [rbp + dst]);
-            #[cfg(target_arch = "aarch64")]
-            dynasm!(self.mc ; .arch aarch64 ; ldr x0, [sp], #16 ; str x0, [x29, dst as u32]);
         }
 
         // Bind the LABEL — JUMP targets here (after the copies).
         let label = self.mc.new_dynamic_label();
-        #[cfg(target_arch = "x86_64")]
         dynasm!(self.mc ; .arch x64 ; =>label);
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64 ; =>label);
         if let Some(descr) = loop_target_descr(op) {
             descr.set_ll_loop_code(self.mc.offset().0);
             if let Some(id) = loop_target_id(op) {
@@ -3897,26 +3232,14 @@ impl Assembler386 {
     /// jump.py:66 _move: emit a single slot-to-slot or const-to-slot move.
     fn emit_slot_move(&mut self, src: i32, dst: i32, is_const: bool, val: i64) {
         if is_const {
-            #[cfg(target_arch = "x86_64")]
             dynasm!(self.mc ; .arch x64
                 ; mov rax, QWORD val
                 ; mov [rbp + dst], rax
             );
-            #[cfg(target_arch = "aarch64")]
-            {
-                self.emit_mov_imm64(0, val);
-                dynasm!(self.mc ; .arch aarch64 ; str x0, [x29, dst as u32]);
-            }
         } else if src != dst {
-            #[cfg(target_arch = "x86_64")]
             dynasm!(self.mc ; .arch x64
                 ; mov rax, [rbp + src]
                 ; mov [rbp + dst], rax
-            );
-            #[cfg(target_arch = "aarch64")]
-            dynasm!(self.mc ; .arch aarch64
-                ; ldr x0, [x29, src as u32]
-                ; str x0, [x29, dst as u32]
             );
         }
     }
@@ -3984,15 +3307,7 @@ impl Assembler386 {
                     let dst = moves[i].1;
                     if srccount.get(&dst).copied().unwrap_or(-1) >= 0 {
                         // Push first dst in the cycle
-                        #[cfg(target_arch = "x86_64")]
                         dynasm!(self.mc ; .arch x64 ; push QWORD [rbp + dst]);
-                        #[cfg(target_arch = "aarch64")]
-                        {
-                            dynasm!(self.mc ; .arch aarch64
-                                ; ldr x0, [x29, dst as u32]
-                                ; str x0, [sp, #-16]!
-                            );
-                        }
                         // Walk the cycle
                         let mut cur = i;
                         loop {
@@ -4005,15 +3320,7 @@ impl Assembler386 {
                             if let Some(ni) = next {
                                 if srccount.get(&moves[ni].1).copied().unwrap_or(-1) < 0 {
                                     // End of cycle: pop into this slot
-                                    #[cfg(target_arch = "x86_64")]
                                     dynasm!(self.mc ; .arch x64 ; pop QWORD [rbp + cd]);
-                                    #[cfg(target_arch = "aarch64")]
-                                    {
-                                        dynasm!(self.mc ; .arch aarch64
-                                            ; ldr x0, [sp], #16
-                                            ; str x0, [x29, cd as u32]
-                                        );
-                                    }
                                     break;
                                 }
                                 self.emit_slot_move(src, cd, false, 0);
@@ -4034,26 +3341,15 @@ impl Assembler386 {
             loop_target_id(op).and_then(|k| self.target_tokens_currently_compiling.get(&k).copied())
         {
             // Same-buffer jump (loop body)
-            #[cfg(target_arch = "x86_64")]
             dynasm!(self.mc ; .arch x64 ; jmp =>label);
-            #[cfg(target_arch = "aarch64")]
-            dynasm!(self.mc ; .arch aarch64 ; b =>label);
         } else if let Some(target) = jump_descr.map(|descr| descr.ll_loop_code()) {
             // assembler.py closing_jump parity: bridge jumps back to
             // the original loop's LABEL via absolute address.
-            #[cfg(target_arch = "x86_64")]
-            {
                 let addr = target as i64;
                 dynasm!(self.mc ; .arch x64
                     ; mov rax, QWORD addr
                     ; jmp rax
                 );
-            }
-            #[cfg(target_arch = "aarch64")]
-            {
-                self.emit_mov_imm64(0, target as i64);
-                dynasm!(self.mc ; .arch aarch64 ; br x0);
-            }
         }
     }
 
@@ -4102,25 +3398,15 @@ impl Assembler386 {
             if result_type == Type::Float {
                 // Float: load to xmm0, store via MOVSD
                 self.load_arg_to_rax(arg0); // loads raw bits
-                #[cfg(target_arch = "x86_64")]
                 dynasm!(self.mc
                     ; .arch x64
                     ; mov [rbp + slot0_offset], rax  // store float bits via GPR
                 );
-                #[cfg(target_arch = "aarch64")]
-                dynasm!(self.mc ; .arch aarch64
-                    ; str x0, [x29, slot0_offset as u32]
-                );
             } else {
                 self.load_arg_to_rax(arg0);
-                #[cfg(target_arch = "x86_64")]
                 dynasm!(self.mc
                     ; .arch x64
                     ; mov [rbp + slot0_offset], rax
-                );
-                #[cfg(target_arch = "aarch64")]
-                dynasm!(self.mc ; .arch aarch64
-                    ; str x0, [x29, slot0_offset as u32]
                 );
             }
         }
@@ -4128,19 +3414,11 @@ impl Assembler386 {
         // Store descr pointer at jf_ptr[0] (jf_descr slot).
         // compile.py:665-674 parity: use global singleton pointer.
         let descr_ptr = global_descr_ptr;
-        #[cfg(target_arch = "x86_64")]
         dynasm!(self.mc
             ; .arch x64
             ; mov rax, QWORD descr_ptr
             ; mov [rbp + JF_DESCR_OFS], rax
         );
-        #[cfg(target_arch = "aarch64")]
-        {
-            self.emit_mov_imm64(0, descr_ptr);
-            dynasm!(self.mc ; .arch aarch64
-                ; str x0, [x29, JF_DESCR_OFS as u32]
-            );
-        }
 
         if result_type == Type::Ref {
             if let Some(gcmap) = self.finish_gcmap {
@@ -4187,33 +3465,18 @@ impl Assembler386 {
     fn load_float_arg_to_d0(&mut self, opref: OpRef) {
         match self.resolve_opref(opref) {
             ResolvedArg::Slot(offset) => {
-                #[cfg(target_arch = "x86_64")]
                 dynasm!(self.mc
                     ; .arch x64
                     ; movsd xmm0, [rbp + offset]
                 );
-                #[cfg(target_arch = "aarch64")]
-                dynasm!(self.mc ; .arch aarch64
-                    ; ldr d0, [x29, offset as u32]
-                );
             }
             ResolvedArg::Const(val) => {
                 // Load constant via integer register, then move to float register.
-                #[cfg(target_arch = "x86_64")]
-                {
                     dynasm!(self.mc
                         ; .arch x64
                         ; mov rax, QWORD val as i64
                         ; movq xmm0, rax
                     );
-                }
-                #[cfg(target_arch = "aarch64")]
-                {
-                    self.emit_mov_imm64(0, val);
-                    dynasm!(self.mc ; .arch aarch64
-                        ; fmov d0, x0
-                    );
-                }
             }
         }
     }
@@ -4222,32 +3485,17 @@ impl Assembler386 {
     fn load_float_arg_to_d1(&mut self, opref: OpRef) {
         match self.resolve_opref(opref) {
             ResolvedArg::Slot(offset) => {
-                #[cfg(target_arch = "x86_64")]
                 dynasm!(self.mc
                     ; .arch x64
                     ; movsd xmm1, [rbp + offset]
                 );
-                #[cfg(target_arch = "aarch64")]
-                dynasm!(self.mc ; .arch aarch64
-                    ; ldr d1, [x29, offset as u32]
-                );
             }
             ResolvedArg::Const(val) => {
-                #[cfg(target_arch = "x86_64")]
-                {
                     dynasm!(self.mc
                         ; .arch x64
                         ; mov rax, QWORD val as i64
                         ; movq xmm1, rax
                     );
-                }
-                #[cfg(target_arch = "aarch64")]
-                {
-                    self.emit_mov_imm64(1, val);
-                    dynasm!(self.mc ; .arch aarch64
-                        ; fmov d1, x1
-                    );
-                }
             }
         }
     }
@@ -4256,14 +3504,9 @@ impl Assembler386 {
     fn store_d0_to_result(&mut self, result_opref: OpRef) {
         let slot = self.allocate_slot(result_opref);
         let offset = Self::slot_offset(slot);
-        #[cfg(target_arch = "x86_64")]
         dynasm!(self.mc
             ; .arch x64
             ; movsd [rbp + offset], xmm0
-        );
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64
-            ; str d0, [x29, offset as u32]
         );
     }
 
@@ -4277,13 +3520,10 @@ impl Assembler386 {
     fn genop_float_add(&mut self, op: &Op) {
         self.load_float_arg_to_d0(op.arg(0));
         self.load_float_arg_to_d1(op.arg(1));
-        #[cfg(target_arch = "x86_64")]
         dynasm!(self.mc
             ; .arch x64
             ; addsd xmm0, xmm1
         );
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64
             ; fadd d0, d0, d1
         );
         self.store_d0_to_result(op.pos);
@@ -4293,13 +3533,10 @@ impl Assembler386 {
     fn genop_float_sub(&mut self, op: &Op) {
         self.load_float_arg_to_d0(op.arg(0));
         self.load_float_arg_to_d1(op.arg(1));
-        #[cfg(target_arch = "x86_64")]
         dynasm!(self.mc
             ; .arch x64
             ; subsd xmm0, xmm1
         );
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64
             ; fsub d0, d0, d1
         );
         self.store_d0_to_result(op.pos);
@@ -4309,13 +3546,10 @@ impl Assembler386 {
     fn genop_float_mul(&mut self, op: &Op) {
         self.load_float_arg_to_d0(op.arg(0));
         self.load_float_arg_to_d1(op.arg(1));
-        #[cfg(target_arch = "x86_64")]
         dynasm!(self.mc
             ; .arch x64
             ; mulsd xmm0, xmm1
         );
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64
             ; fmul d0, d0, d1
         );
         self.store_d0_to_result(op.pos);
@@ -4325,13 +3559,10 @@ impl Assembler386 {
     fn genop_float_truediv(&mut self, op: &Op) {
         self.load_float_arg_to_d0(op.arg(0));
         self.load_float_arg_to_d1(op.arg(1));
-        #[cfg(target_arch = "x86_64")]
         dynasm!(self.mc
             ; .arch x64
             ; divsd xmm0, xmm1
         );
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64
             ; fdiv d0, d0, d1
         );
         self.store_d0_to_result(op.pos);
@@ -4342,8 +3573,6 @@ impl Assembler386 {
     /// aarch64: FNEG d0, d0.
     fn genop_float_neg(&mut self, op: &Op) {
         self.load_float_arg_to_d0(op.arg(0));
-        #[cfg(target_arch = "x86_64")]
-        {
             // Load the sign-bit mask (0x8000_0000_0000_0000) into XMM1
             // via integer register, then XOR.
             let sign_mask: i64 = i64::MIN; // 0x8000000000000000
@@ -4353,9 +3582,6 @@ impl Assembler386 {
                 ; movq xmm1, rax
                 ; xorpd xmm0, xmm1
             );
-        }
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64
             ; fneg d0, d0
         );
         self.store_d0_to_result(op.pos);
@@ -4364,13 +3590,10 @@ impl Assembler386 {
     /// CAST_INT_TO_FLOAT: result = (f64)arg0
     fn genop_cast_int_to_float(&mut self, op: &Op) {
         self.load_arg_to_rax(op.arg(0));
-        #[cfg(target_arch = "x86_64")]
         dynasm!(self.mc
             ; .arch x64
             ; cvtsi2sd xmm0, rax
         );
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64
             ; scvtf d0, x0
         );
         self.store_d0_to_result(op.pos);
@@ -4379,13 +3602,10 @@ impl Assembler386 {
     /// CAST_FLOAT_TO_INT: result = (i64)arg0 (truncation)
     fn genop_cast_float_to_int(&mut self, op: &Op) {
         self.load_float_arg_to_d0(op.arg(0));
-        #[cfg(target_arch = "x86_64")]
         dynasm!(self.mc
             ; .arch x64
             ; cvttsd2si rax, xmm0
         );
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64
             ; fcvtzs x0, d0
         );
         self.store_rax_to_result(op.pos);
@@ -4426,7 +3646,6 @@ impl Assembler386 {
         self.load_arg_to_rax(op.arg(0));
 
         // Load the field value at [rax + offset] into rax/x0.
-        #[cfg(target_arch = "x86_64")]
         match size {
             1 => dynasm!(self.mc
                 ; .arch x64
@@ -4446,21 +3665,6 @@ impl Assembler386 {
             ),
         }
 
-        #[cfg(target_arch = "aarch64")]
-        match size {
-            1 => dynasm!(self.mc ; .arch aarch64
-                ; ldrb w0, [x0, offset as u32]
-            ),
-            2 => dynasm!(self.mc ; .arch aarch64
-                ; ldrh w0, [x0, offset as u32]
-            ),
-            4 => dynasm!(self.mc ; .arch aarch64
-                ; ldr w0, [x0, offset as u32]
-            ),
-            _ => dynasm!(self.mc ; .arch aarch64
-                ; ldr x0, [x0, offset as u32]
-            ),
-        }
 
         self.store_rax_to_result(op.pos);
     }
@@ -4474,7 +3678,6 @@ impl Assembler386 {
         self.load_arg_to_rax(op.arg(0));
         self.load_arg_to_rcx(op.arg(1));
 
-        #[cfg(target_arch = "x86_64")]
         match size {
             1 => dynasm!(self.mc
                 ; .arch x64
@@ -4494,21 +3697,6 @@ impl Assembler386 {
             ),
         }
 
-        #[cfg(target_arch = "aarch64")]
-        match size {
-            1 => dynasm!(self.mc ; .arch aarch64
-                ; strb w1, [x0, offset as u32]
-            ),
-            2 => dynasm!(self.mc ; .arch aarch64
-                ; strh w1, [x0, offset as u32]
-            ),
-            4 => dynasm!(self.mc ; .arch aarch64
-                ; str w1, [x0, offset as u32]
-            ),
-            _ => dynasm!(self.mc ; .arch aarch64
-                ; str x1, [x0, offset as u32]
-            ),
-        }
     }
 
     /// GETARRAYITEM_GC_*: result = array[index]
@@ -4527,8 +3715,6 @@ impl Assembler386 {
         self.load_arg_to_rcx(op.arg(1));
 
         // Compute address: rax = rax + base_size + rcx * item_size
-        #[cfg(target_arch = "x86_64")]
-        {
             // rcx = rcx * item_size
             if item_size != 1 {
                 dynasm!(self.mc
@@ -4560,40 +3746,7 @@ impl Assembler386 {
                     ; mov rax, [rax]
                 ),
             }
-        }
 
-        #[cfg(target_arch = "aarch64")]
-        {
-            // x1 = x1 * item_size; x0 = x0 + base_size + x1
-            if item_size != 1 {
-                self.emit_mov_imm64(2, item_size as i64); // x2 = item_size
-                dynasm!(self.mc ; .arch aarch64
-                    ; mul x1, x1, x2
-                );
-            }
-            if base_size != 0 {
-                dynasm!(self.mc ; .arch aarch64
-                    ; add x0, x0, base_size as u32
-                );
-            }
-            dynasm!(self.mc ; .arch aarch64
-                ; add x0, x0, x1
-            );
-            match item_size {
-                1 => dynasm!(self.mc ; .arch aarch64
-                    ; ldrb w0, [x0]
-                ),
-                2 => dynasm!(self.mc ; .arch aarch64
-                    ; ldrh w0, [x0]
-                ),
-                4 => dynasm!(self.mc ; .arch aarch64
-                    ; ldr w0, [x0]
-                ),
-                _ => dynasm!(self.mc ; .arch aarch64
-                    ; ldr x0, [x0]
-                ),
-            }
-        }
 
         self.store_rax_to_result(op.pos);
     }
@@ -4614,8 +3767,6 @@ impl Assembler386 {
         self.load_arg_to_rcx(op.arg(1));
 
         // Compute element address: rax = rax + base_size + rcx * item_size
-        #[cfg(target_arch = "x86_64")]
-        {
             if item_size != 1 {
                 dynasm!(self.mc
                     ; .arch x64
@@ -4627,31 +3778,11 @@ impl Assembler386 {
                 ; add rax, base_size
                 ; add rax, rcx
             );
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            if item_size != 1 {
-                self.emit_mov_imm64(2, item_size as i64);
-                dynasm!(self.mc ; .arch aarch64
-                    ; mul x1, x1, x2
-                );
-            }
-            if base_size != 0 {
-                dynasm!(self.mc ; .arch aarch64
-                    ; add x0, x0, base_size as u32
-                );
-            }
-            dynasm!(self.mc ; .arch aarch64
-                ; add x0, x0, x1
-            );
-        }
 
         // Now load value from arg2 and store it.
         // We need a third register: use rcx/x1 again for the value
         // (the address is in rax/x0).
         // Save rax/x0 (element address) before loading value.
-        #[cfg(target_arch = "x86_64")]
-        {
             // Push address, load value into rcx, pop address into rax.
             dynasm!(self.mc
                 ; .arch x64
@@ -4681,30 +3812,7 @@ impl Assembler386 {
                     ; mov [rax], rcx
                 ),
             }
-        }
 
-        #[cfg(target_arch = "aarch64")]
-        {
-            // Save x0 (element address) in x2, load value into x1.
-            dynasm!(self.mc ; .arch aarch64
-                ; mov x2, x0
-            );
-            self.load_arg_to_rcx(op.arg(2)); // loads into x1
-            match item_size {
-                1 => dynasm!(self.mc ; .arch aarch64
-                    ; strb w1, [x2]
-                ),
-                2 => dynasm!(self.mc ; .arch aarch64
-                    ; strh w1, [x2]
-                ),
-                4 => dynasm!(self.mc ; .arch aarch64
-                    ; str w1, [x2]
-                ),
-                _ => dynasm!(self.mc ; .arch aarch64
-                    ; str x1, [x2]
-                ),
-            }
-        }
     }
 
     /// ARRAYLEN_GC: result = array.length
@@ -4722,13 +3830,10 @@ impl Assembler386 {
         self.load_arg_to_rax(op.arg(0));
 
         // Load length from [array + len_offset].
-        #[cfg(target_arch = "x86_64")]
         dynasm!(self.mc
             ; .arch x64
             ; mov rax, [rax + len_offset]
         );
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64
             ; ldr x0, [x0, len_offset as u32]
         );
 
@@ -4752,17 +3857,13 @@ impl Assembler386 {
     fn emit_call(&mut self, op: &Op, func_arg: usize) {
         let arg_count = op.num_args();
 
-        #[cfg(target_arch = "x86_64")]
         dynasm!(self.mc ; .arch x64 ; push rbp);
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64 ; stp x29, x30, [sp, #-16]!);
 
         for i in (func_arg + 1)..arg_count.min(func_arg + 7) {
             let arg = op.arg(i);
             let abi_idx = i - func_arg - 1;
             match self.resolve_opref(arg) {
                 ResolvedArg::Slot(offset) => {
-                    #[cfg(target_arch = "x86_64")]
                     match abi_idx {
                         0 => dynasm!(self.mc ; .arch x64 ; mov rdi, [rbp + offset]),
                         1 => dynasm!(self.mc ; .arch x64 ; mov rsi, [rbp + offset]),
@@ -4772,16 +3873,8 @@ impl Assembler386 {
                         5 => dynasm!(self.mc ; .arch x64 ; mov r9, [rbp + offset]),
                         _ => {}
                     }
-                    #[cfg(target_arch = "aarch64")]
-                    {
-                        let reg = abi_idx as u8;
-                        dynasm!(self.mc ; .arch aarch64
-                            ; ldr X(reg), [x29, offset as u32]
-                        );
-                    }
                 }
                 ResolvedArg::Const(val) => {
-                    #[cfg(target_arch = "x86_64")]
                     match abi_idx {
                         0 => dynasm!(self.mc ; .arch x64 ; mov rdi, QWORD val as i64),
                         1 => dynasm!(self.mc ; .arch x64 ; mov rsi, QWORD val as i64),
@@ -4791,46 +3884,28 @@ impl Assembler386 {
                         5 => dynasm!(self.mc ; .arch x64 ; mov r9, QWORD val as i64),
                         _ => {}
                     }
-                    #[cfg(target_arch = "aarch64")]
-                    {
-                        let reg = abi_idx as u32;
-                        self.emit_mov_imm64(reg, val);
-                    }
                 }
             }
         }
 
         match self.resolve_opref(op.arg(func_arg)) {
             ResolvedArg::Slot(offset) => {
-                #[cfg(target_arch = "x86_64")]
                 dynasm!(self.mc ; .arch x64
                     ; mov rax, [rbp + offset]
                     ; call rax
                 );
-                #[cfg(target_arch = "aarch64")]
-                dynasm!(self.mc ; .arch aarch64
-                    ; ldr x8, [x29, offset as u32]
                     ; blr x8
                 );
             }
             ResolvedArg::Const(val) => {
-                #[cfg(target_arch = "x86_64")]
                 dynasm!(self.mc ; .arch x64
                     ; mov rax, QWORD val as i64
                     ; call rax
                 );
-                #[cfg(target_arch = "aarch64")]
-                {
-                    self.emit_mov_imm64(8, val);
-                    dynasm!(self.mc ; .arch aarch64 ; blr x8);
-                }
             }
         }
 
-        #[cfg(target_arch = "x86_64")]
         dynasm!(self.mc ; .arch x64 ; pop rbp);
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64 ; ldp x29, x30, [sp], #16);
     }
 
     /// aarch64/opassembler.py:1036 _emit_call.
@@ -4839,10 +3914,7 @@ impl Assembler386 {
     fn emit_call_from_arglocs(&mut self, arglocs: &[Loc], func_index: usize) {
         let arg_count = arglocs.len();
 
-        #[cfg(target_arch = "x86_64")]
         dynasm!(self.mc ; .arch x64 ; push rbp);
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64 ; stp x29, x30, [sp, #-16]!);
 
         for i in (func_index + 1)..arg_count.min(func_index + 7) {
             let abi_idx = i - func_index - 1;
@@ -4850,7 +3922,6 @@ impl Assembler386 {
             match arg {
                 Loc::Frame(f) => {
                     let offset = f.ebp_loc.value;
-                    #[cfg(target_arch = "x86_64")]
                     match abi_idx {
                         0 => dynasm!(self.mc ; .arch x64 ; mov rdi, [rbp + offset]),
                         1 => dynasm!(self.mc ; .arch x64 ; mov rsi, [rbp + offset]),
@@ -4860,18 +3931,8 @@ impl Assembler386 {
                         5 => dynasm!(self.mc ; .arch x64 ; mov r9, [rbp + offset]),
                         _ => {}
                     }
-                    #[cfg(target_arch = "aarch64")]
-                    {
-                        let reg = abi_idx as u8;
-                        if f.ebp_loc.is_float {
-                            dynasm!(self.mc ; .arch aarch64 ; ldr D(reg), [x29, offset as u32]);
-                        } else {
-                            dynasm!(self.mc ; .arch aarch64 ; ldr X(reg), [x29, offset as u32]);
-                        }
-                    }
                 }
                 Loc::Reg(r) => {
-                    #[cfg(target_arch = "x86_64")]
                     match abi_idx {
                         0 => dynasm!(self.mc ; .arch x64 ; mov rdi, Rq(r.value)),
                         1 => dynasm!(self.mc ; .arch x64 ; mov rsi, Rq(r.value)),
@@ -4881,19 +3942,9 @@ impl Assembler386 {
                         5 => dynasm!(self.mc ; .arch x64 ; mov r9, Rq(r.value)),
                         _ => {}
                     }
-                    #[cfg(target_arch = "aarch64")]
-                    {
-                        let reg = abi_idx as u8;
-                        if r.is_xmm {
-                            dynasm!(self.mc ; .arch aarch64 ; fmov D(reg), D(r.value));
-                        } else {
-                            dynasm!(self.mc ; .arch aarch64 ; mov X(reg), X(r.value));
-                        }
-                    }
                 }
                 Loc::Immed(i) => {
                     let val = i.value;
-                    #[cfg(target_arch = "x86_64")]
                     match abi_idx {
                         0 => dynasm!(self.mc ; .arch x64 ; mov rdi, QWORD val),
                         1 => dynasm!(self.mc ; .arch x64 ; mov rsi, QWORD val),
@@ -4903,11 +3954,6 @@ impl Assembler386 {
                         5 => dynasm!(self.mc ; .arch x64 ; mov r9, QWORD val),
                         _ => {}
                     }
-                    #[cfg(target_arch = "aarch64")]
-                    {
-                        let reg = abi_idx as u32;
-                        self.emit_mov_imm64(reg, val);
-                    }
                 }
                 _ => {}
             }
@@ -4916,49 +3962,32 @@ impl Assembler386 {
         match arglocs.get(func_index) {
             Some(Loc::Frame(f)) => {
                 let offset = f.ebp_loc.value;
-                #[cfg(target_arch = "x86_64")]
                 dynasm!(self.mc ; .arch x64
                     ; mov rax, [rbp + offset]
                     ; call rax
                 );
-                #[cfg(target_arch = "aarch64")]
-                dynasm!(self.mc ; .arch aarch64
-                    ; ldr x8, [x29, offset as u32]
                     ; blr x8
                 );
             }
             Some(Loc::Reg(r)) => {
-                #[cfg(target_arch = "x86_64")]
                 dynasm!(self.mc ; .arch x64
                     ; mov rax, Rq(r.value)
                     ; call rax
                 );
-                #[cfg(target_arch = "aarch64")]
-                dynasm!(self.mc ; .arch aarch64
-                    ; mov x8, X(r.value)
                     ; blr x8
                 );
             }
             Some(Loc::Immed(i)) => {
                 let val = i.value;
-                #[cfg(target_arch = "x86_64")]
                 dynasm!(self.mc ; .arch x64
                     ; mov rax, QWORD val
                     ; call rax
                 );
-                #[cfg(target_arch = "aarch64")]
-                {
-                    self.emit_mov_imm64(8, val);
-                    dynasm!(self.mc ; .arch aarch64 ; blr x8);
-                }
             }
             _ => {}
         }
 
-        #[cfg(target_arch = "x86_64")]
         dynasm!(self.mc ; .arch x64 ; pop rbp);
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64 ; ldp x29, x30, [sp], #16);
     }
 
     fn ensure_call_result_bit_extension(&mut self, arglocs: &[Loc]) {
@@ -4968,7 +3997,6 @@ impl Assembler386 {
             return;
         }
 
-        #[cfg(target_arch = "x86_64")]
         match size {
             4 => {
                 if signed {
@@ -4994,31 +4022,6 @@ impl Assembler386 {
             _ => {}
         }
 
-        #[cfg(target_arch = "aarch64")]
-        match size {
-            4 => {
-                if signed {
-                    dynasm!(self.mc ; .arch aarch64 ; lsl x0, x0, 32 ; asr x0, x0, 32);
-                } else {
-                    dynasm!(self.mc ; .arch aarch64 ; lsl x0, x0, 32 ; lsr x0, x0, 32);
-                }
-            }
-            2 => {
-                if signed {
-                    dynasm!(self.mc ; .arch aarch64 ; lsl x0, x0, 48 ; asr x0, x0, 48);
-                } else {
-                    dynasm!(self.mc ; .arch aarch64 ; and x0, x0, 0xFFFF);
-                }
-            }
-            1 => {
-                if signed {
-                    dynasm!(self.mc ; .arch aarch64 ; lsl x0, x0, 56 ; asr x0, x0, 56);
-                } else {
-                    dynasm!(self.mc ; .arch aarch64 ; and x0, x0, 0xFF);
-                }
-            }
-            _ => {}
-        }
     }
 
     /// assembler.py:2176 _genop_call — internal call implementation.
@@ -5067,12 +4070,16 @@ impl Assembler386 {
     /// Uses regalloc-provided arglocs to load callee arguments instead of
     /// resolve_opref(), which drops register-carried values to Const(0).
     fn genop_call_assembler(&mut self, op: &Op, arglocs: &[Loc]) {
-        let _descr = op.descr.as_ref().and_then(|d| d.as_call_descr());
+        let call_descr = op.descr.as_ref().and_then(|d| d.as_call_descr());
+        let expansion = call_descr.and_then(|d| d.vable_expansion());
 
         let num_args = op.args.len();
+        let num_expanded_items = expansion
+            .map(|exp| 1 + exp.scalar_fields.len() + exp.num_array_items)
+            .unwrap_or(num_args);
         // llmodel.py:298 malloc_jitframe parity: callee needs frame_depth
         // slots (frame-slot model stores ALL intermediates in jitframe).
-        let jf_slots = self.frame_depth.max(num_args);
+        let jf_slots = self.frame_depth.max(num_expanded_items);
         let jf_alloc_bytes = crate::jitframe::JitFrame::alloc_size(jf_slots) as i64;
         let jf_frame_len = jf_slots as i64;
         let calloc_ptr = libc::calloc as *const () as i64;
@@ -5083,20 +4090,13 @@ impl Assembler386 {
         // across calloc/call/free. These are callee-saved by ABI and saved
         // in _call_header, but the regalloc may have assigned them to
         // live variables. Push/pop to preserve the outer state.
-        #[cfg(target_arch = "x86_64")]
         dynasm!(self.mc ; .arch x64
             ; mov r12, rbp            // save caller's jf_ptr in r12
-        );
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64
-            ; stp x19, x20, [sp, #-16]!  // save x19/x20 on stack
-            ; mov x19, x29               // x19 = caller's jf_ptr
         );
 
         // Allocate callee jitframe on heap via calloc.
         // Stack alignment: after prologue (push rbp + push r12) + return
         // addr, rsp ≡ -8 (mod 16). sub 8 aligns to 16 for ABI call.
-        #[cfg(target_arch = "x86_64")]
         dynasm!(self.mc ; .arch x64
             ; sub rsp, 8                        // align to 16
             ; mov rdi, 1                        // calloc nmemb
@@ -5105,67 +4105,109 @@ impl Assembler386 {
             ; call rax                          // rax = heap jf_ptr
             ; add rsp, 8                        // unalign
         );
-        #[cfg(target_arch = "aarch64")]
-        {
-            self.emit_mov_imm64(0, 1);
-            self.emit_mov_imm64(1, jf_alloc_bytes);
-            self.emit_mov_imm64(2, calloc_ptr);
-            dynasm!(self.mc ; .arch aarch64
-                ; sub sp, sp, 16                // align
-                ; blr x2                        // x0 = heap jf_ptr
-                ; add sp, sp, 16                // unalign
-            );
-        }
 
         // rdx/x20 = heap jf_ptr (held across arg stores).
         // load_arg_to_rax reads from [rbp+offset], rbp still = caller's jf.
         // Wait: rbp was saved to r12 but NOT changed yet. Actually we did
         // `mov r12, rbp` above, so rbp still points to caller's jf. ✓
-        #[cfg(target_arch = "x86_64")]
         dynasm!(self.mc ; .arch x64
             ; mov rdx, rax            // rdx = heap jf_ptr
             ; mov QWORD [rdx + JF_DESCR_OFS], 0
             ; mov QWORD [rdx + JF_FRAME_OFS as i32], jf_frame_len
         );
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64
-            ; mov x20, x0             // x20 = heap jf_ptr
-            ; str xzr, [x20, JF_DESCR_OFS as u32]
-        );
-        #[cfg(target_arch = "aarch64")]
-        {
-            self.emit_mov_imm64(0, jf_frame_len);
-            dynasm!(self.mc ; .arch aarch64
-                ; str x0, [x20, JF_FRAME_OFS as u32]
-            );
-        }
 
-        // Store callee args at jf_frame[i].
-        // arglocs are all Frame/Immed (regalloc synced to stack).
-        for (i, loc) in arglocs.iter().enumerate() {
-            let dest_offset = (FIRST_ITEM_OFFSET + i * 8) as i32;
-            // Load value from the regalloc-determined location into rax/x0.
-            self.emit_load_to_rax(*loc);
-            #[cfg(target_arch = "x86_64")]
-            dynasm!(self.mc ; .arch x64
-                ; mov [rdx + dest_offset], rax
-            );
-            #[cfg(target_arch = "aarch64")]
-            dynasm!(self.mc ; .arch aarch64
-                ; str x0, [x20, dest_offset as u32]
-            );
+        // rewrite.py:665-695 handle_call_assembler parity:
+        // if VableExpansion is present, expand the caller frame reference
+        // into the callee's full inputarg layout. Otherwise, copy the
+        // raw CALL_ASSEMBLER arguments as ordinary loop inputs.
+        //
+        // All callee inputs live at absolute jitframe slots
+        // [JITFRAME_FIXED_SIZE + relative_input_index].
+        if let Some(expansion) = expansion {
+            for slot in 0..num_expanded_items {
+                let dest_offset = Self::slot_offset(JITFRAME_FIXED_SIZE + slot);
+
+                if let Some(&(_, cval)) = expansion.const_overrides.iter().find(|(s, _)| *s == slot)
+                {
+                    dynasm!(self.mc ; .arch x64
+                        ; mov rax, QWORD cval
+                        ; mov [rdx + dest_offset], rax
+                    );
+                    continue;
+                }
+
+                if let Some(&(_, arg_idx)) =
+                    expansion.arg_overrides.iter().find(|(s, _)| *s == slot)
+                {
+                    let src = arglocs
+                        .get(arg_idx)
+                        .copied()
+                        .expect("call_assembler arg override out of bounds");
+                    self.emit_load_to_rax(src);
+                    dynasm!(self.mc ; .arch x64
+                        ; mov [rdx + dest_offset], rax
+                    );
+                    continue;
+                }
+
+                if slot == 0 {
+                    let frame_loc = arglocs
+                        .first()
+                        .copied()
+                        .expect("call_assembler vable expansion missing frame arg");
+                    self.emit_load_to_rax(frame_loc);
+                    dynasm!(self.mc ; .arch x64
+                        ; mov [rdx + dest_offset], rax
+                    );
+                    continue;
+                }
+
+                if slot <= expansion.scalar_fields.len() {
+                    let (field_ofs, _) = expansion.scalar_fields[slot - 1];
+                    let frame_loc = arglocs
+                        .first()
+                        .copied()
+                        .expect("call_assembler vable expansion missing frame arg");
+                    self.emit_load_to_rax(frame_loc);
+                    dynasm!(self.mc ; .arch x64
+                        ; mov rax, [rax + field_ofs as i32]
+                        ; mov [rdx + dest_offset], rax
+                    );
+                        ; ldr x0, [x0, field_ofs as u32]
+                    continue;
+                }
+
+                let array_index = slot - 1 - expansion.scalar_fields.len();
+                let data_ptr_ofs = expansion.array_struct_offset + expansion.array_ptr_offset;
+                let item_ofs = (array_index * 8) as i32;
+                let frame_loc = arglocs
+                    .first()
+                    .copied()
+                    .expect("call_assembler vable expansion missing frame arg");
+                self.emit_load_to_rax(frame_loc);
+                dynasm!(self.mc ; .arch x64
+                    ; mov rax, [rax + data_ptr_ofs as i32]
+                    ; mov rax, [rax + item_ofs]
+                    ; mov [rdx + dest_offset], rax
+                );
+                    ; ldr x0, [x0, data_ptr_ofs as u32]
+                    ; ldr x0, [x0, item_ofs as u32]
+            }
+        } else {
+            for (i, loc) in arglocs.iter().enumerate() {
+                let dest_offset = Self::slot_offset(JITFRAME_FIXED_SIZE + i);
+                self.emit_load_to_rax(*loc);
+                dynasm!(self.mc ; .arch x64
+                    ; mov [rdx + dest_offset], rax
+                );
+            }
         }
 
         // _call_assembler_emit_call (assembler.py:2267-2269):
         // rdi/x0 = callee jf_ptr.
-        #[cfg(target_arch = "x86_64")]
         dynasm!(self.mc ; .arch x64
             ; mov rdi, rdx            // rdi = heap jf ptr
             ; sub rsp, 8              // align stack for call
-        );
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64
-            ; mov x0, x20             // x0 = heap jf ptr
         );
 
         // assembler.py:320 _call_assembler_emit_call(descr._ll_function_addr, ...)
@@ -5197,11 +4239,9 @@ impl Assembler386 {
             // RPython uses the first argument slot of the callee jitframe.
             // Read it, free the heap jf, then call force_fn(frame_ptr).
             let force_addr = crate::call_assembler_force_fn_addr() as i64;
-            #[cfg(target_arch = "x86_64")]
-            {
                 if force_addr != 0 {
                     dynasm!(self.mc ; .arch x64
-                        ; mov r13, [rdx + FIRST_ITEM_OFFSET as i32]
+                        ; mov r13, [rdx + Self::slot_offset(JITFRAME_FIXED_SIZE) as i32]
                         ; mov rdi, rdx                   // free(heap_jf)
                         ; sub rsp, 8
                         ; mov rax, QWORD free_ptr
@@ -5214,6 +4254,7 @@ impl Assembler386 {
                         ; call rax                       // rax = force_fn(frame_ptr) = result
                         ; add rsp, 8
                     );
+                    self.reload_frame_if_necessary();
                 } else {
                     // No force_fn registered — free and return 0.
                     dynasm!(self.mc ; .arch x64
@@ -5226,86 +4267,48 @@ impl Assembler386 {
                         ; xor eax, eax                   // result = 0
                     );
                 }
-            }
-            #[cfg(target_arch = "aarch64")]
-            {
-                if force_addr != 0 {
-                    dynasm!(self.mc ; .arch aarch64
-                        ; ldr x21, [x20, FIRST_ITEM_OFFSET as u32]
-                    );
-                    self.emit_mov_imm64(2, free_ptr);
-                    dynasm!(self.mc ; .arch aarch64
-                        ; mov x0, x20
-                        ; blr x2                        // free(heap_jf)
-                        ; mov x29, x19                  // restore caller jf_ptr
-                        ; mov x0, x21                   // arg0 = PyFrame ptr
-                    );
-                    self.emit_mov_imm64(2, force_addr);
-                    dynasm!(self.mc ; .arch aarch64
-                        ; blr x2                        // x0 = force_fn(frame_ptr)
-                    );
-                } else {
-                    self.emit_mov_imm64(2, free_ptr);
-                    dynasm!(self.mc ; .arch aarch64
-                        ; mov x0, x20
-                        ; blr x2
-                        ; mov x29, x19
-                        ; mov x0, 0
-                    );
-                }
-            }
         } else {
-            // Resolved target: call callee and handle fast/slow path.
+            // Resolved target: call callee via execute trampoline
+            // (stacker stack-growth protection for deep CALL_ASSEMBLER recursion).
+            let trampoline_addr = crate::call_assembler_execute_addr() as i64;
             if let Some(addr) = target_addr {
                 let addr = addr as i64;
-                #[cfg(target_arch = "x86_64")]
                 dynasm!(self.mc ; .arch x64
-                    ; mov rax, QWORD addr
+                    ; mov rsi, QWORD addr             // arg1 = callee entry addr
+                    ; mov rax, QWORD trampoline_addr
                     ; call rax
                 );
-                #[cfg(target_arch = "aarch64")]
-                {
-                    self.emit_mov_imm64(2, addr);
-                    dynasm!(self.mc ; .arch aarch64 ; blr x2);
-                }
-            } else if let Some(label) = self.self_entry_label {
-                #[cfg(target_arch = "x86_64")]
-                dynasm!(self.mc ; .arch x64 ; call =>label);
-                #[cfg(target_arch = "aarch64")]
-                dynasm!(self.mc ; .arch aarch64 ; bl =>label);
+            } else if self.self_entry_label.is_some() {
+                // Self-entry: load entry addr from self_entry_addr_ptr
+                // (written after finalization).
+                let addr_ptr = self.self_entry_addr_ptr as i64;
+                dynasm!(self.mc ; .arch x64
+                    ; mov rsi, QWORD addr_ptr         // rsi = &entry_addr
+                    ; mov rsi, [rsi]                   // rsi = entry_addr
+                    ; mov rax, QWORD trampoline_addr
+                    ; call rax
+                );
             }
 
             // rax/x0 = callee's returned jf_ptr (= heap jf_ptr we passed).
-            #[cfg(target_arch = "x86_64")]
             dynasm!(self.mc ; .arch x64
                 ; add rsp, 8              // undo alignment
             );
 
             // Restore caller's jf_ptr.
-            #[cfg(target_arch = "x86_64")]
             dynasm!(self.mc ; .arch x64
                 ; mov rbp, r12            // restore caller's jf_ptr
             );
-            #[cfg(target_arch = "aarch64")]
-            dynasm!(self.mc ; .arch aarch64
-                ; mov x29, x19            // restore
-            );
+            self.reload_frame_if_necessary();
 
             // rax = callee's returned jf_ptr (heap-allocated).
             // Save it in rdx for descr check and free.
-            #[cfg(target_arch = "x86_64")]
             dynasm!(self.mc ; .arch x64
                 ; mov rdx, rax            // rdx = callee jf_ptr
-            );
-            #[cfg(target_arch = "aarch64")]
-            dynasm!(self.mc ; .arch aarch64
-                ; mov x20, x0             // x20 = callee jf_ptr
             );
 
             // _call_assembler_check_descr (assembler.py:2274-2278):
             //   CMP [jf_ptr + jf_descr_ofs], done_with_this_frame_descr_{type}
-            #[cfg(target_arch = "x86_64")]
-            {
                 let fast_path = self.mc.new_dynamic_label();
                 let merge = self.mc.new_dynamic_label();
                 dynasm!(self.mc ; .arch x64
@@ -5324,8 +4327,9 @@ impl Assembler386 {
                     ; mov rax, QWORD helper_addr
                     ; call rax                          // rax = helper result
                     ; add rsp, 8
-                    ; jmp =>merge
                 );
+                self.reload_frame_if_necessary();
+                dynasm!(self.mc ; .arch x64 ; jmp =>merge);
 
                 // Path B (fast): _call_assembler_load_result (assembler.py:2291-2303)
                 dynasm!(self.mc ; .arch x64
@@ -5355,42 +4359,6 @@ impl Assembler386 {
                         ; =>merge
                     );
                 }
-            }
-            #[cfg(target_arch = "aarch64")]
-            {
-                let fast_path = self.mc.new_dynamic_label();
-                let merge = self.mc.new_dynamic_label();
-                self.emit_mov_imm64(2, done_descr_ptr);
-                dynasm!(self.mc ; .arch aarch64
-                    ; ldr x1, [x20, JF_DESCR_OFS as u32]
-                    ; cmp x1, x2
-                    ; b.eq =>fast_path
-                );
-                // Path A (slow)
-                {
-                    self.emit_mov_imm64(2, helper_addr);
-                    self.emit_mov_imm64(1, green_key); // x1 = green_key
-                    dynasm!(self.mc ; .arch aarch64
-                        ; mov x0, x20                   // arg0 = callee_jf_ptr
-                        ; blr x2                        // x0 = helper result
-                        ; b =>merge
-                    );
-                }
-                // Path B (fast)
-                {
-                    dynasm!(self.mc ; .arch aarch64
-                        ; =>fast_path
-                        ; ldr x19, [x20, FIRST_ITEM_OFFSET as u32]
-                    );
-                    self.emit_mov_imm64(2, free_ptr);
-                    dynasm!(self.mc ; .arch aarch64
-                        ; mov x0, x20
-                        ; blr x2
-                        ; mov x0, x19                   // x0 = result
-                        ; =>merge
-                    );
-                }
-            }
         } // end if is_resolved
 
         // Store result to the output slot (rax/x0 holds result).
@@ -5399,10 +4367,6 @@ impl Assembler386 {
         }
 
         // Restore callee-saved regs clobbered by this sequence.
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64
-            ; ldp x19, x20, [sp], #16    // restore x19/x20
-        );
     }
 
     // ----------------------------------------------------------------
@@ -5424,24 +4388,13 @@ impl Assembler386 {
             .unwrap_or(16) as i64;
         let malloc_ptr = libc::malloc as *const () as i64;
         // Call malloc(obj_size)
-        #[cfg(target_arch = "x86_64")]
-        {
             dynasm!(self.mc ; .arch x64
                 ; mov rdi, QWORD obj_size
                 ; mov rax, QWORD malloc_ptr
                 ; call rax
             );
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            self.emit_mov_imm64(0, obj_size);
-            self.emit_mov_imm64(2, malloc_ptr);
-            dynasm!(self.mc ; .arch aarch64 ; blr x2);
-        }
         // rax/x0 = pointer to allocated memory
         // Zero-initialize
-        #[cfg(target_arch = "x86_64")]
-        {
             dynasm!(self.mc ; .arch x64
                 ; push rax           // save ptr
                 ; mov rdi, rax       // dest = ptr
@@ -5451,23 +4404,6 @@ impl Assembler386 {
                 ; call rax
                 ; pop rax            // restore ptr
             );
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            dynasm!(self.mc ; .arch aarch64
-                ; mov x19, x0       // save ptr in callee-saved
-            );
-            // memset(ptr, 0, size)
-            dynasm!(self.mc ; .arch aarch64
-                ; mov x1, 0         // val = 0
-            );
-            self.emit_mov_imm64(2, obj_size);
-            self.emit_mov_imm64(3, libc::memset as *const () as i64);
-            dynasm!(self.mc ; .arch aarch64
-                ; blr x3
-                ; mov x0, x19       // restore ptr
-            );
-        }
         if !op.pos.is_none() {
             self.store_rax_to_result(op.pos);
         }
@@ -5489,8 +4425,6 @@ impl Assembler386 {
             .map(|sd| sd.vtable())
             .unwrap_or(0) as i64;
         let malloc_ptr = libc::malloc as *const () as i64;
-        #[cfg(target_arch = "x86_64")]
-        {
             dynasm!(self.mc ; .arch x64
                 ; mov rdi, QWORD obj_size
                 ; mov rax, QWORD malloc_ptr
@@ -5510,23 +4444,6 @@ impl Assembler386 {
                     ; mov [rax], rcx
                 );
             }
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            self.emit_mov_imm64(0, obj_size);
-            self.emit_mov_imm64(2, malloc_ptr);
-            dynasm!(self.mc ; .arch aarch64 ; blr x2);
-            dynasm!(self.mc ; .arch aarch64 ; mov x19, x0);
-            dynasm!(self.mc ; .arch aarch64 ; mov x1, 0);
-            self.emit_mov_imm64(2, obj_size);
-            self.emit_mov_imm64(3, libc::memset as *const () as i64);
-            dynasm!(self.mc ; .arch aarch64 ; blr x3);
-            dynasm!(self.mc ; .arch aarch64 ; mov x0, x19);
-            if vtable != 0 {
-                self.emit_mov_imm64(1, vtable);
-                dynasm!(self.mc ; .arch aarch64 ; str x1, [x0]);
-            }
-        }
         if !op.pos.is_none() {
             self.store_rax_to_result(op.pos);
         }
@@ -5551,14 +4468,9 @@ impl Assembler386 {
     /// x86/assembler.py genop_force_token: mov resloc, ebp
     fn genop_force_token(&mut self, op: &Op) {
         // The frame pointer is the force token.
-        #[cfg(target_arch = "x86_64")]
         dynasm!(self.mc
             ; .arch x64
             ; mov rax, rbp
-        );
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64
-            ; mov x0, x29
         );
         self.store_rax_to_result(op.pos);
     }
@@ -5572,13 +4484,10 @@ impl Assembler386 {
         let offset = Self::field_offset_from_descr(op);
         self.load_arg_to_rax(op.arg(0));
 
-        #[cfg(target_arch = "x86_64")]
         dynasm!(self.mc
             ; .arch x64
             ; mov rax, [rax + offset]
         );
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64
             ; ldr x0, [x0, offset as u32]
         );
 
@@ -5600,8 +4509,6 @@ impl Assembler386 {
         self.load_arg_to_rax(op.arg(0)); // string pointer
         self.load_arg_to_rcx(op.arg(1)); // index
 
-        #[cfg(target_arch = "x86_64")]
-        {
             // Address = rax + base_size + rcx * item_size
             if item_size != 1 {
                 dynasm!(self.mc
@@ -5632,39 +4539,7 @@ impl Assembler386 {
                     ; mov rax, [rax]
                 ),
             }
-        }
 
-        #[cfg(target_arch = "aarch64")]
-        {
-            if item_size != 1 {
-                self.emit_mov_imm64(2, item_size as i64);
-                dynasm!(self.mc ; .arch aarch64
-                    ; mul x1, x1, x2
-                );
-            }
-            if base_size != 0 {
-                dynasm!(self.mc ; .arch aarch64
-                    ; add x0, x0, base_size as u32
-                );
-            }
-            dynasm!(self.mc ; .arch aarch64
-                ; add x0, x0, x1
-            );
-            match item_size {
-                1 => dynasm!(self.mc ; .arch aarch64
-                    ; ldrb w0, [x0]
-                ),
-                2 => dynasm!(self.mc ; .arch aarch64
-                    ; ldrh w0, [x0]
-                ),
-                4 => dynasm!(self.mc ; .arch aarch64
-                    ; ldr w0, [x0]
-                ),
-                _ => dynasm!(self.mc ; .arch aarch64
-                    ; ldr x0, [x0]
-                ),
-            }
-        }
 
         self.store_rax_to_result(op.pos);
     }
@@ -5675,10 +4550,7 @@ impl Assembler386 {
 
     /// assembler.py:1817 genop_save_exc_class — stub: returns 0.
     fn genop_save_exc_class(&mut self, op: &Op) {
-        #[cfg(target_arch = "x86_64")]
         dynasm!(self.mc ; .arch x64 ; xor eax, eax);
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64 ; mov x0, 0);
         if !op.pos.is_none() {
             self.store_rax_to_result(op.pos);
         }
@@ -5686,10 +4558,7 @@ impl Assembler386 {
 
     /// assembler.py:1827 genop_save_exception — stub: returns 0.
     fn genop_save_exception(&mut self, op: &Op) {
-        #[cfg(target_arch = "x86_64")]
         dynasm!(self.mc ; .arch x64 ; xor eax, eax);
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64 ; mov x0, 0);
         if !op.pos.is_none() {
             self.store_rax_to_result(op.pos);
         }
@@ -5703,13 +4572,10 @@ impl Assembler386 {
     fn genop_int_floordiv(&mut self, op: &Op) {
         self.load_arg_to_rax(op.arg(0));
         self.load_arg_to_rcx(op.arg(1));
-        #[cfg(target_arch = "x86_64")]
         dynasm!(self.mc ; .arch x64
             ; cqo
             ; idiv rcx
         );
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64
             ; sdiv x0, x0, x1
         );
         self.store_rax_to_result(op.pos);
@@ -5719,14 +4585,11 @@ impl Assembler386 {
     fn genop_int_mod(&mut self, op: &Op) {
         self.load_arg_to_rax(op.arg(0));
         self.load_arg_to_rcx(op.arg(1));
-        #[cfg(target_arch = "x86_64")]
         dynasm!(self.mc ; .arch x64
             ; cqo
             ; idiv rcx
             ; mov rax, rdx
         );
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64
             ; sdiv x2, x0, x1
             ; msub x0, x2, x1, x0
         );
@@ -5737,13 +4600,10 @@ impl Assembler386 {
     fn genop_uint_mul_high(&mut self, op: &Op) {
         self.load_arg_to_rax(op.arg(0));
         self.load_arg_to_rcx(op.arg(1));
-        #[cfg(target_arch = "x86_64")]
         dynasm!(self.mc ; .arch x64
             ; mul rcx
             ; mov rax, rdx
         );
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64
             ; umulh x0, x0, x1
         );
         self.store_rax_to_result(op.pos);
@@ -5759,19 +4619,10 @@ impl Assembler386 {
         let shift = 64 - num_bytes * 8;
         if shift > 0 && shift < 64 {
             let sh = shift as u8;
-            #[cfg(target_arch = "x86_64")]
             dynasm!(self.mc ; .arch x64
                 ; shl rax, sh
                 ; sar rax, sh
             );
-            #[cfg(target_arch = "aarch64")]
-            {
-                let sh32 = shift as u32;
-                dynasm!(self.mc ; .arch aarch64
-                    ; lsl x0, x0, sh32
-                    ; asr x0, x0, sh32
-                );
-            }
         }
         self.store_rax_to_result(op.pos);
     }
@@ -5783,17 +4634,12 @@ impl Assembler386 {
     /// FLOAT_ABS: result = |arg0|
     fn genop_float_abs(&mut self, op: &Op) {
         self.load_float_arg_to_d0(op.arg(0));
-        #[cfg(target_arch = "x86_64")]
-        {
             let mask: i64 = i64::MAX; // 0x7FFF_FFFF_FFFF_FFFF
             dynasm!(self.mc ; .arch x64
                 ; mov rax, QWORD mask
                 ; movq xmm1, rax
                 ; andpd xmm0, xmm1
             );
-        }
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64
             ; fabs d0, d0
         );
         self.store_d0_to_result(op.pos);
@@ -5811,8 +4657,6 @@ impl Assembler386 {
             self.load_float_arg_to_d1(op.arg(1));
         }
 
-        #[cfg(target_arch = "x86_64")]
-        {
             dynasm!(self.mc ; .arch x64 ; ucomisd xmm0, xmm1);
             match op.opcode {
                 OpCode::FloatLt | OpCode::FloatGt => {
@@ -5836,29 +4680,6 @@ impl Assembler386 {
                 }
             }
             dynasm!(self.mc ; .arch x64 ; test rax, rax);
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            dynasm!(self.mc ; .arch aarch64 ; fcmp d0, d1);
-            match op.opcode {
-                OpCode::FloatLt | OpCode::FloatGt => {
-                    dynasm!(self.mc ; .arch aarch64 ; cset x0, gt);
-                }
-                OpCode::FloatLe | OpCode::FloatGe => {
-                    dynasm!(self.mc ; .arch aarch64 ; cset x0, ge);
-                }
-                OpCode::FloatEq => {
-                    dynasm!(self.mc ; .arch aarch64 ; cset x0, eq);
-                }
-                OpCode::FloatNe => {
-                    dynasm!(self.mc ; .arch aarch64 ; cset x0, ne);
-                }
-                _ => {
-                    dynasm!(self.mc ; .arch aarch64 ; cset x0, eq);
-                }
-            }
-            dynasm!(self.mc ; .arch aarch64 ; cmp x0, 0);
-        }
         self.guard_success_cc = Some(CC_NE);
         if !op.pos.is_none() {
             self.store_rax_to_result(op.pos);
@@ -5868,13 +4689,10 @@ impl Assembler386 {
     /// CAST_FLOAT_TO_SINGLEFLOAT: f64 → f32 (bits in lower 32 of i64)
     fn genop_cast_float_to_singlefloat(&mut self, op: &Op) {
         self.load_float_arg_to_d0(op.arg(0));
-        #[cfg(target_arch = "x86_64")]
         dynasm!(self.mc ; .arch x64
             ; cvtsd2ss xmm0, xmm0
             ; movd eax, xmm0
         );
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64
             ; fcvt s0, d0
             ; fmov w0, s0
         );
@@ -5884,13 +4702,10 @@ impl Assembler386 {
     /// CAST_SINGLEFLOAT_TO_FLOAT: f32 (bits in lower 32) → f64
     fn genop_cast_singlefloat_to_float(&mut self, op: &Op) {
         self.load_arg_to_rax(op.arg(0));
-        #[cfg(target_arch = "x86_64")]
         dynasm!(self.mc ; .arch x64
             ; movd xmm0, eax
             ; cvtss2sd xmm0, xmm0
         );
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64
             ; fmov s0, w0
             ; fcvt d0, s0
         );
@@ -5906,7 +4721,6 @@ impl Assembler386 {
     fn emit_load_from_rax_sized(&mut self, itemsize: i32) {
         let abs_size = itemsize.unsigned_abs() as usize;
         let signed = itemsize < 0;
-        #[cfg(target_arch = "x86_64")]
         match (abs_size, signed) {
             (1, true) => dynasm!(self.mc ; .arch x64 ; movsx rax, BYTE [rax]),
             (2, true) => dynasm!(self.mc ; .arch x64 ; movsx rax, WORD [rax]),
@@ -5919,33 +4733,15 @@ impl Assembler386 {
             (4, false) => dynasm!(self.mc ; .arch x64 ; mov eax, [rax]),
             _ => dynasm!(self.mc ; .arch x64 ; mov rax, [rax]),
         }
-        #[cfg(target_arch = "aarch64")]
-        match (abs_size, signed) {
-            (1, true) => dynasm!(self.mc ; .arch aarch64 ; ldrsb x0, [x0]),
-            (2, true) => dynasm!(self.mc ; .arch aarch64 ; ldrsh x0, [x0]),
-            (4, true) => dynasm!(self.mc ; .arch aarch64 ; ldrsw x0, [x0]),
-            (1, false) => dynasm!(self.mc ; .arch aarch64 ; ldrb w0, [x0]),
-            (2, false) => dynasm!(self.mc ; .arch aarch64 ; ldrh w0, [x0]),
-            (4, false) => dynasm!(self.mc ; .arch aarch64 ; ldr w0, [x0]),
-            _ => dynasm!(self.mc ; .arch aarch64 ; ldr x0, [x0]),
-        }
     }
 
     /// Emit a sized store of rcx/x1 to [rax]/[x0].
     fn emit_store_to_rax_sized(&mut self, size: usize) {
-        #[cfg(target_arch = "x86_64")]
         match size {
             1 => dynasm!(self.mc ; .arch x64 ; mov [rax], cl),
             2 => dynasm!(self.mc ; .arch x64 ; mov [rax], cx),
             4 => dynasm!(self.mc ; .arch x64 ; mov [rax], ecx),
             _ => dynasm!(self.mc ; .arch x64 ; mov [rax], rcx),
-        }
-        #[cfg(target_arch = "aarch64")]
-        match size {
-            1 => dynasm!(self.mc ; .arch aarch64 ; strb w1, [x0]),
-            2 => dynasm!(self.mc ; .arch aarch64 ; strh w1, [x0]),
-            4 => dynasm!(self.mc ; .arch aarch64 ; str w1, [x0]),
-            _ => dynasm!(self.mc ; .arch aarch64 ; str x1, [x0]),
         }
     }
 
@@ -5962,10 +4758,7 @@ impl Assembler386 {
     fn genop_gc_load(&mut self, op: &Op) {
         self.load_arg_to_rax(op.arg(0));
         self.load_arg_to_rcx(op.arg(1));
-        #[cfg(target_arch = "x86_64")]
         dynasm!(self.mc ; .arch x64 ; add rax, rcx);
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64 ; add x0, x0, x1);
 
         let itemsize = self.resolve_const_or(op.arg(2), 8) as i32;
         self.emit_load_from_rax_sized(itemsize);
@@ -5982,8 +4775,6 @@ impl Assembler386 {
         self.load_arg_to_rax(op.arg(0));
         self.load_arg_to_rcx(op.arg(1));
 
-        #[cfg(target_arch = "x86_64")]
-        {
             if scale != 1 {
                 dynasm!(self.mc ; .arch x64 ; imul rcx, rcx, scale);
             }
@@ -5991,18 +4782,6 @@ impl Assembler386 {
             if base_offset != 0 {
                 dynasm!(self.mc ; .arch x64 ; add rax, base_offset);
             }
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            if scale != 1 {
-                self.emit_mov_imm64(2, scale as i64);
-                dynasm!(self.mc ; .arch aarch64 ; mul x1, x1, x2);
-            }
-            dynasm!(self.mc ; .arch aarch64 ; add x0, x0, x1);
-            if base_offset != 0 {
-                dynasm!(self.mc ; .arch aarch64 ; add x0, x0, base_offset as u32);
-            }
-        }
 
         self.emit_load_from_rax_sized(itemsize);
         self.store_rax_to_result(op.pos);
@@ -6018,20 +4797,10 @@ impl Assembler386 {
 
         self.load_arg_to_rax(op.arg(0));
         self.load_arg_to_rcx(op.arg(1));
-        #[cfg(target_arch = "x86_64")]
-        {
             dynasm!(self.mc ; .arch x64 ; add rax, rcx);
             dynasm!(self.mc ; .arch x64 ; push rax);
             self.load_arg_to_rcx(op.arg(2));
             dynasm!(self.mc ; .arch x64 ; pop rax);
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            dynasm!(self.mc ; .arch aarch64 ; add x0, x0, x1);
-            dynasm!(self.mc ; .arch aarch64 ; mov x2, x0);
-            self.load_arg_to_rcx(op.arg(2));
-            dynasm!(self.mc ; .arch aarch64 ; mov x0, x2);
-        }
         self.emit_store_to_rax_sized(itemsize);
     }
 
@@ -6045,8 +4814,6 @@ impl Assembler386 {
 
         self.load_arg_to_rax(op.arg(0));
         self.load_arg_to_rcx(op.arg(1));
-        #[cfg(target_arch = "x86_64")]
-        {
             if scale != 1 {
                 dynasm!(self.mc ; .arch x64 ; imul rcx, rcx, scale);
             }
@@ -6057,21 +4824,6 @@ impl Assembler386 {
             dynasm!(self.mc ; .arch x64 ; push rax);
             self.load_arg_to_rcx(op.arg(2));
             dynasm!(self.mc ; .arch x64 ; pop rax);
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            if scale != 1 {
-                self.emit_mov_imm64(2, scale as i64);
-                dynasm!(self.mc ; .arch aarch64 ; mul x1, x1, x2);
-            }
-            dynasm!(self.mc ; .arch aarch64 ; add x0, x0, x1);
-            if base_offset != 0 {
-                dynasm!(self.mc ; .arch aarch64 ; add x0, x0, base_offset as u32);
-            }
-            dynasm!(self.mc ; .arch aarch64 ; mov x2, x0);
-            self.load_arg_to_rcx(op.arg(2));
-            dynasm!(self.mc ; .arch aarch64 ; mov x0, x2);
-        }
         self.emit_store_to_rax_sized(itemsize);
     }
 
@@ -6082,10 +4834,7 @@ impl Assembler386 {
 
         self.load_arg_to_rax(op.arg(0));
         self.load_arg_to_rcx(op.arg(1));
-        #[cfg(target_arch = "x86_64")]
         dynasm!(self.mc ; .arch x64 ; add rax, rcx);
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64 ; add x0, x0, x1);
 
         self.emit_load_from_rax_sized(size as i32);
         let _ = offset; // offset is in the descriptor, not used for raw_load
@@ -6098,20 +4847,10 @@ impl Assembler386 {
 
         self.load_arg_to_rax(op.arg(0));
         self.load_arg_to_rcx(op.arg(1));
-        #[cfg(target_arch = "x86_64")]
-        {
             dynasm!(self.mc ; .arch x64 ; add rax, rcx);
             dynasm!(self.mc ; .arch x64 ; push rax);
             self.load_arg_to_rcx(op.arg(2));
             dynasm!(self.mc ; .arch x64 ; pop rax);
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            dynasm!(self.mc ; .arch aarch64 ; add x0, x0, x1);
-            dynasm!(self.mc ; .arch aarch64 ; mov x2, x0);
-            self.load_arg_to_rcx(op.arg(2));
-            dynasm!(self.mc ; .arch aarch64 ; mov x0, x2);
-        }
         self.emit_store_to_rax_sized(size);
     }
 
@@ -6141,8 +4880,6 @@ impl Assembler386 {
         self.load_arg_to_rcx(op.arg(1));
         let total_offset = base_size + field_offset;
 
-        #[cfg(target_arch = "x86_64")]
-        {
             if item_size != 1 {
                 dynasm!(self.mc ; .arch x64 ; imul rcx, rcx, item_size);
             }
@@ -6150,18 +4887,6 @@ impl Assembler386 {
                 ; add rax, total_offset
                 ; add rax, rcx
             );
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            if item_size != 1 {
-                self.emit_mov_imm64(2, item_size as i64);
-                dynasm!(self.mc ; .arch aarch64 ; mul x1, x1, x2);
-            }
-            if total_offset != 0 {
-                dynasm!(self.mc ; .arch aarch64 ; add x0, x0, total_offset as u32);
-            }
-            dynasm!(self.mc ; .arch aarch64 ; add x0, x0, x1);
-        }
 
         self.emit_load_from_rax_sized(field_size as i32);
         self.store_rax_to_result(op.pos);
@@ -6189,8 +4914,6 @@ impl Assembler386 {
         self.load_arg_to_rcx(op.arg(1));
         let total_offset = base_size + field_offset;
 
-        #[cfg(target_arch = "x86_64")]
-        {
             if item_size != 1 {
                 dynasm!(self.mc ; .arch x64 ; imul rcx, rcx, item_size);
             }
@@ -6201,21 +4924,6 @@ impl Assembler386 {
             dynasm!(self.mc ; .arch x64 ; push rax);
             self.load_arg_to_rcx(op.arg(2));
             dynasm!(self.mc ; .arch x64 ; pop rax);
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            if item_size != 1 {
-                self.emit_mov_imm64(2, item_size as i64);
-                dynasm!(self.mc ; .arch aarch64 ; mul x1, x1, x2);
-            }
-            if total_offset != 0 {
-                dynasm!(self.mc ; .arch aarch64 ; add x0, x0, total_offset as u32);
-            }
-            dynasm!(self.mc ; .arch aarch64 ; add x0, x0, x1);
-            dynasm!(self.mc ; .arch aarch64 ; mov x2, x0);
-            self.load_arg_to_rcx(op.arg(2));
-            dynasm!(self.mc ; .arch aarch64 ; mov x0, x2);
-        }
 
         self.emit_store_to_rax_sized(field_size);
     }
@@ -6228,34 +4936,22 @@ impl Assembler386 {
     fn genop_discard_cond_call(&mut self, op: &Op) {
         self.load_arg_to_rax(op.arg(0));
         let skip_label = self.mc.new_dynamic_label();
-        #[cfg(target_arch = "x86_64")]
         dynasm!(self.mc ; .arch x64 ; test rax, rax ; jz =>skip_label);
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64 ; cbz x0, =>skip_label);
 
         self.emit_call(op, 1);
 
-        #[cfg(target_arch = "x86_64")]
         dynasm!(self.mc ; .arch x64 ; =>skip_label);
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64 ; =>skip_label);
     }
 
     /// COND_CALL_VALUE_I/R: if arg(0) == 0, call function; else result = arg(0).
     fn genop_cond_call_value(&mut self, op: &Op) {
         self.load_arg_to_rax(op.arg(0));
         let skip_label = self.mc.new_dynamic_label();
-        #[cfg(target_arch = "x86_64")]
         dynasm!(self.mc ; .arch x64 ; test rax, rax ; jnz =>skip_label);
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64 ; cbnz x0, =>skip_label);
 
         self.emit_call(op, 1);
 
-        #[cfg(target_arch = "x86_64")]
         dynasm!(self.mc ; .arch x64 ; =>skip_label);
-        #[cfg(target_arch = "aarch64")]
-        dynasm!(self.mc ; .arch aarch64 ; =>skip_label);
 
         if !op.pos.is_none() {
             self.store_rax_to_result(op.pos);
@@ -6277,8 +4973,6 @@ impl Assembler386 {
 
         self.load_arg_to_rax(op.arg(0)); // string
         self.load_arg_to_rcx(op.arg(1)); // index
-        #[cfg(target_arch = "x86_64")]
-        {
             if item_size != 1 {
                 dynasm!(self.mc ; .arch x64 ; imul rcx, rcx, item_size);
             }
@@ -6286,21 +4980,6 @@ impl Assembler386 {
             dynasm!(self.mc ; .arch x64 ; push rax);
             self.load_arg_to_rcx(op.arg(2));
             dynasm!(self.mc ; .arch x64 ; pop rax);
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            if item_size != 1 {
-                self.emit_mov_imm64(2, item_size as i64);
-                dynasm!(self.mc ; .arch aarch64 ; mul x1, x1, x2);
-            }
-            dynasm!(self.mc ; .arch aarch64
-                ; add x0, x0, base_size as u32
-                ; add x0, x0, x1
-            );
-            dynasm!(self.mc ; .arch aarch64 ; mov x2, x0);
-            self.load_arg_to_rcx(op.arg(2));
-            dynasm!(self.mc ; .arch aarch64 ; mov x0, x2);
-        }
         self.emit_store_to_rax_sized(item_size as usize);
     }
 
@@ -6316,8 +4995,6 @@ impl Assembler386 {
 
         // Compute byte_count = length * item_size
         self.load_arg_to_rax(op.arg(4));
-        #[cfg(target_arch = "x86_64")]
-        {
             if item_size != 1 {
                 dynasm!(self.mc ; .arch x64
                     ; mov rcx, QWORD item_size
@@ -6366,51 +5043,6 @@ impl Assembler386 {
                 ; call rax
                 ; pop rbp
             );
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            if item_size != 1 {
-                self.emit_mov_imm64(1, item_size);
-                dynasm!(self.mc ; .arch aarch64 ; mul x0, x0, x1);
-            }
-            dynasm!(self.mc ; .arch aarch64 ; str x0, [sp, #-16]!); // byte_count
-
-            self.load_arg_to_rax(op.arg(0));
-            self.load_arg_to_rcx(op.arg(2));
-            if item_size != 1 {
-                self.emit_mov_imm64(2, item_size);
-                dynasm!(self.mc ; .arch aarch64 ; mul x1, x1, x2);
-            }
-            dynasm!(self.mc ; .arch aarch64
-                ; add x0, x0, base_size as u32
-                ; add x0, x0, x1
-                ; str x0, [sp, #-16]!  // src_addr
-            );
-
-            self.load_arg_to_rax(op.arg(1));
-            self.load_arg_to_rcx(op.arg(3));
-            if item_size != 1 {
-                self.emit_mov_imm64(2, item_size);
-                dynasm!(self.mc ; .arch aarch64 ; mul x1, x1, x2);
-            }
-            dynasm!(self.mc ; .arch aarch64
-                ; add x0, x0, base_size as u32
-                ; add x0, x0, x1
-            );
-
-            let memmove_ptr = libc::memmove as *const () as i64;
-            dynasm!(self.mc ; .arch aarch64
-                ; ldr x1, [sp], #16  // src
-                ; ldr x2, [sp], #16  // count
-            );
-            // x0 = dst already
-            dynasm!(self.mc ; .arch aarch64 ; stp x29, x30, [sp, #-16]!);
-            self.emit_mov_imm64(3, memmove_ptr);
-            dynasm!(self.mc ; .arch aarch64
-                ; blr x3
-                ; ldp x29, x30, [sp], #16
-            );
-        }
     }
 
     /// NEWSTR: allocate a byte string of given length.
@@ -6432,8 +5064,6 @@ impl Assembler386 {
         let malloc_ptr = libc::malloc as *const () as i64;
         let memset_ptr = libc::memset as *const () as i64;
 
-        #[cfg(target_arch = "x86_64")]
-        {
             // Save length, compute total_size = base_size + length * item_size
             dynasm!(self.mc ; .arch x64
                 ; push rax                           // save length
@@ -6456,39 +5086,6 @@ impl Assembler386 {
                 // Store length at offset 8 (RPython string header)
                 ; mov [rax + 8], rcx
             );
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            dynasm!(self.mc ; .arch aarch64
-                ; str x0, [sp, #-16]!               // save length
-            );
-            if item_size != 1 {
-                self.emit_mov_imm64(1, item_size);
-                dynasm!(self.mc ; .arch aarch64 ; mul x0, x0, x1);
-            }
-            dynasm!(self.mc ; .arch aarch64
-                ; add x0, x0, base_size as u32
-                ; str x0, [sp, #-16]!               // save total_size
-            );
-            dynasm!(self.mc ; .arch aarch64 ; stp x29, x30, [sp, #-16]!);
-            self.emit_mov_imm64(8, malloc_ptr);
-            dynasm!(self.mc ; .arch aarch64
-                ; blr x8
-                ; ldp x29, x30, [sp], #16
-                ; ldr x2, [sp], #16                 // total_size
-                ; mov x19, x0                        // save ptr
-                ; mov x1, 0                          // val = 0
-                ; stp x29, x30, [sp, #-16]!
-            );
-            self.emit_mov_imm64(8, memset_ptr);
-            dynasm!(self.mc ; .arch aarch64
-                ; blr x8
-                ; ldp x29, x30, [sp], #16
-                ; mov x0, x19                        // restore ptr
-                ; ldr x1, [sp], #16                  // length
-                ; str x1, [x0, 8]                    // store length at offset 8
-            );
-        }
 
         if !op.pos.is_none() {
             self.store_rax_to_result(op.pos);
@@ -6514,8 +5111,6 @@ impl Assembler386 {
         self.load_arg_to_rax(op.arg(0)); // base
         self.load_arg_to_rcx(op.arg(1)); // start
 
-        #[cfg(target_arch = "x86_64")]
-        {
             if scale_start != 1 {
                 dynasm!(self.mc ; .arch x64 ; imul rcx, rcx, scale_start as i32);
             }
@@ -6538,35 +5133,6 @@ impl Assembler386 {
                 ; call rax
                 ; pop rbp
             );
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            if scale_start != 1 {
-                self.emit_mov_imm64(2, scale_start);
-                dynasm!(self.mc ; .arch aarch64 ; mul x1, x1, x2);
-            }
-            dynasm!(self.mc ; .arch aarch64
-                ; add x0, x0, base_size as u32
-                ; add x0, x0, x1
-                ; str x0, [sp, #-16]!               // save dest
-            );
-            self.load_arg_to_rax(op.arg(2));
-            if scale_size != 1 {
-                self.emit_mov_imm64(1, scale_size);
-                dynasm!(self.mc ; .arch aarch64 ; mul x0, x0, x1);
-            }
-            dynasm!(self.mc ; .arch aarch64
-                ; mov x2, x0                         // byte_length
-                ; ldr x0, [sp], #16                  // dest
-                ; mov x1, 0
-                ; stp x29, x30, [sp, #-16]!
-            );
-            self.emit_mov_imm64(8, memset_ptr);
-            dynasm!(self.mc ; .arch aarch64
-                ; blr x8
-                ; ldp x29, x30, [sp], #16
-            );
-        }
     }
 
     // ================================================================
@@ -6582,8 +5148,6 @@ impl Assembler386 {
         self.load_arg_to_rax(op.arg(0));
         self.load_arg_to_rcx(op.arg(1));
 
-        #[cfg(target_arch = "x86_64")]
-        {
             if scale != 1 {
                 dynasm!(self.mc ; .arch x64 ; imul rcx, rcx, scale);
             }
@@ -6591,18 +5155,6 @@ impl Assembler386 {
             if offset != 0 {
                 dynasm!(self.mc ; .arch x64 ; add rax, offset);
             }
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            if scale != 1 {
-                self.emit_mov_imm64(2, scale as i64);
-                dynasm!(self.mc ; .arch aarch64 ; mul x1, x1, x2);
-            }
-            dynasm!(self.mc ; .arch aarch64 ; add x0, x0, x1);
-            if offset != 0 {
-                dynasm!(self.mc ; .arch aarch64 ; add x0, x0, offset as u32);
-            }
-        }
 
         self.store_rax_to_result(op.pos);
     }
@@ -6619,20 +5171,3 @@ impl Assembler386 {
 }
 
 /// Flush icache — aarch64 only.
-#[cfg(target_arch = "aarch64")]
-fn flush_icache(addr: *const u8, len: usize) {
-    #[cfg(target_os = "macos")]
-    {
-        unsafe extern "C" {
-            fn sys_icache_invalidate(start: *mut u8, size: usize);
-        }
-        unsafe { sys_icache_invalidate(addr as *mut u8, len) };
-    }
-    #[cfg(target_os = "linux")]
-    {
-        unsafe extern "C" {
-            fn __clear_cache(start: *mut u8, end: *mut u8);
-        }
-        unsafe { __clear_cache(addr as *mut u8, (addr as *mut u8).add(len)) };
-    }
-}

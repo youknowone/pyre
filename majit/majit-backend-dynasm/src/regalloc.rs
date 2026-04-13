@@ -1256,11 +1256,12 @@ impl RegisterManager {
 
     /// regalloc.py:611
     pub fn loc(
-        &self,
+        &mut self,
         v: OpRef,
+        tp: Type,
         must_exist: bool,
-        longevity: &LifetimeManager,
-        fm: &FrameManager,
+        longevity: &mut LifetimeManager,
+        fm: &mut FrameManager,
         constants: &HashMap<u32, i64>,
     ) -> Loc {
         if v.is_constant() {
@@ -1285,7 +1286,7 @@ impl RegisterManager {
         if must_exist {
             panic!("RegisterManager.loc: box {:?} not found", v);
         }
-        Loc::Immed(ImmedLoc::new(0))
+        Loc::Frame(fm.loc(v, tp, false, longevity))
     }
 
     /// regalloc.py:625 return_constant
@@ -1318,7 +1319,7 @@ impl RegisterManager {
     pub fn make_sure_var_in_reg(
         &mut self,
         v: OpRef,
-        _tp: Type,
+        tp: Type,
         forbidden_vars: &[OpRef],
         selected_reg: Option<RegLoc>,
         need_lower_byte: bool,
@@ -1338,7 +1339,7 @@ impl RegisterManager {
                 pending_moves,
             );
         }
-        let prev_loc = self.loc(v, true, longevity, fm, constants);
+        let prev_loc = self.loc(v, tp, true, longevity, fm, constants);
         if matches!(prev_loc, Loc::Reg(r) if r == self.frame_reg) && selected_reg.is_none() {
             return prev_loc;
         }
@@ -1392,7 +1393,7 @@ impl RegisterManager {
         // regalloc.py:685 — two cases where we allocate a new register
         let not_in_reg = !self.reg_bindings_contains(v, longevity);
         if not_in_reg || (v_keeps_living && !self.free_regs.is_empty()) {
-            let v_loc = self.loc(v, false, longevity, fm, constants);
+            let v_loc = self.loc(v, tp, false, longevity, fm, constants);
             let result_loc =
                 self.force_allocate_reg(result_v, forbidden_vars, None, false, longevity, fm);
             let new_loc = Loc::Reg(result_loc);
@@ -1793,13 +1794,33 @@ impl RegAlloc {
     // ── Location dispatch (type-based routing to rm or xrm) ──
 
     /// x86/regalloc.py:291 loc(v)
-    pub fn loc(&self, v: OpRef, tp: Type) -> Loc {
+    pub fn loc(&mut self, v: OpRef, tp: Type) -> Loc {
+        self.loc_with_mode(v, tp, false)
+    }
+
+    pub fn loc_must_exist(&mut self, v: OpRef, tp: Type) -> Loc {
+        self.loc_with_mode(v, tp, true)
+    }
+
+    fn loc_with_mode(&mut self, v: OpRef, tp: Type, must_exist: bool) -> Loc {
         if tp == Type::Float {
-            self.xrm
-                .loc(v, false, &self.longevity, &self.fm, &self.constants)
+            self.xrm.loc(
+                v,
+                tp,
+                must_exist,
+                &mut self.longevity,
+                &mut self.fm,
+                &self.constants,
+            )
         } else {
-            self.rm
-                .loc(v, false, &self.longevity, &self.fm, &self.constants)
+            self.rm.loc(
+                v,
+                tp,
+                must_exist,
+                &mut self.longevity,
+                &mut self.fm,
+                &self.constants,
+            )
         }
     }
 
@@ -1996,7 +2017,7 @@ impl RegAlloc {
     }
 
     /// x86/regalloc.py:682 locs_for_fail
-    pub fn locs_for_fail(&self, guard_op: &Op) -> Vec<Option<Loc>> {
+    pub fn locs_for_fail(&mut self, guard_op: &Op) -> Vec<Option<Loc>> {
         let fail_args = match &guard_op.fail_args {
             Some(fa) => fa,
             None => return Vec::new(),
@@ -2014,18 +2035,7 @@ impl RegAlloc {
                 continue;
             }
             let tp = self.tp(arg);
-            let reg_loc = if tp == Type::Float {
-                self.xrm.reg_bindings_get(arg, &self.longevity)
-            } else {
-                self.rm.reg_bindings_get(arg, &self.longevity)
-            };
-            if let Some(reg) = reg_loc {
-                locs.push(Some(Loc::Reg(reg)));
-            } else if let Some(floc) = self.fm.get(arg, &self.longevity) {
-                locs.push(Some(Loc::Frame(floc)));
-            } else {
-                locs.push(None);
-            }
+            locs.push(Some(self.loc_must_exist(arg, tp)));
         }
         locs
     }
@@ -2747,9 +2757,10 @@ impl RegAlloc {
     fn consider_float_op(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let loc1 = self.xrm.loc(
             op.args[1],
+            Type::Float,
             false,
-            &self.longevity,
-            &self.fm,
+            &mut self.longevity,
+            &mut self.fm,
             &self.constants,
         );
         let args: Vec<OpRef> = op.args.iter().copied().collect();
@@ -3028,7 +3039,7 @@ impl RegAlloc {
         let mut arglocs: Vec<Loc> = Vec::new();
         for &arg in &op.args {
             let tp = self.tp(arg);
-            arglocs.push(self.loc(arg, tp));
+            arglocs.push(self.loc_must_exist(arg, tp));
         }
 
         let result_tp = op.opcode.result_type();
@@ -3098,7 +3109,7 @@ impl RegAlloc {
         let mut locs = Vec::new();
         for &arg in &op.args {
             let tp = self.tp(arg);
-            locs.push(self.loc(arg, tp));
+            locs.push(self.loc_must_exist(arg, tp));
         }
         self.perform(i, locs, None, output);
     }

@@ -1,0 +1,232 @@
+/// aarch64/opassembler.py parity: arch-specific operation emission.
+///
+/// RPython separates instruction emission from assembly control flow:
+/// - `llsupport/assembler.py` → common (BaseAssembler)
+/// - `aarch64/opassembler.py` → arch-specific emit_op_* (ResOpAssembler)
+/// - `aarch64/assembler.py` → control flow (AssemblerARM64)
+///
+/// This module contains aarch64-specific emit helpers called from
+/// the regalloc-aware dispatch in assembler.rs.
+use dynasmrt::{DynasmApi, dynasm};
+
+use super::assembler::AssemblerARM64;
+use crate::regloc::{Loc, RegLoc};
+
+impl AssemblerARM64 {
+    // ── emit_op_setfield_gc ──
+    // aarch64/opassembler.py: emit_op_setfield_gc
+    // x86/assembler.py: genop_discard_setfield_gc
+
+    pub(crate) fn emit_op_setfield_regalloc(
+        &mut self,
+        base: &RegLoc,
+        val_loc: &Loc,
+        ofs: i32,
+        field_size: usize,
+    ) {
+        match val_loc {
+            Loc::Reg(v) if v.is_xmm => {
+                dynasm!(self.mc ; .arch aarch64 ; str D(v.value), [X(base.value), ofs as u32]);
+            }
+            Loc::Reg(v) => match field_size {
+                1 => {
+                    dynasm!(self.mc ; .arch aarch64 ; strb W(v.value), [X(base.value), ofs as u32])
+                }
+                2 => {
+                    dynasm!(self.mc ; .arch aarch64 ; strh W(v.value), [X(base.value), ofs as u32])
+                }
+                4 => dynasm!(self.mc ; .arch aarch64 ; str W(v.value), [X(base.value), ofs as u32]),
+                _ => dynasm!(self.mc ; .arch aarch64 ; str X(v.value), [X(base.value), ofs as u32]),
+            },
+            _ => {
+                let scratch = RegLoc::new(16, false);
+                self.regalloc_mov(val_loc, &Loc::Reg(scratch));
+                match field_size {
+                    1 => {
+                        dynasm!(self.mc ; .arch aarch64 ; strb W(scratch.value), [X(base.value), ofs as u32])
+                    }
+                    2 => {
+                        dynasm!(self.mc ; .arch aarch64 ; strh W(scratch.value), [X(base.value), ofs as u32])
+                    }
+                    4 => {
+                        dynasm!(self.mc ; .arch aarch64 ; str W(scratch.value), [X(base.value), ofs as u32])
+                    }
+                    _ => {
+                        dynasm!(self.mc ; .arch aarch64 ; str X(scratch.value), [X(base.value), ofs as u32])
+                    }
+                }
+            }
+        }
+    }
+
+    // ── emit_op_gc_load ──
+    // aarch64/opassembler.py:365-370 emit_op_gc_load_i/r/f
+    // x86/assembler.py:1645 genop_gc_load_i — size_loc/sign_loc
+
+    /// `size`: byte size (1/2/4/8). Negative = signed load (for ints).
+    pub(crate) fn emit_op_gcload_regalloc(
+        &mut self,
+        base: &RegLoc,
+        ofs_loc: &Loc,
+        dst: &RegLoc,
+        size: i64,
+    ) {
+        let abs_size = size.unsigned_abs() as usize;
+        let signed = size < 0;
+        match ofs_loc {
+            Loc::Immed(i) => {
+                let o = i.value as i32;
+                self.emit_load_sized(base, o, None, dst, abs_size, signed);
+            }
+            Loc::Reg(ofs_r) => {
+                self.emit_load_sized(base, 0, Some(ofs_r), dst, abs_size, signed);
+            }
+            _ => {}
+        }
+    }
+
+    /// Emit a sized load: [base + ofs] or [base + ofs_reg].
+    fn emit_load_sized(
+        &mut self,
+        base: &RegLoc,
+        ofs: i32,
+        ofs_reg: Option<&RegLoc>,
+        dst: &RegLoc,
+        size: usize,
+        signed: bool,
+    ) {
+        if dst.is_xmm {
+            // Float: always 8-byte
+            if let Some(r) = ofs_reg {
+                dynasm!(self.mc ; .arch aarch64 ; ldr D(dst.value), [X(base.value), X(r.value)]);
+            } else {
+                dynasm!(self.mc ; .arch aarch64 ; ldr D(dst.value), [X(base.value), ofs as u32]);
+            }
+            return;
+        }
+        // Integer load with size/sign
+            if let Some(r) = ofs_reg {
+                match (size, signed) {
+                    (1, false) => {
+                        dynasm!(self.mc ; .arch aarch64 ; ldrb W(dst.value), [X(base.value), X(r.value)])
+                    }
+                    (1, true) => {
+                        dynasm!(self.mc ; .arch aarch64 ; ldrsb X(dst.value), [X(base.value), X(r.value)])
+                    }
+                    (2, false) => {
+                        dynasm!(self.mc ; .arch aarch64 ; ldrh W(dst.value), [X(base.value), X(r.value)])
+                    }
+                    (2, true) => {
+                        dynasm!(self.mc ; .arch aarch64 ; ldrsh X(dst.value), [X(base.value), X(r.value)])
+                    }
+                    (4, false) => {
+                        dynasm!(self.mc ; .arch aarch64 ; ldr W(dst.value), [X(base.value), X(r.value)])
+                    }
+                    (4, true) => {
+                        dynasm!(self.mc ; .arch aarch64 ; ldrsw X(dst.value), [X(base.value), X(r.value)])
+                    }
+                    _ => {
+                        dynasm!(self.mc ; .arch aarch64 ; ldr X(dst.value), [X(base.value), X(r.value)])
+                    }
+                }
+            } else {
+                match (size, signed) {
+                    (1, false) => {
+                        dynasm!(self.mc ; .arch aarch64 ; ldrb W(dst.value), [X(base.value), ofs as u32])
+                    }
+                    (1, true) => {
+                        dynasm!(self.mc ; .arch aarch64 ; ldrsb X(dst.value), [X(base.value), ofs as u32])
+                    }
+                    (2, false) => {
+                        dynasm!(self.mc ; .arch aarch64 ; ldrh W(dst.value), [X(base.value), ofs as u32])
+                    }
+                    (2, true) => {
+                        dynasm!(self.mc ; .arch aarch64 ; ldrsh X(dst.value), [X(base.value), ofs as u32])
+                    }
+                    (4, false) => {
+                        dynasm!(self.mc ; .arch aarch64 ; ldr W(dst.value), [X(base.value), ofs as u32])
+                    }
+                    (4, true) => {
+                        dynasm!(self.mc ; .arch aarch64 ; ldrsw X(dst.value), [X(base.value), ofs as u32])
+                    }
+                    _ => {
+                        dynasm!(self.mc ; .arch aarch64 ; ldr X(dst.value), [X(base.value), ofs as u32])
+                    }
+                }
+            }
+    }
+
+    // ── emit_op_gc_store ──
+    // aarch64/opassembler.py:365-370 emit_op_gc_store
+    // x86/assembler.py:1746 genop_gc_store — size_loc
+
+    /// `size`: byte size (1/2/4/8).
+    pub(crate) fn emit_op_gcstore_regalloc(
+        &mut self,
+        base: &RegLoc,
+        ofs_loc: &Loc,
+        val: &RegLoc,
+        size: usize,
+    ) {
+        match ofs_loc {
+            Loc::Immed(i) => {
+                let o = i.value as i32;
+                self.emit_store_sized(base, o, None, val, size);
+            }
+            Loc::Reg(ofs_r) => {
+                self.emit_store_sized(base, 0, Some(ofs_r), val, size);
+            }
+            _ => {}
+        }
+    }
+
+    /// Emit a sized store: [base + ofs] or [base + ofs_reg].
+    fn emit_store_sized(
+        &mut self,
+        base: &RegLoc,
+        ofs: i32,
+        ofs_reg: Option<&RegLoc>,
+        val: &RegLoc,
+        size: usize,
+    ) {
+        if val.is_xmm {
+            if let Some(r) = ofs_reg {
+                dynasm!(self.mc ; .arch aarch64 ; str D(val.value), [X(base.value), X(r.value)]);
+            } else {
+                dynasm!(self.mc ; .arch aarch64 ; str D(val.value), [X(base.value), ofs as u32]);
+            }
+            return;
+        }
+            if let Some(r) = ofs_reg {
+                match size {
+                    1 => {
+                        dynasm!(self.mc ; .arch aarch64 ; strb W(val.value), [X(base.value), X(r.value)])
+                    }
+                    2 => {
+                        dynasm!(self.mc ; .arch aarch64 ; strh W(val.value), [X(base.value), X(r.value)])
+                    }
+                    4 => {
+                        dynasm!(self.mc ; .arch aarch64 ; str W(val.value), [X(base.value), X(r.value)])
+                    }
+                    _ => {
+                        dynasm!(self.mc ; .arch aarch64 ; str X(val.value), [X(base.value), X(r.value)])
+                    }
+                }
+            } else {
+                match size {
+                    1 => {
+                        dynasm!(self.mc ; .arch aarch64 ; strb W(val.value), [X(base.value), ofs as u32])
+                    }
+                    2 => {
+                        dynasm!(self.mc ; .arch aarch64 ; strh W(val.value), [X(base.value), ofs as u32])
+                    }
+                    4 => {
+                        dynasm!(self.mc ; .arch aarch64 ; str W(val.value), [X(base.value), ofs as u32])
+                    }
+                    _ => {
+                        dynasm!(self.mc ; .arch aarch64 ; str X(val.value), [X(base.value), ofs as u32])
+                    }
+                }
+            }
+    }
+}

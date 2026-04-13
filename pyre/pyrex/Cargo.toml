@@ -11,6 +11,16 @@ description = "pyre executable — Python Rewritten"
 name = "pyre"
 path = "src/main.rs"
 
+[[bin]]
+name = "pyre-cranelift"
+path = "src/bin/pyre-cranelift.rs"
+required-features = ["cranelift"]
+
+[[bin]]
+name = "pyre-dynasm"
+path = "src/bin/pyre-dynasm.rs"
+required-features = ["dynasm"]
+
 [features]
 default = ["cranelift"]
 jit = []  # meta feature: enabled by cranelift or dynasm
