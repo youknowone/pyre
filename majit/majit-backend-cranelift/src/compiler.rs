@@ -175,6 +175,26 @@ fn jitframe_gc_type_id_is_explicit() -> bool {
 unsafe fn jitframe_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut GcRef)) {
     let jf_ptr = obj_addr as *const u8;
 
+    // jitframe.py:105-109: trace header GC refs before consulting jf_gcmap.
+    // Only savedata/guard_exc/jf_forward are GC-managed pointers here.
+    let savedata_ptr = unsafe { jf_ptr.add(JF_SAVEDATA_OFS as usize) as *mut GcRef };
+    let savedata = unsafe { *savedata_ptr };
+    if !savedata.is_null() {
+        f(savedata_ptr);
+    }
+
+    let guard_exc_ptr = unsafe { jf_ptr.add(JF_GUARD_EXC_OFS as usize) as *mut GcRef };
+    let guard_exc = unsafe { *guard_exc_ptr };
+    if !guard_exc.is_null() {
+        f(guard_exc_ptr);
+    }
+
+    let forward_ptr = unsafe { jf_ptr.add(JF_FORWARD_OFS as usize) as *mut GcRef };
+    let forward = unsafe { *forward_ptr };
+    if !forward.is_null() {
+        f(forward_ptr);
+    }
+
     // jitframe.py:115: gcmap = (obj_addr + getofs('jf_gcmap')).address[0]
     let gcmap_ptr = unsafe { *(jf_ptr.add(JF_GCMAP_OFS as usize) as *const *const u8) };
     if gcmap_ptr.is_null() {
@@ -4743,16 +4763,11 @@ fn run_compiled_code_inner(
     // are spilled/reloaded around collecting calls. Input slots are read
     // once at entry (before any GC point) and their values live in
     // SSA/ref_root_slots afterward.
-    let use_gc_alloc = gc_runtime_id.is_some();
+    let runtime_jitframe_tid = gc_runtime_id.and_then(runtime_jitframe_type_id);
+    let use_gc_alloc = runtime_jitframe_tid.is_some();
     let (jf_gcref, heap_owner): (GcRef, Option<Vec<i64>>) = if use_gc_alloc {
         let runtime_id = gc_runtime_id.unwrap();
-        let type_id = runtime_jitframe_type_id(runtime_id).unwrap_or_else(|| {
-            if jitframe_gc_type_id_is_explicit() {
-                jitframe_gc_type_id()
-            } else {
-                u32::MAX
-            }
-        });
+        let type_id = runtime_jitframe_tid.unwrap();
         assert_ne!(
             type_id,
             u32::MAX,
