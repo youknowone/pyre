@@ -254,23 +254,31 @@ fn stack_effects(
         | Instruction::StoreName { .. }
         | Instruction::StoreGlobal { .. }
         | Instruction::StoreDeref { .. }
-        | Instruction::YieldValue { .. }
         | Instruction::EndSend
-        | Instruction::PopExcept => (d - 1, d - 1),
+        | Instruction::PopIter => (d - 1, d - 1),
+        // YieldValue: sends TOS to caller, receives new value back. Net 0.
+        Instruction::YieldValue { .. } => (d, d),
+        // PopExcept: codewriter emits no depth change (exception state
+        // is in TLS, cleared by interpreter). Must match codewriter.
+        Instruction::PopExcept => (d, d),
+        // Pop two
+        Instruction::EndFor => (d - 2, d - 2),
         // Pop 0, push 0 (identity stack effect)
         Instruction::DeleteFast { .. }
         | Instruction::DeleteName { .. }
         | Instruction::DeleteGlobal { .. }
         | Instruction::DeleteDeref { .. }
-        | Instruction::ListAppend { .. }
+        | Instruction::Swap { .. }
+        | Instruction::CopyFreeVars { .. } => (d, d),
+        // Pop 1 (consume item, append/extend into collection at TOS[i])
+        Instruction::ListAppend { .. }
         | Instruction::SetAdd { .. }
-        | Instruction::MapAdd { .. }
         | Instruction::ListExtend { .. }
         | Instruction::SetUpdate { .. }
         | Instruction::DictUpdate { .. }
-        | Instruction::DictMerge { .. }
-        | Instruction::Swap { .. }
-        | Instruction::CopyFreeVars { .. } => (d, d),
+        | Instruction::DictMerge { .. } => (d - 1, d - 1),
+        // Pop 2 (key + value into collection at TOS[i])
+        Instruction::MapAdd { .. } => (d - 2, d - 2),
         // Pop 1 push 1 (net 0)
         Instruction::UnaryNegative
         | Instruction::UnaryNot
@@ -278,26 +286,35 @@ fn stack_effects(
         | Instruction::GetIter
         | Instruction::GetYieldFromIter
         | Instruction::GetAIter
-        | Instruction::GetLen
+        | Instruction::LoadAttr { .. }
+        | Instruction::GetAwaitable { .. } => (d, d),
+        // Push 1 onto TOS without popping (net +1)
+        Instruction::GetLen
         | Instruction::MatchMapping
         | Instruction::MatchSequence
-        | Instruction::ImportName { .. }
-        | Instruction::ImportFrom { .. }
-        | Instruction::LoadAttr { .. }
-        | Instruction::CheckExcMatch
-        | Instruction::GetAwaitable { .. }
-        | Instruction::LoadSuperAttr { .. } => (d, d),
+        | Instruction::ImportFrom { .. } => (d + 1, d + 1),
+        // ImportName: pop 2 (fromlist + level), push 1 (module). Net -1.
+        Instruction::ImportName { .. } => (d - 1, d - 1),
+        // LoadSuperAttr: pop 3 (global_super, cls, self), push 1. Net -2.
+        Instruction::LoadSuperAttr { .. } => (d - 2, d - 2),
+        // CheckExcMatch: codewriter pops 2 (match_type + exception),
+        // pushes 1 (result). Net -1. Must match codewriter.
+        Instruction::CheckExcMatch => (d - 1, d - 1),
         // Pop 2 push 1 (net -1)
         Instruction::BinaryOp { .. }
         | Instruction::CompareOp { .. }
         | Instruction::IsOp { .. }
         | Instruction::ContainsOp { .. } => (d - 1, d - 1),
-        // Pop 2
-        Instruction::StoreAttr { .. }
-        | Instruction::DeleteAttr { .. }
-        | Instruction::StoreSubscr => (d - 2, d - 2),
-        // Pop 3
-        Instruction::StoreSlice | Instruction::DeleteSubscr => (d - 3, d - 3),
+        // Pop 2: obj + value
+        Instruction::StoreAttr { .. } => (d - 2, d - 2),
+        // Pop 1: obj only
+        Instruction::DeleteAttr { .. } => (d - 1, d - 1),
+        // Pop 3: value + obj + key. Codewriter pops 3 explicitly.
+        Instruction::StoreSubscr => (d - 3, d - 3),
+        // Pop 2: obj + key
+        Instruction::DeleteSubscr => (d - 2, d - 2),
+        // Pop 4: value + obj + start + end
+        Instruction::StoreSlice => (d - 4, d - 4),
         // Unconditional jumps
         Instruction::JumpForward { .. }
         | Instruction::JumpBackward { .. }
@@ -342,10 +359,16 @@ fn stack_effects(
             let s = count.get(op_arg) as usize as i32;
             (d - 1 + s, d - 1 + s)
         }
-        // MatchClass: pop 2 push 1 (net -1)
-        Instruction::MatchClass { .. } => (d - 1, d - 1),
-        // Raise: conservative, keep depth
-        Instruction::Reraise { .. } | Instruction::RaiseVarargs { .. } => (d, d),
+        // MatchClass: pop 3 (TOS, TOS1, TOS2), push 1 (bool). Net -2.
+        Instruction::MatchClass { .. } => (d - 2, d - 2),
+        // Reraise pops TOS (exception). Net -1.
+        Instruction::Reraise { .. } => (d - 1, d - 1),
+        // RaiseVarargs: pops argc values from stack.
+        // Codewriter pops 1 when argc >= 1, 0 when argc == 0.
+        Instruction::RaiseVarargs { argc } => {
+            let n = argc.get(op_arg) as i32;
+            (d - n, d - n)
+        }
         // Default: conservative, keep same depth
         _ => (d, d),
     };
