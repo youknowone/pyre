@@ -171,10 +171,20 @@ pub trait GcAllocator: Send {
     /// Must be called before storing a GC reference into `obj`.
     fn write_barrier(&mut self, obj: GcRef);
 
-    /// Card-marking write barrier for arrays.
-    /// Marks a single card covering `index` instead of adding the
-    /// entire object to the remembered set.
-    fn write_barrier_from_array(&mut self, obj: GcRef, index: usize);
+    /// incminimark.py:1606 jit_remember_young_pointer_from_array:
+    /// Called by JIT when TRACK_YOUNG_PTRS set but CARDS_SET not.
+    /// Tries to set CARDS_SET if HAS_CARDS; else generic barrier.
+    fn jit_remember_young_pointer_from_array(&mut self, obj: GcRef);
+
+    /// incminimark.py:1557 remember_young_pointer_from_array2:
+    /// Full card-marking barrier with index. Called when marking a
+    /// specific card after CARDS_SET is already established.
+    fn remember_young_pointer_from_array2(
+        &mut self,
+        obj: GcRef,
+        index: usize,
+        card_page_shift: u32,
+    );
 
     /// Trigger a minor (nursery) collection.
     fn collect_nursery(&mut self);

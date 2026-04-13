@@ -902,51 +902,84 @@ impl MiniMarkGC {
         }
     }
 
-    /// Card-marking write barrier for large arrays.
-    ///
-    /// Instead of adding the entire object to the remembered set,
-    /// mark only the card that covers the modified array index.
-    /// This avoids rescanning the entire array during minor collection.
-    ///
-    /// `obj` is the array object; `index` is the element index being written.
-    /// `card_page_shift` determines the card granularity (elements per card = 1 << shift).
+    /// incminimark.py:1495-1501 write_barrier_from_array:
+    /// called by non-JIT code. Checks TRACK_YOUNG_PTRS, then dispatches
+    /// to remember_young_pointer_from_array2 (card path) or
+    /// remember_young_pointer (generic).
     pub fn do_write_barrier_card(&mut self, obj: GcRef, index: usize, card_page_shift: u32) {
         if obj.is_null() {
             return;
         }
         let hdr = unsafe { header_of(obj.0) };
-
-        // If TRACK_YOUNG_PTRS is set, this object hasn't been written before.
         if hdr.has_flag(flags::TRACK_YOUNG_PTRS) {
-            if hdr.has_flag(flags::HAS_CARDS) {
-                // Object supports card marking: enable it.
-                hdr.clear_flag(flags::TRACK_YOUNG_PTRS);
-                self.mark_card(obj, index, card_page_shift);
-                return;
-            }
-            // Fall back to full barrier.
+            self.remember_young_pointer_from_array2(obj, index, card_page_shift);
+        }
+    }
+
+    /// incminimark.py:1557-1600 remember_young_pointer_from_array2:
+    /// Called when TRACK_YOUNG_PTRS is set. If HAS_CARDS, marks the
+    /// card WITHOUT clearing TRACK_YOUNG_PTRS. Otherwise falls back
+    /// to the generic _remember_young_pointer_inlined.
+    fn remember_young_pointer_from_array2(
+        &mut self,
+        obj: GcRef,
+        index: usize,
+        card_page_shift: u32,
+    ) {
+        let hdr = unsafe { header_of(obj.0) };
+        if !hdr.has_flag(flags::HAS_CARDS) {
+            // No cards — fall back to generic barrier.
+            // _remember_young_pointer_inlined clears TRACK_YOUNG_PTRS.
             hdr.clear_flag(flags::TRACK_YOUNG_PTRS);
             self.remembered_set.push(obj.0);
             return;
         }
+        // Card path: mark the specific card. TRACK_YOUNG_PTRS stays set
+        // so that subsequent writes still enter the barrier.
+        self.mark_card(obj, index, card_page_shift);
+    }
 
-        // Already had barrier triggered. If it has cards, mark the card.
+    /// incminimark.py:1606-1617 jit_remember_young_pointer_from_array:
+    /// Minimal version called by the JIT when TRACK_YOUNG_PTRS is set
+    /// but CARDS_SET is not. Tries to set CARDS_SET; otherwise falls
+    /// back to remember_young_pointer (generic barrier).
+    pub fn jit_remember_young_pointer_from_array(&mut self, obj: GcRef) {
+        let hdr = unsafe { header_of(obj.0) };
         if hdr.has_flag(flags::HAS_CARDS) {
-            self.mark_card(obj, index, card_page_shift);
+            // Set CARDS_SET. TRACK_YOUNG_PTRS stays set so the JIT
+            // barrier keeps firing → routes to card-marking path.
+            hdr.set_flag(flags::CARDS_SET);
+            self.remembered_set.push(obj.0);
+        } else {
+            // No cards — generic barrier.
+            self.do_write_barrier(obj);
         }
     }
 
-    /// Mark a specific card in a card-marked array object.
+    /// incminimark.py:1576-1598 mark_card:
+    /// Set the card bit for the given index. If CARDS_SET not yet
+    /// set, add obj to tracking list and set CARDS_SET.
     fn mark_card(&mut self, obj: GcRef, index: usize, card_page_shift: u32) {
-        let hdr = unsafe { header_of(obj.0) };
-        if !hdr.has_flag(flags::CARDS_SET) {
-            hdr.set_flag(flags::CARDS_SET);
-            // First card dirty: add to remembered set for scanning.
-            self.remembered_set.push(obj.0);
+        let card_index = index >> card_page_shift;
+
+        // Check if bit already set (early return optimization).
+        if self
+            .card_dirty
+            .get(&obj.0)
+            .is_some_and(|c| c.contains(&card_index))
+        {
+            return;
         }
 
-        let card_index = index >> card_page_shift;
+        // Set the card bit.
         self.card_dirty.entry(obj.0).or_default().insert(card_index);
+
+        // If CARDS_SET not yet set, track this object and set the flag.
+        let hdr = unsafe { header_of(obj.0) };
+        if !hdr.has_flag(flags::CARDS_SET) {
+            self.remembered_set.push(obj.0);
+            hdr.set_flag(flags::CARDS_SET);
+        }
     }
 
     /// Check whether a specific card of an object is dirty.
@@ -1417,8 +1450,17 @@ impl GcAllocator for MiniMarkGC {
         self.do_write_barrier(obj);
     }
 
-    fn write_barrier_from_array(&mut self, obj: GcRef, index: usize) {
-        self.do_write_barrier_card(obj, index, DEFAULT_CARD_PAGE_SHIFT);
+    fn jit_remember_young_pointer_from_array(&mut self, obj: GcRef) {
+        self.jit_remember_young_pointer_from_array(obj);
+    }
+
+    fn remember_young_pointer_from_array2(
+        &mut self,
+        obj: GcRef,
+        index: usize,
+        card_page_shift: u32,
+    ) {
+        self.remember_young_pointer_from_array2(obj, index, card_page_shift);
     }
 
     fn collect_nursery(&mut self) {

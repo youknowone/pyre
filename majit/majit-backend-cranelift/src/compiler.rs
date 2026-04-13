@@ -2906,12 +2906,24 @@ extern "C" fn gc_write_barrier_shim(runtime_id: u64, obj: u64) {
     with_gc_runtime(runtime_id, |gc| gc.write_barrier(GcRef(obj as usize)));
 }
 
-/// incminimark.py:write_barrier_from_array / jit_remember_young_pointer_from_array:
-/// card-marking write barrier for arrays. Marks a single card instead of
-/// adding the entire object to the remembered set.
-extern "C" fn gc_write_barrier_card_shim(runtime_id: u64, obj: u64, index: u64) {
+/// incminimark.py:1606 jit_remember_young_pointer_from_array:
+/// Called by JIT when TRACK_YOUNG_PTRS set but CARDS_SET not.
+/// Tries to enable card marking; falls back to generic barrier.
+extern "C" fn gc_jit_remember_young_pointer_from_array_shim(runtime_id: u64, obj: u64) {
     with_gc_runtime(runtime_id, |gc| {
-        gc.write_barrier_from_array(GcRef(obj as usize), index as usize);
+        gc.jit_remember_young_pointer_from_array(GcRef(obj as usize));
+    });
+}
+
+/// incminimark.py:1557 remember_young_pointer_from_array2:
+/// Mark a specific card for the given array index.
+extern "C" fn gc_remember_young_pointer_from_array2_shim(runtime_id: u64, obj: u64, index: u64) {
+    with_gc_runtime(runtime_id, |gc| {
+        gc.remember_young_pointer_from_array2(
+            GcRef(obj as usize),
+            index as usize,
+            majit_gc::collector::DEFAULT_CARD_PAGE_SHIFT,
+        );
     });
 }
 
@@ -3257,9 +3269,15 @@ fn resolve_call_assembler_target(
         return Ok(None);
     }
 
-    // RPython: arity check only (Int vs Ref mismatch is valid for
-    // function-entry typed locals).
-    if target.inputarg_types.len() != call_descr.arg_types().len() {
+    // rewrite.py:665-695 handle_call_assembler: RPython's GC rewriter
+    // strips CALL_ASSEMBLER args to [frame], so the backend never sees
+    // a caller-arg vs callee-inputarg arity mismatch. When we have a
+    // VableExpansion, args are frame-based (the backend reads from the
+    // frame via expansion offsets), so skip the arity check.
+    // Without VableExpansion, verify direct-arg arity still matches.
+    if call_descr.vable_expansion().is_none()
+        && target.inputarg_types.len() != call_descr.arg_types().len()
+    {
         return Err(unsupported_semantics(
             opcode,
             "call-assembler target arity does not match the descriptor",
@@ -8398,8 +8416,9 @@ impl CraneliftBackend {
                         .ins()
                         .brif(has_cards, card_block, &[], full_barrier_block, &[]);
 
-                    // Full barrier: call jit_remember_young_pointer, then
-                    // re-check CARDS_SET (the barrier may have set it).
+                    // assembler.py:2326-2335 WriteBarrierSlowPath:
+                    // CALL wb_slowpath[1] — jit_remember_young_pointer_from_array
+                    // (NOT generic remember_young_pointer)
                     builder.switch_to_block(full_barrier_block);
                     builder.seal_block(full_barrier_block);
                     let runtime_id = gc_runtime_id.ok_or_else(|| missing_gc_runtime(op.opcode))?;
@@ -8408,11 +8427,13 @@ impl CraneliftBackend {
                         &mut builder,
                         ptr_type,
                         call_conv,
-                        gc_write_barrier_shim as *const () as usize,
+                        gc_jit_remember_young_pointer_from_array_shim as *const () as usize,
                         &[runtime_id_v, obj],
                         None,
                     );
-                    // Re-load flag byte after barrier (it may have set CARDS_SET)
+                    // assembler.py:2338-2341: re-check CARDS_SET after
+                    // the helper (it may have set it via HAS_CARDS path).
+                    // JNS done — if sign bit (CARDS_SET) still not set, done.
                     let flag_byte2 =
                         builder
                             .ins()
@@ -8424,17 +8445,19 @@ impl CraneliftBackend {
                         .ins()
                         .brif(has_cards2, card_block, &[], cont_block, &[]);
 
-                    // Card marking: call write_barrier_from_array(obj, index)
+                    // assembler.py:2346-2372 card marking:
+                    // Set the card bit for the written index.
                     builder.switch_to_block(card_block);
                     builder.seal_block(card_block);
-                    let runtime_id_v2 = builder
-                        .ins()
-                        .iconst(cl_types::I64, gc_runtime_id.unwrap_or(0) as i64);
+                    let runtime_id_v2 = builder.ins().iconst(
+                        cl_types::I64,
+                        gc_runtime_id.ok_or_else(|| missing_gc_runtime(op.opcode))? as i64,
+                    );
                     let _ = emit_host_call(
                         &mut builder,
                         ptr_type,
                         call_conv,
-                        gc_write_barrier_card_shim as *const () as usize,
+                        gc_remember_young_pointer_from_array2_shim as *const () as usize,
                         &[runtime_id_v2, obj, index],
                         None,
                     );
