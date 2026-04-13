@@ -136,6 +136,15 @@ impl JitDriverStaticData {
         let name = self.virtualizable.as_deref()?;
         self.vars.iter().find(|var| var.name == name)
     }
+
+    /// rewrite.py:684 `jd.index_of_virtualizable` parity.
+    ///
+    /// Returns the index inside the red-arg list / original
+    /// CALL_ASSEMBLER arglist, not the absolute index in `vars`.
+    pub fn virtualizable_arg_index(&self) -> Option<usize> {
+        let name = self.virtualizable.as_deref()?;
+        self.reds().iter().position(|var| var.name == name)
+    }
 }
 
 /// Trait implemented by declarative `#[jit_driver]` marker types.

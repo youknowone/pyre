@@ -18,6 +18,9 @@ struct MetaCallAssemblerDescr {
     result_type: Type,
     target_token: u64,
     vable_expansion: Option<VableExpansion>,
+    /// rewrite.py:684 `jd.index_of_virtualizable`: index of the
+    /// virtualizable argument inside the callee's red-arg list.
+    virtualizable_arg_index: Option<usize>,
 }
 
 impl majit_ir::Descr for MetaCallDescr {
@@ -72,6 +75,9 @@ impl CallDescr for MetaCallAssemblerDescr {
     }
     fn call_target_token(&self) -> Option<u64> {
         Some(self.target_token)
+    }
+    fn call_virtualizable_index(&self) -> Option<usize> {
+        self.virtualizable_arg_index
     }
     fn effect_info(&self) -> &EffectInfo {
         static INFO: EffectInfo = EffectInfo::const_new(ExtraEffect::CanRaise, OopSpecIndex::None);
@@ -138,12 +144,14 @@ pub fn make_call_assembler_descr(
     target_token: u64,
     arg_types: &[Type],
     result_type: Type,
+    virtualizable_arg_index: Option<usize>,
 ) -> DescrRef {
     Arc::new(MetaCallAssemblerDescr {
         arg_types: arg_types.to_vec(),
         result_type,
         target_token,
         vable_expansion: None,
+        virtualizable_arg_index,
     })
 }
 
@@ -161,5 +169,6 @@ pub fn make_call_assembler_descr_with_vable(
         result_type,
         target_token,
         vable_expansion: Some(expansion),
+        virtualizable_arg_index: None,
     })
 }

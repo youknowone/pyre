@@ -2371,7 +2371,12 @@ impl TraceCtx {
         arg_types: &[Type],
         ret_type: Type,
     ) -> OpRef {
-        let descr = make_call_assembler_descr(target.number, arg_types, ret_type);
+        let descr = make_call_assembler_descr(
+            target.number,
+            arg_types,
+            ret_type,
+            target.virtualizable_arg_index,
+        );
         self.record_op_with_descr(opcode, args, descr)
     }
 
@@ -2381,7 +2386,14 @@ impl TraceCtx {
     /// `call_assembler_int_by_number_typed` instead.
     pub fn call_assembler_int_by_number(&mut self, target_number: u64, args: &[OpRef]) -> OpRef {
         let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
-        let descr = make_call_assembler_descr(target_number, &arg_types, Type::Int);
+        let descr = make_call_assembler_descr(
+            target_number,
+            &arg_types,
+            Type::Int,
+            self.driver_descriptor
+                .as_ref()
+                .and_then(JitDriverStaticData::virtualizable_arg_index),
+        );
         self.record_op_with_descr(OpCode::CallAssemblerI, args, descr)
     }
 
@@ -2392,7 +2404,14 @@ impl TraceCtx {
         args: &[OpRef],
         arg_types: &[Type],
     ) -> OpRef {
-        let descr = make_call_assembler_descr(target_number, arg_types, Type::Int);
+        let descr = make_call_assembler_descr(
+            target_number,
+            arg_types,
+            Type::Int,
+            self.driver_descriptor
+                .as_ref()
+                .and_then(JitDriverStaticData::virtualizable_arg_index),
+        );
         self.record_op_with_descr(OpCode::CallAssemblerI, args, descr)
     }
 
@@ -2404,7 +2423,14 @@ impl TraceCtx {
         args: &[OpRef],
         arg_types: &[Type],
     ) -> OpRef {
-        let descr = make_call_assembler_descr(target_number, arg_types, Type::Ref);
+        let descr = make_call_assembler_descr(
+            target_number,
+            arg_types,
+            Type::Ref,
+            self.driver_descriptor
+                .as_ref()
+                .and_then(JitDriverStaticData::virtualizable_arg_index),
+        );
         self.record_op_with_descr(OpCode::CallAssemblerR, args, descr)
     }
 
@@ -2899,7 +2925,8 @@ mod tests {
     #[test]
     fn call_assembler_typed_preserves_mixed_arg_types_and_target_token() {
         let (mut ctx, args) = make_ctx_with_mixed_inputs();
-        let token = JitCellToken::new(777);
+        let mut token = JitCellToken::new(777);
+        token.virtualizable_arg_index = Some(1);
         let _ = ctx.call_assembler_ref_typed(&token, &args, &[Type::Ref, Type::Float, Type::Int]);
         let op = take_single_call_op(ctx, &args);
         assert_eq!(op.opcode, OpCode::CallAssemblerR);
@@ -2911,6 +2938,7 @@ mod tests {
             .expect("call op should carry CallDescr");
         assert_eq!(call_descr.arg_types(), &[Type::Ref, Type::Float, Type::Int]);
         assert_eq!(call_descr.call_target_token(), Some(777));
+        assert_eq!(call_descr.call_virtualizable_index(), Some(1));
     }
 
     fn take_all_ops(ctx: TraceCtx) -> Vec<majit_ir::Op> {
