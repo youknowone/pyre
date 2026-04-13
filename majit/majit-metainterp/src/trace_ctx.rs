@@ -306,6 +306,9 @@ impl TraceCtx {
         let initial_boxes: Vec<OpRef> = (0..recorder.num_inputargs())
             .map(|i| OpRef(i as u32))
             .collect();
+        // RPython pyjitpl.py:2878: initial merge point types come from
+        // live_arg_boxes which carry actual types (INT/REF/FLOAT).
+        let initial_input_types = recorder.inputarg_types();
         TraceCtx {
             recorder,
             green_key,
@@ -324,7 +327,7 @@ impl TraceCtx {
             current_merge_points: vec![MergePoint {
                 green_key,
                 position: initial_position,
-                original_box_types: initial_boxes.iter().map(|_| Type::Ref).collect(),
+                original_box_types: initial_input_types,
                 original_boxes: initial_boxes.clone(),
                 header_pc: 0,
             }],

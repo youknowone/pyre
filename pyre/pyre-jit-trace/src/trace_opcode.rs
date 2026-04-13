@@ -1019,7 +1019,10 @@ impl MIFrame {
             s.nlocals = concrete_nlocals;
             s.valuestackdepth = concrete_vsd;
             let stack_only = s.stack_only_depth();
-            // All slot types forced to Ref (PyObjectRef).
+            // RPython pyjitpl.py:2955-2965: loop-carried types come from
+            // the actual tracked symbolic types (INT/REF/FLOAT). Only
+            // reset to Ref when the type vector drifted in length
+            // (e.g. inline tracing changed nlocals).
             if s.symbolic_local_types.len() != concrete_nlocals {
                 s.symbolic_local_types = vec![Type::Ref; concrete_nlocals];
             }
