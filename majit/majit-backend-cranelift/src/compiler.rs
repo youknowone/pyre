@@ -2875,6 +2875,14 @@ extern "C" fn gc_alloc_nursery_shim(runtime_id: u64, size: u64) -> u64 {
     })
 }
 
+/// Simple heap alloc for callee jitframe (debugging: isolates
+/// stack-vs-heap from nursery-vs-heap issues).
+extern "C" fn alloc_callee_jf_heap(size: u64) -> u64 {
+    let layout = std::alloc::Layout::from_size_align(size as usize, 8).expect("bad jf layout");
+    let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+    ptr as u64
+}
+
 /// Plain malloc fallback for New() when no GC runtime is configured.
 extern "C" fn plain_malloc_zeroed_shim(size: u64) -> u64 {
     let layout = std::alloc::Layout::from_size_align(size as usize, 8)
@@ -7276,28 +7284,33 @@ impl CraneliftBackend {
                     let jf_depth = num_expanded_items.max(callee_depth).max(1);
                     let jf_bytes = (JF_FRAME_ITEM0_OFS as u32) + (jf_depth as u32) * 8;
 
-                    // rewrite.py:613-653 gen_malloc_frame: ideally nursery alloc,
-                    // but nursery jitframes get collected during guard failure
-                    // (the callee pops shadow stack before returning; the guard
-                    // handler's raw pointer is not a GC root). Stack alloc is
-                    // safe because stack memory is never moved by GC.
-                    // TODO: nursery alloc + push callee jf_ptr onto shadow
-                    // stack before calling guard failure handler.
-                    let args_slot = builder.create_sized_stack_slot(StackSlotData::new(
-                        StackSlotKind::ExplicitSlot,
-                        jf_bytes,
-                        3,
-                    ));
-                    let args_ptr = builder.ins().stack_addr(ptr_type, args_slot, 0);
+                    // rewrite.py:613-653 gen_malloc_frame parity:
+                    // Allocate callee jitframe via simple heap alloc (Vec).
+                    // No GC interaction — heap memory is never moved.
+                    // TODO: replace with nursery alloc once Cranelift SSA
+                    // block-param threading issue is resolved.
+                    let jf_size_val = builder.ins().iconst(cl_types::I64, jf_bytes as i64);
+                    let args_ptr = emit_host_call(
+                        &mut builder,
+                        ptr_type,
+                        call_conv,
+                        alloc_callee_jf_heap as *const () as usize,
+                        &[jf_size_val],
+                        Some(ptr_type),
+                    )
+                    .expect("alloc_callee_jf_heap must return");
                     // rewrite.py:665-695 handle_call_assembler: store inputargs
                     // into callee jitframe. VableExpansion reads from the frame
                     // arg (op.args[0]), with const/arg overrides for callee entry.
                     if let Some(expansion) = call_descr.vable_expansion() {
                         let frame_val = resolve_opref(&mut builder, &constants, op.args[0]);
                         // Slot 0: frame reference
-                        builder
-                            .ins()
-                            .stack_store(frame_val, args_slot, JF_FRAME_ITEM0_OFS);
+                        builder.ins().store(
+                            MemFlags::trusted(),
+                            frame_val,
+                            args_ptr,
+                            JF_FRAME_ITEM0_OFS,
+                        );
                         // Slots 1..N: scalar fields from frame
                         for (i, &(offset, _tp)) in expansion.scalar_fields.iter().enumerate() {
                             let slot = i + 1;
@@ -7307,7 +7320,7 @@ impl CraneliftBackend {
                                 expansion.const_overrides.iter().find(|(s, _)| *s == slot)
                             {
                                 let cv = builder.ins().iconst(cl_types::I64, cval);
-                                builder.ins().stack_store(cv, args_slot, ofs);
+                                builder.ins().store(MemFlags::trusted(), cv, args_ptr, ofs);
                             } else {
                                 let val = builder.ins().load(
                                     cl_types::I64,
@@ -7315,7 +7328,7 @@ impl CraneliftBackend {
                                     frame_val,
                                     offset as i32,
                                 );
-                                builder.ins().stack_store(val, args_slot, ofs);
+                                builder.ins().store(MemFlags::trusted(), val, args_ptr, ofs);
                             }
                         }
                         // Slots N+1..: array items from frame
@@ -7337,7 +7350,7 @@ impl CraneliftBackend {
                                 expansion.arg_overrides.iter().find(|(s, _)| *s == slot)
                             {
                                 let val = resolve_opref(&mut builder, &constants, op.args[arg_idx]);
-                                builder.ins().stack_store(val, args_slot, ofs);
+                                builder.ins().store(MemFlags::trusted(), val, args_ptr, ofs);
                             } else {
                                 let val = builder.ins().load(
                                     cl_types::I64,
@@ -7345,20 +7358,17 @@ impl CraneliftBackend {
                                     arr_data_ptr_val,
                                     (i * 8) as i32,
                                 );
-                                builder.ins().stack_store(val, args_slot, ofs);
+                                builder.ins().store(MemFlags::trusted(), val, args_ptr, ofs);
                             }
                         }
                     } else {
                         for (index, &arg_ref) in op.args.iter().enumerate() {
                             let raw = resolve_opref(&mut builder, &constants, arg_ref);
                             let ofs = JF_FRAME_ITEM0_OFS + (index as i32) * 8;
-                            builder.ins().stack_store(raw, args_slot, ofs);
+                            builder.ins().store(MemFlags::trusted(), raw, args_ptr, ofs);
                         }
                     }
-                    let args_data_ptr =
-                        builder
-                            .ins()
-                            .stack_addr(ptr_type, args_slot, JF_FRAME_ITEM0_OFS);
+                    let args_data_ptr = builder.ins().iadd_imm(args_ptr, JF_FRAME_ITEM0_OFS as i64);
                     let target_token = builder.ins().iconst(
                         cl_types::I64,
                         call_descr.call_target_token().unwrap() as i64,
