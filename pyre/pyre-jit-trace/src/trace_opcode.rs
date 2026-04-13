@@ -3355,29 +3355,40 @@ impl MIFrame {
                     };
                     // pyjitpl.py:2017: do_residual_call step 1
                     this.vable_and_vrefs_before_residual_call(ctx);
-                    // RPython parity: use CALL_ASSEMBLER_I when a token
-                    // exists (compiled or pending).
-                    let ca_token = if is_self_recursive {
-                        driver
-                            .get_loop_token_number(callee_key)
-                            .or_else(|| driver.get_pending_token_number(callee_key))
-                    } else {
-                        None
-                    };
+                    // pyjitpl.py:1425 do_recursive_call parity:
+                    // ALL recursive portal calls use CALL_ASSEMBLER when
+                    // a compiled or pending token exists — not just
+                    // self-recursive ones.
+                    let ca_token = driver
+                        .get_loop_token_number(callee_key)
+                        .or_else(|| driver.get_pending_token_number(callee_key));
                     let result = if let Some(token_number) = ca_token {
                         // pyjitpl.py:3589-3609 direct_assembler_call parity:
                         // CALL_ASSEMBLER takes [caller_frame, boxed_arg].
-                        // No CallR(create_frame) host function call.
-                        // Backend reads code/ns from caller_frame via
-                        // VableExpansion, uses const_overrides for ni/vsd,
-                        // and arg_overrides for locals[0] = boxed_arg.
+                        // Backend reads scalar fields from caller_frame via
+                        // VableExpansion. For self-recursive, code/ns come
+                        // from the frame; for non-self-recursive, they're
+                        // const_overrides with the callee's values.
                         let boxed_arg = wrapint(ctx, raw_arg);
+                        let callee_code_ptr =
+                            unsafe { pyre_interpreter::get_pycode(concrete_callable) };
                         let callee_nlocals = unsafe {
-                            let code_ptr = pyre_interpreter::get_pycode(concrete_callable)
-                                as *const pyre_interpreter::CodeObject;
-                            (&*code_ptr).varnames.len()
+                            (&*(callee_code_ptr as *const pyre_interpreter::CodeObject))
+                                .varnames
+                                .len()
                         };
+                        let callee_ns_ptr = unsafe { function_get_globals(concrete_callable) };
                         let first_array_slot = 1 + 4; // frame + 4 scalars
+                        // Callee entry overrides: next_instr=0, vsd=nlocals.
+                        // Non-self-recursive also overrides code and namespace.
+                        let mut const_overrides = vec![
+                            (1, 0),                     // slot 1 = next_instr = 0
+                            (3, callee_nlocals as i64), // slot 3 = vsd = nlocals
+                        ];
+                        if !is_self_recursive {
+                            const_overrides.push((2, callee_code_ptr as i64)); // slot 2 = code
+                            const_overrides.push((4, callee_ns_ptr as i64)); // slot 4 = namespace
+                        }
                         let expansion = majit_ir::VableExpansion {
                             scalar_fields: vec![
                                 (crate::frame_layout::PYFRAME_NEXT_INSTR_OFFSET, Type::Int),
@@ -3392,11 +3403,7 @@ impl MIFrame {
                                 crate::frame_layout::PYFRAME_LOCALS_CELLS_STACK_OFFSET,
                             array_ptr_offset: pyre_object::PYOBJECT_ARRAY_PTR_OFFSET,
                             num_array_items: callee_nlocals,
-                            // Callee entry: next_instr=0, vsd=nlocals
-                            const_overrides: vec![
-                                (1, 0),                     // slot 1 = next_instr = 0
-                                (3, callee_nlocals as i64), // slot 3 = vsd = nlocals
-                            ],
+                            const_overrides,
                             // locals[0] = boxed_arg (CALL_ASSEMBLER arg[1])
                             arg_overrides: vec![(first_array_slot, 1)],
                         };
