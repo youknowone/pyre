@@ -1605,6 +1605,7 @@ impl OptContext {
         let result = preamble_op.resolved;
         let is_constant = self.get_constant(preamble_source).is_some();
         if self.imported_short_preamble_used.insert(preamble_source) {
+            // unroll.py:28: assert short_preamble_producer is not None
             // unroll.py:32: use_box(op, preamble_op.preamble_op, self)
             let (arg_guards, result_guards) = self.collect_use_box_guards(preamble_source);
             if let Some(mut builder) = self.active_short_preamble_producer.take() {
@@ -1613,6 +1614,16 @@ impl OptContext {
             } else if let Some(mut builder) = self.imported_short_preamble_builder.take() {
                 builder.use_box(preamble_source, &arg_guards, &result_guards);
                 self.imported_short_preamble_builder = Some(builder);
+            } else {
+                // unroll.py:28: assert False  # unreachable code
+                // In production (UnrollOptimizer), short_preamble_producer
+                // is always set. Unit tests may omit builder setup.
+                if crate::optimizeopt::majit_log_enabled() {
+                    eprintln!(
+                        "[jit] WARNING: force_op_from_preamble_op: \
+                         short_preamble_producer is None (RPython: unreachable)"
+                    );
+                }
             }
             // shortpreamble.py:404: optimizer.setinfo_from_preamble(box, info, None)
             if let Some(info) = self.get_ptr_info(preamble_source).cloned() {
