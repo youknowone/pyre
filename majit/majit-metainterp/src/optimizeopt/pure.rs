@@ -2027,11 +2027,7 @@ mod tests {
             OpRef(1),
             false,
         );
-        initialize_imported_short_pure_builder(
-            &mut ctx,
-            imported.pop.preamble_op.clone(),
-            Some(1),
-        );
+        initialize_imported_short_pure_builder(&mut ctx, imported.pop.preamble_op.clone(), Some(1));
         ctx.imported_short_pure_ops.push(imported);
 
         pass.setup();
@@ -2116,11 +2112,7 @@ mod tests {
             OpRef(1),
             false,
         );
-        initialize_imported_short_pure_builder(
-            &mut ctx,
-            imported.pop.preamble_op.clone(),
-            Some(1),
-        );
+        initialize_imported_short_pure_builder(&mut ctx, imported.pop.preamble_op.clone(), Some(1));
         ctx.imported_short_pure_ops.push(imported);
 
         pass.setup();

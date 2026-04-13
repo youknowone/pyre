@@ -373,30 +373,37 @@ impl ArrayCachedItem {
 
     /// heap.py:278-298 ArrayCachedItem._cannot_alias_via_content
     fn _cannot_alias_via_content(opref1: OpRef, opref2: OpRef, ctx: &mut OptContext) -> bool {
-        use crate::optimizeopt::info::PtrInfo;
+        use crate::optimizeopt::info::{FieldEntry, PtrInfo};
         // heap.py:279-282: isinstance(opinfo, ArrayPtrInfo)
-        let items1: Vec<OpRef> = match ctx.get_ptr_info(opref1) {
-            Some(PtrInfo::Array(a)) => a.items.iter().filter_map(|e| e.as_opref()).collect(),
+        // info.py:530 all_items() returns _items (the dense list, None slots included).
+        // Clone to avoid borrow conflict with ctx below.
+        let items1: Vec<FieldEntry> = match ctx.get_ptr_info(opref1) {
+            Some(PtrInfo::Array(a)) => a.items.clone(),
             _ => return false,
         };
-        let items2: Vec<OpRef> = match ctx.get_ptr_info(opref2) {
-            Some(PtrInfo::Array(a)) => a.items.iter().filter_map(|e| e.as_opref()).collect(),
+        let items2: Vec<FieldEntry> = match ctx.get_ptr_info(opref2) {
+            Some(PtrInfo::Array(a)) => a.items.clone(),
             _ => return false,
         };
-        // heap.py:288-298: compare cached constant values at each index
+        // heap.py:288-298: slot-by-slot comparison preserving index alignment.
+        // None/Preamble slots are kept at their original positions.
         let len = items1.len().min(items2.len());
         for i in 0..len {
-            let v1 = ctx.get_box_replacement(items1[i]);
-            let v2 = ctx.get_box_replacement(items2[i]);
+            // heap.py:289-290: value = get_box_replacement(content[index])
+            let v1 = items1[i].as_opref().map(|r| ctx.get_box_replacement(r));
+            let v2 = items2[i].as_opref().map(|r| ctx.get_box_replacement(r));
+            // heap.py:291-292: if value is None: continue
+            let (Some(v1), Some(v2)) = (v1, v2) else {
+                continue;
+            };
             if v1.is_none() || v2.is_none() {
                 continue;
             }
-            // heap.py:294-295: not value.is_constant() → skip
-            let (c1, c2) = match (ctx.get_constant(v1), ctx.get_constant(v2)) {
-                (Some(a), Some(b)) => (a.clone(), b.clone()),
-                _ => continue,
+            // heap.py:293-294: if not value.is_constant(): continue
+            let (Some(c1), Some(c2)) = (ctx.get_constant(v1), ctx.get_constant(v2)) else {
+                continue;
             };
-            // heap.py:296-297: not value1.same_constant(value2) → CANNOT_ALIAS
+            // heap.py:296: if not value1.same_constant(value2): return CANNOT_ALIAS
             if c1 != c2 {
                 return true;
             }
