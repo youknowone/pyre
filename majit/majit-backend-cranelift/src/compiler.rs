@@ -8148,8 +8148,10 @@ impl CraneliftBackend {
                         // Slow path passes GC-updated values from jitframe.
                         let (nf_addr, nt_addr) = majit_gc::nursery::nursery_global_addrs();
                         let flags = MemFlags::trusted();
-                        let size_imm = resolve_rewriter_immediate_i64(&constants, op.arg(0));
-                        let size_total = builder.ins().iconst(cl_types::I64, size_imm);
+                        // gc/rewrite.rs:569,599: size is a raw OpRef value from the
+                        // GC rewriter (NOT a constant-pool reference). Use raw value
+                        // to avoid collision with optimizer-produced constants.
+                        let size_total = builder.ins().iconst(cl_types::I64, op.arg(0).0 as i64);
                         let nf_ptr = builder.ins().iconst(ptr_type, nf_addr as i64);
                         let nt_ptr = builder.ins().iconst(ptr_type, nt_addr as i64);
                         let free = builder.ins().load(ptr_type, flags, nf_ptr, 0);
@@ -8260,7 +8262,7 @@ impl CraneliftBackend {
                         let runtime_id = builder.ins().iconst(cl_types::I64, runtime_id as i64);
                         let size_total = builder.ins().iconst(
                             cl_types::I64,
-                            resolve_rewriter_immediate_i64(&constants, op.arg(0)),
+                            op.arg(0).0 as i64,
                         );
                         let size = builder.ins().iadd_imm(size_total, -(GcHeader::SIZE as i64));
                         let result = emit_collecting_gc_call(
@@ -9309,10 +9311,11 @@ impl CraneliftBackend {
                 // args[0] = base ptr, args[1] = byte offset
                 OpCode::NurseryPtrIncrement => {
                     let base = resolve_opref(&mut builder, &constants, op.arg(0));
-                    let offset = builder.ins().iconst(
-                        cl_types::I64,
-                        resolve_rewriter_immediate_i64(&constants, op.arg(1)),
-                    );
+                    // gc/rewrite.rs:587: byte offset is a raw OpRef value
+                    // (NOT a constant-pool reference). Use raw value to avoid
+                    // collision with optimizer-produced constants at the same
+                    // OpRef index.
+                    let offset = builder.ins().iconst(cl_types::I64, op.arg(1).0 as i64);
                     let r = builder.ins().iadd(base, offset);
                     builder.def_var(var(vi), r);
                 }
@@ -9327,17 +9330,24 @@ impl CraneliftBackend {
                     // Resolve target: try descr-based lookup first, then
                     // fall back to loop_block (Jump without descr targets
                     // the loop header, matching RPython's self-loop).
-                    let target_block = op
-                        .descr
-                        .as_ref()
-                        .and_then(|descr| label_blocks_by_descr.get(&descr.index()).copied())
-                        .or_else(|| {
-                            if loop_block != entry_block {
-                                Some(loop_block)
-                            } else {
-                                None
-                            }
-                        });
+                    let target_block =
+                        op.descr
+                            .as_ref()
+                            .and_then(|descr| label_blocks_by_descr.get(&descr.index()).copied())
+                            .or_else(|| {
+                                // Only fallback to loop_block for implicit self-loops
+                                // (Jump with no descr). If the Jump has a descr pointing
+                                // to a target NOT in this function's Labels (bridge →
+                                // main loop), it's an external jump — compile as FINISH.
+                                let has_unmatched_descr = op.descr.as_ref().map_or(false, |d| {
+                                    !label_blocks_by_descr.contains_key(&d.index())
+                                });
+                                if !has_unmatched_descr && loop_block != entry_block {
+                                    Some(loop_block)
+                                } else {
+                                    None
+                                }
+                            });
                     if let Some(target_block) = target_block {
                         builder.ins().jump(target_block, &block_args(&vals));
                     } else {
