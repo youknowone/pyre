@@ -1341,6 +1341,16 @@ impl MIFrame {
 
     /// PyPy generate_guard + capture_resumedata: uses current_fail_args
     /// which encodes the full framestack for multi-frame resume.
+    /// pyjitpl.py:3222 store_token_in_vable():
+    ///   force_token = self.history.record0(rop.FORCE_TOKEN, ...)
+    ///   self.history.record2(rop.SETFIELD_GC, vbox, force_token, ...)
+    ///   self.generate_guard(rop.GUARD_NOT_FORCED_2)
+    pub(crate) fn store_token_in_vable(&mut self, ctx: &mut TraceCtx) {
+        if ctx.store_token_in_vable_setfield() {
+            self.generate_guard(ctx, OpCode::GuardNotForced2, &[]);
+        }
+    }
+
     pub(crate) fn generate_guard(&mut self, ctx: &mut TraceCtx, opcode: OpCode, args: &[OpRef]) {
         // pyjitpl.py:2558-2560 generate_guard parity:
         //     if isinstance(box, Const):    # no need for a guard
@@ -2985,10 +2995,27 @@ impl MIFrame {
                                 let ca_args = if target_num_inputs <= 1 {
                                     vec![callee_frame]
                                 } else if callee_stack_only == 0 {
+                                    // warmstate.py:73 wrap() parity:
+                                    // every Python local is stored as a
+                                    // PyObjectRef (W_Root). The optimizer
+                                    // may have unboxed the caller's
+                                    // `args` to Int/Float; re-box them
+                                    // via NewWithVtable + SetfieldGc so
+                                    // the callee frame receives proper
+                                    // W_IntObject / W_FloatObject
+                                    // pointers. In RPython the box type
+                                    // is fixed so this rewrap is
+                                    // structurally unnecessary.
+                                    let boxed_args: Vec<OpRef> = args
+                                        .iter()
+                                        .map(|&arg| {
+                                            crate::state::ensure_boxed_for_ca(ctx, &*this, arg)
+                                        })
+                                        .collect();
                                     synthesize_fresh_callee_entry_args(
                                         ctx,
                                         callee_frame,
-                                        args,
+                                        &boxed_args,
                                         callee_nlocals,
                                         ca_code,
                                         ca_ns,
@@ -3946,19 +3973,15 @@ impl MIFrame {
         }
         let action = match step_result {
             Ok(pyre_interpreter::StepResult::Return(value)) => {
-                // warmspot.py:449 portal result_type == REF: FINISH stores Ref.
-                // If the traced value is Int (optimizer unboxed), box it before
-                // FINISH so done_with_this_frame_descr_ref is used.
-                let vtype = self.value_type(value.opref);
-                let (farg, ftype) = if vtype == Type::Int {
-                    let boxed = self.with_ctx(|_this, ctx| wrapint(ctx, value.opref));
-                    (boxed, Type::Ref)
-                } else {
-                    (value.opref, vtype)
-                };
+                // pyjitpl.py:2489-2502 compile_done_with_this_frame parity:
+                // result_type is always REF. ensure_boxed_for_ca re-boxes
+                // unboxed Int/Float values (NewWithVtable + SetfieldGc).
+                let v = value.opref;
+                let finish_value =
+                    self.with_ctx(|this, ctx| crate::state::ensure_boxed_for_ca(ctx, this, v));
                 TraceAction::Finish {
-                    finish_args: vec![farg],
-                    finish_arg_types: vec![ftype],
+                    finish_args: vec![finish_value],
+                    finish_arg_types: vec![Type::Ref],
                 }
             }
             Err(_) => TraceAction::Abort,
@@ -4052,28 +4075,21 @@ pub(crate) fn trace_step_result_to_action(
             loop_header_pc: Some(loop_header_pc),
         },
         Ok(pyre_interpreter::StepResult::Return(fop)) => {
-            // pyjitpl.py:3198-3220 compile_done_with_this_frame parity:
-            //   result_type = jitdriver_sd.result_type
-            //   if result_type == history.REF:
-            //       token = sd.done_with_this_frame_descr_ref
+            // pyjitpl.py:2489-2502 finishframe + compile_done_with_this_frame:
+            //   result_type = self.jitdriver_sd.result_type  (STATIC property)
+            //   elif result_type == history.REF:
+            //       raise jitexc.DoneWithThisFrameRef(resultbox.getref_base())
             //
-            // warmspot.py:449: result_type = getkind(portal.getreturnvar())
-            // PyPy portal returns W_Root → REF. FINISH always uses
-            // done_with_this_frame_descr_ref.
+            // pyre eval_loop_jit sets result_type = Type::Ref. Every FINISH
+            // at the portal exit must carry Type::Ref. If the optimizer
+            // unboxed the return value to Int/Float, ensure_boxed_for_ca
+            // re-boxes it (NewWithVtable + SetfieldGc).
             let value = fop.opref;
-            let vt = state.value_type(value);
-            let finish_value = if vt == Type::Int {
-                // Re-box Int → Ref (portal result_type = REF).
-                state.with_ctx(|this, ctx| wrapint(ctx, value))
-            } else {
-                value
-            };
-            // pyjitpl.py:3199-3236 compile_done_with_this_frame ->
-            // store_token_in_vable parity.
+            let finish_value =
+                state.with_ctx(|this, ctx| crate::state::ensure_boxed_for_ca(ctx, this, value));
+            // pyjitpl.py:3222 store_token_in_vable
             state.with_ctx(|this, ctx| {
-                if ctx.store_token_in_vable_setfield() {
-                    this.generate_guard(ctx, OpCode::GuardNotForced2, &[]);
-                }
+                this.store_token_in_vable(ctx);
             });
             TraceAction::Finish {
                 finish_args: vec![finish_value],
@@ -4081,21 +4097,18 @@ pub(crate) fn trace_step_result_to_action(
             }
         }
         Ok(pyre_interpreter::StepResult::Yield(fop)) => {
-            let finish_type = match state.value_type(fop.opref) {
-                Type::Int => Type::Int,
-                Type::Float => Type::Float,
-                Type::Ref | Type::Void => Type::Ref,
-            };
-            // pyjitpl.py:3199 compile_done_with_this_frame parity for
-            // generator yield exits — same as the return path above.
+            // pyjitpl.py:3198 compile_done_with_this_frame parity:
+            // Yield uses the same Ref result_type.
+            let value = fop.opref;
+            let finish_value =
+                state.with_ctx(|this, ctx| crate::state::ensure_boxed_for_ca(ctx, this, value));
+            // pyjitpl.py:3222 store_token_in_vable (same as return path)
             state.with_ctx(|this, ctx| {
-                if ctx.store_token_in_vable_setfield() {
-                    this.generate_guard(ctx, OpCode::GuardNotForced2, &[]);
-                }
+                this.store_token_in_vable(ctx);
             });
             TraceAction::Finish {
-                finish_args: vec![fop.opref],
-                finish_arg_types: vec![finish_type],
+                finish_args: vec![finish_value],
+                finish_arg_types: vec![Type::Ref],
             }
         }
         Err(err) => {

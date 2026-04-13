@@ -2743,8 +2743,10 @@ extern "C" fn call_assembler_shim(
     outcome_ptr: u64,
     _expected_result_kind: u64,
 ) -> u64 {
-    // rstack.stack_almost_full() parity: CALL_ASSEMBLER recursion may
-    // exhaust the native stack.
+    // warmspot.py:1017-1024 assembler_call_helper parity: handle_fail
+    // always raises JitException, never returns silently.
+    // stacker::maybe_grow ensures recursive CALL_ASSEMBLER does not
+    // exhaust the native stack (rstack.py stack_almost_full parity).
     stacker::maybe_grow(512 * 1024, 8 * 1024 * 1024, || {
         call_assembler_shim_inner(target_token, args_ptr, outcome_ptr, _expected_result_kind)
     })
@@ -3269,18 +3271,28 @@ fn resolve_call_assembler_target(
         return Ok(None);
     }
 
-    // rewrite.py:665-695 handle_call_assembler: RPython's GC rewriter
-    // strips CALL_ASSEMBLER args to [frame], so the backend never sees
-    // a caller-arg vs callee-inputarg arity mismatch. When we have a
-    // VableExpansion, args are frame-based (the backend reads from the
-    // frame via expansion offsets), so skip the arity check.
-    // Without VableExpansion, verify direct-arg arity still matches.
-    if call_descr.vable_expansion().is_none()
-        && target.inputarg_types.len() != call_descr.arg_types().len()
-    {
+    // RPython rewrite.py:665-695 handle_call_assembler: when VableExpansion
+    // is present, the CALL_ASSEMBLER op carries fewer args than the callee's
+    // inputarg_types. The EXPANDED arity (1 frame + scalar_fields + array_items)
+    // must match the target. Without VableExpansion, op.args matches directly.
+    let expected_arity = if let Some(exp) = call_descr.vable_expansion() {
+        1 + exp.scalar_fields.len() + exp.num_array_items
+    } else {
+        call_descr.arg_types().len()
+    };
+    if target.inputarg_types.len() != expected_arity {
         return Err(unsupported_semantics(
             opcode,
-            "call-assembler target arity does not match the descriptor",
+            &format!(
+                "call-assembler target arity {} does not match expected {}{}",
+                target.inputarg_types.len(),
+                expected_arity,
+                if call_descr.vable_expansion().is_some() {
+                    " (with VableExpansion)"
+                } else {
+                    ""
+                },
+            ),
         ));
     }
     let finish_descr = target

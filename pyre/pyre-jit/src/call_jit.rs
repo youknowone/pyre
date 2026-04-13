@@ -484,21 +484,15 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
     let mut func_frame = PyFrame::new_for_call(code, &[], namespace, exec_ctx);
     func_frame.fix_array_ptrs();
 
-    // warmspot.py:1021 assembler_call_helper: execute callee in
-    // plain interpreter. Force helpers must NOT re-enter compiled code
-    // (RPython: handle_fail → resume_in_blackhole, no portal re-entry).
-    // force_plain_eval ensures nested user-calls also stay plain.
-    let _plain_guard = pyre_interpreter::call::force_plain_eval();
-    let result = match pyre_interpreter::eval::eval_frame_plain(&mut func_frame) {
-        Ok(r) => r,
-        Err(err) => {
-            // warmspot.py:998 parity: assembler_call_helper re-raises.
-            // Set JIT_EXC_VALUE so GUARD_NO_EXCEPTION fires.
-            #[cfg(feature = "cranelift")]
-            majit_backend_cranelift::jit_exc_raise(err.exc_object as i64);
-            pyre_object::PY_NULL
-        }
-    };
+    // warmspot.py:1021-1028 assembler_call_helper:
+    //   fail_descr.handle_fail(deadframe, metainterp_sd, jd)
+    //   except JitException as e: return handle_jitexception(e)
+    //
+    // handle_jitexception (warmspot.py:961) handles ContinueRunningNormally
+    // by calling portal_ptr(*args) — the JIT-aware portal. RPython does
+    // NOT prevent JIT re-entry here. The callee can enter compiled code
+    // through maybe_compile_and_run in the portal runner.
+    let result = crate::eval::portal_runner(&mut func_frame);
 
     // warmspot.py:449 result_type=REF: always boxed Ref
     result as i64
@@ -604,23 +598,14 @@ extern "C" fn jit_force_callee_frame_interp(frame_ptr: i64) -> i64 {
 
     let green_key = crate::eval::make_green_key(frame.code, frame.next_instr);
 
-    // warmspot.py:1021-1028 assembler_call_helper parity: if the blackhole
-    // cannot run (pc_map miss = corrupt resume data), fall back to plain
-    // interpreter evaluation. RPython's assembler_call_helper asserts
-    // handle_fail never returns silently; the nearest structural equivalent
-    // in pyre is eval_frame_plain, which re-runs the frame in the
-    // interpreter without JIT re-entry.
+    // warmspot.py:1021-1028 assembler_call_helper parity: calls
+    // handle_fail → JitException → handle_jitexception, which handles
+    // CRN by calling portal_ptr (JIT-aware). The blackhole is the
+    // primary path; portal_runner is the fallback when the blackhole
+    // cannot run (pc_map miss).
     let result = match blackhole_from_jit_frame(frame) {
         Some(r) => r,
-        None => match pyre_interpreter::eval::eval_frame_plain(frame) {
-            Ok(r) => r,
-            Err(err) => {
-                // warmspot.py:998 parity: propagate exception.
-                #[cfg(feature = "cranelift")]
-                majit_backend_cranelift::jit_exc_raise(err.exc_object as i64);
-                pyre_object::PY_NULL
-            }
-        },
+        None => crate::eval::portal_runner(frame),
     };
 
     // warmspot.py:449 result_type=REF: always boxed Ref
@@ -1532,14 +1517,12 @@ pub extern "C" fn jit_force_self_recursive_call_1(caller_frame: i64, boxed_arg: 
     let green_key = crate::eval::make_green_key(caller.code, 0);
     // result_type=REF: arg is already boxed Ref
     let frame_ptr = create_self_recursive_callee_frame_impl_1_boxed(caller_frame, boxed_arg_ref);
-    // warmspot.py:1021 assembler_call_helper: force path runs in plain
-    // interpreter. RPython: handle_fail → resume_in_blackhole, no portal.
+    // blackhole.py:1101-1132 bhimpl_recursive_call_r: calls
+    // cpu.bh_call_r(portal_runner_adr, ...) which re-enters JIT.
+    // warmspot.py:941 ll_portal_runner: maybe_compile_and_run + portal_ptr.
     let result = {
         let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
-        match pyre_interpreter::eval::eval_frame_plain(frame) {
-            Ok(r) => r as i64,
-            Err(_) => 0i64,
-        }
+        crate::eval::portal_runner(frame) as i64
     };
     jit_drop_callee_frame(frame_ptr);
     result
@@ -1582,19 +1565,15 @@ pub extern "C" fn jit_force_recursive_call_raw_1(
 
     let boxed = pyre_object::intobject::w_int_new(raw_int_arg);
     let frame_ptr = create_callee_frame_impl_1_boxed(caller_frame, callable_ref, boxed);
-    // RPython parity: nested calls CAN enter JIT (blackhole.py:1095).
-    // warmspot.py:1021-1028 assembler_call_helper parity: if the blackhole
-    // cannot run (pc_map miss), fall back to plain interpreter evaluation.
-    // Previously we returned the raw null as if it were a normal result,
-    // which would silently corrupt recursive-call computations on failure.
+    // blackhole.py:1101-1132 bhimpl_recursive_call_r: calls
+    // cpu.bh_call_r(portal_runner_adr, ...) which re-enters JIT.
+    // warmspot.py:1021-1028: if blackhole can't run, portal_runner
+    // is the fallback (JIT-aware, not plain interpreter).
     let result = {
         let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
         let bh_result = match blackhole_from_jit_frame(frame) {
             Some(r) => r,
-            None => match pyre_interpreter::eval::eval_frame_plain(frame) {
-                Ok(r) => r,
-                Err(_) => pyre_object::PY_NULL,
-            },
+            None => crate::eval::portal_runner(frame),
         };
         // warmspot.py:449 result_type=REF: always boxed Ref
         bh_result as i64
@@ -1628,16 +1607,14 @@ pub extern "C" fn jit_force_self_recursive_call_raw_1(caller_frame: i64, raw_int
 
     let boxed = pyre_object::intobject::w_int_new(raw_int_arg);
     let frame_ptr = create_self_recursive_callee_frame_impl_1_boxed(caller_frame, boxed);
-    // warmspot.py:1021 assembler_call_helper: force path runs in plain
-    // interpreter. RPython: handle_fail → resume_in_blackhole, no portal.
+    // blackhole.py:1110-1116 bhimpl_recursive_call_r: calls
+    // cpu.bh_call_r(portal_runner_adr, ...) which invokes
+    // warmspot.py:941 ll_portal_runner. portal_runner re-enters
+    // the JIT through maybe_compile_and_run + portal_ptr.
     let result = {
         let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
-        let pr_result = match pyre_interpreter::eval::eval_frame_plain(frame) {
-            Ok(r) => r,
-            Err(_) => pyre_object::PY_NULL,
-        };
         // warmspot.py:449 result_type=REF: always boxed Ref
-        pr_result as i64
+        crate::eval::portal_runner(frame) as i64
     };
     jit_drop_callee_frame(frame_ptr);
     if majit_metainterp::majit_log_enabled() && raw_int_arg <= 4 {

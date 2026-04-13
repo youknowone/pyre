@@ -922,13 +922,11 @@ impl<S: JitState> JitDriver<S> {
                 finish_args,
                 finish_arg_types,
             } => {
-                // pyjitpl.py:3198-3220 compile_done_with_this_frame:
-                //   self.history.record(rop.FINISH, exits, None, descr=token)
-                //   target_token = compile.compile_trace(self, self.resumekey, exits)
-                //
-                // Bridge tracing that exits via return: record FINISH into the
-                // bridge's own TraceCtx (created fresh by start_retrace_from_guard)
-                // and compile via compile_trace's normal bridge path.
+                // pyjitpl.py:3198-3220 compile_done_with_this_frame parity:
+                // RPython records FINISH into the live trace history and calls
+                // compile_trace(self, self.resumekey, exits) — the same
+                // function used for bridge compilation. compile_trace_finish
+                // appends FINISH to the full trace and compiles it as a bridge.
                 if let Some((bridge_key, bridge_trace_id, bridge_fail_index, _bridge_code)) =
                     self.bridge_info.take()
                 {

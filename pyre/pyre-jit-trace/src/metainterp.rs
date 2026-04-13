@@ -648,9 +648,7 @@ impl PyreMetaInterp {
                 let concrete_frame = sym_mut.concrete_vable_ptr as usize;
                 let pc = sym_mut.pending_next_instr.unwrap_or(0);
                 let mut mi = super::state::MIFrame::from_sym(ctx, sym_mut, concrete_frame, pc, pc);
-                if ctx.store_token_in_vable_setfield() {
-                    mi.generate_guard(ctx, majit_ir::OpCode::GuardNotForced2, &[]);
-                }
+                mi.store_token_in_vable(ctx);
             }
             return Some(LoopAction::Return(TraceAction::Finish {
                 finish_args: vec![exc_opref],

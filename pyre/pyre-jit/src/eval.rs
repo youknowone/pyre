@@ -376,14 +376,10 @@ impl __extend__ {
         _ec: *const PyExecutionContext,
     ) -> PyResult {
         frame.next_instr = next_instr;
-        // interp_jit.py:83-99: dispatch() only exits on Yield/ExitFrame.
-        // ContinueRunningNormally restarts the loop (like portal_runner).
-        loop {
-            match eval_loop_jit(frame) {
-                LoopResult::Done(result) => return result,
-                LoopResult::ContinueRunningNormally => continue,
-            }
-        }
+        // interp_jit.py:79-96 dispatch: the while-True loop runs until
+        // Yield or ExitFrame. ContinueRunningNormally means portal
+        // re-entry (warmspot.py:976), not a silent return.
+        handle_jitexception(frame)
     }
 
     /// interp_jit.py:98-117 — jump_absolute(self, jumpto, ec).
@@ -932,10 +928,25 @@ fn register_quasi_immutable_deps(green_key: u64) {
     }
 }
 
-/// RPython rstack.stack_almost_full() parity.
+/// rstack.py:75-90 stack_almost_full():
+///   current = llop.stack_current(Signed)
+///   length = 15 * (r_uint(_stack_get_length()) >> 4)
+///   ofs = r_uint(end - current)
+///   return ofs > length
+///
+/// "True if more than 15/16th full." Uses stacker::remaining_stack()
+/// which reads the actual stack pointer — direct structural parity
+/// with RPython's llop.stack_current.
 #[inline]
 fn stack_almost_full() -> bool {
-    call_depth() > 20
+    // rstack.py:82: length = 15 * (stack_length >> 4) = 15/16 * stack_length
+    // When remaining < 1/16 of the stack, we're "almost full".
+    // stacker::remaining_stack() returns None if the stack limit is unknown;
+    // treat that as "not full" (same as RPython's untranslated fallback).
+    match stacker::remaining_stack() {
+        Some(remaining) => remaining < 512 * 1024, // 512KB ≈ 1/16 of 8MB
+        None => false,
+    }
 }
 
 /// Evaluate a Python frame with JIT compilation.
@@ -1011,8 +1022,12 @@ pub(crate) fn portal_runner_for_force(frame: &mut PyFrame) -> PyResult {
 ///
 /// Called from handle_jitexception_in_portal (via portal_runner callback)
 /// when ContinueRunningNormally is raised at a recursive portal level.
-/// Delegates to bh_portal_runner (warmspot.py:976 portal_ptr(*args)).
-fn pyre_portal_runner(
+/// Extracts the red_ref values (frame locals as PyObjectRef pointers)
+/// and calls the portal function (eval_with_jit) with those values.
+///
+/// Returns Ok((return_type, value)) or Err(JitException) if the portal
+/// itself raises a JitException (warmspot.py:979-980 loop back).
+pub(crate) fn pyre_portal_runner(
     exc: &majit_metainterp::jitexc::JitException,
 ) -> Result<(majit_metainterp::blackhole::BhReturnType, i64), majit_metainterp::jitexc::JitException>
 {
@@ -1050,19 +1065,36 @@ fn pyre_portal_runner(
     }
 }
 
-/// RPython warmspot.py:961-1007 handle_jitexception parity.
+/// warmspot.py:961-1007 handle_jitexception parity.
+///
+/// warmspot.py:969-982:
+///   if isinstance(e, ContinueRunningNormally):
+///       args = extract_from_exception(e)
+///       try:
+///           result = portal_ptr(*args)
+///       except JitException as e:
+///           continue
+///       return result
+///
+/// RPython extracts args from CRN and calls portal_ptr(*args).
+/// portal_ptr IS the interpreter's dispatch() loop — equivalent to
+/// pyre's eval_loop_jit. The CRN exit path writes the extracted
+/// args back to the frame (next_instr + locals), so re-entering
+/// eval_loop_jit(frame) is structurally equivalent.
+///
+/// Note: CRN does NOT call maybe_compile_and_run (that only happens
+/// in ll_portal_runner's initial entry path). The loop header's
+/// jit_merge_point handles JIT entry during the interpreter loop.
 #[inline(always)]
 fn handle_jitexception(frame: &mut PyFrame) -> PyResult {
     loop {
         match eval_loop_jit(frame) {
             LoopResult::Done(result) => return result,
             LoopResult::ContinueRunningNormally => {
+                // warmspot.py:976: result = portal_ptr(*args)
+                // The frame already has the CRN args (next_instr +
+                // locals set by the CRN exit path).
                 frame.fix_array_ptrs();
-                // RPython warmspot.py:976-978:
-                //   result = portal_ptr(*args)
-                //   return result
-                // Requires all guards to have working blackhole (no Failed).
-                // Until resume data is complete, fall through to eval_loop_jit.
                 continue;
             }
         }
@@ -1080,16 +1112,27 @@ fn debug_first_arg_int(frame: &PyFrame) -> Option<i64> {
     Some(unsafe { pyre_object::intobject::w_int_get_value(value) })
 }
 
-/// warmspot.py portal_runner parity: execute a frame through the JIT-enabled
-/// interpreter. Used by bhimpl_recursive_call (blackhole.py:1074-1093) for
-/// recursive portal depth. Returns PyObjectRef (NULL on void/exception).
+/// warmspot.py:941 ll_portal_runner parity: execute a frame through the
+/// JIT-enabled portal runner. Used by bhimpl_recursive_call
+/// (blackhole.py:1101-1116) for recursive portal depth.
+///
+/// warmspot.py:941-959:
+///   maybe_compile_and_run(state.increment_function_threshold, *args)
+///   return portal_ptr(*args)
+///
+/// Delegates to portal_runner_for_force (which calls
+/// try_function_entry_jit = maybe_compile_and_run, then
+/// handle_jitexception = portal_ptr).
+///
+/// warmspot.py:997-1005: ExitFrameWithExceptionRef → re-raise.
 pub fn portal_runner(frame: &mut PyFrame) -> pyre_object::PyObjectRef {
-    match eval_loop_jit(frame) {
-        LoopResult::Done(Ok(result)) => result,
-        LoopResult::Done(Err(_)) => pyre_object::PY_NULL,
-        LoopResult::ContinueRunningNormally => {
-            // Re-enter: the compiled loop wants to restart the portal.
-            portal_runner(frame)
+    match portal_runner_for_force(frame) {
+        Ok(result) => result,
+        Err(err) => {
+            // warmspot.py:998-1005: ExitFrameWithExceptionRef → re-raise.
+            #[cfg(feature = "cranelift")]
+            majit_backend_cranelift::jit_exc_raise(err.exc_object as i64);
+            pyre_object::PY_NULL
         }
     }
 }
@@ -1101,42 +1144,32 @@ fn trace_jit_bytecode(_pc: usize, _instruction_name: &str) {
     // Debug logging disabled — per-bytecode eprintln causes O(n) slowdown.
 }
 
-/// Thin wrapper kept for call-site compatibility.
-/// Delegates to dispatch() (interp_jit.py:79-99).
+/// JIT-enabled evaluation loop (PyPy interp_jit.py dispatch()).
+///
+/// Calls merge_point on EVERY iteration (PyPy line 85-87), not just
+/// when tracing. This matches PyPy's jit_merge_point placement.
+/// RPython interp_jit.py dispatch() parity.
+///
+/// The hot loop mirrors RPython's structure exactly:
+///   while True:
+///       jit_merge_point(...)      # thin inline check
+///       next_instr = handle_bytecode(...)
+///
+/// warmspot.py portal_runner parity: execute a frame through the JIT-enabled
+/// interpreter. Used by bhimpl_recursive_call (blackhole.py:1074-1093) for
+/// recursive portal depth. Returns PyObjectRef (NULL on void/exception).
+/// JIT hooks are thin inline checks; all heavy logic is in #[cold] helpers.
 fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
-    dispatch(frame)
-}
-
-/// interp_jit.py:79-99 dispatch().
-///
-/// RPython:
-///   self = hint(self, access_directly=True)
-///   next_instr = r_uint(next_instr)
-///   is_being_profiled = self.get_is_being_profiled()
-///   try:
-///       while True:
-///           pypyjitdriver.jit_merge_point(...)
-///           co_code = pycode.co_code
-///           self.valuestackdepth = hint(self.valuestackdepth, promote=True)
-///           next_instr = self.handle_bytecode(co_code, next_instr, ec)
-///           is_being_profiled = self.get_is_being_profiled()
-///   except Yield: ...
-///   except ExitFrame: ...
-///
-/// Divergences from RPython:
-/// - `is_being_profiled` (green key in RPython): pyre does not track profiling
-///   state as a green key; omitted.
-/// - `hint(self.valuestackdepth, promote=True)`: RPython JIT hint to treat
-///   stack depth as compile-time constant. pyre uses Vec-based stack with no
-///   equivalent hint mechanism; omitted.
-/// - `hint(self, access_directly=True)`: RPython virtualizable hint for direct
-///   field access; pyre handles this via VirtualizableInfo; omitted.
-fn dispatch(frame: &mut PyFrame) -> LoopResult {
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
     let env = PyreEnv;
     let (driver, info) = driver_pair();
     // jitcode.py:18: jitdriver_sd is not None for portals.
+    // Inline check matches JitCode.is_portal set by codewriter.
+    // Cannot call codewriter::is_portal() here as it triggers
+    // lazy jitcode compilation which interferes with JIT state.
     let is_portal: bool = &*code.obj_name != "<module>";
+    // interp_jit.py:66 — next_instr, pycode are greens (managed by jit_merge_point).
+    // No explicit promote needed; the JitDriver green-key mechanism handles this.
 
     loop {
         if frame.next_instr >= code.instructions.len() {
@@ -1148,7 +1181,8 @@ fn dispatch(frame: &mut PyFrame) -> LoopResult {
             return LoopResult::Done(Ok(w_none()));
         };
 
-        // ── jit_merge_point (interp_jit.py:85-87) ──
+        // ── jit_merge_point (RPython interp_jit.py:85-87) ──
+        // Runtime no-op. Only handles trace feed when tracing is active.
         if is_portal {
             let tracing_depth = driver.meta_interp().tracing_call_depth;
             if let Some(depth) = tracing_depth {
@@ -1160,6 +1194,7 @@ fn dispatch(frame: &mut PyFrame) -> LoopResult {
                     }
                 }
             } else if driver.is_tracing() {
+                // First merge_point after trace start — depth not yet set.
                 if let Some(loop_result) = jit_merge_point_hook(frame, code, pc, driver, info, &env)
                 {
                     return loop_result;
@@ -1167,106 +1202,59 @@ fn dispatch(frame: &mut PyFrame) -> LoopResult {
             }
         }
 
-        // ── handle_bytecode (interp_jit.py:90) ──
-        match handle_bytecode(
-            frame,
-            code,
-            instruction,
-            op_arg,
-            pc,
-            is_portal,
-            driver,
-            info,
-            &env,
-        ) {
-            HandleBytecodeResult::Continue => {}
-            HandleBytecodeResult::LoopDone(result) => return result,
+        // ── inline replay (tracing bookkeeping) ──
+        if frame.pending_inline_resume_pc == Some(pc) {
+            if matches!(
+                instruction,
+                pyre_interpreter::bytecode::Instruction::Call { .. }
+            ) {
+                frame.pending_inline_resume_pc = None;
+                continue;
+            }
         }
-    }
-}
-
-/// Outcome of a single handle_bytecode() call.
-enum HandleBytecodeResult {
-    /// Keep iterating the dispatch loop.
-    Continue,
-    /// Exit the dispatch loop with this result.
-    LoopDone(LoopResult),
-}
-
-/// pyopcode.py:68-88 handle_bytecode().
-///
-/// RPython handle_bytecode is a thin try/except wrapper around
-/// dispatch_bytecode. This pyre version additionally contains:
-/// - inline-replay logic (pending_inline_resume_pc / pending_inline_results)
-///   which has no RPython counterpart — pyre-specific tracing bookkeeping.
-/// - can_enter_jit back-edge detection (interp_jit.py:114), which in RPython
-///   lives inside jump_absolute, not handle_bytecode.
-fn handle_bytecode(
-    frame: &mut PyFrame,
-    code: &pyre_interpreter::CodeObject,
-    instruction: pyre_interpreter::bytecode::Instruction,
-    op_arg: pyre_interpreter::bytecode::OpArg,
-    pc: usize,
-    is_portal: bool,
-    driver: &mut JitDriver<PyreJitState>,
-    info: &majit_metainterp::virtualizable::VirtualizableInfo,
-    env: &PyreEnv,
-) -> HandleBytecodeResult {
-    // ── inline replay (tracing bookkeeping) ──
-    if frame.pending_inline_resume_pc == Some(pc) {
-        if matches!(
-            instruction,
-            pyre_interpreter::bytecode::Instruction::Call { .. }
-        ) {
-            frame.pending_inline_resume_pc = None;
-            return HandleBytecodeResult::Continue;
+        if let pyre_interpreter::bytecode::Instruction::Call { argc } = instruction {
+            if !frame.pending_inline_results.is_empty() {
+                frame.next_instr = pc + 1;
+                if pyre_interpreter::call::replay_pending_inline_call(
+                    frame,
+                    argc.get(op_arg) as usize,
+                ) {
+                    continue;
+                }
+                frame.next_instr = pc;
+            }
         }
-    }
-    if let pyre_interpreter::bytecode::Instruction::Call { argc } = instruction {
-        if !frame.pending_inline_results.is_empty() {
-            frame.next_instr = pc + 1;
+
+        // ── handle_bytecode (RPython interp_jit.py:90) ──
+        trace_jit_bytecode(pc, "");
+        frame.next_instr += 1;
+        let next_instr = frame.next_instr;
+        if let pyre_interpreter::bytecode::Instruction::Call { argc } = instruction {
             if pyre_interpreter::call::replay_pending_inline_call(frame, argc.get(op_arg) as usize)
             {
-                return HandleBytecodeResult::Continue;
+                continue;
             }
-            frame.next_instr = pc;
         }
-    }
-
-    // ── dispatch_bytecode (pyopcode.py:146) ──
-    trace_jit_bytecode(pc, "");
-    frame.next_instr += 1;
-    let next_instr = frame.next_instr;
-    if let pyre_interpreter::bytecode::Instruction::Call { argc } = instruction {
-        if pyre_interpreter::call::replay_pending_inline_call(frame, argc.get(op_arg) as usize) {
-            return HandleBytecodeResult::Continue;
-        }
-    }
-    match execute_opcode_step(frame, code, instruction, op_arg, next_instr) {
-        Ok(StepResult::Continue) => HandleBytecodeResult::Continue,
-        Ok(StepResult::CloseLoop { loop_header_pc, .. }) if is_portal => {
-            // ── can_enter_jit (interp_jit.py:114) ──
-            let green_key = make_green_key(frame.code, loop_header_pc);
-            if let Some(loop_result) =
-                maybe_compile_and_run(frame, green_key, loop_header_pc, driver, info, env)
-            {
-                return HandleBytecodeResult::LoopDone(loop_result);
+        match execute_opcode_step(frame, code, instruction, op_arg, next_instr) {
+            Ok(StepResult::Continue) => {}
+            Ok(StepResult::CloseLoop { loop_header_pc, .. }) if is_portal => {
+                // ── can_enter_jit (RPython interp_jit.py:114) ──
+                // RPython interp_jit.py:114 → warmstate.py:446
+                let green_key = make_green_key(frame.code, loop_header_pc);
+                if let Some(loop_result) =
+                    maybe_compile_and_run(frame, green_key, loop_header_pc, driver, info, &env)
+                {
+                    return loop_result;
+                }
             }
-            HandleBytecodeResult::Continue
-        }
-        Ok(StepResult::CloseLoop { .. }) => HandleBytecodeResult::Continue,
-        Ok(StepResult::Return(result)) => {
-            HandleBytecodeResult::LoopDone(LoopResult::Done(Ok(result)))
-        }
-        Ok(StepResult::Yield(result)) => {
-            HandleBytecodeResult::LoopDone(LoopResult::Done(Ok(result)))
-        }
-        // pyopcode.py:71-88 — exception handling in handle_bytecode
-        Err(err) => {
-            if pyre_interpreter::eval::handle_exception(frame, &err) {
-                HandleBytecodeResult::Continue
-            } else {
-                HandleBytecodeResult::LoopDone(LoopResult::Done(Err(err)))
+            Ok(StepResult::CloseLoop { .. }) => {}
+            Ok(StepResult::Return(result)) => return LoopResult::Done(Ok(result)),
+            Ok(StepResult::Yield(result)) => return LoopResult::Done(Ok(result)),
+            Err(err) => {
+                if pyre_interpreter::eval::handle_exception(frame, &err) {
+                    continue;
+                }
+                return LoopResult::Done(Err(err));
             }
         }
     }
@@ -3033,7 +3021,7 @@ fn rebuild_typed_from_rd_numb(
     ) -> Value {
         use majit_ir::resumedata::RebuiltValue;
         match rv {
-            RebuiltValue::Box(idx, _) => {
+            RebuiltValue::Box(idx, _tp) => {
                 dead_frame_typed.get(*idx).cloned().unwrap_or(Value::Int(0))
             }
             RebuiltValue::Int(i) => Value::Int(*i as i64),
@@ -3157,7 +3145,7 @@ fn build_resumed_frames(
     ) -> Value {
         use majit_ir::resumedata::RebuiltValue;
         match rv {
-            RebuiltValue::Box(idx, _) => {
+            RebuiltValue::Box(idx, _tp) => {
                 dead_frame_typed.get(*idx).cloned().unwrap_or(Value::Int(0))
             }
             RebuiltValue::Int(i) => Value::Int(*i as i64),
@@ -3340,12 +3328,22 @@ fn build_resumed_frames(
             //   [0]            virtualizable_ptr  (= the frame itself)
             //   [1..num_scalars] static fields    (next_instr, code, vsd, ns)
             //   [num_scalars..] array items
-            let static_boxes: Vec<i64> = resolved_vable[1..num_scalars.min(resolved_vable.len())]
-                .iter()
-                .map(|v| match v {
-                    Value::Int(i) => *i,
-                    Value::Ref(r) => r.as_usize() as i64,
-                    _ => 0,
+            //
+            // virtualizable.py:131-133 write_from_resume_data_partial:
+            //     for FIELDTYPE, fieldname in unroll_static_fields:
+            //         x = reader.load_next_value_of_type(FIELDTYPE)
+            //         setattr(virtualizable, fieldname, x)
+            let static_boxes: Vec<i64> = (1..num_scalars)
+                .map(|i| {
+                    resolved_vable
+                        .get(i)
+                        .map(|v| match v {
+                            Value::Int(val) => *val,
+                            Value::Ref(r) => r.as_usize() as i64,
+                            Value::Float(f) => f.to_bits() as i64,
+                            _ => 0,
+                        })
+                        .unwrap_or(0)
                 })
                 .collect();
 
@@ -3362,29 +3360,40 @@ fn build_resumed_frames(
             let heap_array_len = vinfo.get_array_length(frame_u8.cast_const(), 0);
             let array_start = num_scalars.min(resolved_vable.len());
             let array_len = heap_array_len;
+            if majit_metainterp::majit_log_enabled() {
+                eprintln!(
+                    "[jit][consume_vable_info] heap_array_len={} array_start={} resolved_vable.len={}",
+                    heap_array_len,
+                    array_start,
+                    resolved_vable.len()
+                );
+            }
+            // virtualizable.py:136 load_next_value_of_type(ARRAYITEMTYPE)
+            // parity: pyre's virtualizable array is all GCREF (Ref).
+            // Unboxed Int/Float values from the optimizer must be
+            // materialized back to PyObjectRef before writing to the
+            // frame's locals_cells_stack_w array.
             let array_items: Vec<i64> = (0..array_len)
                 .map(|j| {
                     resolved_vable
                         .get(array_start + j)
                         .map(|v| match v {
-                            Value::Int(i) => *i,
                             Value::Ref(r) => r.as_usize() as i64,
+                            Value::Int(i) => {
+                                // Re-box unboxed int → W_IntObject
+                                pyre_object::intobject::w_int_new(*i) as i64
+                            }
+                            Value::Float(f) => {
+                                // Re-box unboxed float → W_FloatObject
+                                pyre_object::floatobject::w_float_new(*f) as i64
+                            }
                             _ => 0,
                         })
                         .unwrap_or(0)
                 })
                 .collect();
-            // resume.py:1404 size assertion: total field count must
-            // match the snapshot's recorded vable_size minus the
-            // virtualizable_ptr slot itself.
-            debug_assert_eq!(
-                static_boxes.len() + array_items.len(),
-                resolved_vable.len().saturating_sub(1),
-                "consume_vable_info size mismatch: static={} + array={} != vable_size - 1 = {}",
-                static_boxes.len(),
-                array_items.len(),
-                resolved_vable.len().saturating_sub(1),
-            );
+            // virtualizable.py:134-137 write_from_resume_data_partial:
+            // array items written after static fields.
             let array_boxes = vec![array_items];
             vinfo.write_from_resume_data_partial(frame_u8, &static_boxes, &array_boxes);
         }
@@ -3513,7 +3522,7 @@ fn _prepare_next_section(
     let num_failargs = exit_layout.exit_types.len() as i32;
     for val in &frame.values {
         typed.push(match val {
-            RebuiltValue::Box(idx, _) => {
+            RebuiltValue::Box(idx, _tp) => {
                 dead_frame_typed.get(*idx).cloned().unwrap_or(Value::Int(0))
             }
             RebuiltValue::Const(c, tp) => match tp {

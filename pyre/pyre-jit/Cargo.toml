@@ -24,6 +24,7 @@ majit-gc = { workspace = true }
 pyre-jit-trace = { workspace = true }
 majit-backend-cranelift = { workspace = true, optional = true }
 majit-backend-dynasm = { workspace = true, optional = true }
+stacker = "0.1"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 majit-backend-wasm = { workspace = true }
