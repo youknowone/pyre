@@ -2743,8 +2743,8 @@ extern "C" fn call_assembler_shim(
     outcome_ptr: u64,
     _expected_result_kind: u64,
 ) -> u64 {
-    // warmspot.py:1017-1024 assembler_call_helper parity: handle_fail
-    // always raises JitException, never returns silently.
+    // warmspot.py:1017-1024 assembler_call_helper parity:
+    // handle_fail always raises JitException, never returns silently.
     // stacker::maybe_grow ensures recursive CALL_ASSEMBLER does not
     // exhaust the native stack (rstack.py stack_almost_full parity).
     stacker::maybe_grow(512 * 1024, 8 * 1024 * 1024, || {

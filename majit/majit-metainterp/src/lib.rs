@@ -16,7 +16,7 @@ extern crate self as majit_metainterp;
 use majit_ir::{OpRef, Type};
 
 pub mod blackhole;
-mod call_descr;
+pub mod call_descr;
 pub(crate) mod compile;
 mod constant_pool;
 pub(crate) mod executor;

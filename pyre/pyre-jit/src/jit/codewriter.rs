@@ -34,20 +34,10 @@ use pyre_jit_trace::virtualizable_spec::LOCALS_CELLS_STACK_W_VABLE_ARRAY_INDEX;
 /// vector; `var_num` from `LOAD_FAST`/`STORE_FAST` is already a direct
 /// offset into that vector (no indirection).
 ///
-/// **NOT YET WIRED UP**: this helper exists for the planned port of
-/// `LOAD_FAST`/`STORE_FAST` → `BC_GETARRAYITEM_VABLE_R` /
-/// `BC_SETARRAYITEM_VABLE_R` against `locals_cells_stack_w`. The
-/// matching `pypy/interpreter/pyopcode.py:495 LOAD_FAST` reads
-/// `frame.locals_cells_stack_w[var_num]` directly, and PyPy's JIT
-/// translator rewrites that read into a `getarrayitem_vable_r`
-/// against the virtualizable array. pyre's codewriter currently emits
-/// a plain `move_r` for both opcodes (see the LoadFast / StoreFast
-/// arms below); the lowering is gated on the parallel "virtualizable
-/// box propagation across loop iterations" port (task: virtualizable
-/// boxes / unroll preamble). Until both halves land together this
-/// helper has no callers — see Phase 4/5 of the vable-locals epic.
+/// jtransform.py:1877 do_fixed_list_getitem / :1898 do_fixed_list_setitem
+/// rewrite portal local accesses into `getarrayitem_vable_r` /
+/// `setarrayitem_vable_r` against the virtualizable array.
 #[inline]
-#[allow(dead_code)] // see doc comment: pending Phase 4/5 wiring
 fn local_to_vable_slot(var_num: usize) -> usize {
     var_num
 }
@@ -312,17 +302,15 @@ impl CodeWriter {
         // function has its own dispatch loop), so all jitcodes with loop
         // headers are portals.
         let is_portal = !loop_header_pcs.is_empty();
-        // NOTE: the planned `should_emit_vable_for_portal_locals` toggle
-        // (which would gate LoadFast/StoreFast on the
-        // `getarrayitem_vable_r` / `setarrayitem_vable_r` lowering — see
-        // `local_to_vable_slot` above) is intentionally omitted: pyre's
-        // LoadFast/StoreFast still emit plain `move_r` and the matching
-        // virtualizable-box propagation across loop iterations is not yet
-        // ported. Wiring the toggle without the lowering would be dead
-        // scaffolding that misleads readers about the port status. Both
-        // halves must land together (Phase 4/5 of the vable-locals epic).
-        // jtransform.py:1690-1712: portal jitcodes get jit_merge_point
-        // at the first loop header. Non-portal (no loops): no merge point.
+        // RPython parity: every backward jump goes through dispatch() →
+        // jit_merge_point(). The blackhole's bhimpl_jit_merge_point raises
+        // ContinueRunningNormally at the bottommost level. Ideally all
+        // loop headers should emit BC_JIT_MERGE_POINT, but the
+        // CRN→interpreter→JIT-reentry cycle crashes in JIT compiled code
+        // because blackhole-modified frame locals can contain values
+        // incompatible with the compiled trace's assumptions. Until the
+        // full RPython CRN→portal_ptr restart is implemented, only the
+        // first loop header is a merge point.
         let merge_point_pc = loop_header_pcs.iter().copied().min();
         let mut emitted_merge_point = false;
 
@@ -337,8 +325,6 @@ impl CodeWriter {
             pc_map[py_pc] = assembler.current_pos();
             depth_at_pc[py_pc] = current_depth;
 
-            // jtransform.py:1690/1714: jit_merge_point at the portal's
-            // merge point; loop_header at all other backward jump targets.
             if loop_header_pcs.contains(&py_pc) {
                 if merge_point_pc == Some(py_pc) && !emitted_merge_point {
                     // interp_jit.py:64 portal contract:
@@ -396,27 +382,27 @@ impl CodeWriter {
 
                 // jtransform.py:1877 do_fixed_list_getitem vable case:
                 // portal locals are virtualizable array items.
-                // pyopcode.py:495 reads locals_cells_stack_w[varindex],
-                // which the JIT translator rewrites into
-                // getarrayitem_vable_r(frame, 0, var_num).
                 // Phase 5 (vable read) blocked: emitting vable_getarrayitem_ref
-                // alone causes nbody CRASH + fannkuch TIMEOUT; shadow read
-                // (move_r + vable_getarrayitem_ref) recovers nbody but
-                // fannkuch still regresses. Keep move_r until the blackhole
-                // resume path reads from the frame directly.
+                // alone causes nested_loop WRONG output; shadow read
+                // would need virtualizable_boxes propagation across JUMP
+                // back-edge (unroll.rs export_state/import_state parity).
+                // Keep move_r until the blackhole resume path reads from
+                // the frame directly.
                 Instruction::LoadFast { var_num } | Instruction::LoadFastBorrow { var_num } => {
                     let reg = var_num.get(op_arg).as_usize() as u16;
                     assembler.move_r(stack_base + current_depth, reg);
                     current_depth += 1;
                 }
 
+                // jtransform.py:1898 do_fixed_list_setitem vable case:
+                // Shadow write: keep move_r AND write to vable array.
+                // Pure vable write (RPython parity) blocked on the same
+                // virtualizable_boxes propagation gap as LoadFast above.
                 Instruction::StoreFast { var_num } => {
                     let reg = var_num.get(op_arg).as_usize() as u16;
                     current_depth -= 1;
                     assembler.move_r(reg, stack_base + current_depth);
-                    // jtransform.py:1898 do_fixed_list_setitem vable case:
-                    // portal locals are virtualizable array items.
-                    // Shadow write: keep move_r AND write to vable array.
+                    // Shadow write to vable array for consume_vable_info.
                     if is_portal {
                         assembler
                             .load_const_i_value(int_tmp0, local_to_vable_slot(reg as usize) as i64);
@@ -453,7 +439,8 @@ impl CodeWriter {
                     current_depth += 1;
                 }
 
-                // Superinstruction: two consecutive LoadFast / LoadFastBorrow
+                // Superinstruction: two consecutive LoadFast / LoadFastBorrow.
+                // Phase 5 blocked — see LoadFast comment above.
                 Instruction::LoadFastBorrowLoadFastBorrow { var_nums }
                 | Instruction::LoadFastLoadFast { var_nums } => {
                     let pair = var_nums.get(op_arg);
@@ -842,7 +829,7 @@ impl CodeWriter {
                 }
 
                 // CPython 3.13 superinstruction: STORE_FAST_STORE_FAST.
-                // Pops 2 values and stores to two locals.
+                // jtransform.py:1898 — each local write → setarrayitem_vable_r.
                 Instruction::StoreFastStoreFast { var_nums } => {
                     let pair = var_nums.get(op_arg);
                     let reg_a = u32::from(pair.idx_1()) as u16;
@@ -851,7 +838,7 @@ impl CodeWriter {
                     assembler.move_r(reg_a, stack_base + current_depth);
                     current_depth -= 1;
                     assembler.move_r(reg_b, stack_base + current_depth);
-                    // jtransform.py:1898 parity: shadow write both stores
+                    // Shadow write both stores to vable array.
                     if is_portal {
                         assembler.load_const_i_value(
                             int_tmp0,

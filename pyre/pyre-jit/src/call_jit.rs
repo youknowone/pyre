@@ -652,11 +652,9 @@ pub(crate) fn bh_portal_runner(all_i: &[i64], all_r: &[i64], _all_f: &[i64]) -> 
 /// raising, and a silent null would corrupt computations that depend on
 /// the call's return value (see `jit_force_recursive_call_raw_1`).
 fn blackhole_from_jit_frame(frame: &mut PyFrame) -> Option<PyObjectRef> {
-    // blackhole.py:1067-1093 bhimpl_jit_merge_point: when blackhole reaches
-    // a portal entry it calls bhimpl_recursive_call_*, which routes through
-    // portal_runner_adr (= JIT entry). pyre wires bh_portal_runner into the
-    // BlackholeInterpreter via portal_runner_ptr below; bh_call_fn_impl uses
-    // call_user_function which honors EVAL_OVERRIDE for the same effect.
+    // blackhole.py:1067 bhimpl_jit_merge_point: raises
+    // ContinueRunningNormally. bh_call_fn_impl dispatches user calls
+    // via call_user_function which honors EVAL_OVERRIDE for JIT re-entry.
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
     let py_pc = frame.next_instr;
 
@@ -754,33 +752,34 @@ fn blackhole_from_jit_frame(frame: &mut PyFrame) -> Option<PyObjectRef> {
         );
     }
 
-    // RPython: _run_forever(blackholeinterp, current_exc)
-    let _ = bh.run();
+    // blackhole.py:1752 _run_forever(blackholeinterp, current_exc) parity:
+    // run_forever_with_portal loops resume_mainloop with portal_runner
+    // callback for ContinueRunningNormally dispatch (blackhole.py:1075
+    // bhimpl_recursive_call → portal_runner → JIT re-entry).
+    let portal_runner = |exc: &majit_metainterp::jitexc::JitException| -> Result<
+        (majit_metainterp::blackhole::BhReturnType, i64),
+        majit_metainterp::jitexc::JitException,
+    > { crate::eval::pyre_portal_runner(exc) };
+    let jit_exc =
+        majit_metainterp::blackhole::run_forever_with_portal(builder, bh, 0, Some(&portal_runner));
 
-    // blackhole.py:1664-1677 _done_with_this_frame:
-    // RPython dispatches by _return_type (i/r/f/v).
-    use majit_metainterp::blackhole::BhReturnType;
-    let result = match bh.return_type {
-        BhReturnType::Int => {
-            // blackhole.py:1671 DoneWithThisFrameInt(get_tmpreg_i)
-            pyre_object::intobject::w_int_new(bh.get_tmpreg_i()) as PyObjectRef
+    // warmspot.py:983-997 handle_jitexception dispatch:
+    use majit_metainterp::jitexc::JitException as MJitExc;
+    match jit_exc {
+        MJitExc::DoneWithThisFrameRef(gcref) => Some(gcref.0 as PyObjectRef),
+        MJitExc::DoneWithThisFrameInt(i) => {
+            Some(pyre_object::intobject::w_int_new(i) as PyObjectRef)
         }
-        BhReturnType::Ref => {
-            // blackhole.py:1673 DoneWithThisFrameRef(get_tmpreg_r)
-            bh.get_tmpreg_r() as PyObjectRef
+        MJitExc::DoneWithThisFrameFloat(f) => {
+            Some(pyre_object::floatobject::w_float_new(f) as PyObjectRef)
         }
-        BhReturnType::Float => {
-            // blackhole.py:1675 DoneWithThisFrameFloat(get_tmpreg_f)
-            let bits = bh.get_tmpreg_f() as u64;
-            pyre_object::floatobject::w_float_new(f64::from_bits(bits)) as PyObjectRef
+        MJitExc::DoneWithThisFrameVoid => Some(std::ptr::null_mut()),
+        MJitExc::ExitFrameWithExceptionRef(_) | MJitExc::ContinueRunningNormally { .. } => {
+            // Exception or CRN at bottommost level — caller falls back
+            // to plain interpreter.
+            None
         }
-        BhReturnType::Void => std::ptr::null_mut(),
-    };
-
-    // RPython: builder.release_interp(blackholeinterp) — return to pool
-    builder.release_interp(bh);
-
-    Some(result)
+    }
 }
 
 /// jitexc.py JitException hierarchy — structural parity with RPython.
@@ -2902,16 +2901,11 @@ pub extern "C" fn bh_call_fn_8(
     )
 }
 
-/// blackhole.py bhimpl_residual_call: parent frame from BH_VABLE_PTR.
-/// RPython: bhimpl_residual_call dispatches via cpu.bh_call_*.
-/// pyre: dispatches builtin vs user function. Parent frame provides
-/// full call protocol (defaults, kw-only, varargs, generator).
-///
-/// blackhole.py:1101-1132 bhimpl_recursive_call_* parity: nested user
-/// function calls flow through `call_user_function` which honors
-/// `EVAL_OVERRIDE` (= eval_with_jit). This re-enters compiled code via
-/// the same `try_function_entry_jit` path as a top-level call, exactly
-/// equivalent to RPython `cpu.bh_call_*(portal_runner_adr, ...)`.
+/// blackhole.py:1224 bhimpl_residual_call: cpu.bh_call_r.
+/// RPython: cpu.bh_call_r (llmodel.py:816) invokes calldescr.call_stub_r
+/// directly — a plain function-pointer call, no portal_runner indirection.
+/// Only bhimpl_recursive_call_* (blackhole.py:1095) uses the portal
+/// runner to re-enter JIT.
 fn bh_call_fn_impl(callable: PyObjectRef, args: &[PyObjectRef]) -> i64 {
     if callable.is_null() {
         let err = pyre_interpreter::PyError::new(
@@ -2942,12 +2936,10 @@ fn bh_call_fn_impl(callable: PyObjectRef, args: &[PyObjectRef]) -> i64 {
         majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(err.to_exc_object() as i64));
         return 0;
     }
-    // blackhole.py:1224-1249 bhimpl_residual_call parity: residual calls
-    // in the blackhole go through cpu.bh_call_* which is a plain call, NOT
-    // through the portal runner. Only bhimpl_recursive_call_* (line 1095)
-    // uses the portal runner to re-enter JIT. call_user_function_plain
-    // uses eval_frame_plain (no EVAL_OVERRIDE/JIT re-entry), matching
-    // RPython's cpu.bh_call_* semantics for residual blackhole calls.
+    // blackhole.py:1224-1249 bhimpl_residual_call: residual calls in the
+    // blackhole go through cpu.bh_call_* which is a plain call, NOT
+    // through the portal runner. call_user_function_plain uses
+    // eval_frame_plain (no JIT re-entry), matching RPython semantics.
     let parent_frame_ptr =
         majit_metainterp::blackhole::BH_VABLE_PTR.with(|c| c.get()) as *const PyFrame;
     let parent_frame = unsafe { &*parent_frame_ptr };

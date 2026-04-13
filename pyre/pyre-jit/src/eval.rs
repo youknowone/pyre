@@ -1064,35 +1064,20 @@ pub(crate) fn pyre_portal_runner(
     }
 }
 
-/// warmspot.py:961-1007 handle_jitexception parity.
+/// warmspot.py:961-1007 handle_jitexception.
 ///
-/// warmspot.py:969-982:
-///   if isinstance(e, ContinueRunningNormally):
-///       args = extract_from_exception(e)
-///       try:
-///           result = portal_ptr(*args)
-///       except JitException as e:
-///           continue
-///       return result
-///
-/// RPython extracts args from CRN and calls portal_ptr(*args).
-/// portal_ptr IS the interpreter's dispatch() loop — equivalent to
-/// pyre's eval_loop_jit. The CRN exit path writes the extracted
-/// args back to the frame (next_instr + locals), so re-entering
-/// eval_loop_jit(frame) is structurally equivalent.
-///
-/// Note: CRN does NOT call maybe_compile_and_run (that only happens
-/// in ll_portal_runner's initial entry path). The loop header's
-/// jit_merge_point handles JIT entry during the interpreter loop.
+/// RPython: CRN → portal_ptr(*args) re-invokes the interpreter.
+/// pyre: CRN → re-loop eval_loop_jit(frame). This does NOT call
+/// maybe_compile_and_run (warmspot.py:948); portal_ptr is a plain
+/// interpreter dispatch, and pyre's eval_loop_jit is the equivalent.
+/// TODO: exact portal_ptr(*args) parity (currently `continue`
+/// re-enters without re-extracting CRN args from the exception).
 #[inline(always)]
 fn handle_jitexception(frame: &mut PyFrame) -> PyResult {
     loop {
         match eval_loop_jit(frame) {
             LoopResult::Done(result) => return result,
             LoopResult::ContinueRunningNormally => {
-                // warmspot.py:976: result = portal_ptr(*args)
-                // The frame already has the CRN args (next_instr +
-                // locals set by the CRN exit path).
                 frame.fix_array_ptrs();
                 continue;
             }
