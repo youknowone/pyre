@@ -2746,20 +2746,12 @@ impl MIFrame {
                     }
                 }
 
-                // PyPy converges self-recursion to separate functrace +
-                // call_assembler once compiled code exists. However,
-                // `_opimpl_recursive_call` still goes through `perform_call()`
-                // while tracing the current portal, and only switches to the
-                // assembler-call path after recursion is no longer being
-                // unrolled in the active trace.
-                //
-                // pyre does not yet have the full `ChangeFrame`-style
-                // self-recursive framestack needed to trace through that path
-                // safely. If we emit CALL_ASSEMBLER here for a pending
-                // self-recursive token, the backend sees a transient
-                // descriptor/input mismatch and rejects the trace. Keep
-                // self-recursion on the helper-boundary path below until the
-                // framestack implementation is complete.
+                // pyjitpl.py:1422 do_recursive_call / do_residual_call:
+                // assembler_call is already computed above. The Inline
+                // path passes it to inline_function_call which gates
+                // CALL_ASSEMBLER vs CALL_MAY_FORCE on the boolean.
+                // Non-Inline paths (pending_token, CallAssembler match)
+                // handle their own CALL_ASSEMBLER emission.
                 if majit_metainterp::majit_log_enabled() {
                     eprintln!(
                         "[jit][call-check] is_self={} cache_safe={} inline_active={} callee_key={}",
@@ -3091,22 +3083,11 @@ impl MIFrame {
                             });
                         }
                     }
-                    majit_metainterp::InlineDecision::Inline => {
-                        if let Some(frame_helper) =
-                            (crate::callbacks::get().callee_frame_helper)(nargs)
-                        {
-                            return self.inline_function_call(
-                                callable,
-                                args,
-                                concrete_callable,
-                                callee_key,
-                                frame_helper,
-                                concrete_args,
-                                assembler_call,
-                            );
-                        }
-                    }
-                    majit_metainterp::InlineDecision::ResidualCall => {}
+                    // Inline is handled at the top of the dispatch (line 2763).
+                    // If we reach here, either frame_helper was unavailable
+                    // or inline_decision changed; fall to residual below.
+                    majit_metainterp::InlineDecision::Inline
+                    | majit_metainterp::InlineDecision::ResidualCall => {}
                 }
 
                 let call_pc = self.fallthrough_pc.saturating_sub(1);
