@@ -196,7 +196,7 @@ impl PyreMetaInterp {
                 if let Some(ref has_compiled) = ctx.has_compiled_targets_fn {
                     // pyjitpl.py:2979: ptoken = self.get_procedure_token(greenboxes)
                     // greenboxes = (code, pc) for the CURRENT frame's loop header.
-                    let w_code = self.framestack[0].jitcode;
+                    let w_code = self.framestack.last().unwrap().jitcode;
                     let target_pc = match &action {
                         TraceAction::CloseLoopWithArgs {
                             loop_header_pc: Some(tp),

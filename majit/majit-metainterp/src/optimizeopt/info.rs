@@ -1827,15 +1827,10 @@ impl PtrInfo {
             PtrInfo::Instance(v) => {
                 v.preamble_fields.retain(|(k, _)| *k != field_idx);
                 v.preamble_fields.push((field_idx, pop));
-                // RPython parity: PreambleOp is stored in _fields directly,
-                // so getfield(descr) returns PreambleOp (isinstance check).
-                // Clear the regular field so _getfield falls through.
-                v.fields.retain(|(k, _)| *k != field_idx);
             }
             PtrInfo::Struct(v) => {
                 v.preamble_fields.retain(|(k, _)| *k != field_idx);
                 v.preamble_fields.push((field_idx, pop));
-                v.fields.retain(|(k, _)| *k != field_idx);
             }
             _ => {
                 // RPython: AbstractStructPtrInfo always supports _fields.
@@ -1863,9 +1858,6 @@ impl PtrInfo {
         if let PtrInfo::Array(v) = self {
             v.preamble_items.retain(|(k, _)| *k != index);
             v.preamble_items.push((index, pop));
-            if index < v.items.len() {
-                v.items[index] = OpRef::NONE;
-            }
         }
     }
 
@@ -1991,14 +1983,9 @@ impl PtrInfo {
     /// info.py: getfield(field_descr) — get a field from a virtual object.
     /// info.py:212-214 AbstractStructPtrInfo.getfield
     ///
-    /// RPython parity: if isinstance(res, PreambleOp): return None
-    /// PreambleOp entries in preamble_fields shadow regular field values
-    /// so the caller falls through to the force_op_from_preamble path.
+    /// Typed adaptation: heap import keeps PreambleOp in a side-store,
+    /// but generic field readers still need the concrete cached value.
     pub fn getfield(&self, field_idx: u32) -> Option<OpRef> {
-        // RPython: isinstance(res, PreambleOp) → return None
-        if self.has_preamble_field(field_idx) {
-            return None;
-        }
         match self {
             PtrInfo::Instance(v) => v
                 .fields
@@ -2044,9 +2031,6 @@ impl PtrInfo {
 
     /// info.py: getitem(index) — get an item from a virtual array.
     pub fn getitem(&self, index: usize) -> Option<OpRef> {
-        if self.has_preamble_item(index) {
-            return None;
-        }
         match self {
             PtrInfo::Array(v) => v.items.get(index).copied(),
             PtrInfo::VirtualArray(v) => v.items.get(index).copied(),
@@ -2992,7 +2976,7 @@ mod tests {
     }
 
     #[test]
-    fn test_preamble_item_shadows_regular_array_item() {
+    fn test_preamble_item_keeps_regular_array_item_visible() {
         let descr: DescrRef = Arc::new(TestDescr);
         let mut info = PtrInfo::array(descr, crate::optimizeopt::intutils::IntBound::nonnegative());
         info.setitem(1, OpRef(77));
@@ -3009,12 +2993,12 @@ mod tests {
         info.set_preamble_item(1, pop.clone());
 
         assert!(info.has_preamble_item(1));
-        assert_eq!(info.getitem(1), None);
+        assert_eq!(info.getitem(1), Some(OpRef(77)));
         let recovered = info
             .take_preamble_item(1)
             .expect("preamble item should be recoverable");
         assert_eq!(recovered.resolved, OpRef(99));
-        assert_eq!(info.getitem(1), Some(OpRef::NONE));
+        assert_eq!(info.getitem(1), Some(OpRef(77)));
     }
 
     #[test]
