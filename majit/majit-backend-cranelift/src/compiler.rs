@@ -8004,6 +8004,21 @@ impl CraneliftBackend {
                     if use_inline {
                         // x86/assembler.py:2556-2565 malloc_cond parity:
                         // inline nursery bump alloc for both loops and bridges.
+                        //
+                        // RPython pattern:
+                        //   inline: CMP+JA → fast: MOV(bump alloc)
+                        //   slow stub: push_gcmap, CALL trampoline
+                        //   trampoline: _push_all_regs, GC call,
+                        //               _pop_all_regs, pop_gcmap, RET
+                        //
+                        // Fast path: ZERO overhead (no spill/gcmap).
+                        // Slow path: all GC work inside CALL/RET boundary.
+                        // After RET, registers restored from jitframe.
+                        //
+                        // Cranelift equivalent: explicit block params carry
+                        // all live ref values + jf_ptr through the merge.
+                        // Fast path passes originals (no memory ops).
+                        // Slow path passes GC-updated values from jitframe.
                         let (nf_addr, nt_addr) = majit_gc::nursery::nursery_global_addrs();
                         let flags = MemFlags::trusted();
                         let size_imm = resolve_rewriter_immediate_i64(&constants, op.arg(0));
@@ -8018,10 +8033,18 @@ impl CraneliftBackend {
                                 .ins()
                                 .icmp(IntCC::UnsignedLessThanOrEqual, new_free, top);
 
-                        // _push_all_regs_to_frame parity: spill ref roots
-                        // before the branch so both paths have consistent
-                        // jf_frame contents. The fast path wastes one spill
-                        // but avoids SSA variable splits across blocks.
+                        // Collect live ref vars for block param passing.
+                        let live_refs: Vec<(u32, usize)> = ref_root_slots
+                            .iter()
+                            .filter(|(var_idx, _)| defined_ref_vars.contains(var_idx))
+                            .copied()
+                            .collect();
+
+                        // Keep jitframe up-to-date for other GC paths.
+                        // The gcmap push is required here (not just in slow
+                        // block) due to Cranelift egraph optimizer: without
+                        // this MemFlags::new() store, the optimizer
+                        // miscompiles the spill/reload pattern.
                         spill_ref_roots(
                             &mut builder,
                             jf_ptr,
@@ -8034,10 +8057,16 @@ impl CraneliftBackend {
                         let fast_block = builder.create_block();
                         let slow_block = builder.create_block();
                         let merge_block = builder.create_block();
-                        builder.append_block_param(merge_block, ptr_type); // result only
+                        // Block params: [result, jf_ptr, ref0, ref1, ...]
+                        builder.append_block_param(merge_block, ptr_type); // result
+                        builder.append_block_param(merge_block, ptr_type); // jf_ptr
+                        for _ in &live_refs {
+                            builder.append_block_param(merge_block, cl_types::I64);
+                        }
                         builder.ins().brif(fits, fast_block, &[], slow_block, &[]);
 
-                        // fast: inline bump alloc, no GC
+                        // fast: inline bump alloc, no GC — zero spill overhead
+                        // (malloc_cond: MOV [nursery_free], edx; continue)
                         builder.switch_to_block(fast_block);
                         builder.seal_block(fast_block);
                         builder.ins().store(flags, new_free, nf_ptr, 0);
@@ -8045,10 +8074,17 @@ impl CraneliftBackend {
                         builder.ins().store(MemFlags::trusted(), zero_hdr, free, 0);
                         let hdr_sz = builder.ins().iconst(ptr_type, GcHeader::SIZE as i64);
                         let obj = builder.ins().iadd(free, hdr_sz);
-                        builder.ins().jump(merge_block, &[BlockArg::from(obj)]);
+                        // Pass original values through block params
+                        let mut fast_args: Vec<BlockArg> =
+                            vec![BlockArg::from(obj), BlockArg::from(jf_ptr)];
+                        for &(var_idx, _) in &live_refs {
+                            fast_args.push(BlockArg::from(builder.use_var(var(var_idx))));
+                        }
+                        builder.ins().jump(merge_block, &fast_args);
 
-                        // slow: host call (malloc_slowpath), may trigger GC.
-                        // Refs already spilled and gcmap pushed above.
+                        // slow: MallocCondSlowPath + _build_malloc_slowpath
+                        // parity. Refs already spilled and gcmap pushed
+                        // in dominator above.
                         builder.switch_to_block(slow_block);
                         builder.seal_block(slow_block);
                         builder.set_cold_block(slow_block);
@@ -8064,24 +8100,37 @@ impl CraneliftBackend {
                             Some(cl_types::I64),
                         )
                         .expect("alloc");
-                        builder.ins().jump(merge_block, &[BlockArg::from(slow_r)]);
+                        // _build_malloc_slowpath: _reload_frame, _pop_all_regs, pop_gcmap
+                        let jf_ptr_slow =
+                            emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                        emit_pop_gcmap(&mut builder, jf_ptr_slow, per_call_gcmap);
+                        // Pass GC-updated values through block params
+                        let mut slow_args: Vec<BlockArg> =
+                            vec![BlockArg::from(slow_r), BlockArg::from(jf_ptr_slow)];
+                        for &(_var_idx, slot) in &live_refs {
+                            let offset = ref_root_base_ofs + (slot as i32) * 8;
+                            let val = builder.ins().load(
+                                cl_types::I64,
+                                MemFlags::new(),
+                                jf_ptr_slow,
+                                offset,
+                            );
+                            slow_args.push(BlockArg::from(val));
+                        }
+                        builder.ins().jump(merge_block, &slow_args);
 
-                        // _pop_all_regs_from_frame parity: reload jf_ptr,
-                        // pop gcmap, reload ref roots after merge.
+                        // merge: receive values from block params
                         builder.switch_to_block(merge_block);
                         builder.seal_block(merge_block);
-                        let result = builder.block_params(merge_block)[0];
-                        jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                        let params = builder.block_params(merge_block).to_vec();
+                        let result = params[0];
+                        jf_ptr = params[1];
                         emit_pop_gcmap(&mut builder, jf_ptr, per_call_gcmap);
-                        reload_ref_roots(
-                            &mut builder,
-                            jf_ptr,
-                            &ref_root_slots,
-                            &defined_ref_vars,
-                            ref_root_base_ofs,
-                        );
                         outputs_ptr = jf_ptr;
                         builder.def_var(jf_ptr_var, jf_ptr);
+                        for (i, &(var_idx, _)) in live_refs.iter().enumerate() {
+                            builder.def_var(var(var_idx), params[2 + i]);
+                        }
                         builder.def_var(var(vi), result);
                     } else {
                         // no GC runtime — host call fallback (test-only path)
@@ -8167,6 +8216,13 @@ impl CraneliftBackend {
                         .ins()
                         .icmp(IntCC::UnsignedLessThanOrEqual, new_free, top);
 
+                    // Same block-param pattern as CallMallocNursery.
+                    let live_refs: Vec<(u32, usize)> = ref_root_slots
+                        .iter()
+                        .filter(|(var_idx, _)| defined_ref_vars.contains(var_idx))
+                        .copied()
+                        .collect();
+
                     spill_ref_roots(
                         &mut builder,
                         jf_ptr,
@@ -8179,7 +8235,11 @@ impl CraneliftBackend {
                     let fast_block = builder.create_block();
                     let slow_block = builder.create_block();
                     let merge_block = builder.create_block();
-                    builder.append_block_param(merge_block, ptr_type); // alloc result only
+                    builder.append_block_param(merge_block, ptr_type); // result
+                    builder.append_block_param(merge_block, ptr_type); // jf_ptr
+                    for _ in &live_refs {
+                        builder.append_block_param(merge_block, cl_types::I64);
+                    }
 
                     builder.ins().brif(fits, fast_block, &[], slow_block, &[]);
 
@@ -8191,11 +8251,17 @@ impl CraneliftBackend {
                     builder.ins().store(MemFlags::trusted(), zero_hdr, free, 0);
                     let header_size = builder.ins().iconst(ptr_type, GcHeader::SIZE as i64);
                     let obj_ptr = builder.ins().iadd(free, header_size);
-                    builder.ins().jump(merge_block, &[BlockArg::from(obj_ptr)]);
+                    let mut fast_args: Vec<BlockArg> =
+                        vec![BlockArg::from(obj_ptr), BlockArg::from(jf_ptr)];
+                    for &(var_idx, _) in &live_refs {
+                        fast_args.push(BlockArg::from(builder.use_var(var(var_idx))));
+                    }
+                    builder.ins().jump(merge_block, &fast_args);
 
                     // slow: host call (malloc_slowpath), may trigger GC.
                     builder.switch_to_block(slow_block);
                     builder.seal_block(slow_block);
+                    builder.set_cold_block(slow_block);
                     let runtime_id = gc_runtime_id.ok_or_else(|| missing_gc_runtime(op.opcode))?;
                     let runtime_id_val = builder.ins().iconst(cl_types::I64, runtime_id as i64);
                     let size = builder.ins().iadd_imm(size_total, -(GcHeader::SIZE as i64));
@@ -8208,24 +8274,32 @@ impl CraneliftBackend {
                         Some(cl_types::I64),
                     )
                     .expect("GC frame allocation helper must return a value");
-                    builder
-                        .ins()
-                        .jump(merge_block, &[BlockArg::from(slow_result)]);
+                    let jf_ptr_slow =
+                        emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                    emit_pop_gcmap(&mut builder, jf_ptr_slow, per_call_gcmap);
+                    let mut slow_args: Vec<BlockArg> =
+                        vec![BlockArg::from(slow_result), BlockArg::from(jf_ptr_slow)];
+                    for &(_var_idx, slot) in &live_refs {
+                        let offset = ref_root_base_ofs + (slot as i32) * 8;
+                        let val =
+                            builder
+                                .ins()
+                                .load(cl_types::I64, MemFlags::new(), jf_ptr_slow, offset);
+                        slow_args.push(BlockArg::from(val));
+                    }
+                    builder.ins().jump(merge_block, &slow_args);
 
                     builder.switch_to_block(merge_block);
                     builder.seal_block(merge_block);
-                    let result = builder.block_params(merge_block)[0];
-                    jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                    let params = builder.block_params(merge_block).to_vec();
+                    let result = params[0];
+                    jf_ptr = params[1];
                     emit_pop_gcmap(&mut builder, jf_ptr, per_call_gcmap);
-                    reload_ref_roots(
-                        &mut builder,
-                        jf_ptr,
-                        &ref_root_slots,
-                        &defined_ref_vars,
-                        ref_root_base_ofs,
-                    );
                     outputs_ptr = jf_ptr;
                     builder.def_var(jf_ptr_var, jf_ptr);
+                    for (i, &(var_idx, _)) in live_refs.iter().enumerate() {
+                        builder.def_var(var(var_idx), params[2 + i]);
+                    }
                     builder.def_var(var(vi), result);
                 }
 
