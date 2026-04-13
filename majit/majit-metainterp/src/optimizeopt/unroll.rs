@@ -2124,10 +2124,10 @@ impl OptUnroll {
             }
             Some(crate::optimizeopt::info::PtrInfo::VirtualArray(v)) => v.items.clone(),
             Some(crate::optimizeopt::info::PtrInfo::Instance(v)) if !v.fields.is_empty() => {
-                v.fields.iter().filter_map(|(_, e)| e.as_opref()).collect()
+                v.fields.iter().map(|(_, e)| e.as_seen_opref()).collect()
             }
             Some(crate::optimizeopt::info::PtrInfo::Struct(v)) if !v.fields.is_empty() => {
-                v.fields.iter().filter_map(|(_, e)| e.as_opref()).collect()
+                v.fields.iter().map(|(_, e)| e.as_seen_opref()).collect()
             }
             _ => return,
         };

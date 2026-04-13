@@ -133,54 +133,45 @@ impl CachedField {
 
     /// heap.py:177-187 CachedField._getfield(opinfo, descr, optheap, true_force=True)
     ///
-    /// Takes `descr` so the constant-base path routes through
-    /// `ConstPtrInfo._get_info(parent_descr, optheap)` (info.py:738 →
-    /// info.py:715-726) which creates `StructPtrInfo(parent_descr)` on miss.
+    /// Returns the raw FieldEntry from _fields — caller checks Preamble vs Value.
+    /// RPython: `res = opinfo.getfield(descr, optheap)`
+    ///          `if isinstance(res, PreambleOp): ...`
     fn _getfield(
         &self,
         struct_opref: OpRef,
         descr: &DescrRef,
         ctx: &mut OptContext,
-    ) -> Option<OpRef> {
+    ) -> Option<crate::optimizeopt::info::FieldEntry> {
         let descr_idx = descr.index();
-        // info.py:212-214 AbstractStructPtrInfo.getfield
-        // RPython: return self._fields[fielddescr.get_index()]
-        // Returns whatever is stored — None if no entry or if cleared by
-        // set_preamble_field. The caller (heap.py:177-187 _getfield) then
-        // checks isinstance(res, PreambleOp) via take_preamble_field.
+        // info.py:212-214: return self._fields[fielddescr.get_index()]
         if let Some(info) = ctx.get_ptr_info(struct_opref) {
             if let Some(entry) = info.getfield(descr_idx) {
-                if let Some(value) = entry.as_opref() {
-                    if !value.is_none() {
-                        return Some(value);
-                    }
-                }
+                return Some(entry);
             }
         }
         // info.py:738-743 ConstPtrInfo.getfield → _get_info(parent_descr, optheap)
         let parent_descr = descr.as_field_descr().and_then(|fd| fd.get_parent_descr());
         if let Some(info) = ctx.get_const_info_mut(struct_opref, parent_descr) {
             if let Some(entry) = info.getfield(descr_idx) {
-                if let Some(value) = entry.as_opref() {
-                    if !value.is_none() {
-                        return Some(value);
-                    }
-                }
+                return Some(entry);
             }
         }
         None
     }
 
     /// heap.py:103-120 AbstractCachedEntry.getfield_from_cache
+    /// heap.py:103-120 AbstractCachedEntry.getfield_from_cache
     fn getfield_from_cache(
         &self,
         struct_opref: OpRef,
         descr: &DescrRef,
         ctx: &mut OptContext,
-    ) -> Option<OpRef> {
+    ) -> Option<crate::optimizeopt::info::FieldEntry> {
         if let Some((lazy_obj, lazy_op)) = &self.lazy_set {
             if *lazy_obj == struct_opref {
-                return Some(Self::_get_rhs_from_set_op(lazy_op));
+                return Some(crate::optimizeopt::info::FieldEntry::Value(
+                    Self::_get_rhs_from_set_op(lazy_op),
+                ));
             }
         }
         self._getfield(struct_opref, descr, ctx)
@@ -216,15 +207,19 @@ impl CachedField {
         // heap.py:217-225: shared field with two different constants
         // → CANNOT_ALIAS. RPython iterates positionally; the Rust port
         // matches by field_idx (equivalent for the same descriptor layout).
-        for &(idx1, v1) in &f1 {
-            for &(idx2, v2) in &f2 {
+        for (idx1, e1) in &f1 {
+            for (idx2, e2) in &f2 {
                 if idx1 != idx2 {
                     continue;
                 }
-                let v1r = ctx.get_box_replacement(v1);
-                let v2r = ctx.get_box_replacement(v2);
-                if ctx.is_constant(v1r) && ctx.is_constant(v2r) && v1r != v2r {
-                    return true;
+                // Only compare concrete values; Preamble entries have no
+                // known constant value.
+                if let (Some(v1), Some(v2)) = (e1.as_opref(), e2.as_opref()) {
+                    let v1r = ctx.get_box_replacement(v1);
+                    let v2r = ctx.get_box_replacement(v2);
+                    if ctx.is_constant(v1r) && ctx.is_constant(v2r) && v1r != v2r {
+                        return true;
+                    }
                 }
             }
         }
@@ -287,7 +282,16 @@ impl CachedField {
             if structbox.is_none() {
                 continue;
             }
-            let cached_val = match self._getfield(structbox, descr, ctx) {
+            let cached_val = match ctx
+                .get_ptr_info(structbox)
+                .and_then(|info| info.getfield(descr_idx))
+                .map(|entry| entry.as_seen_opref())
+                .or_else(|| {
+                    let parent_descr = descr.as_field_descr().and_then(|fd| fd.get_parent_descr());
+                    ctx.get_const_info_mut(structbox, parent_descr)
+                        .and_then(|info| info.getfield(descr_idx))
+                        .map(|entry| entry.as_seen_opref())
+                }) {
                 Some(v) if !v.is_none() => v,
                 _ => continue,
             };
@@ -409,34 +413,26 @@ impl ArrayCachedItem {
     /// Takes `descr` so the constant-base path can route through
     /// `ConstPtrInfo._get_array_info(descr, optheap)` (info.py:728-735)
     /// which creates an `ArrayPtrInfo` on miss.
+    /// heap.py:238-250 ArrayCachedItem._getfield — returns raw FieldEntry.
     fn _getfield(
         &self,
         array_opref: OpRef,
         descr: &DescrRef,
         ctx: &mut OptContext,
-    ) -> Option<OpRef> {
-        // info.py: ArrayPtrInfo.getitem(descr, self.index, optheap)
+    ) -> Option<crate::optimizeopt::info::FieldEntry> {
         if self.index < 0 {
             return None;
         }
         let idx = self.index as usize;
         if let Some(info) = ctx.get_ptr_info(array_opref) {
             if let Some(entry) = info.getitem(idx) {
-                if let Some(value) = entry.as_opref() {
-                    if !value.is_none() {
-                        return Some(value);
-                    }
-                }
+                return Some(entry);
             }
         }
         // info.py:746-748 ConstPtrInfo.getitem → _get_array_info(descr, optheap)
         if let Some(info) = ctx.get_const_info_array_mut(array_opref, descr.clone()) {
             if let Some(entry) = info.getitem(idx) {
-                if let Some(value) = entry.as_opref() {
-                    if !value.is_none() {
-                        return Some(value);
-                    }
-                }
+                return Some(entry);
             }
         }
         None
@@ -448,10 +444,12 @@ impl ArrayCachedItem {
         array_opref: OpRef,
         descr: &DescrRef,
         ctx: &mut OptContext,
-    ) -> Option<OpRef> {
+    ) -> Option<crate::optimizeopt::info::FieldEntry> {
         if let Some((lazy_obj, lazy_op)) = &self.lazy_set {
             if *lazy_obj == array_opref {
-                return Some(Self::_get_rhs_from_set_op(lazy_op));
+                return Some(crate::optimizeopt::info::FieldEntry::Value(
+                    Self::_get_rhs_from_set_op(lazy_op),
+                ));
             }
         }
         self._getfield(array_opref, descr, ctx)
@@ -478,7 +476,15 @@ impl ArrayCachedItem {
             if arraybox.is_none() {
                 continue;
             }
-            let cached_val = match self._getfield(arraybox, descr, ctx) {
+            let cached_val = match ctx
+                .get_ptr_info(arraybox)
+                .and_then(|info| info.getitem(self.index as usize))
+                .map(|entry| entry.as_seen_opref())
+                .or_else(|| {
+                    ctx.get_const_info_array_mut(arraybox, descr.clone())
+                        .and_then(|info| info.getitem(self.index as usize))
+                        .map(|entry| entry.as_seen_opref())
+                }) {
                 Some(v) if !v.is_none() => v,
                 _ => continue,
             };
@@ -1639,10 +1645,27 @@ impl OptHeap {
             // heap.py:117-120: always check cache entries after alias analysis.
             // RPython falls through here even when lazy_set exists (CANNOT_ALIAS).
             if !force_lazy {
-                if let Some(cached) = cf._getfield(obj, op.descr.as_ref().unwrap(), ctx) {
-                    let cached = ctx.get_box_replacement(cached);
-                    ctx.replace_op(op.pos, cached);
-                    return OptimizationResult::Remove;
+                if let Some(entry) = cf._getfield(obj, op.descr.as_ref().unwrap(), ctx) {
+                    // heap.py:182-186: isinstance(res, PreambleOp)
+                    match entry {
+                        crate::optimizeopt::info::FieldEntry::Preamble(pop) => {
+                            // heap.py:185-186: force_op_from_preamble, setfield
+                            let cached = pop.resolved;
+                            ctx.force_op_from_preamble_op(&pop);
+                            ctx.structinfo_setfield(op, field_idx, cached);
+                            self.field_cache(field_idx).register_info(obj);
+                            let cached = ctx.get_box_replacement(cached);
+                            ctx.replace_op(op.pos, cached);
+                            return OptimizationResult::Remove;
+                        }
+                        crate::optimizeopt::info::FieldEntry::Value(cached) => {
+                            if !cached.is_none() {
+                                let cached = ctx.get_box_replacement(cached);
+                                ctx.replace_op(op.pos, cached);
+                                return OptimizationResult::Remove;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1685,51 +1708,9 @@ impl OptHeap {
         // Virtualizable fields are loop-variant; skip caching/import.
         let is_vable_field = op.descr.as_ref().map_or(false, |d| d.is_virtualizable());
 
-        // heap.py:177-187: CachedField._getfield — PreambleOp detection.
-        //   res = opinfo.getfield(descr, optheap)
-        //   if isinstance(res, PreambleOp):
-        //       res = optheap.optimizer.force_op_from_preamble(res)
-        //       opinfo.setfield(descr, None, res, optheap=optheap)
-        //   return res
-        if !is_vable_field {
-            // heap.py:177-187: CachedField._getfield — PreambleOp detection.
-            // info.py:716: ConstPtrInfo._get_info delegates to const_infos.
-            // heap.py:177-187: CachedField._getfield PreambleOp detection.
-            let pop = ctx
-                .get_ptr_info_mut(obj)
-                .and_then(|info| info.take_preamble_field(field_idx))
-                .or_else(|| {
-                    let pd = op
-                        .descr
-                        .as_ref()
-                        .and_then(|d| d.as_field_descr())
-                        .and_then(|fd| fd.get_parent_descr());
-                    ctx.get_const_info_mut(obj, pd)
-                        .and_then(|info| info.take_preamble_field(field_idx))
-                });
-            if let Some(pop) = pop {
-                let cached = pop.resolved;
-                // heap.py:185-186: force_op_from_preamble(res)
-                ctx.force_op_from_preamble_op(&pop);
-                let d = op.descr.clone();
-                let is_immutable = d.as_ref().map_or(false, |dd| dd.is_always_pure());
-                if is_immutable {
-                    vb_set(&mut self.immutable_field_descrs, key.1);
-                    self.immutable_cached_fields.insert(key, cached);
-                }
-                if self
-                    .field_cache(field_idx)
-                    ._getfield(obj, op.descr.as_ref().unwrap(), ctx)
-                    .is_none()
-                {
-                    self.field_cache(field_idx).register_info(obj);
-                    // info.py: opinfo.setfield(...) — keep PtrInfo in sync
-                    // with the cached entry so subsequent reads via
-                    // read_field_via_info pick up the imported value.
-                    ctx.structinfo_setfield(op, field_idx, cached);
-                }
-            }
-        }
+        // RPython parity: PreambleOp detection is now inline in _getfield →
+        // FieldEntry::Preamble (heap.py:182-186). The getfield_from_cache path
+        // above handles both Value and Preamble entries uniformly.
 
         // Check immutable field cache first — these survive all invalidation.
         if let Some(&cached) = self.immutable_cached_fields.get(&key) {
@@ -1740,10 +1721,25 @@ impl OptHeap {
 
         // Check read cache (after import).
         if let Some(cf) = self.cached_fields.get(&field_idx) {
-            if let Some(cached) = cf._getfield(obj, op.descr.as_ref().unwrap(), ctx) {
-                let cached = ctx.get_box_replacement(cached);
-                ctx.replace_op(op.pos, cached);
-                return OptimizationResult::Remove;
+            if let Some(entry) = cf._getfield(obj, op.descr.as_ref().unwrap(), ctx) {
+                match entry {
+                    crate::optimizeopt::info::FieldEntry::Preamble(pop) => {
+                        let cached = pop.resolved;
+                        ctx.force_op_from_preamble_op(&pop);
+                        ctx.structinfo_setfield(op, field_idx, cached);
+                        self.field_cache(field_idx).register_info(obj);
+                        let cached = ctx.get_box_replacement(cached);
+                        ctx.replace_op(op.pos, cached);
+                        return OptimizationResult::Remove;
+                    }
+                    crate::optimizeopt::info::FieldEntry::Value(cached) => {
+                        if !cached.is_none() {
+                            let cached = ctx.get_box_replacement(cached);
+                            ctx.replace_op(op.pos, cached);
+                            return OptimizationResult::Remove;
+                        }
+                    }
+                }
             }
         }
 
@@ -1858,10 +1854,24 @@ impl OptHeap {
                 if *lazy_obj == obj && lazy_op.arg(1) == new_value {
                     return OptimizationResult::Remove;
                 }
-            } else if let Some(cached) = cf._getfield(obj, op.descr.as_ref().unwrap(), ctx) {
-                let cached_resolved = ctx.get_box_replacement(cached);
-                if cached_resolved == new_value {
-                    return OptimizationResult::Remove;
+            } else if let Some(entry) = cf._getfield(obj, op.descr.as_ref().unwrap(), ctx) {
+                match entry {
+                    crate::optimizeopt::info::FieldEntry::Preamble(pop) => {
+                        let cached_seen = ctx.get_box_replacement(pop.op);
+                        if cached_seen == new_value {
+                            let cached = pop.resolved;
+                            ctx.force_op_from_preamble_op(&pop);
+                            ctx.structinfo_setfield(op, field_idx, cached);
+                            self.field_cache(field_idx).register_info(obj);
+                            return OptimizationResult::Remove;
+                        }
+                    }
+                    crate::optimizeopt::info::FieldEntry::Value(cached) => {
+                        let cached_resolved = ctx.get_box_replacement(cached);
+                        if cached_resolved == new_value {
+                            return OptimizationResult::Remove;
+                        }
+                    }
                 }
             }
         }
@@ -1910,14 +1920,29 @@ impl OptHeap {
 
         // heap.py:84-101: after force, recheck cached value
         {
-            let cached_value = self
-                .field_cache(field_idx)
-                ._getfield(obj, op.descr.as_ref().unwrap(), ctx)
-                .map(|c| ctx.get_box_replacement(c));
-            if let Some(cached_resolved) = cached_value {
-                if cached_resolved == new_value {
-                    self.field_cache(field_idx).lazy_set = None;
-                    return OptimizationResult::Remove;
+            if let Some(entry) =
+                self.field_cache(field_idx)
+                    ._getfield(obj, op.descr.as_ref().unwrap(), ctx)
+            {
+                match entry {
+                    crate::optimizeopt::info::FieldEntry::Preamble(pop) => {
+                        let cached_seen = ctx.get_box_replacement(pop.op);
+                        if cached_seen == new_value {
+                            let cached = pop.resolved;
+                            ctx.force_op_from_preamble_op(&pop);
+                            ctx.structinfo_setfield(op, field_idx, cached);
+                            self.field_cache(field_idx).register_info(obj);
+                            self.field_cache(field_idx).lazy_set = None;
+                            return OptimizationResult::Remove;
+                        }
+                    }
+                    crate::optimizeopt::info::FieldEntry::Value(cached) => {
+                        let cached_resolved = ctx.get_box_replacement(cached);
+                        if cached_resolved == new_value {
+                            self.field_cache(field_idx).lazy_set = None;
+                            return OptimizationResult::Remove;
+                        }
+                    }
                 }
             }
         }
@@ -1987,10 +2012,26 @@ impl OptHeap {
                     // CANNOT_ALIAS: fall through to _getfield
                 }
                 if !force_lazy_arr {
-                    if let Some(cached) = cai._getfield(array, op.descr.as_ref().unwrap(), ctx) {
-                        let cached = ctx.get_box_replacement(cached);
-                        ctx.replace_op(op.pos, cached);
-                        return OptimizationResult::Remove;
+                    if let Some(entry) = cai._getfield(array, op.descr.as_ref().unwrap(), ctx) {
+                        match entry {
+                            crate::optimizeopt::info::FieldEntry::Preamble(pop) => {
+                                let cached = pop.resolved;
+                                ctx.force_op_from_preamble_op(&pop);
+                                self.arrayitem_cache(descr_idx, const_index)
+                                    .register_info(array);
+                                ctx.arrayinfo_setitem(op, const_index as usize, cached);
+                                let cached = ctx.get_box_replacement(cached);
+                                ctx.replace_op(op.pos, cached);
+                                return OptimizationResult::Remove;
+                            }
+                            crate::optimizeopt::info::FieldEntry::Value(cached) => {
+                                if !cached.is_none() {
+                                    let cached = ctx.get_box_replacement(cached);
+                                    ctx.replace_op(op.pos, cached);
+                                    return OptimizationResult::Remove;
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -2048,10 +2089,26 @@ impl OptHeap {
                 .get(&descr_idx)
                 .and_then(|s| s.const_indexes.get(&const_index))
             {
-                if let Some(cached) = cai._getfield(array, op.descr.as_ref().unwrap(), ctx) {
-                    let cached = ctx.get_box_replacement(cached);
-                    ctx.replace_op(op.pos, cached);
-                    return OptimizationResult::Remove;
+                if let Some(entry) = cai._getfield(array, op.descr.as_ref().unwrap(), ctx) {
+                    match entry {
+                        crate::optimizeopt::info::FieldEntry::Preamble(pop) => {
+                            let cached = pop.resolved;
+                            ctx.force_op_from_preamble_op(&pop);
+                            self.arrayitem_cache(descr_idx, const_index)
+                                .register_info(array);
+                            ctx.arrayinfo_setitem(op, const_index as usize, cached);
+                            let cached = ctx.get_box_replacement(cached);
+                            ctx.replace_op(op.pos, cached);
+                            return OptimizationResult::Remove;
+                        }
+                        crate::optimizeopt::info::FieldEntry::Value(cached) => {
+                            if !cached.is_none() {
+                                let cached = ctx.get_box_replacement(cached);
+                                ctx.replace_op(op.pos, cached);
+                                return OptimizationResult::Remove;
+                            }
+                        }
+                    }
                 }
             }
             self.cache_arrayitem(array, descr_idx, const_index, op.descr.as_ref());
@@ -2164,10 +2221,25 @@ impl OptHeap {
                 if *lazy_obj == array && lazy_op.arg(2) == new_value {
                     return OptimizationResult::Remove;
                 }
-            } else if let Some(cached) = cai._getfield(array, op.descr.as_ref().unwrap(), ctx) {
-                let cached = ctx.get_box_replacement(cached);
-                if cached == new_value {
-                    return OptimizationResult::Remove;
+            } else if let Some(entry) = cai._getfield(array, op.descr.as_ref().unwrap(), ctx) {
+                match entry {
+                    crate::optimizeopt::info::FieldEntry::Preamble(pop) => {
+                        let cached_seen = ctx.get_box_replacement(pop.op);
+                        if cached_seen == new_value {
+                            let cached = pop.resolved;
+                            ctx.force_op_from_preamble_op(&pop);
+                            self.arrayitem_cache(descr_idx, const_index)
+                                .register_info(array);
+                            ctx.arrayinfo_setitem(op, const_index as usize, cached);
+                            return OptimizationResult::Remove;
+                        }
+                    }
+                    crate::optimizeopt::info::FieldEntry::Value(cached) => {
+                        let cached = ctx.get_box_replacement(cached);
+                        if cached == new_value {
+                            return OptimizationResult::Remove;
+                        }
+                    }
                 }
             }
         }
@@ -2209,14 +2281,30 @@ impl OptHeap {
         // heap.py:84-101: recheck after force
         {
             let arr_descr = op.descr.as_ref().unwrap();
-            let cached_value = self
+            if let Some(entry) = self
                 .arrayitem_cache(descr_idx, const_index)
                 ._getfield(array, arr_descr, ctx)
-                .map(|c| ctx.get_box_replacement(c));
-            if let Some(cached_resolved) = cached_value {
-                if cached_resolved == new_value {
-                    self.arrayitem_cache(descr_idx, const_index).lazy_set = None;
-                    return OptimizationResult::Remove;
+            {
+                match entry {
+                    crate::optimizeopt::info::FieldEntry::Preamble(pop) => {
+                        let cached_seen = ctx.get_box_replacement(pop.op);
+                        if cached_seen == new_value {
+                            let cached = pop.resolved;
+                            ctx.force_op_from_preamble_op(&pop);
+                            self.arrayitem_cache(descr_idx, const_index)
+                                .register_info(array);
+                            ctx.arrayinfo_setitem(op, const_index as usize, cached);
+                            self.arrayitem_cache(descr_idx, const_index).lazy_set = None;
+                            return OptimizationResult::Remove;
+                        }
+                    }
+                    crate::optimizeopt::info::FieldEntry::Value(cached) => {
+                        let cached_resolved = ctx.get_box_replacement(cached);
+                        if cached_resolved == new_value {
+                            self.arrayitem_cache(descr_idx, const_index).lazy_set = None;
+                            return OptimizationResult::Remove;
+                        }
+                    }
                 }
             }
         }
@@ -2943,7 +3031,16 @@ impl Optimization for OptHeap {
                 // heap.py:838-839: structinfo = cf.cached_infos[i]
                 //                  box2 = structinfo.getfield(descr)
                 let resolved = ctx.get_box_replacement(obj);
-                let Some(val) = cf._getfield(resolved, &descr, ctx) else {
+                let Some(val) = ctx
+                    .get_ptr_info(resolved)
+                    .and_then(|info| info.getfield(field_idx))
+                    .map(|entry| entry.as_seen_opref())
+                    .or_else(|| {
+                        ctx.get_const_info_mut(resolved, parent.clone())
+                            .and_then(|info| info.getfield(field_idx))
+                            .map(|entry| entry.as_seen_opref())
+                    })
+                else {
                     continue;
                 };
                 if !val.is_none() {
@@ -3031,7 +3128,16 @@ impl Optimization for OptHeap {
                     }
                     let resolved = ctx.get_box_replacement(obj);
                     // heap.py:860: box2 = arrayinfo.getitem(descr, index)
-                    let Some(val) = cai._getfield(resolved, &descr, ctx) else {
+                    let Some(val) = ctx
+                        .get_ptr_info(resolved)
+                        .and_then(|info| info.getitem(index as usize))
+                        .map(|entry| entry.as_seen_opref())
+                        .or_else(|| {
+                            ctx.get_const_info_array_mut(resolved, descr.clone())
+                                .and_then(|info| info.getitem(index as usize))
+                                .map(|entry| entry.as_seen_opref())
+                        })
+                    else {
                         continue;
                     };
                     if !val.is_none() {

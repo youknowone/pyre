@@ -107,6 +107,20 @@ impl FieldEntry {
         }
     }
 
+    /// View this slot the same way RPython reads `_fields[]` / `_items[]`
+    /// in non-forcing paths such as `serialize_optheap`,
+    /// `produce_short_preamble_ops`, and `_expand_infos_from_virtual`.
+    ///
+    /// Normal values return the stored OpRef. `PreambleOp` entries expose
+    /// their original Phase 1 source box (`pop.op`), matching PyPy's
+    /// `get_box_replacement(PreambleOp(...))` behavior.
+    pub fn as_seen_opref(&self) -> OpRef {
+        match self {
+            FieldEntry::Value(opref) => *opref,
+            FieldEntry::Preamble(pop) => pop.op,
+        }
+    }
+
     /// Consume and extract the `PreambleOp` if this is a `Preamble` entry.
     pub fn into_preamble(self) -> Option<PreambleOp> {
         match self {
@@ -2030,21 +2044,25 @@ impl PtrInfo {
 
     /// info.py: all_items() — return all cached field entries as (idx, OpRef).
     /// heap.py:211,214: opinfo.all_items() used by _cannot_alias_via_content.
-    /// For Instance/Struct, extracts Value entries (skips Preamble).
-    pub fn all_items(&self) -> Vec<(u32, OpRef)> {
+    /// For Instance/Struct, preserve inline `PreambleOp` entries by exposing
+    /// their source box identity (`pop.op`), which is what PyPy sees when it
+    /// iterates `_fields[]` / `_items[]`.
+    /// info.py:200-201: all_items — returns _fields directly.
+    /// RPython: includes PreambleOp entries alongside normal values.
+    pub fn all_items(&self) -> Vec<(u32, FieldEntry)> {
         match self {
-            PtrInfo::Instance(v) => v
+            PtrInfo::Instance(v) => v.fields.clone(),
+            PtrInfo::Struct(v) => v.fields.clone(),
+            PtrInfo::Virtual(v) => v
                 .fields
                 .iter()
-                .filter_map(|(k, e)| e.as_opref().map(|r| (*k, r)))
+                .map(|(k, v)| (*k, FieldEntry::Value(*v)))
                 .collect(),
-            PtrInfo::Struct(v) => v
+            PtrInfo::VirtualStruct(v) => v
                 .fields
                 .iter()
-                .filter_map(|(k, e)| e.as_opref().map(|r| (*k, r)))
+                .map(|(k, v)| (*k, FieldEntry::Value(*v)))
                 .collect(),
-            PtrInfo::Virtual(v) => v.fields.clone(),
-            PtrInfo::VirtualStruct(v) => v.fields.clone(),
             _ => Vec::new(),
         }
     }
@@ -3070,6 +3088,26 @@ mod tests {
             info.getitem(1).and_then(|e| e.as_opref()),
             Some(OpRef::NONE)
         );
+    }
+
+    #[test]
+    fn test_all_items_exposes_preamble_source_box() {
+        let descr: DescrRef = Arc::new(TestDescr);
+        let mut info = PtrInfo::instance(Some(descr), None);
+        let replay = Op::new(OpCode::GetfieldGcI, &[OpRef(10)]);
+        let pop = PreambleOp {
+            op: OpRef(88),
+            resolved: OpRef(99),
+            invented_name: false,
+            preamble_op: replay,
+        };
+        info.set_preamble_field(3, pop);
+
+        // all_items includes Preamble entries (RPython parity: _fields returns raw)
+        let items = info.all_items();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].0, 3);
+        assert!(items[0].1.is_preamble());
     }
 
     #[test]
