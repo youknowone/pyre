@@ -178,6 +178,14 @@ pub fn init(ns: &mut PyNamespace) {
     );
     namespace_store(
         ns,
+        "truth",
+        make_builtin_function("truth", |args| {
+            assert!(args.len() == 1);
+            Ok(w_bool_from(crate::baseobjspace::is_true(args[0])))
+        }),
+    );
+    namespace_store(
+        ns,
         "is_",
         make_builtin_function("is_", |args| {
             assert!(args.len() == 2);

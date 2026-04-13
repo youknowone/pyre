@@ -1256,16 +1256,15 @@ pub(crate) fn builtin_int(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     }
     let obj = args[0];
     unsafe {
-        // int(int_value) → return as-is. base argument is meaningful only
-        // for string conversion; ignore it for int/float/bool inputs.
+        // int(bool) → int (not bool); int(int) → return as-is.
+        if is_bool(obj) {
+            return Ok(w_int_new(if w_bool_get_value(obj) { 1 } else { 0 }));
+        }
         if is_int(obj) {
             return Ok(obj);
         }
         if is_float(obj) {
             return Ok(w_int_new(floatobject::w_float_get_value(obj) as i64));
-        }
-        if is_bool(obj) {
-            return Ok(w_int_new(if w_bool_get_value(obj) { 1 } else { 0 }));
         }
         // int(string, base) — parse string in given base.
         let base: u32 = if args.len() > 1 && is_int(args[1]) {

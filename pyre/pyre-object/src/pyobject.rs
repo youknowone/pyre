@@ -304,7 +304,7 @@ pub unsafe fn py_type_check(obj: PyObjectRef, tp: &PyType) -> bool {
 
 #[inline]
 pub unsafe fn is_int(obj: PyObjectRef) -> bool {
-    unsafe { py_type_check(obj, &INT_TYPE) }
+    unsafe { py_type_check(obj, &INT_TYPE) || py_type_check(obj, &BOOL_TYPE) }
 }
 
 #[inline]
