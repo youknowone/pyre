@@ -2622,12 +2622,20 @@ impl<S: JitState> JitDriver<S> {
         // pyjitpl.py:2890 parity: bridge traces start at resume_pc, not at
         // function entry (pc=0). Set header_pc so init_symbolic correctly
         // detects this is NOT a function-entry trace.
-        // pyjitpl.py:2970-2975 reached_loop_header parity:
-        // Collect compiled keys BEFORE borrowing ctx mutably.
-        let compiled_keys = self.meta.compiled_green_keys();
+        // pyjitpl.py:2979 reached_loop_header parity:
+        // Set live lookup callback for has_compiled_targets(greenkey).
+        // RPython: ptoken = self.get_procedure_token(greenboxes)
+        //          if has_compiled_targets(ptoken): ...
+        // Use a raw pointer to self.meta for the callback — safe because
+        // bridge tracing runs synchronously within start_bridge_tracing's
+        // caller scope, so self.meta outlives the callback.
+        let meta_ptr = &self.meta as *const _ as *const ();
         if let Some(ref mut ctx) = self.meta.tracing {
             ctx.header_pc = resume_pc;
-            ctx.compiled_green_keys = Some(compiled_keys);
+            ctx.has_compiled_targets_fn = Some(Box::new(move |gk: u64| -> bool {
+                let meta = unsafe { &*(meta_ptr as *const crate::pyjitpl::MetaInterp<S::Meta>) };
+                meta.has_compiled_targets(gk)
+            }));
         }
         // resume.py:1042 parity: map frame locals to bridge InputArg OpRefs
         // so bridge tracing sees locals as symbolic variables, not concrete values.

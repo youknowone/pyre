@@ -3375,18 +3375,14 @@ impl OptUnroll {
                     if let Some(info) = ctx.get_const_info_mut(obj_resolved, parent_descr) {
                         info.set_preamble_field(descr_idx, pop.clone());
                     }
+                    // shortpreamble.py:72-74:
+                    //   opinfo = opt.optimizer.ensure_ptr_info_arg0(g)
+                    //   pop = PreambleOp(self.res, preamble_op, invented_name)
+                    //   assert not opinfo.is_virtual()
+                    //   opinfo.setfield(descr, struct, pop, optheap, cf)
                     let mut struct_info = ctx.ensure_ptr_info_arg0(&getfield_op);
                     if let Some(info) = struct_info.as_mut() {
-                        info.set_preamble_field(descr_idx, pop.clone());
-                    }
-                    // RPython parity: in RPython, PreambleOp is stored in
-                    // _fields which is accessed via the forwarded Box identity.
-                    // In majit, forwarding chains may skip the LABEL arg where
-                    // ensure_ptr_info_arg0 stored the PreambleOp. Also store on
-                    // the original un-replaced `obj` slot so body getfield ops
-                    // that resolve to `obj` (before replacement) find it.
-                    if obj != obj_resolved {
-                        if let Some(info) = ctx.get_ptr_info_mut(obj) {
+                        if !info.is_virtual() {
                             info.set_preamble_field(descr_idx, pop.clone());
                         }
                     }

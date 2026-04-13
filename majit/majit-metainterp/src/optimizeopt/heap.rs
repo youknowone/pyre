@@ -144,15 +144,11 @@ impl CachedField {
     ) -> Option<OpRef> {
         let descr_idx = descr.index();
         // info.py:212-214 AbstractStructPtrInfo.getfield
-        //
-        // RPython parity: if preamble_fields has this field, return None
-        // so optimize_getfield falls through to the PreambleOp path
-        // (heap.py:177-187). RPython stores PreambleOp in _fields directly
-        // and getfield returns None when isinstance(res, PreambleOp).
+        // RPython: return self._fields[fielddescr.get_index()]
+        // Returns whatever is stored — None if no entry or if cleared by
+        // set_preamble_field. The caller (heap.py:177-187 _getfield) then
+        // checks isinstance(res, PreambleOp) via take_preamble_field.
         if let Some(info) = ctx.get_ptr_info(struct_opref) {
-            if info.has_preamble_field(descr_idx) {
-                return None;
-            }
             if let Some(value) = info.getfield(descr_idx) {
                 if !value.is_none() {
                     return Some(value);
@@ -162,9 +158,6 @@ impl CachedField {
         // info.py:738-743 ConstPtrInfo.getfield → _get_info(parent_descr, optheap)
         let parent_descr = descr.as_field_descr().and_then(|fd| fd.get_parent_descr());
         if let Some(info) = ctx.get_const_info_mut(struct_opref, parent_descr) {
-            if info.has_preamble_field(descr_idx) {
-                return None;
-            }
             if let Some(value) = info.getfield(descr_idx) {
                 if !value.is_none() {
                     return Some(value);

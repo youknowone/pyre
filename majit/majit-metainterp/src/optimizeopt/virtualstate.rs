@@ -2372,7 +2372,6 @@ mod tests {
                 descr,
                 fields: vec![],
                 field_descrs: Vec::new(),
-                preamble_fields: Vec::new(),
                 last_guard_pos: -1,
             }),
         );
@@ -2408,7 +2407,6 @@ mod tests {
                 descr,
                 fields: vec![],
                 field_descrs: Vec::new(),
-                preamble_fields: Vec::new(),
                 last_guard_pos: -1,
             }),
         );
@@ -2464,7 +2462,6 @@ mod tests {
                 descr: descr.clone(),
                 fields: vec![(0, inner_field_value)],
                 field_descrs: Vec::new(),
-                preamble_fields: Vec::new(),
                 last_guard_pos: -1,
             }),
         );
@@ -2474,7 +2471,6 @@ mod tests {
                 descr,
                 fields: vec![(0, inner_field_value)],
                 field_descrs: Vec::new(),
-                preamble_fields: Vec::new(),
                 last_guard_pos: -1,
             }),
         );
@@ -2532,7 +2528,6 @@ mod tests {
                 descr,
                 fields: vec![(0, OpRef::NONE), (8, field_value)],
                 field_descrs: Vec::new(),
-                preamble_fields: Vec::new(),
                 last_guard_pos: -1,
             }),
         );
@@ -2588,7 +2583,6 @@ mod tests {
                 descr,
                 fields: vec![],
                 field_descrs: Vec::new(),
-                preamble_fields: Vec::new(),
                 last_guard_pos: -1,
             }),
         );

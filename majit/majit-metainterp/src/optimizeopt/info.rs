@@ -662,7 +662,6 @@ impl PtrInfo {
             ob_type_descr: None,
             fields: Vec::new(),
             field_descrs: Vec::new(),
-            preamble_fields: Vec::new(),
             last_guard_pos: -1,
         })
     }
@@ -683,7 +682,6 @@ impl PtrInfo {
             descr,
             fields: Vec::new(),
             field_descrs: Vec::new(),
-            preamble_fields: Vec::new(),
             last_guard_pos: -1,
         })
     }
@@ -1818,28 +1816,23 @@ impl PtrInfo {
     /// RPython: `opinfo.setfield(descr, struct, pop, optheap, cf)`
     /// where `pop` is a PreambleOp wrapper.
     pub fn set_preamble_field(&mut self, field_idx: u32, pop: PreambleOp) {
+        // shortpreamble.py:74: assert not opinfo.is_virtual()
+        // RPython never stores PreambleOp on virtual PtrInfo. The struct
+        // was forced by force_box_for_end_of_preamble before export.
+        debug_assert!(
+            !self.is_virtual(),
+            "set_preamble_field on virtual PtrInfo (RPython: assert not opinfo.is_virtual())"
+        );
         match self {
             PtrInfo::Instance(v) => {
                 v.preamble_fields.retain(|(k, _)| *k != field_idx);
                 v.preamble_fields.push((field_idx, pop));
                 // RPython parity: PreambleOp is stored in _fields directly,
-                // so getfield(descr) returns None (isinstance check). Clear
-                // the regular field so _getfield falls through to PreambleOp path.
+                // so getfield(descr) returns PreambleOp (isinstance check).
+                // Clear the regular field so _getfield falls through.
                 v.fields.retain(|(k, _)| *k != field_idx);
             }
             PtrInfo::Struct(v) => {
-                v.preamble_fields.retain(|(k, _)| *k != field_idx);
-                v.preamble_fields.push((field_idx, pop));
-                v.fields.retain(|(k, _)| *k != field_idx);
-            }
-            PtrInfo::Virtual(v) => {
-                // RPython: PreambleOp replaces the concrete value in _fields.
-                // The virtual stays virtual; only the specific field is shadowed.
-                v.preamble_fields.retain(|(k, _)| *k != field_idx);
-                v.preamble_fields.push((field_idx, pop));
-                v.fields.retain(|(k, _)| *k != field_idx);
-            }
-            PtrInfo::VirtualStruct(v) => {
                 v.preamble_fields.retain(|(k, _)| *k != field_idx);
                 v.preamble_fields.push((field_idx, pop));
                 v.fields.retain(|(k, _)| *k != field_idx);
@@ -1882,8 +1875,6 @@ impl PtrInfo {
         match self {
             PtrInfo::Instance(v) => v.preamble_fields.iter().any(|(k, _)| *k == field_idx),
             PtrInfo::Struct(v) => v.preamble_fields.iter().any(|(k, _)| *k == field_idx),
-            PtrInfo::Virtual(v) => v.preamble_fields.iter().any(|(k, _)| *k == field_idx),
-            PtrInfo::VirtualStruct(v) => v.preamble_fields.iter().any(|(k, _)| *k == field_idx),
             _ => false,
         }
     }
@@ -1910,20 +1901,6 @@ impl PtrInfo {
                 }
             }
             PtrInfo::Struct(v) => {
-                if let Some(pos) = v.preamble_fields.iter().position(|(k, _)| *k == field_idx) {
-                    Some(v.preamble_fields.remove(pos).1)
-                } else {
-                    None
-                }
-            }
-            PtrInfo::Virtual(v) => {
-                if let Some(pos) = v.preamble_fields.iter().position(|(k, _)| *k == field_idx) {
-                    Some(v.preamble_fields.remove(pos).1)
-                } else {
-                    None
-                }
-            }
-            PtrInfo::VirtualStruct(v) => {
                 if let Some(pos) = v.preamble_fields.iter().position(|(k, _)| *k == field_idx) {
                     Some(v.preamble_fields.remove(pos).1)
                 } else {
@@ -1993,14 +1970,8 @@ impl PtrInfo {
                 v.fields.retain(|(k, _)| *k != field_idx);
                 v.preamble_fields.retain(|(k, _)| *k != field_idx);
             }
-            PtrInfo::Virtual(v) => {
-                v.fields.retain(|(k, _)| *k != field_idx);
-                v.preamble_fields.retain(|(k, _)| *k != field_idx);
-            }
-            PtrInfo::VirtualStruct(v) => {
-                v.fields.retain(|(k, _)| *k != field_idx);
-                v.preamble_fields.retain(|(k, _)| *k != field_idx);
-            }
+            PtrInfo::Virtual(v) => v.fields.retain(|(k, _)| *k != field_idx),
+            PtrInfo::VirtualStruct(v) => v.fields.retain(|(k, _)| *k != field_idx),
             _ => {}
         }
     }
@@ -2243,11 +2214,6 @@ pub struct VirtualInfo {
     pub fields: Vec<(u32, OpRef)>,
     /// Original field descriptors, in parent-local slot order.
     pub field_descrs: Vec<DescrRef>,
-    /// RPython stores PreambleOp directly in _fields[]. In Rust, Virtual fields
-    /// are typed `Vec<(u32, OpRef)>`, so PreambleOp entries live here. When a
-    /// preamble_fields entry exists for a field_idx, the concrete field in
-    /// `fields` is cleared, matching RPython's _fields[idx] = PreambleOp.
-    pub preamble_fields: Vec<(u32, PreambleOp)>,
     /// info.py:91-92
     pub last_guard_pos: i32,
 }
@@ -2330,8 +2296,6 @@ pub struct VirtualStructInfo {
     pub fields: Vec<(u32, OpRef)>,
     /// Original field descriptors, in parent-local slot order, used for force.
     pub field_descrs: Vec<DescrRef>,
-    /// RPython stores PreambleOp directly in _fields[]. Same as VirtualInfo.
-    pub preamble_fields: Vec<(u32, PreambleOp)>,
     /// info.py:91-92
     pub last_guard_pos: i32,
 }

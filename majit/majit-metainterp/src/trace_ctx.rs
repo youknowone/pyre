@@ -67,10 +67,11 @@ pub struct TraceCtx {
     /// tracing with their trace positions. First visit records the key +
     /// position; second visit closes the loop.
     current_merge_points: Vec<MergePoint>,
-    /// pyjitpl.py:2970-2975 reached_loop_header parity: set of green keys
-    /// that have compiled targets. Bridge traces skip loop headers without
-    /// compiled targets, continuing until they reach a compiled loop's header.
-    pub compiled_green_keys: Option<std::collections::HashSet<u64>>,
+    /// pyjitpl.py:2979 reached_loop_header parity: callback to check
+    /// has_compiled_targets(ptoken) for a given green key. Bridge traces
+    /// skip loop headers without compiled targets. Live lookup (not snapshot)
+    /// matches RPython's get_procedure_token(greenboxes) + has_compiled_targets.
+    pub has_compiled_targets_fn: Option<Box<dyn Fn(u64) -> bool>>,
     /// pyjitpl.py:2398: tracing-time heap cache.
     /// Tracks field/array values, allocations, escape status, and class/nullity
     /// knowledge during tracing to avoid recording redundant operations.
@@ -291,7 +292,7 @@ impl TraceCtx {
             initial_inputarg_consts: vec![],
             pending_guard_not_invalidated_pc: None,
             forced_virtualizable: None,
-            compiled_green_keys: None,
+            has_compiled_targets_fn: None,
         }
     }
 
@@ -333,7 +334,7 @@ impl TraceCtx {
             initial_inputarg_consts: vec![],
             pending_guard_not_invalidated_pc: None,
             forced_virtualizable: None,
-            compiled_green_keys: None,
+            has_compiled_targets_fn: None,
         }
     }
 
