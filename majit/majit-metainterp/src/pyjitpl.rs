@@ -2475,6 +2475,16 @@ impl<M: Clone> MetaInterp<M> {
             .map_or(false, |c| !c.front_target_tokens.is_empty())
     }
 
+    /// pyjitpl.py:2970 parity: collect all green keys that have compiled
+    /// targets. Used by bridge tracing to skip non-compiled loop headers.
+    pub fn compiled_green_keys(&self) -> std::collections::HashSet<u64> {
+        self.compiled_loops
+            .iter()
+            .filter(|(_, c)| !c.front_target_tokens.is_empty())
+            .map(|(&k, _)| k)
+            .collect()
+    }
+
     /// pyjitpl.py:3179-3190: compile_trace — try to compile the current
     /// trace as a bridge to an existing compiled loop.
     ///

@@ -2622,8 +2622,12 @@ impl<S: JitState> JitDriver<S> {
         // pyjitpl.py:2890 parity: bridge traces start at resume_pc, not at
         // function entry (pc=0). Set header_pc so init_symbolic correctly
         // detects this is NOT a function-entry trace.
+        // pyjitpl.py:2970-2975 reached_loop_header parity:
+        // Collect compiled keys BEFORE borrowing ctx mutably.
+        let compiled_keys = self.meta.compiled_green_keys();
         if let Some(ref mut ctx) = self.meta.tracing {
             ctx.header_pc = resume_pc;
+            ctx.compiled_green_keys = Some(compiled_keys);
         }
         // resume.py:1042 parity: map frame locals to bridge InputArg OpRefs
         // so bridge tracing sees locals as symbolic variables, not concrete values.

@@ -182,6 +182,35 @@ impl PyreMetaInterp {
                 LoopAction::Continue
             }
             TraceAction::CloseLoop | TraceAction::CloseLoopWithArgs { .. } => {
+                // pyjitpl.py:2970-2975 reached_loop_header:
+                //     ptoken = self.get_procedure_token(greenboxes)
+                //     if has_compiled_targets(ptoken):
+                //         self.compile_trace(...)   # close the trace
+                //     else:
+                //         return  # continue tracing past this merge point
+                //
+                // Bridge traces skip loop headers that don't have compiled
+                // code, continuing until they reach a COMPILED loop's header.
+                // Without this, nested loop bridges close at the outer loop's
+                // header instead of the inner loop's.
+                if let Some(ref compiled_keys) = ctx.compiled_green_keys {
+                    let w_code = self.framestack[0].jitcode;
+                    let target_pc = match &action {
+                        TraceAction::CloseLoopWithArgs {
+                            loop_header_pc: Some(tp),
+                            ..
+                        } => *tp,
+                        _ => pc,
+                    };
+                    let gk = crate::driver::make_green_key(w_code, target_pc);
+                    if !compiled_keys.contains(&gk) {
+                        // No compiled targets for this loop — continue tracing.
+                        // RPython: reached_loop_header returns without closing.
+                        let top = self.framestack.last_mut().unwrap();
+                        top.pc = pc;
+                        return LoopAction::Continue;
+                    }
+                }
                 self.handle_close_loop(ctx, &action, pc);
                 LoopAction::Return(action)
             }
