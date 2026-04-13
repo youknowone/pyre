@@ -40,19 +40,14 @@ pub struct VirtualizableConfig {
     pub array_lengths: Vec<usize>,
 }
 
-/// JitVirtualRef field descriptor indices — properly encoded with byte offsets.
+/// JitVirtualRef field slot indices.
 ///
-/// JitVirtualRef layout (#[repr(C)]):
-///   offset  0: type_tag       (u64, 8 bytes) — type identity (RPython typeptr)
-///   offset  8: virtual_token  (i64, 8 bytes)
-///   offset 16: forced         (*mut u8, 8 bytes, Ref)
-///   total: 24 bytes
-///
-/// Encoding: FIELD_DESCR_TAG | (offset << 4) | (size_bits << 1) | type_bits
-///   type_bits: 0=Int, 1=Ref;  size_bits: 0 → 8 bytes
-const VREF_TYPE_TAG_FIELD_INDEX: u32 = 0x1000_0000; // offset=0, Int
-const VREF_VIRTUAL_TOKEN_FIELD_INDEX: u32 = 0x1000_0080; // offset=8, Int
-const VREF_FORCED_FIELD_INDEX: u32 = 0x1000_0101; // offset=16, Ref
+/// PyPy stores struct fields densely by `fielddescr.get_index()`. Keep the
+/// virtual JitVirtualRef fields in the same slot order and let the descriptor
+/// object carry offset/type metadata.
+const VREF_TYPE_TAG_FIELD_INDEX: u32 = 0;
+const VREF_VIRTUAL_TOKEN_FIELD_INDEX: u32 = 1;
+const VREF_FORCED_FIELD_INDEX: u32 = 2;
 /// Size descriptor index for the JitVirtualRef struct.
 const VREF_SIZE_DESCR_INDEX: u32 = 0x7F10;
 
@@ -963,9 +958,9 @@ impl OptVirtualize {
             (VREF_FORCED_FIELD_INDEX, null_ref),
         ];
         let field_descrs = vec![
-            make_field_index_descr(VREF_TYPE_TAG_FIELD_INDEX),
-            make_field_index_descr(VREF_VIRTUAL_TOKEN_FIELD_INDEX),
-            make_field_index_descr(VREF_FORCED_FIELD_INDEX),
+            make_vref_field_descr(VREF_TYPE_TAG_FIELD_INDEX),
+            make_vref_field_descr(VREF_VIRTUAL_TOKEN_FIELD_INDEX),
+            make_vref_field_descr(VREF_FORCED_FIELD_INDEX),
         ];
         let vinfo = VirtualStructInfo {
             descr: vref_descr,
@@ -1043,14 +1038,14 @@ impl OptVirtualize {
         // virtualize.py:150-153: set 'forced' to the real object.
         if !obj_is_null {
             let mut set_forced = Op::new(OpCode::SetfieldGc, &[vref_ref, obj_ref]);
-            set_forced.descr = Some(make_field_index_descr(VREF_FORCED_FIELD_INDEX));
+            set_forced.descr = Some(make_vref_field_descr(VREF_FORCED_FIELD_INDEX));
             ctx.emit_extra(ctx.current_pass_idx, set_forced);
         }
 
         // virtualize.py:155-158: set 'virtual_token' to CONST_NULL.
         let null_ref = ctx.emit_constant_ref(majit_ir::GcRef(0));
         let mut set_token = Op::new(OpCode::SetfieldGc, &[vref_ref, null_ref]);
-        set_token.descr = Some(make_field_index_descr(VREF_VIRTUAL_TOKEN_FIELD_INDEX));
+        set_token.descr = Some(make_vref_field_descr(VREF_VIRTUAL_TOKEN_FIELD_INDEX));
         ctx.emit_extra(ctx.current_pass_idx, set_token);
 
         OptimizationResult::Remove
@@ -1645,6 +1640,59 @@ impl FieldDescr for FieldIndexDescr {
 
 pub(crate) fn make_field_index_descr(idx: u32) -> DescrRef {
     Arc::new(FieldIndexDescr(idx))
+}
+
+#[derive(Debug)]
+struct VRefFieldDescr {
+    index: u32,
+    offset: usize,
+    field_type: Type,
+}
+
+impl Descr for VRefFieldDescr {
+    fn index(&self) -> u32 {
+        self.index
+    }
+
+    fn as_field_descr(&self) -> Option<&dyn FieldDescr> {
+        Some(self)
+    }
+}
+
+impl FieldDescr for VRefFieldDescr {
+    fn offset(&self) -> usize {
+        self.offset
+    }
+
+    fn field_size(&self) -> usize {
+        8
+    }
+
+    fn field_type(&self) -> majit_ir::Type {
+        self.field_type
+    }
+
+    fn index_in_parent(&self) -> usize {
+        self.index as usize
+    }
+
+    fn get_parent_descr(&self) -> Option<DescrRef> {
+        Some(Arc::new(VRefSizeDescr))
+    }
+}
+
+fn make_vref_field_descr(index: u32) -> DescrRef {
+    let (offset, field_type) = match index {
+        VREF_TYPE_TAG_FIELD_INDEX => (0, Type::Int),
+        VREF_VIRTUAL_TOKEN_FIELD_INDEX => (8, Type::Int),
+        VREF_FORCED_FIELD_INDEX => (16, Type::Ref),
+        _ => panic!("invalid JitVirtualRef field slot {index}"),
+    };
+    Arc::new(VRefFieldDescr {
+        index,
+        offset,
+        field_type,
+    })
 }
 
 /// Size descriptor for JitVirtualRef (24 bytes = type_tag + virtual_token + forced).
@@ -3114,8 +3162,25 @@ mod tests {
         // call_n(p1)
         // call_n(p0)
         // jump(p0)
-        let sd = size_descr(1);
-        let fd = majit_ir::descr::make_field_descr_full(10, 0, 8, Type::Ref, true);
+        let group = majit_ir::descr::make_simple_descr_group(
+            1,
+            16,
+            1,
+            0,
+            &[majit_ir::descr::SimpleFieldDescrSpec {
+                index: 10,
+                name: "Node.value".to_string(),
+                offset: 0,
+                field_size: 8,
+                field_type: Type::Ref,
+                is_immutable: true,
+                flag: majit_ir::ArrayFlag::Unsigned,
+                virtualizable: false,
+                index_in_parent: 0,
+            }],
+        );
+        let sd = group.size_descr.clone() as DescrRef;
+        let fd = group.field_descrs[0].clone() as DescrRef;
         let mut ops = vec![
             Op::with_descr(OpCode::NewWithVtable, &[], sd.clone()),
             Op::with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(100)], fd.clone()),

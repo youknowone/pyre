@@ -4381,13 +4381,13 @@ mod tests {
         use crate::optimizeopt::info::{PtrInfo, VirtualStructInfo};
 
         let descr = make_size_descr(16);
-        let field_descr = crate::optimizeopt::virtualize::make_field_index_descr(1);
+        let field_descr: DescrRef = std::sync::Arc::new(TestDescr(0));
         let mut ctx = OptContext::with_num_inputs(16, 1);
         ctx.set_ptr_info(
             OpRef(10),
             PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr: descr.clone(),
-                fields: vec![(1, OpRef(11))],
+                fields: vec![(0, OpRef(11))],
                 field_descrs: vec![field_descr.clone()],
                 last_guard_pos: -1,
             }),

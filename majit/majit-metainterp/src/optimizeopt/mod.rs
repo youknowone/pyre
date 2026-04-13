@@ -1603,6 +1603,7 @@ impl OptContext {
     ) -> OpRef {
         let preamble_source = preamble_op.op;
         let result = preamble_op.resolved;
+        let result_type = preamble_op.preamble_op.result_type();
         let is_constant = self.get_constant(preamble_source).is_some();
         if self.imported_short_preamble_used.insert(preamble_source) {
             // unroll.py:28: assert short_preamble_producer is not None
@@ -1632,6 +1633,11 @@ impl OptContext {
             if let Some(info) = self.get_ptr_info(preamble_source).cloned() {
                 self.setinfo_from_preamble(result, &info, None);
             }
+            // RPython PreambleOp carries Box.type intrinsically. majit's
+            // imported replay uses a distinct `resolved` OpRef, so preserve
+            // the replay result type on first force when the import path did
+            // not already seed `value_types` (e.g. focused unit fixtures).
+            self.value_types.entry(result.0).or_insert(result_type);
             // unroll.py:34-37: potential_extra_ops[op] = preamble_op
             if !is_constant {
                 // unroll.py:35-36: invented_name → get_box_replacement(op)
