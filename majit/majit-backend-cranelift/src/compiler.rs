@@ -2906,6 +2906,15 @@ extern "C" fn gc_write_barrier_shim(runtime_id: u64, obj: u64) {
     with_gc_runtime(runtime_id, |gc| gc.write_barrier(GcRef(obj as usize)));
 }
 
+/// incminimark.py:write_barrier_from_array / jit_remember_young_pointer_from_array:
+/// card-marking write barrier for arrays. Marks a single card instead of
+/// adding the entire object to the remembered set.
+extern "C" fn gc_write_barrier_card_shim(runtime_id: u64, obj: u64, index: u64) {
+    with_gc_runtime(runtime_id, |gc| {
+        gc.write_barrier_from_array(GcRef(obj as usize), index as usize);
+    });
+}
+
 thread_local! {
     static DECLARED_VARS_DEBUG: std::cell::RefCell<Option<std::collections::HashSet<u32>>> = const { std::cell::RefCell::new(None) };
     /// Op-result variable positions: ops that define a result via def_var.
@@ -8221,16 +8230,11 @@ impl CraneliftBackend {
                 }
 
                 // ── GC write barriers ──
-                OpCode::CondCallGcWb | OpCode::CondCallGcWbArray => {
-                    // x86/assembler.py:2388-2436 _write_barrier_fastpath:
-                    //   TEST8 [obj + jit_wb_if_flag_byteofs], mask
-                    //   JNZ slow  (WriteBarrierSlowPath)
-                    // Fast path: flag not set → nothing to do.
-                    // Slow path: call jit_remember_young_pointer.
-                    //
-                    // The flag byte offset is computed from GcHeader layout:
-                    // header at obj - GcHeader::SIZE; TRACK_YOUNG_PTRS is at
-                    // bit FLAG_SHIFT in the u64 word → byte 4 on little-endian.
+                OpCode::CondCallGcWb => {
+                    // x86/assembler.py:2438-2439 genop_discard_cond_call_gc_wb:
+                    //   _write_barrier_fastpath(array=False)
+                    //   TEST8 [obj + flag_byteofs], TRACK_YOUNG_PTRS_mask
+                    //   JNZ slow → call jit_remember_young_pointer
                     let obj = resolve_opref(&mut builder, &constants, op.arg(0));
                     let flag_byte_ofs = -(majit_gc::header::GcHeader::SIZE as i32)
                         + WriteBarrierDescr::extract_flag_byte(gc_flags::TRACK_YOUNG_PTRS).0 as i32;
@@ -8253,7 +8257,6 @@ impl CraneliftBackend {
                         .ins()
                         .brif(needs_barrier, slow_block, &[], cont_block, &[]);
 
-                    // WriteBarrierSlowPath: call gc_write_barrier_shim
                     builder.switch_to_block(slow_block);
                     builder.seal_block(slow_block);
                     let runtime_id = gc_runtime_id.ok_or_else(|| missing_gc_runtime(op.opcode))?;
@@ -8264,6 +8267,101 @@ impl CraneliftBackend {
                         call_conv,
                         gc_write_barrier_shim as *const () as usize,
                         &[runtime_id_v, obj],
+                        None,
+                    );
+                    builder.ins().jump(cont_block, &[]);
+
+                    builder.switch_to_block(cont_block);
+                    builder.seal_block(cont_block);
+                }
+
+                OpCode::CondCallGcWbArray => {
+                    // x86/assembler.py:2441-2443 genop_discard_cond_call_gc_wb_array:
+                    //   _write_barrier_fastpath(array=True)
+                    // Tests TRACK_YOUNG_PTRS | CARDS_SET in one byte.
+                    // If CARDS_SET already on: skip full barrier, go to card marking.
+                    // If only TRACK_YOUNG_PTRS: call full barrier, then check CARDS_SET.
+                    let obj = resolve_opref(&mut builder, &constants, op.arg(0));
+                    let index =
+                        resolve_opref_or_imm(&mut builder, &constants, &known_values, op.arg(1));
+                    let flag_byte_ofs = -(majit_gc::header::GcHeader::SIZE as i32)
+                        + WriteBarrierDescr::extract_flag_byte(gc_flags::TRACK_YOUNG_PTRS).0 as i32;
+                    // gc.py:2408: mask = jit_wb_if_flag_singlebyte | -0x80
+                    let wb_mask =
+                        WriteBarrierDescr::extract_flag_byte(gc_flags::TRACK_YOUNG_PTRS).1;
+                    let cards_mask = WriteBarrierDescr::extract_flag_byte(gc_flags::CARDS_SET).1;
+                    let combined_mask = (wb_mask | cards_mask) as i64;
+
+                    let flag_byte =
+                        builder
+                            .ins()
+                            .load(cl_types::I8, MemFlags::trusted(), obj, flag_byte_ofs);
+                    let flag_ext = builder.ins().uextend(cl_types::I64, flag_byte);
+                    let mask_v = builder.ins().iconst(cl_types::I64, combined_mask);
+                    let test = builder.ins().band(flag_ext, mask_v);
+                    let zero = builder.ins().iconst(cl_types::I64, 0);
+                    let any_flag = builder.ins().icmp(IntCC::NotEqual, test, zero);
+
+                    let cont_block = builder.create_block();
+                    let slow_block = builder.create_block();
+                    builder.set_cold_block(slow_block);
+                    builder
+                        .ins()
+                        .brif(any_flag, slow_block, &[], cont_block, &[]);
+
+                    // Slow path: check if CARDS_SET → card marking only
+                    builder.switch_to_block(slow_block);
+                    builder.seal_block(slow_block);
+
+                    let cards_mask_v = builder.ins().iconst(cl_types::I64, cards_mask as i64);
+                    let cards_test = builder.ins().band(flag_ext, cards_mask_v);
+                    let has_cards = builder.ins().icmp(IntCC::NotEqual, cards_test, zero);
+
+                    let card_block = builder.create_block();
+                    let full_barrier_block = builder.create_block();
+                    builder.set_cold_block(full_barrier_block);
+                    builder
+                        .ins()
+                        .brif(has_cards, card_block, &[], full_barrier_block, &[]);
+
+                    // Full barrier: call jit_remember_young_pointer, then
+                    // re-check CARDS_SET (the barrier may have set it).
+                    builder.switch_to_block(full_barrier_block);
+                    builder.seal_block(full_barrier_block);
+                    let runtime_id = gc_runtime_id.ok_or_else(|| missing_gc_runtime(op.opcode))?;
+                    let runtime_id_v = builder.ins().iconst(cl_types::I64, runtime_id as i64);
+                    let _ = emit_host_call(
+                        &mut builder,
+                        ptr_type,
+                        call_conv,
+                        gc_write_barrier_shim as *const () as usize,
+                        &[runtime_id_v, obj],
+                        None,
+                    );
+                    // Re-load flag byte after barrier (it may have set CARDS_SET)
+                    let flag_byte2 =
+                        builder
+                            .ins()
+                            .load(cl_types::I8, MemFlags::trusted(), obj, flag_byte_ofs);
+                    let flag_ext2 = builder.ins().uextend(cl_types::I64, flag_byte2);
+                    let cards_test2 = builder.ins().band(flag_ext2, cards_mask_v);
+                    let has_cards2 = builder.ins().icmp(IntCC::NotEqual, cards_test2, zero);
+                    builder
+                        .ins()
+                        .brif(has_cards2, card_block, &[], cont_block, &[]);
+
+                    // Card marking: call write_barrier_from_array(obj, index)
+                    builder.switch_to_block(card_block);
+                    builder.seal_block(card_block);
+                    let runtime_id_v2 = builder
+                        .ins()
+                        .iconst(cl_types::I64, gc_runtime_id.unwrap_or(0) as i64);
+                    let _ = emit_host_call(
+                        &mut builder,
+                        ptr_type,
+                        call_conv,
+                        gc_write_barrier_card_shim as *const () as usize,
+                        &[runtime_id_v2, obj, index],
                         None,
                     );
                     builder.ins().jump(cont_block, &[]);

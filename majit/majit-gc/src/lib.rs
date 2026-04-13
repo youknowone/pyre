@@ -171,6 +171,11 @@ pub trait GcAllocator: Send {
     /// Must be called before storing a GC reference into `obj`.
     fn write_barrier(&mut self, obj: GcRef);
 
+    /// Card-marking write barrier for arrays.
+    /// Marks a single card covering `index` instead of adding the
+    /// entire object to the remembered set.
+    fn write_barrier_from_array(&mut self, obj: GcRef, index: usize);
+
     /// Trigger a minor (nursery) collection.
     fn collect_nursery(&mut self);
 

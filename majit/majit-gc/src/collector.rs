@@ -1417,6 +1417,10 @@ impl GcAllocator for MiniMarkGC {
         self.do_write_barrier(obj);
     }
 
+    fn write_barrier_from_array(&mut self, obj: GcRef, index: usize) {
+        self.do_write_barrier_card(obj, index, DEFAULT_CARD_PAGE_SHIFT);
+    }
+
     fn collect_nursery(&mut self) {
         self.do_collect_nursery();
     }
