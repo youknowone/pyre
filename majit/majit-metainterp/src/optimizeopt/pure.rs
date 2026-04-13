@@ -436,7 +436,7 @@ impl OptPure {
                     }
                     continue;
                 }
-                let forced = ctx.force_op_from_preamble(entry.pop.resolved);
+                let forced = ctx.force_op_from_preamble_op(&entry.pop);
                 if !Self::matches_result_type(op, forced, ctx) {
                     continue;
                 }
@@ -447,39 +447,52 @@ impl OptPure {
         // Fallback: search ctx.imported_short_pure_ops directly.
         // Active until install_preamble_pure_ops is enabled, which
         // transfers these entries into preamble_pure_ops above.
-        ctx.imported_short_pure_ops.iter().find_map(|entry| {
+        let mut matched_entry = None;
+        for entry in &ctx.imported_short_pure_ops {
             if entry.opcode != op.opcode {
-                return None;
+                continue;
             }
             if entry.descr.as_ref().map(|d| d.index()) != descr_index {
-                return None;
+                continue;
             }
             if entry.args.len() != op.args.len() {
-                return None;
+                continue;
             }
             // same_box: identity for non-constants, same_constant for constants.
+            let mut args_match = true;
             for (expected, &arg) in entry.args.iter().zip(op.args.iter()) {
                 let query = ctx.get_box_replacement(arg);
                 match expected {
                     crate::optimizeopt::ImportedShortPureArg::OpRef(expected_ref) => {
                         if query != *expected_ref {
-                            return None;
+                            args_match = false;
+                            break;
                         }
                     }
                     crate::optimizeopt::ImportedShortPureArg::Const(expected_value, _source) => {
                         match ctx.get_constant(query) {
                             Some(v) if v == expected_value => {}
-                            _ => return None,
+                            _ => {
+                                args_match = false;
+                                break;
+                            }
                         }
                     }
                 }
             }
-            if Self::matches_result_type(op, entry.result, ctx) {
-                Some(entry.result)
-            } else {
-                None
+            if !args_match {
+                continue;
             }
-        })
+            matched_entry = Some(entry.clone());
+            break;
+        }
+        if let Some(matched_entry) = matched_entry {
+            let forced = ctx.force_op_from_preamble_op(&matched_entry.pop);
+            if Self::matches_result_type(op, forced, ctx) {
+                return Some(forced);
+            }
+        }
+        None
     }
 
     /// Store PreambleOp in OptPure for always-pure ops.
@@ -720,6 +733,18 @@ impl Default for OptPure {
     }
 }
 
+impl OptPure {
+    fn force_box(&mut self, opref: OpRef, ctx: &mut OptContext) -> OpRef {
+        let resolved = ctx.get_box_replacement(opref);
+        if ctx.get_ptr_info(resolved).is_some_and(|i| i.is_virtual()) {
+            let mut info = ctx.take_ptr_info(resolved).unwrap();
+            let forced = info.force_box(resolved, ctx);
+            return ctx.get_box_replacement(forced);
+        }
+        resolved
+    }
+}
+
 impl Optimization for OptPure {
     fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         // optimizer.py: pure_from_args1 parity — consume pending registrations
@@ -747,7 +772,7 @@ impl Optimization for OptPure {
         }
 
         // Handle the postponed OVF op when we see GUARD_NO_OVERFLOW.
-        if let Some(postponed) = self.postponed_op.take() {
+        if let Some(mut postponed) = self.postponed_op.take() {
             if op.opcode == OpCode::GuardNoOverflow {
                 // Try constant folding on the OVF op.
                 if let Some(folded) = try_constant_fold_int_value(&postponed, ctx) {
@@ -801,12 +826,24 @@ impl Optimization for OptPure {
                     }
                 }
 
+                // RPython emits the postponed op through Optimizer.emit(),
+                // which force_box()es every arg before final emission.
+                // ctx.emit() bypasses that optimizer path, so mirror the
+                // force_box step here before recording the postponed op.
+                for i in 0..postponed.num_args() {
+                    let arg = ctx.get_box_replacement(postponed.arg(i));
+                    postponed.args[i] = self.force_box(arg, ctx);
+                }
                 // Record and emit both the OVF op and the guard.
                 self.cache.insert(key, postponed.pos);
                 ctx.emit(postponed);
                 return OptimizationResult::PassOn; // guard passes through
             } else {
                 // Not a GUARD_NO_OVERFLOW: emit the postponed op now.
+                for i in 0..postponed.num_args() {
+                    let arg = ctx.get_box_replacement(postponed.arg(i));
+                    postponed.args[i] = self.force_box(arg, ctx);
+                }
                 ctx.emit(postponed);
             }
         }
@@ -1047,6 +1084,18 @@ impl Optimization for OptPure {
                     continue;
                 }
             }
+            let imported_args = entry
+                .args
+                .iter()
+                .map(|a| match a {
+                    crate::optimizeopt::ImportedShortPureArg::OpRef(r) => *r,
+                    crate::optimizeopt::ImportedShortPureArg::Const(_v, source) => *source,
+                })
+                .collect::<Vec<_>>();
+            let mut imported_op = Op::new(entry.opcode, &imported_args);
+            imported_op.pos = entry.result;
+            imported_op.descr = entry.descr.clone();
+            self.short_preamble_pure_ops.push(imported_op);
             let resolved_args: Vec<OpRef> = entry
                 .args
                 .iter()
@@ -1060,10 +1109,15 @@ impl Optimization for OptPure {
                 })
                 .collect();
             let descr_index = entry.descr.as_ref().map(|d| d.index());
+            let source = ctx.imported_short_source(entry.result);
+            let mut replay = majit_ir::Op::new(entry.opcode, &resolved_args);
+            replay.pos = source;
+            replay.descr = entry.descr.clone();
             let pop = crate::optimizeopt::info::PreambleOp {
-                op: ctx.imported_short_source(entry.result),
+                op: source,
                 resolved: entry.result,
                 invented_name: false,
+                preamble_op: replay,
             };
             if entry.opcode.is_call_pure() || entry.opcode.is_call() {
                 // shortpreamble.py:122-123: optpure.extra_call_pure.append(PreambleOp(...))
@@ -1919,18 +1973,20 @@ mod tests {
         let mut ctx = OptContext::with_num_inputs(6, 0);
         ctx.make_constant(OpRef(10), majit_ir::Value::Int(7));
         ctx.imported_short_pure_ops
-            .push(crate::optimizeopt::ImportedShortPureOp {
-                opcode: OpCode::IntAdd,
-                descr: None,
-                args: vec![
+            .push(crate::optimizeopt::ImportedShortPureOp::new(
+                OpCode::IntAdd,
+                None,
+                vec![
                     crate::optimizeopt::ImportedShortPureArg::OpRef(OpRef(0)),
                     crate::optimizeopt::ImportedShortPureArg::Const(
                         majit_ir::Value::Int(7),
                         OpRef(10),
                     ),
                 ],
-                result: OpRef(1),
-            });
+                OpRef(1),
+                OpRef(1),
+                false,
+            ));
 
         pass.setup();
         pass.install_preamble_pure_ops(&ctx);
@@ -1940,6 +1996,49 @@ mod tests {
         let result = pass.propagate_forward(&op, &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_box_replacement(OpRef(2)), OpRef(1));
+    }
+
+    #[test]
+    fn test_imported_short_pure_result_is_reexported_to_short_preamble() {
+        // Imported pure ops (from previous peeling cycle) should be
+        // re-exported to ShortBoxes via short_preamble_pure_ops.
+        let mut pass = OptPure::new();
+        let mut ctx = OptContext::with_num_inputs(6, 0);
+        // Use constant-namespace OpRef (as the actual import process does).
+        let const_opref = OpRef::from_const(10);
+        ctx.seed_constant(const_opref, majit_ir::Value::Int(7));
+        ctx.imported_short_pure_ops
+            .push(crate::optimizeopt::ImportedShortPureOp::new(
+                OpCode::IntAdd,
+                None,
+                vec![
+                    crate::optimizeopt::ImportedShortPureArg::OpRef(OpRef(0)),
+                    crate::optimizeopt::ImportedShortPureArg::Const(
+                        majit_ir::Value::Int(7),
+                        const_opref,
+                    ),
+                ],
+                OpRef(2),
+                OpRef(2),
+                false,
+            ));
+
+        pass.setup();
+        pass.install_preamble_pure_ops(&ctx);
+
+        // Label args don't include OpRef(2), so the pure op should be produced.
+        let mut sb =
+            crate::optimizeopt::shortpreamble::ShortBoxes::with_label_args(&[OpRef(0), OpRef(1)]);
+        sb.note_known_constants_from_ctx(&ctx);
+        pass.produce_potential_short_preamble_ops(&mut sb, &mut ctx);
+        let collected = sb.produced_ops();
+        assert_eq!(collected.len(), 1);
+        assert!(matches!(
+            collected[0].1.kind,
+            crate::optimizeopt::shortpreamble::PreambleOpKind::Pure
+        ));
+        assert_eq!(collected[0].1.preamble_op.opcode, OpCode::IntAdd);
+        assert_eq!(collected[0].1.preamble_op.pos, OpRef(2));
     }
 
     #[test]
@@ -1956,18 +2055,20 @@ mod tests {
             majit_ir::EffectInfo::elidable(),
         );
         ctx.imported_short_pure_ops
-            .push(crate::optimizeopt::ImportedShortPureOp {
-                opcode: OpCode::CallPureI,
-                descr: Some(call_descr.clone()),
-                args: vec![
+            .push(crate::optimizeopt::ImportedShortPureOp::new(
+                OpCode::CallPureI,
+                Some(call_descr.clone()),
+                vec![
                     crate::optimizeopt::ImportedShortPureArg::Const(
                         majit_ir::Value::Int(0x1234),
                         OpRef(10),
                     ),
                     crate::optimizeopt::ImportedShortPureArg::OpRef(OpRef(0)),
                 ],
-                result: OpRef(1),
-            });
+                OpRef(1),
+                OpRef(1),
+                false,
+            ));
 
         pass.setup();
         pass.install_preamble_pure_ops(&ctx);

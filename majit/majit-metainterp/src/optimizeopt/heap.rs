@@ -3300,6 +3300,11 @@ mod tests {
                 op: OpRef(100),
                 resolved: OpRef(1),
                 invented_name: false,
+                preamble_op: {
+                    let mut op = majit_ir::Op::new(majit_ir::OpCode::SameAsI, &[OpRef(100)]);
+                    op.pos = OpRef(100);
+                    op
+                },
             },
         );
 
@@ -3332,6 +3337,11 @@ mod tests {
                 op: OpRef(100),
                 resolved: OpRef(1),
                 invented_name: false,
+                preamble_op: {
+                    let mut op = majit_ir::Op::new(majit_ir::OpCode::SameAsI, &[OpRef(100)]);
+                    op.pos = OpRef(100);
+                    op
+                },
             },
         );
 

@@ -2798,12 +2798,15 @@ impl Optimization for OptRewrite {
                         if !self.loop_invariant_results.contains_key(&func_val) {
                             // RPython shortpreamble.py:158-159
                             let source = ctx.imported_short_source(imported);
+                            let mut replay = Op::new(OpCode::SameAsI, &[source]);
+                            replay.pos = source;
                             self.loop_invariant_results.insert(
                                 func_val,
                                 LoopInvariantEntry::Preamble(PreambleOp {
                                     op: source,
                                     resolved: imported,
                                     invented_name: false,
+                                    preamble_op: replay,
                                 }),
                             );
                         }
@@ -2813,7 +2816,8 @@ impl Optimization for OptRewrite {
                     if let Some(entry) = self.loop_invariant_results.get(&func_val).cloned() {
                         let cached_result = match entry {
                             LoopInvariantEntry::Preamble(ref pop) => {
-                                let forced = ctx.force_op_from_preamble(pop.resolved);
+                                // unroll.py:26: force_op_from_preamble(preamble_op)
+                                let forced = ctx.force_op_from_preamble_op(pop);
                                 self.loop_invariant_results
                                     .insert(func_val, LoopInvariantEntry::Direct(forced));
                                 forced

@@ -762,7 +762,6 @@ impl UnrollOptimizer {
         }
 
         // ── unroll.py:140-175: finalize + jump_to_existing_trace ──
-        let imported_short_preamble_builder = opt_p2.imported_short_preamble_builder.clone();
         let imported_short_aliases = opt_p2.imported_short_aliases.clone();
         let imported_short_sources = opt_p2.imported_short_sources.clone();
 
@@ -797,7 +796,83 @@ impl UnrollOptimizer {
                 es.renamed_inputarg_types.clone(),
             )
         };
-        let mut initial_sp = opt_p2.imported_short_preamble.clone().unwrap_or_else(|| {
+        // RPython unroll.py:124-141 performs an extra end-of-preamble forcing
+        // pass on the closing JUMP args before finalize_short_preamble():
+        //   for a in end_jump.getarglist():
+        //       self.force_box_for_end_of_preamble(get_box_replacement(a))
+        //   current_vs = self.optunroll.get_virtual_state(end_jump.getarglist())
+        //   target_virtual_state = self.optunroll.pick_virtual_state(...)
+        //   args = target_virtual_state.make_inputargs(..., force_boxes=True)
+        //   for arg in args:
+        //       self.force_box(arg)
+        //
+        // The optimizer-level imported_short_preamble snapshot is taken before
+        // this step, so rebuild from the live Phase 2 context here instead of
+        // trusting the stale copy.
+        let body_jump_args: Vec<OpRef> = body_terminal_op
+            .as_ref()
+            .map(|jump| jump.args.to_vec())
+            .or_else(|| {
+                p2_ops
+                    .iter()
+                    .rfind(|op| op.opcode == OpCode::Jump)
+                    .map(|jump| jump.args.to_vec())
+            })
+            .unwrap_or_default();
+        let (imported_short_preamble_builder, rebuilt_imported_short_preamble) =
+            if let Some(mut final_ctx) = opt_p2.final_ctx.take() {
+                if !body_jump_args.is_empty() {
+                    let resolved_jump_args: Vec<OpRef> = body_jump_args
+                        .iter()
+                        .map(|&arg| final_ctx.get_box_replacement(arg))
+                        .collect();
+                    for &arg in &resolved_jump_args {
+                        let _ = opt_p2.force_at_the_end_of_preamble(arg, &mut final_ctx);
+                    }
+                    let forced_jump_args: Vec<OpRef> = body_jump_args
+                        .iter()
+                        .map(|&arg| final_ctx.get_box_replacement(arg))
+                        .collect();
+                    let current_vs = crate::optimizeopt::virtualstate::export_state(
+                        &forced_jump_args,
+                        &final_ctx,
+                        &final_ctx.forwarded,
+                    );
+                    let mut target_states: Vec<crate::optimizeopt::virtualstate::VirtualState> =
+                        self.target_tokens
+                            .iter()
+                            .filter_map(|token| token.virtual_state.clone())
+                            .collect();
+                    let target_virtual_state =
+                        if let Some(idx) = pick_virtual_state(&current_vs, &target_states) {
+                            target_states.swap_remove(idx)
+                        } else {
+                            exported_vs.clone()
+                        };
+                    if let Ok(args) = target_virtual_state.make_inputargs(
+                        &forced_jump_args,
+                        &mut opt_p2,
+                        &mut final_ctx,
+                        true,
+                    ) {
+                        for arg in args {
+                            if !arg.is_none() {
+                                let _ = opt_p2.force_box(arg, &mut final_ctx);
+                            }
+                        }
+                    }
+                }
+                let rebuilt = final_ctx.build_imported_short_preamble();
+                let builder = final_ctx.imported_short_preamble_builder.clone();
+                opt_p2.final_ctx = Some(final_ctx);
+                (builder, rebuilt)
+            } else {
+                (
+                    opt_p2.imported_short_preamble_builder.clone(),
+                    opt_p2.imported_short_preamble.clone(),
+                )
+            };
+        let mut initial_sp = rebuilt_imported_short_preamble.unwrap_or_else(|| {
             crate::optimizeopt::shortpreamble::build_short_preamble_from_exported_boxes(
                 &exported_end_args,
                 &exported_short_inputargs,
@@ -3193,12 +3268,14 @@ impl OptUnroll {
                     // paired GuardNoOverflow arrives, so guard pairing
                     // is maintained even for imported OVF operations.
                     ctx.imported_short_pure_ops
-                        .push(crate::optimizeopt::ImportedShortPureOp {
+                        .push(crate::optimizeopt::ImportedShortPureOp::new(
                             opcode,
-                            descr: descr.clone(),
+                            descr.clone(),
                             args,
-                            result: result_opref,
-                        });
+                            result_opref,
+                            source,
+                            invented_name,
+                        ));
                     ctx.imported_short_sources
                         .push(crate::optimizeopt::ImportedShortSource {
                             result: result_opref,
@@ -3275,14 +3352,16 @@ impl OptUnroll {
                             );
                         }
                     }
+                    let mut getfield_op =
+                        majit_ir::Op::new(OpCode::getfield_for_type(result_type), &[obj_resolved]);
+                    getfield_op.descr = Some(descr.clone());
+                    getfield_op.pos = source;
                     let pop = crate::optimizeopt::info::PreambleOp {
                         op: source,
                         resolved: value,
                         invented_name,
+                        preamble_op: getfield_op.clone(),
                     };
-                    let mut getfield_op =
-                        majit_ir::Op::new(OpCode::getfield_for_type(result_type), &[obj_resolved]);
-                    getfield_op.descr = Some(descr.clone());
                     // RPython shortpreamble.py:72-79:
                     //   opinfo = ensure_ptr_info_arg0(g)
                     //   opinfo.setfield(..., pop, ...)
@@ -3370,10 +3449,12 @@ impl OptUnroll {
                         &[obj_resolved, index_const],
                     );
                     getarrayitem_op.descr = Some(descr.clone());
+                    getarrayitem_op.pos = source;
                     let pop = crate::optimizeopt::info::PreambleOp {
                         op: source,
                         resolved: value,
                         invented_name,
+                        preamble_op: getarrayitem_op.clone(),
                     };
                     if obj_resolved.is_constant() || ctx.get_constant(obj_resolved).is_some() {
                         if let Some(info) =
@@ -5345,15 +5426,17 @@ mod tests {
         assert_eq!(ctx2.get_constant(OpRef(10)), Some(&Value::Int(7)));
         assert_eq!(
             ctx2.imported_short_pure_ops,
-            vec![crate::optimizeopt::ImportedShortPureOp {
-                opcode: OpCode::IntAdd,
-                descr: None,
-                args: vec![
+            vec![crate::optimizeopt::ImportedShortPureOp::new(
+                OpCode::IntAdd,
+                None,
+                vec![
                     crate::optimizeopt::ImportedShortPureArg::OpRef(OpRef(12)),
                     crate::optimizeopt::ImportedShortPureArg::Const(Value::Int(7), OpRef(10)),
                 ],
-                result: OpRef(11),
-            }]
+                OpRef(11),
+                OpRef(11),
+                false
+            )]
         );
     }
 
@@ -5410,15 +5493,17 @@ mod tests {
         assert_eq!(ctx2.get_constant(OpRef(10)), Some(&Value::Int(0x1234)));
         assert_eq!(
             ctx2.imported_short_pure_ops,
-            vec![crate::optimizeopt::ImportedShortPureOp {
-                opcode: OpCode::CallPureI,
-                descr: Some(call_descr.clone()),
-                args: vec![
+            vec![crate::optimizeopt::ImportedShortPureOp::new(
+                OpCode::CallPureI,
+                Some(call_descr.clone()),
+                vec![
                     crate::optimizeopt::ImportedShortPureArg::Const(Value::Int(0x1234), OpRef(10)),
                     crate::optimizeopt::ImportedShortPureArg::OpRef(OpRef(12)),
                 ],
-                result: OpRef(11),
-            }]
+                OpRef(11),
+                OpRef(11),
+                false
+            )]
         );
     }
 
@@ -5507,24 +5592,28 @@ mod tests {
         assert_eq!(
             ctx2.imported_short_pure_ops,
             vec![
-                crate::optimizeopt::ImportedShortPureOp {
-                    opcode: OpCode::IntAdd,
-                    descr: None,
-                    args: vec![
+                crate::optimizeopt::ImportedShortPureOp::new(
+                    OpCode::IntAdd,
+                    None,
+                    vec![
                         crate::optimizeopt::ImportedShortPureArg::OpRef(OpRef(12)),
                         crate::optimizeopt::ImportedShortPureArg::Const(Value::Int(7), OpRef(10)),
                     ],
-                    result: temp_result,
-                },
-                crate::optimizeopt::ImportedShortPureOp {
-                    opcode: OpCode::IntMul,
-                    descr: None,
-                    args: vec![
+                    temp_result,
+                    temp_result,
+                    false
+                ),
+                crate::optimizeopt::ImportedShortPureOp::new(
+                    OpCode::IntMul,
+                    None,
+                    vec![
                         crate::optimizeopt::ImportedShortPureArg::OpRef(temp_result),
                         crate::optimizeopt::ImportedShortPureArg::OpRef(OpRef(13)),
                     ],
-                    result: OpRef(14),
-                },
+                    OpRef(14),
+                    OpRef(14),
+                    false
+                ),
             ]
         );
     }
@@ -5579,15 +5668,17 @@ mod tests {
         );
         assert_eq!(
             ctx2.imported_short_pure_ops,
-            vec![crate::optimizeopt::ImportedShortPureOp {
-                opcode: OpCode::GetfieldGcPureI,
-                descr: Some(field_descr.clone()),
-                args: vec![crate::optimizeopt::ImportedShortPureArg::Const(
+            vec![crate::optimizeopt::ImportedShortPureOp::new(
+                OpCode::GetfieldGcPureI,
+                Some(field_descr.clone()),
+                vec![crate::optimizeopt::ImportedShortPureArg::Const(
                     Value::Ref(ptr),
                     OpRef::from_const(23)
                 )],
-                result: OpRef(11),
-            }]
+                OpRef(11),
+                OpRef(11),
+                false
+            )]
         );
     }
 

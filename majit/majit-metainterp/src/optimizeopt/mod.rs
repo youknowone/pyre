@@ -102,6 +102,43 @@ pub struct ImportedShortPureOp {
     pub descr: Option<DescrRef>,
     pub args: Vec<ImportedShortPureArg>,
     pub result: OpRef,
+    /// RPython: PreambleOp stored in pure cache. Used by force_op_from_preamble.
+    pub pop: crate::optimizeopt::info::PreambleOp,
+}
+
+impl ImportedShortPureOp {
+    /// Construct with auto-generated PreambleOp from fields.
+    pub fn new(
+        opcode: OpCode,
+        descr: Option<DescrRef>,
+        args: Vec<ImportedShortPureArg>,
+        result: OpRef,
+        source: OpRef,
+        invented_name: bool,
+    ) -> Self {
+        let replay_args: Vec<OpRef> = args
+            .iter()
+            .map(|a| match a {
+                ImportedShortPureArg::OpRef(r) => *r,
+                ImportedShortPureArg::Const(_, src) => *src,
+            })
+            .collect();
+        let mut replay = majit_ir::Op::new(opcode, &replay_args);
+        replay.pos = source;
+        replay.descr = descr.clone();
+        ImportedShortPureOp {
+            opcode,
+            descr,
+            args,
+            result,
+            pop: crate::optimizeopt::info::PreambleOp {
+                op: source,
+                resolved: result,
+                invented_name,
+                preamble_op: replay,
+            },
+        }
+    }
 }
 
 impl PartialEq for ImportedShortPureOp {
@@ -1589,6 +1626,12 @@ impl OptContext {
                 } else {
                     preamble_source
                 };
+                if crate::optimizeopt::majit_log_enabled() {
+                    eprintln!(
+                        "[jit] potential_extra_ops.insert key={key:?} source={preamble_source:?} result={result:?} invented={}",
+                        preamble_op.invented_name
+                    );
+                }
                 self.potential_extra_ops.insert(key, preamble_op.clone());
             }
         }
@@ -1601,9 +1644,14 @@ impl OptContext {
     }
 
     /// Backward compat: force_op_from_preamble by OpRef lookup.
+    /// unroll.py:26-39: force_op_from_preamble(preamble_op)
+    ///
+    /// Backward compat wrapper: builds PreambleOp from OpRef lookup.
+    /// RPython receives a PreambleOp directly; this path looks up
+    /// the produced_short_op to reconstruct it.
     pub fn force_op_from_preamble(&mut self, result: OpRef) -> OpRef {
         let preamble_source = self.imported_short_source(result);
-        let invented_name = self
+        let produced = self
             .imported_short_preamble_builder
             .as_ref()
             .and_then(|b| b.produced_short_op(preamble_source))
@@ -1611,12 +1659,19 @@ impl OptContext {
                 self.active_short_preamble_producer
                     .as_ref()
                     .and_then(|b| b.produced_short_op(preamble_source))
-            })
-            .map_or(false, |p| p.invented_name);
+            });
+        // unroll.py:27: isinstance(preamble_op, PreambleOp) — RPython
+        // always receives PreambleOp directly. All callers with a
+        // PreambleOp should use force_op_from_preamble_op() instead.
+        let produced = produced.expect(
+            "force_op_from_preamble: produced_short_op not found — \
+             caller should use force_op_from_preamble_op(&PreambleOp)",
+        );
         let pop = crate::optimizeopt::info::PreambleOp {
             op: preamble_source,
             resolved: result,
-            invented_name,
+            invented_name: produced.invented_name,
+            preamble_op: produced.preamble_op,
         };
         self.force_op_from_preamble_op(&pop)
     }

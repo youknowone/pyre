@@ -63,6 +63,9 @@ pub struct PreambleOp {
     pub resolved: OpRef,
     /// RPython: PreambleOp.invented_name
     pub invented_name: bool,
+    /// RPython: PreambleOp.preamble_op — the actual replay operation
+    /// for the short preamble. Always present (RPython parity).
+    pub preamble_op: majit_ir::Op,
 }
 
 /// Information about an operation's result, attached during optimization.

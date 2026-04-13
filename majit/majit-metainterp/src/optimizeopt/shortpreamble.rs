@@ -1082,23 +1082,40 @@ struct AbstractShortPreambleBuilderState {
 }
 
 impl AbstractShortPreambleBuilderState {
-    fn record_preamble_use(&mut self, result: OpRef, produced: &ProducedShortOp) {
-        let current_result = produced.preamble_op.pos;
-        // RPython shortpreamble.py records the box after replacement
-        // (op.get_box_replacement()), i.e. the replayed/local result, not the
-        // exported source identity used as a lookup key.
-        let used_box = current_result;
-        if produced.invented_name {
-            let source = produced.same_as_source.unwrap_or(result);
-            let mut op = Op::new(
-                OpCode::same_as_for_type(produced.preamble_op.result_type()),
-                &[source],
-            );
-            op.pos = current_result;
-            self.extra_same_as.push(op);
+    /// shortpreamble.py:432-440: add_preamble_op
+    ///
+    /// RPython (4 lines):
+    ///   op = preamble_op.op.get_box_replacement()
+    ///   if preamble_op.invented_name:
+    ///       self.extra_same_as.append(op)
+    ///   self.used_boxes.append(op)
+    ///   self.short_preamble_jump.append(preamble_op.preamble_op)
+    ///
+    /// `same_as_source`: the original OpRef this invented name aliases.
+    fn record_imported_preamble_use(
+        &mut self,
+        op: OpRef,
+        replay_op: &Op,
+        invented_name: bool,
+        same_as_source: Option<OpRef>,
+    ) {
+        if invented_name {
+            let source = same_as_source.unwrap_or(op);
+            let mut same_as = Op::new(OpCode::same_as_for_type(replay_op.result_type()), &[source]);
+            same_as.pos = op;
+            self.extra_same_as.push(same_as);
         }
-        self.used_boxes.push(used_box);
-        self.short_preamble_jump.push(produced.preamble_op.clone());
+        self.used_boxes.push(op);
+        self.short_preamble_jump.push(replay_op.clone());
+    }
+
+    fn record_preamble_use(&mut self, result: OpRef, produced: &ProducedShortOp) {
+        self.record_imported_preamble_use(
+            result,
+            &produced.preamble_op,
+            produced.invented_name,
+            produced.same_as_source,
+        );
     }
 
     /// Internal: append preamble_op to short (with ovf guard).
@@ -1403,13 +1420,34 @@ impl ShortPreambleBuilder {
 
     /// shortpreamble.py:432-440: add_preamble_op(preamble_op)
     /// Called from optimizer.force_box when popping from potential_extra_ops.
+    ///
+    /// RPython unconditionally appends to used_boxes and short_preamble_jump
+    /// without any produced_short_boxes lookup:
+    ///   op = preamble_op.op.get_box_replacement()
+    ///   self.used_boxes.append(op)
+    ///   self.short_preamble_jump.append(preamble_op.preamble_op)
+    /// shortpreamble.py:432-440: add_preamble_op(preamble_op)
+    /// RPython unconditionally appends:
+    ///   op = preamble_op.op.get_box_replacement()
+    ///   self.used_boxes.append(op)
+    ///   self.short_preamble_jump.append(preamble_op.preamble_op)
+    /// shortpreamble.py:432-440: add_preamble_op(preamble_op)
     pub fn add_preamble_op_from_pop(
         &mut self,
         preamble_op: &crate::optimizeopt::info::PreambleOp,
         resolved_op: OpRef,
     ) {
         if let Some(produced) = self.produced_short_boxes.get(&preamble_op.op) {
-            self.state.record_preamble_use(preamble_op.op, produced);
+            self.state.record_preamble_use(resolved_op, produced);
+        } else {
+            // shortpreamble.py:432-440: same 4-line pattern via common helper.
+            let replay_op = &preamble_op.preamble_op;
+            self.state.record_imported_preamble_use(
+                resolved_op,
+                replay_op,
+                preamble_op.invented_name,
+                Some(preamble_op.op),
+            );
         }
     }
 
@@ -1694,26 +1732,44 @@ impl ExtendedShortPreambleBuilder {
 
     /// shortpreamble.py:465-476: add_preamble_op(preamble_op)
     ///
-    /// RPython: `op = preamble_op.op.get_box_replacement()` — canonicalizes
-    /// through forwarding BEFORE appending to label_args. This collapses
-    /// aliases so the same logical value doesn't appear as multiple
-    /// distinct label_args entries (which would cause spurious growth of
-    /// short_jump_args in inline_short_preamble's inner force loop).
+    /// RPython unconditionally appends to label_args and jump_args:
+    ///   op = preamble_op.op.get_box_replacement()
+    ///   self.label_args.append(op)
+    ///   self.jump_args.append(preamble_op.preamble_op)
+    /// shortpreamble.py:465-476: add_preamble_op(preamble_op)
+    ///
+    /// Extended version: label_args/jump_args instead of used_boxes.
+    ///   op = preamble_op.op.get_box_replacement()
+    ///   if preamble_op.invented_name:
+    ///       self.extra_same_as.append(op)
+    ///   self.label_args.append(op)
+    ///   self.jump_args.append(preamble_op.preamble_op)
     pub fn add_preamble_op_from_pop(
         &mut self,
         preamble_op: &crate::optimizeopt::info::PreambleOp,
         resolved_op: OpRef,
     ) {
-        // RPython: preamble_op.op.get_box_replacement() → resolved_op
-        // Use resolved_op for the lookup AND for label_args, matching RPython.
         let lookup_key = if self.produced_short_boxes.contains_key(&resolved_op) {
             resolved_op
         } else {
-            // Fallback: try the raw key (pre-resolution) for backward compat
             preamble_op.op
         };
         if let Some(produced) = self.produced_short_boxes.get(&lookup_key).cloned() {
             self.add_tracked_preamble_op(resolved_op, &produced);
+        } else {
+            // shortpreamble.py:465-476: same pattern via replay_op.
+            let op = resolved_op;
+            let replay_op = &preamble_op.preamble_op;
+            if preamble_op.invented_name {
+                let source = preamble_op.op;
+                let mut same_as =
+                    Op::new(OpCode::same_as_for_type(replay_op.result_type()), &[source]);
+                same_as.pos = op;
+                self.extra_same_as.push(same_as);
+            }
+            self.label_args.push(op);
+            self.short_jump_args.push(replay_op.pos);
+            self.short_preamble_jump.push(replay_op.clone());
         }
     }
 
@@ -2682,5 +2738,53 @@ mod tests {
         assert_eq!(extra[0].opcode, OpCode::SameAsI);
         assert_eq!(extra[0].pos, alias_result);
         assert_eq!(extra[0].args.as_slice(), &[OpRef(20)]);
+    }
+
+    #[test]
+    fn test_short_preamble_builder_fallback_keeps_invented_name_alias_identity() {
+        let mut builder = ShortPreambleBuilder::new(&[OpRef(7)], &[], &[OpRef(7)]);
+        let mut replay_op = Op::new(OpCode::GetfieldGcI, &[OpRef(30)]);
+        replay_op.pos = OpRef(14);
+        let pop = crate::optimizeopt::info::PreambleOp {
+            op: OpRef(14),
+            resolved: OpRef(41),
+            invented_name: true,
+            preamble_op: replay_op,
+        };
+
+        builder.add_preamble_op_from_pop(&pop, OpRef(41));
+
+        assert_eq!(builder.used_boxes(), &[OpRef(41)]);
+        assert_eq!(builder.short_preamble_jump().len(), 1);
+        assert_eq!(builder.short_preamble_jump()[0].pos, OpRef(14));
+        let extra = builder.extra_same_as();
+        assert_eq!(extra.len(), 1);
+        assert_eq!(extra[0].opcode, OpCode::SameAsI);
+        assert_eq!(extra[0].pos, OpRef(41));
+        assert_eq!(extra[0].args.as_slice(), &[OpRef(14)]);
+    }
+
+    #[test]
+    fn test_extended_short_preamble_builder_fallback_keeps_invented_name_alias_identity() {
+        let sb = ShortPreambleBuilder::new(&[OpRef(7)], &[], &[OpRef(7)]);
+        let mut builder = ExtendedShortPreambleBuilder::new(0, &sb);
+        let mut replay_op = Op::new(OpCode::GetfieldGcI, &[OpRef(30)]);
+        replay_op.pos = OpRef(14);
+        let pop = crate::optimizeopt::info::PreambleOp {
+            op: OpRef(14),
+            resolved: OpRef(41),
+            invented_name: true,
+            preamble_op: replay_op,
+        };
+
+        builder.add_preamble_op_from_pop(&pop, OpRef(41));
+
+        assert_eq!(builder.label_args(), &[OpRef(41)]);
+        assert_eq!(builder.jump_args(), &[OpRef(14)]);
+        let extra = builder.extra_same_as();
+        assert_eq!(extra.len(), 1);
+        assert_eq!(extra[0].opcode, OpCode::SameAsI);
+        assert_eq!(extra[0].pos, OpRef(41));
+        assert_eq!(extra[0].args.as_slice(), &[OpRef(14)]);
     }
 }

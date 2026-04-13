@@ -1211,6 +1211,21 @@ impl Optimizer {
                     .then(|| ctx.take_potential_extra_op(preamble_source))
                     .flatten()
             });
+        if std::env::var_os("MAJIT_LOG").is_some()
+            && (opref == majit_ir::OpRef(83)
+                || resolved == majit_ir::OpRef(83)
+                || preamble_source == majit_ir::OpRef(16)
+                || tracked
+                    .as_ref()
+                    .is_some_and(|pop| pop.op == majit_ir::OpRef(16)))
+        {
+            eprintln!(
+                "[jit] force_box_pop opref={opref:?} resolved={resolved:?} preamble_source={preamble_source:?} tracked={:?}",
+                tracked
+                    .as_ref()
+                    .map(|pop| (pop.op, pop.resolved, pop.invented_name))
+            );
+        }
         if let Some(preamble_op) = tracked {
             let resolved_for_pop = ctx.get_box_replacement(preamble_op.op);
             if let Some(builder) = ctx.active_short_preamble_producer_mut() {
@@ -4404,6 +4419,11 @@ mod tests {
                 op: OpRef(14),
                 resolved: OpRef(14),
                 invented_name: false,
+                preamble_op: {
+                    let mut op = majit_ir::Op::new(majit_ir::OpCode::SameAsI, &[OpRef(14)]);
+                    op.pos = OpRef(14);
+                    op
+                },
             },
         );
 
