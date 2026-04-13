@@ -751,10 +751,6 @@ pub(crate) fn current_trace_green_key(state: &mut MIFrame) -> u64 {
     state.with_ctx(|_, ctx| ctx.green_key())
 }
 
-pub(crate) fn root_trace_green_key(state: &mut MIFrame) -> u64 {
-    state.with_ctx(|_, ctx| ctx.root_green_key())
-}
-
 /// pyjitpl.py:3514 find_biggest_function
 pub(crate) fn biggest_inline_trace_key(state: &mut MIFrame) -> Option<u64> {
     state.with_ctx(|_, ctx| ctx.find_biggest_function())

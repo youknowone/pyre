@@ -2615,7 +2615,6 @@ impl MIFrame {
                 // if we know the callee body and it is a small acyclic helper,
                 // trace through it directly instead of waiting for
                 // should_inline() to bless a helper-boundary inline.
-                let root_trace_green_key = root_trace_green_key(self);
                 let current_function_key =
                     crate::driver::make_green_key(unsafe { (*self.sym().jitcode).code }, 0);
                 let is_self_recursive = callee_key == current_function_key;
@@ -2635,54 +2634,68 @@ impl MIFrame {
                 };
                 let callee_prefers_function_entry =
                     (crate::callbacks::get().callable_prefers_function_entry)(concrete_callable);
-                if is_self_recursive
-                    && inline_decision == majit_metainterp::InlineDecision::Inline
-                    && recursive_depth >= max_unroll_recursion
-                {
-                    driver
-                        .meta_interp_mut()
-                        .warm_state_mut()
-                        .disable_noninlinable_function(callee_key);
+                // pyjitpl.py:1376-1423 _opimpl_recursive_call parity:
+                // Compute assembler_call boolean. For self-recursive calls,
+                // InlineDecision already encodes the RPython decision:
+                //   Inline → recursive_depth < max_unroll → perform_call
+                //   CallAssembler → recursive_depth >= max_unroll, has token
+                //   ResidualCall → recursive_depth >= max_unroll, no token
+                let assembler_call;
+                if is_self_recursive {
+                    if inline_decision == majit_metainterp::InlineDecision::Inline {
+                        // pyjitpl.py:1414-1416: RPython would perform_call
+                        // (trace-through) here. Pyre's PendingInlineFrame
+                        // doesn't yet support recursive loop detection
+                        // (reached_loop_header pyjitpl.py:2950), so
+                        // self-recursive trace-through produces over-
+                        // specialized traces. Promote to assembler_call
+                        // when a token exists; residual call otherwise.
+                        // Phase 3: replace with perform_call once loop
+                        // detection is ready.
+                        assembler_call = driver
+                            .get_loop_token_number(callee_key)
+                            .or_else(|| driver.get_pending_token_number(callee_key))
+                            .is_some();
+                    } else {
+                        // pyjitpl.py:1404-1413: recursion exceeds limit.
+                        // dont_trace_here(greenboxes) — mark for future calls.
+                        if callee_inline_eligible {
+                            driver
+                                .meta_interp_mut()
+                                .warm_state_mut()
+                                .disable_noninlinable_function(callee_key);
+                        }
+                        // pyjitpl.py:1417: assembler_call = True when token exists
+                        assembler_call =
+                            inline_decision == majit_metainterp::InlineDecision::CallAssembler;
+                    }
+                } else {
+                    assembler_call =
+                        inline_decision == majit_metainterp::InlineDecision::CallAssembler;
                 }
 
-                // RPython _opimpl_recursive_call() traces recursive portal
-                // calls via perform_call() only until max_unroll_recursion is
-                // hit, then forces the residual/assembler path so the current
-                // trace can converge. Mirror that here instead of letting
-                // self-recursive trace-through run until trace-too-long.
-                let tracing_recursive_function_entry =
-                    is_self_recursive && root_trace_green_key == current_function_key;
-                let can_trace_through = callee_inline_eligible
-                    && nargs <= 4
-                    && if is_self_recursive {
-                        // RPython pyjitpl.py reached_loop_header(): when a
-                        // function-entry trace re-enters the same portal, the
-                        // recursive call is handed off with
-                        // do_recursive_call(..., assembler_call=True)
-                        // instead of tracing through the nested portal body as
-                        // an ordinary inline helper. Keep pyre on the same
-                        // side of that boundary: root function-entry traces do
-                        // not recursively trace-through "self"; they converge
-                        // to CALL_ASSEMBLER via the pending token path below.
-                        !tracing_recursive_function_entry
-                            && inline_decision == majit_metainterp::InlineDecision::Inline
-                            && recursive_depth < max_unroll_recursion
-                    } else {
-                        !callee_prefers_function_entry && !callee_has_loop
-                    };
+                // pyjitpl.py:1414-1416: perform_call when recursion under limit.
+                // Non-self calls: trace-through small acyclic helpers.
+                // Self-recursive: disabled until Phase 3 (loop detection).
+                let can_trace_through = if is_self_recursive {
+                    false
+                } else {
+                    callee_inline_eligible
+                        && nargs <= 4
+                        && !callee_prefers_function_entry
+                        && !callee_has_loop
+                };
 
                 if majit_metainterp::majit_log_enabled() {
                     eprintln!(
-                        "[jit][direct-call] key={} nargs={} inline_eligible={} self_recursive={} recursive_depth={} max_unroll_recursion={} prefers_func_entry={} has_loop={} inline_active={} can_trace_through={}",
+                        "[jit][direct-call] key={} nargs={} inline_eligible={} self_recursive={} recursive_depth={} max_unroll={} assembler_call={} can_trace_through={}",
                         callee_key,
                         nargs,
                         callee_inline_eligible,
                         is_self_recursive,
                         recursive_depth,
                         max_unroll_recursion,
-                        callee_prefers_function_entry,
-                        callee_has_loop,
-                        inline_framestack_active,
+                        assembler_call,
                         can_trace_through,
                     );
                 }
@@ -2767,6 +2780,7 @@ impl MIFrame {
                             callee_key,
                             frame_helper,
                             concrete_args,
+                            assembler_call,
                         );
                     }
                 }
@@ -3088,6 +3102,7 @@ impl MIFrame {
                                 callee_key,
                                 frame_helper,
                                 concrete_args,
+                                assembler_call,
                             );
                         }
                     }
@@ -3314,8 +3329,10 @@ impl MIFrame {
         })
     }
 
-    /// CallMayForce-based inline: opaque helper call.
-    /// Fallback for self-recursion or when trace-through is not available.
+    /// pyjitpl.py:1425-1432 do_recursive_call +
+    /// pyjitpl.py:1995-2083 do_residual_call parity.
+    /// When assembler_call=true, emits CALL_ASSEMBLER via token lookup.
+    /// Otherwise emits CALL_MAY_FORCE (normal residual call).
     fn inline_function_call(
         &mut self,
         callable: OpRef,
@@ -3324,6 +3341,7 @@ impl MIFrame {
         callee_key: u64,
         frame_helper: *const (),
         passed_concrete_args: &[PyObjectRef],
+        assembler_call: bool,
     ) -> Result<OpRef, PyError> {
         let (driver, _) = crate::driver::driver_pair();
         let concrete_arg0 = if args.len() == 1 {
@@ -3355,13 +3373,16 @@ impl MIFrame {
                     };
                     // pyjitpl.py:2017: do_residual_call step 1
                     this.vable_and_vrefs_before_residual_call(ctx);
-                    // pyjitpl.py:1425 do_recursive_call parity:
-                    // ALL recursive portal calls use CALL_ASSEMBLER when
-                    // a compiled or pending token exists — not just
-                    // self-recursive ones.
-                    let ca_token = driver
-                        .get_loop_token_number(callee_key)
-                        .or_else(|| driver.get_pending_token_number(callee_key));
+                    // pyjitpl.py:2053-2055: direct_assembler_call only when
+                    // assembler_call=True (computed in _opimpl_recursive_call).
+                    // Token lookup happens AFTER the decision, not before.
+                    let ca_token = if assembler_call {
+                        driver
+                            .get_loop_token_number(callee_key)
+                            .or_else(|| driver.get_pending_token_number(callee_key))
+                    } else {
+                        None
+                    };
                     let result = if let Some(token_number) = ca_token {
                         // pyjitpl.py:3589-3609 direct_assembler_call parity:
                         // CALL_ASSEMBLER takes [caller_frame, boxed_arg].
