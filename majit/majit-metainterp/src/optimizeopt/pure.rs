@@ -1143,6 +1143,46 @@ impl Optimization for OptPure {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn initialize_imported_short_pure_builder(
+        ctx: &mut OptContext,
+        preamble_op: Op,
+        label_arg_idx: Option<usize>,
+    ) {
+        let source = preamble_op.pos;
+        let short_inputargs: Vec<OpRef> = match label_arg_idx {
+            Some(idx) => (0..=idx as u32).map(OpRef).collect(),
+            None => vec![OpRef(0)],
+        };
+        ctx.initialize_imported_short_preamble_builder(
+            &short_inputargs,
+            &short_inputargs,
+            &[crate::optimizeopt::shortpreamble::PreambleOp {
+                op: preamble_op,
+                kind: crate::optimizeopt::shortpreamble::PreambleOpKind::Pure,
+                label_arg_idx,
+                invented_name: false,
+                same_as_source: None,
+            }],
+        );
+        // Keep the source result available to use_box() exactly like the
+        // imported short preamble path does after unroll import.
+        if source != OpRef::NONE {
+            ctx.potential_extra_ops.insert(
+                source,
+                crate::optimizeopt::info::PreambleOp {
+                    op: source,
+                    resolved: source,
+                    invented_name: false,
+                    preamble_op: {
+                        let mut same_as = Op::new(OpCode::SameAsI, &[source]);
+                        same_as.pos = source;
+                        same_as
+                    },
+                },
+            );
+        }
+    }
     use crate::optimizeopt::optimizer::Optimizer;
     use majit_ir::Type;
     use majit_ir::descr::make_field_descr_full;
@@ -1971,27 +2011,34 @@ mod tests {
     fn test_imported_short_pure_result_replays_into_pure_cache() {
         let mut pass = OptPure::new();
         let mut ctx = OptContext::with_num_inputs(6, 0);
-        ctx.make_constant(OpRef(10), majit_ir::Value::Int(7));
-        ctx.imported_short_pure_ops
-            .push(crate::optimizeopt::ImportedShortPureOp::new(
-                OpCode::IntAdd,
-                None,
-                vec![
-                    crate::optimizeopt::ImportedShortPureArg::OpRef(OpRef(0)),
-                    crate::optimizeopt::ImportedShortPureArg::Const(
-                        majit_ir::Value::Int(7),
-                        OpRef(10),
-                    ),
-                ],
-                OpRef(1),
-                OpRef(1),
-                false,
-            ));
+        let const_opref = OpRef::from_const(10);
+        ctx.seed_constant(const_opref, majit_ir::Value::Int(7));
+        let imported = crate::optimizeopt::ImportedShortPureOp::new(
+            OpCode::IntAdd,
+            None,
+            vec![
+                crate::optimizeopt::ImportedShortPureArg::OpRef(OpRef(0)),
+                crate::optimizeopt::ImportedShortPureArg::Const(
+                    majit_ir::Value::Int(7),
+                    const_opref,
+                ),
+            ],
+            OpRef(1),
+            OpRef(1),
+            false,
+        );
+        initialize_imported_short_pure_builder(
+            &mut ctx,
+            imported.pop.preamble_op.clone(),
+            Some(1),
+        );
+        ctx.imported_short_pure_ops.push(imported);
 
         pass.setup();
         pass.install_preamble_pure_ops(&ctx);
 
         let mut op = Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(10)]);
+        op.args[1] = const_opref;
         op.pos = OpRef(2);
         let result = pass.propagate_forward(&op, &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
@@ -2045,7 +2092,8 @@ mod tests {
     fn test_imported_short_call_pure_result_replays_into_pure_cache() {
         let mut pass = OptPure::new();
         let mut ctx = OptContext::with_num_inputs(8, 0);
-        ctx.make_constant(OpRef(10), majit_ir::Value::Int(0x1234));
+        let const_opref = OpRef::from_const(10);
+        ctx.seed_constant(const_opref, majit_ir::Value::Int(0x1234));
         let call_descr = majit_ir::descr::make_call_descr_full(
             77,
             vec![majit_ir::Type::Int, majit_ir::Type::Int],
@@ -2054,26 +2102,31 @@ mod tests {
             8,
             majit_ir::EffectInfo::elidable(),
         );
-        ctx.imported_short_pure_ops
-            .push(crate::optimizeopt::ImportedShortPureOp::new(
-                OpCode::CallPureI,
-                Some(call_descr.clone()),
-                vec![
-                    crate::optimizeopt::ImportedShortPureArg::Const(
-                        majit_ir::Value::Int(0x1234),
-                        OpRef(10),
-                    ),
-                    crate::optimizeopt::ImportedShortPureArg::OpRef(OpRef(0)),
-                ],
-                OpRef(1),
-                OpRef(1),
-                false,
-            ));
+        let imported = crate::optimizeopt::ImportedShortPureOp::new(
+            OpCode::CallPureI,
+            Some(call_descr.clone()),
+            vec![
+                crate::optimizeopt::ImportedShortPureArg::Const(
+                    majit_ir::Value::Int(0x1234),
+                    const_opref,
+                ),
+                crate::optimizeopt::ImportedShortPureArg::OpRef(OpRef(0)),
+            ],
+            OpRef(1),
+            OpRef(1),
+            false,
+        );
+        initialize_imported_short_pure_builder(
+            &mut ctx,
+            imported.pop.preamble_op.clone(),
+            Some(1),
+        );
+        ctx.imported_short_pure_ops.push(imported);
 
         pass.setup();
         pass.install_preamble_pure_ops(&ctx);
 
-        let mut op = Op::new(OpCode::CallPureI, &[OpRef(10), OpRef(0)]);
+        let mut op = Op::new(OpCode::CallPureI, &[const_opref, OpRef(0)]);
         op.pos = OpRef(2);
         op.descr = Some(call_descr);
         let result = pass.propagate_forward(&op, &mut ctx);

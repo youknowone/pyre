@@ -1936,6 +1936,19 @@ mod tests {
         idx: u32,
     }
 
+    #[derive(Debug)]
+    struct TestParentSizeDescr {
+        idx: u32,
+        field_type: majit_ir::Type,
+        all_field_descrs: Vec<Arc<dyn FieldDescr>>,
+    }
+
+    #[derive(Debug)]
+    struct TestParentFieldDescr {
+        idx: u32,
+        field_type: majit_ir::Type,
+    }
+
     impl Descr for TestFieldDescr {
         fn index(&self) -> u32 {
             self.idx
@@ -1947,7 +1960,7 @@ mod tests {
 
     impl FieldDescr for TestFieldDescr {
         fn get_parent_descr(&self) -> Option<DescrRef> {
-            None
+            Some(test_parent_size_descr(self.idx, majit_ir::Type::Int))
         }
         fn index_in_parent(&self) -> usize {
             self.idx as usize
@@ -1967,8 +1980,9 @@ mod tests {
     /// except `field_type() == Type::Ref`; used by test fixtures that
     /// need a Ref-valued field (e.g. a `next` pointer in a linked
     /// node). Both implementations override `get_parent_descr` to
-    /// return a fresh SizeDescr each call so the test doesn't need to
-    /// keep a Weak parent alive.
+    /// return a fresh parent-backed SizeDescr each call so stale
+    /// hand-written descriptors still obey the optimizer's
+    /// "non-typeptr fields always know their parent" contract.
     #[derive(Debug)]
     struct TestRefFieldDescr {
         idx: u32,
@@ -1985,7 +1999,7 @@ mod tests {
 
     impl FieldDescr for TestRefFieldDescr {
         fn get_parent_descr(&self) -> Option<DescrRef> {
-            Some(size_descr(0xFFFF_0000))
+            Some(test_parent_size_descr(self.idx, majit_ir::Type::Ref))
         }
         fn offset(&self) -> usize {
             self.idx as usize * 8
@@ -1999,6 +2013,77 @@ mod tests {
         fn index_in_parent(&self) -> usize {
             self.idx as usize
         }
+    }
+
+    impl Descr for TestParentSizeDescr {
+        fn index(&self) -> u32 {
+            0xFFFF_0000 | self.idx
+        }
+        fn as_size_descr(&self) -> Option<&dyn majit_ir::SizeDescr> {
+            Some(self)
+        }
+    }
+
+    impl majit_ir::SizeDescr for TestParentSizeDescr {
+        fn size(&self) -> usize {
+            64
+        }
+        fn type_id(&self) -> u32 {
+            0xFFFF_0000 | self.idx
+        }
+        fn is_immutable(&self) -> bool {
+            false
+        }
+        fn all_field_descrs(&self) -> &[Arc<dyn FieldDescr>] {
+            &self.all_field_descrs
+        }
+    }
+
+    impl Descr for TestParentFieldDescr {
+        fn index(&self) -> u32 {
+            self.idx
+        }
+        fn as_field_descr(&self) -> Option<&dyn FieldDescr> {
+            Some(self)
+        }
+    }
+
+    impl FieldDescr for TestParentFieldDescr {
+        fn get_parent_descr(&self) -> Option<DescrRef> {
+            None
+        }
+        fn index_in_parent(&self) -> usize {
+            self.idx as usize
+        }
+        fn offset(&self) -> usize {
+            self.idx as usize * 8
+        }
+        fn field_size(&self) -> usize {
+            8
+        }
+        fn field_type(&self) -> majit_ir::Type {
+            self.field_type
+        }
+    }
+
+    fn test_parent_size_descr(idx: u32, field_type: majit_ir::Type) -> DescrRef {
+        let all_field_descrs: Vec<Arc<dyn FieldDescr>> = (0..=idx)
+            .map(|field_idx| {
+                Arc::new(TestParentFieldDescr {
+                    idx: field_idx,
+                    field_type: if field_idx == idx {
+                        field_type
+                    } else {
+                        majit_ir::Type::Int
+                    },
+                }) as Arc<dyn FieldDescr>
+            })
+            .collect();
+        Arc::new(TestParentSizeDescr {
+            idx,
+            field_type,
+            all_field_descrs,
+        })
     }
 
     #[derive(Debug)]

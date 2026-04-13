@@ -3221,6 +3221,43 @@ mod tests {
         Arc::new(ImmutableDescr(idx))
     }
 
+    fn initialize_imported_short_heap_field(
+        ctx: &mut OptContext,
+        object: OpRef,
+        descr: &DescrRef,
+        source: OpRef,
+        resolved: OpRef,
+        opcode: OpCode,
+    ) {
+        use crate::optimizeopt::info::{PreambleOp, PtrInfo};
+
+        let mut preamble_op = Op::with_descr(opcode, &[object], descr.clone());
+        preamble_op.pos = source;
+        ctx.initialize_imported_short_preamble_builder(
+            &[object, resolved],
+            &[object, resolved],
+            &[crate::optimizeopt::shortpreamble::PreambleOp {
+                op: preamble_op.clone(),
+                kind: crate::optimizeopt::shortpreamble::PreambleOpKind::Heap,
+                label_arg_idx: Some(1),
+                invented_name: false,
+                same_as_source: None,
+            }],
+        );
+        ctx.set_ptr_info(object, PtrInfo::instance(None, None));
+        ctx.get_ptr_info_mut(object)
+            .unwrap()
+            .set_preamble_field(
+                descr.index(),
+                PreambleOp {
+                    op: source,
+                    resolved,
+                    invented_name: false,
+                    preamble_op,
+                },
+            );
+    }
+
     /// Call descriptor with default EffectInfo (non-random, non-elidable).
     /// heapcache.py:362-370 parity: plain calls with known effectinfo
     /// use invalidate_unescaped instead of full reset.
@@ -3292,24 +3329,16 @@ mod tests {
 
     #[test]
     fn test_imported_short_cached_fields_replays_into_heap() {
-        use crate::optimizeopt::info::{PreambleOp, PtrInfo};
         let d = descr(55);
         let mut heap = OptHeap::new();
         let mut ctx = OptContext::with_num_inputs(4, 2);
-        // RPython PreambleOp parity: store PreambleOp in PtrInfo
-        ctx.set_ptr_info(OpRef(0), PtrInfo::instance(None, None));
-        ctx.get_ptr_info_mut(OpRef(0)).unwrap().set_preamble_field(
-            d.index(),
-            PreambleOp {
-                op: OpRef(100),
-                resolved: OpRef(1),
-                invented_name: false,
-                preamble_op: {
-                    let mut op = majit_ir::Op::new(majit_ir::OpCode::SameAsI, &[OpRef(100)]);
-                    op.pos = OpRef(100);
-                    op
-                },
-            },
+        initialize_imported_short_heap_field(
+            &mut ctx,
+            OpRef(0),
+            &d,
+            OpRef(100),
+            OpRef(1),
+            OpCode::GetfieldGcI,
         );
 
         let mut op = Op::with_descr(OpCode::GetfieldGcI, &[OpRef(0)], d);
@@ -3331,22 +3360,13 @@ mod tests {
         let d_size = descr(11); // size field (different)
         let mut heap = OptHeap::new();
         let mut ctx = OptContext::with_num_inputs(4, 4);
-
-        // RPython PreambleOp parity: store PreambleOp in PtrInfo
-        use crate::optimizeopt::info::{PreambleOp, PtrInfo};
-        ctx.set_ptr_info(OpRef(0), PtrInfo::instance(None, None));
-        ctx.get_ptr_info_mut(OpRef(0)).unwrap().set_preamble_field(
-            d_head.index(),
-            PreambleOp {
-                op: OpRef(100),
-                resolved: OpRef(1),
-                invented_name: false,
-                preamble_op: {
-                    let mut op = majit_ir::Op::new(majit_ir::OpCode::SameAsI, &[OpRef(100)]);
-                    op.pos = OpRef(100);
-                    op
-                },
-            },
+        initialize_imported_short_heap_field(
+            &mut ctx,
+            OpRef(0),
+            &d_head,
+            OpRef(100),
+            OpRef(1),
+            OpCode::GetfieldGcR,
         );
 
         // First getfield on head: consumes the import, caches the value.

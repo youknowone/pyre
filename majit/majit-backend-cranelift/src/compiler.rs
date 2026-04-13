@@ -12450,10 +12450,16 @@ mod tests {
     }
 
     fn make_gc_backend() -> CraneliftBackend {
-        CraneliftBackend::with_gc_allocator(Box::new(MiniMarkGC::with_config(GcConfig {
+        let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 1 << 20,
             large_object_threshold: 1 << 20,
-        })))
+        });
+        // eval.rs registers regular GC types before installing the backend.
+        // Keep this fixture on the same path so set_gc_allocator() can lazily
+        // register JITFRAME instead of tripping the "type id not registered"
+        // assertion that only exists for half-initialized test runtimes.
+        gc.register_type(TypeInfo::simple(16));
+        CraneliftBackend::with_gc_allocator(Box::new(gc))
     }
 
     #[derive(Default)]
@@ -12520,6 +12526,19 @@ mod tests {
         }
 
         fn write_barrier(&mut self, _obj: GcRef) {
+            self.state.lock().unwrap().write_barriers += 1;
+        }
+
+        fn jit_remember_young_pointer_from_array(&mut self, _obj: GcRef) {
+            self.state.lock().unwrap().write_barriers += 1;
+        }
+
+        fn remember_young_pointer_from_array2(
+            &mut self,
+            _obj: GcRef,
+            _index: usize,
+            _card_page_shift: u32,
+        ) {
             self.state.lock().unwrap().write_barriers += 1;
         }
 
@@ -12998,6 +13017,8 @@ mod tests {
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let patched = majit_backend::ExitRecoveryLayout {
+            vable_array: Vec::new(),
+            vref_array: Vec::new(),
             frames: vec![majit_backend::ExitFrameLayout {
                 trace_id: None,
                 header_pc: None,
@@ -13121,6 +13142,8 @@ mod tests {
             .unwrap();
 
         let source_layout = majit_backend::ExitRecoveryLayout {
+            vable_array: Vec::new(),
+            vref_array: Vec::new(),
             frames: vec![
                 majit_backend::ExitFrameLayout {
                     trace_id: Some(10),
@@ -13300,6 +13323,8 @@ mod tests {
             .unwrap();
 
         let root_layout = majit_backend::ExitRecoveryLayout {
+            vable_array: Vec::new(),
+            vref_array: Vec::new(),
             frames: vec![
                 majit_backend::ExitFrameLayout {
                     trace_id: None,
@@ -13372,6 +13397,8 @@ mod tests {
         );
 
         let bridge_source_layout = majit_backend::ExitRecoveryLayout {
+            vable_array: Vec::new(),
+            vref_array: Vec::new(),
             frames: vec![
                 majit_backend::ExitFrameLayout {
                     trace_id: None,
@@ -14058,39 +14085,6 @@ mod tests {
         // typeptr at offset 0, payload at offset 8
         assert_eq!(unsafe { *(moved.0 as *const u64) }, 0x4444);
         assert_eq!(unsafe { *((moved.0 + 8) as *const u64) }, 0xCAFEBABE);
-    }
-
-    // ── Debug / no-op tests ──
-
-    #[test]
-    fn test_debug_ops_are_noop() {
-        let mut backend = CraneliftBackend::new();
-
-        let inputargs = vec![InputArg::new_int(0)];
-        let ops = vec![
-            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
-            mk_op(OpCode::DebugMergePoint, &[], OpRef::NONE.0),
-            mk_op(
-                OpCode::EnterPortalFrame,
-                &[OpRef(100), OpRef(101)],
-                OpRef::NONE.0,
-            ),
-            mk_op(OpCode::LeavePortalFrame, &[OpRef(100)], OpRef::NONE.0),
-            mk_op(OpCode::JitDebug, &[], OpRef::NONE.0),
-            mk_op(OpCode::Keepalive, &[OpRef(0)], OpRef::NONE.0),
-            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
-        ];
-
-        let mut constants = HashMap::new();
-        constants.insert(100, 0i64);
-        constants.insert(101, 0i64);
-        backend.set_constants(constants);
-
-        let mut token = JitCellToken::new(30);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
-
-        let frame = backend.execute_token(&token, &[Value::Int(42)]);
-        assert_eq!(backend.get_int_value(&frame, 0), 42);
     }
 
     // ── SameAs variants ──

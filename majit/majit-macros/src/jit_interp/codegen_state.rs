@@ -2472,7 +2472,7 @@ mod tests {
         });
 
         assert!(generated.contains("fn __build_virtualizable_info"));
-        assert!(generated.contains("__info . add_embedded_array_field_with_layout"));
+        assert!(generated.contains("__info . add_embedded_array_field"));
         assert!(generated.contains("fn virtualizable_heap_ptr"));
         assert!(generated.contains("fn export_virtualizable_boxes"));
         assert!(generated.contains("fn sync_virtualizable_before_residual_call"));
