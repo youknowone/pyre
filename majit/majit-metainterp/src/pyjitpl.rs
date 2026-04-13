@@ -7001,11 +7001,14 @@ impl<M: Clone> MetaInterp<M> {
                 return InlineDecision::ResidualCall;
             }
 
-            // Self-recursion: PyPy max_unroll_recursion strategy.
-            // RPython warmstate.py:714 get_assembler_token: when the
-            // callee is not yet compiled, compile_tmp_callback creates
-            // a temporary token so CALL_ASSEMBLER can still be emitted.
-            // In pyre, pending_token serves the same role.
+            // pyjitpl.py:1382-1416 _opimpl_recursive_call:
+            // Self-recursion uses max_unroll_recursion strategy.
+            // depth < max_unroll → Inline (perform_call path).
+            // depth >= max_unroll → CallAssembler if token exists.
+            // RPython's get_assembler_token (warmstate.py:714) creates
+            // a compile_tmp_callback when no token exists. Pyre lacks
+            // compile_tmp_callback, so ResidualCall when no token.
+            // dont_trace_here is called by the dispatch site (Phase 1).
             if is_self_recursive {
                 if recursive_depth < self.max_unroll_recursion {
                     return InlineDecision::Inline;
@@ -7013,7 +7016,6 @@ impl<M: Clone> MetaInterp<M> {
                 if callee_compiled || self.pending_token.map_or(false, |(k, _)| k == callee_key) {
                     return InlineDecision::CallAssembler;
                 }
-                self.warm_state.boost_function_entry(callee_key);
                 return InlineDecision::ResidualCall;
             }
 
