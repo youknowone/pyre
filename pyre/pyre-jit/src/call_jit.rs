@@ -1156,7 +1156,27 @@ pub fn resume_in_blackhole(
         // _callback_r → write_a_ref. pyre: all Python locals are
         // PyObjectRef → ref bank only (codewriter uses move_r).
         // Override the pre-filled values with the liveness-filtered recovery data.
-        if use_liveness {
+        if n_vals == 0 && nlocals > 0 {
+            // RPython parity: when resume data has no values (nvals=0),
+            // consume_vable_info has already written correct values to
+            // the live frame. Load locals directly from the frame's
+            // locals_cells_stack_w array into bh.registers_r so the
+            // blackhole can execute with correct operand values.
+            let frame = unsafe { &*frame_ptr };
+            for i in 0..nlocals.min(frame.locals_cells_stack_w.len()) {
+                let obj = frame.locals_cells_stack_w[i];
+                if obj != pyre_object::PY_NULL {
+                    bh.setarg_r(i, obj as i64);
+                }
+            }
+            if majit_metainterp::majit_log_enabled() {
+                eprintln!(
+                    "[jit][vable-fill] nvals=0 → loaded {} locals from frame at py_pc={}",
+                    nlocals.min(frame.locals_cells_stack_w.len()),
+                    section.py_pc,
+                );
+            }
+        } else if use_liveness {
             if let Some(info) = liveness_info {
                 for (val_idx, &reg_idx) in info.live_r_regs.iter().enumerate() {
                     let idx = reg_idx as usize;
