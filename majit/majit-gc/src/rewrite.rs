@@ -41,6 +41,11 @@ pub struct GcRewriterImpl {
     /// JitFrame info for call_assembler rewriting.
     /// rewrite.py:665 — handle_call_assembler needs frame layout info.
     pub jitframe_info: Option<JitFrameDescrs>,
+    /// Type annotations for constant OpRefs. RPython's ConstPtr/ConstInt
+    /// boxes carry `.type` intrinsically; here we pass constant types
+    /// from the optimizer so the rewriter can check `v.type == 'r'` on
+    /// constant values (rewrite.py:930).
+    pub constant_types: HashMap<u32, Type>,
 }
 
 /// JitFrame field descriptors for handle_call_assembler.
@@ -107,6 +112,12 @@ struct RewriteState {
     next_pos: u32,
     /// Constant pool (from optimizer) — maps OpRef key → i64 value.
     constants: HashMap<u32, i64>,
+    /// rewrite.py:930 parity — structural equivalent of Box.type.
+    /// Maps OpRef.0 → Type for all known values (both op results and
+    /// constants). In RPython each Box carries its own `.type` attribute;
+    /// here we mirror that with an explicit lookup table because OpRef
+    /// is a plain u32 without embedded type information.
+    result_types: HashMap<u32, Type>,
 
     // ── Nursery batching ──
     /// The index in `out` of the current CALL_MALLOC_NURSERY op, if any.
@@ -121,9 +132,10 @@ struct RewriteState {
     last_malloced_ref: OpRef,
 
     // ── Write barrier tracking ──
-    /// Set of OpRef indices whose write barrier has already been emitted
-    /// (freshly allocated objects, or objects we already issued a WB for).
-    /// Cleared whenever we emit an operation that can trigger a collection.
+    /// rewrite.py:41-45: _write_barrier_applied — set of OpRef indices
+    /// whose write barrier has already been emitted (freshly allocated
+    /// objects, or objects we already issued a WB for). Cleared whenever
+    /// we emit an operation that can trigger a collection or on LABEL.
     wb_applied: HashSet<u32>,
     /// Forwarding map from original result OpRefs to rewritten result OpRefs.
     forwarding: HashMap<u32, OpRef>,
@@ -133,6 +145,12 @@ struct RewriteState {
     /// duplicate a `COND_CALL_GC_WB_ARRAY` immediately followed by the
     /// corresponding `SETARRAYITEM_GC`.
     pending_array_wb: Option<u32>,
+
+    // ── Array length tracking (rewrite.py:59 _known_lengths) ──
+    /// Maps array OpRef → known length. Populated when NEW_ARRAY has a
+    /// constant length operand (rewrite.py:551). Cleared on LABEL
+    /// (rewrite.py:1005) and emitting_can_collect.
+    known_lengths: HashMap<u32, usize>,
 
     // ── Pending zero tracking ──
     /// Deferred ZERO_ARRAY ops that may be optimized away if subsequent
@@ -158,6 +176,7 @@ impl RewriteState {
             out: Vec::with_capacity(hint + hint / 4),
             next_pos,
             constants: HashMap::new(),
+            result_types: HashMap::new(),
             pending_malloc_idx: None,
             pending_malloc_total: 0,
             previous_size: 0,
@@ -165,6 +184,7 @@ impl RewriteState {
             wb_applied: HashSet::new(),
             forwarding: HashMap::new(),
             pending_array_wb: None,
+            known_lengths: HashMap::new(),
             pending_zeros: Vec::new(),
             initialized_indices: HashMap::new(),
             pending_vtable_inits: Vec::new(),
@@ -231,20 +251,46 @@ impl RewriteState {
         pos
     }
 
-    /// Mark that we are about to emit something that can trigger GC.
-    /// This invalidates nursery batching and write barrier memoisation.
+    /// rewrite.py:699-711 emitting_an_operation_that_can_collect
     fn emitting_can_collect(&mut self) {
         self.pending_malloc_idx = None;
         self.wb_applied.clear();
         self.pending_array_wb = None;
+        self.emit_pending_zeros();
     }
 
     fn remember_wb(&mut self, r: OpRef) {
         self.wb_applied.insert(r.0);
     }
 
+    /// rewrite.py:66-67: remember_known_length
+    fn remember_known_length(&mut self, op: OpRef, length: usize) {
+        self.known_lengths.insert(op.0, length);
+    }
+
+    /// rewrite.py:81-82: known_length(op, default)
+    fn known_length(&self, op: OpRef, default: usize) -> usize {
+        self.known_lengths.get(&op.0).copied().unwrap_or(default)
+    }
+
+    /// rewrite.py:714: write_barrier_applied(op)
     fn wb_already_applied(&self, r: OpRef) -> bool {
         self.wb_applied.contains(&r.0)
+    }
+
+    /// rewrite.py:930 parity: `v.type` — get the type of an OpRef.
+    fn result_type_of(&self, r: OpRef) -> Option<Type> {
+        self.result_types.get(&r.0).copied()
+    }
+
+    /// rewrite.py:930 parity: `isinstance(v, ConstPtr) and not needs_write_barrier(v.value)`.
+    /// A null ConstPtr never needs a write barrier.
+    fn is_null_constant(&self, r: OpRef) -> bool {
+        if let Some(&val) = self.constants.get(&r.0) {
+            val == 0
+        } else {
+            false
+        }
     }
 
     fn resolve(&self, r: OpRef) -> OpRef {
@@ -309,7 +355,7 @@ impl RewriteState {
 
     /// Flush all pending ZERO_ARRAY ops, emitting optimized versions
     /// that skip indices already covered by SETARRAYITEM writes.
-    fn flush_pending_zeros(&mut self) {
+    fn emit_pending_zeros(&mut self) {
         let pending = std::mem::take(&mut self.pending_zeros);
         let inited = std::mem::take(&mut self.initialized_indices);
 
@@ -470,6 +516,12 @@ impl GcRewriterImpl {
             }
         }
 
+        // rewrite.py:551: if isinstance(v_length, ConstInt):
+        //     self.remember_known_length(op, v_length.getint())
+        if let Some(num_elem) = st.resolve_constant(v_length.0) {
+            st.remember_known_length(result, num_elem as usize);
+        }
+
         // Don't add to wb_applied: large young arrays may need card
         // marking, so the GC still relies on write barriers.
     }
@@ -495,15 +547,34 @@ impl GcRewriterImpl {
             }
         }
 
-        // Determine whether the stored value is a Ref type from the field descriptor.
-        let is_ref_store = op
+        // rewrite.py:930-931: check the stored VALUE's type.
+        //   v = op.getarg(1)
+        //   if (v.type == 'r' and (not isinstance(v, ConstPtr) or
+        //       rgc.needs_write_barrier(v.value))):
+        //
+        // Gate on field descriptor: if the field is not a pointer field,
+        // the GC won't trace it, so no WB is needed regardless of value
+        // type. In RPython val.type=='r' implies the field is GCREF;
+        // here ForceToken (Ref) stores to an Int-typed field (offset 128),
+        // a pyre-specific divergence.
+        let field_is_ptr = op
             .descr
             .as_ref()
             .and_then(|d| d.as_field_descr())
             .map(|fd| fd.is_pointer_field())
             .unwrap_or(false);
+        let val = rewritten.arg(1);
+        let val_is_ref = if field_is_ptr {
+            match st.result_type_of(val) {
+                Some(tp) => tp == Type::Ref,
+                None => true, // field is ptr → assume value is Ref
+            }
+        } else {
+            false
+        };
+        let is_null_const = val_is_ref && st.is_null_constant(val);
 
-        if is_ref_store && !st.wb_already_applied(obj) {
+        if val_is_ref && !is_null_const && !st.wb_already_applied(obj) {
             // Emit COND_CALL_GC_WB(obj) before the store.
             let wb_op = Op::new(OpCode::CondCallGcWb, &[obj]);
             st.emit(wb_op);
@@ -515,7 +586,8 @@ impl GcRewriterImpl {
     }
 
     // ────────────────────────────────────────────────────────
-    // SETARRAYITEM_GC  → maybe COND_CALL_GC_WB_ARRAY + SETARRAYITEM_GC
+    // SETARRAYITEM_GC  → maybe COND_CALL_GC_WB{_ARRAY} + SETARRAYITEM_GC
+    // rewrite.py:936-946 handle_write_barrier_setarrayitem
     // ────────────────────────────────────────────────────────
 
     fn handle_setarrayitem_gc(&self, op: &Op, st: &mut RewriteState) {
@@ -529,28 +601,63 @@ impl GcRewriterImpl {
             st.record_setarrayitem_index(obj, index_ref.0 as usize);
         }
 
-        let is_ref_store = op
-            .descr
-            .as_ref()
-            .and_then(|d| d.as_array_descr())
-            .map(|ad| ad.is_array_of_pointers())
-            .unwrap_or(false);
-
         if st.take_pending_array_wb(obj) {
             st.emit(rewritten);
             return;
         }
 
-        if is_ref_store && !st.wb_already_applied(obj) {
-            // For arrays we emit the array variant which also passes the index.
-            let index = rewritten.arg(1);
-            let wb_op = Op::new(OpCode::CondCallGcWbArray, &[obj, index]);
-            st.emit(wb_op);
-            // Array WB is not enough to skip future barriers (card marking).
-            // So we intentionally do NOT remember_wb here.
+        // rewrite.py:938-941: check the stored VALUE's type (arg2).
+        //   val = op.getarg(0)  [the base object]
+        //   if not self.write_barrier_applied(val):
+        //       v = op.getarg(2)
+        //       if (v.type == 'r' and (not isinstance(v, ConstPtr) or
+        //           rgc.needs_write_barrier(v.value))):
+        //           self.gen_write_barrier_array(val, op.getarg(1))
+        if !st.wb_already_applied(obj) {
+            let v = rewritten.arg(2);
+            let val_is_ref = match st.result_type_of(v) {
+                Some(tp) => tp == Type::Ref,
+                None => op
+                    .descr
+                    .as_ref()
+                    .and_then(|d| d.as_array_descr())
+                    .map(|ad| ad.is_array_of_pointers())
+                    .unwrap_or(false),
+            };
+            let is_null_const = val_is_ref && st.is_null_constant(v);
+
+            if val_is_ref && !is_null_const {
+                self.gen_write_barrier_array(obj, rewritten.arg(1), st);
+            }
         }
 
         st.emit(rewritten);
+    }
+
+    // ────────────────────────────────────────────────────────
+    // rewrite.py:955-973 gen_write_barrier_array
+    // ────────────────────────────────────────────────────────
+
+    fn gen_write_barrier_array(&self, v_base: OpRef, v_index: OpRef, st: &mut RewriteState) {
+        if self.wb_descr.jit_wb_cards_set != 0 {
+            // If we know statically the length of 'v_base', and it is not
+            // too big, then produce a regular write_barrier. If it's
+            // unknown or too big, produce a write_barrier_from_array.
+            const LARGE: usize = 130;
+            let length = st.known_length(v_base, LARGE);
+            if length >= LARGE {
+                // Unknown or too big: produce COND_CALL_GC_WB_ARRAY.
+                let wb_op = Op::new(OpCode::CondCallGcWbArray, &[v_base, v_index]);
+                st.emit(wb_op);
+                // rewrite.py:970: a WB_ARRAY is not enough to prevent
+                // any future write barriers, so don't remember_wb!
+                return;
+            }
+        }
+        // Fall-back: produce a regular write_barrier.
+        let wb_op = Op::new(OpCode::CondCallGcWb, &[v_base]);
+        st.emit(wb_op);
+        st.remember_wb(v_base);
     }
 
     // ────────────────────────────────────────────────────────
@@ -788,7 +895,19 @@ impl GcRewriter for GcRewriterImpl {
             .max()
             .map_or(0, |max_pos| max_pos.saturating_add(1));
         let mut st = RewriteState::with_constants(ops.len(), next_pos, constants.clone());
-
+        // Build result_types map from input ops — structural equivalent
+        // of RPython's Box.type attribute (rewrite.py:930 `v.type`).
+        for op in &ops {
+            let rt = op.result_type();
+            if rt != Type::Void && !op.pos.is_none() {
+                st.result_types.insert(op.pos.0, rt);
+            }
+        }
+        // Merge constant types — RPython's ConstPtr/ConstInt carry type
+        // intrinsically; here we inject them into the same map.
+        for (&k, &tp) in &self.constant_types {
+            st.result_types.entry(k).or_insert(tp);
+        }
         for op in &ops {
             if !matches!(
                 op.opcode,
@@ -816,10 +935,10 @@ impl GcRewriter for GcRewriterImpl {
                 // Skip debug merge points (they carry no semantics).
                 OpCode::DebugMergePoint => continue,
 
-                // rewrite.py:382+1003-1006 emit_label: reset nursery
-                // allocation merging state at basic block boundaries.
+                // rewrite.py:1003-1006 emit_label
                 OpCode::Label => {
                     st.emitting_can_collect();
+                    st.known_lengths.clear();
                     let rewritten = st.rewrite_op(op);
                     st.emit_rewritten_from(op, rewritten);
                 }
@@ -849,7 +968,7 @@ impl GcRewriter for GcRewriterImpl {
                 | OpCode::CallAssemblerR
                 | OpCode::CallAssemblerF
                 | OpCode::CallAssemblerN => {
-                    st.flush_pending_zeros();
+                    st.emit_pending_zeros();
                     st.emitting_can_collect();
                     let rewritten = st.rewrite_op(op);
                     st.emit_rewritten_from(op, rewritten);
@@ -869,7 +988,7 @@ impl GcRewriter for GcRewriterImpl {
 
                 // ── Operations that can trigger GC ──
                 _ if op.opcode.can_malloc() => {
-                    st.flush_pending_zeros();
+                    st.emit_pending_zeros();
                     st.emitting_can_collect();
                     let rewritten = st.rewrite_op(op);
                     st.emit_rewritten_from(op, rewritten);
@@ -877,7 +996,7 @@ impl GcRewriter for GcRewriterImpl {
 
                 // ── Guards flush pending zeros but do not invalidate WB tracking. ──
                 _ if op.opcode.is_guard() => {
-                    st.flush_pending_zeros();
+                    st.emit_pending_zeros();
                     let rewritten = st.rewrite_op(op);
                     st.emit(rewritten);
                 }
@@ -897,7 +1016,7 @@ impl GcRewriter for GcRewriterImpl {
                 }
                 // ── Final ops (Jump, Finish) flush pending zeros before emit. ──
                 _ if op.opcode.is_final() => {
-                    st.flush_pending_zeros();
+                    st.emit_pending_zeros();
                     let rewritten = st.rewrite_op(op);
                     st.emit_rewritten_from(op, rewritten);
                 }
@@ -912,7 +1031,7 @@ impl GcRewriter for GcRewriterImpl {
 
         // Flush any remaining pending zeros and vtable inits at end of trace.
         self.flush_pending_vtable_inits(&mut st);
-        st.flush_pending_zeros();
+        st.emit_pending_zeros();
 
         (st.out, st.constants)
     }
@@ -1023,11 +1142,12 @@ mod tests {
                 jit_wb_if_flag_byteofs: 0,
                 jit_wb_if_flag_singlebyte: 1,
                 jit_wb_cards_set: 0,
+                jit_wb_card_page_shift: 0,
                 jit_wb_cards_set_byteofs: 0,
                 jit_wb_cards_set_singlebyte: 0,
-                jit_wb_card_page_shift: 0,
             },
             jitframe_info: None,
+            constant_types: HashMap::new(),
         }
     }
 
@@ -1379,10 +1499,13 @@ mod tests {
         assert_eq!(constants.get(&vtable_ref.0).copied(), Some(0xDEAD_i64));
     }
 
-    // ── Test 11: SETARRAYITEM_GC with Ref triggers array WB ──
+    // ── Test 11: SETARRAYITEM_GC with Ref — no card marking → regular WB ──
 
     #[test]
     fn test_setarrayitem_gc_ref_wb() {
+        // make_rewriter() has jit_wb_cards_set = 0 (card marking disabled).
+        // rewrite.py:955-973: without card marking, gen_write_barrier_array
+        // falls back to gen_write_barrier → COND_CALL_GC_WB.
         let rw = make_rewriter();
         let obj = OpRef(0);
         let idx = OpRef(1);
@@ -1396,9 +1519,8 @@ mod tests {
         let result = rw.rewrite_for_gc(&ops);
 
         assert_eq!(result.len(), 2);
-        assert_eq!(result[0].opcode, OpCode::CondCallGcWbArray);
+        assert_eq!(result[0].opcode, OpCode::CondCallGcWb);
         assert_eq!(result[0].args[0], obj);
-        assert_eq!(result[0].args[1], idx);
         assert_eq!(result[1].opcode, OpCode::SetarrayitemGc);
     }
 
@@ -1663,5 +1785,133 @@ mod tests {
             zero_count, 0,
             "plain NEW_ARRAY should not produce ZERO_ARRAY"
         );
+    }
+
+    // ── Test: gen_write_barrier_array LARGE threshold ──
+
+    fn make_rewriter_with_cards() -> GcRewriterImpl {
+        GcRewriterImpl {
+            nursery_free_addr: 0x1000,
+            nursery_top_addr: 0x2000,
+            max_nursery_size: 4096,
+            wb_descr: WriteBarrierDescr {
+                jit_wb_if_flag: 1,
+                jit_wb_if_flag_byteofs: 0,
+                jit_wb_if_flag_singlebyte: 1,
+                jit_wb_cards_set: 0x40,
+                jit_wb_card_page_shift: 7,
+                jit_wb_cards_set_byteofs: 0,
+                jit_wb_cards_set_singlebyte: 0x40,
+            },
+            jitframe_info: None,
+            constant_types: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn test_setarrayitem_gc_small_array_uses_regular_wb() {
+        // rewrite.py:961-964: known length < LARGE → regular WB.
+        let rw = make_rewriter_with_cards();
+        // NEW_ARRAY with const length 10 (< 130).
+        // Use a constant-pool OpRef for the length.
+        let len_ref = OpRef(10_000); // constant key
+        let mut constants = HashMap::new();
+        constants.insert(10_000, 10_i64);
+        let mut new_array = Op::with_descr(OpCode::NewArrayClear, &[len_ref], array_descr_ref());
+        new_array.pos = OpRef(0);
+        let ops = vec![
+            new_array,
+            Op::with_descr(
+                OpCode::SetarrayitemGc,
+                &[OpRef(0), OpRef(1), OpRef(2)],
+                array_descr_ref(),
+            ),
+            Op::new(OpCode::Finish, &[]),
+        ];
+        let (result, _) = rw.rewrite_for_gc_with_constants(&ops, &constants);
+        // Small array → regular COND_CALL_GC_WB, not WB_ARRAY.
+        let wb = result
+            .iter()
+            .filter(|o| o.opcode == OpCode::CondCallGcWb)
+            .count();
+        let wb_arr = result
+            .iter()
+            .filter(|o| o.opcode == OpCode::CondCallGcWbArray)
+            .count();
+        assert_eq!(wb, 1, "small array should get regular WB");
+        assert_eq!(wb_arr, 0, "small array should NOT get WB_ARRAY");
+    }
+
+    #[test]
+    fn test_setarrayitem_gc_large_array_uses_wb_array() {
+        // rewrite.py:965-970: known length >= LARGE → WB_ARRAY.
+        let rw = make_rewriter_with_cards();
+        // NEW_ARRAY with const length 200 (>= 130).
+        let len_ref = OpRef(10_000);
+        let mut constants = HashMap::new();
+        constants.insert(10_000, 200_i64);
+        let mut new_array = Op::with_descr(OpCode::NewArrayClear, &[len_ref], array_descr_ref());
+        new_array.pos = OpRef(0);
+        let ops = vec![
+            new_array,
+            Op::with_descr(
+                OpCode::SetarrayitemGc,
+                &[OpRef(0), OpRef(1), OpRef(2)],
+                array_descr_ref(),
+            ),
+            Op::new(OpCode::Finish, &[]),
+        ];
+        let (result, _) = rw.rewrite_for_gc_with_constants(&ops, &constants);
+        let wb = result
+            .iter()
+            .filter(|o| o.opcode == OpCode::CondCallGcWb)
+            .count();
+        let wb_arr = result
+            .iter()
+            .filter(|o| o.opcode == OpCode::CondCallGcWbArray)
+            .count();
+        assert_eq!(wb, 0, "large array should NOT get regular WB");
+        assert_eq!(wb_arr, 1, "large array should get WB_ARRAY");
+    }
+
+    #[test]
+    fn test_setarrayitem_gc_unknown_length_uses_wb_array() {
+        // rewrite.py:962: unknown length defaults to LARGE → WB_ARRAY.
+        let rw = make_rewriter_with_cards();
+        // No NEW_ARRAY, so v_base has unknown length.
+        let ops = vec![
+            Op::with_descr(
+                OpCode::SetarrayitemGc,
+                &[OpRef(0), OpRef(1), OpRef(2)],
+                array_descr_ref(),
+            ),
+            Op::new(OpCode::Finish, &[]),
+        ];
+        let result = rw.rewrite_for_gc(&ops);
+        let wb_arr = result
+            .iter()
+            .filter(|o| o.opcode == OpCode::CondCallGcWbArray)
+            .count();
+        assert_eq!(wb_arr, 1, "unknown length should get WB_ARRAY");
+    }
+
+    #[test]
+    fn test_setarrayitem_gc_int_value_no_wb() {
+        // rewrite.py:940: v.type != 'r' → no write barrier at all.
+        let rw = make_rewriter_with_cards();
+        let ops = vec![
+            Op::with_descr(
+                OpCode::SetarrayitemGc,
+                &[OpRef(0), OpRef(1), OpRef(2)],
+                array_descr_int(),
+            ),
+            Op::new(OpCode::Finish, &[]),
+        ];
+        let result = rw.rewrite_for_gc(&ops);
+        let any_wb = result
+            .iter()
+            .filter(|o| o.opcode == OpCode::CondCallGcWb || o.opcode == OpCode::CondCallGcWbArray)
+            .count();
+        assert_eq!(any_wb, 0, "int store should not produce any WB");
     }
 }

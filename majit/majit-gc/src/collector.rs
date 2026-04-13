@@ -24,6 +24,9 @@ pub struct GcConfig {
     /// Maximum object size that can be allocated in the nursery.
     /// Larger objects go directly to old gen.
     pub large_object_threshold: usize,
+    /// incminimark.py:275: card_page_indices (0 disables card marking).
+    /// Must be a power of two.
+    pub card_page_indices: u32,
 }
 
 impl Default for GcConfig {
@@ -32,6 +35,7 @@ impl Default for GcConfig {
         GcConfig {
             nursery_size: DEFAULT_NURSERY_SIZE,
             large_object_threshold: (16384 + 512) * 8,
+            card_page_indices: 128,
         }
     }
 }
@@ -200,6 +204,9 @@ pub struct MiniMarkGC {
     _infobits_offset: usize,
     _infobits_offset_plus: usize,
     _T_IS_RPYTHON_INSTANCE_BYTE: u8,
+    /// incminimark.py:315-317: log2(card_page_indices).
+    /// 0 if card marking is disabled.
+    card_page_shift: u32,
 }
 
 impl MiniMarkGC {
@@ -232,7 +239,15 @@ impl MiniMarkGC {
             _infobits_offset: 0,
             _infobits_offset_plus: 0,
             _T_IS_RPYTHON_INSTANCE_BYTE: 0,
+            card_page_shift: 0,
         };
+        // incminimark.py:314-317
+        if gc.config.card_page_indices > 0 {
+            gc.card_page_shift = 0;
+            while (1u32 << gc.card_page_shift) < gc.config.card_page_indices {
+                gc.card_page_shift += 1;
+            }
+        }
         gc._setup_guard_is_object();
         gc
     }
@@ -291,9 +306,12 @@ impl MiniMarkGC {
         self.nursery.contains(addr)
     }
 
+    /// incminimark.py range-check parity: use nursery range check instead
+    /// of nursery_object_starts HashSet. JIT inline nursery bump-alloc
+    /// creates objects not registered in the HashSet; range check covers them.
     #[inline]
     fn is_managed_heap_object(&self, addr: usize) -> bool {
-        self.nursery_object_starts.contains(&addr) || self.oldgen.contains(addr)
+        self.nursery.contains(addr) || self.oldgen.contains(addr)
     }
 
     /// incminimark.py:1208 is_in_nursery parity.
@@ -474,7 +492,7 @@ impl MiniMarkGC {
 
             if has_cards {
                 // Card-marked object: scan only dirty card ranges.
-                self.scan_cards_for_young_refs(obj_addr, DEFAULT_CARD_PAGE_SHIFT);
+                self.scan_cards_for_young_refs(obj_addr, self.card_page_shift);
                 self.clear_cards(obj_addr);
                 // Re-set TRACK_YOUNG_PTRS for future write barriers.
                 unsafe {
@@ -891,6 +909,14 @@ impl MiniMarkGC {
     ///
     /// If the object has TRACK_YOUNG_PTRS set, we clear it and add the object
     /// to the remembered set, because it might now point to a young object.
+    ///
+    /// The `is_managed_heap_object` guard is NOT in incminimark — it
+    /// compensates for virtualizable objects (PyFrame) being Rust
+    /// Box-allocated instead of GC-managed. The JIT's COND_CALL_GC_WB
+    /// fires for these objects because the rewriter emits WB for all
+    /// SETFIELD_GC on Ref-typed values, and the flag-test reads garbage
+    /// RPython's write_barrier() only tests the header flag and does not
+    /// special-case non-managed addresses here.
     pub fn do_write_barrier(&mut self, obj: GcRef) {
         if obj.is_null() {
             return;
@@ -1069,8 +1095,10 @@ impl MiniMarkGC {
     /// the inline flag test emitted by COND_CALL_GC_WB).
     ///
     /// Equivalent to incminimark's `jit_remember_young_pointer()`.
+    ///
+    /// See `do_write_barrier` for why `is_managed_heap_object` is needed.
     pub fn jit_remember_young_pointer(&mut self, obj: GcRef) {
-        if obj.is_null() {
+        if obj.is_null() || !self.is_managed_heap_object(obj.0) {
             return;
         }
         // Clear TRACK_YOUNG_PTRS so the object won't trigger the
@@ -1491,6 +1519,10 @@ impl GcAllocator for MiniMarkGC {
         self.config.large_object_threshold
     }
 
+    fn card_page_shift(&self) -> u32 {
+        self.card_page_shift
+    }
+
     fn jit_remember_young_pointer(&mut self, obj: GcRef) {
         self.jit_remember_young_pointer(obj);
     }
@@ -1723,6 +1755,7 @@ mod tests {
         MiniMarkGC::with_config(GcConfig {
             nursery_size,
             large_object_threshold: nursery_size / 2,
+            ..GcConfig::default()
         })
     }
 

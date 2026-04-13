@@ -11,7 +11,8 @@ use cranelift_codegen::Context;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::types as cl_types;
 use cranelift_codegen::ir::{
-    AbiParam, BlockArg, Function, InstBuilder, MemFlags, Signature, StackSlotData, StackSlotKind,
+    AbiParam, BlockArg, Function, InstBuilder, MemFlags, Signature, StackSlot, StackSlotData,
+    StackSlotKind,
 };
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
@@ -2924,28 +2925,17 @@ extern "C" fn gc_alloc_varsize_shim(
     })
 }
 
+/// aarch64/assembler.py:342 get_write_barrier_fn()
+/// → incminimark.py:1569 jit_remember_young_pointer
 extern "C" fn gc_write_barrier_shim(runtime_id: u64, obj: u64) {
     with_gc_runtime(runtime_id, |gc| gc.write_barrier(GcRef(obj as usize)));
 }
 
-/// incminimark.py:1606 jit_remember_young_pointer_from_array:
-/// Called by JIT when TRACK_YOUNG_PTRS set but CARDS_SET not.
-/// Tries to enable card marking; falls back to generic barrier.
+/// aarch64/assembler.py:352 get_write_barrier_from_array_fn()
+/// → incminimark.py:1606 jit_remember_young_pointer_from_array
 extern "C" fn gc_jit_remember_young_pointer_from_array_shim(runtime_id: u64, obj: u64) {
     with_gc_runtime(runtime_id, |gc| {
         gc.jit_remember_young_pointer_from_array(GcRef(obj as usize));
-    });
-}
-
-/// incminimark.py:1557 remember_young_pointer_from_array2:
-/// Mark a specific card for the given array index.
-extern "C" fn gc_remember_young_pointer_from_array2_shim(runtime_id: u64, obj: u64, index: u64) {
-    with_gc_runtime(runtime_id, |gc| {
-        gc.remember_young_pointer_from_array2(
-            GcRef(obj as usize),
-            index as usize,
-            majit_gc::collector::DEFAULT_CARD_PAGE_SHIFT,
-        );
     });
 }
 
@@ -4016,10 +4006,10 @@ fn emit_host_call(
     return_type.map(|_| builder.inst_results(call)[0])
 }
 
-/// RPython parity: spill live GC refs to jf_frame before a call that
-/// may trigger GC. callbuilder.py push_gcmap (1 MOV) stores the gcmap;
-/// refs are already in jf_frame slots because the backend keeps them
-/// there persistently (assembler.py _push_all_regs_to_frame).
+/// assembler.py:1348-1367 _push_all_regs_to_frame:
+/// Save all defined GC ref variables to jf_frame slots before a call
+/// that may trigger GC. The per-call gcmap (from get_gcmap) tells the
+/// GC which of these slots are alive.
 fn spill_ref_roots(
     builder: &mut FunctionBuilder,
     jf_ptr: CValue,
@@ -4027,24 +4017,19 @@ fn spill_ref_roots(
     defined_ref_vars: &HashSet<u32>,
     ref_root_base_ofs: i32,
 ) {
-    // Only spill DEFINED ref vars. Undefined slots were zeroed at
-    // function entry and remain zero (no def_var overwrites them),
-    // so GC sees NULL — no stale pointer risk.
     for &(var_idx, slot) in ref_root_slots {
         if !defined_ref_vars.contains(&var_idx) {
             continue;
         }
         let offset = ref_root_base_ofs + (slot as i32) * 8;
         let val = builder.use_var(var(var_idx));
-        // Do NOT use MemFlags::trusted() — the GC reads these slots
-        // via jitframe_custom_trace during collection, so the stores
-        // must be visible before the collecting call.
         builder.ins().store(MemFlags::new(), val, jf_ptr, offset);
     }
 }
 
-/// RPython parity: reload GC refs from jf_frame after a call — the GC
-/// may have moved objects and updated the slots in-place.
+/// assembler.py:1369-1377 _pop_all_regs_from_frame:
+/// Reload all defined GC ref variables from jf_frame after a call.
+/// The GC may have moved objects and updated the slots in-place.
 fn reload_ref_roots(
     builder: &mut FunctionBuilder,
     jf_ptr: CValue,
@@ -4060,8 +4045,6 @@ fn reload_ref_roots(
         let val = builder
             .ins()
             .load(cl_types::I64, MemFlags::trusted(), jf_ptr, offset);
-        // TODO: re-enable nursery jitframe allocation once inline nursery
-        // bump tracking is fixed (use_gc_alloc currently forced to false).
         builder.def_var(var(var_idx), val);
     }
 }
@@ -4084,30 +4067,51 @@ fn ptr_arg_as_i64(
 /// slots that hold GC references at a given call site. The bitmap bit
 /// position is the frame slot index (relative to jf_frame[0]).
 ///
-/// The ref root slots are placed at frame positions
-/// `max_output_slots + 0, max_output_slots + 1, ...`.
-/// Returns a leaked `[length, data]` gcmap array pointer, or null if
-/// no ref roots exist.
-fn compute_per_call_gcmap(max_output_slots: usize, num_ref_roots: usize) -> i64 {
-    if num_ref_roots == 0 {
+/// regalloc.py:1089-1106 get_gcmap
+///
+/// Build a per-call-site gcmap bitmap marking only the ref root slots
+/// that are still alive at `position`. A ref is alive when its
+/// `last_usage >= position` (regalloc.py:380 is_still_alive).
+///
+/// Returns a leaked `[length, data]` gcmap array pointer (same layout
+/// as RPython's allocate_gcmap), or 0 (NULLGCMAP) if no live refs.
+fn get_gcmap(
+    position: usize,
+    max_output_slots: usize,
+    ref_root_slots: &[(u32, usize)],
+    longevity: &HashMap<u32, usize>,
+    defined_ref_vars: &HashSet<u32>,
+) -> i64 {
+    // regalloc.py:1093-1105: iterate bindings, include only alive refs.
+    let mut live_bit_positions: Vec<usize> = Vec::new();
+    for &(var_idx, slot) in ref_root_slots {
+        if !defined_ref_vars.contains(&var_idx) {
+            continue;
+        }
+        // regalloc.py:1096/1102: box.type == REF and self.rm.is_still_alive(box)
+        // is_still_alive: longevity[v].last_usage >= position
+        if let Some(&last_usage) = longevity.get(&var_idx) {
+            if last_usage >= position {
+                live_bit_positions.push(max_output_slots + slot);
+            }
+        }
+    }
+    if live_bit_positions.is_empty() {
         return 0; // NULLGCMAP
     }
-    let max_bit = max_output_slots + num_ref_roots;
+    let max_bit = live_bit_positions.iter().copied().max().unwrap() + 1;
     if max_bit <= 64 {
-        // Fast path: single-word bitmap (most common case).
         let mut bitmap: usize = 0;
-        for slot in 0..num_ref_roots {
-            bitmap |= 1usize << (max_output_slots + slot);
+        for bit_pos in &live_bit_positions {
+            bitmap |= 1usize << bit_pos;
         }
         let gcmap_arr = Box::leak(Box::new([1isize, bitmap as isize]));
         return gcmap_arr.as_ptr() as i64;
     }
-    // Multi-word bitmap for large traces.
     let num_words = (max_bit + 63) / 64;
     let mut gcmap: Vec<isize> = vec![0; 1 + num_words];
     gcmap[0] = num_words as isize;
-    for slot in 0..num_ref_roots {
-        let bit_pos = max_output_slots + slot;
+    for bit_pos in &live_bit_positions {
         let word_idx = bit_pos / 64;
         let bit_idx = bit_pos % 64;
         gcmap[1 + word_idx] |= (1usize << bit_idx) as isize;
@@ -5117,6 +5121,10 @@ pub struct CraneliftBackend {
     module: JITModule,
     func_ctx: FunctionBuilderContext,
     constants: HashMap<u32, i64>,
+    /// rewrite.py:930 parity — type annotations for constant OpRefs.
+    /// Set by `set_constant_types` before each compile call; used by
+    /// the GC rewriter to check `v.type == 'r'` on constant values.
+    constant_types: HashMap<u32, majit_ir::Type>,
     func_counter: u32,
     gc_runtime_id: Option<u64>,
     trace_counter: u64,
@@ -5212,6 +5220,7 @@ impl CraneliftBackend {
             module,
             func_ctx,
             constants: HashMap::new(),
+            constant_types: HashMap::new(),
             func_counter: 0,
             gc_runtime_id: None,
             trace_counter: 1,
@@ -5296,6 +5305,11 @@ impl CraneliftBackend {
         self.constants = constants;
     }
 
+    /// Set constant type annotations for the next compile call.
+    pub fn set_constant_types(&mut self, constant_types: HashMap<u32, majit_ir::Type>) {
+        self.constant_types = constant_types;
+    }
+
     /// Force the next compile call to assign a specific trace id to all exits.
     pub fn set_next_trace_id(&mut self, trace_id: u64) {
         self.next_trace_id = Some(trace_id);
@@ -5307,19 +5321,32 @@ impl CraneliftBackend {
         self.next_header_pc = Some(header_pc);
     }
 
-    fn gc_rewriter(&self) -> Option<GcRewriterImpl> {
+    fn gc_rewriter(&self, constant_types: &HashMap<u32, majit_ir::Type>) -> Option<GcRewriterImpl> {
         let runtime_id = self.gc_runtime_id?;
+        let ct = constant_types.clone();
         Some(with_gc_runtime(runtime_id, |gc| GcRewriterImpl {
             nursery_free_addr: gc.nursery_free() as usize,
             nursery_top_addr: gc.nursery_top() as usize,
             max_nursery_size: gc.max_nursery_object_size(),
-            // The Cranelift backend currently lowers WB ops through runtime
-            // helper calls instead of inlining flag checks, but the rewriter
-            // still expects a descriptor-shaped config object.
-            wb_descr: WriteBarrierDescr::for_current_gc(),
+            // gc.py:259-283 WriteBarrierDescr parity.
+            wb_descr: {
+                let mut descr = WriteBarrierDescr::for_current_gc();
+                let card_page_shift = gc.card_page_shift();
+                if card_page_shift > 0 {
+                    descr.jit_wb_card_page_shift = card_page_shift;
+                } else {
+                    // gc.py:283: no card marking → jit_wb_cards_set = 0
+                    descr.jit_wb_cards_set = 0;
+                    descr.jit_wb_card_page_shift = 0;
+                    descr.jit_wb_cards_set_byteofs = 0;
+                    descr.jit_wb_cards_set_singlebyte = 0;
+                }
+                descr
+            },
             jitframe_info: INLINE_ARENA
                 .get()
                 .and_then(|arena| arena.jitframe_descrs.clone()),
+            constant_types: ct,
         }))
     }
 
@@ -5328,10 +5355,11 @@ impl CraneliftBackend {
         inputargs: &[InputArg],
         ops: &[Op],
         constants: &HashMap<u32, i64>,
+        constant_types: &HashMap<u32, majit_ir::Type>,
     ) -> Vec<Op> {
         let mut normalized = normalize_ops_for_codegen_simple(inputargs, ops);
         inject_builtin_string_descrs(&mut normalized);
-        if let Some(rewriter) = self.gc_rewriter() {
+        if let Some(rewriter) = self.gc_rewriter(constant_types) {
             let (result, new_constants) =
                 rewriter.rewrite_for_gc_with_constants(&normalized, constants);
             // Merge GC rewriter's new constants into self.constants
@@ -5559,7 +5587,12 @@ impl CraneliftBackend {
         source_guard: Option<(u64, u32)>,
         caller_layout: Option<&ExitRecoveryLayout>,
     ) -> Result<CompiledLoop, BackendError> {
-        let prepared_ops = self.prepare_ops_for_compile(inputargs, ops, &self.constants.clone());
+        let prepared_ops = self.prepare_ops_for_compile(
+            inputargs,
+            ops,
+            &self.constants.clone(),
+            &self.constant_types.clone(),
+        );
         let ops = prepared_ops.as_slice();
         // RPython parity: regalloc asserts that every Box used as an
         // argument or in fail_args is bound to a register or stack
@@ -5664,6 +5697,28 @@ impl CraneliftBackend {
             .map(|input| input.index)
             .collect();
 
+        // regalloc.py:1173-1213 compute_vars_longevity
+        // Compute last_usage for each ref root variable. Used by get_gcmap
+        // to build per-call-site gcmaps (only alive refs are marked).
+        let longevity: HashMap<u32, usize> = {
+            let mut m: HashMap<u32, usize> = HashMap::new();
+            for (i, op) in ops.iter().enumerate() {
+                for &arg in op
+                    .args
+                    .iter()
+                    .chain(op.fail_args.iter().flat_map(|fa| fa.iter()))
+                {
+                    let idx = arg.0;
+                    if ref_root_slots.iter().any(|(vi, _)| *vi == idx) {
+                        m.entry(idx)
+                            .and_modify(|last| *last = (*last).max(i))
+                            .or_insert(i);
+                    }
+                }
+            }
+            m
+        };
+
         // Pre-scan for vector-producing ops (SIMD variable types)
         let vec_oprefs = build_vec_oprefs(ops, num_inputs);
         let vec_float_oprefs = build_vec_float_oprefs(ops, num_inputs);
@@ -5702,13 +5757,12 @@ impl CraneliftBackend {
         // RPython: refs are always in jf_frame; gcmap marks which slots
         // are live at each GC point (regalloc.py get_gcmap).
         let ref_root_base_ofs = JF_FRAME_ITEM0_OFS + (max_output_slots as i32) * 8;
-        let per_call_gcmap = compute_per_call_gcmap(max_output_slots, ref_root_slots.len());
         if std::env::var_os("MAJIT_LOG").is_some() {
             eprintln!(
-                "[codegen] per_call_gcmap={:#x} max_output={} ref_roots={}",
-                per_call_gcmap,
+                "[codegen] max_output={} ref_roots={} longevity={:?}",
                 max_output_slots,
-                ref_root_slots.len()
+                ref_root_slots.len(),
+                longevity,
             );
         }
         let debug_declares = std::env::var_os("MAJIT_DEBUG_DECLARES").is_some();
@@ -6096,6 +6150,16 @@ impl CraneliftBackend {
             // reference an SSA value defined in a non-dominating block.
             jf_ptr = builder.use_var(jf_ptr_var);
             outputs_ptr = jf_ptr;
+
+            // regalloc.py:1089-1106 get_gcmap: per-call-site gcmap
+            // marking only alive ref root slots at this position.
+            let per_call_gcmap = get_gcmap(
+                op_idx,
+                max_output_slots,
+                &ref_root_slots,
+                &longevity,
+                &defined_ref_vars,
+            );
 
             match op.opcode {
                 // ── Integer arithmetic ──
@@ -7335,15 +7399,26 @@ impl CraneliftBackend {
                         }
                         // Slots N+1..: array items from frame
                         let num_scalars_with_frame = 1 + expansion.scalar_fields.len();
-                        let arr_struct_addr = builder
-                            .ins()
-                            .iadd_imm(frame_val, expansion.array_struct_offset as i64);
-                        let arr_data_ptr_val = builder.ins().load(
-                            ptr_type,
-                            MemFlags::trusted(),
-                            arr_struct_addr,
-                            expansion.array_ptr_offset as i32,
-                        );
+                        // Only load array data pointer if at least one item
+                        // needs to be read from the frame (not all arg_overrides).
+                        let needs_array_load = (0..expansion.num_array_items).any(|i| {
+                            let slot = num_scalars_with_frame + i;
+                            !expansion.arg_overrides.iter().any(|(s, _)| *s == slot)
+                        });
+                        let arr_data_ptr_val = if needs_array_load {
+                            let arr_struct_addr = builder
+                                .ins()
+                                .iadd_imm(frame_val, expansion.array_struct_offset as i64);
+                            builder.ins().load(
+                                ptr_type,
+                                MemFlags::trusted(),
+                                arr_struct_addr,
+                                expansion.array_ptr_offset as i32,
+                            )
+                        } else {
+                            // Placeholder — never used.
+                            builder.ins().iconst(ptr_type, 0)
+                        };
                         for i in 0..expansion.num_array_items {
                             let slot = num_scalars_with_frame + i;
                             let ofs = JF_FRAME_ITEM0_OFS + (slot as i32) * 8;
@@ -8356,146 +8431,142 @@ impl CraneliftBackend {
                 }
 
                 // ── GC write barriers ──
-                OpCode::CondCallGcWb => {
-                    // x86/assembler.py:2438-2439 genop_discard_cond_call_gc_wb:
-                    //   _write_barrier_fastpath(array=False)
-                    //   TEST8 [obj + flag_byteofs], TRACK_YOUNG_PTRS_mask
-                    //   JNZ slow → call jit_remember_young_pointer
+                // aarch64/opassembler.py:912-1021 _write_barrier_fastpath parity:
+                // Inline flag check → skip if flag not set → slow path call.
+                // CondCallGcWbArray: card marking + post-helper re-test.
+                OpCode::CondCallGcWb | OpCode::CondCallGcWbArray => {
+                    let runtime_id_val =
+                        gc_runtime_id.ok_or_else(|| missing_gc_runtime(op.opcode))?;
                     let obj = resolve_opref(&mut builder, &constants, op.arg(0));
-                    let flag_byte_ofs = -(majit_gc::header::GcHeader::SIZE as i32)
-                        + WriteBarrierDescr::extract_flag_byte(gc_flags::TRACK_YOUNG_PTRS).0 as i32;
-                    let mask = WriteBarrierDescr::extract_flag_byte(gc_flags::TRACK_YOUNG_PTRS).1;
+                    let is_array = op.opcode == OpCode::CondCallGcWbArray;
+
+                    // Load flag byte from object header.
+                    let rw = self.gc_rewriter(&HashMap::new());
+                    let wb_byteofs = rw
+                        .as_ref()
+                        .map(|r| r.wb_descr.jit_wb_if_flag_byteofs as i32)
+                        .unwrap_or(0);
+                    let wb_mask_raw = rw
+                        .as_ref()
+                        .map(|r| r.wb_descr.jit_wb_if_flag_singlebyte)
+                        .unwrap_or(0);
+                    let wb_cards_set = rw
+                        .as_ref()
+                        .map(|r| r.wb_descr.jit_wb_cards_set)
+                        .unwrap_or(0);
+                    let wb_card_shift = rw
+                        .as_ref()
+                        .map(|r| r.wb_descr.jit_wb_card_page_shift)
+                        .unwrap_or(0);
+                    let wb_cards_singlebyte = rw
+                        .as_ref()
+                        .map(|r| r.wb_descr.jit_wb_cards_set_singlebyte)
+                        .unwrap_or(0);
+                    drop(rw);
+
+                    // opassembler.py:921-929: mask includes CARDS_SET singlebyte for array ops.
+                    let wb_mask = if is_array && wb_cards_set != 0 {
+                        (wb_mask_raw as i64) | (wb_cards_singlebyte as i64)
+                    } else {
+                        wb_mask_raw as i64
+                    };
 
                     let flag_byte =
                         builder
                             .ins()
-                            .load(cl_types::I8, MemFlags::trusted(), obj, flag_byte_ofs);
+                            .load(cl_types::I8, MemFlags::trusted(), obj, wb_byteofs);
                     let flag_ext = builder.ins().uextend(cl_types::I64, flag_byte);
-                    let mask_v = builder.ins().iconst(cl_types::I64, mask as i64);
-                    let test = builder.ins().band(flag_ext, mask_v);
+                    let mask_val = builder.ins().iconst(cl_types::I64, wb_mask & 0xFF);
+                    let test = builder.ins().band(flag_ext, mask_val);
                     let zero = builder.ins().iconst(cl_types::I64, 0);
-                    let needs_barrier = builder.ins().icmp(IntCC::NotEqual, test, zero);
+                    let needs_wb = builder.ins().icmp(IntCC::NotEqual, test, zero);
 
                     let slow_block = builder.create_block();
-                    builder.set_cold_block(slow_block);
                     let cont_block = builder.create_block();
                     builder
                         .ins()
-                        .brif(needs_barrier, slow_block, &[], cont_block, &[]);
+                        .brif(needs_wb, slow_block, &[], cont_block, &[]);
 
                     builder.switch_to_block(slow_block);
                     builder.seal_block(slow_block);
-                    let runtime_id = gc_runtime_id.ok_or_else(|| missing_gc_runtime(op.opcode))?;
-                    let runtime_id_v = builder.ins().iconst(cl_types::I64, runtime_id as i64);
-                    let _ = emit_host_call(
-                        &mut builder,
-                        ptr_type,
-                        call_conv,
-                        gc_write_barrier_shim as *const () as usize,
-                        &[runtime_id_v, obj],
-                        None,
-                    );
-                    builder.ins().jump(cont_block, &[]);
-
-                    builder.switch_to_block(cont_block);
-                    builder.seal_block(cont_block);
-                }
-
-                OpCode::CondCallGcWbArray => {
-                    // x86/assembler.py:2441-2443 genop_discard_cond_call_gc_wb_array:
-                    //   _write_barrier_fastpath(array=True)
-                    // Tests TRACK_YOUNG_PTRS | CARDS_SET in one byte.
-                    // If CARDS_SET already on: skip full barrier, go to card marking.
-                    // If only TRACK_YOUNG_PTRS: call full barrier, then check CARDS_SET.
-                    let obj = resolve_opref(&mut builder, &constants, op.arg(0));
-                    let index =
-                        resolve_opref_or_imm(&mut builder, &constants, &known_values, op.arg(1));
-                    let flag_byte_ofs = -(majit_gc::header::GcHeader::SIZE as i32)
-                        + WriteBarrierDescr::extract_flag_byte(gc_flags::TRACK_YOUNG_PTRS).0 as i32;
-                    // gc.py:2408: mask = jit_wb_if_flag_singlebyte | -0x80
-                    let wb_mask =
-                        WriteBarrierDescr::extract_flag_byte(gc_flags::TRACK_YOUNG_PTRS).1;
-                    let cards_mask = WriteBarrierDescr::extract_flag_byte(gc_flags::CARDS_SET).1;
-                    let combined_mask = (wb_mask | cards_mask) as i64;
-
-                    let flag_byte =
-                        builder
-                            .ins()
-                            .load(cl_types::I8, MemFlags::trusted(), obj, flag_byte_ofs);
-                    let flag_ext = builder.ins().uextend(cl_types::I64, flag_byte);
-                    let mask_v = builder.ins().iconst(cl_types::I64, combined_mask);
-                    let test = builder.ins().band(flag_ext, mask_v);
-                    let zero = builder.ins().iconst(cl_types::I64, 0);
-                    let any_flag = builder.ins().icmp(IntCC::NotEqual, test, zero);
-
-                    let cont_block = builder.create_block();
-                    let slow_block = builder.create_block();
                     builder.set_cold_block(slow_block);
-                    builder
-                        .ins()
-                        .brif(any_flag, slow_block, &[], cont_block, &[]);
 
-                    // Slow path: check if CARDS_SET → card marking only
-                    builder.switch_to_block(slow_block);
-                    builder.seal_block(slow_block);
+                    if is_array && wb_cards_set != 0 {
+                        // opassembler.py:941-1021 card marking path.
+                        let helper_call_block = builder.create_block();
+                        let card_mark_block = builder.create_block();
 
-                    let cards_mask_v = builder.ins().iconst(cl_types::I64, cards_mask as i64);
-                    let cards_test = builder.ins().band(flag_ext, cards_mask_v);
-                    let has_cards = builder.ins().icmp(IntCC::NotEqual, cards_test, zero);
-
-                    let card_block = builder.create_block();
-                    let full_barrier_block = builder.create_block();
-                    builder.set_cold_block(full_barrier_block);
-                    builder
-                        .ins()
-                        .brif(has_cards, card_block, &[], full_barrier_block, &[]);
-
-                    // assembler.py:2326-2335 WriteBarrierSlowPath:
-                    // CALL wb_slowpath[1] — jit_remember_young_pointer_from_array
-                    // (NOT generic remember_young_pointer)
-                    builder.switch_to_block(full_barrier_block);
-                    builder.seal_block(full_barrier_block);
-                    let runtime_id = gc_runtime_id.ok_or_else(|| missing_gc_runtime(op.opcode))?;
-                    let runtime_id_v = builder.ins().iconst(cl_types::I64, runtime_id as i64);
-                    let _ = emit_host_call(
-                        &mut builder,
-                        ptr_type,
-                        call_conv,
-                        gc_jit_remember_young_pointer_from_array_shim as *const () as usize,
-                        &[runtime_id_v, obj],
-                        None,
-                    );
-                    // assembler.py:2338-2341: re-check CARDS_SET after
-                    // the helper (it may have set it via HAS_CARDS path).
-                    // JNS done — if sign bit (CARDS_SET) still not set, done.
-                    let flag_byte2 =
+                        // opassembler.py:944-949: pre-call CARDS_SET test.
+                        let cards_mask_val = (wb_cards_singlebyte as u8) as i64;
+                        let cards_mask = builder.ins().iconst(cl_types::I64, cards_mask_val);
+                        let cards_test = builder.ins().band(flag_ext, cards_mask);
+                        let has_cards = builder.ins().icmp(IntCC::NotEqual, cards_test, zero);
                         builder
                             .ins()
-                            .load(cl_types::I8, MemFlags::trusted(), obj, flag_byte_ofs);
-                    let flag_ext2 = builder.ins().uextend(cl_types::I64, flag_byte2);
-                    let cards_test2 = builder.ins().band(flag_ext2, cards_mask_v);
-                    let has_cards2 = builder.ins().icmp(IntCC::NotEqual, cards_test2, zero);
-                    builder
-                        .ins()
-                        .brif(has_cards2, card_block, &[], cont_block, &[]);
+                            .brif(has_cards, card_mark_block, &[], helper_call_block, &[]);
 
-                    // assembler.py:2346-2372 card marking:
-                    // Set the card bit for the written index.
-                    builder.switch_to_block(card_block);
-                    builder.seal_block(card_block);
-                    let runtime_id_v2 = builder.ins().iconst(
-                        cl_types::I64,
-                        gc_runtime_id.ok_or_else(|| missing_gc_runtime(op.opcode))? as i64,
-                    );
-                    let _ = emit_host_call(
-                        &mut builder,
-                        ptr_type,
-                        call_conv,
-                        gc_remember_young_pointer_from_array2_shim as *const () as usize,
-                        &[runtime_id_v2, obj, index],
-                        None,
-                    );
-                    builder.ins().jump(cont_block, &[]);
+                        // opassembler.py:953-980: array-specific helper call.
+                        builder.switch_to_block(helper_call_block);
+                        builder.seal_block(helper_call_block);
+                        let runtime_id = builder.ins().iconst(cl_types::I64, runtime_id_val as i64);
+                        let _ = emit_host_call(
+                            &mut builder,
+                            ptr_type,
+                            call_conv,
+                            gc_jit_remember_young_pointer_from_array_shim as *const () as usize,
+                            &[runtime_id, obj],
+                            None,
+                        );
+
+                        // opassembler.py:982-987: post-helper re-load + re-test CARDS_SET.
+                        let flag_byte2 =
+                            builder
+                                .ins()
+                                .load(cl_types::I8, MemFlags::trusted(), obj, wb_byteofs);
+                        let flag_ext2 = builder.ins().uextend(cl_types::I64, flag_byte2);
+                        let cards_test2 = builder.ins().band(flag_ext2, cards_mask);
+                        let has_cards2 = builder.ins().icmp(IntCC::NotEqual, cards_test2, zero);
+                        builder
+                            .ins()
+                            .brif(has_cards2, card_mark_block, &[], cont_block, &[]);
+
+                        // opassembler.py:994-1015: inline card bit setting.
+                        builder.switch_to_block(card_mark_block);
+                        builder.seal_block(card_mark_block);
+                        let index = resolve_opref(&mut builder, &constants, op.arg(1));
+                        let shift_plus_3 = (wb_card_shift + 3) as i64;
+                        let shifted = builder.ins().ushr_imm(index, shift_plus_3);
+                        let byteofs_val = builder.ins().bnot(shifted);
+                        let bit_idx = builder.ins().ushr_imm(index, wb_card_shift as i64);
+                        let seven = builder.ins().iconst(cl_types::I64, 7);
+                        let bit_idx = builder.ins().band(bit_idx, seven);
+                        let one = builder.ins().iconst(cl_types::I64, 1);
+                        let bit_mask = builder.ins().ishl(one, bit_idx);
+                        let card_addr = builder.ins().iadd(obj, byteofs_val);
+                        let card_byte =
+                            builder
+                                .ins()
+                                .load(cl_types::I8, MemFlags::trusted(), card_addr, 0);
+                        let card_ext = builder.ins().uextend(cl_types::I64, card_byte);
+                        let card_new = builder.ins().bor(card_ext, bit_mask);
+                        let card_trunc = builder.ins().ireduce(cl_types::I8, card_new);
+                        builder
+                            .ins()
+                            .store(MemFlags::trusted(), card_trunc, card_addr, 0);
+                        builder.ins().jump(cont_block, &[]);
+                    } else {
+                        // Simple write barrier (no card marking).
+                        let runtime_id = builder.ins().iconst(cl_types::I64, runtime_id_val as i64);
+                        let _ = emit_host_call(
+                            &mut builder,
+                            ptr_type,
+                            call_conv,
+                            gc_write_barrier_shim as *const () as usize,
+                            &[runtime_id, obj],
+                            None,
+                        );
+                        builder.ins().jump(cont_block, &[]);
+                    }
 
                     builder.switch_to_block(cont_block);
                     builder.seal_block(cont_block);
@@ -12468,6 +12539,7 @@ mod tests {
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 1 << 20,
             large_object_threshold: 1 << 20,
+            ..GcConfig::default()
         });
         // eval.rs registers regular GC types before installing the backend.
         // Keep this fixture on the same path so set_gc_allocator() can lazily
@@ -14053,6 +14125,7 @@ mod tests {
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 160,
             large_object_threshold: 1024,
+            ..GcConfig::default()
         });
         gc.register_type(TypeInfo::simple(16));
 
@@ -16600,6 +16673,7 @@ mod tests {
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 160,
             large_object_threshold: 1024,
+            ..GcConfig::default()
         });
         gc.register_type(TypeInfo::simple(16));
 
@@ -16639,6 +16713,7 @@ mod tests {
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 160,
             large_object_threshold: 1024,
+            ..GcConfig::default()
         });
         gc.register_type(TypeInfo::simple(16));
 
@@ -16694,6 +16769,7 @@ mod tests {
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 160,
             large_object_threshold: 1024,
+            ..GcConfig::default()
         });
         let old_root_tid = gc.register_type(TypeInfo::with_gc_ptrs(8, vec![0]));
         let young_node_tid = gc.register_type(TypeInfo::simple(16));
@@ -16925,6 +17001,7 @@ mod tests {
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 160,
             large_object_threshold: 1024,
+            ..GcConfig::default()
         });
         gc.register_type(TypeInfo::simple(16));
 
@@ -16973,6 +17050,7 @@ mod tests {
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 160,
             large_object_threshold: 1024,
+            ..GcConfig::default()
         });
         gc.register_type(TypeInfo::simple(16));
 
@@ -17025,6 +17103,7 @@ mod tests {
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 160,
             large_object_threshold: 1024,
+            ..GcConfig::default()
         });
         gc.register_type(TypeInfo::simple(16));
 
@@ -17062,6 +17141,7 @@ mod tests {
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 160,
             large_object_threshold: 1024,
+            ..GcConfig::default()
         });
         gc.register_type(TypeInfo::simple(16));
 

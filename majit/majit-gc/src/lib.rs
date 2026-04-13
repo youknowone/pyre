@@ -53,31 +53,39 @@ pub mod flags {
 /// From rpython/jit/backend/llsupport/gc.py WriteBarrierDescr.
 #[derive(Debug, Clone)]
 pub struct WriteBarrierDescr {
-    /// The flag bit to test in the object header.
+    /// gc.py:268: GCClass.JIT_WB_IF_FLAG
     pub jit_wb_if_flag: u64,
-    /// Byte offset of the flag byte in the header.
-    pub jit_wb_if_flag_byteofs: usize,
-    /// Single-byte mask to test.
+    /// gc.py:269: extract_flag_byte(jit_wb_if_flag) → byteofs
+    /// Object-relative (negative = before object start, in header).
+    pub jit_wb_if_flag_byteofs: i32,
+    /// gc.py:269: extract_flag_byte(jit_wb_if_flag) → singlebyte
     pub jit_wb_if_flag_singlebyte: u8,
-    /// Flag for card marking (GCFLAG_CARDS_SET).
+    /// gc.py:273: GCClass.JIT_WB_CARDS_SET (0 if no card marking)
     pub jit_wb_cards_set: u64,
-    /// Byte offset of the CARDS_SET flag byte.
-    pub jit_wb_cards_set_byteofs: usize,
-    /// Single-byte mask for CARDS_SET (must be -0x80 = 0x80).
-    pub jit_wb_cards_set_singlebyte: i8,
-    /// Shift for computing card index (1 << shift == card_page_indices).
+    /// gc.py:274: GCClass.JIT_WB_CARD_PAGE_SHIFT
     pub jit_wb_card_page_shift: u32,
+    /// gc.py:275: extract_flag_byte(jit_wb_cards_set) → byteofs
+    pub jit_wb_cards_set_byteofs: i32,
+    /// gc.py:275: extract_flag_byte(jit_wb_cards_set) → singlebyte
+    /// Must equal -0x80 (signed) per gc.py:281 assert.
+    pub jit_wb_cards_set_singlebyte: i8,
 }
 
 impl WriteBarrierDescr {
     /// gc.py:285-293 extract_flag_byte: find the non-zero byte in the
-    /// header-shifted flag word and return (byte_offset, byte_mask).
-    pub fn extract_flag_byte(flag: u64) -> (usize, u8) {
+    /// header-shifted flag word and return (obj_relative_byteofs, singlebyte).
+    ///
+    /// The returned offset is relative to the **object pointer** (not the
+    /// header), matching RPython's convention where the JIT emits
+    /// `load [obj + byteofs]`.  Since our header sits at `obj - GcHeader::SIZE`,
+    /// the conversion is `obj_ofs = header_ofs - GcHeader::SIZE`.
+    pub fn extract_flag_byte(flag: u64) -> (i32, i8) {
         let shifted = flag << crate::header::FLAG_SHIFT;
         let bytes = shifted.to_le_bytes();
         for (i, &b) in bytes.iter().enumerate() {
             if b != 0 {
-                return (i, b);
+                let obj_ofs = i as i32 - crate::header::GcHeader::SIZE as i32;
+                return (obj_ofs, b as i8);
             }
         }
         (0, 0)
@@ -96,17 +104,17 @@ impl WriteBarrierDescr {
             "CARDS_SET and TRACK_YOUNG_PTRS must be in the same byte"
         );
         debug_assert_eq!(
-            cards_set_singlebyte as i8, -0x80i8,
+            cards_set_singlebyte, -0x80i8,
             "CARDS_SET must be the MSB of its byte (-0x80)"
         );
         WriteBarrierDescr {
             jit_wb_if_flag: flags::TRACK_YOUNG_PTRS,
             jit_wb_if_flag_byteofs: if_flag_byteofs,
-            jit_wb_if_flag_singlebyte: if_flag_singlebyte,
+            jit_wb_if_flag_singlebyte: if_flag_singlebyte as u8,
             jit_wb_cards_set: flags::CARDS_SET,
-            jit_wb_cards_set_byteofs: cards_set_byteofs,
-            jit_wb_cards_set_singlebyte: cards_set_singlebyte as i8,
             jit_wb_card_page_shift: crate::collector::DEFAULT_CARD_PAGE_SHIFT,
+            jit_wb_cards_set_byteofs: cards_set_byteofs,
+            jit_wb_cards_set_singlebyte: cards_set_singlebyte,
         }
     }
 }
@@ -167,6 +175,7 @@ pub trait GcAllocator: Send {
         length: usize,
     ) -> GcRef;
 
+    /// incminimark.py:1569: jit_remember_young_pointer(obj)
     /// Perform a write barrier check on `obj`.
     /// Must be called before storing a GC reference into `obj`.
     fn write_barrier(&mut self, obj: GcRef);
@@ -213,6 +222,12 @@ pub trait GcAllocator: Send {
 
     /// Maximum size for nursery allocation (larger objects go to old gen directly).
     fn max_nursery_object_size(&self) -> usize;
+
+    /// incminimark.py: card_page_indices → JIT_WB_CARD_PAGE_SHIFT.
+    /// Log2 of the card page size. 0 if card marking is disabled.
+    fn card_page_shift(&self) -> u32 {
+        0
+    }
 
     /// Fast-path write barrier for JIT-compiled code.
     ///

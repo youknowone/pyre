@@ -2193,6 +2193,7 @@ impl<M: Clone> MetaInterp<M> {
         let compiled_constants = constants.clone();
         let compiled_constant_types = constant_types.clone();
         self.backend.set_constants(constants);
+        self.backend.set_constant_types(constant_types.clone());
 
         // Use pre-allocated token number if available (for self-recursion
         // support), otherwise allocate a fresh one.
@@ -2933,6 +2934,7 @@ impl<M: Clone> MetaInterp<M> {
         let compiled_constants = constants.clone();
         let compiled_constant_types = constant_types.clone();
         self.backend.set_constants(constants);
+        self.backend.set_constant_types(constant_types.clone());
 
         let token_num = self.warm_state.alloc_token_number();
         let mut token = JitCellToken::new(token_num);
@@ -3303,6 +3305,7 @@ impl<M: Clone> MetaInterp<M> {
         let compiled_constants = constants.clone();
         let compiled_constant_types = constant_types.clone();
         self.backend.set_constants(constants);
+        self.backend.set_constant_types(constant_types.clone());
         token.green_key = green_key;
         // virtualizable.py:86 read_boxes: set num_scalar_inputargs on token
         // so the backend can find the first local in force_fn paths.
@@ -3586,6 +3589,7 @@ impl<M: Clone> MetaInterp<M> {
         let compiled_constants = constants.clone();
         let compiled_constant_types = constant_types.clone();
         self.backend.set_constants(constants);
+        self.backend.set_constant_types(constant_types.clone());
         token.green_key = green_key;
 
         match self
@@ -5334,6 +5338,7 @@ impl<M: Clone> MetaInterp<M> {
         }
 
         self.backend.set_constants(constants);
+        self.backend.set_constant_types(constant_types.clone());
         self.backend.set_next_trace_id(trace_id);
         self.backend.set_next_header_pc(original_green_key);
 
@@ -5747,6 +5752,7 @@ impl<M: Clone> MetaInterp<M> {
         }
 
         self.backend.set_constants(constants);
+        self.backend.set_constant_types(constant_types.clone());
         self.backend.set_next_trace_id(bridge_trace_id);
         self.backend.set_next_header_pc(green_key);
 
