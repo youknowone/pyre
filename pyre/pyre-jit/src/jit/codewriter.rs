@@ -394,21 +394,16 @@ impl CodeWriter {
                     // RPython: no-op operations produce no jitcode output
                 }
 
-                // flatten.py: input args → registers 0..n-1
-                // regalloc.py: LOAD_FAST = ref_copy local → stack register
-                //
-                // **DIVERGENCE FROM PYPY** (tracked: vable-locals epic,
-                // Phase 4/5): pypy/interpreter/pyopcode.py:495 reads
-                // `self.locals_cells_stack_w[varindex]`, which the JIT
-                // translator rewrites into `getarrayitem_vable_r`
-                // (locals_cells_stack_w array, var_num) on portal
-                // jitcodes. pyre's codewriter currently emits a plain
-                // ref-register copy: this is correct only because pyre's
-                // local registers are aliased onto the same indices that
-                // the heuristic resume path writes back from
-                // `frame.locals_cells_stack_w`. The vable lowering is
-                // gated on porting `virtualizable_boxes[-1]` propagation
-                // across loop iterations (a separate epic).
+                // jtransform.py:1877 do_fixed_list_getitem vable case:
+                // portal locals are virtualizable array items.
+                // pyopcode.py:495 reads locals_cells_stack_w[varindex],
+                // which the JIT translator rewrites into
+                // getarrayitem_vable_r(frame, 0, var_num).
+                // Phase 5 (vable read) blocked: emitting vable_getarrayitem_ref
+                // alone causes nbody CRASH + fannkuch TIMEOUT; shadow read
+                // (move_r + vable_getarrayitem_ref) recovers nbody but
+                // fannkuch still regresses. Keep move_r until the blackhole
+                // resume path reads from the frame directly.
                 Instruction::LoadFast { var_num } | Instruction::LoadFastBorrow { var_num } => {
                     let reg = var_num.get(op_arg).as_usize() as u16;
                     assembler.move_r(stack_base + current_depth, reg);
