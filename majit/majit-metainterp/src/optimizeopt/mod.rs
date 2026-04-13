@@ -2373,7 +2373,9 @@ impl OptContext {
     /// `_get_info`/`_get_array_info` half is `const_infos.entry(...)`
     /// (RPython: `optheap.const_infos[ref]`).
     fn copy_fields_to_const(&mut self, source: OpRef, gcref: majit_ir::GcRef) {
-        use crate::optimizeopt::info::{ArrayPtrInfo, Forwarded, PtrInfo, StructPtrInfo};
+        use crate::optimizeopt::info::{
+            ArrayPtrInfo, FieldEntry, Forwarded, PtrInfo, StructPtrInfo,
+        };
         let Some(Forwarded::Info(info)) = self.forwarded.get(source.0 as usize) else {
             return;
         };
@@ -2391,7 +2393,6 @@ impl OptContext {
                         descr,
                         fields: Vec::new(),
                         field_descrs: Vec::new(),
-                        preamble_fields: Vec::new(),
                         last_guard_pos: -1,
                     })
                 });
@@ -2407,7 +2408,6 @@ impl OptContext {
                         descr,
                         fields: Vec::new(),
                         field_descrs: Vec::new(),
-                        preamble_fields: Vec::new(),
                         last_guard_pos: -1,
                     })
                 });
@@ -2417,13 +2417,16 @@ impl OptContext {
             }
             PtrInfo::Virtual(v) if !v.fields.is_empty() => {
                 let descr = v.descr.clone();
-                let fields = v.fields.clone();
+                let fields: Vec<(u32, FieldEntry)> = v
+                    .fields
+                    .iter()
+                    .map(|&(k, r)| (k, FieldEntry::Value(r)))
+                    .collect();
                 let ci = self.const_infos.entry(key).or_insert_with(|| {
                     PtrInfo::Struct(StructPtrInfo {
                         descr,
                         fields: Vec::new(),
                         field_descrs: Vec::new(),
-                        preamble_fields: Vec::new(),
                         last_guard_pos: -1,
                     })
                 });
@@ -2433,13 +2436,16 @@ impl OptContext {
             }
             PtrInfo::VirtualStruct(v) if !v.fields.is_empty() => {
                 let descr = v.descr.clone();
-                let fields = v.fields.clone();
+                let fields: Vec<(u32, FieldEntry)> = v
+                    .fields
+                    .iter()
+                    .map(|&(k, r)| (k, FieldEntry::Value(r)))
+                    .collect();
                 let ci = self.const_infos.entry(key).or_insert_with(|| {
                     PtrInfo::Struct(StructPtrInfo {
                         descr,
                         fields: Vec::new(),
                         field_descrs: Vec::new(),
-                        preamble_fields: Vec::new(),
                         last_guard_pos: -1,
                     })
                 });
@@ -2458,7 +2464,6 @@ impl OptContext {
                         descr,
                         lenbound,
                         items: Vec::new(),
-                        preamble_items: Vec::new(),
                         last_guard_pos: -1,
                     })
                 });
@@ -2469,13 +2474,13 @@ impl OptContext {
             PtrInfo::VirtualArray(v) if !v.items.is_empty() => {
                 let descr = v.descr.clone();
                 let len = v.items.len() as i64;
-                let items = v.items.clone();
+                let items: Vec<FieldEntry> =
+                    v.items.iter().map(|&r| FieldEntry::Value(r)).collect();
                 let ci = self.const_infos.entry(key).or_insert_with(|| {
                     PtrInfo::Array(ArrayPtrInfo {
                         descr,
                         lenbound: IntBound::from_constant(len),
                         items: Vec::new(),
-                        preamble_items: Vec::new(),
                         last_guard_pos: -1,
                     })
                 });

@@ -2066,6 +2066,7 @@ impl OptRewrite {
                 // rewrite.py:650-651: source_info.getitem(arraydescr, index + source_start)
                 ctx.get_ptr_info(source_box)
                     .and_then(|info| info.getitem((index + source_start) as usize))
+                    .and_then(|e| e.as_opref())
             } else {
                 // rewrite.py:653: opnum = OpHelpers.getarrayitem_for_descr(arraydescr)
                 // Select I/R/F opcode based on item type.

@@ -871,6 +871,7 @@ impl VirtualState {
                     .map(|(field_idx, _)| {
                         ctx.get_ptr_info(resolved)
                             .and_then(|info| info.getfield(*field_idx))
+                            .and_then(|e| e.as_opref())
                             .map(|f| ctx.get_box_replacement(f))
                             .unwrap_or(OpRef::NONE)
                     })
@@ -919,6 +920,7 @@ impl VirtualState {
                     let item_ref = ctx
                         .get_ptr_info(resolved)
                         .and_then(|info| info.getitem(index))
+                        .and_then(|e| e.as_opref())
                         .unwrap_or(OpRef::NONE);
                     Self::enum_forced_boxes_recurse(
                         item_state,

@@ -51,8 +51,8 @@ impl Default for Forwarded {
 /// via the short preamble builder.
 ///
 /// RPython stores PreambleOp directly in `_fields[]` (Python's dynamic
-/// typing). Rust requires a separate storage (`preamble_fields`) with
-/// the same read-before-regular-fields semantics.
+/// typing). Rust mirrors this with the `FieldEntry` enum stored in the
+/// same `fields` / `items` vectors.
 #[derive(Clone, Debug)]
 pub struct PreambleOp {
     /// Phase 1 result box — RPython: PreambleOp.op (aka HeapOp.res)
@@ -66,6 +66,54 @@ pub struct PreambleOp {
     /// RPython: PreambleOp.preamble_op — the actual replay operation
     /// for the short preamble. Always present (RPython parity).
     pub preamble_op: majit_ir::Op,
+}
+
+/// RPython _fields[] element — either a concrete value or a PreambleOp sentinel.
+///
+/// info.py:203 `setfield` stores either a normal Box or a PreambleOp into
+/// `_fields[]`. heap.py:177 `_getfield` checks `isinstance(res, PreambleOp)`
+/// to decide whether to force the value via the short preamble.
+///
+/// Rust equivalent: typed enum instead of Python's duck-typed list.
+#[derive(Clone, Debug)]
+pub enum FieldEntry {
+    /// Normal cached field value (info.py:203 setfield).
+    Value(OpRef),
+    /// shortpreamble.py:11 PreambleOp — sentinel stored during Phase 2 import.
+    Preamble(PreambleOp),
+}
+
+impl FieldEntry {
+    /// Extract the concrete OpRef if this is a `Value` entry.
+    /// Returns `None` for `Preamble` entries (those need special handling
+    /// via `force_op_from_preamble`).
+    pub fn as_opref(&self) -> Option<OpRef> {
+        match self {
+            FieldEntry::Value(opref) => Some(*opref),
+            FieldEntry::Preamble(_) => None,
+        }
+    }
+
+    /// Returns true if this is a `Preamble` entry.
+    pub fn is_preamble(&self) -> bool {
+        matches!(self, FieldEntry::Preamble(_))
+    }
+
+    /// Extract the `PreambleOp` if this is a `Preamble` entry.
+    pub fn as_preamble(&self) -> Option<&PreambleOp> {
+        match self {
+            FieldEntry::Preamble(pop) => Some(pop),
+            FieldEntry::Value(_) => None,
+        }
+    }
+
+    /// Consume and extract the `PreambleOp` if this is a `Preamble` entry.
+    pub fn into_preamble(self) -> Option<PreambleOp> {
+        match self {
+            FieldEntry::Preamble(pop) => Some(pop),
+            FieldEntry::Value(_) => None,
+        }
+    }
 }
 
 /// Information about an operation's result, attached during optimization.
@@ -615,7 +663,6 @@ impl PtrInfo {
             known_class: Some(class_ptr),
             fields: Vec::new(),
             field_descrs: Vec::new(),
-            preamble_fields: Vec::new(),
             last_guard_pos: -1,
         })
     }
@@ -627,7 +674,6 @@ impl PtrInfo {
             known_class,
             fields: Vec::new(),
             field_descrs: Vec::new(),
-            preamble_fields: Vec::new(),
             last_guard_pos: -1,
         })
     }
@@ -638,7 +684,6 @@ impl PtrInfo {
             descr,
             fields: Vec::new(),
             field_descrs: Vec::new(),
-            preamble_fields: Vec::new(),
             last_guard_pos: -1,
         })
     }
@@ -649,7 +694,6 @@ impl PtrInfo {
             descr,
             lenbound,
             items: Vec::new(),
-            preamble_items: Vec::new(),
             last_guard_pos: -1,
         })
     }
@@ -1044,9 +1088,9 @@ impl PtrInfo {
     /// info.py: visitor_walk_recursive — walks all fields of a virtual.
     pub fn visitor_walk_recursive(&self) -> Vec<OpRef> {
         match self {
-            PtrInfo::Instance(v) => v.fields.iter().map(|(_, r)| *r).collect(),
-            PtrInfo::Struct(v) => v.fields.iter().map(|(_, r)| *r).collect(),
-            PtrInfo::Array(v) => v.items.clone(),
+            PtrInfo::Instance(v) => v.fields.iter().filter_map(|(_, e)| e.as_opref()).collect(),
+            PtrInfo::Struct(v) => v.fields.iter().filter_map(|(_, e)| e.as_opref()).collect(),
+            PtrInfo::Array(v) => v.items.iter().filter_map(|e| e.as_opref()).collect(),
             PtrInfo::Virtual(v) => v.fields.iter().map(|(_, r)| *r).collect(),
             PtrInfo::VirtualArray(v) => v.items.clone(),
             PtrInfo::VirtualStruct(v) => v.fields.iter().map(|(_, r)| *r).collect(),
@@ -1213,10 +1257,9 @@ impl PtrInfo {
                     fields: vinfo
                         .fields
                         .iter()
-                        .map(|&(idx, val)| (idx, ctx.get_box_replacement(val)))
+                        .map(|&(idx, val)| (idx, FieldEntry::Value(ctx.get_box_replacement(val))))
                         .collect(),
                     field_descrs: vinfo.field_descrs.clone(),
-                    preamble_fields: Vec::new(),
                     last_guard_pos: -1,
                 });
                 let mut new_op = Op::new(OpCode::New, &[]);
@@ -1252,10 +1295,9 @@ impl PtrInfo {
                     fields: vinfo
                         .fields
                         .iter()
-                        .map(|&(idx, val)| (idx, ctx.get_box_replacement(val)))
+                        .map(|&(idx, val)| (idx, FieldEntry::Value(ctx.get_box_replacement(val))))
                         .collect(),
                     field_descrs: vinfo.field_descrs.clone(),
-                    preamble_fields: Vec::new(),
                     last_guard_pos: -1,
                 });
                 let mut new_op = Op::new(OpCode::NewWithVtable, &[]);
@@ -1775,20 +1817,20 @@ impl PtrInfo {
             PtrInfo::Instance(v) => {
                 for entry in &mut v.fields {
                     if entry.0 == field_idx {
-                        entry.1 = value;
+                        entry.1 = FieldEntry::Value(value);
                         return;
                     }
                 }
-                v.fields.push((field_idx, value));
+                v.fields.push((field_idx, FieldEntry::Value(value)));
             }
             PtrInfo::Struct(v) => {
                 for entry in &mut v.fields {
                     if entry.0 == field_idx {
-                        entry.1 = value;
+                        entry.1 = FieldEntry::Value(value);
                         return;
                     }
                 }
-                v.fields.push((field_idx, value));
+                v.fields.push((field_idx, FieldEntry::Value(value)));
             }
             PtrInfo::Virtual(v) => {
                 for entry in &mut v.fields {
@@ -1825,26 +1867,25 @@ impl PtrInfo {
         );
         match self {
             PtrInfo::Instance(v) => {
-                v.preamble_fields.retain(|(k, _)| *k != field_idx);
-                v.preamble_fields.push((field_idx, pop));
+                v.fields.retain(|(k, _)| *k != field_idx);
+                v.fields.push((field_idx, FieldEntry::Preamble(pop)));
             }
             PtrInfo::Struct(v) => {
-                v.preamble_fields.retain(|(k, _)| *k != field_idx);
-                v.preamble_fields.push((field_idx, pop));
+                v.fields.retain(|(k, _)| *k != field_idx);
+                v.fields.push((field_idx, FieldEntry::Preamble(pop)));
             }
             _ => {
                 // RPython: AbstractStructPtrInfo always supports _fields.
                 // In majit, NonNull / Constant / Str / Virtualizable etc.
-                // lack preamble_fields. Upgrade to Instance — known_class
+                // lack _fields. Upgrade to Instance — known_class
                 // is None because make_constant_class would already have
                 // installed an Instance with the class set, which would
                 // have hit the first match arm above.
                 *self = PtrInfo::Instance(InstancePtrInfo {
                     descr: None,
                     known_class: None,
-                    fields: Vec::new(),
+                    fields: vec![(field_idx, FieldEntry::Preamble(pop))],
                     field_descrs: Vec::new(),
-                    preamble_fields: vec![(field_idx, pop)],
                     last_guard_pos: -1,
                 });
             }
@@ -1856,8 +1897,10 @@ impl PtrInfo {
     /// `PreambleOp` is not an `OpRef`.
     pub fn set_preamble_item(&mut self, index: usize, pop: PreambleOp) {
         if let PtrInfo::Array(v) = self {
-            v.preamble_items.retain(|(k, _)| *k != index);
-            v.preamble_items.push((index, pop));
+            if index >= v.items.len() {
+                v.items.resize(index + 1, FieldEntry::Value(OpRef::NONE));
+            }
+            v.items[index] = FieldEntry::Preamble(pop);
         }
     }
 
@@ -1865,8 +1908,14 @@ impl PtrInfo {
     /// Returns true if preamble_fields has an entry for this field_idx.
     pub fn has_preamble_field(&self, field_idx: u32) -> bool {
         match self {
-            PtrInfo::Instance(v) => v.preamble_fields.iter().any(|(k, _)| *k == field_idx),
-            PtrInfo::Struct(v) => v.preamble_fields.iter().any(|(k, _)| *k == field_idx),
+            PtrInfo::Instance(v) => v
+                .fields
+                .iter()
+                .any(|(k, e)| *k == field_idx && e.is_preamble()),
+            PtrInfo::Struct(v) => v
+                .fields
+                .iter()
+                .any(|(k, e)| *k == field_idx && e.is_preamble()),
             _ => false,
         }
     }
@@ -1875,7 +1924,7 @@ impl PtrInfo {
     /// Returns true if preamble_items has an entry for this index.
     pub fn has_preamble_item(&self, index: usize) -> bool {
         match self {
-            PtrInfo::Array(v) => v.preamble_items.iter().any(|(k, _)| *k == index),
+            PtrInfo::Array(v) => v.items.get(index).map_or(false, |e| e.is_preamble()),
             _ => false,
         }
     }
@@ -1886,15 +1935,23 @@ impl PtrInfo {
     pub fn take_preamble_field(&mut self, field_idx: u32) -> Option<PreambleOp> {
         match self {
             PtrInfo::Instance(v) => {
-                if let Some(pos) = v.preamble_fields.iter().position(|(k, _)| *k == field_idx) {
-                    Some(v.preamble_fields.remove(pos).1)
+                if let Some(pos) = v
+                    .fields
+                    .iter()
+                    .position(|(k, e)| *k == field_idx && e.is_preamble())
+                {
+                    v.fields.remove(pos).1.into_preamble()
                 } else {
                     None
                 }
             }
             PtrInfo::Struct(v) => {
-                if let Some(pos) = v.preamble_fields.iter().position(|(k, _)| *k == field_idx) {
-                    Some(v.preamble_fields.remove(pos).1)
+                if let Some(pos) = v
+                    .fields
+                    .iter()
+                    .position(|(k, e)| *k == field_idx && e.is_preamble())
+                {
+                    v.fields.remove(pos).1.into_preamble()
                 } else {
                     None
                 }
@@ -1908,8 +1965,13 @@ impl PtrInfo {
     pub fn take_preamble_item(&mut self, index: usize) -> Option<PreambleOp> {
         match self {
             PtrInfo::Array(v) => {
-                if let Some(pos) = v.preamble_items.iter().position(|(k, _)| *k == index) {
-                    Some(v.preamble_items.remove(pos).1)
+                if let Some(entry) = v.items.get_mut(index) {
+                    if entry.is_preamble() {
+                        let taken = std::mem::replace(entry, FieldEntry::Value(OpRef::NONE));
+                        taken.into_preamble()
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 }
@@ -1956,11 +2018,9 @@ impl PtrInfo {
         match self {
             PtrInfo::Instance(v) => {
                 v.fields.retain(|(k, _)| *k != field_idx);
-                v.preamble_fields.retain(|(k, _)| *k != field_idx);
             }
             PtrInfo::Struct(v) => {
                 v.fields.retain(|(k, _)| *k != field_idx);
-                v.preamble_fields.retain(|(k, _)| *k != field_idx);
             }
             PtrInfo::Virtual(v) => v.fields.retain(|(k, _)| *k != field_idx),
             PtrInfo::VirtualStruct(v) => v.fields.retain(|(k, _)| *k != field_idx),
@@ -1968,45 +2028,54 @@ impl PtrInfo {
         }
     }
 
-    /// info.py: all_items() — return all cached field entries.
+    /// info.py: all_items() — return all cached field entries as (idx, OpRef).
     /// heap.py:211,214: opinfo.all_items() used by _cannot_alias_via_content.
-    pub fn all_items(&self) -> &[(u32, OpRef)] {
+    /// For Instance/Struct, extracts Value entries (skips Preamble).
+    pub fn all_items(&self) -> Vec<(u32, OpRef)> {
         match self {
-            PtrInfo::Instance(v) => &v.fields,
-            PtrInfo::Struct(v) => &v.fields,
-            PtrInfo::Virtual(v) => &v.fields,
-            PtrInfo::VirtualStruct(v) => &v.fields,
-            _ => &[],
+            PtrInfo::Instance(v) => v
+                .fields
+                .iter()
+                .filter_map(|(k, e)| e.as_opref().map(|r| (*k, r)))
+                .collect(),
+            PtrInfo::Struct(v) => v
+                .fields
+                .iter()
+                .filter_map(|(k, e)| e.as_opref().map(|r| (*k, r)))
+                .collect(),
+            PtrInfo::Virtual(v) => v.fields.clone(),
+            PtrInfo::VirtualStruct(v) => v.fields.clone(),
+            _ => Vec::new(),
         }
     }
 
-    /// info.py: getfield(field_descr) — get a field from a virtual object.
     /// info.py:212-214 AbstractStructPtrInfo.getfield
     ///
-    /// Typed adaptation: heap import keeps PreambleOp in a side-store,
-    /// but generic field readers still need the concrete cached value.
-    pub fn getfield(&self, field_idx: u32) -> Option<OpRef> {
+    /// Returns `FieldEntry` — callers must handle both `Value` and `Preamble`
+    /// variants. RPython returns the _fields[] element directly which may be
+    /// a PreambleOp sentinel; this matches that design.
+    pub fn getfield(&self, field_idx: u32) -> Option<FieldEntry> {
         match self {
             PtrInfo::Instance(v) => v
                 .fields
                 .iter()
                 .find(|(k, _)| *k == field_idx)
-                .map(|(_, v)| *v),
+                .map(|(_, e)| e.clone()),
             PtrInfo::Struct(v) => v
                 .fields
                 .iter()
                 .find(|(k, _)| *k == field_idx)
-                .map(|(_, v)| *v),
+                .map(|(_, e)| e.clone()),
             PtrInfo::Virtual(v) => v
                 .fields
                 .iter()
                 .find(|(k, _)| *k == field_idx)
-                .map(|(_, v)| *v),
+                .map(|(_, v)| FieldEntry::Value(*v)),
             PtrInfo::VirtualStruct(v) => v
                 .fields
                 .iter()
                 .find(|(k, _)| *k == field_idx)
-                .map(|(_, v)| *v),
+                .map(|(_, v)| FieldEntry::Value(*v)),
             _ => None,
         }
     }
@@ -2016,9 +2085,9 @@ impl PtrInfo {
         match self {
             PtrInfo::Array(v) => {
                 if index >= v.items.len() {
-                    v.items.resize(index + 1, OpRef::NONE);
+                    v.items.resize(index + 1, FieldEntry::Value(OpRef::NONE));
                 }
-                v.items[index] = value;
+                v.items[index] = FieldEntry::Value(value);
             }
             PtrInfo::VirtualArray(v) => {
                 if index < v.items.len() {
@@ -2030,10 +2099,11 @@ impl PtrInfo {
     }
 
     /// info.py: getitem(index) — get an item from a virtual array.
-    pub fn getitem(&self, index: usize) -> Option<OpRef> {
+    /// Returns `FieldEntry` — callers must handle `Preamble` variants.
+    pub fn getitem(&self, index: usize) -> Option<FieldEntry> {
         match self {
-            PtrInfo::Array(v) => v.items.get(index).copied(),
-            PtrInfo::VirtualArray(v) => v.items.get(index).copied(),
+            PtrInfo::Array(v) => v.items.get(index).cloned(),
+            PtrInfo::VirtualArray(v) => v.items.get(index).map(|r| FieldEntry::Value(*r)),
             _ => None,
         }
     }
@@ -2046,9 +2116,8 @@ impl PtrInfo {
         match self {
             PtrInfo::Array(v) => {
                 if index < v.items.len() {
-                    v.items[index] = OpRef::NONE;
+                    v.items[index] = FieldEntry::Value(OpRef::NONE);
                 }
-                v.preamble_items.retain(|(k, _)| *k != index);
             }
             PtrInfo::VirtualArray(v) => {
                 if index < v.items.len() {
@@ -2224,14 +2293,12 @@ pub struct InstancePtrInfo {
     pub descr: Option<DescrRef>,
     /// Known class pointer, if guarded exactly.
     pub known_class: Option<GcRef>,
-    /// Cached field values.
-    pub fields: Vec<(u32, OpRef)>,
+    /// info.py:175 _fields — cached field values.
+    /// RPython stores both normal Boxes and PreambleOp sentinels in the
+    /// same list. Rust mirrors this with `Vec<(u32, FieldEntry)>`.
+    pub fields: Vec<(u32, FieldEntry)>,
     /// Original field descriptors, in parent-local slot order.
     pub field_descrs: Vec<DescrRef>,
-    /// shortpreamble.py:11-49: PreambleOp wrappers stored during Phase 2
-    /// import. RPython stores these in `_fields[]` (mixed with regular
-    /// values); Rust uses a separate Vec with read-before-fields semantics.
-    pub preamble_fields: Vec<(u32, PreambleOp)>,
     /// info.py:91-92
     pub last_guard_pos: i32,
 }
@@ -2243,12 +2310,10 @@ pub struct InstancePtrInfo {
 pub struct StructPtrInfo {
     /// Exact struct descriptor.
     pub descr: DescrRef,
-    /// Cached field values.
-    pub fields: Vec<(u32, OpRef)>,
+    /// info.py:175 _fields — cached field values (same as InstancePtrInfo).
+    pub fields: Vec<(u32, FieldEntry)>,
     /// Original field descriptors, in parent-local slot order.
     pub field_descrs: Vec<DescrRef>,
-    /// shortpreamble.py:11-49: PreambleOp wrappers (same as InstancePtrInfo).
-    pub preamble_fields: Vec<(u32, PreambleOp)>,
     /// info.py:91-92
     pub last_guard_pos: i32,
 }
@@ -2262,11 +2327,9 @@ pub struct ArrayPtrInfo {
     pub descr: DescrRef,
     /// Known bounds on the array length.
     pub lenbound: IntBound,
-    /// Cached item values for constant indices.
-    pub items: Vec<OpRef>,
-    /// shortpreamble.py:11-49: PreambleOp wrappers stored during Phase 2
-    /// import for constant-index array reads.
-    pub preamble_items: Vec<(usize, PreambleOp)>,
+    /// info.py:579 _items — cached item values for constant indices.
+    /// RPython stores both normal Boxes and PreambleOp sentinels.
+    pub items: Vec<FieldEntry>,
     /// info.py:91-92
     pub last_guard_pos: i32,
 }
@@ -2953,13 +3016,13 @@ mod tests {
         let descr: DescrRef = Arc::new(TestDescr);
         let mut info = PtrInfo::virtual_obj(descr, None);
 
-        assert_eq!(info.getfield(0), None);
+        assert!(info.getfield(0).is_none());
         info.setfield(0, OpRef(10));
-        assert_eq!(info.getfield(0), Some(OpRef(10)));
+        assert_eq!(info.getfield(0).and_then(|e| e.as_opref()), Some(OpRef(10)));
         info.setfield(0, OpRef(20)); // overwrite
-        assert_eq!(info.getfield(0), Some(OpRef(20)));
+        assert_eq!(info.getfield(0).and_then(|e| e.as_opref()), Some(OpRef(20)));
         info.setfield(1, OpRef(30));
-        assert_eq!(info.getfield(1), Some(OpRef(30)));
+        assert_eq!(info.getfield(1).and_then(|e| e.as_opref()), Some(OpRef(30)));
     }
 
     #[test]
@@ -2967,12 +3030,15 @@ mod tests {
         let descr: DescrRef = Arc::new(TestDescr);
         let mut info = PtrInfo::virtual_array(descr, 3, false);
 
-        assert_eq!(info.getitem(0), Some(OpRef::NONE)); // initialized to NONE
+        assert_eq!(
+            info.getitem(0).and_then(|e| e.as_opref()),
+            Some(OpRef::NONE)
+        ); // initialized to NONE
         info.setitem(0, OpRef(10));
-        assert_eq!(info.getitem(0), Some(OpRef(10)));
+        assert_eq!(info.getitem(0).and_then(|e| e.as_opref()), Some(OpRef(10)));
         info.setitem(2, OpRef(30));
-        assert_eq!(info.getitem(2), Some(OpRef(30)));
-        assert_eq!(info.getitem(5), None); // out of bounds
+        assert_eq!(info.getitem(2).and_then(|e| e.as_opref()), Some(OpRef(30)));
+        assert!(info.getitem(5).is_none()); // out of bounds
     }
 
     #[test]
@@ -2980,7 +3046,7 @@ mod tests {
         let descr: DescrRef = Arc::new(TestDescr);
         let mut info = PtrInfo::array(descr, crate::optimizeopt::intutils::IntBound::nonnegative());
         info.setitem(1, OpRef(77));
-        assert_eq!(info.getitem(1), Some(OpRef(77)));
+        assert_eq!(info.getitem(1).and_then(|e| e.as_opref()), Some(OpRef(77)));
 
         let mut replay = Op::new(OpCode::GetarrayitemGcI, &[OpRef(10), OpRef::from_const(0)]);
         replay.pos = OpRef(88);
@@ -2993,12 +3059,17 @@ mod tests {
         info.set_preamble_item(1, pop.clone());
 
         assert!(info.has_preamble_item(1));
-        assert_eq!(info.getitem(1), Some(OpRef(77)));
+        // After set_preamble_item, getitem returns Preamble (not the old Value)
+        assert!(info.getitem(1).map_or(false, |e| e.is_preamble()));
         let recovered = info
             .take_preamble_item(1)
             .expect("preamble item should be recoverable");
         assert_eq!(recovered.resolved, OpRef(99));
-        assert_eq!(info.getitem(1), Some(OpRef(77)));
+        // After take_preamble_item, slot is Value(NONE)
+        assert_eq!(
+            info.getitem(1).and_then(|e| e.as_opref()),
+            Some(OpRef::NONE)
+        );
     }
 
     #[test]

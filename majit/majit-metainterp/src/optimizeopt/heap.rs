@@ -149,18 +149,22 @@ impl CachedField {
         // set_preamble_field. The caller (heap.py:177-187 _getfield) then
         // checks isinstance(res, PreambleOp) via take_preamble_field.
         if let Some(info) = ctx.get_ptr_info(struct_opref) {
-            if let Some(value) = info.getfield(descr_idx) {
-                if !value.is_none() {
-                    return Some(value);
+            if let Some(entry) = info.getfield(descr_idx) {
+                if let Some(value) = entry.as_opref() {
+                    if !value.is_none() {
+                        return Some(value);
+                    }
                 }
             }
         }
         // info.py:738-743 ConstPtrInfo.getfield → _get_info(parent_descr, optheap)
         let parent_descr = descr.as_field_descr().and_then(|fd| fd.get_parent_descr());
         if let Some(info) = ctx.get_const_info_mut(struct_opref, parent_descr) {
-            if let Some(value) = info.getfield(descr_idx) {
-                if !value.is_none() {
-                    return Some(value);
+            if let Some(entry) = info.getfield(descr_idx) {
+                if let Some(value) = entry.as_opref() {
+                    if !value.is_none() {
+                        return Some(value);
+                    }
                 }
             }
         }
@@ -212,8 +216,8 @@ impl CachedField {
         // heap.py:217-225: shared field with two different constants
         // → CANNOT_ALIAS. RPython iterates positionally; the Rust port
         // matches by field_idx (equivalent for the same descriptor layout).
-        for &(idx1, v1) in f1 {
-            for &(idx2, v2) in f2 {
+        for &(idx1, v1) in &f1 {
+            for &(idx2, v2) in &f2 {
                 if idx1 != idx2 {
                     continue;
                 }
@@ -417,17 +421,21 @@ impl ArrayCachedItem {
         }
         let idx = self.index as usize;
         if let Some(info) = ctx.get_ptr_info(array_opref) {
-            if let Some(value) = info.getitem(idx) {
-                if !value.is_none() {
-                    return Some(value);
+            if let Some(entry) = info.getitem(idx) {
+                if let Some(value) = entry.as_opref() {
+                    if !value.is_none() {
+                        return Some(value);
+                    }
                 }
             }
         }
         // info.py:746-748 ConstPtrInfo.getitem → _get_array_info(descr, optheap)
         if let Some(info) = ctx.get_const_info_array_mut(array_opref, descr.clone()) {
-            if let Some(value) = info.getitem(idx) {
-                if !value.is_none() {
-                    return Some(value);
+            if let Some(entry) = info.getitem(idx) {
+                if let Some(value) = entry.as_opref() {
+                    if !value.is_none() {
+                        return Some(value);
+                    }
                 }
             }
         }
@@ -3574,7 +3582,8 @@ mod tests {
         assert!(matches!(result, OptimizationResult::Emit(_)));
         assert_eq!(
             ctx.get_ptr_info(OpRef(100))
-                .and_then(|info| info.getitem(3)),
+                .and_then(|info| info.getitem(3))
+                .and_then(|e| e.as_opref()),
             Some(OpRef(200))
         );
     }
@@ -3618,7 +3627,8 @@ mod tests {
         pass.flush(&mut ctx);
         assert_eq!(
             ctx.get_ptr_info(OpRef(100))
-                .and_then(|info| info.getitem(3)),
+                .and_then(|info| info.getitem(3))
+                .and_then(|e| e.as_opref()),
             Some(OpRef(101))
         );
     }

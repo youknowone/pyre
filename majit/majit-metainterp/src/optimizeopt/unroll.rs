@@ -2124,10 +2124,10 @@ impl OptUnroll {
             }
             Some(crate::optimizeopt::info::PtrInfo::VirtualArray(v)) => v.items.clone(),
             Some(crate::optimizeopt::info::PtrInfo::Instance(v)) if !v.fields.is_empty() => {
-                v.fields.iter().map(|(_, r)| *r).collect()
+                v.fields.iter().filter_map(|(_, e)| e.as_opref()).collect()
             }
             Some(crate::optimizeopt::info::PtrInfo::Struct(v)) if !v.fields.is_empty() => {
-                v.fields.iter().map(|(_, r)| *r).collect()
+                v.fields.iter().filter_map(|(_, e)| e.as_opref()).collect()
             }
             _ => return,
         };
@@ -3447,12 +3447,15 @@ impl OptUnroll {
                         if let Some(info) = array_info.as_mut() {
                             if let crate::optimizeopt::info::PtrInfo::Array(array_info) = info {
                                 let _ = array_info.lenbound.make_gt_const(index as i64);
-                                array_info
-                                    .preamble_items
-                                    .retain(|(k, _)| *k != index as usize);
-                                array_info
-                                    .preamble_items
-                                    .push((index as usize, pop.clone()));
+                                let idx = index as usize;
+                                if idx >= array_info.items.len() {
+                                    array_info.items.resize(
+                                        idx + 1,
+                                        crate::optimizeopt::info::FieldEntry::Value(OpRef::NONE),
+                                    );
+                                }
+                                array_info.items[idx] =
+                                    crate::optimizeopt::info::FieldEntry::Preamble(pop.clone());
                             }
                         }
                     }
