@@ -374,14 +374,33 @@ impl ArrayCachedItem {
     /// heap.py:278-298 ArrayCachedItem._cannot_alias_via_content
     fn _cannot_alias_via_content(opref1: OpRef, opref2: OpRef, ctx: &mut OptContext) -> bool {
         use crate::optimizeopt::info::PtrInfo;
-        let (Some(PtrInfo::Array(_)), Some(PtrInfo::Array(_))) =
-            (ctx.get_ptr_info(opref1), ctx.get_ptr_info(opref2))
-        else {
-            return false;
+        // heap.py:279-282: isinstance(opinfo, ArrayPtrInfo)
+        let items1: Vec<OpRef> = match ctx.get_ptr_info(opref1) {
+            Some(PtrInfo::Array(a)) => a.items.iter().filter_map(|e| e.as_opref()).collect(),
+            _ => return false,
         };
-        // heap.py:283-298: check all_items for constant differences
-        // ArrayPtrInfo.all_items() returns fields, not items, so
-        // for arrays this rarely succeeds. Keep the structure for PyPy parity.
+        let items2: Vec<OpRef> = match ctx.get_ptr_info(opref2) {
+            Some(PtrInfo::Array(a)) => a.items.iter().filter_map(|e| e.as_opref()).collect(),
+            _ => return false,
+        };
+        // heap.py:288-298: compare cached constant values at each index
+        let len = items1.len().min(items2.len());
+        for i in 0..len {
+            let v1 = ctx.get_box_replacement(items1[i]);
+            let v2 = ctx.get_box_replacement(items2[i]);
+            if v1.is_none() || v2.is_none() {
+                continue;
+            }
+            // heap.py:294-295: not value.is_constant() → skip
+            let (c1, c2) = match (ctx.get_constant(v1), ctx.get_constant(v2)) {
+                (Some(a), Some(b)) => (a.clone(), b.clone()),
+                _ => continue,
+            };
+            // heap.py:296-297: not value1.same_constant(value2) → CANNOT_ALIAS
+            if c1 != c2 {
+                return true;
+            }
+        }
         false
     }
 
@@ -2995,8 +3014,12 @@ impl Optimization for OptHeap {
         }
     }
 
-    /// heap.py:825-846 OptHeap.serialize_optheap
-    fn export_cached_fields(&self, ctx: &mut OptContext) -> Vec<(OpRef, DescrRef, OpRef)> {
+    /// heap.py:825-846 OptHeap.serialize_optheap(available_boxes)
+    fn export_cached_fields(
+        &self,
+        ctx: &mut OptContext,
+        available_boxes: Option<&std::collections::HashSet<OpRef>>,
+    ) -> Vec<(OpRef, DescrRef, OpRef)> {
         let mut result = Vec::new();
         // heap.py:827-846: for descr, cf in cached_fields.iteritems():
         for (&field_idx, cf) in &self.cached_fields {
@@ -3028,6 +3051,12 @@ impl Optimization for OptHeap {
                 if obj.is_none() {
                     continue;
                 }
+                // heap.py:836: if not box1.is_constant() and box1 not in available_boxes: continue
+                if let Some(ab) = available_boxes {
+                    if !obj.is_constant() && !ab.contains(&obj) {
+                        continue;
+                    }
+                }
                 // heap.py:838-839: structinfo = cf.cached_infos[i]
                 //                  box2 = structinfo.getfield(descr)
                 let resolved = ctx.get_box_replacement(obj);
@@ -3043,7 +3072,16 @@ impl Optimization for OptHeap {
                 else {
                     continue;
                 };
-                if !val.is_none() {
+                // heap.py:844: box2 = box2.get_box_replacement()
+                let val = ctx.get_box_replacement(val);
+                // heap.py:845: if box2.is_constant() or box2 in available_boxes:
+                if val.is_none() {
+                    continue;
+                }
+                let val_ok = available_boxes.map_or(true, |ab| {
+                    val.is_constant() || ctx.is_constant(val) || ab.contains(&val)
+                });
+                if val_ok {
                     result.push((obj, descr.clone(), val));
                 }
             }
@@ -3101,8 +3139,12 @@ impl Optimization for OptHeap {
         }
     }
 
-    /// heap.py:847-868 serialize_optheap (array half)
-    fn export_cached_arrayitems(&self, ctx: &mut OptContext) -> Vec<(OpRef, i64, DescrRef, OpRef)> {
+    /// heap.py:847-868 serialize_optheap(available_boxes) (array half)
+    fn export_cached_arrayitems(
+        &self,
+        ctx: &mut OptContext,
+        available_boxes: Option<&std::collections::HashSet<OpRef>>,
+    ) -> Vec<(OpRef, i64, DescrRef, OpRef)> {
         let mut result = Vec::new();
         for (&descr_idx, submap) in &self.cached_arrayitems {
             let descr = match self.array_descr_map.get(&descr_idx) {
@@ -3122,6 +3164,12 @@ impl Optimization for OptHeap {
                     if obj.is_none() {
                         continue;
                     }
+                    // heap.py:855: if not box1.is_constant() and box1 not in available_boxes: continue
+                    if let Some(ab) = available_boxes {
+                        if !obj.is_constant() && !ab.contains(&obj) {
+                            continue;
+                        }
+                    }
                     // heap.py:858: if index >= 2**15: continue
                     if index >= (1 << 15) {
                         continue;
@@ -3140,7 +3188,16 @@ impl Optimization for OptHeap {
                     else {
                         continue;
                     };
-                    if !val.is_none() {
+                    // heap.py:865: box2 = box2.get_box_replacement()
+                    let val = ctx.get_box_replacement(val);
+                    // heap.py:866: if box2.is_constant() or box2 in available_boxes:
+                    if val.is_none() {
+                        continue;
+                    }
+                    let val_ok = available_boxes.map_or(true, |ab| {
+                        val.is_constant() || ctx.is_constant(val) || ab.contains(&val)
+                    });
+                    if val_ok {
                         result.push((obj, index, descr.clone(), val));
                     }
                 }
@@ -3359,17 +3416,15 @@ mod tests {
             }],
         );
         ctx.set_ptr_info(object, PtrInfo::instance(None, None));
-        ctx.get_ptr_info_mut(object)
-            .unwrap()
-            .set_preamble_field(
-                descr.index(),
-                PreambleOp {
-                    op: source,
-                    resolved,
-                    invented_name: false,
-                    preamble_op,
-                },
-            );
+        ctx.get_ptr_info_mut(object).unwrap().set_preamble_field(
+            descr.index(),
+            PreambleOp {
+                op: source,
+                resolved,
+                invented_name: false,
+                preamble_op,
+            },
+        );
     }
 
     /// Call descriptor with default EffectInfo (non-random, non-elidable).

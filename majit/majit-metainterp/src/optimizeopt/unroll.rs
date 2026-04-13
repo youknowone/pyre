@@ -383,12 +383,18 @@ impl UnrollOptimizer {
                             .collect();
                     }
                     // Export Phase 1's heap cache for Phase 2.
+                    // bridgeopt.py:64-67: available_boxes = {box: None for box in liveboxes
+                    //                     if box is not None and box in liveboxes_from_env}
+                    // Phase 1 export: end_args are the available live boxes.
+                    let available_boxes: std::collections::HashSet<OpRef> =
+                        state.end_args.iter().copied().collect();
                     // Temporarily take ctx out to avoid borrow conflict between
                     // &mut final_ctx and &self.passes in export_all_*.
                     if let Some(mut final_ctx) = opt_p1.final_ctx.take() {
-                        state.preamble_heap_cache = opt_p1.export_all_cached_fields(&mut final_ctx);
-                        state.preamble_heap_array_cache =
-                            opt_p1.export_all_cached_arrayitems(&mut final_ctx);
+                        state.preamble_heap_cache =
+                            opt_p1.export_all_cached_fields(&mut final_ctx, Some(&available_boxes));
+                        state.preamble_heap_array_cache = opt_p1
+                            .export_all_cached_arrayitems(&mut final_ctx, Some(&available_boxes));
                         opt_p1.final_ctx = Some(final_ctx);
                     }
                     // opencoder.py:271 _index parity: Phase 2's TraceIterator

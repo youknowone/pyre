@@ -4091,10 +4091,12 @@ pub trait Optimization {
         // Default: no contribution
     }
 
-    /// heap.py:825-846 serialize_optheap — export struct field triples.
+    /// heap.py:825-846 serialize_optheap(available_boxes) — export struct field triples.
+    /// `available_boxes`: None = no filter (accept all), Some = RPython filter.
     fn export_cached_fields(
         &self,
         _ctx: &mut OptContext,
+        _available_boxes: Option<&std::collections::HashSet<OpRef>>,
     ) -> Vec<(OpRef, majit_ir::DescrRef, OpRef)> {
         Vec::new()
     }
@@ -4107,10 +4109,12 @@ pub trait Optimization {
     ) {
     }
 
-    /// heap.py:847-868 serialize_optheap — export array item triples.
+    /// heap.py:847-868 serialize_optheap(available_boxes) — export array item triples.
+    /// `available_boxes`: None = no filter (accept all), Some = RPython filter.
     fn export_cached_arrayitems(
         &self,
         _ctx: &mut OptContext,
+        _available_boxes: Option<&std::collections::HashSet<OpRef>>,
     ) -> Vec<(OpRef, i64, majit_ir::DescrRef, OpRef)> {
         Vec::new()
     }

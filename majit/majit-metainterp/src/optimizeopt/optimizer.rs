@@ -1117,26 +1117,28 @@ impl Optimizer {
         }
     }
 
-    /// Collect all cached field entries from all passes.
+    /// heap.py:825 serialize_optheap(available_boxes) — struct half.
     pub fn export_all_cached_fields(
         &self,
         ctx: &mut OptContext,
+        available_boxes: Option<&std::collections::HashSet<OpRef>>,
     ) -> Vec<(OpRef, majit_ir::DescrRef, OpRef)> {
         let mut result = Vec::new();
         for pass in &self.passes {
-            result.extend(pass.export_cached_fields(ctx));
+            result.extend(pass.export_cached_fields(ctx, available_boxes));
         }
         result
     }
 
-    /// Collect all cached array item entries from all passes.
+    /// heap.py:847 serialize_optheap(available_boxes) — array half.
     pub fn export_all_cached_arrayitems(
         &self,
         ctx: &mut OptContext,
+        available_boxes: Option<&std::collections::HashSet<OpRef>>,
     ) -> Vec<(OpRef, i64, majit_ir::DescrRef, OpRef)> {
         let mut result = Vec::new();
         for pass in &self.passes {
-            result.extend(pass.export_cached_arrayitems(ctx));
+            result.extend(pass.export_cached_arrayitems(ctx, available_boxes));
         }
         result
     }
@@ -3260,9 +3262,12 @@ impl Optimizer {
     ) -> crate::resume::OptimizerKnowledgeForResume {
         let mut heap_fields_raw = Vec::new();
         let mut heap_arrayitems_raw = Vec::new();
+        // Guard resume: export all cached fields (no available_boxes filter).
+        // RPython only calls serialize_optheap from bridgeopt.py; this
+        // guard-resume path has no RPython-equivalent filter.
         for pass in &self.passes {
-            let fields = pass.export_cached_fields(ctx);
-            let items = pass.export_cached_arrayitems(ctx);
+            let fields = pass.export_cached_fields(ctx, None);
+            let items = pass.export_cached_arrayitems(ctx, None);
             if !fields.is_empty() || !items.is_empty() {
                 heap_fields_raw = fields;
                 heap_arrayitems_raw = items;
