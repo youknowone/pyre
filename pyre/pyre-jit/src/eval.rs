@@ -1067,11 +1067,13 @@ pub(crate) fn pyre_portal_runner(
 /// warmspot.py:961-1007 handle_jitexception.
 ///
 /// RPython: CRN → portal_ptr(*args) re-invokes the interpreter.
-/// pyre: CRN → re-loop eval_loop_jit(frame). This does NOT call
-/// maybe_compile_and_run (warmspot.py:948); portal_ptr is a plain
-/// interpreter dispatch, and pyre's eval_loop_jit is the equivalent.
-/// TODO: exact portal_ptr(*args) parity (currently `continue`
-/// re-enters without re-extracting CRN args from the exception).
+/// pyre: CRN → re-loop eval_loop_jit(frame). frame.next_instr is
+/// already set from green_int[0] at the CRN source (eval.rs:1631),
+/// and frame locals are already written by the blackhole's
+/// bhimpl_vable_setarrayitem_ref (shadow write). Red args need not
+/// be re-extracted — bh_portal_runner also only extracts next_instr.
+/// portal_runner_for_force was tried and regressed nested_loop
+/// (try_function_entry_jit causes incorrect inner-loop recompilation).
 #[inline(always)]
 fn handle_jitexception(frame: &mut PyFrame) -> PyResult {
     loop {

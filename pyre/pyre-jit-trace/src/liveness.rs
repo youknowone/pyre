@@ -113,18 +113,12 @@ impl LiveVars {
                         }
                     }
                     // LoadFastBorrowLoadFastBorrow reads two locals — GEN both.
-                    // Correct per RPython liveness semantics, but currently
-                    // disabled: enabling exposes a pre-existing blackhole bug
-                    // where dead locals get stale CONST values from trace
-                    // recording time. Without GEN, the blackhole naturally
-                    // fails (too few values) and the loop is invalidated —
-                    // interpreter takes over. With GEN, the blackhole succeeds
-                    // but computes wrong results from stale dead-local values.
-                    // Verified correct via FORCE_BH_FAIL: GEN=ON + forced
-                    // blackhole failure produces correct output.
-                    // TODO: implement consume_vable_info (resume.py:1399) to
-                    // provide runtime-resolved values for dead locals, then
-                    // re-enable.
+                    // Blocked on Phase 5 (LOAD_FAST → vable read): the
+                    // blackhole reads locals via move_r (registers_r), not
+                    // from the frame's vable array. Even with
+                    // consume_vable_info writing fresh values to the frame,
+                    // the blackhole won't see them. Re-enable once the
+                    // blackhole jitcode uses GETARRAYITEM_VABLE_R for locals.
                     // Instruction::LoadFastBorrowLoadFastBorrow { var_nums } => {
                     //     let pair = var_nums.get(op_arg);
                     //     for i in [u32::from(pair.idx_1()) as usize,
