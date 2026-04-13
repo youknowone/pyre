@@ -23,45 +23,16 @@ use pyre_interpreter::pyframe::PyFrame;
 // natively without memoization.
 
 thread_local! {
-    static RECURSIVE_DISPATCH_CACHE: UnsafeCell<Option<(u64, FinishProtocol, Option<u64>, bool)>> =
+    static RECURSIVE_DISPATCH_CACHE: UnsafeCell<Option<(u64, Option<u64>, bool)>> =
         const { UnsafeCell::new(None) };
-    static SELF_RECURSIVE_DISPATCH_CACHE: UnsafeCell<Option<(u64, FinishProtocol, Option<u64>)>> =
+    static SELF_RECURSIVE_DISPATCH_CACHE: UnsafeCell<Option<(u64, Option<u64>)>> =
         const { UnsafeCell::new(None) };
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum FinishProtocol {
-    RawInt,
-    Boxed,
-}
-
-// force_cache_index removed
-
-#[inline]
-fn finish_protocol(green_key: u64) -> FinishProtocol {
-    let (driver, _) = crate::eval::driver_pair();
-    if driver.has_raw_int_finish(green_key) {
-        FinishProtocol::RawInt
-    } else {
-        FinishProtocol::Boxed
-    }
-}
-
-#[inline]
-fn normalize_direct_finish_result(protocol: FinishProtocol, raw: i64) -> i64 {
-    match protocol {
-        FinishProtocol::RawInt => {
-            let maybe_boxed = raw as PyObjectRef;
-            let looks_like_heap_ptr = raw > 4096 && (raw as usize & 0x7) == 0;
-            if looks_like_heap_ptr && !maybe_boxed.is_null() && unsafe { is_int(maybe_boxed) } {
-                unsafe { w_int_get_value(maybe_boxed) }
-            } else {
-                raw
-            }
-        }
-        FinishProtocol::Boxed => raw,
-    }
-}
+// warmspot.py:449 portal result_type == REF: FINISH always boxes via
+// wrapint, so the force/resume paths always receive a boxed Ref.
+// FinishProtocol and normalize_direct_finish_result removed — they
+// were dead code since result_type is always Type::Ref.
 
 fn debug_instruction_window(frame: &PyFrame) -> String {
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
@@ -270,52 +241,45 @@ pub fn maybe_handle_inline_concrete_call(
     } else {
         jit_force_recursive_call_raw_1(frame as *const PyFrame as i64, callable as i64, raw_arg)
     };
-    let result = match finish_protocol(green_key) {
-        FinishProtocol::RawInt => w_int_new(forced),
-        FinishProtocol::Boxed => forced as PyObjectRef,
-    };
+    // warmspot.py:449 result_type=REF: force always returns boxed Ref
+    let result = forced as PyObjectRef;
     Some(Ok(result))
 }
 
-fn recursive_dispatch(
-    callable: PyObjectRef,
-    green_key: u64,
-) -> (FinishProtocol, Option<u64>, bool) {
+fn recursive_dispatch(callable: PyObjectRef, green_key: u64) -> (Option<u64>, bool) {
     RECURSIVE_DISPATCH_CACHE.with(|cell| unsafe {
         let slot = &mut *cell.get();
-        if let Some((cached_key, protocol, token_num, memo_safe)) = *slot {
+        if let Some((cached_key, token_num, memo_safe)) = *slot {
             if cached_key == green_key && token_num.is_some() {
-                return (protocol, token_num, memo_safe);
+                return (token_num, memo_safe);
             }
         }
 
         let (driver, _) = crate::eval::driver_pair();
-        let protocol = finish_protocol(green_key);
         let token_num = driver.get_loop_token(green_key).map(|token| token.number);
         let memo_safe = recursive_force_cache_safe(callable);
         if token_num.is_some() {
-            *slot = Some((green_key, protocol, token_num, memo_safe));
+            *slot = Some((green_key, token_num, memo_safe));
         }
-        (protocol, token_num, memo_safe)
+        (token_num, memo_safe)
     })
 }
 
-fn self_recursive_dispatch(green_key: u64) -> (FinishProtocol, Option<u64>) {
+fn self_recursive_dispatch(green_key: u64) -> Option<u64> {
     SELF_RECURSIVE_DISPATCH_CACHE.with(|cell| unsafe {
         let slot = &mut *cell.get();
-        if let Some((cached_key, protocol, token_num)) = *slot {
+        if let Some((cached_key, token_num)) = *slot {
             if cached_key == green_key && token_num.is_some() {
-                return (protocol, token_num);
+                return token_num;
             }
         }
 
         let (driver, _) = crate::eval::driver_pair();
-        let protocol = finish_protocol(green_key);
         let token_num = driver.get_loop_token(green_key).map(|token| token.number);
         if token_num.is_some() {
-            *slot = Some((green_key, protocol, token_num));
+            *slot = Some((green_key, token_num));
         }
-        (protocol, token_num)
+        token_num
     })
 }
 
@@ -517,8 +481,6 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
     };
 
     let green_key = crate::eval::make_green_key(code, 0);
-    let protocol = finish_protocol(green_key);
-
     let mut func_frame = PyFrame::new_for_call(code, &[], namespace, exec_ctx);
     func_frame.fix_array_ptrs();
 
@@ -538,13 +500,8 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
         }
     };
 
-    match protocol {
-        FinishProtocol::RawInt if !result.is_null() && unsafe { is_int(result) } => unsafe {
-            w_int_get_value(result)
-        },
-        FinishProtocol::RawInt => result as i64,
-        FinishProtocol::Boxed => result as i64,
-    }
+    // warmspot.py:449 result_type=REF: always boxed Ref
+    result as i64
 }
 
 /// warmspot.py:1021-1028 — assembler_call_helper.
@@ -593,7 +550,6 @@ fn jit_force_callee_frame_raw(frame_ptr: i64) -> i64 {
     let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
 
     let green_key = crate::eval::make_green_key(frame.code, frame.next_instr);
-    let protocol = finish_protocol(green_key);
 
     let (driver, _) = crate::eval::driver_pair();
     if let Some(token) = driver.get_loop_token(green_key) {
@@ -617,12 +573,9 @@ fn jit_force_callee_frame_raw(frame_ptr: i64) -> i64 {
             &inputs,
             jit_force_callee_frame_interp,
         ) {
-            let value = match protocol {
-                FinishProtocol::RawInt => normalize_direct_finish_result(protocol, raw),
-                FinishProtocol::Boxed => w_int_new(raw) as i64,
-            };
-            // force cache removed
-            return value;
+            // result_type=REF: fast path returns boxed Ref as-is
+            // (compiler.rs:2655 [Type::Ref] => outputs[0])
+            return raw;
         }
     }
 
@@ -630,14 +583,8 @@ fn jit_force_callee_frame_raw(frame_ptr: i64) -> i64 {
     // plain interpreter, no JIT re-entry.
     match pyre_interpreter::eval::eval_frame_plain(frame) {
         Ok(result) => {
-            let value = match protocol {
-                FinishProtocol::RawInt if !result.is_null() && unsafe { is_int(result) } => unsafe {
-                    w_int_get_value(result)
-                },
-                FinishProtocol::RawInt => result as i64,
-                FinishProtocol::Boxed => result as i64,
-            };
-            value
+            // warmspot.py:449 result_type=REF: always boxed Ref
+            result as i64
         }
         Err(err) => {
             // warmspot.py:998 parity: propagate exception via JIT_EXC_VALUE.
@@ -656,7 +603,6 @@ extern "C" fn jit_force_callee_frame_interp(frame_ptr: i64) -> i64 {
     let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
 
     let green_key = crate::eval::make_green_key(frame.code, frame.next_instr);
-    let protocol = finish_protocol(green_key);
 
     // warmspot.py:1021-1028 assembler_call_helper parity: if the blackhole
     // cannot run (pc_map miss = corrupt resume data), fall back to plain
@@ -677,13 +623,8 @@ extern "C" fn jit_force_callee_frame_interp(frame_ptr: i64) -> i64 {
         },
     };
 
-    match protocol {
-        FinishProtocol::RawInt if !result.is_null() && unsafe { is_int(result) } => unsafe {
-            w_int_get_value(result)
-        },
-        FinishProtocol::RawInt => result as i64,
-        FinishProtocol::Boxed => result as i64,
-    }
+    // warmspot.py:449 result_type=REF: always boxed Ref
+    result as i64
 }
 
 /// RPython: FieldDescr.offset is resolved at rtyper time. In pyre, Rust struct
@@ -1483,15 +1424,7 @@ pub extern "C" fn jit_force_recursive_call_1(
     let boxed_arg_ref = boxed_arg as PyObjectRef;
     let w_code = unsafe { pyre_interpreter::getcode(callable_ref) };
     let green_key = crate::eval::make_green_key(w_code, 0);
-    if matches!(finish_protocol(green_key), FinishProtocol::RawInt)
-        && !boxed_arg_ref.is_null()
-        && unsafe { is_int(boxed_arg_ref) }
-    {
-        let raw_arg = unsafe { w_int_get_value(boxed_arg_ref) };
-        let forced = jit_force_recursive_call_raw_1(caller_frame, callable, raw_arg);
-        return w_int_new(forced) as i64;
-    }
-
+    // result_type=REF: no RawInt unbox needed — arg is already boxed Ref
     if majit_metainterp::majit_log_enabled() {
         let caller = unsafe { &*(caller_frame as *const PyFrame) };
         let caller_arg0 = if caller.locals_cells_stack_w.len() > 0
@@ -1549,11 +1482,7 @@ pub extern "C" fn jit_force_recursive_call_argraw_boxed_1(
     let callable_ref = callable as PyObjectRef;
     let w_code = unsafe { pyre_interpreter::getcode(callable_ref) };
     let green_key = crate::eval::make_green_key(w_code, 0);
-    if matches!(finish_protocol(green_key), FinishProtocol::RawInt) {
-        let forced = jit_force_recursive_call_raw_1(caller_frame, callable, raw_int_arg);
-        return w_int_new(forced) as i64;
-    }
-
+    // result_type=REF: box the int arg, dispatch as boxed Ref
     let boxed = pyre_object::intobject::w_int_new(raw_int_arg);
     jit_force_recursive_call_1(caller_frame, callable, boxed as i64)
 }
@@ -1573,15 +1502,7 @@ pub extern "C" fn jit_force_self_recursive_call_1(caller_frame: i64, boxed_arg: 
     }
     let caller = unsafe { &*(caller_frame as *const PyFrame) };
     let green_key = crate::eval::make_green_key(caller.code, 0);
-    if matches!(finish_protocol(green_key), FinishProtocol::RawInt)
-        && !boxed_arg_ref.is_null()
-        && unsafe { is_int(boxed_arg_ref) }
-    {
-        let raw_arg = unsafe { w_int_get_value(boxed_arg_ref) };
-        let forced = jit_force_self_recursive_call_raw_1(caller_frame, raw_arg);
-        return w_int_new(forced) as i64;
-    }
-
+    // result_type=REF: arg is already boxed Ref
     let frame_ptr = create_self_recursive_callee_frame_impl_1_boxed(caller_frame, boxed_arg_ref);
     // warmspot.py:1021 assembler_call_helper: force path runs in plain
     // interpreter. RPython: handle_fail → resume_in_blackhole, no portal.
@@ -1608,11 +1529,7 @@ pub extern "C" fn jit_force_self_recursive_call_argraw_boxed_1(
     let _suspend_inline_result = pyre_interpreter::call::suspend_inline_handled_result();
     let caller = unsafe { &*(caller_frame as *const PyFrame) };
     let green_key = crate::eval::make_green_key(caller.code, 0);
-    if matches!(finish_protocol(green_key), FinishProtocol::RawInt) {
-        let forced = jit_force_self_recursive_call_raw_1(caller_frame, raw_int_arg);
-        return w_int_new(forced) as i64;
-    }
-
+    // result_type=REF: box the int arg, dispatch as boxed Ref
     let boxed = pyre_object::intobject::w_int_new(raw_int_arg);
     jit_force_self_recursive_call_1(caller_frame, boxed as i64)
 }
@@ -1633,7 +1550,7 @@ pub extern "C" fn jit_force_recursive_call_raw_1(
     let callable_ref = callable as PyObjectRef;
     let w_code = unsafe { pyre_interpreter::getcode(callable_ref) };
     let green_key = crate::eval::make_green_key(w_code, 0);
-    let (protocol, _token_num, _memo_safe) = recursive_dispatch(callable_ref, green_key);
+    let (_token_num, _memo_safe) = recursive_dispatch(callable_ref, green_key);
 
     let boxed = pyre_object::intobject::w_int_new(raw_int_arg);
     let frame_ptr = create_callee_frame_impl_1_boxed(caller_frame, callable_ref, boxed);
@@ -1651,13 +1568,8 @@ pub extern "C" fn jit_force_recursive_call_raw_1(
                 Err(_) => pyre_object::PY_NULL,
             },
         };
-        match protocol {
-            FinishProtocol::RawInt if !bh_result.is_null() && unsafe { is_int(bh_result) } => unsafe {
-                w_int_get_value(bh_result)
-            },
-            FinishProtocol::RawInt => bh_result as i64,
-            FinishProtocol::Boxed => bh_result as i64,
-        }
+        // warmspot.py:449 result_type=REF: always boxed Ref
+        bh_result as i64
     };
     jit_drop_callee_frame(frame_ptr);
     result
@@ -1684,7 +1596,7 @@ pub extern "C" fn jit_force_self_recursive_call_raw_1(caller_frame: i64, raw_int
     let caller = unsafe { &*(caller_frame as *const PyFrame) };
     let w_code = caller.code;
     let green_key = crate::eval::make_green_key(w_code, 0);
-    let (protocol, _token_num) = self_recursive_dispatch(green_key);
+    let _token_num = self_recursive_dispatch(green_key);
 
     let boxed = pyre_object::intobject::w_int_new(raw_int_arg);
     let frame_ptr = create_self_recursive_callee_frame_impl_1_boxed(caller_frame, boxed);
@@ -1696,19 +1608,14 @@ pub extern "C" fn jit_force_self_recursive_call_raw_1(caller_frame: i64, raw_int
             Ok(r) => r,
             Err(_) => pyre_object::PY_NULL,
         };
-        match protocol {
-            FinishProtocol::RawInt if !pr_result.is_null() && unsafe { is_int(pr_result) } => unsafe {
-                w_int_get_value(pr_result)
-            },
-            FinishProtocol::RawInt => pr_result as i64,
-            FinishProtocol::Boxed => pr_result as i64,
-        }
+        // warmspot.py:449 result_type=REF: always boxed Ref
+        pr_result as i64
     };
     jit_drop_callee_frame(frame_ptr);
     if majit_metainterp::majit_log_enabled() && raw_int_arg <= 4 {
         eprintln!(
-            "[jit][force-self-recursive] exit arg={} result={} protocol={:?}",
-            raw_int_arg, result, protocol
+            "[jit][force-self-recursive] exit arg={} result={}",
+            raw_int_arg, result
         );
     }
     result
@@ -2850,17 +2757,10 @@ pub fn callee_frame_helper(nargs: usize) -> Option<*const ()> {
 }
 
 /// Force callee and return BOXED result (for inline_function_call).
-/// Unlike jit_force_callee_frame which returns raw int for the CA protocol,
-/// this returns a boxed PyObjectRef for use in traces that expect boxed values.
+/// warmspot.py:449 result_type=REF: jit_force_callee_frame already
+/// returns boxed Ref, so this is just a pass-through.
 pub extern "C" fn jit_force_callee_frame_boxed(frame_ptr: i64) -> i64 {
-    let frame = unsafe { &*(frame_ptr as *const PyFrame) };
-    let green_key = crate::eval::make_green_key(frame.code, frame.next_instr);
-    let protocol = finish_protocol(green_key);
-    let result = jit_force_callee_frame(frame_ptr);
-    match protocol {
-        FinishProtocol::RawInt => w_int_new(result) as i64,
-        FinishProtocol::Boxed => result,
-    }
+    jit_force_callee_frame(frame_ptr)
 }
 
 pub extern "C" fn jit_drop_callee_frame(frame_ptr: i64) {
