@@ -22,22 +22,30 @@ pub mod trace;
 ///
 /// From incminimark.py GCFLAG_* constants.
 pub mod flags {
-    /// Old object that may point to young objects (needs write barrier check).
+    // incminimark.py GCFLAG_* — bit positions must match RPython exactly.
+    // first_gcflag = 1 << 32; each constant below is (first_gcflag << N)
+    // expressed as the unshifted bit index N.
+    /// GCFLAG_TRACK_YOUNG_PTRS (bit 0)
     pub const TRACK_YOUNG_PTRS: u64 = 1 << 0;
-    /// Prebuilt object with no heap pointers yet.
+    /// GCFLAG_NO_HEAP_PTRS (bit 1)
     pub const NO_HEAP_PTRS: u64 = 1 << 1;
-    /// Marked as visited during major collection.
+    /// GCFLAG_VISITED (bit 2)
     pub const VISITED: u64 = 1 << 2;
-    /// Has a shadow copy for identity hash.
+    /// GCFLAG_HAS_SHADOW (bit 3)
     pub const HAS_SHADOW: u64 = 1 << 3;
-    /// Finalizer ordering.
+    /// GCFLAG_FINALIZATION_ORDERING (bit 4)
     pub const FINALIZATION_ORDERING: u64 = 1 << 4;
-    /// Has card marking enabled (for large arrays).
-    pub const HAS_CARDS: u64 = 1 << 5;
-    /// At least one card is marked.
-    pub const CARDS_SET: u64 = 1 << 6;
-    /// Pinned in nursery (won't be moved).
-    pub const PINNED: u64 = 1 << 7;
+    /// GCFLAG_EXTRA (bit 5) — reserved
+    pub const EXTRA: u64 = 1 << 5;
+    /// GCFLAG_HAS_CARDS (bit 6)
+    pub const HAS_CARDS: u64 = 1 << 6;
+    /// GCFLAG_CARDS_SET (bit 7) — MSB of the byte containing TRACK_YOUNG_PTRS.
+    /// The x86 backend relies on this being -0x80 as a signed byte.
+    pub const CARDS_SET: u64 = 1 << 7;
+    /// GCFLAG_VISITED_RMY (bit 8)
+    pub const VISITED_RMY: u64 = 1 << 8;
+    /// GCFLAG_PINNED (bit 9)
+    pub const PINNED: u64 = 1 << 9;
 }
 
 /// Write barrier descriptor — information the JIT needs to emit write barrier checks.
@@ -51,9 +59,13 @@ pub struct WriteBarrierDescr {
     pub jit_wb_if_flag_byteofs: usize,
     /// Single-byte mask to test.
     pub jit_wb_if_flag_singlebyte: u8,
-    /// Flag for card marking.
+    /// Flag for card marking (GCFLAG_CARDS_SET).
     pub jit_wb_cards_set: u64,
-    /// Shift for computing card index.
+    /// Byte offset of the CARDS_SET flag byte.
+    pub jit_wb_cards_set_byteofs: usize,
+    /// Single-byte mask for CARDS_SET (must be -0x80 = 0x80).
+    pub jit_wb_cards_set_singlebyte: i8,
+    /// Shift for computing card index (1 << shift == card_page_indices).
     pub jit_wb_card_page_shift: u32,
 }
 
@@ -74,13 +86,27 @@ impl WriteBarrierDescr {
     /// Build a descriptor with correct byte offsets for the current
     /// header layout. gc.py:259-293 WriteBarrierDescr.__init__.
     pub fn for_current_gc() -> Self {
-        let (byteofs, singlebyte) = Self::extract_flag_byte(flags::TRACK_YOUNG_PTRS);
+        let (if_flag_byteofs, if_flag_singlebyte) =
+            Self::extract_flag_byte(flags::TRACK_YOUNG_PTRS);
+        let (cards_set_byteofs, cards_set_singlebyte) = Self::extract_flag_byte(flags::CARDS_SET);
+        // gc.py:280-281: the x86 backend relies on these two facts
+        // to avoid one instruction in _write_barrier_fastpath.
+        debug_assert_eq!(
+            cards_set_byteofs, if_flag_byteofs,
+            "CARDS_SET and TRACK_YOUNG_PTRS must be in the same byte"
+        );
+        debug_assert_eq!(
+            cards_set_singlebyte as i8, -0x80i8,
+            "CARDS_SET must be the MSB of its byte (-0x80)"
+        );
         WriteBarrierDescr {
             jit_wb_if_flag: flags::TRACK_YOUNG_PTRS,
-            jit_wb_if_flag_byteofs: byteofs,
-            jit_wb_if_flag_singlebyte: singlebyte,
+            jit_wb_if_flag_byteofs: if_flag_byteofs,
+            jit_wb_if_flag_singlebyte: if_flag_singlebyte,
             jit_wb_cards_set: flags::CARDS_SET,
-            jit_wb_card_page_shift: 0, // TODO: card page shift from GC config
+            jit_wb_cards_set_byteofs: cards_set_byteofs,
+            jit_wb_cards_set_singlebyte: cards_set_singlebyte as i8,
+            jit_wb_card_page_shift: crate::collector::DEFAULT_CARD_PAGE_SHIFT,
         }
     }
 }

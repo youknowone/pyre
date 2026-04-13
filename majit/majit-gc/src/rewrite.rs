@@ -1023,6 +1023,8 @@ mod tests {
                 jit_wb_if_flag_byteofs: 0,
                 jit_wb_if_flag_singlebyte: 1,
                 jit_wb_cards_set: 0,
+                jit_wb_cards_set_byteofs: 0,
+                jit_wb_cards_set_singlebyte: 0,
                 jit_wb_card_page_shift: 0,
             },
             jitframe_info: None,
