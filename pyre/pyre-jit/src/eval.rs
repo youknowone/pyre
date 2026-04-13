@@ -1007,13 +1007,11 @@ pub(crate) fn portal_runner_for_force(frame: &mut PyFrame) -> PyResult {
 
 /// warmspot.py:970-983 ContinueRunningNormally → portal_ptr(*args) parity.
 ///
+/// warmspot.py:961-983 handle_jitexception: ContinueRunningNormally path.
+///
 /// Called from handle_jitexception_in_portal (via portal_runner callback)
 /// when ContinueRunningNormally is raised at a recursive portal level.
-/// Extracts the red_ref values (frame locals as PyObjectRef pointers)
-/// and calls the portal function (eval_with_jit) with those values.
-///
-/// Returns Ok((return_type, value)) or Err(JitException) if the portal
-/// itself raises a JitException (warmspot.py:979-980 loop back).
+/// Delegates to bh_portal_runner (warmspot.py:976 portal_ptr(*args)).
 fn pyre_portal_runner(
     exc: &majit_metainterp::jitexc::JitException,
 ) -> Result<(majit_metainterp::blackhole::BhReturnType, i64), majit_metainterp::jitexc::JitException>
@@ -1021,45 +1019,34 @@ fn pyre_portal_runner(
     use majit_metainterp::blackhole::BhReturnType;
     use majit_metainterp::jitexc::JitException;
 
-    let JitException::ContinueRunningNormally { red_ref, .. } = exc else {
-        // Not ContinueRunningNormally — shouldn't reach here.
+    let JitException::ContinueRunningNormally {
+        green_int,
+        green_ref,
+        green_float,
+        red_int,
+        red_ref,
+        red_float,
+    } = exc
+    else {
         return Ok((BhReturnType::Void, 0));
     };
 
-    // warmspot.py:972-975: extract args from ContinueRunningNormally.
-    // pyre's red args: [frame_ptr, next_instr, vsd, locals...]
-    // red_ref[0] is the frame pointer.
-    if red_ref.is_empty() {
-        return Ok((BhReturnType::Void, 0));
-    }
-
-    let frame_ptr = red_ref[0] as *mut PyFrame;
-    if frame_ptr.is_null() {
-        return Ok((BhReturnType::Void, 0));
-    }
+    // warmspot.py:972-975: portalfunc_ARGS extraction.
+    // Build merged arg lists like blackhole.py:1113-1116.
+    let mut all_i = green_int.clone();
+    all_i.extend(red_int);
+    let mut all_r = green_ref.clone();
+    all_r.extend(red_ref);
+    let mut all_f = green_float.clone();
+    all_f.extend(red_float);
 
     // warmspot.py:976-978: result = portal_ptr(*args)
-    // In pyre, this means running the frame through eval_with_jit.
-    let frame = unsafe { &mut *frame_ptr };
-    match crate::eval::eval_with_jit(frame) {
-        Ok(result) => {
-            // warmspot.py:982: result = unspecialize_value(result)
-            Ok((BhReturnType::Ref, result as i64))
-        }
-        Err(py_err) => {
-            // blackhole.py:1773-1775: regular exception from portal_ptr.
-            // _handle_jitexception catches it with `except Exception as e`
-            // and converts via get_llexception(cpu, e) → lle.
-            // This lle becomes current_exc in the blackhole chain.
-            //
-            // In Rust, we return Err(ExitFrameWithExceptionRef) which
-            // handle_jitexception_in_portal converts to Err(exc_value),
-            // and handle_jitexception sets current_exc = exc_value.
-            let exc_obj = py_err.exc_object;
-            Err(JitException::ExitFrameWithExceptionRef(majit_ir::GcRef(
-                exc_obj as usize,
-            )))
-        }
+    let result = crate::call_jit::bh_portal_runner(&all_i, &all_r, &all_f);
+    if result == 0 || result == pyre_object::PY_NULL as i64 {
+        Ok((BhReturnType::Void, 0))
+    } else {
+        // warmspot.py:982: result = unspecialize_value(result)
+        Ok((BhReturnType::Ref, result))
     }
 }
 
@@ -1661,7 +1648,7 @@ fn execute_assembler(
                     let bh_result =
                         resume_in_blackhole_from_exit_layout(frame, raw_values, exit_layout);
                     match &bh_result {
-                        crate::call_jit::BlackholeResult::ContinueRunningNormally => {
+                        crate::call_jit::BlackholeResult::ContinueRunningNormally { .. } => {
                             Some(LoopResult::ContinueRunningNormally)
                         }
                         crate::call_jit::BlackholeResult::Failed => {
@@ -1831,7 +1818,7 @@ fn bound_reached(
                     let bh_result =
                         resume_in_blackhole_from_exit_layout(frame, raw_values, exit_layout);
                     match &bh_result {
-                        crate::call_jit::BlackholeResult::ContinueRunningNormally => {
+                        crate::call_jit::BlackholeResult::ContinueRunningNormally { .. } => {
                             return Some(LoopResult::ContinueRunningNormally);
                         }
                         crate::call_jit::BlackholeResult::Failed => {}
@@ -1976,7 +1963,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
                     let bh_result =
                         resume_in_blackhole_from_exit_layout(frame, raw_values, exit_layout);
                     match &bh_result {
-                        crate::call_jit::BlackholeResult::ContinueRunningNormally => {
+                        crate::call_jit::BlackholeResult::ContinueRunningNormally { .. } => {
                             // Fall through to eval_loop_jit
                         }
                         crate::call_jit::BlackholeResult::Failed => {

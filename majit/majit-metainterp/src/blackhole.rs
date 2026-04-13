@@ -14,6 +14,22 @@ use crate::resume::{
 };
 use majit_ir::{GcRef, Op, OpCode, OpRef};
 
+/// blackhole.py:1068 parity: typed payload decoded from merge-point
+/// bytecode operands. Corresponds to the 6 lists in
+/// ContinueRunningNormally(gi, gr, gf, ri, rr, rf).
+///
+/// Corresponds to ContinueRunningNormally(gi, gr, gf, ri, rr, rf)
+/// in jitexc.py:53 — the typed portal args, NOT live locals.
+#[derive(Debug, Clone, Default)]
+pub struct MergePointArgs {
+    pub green_int: Vec<i64>,
+    pub green_ref: Vec<i64>,
+    pub green_float: Vec<i64>,
+    pub red_int: Vec<i64>,
+    pub red_ref: Vec<i64>,
+    pub red_float: Vec<i64>,
+}
+
 use crate::executor::{OpResult, TraceValues, ValueStore, execute_one, resolve};
 
 /// Trait for IR-based blackhole memory access.
@@ -847,6 +863,9 @@ enum DispatchError {
     /// Exception raised — must call handle_exception_in_frame.
     /// Carries the exception value (GcRef pointer as i64).
     RaiseException(i64),
+    /// blackhole.py:1068-1069: raise ContinueRunningNormally(*args)
+    /// Bottommost blackhole reached the merge point — restart portal.
+    ContinueRunningNormally(MergePointArgs),
 }
 
 /// Jitcode-based blackhole interpreter.
@@ -910,8 +929,6 @@ pub struct BlackholeInterpreter {
     runtime_stacks: Vec<Vec<i64>>,
     /// Current selected storage index.
     current_selected: usize,
-    /// Set to true when `run()` exited via merge point (not LeaveFrame).
-    pub reached_merge_point: bool,
     /// True when run() hit BC_ABORT (unsupported bytecode). Callers
     /// must not treat abort as DoneWithThisFrame — side effects from
     /// partial execution have corrupted state.
@@ -949,8 +966,11 @@ pub struct BlackholeInterpreter {
     ///   jitdriver_sd = self.builder.metainterp_sd.jitdrivers_sd[jdindex]
     ///   fnptr = adr2int(jitdriver_sd.portal_runner_adr)
     ///   calldescr = jitdriver_sd.mainjitcode.calldescr
-    /// pyre: single jitdriver. portal_runner_ptr is the fnptr.
-    pub portal_runner_ptr: Option<fn(i64) -> i64>,
+    /// warmspot.py:1010-1013: jd.portal_runner_ptr.
+    /// Portal runner with full portal arg ABI:
+    ///   fn(all_i: &[i64], all_r: &[i64], all_f: &[i64]) -> i64
+    /// where all_i = greens_i + reds_i, all_r = greens_r + reds_r, etc.
+    pub portal_runner_ptr: Option<fn(&[i64], &[i64], &[i64]) -> i64>,
     /// RPython: `jitdriver_sd.mainjitcode.calldescr` — CallDescr of the portal
     /// function. Returned by `get_portal_runner()` for `bhimpl_recursive_call_*`.
     pub mainjitcode_calldescr: BhCallDescr,
@@ -996,7 +1016,6 @@ impl BlackholeInterpreter {
             return_type: BhReturnType::Void,
             runtime_stacks: Vec::new(),
             current_selected: 0,
-            reached_merge_point: false,
             aborted: false,
             got_exception: false,
             last_opcode_position: 0,
@@ -1065,7 +1084,23 @@ impl BlackholeInterpreter {
         self.got_exception = false;
         self.last_opcode_position = position;
         self.exception_last_value = 0;
-        self.reached_merge_point = false;
+    }
+
+    /// interp_jit.py:64 parity: fill dedicated portal red-arg registers
+    /// with virtualizable_ptr (frame) and ec (execution context).
+    ///
+    /// Must be called AFTER virtualizable_ptr is assigned — setposition()
+    /// runs before the caller sets virtualizable_ptr, so portal registers
+    /// are filled as a separate step.
+    pub fn fill_portal_registers(&mut self, ec: i64) {
+        let frame_reg = self.jitcode.portal_frame_reg;
+        let ec_reg = self.jitcode.portal_ec_reg;
+        if frame_reg != u16::MAX && (frame_reg as usize) < self.registers_r.len() {
+            self.registers_r[frame_reg as usize] = self.virtualizable_ptr;
+        }
+        if ec_reg != u16::MAX && (ec_reg as usize) < self.registers_r.len() {
+            self.registers_r[ec_reg as usize] = ec;
+        }
     }
 
     /// blackhole.py:1095-1099 get_portal_runner(jdindex):
@@ -1117,88 +1152,35 @@ impl BlackholeInterpreter {
 
     /// blackhole.py:1109-1116 bhimpl_recursive_call_r:
     ///   fnptr, calldescr = self.get_portal_runner(jdindex)
-    ///   return self.cpu.bh_call_r(fnptr, greens_i+reds_i, greens_r+reds_r, ...)
-    ///
-    /// pyre: greens = [next_instr], reds = [locals via virtualizable].
-    /// Write greens+reds to the virtualizable (frame) then call portal_runner.
-    pub fn bhimpl_recursive_call_r(&self, portal_runner: fn(i64) -> i64) -> i64 {
-        // bh_call_r(fnptr, greens_i + reds_i, greens_r + reds_r, ..., calldescr)
-        // pyre packs args into the virtualizable before the call.
-        self.sync_virtualizable_for_recursive_portal();
-        portal_runner(self.virtualizable_ptr)
-    }
-
-    /// pyre portal recursion contract: materialize the live virtualizable
-    /// state in the heap frame before calling `portal_runner(frame_ptr)`.
-    ///
-    /// RPython's bh_call_r path forwards the current greens/reds directly as
-    /// call arguments. pyre stores the equivalent state in the unified
-    /// `locals_cells_stack_w` array and scalar virtualizable fields:
-    ///   - green: next_instr
-    ///   - red scalar: valuestackdepth
-    ///   - red array: locals + live value stack
-    ///
-    /// Without the stack and valuestackdepth write-back, recursive portal
-    /// re-entry observes a stale frame shape and can resume with the wrong
-    /// operand stack contents.
-    fn sync_virtualizable_for_recursive_portal(&self) {
-        const PYFRAME_NEXT_INSTR_FIELD_INDEX: usize = 0;
-        const PYFRAME_VALUESTACKDEPTH_FIELD_INDEX: usize = 2;
-        const PYFRAME_LOCALS_CELLS_STACK_ARRAY_INDEX: usize = 0;
-
-        if self.virtualizable_ptr == 0 || self.virtualizable_info.is_null() {
-            return;
-        }
-
-        let py_pc = self.jitcode.jit_pc_to_py_pc(self.last_opcode_position) as usize;
-        let frame_ptr = self.virtualizable_ptr as *mut u8;
-        let info = unsafe { &*self.virtualizable_info };
-        let nlocals = self.jitcode.nlocals;
-        let stack_depth = self.jitcode.depth_at_py_pc.get(py_pc).copied().unwrap_or(0) as usize;
-        let stack_base = self.virtualizable_stack_base.max(nlocals);
-
-        unsafe {
-            info.write_field(frame_ptr, PYFRAME_NEXT_INSTR_FIELD_INDEX, py_pc as i64);
-            info.write_field(
-                frame_ptr,
-                PYFRAME_VALUESTACKDEPTH_FIELD_INDEX,
-                (stack_base + stack_depth) as i64,
-            );
-        }
-
-        let array_len = info
-            .array_fields
-            .get(PYFRAME_LOCALS_CELLS_STACK_ARRAY_INDEX)
-            .map(|array| unsafe {
-                crate::virtualizable::vable_array_len(frame_ptr as *const u8, array)
-            })
-            .unwrap_or(0);
-
-        for i in 0..nlocals {
-            if i < self.registers_r.len() && i < array_len {
-                unsafe {
-                    info.write_array_item(
-                        frame_ptr,
-                        PYFRAME_LOCALS_CELLS_STACK_ARRAY_INDEX,
-                        i,
-                        self.registers_r[i],
-                    )
-                };
-            }
-        }
-        for d in 0..stack_depth {
-            let reg_idx = nlocals + d;
-            let frame_idx = stack_base + d;
-            if reg_idx < self.registers_r.len() && frame_idx < array_len {
-                unsafe {
-                    info.write_array_item(
-                        frame_ptr,
-                        PYFRAME_LOCALS_CELLS_STACK_ARRAY_INDEX,
-                        frame_idx,
-                        self.registers_r[reg_idx],
-                    )
-                };
-            }
+    ///   return self.cpu.bh_call_r(fnptr, greens_i+reds_i, greens_r+reds_r,
+    ///                             greens_f+reds_f, calldescr)
+    pub fn bhimpl_recursive_call_r(
+        &self,
+        jdindex: usize,
+        greens_i: Vec<i64>,
+        greens_r: Vec<i64>,
+        greens_f: Vec<i64>,
+        reds_i: Vec<i64>,
+        reds_r: Vec<i64>,
+        reds_f: Vec<i64>,
+    ) -> i64 {
+        let (fnptr, calldescr) = self.get_portal_runner(jdindex);
+        // blackhole.py:1113-1116: greens + reds merged per kind.
+        let mut all_i = greens_i;
+        all_i.extend(&reds_i);
+        let mut all_r = greens_r;
+        all_r.extend(&reds_r);
+        let mut all_f = greens_f;
+        all_f.extend(&reds_f);
+        if let Some(cpu) = self.cpu {
+            // RPython path: cpu.bh_call_r(fnptr, all_i, all_r, all_f, calldescr)
+            cpu.bh_call_r(fnptr, Some(&all_i), Some(&all_r), Some(&all_f), &calldescr)
+                .0 as i64
+        } else if let Some(runner) = self.portal_runner_ptr {
+            // blackhole.py:1113-1116: portal_runner(all_i, all_r, all_f)
+            runner(&all_i, &all_r, &all_f)
+        } else {
+            0
         }
     }
 
@@ -1413,6 +1395,42 @@ impl BlackholeInterpreter {
         jitcode::read_u16(&self.jitcode.code, &mut self.position)
     }
 
+    /// blackhole.py:1732-1748 _get_list_of_values parity.
+    ///
+    /// Decodes a bytecode-encoded register list: [length:u8][indices:u8...].
+    /// Returns a Vec of register values looked up from the appropriate
+    /// register file (registers_i for 'I', registers_r for 'R').
+    fn _get_list_of_values_i(&mut self) -> Vec<i64> {
+        let length = self.next_u8() as usize;
+        let mut values = Vec::with_capacity(length);
+        for _ in 0..length {
+            let index = self.next_u8() as usize;
+            values.push(self.registers_i.get(index).copied().unwrap_or(0));
+        }
+        values
+    }
+
+    /// blackhole.py:1733-1748 _get_list_of_values(self, code, position, 'R')
+    fn _get_list_of_values_r(&mut self) -> Vec<i64> {
+        let length = self.next_u8() as usize;
+        let mut values = Vec::with_capacity(length);
+        for _ in 0..length {
+            let index = self.next_u8() as usize;
+            values.push(self.registers_r.get(index).copied().unwrap_or(0));
+        }
+        values
+    }
+
+    fn _get_list_of_values_f(&mut self) -> Vec<i64> {
+        let length = self.next_u8() as usize;
+        let mut values = Vec::with_capacity(length);
+        for _ in 0..length {
+            let index = self.next_u8() as usize;
+            values.push(self.registers_f.get(index).copied().unwrap_or(0));
+        }
+        values
+    }
+
     fn finished(&self) -> bool {
         self.position >= self.jitcode.code.len()
     }
@@ -1523,29 +1541,21 @@ impl BlackholeInterpreter {
     ///
     /// RPython: `BlackholeInterpreter.run()` catches `LeaveFrame` and breaks,
     /// catches exceptions and calls `handle_exception_in_frame`.
-    pub fn run(&mut self) {
-        // blackhole.py parity: each BlackholeInterp has its own parent frame
-        // via its nextblackholeinterp chain. In pyre we expose the parent
-        // frame via BH_VABLE_PTR (thread-local) for extern "C" call helpers.
-        // Save/restore the previous value so nested blackhole runs (triggered
-        // by bhimpl_residual_call re-entering compiled code → another
-        // blackhole) do not corrupt the caller's parent pointer.
+    /// Returns `Some(args)` for `ContinueRunningNormally` (RPython: raise
+    /// jitexc.ContinueRunningNormally propagates through run→_run_forever).
+    pub fn run(&mut self) -> Option<MergePointArgs> {
         let saved_bh_vable = BH_VABLE_PTR.with(|c| c.get());
         BH_VABLE_PTR.with(|c| c.set(self.virtualizable_ptr));
-        // blackhole.py BlackholeInterpreter.registers_r parity: register the
-        // ref register bank with the GC so nursery objects held only by
-        // blackhole regs survive across collecting calls. RPython traces
-        // these via the Box array's RPython type; pyre uses an explicit
-        // thread-local stack walked by `do_collect_nursery`.
         let bh_depth = unsafe {
             majit_gc::shadow_stack::push_bh_regs(&mut self.registers_r, &mut self.tmpreg_r)
         };
-        self.run_inner();
+        let result = self.run_inner();
         majit_gc::shadow_stack::pop_bh_regs_to(bh_depth);
         BH_VABLE_PTR.with(|c| c.set(saved_bh_vable));
+        result
     }
 
-    fn run_inner(&mut self) {
+    fn run_inner(&mut self) -> Option<MergePointArgs> {
         let trace = crate::majit_log_enabled();
         loop {
             if self.finished() {
@@ -1556,7 +1566,7 @@ impl BlackholeInterpreter {
                         self.registers_i.get(0).copied().unwrap_or(-1)
                     );
                 }
-                return;
+                return None;
             }
             let pos_before = self.position;
             self.last_opcode_position = pos_before;
@@ -1581,7 +1591,15 @@ impl BlackholeInterpreter {
                             pos_before, self.return_type,
                         );
                     }
-                    return;
+                    return None;
+                }
+                Err(DispatchError::ContinueRunningNormally(args)) => {
+                    // blackhole.py:1068: raise ContinueRunningNormally(*args)
+                    // Propagates out of run() like RPython's JitException.
+                    if trace {
+                        eprintln!("[bh-trace] ContinueRunningNormally at pos={}", pos_before);
+                    }
+                    return Some(args);
                 }
                 Err(DispatchError::RaiseException(exc)) => {
                     // blackhole.py:359-361: except Exception → handle_exception_in_frame
@@ -1595,7 +1613,7 @@ impl BlackholeInterpreter {
                     // No handler: propagate exception via got_exception flag
                     self.got_exception = true;
                     self.exception_last_value = exc;
-                    return;
+                    return None;
                 }
             }
         }
@@ -1813,28 +1831,40 @@ impl BlackholeInterpreter {
                 self.position = target;
             }
             BC_JIT_MERGE_POINT => {
-                // blackhole.py:1067-1093 bhimpl_jit_merge_point
+                // blackhole.py:1066-1093 bhimpl_jit_merge_point parity.
+                // @arguments("self", "i", "I", "R", "F", "I", "R", "F")
+                // Decode jdindex + 6 typed register lists from bytecode.
+                let jdindex = self.next_u8() as usize;
+                let gi = self._get_list_of_values_i();
+                let gr = self._get_list_of_values_r();
+                let gf = self._get_list_of_values_f();
+                let ri = self._get_list_of_values_i();
+                let rr = self._get_list_of_values_r();
+                let rf = self._get_list_of_values_f();
+
                 if self.nextblackholeinterp.is_none() {
-                    // blackhole.py:1068: bottommost → ContinueRunningNormally
-                    self.reached_merge_point = true;
-                    return Err(DispatchError::LeaveFrame);
+                    // blackhole.py:1068-1069: bottommost level.
+                    //   raise ContinueRunningNormally(*args)
+                    return Err(DispatchError::ContinueRunningNormally(MergePointArgs {
+                        green_int: gi,
+                        green_ref: gr,
+                        green_float: gf,
+                        red_int: ri,
+                        red_ref: rr,
+                        red_float: rf,
+                    }));
                 }
                 // blackhole.py:1074-1093: recursive portal level.
-                //   sd = self.builder.metainterp_sd
-                //   result_type = sd.jitdrivers_sd[jdindex].result_type
-                //   x = self.bhimpl_recursive_call_r(jdindex, *args)
-                //   self.bhimpl_ref_return(x)
-                // pyre: result_type is always 'r' (PyObjectRef).
-                let (fnptr, _calldescr) = self.get_portal_runner(0);
-                if fnptr != 0 {
-                    let portal_runner: fn(i64) -> i64 =
-                        unsafe { std::mem::transmute(fnptr as usize) };
-                    let x = self.bhimpl_recursive_call_r(portal_runner);
-                    // bhimpl_ref_return(x): tmpreg_r = x; raise LeaveFrame
-                    self.tmpreg_r = x;
-                    self.return_type = BhReturnType::Ref;
-                    return Err(DispatchError::LeaveFrame);
-                }
+                // sd = self.builder.metainterp_sd
+                // result_type = sd.jitdrivers_sd[jdindex].result_type
+                // pyre: single jitdriver, result_type always Ref.
+                // RPython dispatches on result_type {v,i,r,f}; pyre
+                // always takes the 'r' path.
+                let x = self.bhimpl_recursive_call_r(jdindex, gi, gr, gf, ri, rr, rf);
+                // blackhole.py:1088-1089: bhimpl_ref_return(x)
+                self.tmpreg_r = x;
+                self.return_type = BhReturnType::Ref;
+                return Err(DispatchError::LeaveFrame);
             }
             BC_JUMP_TARGET => {
                 // Non-portal loop header marker (helper jitcodes only).
@@ -2511,7 +2541,6 @@ impl BlackholeInterpBuilder {
         // Pool management (RPython uses linked-list via .back; Rust uses Vec)
         interp.nextblackholeinterp = None;
         interp.runtime_stacks.clear();
-        interp.reached_merge_point = false;
         interp.aborted = false;
         interp.got_exception = false;
         interp.virtualizable_stack_base = 0;
@@ -6506,9 +6535,6 @@ fn handler_setlistitem_gc_r(
 ///     except KeyError:
 ///         return pc
 /// ```
-/// TODO: resolve descr index to a SwitchDictDescr table. Currently falls
-/// through (returns pc) which matches the KeyError fallback path but never
-/// takes the dict-hit branch.
 fn handler_switch(
     bh: &mut BlackholeInterpreter,
     code: &[u8],

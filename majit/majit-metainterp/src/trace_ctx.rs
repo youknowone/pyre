@@ -1199,23 +1199,29 @@ impl TraceCtx {
         //             rop.COND_CALL, [condbox, funcbox, box],
         //             vinfo.clear_vable_descr, False, False)
         //
-        // Pyre does not yet register a `clear_vable_ptr` runtime helper or
-        // the matching COND_CALL descriptor on VirtualizableInfo, so the
-        // full sequence cannot be emitted without dead function pointers.
-        // Port the observable prefix (GETFIELD_GC_R + PTR_NE against
-        // CONST_NULL) so the heap cache / optimizer see the same shape
-        // RPython produces; leave the COND_CALL tail as a TODO until
-        // VirtualizableInfo carries `clear_vable_descr` + function pointer.
+        // pyjitpl.py:1190-1200 emit_force_virtualizable:
+        //   tokenbox = mi.execute_and_record(GETFIELD_GC_R, token_descr, box)
+        //   condbox = mi.execute_and_record(PTR_NE, None, tokenbox, CONST_NULL)
+        //   funcbox = ConstInt(cast(Signed, vinfo.clear_vable_ptr))
+        //   self.execute_varargs(COND_CALL, [condbox, funcbox, box],
+        //                        vinfo.clear_vable_descr, False, False)
         if !self.heap_cache.is_unescaped(vable_opref) {
             if let Some(info) = self.virtualizable_info.clone() {
                 let token_descr = info.token_field_descr();
                 let tokenbox =
                     self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], token_descr);
                 let null_ref = self.const_null();
-                let _condbox = self.record_op(OpCode::PtrNe, &[tokenbox, null_ref]);
-                // TODO(vable-locals epic): emit COND_CALL(condbox,
-                // funcbox=clear_vable_ptr, box) once VirtualizableInfo
-                // carries a clear_vable_descr + function pointer.
+                let condbox = self.record_op(OpCode::PtrNe, &[tokenbox, null_ref]);
+                if let (Some(clear_fn), Some(clear_descr)) =
+                    (info.clear_vable_fn, info.clear_vable_descr.clone())
+                {
+                    let funcbox = self.const_int(clear_fn as usize as i64);
+                    self.recorder.record_op_with_descr(
+                        OpCode::CondCallN,
+                        &[condbox, funcbox, vable_opref],
+                        clear_descr,
+                    );
+                }
             }
         }
         // Step 5b: mark this box as a known nonstandard virtualizable so

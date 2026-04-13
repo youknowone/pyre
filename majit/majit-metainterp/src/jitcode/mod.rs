@@ -213,9 +213,14 @@ pub struct JitCode {
     /// RPython: pc → offset into all_liveness (embedded in jitcode bytecodes).
     pub py_to_jit_pc: Vec<usize>,
     /// Number of locals in the source function.
-    /// Used by bhimpl_jit_merge_point's recursive call to limit frame writeback
-    /// to merge-point args only (RPython greens + reds parity).
     pub nlocals: usize,
+    /// interp_jit.py:64 parity: dedicated ref register index for the portal's
+    /// `frame` red arg (reds = ['frame', 'ec']). Filled during blackhole setup
+    /// with virtualizable_ptr.
+    pub portal_frame_reg: u16,
+    /// interp_jit.py:64 parity: dedicated ref register index for the portal's
+    /// `ec` red arg. Filled during blackhole setup (0 in pyre — no separate ec).
+    pub portal_ec_reg: u16,
     /// Absolute start index of the operand stack inside the virtualizable's
     /// unified `locals_cells_stack_w` array (i.e. `nlocals + ncells`).
     /// Computed once at codewriter time per source function so that

@@ -1,3 +1,5 @@
+use majit_ir::Type;
+use majit_ir::descr::{EffectInfo, make_call_descr};
 use majit_metainterp::virtualizable::VirtualizableInfo;
 use pyre_interpreter::CodeObject;
 use pyre_interpreter::{PyExecutionContext, PyNamespace, PyObjectArray};
@@ -58,8 +60,26 @@ pub const PYFRAME_LOCALS_OFFSET: usize = PYFRAME_LOCALS_CELLS_STACK_OFFSET;
 /// `VirtualizableInfo` carries `descr.py FieldDescr.parent_descr` —
 /// required by `OptContext::ensure_ptr_info_arg0` (`optimizer.py:478`)
 /// to dispatch GETFIELD/SETFIELD to `InstancePtrInfo` / `StructPtrInfo`.
+/// virtualizable.py:45-46: clear_vable_ptr — C-ABI helper that writes
+/// TOKEN_NONE (0) to the vable_token field of a PyFrame.
+unsafe extern "C" fn pyre_clear_vable_token(obj_ptr: i64) {
+    let ptr = obj_ptr as *mut u8;
+    if !ptr.is_null() {
+        let token_ptr = ptr.add(PYFRAME_VABLE_TOKEN_OFFSET) as *mut u64;
+        *token_ptr = 0;
+    }
+}
+
 pub fn build_pyframe_virtualizable_info() -> VirtualizableInfo {
     let mut info = crate::virtualizable_gen::build_virtualizable_info();
     info.set_parent_descr(crate::state::pyframe_size_descr());
+    // virtualizable.py:45-47: clear_vable_ptr + clear_vable_descr.
+    // COND_CALL(cond, funcptr, vable_box) — takes one Ref arg, returns void.
+    info.clear_vable_fn = Some(pyre_clear_vable_token);
+    info.clear_vable_descr = Some(make_call_descr(
+        vec![Type::Ref],
+        Type::Void,
+        EffectInfo::default(),
+    ));
     info
 }

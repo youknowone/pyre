@@ -41,6 +41,7 @@ pub struct JitCodeBuilder {
     num_regs_r: u16,
     num_regs_f: u16,
     constants_i: Vec<i64>,
+    constants_r: Vec<i64>,
     opcodes: Vec<OpCode>,
     labels: Vec<Option<usize>>,
     patches: Vec<(usize, usize)>,
@@ -99,6 +100,23 @@ impl JitCodeBuilder {
         let index = self.constants_i.len() as u16;
         self.constants_i.push(value);
         index
+    }
+
+    /// Add a ref constant to the constant pool. Returns pool index.
+    pub fn add_const_r(&mut self, value: i64) -> u16 {
+        let index = self.constants_r.len() as u16;
+        self.constants_r.push(value);
+        index
+    }
+
+    /// Current num_regs_i (for computing constant register indices).
+    pub fn num_regs_i(&self) -> u16 {
+        self.num_regs_i
+    }
+
+    /// Current num_regs_r (for computing constant register indices).
+    pub fn num_regs_r(&self) -> u16 {
+        self.num_regs_r
     }
 
     pub fn load_const_i_value(&mut self, dst: u16, value: i64) {
@@ -389,8 +407,42 @@ impl JitCodeBuilder {
     }
 
     /// blackhole.py:1066 bhimpl_jit_merge_point: portal merge point.
-    pub fn jit_merge_point(&mut self) {
+    ///
+    /// assembler.py:181-196 parity: encodes jdindex + 6 typed register
+    /// lists (greens_i, greens_r, greens_f, reds_i, reds_r, reds_f).
+    /// Each list is [length:u8][reg_indices:u8...].
+    ///
+    /// interp_jit.py:64 portal contract:
+    ///   greens = ['next_instr', 'is_being_profiled', 'pycode']
+    ///   reds = ['frame', 'ec']
+    ///
+    /// `greens_i` = [next_instr_reg, is_being_profiled_reg] (constant slots)
+    /// `greens_r` = [pycode_reg] (constant slot)
+    /// `reds_r`   = [frame_reg, ec_reg] (dedicated portal registers)
+    pub fn jit_merge_point(&mut self, greens_i: &[u8], greens_r: &[u8], reds_r: &[u8]) {
         self.push_u8(BC_JIT_MERGE_POINT);
+        self.push_u8(0); // jdindex
+        // gi: green int registers (next_instr, is_being_profiled)
+        self.push_u8(greens_i.len() as u8);
+        for &idx in greens_i {
+            self.push_u8(idx);
+        }
+        // gr: green ref registers (pycode)
+        self.push_u8(greens_r.len() as u8);
+        for &idx in greens_r {
+            self.push_u8(idx);
+        }
+        // gf: empty
+        self.push_u8(0);
+        // ri: empty
+        self.push_u8(0);
+        // rr: red ref registers (frame, ec)
+        self.push_u8(reds_r.len() as u8);
+        for &idx in reds_r {
+            self.push_u8(idx);
+        }
+        // rf: empty
+        self.push_u8(0);
     }
 
     pub fn abort(&mut self) {
@@ -1105,7 +1157,7 @@ impl JitCodeBuilder {
             c_num_regs_r: self.num_regs_r,
             c_num_regs_f: self.num_regs_f,
             constants_i: self.constants_i,
-            constants_r: Vec::new(),
+            constants_r: self.constants_r,
             constants_f: Vec::new(),
             liveness: Vec::new(),
             liveness_info: Vec::new(),
@@ -1118,6 +1170,8 @@ impl JitCodeBuilder {
             jit_to_py_pc: Vec::new(),
             py_to_jit_pc: Vec::new(),
             nlocals: 0,
+            portal_frame_reg: u16::MAX,
+            portal_ec_reg: u16::MAX,
             stack_base: 0,
             depth_at_py_pc: Vec::new(),
             jitdriver_sd: None,

@@ -160,6 +160,13 @@ pub struct VirtualizableInfo {
     /// virtualizable.py:83-84: self.array_field_by_descrs = {descr: i ...}
     /// Map from descriptor identity (Arc pointer address) to array field index.
     pub array_field_by_descrs: HashMap<usize, usize>,
+    /// virtualizable.py:45-46: self.clear_vable_ptr = ...
+    /// C-ABI function pointer: fn(obj_ptr) that writes TOKEN_NONE to vable_token.
+    /// Used by COND_CALL in emit_force_virtualizable (pyjitpl.py:1197).
+    pub clear_vable_fn: Option<unsafe extern "C" fn(i64)>,
+    /// virtualizable.py:47: self.clear_vable_descr = ...
+    /// CallDescr for the COND_CALL that invokes clear_vable_fn.
+    pub clear_vable_descr: Option<DescrRef>,
 }
 
 impl Clone for VirtualizableInfo {
@@ -177,6 +184,8 @@ impl Clone for VirtualizableInfo {
             _array_field_descrs: self._array_field_descrs.clone(),
             static_field_by_descrs: self.static_field_by_descrs.clone(),
             array_field_by_descrs: self.array_field_by_descrs.clone(),
+            clear_vable_fn: self.clear_vable_fn,
+            clear_vable_descr: self.clear_vable_descr.clone(),
         }
     }
 }
@@ -197,6 +206,8 @@ impl VirtualizableInfo {
             _array_field_descrs: Vec::new(),
             static_field_by_descrs: HashMap::new(),
             array_field_by_descrs: HashMap::new(),
+            clear_vable_fn: None,
+            clear_vable_descr: None,
         }
     }
 

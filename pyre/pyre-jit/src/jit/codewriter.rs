@@ -189,7 +189,7 @@ impl CodeWriter {
     /// Python bytecodes serve as the "graph". Since they are already linear
     /// and register-allocated, jtransform/regalloc/flatten are identity
     /// transforms. We go directly to assembly.
-    pub fn transform_graph_to_jitcode(&self, code: &CodeObject) -> PyJitCode {
+    pub fn transform_graph_to_jitcode(&self, code: &CodeObject, w_code: *const ()) -> PyJitCode {
         let nlocals = code.varnames.len();
         // regalloc.py parity: all values (locals + stack temporaries) live in
         // typed register files. The value stack is mapped to ref registers
@@ -200,6 +200,10 @@ impl CodeWriter {
         let obj_tmp1 = (nlocals + max_stackdepth + 1) as u16;
         let arg_regs_start = (nlocals + max_stackdepth + 2) as u16;
         let null_ref_reg = (nlocals + max_stackdepth + 10) as u16;
+        // interp_jit.py:64 parity: dedicated ref registers for portal reds.
+        // reds = ['frame', 'ec'] → two registers beyond null_ref_reg.
+        let portal_frame_reg = null_ref_reg + 1;
+        let portal_ec_reg = null_ref_reg + 2;
 
         let int_tmp0 = 0u16;
         let int_tmp1 = 1u16;
@@ -220,7 +224,7 @@ impl CodeWriter {
         assembler.set_name(code.obj_name.to_string());
 
         // RPython regalloc.py: keep kind-separated register files.
-        assembler.ensure_r_regs(null_ref_reg + 1);
+        assembler.ensure_r_regs(portal_ec_reg + 1);
         assembler.ensure_i_regs(op_code_reg + 1);
 
         // Register helper function pointers
@@ -337,7 +341,39 @@ impl CodeWriter {
             // merge point; loop_header at all other backward jump targets.
             if loop_header_pcs.contains(&py_pc) {
                 if merge_point_pc == Some(py_pc) && !emitted_merge_point {
-                    assembler.jit_merge_point();
+                    // interp_jit.py:64 portal contract:
+                    //   greens = ['next_instr', 'is_being_profiled', 'pycode']
+                    //   reds = ['frame', 'ec']
+                    //
+                    // jtransform.py:1690 make_three_lists parity:
+                    //   gi = [next_instr, is_being_profiled]
+                    //   gr = [pycode]
+                    //   rr = [frame, ec]
+                    //
+                    // Green consts → constant pool → register bank slots.
+                    let next_instr_const_idx = assembler.add_const_i(py_pc as i64);
+                    let is_being_profiled_const_idx = assembler.add_const_i(0); // always 0
+                    // Register index = num_regs_i + const_pool_idx
+                    let num_regs_i = assembler.num_regs_i();
+                    let gi_next_instr_reg = (num_regs_i + next_instr_const_idx) as u8;
+                    let gi_is_profiled_reg = (num_regs_i + is_being_profiled_const_idx) as u8;
+
+                    // pycode → ref constant pool → register bank slot.
+                    // interp_jit.py:85: pycode is the W_CodeObject (PyObjectRef),
+                    // not the inner CodeObject struct.
+                    let pycode_const_idx = assembler.add_const_r(w_code as i64);
+                    let num_regs_r = assembler.num_regs_r();
+                    let gr_pycode_reg = (num_regs_r + pycode_const_idx) as u8;
+
+                    // Red refs: dedicated portal registers (frame, ec).
+                    let frame_reg = portal_frame_reg as u8;
+                    let ec_reg = portal_ec_reg as u8;
+
+                    assembler.jit_merge_point(
+                        &[gi_next_instr_reg, gi_is_profiled_reg],
+                        &[gr_pycode_reg],
+                        &[frame_reg, ec_reg],
+                    );
                     emitted_merge_point = true;
                 } else {
                     assembler.jump_target();
@@ -1013,6 +1049,8 @@ impl CodeWriter {
             result_type: 'r',
         };
         jitcode.nlocals = code.varnames.len();
+        jitcode.portal_frame_reg = portal_frame_reg;
+        jitcode.portal_ec_reg = portal_ec_reg;
         // Per-jitcode stack base in `locals_cells_stack_w`. Each jitcode in
         // a blackhole chain owns its own value (different functions have
         // different cellvar layouts), so the rd_numb resume path can read
@@ -1094,8 +1132,8 @@ impl CodeWriter {
     ///
     /// For pyre, JitCodes are compiled lazily per-CodeObject (not AOT).
     /// This method compiles a single CodeObject and caches the result.
-    pub fn make_jitcode(&self, code: &CodeObject) -> PyJitCode {
-        self.transform_graph_to_jitcode(code)
+    pub fn make_jitcode(&self, code: &CodeObject, w_code: *const ()) -> PyJitCode {
+        self.transform_graph_to_jitcode(code, w_code)
     }
 }
 
@@ -1158,7 +1196,7 @@ pub fn get_jitcode(
     JITCODE_CACHE.with(|cell| {
         let cache = unsafe { &mut *cell.get() };
         if !cache.contains_key(&key) {
-            let pyjitcode = writer.make_jitcode(code);
+            let pyjitcode = writer.make_jitcode(code, w_code);
             cache.insert(key, pyjitcode);
             // RPython parity: clone JitCode into state::JitCode (which is
             // Box'd in MetaInterpStaticData.jitcodes — stable address).

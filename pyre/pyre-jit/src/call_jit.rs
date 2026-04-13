@@ -659,11 +659,34 @@ fn resolve_field_offset(owner: &str, field_name: &str) -> usize {
 /// Callback for bhimpl_recursive_call. Receives a frame pointer, executes
 /// the frame through the JIT-enabled interpreter (eval_loop_jit), and
 /// returns the result. This enables JIT re-entry at recursive portal depth.
-pub(crate) fn bh_portal_runner(frame_ptr: i64) -> i64 {
-    if frame_ptr == 0 {
+/// warmspot.py:941-959 ll_portal_runner(*args) parity.
+/// Portal runner with full portal arg ABI.
+///
+/// blackhole.py:1113-1116: called with merged arg lists:
+///   all_i = greens_i + reds_i = [next_instr, is_being_profiled]
+///   all_r = greens_r + reds_r = [pycode, frame, ec]
+///   all_f = greens_f + reds_f = []
+///
+/// warmspot.py:972-975: portalfunc_ARGS extraction order:
+///   (Int, 'green_int', 0) → next_instr = all_i[0]
+///   (Int, 'green_int', 1) → is_being_profiled = all_i[1]
+///   (Ref, 'green_ref', 0) → pycode = all_r[0]
+///   (Ref, 'red_ref', 0)   → frame = all_r[1]
+///   (Ref, 'red_ref', 1)   → ec = all_r[2]
+pub(crate) fn bh_portal_runner(all_i: &[i64], all_r: &[i64], _all_f: &[i64]) -> i64 {
+    // warmspot.py:972-975: extract portal args from merged lists.
+    let next_instr = all_i.first().copied().unwrap_or(0) as usize;
+    let _is_being_profiled = all_i.get(1).copied().unwrap_or(0);
+    let _pycode = all_r.first().copied().unwrap_or(0);
+    let frame_ptr = all_r.get(1).copied().unwrap_or(0) as *mut PyFrame;
+    let _ec = all_r.get(2).copied().unwrap_or(0);
+
+    if frame_ptr.is_null() {
         return pyre_object::PY_NULL as i64;
     }
-    let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
+    let frame = unsafe { &mut *frame_ptr };
+    // warmspot.py:976: set portal args on frame before dispatch.
+    frame.next_instr = next_instr;
     crate::eval::portal_runner(frame) as i64
 }
 
@@ -769,6 +792,10 @@ fn blackhole_from_jit_frame(frame: &mut PyFrame) -> Option<PyObjectRef> {
     bh.virtualizable_ptr = frame as *mut PyFrame as i64;
     bh.virtualizable_info = crate::eval::get_virtualizable_info();
     bh.virtualizable_stack_base = frame_stack_base;
+    // Portal red-arg registers must be filled AFTER virtualizable_ptr.
+    // interp_jit.py:64 reds=['frame','ec']: ec = frame.execution_context.
+    let ec = frame.execution_context as i64;
+    bh.fill_portal_registers(ec);
 
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
@@ -781,7 +808,7 @@ fn blackhole_from_jit_frame(frame: &mut PyFrame) -> Option<PyObjectRef> {
     }
 
     // RPython: _run_forever(blackholeinterp, current_exc)
-    bh.run();
+    let _ = bh.run();
 
     // blackhole.py:1664-1677 _done_with_this_frame:
     // RPython dispatches by _return_type (i/r/f/v).
@@ -847,8 +874,15 @@ pub enum JitException {
 /// Each variant matches an RPython JitException subclass 1:1.
 /// The value is carried in its native type — no boxing into PyObjectRef.
 pub enum BlackholeResult {
-    /// jitexc.py:52 ContinueRunningNormally
-    ContinueRunningNormally,
+    /// jitexc.py:53 ContinueRunningNormally(gi, gr, gf, ri, rr, rf)
+    ContinueRunningNormally {
+        green_int: Vec<i64>,
+        green_ref: Vec<PyObjectRef>,
+        green_float: Vec<f64>,
+        red_int: Vec<i64>,
+        red_ref: Vec<PyObjectRef>,
+        red_float: Vec<f64>,
+    },
     /// jitexc.py:16 DoneWithThisFrameVoid
     DoneWithThisFrameVoid,
     /// jitexc.py:20 DoneWithThisFrameInt(result: Signed)
@@ -864,13 +898,26 @@ pub enum BlackholeResult {
 }
 
 impl From<JitException> for BlackholeResult {
-    /// 1:1 projection of JitException onto BlackholeResult.
-    /// No boxing — each typed value passes through in its native type.
+    /// jitexc.py parity: each JitException variant maps to BlackholeResult
+    /// with its payload preserved — ContinueRunningNormally carries the
+    /// 6 green/red lists through.
     fn from(exc: JitException) -> Self {
         match exc {
-            JitException::ContinueRunningNormally { .. } => {
-                BlackholeResult::ContinueRunningNormally
-            }
+            JitException::ContinueRunningNormally {
+                green_int,
+                green_ref,
+                green_float,
+                red_int,
+                red_ref,
+                red_float,
+            } => BlackholeResult::ContinueRunningNormally {
+                green_int,
+                green_ref,
+                green_float,
+                red_int,
+                red_ref,
+                red_float,
+            },
             JitException::DoneWithThisFrameVoid => BlackholeResult::DoneWithThisFrameVoid,
             JitException::DoneWithThisFrameInt(v) => BlackholeResult::DoneWithThisFrameInt(v),
             JitException::DoneWithThisFrameRef(r) => BlackholeResult::DoneWithThisFrameRef(r),
@@ -1216,6 +1263,9 @@ pub fn resume_in_blackhole(
         bh.virtualizable_ptr = frame_ptr as i64;
         bh.virtualizable_info = crate::eval::get_virtualizable_info();
         bh.virtualizable_stack_base = nlocals + pyre_interpreter::pyframe::ncells(code_ref);
+        // Portal red-arg registers must be filled AFTER virtualizable_ptr.
+        let ec = unsafe { (*frame_ptr).execution_context as i64 };
+        bh.fill_portal_registers(ec);
 
         // RPython: nextbh.nextblackholeinterp = curbh
         bh.nextblackholeinterp = prev_bh.map(Box::new);
@@ -1234,54 +1284,32 @@ pub fn resume_in_blackhole(
     // Run the innermost blackhole. On RETURN_VALUE (LeaveFrame),
     // pop to caller blackhole and continue.
     loop {
-        bh.run();
-
-        if bh.reached_merge_point {
-            // jitexc.py:53 ContinueRunningNormally:
-            // RPython raises ContinueRunningNormally(gi, gr, gf, ri, rr, rf)
-            // with portal arguments in 6 type-grouped arrays to re-enter
-            // the portal from warmspot. pyre writes the blackhole's final
-            // register state to the frame directly and returns the enum.
-            let py_pc = bh.jitcode.jit_pc_to_py_pc(bh.last_opcode_position) as usize;
+        if let Some(args) = bh.run() {
+            // blackhole.py:1068: raise ContinueRunningNormally(*args)
+            // Propagated from run() as RPython's JitException equivalent.
             let frame_ptr = bh.virtualizable_ptr as *mut PyFrame;
-            if !frame_ptr.is_null() {
-                let frame = unsafe { &mut *frame_ptr };
-                let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
-                let nlocals = code.varnames.len();
-                // blackhole.py:1068 parity: only live values are carried
-                // by ContinueRunningNormally. Use liveness at the merge
-                // point PC to determine which locals to write back.
-                let live = pyre_jit_trace::state::liveness_for(code);
-                for i in 0..nlocals {
-                    if i < bh.registers_r.len()
-                        && i < frame.locals_cells_stack_w.len()
-                        && live.is_local_live(py_pc, i)
-                    {
-                        frame.locals_cells_stack_w[i] =
-                            bh.registers_r[i] as pyre_object::PyObjectRef;
-                    }
-                }
-                let ncells = pyre_interpreter::pyframe::ncells(code);
-                let stack_base = nlocals + ncells;
-                // resume.py:1593 parity: value-stack temporaries live at
-                // registers_r[nlocals + d] (codewriter parks them via
-                // move_r). depth_at_py_pc[merge_py_pc] gives the count.
-                let depth = bh.jitcode.depth_at_py_pc.get(py_pc).copied().unwrap_or(0) as usize;
-                frame.valuestackdepth = stack_base + depth;
-                for d in 0..depth {
-                    let reg_idx = nlocals + d;
-                    let frame_idx = stack_base + d;
-                    if reg_idx < bh.registers_r.len()
-                        && frame_idx < frame.locals_cells_stack_w.len()
-                    {
-                        frame.locals_cells_stack_w[frame_idx] =
-                            bh.registers_r[reg_idx] as pyre_object::PyObjectRef;
-                    }
-                }
-                frame.next_instr = py_pc;
-            }
             builder.release_interp(bh);
-            return BlackholeResult::ContinueRunningNormally;
+            let mut red_ref: Vec<PyObjectRef> =
+                args.red_ref.iter().map(|&v| v as PyObjectRef).collect();
+            if red_ref.is_empty() {
+                red_ref.push(frame_ptr as PyObjectRef);
+            }
+            return BlackholeResult::ContinueRunningNormally {
+                green_int: args.green_int,
+                green_ref: args.green_ref.iter().map(|&v| v as PyObjectRef).collect(),
+                green_float: args
+                    .green_float
+                    .iter()
+                    .map(|&v| f64::from_bits(v as u64))
+                    .collect(),
+                red_int: args.red_int,
+                red_ref,
+                red_float: args
+                    .red_float
+                    .iter()
+                    .map(|&v| f64::from_bits(v as u64))
+                    .collect(),
+            };
         }
 
         // BC_ABORT: unsupported bytecode hit during execution.
@@ -1736,7 +1764,7 @@ fn jit_blackhole_resume_from_guard(
             rd_virtuals_ref,
             deadframe_types.as_deref(),
         );
-        return handle_blackhole_result(result, fail_values, actual_green_key);
+        return handle_blackhole_result(result, actual_green_key);
     }
 
     // RPython: every guard has rd_numb from capture_resumedata +
@@ -1886,11 +1914,31 @@ pub fn blackhole_resume_via_rd_numb(
 
     // blackhole.py:1752 _run_forever parity.
     loop {
-        bh.run();
-
-        if bh.reached_merge_point {
+        if let Some(args) = bh.run() {
+            // blackhole.py:1068: raise ContinueRunningNormally(*args)
+            let frame_ptr = bh.virtualizable_ptr as *mut PyFrame;
             builder.release_interp(bh);
-            return BlackholeResult::ContinueRunningNormally;
+            let mut red_ref: Vec<PyObjectRef> =
+                args.red_ref.iter().map(|&v| v as PyObjectRef).collect();
+            if red_ref.is_empty() {
+                red_ref.push(frame_ptr as PyObjectRef);
+            }
+            return BlackholeResult::ContinueRunningNormally {
+                green_int: args.green_int,
+                green_ref: args.green_ref.iter().map(|&v| v as PyObjectRef).collect(),
+                green_float: args
+                    .green_float
+                    .iter()
+                    .map(|&v| f64::from_bits(v as u64))
+                    .collect(),
+                red_int: args.red_int,
+                red_ref,
+                red_float: args
+                    .red_float
+                    .iter()
+                    .map(|&v| f64::from_bits(v as u64))
+                    .collect(),
+            };
         }
         if bh.aborted {
             builder.release_interp(bh);
@@ -1964,16 +2012,10 @@ pub fn blackhole_resume_via_rd_numb(
 
 /// warmspot.py:961-1007 handle_jitexception parity.
 ///
-/// warmspot.py:961-1007 handle_jitexception parity.
-///
 /// RPython captures result_kind in closure (warmspot.py:913). For pyre,
 /// portal result_type == REF (warmspot.py:449), so ALL CALL_ASSEMBLER
 /// ops use _R. The result is always a Ref (PyObjectRef).
-fn handle_blackhole_result(
-    bh_result: BlackholeResult,
-    fail_values: &[i64],
-    _green_key: u64,
-) -> Option<i64> {
+fn handle_blackhole_result(bh_result: BlackholeResult, _green_key: u64) -> Option<i64> {
     match bh_result {
         // warmspot.py:985-987: DoneWithThisFrameVoid → return None
         BlackholeResult::DoneWithThisFrameVoid => {
@@ -2020,34 +2062,33 @@ fn handle_blackhole_result(
             }
             Some(0) // garbage return — GUARD_NO_EXCEPTION will fire
         }
-        // warmspot.py:970-983: ContinueRunningNormally → call portal_ptr(*args).
-        // warmspot.py:982: unspecialize_value(result) — identity for GCREF portal.
-        // eval_frame_plain returns PyObjectRef (Ref), no normalization needed.
-        BlackholeResult::ContinueRunningNormally => {
-            let callee_frame_ptr = fail_values[0] as *mut PyFrame;
-            if callee_frame_ptr.is_null() {
-                return None;
-            }
-            let callee_frame = unsafe { &mut *callee_frame_ptr };
+        // warmspot.py:970-983: ContinueRunningNormally → portal_ptr(*args).
+        BlackholeResult::ContinueRunningNormally {
+            green_int,
+            green_ref,
+            green_float,
+            red_int,
+            red_ref,
+            red_float,
+        } => {
+            // warmspot.py:972-975: portalfunc_ARGS extraction.
+            // Build merged arg lists: all_i = gi + ri, all_r = gr + rr, all_f = gf + rf.
+            // warmstate.py:41 unspecialize_value: Ref→GCREF(i64), Float→FLOATSTORAGE(i64).
+            let mut all_i = green_int;
+            all_i.extend(&red_int);
+            let mut all_r: Vec<i64> = green_ref.iter().map(|r| *r as i64).collect();
+            all_r.extend(red_ref.iter().map(|r| *r as i64));
+            let mut all_f: Vec<i64> = green_float.iter().map(|f| f.to_bits() as i64).collect();
+            all_f.extend(red_float.iter().map(|f| f.to_bits() as i64));
             if majit_metainterp::majit_log_enabled() {
                 eprintln!(
-                    "[blackhole-resume] ContinueRunningNormally, interpreter from pc={}",
-                    callee_frame.next_instr,
+                    "[blackhole-resume] ContinueRunningNormally → portal_ptr(all_i={:?}, all_r=[{:#x?}])",
+                    all_i, all_r,
                 );
             }
-            let _plain_guard = pyre_interpreter::call::force_plain_eval();
-            match pyre_interpreter::eval::eval_frame_plain(callee_frame) {
-                // Portal returns PyObjectRef (Ref) — return as-is.
-                Ok(result) => Some(result as i64),
-                Err(err) => {
-                    let exc_obj = err.exc_object;
-                    if exc_obj != pyre_object::PY_NULL {
-                        #[cfg(feature = "cranelift")]
-                        majit_backend_cranelift::jit_exc_raise(exc_obj as i64);
-                    }
-                    Some(0) // garbage return — GUARD_NO_EXCEPTION will fire
-                }
-            }
+            // warmspot.py:976-978: result = portal_ptr(*args)
+            let result = bh_portal_runner(&all_i, &all_r, &all_f);
+            if result == 0 { None } else { Some(result) }
         }
         BlackholeResult::Failed => {
             if majit_metainterp::majit_log_enabled() {
