@@ -367,9 +367,9 @@ pub fn load_const_concrete(constant: &pyre_interpreter::bytecode::ConstantData) 
 use pyre_interpreter::{
     ArithmeticOpcodeHandler, BranchOpcodeHandler, ConstantOpcodeHandler, ControlFlowOpcodeHandler,
     IterOpcodeHandler, LocalOpcodeHandler, NamespaceOpcodeHandler, OpcodeStepExecutor, PyBigInt,
-    PyError, PyNamespace, PyObjectArray, SharedOpcodeHandler, StackOpcodeHandler,
-    TruthOpcodeHandler, builtin_code_name, decode_instruction_at, execute_opcode_step,
-    function_get_code, function_get_globals, is_builtin_code, is_function, range_iter_continues,
+    PyError, PyNamespace, SharedOpcodeHandler, StackOpcodeHandler, TruthOpcodeHandler,
+    builtin_code_name, decode_instruction_at, execute_opcode_step, function_get_code,
+    function_get_globals, is_builtin_code, is_function, range_iter_continues,
 };
 
 use crate::descr::{
@@ -1166,7 +1166,8 @@ pub(crate) fn concrete_return_value(frame: usize) -> Option<PyObjectRef> {
 pub fn concrete_stack_value(frame: usize, abs_idx: usize) -> Option<PyObjectRef> {
     let frame_ptr = (frame != 0).then_some(frame as *const u8)?;
     let arr_ptr = unsafe {
-        *(frame_ptr.add(PYFRAME_LOCALS_CELLS_STACK_OFFSET) as *const *const PyObjectArray)
+        *(frame_ptr.add(PYFRAME_LOCALS_CELLS_STACK_OFFSET)
+            as *const *const pyre_object::FixedObjectArray)
     };
     let arr = unsafe { &*arr_ptr };
     arr.as_slice().get(abs_idx).copied()
@@ -1843,16 +1844,17 @@ impl PyreJitState {
         (self.frame != 0).then_some(self.frame as *mut u8)
     }
 
-    fn frame_array(&self, offset: usize) -> Option<&PyObjectArray> {
+    fn frame_array(&self, offset: usize) -> Option<&pyre_object::FixedObjectArray> {
         let frame_ptr = self.frame_ptr()?;
-        // locals_cells_stack_w is now *mut PyObjectArray (pointer field)
-        let arr_ptr = unsafe { *(frame_ptr.add(offset) as *const *const PyObjectArray) };
+        let arr_ptr =
+            unsafe { *(frame_ptr.add(offset) as *const *const pyre_object::FixedObjectArray) };
         Some(unsafe { &*arr_ptr })
     }
 
-    fn frame_array_mut(&mut self, offset: usize) -> Option<&mut PyObjectArray> {
+    fn frame_array_mut(&mut self, offset: usize) -> Option<&mut pyre_object::FixedObjectArray> {
         let frame_ptr = self.frame_ptr()?;
-        let arr_ptr = unsafe { *(frame_ptr.add(offset) as *const *mut PyObjectArray) };
+        let arr_ptr =
+            unsafe { *(frame_ptr.add(offset) as *const *mut pyre_object::FixedObjectArray) };
         Some(unsafe { &mut *arr_ptr })
     }
 
@@ -1871,11 +1873,11 @@ impl PyreJitState {
         true
     }
 
-    fn locals_cells_stack_array(&self) -> Option<&PyObjectArray> {
+    fn locals_cells_stack_array(&self) -> Option<&pyre_object::FixedObjectArray> {
         self.frame_array(PYFRAME_LOCALS_CELLS_STACK_OFFSET)
     }
 
-    fn locals_cells_stack_array_mut(&mut self) -> Option<&mut PyObjectArray> {
+    fn locals_cells_stack_array_mut(&mut self) -> Option<&mut pyre_object::FixedObjectArray> {
         self.frame_array_mut(PYFRAME_LOCALS_CELLS_STACK_OFFSET)
     }
 
@@ -1970,7 +1972,7 @@ impl PyreJitState {
     /// Total capacity of the unified array.
     pub fn array_capacity(&self) -> usize {
         self.locals_cells_stack_array()
-            .map(PyObjectArray::len)
+            .map(pyre_object::FixedObjectArray::len)
             .unwrap_or(0)
     }
 

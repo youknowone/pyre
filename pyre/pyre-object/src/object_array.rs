@@ -226,6 +226,101 @@ impl IndexMut<usize> for PyObjectArray {
     }
 }
 
+// ─── FixedObjectArray: pyframe.py:112 make_sure_not_resized parity ────────
+//
+// RPython `locals_cells_stack_w = [None] * size; make_sure_not_resized(...)`
+// becomes a fixed-length GcArray. This type mirrors that: len is immutable
+// after creation, no push/grow/spare_capacity.
+
+/// Offset of `ptr` within `FixedObjectArray`.
+pub const FIXED_ARRAY_PTR_OFFSET: usize = std::mem::offset_of!(FixedObjectArray, ptr);
+
+/// Offset of `len` within `FixedObjectArray`.
+pub const FIXED_ARRAY_LEN_OFFSET: usize = std::mem::offset_of!(FixedObjectArray, len);
+
+/// pyframe.py:110-112: fixed-length GcArray for `locals_cells_stack_w`.
+///
+/// Once created, the length never changes. No push, no grow.
+/// Items are mutable (stack operations write via index) but the
+/// array cannot be resized.
+#[repr(C)]
+pub struct FixedObjectArray {
+    /// Raw pointer to heap-allocated storage. JIT reads at offset 0.
+    pub ptr: *mut PyObjectRef,
+    /// Fixed length (== allocation capacity).
+    len: usize,
+}
+
+impl FixedObjectArray {
+    /// pyframe.py:110: `[None] * size`
+    pub fn filled(len: usize, value: PyObjectRef) -> Self {
+        let len = len.max(1);
+        let mut storage = vec![value; len];
+        let mut boxed = storage.into_boxed_slice();
+        let ptr = boxed.as_mut_ptr();
+        std::mem::forget(boxed);
+        Self { ptr, len }
+    }
+
+    pub fn from_vec(values: Vec<PyObjectRef>) -> Self {
+        assert!(
+            !values.is_empty(),
+            "FixedObjectArray: frame array must not be empty"
+        );
+        let mut boxed = values.into_boxed_slice();
+        let len = boxed.len();
+        let ptr = boxed.as_mut_ptr();
+        std::mem::forget(boxed);
+        Self { ptr, len }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn as_slice(&self) -> &[PyObjectRef] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [PyObjectRef] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+
+    pub fn to_vec(&self) -> Vec<PyObjectRef> {
+        self.as_slice().to_vec()
+    }
+
+    pub fn swap(&mut self, a: usize, b: usize) {
+        self.as_mut_slice().swap(a, b);
+    }
+}
+
+impl Drop for FixedObjectArray {
+    fn drop(&mut self) {
+        if self.len > 0 && !self.ptr.is_null() {
+            unsafe {
+                drop(Vec::from_raw_parts(self.ptr, self.len, self.len));
+            }
+        }
+    }
+}
+
+impl Index<usize> for FixedObjectArray {
+    type Output = PyObjectRef;
+    #[inline]
+    fn index(&self, index: usize) -> &Self::Output {
+        unsafe { &*self.ptr.add(index) }
+    }
+}
+
+impl IndexMut<usize> for FixedObjectArray {
+    #[inline]
+    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
+        unsafe { &mut *self.ptr.add(index) }
+    }
+}
+
 // ─── GcArray: RPython GC array allocation + setarrayitem parity ──────────
 //
 // resume.py:1444-1537 ResumeDataDirectReader:

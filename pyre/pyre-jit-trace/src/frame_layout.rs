@@ -2,7 +2,8 @@ use majit_ir::Type;
 use majit_ir::descr::{EffectInfo, make_call_descr};
 use majit_metainterp::virtualizable::VirtualizableInfo;
 use pyre_interpreter::CodeObject;
-use pyre_interpreter::{PyExecutionContext, PyNamespace, PyObjectArray};
+use pyre_interpreter::{PyExecutionContext, PyNamespace};
+use pyre_object::FixedObjectArray;
 
 /// Shared PyFrame layout contract used by the interpreter and tracer.
 ///
@@ -16,7 +17,7 @@ struct PyFrameLayout {
     #[allow(dead_code)]
     code: *const CodeObject,
     #[allow(dead_code)]
-    locals_cells_stack_w: *mut PyObjectArray,
+    locals_cells_stack_w: *mut FixedObjectArray,
     #[allow(dead_code)]
     valuestackdepth: usize,
     #[allow(dead_code)]
