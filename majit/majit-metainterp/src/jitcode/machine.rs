@@ -2766,7 +2766,7 @@ fn build_concrete_values(
 ) -> Vec<majit_ir::Value> {
     let mut values = vec![majit_ir::Value::Int(func_ptr as usize as i64)];
     for (i, &v) in concrete_args.iter().enumerate() {
-        let tp = arg_types.get(i).copied().unwrap_or(majit_ir::Type::Int);
+        let tp = arg_types[i];
         values.push(typed_value_from_raw(v, tp));
     }
     values
