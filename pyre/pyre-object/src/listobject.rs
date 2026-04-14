@@ -34,8 +34,9 @@ pub struct W_ListObject {
     pub float_items: FloatArray,
 }
 
-/// Pyre equivalent of RPython `is_plain_int1(w_obj)` (listobject.py:2397):
-///   `type(w_obj) is W_IntObject`
+/// Pyre equivalent of RPython `is_plain_int1(w_obj)` (listobject.py:2389):
+///   `type(w_obj) is W_IntObject or (type(w_obj) is W_LongObject and w_obj._fits_int())`
+/// The W_LongObject._fits_int() branch is not applicable in pyre (no W_LongObject).
 /// Unique ints (created by w_int_new_unique for int subclass instances) are excluded
 /// because they may carry per-object attributes that require pointer identity.
 #[inline]
@@ -336,61 +337,40 @@ pub unsafe fn w_list_setslice(
     new_items: Vec<PyObjectRef>,
 ) {
     let list = &mut *(obj as *mut W_ListObject);
-    // Determine if all new_items match current strategy
+    // AbstractUnwrappedStrategy.setslice (listobject.py:1749-1808) step==1:
+    //   if not self.list_is_correct_type(w_other): switch_to_object_strategy; re-dispatch
+    //   items = unerase(w_list.lstorage)
+    //   delta = slicelength - len2
+    //   if delta < 0: grow + shift right
+    //   elif delta > 0: del items[start:start+delta]
+    //   for i in range(len2): items[start+i] = other_items[i]
     match list.strategy {
         ListStrategy::Integer => {
-            // AbstractUnwrappedStrategy.setslice (listobject.py:1750):
-            //   list_is_correct_type(w_other): typed splice
             let all_int = new_items.iter().all(|&v| is_plain_int1(v));
             if all_int {
-                // typed splice: remove [start..end] then insert new int values
-                let end_clamped = end.min(list.int_items.len());
-                let start_clamped = start.min(list.int_items.len());
-                let remove_count = end_clamped.saturating_sub(start_clamped);
-                // drain remove_count elements starting at start_clamped
-                for _ in 0..remove_count {
-                    list.int_items.remove(start_clamped);
-                }
-                // insert new values starting at start_clamped
-                for (i, &v) in new_items.iter().enumerate() {
-                    list.int_items.insert(start_clamped + i, w_int_get_value(v));
-                }
+                let new_ints: Vec<i64> = new_items.iter().map(|&v| w_int_get_value(v)).collect();
+                let remove_count = end.saturating_sub(start);
+                list.int_items.splice(start, remove_count, &new_ints);
                 return;
             }
-            // fall through to object strategy
             switch_to_object_strategy(list);
         }
         ListStrategy::Float => {
-            let all_float = new_items
-                .iter()
-                .all(|&v| !v.is_null() && is_float(v));
+            let all_float = new_items.iter().all(|&v| !v.is_null() && is_float(v));
             if all_float {
-                let end_clamped = end.min(list.float_items.len());
-                let start_clamped = start.min(list.float_items.len());
-                let remove_count = end_clamped.saturating_sub(start_clamped);
-                for _ in 0..remove_count {
-                    list.float_items.remove(start_clamped);
-                }
-                for (i, &v) in new_items.iter().enumerate() {
-                    list.float_items.insert(start_clamped + i, w_float_get_value(v));
-                }
+                let new_floats: Vec<f64> =
+                    new_items.iter().map(|&v| w_float_get_value(v)).collect();
+                let remove_count = end.saturating_sub(start);
+                list.float_items.splice(start, remove_count, &new_floats);
                 return;
             }
             switch_to_object_strategy(list);
         }
         ListStrategy::Object => {}
     }
-    // Object strategy splice
-    let len = list.items.len();
-    let s = start.min(len);
-    let e = end.min(len);
-    let remove_count = e.saturating_sub(s);
-    for _ in 0..remove_count {
-        list.items.remove(s);
-    }
-    for (i, v) in new_items.into_iter().enumerate() {
-        list.items.insert(s + i, v);
-    }
+    // Object strategy: splice in-place, O(n)
+    let remove_count = end.saturating_sub(start);
+    list.items.splice(start, remove_count, &new_items);
 }
 
 /// Insert item at index.
@@ -475,8 +455,10 @@ pub unsafe fn w_list_pop_end(obj: PyObjectRef) -> Option<PyObjectRef> {
 }
 
 /// Clear all items.
-/// Mirrors RPython `W_ListObject.clear` (listobject.py:359) which switches to
-/// EmptyListStrategy. We keep Object strategy with empty storage.
+/// RPython `W_ListObject.clear` (listobject.py:391) switches to EmptyListStrategy.
+/// Pyre has no EmptyListStrategy, so we keep the **current** strategy and empty its
+/// storage — semantically equivalent for all subsequent operations (append re-fills
+/// the same typed storage; mixed items will switch to ObjectStrategy as needed).
 pub unsafe fn w_list_clear(obj: PyObjectRef) {
     let list = &mut *(obj as *mut W_ListObject);
     match list.strategy {
@@ -816,10 +798,19 @@ mod tests {
             assert!(w_list_uses_int_storage(list));
             let popped = w_list_pop(list, 1).unwrap();
             assert_eq!(crate::intobject::w_int_get_value(popped), 2);
-            assert!(w_list_uses_int_storage(list), "pop must not switch strategy");
+            assert!(
+                w_list_uses_int_storage(list),
+                "pop must not switch strategy"
+            );
             assert_eq!(w_list_len(list), 2);
-            assert_eq!(crate::intobject::w_int_get_value(w_list_getitem(list, 0).unwrap()), 1);
-            assert_eq!(crate::intobject::w_int_get_value(w_list_getitem(list, 1).unwrap()), 3);
+            assert_eq!(
+                crate::intobject::w_int_get_value(w_list_getitem(list, 0).unwrap()),
+                1
+            );
+            assert_eq!(
+                crate::intobject::w_int_get_value(w_list_getitem(list, 1).unwrap()),
+                3
+            );
         }
     }
 
@@ -831,7 +822,10 @@ mod tests {
             assert!(w_list_uses_int_storage(list));
             let popped = w_list_pop_end(list).unwrap();
             assert_eq!(crate::intobject::w_int_get_value(popped), 20);
-            assert!(w_list_uses_int_storage(list), "pop_end must not switch strategy");
+            assert!(
+                w_list_uses_int_storage(list),
+                "pop_end must not switch strategy"
+            );
             assert_eq!(w_list_len(list), 1);
         }
     }
@@ -843,9 +837,15 @@ mod tests {
         unsafe {
             assert!(w_list_uses_int_storage(list));
             w_list_insert(list, 1, w_int_new(2));
-            assert!(w_list_uses_int_storage(list), "insert int must not switch strategy");
+            assert!(
+                w_list_uses_int_storage(list),
+                "insert int must not switch strategy"
+            );
             assert_eq!(w_list_len(list), 3);
-            assert_eq!(crate::intobject::w_int_get_value(w_list_getitem(list, 1).unwrap()), 2);
+            assert_eq!(
+                crate::intobject::w_int_get_value(w_list_getitem(list, 1).unwrap()),
+                2
+            );
         }
     }
 
@@ -869,9 +869,18 @@ mod tests {
         unsafe {
             assert!(w_list_uses_int_storage(list));
             w_list_reverse(list);
-            assert!(w_list_uses_int_storage(list), "reverse must not switch strategy");
-            assert_eq!(crate::intobject::w_int_get_value(w_list_getitem(list, 0).unwrap()), 3);
-            assert_eq!(crate::intobject::w_int_get_value(w_list_getitem(list, 2).unwrap()), 1);
+            assert!(
+                w_list_uses_int_storage(list),
+                "reverse must not switch strategy"
+            );
+            assert_eq!(
+                crate::intobject::w_int_get_value(w_list_getitem(list, 0).unwrap()),
+                3
+            );
+            assert_eq!(
+                crate::intobject::w_int_get_value(w_list_getitem(list, 2).unwrap()),
+                1
+            );
         }
     }
 
@@ -882,7 +891,10 @@ mod tests {
         unsafe {
             assert!(w_list_uses_int_storage(list));
             w_list_clear(list);
-            assert!(w_list_uses_int_storage(list), "clear must not switch to Object");
+            assert!(
+                w_list_uses_int_storage(list),
+                "clear must not switch to Object"
+            );
             assert_eq!(w_list_len(list), 0);
         }
     }
@@ -894,10 +906,19 @@ mod tests {
         unsafe {
             assert!(w_list_uses_int_storage(list));
             w_list_delslice(list, 1, 3);
-            assert!(w_list_uses_int_storage(list), "delslice must not switch strategy");
+            assert!(
+                w_list_uses_int_storage(list),
+                "delslice must not switch strategy"
+            );
             assert_eq!(w_list_len(list), 2);
-            assert_eq!(crate::intobject::w_int_get_value(w_list_getitem(list, 0).unwrap()), 1);
-            assert_eq!(crate::intobject::w_int_get_value(w_list_getitem(list, 1).unwrap()), 4);
+            assert_eq!(
+                crate::intobject::w_int_get_value(w_list_getitem(list, 0).unwrap()),
+                1
+            );
+            assert_eq!(
+                crate::intobject::w_int_get_value(w_list_getitem(list, 1).unwrap()),
+                4
+            );
         }
     }
 
@@ -913,7 +934,10 @@ mod tests {
             assert!(w_list_uses_float_storage(list));
             let popped = w_list_pop(list, 0).unwrap();
             assert_eq!(crate::floatobject::w_float_get_value(popped), 1.0);
-            assert!(w_list_uses_float_storage(list), "pop must not switch strategy");
+            assert!(
+                w_list_uses_float_storage(list),
+                "pop must not switch strategy"
+            );
             assert_eq!(w_list_len(list), 2);
         }
     }
@@ -928,8 +952,14 @@ mod tests {
         unsafe {
             assert!(w_list_uses_float_storage(list));
             w_list_reverse(list);
-            assert!(w_list_uses_float_storage(list), "reverse must not switch strategy");
-            assert_eq!(crate::floatobject::w_float_get_value(w_list_getitem(list, 0).unwrap()), 2.0);
+            assert!(
+                w_list_uses_float_storage(list),
+                "reverse must not switch strategy"
+            );
+            assert_eq!(
+                crate::floatobject::w_float_get_value(w_list_getitem(list, 0).unwrap()),
+                2.0
+            );
         }
     }
 
@@ -940,10 +970,19 @@ mod tests {
         unsafe {
             assert!(w_list_uses_int_storage(list));
             assert!(w_list_remove(list, w_int_new(2)));
-            assert!(w_list_uses_int_storage(list), "remove must not switch strategy");
+            assert!(
+                w_list_uses_int_storage(list),
+                "remove must not switch strategy"
+            );
             assert_eq!(w_list_len(list), 2);
-            assert_eq!(crate::intobject::w_int_get_value(w_list_getitem(list, 0).unwrap()), 1);
-            assert_eq!(crate::intobject::w_int_get_value(w_list_getitem(list, 1).unwrap()), 3);
+            assert_eq!(
+                crate::intobject::w_int_get_value(w_list_getitem(list, 0).unwrap()),
+                1
+            );
+            assert_eq!(
+                crate::intobject::w_int_get_value(w_list_getitem(list, 1).unwrap()),
+                3
+            );
         }
     }
 }

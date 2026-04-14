@@ -154,6 +154,48 @@ impl IntArray {
         self.as_mut_slice().reverse();
     }
 
+    /// Replace `[start .. start+remove_count]` with `new_values` in one pass.
+    /// Mirrors RPython `AbstractUnwrappedStrategy.setslice` (listobject.py:1773-1808)
+    /// step==1 path: `del items[start:start+delta]` + overwrite, O(n).
+    pub fn splice(&mut self, start: usize, remove_count: usize, new_values: &[i64]) {
+        let old_len = self.len;
+        let s = start.min(old_len);
+        let slicelength = remove_count.min(old_len - s);
+        let len2 = new_values.len();
+        let new_len = old_len - slicelength + len2;
+        if len2 > slicelength {
+            // growing: ensure capacity, then shift right
+            if new_len > self.capacity() {
+                if self.heap_cap == 0 {
+                    self.grow_to_heap(new_len);
+                } else {
+                    self.grow_heap(new_len);
+                }
+            }
+            unsafe {
+                std::ptr::copy(
+                    self.ptr.add(s + slicelength),
+                    self.ptr.add(s + len2),
+                    old_len - s - slicelength,
+                );
+            }
+            self.len = new_len;
+        } else if slicelength > len2 {
+            // shrinking: shift left
+            unsafe {
+                std::ptr::copy(
+                    self.ptr.add(s + slicelength),
+                    self.ptr.add(s + len2),
+                    old_len - s - slicelength,
+                );
+            }
+            self.len = new_len;
+        }
+        if len2 > 0 {
+            self.as_mut_slice()[s..s + len2].copy_from_slice(new_values);
+        }
+    }
+
     #[inline]
     pub fn fix_ptr(&mut self) {
         if self.heap_cap == 0 {
