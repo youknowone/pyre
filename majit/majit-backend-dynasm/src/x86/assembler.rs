@@ -1823,6 +1823,8 @@ impl Assembler386 {
                 {
                     dynasm!(self.mc ; .arch x64 ; jmp =>label);
                 } else if let Some(target) = jump_descr.map(|descr| descr.ll_loop_code()) {
+                    // External JUMP: direct JMP to target loop code.
+                    // assembler.py:2461 mc.JMP(imm(target))
                     let addr = target as i64;
                     dynasm!(self.mc ; .arch x64
                         ; mov rax, QWORD addr
@@ -5114,5 +5116,10 @@ impl Assembler386 {
     /// if constant OpRefs are used (OpRef.0 >= 10000).
     pub fn set_constants(&mut self, constants: HashMap<u32, i64>) {
         self.constants = constants;
+    }
+
+    /// Set constant type annotations for the next compile call.
+    pub fn set_constant_types(&mut self, _constant_types: HashMap<u32, majit_ir::Type>) {
+        // dynasm backend doesn't need type annotations for constants
     }
 }

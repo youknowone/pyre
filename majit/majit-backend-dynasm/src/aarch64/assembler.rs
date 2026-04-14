@@ -1734,8 +1734,6 @@ impl AssemblerARM64 {
                 // RPython: jump args count == target label args count.
                 // Bridge Jump may carry extra args beyond what the target
                 // Label expects. Only remap args that have a target location.
-                // If target_arglocs is empty (no TargetToken stored), fall
-                // back to frame-slot identity mapping for all args.
                 let remap_count = if target_arglocs.is_empty() {
                     arglocs.len()
                 } else {
@@ -1765,17 +1763,6 @@ impl AssemblerARM64 {
                 }
                 let tmpreg1 = Loc::Reg(crate::regloc::RegLoc::new(16, false));
                 let tmpreg2 = Loc::Reg(crate::regloc::RegLoc::new(15, true));
-                if std::env::var_os("MAJIT_LOG").is_some() {
-                    eprintln!(
-                        "[dynasm] Jump remap: {} int src→dst, {} float src→dst",
-                        src_locations1.len(),
-                        src_locations2.len()
-                    );
-                    for (i, (s, d)) in src_locations1.iter().zip(dst_locations1.iter()).enumerate()
-                    {
-                        eprintln!("[dynasm]   int[{}]: {:?} → {:?}", i, s, d);
-                    }
-                }
                 self.remap_frame_layout_mixed(
                     &src_locations1,
                     &dst_locations1,
@@ -1784,13 +1771,17 @@ impl AssemblerARM64 {
                     &dst_locations2,
                     tmpreg2,
                 );
+                // assembler.py:2456-2462 closing_jump
                 if let Some(label) = loop_target_id(op)
                     .and_then(|k| self.target_tokens_currently_compiling.get(&k).copied())
                 {
                     dynasm!(self.mc ; .arch aarch64 ; b =>label);
                 } else if let Some(target) = jump_descr.map(|descr| descr.ll_loop_code()) {
-                    self.emit_mov_imm64(0, target as i64);
-                    dynasm!(self.mc ; .arch aarch64 ; br x0);
+                    // External JUMP: direct branch to target loop code.
+                    // assembler.py:2461 mc.JMP(imm(target))
+                    // Use x16 (IP0 scratch) to avoid clobbering remap'd regs.
+                    self.emit_mov_imm64(16, target as i64);
+                    dynasm!(self.mc ; .arch aarch64 ; br x16);
                 }
             }
             OpCode::Finish => {
@@ -4943,6 +4934,11 @@ impl AssemblerARM64 {
     /// if constant OpRefs are used (OpRef.0 >= 10000).
     pub fn set_constants(&mut self, constants: HashMap<u32, i64>) {
         self.constants = constants;
+    }
+
+    /// Set constant type annotations for the next compile call.
+    pub fn set_constant_types(&mut self, _constant_types: HashMap<u32, majit_ir::Type>) {
+        // dynasm backend doesn't need type annotations for constants
     }
 }
 

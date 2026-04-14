@@ -1301,12 +1301,6 @@ pub struct ExportedState {
     /// Types of end_args as determined by Phase 1 optimization.
     /// Used by Phase 2 import_state to propagate unboxed types.
     pub end_arg_types: Vec<Type>,
-    /// Phase 1 heap cache: `(obj, descr, cached_value)` triples for
-    /// ALL fields cached during preamble optimization. Phase 2
-    /// `import_state` uses this to pre-populate its heap cache for
-    /// inputargs that the preamble already read fields from. Mirrors
-    /// `serialize_optheap` (heap.py:825-846) which returns
-    /// `[(box1, descr, box2)]`.
     /// Virtual state at the loop boundary.
     pub virtual_state: crate::optimizeopt::virtualstate::VirtualState,
     /// unroll.py: exported_infos — optimizer knowledge from preamble.
@@ -2877,7 +2871,7 @@ impl OptUnroll {
     /// line-by-line port of unroll.py:59-92.
     ///
     /// `ExportedValueInfo` is majit's serialized container around the
-    /// PtrInfo plus a few side fields (constant, int_lower_bound) that
+    /// PtrInfo plus a few side fields (constant, int_bound) that
     /// RPython carries on the box itself. This wrapper is the only
     /// place that needs to know the serialization details.
     fn setinfo_from_preamble(
@@ -4258,7 +4252,9 @@ fn assemble_peeled_trace_with_jump_args(
             }
             let mut jump_args = mapped_base_args;
             if !jump_to_self {
-                jump_args.truncate(start_label_args.len());
+                // Non-self jump: truncate to target label arity, not source label.
+                // RPython: make_inputargs_and_virtuals produces exactly target arity.
+                jump_args.truncate(target_label_args.len());
             }
             if jump_to_self {
                 // RPython compile.py:334: assert jump.numargs() == label.numargs().

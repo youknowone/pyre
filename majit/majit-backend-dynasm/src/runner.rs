@@ -102,6 +102,14 @@ impl DynasmBackend {
         self.constants = constants;
     }
 
+    /// Set constant type annotations for the next compile call.
+    pub fn set_constant_types(
+        &mut self,
+        _constant_types: std::collections::HashMap<u32, majit_ir::Type>,
+    ) {
+        // dynasm backend doesn't need type annotations for constants
+    }
+
     /// Force the next compile to use a specific trace id.
     pub fn set_next_trace_id(&mut self, trace_id: u64) {
         self.next_trace_id = trace_id;
@@ -520,9 +528,6 @@ impl Backend for DynasmBackend {
         }
 
         // llmodel.py:412-420 get_latest_descr: read jf_descr from frame.
-        // RPython resolves jf_descr via AbstractDescr.show() which
-        // works for any descr from any loop or bridge. We search root
-        // loop fail_descrs + all bridge fail_descrs in asmmemmgr_blocks.
         let jf_descr_raw = unsafe { JitFrame::get_latest_descr(result_jf) as i64 };
         let descr = Self::find_descr_by_ptr(token, jf_descr_raw as usize);
 
@@ -597,9 +602,6 @@ impl Backend for DynasmBackend {
         let jf_descr_raw = unsafe { JitFrame::get_latest_descr(result_jf) as i64 };
         let descr = Self::find_descr_by_ptr(token, jf_descr_raw as usize);
 
-        // RPython parity: typed_outputs correspond to fail_arg_types.
-        // raw outputs contain ALL jitframe slots; typed_outputs only
-        // include the fail_arg entries (matching Cranelift behavior).
         let num_fail_args = descr.fail_arg_types.len();
         let mut outputs = Vec::with_capacity(num_slots);
         for i in 0..num_slots {
@@ -609,7 +611,7 @@ impl Backend for DynasmBackend {
         for i in 0..num_fail_args {
             let raw = match descr.fail_arg_locs.get(i) {
                 Some(Some(slot)) => outputs.get(*slot).copied().unwrap_or(0),
-                Some(None) => 0, // virtual
+                Some(None) => 0,
                 None => outputs.get(i).copied().unwrap_or(0),
             };
             typed_outputs.push(match descr.fail_arg_types[i] {
