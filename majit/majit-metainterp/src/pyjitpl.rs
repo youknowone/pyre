@@ -1893,6 +1893,9 @@ impl<M: Clone> MetaInterp<M> {
             None
         };
 
+        // compile.py:221: call_pure_results = metainterp.call_pure_results
+        let call_pure_results = ctx.take_call_pure_results();
+
         let mut recorder = ctx.recorder;
         // RPython heapcache.py:176: every trace gets at least one
         // GUARD_NOT_INVALIDATED. This allows external invalidation
@@ -2007,6 +2010,7 @@ impl<M: Clone> MetaInterp<M> {
         unroll_opt.max_retrace_guards = self.warm_state.max_retrace_guards();
         unroll_opt.constant_types = constant_types.clone();
         unroll_opt.callinfocollection = self.callinfocollection.clone();
+        unroll_opt.call_pure_results = call_pure_results.clone();
         unroll_opt.numbering_type_overrides = numbering_overrides.clone();
         // RPython Box type parity: each InputArg carries its type from
         // tracing. Propagate to optimizer so value_types covers inputargs.
@@ -2095,6 +2099,7 @@ impl<M: Clone> MetaInterp<M> {
                         simple_opt.snapshot_vable_boxes = snapshot_vable_map.clone();
                         simple_opt.snapshot_frame_pcs = snapshot_pc_map.clone();
                         simple_opt.snapshot_box_types = retry_sbt.clone();
+                        simple_opt.call_pure_results = call_pure_results.clone();
                         let retry_result =
                             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                 simple_opt.optimize_with_constants_and_inputs(

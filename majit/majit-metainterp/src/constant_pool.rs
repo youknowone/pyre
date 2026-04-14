@@ -128,6 +128,24 @@ impl ConstantPool {
         self.constant_types.get(&opref.0).copied()
     }
 
+    /// pyjitpl.py:3572 executor.constant_from_op(a) parity:
+    /// return the typed Value for a constant OpRef, or None if
+    /// the OpRef is not a known constant.
+    pub fn get_value(&self, opref: OpRef) -> Option<majit_ir::Value> {
+        let &raw = self.constants.get(&opref.0)?;
+        let tp = self
+            .constant_types
+            .get(&opref.0)
+            .copied()
+            .unwrap_or(Type::Int);
+        Some(match tp {
+            Type::Int => majit_ir::Value::Int(raw),
+            Type::Ref => majit_ir::Value::Ref(majit_ir::GcRef(raw as usize)),
+            Type::Float => majit_ir::Value::Float(f64::from_bits(raw as u64)),
+            Type::Void => majit_ir::Value::Void,
+        })
+    }
+
     /// Mark an existing constant with a specific type for resume data only.
     /// RPython parity: GcRef pointers stored via const_int() need Ref type
     /// for correct resume data encoding, but Cranelift must treat them as Int

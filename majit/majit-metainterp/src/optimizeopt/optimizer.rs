@@ -44,7 +44,7 @@ pub struct Optimizer {
     /// (via get_constant_box) → result value, carried across
     /// loop iterations so the optimizer can constant-fold repeated
     /// pure calls. RPython uses value-based equality for keys.
-    call_pure_results: std::collections::HashMap<Vec<majit_ir::Value>, majit_ir::Value>,
+    pub call_pure_results: std::collections::HashMap<Vec<majit_ir::Value>, majit_ir::Value>,
     /// optimizer.py: `_last_guard_op` — tracks the last emitted guard
     /// for guard sharing and descriptor fusion.
     _last_guard_op: Option<Op>,

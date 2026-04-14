@@ -115,6 +115,9 @@ pub struct UnrollOptimizer {
     /// RPython metainterp_sd.callinfocollection parity.
     /// Maps oopspec indices to (calldescr, func_ptr) for generate_modified_call.
     pub callinfocollection: Option<std::sync::Arc<majit_ir::descr::CallInfoCollection>>,
+    /// compile.py:221 + optimizer.py:530: call_pure_results from tracing.
+    /// Passed through to the inner Optimizer for cross-iteration CALL_PURE folding.
+    pub call_pure_results: std::collections::HashMap<Vec<majit_ir::Value>, majit_ir::Value>,
 }
 
 impl UnrollOptimizer {
@@ -140,6 +143,7 @@ impl UnrollOptimizer {
             phase1_patchguardop: None,
             next_global_opref: 0,
             callinfocollection: None,
+            call_pure_results: std::collections::HashMap::new(),
         }
     }
 
@@ -301,6 +305,7 @@ impl UnrollOptimizer {
             opt_p1.snapshot_vable_boxes = self.snapshot_vable_boxes.clone();
             opt_p1.snapshot_frame_pcs = self.snapshot_frame_pcs.clone();
             opt_p1.snapshot_box_types = self.snapshot_box_types.clone();
+            opt_p1.call_pure_results = self.call_pure_results.clone();
             // RPython optimize_preamble (unroll.py:101-103): flush=False.
             // JUMP/FINISH is NOT sent through the pass pipeline; it's
             // returned in info.jump_op for Phase 2 to consume.
@@ -492,6 +497,7 @@ impl UnrollOptimizer {
         opt_p2.snapshot_vable_boxes = self.snapshot_vable_boxes.clone();
         opt_p2.snapshot_frame_pcs = self.snapshot_frame_pcs.clone();
         opt_p2.snapshot_box_types = self.snapshot_box_types.clone();
+        opt_p2.call_pure_results = self.call_pure_results.clone();
         // RPython: same Optimizer instance keeps patchguardop across phases.
         // Phase 1 processes GUARD_FUTURE_CONDITION (from close_loop_args_at)
         // which sets patchguardop. optimizer.py:294 parity — no synthetic

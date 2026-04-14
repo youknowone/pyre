@@ -2213,12 +2213,12 @@ where
                     let const_idx = frame.next_u16() as usize;
                     let value = *frame
                         .jitcode
-                        .constants_i
+                        .constants_r
                         .get(const_idx)
                         .expect("jitcode const index out of bounds");
                     (dst, value)
                 };
-                self.set_ref_reg(dst, Some(ctx.const_int(value)), Some(value));
+                self.set_ref_reg(dst, Some(ctx.const_ref(value)), Some(value));
             }
             BC_POP_R => {
                 let dst = self.frames.current_mut().next_u16() as usize;
@@ -3255,7 +3255,7 @@ mod tests {
         let mut ctx = TraceCtx::for_test(0);
         let mut info = VirtualizableInfo::new(0);
         info.set_parent_descr(majit_ir::descr::make_size_descr(64));
-        let vable_ref = ctx.const_int(obj_ptr);
+        let vable_ref = ctx.const_ref(obj_ptr);
         ctx.init_virtualizable_boxes(&info, vable_ref, &[], &[]);
 
         let mut sym = DummySym::default();
@@ -3307,7 +3307,7 @@ mod tests {
         let mut ctx = TraceCtx::for_test(0);
         let mut info = VirtualizableInfo::new(0);
         info.set_parent_descr(majit_ir::descr::make_size_descr(64));
-        let vable_ref = ctx.const_int(obj_ptr);
+        let vable_ref = ctx.const_ref(obj_ptr);
         ctx.init_virtualizable_boxes(&info, vable_ref, &[], &[]);
 
         let mut sym = DummySym::default();
@@ -3353,7 +3353,7 @@ mod tests {
         let mut ctx = TraceCtx::for_test(0);
         let mut info = VirtualizableInfo::new(0);
         info.set_parent_descr(majit_ir::descr::make_size_descr(64));
-        let vable_ref = ctx.const_int(obj_ptr);
+        let vable_ref = ctx.const_ref(obj_ptr);
         ctx.init_virtualizable_boxes(&info, vable_ref, &[], &[]);
 
         let mut sym = DummySym::default();
@@ -3403,7 +3403,7 @@ mod tests {
         let mut ctx = TraceCtx::for_test(0);
         let mut info = VirtualizableInfo::new(0);
         info.set_parent_descr(majit_ir::descr::make_size_descr(64));
-        let vable_ref = ctx.const_int(obj_ptr);
+        let vable_ref = ctx.const_ref(obj_ptr);
         ctx.init_virtualizable_boxes(&info, vable_ref, &[], &[]);
 
         let mut sym = DummySym::default();
@@ -3453,7 +3453,7 @@ mod tests {
         let mut ctx = TraceCtx::for_test(0);
         let mut info = VirtualizableInfo::new(0);
         info.set_parent_descr(majit_ir::descr::make_size_descr(64));
-        let vable_ref = ctx.const_int(obj_ptr);
+        let vable_ref = ctx.const_ref(obj_ptr);
         ctx.init_virtualizable_boxes(&info, vable_ref, &[], &[]);
 
         let mut sym = DummySym::default();

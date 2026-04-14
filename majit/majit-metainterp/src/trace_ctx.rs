@@ -1,7 +1,7 @@
 //! No direct RPython equivalent — unified trace recording context
 //! (RPython splits this across MetaInterp.history, compile.py, and Trace).
 
-use majit_ir::{DescrRef, GreenKey, OpCode, OpRef, Type};
+use majit_ir::{DescrRef, GreenKey, OpCode, OpRef, Type, Value};
 use majit_trace::heapcache::HeapCache;
 use majit_trace::recorder::{Trace, TracePosition};
 
@@ -100,6 +100,10 @@ pub struct TraceCtx {
     /// TraceCtx because TraceCtx is freshly created per trace and the
     /// MetaInterp is reused across traces.
     forced_virtualizable: Option<OpRef>,
+    /// pyjitpl.py:2397: call_pure_results — maps constant argument tuples
+    /// to their concrete result values, recorded during tracing.
+    /// Passed to the optimizer for cross-iteration CALL_PURE folding.
+    call_pure_results: std::collections::HashMap<Vec<Value>, Value>,
 }
 
 /// pyjitpl.py:2989 — a visited loop header with its trace position.
@@ -293,6 +297,7 @@ impl TraceCtx {
             pending_guard_not_invalidated_pc: None,
             forced_virtualizable: None,
             has_compiled_targets_fn: None,
+            call_pure_results: std::collections::HashMap::new(),
         }
     }
 
@@ -338,6 +343,7 @@ impl TraceCtx {
             pending_guard_not_invalidated_pc: None,
             forced_virtualizable: None,
             has_compiled_targets_fn: None,
+            call_pure_results: std::collections::HashMap::new(),
         }
     }
 
@@ -1864,6 +1870,38 @@ impl TraceCtx {
 
     pub fn call_void_typed(&mut self, func_ptr: *const (), args: &[OpRef], arg_types: &[Type]) {
         let _ = self.call_typed(OpCode::CallN, func_ptr, args, arg_types, Type::Void);
+    }
+
+    /// pyjitpl.py:3553-3579: record_result_of_call_pure.
+    ///
+    /// After a pure call executes during tracing, record the mapping from
+    /// constant argument values to the result value. The optimizer uses this
+    /// to constant-fold repeated pure calls across loop iterations.
+    ///
+    /// `call_args` are the OpRefs passed to CALL_PURE (including func_ptr
+    /// at position 0). `result_value` is the concrete result of the call.
+    pub fn record_result_of_call_pure(&mut self, call_args: &[OpRef], result_value: Value) {
+        // pyjitpl.py:3562-3568: if all args are constants, we could
+        // remove the op entirely. For now just record the mapping.
+        let mut arg_consts = Vec::with_capacity(call_args.len());
+        for &arg in call_args {
+            if let Some(val) = self.constants.get_value(arg) {
+                arg_consts.push(val);
+            } else {
+                // pyjitpl.py:3572: constant_from_op(a) — convert all
+                // args to constants. If an arg is not a constant (i.e.
+                // a runtime inputarg), still record; the optimizer
+                // builds its own constant key from get_constant_box().
+                return;
+            }
+        }
+        self.call_pure_results.insert(arg_consts, result_value);
+    }
+
+    /// pyjitpl.py:2397 + compile.py:221: take call_pure_results for
+    /// passing to the optimizer.
+    pub fn take_call_pure_results(&mut self) -> std::collections::HashMap<Vec<Value>, Value> {
+        std::mem::take(&mut self.call_pure_results)
     }
 
     // ── conditional_call / record_known_result (jtransform.py:1665, 292) ──

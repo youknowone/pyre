@@ -1250,98 +1250,145 @@ fn builtin_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 }
 
 /// `int(obj)` → convert to int
+/// intobject.py:989-1050 _new_baseint
 pub(crate) fn builtin_int(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.is_empty() {
         return Ok(w_int_new(0));
     }
     let obj = args[0];
-    unsafe {
-        // intobject.py:991 _new_baseint: space.is_w(space.type(w_value), space.w_int)
+    let w_base = args.get(1).copied();
+
+    if w_base.is_none() {
+        // intobject.py:991: exact int type → return as-is
         let w_type = crate::typedef::r#type(obj);
         let w_int = crate::typedef::gettypefor(&INT_TYPE);
         if w_type.is_some() && w_type == w_int {
             return Ok(obj);
         }
-        if is_bool(obj) {
-            return Ok(w_int_new(if w_bool_get_value(obj) { 1 } else { 0 }));
+        // intobject.py:994: __int__ dunder
+        if let Ok(int_fn) = crate::baseobjspace::getattr(obj, "__int__") {
+            let result = crate::call_function(int_fn, &[obj]);
+            return Ok(ensure_baseint(result));
         }
-        if is_float(obj) {
-            return Ok(w_int_new(floatobject::w_float_get_value(obj) as i64));
+        // intobject.py:997: __trunc__ dunder (deprecated)
+        if let Ok(trunc_fn) = crate::baseobjspace::getattr(obj, "__trunc__") {
+            let w_obj = crate::call_function(trunc_fn, &[obj]);
+            if !unsafe { is_int(w_obj) } {
+                if let Ok(index_fn) = crate::baseobjspace::getattr(w_obj, "__index__") {
+                    let w_indexed = crate::call_function(index_fn, &[w_obj]);
+                    return Ok(ensure_baseint(w_indexed));
+                }
+                return Err(crate::PyError::type_error(
+                    "__trunc__ returned non-Integral type",
+                ));
+            }
+            return Ok(ensure_baseint(w_obj));
         }
-        // int(string, base) — parse string in given base.
-        let base: u32 = if args.len() > 1 && is_int(args[1]) {
-            w_int_get_value(args[1]) as u32
+        // intobject.py:1015: __index__ dunder
+        if let Ok(index_fn) = crate::baseobjspace::getattr(obj, "__index__") {
+            let w_obj = crate::call_function(index_fn, &[obj]);
+            return Ok(ensure_baseint(w_obj));
+        }
+        // intobject.py:1026-1038: str / bytes / bytearray
+        unsafe {
+            if is_str(obj) {
+                return parse_int_from_str(w_str_get_value(obj), 10);
+            }
+            if pyre_object::bytesobject::is_bytes_like(obj) {
+                let data = pyre_object::bytesobject::bytes_like_data(obj);
+                let s = String::from_utf8_lossy(data);
+                return parse_int_from_str(&s, 10);
+            }
+        }
+        // intobject.py:1040-1050: buffer interface fallback → TypeError
+        return Err(crate::PyError::type_error(
+            "int() argument must be a string, a bytes-like object or a number, not '%T'",
+        ));
+    }
+
+    // intobject.py:1051-1072: w_base is not None — parse with base
+    let base: u32 = if let Some(w_b) = w_base {
+        if unsafe { is_int(w_b) } {
+            unsafe { w_int_get_value(w_b) as u32 }
         } else {
-            10
-        };
-        // bytearray/bytes input is treated like a string of ASCII digits.
+            return Err(crate::PyError::type_error(
+                "int() can't convert non-string with explicit base",
+            ));
+        }
+    } else {
+        10
+    };
+    unsafe {
+        if is_str(obj) {
+            return parse_int_from_str(w_str_get_value(obj), base);
+        }
         if pyre_object::bytesobject::is_bytes_like(obj) {
             let data = pyre_object::bytesobject::bytes_like_data(obj);
-            let s_owned = String::from_utf8_lossy(data).into_owned();
-            let s = s_owned.trim();
-            let cleaned: String = s.chars().filter(|&c| c != '_').collect();
-            if let Ok(v) = i64::from_str_radix(&cleaned, base) {
-                return Ok(w_int_new(v));
-            }
-            return Err(crate::PyError::new(
-                crate::PyErrorKind::ValueError,
-                format!("invalid literal for int() with base {base}: '{s}'"),
-            ));
-        }
-        if is_str(obj) {
-            let s = w_str_get_value(obj).trim();
-            // Strip optional 0b/0o/0x prefix when base is 0 or matches.
-            let (sign, rest) = if let Some(r) = s.strip_prefix('-') {
-                (-1i64, r)
-            } else if let Some(r) = s.strip_prefix('+') {
-                (1i64, r)
-            } else {
-                (1i64, s)
-            };
-            let (radix, digits) = if base == 0 {
-                if let Some(r) = rest.strip_prefix("0x").or(rest.strip_prefix("0X")) {
-                    (16u32, r)
-                } else if let Some(r) = rest.strip_prefix("0b").or(rest.strip_prefix("0B")) {
-                    (2u32, r)
-                } else if let Some(r) = rest.strip_prefix("0o").or(rest.strip_prefix("0O")) {
-                    (8u32, r)
-                } else {
-                    (10u32, rest)
-                }
-            } else {
-                let stripped = match base {
-                    16 => rest
-                        .strip_prefix("0x")
-                        .or(rest.strip_prefix("0X"))
-                        .unwrap_or(rest),
-                    2 => rest
-                        .strip_prefix("0b")
-                        .or(rest.strip_prefix("0B"))
-                        .unwrap_or(rest),
-                    8 => rest
-                        .strip_prefix("0o")
-                        .or(rest.strip_prefix("0O"))
-                        .unwrap_or(rest),
-                    _ => rest,
-                };
-                (base, stripped)
-            };
-            // Skip underscores allowed in numeric literals.
-            let cleaned: String = digits.chars().filter(|&c| c != '_').collect();
-            if let Ok(v) = i64::from_str_radix(&cleaned, radix) {
-                return Ok(w_int_new(sign * v));
-            }
-            return Err(crate::PyError::new(
-                crate::PyErrorKind::ValueError,
-                format!("invalid literal for int() with base {base}: '{s}'"),
-            ));
+            let s = String::from_utf8_lossy(data);
+            return parse_int_from_str(&s, base);
         }
     }
-    // __int__ protocol
-    if let Ok(int_fn) = crate::baseobjspace::getattr(obj, "__int__") {
-        return Ok(crate::call_function(int_fn, &[obj]));
+    Err(crate::PyError::type_error(
+        "int() can't convert non-string with explicit base",
+    ))
+}
+
+/// intobject.py:1093: _ensure_baseint — unwrap subclass to plain int.
+fn ensure_baseint(obj: PyObjectRef) -> PyObjectRef {
+    if unsafe { is_int(obj) } {
+        let v = unsafe { w_int_get_value(obj) };
+        w_int_new(v)
+    } else {
+        obj
     }
-    Ok(w_int_new(0))
+}
+
+/// Parse an integer from a string with the given base.
+fn parse_int_from_str(s: &str, base: u32) -> Result<PyObjectRef, crate::PyError> {
+    let s = s.trim();
+    let (sign, rest) = if let Some(r) = s.strip_prefix('-') {
+        (-1i64, r)
+    } else if let Some(r) = s.strip_prefix('+') {
+        (1i64, r)
+    } else {
+        (1i64, s)
+    };
+    let (radix, digits) = if base == 0 {
+        if let Some(r) = rest.strip_prefix("0x").or(rest.strip_prefix("0X")) {
+            (16u32, r)
+        } else if let Some(r) = rest.strip_prefix("0b").or(rest.strip_prefix("0B")) {
+            (2u32, r)
+        } else if let Some(r) = rest.strip_prefix("0o").or(rest.strip_prefix("0O")) {
+            (8u32, r)
+        } else {
+            (10u32, rest)
+        }
+    } else {
+        let stripped = match base {
+            16 => rest
+                .strip_prefix("0x")
+                .or(rest.strip_prefix("0X"))
+                .unwrap_or(rest),
+            2 => rest
+                .strip_prefix("0b")
+                .or(rest.strip_prefix("0B"))
+                .unwrap_or(rest),
+            8 => rest
+                .strip_prefix("0o")
+                .or(rest.strip_prefix("0O"))
+                .unwrap_or(rest),
+            _ => rest,
+        };
+        (base, stripped)
+    };
+    let cleaned: String = digits.chars().filter(|&c| c != '_').collect();
+    if let Ok(v) = i64::from_str_radix(&cleaned, radix) {
+        return Ok(w_int_new(sign * v));
+    }
+    Err(crate::PyError::new(
+        crate::PyErrorKind::ValueError,
+        format!("invalid literal for int() with base {base}: '{s}'"),
+    ))
 }
 
 /// `float(obj)` → convert to float

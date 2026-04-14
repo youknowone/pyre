@@ -877,7 +877,7 @@ impl JitCodeBuilder {
     // ── Ref-typed builder methods ─────────────────────────────
 
     pub fn load_const_r_value(&mut self, dst: u16, value: i64) {
-        let const_idx = self.add_const_i(value);
+        let const_idx = self.add_const_r(value);
         self.load_const_r(dst, const_idx);
     }
 

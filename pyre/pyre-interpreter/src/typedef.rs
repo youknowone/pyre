@@ -392,6 +392,15 @@ pub fn init_typeobjects() {
         ellipsis_type as usize,
     );
 
+    // typedef.py:948-954 NotImplemented.typedef.
+    let notimplemented_type =
+        new_typeobject_with_base("NotImplementedType", init_notimplemented_type, object_type);
+    unsafe { pyre_object::w_type_set_acceptable_as_base_class(notimplemented_type, false) };
+    reg.insert(
+        &pyre_object::pyobject::NOTIMPLEMENTED_TYPE as *const PyType as usize,
+        notimplemented_type as usize,
+    );
+
     // types.UnionType — PyPy: _pypy_generic_alias.py UnionType, bases=(object,)
     reg.insert(
         &pyre_object::UNION_TYPE as *const PyType as usize,
@@ -728,6 +737,39 @@ fn init_ellipsis_type(ns: &mut PyNamespace) {
         ns,
         "__reduce__",
         make_builtin_function("__reduce__", |_args| Ok(w_str_new("Ellipsis"))),
+    );
+}
+
+/// special.py:20: NotImplemented.descr_new_notimplemented
+fn notimplemented_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    if let Some(w_notimplemented) = gettypefor(&pyre_object::pyobject::NOTIMPLEMENTED_TYPE) {
+        check_user_subclass(w_notimplemented, cls)?;
+    }
+    Ok(pyre_object::noneobject::w_not_implemented())
+}
+
+/// typedef.py:948-954 NotImplemented.typedef
+fn init_notimplemented_type(ns: &mut PyNamespace) {
+    namespace_store(ns, "__new__", make_new_descr(notimplemented_descr_new));
+    namespace_store(
+        ns,
+        "__repr__",
+        make_builtin_function("__repr__", |_args| Ok(w_str_new("NotImplemented"))),
+    );
+    namespace_store(
+        ns,
+        "__reduce__",
+        make_builtin_function("__reduce__", |_args| Ok(w_str_new("NotImplemented"))),
+    );
+    // special.py:28-33 descr_bool — DeprecationWarning
+    // TODO: emit DeprecationWarning when warnings infrastructure exists
+    namespace_store(
+        ns,
+        "__bool__",
+        make_builtin_function("__bool__", |_args| {
+            Ok(pyre_object::boolobject::w_bool_from(true))
+        }),
     );
 }
 
@@ -2978,17 +3020,20 @@ fn init_float_type(ns: &mut PyNamespace) {
             }
         }),
     );
-    namespace_store(
-        ns,
-        "__trunc__",
-        make_builtin_function("__trunc__", |args| {
-            if args.is_empty() {
-                return Err(crate::PyError::type_error("__trunc__() requires self"));
-            }
-            let v = unsafe { pyre_object::w_float_get_value(args[0]) };
-            Ok(pyre_object::w_int_new(v.trunc() as i64))
-        }),
-    );
+    // floatobject.py:713: __int__ = interp2app(W_FloatObject.descr_trunc)
+    for method in ["__trunc__", "__int__"] {
+        namespace_store(
+            ns,
+            method,
+            make_builtin_function(method, |args| {
+                if args.is_empty() {
+                    return Err(crate::PyError::type_error("__trunc__() requires self"));
+                }
+                let v = unsafe { pyre_object::w_float_get_value(args[0]) };
+                Ok(pyre_object::w_int_new(v.trunc() as i64))
+            }),
+        );
+    }
 }
 
 /// IEEE 754 double decomposition into (mantissa, exponent, sign).
