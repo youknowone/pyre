@@ -34,11 +34,8 @@ pub struct W_ListObject {
     pub float_items: FloatArray,
 }
 
-/// Pyre equivalent of RPython `is_plain_int1(w_obj)` (listobject.py:2389):
-///   `type(w_obj) is W_IntObject or (type(w_obj) is W_LongObject and w_obj._fits_int())`
-/// The W_LongObject._fits_int() branch is not applicable in pyre (no W_LongObject).
-/// Unique ints (created by w_int_new_unique for int subclass instances) are excluded
-/// because they may carry per-object attributes that require pointer identity.
+/// `is_plain_int1(w_obj)` — RPython listobject.py:2389.
+/// True if `item` is a plain `int` (exact type, not subclass, not long).
 #[inline]
 unsafe fn is_plain_int1(item: PyObjectRef) -> bool {
     if item.is_null() || !is_int(item) {
@@ -328,7 +325,6 @@ pub unsafe fn rebuild_object_items(list: &mut W_ListObject, items: Vec<PyObjectR
 }
 
 /// Set a slice of the list: `list[start:end] = new_items` (step=1).
-/// Mirrors RPython `AbstractUnwrappedStrategy.setslice` (listobject.py:1750) for step==1.
 /// Switches to ObjectStrategy when new_items don't match the current strategy type.
 pub unsafe fn w_list_setslice(
     obj: PyObjectRef,
@@ -337,13 +333,7 @@ pub unsafe fn w_list_setslice(
     new_items: Vec<PyObjectRef>,
 ) {
     let list = &mut *(obj as *mut W_ListObject);
-    // AbstractUnwrappedStrategy.setslice (listobject.py:1749-1808) step==1:
-    //   if not self.list_is_correct_type(w_other): switch_to_object_strategy; re-dispatch
-    //   items = unerase(w_list.lstorage)
-    //   delta = slicelength - len2
-    //   if delta < 0: grow + shift right
-    //   elif delta > 0: del items[start:start+delta]
-    //   for i in range(len2): items[start+i] = other_items[i]
+    // AbstractUnwrappedStrategy.setslice (listobject.py:1749-1808) step==1.
     match list.strategy {
         ListStrategy::Integer => {
             let all_int = new_items.iter().all(|&v| is_plain_int1(v));
@@ -374,9 +364,6 @@ pub unsafe fn w_list_setslice(
 }
 
 /// Insert item at index.
-/// Mirrors RPython `AbstractUnwrappedStrategy.insert` (listobject.py:1714):
-///   if `is_correct_type(w_item)`: `l.insert(index, unwrap(w_item))`
-///   else: `switch_to_next_strategy` then delegate.
 pub unsafe fn w_list_insert(obj: PyObjectRef, index: i64, value: PyObjectRef) {
     let list = &mut *(obj as *mut W_ListObject);
     let len = w_list_len(obj) as i64;
@@ -406,9 +393,7 @@ pub unsafe fn w_list_insert(obj: PyObjectRef, index: i64, value: PyObjectRef) {
     }
 }
 
-/// Remove and return item at index.
-/// Mirrors RPython `AbstractUnwrappedStrategy.pop` (listobject.py:1855):
-///   `item = l.pop(index); return self.wrap(item)`
+/// Remove and return item at `index`. Returns `None` if out of bounds.
 pub unsafe fn w_list_pop(obj: PyObjectRef, index: i64) -> Option<PyObjectRef> {
     let list = &mut *(obj as *mut W_ListObject);
     let len = w_list_len(obj) as i64;
@@ -427,9 +412,7 @@ pub unsafe fn w_list_pop(obj: PyObjectRef, index: i64) -> Option<PyObjectRef> {
     }
 }
 
-/// Remove and return last item.
-/// Mirrors RPython `AbstractUnwrappedStrategy.pop_end` (listobject.py:1848):
-///   `return self.wrap(l.pop())`
+/// Remove and return last item. Returns `None` if empty.
 pub unsafe fn w_list_pop_end(obj: PyObjectRef) -> Option<PyObjectRef> {
     let list = &mut *(obj as *mut W_ListObject);
     match list.strategy {
@@ -478,8 +461,6 @@ pub unsafe fn w_list_clear(obj: PyObjectRef) {
 }
 
 /// Reverse in place.
-/// Mirrors RPython `AbstractUnwrappedStrategy.reverse` (listobject.py:1880):
-///   `self.unerase(w_list.lstorage).reverse()`
 pub unsafe fn w_list_reverse(obj: PyObjectRef) {
     let list = &mut *(obj as *mut W_ListObject);
     match list.strategy {
@@ -489,9 +470,7 @@ pub unsafe fn w_list_reverse(obj: PyObjectRef) {
     }
 }
 
-/// Delete a range of items [start..end) by index.
-/// Mirrors RPython `AbstractUnwrappedStrategy.deleteslice` (listobject.py:1815)
-/// for the step==1 case used by `list_delslice`.
+/// Delete a range of items `[start..end)` in place.
 pub unsafe fn w_list_delslice(obj: PyObjectRef, start: usize, end: usize) {
     let list = &mut *(obj as *mut W_ListObject);
     match list.strategy {
@@ -539,9 +518,7 @@ pub unsafe fn w_list_delslice(obj: PyObjectRef, start: usize, end: usize) {
     }
 }
 
-/// Remove first occurrence of value.
-/// Mirrors RPython `W_ListObject.descr_remove` (listobject.py:790):
-///   find via `find_or_count`, then `self.pop(i)`.
+/// Remove first occurrence of `value`. Returns `true` if found and removed.
 pub unsafe fn w_list_remove(obj: PyObjectRef, value: PyObjectRef) -> bool {
     let list = &mut *(obj as *mut W_ListObject);
     match list.strategy {
@@ -788,7 +765,6 @@ mod tests {
     // ── per-strategy operation tests ─────────────────────────────────────────
     // These verify that pop/pop_end/insert/reverse/clear/delslice do NOT
     // switch to ObjectStrategy when the list is homogeneous (int or float).
-    // Mirrors RPython AbstractUnwrappedStrategy parity (listobject.py:1714-1891).
 
     #[test]
     fn test_int_list_pop_stays_integer_strategy() {
