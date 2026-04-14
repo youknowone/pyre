@@ -1,5 +1,6 @@
 mod codewriter;
 mod frame;
+pub mod liveness;
 pub(crate) mod machine;
 
 pub use codewriter::JitCodeBuilder;
