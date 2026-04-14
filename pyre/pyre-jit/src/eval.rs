@@ -1739,7 +1739,6 @@ fn bound_reached(
             // run their own eval_loop_jit) don't trigger jit_merge_point_hook.
             driver.meta_interp_mut().tracing_call_depth = Some(call_depth());
             let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
-            let concrete_frame = frame.snapshot_for_tracing();
             let outcome = driver.jit_merge_point_keyed(
                 green_key,
                 loop_header_pc,
@@ -1749,6 +1748,7 @@ fn bound_reached(
                 |ctx, sym| {
                     use pyre_jit_trace::trace::trace_bytecode;
                     crate::jit::codewriter::ensure_jitcode_for(code, frame.code);
+                    let concrete_frame = frame.snapshot_for_tracing();
                     let (action, _) =
                         trace_bytecode(ctx, sym, code, loop_header_pc, concrete_frame);
                     action
