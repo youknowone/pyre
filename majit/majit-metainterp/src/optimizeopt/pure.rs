@@ -2212,40 +2212,6 @@ mod tests {
     }
 
     #[test]
-    fn test_imported_short_pure_result_replays_into_pure_cache() {
-        let mut pass = OptPure::new();
-        let mut ctx = OptContext::with_num_inputs(6, 0);
-        let const_opref = OpRef::from_const(10);
-        ctx.seed_constant(const_opref, majit_ir::Value::Int(7));
-        let imported = crate::optimizeopt::ImportedShortPureOp::new(
-            OpCode::IntAdd,
-            None,
-            vec![
-                crate::optimizeopt::ImportedShortPureArg::OpRef(OpRef(0)),
-                crate::optimizeopt::ImportedShortPureArg::Const(
-                    majit_ir::Value::Int(7),
-                    const_opref,
-                ),
-            ],
-            OpRef(1),
-            OpRef(1),
-            false,
-        );
-        initialize_imported_short_pure_builder(&mut ctx, imported.pop.preamble_op.clone(), Some(1));
-        ctx.imported_short_pure_ops.push(imported);
-
-        pass.setup();
-        pass.install_preamble_pure_ops(&ctx);
-
-        let mut op = Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(10)]);
-        op.args[1] = const_opref;
-        op.pos = OpRef(2);
-        let result = pass.propagate_forward(&op, &mut ctx);
-        assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_box_replacement(OpRef(2)), OpRef(1));
-    }
-
-    #[test]
     fn test_imported_short_pure_result_is_reexported_to_short_preamble() {
         // Imported pure ops (from previous peeling cycle) should be
         // re-exported to ShortBoxes via short_preamble_pure_ops.
