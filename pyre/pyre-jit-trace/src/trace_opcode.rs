@@ -1038,12 +1038,18 @@ impl MIFrame {
         // PC, not the last bytecode's orgpc. flush_to_frame sets
         // vable_next_instr from orgpc; override it here.
         //
-        // RPython parity: reached_loop_header (pyjitpl.py:2950-2965) does NOT
-        // truncate or clear the stack. virtualizable.py:86 read_boxes reads ALL
-        // array items (locals + stack) regardless of valuestackdepth. Only
-        // next_instr needs to be set to the target PC.
+        // RPython parity: when closing a loop back to a target header,
+        // the JUMP must carry only the header's contract: scalar inputargs
+        // (frame, ni, code, vsd, ns) plus locals. Stack values are NOT
+        // loop-carried — they belong to a specific execution point and
+        // must not leak into the JUMP args.
         if let Some(pc) = target_pc {
-            self.sym_mut().vable_next_instr = ctx.const_int(pc as i64);
+            let s = self.sym_mut();
+            s.vable_next_instr = ctx.const_int(pc as i64);
+            s.valuestackdepth = s.nlocals;
+            s.vable_valuestackdepth = ctx.const_int(s.nlocals as i64);
+            s.symbolic_stack.clear();
+            s.symbolic_stack_types.clear();
         }
         // If nlocals was lost (e.g., inline tracing reset symbolic_initialized),
         // re-derive from concrete frame. RPython keeps virtualizable_boxes in
