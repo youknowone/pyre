@@ -76,7 +76,8 @@ mod tests {
         let obj = w_bool_new(true);
         unsafe {
             assert!(is_bool(obj));
-            assert!(!is_int(obj));
+            // bool is a subclass of int, so is_int(bool) is true.
+            assert!(is_int(obj));
             assert!(w_bool_get_value(obj));
             drop(Box::from_raw(obj as *mut W_BoolObject));
         }

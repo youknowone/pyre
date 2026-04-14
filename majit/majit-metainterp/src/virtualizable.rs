@@ -1481,8 +1481,11 @@ mod tests {
 
     #[test]
     fn test_read_array_lengths_from_embedded_array_container() {
+        // `EmbeddedArray` is a 2-level layout: the frame field stores a
+        // pointer to a container struct that owns the items pointer.
+        // Matches pyre's PyFrame.locals_cells_stack_w: *mut FixedObjectArray.
         #[repr(C)]
-        struct InlineArray {
+        struct ArrayContainer {
             ptr: *mut i64,
             len: usize,
         }
@@ -1490,16 +1493,17 @@ mod tests {
         #[repr(C)]
         struct Obj {
             token: usize,
-            arr: InlineArray,
+            arr: *mut ArrayContainer,
         }
 
         let mut backing = vec![10i64, 20, 30];
+        let mut container = ArrayContainer {
+            ptr: backing.as_mut_ptr(),
+            len: backing.len(),
+        };
         let obj = Obj {
             token: 0,
-            arr: InlineArray {
-                ptr: backing.as_mut_ptr(),
-                len: backing.len(),
-            },
+            arr: &mut container as *mut _,
         };
 
         let mut info = VirtualizableInfo::new(0);
@@ -1508,8 +1512,8 @@ mod tests {
             "arr",
             Type::Int,
             std::mem::offset_of!(Obj, arr),
-            std::mem::offset_of!(InlineArray, ptr),
-            std::mem::offset_of!(InlineArray, len),
+            std::mem::offset_of!(ArrayContainer, ptr),
+            std::mem::offset_of!(ArrayContainer, len),
             0,
         );
 

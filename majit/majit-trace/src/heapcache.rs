@@ -368,17 +368,19 @@ impl HeapCache {
     /// RPython: update_version(ref_frontend_op)
     /// heapcache.py:199-209
     ///
-    ///     def update_version(self, ref_frontend_op):
-    ///         """Ensure the version of 'ref_frontend_op' is current. If not,
-    ///         it will update 'ref_frontend_op' (removing most flags currently set).
-    ///         """
-    ///         if not self.test_head_version(ref_frontend_op):
-    ///             f = self.head_version
-    ///             if (self.test_likely_virtual_version(ref_frontend_op) and
-    ///                 test_flags(ref_frontend_op, HF_LIKELY_VIRTUAL)):
-    ///                 f |= HF_LIKELY_VIRTUAL
-    ///             ref_frontend_op._set_heapc_flags(f)
-    ///             ref_frontend_op._heapc_deps = None
+    /// ```text
+    ///  def update_version(self, ref_frontend_op):
+    ///      """Ensure the version of 'ref_frontend_op' is current. If not,
+    ///      it will update 'ref_frontend_op' (removing most flags currently set).
+    ///      """
+    ///      if not self.test_head_version(ref_frontend_op):
+    ///          f = self.head_version
+    ///          if (self.test_likely_virtual_version(ref_frontend_op) and
+    ///              test_flags(ref_frontend_op, HF_LIKELY_VIRTUAL)):
+    ///              f |= HF_LIKELY_VIRTUAL
+    ///          ref_frontend_op._set_heapc_flags(f)
+    ///          ref_frontend_op._heapc_deps = None
+    /// ```
     pub fn update_version(&mut self, opref: OpRef) {
         if opref.is_constant() {
             return;
@@ -442,12 +444,14 @@ impl HeapCache {
 
     /// heapcache.py:224-229
     ///
-    ///     def _escape_from_write(self, box, fieldbox):
-    ///         if self.is_unescaped(box) and self.is_unescaped(fieldbox):
-    ///             deps = self._get_deps(box)
-    ///             deps.append(fieldbox)
-    ///         elif fieldbox is not None:
-    ///             self._escape_box(fieldbox)
+    /// ```text
+    ///  def _escape_from_write(self, box, fieldbox):
+    ///      if self.is_unescaped(box) and self.is_unescaped(fieldbox):
+    ///          deps = self._get_deps(box)
+    ///          deps.append(fieldbox)
+    ///      elif fieldbox is not None:
+    ///          self._escape_box(fieldbox)
+    /// ```
     pub fn _escape_from_write(&mut self, r#box: OpRef, fieldbox: OpRef) {
         if self.is_unescaped(r#box) && self.is_unescaped(fieldbox) {
             let deps = self._get_deps(r#box);
@@ -466,21 +470,23 @@ impl HeapCache {
 
     /// heapcache.py:295-309 `_escape_box(box)`.
     ///
-    ///     def _escape_box(self, box):
-    ///         if isinstance(box, RefFrontendOp):
-    ///             remove_flags(box, HF_LIKELY_VIRTUAL | HF_IS_UNESCAPED)
-    ///             deps = box._heapc_deps
-    ///             if deps is not None:
-    ///                 if not self.test_head_version(box):
-    ///                     box._heapc_deps = None
-    ///                 else:
-    ///                     # 'deps[0]' is abused to store the array length, keep it
-    ///                     if deps[0] is None:
-    ///                         box._heapc_deps = None
-    ///                     else:
-    ///                         box._heapc_deps = [deps[0]]
-    ///                     for i in range(1, len(deps)):
-    ///                         self._escape_box(deps[i])
+    /// ```text
+    ///  def _escape_box(self, box):
+    ///      if isinstance(box, RefFrontendOp):
+    ///          remove_flags(box, HF_LIKELY_VIRTUAL | HF_IS_UNESCAPED)
+    ///          deps = box._heapc_deps
+    ///          if deps is not None:
+    ///              if not self.test_head_version(box):
+    ///                  box._heapc_deps = None
+    ///              else:
+    ///                  # 'deps[0]' is abused to store the array length, keep it
+    ///                  if deps[0] is None:
+    ///                      box._heapc_deps = None
+    ///                  else:
+    ///                      box._heapc_deps = [deps[0]]
+    ///                  for i in range(1, len(deps)):
+    ///                      self._escape_box(deps[i])
+    /// ```
     pub fn mark_escaped_box(&mut self, opref: OpRef) {
         if opref.is_constant() {
             return;
@@ -655,11 +661,13 @@ impl HeapCache {
 
     /// heapcache.py:502-506
     ///
-    ///     def new(self, box):
-    ///         assert isinstance(box, RefFrontendOp)
-    ///         self.update_version(box)
-    ///         add_flags(box, HF_LIKELY_VIRTUAL | HF_SEEN_ALLOCATION | HF_IS_UNESCAPED
-    ///                        | HF_KNOWN_NULLITY)
+    /// ```text
+    ///  def new(self, box):
+    ///      assert isinstance(box, RefFrontendOp)
+    ///      self.update_version(box)
+    ///      add_flags(box, HF_LIKELY_VIRTUAL | HF_SEEN_ALLOCATION | HF_IS_UNESCAPED
+    ///                     | HF_KNOWN_NULLITY)
+    /// ```
     pub fn new_object(&mut self, opref: OpRef) {
         if opref.is_constant() {
             return;
@@ -674,15 +682,17 @@ impl HeapCache {
 
     /// heapcache.py:508-516 new_array
     ///
-    ///     def new_array(self, box, lengthbox):
-    ///         assert isinstance(box, RefFrontendOp)
-    ///         self.update_version(box)
-    ///         flags = HF_SEEN_ALLOCATION | HF_KNOWN_NULLITY
-    ///         if isinstance(lengthbox, Const):
-    ///             # only constant-length arrays are virtuals
-    ///             flags |= HF_LIKELY_VIRTUAL | HF_IS_UNESCAPED
-    ///         add_flags(box, flags)
-    ///         self.arraylen_now_known(box, lengthbox)
+    /// ```text
+    ///  def new_array(self, box, lengthbox):
+    ///      assert isinstance(box, RefFrontendOp)
+    ///      self.update_version(box)
+    ///      flags = HF_SEEN_ALLOCATION | HF_KNOWN_NULLITY
+    ///      if isinstance(lengthbox, Const):
+    ///          # only constant-length arrays are virtuals
+    ///          flags |= HF_LIKELY_VIRTUAL | HF_IS_UNESCAPED
+    ///      add_flags(box, flags)
+    ///      self.arraylen_now_known(box, lengthbox)
+    /// ```
     pub fn new_array(&mut self, opref: OpRef, lengthbox: OpRef, length_is_const: bool) {
         if opref.is_constant() {
             return;
@@ -701,18 +711,22 @@ impl HeapCache {
 
     /// heapcache.py:485-486
     ///
-    ///     def is_known_nonstandard_virtualizable(self, box):
-    ///         return self._check_flag(box, HF_NONSTD_VABLE) or self._check_flag(box, HF_SEEN_ALLOCATION)
+    /// ```text
+    ///  def is_known_nonstandard_virtualizable(self, box):
+    ///      return self._check_flag(box, HF_NONSTD_VABLE) or self._check_flag(box, HF_SEEN_ALLOCATION)
+    /// ```
     pub fn is_known_nonstandard_virtualizable(&self, opref: OpRef) -> bool {
         self._check_flag(opref, HF_NONSTD_VABLE) || self._check_flag(opref, HF_SEEN_ALLOCATION)
     }
 
     /// heapcache.py:488-491
     ///
-    ///     def nonstandard_virtualizables_now_known(self, box):
-    ///         if isinstance(box, Const):
-    ///             return
-    ///         self._set_flag(box, HF_NONSTD_VABLE)
+    /// ```text
+    ///  def nonstandard_virtualizables_now_known(self, box):
+    ///      if isinstance(box, Const):
+    ///          return
+    ///      self._set_flag(box, HF_NONSTD_VABLE)
+    /// ```
     pub fn nonstandard_virtualizables_now_known(&mut self, opref: OpRef) {
         if opref.is_constant() {
             return;
@@ -722,11 +736,13 @@ impl HeapCache {
 
     /// heapcache.py:598-602 `replace_box(oldbox, newbox)`.
     ///
-    ///     def replace_box(self, oldbox, newbox):
-    ///         # here, only for replacing a box with a const
-    ///         if isinstance(oldbox, FrontendOp) and isinstance(newbox, Const):
-    ///             assert newbox.same_constant(constant_from_op(oldbox))
-    ///             oldbox.set_replaced_with_const()
+    /// ```text
+    ///  def replace_box(self, oldbox, newbox):
+    ///      # here, only for replacing a box with a const
+    ///      if isinstance(oldbox, FrontendOp) and isinstance(newbox, Const):
+    ///          assert newbox.same_constant(constant_from_op(oldbox))
+    ///          oldbox.set_replaced_with_const()
+    /// ```
     ///
     pub fn replace_box(&mut self, old: OpRef, new: OpRef) {
         // Transfer field cache entries keyed by (OpRef, descr_index).
@@ -771,10 +787,12 @@ impl HeapCache {
 
     /// heapcache.py:470-473
     ///
-    ///     def class_now_known(self, box):
-    ///         if isinstance(box, Const):
-    ///             return
-    ///         self._set_flag(box, HF_KNOWN_CLASS | HF_KNOWN_NULLITY)
+    /// ```text
+    ///  def class_now_known(self, box):
+    ///      if isinstance(box, Const):
+    ///          return
+    ///      self._set_flag(box, HF_KNOWN_CLASS | HF_KNOWN_NULLITY)
+    /// ```
     ///
     pub fn class_now_known(&mut self, opref: OpRef, class: GcRef) {
         if opref.is_constant() {
@@ -819,9 +837,11 @@ impl HeapCache {
 
     /// heapcache.py:79-82 `CacheEntry._seen_alloc(box)`:
     ///
-    ///     if not isinstance(ref_box, RefFrontendOp):
-    ///         return False
-    ///     return self.heapcache._check_flag(ref_box, HF_SEEN_ALLOCATION)
+    /// ```text
+    ///  if not isinstance(ref_box, RefFrontendOp):
+    ///      return False
+    ///  return self.heapcache._check_flag(ref_box, HF_SEEN_ALLOCATION)
+    /// ```
     pub fn saw_allocation(&self, opref: OpRef) -> bool {
         self._check_flag(opref, HF_SEEN_ALLOCATION)
     }
@@ -935,31 +955,33 @@ impl HeapCache {
 
     /// heapcache.py:312-336
     ///
-    ///     def clear_caches_not_necessary(self, opnum, descr):
-    ///         if (opnum == rop.SETFIELD_GC or
-    ///             opnum == rop.SETARRAYITEM_GC or
-    ///             opnum == rop.SETFIELD_RAW or
-    ///             opnum == rop.SETARRAYITEM_RAW or
-    ///             opnum == rop.SETINTERIORFIELD_GC or
-    ///             opnum == rop.COPYSTRCONTENT or
-    ///             opnum == rop.COPYUNICODECONTENT or
-    ///             opnum == rop.STRSETITEM or
-    ///             opnum == rop.UNICODESETITEM or
-    ///             opnum == rop.SETFIELD_RAW or
-    ///             opnum == rop.SETARRAYITEM_RAW or
-    ///             opnum == rop.SETINTERIORFIELD_RAW or
-    ///             opnum == rop.RECORD_EXACT_CLASS or
-    ///             opnum == rop.RAW_STORE or
-    ///             opnum == rop.ASSERT_NOT_NONE or
-    ///             opnum == rop.RECORD_EXACT_CLASS or
-    ///             opnum == rop.RECORD_EXACT_VALUE_I or
-    ///             opnum == rop.RECORD_EXACT_VALUE_R):
-    ///             return True
-    ///         if (rop._OVF_FIRST <= opnum <= rop._OVF_LAST or
-    ///             rop._NOSIDEEFFECT_FIRST <= opnum <= rop._NOSIDEEFFECT_LAST or
-    ///             rop._GUARD_FIRST <= opnum <= rop._GUARD_LAST):
-    ///             return True
-    ///         return False
+    /// ```text
+    ///  def clear_caches_not_necessary(self, opnum, descr):
+    ///      if (opnum == rop.SETFIELD_GC or
+    ///          opnum == rop.SETARRAYITEM_GC or
+    ///          opnum == rop.SETFIELD_RAW or
+    ///          opnum == rop.SETARRAYITEM_RAW or
+    ///          opnum == rop.SETINTERIORFIELD_GC or
+    ///          opnum == rop.COPYSTRCONTENT or
+    ///          opnum == rop.COPYUNICODECONTENT or
+    ///          opnum == rop.STRSETITEM or
+    ///          opnum == rop.UNICODESETITEM or
+    ///          opnum == rop.SETFIELD_RAW or
+    ///          opnum == rop.SETARRAYITEM_RAW or
+    ///          opnum == rop.SETINTERIORFIELD_RAW or
+    ///          opnum == rop.RECORD_EXACT_CLASS or
+    ///          opnum == rop.RAW_STORE or
+    ///          opnum == rop.ASSERT_NOT_NONE or
+    ///          opnum == rop.RECORD_EXACT_CLASS or
+    ///          opnum == rop.RECORD_EXACT_VALUE_I or
+    ///          opnum == rop.RECORD_EXACT_VALUE_R):
+    ///          return True
+    ///      if (rop._OVF_FIRST <= opnum <= rop._OVF_LAST or
+    ///          rop._NOSIDEEFFECT_FIRST <= opnum <= rop._NOSIDEEFFECT_LAST or
+    ///          rop._GUARD_FIRST <= opnum <= rop._GUARD_LAST):
+    ///          return True
+    ///      return False
+    /// ```
     ///
     /// CALL_* opcodes are deliberately NOT in this set — RPython invalidates
     /// caches whenever a residual call runs, since the callee could mutate
@@ -1035,10 +1057,12 @@ impl HeapCache {
 
     /// heapcache.py:378-381 _clear_caches_arraycopy
     ///
-    ///     def _clear_caches_arraycopy(self, opnum, descr, argboxes, effectinfo):
-    ///         self._clear_caches_arrayop(argboxes[1], argboxes[2],
-    ///                                    argboxes[3], argboxes[4], argboxes[5],
-    ///                                    effectinfo)
+    /// ```text
+    ///  def _clear_caches_arraycopy(self, opnum, descr, argboxes, effectinfo):
+    ///      self._clear_caches_arrayop(argboxes[1], argboxes[2],
+    ///                                 argboxes[3], argboxes[4], argboxes[5],
+    ///                                 effectinfo)
+    /// ```
     pub fn _clear_caches_arraycopy(
         &mut self,
         _opnum: OpCode,
@@ -1064,10 +1088,12 @@ impl HeapCache {
 
     /// heapcache.py:383-386 _clear_caches_arraymove
     ///
-    ///     def _clear_caches_arraymove(self, opnum, descr, argboxes, effectinfo):
-    ///         self._clear_caches_arrayop(argboxes[1], argboxes[1],
-    ///                                    argboxes[2], argboxes[3], argboxes[4],
-    ///                                    effectinfo)
+    /// ```text
+    ///  def _clear_caches_arraymove(self, opnum, descr, argboxes, effectinfo):
+    ///      self._clear_caches_arrayop(argboxes[1], argboxes[1],
+    ///                                 argboxes[2], argboxes[3], argboxes[4],
+    ///                                 effectinfo)
+    /// ```
     pub fn _clear_caches_arraymove(
         &mut self,
         _opnum: OpCode,
@@ -1093,21 +1119,23 @@ impl HeapCache {
 
     /// heapcache.py:388-447 _clear_caches_arrayop
     ///
-    ///     def _clear_caches_arrayop(self, source_box, dest_box,
-    ///                               source_start_box, dest_start_box, length_box,
-    ///                               effectinfo):
-    ///         seen_allocation_of_target = self._check_flag(dest_box,
-    ///                                                      HF_SEEN_ALLOCATION)
-    ///         if (isinstance(source_start_box, ConstInt) and
-    ///             isinstance(dest_start_box, ConstInt) and
-    ///             isinstance(length_box, ConstInt) and
-    ///             effectinfo.single_write_descr_array is not None):
-    ///             ...per-index copy from source to dest...
-    ///             return
-    ///         elif effectinfo.single_write_descr_array is not None:
-    ///             ...wholesale clear of dest descr submap...
-    ///             return
-    ///         self.reset_keep_likely_virtuals()
+    /// ```text
+    ///  def _clear_caches_arrayop(self, source_box, dest_box,
+    ///                            source_start_box, dest_start_box, length_box,
+    ///                            effectinfo):
+    ///      seen_allocation_of_target = self._check_flag(dest_box,
+    ///                                                   HF_SEEN_ALLOCATION)
+    ///      if (isinstance(source_start_box, ConstInt) and
+    ///          isinstance(dest_start_box, ConstInt) and
+    ///          isinstance(length_box, ConstInt) and
+    ///          effectinfo.single_write_descr_array is not None):
+    ///          ...per-index copy from source to dest...
+    ///          return
+    ///      elif effectinfo.single_write_descr_array is not None:
+    ///          ...wholesale clear of dest descr submap...
+    ///          return
+    ///      self.reset_keep_likely_virtuals()
+    /// ```
     ///
     /// `const_value` resolves a constant-namespace OpRef to its raw `i64`.
     /// RPython reads `box.getint()` directly from the ConstInt; majit needs
@@ -1337,10 +1365,12 @@ impl HeapCache {
 
     /// heapcache.py:480-483
     ///
-    ///     def nullity_now_known(self, box):
-    ///         if isinstance(box, Const):
-    ///             return
-    ///         self._set_flag(box, HF_KNOWN_NULLITY)
+    /// ```text
+    ///  def nullity_now_known(self, box):
+    ///      if isinstance(box, Const):
+    ///          return
+    ///      self._set_flag(box, HF_KNOWN_NULLITY)
+    /// ```
     ///
     pub fn nullity_now_known(&mut self, opref: OpRef, is_nonnull: bool) {
         if opref.is_constant() {
@@ -1379,14 +1409,16 @@ impl HeapCache {
 
     /// heapcache.py:579-586 arraylen
     ///
-    ///     def arraylen(self, box):
-    ///         if (isinstance(box, RefFrontendOp) and
-    ///             self.test_head_version(box) and
-    ///             box._heapc_deps is not None):
-    ///             res_box = box._heapc_deps[0]
-    ///             if res_box is not None:
-    ///                 return maybe_replace_with_const(res_box)
-    ///         return None
+    /// ```text
+    ///  def arraylen(self, box):
+    ///      if (isinstance(box, RefFrontendOp) and
+    ///          self.test_head_version(box) and
+    ///          box._heapc_deps is not None):
+    ///          res_box = box._heapc_deps[0]
+    ///          if res_box is not None:
+    ///              return maybe_replace_with_const(res_box)
+    ///      return None
+    /// ```
     ///
     pub fn arraylen(&self, array: OpRef) -> Option<OpRef> {
         if array.is_constant() {
@@ -1408,15 +1440,17 @@ impl HeapCache {
 
     /// heapcache.py:588-596 arraylen_now_known
     ///
-    ///     def arraylen_now_known(self, box, lengthbox):
-    ///         # we store in '_heapc_deps' a list of boxes: the *first* box
-    ///         # is the known length or None, and the remaining boxes are
-    ///         # the regular dependencies.
-    ///         if isinstance(box, Const):
-    ///             return
-    ///         deps = self._get_deps(box)
-    ///         assert deps is not None
-    ///         deps[0] = lengthbox
+    /// ```text
+    ///  def arraylen_now_known(self, box, lengthbox):
+    ///      # we store in '_heapc_deps' a list of boxes: the *first* box
+    ///      # is the known length or None, and the remaining boxes are
+    ///      # the regular dependencies.
+    ///      if isinstance(box, Const):
+    ///          return
+    ///      deps = self._get_deps(box)
+    ///      assert deps is not None
+    ///      deps[0] = lengthbox
+    /// ```
     ///
     pub fn arraylen_now_known(&mut self, array: OpRef, length: OpRef) {
         if array.is_constant() {
@@ -1455,12 +1489,14 @@ impl HeapCache {
 
     /// heapcache.py:629-634 call_loopinvariant_known_result
     ///
-    ///     def call_loopinvariant_known_result(self, allboxes, descr):
-    ///         if self.loop_invariant_descr is not descr:
-    ///             return None
-    ///         if self.loop_invariant_arg0int != allboxes[0].getint():
-    ///             return None
-    ///         return self.loop_invariant_result
+    /// ```text
+    ///  def call_loopinvariant_known_result(self, allboxes, descr):
+    ///      if self.loop_invariant_descr is not descr:
+    ///          return None
+    ///      if self.loop_invariant_arg0int != allboxes[0].getint():
+    ///          return None
+    ///      return self.loop_invariant_result
+    /// ```
     ///
     /// Only ONE result is stored at a time. RPython matches by descr
     /// **identity** and the arg0 **integer value**; majit keys both
@@ -1482,10 +1518,12 @@ impl HeapCache {
 
     /// heapcache.py:636-639 call_loopinvariant_now_known
     ///
-    ///     def call_loopinvariant_now_known(self, allboxes, descr, res):
-    ///         self.loop_invariant_descr = descr
-    ///         self.loop_invariant_arg0int = allboxes[0].getint()
-    ///         self.loop_invariant_result = res
+    /// ```text
+    ///  def call_loopinvariant_now_known(self, allboxes, descr, res):
+    ///      self.loop_invariant_descr = descr
+    ///      self.loop_invariant_arg0int = allboxes[0].getint()
+    ///      self.loop_invariant_result = res
+    /// ```
     pub fn call_loopinvariant_now_known(&mut self, descr_index: u32, arg0_int: i64, result: OpRef) {
         self.loopinvariant_descr = Some(descr_index);
         self.loopinvariant_arg0 = Some(arg0_int);
@@ -1506,22 +1544,24 @@ impl HeapCache {
 
     /// heapcache.py:163-181 reset
     ///
-    ///     def reset(self):
-    ///         # Global reset of all flags. Update both version numbers so
-    ///         # that any access to '_heapc_flags' will be marked as outdated.
-    ///         assert self.head_version < _HF_VERSION_MAX
-    ///         self.head_version += _HF_VERSION_INC
-    ///         self.likely_virtual_version = self.head_version
-    ///         #
-    ///         # heap cache
-    ///         self.heap_cache = {}
-    ///         self.heap_array_cache = {}
-    ///         self.need_guard_not_invalidated = True
-    ///         #
-    ///         # result of one loop invariant call
-    ///         self.loop_invariant_result = None
-    ///         self.loop_invariant_descr = None
-    ///         self.loop_invariant_arg0int = -1
+    /// ```text
+    ///  def reset(self):
+    ///      # Global reset of all flags. Update both version numbers so
+    ///      # that any access to '_heapc_flags' will be marked as outdated.
+    ///      assert self.head_version < _HF_VERSION_MAX
+    ///      self.head_version += _HF_VERSION_INC
+    ///      self.likely_virtual_version = self.head_version
+    ///      #
+    ///      # heap cache
+    ///      self.heap_cache = {}
+    ///      self.heap_array_cache = {}
+    ///      self.need_guard_not_invalidated = True
+    ///      #
+    ///      # result of one loop invariant call
+    ///      self.loop_invariant_result = None
+    ///      self.loop_invariant_descr = None
+    ///      self.loop_invariant_arg0int = -1
+    /// ```
     ///
     pub fn reset(&mut self) {
         assert!(self.head_version < HF_VERSION_MAX);
@@ -1556,13 +1596,15 @@ impl HeapCache {
 
     /// heapcache.py:183-189 reset_keep_likely_virtuals
     ///
-    ///     def reset_keep_likely_virtuals(self):
-    ///         # Update only 'head_version', but 'likely_virtual_version'
-    ///         # remains at its older value.
-    ///         assert self.head_version < _HF_VERSION_MAX
-    ///         self.head_version += _HF_VERSION_INC
-    ///         self.heap_cache = {}
-    ///         self.heap_array_cache = {}
+    /// ```text
+    ///  def reset_keep_likely_virtuals(self):
+    ///      # Update only 'head_version', but 'likely_virtual_version'
+    ///      # remains at its older value.
+    ///      assert self.head_version < _HF_VERSION_MAX
+    ///      self.head_version += _HF_VERSION_INC
+    ///      self.heap_cache = {}
+    ///      self.heap_array_cache = {}
+    /// ```
     ///
     pub fn reset_keep_likely_virtuals(&mut self) {
         assert!(self.head_version < HF_VERSION_MAX);

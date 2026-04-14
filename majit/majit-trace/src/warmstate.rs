@@ -1470,8 +1470,10 @@ impl WarmEnterState {
 
     /// counter.py:239-240 lookup_chain(hash)
     ///
-    ///     def lookup_chain(self, hash):
-    ///         return self.celltable[self._get_index(hash)]
+    /// ```text
+    ///  def lookup_chain(self, hash):
+    ///      return self.celltable[self._get_index(hash)]
+    /// ```
     ///
     /// Returns the head of the chain at `hash`. Walk `.next` to
     /// iterate the chain.
@@ -1481,17 +1483,19 @@ impl WarmEnterState {
 
     /// counter.py:246-256 install_new_cell(hash, newcell)
     ///
-    ///     def install_new_cell(self, hash, newcell):
-    ///         index = self._get_index(hash)
-    ///         cell = self.celltable[index]
-    ///         keep = newcell
-    ///         while cell is not None:
-    ///             nextcell = cell.next
-    ///             if not cell.should_remove_jitcell():
-    ///                 cell.next = keep
-    ///                 keep = cell
-    ///             cell = nextcell
-    ///         self.celltable[index] = keep
+    /// ```text
+    ///  def install_new_cell(self, hash, newcell):
+    ///      index = self._get_index(hash)
+    ///      cell = self.celltable[index]
+    ///      keep = newcell
+    ///      while cell is not None:
+    ///          nextcell = cell.next
+    ///          if not cell.should_remove_jitcell():
+    ///              cell.next = keep
+    ///              keep = cell
+    ///          cell = nextcell
+    ///      self.celltable[index] = keep
+    /// ```
     pub fn install_new_cell(&mut self, hash: u64, newcell: Option<BaseJitCell>) {
         let mut keep = newcell;
         let mut cell_opt = self.cells.remove(&hash);
@@ -1513,9 +1517,11 @@ impl WarmEnterState {
 
     /// counter.py:242-244 cleanup_chain(hash)
     ///
-    ///     def cleanup_chain(self, hash):
-    ///         self.reset(hash)
-    ///         self.install_new_cell(hash, None)
+    /// ```text
+    ///  def cleanup_chain(self, hash):
+    ///      self.reset(hash)
+    ///      self.install_new_cell(hash, None)
+    /// ```
     pub fn cleanup_chain(&mut self, hash: u64) {
         self.counter.reset(hash);
         self.install_new_cell(hash, None);

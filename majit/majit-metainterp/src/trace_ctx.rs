@@ -416,20 +416,22 @@ impl TraceCtx {
     /// pyjitpl.py:3499-3512 `MetaInterp.replace_box(oldbox, newbox)` —
     /// trace-context portion.
     ///
-    ///     def replace_box(self, oldbox, newbox):
-    ///         for frame in self.framestack:
-    ///             frame.replace_active_box_in_frame(oldbox, newbox)
-    ///         boxes = self.virtualref_boxes
-    ///         for i in range(len(boxes)):
-    ///             if boxes[i] is oldbox:
-    ///                 boxes[i] = newbox
-    ///         if (self.jitdriver_sd.virtualizable_info is not None or
-    ///             self.jitdriver_sd.greenfield_info is not None):
-    ///             boxes = self.virtualizable_boxes
-    ///             for i in range(len(boxes)):
-    ///                 if boxes[i] is oldbox:
-    ///                     boxes[i] = newbox
-    ///         self.heapcache.replace_box(oldbox, newbox)
+    /// ```text
+    ///  def replace_box(self, oldbox, newbox):
+    ///      for frame in self.framestack:
+    ///          frame.replace_active_box_in_frame(oldbox, newbox)
+    ///      boxes = self.virtualref_boxes
+    ///      for i in range(len(boxes)):
+    ///          if boxes[i] is oldbox:
+    ///              boxes[i] = newbox
+    ///      if (self.jitdriver_sd.virtualizable_info is not None or
+    ///          self.jitdriver_sd.greenfield_info is not None):
+    ///          boxes = self.virtualizable_boxes
+    ///          for i in range(len(boxes)):
+    ///              if boxes[i] is oldbox:
+    ///                  boxes[i] = newbox
+    ///      self.heapcache.replace_box(oldbox, newbox)
+    /// ```
     ///
     /// pyre splits `MetaInterp.replace_box` across two layers:
     ///
@@ -1102,33 +1104,35 @@ impl TraceCtx {
 
     /// pyjitpl.py:1120-1146 `_nonstandard_virtualizable(pc, box, fielddescr)`.
     ///
-    ///     def _nonstandard_virtualizable(self, pc, box, fielddescr):
-    ///         # returns True if 'box' is actually not the "standard" virtualizable
-    ///         # that is stored in metainterp.virtualizable_boxes[-1]
-    ///         if self.metainterp.heapcache.is_known_nonstandard_virtualizable(box):
-    ///             self.metainterp.staticdata.profiler.count_ops(rop.PTR_EQ, Counters.HEAPCACHED_OPS)
-    ///             return True
-    ///         if box is self.metainterp.forced_virtualizable:
-    ///             self.metainterp.forced_virtualizable = None
-    ///         if (self.metainterp.jitdriver_sd.virtualizable_info is not None or
-    ///             self.metainterp.jitdriver_sd.greenfield_info is not None):
-    ///             standard_box = self.metainterp.virtualizable_boxes[-1]
-    ///             if standard_box is box:
-    ///                 return False
-    ///             vinfo = self.metainterp.jitdriver_sd.virtualizable_info
-    ///             if vinfo is fielddescr.get_vinfo():
-    ///                 eqbox = self.metainterp.execute_and_record(rop.PTR_EQ, None,
-    ///                                                            box, standard_box)
-    ///                 eqbox = self.implement_guard_value(eqbox, pc)
-    ///                 isstandard = eqbox.getint()
-    ///                 if isstandard:
-    ///                     if box.type == 'r':
-    ///                         self.metainterp.replace_box(box, standard_box)
-    ///                     return False
-    ///         if not self.metainterp.heapcache.is_unescaped(box):
-    ///             self.emit_force_virtualizable(fielddescr, box)
-    ///         self.metainterp.heapcache.nonstandard_virtualizables_now_known(box)
-    ///         return True
+    /// ```text
+    ///  def _nonstandard_virtualizable(self, pc, box, fielddescr):
+    ///      # returns True if 'box' is actually not the "standard" virtualizable
+    ///      # that is stored in metainterp.virtualizable_boxes[-1]
+    ///      if self.metainterp.heapcache.is_known_nonstandard_virtualizable(box):
+    ///          self.metainterp.staticdata.profiler.count_ops(rop.PTR_EQ, Counters.HEAPCACHED_OPS)
+    ///          return True
+    ///      if box is self.metainterp.forced_virtualizable:
+    ///          self.metainterp.forced_virtualizable = None
+    ///      if (self.metainterp.jitdriver_sd.virtualizable_info is not None or
+    ///          self.metainterp.jitdriver_sd.greenfield_info is not None):
+    ///          standard_box = self.metainterp.virtualizable_boxes[-1]
+    ///          if standard_box is box:
+    ///              return False
+    ///          vinfo = self.metainterp.jitdriver_sd.virtualizable_info
+    ///          if vinfo is fielddescr.get_vinfo():
+    ///              eqbox = self.metainterp.execute_and_record(rop.PTR_EQ, None,
+    ///                                                         box, standard_box)
+    ///              eqbox = self.implement_guard_value(eqbox, pc)
+    ///              isstandard = eqbox.getint()
+    ///              if isstandard:
+    ///                  if box.type == 'r':
+    ///                      self.metainterp.replace_box(box, standard_box)
+    ///                  return False
+    ///      if not self.metainterp.heapcache.is_unescaped(box):
+    ///          self.emit_force_virtualizable(fielddescr, box)
+    ///      self.metainterp.heapcache.nonstandard_virtualizables_now_known(box)
+    ///      return True
+    /// ```
     ///
     /// In pyre this is the LIVE entry path used by the jitcode machine
     /// (`vable_*_indexed`) at trace time. The pyjitpl::nonstandard_virtualizable
@@ -1255,12 +1259,14 @@ impl TraceCtx {
 
     /// pyjitpl.py:1167-1172 `opimpl_getfield_vable_i(box, fielddescr, pc)`.
     ///
-    ///     def opimpl_getfield_vable_i(self, box, fielddescr, pc):
-    ///         if self._nonstandard_virtualizable(pc, box, fielddescr):
-    ///             return self.opimpl_getfield_gc_i(box, fielddescr)
-    ///         self.metainterp.check_synchronized_virtualizable()
-    ///         index = self._get_virtualizable_field_index(fielddescr)
-    ///         return self.metainterp.virtualizable_boxes[index]
+    /// ```text
+    ///  def opimpl_getfield_vable_i(self, box, fielddescr, pc):
+    ///      if self._nonstandard_virtualizable(pc, box, fielddescr):
+    ///          return self.opimpl_getfield_gc_i(box, fielddescr)
+    ///      self.metainterp.check_synchronized_virtualizable()
+    ///      index = self._get_virtualizable_field_index(fielddescr)
+    ///      return self.metainterp.virtualizable_boxes[index]
+    /// ```
     pub fn vable_getfield_int(&mut self, vable_opref: OpRef, fielddescr: DescrRef) -> OpRef {
         if self.is_nonstandard_virtualizable(vable_opref) {
             // self.opimpl_getfield_gc_i(box, fielddescr)
@@ -1287,13 +1293,15 @@ impl TraceCtx {
 
     /// pyjitpl.py:1188-1199 `_opimpl_setfield_vable(box, valuebox, fielddescr, pc)`.
     ///
-    ///     def _opimpl_setfield_vable(self, box, valuebox, fielddescr, pc):
-    ///         if self._nonstandard_virtualizable(pc, box, fielddescr):
-    ///             return self._opimpl_setfield_gc_any(box, valuebox, fielddescr)
-    ///         index = self._get_virtualizable_field_index(fielddescr)
-    ///         self.metainterp.virtualizable_boxes[index] = valuebox
-    ///         self.metainterp.synchronize_virtualizable()
-    ///         # XXX only the index'th field needs to be synchronized, really
+    /// ```text
+    ///  def _opimpl_setfield_vable(self, box, valuebox, fielddescr, pc):
+    ///      if self._nonstandard_virtualizable(pc, box, fielddescr):
+    ///          return self._opimpl_setfield_gc_any(box, valuebox, fielddescr)
+    ///      index = self._get_virtualizable_field_index(fielddescr)
+    ///      self.metainterp.virtualizable_boxes[index] = valuebox
+    ///      self.metainterp.synchronize_virtualizable()
+    ///      # XXX only the index'th field needs to be synchronized, really
+    /// ```
     pub fn vable_setfield(&mut self, vable_opref: OpRef, fielddescr: DescrRef, value: OpRef) {
         if self.is_nonstandard_virtualizable(vable_opref) {
             // self._opimpl_setfield_gc_any(box, valuebox, fielddescr)
@@ -1324,12 +1332,14 @@ impl TraceCtx {
 
     /// pyjitpl.py:1173-1179 `opimpl_getfield_vable_r(box, fielddescr, pc)`.
     ///
-    ///     def opimpl_getfield_vable_r(self, box, fielddescr, pc):
-    ///         if self._nonstandard_virtualizable(pc, box, fielddescr):
-    ///             return self.opimpl_getfield_gc_r(box, fielddescr)
-    ///         self.metainterp.check_synchronized_virtualizable()
-    ///         index = self._get_virtualizable_field_index(fielddescr)
-    ///         return self.metainterp.virtualizable_boxes[index]
+    /// ```text
+    ///  def opimpl_getfield_vable_r(self, box, fielddescr, pc):
+    ///      if self._nonstandard_virtualizable(pc, box, fielddescr):
+    ///          return self.opimpl_getfield_gc_r(box, fielddescr)
+    ///      self.metainterp.check_synchronized_virtualizable()
+    ///      index = self._get_virtualizable_field_index(fielddescr)
+    ///      return self.metainterp.virtualizable_boxes[index]
+    /// ```
     pub fn vable_getfield_ref(&mut self, vable_opref: OpRef, fielddescr: DescrRef) -> OpRef {
         if self.is_nonstandard_virtualizable(vable_opref) {
             return self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], fielddescr);
@@ -1351,12 +1361,14 @@ impl TraceCtx {
 
     /// pyjitpl.py:1180-1186 `opimpl_getfield_vable_f(box, fielddescr, pc)`.
     ///
-    ///     def opimpl_getfield_vable_f(self, box, fielddescr, pc):
-    ///         if self._nonstandard_virtualizable(pc, box, fielddescr):
-    ///             return self.opimpl_getfield_gc_f(box, fielddescr)
-    ///         self.metainterp.check_synchronized_virtualizable()
-    ///         index = self._get_virtualizable_field_index(fielddescr)
-    ///         return self.metainterp.virtualizable_boxes[index]
+    /// ```text
+    ///  def opimpl_getfield_vable_f(self, box, fielddescr, pc):
+    ///      if self._nonstandard_virtualizable(pc, box, fielddescr):
+    ///          return self.opimpl_getfield_gc_f(box, fielddescr)
+    ///      self.metainterp.check_synchronized_virtualizable()
+    ///      index = self._get_virtualizable_field_index(fielddescr)
+    ///      return self.metainterp.virtualizable_boxes[index]
+    /// ```
     pub fn vable_getfield_float(&mut self, vable_opref: OpRef, fielddescr: DescrRef) -> OpRef {
         if self.is_nonstandard_virtualizable(vable_opref) {
             return self.record_op_with_descr(OpCode::GetfieldGcF, &[vable_opref], fielddescr);
@@ -1398,15 +1410,17 @@ impl TraceCtx {
 
     /// pyjitpl.py:1201-1216 `_get_arrayitem_vable_index(pc, arrayfielddescr, indexbox)`.
     ///
-    ///     def _get_arrayitem_vable_index(self, pc, arrayfielddescr, indexbox):
-    ///         indexbox = self.implement_guard_value(indexbox, pc)
-    ///         vinfo = self.metainterp.jitdriver_sd.virtualizable_info
-    ///         virtualizable_box = self.metainterp.virtualizable_boxes[-1]
-    ///         virtualizable = vinfo.unwrap_virtualizable_box(virtualizable_box)
-    ///         arrayindex = vinfo.array_field_by_descrs[arrayfielddescr]
-    ///         index = indexbox.getint()
-    ///         assert 0 <= index < vinfo.get_array_length(virtualizable, arrayindex)
-    ///         return vinfo.get_index_in_array(virtualizable, arrayindex, index)
+    /// ```text
+    ///  def _get_arrayitem_vable_index(self, pc, arrayfielddescr, indexbox):
+    ///      indexbox = self.implement_guard_value(indexbox, pc)
+    ///      vinfo = self.metainterp.jitdriver_sd.virtualizable_info
+    ///      virtualizable_box = self.metainterp.virtualizable_boxes[-1]
+    ///      virtualizable = vinfo.unwrap_virtualizable_box(virtualizable_box)
+    ///      arrayindex = vinfo.array_field_by_descrs[arrayfielddescr]
+    ///      index = indexbox.getint()
+    ///      assert 0 <= index < vinfo.get_array_length(virtualizable, arrayindex)
+    ///      return vinfo.get_index_in_array(virtualizable, arrayindex, index)
+    /// ```
     fn get_arrayitem_vable_index(
         &mut self,
         index: OpRef,
@@ -1430,14 +1444,16 @@ impl TraceCtx {
     /// pyjitpl.py:1218-1230 `_opimpl_getarrayitem_vable(box, indexbox, fdescr, adescr, pc)`
     /// (int variant via `opimpl_getarrayitem_vable_i = _opimpl_getarrayitem_vable`).
     ///
-    ///     def _opimpl_getarrayitem_vable(self, box, indexbox, fdescr, adescr, pc):
-    ///         if self._nonstandard_virtualizable(pc, box, fdescr):
-    ///             arraybox = self.opimpl_getfield_gc_r(box, fdescr)
-    ///             ...
-    ///             return self.opimpl_getarrayitem_gc_i(arraybox, indexbox, adescr)
-    ///         self.metainterp.check_synchronized_virtualizable()
-    ///         index = self._get_arrayitem_vable_index(pc, fdescr, indexbox)
-    ///         return self.metainterp.virtualizable_boxes[index]
+    /// ```text
+    ///  def _opimpl_getarrayitem_vable(self, box, indexbox, fdescr, adescr, pc):
+    ///      if self._nonstandard_virtualizable(pc, box, fdescr):
+    ///          arraybox = self.opimpl_getfield_gc_r(box, fdescr)
+    ///          ...
+    ///          return self.opimpl_getarrayitem_gc_i(arraybox, indexbox, adescr)
+    ///      self.metainterp.check_synchronized_virtualizable()
+    ///      index = self._get_arrayitem_vable_index(pc, fdescr, indexbox)
+    ///      return self.metainterp.virtualizable_boxes[index]
+    /// ```
     pub fn vable_getarrayitem_int_indexed(
         &mut self,
         vable_opref: OpRef,
@@ -1616,16 +1632,18 @@ impl TraceCtx {
 
     /// pyjitpl.py:1253-1263 `opimpl_arraylen_vable(box, fdescr, adescr, pc)`.
     ///
-    ///     def opimpl_arraylen_vable(self, box, fdescr, adescr, pc):
-    ///         if self._nonstandard_virtualizable(pc, box, fdescr):
-    ///             arraybox = self.opimpl_getfield_gc_r(box, fdescr)
-    ///             return self.opimpl_arraylen_gc(arraybox, adescr)
-    ///         vinfo = self.metainterp.jitdriver_sd.virtualizable_info
-    ///         virtualizable_box = self.metainterp.virtualizable_boxes[-1]
-    ///         virtualizable = vinfo.unwrap_virtualizable_box(virtualizable_box)
-    ///         arrayindex = vinfo.array_field_by_descrs[fdescr]
-    ///         result = vinfo.get_array_length(virtualizable, arrayindex)
-    ///         return ConstInt(result)
+    /// ```text
+    ///  def opimpl_arraylen_vable(self, box, fdescr, adescr, pc):
+    ///      if self._nonstandard_virtualizable(pc, box, fdescr):
+    ///          arraybox = self.opimpl_getfield_gc_r(box, fdescr)
+    ///          return self.opimpl_arraylen_gc(arraybox, adescr)
+    ///      vinfo = self.metainterp.jitdriver_sd.virtualizable_info
+    ///      virtualizable_box = self.metainterp.virtualizable_boxes[-1]
+    ///      virtualizable = vinfo.unwrap_virtualizable_box(virtualizable_box)
+    ///      arrayindex = vinfo.array_field_by_descrs[fdescr]
+    ///      result = vinfo.get_array_length(virtualizable, arrayindex)
+    ///      return ConstInt(result)
+    /// ```
     pub fn vable_arraylen_vable(&mut self, vable_opref: OpRef, fdescr: DescrRef) -> OpRef {
         if self.is_nonstandard_virtualizable(vable_opref) {
             // arraybox = self.opimpl_getfield_gc_r(box, fdescr)

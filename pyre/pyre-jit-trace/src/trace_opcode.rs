@@ -750,22 +750,24 @@ impl MIFrame {
     ///
     /// RPython structure:
     ///
-    ///     def vable_and_vrefs_before_residual_call(self):
-    ///         vrefinfo = self.staticdata.virtualref_info
-    ///         for i in range(1, len(self.virtualref_boxes), 2):
-    ///             vrefbox = self.virtualref_boxes[i]
-    ///             vref = vrefbox.getref_base()
-    ///             vrefinfo.tracing_before_residual_call(vref)
-    ///         #
-    ///         vinfo = self.jitdriver_sd.virtualizable_info
-    ///         if vinfo is not None:
-    ///             virtualizable_box = self.virtualizable_boxes[-1]
-    ///             virtualizable = vinfo.unwrap_virtualizable_box(virtualizable_box)
-    ///             vinfo.tracing_before_residual_call(virtualizable)
-    ///             force_token = self.history.record0(rop.FORCE_TOKEN, ...)
-    ///             self.history.record2(rop.SETFIELD_GC, virtualizable_box,
-    ///                                  force_token, None,
-    ///                                  descr=vinfo.vable_token_descr)
+    /// ```text
+    ///  def vable_and_vrefs_before_residual_call(self):
+    ///      vrefinfo = self.staticdata.virtualref_info
+    ///      for i in range(1, len(self.virtualref_boxes), 2):
+    ///          vrefbox = self.virtualref_boxes[i]
+    ///          vref = vrefbox.getref_base()
+    ///          vrefinfo.tracing_before_residual_call(vref)
+    ///      #
+    ///      vinfo = self.jitdriver_sd.virtualizable_info
+    ///      if vinfo is not None:
+    ///          virtualizable_box = self.virtualizable_boxes[-1]
+    ///          virtualizable = vinfo.unwrap_virtualizable_box(virtualizable_box)
+    ///          vinfo.tracing_before_residual_call(virtualizable)
+    ///          force_token = self.history.record0(rop.FORCE_TOKEN, ...)
+    ///          self.history.record2(rop.SETFIELD_GC, virtualizable_box,
+    ///                               force_token, None,
+    ///                               descr=vinfo.vable_token_descr)
+    /// ```
     ///
     /// Key points:
     ///   1. vref token marking is unconditional (no vinfo check).
