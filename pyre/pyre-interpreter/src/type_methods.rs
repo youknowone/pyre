@@ -123,67 +123,59 @@ pub fn list_method_sort(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     Ok(w_none())
 }
 
-/// PyPy: listobject.py descr_index — list.index(value)
+/// listobject.py:795 `descr_index` — list.index(value[, start[, stop]]).
 pub fn list_method_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() >= 2, "index() takes at least 1 argument");
     let list = args[0];
     let value = args[1];
-    unsafe {
-        let n = w_list_len(list);
-        for i in 0..n {
-            if let Some(item) = w_list_getitem(list, i as i64) {
-                if std::ptr::eq(item, value) {
-                    return Ok(w_int_new(i as i64));
-                }
-                if is_int(item) && is_int(value) && w_int_get_value(item) == w_int_get_value(value)
-                {
-                    return Ok(w_int_new(i as i64));
-                }
-                if is_str(item) && is_str(value) && w_str_get_value(item) == w_str_get_value(value)
-                {
-                    return Ok(w_int_new(i as i64));
-                }
-            }
+    // listobject.py:799 unwrap_spec defaults: w_start=0 / w_stop=sys.maxint.
+    // listobject.py:803 unwrap_start_stop handles negative normalization,
+    // __index__ coercion and TypeError for non-index arguments.
+    let size = unsafe { pyre_object::w_list_len(list) } as i64;
+    let w_start = if args.len() >= 3 {
+        args[2]
+    } else {
+        w_int_new(0)
+    };
+    let w_stop = if args.len() >= 4 {
+        args[3]
+    } else {
+        w_int_new(i64::MAX)
+    };
+    let (start, stop) = crate::sliceobject::unwrap_start_stop(size, w_start, w_stop)?;
+    match crate::listobject::w_list_find_or_count(list, value, start, stop, false)? {
+        crate::listobject::FindOrCountResult::Index(i) => Ok(w_int_new(i)),
+        crate::listobject::FindOrCountResult::NotFound => Err(crate::PyError::new(
+            crate::PyErrorKind::ValueError,
+            // listobject.py:805 `oefmt(space.w_ValueError, "%R is not in list", w_value)`
+            format!("{} is not in list", unsafe {
+                crate::display::py_repr(value)
+            }),
+        )),
+        crate::listobject::FindOrCountResult::Count(_) => {
+            unreachable!("find_or_count with count=false never returns Count")
         }
     }
-    panic!("ValueError: value not in list")
 }
 
-/// PyPy: listobject.py descr_count — list.count(value)
+/// listobject.py:744 `descr_count` — list.count(value)
 pub fn list_method_count(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() >= 2, "count() takes exactly 1 argument");
     let list = args[0];
     let value = args[1];
-    let mut count: i64 = 0;
-    unsafe {
-        let n = w_list_len(list);
-        for i in 0..n {
-            if let Some(item) = w_list_getitem(list, i as i64) {
-                if std::ptr::eq(item, value) {
-                    count += 1;
-                } else if is_int(item)
-                    && is_int(value)
-                    && w_int_get_value(item) == w_int_get_value(value)
-                {
-                    count += 1;
-                }
-            }
+    match crate::listobject::w_list_find_or_count(list, value, 0, i64::MAX, true)? {
+        crate::listobject::FindOrCountResult::Count(n) => Ok(w_int_new(n)),
+        crate::listobject::FindOrCountResult::NotFound => Ok(w_int_new(0)),
+        crate::listobject::FindOrCountResult::Index(_) => {
+            unreachable!("find_or_count with count=true never returns Index")
         }
     }
-    Ok(w_int_new(count))
 }
 
-/// PyPy: listobject.py descr_remove — list.remove(value)
+/// listobject.py:782 `descr_remove` — list.remove(value).
 pub fn list_method_remove(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() >= 2, "remove() takes exactly 1 argument");
-    unsafe {
-        if !pyre_object::listobject::w_list_remove(args[0], args[1]) {
-            return Err(crate::PyError::new(
-                crate::PyErrorKind::ValueError,
-                "list.remove(x): x not in list".to_string(),
-            ));
-        }
-    }
+    crate::listobject::w_list_remove(args[0], args[1])?;
     Ok(w_none())
 }
 

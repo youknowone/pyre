@@ -1254,7 +1254,7 @@ fn builtin_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// PyPy's space.get_and_call_function returns normally or raises;
 /// pyre's call_function stashes errors as PY_NULL. This helper
 /// recovers stashed errors as Result.
-fn call_and_check(
+pub(crate) fn call_and_check(
     method: PyObjectRef,
     args: &[PyObjectRef],
 ) -> Result<PyObjectRef, crate::PyError> {
@@ -1408,7 +1408,7 @@ fn getindex_w_for_base(w_base: PyObjectRef) -> Result<u32, crate::PyError> {
 ///
 /// Return w_obj.__index__() as i64. On overflow, clamp to i64::MAX
 /// (w_exception=None path).
-fn getindex_w(w_obj: PyObjectRef) -> Result<i64, crate::PyError> {
+pub(crate) fn getindex_w(w_obj: PyObjectRef) -> Result<i64, crate::PyError> {
     unsafe {
         if is_int(w_obj) {
             return Ok(w_int_get_value(w_obj));

@@ -1,6 +1,5 @@
 mod codewriter;
 mod frame;
-pub mod liveness;
 pub(crate) mod machine;
 
 pub use codewriter::JitCodeBuilder;
@@ -344,15 +343,6 @@ impl JitCode {
     /// RPython jitcode.py:95-100 `_missing_liveness(self, pc)`.
     pub fn _missing_liveness(&self, pc: usize) -> ! {
         panic!("missing liveness[{}] in JitCode", pc)
-    }
-
-    /// True iff `get_live_vars_info(pc, _)` has liveness data for this pc.
-    /// Used by resume paths to pre-check before calling into
-    /// `consume_one_section`, avoiding `_missing_liveness` panics on
-    /// pyre jitcodes whose translation aborted (e.g. 256-reg overflow)
-    /// and left some pcs without liveness entries.
-    pub fn has_liveness_at(&self, pc: usize) -> bool {
-        self.liveness_offsets.contains_key(&(pc as u32))
     }
 
     /// RPython: `JitCode.follow_jump(position)` -- follow a label at position.

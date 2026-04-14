@@ -2138,9 +2138,13 @@ impl OptContext {
                 *v as i64,
             ));
         }
-        if !matches!(self.opref_type(replaced), Some(majit_ir::Type::Int) | None) {
-            return None;
-        }
+        // optimizer.py:107 second `assert op.type == 'i'` — Box.type is
+        // immutable in RPython, so the replaced op must still be int-typed.
+        assert!(
+            matches!(self.opref_type(replaced), Some(majit_ir::Type::Int) | None),
+            "peek_intbound: replaced OpRef must be int-typed, got {:?}",
+            self.opref_type(replaced)
+        );
         if replaced.is_constant() {
             return None;
         }
@@ -2170,13 +2174,13 @@ impl OptContext {
         if let Some(Value::Int(v)) = self.get_constant(replaced) {
             return crate::optimizeopt::intutils::IntBound::from_constant(*v as i64);
         }
-        if !matches!(self.opref_type(replaced), Some(majit_ir::Type::Int) | None) {
-            // Snapshot dedup may alias an Int inputarg with a Ref vable
-            // box. The bridge optimizer calls getintbound on the Int side,
-            // but get_box_replacement resolves to the Ref side. Return
-            // unbounded — the intbound is not meaningful for Ref values.
-            return crate::optimizeopt::intutils::IntBound::unbounded();
-        }
+        // optimizer.py:110 second `assert op.type == 'i'` — Box.type is
+        // immutable, so the replaced op must still be int-typed.
+        assert!(
+            matches!(self.opref_type(replaced), Some(majit_ir::Type::Int) | None),
+            "getintbound: replaced OpRef must be int-typed, got {:?}",
+            self.opref_type(replaced)
+        );
         if replaced.is_constant() {
             return crate::optimizeopt::intutils::IntBound::unbounded();
         }
@@ -2213,9 +2217,13 @@ impl OptContext {
             self.opref_type(opref)
         );
         let replaced = self.get_box_replacement(opref);
-        if !matches!(self.opref_type(replaced), Some(majit_ir::Type::Int) | None) {
-            return;
-        }
+        // optimizer.py:116 `assert op.type == 'i'` — Box.type is immutable
+        // in RPython, so the replaced op must still be int-typed.
+        assert!(
+            matches!(self.opref_type(replaced), Some(majit_ir::Type::Int) | None),
+            "setintbound: replaced OpRef must be int-typed, got {:?}",
+            self.opref_type(replaced)
+        );
         if replaced.is_constant() || self.get_constant(replaced).is_some() {
             return;
         }
@@ -2268,10 +2276,13 @@ impl OptContext {
             let mut tmp = crate::optimizeopt::intutils::IntBound::from_constant(*v as i64);
             return f(&mut tmp);
         }
-        if !matches!(self.opref_type(replaced), Some(majit_ir::Type::Int) | None) {
-            let mut tmp = crate::optimizeopt::intutils::IntBound::unbounded();
-            return f(&mut tmp);
-        }
+        // optimizer.py:107/110 `assert op.type == 'i'` — Box.type is
+        // immutable, so the replaced op must still be int-typed.
+        assert!(
+            matches!(self.opref_type(replaced), Some(majit_ir::Type::Int) | None),
+            "with_intbound_mut: replaced OpRef must be int-typed, got {:?}",
+            self.opref_type(replaced)
+        );
         if replaced.is_constant() {
             let mut tmp = crate::optimizeopt::intutils::IntBound::unbounded();
             return f(&mut tmp);

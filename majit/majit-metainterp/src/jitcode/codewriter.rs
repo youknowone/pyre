@@ -42,6 +42,7 @@ pub struct JitCodeBuilder {
     num_regs_f: u16,
     constants_i: Vec<i64>,
     constants_r: Vec<i64>,
+    constants_f: Vec<i64>,
     opcodes: Vec<OpCode>,
     labels: Vec<Option<usize>>,
     patches: Vec<(usize, usize)>,
@@ -106,6 +107,20 @@ impl JitCodeBuilder {
     pub fn add_const_r(&mut self, value: i64) -> u16 {
         let index = self.constants_r.len() as u16;
         self.constants_r.push(value);
+        index
+    }
+
+    /// Add a float constant (bits as i64) to the constant pool. Returns pool index.
+    pub fn add_const_f(&mut self, value: i64) -> u16 {
+        if let Some(index) = self
+            .constants_f
+            .iter()
+            .position(|&existing| existing == value)
+        {
+            return index as u16;
+        }
+        let index = self.constants_f.len() as u16;
+        self.constants_f.push(value);
         index
     }
 
@@ -975,7 +990,7 @@ impl JitCodeBuilder {
     // ── Float-typed builder methods ───────────────────────────
 
     pub fn load_const_f_value(&mut self, dst: u16, value: i64) {
-        let const_idx = self.add_const_i(value);
+        let const_idx = self.add_const_f(value);
         self.load_const_f(dst, const_idx);
     }
 
@@ -1158,7 +1173,7 @@ impl JitCodeBuilder {
             c_num_regs_f: self.num_regs_f,
             constants_i: self.constants_i,
             constants_r: self.constants_r,
-            constants_f: Vec::new(),
+            constants_f: self.constants_f,
             liveness: Vec::new(),
             liveness_info: Vec::new(),
             liveness_offsets: std::collections::HashMap::new(),

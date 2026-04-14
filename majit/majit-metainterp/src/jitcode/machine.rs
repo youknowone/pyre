@@ -2366,12 +2366,12 @@ where
                     let const_idx = frame.next_u16() as usize;
                     let value = *frame
                         .jitcode
-                        .constants_i
+                        .constants_f
                         .get(const_idx)
                         .expect("jitcode const index out of bounds");
                     (dst, value)
                 };
-                self.set_float_reg(dst, Some(ctx.const_int(value)), Some(value));
+                self.set_float_reg(dst, Some(ctx.const_float(value)), Some(value));
             }
             BC_POP_F => {
                 let dst = self.frames.current_mut().next_u16() as usize;

@@ -551,54 +551,89 @@ pub unsafe fn w_list_delslice(obj: PyObjectRef, start: usize, end: usize) {
     }
 }
 
-/// Remove first occurrence of `value`. Returns `true` if found and removed.
-pub unsafe fn w_list_remove(obj: PyObjectRef, value: PyObjectRef) -> bool {
-    let list = &mut *(obj as *mut W_ListObject);
+/// Result of the typed fast-path `find_or_count`. Mirrors the
+/// short-circuit return in `IntegerListStrategy.find_or_count`
+/// (listobject.py:1613) and `FloatListStrategy.find_or_count` — when the
+/// strategy + needle type match, the typed pool is scanned in place.
+/// Otherwise `NeedsGeneric` signals that the caller (pyre-interpreter)
+/// must run `ListStrategy.find_or_count`'s generic `space.eq_w` loop.
+pub enum ListFindFast {
+    /// Fast path applicable, item found at this index (find mode).
+    Found(i64),
+    /// Fast path applicable, count matched this many times (count mode).
+    Count(i64),
+    /// Fast path applicable but item not present (find mode).
+    NotFound,
+    /// Strategy/item type mismatch; caller must run generic eq_w loop.
+    NeedsGeneric,
+}
+
+/// Typed fast-path for `W_ListObject.find_or_count`. Handles
+/// `IntegerListStrategy.find_or_count` (listobject.py:1613) and
+/// `FloatListStrategy.find_or_count` (listobject.py:1928) fast paths
+/// only. Callers must handle `NeedsGeneric` via the interpreter-level
+/// `ListStrategy.find_or_count` which runs the `space.eq_w` loop.
+pub unsafe fn w_list_find_or_count_fast(
+    obj: PyObjectRef,
+    w_item: PyObjectRef,
+    start: i64,
+    stop: i64,
+    count: bool,
+) -> ListFindFast {
+    let list = &*(obj as *const W_ListObject);
     match list.strategy {
-        ListStrategy::Object => {
-            let items = list.items.as_slice();
-            for i in 0..items.len() {
-                let item = items[i];
-                let eq = if std::ptr::eq(item, value) {
-                    true
-                } else if is_int(item) && is_int(value) {
-                    w_int_get_value(item) == w_int_get_value(value)
-                } else {
-                    false
-                };
-                if eq {
-                    list.items.remove(i);
-                    return true;
-                }
-            }
-            false
-        }
-        ListStrategy::Integer => {
-            if !value.is_null() && is_int(value) {
-                let target = w_int_get_value(value);
-                let items = list.int_items.as_slice();
-                for i in 0..items.len() {
-                    if items[i] == target {
-                        list.int_items.remove(i);
-                        return true;
+        // listobject.py:1613 IntegerListStrategy.find_or_count: fast path
+        // when `is_plain_int1(w_obj)`, else fall back to generic.
+        ListStrategy::Integer if is_plain_int1(w_item) => {
+            let target = if is_int(w_item) {
+                w_int_get_value(w_item)
+            } else {
+                i64::try_from(w_long_get_value(w_item)).unwrap_or(0)
+            };
+            let items = list.int_items.as_slice();
+            let stop = stop.min(items.len() as i64);
+            let mut result: i64 = 0;
+            let mut i = start.max(0);
+            while i < stop {
+                if items[i as usize] == target {
+                    if count {
+                        result += 1;
+                    } else {
+                        return ListFindFast::Found(i);
                     }
                 }
+                i += 1;
             }
-            false
+            if count {
+                ListFindFast::Count(result)
+            } else {
+                ListFindFast::NotFound
+            }
         }
-        ListStrategy::Float => {
-            if !value.is_null() && is_float(value) {
-                let target = w_float_get_value(value);
-                let items = list.float_items.as_slice();
-                for i in 0..items.len() {
-                    if items[i] == target {
-                        list.float_items.remove(i);
-                        return true;
+        // listobject.py:1928 FloatListStrategy.find_or_count → base.
+        ListStrategy::Float if !w_item.is_null() && is_float(w_item) => {
+            let target = w_float_get_value(w_item);
+            let items = list.float_items.as_slice();
+            let stop = stop.min(items.len() as i64);
+            let mut result: i64 = 0;
+            let mut i = start.max(0);
+            while i < stop {
+                if items[i as usize] == target {
+                    if count {
+                        result += 1;
+                    } else {
+                        return ListFindFast::Found(i);
                     }
                 }
+                i += 1;
             }
-            false
+            if count {
+                ListFindFast::Count(result)
+            } else {
+                ListFindFast::NotFound
+            }
         }
+        _ => ListFindFast::NeedsGeneric,
     }
 }
 
@@ -973,25 +1008,19 @@ mod tests {
     }
 
     #[test]
-    fn test_int_list_remove_stays_integer_strategy() {
-        // W_ListObject.descr_remove (listobject.py:790): find_or_count then pop
+    fn test_int_list_find_or_count_fast_integer_strategy() {
+        // listobject.py:1613 IntegerListStrategy.find_or_count fast path.
         let list = w_list_new(vec![w_int_new(1), w_int_new(2), w_int_new(3)]);
         unsafe {
             assert!(w_list_uses_int_storage(list));
-            assert!(w_list_remove(list, w_int_new(2)));
-            assert!(
-                w_list_uses_int_storage(list),
-                "remove must not switch strategy"
-            );
-            assert_eq!(w_list_len(list), 2);
-            assert_eq!(
-                crate::intobject::w_int_get_value(w_list_getitem(list, 0).unwrap()),
-                1
-            );
-            assert_eq!(
-                crate::intobject::w_int_get_value(w_list_getitem(list, 1).unwrap()),
-                3
-            );
+            match w_list_find_or_count_fast(list, w_int_new(2), 0, i64::MAX, false) {
+                ListFindFast::Found(i) => assert_eq!(i, 1),
+                _ => panic!("expected Found(1)"),
+            }
+            match w_list_find_or_count_fast(list, w_int_new(99), 0, i64::MAX, false) {
+                ListFindFast::NotFound => {}
+                _ => panic!("expected NotFound"),
+            }
         }
     }
 }
