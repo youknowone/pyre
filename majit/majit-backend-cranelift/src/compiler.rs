@@ -6225,38 +6225,14 @@ impl CraneliftBackend {
                     let (a, b) = resolve_binop(&mut builder, &constants, op);
                     let r = builder.ins().imul(a, b);
                     builder.def_var(var(vi), r);
-                    // Check overflow: if b != 0 && r / b != a, then overflow.
-                    // We need to guard against sdiv trap when b == 0.
-                    // Use a conditional: if b == 0, ovf = 0; else ovf = (r/b != a).
-                    let zero = builder.ins().iconst(cl_types::I64, 0);
-                    let b_is_zero = builder.ins().icmp(IntCC::Equal, b, zero);
-
-                    let no_div_block = builder.create_block();
-                    let div_block = builder.create_block();
-                    let merge_block = builder.create_block();
-                    builder.append_block_param(merge_block, cl_types::I64);
-
-                    builder
-                        .ins()
-                        .brif(b_is_zero, no_div_block, &[], div_block, &[]);
-
-                    // b == 0 path: no overflow (result is just 0 * a = 0)
-                    builder.switch_to_block(no_div_block);
-                    builder.seal_block(no_div_block);
-                    let no_ovf = builder.ins().iconst(cl_types::I64, 0);
-                    builder.ins().jump(merge_block, &[BlockArg::from(no_ovf)]);
-
-                    // b != 0 path: check r / b != a
-                    builder.switch_to_block(div_block);
-                    builder.seal_block(div_block);
-                    let div = builder.ins().sdiv(r, b);
-                    let div_ne_a = builder.ins().icmp(IntCC::NotEqual, div, a);
-                    let ovf_ext = builder.ins().uextend(cl_types::I64, div_ne_a);
-                    builder.ins().jump(merge_block, &[BlockArg::from(ovf_ext)]);
-
-                    builder.switch_to_block(merge_block);
-                    builder.seal_block(merge_block);
-                    let ovf = builder.block_params(merge_block)[0];
+                    // x86 IMUL sets OF when the 128-bit signed product doesn't
+                    // fit in 64 bits (assembler.py:1864-1866). Mirror that by
+                    // comparing the high 64 bits against the sign-extension of
+                    // the low 64 bits: ovf <=> smulhi(a,b) != (r >>s 63).
+                    let hi = builder.ins().smulhi(a, b);
+                    let sign = builder.ins().sshr_imm(r, 63);
+                    let differ = builder.ins().icmp(IntCC::NotEqual, hi, sign);
+                    let ovf = builder.ins().uextend(cl_types::I64, differ);
                     last_ovf_flag = Some(ovf);
                 }
                 OpCode::IntAnd => {
