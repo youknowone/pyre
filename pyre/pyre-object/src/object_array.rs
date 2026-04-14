@@ -183,6 +183,57 @@ impl PyObjectArray {
     pub fn swap(&mut self, a: usize, b: usize) {
         self.as_mut_slice().swap(a, b);
     }
+
+    /// Insert `value` at `index`, shifting later elements right.
+    /// Mirrors RPython `AbstractUnwrappedStrategy.insert` (listobject.py:1714):
+    ///   `l.insert(index, self.unwrap(w_item))`
+    pub fn insert(&mut self, index: usize, value: PyObjectRef) {
+        debug_assert!(index <= self.len);
+        if self.len == self.capacity() {
+            if self.heap_cap == 0 {
+                self.grow_to_heap(self.len + 1);
+            } else {
+                self.grow_heap(self.len + 1);
+            }
+        }
+        let len_orig = self.len;
+        unsafe {
+            let ptr = self.ptr;
+            std::ptr::copy(ptr.add(index), ptr.add(index + 1), len_orig - index);
+            *ptr.add(index) = value;
+        }
+        self.len += 1;
+    }
+
+    /// Remove and return the element at `index`, shifting later elements left.
+    /// Mirrors RPython `AbstractUnwrappedStrategy.pop` (listobject.py:1855):
+    ///   `item = l.pop(index)`
+    pub fn remove(&mut self, index: usize) -> PyObjectRef {
+        debug_assert!(index < self.len);
+        let len = self.len;
+        let slice = self.as_mut_slice();
+        let value = slice[index];
+        slice.copy_within(index + 1..len, index);
+        self.len -= 1;
+        value
+    }
+
+    /// Remove and return the last element.
+    /// Mirrors RPython `AbstractUnwrappedStrategy.pop_end` (listobject.py:1848):
+    ///   `return self.wrap(l.pop())`
+    pub fn pop(&mut self) -> PyObjectRef {
+        debug_assert!(self.len > 0);
+        let value = self.as_slice()[self.len - 1];
+        self.len -= 1;
+        value
+    }
+
+    /// Reverse storage in-place.
+    /// Mirrors RPython `AbstractUnwrappedStrategy.reverse` (listobject.py:1880):
+    ///   `self.unerase(w_list.lstorage).reverse()`
+    pub fn reverse(&mut self) {
+        self.as_mut_slice().reverse();
+    }
 }
 
 impl Drop for PyObjectArray {
