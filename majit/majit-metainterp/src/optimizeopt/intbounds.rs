@@ -49,6 +49,14 @@ impl OptIntBounds {
     /// `OptContext::getintbound` is the equivalent. Kept here as a method on
     /// `OptIntBounds` for call-site brevity.
     fn getintbound(&self, opref: OpRef, ctx: &mut OptContext) -> IntBound {
+        // optimizer.py:100: assert op.type == 'i'. When OpRef replacement
+        // chains cross the Int/Ref boundary (snapshot dedup aliasing a
+        // vable Ref slot onto a frame Int slot), return unbounded to avoid
+        // propagating incorrect bounds on non-integer values.
+        let replaced = ctx.get_box_replacement(opref);
+        if !matches!(ctx.opref_type(replaced), Some(majit_ir::Type::Int) | None) {
+            return IntBound::unbounded();
+        }
         ctx.getintbound(opref)
     }
 
