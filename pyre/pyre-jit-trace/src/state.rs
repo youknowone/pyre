@@ -1318,14 +1318,18 @@ pub(crate) fn boxed_slot_i64_for_type(slot_type: Type, raw: i64) -> PyObjectRef 
     }
 }
 
-pub(crate) fn boxed_slot_value_for_type(slot_type: Type, value: &Value) -> PyObjectRef {
-    match (slot_type, value) {
-        (Type::Int, Value::Int(v)) => w_int_new(*v),
-        (Type::Float, Value::Float(v)) => pyre_object::floatobject::w_float_new(*v),
-        (_, Value::Ref(r)) => r.as_usize() as PyObjectRef,
-        (_, Value::Int(v)) => *v as PyObjectRef,
-        (_, Value::Float(v)) => v.to_bits() as PyObjectRef,
-        (_, Value::Void) => PY_NULL,
+/// virtualizable.py:136 `lst[j] = reader.load_next_value_of_type(ARRAYITEMTYPE)`:
+/// pyre's `locals_cells_stack_w` array item type is GCREF, so every write to
+/// a frame slot must produce a boxed PyObjectRef regardless of the label's
+/// argument type (a Body-Label Int OpRef still stores a W_IntObject in the
+/// array). `slot_type` is retained for call-site symmetry but no longer
+/// gates the boxing decision.
+pub(crate) fn boxed_slot_value_for_type(_slot_type: Type, value: &Value) -> PyObjectRef {
+    match value {
+        Value::Int(v) => w_int_new(*v),
+        Value::Float(v) => pyre_object::floatobject::w_float_new(*v),
+        Value::Ref(r) => r.as_usize() as PyObjectRef,
+        Value::Void => PY_NULL,
     }
 }
 
@@ -4938,7 +4942,13 @@ mod tests {
         );
         assert_eq!(state.sym().valuestackdepth, 3);
         assert_eq!(state.sym().symbolic_stack.len(), 2);
-        assert!(state.sym().symbolic_stack.iter().all(|opref| !opref.is_none()));
+        assert!(
+            state
+                .sym()
+                .symbolic_stack
+                .iter()
+                .all(|opref| !opref.is_none())
+        );
     }
 
     #[test]
