@@ -5765,7 +5765,7 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     builder.wire_handler("getarrayitem_vable_f/ridd>f", handler_getarrayitem_vable_f);
     builder.wire_handler("setarrayitem_vable_f/rifdd", handler_setarrayitem_vable_f);
 
-    // Inline call (stub — needs frame-chain)
+    // Inline call
     builder.wire_handler("inline_call_irf_i/dIRF>i", handler_inline_call_irf_i);
     builder.wire_handler("inline_call_irf_r/dIRF>r", handler_inline_call_irf_r);
     builder.wire_handler("inline_call_irf_f/dIRF>f", handler_inline_call_irf_f);
@@ -5777,7 +5777,7 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     builder.wire_handler("inline_call_r_r/dR>r", handler_inline_call_r_r);
     builder.wire_handler("inline_call_r_v/dR", handler_inline_call_r_v);
 
-    // Recursive call (stub — needs portal runner)
+    // Recursive call
     builder.wire_handler("recursive_call_i/cIRFIRF>i", handler_recursive_call_i);
     builder.wire_handler("recursive_call_r/cIRFIRF>r", handler_recursive_call_r);
     builder.wire_handler("recursive_call_f/cIRFIRF>f", handler_recursive_call_f);
@@ -6982,8 +6982,8 @@ fn handler_setlistitem_gc_f(
 // inline_call — RPython blackhole.py:1278-1319
 // RPython: cpu.bh_call_*(adr2int(jitcode.fnaddr), args_i, args_r, args_f, jitcode.calldescr)
 // The 'j' argcode reads a JitCode descriptor carrying fnaddr + calldescr.
-// pyre: fnaddr is stored in BhDescr::JitCode; calldescr not yet modeled.
-// TODO: Full implementation should use jitcode_index for frame-chain push/pop.
+// majit stores the same pair in BhDescr::JitCode and dispatches directly
+// through the backend bh_call_* entry points.
 fn read_inline_call_jitcode(
     bh: &BlackholeInterpreter,
     code: &[u8],

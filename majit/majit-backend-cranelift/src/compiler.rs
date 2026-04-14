@@ -8270,10 +8270,7 @@ impl CraneliftBackend {
                         let runtime_id =
                             gc_runtime_id.ok_or_else(|| missing_gc_runtime(op.opcode))?;
                         let runtime_id = builder.ins().iconst(cl_types::I64, runtime_id as i64);
-                        let size_total = builder.ins().iconst(
-                            cl_types::I64,
-                            op.arg(0).0 as i64,
-                        );
+                        let size_total = builder.ins().iconst(cl_types::I64, op.arg(0).0 as i64);
                         let size = builder.ins().iadd_imm(size_total, -(GcHeader::SIZE as i64));
                         let result = emit_collecting_gc_call(
                             &mut builder,

@@ -19,6 +19,7 @@ pub mod handler_spec;
 pub mod hints;
 pub mod inline;
 pub mod jitcode;
+pub mod layout;
 pub mod liveness;
 pub mod model;
 mod parse;
@@ -27,11 +28,12 @@ pub mod regalloc;
 #[cfg(test)]
 mod test_support;
 
-pub use call::CallDescriptor;
+pub use call::{CallDescriptor, StructFieldLayout, StructLayout};
 pub use front::{
     AstGraphOptions, SemanticFunction, SemanticProgram, build_semantic_program,
     build_semantic_program_from_parsed_files,
 };
+pub use layout::{HeuristicLayoutProvider, LayoutProvider};
 pub use model::{
     Block, BlockId, CallTarget, FunctionGraph, OpKind, SpaceOperation, Terminator, ValueId,
     ValueType,
@@ -117,17 +119,33 @@ pub fn analyze_multiple_pipeline(sources: &[&str]) -> passes::ProgramPipelineRes
 /// Configurable canonical multi-file analysis entry point.
 ///
 /// This is the canonical graph/pipeline translator entry point.
+/// Uses `HeuristicLayoutProvider` for struct layouts (type-string approximation).
 pub fn analyze_multiple_pipeline_with_config(
     sources: &[&str],
     config: &AnalyzeConfig,
 ) -> passes::ProgramPipelineResult {
     let parsed_files: Vec<_> = sources.iter().map(|s| parse::parse_source(s)).collect();
-    analyze_pipeline_from_parsed(&parsed_files, config)
+    analyze_pipeline_from_parsed(&parsed_files, config, None)
+}
+
+/// Multi-file analysis with explicit layout provider.
+///
+/// RPython equivalent: the translator resolves struct layouts via
+/// `symbolic.get_field_token()` / `symbolic.get_size()`. The layout
+/// provider supplies these values. Pass `None` to use the heuristic default.
+pub fn analyze_multiple_pipeline_with_layout(
+    sources: &[&str],
+    config: &AnalyzeConfig,
+    layout_provider: &dyn layout::LayoutProvider,
+) -> passes::ProgramPipelineResult {
+    let parsed_files: Vec<_> = sources.iter().map(|s| parse::parse_source(s)).collect();
+    analyze_pipeline_from_parsed(&parsed_files, config, Some(layout_provider))
 }
 
 fn analyze_pipeline_from_parsed(
     parsed_files: &[parse::ParsedInterpreter],
     config: &AnalyzeConfig,
+    layout_provider: Option<&dyn layout::LayoutProvider>,
 ) -> passes::ProgramPipelineResult {
     let program = front::build_semantic_program_from_parsed_files(parsed_files);
     let mut pipeline = passes::analyze_program(&program, &config.pipeline);
@@ -174,42 +192,25 @@ fn analyze_pipeline_from_parsed(
     call_control.set_known_struct_names(program.known_struct_names.clone());
     // RPython: struct field types for op.args[0].concretetype resolution.
     call_control.set_struct_fields(program.struct_fields.clone());
-    // Heuristic struct layout from type strings — NOT equivalent to RPython's
-    // symbolic.get_field_token / get_size which use actual C-level layout.
-    // The runtime should override via set_struct_layout() with actual offsets.
-    //
-    // Fixed-point iteration: RPython's symbolic.get_size() is order-independent
-    // because it queries the C compiler. Our heuristic depends on known_sizes,
-    // so we iterate until convergence. For depth-N nesting, at most N+1
-    // iterations are needed (each pass fixes at least one more level).
-    // Rust forbids recursive by-value structs, so this always terminates.
-    let mut known_sizes: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
-    loop {
-        let mut changed = false;
-        for (struct_name, fields) in &program.struct_fields.fields {
-            let layout = call::StructLayout::from_type_strings(
-                fields,
-                &std::collections::HashSet::new(),
-                &known_sizes,
+    // RPython: symbolic.get_field_token / get_size — resolve struct layouts
+    // through the LayoutProvider. If no provider is given, use the heuristic
+    // (type-string-based approximation of #[repr(C)] layout).
+    let heuristic;
+    let provider: &dyn layout::LayoutProvider = match layout_provider {
+        Some(p) => p,
+        None => {
+            heuristic = layout::HeuristicLayoutProvider::from_struct_fields(
+                &program.struct_fields.fields,
+                &program.known_struct_names,
             );
-            if known_sizes.get(struct_name) != Some(&layout.size) {
-                known_sizes.insert(struct_name.clone(), layout.size);
-                changed = true;
-            }
+            &heuristic
         }
-        if !changed {
-            break;
+    };
+    // Populate CallControl with layouts from the provider.
+    for struct_name in program.struct_fields.fields.keys() {
+        if let Some(layout) = provider.get_struct_layout(struct_name) {
+            call_control.set_struct_layout(struct_name.clone(), layout);
         }
-    }
-    // Final pass with converged sizes: build StructLayouts for CallControl.
-    for (struct_name, fields) in &program.struct_fields.fields {
-        let layout = call::StructLayout::from_type_strings(
-            fields,
-            &std::collections::HashSet::new(),
-            &known_sizes,
-        );
-        call_control.set_struct_layout(struct_name.clone(), layout);
     }
     for (path, graph) in &canonical_function_graphs {
         call_control.register_function_graph(path.clone(), graph.clone());
