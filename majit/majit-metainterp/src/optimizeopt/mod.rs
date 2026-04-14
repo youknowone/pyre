@@ -2138,11 +2138,9 @@ impl OptContext {
                 *v as i64,
             ));
         }
-        assert!(
-            matches!(self.opref_type(replaced), Some(majit_ir::Type::Int) | None),
-            "peek_intbound: replaced opref must be int or unknown, got {:?}",
-            self.opref_type(replaced)
-        );
+        if !matches!(self.opref_type(replaced), Some(majit_ir::Type::Int) | None) {
+            return None;
+        }
         if replaced.is_constant() {
             return None;
         }
@@ -2172,11 +2170,13 @@ impl OptContext {
         if let Some(Value::Int(v)) = self.get_constant(replaced) {
             return crate::optimizeopt::intutils::IntBound::from_constant(*v as i64);
         }
-        assert!(
-            matches!(self.opref_type(replaced), Some(majit_ir::Type::Int) | None),
-            "getintbound: replaced opref must be int or unknown, got {:?}",
-            self.opref_type(replaced)
-        );
+        if !matches!(self.opref_type(replaced), Some(majit_ir::Type::Int) | None) {
+            // Snapshot dedup may alias an Int inputarg with a Ref vable
+            // box. The bridge optimizer calls getintbound on the Int side,
+            // but get_box_replacement resolves to the Ref side. Return
+            // unbounded — the intbound is not meaningful for Ref values.
+            return crate::optimizeopt::intutils::IntBound::unbounded();
+        }
         if replaced.is_constant() {
             return crate::optimizeopt::intutils::IntBound::unbounded();
         }
@@ -2213,11 +2213,9 @@ impl OptContext {
             self.opref_type(opref)
         );
         let replaced = self.get_box_replacement(opref);
-        assert!(
-            matches!(self.opref_type(replaced), Some(majit_ir::Type::Int) | None),
-            "setintbound: replaced opref must be int or unknown, got {:?}",
-            self.opref_type(replaced)
-        );
+        if !matches!(self.opref_type(replaced), Some(majit_ir::Type::Int) | None) {
+            return;
+        }
         if replaced.is_constant() || self.get_constant(replaced).is_some() {
             return;
         }
@@ -2270,11 +2268,10 @@ impl OptContext {
             let mut tmp = crate::optimizeopt::intutils::IntBound::from_constant(*v as i64);
             return f(&mut tmp);
         }
-        assert!(
-            matches!(self.opref_type(replaced), Some(majit_ir::Type::Int) | None),
-            "with_intbound_mut: replaced opref must be int or unknown, got {:?}",
-            self.opref_type(replaced)
-        );
+        if !matches!(self.opref_type(replaced), Some(majit_ir::Type::Int) | None) {
+            let mut tmp = crate::optimizeopt::intutils::IntBound::unbounded();
+            return f(&mut tmp);
+        }
         if replaced.is_constant() {
             let mut tmp = crate::optimizeopt::intutils::IntBound::unbounded();
             return f(&mut tmp);
