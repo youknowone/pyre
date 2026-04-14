@@ -1692,18 +1692,11 @@ impl PtrInfo {
     }
 
     /// info.py: same_info(other) — whether two PtrInfos describe the same value.
+    /// info.py:71-72: same_info() → `self is other` (identity).
+    /// ConstPtrInfo overrides to compare constant values (info.py:774-777).
     pub fn same_info(&self, other: &PtrInfo) -> bool {
         match (self, other) {
             (PtrInfo::Constant(a), PtrInfo::Constant(b)) => a == b,
-            (PtrInfo::NonNull { .. }, PtrInfo::NonNull { .. }) => true,
-            (PtrInfo::Instance(a), PtrInfo::Instance(b)) => {
-                a.descr.as_ref().map(|d| d.index()) == b.descr.as_ref().map(|d| d.index())
-                    && a.known_class == b.known_class
-            }
-            (PtrInfo::Struct(a), PtrInfo::Struct(b)) => a.descr.index() == b.descr.index(),
-            (PtrInfo::Array(a), PtrInfo::Array(b)) => {
-                a.descr.index() == b.descr.index() && a.lenbound == b.lenbound
-            }
             _ => std::ptr::eq(self, other),
         }
     }
@@ -1873,12 +1866,7 @@ impl PtrInfo {
     /// where `pop` is a PreambleOp wrapper.
     pub fn set_preamble_field(&mut self, field_idx: u32, pop: PreambleOp) {
         // shortpreamble.py:74: assert not opinfo.is_virtual()
-        // RPython never stores PreambleOp on virtual PtrInfo. The struct
-        // was forced by force_box_for_end_of_preamble before export.
-        debug_assert!(
-            !self.is_virtual(),
-            "set_preamble_field on virtual PtrInfo (RPython: assert not opinfo.is_virtual())"
-        );
+        assert!(!self.is_virtual(), "set_preamble_field on virtual");
         match self {
             PtrInfo::Instance(v) => {
                 v.fields.retain(|(k, _)| *k != field_idx);
@@ -1910,6 +1898,8 @@ impl PtrInfo {
     /// Rust keeps these separate from `items` for the same reason as fields:
     /// `PreambleOp` is not an `OpRef`.
     pub fn set_preamble_item(&mut self, index: usize, pop: PreambleOp) {
+        // shortpreamble.py:74: assert not opinfo.is_virtual()
+        assert!(!self.is_virtual(), "set_preamble_item on virtual");
         if let PtrInfo::Array(v) = self {
             if index >= v.items.len() {
                 v.items.resize(index + 1, FieldEntry::Value(OpRef::NONE));
@@ -2062,6 +2052,19 @@ impl PtrInfo {
                 .fields
                 .iter()
                 .map(|(k, v)| (*k, FieldEntry::Value(*v)))
+                .collect(),
+            // info.py:530 ArrayPtrInfo.all_items() returns self._items
+            PtrInfo::Array(v) => v
+                .items
+                .iter()
+                .enumerate()
+                .map(|(i, e)| (i as u32, e.clone()))
+                .collect(),
+            PtrInfo::VirtualArray(v) => v
+                .items
+                .iter()
+                .enumerate()
+                .map(|(i, val)| (i as u32, FieldEntry::Value(*val)))
                 .collect(),
             _ => Vec::new(),
         }
