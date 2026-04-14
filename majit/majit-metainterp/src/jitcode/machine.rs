@@ -2183,21 +2183,13 @@ where
                     let traced = match opcode {
                         BC_CALL_INT => ctx.call_int_typed(trace_ptr, &args, &arg_types),
                         BC_CALL_PURE_INT => {
-                            // pyjitpl.py:1941-1948: record plain CALL, then
-                            // record_result_of_call_pure patches/caches.
                             let patch_pos = ctx.get_trace_position();
                             let plain_op = ctx.call_int_typed(trace_ptr, &args, &arg_types);
                             let func_ref = ctx.const_int(trace_ptr as usize as i64);
                             let mut call_args = vec![func_ref];
                             call_args.extend_from_slice(&args);
-                            // pyjitpl.py:3572: constant_from_op(a) reads the
-                            // concrete runtime value from each Box. Use
-                            // concrete_args (actual execution-time values).
-                            let mut concrete_values =
-                                vec![majit_ir::Value::Int(trace_ptr as usize as i64)];
-                            for &v in &concrete_args {
-                                concrete_values.push(majit_ir::Value::Int(v));
-                            }
+                            let concrete_values =
+                                build_concrete_values(trace_ptr, &concrete_args, &arg_types);
                             ctx.record_result_of_call_pure(
                                 plain_op,
                                 &call_args,
@@ -2332,11 +2324,8 @@ where
                             let func_ref = ctx.const_int(trace_ptr as usize as i64);
                             let mut call_args = vec![func_ref];
                             call_args.extend_from_slice(&args);
-                            let mut concrete_values =
-                                vec![majit_ir::Value::Int(trace_ptr as usize as i64)];
-                            for &v in &concrete_args {
-                                concrete_values.push(majit_ir::Value::Int(v));
-                            }
+                            let concrete_values =
+                                build_concrete_values(trace_ptr, &concrete_args, &arg_types);
                             ctx.record_result_of_call_pure(
                                 plain_op,
                                 &call_args,
@@ -2471,11 +2460,8 @@ where
                             let func_ref = ctx.const_int(trace_ptr as usize as i64);
                             let mut call_args = vec![func_ref];
                             call_args.extend_from_slice(&args);
-                            let mut concrete_values =
-                                vec![majit_ir::Value::Int(trace_ptr as usize as i64)];
-                            for &v in &concrete_args {
-                                concrete_values.push(majit_ir::Value::Int(v));
-                            }
+                            let concrete_values =
+                                build_concrete_values(trace_ptr, &concrete_args, &arg_types);
                             ctx.record_result_of_call_pure(
                                 plain_op,
                                 &call_args,
@@ -2759,6 +2745,31 @@ pub(crate) fn eval_unary_f(opcode: OpCode, value: i64) -> i64 {
         other => panic!("unsupported jitcode float unary op {other:?}"),
     };
     f64::to_bits(result) as i64
+}
+
+/// executor.py:544 constant_from_op — typed Value from raw i64 + Type.
+fn typed_value_from_raw(raw: i64, tp: majit_ir::Type) -> majit_ir::Value {
+    match tp {
+        majit_ir::Type::Int => majit_ir::Value::Int(raw),
+        majit_ir::Type::Ref => majit_ir::Value::Ref(majit_ir::GcRef(raw as usize)),
+        majit_ir::Type::Float => majit_ir::Value::Float(f64::from_bits(raw as u64)),
+        majit_ir::Type::Void => majit_ir::Value::Void,
+    }
+}
+
+/// executor.py:544 parity: build typed concrete_values for call_pure_results key.
+/// First element is func_ptr (always Int), rest use arg_types.
+fn build_concrete_values(
+    func_ptr: *const (),
+    concrete_args: &[i64],
+    arg_types: &[majit_ir::Type],
+) -> Vec<majit_ir::Value> {
+    let mut values = vec![majit_ir::Value::Int(func_ptr as usize as i64)];
+    for (i, &v) in concrete_args.iter().enumerate() {
+        let tp = arg_types.get(i).copied().unwrap_or(majit_ir::Type::Int);
+        values.push(typed_value_from_raw(v, tp));
+    }
+    values
 }
 
 pub(crate) fn call_int_function(func_ptr: *const (), args: &[i64]) -> i64 {
