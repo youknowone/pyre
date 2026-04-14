@@ -780,9 +780,19 @@ impl PyFrame {
     }
 
     /// PyPy-compatible stack index validator.
+    ///
+    /// Asserts both lower and upper bounds: a valid stack write goes to
+    /// `stack_base() <= index < locals_cells_stack_w.len()`. Pyre's
+    /// `PyObjectArray` is allocated with `nlocals + ncells +
+    /// max_stackdepth` slots (pyframe.rs:1091), so writing at or past
+    /// `array_len` overruns the heap buffer — catastrophic in release
+    /// mode, where `PyObjectArray` indexing is unchecked. This guard
+    /// converts the heap overrun into a debug-mode assertion failure
+    /// that surfaces tracer/JIT vsd miscalculations at the source
+    /// rather than as silent malloc corruption later.
     #[inline]
     pub fn _check_stack_index(&self, index: usize) -> bool {
-        index >= self.stack_base()
+        index >= self.stack_base() && index < self.locals_w().len()
     }
 
     /// pyframe.py:313-314 popvalue
