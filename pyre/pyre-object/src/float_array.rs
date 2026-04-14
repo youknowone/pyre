@@ -119,6 +119,104 @@ impl FloatArray {
             &self.inline_buf[..self.len]
         }
     }
+
+    pub fn as_mut_slice(&mut self) -> &mut [f64] {
+        if self.heap_cap > 0 {
+            unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+        } else {
+            &mut self.inline_buf[..self.len]
+        }
+    }
+
+    /// Insert `value` at `index`, shifting later elements right.
+    /// Mirrors RPython `AbstractUnwrappedStrategy.insert` (listobject.py:1714):
+    ///   `l.insert(index, self.unwrap(w_item))`
+    pub fn insert(&mut self, index: usize, value: f64) {
+        debug_assert!(index <= self.len);
+        if self.len == self.capacity() {
+            if self.heap_cap == 0 {
+                self.grow_to_heap(self.len + 1);
+            } else {
+                self.grow_heap(self.len + 1);
+            }
+        }
+        unsafe {
+            let ptr = self.ptr;
+            std::ptr::copy(ptr.add(index), ptr.add(index + 1), self.len - index);
+            *ptr.add(index) = value;
+        }
+        self.len += 1;
+    }
+
+    /// Remove and return the element at `index`, shifting later elements left.
+    /// Mirrors RPython `AbstractUnwrappedStrategy.pop` (listobject.py:1855):
+    ///   `item = l.pop(index)`
+    pub fn remove(&mut self, index: usize) -> f64 {
+        debug_assert!(index < self.len);
+        let len = self.len;
+        let slice = self.as_mut_slice();
+        let value = slice[index];
+        slice.copy_within(index + 1..len, index);
+        self.len -= 1;
+        value
+    }
+
+    /// Remove and return the last element.
+    /// Mirrors RPython `AbstractUnwrappedStrategy.pop_end` (listobject.py:1848):
+    ///   `return self.wrap(l.pop())`
+    pub fn pop(&mut self) -> f64 {
+        debug_assert!(self.len > 0);
+        let value = self.as_slice()[self.len - 1];
+        self.len -= 1;
+        value
+    }
+
+    /// Reverse storage in-place.
+    /// Mirrors RPython `AbstractUnwrappedStrategy.reverse` (listobject.py:1880):
+    ///   `self.unerase(w_list.lstorage).reverse()`
+    pub fn reverse(&mut self) {
+        self.as_mut_slice().reverse();
+    }
+
+    /// Replace `[start .. start+remove_count]` with `new_values` in one pass.
+    /// Mirrors RPython `AbstractUnwrappedStrategy.setslice` (listobject.py:1773-1808)
+    /// step==1 path: `del items[start:start+delta]` + overwrite, O(n).
+    pub fn splice(&mut self, start: usize, remove_count: usize, new_values: &[f64]) {
+        let old_len = self.len;
+        let s = start.min(old_len);
+        let slicelength = remove_count.min(old_len - s);
+        let len2 = new_values.len();
+        let new_len = old_len - slicelength + len2;
+        if len2 > slicelength {
+            if new_len > self.capacity() {
+                if self.heap_cap == 0 {
+                    self.grow_to_heap(new_len);
+                } else {
+                    self.grow_heap(new_len);
+                }
+            }
+            unsafe {
+                std::ptr::copy(
+                    self.ptr.add(s + slicelength),
+                    self.ptr.add(s + len2),
+                    old_len - s - slicelength,
+                );
+            }
+            self.len = new_len;
+        } else if slicelength > len2 {
+            unsafe {
+                std::ptr::copy(
+                    self.ptr.add(s + slicelength),
+                    self.ptr.add(s + len2),
+                    old_len - s - slicelength,
+                );
+            }
+            self.len = new_len;
+        }
+        if len2 > 0 {
+            self.as_mut_slice()[s..s + len2].copy_from_slice(new_values);
+        }
+    }
 }
 
 impl Drop for FloatArray {

@@ -11,6 +11,7 @@ use crate::pyobject::*;
 use crate::{
     FloatArray, IntArray, PyObjectArray, floatobject::w_float_get_value, floatobject::w_float_new,
     intobject::w_int_get_value, intobject::w_int_new, intobject::w_int_small_cached,
+    longobject::w_long_fits_int, longobject::w_long_get_value,
 };
 
 #[repr(u8)]
@@ -34,22 +35,33 @@ pub struct W_ListObject {
     pub float_items: FloatArray,
 }
 
-/// Check if all items are regular (cached) ints that can use IntegerListStrategy.
-/// Unique ints (created by w_int_new_unique for int subclass instances) are excluded
-/// because they may carry per-object attributes that require pointer identity.
-fn all_ints(items: &[PyObjectRef]) -> bool {
-    items.iter().all(|&item| {
-        if item.is_null() || !unsafe { is_int(item) } {
-            return false;
-        }
-        let v = unsafe { w_int_get_value(item) };
-        // If value is in small-int cache range, check pointer identity
+/// `is_plain_int1(w_obj)` — RPython listobject.py:2390.
+/// True if `item` is a plain `int` (exact type W_IntObject, not a bool subclass)
+/// or a W_LongObject whose value fits in a machine-word int.
+///   `type(w_obj) is W_IntObject  OR  (type(w_obj) is W_LongObject AND w_obj._fits_int())`
+#[inline]
+unsafe fn is_plain_int1(item: PyObjectRef) -> bool {
+    if item.is_null() {
+        return false;
+    }
+    if is_int(item) {
+        // W_IntObject: verify not a bool subclass by checking small-int cache identity.
+        let v = w_int_get_value(item);
         if w_int_small_cached(v) {
             std::ptr::eq(item, w_int_new(v))
         } else {
             true
         }
-    })
+    } else if is_long(item) {
+        // W_LongObject: accept if value fits in a machine-word integer.
+        w_long_fits_int(item)
+    } else {
+        false
+    }
+}
+
+fn all_ints(items: &[PyObjectRef]) -> bool {
+    items.iter().all(|&item| unsafe { is_plain_int1(item) })
 }
 
 fn all_floats(items: &[PyObjectRef]) -> bool {
@@ -203,8 +215,14 @@ pub unsafe fn w_list_setitem(obj: PyObjectRef, index: i64, value: PyObjectRef) -
             if idx < 0 || idx >= len {
                 return false;
             }
-            if !value.is_null() && is_int(value) {
-                list.int_items[idx as usize] = w_int_get_value(value);
+            // AbstractUnwrappedStrategy.setitem (listobject.py:1737): plain_int_w (unwrap)
+            if is_plain_int1(value) {
+                let v = if is_int(value) {
+                    w_int_get_value(value)
+                } else {
+                    i64::try_from(w_long_get_value(value)).unwrap_or(0)
+                };
+                list.int_items[idx as usize] = v;
                 true
             } else {
                 switch_to_object_strategy(list);
@@ -235,24 +253,18 @@ pub unsafe fn w_list_setitem(obj: PyObjectRef, index: i64, value: PyObjectRef) -
 pub unsafe fn w_list_append(obj: PyObjectRef, value: PyObjectRef) {
     let list = &mut *(obj as *mut W_ListObject);
     match list.strategy {
+        // AbstractUnwrappedStrategy.append (listobject.py:1695):
+        //   if self.is_correct_type(w_item): l.append(self.unwrap(w_item)); return
+        //   self.switch_to_next_strategy(w_list, w_item); w_list.append(w_item)
         ListStrategy::Object => list.items.push(value),
         ListStrategy::Integer => {
-            if !value.is_null()
-                && is_int(value)
-                && crate::w_int_small_cached(w_int_get_value(value))
-            {
-                // Only use int strategy for cached (non-unique) ints.
-                // Unique ints (from w_int_new_unique) may carry per-object
-                // attributes and must preserve pointer identity.
-                let v = w_int_get_value(value);
-                if std::ptr::eq(value, crate::w_int_new(v)) {
-                    list.int_items.push(v);
+            if is_plain_int1(value) {
+                let v = if is_int(value) {
+                    w_int_get_value(value)
                 } else {
-                    switch_to_object_strategy(list);
-                    list.items.push(value);
-                }
-            } else if !value.is_null() && is_int(value) {
-                list.int_items.push(w_int_get_value(value));
+                    i64::try_from(w_long_get_value(value)).unwrap_or(0)
+                };
+                list.int_items.push(v);
             } else {
                 switch_to_object_strategy(list);
                 list.items.push(value);
@@ -330,31 +342,94 @@ pub unsafe fn rebuild_object_items(list: &mut W_ListObject, items: Vec<PyObjectR
     list.items.fix_ptr();
 }
 
-/// Get a mutable copy of items as Vec (object strategy).
-pub unsafe fn items_to_vec(list: &mut W_ListObject) -> Vec<PyObjectRef> {
-    switch_to_object_strategy(list);
-    list.items.to_vec()
+/// Set a slice of the list: `list[start:end] = new_items` (step=1).
+/// Switches to ObjectStrategy when new_items don't match the current strategy type.
+pub unsafe fn w_list_setslice(
+    obj: PyObjectRef,
+    start: usize,
+    end: usize,
+    new_items: Vec<PyObjectRef>,
+) {
+    let list = &mut *(obj as *mut W_ListObject);
+    // AbstractUnwrappedStrategy.setslice (listobject.py:1749-1808) step==1.
+    match list.strategy {
+        ListStrategy::Integer => {
+            let all_int = new_items.iter().all(|&v| is_plain_int1(v));
+            if all_int {
+                let new_ints: Vec<i64> = new_items
+                    .iter()
+                    .map(|&v| {
+                        if is_int(v) {
+                            w_int_get_value(v)
+                        } else {
+                            i64::try_from(w_long_get_value(v)).unwrap_or(0)
+                        }
+                    })
+                    .collect();
+                let remove_count = end.saturating_sub(start);
+                list.int_items.splice(start, remove_count, &new_ints);
+                return;
+            }
+            switch_to_object_strategy(list);
+        }
+        ListStrategy::Float => {
+            let all_float = new_items.iter().all(|&v| !v.is_null() && is_float(v));
+            if all_float {
+                let new_floats: Vec<f64> =
+                    new_items.iter().map(|&v| w_float_get_value(v)).collect();
+                let remove_count = end.saturating_sub(start);
+                list.float_items.splice(start, remove_count, &new_floats);
+                return;
+            }
+            switch_to_object_strategy(list);
+        }
+        ListStrategy::Object => {}
+    }
+    // Object strategy: splice in-place, O(n)
+    let remove_count = end.saturating_sub(start);
+    list.items.splice(start, remove_count, &new_items);
 }
 
-/// Insert item at index. PyPy: listobject.py descr_insert.
+/// Insert item at index.
 pub unsafe fn w_list_insert(obj: PyObjectRef, index: i64, value: PyObjectRef) {
     let list = &mut *(obj as *mut W_ListObject);
-    let mut items = items_to_vec(list);
-    let len = items.len() as i64;
+    let len = w_list_len(obj) as i64;
     let idx = if index < 0 {
         (index + len).max(0) as usize
     } else {
-        (index as usize).min(items.len())
+        (index as usize).min(len as usize)
     };
-    items.insert(idx, value);
-    rebuild_object_items(list, items);
+    match list.strategy {
+        ListStrategy::Object => list.items.insert(idx, value),
+        ListStrategy::Integer => {
+            if is_plain_int1(value) {
+                let v = if is_int(value) {
+                    w_int_get_value(value)
+                } else {
+                    // W_LongObject that fits in i64 (plain_int_w / _int_w)
+                    i64::try_from(w_long_get_value(value)).unwrap_or(0)
+                };
+                list.int_items.insert(idx, v);
+            } else {
+                switch_to_object_strategy(list);
+                list.items.insert(idx, value);
+            }
+        }
+        ListStrategy::Float => {
+            if !value.is_null() && is_float(value) {
+                list.float_items.insert(idx, w_float_get_value(value));
+            } else {
+                switch_to_object_strategy(list);
+                list.items.insert(idx, value);
+            }
+        }
+    }
 }
 
-/// Remove and return item at index. PyPy: listobject.py descr_pop.
+/// Remove and return item at `index`. Returns `None` if out of bounds.
 pub unsafe fn w_list_pop(obj: PyObjectRef, index: i64) -> Option<PyObjectRef> {
     let list = &mut *(obj as *mut W_ListObject);
-    let mut items = items_to_vec(list);
-    let len = items.len() as i64;
+    let len = w_list_len(obj) as i64;
     if len == 0 {
         return None;
     }
@@ -362,57 +437,169 @@ pub unsafe fn w_list_pop(obj: PyObjectRef, index: i64) -> Option<PyObjectRef> {
     if idx < 0 || idx >= len {
         return None;
     }
-    let removed = items.remove(idx as usize);
-    rebuild_object_items(list, items);
-    Some(removed)
+    let idx = idx as usize;
+    match list.strategy {
+        ListStrategy::Object => Some(list.items.remove(idx)),
+        ListStrategy::Integer => Some(w_int_new(list.int_items.remove(idx))),
+        ListStrategy::Float => Some(w_float_new(list.float_items.remove(idx))),
+    }
 }
 
-/// Clear all items. PyPy: listobject.py descr_clear.
+/// Remove and return last item. Returns `None` if empty.
+pub unsafe fn w_list_pop_end(obj: PyObjectRef) -> Option<PyObjectRef> {
+    let list = &mut *(obj as *mut W_ListObject);
+    match list.strategy {
+        ListStrategy::Object => {
+            if list.items.len() == 0 {
+                return None;
+            }
+            Some(list.items.pop())
+        }
+        ListStrategy::Integer => {
+            if list.int_items.len() == 0 {
+                return None;
+            }
+            Some(w_int_new(list.int_items.pop()))
+        }
+        ListStrategy::Float => {
+            if list.float_items.len() == 0 {
+                return None;
+            }
+            Some(w_float_new(list.float_items.pop()))
+        }
+    }
+}
+
+/// Clear all items.
+/// RPython `W_ListObject.clear` (listobject.py:391) switches to EmptyListStrategy.
+/// Pyre has no EmptyListStrategy, so we keep the **current** strategy and empty its
+/// storage — semantically equivalent for all subsequent operations (append re-fills
+/// the same typed storage; mixed items will switch to ObjectStrategy as needed).
 pub unsafe fn w_list_clear(obj: PyObjectRef) {
     let list = &mut *(obj as *mut W_ListObject);
-    rebuild_object_items(list, Vec::new());
-    list.strategy = ListStrategy::Object;
+    match list.strategy {
+        ListStrategy::Object => {
+            list.items = PyObjectArray::from_vec(Vec::new());
+            list.items.fix_ptr();
+        }
+        ListStrategy::Integer => {
+            list.int_items = IntArray::from_vec(Vec::new());
+            list.int_items.fix_ptr();
+        }
+        ListStrategy::Float => {
+            list.float_items = FloatArray::from_vec(Vec::new());
+            list.float_items.fix_ptr();
+        }
+    }
 }
 
-/// Reverse in place. PyPy: listobject.py descr_reverse.
+/// Reverse in place.
 pub unsafe fn w_list_reverse(obj: PyObjectRef) {
     let list = &mut *(obj as *mut W_ListObject);
-    let mut items = items_to_vec(list);
-    items.reverse();
-    rebuild_object_items(list, items);
+    match list.strategy {
+        ListStrategy::Object => list.items.reverse(),
+        ListStrategy::Integer => list.int_items.reverse(),
+        ListStrategy::Float => list.float_items.reverse(),
+    }
 }
 
-/// Delete a range of items by index range (drain). PyPy: listobject.py list_delslice.
+/// Delete a range of items `[start..end)` in place.
 pub unsafe fn w_list_delslice(obj: PyObjectRef, start: usize, end: usize) {
     let list = &mut *(obj as *mut W_ListObject);
-    let mut items = items_to_vec(list);
-    let len = items.len();
-    let s = start.min(len);
-    let e = end.min(len);
-    if s < e {
-        items.drain(s..e);
+    match list.strategy {
+        ListStrategy::Object => {
+            let len = list.items.len();
+            let s = start.min(len);
+            let e = end.min(len);
+            if s < e {
+                // shift elements left: items[s..len-count] = items[e..len]
+                let count = e - s;
+                let slice = list.items.as_mut_slice();
+                slice.copy_within(e..len, s);
+                // truncate: reduce len by count
+                for _ in 0..count {
+                    list.items.pop();
+                }
+            }
+        }
+        ListStrategy::Integer => {
+            let len = list.int_items.len();
+            let s = start.min(len);
+            let e = end.min(len);
+            if s < e {
+                let count = e - s;
+                let slice = list.int_items.as_mut_slice();
+                slice.copy_within(e..len, s);
+                for _ in 0..count {
+                    list.int_items.pop();
+                }
+            }
+        }
+        ListStrategy::Float => {
+            let len = list.float_items.len();
+            let s = start.min(len);
+            let e = end.min(len);
+            if s < e {
+                let count = e - s;
+                let slice = list.float_items.as_mut_slice();
+                slice.copy_within(e..len, s);
+                for _ in 0..count {
+                    list.float_items.pop();
+                }
+            }
+        }
     }
-    rebuild_object_items(list, items);
 }
 
-/// Remove first occurrence of value. PyPy: listobject.py descr_remove.
+/// Remove first occurrence of `value`. Returns `true` if found and removed.
 pub unsafe fn w_list_remove(obj: PyObjectRef, value: PyObjectRef) -> bool {
     let list = &mut *(obj as *mut W_ListObject);
-    let mut items = items_to_vec(list);
-    for i in 0..items.len() {
-        if std::ptr::eq(items[i], value) {
-            items.remove(i);
-            rebuild_object_items(list, items);
-            return true;
+    match list.strategy {
+        ListStrategy::Object => {
+            let items = list.items.as_slice();
+            for i in 0..items.len() {
+                let item = items[i];
+                let eq = if std::ptr::eq(item, value) {
+                    true
+                } else if is_int(item) && is_int(value) {
+                    w_int_get_value(item) == w_int_get_value(value)
+                } else {
+                    false
+                };
+                if eq {
+                    list.items.remove(i);
+                    return true;
+                }
+            }
+            false
         }
-        if is_int(items[i]) && is_int(value) && w_int_get_value(items[i]) == w_int_get_value(value)
-        {
-            items.remove(i);
-            rebuild_object_items(list, items);
-            return true;
+        ListStrategy::Integer => {
+            if !value.is_null() && is_int(value) {
+                let target = w_int_get_value(value);
+                let items = list.int_items.as_slice();
+                for i in 0..items.len() {
+                    if items[i] == target {
+                        list.int_items.remove(i);
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+        ListStrategy::Float => {
+            if !value.is_null() && is_float(value) {
+                let target = w_float_get_value(value);
+                let items = list.float_items.as_slice();
+                for i in 0..items.len() {
+                    if items[i] == target {
+                        list.float_items.remove(i);
+                        return true;
+                    }
+                }
+            }
+            false
         }
     }
-    false
 }
 
 pub extern "C" fn jit_list_append(list: i64, item: i64) -> i64 {
@@ -605,6 +792,206 @@ mod tests {
             assert_eq!(w_list_len(list), 3);
             let value = w_list_getitem(list, 2).unwrap();
             assert!(crate::pyobject::is_int(value));
+        }
+    }
+
+    // ── per-strategy operation tests ─────────────────────────────────────────
+    // These verify that pop/pop_end/insert/reverse/clear/delslice do NOT
+    // switch to ObjectStrategy when the list is homogeneous (int or float).
+
+    #[test]
+    fn test_int_list_pop_stays_integer_strategy() {
+        // AbstractUnwrappedStrategy.pop (listobject.py:1855)
+        let list = w_list_new(vec![w_int_new(1), w_int_new(2), w_int_new(3)]);
+        unsafe {
+            assert!(w_list_uses_int_storage(list));
+            let popped = w_list_pop(list, 1).unwrap();
+            assert_eq!(crate::intobject::w_int_get_value(popped), 2);
+            assert!(
+                w_list_uses_int_storage(list),
+                "pop must not switch strategy"
+            );
+            assert_eq!(w_list_len(list), 2);
+            assert_eq!(
+                crate::intobject::w_int_get_value(w_list_getitem(list, 0).unwrap()),
+                1
+            );
+            assert_eq!(
+                crate::intobject::w_int_get_value(w_list_getitem(list, 1).unwrap()),
+                3
+            );
+        }
+    }
+
+    #[test]
+    fn test_int_list_pop_end_stays_integer_strategy() {
+        // AbstractUnwrappedStrategy.pop_end (listobject.py:1848)
+        let list = w_list_new(vec![w_int_new(10), w_int_new(20)]);
+        unsafe {
+            assert!(w_list_uses_int_storage(list));
+            let popped = w_list_pop_end(list).unwrap();
+            assert_eq!(crate::intobject::w_int_get_value(popped), 20);
+            assert!(
+                w_list_uses_int_storage(list),
+                "pop_end must not switch strategy"
+            );
+            assert_eq!(w_list_len(list), 1);
+        }
+    }
+
+    #[test]
+    fn test_int_list_insert_stays_integer_strategy() {
+        // AbstractUnwrappedStrategy.insert (listobject.py:1714)
+        let list = w_list_new(vec![w_int_new(1), w_int_new(3)]);
+        unsafe {
+            assert!(w_list_uses_int_storage(list));
+            w_list_insert(list, 1, w_int_new(2));
+            assert!(
+                w_list_uses_int_storage(list),
+                "insert int must not switch strategy"
+            );
+            assert_eq!(w_list_len(list), 3);
+            assert_eq!(
+                crate::intobject::w_int_get_value(w_list_getitem(list, 1).unwrap()),
+                2
+            );
+        }
+    }
+
+    #[test]
+    fn test_int_list_insert_float_switches_to_object() {
+        // AbstractUnwrappedStrategy.switch_to_next_strategy (listobject.py:1720)
+        let list = w_list_new(vec![w_int_new(1), w_int_new(2)]);
+        let fv = crate::floatobject::w_float_new(9.0);
+        unsafe {
+            assert!(w_list_uses_int_storage(list));
+            w_list_insert(list, 1, fv);
+            assert!(w_list_uses_object_storage(list));
+            assert_eq!(w_list_len(list), 3);
+        }
+    }
+
+    #[test]
+    fn test_int_list_reverse_stays_integer_strategy() {
+        // AbstractUnwrappedStrategy.reverse (listobject.py:1880)
+        let list = w_list_new(vec![w_int_new(1), w_int_new(2), w_int_new(3)]);
+        unsafe {
+            assert!(w_list_uses_int_storage(list));
+            w_list_reverse(list);
+            assert!(
+                w_list_uses_int_storage(list),
+                "reverse must not switch strategy"
+            );
+            assert_eq!(
+                crate::intobject::w_int_get_value(w_list_getitem(list, 0).unwrap()),
+                3
+            );
+            assert_eq!(
+                crate::intobject::w_int_get_value(w_list_getitem(list, 2).unwrap()),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn test_int_list_clear_stays_integer_strategy() {
+        // W_ListObject.clear: switches to EmptyListStrategy; here we keep int strategy empty
+        let list = w_list_new(vec![w_int_new(1), w_int_new(2)]);
+        unsafe {
+            assert!(w_list_uses_int_storage(list));
+            w_list_clear(list);
+            assert!(
+                w_list_uses_int_storage(list),
+                "clear must not switch to Object"
+            );
+            assert_eq!(w_list_len(list), 0);
+        }
+    }
+
+    #[test]
+    fn test_int_list_delslice_stays_integer_strategy() {
+        // AbstractUnwrappedStrategy.deleteslice (listobject.py:1815)
+        let list = w_list_new(vec![w_int_new(1), w_int_new(2), w_int_new(3), w_int_new(4)]);
+        unsafe {
+            assert!(w_list_uses_int_storage(list));
+            w_list_delslice(list, 1, 3);
+            assert!(
+                w_list_uses_int_storage(list),
+                "delslice must not switch strategy"
+            );
+            assert_eq!(w_list_len(list), 2);
+            assert_eq!(
+                crate::intobject::w_int_get_value(w_list_getitem(list, 0).unwrap()),
+                1
+            );
+            assert_eq!(
+                crate::intobject::w_int_get_value(w_list_getitem(list, 1).unwrap()),
+                4
+            );
+        }
+    }
+
+    #[test]
+    fn test_float_list_pop_stays_float_strategy() {
+        // AbstractUnwrappedStrategy.pop (listobject.py:1855)
+        let list = w_list_new(vec![
+            crate::floatobject::w_float_new(1.0),
+            crate::floatobject::w_float_new(2.0),
+            crate::floatobject::w_float_new(3.0),
+        ]);
+        unsafe {
+            assert!(w_list_uses_float_storage(list));
+            let popped = w_list_pop(list, 0).unwrap();
+            assert_eq!(crate::floatobject::w_float_get_value(popped), 1.0);
+            assert!(
+                w_list_uses_float_storage(list),
+                "pop must not switch strategy"
+            );
+            assert_eq!(w_list_len(list), 2);
+        }
+    }
+
+    #[test]
+    fn test_float_list_reverse_stays_float_strategy() {
+        // AbstractUnwrappedStrategy.reverse (listobject.py:1880)
+        let list = w_list_new(vec![
+            crate::floatobject::w_float_new(1.0),
+            crate::floatobject::w_float_new(2.0),
+        ]);
+        unsafe {
+            assert!(w_list_uses_float_storage(list));
+            w_list_reverse(list);
+            assert!(
+                w_list_uses_float_storage(list),
+                "reverse must not switch strategy"
+            );
+            assert_eq!(
+                crate::floatobject::w_float_get_value(w_list_getitem(list, 0).unwrap()),
+                2.0
+            );
+        }
+    }
+
+    #[test]
+    fn test_int_list_remove_stays_integer_strategy() {
+        // W_ListObject.descr_remove (listobject.py:790): find_or_count then pop
+        let list = w_list_new(vec![w_int_new(1), w_int_new(2), w_int_new(3)]);
+        unsafe {
+            assert!(w_list_uses_int_storage(list));
+            assert!(w_list_remove(list, w_int_new(2)));
+            assert!(
+                w_list_uses_int_storage(list),
+                "remove must not switch strategy"
+            );
+            assert_eq!(w_list_len(list), 2);
+            assert_eq!(
+                crate::intobject::w_int_get_value(w_list_getitem(list, 0).unwrap()),
+                1
+            );
+            assert_eq!(
+                crate::intobject::w_int_get_value(w_list_getitem(list, 1).unwrap()),
+                3
+            );
         }
     }
 }

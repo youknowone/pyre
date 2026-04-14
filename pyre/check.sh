@@ -176,7 +176,14 @@ run_bench       "nested_loop"    "$BENCH/nested_loop.py"         5       ""     
 run_bench       "raise_catch"   "$BENCH/raise_catch_loop.py"     6
 run_bench       "spectral_norm" "$BENCH/spectral_norm.py"       10      ""       15
 run_bench       "nbody"          "$BENCH/nbody_50k.py"           5       ""       11
-run_bench       "fannkuch"       "$BENCH/fannkuch.py"          5
+run_bench       "fannkuch"       "$BENCH/fannkuch.py"            5
+# list per-strategy ops (Integer strategy stays without boxing on insert/pop/reverse/setslice)
+# PYPYLOG verified: all benchmarks hit guard_class(IntegerListStrategy) + ArrayS 8 ops.
+# pyre is an interpreter (no JIT) so cpython ratio thresholds don't apply; use MAX_SEC.
+run_bench       "list_reverse"   "$BENCH/list_reverse.py"        5       2
+run_bench       "list_pop_append" "$BENCH/list_pop_append.py"    5       2
+run_bench       "list_insert"    "$BENCH/list_insert.py"         5       3
+run_bench       "list_setslice"  "$BENCH/list_setslice.py"       5       2
 
 echo ""
 echo "─────────────────────────────────"

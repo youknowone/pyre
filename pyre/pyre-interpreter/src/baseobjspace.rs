@@ -2655,12 +2655,9 @@ pub fn setitem(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef) -> PyRe
                 };
                 let s = if s < 0 { (len + s).max(0) } else { s.min(len) } as usize;
                 let e = if e < 0 { (len + e).max(0) } else { e.min(len) } as usize;
-                // Replace items[s..e] with the iterable value
+                // Replace items[s..e] with the iterable value.
                 let new_items = crate::builtins::collect_iterable(value)?;
-                let list_obj = &mut *(obj as *mut pyre_object::listobject::W_ListObject);
-                let mut items = pyre_object::listobject::items_to_vec(list_obj);
-                items.splice(s..e, new_items);
-                pyre_object::listobject::rebuild_object_items(list_obj, items);
+                pyre_object::listobject::w_list_setslice(obj, s, e, new_items);
                 return Ok(w_none());
             }
             if !is_int(index) {
