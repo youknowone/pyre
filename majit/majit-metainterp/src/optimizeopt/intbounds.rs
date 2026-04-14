@@ -1423,8 +1423,9 @@ impl Optimization for OptIntBounds {
     /// Dispatches to the correct postprocess_* method based on opcode.
     fn propagate_postprocess(&mut self, op: &Op, ctx: &mut OptContext) {
         match op.opcode {
-            // ── _postprocess_guard_true_false_value ──
-            // intbounds.py:52-58
+            // intbounds.py:52-58 _postprocess_guard_true_false_value
+            //   if op.getarg(0).type == 'i':
+            //       self.propagate_bounds_backward(op.getarg(0))
             OpCode::GuardTrue | OpCode::GuardFalse | OpCode::GuardValue => {
                 let arg0 = ctx.get_box_replacement(op.arg(0));
                 let is_int = ctx
@@ -1432,11 +1433,6 @@ impl Optimization for OptIntBounds {
                     .map_or(true, |t| t == majit_ir::Type::Int);
                 if !is_int {
                     return;
-                }
-                if op.opcode == OpCode::GuardTrue {
-                    self.setintbound(arg0, IntBound::from_constant(1), ctx);
-                } else if op.opcode == OpCode::GuardFalse {
-                    self.setintbound(arg0, IntBound::from_constant(0), ctx);
                 }
                 // intbounds.py:40-50 propagate_bounds_backward
                 let b = self.getintbound(arg0, ctx);

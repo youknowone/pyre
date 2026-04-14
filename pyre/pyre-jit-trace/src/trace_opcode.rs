@@ -1039,22 +1039,9 @@ impl MIFrame {
         // pyjitpl.py:2973: at a merge point, next_instr should be the TARGET
         // PC, not the last bytecode's orgpc. flush_to_frame sets
         // vable_next_instr from orgpc; override it here.
-        //
-        // RPython note: virtualizable.py:86-98 read_boxes reads the FULL
-        // locals_cells_stack_w[*] array (fixed size = nlocals + ncells +
-        // co_stacksize). pyre uses split symbolic_locals / symbolic_stack
-        // with dynamic sizes. The root trace label was compiled with
-        // stack_only=0 at function entry; bridge JUMPs must match that
-        // contract by clearing stale stack state. Full-array parity
-        // requires changing label creation to always include the full
-        // array — tracked as a separate effort.
         if let Some(pc) = target_pc {
             let s = self.sym_mut();
             s.vable_next_instr = ctx.const_int(pc as i64);
-            s.valuestackdepth = s.nlocals;
-            s.vable_valuestackdepth = ctx.const_int(s.nlocals as i64);
-            s.symbolic_stack.clear();
-            s.symbolic_stack_types.clear();
         }
         // If nlocals was lost (e.g., inline tracing reset symbolic_initialized),
         // re-derive from concrete frame. RPython keeps virtualizable_boxes in
