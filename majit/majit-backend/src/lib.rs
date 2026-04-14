@@ -650,6 +650,10 @@ pub struct JitCellToken {
     /// virtualizable.py:86 read_boxes: number of scalar inputargs
     /// (frame + static fields). First local is at this index.
     pub num_scalar_inputargs: usize,
+    /// warmspot.py / rewrite.py parity: JitDriverSD.index_of_virtualizable.
+    /// Index inside the original CALL_ASSEMBLER arglist before rewrite
+    /// collapses it to `[frame]` or `[frame, virtualizable]`.
+    pub virtualizable_arg_index: Option<usize>,
     /// Backend-specific compiled data.
     pub compiled: Option<Box<dyn std::any::Any + Send>>,
     /// Flag indicating whether the compiled code has been invalidated.
@@ -703,6 +707,7 @@ impl JitCellToken {
             green_key: 0,
             inputarg_types: Vec::new(),
             num_scalar_inputargs: 0,
+            virtualizable_arg_index: None,
             compiled: None,
             invalidated: Arc::new(AtomicBool::new(false)),
             version_info: None,
