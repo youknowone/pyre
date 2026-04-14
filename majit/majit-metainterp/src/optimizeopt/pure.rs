@@ -1093,6 +1093,19 @@ impl Optimization for OptPure {
         // (the condition value). pure.py: optimize_COND_CALL_VALUE_I.
         if op.opcode.is_cond_call_value() {
             let op_descr_index = op.descr.as_ref().map(|d| d.index());
+            let key = PureOpKey {
+                opcode: OpCode::call_pure_for_type(op.result_type()),
+                args: op.args[1..].to_vec(),
+                descr_index: op_descr_index,
+            };
+
+            if let Some(cached_ref) = self.lookup_pure(&key) {
+                let cached_ref = ctx.get_box_replacement(cached_ref);
+                ctx.replace_op(op.pos, cached_ref);
+                self.last_emitted_was_removed = true;
+                return OptimizationResult::Remove;
+            }
+
             for &pos in &self.call_pure_positions {
                 if let Some(old_op) = ctx.new_operations.get(pos) {
                     let old_descr_index = old_op.descr.as_ref().map(|d| d.index());
@@ -1137,12 +1150,6 @@ impl Optimization for OptPure {
                     return OptimizationResult::Remove;
                 }
             }
-
-            let key = PureOpKey {
-                opcode: OpCode::call_pure_for_type(op.result_type()),
-                args: op.args[1..].to_vec(),
-                descr_index: op_descr_index,
-            };
             if let Some(result_ref) = self.lookup_known_result(&key) {
                 let result_ref = ctx.get_box_replacement(result_ref);
                 ctx.replace_op(op.pos, result_ref);
@@ -1150,6 +1157,7 @@ impl Optimization for OptPure {
                 return OptimizationResult::Remove;
             }
 
+            self.cache.insert(key, op.pos);
             self.call_pure_positions.push(ctx.new_operations.len());
             // Unlike CALL_PURE, COND_CALL_VALUE is NOT demoted — emit as-is.
             return OptimizationResult::Emit(op.clone());
