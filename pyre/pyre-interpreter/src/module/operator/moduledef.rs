@@ -176,6 +176,7 @@ pub fn init(ns: &mut PyNamespace) {
             Ok(w_bool_from(!crate::baseobjspace::is_true(args[0])))
         }),
     );
+    // interp_operator.py:138
     namespace_store(
         ns,
         "truth",
