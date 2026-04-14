@@ -115,11 +115,7 @@ impl PyObjectArray {
     pub fn insert(&mut self, index: usize, value: PyObjectRef) {
         debug_assert!(index <= self.len);
         if self.len == self.capacity() {
-            if self.heap_cap == 0 {
-                self.grow_to_heap(self.len + 1);
-            } else {
-                self.grow_heap(self.len + 1);
-            }
+            self.grow(self.len + 1);
         }
         let len_orig = self.len;
         unsafe {
@@ -174,11 +170,7 @@ impl PyObjectArray {
         let new_len = old_len - slicelength + len2;
         if len2 > slicelength {
             if new_len > self.capacity() {
-                if self.heap_cap == 0 {
-                    self.grow_to_heap(new_len);
-                } else {
-                    self.grow_heap(new_len);
-                }
+                self.grow(new_len);
             }
             std::ptr::copy(
                 self.ptr.add(s + slicelength),
@@ -254,8 +246,13 @@ pub struct FixedObjectArray {
 impl FixedObjectArray {
     /// pyframe.py:110: `[None] * size`
     pub fn filled(len: usize, value: PyObjectRef) -> Self {
-        let len = len.max(1);
-        let mut storage = vec![value; len];
+        if len == 0 {
+            return Self {
+                ptr: std::ptr::NonNull::dangling().as_ptr(),
+                len: 0,
+            };
+        }
+        let storage = vec![value; len];
         let mut boxed = storage.into_boxed_slice();
         let ptr = boxed.as_mut_ptr();
         std::mem::forget(boxed);
@@ -263,10 +260,12 @@ impl FixedObjectArray {
     }
 
     pub fn from_vec(values: Vec<PyObjectRef>) -> Self {
-        assert!(
-            !values.is_empty(),
-            "FixedObjectArray: frame array must not be empty"
-        );
+        if values.is_empty() {
+            return Self {
+                ptr: std::ptr::NonNull::dangling().as_ptr(),
+                len: 0,
+            };
+        }
         let mut boxed = values.into_boxed_slice();
         let len = boxed.len();
         let ptr = boxed.as_mut_ptr();

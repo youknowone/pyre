@@ -3384,7 +3384,7 @@ impl MIFrame {
                             ],
                             array_struct_offset:
                                 crate::frame_layout::PYFRAME_LOCALS_CELLS_STACK_OFFSET,
-                            array_ptr_offset: pyre_object::PYOBJECT_ARRAY_PTR_OFFSET,
+                            array_ptr_offset: pyre_object::FIXED_ARRAY_PTR_OFFSET,
                             num_array_items: callee_nlocals,
                             const_overrides,
                             // locals[0] = boxed_arg (CALL_ASSEMBLER arg[1])

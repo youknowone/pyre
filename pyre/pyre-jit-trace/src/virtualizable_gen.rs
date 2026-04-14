@@ -9,7 +9,7 @@ use crate::frame_layout::{
     PYFRAME_NEXT_INSTR_OFFSET, PYFRAME_VABLE_TOKEN_OFFSET, PYFRAME_VALUESTACKDEPTH_OFFSET,
 };
 use crate::state::PyreJitState;
-use pyre_object::{PYOBJECT_ARRAY_LEN_OFFSET, PYOBJECT_ARRAY_PTR_OFFSET};
+use pyre_object::{FIXED_ARRAY_LEN_OFFSET, FIXED_ARRAY_PTR_OFFSET};
 
 majit_macros::virtualizable! {
     state = PyreJitState,
@@ -46,8 +46,8 @@ majit_macros::virtualizable! {
     arrays = {
         locals_cells_stack_w: ref @ PYFRAME_LOCALS_CELLS_STACK_OFFSET {
             embedded,
-            ptr_offset: PYOBJECT_ARRAY_PTR_OFFSET,
-            length_offset: PYOBJECT_ARRAY_LEN_OFFSET,
+            ptr_offset: FIXED_ARRAY_PTR_OFFSET,
+            length_offset: FIXED_ARRAY_LEN_OFFSET,
             items_offset: 0,
         },
     },
