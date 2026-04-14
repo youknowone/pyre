@@ -434,6 +434,45 @@ struct RegisteredLoopTarget {
 unsafe impl Send for RegisteredLoopTarget {}
 unsafe impl Sync for RegisteredLoopTarget {}
 
+// history.py:470-499 TargetToken._ll_loop_code parity.
+// Maps TargetToken descriptor identity (Arc::as_ptr) to the loop entry
+// point needed to re-enter the target from an external JUMP exit.
+// assembler.py:2456-2462 closing_jump reads `target_token._ll_loop_code`
+// directly for cross-loop JMPs; since Cranelift can't emit raw inter-
+// function JMPs, the dispatcher reads this entry and invokes
+// run_compiled_code on the target's code_ptr.
+#[derive(Clone)]
+struct LoopTargetEntry {
+    code_ptr: *const u8,
+    fail_descrs: Vec<Arc<CraneliftFailDescr>>,
+    gc_runtime_id: Option<u64>,
+    num_inputs: usize,
+    num_ref_roots: usize,
+    max_output_slots: usize,
+}
+
+unsafe impl Send for LoopTargetEntry {}
+unsafe impl Sync for LoopTargetEntry {}
+
+static LOOP_TARGET_REGISTRY: OnceLock<Mutex<HashMap<usize, LoopTargetEntry>>> = OnceLock::new();
+
+fn loop_target_registry() -> &'static Mutex<HashMap<usize, LoopTargetEntry>> {
+    LOOP_TARGET_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// history.py:470 TargetToken identity key: Arc allocation address.
+/// Mirrors PyPy's `target_tokens_currently_compiling[descr] = None`
+/// dict keyed by descriptor object identity.
+fn register_loop_target(descr: &majit_ir::DescrRef, entry: LoopTargetEntry) {
+    let key = majit_ir::descr_identity(descr);
+    loop_target_registry().lock().unwrap().insert(key, entry);
+}
+
+fn lookup_loop_target(descr: &majit_ir::DescrRef) -> Option<LoopTargetEntry> {
+    let key = majit_ir::descr_identity(descr);
+    loop_target_registry().lock().unwrap().get(&key).cloned()
+}
+
 fn deadframe_layout(frame: &DeadFrame) -> Option<FailDescrLayout> {
     frame
         .data
@@ -2282,19 +2321,24 @@ pub fn grab_exc_value_from_deadframe(frame: &DeadFrame) -> Result<GcRef, Backend
 }
 
 fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64]) -> DeadFrame {
+    let mut cur_code_ptr = target.code_ptr;
+    let mut cur_fail_descrs = target.fail_descrs.clone();
+    let mut cur_gc_runtime_id = target.gc_runtime_id;
+    let mut cur_num_ref_roots = target.num_ref_roots;
+    let mut cur_max_output_slots = target.max_output_slots;
     let mut current_inputs = inputs.to_vec();
     loop {
         let exec = run_compiled_code(
-            target.code_ptr,
-            &target.fail_descrs,
-            target.gc_runtime_id,
-            target.num_ref_roots,
-            target.max_output_slots,
+            cur_code_ptr,
+            &cur_fail_descrs,
+            cur_gc_runtime_id,
+            cur_num_ref_roots,
+            cur_max_output_slots,
             &current_inputs,
         );
         let fail_index = exec.fail_index;
         let direct_descr = exec.direct_descr.clone();
-        let outputs = exec.extract_outputs(target.max_output_slots.max(1));
+        let outputs = exec.extract_outputs(cur_max_output_slots.max(1));
 
         if let Some(frame) = maybe_take_call_assembler_deadframe(fail_index, &outputs) {
             return wrap_call_assembler_deadframe_with_caller_prefix(
@@ -2309,10 +2353,10 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
         }
 
         let fail_descr_arc =
-            direct_descr.unwrap_or_else(|| target.fail_descrs[fail_index as usize].clone());
+            direct_descr.unwrap_or_else(|| cur_fail_descrs[fail_index as usize].clone());
         let fail_descr = &fail_descr_arc;
         let _fail_count = fail_descr.increment_fail_count();
-        ACTIVE_GC_RUNTIME_ID.with(|c| c.set(target.gc_runtime_id));
+        ACTIVE_GC_RUNTIME_ID.with(|c| c.set(cur_gc_runtime_id));
         let bridge_guard = fail_descr.bridge_ref();
         if let Some(ref bridge) = *bridge_guard {
             if bridge.loop_reentry {
@@ -2328,7 +2372,14 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
                 let _ = bridge_guard;
                 let bridge_descr = get_latest_descr_from_deadframe(&bridge_frame)
                     .expect("bridge deadframe must have descriptor");
-                if bridge_descr.is_finish() {
+                // llgraph/runner.py:1130-1140 Jump exception on external JUMP:
+                // switch to the target loop identified by its TargetToken.
+                // assembler.py:2456-2462 closing_jump parity.
+                if bridge_descr.is_external_jump() {
+                    let target_entry = bridge_descr
+                        .target_descr()
+                        .and_then(lookup_loop_target)
+                        .expect("external JUMP target must be a registered LoopTargetDescr");
                     current_inputs = raw_values_from_deadframe_typed(
                         &bridge_frame,
                         bridge_descr.fail_arg_types(),
@@ -2336,7 +2387,12 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
                     .unwrap_or_else(|err| {
                         panic!("bridge loop-reentry deadframe decode failed: {err}")
                     });
-                    continue; // re-enter loop
+                    cur_code_ptr = target_entry.code_ptr;
+                    cur_fail_descrs = target_entry.fail_descrs;
+                    cur_gc_runtime_id = target_entry.gc_runtime_id;
+                    cur_num_ref_roots = target_entry.num_ref_roots;
+                    cur_max_output_slots = target_entry.max_output_slots;
+                    continue;
                 }
                 return bridge_frame;
             }
@@ -5441,25 +5497,28 @@ impl CraneliftBackend {
             };
             let fail_descr = &fail_descr;
 
+            // llgraph/runner.py:1130-1140 Jump exception caught by execute():
+            // cross-loop JUMP — switch to the target loop trace identified
+            // by the TargetToken stored on the fail descriptor.
+            // assembler.py:2456-2462 closing_jump: raw JMP to
+            // `target_token._ll_loop_code`. Cranelift can't emit inter-
+            // function JMPs, so we return and re-enter the target loop here.
+            if fail_descr.is_external_jump {
+                let target_entry = fail_descr
+                    .target_descr
+                    .as_ref()
+                    .and_then(lookup_loop_target)
+                    .expect("external JUMP target must be a registered LoopTargetDescr");
+                cur_code_ptr = target_entry.code_ptr;
+                cur_fail_descrs = target_entry.fail_descrs;
+                cur_gc_runtime_id = target_entry.gc_runtime_id;
+                cur_num_ref_roots = target_entry.num_ref_roots;
+                cur_max_output_slots = target_entry.max_output_slots;
+                cur_inputs = outputs;
+                continue;
+            }
             // llgraph/runner.py:1200-1201 execute_finish → ExecutionFinished.
             if fail_descr.is_finish {
-                if fail_descr
-                    .is_loop_reentry
-                    .load(std::sync::atomic::Ordering::Acquire)
-                {
-                    // llgraph/runner.py:1130-1140: bridge external JUMP
-                    // back to loop — equivalent to Jump exception caught
-                    // by execute(). Switch back to main loop trace.
-                    cur_code_ptr = compiled.code_ptr;
-                    cur_fail_descrs = compiled.fail_descrs.clone();
-                    cur_gc_runtime_id = compiled.gc_runtime_id;
-                    cur_num_ref_roots = compiled.num_ref_roots;
-                    cur_max_output_slots = compiled.max_output_slots;
-
-                    cur_inputs = outputs;
-
-                    continue;
-                }
                 // Real FINISH — function completed.
                 // jf_savedata already correct in jf_frame memory.
                 // jf_guard_exc already written by emit_guard_exit.
@@ -10331,6 +10390,34 @@ impl CraneliftBackend {
         for descr in &fail_descrs {
             descr.set_trace_info(trace_info.clone());
         }
+        // history.py:470-499 / x86/regalloc.py:1397 / x86/assembler.py:990-993
+        // parity: set TargetToken._ll_loop_code on every Label in this
+        // function, and register the entry in LOOP_TARGET_REGISTRY so that
+        // an external JUMP whose descr is one of these Labels can re-enter
+        // here (assembler.py:2456-2462 closing_jump).
+        // Cranelift can't expose individual block addresses, so we use the
+        // function's code_ptr for every Label in this function — re-entry
+        // re-runs the preamble. PyPy's raw JMP would skip preamble; for
+        // pyre's loops the preamble is just inputarg decoding (idempotent).
+        let entry: LoopTargetEntry = LoopTargetEntry {
+            code_ptr,
+            fail_descrs: fail_descrs.clone(),
+            gc_runtime_id,
+            num_inputs: inputargs.len(),
+            num_ref_roots: ref_root_slots.len(),
+            max_output_slots,
+        };
+        for op in ops.iter() {
+            if op.opcode != OpCode::Label {
+                continue;
+            }
+            if let Some(descr_ref) = op.descr.as_ref() {
+                if let Some(target) = descr_ref.as_loop_target_descr() {
+                    target.set_ll_loop_code(code_ptr as usize);
+                }
+                register_loop_target(descr_ref, entry.clone());
+            }
+        }
         Ok(CompiledLoop {
             trace_id,
             input_types: trace_info.input_types.clone(),
@@ -10760,14 +10847,34 @@ fn collect_guards(
             }
             bits
         };
-        let mut descr = CraneliftFailDescr::new_with_trace_and_kind_and_force_tokens(
-            fail_index,
-            trace_id,
-            fail_arg_types,
-            is_finish || is_external_jump,
-            force_token_slots,
-            recovery_layout,
-        );
+        let mut descr = if is_external_jump {
+            // assembler.py:2456-2462 closing_jump parity: JUMP whose target
+            // TargetToken lives in a different compiled function. The op.descr
+            // is the target TargetToken (history.py:470) — the dispatcher
+            // reads it to re-enter the target via lookup_loop_target.
+            let target_descr = op
+                .descr
+                .as_ref()
+                .cloned()
+                .expect("external JUMP must carry a TargetToken descr");
+            CraneliftFailDescr::new_external_jump(
+                fail_index,
+                trace_id,
+                fail_arg_types,
+                force_token_slots,
+                recovery_layout,
+                target_descr,
+            )
+        } else {
+            CraneliftFailDescr::new_with_trace_and_kind_and_force_tokens(
+                fail_index,
+                trace_id,
+                fail_arg_types,
+                is_finish,
+                force_token_slots,
+                recovery_layout,
+            )
+        };
         let accum_info = if let Some(fd) = op.descr.as_ref().and_then(|d| d.as_fail_descr()) {
             let vi = fd.vector_info();
             descr.vector_info = vi.clone();
@@ -11037,30 +11144,14 @@ impl majit_backend::Backend for CraneliftBackend {
         }
         if let Some(ref sd) = source_descr {
             let bridge_num_inputs = compiled.num_inputs;
-            // Determine loop_reentry before creating BridgeData.
-            let has_label: HashSet<u32> = ops
-                .iter()
-                .filter(|o| o.opcode == OpCode::Label)
-                .filter_map(|o| o.descr.as_ref().map(|d| d.index()))
-                .collect();
-            let is_loop_reentry = ops.last().map_or(false, |op| {
-                op.opcode == OpCode::Jump
-                    && op
-                        .descr
-                        .as_ref()
-                        .map_or(false, |d| !has_label.contains(&d.index()))
-            });
-            // Mark the bridge's Finish descriptors as loop_reentry so
-            // execute_with_inputs can detect them and re-enter the loop.
-            if is_loop_reentry {
-                for descr in &compiled.fail_descrs {
-                    if descr.is_finish {
-                        descr
-                            .is_loop_reentry
-                            .store(true, std::sync::atomic::Ordering::Release);
-                    }
-                }
-            }
+            // history.py:470-499 TargetToken parity: a bridge that ends with
+            // an external JUMP re-enters its target via
+            // `target_descr._ll_loop_code` (stored on the fail_descr at
+            // collect_guards time). BridgeData.loop_reentry caches this for
+            // the `execute_bridge` entry marshaling path; derive it from
+            // the compiled fail_descrs' is_external_jump flag rather than
+            // re-scanning ops + mutating descrs after the fact.
+            let loop_reentry = compiled.fail_descrs.iter().any(|d| d.is_external_jump);
             sd.attach_bridge(BridgeData {
                 trace_id: compiled.trace_id,
                 input_types: compiled.input_types.clone(),
@@ -11071,20 +11162,7 @@ impl majit_backend::Backend for CraneliftBackend {
                 fail_descrs: compiled.fail_descrs,
                 terminal_exit_layouts: compiled.terminal_exit_layouts,
                 gc_runtime_id: compiled.gc_runtime_id,
-                loop_reentry: {
-                    let has_label: HashSet<u32> = ops
-                        .iter()
-                        .filter(|o| o.opcode == OpCode::Label)
-                        .filter_map(|o| o.descr.as_ref().map(|d| d.index()))
-                        .collect();
-                    ops.last().map_or(false, |op| {
-                        op.opcode == OpCode::Jump
-                            && op
-                                .descr
-                                .as_ref()
-                                .map_or(false, |d| !has_label.contains(&d.index()))
-                    })
-                },
+                loop_reentry,
                 num_inputs: bridge_num_inputs,
                 num_ref_roots: compiled.num_ref_roots,
                 max_output_slots: compiled.max_output_slots,

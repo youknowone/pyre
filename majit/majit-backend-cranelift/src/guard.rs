@@ -11,7 +11,7 @@
 use crate::compiler::{register_gc_roots, unregister_gc_roots};
 use majit_backend::{CompiledTraceInfo, ExitRecoveryLayout, FailDescrLayout, TerminalExitLayout};
 use majit_gc::GcMap;
-use majit_ir::{AccumVectorInfo, FailDescr, GcRef, Type};
+use majit_ir::{AccumVectorInfo, DescrRef, FailDescr, GcRef, Type};
 use std::cell::UnsafeCell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -113,10 +113,20 @@ pub struct CraneliftFailDescr {
     pub fail_arg_types: Vec<Type>,
     pub gc_map: GcMap,
     pub is_finish: bool,
-    /// Bridge external JUMP → parent loop: the caller should re-enter
-    /// the parent loop with these fail_arg values as new inputs.
-    /// Set after bridge compilation — uses atomic for interior mutability.
-    pub is_loop_reentry: std::sync::atomic::AtomicBool,
+    /// history.py:470-499 TargetToken parity for cross-loop JUMP.
+    /// True for external JUMP exits (JUMP whose target TargetToken lives in
+    /// a different compiled function). assembler.py:2456-2462 closing_jump
+    /// emits a raw JMP to `target_token._ll_loop_code`. Cranelift can't
+    /// emit raw inter-function JMPs, so the exit returns to the dispatcher
+    /// which reads `target_descr` and re-enters the target loop's code_ptr
+    /// (looked up via `lookup_loop_target`). Mutually exclusive with is_finish.
+    pub is_external_jump: bool,
+    /// The TargetToken descriptor this JUMP targets, used by the dispatcher
+    /// to look up the target loop. Present only when is_external_jump=true.
+    /// (history.py:470 TargetToken — identity is the Arc's allocation address,
+    /// matching PyPy's `target_tokens_currently_compiling[descr] = None` dict
+    /// keyed by descriptor identity.)
+    pub target_descr: Option<DescrRef>,
     pub force_token_slots: Vec<usize>,
     /// Write-once during compilation, read-only after.
     /// No lock — RPython ResumeGuardDescr has no lock (GIL).
@@ -154,6 +164,11 @@ impl std::fmt::Debug for CraneliftFailDescr {
             .field("fail_arg_types", &self.fail_arg_types)
             .field("gc_map", &self.gc_map)
             .field("is_finish", &self.is_finish)
+            .field("is_external_jump", &self.is_external_jump)
+            .field(
+                "target_descr",
+                &self.target_descr.as_ref().map(|d| d.repr()),
+            )
             .field("force_token_slots", &self.force_token_slots)
             .field("trace_info", unsafe { &*self.trace_info.get() })
             .field("recovery_layout", unsafe { &*self.recovery_layout.get() })
@@ -239,7 +254,45 @@ impl CraneliftFailDescr {
             gc_map: Self::gc_map_for_types(&fail_arg_types, &force_token_slots),
             fail_arg_types,
             is_finish,
-            is_loop_reentry: std::sync::atomic::AtomicBool::new(false),
+            is_external_jump: false,
+            target_descr: None,
+            force_token_slots,
+            trace_info: UnsafeCell::new(None),
+            recovery_layout: UnsafeCell::new(recovery_layout),
+            status: std::sync::atomic::AtomicU64::new(0),
+            fail_count: AtomicU32::new(0),
+            vector_info: Vec::new(),
+            bridge: UnsafeCell::new(None),
+            bridge_code_ptr_cache: std::sync::atomic::AtomicUsize::new(0),
+            gc_runtime_id: None,
+        }
+    }
+
+    /// Construct a fail descriptor for an external JUMP exit.
+    /// assembler.py:2456-2462 closing_jump parity: JUMP whose target
+    /// TargetToken lives in a different compiled function. Cranelift can't
+    /// emit raw inter-function JMPs, so the dispatcher receives this descr
+    /// and re-enters the target loop via `lookup_loop_target(target_descr)`.
+    pub fn new_external_jump(
+        fail_index: u32,
+        trace_id: u64,
+        fail_arg_types: Vec<Type>,
+        mut force_token_slots: Vec<usize>,
+        recovery_layout: Option<ExitRecoveryLayout>,
+        target_descr: DescrRef,
+    ) -> Self {
+        force_token_slots.sort_unstable();
+        force_token_slots.dedup();
+        CraneliftFailDescr {
+            fail_index,
+            source_op_index: None,
+            trace_id,
+            green_key: 0,
+            gc_map: Self::gc_map_for_types(&fail_arg_types, &force_token_slots),
+            fail_arg_types,
+            is_finish: false,
+            is_external_jump: true,
+            target_descr: Some(target_descr),
             force_token_slots,
             trace_info: UnsafeCell::new(None),
             recovery_layout: UnsafeCell::new(recovery_layout),
@@ -430,6 +483,14 @@ impl FailDescr for CraneliftFailDescr {
 
     fn is_finish(&self) -> bool {
         self.is_finish
+    }
+
+    fn is_external_jump(&self) -> bool {
+        self.is_external_jump
+    }
+
+    fn target_descr(&self) -> Option<&DescrRef> {
+        self.target_descr.as_ref()
     }
 
     fn trace_id(&self) -> u64 {

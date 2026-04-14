@@ -674,6 +674,21 @@ pub trait FailDescr: Descr {
         false
     }
 
+    /// history.py:470-499 TargetToken parity: whether this exit corresponds
+    /// to an external JUMP whose target lives in a different compiled
+    /// function. Backends that can't emit raw inter-function JMPs (Cranelift)
+    /// flag the exit so the dispatcher re-enters the target via
+    /// `target_descr()`. assembler.py:2456-2462 closing_jump.
+    fn is_external_jump(&self) -> bool {
+        false
+    }
+
+    /// history.py:470 TargetToken descriptor identifying the JUMP target.
+    /// Present only when `is_external_jump()` is true.
+    fn target_descr(&self) -> Option<&DescrRef> {
+        None
+    }
+
     /// history.py:137-139: exits_early()
     /// Is this guard a guard_early_exit or moved before one?
     fn exits_early(&self) -> bool {
