@@ -11,6 +11,7 @@ use crate::pyobject::*;
 use crate::{
     FloatArray, IntArray, PyObjectArray, floatobject::w_float_get_value, floatobject::w_float_new,
     intobject::w_int_get_value, intobject::w_int_new, intobject::w_int_small_cached,
+    longobject::w_long_fits_int, longobject::w_long_get_value,
 };
 
 #[repr(u8)]
@@ -34,20 +35,28 @@ pub struct W_ListObject {
     pub float_items: FloatArray,
 }
 
-/// `is_plain_int1(w_obj)` — RPython listobject.py:2389.
-/// True if `item` is a plain `int` (exact type, not subclass, not long).
+/// `is_plain_int1(w_obj)` — RPython listobject.py:2390.
+/// True if `item` is a plain `int` (exact type W_IntObject, not a bool subclass)
+/// or a W_LongObject whose value fits in a machine-word int.
+///   `type(w_obj) is W_IntObject  OR  (type(w_obj) is W_LongObject AND w_obj._fits_int())`
 #[inline]
 unsafe fn is_plain_int1(item: PyObjectRef) -> bool {
-    if item.is_null() || !is_int(item) {
+    if item.is_null() {
         return false;
     }
-    let v = w_int_get_value(item);
-    // For values in the small-int cache range, verify pointer identity.
-    // A non-matching pointer means w_int_new_unique made a subclass instance.
-    if w_int_small_cached(v) {
-        std::ptr::eq(item, w_int_new(v))
+    if is_int(item) {
+        // W_IntObject: verify not a bool subclass by checking small-int cache identity.
+        let v = w_int_get_value(item);
+        if w_int_small_cached(v) {
+            std::ptr::eq(item, w_int_new(v))
+        } else {
+            true
+        }
+    } else if is_long(item) {
+        // W_LongObject: accept if value fits in a machine-word integer.
+        w_long_fits_int(item)
     } else {
-        true
+        false
     }
 }
 
@@ -206,10 +215,14 @@ pub unsafe fn w_list_setitem(obj: PyObjectRef, index: i64, value: PyObjectRef) -
             if idx < 0 || idx >= len {
                 return false;
             }
-            // AbstractUnwrappedStrategy.setitem (listobject.py:1737):
-            //   if is_correct_type(w_item): l[index] = unwrap(w_item)
+            // AbstractUnwrappedStrategy.setitem (listobject.py:1737): plain_int_w (unwrap)
             if is_plain_int1(value) {
-                list.int_items[idx as usize] = w_int_get_value(value);
+                let v = if is_int(value) {
+                    w_int_get_value(value)
+                } else {
+                    i64::try_from(w_long_get_value(value)).unwrap_or(0)
+                };
+                list.int_items[idx as usize] = v;
                 true
             } else {
                 switch_to_object_strategy(list);
@@ -246,7 +259,12 @@ pub unsafe fn w_list_append(obj: PyObjectRef, value: PyObjectRef) {
         ListStrategy::Object => list.items.push(value),
         ListStrategy::Integer => {
             if is_plain_int1(value) {
-                list.int_items.push(w_int_get_value(value));
+                let v = if is_int(value) {
+                    w_int_get_value(value)
+                } else {
+                    i64::try_from(w_long_get_value(value)).unwrap_or(0)
+                };
+                list.int_items.push(v);
             } else {
                 switch_to_object_strategy(list);
                 list.items.push(value);
@@ -338,7 +356,16 @@ pub unsafe fn w_list_setslice(
         ListStrategy::Integer => {
             let all_int = new_items.iter().all(|&v| is_plain_int1(v));
             if all_int {
-                let new_ints: Vec<i64> = new_items.iter().map(|&v| w_int_get_value(v)).collect();
+                let new_ints: Vec<i64> = new_items
+                    .iter()
+                    .map(|&v| {
+                        if is_int(v) {
+                            w_int_get_value(v)
+                        } else {
+                            i64::try_from(w_long_get_value(v)).unwrap_or(0)
+                        }
+                    })
+                    .collect();
                 let remove_count = end.saturating_sub(start);
                 list.int_items.splice(start, remove_count, &new_ints);
                 return;
@@ -376,7 +403,13 @@ pub unsafe fn w_list_insert(obj: PyObjectRef, index: i64, value: PyObjectRef) {
         ListStrategy::Object => list.items.insert(idx, value),
         ListStrategy::Integer => {
             if is_plain_int1(value) {
-                list.int_items.insert(idx, w_int_get_value(value));
+                let v = if is_int(value) {
+                    w_int_get_value(value)
+                } else {
+                    // W_LongObject that fits in i64 (plain_int_w / _int_w)
+                    i64::try_from(w_long_get_value(value)).unwrap_or(0)
+                };
+                list.int_items.insert(idx, v);
             } else {
                 switch_to_object_strategy(list);
                 list.items.insert(idx, value);

@@ -56,6 +56,15 @@ pub fn box_bigint_constant(value: &BigInt) -> PyObjectRef {
     w_long_new(value.clone())
 }
 
+/// `W_LongObject._fits_int()` — longobject.py:141 / rbigint.fits_int.
+/// True if the value fits in a machine-word integer (i64 on 64-bit).
+/// Used by `is_plain_int1` to accept long objects that are in the int range.
+#[inline]
+pub unsafe fn w_long_fits_int(obj: PyObjectRef) -> bool {
+    let big = w_long_get_value(obj);
+    i64::try_from(big).is_ok()
+}
+
 /// Extract a reference to the BigInt value from a known W_LongObject pointer.
 ///
 /// # Safety
