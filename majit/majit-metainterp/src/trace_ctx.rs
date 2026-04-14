@@ -553,6 +553,11 @@ impl TraceCtx {
     }
 
     /// Get or create a Ref-typed constant OpRef.
+    /// executor.py:544 constant_from_op(op) parity: get typed Value for OpRef.
+    pub fn constants_get_value(&self, opref: OpRef) -> Option<Value> {
+        self.constants.get_value(opref)
+    }
+
     /// RPython parity: Ref constants preserve their type so guard
     /// fail_args are correctly typed during guard failure recovery.
     pub fn const_ref(&mut self, value: i64) -> OpRef {

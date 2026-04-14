@@ -1250,6 +1250,24 @@ fn builtin_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 }
 
 /// `int(obj)` → convert to int
+/// call_function with exception propagation.
+/// PyPy's space.get_and_call_function returns normally or raises;
+/// pyre's call_function stashes errors as PY_NULL. This helper
+/// recovers stashed errors as Result.
+fn call_and_check(
+    method: PyObjectRef,
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, crate::PyError> {
+    let result = crate::call_function(method, args);
+    if result == pyre_object::PY_NULL {
+        if let Some(err) = crate::call::take_call_error() {
+            return Err(err);
+        }
+        return Err(crate::PyError::type_error("call returned NULL"));
+    }
+    Ok(result)
+}
+
 /// intobject.py:989-1050 _new_baseint
 pub(crate) fn builtin_int(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.is_empty() {
@@ -1267,7 +1285,8 @@ pub(crate) fn builtin_int(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         }
         // intobject.py:994: space.lookup(w_value, '__int__')
         if let Some(method) = unsafe { crate::baseobjspace::lookup(obj, "__int__") } {
-            let w_intvalue = crate::call_function(method, &[obj]);
+            // intobject.py:995: w_intvalue = space.int(w_value)
+            let w_intvalue = call_and_check(method, &[obj])?;
             return ensure_baseint_result(w_intvalue, obj);
         }
         // intobject.py:997: space.lookup(w_value, '__trunc__')
@@ -1275,16 +1294,16 @@ pub(crate) fn builtin_int(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             // intobject.py:998-999: DeprecationWarning
             crate::warn::warn_deprecation("The delegation of int() to __trunc__ is deprecated.");
             // intobject.py:1001: w_obj = space.trunc(w_value)
-            let w_obj = crate::call_function(method, &[obj]);
+            let w_obj = call_and_check(method, &[obj])?;
             // intobject.py:1002: if not space.isinstance_w(w_obj, space.w_int)
             if !unsafe { pyre_object::pyobject::is_int_or_long(w_obj) } {
                 // intobject.py:1003-1004: try: w_obj = space.index(w_obj)
                 if let Some(idx_method) = unsafe { crate::baseobjspace::lookup(w_obj, "__index__") }
                 {
-                    let w_indexed = crate::call_function(idx_method, &[w_obj]);
+                    let w_indexed = call_and_check(idx_method, &[w_obj])?;
                     return ensure_baseint_result(w_indexed, obj);
                 }
-                // intobject.py:1008-1011: __trunc__ returned non-Integral (type '%T')
+                // intobject.py:1008-1011
                 return Err(crate::PyError::type_error(
                     "__trunc__ returned non-Integral (type '%T')",
                 ));
@@ -1294,7 +1313,7 @@ pub(crate) fn builtin_int(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         // intobject.py:1015: space.lookup(w_value, '__index__')
         if let Some(method) = unsafe { crate::baseobjspace::lookup(obj, "__index__") } {
             // intobject.py:1016: w_obj = space.index(w_value)
-            let w_obj = crate::call_function(method, &[obj]);
+            let w_obj = call_and_check(method, &[obj])?;
             // intobject.py:1017: if not space.is_w(space.type(w_obj), space.w_int)
             let w_obj_type = crate::typedef::r#type(w_obj);
             if w_obj_type != w_int {
@@ -1402,7 +1421,7 @@ fn getindex_w(w_obj: PyObjectRef) -> Result<i64, crate::PyError> {
         }
         // baseobjspace.py:1568: w_index = self.index(w_obj)
         if let Some(method) = crate::baseobjspace::lookup(w_obj, "__index__") {
-            let w_index = crate::call_function(method, &[w_obj]);
+            let w_index = call_and_check(method, &[w_obj])?;
             if is_int(w_index) {
                 return Ok(w_int_get_value(w_index));
             }

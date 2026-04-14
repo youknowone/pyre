@@ -2177,10 +2177,33 @@ where
                     } else {
                         None
                     };
+                    // pyjitpl.py:1941-1948: CALL_PURE records plain CALL
+                    // first, executes, then patches via record_result_of_call_pure.
+                    let concrete = call_int_function(concrete_ptr, &concrete_args);
                     let traced = match opcode {
                         BC_CALL_INT => ctx.call_int_typed(trace_ptr, &args, &arg_types),
                         BC_CALL_PURE_INT => {
-                            ctx.call_elidable_int_typed(trace_ptr, &args, &arg_types)
+                            let patch_pos = ctx.get_trace_position();
+                            let plain_op = ctx.call_int_typed(trace_ptr, &args, &arg_types);
+                            let func_ref = ctx.const_int(trace_ptr as usize as i64);
+                            let mut call_args = vec![func_ref];
+                            call_args.extend_from_slice(&args);
+                            let concrete_values: Vec<majit_ir::Value> = call_args
+                                .iter()
+                                .map(|a| {
+                                    ctx.constants_get_value(*a)
+                                        .unwrap_or(majit_ir::Value::Int(0))
+                                })
+                                .collect();
+                            ctx.record_result_of_call_pure(
+                                plain_op,
+                                &call_args,
+                                &concrete_values,
+                                crate::call_descr::make_call_descr(&arg_types, majit_ir::Type::Int),
+                                patch_pos,
+                                majit_ir::OpCode::CallI,
+                                majit_ir::Value::Int(concrete),
+                            )
                         }
                         BC_CALL_MAY_FORCE_INT => {
                             ctx.call_may_force_int_typed(trace_ptr, &args, &arg_types)
@@ -2193,7 +2216,6 @@ where
                         }
                         _ => unreachable!(),
                     };
-                    let concrete = call_int_function(concrete_ptr, &concrete_args);
                     if opcode == BC_CALL_MAY_FORCE_INT
                         && matches!(
                             Self::finalize_standard_virtualizable_may_force(ctx, sym, active_vable),
@@ -2298,10 +2320,31 @@ where
                     } else {
                         None
                     };
+                    let concrete = call_int_function(concrete_ptr, &concrete_args);
                     let traced = match opcode {
                         BC_CALL_REF => ctx.call_ref_typed(trace_ptr, &args, &arg_types),
                         BC_CALL_PURE_REF => {
-                            ctx.call_elidable_ref_typed(trace_ptr, &args, &arg_types)
+                            let patch_pos = ctx.get_trace_position();
+                            let plain_op = ctx.call_ref_typed(trace_ptr, &args, &arg_types);
+                            let func_ref = ctx.const_int(trace_ptr as usize as i64);
+                            let mut call_args = vec![func_ref];
+                            call_args.extend_from_slice(&args);
+                            let concrete_values: Vec<majit_ir::Value> = call_args
+                                .iter()
+                                .map(|a| {
+                                    ctx.constants_get_value(*a)
+                                        .unwrap_or(majit_ir::Value::Int(0))
+                                })
+                                .collect();
+                            ctx.record_result_of_call_pure(
+                                plain_op,
+                                &call_args,
+                                &concrete_values,
+                                crate::call_descr::make_call_descr(&arg_types, majit_ir::Type::Ref),
+                                patch_pos,
+                                majit_ir::OpCode::CallR,
+                                majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize)),
+                            )
                         }
                         BC_CALL_MAY_FORCE_REF => {
                             ctx.call_may_force_ref_typed(trace_ptr, &args, &arg_types)
@@ -2314,7 +2357,6 @@ where
                         }
                         _ => unreachable!(),
                     };
-                    let concrete = call_int_function(concrete_ptr, &concrete_args);
                     if opcode == BC_CALL_MAY_FORCE_REF
                         && matches!(
                             Self::finalize_standard_virtualizable_may_force(ctx, sym, active_vable),
@@ -2419,10 +2461,34 @@ where
                     } else {
                         None
                     };
+                    let concrete = call_int_function(concrete_ptr, &concrete_args);
                     let traced = match opcode {
                         BC_CALL_FLOAT => ctx.call_float_typed(trace_ptr, &args, &arg_types),
                         BC_CALL_PURE_FLOAT => {
-                            ctx.call_elidable_float_typed(trace_ptr, &args, &arg_types)
+                            let patch_pos = ctx.get_trace_position();
+                            let plain_op = ctx.call_float_typed(trace_ptr, &args, &arg_types);
+                            let func_ref = ctx.const_int(trace_ptr as usize as i64);
+                            let mut call_args = vec![func_ref];
+                            call_args.extend_from_slice(&args);
+                            let concrete_values: Vec<majit_ir::Value> = call_args
+                                .iter()
+                                .map(|a| {
+                                    ctx.constants_get_value(*a)
+                                        .unwrap_or(majit_ir::Value::Int(0))
+                                })
+                                .collect();
+                            ctx.record_result_of_call_pure(
+                                plain_op,
+                                &call_args,
+                                &concrete_values,
+                                crate::call_descr::make_call_descr(
+                                    &arg_types,
+                                    majit_ir::Type::Float,
+                                ),
+                                patch_pos,
+                                majit_ir::OpCode::CallF,
+                                majit_ir::Value::Float(f64::from_bits(concrete as u64)),
+                            )
                         }
                         BC_CALL_MAY_FORCE_FLOAT => {
                             ctx.call_may_force_float_typed(trace_ptr, &args, &arg_types)
@@ -2435,7 +2501,6 @@ where
                         }
                         _ => unreachable!(),
                     };
-                    let concrete = call_int_function(concrete_ptr, &concrete_args);
                     if opcode == BC_CALL_MAY_FORCE_FLOAT
                         && matches!(
                             Self::finalize_standard_virtualizable_may_force(ctx, sym, active_vable),
