@@ -154,6 +154,13 @@ pub trait JitState: Sized {
             .collect()
     }
 
+    /// virtualizable.py:86 read_boxes() + warmstate.py:73 wrap() parity:
+    /// function-entry live values carry their natural types from wrap().
+    /// GC pointers (Python locals) → RefFrontendOp, raw ints → IntFrontendOp.
+    fn extract_live_values_for_entry(&self, meta: &Self::Meta) -> Vec<Value> {
+        self.extract_live_values(meta)
+    }
+
     fn live_value_types(&self, meta: &Self::Meta) -> Vec<Type> {
         self.extract_live(meta).iter().map(|_| Type::Int).collect()
     }
