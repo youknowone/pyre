@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 description = "pyre executable — Python Rewritten"
+default-run = "pyre"
 
 [[bin]]
 name = "pyre"

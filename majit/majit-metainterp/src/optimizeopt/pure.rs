@@ -1092,20 +1092,57 @@ impl Optimization for OptPure {
         // COND_CALL_VALUE_I/R → CSE like CALL_PURE, but skip arg[0]
         // (the condition value). pure.py: optimize_COND_CALL_VALUE_I.
         if op.opcode.is_cond_call_value() {
-            // Build CSE key from args[1..] (skip condition value at arg[0])
-            let key = PureOpKey {
-                opcode: OpCode::CallPureI,
-                args: op.args[1..].to_vec(),
-                descr_index: None,
-            };
-
-            if let Some(cached_ref) = self.lookup_pure(&key) {
-                let cached_ref = ctx.get_box_replacement(cached_ref);
-                ctx.replace_op(op.pos, cached_ref);
-                self.last_emitted_was_removed = true;
-                return OptimizationResult::Remove;
+            let op_descr_index = op.descr.as_ref().map(|d| d.index());
+            for &pos in &self.call_pure_positions {
+                if let Some(old_op) = ctx.new_operations.get(pos) {
+                    let old_descr_index = old_op.descr.as_ref().map(|d| d.index());
+                    if Self::optimize_call_pure_old(
+                        op,
+                        old_op.opcode,
+                        &old_op.args,
+                        old_descr_index,
+                        op_descr_index,
+                        1,
+                        ctx,
+                    ) {
+                        let cached_ref = ctx.get_box_replacement(old_op.pos);
+                        ctx.replace_op(op.pos, cached_ref);
+                        self.last_emitted_was_removed = true;
+                        return OptimizationResult::Remove;
+                    }
+                }
             }
 
+            for entry in &self.extra_call_pure {
+                let (entry_opcode, entry_args, entry_descr_index, entry_result) = match entry {
+                    ExtraCallPureEntry::Direct { key, result } => {
+                        (key.opcode, key.args.clone(), key.descr_index, *result)
+                    }
+                    ExtraCallPureEntry::Preamble { key, pop } => {
+                        (key.opcode, key.args.clone(), key.descr_index, pop.resolved)
+                    }
+                };
+                if Self::optimize_call_pure_old(
+                    op,
+                    entry_opcode,
+                    &entry_args,
+                    entry_descr_index,
+                    op_descr_index,
+                    1,
+                    ctx,
+                ) {
+                    let cached_ref = ctx.get_box_replacement(entry_result);
+                    ctx.replace_op(op.pos, cached_ref);
+                    self.last_emitted_was_removed = true;
+                    return OptimizationResult::Remove;
+                }
+            }
+
+            let key = PureOpKey {
+                opcode: OpCode::call_pure_for_type(op.result_type()),
+                args: op.args[1..].to_vec(),
+                descr_index: op_descr_index,
+            };
             if let Some(result_ref) = self.lookup_known_result(&key) {
                 let result_ref = ctx.get_box_replacement(result_ref);
                 ctx.replace_op(op.pos, result_ref);
@@ -1113,7 +1150,6 @@ impl Optimization for OptPure {
                 return OptimizationResult::Remove;
             }
 
-            self.cache.insert(key, op.pos);
             self.call_pure_positions.push(ctx.new_operations.len());
             // Unlike CALL_PURE, COND_CALL_VALUE is NOT demoted — emit as-is.
             return OptimizationResult::Emit(op.clone());

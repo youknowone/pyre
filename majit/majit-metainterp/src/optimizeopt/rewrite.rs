@@ -4563,6 +4563,19 @@ mod tests {
 
         let mut ctx = OptContext::with_num_inputs(4, 3);
         ctx.make_constant(OpRef(0), Value::Int(0x1234));
+        let mut imported_preamble = Op::new(OpCode::CallI, &[OpRef(0), OpRef(2)]);
+        imported_preamble.pos = OpRef(1);
+        ctx.initialize_imported_short_preamble_builder(
+            &[OpRef(0), OpRef(1), OpRef(2)],
+            &[OpRef(0), OpRef(1), OpRef(2)],
+            &[crate::optimizeopt::shortpreamble::PreambleOp {
+                op: imported_preamble,
+                kind: crate::optimizeopt::shortpreamble::PreambleOpKind::LoopInvariant,
+                label_arg_idx: None,
+                invented_name: false,
+                same_as_source: None,
+            }],
+        );
         ctx.imported_loop_invariant_results.insert(0x1234, OpRef(1));
 
         let mut pass = OptRewrite::new();
