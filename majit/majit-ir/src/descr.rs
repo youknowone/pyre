@@ -1060,6 +1060,15 @@ pub trait CallDescr: Descr {
         None
     }
 
+    /// RPython JitDriverSD.index_of_virtualizable for CALL_ASSEMBLER.
+    ///
+    /// When present, identifies the virtualizable argument inside the
+    /// original call_assembler arglist before rewrite.py shrinks it to
+    /// `[frame]` or `[frame, virtualizable]`.
+    fn call_virtualizable_index(&self) -> Option<usize> {
+        None
+    }
+
     /// Side effect information.
     fn effect_info(&self) -> &EffectInfo;
 
