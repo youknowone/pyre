@@ -16671,7 +16671,10 @@ mod tests {
     #[test]
     fn test_gc_collecting_alloc_preserves_live_ref_inputs() {
         let mut gc = MiniMarkGC::with_config(GcConfig {
-            nursery_size: 160,
+            // RPython llsupport/test_gc_integration.py:test_malloc_1 parity:
+            // make the nursery small enough that the trace's second nursery
+            // allocation must overflow and trigger a minor collection.
+            nursery_size: 112,
             large_object_threshold: 1024,
             ..GcConfig::default()
         });
@@ -16691,8 +16694,9 @@ mod tests {
         let inputargs = vec![InputArg::new_ref(0)];
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
-            mk_op(OpCode::CallMallocNursery, &[OpRef(24)], 1),
-            mk_op(OpCode::Finish, &[OpRef(0), OpRef(1)], OpRef::NONE.0),
+            mk_op(OpCode::CallMallocNursery, &[OpRef(56)], 1),
+            mk_op(OpCode::CallMallocNursery, &[OpRef(56)], 2),
+            mk_op(OpCode::Finish, &[OpRef(0), OpRef(2)], OpRef::NONE.0),
         ];
 
         let mut token = JitCellToken::new(1505);
