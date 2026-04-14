@@ -762,12 +762,12 @@ fn init_notimplemented_type(ns: &mut PyNamespace) {
         "__reduce__",
         make_builtin_function("__reduce__", |_args| Ok(w_str_new("NotImplemented"))),
     );
-    // special.py:28-33 descr_bool — DeprecationWarning
-    // TODO: emit DeprecationWarning when warnings infrastructure exists
+    // special.py:28-33 descr_bool
     namespace_store(
         ns,
         "__bool__",
         make_builtin_function("__bool__", |_args| {
+            crate::warn::warn_deprecation("NotImplemented should not be used in a boolean context");
             Ok(pyre_object::boolobject::w_bool_from(true))
         }),
     );

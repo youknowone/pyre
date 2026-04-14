@@ -1874,28 +1874,73 @@ impl TraceCtx {
 
     /// pyjitpl.py:3553-3579: record_result_of_call_pure.
     ///
-    /// After a pure call executes during tracing, record the mapping from
-    /// constant argument values to the result value. The optimizer uses this
-    /// to constant-fold repeated pure calls across loop iterations.
+    /// Patch a CALL into a CALL_PURE. Called after a pure call executes
+    /// during tracing with no exception.
     ///
-    /// `call_args` are the OpRefs passed to CALL_PURE (including func_ptr
-    /// at position 0). `result_value` is the concrete result of the call.
-    pub fn record_result_of_call_pure(&mut self, call_args: &[OpRef], result_value: Value) {
-        // pyjitpl.py:3562-3568: if all args are constants, we could
-        // remove the op entirely. For now just record the mapping.
-        let mut arg_consts = Vec::with_capacity(call_args.len());
-        for &arg in call_args {
-            if let Some(val) = self.constants.get_value(arg) {
-                arg_consts.push(val);
-            } else {
-                // pyjitpl.py:3572: constant_from_op(a) — convert all
-                // args to constants. If an arg is not a constant (i.e.
-                // a runtime inputarg), still record; the optimizer
-                // builds its own constant key from get_constant_box().
-                return;
-            }
+    /// - If all args are constants: cut the CALL op and return the constant
+    ///   result directly (the CALL is elided from the trace).
+    /// - Otherwise: store `arg_consts → result` in `call_pure_results`,
+    ///   cut the plain CALL, and re-record as CALL_PURE.
+    ///
+    /// Returns the OpRef of the result (either the original `op` or a
+    /// freshly recorded CALL_PURE, or a constant if all-constant-folded).
+    pub fn record_result_of_call_pure(
+        &mut self,
+        op: OpRef,
+        argboxes: &[OpRef],
+        descr: DescrRef,
+        patch_pos: TracePosition,
+        opcode: OpCode,
+        result_value: Value,
+    ) -> OpRef {
+        let resbox_as_const = result_value;
+        // pyjitpl.py:3557-3561: COND_CALL_VALUE ignores the 'value' arg
+        let is_cond_value = opcode.is_cond_call_value();
+        let normargboxes = if is_cond_value {
+            &argboxes[1..]
+        } else {
+            argboxes
+        };
+        // pyjitpl.py:3562-3565: check if all args are constants
+        let all_const = normargboxes
+            .iter()
+            .all(|arg| self.constants.get_value(*arg).is_some());
+        if all_const {
+            // pyjitpl.py:3566-3569: all-constants: remove the CALL
+            self.recorder.cut(patch_pos);
+            let const_opref = match resbox_as_const {
+                Value::Int(v) => self.constants.get_or_insert(v),
+                Value::Float(v) => self
+                    .constants
+                    .get_or_insert_typed(v.to_bits() as i64, Type::Float),
+                Value::Ref(r) => self
+                    .constants
+                    .get_or_insert_typed(r.as_usize() as i64, Type::Ref),
+                Value::Void => self.constants.get_or_insert(0),
+            };
+            return const_opref;
         }
-        self.call_pure_results.insert(arg_consts, result_value);
+        // pyjitpl.py:3572-3573: not all constants — store mapping
+        let arg_consts: Vec<Value> = normargboxes
+            .iter()
+            .filter_map(|arg| self.constants.get_value(*arg))
+            .collect();
+        self.call_pure_results.insert(arg_consts, resbox_as_const);
+        // pyjitpl.py:3574-3575: COND_CALL_VALUE remains as-is
+        if is_cond_value {
+            return op;
+        }
+        // pyjitpl.py:3576-3579: cut CALL, re-record as CALL_PURE
+        let ret_type = match resbox_as_const {
+            Value::Int(_) => Type::Int,
+            Value::Ref(_) => Type::Ref,
+            Value::Float(_) => Type::Float,
+            Value::Void => Type::Void,
+        };
+        let pure_opcode = OpCode::call_pure_for_type(ret_type);
+        self.recorder.cut(patch_pos);
+        self.recorder
+            .record_op_with_descr(pure_opcode, argboxes, descr)
     }
 
     /// pyjitpl.py:2397 + compile.py:221: take call_pure_results for

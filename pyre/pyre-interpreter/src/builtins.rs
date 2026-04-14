@@ -1259,41 +1259,63 @@ pub(crate) fn builtin_int(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     let w_base = args.get(1).copied();
 
     if w_base.is_none() {
-        // intobject.py:991: exact int type → return as-is
+        // intobject.py:991: space.is_w(space.type(w_value), space.w_int)
         let w_type = crate::typedef::r#type(obj);
         let w_int = crate::typedef::gettypefor(&INT_TYPE);
         if w_type.is_some() && w_type == w_int {
             return Ok(obj);
         }
-        // intobject.py:994: __int__ dunder
-        if let Ok(int_fn) = crate::baseobjspace::getattr(obj, "__int__") {
-            let result = crate::call_function(int_fn, &[obj]);
-            return Ok(ensure_baseint(result));
+        // intobject.py:994: space.lookup(w_value, '__int__')
+        if let Some(method) = unsafe { crate::baseobjspace::lookup(obj, "__int__") } {
+            let w_intvalue = crate::call_function(method, &[obj]);
+            return ensure_baseint_result(w_intvalue, obj);
         }
-        // intobject.py:997: __trunc__ dunder (deprecated)
-        if let Ok(trunc_fn) = crate::baseobjspace::getattr(obj, "__trunc__") {
-            let w_obj = crate::call_function(trunc_fn, &[obj]);
-            if !unsafe { is_int(w_obj) } {
-                if let Ok(index_fn) = crate::baseobjspace::getattr(w_obj, "__index__") {
-                    let w_indexed = crate::call_function(index_fn, &[w_obj]);
-                    return Ok(ensure_baseint(w_indexed));
+        // intobject.py:997: space.lookup(w_value, '__trunc__')
+        if let Some(method) = unsafe { crate::baseobjspace::lookup(obj, "__trunc__") } {
+            // intobject.py:998-999: DeprecationWarning
+            crate::warn::warn_deprecation("The delegation of int() to __trunc__ is deprecated.");
+            // intobject.py:1001: w_obj = space.trunc(w_value)
+            let w_obj = crate::call_function(method, &[obj]);
+            // intobject.py:1002: if not space.isinstance_w(w_obj, space.w_int)
+            if !unsafe { pyre_object::pyobject::is_int_or_long(w_obj) } {
+                // intobject.py:1003-1004: try: w_obj = space.index(w_obj)
+                if let Some(idx_method) = unsafe { crate::baseobjspace::lookup(w_obj, "__index__") }
+                {
+                    let w_indexed = crate::call_function(idx_method, &[w_obj]);
+                    return ensure_baseint_result(w_indexed, obj);
                 }
+                // intobject.py:1008-1011: __trunc__ returned non-Integral (type '%T')
                 return Err(crate::PyError::type_error(
-                    "__trunc__ returned non-Integral type",
+                    "__trunc__ returned non-Integral (type '%T')",
                 ));
             }
-            return Ok(ensure_baseint(w_obj));
+            return ensure_baseint_result(w_obj, obj);
         }
-        // intobject.py:1015: __index__ dunder
-        if let Ok(index_fn) = crate::baseobjspace::getattr(obj, "__index__") {
-            let w_obj = crate::call_function(index_fn, &[obj]);
-            return Ok(ensure_baseint(w_obj));
+        // intobject.py:1015: space.lookup(w_value, '__index__')
+        if let Some(method) = unsafe { crate::baseobjspace::lookup(obj, "__index__") } {
+            // intobject.py:1016: w_obj = space.index(w_value)
+            let w_obj = crate::call_function(method, &[obj]);
+            // intobject.py:1017: if not space.is_w(space.type(w_obj), space.w_int)
+            let w_obj_type = crate::typedef::r#type(w_obj);
+            if w_obj_type != w_int {
+                // intobject.py:1018: if space.isinstance_w(w_obj, space.w_int)
+                if unsafe { pyre_object::pyobject::is_int_or_long(w_obj) } {
+                    // intobject.py:1019: w_obj = space.int(w_obj)
+                    return ensure_baseint_result(w_obj, obj);
+                }
+                // intobject.py:1020-1023
+                return Err(crate::PyError::type_error(
+                    "int() argument must be a string, a bytes-like object or a number, not '%T'",
+                ));
+            }
+            return ensure_baseint_result(w_obj, obj);
         }
-        // intobject.py:1026-1038: str / bytes / bytearray
+        // intobject.py:1026-1034: str
         unsafe {
             if is_str(obj) {
                 return parse_int_from_str(w_str_get_value(obj), 10);
             }
+            // intobject.py:1035-1038: bytes / bytearray
             if pyre_object::bytesobject::is_bytes_like(obj) {
                 let data = pyre_object::bytesobject::bytes_like_data(obj);
                 let s = String::from_utf8_lossy(data);
@@ -1307,17 +1329,7 @@ pub(crate) fn builtin_int(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     }
 
     // intobject.py:1051-1072: w_base is not None — parse with base
-    let base: u32 = if let Some(w_b) = w_base {
-        if unsafe { is_int(w_b) } {
-            unsafe { w_int_get_value(w_b) as u32 }
-        } else {
-            return Err(crate::PyError::type_error(
-                "int() can't convert non-string with explicit base",
-            ));
-        }
-    } else {
-        10
-    };
+    let base = getindex_w_for_base(w_base.unwrap())?;
     unsafe {
         if is_str(obj) {
             return parse_int_from_str(w_str_get_value(obj), base);
@@ -1333,14 +1345,64 @@ pub(crate) fn builtin_int(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     ))
 }
 
-/// intobject.py:1093: _ensure_baseint — unwrap subclass to plain int.
-fn ensure_baseint(obj: PyObjectRef) -> PyObjectRef {
-    if unsafe { is_int(obj) } {
-        let v = unsafe { w_int_get_value(obj) };
-        w_int_new(v)
-    } else {
-        obj
+/// intobject.py:1093-1107 _ensure_baseint
+fn ensure_baseint_result(
+    obj: PyObjectRef,
+    _original: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    unsafe {
+        if is_int(obj) {
+            // intobject.py:1096-1098: W_IntObject (or subclass) → wrapint
+            return Ok(w_int_new(w_int_get_value(obj)));
+        }
+        if pyre_object::pyobject::is_long(obj) {
+            // intobject.py:1100-1102: W_AbstractLongObject → newlong
+            return Ok(pyre_object::longobject::w_long_new(
+                pyre_object::longobject::w_long_get_value(obj).clone(),
+            ));
+        }
     }
+    // intobject.py:1104-1107
+    Err(crate::PyError::type_error(
+        "int() argument must be a string, a bytes-like object or a number, not '%T'",
+    ))
+}
+
+/// intobject.py:1052-1057 space.getindex_w(w_base, None)
+///
+/// Extract base as u32 from any object supporting __index__.
+/// On overflow, returns 37 (sentinel that produces ValueError in parser).
+fn getindex_w_for_base(w_base: PyObjectRef) -> Result<u32, crate::PyError> {
+    let value: i64 = unsafe {
+        if is_int(w_base) {
+            w_int_get_value(w_base)
+        } else if pyre_object::pyobject::is_long(w_base) {
+            // overflow → sentinel 37
+            return Ok(37);
+        } else if let Some(method) = crate::baseobjspace::lookup(w_base, "__index__") {
+            let w_result = crate::call_function(method, &[w_base]);
+            if is_int(w_result) {
+                w_int_get_value(w_result)
+            } else if pyre_object::pyobject::is_long(w_result) {
+                return Ok(37);
+            } else {
+                return Err(crate::PyError::type_error(
+                    "int() second argument must be an integer, not '%T'",
+                ));
+            }
+        } else {
+            return Err(crate::PyError::type_error(
+                "int() second argument must be an integer, not '%T'",
+            ));
+        }
+    };
+    if value < 0 || value == 1 || value > 36 {
+        return Err(crate::PyError::new(
+            crate::PyErrorKind::ValueError,
+            format!("int() base must be >= 2 and <= 36, or 0"),
+        ));
+    }
+    Ok(value as u32)
 }
 
 /// Parse an integer from a string with the given base.

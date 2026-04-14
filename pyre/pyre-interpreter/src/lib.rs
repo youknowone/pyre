@@ -27,6 +27,7 @@ pub mod runtime_ops;
 pub mod shared_opcode;
 pub mod type_methods;
 pub mod typedef;
+pub mod warn;
 
 // ── Execution and import modules ──
 pub mod call;
