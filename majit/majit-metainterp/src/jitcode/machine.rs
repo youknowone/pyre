@@ -2183,18 +2183,21 @@ where
                     let traced = match opcode {
                         BC_CALL_INT => ctx.call_int_typed(trace_ptr, &args, &arg_types),
                         BC_CALL_PURE_INT => {
+                            // pyjitpl.py:1941-1948: record plain CALL, then
+                            // record_result_of_call_pure patches/caches.
                             let patch_pos = ctx.get_trace_position();
                             let plain_op = ctx.call_int_typed(trace_ptr, &args, &arg_types);
                             let func_ref = ctx.const_int(trace_ptr as usize as i64);
                             let mut call_args = vec![func_ref];
                             call_args.extend_from_slice(&args);
-                            let concrete_values: Vec<majit_ir::Value> = call_args
-                                .iter()
-                                .map(|a| {
-                                    ctx.constants_get_value(*a)
-                                        .unwrap_or(majit_ir::Value::Int(0))
-                                })
-                                .collect();
+                            // pyjitpl.py:3572: constant_from_op(a) reads the
+                            // concrete runtime value from each Box. Use
+                            // concrete_args (actual execution-time values).
+                            let mut concrete_values =
+                                vec![majit_ir::Value::Int(trace_ptr as usize as i64)];
+                            for &v in &concrete_args {
+                                concrete_values.push(majit_ir::Value::Int(v));
+                            }
                             ctx.record_result_of_call_pure(
                                 plain_op,
                                 &call_args,
@@ -2329,13 +2332,11 @@ where
                             let func_ref = ctx.const_int(trace_ptr as usize as i64);
                             let mut call_args = vec![func_ref];
                             call_args.extend_from_slice(&args);
-                            let concrete_values: Vec<majit_ir::Value> = call_args
-                                .iter()
-                                .map(|a| {
-                                    ctx.constants_get_value(*a)
-                                        .unwrap_or(majit_ir::Value::Int(0))
-                                })
-                                .collect();
+                            let mut concrete_values =
+                                vec![majit_ir::Value::Int(trace_ptr as usize as i64)];
+                            for &v in &concrete_args {
+                                concrete_values.push(majit_ir::Value::Int(v));
+                            }
                             ctx.record_result_of_call_pure(
                                 plain_op,
                                 &call_args,
@@ -2470,13 +2471,11 @@ where
                             let func_ref = ctx.const_int(trace_ptr as usize as i64);
                             let mut call_args = vec![func_ref];
                             call_args.extend_from_slice(&args);
-                            let concrete_values: Vec<majit_ir::Value> = call_args
-                                .iter()
-                                .map(|a| {
-                                    ctx.constants_get_value(*a)
-                                        .unwrap_or(majit_ir::Value::Int(0))
-                                })
-                                .collect();
+                            let mut concrete_values =
+                                vec![majit_ir::Value::Int(trace_ptr as usize as i64)];
+                            for &v in &concrete_args {
+                                concrete_values.push(majit_ir::Value::Int(v));
+                            }
                             ctx.record_result_of_call_pure(
                                 plain_op,
                                 &call_args,
