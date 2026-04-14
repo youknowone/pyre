@@ -1637,17 +1637,37 @@ impl MIFrame {
         opref: OpRef,
         ctx: &majit_metainterp::TraceCtx,
     ) -> majit_trace::recorder::SnapshotTagged {
+        Self::opref_to_snapshot_tagged_for_slot(opref, ctx, None)
+    }
+
+    /// virtualizable.py:86-98 `read_boxes(cpu, virtualizable, startindex)` parity:
+    /// each slot is wrapped via `wrap(cpu, value, startindex + i)` where the
+    /// lltype (ARRAYITEMTYPE or static field `FIELDTYPE`) is declared and
+    /// determines the resulting Const's INT/REF/FLOAT kind. pyre stores
+    /// constants in a unified pool whose stored `const_type` may disagree
+    /// with the slot's declared type (e.g. pointer constants opened via
+    /// `const_int`), so snapshot encoding must prefer the slot's declared
+    /// type when it is known — otherwise `_gettagged` → `getconst(val, tp)`
+    /// picks TAGINT for a Ref-typed slot and the resume reader decodes a
+    /// raw i64 where a PyObjectRef is expected.
+    fn opref_to_snapshot_tagged_for_slot(
+        opref: OpRef,
+        ctx: &majit_metainterp::TraceCtx,
+        declared_type: Option<majit_ir::Type>,
+    ) -> majit_trace::recorder::SnapshotTagged {
         if opref.is_none() {
-            majit_trace::recorder::SnapshotTagged::Const(0, majit_ir::Type::Ref)
+            majit_trace::recorder::SnapshotTagged::Const(
+                0,
+                declared_type.unwrap_or(majit_ir::Type::Ref),
+            )
         } else if ctx.constant_value(opref).is_some() {
             let val = ctx.constant_value(opref).unwrap_or(0);
-            // resume.py:157-183 `getconst(const)` dispatches on
-            // `const.type` — every Const is typed (ConstInt, ConstPtr,
-            // ConstFloat). pyre's plain `const_int(v)` creates a pool
-            // entry without an explicit type slot, matching RPython's
-            // ConstInt whose intrinsic type is INT; fall back to Int
-            // here rather than requiring callers to tag every integer.
-            let tp = ctx.const_type(opref).unwrap_or(majit_ir::Type::Int);
+            // resume.py:157-183 `getconst(const)` dispatches on `const.type`.
+            // When the caller knows the slot's declared type (e.g. a
+            // virtualizable static field or array item), use it directly so
+            // pointer constants opened via `const_int` still tag as REF.
+            let tp = declared_type
+                .unwrap_or_else(|| ctx.const_type(opref).unwrap_or(majit_ir::Type::Int));
             majit_trace::recorder::SnapshotTagged::Const(val, tp)
         } else {
             // resume.py:211,214: box.type for _number_boxes TAGVIRTUAL/TAGBOX.
@@ -1689,10 +1709,25 @@ impl MIFrame {
         let stack_only = sym.stack_only_depth();
         let mut boxes = Vec::new();
         // opencoder.py:722: virtualizable_ptr FIRST.
-        boxes.push(Self::opref_to_snapshot_tagged(sym.frame, ctx));
+        // The virtualizable frame pointer is always a GCREF.
+        boxes.push(Self::opref_to_snapshot_tagged_for_slot(
+            sym.frame,
+            ctx,
+            Some(majit_ir::Type::Ref),
+        ));
         // Static fields in declared order (virtualizable.py:90-93).
-        for opref in sym.vable_field_oprefs() {
-            boxes.push(Self::opref_to_snapshot_tagged(opref, ctx));
+        // virtualizable.py:131-133 wraps each value with its declared
+        // `FIELDTYPE`; pyre mirrors that by consulting
+        // `VirtualizableInfo::static_fields[i].field_type`.
+        let vable_static_types: Vec<majit_ir::Type> = ctx
+            .virtualizable_info()
+            .map(|info| info.static_fields.iter().map(|f| f.field_type).collect())
+            .unwrap_or_default();
+        for (idx, opref) in sym.vable_field_oprefs().iter().enumerate() {
+            let declared = vable_static_types.get(idx).copied();
+            boxes.push(Self::opref_to_snapshot_tagged_for_slot(
+                *opref, ctx, declared,
+            ));
         }
         // Array items: locals + stack (virtualizable.py:86 read_boxes).
         // pyjitpl.py:177 parity: use pre_opcode_stack (orgpc state) when
@@ -1731,6 +1766,16 @@ impl MIFrame {
                 sym.nlocals + stack_depth
             });
         let full_array_len = physical_array_len;
+        // virtualizable.py:135-137 `lst[j] = reader.load_next_value_of_type(
+        // ARRAYITEMTYPE)` — every array slot is the array's declared item
+        // type (GCREF for pyre's `locals_cells_stack_w`), regardless of
+        // what the optimizer chose for the OpRef's own kind. Enforce this
+        // at encoding time so a `LOAD_CONST 0` whose OpRef is Int-typed
+        // still lands in the snapshot as a Ref constant.
+        let array_item_type = ctx
+            .virtualizable_info()
+            .and_then(|info| info.array_fields.first().map(|a| a.item_type))
+            .unwrap_or(majit_ir::Type::Ref);
         for i in 0..full_array_len {
             let opref = if i < sym.symbolic_locals.len() {
                 sym.symbolic_locals[i]
@@ -1743,7 +1788,11 @@ impl MIFrame {
                 }
             };
             if !opref.is_none() {
-                boxes.push(Self::opref_to_snapshot_tagged(opref, ctx));
+                boxes.push(Self::opref_to_snapshot_tagged_for_slot(
+                    opref,
+                    ctx,
+                    Some(array_item_type),
+                ));
             } else if let Some(frame) = concrete_frame {
                 let val = frame
                     .locals_w()
@@ -1753,10 +1802,14 @@ impl MIFrame {
                     .unwrap_or(pyre_object::PY_NULL);
                 boxes.push(majit_trace::recorder::SnapshotTagged::Const(
                     val as i64,
-                    Type::Ref,
+                    array_item_type,
                 ));
             } else {
-                boxes.push(Self::opref_to_snapshot_tagged(OpRef::NONE, ctx));
+                boxes.push(Self::opref_to_snapshot_tagged_for_slot(
+                    OpRef::NONE,
+                    ctx,
+                    Some(array_item_type),
+                ));
             }
         }
         boxes
