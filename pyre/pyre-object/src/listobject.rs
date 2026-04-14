@@ -34,22 +34,27 @@ pub struct W_ListObject {
     pub float_items: FloatArray,
 }
 
-/// Check if all items are regular (cached) ints that can use IntegerListStrategy.
+/// Pyre equivalent of RPython `is_plain_int1(w_obj)` (listobject.py:2397):
+///   `type(w_obj) is W_IntObject`
 /// Unique ints (created by w_int_new_unique for int subclass instances) are excluded
 /// because they may carry per-object attributes that require pointer identity.
+#[inline]
+unsafe fn is_plain_int1(item: PyObjectRef) -> bool {
+    if item.is_null() || !is_int(item) {
+        return false;
+    }
+    let v = w_int_get_value(item);
+    // For values in the small-int cache range, verify pointer identity.
+    // A non-matching pointer means w_int_new_unique made a subclass instance.
+    if w_int_small_cached(v) {
+        std::ptr::eq(item, w_int_new(v))
+    } else {
+        true
+    }
+}
+
 fn all_ints(items: &[PyObjectRef]) -> bool {
-    items.iter().all(|&item| {
-        if item.is_null() || !unsafe { is_int(item) } {
-            return false;
-        }
-        let v = unsafe { w_int_get_value(item) };
-        // If value is in small-int cache range, check pointer identity
-        if w_int_small_cached(v) {
-            std::ptr::eq(item, w_int_new(v))
-        } else {
-            true
-        }
-    })
+    items.iter().all(|&item| unsafe { is_plain_int1(item) })
 }
 
 fn all_floats(items: &[PyObjectRef]) -> bool {
@@ -203,7 +208,9 @@ pub unsafe fn w_list_setitem(obj: PyObjectRef, index: i64, value: PyObjectRef) -
             if idx < 0 || idx >= len {
                 return false;
             }
-            if !value.is_null() && is_int(value) {
+            // AbstractUnwrappedStrategy.setitem (listobject.py:1737):
+            //   if is_correct_type(w_item): l[index] = unwrap(w_item)
+            if is_plain_int1(value) {
                 list.int_items[idx as usize] = w_int_get_value(value);
                 true
             } else {
@@ -235,23 +242,12 @@ pub unsafe fn w_list_setitem(obj: PyObjectRef, index: i64, value: PyObjectRef) -
 pub unsafe fn w_list_append(obj: PyObjectRef, value: PyObjectRef) {
     let list = &mut *(obj as *mut W_ListObject);
     match list.strategy {
+        // AbstractUnwrappedStrategy.append (listobject.py:1695):
+        //   if self.is_correct_type(w_item): l.append(self.unwrap(w_item)); return
+        //   self.switch_to_next_strategy(w_list, w_item); w_list.append(w_item)
         ListStrategy::Object => list.items.push(value),
         ListStrategy::Integer => {
-            if !value.is_null()
-                && is_int(value)
-                && crate::w_int_small_cached(w_int_get_value(value))
-            {
-                // Only use int strategy for cached (non-unique) ints.
-                // Unique ints (from w_int_new_unique) may carry per-object
-                // attributes and must preserve pointer identity.
-                let v = w_int_get_value(value);
-                if std::ptr::eq(value, crate::w_int_new(v)) {
-                    list.int_items.push(v);
-                } else {
-                    switch_to_object_strategy(list);
-                    list.items.push(value);
-                }
-            } else if !value.is_null() && is_int(value) {
+            if is_plain_int1(value) {
                 list.int_items.push(w_int_get_value(value));
             } else {
                 switch_to_object_strategy(list);
@@ -343,9 +339,9 @@ pub unsafe fn w_list_setslice(
     // Determine if all new_items match current strategy
     match list.strategy {
         ListStrategy::Integer => {
-            let all_int = new_items
-                .iter()
-                .all(|&v| !v.is_null() && is_int(v));
+            // AbstractUnwrappedStrategy.setslice (listobject.py:1750):
+            //   list_is_correct_type(w_other): typed splice
+            let all_int = new_items.iter().all(|&v| is_plain_int1(v));
             if all_int {
                 // typed splice: remove [start..end] then insert new int values
                 let end_clamped = end.min(list.int_items.len());
@@ -412,7 +408,7 @@ pub unsafe fn w_list_insert(obj: PyObjectRef, index: i64, value: PyObjectRef) {
     match list.strategy {
         ListStrategy::Object => list.items.insert(idx, value),
         ListStrategy::Integer => {
-            if !value.is_null() && is_int(value) {
+            if is_plain_int1(value) {
                 list.int_items.insert(idx, w_int_get_value(value));
             } else {
                 switch_to_object_strategy(list);
