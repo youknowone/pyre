@@ -143,15 +143,12 @@ pub struct MiniMarkGC {
     pub types: TypeRegistry,
     /// Root set.
     pub roots: RootSet,
-    /// Remembered set: old objects that may point to young objects.
-    /// These are old-gen object payload addresses whose TRACK_YOUNG_PTRS
-    /// flag has been cleared by the write barrier.
-    remembered_set: Vec<usize>,
-    /// Card table: maps object address to set of dirty card indices.
-    /// Used for large arrays where scanning the entire array during
-    /// minor collection is too expensive. Only dirty card ranges are
-    /// scanned instead of the whole array.
-    card_dirty: HashMap<usize, HashSet<usize>>,
+    /// incminimark.py:344 old_objects_pointing_to_young
+    old_objects_pointing_to_young: Vec<usize>,
+    /// incminimark.py:352 old_objects_with_cards_set
+    /// Objects that have GCFLAG_CARDS_SET. Card bits are stored inline
+    /// before the GC header (incminimark.py:1622 get_card).
+    old_objects_with_cards_set: Vec<usize>,
     /// Configuration.
     config: GcConfig,
     /// Count of minor collections performed.
@@ -163,15 +160,10 @@ pub struct MiniMarkGC {
     /// Old-gen bytes at the end of the last completed major collection.
     /// Used to decide when to start the next incremental cycle.
     last_major_bytes: usize,
-    /// Bytes promoted to old gen since the current incremental cycle started.
-    ///
-    /// Mirrors incminimark's `size_objects_made_old`.
-    bytes_made_old_since_cycle: usize,
-    /// Promotion credit granted by completed major-GC steps within the current
-    /// incremental cycle.
-    ///
-    /// Mirrors incminimark's `threshold_objects_made_old`.
-    threshold_bytes_made_old: usize,
+    /// incminimark.py:370: size_objects_made_old
+    size_objects_made_old: usize,
+    /// incminimark.py:371: threshold_objects_made_old
+    threshold_objects_made_old: usize,
     /// Exact payload addresses of objects currently resident in the nursery.
     ///
     /// In RPython, roots are always exact GC object addresses. In this hybrid
@@ -223,15 +215,15 @@ impl MiniMarkGC {
             oldgen: OldGen::new(),
             types: TypeRegistry::new(),
             roots: RootSet::new(),
-            remembered_set: Vec::new(),
-            card_dirty: HashMap::new(),
+            old_objects_pointing_to_young: Vec::new(),
+            old_objects_with_cards_set: Vec::new(),
             config,
             minor_collections: 0,
             major_collections: 0,
             incr_state: IncrementalMarkState::new(nursery_size),
             last_major_bytes: 0,
-            bytes_made_old_since_cycle: 0,
-            threshold_bytes_made_old: 0,
+            size_objects_made_old: 0,
+            threshold_objects_made_old: 0,
             nursery_object_starts: HashSet::new(),
             pinned_objects: HashSet::new(),
             compiled_code_registry: CompiledCodeRegistry::new(),
@@ -306,9 +298,7 @@ impl MiniMarkGC {
         self.nursery.contains(addr)
     }
 
-    /// incminimark.py range-check parity: use nursery range check instead
-    /// of nursery_object_starts HashSet. JIT inline nursery bump-alloc
-    /// creates objects not registered in the HashSet; range check covers them.
+    /// Internal: check whether address belongs to a GC-managed region.
     #[inline]
     fn is_managed_heap_object(&self, addr: usize) -> bool {
         self.nursery.contains(addr) || self.oldgen.contains(addr)
@@ -389,9 +379,47 @@ impl MiniMarkGC {
         let hdr = unsafe { &mut *(ptr as *mut GcHeader) };
         // Old objects start with TRACK_YOUNG_PTRS set (they need write barrier).
         *hdr = GcHeader::with_flags(type_id, flags::TRACK_YOUNG_PTRS);
-        self.bytes_made_old_since_cycle =
-            self.bytes_made_old_since_cycle.saturating_add(total_size);
+        self.size_objects_made_old = self.size_objects_made_old.saturating_add(total_size);
         GcRef((ptr as usize) + GcHeader::SIZE)
+    }
+
+    /// incminimark.py:1027-1067 external_malloc (card-marked variant):
+    /// Allocate a large varsize object in old gen with inline card bytes
+    /// before the GC header. Layout: [card_bytes][GcHeader][payload].
+    /// Sets HAS_CARDS and TRACK_YOUNG_PTRS.
+    fn alloc_external_with_cards(
+        &mut self,
+        type_id: u32,
+        total_payload: usize,
+        array_length: usize,
+    ) -> GcRef {
+        // incminimark.py:1028-1029
+        let card_header_size = if self.card_page_shift > 0 {
+            // Round up to word alignment.
+            let bytes = self.card_marking_bytes_for_length(array_length);
+            let words = (bytes + std::mem::size_of::<usize>() - 1) / std::mem::size_of::<usize>();
+            words * std::mem::size_of::<usize>()
+        } else {
+            0
+        };
+        let total_size = card_header_size + GcHeader::SIZE + total_payload;
+
+        // incminimark.py:1053: allocate including card header
+        let arena = self
+            .oldgen
+            .alloc_with_card_header(total_size, card_header_size);
+
+        // incminimark.py:1059-1064: zero card bytes
+        unsafe {
+            std::ptr::write_bytes(arena, 0, card_header_size);
+        }
+
+        // incminimark.py:1067: result = arena + cardheadersize
+        let hdr_ptr = (arena as usize + card_header_size) as *mut GcHeader;
+        let hdr = unsafe { &mut *hdr_ptr };
+        *hdr = GcHeader::with_flags(type_id, flags::TRACK_YOUNG_PTRS | flags::HAS_CARDS);
+        self.size_objects_made_old = self.size_objects_made_old.saturating_add(total_size);
+        GcRef(hdr_ptr as usize + GcHeader::SIZE)
     }
 
     /// Perform a minor (nursery) collection.
@@ -470,7 +498,8 @@ impl MiniMarkGC {
         // those black objects so the major collector rescans their new
         // outgoing references before sweep.
         if self.incr_state.marking_in_progress {
-            let remembered_now: Vec<usize> = self.remembered_set.iter().copied().collect();
+            let remembered_now: Vec<usize> =
+                self.old_objects_pointing_to_young.iter().copied().collect();
             for obj_addr in remembered_now {
                 let hdr = unsafe { header_of(obj_addr) };
                 if hdr.has_flag(flags::VISITED) {
@@ -479,41 +508,24 @@ impl MiniMarkGC {
             }
         }
 
-        // Phase 2: Process remembered set and transitive closure.
-        let mut idx = 0;
+        // incminimark.py:1843-1862: while True loop.
+        // collect_oldrefs_to_nursery may cause new objects to appear in
+        // old_objects_with_cards_set; loop back to drain them.
         loop {
-            if idx >= self.remembered_set.len() {
-                break;
+            // incminimark.py:1846-1847: collect_cardrefs_to_nursery
+            if self.card_page_shift > 0 {
+                self.collect_cardrefs_to_nursery();
             }
-            let obj_addr = self.remembered_set[idx];
-            idx += 1;
 
-            let has_cards = unsafe { header_of(obj_addr).has_flag(flags::CARDS_SET) };
+            // incminimark.py:1855: collect_oldrefs_to_nursery
+            self.collect_oldrefs_to_nursery();
 
-            if has_cards {
-                // Card-marked object: scan only dirty card ranges.
-                self.scan_cards_for_young_refs(obj_addr, self.card_page_shift);
-                self.clear_cards(obj_addr);
-                // Re-set TRACK_YOUNG_PTRS for future write barriers.
-                unsafe {
-                    header_of(obj_addr).set_flag(flags::TRACK_YOUNG_PTRS);
-                }
-            } else {
-                // Re-set TRACK_YOUNG_PTRS on this old object since we're
-                // processing all its young references now.
-                unsafe {
-                    header_of(obj_addr).set_flag(flags::TRACK_YOUNG_PTRS);
-                }
-
-                // Trace this old-gen object's fields and copy any nursery
-                // objects they reference.
-                self.trace_and_update_object(obj_addr);
+            // incminimark.py:1859-1861: loop back if new cards appeared
+            if self.card_page_shift > 0 && !self.old_objects_with_cards_set.is_empty() {
+                continue;
             }
+            break;
         }
-
-        // Clear remembered set and any remaining card entries.
-        self.remembered_set.clear();
-        self.clear_all_cards();
 
         // Reset nursery for new allocations, preserving pinned objects.
         if self.pinned_objects.is_empty() {
@@ -579,8 +591,7 @@ impl MiniMarkGC {
                 .alloc_and_copy(header_ptr as *const u8, total_size)
         };
         let new_obj_addr = new_header_ptr as usize + GcHeader::SIZE;
-        self.bytes_made_old_since_cycle =
-            self.bytes_made_old_since_cycle.saturating_add(total_size);
+        self.size_objects_made_old = self.size_objects_made_old.saturating_add(total_size);
 
         // Set TRACK_YOUNG_PTRS on the new old-gen object.
         let new_hdr = unsafe { &mut *(new_header_ptr as *mut GcHeader) };
@@ -598,7 +609,7 @@ impl MiniMarkGC {
             // can re-set it after processing.
             let new_hdr = unsafe { &mut *(new_header_ptr as *mut GcHeader) };
             new_hdr.clear_flag(flags::TRACK_YOUNG_PTRS);
-            self.remembered_set.push(new_obj_addr);
+            self.old_objects_pointing_to_young.push(new_obj_addr);
         }
 
         GcRef(new_obj_addr)
@@ -712,13 +723,13 @@ impl MiniMarkGC {
         }
 
         loop {
-            self.threshold_bytes_made_old = self
-                .threshold_bytes_made_old
+            self.threshold_objects_made_old = self
+                .threshold_objects_made_old
                 .saturating_add(self.config.nursery_size / 2);
 
             if !self.incr_state.marking_in_progress {
-                self.bytes_made_old_since_cycle = 0;
-                self.threshold_bytes_made_old = self.config.nursery_size / 2;
+                self.size_objects_made_old = 0;
+                self.threshold_objects_made_old = self.config.nursery_size / 2;
                 self.start_incremental_cycle();
             }
 
@@ -728,7 +739,7 @@ impl MiniMarkGC {
                 break;
             }
 
-            if self.bytes_made_old_since_cycle <= self.threshold_bytes_made_old {
+            if self.size_objects_made_old <= self.threshold_objects_made_old {
                 break;
             }
         }
@@ -838,8 +849,8 @@ impl MiniMarkGC {
         self.major_collections += 1;
         self.oldgen.sweep();
         self.last_major_bytes = self.oldgen.total_bytes();
-        self.bytes_made_old_since_cycle = 0;
-        self.threshold_bytes_made_old = 0;
+        self.size_objects_made_old = 0;
+        self.threshold_objects_made_old = 0;
     }
 
     /// Whether an incremental marking cycle is currently in progress.
@@ -905,27 +916,22 @@ impl MiniMarkGC {
         }
     }
 
-    /// Write barrier: call before storing a GC reference into an old-gen object.
-    ///
-    /// If the object has TRACK_YOUNG_PTRS set, we clear it and add the object
-    /// to the remembered set, because it might now point to a young object.
-    ///
-    /// The `is_managed_heap_object` guard is NOT in incminimark — it
-    /// compensates for virtualizable objects (PyFrame) being Rust
-    /// Box-allocated instead of GC-managed. The JIT's COND_CALL_GC_WB
-    /// fires for these objects because the rewriter emits WB for all
-    /// SETFIELD_GC on Ref-typed values, and the flag-test reads garbage
-    /// RPython's write_barrier() only tests the header flag and does not
-    /// special-case non-managed addresses here.
+    /// incminimark.py:1489-1493 write_barrier
     pub fn do_write_barrier(&mut self, obj: GcRef) {
         if obj.is_null() {
             return;
         }
         let hdr = unsafe { header_of(obj.0) };
         if hdr.has_flag(flags::TRACK_YOUNG_PTRS) {
-            hdr.clear_flag(flags::TRACK_YOUNG_PTRS);
-            self.remembered_set.push(obj.0);
+            self._remember_young_pointer_inlined(obj);
         }
+    }
+
+    /// incminimark.py:1504-1530 _remember_young_pointer_inlined
+    fn _remember_young_pointer_inlined(&mut self, obj: GcRef) {
+        self.old_objects_pointing_to_young.push(obj.0);
+        let hdr = unsafe { header_of(obj.0) };
+        hdr.clear_flag(flags::TRACK_YOUNG_PTRS);
     }
 
     /// incminimark.py:1495-1501 write_barrier_from_array:
@@ -954,10 +960,8 @@ impl MiniMarkGC {
     ) {
         let hdr = unsafe { header_of(obj.0) };
         if !hdr.has_flag(flags::HAS_CARDS) {
-            // No cards — fall back to generic barrier.
-            // _remember_young_pointer_inlined clears TRACK_YOUNG_PTRS.
-            hdr.clear_flag(flags::TRACK_YOUNG_PTRS);
-            self.remembered_set.push(obj.0);
+            // incminimark.py:1571: no cards, use default logic
+            self._remember_young_pointer_inlined(obj);
             return;
         }
         // Card path: mark the specific card. TRACK_YOUNG_PTRS stays set
@@ -965,70 +969,139 @@ impl MiniMarkGC {
         self.mark_card(obj, index, card_page_shift);
     }
 
-    /// incminimark.py:1606-1617 jit_remember_young_pointer_from_array:
-    /// Minimal version called by the JIT when TRACK_YOUNG_PTRS is set
-    /// but CARDS_SET is not. Tries to set CARDS_SET; otherwise falls
-    /// back to remember_young_pointer (generic barrier).
+    /// incminimark.py:1606-1617 jit_remember_young_pointer_from_array
     pub fn jit_remember_young_pointer_from_array(&mut self, obj: GcRef) {
         let hdr = unsafe { header_of(obj.0) };
         if hdr.has_flag(flags::HAS_CARDS) {
-            // Set CARDS_SET. TRACK_YOUNG_PTRS stays set so the JIT
-            // barrier keeps firing → routes to card-marking path.
+            // incminimark.py:1613-1615
+            self.old_objects_with_cards_set.push(obj.0);
             hdr.set_flag(flags::CARDS_SET);
-            self.remembered_set.push(obj.0);
         } else {
-            // No cards — generic barrier.
             self.do_write_barrier(obj);
         }
     }
 
-    /// incminimark.py:1576-1598 mark_card:
-    /// Set the card bit for the given index. If CARDS_SET not yet
-    /// set, add obj to tracking list and set CARDS_SET.
-    fn mark_card(&mut self, obj: GcRef, index: usize, card_page_shift: u32) {
-        let card_index = index >> card_page_shift;
+    /// incminimark.py:1301-1308 card_marking_bytes_for_length
+    pub fn card_marking_bytes_for_length(&self, length: usize) -> usize {
+        (length + (8usize << self.card_page_shift) - 1) >> (self.card_page_shift + 3)
+    }
 
-        // Check if bit already set (early return optimization).
-        if self
-            .card_dirty
-            .get(&obj.0)
-            .is_some_and(|c| c.contains(&card_index))
-        {
+    /// incminimark.py:1622-1625 get_card
+    /// Returns a pointer to the card byte for the given byteindex.
+    /// Card bytes live before the GC header: obj - header_size + (~byteindex).
+    #[inline]
+    unsafe fn get_card(obj_addr: usize, byteindex: usize) -> *mut u8 {
+        // ~byteindex in Python is -(byteindex+1) as a signed value.
+        // obj - header_size + (~byteindex) = obj - header_size - byteindex - 1
+        (obj_addr - GcHeader::SIZE - byteindex - 1) as *mut u8
+    }
+
+    /// incminimark.py:1557-1598 remember_young_pointer_from_array2
+    /// (card-marking part: lines 1576-1598)
+    fn mark_card(&mut self, obj: GcRef, index: usize, card_page_shift: u32) {
+        // incminimark.py:1576-1578
+        let bitindex = index >> card_page_shift;
+        let byteindex = bitindex >> 3;
+        let bitmask: u8 = 1 << (bitindex & 7);
+
+        // incminimark.py:1581-1584: if bit already set, leave.
+        let addr_byte = unsafe { Self::get_card(obj.0, byteindex) };
+        let byte = unsafe { *addr_byte };
+        if byte & bitmask != 0 {
             return;
         }
 
-        // Set the card bit.
-        self.card_dirty.entry(obj.0).or_default().insert(card_index);
+        // incminimark.py:1594: set the card bit.
+        unsafe {
+            *addr_byte = byte | bitmask;
+        }
 
-        // If CARDS_SET not yet set, track this object and set the flag.
+        // incminimark.py:1596-1598: if CARDS_SET not yet set, add to
+        // old_objects_with_cards_set and set the flag.
         let hdr = unsafe { header_of(obj.0) };
         if !hdr.has_flag(flags::CARDS_SET) {
-            self.remembered_set.push(obj.0);
+            self.old_objects_with_cards_set.push(obj.0);
             hdr.set_flag(flags::CARDS_SET);
         }
     }
 
-    /// Check whether a specific card of an object is dirty.
+    /// Check whether a specific card bit of an object is set.
     pub fn is_card_dirty(&self, obj: GcRef, card_index: usize) -> bool {
-        self.card_dirty
-            .get(&obj.0)
-            .is_some_and(|cards| cards.contains(&card_index))
+        let byteindex = card_index >> 3;
+        let bitmask: u8 = 1 << (card_index & 7);
+        let byte = unsafe { *Self::get_card(obj.0, byteindex) };
+        byte & bitmask != 0
     }
 
     /// Return all dirty card indices for the given object.
     pub fn dirty_cards(&self, obj: GcRef) -> Vec<usize> {
-        self.card_dirty
-            .get(&obj.0)
-            .map(|cards| {
-                let mut v: Vec<usize> = cards.iter().copied().collect();
-                v.sort();
-                v
-            })
-            .unwrap_or_default()
+        let type_id = unsafe { header_of(obj.0).type_id() };
+        let type_info = self.types.get(type_id);
+        let length_offset = type_info.length_offset;
+        let length = unsafe { *((obj.0 + length_offset) as *const usize) };
+        let num_bytes = self.card_marking_bytes_for_length(length);
+        let mut result = Vec::new();
+        for bi in 0..num_bytes {
+            let byte = unsafe { *Self::get_card(obj.0, bi) };
+            for bit in 0..8u32 {
+                if byte & (1 << bit) != 0 {
+                    result.push(bi * 8 + bit as usize);
+                }
+            }
+        }
+        result
     }
 
-    /// Scan only dirty card ranges of a card-marked array object for
-    /// young-generation references. Avoids rescanning the entire array.
+    /// incminimark.py:2009-2083: collect_cardrefs_to_nursery
+    fn collect_cardrefs_to_nursery(&mut self) {
+        while let Some(obj_addr) = self.old_objects_with_cards_set.pop() {
+            let hdr = unsafe { header_of(obj_addr) };
+            debug_assert!(hdr.has_flag(flags::HAS_CARDS));
+            debug_assert!(hdr.has_flag(flags::CARDS_SET));
+            hdr.clear_flag(flags::CARDS_SET);
+
+            if !hdr.has_flag(flags::TRACK_YOUNG_PTRS) {
+                // incminimark.py:2036-2039
+                self.clear_cards(obj_addr);
+            } else {
+                // incminimark.py:2042-2072
+                self.scan_cards_for_young_refs(obj_addr, self.card_page_shift);
+            }
+            // incminimark.py:2074-2083
+            if self.incr_state.marking_in_progress {
+                let hdr = unsafe { header_of(obj_addr) };
+                hdr.clear_flag(flags::VISITED);
+                self.incr_state.gray_stack.push(obj_addr);
+            }
+        }
+    }
+
+    /// incminimark.py:2086-2106: collect_oldrefs_to_nursery
+    fn collect_oldrefs_to_nursery(&mut self) {
+        let mut idx = 0;
+        while idx < self.old_objects_pointing_to_young.len() {
+            let obj_addr = self.old_objects_pointing_to_young[idx];
+            idx += 1;
+
+            debug_assert!(
+                !unsafe { header_of(obj_addr) }.has_flag(flags::TRACK_YOUNG_PTRS),
+                "old_objects_pointing_to_young contains obj with TRACK_YOUNG_PTRS"
+            );
+
+            // incminimark.py:2101: re-set TRACK_YOUNG_PTRS
+            unsafe {
+                header_of(obj_addr).set_flag(flags::TRACK_YOUNG_PTRS);
+            }
+
+            // incminimark.py:2106: trace_and_drag_out_of_nursery(obj)
+            self.trace_and_update_object(obj_addr);
+        }
+
+        self.old_objects_pointing_to_young.clear();
+    }
+
+    /// incminimark.py:2042-2072 — walk inline card bytes, trace dirty
+    /// intervals via trace_and_drag_out_of_nursery_partial, clear bytes.
     fn scan_cards_for_young_refs(&mut self, obj_addr: usize, card_page_shift: u32) {
         let type_id = unsafe { header_of(obj_addr).type_id() };
         let type_info = self.types.get(type_id);
@@ -1042,70 +1115,69 @@ impl MiniMarkGC {
         let length_offset = type_info.length_offset;
         let length = unsafe { *((obj_addr + length_offset) as *const usize) };
         let items_start = obj_addr + base_size;
+        let card_page_indices = 1usize << card_page_shift;
 
-        let dirty_cards: Vec<usize> = self
-            .card_dirty
-            .get(&obj_addr)
-            .map(|cards| cards.iter().copied().collect())
-            .unwrap_or_default();
+        // incminimark.py:2026
+        let num_bytes = self.card_marking_bytes_for_length(length);
 
-        for card_idx in dirty_cards {
-            let start = card_idx << card_page_shift;
-            let end = ((card_idx + 1) << card_page_shift).min(length);
+        // incminimark.py:2045-2072: walk card bytes backward
+        let mut interval_start: usize = 0;
+        for bi in 0..num_bytes {
+            let p = unsafe { Self::get_card(obj_addr, bi) };
+            let cardbyte = unsafe { *p };
+            unsafe {
+                *p = 0;
+            } // reset the byte
+            let next_byte_start = interval_start + 8 * card_page_indices;
 
-            for i in start..end {
-                let slot = (items_start + i * item_size) as *mut GcRef;
-                let field_ref = unsafe { *slot };
-                if !field_ref.is_null() && self.is_in_nursery(field_ref.0) {
-                    let new_ref = self.copy_nursery_object(field_ref.0);
-                    unsafe {
-                        *slot = new_ref;
+            let mut cb = cardbyte;
+            let mut cur = interval_start;
+            while cb != 0 {
+                let interval_stop = (cur + card_page_indices).min(length);
+                if cb & 1 != 0 && interval_stop > cur {
+                    // trace_and_drag_out_of_nursery_partial
+                    for i in cur..interval_stop {
+                        let slot = (items_start + i * item_size) as *mut GcRef;
+                        let field_ref = unsafe { *slot };
+                        if !field_ref.is_null() && self.is_in_nursery(field_ref.0) {
+                            let new_ref = self.copy_nursery_object(field_ref.0);
+                            unsafe {
+                                *slot = new_ref;
+                            }
+                        }
                     }
                 }
+                cur = cur + card_page_indices;
+                cb >>= 1;
             }
+            interval_start = next_byte_start;
         }
     }
 
-    /// Clear card table entries for a given object.
+    /// Clear inline card bytes for a given object.
     pub fn clear_cards(&mut self, obj_addr: usize) {
-        self.card_dirty.remove(&obj_addr);
+        let type_id = unsafe { header_of(obj_addr).type_id() };
+        let type_info = self.types.get(type_id);
+        let length_offset = type_info.length_offset;
+        let length = unsafe { *((obj_addr + length_offset) as *const usize) };
+        let num_bytes = self.card_marking_bytes_for_length(length);
+        for bi in 0..num_bytes {
+            unsafe {
+                *Self::get_card(obj_addr, bi) = 0;
+            }
+        }
         let hdr = unsafe { header_of(obj_addr) };
         hdr.clear_flag(flags::CARDS_SET);
     }
 
-    /// Clear all card table entries. Called during minor collection
-    /// after processing all card-marked objects.
-    pub fn clear_all_cards(&mut self) {
-        let addrs: Vec<usize> = self.card_dirty.keys().copied().collect();
-        for addr in addrs {
-            let hdr = unsafe { header_of(addr) };
-            hdr.clear_flag(flags::CARDS_SET);
-        }
-        self.card_dirty.clear();
-    }
-
     // ── JIT integration hooks ──
 
-    /// Fast-path write barrier for JIT-compiled code.
-    ///
-    /// Called from JIT-compiled code when a write barrier fires.
-    /// Adds the object directly to the remembered set without the
-    /// full flag-check logic of `do_write_barrier()`, because the
-    /// JIT has already determined that the barrier is needed (via
-    /// the inline flag test emitted by COND_CALL_GC_WB).
-    ///
-    /// Equivalent to incminimark's `jit_remember_young_pointer()`.
-    ///
-    /// See `do_write_barrier` for why `is_managed_heap_object` is needed.
+    /// incminimark.py:1538-1549 remember_young_pointer
     pub fn jit_remember_young_pointer(&mut self, obj: GcRef) {
-        if obj.is_null() || !self.is_managed_heap_object(obj.0) {
+        if obj.is_null() {
             return;
         }
-        // Clear TRACK_YOUNG_PTRS so the object won't trigger the
-        // barrier again until it is re-processed in a minor collection.
-        let hdr = unsafe { header_of(obj.0) };
-        hdr.clear_flag(flags::TRACK_YOUNG_PTRS);
-        self.remembered_set.push(obj.0);
+        self._remember_young_pointer_inlined(obj);
     }
 
     /// Returns true if the GC supports optimized conditional write barriers.
@@ -1240,8 +1312,8 @@ impl MiniMarkGC {
     }
 
     /// Number of objects in the remembered set (for testing / diagnostics).
-    pub fn remembered_set_len(&self) -> usize {
-        self.remembered_set.len()
+    pub fn old_objects_pointing_to_young_len(&self) -> usize {
+        self.old_objects_pointing_to_young.len()
     }
 }
 
@@ -1875,11 +1947,11 @@ mod tests {
         // Write barrier clears the flag and adds to remembered set.
         gc.do_write_barrier(old_obj);
         assert!(!hdr.has_flag(flags::TRACK_YOUNG_PTRS));
-        assert_eq!(gc.remembered_set.len(), 1);
+        assert_eq!(gc.old_objects_pointing_to_young.len(), 1);
 
         // Second call: flag already cleared, should not add again.
         gc.do_write_barrier(old_obj);
-        assert_eq!(gc.remembered_set.len(), 1);
+        assert_eq!(gc.old_objects_pointing_to_young.len(), 1);
     }
 
     #[test]
@@ -2163,7 +2235,7 @@ mod tests {
 
         // Write barrier on null should be a no-op.
         gc.do_write_barrier(GcRef::NULL);
-        assert!(gc.remembered_set.is_empty());
+        assert!(gc.old_objects_pointing_to_young.is_empty());
     }
 
     #[test]
@@ -2320,13 +2392,16 @@ mod tests {
 
     #[test]
     fn test_card_marking_basic() {
+        let ptr_size = std::mem::size_of::<GcRef>();
         let mut gc = test_gc(4096);
-        gc.register_type(TypeInfo::simple(16));
-
-        // Allocate an old-gen object with HAS_CARDS flag.
-        let obj = gc.alloc_in_oldgen(0, GcHeader::SIZE + 16);
-        let hdr = unsafe { header_of(obj.0) };
-        hdr.set_flag(flags::HAS_CARDS);
+        let tid = gc.register_type(TypeInfo::varsize(8, ptr_size, 0, true, Vec::new()));
+        let array_length = 512;
+        let payload = 8 + ptr_size * array_length;
+        let obj = gc.alloc_external_with_cards(tid, payload, array_length);
+        // Write array length.
+        unsafe {
+            *(obj.0 as *mut usize) = array_length;
+        }
 
         // Card-marking write barrier: mark card for index 5.
         gc.do_write_barrier_card(obj, 5, DEFAULT_CARD_PAGE_SHIFT);
@@ -2336,6 +2411,7 @@ mod tests {
             gc.is_card_dirty(obj, 0),
             "card 0 should be dirty after writing index 5"
         );
+        let hdr = unsafe { header_of(obj.0) };
         assert!(
             hdr.has_flag(flags::CARDS_SET),
             "CARDS_SET flag should be set"
@@ -2352,44 +2428,43 @@ mod tests {
 
     #[test]
     fn test_card_marking_clear_after_collection() {
+        let ptr_size = std::mem::size_of::<GcRef>();
         let mut gc = test_gc(4096);
-        gc.register_type(TypeInfo::simple(16));
-
-        // Allocate an old-gen object with HAS_CARDS.
-        let obj = gc.alloc_in_oldgen(0, GcHeader::SIZE + 16);
-        let hdr = unsafe { header_of(obj.0) };
-        hdr.set_flag(flags::HAS_CARDS);
+        let tid = gc.register_type(TypeInfo::varsize(8, ptr_size, 0, true, Vec::new()));
+        let array_length = 512;
+        let payload = 8 + ptr_size * array_length;
+        let obj = gc.alloc_external_with_cards(tid, payload, array_length);
+        unsafe {
+            *(obj.0 as *mut usize) = array_length;
+        }
 
         // Mark some cards.
         gc.do_write_barrier_card(obj, 0, DEFAULT_CARD_PAGE_SHIFT);
         gc.do_write_barrier_card(obj, 200, DEFAULT_CARD_PAGE_SHIFT);
         assert!(
-            !gc.card_dirty.is_empty(),
+            unsafe { header_of(obj.0) }.has_flag(flags::CARDS_SET),
             "cards should be dirty before collection"
         );
 
-        // Minor collection clears card table.
         gc.do_collect_nursery();
 
         assert!(
-            gc.card_dirty.is_empty(),
-            "card table should be cleared after collection"
-        );
-        let hdr = unsafe { header_of(obj.0) };
-        assert!(
-            !hdr.has_flag(flags::CARDS_SET),
+            !unsafe { header_of(obj.0) }.has_flag(flags::CARDS_SET),
             "CARDS_SET flag should be cleared after collection"
         );
     }
 
     #[test]
     fn test_card_marking_dirty_cards_list() {
+        let ptr_size = std::mem::size_of::<GcRef>();
         let mut gc = test_gc(4096);
-        gc.register_type(TypeInfo::simple(16));
-
-        let obj = gc.alloc_in_oldgen(0, GcHeader::SIZE + 16);
-        let hdr = unsafe { header_of(obj.0) };
-        hdr.set_flag(flags::HAS_CARDS);
+        let tid = gc.register_type(TypeInfo::varsize(8, ptr_size, 0, true, Vec::new()));
+        let array_length = 512;
+        let payload = 8 + ptr_size * array_length;
+        let obj = gc.alloc_external_with_cards(tid, payload, array_length);
+        unsafe {
+            *(obj.0 as *mut usize) = array_length;
+        }
 
         // Mark cards for indices in different card pages.
         gc.do_write_barrier_card(obj, 0, DEFAULT_CARD_PAGE_SHIFT);
@@ -2412,29 +2487,37 @@ mod tests {
         gc.do_write_barrier_card(obj, 5, DEFAULT_CARD_PAGE_SHIFT);
 
         // Should fall back to full remembered set.
-        assert_eq!(gc.remembered_set.len(), 1, "should add to remembered set");
+        assert_eq!(
+            gc.old_objects_pointing_to_young.len(),
+            1,
+            "should add to remembered set"
+        );
         assert!(
-            gc.card_dirty.is_empty(),
+            !unsafe { header_of(obj.0) }.has_flag(flags::CARDS_SET),
             "should not mark cards without HAS_CARDS"
         );
     }
 
     #[test]
     fn test_card_clear_individual() {
+        let ptr_size = std::mem::size_of::<GcRef>();
         let mut gc = test_gc(4096);
-        gc.register_type(TypeInfo::simple(16));
+        let tid = gc.register_type(TypeInfo::varsize(8, ptr_size, 0, true, Vec::new()));
+        let array_length = 512;
+        let payload = 8 + ptr_size * array_length;
 
-        let obj1 = gc.alloc_in_oldgen(0, GcHeader::SIZE + 16);
-        let obj2 = gc.alloc_in_oldgen(0, GcHeader::SIZE + 16);
-        let hdr1 = unsafe { header_of(obj1.0) };
-        let hdr2 = unsafe { header_of(obj2.0) };
-        hdr1.set_flag(flags::HAS_CARDS);
-        hdr2.set_flag(flags::HAS_CARDS);
+        let obj1 = gc.alloc_external_with_cards(tid, payload, array_length);
+        let obj2 = gc.alloc_external_with_cards(tid, payload, array_length);
+        unsafe {
+            *(obj1.0 as *mut usize) = array_length;
+        }
+        unsafe {
+            *(obj2.0 as *mut usize) = array_length;
+        }
 
         gc.do_write_barrier_card(obj1, 0, DEFAULT_CARD_PAGE_SHIFT);
         gc.do_write_barrier_card(obj2, 0, DEFAULT_CARD_PAGE_SHIFT);
 
-        // Clear only obj1's cards.
         gc.clear_cards(obj1.0);
 
         assert!(!gc.is_card_dirty(obj1, 0), "obj1 cards should be cleared");
@@ -2757,13 +2840,13 @@ mod tests {
 
         // Simulate a minor collection that promoted more than one step's worth
         // of objects so incminimark-style accounting demands extra progress.
-        gc.bytes_made_old_since_cycle = gc.config.nursery_size;
-        gc.threshold_bytes_made_old = 0;
+        gc.size_objects_made_old = gc.config.nursery_size;
+        gc.threshold_objects_made_old = 0;
         gc.run_major_progress_after_minor();
 
         assert!(
             gc.incremental_objects_marked() >= 2
-                || gc.threshold_bytes_made_old > gc.config.nursery_size / 2,
+                || gc.threshold_objects_made_old > gc.config.nursery_size / 2,
             "major progress should take multiple steps when promoted bytes outpace credit"
         );
 
@@ -3076,17 +3159,13 @@ mod tests {
         let array_length = 512usize;
         let total_payload = 8 + ptr_size * array_length;
 
-        // Allocate the array directly in old gen (it's large).
-        let arr = gc.alloc_in_oldgen(arr_tid, GcHeader::SIZE + total_payload);
+        // Allocate the array in old gen with inline card bytes.
+        let arr = gc.alloc_external_with_cards(arr_tid, total_payload, array_length);
 
         // Write the length field.
         unsafe {
             *(arr.0 as *mut usize) = array_length;
         }
-
-        // Enable card marking on this object.
-        let hdr = unsafe { header_of(arr.0) };
-        hdr.set_flag(flags::HAS_CARDS);
 
         // Initialize all array slots to NULL.
         let items_start = arr.0 + 8;
@@ -3158,7 +3237,7 @@ mod tests {
 
         // Cards should be cleared after collection.
         assert!(
-            gc.card_dirty.is_empty(),
+            !unsafe { header_of(arr.0) }.has_flag(flags::CARDS_SET),
             "card table should be cleared after collection"
         );
         let hdr = unsafe { header_of(root.0) };
@@ -3251,16 +3330,16 @@ mod tests {
 
         // A and B should be in the remembered set.
         assert!(
-            gc.remembered_set.contains(&root_a.0),
+            gc.old_objects_pointing_to_young.contains(&root_a.0),
             "write barrier should add A to remembered set during marking"
         );
         assert!(
-            gc.remembered_set.contains(&root_b.0),
+            gc.old_objects_pointing_to_young.contains(&root_b.0),
             "write barrier should add B to remembered set during marking"
         );
         // C was not written to, so it shouldn't be in remembered set.
         assert!(
-            !gc.remembered_set.contains(&root_c.0),
+            !gc.old_objects_pointing_to_young.contains(&root_c.0),
             "C should not be in remembered set"
         );
 
@@ -3488,19 +3567,19 @@ mod tests {
         gc.jit_remember_young_pointer(obj);
 
         assert!(!hdr.has_flag(flags::TRACK_YOUNG_PTRS));
-        assert_eq!(gc.remembered_set_len(), 1);
+        assert_eq!(gc.old_objects_pointing_to_young_len(), 1);
 
         // Calling again adds a second entry (JIT fast-path does not
         // deduplicate; the collector handles this during minor collection).
         gc.jit_remember_young_pointer(obj);
-        assert_eq!(gc.remembered_set_len(), 2);
+        assert_eq!(gc.old_objects_pointing_to_young_len(), 2);
     }
 
     #[test]
     fn test_jit_remember_young_pointer_null_is_noop() {
         let mut gc = test_gc(4096);
         gc.jit_remember_young_pointer(GcRef::NULL);
-        assert_eq!(gc.remembered_set_len(), 0);
+        assert_eq!(gc.old_objects_pointing_to_young_len(), 0);
     }
 
     #[test]

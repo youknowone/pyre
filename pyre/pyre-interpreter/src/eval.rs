@@ -314,11 +314,11 @@ impl SharedOpcodeHandler for PyFrame {
 
 impl LocalOpcodeHandler for PyFrame {
     fn load_local_value(&mut self, idx: usize) -> Result<Self::Value, PyError> {
-        Ok(self.locals_cells_stack_w[idx])
+        Ok(self.locals_w()[idx])
     }
 
     fn load_local_checked_value(&mut self, idx: usize, name: &str) -> Result<Self::Value, PyError> {
-        let value = self.locals_cells_stack_w[idx];
+        let value = self.locals_w()[idx];
         if value.is_null() {
             return Err(PyError::new(
                 PyErrorKind::NameError,
@@ -334,7 +334,7 @@ impl LocalOpcodeHandler for PyFrame {
     fn store_local_value(&mut self, idx: usize, value: Self::Value) -> Result<(), PyError> {
         // STORE_FAST always writes directly to the slot.
         // Cell content updates use STORE_DEREF, not STORE_FAST.
-        self.locals_cells_stack_w[idx] = value;
+        self.locals_w_mut()[idx] = value;
         Ok(())
     }
 }
@@ -374,7 +374,7 @@ impl StackOpcodeHandler for PyFrame {
     fn swap_values(&mut self, depth: usize) -> Result<(), PyError> {
         let top_idx = self.valuestackdepth - 1;
         let other_idx = self.valuestackdepth - depth;
-        self.locals_cells_stack_w.swap(top_idx, other_idx);
+        self.locals_w_mut().swap(top_idx, other_idx);
         Ok(())
     }
 }
@@ -407,14 +407,16 @@ impl IterOpcodeHandler for PyFrame {
             if pyre_object::is_list(iter) {
                 let len = pyre_object::w_list_len(iter);
                 let seq_iter = pyre_object::w_seq_iter_new(iter, len);
-                self.locals_cells_stack_w[self.valuestackdepth - 1] = seq_iter;
+                let tos = self.valuestackdepth - 1;
+                self.locals_w_mut()[tos] = seq_iter;
                 return Ok(());
             }
             // tuple → seq_iter
             if pyre_object::is_tuple(iter) {
                 let len = pyre_object::w_tuple_len(iter);
                 let seq_iter = pyre_object::w_seq_iter_new(iter, len);
-                self.locals_cells_stack_w[self.valuestackdepth - 1] = seq_iter;
+                let tos = self.valuestackdepth - 1;
+                self.locals_w_mut()[tos] = seq_iter;
                 return Ok(());
             }
             // str → list of 1-char strings → seq_iter
@@ -430,7 +432,8 @@ impl IterOpcodeHandler for PyFrame {
                 let char_list = pyre_object::w_list_new(chars);
                 let len = s.chars().count();
                 let seq_iter = pyre_object::w_seq_iter_new(char_list, len);
-                self.locals_cells_stack_w[self.valuestackdepth - 1] = seq_iter;
+                let tos = self.valuestackdepth - 1;
+                self.locals_w_mut()[tos] = seq_iter;
                 return Ok(());
             }
             // bytes/bytearray → list of int → seq_iter
@@ -444,7 +447,8 @@ impl IterOpcodeHandler for PyFrame {
                 }
                 let list = pyre_object::w_list_new(items);
                 let seq_iter = pyre_object::w_seq_iter_new(list, len);
-                self.locals_cells_stack_w[self.valuestackdepth - 1] = seq_iter;
+                let tos = self.valuestackdepth - 1;
+                self.locals_w_mut()[tos] = seq_iter;
                 return Ok(());
             }
             // dict → iterate over keys (PyPy: dictobject.py __iter__ → dict_keys)
@@ -455,7 +459,8 @@ impl IterOpcodeHandler for PyFrame {
                 let key_list = pyre_object::w_list_new(keys);
                 let len = entries.len();
                 let seq_iter = pyre_object::w_seq_iter_new(key_list, len);
-                self.locals_cells_stack_w[self.valuestackdepth - 1] = seq_iter;
+                let tos = self.valuestackdepth - 1;
+                self.locals_w_mut()[tos] = seq_iter;
                 return Ok(());
             }
             // set / frozenset → iterate via insertion order (PyPy:
@@ -465,7 +470,8 @@ impl IterOpcodeHandler for PyFrame {
                 let len = items.len();
                 let key_list = pyre_object::w_list_new(items);
                 let seq_iter = pyre_object::w_seq_iter_new(key_list, len);
-                self.locals_cells_stack_w[self.valuestackdepth - 1] = seq_iter;
+                let tos = self.valuestackdepth - 1;
+                self.locals_w_mut()[tos] = seq_iter;
                 return Ok(());
             }
             // User-defined __iter__ — PyPy: space.iter → __iter__()
@@ -474,7 +480,8 @@ impl IterOpcodeHandler for PyFrame {
             // PyObject_GetIter → tp_iter or PySeqIter_New).
             if pyre_object::is_instance(iter) {
                 let result = crate::baseobjspace::iter(iter)?;
-                self.locals_cells_stack_w[self.valuestackdepth - 1] = result;
+                let tos = self.valuestackdepth - 1;
+                self.locals_w_mut()[tos] = result;
                 return Ok(());
             }
             // Type object: metaclass __iter__ (NOT the type's own MRO)
@@ -494,7 +501,8 @@ impl IterOpcodeHandler for PyFrame {
                     if let Some(method) = crate::baseobjspace::lookup_in_type(metaclass, "__iter__")
                     {
                         let result = crate::call_function(method, &[iter]);
-                        self.locals_cells_stack_w[self.valuestackdepth - 1] = result;
+                        let tos = self.valuestackdepth - 1;
+                        self.locals_w_mut()[tos] = result;
                         return Ok(());
                     }
                 }
@@ -749,13 +757,13 @@ impl OpcodeStepExecutor for PyFrame {
         if depth < 1 {
             return Err(PyError::type_error("WITH_EXCEPT_START on empty stack"));
         }
-        let val = self.locals_cells_stack_w[depth - 1];
+        let val = self.locals_w()[depth - 1];
         // Find exit_func: walk down from TOS-1 looking for the first
         // callable. CPython's static layout puts it at TOS-4, but pyre's
         // SWAP path may leave a NULL or different offset.
         let mut exit_func = pyre_object::PY_NULL;
         for offset in 2..=depth.min(8) {
-            let candidate = self.locals_cells_stack_w[depth - offset];
+            let candidate = self.locals_w()[depth - offset];
             if candidate.is_null() {
                 continue;
             }
@@ -853,7 +861,7 @@ impl OpcodeStepExecutor for PyFrame {
     /// PyPy: pyopcode.py LOAD_DEREF → cell.get()
     /// If the slot holds a cell object, dereference it to get the value.
     fn load_deref(&mut self, idx: usize) -> Result<(), Self::Error> {
-        let slot = self.locals_cells_stack_w[idx];
+        let slot = self.locals_w()[idx];
         let value = if !slot.is_null() && unsafe { pyre_object::is_cell(slot) } {
             unsafe { pyre_object::w_cell_get(slot) }
         } else {
@@ -873,11 +881,11 @@ impl OpcodeStepExecutor for PyFrame {
     /// PyPy: pyopcode.py STORE_DEREF → cell.set(value)
     fn store_deref(&mut self, idx: usize) -> Result<(), Self::Error> {
         let value = self.pop();
-        let slot = self.locals_cells_stack_w[idx];
+        let slot = self.locals_w()[idx];
         if !slot.is_null() && unsafe { pyre_object::is_cell(slot) } {
             unsafe { pyre_object::w_cell_set(slot, value) };
         } else {
-            self.locals_cells_stack_w[idx] = value;
+            self.locals_w_mut()[idx] = value;
         }
         Ok(())
     }
@@ -886,7 +894,7 @@ impl OpcodeStepExecutor for PyFrame {
     ///
     /// PyPy: pyopcode.py LOAD_CLOSURE → push cell for closure capture.
     fn load_closure(&mut self, idx: usize) -> Result<(), Self::Error> {
-        let cell = self.locals_cells_stack_w[idx];
+        let cell = self.locals_w()[idx];
         self.push(cell);
         Ok(())
     }
@@ -908,14 +916,14 @@ impl OpcodeStepExecutor for PyFrame {
                 eprintln!("  {i}: {:?}", instr);
             }
         }
-        let current = self.locals_cells_stack_w[idx];
-        self.locals_cells_stack_w[idx] = pyre_object::w_cell_new(current);
+        let current = self.locals_w()[idx];
+        self.locals_w_mut()[idx] = pyre_object::w_cell_new(current);
         Ok(())
     }
 
     fn delete_deref(&mut self, idx: usize) -> Result<(), Self::Error> {
         let nlocals = self.nlocals();
-        self.locals_cells_stack_w[nlocals + idx] = PY_NULL;
+        self.locals_w_mut()[nlocals + idx] = PY_NULL;
         Ok(())
     }
 
@@ -1091,7 +1099,7 @@ impl OpcodeStepExecutor for PyFrame {
     // ── DeleteFast ──
 
     fn delete_fast(&mut self, idx: usize) -> Result<(), Self::Error> {
-        self.locals_cells_stack_w[idx] = PY_NULL;
+        self.locals_w_mut()[idx] = PY_NULL;
         Ok(())
     }
 
@@ -1249,9 +1257,9 @@ impl OpcodeStepExecutor for PyFrame {
 
     // ── LoadFastAndClear (comprehension scope) ──
     fn load_fast_and_clear(&mut self, idx: usize) -> Result<(), Self::Error> {
-        let val = self.locals_cells_stack_w[idx];
+        let val = self.locals_w()[idx];
         self.push(val);
-        self.locals_cells_stack_w[idx] = PY_NULL;
+        self.locals_w_mut()[idx] = PY_NULL;
         Ok(())
     }
 
@@ -1475,7 +1483,7 @@ impl OpcodeStepExecutor for PyFrame {
         gen_frame.next_instr = self.next_instr;
         // Copy locals + cells + stack
         for i in 0..self.valuestackdepth {
-            gen_frame.locals_cells_stack_w[i] = self.locals_cells_stack_w[i];
+            gen_frame.locals_w_mut()[i] = self.locals_w()[i];
         }
         gen_frame.valuestackdepth = self.valuestackdepth;
         gen_frame.block_stack = self.block_stack.clone();
@@ -1829,7 +1837,7 @@ impl OpcodeStepExecutor for PyFrame {
             } else {
                 let code = &*crate::pyframe_get_pycode(self);
                 for (idx, name) in code.varnames.iter().enumerate() {
-                    let value = self.locals_cells_stack_w[idx];
+                    let value = self.locals_w()[idx];
                     if !value.is_null() {
                         pyre_object::w_dict_store(dict, pyre_object::w_str_new(name), value);
                     }

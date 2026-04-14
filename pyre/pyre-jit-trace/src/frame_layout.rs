@@ -16,7 +16,7 @@ struct PyFrameLayout {
     #[allow(dead_code)]
     code: *const CodeObject,
     #[allow(dead_code)]
-    locals_cells_stack_w: PyObjectArray,
+    locals_cells_stack_w: *mut PyObjectArray,
     #[allow(dead_code)]
     valuestackdepth: usize,
     #[allow(dead_code)]

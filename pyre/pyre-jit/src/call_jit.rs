@@ -266,7 +266,8 @@ pub fn arena_global_info() -> majit_backend_cranelift::InlineFrameArenaInfo {
         buf_base_addr: unsafe { std::ptr::addr_of!(ARENA_BUF_BASE) as usize },
         top_addr: unsafe { std::ptr::addr_of!(ARENA_TOP) as usize },
         initialized_addr: unsafe { std::ptr::addr_of!(ARENA_INITIALIZED) as usize },
-        frame_size: std::mem::size_of::<pyre_interpreter::pyframe::PyFrame>(),
+        frame_size: GC_HEADER_SIZE + std::mem::size_of::<pyre_interpreter::pyframe::PyFrame>(),
+        gc_header_size: GC_HEADER_SIZE,
         frame_code_offset: pyre_interpreter::pyframe::PYFRAME_CODE_OFFSET,
         frame_next_instr_offset: pyre_interpreter::pyframe::PYFRAME_NEXT_INSTR_OFFSET,
         frame_vable_token_offset: pyre_interpreter::pyframe::PYFRAME_VABLE_TOKEN_OFFSET,
@@ -274,10 +275,6 @@ pub fn arena_global_info() -> majit_backend_cranelift::InlineFrameArenaInfo {
         drop_fn_addr: jit_drop_callee_frame as *const () as usize,
         arena_cap: ARENA_CAP,
         jitframe_descrs: Some(majit_gc::rewrite::JitFrameDescrs {
-            create_fn_addrs: vec![
-                jit_create_self_recursive_callee_frame_1_raw_int as *const () as usize,
-            ],
-            drop_fn_addr: jit_drop_callee_frame as *const () as usize,
             jitframe_tid: crate::jit::descr::JITFRAME_GC_TYPE_ID,
             jitframe_fixed_size: JITFRAME_FIXED_SIZE,
             jf_frame_info_ofs: JF_FRAME_INFO_OFS,
@@ -290,14 +287,6 @@ pub fn arena_global_info() -> majit_backend_cranelift::InlineFrameArenaInfo {
             jf_frame_baseitemofs: BASEITEMOFS,
             jf_frame_lengthofs: LENGTHOFS,
             sign_size: SIGN_SIZE,
-            pyframe_alloc_size: std::mem::size_of::<pyre_interpreter::pyframe::PyFrame>(),
-            pyframe_code_ofs: pyre_interpreter::pyframe::PYFRAME_CODE_OFFSET,
-            pyframe_namespace_ofs: std::mem::offset_of!(
-                pyre_interpreter::pyframe::PyFrame,
-                namespace
-            ),
-            pyframe_next_instr_ofs: pyre_interpreter::pyframe::PYFRAME_NEXT_INSTR_OFFSET,
-            pyframe_vable_token_ofs: pyre_interpreter::pyframe::PYFRAME_VABLE_TOKEN_OFFSET,
         }),
     }
 }
@@ -308,9 +297,19 @@ pub fn arena_global_info() -> majit_backend_cranelift::InlineFrameArenaInfo {
 // Eliminates heap allocation for recursion depths up to ARENA_CAP.
 
 const ARENA_CAP: usize = 64;
+use pyre_interpreter::pyframe::GC_HEADER_SIZE;
+
+/// Arena slot: GC header (zeroed) + PyFrame.
+/// Write barriers read `*(frame_ptr - 8)` for the flag byte;
+/// the zeroed header makes `TRACK_YOUNG_PTRS=0` → fast-path skip.
+#[repr(C, align(8))]
+struct ArenaSlot {
+    _gc_header: [u8; GC_HEADER_SIZE],
+    frame: MaybeUninit<PyFrame>,
+}
 
 struct FrameArena {
-    buf: Box<[MaybeUninit<PyFrame>; ARENA_CAP]>,
+    buf: Box<[ArenaSlot; ARENA_CAP]>,
     /// Number of frames currently in use (LIFO stack pointer).
     top: usize,
     /// Frames below this index have been initialized at least once.
@@ -321,7 +320,14 @@ struct FrameArena {
 impl FrameArena {
     fn new() -> Self {
         let mut arena = Self {
-            buf: Box::new([const { MaybeUninit::uninit() }; ARENA_CAP]),
+            buf: Box::new(
+                [const {
+                    ArenaSlot {
+                        _gc_header: [0u8; GC_HEADER_SIZE],
+                        frame: MaybeUninit::uninit(),
+                    }
+                }; ARENA_CAP],
+            ),
             top: 0,
             initialized: 0,
         };
@@ -336,6 +342,7 @@ impl FrameArena {
     }
 
     /// Take the next frame slot. Returns (ptr, was_previously_initialized).
+    /// The returned pointer has a zeroed GC header at `ptr - GC_HEADER_SIZE`.
     #[inline]
     fn take(&mut self) -> Option<(*mut PyFrame, bool)> {
         if self.top < ARENA_CAP {
@@ -344,7 +351,7 @@ impl FrameArena {
             unsafe {
                 ARENA_TOP = self.top;
             }
-            let ptr = self.buf[idx].as_mut_ptr();
+            let ptr = self.buf[idx].frame.as_mut_ptr();
             let was_init = idx < self.initialized;
             Some((ptr, was_init))
         } else {
@@ -355,15 +362,14 @@ impl FrameArena {
     /// Return a frame to the arena. Must be the most recently taken frame (LIFO).
     #[inline]
     fn put(&mut self, ptr: *mut PyFrame) -> bool {
-        if self.top > 0 && ptr == self.buf[self.top - 1].as_mut_ptr() {
+        if self.top > 0 && ptr == self.buf[self.top - 1].frame.as_mut_ptr() {
             self.top -= 1;
             unsafe {
                 ARENA_TOP = self.top;
             }
             return true;
         }
-        // Check if within arena range — don't free, but mark as non-LIFO.
-        let base = self.buf[0].as_mut_ptr() as usize;
+        let base = self.buf[0].frame.as_mut_ptr() as usize;
         let end = unsafe { self.buf.as_ptr().add(ARENA_CAP) as usize };
         let addr = ptr as usize;
         addr >= base && addr < end
@@ -521,7 +527,7 @@ fn jit_force_callee_frame_raw(frame_ptr: i64) -> i64 {
             frame.valuestackdepth as i64,
         ];
         for i in 0..nlocals {
-            inputs.push(frame.locals_cells_stack_w[i] as i64);
+            inputs.push(frame.locals_w()[i] as i64);
         }
         #[cfg(feature = "cranelift")]
         if let Some(raw) = majit_backend_cranelift::execute_call_assembler_direct(
@@ -712,8 +718,8 @@ fn blackhole_from_jit_frame(frame: &mut PyFrame) -> Option<PyObjectRef> {
     // pyre-specific path loads from the concrete frame directly.
     let nlocals = code.varnames.len();
     for i in 0..nlocals {
-        if i < frame.locals_cells_stack_w.len() {
-            bh.setarg_r(i, frame.locals_cells_stack_w[i] as i64);
+        if i < frame.locals_w().len() {
+            bh.setarg_r(i, frame.locals_w()[i] as i64);
         }
     }
 
@@ -728,8 +734,8 @@ fn blackhole_from_jit_frame(frame: &mut PyFrame) -> Option<PyObjectRef> {
     for d in 0..vsd.saturating_sub(frame_stack_base) {
         let frame_idx = frame_stack_base + d;
         let reg_idx = nlocals + d;
-        if frame_idx < frame.locals_cells_stack_w.len() && reg_idx < bh.registers_r.len() {
-            bh.setarg_r(reg_idx, frame.locals_cells_stack_w[frame_idx] as i64);
+        if frame_idx < frame.locals_w().len() && reg_idx < bh.registers_r.len() {
+            bh.setarg_r(reg_idx, frame.locals_w()[frame_idx] as i64);
         }
     }
 
@@ -1163,8 +1169,8 @@ pub fn resume_in_blackhole(
             // locals_cells_stack_w array into bh.registers_r so the
             // blackhole can execute with correct operand values.
             let frame = unsafe { &*frame_ptr };
-            for i in 0..nlocals.min(frame.locals_cells_stack_w.len()) {
-                let obj = frame.locals_cells_stack_w[i];
+            for i in 0..nlocals.min(frame.locals_w().len()) {
+                let obj = frame.locals_w()[i];
                 if obj != pyre_object::PY_NULL {
                     bh.setarg_r(i, obj as i64);
                 }
@@ -1172,7 +1178,7 @@ pub fn resume_in_blackhole(
             if majit_metainterp::majit_log_enabled() {
                 eprintln!(
                     "[jit][vable-fill] nvals=0 → loaded {} locals from frame at py_pc={}",
-                    nlocals.min(frame.locals_cells_stack_w.len()),
+                    nlocals.min(frame.locals_w().len()),
                     section.py_pc,
                 );
             }
@@ -1422,11 +1428,11 @@ pub extern "C" fn jit_force_recursive_call_1(
     // result_type=REF: no RawInt unbox needed — arg is already boxed Ref
     if majit_metainterp::majit_log_enabled() {
         let caller = unsafe { &*(caller_frame as *const PyFrame) };
-        let caller_arg0 = if caller.locals_cells_stack_w.len() > 0
-            && !caller.locals_cells_stack_w[0].is_null()
-            && unsafe { is_int(caller.locals_cells_stack_w[0]) }
+        let caller_arg0 = if caller.locals_w().len() > 0
+            && !caller.locals_w()[0].is_null()
+            && unsafe { is_int(caller.locals_w()[0]) }
         {
-            Some(unsafe { w_int_get_value(caller.locals_cells_stack_w[0]) })
+            Some(unsafe { w_int_get_value(caller.locals_w()[0]) })
         } else {
             None
         };
@@ -1446,11 +1452,11 @@ pub extern "C" fn jit_force_recursive_call_1(
     jit_drop_callee_frame(frame_ptr);
     if majit_metainterp::majit_log_enabled() {
         let caller = unsafe { &*(caller_frame as *const PyFrame) };
-        let caller_arg0 = if caller.locals_cells_stack_w.len() > 0
-            && !caller.locals_cells_stack_w[0].is_null()
-            && unsafe { is_int(caller.locals_cells_stack_w[0]) }
+        let caller_arg0 = if caller.locals_w().len() > 0
+            && !caller.locals_w()[0].is_null()
+            && unsafe { is_int(caller.locals_w()[0]) }
         {
-            Some(unsafe { w_int_get_value(caller.locals_cells_stack_w[0]) })
+            Some(unsafe { w_int_get_value(caller.locals_w()[0]) })
         } else {
             None
         };
@@ -2428,10 +2434,10 @@ pub fn create_callee_frame_impl_pub(caller_frame: i64, callable: i64, args: &[Py
 
 #[inline]
 fn reset_reused_call_frame(frame: &mut PyFrame, args: &[PyObjectRef]) {
-    frame.locals_cells_stack_w.as_mut_slice().fill(PY_NULL);
+    frame.locals_w_mut().as_mut_slice().fill(PY_NULL);
     let nargs = args.len().min(frame.nlocals());
     for (idx, value) in args.iter().take(nargs).enumerate() {
-        frame.locals_cells_stack_w[idx] = *value;
+        frame.locals_w_mut()[idx] = *value;
     }
     frame.valuestackdepth = frame.stack_base();
     frame.next_instr = 0;
@@ -2461,6 +2467,7 @@ fn create_callee_frame_impl_1_boxed(
                 reset_reused_call_frame(f, &[boxed_arg]);
             } else {
                 unsafe {
+                    std::ptr::drop_in_place(ptr);
                     std::ptr::write(
                         ptr,
                         PyFrame::new_for_call(
@@ -2486,12 +2493,14 @@ fn create_callee_frame_impl_1_boxed(
         return ptr as i64;
     }
 
-    let frame_ptr = Box::into_raw(Box::new(PyFrame::new_for_call(
-        w_code,
-        &[boxed_arg],
-        globals,
-        caller.execution_context,
-    )));
+    let frame_ptr = unsafe {
+        alloc_frame_with_gc_header(PyFrame::new_for_call(
+            w_code,
+            &[boxed_arg],
+            globals,
+            caller.execution_context,
+        ))
+    };
     unsafe { &mut *frame_ptr }.fix_array_ptrs();
     frame_ptr as i64
 }
@@ -2519,6 +2528,7 @@ fn create_self_recursive_callee_frame_impl_1_boxed(
                 reset_reused_call_frame(f, &[boxed_arg]);
             } else {
                 unsafe {
+                    std::ptr::drop_in_place(ptr);
                     std::ptr::write(
                         ptr,
                         PyFrame::new_for_call(func_code, &[boxed_arg], globals, execution_context),
@@ -2539,12 +2549,14 @@ fn create_self_recursive_callee_frame_impl_1_boxed(
         return ptr as i64;
     }
 
-    let frame_ptr = Box::into_raw(Box::new(PyFrame::new_for_call(
-        func_code,
-        &[boxed_arg],
-        globals,
-        execution_context,
-    )));
+    let frame_ptr = unsafe {
+        alloc_frame_with_gc_header(PyFrame::new_for_call(
+            func_code,
+            &[boxed_arg],
+            globals,
+            execution_context,
+        ))
+    };
     unsafe { &mut *frame_ptr }.fix_array_ptrs();
     frame_ptr as i64
 }
@@ -2568,8 +2580,8 @@ fn create_callee_frame_impl(caller_frame: i64, callable: i64, args: &[PyObjectRe
             {
                 reset_reused_call_frame(f, args);
             } else {
-                // Different function: full reinit (rare for fib)
                 unsafe {
+                    std::ptr::drop_in_place(ptr);
                     std::ptr::write(
                         ptr,
                         PyFrame::new_for_call(w_code, args, globals, caller.execution_context),
@@ -2578,7 +2590,6 @@ fn create_callee_frame_impl(caller_frame: i64, callable: i64, args: &[PyObjectRe
                 }
             }
         } else {
-            // First-time init for this arena slot
             unsafe {
                 std::ptr::write(
                     ptr,
@@ -2592,12 +2603,14 @@ fn create_callee_frame_impl(caller_frame: i64, callable: i64, args: &[PyObjectRe
     }
 
     // Arena full: heap fallback (should not happen for recursion < 64)
-    let frame_ptr = Box::into_raw(Box::new(PyFrame::new_for_call(
-        w_code,
-        args,
-        globals,
-        caller.execution_context,
-    )));
+    let frame_ptr = unsafe {
+        alloc_frame_with_gc_header(PyFrame::new_for_call(
+            w_code,
+            args,
+            globals,
+            caller.execution_context,
+        ))
+    };
     unsafe { &mut *frame_ptr }.fix_array_ptrs();
     frame_ptr as i64
 }
@@ -2660,6 +2673,9 @@ pub extern "C" fn jit_create_self_recursive_callee_frame_1_raw_int(
             reset_reused_call_frame(f, &[boxed]);
         } else {
             unsafe {
+                if was_init {
+                    std::ptr::drop_in_place(ptr);
+                }
                 std::ptr::write(
                     ptr,
                     PyFrame::new_for_call(func_code, &[boxed], globals, execution_context),
@@ -2673,12 +2689,14 @@ pub extern "C" fn jit_create_self_recursive_callee_frame_1_raw_int(
         return ptr as i64;
     }
 
-    let frame_ptr = Box::into_raw(Box::new(PyFrame::new_for_call(
-        func_code,
-        &[boxed],
-        globals,
-        execution_context,
-    )));
+    let frame_ptr = unsafe {
+        alloc_frame_with_gc_header(PyFrame::new_for_call(
+            func_code,
+            &[boxed],
+            globals,
+            execution_context,
+        ))
+    };
     unsafe { &mut *frame_ptr }.fix_array_ptrs();
     frame_ptr as i64
 }
@@ -2763,6 +2781,29 @@ pub extern "C" fn jit_force_callee_frame_boxed(frame_ptr: i64) -> i64 {
     jit_force_callee_frame(frame_ptr)
 }
 
+/// Allocate a PyFrame with a zeroed GC header prepended.
+/// Returns a frame pointer with valid header at `ptr - GC_HEADER_SIZE`.
+unsafe fn alloc_frame_with_gc_header(frame: PyFrame) -> *mut PyFrame {
+    let total = GC_HEADER_SIZE + std::mem::size_of::<PyFrame>();
+    let layout = std::alloc::Layout::from_size_align(total, 8).unwrap();
+    let raw = std::alloc::alloc_zeroed(layout);
+    if raw.is_null() {
+        std::alloc::handle_alloc_error(layout);
+    }
+    let frame_ptr = raw.add(GC_HEADER_SIZE) as *mut PyFrame;
+    std::ptr::write(frame_ptr, frame);
+    frame_ptr
+}
+
+/// Deallocate a PyFrame allocated with [`alloc_frame_with_gc_header`].
+unsafe fn dealloc_frame_with_gc_header(frame_ptr: *mut PyFrame) {
+    std::ptr::drop_in_place(frame_ptr);
+    let raw = (frame_ptr as *mut u8).sub(GC_HEADER_SIZE);
+    let total = GC_HEADER_SIZE + std::mem::size_of::<PyFrame>();
+    let layout = std::alloc::Layout::from_size_align(total, 8).unwrap();
+    std::alloc::dealloc(raw, layout);
+}
+
 pub extern "C" fn jit_drop_callee_frame(frame_ptr: i64) {
     if frame_ptr & 1 != 0 {
         return;
@@ -2771,8 +2812,7 @@ pub extern "C" fn jit_drop_callee_frame(frame_ptr: i64) {
     let arena = arena_ref();
     let reused = arena.put(ptr);
     if !reused {
-        // Not an arena frame (heap fallback) — free it
-        unsafe { drop(Box::from_raw(ptr)) };
+        unsafe { dealloc_frame_with_gc_header(ptr) };
     }
 }
 

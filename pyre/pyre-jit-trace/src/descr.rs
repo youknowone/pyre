@@ -526,7 +526,7 @@ static W_LIST_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             ),
             (
                 "W_ListObject.items.heap_cap",
-                std::mem::offset_of!(W_ListObject, items) + PYOBJECT_ARRAY_HEAP_CAP_OFFSET,
+                std::mem::offset_of!(W_ListObject, items) + PYOBJECT_ARRAY_CAP_OFFSET,
                 8,
                 Type::Int,
                 false,
@@ -732,7 +732,7 @@ use pyre_object::rangeobject::{
 use pyre_object::{
     BOOL_BOOLVAL_OFFSET, DICT_LEN_OFFSET, FLOAT_ARRAY_HEAP_CAP_OFFSET, FLOAT_ARRAY_LEN_OFFSET,
     FLOAT_ARRAY_PTR_OFFSET, INT_ARRAY_HEAP_CAP_OFFSET, INT_ARRAY_LEN_OFFSET, INT_ARRAY_PTR_OFFSET,
-    INT_INTVAL_OFFSET, PYOBJECT_ARRAY_HEAP_CAP_OFFSET, PYOBJECT_ARRAY_LEN_OFFSET, STR_LEN_OFFSET,
+    INT_INTVAL_OFFSET, PYOBJECT_ARRAY_CAP_OFFSET, PYOBJECT_ARRAY_LEN_OFFSET, STR_LEN_OFFSET,
     W_ListObject, W_TupleObject,
 };
 use pyre_object::{FLOAT_TYPE, INT_TYPE};

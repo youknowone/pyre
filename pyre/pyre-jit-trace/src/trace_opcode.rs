@@ -1719,7 +1719,7 @@ impl MIFrame {
         // current symbolic depth. Read the physical frame length and
         // pad missing slots with the live concrete value (or NULL).
         let physical_array_len = concrete_frame
-            .map(|f| f.locals_cells_stack_w.len())
+            .map(|f| f.locals_w().len())
             .unwrap_or_else(|| {
                 let current_vsd = sym.pre_opcode_vsd.unwrap_or(sym.valuestackdepth);
                 let stack_depth = current_vsd
@@ -1743,7 +1743,7 @@ impl MIFrame {
                 boxes.push(Self::opref_to_snapshot_tagged(opref, ctx));
             } else if let Some(frame) = concrete_frame {
                 let val = frame
-                    .locals_cells_stack_w
+                    .locals_w()
                     .as_slice()
                     .get(i)
                     .copied()

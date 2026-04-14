@@ -103,10 +103,11 @@ pub struct VableArrayInfo {
 /// Physical storage strategy for a virtualizable array field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VableArrayStorage {
-    /// The frame field stores a raw pointer to an array object.
+    /// The frame field stores a raw pointer directly to array items.
     DirectPointer,
-    /// The frame field stores an embedded array container with a separate
-    /// data pointer and length, e.g. `PyObjectArray`.
+    /// The frame field stores a pointer to an array container struct
+    /// (e.g. `*mut PyObjectArray`). The data pointer is at `ptr_offset`
+    /// within that container (2-level indirection).
     EmbeddedArray { ptr_offset: usize },
 }
 
@@ -247,17 +248,13 @@ impl VirtualizableInfo {
             })
             .collect();
         // virtualizable.py:73-74: self.array_field_descrs = [cpu.fielddescrof(VTYPE, name) ...]
-        // RPython uses DirectPointer only: field offset IS the pointer offset.
-        // EmbeddedArray (Rust-only): the actual pointer lives at field_offset + ptr_offset,
-        // so the descriptor offset must account for that to match GETFIELD_GC_R semantics.
+        // The descriptor offset is the field_offset — the position of the
+        // array pointer within the virtualizable struct.
         self._array_field_descrs = self
             .array_fields
             .iter()
             .map(|a| {
-                let offset = match a.storage {
-                    VableArrayStorage::DirectPointer => a.field_offset,
-                    VableArrayStorage::EmbeddedArray { ptr_offset } => a.field_offset + ptr_offset,
-                };
+                let offset = a.field_offset;
                 Self::build_field_descr(
                     &descr,
                     offset,
@@ -707,7 +704,8 @@ impl VirtualizableInfo {
                 }
             }
             VableArrayStorage::EmbeddedArray { .. } => {
-                *(obj_ptr.add(ai.field_offset + ai.length_offset) as *const usize)
+                let container = *(obj_ptr.add(ai.field_offset) as *const *const u8);
+                *(container.add(ai.length_offset) as *const usize)
             }
         }
     }
@@ -957,7 +955,10 @@ impl VableArrayInfo {
                 *(obj_ptr.add(self.field_offset) as *const *const u8)
             }
             VableArrayStorage::EmbeddedArray { ptr_offset } => {
-                *(obj_ptr.add(self.field_offset + ptr_offset) as *const *const u8)
+                // 2-level: field_offset → pointer to container struct,
+                // then ptr_offset within that struct → data pointer.
+                let container = *(obj_ptr.add(self.field_offset) as *const *const u8);
+                *(container.add(ptr_offset) as *const *const u8)
             }
         }
     }
@@ -2236,12 +2237,11 @@ impl crate::resume::VirtualizableInfo for VirtualizableInfo {
 pub unsafe fn vable_array_len(vable_ptr: *const u8, array: &VableArrayInfo) -> usize {
     match array.storage {
         VableArrayStorage::EmbeddedArray { .. } => {
-            // Embedded array: length at field_offset + length_offset
-            let container = vable_ptr.add(array.field_offset);
+            // Pointer to container struct: deref then read length
+            let container = *(vable_ptr.add(array.field_offset) as *const *const u8);
             *(container.add(array.length_offset) as *const usize)
         }
         VableArrayStorage::DirectPointer => {
-            // Direct pointer: dereference pointer, then read length
             let arr_ptr = *(vable_ptr.add(array.field_offset) as *const *const u8);
             if arr_ptr.is_null() {
                 0
@@ -2262,7 +2262,7 @@ pub unsafe fn vable_read_array_item(
     let item_size = 8usize; // i64/ptr size
     let data_ptr = match array.storage {
         VableArrayStorage::EmbeddedArray { ptr_offset } => {
-            let container = vable_ptr.add(array.field_offset);
+            let container = *(vable_ptr.add(array.field_offset) as *const *const u8);
             *(container.add(ptr_offset) as *const *const u8)
         }
         VableArrayStorage::DirectPointer => {
@@ -2289,7 +2289,7 @@ pub unsafe fn vable_write_array_item(
     let item_size = 8usize; // i64/ptr size
     let data_ptr = match array.storage {
         VableArrayStorage::EmbeddedArray { ptr_offset } => {
-            let container = vable_ptr.add(array.field_offset);
+            let container = *(vable_ptr.add(array.field_offset) as *const *mut u8);
             *(container.add(ptr_offset) as *const *mut u8)
         }
         VableArrayStorage::DirectPointer => {

@@ -54,8 +54,10 @@ pub struct PyFrame {
     /// PyPy: pyframe.py `self.pycode = code` — stores the PyCode instance.
     /// Same pointer as `func.getcode()`, so `getcode(func) == frame.code`.
     pub code: *const (),
-    /// Unified locals + cells + operand stack array.
-    pub locals_cells_stack_w: PyObjectArray,
+    /// pypy/interpreter/pyframe.py:84 locals_cells_stack_w
+    /// Ptr(GcArray(W_Root)) — pointer to heap-allocated ref array.
+    /// RPython: `self.locals_cells_stack_w = [None] * size`
+    pub locals_cells_stack_w: *mut PyObjectArray,
     /// Absolute index into `locals_cells_stack_w` marking the top of the
     /// operand stack. Starts at `nlocals + ncells` (empty stack), grows upward.
     pub valuestackdepth: usize,
@@ -93,6 +95,60 @@ pub struct PyFrame {
     /// and LOAD_NAME checks here first before falling back to `namespace`.
     /// Used for class body execution where locals ≠ globals.
     pub class_locals: *mut PyNamespace,
+}
+
+/// GC header size in bytes.  Matches `majit_gc::header::GcHeader::SIZE`.
+/// Every PyObjectArray and PyFrame allocation prepends this many zero bytes
+/// so that RPython-style write barriers (`*(obj + wb_byteofs) & mask`) read a
+/// valid header with `TRACK_YOUNG_PTRS=0` and skip the slow path.
+pub const GC_HEADER_SIZE: usize = 8;
+
+/// Allocate a `PyObjectArray` with a zeroed GC header prepended.
+///
+/// incminimark write barrier reads at `obj - HEADER_SIZE`;
+/// zeroed header ⇒ `TRACK_YOUNG_PTRS` clear ⇒ barrier fast-path skips.
+pub unsafe fn alloc_array_with_gc_header(array: PyObjectArray) -> *mut PyObjectArray {
+    let total = GC_HEADER_SIZE + std::mem::size_of::<PyObjectArray>();
+    let layout = std::alloc::Layout::from_size_align(total, 8).unwrap();
+    let raw = std::alloc::alloc_zeroed(layout);
+    if raw.is_null() {
+        std::alloc::handle_alloc_error(layout);
+    }
+    let ptr = raw.add(GC_HEADER_SIZE) as *mut PyObjectArray;
+    std::ptr::write(ptr, array);
+    ptr
+}
+
+/// Deallocate a `PyObjectArray` that was allocated with [`alloc_array_with_gc_header`].
+pub unsafe fn dealloc_array_with_gc_header(ptr: *mut PyObjectArray) {
+    std::ptr::drop_in_place(ptr);
+    let raw = (ptr as *mut u8).sub(GC_HEADER_SIZE);
+    let total = GC_HEADER_SIZE + std::mem::size_of::<PyObjectArray>();
+    let layout = std::alloc::Layout::from_size_align(total, 8).unwrap();
+    std::alloc::dealloc(raw, layout);
+}
+
+impl Drop for PyFrame {
+    fn drop(&mut self) {
+        if !self.locals_cells_stack_w.is_null() {
+            unsafe { dealloc_array_with_gc_header(self.locals_cells_stack_w) };
+            self.locals_cells_stack_w = std::ptr::null_mut();
+        }
+    }
+}
+
+impl PyFrame {
+    /// Access locals_cells_stack_w (deref the pointer).
+    #[inline]
+    pub fn locals_w(&self) -> &PyObjectArray {
+        unsafe { &*self.locals_cells_stack_w }
+    }
+
+    /// Mutably access locals_cells_stack_w.
+    #[inline]
+    pub fn locals_w_mut(&mut self) -> &mut PyObjectArray {
+        unsafe { &mut *self.locals_cells_stack_w }
+    }
 }
 
 /// Extract raw CodeObject from frame's W_CodeObject.
@@ -365,14 +421,13 @@ impl PyFrame {
         let raw =
             unsafe { crate::w_code_get_ptr(code as pyre_object::PyObjectRef) as *const CodeObject };
         self.namespace = namespace;
-        self.locals_cells_stack_w = PyObjectArray::filled(
-            unsafe {
-                (&*raw).varnames.len()
-                    + ncells(unsafe { &*raw })
-                    + unsafe { (&*raw).max_stackdepth as usize }
-            },
-            PY_NULL,
-        );
+        unsafe { dealloc_array_with_gc_header(self.locals_cells_stack_w) };
+        self.locals_cells_stack_w = unsafe {
+            alloc_array_with_gc_header(PyObjectArray::filled(
+                (&*raw).varnames.len() + ncells(&*raw) + (&*raw).max_stackdepth as usize,
+                PY_NULL,
+            ))
+        };
         self.valuestackdepth = unsafe { (&*raw).varnames.len() + ncells(unsafe { &*raw }) };
         self.next_instr = 0;
         self.block_stack.clear();
@@ -403,7 +458,7 @@ impl PyFrame {
     /// PyPy-compatible `_getcell`.
     #[inline]
     pub fn _getcell(&self, varindex: usize) -> PyObjectRef {
-        self.locals_cells_stack_w
+        self.locals_w()
             .as_slice()
             .get(self.nlocals() + varindex)
             .copied()
@@ -444,7 +499,12 @@ impl PyFrame {
         PyFrame {
             execution_context,
             code,
-            locals_cells_stack_w: crate::PyObjectArray::from_vec(vec![pyre_object::PY_NULL; size]),
+            locals_cells_stack_w: unsafe {
+                alloc_array_with_gc_header(crate::PyObjectArray::from_vec(vec![
+                    pyre_object::PY_NULL;
+                    size
+                ]))
+            },
             valuestackdepth: nlocals + ncells,
             next_instr: 0,
             namespace,
@@ -497,10 +557,12 @@ impl PyFrame {
         PyFrame {
             execution_context,
             code,
-            locals_cells_stack_w: PyObjectArray::filled(
-                num_locals + num_cells + max_stack,
-                PY_NULL,
-            ),
+            locals_cells_stack_w: unsafe {
+                alloc_array_with_gc_header(PyObjectArray::filled(
+                    num_locals + num_cells + max_stack,
+                    PY_NULL,
+                ))
+            },
             valuestackdepth: num_locals + num_cells,
             next_instr: 0,
             namespace,
@@ -521,7 +583,9 @@ impl PyFrame {
         let mut frame = Box::new(PyFrame {
             execution_context: self.execution_context,
             code: self.code,
-            locals_cells_stack_w: PyObjectArray::from_vec(self.locals_cells_stack_w.to_vec()),
+            locals_cells_stack_w: unsafe {
+                alloc_array_with_gc_header(PyObjectArray::from_vec(self.locals_w().to_vec()))
+            },
             valuestackdepth: self.valuestackdepth,
             next_instr: self.next_instr,
             namespace: self.namespace,
@@ -560,7 +624,8 @@ impl PyFrame {
     #[inline]
     pub fn push(&mut self, value: PyObjectRef) {
         self.assert_stack_index(self.valuestackdepth);
-        self.locals_cells_stack_w[self.valuestackdepth] = value;
+        let idx = self.valuestackdepth;
+        self.locals_w_mut()[idx] = value;
         self.valuestackdepth += 1;
     }
 
@@ -568,21 +633,21 @@ impl PyFrame {
     pub fn pop(&mut self) -> PyObjectRef {
         assert!(self.valuestackdepth > self.stack_base());
         let depth = self.valuestackdepth - 1;
-        let value = self.locals_cells_stack_w[depth];
-        self.locals_cells_stack_w[depth] = PY_NULL;
+        let value = self.locals_w()[depth];
+        self.locals_w_mut()[depth] = PY_NULL;
         self.valuestackdepth = depth;
         value
     }
 
     #[inline]
     pub fn peek(&self) -> PyObjectRef {
-        self.locals_cells_stack_w[self.valuestackdepth - 1]
+        self.locals_w()[self.valuestackdepth - 1]
     }
 
     #[inline]
     #[allow(dead_code)]
     pub fn peek_at(&self, depth: usize) -> PyObjectRef {
-        self.locals_cells_stack_w[self.valuestackdepth - 1 - depth]
+        self.locals_w()[self.valuestackdepth - 1 - depth]
     }
 
     /// PyPy-compatible stack operation aliases.
@@ -657,7 +722,7 @@ impl PyFrame {
         self.assert_stack_index(base);
         let mut values = Vec::with_capacity(n);
         for i in base..self.valuestackdepth {
-            values.push(self.locals_cells_stack_w[i]);
+            values.push(self.locals_w()[i]);
         }
         values
     }
@@ -668,7 +733,8 @@ impl PyFrame {
         let finaldepth = self.valuestackdepth.saturating_sub(n);
         self.assert_stack_index(finaldepth);
         while self.valuestackdepth > finaldepth {
-            self.locals_cells_stack_w[self.valuestackdepth - 1] = PY_NULL;
+            let idx = self.valuestackdepth - 1;
+            self.locals_w_mut()[idx] = PY_NULL;
             self.valuestackdepth -= 1;
         }
     }
@@ -710,7 +776,7 @@ impl PyFrame {
         if index == usize::MAX || index < self.stack_base() {
             return PY_NULL;
         }
-        self.locals_cells_stack_w[index]
+        self.locals_w()[index]
     }
 
     /// PyPy-compatible `settopvalue()`.
@@ -722,7 +788,7 @@ impl PyFrame {
             .unwrap_or(0);
         self.assert_stack_index(index);
         assert!(index < self.valuestackdepth);
-        self.locals_cells_stack_w[index] = value;
+        self.locals_w_mut()[index] = value;
     }
 
     /// PyPy-compatible `dropvaluesuntil()`.
@@ -730,7 +796,8 @@ impl PyFrame {
     pub fn dropvaluesuntil(&mut self, finaldepth: usize) {
         self.assert_stack_index(finaldepth);
         while self.valuestackdepth > finaldepth {
-            self.locals_cells_stack_w[self.valuestackdepth - 1] = PY_NULL;
+            let idx = self.valuestackdepth - 1;
+            self.locals_w_mut()[idx] = PY_NULL;
             self.valuestackdepth -= 1;
         }
     }
@@ -936,7 +1003,7 @@ impl PyFrame {
     pub fn setfastscope(&mut self, scope_w: &[PyObjectRef]) {
         assert!(scope_w.len() <= self.nlocals());
         for (index, value) in scope_w.iter().copied().enumerate() {
-            self.locals_cells_stack_w[index] = value;
+            self.locals_w_mut()[index] = value;
         }
         // In this port, cell initialization is performed as part of scope load.
         self.init_cells();
@@ -954,7 +1021,7 @@ impl PyFrame {
             fast_slots[i] = namespace.get(name).copied().unwrap_or(PY_NULL);
         }
         for (i, value) in fast_slots.iter().enumerate() {
-            self.locals_cells_stack_w[i] = *value;
+            self.locals_w_mut()[i] = *value;
         }
     }
 
@@ -965,10 +1032,11 @@ impl PyFrame {
         let num_locals = self.code().varnames.len();
         let base = num_locals;
         for i in 0..ncellvars {
-            if base + i >= self.locals_cells_stack_w.len() {
+            if base + i >= self.locals_w().len() {
                 break;
             }
-            self.locals_cells_stack_w[base + i] = self.locals_cells_stack_w[i];
+            let val = self.locals_w()[i];
+            self.locals_w_mut()[base + i] = val;
         }
     }
 
@@ -980,7 +1048,7 @@ impl PyFrame {
             namespace => unsafe { &mut *namespace },
         };
         namespace.clear();
-        let locals = self.locals_cells_stack_w.as_slice();
+        let locals = self.locals_w().as_slice();
         let code = self.code();
 
         for (name, value) in code.varnames.iter().zip(locals.iter()) {
@@ -1088,13 +1156,13 @@ impl PyFrame {
         let num_cells = ncells(code_ref);
         let max_stack = code_ref.max_stackdepth as usize;
 
-        let mut locals_cells_stack_w =
+        let mut locals_cells_stack_w_arr =
             PyObjectArray::filled(num_locals + num_cells + max_stack, PY_NULL);
 
         // Bind positional arguments directly -- no intermediate Vec.
         let nargs = args.len().min(num_locals);
         for i in 0..nargs {
-            locals_cells_stack_w[i] = args[i];
+            locals_cells_stack_w_arr[i] = args[i];
         }
 
         // Copy free variables from closure tuple into the frame's cell slots.
@@ -1104,14 +1172,14 @@ impl PyFrame {
             let n_freevars = code_ref.freevars.len();
             for i in 0..n_freevars {
                 let cell = unsafe { w_tuple_getitem(closure, i as i64).unwrap() };
-                locals_cells_stack_w[num_locals + n_cellvars_only + i] = cell;
+                locals_cells_stack_w_arr[num_locals + n_cellvars_only + i] = cell;
             }
         }
 
         PyFrame {
             execution_context,
             code,
-            locals_cells_stack_w,
+            locals_cells_stack_w: unsafe { alloc_array_with_gc_header(locals_cells_stack_w_arr) },
             valuestackdepth: num_locals + num_cells,
             next_instr: 0,
             namespace: globals,
@@ -1136,7 +1204,8 @@ impl PyFrame {
     /// frame is at its final stack location.
     #[inline]
     pub fn fix_array_ptrs(&mut self) {
-        self.locals_cells_stack_w.fix_ptr();
+        // locals_cells_stack_w is now a heap-allocated pointer;
+        // fix_ptr on PyObjectArray is a no-op.
     }
 
     /// Load a constant from the code object by raw index.

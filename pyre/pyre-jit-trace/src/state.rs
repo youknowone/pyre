@@ -1165,8 +1165,10 @@ pub(crate) fn concrete_return_value(frame: usize) -> Option<PyObjectRef> {
 /// Read a value from the unified `locals_cells_stack_w` at the given absolute index.
 pub fn concrete_stack_value(frame: usize, abs_idx: usize) -> Option<PyObjectRef> {
     let frame_ptr = (frame != 0).then_some(frame as *const u8)?;
-    let arr =
-        unsafe { &*(frame_ptr.add(PYFRAME_LOCALS_CELLS_STACK_OFFSET) as *const PyObjectArray) };
+    let arr_ptr = unsafe {
+        *(frame_ptr.add(PYFRAME_LOCALS_CELLS_STACK_OFFSET) as *const *const PyObjectArray)
+    };
+    let arr = unsafe { &*arr_ptr };
     arr.as_slice().get(abs_idx).copied()
 }
 
@@ -1843,12 +1845,15 @@ impl PyreJitState {
 
     fn frame_array(&self, offset: usize) -> Option<&PyObjectArray> {
         let frame_ptr = self.frame_ptr()?;
-        Some(unsafe { &*(frame_ptr.add(offset) as *const PyObjectArray) })
+        // locals_cells_stack_w is now *mut PyObjectArray (pointer field)
+        let arr_ptr = unsafe { *(frame_ptr.add(offset) as *const *const PyObjectArray) };
+        Some(unsafe { &*arr_ptr })
     }
 
     fn frame_array_mut(&mut self, offset: usize) -> Option<&mut PyObjectArray> {
         let frame_ptr = self.frame_ptr()?;
-        Some(unsafe { &mut *(frame_ptr.add(offset) as *mut PyObjectArray) })
+        let arr_ptr = unsafe { *(frame_ptr.add(offset) as *const *mut PyObjectArray) };
+        Some(unsafe { &mut *arr_ptr })
     }
 
     fn read_frame_usize(&self, offset: usize) -> Option<usize> {
@@ -3923,7 +3928,7 @@ mod tests {
         let code = compile_exec("x = 1").expect("test code should compile");
         let mut frame = Box::new(PyFrame::new(code));
         frame.fix_array_ptrs();
-        let full_len = frame.locals_cells_stack_w.len();
+        let full_len = frame.locals_w().len();
         let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
 
         let mut state = empty_state();
@@ -4077,7 +4082,7 @@ mod tests {
 
         let code = compile_exec("x = 1").expect("test code should compile");
         let mut frame = Box::new(PyFrame::new(code));
-        frame.locals_cells_stack_w[0] = w_int_new(41);
+        frame.locals_w_mut()[0] = w_int_new(41);
         frame.fix_array_ptrs();
         let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
 
@@ -4827,8 +4832,8 @@ mod tests {
         let mut frame = Box::new(PyFrame::new(code));
         let local_ref = w_int_new(41);
         let stack_int = w_int_new(7);
-        frame.locals_cells_stack_w[0] = local_ref;
-        frame.locals_cells_stack_w[1] = stack_int;
+        frame.locals_w_mut()[0] = local_ref;
+        frame.locals_w_mut()[1] = stack_int;
         frame.fix_array_ptrs();
         let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
 
@@ -4933,7 +4938,7 @@ mod tests {
             assert!(w_list_uses_int_storage(list));
         }
         let arg_idx = frame.stack_base() + 2;
-        frame.locals_cells_stack_w[arg_idx] = list;
+        frame.locals_w_mut()[arg_idx] = list;
         frame.fix_array_ptrs();
         let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
 

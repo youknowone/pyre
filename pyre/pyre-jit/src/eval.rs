@@ -1088,10 +1088,10 @@ fn handle_jitexception(frame: &mut PyFrame) -> PyResult {
 }
 
 fn debug_first_arg_int(frame: &PyFrame) -> Option<i64> {
-    if frame.locals_cells_stack_w.len() == 0 {
+    if frame.locals_w().len() == 0 {
         return None;
     }
-    let value = frame.locals_cells_stack_w[0];
+    let value = frame.locals_w()[0];
     if value.is_null() || !unsafe { pyre_object::pyobject::is_int(value) } {
         return None;
     }
@@ -1466,7 +1466,7 @@ fn resume_in_blackhole_from_exit_layout(
     let saved_code = frame.code;
     let saved_vsd = frame.valuestackdepth;
     let saved_ns = frame.namespace;
-    let saved_array: Vec<pyre_object::PyObjectRef> = frame.locals_cells_stack_w.as_slice().to_vec();
+    let saved_array: Vec<pyre_object::PyObjectRef> = frame.locals_w().as_slice().to_vec();
 
     build_blackhole_frames_from_deadframe(raw_values, exit_layout);
     let guard_frames = take_last_guard_frames();
@@ -1479,7 +1479,7 @@ fn resume_in_blackhole_from_exit_layout(
             frame.code = saved_code;
             frame.valuestackdepth = saved_vsd;
             frame.namespace = saved_ns;
-            let dest = frame.locals_cells_stack_w.as_mut_slice();
+            let dest = frame.locals_w_mut().as_mut_slice();
             let n = dest.len().min(saved_array.len());
             dest[..n].copy_from_slice(&saved_array[..n]);
         }
@@ -1506,9 +1506,9 @@ fn execute_assembler(
     frame.next_instr = entry_pc;
 
     if majit_metainterp::majit_log_enabled() {
-        let locals: Vec<(usize, Option<i64>)> = (0..frame.locals_cells_stack_w.len().min(5))
+        let locals: Vec<(usize, Option<i64>)> = (0..frame.locals_w().len().min(5))
             .map(|i| {
-                let value = frame.locals_cells_stack_w[i];
+                let value = frame.locals_w()[i];
                 let decoded = if value.is_null() || !unsafe { pyre_object::pyobject::is_int(value) }
                 {
                     None
@@ -1669,9 +1669,9 @@ fn bound_reached(
     env: &PyreEnv,
 ) -> Option<LoopResult> {
     if majit_metainterp::majit_log_enabled() {
-        let locals: Vec<(usize, Option<i64>)> = (0..frame.locals_cells_stack_w.len().min(5))
+        let locals: Vec<(usize, Option<i64>)> = (0..frame.locals_w().len().min(5))
             .map(|i| {
-                let value = frame.locals_cells_stack_w[i];
+                let value = frame.locals_w()[i];
                 let decoded = if value.is_null() || !unsafe { pyre_object::pyobject::is_int(value) }
                 {
                     None

@@ -1677,7 +1677,7 @@ fn builtin_super(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             .iter()
             .filter(|c| !code.varnames.contains(c))
             .count();
-        let locals = frame.locals_cells_stack_w.as_slice();
+        let locals = frame.locals_w().as_slice();
 
         let mut w_class = pyre_object::PY_NULL;
 
@@ -2047,7 +2047,7 @@ fn builtin_locals(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let dict = pyre_object::w_dict_new();
         let code = unsafe { &*crate::pyframe_get_pycode(frame) };
         for (idx, name) in code.varnames.iter().enumerate() {
-            let value = frame.locals_cells_stack_w[idx];
+            let value = frame.locals_w()[idx];
             if !value.is_null() {
                 unsafe { pyre_object::w_dict_store(dict, pyre_object::w_str_new(name), value) };
             }

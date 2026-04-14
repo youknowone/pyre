@@ -12,8 +12,12 @@ use crate::header::{GcHeader, header_of};
 
 /// A single old-generation allocation record.
 struct OldObject {
-    /// Address of the header (start of allocated block).
+    /// Address of the GC header within the allocated block.
+    /// For card-marked objects: alloc_start + card_header_size.
+    /// For normal objects: same as alloc_start.
     header_addr: usize,
+    /// Address of the raw allocation (for deallocation).
+    alloc_addr: usize,
     /// Layout used for deallocation.
     layout: Layout,
 }
@@ -50,6 +54,30 @@ impl OldGen {
         }
         self.objects.push(OldObject {
             header_addr: ptr as usize,
+            alloc_addr: ptr as usize,
+            layout,
+        });
+        self.total_bytes += total_size;
+        ptr
+    }
+
+    /// Allocate with card header space before the GC header.
+    /// Returns the raw arena start pointer. The GC header starts at
+    /// `result + card_header_size`.
+    pub fn alloc_with_card_header(
+        &mut self,
+        total_size: usize,
+        card_header_size: usize,
+    ) -> *mut u8 {
+        let total_size = total_size.max(GcHeader::MIN_NURSERY_OBJ_SIZE);
+        let layout = Layout::from_size_align(total_size, 8).expect("invalid layout");
+        let ptr = unsafe { alloc::alloc_zeroed(layout) };
+        if ptr.is_null() {
+            alloc::handle_alloc_error(layout);
+        }
+        self.objects.push(OldObject {
+            header_addr: ptr as usize + card_header_size,
+            alloc_addr: ptr as usize,
             layout,
         });
         self.total_bytes += total_size;
@@ -96,7 +124,7 @@ impl OldGen {
                 // Dead: free it.
                 freed_bytes += obj_record.layout.size();
                 unsafe {
-                    alloc::dealloc(obj_record.header_addr as *mut u8, obj_record.layout);
+                    alloc::dealloc(obj_record.alloc_addr as *mut u8, obj_record.layout);
                 }
             }
         }
@@ -138,7 +166,7 @@ impl Drop for OldGen {
     fn drop(&mut self) {
         for obj_record in self.objects.drain(..) {
             unsafe {
-                alloc::dealloc(obj_record.header_addr as *mut u8, obj_record.layout);
+                alloc::dealloc(obj_record.alloc_addr as *mut u8, obj_record.layout);
             }
         }
     }
