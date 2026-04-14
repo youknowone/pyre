@@ -74,6 +74,7 @@ pub enum SnapshotTagged {
     Virtual(u32),
 }
 
+#[derive(Clone)]
 pub struct Trace {
     /// Recorded operations.
     ops: Vec<Op>,
@@ -258,6 +259,8 @@ impl Trace {
         self.finalized = true;
     }
 
+    /// Undo the JUMP added by close_loop/close_loop_with_descr.
+    /// Restores the recorder to pre-close state so tracing can continue.
     /// Finish the trace (non-looping): add a FINISH operation.
     /// `finish_args` are the values returned from the trace.
     pub fn finish(&mut self, finish_args: &[OpRef], descr: DescrRef) {
