@@ -798,6 +798,24 @@ fn try_constant_fold_int_value(op: &Op, ctx: &OptContext) -> Option<i64> {
 }
 
 fn constant_ptr_value(arg: OpRef, ctx: &OptContext) -> Option<usize> {
+    let resolved = ctx.get_box_replacement(arg);
+    // RPython parity: Ref-typed inputargs must not be treated as compile-time
+    // constant pointers. In RPython, inputarg Box.value is unknown until
+    // guard_value establishes it. pyre's seed_constant pre-populates
+    // trace-time Ref values that try_constant_fold_pure_getfield would
+    // dereference — reading fields from objects that may differ at runtime.
+    // Only Forwarded::Const (from guard_value) is a genuine constant.
+    let ia_base = ctx.inputarg_base as usize;
+    let ia_end = ia_base + ctx.num_inputs();
+    if (resolved.0 as usize) >= ia_base && (resolved.0 as usize) < ia_end {
+        use crate::optimizeopt::info::Forwarded;
+        if let Some(Forwarded::Const(Value::Ref(ptr))) = ctx.forwarded.get(resolved.0 as usize) {
+            if !ptr.is_null() {
+                return Some(ptr.as_usize());
+            }
+        }
+        return None;
+    }
     match ctx.get_constant(arg)? {
         Value::Ref(ptr) if !ptr.is_null() => Some(ptr.as_usize()),
         _ => None,
