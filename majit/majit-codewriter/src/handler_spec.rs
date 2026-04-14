@@ -59,6 +59,12 @@ const CONSTANT_METHODS: &[ConstantMethod] = &[
         concrete_expr: "crate::state::ConcreteValue::Ref(pyre_object::w_none())",
         trace_call: "self.trace_none_constant()?",
     },
+    ConstantMethod {
+        name: "ellipsis_constant",
+        args_decl: "",
+        concrete_expr: "crate::state::ConcreteValue::Ref(pyre_object::noneobject::w_ellipsis())",
+        trace_call: "self.trace_ellipsis_constant()?",
+    },
 ];
 
 /// Render a single trivial-constant method (the `int/float/bool/str/none` shape).
@@ -147,9 +153,13 @@ fn emit_constant_impl(out: &mut String) {
     out.push_str("        Ok(crate::state::FrontendOp::new(opref, concrete))\n");
     out.push_str("    }\n");
 
-    // none_constant — trivial shape (last).
+    // none_constant — trivial shape.
     out.push('\n');
     emit_constant_method(out, &CONSTANT_METHODS[4]);
+
+    // ellipsis_constant — trivial shape (last).
+    out.push('\n');
+    emit_constant_method(out, &CONSTANT_METHODS[5]);
 
     out.push_str("}\n");
 }
@@ -378,6 +388,7 @@ mod tests {
             "fn bytes_constant",
             "fn code_constant",
             "fn none_constant",
+            "fn ellipsis_constant",
         ] {
             assert!(
                 out.contains(method),

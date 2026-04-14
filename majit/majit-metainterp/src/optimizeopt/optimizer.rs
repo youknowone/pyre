@@ -40,11 +40,11 @@ pub struct Optimizer {
     /// adds virtual input args).
     final_num_inputs: usize,
     /// Cache of CALL_PURE results from previous traces.
-    /// optimizer.py: `call_pure_results` — maps
-    /// (func_ptr, arg0, arg1, ...) → result value, carried across
+    /// optimizer.py: `call_pure_results` — maps constant values
+    /// (via get_constant_box) → result value, carried across
     /// loop iterations so the optimizer can constant-fold repeated
-    /// pure calls.
-    call_pure_results: std::collections::HashMap<Vec<majit_ir::OpRef>, majit_ir::Value>,
+    /// pure calls. RPython uses value-based equality for keys.
+    call_pure_results: std::collections::HashMap<Vec<majit_ir::Value>, majit_ir::Value>,
     /// optimizer.py: `_last_guard_op` — tracks the last emitted guard
     /// for guard sharing and descriptor fusion.
     last_guard_op: Option<Op>,
@@ -980,13 +980,14 @@ impl Optimizer {
     }
 
     /// Record a CALL_PURE result for cross-iteration constant folding.
-    /// RPython optimizer.py: `call_pure_results[key] = value`
-    pub fn record_call_pure_result(&mut self, args: Vec<majit_ir::OpRef>, value: majit_ir::Value) {
+    /// RPython pyjitpl.py:3572: `arg_consts = [executor.constant_from_op(a) ...]`
+    /// RPython optimizer.py:222: `get_constant_box(arg)` → value-based keys.
+    pub fn record_call_pure_result(&mut self, args: Vec<majit_ir::Value>, value: majit_ir::Value) {
         self.call_pure_results.insert(args, value);
     }
 
     /// Look up a previously recorded CALL_PURE result.
-    pub fn get_call_pure_result(&self, args: &[majit_ir::OpRef]) -> Option<&majit_ir::Value> {
+    pub fn get_call_pure_result(&self, args: &[majit_ir::Value]) -> Option<&majit_ir::Value> {
         self.call_pure_results.get(args)
     }
 
@@ -1663,23 +1664,10 @@ impl Optimizer {
             );
         }
 
-        // optimizer.py: inject call_pure_results into OptPure so it can
+        // optimizer.py: pass call_pure_results to OptPure so it can
         // constant-fold repeated pure calls across loop iterations.
-        if !self.call_pure_results.is_empty() {
-            for pass in &mut self.passes {
-                if pass.name() == "pure" {
-                    // Downcast not possible with trait objects, but we record
-                    // the results as known constants in the context instead.
-                    for (args, value) in &self.call_pure_results {
-                        if let majit_ir::Value::Int(v) = value {
-                            if let Some(result_ref) = args.last() {
-                                ctx.seed_constant(*result_ref, majit_ir::Value::Int(*v));
-                            }
-                        }
-                    }
-                    break;
-                }
-            }
+        for pass in &mut self.passes {
+            pass.set_call_pure_results(&self.call_pure_results);
         }
 
         // Take ownership of imported_loop_state for the duration of
@@ -4266,13 +4254,17 @@ mod tests {
 
     #[test]
     fn test_call_pure_results() {
+        use majit_ir::Value;
         let mut opt = Optimizer::new();
-        opt.record_call_pure_result(vec![OpRef(10), OpRef(20)], majit_ir::Value::Int(42));
+        opt.record_call_pure_result(vec![Value::Int(10), Value::Int(20)], Value::Int(42));
         assert_eq!(
-            opt.get_call_pure_result(&[OpRef(10), OpRef(20)]),
-            Some(&majit_ir::Value::Int(42))
+            opt.get_call_pure_result(&[Value::Int(10), Value::Int(20)]),
+            Some(&Value::Int(42))
         );
-        assert_eq!(opt.get_call_pure_result(&[OpRef(10), OpRef(99)]), None);
+        assert_eq!(
+            opt.get_call_pure_result(&[Value::Int(10), Value::Int(99)]),
+            None
+        );
     }
 
     #[test]

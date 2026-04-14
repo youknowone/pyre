@@ -4086,6 +4086,14 @@ pub trait Optimization {
     /// Only OptPure consumes this; other passes ignore it.
     fn set_pureop_historylength(&mut self, _limit: usize) {}
 
+    /// optimizer.py:517 propagate_all_forward(trace, call_pure_results, flush).
+    /// Only OptPure consumes this; other passes ignore it.
+    fn set_call_pure_results(
+        &mut self,
+        _results: &std::collections::HashMap<Vec<majit_ir::Value>, majit_ir::Value>,
+    ) {
+    }
+
     /// Name of this pass (for debugging).
     fn name(&self) -> &'static str;
 

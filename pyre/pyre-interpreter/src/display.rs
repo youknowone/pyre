@@ -2,8 +2,8 @@ use std::fmt;
 
 use pyre_object::excobject::EXCEPTION_TYPE;
 use pyre_object::pyobject::{
-    BOOL_TYPE, FLOAT_TYPE, INSTANCE_TYPE, INT_TYPE, LONG_TYPE, MODULE_TYPE, NONE_TYPE, PyObjectRef,
-    PyType, STR_TYPE, TYPE_TYPE,
+    BOOL_TYPE, ELLIPSIS_TYPE, FLOAT_TYPE, INSTANCE_TYPE, INT_TYPE, LONG_TYPE, MODULE_TYPE,
+    NONE_TYPE, PyObjectRef, PyType, STR_TYPE, TYPE_TYPE,
 };
 
 use crate::{
@@ -106,6 +106,8 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> String {
             &pyre_object::pyobject::NOTIMPLEMENTED_TYPE as *const PyType,
         ) {
             "NotImplemented".to_string()
+        } else if std::ptr::eq(tp, &ELLIPSIS_TYPE as *const PyType) {
+            "Ellipsis".to_string()
         } else if std::ptr::eq(tp, &BUILTIN_CODE_TYPE as *const PyType) {
             // Raw BuiltinCode objects (Code-level, not normally user-visible)
             let name = builtin_code_name(obj);

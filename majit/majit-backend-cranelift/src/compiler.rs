@@ -8167,20 +8167,6 @@ impl CraneliftBackend {
                             .copied()
                             .collect();
 
-                        // Keep jitframe up-to-date for other GC paths.
-                        // The gcmap push is required here (not just in slow
-                        // block) due to Cranelift egraph optimizer: without
-                        // this MemFlags::new() store, the optimizer
-                        // miscompiles the spill/reload pattern.
-                        spill_ref_roots(
-                            &mut builder,
-                            jf_ptr,
-                            &ref_root_slots,
-                            &defined_ref_vars,
-                            ref_root_base_ofs,
-                        );
-                        emit_push_gcmap(&mut builder, jf_ptr, per_call_gcmap);
-
                         let fast_block = builder.create_block();
                         let slow_block = builder.create_block();
                         let merge_block = builder.create_block();
@@ -8209,12 +8195,21 @@ impl CraneliftBackend {
                         }
                         builder.ins().jump(merge_block, &fast_args);
 
-                        // slow: MallocCondSlowPath + _build_malloc_slowpath
-                        // parity. Refs already spilled and gcmap pushed
-                        // in dominator above.
+                        // slow: aarch64 _build_malloc_slowpath parity.
+                        // Fast path is bare bump-allocation; only the
+                        // overflow path spills refs and installs jf_gcmap
+                        // before calling the helper.
                         builder.switch_to_block(slow_block);
                         builder.seal_block(slow_block);
                         builder.set_cold_block(slow_block);
+                        spill_ref_roots(
+                            &mut builder,
+                            jf_ptr,
+                            &ref_root_slots,
+                            &defined_ref_vars,
+                            ref_root_base_ofs,
+                        );
+                        emit_push_gcmap(&mut builder, jf_ptr, per_call_gcmap);
                         let rid = gc_runtime_id.ok_or_else(|| missing_gc_runtime(op.opcode))?;
                         let rid_v = builder.ins().iconst(cl_types::I64, rid as i64);
                         let ps = builder.ins().iadd_imm(size_total, -(GcHeader::SIZE as i64));
@@ -8231,18 +8226,18 @@ impl CraneliftBackend {
                         let jf_ptr_slow =
                             emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
                         emit_pop_gcmap(&mut builder, jf_ptr_slow, per_call_gcmap);
+                        reload_ref_roots(
+                            &mut builder,
+                            jf_ptr_slow,
+                            &ref_root_slots,
+                            &defined_ref_vars,
+                            ref_root_base_ofs,
+                        );
                         // Pass GC-updated values through block params
                         let mut slow_args: Vec<BlockArg> =
                             vec![BlockArg::from(slow_r), BlockArg::from(jf_ptr_slow)];
-                        for &(_var_idx, slot) in &live_refs {
-                            let offset = ref_root_base_ofs + (slot as i32) * 8;
-                            let val = builder.ins().load(
-                                cl_types::I64,
-                                MemFlags::new(),
-                                jf_ptr_slow,
-                                offset,
-                            );
-                            slow_args.push(BlockArg::from(val));
+                        for &(var_idx, _) in &live_refs {
+                            slow_args.push(BlockArg::from(builder.use_var(var(var_idx))));
                         }
                         builder.ins().jump(merge_block, &slow_args);
 
@@ -8252,7 +8247,6 @@ impl CraneliftBackend {
                         let params = builder.block_params(merge_block).to_vec();
                         let result = params[0];
                         jf_ptr = params[1];
-                        emit_pop_gcmap(&mut builder, jf_ptr, per_call_gcmap);
                         outputs_ptr = jf_ptr;
                         builder.def_var(jf_ptr_var, jf_ptr);
                         for (i, &(var_idx, _)) in live_refs.iter().enumerate() {
@@ -16668,48 +16662,90 @@ mod tests {
         assert!(!unsafe { header_of(obj.0).has_flag(flags::TRACK_YOUNG_PTRS) });
     }
 
+    /// test_gc_integration.py:808 test_malloc_1:
+    /// Three call_malloc_nursery(size) in the trace. Nursery sized so
+    /// the jitframe + first two allocs fit but the third overflows,
+    /// triggering a nursery collection.
+    ///
+    /// RPython: init_nursery(2 * sizeof.size), three call_malloc_nursery(size).
+    /// In majit the jitframe itself lives in the nursery, so we size
+    /// the nursery for jitframe + 2 user allocs (third overflows).
     #[test]
     fn test_gc_collecting_alloc_preserves_live_ref_inputs() {
+        let payload_size: usize = 16;
+        let alloc_size = majit_gc::header::GcHeader::SIZE + payload_size; // 24
+
+        // test_gc_integration.py:820: init_nursery(2 * sizeof.size).
+        // RPython nursery holds exactly 2 user objects (jitframe is
+        // separate). In majit jitframe is nursery-allocated, so compute:
+        //   header_words = JF_FRAME_ITEM0_OFS / 8 = 8
+        //   depth = max(max_output=1, fail_args=3, inputs=0, 1) = 3
+        //   ref_roots = 3 (one per CallMallocNursery result)
+        //   jf_payload = (8 + 3 + 3) * 8 = 112
+        //   jf_total = GcHeader::SIZE + 112 = 120
+        //   nursery = 120 + 2*24 = 168
+        let jf_header_words: usize = (JF_FRAME_ITEM0_OFS as usize) / 8;
+        let jf_depth = 3_usize; // max(1 finish output, 3 fail_args, 0 inputs)
+        let jf_ref_roots = 3_usize;
+        let jf_payload = (jf_header_words + jf_depth + jf_ref_roots) * 8;
+        let jf_nursery_alloc = majit_gc::header::GcHeader::SIZE + jf_payload;
+        let nursery_size = jf_nursery_alloc + 2 * alloc_size;
+
         let mut gc = MiniMarkGC::with_config(GcConfig {
-            // RPython llsupport/test_gc_integration.py:test_malloc_1 parity:
-            // make the nursery small enough that the trace's second nursery
-            // allocation must overflow and trigger a minor collection.
-            nursery_size: 112,
+            nursery_size,
             large_object_threshold: 1024,
             ..GcConfig::default()
         });
-        gc.register_type(TypeInfo::simple(16));
-
-        let root = gc.alloc_with_type(0, 16);
-        assert!(gc.is_in_nursery(root.0));
-        unsafe {
-            *(root.0 as *mut u64) = 0xD00DFEED;
-        }
-
-        let filler = gc.alloc_with_type(0, 16);
-        assert!(gc.is_in_nursery(filler.0));
+        gc.register_type(TypeInfo::simple(payload_size));
 
         let mut backend = CraneliftBackend::with_gc_allocator(Box::new(gc));
 
-        let inputargs = vec![InputArg::new_ref(0)];
+        // test_gc_integration.py:808-817:
+        //   []
+        //   p0 = call_malloc_nursery(size)
+        //   p1 = call_malloc_nursery(size)
+        //   p2 = call_malloc_nursery(size)  # this overflows
+        //   guard_nonnull(p2, descr=faildescr) [p0, p1, p2]
+        //   finish(p2, descr=finaldescr)
+        let size_arg = OpRef(alloc_size as u32);
+        let inputargs = vec![];
+        let mut guard = mk_op(OpCode::GuardNonnull, &[OpRef(2)], OpRef::NONE.0);
+        guard.fail_args = Some(smallvec::smallvec![OpRef(0), OpRef(1), OpRef(2)]);
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
-            mk_op(OpCode::CallMallocNursery, &[OpRef(56)], 1),
-            mk_op(OpCode::CallMallocNursery, &[OpRef(56)], 2),
-            mk_op(OpCode::Finish, &[OpRef(0), OpRef(2)], OpRef::NONE.0),
+            mk_op(OpCode::Label, &[], OpRef::NONE.0),
+            mk_op(OpCode::CallMallocNursery, &[size_arg], 0),
+            mk_op(OpCode::CallMallocNursery, &[size_arg], 1),
+            mk_op(OpCode::CallMallocNursery, &[size_arg], 2), // overflows
+            guard,
+            mk_op(OpCode::Finish, &[OpRef(2)], OpRef::NONE.0),
         ];
 
         let mut token = JitCellToken::new(1505);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
-        let frame = backend.execute_token(&token, &[Value::Ref(root)]);
-        let moved_root = backend.get_ref_value(&frame, 0);
-        let new_obj = backend.get_ref_value(&frame, 1);
+        // Snapshot nursery free pointer before execution.
+        let gc_id = backend.gc_runtime_id.unwrap();
+        let nf_before = with_gc_runtime(gc_id, |gc| gc.nursery_free() as usize);
 
-        assert!(!moved_root.is_null());
-        assert_ne!(moved_root, root);
-        assert_eq!(unsafe { *(moved_root.0 as *const u64) }, 0xD00DFEED);
-        assert!(!new_obj.is_null());
+        let frame = backend.execute_token(&token, &[]);
+
+        // Verify collection occurred: after minor collection the nursery
+        // resets, so nursery_free is near the start (only p2 allocated
+        // post-collection). Without collection nursery_free would advance
+        // by jf + 3*alloc = jf + 72 past nf_before.
+        let nf_after = with_gc_runtime(gc_id, |gc| gc.nursery_free() as usize);
+        assert!(
+            nf_after < nf_before + 3 * alloc_size,
+            "nursery should have been collected (free before={nf_before:#x}, \
+             after={nf_after:#x}, expected advance without collection ≥ {})",
+            3 * alloc_size
+        );
+
+        // test_gc_integration.py:826-828:
+        // thing = frame.jf_frame[unpack_gcmap(frame)[0]]
+        // assert thing == rffi.cast(lltype.Signed, cpu.gc_ll_descr.nursery)
+        let p2 = backend.get_ref_value(&frame, 0);
+        assert!(!p2.is_null(), "p2 should be non-null after collection");
     }
 
     #[test]

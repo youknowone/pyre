@@ -286,6 +286,7 @@ pub trait ConstantOpcodeHandler: SharedOpcodeHandler {
     fn bytes_constant(&mut self, value: &[u8]) -> Result<Self::Value, PyError>;
     fn code_constant(&mut self, code: &CodeObject) -> Result<Self::Value, PyError>;
     fn none_constant(&mut self) -> Result<Self::Value, PyError>;
+    fn ellipsis_constant(&mut self) -> Result<Self::Value, PyError>;
     fn slice_constant(
         &mut self,
         start: Self::Value,
@@ -327,7 +328,7 @@ fn load_const_value<H: ConstantOpcodeHandler + ?Sized>(
         }
         ConstantData::Code { code } => handler.code_constant(code),
         ConstantData::None => handler.none_constant(),
-        ConstantData::Ellipsis => handler.none_constant(), // stub: Ellipsis → None
+        ConstantData::Ellipsis => handler.ellipsis_constant(),
         ConstantData::Bytes { value } => handler.bytes_constant(value),
         ConstantData::Complex { value } => {
             // Complex number stub → just the real part

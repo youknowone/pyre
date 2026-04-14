@@ -1142,31 +1142,14 @@ impl PyFrame {
     /// Load a constant from the code object by raw index.
     /// Used by the blackhole interpreter's bh_load_const_fn.
     pub fn load_const_pyobj(&self, idx: usize) -> PyObjectRef {
-        use crate::bytecode::ConstantData;
-        use num_traits::ToPrimitive;
         let code = self.code();
         // RPython: constants are in JitCode.constants_r. In pyre, we resolve
         // from the CodeObject's constant table at runtime.
-        let constants: &[ConstantData] = unsafe {
-            std::slice::from_raw_parts(
-                code.constants.as_ptr() as *const ConstantData,
-                code.constants.len(),
-            )
-        };
+        let constants = code_constants(code);
         if idx >= constants.len() {
             return pyre_object::w_none();
         }
-        match &constants[idx] {
-            ConstantData::Integer { value } => {
-                pyre_object::intobject::w_int_new(value.to_i64().unwrap_or(0))
-            }
-            ConstantData::Float { value } => pyre_object::floatobject::w_float_new(*value),
-            ConstantData::Boolean { value } => {
-                pyre_object::intobject::w_int_new(if *value { 1 } else { 0 })
-            }
-            ConstantData::None => pyre_object::w_none(),
-            _ => pyre_object::w_none(),
-        }
+        pyobject_from_constant(&constants[idx])
     }
 }
 
@@ -1174,18 +1157,26 @@ impl PyFrame {
 /// Used by the blackhole's bh_load_const_fn when the code pointer
 /// comes from a virtualizable field read.
 pub fn load_const_from_code(code: &CodeObject, idx: usize) -> PyObjectRef {
-    use crate::bytecode::ConstantData;
-    use num_traits::ToPrimitive;
-    let constants: &[ConstantData] = unsafe {
-        std::slice::from_raw_parts(
-            code.constants.as_ptr() as *const ConstantData,
-            code.constants.len(),
-        )
-    };
+    let constants = code_constants(code);
     if idx >= constants.len() {
         return pyre_object::w_none();
     }
-    match &constants[idx] {
+    pyobject_from_constant(&constants[idx])
+}
+
+fn code_constants(code: &CodeObject) -> &[crate::bytecode::ConstantData] {
+    unsafe {
+        std::slice::from_raw_parts(
+            code.constants.as_ptr() as *const crate::bytecode::ConstantData,
+            code.constants.len(),
+        )
+    }
+}
+
+fn pyobject_from_constant(constant: &crate::bytecode::ConstantData) -> PyObjectRef {
+    use crate::bytecode::ConstantData;
+    use num_traits::ToPrimitive;
+    match constant {
         ConstantData::Integer { value } => {
             pyre_object::intobject::w_int_new(value.to_i64().unwrap_or(0))
         }
@@ -1194,8 +1185,27 @@ pub fn load_const_from_code(code: &CodeObject, idx: usize) -> PyObjectRef {
             pyre_object::intobject::w_int_new(if *value { 1 } else { 0 })
         }
         ConstantData::None => pyre_object::w_none(),
+        ConstantData::Ellipsis => pyre_object::noneobject::w_ellipsis(),
         _ => pyre_object::w_none(),
     }
 }
 
 // Virtualizable configuration is in jit/frame_layout.rs
+
+#[cfg(test)]
+mod tests {
+    use super::load_const_from_code;
+
+    #[test]
+    fn load_const_from_code_returns_ellipsis_singleton() {
+        let code = crate::compile_eval("...");
+        let code = code.expect("compile should succeed");
+        let ellipsis_index = super::code_constants(&code)
+            .iter()
+            .position(|constant| matches!(constant, crate::bytecode::ConstantData::Ellipsis))
+            .expect("compiled code should contain an Ellipsis constant");
+
+        let loaded = load_const_from_code(&code, ellipsis_index);
+        assert_eq!(loaded, pyre_object::noneobject::w_ellipsis());
+    }
+}

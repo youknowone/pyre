@@ -6,7 +6,7 @@
 /// the cached result is returned instead of recomputing.
 use std::collections::HashMap;
 
-use majit_ir::{GcRef, Op, OpCode, OpRef, Type, Value};
+use majit_ir::{GcRef, Op, OpCode, OpRef, Value};
 
 use crate::optimizeopt::info::PreambleOp;
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
@@ -54,6 +54,19 @@ impl PureOpKey {
             descr_index: self.descr_index,
         }
     }
+}
+
+/// pure.py:213: known_result_call_pure entry.
+/// RPython stores the full RECORD_KNOWN_RESULT op and compares by descr +
+/// _same_args(known_op, query_op, 1, start_index). We pre-extract the
+/// fields to avoid storing a dummy PureOpKey with an opcode.
+#[derive(Clone, Debug)]
+struct KnownResultEntry {
+    descr_index: Option<u32>,
+    /// args[1..] from the RECORD_KNOWN_RESULT op (the call arguments).
+    args: Vec<OpRef>,
+    /// arg(0) from the RECORD_KNOWN_RESULT op (the known result).
+    result: OpRef,
 }
 
 /// pure.py:36-95 RecentPureOps — fixed-size ring buffer with linear scan.
@@ -283,12 +296,18 @@ pub struct OptPure {
     /// pure.py: last_emitted_operation is REMOVED check.
     last_emitted_was_removed: bool,
     /// Pre-recorded CALL_PURE results from RECORD_KNOWN_RESULT.
-    /// pure.py: known_result_call_pure
-    known_result_call_pure: Vec<(PureOpKey, OpRef)>,
+    /// pure.py: known_result_call_pure — stores the full RECORD_KNOWN_RESULT op.
+    /// RPython lookup: descr + _same_args(known_op, op, 1, start_index).
+    /// We store (descr_index, args_from_1, result) — no opcode comparison.
+    known_result_call_pure: Vec<KnownResultEntry>,
     /// pure.py:104: extra_call_pure — CALL_PURE results from the previous
     /// loop iteration and preamble import. May contain PreambleOp entries
     /// (RPython isinstance check → force_op_from_preamble → replace in-place).
     extra_call_pure: Vec<ExtraCallPureEntry>,
+    /// optimizer.py: call_pure_results passed into propagate_all_forward.
+    /// RPython keys are lists of constant boxes (value-based equality).
+    /// Keys are the constant Values that _can_optimize_call_pure builds.
+    call_pure_results: HashMap<Vec<Value>, Value>,
     /// shortpreamble.py:124-126: PureOp.produce_op stores PreambleOp in
     /// optpure's cache. In majit, PreambleOp entries stored here are
     /// searched with forwarding-aware matching (force_preamble_op pattern).
@@ -318,6 +337,7 @@ impl OptPure {
             last_emitted_was_removed: false,
             known_result_call_pure: Vec::new(),
             extra_call_pure: Vec::new(),
+            call_pure_results: HashMap::new(),
             preamble_pure_ops: Vec::new(),
         }
     }
@@ -457,22 +477,22 @@ impl OptPure {
         &self.call_pure_positions
     }
 
-    /// Check known_result_call_pure for a matching call.
-    fn lookup_known_result(&self, key: &PureOpKey) -> Option<OpRef> {
-        // Check known_result_call_pure first (from RECORD_KNOWN_RESULT)
-        for (k, result) in &self.known_result_call_pure {
-            if k.opcode == key.opcode && k.descr_index == key.descr_index && k.args == key.args {
-                return Some(*result);
+    /// pure.py:211-220 — check known_result_call_pure for a matching call.
+    ///
+    /// RPython iterates known_result_call_pure and compares:
+    ///   `op.getdescr() is not known_result_op.getdescr()` → descr check
+    ///   `self._same_args(known_result_op, op, 1, start_index)` → args check
+    /// No opcode comparison.
+    fn lookup_known_result(&self, op: &Op, start_index: usize, ctx: &OptContext) -> Option<OpRef> {
+        let op_descr_index = op.descr.as_ref().map(|d| d.index());
+        for entry in &self.known_result_call_pure {
+            if entry.descr_index != op_descr_index {
+                continue;
             }
-        }
-        // pure.py: also check extra_call_pure (from previous loop iteration)
-        for entry in &self.extra_call_pure {
-            let (k, result) = match entry {
-                ExtraCallPureEntry::Direct { key, result } => (key, *result),
-                ExtraCallPureEntry::Preamble { key, pop } => (key, pop.resolved),
-            };
-            if k.opcode == key.opcode && k.descr_index == key.descr_index && k.args == key.args {
-                return Some(result);
+            // _same_args(known_op, op, 1, start_index):
+            // entry.args is already known_op.args[1..], so compare from 0.
+            if Self::_same_args(&entry.args, &op.args, 0, start_index, ctx) {
+                return Some(entry.result);
             }
         }
         None
@@ -838,6 +858,28 @@ impl OptPure {
         }
         resolved
     }
+
+    /// optimizer.py:215-226 _can_optimize_call_pure.
+    ///
+    /// RPython: for each arg, `get_constant_box(arg)` returns the constant
+    /// value (ConstInt/ConstPtr/ConstFloat), then uses those values as the
+    /// lookup key in call_pure_results. Value-based equality, not identity.
+    fn lookup_call_pure_result(
+        &mut self,
+        op: &Op,
+        start_index: usize,
+        ctx: &mut OptContext,
+    ) -> Option<Value> {
+        let mut arg_consts = Vec::with_capacity(op.num_args().saturating_sub(start_index));
+        for i in start_index..op.num_args() {
+            let forced = self.force_box(op.arg(i), ctx);
+            let Some(const_value) = ctx.get_constant(forced) else {
+                return None;
+            };
+            arg_consts.push(*const_value);
+        }
+        self.call_pure_results.get(&arg_consts).cloned()
+    }
 }
 
 impl Optimization for OptPure {
@@ -957,17 +999,15 @@ impl Optimization for OptPure {
         }
 
         // pure.py:211-220: RECORD_KNOWN_RESULT — record for later CALL_PURE lookup.
-        // resoperation.py:1165: RECORD_KNOWN_RESULT/*d — carries calldescr.
-        // pure.py:215: `if op.getdescr() is not known_result_op.getdescr(): continue`
+        // pure.py:214: `self.known_result_call_pure.append(op)`
+        // Lookup compares descr + _same_args(known_op, query_op, 1, start_index).
         if op.opcode == OpCode::RecordKnownResult {
             if op.num_args() >= 2 {
-                let result = op.arg(0);
-                let key = PureOpKey {
-                    opcode: OpCode::call_pure_for_type(ctx.opref_type(result).unwrap_or(Type::Int)),
-                    args: op.args[1..].to_vec(),
+                self.known_result_call_pure.push(KnownResultEntry {
                     descr_index: op.descr.as_ref().map(|d| d.index()),
-                };
-                self.known_result_call_pure.push((key, result));
+                    args: op.args[1..].to_vec(),
+                    result: op.arg(0),
+                });
             }
             return OptimizationResult::Remove;
         }
@@ -1004,10 +1044,9 @@ impl Optimization for OptPure {
         // pure.py:185-228 optimize_call_pure
         if op.opcode.is_call_pure() {
             // pure.py:185-188: force_box on each non-skipped arg.
-            // pure.py:191-196: constant-fold check via _can_optimize_call_pure
-            // (handled by force_preamble_op + try_constant_fold).
-            if let Some(cached_ref) = self.force_preamble_op(op, ctx) {
-                ctx.replace_op(op.pos, cached_ref);
+            // pure.py:191-196: constant-fold check via _can_optimize_call_pure.
+            if let Some(value) = self.lookup_call_pure_result(op, 0, ctx) {
+                ctx.make_constant(op.pos, value);
                 self.last_emitted_was_removed = true;
                 return OptimizationResult::Remove;
             }
@@ -1072,7 +1111,7 @@ impl Optimization for OptPure {
                 }
             }
             // pure.py:211-220 — known_result_call_pure (RECORD_KNOWN_RESULT).
-            if let Some(result_ref) = self.lookup_known_result(&key) {
+            if let Some(result_ref) = self.lookup_known_result(op, 0, ctx) {
                 let result_ref = ctx.get_box_replacement(result_ref);
                 ctx.replace_op(op.pos, result_ref);
                 self.last_emitted_was_removed = true;
@@ -1089,23 +1128,21 @@ impl Optimization for OptPure {
             return OptimizationResult::Emit(new_op);
         }
 
-        // COND_CALL_VALUE_I/R → CSE like CALL_PURE, but skip arg[0]
-        // (the condition value). pure.py: optimize_COND_CALL_VALUE_I.
+        // pure.py:236-238: optimize_COND_CALL_VALUE_I/R delegates to
+        // optimize_call_pure(op, start_index=1).
         if op.opcode.is_cond_call_value() {
+            let start_index: usize = 1;
             let op_descr_index = op.descr.as_ref().map(|d| d.index());
-            let key = PureOpKey {
-                opcode: OpCode::call_pure_for_type(op.result_type()),
-                args: op.args[1..].to_vec(),
-                descr_index: op_descr_index,
-            };
 
-            if let Some(cached_ref) = self.lookup_pure(&key) {
-                let cached_ref = ctx.get_box_replacement(cached_ref);
-                ctx.replace_op(op.pos, cached_ref);
+            // pure.py:191-196: _can_optimize_call_pure(op, start_index=1).
+            if let Some(value) = self.lookup_call_pure_result(op, start_index, ctx) {
+                ctx.make_constant(op.pos, value);
                 self.last_emitted_was_removed = true;
                 return OptimizationResult::Remove;
             }
 
+            // pure.py:200-203: iterate call_pure_positions, try
+            // optimize_call_pure_old with adjusted start_index.
             for &pos in &self.call_pure_positions {
                 if let Some(old_op) = ctx.new_operations.get(pos) {
                     let old_descr_index = old_op.descr.as_ref().map(|d| d.index());
@@ -1115,7 +1152,7 @@ impl Optimization for OptPure {
                         &old_op.args,
                         old_descr_index,
                         op_descr_index,
-                        1,
+                        start_index,
                         ctx,
                     ) {
                         let cached_ref = ctx.get_box_replacement(old_op.pos);
@@ -1125,7 +1162,7 @@ impl Optimization for OptPure {
                     }
                 }
             }
-
+            // pure.py:204-210: iterate extra_call_pure entries.
             for entry in &self.extra_call_pure {
                 let (entry_opcode, entry_args, entry_descr_index, entry_result) = match entry {
                     ExtraCallPureEntry::Direct { key, result } => {
@@ -1141,7 +1178,7 @@ impl Optimization for OptPure {
                     &entry_args,
                     entry_descr_index,
                     op_descr_index,
-                    1,
+                    start_index,
                     ctx,
                 ) {
                     let cached_ref = ctx.get_box_replacement(entry_result);
@@ -1150,16 +1187,18 @@ impl Optimization for OptPure {
                     return OptimizationResult::Remove;
                 }
             }
-            if let Some(result_ref) = self.lookup_known_result(&key) {
+            // pure.py:211-220: known_result_call_pure.
+            if let Some(result_ref) = self.lookup_known_result(op, start_index, ctx) {
                 let result_ref = ctx.get_box_replacement(result_ref);
                 ctx.replace_op(op.pos, result_ref);
                 self.last_emitted_was_removed = true;
                 return OptimizationResult::Remove;
             }
 
+            let key = PureOpKey::from_op(op);
             self.cache.insert(key, op.pos);
             self.call_pure_positions.push(ctx.new_operations.len());
-            // Unlike CALL_PURE, COND_CALL_VALUE is NOT demoted — emit as-is.
+            // pure.py:226-227: COND_CALL_VALUE is NOT demoted to CALL.
             return OptimizationResult::Emit(op.clone());
         }
 
@@ -1177,6 +1216,10 @@ impl Optimization for OptPure {
         // Note: extra_call_pure is NOT cleared on setup — it persists
         // across optimization runs (set by set_extra_call_pure before opt).
         // preamble_pure_ops also NOT cleared — populated during import.
+    }
+
+    fn set_call_pure_results(&mut self, results: &HashMap<Vec<Value>, Value>) {
+        self.call_pure_results = results.clone();
     }
 
     fn name(&self) -> &'static str {
@@ -1563,6 +1606,7 @@ mod tests {
             last_emitted_was_removed: false,
             known_result_call_pure: Vec::new(),
             extra_call_pure: Vec::new(),
+            call_pure_results: HashMap::new(),
             preamble_pure_ops: Vec::new(),
         }));
         let result = opt.optimize_with_constants_and_inputs(
@@ -2120,13 +2164,51 @@ mod tests {
         let args = vec![OpRef(100), OpRef(101)];
         pass.set_extra_call_pure(vec![(args.clone(), OpRef(50))]);
 
-        // The lookup should find the injected result
+        // extra_call_pure entries are searched via optimize_call_pure_old
+        // in the CALL_PURE handler (pure.py:204-210), not via
+        // lookup_known_result (which only searches known_result_call_pure).
         let key = super::PureOpKey {
             opcode: OpCode::CallPureI,
             args,
             descr_index: None,
         };
-        assert_eq!(pass.lookup_known_result(&key), Some(OpRef(50)));
+        // Verify entries exist in extra_call_pure
+        assert_eq!(pass.extra_call_pure.len(), 1);
+        match &pass.extra_call_pure[0] {
+            super::ExtraCallPureEntry::Direct { key: k, result } => {
+                assert_eq!(k, &key);
+                assert_eq!(*result, OpRef(50));
+            }
+            _ => panic!("expected Direct entry"),
+        }
+    }
+
+    #[test]
+    fn test_known_result_call_pure_lookup() {
+        let mut pass = OptPure::new();
+        let ctx = OptContext::with_num_inputs(4, 0);
+
+        // pure.py:214: self.known_result_call_pure.append(op)
+        pass.known_result_call_pure.push(super::KnownResultEntry {
+            descr_index: None,
+            args: vec![OpRef(100), OpRef(101)],
+            result: OpRef(50),
+        });
+
+        // CALL_PURE lookup: start_index=0, descr matches (both None), args match
+        let op = Op::new(OpCode::CallPureI, &[OpRef(100), OpRef(101)]);
+        assert_eq!(pass.lookup_known_result(&op, 0, &ctx), Some(OpRef(50)));
+
+        // COND_CALL_VALUE lookup: start_index=1, skip arg(0)
+        let cond_op = Op::new(
+            OpCode::CondCallValueI,
+            &[OpRef(999), OpRef(100), OpRef(101)],
+        );
+        assert_eq!(pass.lookup_known_result(&cond_op, 1, &ctx), Some(OpRef(50)));
+
+        // Args mismatch → None
+        let bad_args = Op::new(OpCode::CallPureI, &[OpRef(100), OpRef(999)]);
+        assert_eq!(pass.lookup_known_result(&bad_args, 0, &ctx), None);
     }
 
     #[test]
@@ -2422,5 +2504,26 @@ mod tests {
         // First COND_CALL_VALUE emitted, second removed by CSE
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::CondCallValueI);
+    }
+
+    #[test]
+    fn test_cond_call_value_uses_call_pure_results_starting_at_arg1() {
+        let mut ops = vec![Op::new(
+            OpCode::CondCallValueI,
+            &[OpRef(100), OpRef::from_const(0), OpRef::from_const(1)],
+        )];
+        assign_positions(&mut ops);
+
+        let mut opt = Optimizer::new();
+        opt.record_call_pure_result(vec![Value::Int(0xCAFE), Value::Int(7)], Value::Int(42));
+        opt.add_pass(Box::new(OptPure::new()));
+
+        let mut constants = std::collections::HashMap::new();
+        constants.insert(OpRef::from_const(0).0, 0xCAFE_i64);
+        constants.insert(OpRef::from_const(1).0, 7_i64);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1);
+
+        assert!(result.is_empty());
+        assert_eq!(constants.get(&ops[0].pos.0), Some(&42_i64));
     }
 }

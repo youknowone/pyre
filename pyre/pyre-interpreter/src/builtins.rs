@@ -1256,12 +1256,14 @@ pub(crate) fn builtin_int(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     }
     let obj = args[0];
     unsafe {
-        // int(bool) → int (not bool); int(int) → return as-is.
+        // intobject.py:991 _new_baseint: space.is_w(space.type(w_value), space.w_int)
+        let w_type = crate::typedef::r#type(obj);
+        let w_int = crate::typedef::gettypefor(&INT_TYPE);
+        if w_type.is_some() && w_type == w_int {
+            return Ok(obj);
+        }
         if is_bool(obj) {
             return Ok(w_int_new(if w_bool_get_value(obj) { 1 } else { 0 }));
-        }
-        if is_int(obj) {
-            return Ok(obj);
         }
         if is_float(obj) {
             return Ok(w_int_new(floatobject::w_float_get_value(obj) as i64));

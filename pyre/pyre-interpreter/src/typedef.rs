@@ -384,6 +384,14 @@ pub fn init_typeobjects() {
         new_typeobject_with_base("NoneType", |_| {}, object_type) as usize,
     );
 
+    // typedef.py:941-946 Ellipsis.typedef.
+    let ellipsis_type = new_typeobject_with_base("ellipsis", init_ellipsis_type, object_type);
+    unsafe { pyre_object::w_type_set_acceptable_as_base_class(ellipsis_type, false) };
+    reg.insert(
+        &ELLIPSIS_TYPE as *const PyType as usize,
+        ellipsis_type as usize,
+    );
+
     // types.UnionType — PyPy: _pypy_generic_alias.py UnionType, bases=(object,)
     reg.insert(
         &pyre_object::UNION_TYPE as *const PyType as usize,
@@ -699,6 +707,28 @@ fn float_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 fn make_new_descr(func: fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>) -> PyObjectRef {
     let f = make_builtin_function("__new__", func);
     pyre_object::w_staticmethod_new(f)
+}
+
+fn ellipsis_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    if let Some(w_ellipsis) = gettypefor(&pyre_object::ELLIPSIS_TYPE) {
+        check_user_subclass(w_ellipsis, cls)?;
+    }
+    Ok(pyre_object::noneobject::w_ellipsis())
+}
+
+fn init_ellipsis_type(ns: &mut PyNamespace) {
+    namespace_store(ns, "__new__", make_new_descr(ellipsis_descr_new));
+    namespace_store(
+        ns,
+        "__repr__",
+        make_builtin_function("__repr__", |_args| Ok(w_str_new("Ellipsis"))),
+    );
+    namespace_store(
+        ns,
+        "__reduce__",
+        make_builtin_function("__reduce__", |_args| Ok(w_str_new("Ellipsis"))),
+    );
 }
 
 /// `str.__new__(cls, *args)` — PyPy: unicodeobject.py descr__new__
@@ -4143,5 +4173,19 @@ fn descr_get_weakref(
         Some(lifeline) => Ok(crate::module::_weakref::interp_weakref::get_any_weakref(
             lifeline,
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_ellipsis_has_registered_typeobject() {
+        crate::typedef::init_typeobjects();
+        let w_type = crate::typedef::r#type(pyre_object::noneobject::w_ellipsis())
+            .expect("Ellipsis should resolve to a W_TypeObject");
+        unsafe {
+            assert_eq!(pyre_object::w_type_get_name(w_type), "ellipsis");
+            assert!(!pyre_object::w_type_get_acceptable_as_base_class(w_type));
+        }
     }
 }

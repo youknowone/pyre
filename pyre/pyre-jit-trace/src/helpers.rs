@@ -478,6 +478,10 @@ pub trait TraceHelperAccess {
     fn trace_none_constant(&mut self) -> Result<OpRef, PyError> {
         self.with_trace_ctx(|ctx| Ok(ctx.const_ref(w_none() as i64)))
     }
+
+    fn trace_ellipsis_constant(&mut self) -> Result<OpRef, PyError> {
+        self.with_trace_ctx(|ctx| Ok(ctx.const_ref(pyre_object::noneobject::w_ellipsis() as i64)))
+    }
 }
 
 /// Emit inline W_Int creation (NewWithVtable + SetfieldGc).

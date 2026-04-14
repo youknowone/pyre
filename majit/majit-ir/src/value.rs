@@ -57,12 +57,45 @@ impl GcRef {
 }
 
 /// A concrete runtime value.
-#[derive(Clone, Copy, Debug, PartialEq)]
+///
+/// PartialEq, Eq, and Hash all use f64::to_bits() for Float values,
+/// matching RPython history.py:282-294 where ConstFloat._get_hash_()
+/// and same_constant() are both bitwise: 0.0 ≠ -0.0, NaN == NaN
+/// (same bits).
+#[derive(Clone, Copy, Debug)]
 pub enum Value {
     Int(i64),
     Float(f64),
     Ref(GcRef),
     Void,
+}
+
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Value::Int(a), Value::Int(b)) => a == b,
+            // history.py:292: longlong.extract_bits(self.value) == longlong.extract_bits(other.value)
+            (Value::Float(a), Value::Float(b)) => a.to_bits() == b.to_bits(),
+            (Value::Ref(a), Value::Ref(b)) => a.0 == b.0,
+            (Value::Void, Value::Void) => true,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Value {}
+
+impl std::hash::Hash for Value {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Value::Int(v) => v.hash(state),
+            // history.py:283: longlong.gethash(self.value) — bitwise
+            Value::Float(v) => v.to_bits().hash(state),
+            Value::Ref(r) => r.0.hash(state),
+            Value::Void => {}
+        }
+    }
 }
 
 impl Value {
