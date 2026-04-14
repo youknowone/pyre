@@ -1014,6 +1014,18 @@ impl MIFrame {
         // accounting drifted during tracing, resync depth/shape from the
         // concrete frame before materializing JUMP args.
         // MIFrame Box tracking: use PyreSym's tracked values, not snapshot.
+        //
+        // When closing to a target loop header, clear stale stack state
+        // BEFORE the resync block and flush_to_frame, so that flush emits
+        // VSD = nlocals (not stale stack depth) and the JUMP args count
+        // matches the root label contract (stack_only = 0 at function entry).
+        if target_pc.is_some() {
+            let s = self.sym_mut();
+            s.valuestackdepth = s.nlocals;
+            s.vable_valuestackdepth = ctx.const_int(s.nlocals as i64);
+            s.symbolic_stack.clear();
+            s.symbolic_stack_types.clear();
+        }
         let concrete_nlocals = self.sym().nlocals;
         let concrete_vsd = self.sym().valuestackdepth.max(concrete_nlocals);
         {
@@ -1039,11 +1051,6 @@ impl MIFrame {
         // pyjitpl.py:2973: at a merge point, next_instr should be the TARGET
         // PC, not the last bytecode's orgpc. flush_to_frame sets
         // vable_next_instr from orgpc; override it here.
-        //
-        // pyjitpl.py:2961 reached_loop_header carries
-        // self.virtualizable_boxes[:-1] unchanged into the JUMP.
-        // virtualizable.py:86-98 read_boxes reads the FULL
-        // locals_cells_stack_w[*] array, so stack slots are preserved.
         if let Some(pc) = target_pc {
             let s = self.sym_mut();
             s.vable_next_instr = ctx.const_int(pc as i64);

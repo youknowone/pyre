@@ -1732,15 +1732,13 @@ impl AssemblerARM64 {
                 let mut src_locations2 = Vec::new();
                 let mut dst_locations2 = Vec::new();
                 // x86/regalloc.py:1287: assert len(arglocs) == jump_op.numargs()
-                // RPython enforces arity equality at regalloc time;
-                // the assembler never sees surplus args.
                 let remap_count = if target_arglocs.is_empty() {
                     arglocs.len()
                 } else {
                     assert_eq!(
                         arglocs.len(),
                         target_arglocs.len(),
-                        "JUMP args ({}) != target LABEL args ({})",
+                        "JUMP args ({}) must match target LABEL args ({})",
                         arglocs.len(),
                         target_arglocs.len(),
                     );
