@@ -594,10 +594,6 @@ impl OptVirtualize {
                     }
                 }
             }
-            // virtualize.py:184-193: getfield on virtual returns _fields[idx]
-            // directly (could be None, normal Box, or PreambleOp in RPython).
-            // PreambleOp is NEVER stored on virtual PtrInfo (shortpreamble.py:74:
-            // assert not opinfo.is_virtual()), so no PreambleOp check needed here.
             let field_val = match &info {
                 PtrInfo::Virtual(vinfo) => get_field(&vinfo.fields, field_idx),
                 PtrInfo::VirtualStruct(vinfo) => get_field(&vinfo.fields, field_idx),
