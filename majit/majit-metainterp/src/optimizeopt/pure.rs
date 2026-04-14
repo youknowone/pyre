@@ -31,7 +31,7 @@ enum ExtraCallPureEntry {
 struct PureOpKey {
     opcode: OpCode,
     args: Vec<OpRef>,
-    descr_index: Option<u32>,
+    descr_identity: Option<usize>,
 }
 
 impl PureOpKey {
@@ -39,7 +39,18 @@ impl PureOpKey {
         PureOpKey {
             opcode: op.opcode,
             args: op.args.to_vec(),
-            descr_index: op.descr.as_ref().map(|d| d.index()),
+            descr_identity: op.descr.as_ref().map(majit_ir::descr::descr_identity),
+        }
+    }
+
+    /// pure.py:185 parity: COND_CALL_VALUE uses start_index=1 to skip arg[0].
+    /// The key uses CALL_PURE opcode so that COND_CALL_VALUE and CALL_PURE
+    /// share the same cache namespace (RPython uses the same dict).
+    fn from_call_op(op: &Op, start_index: usize) -> Self {
+        PureOpKey {
+            opcode: OpCode::call_pure_for_type(op.result_type()),
+            args: op.args[start_index..].to_vec(),
+            descr_identity: op.descr.as_ref().map(majit_ir::descr::descr_identity),
         }
     }
 
@@ -51,7 +62,7 @@ impl PureOpKey {
         PureOpKey {
             opcode: self.opcode,
             args: swapped,
-            descr_index: self.descr_index,
+            descr_identity: self.descr_identity,
         }
     }
 }
@@ -62,7 +73,7 @@ impl PureOpKey {
 /// fields to avoid storing a dummy PureOpKey with an opcode.
 #[derive(Clone, Debug)]
 struct KnownResultEntry {
-    descr_index: Option<u32>,
+    descr_identity: Option<usize>,
     /// args[1..] from the RECORD_KNOWN_RESULT op (the call arguments).
     args: Vec<OpRef>,
     /// arg(0) from the RECORD_KNOWN_RESULT op (the known result).
@@ -122,7 +133,7 @@ impl RecentPureOps {
         &self,
         opcode: OpCode,
         arg0: OpRef,
-        descr_index: Option<u32>,
+        descr_identity: Option<usize>,
         same_box: impl Fn(OpRef, OpRef) -> bool,
     ) -> Option<OpRef> {
         for entry in &self.lst {
@@ -130,7 +141,7 @@ impl RecentPureOps {
             if k.opcode != opcode || k.args.len() != 1 {
                 continue;
             }
-            if k.descr_index != descr_index {
+            if k.descr_identity != descr_identity {
                 continue;
             }
             // pure.py:62 — box0.same_box(get_box_replacement(op.getarg(0)))
@@ -150,7 +161,7 @@ impl RecentPureOps {
         opcode: OpCode,
         arg0: OpRef,
         arg1: OpRef,
-        descr_index: Option<u32>,
+        descr_identity: Option<usize>,
         commutative: bool,
         same_box: impl Fn(OpRef, OpRef) -> bool,
     ) -> Option<OpRef> {
@@ -159,7 +170,7 @@ impl RecentPureOps {
             if k.opcode != opcode || k.args.len() != 2 {
                 continue;
             }
-            if k.descr_index != descr_index {
+            if k.descr_identity != descr_identity {
                 continue;
             }
             // pure.py:72-75 — same_box includes get_box_replacement
@@ -238,11 +249,11 @@ impl RecentPureOpTable {
         &self,
         opcode: OpCode,
         arg0: OpRef,
-        descr_index: Option<u32>,
+        descr_identity: Option<usize>,
         same_box: impl Fn(OpRef, OpRef) -> bool,
     ) -> Option<OpRef> {
         self.bucket(opcode)
-            .and_then(|bucket| bucket.lookup1(opcode, arg0, descr_index, same_box))
+            .and_then(|bucket| bucket.lookup1(opcode, arg0, descr_identity, same_box))
     }
 
     fn lookup2(
@@ -250,12 +261,12 @@ impl RecentPureOpTable {
         opcode: OpCode,
         arg0: OpRef,
         arg1: OpRef,
-        descr_index: Option<u32>,
+        descr_identity: Option<usize>,
         commutative: bool,
         same_box: impl Fn(OpRef, OpRef) -> bool,
     ) -> Option<OpRef> {
         self.bucket(opcode).and_then(|bucket| {
-            bucket.lookup2(opcode, arg0, arg1, descr_index, commutative, same_box)
+            bucket.lookup2(opcode, arg0, arg1, descr_identity, commutative, same_box)
         })
     }
 
@@ -298,7 +309,7 @@ pub struct OptPure {
     /// Pre-recorded CALL_PURE results from RECORD_KNOWN_RESULT.
     /// pure.py: known_result_call_pure — stores the full RECORD_KNOWN_RESULT op.
     /// RPython lookup: descr + _same_args(known_op, op, 1, start_index).
-    /// We store (descr_index, args_from_1, result) — no opcode comparison.
+    /// We store (descr_identity, args_from_1, result) — no opcode comparison.
     known_result_call_pure: Vec<KnownResultEntry>,
     /// pure.py:104: extra_call_pure — CALL_PURE results from the previous
     /// loop iteration and preamble import. May contain PreambleOp entries
@@ -321,7 +332,7 @@ pub struct OptPure {
 struct PreamblePureEntry {
     opcode: OpCode,
     args: Vec<OpRef>,
-    descr_index: Option<u32>,
+    descr_identity: Option<usize>,
     pop: PreambleOp,
     /// Forced flag: after first match, replaced with Direct result.
     forced_result: Option<OpRef>,
@@ -351,7 +362,7 @@ impl OptPure {
                 let key = PureOpKey {
                     opcode: OpCode::CallPureI,
                     args,
-                    descr_index: None,
+                    descr_identity: None,
                 };
                 ExtraCallPureEntry::Direct { key, result }
             })
@@ -419,7 +430,7 @@ impl OptPure {
         let key = PureOpKey {
             opcode,
             args: args.to_vec(),
-            descr_index: None,
+            descr_identity: None,
         };
         self.cache.insert(key, result);
     }
@@ -451,10 +462,10 @@ impl OptPure {
         &self,
         opcode: OpCode,
         arg0: OpRef,
-        descr_index: Option<u32>,
+        descr_identity: Option<usize>,
         same_box: impl Fn(OpRef, OpRef) -> bool,
     ) -> Option<OpRef> {
-        self.cache.lookup1(opcode, arg0, descr_index, same_box)
+        self.cache.lookup1(opcode, arg0, descr_identity, same_box)
     }
 
     /// pure.py:67-79 lookup2(opt, box0, box1, descr, commutative).
@@ -463,12 +474,12 @@ impl OptPure {
         opcode: OpCode,
         arg0: OpRef,
         arg1: OpRef,
-        descr_index: Option<u32>,
+        descr_identity: Option<usize>,
         commutative: bool,
         same_box: impl Fn(OpRef, OpRef) -> bool,
     ) -> Option<OpRef> {
         self.cache
-            .lookup2(opcode, arg0, arg1, descr_index, commutative, same_box)
+            .lookup2(opcode, arg0, arg1, descr_identity, commutative, same_box)
     }
 
     /// Get the positions of emitted CALL_PURE ops (for short preamble generation).
@@ -484,9 +495,9 @@ impl OptPure {
     ///   `self._same_args(known_result_op, op, 1, start_index)` → args check
     /// No opcode comparison.
     fn lookup_known_result(&self, op: &Op, start_index: usize, ctx: &OptContext) -> Option<OpRef> {
-        let op_descr_index = op.descr.as_ref().map(|d| d.index());
+        let op_descr_identity = op.descr.as_ref().map(majit_ir::descr::descr_identity);
         for entry in &self.known_result_call_pure {
-            if entry.descr_index != op_descr_index {
+            if entry.descr_identity != op_descr_identity {
                 continue;
             }
             // _same_args(known_op, op, 1, start_index):
@@ -516,12 +527,12 @@ impl OptPure {
     /// Searches preamble entries with forwarding-aware arg matching.
     /// On match, forces PreambleOp (in-place replacement) and returns result.
     fn force_preamble_op(&mut self, op: &Op, ctx: &mut OptContext) -> Option<OpRef> {
-        let descr_index = op.descr.as_ref().map(|d| d.index());
+        let descr_identity = op.descr.as_ref().map(majit_ir::descr::descr_identity);
         for entry in &mut self.preamble_pure_ops {
             if entry.opcode != op.opcode {
                 continue;
             }
-            if entry.descr_index != descr_index {
+            if entry.descr_identity != descr_identity {
                 continue;
             }
             if entry.args.len() != op.args.len() {
@@ -567,7 +578,7 @@ impl OptPure {
             if entry.opcode != op.opcode {
                 continue;
             }
-            if entry.descr.as_ref().map(|d| d.index()) != descr_index {
+            if entry.descr.as_ref().map(majit_ir::descr::descr_identity) != descr_identity {
                 continue;
             }
             if entry.args.len() != op.args.len() {
@@ -616,13 +627,13 @@ impl OptPure {
         &mut self,
         opcode: OpCode,
         args: Vec<OpRef>,
-        descr_index: Option<u32>,
+        descr_identity: Option<usize>,
         pop: PreambleOp,
     ) {
         self.preamble_pure_ops.push(PreamblePureEntry {
             opcode,
             args,
-            descr_index,
+            descr_identity,
             pop,
             forced_result: None,
         });
@@ -634,13 +645,13 @@ impl OptPure {
         &mut self,
         opcode: OpCode,
         args: Vec<OpRef>,
-        descr_index: Option<u32>,
+        descr_identity: Option<usize>,
         pop: PreambleOp,
     ) {
         let key = PureOpKey {
             opcode,
             args,
-            descr_index,
+            descr_identity,
         };
         self.extra_call_pure
             .push(ExtraCallPureEntry::Preamble { key, pop });
@@ -703,13 +714,13 @@ impl OptPure {
         op: &Op,
         old_op_opcode: OpCode,
         old_op_args: &[OpRef],
-        old_op_descr_index: Option<u32>,
-        op_descr_index: Option<u32>,
+        old_op_descr_identity: Option<usize>,
+        op_descr_identity: Option<usize>,
         start_index: usize,
         ctx: &OptContext,
     ) -> bool {
         // pure.py:250-251: descr identity check.
-        if op_descr_index != old_op_descr_index {
+        if op_descr_identity != old_op_descr_identity {
             return false;
         }
         // RPython relies on each CALL_PURE having a unique descriptor that
@@ -957,7 +968,7 @@ impl Optimization for OptPure {
                     let non_ovf_key = PureOpKey {
                         opcode: non_ovf,
                         args: postponed.args.to_vec(),
-                        descr_index: None,
+                        descr_identity: None,
                     };
                     if let Some(cached_ref) = self.lookup_pure(&non_ovf_key) {
                         // _can_reuse_oldop(non_ovf, ovf=true) is false:
@@ -1004,7 +1015,7 @@ impl Optimization for OptPure {
         if op.opcode == OpCode::RecordKnownResult {
             if op.num_args() >= 2 {
                 self.known_result_call_pure.push(KnownResultEntry {
-                    descr_index: op.descr.as_ref().map(|d| d.index()),
+                    descr_identity: op.descr.as_ref().map(majit_ir::descr::descr_identity),
                     args: op.args[1..].to_vec(),
                     result: op.arg(0),
                 });
@@ -1041,98 +1052,12 @@ impl Optimization for OptPure {
             return OptimizationResult::PassOn;
         }
 
-        // pure.py:185-228 optimize_call_pure
-        if op.opcode.is_call_pure() {
-            // pure.py:185-188: force_box on each non-skipped arg.
-            // pure.py:191-196: constant-fold check via _can_optimize_call_pure.
-            if let Some(value) = self.lookup_call_pure_result(op, 0, ctx) {
-                ctx.make_constant(op.pos, value);
-                self.last_emitted_was_removed = true;
-                return OptimizationResult::Remove;
-            }
-
-            let key = PureOpKey::from_op(op);
-
-            // pure.py:200-203 — iterate call_pure_positions and try
-            // optimize_call_pure_old against each emitted call_pure.
-            //
-            // Fast path: HashMap lookup hits the common case (exact
-            // key match). Fallback below covers RPython's cond_call_value
-            // asymmetric reuse.
-            if let Some(cached_ref) = self.lookup_pure(&key) {
-                let cached_ref = ctx.get_box_replacement(cached_ref);
-                ctx.replace_op(op.pos, cached_ref);
-                self.last_emitted_was_removed = true;
-                return OptimizationResult::Remove;
-            }
-            let op_descr_index = op.descr.as_ref().map(|d| d.index());
-            for &pos in &self.call_pure_positions {
-                if let Some(old_op) = ctx.new_operations.get(pos) {
-                    let old_descr_index = old_op.descr.as_ref().map(|d| d.index());
-                    if Self::optimize_call_pure_old(
-                        op,
-                        old_op.opcode,
-                        &old_op.args,
-                        old_descr_index,
-                        op_descr_index,
-                        0,
-                        ctx,
-                    ) {
-                        let cached_ref = ctx.get_box_replacement(old_op.pos);
-                        ctx.replace_op(op.pos, cached_ref);
-                        self.last_emitted_was_removed = true;
-                        return OptimizationResult::Remove;
-                    }
-                }
-            }
-            // pure.py:204-210 — iterate extra_call_pure entries.
-            for entry in &self.extra_call_pure {
-                let (entry_opcode, entry_args, entry_descr_index, entry_result) = match entry {
-                    ExtraCallPureEntry::Direct { key, result } => {
-                        (key.opcode, key.args.clone(), key.descr_index, *result)
-                    }
-                    ExtraCallPureEntry::Preamble { key, pop } => {
-                        (key.opcode, key.args.clone(), key.descr_index, pop.resolved)
-                    }
-                };
-                if Self::optimize_call_pure_old(
-                    op,
-                    entry_opcode,
-                    &entry_args,
-                    entry_descr_index,
-                    op_descr_index,
-                    0,
-                    ctx,
-                ) {
-                    let cached_ref = ctx.get_box_replacement(entry_result);
-                    ctx.replace_op(op.pos, cached_ref);
-                    self.last_emitted_was_removed = true;
-                    return OptimizationResult::Remove;
-                }
-            }
-            // pure.py:211-220 — known_result_call_pure (RECORD_KNOWN_RESULT).
-            if let Some(result_ref) = self.lookup_known_result(op, 0, ctx) {
-                let result_ref = ctx.get_box_replacement(result_ref);
-                ctx.replace_op(op.pos, result_ref);
-                self.last_emitted_was_removed = true;
-                return OptimizationResult::Remove;
-            }
-
-            self.cache.insert(key, op.pos);
-            // pure.py:222-225: replace CALL_PURE with CALL (start_index == 0).
-            self.call_pure_positions.push(ctx.new_operations.len());
-            let new_op = self.demote_call_pure(op);
-            if !Self::call_pure_can_raise(op) {
-                self.short_preamble_pure_ops.push(new_op.clone());
-            }
-            return OptimizationResult::Emit(new_op);
-        }
-
-        // pure.py:236-238: optimize_COND_CALL_VALUE_I/R delegates to
-        // optimize_call_pure(op, start_index=1).
-        if op.opcode.is_cond_call_value() {
-            let start_index: usize = 1;
-            let op_descr_index = op.descr.as_ref().map(|d| d.index());
+        // pure.py:185-228 optimize_call_pure(op, start_index)
+        // pure.py:230-234: optimize_CALL_PURE_I/R/F/N → start_index=0
+        // pure.py:236-238: optimize_COND_CALL_VALUE_I/R → start_index=1
+        if op.opcode.is_call_pure() || op.opcode.is_cond_call_value() {
+            let start_index: usize = if op.opcode.is_cond_call_value() { 1 } else { 0 };
+            let op_descr_identity = op.descr.as_ref().map(majit_ir::descr::descr_identity);
 
             // pure.py:191-196: _can_optimize_call_pure(op, start_index=1).
             if let Some(value) = self.lookup_call_pure_result(op, start_index, ctx) {
@@ -1145,13 +1070,14 @@ impl Optimization for OptPure {
             // optimize_call_pure_old with adjusted start_index.
             for &pos in &self.call_pure_positions {
                 if let Some(old_op) = ctx.new_operations.get(pos) {
-                    let old_descr_index = old_op.descr.as_ref().map(|d| d.index());
+                    let old_descr_identity =
+                        old_op.descr.as_ref().map(majit_ir::descr::descr_identity);
                     if Self::optimize_call_pure_old(
                         op,
                         old_op.opcode,
                         &old_op.args,
-                        old_descr_index,
-                        op_descr_index,
+                        old_descr_identity,
+                        op_descr_identity,
                         start_index,
                         ctx,
                     ) {
@@ -1164,20 +1090,23 @@ impl Optimization for OptPure {
             }
             // pure.py:204-210: iterate extra_call_pure entries.
             for entry in &self.extra_call_pure {
-                let (entry_opcode, entry_args, entry_descr_index, entry_result) = match entry {
+                let (entry_opcode, entry_args, entry_descr_identity, entry_result) = match entry {
                     ExtraCallPureEntry::Direct { key, result } => {
-                        (key.opcode, key.args.clone(), key.descr_index, *result)
+                        (key.opcode, key.args.clone(), key.descr_identity, *result)
                     }
-                    ExtraCallPureEntry::Preamble { key, pop } => {
-                        (key.opcode, key.args.clone(), key.descr_index, pop.resolved)
-                    }
+                    ExtraCallPureEntry::Preamble { key, pop } => (
+                        key.opcode,
+                        key.args.clone(),
+                        key.descr_identity,
+                        pop.resolved,
+                    ),
                 };
                 if Self::optimize_call_pure_old(
                     op,
                     entry_opcode,
                     &entry_args,
-                    entry_descr_index,
-                    op_descr_index,
+                    entry_descr_identity,
+                    op_descr_identity,
                     start_index,
                     ctx,
                 ) {
@@ -1195,11 +1124,20 @@ impl Optimization for OptPure {
                 return OptimizationResult::Remove;
             }
 
-            let key = PureOpKey::from_op(op);
+            let key = PureOpKey::from_call_op(op, start_index);
             self.cache.insert(key, op.pos);
             self.call_pure_positions.push(ctx.new_operations.len());
-            // pure.py:226-227: COND_CALL_VALUE is NOT demoted to CALL.
-            return OptimizationResult::Emit(op.clone());
+            if start_index == 0 {
+                // pure.py:222-225: replace CALL_PURE with CALL.
+                let new_op = self.demote_call_pure(op);
+                if !Self::call_pure_can_raise(op) {
+                    self.short_preamble_pure_ops.push(new_op.clone());
+                }
+                return OptimizationResult::Emit(new_op);
+            } else {
+                // pure.py:226-227: COND_CALL_VALUE is NOT demoted.
+                return OptimizationResult::Emit(op.clone());
+            }
         }
 
         OptimizationResult::PassOn
@@ -1273,7 +1211,7 @@ impl Optimization for OptPure {
                     }
                 })
                 .collect();
-            let descr_index = entry.descr.as_ref().map(|d| d.index());
+            let descr_identity = entry.descr.as_ref().map(majit_ir::descr::descr_identity);
             let source = ctx.imported_short_source(entry.result);
             let mut replay = majit_ir::Op::new(entry.opcode, &resolved_args);
             replay.pos = source;
@@ -1286,10 +1224,10 @@ impl Optimization for OptPure {
             };
             if entry.opcode.is_call_pure() || entry.opcode.is_call() {
                 // shortpreamble.py:122-123: optpure.extra_call_pure.append(PreambleOp(...))
-                self.extra_call_pure_preamble(entry.opcode, resolved_args, descr_index, pop);
+                self.extra_call_pure_preamble(entry.opcode, resolved_args, descr_identity, pop);
             } else {
                 // shortpreamble.py:124-126: opt.pure(opnum, PreambleOp(...))
-                self.pure_preamble(entry.opcode, resolved_args, descr_index, pop);
+                self.pure_preamble(entry.opcode, resolved_args, descr_identity, pop);
             }
         }
     }
@@ -1646,17 +1584,17 @@ mod tests {
         let key1 = PureOpKey {
             opcode: OpCode::IntAdd,
             args: vec![OpRef(0), OpRef(1)],
-            descr_index: None,
+            descr_identity: None,
         };
         let key2 = PureOpKey {
             opcode: OpCode::IntAdd,
             args: vec![OpRef(0), OpRef(1)],
-            descr_index: None,
+            descr_identity: None,
         };
         let key3 = PureOpKey {
             opcode: OpCode::IntAdd,
             args: vec![OpRef(1), OpRef(0)],
-            descr_index: None,
+            descr_identity: None,
         };
         assert_eq!(key1, key2);
         assert_ne!(key1, key3);
@@ -2170,7 +2108,7 @@ mod tests {
         let key = super::PureOpKey {
             opcode: OpCode::CallPureI,
             args,
-            descr_index: None,
+            descr_identity: None,
         };
         // Verify entries exist in extra_call_pure
         assert_eq!(pass.extra_call_pure.len(), 1);
@@ -2190,7 +2128,7 @@ mod tests {
 
         // pure.py:214: self.known_result_call_pure.append(op)
         pass.known_result_call_pure.push(super::KnownResultEntry {
-            descr_index: None,
+            descr_identity: None,
             args: vec![OpRef(100), OpRef(101)],
             result: OpRef(50),
         });
