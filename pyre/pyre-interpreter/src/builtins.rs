@@ -1362,40 +1362,20 @@ fn ensure_baseint_result(
             ));
         }
     }
-    // intobject.py:1104-1107
-    Err(crate::PyError::type_error(
-        "int() argument must be a string, a bytes-like object or a number, not '%T'",
+    // intobject.py:1104-1107: shouldn't happen
+    Err(crate::PyError::new(
+        crate::PyErrorKind::RuntimeError,
+        "internal error in int.__new__()".to_string(),
     ))
 }
 
-/// intobject.py:1052-1057 space.getindex_w(w_base, None)
+/// baseobjspace.py:1564-1596 space.getindex_w(w_base, None)
 ///
-/// Extract base as u32 from any object supporting __index__.
-/// On overflow, returns 37 (sentinel that produces ValueError in parser).
+/// Calls __index__() on w_base and converts to i64.
+/// On OverflowError (long that doesn't fit i64), returns 37 sentinel
+/// (intobject.py:1057: causes ValueError in string_to_bigint).
 fn getindex_w_for_base(w_base: PyObjectRef) -> Result<u32, crate::PyError> {
-    let value: i64 = unsafe {
-        if is_int(w_base) {
-            w_int_get_value(w_base)
-        } else if pyre_object::pyobject::is_long(w_base) {
-            // overflow → sentinel 37
-            return Ok(37);
-        } else if let Some(method) = crate::baseobjspace::lookup(w_base, "__index__") {
-            let w_result = crate::call_function(method, &[w_base]);
-            if is_int(w_result) {
-                w_int_get_value(w_result)
-            } else if pyre_object::pyobject::is_long(w_result) {
-                return Ok(37);
-            } else {
-                return Err(crate::PyError::type_error(
-                    "int() second argument must be an integer, not '%T'",
-                ));
-            }
-        } else {
-            return Err(crate::PyError::type_error(
-                "int() second argument must be an integer, not '%T'",
-            ));
-        }
-    };
+    let value = getindex_w(w_base)?;
     if value < 0 || value == 1 || value > 36 {
         return Err(crate::PyError::new(
             crate::PyErrorKind::ValueError,
@@ -1403,6 +1383,39 @@ fn getindex_w_for_base(w_base: PyObjectRef) -> Result<u32, crate::PyError> {
         ));
     }
     Ok(value as u32)
+}
+
+/// baseobjspace.py:1564-1596 space.getindex_w(w_obj, None)
+///
+/// Return w_obj.__index__() as i64. On overflow, clamp to i64::MAX
+/// (w_exception=None path).
+fn getindex_w(w_obj: PyObjectRef) -> Result<i64, crate::PyError> {
+    unsafe {
+        if is_int(w_obj) {
+            return Ok(w_int_get_value(w_obj));
+        }
+        if pyre_object::pyobject::is_long(w_obj) {
+            // baseobjspace.py:1586-1591: try int_w, on overflow clamp
+            use num_traits::ToPrimitive;
+            let big = pyre_object::longobject::w_long_get_value(w_obj);
+            return Ok(big.to_i64().unwrap_or(i64::MAX));
+        }
+        // baseobjspace.py:1568: w_index = self.index(w_obj)
+        if let Some(method) = crate::baseobjspace::lookup(w_obj, "__index__") {
+            let w_index = crate::call_function(method, &[w_obj]);
+            if is_int(w_index) {
+                return Ok(w_int_get_value(w_index));
+            }
+            if pyre_object::pyobject::is_long(w_index) {
+                use num_traits::ToPrimitive;
+                let big = pyre_object::longobject::w_long_get_value(w_index);
+                return Ok(big.to_i64().unwrap_or(i64::MAX));
+            }
+        }
+    }
+    Err(crate::PyError::type_error(
+        "int() second argument must be an integer, not '%T'",
+    ))
 }
 
 /// Parse an integer from a string with the given base.

@@ -1877,17 +1877,14 @@ impl TraceCtx {
     /// Patch a CALL into a CALL_PURE. Called after a pure call executes
     /// during tracing with no exception.
     ///
-    /// - If all args are constants: cut the CALL op and return the constant
-    ///   result directly (the CALL is elided from the trace).
-    /// - Otherwise: store `arg_consts → result` in `call_pure_results`,
-    ///   cut the plain CALL, and re-record as CALL_PURE.
-    ///
-    /// Returns the OpRef of the result (either the original `op` or a
-    /// freshly recorded CALL_PURE, or a constant if all-constant-folded).
+    /// `concrete_arg_values` contains the execution-time values for ALL
+    /// args (pyjitpl.py:3572 `[executor.constant_from_op(a) for a in
+    /// normargboxes]`). Used as the full cache key.
     pub fn record_result_of_call_pure(
         &mut self,
         op: OpRef,
         argboxes: &[OpRef],
+        concrete_arg_values: &[Value],
         descr: DescrRef,
         patch_pos: TracePosition,
         opcode: OpCode,
@@ -1896,17 +1893,15 @@ impl TraceCtx {
         let resbox_as_const = result_value;
         // pyjitpl.py:3557-3561: COND_CALL_VALUE ignores the 'value' arg
         let is_cond_value = opcode.is_cond_call_value();
-        let normargboxes = if is_cond_value {
-            &argboxes[1..]
-        } else {
-            argboxes
-        };
-        // pyjitpl.py:3562-3565: check if all args are constants
+        let norm_start = if is_cond_value { 1 } else { 0 };
+        let normargboxes = &argboxes[norm_start..];
+        let norm_values = &concrete_arg_values[norm_start..];
+        // pyjitpl.py:3562-3565: check if all args are Const
         let all_const = normargboxes
             .iter()
             .all(|arg| self.constants.get_value(*arg).is_some());
         if all_const {
-            // pyjitpl.py:3566-3569: all-constants: remove the CALL
+            // pyjitpl.py:3566-3569: all-constants → cut the CALL
             self.recorder.cut(patch_pos);
             let const_opref = match resbox_as_const {
                 Value::Int(v) => self.constants.get_or_insert(v),
@@ -1920,11 +1915,8 @@ impl TraceCtx {
             };
             return const_opref;
         }
-        // pyjitpl.py:3572-3573: not all constants — store mapping
-        let arg_consts: Vec<Value> = normargboxes
-            .iter()
-            .filter_map(|arg| self.constants.get_value(*arg))
-            .collect();
+        // pyjitpl.py:3572-3573: constant_from_op(a) for ALL args
+        let arg_consts: Vec<Value> = norm_values.to_vec();
         self.call_pure_results.insert(arg_consts, resbox_as_const);
         // pyjitpl.py:3574-3575: COND_CALL_VALUE remains as-is
         if is_cond_value {

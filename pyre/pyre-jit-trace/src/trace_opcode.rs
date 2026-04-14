@@ -1038,11 +1038,14 @@ impl MIFrame {
         // PC, not the last bytecode's orgpc. flush_to_frame sets
         // vable_next_instr from orgpc; override it here.
         //
-        // RPython parity: when closing a loop back to a target header,
-        // the JUMP must carry only the header's contract: scalar inputargs
-        // (frame, ni, code, vsd, ns) plus locals. Stack values are NOT
-        // loop-carried — they belong to a specific execution point and
-        // must not leak into the JUMP args.
+        // RPython note: virtualizable.py:86-98 read_boxes reads the FULL
+        // locals_cells_stack_w[*] array (fixed size = nlocals + ncells +
+        // co_stacksize). pyre uses split symbolic_locals / symbolic_stack
+        // with dynamic sizes. The root trace label was compiled with
+        // stack_only=0 at function entry; bridge JUMPs must match that
+        // contract by clearing stale stack state. Full-array parity
+        // requires changing label creation to always include the full
+        // array — tracked as a separate effort.
         if let Some(pc) = target_pc {
             let s = self.sym_mut();
             s.vable_next_instr = ctx.const_int(pc as i64);

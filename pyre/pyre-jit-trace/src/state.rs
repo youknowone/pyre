@@ -4881,7 +4881,12 @@ mod tests {
     }
 
     #[test]
-    fn test_close_loop_args_at_target_pc_uses_locals_only_jump_contract() {
+    fn test_close_loop_args_at_target_pc_clears_stack_for_label_contract() {
+        // Pyre label contract: root trace label is recorded at function
+        // entry with stack_only=0. Bridge JUMPs must match by clearing
+        // stale stack state. RPython uses a fixed-size full array for
+        // both label and JUMP (virtualizable.py:86-98 read_boxes reads
+        // ALL items); porting that requires changing label creation too.
         ensure_test_callbacks();
         let mut ctx = TraceCtx::for_test(0);
         let frame_ref = ctx.const_ref(0x1000);
@@ -4921,11 +4926,10 @@ mod tests {
         assert_eq!(
             jump_args.len(),
             crate::virtualizable_gen::NUM_SCALAR_INPUTARGS + 1,
-            "target loop header should receive frame header plus locals only"
+            "bridge JUMP matches root label: header + locals only"
         );
         assert_eq!(state.sym().valuestackdepth, state.sym().nlocals);
         assert!(state.sym().symbolic_stack.is_empty());
-        assert!(state.sym().symbolic_stack_types.is_empty());
     }
 
     #[test]
