@@ -1731,13 +1731,20 @@ impl AssemblerARM64 {
                 let mut dst_locations1 = Vec::new();
                 let mut src_locations2 = Vec::new();
                 let mut dst_locations2 = Vec::new();
-                // RPython: jump args count == target label args count.
-                // Bridge Jump may carry extra args beyond what the target
-                // Label expects. Only remap args that have a target location.
+                // x86/regalloc.py:1287: assert len(arglocs) == jump_op.numargs()
+                // RPython enforces arity equality at regalloc time;
+                // the assembler never sees surplus args.
                 let remap_count = if target_arglocs.is_empty() {
                     arglocs.len()
                 } else {
-                    arglocs.len().min(target_arglocs.len())
+                    assert_eq!(
+                        arglocs.len(),
+                        target_arglocs.len(),
+                        "JUMP args ({}) != target LABEL args ({})",
+                        arglocs.len(),
+                        target_arglocs.len(),
+                    );
+                    target_arglocs.len()
                 };
                 for (i, src_loc) in arglocs[..remap_count].iter().enumerate() {
                     let dst_loc = if i < target_arglocs.len() {

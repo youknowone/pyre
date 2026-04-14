@@ -2623,8 +2623,8 @@ impl<M: Clone> MetaInterp<M> {
         ctx.recorder.unfinalize();
         ctx.recorder.cut(cut_at);
 
-        let label = if ends_with_jump { "jump" } else { "finish" };
         if crate::majit_log_enabled() {
+            let label = if ends_with_jump { "jump" } else { "finish" };
             eprintln!(
                 "[jit] compile_trace({}): key={}, ops={}, origin={:?}",
                 label,
@@ -2651,9 +2651,6 @@ impl<M: Clone> MetaInterp<M> {
                     );
                 }
                 if already {
-                    if crate::majit_log_enabled() {
-                        eprintln!("[jit] skip bridge: guard {} already has bridge", fail_index);
-                    }
                     return CompileOutcome::Compiled {
                         green_key: 0,
                         from_retry: false,
@@ -5604,6 +5601,14 @@ impl<M: Clone> MetaInterp<M> {
         // classes that were known at the guard point are restored —
         // runtime class inspection is NOT used here.
         let loop_num_inputs = compiled.num_inputs;
+        if crate::majit_log_enabled() {
+            eprintln!(
+                "--- bridge trace (before opt) ninputs={} ---",
+                bridge_inputargs.len()
+            );
+            eprintln!("inputargs: {:?}", bridge_inputargs);
+            eprint!("{}", majit_ir::format_trace(bridge_ops, &constants));
+        }
         // compile.py:1077-1078 parity: optimize_bridge may raise InvalidLoop
         // (e.g. rewrite.py:404-407 GUARD_CLASS proven to always fail).
         // RPython catches it via the abstract jitexc handler and discards
