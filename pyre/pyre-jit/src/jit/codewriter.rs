@@ -437,12 +437,22 @@ impl CodeWriter {
 
                 // jtransform.py:1877 do_fixed_list_getitem vable case:
                 // portal locals are virtualizable array items.
-                // Phase 5 (vable read) blocked: emitting vable_getarrayitem_ref
-                // alone causes nested_loop WRONG output; shadow read
-                // would need virtualizable_boxes propagation across JUMP
-                // back-edge (unroll.rs export_state/import_state parity).
-                // Keep move_r until the blackhole resume path reads from
-                // the frame directly.
+                // Phase 5 (vable read) blocked on a bridge-level type
+                // reconciliation gap: parent guards can save locals as
+                // unboxed Int/Float (intbounds-promoted), so on bridge
+                // entry `virtualizable_boxes[flat_idx]` holds Int-typed
+                // OpRefs. Emitting vable_getarrayitem_ref here would pull
+                // those Int OpRefs into Ref registers, poisoning the
+                // optimizer's forwarding chain (optimize_bridge → intbounds
+                // → getintbound sees Ref where Int was declared).
+                //
+                // Resolving Phase 5 requires one of: (a) re-boxing Int
+                // OpRefs at bridge import to keep virtualizable_boxes
+                // uniformly Ref-typed, (b) per-slot type dispatch at
+                // LOAD_FAST (generic bytecode → vable_getarrayitem_i/r/f),
+                // or (c) threading dynamic local type info to the
+                // codewriter. Until then, keep move_r so the blackhole
+                // reads the frame value via its pre-consumed register.
                 Instruction::LoadFast { var_num } | Instruction::LoadFastBorrow { var_num } => {
                     let reg = var_num.get(op_arg).as_usize() as u16;
                     assembler.move_r(stack_base + current_depth, reg);
