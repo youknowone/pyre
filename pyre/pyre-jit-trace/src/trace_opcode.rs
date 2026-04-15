@@ -1991,6 +1991,24 @@ impl MIFrame {
         let saved_vsd = self.sym().vable_valuestackdepth;
         self.orgpc = resume_pc;
 
+        // Branch guards resume at `other_target` (the runtime jump destination,
+        // not the POP_JUMP_IF_* opcode's orgpc). At `other_target` the Python
+        // interpreter has already popped the comparison truth, so the snapshot
+        // must reflect the POST-POP stack state. `pre_opcode_stack` /
+        // `pre_opcode_vsd` were captured at the START of POP_JUMP_IF (PRE-POP)
+        // and still carry the Int truth — using them here would emit a
+        // `Box(truth_opref, Int)` at a Ref-declared `locals_cells_stack_w`
+        // slot and corrupt the PyFrame when the guard resumes (the decoder
+        // writes a raw i64 where a PyObjectRef is expected).
+        //
+        // Temporarily suppress the pre-opcode snapshot for the duration of
+        // the branch guard capture so `flush_to_frame_for_guard`,
+        // `get_list_of_active_boxes`, and `build_virtualizable_boxes` all
+        // read the current (post-pop) symbolic_stack / valuestackdepth.
+        let saved_pre_opcode_vsd = self.sym_mut().pre_opcode_vsd.take();
+        let saved_pre_opcode_stack = self.sym_mut().pre_opcode_stack.take();
+        let saved_pre_opcode_stack_types = self.sym_mut().pre_opcode_stack_types.take();
+
         self.flush_to_frame_for_guard(ctx);
         // pyjitpl.py:177: get_list_of_active_boxes uses frame.pc for liveness
         let callee_active_boxes = self.get_list_of_active_boxes(ctx, false, false);
@@ -2074,6 +2092,9 @@ impl MIFrame {
         let s = self.sym_mut();
         s.vable_next_instr = saved_ni;
         s.vable_valuestackdepth = saved_vsd;
+        s.pre_opcode_vsd = saved_pre_opcode_vsd;
+        s.pre_opcode_stack = saved_pre_opcode_stack;
+        s.pre_opcode_stack_types = saved_pre_opcode_stack_types;
     }
 
     /// RPython registers[idx] parity: read concrete value from Box arrays.
