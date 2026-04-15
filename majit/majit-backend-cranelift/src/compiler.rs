@@ -429,6 +429,19 @@ struct RegisteredLoopTarget {
     /// virtualizable.py:86 read_boxes: number of scalar inputargs
     /// (frame + static fields). First local is at this index.
     num_scalar_inputargs: usize,
+    /// regalloc.py:871 — byte offsets of each inputarg within jf_frame,
+    /// relative to BASEITEMOFS. _ll_initial_locs[i] = i * 8 (contiguous).
+    _ll_initial_locs: Vec<i32>,
+    /// rewrite.py:669 — compiled_loop_token.frame_info.
+    /// Leaked Box<[isize; 2]> with stable address (never freed).
+    /// Layout matches jitframe.py JitFrameInfo: two Signed (isize) fields.
+    /// RPython: frame_info = lltype.malloc(JITFRAMEINFO) — allocated once,
+    /// updated in place, pointer survives across registry clones/updates.
+    frame_info: *mut [isize; 2],
+    /// pyjitpl.py:3605 — outermost_jitdriver_sd.index_of_virtualizable.
+    /// Read from JitCellToken at registration time; -1 when the driver
+    /// has no virtualizable.
+    index_of_virtualizable: i32,
 }
 
 unsafe impl Send for RegisteredLoopTarget {}
@@ -2020,6 +2033,42 @@ fn register_call_assembler_target(
             // header (first N entries with at least one Int).
             token.inputarg_types.len().min(compiled.num_inputs)
         },
+        // regalloc.py:861-871 _set_initial_bindings:
+        //   locs.append(loc.value - base_ofs)
+        // Pyre uses contiguous layout: inputarg[i] at slot i.
+        _ll_initial_locs: (0..compiled.num_inputs).map(|i| (i as i32) * 8).collect(),
+        // rewrite.py:669 — compiled_loop_token.frame_info
+        // jitframe.py:18-22 jitframeinfo_update_depth(fi, base_ofs, depth)
+        //
+        // size includes the 8-byte GcHeader overhead that pyre prepends to
+        // every nursery allocation. `malloc_nursery_varsize_frame(size)`
+        // bumps the nursery by `size` bytes and returns a pointer 8 bytes
+        // in (past the GcHeader), so the JITFRAME-layout object has only
+        // `size - GcHeader::SIZE` bytes of usable payload.
+        frame_info: {
+            let depth = (compiled.max_output_slots + compiled.num_ref_roots) as isize;
+            let base_ofs = JF_FRAME_ITEM0_OFS as isize;
+            let size = GcHeader::SIZE as isize + base_ofs + depth * 8;
+            // RPython: frame_info is allocated once, updated in place.
+            // Reuse the pending target's allocation if it exists.
+            let mut registry = call_assembler_registry().lock().unwrap();
+            let fi = if let Some(existing) = registry.get(&token.number) {
+                let fi = existing.frame_info;
+                unsafe {
+                    (*fi)[0] = depth;
+                    (*fi)[1] = size;
+                }
+                fi
+            } else {
+                Box::into_raw(Box::new([depth, size]))
+            };
+            drop(registry);
+            fi
+        },
+        index_of_virtualizable: token
+            .virtualizable_arg_index
+            .map(|i| i as i32)
+            .unwrap_or(-1),
     };
     validate_registered_target_against_call_assembler_expectations(token.number, &target)?;
     // Invalidate thread-local cache in case a pending placeholder was cached.
@@ -2061,6 +2110,7 @@ pub fn register_pending_call_assembler_target(
     inputarg_types: Vec<Type>,
     num_inputs: usize,
     num_scalar_inputargs: usize,
+    index_of_virtualizable: i32,
 ) {
     let target = RegisteredLoopTarget {
         trace_id: 0,
@@ -2077,6 +2127,9 @@ pub fn register_pending_call_assembler_target(
         frame_depth: 1,
         inputarg_types,
         num_scalar_inputargs,
+        _ll_initial_locs: (0..num_inputs).map(|i| (i as i32) * 8).collect(),
+        frame_info: Box::into_raw(Box::new([0isize, 0isize])),
+        index_of_virtualizable,
     };
     call_assembler_registry()
         .lock()
@@ -5402,6 +5455,21 @@ impl CraneliftBackend {
                 .get()
                 .and_then(|arena| arena.jitframe_descrs.clone()),
             constant_types: ct,
+            // rewrite.py:673 — lookup compiled_loop_token._ll_initial_locs
+            call_assembler_callee_locs: Some(Box::new(|token_number| {
+                lookup_call_assembler_target(token_number).map(|t| {
+                    // rewrite.py:669 — ptr2int(compiled_loop_token.frame_info)
+                    let fi_ptr = t.frame_info;
+                    majit_gc::rewrite::CallAssemblerCalleeLocs {
+                        _ll_initial_locs: t._ll_initial_locs.clone(),
+                        frame_depth: t.frame_depth,
+                        frame_info_ptr: fi_ptr as usize,
+                        // pyjitpl.py:3605 — outermost_jitdriver_sd.index_of_virtualizable,
+                        // propagated from JitCellToken at registration time.
+                        index_of_virtualizable: t.index_of_virtualizable,
+                    }
+                })
+            })),
         }))
     }
 
@@ -10967,12 +11035,14 @@ impl majit_backend::Backend for CraneliftBackend {
         input_types: Vec<majit_ir::Type>,
         num_inputs: usize,
         num_scalar_inputargs: usize,
+        index_of_virtualizable: i32,
     ) {
         register_pending_call_assembler_target(
             token_number,
             input_types,
             num_inputs,
             num_scalar_inputargs,
+            index_of_virtualizable,
         );
     }
 

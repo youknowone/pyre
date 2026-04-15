@@ -25,6 +25,27 @@ fn round_up(size: usize) -> usize {
     (size + NURSERY_ALIGN - 1) & !(NURSERY_ALIGN - 1)
 }
 
+/// regalloc.py:871 — compiled_loop_token._ll_initial_locs + frame_info.
+///
+/// Per-callee metadata needed by handle_call_assembler to allocate and
+/// fill the callee jitframe.
+#[derive(Clone, Debug)]
+pub struct CallAssemblerCalleeLocs {
+    /// regalloc.py:869 — byte offsets of each inputarg within jf_frame,
+    /// relative to BASEITEMOFS (i.e. index_list[i] = loc.value - base_ofs).
+    pub _ll_initial_locs: Vec<i32>,
+    /// Total jitframe depth (in slots).
+    /// regalloc.py:861 — needed for gen_malloc_frame allocation size.
+    pub frame_depth: usize,
+    /// rewrite.py:669 — ptr2int(loop_token.compiled_loop_token.frame_info).
+    /// Raw address of the callee's JitFrameInfo struct.
+    pub frame_info_ptr: usize,
+    /// pyjitpl.py:3605 — jd.index_of_virtualizable.
+    /// Index into the original arglist of the virtualizable box.
+    /// -1 if no virtualizable.
+    pub index_of_virtualizable: i32,
+}
+
 /// GC rewriter implementation.
 ///
 /// Walks a list of IR operations and rewrites allocation / store ops
@@ -46,6 +67,10 @@ pub struct GcRewriterImpl {
     /// from the optimizer so the rewriter can check `v.type == 'r'` on
     /// constant values (rewrite.py:930).
     pub constant_types: HashMap<u32, Type>,
+    /// rewrite.py:673 — lookup compiled_loop_token._ll_initial_locs
+    /// by target token number. Provided by the backend.
+    pub call_assembler_callee_locs:
+        Option<Box<dyn Fn(u64) -> Option<CallAssemblerCalleeLocs> + Send>>,
 }
 
 /// JitFrame field descriptors for handle_call_assembler.
@@ -852,6 +877,113 @@ impl GcRewriterImpl {
                 .insert(op.pos.0, (final_box, final_constant));
         }
     }
+
+    /// rewrite.py:665-695 handle_call_assembler:
+    ///   1. gen_malloc_frame — allocate callee jitframe from nursery
+    ///   2. gen_initialize_tid + zero GC fields
+    ///   3. store each arg at _ll_initial_locs[i] offset
+    ///   4. replace multi-arg CALL_ASSEMBLER with single-arg [frame]
+    fn handle_call_assembler(&self, op: &Op, st: &mut RewriteState) {
+        let descrs = self.jitframe_info.as_ref().unwrap();
+        let lookup = self.call_assembler_callee_locs.as_ref().unwrap();
+
+        // rewrite.py:667-668 — loop_token = op.getdescr(); JitCellToken
+        let call_descr = op
+            .descr
+            .as_ref()
+            .and_then(|d| d.as_call_descr())
+            .expect("CallAssembler op must have a CallDescr");
+        let token = call_descr
+            .call_target_token()
+            .expect("CallAssembler descr must have a target token");
+
+        // rewrite.py:673 — index_list = loop_token.compiled_loop_token._ll_initial_locs
+        // RPython: compiled_loop_token is pre-allocated with the token;
+        // frame_info pointer is stable. Self-recursive calls go through
+        // register_pending_call_assembler_target() BEFORE tracing emits
+        // any CALL_ASSEMBLER op referencing this token.
+        let callee_locs = lookup(token)
+            .expect("pending CALL_ASSEMBLER target must be registered before rewriter runs");
+
+        // rewrite.py:627-653 — gen_malloc_frame(llfi)
+        // RPython reads jfi_frame_size from frame_info AT RUNTIME so
+        // the allocation size is correct even for self-recursive calls
+        // (where frame_info is pre-allocated with [0,0] and updated
+        // after compilation).
+        let llfi = st.const_int(callee_locs.frame_info_ptr as i64);
+        let word_size = st.const_int(8);
+
+        // rewrite.py:628-632 — GC_LOAD_I(frame_info, jfi_frame_size_ofs, 8)
+        let jfi_frame_size_ofs = st.const_int(std::mem::size_of::<isize>() as i64);
+        let size = st.emit(Op::new(
+            OpCode::GcLoadI,
+            &[llfi, jfi_frame_size_ofs, word_size],
+        ));
+        // rewrite.py:634 — gen_malloc_nursery_varsize_frame(size)
+        st.emitting_an_operation_that_can_collect();
+        let malloc_op = Op::new(OpCode::CallMallocNurseryVarsizeFrame, &[size]);
+        let frame = st.emit_result(malloc_op, OpRef::NONE);
+        st.remember_write_barrier(frame);
+
+        // rewrite.py:635 — gen_initialize_tid(frame, descrs.arraydescr.tid)
+        self.gen_initialize_tid(frame, descrs.jitframe_tid, st);
+
+        // rewrite.py:636-650 — zero GC fields
+        let zero = st.const_int(0);
+        for &ofs in &[
+            descrs.jf_descr_ofs,
+            descrs.jf_force_descr_ofs,
+            descrs.jf_savedata_ofs,
+            descrs.jf_guard_exc_ofs,
+            descrs.jf_forward_ofs,
+        ] {
+            let ofs_ref = st.const_int(ofs as i64);
+            st.emit(Op::new(OpCode::GcStore, &[frame, ofs_ref, zero, word_size]));
+        }
+
+        // rewrite.py:639-640,651-652 — load depth, set length
+        let jfi_frame_depth_ofs = st.const_int(0);
+        let length = st.emit(Op::new(
+            OpCode::GcLoadI,
+            &[llfi, jfi_frame_depth_ofs, word_size],
+        ));
+        let len_ofs = st.const_int(descrs.jf_frame_lengthofs as i64);
+        st.emit(Op::new(
+            OpCode::GcStore,
+            &[frame, len_ofs, length, word_size],
+        ));
+
+        // rewrite.py:671 — emit_setfield(frame, ConstInt(llfi), descr=descrs.jf_frame_info)
+        let fi_ofs = st.const_int(descrs.jf_frame_info_ofs as i64);
+        st.emit(Op::new(OpCode::GcStore, &[frame, fi_ofs, llfi, word_size]));
+
+        // rewrite.py:672-683 — store each arg at _ll_initial_locs[i]
+        let arglist: Vec<OpRef> = op.args.iter().map(|&a| st.resolve(a)).collect();
+        let index_list = &callee_locs._ll_initial_locs;
+        for (i, &arg) in arglist.iter().enumerate() {
+            // rewrite.py:678 — array_offset = index_list[i]
+            // rewrite.py:681 — offset = basesize + array_offset
+            let offset = descrs.jf_frame_baseitemofs as i32 + index_list[i];
+            let ofs_ref = st.const_int(offset as i64);
+            st.emit(Op::new(OpCode::GcStore, &[frame, ofs_ref, arg, word_size]));
+        }
+
+        // rewrite.py:685-695 — replace multi-arg with [frame] or
+        // [frame, arglist[index_of_virtualizable]]
+        let new_args = if callee_locs.index_of_virtualizable >= 0 {
+            let vable_idx = callee_locs.index_of_virtualizable as usize;
+            vec![frame, arglist[vable_idx]]
+        } else {
+            vec![frame]
+        };
+        let mut call_asm = Op::new(op.opcode, &new_args);
+        call_asm.descr = op.descr.clone();
+        call_asm.fail_args = op
+            .fail_args
+            .as_ref()
+            .map(|fa| fa.iter().map(|&a| st.resolve(a)).collect());
+        st.emit_rewritten_from(op, call_asm);
+    }
 }
 
 impl GcRewriterImpl {
@@ -1161,6 +1293,7 @@ mod tests {
             },
             jitframe_info: None,
             constant_types: HashMap::new(),
+            call_assembler_callee_locs: None,
         }
     }
 
@@ -1845,6 +1978,7 @@ mod tests {
             },
             jitframe_info: None,
             constant_types: HashMap::new(),
+            call_assembler_callee_locs: None,
         }
     }
 

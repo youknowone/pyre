@@ -976,6 +976,7 @@ impl Backend for DynasmBackend {
         _input_types: Vec<Type>,
         _num_inputs: usize,
         _num_scalar_inputargs: usize,
+        _index_of_virtualizable: i32,
     ) {
         // Insert with code_addr = 0 (pending). call_assembler_targets_snapshot
         // will include this entry, but Assembler386.call_assembler_targets

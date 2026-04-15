@@ -255,6 +255,7 @@ pub fn register_pending_call_assembler_target(
     _inputarg_types: Vec<majit_ir::Type>,
     _num_inputs: usize,
     _num_scalar_inputargs: usize,
+    _index_of_virtualizable: i32,
 ) {
     // Delegate to the runner's CALL_ASSEMBLER_TARGETS registry.
     runner::DynasmBackend::register_pending_call_assembler_target_static(token_number);

@@ -1290,11 +1290,20 @@ impl<M: Clone> MetaInterp<M> {
                 // target so call_assembler can resolve the pending token at
                 // runtime. call_assembler_fast_path detects null code_ptr and
                 // falls back to force_fn.
+                // pyjitpl.py:3605 — outermost_jitdriver_sd.index_of_virtualizable.
+                // Pyre's portal jitdriver uses frame at inputarg 0 as the
+                // virtualizable; -1 when no virtualizable is configured.
+                let index_of_virtualizable: i32 = if self.virtualizable_info.is_some() {
+                    0
+                } else {
+                    -1
+                };
                 self.backend.register_pending_target(
                     pending_num,
                     input_types,
                     num_inputs,
                     self.num_scalar_inputargs,
+                    index_of_virtualizable,
                 );
                 if let Some(ref hook) = self.hooks.on_trace_start {
                     hook(green_key);

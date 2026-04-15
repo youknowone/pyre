@@ -798,6 +798,7 @@ pub trait Backend: Send {
         _input_types: Vec<Type>,
         _num_inputs: usize,
         _num_scalar_inputargs: usize,
+        _index_of_virtualizable: i32,
     ) {
     }
 
