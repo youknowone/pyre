@@ -1203,12 +1203,16 @@ pub fn resume_in_blackhole(
             builder.release_interp(bh);
 
             let Some(mut caller_bh) = next.map(|b| *b) else {
-                // blackhole.py:1679 _exit_frame_with_exception:
+                // blackhole.py:1679-1682 _exit_frame_with_exception:
+                //   e = cast_opaque_ptr(GCREF, e)
                 //   raise ExitFrameWithExceptionRef(e)
-                // RPython: propagates as DoneWithThisFrame(Err).
-                // pyre: blackhole resume data produces spurious exceptions
-                // from incorrect state reconstruction. Return Failed until
-                // consume_one_section is compatible with pyre JitCode liveness.
+                // TODO(parity): should be ExitFrameWithExceptionRef(e).
+                // Currently returns Failed because pyre's blackhole state
+                // reconstruction is incomplete (not all live registers are
+                // filled from resume data), causing spurious exceptions
+                // that would crash the program if propagated. Fix the
+                // resume data / liveness encoder first, then switch to
+                // ExitFrameWithExceptionRef.
                 return BlackholeResult::Failed;
             };
 

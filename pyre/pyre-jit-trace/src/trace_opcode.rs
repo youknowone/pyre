@@ -2950,9 +2950,10 @@ impl MIFrame {
                                 let helper_arg_types = frame_callable_arg_types(args.len());
                                 ctx.call_ref_typed(frame_helper, &helper_args, &helper_arg_types)
                             };
-                            // RPython parity: CallAssemblerI locals must be Ref
-                            // (boxed) to match the callee trace's virtualizable
-                            // array type. Raw Int args are re-boxed before passing.
+                            // pyjitpl.py:3589 direct_assembler_call: pass only
+                            // red args. rewrite.py:665 handle_call_assembler:
+                            // backend reads remaining fields from callee_frame
+                            // via VableExpansion.
                             let ca_locals: Vec<OpRef> =
                                 if let Some(raw_arg) = self_recursive_raw_arg {
                                     vec![wrapint(ctx, raw_arg)]
@@ -2961,28 +2962,39 @@ impl MIFrame {
                                         .map(|&arg| ensure_boxed_for_ca(ctx, &*this, arg))
                                         .collect()
                                 };
-                            let ca_code = unsafe { function_get_code(concrete_callable) } as usize;
-                            let ca_ns = unsafe { function_get_globals(concrete_callable) } as usize;
-                            let ca_args = synthesize_fresh_callee_entry_args(
-                                ctx,
-                                callee_frame,
-                                &ca_locals,
-                                callee_nlocals,
-                                ca_code,
-                                ca_ns,
-                            );
-                            let callee_slot_types = pending_entry_slot_types_from_args(
-                                &vec![Type::Ref; ca_locals.len()],
-                                callee_nlocals,
-                                0,
-                            );
-                            let ca_arg_types =
-                                frame_entry_arg_types_from_slot_types(&callee_slot_types);
+                            let first_array_slot = 1 + 6; // frame + 6 scalars
+                            let arg_overrides: Vec<(usize, usize)> = (0..ca_locals.len())
+                                .map(|i| (first_array_slot + i, 1 + i))
+                                .collect();
+                            let expansion = majit_ir::VableExpansion {
+                                scalar_fields: vec![
+                                    (crate::frame_layout::PYFRAME_LAST_INSTR_OFFSET, Type::Int),
+                                    (crate::frame_layout::PYFRAME_PYCODE_OFFSET, Type::Ref),
+                                    (
+                                        crate::frame_layout::PYFRAME_VALUESTACKDEPTH_OFFSET,
+                                        Type::Int,
+                                    ),
+                                    (crate::frame_layout::PYFRAME_DEBUGDATA_OFFSET, Type::Ref),
+                                    (crate::frame_layout::PYFRAME_LASTBLOCK_OFFSET, Type::Ref),
+                                    (crate::frame_layout::PYFRAME_W_GLOBALS_OFFSET, Type::Ref),
+                                ],
+                                array_struct_offset:
+                                    crate::frame_layout::PYFRAME_LOCALS_CELLS_STACK_OFFSET,
+                                array_ptr_offset: pyre_object::FIXED_ARRAY_PTR_OFFSET,
+                                num_array_items: callee_nlocals,
+                                const_overrides: vec![],
+                                arg_overrides,
+                            };
+                            let mut ca_args = vec![callee_frame];
+                            ca_args.extend_from_slice(&ca_locals);
+                            let ca_arg_types = vec![Type::Ref; ca_args.len()];
                             // warmspot.py:449 portal result_type == REF → CALL_ASSEMBLER_R
-                            let ca_result = ctx.call_assembler_ref_by_number_typed(
+                            let ca_result = ctx.call_assembler_with_vable_expansion_args(
                                 token_number,
                                 &ca_args,
                                 &ca_arg_types,
+                                Type::Ref,
+                                expansion,
                             );
                             ctx.call_void(
                                 crate::callbacks::get().jit_drop_callee_frame,
@@ -3106,80 +3118,107 @@ impl MIFrame {
                                     ));
                                 };
 
-                                let ca_code =
-                                    unsafe { function_get_code(concrete_callable) } as usize;
-                                let ca_ns =
-                                    unsafe { function_get_globals(concrete_callable) } as usize;
-                                let ca_args = if target_num_inputs <= 1 {
-                                    vec![callee_frame]
-                                } else if callee_stack_only == 0 {
-                                    // warmstate.py:73 wrap() parity:
-                                    // every Python local is stored as a
-                                    // PyObjectRef (W_Root). The optimizer
-                                    // may have unboxed the caller's
-                                    // `args` to Int/Float; re-box them
-                                    // via NewWithVtable + SetfieldGc so
-                                    // the callee frame receives proper
-                                    // W_IntObject / W_FloatObject
-                                    // pointers. In RPython the box type
-                                    // is fixed so this rewrap is
-                                    // structurally unnecessary.
+                                // pyjitpl.py:3589 direct_assembler_call: pass only
+                                // red args. rewrite.py:665 handle_call_assembler:
+                                // backend reads remaining fields from callee_frame
+                                // via VableExpansion.
+                                let num_array_items = callee_nlocals + callee_stack_only;
+                                let ca_result = if target_num_inputs <= 1 {
+                                    let expansion = majit_ir::VableExpansion {
+                                        scalar_fields: vec![
+                                            (
+                                                crate::frame_layout::PYFRAME_LAST_INSTR_OFFSET,
+                                                Type::Int,
+                                            ),
+                                            (crate::frame_layout::PYFRAME_PYCODE_OFFSET, Type::Ref),
+                                            (
+                                                crate::frame_layout::PYFRAME_VALUESTACKDEPTH_OFFSET,
+                                                Type::Int,
+                                            ),
+                                            (
+                                                crate::frame_layout::PYFRAME_DEBUGDATA_OFFSET,
+                                                Type::Ref,
+                                            ),
+                                            (
+                                                crate::frame_layout::PYFRAME_LASTBLOCK_OFFSET,
+                                                Type::Ref,
+                                            ),
+                                            (
+                                                crate::frame_layout::PYFRAME_W_GLOBALS_OFFSET,
+                                                Type::Ref,
+                                            ),
+                                        ],
+                                        array_struct_offset:
+                                            crate::frame_layout::PYFRAME_LOCALS_CELLS_STACK_OFFSET,
+                                        array_ptr_offset: pyre_object::FIXED_ARRAY_PTR_OFFSET,
+                                        num_array_items,
+                                        const_overrides: vec![],
+                                        arg_overrides: vec![],
+                                    };
+                                    ctx.call_assembler_with_vable_expansion_args(
+                                        token_number,
+                                        &[callee_frame],
+                                        &[Type::Ref],
+                                        Type::Ref,
+                                        expansion,
+                                    )
+                                } else {
                                     let boxed_args: Vec<OpRef> = args
                                         .iter()
                                         .map(|&arg| {
                                             crate::state::ensure_boxed_for_ca(ctx, &*this, arg)
                                         })
                                         .collect();
-                                    synthesize_fresh_callee_entry_args(
-                                        ctx,
-                                        callee_frame,
-                                        &boxed_args,
-                                        callee_nlocals,
-                                        ca_code,
-                                        ca_ns,
+                                    // virtualizable.py:86 read_boxes: all static
+                                    // fields first, then array slots. 6 scalars
+                                    // (last_instr, pycode, valuestackdepth,
+                                    // debugdata, lastblock, w_globals) + frame.
+                                    let first_array_slot = 1 + 6;
+                                    let arg_overrides: Vec<(usize, usize)> = (0..boxed_args.len())
+                                        .map(|i| (first_array_slot + i, 1 + i))
+                                        .collect();
+                                    let expansion = majit_ir::VableExpansion {
+                                        scalar_fields: vec![
+                                            (
+                                                crate::frame_layout::PYFRAME_LAST_INSTR_OFFSET,
+                                                Type::Int,
+                                            ),
+                                            (crate::frame_layout::PYFRAME_PYCODE_OFFSET, Type::Ref),
+                                            (
+                                                crate::frame_layout::PYFRAME_VALUESTACKDEPTH_OFFSET,
+                                                Type::Int,
+                                            ),
+                                            (
+                                                crate::frame_layout::PYFRAME_DEBUGDATA_OFFSET,
+                                                Type::Ref,
+                                            ),
+                                            (
+                                                crate::frame_layout::PYFRAME_LASTBLOCK_OFFSET,
+                                                Type::Ref,
+                                            ),
+                                            (
+                                                crate::frame_layout::PYFRAME_W_GLOBALS_OFFSET,
+                                                Type::Ref,
+                                            ),
+                                        ],
+                                        array_struct_offset:
+                                            crate::frame_layout::PYFRAME_LOCALS_CELLS_STACK_OFFSET,
+                                        array_ptr_offset: pyre_object::FIXED_ARRAY_PTR_OFFSET,
+                                        num_array_items,
+                                        const_overrides: vec![],
+                                        arg_overrides,
+                                    };
+                                    let mut ca_args = vec![callee_frame];
+                                    ca_args.extend_from_slice(&boxed_args);
+                                    let ca_arg_types = vec![Type::Ref; ca_args.len()];
+                                    ctx.call_assembler_with_vable_expansion_args(
+                                        token_number,
+                                        &ca_args,
+                                        &ca_arg_types,
+                                        Type::Ref,
+                                        expansion,
                                     )
-                                } else {
-                                    let callee_ni = frame_get_next_instr(ctx, callee_frame);
-                                    let callee_code = frame_get_code(ctx, callee_frame);
-                                    let callee_sd = frame_get_stack_depth(ctx, callee_frame);
-                                    let callee_ns = frame_get_namespace(ctx, callee_frame);
-                                    let mut a = vec![
-                                        callee_frame,
-                                        callee_ni,
-                                        callee_code,
-                                        callee_sd,
-                                        callee_ns,
-                                    ];
-                                    let callee_arr =
-                                        frame_locals_cells_stack_array(ctx, callee_frame);
-                                    for i in 0..callee_nlocals {
-                                        let idx = ctx.const_int(i as i64);
-                                        let val = ctx.record_op_with_descr(
-                                            OpCode::GetarrayitemGcR,
-                                            &[callee_arr, idx],
-                                            pyobject_array_descr(),
-                                        );
-                                        a.push(val);
-                                    }
-                                    for i in 0..callee_stack_only {
-                                        let idx = ctx.const_int((callee_nlocals + i) as i64);
-                                        let val = ctx.record_op_with_descr(
-                                            OpCode::GetarrayitemGcR,
-                                            &[callee_arr, idx],
-                                            pyobject_array_descr(),
-                                        );
-                                        a.push(val);
-                                    }
-                                    a
                                 };
-                                let ca_arg_types =
-                                    frame_entry_arg_types_from_slot_types(&callee_meta.slot_types);
-                                // warmspot.py:449 portal result_type == REF → CALL_ASSEMBLER_R
-                                let ca_result = ctx.call_assembler_ref_by_number_typed(
-                                    token_number,
-                                    &ca_args,
-                                    &ca_arg_types,
-                                );
                                 ctx.call_void(
                                     crate::callbacks::get().jit_drop_callee_frame,
                                     &[callee_frame],
