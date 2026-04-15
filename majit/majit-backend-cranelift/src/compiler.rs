@@ -1599,9 +1599,9 @@ pub struct InlineFrameArenaInfo {
     pub buf_base_addr: usize,
     pub top_addr: usize,
     pub initialized_addr: usize,
-    /// Slot size including GC header: `GC_HEADER_SIZE + sizeof(PyFrame)`.
     pub frame_size: usize,
-    /// Byte offset from slot start to the PyFrame payload (= GC_HEADER_SIZE).
+    /// GcHeader size prepended before each PyFrame in the arena slot.
+    /// PyPy layout: [GcHeader (8 bytes)][PyFrame fields].
     pub gc_header_size: usize,
     pub frame_code_offset: usize,
     pub frame_next_instr_offset: usize,
@@ -3037,14 +3037,14 @@ extern "C" fn gc_alloc_varsize_shim(
     })
 }
 
-/// incminimark.py:1569: jit_remember_young_pointer
+/// aarch64/assembler.py:342 get_write_barrier_fn()
+/// → incminimark.py:1569 jit_remember_young_pointer
 extern "C" fn gc_write_barrier_shim(runtime_id: u64, obj: u64) {
-    with_gc_runtime(runtime_id, |gc| {
-        gc.write_barrier(GcRef(obj as usize));
-    });
+    with_gc_runtime(runtime_id, |gc| gc.write_barrier(GcRef(obj as usize)));
 }
 
-/// incminimark.py:1606: jit_remember_young_pointer_from_array
+/// aarch64/assembler.py:352 get_write_barrier_from_array_fn()
+/// → incminimark.py:1606 jit_remember_young_pointer_from_array
 extern "C" fn gc_jit_remember_young_pointer_from_array_shim(runtime_id: u64, obj: u64) {
     with_gc_runtime(runtime_id, |gc| {
         gc.jit_remember_young_pointer_from_array(GcRef(obj as usize));
@@ -7513,20 +7513,13 @@ impl CraneliftBackend {
                             !expansion.arg_overrides.iter().any(|(s, _)| *s == slot)
                         });
                         let arr_data_ptr_val = if needs_array_load {
-                            // Load the PyObjectArray pointer from the frame.
-                            // locals_cells_stack_w is now *mut PyObjectArray
-                            // (RPython: Ptr(GcArray) field).
-                            let arr_obj_ptr = builder.ins().load(
-                                ptr_type,
-                                MemFlags::trusted(),
-                                frame_val,
-                                expansion.array_struct_offset as i32,
-                            );
-                            // Load the data pointer from the PyObjectArray struct.
+                            let arr_struct_addr = builder
+                                .ins()
+                                .iadd_imm(frame_val, expansion.array_struct_offset as i64);
                             builder.ins().load(
                                 ptr_type,
                                 MemFlags::trusted(),
-                                arr_obj_ptr,
+                                arr_struct_addr,
                                 expansion.array_ptr_offset as i32,
                             )
                         } else {
@@ -12017,6 +12010,7 @@ fn emit_inline_arena_take(
     builder.seal_block(fast_block);
 
     // frame_ptr = buf_base + top * frame_size + gc_header_size
+    // PyPy layout: [GcHeader][PyFrame] — frame_ptr skips the GcHeader.
     let buf_base_addr = builder.ins().iconst(ptr_type, arena.buf_base_addr as i64);
     let buf_base = builder.ins().load(ptr_type, flags, buf_base_addr, 0);
     let frame_size = builder.ins().iconst(ptr_type, arena.frame_size as i64);
@@ -12158,9 +12152,9 @@ fn emit_inline_arena_put(
     let buf_base = builder.ins().load(ptr_type, flags, buf_base_addr, 0);
     let frame_size = builder.ins().iconst(ptr_type, arena.frame_size as i64);
     let offset = builder.ins().imul(new_top, frame_size);
-    let slot_ptr = builder.ins().iadd(buf_base, offset);
+    let slot_expected = builder.ins().iadd(buf_base, offset);
     let gc_hdr_ofs = builder.ins().iconst(ptr_type, arena.gc_header_size as i64);
-    let expected = builder.ins().iadd(slot_ptr, gc_hdr_ofs);
+    let expected = builder.ins().iadd(slot_expected, gc_hdr_ofs);
     let is_lifo = builder.ins().icmp(IntCC::Equal, frame_ptr, expected);
 
     let fast_put_block = builder.create_block();

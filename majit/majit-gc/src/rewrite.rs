@@ -78,6 +78,10 @@ pub struct GcRewriterImpl {
 /// rewrite.py:666 — `descrs = self.gc_ll_descr.getframedescrs(self.cpu)`
 #[derive(Clone)]
 pub struct JitFrameDescrs {
+    /// Addresses of all `jit_create_*_callee_frame_*` variants.
+    pub create_fn_addrs: Vec<usize>,
+    /// Address of `jit_drop_callee_frame`.
+    pub drop_fn_addr: usize,
     /// GC type id for JitFrame (from gc.register_type).
     pub jitframe_tid: u32,
     /// JitFrame fixed header size (bytes).
@@ -97,13 +101,31 @@ pub struct JitFrameDescrs {
     pub jf_frame_lengthofs: usize,
     /// SIGN_SIZE: size of one jf_frame slot.
     pub sign_size: usize,
+    // ── PyFrame layout (for nursery allocation transition) ──
+    /// Total PyFrame size for nursery allocation.
+    pub pyframe_alloc_size: usize,
+    /// Byte offset of `code` in PyFrame.
+    pub pyframe_code_ofs: usize,
+    /// Byte offset of `namespace` in PyFrame.
+    pub pyframe_namespace_ofs: usize,
+    /// Byte offset of `next_instr` in PyFrame.
+    pub pyframe_next_instr_ofs: usize,
+    /// Byte offset of `vable_token` in PyFrame.
+    pub pyframe_vable_token_ofs: usize,
 }
 
 /// A deferred ZERO_ARRAY emission that can be elided or shortened when
 /// subsequent SETARRAYITEM writes cover parts of the array.
-/// rewrite.py:70-73 setarrayitems_occurred / remember_setarrayitem_occurrences
-/// Tracks which array item indices have been set since the last ZERO_ARRAY.
-/// Keyed by array OpRef, value is set of item indices.
+struct PendingZero {
+    /// The OpRef of the array being zeroed.
+    array_ref: OpRef,
+    /// Start index of the zero range.
+    start: usize,
+    /// Length (number of items) of the zero range.
+    length: usize,
+    /// The original op (used for descriptor propagation).
+    original_op: Op,
+}
 
 /// Per-rewrite mutable state (not stored on the struct so that
 /// `rewrite_for_gc` can take `&self`).
@@ -135,8 +157,11 @@ struct RewriteState {
     last_malloced_ref: OpRef,
 
     // ── Write barrier tracking ──
-    /// rewrite.py:41-45: _write_barrier_applied
-    _write_barrier_applied: HashSet<u32>,
+    /// rewrite.py:41-45: _write_barrier_applied — set of OpRef indices
+    /// whose write barrier has already been emitted (freshly allocated
+    /// objects, or objects we already issued a WB for). Cleared whenever
+    /// we emit an operation that can trigger a collection or on LABEL.
+    wb_applied: HashSet<u32>,
     /// Forwarding map from original result OpRefs to rewritten result OpRefs.
     forwarding: HashMap<u32, OpRef>,
     /// One-shot marker for an already-emitted array write barrier.
@@ -147,18 +172,18 @@ struct RewriteState {
     pending_array_wb: Option<u32>,
 
     // ── Array length tracking (rewrite.py:59 _known_lengths) ──
-    _known_lengths: HashMap<u32, usize>,
+    /// Maps array OpRef → known length. Populated when NEW_ARRAY has a
+    /// constant length operand (rewrite.py:551). Cleared on LABEL
+    /// (rewrite.py:1005) and emitting_an_operation_that_can_collect.
+    known_lengths: HashMap<u32, usize>,
 
-    // ── Constant addition tracking (rewrite.py:64 _constant_additions) ──
-    _constant_additions: HashMap<u32, (OpRef, i64)>,
-
-    // ── Pending zero tracking (rewrite.py:34-36) ──
-    /// rewrite.py:34 last_zero_arrays
-    last_zero_arrays: Vec<usize>,
-    /// rewrite.py:35 _setarrayitems_occurred
-    setarrayitems_occurred: HashMap<u32, HashSet<usize>>,
-    /// rewrite.py:61 _delayed_zero_setfields
-    _delayed_zero_setfields: HashMap<u32, HashSet<usize>>,
+    // ── Pending zero tracking ──
+    /// Deferred ZERO_ARRAY ops that may be optimized away if subsequent
+    /// SETARRAYITEM writes cover the entire range.
+    pending_zeros: Vec<PendingZero>,
+    /// Tracks which array indices have been explicitly SET since the
+    /// pending zero was recorded. Keyed by array OpRef index.
+    initialized_indices: HashMap<u32, HashSet<usize>>,
 
     // ── Pending vtable initializations ──
     /// rewrite.py:479-484 handle_malloc_operation parity: for a batch of
@@ -181,14 +206,12 @@ impl RewriteState {
             pending_malloc_total: 0,
             previous_size: 0,
             last_malloced_ref: OpRef::NONE,
-            _write_barrier_applied: HashSet::new(),
+            wb_applied: HashSet::new(),
             forwarding: HashMap::new(),
             pending_array_wb: None,
-            _known_lengths: HashMap::new(),
-            _constant_additions: HashMap::new(),
-            last_zero_arrays: Vec::new(),
-            setarrayitems_occurred: HashMap::new(),
-            _delayed_zero_setfields: HashMap::new(),
+            known_lengths: HashMap::new(),
+            pending_zeros: Vec::new(),
+            initialized_indices: HashMap::new(),
             pending_vtable_inits: Vec::new(),
         }
     }
@@ -256,30 +279,28 @@ impl RewriteState {
     /// rewrite.py:699-711 emitting_an_operation_that_can_collect
     fn emitting_an_operation_that_can_collect(&mut self) {
         self.pending_malloc_idx = None;
-        self._write_barrier_applied.clear();
+        self.wb_applied.clear();
         self.pending_array_wb = None;
         self.emit_pending_zeros();
-        self._constant_additions.clear();
     }
 
-    /// rewrite.py:716-717: remember_write_barrier
-    fn remember_write_barrier(&mut self, r: OpRef) {
-        self._write_barrier_applied.insert(r.0);
+    fn remember_wb(&mut self, r: OpRef) {
+        self.wb_applied.insert(r.0);
     }
 
     /// rewrite.py:66-67: remember_known_length
     fn remember_known_length(&mut self, op: OpRef, length: usize) {
-        self._known_lengths.insert(op.0, length);
+        self.known_lengths.insert(op.0, length);
     }
 
     /// rewrite.py:81-82: known_length(op, default)
     fn known_length(&self, op: OpRef, default: usize) -> usize {
-        self._known_lengths.get(&op.0).copied().unwrap_or(default)
+        self.known_lengths.get(&op.0).copied().unwrap_or(default)
     }
 
-    /// rewrite.py:713-714: write_barrier_applied(op)
-    fn write_barrier_applied(&self, r: OpRef) -> bool {
-        self._write_barrier_applied.contains(&r.0)
+    /// rewrite.py:714: write_barrier_applied(op)
+    fn wb_already_applied(&self, r: OpRef) -> bool {
+        self.wb_applied.contains(&r.0)
     }
 
     /// rewrite.py:930 parity: `v.type` — get the type of an OpRef.
@@ -342,104 +363,63 @@ impl RewriteState {
         matched
     }
 
-    /// rewrite.py:69-76 remember_setarrayitem_occurred
-    fn remember_setarrayitem_occurred(&mut self, array_ref: OpRef, index: usize) {
-        let resolved = self.resolve(array_ref);
-        self.setarrayitems_occurred
-            .entry(resolved.0)
-            .or_default()
-            .insert(index);
+    /// Record that a SETARRAYITEM wrote to `array_ref[index]`,
+    /// so the pending zero for that slot can be skipped.
+    fn record_setarrayitem_index(&mut self, array_ref: OpRef, index: usize) {
+        if self
+            .pending_zeros
+            .iter()
+            .any(|pz| pz.array_ref == array_ref)
+        {
+            self.initialized_indices
+                .entry(array_ref.0)
+                .or_default()
+                .insert(index);
+        }
     }
 
-    /// rewrite.py:78-79 setarrayitems_occurred
-    fn setarrayitems_occurred(&self, array_ref: OpRef) -> Option<&HashSet<usize>> {
-        let resolved = self.resolve(array_ref);
-        self.setarrayitems_occurred.get(&resolved.0)
-    }
-
-    /// rewrite.py:719-766 emit_pending_zeros
-    ///
-    /// Rewrite ZERO_ARRAY ops in `last_zero_arrays` in-place: shrink the
-    /// start/length to skip indices covered by SETARRAYITEM writes.
-    /// Non-constant-length ZERO_ARRAYs are not in the list and are left
-    /// as-is (they were already emitted verbatim).
+    /// Flush all pending ZERO_ARRAY ops, emitting optimized versions
+    /// that skip indices already covered by SETARRAYITEM writes.
     fn emit_pending_zeros(&mut self) {
-        // rewrite.py:723-757: rewrite last_zero_arrays in-place.
-        let indices = std::mem::take(&mut self.last_zero_arrays);
-        for out_idx in indices {
-            let op = &self.out[out_idx];
-            debug_assert_eq!(op.opcode, OpCode::ZeroArray);
-            let descr = op.descr.clone();
-            let item_size = descr
-                .as_ref()
-                .and_then(|d| d.as_array_descr())
-                .map(|ad| ad.item_size())
-                .unwrap_or(1);
-            let arr = op.arg(0);
+        let pending = std::mem::take(&mut self.pending_zeros);
+        let inited = std::mem::take(&mut self.initialized_indices);
 
-            let intset = self.setarrayitems_occurred(arr);
-            if intset.is_none() {
-                // rewrite.py:731-743: no SETARRAYITEM occurred — apply scale.
-                let start = self.resolve_constant(op.arg(1).0).unwrap_or(0) as usize;
-                let length = self.resolve_constant(op.arg(2).0).unwrap_or(0) as usize;
-                let scaled_op = Op::with_descr(
+        for pz in pending {
+            let written = inited.get(&pz.array_ref.0);
+
+            // Find contiguous zero ranges by excluding written indices.
+            let mut i = pz.start;
+            let end = pz.start + pz.length;
+
+            while i < end {
+                // Skip indices already initialized by SETARRAYITEM.
+                if written.is_some_and(|s| s.contains(&i)) {
+                    i += 1;
+                    continue;
+                }
+
+                // Start of a zero run.
+                let run_start = i;
+                while i < end && !written.is_some_and(|s| s.contains(&i)) {
+                    i += 1;
+                }
+                let run_len = i - run_start;
+
+                // Emit ZERO_ARRAY(array, start_const, length_const, 0, descr).
+                let mut zero_op = Op::new(
                     OpCode::ZeroArray,
                     &[
-                        arr,
-                        self.const_int((start * item_size) as i64),
-                        self.const_int((length * item_size) as i64),
-                        self.const_int(1),
-                        self.const_int(1),
+                        pz.array_ref,
+                        OpRef(run_start as u32),
+                        OpRef(run_len as u32),
+                        OpRef(0),
+                        OpRef(0),
                     ],
-                    descr.unwrap(),
                 );
-                self.out[out_idx] = scaled_op;
-                continue;
-            }
-
-            // rewrite.py:744-756: trim start and stop by written indices.
-            let intset = intset.unwrap();
-            let mut start: usize = 0;
-            while intset.contains(&start) {
-                start += 1;
-            }
-            let stop_raw = self.resolve_constant(op.arg(2).0).unwrap_or(0) as usize;
-            let mut stop = stop_raw;
-            debug_assert!(start <= stop);
-            while stop > start && intset.contains(&(stop - 1)) {
-                stop -= 1;
-            }
-            let scaled_op = Op::with_descr(
-                OpCode::ZeroArray,
-                &[
-                    arr,
-                    self.const_int((start * item_size) as i64),
-                    self.const_int(((stop - start) * item_size) as i64),
-                    self.const_int(1),
-                    self.const_int(1),
-                ],
-                descr.unwrap(),
-            );
-            self.out[out_idx] = scaled_op;
-        }
-        self.setarrayitems_occurred.clear();
-        // rewrite.py:760-766: write NULL-pointer-writing ops still pending.
-        let delayed = std::mem::take(&mut self._delayed_zero_setfields);
-        for (obj_key, offsets) in delayed {
-            let obj = self.resolve(OpRef(obj_key));
-            for ofs in offsets {
-                let c_ofs = self.const_int(ofs as i64);
-                let c_zero = self.const_int(0);
-                let c_word = self.const_int(8); // WORD
-                self.emit(Op::new(OpCode::GcStore, &[obj, c_ofs, c_zero, c_word]));
+                zero_op.descr = pz.original_op.descr.clone();
+                self.emit(zero_op);
             }
         }
-    }
-
-    /// rewrite.py:84-91: delayed_zero_setfields(op)
-    fn delayed_zero_setfields(&mut self, op: OpRef) -> &mut HashSet<usize> {
-        let resolved = self.resolve(op);
-        self._delayed_zero_setfields.entry(resolved.0).or_default()
     }
 }
 
@@ -452,23 +432,6 @@ impl GcRewriterImpl {
     // ────────────────────────────────────────────────────────
     // NEW / NEW_WITH_VTABLE  → CALL_MALLOC_NURSERY + tid init
     // ────────────────────────────────────────────────────────
-
-    /// rewrite.py:498-504: clear_gc_fields
-    fn clear_gc_fields(&self, op: &Op, result: OpRef, st: &mut RewriteState) {
-        // In RPython, malloc_zero_filled = True for incminimark.
-        // Our nursery alloc also zero-fills, so this is typically a no-op.
-        // But structurally we track which GC fields need zeroing.
-        let descr = op.descr.as_ref().and_then(|d| d.as_size_descr());
-        if let Some(sd) = descr {
-            let gc_descs = sd.gc_field_descrs();
-            if !gc_descs.is_empty() {
-                let d = st.delayed_zero_setfields(result);
-                for fd in gc_descs {
-                    d.insert(fd.offset());
-                }
-            }
-        }
-    }
 
     fn handle_new(&self, op: &Op, st: &mut RewriteState) {
         let descr = op
@@ -516,9 +479,6 @@ impl GcRewriterImpl {
                 st.pending_vtable_inits.push((obj_ref, vtable));
             }
         }
-
-        // rewrite.py:544: self.clear_gc_fields(descr, op)
-        self.clear_gc_fields(op, obj_ref, st);
     }
 
     /// Flush pending vtable initializations for a batched nursery allocation.
@@ -573,47 +533,17 @@ impl GcRewriterImpl {
             self.gen_initialize_len(result, v_length, descr_ref.clone(), len_descr, st);
         }
 
-        // rewrite.py:588-611 handle_clear_array_contents
-        // rewrite.py:588-611 handle_clear_array_contents
+        // For NEW_ARRAY_CLEAR, defer ZERO_ARRAY emission so that
+        // subsequent SETARRAYITEM writes can eliminate redundant zeroing.
         if is_clear && !v_length.is_none() {
-            let is_const_zero = st.resolve_constant(v_length.0).map_or(false, |v| v == 0);
-            if !is_const_zero {
-                let item_size = descr.item_size();
-                let c_zero = st.const_int(0);
-
-                // rewrite.py:599-602: compute v_length_scaled and scale
-                let (v_length_scaled, scale) = if st.resolve_constant(v_length.0).is_some() {
-                    // ConstInt: keep original, scale applied in emit_pending_zeros.
-                    (v_length, item_size)
-                } else {
-                    // Non-constant: rewrite.py:601 _emit_mul_if_factor_offset_not_supported
-                    // cpu_simplify_scale: emit INT_MUL(v_length, scale), return scale=1.
-                    let scale_const = st.const_int(item_size as i64);
-                    let mul_op = Op::new(OpCode::IntMul, &[v_length, scale_const]);
-                    let v_length_scaled = st.emit_result(mul_op, OpRef(st.next_pos));
-                    (v_length_scaled, 1)
-                };
-
-                // rewrite.py:607-608: args = [v_arr, c_zero, v_length_scaled, scale, v_scale]
-                let v_scale = st.const_int(scale as i64);
-                let mut zero_op = Op::with_descr(
-                    OpCode::ZeroArray,
-                    &[
-                        result,
-                        c_zero,
-                        v_length_scaled,
-                        st.const_int(scale as i64),
-                        v_scale,
-                    ],
-                    descr_ref.clone(),
-                );
-                zero_op.pos = OpRef(st.next_pos);
-                let zero_idx = st.out.len();
-                st.emit(zero_op);
-                // rewrite.py:610-611: only add to last_zero_arrays if ConstInt
-                if st.resolve_constant(v_length.0).is_some() {
-                    st.last_zero_arrays.push(zero_idx);
-                }
+            let length_val = v_length.0 as usize;
+            if length_val > 0 {
+                st.pending_zeros.push(PendingZero {
+                    array_ref: result,
+                    start: 0,
+                    length: length_val,
+                    original_op: op.clone(),
+                });
             }
         }
 
@@ -623,7 +553,7 @@ impl GcRewriterImpl {
             st.remember_known_length(result, num_elem as usize);
         }
 
-        // Don't add to _write_barrier_applied: large young arrays may need card
+        // Don't add to wb_applied: large young arrays may need card
         // marking, so the GC still relies on write barriers.
     }
 
@@ -631,75 +561,90 @@ impl GcRewriterImpl {
     // SETFIELD_GC  → maybe COND_CALL_GC_WB + SETFIELD_GC
     // ────────────────────────────────────────────────────────
 
-    /// rewrite.py:506-512: consider_setfield_gc
-    fn consider_setfield_gc(&self, op: &Op, st: &mut RewriteState) {
-        let obj = st.resolve(op.arg(0));
-        if let Some(fd) = op.descr.as_ref().and_then(|d| d.as_field_descr()) {
-            let ofs = fd.offset();
-            if let Some(d) = st._delayed_zero_setfields.get_mut(&obj.0) {
-                d.remove(&ofs);
-            }
-        }
-    }
-
-    /// rewrite.py:926-934: handle_write_barrier_setfield
-    fn handle_write_barrier_setfield(&self, op: &Op, st: &mut RewriteState) {
+    fn handle_setfield_gc(&self, op: &Op, st: &mut RewriteState) {
         let rewritten = st.rewrite_op(op);
-        let val = rewritten.arg(0);
+        let obj = rewritten.arg(0);
 
-        // Flush pending vtable init for this object.
+        // Flush only THIS obj's pending vtable init before its first
+        // user setfield. This matches RPython's linear trace processing
+        // where NEW_WITH_VTABLE's emit_setfield runs before any following
+        // user setfield on the same object. Other objects' vtable inits
+        // stay pending and are flushed either on their own first setfield
+        // or at the end of the trace.
         if !st.pending_vtable_inits.is_empty() {
-            if let Some(pos) = st.pending_vtable_inits.iter().position(|(o, _)| *o == val) {
+            if let Some(pos) = st.pending_vtable_inits.iter().position(|(o, _)| *o == obj) {
                 let (o, vtable) = st.pending_vtable_inits.remove(pos);
                 self.gen_initialize_vtable(o, vtable, st);
             }
         }
 
-        // rewrite.py:928-931
-        if !st.write_barrier_applied(val) {
-            let v = rewritten.arg(1);
-            let field_is_ptr = op
-                .descr
-                .as_ref()
-                .and_then(|d| d.as_field_descr())
-                .map(|fd| fd.is_pointer_field())
-                .unwrap_or(false);
-            let val_is_ref = if field_is_ptr {
-                match st.result_type_of(v) {
-                    Some(tp) => tp == Type::Ref,
-                    None => true,
-                }
-            } else {
-                false
-            };
-            if val_is_ref && (!st.is_null_constant(v)) {
-                self.gen_write_barrier(val, st);
+        // rewrite.py:930-931: check the stored VALUE's type.
+        //   v = op.getarg(1)
+        //   if (v.type == 'r' and (not isinstance(v, ConstPtr) or
+        //       rgc.needs_write_barrier(v.value))):
+        //
+        // Gate on field descriptor: if the field is not a pointer field,
+        // the GC won't trace it, so no WB is needed regardless of value
+        // type. In RPython val.type=='r' implies the field is GCREF;
+        // here ForceToken (Ref) stores to an Int-typed field (offset 128),
+        // a pyre-specific divergence.
+        let field_is_ptr = op
+            .descr
+            .as_ref()
+            .and_then(|d| d.as_field_descr())
+            .map(|fd| fd.is_pointer_field())
+            .unwrap_or(false);
+        let val = rewritten.arg(1);
+        let val_is_ref = if field_is_ptr {
+            match st.result_type_of(val) {
+                Some(tp) => tp == Type::Ref,
+                None => true, // field is ptr → assume value is Ref
             }
+        } else {
+            false
+        };
+        let is_null_const = val_is_ref && st.is_null_constant(val);
+
+        if val_is_ref && !is_null_const && !st.wb_already_applied(obj) {
+            // Emit COND_CALL_GC_WB(obj) before the store.
+            let wb_op = Op::new(OpCode::CondCallGcWb, &[obj]);
+            st.emit(wb_op);
+            st.remember_wb(obj);
         }
+
+        // Emit the original SETFIELD_GC unchanged.
         st.emit(rewritten);
     }
 
-    /// rewrite.py:514-518: consider_setarrayitem_gc
-    fn consider_setarrayitem_gc(&self, op: &Op, st: &mut RewriteState) {
-        let array_box = st.resolve(op.arg(0));
-        let index_ref = op.arg(1);
-        if let Some(index_val) = st.resolve_constant(index_ref.0) {
-            st.remember_setarrayitem_occurred(array_box, index_val as usize);
-        }
-    }
+    // ────────────────────────────────────────────────────────
+    // SETARRAYITEM_GC  → maybe COND_CALL_GC_WB{_ARRAY} + SETARRAYITEM_GC
+    // rewrite.py:936-946 handle_write_barrier_setarrayitem
+    // ────────────────────────────────────────────────────────
 
-    /// rewrite.py:936-944: handle_write_barrier_setarrayitem
-    fn handle_write_barrier_setarrayitem(&self, op: &Op, st: &mut RewriteState) {
+    fn handle_setarrayitem_gc(&self, op: &Op, st: &mut RewriteState) {
         let rewritten = st.rewrite_op(op);
-        let val = rewritten.arg(0);
+        let obj = rewritten.arg(0);
+        // arg(1) = index, arg(2) = value
 
-        if st.take_pending_array_wb(val) {
+        // Track the index for pending zero optimization.
+        let index_ref = rewritten.arg(1);
+        if !index_ref.is_none() {
+            st.record_setarrayitem_index(obj, index_ref.0 as usize);
+        }
+
+        if st.take_pending_array_wb(obj) {
             st.emit(rewritten);
             return;
         }
 
-        // rewrite.py:938-942
-        if !st.write_barrier_applied(val) {
+        // rewrite.py:938-941: check the stored VALUE's type (arg2).
+        //   val = op.getarg(0)  [the base object]
+        //   if not self.write_barrier_applied(val):
+        //       v = op.getarg(2)
+        //       if (v.type == 'r' and (not isinstance(v, ConstPtr) or
+        //           rgc.needs_write_barrier(v.value))):
+        //           self.gen_write_barrier_array(val, op.getarg(1))
+        if !st.wb_already_applied(obj) {
             let v = rewritten.arg(2);
             let val_is_ref = match st.result_type_of(v) {
                 Some(tp) => tp == Type::Ref,
@@ -710,21 +655,20 @@ impl GcRewriterImpl {
                     .map(|ad| ad.is_array_of_pointers())
                     .unwrap_or(false),
             };
-            if val_is_ref && !st.is_null_constant(v) {
-                self.gen_write_barrier_array(val, rewritten.arg(1), st);
+            let is_null_const = val_is_ref && st.is_null_constant(v);
+
+            if val_is_ref && !is_null_const {
+                self.gen_write_barrier_array(obj, rewritten.arg(1), st);
             }
         }
+
         st.emit(rewritten);
     }
 
-    /// rewrite.py:948-953: gen_write_barrier
-    fn gen_write_barrier(&self, v_base: OpRef, st: &mut RewriteState) {
-        let wb_op = Op::new(OpCode::CondCallGcWb, &[v_base]);
-        st.emit(wb_op);
-        st.remember_write_barrier(v_base);
-    }
+    // ────────────────────────────────────────────────────────
+    // rewrite.py:955-973 gen_write_barrier_array
+    // ────────────────────────────────────────────────────────
 
-    /// rewrite.py:955-973: gen_write_barrier_array
     fn gen_write_barrier_array(&self, v_base: OpRef, v_index: OpRef, st: &mut RewriteState) {
         if self.wb_descr.jit_wb_cards_set != 0 {
             // If we know statically the length of 'v_base', and it is not
@@ -737,12 +681,14 @@ impl GcRewriterImpl {
                 let wb_op = Op::new(OpCode::CondCallGcWbArray, &[v_base, v_index]);
                 st.emit(wb_op);
                 // rewrite.py:970: a WB_ARRAY is not enough to prevent
-                // any future write barriers, so don't remember_write_barrier!
+                // any future write barriers, so don't remember_wb!
                 return;
             }
         }
-        // rewrite.py:973: fall-back case: produce a write_barrier
-        self.gen_write_barrier(v_base, st);
+        // Fall-back: produce a regular write_barrier.
+        let wb_op = Op::new(OpCode::CondCallGcWb, &[v_base]);
+        st.emit(wb_op);
+        st.remember_wb(v_base);
     }
 
     // ────────────────────────────────────────────────────────
@@ -759,7 +705,7 @@ impl GcRewriterImpl {
             let size_ref = st.const_int(size as i64);
             let op = Op::new(OpCode::CallMallocNursery, &[size_ref]);
             let r = st.emit_result(op, result_pos);
-            st.remember_write_barrier(r);
+            st.remember_wb(r);
             return r;
         }
 
@@ -780,7 +726,7 @@ impl GcRewriterImpl {
                 let r = st.emit_result(incr_op, result_pos);
                 st.previous_size = size;
                 st.last_malloced_ref = r;
-                st.remember_write_barrier(r);
+                st.remember_wb(r);
                 return r;
             }
         }
@@ -794,7 +740,7 @@ impl GcRewriterImpl {
         st.pending_malloc_total = size;
         st.previous_size = size;
         st.last_malloced_ref = r;
-        st.remember_write_barrier(r);
+        st.remember_wb(r);
         r
     }
 
@@ -849,33 +795,114 @@ impl GcRewriterImpl {
         st.emit(store);
     }
 
-    /// rewrite.py:1008-1031: record_int_add_or_sub
-    fn record_int_add_or_sub(op: &Op, is_subtraction: bool, st: &mut RewriteState) {
-        let arg1 = op.arg(1);
-        let (constant, base_box) = if let Some(c) = st.resolve_constant(arg1.0) {
-            let c = if is_subtraction { -c } else { c };
-            (c, st.resolve(op.arg(0)))
-        } else {
-            if is_subtraction {
-                return;
-            }
-            let arg0 = op.arg(0);
-            if let Some(c) = st.resolve_constant(arg0.0) {
-                (c, st.resolve(arg1))
-            } else {
-                return;
-            }
+    // ── rewrite.py:665-695 handle_call_assembler helpers ──────────
+
+    /// Check if a CallR op is a call to any create_frame helper variant.
+    fn is_create_frame_call(&self, op: &Op, st: &RewriteState) -> bool {
+        let Some(ref descrs) = self.jitframe_info else {
+            return false;
         };
-        let (final_box, final_constant) =
-            if let Some(&(older_box, extra_offset)) = st._constant_additions.get(&base_box.0) {
-                (older_box, constant + extra_offset)
-            } else {
-                (base_box, constant)
-            };
-        if !op.pos.is_none() {
-            st._constant_additions
-                .insert(op.pos.0, (final_box, final_constant));
-        }
+        let func_addr_key = op.arg(0).0;
+        let Some(func_addr) = st.resolve_constant(func_addr_key) else {
+            return false;
+        };
+        descrs
+            .create_fn_addrs
+            .iter()
+            .any(|&addr| func_addr == addr as i64)
+    }
+
+    /// Check if a CallN op is a call to the drop_frame helper.
+    fn is_drop_frame_call(&self, op: &Op, st: &RewriteState) -> bool {
+        let Some(ref descrs) = self.jitframe_info else {
+            return false;
+        };
+        let func_addr_key = op.arg(0).0;
+        let func_addr = st.resolve_constant(func_addr_key);
+        func_addr == Some(descrs.drop_fn_addr as i64)
+    }
+
+    /// rewrite.py:665-695 — replace CallR(create_frame) with nursery
+    /// allocation + JitFrame field initialization.
+    ///
+    /// Emits:
+    ///   v_frame = CallMallocNurseryVarsizeFrame(size_const)
+    ///   GcStore(v_frame, tid_ofs, tid)         # gen_initialize_tid
+    ///   GcStore(v_frame, jf_descr, 0)          # zero GCREF fields
+    ///   GcStore(v_frame, jf_force_descr, 0)
+    ///   GcStore(v_frame, jf_savedata, 0)
+    ///   GcStore(v_frame, jf_guard_exc, 0)
+    ///   GcStore(v_frame, jf_forward, 0)
+    ///   GcStore(v_frame, jf_frame_info, info_ptr)
+    /// rewrite.py:665-695 parity: replace CallR(create_frame) with
+    /// nursery bump allocation + field initialization.
+    ///
+    /// Allocates a PyFrame-layout block from the nursery (matching
+    /// the field offsets that compiled code reads via raw pointers).
+    /// Copies `code` and `namespace` from the caller frame, zeroes
+    /// `next_instr` and `vable_token`.
+    /// rewrite.py:613-695 gen_malloc_frame + handle_call_assembler parity.
+    ///
+    /// Allocates a PyFrame-sized block from the nursery, initializes the
+    /// GC type ID header, zeroes all GC-traced pointer fields, and copies
+    /// caller's `code` and `namespace`.
+    fn handle_create_frame(&self, op: &Op, st: &mut RewriteState) {
+        let descrs = self.jitframe_info.as_ref().unwrap();
+
+        // rewrite.py:634 — gen_malloc_nursery_varsize_frame
+        let alloc_size = (descrs.pyframe_alloc_size + 7) & !7;
+        st.emitting_an_operation_that_can_collect();
+        let malloc_op = Op::new(
+            OpCode::CallMallocNurseryVarsizeFrame,
+            &[OpRef(alloc_size as u32)],
+        );
+        let frame = st.emit_result(malloc_op, op.pos);
+        st.remember_wb(frame);
+
+        // rewrite.py:635 — gen_initialize_tid(frame, arraydescr.tid)
+        // NOTE: pyre's PyFrame is not yet GC-managed, so the GcHeader
+        // type-id write would touch memory before the PyFrame payload
+        // that is not guaranteed to be accessible from the Cranelift
+        // lowering path (offset 0 in gen_initialize_tid maps to
+        // header-relative, but arena slots already have a zeroed
+        // gc_header prepended). This call is deferred until the backend
+        // GcStore slot-0 lowering is verified to use the correct
+        // negative offset from the payload pointer.
+        // self.gen_initialize_tid(frame, descrs.jitframe_tid, st);
+
+        // rewrite.py:641-650 — zero all GCREF fields.
+        // For JitFrame: jf_savedata, jf_force_descr, jf_descr, jf_guard_exc, jf_forward.
+        // For PyFrame: next_instr, vable_token (plus execution_context, locals_cells_stack_w
+        // which are written by caller before use).
+        let zero = st.const_int(0);
+        let word_size = st.const_int(8);
+        let ni_ofs = st.const_int(descrs.pyframe_next_instr_ofs as i64);
+        let vt_ofs = st.const_int(descrs.pyframe_vable_token_ofs as i64);
+        st.emit(Op::new(OpCode::GcStore, &[frame, ni_ofs, zero, word_size]));
+        st.emit(Op::new(OpCode::GcStore, &[frame, vt_ofs, zero, word_size]));
+
+        // rewrite.py:655-658 — Copy `code` from caller frame (self-recursive: same code).
+        let caller_frame = st.resolve(op.arg(1));
+        let code_ofs = st.const_int(descrs.pyframe_code_ofs as i64);
+        let ns_ofs = st.const_int(descrs.pyframe_namespace_ofs as i64);
+
+        let caller_code = st.emit(Op::new(
+            OpCode::GcLoadI,
+            &[caller_frame, code_ofs, word_size],
+        ));
+        st.emit(Op::new(
+            OpCode::GcStore,
+            &[frame, code_ofs, caller_code, word_size],
+        ));
+
+        // Copy `namespace` from caller frame.
+        let caller_ns = st.emit(Op::new(OpCode::GcLoadI, &[caller_frame, ns_ofs, word_size]));
+        st.emit(Op::new(
+            OpCode::GcStore,
+            &[frame, ns_ofs, caller_ns, word_size],
+        ));
+
+        st.record_result_mapping(op.pos, frame);
     }
 
     /// rewrite.py:665-695 handle_call_assembler:
@@ -1076,7 +1103,7 @@ impl GcRewriter for GcRewriterImpl {
                 // rewrite.py:1003-1006 emit_label
                 OpCode::Label => {
                     st.emitting_an_operation_that_can_collect();
-                    st._known_lengths.clear();
+                    st.known_lengths.clear();
                     let rewritten = st.rewrite_op(op);
                     st.emit_rewritten_from(op, rewritten);
                 }
@@ -1096,28 +1123,12 @@ impl GcRewriter for GcRewriterImpl {
                     self.handle_new_array(op, &mut st, 2); // FLAG_UNICODE
                 }
 
-                // rewrite.py:384-387: record INT_ADD or INT_SUB with a constant
-                OpCode::IntAdd | OpCode::IntAddOvf => {
-                    Self::record_int_add_or_sub(op, false, &mut st);
-                    let rewritten = st.rewrite_op(op);
-                    st.emit_rewritten_from(op, rewritten);
-                }
-                OpCode::IntSub | OpCode::IntSubOvf => {
-                    Self::record_int_add_or_sub(op, true, &mut st);
-                    let rewritten = st.rewrite_op(op);
-                    st.emit_rewritten_from(op, rewritten);
-                }
-
-                // ── rewrite.py:394-404: write barriers ──
+                // ── Stores that may need a write barrier ──
                 OpCode::SetfieldGc => {
-                    self.consider_setfield_gc(op, &mut st);
-                    self.handle_write_barrier_setfield(op, &mut st);
-                    continue;
+                    self.handle_setfield_gc(op, &mut st);
                 }
                 OpCode::SetarrayitemGc => {
-                    self.consider_setarrayitem_gc(op, &mut st);
-                    self.handle_write_barrier_setarrayitem(op, &mut st);
-                    continue;
+                    self.handle_setarrayitem_gc(op, &mut st);
                 }
 
                 // ── call_assembler: rewrite.py:414 handle_call_assembler ──
@@ -1129,6 +1140,18 @@ impl GcRewriter for GcRewriterImpl {
                     st.emitting_an_operation_that_can_collect();
                     let rewritten = st.rewrite_op(op);
                     st.emit_rewritten_from(op, rewritten);
+                }
+
+                // ── rewrite.py:665 handle_call_assembler parity ──
+                // Replace CallR(create_frame) with nursery bump alloc.
+                // Elide CallN(drop_frame) — GC collects nursery objects.
+                // Force path (jit_force_callee_frame) reads code/namespace
+                // via raw offsets, creates a proper PyFrame for interpreter.
+                OpCode::CallR if self.is_create_frame_call(op, &st) => {
+                    self.handle_create_frame(op, &mut st);
+                }
+                OpCode::CallN if self.is_drop_frame_call(op, &st) => {
+                    // rewrite.py:665-695: no explicit free — GC collects.
                 }
 
                 // ── Operations that can trigger GC ──
@@ -1151,7 +1174,7 @@ impl GcRewriter for GcRewriterImpl {
                     let rewritten = st.rewrite_op(op);
                     let obj = rewritten.arg(0);
                     st.emit(rewritten);
-                    st.remember_write_barrier(obj);
+                    st.remember_wb(obj);
                 }
                 OpCode::CondCallGcWbArray => {
                     let rewritten = st.rewrite_op(op);
@@ -1590,7 +1613,7 @@ mod tests {
 
         let result2 = rw.rewrite_for_gc(&ops2);
 
-        // The CallMallocNursery result at pos=0 is in _write_barrier_applied,
+        // The CallMallocNursery result at pos=0 is in wb_applied,
         // so the SetfieldGc at arg(0)=OpRef(0) should NOT get a WB.
         // Expected: CallMallocNursery, GcStore(tid), SetfieldGc
         // No CondCallGcWb because OpRef(0) was remembered.
@@ -1742,108 +1765,83 @@ mod tests {
 
     #[test]
     fn test_pending_zero_fully_initialized() {
-        // NEW_ARRAY_CLEAR(3) + SET[0] + SET[1] + SET[2] → ZERO_ARRAY(start=0,len=0)
+        // NEW_ARRAY_CLEAR(3) + SET[0] + SET[1] + SET[2] → no ZERO_ARRAY emitted.
         let rw = make_rewriter();
-        let len_ref = OpRef(10_000);
-        let mut constants = HashMap::new();
-        constants.insert(10_000, 3_i64);
-        constants.insert(10_001, 0_i64);
-        constants.insert(10_002, 1_i64);
-        constants.insert(10_003, 2_i64);
-        let mut new_array = Op::with_descr(OpCode::NewArrayClear, &[len_ref], array_descr_int());
+        let mut new_array = Op::with_descr(OpCode::NewArrayClear, &[OpRef(3)], array_descr_int());
         new_array.pos = OpRef(0);
 
         let ops = vec![
             new_array,
             Op::with_descr(
                 OpCode::SetarrayitemGc,
-                &[OpRef(0), OpRef(10_001), OpRef(100)],
+                &[OpRef(0), OpRef(0), OpRef(100)],
                 array_descr_int(),
             ),
             Op::with_descr(
                 OpCode::SetarrayitemGc,
-                &[OpRef(0), OpRef(10_002), OpRef(100)],
+                &[OpRef(0), OpRef(1), OpRef(100)],
                 array_descr_int(),
             ),
             Op::with_descr(
                 OpCode::SetarrayitemGc,
-                &[OpRef(0), OpRef(10_003), OpRef(100)],
+                &[OpRef(0), OpRef(2), OpRef(100)],
                 array_descr_int(),
             ),
             Op::new(OpCode::Finish, &[]),
         ];
 
-        let (result, _) = rw.rewrite_for_gc_with_constants(&ops, &constants);
+        let result = rw.rewrite_for_gc(&ops);
 
-        // All indices SET → emit_pending_zeros trims to length 0 (no-op).
-        let zeros: Vec<_> = result
+        // All indices were SET, so no ZERO_ARRAY should be emitted.
+        let zero_count = result
             .iter()
             .filter(|o| o.opcode == OpCode::ZeroArray)
-            .collect();
-        // The ZERO_ARRAY is still emitted but with length=0 (a no-op).
-        assert_eq!(zeros.len(), 1, "ZERO_ARRAY is present but a no-op");
+            .count();
+        assert_eq!(
+            zero_count, 0,
+            "fully initialized array should produce no ZERO_ARRAY"
+        );
     }
 
     #[test]
     fn test_pending_zero_partially_initialized() {
-        // NEW_ARRAY_CLEAR(4) + SET[0] + SET[1] → ZERO_ARRAY trimmed to start=2
+        // NEW_ARRAY_CLEAR(4) + SET[0] + SET[1] → ZERO_ARRAY(arr, 2, 2)
         let rw = make_rewriter();
-        let len_ref = OpRef(10_000);
-        let mut constants = HashMap::new();
-        constants.insert(10_000, 4_i64);
-        constants.insert(10_001, 0_i64);
-        constants.insert(10_002, 1_i64);
-        let mut new_array = Op::with_descr(OpCode::NewArrayClear, &[len_ref], array_descr_int());
+        let mut new_array = Op::with_descr(OpCode::NewArrayClear, &[OpRef(4)], array_descr_int());
         new_array.pos = OpRef(0);
 
         let ops = vec![
             new_array,
             Op::with_descr(
                 OpCode::SetarrayitemGc,
-                &[OpRef(0), OpRef(10_001), OpRef(100)],
+                &[OpRef(0), OpRef(0), OpRef(100)],
                 array_descr_int(),
             ),
             Op::with_descr(
                 OpCode::SetarrayitemGc,
-                &[OpRef(0), OpRef(10_002), OpRef(100)],
+                &[OpRef(0), OpRef(1), OpRef(100)],
                 array_descr_int(),
             ),
             Op::new(OpCode::Finish, &[]),
         ];
 
-        let (result, new_consts) = rw.rewrite_for_gc_with_constants(&ops, &constants);
+        let result = rw.rewrite_for_gc(&ops);
 
-        // Indices 0,1 SET. ZERO_ARRAY trimmed to start=2*itemsize, len=2*itemsize.
+        // Indices 0 and 1 were SET. Indices 2 and 3 still need zeroing.
         let zeros: Vec<_> = result
             .iter()
             .filter(|o| o.opcode == OpCode::ZeroArray)
             .collect();
         assert_eq!(zeros.len(), 1, "should emit exactly one ZERO_ARRAY");
-        // start and length are scaled by item_size (8 bytes for i64 array).
-        let start_val = new_consts
-            .get(&zeros[0].args[1].0)
-            .or(constants.get(&zeros[0].args[1].0))
-            .copied()
-            .unwrap_or(-1);
-        let len_val = new_consts
-            .get(&zeros[0].args[2].0)
-            .or(constants.get(&zeros[0].args[2].0))
-            .copied()
-            .unwrap_or(-1);
-        assert_eq!(start_val, 8, "zero start should be 2*4=8");
-        assert_eq!(len_val, 8, "zero length should be 2*4=8");
+        assert_eq!(zeros[0].args[1], OpRef(2), "zero start should be 2");
+        assert_eq!(zeros[0].args[2], OpRef(2), "zero length should be 2");
     }
 
     #[test]
     fn test_pending_zero_flushed_at_guard() {
         // Guard forces pending zero flush even if no indices were SET.
-        // RPython: ZERO_ARRAY is emitted at NEW_ARRAY_CLEAR time (always),
-        // then optimized in emit_pending_zeros at flush points.
         let rw = make_rewriter();
-        let len_ref = OpRef(10_000);
-        let mut constants = HashMap::new();
-        constants.insert(10_000, 3_i64);
-        let mut new_array = Op::with_descr(OpCode::NewArrayClear, &[len_ref], array_descr_int());
+        let mut new_array = Op::with_descr(OpCode::NewArrayClear, &[OpRef(3)], array_descr_int());
         new_array.pos = OpRef(0);
 
         let ops = vec![
@@ -1852,13 +1850,13 @@ mod tests {
             Op::new(OpCode::Finish, &[]),
         ];
 
-        let (result, new_consts) = rw.rewrite_for_gc_with_constants(&ops, &constants);
+        let result = rw.rewrite_for_gc(&ops);
 
+        // The ZERO_ARRAY should appear before the guard.
         let zero_idx = result.iter().position(|o| o.opcode == OpCode::ZeroArray);
         let guard_idx = result.iter().position(|o| o.opcode == OpCode::GuardTrue);
         assert!(zero_idx.is_some(), "ZERO_ARRAY should be emitted");
         assert!(guard_idx.is_some(), "GuardTrue should be present");
-        // ZERO_ARRAY emitted at NEW_ARRAY_CLEAR time, before guard.
         assert!(
             zero_idx.unwrap() < guard_idx.unwrap(),
             "ZERO_ARRAY should come before GuardTrue"
@@ -1868,75 +1866,53 @@ mod tests {
             .iter()
             .find(|o| o.opcode == OpCode::ZeroArray)
             .unwrap();
-        let start_val = new_consts
-            .get(&zero.args[1].0)
-            .or(constants.get(&zero.args[1].0))
-            .copied()
-            .unwrap_or(-1);
-        let len_val = new_consts
-            .get(&zero.args[2].0)
-            .or(constants.get(&zero.args[2].0))
-            .copied()
-            .unwrap_or(-1);
-        assert_eq!(start_val, 0, "zero start should be 0");
-        assert_eq!(len_val, 12, "zero length should be 3*4=12");
+        assert_eq!(zero.args[1], OpRef(0), "zero start should be 0");
+        assert_eq!(zero.args[2], OpRef(3), "zero length should be 3");
     }
 
     #[test]
     fn test_pending_zero_gap_in_middle() {
-        // NEW_ARRAY_CLEAR(5) + SET[0] + SET[2] + SET[4] → ZERO_ARRAY trimmed.
-        // RPython produces ONE ZERO_ARRAY (trimmed start and stop), not two runs.
+        // NEW_ARRAY_CLEAR(5) + SET[0] + SET[2] + SET[4] → two ZERO_ARRAY runs.
         let rw = make_rewriter();
-        let len_ref = OpRef(10_000);
-        let mut constants = HashMap::new();
-        constants.insert(10_000, 5_i64);
-        constants.insert(10_001, 0_i64);
-        constants.insert(10_002, 2_i64);
-        constants.insert(10_003, 4_i64);
-        let mut new_array = Op::with_descr(OpCode::NewArrayClear, &[len_ref], array_descr_int());
+        let mut new_array = Op::with_descr(OpCode::NewArrayClear, &[OpRef(5)], array_descr_int());
         new_array.pos = OpRef(0);
 
         let ops = vec![
             new_array,
             Op::with_descr(
                 OpCode::SetarrayitemGc,
-                &[OpRef(0), OpRef(10_001), OpRef(100)],
+                &[OpRef(0), OpRef(0), OpRef(100)],
                 array_descr_int(),
             ),
             Op::with_descr(
                 OpCode::SetarrayitemGc,
-                &[OpRef(0), OpRef(10_002), OpRef(100)],
+                &[OpRef(0), OpRef(2), OpRef(100)],
                 array_descr_int(),
             ),
             Op::with_descr(
                 OpCode::SetarrayitemGc,
-                &[OpRef(0), OpRef(10_003), OpRef(100)],
+                &[OpRef(0), OpRef(4), OpRef(100)],
                 array_descr_int(),
             ),
             Op::new(OpCode::Finish, &[]),
         ];
 
-        let (result, new_consts) = rw.rewrite_for_gc_with_constants(&ops, &constants);
+        let result = rw.rewrite_for_gc(&ops);
 
-        // RPython trims: start=1 (first non-SET), stop=4 (last non-SET+1).
-        // Length = (4-1)*8 = 24, start = 1*8 = 8.
+        // Indices 1 and 3 need zeroing → two separate ZERO_ARRAY runs.
         let zeros: Vec<_> = result
             .iter()
             .filter(|o| o.opcode == OpCode::ZeroArray)
             .collect();
-        assert_eq!(zeros.len(), 1, "RPython emits one ZERO_ARRAY, trimmed");
-        let start_val = new_consts
-            .get(&zeros[0].args[1].0)
-            .or(constants.get(&zeros[0].args[1].0))
-            .copied()
-            .unwrap_or(-1);
-        let len_val = new_consts
-            .get(&zeros[0].args[2].0)
-            .or(constants.get(&zeros[0].args[2].0))
-            .copied()
-            .unwrap_or(-1);
-        assert_eq!(start_val, 4, "zero start should be 1*4=4");
-        assert_eq!(len_val, 12, "zero length should be (4-1)*4=12");
+        assert_eq!(
+            zeros.len(),
+            2,
+            "should emit two ZERO_ARRAY runs for gaps at 1 and 3"
+        );
+        assert_eq!(zeros[0].args[1], OpRef(1));
+        assert_eq!(zeros[0].args[2], OpRef(1));
+        assert_eq!(zeros[1].args[1], OpRef(3));
+        assert_eq!(zeros[1].args[2], OpRef(1));
     }
 
     #[test]

@@ -12,12 +12,14 @@ use crate::header::{GcHeader, header_of};
 
 /// A single old-generation allocation record.
 struct OldObject {
-    /// Address of the GC header within the allocated block.
-    /// For card-marked objects: alloc_start + card_header_size.
-    /// For normal objects: same as alloc_start.
+    /// Start of the raw allocation (for dealloc).
+    /// For objects with card marking, this is before the card header bytes.
+    /// incminimark.py:1046-1067: allocsize includes cardheadersize.
+    alloc_start: usize,
+    /// Address of the GcHeader.
+    /// = alloc_start + card_header_bytes for card-marked objects,
+    /// = alloc_start for regular objects.
     header_addr: usize,
-    /// Address of the raw allocation (for deallocation).
-    alloc_addr: usize,
     /// Layout used for deallocation.
     layout: Layout,
 }
@@ -46,42 +48,34 @@ impl OldGen {
     /// Allocate space for an object of `total_size` bytes (header + payload).
     /// Returns a pointer to the header location. Memory is zero-filled.
     pub fn alloc(&mut self, total_size: usize) -> *mut u8 {
-        let total_size = total_size.max(GcHeader::MIN_NURSERY_OBJ_SIZE);
-        let layout = Layout::from_size_align(total_size, 8).expect("invalid layout");
-        let ptr = unsafe { alloc::alloc_zeroed(layout) };
-        if ptr.is_null() {
-            alloc::handle_alloc_error(layout);
-        }
-        self.objects.push(OldObject {
-            header_addr: ptr as usize,
-            alloc_addr: ptr as usize,
-            layout,
-        });
-        self.total_bytes += total_size;
-        ptr
+        self.alloc_with_card_header(total_size, 0)
     }
 
-    /// Allocate with card header space before the GC header.
-    /// Returns the raw arena start pointer. The GC header starts at
-    /// `result + card_header_size`.
+    /// incminimark.py:1046-1067: allocate with card header bytes prepended.
+    ///
+    /// Layout: `[card_bytes (card_header_bytes)] [GcHeader] [payload]`
+    /// Returns pointer to the GcHeader (NOT the card bytes).
+    /// Card bytes are zero-filled.
     pub fn alloc_with_card_header(
         &mut self,
         total_size: usize,
-        card_header_size: usize,
+        card_header_bytes: usize,
     ) -> *mut u8 {
-        let total_size = total_size.max(GcHeader::MIN_NURSERY_OBJ_SIZE);
-        let layout = Layout::from_size_align(total_size, 8).expect("invalid layout");
+        let obj_size = total_size.max(GcHeader::MIN_NURSERY_OBJ_SIZE);
+        let alloc_size = card_header_bytes + obj_size;
+        let layout = Layout::from_size_align(alloc_size, 8).expect("invalid layout");
         let ptr = unsafe { alloc::alloc_zeroed(layout) };
         if ptr.is_null() {
             alloc::handle_alloc_error(layout);
         }
+        let header_ptr = unsafe { ptr.add(card_header_bytes) };
         self.objects.push(OldObject {
-            header_addr: ptr as usize + card_header_size,
-            alloc_addr: ptr as usize,
+            alloc_start: ptr as usize,
+            header_addr: header_ptr as usize,
             layout,
         });
-        self.total_bytes += total_size;
-        ptr
+        self.total_bytes += alloc_size;
+        header_ptr
     }
 
     /// Allocate and copy data from a source address.
@@ -121,10 +115,10 @@ impl OldGen {
                 hdr.clear_flag(flags::VISITED);
                 surviving.push(obj_record);
             } else {
-                // Dead: free it.
+                // Dead: free it. Dealloc from alloc_start (includes card header).
                 freed_bytes += obj_record.layout.size();
                 unsafe {
-                    alloc::dealloc(obj_record.alloc_addr as *mut u8, obj_record.layout);
+                    alloc::dealloc(obj_record.alloc_start as *mut u8, obj_record.layout);
                 }
             }
         }
@@ -166,7 +160,7 @@ impl Drop for OldGen {
     fn drop(&mut self) {
         for obj_record in self.objects.drain(..) {
             unsafe {
-                alloc::dealloc(obj_record.alloc_addr as *mut u8, obj_record.layout);
+                alloc::dealloc(obj_record.alloc_start as *mut u8, obj_record.layout);
             }
         }
     }
