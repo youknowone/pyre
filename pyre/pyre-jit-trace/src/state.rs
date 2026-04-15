@@ -1193,6 +1193,20 @@ pub(crate) fn concrete_locals_len(frame: usize) -> Option<usize> {
     concrete_nlocals(frame)
 }
 
+/// virtualizable.py:86-98 read_boxes: len(locals_cells_stack_w).
+/// The total capacity of the frame's value array (nlocals + co_stacksize).
+pub(crate) fn concrete_locals_cells_stack_len(frame: usize) -> Option<usize> {
+    let frame_ptr = (frame != 0).then_some(frame as *const u8)?;
+    let array_ptr = unsafe {
+        *(frame_ptr.add(crate::frame_layout::PYFRAME_LOCALS_CELLS_STACK_OFFSET)
+            as *const *const pyre_object::FixedObjectArray)
+    };
+    if array_ptr.is_null() {
+        return None;
+    }
+    Some(unsafe { (*array_ptr).len() })
+}
+
 /// Return the absolute valuestackdepth.
 pub(crate) fn concrete_stack_depth(frame: usize) -> Option<usize> {
     let frame_ptr = (frame != 0).then_some(frame as *const u8)?;

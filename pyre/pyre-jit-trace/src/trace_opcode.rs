@@ -1009,23 +1009,10 @@ impl MIFrame {
         ctx: &mut TraceCtx,
         target_pc: Option<usize>,
     ) -> Vec<OpRef> {
-        // RPython parity: loop-carried live state comes from the current
-        // virtualizable frame state at the merge point. If symbolic stack
-        // accounting drifted during tracing, resync depth/shape from the
-        // concrete frame before materializing JUMP args.
-        // MIFrame Box tracking: use PyreSym's tracked values, not snapshot.
-        //
-        // When closing to a target loop header, clear stale stack state
-        // BEFORE the resync block and flush_to_frame, so that flush emits
-        // VSD = nlocals (not stale stack depth) and the JUMP args count
-        // matches the root label contract (stack_only = 0 at function entry).
-        if target_pc.is_some() {
-            let s = self.sym_mut();
-            s.valuestackdepth = s.nlocals;
-            s.vable_valuestackdepth = ctx.const_int(s.nlocals as i64);
-            s.symbolic_stack.clear();
-            s.symbolic_stack_types.clear();
-        }
+        // pyjitpl.py:2954-2965 reached_loop_header: virtualizable_boxes
+        // (read from locals_cells_stack_w[*] by virtualizable.py:86-98
+        // read_boxes) are carried into the JUMP unchanged, including
+        // stack slots. Do NOT truncate to nlocals here.
         let concrete_nlocals = self.sym().nlocals;
         let concrete_vsd = self.sym().valuestackdepth.max(concrete_nlocals);
         {
