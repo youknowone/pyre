@@ -89,7 +89,9 @@ use crate::descr::{
     range_iter_current_descr, range_iter_step_descr, range_iter_stop_descr, str_len_descr,
     tuple_items_len_descr, tuple_items_ptr_descr, w_float_size_descr, w_int_size_descr,
 };
-use crate::frame_layout::PYFRAME_CODE_OFFSET;
+use crate::frame_layout::{
+    PYFRAME_CODE_OFFSET, PYFRAME_DEBUGDATA_OFFSET, PYFRAME_LASTBLOCK_OFFSET,
+};
 use crate::helpers::{TraceHelperAccess, emit_box_float_inline, emit_trace_bool_value_from_truth};
 use crate::liveness::liveness_for;
 
@@ -705,15 +707,27 @@ impl MIFrame {
     pub(crate) fn flush_to_frame(&mut self, ctx: &mut TraceCtx) {
         let resume_pc = self.orgpc;
         let frame_addr = self.concrete_frame_addr;
-        let code_ptr = if frame_addr != 0 {
-            unsafe { *((frame_addr + PYFRAME_CODE_OFFSET) as *const usize) }
+        let (code_ptr, debugdata, lastblock) = if frame_addr != 0 {
+            unsafe {
+                (
+                    *((frame_addr + PYFRAME_CODE_OFFSET) as *const usize),
+                    *((frame_addr + PYFRAME_DEBUGDATA_OFFSET) as *const usize),
+                    *((frame_addr + PYFRAME_LASTBLOCK_OFFSET) as *const usize),
+                )
+            }
         } else {
-            0
+            (0, 0, 0)
         };
         let ns_ptr = self.sym().concrete_namespace as i64;
         let vsd = self.sym().valuestackdepth as i64;
-        self.sym_mut()
-            .flush_vable_fields(ctx, &[resume_pc as i64, code_ptr as i64, vsd, ns_ptr]);
+        // virtualizable.py:86-93 read_boxes: ALL static fields from the heap.
+        let s = self.sym_mut();
+        s.vable_next_instr = ctx.const_int(resume_pc as i64);
+        s.vable_code = ctx.const_ref(code_ptr as i64);
+        s.vable_valuestackdepth = ctx.const_int(vsd);
+        s.vable_debugdata = ctx.const_ref(debugdata as i64);
+        s.vable_lastblock = ctx.const_ref(lastblock as i64);
+        s.vable_namespace = ctx.const_ref(ns_ptr);
     }
 
     /// capture_resumedata(resumepc=orgpc) parity: flush vable fields for guards.
@@ -729,21 +743,32 @@ impl MIFrame {
     fn flush_to_frame_for_guard(&mut self, ctx: &mut TraceCtx) {
         // RPython capture_resumedata(resumepc=orgpc) parity:
         // Always use orgpc (opcode start PC) as the resume PC.
-        // orgpc is set to the current opcode's code unit in from_sym().
         let resume_pc = self.orgpc;
         let frame_addr = self.concrete_frame_addr;
-        let code_ptr = if frame_addr != 0 {
-            unsafe { *((frame_addr + PYFRAME_CODE_OFFSET) as *const usize) }
+        let (code_ptr, debugdata, lastblock) = if frame_addr != 0 {
+            unsafe {
+                (
+                    *((frame_addr + PYFRAME_CODE_OFFSET) as *const usize),
+                    *((frame_addr + PYFRAME_DEBUGDATA_OFFSET) as *const usize),
+                    *((frame_addr + PYFRAME_LASTBLOCK_OFFSET) as *const usize),
+                )
+            }
         } else {
-            0
+            (0, 0, 0)
         };
         let ns_ptr = self.sym().concrete_namespace as i64;
         let vsd = {
             let s = self.sym();
             s.pre_opcode_vsd.unwrap_or(s.valuestackdepth) as i64
         };
-        self.sym_mut()
-            .flush_vable_fields(ctx, &[resume_pc as i64, code_ptr as i64, vsd, ns_ptr]);
+        // virtualizable.py:86-93 read_boxes: ALL static fields from the heap.
+        let s = self.sym_mut();
+        s.vable_next_instr = ctx.const_int(resume_pc as i64);
+        s.vable_code = ctx.const_ref(code_ptr as i64);
+        s.vable_valuestackdepth = ctx.const_int(vsd);
+        s.vable_debugdata = ctx.const_ref(debugdata as i64);
+        s.vable_lastblock = ctx.const_ref(lastblock as i64);
+        s.vable_namespace = ctx.const_ref(ns_ptr);
     }
 
     /// pyjitpl.py:3317-3335 vable_and_vrefs_before_residual_call.
@@ -1070,6 +1095,8 @@ impl MIFrame {
             next_instr,
             code,
             stack_depth,
+            debugdata,
+            lastblock,
             namespace,
             nlocals,
             locals,
@@ -1084,6 +1111,8 @@ impl MIFrame {
                 s.vable_next_instr,
                 s.vable_code,
                 s.vable_valuestackdepth,
+                s.vable_debugdata,
+                s.vable_lastblock,
                 s.vable_namespace,
                 s.nlocals,
                 s.symbolic_locals.clone(),
@@ -1115,7 +1144,15 @@ impl MIFrame {
                 ctx.inputarg_types()
             }
         };
-        let mut args = vec![frame, next_instr, code, stack_depth, namespace];
+        let mut args = vec![
+            frame,
+            next_instr,
+            code,
+            stack_depth,
+            debugdata,
+            lastblock,
+            namespace,
+        ];
         for (idx, value) in locals.into_iter().enumerate() {
             let target_type = inputarg_types
                 .get(crate::virtualizable_gen::NUM_SCALAR_INPUTARGS + idx)
@@ -1163,7 +1200,7 @@ impl MIFrame {
         // sharing one `duplicates` dict across both calls. In pyre's flat
         // layout `args = [frame, ni, code, vsd, ns, locals..., stack...]`,
         // that corresponds to every index 0..args.len(). Previously pyre
-        // skipped the 5 scalar header slots (frame + 4 static fields),
+        // skipped the 7 scalar header slots (frame + 6 static fields),
         // which is a line-by-line divergence from RPython.
         // Track slots that the dedup actually mutated so we can mirror the
         // `put_back_list_of_boxes3` mutation below (pyjitpl.py:1578 writes
@@ -1245,7 +1282,9 @@ impl MIFrame {
                         1 => s.vable_next_instr = new_opref,
                         2 => s.vable_code = new_opref,
                         3 => s.vable_valuestackdepth = new_opref,
-                        4 => s.vable_namespace = new_opref,
+                        4 => s.vable_debugdata = new_opref,
+                        5 => s.vable_lastblock = new_opref,
+                        6 => s.vable_namespace = new_opref,
                         _ => {}
                     }
                 } else {
@@ -1311,6 +1350,8 @@ impl MIFrame {
             s.vable_next_instr,
             s.vable_code,
             s.vable_valuestackdepth,
+            s.vable_debugdata,
+            s.vable_lastblock,
             s.vable_namespace,
         ];
         fa.extend_from_slice(&active_boxes);
@@ -1455,6 +1496,8 @@ impl MIFrame {
                     s.vable_next_instr,
                     s.vable_code,
                     s.vable_valuestackdepth,
+                    s.vable_debugdata,
+                    s.vable_lastblock,
                     s.vable_namespace,
                 ]
             };
@@ -1546,6 +1589,8 @@ impl MIFrame {
                 s.vable_next_instr,
                 s.vable_code,
                 s.vable_valuestackdepth,
+                s.vable_debugdata,
+                s.vable_lastblock,
                 s.vable_namespace,
             ];
             fa.extend_from_slice(&active_boxes);
@@ -2014,14 +2059,15 @@ impl MIFrame {
 
         let mut fail_args: Vec<OpRef> = {
             let s = self.sym();
-            // virtualizable_gen::NUM_SCALAR_INPUTARGS = 5: pyre's vable header
-            // is [frame_ptr, next_instr, code, valuestackdepth, namespace]
-            // (matches the merged generate_guard_core layout in this same file).
+            // interp_jit.py:25-31 scalar field order.
+            // NUM_SCALAR_INPUTARGS = 7: frame + 6 static fields.
             let mut fa = vec![
                 s.frame,
                 s.vable_next_instr,
                 s.vable_code,
                 s.vable_valuestackdepth,
+                s.vable_debugdata,
+                s.vable_lastblock,
                 s.vable_namespace,
             ];
             fa.extend_from_slice(&callee_active_boxes);
@@ -2842,7 +2888,9 @@ impl MIFrame {
                     let callee_nlocals = unsafe {
                         let code_ptr =
                             pyre_interpreter::get_pycode(concrete_callable) as *const CodeObject;
-                        (&*code_ptr).varnames.len()
+                        let code = &*code_ptr;
+                        // pyframe.py:111: nlocals + ncellvars + nfreevars
+                        code.varnames.len() + pyre_interpreter::pyframe::ncells(code)
                     };
                     if nargs == 1 || (crate::callbacks::get().callee_frame_helper)(nargs).is_some()
                     {
@@ -3208,7 +3256,9 @@ impl MIFrame {
         callee_frame.fix_array_ptrs();
 
         let callee_code = unsafe { &*pyre_interpreter::pyframe_get_pycode(&callee_frame) };
-        let callee_nlocals = callee_code.varnames.len();
+        // pyframe.py:111: nlocals + ncellvars + nfreevars = stack base
+        let callee_nlocals =
+            callee_code.varnames.len() + pyre_interpreter::pyframe::ncells(callee_code);
         let caller_namespace = caller_namespace_ptr;
         let callee_globals = unsafe { function_get_globals(concrete_callable) };
         let can_skip_traced_callee_frame = !is_self_recursive
@@ -3236,21 +3286,29 @@ impl MIFrame {
             sym.jitcode = jitcode_for(w_code);
             sym.concrete_namespace = callee_globals as *mut PyNamespace;
             sym.concrete_execution_context = self.sym().concrete_execution_context;
-            let (vable_next_instr, vable_code, vable_valuestackdepth, vable_namespace) = self
-                .with_ctx(|_, ctx| {
-                    // w_code and callee_globals are PyObjectRef pointers;
-                    // tag them as Ref so the typed constant pool dedupes
-                    // them with any other Ref reference to the same address.
-                    (
-                        ctx.const_int(0),
-                        ctx.const_ref(w_code as i64),
-                        ctx.const_int(callee_nlocals as i64),
-                        ctx.const_ref(callee_globals as i64),
-                    )
-                });
+            let (
+                vable_next_instr,
+                vable_code,
+                vable_valuestackdepth,
+                vable_debugdata,
+                vable_lastblock,
+                vable_namespace,
+            ) = self.with_ctx(|_, ctx| {
+                let null = ctx.const_ref(pyre_object::PY_NULL as i64);
+                (
+                    ctx.const_int(0),
+                    ctx.const_ref(w_code as i64),
+                    ctx.const_int(callee_nlocals as i64),
+                    null, // debugdata = None
+                    null, // lastblock = None
+                    ctx.const_ref(callee_globals as i64),
+                )
+            });
             sym.vable_next_instr = vable_next_instr;
             sym.vable_code = vable_code;
             sym.vable_valuestackdepth = vable_valuestackdepth;
+            sym.vable_debugdata = vable_debugdata;
+            sym.vable_lastblock = vable_lastblock;
             sym.vable_namespace = vable_namespace;
             (sym, None)
         } else {
@@ -3334,6 +3392,8 @@ impl MIFrame {
                 s.vable_next_instr,
                 s.vable_code,
                 s.vable_valuestackdepth,
+                s.vable_debugdata,
+                s.vable_lastblock,
                 s.vable_namespace,
             ];
             fa.extend_from_slice(&my_active_boxes);
@@ -3427,21 +3487,25 @@ impl MIFrame {
                         let callee_code_ptr =
                             unsafe { pyre_interpreter::get_pycode(concrete_callable) };
                         let callee_nlocals = unsafe {
-                            (&*(callee_code_ptr as *const pyre_interpreter::CodeObject))
-                                .varnames
-                                .len()
+                            let code = &*(callee_code_ptr as *const pyre_interpreter::CodeObject);
+                            // pyframe.py:111: nlocals + ncellvars + nfreevars
+                            code.varnames.len() + pyre_interpreter::pyframe::ncells(code)
                         };
                         let callee_ns_ptr = unsafe { function_get_globals(concrete_callable) };
-                        let first_array_slot = 1 + 4; // frame + 4 scalars
+                        // interp_jit.py:25-31: 6 scalar fields + frame = 7 slots
+                        let first_array_slot = 1 + 6; // frame + 6 scalars
                         // Callee entry overrides: next_instr=0, vsd=nlocals.
+                        // debugdata=0, lastblock=0 (null).
                         // Non-self-recursive also overrides code and namespace.
                         let mut const_overrides = vec![
                             (1, 0),                     // slot 1 = next_instr = 0
                             (3, callee_nlocals as i64), // slot 3 = vsd = nlocals
+                            (4, 0),                     // slot 4 = debugdata = None
+                            (5, 0),                     // slot 5 = lastblock = None
                         ];
                         if !is_self_recursive {
                             const_overrides.push((2, callee_code_ptr as i64)); // slot 2 = code
-                            const_overrides.push((4, callee_ns_ptr as i64)); // slot 4 = namespace
+                            const_overrides.push((6, callee_ns_ptr as i64)); // slot 6 = namespace
                         }
                         let expansion = majit_ir::VableExpansion {
                             scalar_fields: vec![
@@ -3451,6 +3515,8 @@ impl MIFrame {
                                     crate::frame_layout::PYFRAME_VALUESTACKDEPTH_OFFSET,
                                     Type::Int,
                                 ),
+                                (crate::frame_layout::PYFRAME_DEBUGDATA_OFFSET, Type::Ref),
+                                (crate::frame_layout::PYFRAME_LASTBLOCK_OFFSET, Type::Ref),
                                 (crate::frame_layout::PYFRAME_NAMESPACE_OFFSET, Type::Ref),
                             ],
                             array_struct_offset:
@@ -3801,6 +3867,8 @@ impl MIFrame {
                         s.vable_next_instr,
                         s.vable_code,
                         s.vable_valuestackdepth,
+                        s.vable_debugdata,
+                        s.vable_lastblock,
                         s.vable_namespace,
                     ];
                     fa.extend_from_slice(&active_boxes);
@@ -3811,7 +3879,7 @@ impl MIFrame {
                 // pyjitpl.py:2597: capture_resumedata(self.framestack, ...)
                 let __n = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
                 let jitcode_index = unsafe { (*this.sym().jitcode).index } as u32;
-                // fail_arg_types includes header [Ref, Int, Ref, Int, Ref]; snapshot
+                // fail_arg_types includes header; snapshot
                 // needs only the active_boxes portion.
                 let snapshot_types = &fail_arg_types[__n..];
                 let mut frames = vec![majit_trace::recorder::SnapshotFrame {

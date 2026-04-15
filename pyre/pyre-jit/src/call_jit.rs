@@ -2419,7 +2419,17 @@ fn reset_reused_call_frame(frame: &mut PyFrame, args: &[PyObjectRef]) {
     frame.valuestackdepth = frame.stack_base();
     frame.next_instr = 0;
     frame.vable_token = 0;
-    frame.block_stack.clear();
+    // pyframe.py:80-81,86: new frame starts with debugdata=None, lastblock=None
+    if frame.debugdata != 0 {
+        unsafe {
+            drop(Box::from_raw(
+                frame.debugdata as *mut pyre_interpreter::pyframe::FrameDebugData,
+            ))
+        };
+        frame.debugdata = 0;
+    }
+    frame.escaped = false;
+    frame.clear_blocks();
     frame.pending_inline_results.clear();
     frame.pending_inline_resume_pc = None;
 }

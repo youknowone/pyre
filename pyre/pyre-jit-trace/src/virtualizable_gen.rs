@@ -5,8 +5,9 @@
 //! builder, field/array spec constants, and virtualizable hook helpers.
 
 use crate::frame_layout::{
-    PYFRAME_CODE_OFFSET, PYFRAME_LOCALS_CELLS_STACK_OFFSET, PYFRAME_NAMESPACE_OFFSET,
-    PYFRAME_NEXT_INSTR_OFFSET, PYFRAME_VABLE_TOKEN_OFFSET, PYFRAME_VALUESTACKDEPTH_OFFSET,
+    PYFRAME_CODE_OFFSET, PYFRAME_DEBUGDATA_OFFSET, PYFRAME_LASTBLOCK_OFFSET,
+    PYFRAME_LOCALS_CELLS_STACK_OFFSET, PYFRAME_NAMESPACE_OFFSET, PYFRAME_NEXT_INSTR_OFFSET,
+    PYFRAME_VABLE_TOKEN_OFFSET, PYFRAME_VALUESTACKDEPTH_OFFSET,
 };
 use crate::state::PyreJitState;
 use pyre_object::{FIXED_ARRAY_LEN_OFFSET, FIXED_ARRAY_PTR_OFFSET};
@@ -23,12 +24,17 @@ majit_macros::virtualizable! {
     // Scalar inputarg fields: included in extract_live / jump_args.
     // Must match `fields` order — RPython includes ALL static fields
     // in unroll_static_fields (virtualizable.py:90-93 read_boxes).
+    // interp_jit.py:25-31: last_instr, pycode, valuestackdepth,
+    //   locals_cells_stack_w[*], debugdata, lastblock, w_globals
     // Layout: [frame:Ref, next_instr:Int, code:Ref, valuestackdepth:Int,
-    //          namespace:Ref, array[0..len(lst)]:Ref]
+    //          debugdata:Ref, lastblock:Ref, namespace:Ref,
+    //          array[0..len(lst)]:Ref]
     inputargs = {
         next_instr: Int,
         code: Ref,
         valuestackdepth: Int,
+        debugdata: Ref,
+        lastblock: Ref,
         namespace: Ref,
     },
 
@@ -36,10 +42,13 @@ majit_macros::virtualizable! {
     array_item_type = Ref,
 
     // VirtualizableInfo field layout (byte offsets)
+    // interp_jit.py:25-31 order (excluding array field)
     fields = {
         next_instr: int @ PYFRAME_NEXT_INSTR_OFFSET,
         code: ref @ PYFRAME_CODE_OFFSET,
         valuestackdepth: int @ PYFRAME_VALUESTACKDEPTH_OFFSET,
+        debugdata: ref @ PYFRAME_DEBUGDATA_OFFSET,
+        lastblock: ref @ PYFRAME_LASTBLOCK_OFFSET,
         namespace: ref @ PYFRAME_NAMESPACE_OFFSET,
     },
 

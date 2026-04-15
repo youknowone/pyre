@@ -4,8 +4,7 @@
 //! local variables, and instruction pointer. The JIT virtualizes
 //! these fields so they live in registers instead of memory.
 
-use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::rc::Rc;
 
 use crate::CodeObject;
@@ -66,12 +65,17 @@ pub struct PyFrame {
     /// Raw pointer to the shared globals namespace object.
     /// All frames in the same module share the same globals.
     pub namespace: *mut PyNamespace,
+    /// pyframe.py:82 debugdata — pointer to FrameDebugData or null.
+    /// Virtualizable static field (interp_jit.py:28).
+    pub debugdata: usize,
+    /// pyframe.py:86 lastblock — pointer to top Block or null.
+    /// Virtualizable static field (interp_jit.py:29).
+    pub lastblock: usize,
     /// Virtualizable token — set by JIT when this frame is virtualized.
     /// 0 = not virtualized, nonzero = pointer to JIT state.
     pub vable_token: usize,
-    /// Exception handler block stack (PyPy: lastblock linked list).
-    /// NOT repr(C)-visible to JIT — stored after vable_token.
-    pub block_stack: Vec<Block>,
+    /// pyframe.py:80 escaped — see mark_as_escaped()
+    pub escaped: bool,
     /// Concrete inline-trace replay results owned by this frame.
     ///
     /// PyPy's `finishframe()` writes each child result into the parent in
@@ -134,6 +138,47 @@ impl Drop for PyFrame {
             unsafe { dealloc_array_with_gc_header(self.locals_cells_stack_w) };
             self.locals_cells_stack_w = std::ptr::null_mut();
         }
+        self.clear_blocks();
+        if self.debugdata != 0 {
+            unsafe { drop(Box::from_raw(self.debugdata as *mut FrameDebugData)) };
+            self.debugdata = 0;
+        }
+    }
+}
+
+impl PyFrame {
+    /// Free all blocks in the linked list.
+    pub fn clear_blocks(&mut self) {
+        while self.lastblock != 0 {
+            let node = unsafe { Box::from_raw(self.lastblock as *mut Block) };
+            self.lastblock = node.previous;
+        }
+    }
+
+    /// Deep-clone debugdata for snapshot/generator.
+    pub fn clone_debugdata(&self) -> usize {
+        if self.debugdata == 0 {
+            return 0;
+        }
+        let src = unsafe { &*(self.debugdata as *const FrameDebugData) };
+        let copy = Box::new(*src);
+        Box::into_raw(copy) as usize
+    }
+
+    /// Deep-clone the block linked list for snapshot/generator.
+    pub fn clone_blocks(&self) -> usize {
+        let list = self.get_blocklist();
+        let mut head: usize = 0;
+        // Rebuild in reverse (get_blocklist returns head-first)
+        for block in list.iter().rev() {
+            let node = Box::new(Block {
+                handler: block.handler,
+                level: block.level,
+                previous: head,
+            });
+            head = Box::into_raw(node) as usize;
+        }
+        head
     }
 }
 
@@ -160,47 +205,58 @@ pub unsafe fn pyframe_get_pycode(frame: &PyFrame) -> *const CodeObject {
     crate::w_code_get_ptr(frame.code as pyre_object::PyObjectRef) as *const CodeObject
 }
 
+/// pyframe.py:34-49 FrameDebugData
 #[derive(Clone, Copy)]
 pub struct FrameDebugData {
-    w_locals: *mut PyNamespace,
-    w_globals: *mut PyNamespace,
-    w_f_trace: PyObjectRef,
-    is_being_profiled: bool,
-    is_in_line_tracing: bool,
-    instr_lb: usize,
-    instr_ub: usize,
-    instr_prev_plus_one: usize,
-    f_lineno: usize,
-    escaped: bool,
+    /// pyframe.py:37
+    pub w_f_trace: PyObjectRef,
+    /// pyframe.py:38
+    pub instr_prev_plus_one: usize,
+    /// pyframe.py:39
+    pub f_lineno: usize,
+    /// pyframe.py:40
+    pub is_being_profiled: bool,
+    /// pyframe.py:41
+    pub is_in_line_tracing: bool,
+    /// pyframe.py:42
+    pub f_trace_lines: bool,
+    /// pyframe.py:43
+    pub f_trace_opcodes: bool,
+    /// pyframe.py:44
+    pub w_locals: *mut PyNamespace,
+    /// pyframe.py:45
+    pub hidden_operationerr: PyObjectRef,
+    /// pyframe.py:49 — set in __init__ from pycode.w_globals
+    pub w_globals: *mut PyNamespace,
 }
 
 impl Default for FrameDebugData {
     fn default() -> Self {
         Self {
-            w_locals: std::ptr::null_mut(),
-            w_globals: std::ptr::null_mut(),
             w_f_trace: pyre_object::PY_NULL,
-            is_being_profiled: false,
-            is_in_line_tracing: false,
-            instr_lb: 0,
-            instr_ub: 0,
             instr_prev_plus_one: 0,
             f_lineno: 0,
-            escaped: false,
+            is_being_profiled: false,
+            is_in_line_tracing: false,
+            f_trace_lines: true,
+            f_trace_opcodes: false,
+            w_locals: std::ptr::null_mut(),
+            hidden_operationerr: pyre_object::PY_NULL,
+            w_globals: std::ptr::null_mut(),
         }
     }
 }
 
-thread_local! {
-    static FRAME_DEBUG: RefCell<HashMap<usize, FrameDebugData>> = RefCell::new(HashMap::new());
-}
-
-/// Exception handler block — pushed by SETUP_FINALLY/SETUP_EXCEPT, popped by POP_BLOCK.
-/// PyPy equivalent: pyframe.py Block classes (ExceptBlock, FinallyBlock).
+/// pyopcode.py:1875-1897 FrameBlock — linked list node for the block stack.
+/// `previous` forms a singly-linked list; `lastblock` in PyFrame is the head.
 #[derive(Debug, Clone, Copy)]
 pub struct Block {
+    /// pyopcode.py:1882 handlerposition
     pub handler: usize,
+    /// pyopcode.py:1881 valuestackdepth
     pub level: usize,
+    /// pyopcode.py:1884 previous — raw pointer to the previous Block (0 = None).
+    pub previous: usize,
 }
 
 #[inline]
@@ -234,7 +290,11 @@ pub fn unpickle_block(_space: PyObjectRef, w_tup: PyObjectRef) -> Block {
         })
     }
     .unwrap_or(0);
-    Block { handler, level }
+    Block {
+        handler,
+        level,
+        previous: 0,
+    }
 }
 
 // ── Virtualizable field offsets ───────────────────────────────────────
@@ -258,6 +318,12 @@ pub const PYFRAME_VALUESTACKDEPTH_OFFSET: usize = std::mem::offset_of!(PyFrame, 
 /// Byte offset of `locals_cells_stack_w` in `PyFrame`.
 pub const PYFRAME_LOCALS_CELLS_STACK_OFFSET: usize =
     std::mem::offset_of!(PyFrame, locals_cells_stack_w);
+
+/// Byte offset of `debugdata` in `PyFrame`.
+pub const PYFRAME_DEBUGDATA_OFFSET: usize = std::mem::offset_of!(PyFrame, debugdata);
+
+/// Byte offset of `lastblock` in `PyFrame`.
+pub const PYFRAME_LASTBLOCK_OFFSET: usize = std::mem::offset_of!(PyFrame, lastblock);
 
 // Backward-compat aliases used by JIT code.
 pub const PYFRAME_STACK_DEPTH_OFFSET: usize = PYFRAME_VALUESTACKDEPTH_OFFSET;
@@ -284,69 +350,22 @@ pub fn ncells(code: &CodeObject) -> usize {
 }
 
 impl PyFrame {
+    /// pyframe.py:121 getdebug → self.debugdata
     #[inline]
-    fn debug_key(&self) -> usize {
-        self as *const Self as usize
+    pub fn getdebug(&self) -> *mut FrameDebugData {
+        self.debugdata as *mut FrameDebugData
     }
 
+    /// pyframe.py:124 getorcreatedebug
     #[inline]
-    fn with_debug_data<R>(
-        &self,
-        create: bool,
-        op: impl FnOnce(&mut FrameDebugData) -> R,
-    ) -> Option<R> {
-        let key = self.debug_key();
-        FRAME_DEBUG.with(|cell| {
-            let mut table = cell.borrow_mut();
-            let entry = if create {
-                table.entry(key).or_insert(FrameDebugData {
-                    w_locals: self.namespace,
-                    w_globals: self.namespace,
-                    f_lineno: 0,
-                    w_f_trace: pyre_object::PY_NULL,
-                    is_being_profiled: false,
-                    is_in_line_tracing: false,
-                    instr_lb: 0,
-                    instr_ub: 0,
-                    instr_prev_plus_one: 0,
-                    escaped: false,
-                })
-            } else {
-                table.get_mut(&key)?
-            };
-            if entry.w_locals.is_null() {
-                entry.w_locals = self.class_locals;
-            }
-            if entry.w_locals.is_null() {
-                entry.w_locals = self.namespace;
-            }
-            if entry.w_globals.is_null() {
-                entry.w_globals = self.namespace;
-            }
-            Some(op(entry))
-        })
-    }
-
-    #[inline]
-    fn getdebug_data(&self) -> Option<FrameDebugData> {
-        self.with_debug_data(false, |data| *data)
-    }
-
-    #[inline]
-    fn getorcreate_debug_data(&self) -> FrameDebugData {
-        self.with_debug_data(true, |data| *data).unwrap_or_default()
-    }
-
-    /// PyPy-compatible `getdebug()`.
-    #[inline]
-    pub fn getdebug(&self) -> Option<FrameDebugData> {
-        self.getdebug_data()
-    }
-
-    /// PyPy-compatible `getorcreatedebug()`.
-    #[inline]
-    pub fn getorcreatedebug(&mut self) -> FrameDebugData {
-        self.getorcreate_debug_data()
+    pub fn getorcreatedebug(&mut self) -> &mut FrameDebugData {
+        if self.debugdata == 0 {
+            // pyframe.py:124-127: FrameDebugData(self.pycode, init_lineno=-1)
+            let mut dd = Box::new(FrameDebugData::default());
+            dd.w_globals = self.namespace; // pyframe.py:49
+            self.debugdata = Box::into_raw(dd) as usize;
+        }
+        unsafe { &mut *(self.debugdata as *mut FrameDebugData) }
     }
 
     /// PyPy-compatible alias for `code()`.
@@ -361,51 +380,58 @@ impl PyFrame {
         self.code()
     }
 
-    /// PyPy-compatible frame stack alias for locals/cell locals conversion.
+    /// pyframe.py:129 get_w_globals
     #[inline]
     pub fn get_w_globals(&self) -> *mut PyNamespace {
-        self.getdebug_data()
-            .map_or(self.namespace, |data| data.w_globals)
+        let dd = self.getdebug();
+        if !dd.is_null() {
+            let w = unsafe { (*dd).w_globals };
+            if !w.is_null() {
+                return w;
+            }
+        }
+        self.namespace
     }
 
-    /// PyPy-compatible `get_w_f_trace()`.
+    /// pyframe.py:135 get_w_f_trace
     #[inline]
     pub fn get_w_f_trace(&self) -> PyObjectRef {
-        self.getdebug_data()
-            .and_then(|data| {
-                if data.w_f_trace.is_null() {
-                    None
-                } else {
-                    Some(data.w_f_trace)
-                }
-            })
-            .unwrap_or(pyre_object::PY_NULL)
+        let dd = self.getdebug();
+        if !dd.is_null() {
+            return unsafe { (*dd).w_f_trace };
+        }
+        pyre_object::PY_NULL
     }
 
-    /// PyPy-compatible `get_is_being_profiled()`.
+    /// pyframe.py:141 get_is_being_profiled
     #[inline]
     pub fn get_is_being_profiled(&self) -> bool {
-        self.getdebug_data()
-            .is_some_and(|data| data.is_being_profiled)
+        let dd = self.getdebug();
+        if !dd.is_null() {
+            return unsafe { (*dd).is_being_profiled };
+        }
+        false
     }
 
-    /// PyPy-compatible `get_w_locals()`.
+    /// pyframe.py:147 get_w_locals
     #[inline]
     pub fn get_w_locals(&self) -> *mut PyNamespace {
-        self.getdebug_data()
-            .map_or(std::ptr::null_mut(), |data| data.w_locals)
+        let dd = self.getdebug();
+        if !dd.is_null() {
+            return unsafe { (*dd).w_locals };
+        }
+        std::ptr::null_mut()
     }
 
-    /// PyPy-compatible `getdictscope`.
+    /// pyframe.py:228 getdictscope
     #[inline]
     pub fn getdictscope(&mut self) -> *mut PyNamespace {
-        let namespace = self.get_w_locals();
-        if namespace.is_null() {
-            self.getorcreate_debug_data().w_locals = self.namespace;
-            self.namespace
-        } else {
-            namespace
+        let w_locals = self.get_w_locals();
+        if !w_locals.is_null() {
+            return w_locals;
         }
+        self.getorcreatedebug().w_locals = self.namespace;
+        self.namespace
     }
 
     /// PyPy-compatible `__init__` hook.
@@ -430,7 +456,12 @@ impl PyFrame {
         };
         self.valuestackdepth = unsafe { (&*raw).varnames.len() + ncells(unsafe { &*raw }) };
         self.next_instr = 0;
-        self.block_stack.clear();
+        if self.debugdata != 0 {
+            unsafe { drop(Box::from_raw(self.debugdata as *mut FrameDebugData)) };
+            self.debugdata = 0;
+        }
+        self.escaped = false;
+        self.clear_blocks();
         self.pending_inline_results.clear();
         self.pending_inline_resume_pc = None;
         self.class_locals = std::ptr::null_mut();
@@ -478,10 +509,10 @@ impl PyFrame {
         let _ = _code;
     }
 
-    /// PyPy-compatible `setdictscope`.
+    /// pyframe.py:231 setdictscope
     #[inline]
     pub fn setdictscope(&mut self, w_locals: *mut PyNamespace) {
-        self.getorcreate_debug_data().w_locals = w_locals;
+        self.getorcreatedebug().w_locals = w_locals;
     }
 
     /// Create a minimal frame stub for passing to call dispatch.
@@ -508,8 +539,10 @@ impl PyFrame {
             valuestackdepth: nlocals + ncells,
             next_instr: 0,
             namespace,
+            debugdata: 0,
+            lastblock: 0,
             vable_token: 0,
-            block_stack: Vec::new(),
+            escaped: false,
             pending_inline_results: std::collections::VecDeque::new(),
             pending_inline_resume_pc: None,
             class_locals: std::ptr::null_mut(),
@@ -566,8 +599,10 @@ impl PyFrame {
             valuestackdepth: num_locals + num_cells,
             next_instr: 0,
             namespace,
+            debugdata: 0,
+            lastblock: 0,
             vable_token: 0,
-            block_stack: Vec::new(),
+            escaped: false,
             pending_inline_results: VecDeque::new(),
             pending_inline_resume_pc: None,
             class_locals: std::ptr::null_mut(),
@@ -589,8 +624,10 @@ impl PyFrame {
             valuestackdepth: self.valuestackdepth,
             next_instr: self.next_instr,
             namespace: self.namespace,
+            debugdata: self.clone_debugdata(),
+            lastblock: self.clone_blocks(),
             vable_token: self.vable_token,
-            block_stack: self.block_stack.clone(),
+            escaped: self.escaped,
             pending_inline_results: self.pending_inline_results.clone(),
             pending_inline_resume_pc: self.pending_inline_resume_pc,
             class_locals: self.class_locals,
@@ -802,22 +839,32 @@ impl PyFrame {
         }
     }
 
-    /// PyPy-compatible block-stack helpers.
+    /// pyframe.py:186 append_block
     #[inline]
     pub fn append_block(&mut self, block: Block) {
-        self.block_stack.push(block);
+        let node = Box::new(Block {
+            handler: block.handler,
+            level: block.level,
+            previous: self.lastblock,
+        });
+        self.lastblock = Box::into_raw(node) as usize;
     }
 
-    /// PyPy-compatible block pop helper.
+    /// pyframe.py:190 pop_block
     #[inline]
     pub fn pop_block(&mut self) -> Option<Block> {
-        self.block_stack.pop()
+        if self.lastblock == 0 {
+            return None;
+        }
+        let node = unsafe { Box::from_raw(self.lastblock as *mut Block) };
+        self.lastblock = node.previous;
+        Some(*node)
     }
 
-    /// PyPy-compatible block list check.
+    /// pyframe.py:195 blockstack_non_empty
     #[inline]
     pub fn blockstack_non_empty(&self) -> bool {
-        !self.block_stack.is_empty()
+        self.lastblock != 0
     }
 
     /// PyPy-compatible exception-info unwind helper.
@@ -862,16 +909,26 @@ impl PyFrame {
         let _ = _state;
     }
 
-    /// PyPy-compatible materialized block list.
+    /// pyframe.py:198 get_blocklist — walk linked list, return in reverse order.
     #[inline]
     pub fn get_blocklist(&self) -> Vec<Block> {
-        self.block_stack.iter().rev().copied().collect()
+        let mut lst = Vec::new();
+        let mut ptr = self.lastblock;
+        while ptr != 0 {
+            let block = unsafe { &*(ptr as *const Block) };
+            lst.push(*block);
+            ptr = block.previous;
+        }
+        lst
     }
 
-    /// PyPy-compatible block list restore.
+    /// pyframe.py:207 set_blocklist — rebuild linked list from slice.
     #[inline]
     pub fn set_blocklist(&mut self, lst: &[Block]) {
-        self.block_stack = lst.iter().rev().copied().collect();
+        self.clear_blocks();
+        for block in lst.iter().rev() {
+            self.append_block(*block);
+        }
     }
 
     /// PyPy-compatible execution entrypoint.
@@ -897,10 +954,10 @@ impl PyFrame {
         false
     }
 
-    /// PyPy-compatible `mark_as_escaped`.
+    /// pyframe.py:183 mark_as_escaped
     #[inline]
     pub fn mark_as_escaped(&mut self) {
-        self.getorcreate_debug_data().escaped = true;
+        self.escaped = true;
     }
 
     /// PyPy-compatible `get_builtin`.
@@ -939,16 +996,16 @@ impl PyFrame {
         self.get_w_f_trace()
     }
 
-    /// PyPy-compatible `fset_f_trace`.
+    /// pyframe.py fset_f_trace
     #[inline]
     pub fn fset_f_trace(&mut self, w_trace: PyObjectRef) {
-        self.getorcreate_debug_data().w_f_trace = w_trace;
+        self.getorcreatedebug().w_f_trace = w_trace;
     }
 
-    /// PyPy-compatible `fdel_f_trace`.
+    /// pyframe.py fdel_f_trace
     #[inline]
     pub fn fdel_f_trace(&mut self) {
-        self.getorcreate_debug_data().w_f_trace = pyre_object::PY_NULL;
+        self.getorcreatedebug().w_f_trace = pyre_object::PY_NULL;
     }
 
     /// PyPy-compatible `fget_f_exc_type`.
@@ -981,20 +1038,25 @@ impl PyFrame {
         self.next_instr
     }
 
-    /// PyPy-compatible `fget_f_lineno`.
+    /// pyframe.py fget_f_lineno
     #[inline]
     pub fn fget_f_lineno(&self) -> usize {
         if self.get_w_f_trace().is_null() {
             self.get_last_lineno()
         } else {
-            self.getorcreate_debug_data().f_lineno
+            let dd = self.getdebug();
+            if !dd.is_null() {
+                unsafe { (*dd).f_lineno }
+            } else {
+                0
+            }
         }
     }
 
-    /// PyPy-compatible `fset_f_lineno`.
+    /// pyframe.py fset_f_lineno
     #[inline]
     pub fn fset_f_lineno(&mut self, new_f_lineno: usize) {
-        self.getorcreate_debug_data().f_lineno = new_f_lineno;
+        self.getorcreatedebug().f_lineno = new_f_lineno;
         self.next_instr = new_f_lineno;
     }
 
@@ -1183,8 +1245,10 @@ impl PyFrame {
             valuestackdepth: num_locals + num_cells,
             next_instr: 0,
             namespace: globals,
+            debugdata: 0,
+            lastblock: 0,
             vable_token: 0,
-            block_stack: Vec::new(),
+            escaped: false,
             pending_inline_results: VecDeque::new(),
             pending_inline_resume_pc: None,
             class_locals: std::ptr::null_mut(),

@@ -498,8 +498,9 @@ impl ExecutionContext {
         while !frame.is_null() {
             if is_being_profiled {
                 unsafe {
-                    if let Some(debug) = (&*frame).getdebug() {
-                        let _ = debug;
+                    let debug = (&*frame).getdebug();
+                    if !debug.is_null() {
+                        let _ = &*debug;
                     }
                 }
             }

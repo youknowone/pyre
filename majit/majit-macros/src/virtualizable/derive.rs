@@ -98,7 +98,28 @@ fn parse_vable_attr(tokens_str: &str) -> Option<ParsedVableAttr> {
         }
         return None;
     }
-    // Simple keyword
+    // Simple keyword (possibly with commas for combined: "inputarg, type = ref")
+    if s.contains(',') {
+        let parts: Vec<&str> = s.splitn(2, ',').collect();
+        let keyword = parts[0].trim();
+        let rest = parts.get(1).copied().unwrap_or("");
+        if let Some(role) = parse_vable_role(keyword) {
+            let mut field_type = None;
+            for part in rest.split(',') {
+                let part = part.trim();
+                if let Some((key, val)) = part.split_once('=') {
+                    if key.trim() == "type" {
+                        field_type = Some(val.trim().to_string());
+                    }
+                }
+            }
+            return Some(ParsedVableAttr {
+                role,
+                static_field_index: None,
+                field_type,
+            });
+        }
+    }
     parse_vable_role(s).map(|role| ParsedVableAttr {
         role,
         static_field_index: None,

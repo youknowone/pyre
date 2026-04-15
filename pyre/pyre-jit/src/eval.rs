@@ -3405,6 +3405,20 @@ fn build_resumed_frames(
                 "[jit][consume_vable_info] write_from_resume_data_partial on frame {:?}",
                 vable_frame_ptr,
             );
+            if !vable_frame_ptr.is_null() {
+                let f = unsafe { &*vable_frame_ptr };
+                eprintln!(
+                    "[jit][consume_vable_info] frame after write: ni={} vsd={} code={:?} ns={:?} debugdata={} lastblock={} vable_token={} array_len={}",
+                    f.next_instr,
+                    f.valuestackdepth,
+                    f.code,
+                    f.namespace,
+                    f.debugdata,
+                    f.lastblock,
+                    f.vable_token,
+                    f.locals_w().len(),
+                );
+            }
         }
     }
 

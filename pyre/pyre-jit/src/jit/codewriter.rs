@@ -199,9 +199,10 @@ impl CodeWriter {
         let int_tmp1 = 1u16;
         let op_code_reg = 2u16;
         // jtransform.py: virtualizable field indices for getfield_vable_*
-        // interp_jit.py:25 parity: code=1, namespace=3
+        // interp_jit.py:25-31 / virtualizable_spec.rs parity:
+        //   0=next_instr, 1=code, 2=vsd, 3=debugdata, 4=lastblock, 5=namespace
         const VABLE_CODE_FIELD_IDX: u16 = 1;
-        const VABLE_NAMESPACE_FIELD_IDX: u16 = 3;
+        const VABLE_NAMESPACE_FIELD_IDX: u16 = 5;
 
         // regalloc.py: compile-time stack depth counter — tracks which
         // stack register (stack_base + depth) is the current TOS.

@@ -383,8 +383,9 @@ use crate::descr::{
     w_int_size_descr,
 };
 use crate::frame_layout::{
-    PYFRAME_CODE_OFFSET, PYFRAME_LOCALS_CELLS_STACK_OFFSET, PYFRAME_NAMESPACE_OFFSET,
-    PYFRAME_NEXT_INSTR_OFFSET, PYFRAME_VALUESTACKDEPTH_OFFSET,
+    PYFRAME_CODE_OFFSET, PYFRAME_DEBUGDATA_OFFSET, PYFRAME_LASTBLOCK_OFFSET,
+    PYFRAME_LOCALS_CELLS_STACK_OFFSET, PYFRAME_NAMESPACE_OFFSET, PYFRAME_NEXT_INSTR_OFFSET,
+    PYFRAME_VALUESTACKDEPTH_OFFSET,
 };
 use crate::helpers::{TraceHelperAccess, emit_box_float_inline, emit_trace_bool_value_from_truth};
 
@@ -484,6 +485,10 @@ pub struct PyreSym {
     pub(crate) vable_code: OpRef,
     #[vable(inputarg)]
     pub(crate) vable_valuestackdepth: OpRef,
+    #[vable(inputarg)]
+    pub(crate) vable_debugdata: OpRef,
+    #[vable(inputarg)]
+    pub(crate) vable_lastblock: OpRef,
     #[vable(inputarg)]
     pub(crate) vable_namespace: OpRef,
     pub(crate) symbolic_namespace_slots: std::collections::HashMap<usize, OpRef>,
@@ -1173,7 +1178,10 @@ pub fn concrete_stack_value(frame: usize, abs_idx: usize) -> Option<PyObjectRef>
     arr.as_slice().get(abs_idx).copied()
 }
 
-/// Return nlocals for the given frame (from the unified array's total length and code object).
+/// pyframe.py:111: valuestackdepth = co_nlocals + ncellvars + nfreevars.
+/// Returns the stack base index (nlocals + ncells) for the given frame.
+/// This is the number of non-stack slots in the unified locals_cells_stack_w
+/// array: local variables + cell/free variable slots.
 pub(crate) fn concrete_nlocals(frame: usize) -> Option<usize> {
     let frame_ptr = (frame != 0).then_some(frame as *const u8)?;
     let w_code =
@@ -1185,10 +1193,13 @@ pub(crate) fn concrete_nlocals(frame: usize) -> Option<usize> {
         pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
             as *const pyre_interpreter::CodeObject
     };
-    Some(unsafe { (&(*raw_code).varnames).len() })
+    let code = unsafe { &*raw_code };
+    let nlocals = code.varnames.len();
+    let ncells = pyre_interpreter::pyframe::ncells(code);
+    Some(nlocals + ncells)
 }
 
-/// Return nlocals as the "locals_len" for virtualizable.
+/// Return nlocals+ncells as the "locals_len" for virtualizable.
 pub(crate) fn concrete_locals_len(frame: usize) -> Option<usize> {
     concrete_nlocals(frame)
 }
@@ -1503,16 +1514,19 @@ pub(crate) fn synthesize_fresh_callee_entry_args(
 ) -> Vec<OpRef> {
     // Fresh entry: next_instr=0, valuestackdepth=nlocals (empty stack).
     // virtualizable.py:86: read_boxes reads ALL static fields from the heap.
-    // code and namespace are immutable for the callee — use concrete values.
+    // interp_jit.py:25-31 scalar field order:
+    //   next_instr, code, valuestackdepth, debugdata, lastblock, namespace
+    let null = ctx.const_ref(PY_NULL as i64);
     let mut ca_args = vec![
         callee_frame,
         ctx.const_int(0),                           // next_instr
         ctx.const_ref(callee_code_ptr as i64),      // code
         ctx.const_int(callee_nlocals as i64),       // valuestackdepth
+        null,                                       // debugdata (None)
+        null,                                       // lastblock (None)
         ctx.const_ref(callee_namespace_ptr as i64), // namespace
     ];
     ca_args.extend(args.iter().copied().take(callee_nlocals));
-    let null = ctx.const_ref(PY_NULL as i64);
     while ca_args.len() < crate::virtualizable_gen::NUM_SCALAR_INPUTARGS + callee_nlocals {
         ca_args.push(null);
     }
@@ -1539,6 +1553,8 @@ impl PyreSym {
             vable_next_instr: OpRef::NONE,
             vable_code: OpRef::NONE,
             vable_valuestackdepth: OpRef::NONE,
+            vable_debugdata: OpRef::NONE,
+            vable_lastblock: OpRef::NONE,
             vable_namespace: OpRef::NONE,
             symbolic_namespace_slots: std::collections::HashMap::new(),
             vable_array_base: None,
@@ -2062,6 +2078,26 @@ impl PyreJitState {
             self.write_frame_usize(PYFRAME_NAMESPACE_OFFSET, value),
             "PyreJitState.frame must point to a valid PyFrame"
         );
+    }
+
+    /// pyframe.py:82 debugdata — read from heap frame.
+    pub fn debugdata_as_usize(&self) -> usize {
+        self.read_frame_usize(PYFRAME_DEBUGDATA_OFFSET).unwrap_or(0)
+    }
+
+    /// pyframe.py:82 debugdata — write to heap frame.
+    pub fn set_debugdata(&mut self, value: usize) {
+        let _ = self.write_frame_usize(PYFRAME_DEBUGDATA_OFFSET, value);
+    }
+
+    /// pyframe.py:86 lastblock — read from heap frame.
+    pub fn lastblock_as_usize(&self) -> usize {
+        self.read_frame_usize(PYFRAME_LASTBLOCK_OFFSET).unwrap_or(0)
+    }
+
+    /// pyframe.py:86 lastblock — write to heap frame.
+    pub fn set_lastblock(&mut self, value: usize) {
+        let _ = self.write_frame_usize(PYFRAME_LASTBLOCK_OFFSET, value);
     }
 
     /// Validate that the frame pointer is usable (fields readable, array present).
@@ -2627,6 +2663,8 @@ impl JitState for PyreJitState {
             self.next_instr(),
             self.code_as_usize(),
             self.valuestackdepth(),
+            self.debugdata_as_usize(),
+            self.lastblock_as_usize(),
             self.namespace_as_usize(),
             meta.num_locals,
             meta.valuestackdepth,
@@ -2771,7 +2809,9 @@ impl JitState for PyreJitState {
                 1 => sym.vable_next_instr = resolved,
                 2 => sym.vable_code = resolved,
                 3 => sym.vable_valuestackdepth = resolved,
-                4 => sym.vable_namespace = resolved,
+                4 => sym.vable_debugdata = resolved,
+                5 => sym.vable_lastblock = resolved,
+                6 => sym.vable_namespace = resolved,
                 _ => {
                     let off = i - num_scalars;
                     if off < nlocals {
@@ -2798,8 +2838,8 @@ impl JitState for PyreJitState {
         // pyre's start_bridge_tracing calls initialize_sym() (which runs
         // init_symbolic) BEFORE setup_bridge_sym, so init_symbolic sees
         // bridge_local_oprefs == None and falls into the vable_array_base
-        // branch (init_vable_indices hard-codes vable_array_base = 5 for
-        // pyre's 5-slot virtualizable header). That branch produces
+        // branch (init_vable_indices hard-codes vable_array_base = 7 for
+        // pyre's 7-slot virtualizable header). That branch produces
         // OpRef(base+i) values from the PARENT trace's namespace, leaving
         // stale parent OpRefs in symbolic_locals after we set
         // bridge_local_oprefs here.
@@ -2820,7 +2860,7 @@ impl JitState for PyreJitState {
             types.resize(sym.nlocals, Type::Ref);
             types
         };
-        // The bridge inputs do NOT have the 5-slot scalar header that
+        // The bridge inputs do NOT have the 7-slot scalar header that
         // init_vable_indices assumes. Clear vable_array_base so any later
         // LOAD_FAST falling through to the vable_array_base branch uses
         // the heap-array path instead of synthesizing parent OpRefs.
@@ -4824,7 +4864,11 @@ mod tests {
         sym.nlocals = 1;
         sym.valuestackdepth = 3;
         sym.vable_next_instr = ctx.const_int(12);
+        sym.vable_code = ctx.const_ref(0);
         sym.vable_valuestackdepth = ctx.const_int(1);
+        sym.vable_debugdata = ctx.const_ref(0);
+        sym.vable_lastblock = ctx.const_ref(0);
+        sym.vable_namespace = ctx.const_ref(0);
         sym.symbolic_locals = vec![local0];
         sym.symbolic_local_types = vec![Type::Ref];
         sym.symbolic_stack = vec![stack0, stack1];
@@ -4874,7 +4918,11 @@ mod tests {
         sym.nlocals = 1;
         sym.valuestackdepth = 2;
         sym.vable_next_instr = ctx.const_int(33);
+        sym.vable_code = ctx.const_ref(0);
         sym.vable_valuestackdepth = ctx.const_int(0);
+        sym.vable_debugdata = ctx.const_ref(0);
+        sym.vable_lastblock = ctx.const_ref(0);
+        sym.vable_namespace = ctx.const_ref(0);
         sym.symbolic_locals = vec![OpRef::NONE];
         sym.symbolic_local_types = vec![Type::Ref];
         sym.symbolic_stack = vec![OpRef::NONE];
@@ -4929,6 +4977,8 @@ mod tests {
         sym.vable_next_instr = ctx.const_int(33);
         sym.vable_code = code_ref;
         sym.vable_valuestackdepth = ctx.const_int(3);
+        sym.vable_debugdata = ctx.const_ref(0);
+        sym.vable_lastblock = ctx.const_ref(0);
         sym.vable_namespace = namespace_ref;
         sym.symbolic_locals = vec![local0];
         sym.symbolic_local_types = vec![Type::Ref];

@@ -163,8 +163,8 @@ pub fn handle_exception(frame: &mut PyFrame, err: &PyError) -> bool {
         return true;
     }
 
-    // Fallback: block_stack (old-style SETUP_FINALLY/SETUP_EXCEPT)
-    if let Some(block) = frame.block_stack.pop() {
+    // Fallback: lastblock linked list (old-style SETUP_FINALLY/SETUP_EXCEPT)
+    if let Some(block) = frame.pop_block() {
         while frame.valuestackdepth > block.level {
             frame.pop();
         }
@@ -930,9 +930,10 @@ impl OpcodeStepExecutor for PyFrame {
     // ── Exception handling ──
 
     fn setup_finally(&mut self, handler: usize) -> Result<(), Self::Error> {
-        self.block_stack.push(crate::pyframe::Block {
+        self.append_block(crate::pyframe::Block {
             handler,
             level: self.valuestackdepth,
+            previous: 0,
         });
         Ok(())
     }
@@ -942,7 +943,7 @@ impl OpcodeStepExecutor for PyFrame {
     }
 
     fn pop_block(&mut self) -> Result<(), Self::Error> {
-        self.block_stack.pop();
+        self.pop_block();
         Ok(())
     }
 
@@ -1486,7 +1487,9 @@ impl OpcodeStepExecutor for PyFrame {
             gen_frame.locals_w_mut()[i] = self.locals_w()[i];
         }
         gen_frame.valuestackdepth = self.valuestackdepth;
-        gen_frame.block_stack = self.block_stack.clone();
+        gen_frame.lastblock = self.clone_blocks();
+        gen_frame.debugdata = self.clone_debugdata();
+        gen_frame.escaped = self.escaped;
 
         let frame_ptr = Box::into_raw(Box::new(gen_frame)) as *mut u8;
         let generator = pyre_object::generatorobject::w_generator_new(frame_ptr);
