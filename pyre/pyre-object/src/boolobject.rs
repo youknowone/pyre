@@ -67,6 +67,37 @@ pub fn w_bool_from(value: bool) -> PyObjectRef {
     }
 }
 
+// ── W_BoolObject.descr_and/or/xor (boolobject.py:54-76) ──────────────
+//
+// PyPy _make_bitwise_binop:
+//     def descr_binop(self, space, w_other):
+//         if not isinstance(w_other, W_BoolObject):
+//             return int_op(self, space, w_other)
+//         a = bool(self.intval)
+//         b = bool(w_other.intval)
+//         return space.newbool(op(a, b))
+//
+// The `isinstance(self, W_BoolObject)` dispatch happens on the caller
+// side (space.and_) — these helpers assume both operands are bool.
+
+/// boolobject.py:74 descr_and — both operands W_BoolObject.
+#[inline]
+pub unsafe fn bool_descr_and(a: PyObjectRef, b: PyObjectRef) -> PyObjectRef {
+    unsafe { w_bool_from(w_bool_get_value(a) & w_bool_get_value(b)) }
+}
+
+/// boolobject.py:75 descr_or — both operands W_BoolObject.
+#[inline]
+pub unsafe fn bool_descr_or(a: PyObjectRef, b: PyObjectRef) -> PyObjectRef {
+    unsafe { w_bool_from(w_bool_get_value(a) | w_bool_get_value(b)) }
+}
+
+/// boolobject.py:76 descr_xor — both operands W_BoolObject.
+#[inline]
+pub unsafe fn bool_descr_xor(a: PyObjectRef, b: PyObjectRef) -> PyObjectRef {
+    unsafe { w_bool_from(w_bool_get_value(a) ^ w_bool_get_value(b)) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

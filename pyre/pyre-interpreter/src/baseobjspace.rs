@@ -625,6 +625,12 @@ unsafe fn float_ne(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 /// PyPy: descroperation.py `_binop_impl` →
 ///   1. Try `a.__op__(b)` (forward)
 ///   2. If not found or returns NotImplemented, try `b.__rop__(a)` (reverse)
+///
+/// descroperation.py:432-437 parity: `space.get_and_call_function` raises
+/// OperationError; the NotImplemented return value alone triggers the
+/// fallback. We mirror that by propagating PyError immediately — the
+/// pyre `call_function` shim stashes exceptions in PENDING_CALL_ERROR
+/// so we must consume them via `call_function_impl_result` to match.
 unsafe fn try_instance_binop(a: PyObjectRef, b: PyObjectRef, dunder: &str) -> Option<PyResult> {
     let a_is_inst = is_instance(a);
     let b_is_inst = is_instance(b);
@@ -650,14 +656,13 @@ unsafe fn try_instance_binop(a: PyObjectRef, b: PyObjectRef, dunder: &str) -> Op
         let rdunder = reverse_dunder(dunder).unwrap();
         let w_type = w_instance_get_type(b);
         if let Some(method) = lookup_in_type_where(w_type, rdunder) {
-            crate::call::clear_call_error();
-            let result = crate::call_function(method, &[b, a]);
-            if result.is_null() {
-                if let Some(err) = crate::call::take_call_error() {
-                    return Some(Err(err));
+            match crate::call::call_function_impl_result(method, &[b, a]) {
+                Ok(result) => {
+                    if !is_not_implemented(result) {
+                        return Some(Ok(result));
+                    }
                 }
-            } else if !is_not_implemented(result) {
-                return Some(Ok(result));
+                Err(e) => return Some(Err(e)),
             }
         }
     }
@@ -666,26 +671,24 @@ unsafe fn try_instance_binop(a: PyObjectRef, b: PyObjectRef, dunder: &str) -> Op
     if a_is_inst {
         let w_type = w_instance_get_type(a);
         if let Some(method) = lookup_in_type_where(w_type, dunder) {
-            crate::call::clear_call_error();
-            let result = crate::call_function(method, &[a, b]);
-            if result.is_null() {
-                if let Some(err) = crate::call::take_call_error() {
-                    return Some(Err(err));
+            match crate::call::call_function_impl_result(method, &[a, b]) {
+                Ok(result) => {
+                    if !is_not_implemented(result) {
+                        return Some(Ok(result));
+                    }
                 }
-            } else if !is_not_implemented(result) {
-                return Some(Ok(result));
+                Err(e) => return Some(Err(e)),
             }
         }
         // Also check per-instance attributes (ATTR_TABLE)
         if let Ok(method) = getattr(a, dunder) {
-            crate::call::clear_call_error();
-            let result = crate::call_function(method, &[a, b]);
-            if result.is_null() {
-                if let Some(err) = crate::call::take_call_error() {
-                    return Some(Err(err));
+            match crate::call::call_function_impl_result(method, &[a, b]) {
+                Ok(result) => {
+                    if !is_not_implemented(result) {
+                        return Some(Ok(result));
+                    }
                 }
-            } else if !is_not_implemented(result) {
-                return Some(Ok(result));
+                Err(e) => return Some(Err(e)),
             }
         }
     }
@@ -695,14 +698,13 @@ unsafe fn try_instance_binop(a: PyObjectRef, b: PyObjectRef, dunder: &str) -> Op
         if let Some(rdunder) = reverse_dunder(dunder) {
             let w_type = w_instance_get_type(b);
             if let Some(method) = lookup_in_type_where(w_type, rdunder) {
-                crate::call::clear_call_error();
-                let result = crate::call_function(method, &[b, a]);
-                if result.is_null() {
-                    if let Some(err) = crate::call::take_call_error() {
-                        return Some(Err(err));
+                match crate::call::call_function_impl_result(method, &[b, a]) {
+                    Ok(result) => {
+                        if !is_not_implemented(result) {
+                            return Some(Ok(result));
+                        }
                     }
-                } else if !is_not_implemented(result) {
-                    return Some(Ok(result));
+                    Err(e) => return Some(Err(e)),
                 }
             }
         }
@@ -751,10 +753,12 @@ fn reverse_dunder(dunder: &str) -> Option<&'static str> {
 /// Try to call a unary dunder on an instance.
 ///
 /// PyPy: `ObjSpace.call_function(space.lookup(w_obj, dunder), w_obj)`
+/// The Python-level OperationError must propagate to the caller; use the
+/// Result-returning call path so PENDING_CALL_ERROR is consumed.
 unsafe fn try_instance_unaryop(a: PyObjectRef, dunder: &str) -> Option<PyResult> {
     if is_instance(a) {
         if let Some(method) = lookup(a, dunder) {
-            return Some(Ok(crate::call_function(method, &[a])));
+            return Some(crate::call::call_function_impl_result(method, &[a]));
         }
     }
     None
@@ -1815,7 +1819,13 @@ pub fn and_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     let b = unwrap_cell(b);
     unsafe {
-        if is_int_like(a) && is_int_like(b) {
+        // boolobject.py:74 W_BoolObject.descr_and — both operands bool
+        // → space.newbool(op(a, b)). MRO ensures this runs before the
+        // W_IntObject.descr_and fallback in int_bitand.
+        if is_bool(a) && is_bool(b) {
+            return Ok(pyre_object::bool_descr_and(a, b));
+        }
+        if is_int(a) && is_int(b) {
             return int_bitand(a, b);
         }
         if is_int_or_long(a) && is_int_or_long(b) {
@@ -1860,7 +1870,12 @@ pub fn or_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     let b = unwrap_cell(b);
     unsafe {
-        if is_int_like(a) && is_int_like(b) {
+        // boolobject.py:75 W_BoolObject.descr_or — both operands bool
+        // → space.newbool(op(a, b)).
+        if is_bool(a) && is_bool(b) {
+            return Ok(pyre_object::bool_descr_or(a, b));
+        }
+        if is_int(a) && is_int(b) {
             return int_bitor(a, b);
         }
         if is_int_or_long(a) && is_int_or_long(b) {
@@ -1915,7 +1930,12 @@ pub fn xor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     let b = unwrap_cell(b);
     unsafe {
-        if is_int_like(a) && is_int_like(b) {
+        // boolobject.py:76 W_BoolObject.descr_xor — both operands bool
+        // → space.newbool(op(a, b)).
+        if is_bool(a) && is_bool(b) {
+            return Ok(pyre_object::bool_descr_xor(a, b));
+        }
+        if is_int(a) && is_int(b) {
             return int_bitxor(a, b);
         }
         if is_int_or_long(a) && is_int_or_long(b) {
