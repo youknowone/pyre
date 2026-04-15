@@ -1694,58 +1694,47 @@ impl Assembler386 {
                     self.genop_discard_setfield(op);
                 }
             }
-            // ── GC load / raw load: opassembler.rs emit_op_gcload_regalloc ──
+            // arglocs = [base_loc, ofs_loc, res_loc, imm(nsize)]
             OpCode::GcLoadI
             | OpCode::GcLoadR
             | OpCode::GcLoadF
             | OpCode::RawLoadI
             | OpCode::RawLoadF => {
-                if let (Some(Loc::Reg(base)), Some(ofs_loc), Some(Loc::Reg(dst))) =
-                    (arglocs.first(), arglocs.get(1), result_loc)
-                {
-                    // GcLoadI/R/F: arg[2] = size (negative = signed).
-                    // RawLoadI/F: size from descriptor.
-                    let size = if op.args.len() >= 3 {
-                        self.constants.get(&op.args[2].0).copied().unwrap_or(8)
-                    } else {
-                        op.descr
+                if let (Some(Loc::Reg(base)), Some(ofs_loc)) = (arglocs.first(), arglocs.get(1)) {
+                    let dst = match arglocs.get(2) {
+                        Some(Loc::Reg(r)) => r,
+                        _ => match result_loc {
+                            Some(Loc::Reg(r)) => r,
+                            _ => return,
+                        },
+                    };
+                    let nsize = match arglocs.get(3) {
+                        Some(Loc::Immed(i)) => i.value,
+                        _ => op
+                            .descr
                             .as_ref()
                             .and_then(|d| d.as_array_descr())
                             .map(|ad| {
                                 let s = ad.item_size() as i64;
                                 if ad.is_item_signed() { -s } else { s }
                             })
-                            .unwrap_or(8)
+                            .unwrap_or(8),
                     };
-                    self.emit_op_gcload_regalloc(base, ofs_loc, dst, size);
+                    self.emit_op_gcload_regalloc(base, ofs_loc, dst, nsize);
                 }
             }
             // ── GC store / raw store: opassembler.rs emit_op_gcstore_regalloc ──
+            // arglocs = [value_loc, base_loc, ofs_loc, size_loc]
             OpCode::GcStore | OpCode::RawStore => {
                 if arglocs.len() >= 3 {
-                    if let (Some(Loc::Reg(base)), Some(Loc::Reg(val))) =
-                        (arglocs.first(), arglocs.get(2))
+                    if let (Some(Loc::Reg(val)), Some(Loc::Reg(base))) =
+                        (arglocs.first(), arglocs.get(1))
                     {
-                        // GcStore: arg[3] = size (if present).
-                        // RawStore: size from descriptor.
-                        let size = if arglocs.len() >= 4 {
-                            match &arglocs[3] {
-                                Loc::Immed(i) => i.value.unsigned_abs() as usize,
-                                _ => 8,
-                            }
-                        } else if op.args.len() >= 4 {
-                            self.constants
-                                .get(&op.args[3].0)
-                                .map(|v| v.unsigned_abs() as usize)
-                                .unwrap_or(8)
-                        } else {
-                            op.descr
-                                .as_ref()
-                                .and_then(|d| d.as_array_descr())
-                                .map(|ad| ad.item_size())
-                                .unwrap_or(8)
+                        let size = match arglocs.get(3) {
+                            Some(Loc::Immed(i)) => i.value.unsigned_abs() as usize,
+                            _ => 8,
                         };
-                        self.emit_op_gcstore_regalloc(base, &arglocs[1], val, size);
+                        self.emit_op_gcstore_regalloc(base, &arglocs[2], val, size);
                     }
                 }
             }
@@ -1958,12 +1947,74 @@ impl Assembler386 {
             OpCode::CondCallValueI | OpCode::CondCallValueR => {
                 self.genop_cond_call_value(op);
             }
-            // ── Allocation ──
+            // ── Allocation (raw, when GC rewriter is not active) ──
             OpCode::New => self.genop_new(op),
             OpCode::NewWithVtable => self.genop_new_with_vtable(op),
             OpCode::NewArray | OpCode::NewArrayClear => self.genop_new_array(op),
             OpCode::Newstr => self.genop_newstr(op),
             OpCode::Newunicode => self.genop_newunicode(op),
+            // ── Allocation (rewritten by GC rewriter) ──
+            OpCode::CallMallocNursery => {
+                self.genop_call_malloc_nursery(op, result_loc);
+            }
+            OpCode::CallMallocNurseryVarsizeFrame => {
+                if let Some(Loc::Reg(sizeloc)) = arglocs.first() {
+                    dynasm!(self.mc ; .arch x64 ; mov rdi, Rq(sizeloc.value as u8));
+                }
+                let gcmap_ofs = crate::jitframe::JF_GCMAP_OFS;
+                dynasm!(self.mc ; .arch x64 ; mov QWORD [rbp + gcmap_ofs], 0);
+                dynasm!(self.mc ; .arch x64
+                    ; mov rax, QWORD crate::runner::dynasm_nursery_slowpath as *const () as i64
+                    ; call rax
+                );
+                dynasm!(self.mc ; .arch x64 ; mov QWORD [rbp + gcmap_ofs], 0);
+                if !op.pos.is_none() {
+                    self.store_rax_to_result(op.pos);
+                }
+            }
+            // x86/assembler.py:2567 malloc_cond_varsize parity
+            // arglocs = [lengthloc, imm(itemsize), imm(kind)]
+            OpCode::CallMallocNurseryVarsize => {
+                let base_size = op
+                    .descr
+                    .as_ref()
+                    .and_then(|d| d.as_array_descr())
+                    .map(|ad| ad.base_size())
+                    .unwrap_or(16) as i64;
+                let itemsize = match arglocs.get(1) {
+                    Some(Loc::Immed(i)) => i.value,
+                    _ => 8,
+                };
+                // rdi = base_size, rsi = item_size, rdx = length
+                dynasm!(self.mc ; .arch x64 ; mov rdi, QWORD base_size);
+                dynasm!(self.mc ; .arch x64 ; mov rsi, QWORD itemsize);
+                match arglocs.first() {
+                    Some(Loc::Reg(len_r)) => {
+                        dynasm!(self.mc ; .arch x64 ; mov rdx, Rq(len_r.value as u8));
+                    }
+                    Some(Loc::Immed(len_i)) => {
+                        dynasm!(self.mc ; .arch x64 ; mov rdx, QWORD len_i.value);
+                    }
+                    _ => {
+                        dynasm!(self.mc ; .arch x64 ; xor edx, edx);
+                    }
+                }
+                let gcmap_ofs = crate::jitframe::JF_GCMAP_OFS;
+                dynasm!(self.mc ; .arch x64 ; mov QWORD [rbp + gcmap_ofs], 0);
+                dynasm!(self.mc ; .arch x64
+                    ; mov rax, QWORD crate::runner::dynasm_nursery_slowpath_varsize as *const () as i64
+                    ; call rax
+                );
+                dynasm!(self.mc ; .arch x64 ; mov QWORD [rbp + gcmap_ofs], 0);
+                if !op.pos.is_none() {
+                    self.store_rax_to_result(op.pos);
+                }
+            }
+            OpCode::CheckMemoryError => {}
+            // x86/assembler.py:2438 genop_discard_cond_call_gc_wb
+            OpCode::CondCallGcWb | OpCode::CondCallGcWbArray => {
+                self.emit_write_barrier_fastpath(op, &arglocs);
+            }
             // ── Misc ──
             OpCode::ForceToken => {
                 if let Some(Loc::Reg(r)) = result_loc {
@@ -4346,6 +4397,223 @@ impl Assembler386 {
     // x86/assembler.py:2338 genop_new etc.
     // These require GC runtime support. Emit trap for now.
     // ----------------------------------------------------------------
+
+    /// x86/assembler.py:2438 _write_barrier_fastpath parity.
+    fn emit_write_barrier_fastpath(&mut self, op: &Op, arglocs: &[Loc]) {
+        let wb = match crate::runner::DYNASM_ACTIVE_GC.with(|cell| {
+            cell.borrow()
+                .as_ref()
+                .map(|gc| gc.get_write_barrier_descr())
+        }) {
+            Some(Some(wb)) => wb,
+            _ => return,
+        };
+        let loc_base = match arglocs.first() {
+            Some(Loc::Reg(r)) => *r,
+            _ => return,
+        };
+        let is_array = op.opcode == majit_ir::OpCode::CondCallGcWbArray;
+        let card_marking = is_array && wb.jit_wb_cards_set != 0;
+        let mut mask = wb.jit_wb_if_flag_singlebyte as i64;
+        if card_marking {
+            mask |= wb.jit_wb_cards_set_singlebyte as i64;
+        }
+        mask &= 0xFF;
+        let byteofs = wb.jit_wb_if_flag_byteofs;
+        // x86/assembler.py:2487: TEST byte [base+byteofs], mask
+        dynasm!(self.mc ; .arch x64
+            ; test BYTE [Rq(loc_base.value as u8) + byteofs], mask as i8
+        );
+        let done = self.mc.new_dynamic_label();
+        dynasm!(self.mc ; .arch x64 ; jz =>done);
+
+        if card_marking {
+            // x86/assembler.py:2398-2408: test GCFLAG_CARDS_SET separately
+            let cards_mask = (wb.jit_wb_cards_set_singlebyte as u8) as i8;
+            dynasm!(self.mc ; .arch x64
+                ; test BYTE [Rq(loc_base.value as u8) + byteofs], cards_mask
+            );
+            let card_mark = self.mc.new_dynamic_label();
+            dynasm!(self.mc ; .arch x64 ; jnz =>card_mark);
+
+            // No CARDS_SET yet: call array barrier helper
+            self.emit_wb_helper_call_x86(
+                loc_base,
+                crate::runner::dynasm_write_barrier_from_array as *const () as i64,
+            );
+
+            // Re-check CARDS_SET after helper
+            dynasm!(self.mc ; .arch x64
+                ; test BYTE [Rq(loc_base.value as u8) + byteofs], cards_mask
+                ; jz =>done
+            );
+
+            // Inline card bit set (x86/assembler.py:2398 WriteBarrierSlowPath parity)
+            dynasm!(self.mc ; .arch x64 ; =>card_mark);
+            if let Some(Loc::Reg(loc_index)) = arglocs.get(1) {
+                let shift = (3 + wb.jit_wb_card_page_shift) as i8;
+                // byte_index = ~(index >> (3+page_shift))
+                dynasm!(self.mc ; .arch x64
+                    ; mov rcx, Rq(loc_index.value as u8)
+                    ; shr rcx, shift
+                    ; not rcx
+                );
+                // bit_index = (index >> page_shift) & 7 → set bit
+                let page_shift = wb.jit_wb_card_page_shift as i8;
+                dynasm!(self.mc ; .arch x64
+                    ; mov rax, Rq(loc_index.value as u8)
+                    ; shr rax, page_shift
+                    ; and rax, 7
+                    ; mov rdx, 1
+                    ; shl rdx, cl  // cl = bit_index? no, need rax
+                );
+                // Actually simpler: use BTS instruction
+                // card_byte_ofs = rcx, bit = (index >> page_shift) & 7
+                // Just OR the byte directly
+                dynasm!(self.mc ; .arch x64
+                    ; mov rdx, 1
+                    ; mov r8, Rq(loc_index.value as u8)
+                    ; shr r8, page_shift
+                    ; and r8, 7
+                );
+                // set bit: load byte, or, store
+                dynasm!(self.mc ; .arch x64
+                    ; mov cl, r8b
+                    ; shl dl, cl
+                    ; or BYTE [Rq(loc_base.value as u8) + rcx], dl
+                );
+            }
+        } else {
+            // Non-array: generic barrier
+            self.emit_wb_helper_call_x86(
+                loc_base,
+                crate::runner::dynasm_write_barrier as *const () as i64,
+            );
+        }
+
+        dynasm!(self.mc ; .arch x64 ; =>done);
+    }
+
+    /// _build_wb_slowpath parity: save all GPR + XMM regs, call helper, restore.
+    /// x86/assembler.py:2331-2370 + 2417 (XMM variant).
+    fn emit_wb_helper_call_x86(&mut self, loc_base: crate::regloc::RegLoc, helper: i64) {
+        // Save all caller-saved GPRs
+        dynasm!(self.mc ; .arch x64
+            ; push rax ; push rcx ; push rdx ; push rsi ; push rdi
+            ; push r8 ; push r9 ; push r10 ; push r11
+        );
+        // Save XMM caller-saved (xmm0-xmm15, 16 × 16 bytes = 256 bytes)
+        dynasm!(self.mc ; .arch x64
+            ; sub rsp, 256
+            ; movaps [rsp], xmm0
+            ; movaps [rsp + 16], xmm1
+            ; movaps [rsp + 32], xmm2
+            ; movaps [rsp + 48], xmm3
+            ; movaps [rsp + 64], xmm4
+            ; movaps [rsp + 80], xmm5
+            ; movaps [rsp + 96], xmm6
+            ; movaps [rsp + 112], xmm7
+            ; movaps [rsp + 128], xmm8
+            ; movaps [rsp + 144], xmm9
+            ; movaps [rsp + 160], xmm10
+            ; movaps [rsp + 176], xmm11
+            ; movaps [rsp + 192], xmm12
+            ; movaps [rsp + 208], xmm13
+            ; movaps [rsp + 224], xmm14
+            ; movaps [rsp + 240], xmm15
+        );
+        dynasm!(self.mc ; .arch x64
+            ; mov rdi, Rq(loc_base.value as u8)
+            ; mov rax, QWORD helper
+            ; call rax
+        );
+        // Restore XMM
+        dynasm!(self.mc ; .arch x64
+            ; movaps xmm0, [rsp]
+            ; movaps xmm1, [rsp + 16]
+            ; movaps xmm2, [rsp + 32]
+            ; movaps xmm3, [rsp + 48]
+            ; movaps xmm4, [rsp + 64]
+            ; movaps xmm5, [rsp + 80]
+            ; movaps xmm6, [rsp + 96]
+            ; movaps xmm7, [rsp + 112]
+            ; movaps xmm8, [rsp + 128]
+            ; movaps xmm9, [rsp + 144]
+            ; movaps xmm10, [rsp + 160]
+            ; movaps xmm11, [rsp + 176]
+            ; movaps xmm12, [rsp + 192]
+            ; movaps xmm13, [rsp + 208]
+            ; movaps xmm14, [rsp + 224]
+            ; movaps xmm15, [rsp + 240]
+            ; add rsp, 256
+        );
+        // Restore GPRs
+        dynasm!(self.mc ; .arch x64
+            ; pop r11 ; pop r10 ; pop r9 ; pop r8
+            ; pop rdi ; pop rsi ; pop rdx ; pop rcx ; pop rax
+        );
+    }
+
+    /// x86/assembler.py:2556 malloc_cond parity.
+    fn genop_call_malloc_nursery(&mut self, op: &Op, result_loc: Option<&Loc>) {
+        let size_ref = op.arg(0);
+        let total_size = self
+            .constants
+            .get(&size_ref.0)
+            .copied()
+            .unwrap_or(size_ref.0 as i64);
+        let gc_header_size = majit_gc::header::GcHeader::SIZE as i64;
+        let (nf_addr, nt_addr) = majit_gc::nursery::nursery_global_addrs();
+
+        let nf = nf_addr as i64;
+        let nt = nt_addr as i64;
+
+        // ecx = nursery_free, edx = new nursery_free
+        dynasm!(self.mc ; .arch x64
+            ; mov rcx, QWORD nf
+            ; mov rcx, [rcx]
+            ; lea rdx, [rcx + total_size as i32]
+            ; mov rax, QWORD nt
+            ; cmp rdx, [rax]
+        );
+
+        let slow_path = self.mc.new_dynamic_label();
+        let done = self.mc.new_dynamic_label();
+        dynasm!(self.mc ; .arch x64 ; ja =>slow_path);
+
+        // Fast path: update nursery_free, zero header, compute obj ptr
+        dynasm!(self.mc ; .arch x64
+            ; mov rax, QWORD nf
+            ; mov [rax], rdx
+            ; mov QWORD [rcx], 0       // zero GcHeader
+            ; lea rax, [rcx + gc_header_size as i32]
+        );
+        dynasm!(self.mc ; .arch x64 ; jmp =>done);
+
+        // Slow path: x86/assembler.py:2553 push_gcmap + call
+        dynasm!(self.mc ; .arch x64 ; =>slow_path);
+        let gcmap_ofs = crate::jitframe::JF_GCMAP_OFS;
+        dynasm!(self.mc ; .arch x64 ; mov QWORD [rbp + gcmap_ofs], 0);
+        let slowpath_fn = crate::runner::dynasm_nursery_slowpath as *const () as i64;
+        dynasm!(self.mc ; .arch x64
+            ; mov rdi, QWORD total_size
+            ; mov rax, QWORD slowpath_fn
+            ; call rax
+        );
+        // pop_gcmap
+        dynasm!(self.mc ; .arch x64 ; mov QWORD [rbp + gcmap_ofs], 0);
+
+        dynasm!(self.mc ; .arch x64 ; =>done);
+        if let Some(Loc::Reg(r)) = result_loc {
+            if r.value != 0 {
+                let rv = r.value;
+                dynasm!(self.mc ; .arch x64 ; mov Rq(rv), rax);
+            }
+        }
+        if !op.pos.is_none() {
+            self.store_rax_to_result(op.pos);
+        }
+    }
 
     /// NEW: allocate a fixed-size object. Requires GC runtime.
     /// Emits a trap (UD2/BRK) until GC nursery allocation is wired.

@@ -161,6 +161,7 @@ impl AssemblerARM64 {
     // x86/assembler.py:1746 genop_gc_store — size_loc
 
     /// `size`: byte size (1/2/4/8).
+    /// aarch64/opassembler.py:365 emit_op_gc_store parity.
     pub(crate) fn emit_op_gcstore_regalloc(
         &mut self,
         base: &RegLoc,
@@ -171,12 +172,33 @@ impl AssemblerARM64 {
         match ofs_loc {
             Loc::Immed(i) => {
                 let o = i.value as i32;
-                self.emit_store_sized(base, o, None, val, size);
+                if o < 0 && o >= -256 {
+                    self.emit_stur_sized(base, o, val, size);
+                } else if o < 0 {
+                    // Negative offset outside stur range: load into scratch x16
+                    let scratch = RegLoc::new(16, false);
+                    dynasm!(self.mc ; .arch aarch64
+                        ; movn X(scratch.value), ((!o) as u32) & 0xFFFF
+                    );
+                    self.emit_store_sized(base, 0, Some(&scratch), val, size);
+                } else {
+                    self.emit_store_sized(base, o, None, val, size);
+                }
             }
             Loc::Reg(ofs_r) => {
                 self.emit_store_sized(base, 0, Some(ofs_r), val, size);
             }
             _ => {}
+        }
+    }
+
+    /// Emit a sized store using STUR (unscaled signed offset, ±256 range).
+    fn emit_stur_sized(&mut self, base: &RegLoc, ofs: i32, val: &RegLoc, size: usize) {
+        debug_assert!(ofs >= -256 && ofs < 256);
+        match size {
+            8 => dynasm!(self.mc ; .arch aarch64 ; stur X(val.value), [X(base.value), ofs]),
+            4 => dynasm!(self.mc ; .arch aarch64 ; stur W(val.value), [X(base.value), ofs]),
+            _ => dynasm!(self.mc ; .arch aarch64 ; stur X(val.value), [X(base.value), ofs]),
         }
     }
 
