@@ -436,26 +436,21 @@ impl CodeWriter {
                 }
 
                 // jtransform.py:1877 do_fixed_list_getitem vable case:
-                // portal locals are virtualizable array items.
-                // Phase 5 (vable read) blocked on a bridge-level type
-                // reconciliation gap: parent guards can save locals as
-                // unboxed Int/Float (intbounds-promoted), so on bridge
-                // entry `virtualizable_boxes[flat_idx]` holds Int-typed
-                // OpRefs. Emitting vable_getarrayitem_ref here would pull
-                // those Int OpRefs into Ref registers, poisoning the
-                // optimizer's forwarding chain (optimize_bridge → intbounds
-                // → getintbound sees Ref where Int was declared).
-                //
-                // Resolving Phase 5 requires one of: (a) re-boxing Int
-                // OpRefs at bridge import to keep virtualizable_boxes
-                // uniformly Ref-typed, (b) per-slot type dispatch at
-                // LOAD_FAST (generic bytecode → vable_getarrayitem_i/r/f),
-                // or (c) threading dynamic local type info to the
-                // codewriter. Until then, keep move_r so the blackhole
-                // reads the frame value via its pre-consumed register.
+                // portal locals are virtualizable array items — emit
+                // vable_getarrayitem_ref so the optimizer folds the read
+                // against virtualizable_boxes and the blackhole pulls the
+                // live frame value into stack_base+current_depth on
+                // resume. Non-portal frames keep move_r (no virtualizable
+                // in scope).
                 Instruction::LoadFast { var_num } | Instruction::LoadFastBorrow { var_num } => {
                     let reg = var_num.get(op_arg).as_usize() as u16;
-                    assembler.move_r(stack_base + current_depth, reg);
+                    if is_portal {
+                        assembler
+                            .load_const_i_value(int_tmp0, local_to_vable_slot(reg as usize) as i64);
+                        assembler.vable_getarrayitem_ref(stack_base + current_depth, 0, int_tmp0);
+                    } else {
+                        assembler.move_r(stack_base + current_depth, reg);
+                    }
                     current_depth += 1;
                 }
 
@@ -505,7 +500,10 @@ impl CodeWriter {
                 }
 
                 // Superinstruction: two consecutive LoadFast / LoadFastBorrow.
-                // Phase 5 blocked — see LoadFast comment above.
+                // Plain LoadFast (above) is safely lifted to vable_getarrayitem_ref;
+                // the paired superinstruction is kept on move_r until the
+                // getintbound mismatch seen on nbody/fannkuch when both
+                // halves go through vable_getarrayitem_ref is diagnosed.
                 Instruction::LoadFastBorrowLoadFastBorrow { var_nums }
                 | Instruction::LoadFastLoadFast { var_nums } => {
                     let pair = var_nums.get(op_arg);
