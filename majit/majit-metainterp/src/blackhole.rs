@@ -794,9 +794,6 @@ fn blackhole_with_recovery_layout(
 // (unlike trace IR which only has the traced path).
 // ============================================================================
 
-use crate::jitcode::machine::{
-    call_int_function, eval_binop_f, eval_binop_i, eval_binop_ovf, eval_unary_f, eval_unary_i,
-};
 use crate::jitcode::{
     self, BC_ABORT, BC_ABORT_PERMANENT, BC_ARRAYLEN_VABLE, BC_BRANCH_REG_ZERO, BC_BRANCH_ZERO,
     BC_CALL_ASSEMBLER_FLOAT, BC_CALL_ASSEMBLER_INT, BC_CALL_ASSEMBLER_REF, BC_CALL_ASSEMBLER_VOID,
@@ -815,7 +812,11 @@ use crate::jitcode::{
     BC_RERAISE, BC_RESIDUAL_CALL_VOID, BC_SET_SELECTED, BC_SETARRAYITEM_VABLE_F,
     BC_SETARRAYITEM_VABLE_I, BC_SETARRAYITEM_VABLE_R, BC_SETFIELD_VABLE_F, BC_SETFIELD_VABLE_I,
     BC_SETFIELD_VABLE_R, BC_STORE_DOWN, BC_STORE_STATE_ARRAY, BC_STORE_STATE_FIELD,
-    BC_STORE_STATE_VARRAY, BC_SWAP_STACK, JitArgKind, JitCode, MIFrame, MIFrameStack,
+    BC_STORE_STATE_VARRAY, BC_SWAP_STACK, JitArgKind, JitCode,
+};
+use crate::pyjitpl::{MIFrame, MIFrameStack};
+use crate::pyjitpl::{
+    call_int_function, eval_binop_f, eval_binop_i, eval_binop_ovf, eval_unary_f, eval_unary_i,
 };
 
 // ── BlackholeInterpBuilder: setup_insns infrastructure ──────────────

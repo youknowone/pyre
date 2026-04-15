@@ -11,8 +11,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::flatten::{FlatOp, Label, SSARepr};
 use crate::model::ValueId;
-use crate::passes::flatten::{FlatOp, Label, SSARepr};
 
 /// Compute liveness for a flattened function.
 ///
@@ -277,8 +277,8 @@ impl<'a> Iterator for LivenessIterator<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::flatten::FlatOp;
     use crate::model::{OpKind, SpaceOperation, ValueType};
-    use crate::passes::flatten::FlatOp;
 
     #[test]
     fn basic_liveness() {

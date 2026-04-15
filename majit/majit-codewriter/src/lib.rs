@@ -14,24 +14,31 @@ pub mod assembler;
 pub mod call;
 mod codegen;
 pub mod codewriter;
+pub mod flatten;
 pub mod front;
 pub mod handler_spec;
 pub mod hints;
 pub mod inline;
 pub mod jitcode;
+pub mod jtransform;
 pub mod layout;
 pub mod liveness;
 pub mod model;
 mod parse;
-pub mod passes;
 pub mod regalloc;
 #[cfg(test)]
 mod test_support;
+pub mod translator;
 
 pub use call::{CallDescriptor, StructFieldLayout, StructLayout};
+pub use flatten::{FlatOp, Label, RegKind, SSARepr, flatten, flatten_with_types};
 pub use front::{
     AstGraphOptions, SemanticFunction, SemanticProgram, build_semantic_program,
     build_semantic_program_from_parsed_files,
+};
+pub use jtransform::{
+    CallEffectKind, CallEffectOverride, GraphTransformConfig, GraphTransformResult,
+    VirtualizableFieldDescriptor, rewrite_graph,
 };
 pub use layout::{HeuristicLayoutProvider, LayoutProvider};
 pub use model::{
@@ -41,15 +48,16 @@ pub use model::{
 pub use parse::{
     CallPath, OpcodeDispatchSelector, ParsedInterpreter, find_opcode_dispatch_match, parse_source,
 };
-pub use passes::{
-    AnnotationState, CallEffectKind, CallEffectOverride, ConcreteType, FlatOp,
-    GraphTransformConfig, GraphTransformResult, Label, PipelineConfig, PipelineOpcodeArm,
-    PipelineResult, ProgramPipelineResult, SSARepr, TypeResolutionState,
-    VirtualizableFieldDescriptor, analyze_function, analyze_program, annotate_graph, resolve_types,
-    rewrite_graph,
+pub use translator::annotator::annrpython::{AnnotationState, annotate as annotate_graph};
+pub use translator::pipeline::{
+    PipelineConfig, PipelineOpcodeArm, PipelineResult, ProgramPipelineResult, analyze_function,
+    analyze_program,
 };
+pub use translator::rtyper::rtyper::{ConcreteType, TypeResolutionState, resolve_types};
 
 use serde::{Deserialize, Serialize};
+
+use crate::translator::{annotator::annrpython as annotate, pipeline, rtyper::rtyper as rtype};
 
 /// Configuration for the canonical graph/pipeline analyzer.
 ///
@@ -96,7 +104,7 @@ pub struct MethodInfo {
 }
 
 /// Canonical single-file analysis entry point.
-pub fn analyze_pipeline(source: &str) -> passes::ProgramPipelineResult {
+pub fn analyze_pipeline(source: &str) -> pipeline::ProgramPipelineResult {
     analyze_pipeline_with_config(source, &AnalyzeConfig::default())
 }
 
@@ -104,7 +112,7 @@ pub fn analyze_pipeline(source: &str) -> passes::ProgramPipelineResult {
 pub fn analyze_pipeline_with_config(
     source: &str,
     config: &AnalyzeConfig,
-) -> passes::ProgramPipelineResult {
+) -> pipeline::ProgramPipelineResult {
     analyze_multiple_pipeline_with_config(&[source], config)
 }
 
@@ -112,7 +120,7 @@ pub fn analyze_pipeline_with_config(
 ///
 /// This returns only the graph/pipeline result and is the preferred API for
 /// RPython-like translator consumers.
-pub fn analyze_multiple_pipeline(sources: &[&str]) -> passes::ProgramPipelineResult {
+pub fn analyze_multiple_pipeline(sources: &[&str]) -> pipeline::ProgramPipelineResult {
     analyze_multiple_pipeline_with_config(sources, &AnalyzeConfig::default())
 }
 
@@ -123,7 +131,7 @@ pub fn analyze_multiple_pipeline(sources: &[&str]) -> passes::ProgramPipelineRes
 pub fn analyze_multiple_pipeline_with_config(
     sources: &[&str],
     config: &AnalyzeConfig,
-) -> passes::ProgramPipelineResult {
+) -> pipeline::ProgramPipelineResult {
     let parsed_files: Vec<_> = sources.iter().map(|s| parse::parse_source(s)).collect();
     analyze_pipeline_from_parsed(&parsed_files, config, None)
 }
@@ -137,7 +145,7 @@ pub fn analyze_multiple_pipeline_with_layout(
     sources: &[&str],
     config: &AnalyzeConfig,
     layout_provider: &dyn layout::LayoutProvider,
-) -> passes::ProgramPipelineResult {
+) -> pipeline::ProgramPipelineResult {
     let parsed_files: Vec<_> = sources.iter().map(|s| parse::parse_source(s)).collect();
     analyze_pipeline_from_parsed(&parsed_files, config, Some(layout_provider))
 }
@@ -146,9 +154,9 @@ fn analyze_pipeline_from_parsed(
     parsed_files: &[parse::ParsedInterpreter],
     config: &AnalyzeConfig,
     layout_provider: Option<&dyn layout::LayoutProvider>,
-) -> passes::ProgramPipelineResult {
+) -> pipeline::ProgramPipelineResult {
     let program = front::build_semantic_program_from_parsed_files(parsed_files);
-    let mut pipeline = passes::analyze_program(&program, &config.pipeline);
+    let mut pipeline = pipeline::analyze_program(&program, &config.pipeline);
     let mut canonical_trait_impls = Vec::new();
     let mut canonical_inherent_methods = Vec::new();
     let mut canonical_function_graphs = std::collections::HashMap::new();
@@ -452,9 +460,9 @@ fn build_canonical_opcode_dispatch(
     trait_impls: &[TraitImplInfo],
     inherent_methods: &[parse::InherentMethodInfo],
     function_graphs: &std::collections::HashMap<parse::CallPath, model::FunctionGraph>,
-    pipeline_config: &passes::PipelineConfig,
+    pipeline_config: &pipeline::PipelineConfig,
     call_control: &mut call::CallControl,
-) -> (Vec<passes::PipelineOpcodeArm>, Vec<jitcode::JitCode>) {
+) -> (Vec<pipeline::PipelineOpcodeArm>, Vec<jitcode::JitCode>) {
     let mut opcode_arms = Vec::new();
     let mut receiver_traits = parse::ReceiverTraitBindings::default();
 
@@ -493,7 +501,7 @@ fn build_canonical_opcode_dispatch(
     // snapshot tests / debug dumps keep working. The orthodox pipeline inside
     // `drain_pending_graphs` will recompute its own SSARepr+JitCode below
     // and place the result at `jitcodes[entry_jitcode_index]`.
-    let mut dispatch: Vec<passes::PipelineOpcodeArm> = Vec::with_capacity(opcode_arms.len());
+    let mut dispatch: Vec<pipeline::PipelineOpcodeArm> = Vec::with_capacity(opcode_arms.len());
     for (arm_id, arm) in opcode_arms.into_iter().enumerate() {
         let _resolved_calls = resolve_handler_calls(
             &arm.handler_calls,
@@ -505,13 +513,13 @@ fn build_canonical_opcode_dispatch(
 
         // Parser-level flatten — kept for snapshot tests / debug.
         let flattened = arm.body_graph.as_ref().map(|handler_graph| {
-            let annotations = passes::annotate_graph(handler_graph);
-            let type_state = passes::resolve_types(handler_graph, &annotations);
-            let mut transformer = passes::Transformer::new(&pipeline_config.transform)
+            let annotations = annotate::annotate(handler_graph);
+            let type_state = rtype::resolve_types(handler_graph, &annotations);
+            let mut transformer = jtransform::Transformer::new(&pipeline_config.transform)
                 .with_callcontrol(&mut *call_control)
                 .with_type_state(&type_state);
             let rewritten = transformer.transform(handler_graph);
-            passes::flatten_with_types(&rewritten.graph, &type_state)
+            flatten::flatten_with_types(&rewritten.graph, &type_state)
         });
 
         // Register the arm body in CallControl + reserve a jitcode slot.
@@ -522,7 +530,7 @@ fn build_canonical_opcode_dispatch(
             call_control.get_jitcode(&synthetic_path)
         });
 
-        dispatch.push(passes::PipelineOpcodeArm {
+        dispatch.push(pipeline::PipelineOpcodeArm {
             arm_id,
             selector: arm.selector,
             entry_jitcode_index,
@@ -780,19 +788,19 @@ fn resolve_handler_calls(
 }
 
 /// Generate tracing code directly from the canonical pipeline result.
-pub fn generate_trace_code_from_pipeline(result: &passes::ProgramPipelineResult) -> String {
+pub fn generate_trace_code_from_pipeline(result: &pipeline::ProgramPipelineResult) -> String {
     codegen::generate_from_pipeline(result)
 }
 
 /// Produce a recognition report: how much the pipeline understands.
-pub fn recognition_report(result: &passes::ProgramPipelineResult) -> codegen::RecognitionReport {
+pub fn recognition_report(result: &pipeline::ProgramPipelineResult) -> codegen::RecognitionReport {
     codegen::recognition_report(result)
 }
 pub use codegen::{OpcodeRecognition, RecognitionReport};
 
 /// Generate code from graph pipeline results.
 #[cfg(test)]
-pub fn generate_graph_code(result: &passes::ProgramPipelineResult) -> String {
+pub fn generate_graph_code(result: &pipeline::ProgramPipelineResult) -> String {
     codegen::generate_from_graph(result)
 }
 
@@ -1103,13 +1111,13 @@ mod tests {
         );
 
         // Step 2: graph transform (with virtualizable config)
-        let config = passes::GraphTransformConfig {
-            vable_fields: vec![passes::VirtualizableFieldDescriptor::new(
+        let config = GraphTransformConfig {
+            vable_fields: vec![VirtualizableFieldDescriptor::new(
                 "next_instr",
                 Some("Frame".into()),
                 0,
             )],
-            vable_arrays: vec![passes::VirtualizableFieldDescriptor::new(
+            vable_arrays: vec![VirtualizableFieldDescriptor::new(
                 "locals_w",
                 Some("Frame".into()),
                 0,
@@ -1118,7 +1126,7 @@ mod tests {
         };
 
         let load_fast_graph = &program.functions[0].graph;
-        let result = passes::rewrite_graph(load_fast_graph, &config);
+        let result = rewrite_graph(load_fast_graph, &config);
         assert!(
             result.vable_rewrites > 0,
             "load_fast should have vable rewrites, got notes: {:?}",
@@ -1126,9 +1134,9 @@ mod tests {
         );
 
         // Step 3: flatten the rewritten graph
-        let flattened = passes::flatten_with_types(
+        let flattened = flatten_with_types(
             &result.graph,
-            &passes::resolve_types(&result.graph, &passes::annotate_graph(&result.graph)),
+            &resolve_types(&result.graph, &annotate_graph(&result.graph)),
         );
         eprintln!(
             "load_fast graph ops: {:?}",
@@ -1149,8 +1157,8 @@ mod tests {
         let parsed = parse::parse_source(&source);
         let program = front::build_semantic_program(&parsed);
 
-        let config = passes::PipelineConfig::default();
-        let result = passes::analyze_program(&program, &config);
+        let config = PipelineConfig::default();
+        let result = analyze_program(&program, &config);
 
         eprintln!("=== Graph Pipeline on pyre-interpreter ===");
         eprintln!("Functions analyzed: {}", result.functions.len());
@@ -1226,12 +1234,12 @@ mod tests {
             &AnalyzeConfig {
                 pipeline: PipelineConfig {
                     transform: GraphTransformConfig {
-                        vable_fields: vec![passes::VirtualizableFieldDescriptor::new(
+                        vable_fields: vec![VirtualizableFieldDescriptor::new(
                             "next_instr",
                             Some("Frame".into()),
                             0,
                         )],
-                        vable_arrays: vec![passes::VirtualizableFieldDescriptor::new(
+                        vable_arrays: vec![VirtualizableFieldDescriptor::new(
                             "locals_w",
                             Some("Frame".into()),
                             0,
@@ -1289,12 +1297,12 @@ mod tests {
             &AnalyzeConfig {
                 pipeline: PipelineConfig {
                     transform: GraphTransformConfig {
-                        vable_fields: vec![passes::VirtualizableFieldDescriptor::new(
+                        vable_fields: vec![VirtualizableFieldDescriptor::new(
                             "next_instr",
                             Some("Frame".into()),
                             0,
                         )],
-                        vable_arrays: vec![passes::VirtualizableFieldDescriptor::new(
+                        vable_arrays: vec![VirtualizableFieldDescriptor::new(
                             "locals_w",
                             Some("Frame".into()),
                             0,

@@ -1,3 +1,15 @@
+mod dispatch;
+mod frame;
+
+pub use dispatch::{
+    ClosureRuntime, JitCodeMachine, JitCodeRuntime, JitCodeSym, trace_jitcode,
+    trace_jitcode_with_runtime,
+};
+pub(crate) use dispatch::{
+    call_int_function, eval_binop_f, eval_binop_i, eval_binop_ovf, eval_unary_f, eval_unary_i,
+};
+pub use frame::{MIFrame, MIFrameStack};
+
 use std::collections::{HashMap, HashSet};
 
 use crate::optimizeopt::optimizer::Optimizer;

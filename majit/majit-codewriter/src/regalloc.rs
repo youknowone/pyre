@@ -12,8 +12,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::flatten::RegKind;
 use crate::model::{Block, FunctionGraph, OpKind, Terminator, ValueId};
-use crate::passes::flatten::RegKind;
 
 // ── DependencyGraph (RPython tool/algo/color.py) ──────────────────
 

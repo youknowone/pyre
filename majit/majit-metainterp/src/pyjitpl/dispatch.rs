@@ -7,7 +7,8 @@ use std::marker::PhantomData;
 use majit_backend::JitCellToken;
 use majit_ir::{OpCode, OpRef};
 
-use super::{
+use super::{MIFrame, MIFrameStack};
+use crate::jitcode::{
     BC_ABORT, BC_ABORT_PERMANENT, BC_ARRAYLEN_VABLE, BC_BRANCH_REG_ZERO, BC_BRANCH_ZERO,
     BC_CALL_ASSEMBLER_FLOAT, BC_CALL_ASSEMBLER_INT, BC_CALL_ASSEMBLER_REF, BC_CALL_ASSEMBLER_VOID,
     BC_CALL_FLOAT, BC_CALL_INT, BC_CALL_LOOPINVARIANT_FLOAT, BC_CALL_LOOPINVARIANT_INT,
@@ -27,8 +28,7 @@ use super::{
     BC_RESIDUAL_CALL_VOID, BC_SET_SELECTED, BC_SETARRAYITEM_VABLE_F, BC_SETARRAYITEM_VABLE_I,
     BC_SETARRAYITEM_VABLE_R, BC_SETFIELD_VABLE_F, BC_SETFIELD_VABLE_I, BC_SETFIELD_VABLE_R,
     BC_STORE_DOWN, BC_STORE_STATE_ARRAY, BC_STORE_STATE_FIELD, BC_STORE_STATE_VARRAY,
-    BC_SWAP_STACK, JitArgKind, JitCallArg, JitCallTarget, JitCode, MAX_HOST_CALL_ARITY, MIFrame,
-    MIFrameStack,
+    BC_SWAP_STACK, JitArgKind, JitCallArg, JitCallTarget, JitCode, MAX_HOST_CALL_ARITY,
 };
 use crate::{SymbolicStack, TraceAction, TraceCtx};
 
@@ -1883,10 +1883,14 @@ where
                     arg_types.push(arg_type);
                 }
                 if bytecode == BC_CALL_ASSEMBLER_VOID {
-                    let target = self.frames.current_mut().jitcode.assembler_targets[fn_ptr_idx];
-                    let token = JitCellToken::new(target.token_number);
+                    let (token_number, concrete_ptr) = self
+                        .frames
+                        .current_mut()
+                        .jitcode
+                        .call_assembler_target(fn_ptr_idx);
+                    let token = JitCellToken::new(token_number);
                     ctx.call_assembler_void_typed(&token, &args, &arg_types);
-                    call_void_function(target.concrete_ptr, &concrete_args);
+                    call_void_function(concrete_ptr, &concrete_args);
                 } else {
                     let target = self.frames.current_mut().jitcode.fn_ptrs[fn_ptr_idx];
                     let trace_ptr = if target.trace_ptr.is_null() {
@@ -2155,10 +2159,14 @@ where
                     arg_types.push(arg_type);
                 }
                 if opcode == BC_CALL_ASSEMBLER_INT {
-                    let target = self.frames.current_mut().jitcode.assembler_targets[fn_ptr_idx];
-                    let token = JitCellToken::new(target.token_number);
+                    let (token_number, concrete_ptr) = self
+                        .frames
+                        .current_mut()
+                        .jitcode
+                        .call_assembler_target(fn_ptr_idx);
+                    let token = JitCellToken::new(token_number);
                     let traced = ctx.call_assembler_int_typed(&token, &args, &arg_types);
-                    let concrete = call_int_function(target.concrete_ptr, &concrete_args);
+                    let concrete = call_int_function(concrete_ptr, &concrete_args);
                     self.set_int_reg(dst, Some(traced), Some(concrete));
                 } else {
                     let target = self.frames.current_mut().jitcode.fn_ptrs[fn_ptr_idx];
@@ -2293,10 +2301,14 @@ where
                     arg_types.push(arg_type);
                 }
                 if opcode == BC_CALL_ASSEMBLER_REF {
-                    let target = self.frames.current_mut().jitcode.assembler_targets[fn_ptr_idx];
-                    let token = JitCellToken::new(target.token_number);
+                    let (token_number, concrete_ptr) = self
+                        .frames
+                        .current_mut()
+                        .jitcode
+                        .call_assembler_target(fn_ptr_idx);
+                    let token = JitCellToken::new(token_number);
                     let traced = ctx.call_assembler_ref_typed(&token, &args, &arg_types);
-                    let concrete = call_int_function(target.concrete_ptr, &concrete_args);
+                    let concrete = call_int_function(concrete_ptr, &concrete_args);
                     self.set_ref_reg(dst, Some(traced), Some(concrete));
                 } else {
                     let target = self.frames.current_mut().jitcode.fn_ptrs[fn_ptr_idx];
@@ -2429,10 +2441,14 @@ where
                     arg_types.push(arg_type);
                 }
                 if opcode == BC_CALL_ASSEMBLER_FLOAT {
-                    let target = self.frames.current_mut().jitcode.assembler_targets[fn_ptr_idx];
-                    let token = JitCellToken::new(target.token_number);
+                    let (token_number, concrete_ptr) = self
+                        .frames
+                        .current_mut()
+                        .jitcode
+                        .call_assembler_target(fn_ptr_idx);
+                    let token = JitCellToken::new(token_number);
                     let traced = ctx.call_assembler_float_typed(&token, &args, &arg_types);
-                    let concrete = call_int_function(target.concrete_ptr, &concrete_args);
+                    let concrete = call_int_function(concrete_ptr, &concrete_args);
                     self.set_float_reg(dst, Some(traced), Some(concrete));
                 } else {
                     let target = self.frames.current_mut().jitcode.fn_ptrs[fn_ptr_idx];
@@ -3192,8 +3208,8 @@ fn call_void_function(func_ptr: *const (), args: &[i64]) {
 
 #[cfg(test)]
 mod tests {
-    use super::super::JitCodeBuilder;
     use super::*;
+    use crate::jitcode::JitCodeBuilder;
     use crate::virtualizable::VirtualizableInfo;
     use majit_ir::Type;
 

@@ -11,9 +11,9 @@
 
 use std::collections::HashMap;
 
+use crate::flatten::{FlatOp, Label, RegKind, SSARepr};
 use crate::jitcode::JitCode;
 use crate::model::ValueId;
-use crate::passes::flatten::{FlatOp, Label, RegKind, SSARepr};
 use crate::regalloc::RegAllocResult;
 
 /// Assembler — converts SSARepr to JitCode.

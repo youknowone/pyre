@@ -1,9 +1,6 @@
-mod codewriter;
-mod frame;
-pub(crate) mod machine;
+mod assembler;
 
-pub use codewriter::JitCodeBuilder;
-pub use machine::*;
+pub use assembler::JitCodeBuilder;
 
 use majit_ir::OpCode;
 
@@ -309,6 +306,14 @@ impl JitCode {
         self.c_num_regs_f
     }
 
+    /// Transitional CALL_ASSEMBLER target lookup for the hardcoded
+    /// JitCodeBuilder bytecode. RPython stores the callee loop token in
+    /// descriptor data; this keeps the private compat table encapsulated.
+    pub(crate) fn call_assembler_target(&self, index: usize) -> (u64, *const ()) {
+        let target = self.assembler_targets[index];
+        (target.token_number, target.concrete_ptr)
+    }
+
     /// RPython `jitcode.py:56-57` `def num_regs_and_consts_i(self): return ord(self.c_num_regs_i) + len(self.constants_i)`.
     pub fn num_regs_and_consts_i(&self) -> usize {
         self.c_num_regs_i as usize + self.constants_i.len()
@@ -457,9 +462,6 @@ impl JitCallArg {
 // SAFETY: call targets are function pointers to immutable code.
 unsafe impl Send for JitCode {}
 unsafe impl Sync for JitCode {}
-
-// MIFrame and MIFrameStack are in frame.rs (RPython pyjitpl.py parity).
-pub use frame::{MIFrame, MIFrameStack};
 
 pub(crate) fn read_u8(code: &[u8], cursor: &mut usize) -> u8 {
     let value = *code.get(*cursor).expect("truncated jitcode");

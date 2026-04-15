@@ -9,12 +9,12 @@
 use serde::{Deserialize, Serialize};
 
 use crate::OpcodeDispatchSelector;
+use crate::flatten::{self, SSARepr};
 use crate::front::SemanticFunction;
+use crate::jtransform::{GraphTransformConfig, GraphTransformResult, rewrite_graph};
 use crate::model::FunctionGraph;
-use crate::passes::annotate::{AnnotationState, annotate};
-use crate::passes::flatten::{self, SSARepr};
-use crate::passes::jtransform::{GraphTransformConfig, GraphTransformResult, rewrite_graph};
-use crate::passes::rtype::{TypeResolutionState, resolve_types};
+use crate::translator::annotator::annrpython::{AnnotationState, annotate};
+use crate::translator::rtyper::rtyper::{TypeResolutionState, resolve_types};
 
 /// Configuration for the full analysis pipeline.
 ///
@@ -36,7 +36,7 @@ pub struct PipelineResult {
     pub concrete_types_count: usize,
     pub vable_rewrites: usize,
     pub calls_classified: usize,
-    pub transform_notes: Vec<super::jtransform::GraphTransformNote>,
+    pub transform_notes: Vec<crate::jtransform::GraphTransformNote>,
     /// RPython: the SSARepr produced by flatten_graph().
     pub flattened: SSARepr,
 }
@@ -152,7 +152,7 @@ pub fn analyze_program(
 mod tests {
     use super::*;
     use crate::front;
-    use crate::passes::jtransform::GraphTransformConfig;
+    use crate::jtransform::GraphTransformConfig;
 
     #[test]
     fn pipeline_e2e_simple_function() {
@@ -189,12 +189,12 @@ mod tests {
         let program = front::build_semantic_program(&parsed);
         let config = PipelineConfig {
             transform: GraphTransformConfig {
-                vable_fields: vec![crate::passes::VirtualizableFieldDescriptor::new(
+                vable_fields: vec![crate::jtransform::VirtualizableFieldDescriptor::new(
                     "next_instr",
                     Some("Frame".into()),
                     0,
                 )],
-                vable_arrays: vec![crate::passes::VirtualizableFieldDescriptor::new(
+                vable_arrays: vec![crate::jtransform::VirtualizableFieldDescriptor::new(
                     "locals_w",
                     Some("Frame".into()),
                     0,
@@ -250,8 +250,7 @@ mod tests {
         let has_jump = func.flattened.insns.iter().any(|op| {
             matches!(
                 op,
-                crate::passes::flatten::FlatOp::Jump(_)
-                    | crate::passes::flatten::FlatOp::GotoIfNot { .. }
+                crate::flatten::FlatOp::Jump(_) | crate::flatten::FlatOp::GotoIfNot { .. }
             )
         });
         assert!(has_jump, "flattened fib should have conditional jumps");

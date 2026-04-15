@@ -101,7 +101,7 @@ pub struct JitCode {
     /// flattened SSA representation, kept for `dump()` output. Set by
     /// `Assembler.assemble` (assembler.py:49 `jitcode._ssarepr = ssarepr`).
     #[serde(skip)]
-    pub _ssarepr: Option<crate::passes::flatten::SSARepr>,
+    pub _ssarepr: Option<crate::flatten::SSARepr>,
 }
 
 impl JitCode {
@@ -596,8 +596,8 @@ impl BhDescr {
 ///     ...
 ///     return buf.getvalue()
 /// ```
-pub fn format_assembler(ssarepr: &crate::passes::flatten::SSARepr) -> String {
-    use crate::passes::flatten::FlatOp;
+pub fn format_assembler(ssarepr: &crate::flatten::SSARepr) -> String {
+    use crate::flatten::FlatOp;
     use std::fmt::Write;
 
     let mut out = String::new();

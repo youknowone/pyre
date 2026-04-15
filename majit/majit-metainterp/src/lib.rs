@@ -54,18 +54,16 @@ pub use jit_state::{
     DeoptMaterializationCache, JitState, PendingFieldWriteLayout, ResidualVirtualizableSync,
     ResumeDataResult,
 };
-pub use jitcode::{
-    ClosureRuntime, JitArgKind, JitCallArg, JitCode, JitCodeBuilder, JitCodeMachine,
-    JitCodeRuntime, JitCodeSym, LivenessInfo, MIFrame, MIFrameStack, trace_jitcode,
-    trace_jitcode_with_runtime,
-};
+pub use jitcode::{JitArgKind, JitCallArg, JitCode, JitCodeBuilder, LivenessInfo};
 pub use jitdriver::{DeclarativeJitDriver, JitDriver, JitDriverStaticData};
 pub use majit_backend::CompiledTraceInfo;
 pub use parity::{TraceParityCase, assert_trace_parity, normalize_ops, normalize_trace};
 pub use pyjitpl::{
-    BackEdgeAction, BlackholeRunResult, BridgeRetraceResult, CompileOutcome, CompiledExitLayout,
-    CompiledTerminalExitLayout, CompiledTraceLayout, DeadFrameArtifacts, DetailedDriverRunOutcome,
-    DriverRunOutcome, InlineDecision, JitHooks, JitStats, MetaInterp, RawCompileResult,
+    BackEdgeAction, BlackholeRunResult, BridgeRetraceResult, ClosureRuntime, CompileOutcome,
+    CompiledExitLayout, CompiledTerminalExitLayout, CompiledTraceLayout, DeadFrameArtifacts,
+    DetailedDriverRunOutcome, DriverRunOutcome, InlineDecision, JitCodeMachine, JitCodeRuntime,
+    JitCodeSym, JitHooks, JitStats, MIFrame, MIFrameStack, MetaInterp, RawCompileResult,
+    trace_jitcode, trace_jitcode_with_runtime,
 };
 pub use quasiimmut::QuasiImmut;
 pub use symbolic_stack::SymbolicStack;

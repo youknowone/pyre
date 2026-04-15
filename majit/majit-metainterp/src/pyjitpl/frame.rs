@@ -5,7 +5,7 @@
 /// the call stack of nested inline calls.
 use majit_ir::OpRef;
 
-use super::JitCode;
+use crate::jitcode::{JitCode, read_u8, read_u16};
 
 /// A single execution frame for jitcode bytecode.
 ///
@@ -46,11 +46,11 @@ impl<'a> MIFrame<'a> {
     }
 
     pub fn next_u8(&mut self) -> u8 {
-        super::read_u8(&self.jitcode.code, &mut self.code_cursor)
+        read_u8(&self.jitcode.code, &mut self.code_cursor)
     }
 
     pub fn next_u16(&mut self) -> u16 {
-        super::read_u16(&self.jitcode.code, &mut self.code_cursor)
+        read_u16(&self.jitcode.code, &mut self.code_cursor)
     }
 
     pub fn finished(&self) -> bool {

@@ -1,6 +1,8 @@
 /// JitCodeBuilder — bytecode assembler for JitCode construction.
 ///
-/// RPython codewriter.py: assembler that emits bytecodes into a JitCode object.
+/// RPython codewriter/assembler.py: assembler that emits bytecodes into a
+/// JitCode object. This remains in metainterp only as transitional pyre ABI
+/// glue until callers consume `majit_codewriter::assembler::Assembler`.
 use std::cmp::max;
 
 use majit_backend::JitCellToken;

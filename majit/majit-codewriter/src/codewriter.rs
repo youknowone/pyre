@@ -3,7 +3,7 @@
 //! ```text
 //! rpython/jit/codewriter/          majit-codewriter/src/codewriter/
 //! ├── codewriter.py          →     ├── mod.rs (CodeWriter struct)
-//! ├── jtransform.py          →     ├── (passes/jtransform.rs)
+//! ├── jtransform.py          →     ├── jtransform.rs
 //! ├── flatten.py + assembler.py →  ├── codegen.rs
 //! └── call.py                →     └── (call.rs)
 //! ```
@@ -17,10 +17,10 @@ pub use codegen::{
 
 use crate::assembler::Assembler;
 use crate::call::CallControl;
+use crate::flatten::{RegKind, SSARepr, flatten_with_types};
 use crate::jitcode::JitCode;
+use crate::jtransform::GraphTransformConfig;
 use crate::model::FunctionGraph;
-use crate::passes::GraphTransformConfig;
-use crate::passes::flatten::SSARepr;
 
 /// RPython: `codewriter.py::CodeWriter`.
 ///
@@ -70,13 +70,13 @@ impl CodeWriter {
 
         // Step 0: annotate + rtype (majit-specific)
         // RPython: types are already on Variable.concretetype from the rtyper.
-        let annotations = crate::passes::annotate::annotate(graph);
-        let type_state = crate::passes::rtype::resolve_types(graph, &annotations);
+        let annotations = crate::translator::annotator::annrpython::annotate(graph);
+        let type_state = crate::translator::rtyper::rtyper::resolve_types(graph, &annotations);
 
         // Step 1: jtransform (codewriter.py:42)
         // RPython: transform_graph(graph, cpu, callcontrol, portal_jd)
         let rewritten = {
-            let mut transformer = crate::passes::Transformer::new(config)
+            let mut transformer = crate::jtransform::Transformer::new(config)
                 .with_callcontrol(callcontrol)
                 .with_type_state(&type_state);
             transformer.transform(graph)
@@ -85,13 +85,13 @@ impl CodeWriter {
 
         // Step 2: regalloc (codewriter.py:45-47)
         // RPython: for kind in KINDS: regallocs[kind] = perform_register_allocation(graph, kind)
-        let value_kinds = crate::passes::rtype::build_value_kinds(&type_state);
+        let value_kinds = crate::translator::rtyper::rtyper::build_value_kinds(&type_state);
         let regallocs =
             crate::regalloc::perform_all_register_allocations(&rewritten.graph, &value_kinds);
 
         // Step 3: flatten (codewriter.py:53)
         // RPython: ssarepr = flatten_graph(graph, regallocs, cpu=cpu)
-        let mut ssarepr = crate::passes::flatten::flatten_with_types(&rewritten.graph, &type_state);
+        let mut ssarepr = flatten_with_types(&rewritten.graph, &type_state);
 
         // Step 3b + 4: liveness + assemble (codewriter.py:56,67)
         // RPython: compute_liveness(ssarepr) then assembler.assemble(ssarepr, jitcode, num_regs)
@@ -107,9 +107,9 @@ impl CodeWriter {
             let mut arg_classes = String::new();
             for arg_id in &start_block.inputargs {
                 match ssarepr.value_kinds.get(arg_id) {
-                    Some(crate::passes::flatten::RegKind::Int) => arg_classes.push('i'),
-                    Some(crate::passes::flatten::RegKind::Ref) => arg_classes.push('r'),
-                    Some(crate::passes::flatten::RegKind::Float) => arg_classes.push('f'),
+                    Some(RegKind::Int) => arg_classes.push('i'),
+                    Some(RegKind::Ref) => arg_classes.push('r'),
+                    Some(RegKind::Float) => arg_classes.push('f'),
                     None => arg_classes.push('i'),
                 }
             }
