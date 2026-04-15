@@ -201,6 +201,11 @@ pub trait GcAllocator: Send {
     /// Trigger a full collection.
     fn collect_full(&mut self);
 
+    /// gc.py:268 write_barrier_descr: descriptor for the write barrier check.
+    fn get_write_barrier_descr(&self) -> Option<WriteBarrierDescr> {
+        None
+    }
+
     /// Register a stack/root slot that contains a `GcRef`.
     ///
     /// The pointer must remain valid until removed. Backends use this to
