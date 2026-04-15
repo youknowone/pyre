@@ -23,7 +23,7 @@ path = "src/bin/pyre-dynasm.rs"
 required-features = ["dynasm"]
 
 [features]
-default = ["cranelift"]
+default = ["dynasm"]
 jit = []  # meta feature: enabled by cranelift or dynasm
 cranelift = ["jit", "pyre-jit/cranelift"]
 dynasm = ["jit", "pyre-jit/dynasm"]

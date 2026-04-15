@@ -294,11 +294,10 @@ run_backend_bench() {
     append_comparison "$backend" "$name" "$(fmt_time "$t_cpython")" "$(fmt_time "$t_pypy")" "$(fmt_time "$elapsed")" "(${ratio} vs pypy)"
 }
 
-warmup_bench() {
-    local script="$1" need_cpython="$2"
-    if [ "$need_cpython" = "yes" ]; then
-        python3 "$script" >/dev/null 2>&1 || true
-    fi
+warmup_once() {
+    local script="$1"
+    printf "  %-10s" "warmup"
+    python3 "$script" >/dev/null 2>&1 || true
     pypy3 "$script" >/dev/null 2>&1 || true
     if backend_enabled dynasm; then
         "$DYNASM_PYRE" "$script" >/dev/null 2>&1 || true
@@ -306,6 +305,7 @@ warmup_bench() {
     if backend_enabled cranelift; then
         "$CRANELIFT_PYRE" "$script" >/dev/null 2>&1 || true
     fi
+    printf "%s\n" "$(dim done)"
 }
 
 # run_bench NAME SCRIPT TIMEOUT
@@ -325,9 +325,6 @@ run_bench() {
     fi
 
     echo "  $name"
-    printf "    %-10s" "warmup"
-    warmup_bench "$script" "$need_cpython"
-    printf "%s\n" "$(dim done)"
 
     if [ "$need_cpython" = "yes" ]; then
         printf "    %-10s" "cpython"
@@ -421,6 +418,8 @@ if backend_enabled cranelift; then
     echo "binary[cranelift]: $CRANELIFT_PYRE  timeout-scale: $(backend_timeout_scale cranelift)"
 fi
 echo ""
+warmup_once "$BENCH/int_loop.py"
+echo ""
 
 #                NAME             SCRIPT                         TIMEOUT  DYNASM_VS_CPYTHON  DYNASM_VS_PYPY  CRANELIFT_VS_CPYTHON  CRANELIFT_VS_PYPY
 run_bench       "int_loop"       "$BENCH/int_loop.py"            5       ""                   1.5             ""                      1.5
@@ -438,11 +437,11 @@ run_bench       "nbody"          "$BENCH/nbody_50k.py"           5       11     
 run_bench       "fannkuch"       "$BENCH/fannkuch.py"            5       ""                   ""              ""                      ""
 # list per-strategy ops (Integer strategy stays without boxing on insert/pop/reverse/setslice)
 # PYPYLOG verified: all benchmarks hit guard_class(IntegerListStrategy) + ArrayS 8 ops.
-# Only VS_PYPY is enabled here; empty VS_CPYTHON skips the CPython run.
-run_bench       "list_reverse"   "$BENCH/list_reverse.py"        5       ""                   30              ""                      30
-run_bench       "list_pop_append" "$BENCH/list_pop_append.py"    5       ""                   30              ""                      30
-run_bench       "list_insert"    "$BENCH/list_insert.py"         5       ""                   3               ""                      3
-run_bench       "list_setslice"  "$BENCH/list_setslice.py"       5       ""                   30              ""                      30
+# Keep correctness against PyPy output, but use only CPython performance guards here.
+run_bench       "list_reverse"   "$BENCH/list_reverse.py"        5       7                    ""              7                       ""
+run_bench       "list_pop_append" "$BENCH/list_pop_append.py"    5       10                   ""              10                      ""
+run_bench       "list_insert"    "$BENCH/list_insert.py"         5       ""                   2               ""                      2
+run_bench       "list_setslice"  "$BENCH/list_setslice.py"       5       10                    ""              10                       ""
 
 echo ""
 echo "─────────────────────────────────"
