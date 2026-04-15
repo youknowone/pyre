@@ -139,6 +139,14 @@ pub struct GcCache {
     _cache_arraylen_order: Vec<DescrRef>,
     _cache_call_order: Vec<DescrRef>,
     _cache_interiorfield_order: Vec<DescrRef>,
+
+    /// descr.py:109 + gc.py:536 init_size_descr: dense sequential tid.
+    /// RPython's `heaptracker.register_TYPE` hands out a fresh small
+    /// integer per STRUCT so `guard_class(obj, tid)` can use it as a
+    /// direct slot. We generate the same shape here by allocating
+    /// monotonically on first `get_size_descr` per key — collision-free
+    /// regardless of the caller-supplied LLType key derivation.
+    next_struct_tid: u32,
 }
 
 impl GcCache {
@@ -156,6 +164,8 @@ impl GcCache {
             _cache_arraylen_order: Vec::new(),
             _cache_call_order: Vec::new(),
             _cache_interiorfield_order: Vec::new(),
+            // tid 0 is reserved as "no class" / sentinel.
+            next_struct_tid: 1,
         }
     }
 
@@ -237,11 +247,16 @@ impl GcCache {
     /// `key`: LLType::Struct — STRUCT identity (no vtable in key).
     /// `vtable` is a payload/assertion parameter, not part of the key.
     /// `immutable_flag`: descr.py:112 heaptracker.is_immutable_struct(STRUCT).
+    ///
+    /// The numeric `tid` stored on the returned SizeDescr is allocated
+    /// monotonically from `next_struct_tid` (descr.py:109 +
+    /// gc.py:536 init_size_descr) — caller does not supply it. This
+    /// guarantees dense, collision-free tids per distinct key regardless
+    /// of how the caller derived the `LLType::Struct(u64)` identity.
     pub fn get_size_descr(
         &mut self,
         key: LLType,
         size: usize,
-        type_id: u32,
         vtable: usize,
         immutable_flag: bool,
     ) -> DescrRef {
@@ -249,6 +264,12 @@ impl GcCache {
         if let Some(descr) = self._cache_size.get(&key) {
             return descr.clone();
         }
+        // Fresh tid per distinct key. See field-doc on `next_struct_tid`.
+        let type_id = self.next_struct_tid;
+        self.next_struct_tid = self
+            .next_struct_tid
+            .checked_add(1)
+            .expect("GcCache struct tid overflow (u32)");
         // descr.py:117-118: SizeDescr(size, vtable=vtable, immutable_flag=immutable_flag)
         let mut sd = if vtable != 0 {
             SimpleSizeDescr::with_vtable(u32::MAX, size, type_id, vtable)

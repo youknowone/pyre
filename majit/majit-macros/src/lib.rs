@@ -25,6 +25,7 @@ use syn::{
 };
 
 mod jit_interp;
+mod jit_struct;
 mod virtualizable;
 
 struct JitInlineArgs {
@@ -1322,6 +1323,25 @@ pub fn jit_interp(attr: TokenStream, item: TokenStream) -> TokenStream {
     let config = parse_macro_input!(attr as jit_interp::JitInterpConfig);
     let func = parse_macro_input!(item as ItemFn);
     jit_interp::transform_jit_interp(config, func).into()
+}
+
+/// Register a Rust struct with `majit_ir::descr::GcCache`.
+///
+/// RPython parity: descr.py:105-127 `get_size_descr` + descr.py:218-239
+/// `get_field_descr`. RPython's translator auto-discovers `lltype.Struct`
+/// fields and emits FieldDescr/SizeDescr; this macro performs the same
+/// auto-discovery for Rust structs using `offset_of!` / `size_of`.
+///
+/// Generated inherent methods:
+/// - `__majit_type_id() -> u64`
+/// - `__majit_register_descrs(&mut GcCache) -> DescrRef`
+/// - `const __MAJIT_FIELD_NAMES: &'static [&'static str]`
+///
+/// Only named-field structs are supported in this skeleton. Field types
+/// are classified by a simple heuristic (integer/float primitives vs Ref).
+#[proc_macro_attribute]
+pub fn jit_struct(attr: TokenStream, item: TokenStream) -> TokenStream {
+    jit_struct::expand(attr.into(), item.into()).into()
 }
 
 /// JIT attribute names recognized by `#[jit_module]` for automatic helper discovery.
