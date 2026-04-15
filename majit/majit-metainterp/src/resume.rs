@@ -4729,6 +4729,14 @@ pub struct ResumeDataDirectReader<'a> {
     /// Stored so the caller (blackhole_from_resumedata) can access it
     /// after consume_vref_and_vable completes.
     pub virtualizable_ptr: i64,
+
+    /// RPython resume.py:1022 `self.metainterp_sd.liveness_info` — packed
+    /// all_liveness bytes owned by MetaInterpStaticData and consumed by
+    /// `_prepare_next_section` via `enumerate_vars(offset, all_liveness, ...)`.
+    /// In RPython the reader holds a reference to metainterp_sd; pyre passes
+    /// the slice directly here since majit-metainterp has no metainterp_sd
+    /// struct yet.
+    pub all_liveness: &'a [u8],
 }
 
 /// resume.py:1433-1456 CPU allocation interface for virtual materialization.
@@ -5080,6 +5088,27 @@ impl<'a> ResumeDataDirectReader<'a> {
         all_virtuals: Option<(Vec<i64>, Vec<i64>)>,
         allocator: &'a dyn BlackholeAllocator,
     ) -> Self {
+        Self::new_with_liveness(
+            rd_numb,
+            rd_consts,
+            deadframe,
+            deadframe_types,
+            all_virtuals,
+            allocator,
+            &[],
+        )
+    }
+
+    /// resume.py:1364 __init__ with explicit `metainterp_sd.liveness_info`.
+    pub fn new_with_liveness(
+        rd_numb: &'a [u8],
+        rd_consts: &'a [i64],
+        deadframe: &'a [i64],
+        deadframe_types: Option<&'a [majit_ir::Type]>,
+        all_virtuals: Option<(Vec<i64>, Vec<i64>)>,
+        allocator: &'a dyn BlackholeAllocator,
+        all_liveness: &'a [u8],
+    ) -> Self {
         // resume.py:915-922 _init
         let mut resumecodereader = Reader::new(rd_numb);
         let items_resume_section = resumecodereader.next_item();
@@ -5106,6 +5135,7 @@ impl<'a> ResumeDataDirectReader<'a> {
             virtuals_cache,
             allocator,
             virtualizable_ptr: 0,
+            all_liveness,
         }
     }
 
@@ -5409,24 +5439,15 @@ impl<'a> ResumeDataDirectReader<'a> {
     ///             self.unique_id)
     /// ```
     ///
-    /// Upstream keeps `liveness_info` on `metainterp_sd`; pyre currently
-    /// passes it as BlackholeInterpreter side metadata (same encoding,
-    /// narrower sharing) until `-live-` offsets are embedded in bytecode.
-    /// The three callbacks still call `next_int`/`next_ref`/
-    /// `next_float` on this reader (resume.py:1028-1038), matching
-    /// `_callback_i/_callback_r/_callback_f` plus `write_an_int/write_a_ref/
-    /// write_a_float` (resume.py:1590-1597).
+    /// `all_liveness` is the reader's `self.metainterp_sd.liveness_info`
+    /// slice (resume.py:1022). The three callbacks still call
+    /// `next_int`/`next_ref`/`next_float` on this reader
+    /// (resume.py:1028-1038), matching `_callback_i/_callback_r/_callback_f`
+    /// plus `write_an_int/write_a_ref/write_a_float` (resume.py:1590-1597).
     fn _prepare_next_section(&mut self, info: usize, bh: &mut BlackholeInterpreter) {
         use majit_codewriter::liveness::LivenessIterator;
 
-        // SAFETY: `bh.liveness_info` is read-only metadata
-        // populated by the codewriter. The mutating operations we
-        // perform below (`setarg_i/setarg_r/setarg_f`) touch the
-        // register arrays, not the liveness bytes. The borrowed slice
-        // therefore stays valid for the duration of this section.
-        let liveness_len = bh.liveness_info.len();
-        let liveness_ptr = bh.liveness_info.as_ptr();
-        let all_liveness: &[u8] = unsafe { std::slice::from_raw_parts(liveness_ptr, liveness_len) };
+        let all_liveness: &[u8] = self.all_liveness;
 
         // jitcode.py:149-151 — three length bytes.
         let length_i = all_liveness[info] as u32;
@@ -5741,9 +5762,6 @@ pub struct ResolvedJitCode {
     /// Pyre virtualizable side metadata. RPython does not store this on
     /// JitCode; callers that need it attach it to the BlackholeInterpreter.
     pub virtualizable_stack_base: Option<usize>,
-    /// Packed all_liveness bytes. RPython stores this on metainterp_sd and
-    /// the offset inline in JitCode.code.
-    pub liveness_info: Vec<u8>,
 }
 
 impl ResolvedJitCode {
@@ -5752,17 +5770,11 @@ impl ResolvedJitCode {
             jitcode,
             pc,
             virtualizable_stack_base: None,
-            liveness_info: Vec::new(),
         }
     }
 
     pub fn with_virtualizable_stack_base(mut self, stack_base: usize) -> Self {
         self.virtualizable_stack_base = Some(stack_base);
-        self
-    }
-
-    pub fn with_liveness_metadata(mut self, liveness_info: Vec<u8>) -> Self {
-        self.liveness_info = liveness_info;
         self
     }
 }
@@ -5781,15 +5793,17 @@ pub fn blackhole_from_resumedata<'a>(
     vinfo: Option<&dyn VirtualizableInfo>,
     ginfo: Option<&dyn GreenfieldInfo>,
     allocator: &'a dyn BlackholeAllocator,
+    all_liveness: &'a [u8],
 ) -> Option<(BlackholeInterpreter, i64)> {
     // resume.py:1317-1321
-    let mut resumereader = ResumeDataDirectReader::new(
+    let mut resumereader = ResumeDataDirectReader::new_with_liveness(
         rd_numb,
         rd_consts,
         deadframe,
         deadframe_types,
         None,
         allocator,
+        all_liveness,
     );
 
     // resume.py:1324
@@ -5821,7 +5835,6 @@ pub fn blackhole_from_resumedata<'a>(
         if let Some(stack_base) = resolved.virtualizable_stack_base {
             nextbh.virtualizable_stack_base = stack_base;
         }
-        nextbh.liveness_info = resolved.liveness_info;
 
         // resume.py:1341
         resumereader.consume_one_section(&mut nextbh);

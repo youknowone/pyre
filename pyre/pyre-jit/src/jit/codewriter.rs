@@ -59,10 +59,11 @@ pub struct PyJitCodeMetadata {
     pub portal_ec_reg: u16,
     /// Absolute start index of the operand stack in PyFrame.locals_cells_stack_w.
     pub stack_base: usize,
-    /// Transitional liveness view for pyre trace/resume code. The canonical
-    /// destination is MetaInterpStaticData.all_liveness plus inline live offsets.
+    /// Pyre-local decoded liveness view used by `resume_in_blackhole`'s
+    /// per-section register fill. The canonical packed bytes live on
+    /// `MetaInterpStaticData.liveness_info` and are read via inline
+    /// `-live-` offsets embedded in `JitCode.code`.
     pub liveness: Vec<LivenessInfo>,
-    pub liveness_info: Vec<u8>,
 }
 
 /// Compiled JitCode plus pyre-only metadata.
@@ -1000,28 +1001,18 @@ impl CodeWriter {
         };
 
         // liveness.py:147-166 encode_liveness parity: pack each
-        // LivenessInfo into the all_liveness byte string with
-        // the `[len_i][len_r][len_f] | bitset_i | bitset_r | bitset_f`
-        // layout (liveness.py:139-145), then patch each inline `live/`
-        // marker with the 2-byte offset into that shared byte string.
-        let liveness_info = {
+        // LivenessInfo into the all_liveness byte string with the
+        // `[len_i][len_r][len_f] | bitset_i | bitset_r | bitset_f`
+        // layout (liveness.py:139-145). The packed fragment is appended
+        // to the single global `metainterp_sd.liveness_info` string
+        // (pyjitpl.py:2264 parity) and each inline `live/` marker is
+        // patched with a 2-byte GLOBAL offset.
+        {
             use majit_codewriter::liveness::encode_liveness;
 
-            // live_i_regs / live_f_regs are always empty in pyre (all
-            // Python values are PyObjectRef → ref bank only), so
-            // encoding stays symmetric across the three kinds.
-            //
-            // rpython/jit/codewriter/liveness.py:139 comment: "we encode the
-            // bitsets of which of the 256 registers are live". PyPy treats
-            // this as a hard precondition and the translator panics on a
-            // ≥256 register index. The Rust port DEVIATES by setting
-            // `has_abort = true` on overflow so the outer driver
-            // (`call_jit.rs:1819`) falls back to the interpreter at runtime
-            // — see the comment on `liveness_regs_to_u8_sorted` for the
-            // rationale and the proper-fix TODO. This is a documented
-            // safety net, not source-equivalent behavior.
-            let mut liveness_info: Vec<u8> = Vec::new();
+            let mut liveness_fragment: Vec<u8> = Vec::new();
             let mut liveness_positions: HashMap<(Vec<u8>, Vec<u8>, Vec<u8>), u16> = HashMap::new();
+            let mut local_offsets: Vec<(usize, u16)> = Vec::with_capacity(live_patches.len());
             let mut liveness_overflow = false;
             for (entry, &(_, patch_offset)) in liveness.iter().zip(live_patches.iter()) {
                 let live_i_bytes = liveness_regs_to_u8_sorted(&entry.live_i_regs);
@@ -1043,35 +1034,45 @@ impl CodeWriter {
                 let offset = if let Some(&offset) = liveness_positions.get(&key) {
                     offset
                 } else {
-                    if liveness_info.len() > u16::MAX as usize {
+                    if liveness_fragment.len() > u16::MAX as usize {
                         liveness_overflow = true;
                         break;
                     }
-                    let offset = liveness_info.len() as u16;
+                    let offset = liveness_fragment.len() as u16;
                     liveness_positions.insert(key, offset);
                     // liveness.py:144 header: three lengths.
-                    liveness_info.push(live_i_bytes.len() as u8);
-                    liveness_info.push(live_r_bytes.len() as u8);
-                    liveness_info.push(live_f_bytes.len() as u8);
+                    liveness_fragment.push(live_i_bytes.len() as u8);
+                    liveness_fragment.push(live_r_bytes.len() as u8);
+                    liveness_fragment.push(live_f_bytes.len() as u8);
                     // liveness.py:145 body: three packed bitsets.
-                    liveness_info.extend(encode_liveness(&live_i_bytes));
-                    liveness_info.extend(encode_liveness(&live_r_bytes));
-                    liveness_info.extend(encode_liveness(&live_f_bytes));
+                    liveness_fragment.extend(encode_liveness(&live_i_bytes));
+                    liveness_fragment.extend(encode_liveness(&live_r_bytes));
+                    liveness_fragment.extend(encode_liveness(&live_f_bytes));
                     offset
                 };
-                assembler.patch_live_offset(patch_offset, offset);
+                local_offsets.push((patch_offset, offset));
             }
             if liveness_overflow {
-                // Mark the jitcode as unexecutable and clear partial state
-                // so the outer driver treats it as an unconditional abort.
-                // has_abort lives on PyJitCode, not JitCode (RPython parity
-                // — rpython/jit/codewriter/jitcode.py has no such field).
+                // Mark the jitcode as unexecutable; overflow means the
+                // encoder could not fit into the u16 offset space. See
+                // `liveness_regs_to_u8_sorted` comment for the TODO.
                 has_abort = true;
-                Vec::new()
             } else {
-                liveness_info
+                // pyjitpl.py:2264 append to the global string, then
+                // patch every inline `-live-` with the resulting global
+                // offset. Fails iff the accumulated total would overflow
+                // the 2-byte inline offset field.
+                match pyre_jit_trace::state::append_liveness(&liveness_fragment) {
+                    Some(base) => {
+                        for (patch_offset, local_offset) in local_offsets {
+                            let global = base.saturating_add(local_offset);
+                            assembler.patch_live_offset(patch_offset, global);
+                        }
+                    }
+                    None => has_abort = true,
+                }
             }
-        };
+        }
 
         for site in catch_sites {
             assembler.mark_label(site.landing_label);
@@ -1119,7 +1120,6 @@ impl CodeWriter {
             portal_ec_reg,
             stack_base: frame_stack_base,
             liveness,
-            liveness_info,
         };
 
         PyJitCode {
@@ -1209,7 +1209,6 @@ pub fn get_jitcode(
                     w_code,
                     entry.jitcode.clone(),
                     entry.metadata.py_to_jit_pc.clone(),
-                    entry.metadata.liveness_info.clone(),
                     entry.metadata.liveness.clone(),
                 );
             }

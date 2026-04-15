@@ -108,6 +108,18 @@ pub(crate) const BC_CATCH_EXCEPTION: u8 = 89;
 pub(crate) const BC_LAST_EXC_VALUE: u8 = 90;
 pub(crate) const MAX_HOST_CALL_ARITY: usize = 16;
 
+/// RPython `blackhole.py:72-73` parity helper: the well-known opname →
+/// opcode entries that `BlackholeInterpBuilder.setup_insns(insns)` reads
+/// to resolve `op_live` / `op_catch_exception`. Upstream builds the table
+/// from `assembler.insns`; majit's assembler uses fixed opcode constants,
+/// so we expose just the entries the builder actually consults.
+pub fn wellknown_bh_insns() -> std::collections::HashMap<&'static str, u8> {
+    let mut m = std::collections::HashMap::new();
+    m.insert("live/", BC_LIVE);
+    m.insert("catch_exception/L", BC_CATCH_EXCEPTION);
+    m
+}
+
 /// GC liveness metadata at a specific bytecode PC.
 ///
 /// RPython liveness.py: `[len_i][len_r][len_f][bitset_i][bitset_r][bitset_f]`.

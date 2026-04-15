@@ -1808,8 +1808,7 @@ pub fn blackhole_resume_via_rd_numb(
         let jitcode_pc = pyjitcode.metadata.pc_map.get(pc as usize).copied()?;
         Some(
             resume::ResolvedJitCode::new(pyjitcode.jitcode.clone(), jitcode_pc)
-                .with_virtualizable_stack_base(pyjitcode.metadata.stack_base)
-                .with_liveness_metadata(pyjitcode.metadata.liveness_info.clone()),
+                .with_virtualizable_stack_base(pyjitcode.metadata.stack_base),
         )
     };
 
@@ -1831,6 +1830,7 @@ pub fn blackhole_resume_via_rd_numb(
     // resume.py:1314: vrefinfo = metainterp_sd.virtualref_info
     // resume.py:1316: ginfo = jitdriver_sd.greenfield_info
     let allocator = crate::eval::PyreBlackholeAllocator;
+    let all_liveness = pyre_jit_trace::state::liveness_info_snapshot();
     let bh = resume::blackhole_from_resumedata(
         builder,
         &resolve_jitcode,
@@ -1845,6 +1845,7 @@ pub fn blackhole_resume_via_rd_numb(
         Some(&vinfo as &dyn resume::VirtualizableInfo),
         None, // ginfo — pyre has no greenfield mechanism
         &allocator,
+        &all_liveness,
     );
 
     let Some((mut bh, virtualizable_ptr)) = bh else {

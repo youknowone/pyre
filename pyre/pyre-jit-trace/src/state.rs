@@ -45,20 +45,18 @@ pub(crate) struct JitCode {
     pub code: *const (),
     /// codewriter.py:68: jitcode.index = len(all_jitcodes).
     pub index: i32,
-    /// RPython parity: owned majit JitCode (liveness, bytecodes).
-    /// Set by codewriter via set_majit_jitcode(). Used by
-    /// get_list_of_active_boxes to access the same LivenessInfo
-    /// that consume_one_section uses (all_liveness parity).
-    /// Owned here (inside Box<JitCode> in MetaInterpStaticData.jitcodes)
-    /// so the address is stable — matches RPython's GC-heap JitCode.
+    /// RPython parity: owned majit JitCode (bytecodes, inline `-live-`).
+    /// Set by codewriter via set_majit_jitcode(). Owned here (inside
+    /// Box<JitCode> in MetaInterpStaticData.jitcodes) so the address is
+    /// stable — matches RPython's GC-heap JitCode.
     pub majit_jitcode: Option<majit_metainterp::jitcode::JitCode>,
     /// Pyre translation metadata: py_pc -> jitcode byte offset.
     /// RPython does not need this because frame.pc is already a JitCode PC.
     pub py_to_jit_pc: Vec<usize>,
-    /// Transitional packed liveness data. RPython stores the concatenated
-    /// all_liveness string on MetaInterpStaticData, not on JitCode.
-    pub liveness_info: Vec<u8>,
-    /// Transitional decoded liveness entries for fallback consumers.
+    /// Pyre liveness fallback used only when the global
+    /// `metainterp_sd.liveness_info` lookup cannot locate an entry
+    /// (e.g. merge-point only). Canonical decode reads the global bytes
+    /// at the offset embedded inline in `majit_jitcode.code`.
     pub liveness: Vec<majit_metainterp::jitcode::LivenessInfo>,
 }
 
@@ -87,6 +85,11 @@ struct MetaInterpStaticData {
     /// warmspot.py:282: self.metainterp_sd.jitcodes = jitcodes.
     /// Box<JitCode> for address stability across vec growth.
     jitcodes: Vec<Box<JitCode>>,
+    /// pyjitpl.py:2264 `self.liveness_info = "".join(asm.all_liveness)` —
+    /// single packed liveness byte string, shared across all jitcodes.
+    /// Appended at each JitCode compilation via `append_liveness`; inline
+    /// `-live-` offsets in `JitCode.code` are patched to global offsets.
+    liveness_info: Vec<u8>,
 }
 
 impl MetaInterpStaticData {
@@ -94,6 +97,7 @@ impl MetaInterpStaticData {
         Self {
             by_code: std::collections::HashMap::new(),
             jitcodes: Vec::new(),
+            liveness_info: Vec::new(),
         }
     }
 
@@ -110,7 +114,6 @@ impl MetaInterpStaticData {
             index,
             majit_jitcode: None,
             py_to_jit_pc: Vec::new(),
-            liveness_info: Vec::new(),
             liveness: Vec::new(),
         });
         let ptr = &*jitcode as *const JitCode;
@@ -118,6 +121,29 @@ impl MetaInterpStaticData {
         self.jitcodes.push(jitcode);
         ptr
     }
+}
+
+/// RPython pyjitpl.py:2264 parity: append this jitcode's local
+/// liveness bytes to the global `metainterp_sd.liveness_info` string and
+/// return the base offset so the caller can patch inline `-live-` offsets
+/// with `base + local_offset`. Fails if the total would exceed u16.
+pub fn append_liveness(fragment: &[u8]) -> Option<u16> {
+    METAINTERP_SD.with(|r| {
+        let mut sd = r.borrow_mut();
+        let base = sd.liveness_info.len();
+        if base + fragment.len() > u16::MAX as usize {
+            return None;
+        }
+        sd.liveness_info.extend_from_slice(fragment);
+        Some(base as u16)
+    })
+}
+
+/// RPython resume.py:1022 parity: read-only snapshot of
+/// `metainterp_sd.liveness_info` for the ResumeDataDirectReader. Returns a
+/// Vec copy because thread-local borrows cannot escape the closure.
+pub fn liveness_info_snapshot() -> Vec<u8> {
+    METAINTERP_SD.with(|r| r.borrow().liveness_info.clone())
 }
 
 use std::cell::RefCell;
@@ -151,7 +177,6 @@ pub fn set_majit_jitcode(
     code: *const (),
     majit_jitcode: majit_metainterp::jitcode::JitCode,
     py_to_jit_pc: Vec<usize>,
-    liveness_info: Vec<u8>,
     liveness: Vec<majit_metainterp::jitcode::LivenessInfo>,
 ) {
     METAINTERP_SD.with(|r| {
@@ -163,7 +188,6 @@ pub fn set_majit_jitcode(
             let jc = &mut *sd.jitcodes[idx];
             jc.majit_jitcode = Some(majit_jitcode);
             jc.py_to_jit_pc = py_to_jit_pc;
-            jc.liveness_info = liveness_info;
             jc.liveness = liveness;
         }
     });
@@ -195,11 +219,12 @@ pub fn frame_value_count_at(jitcode_index: i32, pc: i32) -> usize {
         };
         // jitcode.py:147 enumerate_vars parity: decode the offset from the
         // inline `live/` bytecode, then read [len_i, len_r, len_f] from the
-        // SAME all_liveness data that get_list_of_active_boxes uses.
+        // global metainterp_sd.liveness_info — the SAME all_liveness data
+        // that get_list_of_active_boxes uses.
         if let Some(ref jitcode) = jc.majit_jitcode {
             if let Some(&jit_pc) = jc.py_to_jit_pc.get(pc as usize) {
                 let off = jitcode.get_live_vars_info_at(jit_pc);
-                let all_liveness = &jc.liveness_info;
+                let all_liveness = &sd.liveness_info;
                 if off + 2 < all_liveness.len() {
                     let length_i = all_liveness[off] as usize;
                     let length_r = all_liveness[off + 1] as usize;
@@ -242,7 +267,6 @@ static NULL_JITCODE: JitCode = JitCode {
     index: -1,
     majit_jitcode: None,
     py_to_jit_pc: Vec::new(),
-    liveness_info: Vec::new(),
     liveness: Vec::new(),
 };
 

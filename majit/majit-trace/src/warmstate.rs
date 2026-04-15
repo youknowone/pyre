@@ -104,7 +104,7 @@ impl BaseJitCell {
     }
 
     pub fn is_compiled(&self) -> bool {
-        self.loop_token.is_some() && (self.flags & jc_flags::TEMPORARY == 0)
+        self.get_procedure_token().is_some() && (self.flags & jc_flags::TEMPORARY == 0)
     }
 
     pub fn has_procedure_token(&self) -> bool {

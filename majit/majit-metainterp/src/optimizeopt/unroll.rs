@@ -4238,9 +4238,13 @@ fn assemble_peeled_trace_with_jump_args(
             } else {
                 new_op.args.iter().copied().collect()
             };
-            let target_label_args: Vec<OpRef> = current_inner_label_index
-                .and_then(|label_idx| result.get(label_idx).map(|op| op.args.to_vec()))
-                .unwrap_or_else(|| full_label_args.clone());
+            let target_label_args: Vec<OpRef> = if !jump_to_self {
+                start_label_args.to_vec()
+            } else {
+                current_inner_label_index
+                    .and_then(|label_idx| result.get(label_idx).map(|op| op.args.to_vec()))
+                    .unwrap_or_else(|| full_label_args.clone())
+            };
             let target_base_len = if current_inner_label_index.is_some() {
                 original_args.len()
             } else {
@@ -4258,8 +4262,18 @@ fn assemble_peeled_trace_with_jump_args(
             }
             let mut jump_args = mapped_base_args;
             if !jump_to_self {
-                // Non-self jump: truncate to target label arity, not source label.
-                // RPython: make_inputargs_and_virtuals produces exactly target arity.
+                // NEW-DEVIATION (Rust backend arity workaround). RPython
+                // `unroll.py:238-242` jump_to_preamble does
+                // `jump_op.copy_and_change(rop.JUMP, descr=target_tokens[0])`
+                // and PRESERVES jump_op.getarglist(); upstream Label and JUMP
+                // always agree on arity by construction. Majit's preamble
+                // start Label is emitted with `start_label_args` (the
+                // original trace inputargs) while the body-phase JUMP may
+                // carry extra short-preamble slots, so the Rust backend would
+                // reject the arity mismatch. This truncates the extras to
+                // satisfy the backend, NOT because RPython does so. The
+                // proper fix is to widen start_label_args to match JUMP
+                // arity; until then, keep this workaround scoped narrowly.
                 jump_args.truncate(target_label_args.len());
             }
             if jump_to_self {
@@ -5819,8 +5833,15 @@ mod tests {
         assert_ne!(combined[2].pos, OpRef(64));
     }
 
+    // NEW-DEVIATION test (Rust backend arity workaround). RPython
+    // `unroll.py:238-242` jump_to_preamble preserves jump_op.getarglist()
+    // when retargeting to target_tokens[0]; expected value below is what the
+    // majit assembler emits to keep JUMP arity == start Label arity, which
+    // is a workaround for the Label/JUMP arity split described in
+    // `assemble_jump` (see the NEW-DEVIATION comment there). Do not read
+    // this test as proof of RPython jump_to_preamble parity.
     #[test]
-    fn test_assemble_peeled_trace_does_not_route_jump_by_preamble_descr() {
+    fn test_assemble_peeled_trace_truncates_non_self_jump_to_start_label_arity() {
         let start_descr = TargetToken::new_preamble(0).as_jump_target_descr();
         let p2_ops = vec![{
             let mut jump = Op::new(
@@ -5849,13 +5870,13 @@ mod tests {
         assert_eq!(combined[0].opcode, OpCode::Label);
         assert_eq!(combined[1].opcode, OpCode::Label);
         assert_eq!(combined[2].opcode, OpCode::Jump);
-        // RPython parity: unroll.py:238-242 `jump_to_preamble` retargets the
-        // Jump before compile.py assembles the trace, and this assembly helper
-        // must not derive a different arg contract by inspecting that descr.
-        // The caller is responsible for constructing the preamble-shaped Jump.
+        // Rust-backend expectation: JUMP is truncated to start_label_args
+        // arity to match the preamble start Label. RPython does NOT truncate
+        // (it preserves jump_op.getarglist() verbatim), so this is a
+        // workaround, not parity. See `assemble_jump` NEW-DEVIATION comment.
         assert_eq!(
             combined[2].args.as_slice(),
-            &[OpRef(100), OpRef(101), OpRef(102), OpRef(3), OpRef(4)]
+            &[OpRef(100), OpRef(101), OpRef(102)]
         );
     }
 

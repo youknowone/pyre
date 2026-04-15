@@ -976,10 +976,6 @@ pub struct BlackholeInterpreter {
     /// RPython: `jitdriver_sd.mainjitcode.calldescr` — CallDescr of the portal
     /// function. Returned by `get_portal_runner()` for `bhimpl_recursive_call_*`.
     pub mainjitcode_calldescr: BhCallDescr,
-    /// Packed all_liveness bytes. RPython stores this on metainterp_sd;
-    /// majit's blackhole receives it from the pyre resolver until the
-    /// surrounding MetaInterpStaticData object is fully ported.
-    pub liveness_info: Vec<u8>,
 }
 
 // blackhole.py: last exception value from a residual call.
@@ -1008,8 +1004,10 @@ impl BlackholeInterpreter {
         Self {
             cpu: None,
             descrs: Vec::new(),
-            op_catch_exception: BC_CATCH_EXCEPTION,
-            op_live: BC_LIVE,
+            // RPython blackhole.py:289 — copied from builder in `acquire_interp`.
+            // Sentinel `u8::MAX` matches RPython's `insns.get('…', -1)` fallback.
+            op_catch_exception: u8::MAX,
+            op_live: u8::MAX,
             registers_i: Vec::new(),
             registers_r: Vec::new(),
             registers_f: Vec::new(),
@@ -1031,7 +1029,6 @@ impl BlackholeInterpreter {
             virtualizable_stack_base: 0,
             portal_runner_ptr: None,
             mainjitcode_calldescr: BhCallDescr::default(),
-            liveness_info: Vec::new(),
         }
     }
 
@@ -2342,15 +2339,35 @@ impl Default for BlackholeInterpBuilder {
 
 impl BlackholeInterpBuilder {
     pub fn new() -> Self {
-        Self {
+        // RPython blackhole.py:66-74 `setup_insns` sets `op_live` and
+        // `op_catch_exception` by looking up `'live/'` / `'catch_exception/L'`
+        // in the assembler's opcode table. Callers that want the standard
+        // majit opcode numbering can skip `setup_insns` and call
+        // `setup_wellknown_insns()` (same table lookup, well-known subset).
+        let mut builder = Self {
             pool: Vec::new(),
             cpu: None,
             _insns: Vec::new(),
-            op_live: BC_LIVE,
-            op_catch_exception: BC_CATCH_EXCEPTION,
+            op_live: u8::MAX,
+            op_catch_exception: u8::MAX,
             descrs: Vec::new(),
             dispatch_table: Vec::new(),
-        }
+        };
+        builder.setup_wellknown_insns();
+        builder
+    }
+
+    /// RPython `blackhole.py:72-73` parity for just the two well-known
+    /// opcodes (`live/`, `catch_exception/L`). Callers that have a full
+    /// `insns` table should call `setup_insns` instead — it covers the
+    /// dispatch table and the reverse opcode mapping as well.
+    pub fn setup_wellknown_insns(&mut self) {
+        let insns = crate::jitcode::wellknown_bh_insns();
+        self.op_live = insns.get("live/").copied().unwrap_or(u8::MAX);
+        self.op_catch_exception = insns
+            .get("catch_exception/L")
+            .copied()
+            .unwrap_or(u8::MAX);
     }
 
     /// RPython `blackhole.py:66-100` `setup_insns(insns)`.
@@ -2546,7 +2563,6 @@ impl BlackholeInterpBuilder {
         interp.aborted = false;
         interp.got_exception = false;
         interp.virtualizable_stack_base = 0;
-        interp.liveness_info.clear();
         self.pool.push(interp);
     }
 
@@ -2800,6 +2816,7 @@ pub fn resume_in_blackhole(
     rd_consts: &[i64],
     deadframe: &[i64],
     deadframe_exc: i64,
+    all_liveness: &[u8],
 ) -> JitException {
     // blackhole.py:1786-1792
     let null_alloc = crate::resume::NullAllocator;
@@ -2817,6 +2834,7 @@ pub fn resume_in_blackhole(
         None, // vinfo
         None, // ginfo
         &null_alloc,
+        all_liveness,
     );
 
     let Some((bh, _virtualizable_ptr)) = bh else {
