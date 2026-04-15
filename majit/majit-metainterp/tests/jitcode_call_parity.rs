@@ -320,7 +320,12 @@ fn jitcode_typed_call_args_preserve_call_descr_types() {
     let mut root = JitCodeBuilder::new();
     root.load_const_r_value(0, 101);
     root.load_const_f_value(0, 2.5f64.to_bits() as i64);
-    root.load_const_i_value(0, 7);
+    // pyjitpl.py:3562-3569 record_result_of_call_pure parity: when ALL
+    // args are Const, the CALL is cut from the trace and the result is
+    // folded to a constant — no CALL_PURE op is recorded. To exercise
+    // the non-all-const branch that emits a CALL_PURE with its descr,
+    // take the int operand from the symbolic stack (non-constant).
+    root.pop_i(0);
     let fn_idx = root.add_call_target(
         trace_ref_float_int_sum as *const (),
         concrete_ref_float_int_sum as *const (),
@@ -337,18 +342,31 @@ fn jitcode_typed_call_args_preserve_call_descr_types() {
     root.push_i(1);
     let jitcode = root.finish();
 
-    let mut interp = start_trace(&[]);
-    let mut sym = TestSym::new(0);
+    let mut interp = start_trace(&[7]);
+    let mut sym = TestSym::new(1);
+    let initial = [7_i64];
     let action = {
         let ctx = interp.trace_ctx().unwrap();
-        trace_jitcode(ctx, &mut sym, &jitcode, 0, |_| 0, |_, _| 0, |_| 0)
+        trace_jitcode(
+            ctx,
+            &mut sym,
+            &jitcode,
+            0,
+            |_| initial.len(),
+            |_, pos| initial[pos],
+            |_| 0,
+        )
     };
     assert!(matches!(action, TraceAction::Continue));
 
     let result = sym.stack(0).unwrap().peek().unwrap();
     let (trace, _constants) = interp.finish_trace_for_parity(&[result]).unwrap();
-    assert_eq!(trace.ops[0].opcode, OpCode::CallPureI);
-    let call_descr = trace.ops[0]
+    let call_op = trace
+        .ops
+        .iter()
+        .find(|op| op.opcode == OpCode::CallPureI)
+        .expect("CALL_PURE_I op should be recorded when not all args are constants");
+    let call_descr = call_op
         .descr
         .as_ref()
         .and_then(|descr| descr.as_call_descr())
