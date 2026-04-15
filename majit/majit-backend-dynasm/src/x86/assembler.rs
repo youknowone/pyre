@@ -4096,8 +4096,13 @@ impl Assembler386 {
     /// Uses regalloc-provided arglocs to load callee arguments instead of
     /// resolve_opref(), which drops register-carried values to Const(0).
     fn genop_call_assembler(&mut self, op: &Op, arglocs: &[Loc]) {
+        let call_descr = op.descr.as_ref().and_then(|d| d.as_call_descr());
+        let expansion = call_descr.and_then(|d| d.vable_expansion());
+
         let num_args = op.args.len();
-        let num_expanded_items = num_args;
+        let num_expanded_items = expansion
+            .map(|exp| 1 + exp.scalar_fields.len() + exp.num_array_items)
+            .unwrap_or(num_args);
         // llmodel.py:298 malloc_jitframe parity: callee needs frame_depth
         // slots (frame-slot model stores ALL intermediates in jitframe).
         let jf_slots = self.frame_depth.max(num_expanded_items);
@@ -4137,17 +4142,88 @@ impl Assembler386 {
             ; mov QWORD [rdx + JF_FRAME_OFS as i32], jf_frame_len as i32
         );
 
-        // rewrite.py:672-683 handle_call_assembler: copy each CALL_ASSEMBLER
-        // arg at its jitframe slot. Callee inputs live at absolute slots
-        // [JITFRAME_FIXED_SIZE + relative_input_index]. The GC rewriter has
-        // already unrolled any virtualizable expansion upstream, so the
-        // backend sees explicit arglocs 1:1 with slots.
-        for (i, loc) in arglocs.iter().enumerate() {
-            let dest_offset = Self::slot_offset(JITFRAME_FIXED_SIZE + i);
-            self.emit_load_to_rax(*loc);
-            dynasm!(self.mc ; .arch x64
-                ; mov [rdx + dest_offset], rax
-            );
+        // rewrite.py:665-695 handle_call_assembler parity:
+        // if VableExpansion is present, expand the caller frame reference
+        // into the callee's full inputarg layout. Otherwise, copy the
+        // raw CALL_ASSEMBLER arguments as ordinary loop inputs.
+        //
+        // All callee inputs live at absolute jitframe slots
+        // [JITFRAME_FIXED_SIZE + relative_input_index].
+        if let Some(expansion) = expansion {
+            for slot in 0..num_expanded_items {
+                let dest_offset = Self::slot_offset(JITFRAME_FIXED_SIZE + slot);
+
+                if let Some(&(_, cval)) = expansion.const_overrides.iter().find(|(s, _)| *s == slot)
+                {
+                    dynasm!(self.mc ; .arch x64
+                        ; mov rax, QWORD cval
+                        ; mov [rdx + dest_offset], rax
+                    );
+                    continue;
+                }
+
+                if let Some(&(_, arg_idx)) =
+                    expansion.arg_overrides.iter().find(|(s, _)| *s == slot)
+                {
+                    let src = arglocs
+                        .get(arg_idx)
+                        .copied()
+                        .expect("call_assembler arg override out of bounds");
+                    self.emit_load_to_rax(src);
+                    dynasm!(self.mc ; .arch x64
+                        ; mov [rdx + dest_offset], rax
+                    );
+                    continue;
+                }
+
+                if slot == 0 {
+                    let frame_loc = arglocs
+                        .first()
+                        .copied()
+                        .expect("call_assembler vable expansion missing frame arg");
+                    self.emit_load_to_rax(frame_loc);
+                    dynasm!(self.mc ; .arch x64
+                        ; mov [rdx + dest_offset], rax
+                    );
+                    continue;
+                }
+
+                if slot <= expansion.scalar_fields.len() {
+                    let (field_ofs, _) = expansion.scalar_fields[slot - 1];
+                    let frame_loc = arglocs
+                        .first()
+                        .copied()
+                        .expect("call_assembler vable expansion missing frame arg");
+                    self.emit_load_to_rax(frame_loc);
+                    dynasm!(self.mc ; .arch x64
+                        ; mov rax, [rax + field_ofs as i32]
+                        ; mov [rdx + dest_offset], rax
+                    );
+                    continue;
+                }
+
+                let array_index = slot - 1 - expansion.scalar_fields.len();
+                let data_ptr_ofs = expansion.array_struct_offset + expansion.array_ptr_offset;
+                let item_ofs = (array_index * 8) as i32;
+                let frame_loc = arglocs
+                    .first()
+                    .copied()
+                    .expect("call_assembler vable expansion missing frame arg");
+                self.emit_load_to_rax(frame_loc);
+                dynasm!(self.mc ; .arch x64
+                    ; mov rax, [rax + data_ptr_ofs as i32]
+                    ; mov rax, [rax + item_ofs]
+                    ; mov [rdx + dest_offset], rax
+                );
+            }
+        } else {
+            for (i, loc) in arglocs.iter().enumerate() {
+                let dest_offset = Self::slot_offset(JITFRAME_FIXED_SIZE + i);
+                self.emit_load_to_rax(*loc);
+                dynasm!(self.mc ; .arch x64
+                    ; mov [rdx + dest_offset], rax
+                );
+            }
         }
 
         // _call_assembler_emit_call (assembler.py:2267-2269):
