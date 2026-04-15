@@ -3399,11 +3399,11 @@ fn build_resumed_frames(
             // virtualizable.py:134-137 write_from_resume_data_partial:
             // array items written after static fields.
             let array_boxes = vec![array_items];
-            vinfo.write_from_resume_data_partial(frame_u8, &static_boxes, &array_boxes);
+            vinfo.write_all_boxes(frame_u8, &static_boxes, &array_boxes);
         }
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
-                "[jit][consume_vable_info] write_from_resume_data_partial on frame {:?}",
+                "[jit][consume_vable_info] write_all_boxes on frame {:?}",
                 vable_frame_ptr,
             );
             if !vable_frame_ptr.is_null() {

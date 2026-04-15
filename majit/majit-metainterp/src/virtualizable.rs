@@ -910,23 +910,6 @@ impl VirtualizableInfo {
         );
     }
 
-    /// RPython equivalent: `vinfo.write_from_resume_data_partial(...)`.
-    ///
-    /// The boxed data is already split into static and per-array slices, so the
-    /// implementation only writes the provided data back and leaves token
-    /// handling to the caller.
-    ///
-    /// # Safety
-    /// `obj_ptr` must point to a valid virtualizable object.
-    pub unsafe fn write_from_resume_data_partial(
-        &self,
-        obj_ptr: *mut u8,
-        static_boxes: &[i64],
-        array_boxes: &[Vec<i64>],
-    ) {
-        self.write_all_boxes(obj_ptr, static_boxes, array_boxes);
-    }
-
     /// Force virtualizable: write boxes to heap and clear token.
     ///
     /// RPython equivalent: the combined force_now + write_from_resume_data flow.
@@ -1697,7 +1680,7 @@ mod tests {
 
         let new_array_boxes = vec![vec![0x3000_i64, 0, 0x4000_i64]];
         unsafe {
-            info.write_from_resume_data_partial(obj.as_mut_ptr(), &[], &new_array_boxes);
+            info.write_all_boxes(obj.as_mut_ptr(), &[], &new_array_boxes);
         }
 
         unsafe {

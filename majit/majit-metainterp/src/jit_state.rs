@@ -327,7 +327,7 @@ pub trait JitState: Sized {
             return;
         };
         unsafe {
-            info.write_from_resume_data_partial(obj_ptr, &static_boxes, &array_boxes);
+            info.write_all_boxes(obj_ptr, &static_boxes, &array_boxes);
             info.reset_vable_token(obj_ptr);
         }
     }
