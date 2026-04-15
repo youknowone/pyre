@@ -4175,43 +4175,42 @@ impl AssemblerARM64 {
 
     /// NEW: allocate a fixed-size object. Requires GC runtime.
     /// Emits a trap (UD2/BRK) until GC nursery allocation is wired.
+    /// Zero-initialize `size` bytes at address in x0 (preserved).
+    /// Avoids clobbering callee-saved registers (x19-x28).
+    fn inline_memzero(&mut self, size: i64) {
+        let mut ofs = 0i32;
+        while ofs + 16 <= size as i32 {
+            dynasm!(self.mc ; .arch aarch64 ; stp xzr, xzr, [x0, ofs]);
+            ofs += 16;
+        }
+        if ofs + 8 <= size as i32 {
+            let u = ofs as u32;
+            dynasm!(self.mc ; .arch aarch64 ; str xzr, [x0, u]);
+            ofs += 8;
+        }
+        if ofs + 4 <= size as i32 {
+            let u = ofs as u32;
+            dynasm!(self.mc ; .arch aarch64 ; str wzr, [x0, u]);
+        }
+    }
+
     fn genop_new(&mut self, op: &Op) {
-        // Simple allocation: call libc malloc(obj_size).
-        // RPython uses GC nursery bump allocation; we use malloc as stub.
         let obj_size = op
             .descr
             .as_ref()
             .and_then(|d| d.as_size_descr())
             .map(|sd| sd.size())
             .unwrap_or(16) as i64;
-        let malloc_ptr = libc::malloc as *const () as i64;
-        // Call malloc(obj_size)
         self.emit_mov_imm64(0, obj_size);
-        self.emit_mov_imm64(2, malloc_ptr);
+        self.emit_mov_imm64(2, libc::malloc as *const () as i64);
         dynasm!(self.mc ; .arch aarch64 ; blr x2);
-        // rax/x0 = pointer to allocated memory
-        // Zero-initialize
-        dynasm!(self.mc ; .arch aarch64
-            ; mov x19, x0       // save ptr in callee-saved
-        );
-        // memset(ptr, 0, size)
-        dynasm!(self.mc ; .arch aarch64
-            ; mov x1, 0         // val = 0
-        );
-        self.emit_mov_imm64(2, obj_size);
-        self.emit_mov_imm64(3, libc::memset as *const () as i64);
-        dynasm!(self.mc ; .arch aarch64
-            ; blr x3
-            ; mov x0, x19       // restore ptr
-        );
+        self.inline_memzero(obj_size);
         if !op.pos.is_none() {
             self.store_rax_to_result(op.pos);
         }
     }
 
-    /// NEW_WITH_VTABLE: allocate and set vtable pointer.
     fn genop_new_with_vtable(&mut self, op: &Op) {
-        // Same as New, but also write vtable at offset 0.
         let obj_size = op
             .descr
             .as_ref()
@@ -4224,16 +4223,10 @@ impl AssemblerARM64 {
             .and_then(|d| d.as_size_descr())
             .map(|sd| sd.vtable())
             .unwrap_or(0) as i64;
-        let malloc_ptr = libc::malloc as *const () as i64;
         self.emit_mov_imm64(0, obj_size);
-        self.emit_mov_imm64(2, malloc_ptr);
+        self.emit_mov_imm64(2, libc::malloc as *const () as i64);
         dynasm!(self.mc ; .arch aarch64 ; blr x2);
-        dynasm!(self.mc ; .arch aarch64 ; mov x19, x0);
-        dynasm!(self.mc ; .arch aarch64 ; mov x1, 0);
-        self.emit_mov_imm64(2, obj_size);
-        self.emit_mov_imm64(3, libc::memset as *const () as i64);
-        dynasm!(self.mc ; .arch aarch64 ; blr x3);
-        dynasm!(self.mc ; .arch aarch64 ; mov x0, x19);
+        self.inline_memzero(obj_size);
         if vtable != 0 {
             self.emit_mov_imm64(1, vtable);
             dynasm!(self.mc ; .arch aarch64 ; str x1, [x0]);
@@ -4842,7 +4835,7 @@ impl AssemblerARM64 {
             ; blr x8
             ; ldp x29, x30, [sp], #16
             ; ldr x2, [sp], #16                 // total_size
-            ; mov x19, x0                        // save ptr
+            ; str x0, [sp, #-16]!               // save ptr on stack
             ; mov x1, 0                          // val = 0
             ; stp x29, x30, [sp, #-16]!
         );
@@ -4850,7 +4843,7 @@ impl AssemblerARM64 {
         dynasm!(self.mc ; .arch aarch64
             ; blr x8
             ; ldp x29, x30, [sp], #16
-            ; mov x0, x19                        // restore ptr
+            ; ldr x0, [sp], #16                  // restore ptr from stack
             ; ldr x1, [sp], #16                  // length
             ; str x1, [x0, 8]                    // store length at offset 8
         );
