@@ -514,7 +514,9 @@ impl GcRewriterImpl {
     // NEW_ARRAY / NEW_ARRAY_CLEAR  → CALL_MALLOC_NURSERY_VARSIZE
     // ────────────────────────────────────────────────────────
 
-    fn handle_new_array(&self, op: &Op, st: &mut RewriteState) {
+    /// rewrite.py:848 gen_malloc_nursery_varsize parity.
+    /// kind: FLAG_ARRAY=0, FLAG_STR=1, FLAG_UNICODE=2.
+    fn handle_new_array(&self, op: &Op, st: &mut RewriteState, kind: i64) {
         let is_clear = op.opcode == OpCode::NewArrayClear;
 
         let descr_ref = op
@@ -525,14 +527,18 @@ impl GcRewriterImpl {
             .as_array_descr()
             .expect("NEW_ARRAY descr must be ArrayDescr");
 
-        let _item_size = descr.item_size();
+        let item_size = descr.item_size();
         let v_length = st.resolve(op.arg(0)); // the length operand
 
-        // Emit CALL_MALLOC_NURSERY_VARSIZE(itemsize_const, length).
-        // This is a potentially-collecting call, so flush state first.
+        // rewrite.py:857-860: CALL_MALLOC_NURSERY_VARSIZE([ConstInt(kind), ConstInt(itemsize), v_length])
         st.emitting_an_operation_that_can_collect();
 
-        let mut varsize_op = Op::new(OpCode::CallMallocNurseryVarsize, &[v_length]);
+        let kind_ref = st.const_int(kind);
+        let itemsize_ref = st.const_int(item_size as i64);
+        let mut varsize_op = Op::new(
+            OpCode::CallMallocNurseryVarsize,
+            &[kind_ref, itemsize_ref, v_length],
+        );
         varsize_op.descr = op.descr.clone();
         let result = st.emit_result(varsize_op, op.pos);
         st.record_result_mapping(op.pos, result);
@@ -724,28 +730,27 @@ impl GcRewriterImpl {
         let size = round_up(size);
 
         if !self.can_use_nursery(size) {
-            // Fallback: emit a plain CALL_MALLOC_NURSERY that the backend
-            // will turn into a slow-path call. We still flush state.
             st.emitting_an_operation_that_can_collect();
-            let op = Op::new(OpCode::CallMallocNursery, &[OpRef(size as u32)]);
+            let size_ref = st.const_int(size as i64);
+            let op = Op::new(OpCode::CallMallocNursery, &[size_ref]);
             let r = st.emit_result(op, result_pos);
             st.remember_write_barrier(r);
             return r;
         }
 
-        // Try to merge with a previous CALL_MALLOC_NURSERY.
+        // rewrite.py:893-898 merge with previous CALL_MALLOC_NURSERY
         if let Some(prev_idx) = st.pending_malloc_idx {
             let new_total = st.pending_malloc_total + size;
             if self.can_use_nursery(new_total) {
-                // Update the existing CALL_MALLOC_NURSERY's size arg.
-                st.out[prev_idx].args[0] = OpRef(new_total as u32);
+                let new_total_ref = st.const_int(new_total as i64);
+                st.out[prev_idx].args[0] = new_total_ref;
                 st.pending_malloc_total = new_total;
 
-                // Emit a NURSERY_PTR_INCREMENT to compute the address of
-                // this object within the same nursery bump.
+                // rewrite.py:896: NURSERY_PTR_INCREMENT(last, ConstInt(previous_size))
+                let prev_size_ref = st.const_int(st.previous_size as i64);
                 let incr_op = Op::new(
                     OpCode::NurseryPtrIncrement,
-                    &[st.last_malloced_ref, OpRef(st.previous_size as u32)],
+                    &[st.last_malloced_ref, prev_size_ref],
                 );
                 let r = st.emit_result(incr_op, result_pos);
                 st.previous_size = size;
@@ -755,9 +760,10 @@ impl GcRewriterImpl {
             }
         }
 
-        // Emit a fresh CALL_MALLOC_NURSERY.
+        // rewrite.py:903: CALL_MALLOC_NURSERY(ConstInt(size))
         st.emitting_an_operation_that_can_collect();
-        let op = Op::new(OpCode::CallMallocNursery, &[OpRef(size as u32)]);
+        let size_ref = st.const_int(size as i64);
+        let op = Op::new(OpCode::CallMallocNursery, &[size_ref]);
         let r = st.emit_result(op, result_pos);
         st.pending_malloc_idx = Some(st.out.len() - 1);
         st.pending_malloc_total = size;
@@ -771,37 +777,49 @@ impl GcRewriterImpl {
     // Helpers for header initialisation
     // ────────────────────────────────────────────────────────
 
-    /// Emit a GcStore to write the type-id into the object header.
-    fn gen_initialize_tid(&self, obj: OpRef, tid: u32, st: &mut RewriteState) {
-        // We encode the tid in a GcStore(obj, 0, tid) — offset 0 means the
-        // header word which sits at (obj_ptr - HEADER_SIZE) in the actual
-        // layout, but the backend interprets tid-init specially.
-        let store = Op::new(OpCode::GcStore, &[obj, OpRef(0), OpRef(tid)]);
-        st.emit(store);
-    }
-
-    /// Emit a GcStore to write the vtable pointer.
+    /// rewrite.py:914-918 gen_initialize_tid parity.
     ///
-    /// The vtable is a 64-bit pointer that cannot fit in an OpRef (u32).
-    /// Store it in the constants pool and pass the const_ref as arg(2).
-    /// The backend's GcStore slot-1 lowering resolves this via the
-    /// constants map to emit the correct 64-bit immediate.
-    fn gen_initialize_vtable(&self, obj: OpRef, vtable: usize, st: &mut RewriteState) {
-        let vtable_ref = st.const_int(vtable as i64);
-        let store = Op::new(OpCode::GcStore, &[obj, OpRef(1), vtable_ref]);
+    /// RPython: emit_setfield(obj, ConstInt(tid), descr=fielddescr_tid)
+    ///   → emit_gc_store_or_indexed(ptr, ConstInt(0), ConstInt(tid), size=WORD, factor=1, ofs=tid_ofs)
+    ///   → GC_STORE(ptr, ConstInt(tid_ofs), ConstInt(tid), ConstInt(WORD))
+    ///
+    /// The tid field is in the GcHeader which sits before the object pointer.
+    /// offset = -(GcHeader::SIZE) from the object pointer.
+    fn gen_initialize_tid(&self, obj: OpRef, tid: u32, st: &mut RewriteState) {
+        let ofs = st.const_int(-(crate::header::GcHeader::SIZE as i64));
+        let tid_val = st.const_int(tid as i64);
+        let size = st.const_int(std::mem::size_of::<usize>() as i64);
+        let store = Op::new(OpCode::GcStore, &[obj, ofs, tid_val, size]);
         st.emit(store);
     }
 
-    /// Emit a GcStore to initialise the array length field.
+    /// rewrite.py:479-484 gen_initialize_vtable parity.
+    ///
+    /// RPython: emit_setfield(obj, ConstInt(vtable), descr=fielddescr_vtable)
+    /// The vtable pointer is at offset 0 from the object pointer.
+    fn gen_initialize_vtable(&self, obj: OpRef, vtable: usize, st: &mut RewriteState) {
+        let ofs = st.const_int(0);
+        let vtable_ref = st.const_int(vtable as i64);
+        let size = st.const_int(std::mem::size_of::<usize>() as i64);
+        let store = Op::new(OpCode::GcStore, &[obj, ofs, vtable_ref, size]);
+        st.emit(store);
+    }
+
+    /// rewrite.py:550-554 gen_initialize_len parity.
+    ///
+    /// RPython: emit_setfield(obj, length, descr=lendescr)
+    /// The length field offset comes from the array descriptor.
     fn gen_initialize_len(
         &self,
         obj: OpRef,
         length: OpRef,
         array_descr: DescrRef,
-        _len_descr: &dyn FieldDescr,
+        len_descr: &dyn FieldDescr,
         st: &mut RewriteState,
     ) {
-        let mut store = Op::new(OpCode::GcStore, &[obj, OpRef(2), length]);
+        let ofs = st.const_int(len_descr.offset() as i64);
+        let size = st.const_int(len_descr.field_size() as i64);
+        let mut store = Op::new(OpCode::GcStore, &[obj, ofs, length, size]);
         store.descr = Some(array_descr);
         st.emit(store);
     }
@@ -935,12 +953,15 @@ impl GcRewriter for GcRewriterImpl {
                 OpCode::New | OpCode::NewWithVtable => {
                     self.handle_new(op, &mut st);
                 }
+                // rewrite.py:485-494
                 OpCode::NewArray | OpCode::NewArrayClear => {
-                    self.handle_new_array(op, &mut st);
+                    self.handle_new_array(op, &mut st, 0); // FLAG_ARRAY
                 }
-                // Newstr / Newunicode are array-like allocations.
-                OpCode::Newstr | OpCode::Newunicode => {
-                    self.handle_new_array(op, &mut st);
+                OpCode::Newstr => {
+                    self.handle_new_array(op, &mut st, 1); // FLAG_STR
+                }
+                OpCode::Newunicode => {
+                    self.handle_new_array(op, &mut st, 2); // FLAG_UNICODE
                 }
 
                 // rewrite.py:384-387: record INT_ADD or INT_SUB with a constant
@@ -1212,20 +1233,17 @@ mod tests {
         let rw = make_rewriter();
         let ops = vec![Op::with_descr(OpCode::New, &[], size_descr(32, 7))];
 
-        let result = rw.rewrite_for_gc(&ops);
+        let (result, constants) = rw.rewrite_for_gc_with_constants(&ops, &HashMap::new());
 
         // Expect: CallMallocNursery, GcStore (tid)
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].opcode, OpCode::CallMallocNursery);
-        // rewrite.py:474-484 parity: descr.size + GcHeader::SIZE.
-        // PyreSizeDescr reports the bare struct size, so handle_new adds
-        // the 8-byte GC header before passing the total to gen_malloc_nursery.
-        assert_eq!(
-            result[0].args[0].0,
-            32 + crate::header::GcHeader::SIZE as u32
-        );
+        // rewrite.py:474-484 parity: size arg is ConstInt(descr.size + GcHeader::SIZE).
+        let size_val = constants[&result[0].args[0].0];
+        assert_eq!(size_val, (32 + crate::header::GcHeader::SIZE) as i64);
         assert_eq!(result[1].opcode, OpCode::GcStore); // tid init
-        assert_eq!(result[1].args[2].0, 7); // type_id = 7
+        let tid_val = constants[&result[1].args[2].0];
+        assert_eq!(tid_val, 7); // type_id = 7
     }
 
     // ── Test 2: NEW_ARRAY → CALL_MALLOC_NURSERY_VARSIZE ──
@@ -1252,7 +1270,8 @@ mod tests {
             .iter()
             .find(|o| o.opcode == OpCode::CallMallocNurseryVarsize)
             .unwrap();
-        assert_eq!(varsize.args[0], length_ref);
+        // rewrite.py:858: [ConstInt(kind), ConstInt(itemsize), v_length]
+        assert_eq!(varsize.args[2], length_ref);
     }
 
     // ── Test 3: SETFIELD_GC with Ref value → write barrier inserted ──
@@ -1326,12 +1345,8 @@ mod tests {
             Op::with_descr(OpCode::New, &[], size_descr(32, 2)),
         ];
 
-        let result = rw.rewrite_for_gc(&ops);
+        let (result, constants) = rw.rewrite_for_gc_with_constants(&ops, &HashMap::new());
 
-        // First NEW: CallMallocNursery + GcStore(tid)
-        // Second NEW: NurseryPtrIncrement + GcStore(tid)
-        // And the original CallMallocNursery should have been updated
-        // to the combined size.
         assert!(result.iter().any(|o| o.opcode == OpCode::CallMallocNursery));
         assert!(
             result
@@ -1343,22 +1358,17 @@ mod tests {
             .iter()
             .find(|o| o.opcode == OpCode::CallMallocNursery)
             .unwrap();
-        // rewrite.py:474-484 parity: each NEW contributes
-        // round_up(descr.size + GcHeader::SIZE) bytes. Combined:
-        // round_up(24+8) + round_up(32+8) = 32 + 40 = 72.
-        let header = crate::header::GcHeader::SIZE as u32;
-        assert_eq!(
-            malloc.args[0].0,
-            round_up(24 + header as usize) as u32 + round_up(32 + header as usize) as u32
-        );
+        // rewrite.py:893-895: combined size = round_up(24+8) + round_up(32+8) = 32 + 40 = 72
+        let header = crate::header::GcHeader::SIZE as usize;
+        let expected_size = round_up(24 + header) as i64 + round_up(32 + header) as i64;
+        assert_eq!(constants[&malloc.args[0].0], expected_size);
 
         let incr = result
             .iter()
             .find(|o| o.opcode == OpCode::NurseryPtrIncrement)
             .unwrap();
-        // Offset of the second alloc = first allocation's full slot
-        // (round_up(24 + GcHeader::SIZE) = 32).
-        assert_eq!(incr.args[1].0, round_up(24 + header as usize) as u32);
+        // rewrite.py:898: ConstInt(previous_size) = round_up(24 + GcHeader::SIZE) = 32
+        assert_eq!(constants[&incr.args[1].0], round_up(24 + header) as i64);
 
         // Both should have tid initialisation.
         let tid_stores: Vec<_> = result
@@ -1366,8 +1376,8 @@ mod tests {
             .filter(|o| o.opcode == OpCode::GcStore)
             .collect();
         assert_eq!(tid_stores.len(), 2);
-        assert_eq!(tid_stores[0].args[2].0, 1); // first type_id
-        assert_eq!(tid_stores[1].args[2].0, 2); // second type_id
+        assert_eq!(constants[&tid_stores[0].args[2].0], 1); // first type_id
+        assert_eq!(constants[&tid_stores[1].args[2].0], 2); // second type_id
     }
 
     // ── Test 7: A collecting operation between two NEWs prevents batching ──
@@ -1474,21 +1484,12 @@ mod tests {
         // CallMallocNursery + GcStore(tid) + GcStore(vtable)
         assert_eq!(result.len(), 3);
         assert_eq!(result[0].opcode, OpCode::CallMallocNursery);
-        // tid init: GcStore(obj, offset=0, imm=3). `3` is encoded as a
-        // literal immediate (see gen_initialize_tid).
         assert_eq!(result[1].opcode, OpCode::GcStore);
-        assert_eq!(result[1].args[2].0, 3);
-        // vtable init: GcStore(obj, offset=1, const(0xDEAD)).
-        // `gen_initialize_vtable` uses `const_int(vtable)`, which returns
-        // a constant-pool OpRef (>= 10_000). Verify the OpRef resolves to
-        // the correct vtable value through the constant pool.
+        let tid_ref = result[1].args[2];
+        assert_eq!(constants[&tid_ref.0], 3);
         assert_eq!(result[2].opcode, OpCode::GcStore);
         let vtable_ref = result[2].args[2];
-        assert!(
-            vtable_ref.0 >= 10_000,
-            "vtable must be a constant-pool OpRef"
-        );
-        assert_eq!(constants.get(&vtable_ref.0).copied(), Some(0xDEAD_i64));
+        assert_eq!(constants[&vtable_ref.0], 0xDEAD_i64);
     }
 
     // ── Test 11: SETARRAYITEM_GC with Ref — no card marking → regular WB ──

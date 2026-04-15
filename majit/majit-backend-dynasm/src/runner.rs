@@ -13,7 +13,7 @@ use majit_backend::{
     AsmInfo, Backend, BackendError, DeadFrame, ExitRecoveryLayout, FailDescrLayout, JitCellToken,
     RawExecResult, TerminalExitLayout,
 };
-use majit_ir::{FailDescr, GcRef, InputArg, Op, Type, Value};
+use majit_ir::{FailDescr, GcRef, InputArg, Op, OpRef, Type, Value};
 
 #[cfg(target_arch = "aarch64")]
 use crate::aarch64::assembler::{AssemblerARM64 as Asm, CompiledCode};
@@ -38,7 +38,7 @@ thread_local! {
     /// backend on this thread. Stored as a thread-local so the
     /// backend-agnostic `majit_gc::ActiveGcGuardHooks` shims can
     /// reach the live allocator without taking a dynasm dependency.
-    static DYNASM_ACTIVE_GC: RefCell<Option<Box<dyn majit_gc::GcAllocator>>> =
+    pub static DYNASM_ACTIVE_GC: RefCell<Option<Box<dyn majit_gc::GcAllocator>>> =
         const { RefCell::new(None) };
 }
 
@@ -69,6 +69,73 @@ fn dynasm_typeid_is_object(typeid: u32) -> Option<bool> {
     with_dynasm_active_gc(|gc| gc.typeid_is_object(typeid)).flatten()
 }
 
+/// _build_malloc_slowpath parity: nursery overflow slow path.
+///
+/// Called from JIT-compiled code when inline nursery bump allocation
+/// fails (new_free > nursery_top). total_size includes GcHeader.
+///
+/// Returns payload pointer (after GcHeader), matching fast-path semantics.
+pub extern "C" fn dynasm_nursery_slowpath(total_size: u64) -> u64 {
+    let gc_hdr = majit_gc::header::GcHeader::SIZE;
+    let result = DYNASM_ACTIVE_GC.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        guard
+            .as_mut()
+            .map(|gc| gc.alloc_nursery(total_size as usize - gc_hdr).0 as u64)
+    });
+    result.unwrap_or_else(|| unsafe {
+        let raw = libc::calloc(1, total_size as usize) as u64;
+        raw + gc_hdr as u64
+    })
+}
+
+/// _build_malloc_slowpath(kind='var') parity: varsize nursery overflow.
+/// Called with (base_size, item_size, length). Returns payload pointer.
+pub extern "C" fn dynasm_nursery_slowpath_varsize(
+    base_size: u64,
+    item_size: u64,
+    length: u64,
+) -> u64 {
+    let gc_hdr = majit_gc::header::GcHeader::SIZE;
+    let result = DYNASM_ACTIVE_GC.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        guard.as_mut().map(|gc| {
+            gc.alloc_varsize(base_size as usize, item_size as usize, length as usize)
+                .0 as u64
+        })
+    });
+    result.unwrap_or_else(|| {
+        let total = base_size as usize + item_size as usize * length as usize + gc_hdr;
+        unsafe {
+            let raw = libc::calloc(1, total) as u64;
+            raw + gc_hdr as u64
+        }
+    })
+}
+
+/// opassembler.py:956-976: non-array write barrier slow path.
+/// Calls gc.write_barrier(obj) which is the generic barrier.
+pub extern "C" fn dynasm_write_barrier(obj_ptr: u64) {
+    DYNASM_ACTIVE_GC.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        if let Some(gc) = guard.as_mut() {
+            gc.write_barrier(majit_ir::GcRef(obj_ptr as usize));
+        }
+    });
+}
+
+/// opassembler.py:953-960: array write barrier slow path.
+/// Calls jit_remember_young_pointer_from_array(obj) which handles
+/// the CARDS_SET transition for HAS_CARDS arrays.
+pub extern "C" fn dynasm_write_barrier_from_array(obj_ptr: u64) {
+    DYNASM_ACTIVE_GC.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        if let Some(gc) = guard.as_mut() {
+            gc.jit_remember_young_pointer_from_array(majit_ir::GcRef(obj_ptr as usize));
+        }
+    });
+}
+
 /// runner.py:23 AbstractX86CPU — concrete Backend implementation.
 pub struct DynasmBackend {
     /// Next unique trace ID.
@@ -77,6 +144,8 @@ pub struct DynasmBackend {
     next_header_pc: u64,
     /// Constants for the next compilation.
     constants: std::collections::HashMap<u32, i64>,
+    /// Constant type annotations for GC rewriter.
+    constant_types: std::collections::HashMap<u32, majit_ir::Type>,
     /// llmodel.py:64-69 self.vtable_offset — byte offset of the typeptr
     /// field inside instance objects. None when gcremovetypeptr is enabled.
     vtable_offset: Option<usize>,
@@ -88,6 +157,7 @@ impl DynasmBackend {
             next_trace_id: 1,
             next_header_pc: 0,
             constants: std::collections::HashMap::new(),
+            constant_types: std::collections::HashMap::new(),
             vtable_offset: None,
         }
     }
@@ -105,9 +175,9 @@ impl DynasmBackend {
     /// Set constant type annotations for the next compile call.
     pub fn set_constant_types(
         &mut self,
-        _constant_types: std::collections::HashMap<u32, majit_ir::Type>,
+        constant_types: std::collections::HashMap<u32, majit_ir::Type>,
     ) {
-        // dynasm backend doesn't need type annotations for constants
+        self.constant_types = constant_types;
     }
 
     /// Force the next compile to use a specific trace id.
@@ -125,6 +195,67 @@ impl DynasmBackend {
         None
     }
     pub fn set_gc_runtime_id(&mut self, _id: u64) {}
+
+    /// gc.py:525-531 parity: build a GcRewriterImpl from the active GC.
+    fn gc_rewriter(
+        &self,
+        constant_types: &std::collections::HashMap<u32, majit_ir::Type>,
+    ) -> Option<majit_gc::rewrite::GcRewriterImpl> {
+        with_dynasm_active_gc(|gc| {
+            let ct = constant_types.clone();
+            majit_gc::rewrite::GcRewriterImpl {
+                nursery_free_addr: gc.nursery_free() as usize,
+                nursery_top_addr: gc.nursery_top() as usize,
+                max_nursery_size: gc.max_nursery_object_size(),
+                wb_descr: {
+                    let mut descr = majit_gc::WriteBarrierDescr::for_current_gc();
+                    let card_page_shift = gc.card_page_shift();
+                    if card_page_shift > 0 {
+                        descr.jit_wb_card_page_shift = card_page_shift;
+                    } else {
+                        descr.jit_wb_cards_set = 0;
+                        descr.jit_wb_card_page_shift = 0;
+                        descr.jit_wb_cards_set_byteofs = 0;
+                        descr.jit_wb_cards_set_singlebyte = 0;
+                    }
+                    descr
+                },
+                jitframe_info: None,
+                constant_types: ct,
+            }
+        })
+    }
+
+    /// rewrite.py:345 parity: run GC rewriter on ops before assembly.
+    fn prepare_ops_for_compile(&mut self, inputargs: &[InputArg], ops: &[Op]) -> Vec<Op> {
+        let num_inputs = inputargs.len() as u32;
+        let mut normalized: Vec<Op> = ops
+            .iter()
+            .enumerate()
+            .map(|(op_idx, op)| {
+                let mut n = op.clone();
+                if n.result_type() != Type::Void && n.pos.is_none() {
+                    n.pos = OpRef(num_inputs + op_idx as u32);
+                }
+                n
+            })
+            .collect();
+        // rewrite.py:489 parity: inject str_descr/unicode_descr for NEWSTR/NEWUNICODE
+        inject_builtin_string_descrs(&mut normalized);
+        let constant_types = std::mem::take(&mut self.constant_types);
+        if let Some(rewriter) = self.gc_rewriter(&constant_types) {
+            use majit_gc::GcRewriter;
+            let constants = &self.constants;
+            let (result, new_constants) =
+                rewriter.rewrite_for_gc_with_constants(&normalized, constants);
+            for (k, v) in new_constants {
+                self.constants.entry(k).or_insert(v);
+            }
+            result
+        } else {
+            normalized
+        }
+    }
 
     /// llmodel.py:53-54: store gc_ll_descr on the cpu instance.
     ///
@@ -353,8 +484,10 @@ impl Backend for DynasmBackend {
         self.next_trace_id += 1;
         let header_pc = self.next_header_pc;
 
+        // gc.py:109 rewrite_assembler parity: run GC rewriter before regalloc.
+        let prepared_ops = self.prepare_ops_for_compile(inputargs, ops);
         let constants = std::mem::take(&mut self.constants);
-        let typeid_table = self.collect_classptr_typeid_table(ops, &constants);
+        let typeid_table = self.collect_classptr_typeid_table(&prepared_ops, &constants);
         let mut asm = Asm::new(
             trace_id,
             header_pc,
@@ -363,7 +496,7 @@ impl Backend for DynasmBackend {
             typeid_table,
         );
         asm.set_call_assembler_targets(Self::call_assembler_targets_snapshot());
-        let compiled = asm.assemble_loop(inputargs, ops)?;
+        let compiled = asm.assemble_loop(inputargs, &prepared_ops)?;
 
         let code_addr = codebuf::buffer_ptr(&compiled.buffer) as usize;
         let code_size = compiled.buffer.len();
@@ -387,24 +520,21 @@ impl Backend for DynasmBackend {
         let trace_id = self.next_trace_id;
         self.next_trace_id += 1;
 
+        let prepared_ops = self.prepare_ops_for_compile(inputargs, ops);
         let constants = std::mem::take(&mut self.constants);
-        let typeid_table = self.collect_classptr_typeid_table(ops, &constants);
+        let typeid_table = self.collect_classptr_typeid_table(&prepared_ops, &constants);
         let mut asm = Asm::new(trace_id, 0, constants, self.vtable_offset, typeid_table);
         asm.set_call_assembler_targets(Self::call_assembler_targets_snapshot());
 
         let orig_compiled = Self::get_compiled(original_token);
 
-        // assembler.py:638 rebuild_faillocs_from_descr(faildescr, inputargs)
-        // RPython uses the exact faildescr object. We find the matching
-        // DynasmFailDescr by (trace_id, fail_index) across root loop +
-        // all bridges. This handles bridge-on-bridge correctly.
         let guard_descr = Self::find_descr(
             original_token,
             fail_descr.trace_id(),
             fail_descr.fail_index(),
         );
         let arglocs = Asm::rebuild_faillocs_from_descr(&guard_descr, inputargs);
-        let compiled = asm.assemble_bridge(fail_descr, inputargs, ops, &arglocs)?;
+        let compiled = asm.assemble_bridge(fail_descr, inputargs, &prepared_ops, &arglocs)?;
 
         let bridge_addr = codebuf::buffer_ptr(&compiled.buffer) as usize;
         let code_size = compiled.buffer.len();
@@ -967,5 +1097,119 @@ mod tests {
         assert!(majit_gc::check_is_object(obj));
         assert_eq!(majit_gc::get_actual_typeid(obj), Some(obj_tid));
         assert_eq!(majit_gc::typeid_is_object(obj_tid), Some(true));
+    }
+}
+
+// ── rewrite.py:489 parity: inject str_descr/unicode_descr ──
+
+const BUILTIN_STRING_LEN_OFFSET: usize = std::mem::size_of::<usize>();
+const BUILTIN_STRING_BASE_SIZE: usize = BUILTIN_STRING_LEN_OFFSET + std::mem::size_of::<usize>();
+
+#[derive(Debug)]
+struct BuiltinFieldDescr {
+    offset: usize,
+    field_size: usize,
+    field_type: Type,
+    signed: bool,
+}
+
+impl majit_ir::Descr for BuiltinFieldDescr {
+    fn as_field_descr(&self) -> Option<&dyn majit_ir::FieldDescr> {
+        Some(self)
+    }
+}
+
+impl majit_ir::FieldDescr for BuiltinFieldDescr {
+    fn offset(&self) -> usize {
+        self.offset
+    }
+    fn field_size(&self) -> usize {
+        self.field_size
+    }
+    fn field_type(&self) -> Type {
+        self.field_type
+    }
+    fn is_field_signed(&self) -> bool {
+        self.signed
+    }
+}
+
+#[derive(Debug)]
+struct BuiltinArrayDescr {
+    base_size: usize,
+    item_size: usize,
+    type_id: u32,
+    item_type: Type,
+    signed: bool,
+    len_descr: Arc<BuiltinFieldDescr>,
+}
+
+impl majit_ir::Descr for BuiltinArrayDescr {
+    fn as_array_descr(&self) -> Option<&dyn majit_ir::ArrayDescr> {
+        Some(self)
+    }
+}
+
+impl majit_ir::ArrayDescr for BuiltinArrayDescr {
+    fn base_size(&self) -> usize {
+        self.base_size
+    }
+    fn item_size(&self) -> usize {
+        self.item_size
+    }
+    fn type_id(&self) -> u32 {
+        self.type_id
+    }
+    fn item_type(&self) -> Type {
+        self.item_type
+    }
+    fn is_item_signed(&self) -> bool {
+        self.signed
+    }
+    fn len_descr(&self) -> Option<&dyn majit_ir::FieldDescr> {
+        Some(self.len_descr.as_ref())
+    }
+}
+
+fn builtin_string_array_descr(opcode: majit_ir::OpCode) -> Option<majit_ir::DescrRef> {
+    use majit_ir::OpCode;
+    let item_size = match opcode {
+        OpCode::Newstr
+        | OpCode::Strlen
+        | OpCode::Strgetitem
+        | OpCode::Strsetitem
+        | OpCode::Copystrcontent
+        | OpCode::Strhash => 1,
+        OpCode::Newunicode
+        | OpCode::Unicodelen
+        | OpCode::Unicodegetitem
+        | OpCode::Unicodesetitem
+        | OpCode::Copyunicodecontent
+        | OpCode::Unicodehash => 4,
+        _ => return None,
+    };
+    let len_descr = Arc::new(BuiltinFieldDescr {
+        offset: BUILTIN_STRING_LEN_OFFSET,
+        field_size: 8,
+        field_type: Type::Int,
+        signed: false,
+    });
+    Some(Arc::new(BuiltinArrayDescr {
+        base_size: BUILTIN_STRING_BASE_SIZE,
+        item_size,
+        type_id: 0,
+        item_type: Type::Int,
+        signed: false,
+        len_descr,
+    }))
+}
+
+fn inject_builtin_string_descrs(ops: &mut [Op]) {
+    for op in ops {
+        if op.descr.is_none() {
+            if let Some(descr) = builtin_string_array_descr(op.opcode) {
+                op.descr = Some(descr);
+            }
+        }
     }
 }

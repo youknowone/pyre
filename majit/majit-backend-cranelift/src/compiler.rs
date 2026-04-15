@@ -3206,12 +3206,8 @@ fn op_var_index(op: &Op, op_idx: usize, num_inputs: usize) -> usize {
 fn is_rewriter_immediate_arg(opcode: majit_ir::OpCode, arg_idx: usize) -> bool {
     use majit_ir::OpCode;
     match opcode {
-        // gc/rewrite.rs:560,590: CALL_MALLOC_NURSERY(size_immediate)
-        OpCode::CallMallocNursery => arg_idx == 0,
         // ZeroArray(base, start_imm, size_imm, scale_start_imm, scale_size_imm)
         OpCode::ZeroArray => arg_idx >= 1 && arg_idx <= 4,
-        // NurseryPtrIncrement(base, byte_offset_imm)
-        OpCode::NurseryPtrIncrement => arg_idx == 1,
         _ => false,
     }
 }
@@ -8193,10 +8189,11 @@ impl CraneliftBackend {
                         // Slow path passes GC-updated values from jitframe.
                         let (nf_addr, nt_addr) = majit_gc::nursery::nursery_global_addrs();
                         let flags = MemFlags::trusted();
-                        // gc/rewrite.rs:569,599: size is a raw OpRef value from the
-                        // GC rewriter (NOT a constant-pool reference). Use raw value
-                        // to avoid collision with optimizer-produced constants.
-                        let size_total = builder.ins().iconst(cl_types::I64, op.arg(0).0 as i64);
+                        let size_val = constants
+                            .get(&op.arg(0).0)
+                            .copied()
+                            .unwrap_or(op.arg(0).0 as i64);
+                        let size_total = builder.ins().iconst(cl_types::I64, size_val);
                         let nf_ptr = builder.ins().iconst(ptr_type, nf_addr as i64);
                         let nt_ptr = builder.ins().iconst(ptr_type, nt_addr as i64);
                         let free = builder.ins().load(ptr_type, flags, nf_ptr, 0);
@@ -8340,8 +8337,9 @@ impl CraneliftBackend {
                     let runtime_id = builder.ins().iconst(cl_types::I64, runtime_id as i64);
                     let base_size = builder.ins().iconst(cl_types::I64, ad.base_size() as i64);
                     let item_size = builder.ins().iconst(cl_types::I64, ad.item_size() as i64);
+                    // rewrite.py:858: args = [ConstInt(kind), ConstInt(itemsize), v_length]
                     let length =
-                        resolve_opref_or_imm(&mut builder, &constants, &known_values, op.arg(0));
+                        resolve_opref_or_imm(&mut builder, &constants, &known_values, op.arg(2));
                     let result = emit_collecting_gc_call(
                         &mut builder,
                         ptr_type,
@@ -8734,81 +8732,9 @@ impl CraneliftBackend {
 
                 // ── GC stores ──
                 OpCode::GcStore => {
-                    if op.args.len() == 3 {
-                        let base = resolve_opref(&mut builder, &constants, op.arg(0));
-                        match op.arg(1).0 {
-                            0 => {
-                                let hdr_addr =
-                                    builder.ins().iadd_imm(base, -(GcHeader::SIZE as i64));
-                                let old_hdr = builder.ins().load(
-                                    cl_types::I64,
-                                    MemFlags::trusted(),
-                                    hdr_addr,
-                                    0,
-                                );
-                                let flags_mask =
-                                    builder.ins().iconst(cl_types::I64, (!TYPE_ID_MASK) as i64);
-                                let tid = builder.ins().iconst(
-                                    cl_types::I64,
-                                    (op.arg(2).0 as u64 & TYPE_ID_MASK) as i64,
-                                );
-                                let preserved_flags = builder.ins().band(old_hdr, flags_mask);
-                                let new_hdr = builder.ins().bor(preserved_flags, tid);
-                                builder
-                                    .ins()
-                                    .store(MemFlags::trusted(), new_hdr, hdr_addr, 0);
-                            }
-                            1 => {
-                                // GcStore slot 1 writes the vtable pointer to
-                                // obj[0]. arg(2) is a 64-bit constant pool key
-                                // (vtable is a full 64-bit pointer and cannot
-                                // fit in an OpRef u32). Resolve via constants
-                                // map to get the correct 64-bit immediate.
-                                // Match main's SetfieldGc lowering order
-                                // (iconst → iadd_imm → store) for stable
-                                // instruction scheduling across runs.
-                                let vtable_val = constants
-                                    .get(&op.arg(2).0)
-                                    .copied()
-                                    .unwrap_or(op.arg(2).0 as i64);
-                                let vtable = builder.ins().iconst(cl_types::I64, vtable_val);
-                                let addr = builder.ins().iadd_imm(base, 0);
-                                builder.ins().store(MemFlags::trusted(), vtable, addr, 0);
-                            }
-                            2 => {
-                                let descr = op.descr.as_ref().expect(
-                                    "rewrite-generated length store must carry an ArrayDescr",
-                                );
-                                let ad = descr.as_array_descr().expect(
-                                    "rewrite-generated length store descr must be an ArrayDescr",
-                                );
-                                let len_descr = ad
-                                    .len_descr()
-                                    .expect("rewrite-generated length store requires a len_descr");
-                                let addr = builder.ins().iadd_imm(base, len_descr.offset() as i64);
-                                let length = resolve_opref_or_imm(
-                                    &mut builder,
-                                    &constants,
-                                    &known_values,
-                                    op.arg(2),
-                                );
-                                emit_store_to_addr(
-                                    &mut builder,
-                                    addr,
-                                    length,
-                                    len_descr.field_type(),
-                                    len_descr.field_size(),
-                                    op.opcode,
-                                )?;
-                            }
-                            _ => {
-                                return Err(unsupported_semantics(
-                                    op.opcode,
-                                    "unknown rewrite-generated store marker",
-                                ));
-                            }
-                        }
-                    } else if op.args.len() == 4 {
+                    // rewrite.py:140-158 emit_gc_store_or_indexed parity.
+                    // 4-arg form: GC_STORE(base, ConstInt(offset), value, ConstInt(size))
+                    if op.args.len() >= 4 {
                         let item_size = resolve_constant_i64(
                             &constants,
                             &known_values,
@@ -8847,7 +8773,7 @@ impl CraneliftBackend {
                     } else {
                         return Err(unsupported_semantics(
                             op.opcode,
-                            "GC_STORE expects either the rewrite-generated 3-arg form or the generic 4-arg form",
+                            "GC_STORE expects 4-arg form: [base, offset, value, size]",
                         ));
                     }
                 }
@@ -9353,11 +9279,7 @@ impl CraneliftBackend {
                 // args[0] = base ptr, args[1] = byte offset
                 OpCode::NurseryPtrIncrement => {
                     let base = resolve_opref(&mut builder, &constants, op.arg(0));
-                    // gc/rewrite.rs:587: byte offset is a raw OpRef value
-                    // (NOT a constant-pool reference). Use raw value to avoid
-                    // collision with optimizer-produced constants at the same
-                    // OpRef index.
-                    let offset = builder.ins().iconst(cl_types::I64, op.arg(1).0 as i64);
+                    let offset = resolve_opref(&mut builder, &constants, op.arg(1));
                     let r = builder.ins().iadd(base, offset);
                     builder.def_var(var(vi), r);
                 }
@@ -16624,18 +16546,28 @@ mod tests {
     #[test]
     fn test_gc_alloc_and_init_with_configured_runtime() {
         let mut backend = make_gc_backend();
+        // Constants: 10000=32(size), 10001=-8(tid_ofs), 10002=7(tid),
+        // 10003=8(word), 10004=0(vtable_ofs), 10005=0xDEAD(vtable)
+        let mut consts = HashMap::new();
+        consts.insert(10000, 32_i64);
+        consts.insert(10001, -8_i64);
+        consts.insert(10002, 7_i64);
+        consts.insert(10003, 8_i64);
+        consts.insert(10004, 0_i64);
+        consts.insert(10005, 0xDEAD_i64);
+        backend.set_constants(consts);
 
         let inputargs = vec![];
         let ops = vec![
-            mk_op(OpCode::CallMallocNursery, &[OpRef(32)], 0),
+            mk_op(OpCode::CallMallocNursery, &[OpRef(10000)], 0),
             mk_op(
                 OpCode::GcStore,
-                &[OpRef(0), OpRef(0), OpRef(7)],
+                &[OpRef(0), OpRef(10001), OpRef(10002), OpRef(10003)],
                 OpRef::NONE.0,
             ),
             mk_op(
                 OpCode::GcStore,
-                &[OpRef(0), OpRef(1), OpRef(0xDEAD)],
+                &[OpRef(0), OpRef(10004), OpRef(10005), OpRef(10003)],
                 OpRef::NONE.0,
             ),
             mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
@@ -16654,19 +16586,29 @@ mod tests {
     #[test]
     fn test_gc_batched_allocation_layout_with_configured_runtime() {
         let mut backend = make_gc_backend();
+        // Constants: 10000=56(total_size), 10001=-8(tid_ofs), 10002=1(tid1),
+        // 10003=8(word), 10004=24(incr), 10005=2(tid2)
+        let mut consts = HashMap::new();
+        consts.insert(10000, 56_i64);
+        consts.insert(10001, -8_i64);
+        consts.insert(10002, 1_i64);
+        consts.insert(10003, 8_i64);
+        consts.insert(10004, 24_i64);
+        consts.insert(10005, 2_i64);
+        backend.set_constants(consts);
 
         let inputargs = vec![];
         let ops = vec![
-            mk_op(OpCode::CallMallocNursery, &[OpRef(56)], 0),
+            mk_op(OpCode::CallMallocNursery, &[OpRef(10000)], 0),
             mk_op(
                 OpCode::GcStore,
-                &[OpRef(0), OpRef(0), OpRef(1)],
+                &[OpRef(0), OpRef(10001), OpRef(10002), OpRef(10003)],
                 OpRef::NONE.0,
             ),
-            mk_op(OpCode::NurseryPtrIncrement, &[OpRef(0), OpRef(24)], 1),
+            mk_op(OpCode::NurseryPtrIncrement, &[OpRef(0), OpRef(10004)], 1),
             mk_op(
                 OpCode::GcStore,
-                &[OpRef(1), OpRef(0), OpRef(2)],
+                &[OpRef(1), OpRef(10001), OpRef(10005), OpRef(10003)],
                 OpRef::NONE.0,
             ),
             mk_op(OpCode::Finish, &[OpRef(0), OpRef(1)], OpRef::NONE.0),
@@ -16689,17 +16631,29 @@ mod tests {
     #[test]
     fn test_gc_varsize_alloc_and_length_init_with_configured_runtime() {
         let mut backend = make_gc_backend();
+        // Constants: 10000=0(len_ofs), 10001=8(size), 10002=0(kind), 10003=8(itemsize)
+        let mut consts = HashMap::new();
+        consts.insert(10000, 0_i64);
+        consts.insert(10001, 8_i64);
+        consts.insert(10002, 0_i64); // FLAG_ARRAY
+        consts.insert(10003, 8_i64); // itemsize
+        backend.set_constants(consts);
 
         let ad = make_array_descr(16, 8, Type::Int, Some(0));
         let inputargs = vec![InputArg::new_int(0)];
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
-            mk_op_with_descr(OpCode::CallMallocNurseryVarsize, &[OpRef(0)], 1, ad.clone()),
+            // rewrite.py:858: [ConstInt(kind), ConstInt(itemsize), v_length]
             mk_op_with_descr(
+                OpCode::CallMallocNurseryVarsize,
+                &[OpRef(10002), OpRef(10003), OpRef(0)],
+                1,
+                ad.clone(),
+            ),
+            mk_op(
                 OpCode::GcStore,
-                &[OpRef(1), OpRef(2), OpRef(0)],
+                &[OpRef(1), OpRef(10000), OpRef(0), OpRef(10001)],
                 OpRef::NONE.0,
-                ad,
             ),
             mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
         ];
@@ -16782,7 +16736,10 @@ mod tests {
         //   p2 = call_malloc_nursery(size)  # this overflows
         //   guard_nonnull(p2, descr=faildescr) [p0, p1, p2]
         //   finish(p2, descr=finaldescr)
-        let size_arg = OpRef(alloc_size as u32);
+        let mut consts = HashMap::new();
+        consts.insert(10000, alloc_size as i64);
+        backend.set_constants(consts);
+        let size_arg = OpRef(10000);
         let inputargs = vec![];
         let mut guard = mk_op(OpCode::GuardNonnull, &[OpRef(2)], OpRef::NONE.0);
         guard.fail_args = Some(smallvec::smallvec![OpRef(0), OpRef(1), OpRef(2)]);

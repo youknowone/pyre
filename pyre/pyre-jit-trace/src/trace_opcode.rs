@@ -1063,29 +1063,10 @@ impl MIFrame {
             let s = self.sym_mut();
             s.vable_next_instr = ctx.const_int(pc as i64);
         }
-        // If nlocals was lost (e.g., inline tracing reset symbolic_initialized),
-        // re-derive from concrete frame. RPython keeps virtualizable_boxes in
-        // sync across all frames; pyre needs this fallback.
-        // If nlocals was lost (inline tracing reset), recover from
-        // the trace's num_inputs. RPython carries virtualizable_boxes
-        // across frames; pyre derives nlocals from inputarg count.
-        {
-            let num_inputs = ctx.num_inputs();
-            let s = self.sym_mut();
-            if s.nlocals == 0 && s.vable_array_base.is_some() {
-                let base = s.vable_array_base.unwrap() as usize;
-                let nlocals = num_inputs.saturating_sub(base);
-                if nlocals > 0 {
-                    s.nlocals = nlocals;
-                    s.symbolic_locals = (0..nlocals)
-                        .map(|i| OpRef(base as u32 + i as u32))
-                        .collect();
-                    if s.symbolic_local_types.len() != nlocals {
-                        s.symbolic_local_types.resize(nlocals, Type::Ref);
-                    }
-                }
-            }
-        }
+        debug_assert!(
+            self.sym().nlocals > 0 || self.sym().vable_array_base.is_none(),
+            "nlocals must be set by init_symbolic before close_loop_args_at"
+        );
         let (
             frame,
             next_instr,
