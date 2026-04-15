@@ -195,7 +195,7 @@ impl MIFrame {
     /// RPython: both capture (here) and resume (consume_one_section,
     /// resume.py:1381) use the SAME `all_liveness` data, iterating
     /// via LivenessIterator over the same register indices in the
-    /// same order. In pyre, both use JitCode.liveness (LivenessInfo),
+    /// same order. In pyre, both use PyJitCodeMetadata-derived LivenessInfo,
     /// which now has precise per-local liveness from LiveVars::compute
     /// (RPython liveness.py backward analysis parity).
     fn get_list_of_active_boxes(
@@ -204,7 +204,7 @@ impl MIFrame {
         in_a_call: bool,
         after_residual_call: bool,
     ) -> Vec<OpRef> {
-        let (nlocals, local_values, stack_values, majit_jitcode) = {
+        let (nlocals, local_values, stack_values, jitcode_ptr) = {
             let s = self.sym();
             let stack_values = if let Some(ref pre_stack) = s.pre_opcode_stack {
                 pre_stack.clone()
@@ -212,11 +212,12 @@ impl MIFrame {
                 let stack_only = s.stack_only_depth();
                 s.symbolic_stack[..stack_only.min(s.symbolic_stack.len())].to_vec()
             };
-            // state::JitCode is Box'd in MetaInterpStaticData.jitcodes,
-            // so the Option<JitCode> inside has a stable heap address.
-            let mjc: Option<&majit_metainterp::jitcode::JitCode> =
-                unsafe { (*s.jitcode).majit_jitcode.as_ref() };
-            (s.nlocals, s.symbolic_locals.clone(), stack_values, mjc)
+            (
+                s.nlocals,
+                s.symbolic_locals.clone(),
+                stack_values,
+                s.jitcode,
+            )
         };
         // pyjitpl.py:194: in_a_call or after_residual_call → self.pc
         let live_pc = if in_a_call || after_residual_call {
@@ -227,41 +228,38 @@ impl MIFrame {
         // pyjitpl.py:202-203: read the 2-byte offset from JitCode.code
         // (upstream uses `decode_offset(self.jitcode.code, pc + 1)`) and
         // then read the `[len_i][len_r][len_f]` header from the shared
-        // all_liveness byte string. pyre keeps both the offset side
-        // table (`liveness_offsets`) and the packed `liveness_info`
-        // bytes on the JitCode directly; upstream stores the latter
-        // on metainterp_sd.
+        // all_liveness byte string. Pyre stores the packed bytes on its
+        // MetaInterpStaticData JitCode entry; upstream stores them on
+        // metainterp_sd.
         //
         // TRANSITIONAL: when `majit_jitcode` has not been populated yet
         // (inlined-call frames without their own JitCode), fall back to
         // the pyre-jit-trace LiveVars analysis. Pyre's call.py parity
         // work will make every tracing frame carry a valid JitCode so
         // this branch can be removed.
-        let jc = match majit_jitcode {
-            Some(jc) => jc,
-            None => {
-                let raw_code_ptr = unsafe { (*self.sym().jitcode).raw_code() };
-                let live = if !raw_code_ptr.is_null() {
-                    Some(liveness_for(raw_code_ptr))
-                } else {
-                    None
-                };
-                let mut boxes = Vec::with_capacity(nlocals + stack_values.len());
-                for (idx, slot) in local_values.iter().enumerate() {
-                    let is_live = live.map_or(!slot.is_none(), |lv| lv.is_local_live(live_pc, idx));
-                    if is_live {
-                        boxes.push(*slot);
-                    }
+        let jc = unsafe { &*jitcode_ptr };
+        if jc.majit_jitcode.is_none() {
+            let raw_code_ptr = unsafe { (*self.sym().jitcode).raw_code() };
+            let live = if !raw_code_ptr.is_null() {
+                Some(liveness_for(raw_code_ptr))
+            } else {
+                None
+            };
+            let mut boxes = Vec::with_capacity(nlocals + stack_values.len());
+            for (idx, slot) in local_values.iter().enumerate() {
+                let is_live = live.map_or(!slot.is_none(), |lv| lv.is_local_live(live_pc, idx));
+                if is_live {
+                    boxes.push(*slot);
                 }
-                for (idx, slot) in stack_values.iter().enumerate() {
-                    let is_live = live.map_or(!slot.is_none(), |lv| lv.is_stack_live(live_pc, idx));
-                    if is_live {
-                        boxes.push(*slot);
-                    }
-                }
-                return boxes;
             }
-        };
+            for (idx, slot) in stack_values.iter().enumerate() {
+                let is_live = live.map_or(!slot.is_none(), |lv| lv.is_stack_live(live_pc, idx));
+                if is_live {
+                    boxes.push(*slot);
+                }
+            }
+            return boxes;
+        }
         let jit_pc = jc.py_to_jit_pc.get(live_pc).copied().unwrap_or_else(|| {
             panic!(
                 "get_list_of_active_boxes: no pc_map entry for live_pc={}",
@@ -269,15 +267,10 @@ impl MIFrame {
             )
         });
         let offset = jc
-            .liveness_offsets
-            .get(&(jit_pc as u32))
-            .copied()
-            .unwrap_or_else(|| {
-                panic!(
-                    "get_list_of_active_boxes: missing liveness[{}] (live_pc={})",
-                    jit_pc, live_pc
-                )
-            }) as usize;
+            .majit_jitcode
+            .as_ref()
+            .expect("majit_jitcode checked above")
+            .get_live_vars_info_at(jit_pc);
         let all_liveness: &[u8] = &jc.liveness_info;
         // pyjitpl.py:204-206
         let length_i = all_liveness[offset] as u32;

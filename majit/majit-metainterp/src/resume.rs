@@ -5410,22 +5410,22 @@ impl<'a> ResumeDataDirectReader<'a> {
     /// ```
     ///
     /// Upstream keeps `liveness_info` on `metainterp_sd`; pyre currently
-    /// keeps it per-JitCode (same encoding, narrower sharing) so the
-    /// slice is borrowed from `bh.jitcode.liveness_info` instead of
-    /// `metainterp_sd`. The three callbacks still call `next_int`/`next_ref`/
+    /// passes it as BlackholeInterpreter side metadata (same encoding,
+    /// narrower sharing) until `-live-` offsets are embedded in bytecode.
+    /// The three callbacks still call `next_int`/`next_ref`/
     /// `next_float` on this reader (resume.py:1028-1038), matching
     /// `_callback_i/_callback_r/_callback_f` plus `write_an_int/write_a_ref/
     /// write_a_float` (resume.py:1590-1597).
     fn _prepare_next_section(&mut self, info: usize, bh: &mut BlackholeInterpreter) {
         use majit_codewriter::liveness::LivenessIterator;
 
-        // SAFETY: `bh.jitcode.liveness_info` is read-only metadata
+        // SAFETY: `bh.liveness_info` is read-only metadata
         // populated by the codewriter. The mutating operations we
         // perform below (`setarg_i/setarg_r/setarg_f`) touch the
         // register arrays, not the liveness bytes. The borrowed slice
         // therefore stays valid for the duration of this section.
-        let liveness_len = bh.jitcode.liveness_info.len();
-        let liveness_ptr = bh.jitcode.liveness_info.as_ptr();
+        let liveness_len = bh.liveness_info.len();
+        let liveness_ptr = bh.liveness_info.as_ptr();
         let all_liveness: &[u8] = unsafe { std::slice::from_raw_parts(liveness_ptr, liveness_len) };
 
         // jitcode.py:149-151 — three length bytes.
@@ -5735,9 +5735,41 @@ impl<'a> ResumeDataDirectReader<'a> {
 /// `resolve_jitcode` corresponds to RPython's `jitcodes[jitcode_pos]` lookup.
 /// In RPython, `metainterp_sd.jitcodes` is a pre-compiled array.
 /// In majit, this is typically backed by jitcode_factory or a pre-built table.
+pub struct ResolvedJitCode {
+    pub jitcode: crate::jitcode::JitCode,
+    pub pc: usize,
+    /// Pyre virtualizable side metadata. RPython does not store this on
+    /// JitCode; callers that need it attach it to the BlackholeInterpreter.
+    pub virtualizable_stack_base: Option<usize>,
+    /// Packed all_liveness bytes. RPython stores this on metainterp_sd and
+    /// the offset inline in JitCode.code.
+    pub liveness_info: Vec<u8>,
+}
+
+impl ResolvedJitCode {
+    pub fn new(jitcode: crate::jitcode::JitCode, pc: usize) -> Self {
+        Self {
+            jitcode,
+            pc,
+            virtualizable_stack_base: None,
+            liveness_info: Vec::new(),
+        }
+    }
+
+    pub fn with_virtualizable_stack_base(mut self, stack_base: usize) -> Self {
+        self.virtualizable_stack_base = Some(stack_base);
+        self
+    }
+
+    pub fn with_liveness_metadata(mut self, liveness_info: Vec<u8>) -> Self {
+        self.liveness_info = liveness_info;
+        self
+    }
+}
+
 pub fn blackhole_from_resumedata<'a>(
     builder: &mut crate::blackhole::BlackholeInterpBuilder,
-    resolve_jitcode: &dyn Fn(i32, i32) -> Option<(crate::jitcode::JitCode, usize)>,
+    resolve_jitcode: &dyn Fn(i32, i32) -> Option<ResolvedJitCode>,
     rd_numb: &'a [u8],
     rd_consts: &'a [i64],
     deadframe: &'a [i64],
@@ -5781,11 +5813,15 @@ pub fn blackhole_from_resumedata<'a>(
         // resume.py:1338-1340
         let (jitcode_pos, pc) = resumereader.read_jitcode_pos_pc();
         // resume.py:1339: jitcode = jitcodes[jitcode_pos]
-        // resolve_jitcode returns (jitcode, actual_pc) where actual_pc
-        // is the JitCode byte offset (may differ from the rd_numb pc
-        // when rd_numb encodes Python PCs).
-        let (jitcode, actual_pc) = resolve_jitcode(jitcode_pos, pc)?;
-        nextbh.setposition(jitcode, actual_pc);
+        // resolve_jitcode returns the JitCode and bytecode offset. Pyre may
+        // also attach virtualizable layout metadata as a sidecar; RPython's
+        // JitCode itself has no such field.
+        let resolved = resolve_jitcode(jitcode_pos, pc)?;
+        nextbh.setposition(resolved.jitcode, resolved.pc);
+        if let Some(stack_base) = resolved.virtualizable_stack_base {
+            nextbh.virtualizable_stack_base = stack_base;
+        }
+        nextbh.liveness_info = resolved.liveness_info;
 
         // resume.py:1341
         resumereader.consume_one_section(&mut nextbh);

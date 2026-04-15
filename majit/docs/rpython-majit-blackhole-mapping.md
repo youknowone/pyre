@@ -38,7 +38,7 @@ Status legend:
 | `get_tmpreg_f()` | 374 | `get_tmpreg_f()` | 930 | OK | |
 | `_final_result_anytype()` | 377 | — | — | MISSING | Return value by return_type |
 | `cleanup_registers()` | 385 | `cleanup_registers()` | 960 | OK | Clears ref registers and exception_last_value |
-| `get_current_position_info()` | 393 | `get_current_position_info()` | 975 | OK | Searches jitcode.liveness for matching PC |
+| `get_current_position_info()` | 393 | `get_current_position_info()` | 975 | PARTIAL | Canonical path decodes inline `-live-` offsets; pyre still passes temporary side metadata until codewriter emits them |
 | `handle_exception_in_frame(e)` | 396 | `handle_exception_in_frame(exc)` | 1024 | PARTIAL | Exception table lookup exists but handler dispatch may differ |
 | `handle_rvmprof_enter()` | 424 | — | — | N/A | rvmprof not applicable |
 | `copy_constants(regs, consts, idx)` | 441 | — | — | PARTIAL | setposition does register alloc but constant copy from jitcode not fully wired |

@@ -15,21 +15,21 @@ use super::{
     BC_CALL_LOOPINVARIANT_REF, BC_CALL_LOOPINVARIANT_VOID, BC_CALL_MAY_FORCE_FLOAT,
     BC_CALL_MAY_FORCE_INT, BC_CALL_MAY_FORCE_REF, BC_CALL_MAY_FORCE_VOID, BC_CALL_PURE_FLOAT,
     BC_CALL_PURE_INT, BC_CALL_PURE_REF, BC_CALL_REF, BC_CALL_RELEASE_GIL_FLOAT,
-    BC_CALL_RELEASE_GIL_INT, BC_CALL_RELEASE_GIL_REF, BC_CALL_RELEASE_GIL_VOID,
+    BC_CALL_RELEASE_GIL_INT, BC_CALL_RELEASE_GIL_REF, BC_CALL_RELEASE_GIL_VOID, BC_CATCH_EXCEPTION,
     BC_COND_CALL_VALUE_INT, BC_COND_CALL_VALUE_REF, BC_COND_CALL_VOID, BC_COPY_FROM_BOTTOM,
     BC_DUP_STACK, BC_FLOAT_GUARD_VALUE, BC_GETARRAYITEM_VABLE_F, BC_GETARRAYITEM_VABLE_I,
     BC_GETARRAYITEM_VABLE_R, BC_GETFIELD_VABLE_F, BC_GETFIELD_VABLE_I, BC_GETFIELD_VABLE_R,
     BC_HINT_FORCE_VIRTUALIZABLE, BC_INLINE_CALL, BC_INT_GUARD_VALUE, BC_JIT_MERGE_POINT, BC_JUMP,
-    BC_JUMP_TARGET, BC_LOAD_CONST_F, BC_LOAD_CONST_I, BC_LOAD_CONST_R, BC_LOAD_STATE_ARRAY,
-    BC_LOAD_STATE_FIELD, BC_LOAD_STATE_VARRAY, BC_MOVE_F, BC_MOVE_I, BC_MOVE_R, BC_PEEK_I,
-    BC_POP_DISCARD, BC_POP_F, BC_POP_I, BC_POP_R, BC_PUSH_F, BC_PUSH_I, BC_PUSH_R, BC_PUSH_TO,
-    BC_RAISE, BC_RECORD_BINOP_F, BC_RECORD_BINOP_I, BC_RECORD_KNOWN_RESULT_INT,
-    BC_RECORD_KNOWN_RESULT_REF, BC_RECORD_UNARY_F, BC_RECORD_UNARY_I, BC_REF_GUARD_VALUE,
-    BC_REF_RETURN, BC_REQUIRE_STACK, BC_RERAISE, BC_RESIDUAL_CALL_VOID, BC_SET_SELECTED,
-    BC_SETARRAYITEM_VABLE_F, BC_SETARRAYITEM_VABLE_I, BC_SETARRAYITEM_VABLE_R, BC_SETFIELD_VABLE_F,
-    BC_SETFIELD_VABLE_I, BC_SETFIELD_VABLE_R, BC_STORE_DOWN, BC_STORE_STATE_ARRAY,
-    BC_STORE_STATE_FIELD, BC_STORE_STATE_VARRAY, BC_SWAP_STACK, JitArgKind, JitCallArg,
-    JitCallAssemblerTarget, JitCallTarget, JitCode,
+    BC_JUMP_TARGET, BC_LAST_EXC_VALUE, BC_LIVE, BC_LOAD_CONST_F, BC_LOAD_CONST_I, BC_LOAD_CONST_R,
+    BC_LOAD_STATE_ARRAY, BC_LOAD_STATE_FIELD, BC_LOAD_STATE_VARRAY, BC_MOVE_F, BC_MOVE_I,
+    BC_MOVE_R, BC_PEEK_I, BC_POP_DISCARD, BC_POP_F, BC_POP_I, BC_POP_R, BC_PUSH_F, BC_PUSH_I,
+    BC_PUSH_R, BC_PUSH_TO, BC_RAISE, BC_RECORD_BINOP_F, BC_RECORD_BINOP_I,
+    BC_RECORD_KNOWN_RESULT_INT, BC_RECORD_KNOWN_RESULT_REF, BC_RECORD_UNARY_F, BC_RECORD_UNARY_I,
+    BC_REF_GUARD_VALUE, BC_REF_RETURN, BC_REQUIRE_STACK, BC_RERAISE, BC_RESIDUAL_CALL_VOID,
+    BC_SET_SELECTED, BC_SETARRAYITEM_VABLE_F, BC_SETARRAYITEM_VABLE_I, BC_SETARRAYITEM_VABLE_R,
+    BC_SETFIELD_VABLE_F, BC_SETFIELD_VABLE_I, BC_SETFIELD_VABLE_R, BC_STORE_DOWN,
+    BC_STORE_STATE_ARRAY, BC_STORE_STATE_FIELD, BC_STORE_STATE_VARRAY, BC_SWAP_STACK, JitArgKind,
+    JitCallArg, JitCallAssemblerTarget, JitCallTarget, JitCode,
 };
 
 #[derive(Default)]
@@ -421,6 +421,35 @@ impl JitCodeBuilder {
 
     pub fn jump_target(&mut self) {
         self.push_u8(BC_JUMP_TARGET);
+    }
+
+    /// RPython assembler.py: emit `live/` followed by a 2-byte offset into
+    /// the shared all_liveness byte string. Returns the operand offset so the
+    /// caller can patch it after computing liveness.
+    pub fn live_placeholder(&mut self) -> usize {
+        self.push_u8(BC_LIVE);
+        let patch_offset = self.code.len();
+        self.push_u16(0);
+        patch_offset
+    }
+
+    pub fn patch_live_offset(&mut self, patch_offset: usize, offset: u16) {
+        let bytes = offset.to_le_bytes();
+        self.code[patch_offset] = bytes[0];
+        self.code[patch_offset + 1] = bytes[1];
+    }
+
+    /// RPython blackhole.py:969 `catch_exception/L`.
+    pub fn catch_exception(&mut self, label: u16) {
+        self.push_u8(BC_CATCH_EXCEPTION);
+        self.push_label_ref(label);
+    }
+
+    /// RPython blackhole.py:993 `last_exc_value/>r`.
+    pub fn last_exc_value(&mut self, dst: u16) {
+        self.touch_ref_reg(dst);
+        self.push_u8(BC_LAST_EXC_VALUE);
+        self.push_u16(dst);
     }
 
     /// blackhole.py:1066 bhimpl_jit_merge_point: portal merge point.
@@ -1176,21 +1205,10 @@ impl JitCodeBuilder {
             constants_i: self.constants_i,
             constants_r: self.constants_r,
             constants_f: self.constants_f,
-            liveness: Vec::new(),
-            liveness_info: Vec::new(),
-            liveness_offsets: std::collections::HashMap::new(),
             opcodes: self.opcodes,
             sub_jitcodes: self.sub_jitcodes,
             fn_ptrs: self.fn_ptrs,
             assembler_targets: self.assembler_targets,
-            exception_handlers: Vec::new(),
-            jit_to_py_pc: Vec::new(),
-            py_to_jit_pc: Vec::new(),
-            nlocals: 0,
-            portal_frame_reg: u16::MAX,
-            portal_ec_reg: u16::MAX,
-            stack_base: 0,
-            depth_at_py_pc: Vec::new(),
             jitdriver_sd: None,
             descrs: Vec::new(),
             fnaddr: 0,

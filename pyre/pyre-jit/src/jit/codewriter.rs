@@ -17,11 +17,9 @@ use std::cell::UnsafeCell;
 use std::collections::HashMap;
 
 use majit_ir::OpCode;
-use majit_metainterp::jitcode::{JitCode, JitCodeBuilder};
+use majit_metainterp::jitcode::{JitCode, JitCodeBuilder, LivenessInfo};
 use pyre_interpreter::bytecode::{CodeObject, Instruction, OpArgState};
 use pyre_interpreter::runtime_ops::{binary_op_tag, compare_op_tag};
-
-use pyre_jit_trace::virtualizable_spec::LOCALS_CELLS_STACK_W_VABLE_ARRAY_INDEX;
 
 // ---------------------------------------------------------------------------
 // RPython: codewriter/flatten.py KINDS = ['int', 'ref', 'float']
@@ -42,20 +40,47 @@ fn local_to_vable_slot(var_num: usize) -> usize {
     var_num
 }
 
-/// Compiled JitCode with Python PC → JitCode PC mapping.
+/// Pyre-only metadata attached to a Python CodeObject's compiled JitCode.
 ///
-/// RPython: JitCode in codewriter/jitcode.py, plus a per-function PC table
-/// (RPython doesn't need this because jitcode PCs *are* the PCs).
-pub struct PyJitCode {
-    pub jitcode: JitCode,
+/// RPython does not need these fields because its bytecode PCs are already
+/// JitCode PCs. Pyre translates CPython bytecode to JitCode lazily, so the
+/// translation maps live here instead of polluting the canonical JitCode.
+pub struct PyJitCodeMetadata {
     /// py_pc → jitcode byte offset.
     pub pc_map: Vec<usize>,
-    /// jitcode byte offset → py_pc (sorted pairs for binary search reverse lookup).
-    /// Used by handle_exception_in_frame to determine faulting Python PC (lasti).
-    pub jit_to_py_pc: Vec<(usize, usize)>,
+    /// py_pc → jitcode byte offset, named for consumers that mirror RPython's
+    /// frame.pc → jitcode position flow.
+    pub py_to_jit_pc: Vec<usize>,
+    /// Value-stack depth at each Python PC, in slots above stack_base.
+    pub depth_at_py_pc: Vec<u16>,
+    /// Register allocated for the portal's frame red argument.
+    pub portal_frame_reg: u16,
+    /// Register allocated for the portal's execution-context red argument.
+    pub portal_ec_reg: u16,
+    /// Absolute start index of the operand stack in PyFrame.locals_cells_stack_w.
+    pub stack_base: usize,
+    /// Transitional liveness view for pyre trace/resume code. The canonical
+    /// destination is MetaInterpStaticData.all_liveness plus inline live offsets.
+    pub liveness: Vec<LivenessInfo>,
+    pub liveness_info: Vec<u8>,
+}
+
+/// Compiled JitCode plus pyre-only metadata.
+pub struct PyJitCode {
+    pub jitcode: JitCode,
+    pub metadata: PyJitCodeMetadata,
     /// True if the jitcode contains BC_ABORT opcodes (unsupported bytecodes).
     /// Precomputed at compile time to avoid repeated bytecode scanning.
     pub has_abort: bool,
+}
+
+#[derive(Clone, Copy)]
+struct ExceptionCatchSite {
+    landing_label: u16,
+    handler_py_pc: usize,
+    stack_depth: u16,
+    push_lasti: bool,
+    lasti_py_pc: usize,
 }
 
 /// rpython/jit/codewriter/liveness.py:139 "we encode the bitsets of which of
@@ -248,6 +273,32 @@ impl CodeWriter {
             labels.push(assembler.new_label());
         }
 
+        let exception_entries =
+            pyre_interpreter::bytecode::decode_exception_table(&code.exceptiontable);
+        let mut catch_for_pc: Vec<Option<u16>> = vec![None; num_instrs];
+        let mut catch_sites: Vec<ExceptionCatchSite> = Vec::new();
+        for py_pc in 0..num_instrs {
+            let Some(entry) = exception_entries
+                .iter()
+                .find(|entry| py_pc >= entry.start as usize && py_pc < entry.end as usize)
+            else {
+                continue;
+            };
+            let handler_py_pc = entry.target as usize;
+            if handler_py_pc >= num_instrs {
+                continue;
+            }
+            let landing_label = assembler.new_label();
+            catch_for_pc[py_pc] = Some(landing_label);
+            catch_sites.push(ExceptionCatchSite {
+                landing_label,
+                handler_py_pc,
+                stack_depth: entry.depth,
+                push_lasti: entry.push_lasti,
+                lasti_py_pc: py_pc,
+            });
+        }
+
         // RPython jtransform.py:1714-1718 handle_jit_marker__loop_header:
         // Pre-scan JUMP_BACKWARD targets to identify loop headers.
         // RPython emits jit_merge_point + loop_header opcodes at these
@@ -273,8 +324,7 @@ impl CodeWriter {
         // at exception handler entry. Used to correct current_depth at
         // non-linear control flow points.
         let handler_depth_at: std::collections::HashMap<usize, u16> = {
-            let entries = pyre_interpreter::bytecode::decode_exception_table(&code.exceptiontable);
-            entries
+            exception_entries
                 .iter()
                 .map(|e| {
                     let extra = if e.push_lasti { 1u16 } else { 0 };
@@ -295,6 +345,7 @@ impl CodeWriter {
         // precise liveness generation. Stack registers stack_base..stack_base+depth
         // are live at each PC.
         let mut depth_at_pc: Vec<u16> = vec![0; num_instrs];
+        let mut live_patches: Vec<(usize, usize)> = Vec::with_capacity(num_instrs);
 
         // jitcode.py:18: jitdriver_sd is not None for portals.
         // call.py:148: jd.mainjitcode.jitdriver_sd = jd
@@ -324,6 +375,8 @@ impl CodeWriter {
             // RPython flatten.py: Label(block) at block entry
             assembler.mark_label(labels[py_pc]);
             pc_map[py_pc] = assembler.current_pos();
+            let live_patch = assembler.live_placeholder();
+            live_patches.push((py_pc, live_patch));
             depth_at_pc[py_pc] = current_depth;
 
             if loop_header_pcs.contains(&py_pc) {
@@ -898,14 +951,15 @@ impl CodeWriter {
                     assembler.abort_permanent();
                 }
             }
+            if let Some(catch_label) = catch_for_pc[py_pc] {
+                assembler.catch_exception(catch_label);
+            }
         }
 
         // RPython flatten.py parity: every code path ends with an explicit
         // return/raise/goto/unreachable. No end-of-code sentinel needed —
         // falling off the end is unreachable if all bytecodes are covered.
 
-        // RPython: assembler.assemble() → jitcode via make_jitcode()
-        let assembler_code_len = assembler.current_pos();
         // RPython parity: JitCodeBuilder tracks has_abort via abort() calls
         // (BC_ABORT=13). abort_permanent() (BC_ABORT_PERMANENT=14) does not
         // set has_abort. This codewriter only uses abort_permanent() for
@@ -913,7 +967,6 @@ impl CodeWriter {
         // The flag lives on the builder, not on the finished JitCode —
         // matching RPython jitcode.py which has no has_abort field.
         let mut has_abort = assembler.has_abort_flag();
-        let mut jitcode = assembler.finish();
 
         // liveness.py parity: generate LivenessInfo at each bytecode PC.
         // RPython: compute_liveness() runs backward dataflow on SSARepr,
@@ -921,7 +974,7 @@ impl CodeWriter {
         // (pyjitpl.py:177) and consume_one_section (resume.py:1381) use the
         // same all_liveness data. In pyre, LiveVars::compute provides the
         // equivalent backward analysis on Python bytecodes.
-        {
+        let liveness: Vec<LivenessInfo> = {
             let live_vars = pyre_jit_trace::state::liveness_for(code as *const _);
             let mut liveness = Vec::with_capacity(num_instrs);
             for py_pc in 0..num_instrs {
@@ -936,44 +989,22 @@ impl CodeWriter {
                 for d in 0..depth {
                     live_r.push(stack_base + d);
                 }
-                liveness.push(majit_metainterp::jitcode::LivenessInfo {
+                liveness.push(LivenessInfo {
                     pc: jit_pc as u16,
                     live_i_regs: vec![],
                     live_r_regs: live_r,
                     live_f_regs: vec![],
                 });
             }
-            // Deduplicate entries at the same JitCode PC (multiple Python
-            // bytecodes may map to the same JitCode offset, e.g. Cache/Nop).
-            // When merging, take the UNION of live registers (conservative).
-            liveness.sort_by_key(|l| l.pc);
-            let mut merged: Vec<majit_metainterp::jitcode::LivenessInfo> = Vec::new();
-            for entry in liveness {
-                if let Some(last) = merged.last_mut() {
-                    if last.pc == entry.pc {
-                        // Union: merge live_r_regs
-                        for &reg in &entry.live_r_regs {
-                            if !last.live_r_regs.contains(&reg) {
-                                last.live_r_regs.push(reg);
-                            }
-                        }
-                        last.live_r_regs.sort();
-                        continue;
-                    }
-                }
-                merged.push(entry);
-            }
-            jitcode.liveness = merged;
-        }
+            liveness
+        };
 
         // liveness.py:147-166 encode_liveness parity: pack each
-        // merged LivenessInfo into the all_liveness byte string with
+        // LivenessInfo into the all_liveness byte string with
         // the `[len_i][len_r][len_f] | bitset_i | bitset_r | bitset_f`
-        // layout (liveness.py:139-145). `jitcode.liveness_offsets`
-        // maps each jit_pc to the entry's offset in the packed string —
-        // the same information RPython embeds inline via the `-live-`
-        // opcode and `encode_offset`.
-        {
+        // layout (liveness.py:139-145), then patch each inline `live/`
+        // marker with the 2-byte offset into that shared byte string.
+        let liveness_info = {
             use majit_codewriter::liveness::encode_liveness;
 
             // live_i_regs / live_f_regs are always empty in pyre (all
@@ -990,12 +1021,9 @@ impl CodeWriter {
             // rationale and the proper-fix TODO. This is a documented
             // safety net, not source-equivalent behavior.
             let mut liveness_info: Vec<u8> = Vec::new();
-            let mut liveness_offsets: std::collections::HashMap<u32, u32> =
-                std::collections::HashMap::new();
+            let mut liveness_positions: HashMap<(Vec<u8>, Vec<u8>, Vec<u8>), u16> = HashMap::new();
             let mut liveness_overflow = false;
-            for entry in &jitcode.liveness {
-                let offset = liveness_info.len() as u32;
-                liveness_offsets.insert(entry.pc as u32, offset);
+            for (entry, &(_, patch_offset)) in liveness.iter().zip(live_patches.iter()) {
                 let live_i_bytes = liveness_regs_to_u8_sorted(&entry.live_i_regs);
                 let live_r_bytes = liveness_regs_to_u8_sorted(&entry.live_r_regs);
                 let live_f_bytes = liveness_regs_to_u8_sorted(&entry.live_f_regs);
@@ -1007,14 +1035,31 @@ impl CodeWriter {
                             break;
                         }
                     };
-                // liveness.py:144 header: three lengths.
-                liveness_info.push(live_i_bytes.len() as u8);
-                liveness_info.push(live_r_bytes.len() as u8);
-                liveness_info.push(live_f_bytes.len() as u8);
-                // liveness.py:145 body: three packed bitsets.
-                liveness_info.extend(encode_liveness(&live_i_bytes));
-                liveness_info.extend(encode_liveness(&live_r_bytes));
-                liveness_info.extend(encode_liveness(&live_f_bytes));
+                let key = (
+                    live_i_bytes.clone(),
+                    live_r_bytes.clone(),
+                    live_f_bytes.clone(),
+                );
+                let offset = if let Some(&offset) = liveness_positions.get(&key) {
+                    offset
+                } else {
+                    if liveness_info.len() > u16::MAX as usize {
+                        liveness_overflow = true;
+                        break;
+                    }
+                    let offset = liveness_info.len() as u16;
+                    liveness_positions.insert(key, offset);
+                    // liveness.py:144 header: three lengths.
+                    liveness_info.push(live_i_bytes.len() as u8);
+                    liveness_info.push(live_r_bytes.len() as u8);
+                    liveness_info.push(live_f_bytes.len() as u8);
+                    // liveness.py:145 body: three packed bitsets.
+                    liveness_info.extend(encode_liveness(&live_i_bytes));
+                    liveness_info.extend(encode_liveness(&live_r_bytes));
+                    liveness_info.extend(encode_liveness(&live_f_bytes));
+                    offset
+                };
+                assembler.patch_live_offset(patch_offset, offset);
             }
             if liveness_overflow {
                 // Mark the jitcode as unexecutable and clear partial state
@@ -1022,25 +1067,30 @@ impl CodeWriter {
                 // has_abort lives on PyJitCode, not JitCode (RPython parity
                 // — rpython/jit/codewriter/jitcode.py has no such field).
                 has_abort = true;
-                jitcode.liveness_info.clear();
-                jitcode.liveness_offsets.clear();
+                Vec::new()
             } else {
-                jitcode.liveness_info = liveness_info;
-                jitcode.liveness_offsets = liveness_offsets;
+                liveness_info
             }
+        };
+
+        for site in catch_sites {
+            assembler.mark_label(site.landing_label);
+            let mut exc_slot = stack_base + site.stack_depth;
+            if site.push_lasti {
+                assembler.load_const_i_value(int_tmp0, site.lasti_py_pc as i64);
+                assembler.call_ref_typed(
+                    box_int_fn_idx,
+                    &[majit_metainterp::jitcode::JitCallArg::int(int_tmp0)],
+                    obj_tmp0,
+                );
+                assembler.move_r(exc_slot, obj_tmp0);
+                exc_slot += 1;
+            }
+            assembler.last_exc_value(exc_slot);
+            assembler.jump(labels[site.handler_py_pc]);
         }
 
-        // RPython parity: forward PC map (py_pc → jitcode_pc) so
-        // get_list_of_active_boxes can look up LivenessInfo by Python PC.
-        jitcode.py_to_jit_pc = pc_map.clone();
-        // flatten.py / regalloc.py parity: record the symbolic value-stack
-        // depth at every Python PC. RPython jitcodes pre-allocate a typed
-        // register for every value-stack temporary, so resume / merge
-        // exit paths can read exactly `depth_at_py_pc[py_pc]` registers
-        // starting at `stack_base = nlocals` (the codewriter never emits
-        // BC_PUSH_R / BC_POP_R against a runtime stack — only BC_MOVE_R
-        // against the typed register bank).
-        jitcode.depth_at_py_pc = depth_at_pc.clone();
+        let mut jitcode = assembler.finish();
 
         // call.py:148 grab_initial_jitcodes: jd.mainjitcode.jitdriver_sd = jd
         // pyre uses index 0 (single jitdriver) for portal jitcodes.
@@ -1052,82 +1102,29 @@ impl CodeWriter {
             arg_classes: "r".to_string(),
             result_type: 'r',
         };
-        jitcode.nlocals = code.varnames.len();
-        jitcode.portal_frame_reg = portal_frame_reg;
-        jitcode.portal_ec_reg = portal_ec_reg;
-        // Per-jitcode stack base in `locals_cells_stack_w`. Each jitcode in
-        // a blackhole chain owns its own value (different functions have
-        // different cellvar layouts), so the rd_numb resume path can read
-        // it from `bh.jitcode.stack_base` instead of looking up the live
-        // PyFrame's stack_base for the whole chain.
-        jitcode.stack_base = code.varnames.len() + pyre_interpreter::pyframe::ncells(code);
-
-        // blackhole.py handle_exception_in_frame: build exception handler table
-        // from Python's code.exceptiontable. Maps Python PC ranges to JitCode PCs.
-        //
-        // Python 3.11+ exception table: each entry covers [start, end) instruction
-        // range. find_exception_handler(table, offset) returns the handler for
-        // `offset` if offset >= start && offset < end.
-        //
-        // The faulting Python PC (lasti) is determined at runtime from the
-        // blackhole's current jitcode position via jit_to_py_pc reverse map.
-        // lasti_value on JitExceptionHandler is unused; the blackhole dispatch
-        // reads the actual faulting PC.
-        {
-            use majit_metainterp::jitcode::JitExceptionHandler;
-            // decode_exception_table: decode ALL entries from the binary table.
-            // Each ExceptionTableEntry: { start, end, target, depth, push_lasti }.
-            let entries = pyre_interpreter::bytecode::decode_exception_table(&code.exceptiontable);
-            let handlers: Vec<JitExceptionHandler> = entries
-                .iter()
-                .filter_map(|entry| {
-                    let jit_start = *pc_map.get(entry.start as usize)?;
-                    let jit_end = if (entry.end as usize) < num_instrs {
-                        pc_map
-                            .get(entry.end as usize)
-                            .copied()
-                            .unwrap_or(assembler_code_len)
-                    } else {
-                        assembler_code_len
-                    };
-                    let jit_target = *pc_map.get(entry.target as usize)?;
-                    Some(JitExceptionHandler {
-                        jit_start,
-                        jit_end,
-                        jit_target,
-                        stack_depth: entry.depth,
-                        push_lasti: entry.push_lasti,
-                        lasti_value: 0, // determined at runtime
-                        box_int_fn_idx: box_int_fn_idx as u16,
-                    })
-                })
-                .collect();
-            jitcode.exception_handlers = handlers;
-        }
-
-        // Build jit_to_py_pc reverse map for lasti lookup at runtime.
-        let jit_to_py_pc: Vec<(usize, usize)> = {
-            let mut pairs: Vec<(usize, usize)> = pc_map
-                .iter()
-                .enumerate()
-                .map(|(py_pc, &jit_pc)| (jit_pc, py_pc))
-                .collect();
-            pairs.sort_by_key(|&(jit_pc, _)| jit_pc);
-            pairs.dedup_by_key(|entry| entry.0);
-            pairs
-        };
-
-        // Store reverse map on JitCode for handle_exception_in_frame lasti lookup.
-        jitcode.jit_to_py_pc = jit_to_py_pc.clone();
+        // Per-code stack base in `locals_cells_stack_w`. RPython's JitCode
+        // does not carry PyFrame layout data; keep it in PyJitCodeMetadata
+        // and attach it to BlackholeInterpreter setup when pyre needs it.
+        let frame_stack_base = code.varnames.len() + pyre_interpreter::pyframe::ncells(code);
 
         // call.py:167-169 jitcode.fnaddr = getfunctionptr(graph).
         // pyre: all Python functions go through the single portal runner.
         jitcode.fnaddr = crate::call_jit::bh_portal_runner as *const () as usize as i64;
 
+        let metadata = PyJitCodeMetadata {
+            pc_map: pc_map.clone(),
+            py_to_jit_pc: pc_map.clone(),
+            depth_at_py_pc: depth_at_pc,
+            portal_frame_reg,
+            portal_ec_reg,
+            stack_base: frame_stack_base,
+            liveness,
+            liveness_info,
+        };
+
         PyJitCode {
             jitcode,
-            pc_map,
-            jit_to_py_pc,
+            metadata,
             has_abort,
         }
     }
@@ -1208,7 +1205,13 @@ pub fn get_jitcode(
             // get_list_of_active_boxes falls back to LiveVars analysis.
             let entry = cache.get(&key).unwrap();
             if !entry.has_abort {
-                pyre_jit_trace::set_majit_jitcode(w_code, entry.jitcode.clone());
+                pyre_jit_trace::set_majit_jitcode(
+                    w_code,
+                    entry.jitcode.clone(),
+                    entry.metadata.py_to_jit_pc.clone(),
+                    entry.metadata.liveness_info.clone(),
+                    entry.metadata.liveness.clone(),
+                );
             }
         }
         let entry = cache.get(&key).unwrap();

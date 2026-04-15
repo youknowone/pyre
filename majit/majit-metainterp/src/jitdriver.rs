@@ -1332,10 +1332,10 @@ impl<S: JitState> JitDriver<S> {
 
                 // resume.py:1339: resolve jitcode from (jitcode_pos, pc)
                 let resolve_jitcode =
-                    |_pos: i32, pc: i32| -> Option<(crate::jitcode::JitCode, usize)> {
+                    |_pos: i32, pc: i32| -> Option<crate::resume::ResolvedJitCode> {
                         let factory = self.jitcode_factory.as_ref()?;
                         let jitcode = factory(env, pc as usize, 0)?;
-                        Some((jitcode, pc as usize))
+                        Some(crate::resume::ResolvedJitCode::new(jitcode, pc as usize))
                     };
 
                 let fallback_alloc = crate::resume::NullAllocator;
@@ -2892,10 +2892,10 @@ impl<S: JitState> JitDriver<S> {
                 // resume.py:1339: resolve jitcode from (jitcode_pos, pc)
                 let jitcode_factory_ref = self.jitcode_factory.as_ref();
                 let resolve_jitcode =
-                    |_pos: i32, pc: i32| -> Option<(crate::jitcode::JitCode, usize)> {
+                    |_pos: i32, pc: i32| -> Option<crate::resume::ResolvedJitCode> {
                         let factory = jitcode_factory_ref?;
                         let jitcode = factory(env, pc as usize, 0)?;
-                        Some((jitcode, pc as usize))
+                        Some(crate::resume::ResolvedJitCode::new(jitcode, pc as usize))
                     };
 
                 let fallback_alloc = crate::resume::NullAllocator;

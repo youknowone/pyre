@@ -30,6 +30,7 @@ use pyre_object::{
     w_list_uses_float_storage, w_list_uses_int_storage, w_list_uses_object_storage,
     w_str_get_value, w_tuple_len,
 };
+use std::collections::HashMap;
 
 /// jitcode.py:9-21 / codewriter.py:68: JitCode — compiled bytecode unit.
 /// RPython creates JitCode objects with codewriter; pyre wraps
@@ -51,6 +52,14 @@ pub(crate) struct JitCode {
     /// Owned here (inside Box<JitCode> in MetaInterpStaticData.jitcodes)
     /// so the address is stable — matches RPython's GC-heap JitCode.
     pub majit_jitcode: Option<majit_metainterp::jitcode::JitCode>,
+    /// Pyre translation metadata: py_pc -> jitcode byte offset.
+    /// RPython does not need this because frame.pc is already a JitCode PC.
+    pub py_to_jit_pc: Vec<usize>,
+    /// Transitional packed liveness data. RPython stores the concatenated
+    /// all_liveness string on MetaInterpStaticData, not on JitCode.
+    pub liveness_info: Vec<u8>,
+    /// Transitional decoded liveness entries for fallback consumers.
+    pub liveness: Vec<majit_metainterp::jitcode::LivenessInfo>,
 }
 
 impl JitCode {
@@ -100,6 +109,9 @@ impl MetaInterpStaticData {
             code,
             index,
             majit_jitcode: None,
+            py_to_jit_pc: Vec::new(),
+            liveness_info: Vec::new(),
+            liveness: Vec::new(),
         });
         let ptr = &*jitcode as *const JitCode;
         self.by_code.insert(key, self.jitcodes.len());
@@ -135,7 +147,13 @@ pub(crate) fn jitcode_for(code: *const ()) -> *const JitCode {
 /// The JitCode is cloned into the Box'd state::JitCode (stable heap
 /// address), matching RPython where JitCode is a GC-heap object in
 /// MetaInterpStaticData.jitcodes.
-pub fn set_majit_jitcode(code: *const (), majit_jitcode: majit_metainterp::jitcode::JitCode) {
+pub fn set_majit_jitcode(
+    code: *const (),
+    majit_jitcode: majit_metainterp::jitcode::JitCode,
+    py_to_jit_pc: Vec<usize>,
+    liveness_info: Vec<u8>,
+    liveness: Vec<majit_metainterp::jitcode::LivenessInfo>,
+) {
     METAINTERP_SD.with(|r| {
         let mut sd = r.borrow_mut();
         // Ensure the JitCode entry exists.
@@ -144,6 +162,9 @@ pub fn set_majit_jitcode(code: *const (), majit_jitcode: majit_metainterp::jitco
         if let Some(&idx) = sd.by_code.get(&key) {
             let jc = &mut *sd.jitcodes[idx];
             jc.majit_jitcode = Some(majit_jitcode);
+            jc.py_to_jit_pc = py_to_jit_pc;
+            jc.liveness_info = liveness_info;
+            jc.liveness = liveness;
         }
     });
 }
@@ -172,23 +193,21 @@ pub fn frame_value_count_at(jitcode_index: i32, pc: i32) -> usize {
             Some(jc) => jc,
             None => return 0,
         };
-        // jitcode.py:147 enumerate_vars parity: read [len_i, len_r, len_f]
-        // from liveness_info + liveness_offsets — the SAME data that
-        // get_list_of_active_boxes (encoder) uses.
-        if let Some(mjc) = jc.majit_jitcode.as_ref() {
-            if let Some(&jit_pc) = mjc.py_to_jit_pc.get(pc as usize) {
-                if let Some(&offset) = mjc.liveness_offsets.get(&(jit_pc as u32)) {
-                    let off = offset as usize;
-                    let all_liveness = &mjc.liveness_info;
-                    if off + 2 < all_liveness.len() {
-                        let length_i = all_liveness[off] as usize;
-                        let length_r = all_liveness[off + 1] as usize;
-                        let length_f = all_liveness[off + 2] as usize;
-                        return length_i + length_r + length_f;
-                    }
+        // jitcode.py:147 enumerate_vars parity: decode the offset from the
+        // inline `live/` bytecode, then read [len_i, len_r, len_f] from the
+        // SAME all_liveness data that get_list_of_active_boxes uses.
+        if let Some(ref jitcode) = jc.majit_jitcode {
+            if let Some(&jit_pc) = jc.py_to_jit_pc.get(pc as usize) {
+                let off = jitcode.get_live_vars_info_at(jit_pc);
+                let all_liveness = &jc.liveness_info;
+                if off + 2 < all_liveness.len() {
+                    let length_i = all_liveness[off] as usize;
+                    let length_r = all_liveness[off + 1] as usize;
+                    let length_f = all_liveness[off + 2] as usize;
+                    return length_i + length_r + length_f;
                 }
                 // Fallback: LivenessInfo (merge-point only)
-                if let Some(info) = mjc.liveness.iter().find(|i| i.pc as usize == jit_pc) {
+                if let Some(info) = jc.liveness.iter().find(|i| i.pc as usize == jit_pc) {
                     return info.total_live();
                 }
             }
@@ -222,6 +241,9 @@ static NULL_JITCODE: JitCode = JitCode {
     code: std::ptr::null(),
     index: -1,
     majit_jitcode: None,
+    py_to_jit_pc: Vec::new(),
+    liveness_info: Vec::new(),
+    liveness: Vec::new(),
 };
 
 /// Traced value — RPython `FrontendOp(position, _resint/_resref/_resfloat)` parity.

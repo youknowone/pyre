@@ -12,7 +12,7 @@ use crate::jitexc::JitException;
 use crate::resume::{
     MaterializedVirtual, ResolvedPendingFieldWrite, ResumeData, ResumeLayoutSummary,
 };
-use majit_ir::{GcRef, Op, OpCode, OpRef};
+use majit_ir::{GcRef, Op, OpCode};
 
 /// blackhole.py:1068 parity: typed payload decoded from merge-point
 /// bytecode operands. Corresponds to the 6 lists in
@@ -30,7 +30,7 @@ pub struct MergePointArgs {
     pub red_float: Vec<i64>,
 }
 
-use crate::executor::{OpResult, TraceValues, ValueStore, execute_one, resolve};
+use crate::executor::{OpResult, TraceValues, ValueStore, execute_one};
 
 /// Trait for IR-based blackhole memory access.
 ///
@@ -801,18 +801,19 @@ use crate::jitcode::{
     BC_CALL_LOOPINVARIANT_REF, BC_CALL_LOOPINVARIANT_VOID, BC_CALL_MAY_FORCE_FLOAT,
     BC_CALL_MAY_FORCE_INT, BC_CALL_MAY_FORCE_REF, BC_CALL_MAY_FORCE_VOID, BC_CALL_PURE_FLOAT,
     BC_CALL_PURE_INT, BC_CALL_PURE_REF, BC_CALL_REF, BC_CALL_RELEASE_GIL_FLOAT,
-    BC_CALL_RELEASE_GIL_INT, BC_CALL_RELEASE_GIL_REF, BC_CALL_RELEASE_GIL_VOID,
+    BC_CALL_RELEASE_GIL_INT, BC_CALL_RELEASE_GIL_REF, BC_CALL_RELEASE_GIL_VOID, BC_CATCH_EXCEPTION,
     BC_COPY_FROM_BOTTOM, BC_DUP_STACK, BC_GETARRAYITEM_VABLE_F, BC_GETARRAYITEM_VABLE_I,
     BC_GETARRAYITEM_VABLE_R, BC_GETFIELD_VABLE_F, BC_GETFIELD_VABLE_I, BC_GETFIELD_VABLE_R,
     BC_HINT_FORCE_VIRTUALIZABLE, BC_INLINE_CALL, BC_JIT_MERGE_POINT, BC_JUMP, BC_JUMP_TARGET,
-    BC_LOAD_CONST_F, BC_LOAD_CONST_I, BC_LOAD_CONST_R, BC_LOAD_STATE_ARRAY, BC_LOAD_STATE_FIELD,
-    BC_LOAD_STATE_VARRAY, BC_MOVE_F, BC_MOVE_I, BC_MOVE_R, BC_PEEK_I, BC_POP_DISCARD, BC_POP_F,
-    BC_POP_I, BC_POP_R, BC_PUSH_F, BC_PUSH_I, BC_PUSH_R, BC_PUSH_TO, BC_RAISE, BC_RECORD_BINOP_F,
-    BC_RECORD_BINOP_I, BC_RECORD_UNARY_F, BC_RECORD_UNARY_I, BC_REF_RETURN, BC_REQUIRE_STACK,
-    BC_RERAISE, BC_RESIDUAL_CALL_VOID, BC_SET_SELECTED, BC_SETARRAYITEM_VABLE_F,
-    BC_SETARRAYITEM_VABLE_I, BC_SETARRAYITEM_VABLE_R, BC_SETFIELD_VABLE_F, BC_SETFIELD_VABLE_I,
-    BC_SETFIELD_VABLE_R, BC_STORE_DOWN, BC_STORE_STATE_ARRAY, BC_STORE_STATE_FIELD,
-    BC_STORE_STATE_VARRAY, BC_SWAP_STACK, JitArgKind, JitCode,
+    BC_LAST_EXC_VALUE, BC_LIVE, BC_LOAD_CONST_F, BC_LOAD_CONST_I, BC_LOAD_CONST_R,
+    BC_LOAD_STATE_ARRAY, BC_LOAD_STATE_FIELD, BC_LOAD_STATE_VARRAY, BC_MOVE_F, BC_MOVE_I,
+    BC_MOVE_R, BC_PEEK_I, BC_POP_DISCARD, BC_POP_F, BC_POP_I, BC_POP_R, BC_PUSH_F, BC_PUSH_I,
+    BC_PUSH_R, BC_PUSH_TO, BC_RAISE, BC_RECORD_BINOP_F, BC_RECORD_BINOP_I, BC_RECORD_UNARY_F,
+    BC_RECORD_UNARY_I, BC_REF_RETURN, BC_REQUIRE_STACK, BC_RERAISE, BC_RESIDUAL_CALL_VOID,
+    BC_SET_SELECTED, BC_SETARRAYITEM_VABLE_F, BC_SETARRAYITEM_VABLE_I, BC_SETARRAYITEM_VABLE_R,
+    BC_SETFIELD_VABLE_F, BC_SETFIELD_VABLE_I, BC_SETFIELD_VABLE_R, BC_STORE_DOWN,
+    BC_STORE_STATE_ARRAY, BC_STORE_STATE_FIELD, BC_STORE_STATE_VARRAY, BC_SWAP_STACK, JitArgKind,
+    JitCode,
 };
 use crate::pyjitpl::{MIFrame, MIFrameStack};
 use crate::pyjitpl::{
@@ -975,19 +976,23 @@ pub struct BlackholeInterpreter {
     /// RPython: `jitdriver_sd.mainjitcode.calldescr` — CallDescr of the portal
     /// function. Returned by `get_portal_runner()` for `bhimpl_recursive_call_*`.
     pub mainjitcode_calldescr: BhCallDescr,
+    /// Packed all_liveness bytes. RPython stores this on metainterp_sd;
+    /// majit's blackhole receives it from the pyre resolver until the
+    /// surrounding MetaInterpStaticData object is fully ported.
+    pub liveness_info: Vec<u8>,
 }
 
-/// blackhole.py: last exception value from a residual call.
-/// Set by pyre call helpers (bh_call_fn_impl etc.) on error.
-/// Read by dispatch_one to populate exception_last_value on handler dispatch.
+// blackhole.py: last exception value from a residual call.
+// Set by pyre call helpers (bh_call_fn_impl etc.) on error.
+// Read by dispatch_one to populate exception_last_value on handler dispatch.
 thread_local! {
     pub static BH_LAST_EXC_VALUE: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
 }
 
-/// blackhole.py bhimpl_recursive_call: virtualizable pointer for call helpers.
-/// Set by the blackhole run loop before dispatch so extern "C" helpers
-/// (bh_call_fn_impl etc.) can access the parent frame without passing
-/// it through the register file.
+// blackhole.py bhimpl_recursive_call: virtualizable pointer for call helpers.
+// Set by the blackhole run loop before dispatch so extern "C" helpers
+// (bh_call_fn_impl etc.) can access the parent frame without passing
+// it through the register file.
 thread_local! {
     pub static BH_VABLE_PTR: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
 }
@@ -1003,8 +1008,8 @@ impl BlackholeInterpreter {
         Self {
             cpu: None,
             descrs: Vec::new(),
-            op_catch_exception: u8::MAX,
-            op_live: u8::MAX,
+            op_catch_exception: BC_CATCH_EXCEPTION,
+            op_live: BC_LIVE,
             registers_i: Vec::new(),
             registers_r: Vec::new(),
             registers_f: Vec::new(),
@@ -1026,6 +1031,7 @@ impl BlackholeInterpreter {
             virtualizable_stack_base: 0,
             portal_runner_ptr: None,
             mainjitcode_calldescr: BhCallDescr::default(),
+            liveness_info: Vec::new(),
         }
     }
 
@@ -1090,12 +1096,14 @@ impl BlackholeInterpreter {
     /// interp_jit.py:64 parity: fill dedicated portal red-arg registers
     /// with virtualizable_ptr (frame) and ec (execution context).
     ///
+    /// The register indices are produced by pyre's portal codewriter and
+    /// passed as side metadata. RPython `JitCode` has no portal-register
+    /// fields, so they must not be stored on `jitcode.py`'s Rust port.
+    ///
     /// Must be called AFTER virtualizable_ptr is assigned — setposition()
     /// runs before the caller sets virtualizable_ptr, so portal registers
     /// are filled as a separate step.
-    pub fn fill_portal_registers(&mut self, ec: i64) {
-        let frame_reg = self.jitcode.portal_frame_reg;
-        let ec_reg = self.jitcode.portal_ec_reg;
+    pub fn fill_portal_registers(&mut self, frame_reg: u16, ec_reg: u16, ec: i64) {
         if frame_reg != u16::MAX && (frame_reg as usize) < self.registers_r.len() {
             self.registers_r[frame_reg as usize] = self.virtualizable_ptr;
         }
@@ -1256,10 +1264,8 @@ impl BlackholeInterpreter {
     ///
     /// RPython returns an offset into `metainterp_sd.liveness_info`
     /// (via `jitcode.get_live_vars_info(self.position, self.builder.op_live)`).
-    /// pyre currently keeps `liveness_info` per-JitCode and the offsets
-    /// in a side table, but the return value is still that offset —
-    /// consumers pair it with `enumerate_vars(offset, all_liveness, ...)`
-    /// matching `resume.py:1017-1026`.
+    /// Pyre uses a temporary per-interpreter sidecar until its codewriter
+    /// emits `-live-` opcodes directly into JitCode.code.
     pub fn get_current_position_info(&self) -> usize {
         self.jitcode.get_live_vars_info(self.position, self.op_live)
     }
@@ -1474,48 +1480,30 @@ impl BlackholeInterpreter {
     }
 
     /// blackhole.py:396 handle_exception_in_frame: check if the current
-    /// position has an exception handler. If found, unwind stack, push
-    /// exception, jump to handler. Returns true if handled.
-    ///
-    /// lasti (faulting Python PC) is determined internally from
-    /// self.position via jit_pc_to_py_pc reverse map.
+    /// position has an immediately-following `catch_exception/L`.
     pub fn handle_exception_in_frame(&mut self, exc_value: i64) -> bool {
-        // Use the position of the opcode that raised, not the post-operand
-        // position. This matches pyre-interpreter/eval.rs:79 (next_instr - 1)
-        // and ensures the last protected instruction hits its handler.
-        let faulting_jit_pc = self.last_opcode_position;
-        let handler_opt = self
-            .jitcode
-            .find_exception_handler(faulting_jit_pc)
-            .cloned();
-        let Some(handler) = handler_opt else {
-            return false;
-        };
-        let selected = self.current_selected;
-        while self.runtime_stack_len(selected) > handler.stack_depth as usize {
-            if selected < self.runtime_stacks.len() {
-                self.runtime_stacks[selected].pop();
+        let code = &self.jitcode.code;
+        let mut position = self.position;
+        if position < code.len() {
+            let mut opcode = code[position];
+            if opcode == self.op_live {
+                position += majit_codewriter::liveness::OFFSET_SIZE + 1;
+                if position >= code.len() {
+                    return false;
+                }
+                opcode = code[position];
+            }
+            if opcode == self.op_catch_exception {
+                self.exception_last_value = exc_value;
+                if position + 2 >= code.len() {
+                    return false;
+                }
+                let target = (code[position + 1] as usize) | ((code[position + 2] as usize) << 8);
+                self.position = target;
+                return true;
             }
         }
-        if handler.push_lasti {
-            // last_opcode_position is already the faulting instruction's
-            // jitcode PC (set before dispatch_one). No additional -1 needed.
-            let faulting_py_pc = self.jitcode.jit_pc_to_py_pc(faulting_jit_pc);
-            let box_fn_ptr = self
-                .jitcode
-                .fn_ptrs
-                .get(handler.box_int_fn_idx as usize)
-                .map(|t| t.concrete_ptr);
-            if let Some(ptr) = box_fn_ptr {
-                let lasti_boxed = call_int_function(ptr, &[faulting_py_pc]);
-                self.runtime_stack_push(selected, lasti_boxed);
-            }
-        }
-        self.runtime_stack_push(selected, exc_value);
-        self.position = handler.jit_target;
-        self.exception_last_value = exc_value;
-        self.got_exception = false;
-        true
+        false
     }
 
     /// Drain the runtime stack for the given selected index, returning
@@ -1625,6 +1613,19 @@ impl BlackholeInterpreter {
     /// RPython: bytecode dispatch in `dispatch_loop()`, each `bhimpl_*` method
     fn dispatch_one(&mut self, opcode: u8) -> Result<(), DispatchError> {
         match opcode {
+            BC_LIVE => {
+                // blackhole.py:1605 bhimpl_live(pc): return pc + OFFSET_SIZE.
+                self.position += majit_codewriter::liveness::OFFSET_SIZE;
+            }
+            BC_CATCH_EXCEPTION => {
+                // blackhole.py:969 bhimpl_catch_exception(target): no-op in
+                // normal execution; skip the 2-byte label operand.
+                self.position += 2;
+            }
+            BC_LAST_EXC_VALUE => {
+                let dst = self.next_u16() as usize;
+                self.registers_r[dst] = self.exception_last_value;
+            }
             BC_LOAD_CONST_I => {
                 let dst = self.next_u16() as usize;
                 let const_idx = self.next_u16() as usize;
@@ -2345,8 +2346,8 @@ impl BlackholeInterpBuilder {
             pool: Vec::new(),
             cpu: None,
             _insns: Vec::new(),
-            op_live: u8::MAX,
-            op_catch_exception: u8::MAX,
+            op_live: BC_LIVE,
+            op_catch_exception: BC_CATCH_EXCEPTION,
             descrs: Vec::new(),
             dispatch_table: Vec::new(),
         }
@@ -2545,6 +2546,7 @@ impl BlackholeInterpBuilder {
         interp.aborted = false;
         interp.got_exception = false;
         interp.virtualizable_stack_base = 0;
+        interp.liveness_info.clear();
         self.pool.push(interp);
     }
 
@@ -2793,7 +2795,7 @@ pub fn convert_and_run_from_pyjitpl(
 /// `resolve_jitcode` is `metainterp_sd.jitcodes[jitcode_pos]` in RPython.
 pub fn resume_in_blackhole(
     builder: &mut BlackholeInterpBuilder,
-    resolve_jitcode: &dyn Fn(i32, i32) -> Option<(JitCode, usize)>,
+    resolve_jitcode: &dyn Fn(i32, i32) -> Option<crate::resume::ResolvedJitCode>,
     rd_numb: &[u8],
     rd_consts: &[i64],
     deadframe: &[i64],

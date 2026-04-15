@@ -103,6 +103,9 @@ pub(crate) const BC_REF_GUARD_VALUE: u8 = 85;
 pub(crate) const BC_FLOAT_GUARD_VALUE: u8 = 86;
 /// blackhole.py:1066 bhimpl_jit_merge_point: portal merge point marker.
 pub(crate) const BC_JIT_MERGE_POINT: u8 = 87;
+pub(crate) const BC_LIVE: u8 = 88;
+pub(crate) const BC_CATCH_EXCEPTION: u8 = 89;
+pub(crate) const BC_LAST_EXC_VALUE: u8 = 90;
 pub(crate) const MAX_HOST_CALL_ARITY: usize = 16;
 
 /// GC liveness metadata at a specific bytecode PC.
@@ -111,10 +114,8 @@ pub(crate) const MAX_HOST_CALL_ARITY: usize = 16;
 /// Tracks which registers of each type (int/ref/float) are live at a given PC.
 ///
 /// TODO: pyre currently keeps this per-entry form alongside the packed
-/// `liveness_info` string on each JitCode so the codewriter can build
-/// the encoded bytes. Once the codewriter emits the packed form directly
-/// this can be removed and liveness will be consumed exclusively via
-/// `enumerate_vars(offset, all_liveness, ...)` (jitcode.py:146-167).
+/// Temporary pyre-side liveness shape used before the codewriter emits
+/// RPython `-live-` opcodes directly. Canonical JitCode does not store this.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LivenessInfo {
     pub pc: u16,
@@ -171,20 +172,6 @@ pub struct JitCode {
     pub constants_r: Vec<i64>,
     /// RPython: `jitcode.constants_f` — float constant pool (bits as i64).
     pub constants_f: Vec<i64>,
-    /// Liveness metadata for GC / deopt expansion.
-    pub liveness: Vec<LivenessInfo>,
-    /// RPython `metainterp_sd.liveness_info`: packed `[len_i][len_r][len_f]`
-    /// headers followed by `encode_liveness`-bitsets, one entry per
-    /// distinct live-point PC. Upstream stores this on metainterp_sd and
-    /// shares it across all jitcodes; pyre keeps it per-jitcode for now
-    /// (same encoding, narrower sharing). Consumed via `enumerate_vars`.
-    pub liveness_info: Vec<u8>,
-    /// jit_pc → offset into `liveness_info`, set by the codewriter. In
-    /// upstream the offset lives inline in `JitCode.code` as a 2-byte
-    /// payload after the `-live-` opcode and is decoded via
-    /// `get_live_vars_info(pc, op_live)`. Pyre uses a side table until
-    /// the codewriter embeds `-live-` directly.
-    pub liveness_offsets: std::collections::HashMap<u32, u32>,
     /// Pool of majit IR opcodes referenced from the bytecode stream.
     pub opcodes: Vec<OpCode>,
     /// Sub-JitCodes for `inline_call` targets (compound methods).
@@ -199,42 +186,6 @@ pub struct JitCode {
     /// `jd.mainjitcode.jitdriver_sd = jd`.
     /// Used by `_handle_jitexception` to find the portal level in the BH chain.
     pub jitdriver_sd: Option<usize>,
-    /// blackhole.py handle_exception_in_frame: exception handler table.
-    /// Pre-computed from Python's code.exceptiontable during compilation.
-    pub exception_handlers: Vec<JitExceptionHandler>,
-    /// Reverse PC map: sorted (jitcode_pc, py_pc) pairs for binary search.
-    /// Used by handle_exception_in_frame to determine faulting Python PC (lasti).
-    pub jit_to_py_pc: Vec<(usize, usize)>,
-    /// Forward PC map: py_pc → jitcode_pc. Used by get_list_of_active_boxes
-    /// to look up LivenessInfo at the current Python bytecode position.
-    /// RPython: pc → offset into all_liveness (embedded in jitcode bytecodes).
-    pub py_to_jit_pc: Vec<usize>,
-    /// Number of locals in the source function.
-    pub nlocals: usize,
-    /// interp_jit.py:64 parity: dedicated ref register index for the portal's
-    /// `frame` red arg (reds = ['frame', 'ec']). Filled during blackhole setup
-    /// with virtualizable_ptr.
-    pub portal_frame_reg: u16,
-    /// interp_jit.py:64 parity: dedicated ref register index for the portal's
-    /// `ec` red arg. Filled during blackhole setup (0 in pyre — no separate ec).
-    pub portal_ec_reg: u16,
-    /// Absolute start index of the operand stack inside the virtualizable's
-    /// unified `locals_cells_stack_w` array (i.e. `nlocals + ncells`).
-    /// Computed once at codewriter time per source function so that
-    /// resume / merge-point exit paths can write back stack temporaries
-    /// without re-deriving the layout from a `CodeObject` lookup. Each
-    /// jitcode in a blackhole chain owns its own value because every
-    /// Python function has its own locals/cells/stack layout.
-    pub stack_base: usize,
-    /// flatten.py / regalloc.py parity: symbolic value-stack depth at each
-    /// Python PC, in slots above `stack_base = nlocals + ncells`. RPython's
-    /// flatten/regalloc statically assigns every value-stack temporary to a
-    /// typed register; pyre's codewriter mirrors this with
-    /// `move_r(stack_base + depth, ...)`. Resume / merge-point exit paths
-    /// read this to know how many stack registers to fill / write back —
-    /// without it the runtime would need a separate runtime_stacks Vec
-    /// (which RPython jitcodes never use).
-    pub depth_at_py_pc: Vec<u16>,
     /// RPython: `BlackholeInterpBuilder.descrs` — shared descriptor table for
     /// 'd'/'j' argcode resolution (blackhole.py:102-103 `setup_descrs`).
     /// pyre: stored per-jitcode. Loaded into `BlackholeInterpreter.descrs`
@@ -270,25 +221,10 @@ pub struct JitExceptionHandler {
 // -- RPython jitcode.py parity methods --
 
 impl JitCode {
-    /// blackhole.py:396 handle_exception_in_frame: find exception handler
-    /// for the given JitCode PC. Returns the first matching handler.
-    pub fn find_exception_handler(&self, jitcode_pc: usize) -> Option<&JitExceptionHandler> {
-        self.exception_handlers
-            .iter()
-            .find(|h| jitcode_pc >= h.jit_start && jitcode_pc < h.jit_end)
-    }
-
-    /// Reverse lookup: JitCode PC → Python PC.
-    /// Binary search in jit_to_py_pc for the largest jit_pc <= target.
-    pub fn jit_pc_to_py_pc(&self, jit_pc: usize) -> i64 {
-        match self
-            .jit_to_py_pc
-            .binary_search_by_key(&jit_pc, |&(jp, _)| jp)
-        {
-            Ok(idx) => self.jit_to_py_pc[idx].1 as i64,
-            Err(idx) if idx > 0 => self.jit_to_py_pc[idx - 1].1 as i64,
-            _ => 0,
-        }
+    /// RPython `jitcode.py:get_live_vars_info(pc, op_live)` for the canonical
+    /// majit bytecode table, whose `live/` opcode is `BC_LIVE`.
+    pub fn get_live_vars_info_at(&self, pc: usize) -> usize {
+        self.get_live_vars_info(pc, BC_LIVE)
     }
 
     /// RPython `jitcode.py:47-48` `def num_regs_i(self): return ord(self.c_num_regs_i)`.
@@ -330,19 +266,19 @@ impl JitCode {
     }
 
     /// RPython jitcode.py:82-93 `get_live_vars_info(self, pc, op_live)`.
-    ///
-    /// Upstream walks `JitCode.code` to find the nearest `-live-` opcode
-    /// (at `pc` or `pc - OFFSET_SIZE - 1`) and decodes the 2-byte offset
-    /// that follows. Pyre's codewriter does not yet embed `-live-` in
-    /// `JitCode.code`, so the offset is read from the side table
-    /// `liveness_offsets[pc]` instead; the returned value is still an
-    /// offset into `JitCode.liveness_info` and is consumed by
-    /// `enumerate_vars` exactly like upstream.
-    pub fn get_live_vars_info(&self, pc: usize, _op_live: u8) -> usize {
-        if let Some(&offset) = self.liveness_offsets.get(&(pc as u32)) {
-            return offset as usize;
+    pub fn get_live_vars_info(&self, pc: usize, op_live: u8) -> usize {
+        let mut pc = pc;
+        if self.code.get(pc).copied() != Some(op_live) {
+            let step = majit_codewriter::liveness::OFFSET_SIZE + 1;
+            if pc < step {
+                self._missing_liveness(pc);
+            }
+            pc -= step;
+            if self.code.get(pc).copied() != Some(op_live) {
+                self._missing_liveness(pc);
+            }
         }
-        self._missing_liveness(pc)
+        majit_codewriter::liveness::decode_offset(&self.code, pc + 1)
     }
 
     /// RPython jitcode.py:95-100 `_missing_liveness(self, pc)`.

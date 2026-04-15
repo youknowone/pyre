@@ -9,8 +9,8 @@ use std::sync::Once;
 
 use pyre_interpreter::bytecode::{Instruction, OpArgState};
 use pyre_interpreter::{
-    PyResult, function_get_closure, function_get_code, function_get_globals, function_get_name,
-    is_function, register_jit_function_caller,
+    PyResult, function_get_closure, function_get_globals, function_get_name, is_function,
+    register_jit_function_caller,
 };
 use pyre_object::intobject::w_int_get_value;
 use pyre_object::intobject::w_int_new;
@@ -688,14 +688,14 @@ fn blackhole_from_jit_frame(frame: &mut PyFrame) -> Option<PyObjectRef> {
     // direct_run_blackhole_at at line ~1269) which return Failed/false on
     // miss instead of silently restarting from 0 — a silent restart would
     // re-execute the function from scratch and produce incorrect results.
-    let jitcode_pc = if py_pc < pyjitcode.pc_map.len() {
-        pyjitcode.pc_map[py_pc]
+    let jitcode_pc = if py_pc < pyjitcode.metadata.pc_map.len() {
+        pyjitcode.metadata.pc_map[py_pc]
     } else {
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
                 "[jit][bh-fail] blackhole_from_jit_frame: py_pc={} out of pc_map (len={})",
                 py_pc,
-                pyjitcode.pc_map.len(),
+                pyjitcode.metadata.pc_map.len(),
             );
         }
         return None;
@@ -747,7 +747,11 @@ fn blackhole_from_jit_frame(frame: &mut PyFrame) -> Option<PyObjectRef> {
     // Portal red-arg registers must be filled AFTER virtualizable_ptr.
     // interp_jit.py:64 reds=['frame','ec']: ec = frame.execution_context.
     let ec = frame.execution_context as i64;
-    bh.fill_portal_registers(ec);
+    bh.fill_portal_registers(
+        pyjitcode.metadata.portal_frame_reg,
+        pyjitcode.metadata.portal_ec_reg,
+        ec,
+    );
 
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
@@ -951,8 +955,6 @@ pub fn resume_in_blackhole(
     _caller_frame: &mut PyFrame,
     frames: &[ResumedFrame],
 ) -> BlackholeResult {
-    use majit_ir::Value;
-
     if frames.is_empty() {
         if majit_metainterp::majit_log_enabled() {
             eprintln!("[jit][bh-fail] resume_in_blackhole: empty frames");
@@ -1051,8 +1053,8 @@ pub fn resume_in_blackhole(
         // virtualizable.py:126-137: code from resume data, not heap.
         let w_code = section.code;
         let pyjitcode = crate::jit::codewriter::get_jitcode(code, w_code, &writer);
-        let jitcode_pc = if py_pc < pyjitcode.pc_map.len() {
-            pyjitcode.pc_map[py_pc]
+        let jitcode_pc = if py_pc < pyjitcode.metadata.pc_map.len() {
+            pyjitcode.metadata.pc_map[py_pc]
         } else {
             builder.release_chain(prev_bh);
             return BlackholeResult::Failed;
@@ -1097,8 +1099,8 @@ pub fn resume_in_blackhole(
         // resume.py:1381 consume_one_section → 1017 _prepare_next_section
         // → jitcode.py:147 enumerate_vars(info, liveness_info, cb_r)
         // RPython: both encoder (get_list_of_active_boxes) and decoder
-        // use the SAME all_liveness data. Use JitCode.liveness (same
-        // source as get_list_of_active_boxes) via majit_jitcode pointer.
+        // use the SAME all_liveness data. Use PyJitCodeMetadata.liveness
+        // (same source as get_list_of_active_boxes).
         let live_pc = section.rd_numb_pc.unwrap_or(section.py_pc);
         // Look up LivenessInfo from JitCode (same data as capture side).
         let writer = crate::jit::codewriter::CodeWriter::new(
@@ -1118,11 +1120,11 @@ pub fn resume_in_blackhole(
                 as *const pyre_interpreter::CodeObject)
         };
         let pyjitcode = crate::jit::codewriter::get_jitcode(code_ref, w_code_for_jitcode, &writer);
-        let jc = &pyjitcode.jitcode;
-        let liveness_info = jc
+        let meta = &pyjitcode.metadata;
+        let liveness_info = meta
             .py_to_jit_pc
             .get(live_pc)
-            .and_then(|&jit_pc| jc.liveness.iter().find(|info| info.pc as usize == jit_pc));
+            .and_then(|&jit_pc| meta.liveness.iter().find(|info| info.pc as usize == jit_pc));
         let n_live = liveness_info
             .map(|info| info.live_r_regs.len())
             .unwrap_or_else(|| {
@@ -1238,7 +1240,11 @@ pub fn resume_in_blackhole(
         bh.virtualizable_stack_base = nlocals + pyre_interpreter::pyframe::ncells(code_ref);
         // Portal red-arg registers must be filled AFTER virtualizable_ptr.
         let ec = unsafe { (*frame_ptr).execution_context as i64 };
-        bh.fill_portal_registers(ec);
+        bh.fill_portal_registers(
+            pyjitcode.metadata.portal_frame_reg,
+            pyjitcode.metadata.portal_ec_reg,
+            ec,
+        );
 
         // RPython: nextbh.nextblackholeinterp = curbh
         bh.nextblackholeinterp = prev_bh.map(Box::new);
@@ -1667,8 +1673,6 @@ fn jit_blackhole_resume_from_guard(
     raw_deadframe_ptr: *const i64,
     num_raw_deadframe: usize,
 ) -> Option<i64> {
-    use majit_ir::{Type, Value};
-
     if fail_values_ptr.is_null() || num_fail_values == 0 {
         return None;
     }
@@ -1773,38 +1777,41 @@ pub fn blackhole_resume_via_rd_numb(
     // resume.py:1339 jitcodes[jitcode_pos]:
     // jitcode_index is a sequential index into MetaInterpStaticData.jitcodes.
     // Resolve to CodeObject via code_for_jitcode_index, then compile jitcode.
-    let resolve_jitcode =
-        |jitcode_index: i32, pc: i32| -> Option<(majit_metainterp::jitcode::JitCode, usize)> {
-            // resume.py:928/1338 parity: pc is read directly from rd_numb and
-            // passed to setposition as-is. RPython does NOT introduce a
-            // "start from 0" recovery path for negative or out-of-bounds PCs.
-            // If pyre's pc_map lookup fails, the resume data is corrupt —
-            // fail loudly (return None) instead of silently restarting from
-            // the function entry, which would produce wrong results.
-            if pc < 0 {
-                return None;
-            }
-            let code_ptr = pyre_jit_trace::state::code_for_jitcode_index(jitcode_index)?;
-            if code_ptr.is_null() {
-                return None;
-            }
-            let raw_code = unsafe {
-                pyre_interpreter::w_code_get_ptr(code_ptr as pyre_object::PyObjectRef)
-                    as *const pyre_interpreter::CodeObject
-            };
-            if raw_code.is_null() {
-                return None;
-            }
-            let code = unsafe { &*raw_code };
-            let pyjitcode = crate::jit::codewriter::get_jitcode(code, code_ptr, &writer);
-            if pyjitcode.has_abort_opcode() {
-                return None;
-            }
-            // Convert Python PC → JitCode byte offset via pc_map.
-            // pc_map miss is a BUG — fail rather than silently restart from 0.
-            let jitcode_pc = pyjitcode.pc_map.get(pc as usize).copied()?;
-            Some((pyjitcode.jitcode.clone(), jitcode_pc))
+    let resolve_jitcode = |jitcode_index: i32, pc: i32| -> Option<resume::ResolvedJitCode> {
+        // resume.py:928/1338 parity: pc is read directly from rd_numb and
+        // passed to setposition as-is. RPython does NOT introduce a
+        // "start from 0" recovery path for negative or out-of-bounds PCs.
+        // If pyre's pc_map lookup fails, the resume data is corrupt —
+        // fail loudly (return None) instead of silently restarting from
+        // the function entry, which would produce wrong results.
+        if pc < 0 {
+            return None;
+        }
+        let code_ptr = pyre_jit_trace::state::code_for_jitcode_index(jitcode_index)?;
+        if code_ptr.is_null() {
+            return None;
+        }
+        let raw_code = unsafe {
+            pyre_interpreter::w_code_get_ptr(code_ptr as pyre_object::PyObjectRef)
+                as *const pyre_interpreter::CodeObject
         };
+        if raw_code.is_null() {
+            return None;
+        }
+        let code = unsafe { &*raw_code };
+        let pyjitcode = crate::jit::codewriter::get_jitcode(code, code_ptr, &writer);
+        if pyjitcode.has_abort_opcode() {
+            return None;
+        }
+        // Convert Python PC → JitCode byte offset via pc_map.
+        // pc_map miss is a BUG — fail rather than silently restart from 0.
+        let jitcode_pc = pyjitcode.metadata.pc_map.get(pc as usize).copied()?;
+        Some(
+            resume::ResolvedJitCode::new(pyjitcode.jitcode.clone(), jitcode_pc)
+                .with_virtualizable_stack_base(pyjitcode.metadata.stack_base)
+                .with_liveness_metadata(pyjitcode.metadata.liveness_info.clone()),
+        )
+    };
 
     // resume.py:983-991 _prepare_virtuals: convert RdVirtualInfo → VirtualInfo
     // for lazy materialization in getvirtual_ptr/getvirtual_int.
@@ -1861,12 +1868,8 @@ pub fn blackhole_resume_via_rd_numb(
     // chain its own value, otherwise a multi-frame chain whose caller
     // and callee differ in nlocals+ncells uses the wrong operand-stack
     // offset on recursive portal re-entry.
-    bh.virtualizable_stack_base = bh.jitcode.stack_base;
-    let mut current = bh.nextblackholeinterp.as_deref_mut();
-    while let Some(caller_bh) = current {
-        caller_bh.virtualizable_stack_base = caller_bh.jitcode.stack_base;
-        current = caller_bh.nextblackholeinterp.as_deref_mut();
-    }
+    // `blackhole_from_resumedata` attached per-section pyre virtualizable
+    // layout from ResolvedJitCode. RPython JitCode has no stack_base field.
     // blackhole.py:1095 get_portal_runner parity
     bh.portal_runner_ptr = Some(bh_portal_runner);
     // RPython: calldescr = jitdriver_sd.mainjitcode.calldescr
