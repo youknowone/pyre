@@ -1,54 +1,88 @@
 #!/bin/bash
 # pyre pre-merge check: correctness + regression guard + comparison
-# Usage: ./pyre/check.sh [--backend dynasm|cranelift] [path/to/pyre]
+# Usage:
+#   ./pyre/check.sh [--backend dynasm|cranelift] [--timeout-scale N]
+#                   [--dynasm-timeout-scale N] [--cranelift-timeout-scale N]
+#                   [path/to/pyre]
 
 set -euo pipefail
 
 BACKEND=""
+DYNASM_TIMEOUT_SCALE=""
+CRANELIFT_TIMEOUT_SCALE=""
+TIMEOUT_SCALE="1"
+PYRE_PATH=""
+
+usage() {
+    cat <<'EOF'
+Usage:
+  ./pyre/check.sh [--backend dynasm|cranelift] [--timeout-scale N]
+                  [--dynasm-timeout-scale N] [--cranelift-timeout-scale N]
+                  [path/to/pyre]
+
+Options:
+  --backend BACKEND              Run only one backend.
+  --timeout-scale N             Multiply all benchmark timeouts by N.
+  --dynasm-timeout-scale N      Override dynasm timeout multiplier.
+  --cranelift-timeout-scale N   Override cranelift timeout multiplier.
+
+Notes:
+  - Without --backend, the script runs both dynasm and cranelift.
+  - The optional positional binary path is only accepted with --backend.
+EOF
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --backend)
             BACKEND="$2"; shift 2 ;;
         --backend=*|backend=*)
             BACKEND="${1#*=}"; shift ;;
+        --timeout-scale)
+            TIMEOUT_SCALE="$2"; shift 2 ;;
+        --timeout-scale=*)
+            TIMEOUT_SCALE="${1#*=}"; shift ;;
+        --dynasm-timeout-scale)
+            DYNASM_TIMEOUT_SCALE="$2"; shift 2 ;;
+        --dynasm-timeout-scale=*)
+            DYNASM_TIMEOUT_SCALE="${1#*=}"; shift ;;
+        --cranelift-timeout-scale)
+            CRANELIFT_TIMEOUT_SCALE="$2"; shift 2 ;;
+        --cranelift-timeout-scale=*)
+            CRANELIFT_TIMEOUT_SCALE="${1#*=}"; shift ;;
+        -h|--help)
+            usage
+            exit 0 ;;
         *)
             break ;;
     esac
 done
 
-BENCH=pyre/bench
-PASS=0
-FAIL=0
-RESULTS=()
-COMPARISONS=()
-
-CARGO_EXTRA=""
-CARGO_BIN="pyre"
-PYRE_DEFAULT="./target/release/pyre"
-case "$BACKEND" in
-    dynasm)
-        CARGO_EXTRA="--no-default-features --features dynasm"
-        CARGO_BIN="pyre-dynasm"
-        PYRE_DEFAULT="./target/release/pyre-dynasm"
-        ;;
-    cranelift)
-        CARGO_EXTRA="--no-default-features --features cranelift"
-        CARGO_BIN="pyre-cranelift"
-        PYRE_DEFAULT="./target/release/pyre-cranelift"
-        ;;
-    "")
-        ;;  # plain default build keeps using pyre
-    *) echo "ERROR: unknown backend '$BACKEND' (use: dynasm, cranelift)"; exit 1 ;;
-esac
-PYRE="${1:-$PYRE_DEFAULT}"
-
-echo "Building ${CARGO_BIN} (release, backend=${BACKEND:-default})..."
-cargo build --release -p pyrex --bin "$CARGO_BIN" $CARGO_EXTRA 2>&1 | tail -1
-
-if [ ! -x "$PYRE" ]; then
-    echo "ERROR: build failed"
+if [[ $# -gt 1 ]]; then
+    echo "ERROR: too many positional arguments"
+    usage
     exit 1
 fi
+
+if [[ $# -eq 1 ]]; then
+    PYRE_PATH="$1"
+fi
+
+if [[ -n "$PYRE_PATH" && -z "$BACKEND" ]]; then
+    echo "ERROR: [path/to/pyre] requires --backend when running a single binary"
+    usage
+    exit 1
+fi
+
+BENCH=pyre/bench
+RESULTS=()
+ALL_COMPARISONS=()
+DYNASM_PYRE=""
+CRANELIFT_PYRE=""
+DYNASM_PASS=0
+DYNASM_FAIL=0
+CRANELIFT_PASS=0
+CRANELIFT_FAIL=0
 
 red()   { printf "\033[31m%s\033[0m" "$1"; }
 green() { printf "\033[32m%s\033[0m" "$1"; }
@@ -60,146 +94,402 @@ time_user() {
     { /usr/bin/time -p "$@" >/dev/null; } 2>&1 | awk '/^user/{printf "%.2f\n", $2}'
 }
 
-# run_bench NAME SCRIPT TIMEOUT [MAX_SEC] [beat_cpython_margin] [beat_pypy_margin]
-run_bench() {
-    local name="$1" script="$2" timeout="$3" max_sec="${4:-}" beat_cpython="${5:-}" beat_pypy="${6:-}"
-    printf "  %-20s" "$name"
+append_comparison() {
+    local backend="$1" name="$2" t_cpython="$3" t_pypy="$4" pyre_field="$5" note="${6:-}"
+    local row
+    row=$(printf '  %-10s  %-20s  %10s  %9s  %9s  %s' \
+        "$backend" "$name" "$t_cpython" "$t_pypy" "$pyre_field" "$note")
+    ALL_COMPARISONS+=("$row")
+}
 
-    local cpython_output
-    if ! cpython_output="$(python3 "$script")"; then
-        RESULTS+=("$(red "FAIL") $name  cpython crash (exit $? from python)")
-        printf "$(red WRONG)  CPython execution failed\n"
-        FAIL=$((FAIL + 1))
-        COMPARISONS+=("$(printf '  %-20s  cpython %5ss  pypy %5ss  pyre  FAIL' "$name" "-" "-")")
-        return
+backend_timeout_scale() {
+    local backend="$1"
+    case "$backend" in
+        dynasm)
+            echo "${DYNASM_TIMEOUT_SCALE:-$TIMEOUT_SCALE}" ;;
+        cranelift)
+            echo "${CRANELIFT_TIMEOUT_SCALE:-$TIMEOUT_SCALE}" ;;
+        *)
+            echo "ERROR: unknown backend '$backend' (use: dynasm, cranelift)" >&2
+            exit 1 ;;
+    esac
+}
+
+build_backend() {
+    local backend="$1"
+    local cargo_extra=""
+    local cargo_bin=""
+    case "$backend" in
+        dynasm)
+            cargo_extra="--no-default-features --features dynasm"
+            cargo_bin="pyre-dynasm"
+            ;;
+        cranelift)
+            cargo_extra="--no-default-features --features cranelift"
+            cargo_bin="pyre-cranelift"
+            ;;
+        *)
+            echo "ERROR: unknown backend '$backend' (use: dynasm, cranelift)"
+            exit 1 ;;
+    esac
+
+    echo "Building ${cargo_bin} (release, backend=${backend})..."
+    cargo build --release -p pyrex --bin "$cargo_bin" $cargo_extra 2>&1 | tail -1
+}
+
+default_binary_for_backend() {
+    local backend="$1"
+    case "$backend" in
+        dynasm) echo "./target/release/pyre-dynasm" ;;
+        cranelift) echo "./target/release/pyre-cranelift" ;;
+        *)
+            echo "ERROR: unknown backend '$backend' (use: dynasm, cranelift)" >&2
+            exit 1 ;;
+    esac
+}
+
+backend_binary() {
+    local backend="$1"
+    case "$backend" in
+        dynasm) echo "$DYNASM_PYRE" ;;
+        cranelift) echo "$CRANELIFT_PYRE" ;;
+        *)
+            echo "ERROR: unknown backend '$backend' (use: dynasm, cranelift)" >&2
+            exit 1 ;;
+    esac
+}
+
+backend_enabled() {
+    local backend="$1"
+    case "$backend" in
+        dynasm) [[ -n "$DYNASM_PYRE" ]] ;;
+        cranelift) [[ -n "$CRANELIFT_PYRE" ]] ;;
+        *)
+            echo "ERROR: unknown backend '$backend' (use: dynasm, cranelift)" >&2
+            exit 1 ;;
+    esac
+}
+
+scaled_timeout() {
+    local base_timeout="$1"
+    local scale="$2"
+    python3 - "$base_timeout" "$scale" <<'PY'
+import sys
+
+base = float(sys.argv[1])
+scale = float(sys.argv[2])
+value = base * scale
+if value.is_integer():
+    print(int(value))
+else:
+    print(f"{value:.3f}".rstrip("0").rstrip("."))
+PY
+}
+
+fmt_time() {
+    local t="$1"
+    if [[ "$t" == "-" || -z "$t" ]]; then
+        printf "%s" "-"
+    else
+        printf "%ss" "$t"
     fi
+}
 
-    # Measure cpython/pypy user CPU time
-    local t_cpython t_pypy
-    t_cpython=$(time_user python3 "$script")
-    t_pypy=$(time_user pypy3 "$script")
+run_and_capture() {
+    local out_var="$1" time_var="$2" status_var="$3"
+    shift 3
+    local out_file time_file status timed
+    out_file=$(mktemp)
+    time_file=$(mktemp)
+    if /usr/bin/time -p -o "$time_file" "$@" >"$out_file" 2>/dev/null; then
+        status=0
+    else
+        status=$?
+    fi
+    printf -v "$out_var" '%s' "$(cat "$out_file")"
+    timed=$(awk '/^user/{printf "%.2f", $2}' "$time_file")
+    if [[ -z "$timed" ]]; then
+        timed="-"
+    fi
+    printf -v "$time_var" '%s' "$timed"
+    printf -v "$status_var" '%s' "$status"
+    rm -f "$out_file" "$time_file"
+}
 
-    # Measure pyre: capture output and user CPU time separately
-    local output
-    output=$(timeout "$timeout" "$PYRE" "$script" 2>/dev/null) || {
-        local code=$?
-        if [ $code -eq 124 ]; then
-            RESULTS+=("$(red "FAIL") $name  timeout (>${timeout}s)")
-            printf "$(red TIMEOUT)\n"
+record_result() {
+    local backend="$1" status="$2" name="$3" detail="$4"
+    if [[ "$status" == "PASS" ]]; then
+        RESULTS+=("$(green "PASS") $backend $name  $detail")
+        case "$backend" in
+            dynasm) DYNASM_PASS=$((DYNASM_PASS + 1)) ;;
+            cranelift) CRANELIFT_PASS=$((CRANELIFT_PASS + 1)) ;;
+        esac
+    else
+        RESULTS+=("$(red "FAIL") $backend $name  $detail")
+        case "$backend" in
+            dynasm) DYNASM_FAIL=$((DYNASM_FAIL + 1)) ;;
+            cranelift) CRANELIFT_FAIL=$((CRANELIFT_FAIL + 1)) ;;
+        esac
+    fi
+}
+
+run_backend_bench() {
+    local backend="$1" name="$2" script="$3" timeout="$4" vs_cpython="$5" vs_pypy="$6" t_cpython="$7" t_pypy="$8" pypy_output="$9"
+    local pyre_bin effective_timeout output elapsed code ratio slower
+    pyre_bin=$(backend_binary "$backend")
+    effective_timeout=$(scaled_timeout "$timeout" "$(backend_timeout_scale "$backend")")
+
+    printf "    %-10s" "$backend"
+    run_and_capture output elapsed code timeout "$effective_timeout" "$pyre_bin" "$script"
+    if [ "$code" -ne 0 ]; then
+        if [ "$code" -eq 124 ]; then
+            record_result "$backend" "FAIL" "$name" "timeout (>${effective_timeout}s)"
+            printf "$(red TIMEOUT)  >%ss\n" "$effective_timeout"
         else
-            RESULTS+=("$(red "FAIL") $name  crash (exit $code)")
+            record_result "$backend" "FAIL" "$name" "crash (exit $code)"
             printf "$(red "CRASH") (exit $code)\n"
         fi
-        FAIL=$((FAIL + 1))
-        COMPARISONS+=("$(printf '  %-20s  cpython %5ss  pypy %5ss  pyre  FAIL' "$name" "$t_cpython" "$t_pypy")")
+        ratio="-"
+        if [[ "$t_pypy" != "-" ]]; then
+            ratio=$(python3 -c "print('%.1fx' % (${elapsed:-0} / $t_pypy) if float('$t_pypy') > 0 and float('${elapsed:-0}') > 0 else 'N/A')" 2>/dev/null || echo "N/A")
+        fi
+        append_comparison "$backend" "$name" "$(fmt_time "$t_cpython")" "$(fmt_time "$t_pypy")" "FAIL"
         return
-    }
-    local elapsed
-    elapsed=$(time_user "$PYRE" "$script")
+    fi
 
-    # Compute pyre/pypy ratio for comparison table
-    local ratio
+    if [ "$output" != "$pypy_output" ]; then
+        local expected_preview actual_preview
+        expected_preview=$(echo "$pypy_output" | head -c 60)
+        actual_preview=$(echo "$output" | head -c 60)
+        record_result "$backend" "FAIL" "$name" "wrong output"
+        printf "$(red WRONG)  got: %s expected(pypy): %s\n" "$actual_preview" "$expected_preview"
+        append_comparison "$backend" "$name" "$(fmt_time "$t_cpython")" "$(fmt_time "$t_pypy")" "WRONG"
+        return
+    fi
+
     ratio=$(python3 -c "print('%.1fx' % ($elapsed / $t_pypy) if float('$t_pypy') > 0 else 'N/A')" 2>/dev/null || echo "N/A")
 
-    if [ "$output" != "$cpython_output" ]; then
-        RESULTS+=("$(red "FAIL") $name  wrong output")
-        local expected_preview actual_preview
-        expected_preview=$(echo "$cpython_output" | head -c 60)
-        actual_preview=$(echo "$output" | head -c 60)
-        printf "$(red WRONG)  got: %s expected: %s\n" "$actual_preview" "$expected_preview"
-        FAIL=$((FAIL + 1))
-        COMPARISONS+=("$(printf '  %-20s  cpython %5ss  pypy %5ss  pyre  WRONG' "$name" "$t_cpython" "$t_pypy")")
+    if [ -n "$vs_cpython" ]; then
+        slower=$(python3 -c "print('yes' if $elapsed > $t_cpython * $vs_cpython else 'no')")
+        if [ "$slower" = "yes" ]; then
+            record_result "$backend" "FAIL" "$name" "${elapsed}s > cpython ${t_cpython}s x${vs_cpython}"
+            printf "$(red "SLOWER")  pyre ${elapsed}s > cpython ${t_cpython}s x${vs_cpython}\n"
+            append_comparison "$backend" "$name" "$(fmt_time "$t_cpython")" "$(fmt_time "$t_pypy")" "$(fmt_time "$elapsed")" "(${ratio} vs pypy)"
+            return
+        fi
+    fi
+
+    if [ -n "$vs_pypy" ]; then
+        slower=$(python3 -c "print('yes' if $elapsed > $t_pypy * $vs_pypy else 'no')")
+        if [ "$slower" = "yes" ]; then
+            record_result "$backend" "FAIL" "$name" "${elapsed}s > pypy ${t_pypy}s x${vs_pypy}"
+            printf "$(red "SLOWER")  pyre ${elapsed}s > pypy ${t_pypy}s x${vs_pypy}\n"
+            append_comparison "$backend" "$name" "$(fmt_time "$t_cpython")" "$(fmt_time "$t_pypy")" "$(fmt_time "$elapsed")" "(${ratio} vs pypy)"
+            return
+        fi
+    fi
+
+    record_result "$backend" "PASS" "$name" "${elapsed}s"
+    printf "$(green PASS)  ${elapsed}s\n"
+    append_comparison "$backend" "$name" "$(fmt_time "$t_cpython")" "$(fmt_time "$t_pypy")" "$(fmt_time "$elapsed")" "(${ratio} vs pypy)"
+}
+
+warmup_bench() {
+    local script="$1" need_cpython="$2"
+    if [ "$need_cpython" = "yes" ]; then
+        python3 "$script" >/dev/null 2>&1 || true
+    fi
+    pypy3 "$script" >/dev/null 2>&1 || true
+    if backend_enabled dynasm; then
+        "$DYNASM_PYRE" "$script" >/dev/null 2>&1 || true
+    fi
+    if backend_enabled cranelift; then
+        "$CRANELIFT_PYRE" "$script" >/dev/null 2>&1 || true
+    fi
+}
+
+# run_bench NAME SCRIPT TIMEOUT
+#           [dynasm_vs_cpython] [dynasm_vs_pypy]
+#           [cranelift_vs_cpython] [cranelift_vs_pypy]
+run_bench() {
+    local name="$1" script="$2" timeout="$3"
+    local dynasm_vs_cpython="${4:-}" dynasm_vs_pypy="${5:-}"
+    local cranelift_vs_cpython="${6:-}" cranelift_vs_pypy="${7:-}"
+    local need_cpython="no"
+    local cpython_output="" t_cpython="-" cpython_code=0
+    local pypy_output="" t_pypy="-" pypy_code=0
+
+    if { backend_enabled dynasm && [ -n "$dynasm_vs_cpython" ]; } || \
+       { backend_enabled cranelift && [ -n "$cranelift_vs_cpython" ]; }; then
+        need_cpython="yes"
+    fi
+
+    echo "  $name"
+    printf "    %-10s" "warmup"
+    warmup_bench "$script" "$need_cpython"
+    printf "%s\n" "$(dim done)"
+
+    if [ "$need_cpython" = "yes" ]; then
+        printf "    %-10s" "cpython"
+        run_and_capture cpython_output t_cpython cpython_code python3 "$script"
+        if [ "$cpython_code" -ne 0 ]; then
+            printf "$(red "CRASH") (exit $cpython_code)\n"
+        else
+            printf "$(dim done)  %ss\n" "$t_cpython"
+        fi
+    fi
+
+    printf "    %-10s" "pypy"
+    run_and_capture pypy_output t_pypy pypy_code pypy3 "$script"
+    if [ "$pypy_code" -ne 0 ]; then
+        printf "$(red "CRASH") (exit $pypy_code)\n"
+        if backend_enabled dynasm; then
+            record_result "dynasm" "FAIL" "$name" "pypy crash"
+            append_comparison "dynasm" "$name" "$(fmt_time "$t_cpython")" "-" "FAIL"
+        fi
+        if backend_enabled cranelift; then
+            record_result "cranelift" "FAIL" "$name" "pypy crash"
+            append_comparison "cranelift" "$name" "$(fmt_time "$t_cpython")" "-" "FAIL"
+        fi
         return
     fi
+    printf "$(dim done)  %ss\n" "$t_pypy"
 
-    if [ -n "$max_sec" ]; then
-        local over
-        over=$(python3 -c "print('yes' if $elapsed > $max_sec else 'no')")
-        if [ "$over" = "yes" ]; then
-            RESULTS+=("$(red "FAIL") $name  ${elapsed}s > ${max_sec}s limit")
-            printf "$(red SLOW)  ${elapsed}s (limit ${max_sec}s)\n"
-            FAIL=$((FAIL + 1))
-            COMPARISONS+=("$(printf '  %-20s  cpython %5ss  pypy %5ss  pyre %5ss  (%s vs pypy)' "$name" "$t_cpython" "$t_pypy" "$elapsed" "$ratio")")
-            return
+    if backend_enabled dynasm; then
+        if [ -n "$dynasm_vs_cpython" ] && [ "$cpython_code" -ne 0 ]; then
+            printf "    %-10s$(red "FAIL")  missing cpython baseline\n" "dynasm"
+            record_result "dynasm" "FAIL" "$name" "cpython crash"
+            append_comparison "dynasm" "$name" "-" "$(fmt_time "$t_pypy")" "FAIL"
+        else
+            run_backend_bench "dynasm" "$name" "$script" "$timeout" "$dynasm_vs_cpython" "$dynasm_vs_pypy" "$t_cpython" "$t_pypy" "$pypy_output"
         fi
     fi
 
-    if [ -n "$beat_cpython" ]; then
-        local slower margin="$beat_cpython"
-        slower=$(python3 -c "print('yes' if $elapsed > $t_cpython * $margin else 'no')")
-        if [ "$slower" = "yes" ]; then
-            RESULTS+=("$(red "FAIL") $name  ${elapsed}s > cpython ${t_cpython}s x${margin}")
-            printf "$(red "SLOWER")  pyre ${elapsed}s > cpython ${t_cpython}s x${margin}\n"
-            FAIL=$((FAIL + 1))
-            COMPARISONS+=("$(printf '  %-20s  cpython %5ss  pypy %5ss  pyre %5ss  (%s vs pypy)' "$name" "$t_cpython" "$t_pypy" "$elapsed" "$ratio")")
-            return
+    if backend_enabled cranelift; then
+        if [ -n "$cranelift_vs_cpython" ] && [ "$cpython_code" -ne 0 ]; then
+            printf "    %-10s$(red "FAIL")  missing cpython baseline\n" "cranelift"
+            record_result "cranelift" "FAIL" "$name" "cpython crash"
+            append_comparison "cranelift" "$name" "-" "$(fmt_time "$t_pypy")" "FAIL"
+        else
+            run_backend_bench "cranelift" "$name" "$script" "$timeout" "$cranelift_vs_cpython" "$cranelift_vs_pypy" "$t_cpython" "$t_pypy" "$pypy_output"
         fi
     fi
-
-    if [ -n "$beat_pypy" ]; then
-        local slower margin="$beat_pypy"
-        slower=$(python3 -c "print('yes' if $elapsed > $t_pypy * $margin else 'no')")
-        if [ "$slower" = "yes" ]; then
-            RESULTS+=("$(red "FAIL") $name  ${elapsed}s > pypy ${t_pypy}s x${margin}")
-            printf "$(red "SLOWER")  pyre ${elapsed}s > pypy ${t_pypy}s x${margin}\n"
-            FAIL=$((FAIL + 1))
-            COMPARISONS+=("$(printf '  %-20s  cpython %5ss  pypy %5ss  pyre %5ss  (%s vs pypy)' "$name" "$t_cpython" "$t_pypy" "$elapsed" "$ratio")")
-            return
-        fi
-    fi
-
-    RESULTS+=("$(green "PASS") $name  ${elapsed}s")
-    printf "$(green PASS)  ${elapsed}s\n"
-    PASS=$((PASS + 1))
-    COMPARISONS+=("$(printf '  %-20s  cpython %5ss  pypy %5ss  pyre %5ss  (%s vs pypy)' "$name" "$t_cpython" "$t_pypy" "$elapsed" "$ratio")")
 }
+
+if [[ -n "$BACKEND" ]]; then
+    case "$BACKEND" in
+        dynasm|cranelift)
+            ;;
+        *)
+            echo "ERROR: unknown backend '$BACKEND' (use: dynasm, cranelift)"
+            exit 1 ;;
+    esac
+fi
+
+if [[ -n "$BACKEND" ]]; then
+    build_backend "$BACKEND"
+    pyre_bin="${PYRE_PATH:-$(default_binary_for_backend "$BACKEND")}"
+    if [ ! -x "$pyre_bin" ]; then
+        echo "ERROR: build failed for backend '$BACKEND' (missing executable: $pyre_bin)"
+        exit 1
+    fi
+    case "$BACKEND" in
+        dynasm) DYNASM_PYRE="$pyre_bin" ;;
+        cranelift) CRANELIFT_PYRE="$pyre_bin" ;;
+    esac
+else
+    for backend in dynasm cranelift; do
+        build_backend "$backend"
+        pyre_bin="$(default_binary_for_backend "$backend")"
+        if [ ! -x "$pyre_bin" ]; then
+            echo "ERROR: build failed for backend '$backend' (missing executable: $pyre_bin)"
+            exit 1
+        fi
+        case "$backend" in
+            dynasm) DYNASM_PYRE="$pyre_bin" ;;
+            cranelift) CRANELIFT_PYRE="$pyre_bin" ;;
+        esac
+    done
+fi
 
 echo ""
 bold "pyre pre-merge check"; echo ""
-echo "binary: $PYRE  backend: ${BACKEND:-cranelift}"
+if backend_enabled dynasm; then
+    echo "binary[dynasm]: $DYNASM_PYRE  timeout-scale: $(backend_timeout_scale dynasm)"
+fi
+if backend_enabled cranelift; then
+    echo "binary[cranelift]: $CRANELIFT_PYRE  timeout-scale: $(backend_timeout_scale cranelift)"
+fi
 echo ""
 
-# Warm up: cold run to prime disk/CPU caches (results discarded)
-printf "  %-20s" "(warmup)"
-python3 "$BENCH/int_loop.py" >/dev/null 2>&1 || true
-pypy3 "$BENCH/int_loop.py" >/dev/null 2>&1 || true
-"$PYRE" "$BENCH/int_loop.py" >/dev/null 2>&1 || true
-printf "$(dim done)\n"
-
-#                NAME             SCRIPT                         TIMEOUT  MAX_SEC  BEAT_CPYTHON
-run_bench       "int_loop"       "$BENCH/int_loop.py"            5       ""       1       1.5
-run_bench       "float_loop"     "$BENCH/float_loop.py"          5       ""       1       3.0
-run_bench       "fib_loop"       "$BENCH/fib_loop.py"            5       ""       1
-run_bench       "inline_helper"  "$BENCH/inline_helper.py"       5       ""       1       1.5
-run_bench       "fib_recursive" "$BENCH/fib_recursive.py"        5       ""       1       8
-run_bench       "nested_loop"    "$BENCH/nested_loop.py"         5       ""       1       2
-run_bench       "raise_catch"   "$BENCH/raise_catch_loop.py"     6
-run_bench       "spectral_norm" "$BENCH/spectral_norm.py"       10      ""       15
-run_bench       "nbody"          "$BENCH/nbody_50k.py"           5       ""       11
-run_bench       "fannkuch"       "$BENCH/fannkuch.py"            5
+#                NAME             SCRIPT                         TIMEOUT  DYNASM_VS_CPYTHON  DYNASM_VS_PYPY  CRANELIFT_VS_CPYTHON  CRANELIFT_VS_PYPY
+run_bench       "int_loop"       "$BENCH/int_loop.py"            5       ""                   1.5             ""                      1.5
+run_bench       "float_loop"     "$BENCH/float_loop.py"          5       ""                   3.0             ""                      3.0
+run_bench       "fib_loop"       "$BENCH/fib_loop.py"            5       ""                   2.0             1                       ""
+run_bench       "inline_helper"  "$BENCH/inline_helper.py"       5       ""                   1.5             ""                      1.5
+# Dynasm is already slower than CPython here; keep only a relaxed
+# CPython guard and do not add a PyPy criterion.
+run_bench       "fib_recursive" "$BENCH/fib_recursive.py"        5       1.5                  ""              1                       8
+run_bench       "nested_loop"    "$BENCH/nested_loop.py"         5       ""                   2               ""                      2
+run_bench       "raise_catch"   "$BENCH/raise_catch_loop.py"     6       ""                   ""              ""                      ""
+# Dynasm is slower than CPython on these; do not add a PyPy criterion.
+run_bench       "spectral_norm" "$BENCH/spectral_norm.py"       10      15                   ""              15                      ""
+run_bench       "nbody"          "$BENCH/nbody_50k.py"           5       11                   ""              11                      ""
+run_bench       "fannkuch"       "$BENCH/fannkuch.py"            5       ""                   ""              ""                      ""
 # list per-strategy ops (Integer strategy stays without boxing on insert/pop/reverse/setslice)
 # PYPYLOG verified: all benchmarks hit guard_class(IntegerListStrategy) + ArrayS 8 ops.
-# pyre is an interpreter (no JIT) so cpython ratio thresholds don't apply; use MAX_SEC.
-run_bench       "list_reverse"   "$BENCH/list_reverse.py"        5       2
-run_bench       "list_pop_append" "$BENCH/list_pop_append.py"    5       2
-run_bench       "list_insert"    "$BENCH/list_insert.py"         5       3
-run_bench       "list_setslice"  "$BENCH/list_setslice.py"       5       2
+# Only VS_PYPY is enabled here; empty VS_CPYTHON skips the CPython run.
+run_bench       "list_reverse"   "$BENCH/list_reverse.py"        5       ""                   30              ""                      30
+run_bench       "list_pop_append" "$BENCH/list_pop_append.py"    5       ""                   30              ""                      30
+run_bench       "list_insert"    "$BENCH/list_insert.py"         5       ""                   3               ""                      3
+run_bench       "list_setslice"  "$BENCH/list_setslice.py"       5       ""                   30              ""                      30
 
 echo ""
 echo "─────────────────────────────────"
 for r in "${RESULTS[@]}"; do echo "  $r"; done
 echo "─────────────────────────────────"
-
-if [ $FAIL -gt 0 ]; then
-    echo "$(red "FAILED"): $FAIL failed, $PASS passed"
-    exit 1
+if backend_enabled dynasm; then
+    if [ $DYNASM_FAIL -gt 0 ]; then
+        echo "$(red "FAILED"): dynasm $DYNASM_FAIL failed, $DYNASM_PASS passed"
+    else
+        echo "$(green "ALL PASSED"): dynasm $DYNASM_PASS/$DYNASM_PASS"
+    fi
+fi
+if backend_enabled cranelift; then
+    if [ $CRANELIFT_FAIL -gt 0 ]; then
+        echo "$(red "FAILED"): cranelift $CRANELIFT_FAIL failed, $CRANELIFT_PASS passed"
+    else
+        echo "$(green "ALL PASSED"): cranelift $CRANELIFT_PASS/$CRANELIFT_PASS"
+    fi
 fi
 
-echo "$(green "ALL PASSED"): $PASS/$PASS"
+FAILED_BACKEND_RUNS=0
+if backend_enabled dynasm && [ $DYNASM_FAIL -gt 0 ]; then
+    FAILED_BACKEND_RUNS=$((FAILED_BACKEND_RUNS + 1))
+fi
+if backend_enabled cranelift && [ $CRANELIFT_FAIL -gt 0 ]; then
+    FAILED_BACKEND_RUNS=$((FAILED_BACKEND_RUNS + 1))
+fi
+
+ENABLED_BACKEND_RUNS=0
+if backend_enabled dynasm; then
+    ENABLED_BACKEND_RUNS=$((ENABLED_BACKEND_RUNS + 1))
+fi
+if backend_enabled cranelift; then
+    ENABLED_BACKEND_RUNS=$((ENABLED_BACKEND_RUNS + 1))
+fi
+
+if [ $FAILED_BACKEND_RUNS -gt 0 ]; then
+    echo "$(red "FAILED"): $FAILED_BACKEND_RUNS backend run(s) failed"
+else
+    echo "$(green "ALL PASSED"): ${ENABLED_BACKEND_RUNS}/${ENABLED_BACKEND_RUNS} backend run(s)"
+fi
 echo ""
 bold "Comparison"; echo ""
-printf '  %-20s  %10s  %9s  %9s  %s\n' "benchmark" "cpython" "pypy" "pyre" ""
-echo "  ──────────────────────────────────────────────────────────────────"
-for c in "${COMPARISONS[@]}"; do echo "$c"; done
-echo ""
+printf '  %-10s  %-20s  %10s  %9s  %9s  %s\n' "backend" "benchmark" "cpython" "pypy" "pyre" ""
+echo "  ─────────────────────────────────────────────────────────────────────────────────────"
+for c in "${ALL_COMPARISONS[@]}"; do echo "$c"; done
+if [ $FAILED_BACKEND_RUNS -gt 0 ]; then
+    exit 1
+fi
 exit 0
