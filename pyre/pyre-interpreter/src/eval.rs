@@ -203,6 +203,7 @@ fn eval_loop(frame: &mut PyFrame) -> PyResult {
         let Some((instruction, op_arg)) = decode_instruction_at(code, pc) else {
             return Ok(w_none());
         };
+        frame.last_instr = pc as isize;
         frame.next_instr += 1;
         let next_instr = frame.next_instr;
         match execute_opcode_step(frame, code, instruction, op_arg, next_instr) {
@@ -1480,6 +1481,7 @@ impl OpcodeStepExecutor for PyFrame {
         );
         gen_frame.class_locals = self.class_locals;
         gen_frame.next_instr = self.next_instr;
+        gen_frame.last_instr = self.last_instr;
         // Copy locals + cells + stack
         for i in 0..self.valuestackdepth {
             gen_frame.locals_w_mut()[i] = self.locals_w()[i];

@@ -48,14 +48,25 @@ pub fn make_signature(_code: &W_CodeObject) -> PyObjectRef {
     pyre_object::w_none()
 }
 
-/// Compatibility helper that returns argument indexes which shadow cellvars.
+/// pycode.py:637-659 _compute_args_as_cellvars
 pub fn _compute_args_as_cellvars(
-    _varnames: &[String],
-    _cellvars: &[String],
-    _argcount: usize,
-) -> Vec<usize> {
-    let _ = (_varnames, _cellvars, _argcount);
-    Vec::new()
+    varnames: &[String],
+    cellvars: &[String],
+    argcount: usize,
+) -> Vec<isize> {
+    let mut args_as_cellvars = Vec::new();
+    for i in 0..cellvars.len() {
+        let cellname = &cellvars[i];
+        for j in 0..argcount {
+            if *cellname == varnames[j] {
+                while args_as_cellvars.len() < i {
+                    args_as_cellvars.push(-1isize);
+                }
+                args_as_cellvars.push(j as isize);
+            }
+        }
+    }
+    args_as_cellvars
 }
 
 #[inline]

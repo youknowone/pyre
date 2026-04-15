@@ -1213,6 +1213,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
 
         // ── handle_bytecode (RPython interp_jit.py:90) ──
         trace_jit_bytecode(pc, "");
+        frame.last_instr = pc as isize;
         frame.next_instr += 1;
         let next_instr = frame.next_instr;
         if let pyre_interpreter::bytecode::Instruction::Call { argc } = instruction {

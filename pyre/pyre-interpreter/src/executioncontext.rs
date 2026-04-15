@@ -87,11 +87,12 @@ impl PyNamespace {
         self.slot_of(name).map(|idx| &self.values[idx])
     }
 
-    /// Iterate over (name, value) pairs.
+    /// Iterate over (name, value) pairs, skipping tombstoned slots.
     pub fn entries(&self) -> impl Iterator<Item = (&str, &PyObjectRef)> {
         self.names
             .iter()
             .enumerate()
+            .filter(|(_, name)| !name.is_empty())
             .map(move |(i, name)| (name.as_str(), &self.values[i]))
     }
 
@@ -127,6 +128,20 @@ impl PyNamespace {
             self.names.push(name);
             self.values.push(value);
             self.slot_watchers.push(Vec::new());
+            None
+        }
+    }
+
+    /// Remove a key from the namespace (PyPy: space.delitem).
+    /// This performs a real deletion rather than leaving a tombstone.
+    pub fn remove(&mut self, name: &str) -> Option<PyObjectRef> {
+        if let Some(idx) = self.slot_of(name) {
+            self.notify_slot_watchers(idx);
+            self.names.remove(idx);
+            let old = self.values.remove(idx);
+            self.slot_watchers.remove(idx);
+            Some(old)
+        } else {
             None
         }
     }
@@ -181,7 +196,7 @@ impl PyNamespace {
 
     #[inline]
     pub fn keys(&self) -> impl Iterator<Item = &String> {
-        self.names.iter()
+        self.names.iter().filter(|n| !n.is_empty())
     }
 
     /// Remove all entries from the namespace.

@@ -7,7 +7,7 @@
 use std::collections::VecDeque;
 use std::rc::Rc;
 
-use crate::CodeObject;
+use crate::{CodeFlags, CodeObject};
 use crate::{PyExecutionContext, PyNamespace};
 use pyre_object::FixedObjectArray;
 use pyre_object::*;
@@ -62,6 +62,9 @@ pub struct PyFrame {
     pub valuestackdepth: usize,
     /// Index of the next instruction to execute.
     pub next_instr: usize,
+    /// pyframe.py:72 last_instr — index of the last executed instruction.
+    /// PyPy initializes to -1; get_last_lineno uses this for offset2lineno.
+    pub last_instr: isize,
     /// Raw pointer to the shared globals namespace object.
     /// All frames in the same module share the same globals.
     pub namespace: *mut PyNamespace,
@@ -222,7 +225,7 @@ pub struct FrameDebugData {
     /// pyframe.py:38
     pub instr_prev_plus_one: usize,
     /// pyframe.py:39
-    pub f_lineno: usize,
+    pub f_lineno: isize,
     /// pyframe.py:40
     pub is_being_profiled: bool,
     /// pyframe.py:41
@@ -346,24 +349,22 @@ pub const PYFRAME_LASTBLOCK_OFFSET: usize = std::mem::offset_of!(PyFrame, lastbl
 pub const PYFRAME_STACK_DEPTH_OFFSET: usize = PYFRAME_VALUESTACKDEPTH_OFFSET;
 pub const PYFRAME_LOCALS_OFFSET: usize = PYFRAME_LOCALS_CELLS_STACK_OFFSET;
 
-/// Number of cell + free variable slots for a code object.
+/// pytraceback.py offset2lineno(code, offset) — convert instruction index to line number.
 #[inline]
-/// Count cell+free variable slots, excluding cellvars already in varnames.
-/// CPython 3.13+ unified indexing: cellvars that overlap with varnames
-/// share the same slot. Only cellvar-only variables get extra slots.
+pub fn offset2lineno(code: &CodeObject, offset: usize) -> usize {
+    code.locations
+        .get(offset)
+        .map(|(start, _)| start.line.get())
+        .unwrap_or_else(|| code.first_line_number.map(|n| n.get()).unwrap_or(1))
+}
+
+/// pyframe.py:105-106 — cell + free variable slot count.
+/// PyPy: ncellvars = len(code.co_cellvars), nfreevars = len(code.co_freevars)
+/// No overlap filtering — cells and locals occupy separate slots even if
+/// a cellvar has the same name as a local variable.
+#[inline]
 pub fn ncells(code: &CodeObject) -> usize {
-    let cellvars_only = code
-        .cellvars
-        .iter()
-        .filter(|cv| {
-            let cv_name: &str = cv;
-            !code.varnames.iter().any(|v| {
-                let v_name: &str = v;
-                v_name == cv_name
-            })
-        })
-        .count();
-    cellvars_only + code.freevars.len()
+    code.cellvars.len() + code.freevars.len()
 }
 
 impl PyFrame {
@@ -376,9 +377,17 @@ impl PyFrame {
     /// pyframe.py:124 getorcreatedebug
     #[inline]
     pub fn getorcreatedebug(&mut self) -> &mut FrameDebugData {
+        self.getorcreatedebug_with_lineno(-1)
+    }
+
+    /// pyframe.py:124 getorcreatedebug(init_lineno)
+    #[inline]
+    pub fn getorcreatedebug_with_lineno(&mut self, init_lineno: isize) -> &mut FrameDebugData {
         if self.debugdata == 0 {
+            // pyframe.py:47-49: FrameDebugData(self.pycode, init_lineno)
             let mut dd = FrameDebugData::default();
-            dd.w_globals = self.namespace; // pyframe.py:49
+            dd.f_lineno = init_lineno;
+            dd.w_globals = self.namespace; // pycode.w_globals equivalent
             self.debugdata = unsafe { alloc_with_gc_header(dd) } as usize;
         }
         unsafe { &mut *(self.debugdata as *mut FrameDebugData) }
@@ -396,16 +405,15 @@ impl PyFrame {
         self.code()
     }
 
-    /// pyframe.py:129 get_w_globals
+    /// pyframe.py:129-133 get_w_globals
     #[inline]
     pub fn get_w_globals(&self) -> *mut PyNamespace {
-        let dd = self.getdebug();
-        if !dd.is_null() {
-            let w = unsafe { (*dd).w_globals };
-            if !w.is_null() {
-                return w;
-            }
+        let debugdata = self.getdebug();
+        if !debugdata.is_null() {
+            return unsafe { (*debugdata).w_globals };
         }
+        // pyframe.py:133: jit.promote(self.pycode).w_globals
+        // pyre: pycode has no w_globals field; namespace is equivalent
         self.namespace
     }
 
@@ -439,15 +447,11 @@ impl PyFrame {
         std::ptr::null_mut()
     }
 
-    /// pyframe.py:228 getdictscope
+    /// pyframe.py:540-545 getdictscope
     #[inline]
     pub fn getdictscope(&mut self) -> *mut PyNamespace {
-        let w_locals = self.get_w_locals();
-        if !w_locals.is_null() {
-            return w_locals;
-        }
-        self.getorcreatedebug().w_locals = self.namespace;
-        self.namespace
+        self.fast2locals();
+        self.getorcreatedebug().w_locals
     }
 
     /// PyPy-compatible `__init__` hook.
@@ -472,6 +476,7 @@ impl PyFrame {
         };
         self.valuestackdepth = unsafe { (&*raw).varnames.len() + ncells(unsafe { &*raw }) };
         self.next_instr = 0;
+        self.last_instr = -1;
         self.debugdata = 0;
         self.escaped = false;
         self.clear_blocks();
@@ -517,15 +522,66 @@ impl PyFrame {
 
     /// PyPy-compatible `initialize_frame_scopes`.
     #[inline]
-    pub fn initialize_frame_scopes(&mut self, _outer_func: PyObjectRef, _code: *const ()) {
-        let _ = _outer_func;
-        let _ = _code;
+    pub fn initialize_frame_scopes(&mut self, outer_func: PyObjectRef, _code: *const ()) {
+        let code = unsafe { &*pyframe_get_pycode(self) };
+        let flags = code.flags;
+        if !flags.contains(CodeFlags::OPTIMIZED) {
+            let w_locals = if flags.contains(CodeFlags::NEWLOCALS) {
+                unsafe { alloc_with_gc_header(PyNamespace::new()) as *mut PyNamespace }
+            } else {
+                self.get_w_globals()
+            };
+            self.getorcreatedebug().w_locals = w_locals;
+        }
+
+        let ncellvars = code.cellvars.len();
+        let nfreevars = code.freevars.len();
+        if ncellvars == 0 && nfreevars == 0 {
+            return;
+        }
+
+        let closure = if !outer_func.is_null() && unsafe { crate::is_function(outer_func) } {
+            unsafe { crate::function_get_closure(outer_func) }
+        } else {
+            PY_NULL
+        };
+        let closure_size = if closure.is_null() {
+            0
+        } else {
+            unsafe { w_tuple_len(closure) }
+        };
+        assert!(
+            nfreevars == 0 || !outer_func.is_null(),
+            "directly executed code object may not contain free variables"
+        );
+        assert!(
+            closure_size == nfreevars,
+            "code object received a closure with an unexpected number of free variables"
+        );
+
+        let mut index = code.varnames.len();
+        for _ in 0..ncellvars {
+            self.locals_w_mut()[index] = pyre_object::w_cell_new(PY_NULL);
+            index += 1;
+        }
+        for i in 0..nfreevars {
+            self.locals_w_mut()[index] =
+                unsafe { w_tuple_getitem(closure, i as i64).unwrap_or(PY_NULL) };
+            index += 1;
+        }
     }
 
-    /// pyframe.py:231 setdictscope
+    /// pyframe.py:547-552 setdictscope(w_locals, skip_free_vars=False)
     #[inline]
     pub fn setdictscope(&mut self, w_locals: *mut PyNamespace) {
+        self.setdictscope_with_options(w_locals, false);
+    }
+
+    /// pyframe.py:547-552 setdictscope(w_locals, skip_free_vars=False)
+    #[inline]
+    pub fn setdictscope_with_options(&mut self, w_locals: *mut PyNamespace, skip_free_vars: bool) {
         self.getorcreatedebug().w_locals = w_locals;
+        self.locals2fast(skip_free_vars);
     }
 
     /// Create a minimal frame stub for passing to call dispatch.
@@ -551,6 +607,7 @@ impl PyFrame {
             },
             valuestackdepth: nlocals + ncells,
             next_instr: 0,
+            last_instr: -1,
             namespace,
             debugdata: 0,
             lastblock: 0,
@@ -611,6 +668,7 @@ impl PyFrame {
             },
             valuestackdepth: num_locals + num_cells,
             next_instr: 0,
+            last_instr: -1,
             namespace,
             debugdata: 0,
             lastblock: 0,
@@ -636,6 +694,7 @@ impl PyFrame {
             },
             valuestackdepth: self.valuestackdepth,
             next_instr: self.next_instr,
+            last_instr: self.last_instr,
             namespace: self.namespace,
             debugdata: self.clone_debugdata(),
             lastblock: self.clone_blocks(),
@@ -706,10 +765,12 @@ impl PyFrame {
         self.push(value)
     }
 
-    /// PyPy-compatible `pushvalue(None)` helper.
+    /// pyframe.py:304-307 pushvalue_none
     #[inline]
     pub fn pushvalue_none(&mut self) {
-        self.push(w_none())
+        let depth = self.valuestackdepth;
+        debug_assert!(self.locals_w()[depth].is_null());
+        self.valuestackdepth = depth + 1;
     }
 
     /// PyPy-compatible stack index guard.
@@ -724,21 +785,23 @@ impl PyFrame {
         index >= self.stack_base()
     }
 
-    /// PyPy-compatible `popvalue()` alias.
+    /// pyframe.py:313-314 popvalue
     #[inline]
     pub fn popvalue(&mut self) -> PyObjectRef {
-        let value = self.pop();
-        assert!(!value.is_null(), "popvalue on empty value stack");
+        let value = self.popvalue_maybe_none();
+        assert!(!value.is_null());
         value
     }
 
-    /// PyPy-compatible nullable pop path.
+    /// pyframe.py:316-322 popvalue_maybe_none
     #[inline]
     pub fn popvalue_maybe_none(&mut self) -> PyObjectRef {
-        if self.valuestackdepth <= self.stack_base() {
-            return PY_NULL;
-        }
-        self.pop()
+        let depth = self.valuestackdepth - 1;
+        self.assert_stack_index(depth);
+        let w_object = self.locals_w()[depth];
+        self.locals_w_mut()[depth] = PY_NULL;
+        self.valuestackdepth = depth;
+        w_object
     }
 
     /// PyPy `PyFrame._new_popvalues` factory.
@@ -765,22 +828,24 @@ impl PyFrame {
         self.popvalues(n)
     }
 
-    /// PyPy-compatible stack peek helper.
+    /// pyframe.py:337-345 peekvalues
     #[inline]
     pub fn peekvalues(&self, n: usize) -> Vec<PyObjectRef> {
-        let base = self.valuestackdepth.saturating_sub(n);
+        let base = self.valuestackdepth - n;
         self.assert_stack_index(base);
-        let mut values = Vec::with_capacity(n);
-        for i in base..self.valuestackdepth {
-            values.push(self.locals_w()[i]);
+        let mut values_w = vec![PY_NULL; n];
+        let mut idx = n;
+        while idx > 0 {
+            idx -= 1;
+            values_w[idx] = self.locals_w()[base + idx];
         }
-        values
+        values_w
     }
 
-    /// PyPy-compatible `dropvalues`.
+    /// pyframe.py:348-355 dropvalues
     #[inline]
     pub fn dropvalues(&mut self, n: usize) {
-        let finaldepth = self.valuestackdepth.saturating_sub(n);
+        let finaldepth = self.valuestackdepth - n;
         self.assert_stack_index(finaldepth);
         while self.valuestackdepth > finaldepth {
             let idx = self.valuestackdepth - 1;
@@ -1001,10 +1066,10 @@ impl PyFrame {
         self.get_f_back()
     }
 
-    /// PyPy-compatible `fget_f_lasti`.
+    /// pyframe.py:773 fget_f_lasti → space.newint(self.last_instr)
     #[inline]
-    pub fn fget_f_lasti(&self) -> usize {
-        self.next_instr
+    pub fn fget_f_lasti(&self) -> isize {
+        self.last_instr
     }
 
     /// PyPy-compatible `fget_f_trace`.
@@ -1013,16 +1078,67 @@ impl PyFrame {
         self.get_w_f_trace()
     }
 
-    /// pyframe.py fset_f_trace
+    /// pyframe.py:785-791 fset_f_trace
     #[inline]
     pub fn fset_f_trace(&mut self, w_trace: PyObjectRef) {
-        self.getorcreatedebug().w_f_trace = w_trace;
+        if w_trace.is_null() || w_trace == pyre_object::w_none() {
+            self.getorcreatedebug().w_f_trace = pyre_object::PY_NULL;
+        } else {
+            let lineno = self.get_last_lineno() as isize;
+            let d = self.getorcreatedebug();
+            d.w_f_trace = w_trace;
+            d.f_lineno = lineno;
+        }
     }
 
-    /// pyframe.py fdel_f_trace
+    /// pyframe.py:793-794 fdel_f_trace
     #[inline]
     pub fn fdel_f_trace(&mut self) {
         self.getorcreatedebug().w_f_trace = pyre_object::PY_NULL;
+    }
+
+    /// pyframe.py:153-157 get_f_trace_lines
+    #[inline]
+    pub fn get_f_trace_lines(&self) -> bool {
+        let d = self.getdebug();
+        if d.is_null() {
+            return true;
+        }
+        unsafe { (*d).f_trace_lines }
+    }
+
+    /// pyframe.py:159-163 get_f_trace_opcodes
+    #[inline]
+    pub fn get_f_trace_opcodes(&self) -> bool {
+        let d = self.getdebug();
+        if d.is_null() {
+            return false;
+        }
+        unsafe { (*d).f_trace_opcodes }
+    }
+
+    /// pyframe.py:796-797 fget_f_trace_lines
+    #[inline]
+    pub fn fget_f_trace_lines(&self) -> bool {
+        self.get_f_trace_lines()
+    }
+
+    /// pyframe.py:799-800 fset_f_trace_lines
+    #[inline]
+    pub fn fset_f_trace_lines(&mut self, value: bool) {
+        self.getorcreatedebug().f_trace_lines = value;
+    }
+
+    /// pyframe.py:802-803 fget_f_trace_opcodes
+    #[inline]
+    pub fn fget_f_trace_opcodes(&self) -> bool {
+        self.get_f_trace_opcodes()
+    }
+
+    /// pyframe.py:805-806 fset_f_trace_opcodes
+    #[inline]
+    pub fn fset_f_trace_opcodes(&mut self, value: bool) {
+        self.getorcreatedebug().f_trace_opcodes = value;
     }
 
     /// PyPy-compatible `fget_f_exc_type`.
@@ -1049,32 +1165,44 @@ impl PyFrame {
         false
     }
 
-    /// PyPy-compatible `get_f_lineno`.
+    /// pyframe.py:766 get_last_lineno → pytraceback.offset2lineno(self.pycode, self.last_instr)
     #[inline]
     pub fn get_last_lineno(&self) -> usize {
-        self.next_instr
+        let code = unsafe { &*pyframe_get_pycode(self) };
+        if self.last_instr == -1 {
+            return code.first_line_number.map_or(0, |n| n.get() as usize);
+        }
+        offset2lineno(code, self.last_instr as usize)
     }
 
-    /// pyframe.py fget_f_lineno
+    /// pyframe.py:660-671 fget_f_lineno
     #[inline]
-    pub fn fget_f_lineno(&self) -> usize {
+    pub fn fget_f_lineno(&self) -> isize {
         if self.get_w_f_trace().is_null() {
-            self.get_last_lineno()
+            let lineno = self.get_last_lineno();
+            // pyframe.py:663: if lineno == -1: return space.w_None
+            lineno as isize
         } else {
+            // pyframe.py:666: f_lineno = self.getorcreatedebug().f_lineno
             let dd = self.getdebug();
             if !dd.is_null() {
-                unsafe { (*dd).f_lineno }
+                let f_lineno = unsafe { (*dd).f_lineno };
+                if f_lineno == -1 {
+                    // pyframe.py:668: f_lineno = self.pycode.co_firstlineno
+                    let code = unsafe { &*pyframe_get_pycode(self) };
+                    return code.first_line_number.map_or(0, |n| n.get() as isize);
+                }
+                f_lineno
             } else {
                 0
             }
         }
     }
 
-    /// pyframe.py fset_f_lineno
+    /// pyframe.py:680 fset_f_lineno (simplified — full version validates jumps)
     #[inline]
-    pub fn fset_f_lineno(&mut self, new_f_lineno: usize) {
+    pub fn fset_f_lineno(&mut self, new_f_lineno: isize) {
         self.getorcreatedebug().f_lineno = new_f_lineno;
-        self.next_instr = new_f_lineno;
     }
 
     /// PyPy-compatible `setfastscope`.
@@ -1088,90 +1216,148 @@ impl PyFrame {
         self.init_cells();
     }
 
-    /// PyPy-compatible `locals2fast`.
-    #[inline]
-    pub fn locals2fast(&mut self) {
-        let namespace = self.get_w_locals();
-        assert!(!namespace.is_null());
-        let namespace = unsafe { &*namespace };
-        let varnames = self.code().varnames.clone();
-        let mut fast_slots = vec![PY_NULL; self.nlocals()];
-        for (i, name) in varnames.iter().enumerate() {
-            fast_slots[i] = namespace.get(name).copied().unwrap_or(PY_NULL);
+    /// pyframe.py:601-636 locals2fast(skip_free_vars=False)
+    pub fn locals2fast(&mut self, skip_free_vars: bool) {
+        let w_locals = self.getorcreatedebug().w_locals;
+        assert!(!w_locals.is_null());
+        let w_locals_ref = unsafe { &*w_locals };
+
+        let code_ptr = unsafe { pyframe_get_pycode(self) };
+        let code = unsafe { &*code_ptr };
+        let numlocals = code.varnames.len();
+
+        // pyframe.py:609-615: copy locals from dict to fast slots
+        let mut new_fastlocals_w = vec![PY_NULL; numlocals];
+        for i in 0..numlocals {
+            let name = &code.varnames[i];
+            if let Some(&w_value) = w_locals_ref.get(name.as_ref()) {
+                new_fastlocals_w[i] = w_value;
+            }
         }
-        for (i, value) in fast_slots.iter().enumerate() {
-            self.locals_w_mut()[i] = *value;
+        self.setfastscope(&new_fastlocals_w);
+
+        // pyframe.py:619-636: freevarnames = co_cellvars
+        // if CO_OPTIMIZED and not skip_free_vars: freevarnames += co_freevars
+        let ncellvars = code.cellvars.len();
+        let include_freevars = code.flags.contains(CodeFlags::OPTIMIZED) && !skip_free_vars;
+        let freevarnames_len = if include_freevars {
+            ncellvars + code.freevars.len()
+        } else {
+            ncellvars
+        };
+        for i in 0..freevarnames_len {
+            let (name, idx) = if i < ncellvars {
+                (&code.cellvars[i], numlocals + i)
+            } else {
+                (&code.freevars[i - ncellvars], numlocals + i)
+            };
+            if idx < self.locals_w().len() {
+                let w_value = w_locals_ref.get(name.as_ref()).copied().unwrap_or(PY_NULL);
+                // pyframe.py:632-634: cell.set(w_value) / cell.set(None)
+                let slot = self.locals_w()[idx];
+                if !slot.is_null() && unsafe { pyre_object::is_cell(slot) } {
+                    unsafe { pyre_object::w_cell_set(slot, w_value) };
+                } else {
+                    self.locals_w_mut()[idx] = w_value;
+                }
+            }
         }
     }
 
-    /// PyPy-compatible `init_cells`.
+    /// pyframe.py:640-651 init_cells
     #[inline]
     pub fn init_cells(&mut self) {
-        let ncellvars = self.code().cellvars.len();
-        let num_locals = self.code().varnames.len();
-        let base = num_locals;
-        for i in 0..ncellvars {
-            if base + i >= self.locals_w().len() {
-                break;
+        let code = unsafe { &*pyframe_get_pycode(self) };
+        let mut argcount = code.arg_count as usize + code.kwonlyarg_count as usize;
+        if code.flags.contains(CodeFlags::VARARGS) {
+            argcount += 1;
+        }
+        if code.flags.contains(CodeFlags::VARKEYWORDS) {
+            argcount += 1;
+        }
+        let args_to_copy =
+            crate::pycode::_compute_args_as_cellvars(&code.varnames, &code.cellvars, argcount);
+        let mut index = code.varnames.len(); // co_nlocals
+        for i in 0..args_to_copy.len() {
+            let argnum = args_to_copy[i];
+            if argnum >= 0 {
+                let cell = self.locals_w()[index];
+                let val = self.locals_w()[argnum as usize];
+                if !cell.is_null() && unsafe { pyre_object::is_cell(cell) } {
+                    unsafe { pyre_object::w_cell_set(cell, val) };
+                } else {
+                    self.locals_w_mut()[index] = val;
+                }
             }
-            let val = self.locals_w()[i];
-            self.locals_w_mut()[base + i] = val;
+            index += 1;
         }
     }
 
-    /// PyPy-compatible `fast2locals`.
-    #[inline]
+    /// pyframe.py:554-598 fast2locals
     pub fn fast2locals(&mut self) {
-        let namespace = match self.getdictscope() {
-            namespace if namespace.is_null() => return,
-            namespace => unsafe { &mut *namespace },
+        let d = self.getorcreatedebug();
+        let mut w_locals = d.w_locals;
+        let mut write = false;
+        if w_locals.is_null() {
+            w_locals = unsafe { alloc_with_gc_header(PyNamespace::new()) as *mut PyNamespace };
+            write = true;
+        }
+        let w_locals_ref = unsafe { &mut *w_locals };
+
+        let code_ptr = unsafe { pyframe_get_pycode(self) };
+        let code = unsafe { &*code_ptr };
+        let varnames = &code.varnames;
+        let numlocals = varnames.len();
+
+        // pyframe.py:564-575: copy local variables
+        for i in 0..numlocals {
+            let name = &varnames[i];
+            let w_value = self.locals_w()[i];
+            if !w_value.is_null() {
+                w_locals_ref.insert(name.to_string(), w_value);
+            } else {
+                // pyframe.py:571-574: space.delitem(w_locals, w_name)
+                w_locals_ref.remove(name.as_ref());
+            }
+        }
+
+        // pyframe.py:580-581: freevarnames = co_cellvars
+        // if CO_OPTIMIZED: freevarnames += co_freevars
+        let ncellvars = code.cellvars.len();
+        let include_freevars = code.flags.contains(CodeFlags::OPTIMIZED);
+        let freevarnames_len = if include_freevars {
+            ncellvars + code.freevars.len()
+        } else {
+            ncellvars
         };
-        namespace.clear();
-        let locals = self.locals_w().as_slice();
-        let code = self.code();
-
-        for (name, value) in code.varnames.iter().zip(locals.iter()) {
-            if !value.is_null() {
-                namespace.insert(name.to_string(), *value);
-            }
-        }
-
-        let num_locals = code.varnames.len();
-        let cellvars_only = code
-            .cellvars
-            .iter()
-            .filter(|cv| !code.varnames.iter().any(|v| v == *cv))
-            .count();
-
-        for (slot, name) in code
-            .cellvars
-            .iter()
-            .filter(|cv| !code.varnames.iter().any(|v| v == *cv))
-            .enumerate()
-        {
-            let idx = num_locals + slot;
-            if let Some(value) = locals.get(idx).copied() {
-                if !value.is_null() {
-                    namespace.insert((*name).to_string(), value);
+        // pyframe.py:584-596: copy cell/free variables
+        for i in 0..freevarnames_len {
+            let (name, idx) = if i < ncellvars {
+                (&code.cellvars[i], numlocals + i)
+            } else {
+                (&code.freevars[i - ncellvars], numlocals + i)
+            };
+            if idx < self.locals_w().len() {
+                // pyframe.py:586: cell = self._getcell(i)
+                let slot = self.locals_w()[idx];
+                // pyframe.py:588: w_value = cell.get() — dereference cell
+                let w_value = if !slot.is_null() && unsafe { pyre_object::is_cell(slot) } {
+                    unsafe { pyre_object::w_cell_get(slot) }
+                } else {
+                    slot
+                };
+                if !w_value.is_null() {
+                    w_locals_ref.insert(name.to_string(), w_value);
+                } else {
+                    // pyframe.py:589-593: space.delitem(w_locals, w_name)
+                    w_locals_ref.remove(name.as_ref());
                 }
             }
         }
 
-        for (slot, name) in code.freevars.iter().enumerate() {
-            let idx = num_locals + cellvars_only + slot;
-            if let Some(value) = locals.get(idx).copied() {
-                if !value.is_null() {
-                    namespace.insert(name.to_string(), value);
-                }
-            }
+        if write {
+            self.getorcreatedebug().w_locals = w_locals;
         }
-    }
-
-    /// PyPy-compatible `setdictscope` and locals conversion.
-    #[inline]
-    pub fn setdictscope_and_fast(&mut self, w_locals: *mut PyNamespace) {
-        self.setdictscope(w_locals);
-        self.fast2locals();
     }
 
     /// PyPy-compatible `make_arguments`.
@@ -1244,14 +1430,16 @@ impl PyFrame {
             locals_cells_stack_w_arr[i] = args[i];
         }
 
-        // Copy free variables from closure tuple into the frame's cell slots.
-        // Freevars go after cellvar-only slots: indices nlocals+ncellvars_only..
+        // pyframe.py:229-236: copy free variables from closure into freevar slots
+        for i in 0..code_ref.cellvars.len() {
+            locals_cells_stack_w_arr[num_locals + i] = pyre_object::w_cell_new(PY_NULL);
+        }
         if !closure.is_null() {
-            let n_cellvars_only = num_cells - code_ref.freevars.len();
-            let n_freevars = code_ref.freevars.len();
-            for i in 0..n_freevars {
+            let ncellvars = code_ref.cellvars.len();
+            let nfreevars = code_ref.freevars.len();
+            for i in 0..nfreevars {
                 let cell = unsafe { w_tuple_getitem(closure, i as i64).unwrap() };
-                locals_cells_stack_w_arr[num_locals + n_cellvars_only + i] = cell;
+                locals_cells_stack_w_arr[num_locals + ncellvars + i] = cell;
             }
         }
 
@@ -1261,6 +1449,7 @@ impl PyFrame {
             locals_cells_stack_w: unsafe { alloc_array_with_gc_header(locals_cells_stack_w_arr) },
             valuestackdepth: num_locals + num_cells,
             next_instr: 0,
+            last_instr: -1,
             namespace: globals,
             debugdata: 0,
             lastblock: 0,

@@ -2364,10 +2364,7 @@ impl BlackholeInterpBuilder {
     pub fn setup_wellknown_insns(&mut self) {
         let insns = crate::jitcode::wellknown_bh_insns();
         self.op_live = insns.get("live/").copied().unwrap_or(u8::MAX);
-        self.op_catch_exception = insns
-            .get("catch_exception/L")
-            .copied()
-            .unwrap_or(u8::MAX);
+        self.op_catch_exception = insns.get("catch_exception/L").copied().unwrap_or(u8::MAX);
     }
 
     /// RPython `blackhole.py:66-100` `setup_insns(insns)`.

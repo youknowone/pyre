@@ -23,6 +23,8 @@ struct PyFrameLayout {
     #[allow(dead_code)]
     next_instr: usize,
     #[allow(dead_code)]
+    last_instr: isize,
+    #[allow(dead_code)]
     namespace: *mut PyNamespace,
     #[allow(dead_code)]
     debugdata: usize,

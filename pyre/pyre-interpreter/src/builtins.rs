@@ -1813,11 +1813,7 @@ fn builtin_super(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
         // Find __class__ in freevars (it's a cell variable from the enclosing class scope)
         let num_locals = code.varnames.len();
-        let cellvars_only = code
-            .cellvars
-            .iter()
-            .filter(|c| !code.varnames.contains(c))
-            .count();
+        let ncellvars = code.cellvars.len();
         let locals = frame.locals_w().as_slice();
 
         let mut w_class = pyre_object::PY_NULL;
@@ -1825,7 +1821,7 @@ fn builtin_super(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         // Check freevars for __class__
         for (slot, name) in code.freevars.iter().enumerate() {
             if name == "__class__" {
-                let idx = num_locals + cellvars_only + slot;
+                let idx = num_locals + ncellvars + slot;
                 if idx < locals.len() {
                     let cell = locals[idx];
                     if !cell.is_null() {

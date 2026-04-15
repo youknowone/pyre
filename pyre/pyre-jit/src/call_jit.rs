@@ -2422,6 +2422,7 @@ fn reset_reused_call_frame(frame: &mut PyFrame, args: &[PyObjectRef]) {
     }
     frame.valuestackdepth = frame.stack_base();
     frame.next_instr = 0;
+    frame.last_instr = -1;
     frame.vable_token = 0;
     // pyframe.py:80-81,86: new frame starts with debugdata=None, lastblock=None.
     // debugdata and lastblock are GC-managed refs — release references only,
