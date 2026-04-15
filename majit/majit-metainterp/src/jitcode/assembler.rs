@@ -1122,7 +1122,7 @@ impl JitCodeBuilder {
             c_num_regs_f: self.num_regs_f,
             constants_i: self.constants_i,
             constants_r: self.constants_r,
-            constants_f: self.constants_f,
+            constants_f: Vec::new(),
             jitdriver_sd: None,
             fnaddr: 0,
             calldescr: majit_codewriter::jitcode::BhCallDescr::default(),

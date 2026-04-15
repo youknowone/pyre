@@ -874,7 +874,7 @@ fn init_callbacks() {
                 driver_pair: || JIT_DRIVER.with(|cell| cell.get() as *mut u8),
                 ensure_majit_jitcode: |code, w_code| {
                     if !code.is_null() {
-                        crate::jit::codewriter::ensure_jitcode_for(unsafe { &*code }, w_code);
+                        crate::jit::codewriter::ensure_jitcode_for(unsafe { &*code }, w_code, None);
                     }
                 },
             }));
@@ -1274,7 +1274,7 @@ fn jit_merge_point_hook(
             // starts, populating all_liveness. In pyre, JitCode compilation is
             // lazy — ensure the code's JitCode (with liveness) exists before
             // tracing so get_list_of_active_boxes can use it.
-            crate::jit::codewriter::ensure_jitcode_for(code, frame.pycode);
+            crate::jit::codewriter::ensure_jitcode_for(code, frame.pycode, Some(pc));
             let snapshot = frame.snapshot_for_tracing();
             let _ = concrete_frame;
             let (action, _executed_frame) = trace_bytecode(ctx, sym, code, pc, snapshot);
@@ -1746,7 +1746,11 @@ fn bound_reached(
                 || {},
                 |ctx, sym| {
                     use pyre_jit_trace::trace::trace_bytecode;
-                    crate::jit::codewriter::ensure_jitcode_for(code, frame.pycode);
+                    crate::jit::codewriter::ensure_jitcode_for(
+                        code,
+                        frame.pycode,
+                        Some(loop_header_pc),
+                    );
                     let concrete_frame = frame.snapshot_for_tracing();
                     let (action, _) =
                         trace_bytecode(ctx, sym, code, loop_header_pc, concrete_frame);

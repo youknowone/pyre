@@ -73,6 +73,8 @@ pub struct PyJitCode {
     /// True if the jitcode contains BC_ABORT opcodes (unsupported bytecodes).
     /// Precomputed at compile time to avoid repeated bytecode scanning.
     pub has_abort: bool,
+    /// Python PC of the jit_merge_point opcode (trace entry header).
+    pub merge_point_pc: Option<usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -205,7 +207,12 @@ impl CodeWriter {
     /// Python bytecodes serve as the "graph". Since they are already linear
     /// and register-allocated, jtransform/regalloc/flatten are identity
     /// transforms. We go directly to assembly.
-    pub fn transform_graph_to_jitcode(&self, code: &CodeObject, w_code: *const ()) -> PyJitCode {
+    pub fn transform_graph_to_jitcode(
+        &self,
+        code: &CodeObject,
+        w_code: *const (),
+        merge_point_pc: Option<usize>,
+    ) -> PyJitCode {
         let nlocals = code.varnames.len();
         // pyframe.py:111 `self.valuestackdepth = code.co_nlocals + ncellvars
         // + nfreevars`. pyre's `PyFrame.locals_cells_stack_w` uses the same
@@ -373,8 +380,10 @@ impl CodeWriter {
         // incompatible with the compiled trace's assumptions. Until the
         // full RPython CRN→portal_ptr restart is implemented, only the
         // first loop header is a merge point.
-        let merge_point_pc = loop_header_pcs.iter().copied().min();
-        let mut emitted_merge_point = false;
+        // RPython jtransform.py:1690: jit_merge_point only in the portal
+        // graph. merge_point_pc is the trace entry PC (from bound_reached).
+        // Other loop headers use jump_target (no-op in the blackhole).
+        let merge_point_pc = merge_point_pc.or_else(|| loop_header_pcs.iter().copied().min());
 
         // pyframe.py:379-417 pushvalue/popvalue_maybe_none parity:
         // Each push/pop writes self.valuestackdepth = depth ± 1.
@@ -409,32 +418,20 @@ impl CodeWriter {
             depth_at_pc[py_pc] = current_depth;
 
             if loop_header_pcs.contains(&py_pc) {
-                if merge_point_pc == Some(py_pc) && !emitted_merge_point {
+                if merge_point_pc == Some(py_pc) {
                     // interp_jit.py:64 portal contract:
                     //   greens = ['next_instr', 'is_being_profiled', 'pycode']
                     //   reds = ['frame', 'ec']
-                    //
-                    // jtransform.py:1690 make_three_lists parity:
-                    //   gi = [next_instr, is_being_profiled]
-                    //   gr = [pycode]
-                    //   rr = [frame, ec]
-                    //
-                    // Green consts → constant pool → register bank slots.
                     let next_instr_const_idx = assembler.add_const_i(py_pc as i64);
-                    let is_being_profiled_const_idx = assembler.add_const_i(0); // always 0
-                    // Register index = num_regs_i + const_pool_idx
+                    let is_being_profiled_const_idx = assembler.add_const_i(0);
                     let num_regs_i = assembler.num_regs_i();
                     let gi_next_instr_reg = (num_regs_i + next_instr_const_idx) as u8;
                     let gi_is_profiled_reg = (num_regs_i + is_being_profiled_const_idx) as u8;
 
-                    // pycode → ref constant pool → register bank slot.
-                    // interp_jit.py:85: pycode is the W_CodeObject (PyObjectRef),
-                    // not the inner CodeObject struct.
                     let pycode_const_idx = assembler.add_const_r(w_code as i64);
                     let num_regs_r = assembler.num_regs_r();
                     let gr_pycode_reg = (num_regs_r + pycode_const_idx) as u8;
 
-                    // Red refs: dedicated portal registers (frame, ec).
                     let frame_reg = portal_frame_reg as u8;
                     let ec_reg = portal_ec_reg as u8;
 
@@ -443,7 +440,6 @@ impl CodeWriter {
                         &[gr_pycode_reg],
                         &[frame_reg, ec_reg],
                     );
-                    emitted_merge_point = true;
                 } else {
                     assembler.jump_target();
                 }
@@ -1238,6 +1234,7 @@ impl CodeWriter {
             jitcode: std::sync::Arc::new(jitcode),
             metadata,
             has_abort,
+            merge_point_pc,
         }
     }
 
@@ -1245,8 +1242,13 @@ impl CodeWriter {
     ///
     /// For pyre, JitCodes are compiled lazily per-CodeObject (not AOT).
     /// This method compiles a single CodeObject and caches the result.
-    pub fn make_jitcode(&self, code: &CodeObject, w_code: *const ()) -> PyJitCode {
-        self.transform_graph_to_jitcode(code, w_code)
+    pub fn make_jitcode(
+        &self,
+        code: &CodeObject,
+        w_code: *const (),
+        merge_point_pc: Option<usize>,
+    ) -> PyJitCode {
+        self.transform_graph_to_jitcode(code, w_code, merge_point_pc)
     }
 }
 
@@ -1304,12 +1306,20 @@ pub fn get_jitcode(
     code: &CodeObject,
     w_code: *const (),
     writer: &CodeWriter,
+    merge_point_pc: Option<usize>,
 ) -> &'static PyJitCode {
     let key = code as *const CodeObject as usize;
     JITCODE_CACHE.with(|cell| {
         let cache = unsafe { &mut *cell.get() };
-        if !cache.contains_key(&key) {
-            let pyjitcode = writer.make_jitcode(code, w_code);
+        let needs_rebuild = if let Some(existing) = cache.get(&key) {
+            // Rebuild if merge_point_pc changed (first trace provides the
+            // correct PC that was only an estimate at initial creation).
+            merge_point_pc.is_some() && existing.merge_point_pc != merge_point_pc
+        } else {
+            true
+        };
+        if needs_rebuild {
+            let pyjitcode = writer.make_jitcode(code, w_code, merge_point_pc);
             cache.insert(key, pyjitcode);
             // RPython parity: clone JitCode into state::JitCode (which is
             // Box'd in MetaInterpStaticData.jitcodes — stable address).
@@ -1335,7 +1345,11 @@ pub fn get_jitcode(
 /// In pyre, JitCode compilation is lazy. This function ensures the
 /// JitCode (with liveness info) exists for a CodeObject so that
 /// get_list_of_active_boxes can use it during tracing.
-pub fn ensure_jitcode_for(code: &pyre_interpreter::CodeObject, w_code: *const ()) {
+pub fn ensure_jitcode_for(
+    code: &pyre_interpreter::CodeObject,
+    w_code: *const (),
+    merge_point_pc: Option<usize>,
+) {
     let writer = CodeWriter::new(
         crate::call_jit::bh_call_fn,
         crate::call_jit::bh_load_global_fn,
@@ -1347,12 +1361,12 @@ pub fn ensure_jitcode_for(code: &pyre_interpreter::CodeObject, w_code: *const ()
         crate::call_jit::bh_store_subscr_fn,
         crate::call_jit::bh_build_list_fn,
     );
-    let _ = get_jitcode(code, w_code, &writer);
+    let _ = get_jitcode(code, w_code, &writer, merge_point_pc);
 }
 
 /// jitcode.py:18: `jitcode.jitdriver_sd is not None`.
 pub fn is_portal(code: &pyre_interpreter::CodeObject, w_code: *const ()) -> bool {
-    ensure_jitcode_for(code, w_code);
+    ensure_jitcode_for(code, w_code, None);
     let key = code as *const pyre_interpreter::CodeObject as usize;
     JITCODE_CACHE.with(|cell| {
         let cache = unsafe { &*cell.get() };

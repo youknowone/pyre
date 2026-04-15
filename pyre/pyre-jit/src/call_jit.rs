@@ -601,7 +601,7 @@ fn blackhole_from_jit_frame(frame: &mut PyFrame) -> Option<PyObjectRef> {
         bh_store_subscr_fn,
         crate::call_jit::bh_build_list_fn,
     );
-    let pyjitcode = crate::jit::codewriter::get_jitcode(code, frame.pycode, &writer);
+    let pyjitcode = crate::jit::codewriter::get_jitcode(code, frame.pycode, &writer, None);
 
     // Map Python PC → JitCode PC.
     // resume.py:928/1338 parity: rd_numb pc is consumed as-is. RPython does
@@ -974,7 +974,7 @@ pub fn resume_in_blackhole(
         // call.py:148: jitcode via get_jitcode (jitdriver_sd set on portal).
         // virtualizable.py:126-137: code from resume data, not heap.
         let w_code = section.code;
-        let pyjitcode = crate::jit::codewriter::get_jitcode(code, w_code, &writer);
+        let pyjitcode = crate::jit::codewriter::get_jitcode(code, w_code, &writer, None);
         let jitcode_pc = if py_pc < pyjitcode.metadata.pc_map.len() {
             pyjitcode.metadata.pc_map[py_pc]
         } else {
@@ -1656,12 +1656,6 @@ pub fn blackhole_resume_via_rd_numb(
     // jitcode_index is a sequential index into MetaInterpStaticData.jitcodes.
     // Resolve to CodeObject via code_for_jitcode_index, then compile jitcode.
     let resolve_jitcode = |jitcode_index: i32, pc: i32| -> Option<resume::ResolvedJitCode> {
-        // resume.py:928/1338 parity: pc is read directly from rd_numb and
-        // passed to setposition as-is. RPython does NOT introduce a
-        // "start from 0" recovery path for negative or out-of-bounds PCs.
-        // If pyre's pc_map lookup fails, the resume data is corrupt —
-        // fail loudly (return None) instead of silently restarting from
-        // the function entry, which would produce wrong results.
         if pc < 0 {
             return None;
         }
@@ -1677,12 +1671,10 @@ pub fn blackhole_resume_via_rd_numb(
             return None;
         }
         let code = unsafe { &*raw_code };
-        let pyjitcode = crate::jit::codewriter::get_jitcode(code, code_ptr, &writer);
+        let pyjitcode = crate::jit::codewriter::get_jitcode(code, code_ptr, &writer, None);
         if pyjitcode.has_abort_opcode() {
             return None;
         }
-        // Convert Python PC → JitCode byte offset via pc_map.
-        // pc_map miss is a BUG — fail rather than silently restart from 0.
         let jitcode_pc = pyjitcode.metadata.pc_map.get(pc as usize).copied()?;
         Some(
             resume::ResolvedJitCode::new(pyjitcode.jitcode.clone(), jitcode_pc)
