@@ -211,23 +211,6 @@ pub struct StorageConfig {
     pub compact_lengths_offset: Option<Expr>,
     /// Byte offset of the compact storage capacity cache array on the pool object.
     pub compact_caps_offset: Option<Expr>,
-    /// Linked list node size in bytes (for New IR emission).
-    pub linked_list_node_size: Option<Expr>,
-    /// Byte offset of the value field within a linked list node.
-    pub linked_list_value_offset: Option<Expr>,
-    /// Byte offset of the next pointer within a linked list node.
-    pub linked_list_next_offset: Option<Expr>,
-    /// Byte offset of the storage refs array on the shadow storage object.
-    pub linked_list_storage_offset: Option<Expr>,
-    /// Byte offset of the head field on the shadow stack object.
-    pub linked_list_stack_head_offset: Option<Expr>,
-    /// Byte offset of the size field on the shadow stack object.
-    pub linked_list_stack_size_offset: Option<Expr>,
-    /// Byte offset of the tail pointer on Queue objects (FIFO push).
-    /// When set, enables Queue tracing support.
-    pub linked_list_queue_tail_offset: Option<Expr>,
-    /// Storage indices that are Queue (FIFO) storages.
-    pub linked_list_queue_indices: Vec<Expr>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -409,14 +392,6 @@ fn parse_storage_config(input: ParseStream) -> syn::Result<StorageConfig> {
     let mut scan_fn = None;
     let mut can_trace_guard = None;
     let mut compact_live = false;
-    let mut linked_list_node_size = None;
-    let mut linked_list_value_offset = None;
-    let mut linked_list_next_offset = None;
-    let mut linked_list_storage_offset = None;
-    let mut linked_list_stack_head_offset = None;
-    let mut linked_list_stack_size_offset = None;
-    let mut linked_list_queue_tail_offset = None;
-    let mut linked_list_queue_indices: Vec<Expr> = Vec::new();
     let mut compact_encode = None;
     let mut compact_decode = None;
     let mut compact_min = None;
@@ -484,34 +459,6 @@ fn parse_storage_config(input: ParseStream) -> syn::Result<StorageConfig> {
             "compact_caps_offset" => {
                 compact_caps_offset = Some(content.parse::<Expr>()?);
             }
-            "linked_list_node_size" => {
-                linked_list_node_size = Some(content.parse::<Expr>()?);
-            }
-            "linked_list_value_offset" => {
-                linked_list_value_offset = Some(content.parse::<Expr>()?);
-            }
-            "linked_list_next_offset" => {
-                linked_list_next_offset = Some(content.parse::<Expr>()?);
-            }
-            "linked_list_storage_offset" => {
-                linked_list_storage_offset = Some(content.parse::<Expr>()?);
-            }
-            "linked_list_stack_head_offset" => {
-                linked_list_stack_head_offset = Some(content.parse::<Expr>()?);
-            }
-            "linked_list_stack_size_offset" => {
-                linked_list_stack_size_offset = Some(content.parse::<Expr>()?);
-            }
-            "linked_list_queue_tail_offset" => {
-                linked_list_queue_tail_offset = Some(content.parse::<Expr>()?);
-            }
-            "linked_list_queue_indices" => {
-                let inner;
-                bracketed!(inner in content);
-                let exprs: Punctuated<Expr, Token![,]> =
-                    inner.parse_terminated(Expr::parse, Token![,])?;
-                linked_list_queue_indices = exprs.into_iter().collect();
-            }
             "virtualizable" => {
                 let _: LitBool = content.parse()?;
                 return Err(syn::Error::new(
@@ -557,14 +504,6 @@ fn parse_storage_config(input: ParseStream) -> syn::Result<StorageConfig> {
         compact_ptrs_offset,
         compact_lengths_offset,
         compact_caps_offset,
-        linked_list_node_size,
-        linked_list_value_offset,
-        linked_list_next_offset,
-        linked_list_storage_offset,
-        linked_list_stack_head_offset,
-        linked_list_stack_size_offset,
-        linked_list_queue_tail_offset,
-        linked_list_queue_indices,
     })
 }
 

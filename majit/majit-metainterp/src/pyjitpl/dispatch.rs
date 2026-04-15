@@ -168,135 +168,6 @@ pub trait JitCodeSym {
         value
     }
 
-    // -- Linked list storage support -----
-    //
-    // RPython parity: rpaheui uses linked list stacks. OptVirtualize
-    // eliminates Node allocations for push/pop within the same trace.
-
-    /// Get the linked list head OpRef for a storage.
-    /// When Some, push/pop emit New/SetfieldGc/GetfieldGc instead of
-    /// compact array or symbolic stack operations.
-    fn linked_list_head(&self, _selected: usize) -> Option<OpRef> {
-        None
-    }
-
-    /// Get the linked list stack object OpRef for a storage.
-    fn linked_list_stack_ref(&self, _selected: usize) -> Option<OpRef> {
-        None
-    }
-
-    /// Update the linked list head OpRef for a storage.
-    fn set_linked_list_head(&mut self, _selected: usize, _head: OpRef) {}
-
-    /// Update the linked list stack object OpRef for a storage.
-    fn set_linked_list_stack_ref(&mut self, _selected: usize, _stack_ref: OpRef) {}
-
-    /// Ensure linked list head is loaded for a storage.
-    /// Lazily loads from the pool object via GetfieldRawI on first access.
-    fn ensure_linked_list_head(&mut self, _ctx: &mut TraceCtx, selected: usize) -> Option<OpRef> {
-        self.linked_list_head(selected)
-    }
-
-    /// Ensure linked list stack object is loaded for a storage.
-    fn ensure_linked_list_stack_ref(
-        &mut self,
-        _ctx: &mut TraceCtx,
-        selected: usize,
-    ) -> Option<OpRef> {
-        if selected == self.current_selected() {
-            self.current_selected_ref()
-        } else {
-            self.linked_list_stack_ref(selected)
-        }
-    }
-
-    /// Write new linked list head back to the pool object's head cache.
-    fn linked_list_writeback_head(
-        &mut self,
-        _ctx: &mut TraceCtx,
-        _selected: usize,
-        _new_head: OpRef,
-    ) {
-    }
-
-    /// Node size descriptor for New() IR emission.
-    fn node_size_descr(&self) -> Option<majit_ir::DescrRef> {
-        None
-    }
-
-    /// Node.value field descriptor for SetfieldGc/GetfieldGcI.
-    fn node_value_descr(&self) -> Option<majit_ir::DescrRef> {
-        None
-    }
-
-    /// Node.next field descriptor for SetfieldGc/GetfieldGcR.
-    fn node_next_descr(&self) -> Option<majit_ir::DescrRef> {
-        None
-    }
-
-    /// Descriptor for loading one storage ref from the shadow storage object.
-    fn linked_list_storage_item_descr(&self, _selected: usize) -> Option<majit_ir::DescrRef> {
-        None
-    }
-
-    /// Descriptor for the head field on the shadow stack object.
-    fn linked_list_stack_head_descr(&self) -> Option<majit_ir::DescrRef> {
-        None
-    }
-
-    /// Descriptor for the size field on the shadow stack object.
-    fn linked_list_stack_size_descr(&self) -> Option<majit_ir::DescrRef> {
-        None
-    }
-
-    /// Write the latest linked-list size back to the shadow stack object.
-    fn linked_list_writeback_size(
-        &mut self,
-        _ctx: &mut TraceCtx,
-        _selected: usize,
-        _new_size: OpRef,
-    ) {
-    }
-
-    // -- Queue (FIFO) support -----
-    //
-    // Queue uses the same head/size fields as Stack (pop from head),
-    // but push appends to tail. The tail pointer is at a separate offset.
-
-    /// Whether the given storage index is a Queue (FIFO) storage.
-    /// Queue push appends to tail instead of prepending to head.
-    fn is_queue_storage(&self, _selected: usize) -> bool {
-        false
-    }
-
-    /// Descriptor for the tail pointer field on the queue object.
-    fn linked_list_queue_tail_descr(&self) -> Option<majit_ir::DescrRef> {
-        None
-    }
-
-    /// Current tail OpRef for the given queue storage.
-    fn linked_list_tail(&self, _selected: usize) -> Option<OpRef> {
-        None
-    }
-
-    /// Update the tail OpRef for the given queue storage.
-    fn set_linked_list_tail(&mut self, _selected: usize, _tail: OpRef) {}
-
-    /// Write the tail pointer back to the queue object in memory.
-    fn linked_list_writeback_tail(
-        &mut self,
-        _ctx: &mut TraceCtx,
-        _selected: usize,
-        _new_tail: OpRef,
-    ) {
-    }
-
-    /// Ensure the tail pointer is loaded for the given queue storage.
-    /// Returns the OpRef of the tail pointer, or None if not a queue.
-    fn ensure_linked_list_tail(&mut self, _ctx: &mut TraceCtx, _selected: usize) -> Option<OpRef> {
-        None
-    }
-
     // -- State field support (register/tape machines) -----
     //
     // When state_fields is configured, scalar and array fields on the
@@ -675,79 +546,6 @@ where
         Ok(())
     }
 
-    fn linked_list_stack_size(
-        &mut self,
-        ctx: &mut TraceCtx,
-        sym: &mut S,
-        selected: usize,
-    ) -> Result<OpRef, TraceAction> {
-        if selected == sym.current_selected() {
-            sym.current_stacksize_value().ok_or(TraceAction::Abort)
-        } else {
-            let stack_ref = sym
-                .ensure_linked_list_stack_ref(ctx, selected)
-                .ok_or(TraceAction::Abort)?;
-            let size_descr = sym
-                .linked_list_stack_size_descr()
-                .ok_or(TraceAction::Abort)?;
-            Ok(ctx.record_op_with_descr(OpCode::GetfieldGcI, &[stack_ref], size_descr))
-        }
-    }
-
-    fn linked_list_adjust_size(
-        &mut self,
-        ctx: &mut TraceCtx,
-        sym: &mut S,
-        selected: usize,
-        delta: i64,
-    ) -> Result<OpRef, TraceAction> {
-        let size = self.linked_list_stack_size(ctx, sym, selected)?;
-        let amount = ctx.const_int(delta.abs());
-        let new_size = if delta >= 0 {
-            ctx.record_op(OpCode::IntAdd, &[size, amount])
-        } else {
-            ctx.record_op(OpCode::IntSub, &[size, amount])
-        };
-        sym.linked_list_writeback_size(ctx, selected, new_size);
-        if selected == sym.current_selected() {
-            sym.set_current_stacksize_value(new_size);
-        }
-        Ok(new_size)
-    }
-
-    fn linked_list_select_storage(
-        &mut self,
-        ctx: &mut TraceCtx,
-        sym: &mut S,
-        _runtime: &R,
-        selected: usize,
-    ) -> Result<(), TraceAction> {
-        // RPython parity: pool_ref already promoted at trace start (run_to_end).
-        // Each selected gives a distinct immutable GetfieldGcR result.
-        let stack_ref = sym
-            .ensure_linked_list_stack_ref(ctx, selected)
-            .ok_or(TraceAction::Abort)?;
-        // RPython parity: jit.promote(selected) — emit GuardValue to make
-        // the stack pointer a known constant. This prevents cross-stack
-        // aliasing in the heap cache (different stacks get different constants).
-        let size_descr = sym
-            .linked_list_stack_size_descr()
-            .ok_or(TraceAction::Abort)?;
-        let stacksize = ctx.record_op_with_descr(OpCode::GetfieldGcI, &[stack_ref], size_descr);
-        let selected_value = ctx.const_int(selected as i64);
-        sym.set_current_selected_value(selected, selected_value);
-        sym.set_current_selected_ref(selected, stack_ref);
-        sym.set_current_stacksize_value(stacksize);
-        // For Queue storages, also load the tail pointer.
-        if sym.is_queue_storage(selected) {
-            if let Some(tail_descr) = sym.linked_list_queue_tail_descr() {
-                let tail = ctx.record_op_with_descr(OpCode::GetfieldGcR, &[stack_ref], tail_descr);
-                sym.set_linked_list_tail(selected, tail);
-            }
-        }
-        Ok(())
-    }
-
     fn compact_pop_int(
         &mut self,
         ctx: &mut TraceCtx,
@@ -795,140 +593,6 @@ where
             .unwrap_or_else(|| Self::compact_load_raw(ctx, ptr, index));
         let decoded = sym.compact_storage_decode(ctx, raw);
         Ok((decoded, concrete))
-    }
-
-    // ── Linked list push/pop — RPython LinkedList field-op parity ──
-    //
-    // Each method emits raw GetfieldGcR/SetfieldGc ops matching RPython's
-    // source-level field accesses. The optimizer handles caching via
-    // CachedField/lazy_set — no trace-time head/size cache for IR emission.
-
-    /// RPython Stack.push: node=Node(self.head,value); self.head=node; self.size+=1
-    fn linked_list_push(
-        &mut self,
-        ctx: &mut TraceCtx,
-        sym: &mut S,
-        runtime: &R,
-        selected: usize,
-        value: OpRef,
-        concrete: i64,
-    ) -> Result<(), TraceAction> {
-        let node_size_descr = sym.node_size_descr().ok_or(TraceAction::Abort)?;
-        let value_descr = sym.node_value_descr().ok_or(TraceAction::Abort)?;
-        let next_descr = sym.node_next_descr().ok_or(TraceAction::Abort)?;
-        let head_descr = sym
-            .linked_list_stack_head_descr()
-            .ok_or(TraceAction::Abort)?;
-        let size_descr = sym
-            .linked_list_stack_size_descr()
-            .ok_or(TraceAction::Abort)?;
-        let stack_ref = sym
-            .ensure_linked_list_stack_ref(ctx, selected)
-            .ok_or(TraceAction::Abort)?;
-
-        let old_head =
-            ctx.record_op_with_descr(OpCode::GetfieldGcR, &[stack_ref], head_descr.clone());
-        let node = ctx.record_op_with_descr(OpCode::New, &[], node_size_descr);
-        ctx.record_op_with_descr(OpCode::SetfieldGc, &[node, value], value_descr);
-        ctx.record_op_with_descr(OpCode::SetfieldGc, &[node, old_head], next_descr);
-        ctx.record_op_with_descr(OpCode::SetfieldGc, &[stack_ref, node], head_descr);
-        let size = ctx.record_op_with_descr(OpCode::GetfieldGcI, &[stack_ref], size_descr.clone());
-        let one = ctx.const_int(1);
-        let new_size = ctx.record_op(OpCode::IntAdd, &[size, one]);
-        ctx.record_op_with_descr(OpCode::SetfieldGc, &[stack_ref, new_size], size_descr);
-
-        sym.set_linked_list_head(selected, node);
-        if selected == sym.current_selected() {
-            sym.set_current_stacksize_value(new_size);
-        }
-        self.runtime_stack_mut(selected, runtime).push(concrete);
-        Ok(())
-    }
-
-    /// RPython Queue.push: tail.value=value; new=Node(); tail.next=new; self.tail=new; self.size+=1
-    fn linked_list_queue_push(
-        &mut self,
-        ctx: &mut TraceCtx,
-        sym: &mut S,
-        runtime: &R,
-        selected: usize,
-        value: OpRef,
-        concrete: i64,
-    ) -> Result<(), TraceAction> {
-        let node_size_descr = sym.node_size_descr().ok_or(TraceAction::Abort)?;
-        let value_descr = sym.node_value_descr().ok_or(TraceAction::Abort)?;
-        let next_descr = sym.node_next_descr().ok_or(TraceAction::Abort)?;
-        let tail_descr = sym
-            .linked_list_queue_tail_descr()
-            .ok_or(TraceAction::Abort)?;
-        let size_descr = sym
-            .linked_list_stack_size_descr()
-            .ok_or(TraceAction::Abort)?;
-        let stack_ref = sym
-            .ensure_linked_list_stack_ref(ctx, selected)
-            .ok_or(TraceAction::Abort)?;
-
-        let tail = ctx.record_op_with_descr(OpCode::GetfieldGcR, &[stack_ref], tail_descr.clone());
-        ctx.record_op_with_descr(OpCode::SetfieldGc, &[tail, value], value_descr);
-        let new_node = ctx.record_op_with_descr(OpCode::New, &[], node_size_descr);
-        ctx.record_op_with_descr(OpCode::SetfieldGc, &[tail, new_node], next_descr);
-        ctx.record_op_with_descr(OpCode::SetfieldGc, &[stack_ref, new_node], tail_descr);
-        let size = ctx.record_op_with_descr(OpCode::GetfieldGcI, &[stack_ref], size_descr.clone());
-        let one = ctx.const_int(1);
-        let new_size = ctx.record_op(OpCode::IntAdd, &[size, one]);
-        ctx.record_op_with_descr(OpCode::SetfieldGc, &[stack_ref, new_size], size_descr);
-
-        sym.set_linked_list_tail(selected, new_node);
-        if selected == sym.current_selected() {
-            sym.set_current_stacksize_value(new_size);
-        }
-        self.runtime_stack_mut(selected, runtime).push(concrete);
-        Ok(())
-    }
-
-    /// RPython LinkedList.pop: node=self.head; val=node.value; self.head=node.next; self.size-=1
-    fn linked_list_pop(
-        &mut self,
-        ctx: &mut TraceCtx,
-        sym: &mut S,
-        runtime: &R,
-        selected: usize,
-    ) -> Result<(OpRef, i64), TraceAction> {
-        let head_descr = sym
-            .linked_list_stack_head_descr()
-            .ok_or(TraceAction::Abort)?;
-        let size_descr = sym
-            .linked_list_stack_size_descr()
-            .ok_or(TraceAction::Abort)?;
-        let value_descr = sym.node_value_descr().ok_or(TraceAction::Abort)?;
-        let next_descr = sym.node_next_descr().ok_or(TraceAction::Abort)?;
-        let stack_ref = sym
-            .ensure_linked_list_stack_ref(ctx, selected)
-            .ok_or(TraceAction::Abort)?;
-
-        let head = ctx.record_op_with_descr(OpCode::GetfieldGcR, &[stack_ref], head_descr.clone());
-        // Guard against a null head explicitly. This provides
-        // PtrInfo::NonNull to the optimizer for downstream heap caching.
-        // BC_REQUIRE_STACK's size>=1 guard ensures head is non-null at runtime.
-        let resume_pc = ctx.const_int(self.frames.current_mut().pc as i64);
-        Self::record_state_guard(ctx, sym, OpCode::GuardNonnull, &[head], &[resume_pc]);
-        let value = ctx.record_op_with_descr(OpCode::GetfieldGcI, &[head], value_descr);
-        let next = ctx.record_op_with_descr(OpCode::GetfieldGcR, &[head], next_descr);
-        ctx.record_op_with_descr(OpCode::SetfieldGc, &[stack_ref, next], head_descr);
-        let size = ctx.record_op_with_descr(OpCode::GetfieldGcI, &[stack_ref], size_descr.clone());
-        let one = ctx.const_int(1);
-        let new_size = ctx.record_op(OpCode::IntSub, &[size, one]);
-        ctx.record_op_with_descr(OpCode::SetfieldGc, &[stack_ref, new_size], size_descr);
-
-        sym.set_linked_list_head(selected, next);
-        if selected == sym.current_selected() {
-            sym.set_current_stacksize_value(new_size);
-        }
-        let concrete = self
-            .runtime_stack_mut(selected, runtime)
-            .pop()
-            .ok_or(TraceAction::Abort)?;
-        Ok((value, concrete))
     }
 
     // ── Compact storage push/pop ──
@@ -1125,14 +789,7 @@ where
             BC_POP_I => {
                 let dst = self.frames.current_mut().next_u16() as usize;
                 let selected = sym.current_selected();
-                if sym.ensure_linked_list_stack_ref(ctx, selected).is_some() {
-                    let Ok((symbolic, concrete)) =
-                        self.linked_list_pop(ctx, sym, runtime, selected)
-                    else {
-                        return TraceAction::Abort;
-                    };
-                    self.set_int_reg(dst, Some(symbolic), Some(concrete));
-                } else if Self::compact_storage_refs(ctx, sym, selected).is_some() {
+                if Self::compact_storage_refs(ctx, sym, selected).is_some() {
                     let Ok((symbolic, concrete)) =
                         self.compact_pop_int(ctx, sym, runtime, selected)
                     else {
@@ -1151,18 +808,7 @@ where
             BC_PEEK_I => {
                 let dst = self.frames.current_mut().next_u16() as usize;
                 let selected = sym.current_selected();
-                if sym.ensure_linked_list_stack_ref(ctx, selected).is_some() {
-                    // Linked list peek: head.value without pop
-                    let head_descr = sym.linked_list_stack_head_descr().unwrap();
-                    let value_descr = sym.node_value_descr().unwrap();
-                    let stack_ref = sym.ensure_linked_list_stack_ref(ctx, selected).unwrap();
-                    let head =
-                        ctx.record_op_with_descr(OpCode::GetfieldGcR, &[stack_ref], head_descr);
-                    let symbolic =
-                        ctx.record_op_with_descr(OpCode::GetfieldGcI, &[head], value_descr);
-                    let concrete = self.runtime_stack_mut(selected, runtime).last().copied();
-                    self.set_int_reg(dst, Some(symbolic), concrete);
-                } else if Self::compact_storage_refs(ctx, sym, selected).is_some() {
+                if Self::compact_storage_refs(ctx, sym, selected).is_some() {
                     let Ok((symbolic, concrete)) =
                         self.compact_peek_int(ctx, sym, runtime, selected)
                     else {
@@ -1183,17 +829,7 @@ where
                 let src = self.frames.current_mut().next_u16() as usize;
                 let selected = sym.current_selected();
                 let (value, concrete) = self.read_int_reg(src);
-                if sym.ensure_linked_list_stack_ref(ctx, selected).is_some() {
-                    // Linked list mode: Queue appends to tail, Stack prepends to head.
-                    let result = if sym.is_queue_storage(selected) {
-                        self.linked_list_queue_push(ctx, sym, runtime, selected, value, concrete)
-                    } else {
-                        self.linked_list_push(ctx, sym, runtime, selected, value, concrete)
-                    };
-                    if result.is_err() {
-                        return TraceAction::Abort;
-                    }
-                } else if Self::compact_storage_refs(ctx, sym, selected).is_some() {
+                if Self::compact_storage_refs(ctx, sym, selected).is_some() {
                     if self
                         .compact_push_int(ctx, sym, runtime, selected, value, concrete)
                         .is_err()
@@ -1208,41 +844,7 @@ where
             }
             BC_POP_DISCARD => {
                 let selected = sym.current_selected();
-                if sym.ensure_linked_list_stack_ref(ctx, selected).is_some() {
-                    // RPython: self.head = self.head.next; self.size -= 1
-                    let head_descr = sym.linked_list_stack_head_descr().unwrap();
-                    let size_descr = sym.linked_list_stack_size_descr().unwrap();
-                    let next_descr = sym.node_next_descr().unwrap();
-                    let stack_ref = sym.ensure_linked_list_stack_ref(ctx, selected).unwrap();
-                    let head = ctx.record_op_with_descr(
-                        OpCode::GetfieldGcR,
-                        &[stack_ref],
-                        head_descr.clone(),
-                    );
-                    let resume_pc = ctx.const_int(self.frames.current_mut().pc as i64);
-                    Self::record_state_guard(ctx, sym, OpCode::GuardNonnull, &[head], &[resume_pc]);
-                    let next = ctx.record_op_with_descr(OpCode::GetfieldGcR, &[head], next_descr);
-                    ctx.record_op_with_descr(OpCode::SetfieldGc, &[stack_ref, next], head_descr);
-                    let size = ctx.record_op_with_descr(
-                        OpCode::GetfieldGcI,
-                        &[stack_ref],
-                        size_descr.clone(),
-                    );
-                    let one = ctx.const_int(1);
-                    let new_size = ctx.record_op(OpCode::IntSub, &[size, one]);
-                    ctx.record_op_with_descr(
-                        OpCode::SetfieldGc,
-                        &[stack_ref, new_size],
-                        size_descr,
-                    );
-                    sym.set_linked_list_head(selected, next);
-                    if selected == sym.current_selected() {
-                        sym.set_current_stacksize_value(new_size);
-                    }
-                    if self.runtime_stack_mut(selected, runtime).pop().is_none() {
-                        return TraceAction::Abort;
-                    }
-                } else if Self::compact_storage_refs(ctx, sym, selected).is_some() {
+                if Self::compact_storage_refs(ctx, sym, selected).is_some() {
                     if self.runtime_stack_mut(selected, runtime).pop().is_none() {
                         return TraceAction::Abort;
                     }
@@ -1263,26 +865,7 @@ where
             }
             BC_DUP_STACK => {
                 let selected = sym.current_selected();
-                if sym.ensure_linked_list_stack_ref(ctx, selected).is_some() {
-                    // RPython: self.push(self.head.value)
-                    let head_descr = sym.linked_list_stack_head_descr().unwrap();
-                    let value_descr = sym.node_value_descr().unwrap();
-                    let stack_ref = sym.ensure_linked_list_stack_ref(ctx, selected).unwrap();
-                    let head =
-                        ctx.record_op_with_descr(OpCode::GetfieldGcR, &[stack_ref], head_descr);
-                    let value = ctx.record_op_with_descr(OpCode::GetfieldGcI, &[head], value_descr);
-                    let concrete = self
-                        .runtime_stack_mut(selected, runtime)
-                        .last()
-                        .copied()
-                        .expect("dup on empty runtime stack");
-                    if self
-                        .linked_list_push(ctx, sym, runtime, selected, value, concrete)
-                        .is_err()
-                    {
-                        return TraceAction::Abort;
-                    }
-                } else if Self::compact_storage_refs(ctx, sym, selected).is_some() {
+                if Self::compact_storage_refs(ctx, sym, selected).is_some() {
                     let concrete_stack = self.runtime_stack_mut(selected, runtime);
                     let Some(concrete) = concrete_stack.last().copied() else {
                         return TraceAction::Abort;
@@ -1315,37 +898,7 @@ where
             }
             BC_SWAP_STACK => {
                 let selected = sym.current_selected();
-                if sym.ensure_linked_list_stack_ref(ctx, selected).is_some() {
-                    // RPython: a,b = head.value,head.next.value; head.value=b; head.next.value=a
-                    let head_descr = sym.linked_list_stack_head_descr().unwrap();
-                    let value_descr = sym.node_value_descr().unwrap();
-                    let next_descr = sym.node_next_descr().unwrap();
-                    let stack_ref = sym.ensure_linked_list_stack_ref(ctx, selected).unwrap();
-                    let head =
-                        ctx.record_op_with_descr(OpCode::GetfieldGcR, &[stack_ref], head_descr);
-                    let next_node =
-                        ctx.record_op_with_descr(OpCode::GetfieldGcR, &[head], next_descr.clone());
-                    let val_top =
-                        ctx.record_op_with_descr(OpCode::GetfieldGcI, &[head], value_descr.clone());
-                    let val_prev = ctx.record_op_with_descr(
-                        OpCode::GetfieldGcI,
-                        &[next_node],
-                        value_descr.clone(),
-                    );
-                    ctx.record_op_with_descr(
-                        OpCode::SetfieldGc,
-                        &[head, val_prev],
-                        value_descr.clone(),
-                    );
-                    ctx.record_op_with_descr(
-                        OpCode::SetfieldGc,
-                        &[next_node, val_top],
-                        value_descr,
-                    );
-                    let runtime_stack = self.runtime_stack_mut(selected, runtime);
-                    let len = runtime_stack.len();
-                    runtime_stack.swap(len - 1, len - 2);
-                } else if Self::compact_storage_refs(ctx, sym, selected).is_some() {
+                if Self::compact_storage_refs(ctx, sym, selected).is_some() {
                     let runtime_stack = self.runtime_stack_mut(selected, runtime);
                     let len = runtime_stack.len();
                     assert!(
@@ -1753,13 +1306,6 @@ where
                             return TraceAction::Abort;
                         };
                         (cond, runtime_cond)
-                    } else if sym.ensure_linked_list_stack_ref(ctx, selected).is_some() {
-                        let Ok((cond, runtime_cond)) =
-                            self.linked_list_pop(ctx, sym, runtime, selected)
-                        else {
-                            return TraceAction::Abort;
-                        };
-                        (cond, runtime_cond)
                     } else {
                         let runtime_cond = {
                             let runtime_stack = self.runtime_stack_mut(selected, runtime);
@@ -2089,17 +1635,7 @@ where
                         .get(const_idx)
                         .expect("jitcode const index out of bounds") as usize
                 };
-                if sym
-                    .ensure_linked_list_stack_ref(ctx, new_selected)
-                    .is_some()
-                {
-                    if self
-                        .linked_list_select_storage(ctx, sym, runtime, new_selected)
-                        .is_err()
-                    {
-                        return TraceAction::Abort;
-                    }
-                } else if sym.current_selected_ref().is_some() {
+                if sym.current_selected_ref().is_some() {
                     return TraceAction::Abort;
                 } else if Self::compact_storage_refs(ctx, sym, new_selected).is_none()
                     && sym.stack(new_selected).is_none()
@@ -2124,16 +1660,7 @@ where
                     (frame.next_u16() as usize, frame.next_u16() as usize)
                 };
                 let (value, concrete) = self.read_int_reg(src_idx);
-                if sym.ensure_linked_list_stack_ref(ctx, target).is_some() {
-                    let result = if sym.is_queue_storage(target) {
-                        self.linked_list_queue_push(ctx, sym, runtime, target, value, concrete)
-                    } else {
-                        self.linked_list_push(ctx, sym, runtime, target, value, concrete)
-                    };
-                    if result.is_err() {
-                        return TraceAction::Abort;
-                    }
-                } else if sym.current_selected_ref().is_some() {
+                if sym.current_selected_ref().is_some() {
                     return TraceAction::Abort;
                 } else if Self::compact_storage_refs(ctx, sym, target).is_some() {
                     if self
