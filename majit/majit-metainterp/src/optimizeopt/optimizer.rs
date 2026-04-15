@@ -47,7 +47,7 @@ pub struct Optimizer {
     pub call_pure_results: std::collections::HashMap<Vec<majit_ir::Value>, majit_ir::Value>,
     /// optimizer.py: `_last_guard_op` — tracks the last emitted guard
     /// for guard sharing and descriptor fusion.
-    _last_guard_op: Option<Op>,
+    last_guard_op: Option<Op>,
     /// optimizer.py: `replaces_guard` — maps guard op position to replacement.
     replaces_guard: std::collections::HashMap<u32, Op>,
     /// optimizer.py: `pendingfields` — heap fields that need to be
@@ -987,7 +987,7 @@ impl Optimizer {
             pureop_historylength: crate::jit::PARAMETERS.pureop_historylength as usize,
             final_num_inputs: 0,
             call_pure_results: std::collections::HashMap::new(),
-            _last_guard_op: None,
+            last_guard_op: None,
             replaces_guard: std::collections::HashMap::new(),
             pendingfields: Vec::new(),
             can_replace_guards: true,
@@ -1074,11 +1074,11 @@ impl Optimizer {
 
     /// optimizer.py: getlastop() — get the last emitted guard operation.
     pub fn get_last_guard_op(&self) -> Option<&Op> {
-        self._last_guard_op.as_ref()
+        self.last_guard_op.as_ref()
     }
 
     pub fn set_last_guard_op(&mut self, op: Op) {
-        self._last_guard_op = Some(op);
+        self.last_guard_op = Some(op);
     }
 
     /// optimizer.py: notice_guard_future_condition(op)
@@ -1589,7 +1589,7 @@ impl Optimizer {
         self.terminal_op = None;
         // RPython parity: each optimizer run is a fresh Optimizer instance.
         // In pyre we reuse the same Optimizer, so clear per-run state.
-        self._last_guard_op = None;
+        self.last_guard_op = None;
         let mut ctx = OptContext::with_num_inputs_and_start_pos(
             ops.len(),
             num_inputs,
@@ -2931,7 +2931,7 @@ impl Optimizer {
     ///
     /// When emitting a guard, check replaces_guard to see if this guard
     /// should replace a previously emitted one (guard strengthening).
-    /// Also track _last_guard_op for consecutive guard descriptor sharing.
+    /// Also track last_guard_op for consecutive guard descriptor sharing.
     /// RPython optimizer.py:623-625: _emit_operation calls force_box(arg)
     /// on every arg before final emission. In majit, this forces any remaining
     /// virtual args that weren't caught by pass-level handlers.
@@ -2992,7 +2992,7 @@ impl Optimizer {
             // optimizer.py:637: op = self.emit_guard_operation(op, pendingfields)
             op = self.emit_guard_operation(op, ctx);
         } else {
-            // optimizer.py:639-644: preserve _last_guard_op for guard chaining
+            // optimizer.py:639-644: preserve last_guard_op for guard chaining
             // unless the op has side effects or is a call_pure that can raise.
             let preserves_chain = (op.opcode.has_no_side_effect()
                 || op.opcode.is_guard()
@@ -3000,7 +3000,7 @@ impl Optimizer {
                 || op.opcode.is_ovf())
                 && !Self::is_call_pure_pure_canraise(&op);
             if !preserves_chain {
-                self._last_guard_op = None;
+                self.last_guard_op = None;
             }
         }
         // optimizer.py:598-602:
@@ -3097,7 +3097,7 @@ impl Optimizer {
 
     /// optimizer.py:652-686 emit_guard_operation
     ///
-    /// Manages the guard sharing chain (`__last_guard_op`) and dispatches to
+    /// Manages the guard sharing chain (`_last_guard_op`) and dispatches to
     /// `_copy_resume_data_from` (descrless follow-up guard, e.g.
     /// `GUARD_NO_EXCEPTION` after a `CALL_MAY_FORCE`) or to
     /// `store_final_boxes_in_guard` for fresh guards.
@@ -3107,19 +3107,19 @@ impl Optimizer {
         // share resume data with a preceding GUARD_NOT_FORCED. Anything else
         // breaks the chain.
         if (opcode == OpCode::GuardNoException || opcode == OpCode::GuardException)
-            && self._last_guard_op.as_ref().is_some_and(|last| {
+            && self.last_guard_op.as_ref().is_some_and(|last| {
                 last.opcode != OpCode::GuardNotForced && last.opcode != OpCode::GuardNotForced2
             })
         {
-            self._last_guard_op = None;
+            self.last_guard_op = None;
         }
         // optimizer.py:665-670: GUARD_ALWAYS_FAILS must never share resume data.
         if opcode == OpCode::GuardAlwaysFails {
-            self._last_guard_op = None;
+            self.last_guard_op = None;
         }
 
         // optimizer.py:672-683: shared vs. fresh dispatch.
-        let shared = op.descr.is_none() && self._last_guard_op.is_some();
+        let shared = op.descr.is_none() && self.last_guard_op.is_some();
         if shared {
             op = self._copy_resume_data_from(op, ctx);
         } else {
@@ -3202,27 +3202,27 @@ impl Optimizer {
             );
         }
 
-        // optimizer.py:679: update _last_guard_op only on the fresh-guard path.
+        // optimizer.py:679: update last_guard_op only on the fresh-guard path.
         if !shared {
-            self._last_guard_op = Some(op.clone());
+            self.last_guard_op = Some(op.clone());
         }
         // optimizer.py:684-685: GUARD_EXCEPTION breaks the chain.
         if opcode == OpCode::GuardException {
-            self._last_guard_op = None;
+            self.last_guard_op = None;
         }
         op
     }
 
     /// optimizer.py:688-700 _copy_resume_data_from
     ///
-    /// Inherits descr / fail_args / resume_data from `__last_guard_op` for the
+    /// Inherits descr / fail_args / resume_data from `_last_guard_op` for the
     /// follow-up descrless guard, then runs `_maybe_replace_guard_value` if
     /// the inheriting op is a `GUARD_VALUE`.
     fn _copy_resume_data_from(&mut self, mut op: Op, ctx: &mut OptContext) -> Op {
         let last = self
-            ._last_guard_op
+            .last_guard_op
             .as_ref()
-            .expect("_copy_resume_data_from requires _last_guard_op");
+            .expect("_copy_resume_data_from requires last_guard_op");
         op.descr = last.descr.clone();
         op.fail_args = last.fail_args.clone();
         op.rd_resume_position = last.rd_resume_position;

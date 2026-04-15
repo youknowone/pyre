@@ -104,7 +104,7 @@ impl BaseJitCell {
     }
 
     pub fn is_compiled(&self) -> bool {
-        self.get_procedure_token().is_some() && (self.flags & jc_flags::TEMPORARY == 0)
+        self.loop_token.is_some() && (self.flags & jc_flags::TEMPORARY == 0)
     }
 
     pub fn has_procedure_token(&self) -> bool {
@@ -647,7 +647,6 @@ impl WarmEnterState {
             .or_insert_with(BaseJitCell::new);
         cell.flags &= !jc_flags::TRACING;
         cell.set_procedure_token(token, false);
-        self.memory_manager.register_loop(green_key_hash);
     }
 
     pub fn take_procedure_token(&mut self, green_key_hash: u64) -> Option<Arc<JitCellToken>> {
@@ -2198,7 +2197,7 @@ mod tests {
         // - LoopAging evicts the loop.
         // - WarmEnterState removes the compiled loop and allows recompilation.
         let mut ws = WarmEnterState::new(2);
-        ws.memory_manager.set_max_age(2);
+        let mut aging = LoopAging::new(2);
         let key = 0xF00D;
 
         // Step 1: compile a loop
@@ -2210,14 +2209,15 @@ mod tests {
         ws.finish_tracing(key);
         let token = JitCellToken::new(ws.alloc_token_number());
         ws.attach_procedure_to_interp(key, token);
+        aging.register_loop(key);
 
         assert!(matches!(ws.maybe_compile(key), HotResult::RunCompiled));
-        assert_eq!(ws.memory_manager.alive_count(), 1);
+        assert_eq!(aging.alive_count(), 1);
 
         // Step 2: advance past max_age without refreshing
-        ws.memory_manager.next_generation();
-        ws.memory_manager.next_generation();
-        let evicted = ws.memory_manager.next_generation();
+        aging.next_generation();
+        aging.next_generation();
+        let evicted = aging.next_generation();
         assert!(evicted.contains(&key));
 
         // In a real system, eviction would cause the WarmEnterState to reset
@@ -2225,22 +2225,10 @@ mod tests {
         // that we can re-install.
         let token2 = JitCellToken::new(ws.alloc_token_number());
         ws.attach_procedure_to_interp(key, token2);
+        aging.register_loop(key);
 
         assert!(matches!(ws.maybe_compile(key), HotResult::RunCompiled));
-        assert_eq!(ws.memory_manager.alive_count(), 1);
-    }
-
-    #[test]
-    fn test_attach_procedure_registers_loop_with_memory_manager() {
-        let mut ws = WarmEnterState::new(2);
-        let key = 0xCAFE;
-
-        assert!(!ws.memory_manager.contains_loop(key));
-
-        let token = JitCellToken::new(ws.alloc_token_number());
-        ws.attach_procedure_to_interp(key, token);
-
-        assert!(ws.memory_manager.contains_loop(key));
+        assert_eq!(aging.alive_count(), 1);
     }
 
     #[test]

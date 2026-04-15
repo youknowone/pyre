@@ -1368,9 +1368,6 @@ impl<S: JitState> JitDriver<S> {
                     None, // vinfo
                     None, // ginfo
                     allocator,
-                    &[], // all_liveness: majit's generic JitDriver has no
-                         // metainterp_sd.liveness_info (pyre's production
-                         // path wires it via blackhole_resume_via_rd_numb).
                 );
                 if let Some((bh, _vable_ptr)) = bh {
                     let exc =
@@ -2931,9 +2928,6 @@ impl<S: JitState> JitDriver<S> {
                     None, // vinfo
                     None, // ginfo
                     allocator,
-                    &[], // all_liveness: majit's generic JitDriver has no
-                         // metainterp_sd.liveness_info (pyre's production
-                         // path wires it via blackhole_resume_via_rd_numb).
                 );
                 if let Some((bh, _vable_ptr)) = bh {
                     let exc =

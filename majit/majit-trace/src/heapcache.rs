@@ -8,45 +8,44 @@
 use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 
-use majit_ir::{GcRef, OpCode, OpRef};
-
-/// Per-box state — RPython `RefFrontendOp._heapc_flags` + `_heapc_deps`
-/// + `FrontendOp.FO_REPLACED_WITH_CONST`.
-/// history.py:644-711.
-#[derive(Clone)]
-struct RefFrontendOpData {
-    /// Versioned flags: upper bits = version, lower 6 bits = HF_* flags.
-    /// heapcache.py:15-24.
-    flags: u32,
-    /// RPython `_heapc_deps`: deps[0] = cached array length (OpRef::NONE if unknown),
-    /// deps[1:] = escape dependencies from SETFIELD_GC.
-    /// heapcache.py:449-596.
-    deps: Option<Vec<OpRef>>,
-    /// Concrete class pointer — companion to HF_KNOWN_CLASS flag.
-    known_class: Option<GcRef>,
-    /// Nullity: 0 = unknown, 1 = nonnull, 2 = null.
-    /// Extends HF_KNOWN_NULLITY with which side is known.
-    known_nullity: u8,
-    /// history.py:644 `FO_REPLACED_WITH_CONST` — when `replace_box(old, new)`
-    /// is called with a constant `new`, stores the constant OpRef so
-    /// `maybe_replace_with_const` can substitute it in cached reads.
-    replaced_with_const: Option<OpRef>,
+// Vec<bool> helpers — RPython stores these as FrontendOp flags, not sets.
+#[inline(always)]
+fn vb_insert(v: &mut Vec<bool>, opref: OpRef) {
+    if opref.is_constant() {
+        return;
+    }
+    let i = opref.0 as usize;
+    if i >= v.len() {
+        v.resize(i + 1, false);
+    }
+    v[i] = true;
 }
-
-impl Default for RefFrontendOpData {
-    fn default() -> Self {
-        Self {
-            flags: 0,
-            deps: None,
-            known_class: None,
-            known_nullity: 0,
-            replaced_with_const: None,
-        }
+#[inline(always)]
+fn vb_contains(v: &[bool], opref: &OpRef) -> bool {
+    if opref.is_constant() {
+        return false;
+    }
+    v.get(opref.0 as usize).copied().unwrap_or(false)
+}
+#[inline(always)]
+fn vb_remove(v: &mut Vec<bool>, opref: &OpRef) -> bool {
+    if opref.is_constant() {
+        return false;
+    }
+    let i = opref.0 as usize;
+    if i < v.len() && v[i] {
+        v[i] = false;
+        true
+    } else {
+        false
     }
 }
 
-// heapcache.py:15-24 HF_* flags stored per-box on RefFrontendOp._heapc_flags.
-// Consolidated into RefFrontendOpData.flags with version gating.
+use majit_ir::{GcRef, OpCode, OpRef};
+
+// heapcache.py: HF_* flags stored per-box on RefFrontendOp.
+// In majit these are tracked via separate HashSets (is_unescaped,
+// seen_allocation, etc.), but we define the constants for reference.
 
 /// heapcache.py: HF_LIKELY_VIRTUAL
 pub const HF_LIKELY_VIRTUAL: u8 = 0x01;
@@ -64,10 +63,16 @@ pub const HF_NONSTD_VABLE: u8 = 0x20;
 /// heapcache.py helper aliases.
 const HF_VERSION_INC: u32 = 0x40;
 pub const HF_VERSION_MAX: u32 = 0xffff_ffff - HF_VERSION_INC;
+const _HF_VERSION_INC: u32 = HF_VERSION_INC;
+const _HF_VERSION_MAX: u32 = HF_VERSION_MAX;
 
-// heapcache.py:43-47 `maybe_replace_with_const` is now a method on HeapCache
-// (see `HeapCache::maybe_replace_with_const`), not a free function, because
-// the replacement state lives in `RefFrontendOpData.replaced_with_const`.
+// RPython `heapcache.py:27-41` defines module-level helpers
+// `add_flags`, `remove_flags`, `test_flags` that mutate per-op storage
+// (`ref_frontend_op._heapc_flags`). pyre routes the same logic through
+// `HeapCache::_set_flag` / `_remove_flag` / `_check_flag` because pyre's
+// `OpRef` is a bare index with no associated storage outside `HeapCache`'s
+// own `heapc_flags: Vec<u32>` table. The standalone helpers therefore
+// cannot exist as standalone functions and would be misleading stubs.
 
 #[derive(Debug, Default)]
 pub(crate) struct CacheEntry {
@@ -163,6 +168,7 @@ impl CacheEntry {
     }
 
     pub fn read(&mut self, ref_box: OpRef, cache: &HeapCache) -> Option<OpRef> {
+        let _ = cache;
         let ref_box = self.unique_const_heuristic(ref_box);
         let seen_alloc = self.seen_alloc(ref_box, cache);
         self._getdict(seen_alloc)
@@ -275,13 +281,26 @@ pub struct HeapCache {
     /// heapcache.py: `cached_arrayitems`.
     array_cache: HashMap<(OpRef, OpRef, u32), OpRef>,
 
+    /// Known class map: object_ref -> class pointer.
+    /// RPython: CacheEntry 내부. Vec indexed by OpRef.0.
+    known_class: Vec<Option<GcRef>>,
+
     /// Quasi-immutable fields known in this trace.
     /// heapcache.py: `quasi_immut_known`.
     quasi_immut_known: HashSet<(OpRef, u32)>,
 
-    /// Per-box state: versioned flags + deps + known_class + nullity.
-    /// Consolidates RPython's per-RefFrontendOp `_heapc_flags` + `_heapc_deps`.
-    box_data: Vec<RefFrontendOpData>,
+    /// RPython: FrontendOp flag. Vec<bool> indexed by OpRef.0.
+    is_unescaped: Vec<bool>,
+
+    /// RPython: FrontendOp flag. Vec<bool> indexed by OpRef.0.
+    seen_allocation: Vec<bool>,
+
+    /// RPython: FrontendOp flag. Vec<u8> indexed by OpRef.0.
+    /// 0 = unknown, 1 = non-null, 2 = null.
+    known_nullity: Vec<u8>,
+
+    /// RPython: FrontendOp flag. Vec<bool> indexed by OpRef.0.
+    likely_virtual: Vec<bool>,
 
     /// heapcache.py: loop-invariant call result cache.
     /// RPython stores exactly ONE result: (descr, arg0_int) → result.
@@ -290,6 +309,20 @@ pub struct HeapCache {
     loopinvariant_arg0: Option<i64>,
     loopinvariant_result: Option<OpRef>,
 
+    /// heapcache.py: per-box `_heapc_deps`.
+    ///
+    /// RPython stores either `None` or a list on each FrontendOp:
+    /// `deps[0]` is the cached array length and `deps[1:]` are escape
+    /// dependencies added by `_escape_from_write`. pyre's `OpRef` is a bare
+    /// index, so the closest equivalent is a per-op side slot keyed by OpRef.
+    heapc_deps: Vec<Option<Vec<Option<OpRef>>>>,
+
+    /// heapcache.py: oldbox.set_replaced_with_const() in replace_box().
+    ///
+    /// RPython stores this on the box's `_forwarded`; pyre stores the same
+    /// bit of heapcache-visible state in a per-op slot keyed by OpRef.
+    replaced_with_const: Vec<Option<OpRef>>,
+
     /// heapcache.py:176: need_guard_not_invalidated — set True on reset,
     /// consumed by quasi-immut field recording to decide whether to emit
     /// GUARD_NOT_INVALIDATED.
@@ -297,6 +330,8 @@ pub struct HeapCache {
 
     head_version: u32,
     likely_virtual_version: u32,
+    /// RPython: FrontendOp flags. Vec<u32> indexed by OpRef.0.
+    heapc_flags: Vec<u32>,
 }
 
 impl HeapCache {
@@ -307,62 +342,71 @@ impl HeapCache {
             heap_cache: HashMap::new(),
             heap_array_cache: HashMap::new(),
             array_cache: HashMap::new(),
+            known_class: Vec::new(),
             quasi_immut_known: HashSet::new(),
-            box_data: Vec::new(),
+            is_unescaped: Vec::new(),
+            seen_allocation: Vec::new(),
+            known_nullity: Vec::new(),
+            likely_virtual: Vec::new(),
             loopinvariant_descr: None,
             loopinvariant_arg0: None,
             loopinvariant_result: None,
+            heapc_deps: Vec::new(),
+            replaced_with_const: Vec::new(),
             need_guard_not_invalidated: true,
             head_version: 0,
             likely_virtual_version: 0,
+            heapc_flags: Vec::new(),
         }
     }
 
     /// heapcache.py:43-47 `maybe_replace_with_const(box)`.
-    ///
-    /// If `replace_box(old, new)` was called with a constant `new`,
-    /// return that constant instead of `opref`. Otherwise return `opref`
-    /// unchanged. Called from `CacheEntry::read` and `arraylen`.
-    pub fn maybe_replace_with_const(&self, opref: OpRef) -> OpRef {
+    fn maybe_replace_with_const(&self, opref: OpRef) -> OpRef {
         if opref.is_constant() {
             return opref;
         }
-        if let Some(data) = self.box_data.get(opref.0 as usize) {
-            if let Some(const_ref) = data.replaced_with_const {
-                return const_ref;
-            }
-        }
-        opref
+        self.replaced_with_const
+            .get(opref.0 as usize)
+            .and_then(|v| *v)
+            .unwrap_or(opref)
     }
 
-    /// Read the flags word for `opref`. Returns 0 for constants or out-of-bounds.
-    #[inline(always)]
-    fn flags_for(&self, opref: OpRef) -> u32 {
+    fn flags_for_ref(&self, opref: OpRef) -> u32 {
         if opref.is_constant() {
             return 0;
         }
-        self.box_data.get(opref.0 as usize).map_or(0, |d| d.flags)
+        self.heapc_flags.get(opref.0 as usize).copied().unwrap_or(0)
     }
 
-    /// Ensure `box_data` is large enough to index `opref`.
-    fn ensure_data(&mut self, opref: OpRef) {
+    fn set_flags_for_ref(&mut self, opref: OpRef, flags: u32) {
         if opref.is_constant() {
             return;
         }
         let i = opref.0 as usize;
-        if i >= self.box_data.len() {
-            self.box_data.resize_with(i + 1, Default::default);
+        if i >= self.heapc_flags.len() {
+            self.heapc_flags.resize(i + 1, 0);
         }
+        self.heapc_flags[i] = flags;
+    }
+
+    fn versioned_or(self_flags: u32, op_version: u32) -> bool {
+        self_flags >= op_version
+    }
+
+    fn bump_head_version(&mut self) -> u32 {
+        assert!(self.head_version < HF_VERSION_MAX);
+        self.head_version += HF_VERSION_INC;
+        self.head_version
     }
 
     /// RPython: test_head_version(ref_frontend_op)
     pub fn test_head_version(&self, opref: OpRef) -> bool {
-        self.flags_for(opref) >= self.head_version
+        Self::versioned_or(self.flags_for_ref(opref), self.head_version)
     }
 
     /// RPython: test_likely_virtual_version(ref_frontend_op)
     pub fn test_likely_virtual_version(&self, opref: OpRef) -> bool {
-        self.flags_for(opref) >= self.likely_virtual_version
+        Self::versioned_or(self.flags_for_ref(opref), self.likely_virtual_version)
     }
 
     /// RPython: update_version(ref_frontend_op)
@@ -382,33 +426,27 @@ impl HeapCache {
     ///          ref_frontend_op._heapc_deps = None
     /// ```
     pub fn update_version(&mut self, opref: OpRef) {
-        if opref.is_constant() {
+        let old_flags = self.flags_for_ref(opref);
+        if Self::versioned_or(old_flags, self.head_version) {
             return;
         }
-        let old_flags = self.flags_for(opref);
-        if old_flags >= self.head_version {
-            return;
-        }
-        let mut new_flags = self.head_version;
-        if old_flags >= self.likely_virtual_version
+        let mut flags = self.head_version;
+        if Self::versioned_or(old_flags, self.likely_virtual_version)
             && (old_flags & u32::from(HF_LIKELY_VIRTUAL)) != 0
         {
-            new_flags |= u32::from(HF_LIKELY_VIRTUAL);
+            flags |= u32::from(HF_LIKELY_VIRTUAL);
         }
-        self.ensure_data(opref);
-        let data = &mut self.box_data[opref.0 as usize];
-        data.flags = new_flags;
+        self.set_flags_for_ref(opref, flags);
         // RPython: ref_frontend_op._heapc_deps = None
-        data.deps = None;
+        self._remove_deps_for_box(opref);
     }
 
     /// RPython: _check_flag(box, flag)
     pub fn _check_flag(&self, opref: OpRef, flag: u8) -> bool {
-        if opref.is_constant() {
+        if !self.test_head_version(opref) {
             return false;
         }
-        let flags = self.flags_for(opref);
-        flags >= self.head_version && (flags & u32::from(flag)) != 0
+        (self.flags_for_ref(opref) & u32::from(flag)) != 0
     }
 
     /// RPython: _set_flag(box, flag)
@@ -417,29 +455,94 @@ impl HeapCache {
             return;
         }
         self.update_version(opref);
-        self.ensure_data(opref);
-        self.box_data[opref.0 as usize].flags |= u32::from(flag);
+        let flags = self.flags_for_ref(opref) | u32::from(flag);
+        self.set_flags_for_ref(opref, flags);
+        // Keep mirrors: boolean flags used by this Rust implementation.
+        match flag {
+            HF_SEEN_ALLOCATION => {
+                vb_insert(&mut self.seen_allocation, opref);
+            }
+            HF_KNOWN_CLASS => {
+                let i = opref.0 as usize;
+                if i >= self.known_class.len() {
+                    self.known_class.resize(i + 1, None);
+                }
+                if self.known_class[i].is_none() {
+                    self.known_class[i] = Some(GcRef(0));
+                }
+            }
+            HF_KNOWN_NULLITY => {
+                let i = opref.0 as usize;
+                if i >= self.known_nullity.len() {
+                    self.known_nullity.resize(i + 1, 0);
+                }
+                if self.known_nullity[i] == 0 {
+                    self.known_nullity[i] = 1;
+                }
+            }
+            HF_IS_UNESCAPED => {
+                vb_insert(&mut self.is_unescaped, opref);
+            }
+            HF_LIKELY_VIRTUAL => {
+                vb_insert(&mut self.likely_virtual, opref);
+            }
+            // HF_NONSTD_VABLE has no mirror — heapc_flags is the source of truth.
+            _ => {}
+        }
     }
 
     fn _remove_flag(&mut self, opref: OpRef, flag: u8) {
         if opref.is_constant() {
             return;
         }
-        let i = opref.0 as usize;
-        if i < self.box_data.len() {
-            self.box_data[i].flags &= !u32::from(flag);
+        let flags = self.flags_for_ref(opref);
+        if flags == 0 {
+            return;
+        }
+        let updated = flags & !u32::from(flag);
+        self.set_flags_for_ref(opref, updated);
+        match flag {
+            HF_IS_UNESCAPED => {
+                vb_remove(&mut self.is_unescaped, &opref);
+            }
+            HF_LIKELY_VIRTUAL => {
+                vb_remove(&mut self.likely_virtual, &opref);
+            }
+            HF_SEEN_ALLOCATION => {
+                vb_remove(&mut self.seen_allocation, &opref);
+            }
+            HF_KNOWN_NULLITY => {
+                {
+                    let _i = opref.0 as usize;
+                    if _i < self.known_nullity.len() {
+                        self.known_nullity[_i] = 0;
+                    }
+                };
+            }
+            HF_KNOWN_CLASS => {
+                {
+                    let _i = opref.0 as usize;
+                    if _i < self.known_class.len() {
+                        self.known_class[_i] = None;
+                    }
+                };
+            }
+            _ => {}
         }
     }
 
     /// RPython-compatible alias.
-    pub fn _get_deps(&mut self, opref: OpRef) -> &mut Vec<OpRef> {
+    pub fn _get_deps(&mut self, opref: OpRef) -> &mut Vec<Option<OpRef>> {
         self.update_version(opref);
-        self.ensure_data(opref);
-        let data = &mut self.box_data[opref.0 as usize];
-        if data.deps.is_none() {
-            data.deps = Some(vec![OpRef::NONE]); // RPython: [None]
+        let i = opref.0 as usize;
+        if i >= self.heapc_deps.len() {
+            self.heapc_deps.resize_with(i + 1, || None);
         }
-        data.deps.as_mut().unwrap()
+        let deps = self.heapc_deps[i].get_or_insert_with(|| vec![None]);
+        if deps.is_empty() {
+            deps.push(None);
+        }
+        deps
     }
 
     /// heapcache.py:224-229
@@ -455,7 +558,7 @@ impl HeapCache {
     pub fn _escape_from_write(&mut self, r#box: OpRef, fieldbox: OpRef) {
         if self.is_unescaped(r#box) && self.is_unescaped(fieldbox) {
             let deps = self._get_deps(r#box);
-            deps.push(fieldbox);
+            deps.push(Some(fieldbox));
         } else {
             // RPython's `elif fieldbox is not None` — pyre's OpRef is always
             // present (no None equivalent), so the branch always fires.
@@ -491,35 +594,27 @@ impl HeapCache {
         if opref.is_constant() {
             return;
         }
+        if !vb_remove(&mut self.is_unescaped, &opref) {
+            return;
+        }
+        // RPython remove_flags(box, HF_LIKELY_VIRTUAL | HF_IS_UNESCAPED).
+        // _remove_flag updates heapc_flags AND mirrors HF_IS_UNESCAPED /
+        // HF_LIKELY_VIRTUAL Vec<bool> back out, so the version-gated
+        // _check_flag query stays consistent.
+        self._remove_flag(opref, HF_LIKELY_VIRTUAL);
+        self._remove_flag(opref, HF_IS_UNESCAPED);
         let i = opref.0 as usize;
-        if i >= self.box_data.len() {
-            return;
-        }
-
-        // RPython: remove_flags(box, HF_LIKELY_VIRTUAL | HF_IS_UNESCAPED)
-        let had_unescaped = self.box_data[i].flags & u32::from(HF_IS_UNESCAPED) != 0;
-        self.box_data[i].flags &= !u32::from(HF_LIKELY_VIRTUAL | HF_IS_UNESCAPED);
-
-        if !had_unescaped {
-            return;
-        }
-
-        let is_current = self.box_data[i].flags >= self.head_version;
-        let deps = self.box_data[i].deps.take();
-
+        let deps = self.heapc_deps.get_mut(i).and_then(Option::take);
         if let Some(deps) = deps {
-            if is_current {
-                // RPython: keep deps[0] (arraylen) if not NONE
-                let arraylen = deps.get(0).copied().unwrap_or(OpRef::NONE);
-                if arraylen != OpRef::NONE {
-                    self.box_data[i].deps = Some(vec![arraylen]);
+            if self.test_head_version(opref) {
+                let kept_len = deps.first().copied().flatten();
+                if let Some(length) = kept_len {
+                    self.heapc_deps[i] = Some(vec![Some(length)]);
                 }
-                // RPython: for i in range(1, len(deps)): self._escape_box(deps[i])
-                for j in 1..deps.len() {
-                    self.mark_escaped_box(deps[j]);
+                for dep in deps.into_iter().skip(1).flatten() {
+                    self.mark_escaped_box(dep);
                 }
             }
-            // else: stale version, deps already taken/cleared
         }
     }
 
@@ -603,21 +698,16 @@ impl HeapCache {
     }
 
     pub fn setfield_cached(&mut self, obj: OpRef, field_index: u32, value: OpRef) {
-        let obj_is_unescaped = self._check_flag(obj, HF_IS_UNESCAPED);
+        let obj_is_unescaped = vb_contains(&self.is_unescaped, &obj);
         if !obj_is_unescaped {
             // Potential aliasing: clear all cached values for this field
             // from objects that are not known-unescaped.
-            // Snapshot unescaped state before retaining (borrow checker).
-            let unescaped = self.unescaped_snapshot();
             self.field_cache.retain(|&(cached_obj, cached_field), _| {
                 if cached_field != field_index {
                     return true;
                 }
                 // Keep entries for unescaped objects (no aliasing possible)
-                unescaped
-                    .get(cached_obj.0 as usize)
-                    .copied()
-                    .unwrap_or(false)
+                vb_contains(&self.is_unescaped, &cached_obj)
             });
         }
         self.field_cache.insert((obj, field_index), value);
@@ -644,11 +734,10 @@ impl HeapCache {
     /// escaped objects only. Unescaped (newly allocated) objects cannot
     /// be affected by external calls, so their caches are preserved.
     pub fn invalidate_caches_for_escaped(&mut self) {
-        let unescaped = self.unescaped_snapshot();
         self.field_cache
-            .retain(|&(obj, _), _| unescaped.get(obj.0 as usize).copied().unwrap_or(false));
+            .retain(|&(obj, _), _| vb_contains(&self.is_unescaped, &obj));
         self.array_cache
-            .retain(|&(obj, _, _), _| unescaped.get(obj.0 as usize).copied().unwrap_or(false));
+            .retain(|&(obj, _, _), _| vb_contains(&self.is_unescaped, &obj));
     }
 
     /// heapcache.py: mark_escaped_varargs — escape call arguments before
@@ -673,11 +762,13 @@ impl HeapCache {
             return;
         }
         self.update_version(opref);
-        self.ensure_data(opref);
-        let data = &mut self.box_data[opref.0 as usize];
-        data.flags |=
-            u32::from(HF_LIKELY_VIRTUAL | HF_SEEN_ALLOCATION | HF_IS_UNESCAPED | HF_KNOWN_NULLITY);
-        data.known_nullity = 1; // nonnull
+        // RPython add_flags writes the bitwise OR of all four flags into the
+        // versioned heapc_flags. We route through _set_flag so the Vec<bool>
+        // mirrors stay in sync with heapc_flags.
+        self._set_flag(opref, HF_LIKELY_VIRTUAL);
+        self._set_flag(opref, HF_SEEN_ALLOCATION);
+        self._set_flag(opref, HF_IS_UNESCAPED);
+        self._set_flag(opref, HF_KNOWN_NULLITY);
     }
 
     /// heapcache.py:508-516 new_array
@@ -697,15 +788,23 @@ impl HeapCache {
         if opref.is_constant() {
             return;
         }
+        // RPython:
+        //     self.update_version(box)
+        //     flags = HF_SEEN_ALLOCATION | HF_KNOWN_NULLITY
+        //     if isinstance(lengthbox, Const):
+        //         flags |= HF_LIKELY_VIRTUAL | HF_IS_UNESCAPED
+        //     add_flags(box, flags)
+        //     self.arraylen_now_known(box, lengthbox)
         self.update_version(opref);
-        self.ensure_data(opref);
-        let mut flags = u32::from(HF_SEEN_ALLOCATION | HF_KNOWN_NULLITY);
+        self._set_flag(opref, HF_SEEN_ALLOCATION);
+        // RPython adds HF_KNOWN_NULLITY directly via add_flags. Route through
+        // nullity_now_known so the Vec<u8> value mirror also captures non-null.
+        self.nullity_now_known(opref, true);
         if length_is_const {
-            flags |= u32::from(HF_LIKELY_VIRTUAL | HF_IS_UNESCAPED);
+            self._set_flag(opref, HF_LIKELY_VIRTUAL);
+            self._set_flag(opref, HF_IS_UNESCAPED);
         }
-        let data = &mut self.box_data[opref.0 as usize];
-        data.flags |= flags;
-        data.known_nullity = 1; // nonnull
+        // heapcache.py:516: self.arraylen_now_known(box, lengthbox)
         self.arraylen_now_known(opref, lengthbox);
     }
 
@@ -745,37 +844,12 @@ impl HeapCache {
     /// ```
     ///
     pub fn replace_box(&mut self, old: OpRef, new: OpRef) {
-        // Transfer field cache entries keyed by (OpRef, descr_index).
-        let keys: Vec<_> = self
-            .field_cache
-            .keys()
-            .filter(|k| k.0 == old)
-            .cloned()
-            .collect();
-        for key in keys {
-            if let Some(val) = self.field_cache.remove(&key) {
-                self.field_cache.insert((new, key.1), val);
-            }
-        }
-        // RPython: oldbox.set_replaced_with_const()
-        // history.py:667-668 — mark the old box so cached reads return
-        // the constant via maybe_replace_with_const.
         if !old.is_constant() && new.is_constant() {
-            self.ensure_data(old);
-            self.box_data[old.0 as usize].replaced_with_const = Some(new);
-        }
-        // Transfer allocation flags from old to new (non-const → non-const).
-        if !old.is_constant() && !new.is_constant() {
-            let old_i = old.0 as usize;
-            if old_i < self.box_data.len() {
-                let old_flags = self.box_data[old_i].flags;
-                if old_flags & u32::from(HF_IS_UNESCAPED) != 0 {
-                    self._set_flag(new, HF_IS_UNESCAPED);
-                }
-                if old_flags & u32::from(HF_SEEN_ALLOCATION) != 0 {
-                    self._set_flag(new, HF_SEEN_ALLOCATION);
-                }
+            let i = old.0 as usize;
+            if i >= self.replaced_with_const.len() {
+                self.replaced_with_const.resize(i + 1, None);
             }
+            self.replaced_with_const[i] = Some(new);
         }
     }
 
@@ -794,13 +868,24 @@ impl HeapCache {
     ///      self._set_flag(box, HF_KNOWN_CLASS | HF_KNOWN_NULLITY)
     /// ```
     ///
+    /// pyre additionally remembers the concrete class pointer in the
+    /// `known_class` Vec because OpRef carries no static type token —
+    /// RPython retrieves the class via box.getref_base().
     pub fn class_now_known(&mut self, opref: OpRef, class: GcRef) {
         if opref.is_constant() {
             return;
         }
+        let i = opref.0 as usize;
+        if i >= self.known_class.len() {
+            self.known_class.resize(i + 1, None);
+        }
+        self.known_class[i] = Some(class);
+        // RPython _set_flag(box, HF_KNOWN_CLASS | HF_KNOWN_NULLITY).
         self._set_flag(opref, HF_KNOWN_CLASS);
+        // RPython also writes HF_KNOWN_NULLITY in the same _set_flag call;
+        // route through nullity_now_known so the Vec<u8> value mirror also
+        // captures non-null.
         self.nullity_now_known(opref, true);
-        self.box_data[opref.0 as usize].known_class = Some(class);
     }
 
     /// Check if the class of an object is known.
@@ -808,12 +893,9 @@ impl HeapCache {
         if opref.is_constant() {
             return false;
         }
-        self._check_flag(opref, HF_KNOWN_CLASS)
-            && self
-                .box_data
-                .get(opref.0 as usize)
-                .and_then(|d| d.known_class)
-                .is_some()
+        self.known_class
+            .get(opref.0 as usize)
+            .map_or(false, |v| v.is_some())
     }
 
     /// Get the known class of an object, if available.
@@ -821,18 +903,13 @@ impl HeapCache {
         if opref.is_constant() {
             return None;
         }
-        if !self._check_flag(opref, HF_KNOWN_CLASS) {
-            return None;
-        }
-        self.box_data
-            .get(opref.0 as usize)
-            .and_then(|d| d.known_class)
+        self.known_class.get(opref.0 as usize).and_then(|v| *v)
     }
 
     /// Check if an object is unescaped (allocated in this trace and not
     /// yet passed to external code).
     pub fn is_unescaped(&self, opref: OpRef) -> bool {
-        self._check_flag(opref, HF_IS_UNESCAPED)
+        vb_contains(&self.is_unescaped, &opref)
     }
 
     /// heapcache.py:79-82 `CacheEntry._seen_alloc(box)`:
@@ -843,7 +920,7 @@ impl HeapCache {
     ///  return self.heapcache._check_flag(ref_box, HF_SEEN_ALLOCATION)
     /// ```
     pub fn saw_allocation(&self, opref: OpRef) -> bool {
-        self._check_flag(opref, HF_SEEN_ALLOCATION)
+        vb_contains(&self.seen_allocation, &opref)
     }
 
     /// Notify the cache about an operation, potentially invalidating entries.
@@ -864,12 +941,11 @@ impl HeapCache {
         if opcode == OpCode::SetfieldGc && args.len() >= 2 {
             let container = args[0];
             let value = args[1];
-            let c_ue = self.is_unescaped(container);
-            let v_ue = self.is_unescaped(value);
-            if c_ue && v_ue {
-                let deps = self._get_deps(container);
-                deps.push(value);
-            } else if c_ue {
+            if vb_contains(&self.is_unescaped, &container)
+                && vb_contains(&self.is_unescaped, &value)
+            {
+                self._get_deps(container).push(Some(value));
+            } else if vb_contains(&self.is_unescaped, &container) {
                 // Container unescaped, value already escaped — no-op
             } else {
                 self.mark_escaped_recursive(value);
@@ -878,12 +954,11 @@ impl HeapCache {
         if opcode == OpCode::SetarrayitemGc && args.len() >= 3 {
             let container = args[0];
             let value = args[2];
-            let c_ue = self.is_unescaped(container);
-            let v_ue = self.is_unescaped(value);
-            if c_ue && v_ue {
-                let deps = self._get_deps(container);
-                deps.push(value);
-            } else if c_ue {
+            if vb_contains(&self.is_unescaped, &container)
+                && vb_contains(&self.is_unescaped, &value)
+            {
+                self._get_deps(container).push(Some(value));
+            } else if vb_contains(&self.is_unescaped, &container) {
                 // Container unescaped, value already escaped — no-op
             } else {
                 self.mark_escaped_recursive(value);
@@ -1032,7 +1107,7 @@ impl HeapCache {
             || opnum.is_cond_call_value()
             || opnum == OpCode::CondCallN
         {
-            let unescaped = self.unescaped_snapshot();
+            let unescaped = self.is_unescaped.clone();
             for cache in self.heap_cache.values_mut() {
                 cache.invalidate_unescaped(&unescaped);
             }
@@ -1372,12 +1447,20 @@ impl HeapCache {
     ///      self._set_flag(box, HF_KNOWN_NULLITY)
     /// ```
     ///
+    /// pyre additionally tracks WHICH side of the nullity is known (1 =
+    /// non-null, 2 = null) in the `known_nullity` Vec — RPython does not
+    /// need this because callers re-read box.getref_base() at consume time.
     pub fn nullity_now_known(&mut self, opref: OpRef, is_nonnull: bool) {
         if opref.is_constant() {
             return;
         }
+        let i = opref.0 as usize;
+        if i >= self.known_nullity.len() {
+            self.known_nullity.resize(i + 1, 0);
+        }
+        self.known_nullity[i] = if is_nonnull { 1 } else { 2 };
+        // RPython _set_flag(box, HF_KNOWN_NULLITY).
         self._set_flag(opref, HF_KNOWN_NULLITY);
-        self.box_data[opref.0 as usize].known_nullity = if is_nonnull { 1 } else { 2 };
     }
 
     /// Check if a value's nullity is known.
@@ -1393,16 +1476,13 @@ impl HeapCache {
         const_value: impl Fn(OpRef) -> Option<i64>,
     ) -> Option<bool> {
         if opref.is_constant() {
+            // heapcache.py:477: return bool(box.getref_base())
+            // A null ConstPtr (value 0) is known-null; non-zero is known-nonnull.
             return Some(const_value(opref).unwrap_or(0) != 0);
         }
-        if !self._check_flag(opref, HF_KNOWN_NULLITY) {
-            return None;
-        }
-        let v = self
-            .box_data
+        self.known_nullity
             .get(opref.0 as usize)
-            .map_or(0, |d| d.known_nullity);
-        if v == 0 { None } else { Some(v == 1) }
+            .and_then(|v| if *v == 0 { None } else { Some(*v == 1) })
     }
 
     // ── Array length caching (heapcache.py arraylen_now_known / arraylen) ──
@@ -1421,21 +1501,14 @@ impl HeapCache {
     /// ```
     ///
     pub fn arraylen(&self, array: OpRef) -> Option<OpRef> {
-        if array.is_constant() {
+        if array.is_constant() || !self.test_head_version(array) {
             return None;
         }
-        let data = self.box_data.get(array.0 as usize)?;
-        if data.flags < self.head_version {
-            return None;
-        }
-        data.deps.as_ref().and_then(|d| {
-            let v = d.get(0).copied().unwrap_or(OpRef::NONE);
-            if v != OpRef::NONE {
-                Some(self.maybe_replace_with_const(v))
-            } else {
-                None
-            }
-        })
+        self.heapc_deps
+            .get(array.0 as usize)
+            .and_then(|deps| deps.as_ref())
+            .and_then(|deps| deps.first().copied().flatten())
+            .map(|opref| self.maybe_replace_with_const(opref))
     }
 
     /// heapcache.py:588-596 arraylen_now_known
@@ -1452,12 +1525,14 @@ impl HeapCache {
     ///      deps[0] = lengthbox
     /// ```
     ///
+    /// `_get_deps` runs `update_version` as a side effect and ensures the
+    /// `_heapc_deps` list exists with slot 0 reserved for the array length.
     pub fn arraylen_now_known(&mut self, array: OpRef, length: OpRef) {
         if array.is_constant() {
             return;
         }
         let deps = self._get_deps(array);
-        deps[0] = length;
+        deps[0] = Some(length);
     }
 
     // ── Likely virtual tracking (heapcache.py is_likely_virtual) ──
@@ -1469,20 +1544,17 @@ impl HeapCache {
         self.new_object(opref);
     }
 
-    /// Stamp HF_LIKELY_VIRTUAL on a box without touching other allocation flags.
+    /// pyre-only seam used outside the standard `new`/`new_array` allocation
+    /// hooks: stamp HF_LIKELY_VIRTUAL on a box without touching the other
+    /// allocation flags. Routes through `_set_flag` so the version-gated
+    /// heapc_flags stays in sync with the Vec<bool> mirror.
     pub fn mark_likely_virtual(&mut self, opref: OpRef) {
         self._set_flag(opref, HF_LIKELY_VIRTUAL);
     }
 
     /// Check if a value is likely virtual.
-    /// Uses `likely_virtual_version` (NOT `head_version`) so the flag
-    /// survives `reset_keep_likely_virtuals()`.
     pub fn is_likely_virtual(&self, opref: OpRef) -> bool {
-        if opref.is_constant() {
-            return false;
-        }
-        let flags = self.flags_for(opref);
-        flags >= self.likely_virtual_version && (flags & u32::from(HF_LIKELY_VIRTUAL)) != 0
+        vb_contains(&self.likely_virtual, &opref)
     }
 
     // ── Loop-invariant call result caching ──
@@ -1563,22 +1635,35 @@ impl HeapCache {
     ///      self.loop_invariant_arg0int = -1
     /// ```
     ///
+    /// majit also clears the standalone `Vec<bool>` flags
+    /// (`is_unescaped`/`seen_allocation`/...) because those are NOT version-
+    /// gated like RPython's `_heapc_flags` — version bump alone would not
+    /// invalidate them.
     pub fn reset(&mut self) {
+        // heapcache.py:166-168: bump head_version, sync likely_virtual_version.
         assert!(self.head_version < HF_VERSION_MAX);
         self.head_version += HF_VERSION_INC;
         self.likely_virtual_version = self.head_version;
+        // heapcache.py:172-175: clear heap_cache + heap_array_cache.
         self.field_cache.clear();
         self.array_cache.clear();
         self.heap_cache.clear();
         self.heap_array_cache.clear();
+        // heapcache.py:176: need_guard_not_invalidated = True
         self.need_guard_not_invalidated = true;
+        // heapcache.py:179-181: loop_invariant_result/descr/arg0int reset.
         self.loopinvariant_descr = None;
         self.loopinvariant_arg0 = None;
         self.loopinvariant_result = None;
+        // majit-only: standalone Vec<bool> flags are not version-gated, so
+        // a version bump cannot invalidate them. Clear them explicitly.
+        self.known_class.clear();
         self.quasi_immut_known.clear();
-        // Version bump makes all per-box flags invisible, but clear box_data
-        // to reclaim memory and match RPython's behavior where reset() starts fresh.
-        self.box_data.clear();
+        self.is_unescaped.clear();
+        self.seen_allocation.clear();
+        self.known_nullity.clear();
+        self.likely_virtual.clear();
+        self.heapc_deps.clear();
     }
 
     /// heapcache.py:176: check and consume need_guard_not_invalidated.
@@ -1606,35 +1691,25 @@ impl HeapCache {
     ///      self.heap_array_cache = {}
     /// ```
     ///
+    /// `likely_virtual`, `loopinvariant_*`, and `_heapc_deps`
+    /// `need_guard_not_invalidated` are intentionally preserved (a residual
+    /// call that releases the GIL invalidates heap caches but the JIT can
+    /// still trust prior allocation/likely-virtual hints).
     pub fn reset_keep_likely_virtuals(&mut self) {
         assert!(self.head_version < HF_VERSION_MAX);
         self.head_version += HF_VERSION_INC;
-        // likely_virtual_version NOT bumped — likely_virtual flags survive.
         self.field_cache.clear();
         self.array_cache.clear();
         self.heap_cache.clear();
         self.heap_array_cache.clear();
-        // box_data NOT cleared — version bump makes most flags invisible,
-        // but HF_LIKELY_VIRTUAL checks use likely_virtual_version which didn't bump.
     }
 
     /// RPython-compatible alias kept for existing codepaths.
     pub fn _remove_deps_for_box(&mut self, opref: OpRef) {
-        if opref.is_constant() {
-            return;
-        }
         let i = opref.0 as usize;
-        if i < self.box_data.len() {
-            self.box_data[i].deps = None;
+        if i < self.heapc_deps.len() {
+            self.heapc_deps[i] = None;
         }
-    }
-
-    /// Generate a snapshot of which boxes are unescaped (for retain closures).
-    fn unescaped_snapshot(&self) -> Vec<bool> {
-        self.box_data
-            .iter()
-            .map(|d| d.flags >= self.head_version && (d.flags & u32::from(HF_IS_UNESCAPED)) != 0)
-            .collect()
     }
 }
 
@@ -1866,6 +1941,30 @@ mod tests {
     }
 
     #[test]
+    fn test_arraylen_reset_keep_likely_virtuals_invalidates_length() {
+        let mut cache = HeapCache::new();
+        let arr = OpRef(5);
+
+        cache.arraylen_now_known(arr, OpRef(100));
+        assert_eq!(cache.arraylen(arr), Some(OpRef(100)));
+
+        cache.reset_keep_likely_virtuals();
+        assert_eq!(cache.arraylen(arr), None);
+    }
+
+    #[test]
+    fn test_replace_box_marks_old_as_const() {
+        let mut cache = HeapCache::new();
+        let old = OpRef(5);
+        let new = OpRef::from_const(0);
+
+        cache.arraylen_now_known(old, old);
+        cache.replace_box(old, new);
+
+        assert_eq!(cache.arraylen(old), Some(new));
+    }
+
+    #[test]
     fn test_likely_virtual() {
         let mut cache = HeapCache::new();
         let obj = OpRef(3);
@@ -1891,44 +1990,5 @@ mod tests {
         // GUARD_NONNULL makes nullity known
         cache.notify_op(OpCode::GuardNonnull, &[obj], OpRef::NONE);
         assert_eq!(cache.is_nullity_known(obj, |_| None), Some(true));
-    }
-
-    #[test]
-    fn test_maybe_replace_with_const() {
-        let mut cache = HeapCache::new();
-        let obj = OpRef(0);
-        let const_val = OpRef::from_const(42);
-
-        // Before replace_box: no substitution
-        assert_eq!(cache.maybe_replace_with_const(obj), obj);
-
-        // replace_box(old=non-const, new=const) sets the replacement
-        cache.replace_box(obj, const_val);
-        assert_eq!(cache.maybe_replace_with_const(obj), const_val);
-
-        // Constants pass through unchanged
-        assert_eq!(cache.maybe_replace_with_const(const_val), const_val);
-    }
-
-    #[test]
-    fn test_replace_box_const_survives_version_update() {
-        let mut cache = HeapCache::new();
-        let obj = OpRef(3);
-        let const_val = OpRef::from_const(99);
-
-        cache.replace_box(obj, const_val);
-        assert_eq!(cache.maybe_replace_with_const(obj), const_val);
-
-        // Version updates should NOT clear replaced_with_const
-        cache.update_version(obj);
-        assert_eq!(cache.maybe_replace_with_const(obj), const_val);
-
-        // reset_keep_likely_virtuals should NOT clear it either
-        cache.reset_keep_likely_virtuals();
-        assert_eq!(cache.maybe_replace_with_const(obj), const_val);
-
-        // Full reset DOES clear it (new trace)
-        cache.reset();
-        assert_eq!(cache.maybe_replace_with_const(obj), obj);
     }
 }

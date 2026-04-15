@@ -89,15 +89,15 @@ pub fn encode_trace(trace: &TreeLoop) -> Vec<u8> {
         for arg in &op.args {
             encode_varint(&mut buf, arg.0 as u64);
         }
-        // Encode descriptor: 0 = none, else descr_index + 1.
-        // opencoder.py:388-397: uses get_descr_index() (global ID),
-        // NOT get_index() (slot position).
+        // opencoder.py:702-707 _encode_descr: 0 = none, else descr_index + 1.
+        // RPython uses descr.get_descr_index() (global all_descrs index),
+        // NOT descr.index() (parent-local slot).
         if let Some(ref descr) = op.descr {
-            let idx = descr.get_descr_index();
-            if idx >= 0 {
-                encode_varint(&mut buf, (idx as u64) + 1);
+            let descr_index = descr.get_descr_index();
+            if descr_index != -1 {
+                encode_varint(&mut buf, (descr_index as u64) + 1);
             } else {
-                buf.push(1); // has descriptor but no index
+                buf.push(1); // has descriptor but no global index
             }
         } else {
             buf.push(0);

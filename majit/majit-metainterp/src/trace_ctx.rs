@@ -944,6 +944,20 @@ impl TraceCtx {
         self.virtualizable_boxes.is_some()
     }
 
+    /// Set virtualizable_boxes with VirtualizableInfo and array lengths.
+    /// Used by bridge tracing where the boxes are reconstructed from
+    /// resume data (pyjitpl.py:3400 rebuild_state_after_failure parity).
+    pub fn set_virtualizable_boxes_with_info(
+        &mut self,
+        boxes: Vec<OpRef>,
+        info: &VirtualizableInfo,
+        array_lengths: &[usize],
+    ) {
+        self.virtualizable_boxes = Some(boxes);
+        self.virtualizable_info = Some(info.clone());
+        self.virtualizable_array_lengths = Some(array_lengths.to_vec());
+    }
+
     /// Canonical virtualizable metadata for the active standard virtualizable.
     pub fn virtualizable_info(&self) -> Option<&VirtualizableInfo> {
         self.virtualizable_info.as_ref()

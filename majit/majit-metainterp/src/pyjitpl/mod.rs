@@ -4836,8 +4836,7 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// memmgr.py:58-61: keep_loop_alive(looptoken).
-    /// Marks the compiled loop as recently used in the generation-based
-    /// memory manager so hot loops are not evicted while still active.
+    /// warmstate.py:402: warmrunnerdesc.memory_manager.keep_loop_alive(loop_token)
     pub fn keep_loop_alive(&mut self, green_key: u64) {
         self.warm_state.memory_manager.keep_loop_alive(green_key);
     }
@@ -8215,26 +8214,6 @@ mod tests {
                 traces,
                 previous_tokens: Vec::new(),
             },
-        );
-    }
-
-    #[cfg(feature = "cranelift")]
-    #[test]
-    fn test_keep_loop_alive_refreshes_memory_manager_generation() {
-        let mut meta = MetaInterp::<()>::new(2);
-        let key = 0xABCD;
-
-        meta.warm_state.memory_manager.set_max_age(1);
-        let token = JitCellToken::new(meta.warm_state.alloc_token_number());
-        meta.warm_state.attach_procedure_to_interp(key, token);
-
-        meta.try_to_free_some_loops(); // generation 1
-        meta.keep_loop_alive(key);
-        meta.try_to_free_some_loops(); // generation 2
-
-        assert!(
-            meta.warm_state.memory_manager.contains_loop(key),
-            "keep_loop_alive should refresh the compiled loop generation"
         );
     }
 

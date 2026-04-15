@@ -971,6 +971,10 @@ pub struct BlackholeInterpreter {
     /// RPython: `jitdriver_sd.mainjitcode.calldescr` — CallDescr of the portal
     /// function. Returned by `get_portal_runner()` for `bhimpl_recursive_call_*`.
     pub mainjitcode_calldescr: BhCallDescr,
+    /// Packed all_liveness bytes. RPython stores this on metainterp_sd;
+    /// majit's blackhole receives it from the pyre resolver until the
+    /// surrounding MetaInterpStaticData object is fully ported.
+    pub liveness_info: Vec<u8>,
 }
 
 // blackhole.py: last exception value from a residual call.
@@ -1031,6 +1035,7 @@ impl BlackholeInterpreter {
             virtualizable_info: std::ptr::null(),
             portal_runner_ptr: None,
             mainjitcode_calldescr: BhCallDescr::default(),
+            liveness_info: Vec::new(),
         }
     }
 
@@ -2713,12 +2718,7 @@ impl Default for BlackholeInterpBuilder {
 
 impl BlackholeInterpBuilder {
     pub fn new() -> Self {
-        // RPython blackhole.py:66-74 `setup_insns` sets `op_live` and
-        // `op_catch_exception` by looking up `'live/'` / `'catch_exception/L'`
-        // in the assembler's opcode table. Callers that want the standard
-        // majit opcode numbering can skip `setup_insns` and call
-        // `setup_wellknown_insns()` (same table lookup, well-known subset).
-        let mut builder = Self {
+        Self {
             pool: Vec::new(),
             cpu: None,
             _insns: Vec::new(),
@@ -2939,6 +2939,8 @@ impl BlackholeInterpBuilder {
         interp.runtime_stacks.clear();
         interp.aborted = false;
         interp.got_exception = false;
+        interp.virtualizable_stack_base = 0;
+        interp.liveness_info.clear();
         self.pool.push(interp);
     }
 
@@ -3192,7 +3194,6 @@ pub fn resume_in_blackhole(
     rd_consts: &[i64],
     deadframe: &[i64],
     deadframe_exc: i64,
-    all_liveness: &[u8],
 ) -> JitException {
     // blackhole.py:1786-1792
     let null_alloc = crate::resume::NullAllocator;
@@ -3210,7 +3211,6 @@ pub fn resume_in_blackhole(
         None, // vinfo
         None, // ginfo
         &null_alloc,
-        all_liveness,
     );
 
     let Some((bh, _virtualizable_ptr)) = bh else {
@@ -6162,7 +6162,7 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     builder.wire_handler("getarrayitem_vable_f/ridd>f", handler_getarrayitem_vable_f);
     builder.wire_handler("setarrayitem_vable_f/rifdd", handler_setarrayitem_vable_f);
 
-    // Inline call
+    // Inline call (stub — needs frame-chain)
     builder.wire_handler("inline_call_irf_i/dIRF>i", handler_inline_call_irf_i);
     builder.wire_handler("inline_call_irf_r/dIRF>r", handler_inline_call_irf_r);
     builder.wire_handler("inline_call_irf_f/dIRF>f", handler_inline_call_irf_f);
@@ -6174,7 +6174,7 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     builder.wire_handler("inline_call_r_r/dR>r", handler_inline_call_r_r);
     builder.wire_handler("inline_call_r_v/dR", handler_inline_call_r_v);
 
-    // Recursive call
+    // Recursive call (stub — needs portal runner)
     builder.wire_handler("recursive_call_i/cIRFIRF>i", handler_recursive_call_i);
     builder.wire_handler("recursive_call_r/cIRFIRF>r", handler_recursive_call_r);
     builder.wire_handler("recursive_call_f/cIRFIRF>f", handler_recursive_call_f);
@@ -7382,8 +7382,8 @@ fn handler_setlistitem_gc_f(
 // inline_call — RPython blackhole.py:1278-1319
 // RPython: cpu.bh_call_*(adr2int(jitcode.fnaddr), args_i, args_r, args_f, jitcode.calldescr)
 // The 'j' argcode reads a JitCode descriptor carrying fnaddr + calldescr.
-// majit stores the same pair in BhDescr::JitCode and dispatches directly
-// through the backend bh_call_* entry points.
+// pyre: fnaddr is stored in BhDescr::JitCode; calldescr not yet modeled.
+// TODO: Full implementation should use jitcode_index for frame-chain push/pop.
 fn read_inline_call_jitcode(
     bh: &BlackholeInterpreter,
     code: &[u8],
