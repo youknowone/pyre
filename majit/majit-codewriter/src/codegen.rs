@@ -833,6 +833,14 @@ pub fn generated_binary_int_value(
         }
     };
 
+    // RPython parity: int_binop fast path only applies when both operands
+    // are W_IntObject at trace time. When either is W_LongObject (or null),
+    // fall back to the residual trace_binary_value path which calls the
+    // Python-level __add__/__sub__/... method (no guard_class emitted).
+    if concrete.is_none() {
+        return None;
+    }
+
     // intobject.py range validation for FloorDiv/Mod/Shift.
     // RPython generates these as branches in jitcode; pyre validates
     // concretely and falls back to residual for out-of-range cases.

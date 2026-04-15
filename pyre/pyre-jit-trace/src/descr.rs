@@ -525,7 +525,7 @@ static W_LIST_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
             ),
             (
-                "W_ListObject.items.heap_cap",
+                "W_ListObject.items.cap",
                 std::mem::offset_of!(W_ListObject, items) + PYOBJECT_ARRAY_CAP_OFFSET,
                 8,
                 Type::Int,
