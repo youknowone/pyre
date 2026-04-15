@@ -644,6 +644,71 @@ impl AssemblerARM64 {
         }
     }
 
+    /// Load a (lhs, src) pair for a 3-operand binop into registers,
+    /// returning the register numbers to use. Uses x17 for lhs scratch
+    /// and x16 for src scratch when the loc is Frame/Immed.
+    fn load_3op_into_scratch(&mut self, lhs: &Loc, src: &Loc) -> (u8, u8) {
+        let lhs_reg = match lhs {
+            Loc::Reg(r) => r.value,
+            Loc::Frame(f) => {
+                dynasm!(self.mc ; .arch aarch64 ; ldr x17, [x29, f.ebp_loc.value as u32]);
+                17
+            }
+            Loc::Immed(i) => {
+                self.emit_mov_imm64(17, i.value);
+                17
+            }
+            _ => 17,
+        };
+        let src_reg = match src {
+            Loc::Reg(r) => r.value,
+            Loc::Frame(f) => {
+                dynasm!(self.mc ; .arch aarch64 ; ldr x16, [x29, f.ebp_loc.value as u32]);
+                16
+            }
+            Loc::Immed(i) => {
+                self.emit_mov_imm64(16, i.value);
+                16
+            }
+            _ => 16,
+        };
+        (lhs_reg, src_reg)
+    }
+
+    /// Emit a 3-operand integer binop: `OP dst, lhs, src`.
+    ///
+    /// aarch64/opassembler.py parity: `ADD/SUB/AND/ORR/EOR Rd, Rn, Rm` —
+    /// the hardware supports distinct Rd and Rn, unlike x86's 2-operand
+    /// `SUB dst, dst, src`. Handles reg/frame/immediate forms for both
+    /// operands, routing scratch via x16/x17 as needed.
+    fn emit_binop_3op(&mut self, opcode: OpCode, dst_reg: u8, lhs: &Loc, src: &Loc) {
+        let (lhs_reg, src_reg) = self.load_3op_into_scratch(lhs, src);
+        let d = dst_reg;
+        let l = lhs_reg as u8;
+        let s = src_reg as u8;
+        match opcode {
+            OpCode::IntAdd | OpCode::IntAddOvf | OpCode::NurseryPtrIncrement => {
+                dynasm!(self.mc ; .arch aarch64 ; add X(d), X(l), X(s));
+            }
+            OpCode::IntSub | OpCode::IntSubOvf => {
+                dynasm!(self.mc ; .arch aarch64 ; sub X(d), X(l), X(s));
+            }
+            OpCode::IntMul | OpCode::IntMulOvf => {
+                dynasm!(self.mc ; .arch aarch64 ; mul X(d), X(l), X(s));
+            }
+            OpCode::IntAnd => {
+                dynasm!(self.mc ; .arch aarch64 ; and X(d), X(l), X(s));
+            }
+            OpCode::IntOr => {
+                dynasm!(self.mc ; .arch aarch64 ; orr X(d), X(l), X(s));
+            }
+            OpCode::IntXor => {
+                dynasm!(self.mc ; .arch aarch64 ; eor X(d), X(l), X(s));
+            }
+            _ => {}
+        }
+    }
+
     /// Emit: ADD/SUB/AND/OR/XOR reg, loc
     fn emit_binop_reg_loc(&mut self, opcode: OpCode, dst_reg: u8, src: &Loc) {
         // aarch64: load src to x16 scratch if not in register
@@ -1259,65 +1324,50 @@ impl AssemblerARM64 {
     ) {
         match op.opcode {
             OpCode::IntAddOvf => {
-                if let (Some(Loc::Reg(dst)), Some(src)) = (result_loc, arglocs.get(1)) {
-                    let src_reg = match src {
-                        Loc::Reg(s) => s.value,
-                        Loc::Frame(f) => {
-                            dynasm!(self.mc ; .arch aarch64 ; ldr x16, [x29, f.ebp_loc.value as u32]);
-                            16
-                        }
-                        Loc::Immed(i) => {
-                            self.emit_mov_imm64(16, i.value);
-                            16
-                        }
-                        _ => panic!("IntAddOvf expects reg/frame/immed source"),
-                    };
-                    dynasm!(self.mc ; .arch aarch64 ; adds X(dst.value), X(dst.value), X(src_reg as u8));
+                // RPython aarch64/opassembler.py int_add_impl parity —
+                // 3-operand `ADDS Rd, Rn, Rm` (s=1 sets flags for GUARD_NO_OVERFLOW).
+                if let (Some(Loc::Reg(dst)), Some(lhs), Some(src)) =
+                    (result_loc, arglocs.first(), arglocs.get(1))
+                {
+                    let (lhs_reg, src_reg) = self.load_3op_into_scratch(lhs, src);
+                    dynasm!(self.mc ; .arch aarch64
+                        ; adds X(dst.value), X(lhs_reg as u8), X(src_reg as u8));
                     self.guard_success_cc = Some(CC_NO);
                 }
             }
             OpCode::IntSubOvf => {
-                if let (Some(Loc::Reg(dst)), Some(src)) = (result_loc, arglocs.get(1)) {
-                    let src_reg = match src {
-                        Loc::Reg(s) => s.value,
-                        Loc::Frame(f) => {
-                            dynasm!(self.mc ; .arch aarch64 ; ldr x16, [x29, f.ebp_loc.value as u32]);
-                            16
-                        }
-                        Loc::Immed(i) => {
-                            self.emit_mov_imm64(16, i.value);
-                            16
-                        }
-                        _ => panic!("IntSubOvf expects reg/frame/immed source"),
-                    };
-                    dynasm!(self.mc ; .arch aarch64 ; subs X(dst.value), X(dst.value), X(src_reg as u8));
+                // aarch64/opassembler.py int_sub_impl: `SUBS Rd, Rn, Rm`.
+                if let (Some(Loc::Reg(dst)), Some(lhs), Some(src)) =
+                    (result_loc, arglocs.first(), arglocs.get(1))
+                {
+                    let (lhs_reg, src_reg) = self.load_3op_into_scratch(lhs, src);
+                    dynasm!(self.mc ; .arch aarch64
+                        ; subs X(dst.value), X(lhs_reg as u8), X(src_reg as u8));
                     self.guard_success_cc = Some(CC_NO);
                 }
             }
             OpCode::IntMulOvf => {
-                if let (Some(Loc::Reg(dst)), Some(src)) = (result_loc, arglocs.get(1)) {
-                    let src_reg = match src {
-                        Loc::Reg(s) => s.value,
-                        Loc::Frame(f) => {
-                            dynasm!(self.mc ; .arch aarch64 ; ldr x16, [x29, f.ebp_loc.value as u32]);
-                            16
-                        }
-                        Loc::Immed(i) => {
-                            self.emit_mov_imm64(16, i.value);
-                            16
-                        }
-                        _ => panic!("IntMulOvf expects reg/frame/immed source"),
-                    };
+                // aarch64/opassembler.py emit_comp_op_int_mul_ovf: smulh+mul+asr+cmp
+                // against the 64-bit sign-extended high half.
+                if let (Some(Loc::Reg(dst)), Some(lhs), Some(src)) =
+                    (result_loc, arglocs.first(), arglocs.get(1))
+                {
+                    let (lhs_reg, src_reg) = self.load_3op_into_scratch(lhs, src);
                     dynasm!(self.mc ; .arch aarch64
-                        ; smulh x17, X(dst.value), X(src_reg as u8)
-                        ; mul X(dst.value), X(dst.value), X(src_reg as u8)
-                        ; asr x15, X(dst.value), 63
-                        ; cmp x17, x15
+                        ; smulh x15, X(lhs_reg as u8), X(src_reg as u8)
+                        ; mul X(dst.value), X(lhs_reg as u8), X(src_reg as u8)
+                        ; asr x14, X(dst.value), 63
+                        ; cmp x15, x14
                     );
                     self.guard_success_cc = Some(CC_E);
                 }
             }
-            // ── Integer binary (result_loc == arglocs[0], guaranteed by regalloc) ──
+            // ── Integer binary (aarch64 3-operand form) ──
+            // RPython parity: aarch64/opassembler.py `int_sub_impl` emits
+            // `SUB res, l0, l1` with three distinct locations — NOT the
+            // x86 `SUB dst, dst, src` 2-operand pattern. The regalloc may
+            // pick `res != arglocs[0]` (see `consider_int_sub` LEA path),
+            // so we must read arglocs[0] as the true LHS.
             OpCode::IntAdd
             | OpCode::IntSub
             | OpCode::IntMul
@@ -1325,8 +1375,10 @@ impl AssemblerARM64 {
             | OpCode::IntOr
             | OpCode::IntXor
             | OpCode::NurseryPtrIncrement => {
-                if let (Some(Loc::Reg(dst)), Some(src)) = (result_loc, arglocs.get(1)) {
-                    self.emit_binop_reg_loc(op.opcode, dst.value, src);
+                if let (Some(Loc::Reg(dst)), Some(lhs), Some(src)) =
+                    (result_loc, arglocs.first(), arglocs.get(1))
+                {
+                    self.emit_binop_3op(op.opcode, dst.value, lhs, src);
                 }
             }
             // ── Unary integer (result in arglocs[0] register) ──
