@@ -200,10 +200,78 @@ impl MIFrame {
     /// (RPython liveness.py backward analysis parity).
     fn get_list_of_active_boxes(
         &mut self,
-        _ctx: &mut TraceCtx,
+        ctx: &mut TraceCtx,
         in_a_call: bool,
         after_residual_call: bool,
     ) -> Vec<OpRef> {
+        // pyjitpl.py:194: in_a_call or after_residual_call → self.pc
+        let live_pc = if in_a_call || after_residual_call {
+            self.fallthrough_pc
+        } else {
+            self.orgpc
+        };
+        // resume.py:1045 consume_one_section invariant: every register
+        // reported as live must be reachable via a valid OpRef. RPython
+        // trivially satisfies this because `registers_r[i]` is populated
+        // on every read. pyre's `symbolic_locals[i]` is lazily created
+        // by `load_local_value` — a local that's live at this pc but
+        // never yet LOAD_FASTed in the trace (e.g. a forward-live local
+        // at the loop header whose first use is via a superinstruction
+        // liveness edge) keeps `OpRef::NONE`, poisoning the guard's
+        // fail_args. Mirror RPython's invariant by forcing lazy init
+        // for each live local via the same `load_local_value` path that
+        // LOAD_FAST uses, BEFORE snapshotting symbolic_locals below.
+        let nlocals_pre = self.sym().nlocals;
+        let jitcode_ptr_pre = self.sym().jitcode;
+        let (majit_jitcode_raw, py_to_jit_pc_ptr, liveness_info_ptr): (
+            *const majit_metainterp::jitcode::JitCode,
+            *const Vec<usize>,
+            *const Vec<u8>,
+        ) = unsafe {
+            let jc = &*jitcode_ptr_pre;
+            match jc.majit_jitcode.as_ref() {
+                Some(m) => (m as *const _, &jc.py_to_jit_pc, &jc.liveness_info),
+                None => (std::ptr::null(), std::ptr::null(), std::ptr::null()),
+            }
+        };
+        if !majit_jitcode_raw.is_null() {
+            let majit_jc = unsafe { &*majit_jitcode_raw };
+            let py_to_jit_pc = unsafe { &*py_to_jit_pc_ptr };
+            let all_liveness = unsafe { &*liveness_info_ptr };
+            if let Some(&jit_pc) = py_to_jit_pc.get(live_pc) {
+                let offset = majit_jc.get_live_vars_info_at(jit_pc);
+                let length_i = all_liveness[offset] as u32;
+                let length_r = all_liveness[offset + 1] as u32;
+                let _length_f = all_liveness[offset + 2] as u32;
+                let mut off = offset + 3;
+                use majit_codewriter::liveness::LivenessIterator;
+                let mut live_local_idxs: Vec<usize> = Vec::new();
+                for length in [length_i, length_r] {
+                    if length == 0 {
+                        continue;
+                    }
+                    let mut it = LivenessIterator::new(off, length, all_liveness);
+                    while let Some(reg_idx) = it.next() {
+                        let idx = reg_idx as usize;
+                        if idx < nlocals_pre {
+                            live_local_idxs.push(idx);
+                        }
+                    }
+                    off = it.offset;
+                }
+                for idx in live_local_idxs {
+                    let cur = self
+                        .sym()
+                        .symbolic_locals
+                        .get(idx)
+                        .copied()
+                        .unwrap_or(OpRef::NONE);
+                    if cur == OpRef::NONE {
+                        let _ = MIFrame::load_local_value(self, ctx, idx);
+                    }
+                }
+            }
+        }
         let (nlocals, local_values, stack_values, jitcode_ptr) = {
             let s = self.sym();
             let stack_values = if let Some(ref pre_stack) = s.pre_opcode_stack {
@@ -218,12 +286,6 @@ impl MIFrame {
                 stack_values,
                 s.jitcode,
             )
-        };
-        // pyjitpl.py:194: in_a_call or after_residual_call → self.pc
-        let live_pc = if in_a_call || after_residual_call {
-            self.fallthrough_pc
-        } else {
-            self.orgpc
         };
         // pyjitpl.py:202-203: read the 2-byte offset from JitCode.code
         // (upstream uses `decode_offset(self.jitcode.code, pc + 1)`) and
