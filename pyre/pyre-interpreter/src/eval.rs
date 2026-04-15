@@ -1652,19 +1652,30 @@ impl OpcodeStepExecutor for PyFrame {
     }
 
     // ── call_function_ex ──
-    // PyPy: CALL_FUNCTION_VAR_KW; CPython: CALL_FUNCTION_EX
-    // Stack: [callable, NULL, args_tuple, kwargs_dict_or_null]
+    // pyopcode.py:1360 CALL_FUNCTION_EX:
+    //     w_kwargs = self.popvalue() if has_kwarg else None
+    //     w_args = self.popvalue()
+    //     w_function = self.popvalue()
+    //     args = self.argument_factory([], None, None,
+    //                                  w_star=w_args,
+    //                                  w_starstar=w_kwargs,
+    //                                  w_function=w_function)
+    //     w_result = self.space.call_args(w_function, args)
+    //     self.pushvalue(w_result)
+    //
+    // argument.py Arguments.unpack_combined_starargs iterates w_star with
+    // space.fixedview_unroll / space.listview_no_unpack, so arbitrary
+    // iterables are accepted.
     fn call_function_ex(&mut self) -> Result<(), Self::Error> {
         let kwargs_or_null = self.pop();
         let args_obj = self.pop();
         let _null = self.pop();
         let callable = self.pop();
 
-        // Unpack the positional-args tuple/list regardless of the list
-        // strategy (object/int/float storage) — we can't read `items`
-        // directly because the Integer/Float strategies keep the live
-        // values in `int_items` / `float_items` instead.
-        let mut args: Vec<PyObjectRef> = unsafe {
+        // argument.py unpack_combined_starargs equivalent: fast-path tuple
+        // and list so common bytecode emits avoid iter protocol overhead;
+        // fall back to the iter protocol for arbitrary iterables.
+        let args: Vec<PyObjectRef> = unsafe {
             if pyre_object::is_tuple(args_obj) {
                 let n = pyre_object::w_tuple_len(args_obj);
                 (0..n as i64)
@@ -1676,14 +1687,12 @@ impl OpcodeStepExecutor for PyFrame {
                     .filter_map(|i| pyre_object::w_list_getitem(args_obj, i))
                     .collect()
             } else {
-                // Fall back to the iterator protocol for arbitrary
-                // iterables passed to `f(*iter)`.
-                crate::builtins::collect_iterable(args_obj).unwrap_or_default()
+                crate::builtins::collect_iterable(args_obj)?
             }
         };
 
         // Merge kwargs dict into call.
-        // PyPy: argument.py Arguments.prepend + unpack_combined_starstarargs
+        // argument.py Arguments.unpack_combined_starstarargs
         if !kwargs_or_null.is_null() && unsafe { pyre_object::is_dict(kwargs_or_null) } {
             let entries = unsafe { pyre_object::w_dict_str_entries(kwargs_or_null) };
             if !entries.is_empty() {
@@ -1770,21 +1779,27 @@ impl OpcodeStepExecutor for PyFrame {
         }
 
         // Resolve keyword args into positional order.
-        // PyPy: argument.py _match_signature step: match keywords to argnames
+        // argument.py Arguments._match_signature step: match keywords to
+        // argnames, fill defaults, pack *args/**kwargs. PyPy's
+        // `space.call_args` performs this exactly once; pyre mirrors that
+        // by calling resolve_kwargs here and then dispatching directly to
+        // call_user_function_resolved — which skips the defaults_fill /
+        // pack_varargs replay that call_user_function_with_args performs
+        // for positional-only paths.
         let is_builtin = unsafe { crate::is_function(callable_unwrapped) }
             && unsafe {
                 crate::is_builtin_code(
                     crate::getcode(callable_unwrapped) as pyre_object::PyObjectRef
                 )
             };
-        let resolved = if is_builtin {
+        if is_builtin {
             // Builtin functions: pack kwargs into a dict as last arg
             let nkw = if unsafe { pyre_object::is_tuple(kwarg_names) } {
                 unsafe { pyre_object::w_tuple_len(kwarg_names) }
             } else {
                 0
             };
-            if nkw > 0 {
+            let resolved = if nkw > 0 {
                 let n_pos = args.len() - nkw;
                 let mut resolved = args[..n_pos].to_vec();
                 let kwargs_dict = pyre_object::w_dict_new();
@@ -1808,18 +1823,49 @@ impl OpcodeStepExecutor for PyFrame {
                 resolved
             } else {
                 args.clone()
+            };
+            let result = call_callable(self, callable_unwrapped, &resolved)?;
+            self.push(result);
+            return Ok(());
+        }
+
+        // pypy/interpreter/function.py Method.call_args parity: unwrap
+        // bound method by prepending the receiver, then run resolve_kwargs
+        // against the underlying function. This matches
+        // `self.space.call_args(w_function, args)` after the MRO-dispatched
+        // `im_func` has been extracted.
+        let (target_func, mut prepended) = if unsafe { pyre_object::is_method(callable_unwrapped) }
+        {
+            let func = unsafe { pyre_object::w_method_get_func(callable_unwrapped) };
+            let receiver = unsafe {
+                let w_self = pyre_object::w_method_get_self(callable_unwrapped);
+                if !w_self.is_null() && !pyre_object::is_none(w_self) {
+                    w_self
+                } else {
+                    pyre_object::w_method_get_class(callable_unwrapped)
+                }
+            };
+            if !receiver.is_null() && unsafe { !pyre_object::is_none(receiver) } {
+                let mut prepended = Vec::with_capacity(1 + args.len());
+                prepended.push(receiver);
+                prepended.extend_from_slice(&args);
+                (func, Some(prepended))
+            } else {
+                (func, None)
             }
         } else {
-            crate::call::resolve_kwargs(callable_unwrapped, &args, kwarg_names)
+            (callable_unwrapped, None)
         };
-        // resolve_kwargs produces a fully-packed scope (like PyPy's
-        // _match_signature + parse_into_scope). Skip the normal
-        // call_callable → call_user_function path which would re-apply
-        // defaults and pack_varargs.
-        let result = if !is_builtin && unsafe { crate::is_function(callable_unwrapped) } {
-            crate::call::call_user_function_resolved(self, callable_unwrapped, &resolved)?
+        let call_args: &[PyObjectRef] = prepended.as_deref().unwrap_or(&args);
+        let resolved = crate::call::resolve_kwargs(target_func, call_args, kwarg_names);
+        // Drop the temporary prepended buffer once resolved is built.
+        prepended = None;
+        let _ = prepended;
+
+        let result = if unsafe { crate::is_function(target_func) } {
+            crate::call::call_user_function_resolved(self, target_func, &resolved)?
         } else {
-            call_callable(self, callable_unwrapped, &resolved)?
+            call_callable(self, target_func, &resolved)?
         };
         self.push(result);
         Ok(())
