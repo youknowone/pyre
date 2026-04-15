@@ -227,6 +227,7 @@ impl CodeWriter {
         // jtransform.py: virtualizable field indices for getfield_vable_*
         // interp_jit.py:25-31 / virtualizable_spec.rs parity:
         //   0=next_instr, 1=code, 2=vsd, 3=debugdata, 4=lastblock, 5=namespace
+        const VABLE_NEXT_INSTR_FIELD_IDX: u16 = 0;
         const VABLE_CODE_FIELD_IDX: u16 = 1;
         const VABLE_NAMESPACE_FIELD_IDX: u16 = 5;
 
@@ -423,6 +424,23 @@ impl CodeWriter {
 
             let code_unit = code.instructions[py_pc];
             let (instruction, op_arg) = arg_state.get(code_unit);
+
+            // pyopcode.py:172 `self.last_instr = intmask(next_instr)` parity,
+            // adapted to pyre's `frame.next_instr` semantics:
+            //   - RPython keeps `last_instr` (current PC) and advances
+            //     `next_instr` past the decoded opcode.
+            //   - pyre folds both into `frame.next_instr`: the interpreter
+            //     increments it to `py_pc + 1` before executing the opcode,
+            //     and `handle_exception` (eval.rs:87) recovers `py_pc` via
+            //     `frame.next_instr.saturating_sub(1)`.
+            // Mirror that invariant in blackhole jitcode so that an
+            // `ExitFrameWithExceptionRef` leaves the frame at the raising
+            // opcode's PC + 1 — matching what the interpreter would observe
+            // if it had executed the same opcode natively.
+            if is_portal {
+                assembler.load_const_i_value(int_tmp0, (py_pc + 1) as i64);
+                assembler.vable_setfield_int(VABLE_NEXT_INSTR_FIELD_IDX, int_tmp0);
+            }
 
             // RPython jtransform.py: rewrite_operation() dispatches per opname.
             // Each match arm is the pyre equivalent of rewrite_op_*.
