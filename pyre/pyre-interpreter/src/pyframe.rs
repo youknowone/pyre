@@ -107,20 +107,32 @@ pub struct PyFrame {
 /// valid header with `TRACK_YOUNG_PTRS=0` and skip the slow path.
 pub const GC_HEADER_SIZE: usize = 8;
 
-/// Allocate a `FixedObjectArray` with a zeroed GC header prepended.
+/// Allocate a value of type `T` with a zeroed GC header prepended.
 ///
 /// incminimark write barrier reads at `obj - HEADER_SIZE`;
-/// zeroed header ⇒ `TRACK_YOUNG_PTRS` clear ⇒ barrier fast-path skips.
-pub unsafe fn alloc_array_with_gc_header(array: FixedObjectArray) -> *mut FixedObjectArray {
-    let total = GC_HEADER_SIZE + std::mem::size_of::<FixedObjectArray>();
-    let layout = std::alloc::Layout::from_size_align(total, 8).unwrap();
+/// zeroed header => `TRACK_YOUNG_PTRS` clear => barrier fast-path skips.
+///
+/// RPython objects are GC-managed references. The frame holds non-owning
+/// pointers; the GC (or, in pyre's simplified model, the allocator) owns
+/// the allocation. Never manually free pointers returned by this function
+/// from frame code — that would violate the GC ref contract and cause
+/// dangling pointers when the JIT captures these refs in snapshots.
+unsafe fn alloc_with_gc_header<T>(value: T) -> *mut T {
+    let total = GC_HEADER_SIZE + std::mem::size_of::<T>();
+    let align = std::mem::align_of::<T>().max(8);
+    let layout = std::alloc::Layout::from_size_align(total, align).unwrap();
     let raw = std::alloc::alloc_zeroed(layout);
     if raw.is_null() {
         std::alloc::handle_alloc_error(layout);
     }
-    let ptr = raw.add(GC_HEADER_SIZE) as *mut FixedObjectArray;
-    std::ptr::write(ptr, array);
+    let ptr = raw.add(GC_HEADER_SIZE) as *mut T;
+    std::ptr::write(ptr, value);
     ptr
+}
+
+/// Allocate a `FixedObjectArray` with a zeroed GC header prepended.
+pub unsafe fn alloc_array_with_gc_header(array: FixedObjectArray) -> *mut FixedObjectArray {
+    alloc_with_gc_header(array)
 }
 
 /// Deallocate a `FixedObjectArray` allocated with [`alloc_array_with_gc_header`].
@@ -138,21 +150,18 @@ impl Drop for PyFrame {
             unsafe { dealloc_array_with_gc_header(self.locals_cells_stack_w) };
             self.locals_cells_stack_w = std::ptr::null_mut();
         }
-        self.clear_blocks();
-        if self.debugdata != 0 {
-            unsafe { drop(Box::from_raw(self.debugdata as *mut FrameDebugData)) };
-            self.debugdata = 0;
-        }
+        // debugdata and lastblock are GC-managed refs (allocated with
+        // alloc_with_gc_header). The frame holds non-owning references,
+        // matching RPython's GC ref model. Do NOT manually free them here
+        // — the JIT may still hold these pointers in snapshots/resume data.
     }
 }
 
 impl PyFrame {
-    /// Free all blocks in the linked list.
+    /// Release all block references (RPython: self.lastblock = None).
+    /// Block nodes are GC-managed refs — do not manually free them.
     pub fn clear_blocks(&mut self) {
-        while self.lastblock != 0 {
-            let node = unsafe { Box::from_raw(self.lastblock as *mut Block) };
-            self.lastblock = node.previous;
-        }
+        self.lastblock = 0;
     }
 
     /// Deep-clone debugdata for snapshot/generator.
@@ -161,22 +170,22 @@ impl PyFrame {
             return 0;
         }
         let src = unsafe { &*(self.debugdata as *const FrameDebugData) };
-        let copy = Box::new(*src);
-        Box::into_raw(copy) as usize
+        unsafe { alloc_with_gc_header(*src) as usize }
     }
 
     /// Deep-clone the block linked list for snapshot/generator.
     pub fn clone_blocks(&self) -> usize {
         let list = self.get_blocklist();
         let mut head: usize = 0;
-        // Rebuild in reverse (get_blocklist returns head-first)
         for block in list.iter().rev() {
-            let node = Box::new(Block {
-                handler: block.handler,
-                level: block.level,
-                previous: head,
-            });
-            head = Box::into_raw(node) as usize;
+            let node = unsafe {
+                alloc_with_gc_header(Block {
+                    handler: block.handler,
+                    level: block.level,
+                    previous: head,
+                })
+            };
+            head = node as usize;
         }
         head
     }
@@ -360,10 +369,9 @@ impl PyFrame {
     #[inline]
     pub fn getorcreatedebug(&mut self) -> &mut FrameDebugData {
         if self.debugdata == 0 {
-            // pyframe.py:124-127: FrameDebugData(self.pycode, init_lineno=-1)
-            let mut dd = Box::new(FrameDebugData::default());
+            let mut dd = FrameDebugData::default();
             dd.w_globals = self.namespace; // pyframe.py:49
-            self.debugdata = Box::into_raw(dd) as usize;
+            self.debugdata = unsafe { alloc_with_gc_header(dd) } as usize;
         }
         unsafe { &mut *(self.debugdata as *mut FrameDebugData) }
     }
@@ -456,10 +464,7 @@ impl PyFrame {
         };
         self.valuestackdepth = unsafe { (&*raw).varnames.len() + ncells(unsafe { &*raw }) };
         self.next_instr = 0;
-        if self.debugdata != 0 {
-            unsafe { drop(Box::from_raw(self.debugdata as *mut FrameDebugData)) };
-            self.debugdata = 0;
-        }
+        self.debugdata = 0;
         self.escaped = false;
         self.clear_blocks();
         self.pending_inline_results.clear();
@@ -842,12 +847,9 @@ impl PyFrame {
     /// pyframe.py:186 append_block
     #[inline]
     pub fn append_block(&mut self, block: Block) {
-        let node = Box::new(Block {
-            handler: block.handler,
-            level: block.level,
-            previous: self.lastblock,
-        });
-        self.lastblock = Box::into_raw(node) as usize;
+        debug_assert!(block.previous == self.lastblock);
+        let node = unsafe { alloc_with_gc_header(block) };
+        self.lastblock = node as usize;
     }
 
     /// pyframe.py:190 pop_block
@@ -856,7 +858,7 @@ impl PyFrame {
         if self.lastblock == 0 {
             return None;
         }
-        let node = unsafe { Box::from_raw(self.lastblock as *mut Block) };
+        let node = unsafe { &*(self.lastblock as *const Block) };
         self.lastblock = node.previous;
         Some(*node)
     }
@@ -925,9 +927,16 @@ impl PyFrame {
     /// pyframe.py:207 set_blocklist — rebuild linked list from slice.
     #[inline]
     pub fn set_blocklist(&mut self, lst: &[Block]) {
-        self.clear_blocks();
+        self.lastblock = 0;
         for block in lst.iter().rev() {
-            self.append_block(*block);
+            let node = unsafe {
+                alloc_with_gc_header(Block {
+                    handler: block.handler,
+                    level: block.level,
+                    previous: self.lastblock,
+                })
+            };
+            self.lastblock = node as usize;
         }
     }
 

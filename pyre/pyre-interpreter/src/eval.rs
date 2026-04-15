@@ -933,7 +933,7 @@ impl OpcodeStepExecutor for PyFrame {
         self.append_block(crate::pyframe::Block {
             handler,
             level: self.valuestackdepth,
-            previous: 0,
+            previous: self.lastblock,
         });
         Ok(())
     }
