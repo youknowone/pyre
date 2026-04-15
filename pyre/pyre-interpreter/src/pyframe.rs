@@ -68,7 +68,7 @@ pub struct PyFrame {
     /// pyframe.py:82 debugdata — pointer to FrameDebugData or null.
     /// Virtualizable static field (interp_jit.py:28).
     pub debugdata: usize,
-    /// pyframe.py:86 lastblock — pointer to top Block or null.
+    /// pyframe.py:86 lastblock — pointer to top FrameBlock or null.
     /// Virtualizable static field (interp_jit.py:29).
     pub lastblock: usize,
     /// Virtualizable token — set by JIT when this frame is virtualized.
@@ -179,9 +179,9 @@ impl PyFrame {
         let mut head: usize = 0;
         for block in list.iter().rev() {
             let node = unsafe {
-                alloc_with_gc_header(Block {
-                    handler: block.handler,
-                    level: block.level,
+                alloc_with_gc_header(FrameBlock {
+                    valuestackdepth: block.valuestackdepth,
+                    handlerposition: block.handlerposition,
                     previous: head,
                 })
             };
@@ -259,27 +259,35 @@ impl Default for FrameDebugData {
 /// pyopcode.py:1875-1897 FrameBlock — linked list node for the block stack.
 /// `previous` forms a singly-linked list; `lastblock` in PyFrame is the head.
 #[derive(Debug, Clone, Copy)]
-pub struct Block {
-    /// pyopcode.py:1882 handlerposition
-    pub handler: usize,
-    /// pyopcode.py:1881 valuestackdepth
-    pub level: usize,
-    /// pyopcode.py:1884 previous — raw pointer to the previous Block (0 = None).
+pub struct FrameBlock {
+    /// pyopcode.py:1883
+    pub valuestackdepth: usize,
+    /// pyopcode.py:1882
+    pub handlerposition: usize,
+    /// pyopcode.py:1884 — raw pointer to the previous FrameBlock (0 = None).
     pub previous: usize,
+}
+
+impl FrameBlock {
+    /// pyopcode.py:1886-1887
+    #[inline]
+    pub fn cleanupstack(&self, frame: &mut PyFrame) {
+        frame.dropvaluesuntil(self.valuestackdepth);
+    }
 }
 
 #[inline]
 pub fn get_block_class(opname: &str) -> &'static str {
     match opname {
-        "SETUP_LOOP" | "SETUP_EXCEPT" | "SETUP_FINALLY" | "SETUP_WITH" => "Block",
-        _ => "Block",
+        "SETUP_LOOP" | "SETUP_EXCEPT" | "SETUP_FINALLY" | "SETUP_WITH" => "FrameBlock",
+        _ => "FrameBlock",
     }
 }
 
 #[inline]
-pub fn unpickle_block(_space: PyObjectRef, w_tup: PyObjectRef) -> Block {
+pub fn unpickle_block(_space: PyObjectRef, w_tup: PyObjectRef) -> FrameBlock {
     let _ = _space;
-    let handler = unsafe {
+    let handlerposition = unsafe {
         w_tuple_getitem(w_tup, 0).and_then(|v| {
             if is_int(v) {
                 Some(w_int_get_value(v) as usize)
@@ -289,7 +297,7 @@ pub fn unpickle_block(_space: PyObjectRef, w_tup: PyObjectRef) -> Block {
         })
     }
     .unwrap_or(0);
-    let level = unsafe {
+    let valuestackdepth = unsafe {
         w_tuple_getitem(w_tup, 2).and_then(|v| {
             if is_int(v) {
                 Some(w_int_get_value(v) as usize)
@@ -299,9 +307,9 @@ pub fn unpickle_block(_space: PyObjectRef, w_tup: PyObjectRef) -> Block {
         })
     }
     .unwrap_or(0);
-    Block {
-        handler,
-        level,
+    FrameBlock {
+        handlerposition,
+        valuestackdepth,
         previous: 0,
     }
 }
@@ -846,7 +854,7 @@ impl PyFrame {
 
     /// pyframe.py:186 append_block
     #[inline]
-    pub fn append_block(&mut self, block: Block) {
+    pub fn append_block(&mut self, block: FrameBlock) {
         debug_assert!(block.previous == self.lastblock);
         let node = unsafe { alloc_with_gc_header(block) };
         self.lastblock = node as usize;
@@ -854,11 +862,11 @@ impl PyFrame {
 
     /// pyframe.py:190 pop_block
     #[inline]
-    pub fn pop_block(&mut self) -> Option<Block> {
+    pub fn pop_block(&mut self) -> Option<FrameBlock> {
         if self.lastblock == 0 {
             return None;
         }
-        let node = unsafe { &*(self.lastblock as *const Block) };
+        let node = unsafe { &*(self.lastblock as *const FrameBlock) };
         self.lastblock = node.previous;
         Some(*node)
     }
@@ -913,11 +921,11 @@ impl PyFrame {
 
     /// pyframe.py:198 get_blocklist — walk linked list, return in reverse order.
     #[inline]
-    pub fn get_blocklist(&self) -> Vec<Block> {
+    pub fn get_blocklist(&self) -> Vec<FrameBlock> {
         let mut lst = Vec::new();
         let mut ptr = self.lastblock;
         while ptr != 0 {
-            let block = unsafe { &*(ptr as *const Block) };
+            let block = unsafe { &*(ptr as *const FrameBlock) };
             lst.push(*block);
             ptr = block.previous;
         }
@@ -926,13 +934,13 @@ impl PyFrame {
 
     /// pyframe.py:207 set_blocklist — rebuild linked list from slice.
     #[inline]
-    pub fn set_blocklist(&mut self, lst: &[Block]) {
+    pub fn set_blocklist(&mut self, lst: &[FrameBlock]) {
         self.lastblock = 0;
         for block in lst.iter().rev() {
             let node = unsafe {
-                alloc_with_gc_header(Block {
-                    handler: block.handler,
-                    level: block.level,
+                alloc_with_gc_header(FrameBlock {
+                    valuestackdepth: block.valuestackdepth,
+                    handlerposition: block.handlerposition,
                     previous: self.lastblock,
                 })
             };

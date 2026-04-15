@@ -165,12 +165,10 @@ pub fn handle_exception(frame: &mut PyFrame, err: &PyError) -> bool {
 
     // Fallback: lastblock linked list (old-style SETUP_FINALLY/SETUP_EXCEPT)
     if let Some(block) = frame.pop_block() {
-        while frame.valuestackdepth > block.level {
-            frame.pop();
-        }
+        block.cleanupstack(frame);
         let exc_obj = err.to_exc_object();
         frame.push(exc_obj);
-        frame.next_instr = block.handler;
+        frame.next_instr = block.handlerposition;
         return true;
     }
 
@@ -930,9 +928,9 @@ impl OpcodeStepExecutor for PyFrame {
     // ── Exception handling ──
 
     fn setup_finally(&mut self, handler: usize) -> Result<(), Self::Error> {
-        self.append_block(crate::pyframe::Block {
-            handler,
-            level: self.valuestackdepth,
+        self.append_block(crate::pyframe::FrameBlock {
+            valuestackdepth: self.valuestackdepth,
+            handlerposition: handler,
             previous: self.lastblock,
         });
         Ok(())
