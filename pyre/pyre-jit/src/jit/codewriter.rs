@@ -207,6 +207,13 @@ impl CodeWriter {
     /// transforms. We go directly to assembly.
     pub fn transform_graph_to_jitcode(&self, code: &CodeObject, w_code: *const ()) -> PyJitCode {
         let nlocals = code.varnames.len();
+        // pyframe.py:111 `self.valuestackdepth = code.co_nlocals + ncellvars
+        // + nfreevars`. pyre's `PyFrame.locals_cells_stack_w` uses the same
+        // layout: [locals(nlocals), cells(ncells), stack(grows upward)].
+        // `stack_base_absolute` is the array index where the operand stack
+        // begins — the baseline for `frame.valuestackdepth`.
+        let ncells = pyre_interpreter::pyframe::ncells(code);
+        let stack_base_absolute = nlocals + ncells;
         // regalloc.py parity: all values (locals + stack temporaries) live in
         // typed register files. The value stack is mapped to ref registers
         // starting at `stack_base`.
@@ -229,6 +236,7 @@ impl CodeWriter {
         //   0=next_instr, 1=code, 2=vsd, 3=debugdata, 4=lastblock, 5=namespace
         const VABLE_NEXT_INSTR_FIELD_IDX: u16 = 0;
         const VABLE_CODE_FIELD_IDX: u16 = 1;
+        const VABLE_VALUESTACKDEPTH_FIELD_IDX: u16 = 2;
         const VABLE_NAMESPACE_FIELD_IDX: u16 = 5;
 
         // regalloc.py: compile-time stack depth counter — tracks which
@@ -437,9 +445,26 @@ impl CodeWriter {
             // `ExitFrameWithExceptionRef` leaves the frame at the raising
             // opcode's PC + 1 — matching what the interpreter would observe
             // if it had executed the same opcode natively.
+            //
+            // pyframe.py:379-417 pushvalue/popvalue_maybe_none parity:
+            // RPython's push/pop each write `self.valuestackdepth = depth +/- 1`.
+            // On the JIT, these map to per-push `setfield_vable_i`. pyre's
+            // codewriter stores stack values in typed registers rather than
+            // the `locals_cells_stack_w` array, so we cannot emit a vable
+            // setitem for each push. As the coarsest RPython-compatible
+            // approximation we flush `valuestackdepth` once at opcode entry,
+            // reflecting the pre-opcode stack depth — which is what the
+            // interpreter (eval.rs:92 `target_depth = frame.nlocals() +
+            // frame.ncells() + entry.depth`) uses when an exception handler
+            // unwinds the frame.
             if is_portal {
                 assembler.load_const_i_value(int_tmp0, (py_pc + 1) as i64);
                 assembler.vable_setfield_int(VABLE_NEXT_INSTR_FIELD_IDX, int_tmp0);
+                assembler.load_const_i_value(
+                    int_tmp0,
+                    (stack_base_absolute + current_depth as usize) as i64,
+                );
+                assembler.vable_setfield_int(VABLE_VALUESTACKDEPTH_FIELD_IDX, int_tmp0);
             }
 
             // RPython jtransform.py: rewrite_operation() dispatches per opname.
