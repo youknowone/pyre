@@ -1363,10 +1363,10 @@ pub(crate) unsafe fn issubtype_w(w_type: PyObjectRef, cls: PyObjectRef) -> bool 
     if w_type.is_null() {
         return false;
     }
-    // Accept metaclass-created classes (ABCMeta) as well — the cached
-    // MRO lives on the W_TypeObject regardless of whether `ob_type` is
-    // exactly `TYPE_TYPE`.
-    if !is_type(w_type) && !w_type_is_classlike(w_type) {
+    // PyPy's issubtype_w is only valid for type objects.  Use the same
+    // object-space test as abstractinst.py (`space.isinstance_w(...,
+    // space.w_type)`) instead of peeking at Rust layout internals.
+    if !is_type_like_w(w_type) {
         return false;
     }
     let mro_ptr = w_type_get_mro(w_type);
@@ -1473,7 +1473,7 @@ unsafe fn p_recursive_isinstance_type_w(
         Err(e) => return Err(e),
     };
     let w_inst_type = crate::typedef::r#type(w_inst).unwrap_or(pyre_object::PY_NULL);
-    if !std::ptr::eq(w_abstractclass, w_inst_type) && is_type(w_abstractclass) {
+    if !std::ptr::eq(w_abstractclass, w_inst_type) && is_type_like_w(w_abstractclass) {
         return Ok(issubtype_w(w_abstractclass, w_type));
     }
     Ok(false)
@@ -1487,16 +1487,7 @@ unsafe fn p_recursive_isinstance_w(
     w_inst: PyObjectRef,
     w_cls: PyObjectRef,
 ) -> Result<bool, PyError> {
-    if is_type(w_cls) {
-        return p_recursive_isinstance_type_w(w_inst, w_cls);
-    }
-    // PyPy's `is_type` would recognise any `type`-subclass (including
-    // ABCMeta-created classes) because CPython's PyType_Check walks the
-    // metaclass chain. pyre's `is_type` only matches exact W_TypeObject
-    // layout, so metaclass-created classes with non-trivial `ob_type`
-    // fall through here. Route them back through the MRO walk instead of
-    // the slow `__bases__` recursion when they still carry a cached MRO.
-    if w_type_is_classlike(w_cls) {
+    if is_type_like_w(w_cls) {
         return p_recursive_isinstance_type_w(w_inst, w_cls);
     }
     check_class(
@@ -1511,20 +1502,16 @@ unsafe fn p_recursive_isinstance_w(
     p_abstract_issubclass_w(w_abstractclass, w_cls)
 }
 
-/// pypy/objspace/std/typeobject.py: classes created via metaclass
-/// (`type(cls)` != `type`) still satisfy `PyType_Check` because CPython
-/// walks the metaclass hierarchy. pyre's `is_type` only matches the
-/// singleton `TYPE_TYPE`, so this helper catches metaclass-created
-/// classes by looking for a cached MRO. When present, we can safely use
-/// the MRO-based `p_recursive_isinstance_type_w` path.
-unsafe fn w_type_is_classlike(obj: PyObjectRef) -> bool {
-    if obj.is_null() {
-        return false;
-    }
-    // Any W_TypeObject-backed class carries a cached MRO (populated by
-    // `make_builtin_type` / user class creation). Instances never have
-    // one, so this filters out non-classes.
-    !pyre_object::w_type_get_mro(obj).is_null()
+/// abstractinst.py:53-56 / 154-156:
+/// `space.isinstance_w(obj, space.w_type)`.
+///
+/// This deliberately goes through pyre's object-space `isinstance_w`,
+/// which consults the Python-level class (`w_class` / W_TypeObject MRO).
+/// Do not replace it with `pyre_object::is_type_or_subtype()`: that helper
+/// inspects the static Rust `PyType` tag and is not the RPython data path.
+unsafe fn is_type_like_w(obj: PyObjectRef) -> bool {
+    let w_type = crate::typedef::w_type();
+    !w_type.is_null() && isinstance_w(obj, w_type)
 }
 
 /// abstractinst.py:127-147 `p_abstract_issubclass_w`. Walks
@@ -1569,7 +1556,7 @@ unsafe fn p_recursive_issubclass_w(
     w_derived: PyObjectRef,
     w_cls: PyObjectRef,
 ) -> Result<bool, PyError> {
-    if is_type(w_cls) && is_type(w_derived) {
+    if is_type_like_w(w_cls) && is_type_like_w(w_derived) {
         return Ok(issubtype_w(w_derived, w_cls));
     }
     check_class(w_derived, "issubclass() arg 1 must be a class")?;
@@ -3808,7 +3795,7 @@ unsafe fn compute_mro(w_type: PyObjectRef) -> Vec<PyObjectRef> {
     let mut lists: Vec<Vec<PyObjectRef>> = Vec::with_capacity(n + 1);
     for i in 0..n {
         if let Some(base) = w_tuple_getitem(bases, i as i64) {
-            if is_type(base) || w_type_is_classlike(base) {
+            if is_type_like_w(base) {
                 lists.push(compute_mro(base));
             }
         }

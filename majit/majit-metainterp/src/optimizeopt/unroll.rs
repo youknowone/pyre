@@ -4238,27 +4238,9 @@ fn assemble_peeled_trace_with_jump_args(
             } else {
                 new_op.args.iter().copied().collect()
             };
-            // unroll.py:170-171 jump_to_preamble parity: when the Jump's
-            // descr points at the start (preamble) target token, the target
-            // is the top-of-trace preamble Label, not the body Label. pyre's
-            // `LoopTargetDescr::is_preamble_target()` distinguishes these two
-            // descriptor kinds; use it so the Jump args match the preamble
-            // Label's arglist in both arity and content. RPython enforces
-            // `jump.numargs() == label.numargs()` at link time
-            // (compile.py:334, assembler.py closing_jump); violating it
-            // triggers the dynasm backend's arity assertion.
-            let jump_targets_preamble = new_op
-                .descr
-                .as_ref()
-                .and_then(|d| d.as_loop_target_descr())
-                .map_or(false, |lt| lt.is_preamble_target());
-            let target_label_args: Vec<OpRef> = if jump_targets_preamble {
-                start_label_args.to_vec()
-            } else {
-                current_inner_label_index
-                    .and_then(|label_idx| result.get(label_idx).map(|op| op.args.to_vec()))
-                    .unwrap_or_else(|| full_label_args.clone())
-            };
+            let target_label_args: Vec<OpRef> = current_inner_label_index
+                .and_then(|label_idx| result.get(label_idx).map(|op| op.args.to_vec()))
+                .unwrap_or_else(|| full_label_args.clone());
             let target_base_len = if current_inner_label_index.is_some() {
                 original_args.len()
             } else {
@@ -5838,7 +5820,7 @@ mod tests {
     }
 
     #[test]
-    fn test_assemble_peeled_trace_maps_jump_to_preamble_via_start_label_contract() {
+    fn test_assemble_peeled_trace_does_not_route_jump_by_preamble_descr() {
         let start_descr = TargetToken::new_preamble(0).as_jump_target_descr();
         let p2_ops = vec![{
             let mut jump = Op::new(
@@ -5867,9 +5849,13 @@ mod tests {
         assert_eq!(combined[0].opcode, OpCode::Label);
         assert_eq!(combined[1].opcode, OpCode::Label);
         assert_eq!(combined[2].opcode, OpCode::Jump);
+        // RPython parity: unroll.py:238-242 `jump_to_preamble` retargets the
+        // Jump before compile.py assembles the trace, and this assembly helper
+        // must not derive a different arg contract by inspecting that descr.
+        // The caller is responsible for constructing the preamble-shaped Jump.
         assert_eq!(
             combined[2].args.as_slice(),
-            &[OpRef(100), OpRef(101), OpRef(102)]
+            &[OpRef(100), OpRef(101), OpRef(102), OpRef(3), OpRef(4)]
         );
     }
 
