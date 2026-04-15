@@ -1223,13 +1223,6 @@ impl TraceCtx {
         //         self.execute_varargs(
         //             rop.COND_CALL, [condbox, funcbox, box],
         //             vinfo.clear_vable_descr, False, False)
-        //
-        // pyjitpl.py:1190-1200 emit_force_virtualizable:
-        //   tokenbox = mi.execute_and_record(GETFIELD_GC_R, token_descr, box)
-        //   condbox = mi.execute_and_record(PTR_NE, None, tokenbox, CONST_NULL)
-        //   funcbox = ConstInt(cast(Signed, vinfo.clear_vable_ptr))
-        //   self.execute_varargs(COND_CALL, [condbox, funcbox, box],
-        //                        vinfo.clear_vable_descr, False, False)
         if !self.heap_cache.is_unescaped(vable_opref) {
             if let Some(info) = self.virtualizable_info.clone() {
                 let token_descr = info.token_field_descr();
