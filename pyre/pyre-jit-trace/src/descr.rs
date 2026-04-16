@@ -618,8 +618,8 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
             ),
             (
-                "PyFrame.next_instr",
-                crate::frame_layout::PYFRAME_NEXT_INSTR_OFFSET,
+                "PyFrame.last_instr",
+                crate::frame_layout::PYFRAME_LAST_INSTR_OFFSET,
                 8,
                 Type::Int,
                 true,
@@ -627,8 +627,8 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
             ),
             (
-                "PyFrame.code",
-                crate::frame_layout::PYFRAME_CODE_OFFSET,
+                "PyFrame.pycode",
+                crate::frame_layout::PYFRAME_PYCODE_OFFSET,
                 8,
                 Type::Ref,
                 true,
@@ -636,8 +636,8 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
             ),
             (
-                "PyFrame.namespace",
-                crate::frame_layout::PYFRAME_NAMESPACE_OFFSET,
+                "PyFrame.w_globals",
+                crate::frame_layout::PYFRAME_W_GLOBALS_OFFSET,
                 8,
                 Type::Ref,
                 false,

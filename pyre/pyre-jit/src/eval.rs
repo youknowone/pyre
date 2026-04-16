@@ -368,14 +368,14 @@ impl __extend__ {
     ///
     /// In pyre, the JIT-instrumented dispatch loop is eval_loop_jit().
     /// pycode and ec are stored on the frame; eval_loop_jit reads them
-    /// from frame.code and frame.execution_context respectively.
+    /// from frame.pycode and frame.execution_context respectively.
     pub fn dispatch(
         frame: &mut PyFrame,
         _pycode: pyre_object::PyObjectRef,
         next_instr: usize,
         _ec: *const PyExecutionContext,
     ) -> PyResult {
-        frame.next_instr = next_instr;
+        frame.set_last_instr_from_next_instr(next_instr);
         // interp_jit.py:79-96 dispatch: the while-True loop runs until
         // Yield or ExitFrame. ContinueRunningNormally means portal
         // re-entry (warmspot.py:976), not a silent return.
@@ -399,7 +399,7 @@ impl __extend__ {
     ) -> usize {
         if majit_metainterp::we_are_jitted() {
             let decr_by = _get_adapted_tick_counter();
-            frame.next_instr = jumpto;
+            frame.set_last_instr_from_next_instr(jumpto);
             if !ec.is_null() {
                 unsafe {
                     (*ec).bytecode_trace(frame as *mut PyFrame, decr_by);
@@ -407,7 +407,7 @@ impl __extend__ {
             }
             // Re-read: trace/profile hook may have changed the jump target
             // (interp_jit.py:112 — jumpto = r_uint(self.last_instr))
-            jumpto = frame.next_instr;
+            jumpto = frame.next_instr();
         }
         // can_enter_jit is handled by eval_loop_jit's StepResult::CloseLoop
         // path which calls maybe_compile_and_run.
@@ -1158,11 +1158,11 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
     // No explicit promote needed; the JitDriver green-key mechanism handles this.
 
     loop {
-        if frame.next_instr >= code.instructions.len() {
+        if frame.next_instr() >= code.instructions.len() {
             return LoopResult::Done(Ok(w_none()));
         }
 
-        let pc = frame.next_instr;
+        let pc = frame.next_instr();
         let Some((instruction, op_arg)) = pyre_interpreter::decode_instruction_at(code, pc) else {
             return LoopResult::Done(Ok(w_none()));
         };
@@ -1200,22 +1200,22 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
         }
         if let pyre_interpreter::bytecode::Instruction::Call { argc } = instruction {
             if !frame.pending_inline_results.is_empty() {
-                frame.next_instr = pc + 1;
+                frame.set_last_instr_from_next_instr(pc + 1);
                 if pyre_interpreter::call::replay_pending_inline_call(
                     frame,
                     argc.get(op_arg) as usize,
                 ) {
                     continue;
                 }
-                frame.next_instr = pc;
+                frame.set_last_instr_from_next_instr(pc);
             }
         }
 
         // ── handle_bytecode (RPython interp_jit.py:90) ──
         trace_jit_bytecode(pc, "");
         frame.last_instr = pc as isize;
-        frame.next_instr += 1;
-        let next_instr = frame.next_instr;
+        frame.set_last_instr_from_next_instr(pc + 1);
+        let mut next_instr = frame.next_instr();
         if let pyre_interpreter::bytecode::Instruction::Call { argc } = instruction {
             if pyre_interpreter::call::replay_pending_inline_call(frame, argc.get(op_arg) as usize)
             {
@@ -1227,7 +1227,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
             Ok(StepResult::CloseLoop { loop_header_pc, .. }) if is_portal => {
                 // ── can_enter_jit (RPython interp_jit.py:114) ──
                 // RPython interp_jit.py:114 → warmstate.py:446
-                let green_key = make_green_key(frame.code, loop_header_pc);
+                let green_key = make_green_key(frame.pycode, loop_header_pc);
                 if let Some(loop_result) =
                     maybe_compile_and_run(frame, green_key, loop_header_pc, driver, info, &env)
                 {
@@ -1238,7 +1238,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
             Ok(StepResult::Return(result)) => return LoopResult::Done(Ok(result)),
             Ok(StepResult::Yield(result)) => return LoopResult::Done(Ok(result)),
             Err(err) => {
-                if pyre_interpreter::eval::handle_exception(frame, &err) {
+                if pyre_interpreter::eval::handle_exception(frame, &err, &mut next_instr) {
                     continue;
                 }
                 return LoopResult::Done(Err(err));
@@ -1259,7 +1259,7 @@ fn jit_merge_point_hook(
     env: &PyreEnv,
 ) -> Option<LoopResult> {
     let concrete_frame = frame as *mut PyFrame as usize;
-    let green_key = make_green_key(frame.code, pc);
+    let green_key = make_green_key(frame.pycode, pc);
     let mut jit_state = build_jit_state(frame, info);
     let current_depth = call_depth();
     let was_tracing = driver.is_tracing();
@@ -1276,7 +1276,7 @@ fn jit_merge_point_hook(
             // starts, populating all_liveness. In pyre, JitCode compilation is
             // lazy — ensure the code's JitCode (with liveness) exists before
             // tracing so get_list_of_active_boxes can use it.
-            crate::jit::codewriter::ensure_jitcode_for(code, frame.code);
+            crate::jit::codewriter::ensure_jitcode_for(code, frame.pycode);
             let snapshot = frame.snapshot_for_tracing();
             let _ = concrete_frame;
             let (action, _executed_frame) = trace_bytecode(ctx, sym, code, pc, snapshot);
@@ -1463,10 +1463,10 @@ fn resume_in_blackhole_from_exit_layout(
     // Save frame state before consume_vable_info modifies it.
     // RPython's blackhole always completes; pyre's may fail and fall
     // back to the interpreter, which needs the original frame state.
-    let saved_ni = frame.next_instr;
-    let saved_code = frame.code;
+    let saved_ni = frame.next_instr();
+    let saved_code = frame.pycode;
     let saved_vsd = frame.valuestackdepth;
-    let saved_ns = frame.namespace;
+    let saved_ns = frame.w_globals;
     let saved_array: Vec<pyre_object::PyObjectRef> = frame.locals_w().as_slice().to_vec();
 
     build_blackhole_frames_from_deadframe(raw_values, exit_layout);
@@ -1476,10 +1476,10 @@ fn resume_in_blackhole_from_exit_layout(
         if matches!(result, BlackholeResult::Failed) {
             // Restore frame to pre-consume state so the fallback
             // interpreter can continue from the original frame.
-            frame.next_instr = saved_ni;
-            frame.code = saved_code;
+            frame.set_last_instr_from_next_instr(saved_ni);
+            frame.pycode = saved_code;
             frame.valuestackdepth = saved_vsd;
-            frame.namespace = saved_ns;
+            frame.w_globals = saved_ns;
             let dest = frame.locals_w_mut().as_mut_slice();
             let n = dest.len().min(saved_array.len());
             dest[..n].copy_from_slice(&saved_array[..n]);
@@ -1504,7 +1504,7 @@ fn execute_assembler(
     info: &majit_metainterp::virtualizable::VirtualizableInfo,
     env: &PyreEnv,
 ) -> Option<LoopResult> {
-    frame.next_instr = entry_pc;
+    frame.set_last_instr_from_next_instr(entry_pc);
 
     if majit_metainterp::majit_log_enabled() {
         let locals: Vec<(usize, Option<i64>)> = (0..frame.locals_w().len().min(5))
@@ -1632,7 +1632,7 @@ fn execute_assembler(
                             // back to the frame so eval_loop_jit restarts at
                             // the merge point, not the guard-failure PC.
                             if let Some(&ni) = green_int.first() {
-                                frame.next_instr = ni as usize;
+                                frame.set_last_instr_from_next_instr(ni as usize);
                             }
                             Some(LoopResult::ContinueRunningNormally)
                         }
@@ -1701,7 +1701,7 @@ fn bound_reached(
         return None;
     }
     // warmstate.py:437-444: MetaInterp.compile_and_run_once
-    frame.next_instr = loop_header_pc;
+    frame.set_last_instr_from_next_instr(loop_header_pc);
     let mut jit_state = build_jit_state(frame, info);
     // warmstate.py:473-477 JC_TRACING
     if driver.meta_interp().is_tracing_key(green_key) {
@@ -1748,7 +1748,7 @@ fn bound_reached(
                 || {},
                 |ctx, sym| {
                     use pyre_jit_trace::trace::trace_bytecode;
-                    crate::jit::codewriter::ensure_jitcode_for(code, frame.code);
+                    crate::jit::codewriter::ensure_jitcode_for(code, frame.pycode);
                     let concrete_frame = frame.snapshot_for_tracing();
                     let (action, _) =
                         trace_bytecode(ctx, sym, code, loop_header_pc, concrete_frame);
@@ -1809,7 +1809,7 @@ fn bound_reached(
                         } => {
                             // warmspot.py:961 parity: write merge-point PC
                             if let Some(&ni) = green_int.first() {
-                                frame.next_instr = ni as usize;
+                                frame.set_last_instr_from_next_instr(ni as usize);
                             }
                             return Some(LoopResult::ContinueRunningNormally);
                         }
@@ -1845,7 +1845,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     }
     if std::env::var_os("MAJIT_DUMP_BYTECODE").is_some() {
         let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
-        if code.obj_name.as_str() == "fannkuch" && frame.next_instr == 0 {
+        if code.obj_name.as_str() == "fannkuch" && frame.next_instr() == 0 {
             use std::sync::OnceLock;
             static DUMPED: OnceLock<()> = OnceLock::new();
             if DUMPED.get().is_none() {
@@ -1867,7 +1867,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
             }
         }
     }
-    let green_key = make_green_key(frame.code, frame.next_instr);
+    let green_key = make_green_key(frame.pycode, frame.next_instr());
     let (driver, info) = driver_pair();
 
     // RPython warmstate.py maybe_compile_and_run fast path:
@@ -1903,7 +1903,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         let mut jit_state = build_jit_state(frame, info);
         let outcome = driver.run_compiled_detailed_with_bridge_keyed(
             green_key,
-            frame.next_instr,
+            frame.next_instr(),
             &mut jit_state,
             &env,
             || {},
@@ -2042,7 +2042,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
             boosted
         );
     }
-    driver.force_start_tracing(green_key, frame.next_instr, &mut jit_state, &env);
+    driver.force_start_tracing(green_key, frame.next_instr(), &mut jit_state, &env);
     if driver.is_tracing() {
         // RPython warmstate.py:429 decay_all_counters:
         // called once after tracing starts to prevent burst compilation.
@@ -2934,10 +2934,10 @@ pub(crate) fn build_resumed_frames_from_deadframe(
 
 fn build_blackhole_frames_fallback(typed: &[Value]) -> Vec<crate::call_jit::ResumedFrame> {
     let num_scalars = pyre_jit_trace::virtualizable_gen::NUM_SCALAR_INPUTARGS;
-    let ni_idx = pyre_jit_trace::virtualizable_gen::SYM_NEXT_INSTR_IDX as usize;
-    let code_idx = pyre_jit_trace::virtualizable_gen::SYM_CODE_IDX as usize;
+    let ni_idx = pyre_jit_trace::virtualizable_gen::SYM_LAST_INSTR_IDX as usize;
+    let code_idx = pyre_jit_trace::virtualizable_gen::SYM_PYCODE_IDX as usize;
     let vsd_idx = pyre_jit_trace::virtualizable_gen::SYM_VALUESTACKDEPTH_IDX as usize;
-    let ns_idx = pyre_jit_trace::virtualizable_gen::SYM_NAMESPACE_IDX as usize;
+    let ns_idx = pyre_jit_trace::virtualizable_gen::SYM_W_GLOBALS_IDX as usize;
     let frame_ptr = match typed.first() {
         Some(Value::Ref(r)) => r.as_usize() as *mut pyre_interpreter::pyframe::PyFrame,
         Some(Value::Int(v)) => *v as *mut pyre_interpreter::pyframe::PyFrame,
@@ -2946,7 +2946,7 @@ fn build_blackhole_frames_fallback(typed: &[Value]) -> Vec<crate::call_jit::Resu
     // virtualizable.py:86-99 read_boxes: ALL static fields in declared order.
     // typed = [frame(0), ni(1), code(2), vsd(3), ns(4), array...]
     let py_pc = match typed.get(ni_idx) {
-        Some(Value::Int(v)) => *v as usize,
+        Some(Value::Int(v)) => (*v + 1) as usize,
         _ => 0,
     };
     let code = match typed.get(code_idx) {
@@ -3222,10 +3222,10 @@ fn build_resumed_frames(
     // virtualizable_ptr from end to front.
     // vable_values = [frame_ptr(0), ni(1), code(2), vsd(3), ns(4), array...]
     let num_scalars = pyre_jit_trace::virtualizable_gen::NUM_SCALAR_INPUTARGS;
-    let ni_idx = pyre_jit_trace::virtualizable_gen::SYM_NEXT_INSTR_IDX as usize;
-    let code_idx = pyre_jit_trace::virtualizable_gen::SYM_CODE_IDX as usize;
+    let ni_idx = pyre_jit_trace::virtualizable_gen::SYM_LAST_INSTR_IDX as usize;
+    let code_idx = pyre_jit_trace::virtualizable_gen::SYM_PYCODE_IDX as usize;
     let vsd_idx = pyre_jit_trace::virtualizable_gen::SYM_VALUESTACKDEPTH_IDX as usize;
-    let ns_idx = pyre_jit_trace::virtualizable_gen::SYM_NAMESPACE_IDX as usize;
+    let ns_idx = pyre_jit_trace::virtualizable_gen::SYM_W_GLOBALS_IDX as usize;
 
     // Resolve ALL vable fields from resume data.
     // vable_values = [frame_ptr(0), ni(1), code(2), vsd(3), ns(4), array...]
@@ -3258,7 +3258,7 @@ fn build_resumed_frames(
     let vable_ni = resolved_vable
         .get(ni_idx)
         .map(|v| match v {
-            Value::Int(v) => *v as usize,
+            Value::Int(v) => (*v + 1) as usize,
             _ => 0,
         })
         .unwrap_or(0);
@@ -3409,11 +3409,11 @@ fn build_resumed_frames(
             if !vable_frame_ptr.is_null() {
                 let f = unsafe { &*vable_frame_ptr };
                 eprintln!(
-                    "[jit][consume_vable_info] frame after write: ni={} vsd={} code={:?} ns={:?} debugdata={} lastblock={} vable_token={} array_len={}",
-                    f.next_instr,
+                    "[jit][consume_vable_info] frame after write: ni={} vsd={} code={:?} ns={:?} debugdata={:?} lastblock={:?} vable_token={} array_len={}",
+                    f.next_instr(),
                     f.valuestackdepth,
-                    f.code,
-                    f.namespace,
+                    f.pycode,
+                    f.w_globals,
                     f.debugdata,
                     f.lastblock,
                     f.vable_token,
@@ -3443,7 +3443,7 @@ fn build_resumed_frames(
             if !vable_code.is_null() {
                 vable_code
             } else if !vable_frame_ptr.is_null() {
-                unsafe { (*vable_frame_ptr).code }
+                unsafe { (*vable_frame_ptr).pycode }
             } else {
                 std::ptr::null()
             }
@@ -3491,7 +3491,7 @@ fn build_resumed_frames(
             if !vable_ns.is_null() {
                 vable_ns
             } else if !vable_frame_ptr.is_null() {
-                unsafe { (*vable_frame_ptr).namespace as *const () }
+                unsafe { (*vable_frame_ptr).w_globals as *const () }
             } else {
                 std::ptr::null()
             }
@@ -4405,7 +4405,7 @@ mod tests {
         let mut frame = PyFrame::new(code);
         let _ = eval_with_jit(&mut frame);
         unsafe {
-            let x = *(*frame.namespace).get("x").unwrap();
+            let x = *(*frame.w_globals).get("x").unwrap();
             assert_eq!(pyre_object::intobject::w_int_get_value(x), 3);
         }
     }
@@ -4423,7 +4423,7 @@ while i < 20:
         let mut frame = PyFrame::new(code);
         let _ = eval_with_jit(&mut frame);
         unsafe {
-            let s = *(*frame.namespace).get("s").unwrap();
+            let s = *(*frame.w_globals).get("s").unwrap();
             assert_eq!(pyre_object::intobject::w_int_get_value(s), 190);
         }
     }
@@ -4487,13 +4487,13 @@ r = acc",
         let mut frame = PyFrame::new(code);
         let result = eval_with_jit(&mut frame);
         if std::env::var_os("MAJIT_DUMP_BYTECODE").is_some() {
-            let mut keys: Vec<_> = unsafe { (*frame.namespace).keys().cloned().collect() };
+            let mut keys: Vec<_> = unsafe { (*frame.w_globals).keys().cloned().collect() };
             keys.sort();
             eprintln!("module result: {:?}", result);
             eprintln!("module namespace keys: {:?}", keys);
         }
         unsafe {
-            let r = *(*frame.namespace).get("r").unwrap();
+            let r = *(*frame.w_globals).get("r").unwrap();
             assert_eq!(pyre_object::intobject::w_int_get_value(r), 6);
         }
     }
@@ -4521,7 +4521,7 @@ result = fib(12)
         let mut frame = PyFrame::new(code);
         let _ = eval_with_jit(&mut frame);
         unsafe {
-            let result = *(*frame.namespace).get("result").unwrap();
+            let result = *(*frame.w_globals).get("result").unwrap();
             assert_eq!(
                 pyre_object::intobject::w_int_get_value(result),
                 144,
@@ -4547,8 +4547,8 @@ second = g(9)";
         let mut frame = PyFrame::new(code);
         let _ = eval_with_jit(&mut frame);
         unsafe {
-            let first = *(*frame.namespace).get("first").unwrap();
-            let second = *(*frame.namespace).get("second").unwrap();
+            let first = *(*frame.w_globals).get("first").unwrap();
+            let second = *(*frame.w_globals).get("second").unwrap();
             assert_eq!(pyre_object::intobject::w_int_get_value(first), 88);
             assert_eq!(pyre_object::intobject::w_int_get_value(second), 176);
         }
@@ -4573,7 +4573,7 @@ while i < 40:
         let mut frame = PyFrame::new(code);
         let _ = eval_with_jit(&mut frame);
         unsafe {
-            let s = *(*frame.namespace).get("s").unwrap();
+            let s = *(*frame.w_globals).get("s").unwrap();
             assert_eq!(pyre_object::intobject::w_int_get_value(s), 3_900);
         }
     }
@@ -4603,7 +4603,7 @@ while i < 40:
         let mut frame = PyFrame::new(code);
         let _ = eval_with_jit(&mut frame);
         unsafe {
-            let s = *(*frame.namespace).get("s").unwrap();
+            let s = *(*frame.w_globals).get("s").unwrap();
             assert_eq!(pyre_object::intobject::w_int_get_value(s), 21_320);
         }
     }
@@ -4729,8 +4729,8 @@ while i < 40:
         let mut frame = PyFrame::new(code);
         let _ = eval_with_jit(&mut frame);
         unsafe {
-            let s = *(*frame.namespace).get("s").unwrap();
-            let q = *(*frame.namespace).get("q").unwrap();
+            let s = *(*frame.w_globals).get("s").unwrap();
+            let q = *(*frame.w_globals).get("q").unwrap();
             assert_eq!(pyre_object::intobject::w_int_get_value(s), 220);
             assert_eq!(
                 pyre_object::intobject::w_int_get_value(

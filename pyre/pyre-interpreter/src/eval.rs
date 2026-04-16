@@ -136,15 +136,15 @@ pub fn check_exc_match_against(exc_value: PyObjectRef, exc_type: PyObjectRef) ->
 
 /// Try to dispatch an exception using the exception table or block stack.
 ///
-/// Returns `true` if a handler was found (frame.next_instr updated to handler),
+/// Returns `true` if a handler was found (resume PC updated to handler),
 /// `false` if the exception should propagate to the caller.
-pub fn handle_exception(frame: &mut PyFrame, err: &PyError) -> bool {
+pub fn handle_exception(frame: &mut PyFrame, err: &PyError, next_instr: &mut usize) -> bool {
     // GeneratorReturn is not a real exception — always propagate it.
     if err.kind == crate::PyErrorKind::GeneratorReturn {
         return false;
     }
     let code = unsafe { &*crate::pyframe_get_pycode(frame) };
-    let pc = frame.next_instr.saturating_sub(1) as u32;
+    let pc = frame.last_instr as u32;
 
     // Python 3.11+ exception table dispatch
     if let Some(entry) = crate::bytecode::find_exception_handler(&code.exceptiontable, pc) {
@@ -159,16 +159,16 @@ pub fn handle_exception(frame: &mut PyFrame, err: &PyError) -> bool {
         // Push exception value as W_ExceptionObject
         let exc_obj = err.to_exc_object();
         frame.push(exc_obj);
-        frame.next_instr = entry.target as usize;
+        *next_instr = entry.target as usize;
         return true;
     }
 
-    // Fallback: lastblock linked list (old-style SETUP_FINALLY/SETUP_EXCEPT)
+    // Fallback: lastblock (old-style SETUP_FINALLY/SETUP_EXCEPT)
     if let Some(block) = frame.pop_block() {
         block.cleanupstack(frame);
         let exc_obj = err.to_exc_object();
         frame.push(exc_obj);
-        frame.next_instr = block.handlerposition;
+        *next_instr = block.handlerposition;
         return true;
     }
 
@@ -178,11 +178,27 @@ pub fn handle_exception(frame: &mut PyFrame, err: &PyError) -> bool {
 /// Execute a frame — pure interpreter, no JIT.
 pub fn eval_frame_plain(frame: &mut PyFrame) -> PyResult {
     frame.fix_array_ptrs();
-    // Track last known execution context for call_user_function_with_args
-    if !frame.execution_context.is_null() {
-        crate::call::set_last_exec_ctx(frame.execution_context);
+    if frame.execution_context.is_null() {
+        return eval_loop(frame);
     }
-    eval_loop(frame)
+    let execution_context =
+        unsafe { &mut *(frame.execution_context as *mut crate::PyExecutionContext) };
+    crate::call::set_last_exec_ctx(frame.execution_context);
+    frame.f_backref = execution_context.topframeref;
+    execution_context.enter(frame as *mut PyFrame);
+    let mut got_exception = true;
+    let mut w_exitvalue = pyre_object::w_none();
+    let result = (|| {
+        execution_context.call_trace(frame as *mut PyFrame);
+        let result = eval_loop(frame)?;
+        w_exitvalue = result;
+        got_exception = false;
+        Ok(result)
+    })();
+    execution_context.return_trace(frame as *mut PyFrame, w_exitvalue);
+    frame.frame_finished_execution = true;
+    execution_context.leave(frame as *mut PyFrame, w_exitvalue, got_exception);
+    result
 }
 
 /// Resume interpretation after compiled code guard failure.
@@ -193,25 +209,27 @@ pub fn eval_loop_for_force(frame: &mut PyFrame) -> PyResult {
 fn eval_loop(frame: &mut PyFrame) -> PyResult {
     let _current_frame_guard = install_current_frame(frame);
     let code = unsafe { &*crate::pyframe_get_pycode(frame) };
+    let mut next_instr = frame.next_instr();
 
     loop {
-        if frame.next_instr >= code.instructions.len() {
+        if next_instr >= code.instructions.len() {
             return Ok(w_none());
         }
 
-        let pc = frame.next_instr;
+        let pc = next_instr;
+        frame.last_instr = pc as isize;
         let Some((instruction, op_arg)) = decode_instruction_at(code, pc) else {
             return Ok(w_none());
         };
-        frame.last_instr = pc as isize;
-        frame.next_instr += 1;
-        let next_instr = frame.next_instr;
-        match execute_opcode_step(frame, code, instruction, op_arg, next_instr) {
+        let fallthrough = pc + 1;
+        match execute_opcode_step(frame, code, instruction, op_arg, fallthrough) {
             Ok(StepResult::Continue)
             | Ok(StepResult::CloseLoop {
                 jump_args: _,
                 loop_header_pc: _,
-            }) => {}
+            }) => {
+                next_instr = frame.next_instr();
+            }
             Ok(StepResult::Return(result)) => return Ok(result),
             Ok(StepResult::Yield(result)) => return Ok(result),
             Err(err) => {
@@ -220,7 +238,7 @@ fn eval_loop(frame: &mut PyFrame) -> PyResult {
                     let gen_ptr = err.message.parse::<usize>().unwrap_or(0);
                     return Ok(gen_ptr as pyre_object::PyObjectRef);
                 }
-                if handle_exception(frame, &err) {
+                if handle_exception(frame, &err, &mut next_instr) {
                     continue;
                 }
                 return Err(err);
@@ -252,7 +270,7 @@ impl SharedOpcodeHandler for PyFrame {
     }
 
     fn make_function(&mut self, code_obj: Self::Value) -> Result<Self::Value, PyError> {
-        Ok(make_function_from_code_obj(code_obj, self.namespace))
+        Ok(make_function_from_code_obj(code_obj, self.get_w_globals()))
     }
 
     fn call_callable(
@@ -341,25 +359,20 @@ impl LocalOpcodeHandler for PyFrame {
 impl NamespaceOpcodeHandler for PyFrame {
     /// PyPy: LOAD_NAME checks locals first (class body), then globals.
     fn load_name_value(&mut self, name: &str) -> Result<Self::Value, PyError> {
-        // Check class_locals first (PyPy: w_locals in class body scope)
-        if !self.class_locals.is_null() {
-            let locals = unsafe { &*self.class_locals };
+        let w_locals = self.get_w_locals();
+        if !w_locals.is_null() {
+            let locals = unsafe { &*w_locals };
             if let Ok(value) = namespace_load(locals, name) {
                 return Ok(value);
             }
         }
-        // Fall back to globals (PyPy: w_globals)
-        let ns = unsafe { &*self.namespace };
+        let ns = unsafe { &*self.get_w_globals() };
         namespace_load(ns, name)
     }
 
     /// PyPy: STORE_NAME writes to locals (class body) or globals.
     fn store_name_value(&mut self, name: &str, value: Self::Value) -> Result<(), PyError> {
-        let ns = if !self.class_locals.is_null() {
-            unsafe { &mut *self.class_locals }
-        } else {
-            unsafe { &mut *self.namespace }
-        };
+        let ns = unsafe { &mut *self.getdictscope() };
         namespace_store(ns, name, value);
         Ok(())
     }
@@ -586,7 +599,7 @@ impl IterOpcodeHandler for PyFrame {
     }
 
     fn on_iter_exhausted(&mut self, target: usize) -> Result<(), PyError> {
-        self.next_instr = target;
+        self.set_last_instr_from_next_instr(target);
         Ok(())
     }
 }
@@ -609,11 +622,11 @@ impl TruthOpcodeHandler for PyFrame {
 
 impl ControlFlowOpcodeHandler for PyFrame {
     fn fallthrough_target(&mut self) -> usize {
-        self.next_instr
+        self.next_instr()
     }
 
     fn set_next_instr(&mut self, target: usize) -> Result<(), PyError> {
-        self.next_instr = target;
+        self.set_last_instr_from_next_instr(target);
         Ok(())
     }
 
@@ -729,13 +742,11 @@ impl OpcodeStepExecutor for PyFrame {
     /// pyre-equivalent flow runs the bytecode opcode and writes into
     /// the class_locals namespace just like CPython).
     fn setup_annotations(&mut self) -> Result<(), Self::Error> {
-        let ns = if !self.class_locals.is_null() {
-            unsafe { &mut *self.class_locals }
-        } else if !self.namespace.is_null() {
-            unsafe { &mut *self.namespace }
-        } else {
+        let ns = self.getdictscope();
+        if ns.is_null() {
             return Ok(());
-        };
+        }
+        let ns = unsafe { &mut *ns };
         if namespace_load(ns, "__annotations__").is_err() {
             namespace_store(ns, "__annotations__", pyre_object::w_dict_new());
         }
@@ -835,7 +846,7 @@ impl OpcodeStepExecutor for PyFrame {
     fn pop_jump_if_none(&mut self, target: usize) -> Result<(), Self::Error> {
         let val = self.pop();
         if unsafe { pyre_object::is_none(val) } || val.is_null() {
-            self.next_instr = target;
+            self.set_last_instr_from_next_instr(target);
         }
         Ok(())
     }
@@ -843,7 +854,7 @@ impl OpcodeStepExecutor for PyFrame {
     fn pop_jump_if_not_none(&mut self, target: usize) -> Result<(), Self::Error> {
         let val = self.pop();
         if !val.is_null() && !unsafe { pyre_object::is_none(val) } {
-            self.next_instr = target;
+            self.set_last_instr_from_next_instr(target);
         }
         Ok(())
     }
@@ -1028,7 +1039,7 @@ impl OpcodeStepExecutor for PyFrame {
 
         let module = crate::importing::importhook(
             name,
-            self.namespace as PyObjectRef, // for relative imports: __name__/__package__
+            self.get_w_globals() as PyObjectRef, // for relative imports: __name__/__package__
             w_fromlist,
             level,
             self.execution_context,
@@ -1241,7 +1252,7 @@ impl OpcodeStepExecutor for PyFrame {
         }
         // Fall back to globals
         unsafe {
-            if let Some(&val) = (*self.namespace).get(name) {
+            if let Some(&val) = (*self.get_w_globals()).get(name) {
                 self.push(val);
                 return Ok(());
             }
@@ -1387,7 +1398,7 @@ impl OpcodeStepExecutor for PyFrame {
 
     // ── delete_name ──
     fn delete_name(&mut self, name: &str) -> Result<(), Self::Error> {
-        let ns = self.namespace as *mut crate::PyNamespace;
+        let ns = self.get_w_globals();
         unsafe {
             crate::namespace_delete(&mut *ns, name);
         }
@@ -1396,7 +1407,7 @@ impl OpcodeStepExecutor for PyFrame {
 
     // ── delete_global ──
     fn delete_global(&mut self, name: &str) -> Result<(), Self::Error> {
-        let ns = self.namespace as *mut crate::PyNamespace;
+        let ns = self.get_w_globals();
         unsafe {
             crate::namespace_delete(&mut *ns, name);
         }
@@ -1407,7 +1418,7 @@ impl OpcodeStepExecutor for PyFrame {
     // PyPy: IMPORT_STAR — merge module's public names into current namespace.
     fn import_star(&mut self) -> Result<(), Self::Error> {
         let module = self.pop();
-        crate::importing::import_all_from(module, self.namespace);
+        crate::importing::import_all_from(module, self.get_w_globals());
         Ok(())
     }
 
@@ -1438,7 +1449,7 @@ impl OpcodeStepExecutor for PyFrame {
             Err(e) if e.kind == crate::PyErrorKind::StopIteration => {
                 // Don't pop iterator — END_SEND will handle it
                 self.push(pyre_object::w_none()); // push result (None)
-                self.next_instr = target;
+                self.set_last_instr_from_next_instr(target);
                 Ok(())
             }
             Err(e) => Err(e),
@@ -1470,26 +1481,27 @@ impl OpcodeStepExecutor for PyFrame {
         // Legacy path for CPython-style RETURN_GENERATOR (not used with RustPython compiler):
         // Copy the current frame into a heap-allocated frame for the generator.
         // PyPy: GeneratorIterator stores the PyFrame and resumes it on __next__.
-        let w_code = self.code;
+        let w_code = self.pycode;
         let code_ref = unsafe { &*crate::pyframe_get_pycode(self) };
         let n_total = code_ref.varnames.len() + code_ref.cellvars.len() + code_ref.freevars.len();
 
         let mut gen_frame = crate::pyframe::PyFrame::new_with_namespace(
             w_code,
             self.execution_context,
-            self.namespace,
+            self.get_w_globals(),
         );
-        gen_frame.class_locals = self.class_locals;
-        gen_frame.next_instr = self.next_instr;
+        let w_locals = self.get_w_locals();
+        if !w_locals.is_null() {
+            gen_frame.setdictscope(w_locals);
+        }
         gen_frame.last_instr = self.last_instr;
         // Copy locals + cells + stack
         for i in 0..self.valuestackdepth {
             gen_frame.locals_w_mut()[i] = self.locals_w()[i];
         }
         gen_frame.valuestackdepth = self.valuestackdepth;
-        gen_frame.lastblock = self.clone_blocks();
-        gen_frame.debugdata = self.clone_debugdata();
-        gen_frame.escaped = self.escaped;
+        let blocklist = self.get_blocklist();
+        gen_frame.set_blocklist(&blocklist);
 
         let frame_ptr = Box::into_raw(Box::new(gen_frame)) as *mut u8;
         let generator = pyre_object::generatorobject::w_generator_new(frame_ptr);
@@ -1877,8 +1889,9 @@ impl OpcodeStepExecutor for PyFrame {
     fn load_locals(&mut self) -> Result<(), Self::Error> {
         let dict = pyre_object::w_dict_new();
         unsafe {
-            if !self.class_locals.is_null() {
-                for (key, &value) in (*self.class_locals).entries() {
+            let w_locals = self.get_w_locals();
+            if !w_locals.is_null() {
+                for (key, &value) in (*w_locals).entries() {
                     if !value.is_null() {
                         pyre_object::w_dict_store(dict, pyre_object::w_str_new(key), value);
                     }
@@ -1891,8 +1904,9 @@ impl OpcodeStepExecutor for PyFrame {
                         pyre_object::w_dict_store(dict, pyre_object::w_str_new(name), value);
                     }
                 }
-                if self.nlocals() == 0 && !self.namespace.is_null() {
-                    for (key, &value) in (*self.namespace).entries() {
+                let w_globals = self.get_w_globals();
+                if self.nlocals() == 0 && !w_globals.is_null() {
+                    for (key, &value) in (*w_globals).entries() {
                         if !value.is_null() {
                             pyre_object::w_dict_store(dict, pyre_object::w_str_new(key), value);
                         }
@@ -2229,8 +2243,8 @@ mod tests {
         let mut frame = PyFrame::new(code);
         let _ = eval_frame_plain(&mut frame);
         unsafe {
-            let x = *(*frame.namespace).get("x").unwrap();
-            let y = *(*frame.namespace).get("y").unwrap();
+            let x = *(*frame.w_globals).get("x").unwrap();
+            let y = *(*frame.w_globals).get("y").unwrap();
             assert_eq!(w_int_get_value(x), 5);
             assert_eq!(w_int_get_value(y), 25);
         }
@@ -2243,7 +2257,7 @@ mod tests {
         let mut frame = PyFrame::new(code);
         let _ = eval_frame_plain(&mut frame);
         unsafe {
-            let i = *(*frame.namespace).get("i").unwrap();
+            let i = *(*frame.w_globals).get("i").unwrap();
             assert_eq!(w_int_get_value(i), 10);
         }
     }
@@ -2278,7 +2292,7 @@ r = acc",
         let mut frame = PyFrame::new(code);
         let _ = eval_frame_plain(&mut frame);
         unsafe {
-            let r = *(*frame.namespace).get("r").unwrap();
+            let r = *(*frame.w_globals).get("r").unwrap();
             assert_eq!(w_int_get_value(r), 6);
         }
     }
@@ -2407,7 +2421,7 @@ r = acc",
         let mut frame = PyFrame::new(code);
         let _ = eval_frame_plain(&mut frame);
         unsafe {
-            let s = *(*frame.namespace).get("s").unwrap();
+            let s = *(*frame.w_globals).get("s").unwrap();
             assert_eq!(w_int_get_value(s), 45);
         }
     }
@@ -2419,7 +2433,7 @@ r = acc",
         let mut frame = PyFrame::new(code);
         let _ = eval_frame_plain(&mut frame);
         unsafe {
-            let s = *(*frame.namespace).get("s").unwrap();
+            let s = *(*frame.w_globals).get("s").unwrap();
             assert_eq!(w_int_get_value(s), 4_498_500);
         }
     }
@@ -2439,8 +2453,8 @@ while i < 3000:
         let mut frame = PyFrame::new(code);
         let _ = eval_frame_plain(&mut frame);
         unsafe {
-            let i = *(*frame.namespace).get("i").unwrap();
-            let acc = *(*frame.namespace).get("acc").unwrap();
+            let i = *(*frame.w_globals).get("i").unwrap();
+            let acc = *(*frame.w_globals).get("acc").unwrap();
             assert_eq!(w_int_get_value(i), 3000);
             assert_eq!(w_int_get_value(acc), 4500);
         }
@@ -2459,8 +2473,8 @@ while i < 3000:
         let mut frame = PyFrame::new(code);
         let _ = eval_frame_plain(&mut frame);
         unsafe {
-            let i = *(*frame.namespace).get("i").unwrap();
-            let acc = *(*frame.namespace).get("acc").unwrap();
+            let i = *(*frame.w_globals).get("i").unwrap();
+            let acc = *(*frame.w_globals).get("acc").unwrap();
             assert_eq!(w_int_get_value(i), 3000);
             assert_eq!(w_int_get_value(acc), 4_501_500);
         }
@@ -2480,9 +2494,9 @@ while i < 3000:
         let mut frame = PyFrame::new(code);
         let _ = eval_frame_plain(&mut frame);
         unsafe {
-            let i = *(*frame.namespace).get("i").unwrap();
-            let acc = *(*frame.namespace).get("acc").unwrap();
-            let lst = *(*frame.namespace).get("lst").unwrap();
+            let i = *(*frame.w_globals).get("i").unwrap();
+            let acc = *(*frame.w_globals).get("acc").unwrap();
+            let lst = *(*frame.w_globals).get("lst").unwrap();
             assert_eq!(w_int_get_value(i), 3000);
             assert_eq!(w_int_get_value(acc), 4_498_500);
             assert_eq!(w_int_get_value(w_list_getitem(lst, 0).unwrap()), 2999);
@@ -2501,8 +2515,8 @@ while i < 3000:
         let mut frame = PyFrame::new(code);
         let _ = eval_frame_plain(&mut frame);
         unsafe {
-            let i = *(*frame.namespace).get("i").unwrap();
-            let acc = *(*frame.namespace).get("acc").unwrap();
+            let i = *(*frame.w_globals).get("i").unwrap();
+            let acc = *(*frame.w_globals).get("acc").unwrap();
             assert_eq!(w_int_get_value(i), 3000);
             assert_eq!(w_int_get_value(acc), 4095);
         }
@@ -2520,8 +2534,8 @@ while i < 3000:
         let mut frame = PyFrame::new(code);
         let _ = eval_frame_plain(&mut frame);
         unsafe {
-            let i = *(*frame.namespace).get("i").unwrap();
-            let acc = *(*frame.namespace).get("acc").unwrap();
+            let i = *(*frame.w_globals).get("i").unwrap();
+            let acc = *(*frame.w_globals).get("acc").unwrap();
             assert_eq!(w_int_get_value(i), 3000);
             assert_eq!(w_int_get_value(acc), -4_501_500);
         }
@@ -2539,8 +2553,8 @@ while i < 3000:
         let mut frame = PyFrame::new(code);
         let _ = eval_frame_plain(&mut frame);
         unsafe {
-            let i = *(*frame.namespace).get("i").unwrap();
-            let acc = *(*frame.namespace).get("acc").unwrap();
+            let i = *(*frame.w_globals).get("i").unwrap();
+            let acc = *(*frame.w_globals).get("acc").unwrap();
             assert_eq!(w_int_get_value(i), 3000);
             assert_eq!(w_int_get_value(acc), 1_498_500);
         }
@@ -2558,8 +2572,8 @@ while i < 3000:
         let mut frame = PyFrame::new(code);
         let _ = eval_frame_plain(&mut frame);
         unsafe {
-            let i = *(*frame.namespace).get("i").unwrap();
-            let acc = *(*frame.namespace).get("acc").unwrap();
+            let i = *(*frame.w_globals).get("i").unwrap();
+            let acc = *(*frame.w_globals).get("acc").unwrap();
             assert_eq!(w_int_get_value(i), 3000);
             assert_eq!(w_int_get_value(acc), 8_994);
         }
@@ -2577,8 +2591,8 @@ while i < 3000:
         let mut frame = PyFrame::new(code);
         let _ = eval_frame_plain(&mut frame);
         unsafe {
-            let i = *(*frame.namespace).get("i").unwrap();
-            let acc = *(*frame.namespace).get("acc").unwrap();
+            let i = *(*frame.w_globals).get("i").unwrap();
+            let acc = *(*frame.w_globals).get("acc").unwrap();
             assert_eq!(w_int_get_value(i), 3000);
             assert_eq!(w_int_get_value(acc), 2_250_000);
         }
@@ -2598,8 +2612,8 @@ while i < 3000:
         let mut frame = PyFrame::new(code);
         let _ = eval_frame_plain(&mut frame);
         unsafe {
-            let i = *(*frame.namespace).get("i").unwrap();
-            let acc = *(*frame.namespace).get("acc").unwrap();
+            let i = *(*frame.w_globals).get("i").unwrap();
+            let acc = *(*frame.w_globals).get("acc").unwrap();
             assert_eq!(w_int_get_value(i), 3000);
             assert_eq!(w_int_get_value(acc), 3000);
         }
@@ -2621,8 +2635,8 @@ while i < 3000:
         let mut frame = PyFrame::new(code);
         let _ = eval_frame_plain(&mut frame);
         unsafe {
-            let i = *(*frame.namespace).get("i").unwrap();
-            let acc = *(*frame.namespace).get("acc").unwrap();
+            let i = *(*frame.w_globals).get("i").unwrap();
+            let acc = *(*frame.w_globals).get("acc").unwrap();
             assert_eq!(w_int_get_value(i), 3000);
             assert_eq!(w_int_get_value(acc), 3000);
         }
@@ -2644,8 +2658,8 @@ while i < 3000:
         let mut frame = PyFrame::new(code);
         let _ = eval_frame_plain(&mut frame);
         unsafe {
-            let i = *(*frame.namespace).get("i").unwrap();
-            let acc = *(*frame.namespace).get("acc").unwrap();
+            let i = *(*frame.w_globals).get("i").unwrap();
+            let acc = *(*frame.w_globals).get("acc").unwrap();
             assert_eq!(w_int_get_value(i), 3000);
             assert_eq!(w_int_get_value(acc), 3000);
         }
@@ -2665,8 +2679,8 @@ while i < 3000:
         let mut frame = PyFrame::new(code);
         let _ = eval_frame_plain(&mut frame);
         unsafe {
-            let i = *(*frame.namespace).get("i").unwrap();
-            let acc = *(*frame.namespace).get("acc").unwrap();
+            let i = *(*frame.w_globals).get("i").unwrap();
+            let acc = *(*frame.w_globals).get("acc").unwrap();
             assert_eq!(w_int_get_value(i), 3000);
             assert_eq!(w_int_get_value(acc), 3000);
         }
@@ -2686,8 +2700,8 @@ while i < 3000:
         let mut frame = PyFrame::new(code);
         let _ = eval_frame_plain(&mut frame);
         unsafe {
-            let i = *(*frame.namespace).get("i").unwrap();
-            let acc = *(*frame.namespace).get("acc").unwrap();
+            let i = *(*frame.w_globals).get("i").unwrap();
+            let acc = *(*frame.w_globals).get("acc").unwrap();
             assert_eq!(w_int_get_value(i), 3000);
             assert_eq!(w_int_get_value(acc), 3000);
         }
@@ -2709,8 +2723,8 @@ while i < 3000:
         let mut frame = PyFrame::new(code);
         let _ = eval_frame_plain(&mut frame);
         unsafe {
-            let i = *(*frame.namespace).get("i").unwrap();
-            let acc = *(*frame.namespace).get("acc").unwrap();
+            let i = *(*frame.w_globals).get("i").unwrap();
+            let acc = *(*frame.w_globals).get("acc").unwrap();
             assert_eq!(w_int_get_value(i), 3000);
             assert_eq!(w_int_get_value(acc), 3000);
         }
@@ -2730,8 +2744,8 @@ while i < 3000:
         let mut frame = PyFrame::new(code);
         let _ = eval_frame_plain(&mut frame);
         unsafe {
-            let i = *(*frame.namespace).get("i").unwrap();
-            let acc = *(*frame.namespace).get("acc").unwrap();
+            let i = *(*frame.w_globals).get("i").unwrap();
+            let acc = *(*frame.w_globals).get("acc").unwrap();
             assert_eq!(w_int_get_value(i), 3000);
             assert_eq!(w_int_get_value(acc), 3000);
         }
@@ -2750,8 +2764,8 @@ while i < 3000:
         let mut frame = PyFrame::new(code);
         let _ = eval_frame_plain(&mut frame);
         unsafe {
-            let i = *(*frame.namespace).get("i").unwrap();
-            let acc = *(*frame.namespace).get("acc").unwrap();
+            let i = *(*frame.w_globals).get("i").unwrap();
+            let acc = *(*frame.w_globals).get("acc").unwrap();
             assert_eq!(w_int_get_value(i), 3000);
             assert_eq!(w_int_get_value(acc), 12_000);
         }
@@ -2770,8 +2784,8 @@ while i < 3000:
         let mut frame = PyFrame::new(code);
         let _ = eval_frame_plain(&mut frame);
         unsafe {
-            let i = *(*frame.namespace).get("i").unwrap();
-            let acc = *(*frame.namespace).get("acc").unwrap();
+            let i = *(*frame.w_globals).get("i").unwrap();
+            let acc = *(*frame.w_globals).get("acc").unwrap();
             assert_eq!(w_int_get_value(i), 3000);
             assert_eq!(w_int_get_value(acc), 6_000);
         }
@@ -2791,8 +2805,8 @@ while i < 3000:
         let mut frame = PyFrame::new(code);
         let _ = eval_frame_plain(&mut frame);
         unsafe {
-            let i = *(*frame.namespace).get("i").unwrap();
-            let acc = *(*frame.namespace).get("acc").unwrap();
+            let i = *(*frame.w_globals).get("i").unwrap();
+            let acc = *(*frame.w_globals).get("acc").unwrap();
             assert_eq!(w_int_get_value(i), 3000);
             assert_eq!(w_int_get_value(acc), 3000);
         }
@@ -2814,8 +2828,8 @@ while i < 3000:
         let mut frame = PyFrame::new(code);
         let _ = eval_frame_plain(&mut frame);
         unsafe {
-            let i = *(*frame.namespace).get("i").unwrap();
-            let acc = *(*frame.namespace).get("acc").unwrap();
+            let i = *(*frame.w_globals).get("i").unwrap();
+            let acc = *(*frame.w_globals).get("acc").unwrap();
             assert_eq!(w_int_get_value(i), 3000);
             assert_eq!(w_int_get_value(acc), 6000);
         }
@@ -2835,8 +2849,8 @@ while i < 3000:
         let mut frame = PyFrame::new(code);
         let _ = eval_frame_plain(&mut frame);
         unsafe {
-            let i = *(*frame.namespace).get("i").unwrap();
-            let acc = *(*frame.namespace).get("acc").unwrap();
+            let i = *(*frame.w_globals).get("i").unwrap();
+            let acc = *(*frame.w_globals).get("acc").unwrap();
             assert_eq!(w_int_get_value(i), 3000);
             assert_eq!(w_int_get_value(acc), 3000);
         }
@@ -2854,8 +2868,8 @@ while i < 3000:
         let mut frame = PyFrame::new(code);
         let _ = eval_frame_plain(&mut frame);
         unsafe {
-            let i = *(*frame.namespace).get("i").unwrap();
-            let acc = *(*frame.namespace).get("acc").unwrap();
+            let i = *(*frame.w_globals).get("i").unwrap();
+            let acc = *(*frame.w_globals).get("acc").unwrap();
             assert_eq!(w_int_get_value(i), 3000);
             assert_eq!(w_int_get_value(acc), 6426);
         }
@@ -2873,8 +2887,8 @@ while i < 3000:
         let mut frame = PyFrame::new(code);
         let _ = eval_frame_plain(&mut frame);
         unsafe {
-            let i = *(*frame.namespace).get("i").unwrap();
-            let acc = *(*frame.namespace).get("acc").unwrap();
+            let i = *(*frame.w_globals).get("i").unwrap();
+            let acc = *(*frame.w_globals).get("acc").unwrap();
             assert_eq!(w_int_get_value(i), 3000);
             assert_eq!(w_int_get_value(acc), 11568);
         }
@@ -2896,8 +2910,8 @@ while i < 3000:
         let mut frame = PyFrame::new(code);
         let _ = eval_frame_plain(&mut frame);
         unsafe {
-            let i = *(*frame.namespace).get("i").unwrap();
-            let acc = *(*frame.namespace).get("acc").unwrap();
+            let i = *(*frame.w_globals).get("i").unwrap();
+            let acc = *(*frame.w_globals).get("acc").unwrap();
             assert_eq!(w_int_get_value(i), 3000);
             assert_eq!(w_int_get_value(acc), 3000);
         }
@@ -2917,9 +2931,9 @@ while i < 3000:
         let mut frame = PyFrame::new(code);
         let _ = eval_frame_plain(&mut frame);
         unsafe {
-            let i = *(*frame.namespace).get("i").unwrap();
-            let acc = *(*frame.namespace).get("acc").unwrap();
-            let lst = *(*frame.namespace).get("lst").unwrap();
+            let i = *(*frame.w_globals).get("i").unwrap();
+            let acc = *(*frame.w_globals).get("acc").unwrap();
+            let lst = *(*frame.w_globals).get("lst").unwrap();
             assert_eq!(w_int_get_value(i), 3000);
             assert_eq!(w_int_get_value(acc), 4_498_500);
             assert_eq!(w_int_get_value(w_list_getitem(lst, -1).unwrap()), 2999);
@@ -2939,8 +2953,8 @@ while i < 3000:
         let mut frame = PyFrame::new(code);
         let _ = eval_frame_plain(&mut frame);
         unsafe {
-            let i = *(*frame.namespace).get("i").unwrap();
-            let acc = *(*frame.namespace).get("acc").unwrap();
+            let i = *(*frame.w_globals).get("i").unwrap();
+            let acc = *(*frame.w_globals).get("acc").unwrap();
             assert_eq!(w_int_get_value(i), 3000);
             assert_eq!(w_int_get_value(acc), 15_000);
         }
@@ -2960,8 +2974,8 @@ while i < 3000:
         let mut frame = PyFrame::new(code);
         let _ = eval_frame_plain(&mut frame);
         unsafe {
-            let i = *(*frame.namespace).get("i").unwrap();
-            let acc = *(*frame.namespace).get("acc").unwrap();
+            let i = *(*frame.w_globals).get("i").unwrap();
+            let acc = *(*frame.w_globals).get("acc").unwrap();
             assert_eq!(w_int_get_value(i), 3000);
             assert_eq!(w_int_get_value(acc), 4_501_500);
         }
@@ -2974,7 +2988,7 @@ while i < 3000:
         let mut frame = PyFrame::new(code);
         let _ = eval_frame_plain(&mut frame);
         unsafe {
-            let s = *(*frame.namespace).get("s").unwrap();
+            let s = *(*frame.w_globals).get("s").unwrap();
             assert_eq!(w_int_get_value(s), 35);
         }
     }
@@ -2986,7 +3000,7 @@ while i < 3000:
         let mut frame = PyFrame::new(code);
         let _ = eval_frame_plain(&mut frame);
         unsafe {
-            let s = *(*frame.namespace).get("s").unwrap();
+            let s = *(*frame.w_globals).get("s").unwrap();
             // 0 + 2 + 4 + 6 + 8 = 20
             assert_eq!(w_int_get_value(s), 20);
         }
@@ -2999,7 +3013,7 @@ while i < 3000:
         let mut frame = PyFrame::new(code);
         let _ = eval_frame_plain(&mut frame);
         unsafe {
-            let s = *(*frame.namespace).get("s").unwrap();
+            let s = *(*frame.w_globals).get("s").unwrap();
             assert_eq!(w_int_get_value(s), 42);
         }
     }
@@ -3011,7 +3025,7 @@ while i < 3000:
         let mut frame = PyFrame::new(code);
         let _ = eval_frame_plain(&mut frame);
         unsafe {
-            let s = *(*frame.namespace).get("s").unwrap();
+            let s = *(*frame.w_globals).get("s").unwrap();
             // 0 + 1 + 2 + 3 + 4 = 10
             assert_eq!(w_int_get_value(s), 10);
         }
@@ -3026,7 +3040,7 @@ while i < 3000:
         let mut frame = PyFrame::new(code);
         let _ = eval_frame_plain(&mut frame);
         unsafe {
-            let x = *(*frame.namespace).get("x").unwrap();
+            let x = *(*frame.w_globals).get("x").unwrap();
             assert_eq!(w_int_get_value(x), 3);
         }
     }
@@ -3038,7 +3052,7 @@ while i < 3000:
         let mut frame = PyFrame::new(code);
         let _ = eval_frame_plain(&mut frame);
         unsafe {
-            let x = *(*frame.namespace).get("x").unwrap();
+            let x = *(*frame.w_globals).get("x").unwrap();
             assert_eq!(w_int_get_value(x), 5);
         }
     }
@@ -3050,8 +3064,8 @@ while i < 3000:
         let mut frame = PyFrame::new(code);
         let _ = eval_frame_plain(&mut frame);
         unsafe {
-            let a = *(*frame.namespace).get("a").unwrap();
-            let b = *(*frame.namespace).get("b").unwrap();
+            let a = *(*frame.w_globals).get("a").unwrap();
+            let b = *(*frame.w_globals).get("b").unwrap();
             assert_eq!(w_int_get_value(a), 3);
             assert_eq!(w_int_get_value(b), 7);
         }
@@ -3064,7 +3078,7 @@ while i < 3000:
         let source = "x = [1, 2, 3]";
         let (_, frame) = run_exec_frame(source);
         unsafe {
-            let x = *(*frame.namespace).get("x").unwrap();
+            let x = *(*frame.w_globals).get("x").unwrap();
             assert!(is_list(x));
             assert_eq!(w_list_len(x), 3);
             assert_eq!(w_int_get_value(w_list_getitem(x, 0).unwrap()), 1);
@@ -3078,8 +3092,8 @@ while i < 3000:
         let source = "a, b = 1, 2";
         let (_, frame) = run_exec_frame(source);
         unsafe {
-            let a = *(*frame.namespace).get("a").unwrap();
-            let b = *(*frame.namespace).get("b").unwrap();
+            let a = *(*frame.w_globals).get("a").unwrap();
+            let b = *(*frame.w_globals).get("b").unwrap();
             assert_eq!(w_int_get_value(a), 1);
             assert_eq!(w_int_get_value(b), 2);
         }
@@ -3090,7 +3104,7 @@ while i < 3000:
         let source = "lst = [10, 20, 30]\nx = lst[1]";
         let (_, frame) = run_exec_frame(source);
         unsafe {
-            let x = *(*frame.namespace).get("x").unwrap();
+            let x = *(*frame.w_globals).get("x").unwrap();
             assert_eq!(w_int_get_value(x), 20);
         }
     }
@@ -3100,7 +3114,7 @@ while i < 3000:
         let source = "lst = [1, 2, 3]\nlst[0] = 99\nx = lst[0]";
         let (_, frame) = run_exec_frame(source);
         unsafe {
-            let x = *(*frame.namespace).get("x").unwrap();
+            let x = *(*frame.w_globals).get("x").unwrap();
             assert_eq!(w_int_get_value(x), 99);
         }
     }
@@ -3110,7 +3124,7 @@ while i < 3000:
         let source = "d = {1: 10, 2: 20}\nx = d[1]";
         let (_, frame) = run_exec_frame(source);
         unsafe {
-            let x = *(*frame.namespace).get("x").unwrap();
+            let x = *(*frame.w_globals).get("x").unwrap();
             assert_eq!(w_int_get_value(x), 10);
         }
     }
@@ -3122,7 +3136,7 @@ while i < 3000:
         let source = "def double(x):\n    return x * 2\nresult = double(21)";
         let (_, frame) = run_exec_frame(source);
         unsafe {
-            let result = *(*frame.namespace).get("result").unwrap();
+            let result = *(*frame.w_globals).get("result").unwrap();
             assert_eq!(w_int_get_value(result), 42);
         }
     }
@@ -3137,7 +3151,7 @@ def add_squares(a, b):
 result = add_squares(3, 4)";
         let (_, frame) = run_exec_frame(source);
         unsafe {
-            let result = *(*frame.namespace).get("result").unwrap();
+            let result = *(*frame.w_globals).get("result").unwrap();
             assert_eq!(w_int_get_value(result), 25);
         }
     }
@@ -3152,7 +3166,7 @@ def factorial(n):
 result = factorial(5)";
         let (_, frame) = run_exec_frame(source);
         unsafe {
-            let result = *(*frame.namespace).get("result").unwrap();
+            let result = *(*frame.w_globals).get("result").unwrap();
             assert_eq!(w_int_get_value(result), 120);
         }
     }
@@ -3168,7 +3182,7 @@ f.x = 42
 result = f.x";
         let (_, frame) = run_exec_frame(source);
         unsafe {
-            let result = *(*frame.namespace).get("result").unwrap();
+            let result = *(*frame.w_globals).get("result").unwrap();
             assert_eq!(w_int_get_value(result), 42);
         }
     }
@@ -3183,7 +3197,7 @@ f.b = 20
 result = f.a + f.b";
         let (_, frame) = run_exec_frame(source);
         unsafe {
-            let result = *(*frame.namespace).get("result").unwrap();
+            let result = *(*frame.w_globals).get("result").unwrap();
             assert_eq!(w_int_get_value(result), 30);
         }
     }
@@ -3198,7 +3212,7 @@ f.x = 2
 result = f.x";
         let (_, frame) = run_exec_frame(source);
         unsafe {
-            let result = *(*frame.namespace).get("result").unwrap();
+            let result = *(*frame.w_globals).get("result").unwrap();
             assert_eq!(w_int_get_value(result), 2);
         }
     }
@@ -3215,7 +3229,7 @@ g.x = 20
 result = f.x + g.x";
         let (_, frame) = run_exec_frame(source);
         unsafe {
-            let result = *(*frame.namespace).get("result").unwrap();
+            let result = *(*frame.w_globals).get("result").unwrap();
             assert_eq!(w_int_get_value(result), 30);
         }
     }
@@ -3228,7 +3242,7 @@ result = f.x + g.x";
         let (res, frame) = run_exec_frame(source);
         res.expect("exec failed");
         unsafe {
-            let result = *(*frame.namespace).get("result").unwrap();
+            let result = *(*frame.w_globals).get("result").unwrap();
             assert!(w_bool_get_value(result), "1 in [1,2,3] should be True");
         }
     }
@@ -3238,7 +3252,7 @@ result = f.x + g.x";
         let source = "result = 4 not in [1, 2, 3]";
         let (_, frame) = run_exec_frame(source);
         unsafe {
-            let result = *(*frame.namespace).get("result").unwrap();
+            let result = *(*frame.w_globals).get("result").unwrap();
             assert!(w_bool_get_value(result));
         }
     }
@@ -3264,7 +3278,7 @@ result = f.x + g.x";
         let source = "x = 42\nresult = f'val={x}'";
         let (_, frame) = run_exec_frame(source);
         unsafe {
-            let result = *(*frame.namespace).get("result").unwrap();
+            let result = *(*frame.w_globals).get("result").unwrap();
             assert_eq!(w_str_get_value(result), "val=42");
         }
     }
@@ -3275,7 +3289,7 @@ result = f.x + g.x";
         let (res, frame) = run_exec_frame(source);
         match res {
             Ok(_) => unsafe {
-                let result = *(*frame.namespace).get("result").unwrap();
+                let result = *(*frame.w_globals).get("result").unwrap();
                 assert!(is_list(result), "slice result should be list");
                 assert_eq!(w_list_len(result), 2);
                 assert_eq!(w_int_get_value(w_list_getitem(result, 0).unwrap()), 2);
@@ -3317,7 +3331,7 @@ result = f.x + g.x";
         let (res, frame) = run_exec_frame(source);
         res.expect("f-string exec failed");
         unsafe {
-            let result = *(*frame.namespace).get("result").unwrap();
+            let result = *(*frame.w_globals).get("result").unwrap();
             assert_eq!(w_str_get_value(result), "10 + 20 = 30");
         }
     }
@@ -3328,7 +3342,7 @@ result = f.x + g.x";
         let (res, frame) = run_exec_frame(source);
         res.expect("string contains failed");
         unsafe {
-            let result = *(*frame.namespace).get("result").unwrap();
+            let result = *(*frame.w_globals).get("result").unwrap();
             assert!(w_bool_get_value(result));
         }
     }
@@ -3339,7 +3353,7 @@ result = f.x + g.x";
         let (res, frame) = run_exec_frame(source);
         res.expect("tuple contains failed");
         unsafe {
-            let result = *(*frame.namespace).get("result").unwrap();
+            let result = *(*frame.w_globals).get("result").unwrap();
             assert!(w_bool_get_value(result));
         }
     }
@@ -3350,7 +3364,7 @@ result = f.x + g.x";
         let (res, frame) = run_exec_frame(source);
         res.expect("not in failed");
         unsafe {
-            let result = *(*frame.namespace).get("result").unwrap();
+            let result = *(*frame.w_globals).get("result").unwrap();
             assert!(w_bool_get_value(result));
         }
     }
@@ -3361,7 +3375,7 @@ result = f.x + g.x";
         let (res, frame) = run_exec_frame(source);
         res.expect("is not None failed");
         unsafe {
-            let result = *(*frame.namespace).get("result").unwrap();
+            let result = *(*frame.w_globals).get("result").unwrap();
             assert!(w_bool_get_value(result));
         }
     }
@@ -3372,7 +3386,7 @@ result = f.x + g.x";
         let (res, frame) = run_exec_frame(source);
         res.expect("negative slice failed");
         unsafe {
-            let result = *(*frame.namespace).get("result").unwrap();
+            let result = *(*frame.w_globals).get("result").unwrap();
             assert!(is_list(result));
             assert_eq!(w_list_len(result), 3);
         }
@@ -3387,7 +3401,7 @@ result = add(add(1, 2), add(3, 4))";
         let (res, frame) = run_exec_frame(source);
         res.expect("nested call failed");
         unsafe {
-            let result = *(*frame.namespace).get("result").unwrap();
+            let result = *(*frame.w_globals).get("result").unwrap();
             assert_eq!(w_int_get_value(result), 10);
         }
     }
@@ -3404,7 +3418,7 @@ result = x";
         let (res, frame) = run_exec_frame(source);
         res.expect("while+break failed");
         unsafe {
-            let result = *(*frame.namespace).get("result").unwrap();
+            let result = *(*frame.w_globals).get("result").unwrap();
             assert_eq!(w_int_get_value(result), 5);
         }
     }
@@ -3415,7 +3429,7 @@ result = x";
         let (res, frame) = run_exec_frame(source);
         res.expect("inplace add failed");
         unsafe {
-            let result = *(*frame.namespace).get("result").unwrap();
+            let result = *(*frame.w_globals).get("result").unwrap();
             assert_eq!(w_int_get_value(result), 15);
         }
     }
@@ -3430,7 +3444,7 @@ for c in 'hello':
         let (res, frame) = run_exec_frame(source);
         res.expect("string iteration failed");
         unsafe {
-            let result = *(*frame.namespace).get("result").unwrap();
+            let result = *(*frame.w_globals).get("result").unwrap();
             assert_eq!(w_str_get_value(result), "hello");
         }
     }
@@ -3446,7 +3460,7 @@ result = count";
         let (res, frame) = run_exec_frame(source);
         res.expect("enumerate style failed");
         unsafe {
-            let result = *(*frame.namespace).get("result").unwrap();
+            let result = *(*frame.w_globals).get("result").unwrap();
             assert_eq!(w_int_get_value(result), 3);
         }
     }
@@ -3462,7 +3476,7 @@ for i in [1, 2, 3]:
         let (res, frame) = run_exec_frame(source);
         res.expect("nested for failed");
         unsafe {
-            let result = *(*frame.namespace).get("result").unwrap();
+            let result = *(*frame.w_globals).get("result").unwrap();
             // 1*10 + 1*20 + 2*10 + 2*20 + 3*10 + 3*20 = 10+20+20+40+30+60 = 180
             assert_eq!(w_int_get_value(result), 180);
         }
@@ -3480,7 +3494,7 @@ result = x";
         let (res, frame) = run_exec_frame(source);
         match res {
             Ok(_) => unsafe {
-                let result = *(*frame.namespace).get("result").unwrap();
+                let result = *(*frame.w_globals).get("result").unwrap();
                 assert_eq!(w_int_get_value(result), 42);
             },
             Err(e) => panic!("try/except failed: {} ({:?})", e.message, e.kind),
@@ -3498,7 +3512,7 @@ result = fib(10)";
         let (res, frame) = run_exec_frame(source);
         res.expect("fib failed");
         unsafe {
-            let r = *(*frame.namespace).get("result").unwrap();
+            let r = *(*frame.w_globals).get("result").unwrap();
             assert_eq!(w_int_get_value(r), 55);
         }
     }
@@ -3526,7 +3540,7 @@ result = fib(10)";
         let (res, frame) = run_exec_frame(source);
         res.expect("negative index failed");
         unsafe {
-            let r = *(*frame.namespace).get("result").unwrap();
+            let r = *(*frame.w_globals).get("result").unwrap();
             assert_eq!(w_int_get_value(r), 30);
         }
     }
@@ -3537,7 +3551,7 @@ result = fib(10)";
         let (res, frame) = run_exec_frame(source);
         res.expect("boolean and failed");
         unsafe {
-            let r = *(*frame.namespace).get("result").unwrap();
+            let r = *(*frame.w_globals).get("result").unwrap();
             assert!(!crate::baseobjspace::is_true(r));
         }
     }
@@ -3548,7 +3562,7 @@ result = fib(10)";
         let (res, frame) = run_exec_frame(source);
         match res {
             Ok(_) => unsafe {
-                let r = *(*frame.namespace).get("result").unwrap();
+                let r = *(*frame.w_globals).get("result").unwrap();
                 assert!(w_bool_get_value(r));
             },
             Err(e) => eprintln!("chained comparison: {}", e.message),
@@ -3567,7 +3581,7 @@ except ZeroDivisionError:
         let (res, frame) = run_exec_frame(source);
         match res {
             Ok(_) => unsafe {
-                let r = *(*frame.namespace).get("result").unwrap();
+                let r = *(*frame.w_globals).get("result").unwrap();
                 assert_eq!(w_int_get_value(r), 99);
             },
             Err(e) => panic!("specific except failed: {} ({:?})", e.message, e.kind),
@@ -3601,7 +3615,7 @@ finally:
         let (res, frame) = run_exec_frame(source);
         match res {
             Ok(_) => unsafe {
-                let r = *(*frame.namespace).get("result").unwrap();
+                let r = *(*frame.w_globals).get("result").unwrap();
                 assert_eq!(w_int_get_value(r), 11);
             },
             Err(e) => panic!("try/finally failed: {} ({:?})", e.message, e.kind),
@@ -3621,7 +3635,7 @@ result = result + 10
         let (res, frame) = run_exec_frame(source);
         res.expect("multiple except failed");
         unsafe {
-            let r = *(*frame.namespace).get("result").unwrap();
+            let r = *(*frame.w_globals).get("result").unwrap();
             assert_eq!(w_int_get_value(r), 11);
         }
     }
@@ -3638,7 +3652,7 @@ for x in [1, 2, 3, 4, 5]:
         let (res, frame) = run_exec_frame(source);
         res.expect("for+continue failed");
         unsafe {
-            let r = *(*frame.namespace).get("result").unwrap();
+            let r = *(*frame.w_globals).get("result").unwrap();
             // 1 + 2 + 4 + 5 = 12 (skips 3)
             assert_eq!(w_int_get_value(r), 12);
         }
@@ -3654,7 +3668,7 @@ result = greet('world')
         let (res, frame) = run_exec_frame(source);
         match res {
             Ok(_) => unsafe {
-                let r = *(*frame.namespace).get("result").unwrap();
+                let r = *(*frame.w_globals).get("result").unwrap();
                 assert_eq!(w_str_get_value(r), "hello");
             },
             Err(e) => {
@@ -3670,7 +3684,7 @@ result = greet('world')
         let (res, frame) = run_exec_frame(source);
         match res {
             Ok(_) => unsafe {
-                let result = *(*frame.namespace).get("result").unwrap();
+                let result = *(*frame.w_globals).get("result").unwrap();
                 assert!(is_list(result));
                 // After += [3], x should have 3 elements
                 assert_eq!(w_list_len(result), 3);
@@ -3689,7 +3703,7 @@ result = total";
         let (res, frame) = run_exec_frame(source);
         res.expect("for loop failed");
         unsafe {
-            let result = *(*frame.namespace).get("result").unwrap();
+            let result = *(*frame.w_globals).get("result").unwrap();
             assert_eq!(w_int_get_value(result), 15);
         }
     }
@@ -3703,7 +3717,7 @@ for c in 'abc':
         let (res, frame) = run_exec_frame(source);
         match res {
             Ok(_) => unsafe {
-                let result = *(*frame.namespace).get("result").unwrap();
+                let result = *(*frame.w_globals).get("result").unwrap();
                 assert_eq!(w_int_get_value(result), 3);
             },
             Err(e) => {
@@ -3719,7 +3733,7 @@ for c in 'abc':
         let (res, frame) = run_exec_frame(source);
         res.expect("multiple assign failed");
         unsafe {
-            let result = *(*frame.namespace).get("result").unwrap();
+            let result = *(*frame.w_globals).get("result").unwrap();
             assert_eq!(w_int_get_value(result), 84);
         }
     }
@@ -3737,7 +3751,7 @@ result = add5(10)";
         let (res, frame) = run_exec_frame(source);
         match res {
             Ok(_) => unsafe {
-                let r = *(*frame.namespace).get("result").unwrap();
+                let r = *(*frame.w_globals).get("result").unwrap();
                 assert_eq!(w_int_get_value(r), 15);
             },
             Err(e) => panic!("closure failed: {} ({:?})", e.message, e.kind),
@@ -3750,7 +3764,7 @@ result = add5(10)";
         let (res, frame) = run_exec_frame(source);
         res.expect("tuple unpack failed");
         unsafe {
-            let r = *(*frame.namespace).get("result").unwrap();
+            let r = *(*frame.w_globals).get("result").unwrap();
             assert_eq!(w_int_get_value(r), 6);
         }
     }
@@ -3761,7 +3775,7 @@ result = add5(10)";
         let (res, frame) = run_exec_frame(source);
         res.expect("dict access failed");
         unsafe {
-            let r = *(*frame.namespace).get("result").unwrap();
+            let r = *(*frame.w_globals).get("result").unwrap();
             assert_eq!(w_int_get_value(r), 30);
         }
     }
@@ -3772,7 +3786,7 @@ result = add5(10)";
         let (res, frame) = run_exec_frame(source);
         res.expect("string len failed");
         unsafe {
-            let r = *(*frame.namespace).get("result").unwrap();
+            let r = *(*frame.w_globals).get("result").unwrap();
             assert_eq!(w_int_get_value(r), 5);
         }
     }
@@ -3822,7 +3836,7 @@ for x in [1, 2, 3]:
         let (res, frame) = run_exec_frame(source);
         match res {
             Ok(_) => unsafe {
-                let result = *(*frame.namespace).get("result").unwrap();
+                let result = *(*frame.w_globals).get("result").unwrap();
                 assert!(is_list(result));
                 assert_eq!(w_list_len(result), 3);
                 assert_eq!(w_int_get_value(w_list_getitem(result, 0).unwrap()), 2);
@@ -3839,7 +3853,7 @@ for x in [1, 2, 3]:
         let (res, frame) = run_exec_frame(source);
         res.expect("globals() failed");
         unsafe {
-            let result = *(*frame.namespace).get("result").unwrap();
+            let result = *(*frame.w_globals).get("result").unwrap();
             assert_eq!(w_int_get_value(result), 42);
         }
     }
@@ -3854,7 +3868,7 @@ result = f(2, 3)";
         let (res, frame) = run_exec_frame(source);
         res.expect("locals() in function failed");
         unsafe {
-            let result = *(*frame.namespace).get("result").unwrap();
+            let result = *(*frame.w_globals).get("result").unwrap();
             assert_eq!(w_int_get_value(result), 10);
         }
     }
@@ -3870,7 +3884,7 @@ result = C.snap['y'] + globals()['x']";
         let (res, frame) = run_exec_frame(source);
         res.expect("locals() in class failed");
         unsafe {
-            let result = *(*frame.namespace).get("result").unwrap();
+            let result = *(*frame.w_globals).get("result").unwrap();
             assert_eq!(w_int_get_value(result), 3);
         }
     }
@@ -3887,7 +3901,7 @@ result = m(41)";
         let (res, frame) = run_exec_frame(source);
         res.expect("bound method lookup failed");
         unsafe {
-            let result = *(*frame.namespace).get("result").unwrap();
+            let result = *(*frame.w_globals).get("result").unwrap();
             assert_eq!(w_int_get_value(result), 42);
         }
     }
@@ -3903,8 +3917,8 @@ m = c.add";
         let (res, frame) = run_exec_frame(source);
         res.expect("bound method lookup setup failed");
         unsafe {
-            let c_obj = *(*frame.namespace).get("c").unwrap();
-            let m_obj = *(*frame.namespace).get("m").unwrap();
+            let c_obj = *(*frame.w_globals).get("c").unwrap();
+            let m_obj = *(*frame.w_globals).get("m").unwrap();
             assert!(pyre_object::is_method(m_obj));
             assert!(std::ptr::eq(pyre_object::w_method_get_self(m_obj), c_obj));
         }
@@ -3920,7 +3934,7 @@ result = len(xs)";
         let (res, frame) = run_exec_frame(source);
         res.expect("builtin type method lookup failed");
         unsafe {
-            let result = *(*frame.namespace).get("result").unwrap();
+            let result = *(*frame.w_globals).get("result").unwrap();
             assert_eq!(w_int_get_value(result), 1);
         }
     }
@@ -3935,7 +3949,7 @@ result = c.f([1, 2, 3])";
         let (res, frame) = run_exec_frame(source);
         res.expect("builtin function descriptor semantics failed");
         unsafe {
-            let result = *(*frame.namespace).get("result").unwrap();
+            let result = *(*frame.w_globals).get("result").unwrap();
             assert_eq!(w_int_get_value(result), 3);
         }
     }
@@ -3970,12 +3984,12 @@ except TypeError as e:
         let (res, frame) = run_exec_frame(source);
         res.expect("builtin_function typedef overrides failed");
         unsafe {
-            let _doc_value = *(*frame.namespace).get("doc_value").unwrap();
-            let self_is_none = *(*frame.namespace).get("self_is_none").unwrap();
-            let repr_result = *(*frame.namespace).get("repr_result").unwrap();
-            let new_err = *(*frame.namespace).get("new_err").unwrap();
-            let set_err = *(*frame.namespace).get("set_err").unwrap();
-            let del_err = *(*frame.namespace).get("del_err").unwrap();
+            let _doc_value = *(*frame.w_globals).get("doc_value").unwrap();
+            let self_is_none = *(*frame.w_globals).get("self_is_none").unwrap();
+            let repr_result = *(*frame.w_globals).get("repr_result").unwrap();
+            let new_err = *(*frame.w_globals).get("new_err").unwrap();
+            let set_err = *(*frame.w_globals).get("set_err").unwrap();
+            let del_err = *(*frame.w_globals).get("del_err").unwrap();
             assert!(w_bool_get_value(self_is_none));
             assert_eq!(w_str_get_value(repr_result), "<built-in function len>");
             assert_eq!(
@@ -4009,9 +4023,9 @@ manual_result = len(manual)";
         let (res, frame) = run_exec_frame(source);
         res.expect("set constructor parity failed");
         unsafe {
-            let is_subtype = *(*frame.namespace).get("is_subtype").unwrap();
-            let result = *(*frame.namespace).get("result").unwrap();
-            let manual_result = *(*frame.namespace).get("manual_result").unwrap();
+            let is_subtype = *(*frame.w_globals).get("is_subtype").unwrap();
+            let result = *(*frame.w_globals).get("result").unwrap();
+            let manual_result = *(*frame.w_globals).get("manual_result").unwrap();
             assert!(w_bool_get_value(is_subtype));
             assert_eq!(w_int_get_value(result), 3);
             assert_eq!(w_int_get_value(manual_result), 2);
@@ -4031,9 +4045,9 @@ result = len(sub)";
         let (res, frame) = run_exec_frame(source);
         res.expect("frozenset constructor parity failed");
         unsafe {
-            let same = *(*frame.namespace).get("same").unwrap();
-            let is_subtype = *(*frame.namespace).get("is_subtype").unwrap();
-            let result = *(*frame.namespace).get("result").unwrap();
+            let same = *(*frame.w_globals).get("same").unwrap();
+            let is_subtype = *(*frame.w_globals).get("is_subtype").unwrap();
+            let result = *(*frame.w_globals).get("result").unwrap();
             assert!(w_bool_get_value(same));
             assert!(w_bool_get_value(is_subtype));
             assert_eq!(w_int_get_value(result), 3);
@@ -4072,10 +4086,10 @@ except TypeError as e:
         let (res, frame) = run_exec_frame(source);
         res.expect("set/frozenset arity enforcement failed");
         unsafe {
-            let init_err = *(*frame.namespace).get("init_err").unwrap();
-            let init_direct_err = *(*frame.namespace).get("init_direct_err").unwrap();
-            let frozen_err = *(*frame.namespace).get("frozen_err").unwrap();
-            let frozen_new_err = *(*frame.namespace).get("frozen_new_err").unwrap();
+            let init_err = *(*frame.w_globals).get("init_err").unwrap();
+            let init_direct_err = *(*frame.w_globals).get("init_direct_err").unwrap();
+            let frozen_err = *(*frame.w_globals).get("frozen_err").unwrap();
+            let frozen_new_err = *(*frame.w_globals).get("frozen_new_err").unwrap();
             assert!(
                 !w_str_get_value(init_err).is_empty(),
                 "set([1], 2) should raise TypeError"
@@ -4115,8 +4129,8 @@ except TypeError as e:
         let (res, frame) = run_exec_frame(source);
         res.expect("layout safety check failed");
         unsafe {
-            let err = *(*frame.namespace).get("err").unwrap();
-            let frozen_err = *(*frame.namespace).get("frozen_err").unwrap();
+            let err = *(*frame.w_globals).get("err").unwrap();
+            let frozen_err = *(*frame.w_globals).get("frozen_err").unwrap();
             assert!(
                 !w_str_get_value(err).is_empty(),
                 "set.__new__(int) should raise TypeError"
@@ -4140,8 +4154,8 @@ bound = C.pick
 result = bound()";
         let (res, frame) = run_exec_frame(source);
         res.expect("metaclass descriptor lookup failed");
-        let result = unsafe { *(*frame.namespace).get("result").unwrap() };
-        let c_obj = unsafe { *(*frame.namespace).get("C").unwrap() };
+        let result = unsafe { *(*frame.w_globals).get("result").unwrap() };
+        let c_obj = unsafe { *(*frame.w_globals).get("C").unwrap() };
         assert!(std::ptr::eq(result, c_obj));
     }
 
@@ -4158,7 +4172,7 @@ result = C.value";
         let (res, frame) = run_exec_frame(source);
         res.expect("__prepare__ lookup failed");
         unsafe {
-            let result = *(*frame.namespace).get("result").unwrap();
+            let result = *(*frame.w_globals).get("result").unwrap();
             assert_eq!(w_int_get_value(result), 42);
         }
     }
@@ -4173,8 +4187,8 @@ g = f.__globals__
 code = f.__code__";
         let (res, frame) = run_exec_frame(source);
         res.expect("function dunder lookup failed");
-        let globals = unsafe { *(*frame.namespace).get("g").unwrap() };
-        let code = unsafe { *(*frame.namespace).get("code").unwrap() };
+        let globals = unsafe { *(*frame.w_globals).get("g").unwrap() };
+        let code = unsafe { *(*frame.w_globals).get("code").unwrap() };
         unsafe {
             let x = pyre_object::w_dict_lookup(globals, pyre_object::w_str_new("x")).unwrap();
             assert_eq!(w_int_get_value(x), 7);
@@ -4201,7 +4215,7 @@ except TypeError:
         let (res, frame) = run_exec_frame(source);
         res.expect("vars() exception path failed");
         unsafe {
-            let result = *(*frame.namespace).get("result").unwrap();
+            let result = *(*frame.w_globals).get("result").unwrap();
             assert_eq!(w_int_get_value(result), 1);
         }
     }
@@ -4217,7 +4231,7 @@ except TypeError:
         let (res, frame) = run_exec_frame(source);
         res.expect("type() exception path failed");
         unsafe {
-            let result = *(*frame.namespace).get("result").unwrap();
+            let result = *(*frame.w_globals).get("result").unwrap();
             assert_eq!(w_int_get_value(result), 1);
         }
     }

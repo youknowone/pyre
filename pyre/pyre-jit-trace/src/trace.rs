@@ -27,8 +27,8 @@ pub fn trace_bytecode(
     // RPython MetaInterp._interpret() parity: root frame owns a concrete
     // PyFrame snapshot. MetaInterp drives both symbolic tracing AND
     // concrete execution — the interpreter does not run during tracing.
-    concrete_frame.next_instr = start_pc;
-    let w_code = concrete_frame.code;
+    concrete_frame.set_last_instr_from_next_instr(start_pc);
+    let w_code = concrete_frame.pycode;
     let cf_addr = &*concrete_frame as *const pyre_interpreter::pyframe::PyFrame as usize;
     let frame = MetaInterpFrame {
         sym: sym as *mut PyreSym,

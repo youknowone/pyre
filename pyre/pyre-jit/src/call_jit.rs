@@ -38,7 +38,7 @@ fn debug_instruction_window(frame: &PyFrame) -> String {
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
     let mut out = String::new();
     let mut arg_state = OpArgState::default();
-    let current = frame.next_instr;
+    let current = frame.next_instr();
     let start = current.saturating_sub(6);
     let end = (current + 6).min(code.instructions.len());
     for idx in 0..code.instructions.len() {
@@ -126,14 +126,14 @@ pub(crate) fn recursive_force_cache_safe(callable: PyObjectRef) -> bool {
 /// frame's shared globals namespace. This lets eval-time function-entry
 /// tracing converge earlier, closer to PyPy's recursive functrace path.
 pub(crate) fn self_recursive_function_entry_candidate(frame: &PyFrame) -> bool {
-    if frame.next_instr != 0 {
+    if frame.next_instr() != 0 {
         return false;
     }
-    let namespace_ptr = frame.namespace;
+    let namespace_ptr = frame.w_globals;
     let Some(namespace) = (!namespace_ptr.is_null()).then_some(unsafe { &*namespace_ptr }) else {
         return false;
     };
-    let w_code = frame.code;
+    let w_code = frame.pycode;
 
     for idx in 0..namespace.len() {
         let Some(value) = namespace.get_slot(idx) else {
@@ -180,7 +180,7 @@ pub fn maybe_handle_inline_concrete_call(
         return None;
     }
     let callable_globals = unsafe { function_get_globals(callable) };
-    if callable_globals != frame.namespace || !unsafe { function_get_closure(callable) }.is_null() {
+    if callable_globals != frame.w_globals || !unsafe { function_get_closure(callable) }.is_null() {
         return None;
     }
 
@@ -198,7 +198,7 @@ pub fn maybe_handle_inline_concrete_call(
     // RPython blackhole.py:1095: bhimpl_recursive_call → portal_runner
     // CAN enter JIT. JIT_TRACING_DEPTH prevents re-entrant tracing,
     // so nested calls safely enter compiled code without force_plain_eval.
-    let forced = if w_code == frame.code {
+    let forced = if w_code == frame.pycode {
         jit_force_self_recursive_call_raw_1(frame as *const PyFrame as i64, raw_arg)
     } else {
         jit_force_recursive_call_raw_1(frame as *const PyFrame as i64, callable as i64, raw_arg)
@@ -268,8 +268,8 @@ pub fn arena_global_info() -> majit_backend_cranelift::InlineFrameArenaInfo {
         initialized_addr: unsafe { std::ptr::addr_of!(ARENA_INITIALIZED) as usize },
         frame_size: GC_HEADER_SIZE + std::mem::size_of::<pyre_interpreter::pyframe::PyFrame>(),
         gc_header_size: GC_HEADER_SIZE,
-        frame_code_offset: pyre_interpreter::pyframe::PYFRAME_CODE_OFFSET,
-        frame_next_instr_offset: pyre_interpreter::pyframe::PYFRAME_NEXT_INSTR_OFFSET,
+        frame_code_offset: pyre_interpreter::pyframe::PYFRAME_PYCODE_OFFSET,
+        frame_next_instr_offset: pyre_interpreter::pyframe::PYFRAME_LAST_INSTR_OFFSET,
         frame_vable_token_offset: pyre_interpreter::pyframe::PYFRAME_VABLE_TOKEN_OFFSET,
         create_fn_addr: jit_create_self_recursive_callee_frame_1_raw_int as *const () as usize,
         drop_fn_addr: jit_drop_callee_frame as *const () as usize,
@@ -441,8 +441,8 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
     let (code, namespace, exec_ctx) = unsafe {
         use pyre_interpreter::pyframe::*;
         let p = frame_ptr as *const u8;
-        let code = *(p.add(PYFRAME_CODE_OFFSET) as *const *const ());
-        let ns = *(p.add(std::mem::offset_of!(PyFrame, namespace))
+        let code = *(p.add(PYFRAME_PYCODE_OFFSET) as *const *const ());
+        let ns = *(p.add(std::mem::offset_of!(PyFrame, w_globals))
             as *const *mut pyre_interpreter::PyNamespace);
         let ec = *(p.add(std::mem::offset_of!(PyFrame, execution_context))
             as *const *const pyre_interpreter::PyExecutionContext);
@@ -513,7 +513,7 @@ fn jit_force_callee_frame_raw(frame_ptr: i64) -> i64 {
     let _suspend_inline_result = pyre_interpreter::call::suspend_inline_handled_result();
     let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
 
-    let green_key = crate::eval::make_green_key(frame.code, frame.next_instr);
+    let green_key = crate::eval::make_green_key(frame.pycode, frame.next_instr());
 
     let (driver, _) = crate::eval::driver_pair();
     if let Some(token) = driver.get_loop_token(green_key) {
@@ -525,7 +525,7 @@ fn jit_force_callee_frame_raw(frame_ptr: i64) -> i64 {
         };
         let mut inputs = vec![
             frame_ptr,
-            frame.next_instr as i64,
+            frame.last_instr as i64,
             frame.valuestackdepth as i64,
         ];
         for i in 0..nlocals {
@@ -566,7 +566,7 @@ extern "C" fn jit_force_callee_frame_interp(frame_ptr: i64) -> i64 {
     // RPython: blackhole interp — no blackhole_entry_bump needed.
     let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
 
-    let green_key = crate::eval::make_green_key(frame.code, frame.next_instr);
+    let green_key = crate::eval::make_green_key(frame.pycode, frame.next_instr());
 
     // warmspot.py:1021-1028 assembler_call_helper parity: calls
     // handle_fail → JitException → handle_jitexception, which handles
@@ -592,11 +592,11 @@ fn resolve_field_offset(owner: &str, field_name: &str) -> usize {
     // pyre: Rust struct layouts are resolved here via std::mem::offset_of!.
     match field_name {
         "execution_context" => std::mem::offset_of!(PyFrame, execution_context),
-        "code" => std::mem::offset_of!(PyFrame, code),
+        "code" | "pycode" => std::mem::offset_of!(PyFrame, pycode),
         "locals_cells_stack_w" => std::mem::offset_of!(PyFrame, locals_cells_stack_w),
         "valuestackdepth" => std::mem::offset_of!(PyFrame, valuestackdepth),
-        "next_instr" | "f_lasti" => std::mem::offset_of!(PyFrame, next_instr),
-        "namespace" => std::mem::offset_of!(PyFrame, namespace),
+        "next_instr" | "f_lasti" | "last_instr" => std::mem::offset_of!(PyFrame, last_instr),
+        "namespace" | "w_globals" => std::mem::offset_of!(PyFrame, w_globals),
         "vable_token" => std::mem::offset_of!(PyFrame, vable_token),
         _ => {
             if majit_metainterp::majit_log_enabled() {
@@ -641,7 +641,7 @@ pub(crate) fn bh_portal_runner(all_i: &[i64], all_r: &[i64], _all_f: &[i64]) -> 
     }
     let frame = unsafe { &mut *frame_ptr };
     // warmspot.py:976: set portal args on frame before dispatch.
-    frame.next_instr = next_instr;
+    frame.set_last_instr_from_next_instr(next_instr);
     crate::eval::portal_runner(frame) as i64
 }
 
@@ -665,7 +665,7 @@ fn blackhole_from_jit_frame(frame: &mut PyFrame) -> Option<PyObjectRef> {
     // via call_user_function_plain (no JIT re-entry), matching
     // RPython's cpu.bh_call_r plain stub semantics.
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
-    let py_pc = frame.next_instr;
+    let py_pc = frame.next_instr();
 
     // RPython: blackhole_from_resumedata() → setposition + consume_one_section
     // For pyre, we compile Python bytecodes to JitCode and load frame state.
@@ -680,7 +680,7 @@ fn blackhole_from_jit_frame(frame: &mut PyFrame) -> Option<PyObjectRef> {
         bh_store_subscr_fn,
         crate::call_jit::bh_build_list_fn,
     );
-    let pyjitcode = crate::jit::codewriter::get_jitcode(code, frame.code, &writer);
+    let pyjitcode = crate::jit::codewriter::get_jitcode(code, frame.pycode, &writer);
 
     // Map Python PC → JitCode PC.
     // resume.py:928/1338 parity: rd_numb pc is consumed as-is. RPython does
@@ -914,7 +914,7 @@ impl BlackholeResult {
 /// Each decoded frame section from rd_numb.
 pub struct ResumedFrame {
     /// resume.py:1050 jitcode_pos → jitcodes[jitcode_pos].
-    /// W_CodeObject pointer — same level as frame.code / getcode(func).
+    /// W_CodeObject pointer — same level as frame.pycode / getcode(func).
     pub code: *const (),
     /// resume.py:1050 pc (Python bytecode PC for blackhole setposition).
     pub py_pc: usize,
@@ -1518,7 +1518,7 @@ pub extern "C" fn jit_force_self_recursive_call_1(caller_frame: i64, boxed_arg: 
         return boxed_arg;
     }
     let caller = unsafe { &*(caller_frame as *const PyFrame) };
-    let green_key = crate::eval::make_green_key(caller.code, 0);
+    let green_key = crate::eval::make_green_key(caller.pycode, 0);
     // result_type=REF: arg is already boxed Ref
     let frame_ptr = create_self_recursive_callee_frame_impl_1_boxed(caller_frame, boxed_arg_ref);
     // blackhole.py:1101-1132 bhimpl_recursive_call_r: calls
@@ -1544,7 +1544,7 @@ pub extern "C" fn jit_force_self_recursive_call_argraw_boxed_1(
 ) -> i64 {
     let _suspend_inline_result = pyre_interpreter::call::suspend_inline_handled_result();
     let caller = unsafe { &*(caller_frame as *const PyFrame) };
-    let green_key = crate::eval::make_green_key(caller.code, 0);
+    let green_key = crate::eval::make_green_key(caller.pycode, 0);
     // result_type=REF: box the int arg, dispatch as boxed Ref
     let boxed = pyre_object::intobject::w_int_new(raw_int_arg);
     jit_force_self_recursive_call_1(caller_frame, boxed as i64)
@@ -1593,8 +1593,8 @@ pub extern "C" fn jit_force_recursive_call_raw_1(
 /// Unlike `jit_force_recursive_call_raw_1`, this does not need to rediscover
 /// the callee's code/globals from a function object on every call. The caller
 /// frame already carries the exact recursive target:
-/// - `caller.code` is the callee code object
-/// - `caller.namespace` is the module globals
+/// - `caller.pycode` is the callee code object
+/// - `caller.w_globals` is the module globals
 /// - `caller.execution_context` is the shared execution context
 ///
 /// Trace-time recursive CALL_ASSEMBLER handles the optimized path. The
@@ -1608,7 +1608,7 @@ pub extern "C" fn jit_force_self_recursive_call_raw_1(caller_frame: i64, raw_int
         eprintln!("[jit][force-self-recursive] enter arg={}", raw_int_arg);
     }
     let caller = unsafe { &*(caller_frame as *const PyFrame) };
-    let w_code = caller.code;
+    let w_code = caller.pycode;
     let green_key = crate::eval::make_green_key(w_code, 0);
     let _token_num = self_recursive_dispatch(green_key);
 
@@ -1698,7 +1698,7 @@ fn jit_blackhole_resume_from_guard(
     let actual_green_key = if green_key == 0 && num_fail_values >= 1 {
         let frame_ptr = fail_values[0] as *const pyre_interpreter::pyframe::PyFrame;
         if !frame_ptr.is_null() {
-            let code = unsafe { (*frame_ptr).code };
+            let code = unsafe { (*frame_ptr).pycode };
             crate::eval::make_green_key(code, 0)
         } else {
             green_key
@@ -2134,7 +2134,7 @@ pub fn trace_and_compile_from_bridge(
     if resume_pc == 0 {
         return false;
     }
-    frame.next_instr = resume_pc;
+    frame.set_last_instr_from_next_instr(resume_pc);
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
     let env = PyreEnv;
     let mut jit_state = build_jit_state(frame, info);
@@ -2424,15 +2424,14 @@ fn reset_reused_call_frame(frame: &mut PyFrame, args: &[PyObjectRef]) {
         frame.locals_w_mut()[idx] = *value;
     }
     frame.valuestackdepth = frame.stack_base();
-    frame.next_instr = 0;
-    frame.last_instr = -1;
+    frame.set_last_instr_from_next_instr(0);
     frame.vable_token = 0;
     // pyframe.py:80-81,86: new frame starts with debugdata=None, lastblock=None.
     // debugdata and lastblock are GC-managed refs — release references only,
     // never manually free (JIT snapshots may still hold these pointers).
-    frame.debugdata = 0;
+    frame.debugdata = std::ptr::null_mut();
     frame.escaped = false;
-    frame.clear_blocks();
+    frame.set_blocklist(&[]);
     frame.pending_inline_results.clear();
     frame.pending_inline_resume_pc = None;
 }
@@ -2450,8 +2449,8 @@ fn create_callee_frame_impl_1_boxed(
     if let Some((ptr, was_init)) = arena.take() {
         if was_init {
             let f = unsafe { &mut *ptr };
-            if f.code == w_code
-                && f.namespace == globals
+            if f.pycode == w_code
+                && f.w_globals == globals
                 && f.execution_context == caller.execution_context
             {
                 reset_reused_call_frame(f, &[boxed_arg]);
@@ -2500,16 +2499,16 @@ fn create_self_recursive_callee_frame_impl_1_boxed(
     boxed_arg: PyObjectRef,
 ) -> i64 {
     let caller = unsafe { &*(caller_frame as *const PyFrame) };
-    let func_code = caller.code;
-    let globals = caller.namespace;
+    let func_code = caller.pycode;
+    let globals = caller.w_globals;
     let execution_context = caller.execution_context;
 
     let arena = arena_ref();
     if let Some((ptr, was_init)) = arena.take() {
         if was_init {
             let f = unsafe { &mut *ptr };
-            if f.code == func_code
-                && f.namespace == globals
+            if f.pycode == func_code
+                && f.w_globals == globals
                 && f.execution_context == execution_context
             {
                 // Reuse: same code/globals/ec — full reset matching
@@ -2564,8 +2563,8 @@ fn create_callee_frame_impl(caller_frame: i64, callable: i64, args: &[PyObjectRe
             // code, execution_context, namespace, locals_cells_stack_w.ptr
             // are stable for self-recursion (same function, same module).
             let f = unsafe { &mut *ptr };
-            if f.code == w_code
-                && f.namespace == globals
+            if f.pycode == w_code
+                && f.w_globals == globals
                 && f.execution_context == caller.execution_context
             {
                 reset_reused_call_frame(f, args);
@@ -2649,8 +2648,8 @@ pub extern "C" fn jit_create_self_recursive_callee_frame_1_raw_int(
     raw_int_arg: i64,
 ) -> i64 {
     let caller = unsafe { &*(caller_frame as *const PyFrame) };
-    let func_code = caller.code;
-    let globals = caller.namespace;
+    let func_code = caller.pycode;
+    let globals = caller.w_globals;
     let execution_context = caller.execution_context;
 
     let boxed = pyre_object::intobject::w_int_new(raw_int_arg);
@@ -2659,8 +2658,8 @@ pub extern "C" fn jit_create_self_recursive_callee_frame_1_raw_int(
     if let Some((ptr, was_init)) = arena.take() {
         let f = unsafe { &mut *ptr };
         if was_init
-            && f.code == func_code
-            && f.namespace == globals
+            && f.pycode == func_code
+            && f.w_globals == globals
             && f.execution_context == execution_context
         {
             // Reuse: full reset matching new_for_call semantics.

@@ -52,33 +52,38 @@ pub struct PyFrame {
     /// Pointer to the Code object (W_CodeObject).
     ///
     /// PyPy: pyframe.py `self.pycode = code` — stores the PyCode instance.
-    /// Same pointer as `func.getcode()`, so `getcode(func) == frame.code`.
-    pub code: *const (),
+    /// Same pointer as `func.getcode()`, so `getcode(func) == frame.pycode`.
+    pub pycode: *const (),
     /// pypy/interpreter/pyframe.py:84,110-112 locals_cells_stack_w
     /// `[None] * size; make_sure_not_resized(...)` → fixed-length GcArray.
     pub locals_cells_stack_w: *mut FixedObjectArray,
     /// Absolute index into `locals_cells_stack_w` marking the top of the
     /// operand stack. Starts at `nlocals + ncells` (empty stack), grows upward.
     pub valuestackdepth: usize,
-    /// Index of the next instruction to execute.
-    pub next_instr: usize,
     /// pyframe.py:72 last_instr — index of the last executed instruction.
     /// PyPy initializes to -1; get_last_lineno uses this for offset2lineno.
     pub last_instr: isize,
-    /// Raw pointer to the shared globals namespace object.
-    /// All frames in the same module share the same globals.
-    pub namespace: *mut PyNamespace,
-    /// pyframe.py:82 debugdata — pointer to FrameDebugData or null.
+    /// pyframe.py:80 escaped — see mark_as_escaped()
+    pub escaped: bool,
+    /// pyframe.py:82 debugdata — lazily allocated tracing/debug payload.
     /// Virtualizable static field (interp_jit.py:28).
-    pub debugdata: usize,
-    /// pyframe.py:86 lastblock — pointer to top FrameBlock or null.
+    pub debugdata: *mut FrameDebugData,
+    /// pyframe.py:86 lastblock — head of the FrameBlock linked list.
     /// Virtualizable static field (interp_jit.py:29).
-    pub lastblock: usize,
+    pub lastblock: *mut FrameBlock,
+    /// pyframe.py:49 / interp_jit.py:31 w_globals.
+    pub w_globals: *mut PyNamespace,
     /// Virtualizable token — set by JIT when this frame is virtualized.
     /// 0 = not virtualized, nonzero = pointer to JIT state.
     pub vable_token: usize,
-    /// pyframe.py:80 escaped — see mark_as_escaped()
-    pub escaped: bool,
+    /// PyPy: `frame_finished_execution = False`.
+    pub frame_finished_execution: bool,
+    /// PyPy: `f_generator_nowref = None`.
+    pub f_generator_nowref: PyObjectRef,
+    /// PyPy: `w_yielding_from = None`.
+    pub w_yielding_from: PyObjectRef,
+    /// PyPy: `f_backref = jit.vref_None`.
+    pub f_backref: *mut PyFrame,
     /// Concrete inline-trace replay results owned by this frame.
     ///
     /// PyPy's `finishframe()` writes each child result into the parent in
@@ -95,13 +100,6 @@ pub struct PyFrame {
     /// protocol to the outermost interpreter loop without conflating it with
     /// unrelated next_instr changes.
     pub pending_inline_resume_pc: Option<usize>,
-    /// Optional class-body local namespace.
-    ///
-    /// PyPy equivalent: pyframe.py has separate `w_locals` and `w_globals`.
-    /// When set (non-null), STORE_NAME writes here instead of `namespace`,
-    /// and LOAD_NAME checks here first before falling back to `namespace`.
-    /// Used for class body execution where locals ≠ globals.
-    pub class_locals: *mut PyNamespace,
 }
 
 /// GC header size in bytes.  Matches `majit_gc::header::GcHeader::SIZE`.
@@ -147,50 +145,52 @@ pub unsafe fn dealloc_array_with_gc_header(ptr: *mut FixedObjectArray) {
     std::alloc::dealloc(raw, layout);
 }
 
+unsafe fn clone_debugdata_ptr(ptr: *mut FrameDebugData) -> *mut FrameDebugData {
+    if ptr.is_null() {
+        std::ptr::null_mut()
+    } else {
+        Box::into_raw(Box::new((*ptr).clone()))
+    }
+}
+
+unsafe fn clear_debugdata_ptr(ptr: &mut *mut FrameDebugData) {
+    if !(*ptr).is_null() {
+        drop(Box::from_raw(*ptr));
+        *ptr = std::ptr::null_mut();
+    }
+}
+
+unsafe fn clone_block_chain(ptr: *mut FrameBlock) -> *mut FrameBlock {
+    if ptr.is_null() {
+        std::ptr::null_mut()
+    } else {
+        Box::into_raw(Box::new(FrameBlock {
+            handlerposition: (*ptr).handlerposition,
+            valuestackdepth: (*ptr).valuestackdepth,
+            previous: clone_block_chain((*ptr).previous),
+        }))
+    }
+}
+
+unsafe fn clear_block_chain(ptr: &mut *mut FrameBlock) {
+    let mut current = *ptr;
+    while !current.is_null() {
+        let block = Box::from_raw(current);
+        current = block.previous;
+    }
+    *ptr = std::ptr::null_mut();
+}
+
 impl Drop for PyFrame {
     fn drop(&mut self) {
         if !self.locals_cells_stack_w.is_null() {
             unsafe { dealloc_array_with_gc_header(self.locals_cells_stack_w) };
             self.locals_cells_stack_w = std::ptr::null_mut();
         }
-        // debugdata and lastblock are GC-managed refs (allocated with
-        // alloc_with_gc_header). The frame holds non-owning references,
-        // matching RPython's GC ref model. Do NOT manually free them here
-        // — the JIT may still hold these pointers in snapshots/resume data.
-    }
-}
-
-impl PyFrame {
-    /// Release all block references (RPython: self.lastblock = None).
-    /// Block nodes are GC-managed refs — do not manually free them.
-    pub fn clear_blocks(&mut self) {
-        self.lastblock = 0;
-    }
-
-    /// Deep-clone debugdata for snapshot/generator.
-    pub fn clone_debugdata(&self) -> usize {
-        if self.debugdata == 0 {
-            return 0;
+        unsafe {
+            clear_debugdata_ptr(&mut self.debugdata);
+            clear_block_chain(&mut self.lastblock);
         }
-        let src = unsafe { &*(self.debugdata as *const FrameDebugData) };
-        unsafe { alloc_with_gc_header(*src) as usize }
-    }
-
-    /// Deep-clone the block linked list for snapshot/generator.
-    pub fn clone_blocks(&self) -> usize {
-        let list = self.get_blocklist();
-        let mut head: usize = 0;
-        for block in list.iter().rev() {
-            let node = unsafe {
-                alloc_with_gc_header(FrameBlock {
-                    valuestackdepth: block.valuestackdepth,
-                    handlerposition: block.handlerposition,
-                    previous: head,
-                })
-            };
-            head = node as usize;
-        }
-        head
     }
 }
 
@@ -214,18 +214,18 @@ impl PyFrame {
 /// pyre: W_CodeObject wraps a raw CodeObject — this extracts it.
 #[inline]
 pub unsafe fn pyframe_get_pycode(frame: &PyFrame) -> *const CodeObject {
-    crate::w_code_get_ptr(frame.code as pyre_object::PyObjectRef) as *const CodeObject
+    crate::w_code_get_ptr(frame.pycode as pyre_object::PyObjectRef) as *const CodeObject
 }
 
-/// pyframe.py:34-49 FrameDebugData
-#[derive(Clone, Copy)]
+#[repr(C)]
+#[derive(Clone)]
 pub struct FrameDebugData {
+    /// pyframe.py:44
+    pub w_locals: *mut PyNamespace,
+    /// pyframe.py:49 — set in __init__ from pycode.w_globals
+    pub w_globals: *mut PyNamespace,
     /// pyframe.py:37
     pub w_f_trace: PyObjectRef,
-    /// pyframe.py:38
-    pub instr_prev_plus_one: usize,
-    /// pyframe.py:39
-    pub f_lineno: isize,
     /// pyframe.py:40
     pub is_being_profiled: bool,
     /// pyframe.py:41
@@ -234,28 +234,34 @@ pub struct FrameDebugData {
     pub f_trace_lines: bool,
     /// pyframe.py:43
     pub f_trace_opcodes: bool,
-    /// pyframe.py:44
-    pub w_locals: *mut PyNamespace,
+    /// pyframe.py:38
+    pub instr_prev_plus_one: isize,
+    /// pyframe.py:39
+    pub f_lineno: isize,
     /// pyframe.py:45
     pub hidden_operationerr: PyObjectRef,
-    /// pyframe.py:49 — set in __init__ from pycode.w_globals
-    pub w_globals: *mut PyNamespace,
 }
 
-impl Default for FrameDebugData {
-    fn default() -> Self {
+impl FrameDebugData {
+    pub fn new(pycode: *const (), init_lineno: isize) -> Self {
         Self {
+            w_locals: std::ptr::null_mut(),
+            w_globals: unsafe { crate::w_code_get_w_globals(pycode as PyObjectRef) },
             w_f_trace: pyre_object::PY_NULL,
-            instr_prev_plus_one: 0,
-            f_lineno: 0,
             is_being_profiled: false,
             is_in_line_tracing: false,
             f_trace_lines: true,
             f_trace_opcodes: false,
-            w_locals: std::ptr::null_mut(),
+            instr_prev_plus_one: 0,
+            f_lineno: init_lineno,
             hidden_operationerr: pyre_object::PY_NULL,
-            w_globals: std::ptr::null_mut(),
         }
+    }
+}
+
+impl Default for FrameDebugData {
+    fn default() -> Self {
+        Self::new(std::ptr::null(), -1)
     }
 }
 
@@ -267,8 +273,8 @@ pub struct FrameBlock {
     pub valuestackdepth: usize,
     /// pyopcode.py:1882
     pub handlerposition: usize,
-    /// pyopcode.py:1884 — raw pointer to the previous FrameBlock (0 = None).
-    pub previous: usize,
+    /// pyopcode.py:1884 — pointer to the previous FrameBlock (null = None).
+    pub previous: *mut FrameBlock,
 }
 
 impl FrameBlock {
@@ -313,7 +319,7 @@ pub fn unpickle_block(_space: PyObjectRef, w_tup: PyObjectRef) -> FrameBlock {
     FrameBlock {
         handlerposition,
         valuestackdepth,
-        previous: 0,
+        previous: std::ptr::null_mut(),
     }
 }
 
@@ -323,14 +329,14 @@ pub fn unpickle_block(_space: PyObjectRef, w_tup: PyObjectRef) -> FrameBlock {
 // inside a PyFrame, so it can read/write them via raw pointer arithmetic.
 // Equivalent to PyPy's `_virtualizable_` descriptor on pyframe.py.
 
-/// Byte offset of `code` in `PyFrame`.
-pub const PYFRAME_CODE_OFFSET: usize = std::mem::offset_of!(PyFrame, code);
+/// Byte offset of `pycode` in `PyFrame`.
+pub const PYFRAME_PYCODE_OFFSET: usize = std::mem::offset_of!(PyFrame, pycode);
 
 /// Byte offset of `vable_token` in `PyFrame`.
 pub const PYFRAME_VABLE_TOKEN_OFFSET: usize = std::mem::offset_of!(PyFrame, vable_token);
 
-/// Byte offset of `next_instr` in `PyFrame`.
-pub const PYFRAME_NEXT_INSTR_OFFSET: usize = std::mem::offset_of!(PyFrame, next_instr);
+/// Byte offset of `last_instr` in `PyFrame`.
+pub const PYFRAME_LAST_INSTR_OFFSET: usize = std::mem::offset_of!(PyFrame, last_instr);
 
 /// Byte offset of `valuestackdepth` in `PyFrame`.
 pub const PYFRAME_VALUESTACKDEPTH_OFFSET: usize = std::mem::offset_of!(PyFrame, valuestackdepth);
@@ -344,6 +350,9 @@ pub const PYFRAME_DEBUGDATA_OFFSET: usize = std::mem::offset_of!(PyFrame, debugd
 
 /// Byte offset of `lastblock` in `PyFrame`.
 pub const PYFRAME_LASTBLOCK_OFFSET: usize = std::mem::offset_of!(PyFrame, lastblock);
+
+/// Byte offset of `w_globals` in `PyFrame`.
+pub const PYFRAME_W_GLOBALS_OFFSET: usize = std::mem::offset_of!(PyFrame, w_globals);
 
 // Backward-compat aliases used by JIT code.
 pub const PYFRAME_STACK_DEPTH_OFFSET: usize = PYFRAME_VALUESTACKDEPTH_OFFSET;
@@ -370,27 +379,29 @@ pub fn ncells(code: &CodeObject) -> usize {
 impl PyFrame {
     /// pyframe.py:121 getdebug → self.debugdata
     #[inline]
-    pub fn getdebug(&self) -> *mut FrameDebugData {
-        self.debugdata as *mut FrameDebugData
+    fn getdebug_data(&self) -> Option<&FrameDebugData> {
+        (!self.debugdata.is_null()).then(|| unsafe { &*self.debugdata })
     }
 
     /// pyframe.py:124 getorcreatedebug
     #[inline]
-    pub fn getorcreatedebug(&mut self) -> &mut FrameDebugData {
-        self.getorcreatedebug_with_lineno(-1)
+    fn getorcreate_debug_data(&mut self, init_lineno: isize) -> &mut FrameDebugData {
+        if self.debugdata.is_null() {
+            self.debugdata = Box::into_raw(Box::new(FrameDebugData::new(self.pycode, init_lineno)));
+        }
+        unsafe { &mut *self.debugdata }
     }
 
-    /// pyframe.py:124 getorcreatedebug(init_lineno)
+    /// PyPy-compatible `getdebug()`.
     #[inline]
-    pub fn getorcreatedebug_with_lineno(&mut self, init_lineno: isize) -> &mut FrameDebugData {
-        if self.debugdata == 0 {
-            // pyframe.py:47-49: FrameDebugData(self.pycode, init_lineno)
-            let mut dd = FrameDebugData::default();
-            dd.f_lineno = init_lineno;
-            dd.w_globals = self.namespace; // pycode.w_globals equivalent
-            self.debugdata = unsafe { alloc_with_gc_header(dd) } as usize;
-        }
-        unsafe { &mut *(self.debugdata as *mut FrameDebugData) }
+    pub fn getdebug(&self) -> Option<&FrameDebugData> {
+        self.getdebug_data()
+    }
+
+    /// PyPy-compatible `getorcreatedebug()`.
+    #[inline]
+    pub fn getorcreatedebug(&mut self, init_lineno: isize) -> &mut FrameDebugData {
+        self.getorcreate_debug_data(init_lineno)
     }
 
     /// PyPy-compatible alias for `code()`.
@@ -408,50 +419,44 @@ impl PyFrame {
     /// pyframe.py:129-133 get_w_globals
     #[inline]
     pub fn get_w_globals(&self) -> *mut PyNamespace {
-        let debugdata = self.getdebug();
-        if !debugdata.is_null() {
-            return unsafe { (*debugdata).w_globals };
+        match self.getdebug_data() {
+            Some(data) => data.w_globals,
+            None => unsafe { crate::w_code_get_w_globals(self.pycode as PyObjectRef) },
         }
-        // pyframe.py:133: jit.promote(self.pycode).w_globals
-        // pyre: pycode has no w_globals field; namespace is equivalent
-        self.namespace
     }
 
     /// pyframe.py:135 get_w_f_trace
     #[inline]
     pub fn get_w_f_trace(&self) -> PyObjectRef {
-        let dd = self.getdebug();
-        if !dd.is_null() {
-            return unsafe { (*dd).w_f_trace };
-        }
-        pyre_object::PY_NULL
+        self.getdebug_data()
+            .and_then(|data| (!data.w_f_trace.is_null()).then_some(data.w_f_trace))
+            .unwrap_or(pyre_object::PY_NULL)
     }
 
     /// pyframe.py:141 get_is_being_profiled
     #[inline]
     pub fn get_is_being_profiled(&self) -> bool {
-        let dd = self.getdebug();
-        if !dd.is_null() {
-            return unsafe { (*dd).is_being_profiled };
-        }
-        false
+        self.getdebug_data()
+            .map_or(false, |data| data.is_being_profiled)
     }
 
     /// pyframe.py:147 get_w_locals
     #[inline]
     pub fn get_w_locals(&self) -> *mut PyNamespace {
-        let dd = self.getdebug();
-        if !dd.is_null() {
-            return unsafe { (*dd).w_locals };
-        }
-        std::ptr::null_mut()
+        self.getdebug_data()
+            .map_or(std::ptr::null_mut(), |data| data.w_locals)
     }
 
     /// pyframe.py:540-545 getdictscope
     #[inline]
     pub fn getdictscope(&mut self) -> *mut PyNamespace {
-        self.fast2locals();
-        self.getorcreatedebug().w_locals
+        let w_locals = self.get_w_locals();
+        if w_locals.is_null() {
+            self.getorcreate_debug_data(-1).w_locals = self.get_w_globals();
+            self.get_w_globals()
+        } else {
+            w_locals
+        }
     }
 
     /// PyPy-compatible `__init__` hook.
@@ -459,14 +464,14 @@ impl PyFrame {
     pub fn __init__(
         &mut self,
         code: *const (),
-        namespace: *mut PyNamespace,
+        w_globals: *mut PyNamespace,
         outer_func: PyObjectRef,
     ) {
         let _ = outer_func;
-        self.code = code;
+        self.pycode = code;
         let raw =
             unsafe { crate::w_code_get_ptr(code as pyre_object::PyObjectRef) as *const CodeObject };
-        self.namespace = namespace;
+        self.w_globals = w_globals;
         unsafe { dealloc_array_with_gc_header(self.locals_cells_stack_w) };
         self.locals_cells_stack_w = unsafe {
             alloc_array_with_gc_header(FixedObjectArray::filled(
@@ -475,21 +480,37 @@ impl PyFrame {
             ))
         };
         self.valuestackdepth = unsafe { (&*raw).varnames.len() + ncells(unsafe { &*raw }) };
-        self.next_instr = 0;
         self.last_instr = -1;
-        self.debugdata = 0;
         self.escaped = false;
-        self.clear_blocks();
+        self.frame_finished_execution = false;
+        self.f_generator_nowref = PY_NULL;
+        self.w_yielding_from = PY_NULL;
+        self.f_backref = std::ptr::null_mut();
+        unsafe {
+            clear_debugdata_ptr(&mut self.debugdata);
+            clear_block_chain(&mut self.lastblock);
+        }
+        if unsafe { crate::w_code_frame_stores_global(code as PyObjectRef, w_globals) } {
+            self.getorcreate_debug_data(-1).w_globals = w_globals;
+        }
         self.pending_inline_results.clear();
         self.pending_inline_resume_pc = None;
-        self.class_locals = std::ptr::null_mut();
         self.initialize_frame_scopes(outer_func, code);
     }
 
     /// PyPy-compatible `__repr__`.
     #[inline]
     pub fn __repr__(&self) -> String {
-        format!("<{}>", self.get_last_lineno())
+        format!(
+            "<{}.{} executing {} at line {}>",
+            module_path!(),
+            std::any::type_name::<Self>()
+                .rsplit("::")
+                .next()
+                .unwrap_or("PyFrame"),
+            self.code().obj_name.as_str(),
+            self.get_last_lineno()
+        )
     }
 
     /// PyPy-compatible `fget_getdictscope`.
@@ -527,11 +548,11 @@ impl PyFrame {
         let flags = code.flags;
         if !flags.contains(CodeFlags::OPTIMIZED) {
             let w_locals = if flags.contains(CodeFlags::NEWLOCALS) {
-                unsafe { alloc_with_gc_header(PyNamespace::new()) as *mut PyNamespace }
+                Box::into_raw(Box::new(PyNamespace::new()))
             } else {
                 self.get_w_globals()
             };
-            self.getorcreatedebug().w_locals = w_locals;
+            self.getorcreate_debug_data(-1).w_locals = w_locals;
         }
 
         let ncellvars = code.cellvars.len();
@@ -580,7 +601,7 @@ impl PyFrame {
     /// pyframe.py:547-552 setdictscope(w_locals, skip_free_vars=False)
     #[inline]
     pub fn setdictscope_with_options(&mut self, w_locals: *mut PyNamespace, skip_free_vars: bool) {
-        self.getorcreatedebug().w_locals = w_locals;
+        self.getorcreate_debug_data(-1).w_locals = w_locals;
         self.locals2fast(skip_free_vars);
     }
 
@@ -588,7 +609,7 @@ impl PyFrame {
     /// Used by MIFrame Box tracking when concrete_frame is unavailable.
     pub fn new_minimal(
         code: *const (),
-        namespace: *mut crate::PyNamespace,
+        w_globals: *mut crate::PyNamespace,
         execution_context: *const PyExecutionContext,
     ) -> Self {
         let raw =
@@ -596,9 +617,11 @@ impl PyFrame {
         let nlocals = unsafe { (&*raw).varnames.len() };
         let ncells = unsafe { (&*raw).cellvars.len() + (&*raw).freevars.len() };
         let size = nlocals + ncells + 16; // small stack
-        PyFrame {
+        let stores_global =
+            unsafe { crate::w_code_frame_stores_global(code as PyObjectRef, w_globals) };
+        let mut frame = PyFrame {
             execution_context,
-            code,
+            pycode: code,
             locals_cells_stack_w: unsafe {
                 alloc_array_with_gc_header(FixedObjectArray::from_vec(vec![
                     pyre_object::PY_NULL;
@@ -606,17 +629,23 @@ impl PyFrame {
                 ]))
             },
             valuestackdepth: nlocals + ncells,
-            next_instr: 0,
             last_instr: -1,
-            namespace,
-            debugdata: 0,
-            lastblock: 0,
-            vable_token: 0,
             escaped: false,
+            debugdata: std::ptr::null_mut(),
+            lastblock: std::ptr::null_mut(),
+            w_globals,
+            vable_token: 0,
+            frame_finished_execution: false,
+            f_generator_nowref: PY_NULL,
+            w_yielding_from: PY_NULL,
+            f_backref: std::ptr::null_mut(),
             pending_inline_results: std::collections::VecDeque::new(),
             pending_inline_resume_pc: None,
-            class_locals: std::ptr::null_mut(),
+        };
+        if stores_global {
+            frame.getorcreate_debug_data(-1).w_globals = w_globals;
         }
+        frame
     }
 
     /// Create a new frame for executing a code object with a fresh execution context.
@@ -629,26 +658,29 @@ impl PyFrame {
     /// The `Rc` is leaked via `Rc::into_raw` — consistent with pyre's
     /// memory model where code objects and namespaces are also leaked.
     pub fn new_with_context(code: CodeObject, execution_context: Rc<PyExecutionContext>) -> Self {
-        let mut namespace = Box::new(execution_context.fresh_namespace());
-        namespace.fix_ptr();
+        let mut w_globals = Box::new(execution_context.fresh_namespace());
+        w_globals.fix_ptr();
         // Set __name__ — PyPy: Module.__init__ sets __name__ in w_dict
         crate::namespace_store(
-            &mut namespace,
+            &mut w_globals,
             "__name__",
             pyre_object::w_str_new("__main__"),
         );
-        let namespace = Box::into_raw(namespace);
+        let w_globals = Box::into_raw(w_globals);
         let code_ptr = Box::into_raw(Box::new(code));
         let w_code = crate::w_code_new(code_ptr as *const ());
+        unsafe {
+            crate::w_code_set_w_globals(w_code, w_globals);
+        }
         let ctx_ptr = Rc::into_raw(execution_context);
-        Self::new_with_namespace(w_code as *const (), ctx_ptr, namespace)
+        Self::new_with_namespace(w_code as *const (), ctx_ptr, w_globals)
     }
 
     /// Create a new frame with an explicitly provided namespace pointer.
     pub fn new_with_namespace(
         code: *const (),
         execution_context: *const PyExecutionContext,
-        namespace: *mut PyNamespace,
+        w_globals: *mut PyNamespace,
     ) -> Self {
         let raw =
             unsafe { crate::w_code_get_ptr(code as pyre_object::PyObjectRef) as *const CodeObject };
@@ -657,9 +689,11 @@ impl PyFrame {
         let num_cells = ncells(code_ref);
         let max_stack = code_ref.max_stackdepth as usize;
 
-        PyFrame {
+        let stores_global =
+            unsafe { crate::w_code_frame_stores_global(code as PyObjectRef, w_globals) };
+        let mut frame = PyFrame {
             execution_context,
-            code,
+            pycode: code,
             locals_cells_stack_w: unsafe {
                 alloc_array_with_gc_header(FixedObjectArray::filled(
                     num_locals + num_cells + max_stack,
@@ -667,17 +701,23 @@ impl PyFrame {
                 ))
             },
             valuestackdepth: num_locals + num_cells,
-            next_instr: 0,
             last_instr: -1,
-            namespace,
-            debugdata: 0,
-            lastblock: 0,
-            vable_token: 0,
             escaped: false,
+            debugdata: std::ptr::null_mut(),
+            lastblock: std::ptr::null_mut(),
+            w_globals,
+            vable_token: 0,
+            frame_finished_execution: false,
+            f_generator_nowref: PY_NULL,
+            w_yielding_from: PY_NULL,
+            f_backref: std::ptr::null_mut(),
             pending_inline_results: VecDeque::new(),
             pending_inline_resume_pc: None,
-            class_locals: std::ptr::null_mut(),
+        };
+        if stores_global {
+            frame.getorcreate_debug_data(-1).w_globals = w_globals;
         }
+        frame
     }
 
     /// RPython MetaInterp traces against its own MIFrame stack instead of
@@ -688,21 +728,23 @@ impl PyFrame {
     pub fn snapshot_for_tracing(&self) -> Box<Self> {
         let mut frame = Box::new(PyFrame {
             execution_context: self.execution_context,
-            code: self.code,
+            pycode: self.pycode,
             locals_cells_stack_w: unsafe {
                 alloc_array_with_gc_header(FixedObjectArray::from_vec(self.locals_w().to_vec()))
             },
             valuestackdepth: self.valuestackdepth,
-            next_instr: self.next_instr,
             last_instr: self.last_instr,
-            namespace: self.namespace,
-            debugdata: self.clone_debugdata(),
-            lastblock: self.clone_blocks(),
-            vable_token: self.vable_token,
             escaped: self.escaped,
+            debugdata: unsafe { clone_debugdata_ptr(self.debugdata) },
+            lastblock: unsafe { clone_block_chain(self.lastblock) },
+            w_globals: self.get_w_globals(),
+            vable_token: self.vable_token,
+            frame_finished_execution: self.frame_finished_execution,
+            f_generator_nowref: self.f_generator_nowref,
+            w_yielding_from: self.w_yielding_from,
+            f_backref: self.f_backref,
             pending_inline_results: self.pending_inline_results.clone(),
             pending_inline_resume_pc: self.pending_inline_resume_pc,
-            class_locals: self.class_locals,
         });
         // fix_array_ptrs AFTER Box allocation: inline_buf ptr must
         // point to the heap-allocated frame, not a stale stack address.
@@ -929,27 +971,30 @@ impl PyFrame {
 
     /// pyframe.py:186 append_block
     #[inline]
-    pub fn append_block(&mut self, block: FrameBlock) {
-        debug_assert!(block.previous == self.lastblock);
-        let node = unsafe { alloc_with_gc_header(block) };
-        self.lastblock = node as usize;
+    pub fn append_block(&mut self, mut block: FrameBlock) {
+        block.previous = self.lastblock;
+        self.lastblock = Box::into_raw(Box::new(block));
     }
 
     /// pyframe.py:190 pop_block
     #[inline]
     pub fn pop_block(&mut self) -> Option<FrameBlock> {
-        if self.lastblock == 0 {
+        if self.lastblock.is_null() {
             return None;
         }
-        let node = unsafe { &*(self.lastblock as *const FrameBlock) };
-        self.lastblock = node.previous;
-        Some(*node)
+        unsafe {
+            let block = Box::from_raw(self.lastblock);
+            self.lastblock = block.previous;
+            let mut result = *block;
+            result.previous = std::ptr::null_mut();
+            Some(result)
+        }
     }
 
     /// pyframe.py:195 blockstack_non_empty
     #[inline]
     pub fn blockstack_non_empty(&self) -> bool {
-        self.lastblock != 0
+        !self.lastblock.is_null()
     }
 
     /// PyPy-compatible exception-info unwind helper.
@@ -973,7 +1018,7 @@ impl PyFrame {
             pyre_object::w_none(),
             pyre_object::w_none(),
             pyre_object::w_none(),
-            pyre_object::w_int_new(self.next_instr as i64),
+            pyre_object::w_int_new(self.last_instr as i64),
             pyre_object::w_int_new(self.valuestackdepth as i64),
         ])
     }
@@ -998,11 +1043,14 @@ impl PyFrame {
     #[inline]
     pub fn get_blocklist(&self) -> Vec<FrameBlock> {
         let mut lst = Vec::new();
-        let mut ptr = self.lastblock;
-        while ptr != 0 {
-            let block = unsafe { &*(ptr as *const FrameBlock) };
-            lst.push(*block);
-            ptr = block.previous;
+        let mut block = self.lastblock;
+        while !block.is_null() {
+            unsafe {
+                let mut entry = *block;
+                entry.previous = std::ptr::null_mut();
+                lst.push(entry);
+                block = (*block).previous;
+            }
         }
         lst
     }
@@ -1010,23 +1058,38 @@ impl PyFrame {
     /// pyframe.py:207 set_blocklist — rebuild linked list from slice.
     #[inline]
     pub fn set_blocklist(&mut self, lst: &[FrameBlock]) {
-        self.lastblock = 0;
-        for block in lst.iter().rev() {
-            let node = unsafe {
-                alloc_with_gc_header(FrameBlock {
-                    valuestackdepth: block.valuestackdepth,
-                    handlerposition: block.handlerposition,
-                    previous: self.lastblock,
-                })
-            };
-            self.lastblock = node as usize;
+        unsafe { clear_block_chain(&mut self.lastblock) };
+        let mut i = lst.len();
+        while i > 0 {
+            i -= 1;
+            self.append_block(lst[i]);
         }
     }
 
     /// PyPy-compatible execution entrypoint.
     #[inline]
     pub fn run(&mut self) -> crate::PyResult {
-        crate::eval::eval_frame_plain(self)
+        if self._is_generator_or_coroutine() {
+            self.initialize_as_generator()
+        } else {
+            self.execute_frame(None, None)
+        }
+    }
+
+    #[inline]
+    pub fn resume_execute_frame(
+        &mut self,
+        w_arg_or_err: PyObjectRef,
+    ) -> Result<usize, crate::PyError> {
+        if !self.w_yielding_from.is_null() {
+            self.w_yielding_from = PY_NULL;
+        }
+        if self.last_instr != -1 {
+            self.pushvalue(w_arg_or_err);
+            Ok(self.last_instr as usize + 1)
+        } else {
+            Ok(0)
+        }
     }
 
     /// PyPy-compatible execution entrypoint with optional inbound values.
@@ -1034,10 +1097,13 @@ impl PyFrame {
     #[allow(unused_variables)]
     pub fn execute_frame(
         &mut self,
-        _w_inputvalue: Option<PyObjectRef>,
+        w_inputvalue: Option<PyObjectRef>,
         _operr: Option<PyObjectRef>,
     ) -> crate::PyResult {
-        self.run()
+        if let Some(w_arg_or_err) = w_inputvalue {
+            let _ = self.resume_execute_frame(w_arg_or_err)?;
+        }
+        crate::eval::eval_frame_plain(self)
     }
 
     /// PyPy-compatible `hide`.
@@ -1055,13 +1121,20 @@ impl PyFrame {
     /// PyPy-compatible `get_builtin`.
     #[inline]
     pub fn get_builtin(&self) -> PyObjectRef {
-        pyre_object::PY_NULL
+        if self.execution_context.is_null() {
+            return pyre_object::PY_NULL;
+        }
+        let mut builtins = unsafe { (&*self.execution_context).fresh_namespace() };
+        builtins.fix_ptr();
+        pyre_object::dictobject::w_dict_new_with_namespace(
+            Box::into_raw(Box::new(builtins)) as *mut u8
+        )
     }
 
     /// PyPy-compatible `get_f_back`.
     #[inline]
     pub fn get_f_back(&self) -> *mut PyFrame {
-        std::ptr::null_mut()
+        self.f_backref
     }
 
     /// PyPy-compatible `fget_f_builtins`.
@@ -1092,10 +1165,10 @@ impl PyFrame {
     #[inline]
     pub fn fset_f_trace(&mut self, w_trace: PyObjectRef) {
         if w_trace.is_null() || w_trace == pyre_object::w_none() {
-            self.getorcreatedebug().w_f_trace = pyre_object::PY_NULL;
+            self.getorcreate_debug_data(-1).w_f_trace = pyre_object::PY_NULL;
         } else {
-            let lineno = self.get_last_lineno() as isize;
-            let d = self.getorcreatedebug();
+            let lineno = self.get_last_lineno();
+            let d = self.getorcreate_debug_data(-1);
             d.w_f_trace = w_trace;
             d.f_lineno = lineno;
         }
@@ -1104,27 +1177,19 @@ impl PyFrame {
     /// pyframe.py:793-794 fdel_f_trace
     #[inline]
     pub fn fdel_f_trace(&mut self) {
-        self.getorcreatedebug().w_f_trace = pyre_object::PY_NULL;
+        self.getorcreate_debug_data(-1).w_f_trace = pyre_object::PY_NULL;
     }
 
     /// pyframe.py:153-157 get_f_trace_lines
     #[inline]
     pub fn get_f_trace_lines(&self) -> bool {
-        let d = self.getdebug();
-        if d.is_null() {
-            return true;
-        }
-        unsafe { (*d).f_trace_lines }
+        self.getdebug_data().map_or(true, |d| d.f_trace_lines)
     }
 
     /// pyframe.py:159-163 get_f_trace_opcodes
     #[inline]
     pub fn get_f_trace_opcodes(&self) -> bool {
-        let d = self.getdebug();
-        if d.is_null() {
-            return false;
-        }
-        unsafe { (*d).f_trace_opcodes }
+        self.getdebug_data().map_or(false, |d| d.f_trace_opcodes)
     }
 
     /// pyframe.py:796-797 fget_f_trace_lines
@@ -1136,7 +1201,7 @@ impl PyFrame {
     /// pyframe.py:799-800 fset_f_trace_lines
     #[inline]
     pub fn fset_f_trace_lines(&mut self, value: bool) {
-        self.getorcreatedebug().f_trace_lines = value;
+        self.getorcreate_debug_data(-1).f_trace_lines = value;
     }
 
     /// pyframe.py:802-803 fget_f_trace_opcodes
@@ -1148,7 +1213,7 @@ impl PyFrame {
     /// pyframe.py:805-806 fset_f_trace_opcodes
     #[inline]
     pub fn fset_f_trace_opcodes(&mut self, value: bool) {
-        self.getorcreatedebug().f_trace_opcodes = value;
+        self.getorcreate_debug_data(-1).f_trace_opcodes = value;
     }
 
     /// PyPy-compatible `fget_f_exc_type`.
@@ -1177,34 +1242,27 @@ impl PyFrame {
 
     /// pyframe.py:766 get_last_lineno → pytraceback.offset2lineno(self.pycode, self.last_instr)
     #[inline]
-    pub fn get_last_lineno(&self) -> usize {
-        let code = unsafe { &*pyframe_get_pycode(self) };
-        if self.last_instr == -1 {
-            return code.first_line_number.map_or(0, |n| n.get() as usize);
+    pub fn get_last_lineno(&self) -> isize {
+        if self.last_instr < 0 {
+            -1
+        } else {
+            offset2lineno(self.code(), self.last_instr as usize) as isize
         }
-        offset2lineno(code, self.last_instr as usize)
     }
 
     /// pyframe.py:660-671 fget_f_lineno
     #[inline]
     pub fn fget_f_lineno(&self) -> isize {
         if self.get_w_f_trace().is_null() {
-            let lineno = self.get_last_lineno();
-            // pyframe.py:663: if lineno == -1: return space.w_None
-            lineno as isize
+            self.get_last_lineno()
         } else {
-            // pyframe.py:666: f_lineno = self.getorcreatedebug().f_lineno
-            let dd = self.getdebug();
-            if !dd.is_null() {
-                let f_lineno = unsafe { (*dd).f_lineno };
-                if f_lineno == -1 {
-                    // pyframe.py:668: f_lineno = self.pycode.co_firstlineno
-                    let code = unsafe { &*pyframe_get_pycode(self) };
-                    return code.first_line_number.map_or(0, |n| n.get() as isize);
-                }
-                f_lineno
+            let f_lineno = self.getdebug_data().map_or(-1, |dd| dd.f_lineno);
+            if f_lineno == -1 {
+                self.code()
+                    .first_line_number
+                    .map_or(-1, |n| n.get() as isize)
             } else {
-                0
+                f_lineno
             }
         }
     }
@@ -1212,7 +1270,7 @@ impl PyFrame {
     /// pyframe.py:680 fset_f_lineno (simplified — full version validates jumps)
     #[inline]
     pub fn fset_f_lineno(&mut self, new_f_lineno: isize) {
-        self.getorcreatedebug().f_lineno = new_f_lineno;
+        self.getorcreate_debug_data(-1).f_lineno = new_f_lineno;
     }
 
     /// PyPy-compatible `setfastscope`.
@@ -1228,7 +1286,7 @@ impl PyFrame {
 
     /// pyframe.py:601-636 locals2fast(skip_free_vars=False)
     pub fn locals2fast(&mut self, skip_free_vars: bool) {
-        let w_locals = self.getorcreatedebug().w_locals;
+        let w_locals = self.getorcreate_debug_data(-1).w_locals;
         assert!(!w_locals.is_null());
         let w_locals_ref = unsafe { &*w_locals };
 
@@ -1305,11 +1363,11 @@ impl PyFrame {
 
     /// pyframe.py:554-598 fast2locals
     pub fn fast2locals(&mut self) {
-        let d = self.getorcreatedebug();
+        let d = self.getorcreate_debug_data(-1);
         let mut w_locals = d.w_locals;
         let mut write = false;
         if w_locals.is_null() {
-            w_locals = unsafe { alloc_with_gc_header(PyNamespace::new()) as *mut PyNamespace };
+            w_locals = Box::into_raw(Box::new(PyNamespace::new()));
             write = true;
         }
         let w_locals_ref = unsafe { &mut *w_locals };
@@ -1366,7 +1424,7 @@ impl PyFrame {
         }
 
         if write {
-            self.getorcreatedebug().w_locals = w_locals;
+            self.getorcreate_debug_data(-1).w_locals = w_locals;
         }
     }
 
@@ -1453,28 +1511,76 @@ impl PyFrame {
             }
         }
 
-        PyFrame {
+        let stores_global =
+            unsafe { crate::w_code_frame_stores_global(code as PyObjectRef, globals) };
+
+        let mut frame = PyFrame {
             execution_context,
-            code,
+            pycode: code,
             locals_cells_stack_w: unsafe { alloc_array_with_gc_header(locals_cells_stack_w_arr) },
             valuestackdepth: num_locals + num_cells,
-            next_instr: 0,
             last_instr: -1,
-            namespace: globals,
-            debugdata: 0,
-            lastblock: 0,
-            vable_token: 0,
             escaped: false,
+            debugdata: std::ptr::null_mut(),
+            lastblock: std::ptr::null_mut(),
+            w_globals: globals,
+            vable_token: 0,
+            frame_finished_execution: false,
+            f_generator_nowref: PY_NULL,
+            w_yielding_from: PY_NULL,
+            f_backref: std::ptr::null_mut(),
             pending_inline_results: VecDeque::new(),
             pending_inline_resume_pc: None,
-            class_locals: std::ptr::null_mut(),
+        };
+        frame.init_cells();
+        if stores_global {
+            frame.getorcreate_debug_data(-1).w_globals = globals;
         }
+        frame
     }
 
     /// Borrow the raw CodeObject.
     #[inline]
     pub fn code(&self) -> &CodeObject {
         unsafe { &*pyframe_get_pycode(self) }
+    }
+
+    #[inline]
+    pub fn _is_generator_or_coroutine(&self) -> bool {
+        self.code().flags.intersects(
+            crate::CodeFlags::GENERATOR
+                | crate::CodeFlags::COROUTINE
+                | crate::CodeFlags::ITERABLE_COROUTINE,
+        )
+    }
+
+    #[inline]
+    pub fn initialize_as_generator(&mut self) -> crate::PyResult {
+        let mut gen_frame = self.snapshot_for_tracing();
+        gen_frame.fix_array_ptrs();
+        let generator =
+            pyre_object::generatorobject::w_generator_new(Box::into_raw(gen_frame) as *mut u8);
+        self.f_generator_nowref = generator;
+        Ok(generator)
+    }
+
+    #[inline]
+    pub fn get_generator(&self) -> PyObjectRef {
+        self.f_generator_nowref
+    }
+
+    #[inline]
+    pub fn next_instr(&self) -> usize {
+        if self.last_instr < 0 {
+            0
+        } else {
+            self.last_instr as usize + 1
+        }
+    }
+
+    #[inline]
+    pub fn set_last_instr_from_next_instr(&mut self, next_instr: usize) {
+        self.last_instr = next_instr as isize - 1;
     }
 
     /// Repoint internal array pointers after a struct move.

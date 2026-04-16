@@ -19,17 +19,16 @@ pub struct FieldRoleSpec {
     pub role: FieldPatternRole,
 }
 
-/// Virtualizable scalar fields in canonical index order.
+/// Virtualizable scalar fields in canonical PyPy index order.
 /// interp_jit.py:25-31: last_instr, pycode, valuestackdepth,
-///   locals_cells_stack_w[*], debugdata, lastblock, w_globals
-/// pyre maps: last_instr → next_instr, pycode → code, w_globals → namespace
+/// debugdata, lastblock, w_globals
 pub const PYFRAME_VABLE_FIELDS: &[(&str, usize)] = &[
-    ("next_instr", 0),      // interp_jit.py:25 last_instr
-    ("code", 1),            // interp_jit.py:25 pycode
+    ("last_instr", 0),
+    ("pycode", 1),
     ("valuestackdepth", 2), // interp_jit.py:26 valuestackdepth
     ("debugdata", 3),       // interp_jit.py:28 debugdata
     ("lastblock", 4),       // interp_jit.py:29 lastblock
-    ("namespace", 5),       // interp_jit.py:31 w_globals
+    ("w_globals", 5),       // interp_jit.py:31 w_globals
 ];
 
 /// Virtualizable array fields in canonical index order.
@@ -83,28 +82,18 @@ pub const PYFRAME_FIELD_ROLES: &[FieldRoleSpec] = &[
         role: FieldPatternRole::LocalArray,
     },
     FieldRoleSpec {
-        name: "next_instr",
-        owner_root: PYFRAME_VABLE_OWNER_ROOT,
-        role: FieldPatternRole::InstructionPosition,
-    },
-    FieldRoleSpec {
         name: "last_instr",
         owner_root: PYFRAME_VABLE_OWNER_ROOT,
         role: FieldPatternRole::InstructionPosition,
     },
     FieldRoleSpec {
-        name: "pc",
+        name: "pycode",
         owner_root: PYFRAME_VABLE_OWNER_ROOT,
-        role: FieldPatternRole::InstructionPosition,
+        role: FieldPatternRole::ConstantPool,
     },
     FieldRoleSpec {
         name: "co_consts",
         owner_root: "PyCode",
-        role: FieldPatternRole::ConstantPool,
-    },
-    FieldRoleSpec {
-        name: "constants",
-        owner_root: "Code",
         role: FieldPatternRole::ConstantPool,
     },
 ];

@@ -513,10 +513,7 @@ impl ExecutionContext {
         while !frame.is_null() {
             if is_being_profiled {
                 unsafe {
-                    let debug = (&*frame).getdebug();
-                    if !debug.is_null() {
-                        let _ = &*debug;
-                    }
+                    let _ = (&*frame).getdebug();
                 }
             }
             frame = Self::getnextframe_nohidden(frame);

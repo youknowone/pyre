@@ -5027,7 +5027,8 @@ fn generator_send_ex(gen_obj: PyObjectRef, w_arg: PyObjectRef, operr: Option<PyE
 
         let result = if let Some(err) = operr {
             // throw path: inject exception via handle_exception
-            if crate::eval::handle_exception(frame, &err) {
+            let mut next_instr = frame.next_instr();
+            if crate::eval::handle_exception(frame, &err, &mut next_instr) {
                 // Handler found — resume from the handler
                 crate::eval::eval_loop_for_force(frame)
             } else {
@@ -5048,10 +5049,10 @@ fn generator_send_ex(gen_obj: PyObjectRef, w_arg: PyObjectRef, operr: Option<PyE
             Ok(value) => {
                 // Distinguish yield vs return
                 let code = &*crate::pyframe_get_pycode(&*frame);
-                let pc = frame.next_instr;
-                let is_yield = if pc > 0 && pc <= code.instructions.len() {
+                let pc = frame.next_instr();
+                let is_yield = if pc < code.instructions.len() {
                     matches!(
-                        code.instructions[pc - 1].op,
+                        code.instructions[pc].op,
                         crate::Instruction::YieldValue { .. }
                     )
                 } else {

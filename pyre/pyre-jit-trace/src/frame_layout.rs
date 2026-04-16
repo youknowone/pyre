@@ -1,64 +1,32 @@
 use majit_ir::Type;
 use majit_ir::descr::{EffectInfo, make_call_descr};
 use majit_metainterp::virtualizable::VirtualizableInfo;
-use pyre_interpreter::CodeObject;
-use pyre_interpreter::{PyExecutionContext, PyNamespace};
-use pyre_object::FixedObjectArray;
-
-/// Shared PyFrame layout contract used by the interpreter and tracer.
-///
-/// This mirrors `pyre-interpreter::pyframe::PyFrame` exactly so both crates can
-/// compute the same virtualizable offsets without introducing a reverse
-/// dependency from `pyre-jit` to `pyre-interpreter`.
-#[repr(C)]
-struct PyFrameLayout {
-    #[allow(dead_code)]
-    execution_context: *const PyExecutionContext,
-    #[allow(dead_code)]
-    code: *const CodeObject,
-    #[allow(dead_code)]
-    locals_cells_stack_w: *mut FixedObjectArray,
-    #[allow(dead_code)]
-    valuestackdepth: usize,
-    #[allow(dead_code)]
-    next_instr: usize,
-    #[allow(dead_code)]
-    last_instr: isize,
-    #[allow(dead_code)]
-    namespace: *mut PyNamespace,
-    #[allow(dead_code)]
-    debugdata: usize,
-    #[allow(dead_code)]
-    lastblock: usize,
-    #[allow(dead_code)]
-    vable_token: usize,
-}
+use pyre_interpreter::pyframe::PyFrame;
 
 /// Byte offset of `vable_token` in `PyFrame`.
-pub const PYFRAME_VABLE_TOKEN_OFFSET: usize = std::mem::offset_of!(PyFrameLayout, vable_token);
+pub const PYFRAME_VABLE_TOKEN_OFFSET: usize = std::mem::offset_of!(PyFrame, vable_token);
 
-/// Byte offset of `next_instr` in `PyFrame`.
-pub const PYFRAME_NEXT_INSTR_OFFSET: usize = std::mem::offset_of!(PyFrameLayout, next_instr);
+/// Byte offset of `last_instr` in `PyFrame`.
+pub const PYFRAME_LAST_INSTR_OFFSET: usize = std::mem::offset_of!(PyFrame, last_instr);
 
 /// Byte offset of `valuestackdepth` in `PyFrame`.
-pub const PYFRAME_VALUESTACKDEPTH_OFFSET: usize =
-    std::mem::offset_of!(PyFrameLayout, valuestackdepth);
+pub const PYFRAME_VALUESTACKDEPTH_OFFSET: usize = std::mem::offset_of!(PyFrame, valuestackdepth);
 
 /// Byte offset of `locals_cells_stack_w` in `PyFrame`.
 pub const PYFRAME_LOCALS_CELLS_STACK_OFFSET: usize =
-    std::mem::offset_of!(PyFrameLayout, locals_cells_stack_w);
+    std::mem::offset_of!(PyFrame, locals_cells_stack_w);
 
-/// Byte offset of `namespace` in `PyFrame`.
-pub const PYFRAME_NAMESPACE_OFFSET: usize = std::mem::offset_of!(PyFrameLayout, namespace);
+/// Byte offset of `w_globals` in `PyFrame`.
+pub const PYFRAME_W_GLOBALS_OFFSET: usize = std::mem::offset_of!(PyFrame, w_globals);
 
-/// Byte offset of `code` in `PyFrame`.
-pub const PYFRAME_CODE_OFFSET: usize = std::mem::offset_of!(PyFrameLayout, code);
+/// Byte offset of `pycode` in `PyFrame`.
+pub const PYFRAME_PYCODE_OFFSET: usize = std::mem::offset_of!(PyFrame, pycode);
 
 /// Byte offset of `debugdata` in `PyFrame`.
-pub const PYFRAME_DEBUGDATA_OFFSET: usize = std::mem::offset_of!(PyFrameLayout, debugdata);
+pub const PYFRAME_DEBUGDATA_OFFSET: usize = std::mem::offset_of!(PyFrame, debugdata);
 
 /// Byte offset of `lastblock` in `PyFrame`.
-pub const PYFRAME_LASTBLOCK_OFFSET: usize = std::mem::offset_of!(PyFrameLayout, lastblock);
+pub const PYFRAME_LASTBLOCK_OFFSET: usize = std::mem::offset_of!(PyFrame, lastblock);
 
 // Backward-compat aliases used by JIT descriptor helpers.
 pub const PYFRAME_STACK_DEPTH_OFFSET: usize = PYFRAME_VALUESTACKDEPTH_OFFSET;
@@ -67,8 +35,8 @@ pub const PYFRAME_LOCALS_OFFSET: usize = PYFRAME_LOCALS_CELLS_STACK_OFFSET;
 // Compile-time consistency check: frame_layout and pyframe offsets must match.
 const _: () = {
     assert!(PYFRAME_VABLE_TOKEN_OFFSET == pyre_interpreter::pyframe::PYFRAME_VABLE_TOKEN_OFFSET);
-    assert!(PYFRAME_NEXT_INSTR_OFFSET == pyre_interpreter::pyframe::PYFRAME_NEXT_INSTR_OFFSET);
-    assert!(PYFRAME_CODE_OFFSET == pyre_interpreter::pyframe::PYFRAME_CODE_OFFSET);
+    assert!(PYFRAME_LAST_INSTR_OFFSET == pyre_interpreter::pyframe::PYFRAME_LAST_INSTR_OFFSET);
+    assert!(PYFRAME_PYCODE_OFFSET == pyre_interpreter::pyframe::PYFRAME_PYCODE_OFFSET);
     assert!(
         PYFRAME_VALUESTACKDEPTH_OFFSET == pyre_interpreter::pyframe::PYFRAME_VALUESTACKDEPTH_OFFSET
     );
@@ -78,6 +46,7 @@ const _: () = {
     );
     assert!(PYFRAME_DEBUGDATA_OFFSET == pyre_interpreter::pyframe::PYFRAME_DEBUGDATA_OFFSET);
     assert!(PYFRAME_LASTBLOCK_OFFSET == pyre_interpreter::pyframe::PYFRAME_LASTBLOCK_OFFSET);
+    assert!(PYFRAME_W_GLOBALS_OFFSET == pyre_interpreter::pyframe::PYFRAME_W_GLOBALS_OFFSET);
 };
 
 /// Build the virtualizable layout description for `PyFrame`.

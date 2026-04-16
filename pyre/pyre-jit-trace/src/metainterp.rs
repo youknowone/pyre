@@ -89,7 +89,7 @@ impl PyreMetaInterp {
             let mut pc = top
                 .owned_concrete_frame
                 .as_ref()
-                .map(|cf| cf.next_instr)
+                .map(|cf| cf.next_instr())
                 .unwrap_or(top.pc);
             if pc >= code.instructions.len() {
                 return TraceAction::Abort;
@@ -108,7 +108,7 @@ impl PyreMetaInterp {
                         // Sync the concrete frame so subsequent steps see the
                         // corrected PC.
                         if let Some(ref mut cf) = top.owned_concrete_frame {
-                            cf.next_instr = pc;
+                            cf.set_last_instr_from_next_instr(pc);
                         }
                         top.pc = pc;
                     }
@@ -160,7 +160,7 @@ impl PyreMetaInterp {
             top.pc = next_pc;
             let result_idx = sym.stack_only_depth().checked_sub(1);
             if let Some(ref mut cf) = top.owned_concrete_frame {
-                cf.next_instr = next_pc;
+                cf.set_last_instr_from_next_instr(next_pc);
             }
             self.push_inline_frame(ctx, pending, result_idx);
             return LoopAction::Continue;
@@ -177,7 +177,7 @@ impl PyreMetaInterp {
                 top.pc = next_pc;
                 // Sync concrete frame PC with symbolic PC.
                 if let Some(ref mut cf) = top.owned_concrete_frame {
-                    cf.next_instr = next_pc;
+                    cf.set_last_instr_from_next_instr(next_pc);
                 }
                 LoopAction::Continue
             }
@@ -253,7 +253,7 @@ impl PyreMetaInterp {
                     }
                     let _ = cf.pop(); // null_or_self
                     let _ = cf.pop(); // callable
-                    cf.next_instr = sfall;
+                    cf.set_last_instr_from_next_instr(sfall);
                 }
                 self.push_inline_frame(ctx, pending, result_idx);
                 return LoopAction::Continue;
@@ -316,7 +316,7 @@ impl PyreMetaInterp {
                     }
                     let _ = cf.pop(); // null_or_self
                     let _ = cf.pop(); // callable
-                    cf.next_instr = sfall;
+                    cf.set_last_instr_from_next_instr(sfall);
                 }
                 self.push_inline_frame(ctx, pending, result_idx);
                 LoopAction::Continue
@@ -341,7 +341,7 @@ impl PyreMetaInterp {
         driver.enter_inline_frame(pending.green_key);
         ctx.push_inline_trace_position(pending.green_key);
 
-        let callee_code = pending.concrete_frame.code;
+        let callee_code = pending.concrete_frame.pycode;
         let mut owned_sym = Box::new(pending.sym);
         let sym_ptr = owned_sym.as_mut() as *mut PyreSym;
         let mut owned_cf = Box::new(pending.concrete_frame);
@@ -471,7 +471,7 @@ impl PyreMetaInterp {
         };
         let cf = &mut **cf;
         let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(cf) };
-        let ni = cf.next_instr;
+        let ni = cf.next_instr();
         if ni >= code.instructions.len() {
             return;
         }
@@ -479,8 +479,8 @@ impl PyreMetaInterp {
         let Some((instruction, op_arg)) = pyre_interpreter::decode_instruction_at(code, ni) else {
             return;
         };
-        cf.next_instr = ni + 1;
-        let next = cf.next_instr;
+        cf.set_last_instr_from_next_instr(ni + 1);
+        let next = cf.next_instr();
 
         if let Instruction::Call { argc } = instruction {
             let nargs = argc.get(op_arg) as usize;
@@ -501,7 +501,7 @@ impl PyreMetaInterp {
         };
         let cf = &mut **cf;
         let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(cf) };
-        let ni = cf.next_instr;
+        let ni = cf.next_instr();
         if ni >= code.instructions.len() {
             return pyre_object::PY_NULL;
         }
@@ -509,8 +509,8 @@ impl PyreMetaInterp {
         let Some((instruction, op_arg)) = pyre_interpreter::decode_instruction_at(code, ni) else {
             return pyre_object::PY_NULL;
         };
-        cf.next_instr = ni + 1;
-        let next = cf.next_instr;
+        cf.set_last_instr_from_next_instr(ni + 1);
+        let next = cf.next_instr();
 
         match pyre_interpreter::execute_opcode_step(cf, code, instruction, op_arg, next) {
             Ok(pyre_interpreter::StepResult::Return(value)) => materialize_pending_inline_result(
@@ -603,7 +603,7 @@ impl PyreMetaInterp {
                         cf.push(pyre_object::w_int_new(pc as i64));
                     }
                     cf.push(exc_obj);
-                    cf.next_instr = handler_pc;
+                    cf.set_last_instr_from_next_instr(handler_pc);
                 }
 
                 // pyjitpl.py:2518: frame.pc = target; raise ChangeFrame

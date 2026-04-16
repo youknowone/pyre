@@ -1539,7 +1539,7 @@ fn build_class_inner(
     }
 
     let mut frame = PyFrame::new_for_call_with_closure(w_code, &[], globals, exec_ctx, closure);
-    frame.class_locals = class_ns_ptr;
+    frame.setdictscope(class_ns_ptr);
 
     eval_frame_plain(&mut frame)?;
 

@@ -12,7 +12,7 @@ use majit_metainterp::{
 };
 
 use pyre_interpreter::bytecode::{BinaryOperator, CodeObject, ComparisonOperator, Instruction};
-use pyre_interpreter::pyframe::PendingInlineResult;
+use pyre_interpreter::pyframe::{PendingInlineResult, PyFrame};
 use pyre_interpreter::truth_value as objspace_truth_value;
 use pyre_object::PyObjectRef;
 use pyre_object::boolobject::w_bool_get_value;
@@ -555,9 +555,9 @@ use crate::descr::{
     w_int_size_descr,
 };
 use crate::frame_layout::{
-    PYFRAME_CODE_OFFSET, PYFRAME_DEBUGDATA_OFFSET, PYFRAME_LASTBLOCK_OFFSET,
-    PYFRAME_LOCALS_CELLS_STACK_OFFSET, PYFRAME_NAMESPACE_OFFSET, PYFRAME_NEXT_INSTR_OFFSET,
-    PYFRAME_VALUESTACKDEPTH_OFFSET,
+    PYFRAME_DEBUGDATA_OFFSET, PYFRAME_LAST_INSTR_OFFSET, PYFRAME_LASTBLOCK_OFFSET,
+    PYFRAME_LOCALS_CELLS_STACK_OFFSET, PYFRAME_PYCODE_OFFSET, PYFRAME_VALUESTACKDEPTH_OFFSET,
+    PYFRAME_W_GLOBALS_OFFSET,
 };
 use crate::helpers::{TraceHelperAccess, emit_box_float_inline, emit_trace_bool_value_from_truth};
 
@@ -1357,7 +1357,7 @@ pub fn concrete_stack_value(frame: usize, abs_idx: usize) -> Option<PyObjectRef>
 pub(crate) fn concrete_nlocals(frame: usize) -> Option<usize> {
     let frame_ptr = (frame != 0).then_some(frame as *const u8)?;
     let w_code =
-        unsafe { *(frame_ptr.add(crate::frame_layout::PYFRAME_CODE_OFFSET) as *const *const ()) };
+        unsafe { *(frame_ptr.add(crate::frame_layout::PYFRAME_PYCODE_OFFSET) as *const *const ()) };
     if w_code.is_null() {
         return None;
     }
@@ -1399,7 +1399,7 @@ pub(crate) fn concrete_stack_depth(frame: usize) -> Option<usize> {
 pub(crate) fn concrete_namespace_slot(frame: usize, name: &str) -> Option<usize> {
     let frame_ptr = (frame != 0).then_some(frame as *const u8)?;
     let namespace_ptr =
-        unsafe { *(frame_ptr.add(PYFRAME_NAMESPACE_OFFSET) as *const *mut PyNamespace) };
+        unsafe { *(frame_ptr.add(PYFRAME_W_GLOBALS_OFFSET) as *const *mut PyNamespace) };
     let namespace = (!namespace_ptr.is_null()).then_some(unsafe { &*namespace_ptr })?;
     namespace.slot_of(name)
 }
@@ -1407,7 +1407,7 @@ pub(crate) fn concrete_namespace_slot(frame: usize, name: &str) -> Option<usize>
 pub(crate) fn concrete_namespace_value(frame: usize, idx: usize) -> Option<PyObjectRef> {
     let frame_ptr = (frame != 0).then_some(frame as *const u8)?;
     let namespace_ptr =
-        unsafe { *(frame_ptr.add(PYFRAME_NAMESPACE_OFFSET) as *const *mut PyNamespace) };
+        unsafe { *(frame_ptr.add(PYFRAME_W_GLOBALS_OFFSET) as *const *mut PyNamespace) };
     let namespace = (!namespace_ptr.is_null()).then_some(unsafe { &*namespace_ptr })?;
     namespace.get_slot(idx)
 }
@@ -1884,8 +1884,8 @@ impl PyreSym {
         // Extract frame metadata pointers for use without concrete_frame
         if concrete_frame != 0 {
             let frame = unsafe { &*(concrete_frame as *const pyre_interpreter::pyframe::PyFrame) };
-            self.jitcode = jitcode_for(frame.code);
-            self.concrete_namespace = frame.namespace;
+            self.jitcode = jitcode_for(frame.pycode);
+            self.concrete_namespace = frame.w_globals;
             self.concrete_execution_context = frame.execution_context;
             self.concrete_vable_ptr = concrete_frame as *mut u8;
         }
@@ -2082,7 +2082,7 @@ impl PyreJitState {
     fn namespace_ptr(&self) -> Option<*mut PyNamespace> {
         let frame_ptr = self.frame_ptr()?;
         let namespace_ptr =
-            unsafe { *(frame_ptr.add(PYFRAME_NAMESPACE_OFFSET) as *const *mut PyNamespace) };
+            unsafe { *(frame_ptr.add(PYFRAME_W_GLOBALS_OFFSET) as *const *mut PyNamespace) };
         (!namespace_ptr.is_null()).then_some(namespace_ptr)
     }
 
@@ -2191,16 +2191,36 @@ impl PyreJitState {
     // RPython's virtualizable IS the heap object — getattr/setattr go
     // directly to the heap.  These accessors do the same via frame_ptr.
 
+    pub fn last_instr_as_usize(&self) -> usize {
+        let frame_ptr = self
+            .frame_ptr()
+            .expect("PyreJitState.frame must point to a valid PyFrame");
+        unsafe { (*(frame_ptr as *const PyFrame)).last_instr as usize }
+    }
+
+    pub fn set_last_instr(&mut self, value: usize) {
+        let frame_ptr = self
+            .frame_ptr()
+            .expect("PyreJitState.frame must point to a valid PyFrame");
+        unsafe {
+            (*(frame_ptr as *mut PyFrame)).last_instr = value as isize;
+        }
+    }
+
     pub fn next_instr(&self) -> usize {
-        self.read_frame_usize(PYFRAME_NEXT_INSTR_OFFSET)
-            .expect("PyreJitState.frame must point to a valid PyFrame")
+        let frame_ptr = self
+            .frame_ptr()
+            .expect("PyreJitState.frame must point to a valid PyFrame");
+        unsafe { (&*(frame_ptr as *const PyFrame)).next_instr() }
     }
 
     pub fn set_next_instr(&mut self, value: usize) {
-        assert!(
-            self.write_frame_usize(PYFRAME_NEXT_INSTR_OFFSET, value),
-            "PyreJitState.frame must point to a valid PyFrame"
-        );
+        let frame_ptr = self
+            .frame_ptr()
+            .expect("PyreJitState.frame must point to a valid PyFrame");
+        unsafe {
+            (&mut *(frame_ptr as *mut PyFrame)).set_last_instr_from_next_instr(value);
+        }
     }
 
     pub fn valuestackdepth(&self) -> usize {
@@ -2216,32 +2236,52 @@ impl PyreJitState {
     }
 
     /// Read the code pointer (pycode) from the heap frame.
-    pub fn code_as_usize(&self) -> usize {
-        self.read_frame_usize(PYFRAME_CODE_OFFSET)
+    pub fn pycode_as_usize(&self) -> usize {
+        self.read_frame_usize(PYFRAME_PYCODE_OFFSET)
             .expect("PyreJitState.frame must point to a valid PyFrame")
+    }
+
+    /// Read the w_globals pointer from the heap frame.
+    pub fn w_globals_as_usize(&self) -> usize {
+        self.read_frame_usize(PYFRAME_W_GLOBALS_OFFSET)
+            .expect("PyreJitState.frame must point to a valid PyFrame")
+    }
+
+    /// Read the code pointer (pycode) from the heap frame.
+    pub fn code_as_usize(&self) -> usize {
+        self.pycode_as_usize()
     }
 
     /// Read the namespace pointer from the heap frame.
     pub fn namespace_as_usize(&self) -> usize {
-        self.read_frame_usize(PYFRAME_NAMESPACE_OFFSET)
-            .expect("PyreJitState.frame must point to a valid PyFrame")
+        self.w_globals_as_usize()
     }
 
-    /// Write the code pointer to the heap frame.
+    /// Write the pycode pointer to the heap frame.
     /// virtualizable.py:101-107 write_boxes: ALL static fields written.
-    pub fn set_code(&mut self, value: usize) {
+    pub fn set_pycode(&mut self, value: usize) {
         assert!(
-            self.write_frame_usize(PYFRAME_CODE_OFFSET, value),
+            self.write_frame_usize(PYFRAME_PYCODE_OFFSET, value),
             "PyreJitState.frame must point to a valid PyFrame"
         );
     }
 
-    /// Write the namespace pointer to the heap frame.
-    pub fn set_namespace(&mut self, value: usize) {
+    /// Write the w_globals pointer to the heap frame.
+    pub fn set_w_globals(&mut self, value: usize) {
         assert!(
-            self.write_frame_usize(PYFRAME_NAMESPACE_OFFSET, value),
+            self.write_frame_usize(PYFRAME_W_GLOBALS_OFFSET, value),
             "PyreJitState.frame must point to a valid PyFrame"
         );
+    }
+
+    /// Compatibility wrapper for older callers that still speak in
+    /// terms of `code` / `namespace`.
+    pub fn set_code(&mut self, value: usize) {
+        self.set_pycode(value);
+    }
+
+    pub fn set_namespace(&mut self, value: usize) {
+        self.set_w_globals(value);
     }
 
     /// pyframe.py:82 debugdata — read from heap frame.
@@ -2266,7 +2306,7 @@ impl PyreJitState {
 
     /// Validate that the frame pointer is usable (fields readable, array present).
     fn validate_frame(&self) -> bool {
-        self.read_frame_usize(PYFRAME_NEXT_INSTR_OFFSET).is_some()
+        self.frame_ptr().is_some()
             && self
                 .read_frame_usize(PYFRAME_VALUESTACKDEPTH_OFFSET)
                 .is_some()
@@ -2837,12 +2877,12 @@ impl JitState for PyreJitState {
     fn extract_live_values(&self, meta: &Self::Meta) -> Vec<Value> {
         crate::virtualizable_gen::virt_extract_live_values(
             self.frame,
-            self.next_instr(),
-            self.code_as_usize(),
+            self.last_instr_as_usize(),
+            self.pycode_as_usize(),
             self.valuestackdepth(),
             self.debugdata_as_usize(),
             self.lastblock_as_usize(),
-            self.namespace_as_usize(),
+            self.w_globals_as_usize(),
             meta.num_locals,
             meta.valuestackdepth,
             |i| self.local_at(i).unwrap_or(PY_NULL) as usize,
@@ -3143,7 +3183,7 @@ impl JitState for PyreJitState {
         if frame_ptr.is_null() {
             return None;
         }
-        let code = unsafe { (*frame_ptr).code };
+        let code = unsafe { (*frame_ptr).pycode };
         Some(crate::driver::make_green_key(code, pc))
     }
 
@@ -3152,7 +3192,7 @@ impl JitState for PyreJitState {
         if frame_ptr.is_null() {
             return 0;
         }
-        unsafe { (*frame_ptr).code as usize }
+        unsafe { (*frame_ptr).pycode as usize }
     }
 
     fn update_meta_for_cut(meta: &mut Self::Meta, header_pc: usize, original_box_types: &[Type]) {
@@ -3328,17 +3368,17 @@ impl JitState for PyreJitState {
 
         // virtualizable.py:126-137 write_from_resume_data_partial:
         // ALL static fields in unroll_static_fields order.
-        if let Some(ni) = values
-            .get(crate::virtualizable_gen::SYM_NEXT_INSTR_IDX as usize)
+        if let Some(last_instr) = values
+            .get(crate::virtualizable_gen::SYM_LAST_INSTR_IDX as usize)
             .map(value_to_usize)
         {
-            self.set_next_instr(ni);
+            self.set_last_instr(last_instr);
         }
         if let Some(code) = values
-            .get(crate::virtualizable_gen::SYM_CODE_IDX as usize)
+            .get(crate::virtualizable_gen::SYM_PYCODE_IDX as usize)
             .map(value_to_usize)
         {
-            self.set_code(code);
+            self.set_pycode(code);
         }
         if let Some(vsd) = values
             .get(crate::virtualizable_gen::SYM_VALUESTACKDEPTH_IDX as usize)
@@ -3355,10 +3395,10 @@ impl JitState for PyreJitState {
             self.set_valuestackdepth(safe_vsd);
         }
         if let Some(ns) = values
-            .get(crate::virtualizable_gen::SYM_NAMESPACE_IDX as usize)
+            .get(crate::virtualizable_gen::SYM_W_GLOBALS_IDX as usize)
             .map(value_to_usize)
         {
-            self.set_namespace(ns);
+            self.set_w_globals(ns);
         }
 
         let nlocals = self.local_count();
@@ -3373,7 +3413,7 @@ impl JitState for PyreJitState {
         // which filters by liveness. Use the same liveness table to restore.
         let raw_code_ptr = if self.frame != 0 {
             let w_code = unsafe {
-                *((self.frame as *const u8).add(crate::frame_layout::PYFRAME_CODE_OFFSET)
+                *((self.frame as *const u8).add(crate::frame_layout::PYFRAME_PYCODE_OFFSET)
                     as *const *const ())
             };
             if !w_code.is_null() {
@@ -4287,10 +4327,10 @@ mod tests {
         };
         let values = vec![
             Value::Ref(GcRef(frame_ptr)),             // frame
-            Value::Int(9),                            // next_instr
-            Value::Ref(GcRef(frame.code as usize)),   // code
+            Value::Int(8),                            // last_instr
+            Value::Ref(GcRef(frame.pycode as usize)), // pycode
             Value::Int(4),                            // valuestackdepth
-            Value::Ref(GcRef(0)),                     // namespace
+            Value::Ref(GcRef(0)),                     // w_globals
             Value::Ref(GcRef(w_int_new(1) as usize)), // local a
             Value::Ref(GcRef(w_int_new(2) as usize)), // local b
             Value::Ref(GcRef(w_int_new(3) as usize)), // local c
@@ -4924,7 +4964,7 @@ mod tests {
 
         let code = compile_exec("1 + 2").expect("test code should compile");
         let mut frame = Box::new(PyFrame::new(code));
-        frame.next_instr = 456;
+        frame.set_last_instr_from_next_instr(456);
         let lower_value = w_int_new(0);
         let branch_value = w_int_new(1);
         frame.push(lower_value);
@@ -4983,7 +5023,7 @@ mod tests {
 
         let code = compile_exec("1 + 2").expect("test code should compile");
         let mut frame = Box::new(PyFrame::new(code));
-        frame.next_instr = 456;
+        frame.set_last_instr_from_next_instr(456);
         let lower_value = w_int_new(0);
         let branch_value = w_int_new(1);
         frame.push(lower_value);
@@ -5142,7 +5182,7 @@ mod tests {
 
         let mut ctx = TraceCtx::for_test(1);
         let frame_ref = OpRef(0);
-        let code_ref = frame.code;
+        let code_ref = frame.pycode;
         let mut sym = PyreSym::new_uninit(frame_ref);
         sym.symbolic_initialized = true;
         sym.nlocals = 1;

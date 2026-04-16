@@ -5,9 +5,9 @@
 //! builder, field/array spec constants, and virtualizable hook helpers.
 
 use crate::frame_layout::{
-    PYFRAME_CODE_OFFSET, PYFRAME_DEBUGDATA_OFFSET, PYFRAME_LASTBLOCK_OFFSET,
-    PYFRAME_LOCALS_CELLS_STACK_OFFSET, PYFRAME_NAMESPACE_OFFSET, PYFRAME_NEXT_INSTR_OFFSET,
-    PYFRAME_VABLE_TOKEN_OFFSET, PYFRAME_VALUESTACKDEPTH_OFFSET,
+    PYFRAME_DEBUGDATA_OFFSET, PYFRAME_LAST_INSTR_OFFSET, PYFRAME_LASTBLOCK_OFFSET,
+    PYFRAME_LOCALS_CELLS_STACK_OFFSET, PYFRAME_PYCODE_OFFSET, PYFRAME_VABLE_TOKEN_OFFSET,
+    PYFRAME_VALUESTACKDEPTH_OFFSET, PYFRAME_W_GLOBALS_OFFSET,
 };
 use crate::state::PyreJitState;
 use pyre_object::{FIXED_ARRAY_LEN_OFFSET, FIXED_ARRAY_PTR_OFFSET};
@@ -24,18 +24,15 @@ majit_macros::virtualizable! {
     // Scalar inputarg fields: included in extract_live / jump_args.
     // Must match `fields` order — RPython includes ALL static fields
     // in unroll_static_fields (virtualizable.py:90-93 read_boxes).
-    // interp_jit.py:25-31: last_instr, pycode, valuestackdepth,
-    //   locals_cells_stack_w[*], debugdata, lastblock, w_globals
-    // Layout: [frame:Ref, next_instr:Int, code:Ref, valuestackdepth:Int,
-    //          debugdata:Ref, lastblock:Ref, namespace:Ref,
-    //          array[0..len(lst)]:Ref]
+    // Layout: [frame:Ref, last_instr:Int, pycode:Ref, valuestackdepth:Int,
+    //          debugdata:Ref, lastblock:Ref, w_globals:Ref, array...]
     inputargs = {
-        next_instr: Int,
-        code: Ref,
+        last_instr: Int,
+        pycode: Ref,
         valuestackdepth: Int,
         debugdata: Ref,
         lastblock: Ref,
-        namespace: Ref,
+        w_globals: Ref,
     },
 
     // Array items are PyObjectRef (Ref)
@@ -44,12 +41,12 @@ majit_macros::virtualizable! {
     // VirtualizableInfo field layout (byte offsets)
     // interp_jit.py:25-31 order (excluding array field)
     fields = {
-        next_instr: int @ PYFRAME_NEXT_INSTR_OFFSET,
-        code: ref @ PYFRAME_CODE_OFFSET,
+        last_instr: int @ PYFRAME_LAST_INSTR_OFFSET,
+        pycode: ref @ PYFRAME_PYCODE_OFFSET,
         valuestackdepth: int @ PYFRAME_VALUESTACKDEPTH_OFFSET,
         debugdata: ref @ PYFRAME_DEBUGDATA_OFFSET,
         lastblock: ref @ PYFRAME_LASTBLOCK_OFFSET,
-        namespace: ref @ PYFRAME_NAMESPACE_OFFSET,
+        w_globals: ref @ PYFRAME_W_GLOBALS_OFFSET,
     },
 
     arrays = {

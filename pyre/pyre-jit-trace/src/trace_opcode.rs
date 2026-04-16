@@ -90,7 +90,7 @@ use crate::descr::{
     tuple_items_len_descr, tuple_items_ptr_descr, w_float_size_descr, w_int_size_descr,
 };
 use crate::frame_layout::{
-    PYFRAME_CODE_OFFSET, PYFRAME_DEBUGDATA_OFFSET, PYFRAME_LASTBLOCK_OFFSET,
+    PYFRAME_DEBUGDATA_OFFSET, PYFRAME_LASTBLOCK_OFFSET, PYFRAME_PYCODE_OFFSET,
 };
 use crate::helpers::{TraceHelperAccess, emit_box_float_inline, emit_trace_bool_value_from_truth};
 use crate::liveness::liveness_for;
@@ -758,18 +758,18 @@ impl MIFrame {
         self.orgpc = pc;
     }
 
-    /// Update virtualizable next_instr and valuestackdepth.
-    /// RPython parity: always use orgpc (opcode start PC) for next_instr
-    /// so gen_store_back_in_vable writes a real opcode PC to the frame,
-    /// not a Cache PC. The trace loop advancement uses pending_next_instr
-    /// separately (in metainterp.rs step_*_frame).
+    /// Update virtualizable last_instr and valuestackdepth.
+    /// RPython parity: always use orgpc (opcode start PC) as the semantic
+    /// next instruction, so the heap frame stores `last_instr = orgpc - 1`.
+    /// The trace loop advancement uses pending_next_instr separately
+    /// (in metainterp.rs step_*_frame).
     pub(crate) fn flush_to_frame(&mut self, ctx: &mut TraceCtx) {
         let resume_pc = self.orgpc;
         let frame_addr = self.concrete_frame_addr;
         let (code_ptr, debugdata, lastblock) = if frame_addr != 0 {
             unsafe {
                 (
-                    *((frame_addr + PYFRAME_CODE_OFFSET) as *const usize),
+                    *((frame_addr + PYFRAME_PYCODE_OFFSET) as *const usize),
                     *((frame_addr + PYFRAME_DEBUGDATA_OFFSET) as *const usize),
                     *((frame_addr + PYFRAME_LASTBLOCK_OFFSET) as *const usize),
                 )
@@ -781,7 +781,7 @@ impl MIFrame {
         let vsd = self.sym().valuestackdepth as i64;
         // virtualizable.py:86-93 read_boxes: ALL static fields from the heap.
         let s = self.sym_mut();
-        s.vable_next_instr = ctx.const_int(resume_pc as i64);
+        s.vable_next_instr = ctx.const_int(resume_pc as i64 - 1);
         s.vable_code = ctx.const_ref(code_ptr as i64);
         s.vable_valuestackdepth = ctx.const_int(vsd);
         s.vable_debugdata = ctx.const_ref(debugdata as i64);
@@ -791,7 +791,7 @@ impl MIFrame {
 
     /// capture_resumedata(resumepc=orgpc) parity: flush vable fields for guards.
     ///
-    /// When pre_opcode_vsd is set, sets vable_next_instr = orgpc and
+    /// When pre_opcode_vsd is set, sets vable_last_instr = orgpc - 1 and
     /// vable_valuestackdepth = pre-opcode depth. The guard's fail_args
     /// then carry the pre-opcode stack state so the blackhole interpreter
     /// can re-execute the opcode from orgpc.
@@ -807,7 +807,7 @@ impl MIFrame {
         let (code_ptr, debugdata, lastblock) = if frame_addr != 0 {
             unsafe {
                 (
-                    *((frame_addr + PYFRAME_CODE_OFFSET) as *const usize),
+                    *((frame_addr + PYFRAME_PYCODE_OFFSET) as *const usize),
                     *((frame_addr + PYFRAME_DEBUGDATA_OFFSET) as *const usize),
                     *((frame_addr + PYFRAME_LASTBLOCK_OFFSET) as *const usize),
                 )
@@ -822,7 +822,7 @@ impl MIFrame {
         };
         // virtualizable.py:86-93 read_boxes: ALL static fields from the heap.
         let s = self.sym_mut();
-        s.vable_next_instr = ctx.const_int(resume_pc as i64);
+        s.vable_next_instr = ctx.const_int(resume_pc as i64 - 1);
         s.vable_code = ctx.const_ref(code_ptr as i64);
         s.vable_valuestackdepth = ctx.const_int(vsd);
         s.vable_debugdata = ctx.const_ref(debugdata as i64);
@@ -3547,30 +3547,30 @@ impl MIFrame {
                         let callee_ns_ptr = unsafe { function_get_globals(concrete_callable) };
                         // interp_jit.py:25-31: 6 scalar fields + frame = 7 slots
                         let first_array_slot = 1 + 6; // frame + 6 scalars
-                        // Callee entry overrides: next_instr=0, vsd=nlocals.
+                        // Callee entry overrides: last_instr=-1, vsd=nlocals.
                         // debugdata=0, lastblock=0 (null).
-                        // Non-self-recursive also overrides code and namespace.
+                        // Non-self-recursive also overrides pycode and w_globals.
                         let mut const_overrides = vec![
-                            (1, 0),                     // slot 1 = next_instr = 0
+                            (1, -1),                    // slot 1 = last_instr = -1
                             (3, callee_nlocals as i64), // slot 3 = vsd = nlocals
                             (4, 0),                     // slot 4 = debugdata = None
                             (5, 0),                     // slot 5 = lastblock = None
                         ];
                         if !is_self_recursive {
-                            const_overrides.push((2, callee_code_ptr as i64)); // slot 2 = code
-                            const_overrides.push((6, callee_ns_ptr as i64)); // slot 6 = namespace
+                            const_overrides.push((2, callee_code_ptr as i64)); // slot 2 = pycode
+                            const_overrides.push((6, callee_ns_ptr as i64)); // slot 6 = w_globals
                         }
                         let expansion = majit_ir::VableExpansion {
                             scalar_fields: vec![
-                                (crate::frame_layout::PYFRAME_NEXT_INSTR_OFFSET, Type::Int),
-                                (crate::frame_layout::PYFRAME_CODE_OFFSET, Type::Ref),
+                                (crate::frame_layout::PYFRAME_LAST_INSTR_OFFSET, Type::Int),
+                                (crate::frame_layout::PYFRAME_PYCODE_OFFSET, Type::Ref),
                                 (
                                     crate::frame_layout::PYFRAME_VALUESTACKDEPTH_OFFSET,
                                     Type::Int,
                                 ),
                                 (crate::frame_layout::PYFRAME_DEBUGDATA_OFFSET, Type::Ref),
                                 (crate::frame_layout::PYFRAME_LASTBLOCK_OFFSET, Type::Ref),
-                                (crate::frame_layout::PYFRAME_NAMESPACE_OFFSET, Type::Ref),
+                                (crate::frame_layout::PYFRAME_W_GLOBALS_OFFSET, Type::Ref),
                             ],
                             array_struct_offset:
                                 crate::frame_layout::PYFRAME_LOCALS_CELLS_STACK_OFFSET,

@@ -31,10 +31,14 @@ pub struct W_CodeObject {
     pub ob_header: PyObject,
     /// Opaque pointer to a `CodeObject` (owned via Box::into_raw).
     pub code_ptr: *const (),
+    /// PyPy: `PyCode.w_globals`.
+    pub w_globals: *mut crate::PyNamespace,
 }
 
 /// Field offset of `code_ptr` within `W_CodeObject`.
 pub const CODE_PTR_OFFSET: usize = std::mem::offset_of!(W_CodeObject, code_ptr);
+/// Field offset of `w_globals` within `W_CodeObject`.
+pub const CODE_W_GLOBALS_OFFSET: usize = std::mem::offset_of!(W_CodeObject, w_globals);
 
 /// Compatibility helper for unpacking a tuple of strings.
 pub fn unpack_text_tuple(_space: PyObjectRef, w_str_tuple: PyObjectRef) -> Vec<String> {
@@ -93,6 +97,7 @@ pub fn w_code_new(code_ptr: *const ()) -> PyObjectRef {
             w_class: pyre_object::pyobject::get_instantiate(&CODE_TYPE),
         },
         code_ptr,
+        w_globals: std::ptr::null_mut(),
     });
     Box::into_raw(obj) as PyObjectRef
 }
@@ -110,6 +115,43 @@ pub fn box_code_constant(code: &crate::CodeObject) -> PyObjectRef {
 #[inline]
 pub unsafe fn w_code_get_ptr(obj: PyObjectRef) -> *const () {
     unsafe { (*(obj as *const W_CodeObject)).code_ptr }
+}
+
+/// PyPy: `PyCode.w_globals`.
+#[inline]
+pub unsafe fn w_code_get_w_globals(obj: PyObjectRef) -> *mut crate::PyNamespace {
+    if obj.is_null() {
+        return std::ptr::null_mut();
+    }
+    unsafe { (*(obj as *const W_CodeObject)).w_globals }
+}
+
+/// PyPy: `PyCode.w_globals = w_globals`.
+#[inline]
+pub unsafe fn w_code_set_w_globals(obj: PyObjectRef, w_globals: *mut crate::PyNamespace) {
+    if obj.is_null() {
+        return;
+    }
+    unsafe {
+        (*(obj as *mut W_CodeObject)).w_globals = w_globals;
+    }
+}
+
+/// PyPy: `PyCode.frame_stores_global(w_globals)`.
+#[inline]
+pub unsafe fn w_code_frame_stores_global(
+    obj: PyObjectRef,
+    w_globals: *mut crate::PyNamespace,
+) -> bool {
+    if obj.is_null() {
+        return false;
+    }
+    let code = unsafe { &mut *(obj as *mut W_CodeObject) };
+    if code.w_globals.is_null() {
+        code.w_globals = w_globals;
+        return false;
+    }
+    !std::ptr::eq(code.w_globals, w_globals)
 }
 
 /// Check if an object is a code object.

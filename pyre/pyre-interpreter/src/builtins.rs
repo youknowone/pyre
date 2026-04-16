@@ -2064,7 +2064,7 @@ fn exec_or_eval(
             crate::eval::CURRENT_FRAME.with(|current| {
                 let frame = current.get();
                 if !frame.is_null() {
-                    let parent_ns = unsafe { (*frame).namespace };
+                    let parent_ns = unsafe { (*frame).get_w_globals() };
                     if !parent_ns.is_null() {
                         for (k, &v) in unsafe { &*parent_ns }.entries() {
                             if !v.is_null() {
@@ -2145,7 +2145,7 @@ fn builtin_globals(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
                 "globals() requires an active frame",
             ));
         }
-        let namespace = unsafe { (*frame).namespace };
+        let namespace = unsafe { (*frame).get_w_globals() };
         if namespace.is_null() {
             return Err(crate::PyError::runtime_error(
                 "globals() requires an active frame",
@@ -2174,9 +2174,10 @@ fn builtin_locals(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             ));
         }
         let frame = unsafe { &*frame };
-        if !frame.class_locals.is_null() {
+        let w_locals = frame.get_w_locals();
+        if !w_locals.is_null() {
             let dict = pyre_object::w_dict_new();
-            for (k, &v) in unsafe { &*frame.class_locals }.entries() {
+            for (k, &v) in unsafe { &*w_locals }.entries() {
                 unsafe { pyre_object::w_dict_store(dict, pyre_object::w_str_new(k), v) };
             }
             return Ok(dict);
@@ -2189,8 +2190,9 @@ fn builtin_locals(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 unsafe { pyre_object::w_dict_store(dict, pyre_object::w_str_new(name), value) };
             }
         }
-        if frame.nlocals() == 0 && !frame.namespace.is_null() {
-            for (k, &v) in unsafe { &*frame.namespace }.entries() {
+        let w_globals = frame.get_w_globals();
+        if frame.nlocals() == 0 && !w_globals.is_null() {
+            for (k, &v) in unsafe { &*w_globals }.entries() {
                 unsafe { pyre_object::w_dict_store(dict, pyre_object::w_str_new(k), v) };
             }
         }
