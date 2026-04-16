@@ -3056,7 +3056,7 @@ pub(crate) fn call_int_function(func_ptr: *const (), args: &[i64]) -> i64 {
     }
 }
 
-fn call_void_function(func_ptr: *const (), args: &[i64]) {
+pub(crate) fn call_void_function(func_ptr: *const (), args: &[i64]) {
     unsafe {
         match args {
             [] => {

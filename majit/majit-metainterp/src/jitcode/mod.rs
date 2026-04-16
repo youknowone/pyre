@@ -388,6 +388,21 @@ impl JitArgKind {
             other => panic!("unknown jitcode arg kind {other}"),
         }
     }
+
+    /// Map a [`majit_ir::Type`] to its `JitArgKind`.  RPython encodes
+    /// the same mapping inline in `_build_allboxes` per
+    /// `pyjitpl.py:1969-1989` (`history.INT`/`history.REF`/`history.FLOAT`
+    /// chars + `'S'` single-float / `'L'` long-long aliases).  Pyre's
+    /// `Type::Void` has no JitArgKind because void calls carry no
+    /// argbox.
+    pub fn from_type(ty: majit_ir::Type) -> Option<Self> {
+        match ty {
+            majit_ir::Type::Int => Some(Self::Int),
+            majit_ir::Type::Ref => Some(Self::Ref),
+            majit_ir::Type::Float => Some(Self::Float),
+            majit_ir::Type::Void => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
