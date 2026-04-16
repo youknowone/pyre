@@ -195,7 +195,6 @@ pub fn eval_frame_plain(frame: &mut PyFrame) -> PyResult {
         Ok(result)
     })();
     execution_context.return_trace(frame as *mut PyFrame, w_exitvalue);
-    frame.frame_finished_execution = true;
     execution_context.leave(frame as *mut PyFrame, w_exitvalue, got_exception);
     result
 }
@@ -636,6 +635,13 @@ impl ControlFlowOpcodeHandler for PyFrame {
             jump_args: vec![],
             loop_header_pc: target,
         })
+    }
+
+    /// pyopcode.py:180-183 RETURN_VALUE — frame_finished_execution = True
+    /// when the returning path exits the frame (matched by StepResult::Return).
+    fn finish_value(&mut self, value: Self::Value) -> Result<StepResult<Self::Value>, PyError> {
+        self.frame_finished_execution = true;
+        Ok(StepResult::Return(value))
     }
 }
 
