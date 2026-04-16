@@ -29,7 +29,7 @@ use crate::jitframe::{
 use crate::regalloc::{RegAlloc, RegAllocOp};
 use crate::regloc::Loc;
 
-const AARCH64_GEN_REGS: [crate::regloc::RegLoc; 18] = [
+const AARCH64_GEN_REGS: [crate::regloc::RegLoc; 16] = [
     crate::regloc::RegLoc::new(0, false),
     crate::regloc::RegLoc::new(1, false),
     crate::regloc::RegLoc::new(2, false),
@@ -46,8 +46,6 @@ const AARCH64_GEN_REGS: [crate::regloc::RegLoc; 18] = [
     crate::regloc::RegLoc::new(13, false),
     crate::regloc::RegLoc::new(19, false),
     crate::regloc::RegLoc::new(20, false),
-    crate::regloc::RegLoc::new(21, false),
-    crate::regloc::RegLoc::new(22, false),
 ];
 
 const AARCH64_FLOAT_REGS: [crate::regloc::RegLoc; 8] = [
@@ -898,17 +896,13 @@ impl AssemblerARM64 {
     /// x64: System V AMD64 ABI — first arg (jf_ptr) in RDI.
     /// aarch64: AAPCS64 — first arg (jf_ptr) in X0.
     ///
-    /// Save slots: 48 bytes total (fp/lr at [sp,#0], x19/x20 at
-    /// [sp,#16], x21/x22 at [sp,#32]).  Mirrors
-    /// aarch64/assembler.py:1117-1122 which iterates
-    /// `r.callee_saved_registers` to stp every pair; pyre's
-    /// callee-saved set (per regalloc.rs `all_core_regs`) is
-    /// [x19, x20, x21, x22], so the prologue emits two stps.
+    /// Save slots: 32 bytes total (fp/lr at [sp,#0], x19/x20 at
+    /// [sp,#16]).  Mirrors aarch64/assembler.py:1117-1122 which
+    /// iterates `r.callee_saved_registers = [x19, x20]`.
     fn _call_header(&mut self, inputargs: &[InputArg]) {
         dynasm!(self.mc ; .arch aarch64
-            ; stp x29, x30, [sp, #-48]!
-            ; stp x19, x20, [sp, #16]
-            ; stp x21, x22, [sp, #32]
+            ; stp x29, x30, [sp, #-32]!
+            ; stp x19, x20, [sp, #16]   // save callee-saved regs
             ; mov x29, x0
         );
         self.setup_input_state(inputargs);
@@ -922,9 +916,8 @@ impl AssemblerARM64 {
     fn _call_footer(&mut self) {
         dynasm!(self.mc ; .arch aarch64
             ; mov x0, x29
-            ; ldp x21, x22, [sp, #32]
-            ; ldp x19, x20, [sp, #16]
-            ; ldp x29, x30, [sp], #48
+            ; ldp x19, x20, [sp, #16]   // restore callee-saved regs
+            ; ldp x29, x30, [sp], #32
             ; ret
         );
     }

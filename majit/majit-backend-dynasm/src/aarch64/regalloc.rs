@@ -13,15 +13,6 @@ use crate::regloc::RegLoc;
 
 /// aarch64/registers.py:14
 ///   `all_regs = registers[:14] + [x19, x20] #, x21, x22]`
-///
-/// pyre activates upstream's commented-out `, x21, x22` extension.
-/// Empirically required: with only x19/x20 the four loop-carried
-/// values in fib_loop (n, a, b, i) cannot fit in callee-save and
-/// `longest_free_reg`'s caller-save fallback then selects an x-reg
-/// the inner int_add helper clobbers.  Stays a strict subset of
-/// AAPCS64 x19..x28 and matches `JITFRAME_FIXED_SIZE` in arch.rs +
-/// `_call_header` / `_call_footer` stp/ldp pairs in
-/// `aarch64/assembler.rs`.
 pub fn all_core_regs() -> Vec<RegLoc> {
     vec![
         RegLoc::new(0, false),
@@ -40,8 +31,6 @@ pub fn all_core_regs() -> Vec<RegLoc> {
         RegLoc::new(13, false),
         RegLoc::new(19, false),
         RegLoc::new(20, false),
-        RegLoc::new(21, false),
-        RegLoc::new(22, false),
     ]
 }
 
@@ -105,15 +94,13 @@ pub fn call_result_fpr() -> RegLoc {
 /// `core_reg_index` returns the position of `reg` in the canonical
 /// `all_core_regs` list — used by gcmap and jitframe slot tables.
 ///
-/// pyre's aarch64 mapping (kept in sync with `all_core_regs`):
-///   x0..x13 → 0..13, x19 → 14, x20 → 15, x21 → 16, x22 → 17.
+/// aarch64 mapping (matches `all_core_regs`):
+///   x0..x13 → 0..13, x19 → 14, x20 → 15.
 pub fn core_reg_index(reg: RegLoc) -> Option<usize> {
     match reg.value {
         0..=13 => Some(reg.value as usize),
         19 => Some(14),
         20 => Some(15),
-        21 => Some(16),
-        22 => Some(17),
         _ => None,
     }
 }

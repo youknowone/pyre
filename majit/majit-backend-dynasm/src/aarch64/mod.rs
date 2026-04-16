@@ -8,4 +8,3 @@ pub mod arch;
 pub mod assembler;
 mod opassembler;
 pub mod regalloc;
-pub mod reghint;

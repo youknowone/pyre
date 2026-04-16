@@ -67,12 +67,15 @@ pub const IP1: RegLoc = RegLoc {
     is_xmm: false,
 };
 
-/// x86/regalloc.py: nursery-bump path reserves rax (result) and rcx
-/// (temp).  Exported as a per-arch pair mirroring aarch64's
-/// `[x0, x1]` so the shared regalloc base can use a single
-/// `spill_or_move_registers_before_call(&MALLOC_NURSERY_CLOBBER, ...)`
-/// without a cfg gate.
-pub const MALLOC_NURSERY_CLOBBER: [RegLoc; 2] = [EAX, ECX];
+/// x86/regalloc.py:1013 consider_call_malloc_nursery:
+///   `spill_or_move_registers_before_call([ecx, edx])`
+///   `force_allocate_reg(op, selected_reg=ecx)`        → result
+///   `force_allocate_reg(tmp_box, selected_reg=edx)`   → temp
+/// reghint.py:123 consider_call_malloc_nursery:
+///   `longevity.fixed_register(position, ecx, op)`
+///   `longevity.fixed_register(position, edx)`
+pub const MALLOC_NURSERY_CLOBBER: [RegLoc; 2] = [ECX, EDX];
 
-/// x86_64: result register after the nursery bump (rax).
-pub const MALLOC_NURSERY_RESULT: RegLoc = EAX;
+/// x86_64: result register after the nursery bump (ecx per
+/// regalloc.py:1021).
+pub const MALLOC_NURSERY_RESULT: RegLoc = ECX;

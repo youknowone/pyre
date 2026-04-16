@@ -704,13 +704,10 @@ use arch_regalloc::{
     call_result_fpr, call_result_gpr, core_reg_index, frame_reg, save_around_call_core_regs,
 };
 
-// Per-arch reghint pass.  Upstream RPython only ships
-// `rpython/jit/backend/x86/reghint.py`; pyre carries a parallel
-// `aarch64/reghint.rs` that is the proper port of what upstream
-// aarch64 should have (see aarch64/reghint.rs module docs for the
-// latent-bug analysis).
-#[cfg(target_arch = "aarch64")]
-use crate::aarch64::reghint as arch_reghint;
+// Per-arch reghint pass.  Upstream RPython ships reghint only under
+// `rpython/jit/backend/x86/`; there is no `aarch64/reghint.py` and
+// hence no counterpart here.  Strict line-by-line parity: run the
+// reghint pre-pass only on x86_64.
 #[cfg(target_arch = "x86_64")]
 use crate::x86::reghint as arch_reghint;
 
@@ -1619,22 +1616,25 @@ impl RegAlloc {
         }
         // x86/regalloc.py:191 X86RegisterHints().add_hints(longevity, inputargs, operations)
         //
-        // Upstream `rpython/jit/backend/x86/reghint.py` is x86-only.  pyre
-        // also runs reghint on aarch64 because — even after the
-        // arch-aligned LABEL hint code (frame-only) and the callee-save
-        // pool extension — without call-position fixed_register entries,
-        // free_reg_whole_lifetime sees caller-save regs as "always free"
-        // and longest_free_reg picks them for loop-invariants that span
-        // calls.  The mechanism is ABI-driven so it applies on aarch64
-        // identically; this remains a documented NEW-DEVIATION pending
-        // an upstream port of reghint.py to aarch64.
-        let hints = arch_reghint::RegisterHints::new(
-            self.rm.save_around_call_regs.clone(),
-            self.xrm.save_around_call_regs.clone(),
-            self.rm.all_regs.clone(),
-            self.xrm.all_regs.clone(),
-        );
-        hints.add_hints(&mut self.longevity, inputargs, operations);
+        // Strict parity: upstream `rpython/jit/backend/x86/reghint.py`
+        // is x86-only; no `rpython/jit/backend/aarch64/reghint.py`
+        // exists, so the pre-pass runs on x86_64 alone.  aarch64 loses
+        // call-position caller-save blocking — a latent upstream bug
+        // that pyre does not paper over.
+        #[cfg(target_arch = "x86_64")]
+        {
+            let hints = arch_reghint::RegisterHints::new(
+                self.rm.save_around_call_regs.clone(),
+                self.xrm.save_around_call_regs.clone(),
+                self.rm.all_regs.clone(),
+                self.xrm.all_regs.clone(),
+            );
+            hints.add_hints(&mut self.longevity, inputargs, operations);
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = (inputargs, operations);
+        }
     }
 
     /// x86/regalloc.py:209 prepare_loop

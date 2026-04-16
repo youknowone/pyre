@@ -21,12 +21,8 @@ pub const FRAME_FIXED_SIZE: usize = 0;
 pub const PASS_ON_MY_FRAME: usize = 0;
 
 /// aarch64/arch.py:13 — `JITFRAME_FIXED_SIZE = NUM_MANAGED_REGS +
-/// NUM_VFP_REGS`.
-///
-/// pyre grows NUM_MANAGED_REGS from upstream's 16 to 18 to activate
-/// aarch64/registers.py:14's commented `, x21, x22]` extension (see
-/// aarch64/regalloc.rs `all_core_regs`).  Values: 18 GPR + 8 VFP = 26.
-pub const JITFRAME_FIXED_SIZE: usize = 26;
+/// NUM_VFP_REGS`, i.e. 16 GPR + 8 VFP = 24.
+pub const JITFRAME_FIXED_SIZE: usize = 24;
 
 /// aarch64/arch.py: thread-local data is reached via the system TLS
 /// register, not via a fixed slot in the JIT frame.
