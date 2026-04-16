@@ -114,11 +114,29 @@ impl LiveVars {
                     }
                     // Super-instructions LOAD_FAST; LOAD_FAST and
                     // LOAD_FAST_BORROW; LOAD_FAST_BORROW read two locals.
-                    // RPython LOAD_FAST GEN semantics apply to each half,
-                    // but pyre's blackhole still resumes locals via move_r
-                    // (not GETARRAYITEM_VABLE_R), so enabling GEN here
-                    // regresses nbody/fannkuch/spectral_norm at runtime.
-                    // Blocked on A-3 Layer 2 (blackhole frame writeback).
+                    // Enabling GEN here triggers `OptIntBounds::propagate_forward`
+                    // → `OptContext::getintbound` "expected 'i'-typed OpRef, got
+                    // Some(Ref)" during `optimize_bridge`. Confirmed via repro
+                    // that the offending OpRef is CONST_BIT|N (a constant-pool
+                    // index), not an inputarg — the bridge IR contains
+                    // `IntLt(raw_index, OpRef(const|N))` where const|N holds
+                    // value 0 (null pointer) marked Ref.
+                    // Two independent paths must be reconciled before GEN can
+                    // land:
+                    //   1. `ConstantPool::get_or_insert(0)` dedups on the raw
+                    //      i64 but only checks `constant_types`, not
+                    //      `numbering_type_overrides` — so tracer-side
+                    //      `const_int(0)` can alias an idx previously marked
+                    //      Ref by `inject_bridge_constants`.
+                    //   2. `OptContext::const_pool` receives `Value::Ref(0)`
+                    //      directly via a `seed_constant` path during bridge
+                    //      import (short-preamble / setinfo_from_preamble).
+                    //      `OptContext::opref_type` reads `Value::get_type()`,
+                    //      so even if path 1 is fixed, path 2 keeps the Ref
+                    //      visible to the optimizer.
+                    // See memory/phase3_aliasing_diagnostic_2026_04_16.md for
+                    // the repro and diagnostic log. Leave disabled until both
+                    // layers are closed.
                     // Instruction::LoadFastLoadFast { var_nums }
                     // | Instruction::LoadFastBorrowLoadFastBorrow { var_nums } => {
                     //     let pair = var_nums.get(op_arg);
