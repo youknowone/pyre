@@ -1283,6 +1283,13 @@ impl<M: Clone> MetaInterp<M> {
                 ctx.set_force_finish(self.force_finish_trace);
                 let num_inputs = ctx.recorder.num_inputargs();
                 let input_types = ctx.inputarg_types();
+                // warmspot.py:527-538 — jd.index_of_virtualizable is -1 when
+                // no virtualizables, else jitdriver.reds.index(vname).
+                let index_of_virtualizable: i32 = ctx
+                    .driver_descriptor()
+                    .and_then(|jd| jd.virtualizable_arg_index())
+                    .map(|i| i as i32)
+                    .unwrap_or(-1);
                 self.tracing = Some(ctx);
                 let pending_num = self.warm_state.alloc_token_number();
                 self.pending_token = Some((green_key, pending_num));
@@ -1290,14 +1297,6 @@ impl<M: Clone> MetaInterp<M> {
                 // target so call_assembler can resolve the pending token at
                 // runtime. call_assembler_fast_path detects null code_ptr and
                 // falls back to force_fn.
-                // pyjitpl.py:3605 — outermost_jitdriver_sd.index_of_virtualizable.
-                // Pyre's portal jitdriver uses frame at inputarg 0 as the
-                // virtualizable; -1 when no virtualizable is configured.
-                let index_of_virtualizable: i32 = if self.virtualizable_info.is_some() {
-                    0
-                } else {
-                    -1
-                };
                 self.backend.register_pending_target(
                     pending_num,
                     input_types,
