@@ -423,9 +423,6 @@ impl PyreMetaInterp {
                     .resize(result_idx + 1, Type::Ref);
             }
             parent_sym.symbolic_stack_types[result_idx] = result_type;
-            parent_sym
-                .transient_value_types
-                .insert(result_opref, result_type);
 
             // Update concrete stack (THE CRITICAL FIX)
             let cv = ConcreteValue::from_pyobj(concrete_result);

@@ -872,7 +872,6 @@ pub fn generated_binary_int_value(
                     let result = if lhs < 0 { -1i64 } else { 0i64 };
                     let raw = ctx.const_int(result);
                     let boxed = crate::state::wrapint(ctx, raw);
-                    frame.remember_value_type(boxed, majit_ir::Type::Ref);
                     return Some(boxed);
                 }
             }
@@ -902,7 +901,6 @@ pub fn generated_binary_int_value(
 
     // RPython jitcode: wrapint → new_with_vtable + setfield_gc
     let boxed = crate::state::wrapint(ctx, raw_result);
-    frame.remember_value_type(boxed, majit_ir::Type::Ref);
     Some(boxed)
 }
 
@@ -1023,11 +1021,9 @@ pub fn generated_binary_float_value(
     } else {
         ctx.record_op(op_code.unwrap(), &[lhs_raw, rhs_raw])
     };
-    frame.remember_value_type(result, majit_ir::Type::Float);
 
     // RPython: wrapfloat → new_with_vtable + setfield_gc
     let boxed = crate::state::wrapfloat(ctx, result);
-    frame.remember_value_type(boxed, majit_ir::Type::Ref);
     Some(boxed)
 }
 
@@ -1077,7 +1073,6 @@ pub fn generated_compare_value_direct(
                 crate::state::trace_unbox_int_with_resume(frame, ctx, b, int_type_addr)
             };
             let truth = ctx.record_op(cmp, &[lhs_raw, rhs_raw]);
-            frame.remember_value_type(truth, majit_ir::Type::Int);
             // RPython goto_if_not fusion: cache truth for
             // the next POP_JUMP_IF to consume directly.
             let cmp_orgpc = frame.orgpc;
@@ -1146,7 +1141,6 @@ pub fn generated_compare_value_direct(
                 crate::state::trace_unbox_float_with_resume(frame, ctx, b, float_type_addr)
             };
             let truth = ctx.record_op(cmp, &[lhs_raw, rhs_raw]);
-            frame.remember_value_type(truth, majit_ir::Type::Int);
             let cmp_orgpc = frame.orgpc;
             let sym = frame.sym_mut();
             sym.last_comparison_truth = Some(truth);
@@ -1203,7 +1197,6 @@ pub fn generated_unary_int_value(
         frame.generate_guard(ctx, OpCode::GuardFalse, &[is_min]);
     }
     let result = ctx.record_op(opcode, &[payload]);
-    frame.remember_value_type(result, majit_ir::Type::Int);
     Some(result)
 }
 
@@ -1498,13 +1491,11 @@ pub fn generated_direct_len_value(
         if pyre_object::is_str(concrete_value) {
             frame.guard_class(ctx, value, &pyre_object::STR_TYPE as *const _ as *const pyre_object::PyType);
             let len = crate::state::trace_arraylen_gc(ctx, value, crate::descr::str_len_descr());
-            frame.remember_value_type(len, majit_ir::Type::Int);
             return Some(len);
         }
         if pyre_object::is_dict(concrete_value) {
             frame.guard_class(ctx, value, &pyre_object::pyobject::DICT_TYPE as *const _ as *const pyre_object::PyType);
             let len = crate::state::trace_arraylen_gc(ctx, value, crate::descr::dict_len_descr());
-            frame.remember_value_type(len, majit_ir::Type::Int);
             return Some(len);
         }
         if pyre_object::is_list(concrete_value) {
@@ -1522,13 +1513,11 @@ pub fn generated_direct_len_value(
                 return None; // unknown list strategy → residual
             };
             let len = crate::state::trace_arraylen_gc(ctx, value, len_descr);
-            frame.remember_value_type(len, majit_ir::Type::Int);
             return Some(len);
         }
         if pyre_object::is_tuple(concrete_value) {
             frame.guard_class(ctx, value, &pyre_object::pyobject::TUPLE_TYPE as *const _ as *const pyre_object::PyType);
             let len = crate::state::trace_arraylen_gc(ctx, value, crate::descr::tuple_items_len_descr());
-            frame.remember_value_type(len, majit_ir::Type::Int);
             return Some(len);
         }
     }
@@ -1913,12 +1902,10 @@ pub fn generated_list_getitem_by_strategy(
         0 => crate::state::trace_raw_array_getitem_value(ctx, items_ptr, index),
         1 => {
             let raw = crate::state::trace_raw_int_array_getitem_value(ctx, items_ptr, index);
-            frame.remember_value_type(raw, majit_ir::Type::Int);
             raw
         }
         2 => {
             let raw = crate::state::trace_raw_float_array_getitem_value(ctx, items_ptr, index);
-            frame.remember_value_type(raw, majit_ir::Type::Float);
             raw
         }
         _ => unreachable!(),
@@ -2117,7 +2104,6 @@ pub fn generated_iter_next_value(
     }
 
     if !concrete_continues {
-        frame.remember_value_type(zero, majit_ir::Type::Int);
         return Some((zero, 0));
     }
 
@@ -2127,7 +2113,6 @@ pub fn generated_iter_next_value(
     let ri_descr_idx = ri_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[iter, next_current], ri_descr);
     ctx.heap_cache_mut().setfield_cached(iter, ri_descr_idx, next_current);
-    frame.remember_value_type(current, majit_ir::Type::Int);
     Some((current, concrete_current))
 }
 "#);

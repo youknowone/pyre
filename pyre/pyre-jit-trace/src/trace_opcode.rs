@@ -419,31 +419,17 @@ impl MIFrame {
         types
     }
 
-    pub(crate) fn remember_value_type(&mut self, value: OpRef, value_type: Type) {
-        if value.is_none() {
-            return;
-        }
-        self.sym_mut()
-            .transient_value_types
-            .insert(value, value_type);
-    }
-
     pub(crate) fn value_type(&self, value: OpRef) -> Type {
         if value.is_none() {
             return Type::Ref;
         }
-        // Prefer transient_value_types and symbolic_locals/stack types over
-        // raw recorder lookup so func-entry / unbox promotions remain visible.
-        // For op-result OpRefs that have no transient/locals/stack entry,
-        // fall back to the recorder's intrinsic type (op.result_type() or
-        // inputarg.tp). RPython parity: Box.type is intrinsic — without
-        // this fallback, op-result Boxes default to Type::Ref and silently
-        // mistype Int/Float results, producing GUARD_VALUE / IntLt with
-        // the wrong constant pool slot.
+        // Match RPython Box.type semantics: the type is an intrinsic property
+        // of the Box (history.py:220,262,308). Prefer the stack/local slot
+        // type because symbolic entries for function-entry traces / bridge
+        // recovery carry the typed-local view. Fall back to the recorder's
+        // inputarg/constant/op.result_type() when the OpRef is not on the
+        // symbolic stack.
         let sym = self.sym();
-        if let Some(value_type) = sym.transient_value_types.get(&value).copied() {
-            return value_type;
-        }
         if let Some(idx) = sym.symbolic_locals.iter().position(|&slot| slot == value) {
             return sym
                 .symbolic_local_types
@@ -462,7 +448,6 @@ impl MIFrame {
                 .copied()
                 .unwrap_or(Type::Ref);
         }
-        // Fall back to recorder's intrinsic type — matches RPython Box.type.
         let ctx_ref: &TraceCtx = unsafe { &*self.ctx };
         ctx_ref.get_opref_type(value).unwrap_or(Type::Ref)
     }
@@ -485,9 +470,6 @@ impl MIFrame {
         }
         s.symbolic_stack[stack_idx] = value;
         s.symbolic_stack_types[stack_idx] = value_type;
-        if !value.is_none() {
-            s.transient_value_types.insert(value, value_type);
-        }
         if stack_idx >= s.concrete_stack.len() {
             s.concrete_stack.resize(stack_idx + 1, ConcreteValue::Null);
         }
@@ -519,13 +501,7 @@ impl MIFrame {
                 trace_array_getitem_value(ctx, s.locals_cells_stack_array_ref, idx_const);
         }
         let value = s.symbolic_stack[stack_idx];
-        let value_type = s
-            .symbolic_stack_types
-            .get(stack_idx)
-            .copied()
-            .unwrap_or(Type::Ref);
         s.valuestackdepth -= 1;
-        s.transient_value_types.insert(value, value_type);
         Ok(value)
     }
 
@@ -547,12 +523,6 @@ impl MIFrame {
                 trace_array_getitem_value(ctx, s.locals_cells_stack_array_ref, idx_const);
         }
         let value = s.symbolic_stack[stack_idx];
-        let value_type = s
-            .symbolic_stack_types
-            .get(stack_idx)
-            .copied()
-            .unwrap_or(Type::Ref);
-        s.transient_value_types.insert(value, value_type);
         Ok(value)
     }
 
@@ -644,12 +614,6 @@ impl MIFrame {
             }
         }
         let value = s.symbolic_locals[idx];
-        let value_type = s
-            .symbolic_local_types
-            .get(idx)
-            .copied()
-            .unwrap_or(Type::Ref);
-        s.transient_value_types.insert(value, value_type);
         Ok(value)
     }
 
@@ -2258,9 +2222,7 @@ impl MIFrame {
             return int_obj;
         }
         self.guard_class(ctx, int_obj, &INT_TYPE as *const PyType);
-        let raw = opimpl_getfield_gc_i(ctx, int_obj, int_intval_descr());
-        self.remember_value_type(raw, Type::Int);
-        raw
+        opimpl_getfield_gc_i(ctx, int_obj, int_intval_descr())
     }
 
     pub(crate) fn guard_len_gt_index(&mut self, ctx: &mut TraceCtx, len: OpRef, index: usize) {
@@ -3032,7 +2994,6 @@ impl MIFrame {
                                 crate::callbacks::get().jit_drop_callee_frame,
                                 &[callee_frame],
                             );
-                            this.remember_value_type(ca_result, Type::Ref);
                             let result = if inline_framestack_active {
                                 ca_result // already Ref — no unbox+rebox needed
                             } else {
@@ -3229,7 +3190,6 @@ impl MIFrame {
                                     crate::callbacks::get().jit_drop_callee_frame,
                                     &[callee_frame],
                                 );
-                                this.remember_value_type(ca_result, Type::Ref);
                                 let result = if inline_framestack_active {
                                     ca_result // already Ref
                                 } else {
@@ -3596,7 +3556,6 @@ impl MIFrame {
                         this.generate_guard(ctx, OpCode::GuardNotForced, &[]);
                         ctx.heap_cache_mut().invalidate_caches_for_escaped();
                         this.pop_call_replay_stack(ctx, args.len())?;
-                        this.remember_value_type(ca_result, Type::Ref);
                         // Caller unboxes: guard_class + getfield_gc_i
                         let unboxed = this.trace_guarded_int_payload(ctx, ca_result);
                         unboxed

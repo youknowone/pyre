@@ -684,7 +684,6 @@ pub struct PyreSym {
     /// On guard failure, the interpreter jumps to this PC instead of
     /// re-executing the branch instruction (stack machine safety).
     pub(crate) pending_branch_other_target: Option<usize>,
-    pub transient_value_types: std::collections::HashMap<OpRef, Type>,
     // ── MIFrame concrete Box tracking (RPython registers_i/r/f parity) ──
     // Concrete Python object values for locals and stack, tracked in
     // parallel with symbolic_locals/symbolic_stack. Each opcode handler
@@ -1732,7 +1731,6 @@ impl PyreSym {
             last_comparison_concrete_truth: None,
             pending_branch_value: None,
             pending_branch_other_target: None,
-            transient_value_types: std::collections::HashMap::new(),
             concrete_locals: Vec::new(),
             concrete_stack: Vec::new(),
             // jitcode and concrete_namespace initialized below
@@ -1897,9 +1895,6 @@ impl PyreSym {
     pub(crate) fn value_type_of(&self, value: OpRef) -> Type {
         if value.is_none() {
             return Type::Ref;
-        }
-        if let Some(value_type) = self.transient_value_types.get(&value).copied() {
-            return value_type;
         }
         if let Some(idx) = self.symbolic_locals.iter().position(|&slot| slot == value) {
             return self
@@ -4413,7 +4408,6 @@ mod tests {
         sym.symbolic_locals = vec![OpRef::NONE];
         sym.symbolic_local_types = vec![Type::Ref];
         sym.nlocals = 1;
-        sym.transient_value_types.insert(raw, Type::Int);
 
         let mut state = MIFrame {
             ctx: &mut ctx,
@@ -4577,8 +4571,6 @@ mod tests {
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
         sym.valuestackdepth = 0;
         sym.jitcode = jitcode_for(code_ref);
-        sym.transient_value_types.insert(lhs, Type::Int);
-        sym.transient_value_types.insert(rhs, Type::Int);
 
         let mut state = MIFrame {
             ctx: &mut ctx,
@@ -4659,8 +4651,6 @@ mod tests {
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
         sym.valuestackdepth = 0;
         sym.jitcode = jitcode_for(code_ref);
-        sym.transient_value_types.insert(lhs, Type::Int);
-        sym.transient_value_types.insert(rhs, Type::Int);
 
         let mut state = MIFrame {
             ctx: &mut ctx,
@@ -4895,11 +4885,11 @@ mod tests {
         frame.fix_array_ptrs();
         let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
 
-        let mut ctx = TraceCtx::for_test(0);
+        let mut ctx = TraceCtx::for_test(1);
+        let raw_int = OpRef(0);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
         sym.nlocals = frame.nlocals();
         sym.valuestackdepth = frame.valuestackdepth - 1;
-        sym.transient_value_types.insert(OpRef(77), Type::Int);
 
         let mut state = MIFrame {
             ctx: &mut ctx,
@@ -4913,7 +4903,7 @@ mod tests {
         };
 
         let truth = state
-            .truth_value_direct(OpRef(77), w_int_new(7))
+            .truth_value_direct(raw_int, w_int_new(7))
             .expect("raw int truth should trace");
         assert!(!truth.is_none());
 
@@ -5276,11 +5266,12 @@ mod tests {
         let len = state
             .direct_len_value(callable, value, list)
             .expect("integer-list len fast path should trace");
-        assert!(
-            state.sym().transient_value_types.contains_key(&len),
-            "len fast path should remember the typed raw result"
-        );
         let len_type = state.value_type(len);
+        assert_eq!(
+            len_type,
+            Type::Int,
+            "len fast path should produce an Int-typed result"
+        );
 
         let recorder = ctx.into_recorder();
         assert_ne!(
@@ -5385,7 +5376,6 @@ mod tests {
         sym.symbolic_locals = vec![list, value];
         sym.symbolic_local_types = vec![Type::Ref, Type::Int];
         sym.nlocals = 2;
-        sym.transient_value_types.insert(value, Type::Int);
 
         let mut state = MIFrame {
             ctx: &mut ctx,
@@ -5476,7 +5466,6 @@ mod tests {
         sym.symbolic_locals = vec![list, value];
         sym.symbolic_local_types = vec![Type::Ref, Type::Float];
         sym.nlocals = 2;
-        sym.transient_value_types.insert(value, Type::Float);
 
         let mut state = MIFrame {
             ctx: &mut ctx,
