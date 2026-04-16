@@ -275,10 +275,6 @@ pub fn arena_global_info() -> majit_backend_cranelift::InlineFrameArenaInfo {
         drop_fn_addr: jit_drop_callee_frame as *const () as usize,
         arena_cap: ARENA_CAP,
         jitframe_descrs: Some(majit_gc::rewrite::JitFrameDescrs {
-            create_fn_addrs: vec![
-                jit_create_self_recursive_callee_frame_1_raw_int as *const () as usize,
-            ],
-            drop_fn_addr: jit_drop_callee_frame as *const () as usize,
             jitframe_tid: crate::jit::descr::JITFRAME_GC_TYPE_ID,
             jitframe_fixed_size: JITFRAME_FIXED_SIZE,
             jf_frame_info_ofs: JF_FRAME_INFO_OFS,
@@ -291,15 +287,6 @@ pub fn arena_global_info() -> majit_backend_cranelift::InlineFrameArenaInfo {
             jf_frame_baseitemofs: BASEITEMOFS,
             jf_frame_lengthofs: LENGTHOFS,
             sign_size: SIGN_SIZE,
-            pyframe_alloc_size: GC_HEADER_SIZE
-                + std::mem::size_of::<pyre_interpreter::pyframe::PyFrame>(),
-            pyframe_code_ofs: pyre_interpreter::pyframe::PYFRAME_CODE_OFFSET,
-            pyframe_namespace_ofs: std::mem::offset_of!(
-                pyre_interpreter::pyframe::PyFrame,
-                namespace
-            ),
-            pyframe_next_instr_ofs: pyre_interpreter::pyframe::PYFRAME_NEXT_INSTR_OFFSET,
-            pyframe_vable_token_ofs: pyre_interpreter::pyframe::PYFRAME_VABLE_TOKEN_OFFSET,
         }),
     }
 }
@@ -2439,6 +2426,10 @@ fn create_callee_frame_impl_1_boxed(
                 reset_reused_call_frame(f, &[boxed_arg]);
             } else {
                 unsafe {
+                    // Different function: drop the previous frame before
+                    // overwriting, so PyFrame::drop releases the old
+                    // locals_cells_stack_w (pyframe.rs:150).
+                    std::ptr::drop_in_place(ptr);
                     std::ptr::write(
                         ptr,
                         PyFrame::new_for_call(
@@ -2497,6 +2488,7 @@ fn create_self_recursive_callee_frame_impl_1_boxed(
                 reset_reused_call_frame(f, &[boxed_arg]);
             } else {
                 unsafe {
+                    std::ptr::drop_in_place(ptr);
                     std::ptr::write(
                         ptr,
                         PyFrame::new_for_call(func_code, &[boxed_arg], globals, execution_context),
@@ -2548,6 +2540,7 @@ fn create_callee_frame_impl(caller_frame: i64, callable: i64, args: &[PyObjectRe
             } else {
                 // Different function: full reinit (rare for fib)
                 unsafe {
+                    std::ptr::drop_in_place(ptr);
                     std::ptr::write(
                         ptr,
                         PyFrame::new_for_call(w_code, args, globals, caller.execution_context),
@@ -2642,6 +2635,9 @@ pub extern "C" fn jit_create_self_recursive_callee_frame_1_raw_int(
             reset_reused_call_frame(f, &[boxed]);
         } else {
             unsafe {
+                if was_init {
+                    std::ptr::drop_in_place(ptr);
+                }
                 std::ptr::write(
                     ptr,
                     PyFrame::new_for_call(func_code, &[boxed], globals, execution_context),
