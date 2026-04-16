@@ -214,6 +214,18 @@ impl LiveVars {
     pub fn stack_depth_at(&self, pc: usize) -> usize {
         self.stack_depth_at.get(pc).copied().unwrap_or(0)
     }
+
+    /// True iff the dataflow analysis reached `pc`. Unreachable pcs have
+    /// their `stack_depth_at` slot left at the `usize::MAX` sentinel
+    /// (liveness.rs:150) and must not be treated as having a real stack
+    /// height. Used by the codewriter to skip liveness emission for
+    /// unreachable bytecode (RPython parity: flatten_graph() emits only
+    /// reachable blocks).
+    pub fn is_reachable(&self, pc: usize) -> bool {
+        self.stack_depth_at
+            .get(pc)
+            .map_or(false, |&d| d != usize::MAX)
+    }
 }
 
 /// Stack effects: (fallthrough_depth, branch_depth).

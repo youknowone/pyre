@@ -1032,21 +1032,37 @@ impl CodeWriter {
             let mut liveness = Vec::with_capacity(num_instrs);
             for py_pc in 0..num_instrs {
                 let jit_pc = pc_map[py_pc];
-                let depth = depth_at_pc[py_pc];
-                // liveness.py: only live locals are included.
-                let mut live_r: Vec<u16> = (0..nlocals)
-                    .filter(|&idx| live_vars.is_local_live(py_pc, idx))
-                    .map(|idx| idx as u16)
-                    .collect();
-                // Stack slots: live if index < depth at this PC.
-                for d in 0..depth {
-                    live_r.push(stack_base + d);
-                }
+                // RPython flatten_graph() emits blocks only for reachable
+                // control-flow targets. Pyre's codewriter iterates every
+                // py_pc linearly for layout (so `live_patches` has one
+                // entry per pc), but must not generate liveness for
+                // bytecodes the dataflow analysis never reached — those
+                // pcs carry the `usize::MAX` sentinel from
+                // liveness.rs:150 and would truncate into a 65535 stack
+                // depth, blowing past the 256-register limit and
+                // poisoning the entire jitcode with `liveness_overflow`.
+                // Emit an empty LivenessInfo for unreachable pcs to keep
+                // the `liveness.zip(live_patches)` alignment intact.
+                let (live_r, live_i, live_f) = if live_vars.is_reachable(py_pc) {
+                    let depth = depth_at_pc[py_pc];
+                    // liveness.py: only live locals are included.
+                    let mut live_r: Vec<u16> = (0..nlocals)
+                        .filter(|&idx| live_vars.is_local_live(py_pc, idx))
+                        .map(|idx| idx as u16)
+                        .collect();
+                    // Stack slots: live if index < depth at this PC.
+                    for d in 0..depth {
+                        live_r.push(stack_base + d);
+                    }
+                    (live_r, vec![], vec![])
+                } else {
+                    (vec![], vec![], vec![])
+                };
                 liveness.push(LivenessInfo {
                     pc: jit_pc as u16,
-                    live_i_regs: vec![],
+                    live_i_regs: live_i,
                     live_r_regs: live_r,
-                    live_f_regs: vec![],
+                    live_f_regs: live_f,
                 });
             }
             liveness
