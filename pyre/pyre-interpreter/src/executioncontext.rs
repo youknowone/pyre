@@ -43,7 +43,9 @@ impl Clone for PyNamespace {
         let mut namespace = Self {
             names: self.names.clone(),
             values: PyObjectArray::from_vec(self.values.to_vec()),
-            slot_watchers: Vec::new(), // cloned namespace is a new identity
+            // Cloned namespaces start with no registered invalidation watchers,
+            // but the per-slot shape must stay aligned with names/values.
+            slot_watchers: vec![Vec::new(); self.names.len()],
         };
         namespace.fix_ptr();
         namespace
@@ -905,5 +907,14 @@ mod tests {
         namespace.insert("y".to_string(), pyre_object::w_int_new(2));
         assert_eq!(namespace.slot_of("x"), Some(0));
         assert_eq!(namespace.slot_of("y"), Some(1));
+    }
+
+    #[test]
+    fn test_cloned_namespace_keeps_slot_watchers_aligned_for_removal() {
+        let ctx = PyExecutionContext::new();
+        let mut namespace = ctx.fresh_namespace();
+
+        assert!(namespace.remove("len").is_some());
+        assert!(namespace.get("len").is_none());
     }
 }

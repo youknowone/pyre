@@ -1698,6 +1698,10 @@ fn ca_dispatch_redirect(old_token: u64, new_code_ptr: *const u8, new_finish_desc
     }
 }
 
+fn ca_dispatch_remove(token_number: u64) {
+    ca_dispatch_table().lock().unwrap().remove(&token_number);
+}
+
 thread_local! {
     /// Thread-local cache for call_assembler target lookups.
     /// The HashMap holds Arc ownership; CA_FAST_PTR caches a raw pointer
@@ -2092,6 +2096,7 @@ fn register_call_assembler_target(
 fn unregister_call_assembler_target(token_number: u64) {
     invalidate_ca_thread_cache(token_number);
     unregister_call_assembler_expectations(CallAssemblerCallerId::RootLoop(token_number));
+    ca_dispatch_remove(token_number);
     let removed = call_assembler_registry()
         .lock()
         .unwrap()
@@ -2112,6 +2117,11 @@ pub fn register_pending_call_assembler_target(
     num_scalar_inputargs: usize,
     index_of_virtualizable: i32,
 ) {
+    // compile.py: compile_tmp_callback installs a placeholder target that must
+    // not retain dispatch metadata from a previous token incarnation.
+    ca_dispatch_remove(token_number);
+    ca_dispatch_slot(token_number, std::ptr::null());
+    ca_dispatch_set_finish_descr_ptr(token_number, CA_FINISH_INDEX_UNKNOWN as i64);
     let target = RegisteredLoopTarget {
         trace_id: 0,
         header_pc: 0,
@@ -16575,6 +16585,87 @@ mod tests {
         assert!(raw.is_finish);
         assert_eq!(raw.outputs, vec![4]);
         assert_eq!(raw.typed_outputs, vec![Value::Int(4)]);
+    }
+
+    #[test]
+    fn test_call_assembler_reused_token_resets_stale_pending_dispatch_slot() {
+        let token_number = 1500_252;
+
+        {
+            let mut backend = CraneliftBackend::new();
+            let inputargs = vec![InputArg::new_int(0)];
+            let mut constants = HashMap::new();
+            constants.insert(100, 1);
+            constants.insert(101, 0);
+            backend.set_constants(constants);
+
+            let mut token = JitCellToken::new(token_number);
+            let ops = vec![
+                mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+                mk_op(OpCode::IntGt, &[OpRef(0), OpRef(101)], 1),
+                mk_op(OpCode::GuardTrue, &[OpRef(1)], OpRef::NONE.0),
+                mk_op(OpCode::IntSub, &[OpRef(0), OpRef(100)], 2),
+                mk_op_with_descr(
+                    OpCode::CallAssemblerI,
+                    &[OpRef(2)],
+                    3,
+                    make_call_assembler_descr(&token, vec![Type::Int], Type::Int),
+                ),
+                mk_op(OpCode::IntAdd, &[OpRef(3), OpRef(100)], 4),
+                mk_op(OpCode::Finish, &[OpRef(4)], OpRef::NONE.0),
+            ];
+            backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+
+            let failed = backend.execute_token(&token, &[Value::Int(0)]);
+            let guard_descr = get_latest_descr_from_deadframe(&failed)
+                .expect("base-case guard should produce a valid descr");
+            backend.set_constants(HashMap::new());
+            let bridge_ops = vec![
+                mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+                mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
+            ];
+            backend
+                .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, &[])
+                .unwrap();
+
+            let frame = backend.execute_token(&token, &[Value::Int(4)]);
+            assert_eq!(backend.get_int_value(&frame, 0), 4);
+        }
+
+        let mut backend = CraneliftBackend::new();
+        let mut deferred_target = JitCellToken::new(token_number);
+        let caller_inputargs = vec![InputArg::new_int(0)];
+        let caller_ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op_with_descr(
+                OpCode::CallAssemblerI,
+                &[OpRef(0)],
+                1,
+                make_call_assembler_descr(&deferred_target, vec![Type::Int], Type::Int),
+            ),
+            mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
+        ];
+        let mut caller = JitCellToken::new(1500_253);
+        backend
+            .compile_loop(&caller_inputargs, &caller_ops, &mut caller)
+            .unwrap();
+
+        let callee_inputargs = vec![InputArg::new_int(0)];
+        let callee_ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op(OpCode::IntAdd, &[OpRef(0), OpRef(100)], 1),
+            mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
+        ];
+        let mut constants = HashMap::new();
+        constants.insert(100, 7);
+        backend.set_constants(constants);
+        backend
+            .compile_loop(&callee_inputargs, &callee_ops, &mut deferred_target)
+            .unwrap();
+
+        backend.set_constants(HashMap::new());
+        let frame = backend.execute_token(&caller, &[Value::Int(5)]);
+        assert_eq!(backend.get_int_value(&frame, 0), 12);
     }
 
     #[test]
