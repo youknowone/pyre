@@ -2222,7 +2222,10 @@ mod tests {
             majit_ir::Type::Int,
             true,
             8,
-            majit_ir::EffectInfo::elidable(),
+            majit_ir::EffectInfo::new(
+                majit_ir::ExtraEffect::ElidableCannotRaise,
+                majit_ir::OopSpecIndex::None,
+            ),
         );
         let imported = crate::optimizeopt::ImportedShortPureOp::new(
             OpCode::CallPureI,
@@ -2293,7 +2296,10 @@ mod tests {
                 majit_ir::Type::Int,
             ],
             majit_ir::Type::Int,
-            majit_ir::EffectInfo::elidable(),
+            majit_ir::EffectInfo::new(
+                majit_ir::ExtraEffect::ElidableCannotRaise,
+                majit_ir::OopSpecIndex::None,
+            ),
         ));
         let result = pass.propagate_forward(&op, &mut ctx);
         match result {
@@ -2332,7 +2338,10 @@ mod tests {
         op.descr = Some(majit_ir::descr::make_call_descr(
             vec![majit_ir::Type::Int, majit_ir::Type::Int],
             majit_ir::Type::Int,
-            majit_ir::EffectInfo::elidable(),
+            majit_ir::EffectInfo::new(
+                majit_ir::ExtraEffect::ElidableCannotRaise,
+                majit_ir::OopSpecIndex::None,
+            ),
         ));
         // OptRewrite demotes CallLoopinvariantI → CallI
         let rewrite_result = rewrite.propagate_forward(&op, &mut ctx);

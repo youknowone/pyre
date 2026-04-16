@@ -1727,7 +1727,7 @@ fn effectinfo_from_writeanalyze(
     if effects.is_top || extraeffect == ExtraEffect::RandomEffects {
         return EffectInfo {
             extraeffect: ExtraEffect::RandomEffects,
-            oopspecindex: oopspecindex,
+            oopspecindex,
             readonly_descrs_fields: !0, // all bits set = top_set (None in RPython)
             write_descrs_fields: !0,
             readonly_descrs_arrays: !0,
@@ -1735,8 +1735,10 @@ fn effectinfo_from_writeanalyze(
             readonly_descrs_interiorfields: !0,
             write_descrs_interiorfields: !0,
             single_write_descr_array: None,
+            extradescrs: None,
             can_invalidate,
             can_collect: true, // effectinfo.py:364-365: forces → can_collect = True
+            call_release_gil_target: EffectInfo::_NO_CALL_RELEASE_GIL_TARGET,
         };
     }
 
@@ -1781,8 +1783,8 @@ fn effectinfo_from_writeanalyze(
     };
 
     EffectInfo {
-        extraeffect: extraeffect,
-        oopspecindex: oopspecindex,
+        extraeffect,
+        oopspecindex,
         readonly_descrs_fields,
         write_descrs_fields,
         readonly_descrs_arrays,
@@ -1790,8 +1792,10 @@ fn effectinfo_from_writeanalyze(
         readonly_descrs_interiorfields,
         write_descrs_interiorfields,
         single_write_descr_array,
+        extradescrs: None,
         can_invalidate,
         can_collect,
+        call_release_gil_target: EffectInfo::_NO_CALL_RELEASE_GIL_TARGET,
     }
 }
 
@@ -2561,10 +2565,7 @@ struct CallDescriptorEntry {
 
 impl CallDescriptorEntry {
     fn effect_info(&self) -> EffectInfo {
-        match self.extraeffect {
-            ExtraEffect::ElidableCannotRaise => EffectInfo::elidable(),
-            extraeffect => EffectInfo::new(extraeffect, self.oopspecindex),
-        }
+        EffectInfo::new(self.extraeffect, self.oopspecindex)
     }
 }
 

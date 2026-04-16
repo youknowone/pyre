@@ -1261,6 +1261,13 @@ pub struct EffectInfo {
     /// effectinfo.py:201-206: single_write_descr_array
     #[serde(skip)]
     pub single_write_descr_array: Option<DescrRef>,
+    /// effectinfo.py:196: extradescrs — extra descriptors carried by oopspec helpers
+    /// (LIBFFI, ARRAYCOPY/ARRAYMOVE etc.).
+    #[serde(skip)]
+    pub extradescrs: Option<Vec<DescrRef>>,
+    /// effectinfo.py:114, 197: call_release_gil_target = (target_fn_addr, save_err)
+    /// `_NO_CALL_RELEASE_GIL_TARGET = (llmemory.NULL, 0)` by default.
+    pub call_release_gil_target: (u64, i32),
 }
 
 /// Manual PartialEq: single_write_descr_array is excluded (like RPython's
@@ -1277,6 +1284,7 @@ impl PartialEq for EffectInfo {
             && self.write_descrs_interiorfields == other.write_descrs_interiorfields
             && self.can_invalidate == other.can_invalidate
             && self.can_collect == other.can_collect
+            && self.call_release_gil_target == other.call_release_gil_target
     }
 }
 
@@ -1294,9 +1302,12 @@ impl Default for EffectInfo {
             readonly_descrs_interiorfields: 0,
             write_descrs_interiorfields: 0,
             single_write_descr_array: None,
-            can_invalidate: false,
+            extradescrs: None,
             // RPython effectinfo.py:125: can_collect=True default
+            can_invalidate: false,
             can_collect: true,
+            // effectinfo.py:114, 123: call_release_gil_target=_NO_CALL_RELEASE_GIL_TARGET
+            call_release_gil_target: EffectInfo::_NO_CALL_RELEASE_GIL_TARGET,
         }
     }
 }
@@ -1409,10 +1420,6 @@ impl EffectInfo {
             || self.extraeffect == ExtraEffect::ElidableCannotRaise
     }
 
-    pub fn check_is_loopinvariant(&self) -> bool {
-        self.extraeffect == ExtraEffect::LoopInvariant
-    }
-
     pub fn check_can_invalidate(&self) -> bool {
         self.can_invalidate
     }
@@ -1445,10 +1452,11 @@ impl EffectInfo {
         }
     }
 
-    /// effectinfo.py: is_call_release_gil()
-    /// Whether this call releases the GIL (for FFI calls).
+    /// effectinfo.py:255-257: is_call_release_gil()
+    /// `tgt_func, tgt_saveerr = self.call_release_gil_target; return bool(tgt_func)`
     pub fn is_call_release_gil(&self) -> bool {
-        false // Not applicable in our Rust runtime
+        let (tgt_func, _tgt_saveerr) = self.call_release_gil_target;
+        tgt_func != 0
     }
 
     /// Const-compatible constructor for static initialization.
@@ -1463,8 +1471,10 @@ impl EffectInfo {
             readonly_descrs_interiorfields: 0,
             write_descrs_interiorfields: 0,
             single_write_descr_array: None,
+            extradescrs: None,
             can_invalidate: false,
             can_collect: true,
+            call_release_gil_target: EffectInfo::_NO_CALL_RELEASE_GIL_TARGET,
         }
     }
 
@@ -1477,21 +1487,45 @@ impl EffectInfo {
         }
     }
 
-    /// Create an EffectInfo for a pure, elidable operation.
-    pub fn elidable() -> Self {
-        EffectInfo {
-            extraeffect: ExtraEffect::ElidableCannotRaise,
-            ..Default::default()
-        }
+    /// effectinfo.py:64: _OS_offset_uni = OS_UNI_CONCAT - OS_STR_CONCAT
+    pub const _OS_OFFSET_UNI: u16 = OopSpecIndex::UniConcat as u16 - OopSpecIndex::StrConcat as u16;
+
+    /// effectinfo.py:114: _NO_CALL_RELEASE_GIL_TARGET = (llmemory.NULL, 0)
+    pub const _NO_CALL_RELEASE_GIL_TARGET: (u64, i32) = (0, 0);
+
+    /// effectinfo.py:108-112: _OS_CANRAISE — oopspecindex values that can raise
+    /// even when extraeffect <= EF_CANNOT_RAISE.
+    pub fn _is_os_canraise(idx: OopSpecIndex) -> bool {
+        matches!(
+            idx,
+            OopSpecIndex::None
+                | OopSpecIndex::Str2Unicode
+                | OopSpecIndex::LibffiCall
+                | OopSpecIndex::RawMallocVarsizeChar
+                | OopSpecIndex::JitForceVirtual
+                | OopSpecIndex::ShrinkArray
+                | OopSpecIndex::DictLookup
+                | OopSpecIndex::NotInTrace
+        )
     }
 
-    /// Create an EffectInfo for a side-effecting operation.
-    pub fn side_effecting() -> Self {
-        EffectInfo {
-            extraeffect: ExtraEffect::RandomEffects,
-            ..Default::default()
-        }
-    }
+    /// effectinfo.py:271-273: MOST_GENERAL
+    /// `EffectInfo(None, None, None, None, None, None, EF_RANDOM_EFFECTS, can_invalidate=True)`
+    pub const MOST_GENERAL: EffectInfo = EffectInfo {
+        extraeffect: ExtraEffect::RandomEffects,
+        oopspecindex: OopSpecIndex::None,
+        readonly_descrs_fields: 0,
+        write_descrs_fields: 0,
+        readonly_descrs_arrays: 0,
+        write_descrs_arrays: 0,
+        readonly_descrs_interiorfields: 0,
+        write_descrs_interiorfields: 0,
+        single_write_descr_array: None,
+        extradescrs: None,
+        can_invalidate: true,
+        can_collect: true,
+        call_release_gil_target: EffectInfo::_NO_CALL_RELEASE_GIL_TARGET,
+    };
 
     // ── Bitstring check methods (effectinfo.py parity) ──
 
@@ -2568,7 +2602,7 @@ mod tests {
         assert_eq!(ei.oopspecindex, OopSpecIndex::None);
         assert!(ei.check_can_raise(false));
         assert!(!ei.check_is_elidable());
-        assert!(!ei.check_is_loopinvariant());
+        assert!(ei.extraeffect != ExtraEffect::LoopInvariant);
     }
 
     #[test]
@@ -2694,7 +2728,7 @@ mod tests {
             oopspecindex: OopSpecIndex::None,
             ..Default::default()
         };
-        assert!(ei.check_is_loopinvariant());
+        assert!(ei.extraeffect == ExtraEffect::LoopInvariant);
         assert!(!ei.check_is_elidable());
         assert!(!ei.check_can_raise(false));
     }

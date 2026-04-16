@@ -97,7 +97,9 @@ impl CallEffectOverride {
 
 fn effect_info_for_kind(effect: CallEffectKind) -> EffectInfo {
     match effect {
-        CallEffectKind::Elidable => EffectInfo::elidable(),
+        CallEffectKind::Elidable => {
+            EffectInfo::new(ExtraEffect::ElidableCannotRaise, OopSpecIndex::None)
+        }
         CallEffectKind::Residual => EffectInfo::new(ExtraEffect::CanRaise, OopSpecIndex::None),
         CallEffectKind::MayForce => EffectInfo::new(
             ExtraEffect::ForcesVirtualOrVirtualizable,
