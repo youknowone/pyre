@@ -56,9 +56,28 @@ struct AssemblyState {
     /// SSARepr-side switch descrs that must be attached after all labels have
     /// final positions (`assembler.py:258-263`).
     switch_descrs: Vec<(usize, Vec<(i64, TLabel)>)>,
-    /// Runtime descr table for this jitcode.
+    /// Runtime descr table for this jitcode (`assembler.py:26` `self.descrs`).
     descrs: Vec<BhDescr>,
+    /// `assembler.py:26` `self._descr_dict = {}` — identity-keyed dedup so
+    /// re-using the same SSARepr descr across multiple ops yields a stable
+    /// `descrs` index. `DescrOperand` has no inherent identity in Rust;
+    /// the key is the Vec-slot pointer captured when the `Operand` was
+    /// first interned — semantically equivalent to Python's `id()` lookup.
+    descr_dict: HashMap<DescrKey, usize>,
 }
+
+/// Identity key for `DescrOperand` dedup. Matches
+/// `assembler.py:197-199` `if x not in self._descr_dict` which uses
+/// Python object identity.
+///
+/// `Bh` descrs are deduped by pointer-equality against the `DescrOperand`
+/// borrow (the SSARepr owns the operand, so pointers are stable during
+/// assemble()). `SwitchDict` descrs must be deduped by the same rule —
+/// two distinct SwitchDictDescr operands produce two `descrs` entries
+/// even if their `labels` happen to match (matches RPython's identity
+/// semantics).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct DescrKey(*const DescrOperand);
 
 impl Assembler {
     pub fn new() -> Self {
@@ -89,6 +108,7 @@ impl Assembler {
             builder_labels: Vec::new(),
             switch_descrs: Vec::new(),
             descrs: Vec::new(),
+            descr_dict: HashMap::new(),
         };
 
         ssarepr.insns_pos = Some(Vec::with_capacity(ssarepr.insns.len()));
@@ -134,7 +154,13 @@ impl Assembler {
                 args,
                 result,
             } => {
-                scan_descr_operands(state, args);
+                // `assembler.py:197-206` registers descrs inline during op
+                // encoding, guarded by `self._descr_dict`. The previous
+                // pre-scan violated parity by interning every
+                // `Operand::Descr` unconditionally (even on ops that don't
+                // consume a descr in the emitted bytecode) and without
+                // dedup. Dispatch arms that actually need a descr index
+                // now call `record_descr_operand(state, descr)` themselves.
                 dispatch_op(state, opname, args, result.as_ref());
             }
         }
@@ -193,12 +219,18 @@ impl Assembler {
     }
 }
 
-/// Back-compat wrapper matching the original phase-3a skeleton API.
-pub fn assemble(
-    ssarepr: &mut SSARepr,
-    builder: JitCodeBuilder,
-    num_regs: Option<NumRegs>,
-) -> JitCode {
+/// Test-only convenience wrapper — creates a throwaway `Assembler` per
+/// call. **Do not wire this into production paths.** RPython's
+/// `CodeWriter` holds a single `Assembler` whose `all_liveness`,
+/// `all_liveness_positions`, and `num_liveness_ops` accumulate across
+/// every JitCode compiled in the session (`codewriter.py:19-22` /
+/// `pyjitpl.py:2264`). A fresh `Assembler` per call splits the
+/// global liveness table and breaks that invariant.
+///
+/// Production callers must construct one `Assembler` up front and call
+/// `assembler.assemble(...)` repeatedly on it.
+#[cfg(test)]
+fn assemble(ssarepr: &mut SSARepr, builder: JitCodeBuilder, num_regs: Option<NumRegs>) -> JitCode {
     let mut assembler = Assembler::new();
     assembler.assemble(ssarepr, builder, num_regs)
 }
@@ -641,26 +673,43 @@ fn dispatch_op(
     }
 }
 
-fn scan_descr_operands(state: &mut AssemblyState, args: &[Operand]) {
-    for arg in args {
-        if let Operand::Descr(descr) = arg {
-            record_descr_operand(state, descr);
-        }
-    }
-}
-
+/// `assembler.py:197-206` inline descr registration. Called from
+/// dispatch arms that actually consume a descr operand in the emitted
+/// bytecode.
+///
+/// Deduplicates on `Operand::Descr` pointer identity — matches
+/// RPython's `if x not in self._descr_dict` which hashes by object id.
+/// Reusing the same SSARepr descr operand twice yields a stable
+/// `descrs` index both times.
 fn record_descr_operand(state: &mut AssemblyState, descr: &DescrOperand) -> usize {
+    let key = DescrKey(descr as *const DescrOperand);
+    if let Some(&idx) = state.descr_dict.get(&key) {
+        return idx;
+    }
     let index = state.descrs.len();
+    state.descr_dict.insert(key, index);
     match descr {
-        DescrOperand::Bh(descr) => state.descrs.push(descr.clone()),
-        DescrOperand::SwitchDict(descr) => {
+        DescrOperand::Bh(bh) => state.descrs.push(bh.clone()),
+        DescrOperand::SwitchDict(switch) => {
             state.descrs.push(BhDescr::Switch {
                 dict: HashMap::new(),
             });
-            state.switch_descrs.push((index, descr.labels.clone()));
+            state.switch_descrs.push((index, switch.labels.clone()));
         }
     }
     index
+}
+
+/// Helper for dispatch arms: decode an `Operand::Descr`, register it
+/// inline, and return the 16-bit descr index. Used by ops that actually
+/// emit a `d` argcode slot (`assembler.py:205-207`).
+#[allow(dead_code)]
+fn emit_descr(state: &mut AssemblyState, op: &Operand) -> u16 {
+    match op {
+        Operand::Descr(descr) => u16::try_from(record_descr_operand(state, descr))
+            .expect("too many descrs (index > u16::MAX)"),
+        _ => panic!("expected Descr operand, got {:?}", op),
+    }
 }
 
 fn expect_result_or_first_reg(args: &[Operand], result: Option<&Register>, kind: Kind) -> u16 {
@@ -700,18 +749,18 @@ fn expect_small_u16(op: &Operand) -> u16 {
     }
 }
 
+/// `record_binop_*` / `record_unary_*` arg decoder.
+///
+/// The recorded op is passed as `Operand::OpCode(majit_ir::OpCode)`
+/// matching `JitCodeBuilder::record_*`'s signature. RPython's
+/// `codewriter/assembler.py` does not narrow this to a fixed enum; the
+/// opcode is an `AbstractDescr` equivalent and the record path in the
+/// metainterp consumes whatever is passed, so any valid `OpCode` must
+/// round-trip through here without a hand-maintained allowlist.
 fn expect_opcode(op: &Operand) -> majit_ir::OpCode {
     match op {
-        Operand::ConstInt(value) => match *value {
-            0 => majit_ir::OpCode::IntEq,
-            1 => majit_ir::OpCode::IntNe,
-            2 => majit_ir::OpCode::IntLt,
-            3 => majit_ir::OpCode::IntLe,
-            4 => majit_ir::OpCode::IntGt,
-            5 => majit_ir::OpCode::IntGe,
-            other => panic!("unknown OpCode tag {}", other),
-        },
-        _ => panic!("expected ConstInt(opcode_tag), got {:?}", op),
+        Operand::OpCode(code) => *code,
+        _ => panic!("expected OpCode operand, got {:?}", op),
     }
 }
 
@@ -857,13 +906,20 @@ mod tests {
         assert_eq!(jitcode.follow_jump(3), 3);
     }
 
+    /// `assembler.py:197-206` parity: a `Descr` operand attached to an op
+    /// that does not consume a descr in its emitted bytecode MUST NOT be
+    /// registered in `jitcode.descrs`. Registration happens inline during
+    /// per-op encoding — no pre-scan.
     #[test]
-    fn assemble_attaches_switch_descr_after_fix_labels() {
+    fn assemble_does_not_register_unconsumed_descr() {
         let mut switch = SwitchDictDescr::new();
         switch.labels.push((4, TLabel::new("L2")));
 
         let mut ssarepr = SSARepr::new("switch");
         ssarepr.insns.push(Insn::Label(Label::new("L2")));
+        // `abort_permanent` does not consume a descr in its bytecode (it
+        // emits a single BC_ABORT_PERMANENT byte), so the attached
+        // Descr operand is ignored by the assembler.
         ssarepr.insns.push(Insn::op(
             "abort_permanent",
             vec![Operand::Descr(DescrOperand::SwitchDict(switch))],
@@ -871,10 +927,18 @@ mod tests {
 
         let jitcode = assemble(&mut ssarepr, JitCodeBuilder::default(), None);
 
-        assert_eq!(jitcode.descrs.len(), 1);
-        match &jitcode.descrs[0] {
-            BhDescr::Switch { dict } => assert_eq!(dict.get(&4), Some(&0)),
-            other => panic!("expected switch descr, got {:?}", other),
-        }
+        assert!(
+            jitcode.descrs.is_empty(),
+            "descrs attached to non-consuming ops must not be registered; \
+             assembler.py:197-206 registers inline at 'd' argcode emission only, \
+             got descrs={:?}",
+            jitcode.descrs
+        );
     }
+
+    // TODO: once a descr-consuming op (e.g. `switch`, `getfield_gc_d`) is
+    // ported into `dispatch_op`, add a positive test that
+    // `record_descr_operand` is invoked during its encoding and that
+    // `SwitchDictDescr._labels` → `BhDescr::Switch.dict` round-trips via
+    // `fix_labels()`.
 }
