@@ -223,21 +223,21 @@ impl MIFrame {
         // LOAD_FAST uses, BEFORE snapshotting symbolic_locals below.
         let nlocals_pre = self.sym().nlocals;
         let jitcode_ptr_pre = self.sym().jitcode;
-        let (majit_jitcode_raw, py_to_jit_pc_ptr, liveness_info_ptr): (
+        let (majit_jitcode_raw, py_to_jit_pc_ptr): (
             *const majit_metainterp::jitcode::JitCode,
             *const Vec<usize>,
-            *const Vec<u8>,
         ) = unsafe {
             let jc = &*jitcode_ptr_pre;
             match jc.majit_jitcode.as_ref() {
-                Some(m) => (m as *const _, &jc.py_to_jit_pc, &jc.liveness_info),
-                None => (std::ptr::null(), std::ptr::null(), std::ptr::null()),
+                Some(m) => (m as *const _, &jc.py_to_jit_pc),
+                None => (std::ptr::null(), std::ptr::null()),
             }
         };
+        let all_liveness_snapshot = crate::state::liveness_info_snapshot();
         if !majit_jitcode_raw.is_null() {
             let majit_jc = unsafe { &*majit_jitcode_raw };
             let py_to_jit_pc = unsafe { &*py_to_jit_pc_ptr };
-            let all_liveness = unsafe { &*liveness_info_ptr };
+            let all_liveness = &all_liveness_snapshot;
             if let Some(&jit_pc) = py_to_jit_pc.get(live_pc) {
                 let offset = majit_jc.get_live_vars_info_at(jit_pc);
                 let length_i = all_liveness[offset] as u32;

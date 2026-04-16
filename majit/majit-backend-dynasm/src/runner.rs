@@ -222,6 +222,7 @@ impl DynasmBackend {
                 },
                 jitframe_info: None,
                 constant_types: ct,
+                call_assembler_callee_locs: None,
             }
         })
     }
