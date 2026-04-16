@@ -502,8 +502,9 @@ impl CodeWriter {
                 // Superinstruction: two consecutive LoadFast / LoadFastBorrow.
                 // Plain LoadFast (above) is safely lifted to vable_getarrayitem_ref;
                 // the paired superinstruction is kept on move_r until the
-                // getintbound mismatch seen on nbody/fannkuch when both
-                // halves go through vable_getarrayitem_ref is diagnosed.
+                // snapshot-captured-Ref-with-Int-value issue seen on
+                // nbody/fannkuch (memory: superinstruction Phase 5 crash)
+                // is diagnosed and fixed.
                 Instruction::LoadFastBorrowLoadFastBorrow { var_nums }
                 | Instruction::LoadFastLoadFast { var_nums } => {
                     let pair = var_nums.get(op_arg);
