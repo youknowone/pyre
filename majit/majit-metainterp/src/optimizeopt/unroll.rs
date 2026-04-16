@@ -114,7 +114,7 @@ pub struct UnrollOptimizer {
     pub(crate) next_global_opref: u32,
     /// RPython metainterp_sd.callinfocollection parity.
     /// Maps oopspec indices to (calldescr, func_ptr) for generate_modified_call.
-    pub callinfocollection: Option<std::sync::Arc<majit_ir::descr::CallInfoCollection>>,
+    pub callinfocollection: Option<std::sync::Arc<majit_ir::CallInfoCollection>>,
     /// compile.py:221 + optimizer.py:530: call_pure_results from tracing.
     /// Passed through to the inner Optimizer for cross-iteration CALL_PURE folding.
     pub call_pure_results: std::collections::HashMap<Vec<majit_ir::Value>, majit_ir::Value>,

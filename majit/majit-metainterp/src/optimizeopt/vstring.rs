@@ -1080,7 +1080,7 @@ impl OptString {
     ) -> Option<OptimizationResult> {
         // Clone Arc to avoid borrow conflict with ctx
         let cic = ctx.callinfocollection.clone()?;
-        let &(ref calldescr, func_addr) = cic.get(oopspec)?;
+        let &(ref calldescr, func_addr) = cic.callinfo_for_oopspec(oopspec)?;
         let func_const = ctx.alloc_op_position();
         ctx.make_constant(func_const, Value::Int(func_addr as i64));
         let mut call_args = vec![func_const];

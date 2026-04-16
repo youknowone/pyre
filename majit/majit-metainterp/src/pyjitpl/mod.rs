@@ -452,7 +452,7 @@ pub struct MetaInterp<M: Clone> {
     pub(crate) force_finish_trace: bool,
     /// RPython metainterp_sd.callinfocollection parity.
     /// Maps oopspec indices to (calldescr, func_ptr) for generate_modified_call.
-    pub(crate) callinfocollection: Option<std::sync::Arc<majit_ir::descr::CallInfoCollection>>,
+    pub(crate) callinfocollection: Option<std::sync::Arc<majit_ir::CallInfoCollection>>,
     /// info.py:810-822 `ConstPtrInfo.getstrlen1(mode)` runtime hook. The
     /// host runtime (pyre etc.) registers this via
     /// [`MetaInterp::set_string_length_resolver`] at JIT init. Propagated

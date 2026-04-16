@@ -144,7 +144,7 @@ pub struct Optimizer {
     pub string_constant_alloc: Option<crate::optimizeopt::info::StringConstantAllocator>,
     /// RPython metainterp_sd.callinfocollection parity.
     /// Propagated to OptContext for generate_modified_call (vstring.py:853).
-    pub callinfocollection: Option<std::sync::Arc<majit_ir::descr::CallInfoCollection>>,
+    pub callinfocollection: Option<std::sync::Arc<majit_ir::CallInfoCollection>>,
     /// optimizer.py:732 — resume.ResumeDataLoopMemo.
     /// Shared constant pool + box numbering cache across all guards in a loop.
     pub resumedata_memo: crate::resume::ResumeDataLoopMemo,

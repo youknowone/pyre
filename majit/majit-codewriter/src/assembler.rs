@@ -978,7 +978,7 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
 
 // Re-export CallInfoCollection from majit-ir (effectinfo.py::CallInfoCollection).
 // majit-ir already has the RPython-parity version with OopSpecIndex keys.
-pub use majit_ir::descr::CallInfoCollection;
+pub use majit_ir::CallInfoCollection;
 
 impl Assembler {
     /// RPython: `Assembler.see_raw_object(value)` (assembler.py:283-298).
@@ -1017,7 +1017,7 @@ impl Assembler {
     }
 
     pub fn finished(&mut self, callinfocollection: &CallInfoCollection) {
-        for func_addr in callinfocollection.all_function_addresses() {
+        for func_addr in callinfocollection.all_function_addresses_as_int() {
             // RPython: see_raw_object(func.ptr)
             // → name = value._obj._name (for FuncType)
             // → self.list_of_addr2name.append((addr, name))

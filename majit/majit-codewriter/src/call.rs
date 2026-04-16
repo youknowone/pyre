@@ -193,7 +193,7 @@ pub struct CallControl {
 
     /// RPython: `CallControl.callinfocollection` (call.py:31).
     /// Stores oopspec function info for builtin call handling.
-    pub callinfocollection: majit_ir::descr::CallInfoCollection,
+    pub callinfocollection: majit_ir::CallInfoCollection,
 
     /// Next JitCode index to assign.
     next_jitcode_index: usize,
@@ -479,7 +479,7 @@ impl CallControl {
             builtin_targets: HashSet::new(),
             jitcodes: HashMap::new(),
             unfinished_graphs: Vec::new(),
-            callinfocollection: majit_ir::descr::CallInfoCollection::new(),
+            callinfocollection: majit_ir::CallInfoCollection::new(),
             next_jitcode_index: 0,
             elidable_targets: HashSet::new(),
             loopinvariant_targets: HashSet::new(),

@@ -344,7 +344,7 @@ pub struct OptContext {
     /// effectinfo.py: CallInfoCollection — maps oopspec indices to
     /// (calldescr, func_ptr) pairs. Used by generate_modified_call
     /// (vstring.py:853) to emit specialized string comparison calls.
-    pub callinfocollection: Option<std::sync::Arc<majit_ir::descr::CallInfoCollection>>,
+    pub callinfocollection: Option<std::sync::Arc<majit_ir::CallInfoCollection>>,
     /// resume.py parity: per-guard snapshot boxes from tracing time.
     /// Used by emit() to call store_final_boxes_in_guard inline (RPython
     /// calls this during optimization, not post-assembly).
