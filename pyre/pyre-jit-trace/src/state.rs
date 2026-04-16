@@ -2004,49 +2004,28 @@ pub(crate) fn opimpl_virtual_ref_finish(ctx: &mut TraceCtx, sym: &mut PyreSym, v
 }
 
 impl PyreJitState {
-    /// RPython resume.py parity: restore virtualizable frame state directly
-    /// from raw output buffer values, bypassing exit_layout type decoding.
+    /// virtualizable.py:126-137 write_from_resume_data_partial parity.
     ///
-    /// The optimizer may type virtualizable slots as Int (after unboxing),
-    /// but the raw values in the output buffer are always the actual Python
-    /// objects (PyObjectRef pointers). RPython uses FieldDescr at decode time
-    /// to determine types; pyre uses the virtualizable layout to know that
-    /// all array slots (locals + stack) are always Ref (GCREF).
-    pub fn restore_virtualizable_from_raw(
-        &mut self,
-        raw_values: &[i64],
-        slot_types: &[Type],
-    ) -> bool {
+    /// Restore virtualizable frame state from raw output buffer values.
+    /// interp_jit.py:25: locals_cells_stack_w ARRAYITEMTYPE = GCREF.
+    /// All raw values are PyObjectRef pointers — write directly.
+    pub fn restore_virtualizable_from_raw(&mut self, raw_values: &[i64]) -> bool {
         if raw_values.is_empty() {
             return false;
         }
-        // Fail_args layout: [frame, scalars..., active_locals..., active_stack...]
-        // RPython virtualizable.py:126-137 write_from_resume_data_partial:
-        // typed per-slot restore using load_next_value_of_type(ARRAYITEMTYPE).
         let mut idx = crate::virtualizable_gen::virt_restore_scalars_raw(self, raw_values);
 
         let nlocals = self.local_count();
         let stack_only = self.valuestackdepth().saturating_sub(nlocals);
         for local_idx in 0..nlocals {
             if idx < raw_values.len() {
-                let slot_type = slot_types.get(local_idx).copied().unwrap_or(Type::Ref);
-                let _ = self.set_local_at(
-                    local_idx,
-                    boxed_slot_i64_for_type(slot_type, raw_values[idx]),
-                );
+                let _ = self.set_local_at(local_idx, raw_values[idx] as PyObjectRef);
             }
             idx += 1;
         }
         for stack_idx in 0..stack_only {
             if idx < raw_values.len() {
-                let slot_type = slot_types
-                    .get(nlocals + stack_idx)
-                    .copied()
-                    .unwrap_or(Type::Ref);
-                let _ = self.set_stack_at(
-                    stack_idx,
-                    boxed_slot_i64_for_type(slot_type, raw_values[idx]),
-                );
+                let _ = self.set_stack_at(stack_idx, raw_values[idx] as PyObjectRef);
             }
             idx += 1;
         }
@@ -2133,7 +2112,7 @@ impl PyreJitState {
             return;
         }
         if meta.has_virtualizable {
-            self.restore_virtualizable_i64(values, &meta.slot_types);
+            self.restore_virtualizable_i64(values);
         } else {
             let nlocals = self.local_count();
             let stack_only = self.valuestackdepth().saturating_sub(nlocals);
@@ -2294,25 +2273,33 @@ impl PyreJitState {
             && self.locals_cells_stack_array().is_some()
     }
 
-    /// Restore from virtualizable fail_args format:
+    /// virtualizable.py:126-137 write_from_resume_data_partial parity.
+    ///
+    /// Restores virtualizable array slots from the fail_args layout:
     ///   [frame, scalars..., active_locals..., active_stack...]
     ///
-    /// This is the guard failure / fail_args consumer path.
-    /// Carries only ACTIVE slots from current_fail_args(), not the full
-    /// backing array. The full-array restore path is
-    /// import_virtualizable_state (virtualizable.py:126-137 parity).
-    fn restore_virtualizable_i64(&mut self, values: &[i64], slot_types: &[Type]) {
+    /// interp_jit.py:25 declares locals_cells_stack_w as a single
+    /// virtualizable array with uniform ARRAYITEMTYPE = GCREF.
+    /// resume.py:1408 calls write_from_resume_data_partial which loops
+    /// over the array calling reader.load_next_value_of_type(GCREF),
+    /// i.e. reader.next_ref() — every slot is a GCREF pointer.
+    ///
+    /// The raw i64 values here are already PyObjectRef pointers from
+    /// the backend's Ref register bank. Write them directly without
+    /// per-slot type dispatch.
+    fn restore_virtualizable_i64(&mut self, values: &[i64]) {
         let mut idx = crate::virtualizable_gen::virt_restore_scalars_raw(self, values);
 
-        // RPython virtualizable.py:126-137 write_from_resume_data_partial:
-        // reader.load_next_value_of_type(ARRAYITEMTYPE) — typed per slot.
-        // pyre: use slot_types from PyreMeta to re-box Int/Float values
-        // before writing to the PyObjectRef array.
+        // virtualizable.py:134-137:
+        //   for ARRAYITEMTYPE, fieldname in unroll_array_fields:
+        //       lst = getattr(virtualizable, fieldname)
+        //       for j in range(len(lst)):
+        //           lst[j] = reader.load_next_value_of_type(ARRAYITEMTYPE)
+        // ARRAYITEMTYPE is always GCREF for locals_cells_stack_w.
         let nlocals = self.local_count();
         for i in 0..nlocals {
             if idx < values.len() {
-                let slot_type = slot_types.get(i).copied().unwrap_or(Type::Ref);
-                let _ = self.set_local_at(i, boxed_slot_i64_for_type(slot_type, values[idx]));
+                let _ = self.set_local_at(i, values[idx] as PyObjectRef);
             }
             idx += 1;
         }
@@ -2320,8 +2307,7 @@ impl PyreJitState {
         let stack_only = self.valuestackdepth().saturating_sub(nlocals);
         for i in 0..stack_only {
             if idx < values.len() {
-                let slot_type = slot_types.get(nlocals + i).copied().unwrap_or(Type::Ref);
-                let _ = self.set_stack_at(i, boxed_slot_i64_for_type(slot_type, values[idx]));
+                let _ = self.set_stack_at(i, values[idx] as PyObjectRef);
             }
             idx += 1;
         }
