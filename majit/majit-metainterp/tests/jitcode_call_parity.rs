@@ -18,6 +18,8 @@ extern "C" fn sink_sum4(a: i64, b: i64, c: i64, d: i64) {
     LAST_RAW_VOID_SUM.store(a + b + c + d, Ordering::SeqCst);
 }
 
+extern "C" fn concrete_sink_ref_float_int(_value: i64, _factor: i64, _delta: i64) {}
+
 extern "C" fn trace_ref_float_int_sum(value: GcRef, factor: f64, delta: i64) -> i64 {
     value.as_usize() as i64 + factor.floor() as i64 + delta
 }
@@ -593,7 +595,8 @@ fn jitcode_call_assembler_void_preserves_target_token_and_arg_types() {
     root.load_const_f_value(0, 2.5f64.to_bits() as i64);
     root.load_const_i_value(0, 7);
     let token = JitCellToken::new(779);
-    let target_idx = root.add_call_assembler_target(&token, sink_sum4 as *const ());
+    let target_idx =
+        root.add_call_assembler_target(&token, concrete_sink_ref_float_int as *const ());
     root.call_assembler_void_typed_args(
         target_idx,
         &[

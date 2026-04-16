@@ -622,7 +622,6 @@ pub struct PyreSym {
     pub(crate) valuestackdepth: usize,
     #[vable(nlocals)]
     pub(crate) nlocals: usize,
-    pub(crate) symbolic_initialized: bool,
     /// Bridge-specific override for symbolic_locals.
     /// resume.py:1042 parity: when set, init_symbolic uses these OpRefs
     /// (mapped from RebuiltValue::Box(n) in rebuild_from_resumedata) instead
@@ -1717,7 +1716,6 @@ impl PyreSym {
             locals_cells_stack_array_ref: OpRef::NONE,
             valuestackdepth: 0,
             nlocals: 0,
-            symbolic_initialized: false,
             bridge_local_oprefs: None,
             bridge_stack_oprefs: None,
             bridge_local_types: None,
@@ -1757,12 +1755,11 @@ impl PyreSym {
         }
     }
 
-    /// Initialize symbolic tracking state on first trace instruction.
-    /// Subsequent calls are no-ops (state persists across instructions).
+    /// Initialize symbolic tracking state. Called once when the owning
+    /// MetaInterpFrame is pushed (trace.rs for root frame). Callee (inline)
+    /// frames set symbolic state manually in perform_call
+    /// (trace_opcode.rs:3323-3424) and do NOT call this.
     pub(crate) fn init_symbolic(&mut self, ctx: &mut TraceCtx, concrete_frame: usize) {
-        if self.symbolic_initialized {
-            return;
-        }
         self.is_function_entry_trace = ctx.header_pc == 0;
         let nlocals = concrete_nlocals(concrete_frame).unwrap_or(0);
         if majit_metainterp::majit_log_enabled() {
@@ -1889,7 +1886,6 @@ impl PyreSym {
             self.concrete_execution_context = frame.execution_context;
             self.concrete_vable_ptr = concrete_frame as *mut u8;
         }
-        self.symbolic_initialized = true;
     }
 
     /// Stack-only depth (number of values on the operand stack).
@@ -3969,7 +3965,6 @@ mod tests {
         sym.symbolic_locals = vec![obj];
         sym.symbolic_local_types = vec![Type::Ref];
         sym.nlocals = 1;
-        sym.symbolic_initialized = true;
 
         let mut state = MIFrame {
             ctx: &mut ctx,
@@ -4000,7 +3995,6 @@ mod tests {
         sym.symbolic_locals = vec![int_obj];
         sym.symbolic_local_types = vec![Type::Ref];
         sym.nlocals = 1;
-        sym.symbolic_initialized = true;
 
         let mut state = MIFrame {
             ctx: &mut ctx,
@@ -4057,7 +4051,6 @@ mod tests {
 
         let mut ctx = TraceCtx::for_test(1);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
-        sym.symbolic_initialized = true;
 
         let mut state = MIFrame {
             ctx: &mut ctx,
@@ -4351,7 +4344,6 @@ mod tests {
         sym.symbolic_locals = vec![local];
         sym.symbolic_local_types = vec![Type::Int];
         sym.nlocals = 1;
-        sym.symbolic_initialized = true;
 
         let mut state = MIFrame {
             ctx: &mut ctx,
@@ -4380,7 +4372,6 @@ mod tests {
         sym.symbolic_locals = vec![local];
         sym.symbolic_local_types = vec![Type::Ref];
         sym.nlocals = 1;
-        sym.symbolic_initialized = true;
 
         let mut state = MIFrame {
             ctx: &mut ctx,
@@ -4422,7 +4413,6 @@ mod tests {
         sym.symbolic_locals = vec![OpRef::NONE];
         sym.symbolic_local_types = vec![Type::Ref];
         sym.nlocals = 1;
-        sym.symbolic_initialized = true;
         sym.transient_value_types.insert(raw, Type::Int);
 
         let mut state = MIFrame {
@@ -4459,7 +4449,6 @@ mod tests {
         sym.symbolic_locals = vec![key];
         sym.symbolic_local_types = vec![Type::Int];
         sym.nlocals = 1;
-        sym.symbolic_initialized = true;
 
         let mut state = MIFrame {
             ctx: &mut ctx,
@@ -4489,7 +4478,6 @@ mod tests {
         sym.symbolic_locals = vec![lhs, rhs];
         sym.symbolic_local_types = vec![Type::Float, Type::Int];
         sym.nlocals = 2;
-        sym.symbolic_initialized = true;
 
         let mut state = MIFrame {
             ctx: &mut ctx,
@@ -4529,7 +4517,6 @@ mod tests {
         sym.symbolic_locals = vec![callable, arg];
         sym.symbolic_local_types = vec![Type::Ref, Type::Int];
         sym.nlocals = 2;
-        sym.symbolic_initialized = true;
 
         let mut state = MIFrame {
             ctx: &mut ctx,
@@ -4588,7 +4575,6 @@ mod tests {
         let lhs = OpRef(0);
         let rhs = OpRef(1);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
-        sym.symbolic_initialized = true;
         sym.valuestackdepth = 0;
         sym.jitcode = jitcode_for(code_ref);
         sym.transient_value_types.insert(lhs, Type::Int);
@@ -4671,7 +4657,6 @@ mod tests {
         let lhs = OpRef(0);
         let rhs = OpRef(1);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
-        sym.symbolic_initialized = true;
         sym.valuestackdepth = 0;
         sym.jitcode = jitcode_for(code_ref);
         sym.transient_value_types.insert(lhs, Type::Int);
@@ -4766,7 +4751,6 @@ mod tests {
 
         let mut ctx = TraceCtx::for_test(2);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
-        sym.symbolic_initialized = true;
         sym.valuestackdepth = 0;
         sym.jitcode = jitcode_for(code_ref);
 
@@ -4835,7 +4819,6 @@ mod tests {
 
         let mut ctx = TraceCtx::for_test(0);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
-        sym.symbolic_initialized = true;
         sym.last_comparison_truth = Some(OpRef(123));
 
         let mut state = MIFrame {
@@ -4877,7 +4860,6 @@ mod tests {
 
         let mut ctx = TraceCtx::for_test(0);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
-        sym.symbolic_initialized = true;
         sym.nlocals = frame.nlocals();
         sym.valuestackdepth = frame.valuestackdepth;
         sym.last_comparison_truth = Some(OpRef(321));
@@ -4915,7 +4897,6 @@ mod tests {
 
         let mut ctx = TraceCtx::for_test(0);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
-        sym.symbolic_initialized = true;
         sym.nlocals = frame.nlocals();
         sym.valuestackdepth = frame.valuestackdepth - 1;
         sym.transient_value_types.insert(OpRef(77), Type::Int);
@@ -4964,7 +4945,6 @@ mod tests {
         let truth = OpRef(2);
 
         let mut sym = PyreSym::new_uninit(frame_ref);
-        sym.symbolic_initialized = true;
         sym.nlocals = frame.nlocals();
         sym.valuestackdepth = frame.nlocals() + 1;
         sym.symbolic_stack = vec![lower_stack];
@@ -5017,7 +4997,6 @@ mod tests {
         let truth = OpRef(2);
 
         let mut sym = PyreSym::new_uninit(frame_ref);
-        sym.symbolic_initialized = true;
         sym.nlocals = frame.nlocals();
         sym.valuestackdepth = frame.nlocals() + 1;
         sym.symbolic_stack = vec![lower_stack];
@@ -5068,7 +5047,6 @@ mod tests {
         let frame_ref = OpRef(0);
         let truth = OpRef(1);
         let mut sym = PyreSym::new_uninit(frame_ref);
-        sym.symbolic_initialized = true;
         sym.nlocals = frame.nlocals();
         sym.valuestackdepth = frame.valuestackdepth;
         sym.symbolic_stack = vec![truth];
@@ -5108,7 +5086,6 @@ mod tests {
         let stack1 = OpRef(3);
 
         let mut sym = PyreSym::new_uninit(frame_ref);
-        sym.symbolic_initialized = true;
         sym.nlocals = 1;
         sym.valuestackdepth = 3;
         sym.vable_last_instr = ctx.const_int(12);
@@ -5161,7 +5138,6 @@ mod tests {
         let frame_ref = OpRef(0);
         let code_ref = frame.pycode;
         let mut sym = PyreSym::new_uninit(frame_ref);
-        sym.symbolic_initialized = true;
         sym.nlocals = 1;
         sym.valuestackdepth = 2;
         sym.vable_last_instr = ctx.const_int(33);
@@ -5218,7 +5194,6 @@ mod tests {
         let stack1 = ctx.const_ref(0x6000);
 
         let mut sym = PyreSym::new_uninit(frame_ref);
-        sym.symbolic_initialized = true;
         sym.nlocals = 1;
         sym.valuestackdepth = 3;
         sym.vable_last_instr = ctx.const_int(33);
@@ -5286,7 +5261,6 @@ mod tests {
         sym.symbolic_local_types = vec![Type::Ref, Type::Ref];
         sym.nlocals = 2;
         sym.valuestackdepth = frame.stack_base();
-        sym.symbolic_initialized = true;
 
         let mut state = MIFrame {
             ctx: &mut ctx,
@@ -5349,7 +5323,6 @@ mod tests {
         sym.symbolic_locals = vec![list, key];
         sym.symbolic_local_types = vec![Type::Ref, Type::Int];
         sym.nlocals = 2;
-        sym.symbolic_initialized = true;
 
         let mut state = MIFrame {
             ctx: &mut ctx,
@@ -5412,7 +5385,6 @@ mod tests {
         sym.symbolic_locals = vec![list, value];
         sym.symbolic_local_types = vec![Type::Ref, Type::Int];
         sym.nlocals = 2;
-        sym.symbolic_initialized = true;
         sym.transient_value_types.insert(value, Type::Int);
 
         let mut state = MIFrame {
@@ -5504,7 +5476,6 @@ mod tests {
         sym.symbolic_locals = vec![list, value];
         sym.symbolic_local_types = vec![Type::Ref, Type::Float];
         sym.nlocals = 2;
-        sym.symbolic_initialized = true;
         sym.transient_value_types.insert(value, Type::Float);
 
         let mut state = MIFrame {
@@ -5584,7 +5555,6 @@ mod tests {
         sym.symbolic_stack_types = vec![Type::Ref];
         sym.concrete_stack = vec![ConcreteValue::Ref(range_iter)];
         sym.valuestackdepth = 1;
-        sym.symbolic_initialized = true;
 
         let mut state = MIFrame {
             ctx: &mut ctx,

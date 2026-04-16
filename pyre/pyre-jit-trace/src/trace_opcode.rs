@@ -136,7 +136,9 @@ impl MIFrame {
         fallthrough_pc: usize,
         opcode_start_pc: usize,
     ) -> Self {
-        sym.init_symbolic(ctx, concrete_frame);
+        // sym was initialized when its owning MetaInterpFrame was pushed
+        // (trace.rs root push / metainterp.rs perform_call). MIFrame is a
+        // borrowed per-instruction view; no re-initialization here.
         // RPython pyjitpl.py: orgpc = opcode start PC passed to each handler.
         let orgpc = opcode_start_pc;
         Self {
@@ -3329,7 +3331,6 @@ impl MIFrame {
             sym.symbolic_local_types = args.iter().map(|&arg| self.value_type(arg)).collect();
             sym.symbolic_stack = Vec::new();
             sym.symbolic_stack_types = Vec::new();
-            sym.symbolic_initialized = true;
             // MIFrame Box tracking: set concrete metadata for callee
             sym.concrete_locals = concrete_args
                 .iter()
@@ -3409,7 +3410,6 @@ impl MIFrame {
             }
             sym.symbolic_stack = Vec::new();
             sym.symbolic_stack_types = Vec::new();
-            sym.symbolic_initialized = true;
             // MIFrame Box tracking: set concrete metadata for callee
             sym.concrete_locals = concrete_args
                 .iter()

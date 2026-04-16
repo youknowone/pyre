@@ -30,6 +30,11 @@ pub fn trace_bytecode(
     concrete_frame.set_last_instr_from_next_instr(start_pc);
     let w_code = concrete_frame.pycode;
     let cf_addr = &*concrete_frame as *const pyre_interpreter::pyframe::PyFrame as usize;
+    // pyjitpl.py:65 MIFrame.__init__: sym fields populated once at frame
+    // construction. Callee (inline) frames are set up by perform_call
+    // (trace_opcode.rs:3323-3424) and don't call init_symbolic; this path
+    // handles the root frame push.
+    sym.init_symbolic(ctx, cf_addr);
     let frame = MetaInterpFrame {
         sym: sym as *mut PyreSym,
         owned_sym: None,
