@@ -1230,12 +1230,15 @@ impl Optimization for OptString {
             // vstring.py: oopspec call handlers for string operations.
             // STR_CONCAT, STR_SLICE, STR_EQUAL are dispatched by OopSpecIndex
             // on CALL_* ops. For now, check if the call is a string oopspec.
-            // vstring.py: oopspec call dispatch (CALL and CALL_PURE).
+            // vstring.py:621-627: optimize_CALL_R/F/N + optimize_CALL_PURE_*
+            // are all aliased to optimize_CALL_I.
             OpCode::CallI
             | OpCode::CallR
+            | OpCode::CallF
             | OpCode::CallN
             | OpCode::CallPureI
             | OpCode::CallPureR
+            | OpCode::CallPureF
             | OpCode::CallPureN => {
                 if let Some(ref descr) = op.descr {
                     if let Some(cd) = descr.as_call_descr() {

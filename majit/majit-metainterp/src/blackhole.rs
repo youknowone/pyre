@@ -2340,6 +2340,337 @@ impl BlackholeInterpreter {
     }
 }
 
+// ════════════════════════════════════════════════════════════════════════
+// bhimpl_*_call_* family (blackhole.py:1095-1320)
+// ════════════════════════════════════════════════════════════════════════
+//
+// These methods mirror RPython's blackhole call dispatch table. Each
+// variant unpacks one of the three calling-convention shapes
+// (`r` / `ir` / `irf`) into a `Backend::bh_call_{i,r,f,v}` invocation
+// and returns the typed result.  The `recursive_call` family adds a
+// jitdriver-index lookup via `get_portal_runner`.
+//
+// **Not on the dispatch table yet.**  Pyre's blackhole is IR-driven
+// (BC_RESIDUAL_CALL_* / BC_CALL_MAY_FORCE_* / etc. live in
+// `pyjitpl/dispatch.rs::JitCodeMachine::dispatch_one`) rather than
+// driven by an opname lookup like RPython's
+// `BlackholeInterpBuilder.setup_insns`.  The methods below are
+// implemented but currently unreachable from the runtime — they
+// exist so that, once the codewriter's bhimpl-binding pass lands, the
+// dispatcher emitted by `BlackholeInterpBuilder::setup_insns` can
+// route opcodes directly to them with no body changes.  Treat them as
+// API surface only, **not** as proof that pyre's blackhole already
+// handles residual / inline / recursive calls in the upstream way.
+
+impl BlackholeInterpreter {
+    fn cpu(&self) -> &'static dyn majit_backend::Backend {
+        self.cpu.expect("blackhole cpu reference unset")
+    }
+
+    // ── bhimpl_residual_call_* (blackhole.py:1224-1255) ──
+
+    /// blackhole.py:1225-1226
+    pub fn bhimpl_residual_call_r_i(
+        &self,
+        func: i64,
+        args_r: &[i64],
+        calldescr: &majit_codewriter::jitcode::BhCallDescr,
+    ) -> i64 {
+        self.cpu()
+            .bh_call_i(func, None, Some(args_r), None, calldescr)
+    }
+
+    /// blackhole.py:1227-1229
+    pub fn bhimpl_residual_call_r_r(
+        &self,
+        func: i64,
+        args_r: &[i64],
+        calldescr: &majit_codewriter::jitcode::BhCallDescr,
+    ) -> majit_ir::GcRef {
+        self.cpu()
+            .bh_call_r(func, None, Some(args_r), None, calldescr)
+    }
+
+    /// blackhole.py:1230-1232
+    pub fn bhimpl_residual_call_r_v(
+        &self,
+        func: i64,
+        args_r: &[i64],
+        calldescr: &majit_codewriter::jitcode::BhCallDescr,
+    ) {
+        self.cpu()
+            .bh_call_v(func, None, Some(args_r), None, calldescr);
+    }
+
+    /// blackhole.py:1234-1236
+    pub fn bhimpl_residual_call_ir_i(
+        &self,
+        func: i64,
+        args_i: &[i64],
+        args_r: &[i64],
+        calldescr: &majit_codewriter::jitcode::BhCallDescr,
+    ) -> i64 {
+        self.cpu()
+            .bh_call_i(func, Some(args_i), Some(args_r), None, calldescr)
+    }
+
+    /// blackhole.py:1237-1239
+    pub fn bhimpl_residual_call_ir_r(
+        &self,
+        func: i64,
+        args_i: &[i64],
+        args_r: &[i64],
+        calldescr: &majit_codewriter::jitcode::BhCallDescr,
+    ) -> majit_ir::GcRef {
+        self.cpu()
+            .bh_call_r(func, Some(args_i), Some(args_r), None, calldescr)
+    }
+
+    /// blackhole.py:1240-1242
+    pub fn bhimpl_residual_call_ir_v(
+        &self,
+        func: i64,
+        args_i: &[i64],
+        args_r: &[i64],
+        calldescr: &majit_codewriter::jitcode::BhCallDescr,
+    ) {
+        self.cpu()
+            .bh_call_v(func, Some(args_i), Some(args_r), None, calldescr);
+    }
+
+    /// blackhole.py:1244-1246
+    pub fn bhimpl_residual_call_irf_i(
+        &self,
+        func: i64,
+        args_i: &[i64],
+        args_r: &[i64],
+        args_f: &[i64],
+        calldescr: &majit_codewriter::jitcode::BhCallDescr,
+    ) -> i64 {
+        self.cpu()
+            .bh_call_i(func, Some(args_i), Some(args_r), Some(args_f), calldescr)
+    }
+
+    /// blackhole.py:1247-1249
+    pub fn bhimpl_residual_call_irf_r(
+        &self,
+        func: i64,
+        args_i: &[i64],
+        args_r: &[i64],
+        args_f: &[i64],
+        calldescr: &majit_codewriter::jitcode::BhCallDescr,
+    ) -> majit_ir::GcRef {
+        self.cpu()
+            .bh_call_r(func, Some(args_i), Some(args_r), Some(args_f), calldescr)
+    }
+
+    /// blackhole.py:1250-1252
+    pub fn bhimpl_residual_call_irf_f(
+        &self,
+        func: i64,
+        args_i: &[i64],
+        args_r: &[i64],
+        args_f: &[i64],
+        calldescr: &majit_codewriter::jitcode::BhCallDescr,
+    ) -> f64 {
+        self.cpu()
+            .bh_call_f(func, Some(args_i), Some(args_r), Some(args_f), calldescr)
+    }
+
+    /// blackhole.py:1253-1255
+    pub fn bhimpl_residual_call_irf_v(
+        &self,
+        func: i64,
+        args_i: &[i64],
+        args_r: &[i64],
+        args_f: &[i64],
+        calldescr: &majit_codewriter::jitcode::BhCallDescr,
+    ) {
+        self.cpu()
+            .bh_call_v(func, Some(args_i), Some(args_r), Some(args_f), calldescr);
+    }
+
+    // ── bhimpl_inline_call_* (blackhole.py:1278-1319) ──
+    //
+    // RPython unpacks `jitcode.fnaddr` and `jitcode.calldescr` from the
+    // jitcode parameter; pyre passes them directly so the pyre tracer
+    // can reuse the helpers without a JitCode object.
+
+    /// blackhole.py:1279-1281
+    pub fn bhimpl_inline_call_r_i(
+        &self,
+        fnaddr: i64,
+        args_r: &[i64],
+        calldescr: &majit_codewriter::jitcode::BhCallDescr,
+    ) -> i64 {
+        self.bhimpl_residual_call_r_i(fnaddr, args_r, calldescr)
+    }
+    /// blackhole.py:1282-1285
+    pub fn bhimpl_inline_call_r_r(
+        &self,
+        fnaddr: i64,
+        args_r: &[i64],
+        calldescr: &majit_codewriter::jitcode::BhCallDescr,
+    ) -> majit_ir::GcRef {
+        self.bhimpl_residual_call_r_r(fnaddr, args_r, calldescr)
+    }
+    /// blackhole.py:1286-1289
+    pub fn bhimpl_inline_call_r_v(
+        &self,
+        fnaddr: i64,
+        args_r: &[i64],
+        calldescr: &majit_codewriter::jitcode::BhCallDescr,
+    ) {
+        self.bhimpl_residual_call_r_v(fnaddr, args_r, calldescr);
+    }
+    /// blackhole.py:1291-1294
+    pub fn bhimpl_inline_call_ir_i(
+        &self,
+        fnaddr: i64,
+        args_i: &[i64],
+        args_r: &[i64],
+        calldescr: &majit_codewriter::jitcode::BhCallDescr,
+    ) -> i64 {
+        self.bhimpl_residual_call_ir_i(fnaddr, args_i, args_r, calldescr)
+    }
+    /// blackhole.py:1295-1298
+    pub fn bhimpl_inline_call_ir_r(
+        &self,
+        fnaddr: i64,
+        args_i: &[i64],
+        args_r: &[i64],
+        calldescr: &majit_codewriter::jitcode::BhCallDescr,
+    ) -> majit_ir::GcRef {
+        self.bhimpl_residual_call_ir_r(fnaddr, args_i, args_r, calldescr)
+    }
+    /// blackhole.py:1299-1302
+    pub fn bhimpl_inline_call_ir_v(
+        &self,
+        fnaddr: i64,
+        args_i: &[i64],
+        args_r: &[i64],
+        calldescr: &majit_codewriter::jitcode::BhCallDescr,
+    ) {
+        self.bhimpl_residual_call_ir_v(fnaddr, args_i, args_r, calldescr);
+    }
+    /// blackhole.py:1304-1307
+    pub fn bhimpl_inline_call_irf_i(
+        &self,
+        fnaddr: i64,
+        args_i: &[i64],
+        args_r: &[i64],
+        args_f: &[i64],
+        calldescr: &majit_codewriter::jitcode::BhCallDescr,
+    ) -> i64 {
+        self.bhimpl_residual_call_irf_i(fnaddr, args_i, args_r, args_f, calldescr)
+    }
+    /// blackhole.py:1308-1311
+    pub fn bhimpl_inline_call_irf_r(
+        &self,
+        fnaddr: i64,
+        args_i: &[i64],
+        args_r: &[i64],
+        args_f: &[i64],
+        calldescr: &majit_codewriter::jitcode::BhCallDescr,
+    ) -> majit_ir::GcRef {
+        self.bhimpl_residual_call_irf_r(fnaddr, args_i, args_r, args_f, calldescr)
+    }
+    /// blackhole.py:1312-1315
+    pub fn bhimpl_inline_call_irf_f(
+        &self,
+        fnaddr: i64,
+        args_i: &[i64],
+        args_r: &[i64],
+        args_f: &[i64],
+        calldescr: &majit_codewriter::jitcode::BhCallDescr,
+    ) -> f64 {
+        self.bhimpl_residual_call_irf_f(fnaddr, args_i, args_r, args_f, calldescr)
+    }
+    /// blackhole.py:1316-1319
+    pub fn bhimpl_inline_call_irf_v(
+        &self,
+        fnaddr: i64,
+        args_i: &[i64],
+        args_r: &[i64],
+        args_f: &[i64],
+        calldescr: &majit_codewriter::jitcode::BhCallDescr,
+    ) {
+        self.bhimpl_residual_call_irf_v(fnaddr, args_i, args_r, args_f, calldescr);
+    }
+
+    // ── bhimpl_recursive_call_{i,f,v} (blackhole.py:1102-1132) ──
+    //
+    // The `_r` variant already lives further up in this file (line ~1165),
+    // pre-existing pyre code that uses `jdindex` + `get_portal_runner`.
+    // The remaining three follow the same pattern for parity.
+
+    /// blackhole.py:1102-1108
+    pub fn bhimpl_recursive_call_i(
+        &self,
+        jdindex: usize,
+        greens_i: Vec<i64>,
+        greens_r: Vec<i64>,
+        greens_f: Vec<i64>,
+        reds_i: Vec<i64>,
+        reds_r: Vec<i64>,
+        reds_f: Vec<i64>,
+    ) -> i64 {
+        let (fnptr, calldescr) = self.get_portal_runner(jdindex);
+        let mut all_i = greens_i;
+        all_i.extend(&reds_i);
+        let mut all_r = greens_r;
+        all_r.extend(&reds_r);
+        let mut all_f = greens_f;
+        all_f.extend(&reds_f);
+        self.cpu()
+            .bh_call_i(fnptr, Some(&all_i), Some(&all_r), Some(&all_f), &calldescr)
+    }
+
+    /// blackhole.py:1117-1124
+    pub fn bhimpl_recursive_call_f(
+        &self,
+        jdindex: usize,
+        greens_i: Vec<i64>,
+        greens_r: Vec<i64>,
+        greens_f: Vec<i64>,
+        reds_i: Vec<i64>,
+        reds_r: Vec<i64>,
+        reds_f: Vec<i64>,
+    ) -> f64 {
+        let (fnptr, calldescr) = self.get_portal_runner(jdindex);
+        let mut all_i = greens_i;
+        all_i.extend(&reds_i);
+        let mut all_r = greens_r;
+        all_r.extend(&reds_r);
+        let mut all_f = greens_f;
+        all_f.extend(&reds_f);
+        self.cpu()
+            .bh_call_f(fnptr, Some(&all_i), Some(&all_r), Some(&all_f), &calldescr)
+    }
+
+    /// blackhole.py:1125-1132
+    pub fn bhimpl_recursive_call_v(
+        &self,
+        jdindex: usize,
+        greens_i: Vec<i64>,
+        greens_r: Vec<i64>,
+        greens_f: Vec<i64>,
+        reds_i: Vec<i64>,
+        reds_r: Vec<i64>,
+        reds_f: Vec<i64>,
+    ) {
+        let (fnptr, calldescr) = self.get_portal_runner(jdindex);
+        let mut all_i = greens_i;
+        all_i.extend(&reds_i);
+        let mut all_r = greens_r;
+        all_r.extend(&reds_r);
+        let mut all_f = greens_f;
+        all_f.extend(&reds_f);
+        self.cpu()
+            .bh_call_v(fnptr, Some(&all_i), Some(&all_r), Some(&all_f), &calldescr);
+    }
+}
+
 /// Pool manager + dispatch builder for blackhole interpreters.
 ///
 /// RPython `blackhole.py:52-103` `class BlackholeInterpBuilder`.

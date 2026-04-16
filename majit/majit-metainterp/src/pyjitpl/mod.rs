@@ -517,6 +517,12 @@ pub struct MetaInterp<M: Clone> {
     /// Default: `Some(default_cls_of_box)` — reads typeptr at offset 0,
     /// matching backend/model.py:199-201.
     pub(crate) cls_of_box: Option<fn(i64) -> i64>,
+
+    /// pyjitpl.py:2179 `self.metainterp.staticdata` — per-process
+    /// static lookup tables (insns, descrs, indirectcalltargets,
+    /// list_of_addr2name).  See [`MetaInterpStaticData`] for the
+    /// methods that read this field.
+    pub staticdata: MetaInterpStaticData,
 }
 
 /// Internal mutable counters for JIT compilation statistics.
@@ -905,6 +911,7 @@ impl<M: Clone> MetaInterp<M> {
             all_descrs: Vec::new(),
             pending_frontend_boxes: None,
             cls_of_box: Some(default_cls_of_box),
+            staticdata: MetaInterpStaticData::new(),
         }
     }
 
@@ -7113,6 +7120,304 @@ impl<M: Clone> MetaInterp<M> {
             .unwrap_or(0)
     }
 
+    // ────────────────────────────────────────────────────────────────
+    // Frame-management surface mirroring pyjitpl.py:2421-2477.
+    //
+    // **Skeleton stubs.**  Each method here exists so that future call
+    // sites compile against the upstream signature, but the bodies
+    // currently forward through pyre's `enter_inline_frame` /
+    // `leave_inline_frame` (which only maintain the trace-side
+    // `inline_depth` counter) and therefore do NOT yet implement the
+    // upstream call/return protocol.  The pieces still missing are:
+    //
+    // - `MetaInterp<M>` does not own a real `MIFrameStack`, so
+    //   `perform_call` cannot construct an `MIFrame` and call
+    //   `f.setup_call(boxes)` (frame.rs already exposes the method).
+    // - `popframe` does not invoke `frame.cleanup_registers()` or
+    //   restore caller registers — the cleanup helper exists on
+    //   MIFrame but has no live frame to act on.
+    // - `finishframe` does not write the result back into the caller
+    //   frame via `make_result_of_lastop`, nor does it raise
+    //   `DoneWithThisFrame*` when the framestack is empty.
+    // - `is_main_jitcode` cannot consult `jitcode.jitdriver_sd.is_recursive`
+    //   because pyre has no JitCode-by-index registry on MetaInterp.
+    //
+    // Wiring all of this requires adding `framestack: MIFrameStack<'a>`
+    // (and the lifetime parameter) to `MetaInterp<M>`; that landing is
+    // tracked separately.  Until then, treat the methods below as the
+    // upstream API surface only — their bodies match RPython names but
+    // not behaviour.
+    // ────────────────────────────────────────────────────────────────
+
+    /// pyjitpl.py:2421-2425 `MetaInterp.perform_call(jitcode, boxes, greenkey)`.
+    ///
+    /// ```python
+    /// def perform_call(self, jitcode, boxes, greenkey=None):
+    ///     # causes the metainterp to enter the given subfunction
+    ///     f = self.newframe(jitcode, greenkey)
+    ///     f.setup_call(boxes)
+    ///     raise ChangeFrame
+    /// ```
+    ///
+    /// The `jitcode` parameter is identified by the
+    /// [`MetaInterpStaticData::indirectcalltargets`] slot index (see
+    /// `bytecode_for_address`).  `argboxes` mirrors RPython's `boxes`
+    /// list of [`OpRef`]s in declaration order.
+    pub fn perform_call(
+        &mut self,
+        jitcode_idx: usize,
+        _argboxes: &[OpRef],
+        greenkey: Option<u64>,
+    ) -> Result<(), ChangeFrame> {
+        let _ = self.newframe(jitcode_idx, greenkey);
+        // pyjitpl.py:2424: f.setup_call(boxes).  MIFrame::setup_call
+        // (frame.rs) is the named entry point; pyre's MetaInterp does
+        // not yet own a real MIFrameStack so we cannot call it from
+        // here without a frame to act on.  Callers that already have a
+        // MIFrame (JitCodeMachine BC_INLINE_CALL, etc.) invoke
+        // setup_call directly.
+        Err(ChangeFrame)
+    }
+
+    /// pyjitpl.py:2427-2429 `MetaInterp.is_main_jitcode(jitcode)`.
+    ///
+    /// Returns true when the jitcode is the recursive portal jitcode of
+    /// some jitdriver.  Pyre tracks portal targets via
+    /// `WarmEnterState`'s pending-token map; a slot is "main" when its
+    /// `tracing_call_depth` invariant matches the recorded portal.
+    pub fn is_main_jitcode(&self, _jitcode_idx: usize) -> bool {
+        // PRE-EXISTING-ADAPTATION: pyre stores the portal jitcode as a
+        // WarmEnterState pending token rather than a JitCode reference;
+        // until that slot is exposed we approximate `True` with the
+        // inline_depth invariant — the outermost frame is always the
+        // portal in pyre.
+        self.inline_depth() == 0
+    }
+
+    /// pyjitpl.py:2432-2452 `MetaInterp.newframe(jitcode, greenkey)`.
+    ///
+    /// Pushes a new MIFrame onto `self.framestack` and bumps the
+    /// portal call depth when the jitcode belongs to a jitdriver.
+    pub fn newframe(&mut self, jitcode_idx: usize, greenkey: Option<u64>) -> usize {
+        // pyjitpl.py:2433: if jitcode.jitdriver_sd: portal_call_depth += 1
+        if self.is_main_jitcode(jitcode_idx) {
+            // pyjitpl.py:2440-2441: enter_portal_frame on greenkey
+            if let Some(unique_id) = greenkey {
+                self.enter_portal_frame(0, unique_id);
+            }
+        }
+        // pyjitpl.py:2446-2451: reuse / allocate MIFrame, push onto framestack.
+        // Pyre uses `enter_inline_frame` which already maintains the
+        // inline-depth invariant; the actual MIFrame allocation lands
+        // with the framestack worker.
+        let _ = self.enter_inline_frame(greenkey.unwrap_or_default());
+        jitcode_idx
+    }
+
+    /// pyjitpl.py:2454-2456 `MetaInterp.enter_portal_frame(jd_no, unique_id)`.
+    pub fn enter_portal_frame(&mut self, _jd_no: usize, _unique_id: u64) {
+        // pyjitpl.py:2455: history.record2(rop.ENTER_PORTAL_FRAME, ...)
+        // PRE-EXISTING-ADAPTATION: pyre records ENTER_PORTAL_FRAME via
+        // the trace recorder when JitDriverStaticData lands per-driver
+        // jd_no metadata.  The named entry stays so call sites can wire
+        // through the existing record path.
+    }
+
+    /// pyjitpl.py:2458-2459 `MetaInterp.leave_portal_frame(jd_no)`.
+    pub fn leave_portal_frame(&mut self, _jd_no: usize) {
+        // pyjitpl.py:2459: history.record1(rop.LEAVE_PORTAL_FRAME, ...)
+    }
+
+    /// pyjitpl.py:2462-2477 `MetaInterp.popframe(leave_portal_frame=True)`.
+    pub fn popframe(&mut self, _leave_portal_frame: bool) {
+        // pyjitpl.py:2466-2468: portal_call_depth -= 1; leave_portal_frame.
+        self.leave_inline_frame();
+    }
+
+    /// pyjitpl.py:2479-2503 `MetaInterp.finishframe(resultbox, leave_portal_frame=True)`.
+    ///
+    /// Handle a non-exceptional return from the current frame:
+    ///   1. clear `last_exc_value`,
+    ///   2. `popframe(leave_portal_frame)`,
+    ///   3. if framestack is non-empty, write the result into the
+    ///      caller frame via `make_result_of_lastop` and signal
+    ///      `ChangeFrame`,
+    ///   4. otherwise compile the loop result and raise the
+    ///      appropriate `DoneWithThisFrame*`.
+    ///
+    /// PRE-EXISTING-ADAPTATION: pyre's `MetaInterp<M>` does not yet
+    /// own a real `MIFrameStack`; framestack tracking lives inside
+    /// `JitCodeMachine`.  The stub mirrors `popframe`'s shape so call
+    /// sites already line up with the upstream contract — it returns
+    /// `Err(ChangeFrame)` whenever a caller frame would still exist
+    /// (matching the `raise ChangeFrame` branch) and `Ok(())` when
+    /// the frame stack is exhausted.
+    pub fn finishframe(&mut self, leave_portal_frame: bool) -> Result<(), ChangeFrame> {
+        // pyjitpl.py:2481: self.last_exc_value = lltype.nullptr(...)
+        // pyjitpl.py:2482: self.popframe(leave_portal_frame=...)
+        self.popframe(leave_portal_frame);
+        // pyjitpl.py:2483: if self.framestack: ... raise ChangeFrame
+        if self.inline_depth() > 0 {
+            return Err(ChangeFrame);
+        }
+        // pyjitpl.py:2487-2503: compile_done_with_this_frame and the
+        // DoneWithThisFrame* raise live behind pyre's portal-runner
+        // shim; stub returns Ok so callers see the "frame stack
+        // exhausted" branch as a value rather than an exception.
+        Ok(())
+    }
+
+    /// pyjitpl.py:2174-2186 `MIFrame.do_residual_or_indirect_call`.
+    ///
+    /// ```python
+    /// def do_residual_or_indirect_call(self, funcbox, argboxes, calldescr, pc):
+    ///     """The 'residual_call' operation is emitted in two cases:
+    ///     when we have to generate a residual CALL operation, but also
+    ///     to handle an indirect_call that may need to be inlined."""
+    ///     if isinstance(funcbox, Const):
+    ///         sd = self.metainterp.staticdata
+    ///         key = funcbox.getaddr()
+    ///         jitcode = sd.bytecode_for_address(key)
+    ///         if jitcode is not None:
+    ///             # we should follow calls to this graph
+    ///             return self.metainterp.perform_call(jitcode, argboxes)
+    ///     # but we should not follow calls to that graph
+    ///     return self.do_residual_call(funcbox, argboxes, calldescr, pc)
+    /// ```
+    ///
+    /// PRE-EXISTING-ADAPTATION: pyre's MIFrame is a thin shell that
+    /// the parallel framestack worker is fleshing out, so the canonical
+    /// body lives on `MetaInterp<M>` for now.  When MIFrame gains its
+    /// own `metainterp` back-pointer, move this method to MIFrame and
+    /// have it delegate via `self.metainterp.staticdata.bytecode_for_address`
+    /// — the body below remains line-for-line identical.
+    ///
+    /// Returns:
+    /// - `Err(ChangeFrame)` when the funcaddr resolved to an
+    ///   indirect-call target and `perform_call` raised `ChangeFrame`
+    ///   (control transfers into the inlined callee — no return value).
+    /// - `Ok(Some(box))` / `Ok(None)` when the call was emitted as a
+    ///   residual `CALL_*` IR op (caller continues with the residual
+    ///   return value).
+    pub fn do_residual_or_indirect_call(
+        &mut self,
+        funcbox_addr: Option<usize>,
+        argboxes: &[OpRef],
+        calldescr: u64,
+        pc: usize,
+    ) -> Result<Option<OpRef>, ChangeFrame> {
+        // pyjitpl.py:2178: if isinstance(funcbox, Const):
+        if let Some(key) = funcbox_addr {
+            // pyjitpl.py:2179: sd = self.metainterp.staticdata
+            // pyjitpl.py:2181: jitcode = sd.bytecode_for_address(key)
+            if let Some(jitcode_idx) = self.staticdata.bytecode_for_address(key) {
+                // pyjitpl.py:2184: return self.metainterp.perform_call(jitcode, argboxes)
+                self.perform_call(jitcode_idx, argboxes, None)?;
+                unreachable!("perform_call always raises ChangeFrame");
+            }
+        }
+        // pyjitpl.py:2186: return self.do_residual_call(funcbox, argboxes, calldescr, pc)
+        Ok(self.do_residual_call(funcbox_addr, argboxes, calldescr, pc))
+    }
+
+    /// pyjitpl.py:1995-2073 `MIFrame.do_residual_call`.
+    ///
+    /// **Stub.**  Returns `None` (no IR op emitted, caller continues
+    /// with the path it already takes).  The full upstream body is
+    /// not ported yet; the missing pieces are:
+    ///
+    /// 1. EffectInfo lookup off the calldescr to choose between
+    ///    `CALL_*`, `CALL_MAY_FORCE_*`, `CALL_LOOPINVARIANT_*`,
+    ///    `CALL_RELEASE_GIL_*`, `CALL_PURE_*` (pyjitpl.py:2003-2030).
+    /// 2. Heap-cache invalidation per EffectInfo
+    ///    (`heapcache.invalidate_caches_for_*` per pyjitpl.py:2031).
+    /// 3. Force-virtualizable / force-virtual handling
+    ///    (pyjitpl.py:2034-2050).
+    /// 4. `GUARD_NO_EXCEPTION` / `GUARD_NOT_FORCED` emission
+    ///    (pyjitpl.py:2052-2065).
+    /// 5. `assembler_call` / `assembler_call_jd` plumbing for
+    ///    `CALL_ASSEMBLER_*` (pyjitpl.py:2067-2073).
+    ///
+    /// Pyre's tracer (`trace_opcode.rs::call_callable_value`) still
+    /// owns the residual-call emission while these branches remain
+    /// unported; once the full body lands the tracer will delegate
+    /// here per Phase 10A of the porting plan.
+    pub fn do_residual_call(
+        &mut self,
+        _funcbox_addr: Option<usize>,
+        _argboxes: &[OpRef],
+        _calldescr: u64,
+        _pc: usize,
+    ) -> Option<OpRef> {
+        None
+    }
+
+    /// pyjitpl.py:1425-1432 `MIFrame.do_recursive_call`.
+    ///
+    /// **Stub — does NOT match upstream semantics yet.**  RPython:
+    ///
+    /// ```python
+    /// def do_recursive_call(self, targetjitdriver_sd, allboxes, pc,
+    ///                       assembler_call=False):
+    ///     portal_code = targetjitdriver_sd.mainjitcode
+    ///     k = targetjitdriver_sd.portal_runner_adr
+    ///     funcbox = ConstInt(adr2int(k))
+    ///     return self.do_residual_call(funcbox, allboxes,
+    ///                                  portal_code.calldescr, pc,
+    ///                                  assembler_call=assembler_call,
+    ///                                  assembler_call_jd=targetjitdriver_sd)
+    /// ```
+    ///
+    /// Upstream emits a residual `CALL_*` op into the portal runner
+    /// (with the `assembler_call` flag flipping it to
+    /// `CALL_ASSEMBLER_*`).  Pyre cannot do that yet because
+    /// `do_residual_call` is itself a stub (see above), so this method
+    /// forwards to `perform_call` for now — that gets the runtime to
+    /// signal `ChangeFrame` but it inlines the callee instead of
+    /// emitting the assembler-call op.  Replace the body with a real
+    /// `self.do_residual_call(funcbox, argboxes, calldescr, pc, ...)`
+    /// once Phase 7C lands.
+    pub fn do_recursive_call(
+        &mut self,
+        jitcode_idx: usize,
+        argboxes: &[OpRef],
+        greenkey: Option<u64>,
+    ) -> Result<(), ChangeFrame> {
+        self.perform_call(jitcode_idx, argboxes, greenkey)
+    }
+
+    /// pyjitpl.py:2080-2151 `MIFrame.do_conditional_call`.
+    ///
+    /// **Stub.**  Returns `None`.  The full upstream body covers:
+    ///
+    /// 1. `is_value` short-circuit returning `valuebox` when the
+    ///    cached `COND_CALL_VALUE_*` already produced a non-zero
+    ///    result (pyjitpl.py:2087-2107).
+    /// 2. Constant condition fold — when `condbox` is constant zero
+    ///    the call is dropped, otherwise it is emitted as plain
+    ///    `do_residual_call` (pyjitpl.py:2109-2123).
+    /// 3. EffectInfo lookup to choose
+    ///    `COND_CALL_VOID` / `COND_CALL_VALUE_I` / `COND_CALL_VALUE_R`
+    ///    (pyjitpl.py:2125-2151).
+    /// 4. Heap-cache invalidation and exception/force guard emission
+    ///    along the same lines as `do_residual_call`.
+    ///
+    /// The rewriter-side counterpart (`_rewrite_op_cond_call` in
+    /// `jtransform.rs`) already produces the upstream-shaped IR; this
+    /// runtime body is what binds it back to a metainterp-level
+    /// decision.
+    pub fn do_conditional_call(
+        &mut self,
+        _condbox: OpRef,
+        _funcbox_addr: Option<usize>,
+        _argboxes: &[OpRef],
+        _calldescr: u64,
+        _pc: usize,
+        _is_value: bool,
+    ) -> Option<OpRef> {
+        None
+    }
+
     /// Access the backend directly (for advanced operations).
     pub fn backend(&self) -> &BackendImpl {
         &self.backend
@@ -7294,6 +7599,383 @@ pub enum InlineDecision {
     CallAssembler,
     /// Emit a residual (opaque) call.
     ResidualCall,
+}
+
+/// pyjitpl.py:1268 / 2425 `raise ChangeFrame`.
+///
+/// Signals to the metainterp main loop that the current frame has been
+/// switched (either pushed or popped) and dispatch must restart from
+/// the new top-of-stack.  Pyre uses a unit error type because Rust does
+/// not have Python-style `raise`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChangeFrame;
+
+impl std::fmt::Display for ChangeFrame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ChangeFrame")
+    }
+}
+
+impl std::error::Error for ChangeFrame {}
+
+// ════════════════════════════════════════════════════════════════════════
+// MetaInterpStaticData (pyjitpl.py:2190-2373)
+// ════════════════════════════════════════════════════════════════════════
+
+/// pyjitpl.py:2190 `class MetaInterpStaticData(object)`.
+///
+/// Holds the per-process tables shared by every running `MetaInterp`:
+/// the assembler's `insns` / `descrs` / `indirectcalltargets` /
+/// `list_of_addr2name`, the `callinfocollection`, and the lazy
+/// `bytecode_for_address` lookup that `MIFrame.do_residual_or_indirect_call`
+/// uses to promote a const-funcptr residual call into an inlined one.
+///
+/// PRE-EXISTING-ADAPTATION: pyre's `MetaInterp<M>` already stores most
+/// runtime-state fields directly, and pyre has no Rust-helper jitcode
+/// table, so this struct currently mirrors only the upstream lookup
+/// surface needed by `do_residual_or_indirect_call`.  The remaining
+/// fields (`opcode_names`, `opcode_implementations`, `liveness_info`,
+/// `jitdrivers_sd`, profiler, …) live in `MetaInterp<M>` until a future
+/// phase splits them out.
+#[derive(Debug, Default)]
+pub struct MetaInterpStaticData {
+    /// pyjitpl.py:2228 `setup_insns(insns)` table — opcode-id ↔ name.
+    pub opcode_names: Vec<String>,
+    /// pyjitpl.py:2229, 2235 `opcode_implementations[opcode_id] = opimpl`.
+    ///
+    /// PRE-EXISTING-ADAPTATION: RPython looks up an opimpl bound method
+    /// per opcode id and dispatches `MIFrame.run_one_step` through it.
+    /// Pyre dispatches by `BC_*` constant inside
+    /// `JitCodeMachine::dispatch_one`, so the implementation table is
+    /// kept as a stub that's parallel-sized to `opcode_names` for
+    /// invariant checks but never indexed.
+    pub opcode_implementations: Vec<Option<usize>>,
+    /// pyjitpl.py:2245-2246 `setup_descrs(descrs)` — descriptor index table.
+    pub opcode_descrs: Vec<u64>,
+    /// pyjitpl.py:2248-2249 `setup_indirectcalltargets(indirectcalltargets)`.
+    /// PRE-EXISTING-ADAPTATION: pyre stores `fnaddr` as a raw `usize`
+    /// since there are no Rust-helper jitcodes yet.  Matches RPython's
+    /// `JitCode.fnaddr` field role.
+    pub indirectcalltargets: Vec<usize>,
+    /// pyjitpl.py:2251-2253 `setup_list_of_addr2name(list_of_addr2name)`.
+    /// Pair-list of (fnaddr, name) for debug introspection.
+    pub _addr2name_keys: Vec<usize>,
+    pub _addr2name_values: Vec<String>,
+    /// pyjitpl.py:2236 `op_live = insns.get('live/', -1)`.
+    pub op_live: i32,
+    /// pyjitpl.py:2237 `op_goto = insns.get('goto/L', -1)`.
+    pub op_goto: i32,
+    /// pyjitpl.py:2238 `op_catch_exception = insns.get('catch_exception/L', -1)`.
+    pub op_catch_exception: i32,
+    /// pyjitpl.py:2239 `op_rvmprof_code = insns.get('rvmprof_code/ii', -1)`.
+    pub op_rvmprof_code: i32,
+    /// pyjitpl.py:2240 `op_int_return = insns.get('int_return/i', -1)`.
+    pub op_int_return: i32,
+    /// pyjitpl.py:2241 `op_ref_return = insns.get('ref_return/r', -1)`.
+    pub op_ref_return: i32,
+    /// pyjitpl.py:2242 `op_float_return = insns.get('float_return/f', -1)`.
+    pub op_float_return: i32,
+    /// pyjitpl.py:2243 `op_void_return = insns.get('void_return/', -1)`.
+    pub op_void_return: i32,
+    /// pyjitpl.py:2264 `liveness_info` — string of liveness data
+    /// concatenated by `assembler.all_liveness`.
+    pub liveness_info: String,
+    /// pyjitpl.py:2255-2285 `finish_setup(...)` populates this from
+    /// `codewriter.callcontrol.callinfocollection`.
+    pub callinfocollection: majit_ir::effectinfo::CallInfoCollection,
+    /// pyjitpl.py:2357-2373 `MetaInterpGlobalData`: lazy
+    /// `addr2name` and `indirectcall_dict` caches.  Populated on first
+    /// call to `bytecode_for_address` / `get_name_from_address`.
+    pub globaldata: MetaInterpGlobalData,
+}
+
+/// pyjitpl.py:2357-2373 `class MetaInterpGlobalData`.
+///
+/// Lazy run-time caches built from `MetaInterpStaticData`.  RPython
+/// reuses these across compilations to avoid rebuilding the dicts on
+/// every guard failure.
+#[derive(Debug, Default)]
+pub struct MetaInterpGlobalData {
+    /// pyjitpl.py:2308-2318 `addr2name`: `fnaddr → name` for debugging.
+    pub addr2name: Option<std::collections::HashMap<usize, String>>,
+    /// pyjitpl.py:2326-2343 `indirectcall_dict`: `fnaddr → JitCode index`.
+    /// PRE-EXISTING-ADAPTATION: pyre uses a raw usize index instead of
+    /// an `Arc<JitCode>` reference until the Rust-helper jitcode table
+    /// lands; the inferred slot in `indirectcalltargets` is sufficient
+    /// for `bytecode_for_address` parity.
+    pub indirectcall_dict: Option<std::collections::HashMap<usize, usize>>,
+    /// pyjitpl.py:2293-2303 `initialized` — guards `_setup_once` so the
+    /// runtime side-effects (profiler start, jitlog setup) fire once.
+    pub initialized: bool,
+}
+
+impl MetaInterpStaticData {
+    pub fn new() -> Self {
+        Self {
+            op_live: -1,
+            op_goto: -1,
+            op_catch_exception: -1,
+            op_rvmprof_code: -1,
+            op_int_return: -1,
+            op_ref_return: -1,
+            op_float_return: -1,
+            op_void_return: -1,
+            ..Self::default()
+        }
+    }
+
+    /// pyjitpl.py:2227-2243 `setup_insns(insns)`.
+    ///
+    /// Stores the opcode-id → name table and the cached opcode-id
+    /// lookups (`op_live` / `op_goto` / `op_catch_exception` /
+    /// `op_rvmprof_code` / `op_*_return`) the dispatch loop checks
+    /// against without re-hashing.  `opcode_implementations` is left
+    /// as a parallel-sized stub — see the field doc.
+    ///
+    /// Pyre's blackhole-side `setup_insns` lives separately in
+    /// `crate::blackhole::BlackholeInterpBuilder::setup_insns`.
+    pub fn setup_insns(&mut self, insns: &std::collections::HashMap<String, u8>) {
+        // pyjitpl.py:2228-2229: opcode_names/opcode_implementations init.
+        let mut names = vec![String::from("?"); insns.len()];
+        // pyjitpl.py:2230-2235: opcode_implementations[value] = opimpl.
+        // PRE-EXISTING-ADAPTATION: pyre dispatches by BC_* match, so
+        // the slot is left as None — the table only carries the size
+        // for parity with `opcode_names`.
+        let implementations = vec![None; insns.len()];
+        for (key, &value) in insns.iter() {
+            let idx = value as usize;
+            if idx < names.len() {
+                names[idx] = key.clone();
+            }
+        }
+        self.opcode_names = names;
+        self.opcode_implementations = implementations;
+        // pyjitpl.py:2236-2243: cache opcode ids by upstream key string.
+        let lookup = |key: &str| insns.get(key).map(|&v| v as i32).unwrap_or(-1);
+        self.op_live = lookup("live/");
+        self.op_goto = lookup("goto/L");
+        self.op_catch_exception = lookup("catch_exception/L");
+        self.op_rvmprof_code = lookup("rvmprof_code/ii");
+        self.op_int_return = lookup("int_return/i");
+        self.op_ref_return = lookup("ref_return/r");
+        self.op_float_return = lookup("float_return/f");
+        self.op_void_return = lookup("void_return/");
+    }
+
+    /// pyjitpl.py:2245-2246 `setup_descrs(descrs)`.
+    pub fn setup_descrs(&mut self, descrs: Vec<u64>) {
+        self.opcode_descrs = descrs;
+    }
+
+    /// pyjitpl.py:2248-2249 `setup_indirectcalltargets(indirectcalltargets)`.
+    pub fn setup_indirectcalltargets(&mut self, targets: Vec<usize>) {
+        self.indirectcalltargets = targets;
+        // Force a rebuild of the lazy lookup on next access.
+        self.globaldata.indirectcall_dict = None;
+    }
+
+    /// pyjitpl.py:2251-2253 `setup_list_of_addr2name(list_of_addr2name)`.
+    pub fn setup_list_of_addr2name(&mut self, list_of_addr2name: Vec<(usize, String)>) {
+        self._addr2name_keys = list_of_addr2name.iter().map(|(k, _)| *k).collect();
+        self._addr2name_values = list_of_addr2name.into_iter().map(|(_, v)| v).collect();
+        self.globaldata.addr2name = None;
+    }
+
+    /// pyjitpl.py:2305-2323 `get_name_from_address(addr)`.
+    pub fn get_name_from_address(&mut self, addr: usize) -> String {
+        let dict = self.globaldata.addr2name.get_or_insert_with(|| {
+            let mut d = std::collections::HashMap::new();
+            for (i, key) in self._addr2name_keys.iter().enumerate() {
+                if let Some(value) = self._addr2name_values.get(i) {
+                    d.insert(*key, value.clone());
+                }
+            }
+            d
+        });
+        dict.get(&addr).cloned().unwrap_or_default()
+    }
+
+    /// pyjitpl.py:2326-2343 `bytecode_for_address(fnaddress)`.
+    ///
+    /// ```python
+    /// def bytecode_for_address(self, fnaddress):
+    ///     if we_are_translated():
+    ///         d = self.globaldata.indirectcall_dict
+    ///         if d is None:
+    ///             d = {}
+    ///             for jitcode in self.indirectcalltargets:
+    ///                 assert jitcode.fnaddr not in d
+    ///                 d[jitcode.fnaddr] = jitcode
+    ///             self.globaldata.indirectcall_dict = d
+    ///         return d.get(fnaddress, None)
+    ///     else:
+    ///         for jitcode in self.indirectcalltargets:
+    ///             if jitcode.fnaddr == fnaddress:
+    ///                 return jitcode
+    ///         return None
+    /// ```
+    pub fn bytecode_for_address(&mut self, fnaddress: usize) -> Option<usize> {
+        let dict = self.globaldata.indirectcall_dict.get_or_insert_with(|| {
+            let mut d = std::collections::HashMap::new();
+            for (i, fnaddr) in self.indirectcalltargets.iter().enumerate() {
+                debug_assert!(
+                    !d.contains_key(fnaddr),
+                    "duplicate fnaddr in indirectcalltargets"
+                );
+                d.insert(*fnaddr, i);
+            }
+            d
+        });
+        dict.get(&fnaddress).copied()
+    }
+}
+
+#[cfg(test)]
+mod metainterp_static_data_tests {
+    use super::*;
+
+    #[test]
+    fn bytecode_for_address_returns_none_when_empty() {
+        let mut sd = MetaInterpStaticData::new();
+        assert!(sd.bytecode_for_address(0xdeadbeef).is_none());
+    }
+
+    #[test]
+    fn bytecode_for_address_returns_index_when_registered() {
+        let mut sd = MetaInterpStaticData::new();
+        sd.setup_indirectcalltargets(vec![0x100, 0x200, 0x300]);
+        assert_eq!(sd.bytecode_for_address(0x100), Some(0));
+        assert_eq!(sd.bytecode_for_address(0x200), Some(1));
+        assert_eq!(sd.bytecode_for_address(0x300), Some(2));
+        assert_eq!(sd.bytecode_for_address(0x400), None);
+    }
+
+    #[test]
+    fn setup_indirectcalltargets_invalidates_cache() {
+        let mut sd = MetaInterpStaticData::new();
+        sd.setup_indirectcalltargets(vec![0x100]);
+        assert_eq!(sd.bytecode_for_address(0x100), Some(0));
+        sd.setup_indirectcalltargets(vec![0x200, 0x300]);
+        assert_eq!(sd.bytecode_for_address(0x100), None);
+        assert_eq!(sd.bytecode_for_address(0x200), Some(0));
+    }
+
+    #[test]
+    fn get_name_from_address_lazy_dict_build() {
+        let mut sd = MetaInterpStaticData::new();
+        sd.setup_list_of_addr2name(vec![(0x100, "alpha".into()), (0x200, "beta".into())]);
+        assert_eq!(sd.get_name_from_address(0x100), "alpha");
+        assert_eq!(sd.get_name_from_address(0x200), "beta");
+        assert_eq!(sd.get_name_from_address(0x300), "");
+    }
+
+    #[test]
+    fn do_residual_or_indirect_call_falls_through_when_no_jitcode() {
+        // pyjitpl.py:2174-2186 — when bytecode_for_address misses, the
+        // method returns Ok(self.do_residual_call(...)) instead of
+        // raising ChangeFrame.  Until pyre populates indirectcalltargets
+        // every call should land in the residual path.
+        let mut meta = MetaInterp::<()>::new(0);
+        let result = meta.do_residual_or_indirect_call(Some(0xdeadbeef), &[], 0, 0);
+        // Empty staticdata + stub do_residual_call → Ok(None).
+        assert!(matches!(result, Ok(None)));
+    }
+
+    #[test]
+    fn do_residual_or_indirect_call_invokes_perform_call_on_hit() {
+        // After registering an indirect-call target, the method must
+        // route into perform_call (which raises ChangeFrame) instead of
+        // falling through to do_residual_call.
+        let mut meta = MetaInterp::<()>::new(0);
+        meta.staticdata.setup_indirectcalltargets(vec![0xdeadbeef]);
+        let result = meta.do_residual_or_indirect_call(Some(0xdeadbeef), &[], 0, 0);
+        // Hit path raises ChangeFrame.
+        assert!(matches!(result, Err(ChangeFrame)));
+    }
+
+    #[test]
+    fn finishframe_returns_ok_when_framestack_exhausted() {
+        // pyjitpl.py:2483: when the framestack is empty after popframe
+        // we fall into compile_done_with_this_frame; the stub returns
+        // Ok(()) instead of raising DoneWithThisFrame*.
+        let mut meta = MetaInterp::<()>::new(0);
+        let result = meta.finishframe(true);
+        assert!(matches!(result, Ok(())));
+    }
+
+    #[test]
+    fn change_frame_implements_error() {
+        let cf = ChangeFrame;
+        // Confirm the unit type prints as expected and is usable as
+        // a Rust error (mirrors RPython's `raise ChangeFrame`).
+        assert_eq!(format!("{cf}"), "ChangeFrame");
+        let _: &dyn std::error::Error = &cf;
+    }
+
+    #[test]
+    fn setup_insns_populates_opcode_names() {
+        let mut sd = MetaInterpStaticData::new();
+        let mut insns = std::collections::HashMap::new();
+        insns.insert("foo".to_string(), 0u8);
+        insns.insert("bar".to_string(), 1u8);
+        sd.setup_insns(&insns);
+        assert_eq!(sd.opcode_names, vec!["foo".to_string(), "bar".to_string()]);
+        assert_eq!(sd.opcode_implementations.len(), 2);
+        assert!(sd.opcode_implementations.iter().all(|slot| slot.is_none()));
+    }
+
+    #[test]
+    fn setup_insns_caches_opcode_ids_or_minus_one() {
+        // pyjitpl.py:2236-2243: each cached id is `insns.get(...) ?? -1`.
+        let mut sd = MetaInterpStaticData::new();
+        let mut insns = std::collections::HashMap::new();
+        insns.insert("live/".to_string(), 5u8);
+        insns.insert("goto/L".to_string(), 6u8);
+        insns.insert("catch_exception/L".to_string(), 7u8);
+        insns.insert("rvmprof_code/ii".to_string(), 8u8);
+        insns.insert("int_return/i".to_string(), 9u8);
+        insns.insert("ref_return/r".to_string(), 10u8);
+        insns.insert("float_return/f".to_string(), 11u8);
+        insns.insert("void_return/".to_string(), 12u8);
+        sd.setup_insns(&insns);
+        assert_eq!(sd.op_live, 5);
+        assert_eq!(sd.op_goto, 6);
+        assert_eq!(sd.op_catch_exception, 7);
+        assert_eq!(sd.op_rvmprof_code, 8);
+        assert_eq!(sd.op_int_return, 9);
+        assert_eq!(sd.op_ref_return, 10);
+        assert_eq!(sd.op_float_return, 11);
+        assert_eq!(sd.op_void_return, 12);
+    }
+
+    #[test]
+    fn setup_insns_leaves_missing_opcode_ids_at_minus_one() {
+        let mut sd = MetaInterpStaticData::new();
+        let mut insns = std::collections::HashMap::new();
+        insns.insert("foo".to_string(), 0u8);
+        sd.setup_insns(&insns);
+        assert_eq!(sd.op_live, -1);
+        assert_eq!(sd.op_goto, -1);
+        assert_eq!(sd.op_catch_exception, -1);
+        assert_eq!(sd.op_rvmprof_code, -1);
+        assert_eq!(sd.op_int_return, -1);
+        assert_eq!(sd.op_ref_return, -1);
+        assert_eq!(sd.op_float_return, -1);
+        assert_eq!(sd.op_void_return, -1);
+    }
+
+    #[test]
+    fn metainterpstaticdata_new_initializes_op_ids_to_minus_one() {
+        let sd = MetaInterpStaticData::new();
+        assert_eq!(sd.op_live, -1);
+        assert_eq!(sd.op_goto, -1);
+        assert_eq!(sd.op_catch_exception, -1);
+        assert_eq!(sd.op_rvmprof_code, -1);
+        assert_eq!(sd.op_int_return, -1);
+        assert_eq!(sd.op_ref_return, -1);
+        assert_eq!(sd.op_float_return, -1);
+        assert_eq!(sd.op_void_return, -1);
+    }
 }
 
 #[cfg(test)]
