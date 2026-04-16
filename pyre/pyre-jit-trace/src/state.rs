@@ -588,7 +588,7 @@ pub struct PyreJitState {
 pub struct PyreMeta {
     #[vable(num_locals)]
     pub num_locals: usize,
-    pub ns_keys: Vec<String>,
+    pub ns_len: usize,
     #[vable(valuestackdepth)]
     pub valuestackdepth: usize,
     pub has_virtualizable: bool,
@@ -2093,16 +2093,6 @@ impl PyreJitState {
         unsafe { (*namespace_ptr).len() }
     }
 
-    fn namespace_keys(&self) -> Vec<String> {
-        let Some(namespace_ptr) = self.namespace_ptr() else {
-            return Vec::new();
-        };
-        let namespace = unsafe { &*namespace_ptr };
-        let mut keys: Vec<String> = namespace.keys().cloned().collect();
-        keys.sort();
-        keys
-    }
-
     fn restore_single_frame(&mut self, meta: &PyreMeta, values: &[i64]) {
         let Some(&frame) = values.first() else {
             return;
@@ -2855,7 +2845,7 @@ impl JitState for PyreJitState {
         let slot_types = concrete_slot_types(self.frame, num_locals, vsd);
         PyreMeta {
             num_locals,
-            ns_keys: self.namespace_keys(),
+            ns_len: self.namespace_len(),
             valuestackdepth: vsd,
             has_virtualizable: self.has_virtualizable_info(),
             slot_types,
@@ -2924,7 +2914,7 @@ impl JitState for PyreJitState {
         // when procedure_token exists. No next_instr check —
         // the compiled code's preamble handles entry from any PC.
         // Shape checks (nlocals, namespace) ensure frame layout matches.
-        self.local_count() == meta.num_locals && self.namespace_len() == meta.ns_keys.len()
+        self.local_count() == meta.num_locals && self.namespace_len() == meta.ns_len
     }
 
     fn update_meta_for_bridge(meta: &mut Self::Meta, fail_arg_types: &[Type]) {
@@ -3230,7 +3220,7 @@ impl JitState for PyreJitState {
         };
         PyreMeta {
             num_locals: provisional.num_locals,
-            ns_keys: provisional.ns_keys.clone(),
+            ns_len: provisional.ns_len,
             valuestackdepth: vsd,
             has_virtualizable: provisional.has_virtualizable,
             slot_types,
@@ -3926,7 +3916,7 @@ mod tests {
     fn empty_meta() -> PyreMeta {
         PyreMeta {
             num_locals: 0,
-            ns_keys: Vec::new(),
+            ns_len: 0,
             valuestackdepth: 0,
             slot_types: Vec::new(),
             has_virtualizable: false,
@@ -4059,7 +4049,7 @@ mod tests {
         );
         eval_frame_plain(&mut frame).expect("class body should execute");
         let instance = unsafe {
-            (*frame.namespace)
+            (*frame.fget_w_globals())
                 .get("c")
                 .copied()
                 .expect("namespace should contain c")
@@ -4317,7 +4307,7 @@ mod tests {
         state.set_valuestackdepth(4);
         let meta = PyreMeta {
             num_locals: 4,
-            ns_keys: Vec::new(),
+            ns_len: 0,
             valuestackdepth: 4,
             has_virtualizable: true,
             // Stale trace-entry types: all locals looked boxed refs when the
@@ -4330,7 +4320,9 @@ mod tests {
             Value::Int(8),                            // last_instr
             Value::Ref(GcRef(frame.pycode as usize)), // pycode
             Value::Int(4),                            // valuestackdepth
-            Value::Ref(GcRef(0)),                     // w_globals
+            Value::Ref(GcRef(0)),                     // debugdata
+            Value::Ref(GcRef(0)),                     // lastblock
+            Value::Ref(GcRef(0)),                     // namespace
             Value::Ref(GcRef(w_int_new(1) as usize)), // local a
             Value::Ref(GcRef(w_int_new(2) as usize)), // local b
             Value::Ref(GcRef(w_int_new(3) as usize)), // local c
@@ -4590,8 +4582,6 @@ mod tests {
 
         let mut frame = Box::new(PyFrame::new(code));
         frame.fix_array_ptrs();
-        frame.push(w_int_new(1));
-        frame.push(w_int_new(2));
         let _frame_ptr = (&mut *frame) as *mut PyFrame as usize;
 
         let mut ctx = TraceCtx::for_test(2);
@@ -4675,8 +4665,6 @@ mod tests {
                 as *const ();
         let mut frame = Box::new(PyFrame::new(code));
         frame.fix_array_ptrs();
-        frame.push(w_int_new(1));
-        frame.push(w_int_new(2));
         let _frame_ptr = (&mut *frame) as *mut PyFrame as usize;
 
         let mut ctx = TraceCtx::for_test(2);
@@ -4965,17 +4953,12 @@ mod tests {
         let code = compile_exec("1 + 2").expect("test code should compile");
         let mut frame = Box::new(PyFrame::new(code));
         frame.set_last_instr_from_next_instr(456);
-        let lower_value = w_int_new(0);
-        let branch_value = w_int_new(1);
-        frame.push(lower_value);
-        frame.push(branch_value);
         frame.fix_array_ptrs();
         let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
 
         let mut ctx = TraceCtx::for_test(3);
         let expected_pc = ctx.const_int(456);
         let expected_vsd = ctx.const_int(2);
-        let expected_branch_value = ctx.const_int(branch_value as i64);
         let frame_ref = OpRef(0);
         let lower_stack = OpRef(1);
         let truth = OpRef(2);
@@ -4983,7 +4966,7 @@ mod tests {
         let mut sym = PyreSym::new_uninit(frame_ref);
         sym.symbolic_initialized = true;
         sym.nlocals = frame.nlocals();
-        sym.valuestackdepth = frame.valuestackdepth - 1;
+        sym.valuestackdepth = frame.nlocals() + 1;
         sym.symbolic_stack = vec![lower_stack];
         sym.symbolic_stack_types = vec![Type::Ref];
 
@@ -5009,11 +4992,10 @@ mod tests {
             .as_ref()
             .expect("branch guard should carry explicit fail args");
         assert_eq!(guard.opcode, OpCode::GuardTrue);
-        // fail_args: [frame, pc_const, vsd_const, lower_stack, ...]
-        // fail_args: [frame, ni, code, vsd, ns, lower_stack, ...]
-        assert!(fail_args.len() >= 6);
+        // fail_args: [frame, ni, code, vsd, debugdata, lastblock, ns, lower_stack, ...]
+        assert!(fail_args.len() >= 8);
         assert_eq!(fail_args[0], frame_ref);
-        assert_eq!(fail_args[5], lower_stack);
+        assert_eq!(fail_args[7], lower_stack);
     }
 
     #[test]
@@ -5024,17 +5006,12 @@ mod tests {
         let code = compile_exec("1 + 2").expect("test code should compile");
         let mut frame = Box::new(PyFrame::new(code));
         frame.set_last_instr_from_next_instr(456);
-        let lower_value = w_int_new(0);
-        let branch_value = w_int_new(1);
-        frame.push(lower_value);
-        frame.push(branch_value);
         frame.fix_array_ptrs();
         let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
 
         let mut ctx = TraceCtx::for_test(3);
         let expected_pc = ctx.const_int(456);
         let expected_vsd = ctx.const_int(2);
-        let expected_branch_value = ctx.const_int(branch_value as i64);
         let frame_ref = OpRef(0);
         let lower_stack = OpRef(1);
         let truth = OpRef(2);
@@ -5042,7 +5019,7 @@ mod tests {
         let mut sym = PyreSym::new_uninit(frame_ref);
         sym.symbolic_initialized = true;
         sym.nlocals = frame.nlocals();
-        sym.valuestackdepth = frame.valuestackdepth - 1;
+        sym.valuestackdepth = frame.nlocals() + 1;
         sym.symbolic_stack = vec![lower_stack];
         sym.symbolic_stack_types = vec![Type::Ref];
         sym.pending_branch_value = Some(OpRef::NONE);
@@ -5071,9 +5048,10 @@ mod tests {
             .as_ref()
             .expect("branch guard should carry explicit fail args");
         assert_eq!(guard.opcode, OpCode::GuardTrue);
-        // fail_args: [frame, ni, code, vsd, ns, lower_stack, ...]
-        assert!(fail_args.len() >= 6);
+        // fail_args: [frame, ni, code, vsd, debugdata, lastblock, ns, lower_stack, ...]
+        assert!(fail_args.len() >= 8);
         assert_eq!(fail_args[0], frame_ref);
+        assert_eq!(fail_args[7], lower_stack);
     }
 
     #[test]
@@ -5157,13 +5135,12 @@ mod tests {
 
         let fail_args = state.with_ctx(|this, ctx| this.current_fail_args(ctx));
 
-        // fail_args: [frame, next_instr_const, vsd_const, local0, stack0, stack1]
-        // fail_args: [frame, ni, code, vsd, ns, local0, stack0, stack1]
-        assert_eq!(fail_args.len(), 8);
+        // fail_args: [frame, ni, code, vsd, debugdata, lastblock, ns, local0, stack0, stack1]
+        assert_eq!(fail_args.len(), 10);
         assert_eq!(fail_args[0], frame_ref);
-        assert_eq!(fail_args[5], local0);
-        assert_eq!(fail_args[6], stack0);
-        assert_eq!(fail_args[7], stack1);
+        assert_eq!(fail_args[7], local0);
+        assert_eq!(fail_args[8], stack0);
+        assert_eq!(fail_args[9], stack1);
     }
 
     #[test]

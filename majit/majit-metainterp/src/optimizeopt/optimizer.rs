@@ -221,6 +221,54 @@ fn value_to_backend_constant_bits(value: &majit_ir::Value) -> i64 {
     }
 }
 
+fn live_runtime_positions(ops: &[Op]) -> Vec<bool> {
+    let live_limit = ops
+        .iter()
+        .filter(|op| !op.pos.is_none() && !op.pos.is_constant())
+        .map(|op| op.pos.0 as usize + 1)
+        .max()
+        .unwrap_or(0);
+    let mut live_positions = vec![false; live_limit];
+    for op in ops {
+        if !op.pos.is_none() && !op.pos.is_constant() {
+            live_positions[op.pos.0 as usize] = true;
+        }
+    }
+    live_positions
+}
+
+pub(crate) fn sanitize_backend_constants_for_ops(
+    ops: &[Op],
+    constants: &mut std::collections::HashMap<u32, i64>,
+) {
+    let live_positions = live_runtime_positions(ops);
+    constants
+        .retain(|idx, _| (*idx as usize) >= live_positions.len() || !live_positions[*idx as usize]);
+}
+
+pub(crate) fn merge_backend_constants_from_ctx(
+    ctx: &OptContext,
+    constants: &mut std::collections::HashMap<u32, i64>,
+) {
+    let live_positions = live_runtime_positions(&ctx.new_operations);
+
+    for (idx, val) in ctx.constants.iter().enumerate() {
+        let Some(value) = val else {
+            continue;
+        };
+        if idx < live_positions.len() && live_positions[idx] {
+            continue;
+        }
+        constants
+            .entry(idx as u32)
+            .or_insert_with(|| value_to_backend_constant_bits(value));
+    }
+    for (&const_idx, value) in &ctx.const_pool {
+        let key = OpRef::from_const(const_idx).0;
+        constants.insert(key, value_to_backend_constant_bits(value));
+    }
+}
+
 /// RPython unroll.py: import_state virtual info for Phase 2.
 /// Tells OptVirtualize that an inputarg is a virtual object.
 #[derive(Clone, Debug)]
@@ -1616,6 +1664,7 @@ impl Optimizer {
             ctx.constant_types_for_numbering.entry(k).or_insert(v);
         }
 
+        sanitize_backend_constants_for_ops(ops, constants);
         // Pre-populate known constants so passes can see them.
         // Use constant_types to distinguish Ref from Int (GC pointers
         // are stored as i64 in the constants map).
@@ -2142,19 +2191,21 @@ impl Optimizer {
                         kind: produced.kind,
                         label_arg_idx: short_boxes.lookup_label_arg(canonical_result),
                         invented_name: produced.invented_name,
-                        same_as_source: produced.same_as_source.map(|src| ctx.get_box_replacement(src)),
+                        same_as_source: produced.same_as_source,
                     }
                 })
                 .collect();
             if std::env::var_os("MAJIT_LOG").is_some() {
                 for entry in &ctx.exported_short_boxes {
                     eprintln!(
-                        "[jit] exported_short_box: kind={:?} pos={:?} opcode={:?} args={:?} descr_idx={:?}",
+                        "[jit] exported_short_box: kind={:?} pos={:?} opcode={:?} args={:?} descr_idx={:?} invented={} same_as_source={:?}",
                         entry.kind,
                         entry.op.pos,
                         entry.op.opcode,
                         entry.op.args,
                         entry.op.descr.as_ref().map(|d| d.index()),
+                        entry.invented_name,
+                        entry.same_as_source,
                     );
                 }
             }
@@ -2447,19 +2498,8 @@ impl Optimizer {
         }
 
         // Export newly-discovered constants back to the caller's map.
-        for (idx, val) in ctx.constants.iter().enumerate() {
-            if let Some(value) = val {
-                constants
-                    .entry(idx as u32)
-                    .or_insert_with(|| value_to_backend_constant_bits(value));
-            }
-        }
-        for (&const_idx, value) in &ctx.const_pool {
-            let key = OpRef::from_const(const_idx).0;
-            // Use insert (not or_insert) so that constants created during
-            // this phase overwrite stale entries inherited from a prior phase.
-            constants.insert(key, value_to_backend_constant_bits(value));
-        }
+        merge_backend_constants_from_ctx(&ctx, constants);
+        sanitize_backend_constants_for_ops(&ctx.new_operations, constants);
 
         // Preserve final context for jump_to_existing_trace.
         let ops = std::mem::take(&mut ctx.new_operations);
@@ -3519,6 +3559,24 @@ mod tests {
         }
     }
 
+    struct MarkAsTypedConstantButKeep {
+        target: OpRef,
+        value: majit_ir::Value,
+    }
+
+    impl Optimization for MarkAsTypedConstantButKeep {
+        fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+            if op.pos == self.target {
+                ctx.make_constant(op.pos, self.value.clone());
+            }
+            OptimizationResult::PassOn
+        }
+
+        fn name(&self) -> &'static str {
+            "mark_as_typed_constant_but_keep"
+        }
+    }
+
     #[derive(Debug)]
     struct TestSizeDescr {
         index: u32,
@@ -3899,6 +3957,46 @@ mod tests {
         assert_eq!(result[2].arg(0), OpRef(5));
         assert_eq!(constants.get(&5), None);
         assert_eq!(constants.get(&8), Some(&123));
+    }
+
+    #[test]
+    fn test_export_constants_skips_live_op_positions() {
+        let mut opt = Optimizer::new();
+        opt.add_pass(Box::new(MarkAsTypedConstantButKeep {
+            target: OpRef(3),
+            value: majit_ir::Value::Int(1),
+        }));
+
+        let mut ops = vec![Op::new(OpCode::IntGt, &[OpRef(0), OpRef(1)])];
+        ops[0].pos = OpRef(3);
+
+        let mut constants = std::collections::HashMap::new();
+        constants.insert(0, 40);
+        constants.insert(1, 5);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 3);
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].pos, OpRef(3));
+        assert_eq!(constants.get(&3), None);
+    }
+
+    #[test]
+    fn test_import_constants_skips_live_op_positions() {
+        let mut opt = Optimizer::new();
+
+        let mut ops = vec![Op::new(OpCode::IntGt, &[OpRef(0), OpRef(1)])];
+        ops[0].pos = OpRef(3);
+
+        let mut constants = std::collections::HashMap::new();
+        constants.insert(0, 40);
+        constants.insert(1, 5);
+        constants.insert(3, 1);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 3);
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].pos, OpRef(3));
+        assert_eq!(result[0].opcode, OpCode::IntGt);
+        assert_eq!(constants.get(&3), None);
     }
 
     #[test]

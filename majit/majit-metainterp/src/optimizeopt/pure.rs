@@ -538,14 +538,23 @@ impl OptPure {
             if entry.args.len() != op.args.len() {
                 continue;
             }
+            let imported_replay = entry.pop.resolved != entry.pop.op;
             // pure.py:62: box0.same_box(get_box_replacement(op.getarg(0)))
             let args_match = entry
                 .args
                 .iter()
                 .zip(op.args.iter())
                 .all(|(&stored, &query)| {
-                    let s = ctx.get_box_replacement(stored);
-                    let q = ctx.get_box_replacement(query);
+                    let s = if imported_replay {
+                        stored
+                    } else {
+                        ctx.get_box_replacement(stored)
+                    };
+                    let q = if imported_replay {
+                        query
+                    } else {
+                        ctx.get_box_replacement(query)
+                    };
                     if s == q {
                         return true;
                     }
@@ -587,15 +596,15 @@ impl OptPure {
             // same_box: identity for non-constants, same_constant for constants.
             let mut args_match = true;
             for (expected, &arg) in entry.args.iter().zip(op.args.iter()) {
-                let query = ctx.get_box_replacement(arg);
                 match expected {
                     crate::optimizeopt::ImportedShortPureArg::OpRef(expected_ref) => {
-                        if query != *expected_ref {
+                        if arg != *expected_ref {
                             args_match = false;
                             break;
                         }
                     }
                     crate::optimizeopt::ImportedShortPureArg::Const(expected_value, _source) => {
+                        let query = ctx.get_box_replacement(arg);
                         match ctx.get_constant(query) {
                             Some(v) if v == expected_value => {}
                             _ => {

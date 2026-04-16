@@ -348,27 +348,10 @@ impl UnrollOptimizer {
             // Merge them back so build_short_preamble_from_exported_boxes
             // can capture all constants referenced by short preamble ops.
             if let Some(ref final_ctx) = opt_p1.final_ctx {
-                for (idx, val) in final_ctx.constants.iter().enumerate() {
-                    if let Some(v) = val {
-                        let raw = match v {
-                            majit_ir::Value::Int(v) => *v,
-                            majit_ir::Value::Float(f) => f.to_bits() as i64,
-                            majit_ir::Value::Ref(r) => r.0 as i64,
-                            majit_ir::Value::Void => 0,
-                        };
-                        consts_p1.entry(idx as u32).or_insert(raw);
-                    }
-                }
-                for (&const_idx, v) in &final_ctx.const_pool {
-                    let key = OpRef::from_const(const_idx).0;
-                    let raw = match v {
-                        majit_ir::Value::Int(v) => *v,
-                        majit_ir::Value::Float(f) => f.to_bits() as i64,
-                        majit_ir::Value::Ref(r) => r.0 as i64,
-                        majit_ir::Value::Void => 0,
-                    };
-                    consts_p1.entry(key).or_insert(raw);
-                }
+                crate::optimizeopt::optimizer::merge_backend_constants_from_ctx(
+                    final_ctx,
+                    &mut consts_p1,
+                );
             }
             let p1_ni = opt_p1.final_num_inputs();
 
@@ -675,17 +658,10 @@ impl UnrollOptimizer {
         // class pointers from collect_use_box_guards).
         // Merge back into consts_p2 so the backend can resolve them.
         if let Some(ref final_ctx) = opt_p2.final_ctx {
-            for (idx, val) in final_ctx.constants.iter().enumerate() {
-                if let Some(v) = val {
-                    let raw = match v {
-                        majit_ir::Value::Int(v) => *v,
-                        majit_ir::Value::Float(f) => f.to_bits() as i64,
-                        majit_ir::Value::Ref(r) => r.0 as i64,
-                        majit_ir::Value::Void => 0,
-                    };
-                    consts_p2.entry(idx as u32).or_insert(raw);
-                }
-            }
+            crate::optimizeopt::optimizer::merge_backend_constants_from_ctx(
+                final_ctx,
+                &mut consts_p2,
+            );
         }
         let body_terminal_op = opt_p2.terminal_op.clone();
         let p2_ni = opt_p2.final_num_inputs();
@@ -741,7 +717,6 @@ impl UnrollOptimizer {
         // ── unroll.py:140-175: finalize + jump_to_existing_trace ──
         let imported_short_aliases = opt_p2.imported_short_aliases.clone();
         let imported_short_sources = opt_p2.imported_short_sources.clone();
-
         // finalize_short_preamble: create TargetToken for this loop version
         // RPython parity: short preamble ops reference constant OpRefs from
         // the loop's constant pool. Pass consts_p1 so the ShortPreamble
@@ -1207,6 +1182,10 @@ impl UnrollOptimizer {
                 seen.insert(op.pos.0)
             });
         }
+        crate::optimizeopt::optimizer::sanitize_backend_constants_for_ops(
+            &combined,
+            &mut consts_p2,
+        );
         if std::env::var_os("MAJIT_LOG").is_some() {
             eprintln!("--- peeled trace (assembled) ---");
             eprint!("{}", majit_ir::format_trace(&combined, &consts_p2));
@@ -4056,9 +4035,22 @@ fn assemble_peeled_trace_with_jump_args(
         .map(|a| a.0)
         .max()
         .unwrap_or(label_pos);
+    let max_emitted_pos = result
+        .iter()
+        .map(|op| op.pos.0)
+        .filter(|&p| p != u32::MAX)
+        .max()
+        .unwrap_or(label_pos);
     // Fresh body positions must be higher than ALL existing positions:
-    // label, label args, AND Phase 2 op positions (which may be higher
-    // than label positions due to Phase 2 remap or redirect ops).
+    // already-emitted preamble/imported-short ops, label, label args, AND
+    // Phase 2 op positions (which may be higher than label positions due
+    // to Phase 2 remap or redirect ops).
+    //
+    // RPython's distinct Box identities prevent an imported short-preamble
+    // replay result from colliding with a freshly emitted body result. In
+    // majit's flat OpRef model we must keep the body allocator above every
+    // position already emitted into `result`, including the non-invented
+    // imported_short_sources SameAs bridges inserted before the loop label.
     let max_p2_pos = p2_ops
         .iter()
         .map(|op| op.pos.0)
@@ -4066,7 +4058,8 @@ fn assemble_peeled_trace_with_jump_args(
         .max()
         .unwrap_or(0);
     let mut next_body_pos = next_free_pos(
-        label_pos
+        max_emitted_pos
+            .max(label_pos)
             .max(max_label_arg_pos)
             .max(max_p2_pos)
             .saturating_add(1),
@@ -5983,6 +5976,82 @@ mod tests {
         assert_eq!(combined[1].args[0], OpRef(200));
         assert_eq!(combined[2].opcode, OpCode::Jump);
         assert_eq!(combined[2].args.as_slice(), &[OpRef(200), OpRef(300)]);
+    }
+
+    #[test]
+    fn test_assemble_peeled_trace_keeps_body_results_distinct_from_imported_short_sources() {
+        let p1_ops = vec![
+            {
+                let mut op = Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]);
+                op.pos = OpRef(3);
+                op
+            },
+            {
+                let mut op = Op::new(OpCode::IntGt, &[OpRef(2), OpRef(3)]);
+                op.pos = OpRef(4);
+                op
+            },
+        ];
+        let p2_ops = vec![
+            {
+                let mut op = Op::new(OpCode::IntAdd, &[OpRef(3), OpRef(1)]);
+                op.pos = OpRef(10);
+                op
+            },
+            {
+                let mut op = Op::new(OpCode::IntGt, &[OpRef(2), OpRef(10)]);
+                op.pos = OpRef(11);
+                op
+            },
+            {
+                let mut op = Op::new(OpCode::GuardTrue, &[OpRef(11)]);
+                op.fail_args = Some(vec![OpRef(10), OpRef(1), OpRef(2)].into());
+                op
+            },
+            Op::new(OpCode::Jump, &[OpRef(10), OpRef(1), OpRef(2)]),
+        ];
+        let imported_short_sources = vec![crate::optimizeopt::ImportedShortSource {
+            result: OpRef(14),
+            source: OpRef(4),
+        }];
+
+        let combined = assemble_peeled_trace(
+            &p1_ops,
+            &p2_ops,
+            &[OpRef(3), OpRef(1), OpRef(2)],
+            &[OpRef(0), OpRef(1), OpRef(2)],
+            &[],
+            3,
+            true,
+            &[],
+            &imported_short_sources,
+            &std::collections::HashMap::new(),
+            None,
+            None,
+        );
+
+        let imported_same_as = combined
+            .iter()
+            .find(|op| op.pos == OpRef(14))
+            .expect("imported short source same_as");
+        assert_eq!(imported_same_as.opcode, OpCode::SameAsI);
+        assert_eq!(imported_same_as.args.as_slice(), &[OpRef(4)]);
+
+        let body_add = combined
+            .iter()
+            .find(|op| op.opcode == OpCode::IntAdd && op.args.as_slice() == [OpRef(3), OpRef(1)])
+            .expect("body add");
+        let body_compare = combined
+            .iter()
+            .find(|op| op.opcode == OpCode::IntGt && op.args.as_slice() == [OpRef(2), body_add.pos])
+            .expect("body compare must survive with fresh body result pos");
+        assert_ne!(body_compare.pos, OpRef(14));
+
+        let body_guard = combined
+            .iter()
+            .find(|op| op.opcode == OpCode::GuardTrue && op.args.as_slice() == [body_compare.pos])
+            .expect("body guard must use fresh body compare result");
+        assert_eq!(body_guard.args.as_slice(), &[body_compare.pos]);
     }
 
     #[test]
