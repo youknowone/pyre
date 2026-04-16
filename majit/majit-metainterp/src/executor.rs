@@ -1010,3 +1010,95 @@ pub(crate) fn float_binop(values: &(impl ValueStore + ?Sized), op: &Op) -> (f64,
 pub(crate) fn float_unop(values: &(impl ValueStore + ?Sized), op: &Op) -> f64 {
     f64::from_bits(values.resolve(op.args[0]) as u64)
 }
+
+/// rpython/jit/metainterp/executor.py:524-528 `execute_varargs(cpu, metainterp, opnum, argboxes, descr)`.
+///
+/// ```python
+/// def execute_varargs(cpu, metainterp, opnum, argboxes, descr):
+///     # only for opnums with a variable arity (calls, typically)
+///     check_descr(descr)
+///     func = get_execute_function(opnum, -1, True)
+///     return func(cpu, metainterp, argboxes, descr)
+/// ```
+///
+/// For CALL_* opcodes, `func` ultimately calls `cpu.bh_call_*(funcaddr, args)`.
+/// Pyre routes this through the existing `dispatch::call_int_function` /
+/// `dispatch::call_void_function` (and a future float variant) using the
+/// concrete values carried alongside each typed argbox.  `argboxes[0]`
+/// is the funcbox (carrying the function pointer in its `i64` slot) and
+/// the remaining slots are the typed call arguments.
+///
+/// Returns the concrete result value as an `i64` — for void-returning
+/// calls returns `0` (caller ignores it).
+pub fn execute_varargs(
+    opnum: OpCode,
+    argboxes: &[(crate::jitcode::JitArgKind, OpRef, i64)],
+    descr: &dyn majit_ir::descr::CallDescr,
+) -> i64 {
+    debug_assert!(opnum.is_call(), "execute_varargs requires a call opcode");
+    // COND_CALL / COND_CALL_VALUE_* layout (pyjitpl.py:2128-2151):
+    //   argboxes[0] = condbox
+    //   argboxes[1] = funcbox
+    //   argboxes[2..] = call args
+    // RPython's executor handles cond-call dispatch via a per-opcode
+    // execute function (`do_cond_call_*`); pyre inlines the same
+    // semantics here.
+    if matches!(
+        opnum,
+        OpCode::CondCallN | OpCode::CondCallValueI | OpCode::CondCallValueR
+    ) {
+        debug_assert!(
+            argboxes.len() >= 2,
+            "COND_CALL requires [condbox, funcbox, *args]",
+        );
+        let cond = argboxes[0].2;
+        if cond == 0 {
+            // pyjitpl.py: COND_CALL with cond=0 leaves the call alone
+            // and the result default-initializes — for COND_CALL_VALUE_*
+            // the upstream `valuebox` short-circuit lives in the
+            // codewriter; here we return the existing value (0).
+            return 0;
+        }
+        let func_ptr = argboxes[1].2 as *const ();
+        let concrete_args: Vec<i64> = argboxes[2..].iter().map(|(_, _, c)| *c).collect();
+        return match descr.result_type() {
+            majit_ir::Type::Int | majit_ir::Type::Ref => {
+                crate::pyjitpl::call_int_function(func_ptr, &concrete_args)
+            }
+            majit_ir::Type::Void => {
+                crate::pyjitpl::call_void_function(func_ptr, &concrete_args);
+                0
+            }
+            majit_ir::Type::Float => 0,
+        };
+    }
+    debug_assert!(
+        !argboxes.is_empty(),
+        "execute_varargs: argboxes must include funcbox at slot 0",
+    );
+    let func_ptr = argboxes[0].2 as *const ();
+    let concrete_args: Vec<i64> = argboxes[1..].iter().map(|(_, _, c)| *c).collect();
+    match descr.result_type() {
+        // RPython dispatches Int and Ref through the same backend
+        // primitive cpu.bh_call_i (returns i64); pyre's
+        // call_int_function does the same — Ref is bit-identical to Int
+        // at the ABI level.
+        majit_ir::Type::Int | majit_ir::Type::Ref => {
+            crate::pyjitpl::call_int_function(func_ptr, &concrete_args)
+        }
+        majit_ir::Type::Void => {
+            crate::pyjitpl::call_void_function(func_ptr, &concrete_args);
+            0
+        }
+        majit_ir::Type::Float => {
+            // Float-returning C-ABI calls return through XMM0 (x86-64),
+            // not the integer return register.  Pyre's float-call
+            // function pointer wrappers land in a future commit; until
+            // then, return 0 so the call still has the side-effects of
+            // its argument evaluation but the result is unusable.
+            // Documented deviation; production CALL_F goes through the
+            // pyre tracer's call_callable_value path.
+            0
+        }
+    }
+}

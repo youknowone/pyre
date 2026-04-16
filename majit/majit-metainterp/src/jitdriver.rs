@@ -80,6 +80,19 @@ pub struct JitDriverStaticData {
     /// the flag directly on the static data so MetaInterp can decide
     /// without touching the runtime `JitDriver` object.
     pub is_recursive: bool,
+    /// warmspot.py:921 `jd.mainjitcode = pyjitpl_class(jd, mainjitcode)`.
+    ///
+    /// The portal jitcode for this driver — the entry point of the
+    /// recursive function being JITed.  Read by
+    /// `MetaInterp.do_recursive_call` (pyjitpl.py:1427) to set
+    /// `portal_code.calldescr` for the residual CALL_ASSEMBLER op.
+    pub mainjitcode: Option<std::sync::Arc<crate::jitcode::JitCode>>,
+    /// warmspot.py:946 `jd.portal_runner_adr = adr_of(portal_runner)`.
+    ///
+    /// Address of the portal_runner C function — the funcbox for
+    /// `do_recursive_call`'s residual CALL_ASSEMBLER op
+    /// (pyjitpl.py:1428-1429).
+    pub portal_runner_adr: i64,
 }
 
 impl JitDriverStaticData {
@@ -106,6 +119,8 @@ impl JitDriverStaticData {
             virtualizable: virtualizable.map(str::to_string),
             result_type: Type::Ref,
             is_recursive: false,
+            mainjitcode: None,
+            portal_runner_adr: 0,
         }
     }
 

@@ -38,6 +38,16 @@ pub struct MIFrame {
     /// pyjitpl.py `MIFrame.greenkey` — set when this frame is a
     /// recursive portal call (pyjitpl.py:80).
     pub greenkey: Option<u64>,
+    /// pyjitpl.py:91 `self._result_argcode = 'v'`.
+    ///
+    /// Single-byte argcode of the *previous* opimpl's result type
+    /// (`b'i'` / `b'r'` / `b'f'` / `b'v'`).  Updated by call-recording
+    /// opimpls before they advance the pc; consulted by `_try_tco`
+    /// (pyjitpl.py:1281) to decide whether the call's result type
+    /// matches a following `*_return` opcode.  Initialized to `b'v'`
+    /// because a fresh frame's "previous opimpl" is the implicit
+    /// frame setup (returns void).
+    pub _result_argcode: u8,
     /// pyjitpl.py `MIFrame.pushed_box` — the box that the previous
     /// `_opimpl_any_push` instruction parked on the frame.  Reset to
     /// `None` by `cleanup_registers` so a recycled frame does not keep
@@ -65,6 +75,7 @@ impl MIFrame {
             return_r: None,
             return_f: None,
             greenkey: None,
+            _result_argcode: b'v',
             pushed_box: None,
         }
     }
