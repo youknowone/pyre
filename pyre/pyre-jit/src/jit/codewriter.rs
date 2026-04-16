@@ -584,6 +584,24 @@ impl CodeWriter {
                     emit_vsd!(assembler, current_depth);
                 }
 
+                // Super-instruction STORE_FAST; LOAD_FAST: pop TOS into
+                // idx_1 (store), then push idx_2 (load). Net depth 0.
+                // Both halves use register-bank moves (not vable read/write)
+                // pending A-3 Layer 2 (blackhole frame writeback); the
+                // codewriter side still has a real implementation so the
+                // trace doesn't abort on this super-instruction.
+                Instruction::StoreFastLoadFast { var_nums } => {
+                    let pair = var_nums.get(op_arg);
+                    let store_reg = u32::from(pair.idx_1()) as u16;
+                    let load_reg = u32::from(pair.idx_2()) as u16;
+                    current_depth -= 1;
+                    emit_vsd!(assembler, current_depth);
+                    assembler.move_r(store_reg, stack_base + current_depth);
+                    assembler.move_r(stack_base + current_depth, load_reg);
+                    current_depth += 1;
+                    emit_vsd!(assembler, current_depth);
+                }
+
                 // STORE_SUBSCR: stack [value, obj, key] → obj[key] = value
                 Instruction::StoreSubscr => {
                     current_depth -= 1;
