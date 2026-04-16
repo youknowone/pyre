@@ -1441,14 +1441,11 @@ impl OpcodeStepExecutor for PyFrame {
     }
 
     // ── delete_global ──
+    // pypy/interpreter/pyopcode.py:901 DELETE_GLOBAL — delitem only; no NameError conversion.
     fn delete_global(&mut self, name: &str) -> Result<(), Self::Error> {
         let ns = self.get_w_globals();
-        let found = unsafe { crate::namespace_delete(&mut *ns, name) };
-        if !found {
-            return Err(PyError::new(
-                PyErrorKind::NameError,
-                format!("name '{name}' is not defined"),
-            ));
+        unsafe {
+            crate::namespace_delete(&mut *ns, name);
         }
         Ok(())
     }
