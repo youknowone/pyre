@@ -1,4 +1,7 @@
+pub mod assembler;
 pub mod codewriter;
+pub mod flatten;
+pub mod liveness;
 pub use pyre_jit_trace::descr;
 pub mod executor;
 pub use pyre_jit_trace::frame_layout;
