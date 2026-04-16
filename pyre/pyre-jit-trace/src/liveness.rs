@@ -2,6 +2,55 @@
 
 use pyre_interpreter::bytecode::{CodeObject, Instruction};
 
+/// Heuristic: does this opcode touch frame-local slots?
+///
+/// Used to decide whether the GEN/KILL / stack_effects default arm is
+/// covering a real miss. Any variant whose Debug name contains `Fast`
+/// is a locals-accessing opcode (LoadFast*, StoreFast*, DeleteFast,
+/// super-instructions like LoadFastLoadFast, StoreFastLoadFast, ...).
+/// If the explicit match did not catch it, dataflow silently omits the
+/// read/write — the nbody/fannkuch regressions came from exactly that.
+fn instr_touches_locals(instr: &Instruction) -> bool {
+    let name = format!("{:?}", instr);
+    let head = name.split_whitespace().next().unwrap_or("");
+    let head = head.trim_start_matches('&');
+    head.contains("Fast")
+}
+
+/// Log unhandled locals-touching opcodes once per (site, discriminant).
+///
+/// A missed opcode in the GEN/KILL or stack_effects match is silent
+/// today: the catch-all `_` arm lets dataflow succeed with incomplete
+/// information and the bug surfaces much later at a resume point
+/// (fannkuch q0 NameError, nbody super-instructions). Shout on first
+/// sight so the next one is found immediately.
+fn warn_unhandled_opcode(site: &'static str, instr: &Instruction) {
+    if !instr_touches_locals(instr) {
+        return;
+    }
+    use std::cell::RefCell;
+    use std::collections::HashSet;
+    thread_local! {
+        static SEEN: RefCell<HashSet<(&'static str, String)>> =
+            RefCell::new(HashSet::new());
+    }
+    let disc = format!("{:?}", std::mem::discriminant(instr));
+    SEEN.with(|s| {
+        let mut set = s.borrow_mut();
+        if set.insert((site, disc)) {
+            eprintln!(
+                "[liveness][bug] unhandled locals-touching opcode at {}: {:?} — add it to GEN/KILL and stack_effects",
+                site, instr
+            );
+            debug_assert!(
+                false,
+                "liveness: unhandled locals-touching opcode at {} (add to GEN/KILL and stack_effects)",
+                site
+            );
+        }
+    });
+}
+
 /// Skip Cache pseudo-instructions starting at `pos`.
 /// Returns the index of the first non-Cache instruction at or after `pos`.
 fn skip_caches(code: &CodeObject, mut pos: usize) -> usize {
@@ -165,7 +214,26 @@ impl LiveVars {
                             live[word] &= !(1u64 << (i % 64));
                         }
                     }
-                    // StoreFastStoreFast: KILL both target locals.
+                    // STORE_FAST_LOAD_FAST(a, b): store top-of-stack into
+                    // local a (KILL a), then load local b (GEN b). Backward
+                    // order is reversed: GEN(b) first, then KILL(a), so
+                    // a == b leaves the slot live (the load reads a value
+                    // defined elsewhere).
+                    Instruction::StoreFastLoadFast { var_nums } => {
+                        let pair = var_nums.get(op_arg);
+                        let load_idx = u32::from(pair.idx_2()) as usize;
+                        let store_idx = u32::from(pair.idx_1()) as usize;
+                        let lw = load_idx / 64;
+                        if lw < words_per_pc {
+                            live[lw] |= 1u64 << (load_idx % 64);
+                        }
+                        let sw = store_idx / 64;
+                        if sw < words_per_pc {
+                            live[sw] &= !(1u64 << (store_idx % 64));
+                        }
+                    }
+                    // STORE_FAST_STORE_FAST(a, b): two consecutive stores,
+                    // no reads. Both locals are KILLed.
                     Instruction::StoreFastStoreFast { var_nums } => {
                         let pair = var_nums.get(op_arg);
                         for i in [
@@ -178,24 +246,7 @@ impl LiveVars {
                             }
                         }
                     }
-                    // Super-instruction STORE_FAST; LOAD_FAST:
-                    // KILL idx_1 (store target) then GEN idx_2 (load source).
-                    // Backward-dataflow semantics require KILL then GEN so
-                    // that if idx_1 == idx_2, the local is still live-before.
-                    Instruction::StoreFastLoadFast { var_nums } => {
-                        let pair = var_nums.get(op_arg);
-                        let store_i = u32::from(pair.idx_1()) as usize;
-                        let load_i = u32::from(pair.idx_2()) as usize;
-                        let word = store_i / 64;
-                        if word < words_per_pc {
-                            live[word] &= !(1u64 << (store_i % 64));
-                        }
-                        let word = load_i / 64;
-                        if word < words_per_pc {
-                            live[word] |= 1u64 << (load_i % 64);
-                        }
-                    }
-                    _ => {}
+                    other => warn_unhandled_opcode("gen_kill", &other),
                 }
                 let base = pc * words_per_pc;
                 if (0..words_per_pc).any(|w| live_bits[base + w] != live[w]) {
@@ -334,9 +385,9 @@ fn stack_effects(
         Instruction::LoadFastBorrowLoadFastBorrow { .. } | Instruction::LoadFastLoadFast { .. } => {
             (d + 2, d + 2)
         }
-        // Store then load (super-instruction): pop one, push one (net 0).
+        // STORE_FAST_LOAD_FAST: pop one, push one (net 0)
         Instruction::StoreFastLoadFast { .. } => (d, d),
-        // Store two locals (super-instruction): pop 2 (net -2).
+        // STORE_FAST_STORE_FAST: pop two, push none
         Instruction::StoreFastStoreFast { .. } => (d - 2, d - 2),
         // Pop one
         Instruction::PopTop
@@ -460,8 +511,14 @@ fn stack_effects(
             let n = argc.get(op_arg) as i32;
             (d - n, d - n)
         }
-        // Default: conservative, keep same depth
-        _ => (d, d),
+        // Default: conservative, keep same depth. Locals-touching super-
+        // instructions MUST be matched explicitly so their stack effect
+        // is correct; warn loudly on first sight so the miss is caught
+        // before it surfaces as a wrong-depth resume (fannkuch q0).
+        other => {
+            warn_unhandled_opcode("stack_effects", &other);
+            (d, d)
+        }
     };
     (ft.max(0) as usize, br.max(0) as usize)
 }
