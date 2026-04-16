@@ -1,16 +1,10 @@
-/// JIT-enabled tiny2 interpreter via `#[jit_interp]` proc macro.
+/// JIT-enabled tiny2 interpreter via `#[jit_interp]` proc macro with `state_fields`.
 ///
-/// The word-based program is compiled to bytecode, then the bytecoded mainloop
-/// is traced by the auto-generated JitState/trace_instruction.
+/// RPython parity: tiny2_hotpath.py — `_virtualizable_ = ['stackpos', 'stack[*]']`
+/// maps to `state_fields = { stackpos: int, stack: [int; virt] }`.
 ///
 /// Greens: [bytecode (env), pc]
-/// Reds:   [storage (args at bottom, computation stack on top)]
-///
-/// RPython correspondence (tiny2_hotpath.py):
-///   promote(opcode)         — implicit: opcode is constant at each trace position
-///   hint(bytecode, deepfreeze=True) — implicit: &[u8] is immutable
-///   compute_invariants      — implicit: storage pool auto-captures loop state
-///   on_enter_jit            — implicit: storage pool virtualizes args
+/// Reds:   [stackpos, stack]  (tracked via state_fields)
 
 // ── Bytecode opcodes ──
 
@@ -23,6 +17,8 @@ const OP_MUL: u8 = 5;
 const OP_LOOP_START: u8 = 6; // no-op marker (target for back-edge)
 const OP_LOOP_END: u8 = 7; // followed by 2 bytes (target pc, u16 LE)
 const OP_END: u8 = 8;
+
+const STACK_CAP: usize = 1024;
 
 // ── Bytecode compiler ──
 
@@ -67,110 +63,16 @@ fn compile(words: &[&str]) -> Vec<u8> {
     code
 }
 
-// ── Storage pool types ──
+// ── State ──
 
-/// Single i64 storage: args at bottom, computation stack on top.
-pub struct Tiny2Storage {
+/// RPython tiny2_hotpath.py Stack. `_virtualizable_ = ['stackpos', 'stack[*]']`.
+struct Tiny2State {
+    stackpos: i64,
     stack: Vec<i64>,
 }
 
-impl Tiny2Storage {
-    fn new() -> Self {
-        Tiny2Storage { stack: Vec::new() }
-    }
-    pub fn push(&mut self, val: i64) {
-        self.stack.push(val);
-    }
-    pub fn pop(&mut self) -> i64 {
-        self.stack.pop().unwrap()
-    }
-    pub fn dup(&mut self) {
-        let v = *self.stack.last().unwrap();
-        self.stack.push(v);
-    }
-    pub fn add(&mut self) {
-        let a = self.pop();
-        let b = self.pop();
-        self.push(b + a);
-    }
-    pub fn sub(&mut self) {
-        let a = self.pop();
-        let b = self.pop();
-        self.push(b - a);
-    }
-    pub fn mul(&mut self) {
-        let a = self.pop();
-        let b = self.pop();
-        self.push(b * a);
-    }
-    /// Copy element at index `n` (from bottom, 0-based) to top.
-    pub fn copy_up(&mut self, n: usize) {
-        let val = self.stack[n];
-        self.stack.push(val);
-    }
-    /// Pop top and store at index `n` (from bottom, 0-based).
-    pub fn store_down(&mut self, n: usize) {
-        let val = self.stack.pop().unwrap();
-        self.stack[n] = val;
-    }
-    pub fn peek_at(&self, idx: usize) -> i64 {
-        self.stack[self.stack.len() - 1 - idx]
-    }
-    pub fn clear(&mut self) {
-        self.stack.clear();
-    }
-    pub fn data_ptr(&self) -> usize {
-        self.stack.as_ptr() as usize
-    }
-    pub fn len(&self) -> usize {
-        self.stack.len()
-    }
-    pub fn is_empty(&self) -> bool {
-        self.stack.is_empty()
-    }
-    /// Copy the bottom `n` elements (arg slots) into `out`.
-    pub fn read_args(&self, out: &mut [i64]) {
-        let n = out.len().min(self.stack.len());
-        out[..n].copy_from_slice(&self.stack[..n]);
-    }
-}
-
-/// Storage pool wrapping a single Tiny2Storage.
-pub struct Tiny2Pool {
-    storages: Vec<Tiny2Storage>,
-}
-
-impl Tiny2Pool {
-    fn new() -> Self {
-        Tiny2Pool {
-            storages: vec![Tiny2Storage::new()],
-        }
-    }
-    pub fn get(&self, idx: usize) -> &Tiny2Storage {
-        &self.storages[idx]
-    }
-    pub fn get_mut(&mut self, idx: usize) -> &mut Tiny2Storage {
-        &mut self.storages[idx]
-    }
-    pub fn all_jit_compatible(&self) -> bool {
-        true
-    }
-}
-
-/// Interpreter state: storage pool + selected storage index.
-struct Tiny2State {
-    pool: Tiny2Pool,
-    selected: usize,
-}
-
-fn find_used_storages(_program: &Bytecode, _header_pc: usize, _initial: usize) -> Vec<usize> {
-    vec![0]
-}
-
-/// Type alias for bytecode — the env type for `#[jit_interp]`.
 pub type Bytecode = [u8];
 
-/// Extension trait providing `get_op` for bytecode slices.
 trait BytecodeExt {
     fn get_op(&self, pc: usize) -> u8;
 }
@@ -186,18 +88,9 @@ impl BytecodeExt for [u8] {
 #[majit_macros::jit_interp(
     state = Tiny2State,
     env = Bytecode,
-    storage = {
-        pool: state.pool,
-        pool_type: Tiny2Pool,
-        selector: state.selected,
-        untraceable: [],
-        scan: find_used_storages,
-        can_trace_guard: all_jit_compatible,
-    },
-    binops = {
-        add => IntAdd,
-        sub => IntSub,
-        mul => IntMul,
+    state_fields = {
+        stackpos: int,
+        stack: [int; virt],
     },
 )]
 #[allow(unused_assignments, unused_variables)]
@@ -205,19 +98,15 @@ fn mainloop(program: &Bytecode, num_args: usize, args_out: &mut [i64], threshold
     let mut driver: majit_metainterp::JitDriver<Tiny2State> =
         majit_metainterp::JitDriver::new(threshold);
     let mut pc: usize = 0;
-    // stacksize is updated by macro-generated code in can_enter_jit! expansion.
-    let mut stacksize: i32 = num_args as i32;
+    let mut stacksize: i32 = 0;
     let mut state = Tiny2State {
-        pool: Tiny2Pool::new(),
-        selected: 0,
+        stackpos: num_args as i64,
+        stack: vec![0i64; STACK_CAP],
     };
 
     while pc < program.len() {
-        // RPython: tinyjitdriver.jit_merge_point(args=args, loops=loops,
-        //          stack=stack, bytecode=bytecode, pos=pos)
+        // RPython: tinyjitdriver.jit_merge_point(...)
         jit_merge_point!();
-        // RPython: hint(bytecode, deepfreeze=True) — implicit: &[u8] is immutable
-        // RPython: hint(opcode, concrete=True) — implicit: opcode is constant at each pc
         let opcode = program[pc];
         pc += 1;
 
@@ -234,28 +123,43 @@ fn mainloop(program: &Bytecode, num_args: usize, args_out: &mut [i64], threshold
                     program[pc + 7],
                 ]);
                 pc += 8;
-                state.pool.get_mut(state.selected).push(value);
-                stacksize += 1;
+                state.stack[state.stackpos as usize] = value;
+                state.stackpos = state.stackpos + 1;
             }
             OP_PUSH_ARG => {
-                // RPython: stack = Stack(args[n-1], stack)
+                // RPython: stack = Stack(args[n-1], stack) — copy arg to top.
                 let n = program[pc] as usize;
                 pc += 1;
-                state.pool.get_mut(state.selected).copy_up(n);
-                stacksize += 1;
+                let v = state.stack[n];
+                state.stack[state.stackpos as usize] = v;
+                state.stackpos = state.stackpos + 1;
             }
             OP_STORE_ARG => {
-                // RPython: stack, args[n-1] = stack.pop()
+                // RPython: stack, args[n-1] = stack.pop() — pop top and store at arg slot n.
                 let n = program[pc] as usize;
                 pc += 1;
-                state.pool.get_mut(state.selected).store_down(n);
-                stacksize -= 1;
+                state.stackpos = state.stackpos - 1;
+                let v = state.stack[state.stackpos as usize];
+                state.stack[n] = v;
             }
-            // RPython: op2(stack, func_add_int, func_add_str)
-            // Integer-only path; promote(y.__class__) is implicit (no StrBox in bytecoded form).
-            OP_ADD => state.pool.get_mut(state.selected).add(),
-            OP_SUB => state.pool.get_mut(state.selected).sub(),
-            OP_MUL => state.pool.get_mut(state.selected).mul(),
+            OP_ADD => {
+                let a = state.stack[(state.stackpos - 1) as usize];
+                let b = state.stack[(state.stackpos - 2) as usize];
+                state.stack[(state.stackpos - 2) as usize] = b + a;
+                state.stackpos = state.stackpos - 1;
+            }
+            OP_SUB => {
+                let a = state.stack[(state.stackpos - 1) as usize];
+                let b = state.stack[(state.stackpos - 2) as usize];
+                state.stack[(state.stackpos - 2) as usize] = b - a;
+                state.stackpos = state.stackpos - 1;
+            }
+            OP_MUL => {
+                let a = state.stack[(state.stackpos - 1) as usize];
+                let b = state.stack[(state.stackpos - 2) as usize];
+                state.stack[(state.stackpos - 2) as usize] = b * a;
+                state.stackpos = state.stackpos - 1;
+            }
             OP_LOOP_START => {
                 // RPython: loops.append(pos) — loop targets are compiled into bytecode offsets.
             }
@@ -263,12 +167,9 @@ fn mainloop(program: &Bytecode, num_args: usize, args_out: &mut [i64], threshold
                 // RPython: flag = stack.pop(); if flag.as_int() != 0: pos = loops[-1]; promote(pos)
                 let target = (program[pc] as usize) | ((program[pc + 1] as usize) << 8);
                 pc += 2;
-                let cond = state.pool.get_mut(state.selected).pop();
-                stacksize -= 1;
-                let jump = cond != 0;
+                state.stackpos = state.stackpos - 1;
+                let jump = state.stack[state.stackpos as usize] != 0;
                 if jump {
-                    // RPython: promote(pos); can_enter_jit(...)
-                    // promote(pos) is implicit: target is a bytecode literal, already constant.
                     if target <= pc {
                         can_enter_jit!(driver, target, &mut state, program, || {});
                     }
@@ -281,11 +182,13 @@ fn mainloop(program: &Bytecode, num_args: usize, args_out: &mut [i64], threshold
         }
     }
 
-    // Write modified args back (RPython mutates args[] in-place).
-    state.pool.get(state.selected).read_args(args_out);
+    // Write modified args back.
+    let n = args_out.len().min(state.stackpos as usize);
+    args_out[..n].copy_from_slice(&state.stack[..n]);
 
-    // Result is the top of storage.
-    state.pool.get_mut(state.selected).pop()
+    // Result is the top of stack (one past stackpos-1).
+    state.stackpos = state.stackpos - 1;
+    state.stack[state.stackpos as usize]
 }
 
 // ── Public wrapper matching the old API ──
@@ -303,7 +206,7 @@ impl JitTiny2Interp {
     /// Returns the result: stack top if non-empty, else args[0].
     ///
     /// RPython: interpret(bytecode, args) — args are mutated in-place during execution.
-    /// Here, args occupy storage slots 0..num_args and are written back via args_out.
+    /// Here, args occupy stack slots 0..num_args and are written back via args_out.
     pub fn run(&mut self, bytecode: &[&str], args: &mut Vec<i64>) -> i64 {
         let code = compile(bytecode);
         let num_args = args.len();
@@ -311,7 +214,7 @@ impl JitTiny2Interp {
         // Determine if the program ends with a value on stack beyond args.
         let has_result_on_stack = program_has_result(bytecode, num_args);
 
-        // Prepend OP_PUSH_INT instructions for each arg to pre-populate the storage.
+        // Prepend OP_PUSH_INT instructions for each arg to pre-populate the stack.
         // The prepended prefix shifts all bytecode offsets, so loop targets in `code`
         // must be adjusted by the prefix length.
         let prefix_len = num_args * 9; // 1 opcode byte + 8 value bytes per arg
@@ -341,8 +244,8 @@ impl JitTiny2Interp {
         }
         full_code.extend_from_slice(&patched_code);
 
-        // mainloop writes modified args back into args_out before returning.
-        let result = mainloop(&full_code, num_args, args.as_mut_slice(), self.threshold);
+        // Stack starts empty; args are pushed by the OP_PUSH_INT prefix, so pass num_args=0.
+        let result = mainloop(&full_code, 0, args.as_mut_slice(), self.threshold);
 
         if has_result_on_stack { result } else { args[0] }
     }

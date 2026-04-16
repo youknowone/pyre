@@ -1,104 +1,13 @@
-/// JIT-enabled TLA interpreter — auto-generated tracing via `#[jit_interp]`.
+/// JIT-enabled TLA interpreter via `#[jit_interp]` with `state_fields`.
 ///
-/// The `#[jit_interp]` proc macro transforms this interpreter function into
-/// a meta-tracing JIT: it auto-generates `trace_instruction` and `JitState`
-/// impl from the match dispatch arms. No manual IR recording needed.
+/// RPython parity: tla.py Frame `_virtualizable_ = ['stackpos', 'stack[*]']`
+/// (tla.py:98). Integer-only trace — strings cause trace abort.
 ///
-/// This matches RPython's abstraction: write the interpreter, get JIT for free.
-///
-/// Greens: [pc]
-/// Reds:   [stack (via storage pool)]
+/// Greens: [pc, bytecode]
+/// Reds:   [stackpos, stack]  (tracked via state_fields)
 
-// ── Storage pool types ──
-
-/// Single i64 stack storage.
-/// Frame._virtualizable_ = ['stackpos', 'stack[*]'] — tla.py:98
-pub struct TlaStorage {
-    stack: Vec<i64>,
-}
-
-impl TlaStorage {
-    fn new() -> Self {
-        TlaStorage { stack: Vec::new() }
-    }
-    pub fn push(&mut self, val: i64) {
-        self.stack.push(val);
-    }
-    pub fn pop(&mut self) -> i64 {
-        self.stack.pop().unwrap()
-    }
-    pub fn dup(&mut self) {
-        let v = *self.stack.last().unwrap();
-        self.stack.push(v);
-    }
-    pub fn add(&mut self) {
-        let a = self.pop();
-        let b = self.pop();
-        self.push(b + a);
-    }
-    pub fn sub(&mut self) {
-        let a = self.pop();
-        let b = self.pop();
-        self.push(b - a);
-    }
-    pub fn len(&self) -> usize {
-        self.stack.len()
-    }
-    pub fn is_empty(&self) -> bool {
-        self.stack.is_empty()
-    }
-    pub fn peek_at(&self, idx: usize) -> i64 {
-        self.stack[self.stack.len() - 1 - idx]
-    }
-    pub fn clear(&mut self) {
-        self.stack.clear();
-    }
-    pub fn data_ptr(&self) -> usize {
-        self.stack.as_ptr() as usize
-    }
-    pub fn get_op(&self, _pc: usize) -> u8 {
-        0 // unused — opcode is read from env/program directly
-    }
-}
-
-/// Storage pool wrapping a single TlaStorage.
-pub struct TlaPool {
-    storages: Vec<TlaStorage>,
-}
-
-impl TlaPool {
-    fn new() -> Self {
-        TlaPool {
-            storages: vec![TlaStorage::new()],
-        }
-    }
-    pub fn get(&self, idx: usize) -> &TlaStorage {
-        &self.storages[idx]
-    }
-    pub fn get_mut(&mut self, idx: usize) -> &mut TlaStorage {
-        &mut self.storages[idx]
-    }
-    pub fn all_jit_compatible(&self) -> bool {
-        true
-    }
-}
-
-/// Interpreter state: storage pool + selected storage index.
-/// Matches RPython Frame with pc, bytecode as greens, self as red — tla.py:92-95
-struct TlaState {
-    pool: TlaPool,
-    selected: usize,
-}
-
-fn find_used_storages(_program: &Bytecode, _header_pc: usize, _initial: usize) -> Vec<usize> {
-    vec![0]
-}
-
-/// Type alias for bytecode — the env type for `#[jit_interp]`.
 pub type Bytecode = [u8];
 
-/// Extension trait providing `get_op` for bytecode slices.
-/// Required by `#[jit_interp]` generated code.
 trait BytecodeExt {
     fn get_op(&self, pc: usize) -> u8;
 }
@@ -107,6 +16,13 @@ impl BytecodeExt for [u8] {
     fn get_op(&self, pc: usize) -> u8 {
         self[pc]
     }
+}
+
+const STACK_CAP: usize = 1024;
+
+struct TlaState {
+    stackpos: i64,
+    stack: Vec<i64>,
 }
 
 // ── Opcodes ──
@@ -120,39 +36,30 @@ const DUP: u8 = 5;
 const SUB: u8 = 6;
 const NEWSTR: u8 = 7;
 
-// get_printable_location — tla.py:83 (no Rust equivalent needed)
-
 // ── JIT mainloop ──
 
 #[majit_macros::jit_interp(
     state = TlaState,
     env = Bytecode,
-    storage = {
-        pool: state.pool,
-        pool_type: TlaPool,
-        selector: state.selected,
-        untraceable: [],
-        scan: find_used_storages,
-        can_trace_guard: all_jit_compatible,
-    },
-    binops = {
-        add => IntAdd,
-        sub => IntSub,
+    state_fields = {
+        stackpos: int,
+        stack: [int; virt],
     },
 )]
+#[allow(unused_assignments, unused_variables)]
 pub fn mainloop(program: &Bytecode, initial_value: i64, threshold: u32) -> i64 {
     let mut driver: majit_metainterp::JitDriver<TlaState> =
         majit_metainterp::JitDriver::new(threshold);
     let mut pc: usize = 0;
     let mut stacksize: i32 = 0;
     let mut state = TlaState {
-        pool: TlaPool::new(),
-        selected: 0,
+        stackpos: 1,
+        stack: {
+            let mut s = vec![0i64; STACK_CAP];
+            s[0] = initial_value;
+            s
+        },
     };
-
-    // Push initial value onto the stack.
-    state.pool.get_mut(state.selected).push(initial_value);
-    stacksize = 1;
 
     while pc < program.len() {
         jit_merge_point!();
@@ -163,31 +70,34 @@ pub fn mainloop(program: &Bytecode, initial_value: i64, threshold: u32) -> i64 {
             CONST_INT => {
                 let value = program[pc] as i64;
                 pc += 1;
-                state.pool.get_mut(state.selected).push(value);
-                stacksize += 1;
+                state.stack[state.stackpos as usize] = value;
+                state.stackpos = state.stackpos + 1;
             }
             POP => {
-                state.pool.get_mut(state.selected).pop();
-                stacksize -= 1;
+                state.stackpos = state.stackpos - 1;
             }
             DUP => {
-                state.pool.get_mut(state.selected).dup();
-                stacksize += 1;
+                let v = state.stack[(state.stackpos - 1) as usize];
+                state.stack[state.stackpos as usize] = v;
+                state.stackpos = state.stackpos + 1;
             }
             ADD => {
-                state.pool.get_mut(state.selected).add();
-                stacksize -= 1;
+                let a = state.stack[(state.stackpos - 1) as usize];
+                let b = state.stack[(state.stackpos - 2) as usize];
+                state.stack[(state.stackpos - 2) as usize] = b + a;
+                state.stackpos = state.stackpos - 1;
             }
             SUB => {
-                state.pool.get_mut(state.selected).sub();
-                stacksize -= 1;
+                let a = state.stack[(state.stackpos - 1) as usize];
+                let b = state.stack[(state.stackpos - 2) as usize];
+                state.stack[(state.stackpos - 2) as usize] = b - a;
+                state.stackpos = state.stackpos - 1;
             }
             JUMP_IF => {
                 let target = program[pc] as usize;
                 pc += 1;
-                let cond = state.pool.get_mut(state.selected).pop();
-                stacksize -= 1;
-                let jump = cond != 0;
+                state.stackpos = state.stackpos - 1;
+                let jump = state.stack[state.stackpos as usize] != 0;
                 if jump {
                     if target <= pc {
                         can_enter_jit!(driver, target, &mut state, program, || {});
@@ -207,7 +117,8 @@ pub fn mainloop(program: &Bytecode, initial_value: i64, threshold: u32) -> i64 {
         }
     }
 
-    state.pool.get_mut(state.selected).pop()
+    state.stackpos = state.stackpos - 1;
+    state.stack[state.stackpos as usize]
 }
 
 // ── Public wrapper matching the old API ──

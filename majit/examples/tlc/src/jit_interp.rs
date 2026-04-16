@@ -1,169 +1,22 @@
-/// JIT-enabled TLC interpreter — auto-generated tracing via `#[jit_interp]`.
+/// JIT-enabled TLC interpreter via `#[jit_interp]` with `state_fields`.
 ///
-/// The `#[jit_interp]` proc macro transforms this interpreter function into
-/// a meta-tracing JIT: it auto-generates `trace_instruction` and `JitState`
-/// impl from the match dispatch arms. No manual IR recording needed.
+/// RPython parity: tlc.py JitDriver(greens=['pc','code'], reds=['frame','pool']).
+/// TLC's Frame has a plain list stack (no `_virtualizable_`); we use
+/// `state_fields = { stackpos: int, stack: [int; virt] }` to mirror the
+/// virtualizable-stack shape used by tl.py/tla.py for the integer-only trace.
 ///
 /// Greens: [pc]
-/// Reds:   [stack (via storage pool)]
+/// Reds:   [stackpos, stack]
 ///
-/// RPython correspondence (tlc.py):
-///   - JitDriver(greens=['pc', 'code'], reds=['frame', 'pool']) — tlc.py:231
-///   - @elidable Class.get() — tlc.py:76 (class descriptor lookup cached as pure)
-///     Not yet implemented: requires extracting a helper and jitcode lowerer support.
-///   - Object opcodes (NIL, CONS, CAR, CDR, NEW, etc.) are not handled here —
-///     they cause guard failure in RPython, effectively breaking out of the trace.
-///   - Integer-only loop opcodes map directly to IR via #[jit_interp] binops.
+/// Only integer-stack opcodes are traced. Object opcodes (NIL, CONS, CAR, CDR,
+/// NEW, GETATTR, SETATTR, SEND) cause guard failure in RPython and are absent
+/// from this function, matching that behavior.
 use crate::interp::{self, ConstantPool};
 
-// ── Storage pool types ──
+// ── State ──
 
-/// Single i64 stack storage.
-pub struct TlcStorage {
-    stack: Vec<i64>,
-}
-
-impl TlcStorage {
-    fn new() -> Self {
-        TlcStorage { stack: Vec::new() }
-    }
-    pub fn push(&mut self, val: i64) {
-        self.stack.push(val);
-    }
-    pub fn pop(&mut self) -> i64 {
-        self.stack.pop().unwrap()
-    }
-    pub fn dup(&mut self) {
-        let v = *self.stack.last().unwrap();
-        self.stack.push(v);
-    }
-    pub fn swap(&mut self) {
-        let len = self.stack.len();
-        self.stack.swap(len - 1, len - 2);
-    }
-    pub fn add(&mut self) {
-        let a = self.pop();
-        let b = self.pop();
-        self.push(b + a);
-    }
-    pub fn sub(&mut self) {
-        let a = self.pop();
-        let b = self.pop();
-        self.push(b - a);
-    }
-    pub fn mul(&mut self) {
-        let a = self.pop();
-        let b = self.pop();
-        self.push(b * a);
-    }
-    pub fn eq(&mut self) {
-        let a = self.pop();
-        let b = self.pop();
-        self.push(if b == a { 1 } else { 0 });
-    }
-    pub fn ne(&mut self) {
-        let a = self.pop();
-        let b = self.pop();
-        self.push(if b != a { 1 } else { 0 });
-    }
-    pub fn lt(&mut self) {
-        let a = self.pop();
-        let b = self.pop();
-        self.push(if b < a { 1 } else { 0 });
-    }
-    pub fn le(&mut self) {
-        let a = self.pop();
-        let b = self.pop();
-        self.push(if b <= a { 1 } else { 0 });
-    }
-    pub fn gt(&mut self) {
-        let a = self.pop();
-        let b = self.pop();
-        self.push(if b > a { 1 } else { 0 });
-    }
-    pub fn ge(&mut self) {
-        let a = self.pop();
-        let b = self.pop();
-        self.push(if b >= a { 1 } else { 0 });
-    }
-    /// Stack rotation — inline in tlc.py:284 (no @dont_look_inside).
-    pub fn roll(&mut self, r: i64) {
-        if r < -1 {
-            let i = self.stack.len() as i64 + r;
-            assert!(i >= 0, "IndexError in ROLL");
-            let val = self.stack.pop().unwrap();
-            self.stack.insert(i as usize, val);
-        } else if r > 1 {
-            let i = self.stack.len() as i64 - r;
-            assert!(i >= 0, "IndexError in ROLL");
-            let val = self.stack.remove(i as usize);
-            self.stack.push(val);
-        }
-    }
-    pub fn pick_at(&mut self, depth: usize) {
-        let n = self.stack.len() - depth - 1;
-        let val = self.stack[n];
-        self.stack.push(val);
-    }
-    pub fn put_at(&mut self, depth: usize) {
-        let val = self.stack.pop().unwrap();
-        let n = self.stack.len() - depth - 1;
-        self.stack[n] = val;
-    }
-    pub fn len(&self) -> usize {
-        self.stack.len()
-    }
-    pub fn is_empty(&self) -> bool {
-        self.stack.is_empty()
-    }
-    pub fn peek_at(&self, idx: usize) -> i64 {
-        self.stack[self.stack.len() - 1 - idx]
-    }
-    pub fn clear(&mut self) {
-        self.stack.clear();
-    }
-    pub fn data_ptr(&self) -> usize {
-        self.stack.as_ptr() as usize
-    }
-}
-
-/// Storage pool wrapping a single TlcStorage.
-pub struct TlcPool {
-    storages: Vec<TlcStorage>,
-}
-
-impl TlcPool {
-    fn new() -> Self {
-        TlcPool {
-            storages: vec![TlcStorage::new()],
-        }
-    }
-    pub fn get(&self, idx: usize) -> &TlcStorage {
-        &self.storages[idx]
-    }
-    pub fn get_mut(&mut self, idx: usize) -> &mut TlcStorage {
-        &mut self.storages[idx]
-    }
-    pub fn all_jit_compatible(&self) -> bool {
-        true
-    }
-}
-
-/// Interpreter state: storage pool + selected storage index.
-struct TlcState {
-    pool: TlcPool,
-    selected: usize,
-}
-
-fn find_used_storages(_program: &Bytecode, _header_pc: usize, _initial: usize) -> Vec<usize> {
-    vec![0]
-}
-
-/// Type alias for bytecode — the env type for `#[jit_interp]`.
 pub type Bytecode = [u8];
 
-/// Extension trait providing `get_op` for bytecode slices.
-/// Required by `#[jit_interp]` generated code.
 trait BytecodeExt {
     fn get_op(&self, pc: usize) -> u8;
 }
@@ -171,6 +24,45 @@ trait BytecodeExt {
 impl BytecodeExt for [u8] {
     fn get_op(&self, pc: usize) -> u8 {
         self[pc]
+    }
+}
+
+const STACK_CAP: usize = 1024;
+
+struct TlcState {
+    stackpos: i64,
+    stack: Vec<i64>,
+}
+
+/// Stack rotation — residual CALL in the trace.
+///
+/// RPython parity: tlc.py:284 ROLL (inline). Writing it as a raw-pointer
+/// function with `#[dont_look_inside]` lets the JIT emit a single residual
+/// CALL instead of tracing the inner shuffle.
+#[majit_macros::dont_look_inside]
+extern "C" fn tlc_roll(stack_ptr: usize, stackpos: i64, r: i64) {
+    let stack = unsafe { std::slice::from_raw_parts_mut(stack_ptr as *mut i64, stackpos as usize) };
+    let len = stack.len();
+    if r < -1 {
+        // Move top element to position len+r (counted from bottom).
+        let i = len as i64 + r;
+        assert!(i >= 0, "IndexError in ROLL");
+        let i = i as usize;
+        let elem = stack[len - 1];
+        for j in (i..len - 1).rev() {
+            stack[j + 1] = stack[j];
+        }
+        stack[i] = elem;
+    } else if r > 1 {
+        // Move element at position len-r to top.
+        let i = len as i64 - r;
+        assert!(i >= 0, "IndexError in ROLL");
+        let i = i as usize;
+        let elem = stack[i];
+        for j in i..len - 1 {
+            stack[j] = stack[j + 1];
+        }
+        stack[len - 1] = elem;
     }
 }
 
@@ -188,8 +80,6 @@ const SUB: u8 = interp::SUB;
 const MUL: u8 = interp::MUL;
 // DIV not traced: IntObj.div() in tlc.py:144 uses Python 2 floor division (//),
 // which differs from Rust's truncating division for negative operands.
-// Object opcodes (NIL, CONS, CAR, CDR, NEW, GETATTR, SETATTR, SEND) are also
-// not traced — they cause guard failure, breaking out of the compiled trace.
 const EQ: u8 = interp::EQ;
 const NE: u8 = interp::NE;
 const LT: u8 = interp::LT;
@@ -205,41 +95,24 @@ const DEFAULT_THRESHOLD: u32 = 3;
 
 // ── JIT mainloop ──
 
-// #[jit_interp] generates trace_instruction + JitState from the match arms below.
-// Only integer-stack opcodes are traced; object opcodes (NIL, CONS, NEW, SEND, etc.)
-// are absent from this function, so reaching them would abort tracing — matching
-// RPython's behavior where polymorphic dispatch on Obj causes guard failure.
 #[majit_macros::jit_interp(
     state = TlcState,
     env = Bytecode,
-    storage = {
-        pool: state.pool,
-        pool_type: TlcPool,
-        selector: state.selected,
-        untraceable: [],
-        scan: find_used_storages,
-        can_trace_guard: all_jit_compatible,
-    },
-    binops = {
-        add => IntAdd,
-        sub => IntSub,
-        mul => IntMul,
-        eq => IntEq,
-        ne => IntNe,
-        lt => IntLt,
-        le => IntLe,
-        gt => IntGt,
-        ge => IntGe,
+    auto_calls = true,
+    state_fields = {
+        stackpos: int,
+        stack: [int; virt],
     },
 )]
+#[allow(unused_assignments, unused_variables)]
 pub fn mainloop(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 {
     let mut driver: majit_metainterp::JitDriver<TlcState> =
         majit_metainterp::JitDriver::new(threshold);
     let mut pc: usize = 0;
     let mut stacksize: i32 = 0;
     let mut state = TlcState {
-        pool: TlcPool::new(),
-        selected: 0,
+        stackpos: 0,
+        stack: vec![0i64; STACK_CAP],
     };
 
     while pc < program.len() {
@@ -252,50 +125,100 @@ pub fn mainloop(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 {
             PUSH => {
                 let value = program[pc] as i8 as i64;
                 pc += 1;
-                state.pool.get_mut(state.selected).push(value);
-                stacksize += 1;
+                state.stack[state.stackpos as usize] = value;
+                state.stackpos = state.stackpos + 1;
             }
             POP => {
-                state.pool.get_mut(state.selected).pop();
-                stacksize -= 1;
+                state.stackpos = state.stackpos - 1;
             }
-            SWAP => state.pool.get_mut(state.selected).swap(),
-            ADD => state.pool.get_mut(state.selected).add(),
-            SUB => state.pool.get_mut(state.selected).sub(),
-            MUL => state.pool.get_mut(state.selected).mul(),
-            EQ => state.pool.get_mut(state.selected).eq(),
-            NE => state.pool.get_mut(state.selected).ne(),
-            LT => state.pool.get_mut(state.selected).lt(),
-            LE => state.pool.get_mut(state.selected).le(),
-            GT => state.pool.get_mut(state.selected).gt(),
-            GE => state.pool.get_mut(state.selected).ge(),
+            SWAP => {
+                let a = state.stack[(state.stackpos - 1) as usize];
+                let b = state.stack[(state.stackpos - 2) as usize];
+                state.stack[(state.stackpos - 1) as usize] = b;
+                state.stack[(state.stackpos - 2) as usize] = a;
+            }
+            ADD => {
+                let a = state.stack[(state.stackpos - 1) as usize];
+                let b = state.stack[(state.stackpos - 2) as usize];
+                state.stack[(state.stackpos - 2) as usize] = b + a;
+                state.stackpos = state.stackpos - 1;
+            }
+            SUB => {
+                let a = state.stack[(state.stackpos - 1) as usize];
+                let b = state.stack[(state.stackpos - 2) as usize];
+                state.stack[(state.stackpos - 2) as usize] = b - a;
+                state.stackpos = state.stackpos - 1;
+            }
+            MUL => {
+                let a = state.stack[(state.stackpos - 1) as usize];
+                let b = state.stack[(state.stackpos - 2) as usize];
+                state.stack[(state.stackpos - 2) as usize] = b * a;
+                state.stackpos = state.stackpos - 1;
+            }
+            EQ => {
+                let a = state.stack[(state.stackpos - 1) as usize];
+                let b = state.stack[(state.stackpos - 2) as usize];
+                state.stack[(state.stackpos - 2) as usize] = if b == a { 1 } else { 0 };
+                state.stackpos = state.stackpos - 1;
+            }
+            NE => {
+                let a = state.stack[(state.stackpos - 1) as usize];
+                let b = state.stack[(state.stackpos - 2) as usize];
+                state.stack[(state.stackpos - 2) as usize] = if b != a { 1 } else { 0 };
+                state.stackpos = state.stackpos - 1;
+            }
+            LT => {
+                let a = state.stack[(state.stackpos - 1) as usize];
+                let b = state.stack[(state.stackpos - 2) as usize];
+                state.stack[(state.stackpos - 2) as usize] = if b < a { 1 } else { 0 };
+                state.stackpos = state.stackpos - 1;
+            }
+            LE => {
+                let a = state.stack[(state.stackpos - 1) as usize];
+                let b = state.stack[(state.stackpos - 2) as usize];
+                state.stack[(state.stackpos - 2) as usize] = if b <= a { 1 } else { 0 };
+                state.stackpos = state.stackpos - 1;
+            }
+            GT => {
+                let a = state.stack[(state.stackpos - 1) as usize];
+                let b = state.stack[(state.stackpos - 2) as usize];
+                state.stack[(state.stackpos - 2) as usize] = if b > a { 1 } else { 0 };
+                state.stackpos = state.stackpos - 1;
+            }
+            GE => {
+                let a = state.stack[(state.stackpos - 1) as usize];
+                let b = state.stack[(state.stackpos - 2) as usize];
+                state.stack[(state.stackpos - 2) as usize] = if b >= a { 1 } else { 0 };
+                state.stackpos = state.stackpos - 1;
+            }
             ROLL => {
                 let r = program[pc] as i8 as i64;
                 pc += 1;
-                state.pool.get_mut(state.selected).roll(r);
+                tlc_roll(state.stack.as_mut_ptr() as usize, state.stackpos, r);
             }
             PICK => {
                 let i = program[pc] as usize;
                 pc += 1;
-                state.pool.get_mut(state.selected).pick_at(i);
-                stacksize += 1;
+                let v = state.stack[(state.stackpos as usize) - i - 1];
+                state.stack[state.stackpos as usize] = v;
+                state.stackpos = state.stackpos + 1;
             }
             PUT => {
                 let i = program[pc] as usize;
                 pc += 1;
-                state.pool.get_mut(state.selected).put_at(i);
-                stacksize -= 1;
+                state.stackpos = state.stackpos - 1;
+                let v = state.stack[state.stackpos as usize];
+                state.stack[(state.stackpos as usize) - i] = v;
             }
             PUSHARG => {
-                state.pool.get_mut(state.selected).push(inputarg);
-                stacksize += 1;
+                state.stack[state.stackpos as usize] = inputarg;
+                state.stackpos = state.stackpos + 1;
             }
             BR_COND => {
                 let target = ((pc as i64) + program[pc] as i8 as i64 + 1) as usize;
                 let next_pc = pc + 1;
-                let cond = state.pool.get_mut(state.selected).pop();
-                stacksize -= 1;
-                let jump = cond != 0;
+                state.stackpos = state.stackpos - 1;
+                let jump = state.stack[state.stackpos as usize] != 0;
                 if jump {
                     if target < next_pc {
                         can_enter_jit!(driver, target, &mut state, program, || {});
@@ -319,10 +242,11 @@ pub fn mainloop(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 {
         }
     }
 
-    if state.pool.get(state.selected).is_empty() {
+    if state.stackpos == 0 {
         0
     } else {
-        state.pool.get_mut(state.selected).pop()
+        state.stackpos = state.stackpos - 1;
+        state.stack[state.stackpos as usize]
     }
 }
 

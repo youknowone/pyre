@@ -1,10 +1,10 @@
-/// JIT-enabled tiny3 interpreter via `#[jit_interp]` proc macro.
+/// JIT-enabled tiny3 interpreter via `#[jit_interp]` proc macro with `state_fields`.
 ///
-/// The word-based program is compiled to bytecode, then the bytecoded mainloop
-/// is traced by the auto-generated JitState/trace_instruction.
+/// RPython parity: `_virtualizable_ = ['stackpos', 'stack[*]']` maps to
+/// `state_fields = { stackpos: int, stack: [int; virt] }`.
 ///
 /// Greens: [pc]
-/// Reds:   [storage (args at bottom, computation stack on top)]
+/// Reds:   [stackpos, stack]  (args at bottom, computation stack on top)
 ///
 /// The JIT traces the integer-only path. Float arithmetic falls back to the
 /// plain interpreter. This matches RPython's promote(y.__class__) strategy.
@@ -21,6 +21,8 @@ const OP_LOOP_START: u8 = 6; // no-op marker
 const OP_LOOP_END: u8 = 7; // followed by 2 bytes (target pc, u16 LE)
 const OP_END: u8 = 8;
 const OP_PUSH_FLOAT: u8 = 9; // followed by 8 bytes (f64 bits as i64 LE) — not traced by JIT
+
+const STACK_CAP: usize = 1024;
 
 // ── Bytecode compiler ──
 
@@ -69,105 +71,15 @@ fn compile(words: &[&str]) -> Vec<u8> {
     code
 }
 
-// ── Storage pool types ──
+// ── State ──
 
-/// Single i64 storage: args at bottom, computation stack on top.
-pub struct Tiny3Storage {
+struct Tiny3State {
+    stackpos: i64,
     stack: Vec<i64>,
 }
 
-impl Tiny3Storage {
-    fn new() -> Self {
-        Tiny3Storage { stack: Vec::new() }
-    }
-    pub fn push(&mut self, val: i64) {
-        self.stack.push(val);
-    }
-    pub fn pop(&mut self) -> i64 {
-        self.stack.pop().unwrap()
-    }
-    pub fn dup(&mut self) {
-        let v = *self.stack.last().unwrap();
-        self.stack.push(v);
-    }
-    pub fn add(&mut self) {
-        let a = self.pop();
-        let b = self.pop();
-        self.push(b + a);
-    }
-    pub fn sub(&mut self) {
-        let a = self.pop();
-        let b = self.pop();
-        self.push(b - a);
-    }
-    pub fn mul(&mut self) {
-        let a = self.pop();
-        let b = self.pop();
-        self.push(b * a);
-    }
-    /// Copy element at index `n` (from bottom, 0-based) to top.
-    pub fn copy_up(&mut self, n: usize) {
-        let val = self.stack[n];
-        self.stack.push(val);
-    }
-    /// Pop top and store at index `n` (from bottom, 0-based).
-    pub fn store_down(&mut self, n: usize) {
-        let val = self.stack.pop().unwrap();
-        self.stack[n] = val;
-    }
-    pub fn peek_at(&self, idx: usize) -> i64 {
-        self.stack[self.stack.len() - 1 - idx]
-    }
-    pub fn clear(&mut self) {
-        self.stack.clear();
-    }
-    pub fn data_ptr(&self) -> usize {
-        self.stack.as_ptr() as usize
-    }
-    pub fn len(&self) -> usize {
-        self.stack.len()
-    }
-    pub fn is_empty(&self) -> bool {
-        self.stack.is_empty()
-    }
-}
-
-/// Storage pool wrapping a single Tiny3Storage.
-pub struct Tiny3Pool {
-    storages: Vec<Tiny3Storage>,
-}
-
-impl Tiny3Pool {
-    fn new() -> Self {
-        Tiny3Pool {
-            storages: vec![Tiny3Storage::new()],
-        }
-    }
-    pub fn get(&self, idx: usize) -> &Tiny3Storage {
-        &self.storages[idx]
-    }
-    pub fn get_mut(&mut self, idx: usize) -> &mut Tiny3Storage {
-        &mut self.storages[idx]
-    }
-    pub fn all_jit_compatible(&self) -> bool {
-        true
-    }
-}
-
-/// Interpreter state: storage pool + selected storage index.
-struct Tiny3State {
-    pool: Tiny3Pool,
-    selected: usize,
-}
-
-fn find_used_storages(_program: &Bytecode, _header_pc: usize, _initial: usize) -> Vec<usize> {
-    vec![0]
-}
-
-/// Type alias for bytecode — the env type for `#[jit_interp]`.
 pub type Bytecode = [u8];
 
-/// Extension trait providing `get_op` for bytecode slices.
 trait BytecodeExt {
     fn get_op(&self, pc: usize) -> u8;
 }
@@ -183,28 +95,20 @@ impl BytecodeExt for [u8] {
 #[majit_macros::jit_interp(
     state = Tiny3State,
     env = Bytecode,
-    storage = {
-        pool: state.pool,
-        pool_type: Tiny3Pool,
-        selector: state.selected,
-        untraceable: [],
-        scan: find_used_storages,
-        can_trace_guard: all_jit_compatible,
-    },
-    binops = {
-        add => IntAdd,
-        sub => IntSub,
-        mul => IntMul,
+    state_fields = {
+        stackpos: int,
+        stack: [int; virt],
     },
 )]
+#[allow(unused_assignments, unused_variables)]
 fn mainloop(program: &Bytecode, num_args: usize, threshold: u32) -> i64 {
     let mut driver: majit_metainterp::JitDriver<Tiny3State> =
         majit_metainterp::JitDriver::new(threshold);
     let mut pc: usize = 0;
-    let mut stacksize: i32 = num_args as i32;
+    let mut stacksize: i32 = 0;
     let mut state = Tiny3State {
-        pool: Tiny3Pool::new(),
-        selected: 0,
+        stackpos: num_args as i64,
+        stack: vec![0i64; STACK_CAP],
     };
 
     while pc < program.len() {
@@ -225,8 +129,8 @@ fn mainloop(program: &Bytecode, num_args: usize, threshold: u32) -> i64 {
                     program[pc + 7],
                 ]);
                 pc += 8;
-                state.pool.get_mut(state.selected).push(value);
-                stacksize += 1;
+                state.stack[state.stackpos as usize] = value;
+                state.stackpos = state.stackpos + 1;
             }
             OP_PUSH_FLOAT => {
                 // Float literal stored as bit-casted i64 — same encoding as OP_PUSH_INT.
@@ -241,31 +145,47 @@ fn mainloop(program: &Bytecode, num_args: usize, threshold: u32) -> i64 {
                     program[pc + 7],
                 ]);
                 pc += 8;
-                state.pool.get_mut(state.selected).push(value);
-                stacksize += 1;
+                state.stack[state.stackpos as usize] = value;
+                state.stackpos = state.stackpos + 1;
             }
             OP_PUSH_ARG => {
                 let n = program[pc] as usize;
                 pc += 1;
-                state.pool.get_mut(state.selected).copy_up(n);
-                stacksize += 1;
+                let v = state.stack[n];
+                state.stack[state.stackpos as usize] = v;
+                state.stackpos = state.stackpos + 1;
             }
             OP_STORE_ARG => {
                 let n = program[pc] as usize;
                 pc += 1;
-                state.pool.get_mut(state.selected).store_down(n);
-                stacksize -= 1;
+                state.stackpos = state.stackpos - 1;
+                let v = state.stack[state.stackpos as usize];
+                state.stack[n] = v;
             }
-            OP_ADD => state.pool.get_mut(state.selected).add(),
-            OP_SUB => state.pool.get_mut(state.selected).sub(),
-            OP_MUL => state.pool.get_mut(state.selected).mul(),
+            OP_ADD => {
+                let a = state.stack[(state.stackpos - 1) as usize];
+                let b = state.stack[(state.stackpos - 2) as usize];
+                state.stack[(state.stackpos - 2) as usize] = b + a;
+                state.stackpos = state.stackpos - 1;
+            }
+            OP_SUB => {
+                let a = state.stack[(state.stackpos - 1) as usize];
+                let b = state.stack[(state.stackpos - 2) as usize];
+                state.stack[(state.stackpos - 2) as usize] = b - a;
+                state.stackpos = state.stackpos - 1;
+            }
+            OP_MUL => {
+                let a = state.stack[(state.stackpos - 1) as usize];
+                let b = state.stack[(state.stackpos - 2) as usize];
+                state.stack[(state.stackpos - 2) as usize] = b * a;
+                state.stackpos = state.stackpos - 1;
+            }
             OP_LOOP_START => {}
             OP_LOOP_END => {
                 let target = (program[pc] as usize) | ((program[pc + 1] as usize) << 8);
                 pc += 2;
-                let cond = state.pool.get_mut(state.selected).pop();
-                stacksize -= 1;
-                let jump = cond != 0;
+                state.stackpos = state.stackpos - 1;
+                let jump = state.stack[state.stackpos as usize] != 0;
                 if jump {
                     if target <= pc {
                         can_enter_jit!(driver, target, &mut state, program, || {});
@@ -279,7 +199,8 @@ fn mainloop(program: &Bytecode, num_args: usize, threshold: u32) -> i64 {
         }
     }
 
-    state.pool.get_mut(state.selected).pop()
+    state.stackpos = state.stackpos - 1;
+    state.stack[state.stackpos as usize]
 }
 
 // ── Public wrapper matching the old API ──
@@ -299,15 +220,35 @@ impl JitTiny3Interp {
         let num_args = args.len();
         let has_result_on_stack = program_has_result(bytecode, num_args);
 
-        // Prepend OP_PUSH_INT for each arg to pre-populate the storage.
+        // Prepend OP_PUSH_INT for each arg to pre-populate the stack.
+        let prefix_len = num_args * 9;
         let mut full_code = Vec::new();
         for &arg in args.iter() {
             full_code.push(OP_PUSH_INT);
             full_code.extend_from_slice(&arg.to_le_bytes());
         }
-        full_code.extend_from_slice(&code);
+        // Patch loop targets to account for the prepended prefix.
+        let mut patched_code = code.clone();
+        let mut ci = 0;
+        while ci < patched_code.len() {
+            match patched_code[ci] {
+                OP_PUSH_INT | OP_PUSH_FLOAT => ci += 9,
+                OP_PUSH_ARG | OP_STORE_ARG => ci += 2,
+                OP_LOOP_END => {
+                    ci += 1;
+                    let old_target =
+                        (patched_code[ci] as usize) | ((patched_code[ci + 1] as usize) << 8);
+                    let new_target = old_target + prefix_len;
+                    patched_code[ci] = (new_target & 0xFF) as u8;
+                    patched_code[ci + 1] = ((new_target >> 8) & 0xFF) as u8;
+                    ci += 2;
+                }
+                _ => ci += 1,
+            }
+        }
+        full_code.extend_from_slice(&patched_code);
 
-        let result = mainloop(&full_code, num_args, self.threshold);
+        let result = mainloop(&full_code, 0, self.threshold);
 
         // Sync args back via plain interpreter.
         let mut interp_args: Vec<crate::interp::Box> =
