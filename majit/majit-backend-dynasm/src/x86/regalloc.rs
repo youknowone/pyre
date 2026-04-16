@@ -57,3 +57,12 @@ pub fn core_reg_index(reg: RegLoc) -> Option<usize> {
         .iter()
         .position(|candidate| *candidate == reg)
 }
+
+/// x86_64 has no equivalent of aarch64's `ip1` reservation; this
+/// re-export lets the shared regalloc base reference a per-arch tmp
+/// slot uniformly.  R15 is outside the GPR allocation pool so it is a
+/// safe scratch placeholder.
+pub const IP1: RegLoc = RegLoc {
+    value: 15,
+    is_xmm: false,
+};

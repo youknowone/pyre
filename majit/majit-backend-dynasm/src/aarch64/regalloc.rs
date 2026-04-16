@@ -117,3 +117,11 @@ pub fn core_reg_index(reg: RegLoc) -> Option<usize> {
         _ => None,
     }
 }
+
+/// aarch64/registers.py:21 `ip1 = x17` — scratch register reserved for
+/// large-immediate stitching (movz/movk sequences).  Available to the
+/// shared regalloc base as a tmp slot via the per-arch re-export.
+pub const IP1: RegLoc = RegLoc {
+    value: 17,
+    is_xmm: false,
+};

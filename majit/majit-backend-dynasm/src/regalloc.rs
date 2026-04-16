@@ -37,17 +37,8 @@ fn check_imm_arg(arg: i64) -> bool {
     arg >= 0 && arg < DEFAULT_IMM_SIZE
 }
 
-/// aarch64: r.ip1 = x17 (scratch register for large immediates)
-#[cfg(target_arch = "aarch64")]
-const IP1: RegLoc = RegLoc {
-    value: 17,
-    is_xmm: false,
-};
-#[cfg(not(target_arch = "aarch64"))]
-const IP1: RegLoc = RegLoc {
-    value: 15, // r15 on x86_64 — unused scratch
-    is_xmm: false,
-};
+// IP1 — scratch register for large immediates (aarch64 r.ip1 = x17,
+// x86_64 reservation in arch_regalloc::IP1).  Re-exported from per-arch.
 
 // ── Lifetime ───────────────────────────────────────────────────────
 
@@ -709,8 +700,8 @@ use crate::aarch64::regalloc as arch_regalloc;
 use crate::x86::regalloc as arch_regalloc;
 
 use arch_regalloc::{
-    all_core_regs, all_float_regs, call_result_fpr, call_result_gpr, core_reg_index, frame_reg,
-    save_around_call_core_regs,
+    IP1, all_core_regs, all_float_regs, call_result_fpr, call_result_gpr, core_reg_index,
+    frame_reg, save_around_call_core_regs,
 };
 
 // ── RegisterManager ────────────────────────────────────────────────
