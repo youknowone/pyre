@@ -88,7 +88,8 @@ impl CacheEntry {
         Self::default()
     }
 
-    pub fn clear_cache_on_write(&mut self, seen_allocation_of_target: bool) {
+    /// heapcache.py:53-58 _clear_cache_on_write
+    pub fn _clear_cache_on_write(&mut self, seen_allocation_of_target: bool) {
         if !seen_allocation_of_target {
             self.cache_seen_allocation.clear();
         }
@@ -101,26 +102,18 @@ impl CacheEntry {
         }
     }
 
-    pub fn _clear_cache_on_write(&mut self, seen_allocation_of_target: bool) {
-        self.clear_cache_on_write(seen_allocation_of_target)
-    }
-
-    pub fn seen_alloc(&self, ref_box: OpRef, cache: &HeapCache) -> bool {
+    /// heapcache.py:79-82 _seen_alloc
+    ///
+    /// Pyre adapt: needs an explicit `cache: &HeapCache` parameter
+    /// because `CacheEntry` is a separate struct from `HeapCache`
+    /// (RPython attaches the heapcache reference to CacheEntry at
+    /// __init__ time; in Rust we pass it through to avoid a back-
+    /// reference + interior mutability dance).
+    pub fn _seen_alloc(&self, ref_box: OpRef, cache: &HeapCache) -> bool {
         cache.saw_allocation(ref_box)
     }
 
-    pub fn _seen_alloc(&self, ref_box: OpRef, cache: &HeapCache) -> bool {
-        self.seen_alloc(ref_box, cache)
-    }
-
-    pub fn getdict(&self, seen_alloc: bool, _heapcache: &HeapCache) -> &HashMap<OpRef, OpRef> {
-        if seen_alloc {
-            &self.cache_seen_allocation
-        } else {
-            &self.cache_anything
-        }
-    }
-
+    /// heapcache.py:84-88 _getdict
     pub fn _getdict(&self, seen_alloc: bool) -> &HashMap<OpRef, OpRef> {
         if seen_alloc {
             &self.cache_seen_allocation
@@ -129,14 +122,8 @@ impl CacheEntry {
         }
     }
 
-    pub fn getdict_mut(&mut self, seen_alloc: bool) -> &mut HashMap<OpRef, OpRef> {
-        if seen_alloc {
-            &mut self.cache_seen_allocation
-        } else {
-            &mut self.cache_anything
-        }
-    }
-
+    /// Pyre adapt: Python doesn't need a separate `_mut` accessor;
+    /// Rust's borrow checker does.  Mirrors `_getdict`'s body.
     pub fn _getdict_mut(&mut self, seen_alloc: bool) -> &mut HashMap<OpRef, OpRef> {
         if seen_alloc {
             &mut self.cache_seen_allocation
@@ -145,14 +132,16 @@ impl CacheEntry {
         }
     }
 
+    /// heapcache.py:90-94 do_write_with_aliasing
     pub fn do_write_with_aliasing(&mut self, ref_box: OpRef, fieldbox: OpRef, cache: &HeapCache) {
-        let ref_box = self._unique_const_heuristic(ref_box, cache);
-        let seen_alloc = self.seen_alloc(ref_box, cache);
+        let ref_box = self._unique_const_heuristic(ref_box);
+        let seen_alloc = self._seen_alloc(ref_box, cache);
         self._clear_cache_on_write(seen_alloc);
         self._getdict_mut(seen_alloc).insert(ref_box, fieldbox);
     }
 
-    pub fn unique_const_heuristic(&mut self, ref_box: OpRef) -> OpRef {
+    /// heapcache.py:96-104 _unique_const_heuristic
+    pub fn _unique_const_heuristic(&mut self, ref_box: OpRef) -> OpRef {
         if let Some(last) = self.last_const_box {
             if last == ref_box {
                 return last;
@@ -162,32 +151,27 @@ impl CacheEntry {
         ref_box
     }
 
-    pub fn _unique_const_heuristic(&mut self, ref_box: OpRef, _cache: &HeapCache) -> OpRef {
-        let _ = _cache;
-        self.unique_const_heuristic(ref_box)
-    }
-
+    /// heapcache.py:106-114 read
     pub fn read(&mut self, ref_box: OpRef, cache: &HeapCache) -> Option<OpRef> {
-        let _ = cache;
-        let ref_box = self.unique_const_heuristic(ref_box);
-        let seen_alloc = self.seen_alloc(ref_box, cache);
+        let ref_box = self._unique_const_heuristic(ref_box);
+        let seen_alloc = self._seen_alloc(ref_box, cache);
         self._getdict(seen_alloc)
             .get(&ref_box)
             .copied()
             .map(|opref| cache.maybe_replace_with_const(opref))
     }
 
-    pub fn read_now_known(&mut self, ref_box: OpRef, fieldbox: OpRef, _cache: &HeapCache) {
-        let ref_box = self.unique_const_heuristic(ref_box);
-        let seen_alloc = self.seen_alloc(ref_box, _cache);
+    /// heapcache.py:116-119 read_now_known
+    pub fn read_now_known(&mut self, ref_box: OpRef, fieldbox: OpRef, cache: &HeapCache) {
+        let ref_box = self._unique_const_heuristic(ref_box);
+        let seen_alloc = self._seen_alloc(ref_box, cache);
         self._getdict_mut(seen_alloc).insert(ref_box, fieldbox);
     }
 
-    pub fn read_now_known_cacheless(&mut self, ref_box: OpRef, fieldbox: OpRef) {
-        let mut cache = HeapCache::new();
-        self.read_now_known(ref_box, fieldbox, &mut cache)
-    }
-
+    /// heapcache.py:121-129 invalidate_unescaped — RPython makes this a
+    /// public method (no underscore prefix) and `_invalidate_unescaped`
+    /// is the helper that walks both caches.  pyre keeps the same
+    /// public/private pair.
     pub fn invalidate_unescaped(&mut self, unescaped: &[bool]) {
         self._invalidate_unescaped(unescaped)
     }
@@ -393,12 +377,6 @@ impl HeapCache {
         self_flags >= op_version
     }
 
-    fn bump_head_version(&mut self) -> u32 {
-        assert!(self.head_version < HF_VERSION_MAX);
-        self.head_version += HF_VERSION_INC;
-        self.head_version
-    }
-
     /// RPython: test_head_version(ref_frontend_op)
     pub fn test_head_version(&self, opref: OpRef) -> bool {
         Self::versioned_or(self.flags_for_ref(opref), self.head_version)
@@ -566,11 +544,6 @@ impl HeapCache {
         }
     }
 
-    /// RPython-compatible alias.
-    pub fn _escape_box(&mut self, boxref: OpRef) {
-        self.mark_escaped_box(boxref);
-    }
-
     /// heapcache.py:295-309 `_escape_box(box)`.
     ///
     /// ```text
@@ -590,7 +563,7 @@ impl HeapCache {
     ///                  for i in range(1, len(deps)):
     ///                      self._escape_box(deps[i])
     /// ```
-    pub fn mark_escaped_box(&mut self, opref: OpRef) {
+    pub fn _escape_box(&mut self, opref: OpRef) {
         if opref.is_constant() {
             return;
         }
@@ -612,7 +585,7 @@ impl HeapCache {
                     self.heapc_deps[i] = Some(vec![Some(length)]);
                 }
                 for dep in deps.into_iter().skip(1).flatten() {
-                    self.mark_escaped_box(dep);
+                    self._escape_box(dep);
                 }
             }
         }
@@ -645,17 +618,10 @@ impl HeapCache {
         }
     }
 
-    /// Backward-compatible entry name used by invalidate_caches().
-    pub fn mark_escaped_varargs_opcode(
-        &mut self,
-        opnum: OpCode,
-        descr: Option<OpRef>,
-        argboxes: &[OpRef],
-    ) {
-        self.mark_escaped(opnum, descr, argboxes)
-    }
-
-    /// RPython-style name with descr parameter present.
+    /// heapcache.py:259-281 mark_escaped_varargs.
+    /// RPython has both mark_escaped (specialize.arg(1) for opnum) and
+    /// mark_escaped_varargs.  pyre routes both through the same impl
+    /// since Rust does not need the per-opnum specialization.
     pub fn mark_escaped_varargs(
         &mut self,
         opnum: OpCode,
@@ -720,12 +686,6 @@ impl HeapCache {
         self.field_cache.insert((obj, field_index), value);
     }
 
-    /// Record a field read without aliasing concerns (e.g., after GETFIELD
-    /// where the value is now known).
-    pub fn getfield_now_known_alias(&mut self, obj: OpRef, field_index: u32, value: OpRef) {
-        self.getfield_now_known(obj, field_index, value);
-    }
-
     pub fn getfield_now_known(&mut self, obj: OpRef, field_index: u32, value: OpRef) {
         self.field_cache.insert((obj, field_index), value);
     }
@@ -754,14 +714,6 @@ impl HeapCache {
         self.field_cache.retain(|&(obj, _), _| still_unescaped(obj));
         self.array_cache
             .retain(|&(obj, _, _), _| still_unescaped(obj));
-    }
-
-    /// heapcache.py: mark_escaped_varargs — escape call arguments before
-    /// cache invalidation. GETFIELD/PTR_EQ/ASSERT_NOT_NONE args don't escape.
-    pub fn mark_escaped_args(&mut self, args: &[OpRef]) {
-        for &arg in args {
-            self.mark_escaped_recursive(arg);
-        }
     }
 
     /// heapcache.py:502-506
@@ -869,12 +821,6 @@ impl HeapCache {
         }
     }
 
-    /// heapcache.py: _escape_box — recursively escape an object and
-    /// all values stored into it via SETFIELD_GC.
-    pub fn mark_escaped_recursive(&mut self, opref: OpRef) {
-        self.mark_escaped_box(opref);
-    }
-
     /// heapcache.py:470-473
     ///
     /// ```text
@@ -972,7 +918,7 @@ impl HeapCache {
             } else if container_unescaped {
                 // Container unescaped, value already escaped — no-op
             } else {
-                self.mark_escaped_recursive(value);
+                self._escape_box(value);
             }
         }
         if opcode == OpCode::SetarrayitemGc && args.len() >= 3 {
@@ -985,7 +931,7 @@ impl HeapCache {
             } else if container_unescaped {
                 // Container unescaped, value already escaped — no-op
             } else {
-                self.mark_escaped_recursive(value);
+                self._escape_box(value);
             }
         }
         // heapcache.py: GUARD_VALUE → known constant + nonnull.
@@ -1032,7 +978,7 @@ impl HeapCache {
 
         if !dont_escape {
             for &arg in args {
-                self.mark_escaped_recursive(arg);
+                self._escape_box(arg);
             }
         }
     }
@@ -1883,7 +1829,7 @@ mod tests {
         cache.new_object(obj);
         assert!(cache.is_unescaped(obj));
 
-        cache.mark_escaped_box(obj);
+        cache._escape_box(obj);
         assert!(!cache.is_unescaped(obj));
         // saw_allocation is permanent
         assert!(cache.saw_allocation(obj));
@@ -1962,7 +1908,7 @@ mod tests {
         assert!(cache.is_unescaped(value));
 
         // Now mark container as escaped
-        cache.mark_escaped_recursive(container);
+        cache._escape_box(container);
         assert!(!cache.is_unescaped(container));
         // value should also be escaped (stored in container)
         assert!(!cache.is_unescaped(value));

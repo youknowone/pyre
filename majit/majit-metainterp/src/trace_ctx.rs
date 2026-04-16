@@ -1891,7 +1891,7 @@ impl TraceCtx {
         //   escape args + invalidate escaped caches.
         // EF_RANDOM_EFFECTS: handled separately via invalidate_all_caches.
         if !opcode.is_call_pure() && !opcode.is_call_loopinvariant() {
-            self.heap_cache.mark_escaped_args(args);
+            self.heap_cache._escape_argboxes(args);
             self.heap_cache.invalidate_caches_for_escaped();
         }
         result
@@ -2138,7 +2138,7 @@ impl TraceCtx {
         // heapcache.py: may-force calls escape args and invalidate caches.
         // (GuardNotForced after the call also invalidates, but we need
         // the escape marking here for correctness.)
-        self.heap_cache.mark_escaped_args(args);
+        self.heap_cache._escape_argboxes(args);
         self.heap_cache.invalidate_caches_for_escaped();
         result
     }
