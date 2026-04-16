@@ -724,6 +724,23 @@ fn all_core_regs() -> Vec<RegLoc> {
 
 #[cfg(target_arch = "aarch64")]
 fn all_core_regs() -> Vec<RegLoc> {
+    // aarch64/registers.py:14
+    //   all_regs = registers[:14] + [x19, x20] #, x21, x22]
+    //
+    // Upstream leaves `, x21, x22` commented out, which caps the
+    // callee-save pool at two.  Two is enough for RPython's typical
+    // trace shape but too small on pyre traces where several
+    // simultaneously-live loop-carried values cross an inner call
+    // (fib_loop: n, a, b, i are all live across the int_add helper).
+    // In that situation free_reg_whole_lifetime finds no fitting
+    // callee-save and try_pick_free_reg falls back to
+    // longest_free_reg, which picks a caller-save that the call
+    // immediately clobbers.  We activate upstream's own commented
+    // suggestion with x21, x22 to grow the pool to four while
+    // staying a strict subset of AAPCS64 x19..x28.  The
+    // prologue/epilogue stp/ldp pairs in aarch64/assembler.rs
+    // _call_header/_call_footer and JITFRAME_FIXED_SIZE in arch.rs
+    // are updated in lockstep.
     vec![
         RegLoc::new(0, false),
         RegLoc::new(1, false),
@@ -741,6 +758,8 @@ fn all_core_regs() -> Vec<RegLoc> {
         RegLoc::new(13, false),
         RegLoc::new(19, false),
         RegLoc::new(20, false),
+        RegLoc::new(21, false),
+        RegLoc::new(22, false),
     ]
 }
 
@@ -1650,6 +1669,10 @@ pub struct RegAlloc {
     /// jump arglist) so consider_label can recognize a self-loop and emit
     /// frame position hints via add_frame_pos_hint.
     final_jump_args: Option<(usize, Vec<OpRef>)>,
+    /// x86/regalloc.py:1270 self.final_jump_op_position — position of the
+    /// closing JUMP, used by `_compute_hint_locations_from_descr` to pin
+    /// reg hints via `longevity.fixed_register(position, reg, box)`.
+    final_jump_op_position: i32,
 }
 
 impl RegAlloc {
@@ -1670,6 +1693,7 @@ impl RegAlloc {
             value_types: HashMap::new(),
             jump_target_descr: None,
             final_jump_args: None,
+            final_jump_op_position: -1,
         }
     }
 
@@ -1715,9 +1739,28 @@ impl RegAlloc {
         self.value_types.clear();
         self.jump_target_descr = None;
         self.final_jump_args = None;
+        self.final_jump_op_position = -1;
         for iarg in inputargs {
             self.value_types.insert(iarg.index, iarg.tp);
         }
+        // x86/regalloc.py:191 X86RegisterHints().add_hints(longevity, inputargs, operations)
+        //
+        // Verified empirically (parity audit follow-up): gating this
+        // to #[cfg(target_arch = "x86_64")] regresses dynasm fib_loop
+        // even after the callee-save pool was grown to four with
+        // x21, x22.  longest_free_reg's caller-save fallback still
+        // fires when free_reg_whole_lifetime sees no qualifying
+        // callee-save, so the hints are load-bearing on aarch64 too.
+        // Upstream aarch64 ships no reghint.py — this is a documented
+        // deviation: the call-hint mechanism is ABI-driven and the
+        // same shape on aarch64.  See reghint.rs module docs.
+        let hints = crate::reghint::RegisterHints::new(
+            self.rm.save_around_call_regs.clone(),
+            self.xrm.save_around_call_regs.clone(),
+            self.rm.all_regs.clone(),
+            self.xrm.all_regs.clone(),
+        );
+        hints.add_hints(&mut self.longevity, inputargs, operations);
     }
 
     /// x86/regalloc.py:209 prepare_loop
@@ -1736,12 +1779,78 @@ impl RegAlloc {
                     .possibly_free_var(opref, &mut self.longevity, &mut self.fm, tp);
             }
         }
+        self.compute_hint_frame_locations(operations);
     }
 
     /// x86/regalloc.py:221 prepare_bridge
     pub fn prepare_bridge(&mut self, inputargs: &[InputArg], arglocs: &[Loc], operations: &[Op]) {
         self._prepare(inputargs, operations);
         self._update_bindings(arglocs, inputargs);
+        self.compute_hint_frame_locations(operations);
+    }
+
+    /// x86/regalloc.py:1263 compute_hint_frame_locations — pre-walk scan
+    /// that records the closing JUMP so `consider_label` (and the
+    /// same-loop branch in this routine) can feed frame/register hints
+    /// back to the forward regalloc pass.
+    fn compute_hint_frame_locations(&mut self, operations: &[Op]) {
+        let Some(op) = operations.last() else {
+            return;
+        };
+        if op.opcode != OpCode::Jump {
+            return;
+        }
+        let descr_id = op.descr.as_ref().map(descr_identity);
+        self.final_jump_args = descr_id.map(|id| (id, op.args.to_vec()));
+        self.final_jump_op_position = (operations.len() - 1) as i32;
+        let Some(descr) = op.descr.as_ref() else {
+            return;
+        };
+        // x86/regalloc.py:1274 descr._ll_loop_code != 0:
+        //   target LABEL already compiled (bridge/external jump) → apply
+        //   hints now. else: same-loop, wait for consider_label.
+        if let Some(target) = descr.as_loop_target_descr() {
+            if target.ll_loop_code() != 0 {
+                self._compute_hint_locations_from_descr(&*target);
+            }
+        }
+    }
+
+    /// x86/regalloc.py:1284 _compute_hint_locations_from_descr.
+    fn _compute_hint_locations_from_descr(&mut self, descr: &dyn majit_ir::descr::LoopTargetDescr) {
+        use majit_ir::descr::TargetArgLoc;
+        let Some((_, jump_args)) = self.final_jump_args.clone() else {
+            return;
+        };
+        let target_arglocs = descr.target_arglocs();
+        if target_arglocs.len() != jump_args.len() {
+            return;
+        }
+        let position = self.final_jump_op_position;
+        let mut hinted: Vec<OpRef> = Vec::new();
+        for (arg, target) in jump_args.iter().zip(target_arglocs.iter()) {
+            if arg.is_constant() {
+                continue;
+            }
+            match *target {
+                TargetArgLoc::Frame {
+                    position: pos,
+                    ebp_offset,
+                    is_float,
+                } => {
+                    let f = crate::regloc::FrameLoc::new(pos, ebp_offset, is_float);
+                    self.fm.add_frame_pos_hint(*arg, f, &mut self.longevity);
+                }
+                TargetArgLoc::Reg { regnum, is_xmm } => {
+                    if !hinted.contains(arg) {
+                        hinted.push(*arg);
+                        let r = crate::regloc::RegLoc::new(regnum, is_xmm);
+                        self.longevity.fixed_register(position, r, Some(*arg));
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 
     /// regalloc.py:861 _set_initial_bindings — place all inputargs in frame slots.
@@ -2774,33 +2883,28 @@ impl RegAlloc {
     }
 
     /// x86/regalloc.py same_as / identity operations
+    /// aarch64/regalloc.py:879-889 _prepare_op_same_as.
+    ///
+    /// RPython: argloc = convert_to_imm(arg) if imm else make_sure_var_in_reg(arg)
+    ///          possibly_free_vars_for_op(op); free_temp_vars()
+    ///          resloc = force_allocate_reg(op)
     fn consider_same_as(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let tp = op.opcode.result_type();
+        let arg = op.args[0];
         let args: Vec<OpRef> = op.args.iter().copied().collect();
-        let loc = if tp == Type::Float {
-            self.xrm.force_result_in_reg(
-                op.pos,
-                op.args[0],
-                tp,
-                &args,
-                &mut self.longevity,
-                &mut self.fm,
-                &self.constants,
-                &mut self.pending_moves,
-            )
+        // aarch64/regalloc.py:880-884
+        let argloc = if arg.is_constant() {
+            self.rm.convert_to_imm(arg, &self.constants)
         } else {
-            self.rm.force_result_in_reg(
-                op.pos,
-                op.args[0],
-                tp,
-                &args,
-                &mut self.longevity,
-                &mut self.fm,
-                &self.constants,
-                &mut self.pending_moves,
-            )
+            self.make_sure_var_in_reg(arg, tp, &args, None, false)
         };
-        self.perform(i, vec![loc], Some(loc), output);
+        // aarch64/regalloc.py:885-886
+        self.possibly_free_vars_for_op(op, &self.value_types.clone());
+        self.rm.free_temp_vars(&mut self.longevity, &mut self.fm);
+        self.xrm.free_temp_vars(&mut self.longevity, &mut self.fm);
+        // aarch64/regalloc.py:887
+        let resloc = Loc::Reg(self.force_allocate_reg(op.pos, tp, &[], None, false));
+        self.perform(i, vec![argloc], Some(resloc), output);
     }
 
     /// x86/regalloc.py:661 _consider_float_op
@@ -3085,6 +3189,15 @@ impl RegAlloc {
     }
 
     /// aarch64/regalloc.py:603 _prepare_call.
+    ///
+    /// RPython critical ordering: `loc()` for every arg must run BEFORE
+    /// `before_call`. Otherwise variables that die at this call position
+    /// (max_age == self.position) are dropped from reg_bindings by the
+    /// "dies" branch in spill_or_move_registers_before_call without being
+    /// spilled, and the subsequent `loc()` returns a fresh frame slot whose
+    /// contents are unrelated to the argument value. See llsupport/
+    /// regalloc.py:724-734 doc: arglocs "stay valid" only if they were
+    /// captured before before_call.
     fn consider_call(
         &mut self,
         op: &Op,
@@ -3100,6 +3213,21 @@ impl RegAlloc {
             .expect("call op without CallDescr");
         assert_eq!(calldescr.arg_types().len(), op.num_args() - first_arg_index);
 
+        // aarch64/regalloc.py:609-610 — capture arglocs before before_call.
+        let mut arglocs = Vec::with_capacity(op.args.len() + 3);
+        arglocs.push(Loc::Immed(ImmedLoc::new(0))); // placeholder for result_loc
+        arglocs.push(Loc::Immed(ImmedLoc::new(calldescr.result_size() as i64)));
+        arglocs.push(Loc::Immed(ImmedLoc::new(if calldescr.is_result_signed() {
+            1
+        } else {
+            0
+        })));
+        for &arg in &op.args {
+            let tp = self.tp(arg);
+            arglocs.push(self.loc(arg, tp));
+        }
+
+        // aarch64/regalloc.py:622-628 — then _call → before_call → after_call.
         let save_regs = if save_all_regs {
             SAVE_ALL_REGS
         } else if calldescr.get_extra_info().check_can_collect() {
@@ -3135,19 +3263,7 @@ impl RegAlloc {
         } else {
             None
         };
-
-        let mut arglocs = Vec::with_capacity(op.args.len() + 3);
-        arglocs.push(result_loc.unwrap_or(Loc::Immed(ImmedLoc::new(0))));
-        arglocs.push(Loc::Immed(ImmedLoc::new(calldescr.result_size() as i64)));
-        arglocs.push(Loc::Immed(ImmedLoc::new(if calldescr.is_result_signed() {
-            1
-        } else {
-            0
-        })));
-        for &arg in &op.args {
-            let tp = self.tp(arg);
-            arglocs.push(self.loc(arg, tp));
-        }
+        arglocs[0] = result_loc.unwrap_or(Loc::Immed(ImmedLoc::new(0)));
 
         self.perform(i, arglocs, result_loc, output);
     }
@@ -3415,19 +3531,40 @@ impl RegAlloc {
             locs.push(loc);
         }
 
-        // x86/regalloc.py:1407-1409: if jump_op.getdescr() is descr → hints
+        // x86/regalloc.py:1407-1409: if final_jump_op.getdescr() is descr
+        //   → _compute_hint_locations_from_descr(descr).
+        //
+        // Same-loop case: the closing JUMP targets this very Label and was
+        // pre-scanned by `compute_hint_frame_locations` into
+        // `final_jump_args` / `final_jump_op_position`. At this point the
+        // Label's target_arglocs are known (just built into `locs`), so we
+        // can now emit frame hints AND pin reg hints via `fixed_register`
+        // exactly like _compute_hint_locations_from_descr does.
         if let Some(label_id) = op.descr.as_ref().map(descr_identity) {
             if self
                 .final_jump_args
                 .as_ref()
                 .is_some_and(|(jump_id, _)| *jump_id == label_id)
             {
-                if let Some((_, jump_args)) = &self.final_jump_args {
-                    for (iarg, target_loc) in jump_args.iter().zip(locs.iter()) {
-                        if let Loc::Frame(frame_loc) = *target_loc {
+                let jump_args = self.final_jump_args.as_ref().unwrap().1.clone();
+                let position = self.final_jump_op_position;
+                let mut hinted: Vec<OpRef> = Vec::new();
+                for (iarg, target_loc) in jump_args.iter().zip(locs.iter()) {
+                    if iarg.is_constant() {
+                        continue;
+                    }
+                    match *target_loc {
+                        Loc::Frame(frame_loc) => {
                             self.fm
                                 .add_frame_pos_hint(*iarg, frame_loc, &mut self.longevity);
                         }
+                        Loc::Reg(r) => {
+                            if !hinted.contains(iarg) {
+                                hinted.push(*iarg);
+                                self.longevity.fixed_register(position, r, Some(*iarg));
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }

@@ -29,7 +29,7 @@ use crate::jitframe::{
 use crate::regalloc::{RegAlloc, RegAllocOp};
 use crate::regloc::Loc;
 
-const AARCH64_GEN_REGS: [crate::regloc::RegLoc; 16] = [
+const AARCH64_GEN_REGS: [crate::regloc::RegLoc; 18] = [
     crate::regloc::RegLoc::new(0, false),
     crate::regloc::RegLoc::new(1, false),
     crate::regloc::RegLoc::new(2, false),
@@ -46,6 +46,8 @@ const AARCH64_GEN_REGS: [crate::regloc::RegLoc; 16] = [
     crate::regloc::RegLoc::new(13, false),
     crate::regloc::RegLoc::new(19, false),
     crate::regloc::RegLoc::new(20, false),
+    crate::regloc::RegLoc::new(21, false),
+    crate::regloc::RegLoc::new(22, false),
 ];
 
 const AARCH64_FLOAT_REGS: [crate::regloc::RegLoc; 8] = [
@@ -830,10 +832,18 @@ impl AssemblerARM64 {
     /// Emit the function prologue.
     /// x64: System V AMD64 ABI — first arg (jf_ptr) in RDI.
     /// aarch64: AAPCS64 — first arg (jf_ptr) in X0.
+    ///
+    /// Save slots: 48 bytes total (fp/lr at [sp,#0], x19/x20 at
+    /// [sp,#16], x21/x22 at [sp,#32]).  Mirrors
+    /// aarch64/assembler.py:1117-1122 which iterates
+    /// `r.callee_saved_registers` to stp every pair; pyre's
+    /// callee-saved set (per regalloc.rs `all_core_regs`) is
+    /// [x19, x20, x21, x22], so the prologue emits two stps.
     fn _call_header(&mut self, inputargs: &[InputArg]) {
         dynasm!(self.mc ; .arch aarch64
-            ; stp x29, x30, [sp, #-32]!
-            ; stp x19, x20, [sp, #16]   // save callee-saved regs
+            ; stp x29, x30, [sp, #-48]!
+            ; stp x19, x20, [sp, #16]
+            ; stp x21, x22, [sp, #32]
             ; mov x29, x0
         );
         self.setup_input_state(inputargs);
@@ -847,8 +857,9 @@ impl AssemblerARM64 {
     fn _call_footer(&mut self) {
         dynasm!(self.mc ; .arch aarch64
             ; mov x0, x29
-            ; ldp x19, x20, [sp, #16]   // restore callee-saved regs
-            ; ldp x29, x30, [sp], #32
+            ; ldp x21, x22, [sp, #32]
+            ; ldp x19, x20, [sp, #16]
+            ; ldp x29, x30, [sp], #48
             ; ret
         );
     }
@@ -3829,64 +3840,98 @@ impl AssemblerARM64 {
         dynasm!(self.mc ; .arch aarch64 ; ldp x29, x30, [sp], #16);
     }
 
-    /// aarch64/opassembler.py:1036 _emit_call.
-    /// arglocs = [resloc, size, sign, func, args...] for normal CALLs and
-    /// [resloc, size, sign, saveerr, func, args...] for CALL_RELEASE_GIL.
+    /// aarch64/opassembler.py:1036 _emit_call + aarch64/callbuilder.py:21-67
+    /// prepare_arguments.
+    ///
+    /// Register-to-ABI-reg shuffles must go through remap_frame_layout to
+    /// handle cycles: with naïve sequential `mov x0,x2; mov x1,x0` the
+    /// second move reads the already-clobbered x0. RPython routes the
+    /// non-float arg plan through remap_frame_layout(asm, src, dst, ip0)
+    /// and preserves the fnloc across the remap via ip1 when it is a
+    /// register.
     fn emit_call_from_arglocs(&mut self, arglocs: &[Loc], func_index: usize) {
         let arg_count = arglocs.len();
 
         dynasm!(self.mc ; .arch aarch64 ; stp x29, x30, [sp, #-16]!);
 
-        for i in (func_index + 1)..arg_count.min(func_index + 7) {
-            let abi_idx = i - func_index - 1;
-            let arg = &arglocs[i];
+        // aarch64/callbuilder.py:54-60 — if fnloc is a core reg or stack,
+        // save it to ip1 (x17) so later remap can clobber its source reg.
+        let fnloc = arglocs.get(func_index).copied();
+        let fnloc_in_ip1 = match fnloc {
+            Some(Loc::Reg(r)) if !r.is_xmm => {
+                dynasm!(self.mc ; .arch aarch64 ; mov x17, X(r.value));
+                true
+            }
+            Some(Loc::Frame(f)) if !f.ebp_loc.is_float => {
+                dynasm!(self.mc ; .arch aarch64 ; ldr x17, [x29, f.ebp_loc.value as u32]);
+                true
+            }
+            _ => false,
+        };
+
+        // aarch64/callbuilder.py:29-41 — build arg plan.
+        // ABI regs x0..x7 for core, d0..d7 for float.
+        let mut non_float_src: Vec<Loc> = Vec::new();
+        let mut non_float_dst: Vec<Loc> = Vec::new();
+        let mut float_src: Vec<Loc> = Vec::new();
+        let mut float_dst: Vec<Loc> = Vec::new();
+        let mut immed_args: Vec<(u8, i64, bool)> = Vec::new(); // (abi_idx, value, is_float)
+
+        for i in (func_index + 1)..arg_count.min(func_index + 9) {
+            let abi_idx = (i - func_index - 1) as u8;
+            let arg = arglocs[i];
             match arg {
-                Loc::Frame(f) => {
-                    let offset = f.ebp_loc.value;
-                    let reg = abi_idx as u8;
-                    if f.ebp_loc.is_float {
-                        dynasm!(self.mc ; .arch aarch64 ; ldr D(reg), [x29, offset as u32]);
-                    } else {
-                        dynasm!(self.mc ; .arch aarch64 ; ldr X(reg), [x29, offset as u32]);
-                    }
+                Loc::Frame(f) if f.ebp_loc.is_float => {
+                    float_src.push(arg);
+                    float_dst.push(Loc::Reg(crate::regloc::RegLoc::new(abi_idx, true)));
                 }
-                Loc::Reg(r) => {
-                    let reg = abi_idx as u8;
-                    if r.is_xmm {
-                        dynasm!(self.mc ; .arch aarch64 ; fmov D(reg), D(r.value));
-                    } else {
-                        dynasm!(self.mc ; .arch aarch64 ; mov X(reg), X(r.value));
-                    }
+                Loc::Frame(_) => {
+                    non_float_src.push(arg);
+                    non_float_dst.push(Loc::Reg(crate::regloc::RegLoc::new(abi_idx, false)));
                 }
-                Loc::Immed(i) => {
-                    let val = i.value;
-                    let reg = abi_idx as u32;
-                    self.emit_mov_imm64(reg, val);
+                Loc::Reg(r) if r.is_xmm => {
+                    float_src.push(arg);
+                    float_dst.push(Loc::Reg(crate::regloc::RegLoc::new(abi_idx, true)));
+                }
+                Loc::Reg(_) => {
+                    non_float_src.push(arg);
+                    non_float_dst.push(Loc::Reg(crate::regloc::RegLoc::new(abi_idx, false)));
+                }
+                Loc::Immed(im) => {
+                    immed_args.push((abi_idx, im.value, im.is_float));
                 }
                 _ => {}
             }
         }
 
-        match arglocs.get(func_index) {
-            Some(Loc::Frame(f)) => {
-                let offset = f.ebp_loc.value;
-                dynasm!(self.mc ; .arch aarch64
-                    ; ldr x8, [x29, offset as u32]
-                    ; blr x8
-                );
+        // aarch64/callbuilder.py:62-65 — remap non-float then float args.
+        let tmp_nf = Loc::Reg(crate::regloc::RegLoc::new(16, false)); // x16 (ip0)
+        let tmp_fp = Loc::Reg(crate::regloc::RegLoc::new(15, true)); // d15
+        self.remap_frame_layout(&non_float_src, &non_float_dst, tmp_nf);
+        self.remap_frame_layout(&float_src, &float_dst, tmp_fp);
+
+        // Immediate args after remap (each targets a distinct ABI reg).
+        for (abi_idx, val, is_float) in immed_args {
+            if is_float {
+                self.emit_mov_imm64(15, val);
+                dynasm!(self.mc ; .arch aarch64 ; fmov D(abi_idx), X(15));
+            } else {
+                self.emit_mov_imm64(abi_idx as u32, val);
             }
-            Some(Loc::Reg(r)) => {
-                dynasm!(self.mc ; .arch aarch64
-                    ; mov x8, X(r.value)
-                    ; blr x8
-                );
+        }
+
+        // aarch64/callbuilder.py:67 — restore fnloc from ip1 / emit call.
+        if fnloc_in_ip1 {
+            dynasm!(self.mc ; .arch aarch64 ; blr x17);
+        } else {
+            match fnloc {
+                Some(Loc::Immed(i)) => {
+                    let val = i.value;
+                    self.emit_mov_imm64(8, val);
+                    dynasm!(self.mc ; .arch aarch64 ; blr x8);
+                }
+                _ => {}
             }
-            Some(Loc::Immed(i)) => {
-                let val = i.value;
-                self.emit_mov_imm64(8, val);
-                dynasm!(self.mc ; .arch aarch64 ; blr x8);
-            }
-            _ => {}
         }
 
         dynasm!(self.mc ; .arch aarch64 ; ldp x29, x30, [sp], #16);
