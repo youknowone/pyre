@@ -28,7 +28,7 @@ impl OptEarlyForce {
         if let Some(ref descr) = op.descr {
             if let Some(cd) = descr.as_call_descr() {
                 let ei = cd.effect_info();
-                return ei.oopspec_index == majit_ir::OopSpecIndex::RawFree;
+                return ei.oopspecindex == majit_ir::OopSpecIndex::RawFree;
             }
         }
         false

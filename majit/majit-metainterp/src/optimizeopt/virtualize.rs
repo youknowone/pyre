@@ -1275,7 +1275,7 @@ impl Optimization for OptVirtualize {
                 if let Some(ref descr) = op.descr {
                     if let Some(cd) = descr.as_call_descr() {
                         let ei = cd.effect_info();
-                        if ei.oopspec_index == OopSpecIndex::JitForceVirtual {
+                        if ei.oopspecindex == OopSpecIndex::JitForceVirtual {
                             if self.optimize_jit_force_virtual(op, ctx) {
                                 return OptimizationResult::Remove;
                             }
@@ -1324,7 +1324,7 @@ impl Optimization for OptVirtualize {
                 if let Some(ref descr) = op.descr {
                     if let Some(cd) = descr.as_call_descr() {
                         let ei = cd.effect_info();
-                        if ei.oopspec_index == OopSpecIndex::JitForceVirtualizable
+                        if ei.oopspecindex == OopSpecIndex::JitForceVirtualizable
                             && op.num_args() >= 3
                         {
                             let target = ctx.get_box_replacement(op.arg(2));
@@ -1367,7 +1367,7 @@ impl Optimization for OptVirtualize {
                     if let Some(cd) = descr.as_call_descr() {
                         let ei = cd.effect_info();
                         // virtualize.py:228 do_RAW_MALLOC_VARSIZE_CHAR
-                        if ei.oopspec_index == OopSpecIndex::RawMallocVarsizeChar {
+                        if ei.oopspecindex == OopSpecIndex::RawMallocVarsizeChar {
                             // virtualize.py:242-247 do_RAW_MALLOC_VARSIZE_CHAR:
                             //   sizebox = self.get_constant_box(op.getarg(1))
                             //   if sizebox is None:
@@ -1398,7 +1398,7 @@ impl Optimization for OptVirtualize {
                             return self.optimize_escaping_op(op, ctx);
                         }
                         // virtualize.py:230 do_RAW_FREE
-                        if ei.oopspec_index == OopSpecIndex::RawFree {
+                        if ei.oopspecindex == OopSpecIndex::RawFree {
                             // virtualize.py:249-253 do_RAW_FREE:
                             //   opinfo = getrawptrinfo(op.getarg(1))
                             //   if opinfo and opinfo.is_virtual():
@@ -1417,7 +1417,7 @@ impl Optimization for OptVirtualize {
                         //   if info and info.is_virtual():
                         //       return
                         //   # falls off (no else branch matches) → REMOVED
-                        if ei.oopspec_index == OopSpecIndex::JitForceVirtualizable {
+                        if ei.oopspecindex == OopSpecIndex::JitForceVirtualizable {
                             return OptimizationResult::Remove;
                         }
                     }

@@ -3102,7 +3102,7 @@ impl RegAlloc {
 
         let save_regs = if save_all_regs {
             SAVE_ALL_REGS
-        } else if calldescr.effect_info().can_collect() {
+        } else if calldescr.effect_info().check_can_collect() {
             SAVE_GCREF_REGS
         } else {
             SAVE_DEFAULT_REGS

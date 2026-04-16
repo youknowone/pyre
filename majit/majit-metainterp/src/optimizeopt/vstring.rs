@@ -758,7 +758,7 @@ impl OptString {
         ei: &EffectInfo,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
-        match ei.oopspec_index {
+        match ei.oopspecindex {
             OopSpecIndex::StrConcat => self.opt_call_stroruni_str_concat(op, ctx),
             OopSpecIndex::StrSlice => self.opt_call_stroruni_str_slice(op, ctx),
             OopSpecIndex::StrEqual => self.opt_call_stroruni_str_equal(op, ctx),

@@ -367,8 +367,8 @@ impl CallAssemblerDescr {
             result_type,
             target_token,
             effect_info: EffectInfo {
-                extra_effect: majit_ir::ExtraEffect::CanRaise,
-                oopspec_index: OopSpecIndex::None,
+                extraeffect: majit_ir::ExtraEffect::CanRaise,
+                oopspecindex: OopSpecIndex::None,
                 ..Default::default()
             },
         }
@@ -4412,7 +4412,7 @@ fn emit_indirect_call_from_parts(
     // RPython callbuilder.py parity:
     //   emit() [can_collect]: spill + push_gcmap + CALL + pop_gcmap + reload
     //   emit_no_collect(): bare CALL only
-    let can_collect = call_descr.effect_info().can_collect();
+    let can_collect = call_descr.effect_info().check_can_collect();
     if can_collect {
         spill_ref_roots(
             builder,
@@ -12421,8 +12421,8 @@ mod tests {
             arg_types,
             result_type,
             effect_info: EffectInfo {
-                extra_effect: ExtraEffect::CanRaise,
-                oopspec_index: majit_ir::OopSpecIndex::None,
+                extraeffect: ExtraEffect::CanRaise,
+                oopspecindex: majit_ir::OopSpecIndex::None,
                 ..Default::default()
             },
         })

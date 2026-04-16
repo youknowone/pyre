@@ -1432,7 +1432,7 @@ impl Optimizer {
         op.descr
             .as_ref()
             .and_then(|d| d.as_call_descr())
-            .map(|cd| cd.effect_info().can_raise())
+            .map(|cd| cd.effect_info().check_can_raise(false))
             .unwrap_or(true)
     }
 
@@ -3614,8 +3614,8 @@ mod tests {
         Arc::new(TestCallDescr {
             idx,
             effect: EffectInfo {
-                extra_effect: ExtraEffect::CanRaise,
-                oopspec_index: OopSpecIndex::None,
+                extraeffect: ExtraEffect::CanRaise,
+                oopspecindex: OopSpecIndex::None,
                 ..Default::default()
             },
             result_type,

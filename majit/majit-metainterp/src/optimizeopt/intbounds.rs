@@ -1527,7 +1527,7 @@ impl Optimization for OptIntBounds {
                 if let Some(ref d) = op.descr {
                     if let Some(cd) = d.as_call_descr() {
                         let ei = cd.effect_info();
-                        match ei.oopspec_index {
+                        match ei.oopspecindex {
                             majit_ir::OopSpecIndex::IntPyDiv => {
                                 if op.num_args() >= 3 {
                                     let divisor_bound = self.getintbound(op.arg(2), ctx);

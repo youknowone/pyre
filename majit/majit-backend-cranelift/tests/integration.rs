@@ -1086,8 +1086,8 @@ fn call_descr_can_raise(idx: u32) -> DescrRef {
     Arc::new(TestCallDescr {
         idx,
         effect: majit_ir::EffectInfo {
-            extra_effect: majit_ir::ExtraEffect::CanRaise,
-            oopspec_index: majit_ir::OopSpecIndex::None,
+            extraeffect: majit_ir::ExtraEffect::CanRaise,
+            oopspecindex: majit_ir::OopSpecIndex::None,
             ..Default::default()
         },
         arg_types: vec![Type::Int],
@@ -1462,8 +1462,8 @@ fn call_descr_release_gil_i(idx: u32, arg_types: Vec<Type>) -> DescrRef {
     Arc::new(TestCallDescr {
         idx,
         effect: majit_ir::EffectInfo {
-            extra_effect: majit_ir::ExtraEffect::CanRaise,
-            oopspec_index: majit_ir::OopSpecIndex::None,
+            extraeffect: majit_ir::ExtraEffect::CanRaise,
+            oopspecindex: majit_ir::OopSpecIndex::None,
             ..Default::default()
         },
         arg_types,
@@ -1475,8 +1475,8 @@ fn call_descr_release_gil_n(idx: u32, arg_types: Vec<Type>) -> DescrRef {
     Arc::new(TestCallDescr {
         idx,
         effect: majit_ir::EffectInfo {
-            extra_effect: majit_ir::ExtraEffect::CanRaise,
-            oopspec_index: majit_ir::OopSpecIndex::None,
+            extraeffect: majit_ir::ExtraEffect::CanRaise,
+            oopspecindex: majit_ir::OopSpecIndex::None,
             ..Default::default()
         },
         arg_types,
@@ -1920,8 +1920,8 @@ fn call_descr_may_force_i(idx: u32, arg_types: Vec<Type>) -> DescrRef {
     Arc::new(TestCallDescr {
         idx,
         effect: majit_ir::EffectInfo {
-            extra_effect: majit_ir::ExtraEffect::CanRaise,
-            oopspec_index: majit_ir::OopSpecIndex::None,
+            extraeffect: majit_ir::ExtraEffect::CanRaise,
+            oopspecindex: majit_ir::OopSpecIndex::None,
             ..Default::default()
         },
         arg_types,

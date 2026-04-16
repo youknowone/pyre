@@ -1620,10 +1620,10 @@ impl CallControl {
         // RPython call.py:326-332: assert post-conditions
         if elidable || loopinvariant {
             assert!(
-                effectinfo.extra_effect < ExtraEffect::ForcesVirtualOrVirtualizable,
+                effectinfo.extraeffect < ExtraEffect::ForcesVirtualOrVirtualizable,
                 "getcalldescr: elidable/loopinvariant {target} has \
                  effect {:?} >= ForcesVirtualOrVirtualizable",
-                effectinfo.extra_effect
+                effectinfo.extraeffect
             );
         }
 
@@ -1726,8 +1726,8 @@ fn effectinfo_from_writeanalyze(
     // effectinfo.py:285: if effects is top_set or extraeffect == EF_RANDOM_EFFECTS:
     if effects.is_top || extraeffect == ExtraEffect::RandomEffects {
         return EffectInfo {
-            extra_effect: ExtraEffect::RandomEffects,
-            oopspec_index: oopspecindex,
+            extraeffect: ExtraEffect::RandomEffects,
+            oopspecindex: oopspecindex,
             readonly_descrs_fields: !0, // all bits set = top_set (None in RPython)
             write_descrs_fields: !0,
             readonly_descrs_arrays: !0,
@@ -1781,8 +1781,8 @@ fn effectinfo_from_writeanalyze(
     };
 
     EffectInfo {
-        extra_effect: extraeffect,
-        oopspec_index: oopspecindex,
+        extraeffect: extraeffect,
+        oopspecindex: oopspecindex,
         readonly_descrs_fields,
         write_descrs_fields,
         readonly_descrs_arrays,
@@ -2555,15 +2555,15 @@ impl CallTargetPattern {
 
 struct CallDescriptorEntry {
     targets: &'static [CallTargetPattern],
-    extra_effect: ExtraEffect,
-    oopspec_index: OopSpecIndex,
+    extraeffect: ExtraEffect,
+    oopspecindex: OopSpecIndex,
 }
 
 impl CallDescriptorEntry {
     fn effect_info(&self) -> EffectInfo {
-        match self.extra_effect {
+        match self.extraeffect {
             ExtraEffect::ElidableCannotRaise => EffectInfo::elidable(),
-            extra_effect => EffectInfo::new(extra_effect, self.oopspec_index),
+            extraeffect => EffectInfo::new(extraeffect, self.oopspecindex),
         }
     }
 }
@@ -2682,101 +2682,101 @@ const CALL_DESCRIPTOR_TABLE: &[CallDescriptorEntry] = &[
     // ── Pure arithmetic (elidable, cannot raise) ──
     CallDescriptorEntry {
         targets: INT_ARITH_TARGETS,
-        extra_effect: ExtraEffect::ElidableCannotRaise,
-        oopspec_index: OopSpecIndex::None,
+        extraeffect: ExtraEffect::ElidableCannotRaise,
+        oopspecindex: OopSpecIndex::None,
     },
     CallDescriptorEntry {
         targets: INT_CMP_TARGETS,
-        extra_effect: ExtraEffect::ElidableCannotRaise,
-        oopspec_index: OopSpecIndex::None,
+        extraeffect: ExtraEffect::ElidableCannotRaise,
+        oopspecindex: OopSpecIndex::None,
     },
     CallDescriptorEntry {
         targets: FLOAT_ARITH_TARGETS,
-        extra_effect: ExtraEffect::ElidableCannotRaise,
-        oopspec_index: OopSpecIndex::None,
+        extraeffect: ExtraEffect::ElidableCannotRaise,
+        oopspecindex: OopSpecIndex::None,
     },
     CallDescriptorEntry {
         targets: FLOAT_CMP_TARGETS,
-        extra_effect: ExtraEffect::ElidableCannotRaise,
-        oopspec_index: OopSpecIndex::None,
+        extraeffect: ExtraEffect::ElidableCannotRaise,
+        oopspecindex: OopSpecIndex::None,
     },
     // ── Elidable but may raise (ZeroDivisionError, OverflowError) ──
     CallDescriptorEntry {
         targets: INT_FLOORDIV_TARGETS,
-        extra_effect: ExtraEffect::ElidableCanRaise,
-        oopspec_index: OopSpecIndex::IntPyDiv,
+        extraeffect: ExtraEffect::ElidableCanRaise,
+        oopspecindex: OopSpecIndex::IntPyDiv,
     },
     CallDescriptorEntry {
         targets: INT_MOD_TARGETS,
-        extra_effect: ExtraEffect::ElidableCanRaise,
-        oopspec_index: OopSpecIndex::IntPyMod,
+        extraeffect: ExtraEffect::ElidableCanRaise,
+        oopspecindex: OopSpecIndex::IntPyMod,
     },
     CallDescriptorEntry {
         targets: FLOAT_DIV_TARGETS,
-        extra_effect: ExtraEffect::ElidableCanRaise,
-        oopspec_index: OopSpecIndex::None,
+        extraeffect: ExtraEffect::ElidableCanRaise,
+        oopspecindex: OopSpecIndex::None,
     },
     CallDescriptorEntry {
         targets: INT_SHIFT_TARGETS,
-        extra_effect: ExtraEffect::ElidableCanRaise,
-        oopspec_index: OopSpecIndex::None,
+        extraeffect: ExtraEffect::ElidableCanRaise,
+        oopspecindex: OopSpecIndex::None,
     },
     CallDescriptorEntry {
         targets: INT_POW_TARGETS,
-        extra_effect: ExtraEffect::ElidableCanRaise,
-        oopspec_index: OopSpecIndex::None,
+        extraeffect: ExtraEffect::ElidableCanRaise,
+        oopspecindex: OopSpecIndex::None,
     },
     // ── String operations with oopspec ──
     CallDescriptorEntry {
         targets: STR_CONCAT_TARGETS,
-        extra_effect: ExtraEffect::ElidableCanRaise,
-        oopspec_index: OopSpecIndex::StrConcat,
+        extraeffect: ExtraEffect::ElidableCanRaise,
+        oopspecindex: OopSpecIndex::StrConcat,
     },
     CallDescriptorEntry {
         targets: STR_CMP_TARGETS,
-        extra_effect: ExtraEffect::ElidableCannotRaise,
-        oopspec_index: OopSpecIndex::StrCmp,
+        extraeffect: ExtraEffect::ElidableCannotRaise,
+        oopspecindex: OopSpecIndex::StrCmp,
     },
     // ── List operations (may raise, side effects) ──
     CallDescriptorEntry {
         targets: LIST_GETITEM_TARGETS,
-        extra_effect: ExtraEffect::CanRaise,
-        oopspec_index: OopSpecIndex::None,
+        extraeffect: ExtraEffect::CanRaise,
+        oopspecindex: OopSpecIndex::None,
     },
     CallDescriptorEntry {
         targets: LIST_SETITEM_TARGETS,
-        extra_effect: ExtraEffect::CanRaise,
-        oopspec_index: OopSpecIndex::None,
+        extraeffect: ExtraEffect::CanRaise,
+        oopspecindex: OopSpecIndex::None,
     },
     CallDescriptorEntry {
         targets: LIST_APPEND_TARGETS,
-        extra_effect: ExtraEffect::CanRaise,
-        oopspec_index: OopSpecIndex::None,
+        extraeffect: ExtraEffect::CanRaise,
+        oopspecindex: OopSpecIndex::None,
     },
     // ── Tuple access (elidable for valid indices) ──
     CallDescriptorEntry {
         targets: TUPLE_GETITEM_TARGETS,
-        extra_effect: ExtraEffect::ElidableCanRaise,
-        oopspec_index: OopSpecIndex::None,
+        extraeffect: ExtraEffect::ElidableCanRaise,
+        oopspecindex: OopSpecIndex::None,
     },
     // ── Allocating constructors (cannot raise, but NOT elidable) ──
     // w_int_new/w_float_new allocate fresh objects — CSE would merge
     // distinct allocations, breaking Python identity (is).
     CallDescriptorEntry {
         targets: INT_NEW_TARGETS,
-        extra_effect: ExtraEffect::CannotRaise,
-        oopspec_index: OopSpecIndex::None,
+        extraeffect: ExtraEffect::CannotRaise,
+        oopspecindex: OopSpecIndex::None,
     },
     CallDescriptorEntry {
         targets: FLOAT_NEW_TARGETS,
-        extra_effect: ExtraEffect::CannotRaise,
-        oopspec_index: OopSpecIndex::None,
+        extraeffect: ExtraEffect::CannotRaise,
+        oopspecindex: OopSpecIndex::None,
     },
     // w_bool_from returns singletons (True/False) — safe to CSE.
     CallDescriptorEntry {
         targets: BOOL_FROM_TARGETS,
-        extra_effect: ExtraEffect::ElidableCannotRaise,
-        oopspec_index: OopSpecIndex::None,
+        extraeffect: ExtraEffect::ElidableCannotRaise,
+        oopspecindex: OopSpecIndex::None,
     },
 ];
 
@@ -2933,10 +2933,7 @@ mod tests {
             None,
             &mut cache,
         );
-        assert_eq!(
-            descriptor.effect_info.extra_effect,
-            ExtraEffect::CannotRaise
-        );
+        assert_eq!(descriptor.effect_info.extraeffect, ExtraEffect::CannotRaise);
         assert!(!descriptor.effect_info.can_invalidate);
     }
 
@@ -2958,7 +2955,7 @@ mod tests {
             None,
             &mut cache,
         );
-        assert_eq!(descriptor.effect_info.extra_effect, ExtraEffect::CanRaise);
+        assert_eq!(descriptor.effect_info.extraeffect, ExtraEffect::CanRaise);
     }
 
     #[test]
@@ -2981,7 +2978,7 @@ mod tests {
             &mut cache,
         );
         assert_eq!(
-            descriptor.effect_info.extra_effect,
+            descriptor.effect_info.extraeffect,
             ExtraEffect::ElidableCannotRaise
         );
     }
@@ -3006,7 +3003,7 @@ mod tests {
             &mut cache,
         );
         assert_eq!(
-            descriptor.effect_info.extra_effect,
+            descriptor.effect_info.extraeffect,
             ExtraEffect::ElidableCanRaise
         );
     }
@@ -3031,7 +3028,7 @@ mod tests {
             &mut cache,
         );
         assert_eq!(
-            descriptor.effect_info.extra_effect,
+            descriptor.effect_info.extraeffect,
             ExtraEffect::LoopInvariant
         );
     }
@@ -3058,7 +3055,7 @@ mod tests {
             &mut cache,
         );
         assert_eq!(
-            descriptor.effect_info.extra_effect,
+            descriptor.effect_info.extraeffect,
             ExtraEffect::ForcesVirtualOrVirtualizable
         );
     }
@@ -3082,7 +3079,7 @@ mod tests {
             &mut cache,
         );
         assert_eq!(
-            descriptor.effect_info.extra_effect,
+            descriptor.effect_info.extraeffect,
             ExtraEffect::ElidableCannotRaise
         );
     }
@@ -3122,7 +3119,7 @@ mod tests {
             None,
             &mut cache,
         );
-        assert_eq!(descriptor.effect_info.extra_effect, ExtraEffect::CanRaise);
+        assert_eq!(descriptor.effect_info.extraeffect, ExtraEffect::CanRaise);
     }
 
     #[test]
@@ -3142,7 +3139,7 @@ mod tests {
             None,
             &mut cache,
         );
-        assert_eq!(descriptor.effect_info.extra_effect, ExtraEffect::CanRaise);
+        assert_eq!(descriptor.effect_info.extraeffect, ExtraEffect::CanRaise);
         // RandomEffects is false, QuasiImmut is false → can_invalidate is false.
         assert!(!descriptor.effect_info.can_invalidate);
     }
@@ -3226,7 +3223,7 @@ mod tests {
             &mut cache,
         );
         assert_eq!(
-            descriptor.effect_info.extra_effect,
+            descriptor.effect_info.extraeffect,
             ExtraEffect::ElidableCannotRaise
         );
         // Writes should be zeroed out for elidable functions.

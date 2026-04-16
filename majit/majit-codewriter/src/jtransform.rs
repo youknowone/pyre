@@ -647,16 +647,16 @@ impl<'a> Transformer<'a> {
             // The jitcode_lower proc-macro intercepts the macros directly and
             // emits BC_COND_CALL_* / BC_RECORD_KNOWN_RESULT_* bytecodes.
         }
-        let (oopspec_index, extra_effect_override) =
+        let (oopspecindex, extraeffect_override) =
             if let Some((descriptor, _)) = classify_call(target, &self.config.call_effects) {
                 (
-                    descriptor.effect_info.oopspec_index,
-                    Some(descriptor.effect_info.extra_effect),
+                    descriptor.effect_info.oopspecindex,
+                    Some(descriptor.effect_info.extraeffect),
                 )
             } else if let Some(descriptor) = crate::call::describe_call(target) {
                 (
-                    descriptor.effect_info.oopspec_index,
-                    Some(descriptor.effect_info.extra_effect),
+                    descriptor.effect_info.oopspecindex,
+                    Some(descriptor.effect_info.extraeffect),
                 )
             } else if let Some(spec) = user_oopspec.as_deref() {
                 // rlib/jit.py:250 — map user oopspec string to OopSpecIndex.
@@ -682,13 +682,13 @@ impl<'a> Transformer<'a> {
                 target,
                 non_void_args,
                 result_ir_type,
-                oopspec_index,
-                extra_effect_override,
+                oopspecindex,
+                extraeffect_override,
                 &mut self.analysis_cache,
             )
         };
 
-        let effect_str = format!("{:?}", descriptor.effect_info.extra_effect);
+        let effect_str = format!("{:?}", descriptor.effect_info.extraeffect);
         self.notes.push(GraphTransformNote {
             function: graph_name.to_string(),
             detail: format!("builtin {target} → {effect_str}"),
@@ -701,7 +701,7 @@ impl<'a> Transformer<'a> {
         //
         // RPython reuses the SAME calldescr returned by getcalldescr() —
         // it carries the real NON_VOID_ARGS and RESULT types from call.py:334.
-        if oopspec_index != OopSpecIndex::None {
+        if oopspecindex != OopSpecIndex::None {
             if let Some(cc) = self.callcontrol.as_mut() {
                 let calldescr: majit_ir::descr::DescrRef = majit_ir::descr::make_call_descr(
                     non_void_args_for_collection,
@@ -715,7 +715,7 @@ impl<'a> Transformer<'a> {
                 let func_as_int = hasher.finish();
 
                 cc.callinfocollection
-                    .add(oopspec_index, calldescr, func_as_int);
+                    .add(oopspecindex, calldescr, func_as_int);
                 cc.callinfocollection
                     .register_func_name(func_as_int, format!("{target}"));
             }
@@ -1104,7 +1104,9 @@ impl<'a> Transformer<'a> {
         };
         // jtransform.py:1677: assert not forces_virtual_or_virtualizable
         assert!(
-            !descriptor.effect_info.forces_virtual_or_virtualizable(),
+            !descriptor
+                .effect_info
+                .check_forces_virtual_or_virtualizable(),
             "conditional_call target must not force virtualizable"
         );
         // jtransform.py:1678-1680: rewrite_call with force_ir=True
@@ -1200,7 +1202,7 @@ impl<'a> Transformer<'a> {
         };
         // jtransform.py:301: assert calldescr.get_extra_info().check_is_elidable()
         assert!(
-            descriptor.effect_info.is_elidable(),
+            descriptor.effect_info.check_is_elidable(),
             "record_known_result: function must be elidable"
         );
         // jtransform.py:302-307: record_known_result_{i|r}
@@ -1900,9 +1902,9 @@ fn classify_call(
     overrides: &[CallEffectOverride],
 ) -> Option<(CallDescriptor, CallEffectKind)> {
     fn classify_effect_info(info: &majit_ir::descr::EffectInfo) -> CallEffectKind {
-        if info.forces_virtual_or_virtualizable() {
+        if info.check_forces_virtual_or_virtualizable() {
             CallEffectKind::MayForce
-        } else if info.is_elidable() {
+        } else if info.check_is_elidable() {
             CallEffectKind::Elidable
         } else {
             CallEffectKind::Residual
@@ -2055,7 +2057,11 @@ mod tests {
         if let OpKind::CallResidual { descriptor, .. } =
             &result.graph.block(graph.startblock).operations[0].kind
         {
-            assert!(descriptor.effect_info.forces_virtual_or_virtualizable());
+            assert!(
+                descriptor
+                    .effect_info
+                    .check_forces_virtual_or_virtualizable()
+            );
         } else {
             panic!("expected CallResidual");
         }

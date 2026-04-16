@@ -2760,7 +2760,7 @@ impl Optimization for OptRewrite {
                 if let Some(ref descr) = op.descr {
                     if let Some(cd) = descr.as_call_descr() {
                         let ei = cd.effect_info();
-                        match ei.oopspec_index {
+                        match ei.oopspecindex {
                             // rewrite.py:688: OS_INT_UDIV
                             majit_ir::OopSpecIndex::IntUdiv => {
                                 if self.optimize_call_int_udiv(op, ctx) {
@@ -2901,7 +2901,7 @@ impl Optimization for OptRewrite {
                 if let Some(ref descr) = op.descr {
                     if let Some(cd) = descr.as_call_descr() {
                         let ei = cd.effect_info();
-                        match ei.oopspec_index {
+                        match ei.oopspecindex {
                             // rewrite.py:580-590: OS_ARRAYCOPY / OS_ARRAYMOVE
                             majit_ir::OopSpecIndex::Arraycopy => {
                                 if op.num_args() >= 6 {

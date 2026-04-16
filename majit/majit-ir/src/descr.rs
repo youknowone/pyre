@@ -46,8 +46,8 @@ pub enum LLType {
         result_signed: bool,
         /// descr.py:662: result_size = symbolic.get_size(RESULT_ERASED, tsc)
         result_size: usize,
-        extra_effect: u8,
-        oopspec_index: u16,
+        extraeffect: u8,
+        oopspecindex: u16,
         readonly_descrs_fields: u64,
         write_descrs_fields: u64,
         readonly_descrs_arrays: u64,
@@ -92,8 +92,8 @@ impl LLType {
             result_type,
             result_signed,
             result_size,
-            extra_effect: effect.extra_effect as u8,
-            oopspec_index: effect.oopspec_index as u16,
+            extraeffect: effect.extraeffect as u8,
+            oopspecindex: effect.oopspecindex as u16,
             readonly_descrs_fields: effect.readonly_descrs_fields,
             write_descrs_fields: effect.write_descrs_fields,
             readonly_descrs_arrays: effect.readonly_descrs_arrays,
@@ -1237,8 +1237,8 @@ impl Descr for DebugMergePointDescr {
 /// Translated from rpython/jit/codewriter/effectinfo.py.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EffectInfo {
-    pub extra_effect: ExtraEffect,
-    pub oopspec_index: OopSpecIndex,
+    pub extraeffect: ExtraEffect,
+    pub oopspecindex: OopSpecIndex,
     /// effectinfo.py: bitstring_readonly_descrs_fields
     pub readonly_descrs_fields: u64,
     /// effectinfo.py: bitstring_write_descrs_fields
@@ -1267,8 +1267,8 @@ pub struct EffectInfo {
 /// cache key which also excludes it — effectinfo.py:155-164).
 impl PartialEq for EffectInfo {
     fn eq(&self, other: &Self) -> bool {
-        self.extra_effect == other.extra_effect
-            && self.oopspec_index == other.oopspec_index
+        self.extraeffect == other.extraeffect
+            && self.oopspecindex == other.oopspecindex
             && self.readonly_descrs_fields == other.readonly_descrs_fields
             && self.write_descrs_fields == other.write_descrs_fields
             && self.readonly_descrs_arrays == other.readonly_descrs_arrays
@@ -1285,8 +1285,8 @@ impl Eq for EffectInfo {}
 impl Default for EffectInfo {
     fn default() -> Self {
         EffectInfo {
-            extra_effect: ExtraEffect::CanRaise,
-            oopspec_index: OopSpecIndex::None,
+            extraeffect: ExtraEffect::CanRaise,
+            oopspecindex: OopSpecIndex::None,
             readonly_descrs_fields: 0,
             write_descrs_fields: 0,
             readonly_descrs_arrays: 0,
@@ -1403,65 +1403,45 @@ pub enum OopSpecIndex {
 }
 
 impl EffectInfo {
-    pub fn is_elidable(&self) -> bool {
-        matches!(
-            self.extra_effect,
-            ExtraEffect::ElidableCannotRaise
-                | ExtraEffect::ElidableOrMemoryError
-                | ExtraEffect::ElidableCanRaise
-        )
+    pub fn check_is_elidable(&self) -> bool {
+        self.extraeffect == ExtraEffect::ElidableCanRaise
+            || self.extraeffect == ExtraEffect::ElidableOrMemoryError
+            || self.extraeffect == ExtraEffect::ElidableCannotRaise
     }
 
-    pub fn is_loopinvariant(&self) -> bool {
-        self.extra_effect == ExtraEffect::LoopInvariant
+    pub fn check_is_loopinvariant(&self) -> bool {
+        self.extraeffect == ExtraEffect::LoopInvariant
     }
 
-    pub fn can_raise(&self) -> bool {
-        self.extra_effect >= ExtraEffect::ElidableCanRaise
-    }
-
-    /// effectinfo.py: check_can_invalidate()
-    /// Whether this call can invalidate compiled code (quasi-immutable mutations).
-    pub fn can_invalidate(&self) -> bool {
+    pub fn check_can_invalidate(&self) -> bool {
         self.can_invalidate
     }
 
-    /// effectinfo.py: check_can_collect() — whether this call can trigger GC collection.
-    /// RPython: stored as field from collect_analyzer result.
-    pub fn can_collect(&self) -> bool {
+    pub fn check_can_collect(&self) -> bool {
         self.can_collect
     }
 
-    /// effectinfo.py: check_forces_virtual_or_virtualizable()
-    /// Whether this call forces virtualizables or virtual objects.
-    pub fn forces_virtual_or_virtualizable(&self) -> bool {
-        self.extra_effect >= ExtraEffect::ForcesVirtualOrVirtualizable
+    pub fn check_forces_virtual_or_virtualizable(&self) -> bool {
+        self.extraeffect >= ExtraEffect::ForcesVirtualOrVirtualizable
     }
 
     /// Whether this call has random effects (worst case).
     pub fn has_random_effects(&self) -> bool {
-        self.extra_effect == ExtraEffect::RandomEffects
+        self.extraeffect == ExtraEffect::RandomEffects
     }
 
     /// Whether the oopspec identifies a special-cased operation.
     pub fn has_oopspec(&self) -> bool {
-        self.oopspec_index != OopSpecIndex::None
+        self.oopspecindex != OopSpecIndex::None
     }
 
     /// effectinfo.py: check_can_raise(ignore_memoryerror)
     /// Whether this call can raise exceptions (optionally ignoring MemoryError).
     pub fn check_can_raise(&self, ignore_memoryerror: bool) -> bool {
         if ignore_memoryerror {
-            // ElidableOrMemoryError can only raise MemoryError
-            matches!(
-                self.extra_effect,
-                ExtraEffect::ElidableCanRaise
-                    | ExtraEffect::CanRaise
-                    | ExtraEffect::ForcesVirtualOrVirtualizable
-                    | ExtraEffect::RandomEffects
-            )
+            self.extraeffect > ExtraEffect::ElidableOrMemoryError
         } else {
-            self.can_raise()
+            self.extraeffect > ExtraEffect::CannotRaise
         }
     }
 
@@ -1472,10 +1452,10 @@ impl EffectInfo {
     }
 
     /// Const-compatible constructor for static initialization.
-    pub const fn const_new(extra_effect: ExtraEffect, oopspec_index: OopSpecIndex) -> Self {
+    pub const fn const_new(extraeffect: ExtraEffect, oopspecindex: OopSpecIndex) -> Self {
         EffectInfo {
-            extra_effect,
-            oopspec_index,
+            extraeffect,
+            oopspecindex,
             readonly_descrs_fields: 0,
             write_descrs_fields: 0,
             readonly_descrs_arrays: 0,
@@ -1489,10 +1469,10 @@ impl EffectInfo {
     }
 
     /// Create a new EffectInfo with the given effect and oopspec.
-    pub fn new(extra_effect: ExtraEffect, oopspec_index: OopSpecIndex) -> Self {
+    pub fn new(extraeffect: ExtraEffect, oopspecindex: OopSpecIndex) -> Self {
         EffectInfo {
-            extra_effect,
-            oopspec_index,
+            extraeffect,
+            oopspecindex,
             ..Default::default()
         }
     }
@@ -1500,7 +1480,7 @@ impl EffectInfo {
     /// Create an EffectInfo for a pure, elidable operation.
     pub fn elidable() -> Self {
         EffectInfo {
-            extra_effect: ExtraEffect::ElidableCannotRaise,
+            extraeffect: ExtraEffect::ElidableCannotRaise,
             ..Default::default()
         }
     }
@@ -1508,7 +1488,7 @@ impl EffectInfo {
     /// Create an EffectInfo for a side-effecting operation.
     pub fn side_effecting() -> Self {
         EffectInfo {
-            extra_effect: ExtraEffect::RandomEffects,
+            extraeffect: ExtraEffect::RandomEffects,
             ..Default::default()
         }
     }
@@ -1547,11 +1527,6 @@ impl EffectInfo {
     /// NOTE: this is not used so far (matches RPython comment)
     pub fn check_write_descr_interiorfield(&self, descr_idx: u32) -> bool {
         descr_idx < 64 && (self.write_descrs_interiorfields & (1u64 << descr_idx)) != 0
-    }
-
-    /// effectinfo.py: check_is_elidable()
-    pub fn check_is_elidable(&self) -> bool {
-        self.is_elidable()
     }
 
     /// effectinfo.py:201-206: set single_write_descr_array.
@@ -2292,7 +2267,7 @@ pub fn make_raw_malloc_calldescr() -> DescrRef {
     static NEXT_IDX: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x4000_0000);
     let idx = NEXT_IDX.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let effect = EffectInfo {
-        oopspec_index: OopSpecIndex::RawMallocVarsizeChar,
+        oopspecindex: OopSpecIndex::RawMallocVarsizeChar,
         ..EffectInfo::default()
     };
     // Raw malloc returns unsigned pointer (not signed)
@@ -2589,11 +2564,11 @@ mod tests {
     #[test]
     fn test_effect_info_default_can_raise() {
         let ei = EffectInfo::default();
-        assert_eq!(ei.extra_effect, ExtraEffect::CanRaise);
-        assert_eq!(ei.oopspec_index, OopSpecIndex::None);
-        assert!(ei.can_raise());
-        assert!(!ei.is_elidable());
-        assert!(!ei.is_loopinvariant());
+        assert_eq!(ei.extraeffect, ExtraEffect::CanRaise);
+        assert_eq!(ei.oopspecindex, OopSpecIndex::None);
+        assert!(ei.check_can_raise(false));
+        assert!(!ei.check_is_elidable());
+        assert!(!ei.check_is_loopinvariant());
     }
 
     #[test]
@@ -2605,11 +2580,11 @@ mod tests {
         ];
         for effect in elidable_effects {
             let ei = EffectInfo {
-                extra_effect: effect,
-                oopspec_index: OopSpecIndex::None,
+                extraeffect: effect,
+                oopspecindex: OopSpecIndex::None,
                 ..Default::default()
             };
-            assert!(ei.is_elidable(), "expected elidable for {effect:?}");
+            assert!(ei.check_is_elidable(), "expected elidable for {effect:?}");
         }
 
         let non_elidable = [
@@ -2621,83 +2596,132 @@ mod tests {
         ];
         for effect in non_elidable {
             let ei = EffectInfo {
-                extra_effect: effect,
-                oopspec_index: OopSpecIndex::None,
+                extraeffect: effect,
+                oopspecindex: OopSpecIndex::None,
                 ..Default::default()
             };
-            assert!(!ei.is_elidable(), "expected non-elidable for {effect:?}");
+            assert!(
+                !ei.check_is_elidable(),
+                "expected non-elidable for {effect:?}"
+            );
         }
     }
 
     #[test]
     fn test_effect_info_can_raise_ordering() {
         // ExtraEffect ordering: effects >= ElidableCanRaise can raise
+        // effectinfo.py: check_can_raise(ignore_memoryerror=False) is
+        // self.extraeffect > EF_CANNOT_RAISE (2)
         let cannot_raise = [
-            ExtraEffect::ElidableCannotRaise,
-            ExtraEffect::LoopInvariant,
-            ExtraEffect::CannotRaise,
-            ExtraEffect::ElidableOrMemoryError,
+            ExtraEffect::ElidableCannotRaise, // 0
+            ExtraEffect::LoopInvariant,       // 1
+            ExtraEffect::CannotRaise,         // 2
         ];
         for effect in cannot_raise {
             let ei = EffectInfo {
-                extra_effect: effect,
-                oopspec_index: OopSpecIndex::None,
+                extraeffect: effect,
+                oopspecindex: OopSpecIndex::None,
                 ..Default::default()
             };
-            assert!(!ei.can_raise(), "expected cannot raise for {effect:?}");
+            assert!(
+                !ei.check_can_raise(false),
+                "expected cannot raise for {effect:?}"
+            );
         }
 
         let can_raise = [
-            ExtraEffect::ElidableCanRaise,
-            ExtraEffect::CanRaise,
-            ExtraEffect::ForcesVirtualOrVirtualizable,
-            ExtraEffect::RandomEffects,
+            ExtraEffect::ElidableOrMemoryError,        // 3
+            ExtraEffect::ElidableCanRaise,             // 4
+            ExtraEffect::CanRaise,                     // 5
+            ExtraEffect::ForcesVirtualOrVirtualizable, // 6
+            ExtraEffect::RandomEffects,                // 7
         ];
         for effect in can_raise {
             let ei = EffectInfo {
-                extra_effect: effect,
-                oopspec_index: OopSpecIndex::None,
+                extraeffect: effect,
+                oopspecindex: OopSpecIndex::None,
                 ..Default::default()
             };
-            assert!(ei.can_raise(), "expected can raise for {effect:?}");
+            assert!(
+                ei.check_can_raise(false),
+                "expected can raise for {effect:?}"
+            );
+        }
+
+        // effectinfo.py: check_can_raise(ignore_memoryerror=True) is
+        // self.extraeffect > EF_ELIDABLE_OR_MEMORYERROR (3)
+        let cannot_raise_ignoring = [
+            ExtraEffect::ElidableCannotRaise,   // 0
+            ExtraEffect::LoopInvariant,         // 1
+            ExtraEffect::CannotRaise,           // 2
+            ExtraEffect::ElidableOrMemoryError, // 3
+        ];
+        for effect in cannot_raise_ignoring {
+            let ei = EffectInfo {
+                extraeffect: effect,
+                oopspecindex: OopSpecIndex::None,
+                ..Default::default()
+            };
+            assert!(
+                !ei.check_can_raise(true),
+                "expected cannot raise (ignoring memoryerror) for {effect:?}"
+            );
+        }
+
+        let can_raise_ignoring = [
+            ExtraEffect::ElidableCanRaise,             // 4
+            ExtraEffect::CanRaise,                     // 5
+            ExtraEffect::ForcesVirtualOrVirtualizable, // 6
+            ExtraEffect::RandomEffects,                // 7
+        ];
+        for effect in can_raise_ignoring {
+            let ei = EffectInfo {
+                extraeffect: effect,
+                oopspecindex: OopSpecIndex::None,
+                ..Default::default()
+            };
+            assert!(
+                ei.check_can_raise(true),
+                "expected can raise (ignoring memoryerror) for {effect:?}"
+            );
         }
     }
 
     #[test]
     fn test_effect_info_loop_invariant() {
         let ei = EffectInfo {
-            extra_effect: ExtraEffect::LoopInvariant,
-            oopspec_index: OopSpecIndex::None,
+            extraeffect: ExtraEffect::LoopInvariant,
+            oopspecindex: OopSpecIndex::None,
             ..Default::default()
         };
-        assert!(ei.is_loopinvariant());
-        assert!(!ei.is_elidable());
-        assert!(!ei.can_raise());
+        assert!(ei.check_is_loopinvariant());
+        assert!(!ei.check_is_elidable());
+        assert!(!ei.check_can_raise(false));
     }
 
     #[test]
     fn test_effect_info_libffi_call_oopspec() {
         // FFI calls use LibffiCall oopspec index
         let ei = EffectInfo {
-            extra_effect: ExtraEffect::CanRaise,
-            oopspec_index: OopSpecIndex::LibffiCall,
+            extraeffect: ExtraEffect::CanRaise,
+            oopspecindex: OopSpecIndex::LibffiCall,
             ..Default::default()
         };
-        assert_eq!(ei.oopspec_index, OopSpecIndex::LibffiCall);
-        assert!(ei.can_raise());
+        assert_eq!(ei.oopspecindex, OopSpecIndex::LibffiCall);
+        assert!(ei.check_can_raise(false));
     }
 
     #[test]
     fn test_effect_info_forces_virtual() {
         // Parity: calls that force virtualizable objects
         let ei = EffectInfo {
-            extra_effect: ExtraEffect::ForcesVirtualOrVirtualizable,
-            oopspec_index: OopSpecIndex::JitForceVirtualizable,
+            extraeffect: ExtraEffect::ForcesVirtualOrVirtualizable,
+            oopspecindex: OopSpecIndex::JitForceVirtualizable,
             ..Default::default()
         };
-        assert!(ei.can_raise());
-        assert!(!ei.is_elidable());
-        assert_eq!(ei.oopspec_index, OopSpecIndex::JitForceVirtualizable);
+        assert!(ei.check_can_raise(false));
+        assert!(!ei.check_is_elidable());
+        assert_eq!(ei.oopspecindex, OopSpecIndex::JitForceVirtualizable);
     }
 
     #[test]

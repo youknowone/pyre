@@ -1416,11 +1416,11 @@ impl OptHeap {
     }
 
     /// Extract OopSpecIndex from a call op's descriptor, if available.
-    fn get_oopspec_index(op: &Op) -> OopSpecIndex {
+    fn get_oopspecindex(op: &Op) -> OopSpecIndex {
         op.descr
             .as_ref()
             .and_then(|d| d.as_call_descr())
-            .map(|cd| cd.effect_info().oopspec_index)
+            .map(|cd| cd.effect_info().oopspecindex)
             .unwrap_or(OopSpecIndex::None)
     }
 
@@ -1429,7 +1429,7 @@ impl OptHeap {
     /// ARRAYCOPY/ARRAYMOVE with constant indices and known array descriptor
     /// do NOT escape arguments.
     fn mark_escaped_varargs(&mut self, op: &Op, ctx: &mut OptContext) {
-        let oopspec = Self::get_oopspec_index(op);
+        let oopspec = Self::get_oopspecindex(op);
         // heapcache.py:275: single_write_descr_array is not None.
         // RPython: exactly one array write descriptor is known.
         // Bitstring: is_power_of_two means exactly one bit set.
@@ -1481,7 +1481,7 @@ impl OptHeap {
         op.descr
             .as_ref()
             .and_then(|d| d.as_call_descr())
-            .map(|cd| cd.effect_info().can_invalidate())
+            .map(|cd| cd.effect_info().check_can_invalidate())
             .unwrap_or(true)
     }
 
@@ -1490,7 +1490,7 @@ impl OptHeap {
         op.descr
             .as_ref()
             .and_then(|d| d.as_call_descr())
-            .map(|cd| cd.effect_info().forces_virtual_or_virtualizable())
+            .map(|cd| cd.effect_info().check_forces_virtual_or_virtualizable())
             .unwrap_or(false)
     }
 
@@ -2531,7 +2531,7 @@ impl OptHeap {
 
         // Calls: mark arguments as escaped, force lazy sets, and invalidate.
         if opcode.is_call() {
-            let oopspec = Self::get_oopspec_index(op);
+            let oopspec = Self::get_oopspecindex(op);
             match oopspec {
                 // heap.py: DICT_LOOKUP caching — consecutive dict lookups
                 // on the same dict with the same key can be deduplicated.
@@ -4958,8 +4958,8 @@ mod tests {
         Arc::new(TestCallDescr {
             idx,
             effect: EffectInfo {
-                extra_effect: ExtraEffect::CanRaise,
-                oopspec_index: OopSpecIndex::Arraycopy,
+                extraeffect: ExtraEffect::CanRaise,
+                oopspecindex: OopSpecIndex::Arraycopy,
                 ..Default::default()
             },
         })
@@ -4971,7 +4971,7 @@ mod tests {
         let call_d = call_descr(
             70,
             EffectInfo {
-                extra_effect: ExtraEffect::CanRaise,
+                extraeffect: ExtraEffect::CanRaise,
                 write_descrs_fields: 1u64 << 1,
                 ..Default::default()
             },
@@ -5001,7 +5001,7 @@ mod tests {
         let call_d = call_descr(
             71,
             EffectInfo {
-                extra_effect: ExtraEffect::CanRaise,
+                extraeffect: ExtraEffect::CanRaise,
                 write_descrs_fields: 1u64 << 0,
                 ..Default::default()
             },
@@ -5030,7 +5030,7 @@ mod tests {
         let call_d = call_descr(
             72,
             EffectInfo {
-                extra_effect: ExtraEffect::CanRaise,
+                extraeffect: ExtraEffect::CanRaise,
                 can_invalidate: true,
                 ..Default::default()
             },
@@ -5061,7 +5061,7 @@ mod tests {
         let call_d = call_descr(
             73,
             EffectInfo {
-                extra_effect: ExtraEffect::CanRaise,
+                extraeffect: ExtraEffect::CanRaise,
                 write_descrs_arrays: 1u64 << 1,
                 ..Default::default()
             },
@@ -5118,7 +5118,7 @@ mod tests {
         let call_d = call_descr(
             74,
             EffectInfo {
-                extra_effect: ExtraEffect::CanRaise,
+                extraeffect: ExtraEffect::CanRaise,
                 write_descrs_arrays: 1u64 << 0,
                 ..Default::default()
             },
