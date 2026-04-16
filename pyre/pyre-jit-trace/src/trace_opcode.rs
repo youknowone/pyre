@@ -1742,11 +1742,19 @@ impl MIFrame {
         } else if ctx.constant_value(opref).is_some() {
             let val = ctx.constant_value(opref).unwrap_or(0);
             // resume.py:157-183 `getconst(const)` dispatches on `const.type`.
-            // When the caller knows the slot's declared type (e.g. a
-            // virtualizable static field or array item), use it directly so
-            // pointer constants opened via `const_int` still tag as REF.
-            let tp = declared_type
-                .unwrap_or_else(|| ctx.const_type(opref).unwrap_or(majit_ir::Type::Int));
+            // Prefer the pool's actual const type over `declared_type`:
+            // Box.type is immutable, so an Int-typed constant (e.g. an
+            // intbounds-promoted local) must stay Int even when the slot
+            // layout declares Ref. Retyping it here would seed the bridge
+            // optimizer's const_pool with `Value::Ref(GcRef(small_int))`
+            // and later trip the getintbound forwarding assertion. Fall
+            // back to `declared_type` only when the pool has no type for
+            // this OpRef (e.g. raw-pointer constants seeded without a
+            // const_type entry).
+            let tp = ctx
+                .const_type(opref)
+                .or(declared_type)
+                .unwrap_or(majit_ir::Type::Int);
             majit_trace::recorder::SnapshotTagged::Const(val, tp)
         } else {
             // resume.py:211,214: box.type for _number_boxes TAGVIRTUAL/TAGBOX.
