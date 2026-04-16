@@ -99,17 +99,23 @@ pub struct JitFrameDescrs {
     pub sign_size: usize,
 }
 
-/// A deferred ZERO_ARRAY emission that can be elided or shortened when
-/// subsequent SETARRAYITEM writes cover parts of the array.
+/// rewrite.py:719-758 last_zero_arrays parity.
+///
+/// A ZERO_ARRAY op already emitted into `out` whose start/length will
+/// be tightened (or zeroed out) at flush time based on which indices
+/// were covered by subsequent SETARRAYITEM ops.  Mirrors RPython's
+/// in-place setarg pattern — one ZERO_ARRAY per array, trimmed from
+/// both ends; never split into multiple runs.
 struct PendingZero {
+    /// Index in `out` of the already-emitted ZERO_ARRAY op.
+    out_index: usize,
     /// The OpRef of the array being zeroed.
     array_ref: OpRef,
-    /// Start index of the zero range.
-    start: usize,
-    /// Length (number of items) of the zero range.
+    /// Initial length (number of items) before any trimming.
     length: usize,
-    /// The original op (used for descriptor propagation).
-    original_op: Op,
+    /// Per-item byte size from the array descriptor (`scale` in
+    /// rewrite.py:727).
+    scale: i64,
 }
 
 /// Per-rewrite mutable state (not stored on the struct so that
@@ -170,6 +176,21 @@ struct RewriteState {
     /// pending zero was recorded. Keyed by array OpRef index.
     initialized_indices: HashMap<u32, HashSet<usize>>,
 
+    // ── INT_ADD/INT_SUB constant-fold tracking (rewrite.py:64) ──
+    /// `_constant_additions[box]` = `(older_box, constant_add)` for an
+    /// int_add/int_sub whose constant operand can be folded into a
+    /// downstream GC_STORE_INDEXED / GC_LOAD_INDEXED offset.  See
+    /// rewrite.py:1008 record_int_add_or_sub and rewrite.py:173
+    /// _try_use_older_box.
+    ///
+    /// pyre's emit_setarrayitem path does not currently lower to
+    /// GC_STORE_INDEXED, so this map is populated but its
+    /// _try_use_older_box consumer is parked until that lowering is
+    /// ported.  The parity skeleton is kept here so the structural
+    /// presence matches upstream and the consumer can be wired without
+    /// re-introducing the field.
+    _constant_additions: HashMap<u32, (OpRef, i64)>,
+
     // ── Pending vtable initializations ──
     /// rewrite.py:479-484 handle_malloc_operation parity: for a batch of
     /// NEW_WITH_VTABLE ops being coalesced into one nursery bump, defer
@@ -198,6 +219,7 @@ impl RewriteState {
             pending_zeros: Vec::new(),
             initialized_indices: HashMap::new(),
             pending_vtable_inits: Vec::new(),
+            _constant_additions: HashMap::new(),
         }
     }
 
@@ -267,6 +289,61 @@ impl RewriteState {
         self.wb_applied.clear();
         self.pending_array_wb = None;
         self.emit_pending_zeros();
+        // rewrite.py:708-711: clear _constant_additions here, not only
+        // in emit_label, to avoid keeping the older boxes alive across
+        // a potentially-collecting op.
+        self._constant_additions.clear();
+    }
+
+    /// rewrite.py:1008 record_int_add_or_sub.
+    ///
+    /// When `op` is `INT_ADD/INT_ADD_OVF/INT_SUB/INT_SUB_OVF` whose
+    /// non-result operand is a `ConstInt`, remember the (older box,
+    /// constant) pair so a downstream GC_STORE_INDEXED / GC_LOAD_INDEXED
+    /// emit can fold the constant into its `offset` argument via
+    /// `_try_use_older_box`.
+    ///
+    /// `is_subtraction` distinguishes INT_SUB (negate the constant
+    /// before storing) from INT_ADD.  Mirrors rewrite.py:1015.
+    fn record_int_add_or_sub(&mut self, op: &Op, is_subtraction: bool) {
+        let v_arg0 = op.arg(0);
+        let v_arg1 = op.arg(1);
+        let (box_arg, mut constant) = if let Some(c) = self.resolve_constant(v_arg1.0) {
+            let signed = if is_subtraction { -c } else { c };
+            (v_arg0, signed)
+        } else if !is_subtraction {
+            // rewrite.py:1019-1024: int_add only — try arg0 as constant.
+            let Some(c) = self.resolve_constant(v_arg0.0) else {
+                return;
+            };
+            (v_arg1, c)
+        } else {
+            return;
+        };
+        // rewrite.py:1026-1030 invariant: if box itself is a recorded
+        // sum, fold its constant in and chain to the older origin.
+        let box_arg = if let Some(&(older, extra)) = self._constant_additions.get(&box_arg.0) {
+            constant += extra;
+            older
+        } else {
+            box_arg
+        };
+        self._constant_additions
+            .insert(op.pos.0, (box_arg, constant));
+    }
+
+    /// rewrite.py:173 _try_use_older_box.
+    ///
+    /// If `index_box` is a recorded `_constant_additions` entry, replace
+    /// it with the older box and add `factor * extra_offset` to
+    /// `offset`.  Currently unused — kept for parity with rewrite.py
+    /// until pyre's setarrayitem path lowers to GC_STORE_INDEXED.
+    #[allow(dead_code)]
+    fn _try_use_older_box(&self, index_box: OpRef, factor: i64, offset: i64) -> (OpRef, i64) {
+        if let Some(&(older, extra)) = self._constant_additions.get(&index_box.0) {
+            return (older, offset + factor * extra);
+        }
+        (index_box, offset)
     }
 
     fn remember_wb(&mut self, r: OpRef) {
@@ -363,8 +440,15 @@ impl RewriteState {
         }
     }
 
-    /// Flush all pending ZERO_ARRAY ops, emitting optimized versions
-    /// that skip indices already covered by SETARRAYITEM writes.
+    /// rewrite.py:719-758 emit_pending_zeros.
+    ///
+    /// Mutates each previously-emitted ZERO_ARRAY in place: trim from
+    /// both ends past any indices that subsequent SETARRAYITEM writes
+    /// covered, then rewrite arg(1)/arg(2) as byte offset / byte
+    /// length (multiplied by the array's `scale`) and arg(3)/arg(4)
+    /// to ConstInt(1) so the backend treats arg(1)/arg(2) as raw
+    /// bytes.  Length 0 leaves the op as a no-op for the backend
+    /// (matches rewrite.py:754 "may be ConstInt(0)").
     fn emit_pending_zeros(&mut self) {
         let pending = std::mem::take(&mut self.pending_zeros);
         let inited = std::mem::take(&mut self.initialized_indices);
@@ -372,38 +456,24 @@ impl RewriteState {
         for pz in pending {
             let written = inited.get(&pz.array_ref.0);
 
-            // Find contiguous zero ranges by excluding written indices.
-            let mut i = pz.start;
-            let end = pz.start + pz.length;
-
-            while i < end {
-                // Skip indices already initialized by SETARRAYITEM.
-                if written.is_some_and(|s| s.contains(&i)) {
-                    i += 1;
-                    continue;
-                }
-
-                // Start of a zero run.
-                let run_start = i;
-                while i < end && !written.is_some_and(|s| s.contains(&i)) {
-                    i += 1;
-                }
-                let run_len = i - run_start;
-
-                // Emit ZERO_ARRAY(array, start_const, length_const, 0, descr).
-                let mut zero_op = Op::new(
-                    OpCode::ZeroArray,
-                    &[
-                        pz.array_ref,
-                        OpRef(run_start as u32),
-                        OpRef(run_len as u32),
-                        OpRef(0),
-                        OpRef(0),
-                    ],
-                );
-                zero_op.descr = pz.original_op.descr.clone();
-                self.emit(zero_op);
+            // rewrite.py:744-753 trim-from-front / trim-from-back.
+            let mut start: usize = 0;
+            while start < pz.length && written.is_some_and(|s| s.contains(&start)) {
+                start += 1;
             }
+            let mut stop: usize = pz.length;
+            while stop > start && written.is_some_and(|s| s.contains(&(stop - 1))) {
+                stop -= 1;
+            }
+            let scaled_start = self.const_int(start as i64 * pz.scale);
+            let scaled_len = self.const_int((stop - start) as i64 * pz.scale);
+            let one = self.const_int(1);
+
+            let op = &mut self.out[pz.out_index];
+            op.args[1] = scaled_start;
+            op.args[2] = scaled_len;
+            op.args[3] = one;
+            op.args[4] = one;
         }
     }
 }
@@ -518,17 +588,28 @@ impl GcRewriterImpl {
             self.gen_initialize_len(result, v_length, descr_ref.clone(), len_descr, st);
         }
 
-        // For NEW_ARRAY_CLEAR, defer ZERO_ARRAY emission so that
-        // subsequent SETARRAYITEM writes can eliminate redundant zeroing.
+        // rewrite.py:592-608 emit ZERO_ARRAY now and remember it in
+        // last_zero_arrays for emit_pending_zeros to mutate-in-place.
         if is_clear && !v_length.is_none() {
-            let length_val = v_length.0 as usize;
-            if length_val > 0 {
-                st.pending_zeros.push(PendingZero {
-                    array_ref: result,
-                    start: 0,
-                    length: length_val,
-                    original_op: op.clone(),
-                });
+            if let Some(length_val) = st.resolve_constant(v_length.0).map(|n| n as usize) {
+                if length_val > 0 {
+                    let scale = descr.item_size() as i64;
+                    let zero_one = st.const_int(0);
+                    let length_const = st.const_int(length_val as i64);
+                    let mut zero_op = Op::new(
+                        OpCode::ZeroArray,
+                        &[result, zero_one, length_const, zero_one, zero_one],
+                    );
+                    zero_op.descr = op.descr.clone();
+                    let out_index = st.out.len();
+                    st.emit(zero_op);
+                    st.pending_zeros.push(PendingZero {
+                        out_index,
+                        array_ref: result,
+                        length: length_val,
+                        scale,
+                    });
+                }
             }
         }
 
@@ -1049,6 +1130,23 @@ impl GcRewriter for GcRewriterImpl {
                 _ if op.opcode.is_final() => {
                     st.emit_pending_zeros();
                     let rewritten = st.rewrite_op(op);
+                    st.emit_rewritten_from(op, rewritten);
+                }
+
+                // rewrite.py:383-387 — record INT_ADD/INT_SUB whose
+                // constant operand can later be folded into a
+                // GC_STORE_INDEXED / GC_LOAD_INDEXED offset.  The
+                // recording is structurally complete; the consumer
+                // (_try_use_older_box) is parked until the
+                // setarrayitem-to-GC_STORE_INDEXED lowering is ported.
+                OpCode::IntAdd | OpCode::IntAddOvf => {
+                    let rewritten = st.rewrite_op(op);
+                    st.record_int_add_or_sub(&rewritten, false);
+                    st.emit_rewritten_from(op, rewritten);
+                }
+                OpCode::IntSub | OpCode::IntSubOvf => {
+                    let rewritten = st.rewrite_op(op);
+                    st.record_int_add_or_sub(&rewritten, true);
                     st.emit_rewritten_from(op, rewritten);
                 }
 
@@ -1626,12 +1724,20 @@ mod tests {
 
     // ── Pending zero flush tests ──
 
+    /// Helper: build a constants map mapping `key` → `value` for tests
+    /// that need the rewriter's resolve_constant to find a length.
+    fn const_pool(entries: &[(u32, i64)]) -> HashMap<u32, i64> {
+        entries.iter().copied().collect()
+    }
+
     #[test]
     fn test_pending_zero_fully_initialized() {
-        // NEW_ARRAY_CLEAR(3) + SET[0] + SET[1] + SET[2] → no ZERO_ARRAY emitted.
+        // NEW_ARRAY_CLEAR(3) + SET[0] + SET[1] + SET[2] → ZERO_ARRAY emitted
+        // with length=0 (RPython rewrite.py:754 "may be ConstInt(0)").
         let rw = make_rewriter();
         let mut new_array = Op::with_descr(OpCode::NewArrayClear, &[OpRef(3)], array_descr_int());
         new_array.pos = OpRef(0);
+        let constants = const_pool(&[(3, 3)]);
 
         let ops = vec![
             new_array,
@@ -1653,25 +1759,26 @@ mod tests {
             Op::new(OpCode::Finish, &[]),
         ];
 
-        let result = rw.rewrite_for_gc(&ops);
+        let (result, out_consts) = rw.rewrite_for_gc_with_constants(&ops, &constants);
 
-        // All indices were SET, so no ZERO_ARRAY should be emitted.
-        let zero_count = result
+        // All indices were SET, so the in-place ZERO_ARRAY is rewritten
+        // to byte_length 0 — backend treats it as a no-op.
+        let zeros: Vec<_> = result
             .iter()
             .filter(|o| o.opcode == OpCode::ZeroArray)
-            .count();
-        assert_eq!(
-            zero_count, 0,
-            "fully initialized array should produce no ZERO_ARRAY"
-        );
+            .collect();
+        assert_eq!(zeros.len(), 1, "ZERO_ARRAY stays in place per parity");
+        assert_eq!(out_consts[&zeros[0].args[2].0], 0, "byte length must be 0");
     }
 
     #[test]
     fn test_pending_zero_partially_initialized() {
-        // NEW_ARRAY_CLEAR(4) + SET[0] + SET[1] → ZERO_ARRAY(arr, 2, 2)
+        // NEW_ARRAY_CLEAR(4) + SET[0] + SET[1] → ZERO_ARRAY trimmed to
+        // start=2 items, length=2 items → byte_start=8, byte_len=8.
         let rw = make_rewriter();
         let mut new_array = Op::with_descr(OpCode::NewArrayClear, &[OpRef(4)], array_descr_int());
         new_array.pos = OpRef(0);
+        let constants = const_pool(&[(4, 4)]);
 
         let ops = vec![
             new_array,
@@ -1688,16 +1795,19 @@ mod tests {
             Op::new(OpCode::Finish, &[]),
         ];
 
-        let result = rw.rewrite_for_gc(&ops);
+        let (result, out_consts) = rw.rewrite_for_gc_with_constants(&ops, &constants);
 
-        // Indices 0 and 1 were SET. Indices 2 and 3 still need zeroing.
         let zeros: Vec<_> = result
             .iter()
             .filter(|o| o.opcode == OpCode::ZeroArray)
             .collect();
         assert_eq!(zeros.len(), 1, "should emit exactly one ZERO_ARRAY");
-        assert_eq!(zeros[0].args[1], OpRef(2), "zero start should be 2");
-        assert_eq!(zeros[0].args[2], OpRef(2), "zero length should be 2");
+        // item_size = 4 (array_descr_int), so start_items=2 → 8 bytes,
+        // length_items=2 → 8 bytes.
+        assert_eq!(out_consts[&zeros[0].args[1].0], 8, "byte start");
+        assert_eq!(out_consts[&zeros[0].args[2].0], 8, "byte length");
+        assert_eq!(out_consts[&zeros[0].args[3].0], 1, "scale arg(3) is 1");
+        assert_eq!(out_consts[&zeros[0].args[4].0], 1, "scale arg(4) is 1");
     }
 
     #[test]
@@ -1706,6 +1816,7 @@ mod tests {
         let rw = make_rewriter();
         let mut new_array = Op::with_descr(OpCode::NewArrayClear, &[OpRef(3)], array_descr_int());
         new_array.pos = OpRef(0);
+        let constants = const_pool(&[(3, 3)]);
 
         let ops = vec![
             new_array,
@@ -1713,7 +1824,7 @@ mod tests {
             Op::new(OpCode::Finish, &[]),
         ];
 
-        let result = rw.rewrite_for_gc(&ops);
+        let (result, out_consts) = rw.rewrite_for_gc_with_constants(&ops, &constants);
 
         // The ZERO_ARRAY should appear before the guard.
         let zero_idx = result.iter().position(|o| o.opcode == OpCode::ZeroArray);
@@ -1729,16 +1840,21 @@ mod tests {
             .iter()
             .find(|o| o.opcode == OpCode::ZeroArray)
             .unwrap();
-        assert_eq!(zero.args[1], OpRef(0), "zero start should be 0");
-        assert_eq!(zero.args[2], OpRef(3), "zero length should be 3");
+        // No SETs, length=3 items × 4 bytes/item = 12 bytes.
+        assert_eq!(out_consts[&zero.args[1].0], 0, "byte start");
+        assert_eq!(out_consts[&zero.args[2].0], 12, "byte length");
     }
 
     #[test]
     fn test_pending_zero_gap_in_middle() {
-        // NEW_ARRAY_CLEAR(5) + SET[0] + SET[2] + SET[4] → two ZERO_ARRAY runs.
+        // NEW_ARRAY_CLEAR(5) + SET[0] + SET[2] + SET[4] — RPython does
+        // trim-from-both-ends only (no middle splitting): start=1 (skip
+        // index 0), stop=4 (skip index 4), length=3.  Index 2 falls
+        // inside the zero range and is re-zeroed before the SET.
         let rw = make_rewriter();
         let mut new_array = Op::with_descr(OpCode::NewArrayClear, &[OpRef(5)], array_descr_int());
         new_array.pos = OpRef(0);
+        let constants = const_pool(&[(5, 5)]);
 
         let ops = vec![
             new_array,
@@ -1760,22 +1876,16 @@ mod tests {
             Op::new(OpCode::Finish, &[]),
         ];
 
-        let result = rw.rewrite_for_gc(&ops);
+        let (result, out_consts) = rw.rewrite_for_gc_with_constants(&ops, &constants);
 
-        // Indices 1 and 3 need zeroing → two separate ZERO_ARRAY runs.
         let zeros: Vec<_> = result
             .iter()
             .filter(|o| o.opcode == OpCode::ZeroArray)
             .collect();
-        assert_eq!(
-            zeros.len(),
-            2,
-            "should emit two ZERO_ARRAY runs for gaps at 1 and 3"
-        );
-        assert_eq!(zeros[0].args[1], OpRef(1));
-        assert_eq!(zeros[0].args[2], OpRef(1));
-        assert_eq!(zeros[1].args[1], OpRef(3));
-        assert_eq!(zeros[1].args[2], OpRef(1));
+        assert_eq!(zeros.len(), 1, "rewrite.py:719 emits one ZERO_ARRAY");
+        // start_items=1 → 4 bytes, length_items=3 → 12 bytes.
+        assert_eq!(out_consts[&zeros[0].args[1].0], 4, "byte start");
+        assert_eq!(out_consts[&zeros[0].args[2].0], 12, "byte length");
     }
 
     #[test]
