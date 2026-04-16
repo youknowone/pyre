@@ -112,14 +112,15 @@ impl LiveVars {
                             live[word] |= 1u64 << (i % 64);
                         }
                     }
-                    // LoadFastBorrowLoadFastBorrow reads two locals — GEN both.
-                    // Blocked on Phase 5 (LOAD_FAST → vable read): the
-                    // blackhole reads locals via move_r (registers_r), not
-                    // from the frame's vable array. Even with
-                    // consume_vable_info writing fresh values to the frame,
-                    // the blackhole won't see them. Re-enable once the
-                    // blackhole jitcode uses GETARRAYITEM_VABLE_R for locals.
-                    // Instruction::LoadFastBorrowLoadFastBorrow { var_nums } => {
+                    // Super-instructions LOAD_FAST; LOAD_FAST and
+                    // LOAD_FAST_BORROW; LOAD_FAST_BORROW read two locals.
+                    // RPython LOAD_FAST GEN semantics apply to each half,
+                    // but pyre's blackhole still resumes locals via move_r
+                    // (not GETARRAYITEM_VABLE_R), so enabling GEN here
+                    // regresses nbody/fannkuch/spectral_norm at runtime.
+                    // Blocked on A-3 Layer 2 (blackhole frame writeback).
+                    // Instruction::LoadFastLoadFast { var_nums }
+                    // | Instruction::LoadFastBorrowLoadFastBorrow { var_nums } => {
                     //     let pair = var_nums.get(op_arg);
                     //     for i in [u32::from(pair.idx_1()) as usize,
                     //               u32::from(pair.idx_2()) as usize] {
@@ -147,16 +148,21 @@ impl LiveVars {
                             }
                         }
                     }
-                    // StoreFastLoadFast: KILL store target; GEN for idx_2
-                    // left disabled — see LoadFastBorrowLoadFastBorrow note
-                    // above (blackhole resume reads via move_r, not frame
-                    // vable, so extra GEN values go stale).
+                    // Super-instruction STORE_FAST; LOAD_FAST:
+                    // KILL idx_1 (store target) then GEN idx_2 (load source).
+                    // Backward-dataflow semantics require KILL then GEN so
+                    // that if idx_1 == idx_2, the local is still live-before.
                     Instruction::StoreFastLoadFast { var_nums } => {
                         let pair = var_nums.get(op_arg);
                         let store_i = u32::from(pair.idx_1()) as usize;
+                        let load_i = u32::from(pair.idx_2()) as usize;
                         let word = store_i / 64;
                         if word < words_per_pc {
                             live[word] &= !(1u64 << (store_i % 64));
+                        }
+                        let word = load_i / 64;
+                        if word < words_per_pc {
+                            live[word] |= 1u64 << (load_i % 64);
                         }
                     }
                     _ => {}
@@ -413,8 +419,9 @@ fn stack_effects(
             let s = count.get(op_arg) as usize as i32;
             (d - 1 + s, d - 1 + s)
         }
-        // MatchClass: pop 3 (TOS, TOS1, TOS2), push 1 (bool). Net -2.
-        Instruction::MatchClass { .. } => (d - 2, d - 2),
+        // MATCH_CLASS (pyopcode.py:1730): pops w_names, w_type, w_subject (−3)
+        // and pushes either (None, False) or (tuple, True) (+2). Net −1.
+        Instruction::MatchClass { .. } => (d - 1, d - 1),
         // Reraise pops TOS (exception). Net -1.
         Instruction::Reraise { .. } => (d - 1, d - 1),
         // RaiseVarargs: pops argc values from stack.
