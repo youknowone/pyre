@@ -376,6 +376,25 @@ impl CodeWriter {
         let merge_point_pc = loop_header_pcs.iter().copied().min();
         let mut emitted_merge_point = false;
 
+        // pyframe.py:379-417 pushvalue/popvalue_maybe_none parity:
+        // Each push/pop writes self.valuestackdepth = depth ± 1.
+        // jtransform.py:923-928 lowers this to setfield_vable_i.
+        // This macro emits the equivalent BC_SETFIELD_VABLE_I after
+        // every current_depth mutation so the frame's valuestackdepth
+        // stays in sync at every guard/call point — matching RPython's
+        // per-push/per-pop semantics.
+        macro_rules! emit_vsd {
+            ($asm:expr, $depth:expr) => {
+                if is_portal {
+                    $asm.load_const_i_value(
+                        int_tmp0,
+                        (stack_base_absolute + $depth as usize) as i64,
+                    );
+                    $asm.vable_setfield_int(VABLE_VALUESTACKDEPTH_FIELD_IDX, int_tmp0);
+                }
+            };
+        }
+
         for py_pc in 0..num_instrs {
             // Exception handler entry: Python resets stack depth to the
             // handler's specified depth. Correct current_depth to match.
@@ -457,15 +476,15 @@ impl CodeWriter {
             // interpreter (eval.rs:92 `target_depth = frame.nlocals() +
             // frame.ncells() + entry.depth`) uses when an exception handler
             // unwinds the frame.
+            // pyopcode.py:172 `self.last_instr = intmask(next_instr)` parity.
             if is_portal {
                 assembler.load_const_i_value(int_tmp0, (py_pc + 1) as i64);
                 assembler.vable_setfield_int(VABLE_NEXT_INSTR_FIELD_IDX, int_tmp0);
-                assembler.load_const_i_value(
-                    int_tmp0,
-                    (stack_base_absolute + current_depth as usize) as i64,
-                );
-                assembler.vable_setfield_int(VABLE_VALUESTACKDEPTH_FIELD_IDX, int_tmp0);
             }
+            // pyframe.py:379-417: valuestackdepth is written per-push/per-pop
+            // via setfield_vable_i (jtransform.py:923-928), NOT once at opcode
+            // entry. The per-push/per-pop emit_vsd! calls below mirror that.
+            // (The old single-entry flush is removed.)
 
             // RPython jtransform.py: rewrite_operation() dispatches per opname.
             // Each match arm is the pyre equivalent of rewrite_op_*.
@@ -495,6 +514,7 @@ impl CodeWriter {
                         assembler.move_r(stack_base + current_depth, reg);
                     }
                     current_depth += 1;
+                    emit_vsd!(assembler, current_depth);
                 }
 
                 // jtransform.py:1898 do_fixed_list_setitem vable case:
@@ -504,6 +524,7 @@ impl CodeWriter {
                 Instruction::StoreFast { var_num } => {
                     let reg = var_num.get(op_arg).as_usize() as u16;
                     current_depth -= 1;
+                    emit_vsd!(assembler, current_depth);
                     assembler.move_r(reg, stack_base + current_depth);
                     // Shadow write to vable array for consume_vable_info.
                     if is_portal {
@@ -523,6 +544,7 @@ impl CodeWriter {
                     );
                     assembler.move_r(stack_base + current_depth, obj_tmp0);
                     current_depth += 1;
+                    emit_vsd!(assembler, current_depth);
                 }
 
                 Instruction::LoadConst { consti } => {
@@ -540,6 +562,7 @@ impl CodeWriter {
                     );
                     assembler.move_r(stack_base + current_depth, obj_tmp0);
                     current_depth += 1;
+                    emit_vsd!(assembler, current_depth);
                 }
 
                 // Superinstruction: two consecutive LoadFast / LoadFastBorrow.
@@ -555,17 +578,22 @@ impl CodeWriter {
                     let reg_b = u32::from(pair.idx_2()) as u16;
                     assembler.move_r(stack_base + current_depth, reg_a);
                     current_depth += 1;
+                    emit_vsd!(assembler, current_depth);
                     assembler.move_r(stack_base + current_depth, reg_b);
                     current_depth += 1;
+                    emit_vsd!(assembler, current_depth);
                 }
 
                 // STORE_SUBSCR: stack [value, obj, key] → obj[key] = value
                 Instruction::StoreSubscr => {
                     current_depth -= 1;
+                    emit_vsd!(assembler, current_depth);
                     assembler.move_r(obj_tmp1, stack_base + current_depth); // key
                     current_depth -= 1;
+                    emit_vsd!(assembler, current_depth);
                     assembler.move_r(obj_tmp0, stack_base + current_depth); // obj
                     current_depth -= 1;
+                    emit_vsd!(assembler, current_depth);
                     assembler.move_r(arg_regs_start, stack_base + current_depth); // value
                     assembler.call_may_force_void_typed_args(
                         store_subscr_fn_idx,
@@ -579,12 +607,14 @@ impl CodeWriter {
 
                 Instruction::PopTop => {
                     current_depth -= 1;
+                    emit_vsd!(assembler, current_depth);
                     // regalloc.py: discard = just decrement depth, no bytecode
                 }
 
                 Instruction::PushNull => {
                     assembler.move_r(stack_base + current_depth, null_ref_reg);
                     current_depth += 1;
+                    emit_vsd!(assembler, current_depth);
                 }
 
                 // jtransform.py: rewrite_op_int_add etc.
@@ -593,8 +623,10 @@ impl CodeWriter {
                         .expect("unsupported binary op tag in jitcode lowering")
                         as u32;
                     current_depth -= 1;
+                    emit_vsd!(assembler, current_depth);
                     assembler.move_r(obj_tmp1, stack_base + current_depth); // rhs
                     current_depth -= 1;
+                    emit_vsd!(assembler, current_depth);
                     assembler.move_r(obj_tmp0, stack_base + current_depth); // lhs
                     assembler.load_const_i_value(op_code_reg, op_val as i64);
                     assembler.call_may_force_ref_typed(
@@ -608,14 +640,17 @@ impl CodeWriter {
                     );
                     assembler.move_r(stack_base + current_depth, obj_tmp0);
                     current_depth += 1;
+                    emit_vsd!(assembler, current_depth);
                 }
 
                 // jtransform.py: rewrite_op_int_lt, optimize_goto_if_not
                 Instruction::CompareOp { opname } => {
                     let op_val = compare_op_tag(opname.get(op_arg)) as u32;
                     current_depth -= 1;
+                    emit_vsd!(assembler, current_depth);
                     assembler.move_r(obj_tmp1, stack_base + current_depth); // rhs
                     current_depth -= 1;
+                    emit_vsd!(assembler, current_depth);
                     assembler.move_r(obj_tmp0, stack_base + current_depth); // lhs
                     assembler.load_const_i_value(op_code_reg, op_val as i64);
                     assembler.call_may_force_ref_typed(
@@ -629,6 +664,7 @@ impl CodeWriter {
                     );
                     assembler.move_r(stack_base + current_depth, obj_tmp0);
                     current_depth += 1;
+                    emit_vsd!(assembler, current_depth);
                 }
 
                 // jtransform.py: optimize_goto_if_not → goto_if_not
@@ -640,6 +676,7 @@ impl CodeWriter {
                         delta.get(op_arg).as_usize(),
                     );
                     current_depth -= 1;
+                    emit_vsd!(assembler, current_depth);
                     assembler.move_r(obj_tmp0, stack_base + current_depth);
                     assembler.call_int_typed(
                         truth_fn_idx,
@@ -659,6 +696,7 @@ impl CodeWriter {
                         delta.get(op_arg).as_usize(),
                     );
                     current_depth -= 1;
+                    emit_vsd!(assembler, current_depth);
                     assembler.move_r(obj_tmp0, stack_base + current_depth);
                     assembler.call_int_typed(
                         truth_fn_idx,
@@ -696,6 +734,7 @@ impl CodeWriter {
                 // flatten.py: int_return / ref_return
                 Instruction::ReturnValue => {
                     current_depth -= 1;
+                    emit_vsd!(assembler, current_depth);
                     assembler.move_r(obj_tmp0, stack_base + current_depth);
                     assembler.ref_return(obj_tmp0);
                 }
@@ -721,9 +760,11 @@ impl CodeWriter {
                     if raw_namei & 1 != 0 {
                         assembler.move_r(stack_base + current_depth, null_ref_reg);
                         current_depth += 1;
+                        emit_vsd!(assembler, current_depth);
                     }
                     assembler.move_r(stack_base + current_depth, obj_tmp0);
                     current_depth += 1;
+                    emit_vsd!(assembler, current_depth);
                 }
 
                 // RPython jtransform.py: rewrite_op_direct_call →
@@ -741,11 +782,14 @@ impl CodeWriter {
                     let nargs = argc.get(op_arg) as usize;
                     for i in (0..nargs).rev() {
                         current_depth -= 1;
+                        emit_vsd!(assembler, current_depth);
                         assembler.move_r(arg_regs_start + i as u16, stack_base + current_depth);
                     }
                     current_depth -= 1;
+                    emit_vsd!(assembler, current_depth);
                     assembler.move_r(obj_tmp1, stack_base + current_depth); // callable
-                    current_depth -= 1; // NULL (discard)
+                    current_depth -= 1;
+                    emit_vsd!(assembler, current_depth); // NULL (discard)
 
                     // RPython: bhimpl_recursive_call_i(jdindex, greens, reds)
                     // call_fn(callable, arg0, ...) → result
@@ -780,6 +824,7 @@ impl CodeWriter {
                     }
                     assembler.move_r(stack_base + current_depth, obj_tmp0);
                     current_depth += 1;
+                    emit_vsd!(assembler, current_depth);
                 }
 
                 // Python 3.13: ToBool converts TOS to bool before branch.
@@ -790,6 +835,7 @@ impl CodeWriter {
                 // RPython bhimpl_int_neg: -obj via binary_op(0, obj, NB_SUBTRACT)
                 Instruction::UnaryNegative => {
                     current_depth -= 1;
+                    emit_vsd!(assembler, current_depth);
                     assembler.move_r(obj_tmp0, stack_base + current_depth);
                     assembler.load_const_i_value(int_tmp0, 0);
                     assembler.call_may_force_ref_typed(
@@ -813,6 +859,7 @@ impl CodeWriter {
                     );
                     assembler.move_r(stack_base + current_depth, obj_tmp0);
                     current_depth += 1;
+                    emit_vsd!(assembler, current_depth);
                 }
 
                 // Match the interpreter's direct PC arithmetic for
@@ -831,11 +878,13 @@ impl CodeWriter {
                     let argc = count.get(op_arg) as usize;
                     for i in (0..argc.min(2)).rev() {
                         current_depth -= 1;
+                        emit_vsd!(assembler, current_depth);
                         assembler.move_r(arg_regs_start + i as u16, stack_base + current_depth);
                     }
                     // Discard extra items beyond 2 (helper supports 0-2).
                     for _ in 2..argc {
                         current_depth -= 1;
+                        emit_vsd!(assembler, current_depth);
                     }
                     // build_list_fn(argc, item0, item1) → list
                     assembler.load_const_i_value(int_tmp0, argc as i64);
@@ -860,6 +909,7 @@ impl CodeWriter {
                     );
                     assembler.move_r(stack_base + current_depth, obj_tmp0);
                     current_depth += 1;
+                    emit_vsd!(assembler, current_depth);
                 }
 
                 // Exception handling: residual calls to frame helpers.
@@ -870,6 +920,7 @@ impl CodeWriter {
                     let n = argc.get(op_arg) as i64;
                     if n >= 1 {
                         current_depth -= 1;
+                        emit_vsd!(assembler, current_depth);
                         assembler.move_r(obj_tmp0, stack_base + current_depth);
                         assembler.emit_raise(obj_tmp0);
                     } else {
@@ -882,12 +933,15 @@ impl CodeWriter {
                     // flatten.py: dup = ref_copy TOS → TOS+1
                     assembler.move_r(stack_base + current_depth, stack_base + current_depth - 1);
                     current_depth += 1;
+                    emit_vsd!(assembler, current_depth);
                 }
 
                 Instruction::CheckExcMatch => {
                     current_depth -= 1;
+                    emit_vsd!(assembler, current_depth);
                     assembler.move_r(obj_tmp1, stack_base + current_depth); // match type
                     current_depth -= 1;
+                    emit_vsd!(assembler, current_depth);
                     assembler.move_r(obj_tmp0, stack_base + current_depth); // exception
                     // isinstance check via compare_fn(exc, type, ISINSTANCE_OP)
                     assembler.load_const_i_value(int_tmp0, 10); // isinstance op
@@ -902,6 +956,7 @@ impl CodeWriter {
                     );
                     assembler.move_r(stack_base + current_depth, obj_tmp0);
                     current_depth += 1;
+                    emit_vsd!(assembler, current_depth);
                 }
 
                 Instruction::PopExcept => {
@@ -920,6 +975,7 @@ impl CodeWriter {
                         assembler
                             .move_r(stack_base + current_depth, stack_base + current_depth - 1);
                         current_depth += 1;
+                        emit_vsd!(assembler, current_depth);
                     } else {
                         // COPY(d>1): exception handler pattern only.
                         // Use abort_permanent (BC_ABORT_PERMANENT=14) so it
@@ -942,8 +998,10 @@ impl CodeWriter {
                     let reg_a = u32::from(pair.idx_1()) as u16;
                     let reg_b = u32::from(pair.idx_2()) as u16;
                     current_depth -= 1;
+                    emit_vsd!(assembler, current_depth);
                     assembler.move_r(reg_a, stack_base + current_depth);
                     current_depth -= 1;
+                    emit_vsd!(assembler, current_depth);
                     assembler.move_r(reg_b, stack_base + current_depth);
                     // Shadow write both stores to vable array.
                     if is_portal {
@@ -970,6 +1028,7 @@ impl CodeWriter {
                     // Stack effect: pop 1 + push n = net (n - 1)
                     if current_depth > 0 {
                         current_depth -= 1;
+                        emit_vsd!(assembler, current_depth);
                     }
                     current_depth += n;
                 }
@@ -986,17 +1045,21 @@ impl CodeWriter {
                     // push next item: net +1
                     assembler.abort_permanent();
                     current_depth += 1;
+                    emit_vsd!(assembler, current_depth);
                 }
 
                 Instruction::EndFor => {
                     // pop iterator + last value: net -2
                     assembler.abort_permanent();
                     current_depth = current_depth.saturating_sub(2);
+                    // No emit_vsd: after abort_permanent, depth is
+                    // simulation-only for subsequent compile-time tracking.
                 }
 
                 Instruction::PopIter => {
                     // pop iterator: net -1
                     current_depth = current_depth.saturating_sub(1);
+                    emit_vsd!(assembler, current_depth);
                 }
 
                 // Unsupported instruction: abort_permanent.

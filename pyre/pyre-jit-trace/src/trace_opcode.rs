@@ -239,7 +239,8 @@ impl MIFrame {
             let py_to_jit_pc = unsafe { &*py_to_jit_pc_ptr };
             let all_liveness = &all_liveness_snapshot;
             if let Some(&jit_pc) = py_to_jit_pc.get(live_pc) {
-                let offset = majit_jc.get_live_vars_info_at(jit_pc);
+                let offset =
+                    majit_jc.get_live_vars_info(jit_pc, majit_metainterp::jitcode::BC_LIVE);
                 let length_i = all_liveness[offset] as u32;
                 let length_r = all_liveness[offset + 1] as u32;
                 let _length_f = all_liveness[offset + 2] as u32;

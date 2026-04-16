@@ -103,7 +103,7 @@ pub(crate) const BC_REF_GUARD_VALUE: u8 = 85;
 pub(crate) const BC_FLOAT_GUARD_VALUE: u8 = 86;
 /// blackhole.py:1066 bhimpl_jit_merge_point: portal merge point marker.
 pub(crate) const BC_JIT_MERGE_POINT: u8 = 87;
-pub(crate) const BC_LIVE: u8 = 88;
+pub const BC_LIVE: u8 = 88;
 pub(crate) const BC_CATCH_EXCEPTION: u8 = 89;
 pub(crate) const BC_LAST_EXC_VALUE: u8 = 90;
 /// blackhole.py bhimpl_rvmprof_code: rvmprof enter/leave marker.
