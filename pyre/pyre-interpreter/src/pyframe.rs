@@ -1121,17 +1121,13 @@ impl PyFrame {
         self.escaped = true;
     }
 
-    /// PyPy-compatible `get_builtin`.
+    /// pyframe.py:200-204 get_builtin → space.builtin (same dict every call).
     #[inline]
     pub fn get_builtin(&self) -> PyObjectRef {
         if self.execution_context.is_null() {
             return pyre_object::PY_NULL;
         }
-        let mut builtins = unsafe { (&*self.execution_context).fresh_namespace() };
-        builtins.fix_ptr();
-        pyre_object::dictobject::w_dict_new_with_namespace(
-            Box::into_raw(Box::new(builtins)) as *mut u8
-        )
+        unsafe { (*self.execution_context).get_builtin() }
     }
 
     /// PyPy-compatible `get_f_back`.

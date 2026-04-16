@@ -236,6 +236,9 @@ pub struct ExecutionContext {
     pub w_async_exception_type: PyObjectRef,
     pub actionflag: ActionFlag,
     builtins: PyNamespace,
+    /// Cached dict wrapper over `self.builtins` — pyframe.py:200-204
+    /// `space.builtin` returns the same object every call.
+    builtin_dict_cache: std::cell::Cell<PyObjectRef>,
     pub check_signal_action: Option<PyObjectRef>,
 }
 
@@ -263,6 +266,7 @@ impl ExecutionContext {
             w_async_exception_type: pyre_object::PY_NULL,
             actionflag: ActionFlag::new(),
             builtins: new_builtin_namespace(),
+            builtin_dict_cache: std::cell::Cell::new(pyre_object::PY_NULL),
             check_signal_action: None,
         }
     }
@@ -578,6 +582,20 @@ impl ExecutionContext {
     /// so it can be shared across frames as a raw pointer.
     pub fn fresh_namespace(&self) -> PyNamespace {
         self.builtins.clone()
+    }
+
+    /// pyframe.py:200-204 space.builtin — return the same builtin module dict
+    /// every call. Lazily creates a dict wrapper over `self.builtins` on first
+    /// access and caches it.
+    pub fn get_builtin(&self) -> PyObjectRef {
+        let cached = self.builtin_dict_cache.get();
+        if !cached.is_null() {
+            return cached;
+        }
+        let ns_ptr = &self.builtins as *const PyNamespace as *mut u8;
+        let dict = pyre_object::dictobject::w_dict_new_with_namespace(ns_ptr);
+        self.builtin_dict_cache.set(dict);
+        dict
     }
 }
 
