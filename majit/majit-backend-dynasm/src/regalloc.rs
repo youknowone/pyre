@@ -698,141 +698,20 @@ pub fn get_ebp_ofs(base_ofs: i32, position: usize) -> i32 {
     base_ofs + WORD as i32 * (position as i32 + JITFRAME_FIXED_SIZE as i32)
 }
 
-#[cfg(target_arch = "x86_64")]
-fn core_reg_index(reg: RegLoc) -> Option<usize> {
-    all_core_regs()
-        .iter()
-        .position(|candidate| *candidate == reg)
-}
-
+// arch-specific register configuration is delegated to the per-arch
+// regalloc.rs (mirrors RPython's `rpython/jit/backend/x86/regalloc.py`
+// vs `rpython/jit/backend/aarch64/regalloc.py` split).  The shared
+// file here corresponds to `rpython/jit/backend/llsupport/regalloc.py`
+// and only consumes the configuration via these re-exports.
 #[cfg(target_arch = "aarch64")]
-fn core_reg_index(reg: RegLoc) -> Option<usize> {
-    match reg.value {
-        0..=13 => Some(reg.value as usize),
-        19 => Some(14),
-        20 => Some(15),
-        _ => None,
-    }
-}
-
+use crate::aarch64::regalloc as arch_regalloc;
 #[cfg(target_arch = "x86_64")]
-fn all_core_regs() -> Vec<RegLoc> {
-    vec![
-        ECX, EAX, EDX, EBX, ESI, EDI, R8, R9, R10, R12, R13, R14, R15,
-    ]
-}
+use crate::x86::regalloc as arch_regalloc;
 
-#[cfg(target_arch = "aarch64")]
-fn all_core_regs() -> Vec<RegLoc> {
-    // aarch64/registers.py:14
-    //   all_regs = registers[:14] + [x19, x20] #, x21, x22]
-    //
-    // Activates upstream's commented-out `, x21, x22` extension.
-    // Empirically required (parity audit follow-up): with only x19/x20
-    // the four loop-carried values in fib_loop (n, a, b, i) cannot fit
-    // in callee-save and longest_free_reg's caller-save fallback then
-    // selects an x-reg the inner int_add helper clobbers.  Stays a
-    // strict subset of AAPCS64 x19..x28 and matches the size in
-    // arch.rs `JITFRAME_FIXED_SIZE` plus the prologue/epilogue stp/ldp
-    // pairs in aarch64/assembler.rs `_call_header` / `_call_footer`.
-    vec![
-        RegLoc::new(0, false),
-        RegLoc::new(1, false),
-        RegLoc::new(2, false),
-        RegLoc::new(3, false),
-        RegLoc::new(4, false),
-        RegLoc::new(5, false),
-        RegLoc::new(6, false),
-        RegLoc::new(7, false),
-        RegLoc::new(8, false),
-        RegLoc::new(9, false),
-        RegLoc::new(10, false),
-        RegLoc::new(11, false),
-        RegLoc::new(12, false),
-        RegLoc::new(13, false),
-        RegLoc::new(19, false),
-        RegLoc::new(20, false),
-        RegLoc::new(21, false),
-        RegLoc::new(22, false),
-    ]
-}
-
-#[cfg(target_arch = "x86_64")]
-fn save_around_call_core_regs() -> Vec<RegLoc> {
-    vec![EAX, ECX, EDX, ESI, EDI, R8, R9, R10]
-}
-
-#[cfg(target_arch = "aarch64")]
-fn save_around_call_core_regs() -> Vec<RegLoc> {
-    vec![
-        RegLoc::new(0, false),
-        RegLoc::new(1, false),
-        RegLoc::new(2, false),
-        RegLoc::new(3, false),
-        RegLoc::new(4, false),
-        RegLoc::new(5, false),
-        RegLoc::new(6, false),
-        RegLoc::new(7, false),
-        RegLoc::new(8, false),
-        RegLoc::new(9, false),
-        RegLoc::new(10, false),
-        RegLoc::new(11, false),
-        RegLoc::new(12, false),
-        RegLoc::new(13, false),
-    ]
-}
-
-#[cfg(target_arch = "x86_64")]
-fn all_float_regs() -> Vec<RegLoc> {
-    vec![
-        XMM0, XMM1, XMM2, XMM3, XMM4, XMM5, XMM6, XMM7, XMM8, XMM9, XMM10, XMM11, XMM12, XMM13,
-        XMM14,
-    ]
-}
-
-#[cfg(target_arch = "aarch64")]
-fn all_float_regs() -> Vec<RegLoc> {
-    vec![
-        RegLoc::new(0, true),
-        RegLoc::new(1, true),
-        RegLoc::new(2, true),
-        RegLoc::new(3, true),
-        RegLoc::new(4, true),
-        RegLoc::new(5, true),
-        RegLoc::new(6, true),
-        RegLoc::new(7, true),
-    ]
-}
-
-#[cfg(target_arch = "x86_64")]
-fn frame_reg() -> RegLoc {
-    EBP
-}
-
-#[cfg(target_arch = "aarch64")]
-fn frame_reg() -> RegLoc {
-    RegLoc::new(29, false)
-}
-
-#[cfg(target_arch = "x86_64")]
-fn call_result_gpr() -> RegLoc {
-    EAX
-}
-
-#[cfg(target_arch = "aarch64")]
-fn call_result_gpr() -> RegLoc {
-    RegLoc::new(0, false)
-}
-
-#[cfg(target_arch = "x86_64")]
-fn call_result_fpr() -> RegLoc {
-    XMM0
-}
-
-#[cfg(target_arch = "aarch64")]
-fn call_result_fpr() -> RegLoc {
-    RegLoc::new(0, true)
-}
+use arch_regalloc::{
+    all_core_regs, all_float_regs, call_result_fpr, call_result_gpr, core_reg_index, frame_reg,
+    save_around_call_core_regs,
+};
 
 // ── RegisterManager ────────────────────────────────────────────────
 
