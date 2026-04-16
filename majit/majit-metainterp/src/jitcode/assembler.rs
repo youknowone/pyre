@@ -9,27 +9,24 @@ use majit_backend::JitCellToken;
 use majit_ir::OpCode;
 
 use super::{
-    BC_ABORT, BC_ABORT_PERMANENT, BC_ARRAYLEN_VABLE, BC_BRANCH_REG_ZERO, BC_BRANCH_ZERO,
-    BC_CALL_ASSEMBLER_FLOAT, BC_CALL_ASSEMBLER_INT, BC_CALL_ASSEMBLER_REF, BC_CALL_ASSEMBLER_VOID,
-    BC_CALL_FLOAT, BC_CALL_INT, BC_CALL_LOOPINVARIANT_FLOAT, BC_CALL_LOOPINVARIANT_INT,
-    BC_CALL_LOOPINVARIANT_REF, BC_CALL_LOOPINVARIANT_VOID, BC_CALL_MAY_FORCE_FLOAT,
-    BC_CALL_MAY_FORCE_INT, BC_CALL_MAY_FORCE_REF, BC_CALL_MAY_FORCE_VOID, BC_CALL_PURE_FLOAT,
-    BC_CALL_PURE_INT, BC_CALL_PURE_REF, BC_CALL_REF, BC_CALL_RELEASE_GIL_FLOAT,
-    BC_CALL_RELEASE_GIL_INT, BC_CALL_RELEASE_GIL_REF, BC_CALL_RELEASE_GIL_VOID, BC_CATCH_EXCEPTION,
-    BC_COND_CALL_VALUE_INT, BC_COND_CALL_VALUE_REF, BC_COND_CALL_VOID, BC_COPY_FROM_BOTTOM,
-    BC_DUP_STACK, BC_FLOAT_GUARD_VALUE, BC_GETARRAYITEM_VABLE_F, BC_GETARRAYITEM_VABLE_I,
-    BC_GETARRAYITEM_VABLE_R, BC_GETFIELD_VABLE_F, BC_GETFIELD_VABLE_I, BC_GETFIELD_VABLE_R,
-    BC_HINT_FORCE_VIRTUALIZABLE, BC_INLINE_CALL, BC_INT_GUARD_VALUE, BC_JIT_MERGE_POINT, BC_JUMP,
-    BC_JUMP_TARGET, BC_LAST_EXC_VALUE, BC_LIVE, BC_LOAD_CONST_F, BC_LOAD_CONST_I, BC_LOAD_CONST_R,
-    BC_LOAD_STATE_ARRAY, BC_LOAD_STATE_FIELD, BC_LOAD_STATE_VARRAY, BC_MOVE_F, BC_MOVE_I,
-    BC_MOVE_R, BC_PEEK_I, BC_POP_DISCARD, BC_POP_F, BC_POP_I, BC_POP_R, BC_PUSH_F, BC_PUSH_I,
-    BC_PUSH_R, BC_PUSH_TO, BC_RAISE, BC_RECORD_BINOP_F, BC_RECORD_BINOP_I,
-    BC_RECORD_KNOWN_RESULT_INT, BC_RECORD_KNOWN_RESULT_REF, BC_RECORD_UNARY_F, BC_RECORD_UNARY_I,
-    BC_REF_GUARD_VALUE, BC_REF_RETURN, BC_REQUIRE_STACK, BC_RERAISE, BC_RESIDUAL_CALL_VOID,
-    BC_SET_SELECTED, BC_SETARRAYITEM_VABLE_F, BC_SETARRAYITEM_VABLE_I, BC_SETARRAYITEM_VABLE_R,
-    BC_SETFIELD_VABLE_F, BC_SETFIELD_VABLE_I, BC_SETFIELD_VABLE_R, BC_STORE_DOWN,
-    BC_STORE_STATE_ARRAY, BC_STORE_STATE_FIELD, BC_STORE_STATE_VARRAY, BC_SWAP_STACK, JitArgKind,
-    JitCallArg, JitCallAssemblerTarget, JitCallTarget, JitCode,
+    BC_ABORT, BC_ABORT_PERMANENT, BC_ARRAYLEN_VABLE, BC_BRANCH_REG_ZERO, BC_CALL_ASSEMBLER_FLOAT,
+    BC_CALL_ASSEMBLER_INT, BC_CALL_ASSEMBLER_REF, BC_CALL_ASSEMBLER_VOID, BC_CALL_FLOAT,
+    BC_CALL_INT, BC_CALL_LOOPINVARIANT_FLOAT, BC_CALL_LOOPINVARIANT_INT, BC_CALL_LOOPINVARIANT_REF,
+    BC_CALL_LOOPINVARIANT_VOID, BC_CALL_MAY_FORCE_FLOAT, BC_CALL_MAY_FORCE_INT,
+    BC_CALL_MAY_FORCE_REF, BC_CALL_MAY_FORCE_VOID, BC_CALL_PURE_FLOAT, BC_CALL_PURE_INT,
+    BC_CALL_PURE_REF, BC_CALL_REF, BC_CALL_RELEASE_GIL_FLOAT, BC_CALL_RELEASE_GIL_INT,
+    BC_CALL_RELEASE_GIL_REF, BC_CALL_RELEASE_GIL_VOID, BC_CATCH_EXCEPTION, BC_COND_CALL_VALUE_INT,
+    BC_COND_CALL_VALUE_REF, BC_COND_CALL_VOID, BC_FLOAT_GUARD_VALUE, BC_GETARRAYITEM_VABLE_F,
+    BC_GETARRAYITEM_VABLE_I, BC_GETARRAYITEM_VABLE_R, BC_GETFIELD_VABLE_F, BC_GETFIELD_VABLE_I,
+    BC_GETFIELD_VABLE_R, BC_HINT_FORCE_VIRTUALIZABLE, BC_INLINE_CALL, BC_INT_GUARD_VALUE,
+    BC_JIT_MERGE_POINT, BC_JUMP, BC_JUMP_TARGET, BC_LAST_EXC_VALUE, BC_LIVE, BC_LOAD_CONST_F,
+    BC_LOAD_CONST_I, BC_LOAD_CONST_R, BC_LOAD_STATE_ARRAY, BC_LOAD_STATE_FIELD,
+    BC_LOAD_STATE_VARRAY, BC_MOVE_F, BC_MOVE_I, BC_MOVE_R, BC_RAISE, BC_RECORD_BINOP_F,
+    BC_RECORD_BINOP_I, BC_RECORD_KNOWN_RESULT_INT, BC_RECORD_KNOWN_RESULT_REF, BC_RECORD_UNARY_F,
+    BC_RECORD_UNARY_I, BC_REF_GUARD_VALUE, BC_REF_RETURN, BC_RERAISE, BC_RESIDUAL_CALL_VOID,
+    BC_SETARRAYITEM_VABLE_F, BC_SETARRAYITEM_VABLE_I, BC_SETARRAYITEM_VABLE_R, BC_SETFIELD_VABLE_F,
+    BC_SETFIELD_VABLE_I, BC_SETFIELD_VABLE_R, BC_STORE_STATE_ARRAY, BC_STORE_STATE_FIELD,
+    BC_STORE_STATE_VARRAY, JitArgKind, JitCallArg, JitCallAssemblerTarget, JitCallTarget, JitCode,
 };
 
 #[derive(Default)]
@@ -146,36 +143,6 @@ impl JitCodeBuilder {
         self.push_u8(BC_LOAD_CONST_I);
         self.push_u16(dst);
         self.push_u16(const_idx);
-    }
-
-    pub fn pop_i(&mut self, dst: u16) {
-        self.touch_reg(dst);
-        self.push_u8(BC_POP_I);
-        self.push_u16(dst);
-    }
-
-    pub fn peek_i(&mut self, dst: u16) {
-        self.touch_reg(dst);
-        self.push_u8(BC_PEEK_I);
-        self.push_u16(dst);
-    }
-
-    pub fn push_i(&mut self, src: u16) {
-        self.touch_reg(src);
-        self.push_u8(BC_PUSH_I);
-        self.push_u16(src);
-    }
-
-    pub fn pop_discard(&mut self) {
-        self.push_u8(BC_POP_DISCARD);
-    }
-
-    pub fn dup_stack(&mut self) {
-        self.push_u8(BC_DUP_STACK);
-    }
-
-    pub fn swap_stack(&mut self) {
-        self.push_u8(BC_SWAP_STACK);
     }
 
     // ── State field access (register/tape machines) ──
@@ -349,19 +316,6 @@ impl JitCodeBuilder {
         self.push_u16(src);
     }
 
-    pub fn copy_from_bottom(&mut self, idx_reg: u16) {
-        self.touch_reg(idx_reg);
-        self.push_u8(BC_COPY_FROM_BOTTOM);
-        self.push_u16(idx_reg);
-    }
-
-    /// Pop top of stack and store at `index` (from bottom, 0-based).
-    pub fn store_down(&mut self, idx_reg: u16) {
-        self.touch_reg(idx_reg);
-        self.push_u8(BC_STORE_DOWN);
-        self.push_u16(idx_reg);
-    }
-
     pub fn record_binop_i(&mut self, dst: u16, opcode: OpCode, lhs: u16, rhs: u16) {
         let opcode_idx = self.intern_opcode(opcode);
         self.touch_reg(dst);
@@ -382,15 +336,6 @@ impl JitCodeBuilder {
         self.push_u16(dst);
         self.push_u16(opcode_idx);
         self.push_u16(src);
-    }
-
-    pub fn require_stack(&mut self, required: u16) {
-        self.push_u8(BC_REQUIRE_STACK);
-        self.push_u16(required);
-    }
-
-    pub fn branch_zero(&mut self) {
-        self.push_u8(BC_BRANCH_ZERO);
     }
 
     pub fn new_label(&mut self) -> u16 {
@@ -888,18 +833,6 @@ impl JitCodeBuilder {
         self.push_u16(dst);
     }
 
-    pub fn set_selected(&mut self, const_idx: u16) {
-        self.push_u8(BC_SET_SELECTED);
-        self.push_u16(const_idx);
-    }
-
-    pub fn push_to(&mut self, src_reg: u16, target_stack: u16) {
-        self.touch_reg(src_reg);
-        self.push_u8(BC_PUSH_TO);
-        self.push_u16(src_reg);
-        self.push_u16(target_stack);
-    }
-
     pub fn move_i(&mut self, dst: u16, src: u16) {
         self.touch_reg(dst);
         self.touch_reg(src);
@@ -932,18 +865,6 @@ impl JitCodeBuilder {
         self.push_u8(BC_LOAD_CONST_R);
         self.push_u16(dst);
         self.push_u16(const_idx);
-    }
-
-    pub fn pop_r(&mut self, dst: u16) {
-        self.touch_ref_reg(dst);
-        self.push_u8(BC_POP_R);
-        self.push_u16(dst);
-    }
-
-    pub fn push_r(&mut self, src: u16) {
-        self.touch_ref_reg(src);
-        self.push_u8(BC_PUSH_R);
-        self.push_u16(src);
     }
 
     pub fn move_r(&mut self, dst: u16, src: u16) {
@@ -1030,18 +951,6 @@ impl JitCodeBuilder {
         self.push_u8(BC_LOAD_CONST_F);
         self.push_u16(dst);
         self.push_u16(const_idx);
-    }
-
-    pub fn pop_f(&mut self, dst: u16) {
-        self.touch_float_reg(dst);
-        self.push_u8(BC_POP_F);
-        self.push_u16(dst);
-    }
-
-    pub fn push_f(&mut self, src: u16) {
-        self.touch_float_reg(src);
-        self.push_u8(BC_PUSH_F);
-        self.push_u16(src);
     }
 
     pub fn move_f(&mut self, dst: u16, src: u16) {

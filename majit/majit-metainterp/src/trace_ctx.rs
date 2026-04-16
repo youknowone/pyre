@@ -15,7 +15,6 @@ use crate::call_descr::{
 use crate::constant_pool::ConstantPool;
 use crate::fail_descr::{make_fail_descr, make_fail_descr_typed};
 use crate::jitdriver::JitDriverStaticData;
-use crate::symbolic_stack::SymbolicStack;
 use crate::virtualizable::VirtualizableInfo;
 
 /// Tracing context: wraps Trace + ConstantPool with convenience API.
@@ -2716,61 +2715,6 @@ impl TraceCtx {
     /// Record STRHASH: compute string hash.
     pub fn strhash(&mut self, string: OpRef) -> OpRef {
         self.record_op(OpCode::Strhash, &[string])
-    }
-
-    // ── Convenience methods for common trace patterns ───────────────
-
-    /// Pop two operands, record a binary operation, push the result.
-    ///
-    /// Handles the common stack pattern: `a, b → op(a, b)`.
-    /// Note: pops in stack order (top first), but passes to IR as `[second, first]`
-    /// so that the left operand comes first.
-    pub fn trace_binop(&mut self, stack: &mut SymbolicStack, opcode: OpCode) {
-        let r1 = stack.pop().unwrap();
-        let r2 = stack.pop().unwrap();
-        let result = self.record_op(opcode, &[r2, r1]);
-        stack.push(result);
-    }
-
-    /// Push a constant integer value onto the symbolic stack.
-    pub fn trace_push_const(&mut self, stack: &mut SymbolicStack, value: i64) {
-        let opref = self.const_int(value);
-        stack.push(opref);
-    }
-
-    /// Pop one value and call a void function with it.
-    ///
-    /// Common pattern for output operations (e.g., POPNUM, POPCHAR).
-    pub fn trace_call_void_1(&mut self, stack: &mut SymbolicStack, func_ptr: *const ()) {
-        let value = stack.pop().unwrap();
-        self.call_void(func_ptr, &[value]);
-    }
-
-    /// Pop a boolean-like stack value, record the matching guard, and return
-    /// whether tracing should continue or close the loop.
-    ///
-    /// `branch_taken` is the runtime branch result, while `taken_when_true`
-    /// describes whether the interpreter takes the branch on a non-zero value.
-    pub fn trace_branch_guard(
-        &mut self,
-        stack: &mut SymbolicStack,
-        branch_taken: bool,
-        taken_when_true: bool,
-        num_live: usize,
-        close_loop_on_taken: bool,
-    ) -> TraceAction {
-        let cond = stack.pop().unwrap();
-        let opcode = if branch_taken == taken_when_true {
-            OpCode::GuardTrue
-        } else {
-            OpCode::GuardFalse
-        };
-        self.record_guard(opcode, &[cond], num_live);
-        if branch_taken && close_loop_on_taken {
-            TraceAction::CloseLoop
-        } else {
-            TraceAction::Continue
-        }
     }
 }
 

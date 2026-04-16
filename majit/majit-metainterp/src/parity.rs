@@ -125,7 +125,7 @@ pub fn assert_trace_parity(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{SymbolicStack, TraceAction, TraceCtx, make_fail_descr};
+    use crate::{TraceCtx, make_fail_descr};
     use majit_ir::{OpCode, Type};
     use majit_trace::recorder::Trace;
 
@@ -135,28 +135,6 @@ mod tests {
         let trace = ctx.recorder.get_trace();
         let constants = ctx.constants.into_inner();
         (trace, constants)
-    }
-
-    #[test]
-    fn trace_ctx_binop_matches_parity_case() {
-        let mut recorder = Trace::new();
-        let i0 = recorder.record_input_arg(Type::Int);
-        let i1 = recorder.record_input_arg(Type::Int);
-        let mut ctx = TraceCtx::new(recorder, 0);
-        let mut stack = SymbolicStack::new();
-        stack.push(i0);
-        stack.push(i1);
-
-        ctx.trace_binop(&mut stack, OpCode::IntAdd);
-        let result = stack.pop().unwrap();
-        let (trace, constants) = finish_trace_ctx(ctx, &[result]);
-
-        let case = TraceParityCase {
-            name: "trace_ctx_binop_int_add",
-            rpython_reference: "rpython/jit/metainterp/pyjitpl.py: opimpl_int_add",
-            expected_lines: &["v2 = IntAdd(v0, v1)", "Finish(v2)"],
-        };
-        assert_trace_parity(&trace, &constants, &case);
     }
 
     #[test]
@@ -280,49 +258,6 @@ mod tests {
                 "v4 = IntOr(v2, v3)",
                 "Finish(v4)",
             ],
-        };
-        assert_trace_parity(&trace, &constants, &case);
-    }
-
-    #[test]
-    fn branch_guard_taken_on_false_matches_guard_false_trace() {
-        let mut recorder = Trace::new();
-        let i0 = recorder.record_input_arg(Type::Int);
-        let mut ctx = TraceCtx::new(recorder, 0);
-        let mut stack = SymbolicStack::new();
-        stack.push(i0);
-
-        let action = ctx.trace_branch_guard(&mut stack, true, false, 0, false);
-        assert!(matches!(action, TraceAction::Continue));
-        let (trace, constants) = finish_trace_ctx(ctx, &[]);
-
-        let case = TraceParityCase {
-            name: "branch_guard_taken_on_false",
-            rpython_reference: "rpython/jit/metainterp/pyjitpl.py: generate_guard(rop.GUARD_FALSE)",
-            expected_lines: &["GuardFalse(v0)", "Finish()"],
-        };
-        assert_trace_parity(&trace, &constants, &case);
-    }
-
-    #[test]
-    fn branch_guard_taken_on_true_can_close_loop() {
-        let mut recorder = Trace::new();
-        let i0 = recorder.record_input_arg(Type::Int);
-        let mut ctx = TraceCtx::new(recorder, 0);
-        let mut stack = SymbolicStack::new();
-        stack.push(i0);
-
-        let action = ctx.trace_branch_guard(&mut stack, true, true, 0, true);
-        assert!(matches!(
-            action,
-            TraceAction::CloseLoop | TraceAction::CloseLoopWithArgs { .. }
-        ));
-        let (trace, constants) = finish_trace_ctx(ctx, &[]);
-
-        let case = TraceParityCase {
-            name: "branch_guard_taken_on_true_close_loop",
-            rpython_reference: "rpython/jit/metainterp/pyjitpl.py: generate_guard(rop.GUARD_TRUE)",
-            expected_lines: &["GuardTrue(v0)", "Finish()"],
         };
         assert_trace_parity(&trace, &constants, &case);
     }

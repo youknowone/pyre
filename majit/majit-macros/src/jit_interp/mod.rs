@@ -50,8 +50,6 @@ pub struct JitInterpConfig {
     pub state_type: Ident,
     /// The environment type (e.g., `Program`).
     pub env_type: Ident,
-    /// Multi-storage configuration.
-    pub storage: Option<StorageConfig>,
     /// Method name → IR opcode mapping for binary operations.
     pub binops: Vec<(Ident, Ident)>,
     /// Interpreter I/O function → JIT shim function mapping.
@@ -171,32 +169,6 @@ pub enum StateFieldKind {
     VirtArray(Ident),
 }
 
-/// Multi-storage configuration parsed from `storage = { ... }`.
-pub struct StorageConfig {
-    /// Expression to access the storage pool (e.g., `state.storage`).
-    pub pool: Expr,
-    /// Optional expression yielding the JIT-visible GC storage object reference.
-    ///
-    /// Linked-list interpreters can use this to pass a real GC ref as a red
-    /// variable instead of leaking a raw host pointer into GETFIELD_GC.
-    pub pool_ref: Option<Expr>,
-    /// Optional expression yielding the JIT-visible GC selected-storage ref.
-    pub selected_ref: Option<Expr>,
-    /// Type of the storage pool (e.g., `StoragePool`).
-    pub pool_type: Path,
-    /// Expression to access the selected index (e.g., `state.selected`).
-    pub selector: Expr,
-    /// Optional expression to access the selected stack size red variable.
-    pub stacksize: Option<Expr>,
-    /// Storage indices that cannot be traced (e.g., `[VAL_QUEUE, VAL_PORT]`).
-    pub untraceable: Vec<Path>,
-    /// Function to scan for used storages (e.g., `find_used_storages`).
-    pub scan_fn: Ident,
-    /// Optional method on StoragePool to check JIT compatibility of all values.
-    /// When set, `can_trace` additionally calls `pool.method()`.
-    pub can_trace_guard: Option<Ident>,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CallPolicyKind {
     ResidualVoid,
@@ -269,7 +241,6 @@ impl Parse for JitInterpConfig {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let mut state_type = None;
         let mut env_type = None;
-        let mut storage = None;
         let mut binops = None;
         let mut io_shims = None;
         let mut calls: Vec<(Path, Option<CallPolicyKind>)> = Vec::new();
@@ -288,9 +259,6 @@ impl Parse for JitInterpConfig {
                 }
                 "env" => {
                     env_type = Some(input.parse::<Ident>()?);
-                }
-                "storage" => {
-                    storage = Some(parse_storage_config(input)?);
                 }
                 "binops" => {
                     binops = Some(parse_binop_map(input)?);
@@ -332,17 +300,16 @@ impl Parse for JitInterpConfig {
         let env_type =
             env_type.ok_or_else(|| syn::Error::new(input.span(), "missing `env` parameter"))?;
 
-        if storage.is_none() && state_fields.is_none() {
+        if state_fields.is_none() {
             return Err(syn::Error::new(
                 input.span(),
-                "missing `storage` or `state_fields` parameter",
+                "missing `state_fields` parameter",
             ));
         }
 
         Ok(JitInterpConfig {
             state_type,
             env_type,
-            storage,
             binops: binops.unwrap_or_default(),
             io_shims: io_shims.unwrap_or_default(),
             calls,
@@ -359,96 +326,6 @@ fn parse_expr_list(input: ParseStream) -> syn::Result<Vec<Expr>> {
     bracketed!(content in input);
     let exprs: Punctuated<Expr, Token![,]> = content.parse_terminated(Expr::parse, Token![,])?;
     Ok(exprs.into_iter().collect())
-}
-
-/// Parse `{ pool: EXPR, selector: EXPR, untraceable: [...], scan: IDENT }`.
-fn parse_storage_config(input: ParseStream) -> syn::Result<StorageConfig> {
-    let content;
-    braced!(content in input);
-
-    let mut pool = None;
-    let mut pool_ref = None;
-    let mut selected_ref = None;
-    let mut pool_type = None;
-    let mut selector = None;
-    let mut stacksize = None;
-    let mut untraceable = Vec::new();
-    let mut scan_fn = None;
-    let mut can_trace_guard = None;
-    while !content.is_empty() {
-        let key: Ident = content.parse()?;
-        content.parse::<Token![:]>()?;
-
-        match key.to_string().as_str() {
-            "pool" => {
-                pool = Some(content.parse::<Expr>()?);
-            }
-            "pool_ref" => {
-                pool_ref = Some(content.parse::<Expr>()?);
-            }
-            "selected_ref" => {
-                selected_ref = Some(content.parse::<Expr>()?);
-            }
-            "pool_type" => {
-                pool_type = Some(content.parse::<Path>()?);
-            }
-            "selector" => {
-                selector = Some(content.parse::<Expr>()?);
-            }
-            "stacksize" => {
-                stacksize = Some(content.parse::<Expr>()?);
-            }
-            "untraceable" => {
-                let inner;
-                bracketed!(inner in content);
-                let paths: Punctuated<Path, Token![,]> =
-                    inner.parse_terminated(Path::parse, Token![,])?;
-                untraceable = paths.into_iter().collect();
-            }
-            "scan" => {
-                scan_fn = Some(content.parse::<Ident>()?);
-            }
-            "can_trace_guard" => {
-                can_trace_guard = Some(content.parse::<Ident>()?);
-            }
-            "virtualizable" => {
-                let _: LitBool = content.parse()?;
-                return Err(syn::Error::new(
-                    key.span(),
-                    "storage.virtualizable is no longer supported; use `virtualizable_fields` or `state_fields`",
-                ));
-            }
-            other => {
-                return Err(syn::Error::new(
-                    key.span(),
-                    format!("unknown storage parameter: `{other}`"),
-                ));
-            }
-        }
-
-        let _ = content.parse::<Token![,]>();
-    }
-
-    let pool =
-        pool.ok_or_else(|| syn::Error::new(content.span(), "missing `pool` in storage config"))?;
-    let pool_type = pool_type
-        .ok_or_else(|| syn::Error::new(content.span(), "missing `pool_type` in storage config"))?;
-    let selector = selector
-        .ok_or_else(|| syn::Error::new(content.span(), "missing `selector` in storage config"))?;
-    let scan_fn = scan_fn
-        .ok_or_else(|| syn::Error::new(content.span(), "missing `scan` in storage config"))?;
-
-    Ok(StorageConfig {
-        pool,
-        pool_ref,
-        selected_ref,
-        pool_type,
-        selector,
-        stacksize,
-        untraceable,
-        scan_fn,
-        can_trace_guard,
-    })
 }
 
 /// Parse virtualizable_fields = { var: IDENT, token_offset: PATH, fields: { ... }, arrays: { ... } }
@@ -751,111 +628,32 @@ fn generate_merge_wrapper(config: &JitInterpConfig, func: &ItemFn) -> TokenStrea
     let trace_fn_name = quote::format_ident!("__trace_{}", fn_name);
     let state_type = &config.state_type;
     let env_type = &config.env_type;
-    if config.state_fields.is_some() {
-        quote! {
-            #[cold]
-            #[inline(never)]
-            #[allow(non_snake_case)]
-            fn #merge_fn_name(
-                __driver: &mut majit_metainterp::JitDriver<#state_type>,
-                __env: &#env_type,
-                __pc: usize,
-            ) {
-                __driver.merge_point(|__ctx, __sym| {
-                    use majit_metainterp::JitCodeSym;
-                    if __sym.trace_started && __pc == __sym.loop_header_pc() {
-                        return majit_metainterp::TraceAction::CloseLoop;
+    quote! {
+        #[cold]
+        #[inline(never)]
+        #[allow(non_snake_case)]
+        fn #merge_fn_name(
+            __driver: &mut majit_metainterp::JitDriver<#state_type>,
+            __env: &#env_type,
+            __pc: usize,
+        ) {
+            __driver.merge_point(|__ctx, __sym| {
+                use majit_metainterp::JitCodeSym;
+                if __sym.trace_started && __pc == __sym.loop_header_pc() {
+                    return majit_metainterp::TraceAction::CloseLoop;
+                }
+                let __result = #trace_fn_name(__ctx, __sym, __env, __pc);
+                __sym.trace_started = true;
+                // pyjitpl.py:2843 blackhole_if_trace_too_long — check
+                // AFTER executing the step (RPython _interpret loop order).
+                if __ctx.is_too_long() {
+                    if majit_metainterp::majit_log_enabled() {
+                        eprintln!("[jit] trace too long, aborting");
                     }
-                    let __result = #trace_fn_name(__ctx, __sym, __env, __pc);
-                    __sym.trace_started = true;
-                    // pyjitpl.py:2843 blackhole_if_trace_too_long — check
-                    // AFTER executing the step (RPython _interpret loop order).
-                    if __ctx.is_too_long() {
-                        if majit_metainterp::majit_log_enabled() {
-                            eprintln!("[jit] trace too long, aborting");
-                        }
-                        return majit_metainterp::TraceAction::Abort;
-                    }
-                    __result
-                });
-            }
-        }
-    } else {
-        let storage = config
-            .storage
-            .as_ref()
-            .expect("storage config required in storage mode");
-        let pool_type = &storage.pool_type;
-        let close_selected_check = quote! { && __sel == __sym.header_selected() };
-        quote! {
-            #[cold]
-            #[inline(never)]
-            #[allow(non_snake_case)]
-            fn #merge_fn_name(
-                __driver: &mut majit_metainterp::JitDriver<#state_type>,
-                __env: &#env_type,
-                __pc: usize,
-                __pool: &#pool_type,
-                __sel: usize,
-            ) {
-                __driver.merge_point(|__ctx, __sym| {
-                    use majit_metainterp::JitCodeSym;
-                    if __sym.trace_started
-                        && __pc == __sym.loop_header_pc()
-                        #close_selected_check
-                    {
-                        return majit_metainterp::TraceAction::CloseLoop;
-                    }
-                    // pyjitpl.py:2594: record frame.pc for capture_resumedata.
-                    __ctx.last_traced_pc = __pc;
-                    let __result = #trace_fn_name(__ctx, __sym, __env, __pc, __pool, __sel);
-                    __sym.trace_started = true;
-                    // RPython order: debug_merge_point (force_finish) runs
-                    // INSIDE run_one_step, BEFORE blackhole_if_trace_too_long
-                    // in the _interpret() loop. So segmenting must be checked
-                    // first — if we abort instead of segmenting, the trace is
-                    // lost and prepare_trace_segmenting must start over.
-                    //
-                    // pyjitpl.py:1618 force_finish_trace segmenting (FIRST).
-                    if __ctx.force_finish_trace()
-                        && __ctx.num_ops() > __ctx.trace_limit() * 4 / 5
-                    {
-                        // pyjitpl.py:1626 generate_guard(GUARD_ALWAYS_FAILS)
-                        // + capture_resumedata(frame.pc): fail_args = current
-                        // live boxes + bytecode pc (resume_in_blackhole needs
-                        // pc to resume at the guard point).
-                        let mut __live_args = <#state_type as majit_metainterp::JitState>::collect_jump_args(__sym);
-                        let __pc_opref = __ctx.const_int(__pc as i64);
-                        __live_args.push(__pc_opref);
-                        let __live_types: Vec<majit_ir::Type> = __live_args
-                            .iter()
-                            .map(|opref| __ctx.get_opref_type(*opref).unwrap_or(majit_ir::Type::Int))
-                            .collect();
-                        __ctx.record_guard_typed_with_fail_args(
-                            majit_ir::OpCode::GuardAlwaysFails,
-                            &[],
-                            __live_types,
-                            &__live_args,
-                        );
-                        let __dummy = __ctx.const_int(0);
-                        __ctx.record_finish(__dummy, majit_ir::Type::Int);
-                        if majit_metainterp::majit_log_enabled() {
-                            eprintln!("[jit] force_finish_trace: segmenting at {} ops (limit {})",
-                                __ctx.num_ops(), __ctx.trace_limit());
-                        }
-                        return majit_metainterp::TraceAction::SegmentedLoop;
-                    }
-                    // pyjitpl.py:2843 blackhole_if_trace_too_long (SECOND).
-                    if __ctx.is_too_long() {
-                        if majit_metainterp::majit_log_enabled() {
-                            eprintln!("[jit] trace too long ({} ops, limit {}), aborting",
-                                __ctx.num_ops(), __ctx.trace_limit());
-                        }
-                        return majit_metainterp::TraceAction::Abort;
-                    }
-                    __result
-                });
-            }
+                    return majit_metainterp::TraceAction::Abort;
+                }
+                __result
+            });
         }
     }
 }
@@ -869,21 +667,8 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
     let trace_fn_name = quote::format_ident!("__trace_{}", fn_name);
     let merge_fn_name = quote::format_ident!("__merge_{}", fn_name);
 
-    let pool_expr = config.storage.as_ref().map(|s| &s.pool);
-    let sel_expr = config.storage.as_ref().map(|s| &s.selector);
-
-    let is_state_fields = config.state_fields.is_some();
-
     // Rewrite the function body, replacing marker macros
-    let body = rewrite_body(
-        &func.block,
-        &trace_fn_name,
-        &merge_fn_name,
-        pool_expr,
-        sel_expr,
-        &config.greens,
-        is_state_fields,
-    );
+    let body = rewrite_body(&func.block, &trace_fn_name, &merge_fn_name, &config.greens);
 
     quote! {
         #(#attrs)*
@@ -898,10 +683,7 @@ fn rewrite_body(
     block: &syn::Block,
     trace_fn_name: &Ident,
     merge_fn_name: &Ident,
-    pool_expr: Option<&Expr>,
-    sel_expr: Option<&Expr>,
     default_greens: &[Expr],
-    is_state_fields: bool,
 ) -> TokenStream {
     use syn::visit_mut::VisitMut;
 
@@ -1005,10 +787,7 @@ fn rewrite_body(
     struct MarkerRewriter {
         trace_fn_name: Ident,
         merge_fn_name: Ident,
-        pool_expr: Option<Expr>,
-        sel_expr: Option<Expr>,
         default_greens: Vec<Expr>,
-        is_state_fields: bool,
     }
 
     impl VisitMut for MarkerRewriter {
@@ -1034,19 +813,9 @@ fn rewrite_body(
                     let driver = args.driver.unwrap_or_else(|| syn::parse_quote!(driver));
                     let env = args.env.unwrap_or_else(|| syn::parse_quote!(program));
                     let pc = args.pc.unwrap_or_else(|| syn::parse_quote!(pc));
-                    let new_tokens: TokenStream = if self.is_state_fields {
-                        quote! {
-                            if #driver.is_tracing() {
-                                #merge_fn(&mut #driver, #env, #pc);
-                            }
-                        }
-                    } else {
-                        let pool = self.pool_expr.as_ref().expect("storage pool expr");
-                        let sel = self.sel_expr.as_ref().expect("storage selector expr");
-                        quote! {
-                            if #driver.is_tracing() {
-                                #merge_fn(&mut #driver, #env, #pc, &#pool, #sel);
-                            }
+                    let new_tokens: TokenStream = quote! {
+                        if #driver.is_tracing() {
+                            #merge_fn(&mut #driver, #env, #pc);
                         }
                     };
                     *stmt =
@@ -1064,10 +833,6 @@ fn rewrite_body(
         }
 
         fn visit_block_mut(&mut self, block: &mut syn::Block) {
-            // Clone expressions upfront to avoid borrow conflicts
-            let pool_expr = self.pool_expr.clone();
-            let sel_expr = self.sel_expr.clone();
-
             let mut new_stmts = Vec::new();
             let mut i = 0;
             while i < block.stmts.len() {
@@ -1107,14 +872,7 @@ fn rewrite_body(
                             } else {
                                 args.greens.clone()
                             };
-                            let is_sf = self.is_state_fields;
-                            let stacksize_update: TokenStream = if is_sf {
-                                quote! { #stacksize_expr = 0i32; }
-                            } else {
-                                let pool = pool_expr.as_ref().expect("storage pool expr");
-                                let sel = sel_expr.as_ref().expect("storage selector expr");
-                                quote! { #stacksize_expr = #pool.get(#sel).len() as i32; }
-                            };
+                            let stacksize_update: TokenStream = quote! { #stacksize_expr = 0i32; };
                             // compile.py:711 parity: back_edge returns
                             // Some(resume_pc) on guard failure (blackhole
                             // resume) or FINISH (loop header re-entry).
@@ -1159,10 +917,7 @@ fn rewrite_body(
     let mut rewriter = MarkerRewriter {
         trace_fn_name: trace_fn_name.clone(),
         merge_fn_name: merge_fn_name.clone(),
-        pool_expr: pool_expr.cloned(),
-        sel_expr: sel_expr.cloned(),
         default_greens: default_greens.to_vec(),
-        is_state_fields,
     };
     rewriter.visit_block_mut(&mut cloned_block);
 
@@ -1228,40 +983,11 @@ mod tests {
         }
     }
 
-    struct StorageWrapper(StorageConfig);
-    impl Parse for StorageWrapper {
-        fn parse(input: ParseStream) -> syn::Result<Self> {
-            Ok(Self(parse_storage_config(input)?))
-        }
-    }
-
     struct VirtualizableWrapper(VirtualizableDecl);
     impl Parse for VirtualizableWrapper {
         fn parse(input: ParseStream) -> syn::Result<Self> {
             Ok(Self(parse_virtualizable_decl(input)?))
         }
-    }
-
-    #[test]
-    fn parse_storage_config_rejects_legacy_virtualizable_flag() {
-        let tokens: proc_macro2::TokenStream = parse_quote! {
-            {
-                pool: state.storage,
-                pool_type: StoragePool,
-                selector: state.selected,
-                untraceable: [],
-                scan: find_used_storages,
-                virtualizable: true,
-            }
-        };
-        let err = match syn::parse2::<StorageWrapper>(tokens) {
-            Ok(_) => panic!("expected legacy storage.virtualizable to be rejected"),
-            Err(err) => err,
-        };
-        assert!(
-            err.to_string().contains("storage.virtualizable"),
-            "unexpected error: {err}",
-        );
     }
 
     #[test]

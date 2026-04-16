@@ -11,8 +11,8 @@
 pub mod codegen;
 
 pub use codegen::{
-    BinopMapping, CodegenValueKind, IoShim, JitDriverConfig, StorageConfig,
-    VirtualizableCodegenConfig, generate_jitcode,
+    BinopMapping, CodegenValueKind, IoShim, JitDriverConfig, VirtualizableCodegenConfig,
+    generate_jitcode,
 };
 
 use crate::assembler::Assembler;

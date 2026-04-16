@@ -795,25 +795,22 @@ fn blackhole_with_recovery_layout(
 // ============================================================================
 
 use crate::jitcode::{
-    self, BC_ABORT, BC_ABORT_PERMANENT, BC_ARRAYLEN_VABLE, BC_BRANCH_REG_ZERO, BC_BRANCH_ZERO,
+    self, BC_ABORT, BC_ABORT_PERMANENT, BC_ARRAYLEN_VABLE, BC_BRANCH_REG_ZERO,
     BC_CALL_ASSEMBLER_FLOAT, BC_CALL_ASSEMBLER_INT, BC_CALL_ASSEMBLER_REF, BC_CALL_ASSEMBLER_VOID,
     BC_CALL_FLOAT, BC_CALL_INT, BC_CALL_LOOPINVARIANT_FLOAT, BC_CALL_LOOPINVARIANT_INT,
     BC_CALL_LOOPINVARIANT_REF, BC_CALL_LOOPINVARIANT_VOID, BC_CALL_MAY_FORCE_FLOAT,
     BC_CALL_MAY_FORCE_INT, BC_CALL_MAY_FORCE_REF, BC_CALL_MAY_FORCE_VOID, BC_CALL_PURE_FLOAT,
     BC_CALL_PURE_INT, BC_CALL_PURE_REF, BC_CALL_REF, BC_CALL_RELEASE_GIL_FLOAT,
     BC_CALL_RELEASE_GIL_INT, BC_CALL_RELEASE_GIL_REF, BC_CALL_RELEASE_GIL_VOID, BC_CATCH_EXCEPTION,
-    BC_COPY_FROM_BOTTOM, BC_DUP_STACK, BC_GETARRAYITEM_VABLE_F, BC_GETARRAYITEM_VABLE_I,
-    BC_GETARRAYITEM_VABLE_R, BC_GETFIELD_VABLE_F, BC_GETFIELD_VABLE_I, BC_GETFIELD_VABLE_R,
-    BC_HINT_FORCE_VIRTUALIZABLE, BC_INLINE_CALL, BC_JIT_MERGE_POINT, BC_JUMP, BC_JUMP_TARGET,
-    BC_LAST_EXC_VALUE, BC_LIVE, BC_LOAD_CONST_F, BC_LOAD_CONST_I, BC_LOAD_CONST_R,
-    BC_LOAD_STATE_ARRAY, BC_LOAD_STATE_FIELD, BC_LOAD_STATE_VARRAY, BC_MOVE_F, BC_MOVE_I,
-    BC_MOVE_R, BC_PEEK_I, BC_POP_DISCARD, BC_POP_F, BC_POP_I, BC_POP_R, BC_PUSH_F, BC_PUSH_I,
-    BC_PUSH_R, BC_PUSH_TO, BC_RAISE, BC_RECORD_BINOP_F, BC_RECORD_BINOP_I, BC_RECORD_UNARY_F,
-    BC_RECORD_UNARY_I, BC_REF_RETURN, BC_REQUIRE_STACK, BC_RERAISE, BC_RESIDUAL_CALL_VOID,
-    BC_RVMPROF_CODE, BC_SET_SELECTED, BC_SETARRAYITEM_VABLE_F, BC_SETARRAYITEM_VABLE_I,
+    BC_GETARRAYITEM_VABLE_F, BC_GETARRAYITEM_VABLE_I, BC_GETARRAYITEM_VABLE_R, BC_GETFIELD_VABLE_F,
+    BC_GETFIELD_VABLE_I, BC_GETFIELD_VABLE_R, BC_HINT_FORCE_VIRTUALIZABLE, BC_INLINE_CALL,
+    BC_JIT_MERGE_POINT, BC_JUMP, BC_JUMP_TARGET, BC_LAST_EXC_VALUE, BC_LIVE, BC_LOAD_CONST_F,
+    BC_LOAD_CONST_I, BC_LOAD_CONST_R, BC_LOAD_STATE_ARRAY, BC_LOAD_STATE_FIELD,
+    BC_LOAD_STATE_VARRAY, BC_MOVE_F, BC_MOVE_I, BC_MOVE_R, BC_RAISE, BC_RECORD_BINOP_F,
+    BC_RECORD_BINOP_I, BC_RECORD_UNARY_F, BC_RECORD_UNARY_I, BC_REF_RETURN, BC_RERAISE,
+    BC_RESIDUAL_CALL_VOID, BC_RVMPROF_CODE, BC_SETARRAYITEM_VABLE_F, BC_SETARRAYITEM_VABLE_I,
     BC_SETARRAYITEM_VABLE_R, BC_SETFIELD_VABLE_F, BC_SETFIELD_VABLE_I, BC_SETFIELD_VABLE_R,
-    BC_STORE_DOWN, BC_STORE_STATE_ARRAY, BC_STORE_STATE_FIELD, BC_STORE_STATE_VARRAY,
-    BC_SWAP_STACK, JitArgKind, JitCode,
+    BC_STORE_STATE_ARRAY, BC_STORE_STATE_FIELD, BC_STORE_STATE_VARRAY, JitArgKind, JitCode,
 };
 use crate::pyjitpl::{MIFrame, MIFrameStack};
 use crate::pyjitpl::{
@@ -928,12 +925,6 @@ pub struct BlackholeInterpreter {
     pub nextblackholeinterp: Option<Box<BlackholeInterpreter>>,
     /// Return type of this frame.
     pub return_type: BhReturnType,
-    /// Runtime stacks indexed by `selected`.
-    /// RPython: BlackholeInterpreter has a single value stack.
-    /// pyre uses multiple stacks for selected storage (valuestackdepth).
-    runtime_stacks: Vec<Vec<i64>>,
-    /// Current selected storage index.
-    current_selected: usize,
     /// True when run() hit BC_ABORT (unsupported bytecode). Callers
     /// must not treat abort as DoneWithThisFrame — side effects from
     /// partial execution have corrupted state.
@@ -1029,8 +1020,6 @@ impl BlackholeInterpreter {
             position: 0,
             nextblackholeinterp: None,
             return_type: BhReturnType::Void,
-            runtime_stacks: Vec::new(),
-            current_selected: 0,
             aborted: false,
             got_exception: false,
             last_opcode_position: 0,
@@ -1451,43 +1440,6 @@ impl BlackholeInterpreter {
         self.position >= self.jitcode.code.len()
     }
 
-    // -- Runtime stack access --
-
-    fn ensure_stack(&mut self, selected: usize) {
-        if selected >= self.runtime_stacks.len() {
-            self.runtime_stacks.resize_with(selected + 1, Vec::new);
-        }
-    }
-
-    fn runtime_stack_mut(&mut self, selected: usize) -> &mut Vec<i64> {
-        self.ensure_stack(selected);
-        &mut self.runtime_stacks[selected]
-    }
-
-    fn runtime_stack_pop(&mut self, selected: usize) -> i64 {
-        if selected < self.runtime_stacks.len() {
-            self.runtime_stacks[selected].pop().unwrap_or(0)
-        } else {
-            0
-        }
-    }
-
-    pub fn runtime_stack_push(&mut self, selected: usize, value: i64) {
-        self.ensure_stack(selected);
-        self.runtime_stacks[selected].push(value);
-    }
-
-    fn runtime_stack_peek(&self, selected: usize, pos: usize) -> i64 {
-        self.runtime_stacks
-            .get(selected)
-            .and_then(|s| s.get(pos).copied())
-            .unwrap_or(0)
-    }
-
-    fn runtime_stack_len(&self, selected: usize) -> usize {
-        self.runtime_stacks.get(selected).map_or(0, |s| s.len())
-    }
-
     /// blackhole.py:1600-1603 bhimpl_rvmprof_code.
     pub fn bhimpl_rvmprof_code(&self, leaving: i64, unique_id: i64) {
         jit_rvmprof_code(leaving, unique_id);
@@ -1547,16 +1499,6 @@ impl BlackholeInterpreter {
         }
     }
 
-    /// Drain the runtime stack for the given selected index, returning
-    /// all values in order (bottom → top).
-    pub fn runtime_stack_drain(&mut self, selected: usize) -> Vec<i64> {
-        if selected < self.runtime_stacks.len() {
-            std::mem::take(&mut self.runtime_stacks[selected])
-        } else {
-            Vec::new()
-        }
-    }
-
     // -- Call argument reading --
 
     fn read_call_arg(&self, kind: JitArgKind, reg: u16) -> i64 {
@@ -1602,14 +1544,12 @@ impl BlackholeInterpreter {
             self.last_opcode_position = pos_before;
             let opcode = self.next_u8();
             if trace {
-                let stack_len = self.runtime_stack_len(0);
                 eprintln!(
-                    "[bh-trace] pos={} op={} reg0={} reg1={} stack_len={}",
+                    "[bh-trace] pos={} op={} reg0={} reg1={}",
                     pos_before,
                     opcode,
                     self.registers_i.get(0).copied().unwrap_or(-1),
                     self.registers_i.get(1).copied().unwrap_or(-1),
-                    stack_len
                 );
             }
             match self.dispatch_one(opcode) {
@@ -1707,90 +1647,6 @@ impl BlackholeInterpreter {
                 let src = self.next_u16() as usize;
                 self.registers_f[dst] = self.registers_f[src];
             }
-            BC_POP_I => {
-                let dst = self.next_u16() as usize;
-                let selected = self.current_selected;
-                self.registers_i[dst] = self.runtime_stack_pop(selected);
-            }
-            BC_POP_R => {
-                let dst = self.next_u16() as usize;
-                let selected = self.current_selected;
-                self.registers_r[dst] = self.runtime_stack_pop(selected);
-            }
-            BC_POP_F => {
-                let dst = self.next_u16() as usize;
-                let selected = self.current_selected;
-                self.registers_f[dst] = self.runtime_stack_pop(selected);
-            }
-            BC_PUSH_I => {
-                let src = self.next_u16() as usize;
-                let value = self.registers_i[src];
-                let selected = self.current_selected;
-                self.runtime_stack_push(selected, value);
-            }
-            BC_PUSH_R => {
-                let src = self.next_u16() as usize;
-                let value = self.registers_r[src];
-                let selected = self.current_selected;
-                self.runtime_stack_push(selected, value);
-            }
-            BC_PUSH_F => {
-                let src = self.next_u16() as usize;
-                let value = self.registers_f[src];
-                let selected = self.current_selected;
-                self.runtime_stack_push(selected, value);
-            }
-            BC_PUSH_TO => {
-                let target_selected = self.next_u16() as usize;
-                let src = self.next_u16() as usize;
-                let value = self.registers_i[src];
-                self.runtime_stack_push(target_selected, value);
-            }
-            BC_PEEK_I => {
-                let dst = self.next_u16() as usize;
-                let pos = self.next_u16() as usize;
-                let selected = self.current_selected;
-                self.registers_i[dst] = self.runtime_stack_peek(selected, pos);
-            }
-            BC_POP_DISCARD => {
-                let selected = self.current_selected;
-                self.runtime_stack_pop(selected);
-            }
-            BC_DUP_STACK => {
-                let selected = self.current_selected;
-                let top = self.runtime_stack_pop(selected);
-                self.runtime_stack_push(selected, top);
-                self.runtime_stack_push(selected, top);
-            }
-            BC_SWAP_STACK => {
-                let selected = self.current_selected;
-                let a = self.runtime_stack_pop(selected);
-                let b = self.runtime_stack_pop(selected);
-                self.runtime_stack_push(selected, a);
-                self.runtime_stack_push(selected, b);
-            }
-            BC_COPY_FROM_BOTTOM => {
-                let selected = self.current_selected;
-                let pos = self.next_u16() as usize;
-                let value = self.runtime_stack_peek(selected, pos);
-                self.runtime_stack_push(selected, value);
-            }
-            BC_STORE_DOWN => {
-                let selected = self.current_selected;
-                let pos = self.next_u16() as usize;
-                let value = self.runtime_stack_pop(selected);
-                if selected < self.runtime_stacks.len() {
-                    let stack = &mut self.runtime_stacks[selected];
-                    if pos < stack.len() {
-                        stack[pos] = value;
-                    }
-                }
-            }
-            BC_REQUIRE_STACK => {
-                // No-op in blackhole: stack depth requirements only
-                // matter for tracing. Skip the operand.
-                let _required = self.next_u16();
-            }
             BC_RECORD_BINOP_I => {
                 let dst = self.next_u16() as usize;
                 let opcode_idx = self.next_u16() as usize;
@@ -1844,20 +1700,6 @@ impl BlackholeInterpreter {
                 let opcode = self.jitcode.opcodes[opcode_idx];
                 let value = self.registers_f[src_idx];
                 self.registers_f[dst] = eval_unary_f(opcode, value);
-            }
-            BC_BRANCH_ZERO => {
-                // Pops from runtime stack. In blackhole, follow the
-                // branch if value is zero (skip to next jump_target).
-                let selected = self.current_selected;
-                let cond = self.runtime_stack_pop(selected);
-                if cond == 0 {
-                    // Branch taken: scan forward for the next BC_JUMP_TARGET
-                    // This is a simplification; in practice the label map
-                    // would provide the target offset.
-                    // Skip the branch body (fall through if non-zero).
-                }
-                // In blackhole mode, BC_BRANCH_ZERO without explicit target
-                // needs the runtime label map. For now, fall through.
             }
             BC_BRANCH_REG_ZERO => {
                 let cond_idx = self.next_u16() as usize;
@@ -1918,9 +1760,6 @@ impl BlackholeInterpreter {
             }
             BC_JUMP_TARGET => {
                 // Non-portal loop header marker (helper jitcodes only).
-            }
-            BC_SET_SELECTED => {
-                self.current_selected = self.next_u16() as usize;
             }
             BC_REF_RETURN => {
                 // RPython bhimpl_ref_return: return ref value to caller.
@@ -2002,9 +1841,6 @@ impl BlackholeInterpreter {
                 }
 
                 // Copy runtime stacks to callee
-                callee.runtime_stacks = self.runtime_stacks.clone();
-                callee.current_selected = self.current_selected;
-
                 // Execute callee
                 let _ = callee.run();
 
@@ -2024,10 +1860,6 @@ impl BlackholeInterpreter {
                     self.got_exception = true;
                     return Err(DispatchError::LeaveFrame);
                 }
-
-                // Copy runtime stacks back
-                self.runtime_stacks = callee.runtime_stacks;
-                self.current_selected = callee.current_selected;
 
                 // Copy return values
                 if let Some((callee_src, caller_dst)) = return_i {
@@ -2941,7 +2773,6 @@ impl BlackholeInterpBuilder {
         interp.cleanup_registers();
         // Pool management (RPython uses linked-list via .back; Rust uses Vec)
         interp.nextblackholeinterp = None;
-        interp.runtime_stacks.clear();
         interp.aborted = false;
         interp.got_exception = false;
         interp.virtualizable_stack_base = 0;

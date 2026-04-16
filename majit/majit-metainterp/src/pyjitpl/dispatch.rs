@@ -10,75 +10,33 @@ use majit_ir::{OpCode, OpRef};
 
 use super::{MIFrame, MIFrameStack};
 use crate::jitcode::{
-    BC_ABORT, BC_ABORT_PERMANENT, BC_ARRAYLEN_VABLE, BC_BRANCH_REG_ZERO, BC_BRANCH_ZERO,
-    BC_CALL_ASSEMBLER_FLOAT, BC_CALL_ASSEMBLER_INT, BC_CALL_ASSEMBLER_REF, BC_CALL_ASSEMBLER_VOID,
-    BC_CALL_FLOAT, BC_CALL_INT, BC_CALL_LOOPINVARIANT_FLOAT, BC_CALL_LOOPINVARIANT_INT,
-    BC_CALL_LOOPINVARIANT_REF, BC_CALL_LOOPINVARIANT_VOID, BC_CALL_MAY_FORCE_FLOAT,
-    BC_CALL_MAY_FORCE_INT, BC_CALL_MAY_FORCE_REF, BC_CALL_MAY_FORCE_VOID, BC_CALL_PURE_FLOAT,
-    BC_CALL_PURE_INT, BC_CALL_PURE_REF, BC_CALL_REF, BC_CALL_RELEASE_GIL_FLOAT,
-    BC_CALL_RELEASE_GIL_INT, BC_CALL_RELEASE_GIL_REF, BC_CALL_RELEASE_GIL_VOID,
-    BC_COND_CALL_VALUE_INT, BC_COND_CALL_VALUE_REF, BC_COND_CALL_VOID, BC_COPY_FROM_BOTTOM,
-    BC_DUP_STACK, BC_FLOAT_GUARD_VALUE, BC_GETARRAYITEM_VABLE_F, BC_GETARRAYITEM_VABLE_I,
-    BC_GETARRAYITEM_VABLE_R, BC_GETFIELD_VABLE_F, BC_GETFIELD_VABLE_I, BC_GETFIELD_VABLE_R,
-    BC_HINT_FORCE_VIRTUALIZABLE, BC_INLINE_CALL, BC_INT_GUARD_VALUE, BC_JIT_MERGE_POINT, BC_JUMP,
-    BC_JUMP_TARGET, BC_LOAD_CONST_F, BC_LOAD_CONST_I, BC_LOAD_CONST_R, BC_LOAD_STATE_ARRAY,
-    BC_LOAD_STATE_FIELD, BC_LOAD_STATE_VARRAY, BC_MOVE_F, BC_MOVE_I, BC_MOVE_R, BC_PEEK_I,
-    BC_POP_DISCARD, BC_POP_F, BC_POP_I, BC_POP_R, BC_PUSH_F, BC_PUSH_I, BC_PUSH_R, BC_PUSH_TO,
-    BC_RECORD_BINOP_F, BC_RECORD_BINOP_I, BC_RECORD_KNOWN_RESULT_INT, BC_RECORD_KNOWN_RESULT_REF,
-    BC_RECORD_UNARY_F, BC_RECORD_UNARY_I, BC_REF_GUARD_VALUE, BC_REQUIRE_STACK,
-    BC_RESIDUAL_CALL_VOID, BC_SET_SELECTED, BC_SETARRAYITEM_VABLE_F, BC_SETARRAYITEM_VABLE_I,
+    BC_ABORT, BC_ABORT_PERMANENT, BC_ARRAYLEN_VABLE, BC_BRANCH_REG_ZERO, BC_CALL_ASSEMBLER_FLOAT,
+    BC_CALL_ASSEMBLER_INT, BC_CALL_ASSEMBLER_REF, BC_CALL_ASSEMBLER_VOID, BC_CALL_FLOAT,
+    BC_CALL_INT, BC_CALL_LOOPINVARIANT_FLOAT, BC_CALL_LOOPINVARIANT_INT, BC_CALL_LOOPINVARIANT_REF,
+    BC_CALL_LOOPINVARIANT_VOID, BC_CALL_MAY_FORCE_FLOAT, BC_CALL_MAY_FORCE_INT,
+    BC_CALL_MAY_FORCE_REF, BC_CALL_MAY_FORCE_VOID, BC_CALL_PURE_FLOAT, BC_CALL_PURE_INT,
+    BC_CALL_PURE_REF, BC_CALL_REF, BC_CALL_RELEASE_GIL_FLOAT, BC_CALL_RELEASE_GIL_INT,
+    BC_CALL_RELEASE_GIL_REF, BC_CALL_RELEASE_GIL_VOID, BC_COND_CALL_VALUE_INT,
+    BC_COND_CALL_VALUE_REF, BC_COND_CALL_VOID, BC_FLOAT_GUARD_VALUE, BC_GETARRAYITEM_VABLE_F,
+    BC_GETARRAYITEM_VABLE_I, BC_GETARRAYITEM_VABLE_R, BC_GETFIELD_VABLE_F, BC_GETFIELD_VABLE_I,
+    BC_GETFIELD_VABLE_R, BC_HINT_FORCE_VIRTUALIZABLE, BC_INLINE_CALL, BC_INT_GUARD_VALUE,
+    BC_JIT_MERGE_POINT, BC_JUMP, BC_JUMP_TARGET, BC_LOAD_CONST_F, BC_LOAD_CONST_I, BC_LOAD_CONST_R,
+    BC_LOAD_STATE_ARRAY, BC_LOAD_STATE_FIELD, BC_LOAD_STATE_VARRAY, BC_MOVE_F, BC_MOVE_I,
+    BC_MOVE_R, BC_RECORD_BINOP_F, BC_RECORD_BINOP_I, BC_RECORD_KNOWN_RESULT_INT,
+    BC_RECORD_KNOWN_RESULT_REF, BC_RECORD_UNARY_F, BC_RECORD_UNARY_I, BC_REF_GUARD_VALUE,
+    BC_RESIDUAL_CALL_VOID, BC_SETARRAYITEM_VABLE_F, BC_SETARRAYITEM_VABLE_I,
     BC_SETARRAYITEM_VABLE_R, BC_SETFIELD_VABLE_F, BC_SETFIELD_VABLE_I, BC_SETFIELD_VABLE_R,
-    BC_STORE_DOWN, BC_STORE_STATE_ARRAY, BC_STORE_STATE_FIELD, BC_STORE_STATE_VARRAY,
-    BC_SWAP_STACK, JitArgKind, JitCallArg, JitCallTarget, JitCode, MAX_HOST_CALL_ARITY,
+    BC_STORE_STATE_ARRAY, BC_STORE_STATE_FIELD, BC_STORE_STATE_VARRAY, JitArgKind, JitCallArg,
+    JitCallTarget, JitCode, MAX_HOST_CALL_ARITY,
 };
-use crate::{SymbolicStack, TraceAction, TraceCtx};
+use crate::{TraceAction, TraceCtx};
 
 pub trait JitCodeSym {
-    fn current_selected(&self) -> usize;
-    fn current_selected_value(&self) -> Option<OpRef>;
-    fn current_selected_ref(&self) -> Option<OpRef> {
-        None
-    }
-    fn current_stacksize_value(&self) -> Option<OpRef> {
-        None
-    }
-    fn set_current_selected(&mut self, selected: usize);
-    fn set_current_selected_value(&mut self, selected: usize, value: OpRef);
-    fn set_current_selected_ref(&mut self, _selected: usize, _value: OpRef) {}
-    fn set_current_stacksize_value(&mut self, _value: OpRef) {}
-    fn guard_selected(&self) -> usize {
-        self.current_selected()
-    }
-    fn guard_selected_value(&self) -> Option<OpRef> {
-        self.current_selected_value()
-    }
-    fn selected_in_fail_args_prefix(&self) -> bool {
-        false
-    }
-    fn close_requires_header_selected(&self) -> bool {
-        true
-    }
     fn begin_portal_op(&mut self, _pc: usize) {}
     fn commit_portal_op(&mut self) {}
     fn abort_portal_op(&mut self) {}
-    fn stack(&self, selected: usize) -> Option<&SymbolicStack>;
-    fn stack_mut(&mut self, selected: usize) -> Option<&mut SymbolicStack>;
     fn total_slots(&self) -> usize;
     fn loop_header_pc(&self) -> usize;
-    /// RPython parity: initial_selected at the trace header.
-    /// Used by BC_JUMP_TARGET to check green key match before CloseLoop.
-    fn header_selected(&self) -> usize {
-        self.current_selected()
-    }
-    /// RPython parity: jit.promote(storage).
-    /// Emit GuardValue on pool_ref to make it a known constant.
-    fn promote_pool_ref(&mut self, _ctx: &mut TraceCtx, _runtime_value: i64) {}
-    /// tl.py:88  promote(stack.stackpos).
-    /// Emit GuardValue on the stacksize inputarg to make it a compile-time constant.
-    /// Default no-op; storage modes that track stackpos override this.
-    fn promote_stacksize(&mut self, _ctx: &mut TraceCtx, _runtime_value: i64) {}
-    /// Create a symbolic stack for a storage not in the initial layout.
-    fn ensure_stack(&mut self, selected: usize, offset: usize, len: usize);
     /// Full interpreter-visible state to materialize on guard failure.
     ///
     /// When `None`, guards fall back to the legacy auto-generated fail args.
@@ -87,11 +45,6 @@ pub trait JitCodeSym {
     /// Guard-failure state materialization that may record extra IR.
     fn fail_args_with_ctx(&mut self, _ctx: &mut TraceCtx) -> Option<Vec<OpRef>> {
         self.fail_args()
-    }
-
-    /// Current stack lengths in the same storage order as `fail_args()`.
-    fn fail_storage_lengths(&self) -> Option<Vec<usize>> {
-        None
     }
 
     /// Types of fail_args values. When Some, used instead of default all-Int.
@@ -154,58 +107,25 @@ pub trait JitCodeSym {
 }
 
 pub trait JitCodeRuntime {
-    fn stack_len(&self, selected: usize) -> usize;
-    fn stack_peek(&self, selected: usize, pos: usize) -> i64;
     fn label_at(&self, pc: usize) -> usize;
-    /// RPython: jit.promote(storage) — runtime address of the storage pool.
-    fn pool_ptr(&self) -> Option<i64> {
-        None
-    }
 }
 
-pub struct ClosureRuntime<FLen, FPeek, FLabel> {
-    stack_len: FLen,
-    stack_peek: FPeek,
+pub struct ClosureRuntime<FLabel> {
     label_at: FLabel,
-    pool_ptr_val: Option<i64>,
 }
 
-impl<FLen, FPeek, FLabel> ClosureRuntime<FLen, FPeek, FLabel> {
-    pub fn new(stack_len: FLen, stack_peek: FPeek, label_at: FLabel) -> Self {
-        Self {
-            stack_len,
-            stack_peek,
-            label_at,
-            pool_ptr_val: None,
-        }
-    }
-
-    pub fn with_pool_ptr(mut self, pool_ptr: i64) -> Self {
-        self.pool_ptr_val = Some(pool_ptr);
-        self
+impl<FLabel> ClosureRuntime<FLabel> {
+    pub fn new(label_at: FLabel) -> Self {
+        Self { label_at }
     }
 }
 
-impl<FLen, FPeek, FLabel> JitCodeRuntime for ClosureRuntime<FLen, FPeek, FLabel>
+impl<FLabel> JitCodeRuntime for ClosureRuntime<FLabel>
 where
-    FLen: Fn(usize) -> usize,
-    FPeek: Fn(usize, usize) -> i64,
     FLabel: Fn(usize) -> usize,
 {
-    fn stack_len(&self, selected: usize) -> usize {
-        (self.stack_len)(selected)
-    }
-
-    fn stack_peek(&self, selected: usize, pos: usize) -> i64 {
-        (self.stack_peek)(selected, pos)
-    }
-
     fn label_at(&self, pc: usize) -> usize {
         (self.label_at)(pc)
-    }
-
-    fn pool_ptr(&self) -> Option<i64> {
-        self.pool_ptr_val
     }
 }
 
@@ -221,7 +141,6 @@ where
 /// points (`trace_jitcode`, test fixtures) take that path.
 pub struct JitCodeMachine<'mi, S, R> {
     frames: &'mi mut MIFrameStack,
-    runtime_stacks: HashMap<usize, Vec<i64>>,
     marker: PhantomData<(S, R)>,
 }
 
@@ -329,22 +248,6 @@ where
     ) {
         if let Some(mut fail_args) = sym.fail_args_with_ctx(ctx) {
             let mut fail_types = sym.fail_args_types();
-            if let Some(lengths) = sym.fail_storage_lengths() {
-                let n = lengths.len();
-                fail_args.extend(lengths.into_iter().map(|len| ctx.const_int(len as i64)));
-                if let Some(ref mut types) = fail_types {
-                    types.extend(std::iter::repeat(majit_ir::Type::Int).take(n));
-                }
-            }
-            if !sym.selected_in_fail_args_prefix() {
-                let selected = sym
-                    .guard_selected_value()
-                    .unwrap_or_else(|| ctx.const_int(sym.guard_selected() as i64));
-                fail_args.push(selected);
-                if let Some(ref mut types) = fail_types {
-                    types.push(majit_ir::Type::Int);
-                }
-            }
             fail_args.extend_from_slice(extra_fail_args);
             if let Some(ref mut types) = fail_types {
                 types.extend(std::iter::repeat(majit_ir::Type::Int).take(extra_fail_args.len()));
@@ -399,18 +302,11 @@ where
     ) -> Self {
         Self {
             frames,
-            runtime_stacks: HashMap::new(),
             marker: PhantomData,
         }
     }
 
     pub fn run_to_end(&mut self, ctx: &mut TraceCtx, sym: &mut S, runtime: &R) -> TraceAction {
-        // RPython parity: jit.promote(storage) at mainloop entry.
-        // Emit GuardValue on pool_ref before any storage access so
-        // subsequent immutable GetfieldGcR(pool, descr) constant-folds.
-        if let Some(pool_val) = runtime.pool_ptr() {
-            sym.promote_pool_ref(ctx, pool_val);
-        }
         let portal_pc = self.frames.current_mut().pc;
         sym.begin_portal_op(portal_pc);
         while !self.frames.is_empty() {
@@ -525,96 +421,6 @@ where
                     (dst, value)
                 };
                 self.set_int_reg(dst, Some(ctx.const_int(value)), Some(value));
-            }
-            BC_POP_I => {
-                let dst = self.frames.current_mut().next_u16() as usize;
-                let selected = sym.current_selected();
-                let symbolic = {
-                    let stack = sym.stack_mut(selected).expect("missing symbolic stack");
-                    stack.pop()
-                };
-                let concrete = self.runtime_stack_mut(selected, runtime).pop();
-                self.set_int_reg(dst, symbolic, concrete);
-            }
-            BC_PEEK_I => {
-                let dst = self.frames.current_mut().next_u16() as usize;
-                let selected = sym.current_selected();
-                // RPython parity: peek from boxes (SymbolicStack), no IR.
-                let symbolic = {
-                    let stack = sym.stack(selected).expect("missing symbolic stack");
-                    stack.peek()
-                };
-                let concrete = self.runtime_stack_mut(selected, runtime).last().copied();
-                self.set_int_reg(dst, symbolic, concrete);
-            }
-            BC_PUSH_I => {
-                let src = self.frames.current_mut().next_u16() as usize;
-                let selected = sym.current_selected();
-                let (value, concrete) = self.read_int_reg(src);
-                let stack = sym.stack_mut(selected).expect("missing symbolic stack");
-                stack.push(value);
-                self.runtime_stack_mut(selected, runtime).push(concrete);
-            }
-            BC_POP_DISCARD => {
-                let selected = sym.current_selected();
-                let stack = sym.stack_mut(selected).expect("missing symbolic stack");
-                let _ = stack.pop();
-                let _ = self.runtime_stack_mut(selected, runtime).pop();
-            }
-            BC_DUP_STACK => {
-                let selected = sym.current_selected();
-                let stack = sym.stack_mut(selected).expect("missing symbolic stack");
-                stack.dup();
-                let value = self
-                    .runtime_stack_mut(selected, runtime)
-                    .last()
-                    .copied()
-                    .expect("cannot dup from empty runtime stack");
-                self.runtime_stack_mut(selected, runtime).push(value);
-            }
-            BC_SWAP_STACK => {
-                let selected = sym.current_selected();
-                let stack = sym.stack_mut(selected).expect("missing symbolic stack");
-                stack.swap();
-                let stack = self.runtime_stack_mut(selected, runtime);
-                let len = stack.len();
-                assert!(
-                    len >= 2,
-                    "cannot swap runtime stack with fewer than two values"
-                );
-                stack.swap(len - 1, len - 2);
-            }
-            BC_COPY_FROM_BOTTOM => {
-                // Copy element at index (from bottom) to top of stack.
-                let idx_reg = self.frames.current_mut().next_u16() as usize;
-                let selected = sym.current_selected();
-                let (idx_sym, idx_concrete) = self.read_int_reg(idx_reg);
-                let index = idx_concrete as usize;
-
-                let stack = sym.stack_mut(selected).expect("missing symbolic stack");
-                let opref = stack.peek_at(index);
-                stack.push(opref);
-
-                let rt_stack = self.runtime_stack_mut(selected, runtime);
-                let val = rt_stack[index];
-                rt_stack.push(val);
-                let _ = idx_sym; // index is a trace-time constant; symbolic opref comes from stack
-            }
-            BC_STORE_DOWN => {
-                // Pop top of stack, store at index (from bottom).
-                let idx_reg = self.frames.current_mut().next_u16() as usize;
-                let selected = sym.current_selected();
-                let (idx_sym, idx_concrete) = self.read_int_reg(idx_reg);
-                let index = idx_concrete as usize;
-
-                let stack = sym.stack_mut(selected).expect("missing symbolic stack");
-                let opref = stack.pop().expect("store_down on empty stack");
-                stack.set_at(index, opref);
-
-                let rt_stack = self.runtime_stack_mut(selected, runtime);
-                let val = rt_stack.pop().expect("store_down on empty runtime stack");
-                rt_stack[index] = val;
-                let _ = idx_sym;
             }
 
             // -- State field access (register/tape machines) --
@@ -919,66 +725,6 @@ where
                 let value = eval_unary_i(opcode, src_value);
                 self.set_int_reg(dst, Some(ctx.record_op(opcode, &[src])), Some(value));
             }
-            BC_REQUIRE_STACK => {
-                let required = self.frames.current_mut().next_u16() as usize;
-                let selected = sym.current_selected();
-                let concrete_len = self.runtime_stack_mut(selected, runtime).len();
-                if let Some(len) = sym.current_stacksize_value() {
-                    let required_ref = ctx.const_int(required as i64);
-                    let has_enough = ctx.record_op(OpCode::IntGe, &[len, required_ref]);
-                    let opcode = if concrete_len < required {
-                        OpCode::GuardFalse
-                    } else {
-                        OpCode::GuardTrue
-                    };
-                    let pc = self.frames.current_mut().pc;
-                    let resume_pc = if concrete_len < required {
-                        ctx.const_int((pc + 1) as i64)
-                    } else {
-                        ctx.const_int(pc as i64)
-                    };
-                    Self::record_state_guard(ctx, sym, opcode, &[has_enough], &[resume_pc]);
-                }
-                if concrete_len < required {
-                    // Stack insufficient: the interpreter will take the branch.
-                    // Don't abort the trace -- just skip this jitcode's remaining
-                    // bytecodes. The branch direction is handled at interpreter level.
-                }
-            }
-            BC_BRANCH_ZERO => {
-                let selected = sym.current_selected();
-                let runtime_cond = {
-                    let runtime_stack = self.runtime_stack_mut(selected, runtime);
-                    let Some(value) = runtime_stack.pop() else {
-                        return TraceAction::Abort;
-                    };
-                    value
-                };
-                let cond = {
-                    let stack = sym.stack_mut(selected).expect("missing symbolic stack");
-                    stack.pop().expect("branch_zero on empty symbolic stack")
-                };
-                let pc = self.frames.current_mut().pc;
-                // RPython parity: check ALL green keys (pc + selected).
-                let close_loop = runtime.label_at(pc) == sym.loop_header_pc()
-                    && (!sym.close_requires_header_selected()
-                        || sym.current_selected() == sym.header_selected());
-                let opcode = if runtime_cond == 0 {
-                    OpCode::GuardFalse
-                } else {
-                    OpCode::GuardTrue
-                };
-                let resume_pc = if runtime_cond == 0 {
-                    (pc + 1) as i64
-                } else {
-                    runtime.label_at(pc) as i64
-                };
-                let resume_pc = ctx.const_int(resume_pc);
-                Self::record_state_guard(ctx, sym, opcode, &[cond], &[resume_pc]);
-                if runtime_cond == 0 && close_loop {
-                    return TraceAction::CloseLoop;
-                }
-            }
             BC_BRANCH_REG_ZERO => {
                 let (cond_idx, target) = {
                     let frame = self.frames.current_mut();
@@ -1001,21 +747,14 @@ where
                 // blackhole.py:1066 bhimpl_jit_merge_point parity.
                 // Portal merge point: close the loop if at the traced header.
                 let pc = self.frames.current_mut().pc;
-                if runtime.label_at(pc) == sym.loop_header_pc()
-                    && (!sym.close_requires_header_selected()
-                        || sym.current_selected() == sym.header_selected())
-                {
+                if runtime.label_at(pc) == sym.loop_header_pc() {
                     return TraceAction::CloseLoop;
                 }
             }
             BC_JUMP_TARGET => {
                 // Non-portal loop header marker (helper jitcodes only).
-                // Same CloseLoop check: helper inner loops may still close.
                 let pc = self.frames.current_mut().pc;
-                if runtime.label_at(pc) == sym.loop_header_pc()
-                    && (!sym.close_requires_header_selected()
-                        || sym.current_selected() == sym.header_selected())
-                {
+                if runtime.label_at(pc) == sym.loop_header_pc() {
                     return TraceAction::CloseLoop;
                 }
             }
@@ -1260,50 +999,6 @@ where
                     _ => unreachable!(),
                 }
             }
-            BC_SET_SELECTED => {
-                let const_idx = {
-                    let frame = self.frames.current_mut();
-                    frame.next_u16() as usize
-                };
-                let new_selected = {
-                    let frame = self.frames.current_mut();
-                    *frame
-                        .jitcode
-                        .constants_i
-                        .get(const_idx)
-                        .expect("jitcode const index out of bounds") as usize
-                };
-                if sym.current_selected_ref().is_some() {
-                    return TraceAction::Abort;
-                }
-                if sym.stack(new_selected).is_none() {
-                    let len = runtime.stack_len(new_selected);
-                    let offset = sym.total_slots();
-                    sym.ensure_stack(new_selected, offset, len);
-                    let _ = self.runtime_stack_mut(new_selected, runtime);
-                }
-                let selected_value = ctx.const_int(new_selected as i64);
-                sym.set_current_selected_value(new_selected, selected_value);
-            }
-            BC_PUSH_TO => {
-                let (src_idx, target) = {
-                    let frame = self.frames.current_mut();
-                    (frame.next_u16() as usize, frame.next_u16() as usize)
-                };
-                let (value, concrete) = self.read_int_reg(src_idx);
-                if sym.current_selected_ref().is_some() {
-                    return TraceAction::Abort;
-                }
-                if sym.stack(target).is_none() {
-                    let len = runtime.stack_len(target);
-                    let offset = sym.total_slots();
-                    sym.ensure_stack(target, offset, len);
-                    let _ = self.runtime_stack_mut(target, runtime);
-                }
-                let stack = sym.stack_mut(target).expect("missing target stack");
-                stack.push(value);
-                self.runtime_stack_mut(target, runtime).push(concrete);
-            }
             BC_MOVE_I => {
                 let (dst, src) = {
                     let frame = self.frames.current_mut();
@@ -1428,24 +1123,6 @@ where
                 };
                 self.set_ref_reg(dst, Some(ctx.const_ref(value)), Some(value));
             }
-            BC_POP_R => {
-                let dst = self.frames.current_mut().next_u16() as usize;
-                let selected = sym.current_selected();
-                let symbolic = {
-                    let stack = sym.stack_mut(selected).expect("missing symbolic stack");
-                    stack.pop()
-                };
-                let concrete = self.runtime_stack_mut(selected, runtime).pop();
-                self.set_ref_reg(dst, symbolic, concrete);
-            }
-            BC_PUSH_R => {
-                let src = self.frames.current_mut().next_u16() as usize;
-                let selected = sym.current_selected();
-                let (value, concrete) = self.read_ref_reg(src);
-                let stack = sym.stack_mut(selected).expect("missing symbolic stack");
-                stack.push(value);
-                self.runtime_stack_mut(selected, runtime).push(concrete);
-            }
             BC_MOVE_R => {
                 let (dst, src) = {
                     let frame = self.frames.current_mut();
@@ -1567,24 +1244,6 @@ where
                     (dst, value)
                 };
                 self.set_float_reg(dst, Some(ctx.const_float(value)), Some(value));
-            }
-            BC_POP_F => {
-                let dst = self.frames.current_mut().next_u16() as usize;
-                let selected = sym.current_selected();
-                let symbolic = {
-                    let stack = sym.stack_mut(selected).expect("missing symbolic stack");
-                    stack.pop()
-                };
-                let concrete = self.runtime_stack_mut(selected, runtime).pop();
-                self.set_float_reg(dst, symbolic, concrete);
-            }
-            BC_PUSH_F => {
-                let src = self.frames.current_mut().next_u16() as usize;
-                let selected = sym.current_selected();
-                let (value, concrete) = self.read_float_reg(src);
-                let stack = sym.stack_mut(selected).expect("missing symbolic stack");
-                stack.push(value);
-                self.runtime_stack_mut(selected, runtime).push(concrete);
             }
             BC_MOVE_F => {
                 let (dst, src) = {
@@ -1762,15 +1421,6 @@ where
         TraceAction::Continue
     }
 
-    fn runtime_stack_mut(&mut self, selected: usize, runtime: &R) -> &mut Vec<i64> {
-        self.runtime_stacks.entry(selected).or_insert_with(|| {
-            let len = runtime.stack_len(selected);
-            (0..len)
-                .map(|index| runtime.stack_peek(selected, index))
-                .collect()
-        })
-    }
-
     fn set_int_reg(&mut self, reg: usize, opref: Option<OpRef>, value: Option<i64>) {
         let frame = self.frames.current_mut();
         frame.int_regs[reg] = opref;
@@ -1836,22 +1486,18 @@ where
 /// borrow.  Allocates a [`StandaloneFrameStack`], pushes the root
 /// frame, runs the machine, and discards the stack — preserving
 /// pre-unification semantics for callers that have not yet migrated.
-pub fn trace_jitcode<S, FLen, FPeek, FLabel>(
+pub fn trace_jitcode<S, FLabel>(
     ctx: &mut TraceCtx,
     sym: &mut S,
     jitcode: &JitCode,
     pc: usize,
-    runtime_stack_len: FLen,
-    runtime_stack_peek: FPeek,
     label_at: FLabel,
 ) -> TraceAction
 where
     S: JitCodeSym,
-    FLen: Fn(usize) -> usize,
-    FPeek: Fn(usize, usize) -> i64,
     FLabel: Fn(usize) -> usize,
 {
-    let runtime = ClosureRuntime::new(runtime_stack_len, runtime_stack_peek, label_at);
+    let runtime = ClosureRuntime::new(label_at);
     let jitcode_arc = Arc::new(jitcode.clone());
     let sub_jitcodes = jitcode_arc.sub_jitcodes.clone();
     let fn_ptrs = jitcode_arc.fn_ptrs.clone();
@@ -1860,27 +1506,6 @@ where
     let mut machine =
         JitCodeMachine::<S, _>::with_framestack(&mut standalone.frames, &sub_jitcodes, &fn_ptrs);
     machine.run_to_end(ctx, sym, &runtime)
-}
-
-pub fn trace_jitcode_with_runtime<S, R>(
-    ctx: &mut TraceCtx,
-    sym: &mut S,
-    jitcode: &JitCode,
-    pc: usize,
-    runtime: &R,
-) -> TraceAction
-where
-    S: JitCodeSym,
-    R: JitCodeRuntime,
-{
-    let jitcode_arc = Arc::new(jitcode.clone());
-    let sub_jitcodes = jitcode_arc.sub_jitcodes.clone();
-    let fn_ptrs = jitcode_arc.fn_ptrs.clone();
-    let mut standalone = StandaloneFrameStack::new();
-    standalone.frames.push(MIFrame::new(jitcode_arc, pc));
-    let mut machine =
-        JitCodeMachine::<S, _>::with_framestack(&mut standalone.frames, &sub_jitcodes, &fn_ptrs);
-    machine.run_to_end(ctx, sym, runtime)
 }
 
 pub(crate) fn eval_binop_i(opcode: OpCode, lhs: i64, rhs: i64) -> i64 {
@@ -2412,37 +2037,9 @@ mod tests {
     use majit_ir::Type;
 
     #[derive(Default)]
-    struct DummySym {
-        selected: usize,
-        selected_value: Option<OpRef>,
-    }
+    struct DummySym;
 
     impl JitCodeSym for DummySym {
-        fn current_selected(&self) -> usize {
-            self.selected
-        }
-
-        fn current_selected_value(&self) -> Option<OpRef> {
-            self.selected_value
-        }
-
-        fn set_current_selected(&mut self, selected: usize) {
-            self.selected = selected;
-        }
-
-        fn set_current_selected_value(&mut self, selected: usize, value: OpRef) {
-            self.selected = selected;
-            self.selected_value = Some(value);
-        }
-
-        fn stack(&self, _selected: usize) -> Option<&SymbolicStack> {
-            None
-        }
-
-        fn stack_mut(&mut self, _selected: usize) -> Option<&mut SymbolicStack> {
-            None
-        }
-
         fn total_slots(&self) -> usize {
             0
         }
@@ -2450,8 +2047,6 @@ mod tests {
         fn loop_header_pc(&self) -> usize {
             0
         }
-
-        fn ensure_stack(&mut self, _selected: usize, _offset: usize, _len: usize) {}
 
         fn fail_args(&self) -> Option<Vec<OpRef>> {
             None
@@ -2515,15 +2110,7 @@ mod tests {
         ctx.init_virtualizable_boxes(&info, vable_ref, &[field_box, array_box], &[1]);
 
         let mut sym = DummySym::default();
-        let action = trace_jitcode(
-            &mut ctx,
-            &mut sym,
-            &jitcode,
-            0,
-            |_sel| 0,
-            |_sel, _idx| 0,
-            |_pc| 0,
-        );
+        let action = trace_jitcode(&mut ctx, &mut sym, &jitcode, 0, |_pc| 0);
         assert!(matches!(action, TraceAction::Continue));
 
         let recorder = ctx.into_recorder();
@@ -2548,15 +2135,7 @@ mod tests {
         ctx.init_virtualizable_boxes(&info, vable_ref, &[], &[]);
 
         let mut sym = DummySym::default();
-        let action = trace_jitcode(
-            &mut ctx,
-            &mut sym,
-            &jitcode,
-            0,
-            |_sel| 0,
-            |_sel, _idx| 0,
-            |_pc| 0,
-        );
+        let action = trace_jitcode(&mut ctx, &mut sym, &jitcode, 0, |_pc| 0);
         assert!(matches!(action, TraceAction::Continue));
         assert_eq!(obj.token, 0, "tracing side must restore TOKEN_NONE");
 
@@ -2600,15 +2179,7 @@ mod tests {
         ctx.init_virtualizable_boxes(&info, vable_ref, &[], &[]);
 
         let mut sym = DummySym::default();
-        let action = trace_jitcode(
-            &mut ctx,
-            &mut sym,
-            &jitcode,
-            0,
-            |_sel| 0,
-            |_sel, _idx| 0,
-            |_pc| 0,
-        );
+        let action = trace_jitcode(&mut ctx, &mut sym, &jitcode, 0, |_pc| 0);
         assert!(matches!(action, TraceAction::Abort));
         assert_eq!(obj.token, 0, "forced residual call must clear the token");
 
@@ -2646,15 +2217,7 @@ mod tests {
         ctx.init_virtualizable_boxes(&info, vable_ref, &[], &[]);
 
         let mut sym = DummySym::default();
-        let action = trace_jitcode(
-            &mut ctx,
-            &mut sym,
-            &jitcode,
-            0,
-            |_sel| 0,
-            |_sel, _idx| 0,
-            |_pc| 0,
-        );
+        let action = trace_jitcode(&mut ctx, &mut sym, &jitcode, 0, |_pc| 0);
         assert!(matches!(action, TraceAction::Continue));
         assert_eq!(obj.token, 0);
 
@@ -2696,15 +2259,7 @@ mod tests {
         ctx.init_virtualizable_boxes(&info, vable_ref, &[], &[]);
 
         let mut sym = DummySym::default();
-        let action = trace_jitcode(
-            &mut ctx,
-            &mut sym,
-            &jitcode,
-            0,
-            |_sel| 0,
-            |_sel, _idx| 0,
-            |_pc| 0,
-        );
+        let action = trace_jitcode(&mut ctx, &mut sym, &jitcode, 0, |_pc| 0);
         assert!(matches!(action, TraceAction::Continue));
         assert_eq!(obj.token, 0);
 
@@ -2746,15 +2301,7 @@ mod tests {
         ctx.init_virtualizable_boxes(&info, vable_ref, &[], &[]);
 
         let mut sym = DummySym::default();
-        let action = trace_jitcode(
-            &mut ctx,
-            &mut sym,
-            &jitcode,
-            0,
-            |_sel| 0,
-            |_sel, _idx| 0,
-            |_pc| 0,
-        );
+        let action = trace_jitcode(&mut ctx, &mut sym, &jitcode, 0, |_pc| 0);
         assert!(matches!(action, TraceAction::Continue));
         assert_eq!(obj.token, 0);
 

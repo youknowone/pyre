@@ -754,7 +754,7 @@ fn blackhole_from_jit_frame(frame: &mut PyFrame) -> Option<PyObjectRef> {
     // locals_cells_stack_w layout: [locals..., cells..., stack...].
     // stack_base in PyFrame = nlocals + ncells; in JitCode the value-stack
     // temporaries live at registers_r[nlocals + d] (codewriter parity —
-    // BC_MOVE_R only, no BC_PUSH_R / BC_POP_R against runtime_stacks).
+    // BC_MOVE_R only, no BC_PUSH_R / BC_POP_R).
     let ncells = pyre_interpreter::pyframe::ncells(code);
     let frame_stack_base = nlocals + ncells;
     let vsd = frame.valuestackdepth;

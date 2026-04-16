@@ -2,8 +2,7 @@ mod dispatch;
 mod frame;
 
 pub use dispatch::{
-    ClosureRuntime, JitCodeMachine, JitCodeRuntime, JitCodeSym, StandaloneFrameStack,
-    trace_jitcode, trace_jitcode_with_runtime,
+    ClosureRuntime, JitCodeMachine, JitCodeRuntime, JitCodeSym, StandaloneFrameStack, trace_jitcode,
 };
 pub(crate) use dispatch::{
     call_int_function, call_void_function, eval_binop_f, eval_binop_i, eval_binop_ovf,
@@ -9778,33 +9777,18 @@ mod metainterp_static_data_tests {
 
         struct NoopSym;
         impl crate::JitCodeSym for NoopSym {
-            fn current_selected(&self) -> usize {
-                0
-            }
-            fn current_selected_value(&self) -> Option<OpRef> {
-                None
-            }
-            fn set_current_selected(&mut self, _: usize) {}
-            fn set_current_selected_value(&mut self, _: usize, _: OpRef) {}
-            fn stack(&self, _: usize) -> Option<&crate::SymbolicStack> {
-                None
-            }
-            fn stack_mut(&mut self, _: usize) -> Option<&mut crate::SymbolicStack> {
-                None
-            }
             fn total_slots(&self) -> usize {
                 0
             }
             fn loop_header_pc(&self) -> usize {
                 0
             }
-            fn ensure_stack(&mut self, _: usize, _: usize, _: usize) {}
             fn fail_args(&self) -> Option<Vec<OpRef>> {
                 None
             }
         }
         let mut sym = NoopSym;
-        let runtime = crate::ClosureRuntime::new(|_| 0, |_, _| 0, |_| 0);
+        let runtime = crate::ClosureRuntime::new(|_| 0);
 
         let action = meta.trace_jitcode_with_framestack(&mut sym, jitcode, 0, &runtime);
         assert!(matches!(action, crate::TraceAction::Continue));

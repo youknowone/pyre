@@ -26,8 +26,6 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
     let promote_preamble = quote! {}; // arm preamble not used; promote goes in trace fn
 
     let lowerer_config = LowererConfig::new(
-        config.storage.as_ref().map(|s| &s.pool),
-        config.storage.as_ref().map(|s| &s.selector),
         &config.binops,
         &config.io_shims,
         &config.calls,
@@ -38,145 +36,59 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
 
     let classified = classify_arms(&match_expr.arms);
     let env_type = &config.env_type;
-    let has_branch_group = classified
-        .iter()
-        .any(|arm| matches!(arm.pattern, ArmPattern::BranchGroup));
 
     let jitcode_arms = classified
         .iter()
         .map(|arm| generate_jitcode_arm(arm, &lowerer_config, &promote_preamble));
 
-    let label_closure = if has_branch_group {
-        quote! { |__jit_pc| program.get_label(__jit_pc) }
-    } else {
-        quote! { |_unused_pc| 0usize }
-    };
+    let label_closure = quote! { |_unused_pc| 0usize };
 
-    let trace_fn_body = if config.state_fields.is_some() {
-        // state_fields mode: no storage pool, use dummy closures.
-        // State field operations use load_state_field/store_state_field JitCode ops
-        // which don't call the runtime stack closures.
-        quote! {
-            #[allow(non_snake_case, unused_variables, unused_mut)]
-            fn #trace_fn_name(
-                __ctx: &mut majit_metainterp::TraceCtx,
-                __sym: &mut __JitSym,
-                program: &#env_type,
-                pc: usize,
-            ) -> majit_metainterp::TraceAction {
-                use majit_metainterp::TraceAction;
+    let _ = has_pre_dispatch_promote;
+    let trace_fn_body = quote! {
+        #[allow(non_snake_case, unused_variables, unused_mut)]
+        fn #trace_fn_name(
+            __ctx: &mut majit_metainterp::TraceCtx,
+            __sym: &mut __JitSym,
+            program: &#env_type,
+            pc: usize,
+        ) -> majit_metainterp::TraceAction {
+            use majit_metainterp::TraceAction;
 
-                let __op = program.get_op(pc);
-                // The lowered JitCode must see the same local state as the
-                // interpreter's `match opcode { ... }` body: the opcode has
-                // already been fetched and `pc` has already advanced past it.
-                // RPython tracing observes the post-fetch bytecode index when
-                // recording immediate operands, so pass `pc + 1` here instead
-                // of the opcode's address.
-                let __jit_pc = pc + 1;
-                let Some(__jitcode) = #jitcode_fn_name(program, __jit_pc, __op) else {
-                    if majit_metainterp::majit_log_enabled() {
-                        eprintln!(
-                            "[jit] no jitcode for pc={} op={}",
-                            pc,
-                            __op
-                        );
-                    }
-                    return TraceAction::AbortPermanent;
-                };
-
-                let __result = majit_metainterp::trace_jitcode(
-                    __ctx,
-                    __sym,
-                    &__jitcode,
-                    pc,
-                    |_| 0usize,
-                    |_, _| 0i64,
-                    #label_closure,
-                );
-                if majit_metainterp::majit_log_enabled() && !matches!(__result, TraceAction::Continue) {
+            let __op = program.get_op(pc);
+            // The lowered JitCode must see the same local state as the
+            // interpreter's `match opcode { ... }` body: the opcode has
+            // already been fetched and `pc` has already advanced past it.
+            // RPython tracing observes the post-fetch bytecode index when
+            // recording immediate operands, so pass `pc + 1` here instead
+            // of the opcode's address.
+            let __jit_pc = pc + 1;
+            let Some(__jitcode) = #jitcode_fn_name(program, __jit_pc, __op) else {
+                if majit_metainterp::majit_log_enabled() {
                     eprintln!(
-                        "[jit] trace action at pc={} op={} -> {:?}",
+                        "[jit] no jitcode for pc={} op={}",
                         pc,
-                        __op,
-                        __result
+                        __op
                     );
                 }
-                __result
-            }
-        }
-    } else {
-        let pool_type = &config
-            .storage
-            .as_ref()
-            .expect("storage config required in storage mode")
-            .pool_type;
-        quote! {
-            #[allow(non_snake_case, unused_variables, unused_mut)]
-            fn #trace_fn_name(
-                __ctx: &mut majit_metainterp::TraceCtx,
-                __sym: &mut __JitSym,
-                program: &#env_type,
-                pc: usize,
-                __storage: &#pool_type,
-                __selected: usize,
-            ) -> majit_metainterp::TraceAction {
-                use majit_metainterp::{JitCodeSym, TraceAction};
+                return TraceAction::AbortPermanent;
+            };
 
-                let __op = program.get_op(pc);
-                // The lowered JitCode must see the same local state as the
-                // interpreter's `match opcode { ... }` body: the opcode has
-                // already been fetched and `pc` has already advanced past it.
-                // RPython tracing observes the post-fetch bytecode index when
-                // recording immediate operands, so pass `pc + 1` here instead
-                // of the opcode's address.
-                let __jit_pc = pc + 1;
-                let Some(__jitcode) = #jitcode_fn_name(program, __jit_pc, __op) else {
-                    if majit_metainterp::majit_log_enabled() {
-                        eprintln!(
-                            "[jit] no jitcode for pc={} op={} selected={}",
-                            pc,
-                            __op,
-                            __selected
-                        );
-                    }
-                    return TraceAction::AbortPermanent;
-                };
-
-                // tl.py:88 promote(stack.stackpos) — emit GUARD_VALUE on stacksize
-                // before each opcode's JitCode, matching RPython's per-dispatch
-                // promote.  pyjitpl.py:1916 implement_guard_value: if already
-                // Const, no guard needed; else emit GUARD_VALUE(box, Const(N)).
-                if #has_pre_dispatch_promote {
-                    __sym.promote_stacksize(
-                        __ctx,
-                        __storage.get(__selected).len() as i64,
-                    );
-                }
-
-                let __runtime = majit_metainterp::ClosureRuntime::new(
-                    |__stack_index| __storage.get(__stack_index).len(),
-                    |__stack_index, __pos| __storage.get(__stack_index).peek_at(__pos),
-                    #label_closure,
-                ).with_pool_ptr(__storage as *const _ as i64);
-                let __result = majit_metainterp::trace_jitcode_with_runtime(
-                    __ctx,
-                    __sym,
-                    &__jitcode,
+            let __result = majit_metainterp::trace_jitcode(
+                __ctx,
+                __sym,
+                &__jitcode,
+                pc,
+                #label_closure,
+            );
+            if majit_metainterp::majit_log_enabled() && !matches!(__result, TraceAction::Continue) {
+                eprintln!(
+                    "[jit] trace action at pc={} op={} -> {:?}",
                     pc,
-                    &__runtime,
+                    __op,
+                    __result
                 );
-                if majit_metainterp::majit_log_enabled() && !matches!(__result, TraceAction::Continue) {
-                    eprintln!(
-                        "[jit] trace action at pc={} op={} selected={} -> {:?}",
-                        pc,
-                        __op,
-                        __selected,
-                        __result
-                    );
-                }
-                __result
             }
+            __result
         }
     };
 
@@ -219,17 +131,6 @@ fn generate_jitcode_arm(
                 None => quote! { None },
             }
         }
-        ArmPattern::BranchGroup => quote! {
-            let mut __builder = majit_metainterp::JitCodeBuilder::new();
-            match __op {
-                crate::aheui::OP_BRPOP1 => __builder.require_stack(1),
-                crate::aheui::OP_BRPOP2 => __builder.require_stack(2),
-                crate::aheui::OP_BRZ => __builder.branch_zero(),
-                crate::aheui::OP_JMP => __builder.jump_target(),
-                _ => return None,
-            }
-            Some(__builder.finish())
-        },
         ArmPattern::AbortPermanent | ArmPattern::Halt => quote! {
             let mut __builder = majit_metainterp::JitCodeBuilder::new();
             __builder.abort_permanent();
@@ -326,7 +227,7 @@ fn find_match_in_expr(expr: &syn::Expr) -> Option<&syn::ExprMatch> {
 ///
 /// RPython: jtransform.py:596 — `hint(x, promote=True)` becomes
 /// `int_guard_value(x)`.  When detected, the trace function emits
-/// GUARD_VALUE via `promote_stacksize()` before each arm's JitCode.
+/// GUARD_VALUE via `int_guard_value` before each arm's JitCode.
 fn has_promote_before_match(block: &syn::Block) -> bool {
     let mut promotes = Vec::new();
     collect_promote_stmts(&block.stmts, &mut promotes);

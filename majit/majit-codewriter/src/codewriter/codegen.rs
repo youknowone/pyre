@@ -91,9 +91,6 @@ fn classify_state_field_type(ty: &Type) -> Option<StateFieldKind> {
 }
 
 fn infer_state_fields_attr(config: &JitDriverConfig) -> Option<TokenStream> {
-    if config.storage.is_some() {
-        return None;
-    }
     if config.state_fields.is_empty() {
         return None;
     }
@@ -156,9 +153,6 @@ pub struct JitDriverConfig {
     /// Binary operation mappings for `#[jit_interp(binops = { ... })]`.
     pub binops: Vec<BinopMapping>,
 
-    /// Storage pool configuration (None for non-storage interpreters).
-    pub storage: Option<StorageConfig>,
-
     /// I/O shim pairs: `(original_fn_path, shim_fn_name)`.
     pub io_shims: Vec<IoShim>,
 
@@ -207,16 +201,6 @@ pub struct IoShim {
     pub wrapper: TokenStream,
 }
 
-/// Storage pool configuration for `#[jit_interp(storage = { ... })]`.
-pub struct StorageConfig {
-    pub pool: TokenStream,
-    pub pool_type: TokenStream,
-    pub selector: TokenStream,
-    pub untraceable: Vec<TokenStream>,
-    pub scan_fn: TokenStream,
-    pub can_trace_guard: Option<TokenStream>,
-}
-
 /// Generate a complete JIT mainloop module.
 ///
 /// Produces:
@@ -255,31 +239,6 @@ pub fn generate_jitcode(config: &JitDriverConfig) -> TokenStream {
             quote! { #method => #opcode }
         })
         .collect();
-
-    let storage_attr = config.storage.as_ref().map(|s| {
-        let pool = s.pool.clone();
-        let pool_type = s.pool_type.clone();
-        let selector = s.selector.clone();
-        let untraceable = s.untraceable.clone();
-        let scan = s.scan_fn.clone();
-        let guard = s
-            .can_trace_guard
-            .as_ref()
-            .map(|g| {
-                let g = g.clone();
-                quote! { can_trace_guard: #g, }
-            })
-            .unwrap_or_default();
-        quote! {
-            storage = {
-                pool: #pool, pool_type: #pool_type,
-                selector: #selector,
-                untraceable: [#(#untraceable),*],
-                scan: #scan,
-                #guard
-            },
-        }
-    });
 
     let virtualizable_attr = config.virtualizable.as_ref().map(|v| {
         let var = v.var.clone();
@@ -358,7 +317,6 @@ pub fn generate_jitcode(config: &JitDriverConfig) -> TokenStream {
         #[majit_macros::jit_interp(
             state = #state_name, env = #env_type,
             greens = [#(#greens),*],
-            #storage_attr
             #state_fields_attr
             #virtualizable_attr
             binops = { #(#binop_entries),* },
@@ -387,7 +345,6 @@ mod tests {
             state_fields: vec![],
             greens: vec![],
             binops: vec![],
-            storage: None,
             io_shims: vec![],
             virtualizable: None,
             mainloop_body: quote!({}),

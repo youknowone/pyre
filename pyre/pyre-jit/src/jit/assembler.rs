@@ -341,32 +341,6 @@ fn dispatch_op(
             let (dst, value) = expect_load_const_f(args, result);
             state.builder.load_const_f_value(dst, value);
         }
-        "push_i" => state.builder.push_i(expect_reg(&args[0], Kind::Int)),
-        "push_r" => state.builder.push_r(expect_reg(&args[0], Kind::Ref)),
-        "push_f" => state.builder.push_f(expect_reg(&args[0], Kind::Float)),
-        "pop_i" => state
-            .builder
-            .pop_i(expect_result_or_first_reg(args, result, Kind::Int)),
-        "pop_r" => state
-            .builder
-            .pop_r(expect_result_or_first_reg(args, result, Kind::Ref)),
-        "pop_f" => state
-            .builder
-            .pop_f(expect_result_or_first_reg(args, result, Kind::Float)),
-        "peek_i" => state
-            .builder
-            .peek_i(expect_result_or_first_reg(args, result, Kind::Int)),
-        "dup_stack" => state.builder.dup_stack(),
-        "swap_stack" => state.builder.swap_stack(),
-        "require_stack" => state.builder.require_stack(expect_small_u16(&args[0])),
-        "set_selected" => state.builder.set_selected(expect_small_u16(&args[0])),
-        "push_to" => state
-            .builder
-            .push_to(expect_reg(&args[0], Kind::Int), expect_small_u16(&args[1])),
-        "copy_from_bottom" => state
-            .builder
-            .copy_from_bottom(expect_reg(&args[0], Kind::Int)),
-        "store_down" => state.builder.store_down(expect_reg(&args[0], Kind::Int)),
         "load_state_field" => {
             let dst = expect_result_or_first_reg(args, result, Kind::Int);
             state

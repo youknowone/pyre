@@ -33,15 +33,12 @@ where
 
 // ── LowererConfig ────────────────────────────────────────────────────
 
-/// Configuration for storage-aware JitCode lowering.
+/// Configuration for state_fields-aware JitCode lowering.
 ///
 /// Built from `JitInterpConfig` at proc-macro time and passed to the Lowerer
-/// to recognize compound storage methods, I/O shims, and selector assignments.
+/// to recognize state-field reads/writes, virtualizable accesses, I/O shims,
+/// and helper-call policies.
 pub struct LowererConfig {
-    /// Canonical pool expression segments (e.g., ["state", "storage"]).
-    pool_segments: Option<Vec<String>>,
-    /// Canonical selector expression segments (e.g., ["state", "selected"]).
-    selector_segments: Option<Vec<String>>,
     /// Method name → IR OpCode ident (e.g., "add" → IntAdd).
     binops: HashMap<String, Ident>,
     /// Canonical I/O func path → shim ident.
@@ -124,8 +121,6 @@ impl ValueKind {
 
 impl LowererConfig {
     pub fn new(
-        pool_expr: Option<&Expr>,
-        selector_expr: Option<&Expr>,
         binops: &[(Ident, Ident)],
         io_shims: &[(Path, Ident)],
         calls: &[(Path, Option<crate::jit_interp::CallPolicyKind>)],
@@ -133,8 +128,6 @@ impl LowererConfig {
         vable_decl: Option<&crate::jit_interp::VirtualizableDecl>,
         state_fields_cfg: Option<&crate::jit_interp::StateFieldsConfig>,
     ) -> Self {
-        let pool_segments = pool_expr.and_then(canonical_expr_segments);
-        let selector_segments = selector_expr.and_then(canonical_expr_segments);
         let binops = binops
             .iter()
             .map(|(m, o)| (m.to_string(), o.clone()))
@@ -205,8 +198,6 @@ impl LowererConfig {
             (HashMap::new(), HashMap::new(), HashMap::new())
         };
         Self {
-            pool_segments,
-            selector_segments,
             binops,
             io_shims,
             calls,
@@ -247,13 +238,6 @@ fn canonical_expr_segments(expr: &Expr) -> Option<Vec<String>> {
         Expr::Reference(reference) => canonical_expr_segments(&reference.expr),
         _ => None,
     }
-}
-
-fn expr_matches_segments(expr: &Expr, expected: &[String]) -> bool {
-    canonical_expr_segments(expr)
-        .as_ref()
-        .map(|segments| segments == expected)
-        .unwrap_or(false)
 }
 
 fn unwrap_ref_expr(expr: &Expr) -> &Expr {
@@ -887,37 +871,6 @@ impl<'c> Lowerer<'c> {
             return Some(());
         }
 
-        // Config-aware: push_to (non-current storage) BEFORE regular push
-        if self.config.is_some() {
-            if let Some(()) = self.lower_push_to_stmt(expr) {
-                return Some(());
-            }
-        }
-
-        if let Some(push_arg) = push_call_arg(expr) {
-            let binding = self.lower_value_expr(push_arg)?;
-            let reg = binding.reg;
-            match binding.kind {
-                BindingKind::Int => self.statements.push(quote! {
-                    __builder.push_i(#reg);
-                }),
-                BindingKind::Ref => self.statements.push(quote! {
-                    __builder.push_r(#reg);
-                }),
-                BindingKind::Float => self.statements.push(quote! {
-                    __builder.push_f(#reg);
-                }),
-            }
-            return Some(());
-        }
-
-        if is_pop_discard(expr) {
-            self.statements.push(quote! {
-                __builder.pop_discard();
-            });
-            return Some(());
-        }
-
         if let Expr::If(expr_if) = expr {
             return self.lower_if_stmt(expr_if);
         }
@@ -944,13 +897,7 @@ impl<'c> Lowerer<'c> {
 
         // Config-aware patterns
         if self.config.is_some() {
-            if let Some(()) = self.lower_storage_method_stmt(expr) {
-                return Some(());
-            }
             if let Some(()) = self.lower_io_call_stmt(expr) {
-                return Some(());
-            }
-            if let Some(()) = self.lower_selector_assign(expr) {
                 return Some(());
             }
         }
@@ -959,64 +906,6 @@ impl<'c> Lowerer<'c> {
     }
 
     // ── Config-aware lowering methods ────────────────────────────────
-
-    /// Lower compound storage method: pool.get_mut(sel).add() → inline_call(sub-JitCode)
-    fn lower_storage_method_stmt(&mut self, expr: &Expr) -> Option<()> {
-        let Expr::MethodCall(mc) = expr else {
-            return None;
-        };
-        let config = self.config?;
-        let selected_arg = extract_pool_get_mut_arg(&mc.receiver, config)?;
-        let selector_segments = config.selector_segments.as_ref()?;
-        if !expr_matches_segments(&selected_arg, selector_segments) {
-            return None;
-        }
-        let method_name = mc.method.to_string();
-
-        // Compound binop: pop two, operate, push result
-        if let Some(opcode) = config.binops.get(&method_name) {
-            let binop_tokens = if is_overflow_binop(opcode) {
-                quote! {
-                    __sub.peek_i(0);
-                    __sub.swap_stack();
-                    __sub.peek_i(1);
-                    __sub.swap_stack();
-                    __sub.record_binop_i(2, majit_ir::OpCode::#opcode, 1, 0);
-                    __sub.pop_discard();
-                    __sub.pop_discard();
-                    __sub.push_i(2);
-                }
-            } else {
-                quote! {
-                    __sub.pop_i(0);
-                    __sub.pop_i(1);
-                    __sub.record_binop_i(2, majit_ir::OpCode::#opcode, 1, 0);
-                    __sub.push_i(2);
-                }
-            };
-            self.statements.push(quote! {
-                {
-                    let mut __sub = majit_metainterp::JitCodeBuilder::new();
-                    #binop_tokens
-                    let __sub_idx = __builder.add_sub_jitcode(__sub.finish());
-                    __builder.inline_call(__sub_idx);
-                }
-            });
-            return Some(());
-        }
-
-        if method_name == "dup" && mc.args.is_empty() {
-            self.statements.push(quote! { __builder.dup_stack(); });
-            return Some(());
-        }
-
-        if method_name == "swap" && mc.args.is_empty() {
-            self.statements.push(quote! { __builder.swap_stack(); });
-            return Some(());
-        }
-
-        None
-    }
 
     fn lower_config_call_stmt(&mut self, expr: &Expr) -> Option<()> {
         let Expr::Call(call) = expr else {
@@ -1219,54 +1108,6 @@ impl<'c> Lowerer<'c> {
         None
     }
 
-    /// Lower selector changes into jitcode when the RHS is trace-time constant.
-    fn lower_selector_assign(&mut self, expr: &Expr) -> Option<()> {
-        let Expr::Assign(ExprAssign { left, right, .. }) = expr else {
-            return None;
-        };
-        let config = self.config?;
-        let selector_segments = config.selector_segments.as_ref()?;
-        if !expr_matches_segments(left, selector_segments) {
-            return None;
-        }
-        if self.expr_touches_storage(right) || self.expr_uses_stack_bindings(right) {
-            return None;
-        }
-        self.statements.push(quote! {
-            let __selected_value = (#right) as i64;
-            let __selected_const_idx = __builder.add_const_i(__selected_value);
-            __builder.set_selected(__selected_const_idx);
-        });
-        Some(())
-    }
-
-    /// Lower push to non-current storage: pool.get_mut(target).push(r) → push_to(r, target)
-    fn lower_push_to_stmt(&mut self, expr: &Expr) -> Option<()> {
-        let Expr::MethodCall(mc) = expr else {
-            return None;
-        };
-        if mc.method != "push" || mc.args.len() != 1 {
-            return None;
-        }
-        let config = self.config?;
-        let target_arg = extract_pool_get_mut_arg(&mc.receiver, config)?;
-        let selector_segments = config.selector_segments.as_ref()?;
-        // If target == selector, this is a regular push (handled elsewhere)
-        if expr_matches_segments(&target_arg, selector_segments) {
-            return None;
-        }
-        let arg = &mc.args[0];
-        let binding = self.lower_value_expr(arg)?;
-        if !matches!(binding.kind, BindingKind::Int) {
-            return None;
-        }
-        let reg = binding.reg;
-        self.statements.push(quote! {
-            __builder.push_to(#reg, (#target_arg) as u16);
-        });
-        Some(())
-    }
-
     /// Check if a statement modifies JIT-visible state (storage writes).
     fn stmt_modifies_jit_state(&self, stmt: &Stmt) -> bool {
         match stmt {
@@ -1292,8 +1133,7 @@ impl<'c> Lowerer<'c> {
                     || self.expr_modifies_jit_state(right)
             }
             Expr::MethodCall(ExprMethodCall { receiver, args, .. }) => {
-                self.expr_is_pool_mut_access(receiver)
-                    || self.expr_modifies_jit_state(receiver)
+                self.expr_modifies_jit_state(receiver)
                     || args.iter().any(|arg| self.expr_modifies_jit_state(arg))
             }
             Expr::Block(expr_block) => expr_block
@@ -1345,7 +1185,7 @@ impl<'c> Lowerer<'c> {
     }
 
     fn expr_has_jit_state_reference(&self, expr: &Expr) -> bool {
-        if self.expr_is_jit_state_place(expr) || self.expr_is_pool_mut_access(expr) {
+        if self.expr_is_jit_state_place(expr) {
             return true;
         }
         match expr {
@@ -1438,60 +1278,6 @@ impl<'c> Lowerer<'c> {
             Expr::Paren(ExprParen { expr, .. }) | Expr::Reference(ExprReference { expr, .. }) => {
                 self.expr_is_state_root(expr)
             }
-            _ => false,
-        }
-    }
-
-    fn expr_is_pool_mut_access(&self, expr: &Expr) -> bool {
-        let config = match self.config {
-            Some(c) => c,
-            None => return false,
-        };
-        if extract_pool_get_mut_arg(expr, config).is_some() {
-            return true;
-        }
-        match expr {
-            Expr::MethodCall(ExprMethodCall { receiver, args, .. }) => {
-                self.expr_is_pool_mut_access(receiver)
-                    || args.iter().any(|arg| self.expr_is_pool_mut_access(arg))
-            }
-            Expr::Call(ExprCall { func, args, .. }) => {
-                self.expr_is_pool_mut_access(func)
-                    || args.iter().any(|arg| self.expr_is_pool_mut_access(arg))
-            }
-            Expr::Assign(ExprAssign { left, right, .. })
-            | Expr::Binary(ExprBinary { left, right, .. }) => {
-                self.expr_is_pool_mut_access(left) || self.expr_is_pool_mut_access(right)
-            }
-            Expr::Index(syn::ExprIndex { expr, index, .. }) => {
-                self.expr_is_pool_mut_access(expr) || self.expr_is_pool_mut_access(index)
-            }
-            Expr::Field(syn::ExprField { base, .. }) => self.expr_is_pool_mut_access(base),
-            Expr::Block(expr_block) => expr_block
-                .block
-                .stmts
-                .iter()
-                .any(|stmt| self.stmt_touches_jit_state(stmt)),
-            Expr::If(ExprIf {
-                cond,
-                then_branch,
-                else_branch,
-                ..
-            }) => {
-                self.expr_is_pool_mut_access(cond)
-                    || then_branch
-                        .stmts
-                        .iter()
-                        .any(|stmt| self.stmt_touches_jit_state(stmt))
-                    || else_branch
-                        .as_ref()
-                        .is_some_and(|(_, expr)| self.expr_is_pool_mut_access(expr))
-            }
-            Expr::Cast(ExprCast { expr, .. })
-            | Expr::Paren(ExprParen { expr, .. })
-            | Expr::Reference(ExprReference { expr, .. })
-            | Expr::Unary(ExprUnary { expr, .. })
-            | Expr::Try(syn::ExprTry { expr, .. }) => self.expr_is_pool_mut_access(expr),
             _ => false,
         }
     }
@@ -2274,30 +2060,6 @@ impl<'c> Lowerer<'c> {
             return Some(binding);
         }
 
-        if is_pop_value(expr) {
-            let reg = self.alloc_reg();
-            self.statements.push(quote! {
-                __builder.pop_i(#reg);
-            });
-            return Some(Binding {
-                reg,
-                kind: BindingKind::Int,
-                depends_on_stack: true,
-            });
-        }
-
-        if is_peek_value(expr) {
-            let reg = self.alloc_reg();
-            self.statements.push(quote! {
-                __builder.peek_i(#reg);
-            });
-            return Some(Binding {
-                reg,
-                kind: BindingKind::Int,
-                depends_on_stack: true,
-            });
-        }
-
         match expr {
             Expr::Lit(ExprLit {
                 lit: Lit::Int(int_lit),
@@ -2918,20 +2680,6 @@ fn expr_has_loop_control(expr: &Expr) -> bool {
 // ── Helper functions ─────────────────────────────────────────────────
 
 /// Extract the get_mut argument from a pool.get_mut(arg) expression.
-fn extract_pool_get_mut_arg(expr: &Expr, config: &LowererConfig) -> Option<Expr> {
-    let Expr::MethodCall(mc) = expr else {
-        return None;
-    };
-    if mc.method != "get_mut" || mc.args.len() != 1 {
-        return None;
-    }
-    let pool_segments = config.pool_segments.as_ref()?;
-    if !expr_matches_segments(&mc.receiver, pool_segments) {
-        return None;
-    }
-    Some(mc.args[0].clone())
-}
-
 fn extract_stmts(expr: &Expr) -> Vec<Stmt> {
     match expr {
         Expr::Block(block) => block.block.stmts.clone(),
@@ -2965,19 +2713,6 @@ fn extract_pat_literals(pat: &Pat) -> Option<Vec<i64>> {
         // Constant path pattern (e.g., `MY_CONST`): we cannot evaluate
         // this at proc-macro time, so return None to bail out.
         _ => None,
-    }
-}
-
-fn push_call_arg(expr: &Expr) -> Option<&Expr> {
-    let Expr::MethodCall(ExprMethodCall { method, args, .. }) = expr else {
-        return None;
-    };
-    if (method == "push" || method == "push_ref" || method == "push_float" || method == "push_raw")
-        && args.len() == 1
-    {
-        Some(&args[0])
-    } else {
-        None
     }
 }
 
@@ -3020,64 +2755,6 @@ fn typed_call_arg_tokens(bindings: &[Binding]) -> TokenStream {
         }
     });
     quote! { &[#(#args),*] }
-}
-
-fn is_pop_call(expr: &Expr) -> bool {
-    matches!(
-        expr,
-        Expr::MethodCall(ExprMethodCall { method, args, .. }) if (method == "pop" || method == "pop_raw") && args.is_empty()
-    )
-}
-
-fn is_pop_value(expr: &Expr) -> bool {
-    if is_pop_call(expr) {
-        return true;
-    }
-    match expr {
-        Expr::MethodCall(ExprMethodCall {
-            receiver,
-            method,
-            args,
-            ..
-        }) if (method == "unwrap" || method == "expect")
-            && (method == "unwrap" || args.len() == 1) =>
-        {
-            is_pop_call(receiver)
-        }
-        Expr::Call(ExprCall { func, args, .. }) if args.is_empty() => {
-            matches!(&**func, Expr::MethodCall(ExprMethodCall { receiver, method, .. }) if method == "unwrap" && is_pop_call(receiver))
-        }
-        _ => false,
-    }
-}
-
-fn is_peek_value(expr: &Expr) -> bool {
-    match expr {
-        Expr::MethodCall(ExprMethodCall { method, args, .. })
-            if method == "peek" && args.is_empty() =>
-        {
-            true
-        }
-        Expr::MethodCall(ExprMethodCall {
-            receiver,
-            method,
-            args,
-            ..
-        }) if (method == "unwrap" || method == "expect")
-            && (method == "unwrap" || args.len() == 1) =>
-        {
-            matches!(
-                &**receiver,
-                Expr::MethodCall(ExprMethodCall { method, args, .. })
-                    if method == "peek" && args.is_empty()
-            )
-        }
-        _ => false,
-    }
-}
-
-fn is_pop_discard(expr: &Expr) -> bool {
-    is_pop_call(expr)
 }
 
 fn is_supported_int_cast(ty: &Type) -> bool {
@@ -3324,66 +3001,6 @@ mod tests {
         Some(result.to_string())
     }
 
-    #[test]
-    fn lower_match_stmt_with_literals() {
-        let code = r#"{
-            let x = stack.pop();
-            match x {
-                1 => { stack.push(10); }
-                2 => { stack.push(20); }
-                _ => { stack.push(0); }
-            }
-        }"#;
-        let result = try_lower(code);
-        assert!(result.is_some(), "match should be lowerable");
-        let s = result.unwrap();
-        // Should contain IntEq comparisons and branch labels
-        assert!(s.contains("IntEq"), "should generate equality checks");
-        assert!(s.contains("branch_reg_zero"), "should generate branches");
-        assert!(s.contains("new_label"), "should generate labels");
-    }
-
-    #[test]
-    fn lower_match_or_pattern() {
-        let code = r#"{
-            let x = stack.pop();
-            match x {
-                1 | 2 => { stack.push(10); }
-                _ => { stack.push(0); }
-            }
-        }"#;
-        let result = try_lower(code);
-        assert!(
-            result.is_some(),
-            "match with Or pattern should be lowerable"
-        );
-        let s = result.unwrap();
-        assert!(
-            s.contains("IntOr"),
-            "should generate OR for multi-literal pattern"
-        );
-    }
-
-    #[test]
-    fn lower_match_value_expr() {
-        let code = r#"{
-            let x = stack.pop();
-            let y = match x {
-                1 => 10,
-                2 => 20,
-                _ => 0
-            };
-            stack.push(y);
-        }"#;
-        let result = try_lower(code);
-        assert!(result.is_some(), "match as value should be lowerable");
-        let s = result.unwrap();
-        assert!(
-            s.contains("move_i"),
-            "should produce move_i for value result"
-        );
-    }
-
     fn parse_pat(code: &str) -> Pat {
         let match_code = format!("match x {{ {code} => () }}");
         let expr: syn::ExprMatch = syn::parse_str(&match_code).expect("failed to parse match");
@@ -3409,94 +3026,5 @@ mod tests {
         let pat = parse_pat("_");
         let lits = extract_pat_literals(&pat);
         assert_eq!(lits, None);
-    }
-
-    #[test]
-    fn lower_match_no_default() {
-        // Match without a wildcard arm; all arms are guarded.
-        let code = r#"{
-            let x = stack.pop();
-            match x {
-                1 => { stack.push(10); }
-                2 => { stack.push(20); }
-            }
-        }"#;
-        let result = try_lower(code);
-        assert!(
-            result.is_some(),
-            "match without default should be lowerable"
-        );
-    }
-
-    #[test]
-    fn lower_while_loop() {
-        let code = r#"{
-            let x = stack.pop();
-            while x > 0 {
-                stack.push(x);
-                break;
-            }
-        }"#;
-        let result = try_lower(code);
-        assert!(result.is_some(), "while loop should be lowerable");
-        let s = result.unwrap();
-        assert!(s.contains("mark_label"), "should generate loop labels");
-        assert!(s.contains("branch_reg_zero"), "should generate exit branch");
-        assert!(s.contains("jump"), "should generate back-edge jump");
-    }
-
-    #[test]
-    fn lower_loop_with_break() {
-        let code = r#"{
-            let x = stack.pop();
-            loop {
-                stack.push(x);
-                break;
-            }
-        }"#;
-        let result = try_lower(code);
-        assert!(result.is_some(), "loop with break should be lowerable");
-        let s = result.unwrap();
-        assert!(s.contains("mark_label"), "should generate loop labels");
-        assert!(
-            s.contains("jump"),
-            "should generate jumps for break and back-edge"
-        );
-    }
-
-    #[test]
-    fn lower_loop_with_conditional_break() {
-        let code = r#"{
-            let x = stack.pop();
-            loop {
-                if x > 0 {
-                    break;
-                }
-                stack.push(x);
-            }
-        }"#;
-        let result = try_lower(code);
-        assert!(
-            result.is_some(),
-            "loop with conditional break should be lowerable"
-        );
-        let s = result.unwrap();
-        assert!(s.contains("mark_label"), "should generate labels");
-        assert!(
-            s.contains("branch_reg_zero"),
-            "should generate conditional branch"
-        );
-    }
-
-    #[test]
-    fn lower_for_loop_returns_none() {
-        // For loops are not lowered (they fall back to opaque).
-        let code = r#"{
-            for i in 0..10 {
-                stack.push(i);
-            }
-        }"#;
-        let result = try_lower(code);
-        assert!(result.is_none(), "for loop should not be lowerable");
     }
 }

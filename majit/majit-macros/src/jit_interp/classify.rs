@@ -14,7 +14,7 @@
 //! - **Nested if/else**: multiple levels of if/else within a match arm
 //! - **match on opcode** (the main dispatch): the top-level opcode match
 //! - **Nested match in let-binding**: `let x = match ... { ... };` is
-//!   recognized as a `BranchGroup` (BRPOP/JMP/BRZ pattern)
+//!   lowered arm-by-arm by the proc-macro
 //! - **Standalone match**: `match x { 1 => ..., 2 => ..., _ => ... }` is
 //!   lowered to a chained if-else guard sequence
 //!
@@ -39,8 +39,6 @@ use syn::{Arm, Expr, ExprBlock, Pat, Stmt};
 
 /// Classification of a match arm for trace code generation.
 pub enum ArmPattern {
-    /// Branch group — contains a nested match (BRPOP/JMP/BRZ).
-    BranchGroup,
     /// Abort permanently — contains untraceable I/O input operations.
     AbortPermanent,
     /// No-op — empty body.
@@ -86,9 +84,6 @@ fn classify_arm_body(body: &Expr) -> ArmPattern {
 
     if detect_abort_pattern(&stmts) {
         return ArmPattern::AbortPermanent;
-    }
-    if detect_branch_group_pattern(&stmts) {
-        return ArmPattern::BranchGroup;
     }
     if let Some(reason) = detect_unsupported_pattern(&stmts) {
         return ArmPattern::Unsupported(reason);
@@ -230,20 +225,6 @@ fn path_ends_with(expr: &Expr, names: &[&str]) -> bool {
     }
 }
 
-/// Detect branch group pattern: contains a nested match in a let-binding.
-fn detect_branch_group_pattern(stmts: &[Stmt]) -> bool {
-    for stmt in stmts {
-        if let Stmt::Local(local) = stmt {
-            if let Some(init) = &local.init {
-                if matches!(&*init.expr, Expr::Match(_)) {
-                    return true;
-                }
-            }
-        }
-    }
-    false
-}
-
 /// Detect unsupported CFG patterns within match arm statements.
 ///
 /// Returns `Some(reason)` if an unsupported pattern is found.
@@ -261,8 +242,6 @@ fn check_stmt_unsupported(stmt: &Stmt) -> Option<String> {
         Stmt::Expr(expr, _) => check_expr_unsupported(expr),
         Stmt::Local(local) => {
             if let Some(init) = &local.init {
-                // Nested match in let-binding is handled as BranchGroup,
-                // so we only flag it if it's not detected as a branch group.
                 check_expr_unsupported(&init.expr)
             } else {
                 None
@@ -384,13 +363,6 @@ mod tests {
         let arm = parse_arm("0 => { if a { if b { x(); } else { y(); } } else { z(); } },");
         let result = classify_arm_body(&arm.body);
         assert!(matches!(result, ArmPattern::Lowerable));
-    }
-
-    #[test]
-    fn classify_let_match_as_branch_group() {
-        let arm = parse_arm("0 => { let x = match op { 1 => a, _ => b }; },");
-        let result = classify_arm_body(&arm.body);
-        assert!(matches!(result, ArmPattern::BranchGroup));
     }
 
     #[test]
