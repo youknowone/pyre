@@ -4431,86 +4431,57 @@ while i < 20:
     #[test]
     fn test_eval_with_jit_redecodes_opargs_after_extended_arg_jumps() {
         let _jit_params = TestJitParamsGuard::low_threshold();
-        let source = "\
-def fannkuch(n):
-    p = [0] * n
-    q = [0] * n
-    s = [0] * n
-    i = 0
-    while i < n:
-        p[i] = i
-        q[i] = i
-        s[i] = i
-        i = i + 1
-    maxflips = 0
-    checksum = 0
-    sign = 1
-    while True:
-        q0 = p[0]
-        if q0 != 0:
-            i = 1
-            while i < n:
-                q[i] = p[i]
-                i = i + 1
-            flips = 1
-            while True:
-                qq = q[q0]
-                if qq == 0:
-                    break
-                q[q0] = q0
-                if q0 >= 3:
-                    i = 1
-                    j = q0 - 1
-                    while i < j:
-                        t = q[i]
-                        q[i] = q[j]
-                        q[j] = t
-                        i = i + 1
-                        j = j - 1
-                q0 = qq
-                flips = flips + 1
-            if flips > maxflips:
-                maxflips = flips
-            checksum = checksum + sign * flips
-        if sign == 1:
-            t = p[0]
-            p[0] = p[1]
-            p[1] = t
-            sign = -1
-        else:
-            t = p[1]
-            p[1] = p[2]
-            p[2] = t
-            sign = 1
-            i = 2
-            while i < n:
-                sx = s[i]
-                if sx != 0:
-                    s[i] = sx - 1
-                    break
-                if i == n - 1:
-                    return 999
-                s[i] = i
-                t = p[0]
-                j = 0
-                while j < i + 1:
-                    p[j] = p[j + 1]
-                    j = j + 1
-                p[i + 1] = t
-                i = i + 1
-r = fannkuch(4)";
-        let code = pyre_interpreter::compile_exec(source).expect("compile failed");
+        let mut source = String::from(
+            "\
+i = 0
+acc = 0
+if i == 1:
+",
+        );
+        for _ in 0..80 {
+            source.push_str("    acc = acc + 1000\n");
+        }
+        source.push_str(
+            "\
+while i < 6:
+    acc = acc + 1
+    i = i + 1
+r = acc",
+        );
+        let code = pyre_interpreter::compile_exec(&source).expect("compile failed");
+        assert!(
+            code.instructions.windows(2).any(|pair| {
+                matches!(
+                    pair[0].op,
+                    pyre_interpreter::bytecode::Instruction::ExtendedArg
+                ) && !matches!(
+                    pair[1].op,
+                    pyre_interpreter::bytecode::Instruction::ExtendedArg
+                )
+            }),
+            "expected an instruction with an ExtendedArg prefix"
+        );
         if std::env::var_os("MAJIT_DUMP_BYTECODE").is_some() {
             let mut state = pyre_interpreter::OpArgState::default();
             for (pc, unit) in code.instructions.iter().copied().enumerate() {
                 let (instr, oparg) = state.get(unit);
                 eprintln!("{pc:03}: {instr:?} oparg={oparg:?}");
             }
-            for pc in [72usize, 99, 129, 131, 141, 168, 179, 447, 449] {
-                eprintln!(
-                    "decode[{pc}] = {:?}",
-                    pyre_interpreter::decode_instruction_at(&code, pc)
-                );
+            for (pc, pair) in code.instructions.windows(2).enumerate() {
+                if matches!(
+                    pair[0].op,
+                    pyre_interpreter::bytecode::Instruction::ExtendedArg
+                ) && !matches!(
+                    pair[1].op,
+                    pyre_interpreter::bytecode::Instruction::ExtendedArg
+                ) {
+                    let target_pc = pc + 1;
+                    eprintln!(
+                        "decode[{target_pc}] = {:?}",
+                        pyre_interpreter::decode_instruction_at(&code, target_pc)
+                    );
+                    break;
+                }
             }
         }
         let mut frame = PyFrame::new(code);
@@ -4523,7 +4494,7 @@ r = fannkuch(4)";
         }
         unsafe {
             let r = *(*frame.namespace).get("r").unwrap();
-            assert_eq!(pyre_object::intobject::w_int_get_value(r), 999);
+            assert_eq!(pyre_object::intobject::w_int_get_value(r), 6);
         }
     }
 
