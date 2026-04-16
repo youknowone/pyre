@@ -950,7 +950,7 @@ impl GcRewriterImpl {
         st.emitting_an_operation_that_can_collect();
         let malloc_op = Op::new(OpCode::CallMallocNurseryVarsizeFrame, &[size]);
         let frame = st.emit_result(malloc_op, OpRef::NONE);
-        st.remember_write_barrier(frame);
+        st.remember_wb(frame);
 
         // rewrite.py:635 — gen_initialize_tid(frame, descrs.arraydescr.tid)
         self.gen_initialize_tid(frame, descrs.jitframe_tid, st);

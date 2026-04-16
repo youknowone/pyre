@@ -103,16 +103,13 @@ impl BaseJitCell {
         self.flags & jc_flags::TRACING != 0
     }
 
+    /// warmstate.py:191-196 — get_procedure_token returns None for
+    /// invalidated tokens. is_compiled additionally excludes TEMPORARY.
     pub fn is_compiled(&self) -> bool {
-        self.loop_token.is_some() && (self.flags & jc_flags::TEMPORARY == 0)
+        self.get_procedure_token().is_some() && (self.flags & jc_flags::TEMPORARY == 0)
     }
 
-    pub fn has_procedure_token(&self) -> bool {
-        self.loop_token.is_some()
-    }
-
-    /// Get the procedure token, returning None if the token has been
-    /// invalidated (mirrors BaseBaseJitCell.get_procedure_token).
+    /// warmstate.py:191-196 get_procedure_token
     pub fn get_procedure_token(&self) -> Option<&Arc<JitCellToken>> {
         self.loop_token.as_ref().filter(|t| !t.is_invalidated())
     }

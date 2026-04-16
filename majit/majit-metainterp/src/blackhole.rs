@@ -975,6 +975,10 @@ pub struct BlackholeInterpreter {
     /// majit's blackhole receives it from the pyre resolver until the
     /// surrounding MetaInterpStaticData object is fully ported.
     pub liveness_info: Vec<u8>,
+    /// Pyre: absolute start index of the operand stack in
+    /// PyFrame.locals_cells_stack_w. RPython does not need this because
+    /// its JitCode already operates in register space.
+    pub virtualizable_stack_base: usize,
 }
 
 // blackhole.py: last exception value from a residual call.
@@ -1036,6 +1040,7 @@ impl BlackholeInterpreter {
             portal_runner_ptr: None,
             mainjitcode_calldescr: BhCallDescr::default(),
             liveness_info: Vec::new(),
+            virtualizable_stack_base: 0,
         }
     }
 
@@ -2718,7 +2723,7 @@ impl Default for BlackholeInterpBuilder {
 
 impl BlackholeInterpBuilder {
     pub fn new() -> Self {
-        Self {
+        let mut builder = Self {
             pool: Vec::new(),
             cpu: None,
             _insns: Vec::new(),

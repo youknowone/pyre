@@ -266,7 +266,7 @@ pub fn arena_global_info() -> majit_backend_cranelift::InlineFrameArenaInfo {
         buf_base_addr: unsafe { std::ptr::addr_of!(ARENA_BUF_BASE) as usize },
         top_addr: unsafe { std::ptr::addr_of!(ARENA_TOP) as usize },
         initialized_addr: unsafe { std::ptr::addr_of!(ARENA_INITIALIZED) as usize },
-        frame_size: GC_HEADER_SIZE + std::mem::size_of::<pyre_interpreter::pyframe::PyFrame>(),
+        frame_size: std::mem::size_of::<GcFrameSlot>(),
         gc_header_size: GC_HEADER_SIZE,
         frame_code_offset: pyre_interpreter::pyframe::PYFRAME_PYCODE_OFFSET,
         frame_next_instr_offset: pyre_interpreter::pyframe::PYFRAME_LAST_INSTR_OFFSET,
@@ -275,6 +275,10 @@ pub fn arena_global_info() -> majit_backend_cranelift::InlineFrameArenaInfo {
         drop_fn_addr: jit_drop_callee_frame as *const () as usize,
         arena_cap: ARENA_CAP,
         jitframe_descrs: Some(majit_gc::rewrite::JitFrameDescrs {
+            create_fn_addrs: vec![
+                jit_create_self_recursive_callee_frame_1_raw_int as *const () as usize,
+            ],
+            drop_fn_addr: jit_drop_callee_frame as *const () as usize,
             jitframe_tid: crate::jit::descr::JITFRAME_GC_TYPE_ID,
             jitframe_fixed_size: JITFRAME_FIXED_SIZE,
             jf_frame_info_ofs: JF_FRAME_INFO_OFS,
@@ -287,6 +291,15 @@ pub fn arena_global_info() -> majit_backend_cranelift::InlineFrameArenaInfo {
             jf_frame_baseitemofs: BASEITEMOFS,
             jf_frame_lengthofs: LENGTHOFS,
             sign_size: SIGN_SIZE,
+            pyframe_alloc_size: GC_HEADER_SIZE
+                + std::mem::size_of::<pyre_interpreter::pyframe::PyFrame>(),
+            pyframe_code_ofs: pyre_interpreter::pyframe::PYFRAME_CODE_OFFSET,
+            pyframe_namespace_ofs: std::mem::offset_of!(
+                pyre_interpreter::pyframe::PyFrame,
+                namespace
+            ),
+            pyframe_next_instr_ofs: pyre_interpreter::pyframe::PYFRAME_NEXT_INSTR_OFFSET,
+            pyframe_vable_token_ofs: pyre_interpreter::pyframe::PYFRAME_VABLE_TOKEN_OFFSET,
         }),
     }
 }
@@ -297,19 +310,50 @@ pub fn arena_global_info() -> majit_backend_cranelift::InlineFrameArenaInfo {
 // Eliminates heap allocation for recursion depths up to ARENA_CAP.
 
 const ARENA_CAP: usize = 64;
-use pyre_interpreter::pyframe::GC_HEADER_SIZE;
 
-/// Arena slot: GC header (zeroed) + PyFrame.
-/// Write barriers read `*(frame_ptr - 8)` for the flag byte;
-/// the zeroed header makes `TRACK_YOUNG_PTRS=0` → fast-path skip.
-#[repr(C, align(8))]
-struct ArenaSlot {
-    _gc_header: [u8; GC_HEADER_SIZE],
+/// PyPy GcStruct layout: [GcHeader (8 bytes)] [struct fields].
+/// Every GC object (including PyFrame / W_Root) is prepended by a
+/// zeroed GcHeader. Arena slots and heap fallbacks match this layout.
+const GC_HEADER_SIZE: usize = 8;
+
+/// Arena slot with prepended GcHeader (zeroed, layout parity only).
+#[repr(C)]
+struct GcFrameSlot {
+    gc_header: u64,
     frame: MaybeUninit<PyFrame>,
 }
 
+impl GcFrameSlot {
+    const fn zeroed() -> Self {
+        GcFrameSlot {
+            gc_header: 0,
+            frame: MaybeUninit::uninit(),
+        }
+    }
+}
+
+/// Heap-allocated frame with prepended GcHeader.
+#[repr(C)]
+struct GcPyFrame {
+    gc_header: u64,
+    frame: PyFrame,
+}
+
+fn heap_alloc_frame(frame: PyFrame) -> *mut PyFrame {
+    let gc_frame = Box::into_raw(Box::new(GcPyFrame {
+        gc_header: 0,
+        frame,
+    }));
+    unsafe { &mut (*gc_frame).frame as *mut PyFrame }
+}
+
+fn heap_free_frame(ptr: *mut PyFrame) {
+    let gc_frame = unsafe { (ptr as *mut u8).sub(GC_HEADER_SIZE) as *mut GcPyFrame };
+    unsafe { drop(Box::from_raw(gc_frame)) };
+}
+
 struct FrameArena {
-    buf: Box<[ArenaSlot; ARENA_CAP]>,
+    buf: Box<[GcFrameSlot; ARENA_CAP]>,
     /// Number of frames currently in use (LIFO stack pointer).
     top: usize,
     /// Frames below this index have been initialized at least once.
@@ -320,14 +364,7 @@ struct FrameArena {
 impl FrameArena {
     fn new() -> Self {
         let mut arena = Self {
-            buf: Box::new(
-                [const {
-                    ArenaSlot {
-                        _gc_header: [0u8; GC_HEADER_SIZE],
-                        frame: MaybeUninit::uninit(),
-                    }
-                }; ARENA_CAP],
-            ),
+            buf: Box::new([const { GcFrameSlot::zeroed() }; ARENA_CAP]),
             top: 0,
             initialized: 0,
         };
@@ -342,7 +379,7 @@ impl FrameArena {
     }
 
     /// Take the next frame slot. Returns (ptr, was_previously_initialized).
-    /// The returned pointer has a zeroed GC header at `ptr - GC_HEADER_SIZE`.
+    /// The returned pointer points to the PyFrame part (after the GcHeader).
     #[inline]
     fn take(&mut self) -> Option<(*mut PyFrame, bool)> {
         if self.top < ARENA_CAP {
@@ -369,8 +406,9 @@ impl FrameArena {
             }
             return true;
         }
+        // Check if within arena range — don't free, but mark as non-LIFO.
         let base = self.buf[0].frame.as_mut_ptr() as usize;
-        let end = unsafe { self.buf.as_ptr().add(ARENA_CAP) as usize };
+        let end = unsafe { (self.buf.as_ptr() as *const GcFrameSlot).add(ARENA_CAP) as usize };
         let addr = ptr as usize;
         addr >= base && addr < end
     }
@@ -1063,6 +1101,8 @@ pub fn resume_in_blackhole(
 
         let mut bh = builder.acquire_interp();
         bh.setposition(pyjitcode.jitcode.clone(), jitcode_pc);
+        // pyjitpl.py:2264: metainterp_sd.liveness_info — global pool.
+        bh.liveness_info = pyre_jit_trace::state::liveness_info_snapshot();
         // blackhole.py:1095 get_portal_runner parity:
         // Set portal_runner_ptr for bhimpl_recursive_call.
         bh.portal_runner_ptr = Some(bh_portal_runner);
@@ -1097,147 +1137,73 @@ pub fn resume_in_blackhole(
             );
         }
 
-        // resume.py:1381 consume_one_section → 1017 _prepare_next_section
-        // → jitcode.py:147 enumerate_vars(info, liveness_info, cb_r)
-        // RPython: both encoder (get_list_of_active_boxes) and decoder
-        // use the SAME all_liveness data. Use PyJitCodeMetadata.liveness
-        // (same source as get_list_of_active_boxes).
-        let live_pc = section.rd_numb_pc.unwrap_or(section.py_pc);
-        // Look up LivenessInfo from JitCode (same data as capture side).
-        let writer = crate::jit::codewriter::CodeWriter::new(
-            bh_call_fn,
-            bh_load_global_fn,
-            bh_compare_fn,
-            bh_binary_op_fn,
-            bh_box_int_fn,
-            bh_truth_fn,
-            bh_load_const_fn,
-            bh_store_subscr_fn,
-            crate::call_jit::bh_build_list_fn,
+        // resume.py:1381-1384 consume_one_section:
+        //     info = blackholeinterp.get_current_position_info()
+        //     self._prepare_next_section(info)
+        //
+        // _prepare_next_section → enumerate_vars(info, all_liveness,
+        //     callback_i, callback_r, callback_f)
+        //
+        // Each callback: value = self.next_TYPE(); write_a_TYPE(reg, value)
+        // Values are consumed in order: all ints, then all refs, then floats.
+        assert!(
+            !bh.liveness_info.is_empty(),
+            "resume_in_blackhole: missing liveness_info for jitcode at py_pc={} jit_pc={}",
+            section.py_pc,
+            bh.position
         );
-        let w_code_for_jitcode = section.code;
-        let code_ref = unsafe {
-            &*(pyre_interpreter::w_code_get_ptr(w_code_for_jitcode as pyre_object::PyObjectRef)
-                as *const pyre_interpreter::CodeObject)
-        };
-        let pyjitcode = crate::jit::codewriter::get_jitcode(code_ref, w_code_for_jitcode, &writer);
-        let meta = &pyjitcode.metadata;
-        let liveness_info = meta
-            .py_to_jit_pc
-            .get(live_pc)
-            .and_then(|&jit_pc| meta.liveness.iter().find(|info| info.pc as usize == jit_pc));
-        let n_live = liveness_info
-            .map(|info| info.live_r_regs.len())
-            .unwrap_or_else(|| {
-                // Fallback to LiveVars when JitCode liveness unavailable.
-                let live = pyre_jit_trace::state::liveness_for(unsafe {
-                    pyre_interpreter::w_code_get_ptr(section.code as pyre_object::PyObjectRef)
-                        as *const pyre_interpreter::CodeObject
-                });
-                let max_stack = vsd.saturating_sub(nlocals);
-                let n_live_locals = (0..nlocals)
-                    .filter(|&i| live.is_local_live(live_pc, i))
-                    .count();
-                let n_live_stack = (0..max_stack)
-                    .filter(|&i| live.is_stack_live(live_pc, i))
-                    .count();
-                n_live_locals + n_live_stack
-            });
-        // RPython parity: values = active boxes only (no header).
-        let n_vals = section.values.len();
-        let use_liveness = n_live == n_vals;
+        // jitcode.py:82 get_live_vars_info(pc, op_live)
+        let liveness_offset = bh.get_current_position_info();
+        let all_liveness = bh.liveness_info.clone();
+        // jitcode.py:146-167 enumerate_vars: collect live register indices
+        let mut live_i: Vec<u32> = Vec::new();
+        let mut live_r: Vec<u32> = Vec::new();
+        let mut live_f: Vec<u32> = Vec::new();
+        majit_metainterp::jitcode::enumerate_vars(
+            liveness_offset,
+            &all_liveness,
+            |idx| live_i.push(idx),
+            |idx| live_r.push(idx),
+            |idx| live_f.push(idx),
+        );
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
-                "[jit][liveness-fill] py_pc={} live_pc={} nlocals={} live={} vals={} mode={}",
+                "[jit][consume_one_section] py_pc={} jit_pc={} live_i={:?} live_r={:?} live_f={:?} vals={}",
                 section.py_pc,
-                live_pc,
-                nlocals,
-                n_live,
-                n_vals,
-                if use_liveness {
-                    "liveness"
-                } else {
-                    "positional"
-                },
+                bh.position,
+                live_i,
+                live_r,
+                live_f,
+                section.values.len(),
             );
         }
-        // resume.py:1017-1038 _prepare_next_section:
-        // _callback_r → write_a_ref. pyre: all Python locals are
-        // PyObjectRef → ref bank only (codewriter uses move_r).
-        // Override the pre-filled values with the liveness-filtered recovery data.
-        if n_vals == 0 && nlocals > 0 {
-            // RPython parity: when resume data has no values (nvals=0),
-            // consume_vable_info has already written correct values to
-            // the live frame. Load locals directly from the frame's
-            // locals_cells_stack_w array into bh.registers_r so the
-            // blackhole can execute with correct operand values.
-            let frame = unsafe { &*frame_ptr };
-            for i in 0..nlocals.min(frame.locals_w().len()) {
-                let obj = frame.locals_w()[i];
-                if obj != pyre_object::PY_NULL {
-                    bh.setarg_r(i, obj as i64);
-                }
+        // resume.py:1017-1026 _prepare_next_section callbacks:
+        // _callback_i → next_int() → write_an_int(register_index, value)
+        // _callback_r → next_ref() → write_a_ref(register_index, value)
+        // _callback_f → next_float() → write_a_float(register_index, value)
+        let mut val_idx = 0;
+        for &reg_idx in &live_i {
+            if let Some(val) = section.values.get(val_idx) {
+                bh.setarg_i(reg_idx as usize, materialize_virtual_int(val));
             }
-            if majit_metainterp::majit_log_enabled() {
-                eprintln!(
-                    "[jit][vable-fill] nvals=0 → loaded {} locals from frame at py_pc={}",
-                    nlocals.min(frame.locals_w().len()),
-                    section.py_pc,
-                );
+            val_idx += 1;
+        }
+        for &reg_idx in &live_r {
+            if let Some(val) = section.values.get(val_idx) {
+                bh.setarg_r(reg_idx as usize, materialize_virtual(val));
             }
-        } else if use_liveness {
-            if let Some(info) = liveness_info {
-                for (val_idx, &reg_idx) in info.live_r_regs.iter().enumerate() {
-                    let idx = reg_idx as usize;
-                    if let Some(val) = section.values.get(val_idx) {
-                        if idx < nlocals {
-                            bh.setarg_r(idx, materialize_virtual(val));
-                        } else {
-                            bh.runtime_stack_push(0, materialize_virtual(val));
-                        }
-                    }
-                }
-            } else {
-                // Fallback: LiveVars path — all slots ref.
-                let live = pyre_jit_trace::state::liveness_for(unsafe {
-                    pyre_interpreter::w_code_get_ptr(section.code as pyre_object::PyObjectRef)
-                        as *const pyre_interpreter::CodeObject
-                });
-                let max_stack = vsd.saturating_sub(nlocals);
-                let mut val_idx = 0;
-                for i in 0..nlocals {
-                    if live.is_local_live(live_pc, i) {
-                        if let Some(val) = section.values.get(val_idx) {
-                            bh.setarg_r(i, materialize_virtual(val));
-                        }
-                        val_idx += 1;
-                    }
-                }
-                for i in 0..max_stack {
-                    if live.is_stack_live(live_pc, i) {
-                        if let Some(val) = section.values.get(val_idx) {
-                            bh.runtime_stack_push(0, materialize_virtual(val));
-                        }
-                        val_idx += 1;
-                    }
-                }
+            val_idx += 1;
+        }
+        for &reg_idx in &live_f {
+            if let Some(val) = section.values.get(val_idx) {
+                bh.setarg_f(reg_idx as usize, materialize_virtual_float(val));
             }
-        } else {
-            for i in 0..nlocals {
-                if let Some(val) = section.values.get(i) {
-                    bh.setarg_r(i, materialize_virtual(val));
-                }
-            }
-            let stack_only = vsd.saturating_sub(nlocals);
-            for i in 0..stack_only {
-                if let Some(val) = section.values.get(nlocals + i) {
-                    bh.runtime_stack_push(0, materialize_virtual(val));
-                }
-            }
+            val_idx += 1;
         }
         // blackhole.py bhimpl_getfield_vable_*: set virtualizable pointer.
         bh.virtualizable_ptr = frame_ptr as i64;
         bh.virtualizable_info = crate::eval::get_virtualizable_info();
+        bh.virtualizable_stack_base = nlocals + pyre_interpreter::pyframe::ncells(code);
         // Portal red-arg registers must be filled AFTER virtualizable_ptr.
         let ec = unsafe { (*frame_ptr).execution_context as i64 };
         bh.fill_portal_registers(
@@ -1425,6 +1391,24 @@ fn materialize_virtual(val: &majit_ir::Value) -> i64 {
         Value::Int(v) => pyre_object::intobject::w_int_new(*v) as i64,
         Value::Float(v) => pyre_object::floatobject::w_float_new(*v) as i64,
         Value::Void => 0i64,
+    }
+}
+
+/// resume.py:1028 _callback_i → next_int() → write_an_int.
+/// RPython trusts type discipline — no cross-type coercion.
+fn materialize_virtual_int(val: &majit_ir::Value) -> i64 {
+    match val {
+        majit_ir::Value::Int(v) => *v,
+        other => panic!("materialize_virtual_int: expected Int, got {:?}", other),
+    }
+}
+
+/// resume.py:1036 _callback_f → next_float() → write_a_float.
+/// RPython trusts type discipline — no cross-type coercion.
+fn materialize_virtual_float(val: &majit_ir::Value) -> i64 {
+    match val {
+        majit_ir::Value::Float(v) => v.to_bits() as i64,
+        other => panic!("materialize_virtual_float: expected Float, got {:?}", other),
     }
 }
 
@@ -1819,10 +1803,11 @@ pub fn blackhole_resume_via_rd_numb(
         // Convert Python PC → JitCode byte offset via pc_map.
         // pc_map miss is a BUG — fail rather than silently restart from 0.
         let jitcode_pc = pyjitcode.metadata.pc_map.get(pc as usize).copied()?;
-        Some(resume::ResolvedJitCode::new(
-            pyjitcode.jitcode.clone(),
-            jitcode_pc,
-        ))
+        Some(
+            resume::ResolvedJitCode::new(pyjitcode.jitcode.clone(), jitcode_pc)
+                .with_virtualizable_stack_base(pyjitcode.metadata.stack_base)
+                .with_liveness_metadata(pyre_jit_trace::state::liveness_info_snapshot()),
+        )
     };
 
     // resume.py:983-991 _prepare_virtuals: convert RdVirtualInfo → VirtualInfo
@@ -1843,7 +1828,6 @@ pub fn blackhole_resume_via_rd_numb(
     // resume.py:1314: vrefinfo = metainterp_sd.virtualref_info
     // resume.py:1316: ginfo = jitdriver_sd.greenfield_info
     let allocator = crate::eval::PyreBlackholeAllocator;
-    let all_liveness = pyre_jit_trace::state::liveness_info_snapshot();
     let bh = resume::blackhole_from_resumedata(
         builder,
         &resolve_jitcode,
@@ -1858,7 +1842,6 @@ pub fn blackhole_resume_via_rd_numb(
         Some(&vinfo as &dyn resume::VirtualizableInfo),
         None, // ginfo — pyre has no greenfield mechanism
         &allocator,
-        &all_liveness,
     );
 
     let Some((mut bh, virtualizable_ptr)) = bh else {
@@ -2456,7 +2439,6 @@ fn create_callee_frame_impl_1_boxed(
                 reset_reused_call_frame(f, &[boxed_arg]);
             } else {
                 unsafe {
-                    std::ptr::drop_in_place(ptr);
                     std::ptr::write(
                         ptr,
                         PyFrame::new_for_call(
@@ -2482,14 +2464,12 @@ fn create_callee_frame_impl_1_boxed(
         return ptr as i64;
     }
 
-    let frame_ptr = unsafe {
-        alloc_frame_with_gc_header(PyFrame::new_for_call(
-            w_code,
-            &[boxed_arg],
-            globals,
-            caller.execution_context,
-        ))
-    };
+    let frame_ptr = heap_alloc_frame(PyFrame::new_for_call(
+        w_code,
+        &[boxed_arg],
+        globals,
+        caller.execution_context,
+    ));
     unsafe { &mut *frame_ptr }.fix_array_ptrs();
     frame_ptr as i64
 }
@@ -2517,7 +2497,6 @@ fn create_self_recursive_callee_frame_impl_1_boxed(
                 reset_reused_call_frame(f, &[boxed_arg]);
             } else {
                 unsafe {
-                    std::ptr::drop_in_place(ptr);
                     std::ptr::write(
                         ptr,
                         PyFrame::new_for_call(func_code, &[boxed_arg], globals, execution_context),
@@ -2538,14 +2517,12 @@ fn create_self_recursive_callee_frame_impl_1_boxed(
         return ptr as i64;
     }
 
-    let frame_ptr = unsafe {
-        alloc_frame_with_gc_header(PyFrame::new_for_call(
-            func_code,
-            &[boxed_arg],
-            globals,
-            execution_context,
-        ))
-    };
+    let frame_ptr = heap_alloc_frame(PyFrame::new_for_call(
+        func_code,
+        &[boxed_arg],
+        globals,
+        execution_context,
+    ));
     unsafe { &mut *frame_ptr }.fix_array_ptrs();
     frame_ptr as i64
 }
@@ -2569,8 +2546,8 @@ fn create_callee_frame_impl(caller_frame: i64, callable: i64, args: &[PyObjectRe
             {
                 reset_reused_call_frame(f, args);
             } else {
+                // Different function: full reinit (rare for fib)
                 unsafe {
-                    std::ptr::drop_in_place(ptr);
                     std::ptr::write(
                         ptr,
                         PyFrame::new_for_call(w_code, args, globals, caller.execution_context),
@@ -2579,6 +2556,7 @@ fn create_callee_frame_impl(caller_frame: i64, callable: i64, args: &[PyObjectRe
                 }
             }
         } else {
+            // First-time init for this arena slot
             unsafe {
                 std::ptr::write(
                     ptr,
@@ -2592,14 +2570,12 @@ fn create_callee_frame_impl(caller_frame: i64, callable: i64, args: &[PyObjectRe
     }
 
     // Arena full: heap fallback (should not happen for recursion < 64)
-    let frame_ptr = unsafe {
-        alloc_frame_with_gc_header(PyFrame::new_for_call(
-            w_code,
-            args,
-            globals,
-            caller.execution_context,
-        ))
-    };
+    let frame_ptr = heap_alloc_frame(PyFrame::new_for_call(
+        w_code,
+        args,
+        globals,
+        caller.execution_context,
+    ));
     unsafe { &mut *frame_ptr }.fix_array_ptrs();
     frame_ptr as i64
 }
@@ -2666,9 +2642,6 @@ pub extern "C" fn jit_create_self_recursive_callee_frame_1_raw_int(
             reset_reused_call_frame(f, &[boxed]);
         } else {
             unsafe {
-                if was_init {
-                    std::ptr::drop_in_place(ptr);
-                }
                 std::ptr::write(
                     ptr,
                     PyFrame::new_for_call(func_code, &[boxed], globals, execution_context),
@@ -2682,14 +2655,12 @@ pub extern "C" fn jit_create_self_recursive_callee_frame_1_raw_int(
         return ptr as i64;
     }
 
-    let frame_ptr = unsafe {
-        alloc_frame_with_gc_header(PyFrame::new_for_call(
-            func_code,
-            &[boxed],
-            globals,
-            execution_context,
-        ))
-    };
+    let frame_ptr = heap_alloc_frame(PyFrame::new_for_call(
+        func_code,
+        &[boxed],
+        globals,
+        execution_context,
+    ));
     unsafe { &mut *frame_ptr }.fix_array_ptrs();
     frame_ptr as i64
 }
@@ -2779,29 +2750,6 @@ pub extern "C" fn jit_force_callee_frame_boxed(frame_ptr: i64) -> i64 {
     jit_force_callee_frame(frame_ptr)
 }
 
-/// Allocate a PyFrame with a zeroed GC header prepended.
-/// Returns a frame pointer with valid header at `ptr - GC_HEADER_SIZE`.
-unsafe fn alloc_frame_with_gc_header(frame: PyFrame) -> *mut PyFrame {
-    let total = GC_HEADER_SIZE + std::mem::size_of::<PyFrame>();
-    let layout = std::alloc::Layout::from_size_align(total, 8).unwrap();
-    let raw = std::alloc::alloc_zeroed(layout);
-    if raw.is_null() {
-        std::alloc::handle_alloc_error(layout);
-    }
-    let frame_ptr = raw.add(GC_HEADER_SIZE) as *mut PyFrame;
-    std::ptr::write(frame_ptr, frame);
-    frame_ptr
-}
-
-/// Deallocate a PyFrame allocated with [`alloc_frame_with_gc_header`].
-unsafe fn dealloc_frame_with_gc_header(frame_ptr: *mut PyFrame) {
-    std::ptr::drop_in_place(frame_ptr);
-    let raw = (frame_ptr as *mut u8).sub(GC_HEADER_SIZE);
-    let total = GC_HEADER_SIZE + std::mem::size_of::<PyFrame>();
-    let layout = std::alloc::Layout::from_size_align(total, 8).unwrap();
-    std::alloc::dealloc(raw, layout);
-}
-
 #[majit_macros::dont_look_inside]
 pub extern "C" fn jit_drop_callee_frame(frame_ptr: i64) {
     if frame_ptr & 1 != 0 {
@@ -2811,7 +2759,8 @@ pub extern "C" fn jit_drop_callee_frame(frame_ptr: i64) {
     let arena = arena_ref();
     let reused = arena.put(ptr);
     if !reused {
-        unsafe { dealloc_frame_with_gc_header(ptr) };
+        // Not an arena frame (heap fallback) — free GcPyFrame allocation.
+        heap_free_frame(ptr);
     }
 }
 
