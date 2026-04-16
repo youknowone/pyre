@@ -504,14 +504,6 @@ impl Backend for DynasmBackend {
         ops: &[Op],
         token: &mut JitCellToken,
     ) -> Result<AsmInfo, BackendError> {
-        // unroll.py:204-205 force_box_for_end_of_preamble parity (missing in
-        // majit/optimizer — see unroll.rs:1132-1140): reject traces whose
-        // backedge JUMP passes Float at a Ref-typed inputarg position.
-        // Cranelift's compile path enforces the same check via
-        // `build_ref_root_slots`; parity with it prevents nbody NaN from
-        // floats-written-as-pointers when dispatch reaches a bad trace.
-        majit_backend::validate_jump_types_at_preamble(inputargs, ops)?;
-
         let trace_id = self.next_trace_id;
         self.next_trace_id += 1;
         let header_pc = self.next_header_pc;
@@ -580,12 +572,6 @@ impl Backend for DynasmBackend {
         original_token: &JitCellToken,
         _previous_tokens: &[JitCellToken],
     ) -> Result<AsmInfo, BackendError> {
-        // Same force_box_for_end_of_preamble parity check as compile_loop
-        // (see unroll.py:204-205 and unroll.rs:1132-1140). A bridge that
-        // ends with a backedge JUMP to the parent loop's preamble must
-        // also respect the preamble's inputarg types.
-        majit_backend::validate_jump_types_at_preamble(inputargs, ops)?;
-
         let trace_id = self.next_trace_id;
         self.next_trace_id += 1;
 

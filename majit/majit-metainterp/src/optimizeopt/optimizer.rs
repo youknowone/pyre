@@ -1978,7 +1978,7 @@ impl Optimizer {
                 .map(|&arg| ctx.get_box_replacement(arg))
                 .collect();
             for &resolved in &resolved_args {
-                self.force_at_the_end_of_preamble(resolved, &mut ctx);
+                self.force_box_for_end_of_preamble(resolved, &mut ctx);
             }
             // Phase 2: re-resolve after forcing (force may have changed forwarding)
             // and fix Ref→non-Ref type crossings by force_box
@@ -2188,7 +2188,7 @@ impl Optimizer {
             ctx.preamble_end_args = Some(
                 resolved_args
                     .iter()
-                    .map(|&arg| self.force_at_the_end_of_preamble(arg, &mut ctx))
+                    .map(|&arg| self.force_box_for_end_of_preamble(arg, &mut ctx))
                     .collect(),
             );
             // unroll.py:457 `virtual_state = self.get_virtual_state(end_args)`.
@@ -2358,7 +2358,7 @@ impl Optimizer {
                 let resolved = ctx.get_box_replacement(opref);
                 if let Some(info) = ctx.get_ptr_info(resolved) {
                     if info.is_virtual() {
-                        self.force_at_the_end_of_preamble(resolved, &mut ctx);
+                        self.force_box_for_end_of_preamble(resolved, &mut ctx);
                     }
                 }
             }
@@ -2709,7 +2709,7 @@ impl Optimizer {
         let saved_pass_idx = ctx.current_pass_idx;
         ctx.current_pass_idx = ctx.optearlyforce_idx;
         for &arg in &jump_args {
-            let _ = self.force_at_the_end_of_preamble(arg, &mut ctx);
+            let _ = self.force_box_for_end_of_preamble(arg, &mut ctx);
         }
         ctx.current_pass_idx = saved_pass_idx;
 
@@ -4553,7 +4553,7 @@ mod tests {
         );
 
         let mut opt = Optimizer::new();
-        let result = opt.force_at_the_end_of_preamble(OpRef(10), &mut ctx);
+        let result = opt.force_box_for_end_of_preamble(OpRef(10), &mut ctx);
 
         // The virtual is forced to a concrete allocation; the returned ref
         // is the allocation's position, which ctx.get_box_replacement(OpRef(10))
