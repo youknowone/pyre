@@ -222,8 +222,16 @@ pub trait GcAllocator: Send {
     /// Current nursery free pointer.
     fn nursery_free(&self) -> *mut u8;
 
+    /// gc.py:525-531 get_nursery_free_addr parity.
+    /// Address of the mutable nursery_free field that JIT code updates.
+    fn nursery_free_addr(&self) -> usize;
+
     /// Nursery top (end) pointer.
     fn nursery_top(&self) -> *const u8;
+
+    /// gc.py:525-531 get_nursery_top_addr parity.
+    /// Address of the mutable nursery_top field that JIT code reads.
+    fn nursery_top_addr(&self) -> usize;
 
     /// Maximum size for nursery allocation (larger objects go to old gen directly).
     fn max_nursery_object_size(&self) -> usize;

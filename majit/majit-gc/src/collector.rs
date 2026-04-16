@@ -1583,8 +1583,16 @@ impl GcAllocator for MiniMarkGC {
         self.nursery.free_ptr()
     }
 
+    fn nursery_free_addr(&self) -> usize {
+        self.nursery.free_addr()
+    }
+
     fn nursery_top(&self) -> *const u8 {
         self.nursery.top_ptr()
+    }
+
+    fn nursery_top_addr(&self) -> usize {
+        self.nursery.top_addr()
     }
 
     fn max_nursery_object_size(&self) -> usize {

@@ -5433,8 +5433,8 @@ impl CraneliftBackend {
         let runtime_id = self.gc_runtime_id?;
         let ct = constant_types.clone();
         Some(with_gc_runtime(runtime_id, |gc| GcRewriterImpl {
-            nursery_free_addr: gc.nursery_free() as usize,
-            nursery_top_addr: gc.nursery_top() as usize,
+            nursery_free_addr: gc.nursery_free_addr(),
+            nursery_top_addr: gc.nursery_top_addr(),
             max_nursery_size: gc.max_nursery_object_size(),
             // gc.py:259-283 WriteBarrierDescr parity.
             wb_descr: {
@@ -5801,6 +5801,11 @@ impl CraneliftBackend {
         let value_types = build_value_type_map_simple(inputargs, ops);
         let ref_root_slots = build_ref_root_slots(inputargs, ops, &force_tokens)?;
         let gc_runtime_id = self.gc_runtime_id;
+        let gc_nursery_addrs = gc_runtime_id.map(|runtime_id| {
+            with_gc_runtime(runtime_id, |gc| {
+                (gc.nursery_free_addr(), gc.nursery_top_addr())
+            })
+        });
         // llmodel.py:64-69 self.vtable_offset — backend property used by
         // bh_new_with_vtable. Capture for use in NEW_WITH_VTABLE codegen.
         let vtable_offset = self.vtable_offset;
@@ -8255,7 +8260,8 @@ impl CraneliftBackend {
                         // all live ref values + jf_ptr through the merge.
                         // Fast path passes originals (no memory ops).
                         // Slow path passes GC-updated values from jitframe.
-                        let (nf_addr, nt_addr) = majit_gc::nursery::nursery_global_addrs();
+                        let (nf_addr, nt_addr) =
+                            gc_nursery_addrs.ok_or_else(|| missing_gc_runtime(op.opcode))?;
                         let flags = MemFlags::trusted();
                         let size_val = constants
                             .get(&op.arg(0).0)
@@ -8433,7 +8439,8 @@ impl CraneliftBackend {
                     // inline nursery bump alloc with variable size.
                     // Same spill-before-brif / reload-after-merge pattern
                     // as CallMallocNursery for bridge parity.
-                    let (nf_addr, nt_addr) = majit_gc::nursery::nursery_global_addrs();
+                    let (nf_addr, nt_addr) =
+                        gc_nursery_addrs.ok_or_else(|| missing_gc_runtime(op.opcode))?;
                     let flags = MemFlags::trusted();
                     let size_total =
                         resolve_opref_or_imm(&mut builder, &constants, &known_values, op.arg(0));
@@ -12622,6 +12629,8 @@ mod tests {
     struct TrackingGc {
         state: Arc<Mutex<TrackingGcState>>,
         allocations: Vec<Box<[u8]>>,
+        nursery_free: usize,
+        nursery_top: usize,
     }
 
     impl TrackingGc {
@@ -12629,6 +12638,8 @@ mod tests {
             Self {
                 state,
                 allocations: Vec::new(),
+                nursery_free: 0,
+                nursery_top: 0,
             }
         }
 
@@ -12703,11 +12714,19 @@ mod tests {
         }
 
         fn nursery_free(&self) -> *mut u8 {
-            std::ptr::null_mut()
+            self.nursery_free as *mut u8
+        }
+
+        fn nursery_free_addr(&self) -> usize {
+            std::ptr::addr_of!(self.nursery_free) as usize
         }
 
         fn nursery_top(&self) -> *const u8 {
-            std::ptr::null()
+            self.nursery_top as *const u8
+        }
+
+        fn nursery_top_addr(&self) -> usize {
+            std::ptr::addr_of!(self.nursery_top) as usize
         }
 
         fn max_nursery_object_size(&self) -> usize {

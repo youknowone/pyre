@@ -134,6 +134,12 @@ impl Nursery {
         self.ptrs.free
     }
 
+    /// gc.py:525-531 get_nursery_free_addr parity.
+    #[inline]
+    pub fn free_addr(&self) -> usize {
+        std::ptr::addr_of!(self.ptrs.free) as usize
+    }
+
     /// Set the free pointer (used after collection with pinned objects).
     ///
     /// # Safety
@@ -158,6 +164,12 @@ impl Nursery {
     #[inline]
     pub fn top_ptr(&self) -> *const u8 {
         self.ptrs.top
+    }
+
+    /// gc.py:525-531 get_nursery_top_addr parity.
+    #[inline]
+    pub fn top_addr(&self) -> usize {
+        std::ptr::addr_of!(self.ptrs.top) as usize
     }
 
     /// Start of nursery.

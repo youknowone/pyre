@@ -204,8 +204,8 @@ impl DynasmBackend {
         with_dynasm_active_gc(|gc| {
             let ct = constant_types.clone();
             majit_gc::rewrite::GcRewriterImpl {
-                nursery_free_addr: gc.nursery_free() as usize,
-                nursery_top_addr: gc.nursery_top() as usize,
+                nursery_free_addr: gc.nursery_free_addr(),
+                nursery_top_addr: gc.nursery_top_addr(),
                 max_nursery_size: gc.max_nursery_object_size(),
                 wb_descr: {
                     let mut descr = majit_gc::WriteBarrierDescr::for_current_gc();
