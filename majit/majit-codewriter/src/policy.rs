@@ -54,6 +54,32 @@ impl JitPolicyState {
     pub fn set_supports_singlefloats(&mut self, flag: bool) {
         self.supports_singlefloats = flag;
     }
+
+    /// policy.py:27-33 `dump_unsafe_loops`.
+    ///
+    /// ```python
+    /// def dump_unsafe_loops(self):
+    ///     f = udir.join("unsafe-loops.txt").open('w')
+    ///     strs = [str(graph) for graph in self.unsafe_loopy_graphs]
+    ///     strs.sort()
+    ///     for graph in strs:
+    ///         print(graph, file=f)
+    ///     f.close()
+    /// ```
+    ///
+    /// RPython's `udir` is the translator's per-run temp directory; the
+    /// Rust port takes the destination path as a parameter so callers can
+    /// route the dump anywhere (typically `std::env::temp_dir()`).
+    pub fn dump_unsafe_loops(&self, path: &std::path::Path) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut strs: Vec<&String> = self.unsafe_loopy_graphs.iter().collect();
+        strs.sort();
+        let mut f = std::fs::File::create(path)?;
+        for graph in strs {
+            writeln!(f, "{}", graph)?;
+        }
+        Ok(())
+    }
 }
 
 /// `JitPolicy` interface.
@@ -180,12 +206,27 @@ impl JitPolicy for StopAtXPolicy {
 
 /// policy.py:56 `getattr(func, '_jit_look_inside_', ...)`.
 ///
-/// Returns `Some(true|false)` when the explicit `jit_look_inside`
+/// Returns `Some(true|false)` when the explicit `_jit_look_inside_`
 /// override is present, otherwise `None`.
+///
+/// rlib/jit.py wires the override via two decorators:
+///   - `@dont_look_inside` (`rlib/jit.py:142`) sets
+///     `func._jit_look_inside_ = False`
+///   - `@look_inside` (`rlib/jit.py:147`) sets
+///     `func._jit_look_inside_ = True`
+///
+/// `ast.rs::collect_jit_hints` lowers those decorators into the
+/// `"dont_look_inside"` and `"jit_look_inside"` hint strings; both forms
+/// route through this helper.
 fn jit_look_inside_hint(hints: &[String]) -> Option<bool> {
     for h in hints {
+        match h.as_str() {
+            "dont_look_inside" => return Some(false),
+            "jit_look_inside" => return Some(true),
+            _ => {}
+        }
         if let Some(rest) = h.strip_prefix("jit_look_inside") {
-            // Accept both `jit_look_inside` (true) and `jit_look_inside=false`.
+            // Accept the legacy `jit_look_inside=true|false` spelling.
             return match rest.trim_start_matches('=').trim() {
                 "" | "true" | "True" => Some(true),
                 "false" | "False" => Some(false),
@@ -373,6 +414,52 @@ mod tests {
             hints: vec!["unroll_safe".into()],
         };
         assert!(policy.look_inside_graph(&unroll_safe));
+    }
+
+    #[test]
+    fn dont_look_inside_hint_overrides_default_to_false() {
+        // test_policy.py:61-66 `test_dont_look_inside`.
+        let mut policy = DefaultJitPolicy::new();
+        let f = make_func("h", vec!["dont_look_inside"]);
+        assert!(!policy.look_inside_graph(&f));
+    }
+
+    #[test]
+    fn jit_look_inside_hint_overrides_subclass_to_true() {
+        // test_policy.py:68-80 `test_look_inside`.
+        struct NoPolicy(JitPolicyState);
+        impl JitPolicy for NoPolicy {
+            fn state(&self) -> &JitPolicyState {
+                &self.0
+            }
+            fn state_mut(&mut self) -> &mut JitPolicyState {
+                &mut self.0
+            }
+            fn look_inside_function(&self, _: &SemanticFunction) -> bool {
+                false
+            }
+        }
+        let mut policy = NoPolicy(JitPolicyState::new());
+        let h1 = make_func("h1", vec![]);
+        let h2 = make_func("h2", vec!["jit_look_inside"]);
+        assert!(!policy.look_inside_graph(&h1));
+        assert!(policy.look_inside_graph(&h2));
+    }
+
+    #[test]
+    fn dump_unsafe_loops_writes_sorted_names() {
+        let mut state = JitPolicyState::new();
+        state.unsafe_loopy_graphs.insert("zeta".into());
+        state.unsafe_loopy_graphs.insert("alpha".into());
+        state.unsafe_loopy_graphs.insert("mu".into());
+        let path = std::env::temp_dir().join(format!(
+            "majit-test-unsafe-loops-{}.txt",
+            std::process::id()
+        ));
+        state.dump_unsafe_loops(&path).expect("write");
+        let body = std::fs::read_to_string(&path).expect("read");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(body, "alpha\nmu\nzeta\n");
     }
 
     #[test]

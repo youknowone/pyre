@@ -197,6 +197,15 @@ pub struct CallControl {
     /// Stores oopspec function info for builtin call handling.
     pub callinfocollection: majit_ir::CallInfoCollection,
 
+    /// call.py:39 `self.virtualizable_analyzer = VirtualizableAnalyzer(translator)`.
+    pub virtualizable_analyzer: majit_ir::effectinfo::VirtualizableAnalyzer,
+
+    /// call.py:40 `self.quasiimmut_analyzer = QuasiImmutAnalyzer(translator)`.
+    pub quasiimmut_analyzer: majit_ir::effectinfo::QuasiImmutAnalyzer,
+
+    /// call.py:41 `self.randomeffects_analyzer = RandomEffectsAnalyzer(translator)`.
+    pub randomeffects_analyzer: majit_ir::effectinfo::RandomEffectsAnalyzer,
+
     /// Next JitCode index to assign.
     next_jitcode_index: usize,
 
@@ -483,6 +492,9 @@ impl CallControl {
             jitcodes: HashMap::new(),
             unfinished_graphs: Vec::new(),
             callinfocollection: majit_ir::CallInfoCollection::new(),
+            virtualizable_analyzer: majit_ir::effectinfo::VirtualizableAnalyzer,
+            quasiimmut_analyzer: majit_ir::effectinfo::QuasiImmutAnalyzer,
+            randomeffects_analyzer: majit_ir::effectinfo::RandomEffectsAnalyzer,
             next_jitcode_index: 0,
             elidable_targets: HashSet::new(),
             loopinvariant_targets: HashSet::new(),
@@ -667,12 +679,62 @@ impl CallControl {
         self.portal_targets.insert(portal_graph);
     }
 
-    /// RPython: `jitdriver_sd_from_portal_runner_ptr(funcptr)`.
-    /// Find the jitdriver that owns a given portal target.
-    pub fn jitdriver_sd_from_portal(&self, path: &CallPath) -> Option<&JitDriverStaticData> {
+    /// call.py:357-361 `jitdriver_sd_from_portal_graph(graph)`.
+    pub fn jitdriver_sd_from_portal_graph(&self, path: &CallPath) -> Option<&JitDriverStaticData> {
         self.jitdrivers_sd
             .iter()
             .find(|sd| &sd.portal_graph == path)
+    }
+
+    /// call.py:363-367 `jitdriver_sd_from_portal_runner_ptr(funcptr)`.
+    ///
+    /// Pyre has no separate `portal_runner_ptr` (the runner is the
+    /// portal graph itself), so we reuse the path lookup.  Future
+    /// phases that need the distinction can split the field.
+    pub fn jitdriver_sd_from_portal_runner_ptr(
+        &self,
+        path: &CallPath,
+    ) -> Option<&JitDriverStaticData> {
+        self.jitdriver_sd_from_portal_graph(path)
+    }
+
+    /// call.py:369-373 `jitdriver_sd_from_jitdriver(jitdriver)`.
+    ///
+    /// Pyre identifies a jit driver by its index slot in
+    /// `jitdrivers_sd`; we expose the slot lookup under the upstream
+    /// name so call sites mirror RPython.
+    pub fn jitdriver_sd_from_jitdriver(&self, index: usize) -> Option<&JitDriverStaticData> {
+        self.jitdrivers_sd.get(index)
+    }
+
+    /// call.py:375-385 `get_vinfo(VTYPEPTR)`.
+    ///
+    /// **Stub — always returns `None`.**  Upstream walks
+    /// `self.jitdrivers_sd` and returns the unique
+    /// `virtualizable_info` whose `VTYPEPTR` matches.  Pyre's
+    /// [`JitDriverStaticData`] does not yet carry per-driver
+    /// `virtualizable_info`, so callers that rely on the lookup
+    /// (jtransform's vable-field rewrites, optimizer's force-virtual
+    /// path) currently see "no virtualizable info" and fall back to
+    /// the non-vable code path.  The named entry point exists so
+    /// future call sites compile straight from the Python; once
+    /// per-driver virtualizable metadata is plumbed in, replace the
+    /// stub body with the upstream walk.
+    pub fn get_vinfo(&self, _vtypeptr: &str) -> Option<()> {
+        None
+    }
+
+    /// call.py:387-395 `could_be_green_field(SELFTYPE, fieldname)`.
+    ///
+    /// **Stub — always returns `false`.**  Upstream walks every
+    /// jitdriver's `green_fields_info` to decide whether a `(struct,
+    /// field)` pair was observed as a green field.  Pyre does not
+    /// yet perform green-field inference, so the rewriter never
+    /// promotes a getfield to its constant equivalent.  The named
+    /// entry stays so jtransform-side call sites compile against
+    /// the upstream signature.
+    pub fn could_be_green_field(&self, _selftype: &str, _fieldname: &str) -> bool {
+        false
     }
 
     /// Mark a target as a builtin (oopspec) operation.
@@ -861,8 +923,8 @@ impl CallControl {
     /// RPython uses a generator that pops one graph at a time (LIFO).
     /// During processing, new graphs may be added to `unfinished_graphs`
     /// via `get_jitcode()`, and the generator picks them up on the next
-    /// iteration. We emulate this with `pop_one_graph()`.
-    pub fn pop_one_graph(&mut self) -> Option<(CallPath, usize)> {
+    /// iteration. We emulate this with `enum_pending_graphs()`.
+    pub fn enum_pending_graphs(&mut self) -> Option<(CallPath, usize)> {
         let path = self.unfinished_graphs.pop()?; // LIFO, matching RPython
         let index = self.jitcodes[&path];
         Some((path, index))
@@ -1494,7 +1556,7 @@ impl CallControl {
     ///     except DelayedPointer:
     ///         return True
     /// ```
-    pub fn canraise(&self, target: &CallTarget, cache: &mut AnalysisCache) -> CanRaise {
+    pub fn _canraise(&self, target: &CallTarget, cache: &mut AnalysisCache) -> CanRaise {
         self.cached_can_raise(target, cache)
     }
 
@@ -1587,13 +1649,13 @@ impl CallControl {
                 ExtraEffect::LoopInvariant
             } else if elidable {
                 // call.py:292-298
-                match self.canraise(target, cache) {
+                match self._canraise(target, cache) {
                     CanRaise::No => ExtraEffect::ElidableCannotRaise,
                     CanRaise::MemoryErrorOnly => ExtraEffect::ElidableOrMemoryError,
                     CanRaise::Yes => ExtraEffect::ElidableCanRaise,
                 }
             } else if matches!(
-                self.canraise(target, cache),
+                self._canraise(target, cache),
                 CanRaise::Yes | CanRaise::MemoryErrorOnly
             ) {
                 // call.py:299-300
@@ -3284,7 +3346,7 @@ mod tests {
         let target = CallTarget::function_path(["raiser"]);
         let mut cache = AnalysisCache::default();
 
-        let r1 = cc.canraise(&target, &mut cache);
+        let r1 = cc._canraise(&target, &mut cache);
         assert_eq!(r1, CanRaise::Yes);
         assert!(
             cache
@@ -3292,7 +3354,7 @@ mod tests {
                 .contains_key(&CallPath::from_segments(["raiser"]))
         );
 
-        let r2 = cc.canraise(&target, &mut cache);
+        let r2 = cc._canraise(&target, &mut cache);
         assert_eq!(r2, CanRaise::Yes);
     }
 
@@ -3374,7 +3436,7 @@ mod tests {
 
         let target = CallTarget::function_path(["divider"]);
         let mut cache = AnalysisCache::default();
-        let result = cc.canraise(&target, &mut cache);
+        let result = cc._canraise(&target, &mut cache);
         assert_eq!(result, CanRaise::Yes);
     }
 
@@ -3394,7 +3456,7 @@ mod tests {
 
         let target = CallTarget::function_path(["allocator"]);
         let mut cache = AnalysisCache::default();
-        let result = cc.canraise(&target, &mut cache);
+        let result = cc._canraise(&target, &mut cache);
         assert_eq!(result, CanRaise::MemoryErrorOnly);
     }
 

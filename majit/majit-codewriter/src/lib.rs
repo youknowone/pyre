@@ -15,6 +15,7 @@ pub mod call;
 mod codegen;
 pub mod codewriter;
 pub mod flatten;
+pub mod format;
 pub mod front;
 pub mod handler_spec;
 pub mod hints;
@@ -27,6 +28,7 @@ pub mod model;
 mod parse;
 pub mod policy;
 pub mod regalloc;
+pub mod support;
 #[cfg(test)]
 mod test_support;
 pub mod translator;

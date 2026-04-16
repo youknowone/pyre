@@ -171,7 +171,7 @@ impl CodeWriter {
         // During transform, new graphs may be discovered and added via
         // get_jitcode(). We pop one at a time to match RPython's yield semantics.
         loop {
-            let Some((path, alloc_index)) = callcontrol.pop_one_graph() else {
+            let Some((path, alloc_index)) = callcontrol.enum_pending_graphs() else {
                 break;
             };
             let Some(graph) = callcontrol.function_graphs().get(&path).cloned() else {

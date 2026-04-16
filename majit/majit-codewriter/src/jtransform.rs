@@ -622,7 +622,7 @@ impl<'a> Transformer<'a> {
         result_ty: &ValueType,
         graph_name: &str,
     ) -> RewriteResult {
-        // RPython jtransform.py:484-520: _handle_oopspec_call pattern.
+        // RPython jtransform.py:484-520: __handle_oopspec_call pattern.
         //   calldescr = self.callcontrol.getcalldescr(op, oopspecindex, extraeffect)
         //   self.callcontrol.callinfocollection.add(oopspecindex, calldescr, func)
 
@@ -638,9 +638,9 @@ impl<'a> Transformer<'a> {
         // jtransform.py:497-498 — oopspec dispatch by prefix.
         if let Some(spec) = user_oopspec.as_deref() {
             let base = spec.split('(').next().unwrap_or(spec).trim();
-            // jtransform.py:497 — jit.* oopspecs → _handle_jit_call
+            // jtransform.py:497 — jit.* oopspecs → __handle_jit_call
             if base.starts_with("jit.") {
-                return self.handle_jit_call(base, op, target, args, result_ty, graph_name);
+                return self._handle_jit_call(base, op, target, args, result_ty, graph_name);
             }
             // NOTE: conditional_call!/conditional_call_elidable!/record_known_result!
             // are handled by jitcode_lower (proc-macro level), NOT here.
@@ -723,7 +723,7 @@ impl<'a> Transformer<'a> {
             }
         }
 
-        // RPython jtransform.py:2003-2007: _handle_oopspec_call always
+        // RPython jtransform.py:2003-2007: __handle_oopspec_call always
         // produces residual_call_*, appends -live- if calldescr_canraise.
         // Effect is only in the calldescr, never in the opcode name.
         self.handle_residual_call(op, descriptor, args, result_ty, graph_name)
@@ -801,7 +801,7 @@ impl<'a> Transformer<'a> {
         let (jd_index, num_green_args) = self
             .callcontrol
             .as_ref()
-            .and_then(|cc| cc.jitdriver_sd_from_portal(&path))
+            .and_then(|cc| cc.jitdriver_sd_from_portal_graph(&path))
             .map(|sd| (sd.index, sd.greens.len()))
             .unwrap_or((0, 0));
 
@@ -889,9 +889,9 @@ impl<'a> Transformer<'a> {
         self.get_value_kind(v)
     }
 
-    /// RPython: `Transformer._handle_jit_call(op, oopspec_name, args)` (jtransform.py:1730-1757).
-    /// Dispatches jit.* oopspec calls to dedicated opcodes or _handle_oopspec_call.
-    fn handle_jit_call(
+    /// RPython: `Transformer.__handle_jit_call(op, oopspec_name, args)` (jtransform.py:1730-1757).
+    /// Dispatches jit.* oopspec calls to dedicated opcodes or __handle_oopspec_call.
+    fn _handle_jit_call(
         &mut self,
         oopspec_name: &str,
         op: &SpaceOperation,
@@ -965,7 +965,7 @@ impl<'a> Transformer<'a> {
                 }])
             }
             // jtransform.py:1744-1747
-            "jit.force_virtual" => self.handle_oopspec_call(
+            "jit.force_virtual" => self._handle_oopspec_call(
                 op,
                 target,
                 args,
@@ -981,7 +981,7 @@ impl<'a> Transformer<'a> {
                     *result_ty == ValueType::Void,
                     "jit.not_in_trace() function must return None"
                 );
-                self.handle_oopspec_call(
+                self._handle_oopspec_call(
                     op,
                     target,
                     args,
@@ -1000,11 +1000,11 @@ impl<'a> Transformer<'a> {
         }
     }
 
-    /// RPython: `Transformer._handle_oopspec_call(op, args, oopspecindex, extraeffect)`
+    /// RPython: `Transformer.__handle_oopspec_call(op, args, oopspecindex, extraeffect)`
     /// (jtransform.py:1988-2008).
     /// Produces a residual_call with the given oopspecindex embedded in the calldescr,
     /// and registers the function in the callinfocollection.
-    fn handle_oopspec_call(
+    fn _handle_oopspec_call(
         &mut self,
         op: &SpaceOperation,
         target: &CallTarget,
@@ -1877,7 +1877,7 @@ fn call_target_matches_loose(pattern: &CallTarget, target: &CallTarget) -> bool 
 /// Map a user-level oopspec string (from `@oopspec(...)`) to an `OopSpecIndex`.
 ///
 /// rlib/jit.py:250 — `@oopspec(spec)` stores a spec string on the function.
-/// jtransform.py:1731-1755 `_handle_jit_call` patterns the spec name.
+/// jtransform.py:1731-1755 `__handle_jit_call` patterns the spec name.
 ///
 /// For the JIT-specific `jit.*` specs, RPython emits SpaceOperations with
 /// distinct names (e.g. `jit_debug`, `int_isconstant`); for list/dict/str
@@ -1888,7 +1888,7 @@ fn map_user_oopspec_to_index(spec: &str) -> majit_ir::descr::OopSpecIndex {
     // Normalize: `jit.isconstant(value)` → `jit.isconstant`
     let base = spec.split('(').next().unwrap_or(spec).trim();
     match base {
-        // All jit.* oopspecs are intercepted by handle_jit_call() before
+        // All jit.* oopspecs are intercepted by _handle_jit_call() before
         // reaching this function. Remaining oopspecs map to OS_* indices.
         "virtual_ref" | "virtual_ref_finish" => OopSpecIndex::JitForceVirtualizable,
         _ => OopSpecIndex::None,
