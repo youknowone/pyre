@@ -1085,14 +1085,25 @@ impl PyFrame {
         }
     }
 
+    /// pyframe.py:300 resume_execute_frame (send-path only).
+    ///
+    /// pyre does not emit YIELD_FROM/SEND yet, so `w_yielding_from` is
+    /// expected to remain null; asserting makes the gap visible instead of
+    /// silently dropping the delegate. The SApplicationException branch
+    /// (pyframe.py:320) is handled by the caller in `execute_frame`: if
+    /// `operr.is_some()`, resume_execute_frame is skipped and
+    /// `eval_frame_plain_with_operr` routes the error through
+    /// `handle_exception` at `last_instr + 1`, matching PyPy's
+    /// `handle_generator_error`.
     #[inline]
     pub fn resume_execute_frame(
         &mut self,
         w_arg_or_err: PyObjectRef,
     ) -> Result<usize, crate::PyError> {
-        if !self.w_yielding_from.is_null() {
-            self.w_yielding_from = PY_NULL;
-        }
+        debug_assert!(
+            self.w_yielding_from.is_null(),
+            "YIELD_FROM delegation not yet ported; see pyframe.py:305-318",
+        );
         if self.last_instr != -1 {
             self.pushvalue(w_arg_or_err);
             Ok(self.last_instr as usize + 1)
@@ -1557,13 +1568,23 @@ impl PyFrame {
         )
     }
 
+    /// pyframe.py:276 initialize_as_generator
+    ///
+    /// Adaptation: pyre builds the caller's PyFrame on the interpreter stack,
+    /// so we snapshot it onto the heap before handing ownership to the
+    /// generator object. The backref (`f_generator_nowref`) is set on that
+    /// heap-owned snapshot — not on the temporary caller frame — so later
+    /// `get_generator()` calls through the surviving frame pointer return
+    /// the right object.
     #[inline]
     pub fn initialize_as_generator(&mut self) -> crate::PyResult {
         let mut gen_frame = self.snapshot_for_tracing();
         gen_frame.fix_array_ptrs();
-        let generator =
-            pyre_object::generatorobject::w_generator_new(Box::into_raw(gen_frame) as *mut u8);
-        self.f_generator_nowref = generator;
+        let gen_frame_ptr = Box::into_raw(gen_frame);
+        let generator = pyre_object::generatorobject::w_generator_new(gen_frame_ptr as *mut u8);
+        unsafe {
+            (*gen_frame_ptr).f_generator_nowref = generator;
+        }
         Ok(generator)
     }
 
