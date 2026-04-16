@@ -358,13 +358,19 @@ pub const PYFRAME_W_GLOBALS_OFFSET: usize = std::mem::offset_of!(PyFrame, w_glob
 pub const PYFRAME_STACK_DEPTH_OFFSET: usize = PYFRAME_VALUESTACKDEPTH_OFFSET;
 pub const PYFRAME_LOCALS_OFFSET: usize = PYFRAME_LOCALS_CELLS_STACK_OFFSET;
 
-/// pytraceback.py offset2lineno(code, offset) — convert instruction index to line number.
+/// pytraceback.py offset2lineno(c, stopat) — convert instruction index to line number.
+/// Matches RPython: negative `stopat` means "frame not yet started", returns
+/// first-line.
 #[inline]
-pub fn offset2lineno(code: &CodeObject, offset: usize) -> usize {
+pub fn offset2lineno(code: &CodeObject, stopat: isize) -> usize {
+    let lineno = code.first_line_number.map(|n| n.get()).unwrap_or(1);
+    if stopat < 0 {
+        return lineno;
+    }
     code.locations
-        .get(offset)
+        .get(stopat as usize)
         .map(|(start, _)| start.line.get())
-        .unwrap_or_else(|| code.first_line_number.map(|n| n.get()).unwrap_or(1))
+        .unwrap_or(lineno)
 }
 
 /// pyframe.py:105-106 — cell + free variable slot count.
@@ -1237,14 +1243,10 @@ impl PyFrame {
         false
     }
 
-    /// pyframe.py:766 get_last_lineno → pytraceback.offset2lineno(self.pycode, self.last_instr)
+    /// pyframe.py:861-863 get_last_lineno → pytraceback.offset2lineno(pycode, last_instr)
     #[inline]
     pub fn get_last_lineno(&self) -> isize {
-        if self.last_instr < 0 {
-            -1
-        } else {
-            offset2lineno(self.code(), self.last_instr as usize) as isize
-        }
+        offset2lineno(self.code(), self.last_instr) as isize
     }
 
     /// pyframe.py:660-671 fget_f_lineno
