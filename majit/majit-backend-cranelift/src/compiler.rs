@@ -1603,8 +1603,8 @@ pub struct InlineFrameArenaInfo {
     /// GcHeader size prepended before each PyFrame in the arena slot.
     /// PyPy layout: [GcHeader (8 bytes)][PyFrame fields].
     pub gc_header_size: usize,
-    pub frame_code_offset: usize,
-    pub frame_next_instr_offset: usize,
+    pub frame_pycode_offset: usize,
+    pub frame_last_instr_offset: usize,
     pub frame_vable_token_offset: usize,
     pub create_fn_addr: usize,
     pub drop_fn_addr: usize,
@@ -12052,11 +12052,12 @@ fn emit_inline_arena_take(
         ptr_type,
         flags,
         caller_frame,
-        arena.frame_code_offset as i32,
+        arena.frame_pycode_offset as i32,
     );
-    let frame_code = builder
-        .ins()
-        .load(ptr_type, flags, frame_ptr, arena.frame_code_offset as i32);
+    let frame_code =
+        builder
+            .ins()
+            .load(ptr_type, flags, frame_ptr, arena.frame_pycode_offset as i32);
     let same_code = builder.ins().icmp(IntCC::Equal, frame_code, caller_code);
 
     let ultra_fast_block = builder.create_block();
@@ -12076,7 +12077,7 @@ fn emit_inline_arena_take(
         flags,
         neg_one,
         frame_ptr,
-        arena.frame_next_instr_offset as i32,
+        arena.frame_last_instr_offset as i32,
     );
     builder.ins().store(
         flags,

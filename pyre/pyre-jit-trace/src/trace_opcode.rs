@@ -781,12 +781,12 @@ impl MIFrame {
         let vsd = self.sym().valuestackdepth as i64;
         // virtualizable.py:86-93 read_boxes: ALL static fields from the heap.
         let s = self.sym_mut();
-        s.vable_next_instr = ctx.const_int(resume_pc as i64 - 1);
-        s.vable_code = ctx.const_ref(code_ptr as i64);
+        s.vable_last_instr = ctx.const_int(resume_pc as i64 - 1);
+        s.vable_pycode = ctx.const_ref(code_ptr as i64);
         s.vable_valuestackdepth = ctx.const_int(vsd);
         s.vable_debugdata = ctx.const_ref(debugdata as i64);
         s.vable_lastblock = ctx.const_ref(lastblock as i64);
-        s.vable_namespace = ctx.const_ref(ns_ptr);
+        s.vable_w_globals = ctx.const_ref(ns_ptr);
     }
 
     /// capture_resumedata(resumepc=orgpc) parity: flush vable fields for guards.
@@ -822,12 +822,12 @@ impl MIFrame {
         };
         // virtualizable.py:86-93 read_boxes: ALL static fields from the heap.
         let s = self.sym_mut();
-        s.vable_next_instr = ctx.const_int(resume_pc as i64 - 1);
-        s.vable_code = ctx.const_ref(code_ptr as i64);
+        s.vable_last_instr = ctx.const_int(resume_pc as i64 - 1);
+        s.vable_pycode = ctx.const_ref(code_ptr as i64);
         s.vable_valuestackdepth = ctx.const_int(vsd);
         s.vable_debugdata = ctx.const_ref(debugdata as i64);
         s.vable_lastblock = ctx.const_ref(lastblock as i64);
-        s.vable_namespace = ctx.const_ref(ns_ptr);
+        s.vable_w_globals = ctx.const_ref(ns_ptr);
     }
 
     /// pyjitpl.py:3317-3335 vable_and_vrefs_before_residual_call.
@@ -1121,10 +1121,10 @@ impl MIFrame {
         self.flush_to_frame(ctx);
         // pyjitpl.py:2973: at a merge point, next_instr should be the TARGET
         // PC, not the last bytecode's orgpc. flush_to_frame sets
-        // vable_next_instr from orgpc; override it here.
+        // vable_last_instr from orgpc; override it here.
         if let Some(pc) = target_pc {
             let s = self.sym_mut();
-            s.vable_next_instr = ctx.const_int(pc as i64);
+            s.vable_last_instr = ctx.const_int(pc as i64);
         }
         debug_assert!(
             self.sym().nlocals > 0 || self.sym().vable_array_base.is_none(),
@@ -1148,12 +1148,12 @@ impl MIFrame {
             let stack_only = s.stack_only_depth();
             (
                 s.frame,
-                s.vable_next_instr,
-                s.vable_code,
+                s.vable_last_instr,
+                s.vable_pycode,
                 s.vable_valuestackdepth,
                 s.vable_debugdata,
                 s.vable_lastblock,
-                s.vable_namespace,
+                s.vable_w_globals,
                 s.nlocals,
                 s.symbolic_locals.clone(),
                 s.symbolic_stack[..stack_only.min(s.symbolic_stack.len())].to_vec(),
@@ -1319,12 +1319,12 @@ impl MIFrame {
                 if idx < num_scalars {
                     match idx {
                         0 => s.frame = new_opref,
-                        1 => s.vable_next_instr = new_opref,
-                        2 => s.vable_code = new_opref,
+                        1 => s.vable_last_instr = new_opref,
+                        2 => s.vable_pycode = new_opref,
                         3 => s.vable_valuestackdepth = new_opref,
                         4 => s.vable_debugdata = new_opref,
                         5 => s.vable_lastblock = new_opref,
-                        6 => s.vable_namespace = new_opref,
+                        6 => s.vable_w_globals = new_opref,
                         _ => {}
                     }
                 } else {
@@ -1387,12 +1387,12 @@ impl MIFrame {
         let s = self.sym();
         let mut fa = vec![
             s.frame,
-            s.vable_next_instr,
-            s.vable_code,
+            s.vable_last_instr,
+            s.vable_pycode,
             s.vable_valuestackdepth,
             s.vable_debugdata,
             s.vable_lastblock,
-            s.vable_namespace,
+            s.vable_w_globals,
         ];
         fa.extend_from_slice(&active_boxes);
         fa
@@ -1533,12 +1533,12 @@ impl MIFrame {
                 let s = self.sym();
                 vec![
                     s.frame,
-                    s.vable_next_instr,
-                    s.vable_code,
+                    s.vable_last_instr,
+                    s.vable_pycode,
                     s.vable_valuestackdepth,
                     s.vable_debugdata,
                     s.vable_lastblock,
-                    s.vable_namespace,
+                    s.vable_w_globals,
                 ]
             };
             fail_args.extend_from_slice(&callee_active_boxes);
@@ -1626,12 +1626,12 @@ impl MIFrame {
             let s = self.sym();
             let mut fa = vec![
                 s.frame,
-                s.vable_next_instr,
-                s.vable_code,
+                s.vable_last_instr,
+                s.vable_pycode,
                 s.vable_valuestackdepth,
                 s.vable_debugdata,
                 s.vable_lastblock,
-                s.vable_namespace,
+                s.vable_w_globals,
             ];
             fa.extend_from_slice(&active_boxes);
             fa
@@ -1664,7 +1664,7 @@ impl MIFrame {
     ) {
         // pyjitpl.py:2594-2596: saved_pc = frame.pc; frame.pc = resumepc
         let saved_orgpc = self.orgpc;
-        let saved_ni = self.sym().vable_next_instr;
+        let saved_ni = self.sym().vable_last_instr;
         let saved_vsd = self.sym().vable_valuestackdepth;
         self.orgpc = resume_pc;
 
@@ -1702,7 +1702,7 @@ impl MIFrame {
         // pyjitpl.py:2602: frame.pc = saved_pc (restore)
         self.orgpc = saved_orgpc;
         let s = self.sym_mut();
-        s.vable_next_instr = saved_ni;
+        s.vable_last_instr = saved_ni;
         s.vable_valuestackdepth = saved_vsd;
     }
 
@@ -2074,7 +2074,7 @@ impl MIFrame {
         // capture_resumedata(); frame.pc = saved_pc
         // Save ALL state BEFORE flush (generate_guard_core parity).
         let saved_orgpc = self.orgpc;
-        let saved_ni = self.sym().vable_next_instr;
+        let saved_ni = self.sym().vable_last_instr;
         let saved_vsd = self.sym().vable_valuestackdepth;
         self.orgpc = resume_pc;
 
@@ -2111,12 +2111,12 @@ impl MIFrame {
             // NUM_SCALAR_INPUTARGS = 7: frame + 6 static fields.
             let mut fa = vec![
                 s.frame,
-                s.vable_next_instr,
-                s.vable_code,
+                s.vable_last_instr,
+                s.vable_pycode,
                 s.vable_valuestackdepth,
                 s.vable_debugdata,
                 s.vable_lastblock,
-                s.vable_namespace,
+                s.vable_w_globals,
             ];
             fa.extend_from_slice(&callee_active_boxes);
             fa
@@ -2178,7 +2178,7 @@ impl MIFrame {
         // pyjitpl.py:2602: frame.pc = saved_pc (restore all, generate_guard_core parity)
         self.orgpc = saved_orgpc;
         let s = self.sym_mut();
-        s.vable_next_instr = saved_ni;
+        s.vable_last_instr = saved_ni;
         s.vable_valuestackdepth = saved_vsd;
         s.pre_opcode_vsd = saved_pre_opcode_vsd;
         s.pre_opcode_stack = saved_pre_opcode_stack;
@@ -3340,12 +3340,12 @@ impl MIFrame {
             sym.concrete_namespace = callee_globals as *mut PyNamespace;
             sym.concrete_execution_context = self.sym().concrete_execution_context;
             let (
-                vable_next_instr,
-                vable_code,
+                vable_last_instr,
+                vable_pycode,
                 vable_valuestackdepth,
                 vable_debugdata,
                 vable_lastblock,
-                vable_namespace,
+                vable_w_globals,
             ) = self.with_ctx(|_, ctx| {
                 let null = ctx.const_ref(pyre_object::PY_NULL as i64);
                 (
@@ -3357,12 +3357,12 @@ impl MIFrame {
                     ctx.const_ref(callee_globals as i64),
                 )
             });
-            sym.vable_next_instr = vable_next_instr;
-            sym.vable_code = vable_code;
+            sym.vable_last_instr = vable_last_instr;
+            sym.vable_pycode = vable_pycode;
             sym.vable_valuestackdepth = vable_valuestackdepth;
             sym.vable_debugdata = vable_debugdata;
             sym.vable_lastblock = vable_lastblock;
-            sym.vable_namespace = vable_namespace;
+            sym.vable_w_globals = vable_w_globals;
             (sym, None)
         } else {
             // Create symbolic OpRef for callee frame in trace
@@ -3430,7 +3430,7 @@ impl MIFrame {
         self.with_ctx(|this, ctx| {
             let ni = ctx.const_int(return_point_pc as i64);
             let s = this.sym_mut();
-            s.vable_next_instr = ni;
+            s.vable_last_instr = ni;
             s.vable_valuestackdepth = ctx.const_int(s.valuestackdepth as i64);
         });
         // pyjitpl.py:177: active boxes for parent frame.
@@ -3442,12 +3442,12 @@ impl MIFrame {
             let s = this.sym();
             let mut fa = vec![
                 s.frame,
-                s.vable_next_instr,
-                s.vable_code,
+                s.vable_last_instr,
+                s.vable_pycode,
                 s.vable_valuestackdepth,
                 s.vable_debugdata,
                 s.vable_lastblock,
-                s.vable_namespace,
+                s.vable_w_globals,
             ];
             fa.extend_from_slice(&my_active_boxes);
             fa
@@ -3917,12 +3917,12 @@ impl MIFrame {
                     let s = this.sym();
                     let mut fa = vec![
                         s.frame,
-                        s.vable_next_instr,
-                        s.vable_code,
+                        s.vable_last_instr,
+                        s.vable_pycode,
                         s.vable_valuestackdepth,
                         s.vable_debugdata,
                         s.vable_lastblock,
-                        s.vable_namespace,
+                        s.vable_w_globals,
                     ];
                     fa.extend_from_slice(&active_boxes);
                     fa

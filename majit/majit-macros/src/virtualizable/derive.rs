@@ -344,8 +344,8 @@ pub fn expand_sym(input: DeriveInput) -> TokenStream {
 
             /// Flush virtualizable static fields from concrete values.
             ///
-            /// `values` is `[next_instr, code, valuestackdepth, namespace, ...]`
-            /// in VirtualizableInfo declared field order.
+            /// `values` is `[last_instr, pycode, valuestackdepth, ...]`
+            /// in VirtualizableInfo declared field order (interp_jit.py:25-31).
             pub fn flush_vable_fields(
                 &mut self,
                 ctx: &mut majit_metainterp::TraceCtx,

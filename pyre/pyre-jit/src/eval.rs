@@ -3273,7 +3273,7 @@ fn build_resumed_frames(
         .unwrap_or(0);
 
     // virtualizable.py:86-99 read_boxes: ALL static fields in declared order.
-    let vable_code: *const () = resolved_vable
+    let vable_pycode: *const () = resolved_vable
         .get(code_idx)
         .map(|v| match v {
             Value::Ref(r) => r.as_usize() as *const (),
@@ -3441,8 +3441,8 @@ fn build_resumed_frames(
         let is_outermost = frames.len() == 1 || idx == frames.len() - 1;
         let w_code = if is_outermost {
             // virtualizable.py:86-99: code from resume data, not heap.
-            if !vable_code.is_null() {
-                vable_code
+            if !vable_pycode.is_null() {
+                vable_pycode
             } else if !vable_frame_ptr.is_null() {
                 unsafe { (*vable_frame_ptr).pycode }
             } else {

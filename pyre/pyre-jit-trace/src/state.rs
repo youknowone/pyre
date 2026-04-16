@@ -652,9 +652,9 @@ pub struct PyreSym {
     // RPython's unroll_static_fields includes every field from
     // _virtualizable_; ALL must be inputarg (not info_only).
     #[vable(inputarg)]
-    pub(crate) vable_next_instr: OpRef,
+    pub(crate) vable_last_instr: OpRef,
     #[vable(inputarg)]
-    pub(crate) vable_code: OpRef,
+    pub(crate) vable_pycode: OpRef,
     #[vable(inputarg)]
     pub(crate) vable_valuestackdepth: OpRef,
     #[vable(inputarg)]
@@ -662,7 +662,7 @@ pub struct PyreSym {
     #[vable(inputarg)]
     pub(crate) vable_lastblock: OpRef,
     #[vable(inputarg)]
-    pub(crate) vable_namespace: OpRef,
+    pub(crate) vable_w_globals: OpRef,
     pub(crate) symbolic_namespace_slots: std::collections::HashMap<usize, OpRef>,
     #[vable(array_base)]
     pub(crate) vable_array_base: Option<u32>,
@@ -1722,12 +1722,12 @@ impl PyreSym {
             bridge_stack_oprefs: None,
             bridge_local_types: None,
             bridge_stack_types: None,
-            vable_next_instr: OpRef::NONE,
-            vable_code: OpRef::NONE,
+            vable_last_instr: OpRef::NONE,
+            vable_pycode: OpRef::NONE,
             vable_valuestackdepth: OpRef::NONE,
             vable_debugdata: OpRef::NONE,
             vable_lastblock: OpRef::NONE,
-            vable_namespace: OpRef::NONE,
+            vable_w_globals: OpRef::NONE,
             symbolic_namespace_slots: std::collections::HashMap::new(),
             vable_array_base: None,
             last_comparison_truth: None,
@@ -3013,12 +3013,12 @@ impl JitState for PyreJitState {
             let resolved = resolve(ctx, &mut vable_cursor, &mut virtuals_cache, v);
             match i {
                 0 => {} // frame_ptr — implicit, no slot
-                1 => sym.vable_next_instr = resolved,
-                2 => sym.vable_code = resolved,
+                1 => sym.vable_last_instr = resolved,
+                2 => sym.vable_pycode = resolved,
                 3 => sym.vable_valuestackdepth = resolved,
                 4 => sym.vable_debugdata = resolved,
                 5 => sym.vable_lastblock = resolved,
-                6 => sym.vable_namespace = resolved,
+                6 => sym.vable_w_globals = resolved,
                 _ => {
                     let off = i - num_scalars;
                     if off < nlocals {
@@ -5111,12 +5111,12 @@ mod tests {
         sym.symbolic_initialized = true;
         sym.nlocals = 1;
         sym.valuestackdepth = 3;
-        sym.vable_next_instr = ctx.const_int(12);
-        sym.vable_code = ctx.const_ref(0);
+        sym.vable_last_instr = ctx.const_int(12);
+        sym.vable_pycode = ctx.const_ref(0);
         sym.vable_valuestackdepth = ctx.const_int(1);
         sym.vable_debugdata = ctx.const_ref(0);
         sym.vable_lastblock = ctx.const_ref(0);
-        sym.vable_namespace = ctx.const_ref(0);
+        sym.vable_w_globals = ctx.const_ref(0);
         sym.symbolic_locals = vec![local0];
         sym.symbolic_local_types = vec![Type::Ref];
         sym.symbolic_stack = vec![stack0, stack1];
@@ -5164,12 +5164,12 @@ mod tests {
         sym.symbolic_initialized = true;
         sym.nlocals = 1;
         sym.valuestackdepth = 2;
-        sym.vable_next_instr = ctx.const_int(33);
-        sym.vable_code = ctx.const_ref(0);
+        sym.vable_last_instr = ctx.const_int(33);
+        sym.vable_pycode = ctx.const_ref(0);
         sym.vable_valuestackdepth = ctx.const_int(0);
         sym.vable_debugdata = ctx.const_ref(0);
         sym.vable_lastblock = ctx.const_ref(0);
-        sym.vable_namespace = ctx.const_ref(0);
+        sym.vable_w_globals = ctx.const_ref(0);
         sym.symbolic_locals = vec![OpRef::NONE];
         sym.symbolic_local_types = vec![Type::Ref];
         sym.symbolic_stack = vec![OpRef::NONE];
@@ -5221,12 +5221,12 @@ mod tests {
         sym.symbolic_initialized = true;
         sym.nlocals = 1;
         sym.valuestackdepth = 3;
-        sym.vable_next_instr = ctx.const_int(33);
-        sym.vable_code = code_ref;
+        sym.vable_last_instr = ctx.const_int(33);
+        sym.vable_pycode = code_ref;
         sym.vable_valuestackdepth = ctx.const_int(3);
         sym.vable_debugdata = ctx.const_ref(0);
         sym.vable_lastblock = ctx.const_ref(0);
-        sym.vable_namespace = namespace_ref;
+        sym.vable_w_globals = namespace_ref;
         sym.symbolic_locals = vec![local0];
         sym.symbolic_local_types = vec![Type::Ref];
         sym.symbolic_stack = vec![stack0, stack1];
