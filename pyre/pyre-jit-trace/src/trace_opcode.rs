@@ -1119,12 +1119,14 @@ impl MIFrame {
             }
         }
         self.flush_to_frame(ctx);
-        // pyjitpl.py:2973: at a merge point, next_instr should be the TARGET
-        // PC, not the last bytecode's orgpc. flush_to_frame sets
-        // vable_last_instr from orgpc; override it here.
+        // pyjitpl.py:2973 reached_loop_header: a merge-point resume enters
+        // the target loop at `pc`, so last_instr must be `pc - 1` so the
+        // interpreter's `next_instr() = last_instr + 1` returns the merge
+        // point. flush_to_frame already stored `orgpc - 1`; override with
+        // the merge target.
         if let Some(pc) = target_pc {
             let s = self.sym_mut();
-            s.vable_last_instr = ctx.const_int(pc as i64);
+            s.vable_last_instr = ctx.const_int(pc as i64 - 1);
         }
         debug_assert!(
             self.sym().nlocals > 0 || self.sym().vable_array_base.is_none(),
@@ -3426,9 +3428,11 @@ impl MIFrame {
         // (return_point_pc = CALL fallthrough). The callee blackhole
         // handles the call; the caller continues AFTER the call returns.
         // Stack is post-dispatch (args consumed, no result yet).
+        // last_instr = return_point_pc - 1 so the caller's next_instr()
+        // returns the fallthrough PC when the blackhole restores the frame.
         let return_point_pc = self.fallthrough_pc;
         self.with_ctx(|this, ctx| {
-            let ni = ctx.const_int(return_point_pc as i64);
+            let ni = ctx.const_int(return_point_pc as i64 - 1);
             let s = this.sym_mut();
             s.vable_last_instr = ni;
             s.vable_valuestackdepth = ctx.const_int(s.valuestackdepth as i64);
