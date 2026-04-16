@@ -1098,12 +1098,14 @@ impl PyFrame {
     pub fn execute_frame(
         &mut self,
         w_inputvalue: Option<PyObjectRef>,
-        _operr: Option<PyObjectRef>,
+        operr: Option<crate::PyError>,
     ) -> crate::PyResult {
-        if let Some(w_arg_or_err) = w_inputvalue {
-            let _ = self.resume_execute_frame(w_arg_or_err)?;
+        if operr.is_none() {
+            if let Some(w_arg_or_err) = w_inputvalue {
+                let _ = self.resume_execute_frame(w_arg_or_err)?;
+            }
         }
-        crate::eval::eval_frame_plain(self)
+        crate::eval::eval_frame_plain_with_operr(self, operr)
     }
 
     /// PyPy-compatible `hide`.

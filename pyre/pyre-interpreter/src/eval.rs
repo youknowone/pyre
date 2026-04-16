@@ -177,8 +177,23 @@ pub fn handle_exception(frame: &mut PyFrame, err: &PyError, next_instr: &mut usi
 
 /// Execute a frame — pure interpreter, no JIT.
 pub fn eval_frame_plain(frame: &mut PyFrame) -> PyResult {
+    eval_frame_plain_with_operr(frame, None)
+}
+
+/// pyframe.py:270-299 execute_frame body — enter/call_trace/eval_loop/
+/// return_trace/leave wrapping. When `operr` is Some, the generator's
+/// throw() path routes it through handle_operation_error and sets
+/// last_instr = next_instr - 1 before resuming (pyframe.py:273-277).
+pub fn eval_frame_plain_with_operr(frame: &mut PyFrame, operr: Option<PyError>) -> PyResult {
     frame.fix_array_ptrs();
     if frame.execution_context.is_null() {
+        if let Some(err) = operr {
+            let mut next_instr = frame.next_instr();
+            if !handle_exception(frame, &err, &mut next_instr) {
+                return Err(err);
+            }
+            frame.last_instr = next_instr as isize - 1;
+        }
         return eval_loop(frame);
     }
     let execution_context =
@@ -189,6 +204,13 @@ pub fn eval_frame_plain(frame: &mut PyFrame) -> PyResult {
     let mut w_exitvalue = pyre_object::w_none();
     let result = (|| {
         execution_context.call_trace(frame as *mut PyFrame);
+        if let Some(err) = operr {
+            let mut next_instr = frame.next_instr();
+            if !handle_exception(frame, &err, &mut next_instr) {
+                return Err(err);
+            }
+            frame.last_instr = next_instr as isize - 1;
+        }
         let result = eval_loop(frame)?;
         w_exitvalue = result;
         got_exception = false;

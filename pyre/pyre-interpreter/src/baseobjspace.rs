@@ -5025,23 +5025,13 @@ fn generator_send_ex(gen_obj: PyObjectRef, w_arg: PyObjectRef, operr: Option<PyE
         w_generator_set_started(gen_obj);
         w_generator_set_running(gen_obj, true);
 
-        let result = if let Some(err) = operr {
-            // throw path: inject exception via handle_exception
-            let mut next_instr = frame.next_instr();
-            if crate::eval::handle_exception(frame, &err, &mut next_instr) {
-                // Handler found — resume from the handler
-                crate::eval::eval_loop_for_force(frame)
-            } else {
-                // No handler — propagate the exception
-                Err(err)
-            }
+        // generator.py:104 — w_result = frame.execute_frame(w_arg, operr)
+        let w_inputvalue = if already_started && operr.is_none() {
+            Some(w_arg)
         } else {
-            // send/next path: push w_arg on resume (not first call)
-            if already_started {
-                frame.push(w_arg);
-            }
-            crate::eval::eval_loop_for_force(frame)
+            None
         };
+        let result = frame.execute_frame(w_inputvalue, operr);
 
         w_generator_set_running(gen_obj, false);
 
