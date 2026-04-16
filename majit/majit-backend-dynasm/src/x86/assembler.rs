@@ -4563,7 +4563,10 @@ impl Assembler386 {
             .copied()
             .unwrap_or(size_ref.0 as i64);
         let gc_header_size = majit_gc::header::GcHeader::SIZE as i64;
-        let (nf_addr, nt_addr) = majit_gc::nursery::nursery_global_addrs();
+        // gc.py:525-531 — read nursery slot addresses from the active GC
+        // descriptor (cpu.gc_ll_descr.get_nursery_free_addr() parity), not
+        // from a process-global singleton.
+        let (nf_addr, nt_addr) = crate::runner::dynasm_nursery_addrs();
 
         let nf = nf_addr as i64;
         let nt = nt_addr as i64;

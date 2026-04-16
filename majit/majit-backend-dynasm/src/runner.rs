@@ -70,6 +70,14 @@ fn dynasm_typeid_subclass_range(typeid: u32) -> Option<(i64, i64)> {
     with_dynasm_active_gc(|gc| gc.typeid_subclass_range(typeid)).flatten()
 }
 
+/// gc.py:525-531 `get_nursery_free_addr` / `get_nursery_top_addr` parity:
+/// the backend reads nursery slot addresses from the active GC descriptor,
+/// NOT from a process-global singleton. Returns `(0, 0)` when no GC is
+/// bound so the assembler falls back to the slow-path helper.
+pub(crate) fn dynasm_nursery_addrs() -> (usize, usize) {
+    with_dynasm_active_gc(|gc| (gc.nursery_free_addr(), gc.nursery_top_addr())).unwrap_or((0, 0))
+}
+
 fn dynasm_typeid_is_object(typeid: u32) -> Option<bool> {
     with_dynasm_active_gc(|gc| gc.typeid_is_object(typeid)).flatten()
 }
