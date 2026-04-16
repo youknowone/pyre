@@ -109,14 +109,6 @@ fn py_div(a: i64, b: i64) -> i64 {
     if r != 0 && ((r ^ b) < 0) { q - 1 } else { q }
 }
 
-/// Python-style modulo: result has the same sign as the divisor.
-#[inline]
-#[allow(dead_code)]
-fn py_mod(a: i64, b: i64) -> i64 {
-    let r = a % b;
-    if r != 0 && ((r ^ b) < 0) { r + b } else { r }
-}
-
 // ── IntBound ──
 
 /// An abstract bound on an integer value.
@@ -2442,15 +2434,6 @@ mod tests {
         assert_eq!(py_div(-7, -2), 3);
         assert_eq!(py_div(6, 3), 2);
         assert_eq!(py_div(-6, 3), -2);
-    }
-
-    #[test]
-    fn test_py_mod_helper() {
-        assert_eq!(py_mod(7, 2), 1);
-        assert_eq!(py_mod(-7, 2), 1);
-        assert_eq!(py_mod(7, -2), -1);
-        assert_eq!(py_mod(-7, -2), -1);
-        assert_eq!(py_mod(6, 3), 0);
     }
 
     // ── Free function tests ──

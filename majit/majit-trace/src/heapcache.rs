@@ -1520,14 +1520,6 @@ impl HeapCache {
         self.new_object(opref);
     }
 
-    /// pyre-only seam used outside the standard `new`/`new_array` allocation
-    /// hooks: stamp HF_LIKELY_VIRTUAL on a box without touching the other
-    /// allocation flags. Routes through `_set_flag` so the version-gated
-    /// heapc_flags stays in sync with the Vec<bool> mirror.
-    pub fn mark_likely_virtual(&mut self, opref: OpRef) {
-        self._set_flag(opref, HF_LIKELY_VIRTUAL);
-    }
-
     /// heapcache.py:496-500 is_likely_virtual.
     ///   `return (... self.test_likely_virtual_version(box) and
     ///            test_flags(box, HF_LIKELY_VIRTUAL))`
@@ -1967,7 +1959,7 @@ mod tests {
         let obj = OpRef(3);
 
         assert!(!cache.is_likely_virtual(obj));
-        cache.mark_likely_virtual(obj);
+        cache.new_object(obj);
         assert!(cache.is_likely_virtual(obj));
 
         // reset keeps likely_virtual
