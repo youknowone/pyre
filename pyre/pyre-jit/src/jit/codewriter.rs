@@ -1009,19 +1009,10 @@ impl CodeWriter {
             liveness
         };
 
-        // liveness.py:147-166 encode_liveness parity: pack each
-        // LivenessInfo into the all_liveness byte string with the
-        // `[len_i][len_r][len_f] | bitset_i | bitset_r | bitset_f`
-        // layout (liveness.py:139-145). The packed fragment is appended
-        // to the single global `metainterp_sd.liveness_info` string
-        // (pyjitpl.py:2264 parity) and each inline `live/` marker is
-        // patched with a 2-byte GLOBAL offset.
+        // assembler.py:234-248 `_encode_liveness` parity: intern each
+        // liveness triple in the single global all_liveness string and patch
+        // the inline `live/` marker with that global 2-byte offset.
         {
-            use majit_codewriter::liveness::encode_liveness;
-
-            let mut liveness_fragment: Vec<u8> = Vec::new();
-            let mut liveness_positions: HashMap<(Vec<u8>, Vec<u8>, Vec<u8>), u16> = HashMap::new();
-            let mut local_offsets: Vec<(usize, u16)> = Vec::with_capacity(live_patches.len());
             let mut liveness_overflow = false;
             for (entry, &(_, patch_offset)) in liveness.iter().zip(live_patches.iter()) {
                 let live_i_bytes = liveness_regs_to_u8_sorted(&entry.live_i_regs);
@@ -1035,51 +1026,23 @@ impl CodeWriter {
                             break;
                         }
                     };
-                let key = (
-                    live_i_bytes.clone(),
-                    live_r_bytes.clone(),
-                    live_f_bytes.clone(),
-                );
-                let offset = if let Some(&offset) = liveness_positions.get(&key) {
-                    offset
-                } else {
-                    if liveness_fragment.len() > u16::MAX as usize {
+                match pyre_jit_trace::state::intern_liveness(
+                    &live_i_bytes,
+                    &live_r_bytes,
+                    &live_f_bytes,
+                ) {
+                    Some(offset) => assembler.patch_live_offset(patch_offset, offset),
+                    None => {
                         liveness_overflow = true;
                         break;
                     }
-                    let offset = liveness_fragment.len() as u16;
-                    liveness_positions.insert(key, offset);
-                    // liveness.py:144 header: three lengths.
-                    liveness_fragment.push(live_i_bytes.len() as u8);
-                    liveness_fragment.push(live_r_bytes.len() as u8);
-                    liveness_fragment.push(live_f_bytes.len() as u8);
-                    // liveness.py:145 body: three packed bitsets.
-                    liveness_fragment.extend(encode_liveness(&live_i_bytes));
-                    liveness_fragment.extend(encode_liveness(&live_r_bytes));
-                    liveness_fragment.extend(encode_liveness(&live_f_bytes));
-                    offset
-                };
-                local_offsets.push((patch_offset, offset));
+                }
             }
             if liveness_overflow {
                 // Mark the jitcode as unexecutable; overflow means the
                 // encoder could not fit into the u16 offset space. See
                 // `liveness_regs_to_u8_sorted` comment for the TODO.
                 has_abort = true;
-            } else {
-                // pyjitpl.py:2264 append to the global string, then
-                // patch every inline `-live-` with the resulting global
-                // offset. Fails iff the accumulated total would overflow
-                // the 2-byte inline offset field.
-                match pyre_jit_trace::state::append_liveness(&liveness_fragment) {
-                    Some(base) => {
-                        for (patch_offset, local_offset) in local_offsets {
-                            let global = base.saturating_add(local_offset);
-                            assembler.patch_live_offset(patch_offset, global);
-                        }
-                    }
-                    None => has_abort = true,
-                }
             }
         }
 

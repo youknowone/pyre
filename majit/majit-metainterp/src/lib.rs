@@ -35,6 +35,7 @@ pub mod parity;
 mod pyjitpl;
 pub mod quasiimmut;
 pub mod resume;
+pub mod rvmprof;
 mod symbolic_stack;
 mod trace_ctx;
 pub mod virtualizable;

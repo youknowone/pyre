@@ -5753,29 +5753,16 @@ impl<'a> ResumeDataDirectReader<'a> {
 /// Build a chain of BlackholeInterpreters from encoded resume data.
 /// Returns the topmost (innermost) interpreter.
 ///
-/// `resolve_jitcode` corresponds to RPython's `jitcodes[jitcode_pos]` lookup.
-/// In RPython, `metainterp_sd.jitcodes` is a pre-compiled array.
-/// In majit, this is typically backed by jitcode_factory or a pre-built table.
+/// `resolve_jitcode` corresponds to RPython's `jitcodes[jitcode_pos]` lookup
+/// (`resume.py:1339`). Matches upstream's `(jitcode, pc)` tuple result.
 pub struct ResolvedJitCode {
     pub jitcode: crate::jitcode::JitCode,
     pub pc: usize,
-    /// Pyre virtualizable side metadata. RPython does not store this on
-    /// JitCode; callers that need it attach it to the BlackholeInterpreter.
-    pub virtualizable_stack_base: Option<usize>,
 }
 
 impl ResolvedJitCode {
     pub fn new(jitcode: crate::jitcode::JitCode, pc: usize) -> Self {
-        Self {
-            jitcode,
-            pc,
-            virtualizable_stack_base: None,
-        }
-    }
-
-    pub fn with_virtualizable_stack_base(mut self, stack_base: usize) -> Self {
-        self.virtualizable_stack_base = Some(stack_base);
-        self
+        Self { jitcode, pc }
     }
 }
 
@@ -5826,20 +5813,15 @@ pub fn blackhole_from_resumedata<'a>(
 
         // resume.py:1338-1340
         let (jitcode_pos, pc) = resumereader.read_jitcode_pos_pc();
-        // resume.py:1339: jitcode = jitcodes[jitcode_pos]
-        // resolve_jitcode returns the JitCode and bytecode offset. Pyre may
-        // also attach virtualizable layout metadata as a sidecar; RPython's
-        // JitCode itself has no such field.
+        // resume.py:1339-1340: jitcode = jitcodes[jitcode_pos]; curbh.setposition(jitcode, pc)
         let resolved = resolve_jitcode(jitcode_pos, pc)?;
         nextbh.setposition(resolved.jitcode, resolved.pc);
-        if let Some(stack_base) = resolved.virtualizable_stack_base {
-            nextbh.virtualizable_stack_base = stack_base;
-        }
 
         // resume.py:1341
         resumereader.consume_one_section(&mut nextbh);
 
-        // resume.py:1342 — handle_rvmprof_enter (not applicable in majit)
+        // resume.py:1342
+        nextbh.handle_rvmprof_enter();
 
         curbh = Some(Box::new(nextbh));
     }

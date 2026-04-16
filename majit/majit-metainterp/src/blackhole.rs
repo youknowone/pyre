@@ -810,10 +810,10 @@ use crate::jitcode::{
     BC_MOVE_R, BC_PEEK_I, BC_POP_DISCARD, BC_POP_F, BC_POP_I, BC_POP_R, BC_PUSH_F, BC_PUSH_I,
     BC_PUSH_R, BC_PUSH_TO, BC_RAISE, BC_RECORD_BINOP_F, BC_RECORD_BINOP_I, BC_RECORD_UNARY_F,
     BC_RECORD_UNARY_I, BC_REF_RETURN, BC_REQUIRE_STACK, BC_RERAISE, BC_RESIDUAL_CALL_VOID,
-    BC_SET_SELECTED, BC_SETARRAYITEM_VABLE_F, BC_SETARRAYITEM_VABLE_I, BC_SETARRAYITEM_VABLE_R,
-    BC_SETFIELD_VABLE_F, BC_SETFIELD_VABLE_I, BC_SETFIELD_VABLE_R, BC_STORE_DOWN,
-    BC_STORE_STATE_ARRAY, BC_STORE_STATE_FIELD, BC_STORE_STATE_VARRAY, BC_SWAP_STACK, JitArgKind,
-    JitCode,
+    BC_RVMPROF_CODE, BC_SET_SELECTED, BC_SETARRAYITEM_VABLE_F, BC_SETARRAYITEM_VABLE_I,
+    BC_SETARRAYITEM_VABLE_R, BC_SETFIELD_VABLE_F, BC_SETFIELD_VABLE_I, BC_SETFIELD_VABLE_R,
+    BC_STORE_DOWN, BC_STORE_STATE_ARRAY, BC_STORE_STATE_FIELD, BC_STORE_STATE_VARRAY,
+    BC_SWAP_STACK, JitArgKind, JitCode,
 };
 use crate::pyjitpl::{MIFrame, MIFrameStack};
 use crate::pyjitpl::{
@@ -883,6 +883,7 @@ enum DispatchError {
 ///   self.dispatch_loop = builder.dispatch_loop
 ///   self.descrs = builder.descrs
 ///   self.op_catch_exception = builder.op_catch_exception
+///   self.op_rvmprof_code = builder.op_rvmprof_code
 pub struct BlackholeInterpreter {
     /// RPython `blackhole.py:286` `self.cpu = builder.cpu`.
     /// Reference to the backend trait for `bh_*` concrete execution.
@@ -901,6 +902,8 @@ pub struct BlackholeInterpreter {
     pub descrs: Vec<BhDescr>,
     /// RPython `blackhole.py:289` `self.op_catch_exception = builder.op_catch_exception`.
     pub op_catch_exception: u8,
+    /// RPython `blackhole.py:290` `self.op_rvmprof_code = builder.op_rvmprof_code`.
+    pub op_rvmprof_code: u8,
     /// RPython `blackhole.py:289` `self.op_live = builder.op_live`.
     pub op_live: u8,
     /// Integer register bank.
@@ -956,14 +959,6 @@ pub struct BlackholeInterpreter {
     /// Pointer to the VirtualizableInfo describing field offsets.
     /// Used by vable bytecodes to compute memory offsets.
     pub virtualizable_info: *const crate::virtualizable::VirtualizableInfo,
-    /// pyre-specific portal contract: absolute start index of the operand
-    /// stack in the virtualizable's unified locals+cells+stack array.
-    ///
-    /// blackhole.py passes reds explicitly into bh_call_r(...); pyre packs
-    /// the same state into `locals_cells_stack_w` before calling the portal
-    /// runner, so the blackhole needs the stack base to reconstruct the
-    /// frame layout correctly on recursive portal re-entry.
-    pub virtualizable_stack_base: usize,
     /// blackhole.py:1095 get_portal_runner(jdindex):
     ///   jitdriver_sd = self.builder.metainterp_sd.jitdrivers_sd[jdindex]
     ///   fnptr = adr2int(jitdriver_sd.portal_runner_adr)
@@ -993,6 +988,13 @@ thread_local! {
     pub static BH_VABLE_PTR: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
 }
 
+// rvmprof integration lives in the `rvmprof::cintf` module — the
+// structural analog of RPython's `rpython.rlib.rvmprof.cintf`. Blackhole
+// calls through `rvmprof::cintf::jit_rvmprof_code` directly, matching
+// `blackhole.py:416, 438, 1600` where the C intf function is invoked
+// without any hook-registry indirection visible to dispatch code.
+use crate::rvmprof::cintf::jit_rvmprof_code;
+
 impl Default for BlackholeInterpreter {
     fn default() -> Self {
         Self::new()
@@ -1007,6 +1009,7 @@ impl BlackholeInterpreter {
             // RPython blackhole.py:289 — copied from builder in `acquire_interp`.
             // Sentinel `u8::MAX` matches RPython's `insns.get('…', -1)` fallback.
             op_catch_exception: u8::MAX,
+            op_rvmprof_code: u8::MAX,
             op_live: u8::MAX,
             registers_i: Vec::new(),
             registers_r: Vec::new(),
@@ -1026,7 +1029,6 @@ impl BlackholeInterpreter {
             exception_last_value: 0,
             virtualizable_ptr: 0,
             virtualizable_info: std::ptr::null(),
-            virtualizable_stack_base: 0,
             portal_runner_ptr: None,
             mainjitcode_calldescr: BhCallDescr::default(),
         }
@@ -1476,6 +1478,11 @@ impl BlackholeInterpreter {
         self.runtime_stacks.get(selected).map_or(0, |s| s.len())
     }
 
+    /// blackhole.py:1600-1603 bhimpl_rvmprof_code.
+    pub fn bhimpl_rvmprof_code(&self, leaving: i64, unique_id: i64) {
+        jit_rvmprof_code(leaving, unique_id);
+    }
+
     /// blackhole.py:396 handle_exception_in_frame: check if the current
     /// position has an immediately-following `catch_exception/L`.
     pub fn handle_exception_in_frame(&mut self, exc_value: i64) -> bool {
@@ -1499,8 +1506,35 @@ impl BlackholeInterpreter {
                 self.position = target;
                 return true;
             }
+            if opcode == self.op_rvmprof_code {
+                // blackhole.py:412-420: on exception immediately before a
+                // `rvmprof_code/ii`, run the leaving hook and continue
+                // propagating.
+                let leaving = self.registers_i[code[position + 1] as usize];
+                let unique_id = self.registers_i[code[position + 2] as usize];
+                assert_eq!(leaving, 1);
+                self.bhimpl_rvmprof_code(leaving, unique_id);
+            }
         }
         false
+    }
+
+    /// blackhole.py:424-439 handle_rvmprof_enter.
+    pub fn handle_rvmprof_enter(&mut self) {
+        let code = &self.jitcode.code;
+        let mut position = self.position;
+        let mut opcode = code[position];
+        if opcode == self.op_live {
+            position += majit_codewriter::liveness::OFFSET_SIZE + 1;
+            opcode = code[position];
+        }
+        if opcode == self.op_rvmprof_code {
+            let leaving = self.registers_i[code[position + 1] as usize];
+            let unique_id = self.registers_i[code[position + 2] as usize];
+            if leaving == 1 {
+                self.bhimpl_rvmprof_code(0, unique_id);
+            }
+        }
     }
 
     /// Drain the runtime stack for the given selected index, returning
@@ -1622,6 +1656,13 @@ impl BlackholeInterpreter {
             BC_LAST_EXC_VALUE => {
                 let dst = self.next_u16() as usize;
                 self.registers_r[dst] = self.exception_last_value;
+            }
+            BC_RVMPROF_CODE => {
+                let leaving_idx = self.next_u8() as usize;
+                let unique_id_idx = self.next_u8() as usize;
+                let leaving = self.registers_i[leaving_idx];
+                let unique_id = self.registers_i[unique_id_idx];
+                self.bhimpl_rvmprof_code(leaving, unique_id);
             }
             BC_LOAD_CONST_I => {
                 let dst = self.next_u16() as usize;
@@ -2322,6 +2363,8 @@ pub struct BlackholeInterpBuilder {
     pub op_live: u8,
     /// RPython `blackhole.py:73` `self.op_catch_exception`.
     pub op_catch_exception: u8,
+    /// RPython `blackhole.py:74` `self.op_rvmprof_code`.
+    pub op_rvmprof_code: u8,
     /// RPython `blackhole.py:103` `self.descrs`.
     /// Populated by `setup_descrs()` from the assembler's descriptor table.
     pub descrs: Vec<BhDescr>,
@@ -2350,6 +2393,7 @@ impl BlackholeInterpBuilder {
             _insns: Vec::new(),
             op_live: u8::MAX,
             op_catch_exception: u8::MAX,
+            op_rvmprof_code: u8::MAX,
             descrs: Vec::new(),
             dispatch_table: Vec::new(),
         };
@@ -2358,13 +2402,14 @@ impl BlackholeInterpBuilder {
     }
 
     /// RPython `blackhole.py:72-73` parity for just the two well-known
-    /// opcodes (`live/`, `catch_exception/L`). Callers that have a full
-    /// `insns` table should call `setup_insns` instead — it covers the
-    /// dispatch table and the reverse opcode mapping as well.
+    /// opcodes (`live/`, `catch_exception/L`, `rvmprof_code/ii`). Callers
+    /// that have a full `insns` table should call `setup_insns` instead —
+    /// it covers the dispatch table and the reverse opcode mapping as well.
     pub fn setup_wellknown_insns(&mut self) {
         let insns = crate::jitcode::wellknown_bh_insns();
         self.op_live = insns.get("live/").copied().unwrap_or(u8::MAX);
         self.op_catch_exception = insns.get("catch_exception/L").copied().unwrap_or(u8::MAX);
+        self.op_rvmprof_code = insns.get("rvmprof_code/ii").copied().unwrap_or(u8::MAX);
     }
 
     /// RPython `blackhole.py:66-100` `setup_insns(insns)`.
@@ -2378,6 +2423,7 @@ impl BlackholeInterpBuilder {
     ///         self._insns[value] = key
     ///     self.op_live = insns.get('live/', -1)
     ///     self.op_catch_exception = insns.get('catch_exception/L', -1)
+    ///     self.op_rvmprof_code = insns.get('rvmprof_code/ii', -1)
     /// ```
     ///
     /// Builds the reverse opcode table and dispatch function table from the
@@ -2398,6 +2444,7 @@ impl BlackholeInterpBuilder {
         // RPython blackhole.py:72-74: resolve well-known opcodes
         self.op_live = insns.get("live/").copied().unwrap_or(u8::MAX);
         self.op_catch_exception = insns.get("catch_exception/L").copied().unwrap_or(u8::MAX);
+        self.op_rvmprof_code = insns.get("rvmprof_code/ii").copied().unwrap_or(u8::MAX);
         // RPython blackhole.py:76-80: build handler table.
         //
         // RPython immediately calls _get_method(name, argcodes) for every
@@ -2541,10 +2588,12 @@ impl BlackholeInterpBuilder {
         //   self.dispatch_loop = builder.dispatch_loop
         //   self.descrs = builder.descrs
         //   self.op_catch_exception = builder.op_catch_exception
+        //   self.op_rvmprof_code = builder.op_rvmprof_code
         bh.cpu = self.cpu;
         // RPython blackhole.py:288: self.descrs = builder.descrs
         bh.descrs = self.descrs.clone();
         bh.op_catch_exception = self.op_catch_exception;
+        bh.op_rvmprof_code = self.op_rvmprof_code;
         //   self.op_live = builder.op_live
         bh.op_live = self.op_live;
         bh
@@ -2559,7 +2608,6 @@ impl BlackholeInterpBuilder {
         interp.runtime_stacks.clear();
         interp.aborted = false;
         interp.got_exception = false;
-        interp.virtualizable_stack_base = 0;
         self.pool.push(interp);
     }
 
@@ -6025,10 +6073,13 @@ fn handler_str_guard_value(
     Ok(p + 1)
 }
 fn handler_rvmprof_code(
-    _bh: &mut BlackholeInterpreter,
-    _code: &[u8],
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
+    let leaving = bh.registers_i[code[p] as usize];
+    let unique_id = bh.registers_i[code[p + 1] as usize];
+    bh.bhimpl_rvmprof_code(leaving, unique_id);
     Ok(p + 2)
 }
 /// RPython `blackhole.py:1575-1578` `bhimpl_copystrcontent`.

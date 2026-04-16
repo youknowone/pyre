@@ -270,7 +270,7 @@ impl MIFrame {
             .majit_jitcode
             .as_ref()
             .expect("majit_jitcode checked above")
-            .get_live_vars_info_at(jit_pc);
+            .get_live_vars_info(jit_pc, crate::state::op_live());
         // pyjitpl.py:2264 parity: metainterp_sd owns the packed liveness
         // string; clone here because the thread-local borrow cannot escape.
         let all_liveness_bytes = crate::state::liveness_info_snapshot();

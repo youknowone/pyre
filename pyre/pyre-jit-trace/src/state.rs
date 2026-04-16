@@ -86,10 +86,37 @@ struct MetaInterpStaticData {
     /// Box<JitCode> for address stability across vec growth.
     jitcodes: Vec<Box<JitCode>>,
     /// pyjitpl.py:2264 `self.liveness_info = "".join(asm.all_liveness)` —
-    /// single packed liveness byte string, shared across all jitcodes.
-    /// Appended at each JitCode compilation via `append_liveness`; inline
-    /// `-live-` offsets in `JitCode.code` are patched to global offsets.
+    /// frozen snapshot of the assembler's `all_liveness` buffer. In RPython
+    /// this is set once at `finish_setup` time; in pyre the assembler is
+    /// long-lived and liveness accumulates across lazy JitCode compiles,
+    /// so this field is resynced after every `intern_liveness` write.
     liveness_info: Vec<u8>,
+    /// pyjitpl.py:2255 `finish_setup` is per MetaInterpStaticData instance.
+    /// `METAINTERP_SD` is thread-local in pyre, so this guard must live on
+    /// the thread-local object rather than in a process-global `Once`.
+    finish_setup_done: bool,
+
+    // pyjitpl.py:2236-2243 opcode number cache filled by `setup_insns`.
+    // RPython stores every field even when the runtime currently does
+    // not read them, so the structural parity is preserved. Sentinel
+    // `u8::MAX` matches `insns.get('…', -1)` for lookups that happen
+    // before `setup_insns` runs (e.g. early fallback paths).
+    /// pyjitpl.py:2236 `self.op_live = insns.get('live/', -1)`.
+    op_live: u8,
+    /// pyjitpl.py:2237 `self.op_goto = insns.get('goto/L', -1)`.
+    op_goto: u8,
+    /// pyjitpl.py:2238 `self.op_catch_exception = insns.get('catch_exception/L', -1)`.
+    op_catch_exception: u8,
+    /// pyjitpl.py:2239 `self.op_rvmprof_code = insns.get('rvmprof_code/ii', -1)`.
+    op_rvmprof_code: u8,
+    /// pyjitpl.py:2240 `self.op_int_return = insns.get('int_return/i', -1)`.
+    op_int_return: u8,
+    /// pyjitpl.py:2241 `self.op_ref_return = insns.get('ref_return/r', -1)`.
+    op_ref_return: u8,
+    /// pyjitpl.py:2242 `self.op_float_return = insns.get('float_return/f', -1)`.
+    op_float_return: u8,
+    /// pyjitpl.py:2243 `self.op_void_return = insns.get('void_return/', -1)`.
+    op_void_return: u8,
 }
 
 impl MetaInterpStaticData {
@@ -98,7 +125,41 @@ impl MetaInterpStaticData {
             by_code: std::collections::HashMap::new(),
             jitcodes: Vec::new(),
             liveness_info: Vec::new(),
+            finish_setup_done: false,
+            op_live: u8::MAX,
+            op_goto: u8::MAX,
+            op_catch_exception: u8::MAX,
+            op_rvmprof_code: u8::MAX,
+            op_int_return: u8::MAX,
+            op_ref_return: u8::MAX,
+            op_float_return: u8::MAX,
+            op_void_return: u8::MAX,
         }
+    }
+
+    /// pyjitpl.py:2227-2243 `MetaInterpStaticData.setup_insns(self, insns)`:
+    /// copy opcode numbers for the well-known bytecodes out of the
+    /// assembler's `insns` dict in the same order as upstream.
+    fn setup_insns(&mut self, insns: &HashMap<&'static str, u8>) {
+        self.op_live = insns.get("live/").copied().unwrap_or(u8::MAX);
+        self.op_goto = insns.get("goto/L").copied().unwrap_or(u8::MAX);
+        self.op_catch_exception = insns.get("catch_exception/L").copied().unwrap_or(u8::MAX);
+        self.op_rvmprof_code = insns.get("rvmprof_code/ii").copied().unwrap_or(u8::MAX);
+        self.op_int_return = insns.get("int_return/i").copied().unwrap_or(u8::MAX);
+        self.op_ref_return = insns.get("ref_return/r").copied().unwrap_or(u8::MAX);
+        self.op_float_return = insns.get("float_return/f").copied().unwrap_or(u8::MAX);
+        self.op_void_return = insns.get("void_return/").copied().unwrap_or(u8::MAX);
+    }
+
+    /// pyjitpl.py:2255-2264 `finish_setup`: wire the assembler's opcode table
+    /// into this staticdata object and snapshot the current `all_liveness`.
+    fn finish_setup_if_needed(&mut self, insns: &HashMap<&'static str, u8>, all_liveness: Vec<u8>) {
+        if self.finish_setup_done {
+            return;
+        }
+        self.setup_insns(insns);
+        self.liveness_info = all_liveness;
+        self.finish_setup_done = true;
     }
 
     /// codewriter.py:68: get or create JitCode for a CodeObject.
@@ -123,27 +184,72 @@ impl MetaInterpStaticData {
     }
 }
 
-/// RPython pyjitpl.py:2264 parity: append this jitcode's local
-/// liveness bytes to the global `metainterp_sd.liveness_info` string and
-/// return the base offset so the caller can patch inline `-live-` offsets
-/// with `base + local_offset`. Fails if the total would exceed u16.
-pub fn append_liveness(fragment: &[u8]) -> Option<u16> {
-    METAINTERP_SD.with(|r| {
-        let mut sd = r.borrow_mut();
-        let base = sd.liveness_info.len();
-        if base + fragment.len() > u16::MAX as usize {
+/// RPython assembler.py:234-248 `Assembler._encode_liveness` parity:
+/// intern one `[live_i, live_r, live_f]` triple in the assembler's
+/// `all_liveness` buffer and return its 2-byte offset.
+///
+/// Writes land on `AssemblerState` (the writer side); `MetaInterpStaticData`
+/// receives a fresh snapshot via the final `METAINTERP_SD.liveness_info`
+/// assignment — matching `pyjitpl.py:2264`'s
+/// `self.liveness_info = "".join(asm.all_liveness)` after each append.
+pub fn intern_liveness(live_i: &[u8], live_r: &[u8], live_f: &[u8]) -> Option<u16> {
+    use crate::assembler::ASSEMBLER_STATE;
+    use majit_codewriter::liveness::encode_liveness;
+
+    ensure_finish_setup();
+
+    let snapshot = ASSEMBLER_STATE.with(|r| -> Option<(u16, Vec<u8>)> {
+        let mut asm = r.borrow_mut();
+        // assembler.py:149 `self.num_liveness_ops += 1` — counted once per
+        // `-live-` instruction in `write_insn`, before the dedup lookup
+        // inside `_encode_liveness`. The counter measures write-insn call
+        // frequency, not unique-entry count.
+        asm.num_liveness_ops += 1;
+        let key = (live_i.to_vec(), live_r.to_vec(), live_f.to_vec());
+        if let Some(&pos) = asm.all_liveness_positions.get(&key) {
+            return Some((pos, asm.all_liveness.clone()));
+        }
+        let pos = asm.all_liveness_length;
+        let encoded_i = encode_liveness(live_i);
+        let encoded_r = encode_liveness(live_r);
+        let encoded_f = encode_liveness(live_f);
+        if live_i.len() > u8::MAX as usize
+            || live_r.len() > u8::MAX as usize
+            || live_f.len() > u8::MAX as usize
+            || pos > u16::MAX as usize
+        {
             return None;
         }
-        sd.liveness_info.extend_from_slice(fragment);
-        Some(base as u16)
-    })
+        let pos_u16 = pos as u16;
+        asm.all_liveness_positions.insert(key, pos_u16);
+        asm.all_liveness.push(live_i.len() as u8);
+        asm.all_liveness.push(live_r.len() as u8);
+        asm.all_liveness.push(live_f.len() as u8);
+        asm.all_liveness.extend(encoded_i);
+        asm.all_liveness.extend(encoded_r);
+        asm.all_liveness.extend(encoded_f);
+        asm.all_liveness_length = asm.all_liveness.len();
+        Some((pos_u16, asm.all_liveness.clone()))
+    })?;
+
+    let (pos, all_liveness) = snapshot;
+    METAINTERP_SD.with(|r| r.borrow_mut().liveness_info = all_liveness);
+    Some(pos)
 }
 
 /// RPython resume.py:1022 parity: read-only snapshot of
 /// `metainterp_sd.liveness_info` for the ResumeDataDirectReader. Returns a
 /// Vec copy because thread-local borrows cannot escape the closure.
 pub fn liveness_info_snapshot() -> Vec<u8> {
+    ensure_finish_setup();
     METAINTERP_SD.with(|r| r.borrow().liveness_info.clone())
+}
+
+/// pyjitpl.py:2236 parity: expose the staticdata `live/` opcode for callers
+/// that need to decode inline liveness offsets from a JitCode.
+pub fn op_live() -> u8 {
+    ensure_finish_setup();
+    METAINTERP_SD.with(|r| r.borrow().op_live)
 }
 
 use std::cell::RefCell;
@@ -154,15 +260,32 @@ thread_local! {
         RefCell::new(MetaInterpStaticData::new());
 }
 
+/// pyjitpl.py:2255 `MetaInterpStaticData.finish_setup` parity entry point.
+///
+/// RPython runs `finish_setup` once per `MetaInterpStaticData` object. Pyre's
+/// `METAINTERP_SD` is thread-local, so the setup guard also lives on
+/// `MetaInterpStaticData`; only the unrelated callback registration below is
+/// process-global.
+fn ensure_finish_setup() {
+    use crate::assembler::ASSEMBLER_STATE;
+    use std::sync::Once;
+    static FRAME_VALUE_COUNT_INIT: Once = Once::new();
+    FRAME_VALUE_COUNT_INIT.call_once(|| {
+        majit_ir::resumedata::set_frame_value_count_fn(frame_value_count_at);
+    });
+    let (insns, all_liveness) = ASSEMBLER_STATE.with(|a| {
+        let asm = a.borrow();
+        (asm.insns.clone(), asm.all_liveness.clone())
+    });
+    METAINTERP_SD.with(|r| {
+        r.borrow_mut().finish_setup_if_needed(&insns, all_liveness);
+    });
+}
+
 /// pyjitpl.py:74: frame.jitcode — get or create JitCode for CodeObject.
 /// RPython: MetaInterp.staticdata.jitcodes[idx]; pyre: METAINTERP_SD.
 pub(crate) fn jitcode_for(code: *const ()) -> *const JitCode {
-    // Register global frame_value_count callback on first use.
-    use std::sync::Once;
-    static INIT: Once = Once::new();
-    INIT.call_once(|| {
-        majit_ir::resumedata::set_frame_value_count_fn(frame_value_count_at);
-    });
+    ensure_finish_setup();
     METAINTERP_SD.with(|r| r.borrow_mut().jitcode_for(code))
 }
 
@@ -179,6 +302,7 @@ pub fn set_majit_jitcode(
     py_to_jit_pc: Vec<usize>,
     liveness: Vec<majit_metainterp::jitcode::LivenessInfo>,
 ) {
+    ensure_finish_setup();
     METAINTERP_SD.with(|r| {
         let mut sd = r.borrow_mut();
         // Ensure the JitCode entry exists.
@@ -197,6 +321,7 @@ pub fn set_majit_jitcode(
 /// Resolve jitcode_index (sequential int from snapshot numbering)
 /// to the corresponding CodeObject pointer.
 pub fn code_for_jitcode_index(jitcode_index: i32) -> Option<*const ()> {
+    ensure_finish_setup();
     METAINTERP_SD.with(|r| {
         let sd = r.borrow();
         let idx = jitcode_index as usize;
@@ -210,6 +335,7 @@ pub fn code_for_jitcode_index(jitcode_index: i32) -> Option<*const ()> {
 /// get_list_of_active_boxes) for RPython-parity multi-frame decode.
 /// Falls back to LiveVars when JitCode liveness is unavailable.
 pub fn frame_value_count_at(jitcode_index: i32, pc: i32) -> usize {
+    ensure_finish_setup();
     METAINTERP_SD.with(|r| {
         let sd = r.borrow();
         let idx = jitcode_index as usize;
@@ -223,7 +349,7 @@ pub fn frame_value_count_at(jitcode_index: i32, pc: i32) -> usize {
         // that get_list_of_active_boxes uses.
         if let Some(ref jitcode) = jc.majit_jitcode {
             if let Some(&jit_pc) = jc.py_to_jit_pc.get(pc as usize) {
-                let off = jitcode.get_live_vars_info_at(jit_pc);
+                let off = jitcode.get_live_vars_info(jit_pc, sd.op_live);
                 let all_liveness = &sd.liveness_info;
                 if off + 2 < all_liveness.len() {
                     let length_i = all_liveness[off] as usize;

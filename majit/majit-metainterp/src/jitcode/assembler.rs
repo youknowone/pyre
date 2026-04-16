@@ -1205,14 +1205,14 @@ impl JitCodeBuilder {
             constants_i: self.constants_i,
             constants_r: self.constants_r,
             constants_f: self.constants_f,
+            jitdriver_sd: None,
+            fnaddr: 0,
+            calldescr: majit_codewriter::jitcode::BhCallDescr::default(),
             opcodes: self.opcodes,
             sub_jitcodes: self.sub_jitcodes,
             fn_ptrs: self.fn_ptrs,
             assembler_targets: self.assembler_targets,
-            jitdriver_sd: None,
             descrs: Vec::new(),
-            fnaddr: 0,
-            calldescr: majit_codewriter::jitcode::BhCallDescr::default(),
         }
     }
 

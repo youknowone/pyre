@@ -106,17 +106,45 @@ pub(crate) const BC_JIT_MERGE_POINT: u8 = 87;
 pub(crate) const BC_LIVE: u8 = 88;
 pub(crate) const BC_CATCH_EXCEPTION: u8 = 89;
 pub(crate) const BC_LAST_EXC_VALUE: u8 = 90;
+/// blackhole.py bhimpl_rvmprof_code: rvmprof enter/leave marker.
+pub(crate) const BC_RVMPROF_CODE: u8 = 91;
 pub(crate) const MAX_HOST_CALL_ARITY: usize = 16;
 
-/// RPython `blackhole.py:72-73` parity helper: the well-known opname →
-/// opcode entries that `BlackholeInterpBuilder.setup_insns(insns)` reads
-/// to resolve `op_live` / `op_catch_exception`. Upstream builds the table
-/// from `assembler.insns`; majit's assembler uses fixed opcode constants,
-/// so we expose just the entries the builder actually consults.
+/// Fixed majit blackhole opcode-name table.
+///
+/// RPython's `Assembler.insns` is a dense dict grown by
+/// `Assembler.write_insn()` in emission order. majit's current runtime
+/// `JitCodeBuilder` still emits fixed `BC_*` numbers, so this helper is an
+/// adapter table rather than a line-by-line port of `assembler.py`.
+/// Downstream consumers use it only for `insns.get('...', -1)`-style opcode
+/// cache fields and for wiring handlers against majit's fixed bytecodes.
+///
+/// The `argcodes` alphabet follows `assembler.py:162-196`:
+///   `i` int reg, `r` ref reg, `f` float reg, `c` short-const int,
+///   `I/R/F` constant-pool int/ref/float, `L` label, `d` descr,
+///   `N` `ListOfKind` (mixed-kind literal list).
 pub fn wellknown_bh_insns() -> std::collections::HashMap<&'static str, u8> {
     let mut m = std::collections::HashMap::new();
+
+    // pyjitpl.py:2236-2243 — fields `setup_insns` probes explicitly.
     m.insert("live/", BC_LIVE);
     m.insert("catch_exception/L", BC_CATCH_EXCEPTION);
+    m.insert("rvmprof_code/ii", BC_RVMPROF_CODE);
+    m.insert("ref_return/r", BC_REF_RETURN);
+    // NOTE: majit currently emits only `ref_return` because pyre's portal
+    // result type is REF; `int_return`, `float_return`, `void_return`, and
+    // `goto/L` have no corresponding BC_* constants yet. `setup_insns`
+    // therefore observes `u8::MAX` for those missing RPython opcodes, matching
+    // the `insns.get('...', -1)` fallback but not the full RPython opcode set.
+
+    // Control flow / structural markers that actually emit.
+    m.insert("jump/L", BC_JUMP);
+    m.insert("jump_target/L", BC_JUMP_TARGET);
+    m.insert("raise/r", BC_RAISE);
+    m.insert("reraise/", BC_RERAISE);
+    m.insert("last_exc_value/", BC_LAST_EXC_VALUE);
+    m.insert("jit_merge_point/", BC_JIT_MERGE_POINT);
+
     m
 }
 
@@ -165,6 +193,7 @@ pub use majit_codewriter::jitcode::enumerate_vars;
 /// matches RPython even though the representation is wider.
 #[derive(Clone, Debug, Default)]
 pub struct JitCode {
+    // rpython/jit/codewriter/jitcode.py:14-43 canonical fields.
     /// RPython `jitcode.py:15` `self.name = name` — symbolic name for
     /// debugging/logging. RPython takes this as the first `__init__`
     /// argument; pyre's runtime JitCodeBuilder currently leaves it
@@ -184,6 +213,26 @@ pub struct JitCode {
     pub constants_r: Vec<i64>,
     /// RPython: `jitcode.constants_f` — float constant pool (bits as i64).
     pub constants_f: Vec<i64>,
+    /// jitcode.py:18 `jitdriver_sd` — index into jitdrivers_sd array.
+    /// `Some(index)` for portal jitcodes, `None` for helpers.
+    /// Set by call.py:148 grab_initial_jitcodes parity:
+    /// `jd.mainjitcode.jitdriver_sd = jd`.
+    /// Used by `_handle_jitexception` to find the portal level in the BH chain.
+    pub jitdriver_sd: Option<usize>,
+    /// RPython `jitcode.py:16` `self.fnaddr` — function address for `bh_call_*`.
+    /// Set by warmspot.py/call.py from `getfunctionptr(graph)`.
+    pub fnaddr: i64,
+    /// RPython `jitcode.py:17` `self.calldescr` — calling convention descriptor.
+    /// Set by `call.py:get_jitcode_calldescr(graph)` from the function's type.
+    pub calldescr: majit_codewriter::jitcode::BhCallDescr,
+
+    // majit bytecode adapter extension.
+    // These fields have no RPython JitCode counterpart. RPython's
+    // bytecode operand stream references external dispatch tables
+    // maintained by the blackhole builder / metainterp_sd; majit's
+    // runtime JitCodeBuilder inlines the equivalent pools directly
+    // on each JitCode for straight-line dispatch. Future parity work
+    // is to lift these back out to a separate per-adapter structure.
     /// Pool of majit IR opcodes referenced from the bytecode stream.
     pub opcodes: Vec<OpCode>,
     /// Sub-JitCodes for `inline_call` targets (compound methods).
@@ -192,53 +241,16 @@ pub struct JitCode {
     pub fn_ptrs: Vec<JitCallTarget>,
     /// CALL_ASSEMBLER targets keyed by loop token number plus a concrete hook.
     assembler_targets: Vec<JitCallAssemblerTarget>,
-    /// jitcode.py:18 `jitdriver_sd` — index into jitdrivers_sd array.
-    /// `Some(index)` for portal jitcodes, `None` for helpers.
-    /// Set by call.py:148 grab_initial_jitcodes parity:
-    /// `jd.mainjitcode.jitdriver_sd = jd`.
-    /// Used by `_handle_jitexception` to find the portal level in the BH chain.
-    pub jitdriver_sd: Option<usize>,
     /// RPython: `BlackholeInterpBuilder.descrs` — shared descriptor table for
     /// 'd'/'j' argcode resolution (blackhole.py:102-103 `setup_descrs`).
     /// pyre: stored per-jitcode. Loaded into `BlackholeInterpreter.descrs`
     /// by `setposition()`. Empty until the codewriter populates it.
     pub descrs: Vec<majit_codewriter::jitcode::BhDescr>,
-    /// RPython `jitcode.py:16` `self.fnaddr` — function address for `bh_call_*`.
-    /// Set by warmspot.py/call.py from `getfunctionptr(graph)`.
-    pub fnaddr: i64,
-    /// RPython `jitcode.py:17` `self.calldescr` — calling convention descriptor.
-    /// Set by `call.py:get_jitcode_calldescr(graph)` from the function's type.
-    pub calldescr: majit_codewriter::jitcode::BhCallDescr,
-}
-
-/// blackhole.py catch_exception: pre-computed exception handler for a JitCode PC range.
-#[derive(Clone, Debug)]
-pub struct JitExceptionHandler {
-    /// Start JitCode PC (inclusive).
-    pub jit_start: usize,
-    /// End JitCode PC (exclusive).
-    pub jit_end: usize,
-    /// Handler target JitCode PC.
-    pub jit_target: usize,
-    /// Stack depth at handler entry (runtime stack items to keep).
-    pub stack_depth: u16,
-    /// Whether to push lasti (Python PC) before exception object.
-    pub push_lasti: bool,
-    /// Raw Python PC for lasti (boxed at runtime via box_int_fn).
-    pub lasti_value: i64,
-    /// fn_ptr index for box_int_fn (to box lasti at dispatch time).
-    pub box_int_fn_idx: u16,
 }
 
 // -- RPython jitcode.py parity methods --
 
 impl JitCode {
-    /// RPython `jitcode.py:get_live_vars_info(pc, op_live)` for the canonical
-    /// majit bytecode table, whose `live/` opcode is `BC_LIVE`.
-    pub fn get_live_vars_info_at(&self, pc: usize) -> usize {
-        self.get_live_vars_info(pc, BC_LIVE)
-    }
-
     /// RPython `jitcode.py:47-48` `def num_regs_i(self): return ord(self.c_num_regs_i)`.
     pub fn num_regs_i(&self) -> u16 {
         self.c_num_regs_i

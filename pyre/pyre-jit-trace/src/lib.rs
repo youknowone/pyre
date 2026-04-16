@@ -5,6 +5,7 @@
 //! from pyre-jit's eval_loop_jit to prevent MIFrame's monomorphization
 //! of `execute_opcode_step<E>` from bloating the eval loop's codegen.
 
+pub mod assembler;
 pub mod callbacks;
 pub mod descr;
 pub mod dispatch_manifest;

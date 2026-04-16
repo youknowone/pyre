@@ -743,7 +743,6 @@ fn blackhole_from_jit_frame(frame: &mut PyFrame) -> Option<PyObjectRef> {
     // RPython: the virtualizable ptr is the frame itself.
     bh.virtualizable_ptr = frame as *mut PyFrame as i64;
     bh.virtualizable_info = crate::eval::get_virtualizable_info();
-    bh.virtualizable_stack_base = frame_stack_base;
     // Portal red-arg registers must be filled AFTER virtualizable_ptr.
     // interp_jit.py:64 reds=['frame','ec']: ec = frame.execution_context.
     let ec = frame.execution_context as i64;
@@ -1237,7 +1236,6 @@ pub fn resume_in_blackhole(
         // blackhole.py bhimpl_getfield_vable_*: set virtualizable pointer.
         bh.virtualizable_ptr = frame_ptr as i64;
         bh.virtualizable_info = crate::eval::get_virtualizable_info();
-        bh.virtualizable_stack_base = nlocals + pyre_interpreter::pyframe::ncells(code_ref);
         // Portal red-arg registers must be filled AFTER virtualizable_ptr.
         let ec = unsafe { (*frame_ptr).execution_context as i64 };
         bh.fill_portal_registers(
@@ -1245,6 +1243,13 @@ pub fn resume_in_blackhole(
             pyjitcode.metadata.portal_ec_reg,
             ec,
         );
+
+        // resume.py:1342 `curbh.handle_rvmprof_enter()` — runs the rvmprof
+        // `entering=0` hook immediately after consume_one_section. For the
+        // generic `blackhole_from_resumedata` path majit-metainterp already
+        // invokes this at resume.rs:5824; the pyre-local chain builder sits
+        // on a parallel code path and must replay the same step.
+        bh.handle_rvmprof_enter();
 
         // RPython: nextbh.nextblackholeinterp = curbh
         bh.nextblackholeinterp = prev_bh.map(Box::new);
@@ -1806,10 +1811,10 @@ pub fn blackhole_resume_via_rd_numb(
         // Convert Python PC → JitCode byte offset via pc_map.
         // pc_map miss is a BUG — fail rather than silently restart from 0.
         let jitcode_pc = pyjitcode.metadata.pc_map.get(pc as usize).copied()?;
-        Some(
-            resume::ResolvedJitCode::new(pyjitcode.jitcode.clone(), jitcode_pc)
-                .with_virtualizable_stack_base(pyjitcode.metadata.stack_base),
-        )
+        Some(resume::ResolvedJitCode::new(
+            pyjitcode.jitcode.clone(),
+            jitcode_pc,
+        ))
     };
 
     // resume.py:983-991 _prepare_virtuals: convert RdVirtualInfo → VirtualInfo
@@ -1861,16 +1866,6 @@ pub fn blackhole_resume_via_rd_numb(
         bh.virtualizable_ptr = deadframe[0];
     }
     bh.virtualizable_info = crate::eval::get_virtualizable_info();
-    // resume.py:1341 consume_one_section parity: each section in the
-    // resumed chain corresponds to a different Python function with its
-    // own `nlocals + ncells` layout. The heuristic-resume sibling path
-    // (call_jit.rs:1192) computes this per-section from the section's own
-    // CodeObject; the rd_numb path likewise must give every bh in the
-    // chain its own value, otherwise a multi-frame chain whose caller
-    // and callee differ in nlocals+ncells uses the wrong operand-stack
-    // offset on recursive portal re-entry.
-    // `blackhole_from_resumedata` attached per-section pyre virtualizable
-    // layout from ResolvedJitCode. RPython JitCode has no stack_base field.
     // blackhole.py:1095 get_portal_runner parity
     bh.portal_runner_ptr = Some(bh_portal_runner);
     // RPython: calldescr = jitdriver_sd.mainjitcode.calldescr
