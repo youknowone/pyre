@@ -637,11 +637,13 @@ pub unsafe fn w_list_find_or_count_fast(
     }
 }
 
+#[majit_macros::dont_look_inside]
 pub extern "C" fn jit_list_append(list: i64, item: i64) -> i64 {
     unsafe { w_list_append(list as PyObjectRef, item as PyObjectRef) };
     0
 }
 
+#[majit_macros::dont_look_inside]
 pub extern "C" fn jit_list_getitem(list: i64, index: i64) -> i64 {
     unsafe {
         match w_list_getitem(list as PyObjectRef, index) {
@@ -651,6 +653,7 @@ pub extern "C" fn jit_list_getitem(list: i64, index: i64) -> i64 {
     }
 }
 
+#[majit_macros::dont_look_inside]
 pub extern "C" fn jit_list_setitem(list: i64, index: i64, value: i64) -> i64 {
     unsafe {
         if !w_list_setitem(list as PyObjectRef, index, value as PyObjectRef) {

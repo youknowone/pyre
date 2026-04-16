@@ -92,6 +92,7 @@ pub unsafe fn is_str(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &STR_TYPE) }
 }
 
+#[majit_macros::elidable]
 pub extern "C" fn jit_str_concat(a: i64, b: i64) -> i64 {
     let a = a as PyObjectRef;
     let b = b as PyObjectRef;
@@ -105,6 +106,7 @@ pub extern "C" fn jit_str_concat(a: i64, b: i64) -> i64 {
     }
 }
 
+#[majit_macros::elidable]
 pub extern "C" fn jit_str_repeat(s: i64, n: i64) -> i64 {
     let s = s as PyObjectRef;
     unsafe {
@@ -114,6 +116,7 @@ pub extern "C" fn jit_str_repeat(s: i64, n: i64) -> i64 {
     }
 }
 
+#[majit_macros::elidable]
 pub extern "C" fn jit_str_compare(a: i64, b: i64) -> i64 {
     let a = a as PyObjectRef;
     let b = b as PyObjectRef;
@@ -128,6 +131,7 @@ pub extern "C" fn jit_str_compare(a: i64, b: i64) -> i64 {
     }
 }
 
+#[majit_macros::elidable]
 pub extern "C" fn jit_str_is_true(s: i64) -> i64 {
     let s = s as PyObjectRef;
     unsafe { (w_str_len(s) != 0) as i64 }

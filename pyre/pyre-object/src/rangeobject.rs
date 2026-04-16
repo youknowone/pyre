@@ -45,6 +45,7 @@ pub fn w_range_iter_new(start: i64, stop: i64, step: i64) -> PyObjectRef {
     Box::into_raw(obj) as PyObjectRef
 }
 
+#[majit_macros::dont_look_inside]
 pub extern "C" fn jit_range_iter_new(start: i64, stop: i64, step: i64) -> i64 {
     w_range_iter_new(start, stop, step) as i64
 }

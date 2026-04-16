@@ -33,10 +33,12 @@ fn decode_name(name_ptr: i64, name_len: i64) -> Option<&'static str> {
     std::str::from_utf8(bytes).ok()
 }
 
+#[majit_macros::dont_look_inside]
 pub extern "C" fn jit_make_function_from_globals(globals: i64, code_obj: i64) -> i64 {
     make_function_from_code_obj(code_obj as PyObjectRef, globals as *mut PyNamespace) as i64
 }
 
+#[majit_macros::dont_look_inside]
 pub extern "C" fn jit_load_name_from_namespace(
     namespace_ptr: i64,
     name_ptr: i64,
@@ -53,6 +55,7 @@ pub extern "C" fn jit_load_name_from_namespace(
     namespace_get(namespace, name).unwrap_or(std::ptr::null_mut()) as i64
 }
 
+#[majit_macros::dont_look_inside]
 pub extern "C" fn jit_store_name_to_namespace(
     namespace_ptr: i64,
     name_ptr: i64,
@@ -115,6 +118,7 @@ fn call_callable_with_args(frame_ptr: i64, callable: i64, args: &[i64]) -> i64 {
 
 macro_rules! define_callable_call_helper {
     ($name:ident $(, $arg:ident)*) => {
+        #[majit_macros::jit_may_force]
         pub extern "C" fn $name(frame_ptr: i64, callable: i64 $(, $arg: i64)*) -> i64 {
             call_callable_with_args(frame_ptr, callable, &[$($arg),*])
         }
@@ -123,6 +127,7 @@ macro_rules! define_callable_call_helper {
 
 macro_rules! define_known_builtin_call_helper {
     ($name:ident $(, $arg:ident)*) => {
+        #[majit_macros::jit_may_force]
         pub extern "C" fn $name(callable: i64 $(, $arg: i64)*) -> i64 {
             call_builtin_with_args(callable, &[$($arg),*])
         }
@@ -131,6 +136,7 @@ macro_rules! define_known_builtin_call_helper {
 
 macro_rules! define_known_function_call_helper {
     ($name:ident $(, $arg:ident)*) => {
+        #[majit_macros::jit_may_force]
         pub extern "C" fn $name(frame_ptr: i64, callable: i64 $(, $arg: i64)*) -> i64 {
             call_user_function_with_args(frame_ptr, callable, &[$($arg),*])
         }
@@ -370,10 +376,12 @@ fn build_map_from_args(args: &[i64]) -> i64 {
     build_map_from_refs(&items) as i64
 }
 
+#[majit_macros::dont_look_inside]
 pub extern "C" fn jit_build_list_0() -> i64 {
     w_list_new(vec![]) as i64
 }
 
+#[majit_macros::dont_look_inside]
 pub extern "C" fn jit_build_tuple_0() -> i64 {
     w_tuple_new(vec![]) as i64
 }
@@ -692,6 +700,7 @@ pub fn sequence_getitem(seq: PyObjectRef, index: usize) -> Result<PyObjectRef, P
     }
 }
 
+#[majit_macros::jit_may_force]
 pub extern "C" fn jit_sequence_getitem(seq: i64, index: i64) -> i64 {
     match sequence_getitem(seq as PyObjectRef, index as usize) {
         Ok(value) => value as i64,
@@ -789,6 +798,7 @@ pub fn range_iter_next_or_null(iter: PyObjectRef) -> Result<PyObjectRef, PyError
     Err(PyError::type_error("not an iterator"))
 }
 
+#[majit_macros::dont_look_inside]
 pub extern "C" fn jit_range_iter_next_or_null(iter: i64) -> i64 {
     match range_iter_next_or_null(iter as PyObjectRef) {
         Ok(value) => value as i64,

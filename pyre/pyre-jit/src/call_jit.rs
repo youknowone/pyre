@@ -415,6 +415,7 @@ extern "C" fn jit_call_user_function_from_frame(
     }
 }
 
+#[majit_macros::jit_may_force]
 pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
     let _suspend_inline_result = pyre_interpreter::call::suspend_inline_handled_result();
     #[cfg(feature = "cranelift")]
@@ -476,6 +477,7 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
 /// (which operates on PyFrame directly). When the GC rewriter wires
 /// nursery JitFrame allocation, this function replaces the force path.
 #[allow(dead_code)]
+#[majit_macros::jit_may_force]
 pub extern "C" fn assembler_call_helper(jitframe_ptr: i64, _virtualizable_ref: i64) -> i64 {
     use majit_metainterp::jitframe::JitFrame;
 
@@ -1427,6 +1429,7 @@ fn materialize_virtual(val: &majit_ir::Value) -> i64 {
 }
 
 /// Fused recursive call with boxed arg.
+#[majit_macros::dont_look_inside]
 pub extern "C" fn jit_force_recursive_call_1(
     caller_frame: i64,
     callable: i64,
@@ -1485,6 +1488,7 @@ pub extern "C" fn jit_force_recursive_call_1(
 /// has stabilized on a raw-int finish protocol. It is a closer match to
 /// RPython's recursive portal argument flow than boxing the argument in the
 /// trace before every helper-boundary call.
+#[majit_macros::dont_look_inside]
 pub extern "C" fn jit_force_recursive_call_argraw_boxed_1(
     caller_frame: i64,
     callable: i64,
@@ -1506,6 +1510,7 @@ pub extern "C" fn jit_force_recursive_call_argraw_boxed_1(
 /// the callee frame is created directly from the caller's code/globals.
 /// RPython warmspot.py:941 portal_runner parity.
 ///
+#[majit_macros::dont_look_inside]
 pub extern "C" fn jit_force_self_recursive_call_1(caller_frame: i64, boxed_arg: i64) -> i64 {
     let _suspend_inline_result = pyre_interpreter::call::suspend_inline_handled_result();
     let boxed_arg_ref = boxed_arg as PyObjectRef;
@@ -1532,6 +1537,7 @@ pub extern "C" fn jit_force_self_recursive_call_1(caller_frame: i64, boxed_arg: 
 /// Mirrors `jit_force_self_recursive_call_1`, but keeps the trace-side
 /// argument unboxed so recursive helper-boundary calls do not allocate a
 /// temporary `W_Int` in the trace.
+#[majit_macros::dont_look_inside]
 pub extern "C" fn jit_force_self_recursive_call_argraw_boxed_1(
     caller_frame: i64,
     raw_int_arg: i64,
@@ -1551,6 +1557,7 @@ pub extern "C" fn jit_force_self_recursive_call_argraw_boxed_1(
 ///   After:  CallMayForce(force_raw_1, frame, callable, raw_int)
 ///
 /// Boxing happens inside this function, not in the trace.
+#[majit_macros::dont_look_inside]
 pub extern "C" fn jit_force_recursive_call_raw_1(
     caller_frame: i64,
     callable: i64,
@@ -1594,6 +1601,7 @@ pub extern "C" fn jit_force_recursive_call_raw_1(
 /// concrete helper should mirror RPython's force_fn behavior: execute the
 /// callee's own frame without JIT on that frame, but let nested portal
 /// calls re-enter compiled code through the normal portal runner path.
+#[majit_macros::dont_look_inside]
 pub extern "C" fn jit_force_self_recursive_call_raw_1(caller_frame: i64, raw_int_arg: i64) -> i64 {
     let _suspend_inline_result = pyre_interpreter::call::suspend_inline_handled_result();
     if majit_metainterp::majit_log_enabled() && raw_int_arg <= 4 {
@@ -2597,10 +2605,12 @@ fn create_callee_frame_impl(caller_frame: i64, callable: i64, args: &[PyObjectRe
     frame_ptr as i64
 }
 
+#[majit_macros::dont_look_inside]
 pub extern "C" fn jit_create_callee_frame_0(caller_frame: i64, callable: i64) -> i64 {
     create_callee_frame_impl(caller_frame, callable, &[])
 }
 
+#[majit_macros::dont_look_inside]
 pub extern "C" fn jit_create_callee_frame_1(caller_frame: i64, callable: i64, arg0: i64) -> i64 {
     create_callee_frame_impl_1_boxed(caller_frame, callable as PyObjectRef, arg0 as PyObjectRef)
 }
@@ -2610,6 +2620,7 @@ pub extern "C" fn jit_create_callee_frame_1(caller_frame: i64, callable: i64, ar
 /// This skips rediscovering code/globals from a function object and reuses the
 /// caller frame's code/namespace/execution_context directly, which matches the
 /// existing self-recursive raw helper path more closely.
+#[majit_macros::dont_look_inside]
 pub extern "C" fn jit_create_self_recursive_callee_frame_1(caller_frame: i64, arg0: i64) -> i64 {
     debug_assert!(
         caller_frame != 0,
@@ -2632,6 +2643,7 @@ pub extern "C" fn jit_create_self_recursive_callee_frame_1(caller_frame: i64, ar
 ///
 /// RPython parity: compiled code uses jitframe slots, not PyFrame
 /// locals. Frame locals are only needed for interpreter fallback.
+#[majit_macros::dont_look_inside]
 pub extern "C" fn jit_create_self_recursive_callee_frame_1_raw_int(
     caller_frame: i64,
     raw_int_arg: i64,
@@ -2685,6 +2697,7 @@ pub extern "C" fn jit_create_self_recursive_callee_frame_1_raw_int(
 
 /// Raw-int variant: accepts a raw int and boxes it internally.
 /// Eliminates trace_box_int CallI from the trace (boxing folded into frame creation).
+#[majit_macros::dont_look_inside]
 pub extern "C" fn jit_create_callee_frame_1_raw_int(
     caller_frame: i64,
     callable: i64,
@@ -2694,6 +2707,7 @@ pub extern "C" fn jit_create_callee_frame_1_raw_int(
     create_callee_frame_impl_1_boxed(caller_frame, callable as PyObjectRef, boxed)
 }
 
+#[majit_macros::dont_look_inside]
 pub extern "C" fn jit_create_callee_frame_2(
     caller_frame: i64,
     callable: i64,
@@ -2707,6 +2721,7 @@ pub extern "C" fn jit_create_callee_frame_2(
     )
 }
 
+#[majit_macros::dont_look_inside]
 pub extern "C" fn jit_create_callee_frame_3(
     caller_frame: i64,
     callable: i64,
@@ -2725,6 +2740,7 @@ pub extern "C" fn jit_create_callee_frame_3(
     )
 }
 
+#[majit_macros::dont_look_inside]
 pub extern "C" fn jit_create_callee_frame_4(
     caller_frame: i64,
     callable: i64,
@@ -2759,6 +2775,7 @@ pub fn callee_frame_helper(nargs: usize) -> Option<*const ()> {
 /// Force callee and return BOXED result (for inline_function_call).
 /// warmspot.py:449 result_type=REF: jit_force_callee_frame already
 /// returns boxed Ref, so this is just a pass-through.
+#[majit_macros::jit_may_force]
 pub extern "C" fn jit_force_callee_frame_boxed(frame_ptr: i64) -> i64 {
     jit_force_callee_frame(frame_ptr)
 }
@@ -2786,6 +2803,7 @@ unsafe fn dealloc_frame_with_gc_header(frame_ptr: *mut PyFrame) {
     std::alloc::dealloc(raw, layout);
 }
 
+#[majit_macros::dont_look_inside]
 pub extern "C" fn jit_drop_callee_frame(frame_ptr: i64) {
     if frame_ptr & 1 != 0 {
         return;

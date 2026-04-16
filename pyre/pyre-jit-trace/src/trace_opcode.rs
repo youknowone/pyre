@@ -4418,33 +4418,114 @@ impl OpcodeStepExecutor for MIFrame {
         Ok(())
     }
 
-    /// LOAD_ATTR is_method=true — RPython LOOKUP_METHOD parity.
+    /// CPython/PyPy LOOKUP_METHOD parity.
+    ///
+    /// Mirror eval.rs:1543-1608: push `(attr, null_or_self)` where
+    /// `null_or_self` is the bound receiver for instance/class methods and
+    /// `PY_NULL` for already-bound methods / static methods / plain attrs.
     fn load_method(&mut self, name: &str) -> Result<(), Self::Error> {
         let obj = SharedOpcodeHandler::pop_value(self)?;
         let concrete_obj = obj.concrete.to_pyobj();
+        let attr = <Self as SharedOpcodeHandler>::load_attr(self, obj, name)?;
+        <Self as SharedOpcodeHandler>::push_value(self, attr)?;
 
-        // Abort for instance method calls or unknown concrete.
-        let is_instance =
-            !concrete_obj.is_null() && unsafe { pyre_object::is_instance(concrete_obj) };
-        if is_instance || concrete_obj.is_null() {
-            return Err(PyError::type_error(
-                "load_method: instance method — needs LOOKUP_METHOD IR (not yet implemented)",
-            ));
+        let null_value = self.with_ctx(|_this, ctx| {
+            FrontendOp::new(
+                ctx.const_ref(pyre_object::PY_NULL as i64),
+                ConcreteValue::Ref(pyre_object::PY_NULL),
+            )
+        });
+        if concrete_obj.is_null() {
+            return <Self as SharedOpcodeHandler>::push_value(self, null_value);
         }
 
-        // Non-instance path: trace as normal [attr, NULL]
-        let mut attr_concrete = ConcreteValue::Null;
-        if let Ok(result) = pyre_interpreter::baseobjspace::getattr(concrete_obj, name) {
-            attr_concrete = ConcreteValue::from_pyobj(result);
+        let concrete_attr = attr.concrete.to_pyobj();
+        if !concrete_attr.is_null() && unsafe { pyre_object::is_method(concrete_attr) } {
+            return <Self as SharedOpcodeHandler>::push_value(self, null_value);
         }
-        let attr_opref = self.trace_load_attr(obj.opref, name)?;
-        SharedOpcodeHandler::push_value(self, FrontendOp::new(attr_opref, attr_concrete))?;
 
-        let null_opref = self.trace_null_value()?;
-        SharedOpcodeHandler::push_value(
-            self,
-            FrontendOp::new(null_opref, ConcreteValue::Ref(pyre_object::PY_NULL)),
-        )
+        let bound = unsafe {
+            if pyre_object::is_instance(concrete_obj) {
+                let w_type = pyre_object::w_instance_get_type(concrete_obj);
+                let raw = pyre_interpreter::lookup_in_type(w_type, name);
+                match raw {
+                    Some(d) if pyre_object::is_staticmethod(d) => pyre_object::PY_NULL,
+                    Some(d) if pyre_object::is_classmethod(d) => w_type,
+                    Some(d) if pyre_object::is_type(d) => pyre_object::PY_NULL,
+                    Some(d) if pyre_object::is_property(d) => pyre_object::PY_NULL,
+                    Some(d) if pyre_object::is_member(d) => pyre_object::PY_NULL,
+                    Some(d) if pyre_interpreter::is_function(d) => {
+                        let ob_type = (*d).ob_type;
+                        if std::ptr::eq(
+                            ob_type,
+                            &pyre_interpreter::BUILTIN_FUNCTION_TYPE as *const PyType,
+                        ) {
+                            pyre_object::PY_NULL
+                        } else if std::ptr::eq(
+                            ob_type,
+                            &pyre_interpreter::FUNCTION_TYPE as *const PyType,
+                        ) && pyre_interpreter::is_builtin_code(
+                            pyre_interpreter::function_get_code(d) as pyre_object::PyObjectRef,
+                        ) {
+                            concrete_obj
+                        } else {
+                            concrete_obj
+                        }
+                    }
+                    Some(_) => concrete_obj,
+                    None => pyre_object::PY_NULL,
+                }
+            } else if pyre_object::is_type(concrete_obj) {
+                let raw = pyre_interpreter::lookup_in_type(concrete_obj, name);
+                match raw {
+                    Some(d) if pyre_object::is_classmethod(d) => concrete_obj,
+                    Some(_) => pyre_object::PY_NULL,
+                    None => concrete_obj,
+                }
+            } else if pyre_interpreter::typedef::r#type(concrete_obj).is_some()
+                && !pyre_object::is_module(concrete_obj)
+            {
+                concrete_obj
+            } else {
+                pyre_object::PY_NULL
+            }
+        };
+
+        let receiver = if bound.is_null() {
+            null_value
+        } else if bound == concrete_obj {
+            obj
+        } else {
+            let bound_opref = self.with_ctx(|_this, ctx| ctx.const_ref(bound as i64));
+            FrontendOp::new(bound_opref, ConcreteValue::Ref(bound))
+        };
+        <Self as SharedOpcodeHandler>::push_value(self, receiver)
+    }
+
+    /// CPython/PyPy CALL_FUNCTION parity for the `load_method()` stack shape.
+    ///
+    /// shared_opcode.rs intentionally discards `null_or_self`; the concrete
+    /// interpreter override in eval.rs:1640-1652 prepends it for instance
+    /// method calls. Trace-time execution must do the same so `CALL` after
+    /// `LOAD_METHOD` sees the same argument list as the interpreter.
+    fn call(&mut self, nargs: usize) -> Result<(), Self::Error> {
+        let mut args = Vec::with_capacity(nargs);
+        for _ in 0..nargs {
+            args.push(<Self as SharedOpcodeHandler>::pop_value(self)?);
+        }
+        args.reverse();
+        let null_or_self = <Self as SharedOpcodeHandler>::pop_value(self)?;
+        let callable = <Self as SharedOpcodeHandler>::pop_value(self)?;
+
+        let result = if null_or_self.concrete.to_pyobj().is_null() {
+            <Self as SharedOpcodeHandler>::call_callable(self, callable, &args)?
+        } else {
+            let mut full_args = Vec::with_capacity(args.len() + 1);
+            full_args.push(null_or_self);
+            full_args.extend_from_slice(&args);
+            <Self as SharedOpcodeHandler>::call_callable(self, callable, &full_args)?
+        };
+        <Self as SharedOpcodeHandler>::push_value(self, result)
     }
 
     // RPython exception handler tracing (pyjitpl.py:2506 finishframe_exception):

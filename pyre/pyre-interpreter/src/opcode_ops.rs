@@ -117,14 +117,17 @@ pub fn bool_value_from_truth(value: bool) -> PyObjectRef {
     w_bool_from(value)
 }
 
+#[majit_macros::jit_may_force]
 pub extern "C" fn jit_truth_value(value: i64) -> i64 {
     truth_value(value as PyObjectRef) as i64
 }
 
+#[majit_macros::jit_may_force]
 pub extern "C" fn jit_bool_value_from_truth(value: i64) -> i64 {
     bool_value_from_truth(value != 0) as i64
 }
 
+#[majit_macros::jit_may_force]
 pub extern "C" fn jit_binary_value_from_tag(a: i64, b: i64, op_tag: i64) -> i64 {
     match binary_value_from_tag(a as PyObjectRef, b as PyObjectRef, op_tag) {
         Ok(value) => value as i64,
@@ -132,6 +135,7 @@ pub extern "C" fn jit_binary_value_from_tag(a: i64, b: i64, op_tag: i64) -> i64 
     }
 }
 
+#[majit_macros::jit_may_force]
 pub extern "C" fn jit_compare_value_from_tag(a: i64, b: i64, op_tag: i64) -> i64 {
     match compare_value_from_tag(a as PyObjectRef, b as PyObjectRef, op_tag) {
         Ok(value) => value as i64,
@@ -139,6 +143,7 @@ pub extern "C" fn jit_compare_value_from_tag(a: i64, b: i64, op_tag: i64) -> i64
     }
 }
 
+#[majit_macros::jit_may_force]
 pub extern "C" fn jit_unary_negative_value(value: i64) -> i64 {
     match unary_negative_value(value as PyObjectRef) {
         Ok(result) => result as i64,
@@ -146,6 +151,7 @@ pub extern "C" fn jit_unary_negative_value(value: i64) -> i64 {
     }
 }
 
+#[majit_macros::jit_may_force]
 pub extern "C" fn jit_unary_invert_value(value: i64) -> i64 {
     match unary_invert_value(value as PyObjectRef) {
         Ok(result) => result as i64,
@@ -153,6 +159,7 @@ pub extern "C" fn jit_unary_invert_value(value: i64) -> i64 {
     }
 }
 
+#[majit_macros::jit_may_force]
 pub extern "C" fn jit_getitem(obj: i64, index: i64) -> i64 {
     match getitem(obj as PyObjectRef, index as PyObjectRef) {
         Ok(value) => value as i64,
@@ -160,6 +167,7 @@ pub extern "C" fn jit_getitem(obj: i64, index: i64) -> i64 {
     }
 }
 
+#[majit_macros::jit_may_force]
 pub extern "C" fn jit_setitem(obj: i64, index: i64, value: i64) -> i64 {
     match crate::setitem(
         obj as PyObjectRef,
@@ -171,6 +179,7 @@ pub extern "C" fn jit_setitem(obj: i64, index: i64, value: i64) -> i64 {
     }
 }
 
+#[majit_macros::jit_may_force]
 pub extern "C" fn jit_getattr(obj: i64, name_ptr: i64, name_len: i64) -> i64 {
     let bytes = unsafe { std::slice::from_raw_parts(name_ptr as *const u8, name_len as usize) };
     let name = std::str::from_utf8(bytes).expect("invalid attr name in JIT");
@@ -180,6 +189,7 @@ pub extern "C" fn jit_getattr(obj: i64, name_ptr: i64, name_len: i64) -> i64 {
     }
 }
 
+#[majit_macros::jit_may_force]
 pub extern "C" fn jit_setattr(obj: i64, name_ptr: i64, name_len: i64, value: i64) -> i64 {
     let bytes = unsafe { std::slice::from_raw_parts(name_ptr as *const u8, name_len as usize) };
     let name = std::str::from_utf8(bytes).expect("invalid attr name in JIT");

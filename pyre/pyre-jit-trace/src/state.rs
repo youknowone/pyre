@@ -3838,10 +3838,13 @@ mod tests {
     use super::*;
     use majit_metainterp::JitState;
     use majit_metainterp::resume::{MaterializedValue, MaterializedVirtual};
+    use pyre_interpreter::eval::eval_frame_plain;
+    use pyre_interpreter::{OpcodeStepExecutor, SharedOpcodeHandler, compile_exec};
     use pyre_object::OB_TYPE_OFFSET;
     use pyre_object::floatobject::w_float_get_value;
     use pyre_object::listobject::w_list_getitem;
     use std::cell::{Cell, UnsafeCell};
+    use std::rc::Rc;
 
     thread_local! {
         static TEST_CALLBACKS_INIT: Cell<bool> = const { Cell::new(false) };
@@ -4004,6 +4007,56 @@ mod tests {
             saw_pure_payload,
             "int payload fast path should read the immutable payload with GetfieldGcPureI"
         );
+    }
+
+    #[test]
+    fn test_load_method_accepts_plain_python_instance_method() {
+        let code = compile_exec("class C:\n    def f(self):\n        return self\nc = C()\n")
+            .expect("compile failed");
+        let mut frame = pyre_interpreter::PyFrame::new_with_context(
+            code,
+            Rc::new(pyre_interpreter::PyExecutionContext::default()),
+        );
+        eval_frame_plain(&mut frame).expect("class body should execute");
+        let instance = unsafe {
+            (*frame.namespace)
+                .get("c")
+                .copied()
+                .expect("namespace should contain c")
+        };
+
+        let mut ctx = TraceCtx::for_test(1);
+        let mut sym = PyreSym::new_uninit(OpRef::NONE);
+        sym.symbolic_initialized = true;
+
+        let mut state = MIFrame {
+            ctx: &mut ctx,
+            sym: &mut sym,
+            ob_type_fd: trace_ob_type_descr(),
+            fallthrough_pc: 0,
+            parent_frames: Vec::new(),
+            pending_inline_frame: None,
+            orgpc: 0,
+            concrete_frame_addr: (&mut frame as *mut pyre_interpreter::PyFrame) as usize,
+        };
+
+        let instance_ref = ctx.const_ref(instance as i64);
+        <MIFrame as SharedOpcodeHandler>::push_value(
+            &mut state,
+            FrontendOp::new(instance_ref, ConcreteValue::Ref(instance)),
+        )
+        .expect("push instance");
+
+        state.load_method("f").expect("load_method should succeed");
+        let receiver = <MIFrame as SharedOpcodeHandler>::pop_value(&mut state)
+            .expect("receiver should be present");
+        let callable = <MIFrame as SharedOpcodeHandler>::pop_value(&mut state)
+            .expect("callable should be present");
+
+        assert!(receiver.concrete.to_pyobj().is_null());
+        unsafe {
+            assert!(pyre_object::is_method(callable.concrete.to_pyobj()));
+        }
     }
 
     #[test]

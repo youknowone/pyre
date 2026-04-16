@@ -94,6 +94,7 @@ pub unsafe fn w_int_get_value(obj: PyObjectRef) -> i64 {
     unsafe { (*(obj as *const W_IntObject)).intval }
 }
 
+#[majit_macros::dont_look_inside]
 pub extern "C" fn jit_w_int_new(value: i64) -> i64 {
     w_int_new(value) as i64
 }

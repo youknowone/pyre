@@ -57,6 +57,7 @@ pub unsafe fn w_tuple_len(obj: PyObjectRef) -> usize {
     tuple.items.len()
 }
 
+#[majit_macros::elidable]
 pub extern "C" fn jit_tuple_getitem(tuple: i64, index: i64) -> i64 {
     unsafe {
         match w_tuple_getitem(tuple as PyObjectRef, index) {
