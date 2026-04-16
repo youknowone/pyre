@@ -195,22 +195,6 @@ pub struct StorageConfig {
     /// Optional method on StoragePool to check JIT compatibility of all values.
     /// When set, `can_trace` additionally calls `pool.method()`.
     pub can_trace_guard: Option<Ident>,
-    /// Track storage state as compact ptr/len/cap triples instead of flattening contents.
-    pub compact_live: bool,
-    /// Optional helper to encode a semantic i64 value for raw storage writes.
-    pub compact_encode: Option<Path>,
-    /// Optional helper to decode a raw storage word to semantic i64.
-    pub compact_decode: Option<Path>,
-    /// Optional lower bound for values representable in compact storage.
-    pub compact_min: Option<Expr>,
-    /// Optional upper bound for values representable in compact storage.
-    pub compact_max: Option<Expr>,
-    /// Byte offset of the compact storage pointer cache array on the pool object.
-    pub compact_ptrs_offset: Option<Expr>,
-    /// Byte offset of the compact storage length cache array on the pool object.
-    pub compact_lengths_offset: Option<Expr>,
-    /// Byte offset of the compact storage capacity cache array on the pool object.
-    pub compact_caps_offset: Option<Expr>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -391,14 +375,6 @@ fn parse_storage_config(input: ParseStream) -> syn::Result<StorageConfig> {
     let mut untraceable = Vec::new();
     let mut scan_fn = None;
     let mut can_trace_guard = None;
-    let mut compact_live = false;
-    let mut compact_encode = None;
-    let mut compact_decode = None;
-    let mut compact_min = None;
-    let mut compact_max = None;
-    let mut compact_ptrs_offset = None;
-    let mut compact_lengths_offset = None;
-    let mut compact_caps_offset = None;
     while !content.is_empty() {
         let key: Ident = content.parse()?;
         content.parse::<Token![:]>()?;
@@ -434,30 +410,6 @@ fn parse_storage_config(input: ParseStream) -> syn::Result<StorageConfig> {
             }
             "can_trace_guard" => {
                 can_trace_guard = Some(content.parse::<Ident>()?);
-            }
-            "compact_live" => {
-                compact_live = content.parse::<LitBool>()?.value;
-            }
-            "compact_encode" => {
-                compact_encode = Some(content.parse::<Path>()?);
-            }
-            "compact_decode" => {
-                compact_decode = Some(content.parse::<Path>()?);
-            }
-            "compact_min" => {
-                compact_min = Some(content.parse::<Expr>()?);
-            }
-            "compact_max" => {
-                compact_max = Some(content.parse::<Expr>()?);
-            }
-            "compact_ptrs_offset" => {
-                compact_ptrs_offset = Some(content.parse::<Expr>()?);
-            }
-            "compact_lengths_offset" => {
-                compact_lengths_offset = Some(content.parse::<Expr>()?);
-            }
-            "compact_caps_offset" => {
-                compact_caps_offset = Some(content.parse::<Expr>()?);
             }
             "virtualizable" => {
                 let _: LitBool = content.parse()?;
@@ -496,14 +448,6 @@ fn parse_storage_config(input: ParseStream) -> syn::Result<StorageConfig> {
         untraceable,
         scan_fn,
         can_trace_guard,
-        compact_live,
-        compact_encode,
-        compact_decode,
-        compact_min,
-        compact_max,
-        compact_ptrs_offset,
-        compact_lengths_offset,
-        compact_caps_offset,
     })
 }
 
@@ -842,11 +786,7 @@ fn generate_merge_wrapper(config: &JitInterpConfig, func: &ItemFn) -> TokenStrea
             .as_ref()
             .expect("storage config required in storage mode");
         let pool_type = &storage.pool_type;
-        let close_selected_check = if storage.compact_live {
-            quote! {}
-        } else {
-            quote! { && __sel == __sym.header_selected() }
-        };
+        let close_selected_check = quote! { && __sel == __sym.header_selected() };
         quote! {
             #[cold]
             #[inline(never)]

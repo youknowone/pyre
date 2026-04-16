@@ -215,14 +215,6 @@ pub struct StorageConfig {
     pub untraceable: Vec<TokenStream>,
     pub scan_fn: TokenStream,
     pub can_trace_guard: Option<TokenStream>,
-    pub compact_live: bool,
-    pub compact_encode: Option<TokenStream>,
-    pub compact_decode: Option<TokenStream>,
-    pub compact_min: Option<TokenStream>,
-    pub compact_max: Option<TokenStream>,
-    pub compact_ptrs_offset: Option<TokenStream>,
-    pub compact_lengths_offset: Option<TokenStream>,
-    pub compact_caps_offset: Option<TokenStream>,
 }
 
 /// Generate a complete JIT mainloop module.
@@ -278,35 +270,6 @@ pub fn generate_jitcode(config: &JitDriverConfig) -> TokenStream {
                 quote! { can_trace_guard: #g, }
             })
             .unwrap_or_default();
-        let compact_live = s.compact_live;
-        let compact_encode = s.compact_encode.as_ref().map(|path| {
-            let path = path.clone();
-            quote! { compact_encode: #path, }
-        });
-        let compact_decode = s.compact_decode.as_ref().map(|path| {
-            let path = path.clone();
-            quote! { compact_decode: #path, }
-        });
-        let compact_min = s.compact_min.as_ref().map(|expr| {
-            let expr = expr.clone();
-            quote! { compact_min: #expr, }
-        });
-        let compact_max = s.compact_max.as_ref().map(|expr| {
-            let expr = expr.clone();
-            quote! { compact_max: #expr, }
-        });
-        let compact_ptrs_offset = s.compact_ptrs_offset.as_ref().map(|expr| {
-            let expr = expr.clone();
-            quote! { compact_ptrs_offset: #expr, }
-        });
-        let compact_lengths_offset = s.compact_lengths_offset.as_ref().map(|expr| {
-            let expr = expr.clone();
-            quote! { compact_lengths_offset: #expr, }
-        });
-        let compact_caps_offset = s.compact_caps_offset.as_ref().map(|expr| {
-            let expr = expr.clone();
-            quote! { compact_caps_offset: #expr, }
-        });
         quote! {
             storage = {
                 pool: #pool, pool_type: #pool_type,
@@ -314,14 +277,6 @@ pub fn generate_jitcode(config: &JitDriverConfig) -> TokenStream {
                 untraceable: [#(#untraceable),*],
                 scan: #scan,
                 #guard
-                compact_live: #compact_live,
-                #compact_encode
-                #compact_decode
-                #compact_min
-                #compact_max
-                #compact_ptrs_offset
-                #compact_lengths_offset
-                #compact_caps_offset
             },
         }
     });

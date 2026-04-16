@@ -85,9 +85,6 @@ pub trait JitCodeSym {
     fn fail_args(&self) -> Option<Vec<OpRef>>;
 
     /// Guard-failure state materialization that may record extra IR.
-    ///
-    /// Compact storage backends use this to attach logical stack state
-    /// (lengths and pending writes) without exposing it as loop inputargs.
     fn fail_args_with_ctx(&mut self, _ctx: &mut TraceCtx) -> Option<Vec<OpRef>> {
         self.fail_args()
     }
@@ -100,72 +97,6 @@ pub trait JitCodeSym {
     /// Types of fail_args values. When Some, used instead of default all-Int.
     fn fail_args_types(&self) -> Option<Vec<majit_ir::Type>> {
         None
-    }
-
-    /// Compact storage-pool support: raw data pointer for a traced storage.
-    fn compact_storage_ptr(&self, _selected: usize) -> Option<OpRef> {
-        None
-    }
-
-    /// Compact storage-pool support: current logical length for a traced storage.
-    fn compact_storage_len(&self, _selected: usize) -> Option<OpRef> {
-        None
-    }
-
-    /// Compact storage-pool support: current capacity for a traced storage.
-    fn compact_storage_cap(&self, _selected: usize) -> Option<OpRef> {
-        None
-    }
-
-    /// Update the symbolic length for a compact traced storage.
-    fn set_compact_storage_len(&mut self, _selected: usize, _value: OpRef) {}
-
-    /// Get a cached raw word for a concrete compact storage slot.
-    fn compact_storage_slot_raw(&self, _selected: usize, _index: usize) -> Option<OpRef> {
-        None
-    }
-
-    /// Record a cached raw word for a concrete compact storage slot.
-    fn set_compact_storage_slot_raw(&mut self, _selected: usize, _index: usize, _raw: OpRef) {}
-
-    /// Drop cached compact storage slots at and above `len`.
-    fn truncate_compact_storage_slots(&mut self, _selected: usize, _len: usize) {}
-
-    /// Ensure compact storage refs are available, recording any required loads.
-    fn ensure_compact_storage_loaded(
-        &mut self,
-        _ctx: &mut TraceCtx,
-        selected: usize,
-    ) -> Option<(OpRef, OpRef, OpRef)> {
-        Some((
-            self.compact_storage_ptr(selected)?,
-            self.compact_storage_len(selected)?,
-            self.compact_storage_cap(selected)?,
-        ))
-    }
-
-    /// Write the latest compact length back to heap metadata if needed.
-    fn compact_storage_writeback_len(
-        &mut self,
-        _ctx: &mut TraceCtx,
-        _selected: usize,
-        _new_len: OpRef,
-    ) {
-    }
-
-    /// Optional semantic bounds for compact storage values.
-    fn compact_storage_bounds(&self) -> Option<(i64, i64)> {
-        None
-    }
-
-    /// Decode a raw compact storage word into a semantic integer value.
-    fn compact_storage_decode(&self, _ctx: &mut TraceCtx, raw: OpRef) -> OpRef {
-        raw
-    }
-
-    /// Encode a semantic integer value into the raw compact storage representation.
-    fn compact_storage_encode(&self, _ctx: &mut TraceCtx, value: OpRef) -> OpRef {
-        value
     }
 
     // -- State field support (register/tape machines) -----
@@ -428,14 +359,6 @@ where
         }
     }
 
-    fn compact_storage_refs(
-        ctx: &mut TraceCtx,
-        sym: &mut S,
-        selected: usize,
-    ) -> Option<(OpRef, OpRef, OpRef)> {
-        sym.ensure_compact_storage_loaded(ctx, selected)
-    }
-
     fn raw_word_array_descr() -> majit_ir::DescrRef {
         majit_ir::descr::make_array_descr(0, 8, majit_ir::Type::Int)
     }
@@ -462,189 +385,6 @@ where
         let info = ctx.virtualizable_info()?;
         let descr = info.array_field_descrs().get(array_idx)?.clone();
         Some((vable_opref, descr))
-    }
-
-    fn compact_load_raw(ctx: &mut TraceCtx, ptr: OpRef, index: OpRef) -> OpRef {
-        ctx.record_op_with_descr(
-            OpCode::GetarrayitemRawI,
-            &[ptr, index],
-            Self::raw_word_array_descr(),
-        )
-    }
-
-    fn compact_store_raw(ctx: &mut TraceCtx, ptr: OpRef, index: OpRef, raw: OpRef) {
-        ctx.record_op_with_descr(
-            OpCode::SetarrayitemRaw,
-            &[ptr, index, raw],
-            Self::raw_word_array_descr(),
-        );
-    }
-
-    fn compact_resume_pc(&mut self, ctx: &mut TraceCtx) -> OpRef {
-        ctx.const_int(self.frames.current_mut().pc as i64)
-    }
-
-    fn compact_guard_push_capacity(
-        &mut self,
-        ctx: &mut TraceCtx,
-        sym: &mut S,
-        len: OpRef,
-        cap: OpRef,
-    ) {
-        let has_room = ctx.record_op(OpCode::IntLt, &[len, cap]);
-        let resume_pc = self.compact_resume_pc(ctx);
-        Self::record_state_guard(ctx, sym, OpCode::GuardTrue, &[has_room], &[resume_pc]);
-    }
-
-    fn compact_guard_required_stack(
-        &mut self,
-        ctx: &mut TraceCtx,
-        sym: &mut S,
-        len: OpRef,
-        required: usize,
-        concrete_len: usize,
-    ) {
-        let required_ref = ctx.const_int(required as i64);
-        let has_enough = ctx.record_op(OpCode::IntGe, &[len, required_ref]);
-        let opcode = if concrete_len < required {
-            OpCode::GuardFalse
-        } else {
-            OpCode::GuardTrue
-        };
-        let resume_pc = if concrete_len < required {
-            // BRPOP-style traces that took the branch must resume on the
-            // fallthrough instruction when the guard fails.
-            ctx.const_int((self.frames.current_mut().pc + 1) as i64)
-        } else {
-            // Non-branching traces must re-run the current control opcode so
-            // the interpreter can take the branch concretely on guard failure.
-            self.compact_resume_pc(ctx)
-        };
-        Self::record_state_guard(ctx, sym, opcode, &[has_enough], &[resume_pc]);
-    }
-
-    fn compact_guard_value_bounds(
-        &mut self,
-        ctx: &mut TraceCtx,
-        sym: &mut S,
-        value: OpRef,
-        concrete: i64,
-    ) -> Result<(), TraceAction> {
-        let Some((min, max)) = sym.compact_storage_bounds() else {
-            return Ok(());
-        };
-        if concrete < min || concrete > max {
-            return Err(TraceAction::Abort);
-        }
-        let resume_pc = self.compact_resume_pc(ctx);
-        let min_ref = ctx.const_int(min);
-        let lower_ok = ctx.record_op(OpCode::IntGe, &[value, min_ref]);
-        Self::record_state_guard(ctx, sym, OpCode::GuardTrue, &[lower_ok], &[resume_pc]);
-        let max_ref = ctx.const_int(max);
-        let upper_ok = ctx.record_op(OpCode::IntLe, &[value, max_ref]);
-        Self::record_state_guard(ctx, sym, OpCode::GuardTrue, &[upper_ok], &[resume_pc]);
-        Ok(())
-    }
-
-    fn compact_pop_int(
-        &mut self,
-        ctx: &mut TraceCtx,
-        sym: &mut S,
-        runtime: &R,
-        selected: usize,
-    ) -> Result<(OpRef, i64), TraceAction> {
-        let concrete = self
-            .runtime_stack_mut(selected, runtime)
-            .pop()
-            .ok_or(TraceAction::Abort)?;
-        let concrete_new_len = self.runtime_stack_mut(selected, runtime).len();
-        let Some((ptr, len, _)) = Self::compact_storage_refs(ctx, sym, selected) else {
-            return Err(TraceAction::Abort);
-        };
-        let one = ctx.const_int(1);
-        let new_len = ctx.record_op(OpCode::IntSub, &[len, one]);
-        let raw = sym
-            .compact_storage_slot_raw(selected, concrete_new_len)
-            .unwrap_or_else(|| Self::compact_load_raw(ctx, ptr, new_len));
-        sym.truncate_compact_storage_slots(selected, concrete_new_len);
-        let decoded = sym.compact_storage_decode(ctx, raw);
-        sym.set_compact_storage_len(selected, new_len);
-        sym.compact_storage_writeback_len(ctx, selected, new_len);
-        Ok((decoded, concrete))
-    }
-
-    fn compact_peek_int(
-        &mut self,
-        ctx: &mut TraceCtx,
-        sym: &mut S,
-        runtime: &R,
-        selected: usize,
-    ) -> Result<(OpRef, i64), TraceAction> {
-        let concrete_stack = self.runtime_stack_mut(selected, runtime);
-        let concrete = concrete_stack.last().copied().ok_or(TraceAction::Abort)?;
-        let concrete_index = concrete_stack.len() - 1;
-        let Some((ptr, len, _)) = Self::compact_storage_refs(ctx, sym, selected) else {
-            return Err(TraceAction::Abort);
-        };
-        let one = ctx.const_int(1);
-        let index = ctx.record_op(OpCode::IntSub, &[len, one]);
-        let raw = sym
-            .compact_storage_slot_raw(selected, concrete_index)
-            .unwrap_or_else(|| Self::compact_load_raw(ctx, ptr, index));
-        let decoded = sym.compact_storage_decode(ctx, raw);
-        Ok((decoded, concrete))
-    }
-
-    // ── Compact storage push/pop ──
-
-    fn compact_push_int(
-        &mut self,
-        ctx: &mut TraceCtx,
-        sym: &mut S,
-        runtime: &R,
-        selected: usize,
-        value: OpRef,
-        concrete: i64,
-    ) -> Result<(), TraceAction> {
-        let Some((ptr, len, cap)) = Self::compact_storage_refs(ctx, sym, selected) else {
-            return Err(TraceAction::Abort);
-        };
-        let concrete_index = self.runtime_stack_mut(selected, runtime).len();
-        self.compact_guard_push_capacity(ctx, sym, len, cap);
-        self.compact_guard_value_bounds(ctx, sym, value, concrete)?;
-        let raw = sym.compact_storage_encode(ctx, value);
-        Self::compact_store_raw(ctx, ptr, len, raw);
-        sym.set_compact_storage_slot_raw(selected, concrete_index, raw);
-        let one = ctx.const_int(1);
-        let new_len = ctx.record_op(OpCode::IntAdd, &[len, one]);
-        sym.set_compact_storage_len(selected, new_len);
-        sym.compact_storage_writeback_len(ctx, selected, new_len);
-        self.runtime_stack_mut(selected, runtime).push(concrete);
-        Ok(())
-    }
-
-    fn compact_push_raw(
-        &mut self,
-        ctx: &mut TraceCtx,
-        sym: &mut S,
-        runtime: &R,
-        selected: usize,
-        raw: OpRef,
-        concrete: i64,
-    ) -> Result<(), TraceAction> {
-        let Some((ptr, len, cap)) = Self::compact_storage_refs(ctx, sym, selected) else {
-            return Err(TraceAction::Abort);
-        };
-        let concrete_index = self.runtime_stack_mut(selected, runtime).len();
-        self.compact_guard_push_capacity(ctx, sym, len, cap);
-        Self::compact_store_raw(ctx, ptr, len, raw);
-        sym.set_compact_storage_slot_raw(selected, concrete_index, raw);
-        let one = ctx.const_int(1);
-        let new_len = ctx.record_op(OpCode::IntAdd, &[len, one]);
-        sym.set_compact_storage_len(selected, new_len);
-        sym.compact_storage_writeback_len(ctx, selected, new_len);
-        self.runtime_stack_mut(selected, runtime).push(concrete);
-        Ok(())
     }
 
     /// Construct a `JitCodeMachine` over an existing framestack borrow.
@@ -789,161 +529,65 @@ where
             BC_POP_I => {
                 let dst = self.frames.current_mut().next_u16() as usize;
                 let selected = sym.current_selected();
-                if Self::compact_storage_refs(ctx, sym, selected).is_some() {
-                    let Ok((symbolic, concrete)) =
-                        self.compact_pop_int(ctx, sym, runtime, selected)
-                    else {
-                        return TraceAction::Abort;
-                    };
-                    self.set_int_reg(dst, Some(symbolic), Some(concrete));
-                } else {
-                    let symbolic = {
-                        let stack = sym.stack_mut(selected).expect("missing symbolic stack");
-                        stack.pop()
-                    };
-                    let concrete = self.runtime_stack_mut(selected, runtime).pop();
-                    self.set_int_reg(dst, symbolic, concrete);
-                }
+                let symbolic = {
+                    let stack = sym.stack_mut(selected).expect("missing symbolic stack");
+                    stack.pop()
+                };
+                let concrete = self.runtime_stack_mut(selected, runtime).pop();
+                self.set_int_reg(dst, symbolic, concrete);
             }
             BC_PEEK_I => {
                 let dst = self.frames.current_mut().next_u16() as usize;
                 let selected = sym.current_selected();
-                if Self::compact_storage_refs(ctx, sym, selected).is_some() {
-                    let Ok((symbolic, concrete)) =
-                        self.compact_peek_int(ctx, sym, runtime, selected)
-                    else {
-                        return TraceAction::Abort;
-                    };
-                    self.set_int_reg(dst, Some(symbolic), Some(concrete));
-                } else {
-                    // RPython parity: peek from boxes (SymbolicStack), no IR.
-                    let symbolic = {
-                        let stack = sym.stack(selected).expect("missing symbolic stack");
-                        stack.peek()
-                    };
-                    let concrete = self.runtime_stack_mut(selected, runtime).last().copied();
-                    self.set_int_reg(dst, symbolic, concrete);
-                }
+                // RPython parity: peek from boxes (SymbolicStack), no IR.
+                let symbolic = {
+                    let stack = sym.stack(selected).expect("missing symbolic stack");
+                    stack.peek()
+                };
+                let concrete = self.runtime_stack_mut(selected, runtime).last().copied();
+                self.set_int_reg(dst, symbolic, concrete);
             }
             BC_PUSH_I => {
                 let src = self.frames.current_mut().next_u16() as usize;
                 let selected = sym.current_selected();
                 let (value, concrete) = self.read_int_reg(src);
-                if Self::compact_storage_refs(ctx, sym, selected).is_some() {
-                    if self
-                        .compact_push_int(ctx, sym, runtime, selected, value, concrete)
-                        .is_err()
-                    {
-                        return TraceAction::Abort;
-                    }
-                } else {
-                    let stack = sym.stack_mut(selected).expect("missing symbolic stack");
-                    stack.push(value);
-                    self.runtime_stack_mut(selected, runtime).push(concrete);
-                }
+                let stack = sym.stack_mut(selected).expect("missing symbolic stack");
+                stack.push(value);
+                self.runtime_stack_mut(selected, runtime).push(concrete);
             }
             BC_POP_DISCARD => {
                 let selected = sym.current_selected();
-                if Self::compact_storage_refs(ctx, sym, selected).is_some() {
-                    if self.runtime_stack_mut(selected, runtime).pop().is_none() {
-                        return TraceAction::Abort;
-                    }
-                    let concrete_new_len = self.runtime_stack_mut(selected, runtime).len();
-                    let Some((_, len, _)) = Self::compact_storage_refs(ctx, sym, selected) else {
-                        return TraceAction::Abort;
-                    };
-                    let one = ctx.const_int(1);
-                    let new_len = ctx.record_op(OpCode::IntSub, &[len, one]);
-                    sym.truncate_compact_storage_slots(selected, concrete_new_len);
-                    sym.set_compact_storage_len(selected, new_len);
-                    sym.compact_storage_writeback_len(ctx, selected, new_len);
-                } else {
-                    let stack = sym.stack_mut(selected).expect("missing symbolic stack");
-                    let _ = stack.pop();
-                    let _ = self.runtime_stack_mut(selected, runtime).pop();
-                }
+                let stack = sym.stack_mut(selected).expect("missing symbolic stack");
+                let _ = stack.pop();
+                let _ = self.runtime_stack_mut(selected, runtime).pop();
             }
             BC_DUP_STACK => {
                 let selected = sym.current_selected();
-                if Self::compact_storage_refs(ctx, sym, selected).is_some() {
-                    let concrete_stack = self.runtime_stack_mut(selected, runtime);
-                    let Some(concrete) = concrete_stack.last().copied() else {
-                        return TraceAction::Abort;
-                    };
-                    let concrete_top_index = concrete_stack.len() - 1;
-                    let Some((ptr, len, _)) = Self::compact_storage_refs(ctx, sym, selected) else {
-                        return TraceAction::Abort;
-                    };
-                    let one = ctx.const_int(1);
-                    let top_index = ctx.record_op(OpCode::IntSub, &[len, one]);
-                    let raw = sym
-                        .compact_storage_slot_raw(selected, concrete_top_index)
-                        .unwrap_or_else(|| Self::compact_load_raw(ctx, ptr, top_index));
-                    if self
-                        .compact_push_raw(ctx, sym, runtime, selected, raw, concrete)
-                        .is_err()
-                    {
-                        return TraceAction::Abort;
-                    }
-                } else {
-                    let stack = sym.stack_mut(selected).expect("missing symbolic stack");
-                    stack.dup();
-                    let value = self
-                        .runtime_stack_mut(selected, runtime)
-                        .last()
-                        .copied()
-                        .expect("cannot dup from empty runtime stack");
-                    self.runtime_stack_mut(selected, runtime).push(value);
-                }
+                let stack = sym.stack_mut(selected).expect("missing symbolic stack");
+                stack.dup();
+                let value = self
+                    .runtime_stack_mut(selected, runtime)
+                    .last()
+                    .copied()
+                    .expect("cannot dup from empty runtime stack");
+                self.runtime_stack_mut(selected, runtime).push(value);
             }
             BC_SWAP_STACK => {
                 let selected = sym.current_selected();
-                if Self::compact_storage_refs(ctx, sym, selected).is_some() {
-                    let runtime_stack = self.runtime_stack_mut(selected, runtime);
-                    let len = runtime_stack.len();
-                    assert!(
-                        len >= 2,
-                        "cannot swap runtime stack with fewer than two values"
-                    );
-                    runtime_stack.swap(len - 1, len - 2);
-
-                    let Some((ptr, len_ref, _)) = Self::compact_storage_refs(ctx, sym, selected)
-                    else {
-                        return TraceAction::Abort;
-                    };
-                    let one = ctx.const_int(1);
-                    let two = ctx.const_int(2);
-                    let top_index = ctx.record_op(OpCode::IntSub, &[len_ref, one]);
-                    let prev_index = ctx.record_op(OpCode::IntSub, &[len_ref, two]);
-                    let raw_top = sym
-                        .compact_storage_slot_raw(selected, len - 1)
-                        .unwrap_or_else(|| Self::compact_load_raw(ctx, ptr, top_index));
-                    let raw_prev = sym
-                        .compact_storage_slot_raw(selected, len - 2)
-                        .unwrap_or_else(|| Self::compact_load_raw(ctx, ptr, prev_index));
-                    Self::compact_store_raw(ctx, ptr, prev_index, raw_top);
-                    Self::compact_store_raw(ctx, ptr, top_index, raw_prev);
-                    sym.set_compact_storage_slot_raw(selected, len - 2, raw_top);
-                    sym.set_compact_storage_slot_raw(selected, len - 1, raw_prev);
-                } else {
-                    let stack = sym.stack_mut(selected).expect("missing symbolic stack");
-                    stack.swap();
-                    let stack = self.runtime_stack_mut(selected, runtime);
-                    let len = stack.len();
-                    assert!(
-                        len >= 2,
-                        "cannot swap runtime stack with fewer than two values"
-                    );
-                    stack.swap(len - 1, len - 2);
-                }
+                let stack = sym.stack_mut(selected).expect("missing symbolic stack");
+                stack.swap();
+                let stack = self.runtime_stack_mut(selected, runtime);
+                let len = stack.len();
+                assert!(
+                    len >= 2,
+                    "cannot swap runtime stack with fewer than two values"
+                );
+                stack.swap(len - 1, len - 2);
             }
             BC_COPY_FROM_BOTTOM => {
                 // Copy element at index (from bottom) to top of stack.
                 let idx_reg = self.frames.current_mut().next_u16() as usize;
                 let selected = sym.current_selected();
-                if Self::compact_storage_refs(ctx, sym, selected).is_some() {
-                    return TraceAction::Abort;
-                }
                 let (idx_sym, idx_concrete) = self.read_int_reg(idx_reg);
                 let index = idx_concrete as usize;
 
@@ -960,9 +604,6 @@ where
                 // Pop top of stack, store at index (from bottom).
                 let idx_reg = self.frames.current_mut().next_u16() as usize;
                 let selected = sym.current_selected();
-                if Self::compact_storage_refs(ctx, sym, selected).is_some() {
-                    return TraceAction::Abort;
-                }
                 let (idx_sym, idx_concrete) = self.read_int_reg(idx_reg);
                 let index = idx_concrete as usize;
 
@@ -1283,12 +924,20 @@ where
                 let selected = sym.current_selected();
                 let concrete_len = self.runtime_stack_mut(selected, runtime).len();
                 if let Some(len) = sym.current_stacksize_value() {
-                    self.compact_guard_required_stack(ctx, sym, len, required, concrete_len);
-                } else if let Some((_, len, _)) = Self::compact_storage_refs(ctx, sym, selected) {
-                    // RPython parity: the BRPOP path is part of the traced path,
-                    // so compact-storage mode must guard on the current stack
-                    // depth before the interpreter decides whether to jump.
-                    self.compact_guard_required_stack(ctx, sym, len, required, concrete_len);
+                    let required_ref = ctx.const_int(required as i64);
+                    let has_enough = ctx.record_op(OpCode::IntGe, &[len, required_ref]);
+                    let opcode = if concrete_len < required {
+                        OpCode::GuardFalse
+                    } else {
+                        OpCode::GuardTrue
+                    };
+                    let pc = self.frames.current_mut().pc;
+                    let resume_pc = if concrete_len < required {
+                        ctx.const_int((pc + 1) as i64)
+                    } else {
+                        ctx.const_int(pc as i64)
+                    };
+                    Self::record_state_guard(ctx, sym, opcode, &[has_enough], &[resume_pc]);
                 }
                 if concrete_len < required {
                     // Stack insufficient: the interpreter will take the branch.
@@ -1298,28 +947,17 @@ where
             }
             BC_BRANCH_ZERO => {
                 let selected = sym.current_selected();
-                let (cond, runtime_cond) =
-                    if Self::compact_storage_refs(ctx, sym, selected).is_some() {
-                        let Ok((cond, runtime_cond)) =
-                            self.compact_pop_int(ctx, sym, runtime, selected)
-                        else {
-                            return TraceAction::Abort;
-                        };
-                        (cond, runtime_cond)
-                    } else {
-                        let runtime_cond = {
-                            let runtime_stack = self.runtime_stack_mut(selected, runtime);
-                            let Some(value) = runtime_stack.pop() else {
-                                return TraceAction::Abort;
-                            };
-                            value
-                        };
-                        let cond = {
-                            let stack = sym.stack_mut(selected).expect("missing symbolic stack");
-                            stack.pop().expect("branch_zero on empty symbolic stack")
-                        };
-                        (cond, runtime_cond)
+                let runtime_cond = {
+                    let runtime_stack = self.runtime_stack_mut(selected, runtime);
+                    let Some(value) = runtime_stack.pop() else {
+                        return TraceAction::Abort;
                     };
+                    value
+                };
+                let cond = {
+                    let stack = sym.stack_mut(selected).expect("missing symbolic stack");
+                    stack.pop().expect("branch_zero on empty symbolic stack")
+                };
                 let pc = self.frames.current_mut().pc;
                 // RPython parity: check ALL green keys (pc + selected).
                 let close_loop = runtime.label_at(pc) == sym.loop_header_pc()
@@ -1637,22 +1275,15 @@ where
                 };
                 if sym.current_selected_ref().is_some() {
                     return TraceAction::Abort;
-                } else if Self::compact_storage_refs(ctx, sym, new_selected).is_none()
-                    && sym.stack(new_selected).is_none()
-                {
-                    if Self::compact_storage_refs(ctx, sym, sym.current_selected()).is_some() {
-                        return TraceAction::Abort;
-                    }
+                }
+                if sym.stack(new_selected).is_none() {
                     let len = runtime.stack_len(new_selected);
                     let offset = sym.total_slots();
                     sym.ensure_stack(new_selected, offset, len);
                     let _ = self.runtime_stack_mut(new_selected, runtime);
-                    let selected_value = ctx.const_int(new_selected as i64);
-                    sym.set_current_selected_value(new_selected, selected_value);
-                } else {
-                    let selected_value = ctx.const_int(new_selected as i64);
-                    sym.set_current_selected_value(new_selected, selected_value);
                 }
+                let selected_value = ctx.const_int(new_selected as i64);
+                sym.set_current_selected_value(new_selected, selected_value);
             }
             BC_PUSH_TO => {
                 let (src_idx, target) = {
@@ -1662,29 +1293,16 @@ where
                 let (value, concrete) = self.read_int_reg(src_idx);
                 if sym.current_selected_ref().is_some() {
                     return TraceAction::Abort;
-                } else if Self::compact_storage_refs(ctx, sym, target).is_some() {
-                    if self
-                        .compact_push_int(ctx, sym, runtime, target, value, concrete)
-                        .is_err()
-                    {
-                        return TraceAction::Abort;
-                    }
-                } else {
-                    if Self::compact_storage_refs(ctx, sym, sym.current_selected()).is_some()
-                        && sym.stack(target).is_none()
-                    {
-                        return TraceAction::Abort;
-                    }
-                    if sym.stack(target).is_none() {
-                        let len = runtime.stack_len(target);
-                        let offset = sym.total_slots();
-                        sym.ensure_stack(target, offset, len);
-                        let _ = self.runtime_stack_mut(target, runtime);
-                    }
-                    let stack = sym.stack_mut(target).expect("missing target stack");
-                    stack.push(value);
-                    self.runtime_stack_mut(target, runtime).push(concrete);
                 }
+                if sym.stack(target).is_none() {
+                    let len = runtime.stack_len(target);
+                    let offset = sym.total_slots();
+                    sym.ensure_stack(target, offset, len);
+                    let _ = self.runtime_stack_mut(target, runtime);
+                }
+                let stack = sym.stack_mut(target).expect("missing target stack");
+                stack.push(value);
+                self.runtime_stack_mut(target, runtime).push(concrete);
             }
             BC_MOVE_I => {
                 let (dst, src) = {
