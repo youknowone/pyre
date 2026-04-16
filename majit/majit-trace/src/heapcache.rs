@@ -698,16 +698,23 @@ impl HeapCache {
     }
 
     pub fn setfield_cached(&mut self, obj: OpRef, field_index: u32, value: OpRef) {
-        let obj_is_unescaped = vb_contains(&self.is_unescaped, &obj);
+        // heapcache.py:493 is_unescaped — version-gated through _check_flag.
+        let obj_is_unescaped = self.is_unescaped(obj);
         if !obj_is_unescaped {
             // Potential aliasing: clear all cached values for this field
             // from objects that are not known-unescaped.
+            // Snapshot version + flags so the closure can re-check without
+            // borrowing self mutably.
+            let head_version = self.head_version;
+            let flags_snapshot: Vec<u32> = self.heapc_flags.clone();
             self.field_cache.retain(|&(cached_obj, cached_field), _| {
                 if cached_field != field_index {
                     return true;
                 }
                 // Keep entries for unescaped objects (no aliasing possible)
-                vb_contains(&self.is_unescaped, &cached_obj)
+                let i = cached_obj.0 as usize;
+                let f = flags_snapshot.get(i).copied().unwrap_or(0);
+                Self::versioned_or(f, head_version) && (f as u8) & HF_IS_UNESCAPED != 0
             });
         }
         self.field_cache.insert((obj, field_index), value);
@@ -734,10 +741,19 @@ impl HeapCache {
     /// escaped objects only. Unescaped (newly allocated) objects cannot
     /// be affected by external calls, so their caches are preserved.
     pub fn invalidate_caches_for_escaped(&mut self) {
-        self.field_cache
-            .retain(|&(obj, _), _| vb_contains(&self.is_unescaped, &obj));
+        // heapcache.py:493 — version-gated is_unescaped check via the
+        // shared (head_version, heapc_flags) snapshot pattern so the
+        // closure does not need to borrow self.
+        let head_version = self.head_version;
+        let flags_snapshot: Vec<u32> = self.heapc_flags.clone();
+        let still_unescaped = |obj: OpRef| -> bool {
+            let i = obj.0 as usize;
+            let f = flags_snapshot.get(i).copied().unwrap_or(0);
+            Self::versioned_or(f, head_version) && (f as u8) & HF_IS_UNESCAPED != 0
+        };
+        self.field_cache.retain(|&(obj, _), _| still_unescaped(obj));
         self.array_cache
-            .retain(|&(obj, _, _), _| vb_contains(&self.is_unescaped, &obj));
+            .retain(|&(obj, _, _), _| still_unescaped(obj));
     }
 
     /// heapcache.py: mark_escaped_varargs — escape call arguments before
@@ -888,28 +904,35 @@ impl HeapCache {
         self.nullity_now_known(opref, true);
     }
 
-    /// Check if the class of an object is known.
+    /// heapcache.py:467-468 is_class_known.
+    ///   `return self._check_flag(box, HF_KNOWN_CLASS)`
+    /// Version-gated through `_check_flag` so a `reset_keep_likely_virtuals`
+    /// (which only bumps `head_version`) hides stale class info.
     pub fn is_class_known(&self, opref: OpRef) -> bool {
         if opref.is_constant() {
             return false;
         }
-        self.known_class
-            .get(opref.0 as usize)
-            .map_or(false, |v| v.is_some())
+        self._check_flag(opref, HF_KNOWN_CLASS)
     }
 
     /// Get the known class of an object, if available.
+    /// Mirrors heapcache.py:467 — only valid when the version is current,
+    /// because the side `known_class` Vec may hold stale entries from
+    /// before the last `reset_keep_likely_virtuals`.
     pub fn get_known_class(&self, opref: OpRef) -> Option<GcRef> {
         if opref.is_constant() {
+            return None;
+        }
+        if !self._check_flag(opref, HF_KNOWN_CLASS) {
             return None;
         }
         self.known_class.get(opref.0 as usize).and_then(|v| *v)
     }
 
-    /// Check if an object is unescaped (allocated in this trace and not
-    /// yet passed to external code).
+    /// heapcache.py:493-494 is_unescaped.
+    ///   `return self._check_flag(box, HF_IS_UNESCAPED)`
     pub fn is_unescaped(&self, opref: OpRef) -> bool {
-        vb_contains(&self.is_unescaped, &opref)
+        self._check_flag(opref, HF_IS_UNESCAPED)
     }
 
     /// heapcache.py:79-82 `CacheEntry._seen_alloc(box)`:
@@ -920,7 +943,7 @@ impl HeapCache {
     ///  return self.heapcache._check_flag(ref_box, HF_SEEN_ALLOCATION)
     /// ```
     pub fn saw_allocation(&self, opref: OpRef) -> bool {
-        vb_contains(&self.seen_allocation, &opref)
+        self._check_flag(opref, HF_SEEN_ALLOCATION)
     }
 
     /// Notify the cache about an operation, potentially invalidating entries.
@@ -941,11 +964,12 @@ impl HeapCache {
         if opcode == OpCode::SetfieldGc && args.len() >= 2 {
             let container = args[0];
             let value = args[1];
-            if vb_contains(&self.is_unescaped, &container)
-                && vb_contains(&self.is_unescaped, &value)
-            {
+            // heapcache.py:493 is_unescaped — version-gated.
+            let container_unescaped = self.is_unescaped(container);
+            let value_unescaped = self.is_unescaped(value);
+            if container_unescaped && value_unescaped {
                 self._get_deps(container).push(Some(value));
-            } else if vb_contains(&self.is_unescaped, &container) {
+            } else if container_unescaped {
                 // Container unescaped, value already escaped — no-op
             } else {
                 self.mark_escaped_recursive(value);
@@ -954,11 +978,11 @@ impl HeapCache {
         if opcode == OpCode::SetarrayitemGc && args.len() >= 3 {
             let container = args[0];
             let value = args[2];
-            if vb_contains(&self.is_unescaped, &container)
-                && vb_contains(&self.is_unescaped, &value)
-            {
+            let container_unescaped = self.is_unescaped(container);
+            let value_unescaped = self.is_unescaped(value);
+            if container_unescaped && value_unescaped {
                 self._get_deps(container).push(Some(value));
-            } else if vb_contains(&self.is_unescaped, &container) {
+            } else if container_unescaped {
                 // Container unescaped, value already escaped — no-op
             } else {
                 self.mark_escaped_recursive(value);
@@ -1480,6 +1504,12 @@ impl HeapCache {
             // A null ConstPtr (value 0) is known-null; non-zero is known-nonnull.
             return Some(const_value(opref).unwrap_or(0) != 0);
         }
+        // heapcache.py:478: return self._check_flag(box, HF_KNOWN_NULLITY).
+        // Version-gated so a stale `known_nullity` Vec entry from before
+        // the last reset_keep_likely_virtuals does not leak through.
+        if !self._check_flag(opref, HF_KNOWN_NULLITY) {
+            return None;
+        }
         self.known_nullity
             .get(opref.0 as usize)
             .and_then(|v| if *v == 0 { None } else { Some(*v == 1) })
@@ -1552,9 +1582,20 @@ impl HeapCache {
         self._set_flag(opref, HF_LIKELY_VIRTUAL);
     }
 
-    /// Check if a value is likely virtual.
+    /// heapcache.py:496-500 is_likely_virtual.
+    ///   `return (... self.test_likely_virtual_version(box) and
+    ///            test_flags(box, HF_LIKELY_VIRTUAL))`
+    ///
+    /// Note: gates on `test_likely_virtual_version` (NOT
+    /// `test_head_version`) so a `reset_keep_likely_virtuals` does not
+    /// invalidate this flag — the older box is still trusted as likely
+    /// virtual until the *next* version bump (line 184).
     pub fn is_likely_virtual(&self, opref: OpRef) -> bool {
-        vb_contains(&self.likely_virtual, &opref)
+        if !self.test_likely_virtual_version(opref) {
+            return false;
+        }
+        let f = self.flags_for_ref(opref);
+        (f as u8) & HF_LIKELY_VIRTUAL != 0
     }
 
     // ── Loop-invariant call result caching ──
@@ -1664,6 +1705,16 @@ impl HeapCache {
         self.known_nullity.clear();
         self.likely_virtual.clear();
         self.heapc_deps.clear();
+        // history.py:644-668 FO_REPLACED_WITH_CONST is stored on the
+        // FrontendOp's `position_and_flags` field, so RPython's flag
+        // dies with the FrontendOp at trace teardown.  pyre's
+        // `replaced_with_const` Vec is keyed by OpRef.0 (a position
+        // index) and OpRef numbers are reused across traces, so we
+        // clear it at the same trace boundary that drops the
+        // FrontendOp objects in upstream.  Without this the next
+        // trace can pick up a stale substitution from the previous
+        // trace's `replace_box`.
+        self.replaced_with_const.clear();
     }
 
     /// heapcache.py:176: check and consume need_guard_not_invalidated.
