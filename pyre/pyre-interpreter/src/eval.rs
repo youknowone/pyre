@@ -1424,10 +1424,18 @@ impl OpcodeStepExecutor for PyFrame {
     }
 
     // ── delete_name ──
+    // pypy/interpreter/pyopcode.py:821 DELETE_NAME — delete from w_locals; KeyError → NameError.
     fn delete_name(&mut self, name: &str) -> Result<(), Self::Error> {
-        let ns = self.get_w_globals();
-        unsafe {
-            crate::namespace_delete(&mut *ns, name);
+        let mut ns = self.get_w_locals();
+        if ns.is_null() {
+            ns = self.get_w_globals();
+        }
+        let found = unsafe { crate::namespace_delete(&mut *ns, name) };
+        if !found {
+            return Err(PyError::new(
+                PyErrorKind::NameError,
+                format!("name '{name}' is not defined"),
+            ));
         }
         Ok(())
     }
@@ -1435,17 +1443,24 @@ impl OpcodeStepExecutor for PyFrame {
     // ── delete_global ──
     fn delete_global(&mut self, name: &str) -> Result<(), Self::Error> {
         let ns = self.get_w_globals();
-        unsafe {
-            crate::namespace_delete(&mut *ns, name);
+        let found = unsafe { crate::namespace_delete(&mut *ns, name) };
+        if !found {
+            return Err(PyError::new(
+                PyErrorKind::NameError,
+                format!("name '{name}' is not defined"),
+            ));
         }
         Ok(())
     }
 
     // ── import_star ──
-    // PyPy: IMPORT_STAR — merge module's public names into current namespace.
+    // pypy/interpreter/pyopcode.py:1076 IMPORT_STAR — merge module's public names into
+    // the locals mapping (class body / exec-with-locals), not globals.
     fn import_star(&mut self) -> Result<(), Self::Error> {
         let module = self.pop();
-        crate::importing::import_all_from(module, self.get_w_globals());
+        let w_locals = self.getdictscope();
+        crate::importing::import_all_from(module, w_locals);
+        self.setdictscope(w_locals);
         Ok(())
     }
 
