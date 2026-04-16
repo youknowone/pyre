@@ -357,7 +357,7 @@ pub struct CallAssemblerDescr {
     arg_types: Vec<Type>,
     result_type: Type,
     target_token: u64,
-    effect_info: EffectInfo,
+    extra_info: EffectInfo,
 }
 
 impl CallAssemblerDescr {
@@ -366,7 +366,7 @@ impl CallAssemblerDescr {
             arg_types,
             result_type,
             target_token,
-            effect_info: EffectInfo {
+            extra_info: EffectInfo {
                 extraeffect: majit_ir::ExtraEffect::CanRaise,
                 oopspecindex: OopSpecIndex::None,
                 ..Default::default()
@@ -398,8 +398,8 @@ impl majit_ir::CallDescr for CallAssemblerDescr {
         Some(self.target_token)
     }
 
-    fn effect_info(&self) -> &EffectInfo {
-        &self.effect_info
+    fn get_extra_info(&self) -> &EffectInfo {
+        &self.extra_info
     }
 }
 
@@ -4412,7 +4412,7 @@ fn emit_indirect_call_from_parts(
     // RPython callbuilder.py parity:
     //   emit() [can_collect]: spill + push_gcmap + CALL + pop_gcmap + reload
     //   emit_no_collect(): bare CALL only
-    let can_collect = call_descr.effect_info().check_can_collect();
+    let can_collect = call_descr.get_extra_info().check_can_collect();
     if can_collect {
         spill_ref_roots(
             builder,
@@ -12381,7 +12381,7 @@ mod tests {
     struct TestCallDescr {
         arg_types: Vec<Type>,
         result_type: Type,
-        effect_info: EffectInfo,
+        extra_info: EffectInfo,
     }
 
     #[derive(Debug)]
@@ -12411,8 +12411,8 @@ mod tests {
         fn result_size(&self) -> usize {
             8
         }
-        fn effect_info(&self) -> &EffectInfo {
-            &self.effect_info
+        fn get_extra_info(&self) -> &EffectInfo {
+            &self.extra_info
         }
     }
 
@@ -12420,7 +12420,7 @@ mod tests {
         Arc::new(TestCallDescr {
             arg_types,
             result_type,
-            effect_info: EffectInfo {
+            extra_info: EffectInfo {
                 extraeffect: ExtraEffect::CanRaise,
                 oopspecindex: majit_ir::OopSpecIndex::None,
                 ..Default::default()

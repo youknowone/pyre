@@ -80,26 +80,20 @@ pub struct WriteAnalysis {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CallDescriptor {
     pub target: CallTarget,
-    pub effect_info: EffectInfo,
+    pub extra_info: EffectInfo,
 }
 
 impl CallDescriptor {
-    pub fn known(target: CallTarget, effect_info: EffectInfo) -> Self {
-        Self {
-            target,
-            effect_info,
-        }
+    pub fn known(target: CallTarget, extra_info: EffectInfo) -> Self {
+        Self { target, extra_info }
     }
 
-    pub fn override_effect(target: CallTarget, effect_info: EffectInfo) -> Self {
-        Self {
-            target,
-            effect_info,
-        }
+    pub fn override_effect(target: CallTarget, extra_info: EffectInfo) -> Self {
+        Self { target, extra_info }
     }
 
-    pub fn effect_info(&self) -> EffectInfo {
-        self.effect_info.clone()
+    pub fn get_extra_info(&self) -> EffectInfo {
+        self.extra_info.clone()
     }
 }
 
@@ -1630,13 +1624,13 @@ impl CallControl {
         // RPython call.py:334-335: cpu.calldescrof(FUNC, NON_VOID_ARGS, RESULT, effectinfo)
         CallDescriptor {
             target: target.clone(),
-            effect_info: effectinfo,
+            extra_info: effectinfo,
         }
     }
 
     /// RPython: calldescr_canraise(calldescr) (call.py:357-359).
     pub fn calldescr_canraise(&self, calldescr: &CallDescriptor) -> bool {
-        calldescr.effect_info.check_can_raise(false)
+        calldescr.extra_info.check_can_raise(false)
     }
 }
 
@@ -2564,7 +2558,7 @@ struct CallDescriptorEntry {
 }
 
 impl CallDescriptorEntry {
-    fn effect_info(&self) -> EffectInfo {
+    fn get_extra_info(&self) -> EffectInfo {
         EffectInfo::new(self.extraeffect, self.oopspecindex)
     }
 }
@@ -2802,7 +2796,7 @@ pub fn describe_call(target: &CallTarget) -> Option<CallDescriptor> {
     CALL_DESCRIPTOR_TABLE
         .iter()
         .find(|entry| matches_any(target, entry.targets))
-        .map(|entry| CallDescriptor::known(target.clone(), entry.effect_info()))
+        .map(|entry| CallDescriptor::known(target.clone(), entry.get_extra_info()))
 }
 
 #[cfg(test)]
@@ -2934,8 +2928,8 @@ mod tests {
             None,
             &mut cache,
         );
-        assert_eq!(descriptor.effect_info.extraeffect, ExtraEffect::CannotRaise);
-        assert!(!descriptor.effect_info.can_invalidate);
+        assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CannotRaise);
+        assert!(!descriptor.extra_info.can_invalidate);
     }
 
     #[test]
@@ -2956,7 +2950,7 @@ mod tests {
             None,
             &mut cache,
         );
-        assert_eq!(descriptor.effect_info.extraeffect, ExtraEffect::CanRaise);
+        assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CanRaise);
     }
 
     #[test]
@@ -2979,7 +2973,7 @@ mod tests {
             &mut cache,
         );
         assert_eq!(
-            descriptor.effect_info.extraeffect,
+            descriptor.extra_info.extraeffect,
             ExtraEffect::ElidableCannotRaise
         );
     }
@@ -3004,7 +2998,7 @@ mod tests {
             &mut cache,
         );
         assert_eq!(
-            descriptor.effect_info.extraeffect,
+            descriptor.extra_info.extraeffect,
             ExtraEffect::ElidableCanRaise
         );
     }
@@ -3029,7 +3023,7 @@ mod tests {
             &mut cache,
         );
         assert_eq!(
-            descriptor.effect_info.extraeffect,
+            descriptor.extra_info.extraeffect,
             ExtraEffect::LoopInvariant
         );
     }
@@ -3056,7 +3050,7 @@ mod tests {
             &mut cache,
         );
         assert_eq!(
-            descriptor.effect_info.extraeffect,
+            descriptor.extra_info.extraeffect,
             ExtraEffect::ForcesVirtualOrVirtualizable
         );
     }
@@ -3080,7 +3074,7 @@ mod tests {
             &mut cache,
         );
         assert_eq!(
-            descriptor.effect_info.extraeffect,
+            descriptor.extra_info.extraeffect,
             ExtraEffect::ElidableCannotRaise
         );
     }
@@ -3120,7 +3114,7 @@ mod tests {
             None,
             &mut cache,
         );
-        assert_eq!(descriptor.effect_info.extraeffect, ExtraEffect::CanRaise);
+        assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CanRaise);
     }
 
     #[test]
@@ -3140,9 +3134,9 @@ mod tests {
             None,
             &mut cache,
         );
-        assert_eq!(descriptor.effect_info.extraeffect, ExtraEffect::CanRaise);
+        assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CanRaise);
         // RandomEffects is false, QuasiImmut is false → can_invalidate is false.
-        assert!(!descriptor.effect_info.can_invalidate);
+        assert!(!descriptor.extra_info.can_invalidate);
     }
 
     #[test]
@@ -3186,8 +3180,8 @@ mod tests {
             &mut cache,
         );
         // Should have non-zero bitsets for field reads and writes.
-        assert_ne!(descriptor.effect_info.readonly_descrs_fields, 0);
-        assert_ne!(descriptor.effect_info.write_descrs_fields, 0);
+        assert_ne!(descriptor.extra_info.readonly_descrs_fields, 0);
+        assert_ne!(descriptor.extra_info.write_descrs_fields, 0);
     }
 
     #[test]
@@ -3224,11 +3218,11 @@ mod tests {
             &mut cache,
         );
         assert_eq!(
-            descriptor.effect_info.extraeffect,
+            descriptor.extra_info.extraeffect,
             ExtraEffect::ElidableCannotRaise
         );
         // Writes should be zeroed out for elidable functions.
-        assert_eq!(descriptor.effect_info.write_descrs_fields, 0);
+        assert_eq!(descriptor.extra_info.write_descrs_fields, 0);
     }
 
     #[test]
@@ -3298,9 +3292,9 @@ mod tests {
         );
         // Write is set, but readonly should NOT have the same bit set.
         // RPython: readonly = reads & ~writes
-        assert_ne!(descriptor.effect_info.write_descrs_fields, 0);
-        let overlap = descriptor.effect_info.readonly_descrs_fields
-            & descriptor.effect_info.write_descrs_fields;
+        assert_ne!(descriptor.extra_info.write_descrs_fields, 0);
+        let overlap = descriptor.extra_info.readonly_descrs_fields
+            & descriptor.extra_info.write_descrs_fields;
         assert_eq!(
             overlap, 0,
             "readonly and write should not overlap for same field"

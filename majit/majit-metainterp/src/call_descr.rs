@@ -42,7 +42,7 @@ impl CallDescr for MetaCallDescr {
     fn result_size(&self) -> usize {
         0
     }
-    fn effect_info(&self) -> &EffectInfo {
+    fn get_extra_info(&self) -> &EffectInfo {
         // RPython: effectinfo is per-call-site (call.py:300
         // effectinfo_from_writeanalyze). Pyre MetaCallDescr is a generic
         // placeholder. CannotRaise matches RPython's default for helpers
@@ -79,7 +79,7 @@ impl CallDescr for MetaCallAssemblerDescr {
     fn call_virtualizable_index(&self) -> Option<usize> {
         self.virtualizable_arg_index
     }
-    fn effect_info(&self) -> &EffectInfo {
+    fn get_extra_info(&self) -> &EffectInfo {
         static INFO: EffectInfo = EffectInfo::const_new(ExtraEffect::CanRaise, OopSpecIndex::None);
         &INFO
     }
@@ -126,7 +126,7 @@ pub fn make_call_may_force_descr(arg_types: &[Type], result_type: Type) -> Descr
         fn result_size(&self) -> usize {
             0
         }
-        fn effect_info(&self) -> &EffectInfo {
+        fn get_extra_info(&self) -> &EffectInfo {
             static INFO: EffectInfo =
                 EffectInfo::const_new(ExtraEffect::CanRaise, OopSpecIndex::None);
             &INFO

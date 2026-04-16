@@ -2603,7 +2603,7 @@ impl OptContext {
         let Some(cd) = descr.as_call_descr() else {
             return false;
         };
-        cd.effect_info().check_can_raise(true)
+        cd.get_extra_info().check_can_raise(true)
     }
 
     /// optimizer.py:652-686 emit_guard_operation — decide whether to share

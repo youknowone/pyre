@@ -1274,7 +1274,7 @@ impl Optimization for OptVirtualize {
             | OpCode::CallMayForceN => {
                 if let Some(ref descr) = op.descr {
                     if let Some(cd) = descr.as_call_descr() {
-                        let ei = cd.effect_info();
+                        let ei = cd.get_extra_info();
                         if ei.oopspecindex == OopSpecIndex::JitForceVirtual {
                             if self.optimize_jit_force_virtual(op, ctx) {
                                 return OptimizationResult::Remove;
@@ -1323,7 +1323,7 @@ impl Optimization for OptVirtualize {
             OpCode::CondCallN => {
                 if let Some(ref descr) = op.descr {
                     if let Some(cd) = descr.as_call_descr() {
-                        let ei = cd.effect_info();
+                        let ei = cd.get_extra_info();
                         if ei.oopspecindex == OopSpecIndex::JitForceVirtualizable
                             && op.num_args() >= 3
                         {
@@ -1365,7 +1365,7 @@ impl Optimization for OptVirtualize {
             OpCode::CallN | OpCode::CallR | OpCode::CallI => {
                 if let Some(ref descr) = op.descr {
                     if let Some(cd) = descr.as_call_descr() {
-                        let ei = cd.effect_info();
+                        let ei = cd.get_extra_info();
                         // virtualize.py:228 do_RAW_MALLOC_VARSIZE_CHAR
                         if ei.oopspecindex == OopSpecIndex::RawMallocVarsizeChar {
                             // virtualize.py:242-247 do_RAW_MALLOC_VARSIZE_CHAR:

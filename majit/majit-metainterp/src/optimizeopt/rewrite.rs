@@ -1972,7 +1972,7 @@ impl OptRewrite {
             Some(cd) => cd,
             None => return false,
         };
-        let ei = cd.effect_info();
+        let ei = cd.get_extra_info();
         // rewrite.py:617: extrainfo.single_write_descr_array is not None
         // effectinfo.py:201-206: set when exactly one write array descriptor.
         let arraydescr = match &ei.single_write_descr_array {
@@ -2759,7 +2759,7 @@ impl Optimization for OptRewrite {
             OpCode::CallPureI | OpCode::CallPureR | OpCode::CallPureF | OpCode::CallPureN => {
                 if let Some(ref descr) = op.descr {
                     if let Some(cd) = descr.as_call_descr() {
-                        let ei = cd.effect_info();
+                        let ei = cd.get_extra_info();
                         match ei.oopspecindex {
                             // rewrite.py:688: OS_INT_UDIV
                             majit_ir::OopSpecIndex::IntUdiv => {
@@ -2900,7 +2900,7 @@ impl Optimization for OptRewrite {
             OpCode::CallN | OpCode::CallI | OpCode::CallR => {
                 if let Some(ref descr) = op.descr {
                     if let Some(cd) = descr.as_call_descr() {
-                        let ei = cd.effect_info();
+                        let ei = cd.get_extra_info();
                         match ei.oopspecindex {
                             // rewrite.py:580-590: OS_ARRAYCOPY / OS_ARRAYMOVE
                             majit_ir::OopSpecIndex::Arraycopy => {

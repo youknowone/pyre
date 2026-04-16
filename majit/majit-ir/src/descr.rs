@@ -1084,8 +1084,9 @@ pub trait CallDescr: Descr {
         None
     }
 
-    /// Side effect information.
-    fn effect_info(&self) -> &EffectInfo;
+    /// descr.py:511 `get_extra_info()` — returns the EffectInfo describing
+    /// side effects, oopspec classification, and descriptor read/write sets.
+    fn get_extra_info(&self) -> &EffectInfo;
 
     /// Argument class string (RPython encoding: 'i'=int, 'r'=ref, 'f'=float).
     /// descr.py: arg_classes
@@ -1940,7 +1941,7 @@ impl CallDescr for SimpleCallDescr {
     fn result_size(&self) -> usize {
         self.result_size
     }
-    fn effect_info(&self) -> &EffectInfo {
+    fn get_extra_info(&self) -> &EffectInfo {
         &self.effect
     }
 }
@@ -2090,7 +2091,7 @@ mod tests {
         fn is_result_signed(&self) -> bool {
             self.result_signed
         }
-        fn effect_info(&self) -> &EffectInfo {
+        fn get_extra_info(&self) -> &EffectInfo {
             &self.effect
         }
     }

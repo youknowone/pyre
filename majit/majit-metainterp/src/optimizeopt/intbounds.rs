@@ -1526,7 +1526,7 @@ impl Optimization for OptIntBounds {
             OpCode::CallPureI | OpCode::CallI => {
                 if let Some(ref d) = op.descr {
                     if let Some(cd) = d.as_call_descr() {
-                        let ei = cd.effect_info();
+                        let ei = cd.get_extra_info();
                         match ei.oopspecindex {
                             majit_ir::OopSpecIndex::IntPyDiv => {
                                 if op.num_args() >= 3 {

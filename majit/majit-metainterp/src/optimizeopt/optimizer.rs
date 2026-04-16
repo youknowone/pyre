@@ -1432,7 +1432,7 @@ impl Optimizer {
         op.descr
             .as_ref()
             .and_then(|d| d.as_call_descr())
-            .map(|cd| cd.effect_info().check_can_raise(false))
+            .map(|cd| cd.get_extra_info().check_can_raise(false))
             .unwrap_or(true)
     }
 
@@ -3605,7 +3605,7 @@ mod tests {
             8
         }
 
-        fn effect_info(&self) -> &EffectInfo {
+        fn get_extra_info(&self) -> &EffectInfo {
             &self.effect
         }
     }

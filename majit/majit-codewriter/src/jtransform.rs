@@ -652,13 +652,13 @@ impl<'a> Transformer<'a> {
         let (oopspecindex, extraeffect_override) =
             if let Some((descriptor, _)) = classify_call(target, &self.config.call_effects) {
                 (
-                    descriptor.effect_info.oopspecindex,
-                    Some(descriptor.effect_info.extraeffect),
+                    descriptor.extra_info.oopspecindex,
+                    Some(descriptor.extra_info.extraeffect),
                 )
             } else if let Some(descriptor) = crate::call::describe_call(target) {
                 (
-                    descriptor.effect_info.oopspecindex,
-                    Some(descriptor.effect_info.extraeffect),
+                    descriptor.extra_info.oopspecindex,
+                    Some(descriptor.extra_info.extraeffect),
                 )
             } else if let Some(spec) = user_oopspec.as_deref() {
                 // rlib/jit.py:250 — map user oopspec string to OopSpecIndex.
@@ -690,7 +690,7 @@ impl<'a> Transformer<'a> {
             )
         };
 
-        let effect_str = format!("{:?}", descriptor.effect_info.extraeffect);
+        let effect_str = format!("{:?}", descriptor.extra_info.extraeffect);
         self.notes.push(GraphTransformNote {
             function: graph_name.to_string(),
             detail: format!("builtin {target} → {effect_str}"),
@@ -708,7 +708,7 @@ impl<'a> Transformer<'a> {
                 let calldescr: majit_ir::descr::DescrRef = majit_ir::descr::make_call_descr(
                     non_void_args_for_collection,
                     result_ir_type,
-                    descriptor.effect_info.clone(),
+                    descriptor.extra_info.clone(),
                 );
 
                 use std::hash::{Hash, Hasher};
@@ -1040,7 +1040,7 @@ impl<'a> Transformer<'a> {
                 let calldescr = majit_ir::descr::make_call_descr(
                     non_void_args_for_collection,
                     result_ir_type,
-                    descriptor.effect_info.clone(),
+                    descriptor.extra_info.clone(),
                 );
                 use std::hash::{Hash, Hasher};
                 let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -1107,7 +1107,7 @@ impl<'a> Transformer<'a> {
         // jtransform.py:1677: assert not forces_virtual_or_virtualizable
         assert!(
             !descriptor
-                .effect_info
+                .extra_info
                 .check_forces_virtual_or_virtualizable(),
             "conditional_call target must not force virtualizable"
         );
@@ -1151,7 +1151,7 @@ impl<'a> Transformer<'a> {
             result: op.result,
             kind: call_kind,
         }];
-        if descriptor.effect_info.check_can_raise(false) {
+        if descriptor.extra_info.check_can_raise(false) {
             ops.push(SpaceOperation {
                 result: None,
                 kind: OpKind::Live,
@@ -1204,7 +1204,7 @@ impl<'a> Transformer<'a> {
         };
         // jtransform.py:301: assert calldescr.get_extra_info().check_is_elidable()
         assert!(
-            descriptor.effect_info.check_is_elidable(),
+            descriptor.extra_info.check_is_elidable(),
             "record_known_result: function must be elidable"
         );
         // jtransform.py:302-307: record_known_result_{i|r}
@@ -1232,7 +1232,7 @@ impl<'a> Transformer<'a> {
                 result_kind,
             },
         }];
-        if descriptor.effect_info.check_can_raise(false) {
+        if descriptor.extra_info.check_can_raise(false) {
             ops.push(SpaceOperation {
                 result: None,
                 kind: OpKind::Live,
@@ -1262,7 +1262,7 @@ impl<'a> Transformer<'a> {
         let result_kind = value_type_to_kind(result_ty);
         // RPython jtransform.py:469-470: residual_call followed by -live-
         // if the call can raise or may call jitcodes.
-        let can_raise = descriptor.effect_info.check_can_raise(false);
+        let can_raise = descriptor.extra_info.check_can_raise(false);
         let mut ops = vec![SpaceOperation {
             result: op.result,
             kind: OpKind::CallResidual {
@@ -1918,11 +1918,11 @@ fn classify_call(
         .find(|override_| call_target_matches_loose(&override_.descriptor.target, target))
         .map(|override_| override_.descriptor.clone())
     {
-        let effect = classify_effect_info(&descriptor.effect_info());
+        let effect = classify_effect_info(&descriptor.get_extra_info());
         return Some((descriptor, effect));
     }
     let descriptor = crate::call::describe_call(target)?;
-    let effect = classify_effect_info(&descriptor.effect_info());
+    let effect = classify_effect_info(&descriptor.get_extra_info());
     Some((descriptor, effect))
 }
 
@@ -2061,7 +2061,7 @@ mod tests {
         {
             assert!(
                 descriptor
-                    .effect_info
+                    .extra_info
                     .check_forces_virtual_or_virtualizable()
             );
         } else {

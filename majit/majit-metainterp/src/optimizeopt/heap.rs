@@ -1420,7 +1420,7 @@ impl OptHeap {
         op.descr
             .as_ref()
             .and_then(|d| d.as_call_descr())
-            .map(|cd| cd.effect_info().oopspecindex)
+            .map(|cd| cd.get_extra_info().oopspecindex)
             .unwrap_or(OopSpecIndex::None)
     }
 
@@ -1438,7 +1438,7 @@ impl OptHeap {
             .as_ref()
             .and_then(|d| d.as_call_descr())
             .map(|cd| {
-                let w = cd.effect_info().write_descrs_arrays;
+                let w = cd.get_extra_info().write_descrs_arrays;
                 w != 0 && w.is_power_of_two()
             })
             .unwrap_or(false);
@@ -1472,7 +1472,7 @@ impl OptHeap {
         op.descr
             .as_ref()
             .and_then(|d| d.as_call_descr())
-            .map(|cd| cd.effect_info().has_random_effects())
+            .map(|cd| cd.get_extra_info().has_random_effects())
             .unwrap_or(true) // conservative: assume random effects if unknown
     }
 
@@ -1481,7 +1481,7 @@ impl OptHeap {
         op.descr
             .as_ref()
             .and_then(|d| d.as_call_descr())
-            .map(|cd| cd.effect_info().check_can_invalidate())
+            .map(|cd| cd.get_extra_info().check_can_invalidate())
             .unwrap_or(true)
     }
 
@@ -1490,7 +1490,7 @@ impl OptHeap {
         op.descr
             .as_ref()
             .and_then(|d| d.as_call_descr())
-            .map(|cd| cd.effect_info().check_forces_virtual_or_virtualizable())
+            .map(|cd| cd.get_extra_info().check_forces_virtual_or_virtualizable())
             .unwrap_or(false)
     }
 
@@ -1508,7 +1508,7 @@ impl OptHeap {
         self.mark_escaped_varargs(op, ctx);
 
         let ei = match op.descr.as_ref().and_then(|d| d.as_call_descr()) {
-            Some(cd) => cd.effect_info().clone(),
+            Some(cd) => cd.get_extra_info().clone(),
             None => {
                 self.force_all_lazy_sets(ctx.current_pass_idx, ctx);
                 self.clean_caches(ctx);
@@ -4945,7 +4945,7 @@ mod tests {
         fn result_size(&self) -> usize {
             0
         }
-        fn effect_info(&self) -> &EffectInfo {
+        fn get_extra_info(&self) -> &EffectInfo {
             &self.effect
         }
     }

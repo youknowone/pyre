@@ -1063,7 +1063,7 @@ impl majit_ir::CallDescr for TestCallDescr {
     fn result_size(&self) -> usize {
         8
     }
-    fn effect_info(&self) -> &majit_ir::EffectInfo {
+    fn get_extra_info(&self) -> &majit_ir::EffectInfo {
         &self.effect
     }
 }

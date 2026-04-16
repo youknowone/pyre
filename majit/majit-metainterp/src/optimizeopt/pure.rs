@@ -519,7 +519,7 @@ impl OptPure {
         op.descr
             .as_ref()
             .and_then(|d| d.as_call_descr())
-            .map(|cd| cd.effect_info().check_can_raise(true))
+            .map(|cd| cd.get_extra_info().check_can_raise(true))
             .unwrap_or(true)
     }
 

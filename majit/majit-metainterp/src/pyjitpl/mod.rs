@@ -7406,7 +7406,7 @@ mod tests {
             8
         }
 
-        fn effect_info(&self) -> &EffectInfo {
+        fn get_extra_info(&self) -> &EffectInfo {
             static EFFECT_INFO: EffectInfo =
                 EffectInfo::const_new(ExtraEffect::CanRaise, majit_ir::OopSpecIndex::None);
             &EFFECT_INFO
