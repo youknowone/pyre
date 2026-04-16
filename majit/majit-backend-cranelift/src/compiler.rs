@@ -12065,9 +12065,15 @@ fn emit_inline_arena_take(
     builder.seal_block(ultra_fast_block);
 
     let zero = builder.ins().iconst(ptr_type, 0);
-    builder
-        .ins()
-        .store(flags, zero, frame_ptr, arena.frame_next_instr_offset as i32);
+    // last_instr initial value is -1 so next_instr() = last_instr + 1 = 0
+    // dispatches the first opcode.
+    let neg_one = builder.ins().iconst(ptr_type, -1);
+    builder.ins().store(
+        flags,
+        neg_one,
+        frame_ptr,
+        arena.frame_next_instr_offset as i32,
+    );
     builder.ins().store(
         flags,
         zero,

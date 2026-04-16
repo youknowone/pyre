@@ -1239,6 +1239,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
             Ok(StepResult::Yield(result)) => return LoopResult::Done(Ok(result)),
             Err(err) => {
                 if pyre_interpreter::eval::handle_exception(frame, &err, &mut next_instr) {
+                    frame.set_last_instr_from_next_instr(next_instr);
                     continue;
                 }
                 return LoopResult::Done(Err(err));
