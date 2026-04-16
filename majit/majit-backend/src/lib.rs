@@ -1830,6 +1830,63 @@ pub enum BackendError {
     Unsupported(String),
 }
 
+/// Validate that the closing JUMP's backedge arguments type-match the
+/// loop header's (preamble) Label inputarg types.
+///
+/// RPython parity: `unroll.py:204-205 force_box_for_end_of_preamble`
+/// materializes Float/Int values into proper boxes before the JUMP, so
+/// the preamble's Ref-typed inputargs always receive GC pointers at the
+/// backedge. majit's optimizer doesn't yet port `force_box_for_end_of_preamble`
+/// (unroll.rs:1132-1140) — the body JUMP can pass Float/Int OpRefs at
+/// Ref-typed positions (`SameAsF/SameAsI` re-types Ref inputargs).
+///
+/// IEEE-754 double bits are never valid pointers, so Float at Ref means
+/// the compiled code would dereference a float-as-pointer and segfault
+/// (or silently miscompile — e.g. nbody NaN when the optimizer hoists a
+/// float dt into a Ref-typed position).
+///
+/// Returns `Err(Unsupported)` when the trace has a Float at a Ref-typed
+/// inputarg position. Backends should call this before emitting machine
+/// code; on error, the metainterp falls back to interpretation.
+pub fn validate_jump_types_at_preamble(
+    inputargs: &[InputArg],
+    ops: &[Op],
+) -> Result<(), BackendError> {
+    use std::collections::HashMap;
+    let mut type_map: HashMap<u32, Type> = HashMap::new();
+    for op in ops.iter() {
+        if op.result_type() != Type::Void && !op.pos.is_none() {
+            type_map.insert(op.pos.0, op.result_type());
+        }
+    }
+    let Some(jump) = ops.iter().rfind(|op| op.opcode == majit_ir::OpCode::Jump) else {
+        return Ok(());
+    };
+    let num_inputs = inputargs.len();
+    for (i, &arg) in jump.args.iter().enumerate() {
+        if i >= num_inputs {
+            break;
+        }
+        if inputargs[i].tp != Type::Ref {
+            continue;
+        }
+        // Direct inputarg reference (arg index < num_inputs) is always safe:
+        // the value carries its declared type from the Label.
+        if (arg.0 as usize) < num_inputs {
+            continue;
+        }
+        if let Some(&actual_tp) = type_map.get(&arg.0) {
+            if actual_tp == Type::Float {
+                return Err(BackendError::Unsupported(
+                    "jump_to_preamble: backedge passes Float at Ref-typed inputarg position"
+                        .to_string(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 impl std::fmt::Display for BackendError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

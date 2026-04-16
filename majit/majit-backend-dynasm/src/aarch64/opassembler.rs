@@ -195,6 +195,10 @@ impl AssemblerARM64 {
     /// Emit a sized store using STUR (unscaled signed offset, ±256 range).
     fn emit_stur_sized(&mut self, base: &RegLoc, ofs: i32, val: &RegLoc, size: usize) {
         debug_assert!(ofs >= -256 && ofs < 256);
+        if val.is_xmm {
+            dynasm!(self.mc ; .arch aarch64 ; stur D(val.value), [X(base.value), ofs]);
+            return;
+        }
         match size {
             8 => dynasm!(self.mc ; .arch aarch64 ; stur X(val.value), [X(base.value), ofs]),
             4 => dynasm!(self.mc ; .arch aarch64 ; stur W(val.value), [X(base.value), ofs]),
