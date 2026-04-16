@@ -134,6 +134,31 @@ impl LiveVars {
                             live[word] &= !(1u64 << (i % 64));
                         }
                     }
+                    // StoreFastStoreFast: KILL both target locals.
+                    Instruction::StoreFastStoreFast { var_nums } => {
+                        let pair = var_nums.get(op_arg);
+                        for i in [
+                            u32::from(pair.idx_1()) as usize,
+                            u32::from(pair.idx_2()) as usize,
+                        ] {
+                            let word = i / 64;
+                            if word < words_per_pc {
+                                live[word] &= !(1u64 << (i % 64));
+                            }
+                        }
+                    }
+                    // StoreFastLoadFast: KILL store target; GEN for idx_2
+                    // left disabled — see LoadFastBorrowLoadFastBorrow note
+                    // above (blackhole resume reads via move_r, not frame
+                    // vable, so extra GEN values go stale).
+                    Instruction::StoreFastLoadFast { var_nums } => {
+                        let pair = var_nums.get(op_arg);
+                        let store_i = u32::from(pair.idx_1()) as usize;
+                        let word = store_i / 64;
+                        if word < words_per_pc {
+                            live[word] &= !(1u64 << (store_i % 64));
+                        }
+                    }
                     _ => {}
                 }
                 let base = pc * words_per_pc;
@@ -246,20 +271,37 @@ fn stack_effects(
         | Instruction::ExtendedArg => (d, d),
         // Push one
         Instruction::LoadConst { .. }
+        | Instruction::LoadSmallInt { .. }
         | Instruction::LoadFast { .. }
         | Instruction::LoadFastBorrow { .. }
         | Instruction::LoadFastCheck { .. }
         | Instruction::LoadFastAndClear { .. }
         | Instruction::LoadName { .. }
-        | Instruction::LoadGlobal { .. }
         | Instruction::LoadDeref { .. }
         | Instruction::LoadLocals
         | Instruction::LoadBuildClass
         | Instruction::PushNull
         | Instruction::Copy { .. }
         | Instruction::PushExcInfo => (d + 1, d + 1),
-        // Push two (super-instruction: load two locals)
-        Instruction::LoadFastBorrowLoadFastBorrow { .. } => (d + 2, d + 2),
+        // LOAD_GLOBAL pushes 1 or 2 values depending on the low bit of namei.
+        // When namei & 1 == 1, a NULL sentinel is pushed before the result (+2).
+        // When namei & 1 == 0, only the result is pushed (+1).
+        Instruction::LoadGlobal { namei } => {
+            let raw = namei.get(op_arg) as usize;
+            if raw & 1 != 0 {
+                (d + 2, d + 2)
+            } else {
+                (d + 1, d + 1)
+            }
+        }
+        // Push two (super-instructions: load two locals)
+        Instruction::LoadFastBorrowLoadFastBorrow { .. } | Instruction::LoadFastLoadFast { .. } => {
+            (d + 2, d + 2)
+        }
+        // Store then load (super-instruction): pop one, push one (net 0).
+        Instruction::StoreFastLoadFast { .. } => (d, d),
+        // Store two locals (super-instruction): pop 2 (net -2).
+        Instruction::StoreFastStoreFast { .. } => (d - 2, d - 2),
         // Pop one
         Instruction::PopTop
         | Instruction::StoreFast { .. }
@@ -397,6 +439,7 @@ fn is_unconditional_jump(instr: &pyre_interpreter::bytecode::Instruction) -> boo
             | Instruction::JumpBackwardNoInterrupt { .. }
             | Instruction::ReturnValue
             | Instruction::Reraise { .. }
+            | Instruction::RaiseVarargs { .. }
     )
 }
 
