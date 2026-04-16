@@ -320,6 +320,9 @@ impl ExecutionContext {
         if !self.space.is_null() && self.is_tracing > 0 {
             self._revdb_enter(frame);
         }
+        unsafe {
+            (*frame).f_backref = self.topframeref;
+        }
         self.topframeref = frame;
     }
 

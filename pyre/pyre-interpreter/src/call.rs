@@ -324,8 +324,7 @@ fn call_user_function_with_eval(
             closure,
         );
         gen_frame.fix_array_ptrs();
-        let frame_ptr = Box::into_raw(Box::new(gen_frame)) as *mut u8;
-        return Ok(pyre_object::generatorobject::w_generator_new(frame_ptr));
+        return gen_frame.run();
     }
 
     let mut func_frame = PyFrame::new_for_call_with_closure(
@@ -372,8 +371,7 @@ pub fn call_user_function_resolved(
             closure,
         );
         gen_frame.fix_array_ptrs();
-        let frame_ptr = Box::into_raw(Box::new(gen_frame)) as *mut u8;
-        return Ok(pyre_object::generatorobject::w_generator_new(frame_ptr));
+        return gen_frame.run();
     }
 
     let plain_mode = FORCE_PLAIN_EVAL.with(|c| c.get() > 0);
@@ -1250,8 +1248,13 @@ fn call_user_function_with_args(func: PyObjectRef, args: &[PyObjectRef]) -> PyOb
         let mut gen_frame =
             PyFrame::new_for_call_with_closure(w_code, &final_args, globals, exec_ctx, closure);
         gen_frame.fix_array_ptrs();
-        let frame_ptr = Box::into_raw(Box::new(gen_frame)) as *mut u8;
-        return pyre_object::generatorobject::w_generator_new(frame_ptr);
+        return match gen_frame.run() {
+            Ok(v) => v,
+            Err(e) => {
+                set_call_error(e);
+                PY_NULL
+            }
+        };
     }
 
     let mut frame =

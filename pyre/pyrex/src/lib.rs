@@ -175,7 +175,7 @@ fn run_source(source: &str, mode: Mode) {
     // sys.modules['__main__'] before executing user code so that
     // enum.global_enum and similar introspection works.
     let main_module =
-        pyre_object::moduleobject::w_module_new("__main__", frame.namespace as *mut u8);
+        pyre_object::moduleobject::w_module_new("__main__", frame.w_globals as *mut u8);
     importing::set_sys_module("__main__", main_module);
 
     match eval_with_jit(&mut frame) {

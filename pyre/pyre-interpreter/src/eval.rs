@@ -184,7 +184,6 @@ pub fn eval_frame_plain(frame: &mut PyFrame) -> PyResult {
     let execution_context =
         unsafe { &mut *(frame.execution_context as *mut crate::PyExecutionContext) };
     crate::call::set_last_exec_ctx(frame.execution_context);
-    frame.f_backref = execution_context.topframeref;
     execution_context.enter(frame as *mut PyFrame);
     let mut got_exception = true;
     let mut w_exitvalue = pyre_object::w_none();
