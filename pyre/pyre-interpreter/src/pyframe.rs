@@ -718,6 +718,14 @@ impl PyFrame {
         if stores_global {
             frame.getorcreate_debug_data(-1).w_globals = w_globals;
         }
+        // Module-level semantics (pypy/interpreter/module.py): locals == globals.
+        // PyPy doesn't set NEWLOCALS on module code, so initialize_frame_scopes
+        // does `w_locals = w_globals` for !OPTIMIZED && !NEWLOCALS. rustpython's
+        // codegen, however, sets NEWLOCALS on module code too — so the
+        // flag-based branch would hand us a fresh empty dict. new_with_namespace
+        // is only used for the module-level entry frame, so force the PyPy
+        // semantics here directly.
+        frame.getorcreate_debug_data(-1).w_locals = w_globals;
         frame
     }
 
