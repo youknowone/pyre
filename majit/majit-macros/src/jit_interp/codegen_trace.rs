@@ -67,7 +67,14 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
                 use majit_metainterp::TraceAction;
 
                 let __op = program.get_op(pc);
-                let Some(__jitcode) = #jitcode_fn_name(program, pc, __op) else {
+                // The lowered JitCode must see the same local state as the
+                // interpreter's `match opcode { ... }` body: the opcode has
+                // already been fetched and `pc` has already advanced past it.
+                // RPython tracing observes the post-fetch bytecode index when
+                // recording immediate operands, so pass `pc + 1` here instead
+                // of the opcode's address.
+                let __jit_pc = pc + 1;
+                let Some(__jitcode) = #jitcode_fn_name(program, __jit_pc, __op) else {
                     if majit_metainterp::majit_log_enabled() {
                         eprintln!(
                             "[jit] no jitcode for pc={} op={}",
@@ -117,7 +124,14 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
                 use majit_metainterp::{JitCodeSym, TraceAction};
 
                 let __op = program.get_op(pc);
-                let Some(__jitcode) = #jitcode_fn_name(program, pc, __op) else {
+                // The lowered JitCode must see the same local state as the
+                // interpreter's `match opcode { ... }` body: the opcode has
+                // already been fetched and `pc` has already advanced past it.
+                // RPython tracing observes the post-fetch bytecode index when
+                // recording immediate operands, so pass `pc + 1` here instead
+                // of the opcode's address.
+                let __jit_pc = pc + 1;
+                let Some(__jitcode) = #jitcode_fn_name(program, __jit_pc, __op) else {
                     if majit_metainterp::majit_log_enabled() {
                         eprintln!(
                             "[jit] no jitcode for pc={} op={} selected={}",

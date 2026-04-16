@@ -1128,13 +1128,19 @@ impl UnrollOptimizer {
             }
             if let Some(mut end_jump) = body_terminal_op {
                 end_jump.descr = Some(preamble_target.as_jump_target_descr());
-                // Truncate Jump args to match preamble start Label arity.
-                // Body Jump may have N+M args (short preamble), but preamble
-                // Label only has N args. RPython backend ignores extras;
-                // Cranelift requires exact match.
-                if end_jump.args.len() > preamble_arity {
-                    end_jump.args.truncate(preamble_arity);
-                }
+                // compile.py:320/327 parity: start_label uses
+                // start_state.renamed_inputargs, while unroll.py:238-242
+                // retargets the body's JUMP to the preamble token without
+                // rebuilding it. In majit, the backend needs exact arity for
+                // that start-label contract, so reshape the JUMP to the same
+                // preamble args: drop extra short-preamble slots and restore
+                // any invariant slots the body no longer carries explicitly.
+                let mut reshaped_jump_args = end_jump.args.to_vec();
+                reshape_jump_args_for_preamble(
+                    &mut reshaped_jump_args,
+                    &exported_renamed_inputargs[..preamble_arity],
+                );
+                end_jump.args = reshaped_jump_args.into();
                 body_ops = replace_terminal_jump(&body_ops, end_jump);
             } else {
                 body_ops = Self::jump_to_preamble(&body_ops, &preamble_target);
@@ -4250,11 +4256,6 @@ fn assemble_peeled_trace_with_jump_args(
                 );
             }
             let mut jump_args = mapped_base_args;
-            if !jump_to_self {
-                // Non-self jump: truncate to target label arity, not source label.
-                // RPython: make_inputargs_and_virtuals produces exactly target arity.
-                jump_args.truncate(target_label_args.len());
-            }
             if jump_to_self {
                 // RPython compile.py:334: assert jump.numargs() == label.numargs().
                 // Truncate excess JUMP args (from forced virtuals in
@@ -4406,6 +4407,15 @@ fn replace_terminal_jump(body_ops: &[Op], jump_op: Op) -> Vec<Op> {
     result.extend_from_slice(&body_ops[..split_idx]);
     result.push(jump_op);
     result
+}
+
+fn reshape_jump_args_for_preamble(jump_args: &mut Vec<OpRef>, preamble_args: &[OpRef]) {
+    if jump_args.len() > preamble_args.len() {
+        jump_args.truncate(preamble_args.len());
+    }
+    while jump_args.len() < preamble_args.len() {
+        jump_args.push(preamble_args[jump_args.len()]);
+    }
 }
 
 pub fn pick_virtual_state(
@@ -4664,6 +4674,20 @@ mod tests {
             result[1].descr.as_ref().map(|descr| descr.repr()),
             Some("LoopTargetDescr(start:7)".to_string())
         );
+    }
+
+    #[test]
+    fn test_reshape_jump_args_for_preamble_pads_missing_invariants() {
+        let mut jump_args = vec![OpRef(0)];
+        reshape_jump_args_for_preamble(&mut jump_args, &[OpRef(0), OpRef(1)]);
+        assert_eq!(jump_args.as_slice(), &[OpRef(0), OpRef(1)]);
+    }
+
+    #[test]
+    fn test_reshape_jump_args_for_preamble_truncates_extra_slots() {
+        let mut jump_args = vec![OpRef(0), OpRef(1), OpRef(2)];
+        reshape_jump_args_for_preamble(&mut jump_args, &[OpRef(10), OpRef(11)]);
+        assert_eq!(jump_args.as_slice(), &[OpRef(0), OpRef(1)]);
     }
 
     #[test]
@@ -5850,6 +5874,43 @@ mod tests {
             combined[2].args.as_slice(),
             &[OpRef(100), OpRef(101), OpRef(102), OpRef(3), OpRef(4)]
         );
+    }
+
+    #[test]
+    fn test_assemble_peeled_trace_preserves_preamble_jump_arity_when_body_label_is_shorter() {
+        let start_descr = TargetToken::new_preamble(0).as_jump_target_descr();
+        let loop_descr = TargetToken::new_loop(1).as_jump_target_descr();
+        let p2_ops = vec![
+            {
+                let mut op = Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]);
+                op.pos = OpRef(2);
+                op
+            },
+            {
+                let mut jump = Op::new(OpCode::Jump, &[OpRef(0), OpRef(1)]);
+                jump.descr = Some(start_descr.clone());
+                jump
+            },
+        ];
+
+        let combined = assemble_peeled_trace(
+            &[],
+            &p2_ops,
+            &[OpRef(0)],
+            &[OpRef(100), OpRef(101)],
+            &[],
+            2,
+            false,
+            &[],
+            &[],
+            &std::collections::HashMap::new(),
+            Some(start_descr),
+            Some(loop_descr),
+        );
+
+        let jump = combined.last().expect("assembled jump");
+        assert_eq!(jump.opcode, OpCode::Jump);
+        assert_eq!(jump.args.as_slice(), &[OpRef(100), OpRef(101)]);
     }
 
     #[test]
