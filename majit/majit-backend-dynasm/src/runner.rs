@@ -25,12 +25,35 @@ use crate::jitframe::JitFrame;
 #[cfg(target_arch = "x86_64")]
 use crate::x86::assembler::{Assembler386 as Asm, CompiledCode};
 
+/// Per-target metadata for a CALL_ASSEMBLER callee token.
+///
+/// RPython stores `descr._ll_function_addr` on the target token alongside
+/// `compiled_loop_token._ll_initial_locs`, `frame_info`, and
+/// `outermost_jitdriver_sd.index_of_virtualizable`. Dynasm previously
+/// only kept the code address; the other fields are required to wire
+/// `handle_call_assembler` (rewrite.py:665-695) on the dynasm path.
+///
+/// `frame_info` is a leaked `Box<[isize; 2]>` with a stable address that
+/// survives across registry updates, matching RPython's in-place frame
+/// info allocation (rewrite.py:669).
+pub(crate) struct DynasmLoopTarget {
+    pub code_addr: usize,
+    pub num_inputs: usize,
+    pub num_scalar_inputargs: usize,
+    pub _ll_initial_locs: Vec<i32>,
+    pub index_of_virtualizable: i32,
+    pub frame_info: *mut [isize; 2],
+}
+
+unsafe impl Send for DynasmLoopTarget {}
+unsafe impl Sync for DynasmLoopTarget {}
+
 /// Global CALL_ASSEMBLER target registry.
 ///
 /// RPython stores `descr._ll_function_addr` on the target token. Dynasm
 /// resolves the target by token number at compile time, so keep a process-wide
-/// token_number -> code address map of compiled loop entries.
-static CALL_ASSEMBLER_TARGETS: LazyLock<Mutex<HashMap<u64, usize>>> =
+/// token_number -> DynasmLoopTarget map of compiled loop entries.
+static CALL_ASSEMBLER_TARGETS: LazyLock<Mutex<HashMap<u64, DynasmLoopTarget>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 thread_local! {
@@ -445,32 +468,54 @@ impl DynasmBackend {
             .lock()
             .expect("CALL_ASSEMBLER_TARGETS poisoned")
             .iter()
-            .filter(|(_k, v)| **v != 0) // exclude pending (code_addr == 0)
-            .map(|(&k, &v)| (k, v))
+            .filter(|(_k, t)| t.code_addr != 0) // exclude pending
+            .map(|(&k, t)| (k, t.code_addr))
             .collect()
     }
 
     fn register_call_assembler_target(token_number: u64, code_addr: usize) {
-        CALL_ASSEMBLER_TARGETS
+        let mut map = CALL_ASSEMBLER_TARGETS
             .lock()
-            .expect("CALL_ASSEMBLER_TARGETS poisoned")
-            .insert(token_number, code_addr);
+            .expect("CALL_ASSEMBLER_TARGETS poisoned");
+        let entry = map.entry(token_number).or_insert_with(|| DynasmLoopTarget {
+            code_addr: 0,
+            num_inputs: 0,
+            num_scalar_inputargs: 0,
+            _ll_initial_locs: Vec::new(),
+            index_of_virtualizable: -1,
+            frame_info: Box::into_raw(Box::new([0isize, 0isize])),
+        });
+        entry.code_addr = code_addr;
     }
 
     fn redirect_call_assembler_target(old_number: u64, new_addr: usize) {
-        CALL_ASSEMBLER_TARGETS
+        let mut map = CALL_ASSEMBLER_TARGETS
             .lock()
-            .expect("CALL_ASSEMBLER_TARGETS poisoned")
-            .insert(old_number, new_addr);
+            .expect("CALL_ASSEMBLER_TARGETS poisoned");
+        let entry = map.entry(old_number).or_insert_with(|| DynasmLoopTarget {
+            code_addr: 0,
+            num_inputs: 0,
+            num_scalar_inputargs: 0,
+            _ll_initial_locs: Vec::new(),
+            index_of_virtualizable: -1,
+            frame_info: Box::into_raw(Box::new([0isize, 0isize])),
+        });
+        entry.code_addr = new_addr;
     }
 
     /// Static entry point for lib.rs register_pending_call_assembler_target.
     pub fn register_pending_call_assembler_target_static(token_number: u64) {
-        CALL_ASSEMBLER_TARGETS
+        let mut map = CALL_ASSEMBLER_TARGETS
             .lock()
-            .expect("CALL_ASSEMBLER_TARGETS poisoned")
-            .entry(token_number)
-            .or_insert(0);
+            .expect("CALL_ASSEMBLER_TARGETS poisoned");
+        map.entry(token_number).or_insert_with(|| DynasmLoopTarget {
+            code_addr: 0,
+            num_inputs: 0,
+            num_scalar_inputargs: 0,
+            _ll_initial_locs: Vec::new(),
+            index_of_virtualizable: -1,
+            frame_info: Box::into_raw(Box::new([0isize, 0isize])),
+        });
     }
 }
 
@@ -975,20 +1020,33 @@ impl Backend for DynasmBackend {
         &mut self,
         token_number: u64,
         _input_types: Vec<Type>,
-        _num_inputs: usize,
-        _num_scalar_inputargs: usize,
-        _index_of_virtualizable: i32,
+        num_inputs: usize,
+        num_scalar_inputargs: usize,
+        index_of_virtualizable: i32,
     ) {
         // Insert with code_addr = 0 (pending). call_assembler_targets_snapshot
         // will include this entry, but Assembler386.call_assembler_targets
         // won't find a nonzero address, so the generated code takes the
         // "unresolved target" path → helper trampoline → force_fn.
         // compile_loop later overwrites with the real code_addr.
-        CALL_ASSEMBLER_TARGETS
+        //
+        // Populate metadata mirroring Cranelift's RegisteredLoopTarget so the
+        // GC rewriter's handle_call_assembler (rewrite.py:665-695) can later
+        // dispatch through the dynasm backend as well. For now no consumer
+        // reads these fields — see tasks #134 / #120.
+        let mut map = CALL_ASSEMBLER_TARGETS
             .lock()
-            .expect("CALL_ASSEMBLER_TARGETS poisoned")
-            .entry(token_number)
-            .or_insert(0);
+            .expect("CALL_ASSEMBLER_TARGETS poisoned");
+        map.entry(token_number).or_insert_with(|| DynasmLoopTarget {
+            code_addr: 0,
+            num_inputs,
+            num_scalar_inputargs,
+            // regalloc.py:871 _ll_initial_locs — pyre uses contiguous
+            // word-sized inputarg slots, matching cranelift's convention.
+            _ll_initial_locs: (0..num_inputs).map(|i| (i as i32) * 8).collect(),
+            index_of_virtualizable,
+            frame_info: Box::into_raw(Box::new([0isize, 0isize])),
+        });
     }
 
     fn compiled_fail_descr_layouts(
