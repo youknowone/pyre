@@ -18,7 +18,8 @@ impl BytecodeExt for [u8] {
     }
 }
 
-const STACK_CAP: usize = 1024;
+/// tla.py:101 `self.stack = [None] * 8`.
+const STACK_SIZE: usize = 8;
 
 struct TlaState {
     stackpos: i64,
@@ -55,7 +56,7 @@ pub fn mainloop(program: &Bytecode, initial_value: i64, threshold: u32) -> i64 {
     let mut state = TlaState {
         stackpos: 1,
         stack: {
-            let mut s = vec![0i64; STACK_CAP];
+            let mut s = vec![0i64; STACK_SIZE];
             s[0] = initial_value;
             s
         },

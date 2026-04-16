@@ -27,8 +27,6 @@ impl BytecodeExt for [u8] {
     }
 }
 
-const STACK_CAP: usize = 1024;
-
 struct TlcState {
     stackpos: i64,
     stack: Vec<i64>,
@@ -36,9 +34,17 @@ struct TlcState {
 
 /// Stack rotation — residual CALL in the trace.
 ///
-/// RPython parity: tlc.py:284 ROLL (inline). Writing it as a raw-pointer
-/// function with `#[dont_look_inside]` lets the JIT emit a single residual
-/// CALL instead of tracing the inner shuffle.
+/// RPython parity: tlc.py:284 inlines `stack.insert(i, stack.pop())` and
+/// `stack.append(stack.pop(i))`. Under the rpython translator those list
+/// operations lower to `ll_list_insert` / `ll_list_pop_at` residual helpers
+/// (rpython/rtyper/lltypesystem/rlist.py), so the RPython trace ends up with
+/// two residual CALLs at this opcode. pyre's `#[jit_interp]` macro does not
+/// model state-field array ops with `state.stack.insert(i, ...)` / `.pop(i)`,
+/// so we hoist the shuffle into one `#[dont_look_inside]` residual helper;
+/// this is a packaging adaptation — the trace-level shape (single residual
+/// CALL on ROLL) is strictly simpler than RPython's two-residual sequence,
+/// and reverting to inline would require a state-field-array `insert`/`pop_at`
+/// lowering that the macro does not yet provide.
 #[majit_macros::dont_look_inside]
 extern "C" fn tlc_roll(stack_ptr: usize, stackpos: i64, r: i64) {
     let stack = unsafe { std::slice::from_raw_parts_mut(stack_ptr as *mut i64, stackpos as usize) };
@@ -110,9 +116,14 @@ pub fn mainloop(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 {
         majit_metainterp::JitDriver::new(threshold);
     let mut pc: usize = 0;
     let mut stacksize: i32 = 0;
+    // tlc.py:223 `self.stack = []` is a plain dynamic Python list (no
+    // virtualizable). pyre's `state_fields = [int; virt]` requires a fixed
+    // size; use `program.len()` as a safe upper bound (no sequence of
+    // bytecode ops can push more than one value per opcode without
+    // eventually popping, so peak stack depth is bounded by code length).
     let mut state = TlcState {
         stackpos: 0,
-        stack: vec![0i64; STACK_CAP],
+        stack: vec![0i64; program.len()],
     };
 
     while pc < program.len() {

@@ -1,7 +1,14 @@
 /// JIT-enabled tiny2 interpreter via `#[jit_interp]` proc macro with `state_fields`.
 ///
-/// RPython parity: tiny2_hotpath.py — `_virtualizable_ = ['stackpos', 'stack[*]']`
-/// maps to `state_fields = { stackpos: int, stack: [int; virt] }`.
+/// PRE-EXISTING-ADAPTATION: `rpython/jit/tl/tiny2_hotpath.py:90` models the
+/// operand stack as a linked-list `Stack(value, next)`; each push allocates
+/// one cons cell that RPython's JIT peels as a chain of virtuals. pyre's
+/// `state_fields = { stackpos, stack: [int; virt] }` does not express
+/// linked-list stacks — it requires a contiguous virtualizable array. The
+/// array backing is a source-shape deviation; post-optimization the trace
+/// shape is equivalent to RPython's peeled virtuals for the shallow,
+/// constant-height stacks the tinybench exercises. Porting a linked-list
+/// state kind to #[jit_interp] is a separate, larger port.
 ///
 /// Greens: [bytecode (env), pc]
 /// Reds:   [stackpos, stack]  (tracked via state_fields)
@@ -17,8 +24,6 @@ const OP_MUL: u8 = 5;
 const OP_LOOP_START: u8 = 6; // no-op marker (target for back-edge)
 const OP_LOOP_END: u8 = 7; // followed by 2 bytes (target pc, u16 LE)
 const OP_END: u8 = 8;
-
-const STACK_CAP: usize = 1024;
 
 // ── Bytecode compiler ──
 
@@ -101,7 +106,7 @@ fn mainloop(program: &Bytecode, num_args: usize, args_out: &mut [i64], threshold
     let mut stacksize: i32 = 0;
     let mut state = Tiny2State {
         stackpos: num_args as i64,
-        stack: vec![0i64; STACK_CAP],
+        stack: vec![0i64; program.len()],
     };
 
     while pc < program.len() {

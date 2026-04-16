@@ -1,7 +1,10 @@
 /// JIT-enabled tiny3 interpreter via `#[jit_interp]` proc macro with `state_fields`.
 ///
-/// RPython parity: `_virtualizable_ = ['stackpos', 'stack[*]']` maps to
-/// `state_fields = { stackpos: int, stack: [int; virt] }`.
+/// PRE-EXISTING-ADAPTATION: `rpython/jit/tl/tiny3_hotpath.py:96` models the
+/// operand stack as a linked-list `Stack(value, next)`, identical shape to
+/// tiny2_hotpath.py. pyre's `state_fields = { stackpos, stack: [int; virt] }`
+/// does not express linked-list stacks — see the same adaptation note on
+/// `majit/examples/tiny2/src/jit_interp.rs`.
 ///
 /// Greens: [pc]
 /// Reds:   [stackpos, stack]  (args at bottom, computation stack on top)
@@ -21,8 +24,6 @@ const OP_LOOP_START: u8 = 6; // no-op marker
 const OP_LOOP_END: u8 = 7; // followed by 2 bytes (target pc, u16 LE)
 const OP_END: u8 = 8;
 const OP_PUSH_FLOAT: u8 = 9; // followed by 8 bytes (f64 bits as i64 LE) — not traced by JIT
-
-const STACK_CAP: usize = 1024;
 
 // ── Bytecode compiler ──
 
@@ -108,7 +109,7 @@ fn mainloop(program: &Bytecode, num_args: usize, threshold: u32) -> i64 {
     let mut stacksize: i32 = 0;
     let mut state = Tiny3State {
         stackpos: num_args as i64,
-        stack: vec![0i64; STACK_CAP],
+        stack: vec![0i64; program.len()],
     };
 
     while pc < program.len() {

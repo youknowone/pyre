@@ -55,9 +55,9 @@ impl BytecodeExt for [u8] {
     }
 }
 
-const STACK_CAP: usize = 1024;
-
 /// tl.py:13-14 Stack object. `_virtualizable_ = ['stackpos', 'stack[*]']`.
+/// tl.py:17 `Stack(size)` — `size` is the bytecode length; the caller
+/// (`interp_eval`) passes `len(code)`. See tl.py:120.
 struct TlState {
     stackpos: i64,
     stack: Vec<i64>,
@@ -107,7 +107,7 @@ pub fn mainloop(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 {
     let mut stacksize: i32 = 0;
     let mut state = TlState {
         stackpos: 0,
-        stack: vec![0i64; STACK_CAP],
+        stack: vec![0i64; program.len()],
     };
 
     while pc < program.len() {
