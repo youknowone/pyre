@@ -1426,13 +1426,14 @@ impl Optimizer {
         }
     }
 
-    /// optimizer.py: is_call_pure_pure_canraise(op)
-    /// Check if a CALL_PURE can raise an exception.
+    /// optimizer.py:705-711 `is_call_pure_pure_canraise(op)`.
+    /// Mirrors PyPy exactly: ignore `MemoryError`-only effects when deciding
+    /// whether a CALL_PURE breaks guard resume-data sharing.
     pub fn is_call_pure_pure_canraise(op: &Op) -> bool {
         op.descr
             .as_ref()
             .and_then(|d| d.as_call_descr())
-            .map(|cd| cd.get_extra_info().check_can_raise(false))
+            .map(|cd| cd.get_extra_info().check_can_raise(true))
             .unwrap_or(true)
     }
 
@@ -4265,6 +4266,31 @@ mod tests {
             opt.get_call_pure_result(&[Value::Int(10), Value::Int(99)]),
             None
         );
+    }
+
+    #[test]
+    fn test_is_call_pure_pure_canraise_ignores_memoryerror_only() {
+        let mut op = Op::new(OpCode::CallPureI, &[OpRef(0), OpRef(1)]);
+        op.descr = Some(Arc::new(TestCallDescr {
+            idx: 400,
+            effect: EffectInfo::new(ExtraEffect::ElidableOrMemoryError, OopSpecIndex::None),
+            result_type: majit_ir::Type::Int,
+        }));
+        assert!(
+            !Optimizer::is_call_pure_pure_canraise(&op),
+            "optimizer.py:705-711 ignores MemoryError-only effects"
+        );
+    }
+
+    #[test]
+    fn test_is_call_pure_pure_canraise_true_for_other_raising_effects() {
+        let mut op = Op::new(OpCode::CallPureI, &[OpRef(0), OpRef(1)]);
+        op.descr = Some(Arc::new(TestCallDescr {
+            idx: 401,
+            effect: EffectInfo::new(ExtraEffect::ElidableCanRaise, OopSpecIndex::None),
+            result_type: majit_ir::Type::Int,
+        }));
+        assert!(Optimizer::is_call_pure_pure_canraise(&op));
     }
 
     #[test]

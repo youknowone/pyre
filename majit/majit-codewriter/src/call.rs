@@ -12,8 +12,10 @@ use majit_ir::descr::{EffectInfo, ExtraEffect, OopSpecIndex};
 use majit_ir::value::Type;
 use serde::{Deserialize, Serialize};
 
+use crate::front::ast::SemanticFunction;
 use crate::model::{CallTarget, FunctionGraph, OpKind, Terminator};
 use crate::parse::CallPath;
+use crate::policy::JitPolicy;
 
 // ── Graph-based analyzers (RPython effectinfo.py + canraise.py) ────
 //
@@ -152,6 +154,12 @@ pub struct CallControl {
     /// Free function graphs: CallPath → FunctionGraph.
     /// RPython: `funcptr._obj.graph` linkage.
     function_graphs: HashMap<CallPath, FunctionGraph>,
+
+    /// Per-graph hint set, mirroring RPython `func._jit_*_` / `_elidable_function_`.
+    /// Populated by `register_function_graph_with_hints` and
+    /// `register_trait_method_with_hints`; consulted by
+    /// [`crate::policy::JitPolicy::look_inside_graph`] inside `find_all_graphs`.
+    function_hints: HashMap<CallPath, Vec<String>>,
 
     /// Trait impl method graphs: (method_name, impl_type) → FunctionGraph.
     /// Used for resolving `handler.method_name()` calls.
@@ -465,6 +473,7 @@ impl CallControl {
     pub fn new() -> Self {
         Self {
             function_graphs: HashMap::new(),
+            function_hints: HashMap::new(),
             trait_method_graphs: HashMap::new(),
             trait_method_impls: HashMap::new(),
             candidate_graphs: HashSet::new(),
@@ -585,6 +594,22 @@ impl CallControl {
         self.function_graphs.insert(path, graph);
     }
 
+    /// Register a free function graph together with its hints.
+    /// `hints` mirror RPython `func._jit_*_` / `_elidable_function_`
+    /// attributes; they are consulted by
+    /// [`crate::policy::JitPolicy::look_inside_graph`].
+    pub fn register_function_graph_with_hints(
+        &mut self,
+        path: CallPath,
+        graph: FunctionGraph,
+        hints: Vec<String>,
+    ) {
+        self.function_graphs.insert(path.clone(), graph);
+        if !hints.is_empty() {
+            self.function_hints.insert(path, hints);
+        }
+    }
+
     /// Register a trait impl method graph.
     ///
     /// Also registers the graph in function_graphs under a synthetic
@@ -662,13 +687,19 @@ impl CallControl {
     /// Walks from portal graphs transitively: for each Call op,
     /// if the callee has a graph, add it to the candidate set.
     /// Portal must be seeded via `mark_portal()` before calling.
-    pub fn find_all_graphs(&mut self) {
+    /// call.py:49 `find_all_graphs(self, policy)`.
+    ///
+    /// Discovers all candidate graphs reachable from the portal entry
+    /// points. RPython uses `policy.look_inside_graph` to decide whether
+    /// to follow each callee; we synthesize a `SemanticFunction` for the
+    /// per-graph hints stored in `function_hints` and pass it through.
+    pub fn find_all_graphs(&mut self, policy: &mut dyn JitPolicy) {
         assert!(
             !self.portal_targets.is_empty(),
             "find_all_graphs requires at least one portal target; \
              use find_all_graphs_for_tests() if no portal is available"
         );
-        self.find_all_graphs_bfs();
+        self.find_all_graphs_bfs(policy);
     }
 
     /// Test-only: include all registered function graphs as candidates.
@@ -682,10 +713,11 @@ impl CallControl {
             }
             return;
         }
-        self.find_all_graphs_bfs();
+        let mut policy = crate::policy::DefaultJitPolicy::new();
+        self.find_all_graphs_bfs(&mut policy);
     }
 
-    fn find_all_graphs_bfs(&mut self) {
+    fn find_all_graphs_bfs(&mut self, policy: &mut dyn JitPolicy) {
         // RPython call.py:49-92: BFS from portal targets.
         // For each graph, scan all Call ops. If guess_call_kind would
         // return 'regular' (i.e. graphs_from returns a graph AND it's
@@ -729,11 +761,28 @@ impl CallControl {
                     if self.candidate_graphs.contains(&callee_path) {
                         continue; // already discovered
                     }
-                    // RPython call.py:84,87: callee must have a graph.
-                    // is_candidate during BFS = "has a graph" (default policy).
-                    if self.function_graphs.contains_key(&callee_path) {
-                        self.candidate_graphs.insert(callee_path.clone());
-                        todo.push(callee_path);
+                    // RPython call.py:84,87: callee must satisfy
+                    // policy.look_inside_graph(graph). Synthesize a
+                    // SemanticFunction from the stored graph + hints so
+                    // the policy's `_jit_*_` / `_elidable_function_`
+                    // checks fire identically to upstream.
+                    if let Some(graph) = self.function_graphs.get(&callee_path).cloned() {
+                        let hints = self
+                            .function_hints
+                            .get(&callee_path)
+                            .cloned()
+                            .unwrap_or_default();
+                        let func = SemanticFunction {
+                            name: callee_path.last_segment().unwrap_or_default().to_string(),
+                            graph,
+                            return_type: None,
+                            self_ty_root: None,
+                            hints,
+                        };
+                        if policy.look_inside_graph(&func) {
+                            self.candidate_graphs.insert(callee_path.clone());
+                            todo.push(callee_path);
+                        }
                     }
                 }
             }

@@ -25,6 +25,7 @@ pub mod layout;
 pub mod liveness;
 pub mod model;
 mod parse;
+pub mod policy;
 pub mod regalloc;
 #[cfg(test)]
 mod test_support;
@@ -220,8 +221,34 @@ fn analyze_pipeline_from_parsed(
             call_control.set_struct_layout(struct_name.clone(), layout);
         }
     }
+    // Register graphs collected above (free functions only — trait
+    // methods are handled separately via register_trait_method).
     for (path, graph) in &canonical_function_graphs {
         call_control.register_function_graph(path.clone(), graph.clone());
+    }
+    // Re-register free functions with their RPython-equivalent hints
+    // (`elidable`, `loop_invariant`, `unroll_safe`, `jit_look_inside`)
+    // so `JitPolicy::look_inside_graph` sees the same metadata RPython
+    // reads off `func._jit_*_` / `_elidable_function_`.
+    for func in &program.functions {
+        if !func.self_ty_root.is_none() || func.hints.is_empty() {
+            continue;
+        }
+        let segments: Vec<&str> = func.name.split("::").collect();
+        let path = parse::CallPath::from_segments(segments.iter().copied());
+        call_control.register_function_graph_with_hints(
+            path,
+            func.graph.clone(),
+            func.hints.clone(),
+        );
+        let mut crate_segs = vec!["crate"];
+        crate_segs.extend(segments.iter().copied());
+        let crate_path = parse::CallPath::from_segments(crate_segs);
+        call_control.register_function_graph_with_hints(
+            crate_path,
+            func.graph.clone(),
+            func.hints.clone(),
+        );
     }
     // RPython: op.result.concretetype — register return types per function.
     // Each function's return type is registered under its exact canonical path(s).
@@ -417,7 +444,8 @@ fn analyze_pipeline_from_parsed(
             call_control.mark_oopspec(path, spec.to_string());
         }
     }
-    call_control.find_all_graphs();
+    let mut policy = policy::DefaultJitPolicy::new();
+    call_control.find_all_graphs(&mut policy);
 
     let (opcode_dispatch, jitcodes) = build_canonical_opcode_dispatch(
         parsed_files,
