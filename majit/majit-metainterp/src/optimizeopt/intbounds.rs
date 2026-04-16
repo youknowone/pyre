@@ -45,20 +45,9 @@ impl OptIntBounds {
     }
 
     /// optimizer.py:99-113 getintbound — thin wrapper over `ctx.getintbound`.
-    /// In RPython this lives on the base `Optimization` class; majit's
-    /// `OptContext::getintbound` is the equivalent. Kept here as a method on
-    /// `OptIntBounds` for call-site brevity. The int-type invariant
-    /// (optimizer.py:100 `assert op.type == 'i'`) is enforced inside
-    /// `ctx.getintbound`, so this wrapper adds no additional checks.
+    /// optimizer.py:100 `assert op.type == 'i'` is enforced inside
+    /// `ctx.getintbound`.
     fn getintbound(&self, opref: OpRef, ctx: &mut OptContext) -> IntBound {
-        // optimizer.py:100: assert op.type == 'i'. When OpRef replacement
-        // chains cross the Int/Ref boundary (snapshot dedup aliasing a
-        // vable Ref slot onto a frame Int slot), return unbounded to avoid
-        // propagating incorrect bounds on non-integer values.
-        let replaced = ctx.get_box_replacement(opref);
-        if !matches!(ctx.opref_type(replaced), Some(majit_ir::Type::Int) | None) {
-            return IntBound::unbounded();
-        }
         ctx.getintbound(opref)
     }
 

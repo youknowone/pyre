@@ -2122,12 +2122,9 @@ impl OptContext {
     /// Used by exporters that take `&OptContext` and cannot mutate.
     pub fn peek_intbound(&self, opref: OpRef) -> Option<crate::optimizeopt::intutils::IntBound> {
         use crate::optimizeopt::info::Forwarded;
-        // optimizer.py:99-100: assert op.type == 'i'. Allow `None` (unknown
-        // type) so test fixtures with positionally-defined OpRefs that lack
-        // explicit type metadata can still query intbounds — RPython's
-        // intrinsic Box.type would always be 'i' here, but pyre's flat
-        // OpRef model has tests that don't seed `value_types`.
-        debug_assert!(
+        // optimizer.py:99-100: assert op.type == 'i'
+        // None is allowed for test fixtures that don't seed value_types.
+        assert!(
             matches!(self.opref_type(opref), Some(majit_ir::Type::Int) | None),
             "peek_intbound: expected 'i'-typed OpRef, got {:?}",
             self.opref_type(opref)
@@ -2162,9 +2159,8 @@ impl OptContext {
     /// it in forwarded[].
     pub fn getintbound(&mut self, opref: OpRef) -> crate::optimizeopt::intutils::IntBound {
         use crate::optimizeopt::info::Forwarded;
-        // optimizer.py:100: assert op.type == 'i'. See peek_intbound for the
-        // allow-`None` rationale.
-        debug_assert!(
+        // optimizer.py:100: assert op.type == 'i'
+        assert!(
             matches!(self.opref_type(opref), Some(majit_ir::Type::Int) | None),
             "getintbound: expected 'i'-typed OpRef, got {:?}",
             self.opref_type(opref)
@@ -2209,9 +2205,8 @@ impl OptContext {
     /// bound with new bound, or set if none exists.
     pub fn setintbound(&mut self, opref: OpRef, bound: &crate::optimizeopt::intutils::IntBound) {
         use crate::optimizeopt::info::Forwarded;
-        // optimizer.py:116: assert op.type == 'i'. See peek_intbound for the
-        // allow-`None` rationale.
-        debug_assert!(
+        // optimizer.py:116: assert op.type == 'i'
+        assert!(
             matches!(self.opref_type(opref), Some(majit_ir::Type::Int) | None),
             "setintbound: expected 'i'-typed OpRef, got {:?}",
             self.opref_type(opref)
@@ -2265,8 +2260,8 @@ impl OptContext {
         F: FnOnce(&mut crate::optimizeopt::intutils::IntBound) -> R,
     {
         use crate::optimizeopt::info::Forwarded;
-        // See peek_intbound for the allow-`None` rationale.
-        debug_assert!(
+        // optimizer.py:99: assert op.type == 'i'
+        assert!(
             matches!(self.opref_type(opref), Some(majit_ir::Type::Int) | None),
             "with_intbound_mut: expected 'i'-typed OpRef, got {:?}",
             self.opref_type(opref)
