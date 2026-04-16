@@ -4,6 +4,7 @@
 ///   BaseAssembler (llsupport/assembler.py)
 ///     └── ResOpAssembler (aarch64/opassembler.py)
 ///           └── AssemblerARM64 (aarch64/assembler.py)
+pub mod arch;
 pub mod assembler;
 mod opassembler;
 pub mod regalloc;

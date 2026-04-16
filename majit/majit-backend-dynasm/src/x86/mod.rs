@@ -3,5 +3,6 @@
 /// RPython class hierarchy:
 ///   BaseAssembler (llsupport/assembler.py)
 ///     └── Assembler386 (x86/assembler.py)
+pub mod arch;
 pub mod assembler;
 pub mod regalloc;
