@@ -60,6 +60,30 @@ pub struct BridgeRetraceResult {
 }
 
 /// Result of checking a back-edge.
+/// pyjitpl.py:2807 `raise SwitchToBlackhole(Counters.ABORT_TOO_LONG)` —
+/// reason attached to an abort.  RPython uses `Counters.ABORT_*` ints
+/// (`resoperation.Counters.ABORT_TOO_LONG`, `ABORT_BRIDGE`, ...); pyre
+/// tracks only the variants that propagate through the blackhole flow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AbortReason {
+    /// `Counters.ABORT_TOO_LONG`: trace exceeded the length / tag budget.
+    TooLong,
+    /// `Counters.ABORT_BRIDGE` / `ABORT_BAD_LOOP`: generic abort path —
+    /// used when pyre cannot classify the reason more precisely.
+    Generic,
+}
+
+impl AbortReason {
+    /// Map to the upstream `Counters.ABORT_*` integer for hook payloads.
+    #[inline]
+    pub const fn as_int(self) -> i32 {
+        match self {
+            AbortReason::TooLong => 1,
+            AbortReason::Generic => 0,
+        }
+    }
+}
+
 pub enum BackEdgeAction {
     /// Not hot yet; keep interpreting.
     Interpret,
@@ -567,6 +591,14 @@ pub struct MetaInterp<M: Clone> {
     /// `aborted_tracing_jitdriver`.
     pub aborted_tracing_greenkey: Option<u64>,
 
+    /// Stash for `abort_trace_live` → `aborted_tracing` handoff.
+    /// RPython's exception unwind carries green_key/permanent implicitly
+    /// through frame locals; pyre threads them through these fields so
+    /// `aborted_tracing` fires the `on_trace_abort` hook with the same
+    /// payload the old monolithic `abort_trace` produced.
+    pub(crate) pending_abort_green_key: Option<u64>,
+    pub(crate) pending_abort_permanent: bool,
+
     /// pyjitpl.py:2381 `MetaInterp.last_exc_box = None` (class
     /// attribute).  Set by `handle_possible_exception` to the boxed
     /// exception value (either a fresh `ConstPtr` when the class is
@@ -1009,6 +1041,8 @@ impl<M: Clone> MetaInterp<M> {
             last_exc_value: 0,
             aborted_tracing_jitdriver: None,
             aborted_tracing_greenkey: None,
+            pending_abort_green_key: None,
+            pending_abort_permanent: false,
             last_exc_box: None,
             class_of_last_exc_is_const: false,
             forced_virtualizable: 0,
@@ -2011,6 +2045,65 @@ impl<M: Clone> MetaInterp<M> {
     #[inline]
     pub fn is_tracing(&self) -> bool {
         self.tracing.is_some()
+    }
+
+    /// pyjitpl.py:2788-2807 `blackhole_if_trace_too_long`.
+    ///
+    /// Runs the too-long bookkeeping (`disable_noninlinable_function` /
+    /// `aborted_tracing_*` stash / `trace_next_iteration` / `prepare_trace_segmenting`)
+    /// and returns `Some(AbortReason::TooLong)` so the caller can unwind
+    /// exactly once via `abort_trace_live(false)` + `aborted_tracing(reason)`
+    /// — matching RPython's `raise SwitchToBlackhole(ABORT_TOO_LONG)` →
+    /// `_interpret` handler → `aborted_tracing(reason)` shape.
+    ///
+    /// Returns `None` when the trace is still within budget.
+    #[inline]
+    pub fn blackhole_if_trace_too_long(&mut self) -> Option<AbortReason> {
+        match self.tracing.as_ref() {
+            Some(ctx) if ctx.is_too_long() => self.blackhole_trace_too_long_slow(),
+            _ => None,
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn blackhole_trace_too_long_slow(&mut self) -> Option<AbortReason> {
+        let ctx = self.tracing.as_ref().expect("tracing is Some");
+        let green_key = ctx.green_key;
+        // pyjitpl.py:2793: find_biggest_function — if an inlined function
+        // caused the bloat, disable just that function.
+        let huge_fn_key = ctx.find_biggest_function();
+        // pyjitpl.py:2801 `if self.current_merge_points:` — outermost
+        // loop's greenkey, used only when one exists (never for bridges).
+        let outermost_merge_key = ctx.current_merge_points_first_greenkey();
+        if let Some(huge_fn_key) = huge_fn_key {
+            self.warm_state.disable_noninlinable_function(huge_fn_key);
+            // pyjitpl.py:2799-2800: stash the aborted jd_sd + greenkey so
+            // `aborted_tracing(reason)` can fire `on_trace_too_long` when
+            // the hook is ported.  Pyre only registers a single jitdriver
+            // so jd_sd.index is always 0.
+            self.aborted_tracing_jitdriver = Some(0);
+            self.aborted_tracing_greenkey = Some(huge_fn_key);
+            // pyjitpl.py:2801-2804: only boost retrace for the outermost
+            // loop (when `current_merge_points` is non-empty).  Bridge
+            // and function-entry overflow must NOT trigger trace_next_iteration.
+            if let Some(outer_key) = outermost_merge_key {
+                self.warm_state.trace_next_iteration(outer_key);
+            }
+        } else {
+            // pyjitpl.py:2806: no inlinable function found.
+            self.warm_state.prepare_trace_segmenting(green_key);
+        }
+        if crate::majit_log_enabled() {
+            eprintln!(
+                "[jit] blackhole_if_trace_too_long: aborting at key={}",
+                green_key
+            );
+        }
+        // pyjitpl.py:2807 `raise SwitchToBlackhole(ABORT_TOO_LONG)`.
+        // Return the reason; caller unwinds with abort_trace_live +
+        // aborted_tracing(reason) exactly once.
+        Some(AbortReason::TooLong)
     }
 
     /// RPython JC_TRACING parity: check if we are currently tracing
@@ -3487,11 +3580,36 @@ impl<M: Clone> MetaInterp<M> {
     /// Abort the current trace.
     ///
     /// If `permanent` is true, this location will never be traced again.
+    ///
+    /// Structured as two halves mirroring RPython's exception-unwind shape
+    /// (pyjitpl.py:2807 `raise SwitchToBlackhole` → `_interpret` unwind →
+    /// pyjitpl.py:2760 `aborted_tracing(reason)`):
+    ///
+    /// 1. `abort_trace_live(permanent)` — live cleanup only (recorder
+    ///    abort, warm-state reset, pending_token clear).  Matches the
+    ///    implicit unwind in RPython: no stats bump, no hook fire.
+    /// 2. `aborted_tracing(AbortReason::Generic)` — accounting + hook
+    ///    fire (stats.aborted, on_trace_abort).  Matches pyjitpl.py:2760
+    ///    the upstream accounting site.
+    ///
+    /// Blackhole callers that set `aborted_tracing_jitdriver` before
+    /// calling this pair get the distinct `on_trace_too_long` hook
+    /// routed through `aborted_tracing` (currently folded into the
+    /// single `on_trace_abort`; the split lands when pyre's hook surface
+    /// is fully ported).
     pub fn abort_trace(&mut self, permanent: bool) {
+        self.abort_trace_live(permanent);
+        self.aborted_tracing(AbortReason::Generic.as_int());
+    }
+
+    /// Live-cleanup half of `abort_trace` — no stats, no hooks.
+    /// Callers that go through `blackhole_if_trace_too_long` should invoke
+    /// this directly and then call `aborted_tracing(AbortReason::TooLong)`
+    /// so the accounting event fires exactly once with the correct reason.
+    pub fn abort_trace_live(&mut self, permanent: bool) {
         self.force_finish_trace = false;
         self.clear_retrace_state();
         if let Some(ctx) = self.tracing.take() {
-            self.stats.loops_aborted += 1;
             let green_key = ctx.green_key;
             if crate::majit_log_enabled() {
                 eprintln!(
@@ -3501,12 +3619,13 @@ impl<M: Clone> MetaInterp<M> {
             }
             ctx.recorder.abort();
             self.warm_state.abort_tracing(green_key, permanent);
-            // Reset per-trace function call counts.
             self.warm_state.reset_function_counts();
             self.pending_token = None;
-            if let Some(ref hook) = self.hooks.on_trace_abort {
-                hook(green_key, permanent);
-            }
+            // Stash green_key / permanent for the subsequent
+            // `aborted_tracing` call so its hook fires with the upstream
+            // payload even though the ctx has been taken.
+            self.pending_abort_green_key = Some(green_key);
+            self.pending_abort_permanent = permanent;
         }
     }
 
@@ -7834,27 +7953,27 @@ impl<M: Clone> MetaInterp<M> {
     ///    `on_trace_abort` hook when `aborted_tracing_jitdriver` was
     ///    pre-set, then clears both fields per pyjitpl.py:2784-2785.
     ///
-    /// `reason` is opaque (RPython passes a `Counters.*` int); pyre
-    /// keeps it as `i32` so callers can route a stable counter id
-    /// through the eventual hook payload.
+    /// `reason` is the upstream `Counters.ABORT_*` int (pyre routes
+    /// `AbortReason::as_int()` through here).
     pub fn aborted_tracing(&mut self, _reason: i32) {
-        // pyjitpl.py:2761: profiler.count(reason)
-        // pyjitpl.py:2786: stats.aborted()
+        // pyjitpl.py:2761: profiler.count(reason) / 2786: stats.aborted()
         self.stats.loops_aborted = self.stats.loops_aborted.saturating_add(1);
-        // pyjitpl.py:2776-2785: aborted_tracing_jitdriver bookkeeping
-        if self.aborted_tracing_jitdriver.is_some() {
-            // pyjitpl.py:2779-2782: on_trace_too_long hook
-            // (pyre folds into existing on_trace_abort if set; the
-            // distinct on_trace_too_long entry lands when the
-            // upstream hook surface is fully ported)
-            if let Some(ref hook) = self.hooks.on_trace_abort {
-                let greenkey = self.aborted_tracing_greenkey.unwrap_or(0);
-                hook(greenkey, /* permanent = */ false);
-            }
-            // pyjitpl.py:2784-2785: clear both fields
-            self.aborted_tracing_jitdriver = None;
-            self.aborted_tracing_greenkey = None;
+        // pyjitpl.py:2770 on_abort hook payload — pyre's single hook
+        // receives (greenkey, permanent).  `abort_trace_live` stashes the
+        // greenkey / permanent from the consumed ctx so we can fire once
+        // here.  The reason is carried only through the eventual hook
+        // surface split; `_reason` is intentionally unused today.
+        let green_key = self.pending_abort_green_key.take().unwrap_or(0);
+        let permanent = std::mem::take(&mut self.pending_abort_permanent);
+        if let Some(ref hook) = self.hooks.on_trace_abort {
+            hook(green_key, permanent);
         }
+        // pyjitpl.py:2776-2785: on_trace_too_long clause — pyre folds it
+        // into the single hook above until a distinct hook surface is
+        // ported; clear the fields unconditionally so bookkeeping cannot
+        // leak into the next trace.
+        self.aborted_tracing_jitdriver = None;
+        self.aborted_tracing_greenkey = None;
     }
 
     /// pyjitpl.py:2757-2758 `MetaInterp.clear_exception()`.

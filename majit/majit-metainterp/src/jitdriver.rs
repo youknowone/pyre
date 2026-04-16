@@ -46,8 +46,8 @@ use crate::TraceAction;
 use crate::blackhole::ExceptionState;
 use crate::jit_state::JitState;
 use crate::pyjitpl::{
-    BackEdgeAction, CompiledExitLayout, DetailedDriverRunOutcome, InlineDecision, JitStats,
-    MetaInterp,
+    AbortReason, BackEdgeAction, CompiledExitLayout, DetailedDriverRunOutcome, InlineDecision,
+    JitStats, MetaInterp,
 };
 use crate::resume::ResumeLayoutSummary;
 use crate::trace_ctx::TraceCtx;
@@ -1081,28 +1081,17 @@ impl<S: JitState> JitDriver<S> {
                 if crate::majit_log_enabled() && self.bridge_info.is_some() {
                     eprintln!("[bridge] Abort during bridge tracing");
                 }
-                // pyjitpl.py:2788-2807 blackhole_if_trace_too_long parity.
-                if let Some(ctx) = self.meta.trace_ctx() {
-                    if ctx.is_too_long() {
-                        let green_key = ctx.green_key();
-                        // pyjitpl.py:2793: find_biggest_function — if an
-                        // inlined function caused the bloat, disable just
-                        // that function instead of segmenting the loop.
-                        if let Some(huge_fn_key) = ctx.find_biggest_function() {
-                            // pyjitpl.py:2797: disable the huge callee.
-                            self.meta
-                                .warm_state
-                                .disable_noninlinable_function(huge_fn_key);
-                            // pyjitpl.py:2804: boost the current loop so it
-                            // retraces soon (without the disabled callee).
-                            self.meta.warm_state.trace_next_iteration(green_key);
-                        } else {
-                            // pyjitpl.py:2806: no inlinable function found.
-                            self.meta.warm_state.prepare_trace_segmenting(green_key);
-                        }
-                    }
-                }
-                self.meta.abort_trace(false);
+                // pyjitpl.py:2788-2807 blackhole_if_trace_too_long runs the
+                // segmenting / disable bookkeeping and returns the abort
+                // reason.  Unwind once with abort_trace_live + aborted_tracing
+                // matching RPython's `raise SwitchToBlackhole(ABORT_TOO_LONG)`
+                // → `_interpret` handler → `aborted_tracing(reason)` shape.
+                let reason = self
+                    .meta
+                    .blackhole_if_trace_too_long()
+                    .unwrap_or(AbortReason::Generic);
+                self.meta.abort_trace_live(false);
+                self.meta.aborted_tracing(reason.as_int());
                 self.sym = None;
                 self.trace_meta = None;
                 self.bridge_info = None;
@@ -1117,6 +1106,33 @@ impl<S: JitState> JitDriver<S> {
                 self.bridge_info = None;
             }
         }
+    }
+
+    /// pyjitpl.py:2788-2807 `blackhole_if_trace_too_long` + pyjitpl.py:2760
+    /// `aborted_tracing(reason)` parity shape.
+    ///
+    /// Runs the upstream bookkeeping, unwinds the live tracing state via
+    /// `abort_trace_live`, then fires `aborted_tracing(reason)` for the
+    /// accounting event — all exactly once — and clears driver-owned
+    /// per-session state (sym / trace_meta / bridge_info).  Returns
+    /// `true` when an abort fired so callers can act on it.
+    #[inline]
+    pub fn blackhole_if_trace_too_long(&mut self) -> bool {
+        let Some(reason) = self.meta.blackhole_if_trace_too_long() else {
+            return false;
+        };
+        self.meta.abort_trace_live(false);
+        self.meta.aborted_tracing(reason.as_int());
+        self.clear_tracing_session_state();
+        true
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn clear_tracing_session_state(&mut self) {
+        self.sym = None;
+        self.trace_meta = None;
+        self.bridge_info = None;
     }
 
     /// Back-edge handler — call when a backward jump is detected.

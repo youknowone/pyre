@@ -163,6 +163,15 @@ impl TraceCtx {
         self.current_merge_points.clear();
     }
 
+    /// pyjitpl.py:2801 / 2803 / 2818 / 7985 — `current_merge_points[0]`
+    /// is the outermost loop header's greenkey.  Used by
+    /// `blackhole_if_trace_too_long` / `prepare_trace_segmenting` /
+    /// `aborted_tracing` to distinguish "tracing a loop body" from
+    /// "tracing a bridge" (empty merge-points list).
+    pub fn current_merge_points_first_greenkey(&self) -> Option<u64> {
+        self.current_merge_points.first().map(|mp| mp.green_key)
+    }
+
     /// pyjitpl.py:2988: find merge point by key, searching in reverse
     /// order (most recent first, matching RPython's range(len-1, -1, -1)).
     pub fn get_merge_point(&self, key: u64) -> Option<&MergePoint> {

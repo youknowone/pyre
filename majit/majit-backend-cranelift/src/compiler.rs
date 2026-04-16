@@ -10420,13 +10420,24 @@ fn collect_guards(
             .filter_map(|(slot, opref)| force_tokens.contains(&opref.0).then_some(slot))
             .collect();
 
-        // Extract per-guard bytecode resume PC from the last fail_arg constant.
-        // RPython rd_resume_position: the interpreter PC where execution resumes.
-        // The jit_interp macro records resume_pc as the last fail_arg constant.
+        // RPython resume.py:396: on guard failure the resume PC is taken
+        // from the rebuilt top frame (`RebuiltFrame.pc`). rd_numb/rd_consts
+        // are populated by `store_final_boxes_in_guard` during optimizer
+        // emit, so every non-finish, non-external-jump guard that reaches
+        // the backend has them. We pre-compute the PC at compile time so
+        // the ExitFrameLayout doesn't need to decode rd_numb at resume.
         let guard_resume_pc: Option<u64> = if !is_finish && !is_external_jump {
-            fail_arg_refs
-                .last()
-                .and_then(|&last_ref| constants.get(&last_ref.0).map(|&v| v as u64))
+            if let (Some(rd_numb_bytes), Some(rd_consts_data)) = (&op.rd_numb, &op.rd_consts) {
+                use majit_ir::resumedata::{get_frame_value_count_fn, rebuild_from_numbering};
+                let fvc = get_frame_value_count_fn();
+                let fvc_ref: Option<&dyn Fn(i32, i32) -> usize> =
+                    fvc.as_ref().map(|f| f as &dyn Fn(i32, i32) -> usize);
+                let (_nfa, _vable, _vref, frames) =
+                    rebuild_from_numbering(rd_numb_bytes, rd_consts_data, &fail_arg_types, fvc_ref);
+                frames.last().map(|f| f.pc as u64)
+            } else {
+                None
+            }
         } else {
             None
         };

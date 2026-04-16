@@ -127,6 +127,22 @@ impl PyreMetaInterp {
                 LoopAction::Continue => {}
                 LoopAction::Return(ta) => return ta,
             }
+            // pyjitpl.py:2837-2843 _interpret parity:
+            //     while True:
+            //         self.framestack[-1].run_one_step()
+            //         self.blackhole_if_trace_too_long()
+            //
+            // The full `blackhole_if_trace_too_long` bookkeeping
+            // (find_biggest_function / disable_noninlinable_function /
+            // prepare_trace_segmenting) lives on `MetaInterp` and runs
+            // in the jitdriver when it sees `TraceAction::Abort`. Here
+            // we only mirror the trigger: stop dispatch the moment the
+            // recorder exceeds `trace_limit`, which RPython signals via
+            // `raise SwitchToBlackhole(ABORT_TOO_LONG)` inside
+            // `blackhole_if_trace_too_long`.
+            if ctx.is_too_long() {
+                return TraceAction::Abort;
+            }
         }
     }
 

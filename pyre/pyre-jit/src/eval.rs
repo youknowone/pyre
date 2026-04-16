@@ -1240,7 +1240,11 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
             }
         }
         match execute_opcode_step(frame, code, instruction, op_arg, next_instr) {
-            Ok(StepResult::Continue) => {}
+            Ok(StepResult::Continue) => {
+                // pyjitpl.py:2843 blackhole_if_trace_too_long — check after
+                // every traced step to prevent infinite trace recording.
+                driver.blackhole_if_trace_too_long();
+            }
             Ok(StepResult::CloseLoop { loop_header_pc, .. }) if is_portal => {
                 // ── can_enter_jit (RPython interp_jit.py:114) ──
                 // RPython interp_jit.py:114 → warmstate.py:446
