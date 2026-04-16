@@ -6,3 +6,4 @@
 pub mod arch;
 pub mod assembler;
 pub mod regalloc;
+pub mod reghint;

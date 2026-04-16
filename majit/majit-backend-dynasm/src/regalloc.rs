@@ -704,6 +704,16 @@ use arch_regalloc::{
     call_result_fpr, call_result_gpr, core_reg_index, frame_reg, save_around_call_core_regs,
 };
 
+// Per-arch reghint pass.  Upstream RPython only ships
+// `rpython/jit/backend/x86/reghint.py`; pyre carries a parallel
+// `aarch64/reghint.rs` that is the proper port of what upstream
+// aarch64 should have (see aarch64/reghint.rs module docs for the
+// latent-bug analysis).
+#[cfg(target_arch = "aarch64")]
+use crate::aarch64::reghint as arch_reghint;
+#[cfg(target_arch = "x86_64")]
+use crate::x86::reghint as arch_reghint;
+
 // ── RegisterManager ────────────────────────────────────────────────
 
 /// regalloc.py:356 RegisterManager — register allocation logic.
@@ -1618,7 +1628,7 @@ impl RegAlloc {
         // calls.  The mechanism is ABI-driven so it applies on aarch64
         // identically; this remains a documented NEW-DEVIATION pending
         // an upstream port of reghint.py to aarch64.
-        let hints = crate::reghint::RegisterHints::new(
+        let hints = arch_reghint::RegisterHints::new(
             self.rm.save_around_call_regs.clone(),
             self.xrm.save_around_call_regs.clone(),
             self.rm.all_regs.clone(),

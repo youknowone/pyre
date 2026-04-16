@@ -21,7 +21,6 @@ pub mod guard;
 pub mod jitframe;
 pub mod jump;
 pub mod regalloc;
-pub mod reghint;
 pub mod regloc;
 pub mod runner;
 

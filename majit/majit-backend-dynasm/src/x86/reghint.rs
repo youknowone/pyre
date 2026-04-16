@@ -1,109 +1,27 @@
-/// Port of rpython/jit/backend/x86/reghint.py.
-///
-/// Register hints that tell the regalloc which registers to prefer for
-/// specific opcodes. Runs as a pre-pass before the main regalloc walk.
-///
-/// RPython ships reghint only under x86; the aarch64 backend has no
-/// counterpart. For pyre we apply the same mechanism uniformly because
-/// the call-hint logic is ABI-driven (caller-save vs callee-save) and
-/// aarch64 has the identical shape. Without this pass, long-lived
-/// values whose lifetime spans a call can be assigned to caller-save
-/// registers and be clobbered across calls (observed on fib_loop:
-/// loop-invariant n ends up in x5 and is wiped by the inner call).
-///
-/// The x86 file also hints ABI arg registers and emits binop-specific
-/// try_use_same_register hints for two-operand x86 instructions. Those
-/// optimizations are gated under #[cfg(target_arch = "x86_64")] so the
-/// aarch64 port only carries the call-hint mechanism.
+//! Port of `rpython/jit/backend/x86/reghint.py`.
+//!
+//! Register hints that tell the regalloc which registers to prefer
+//! for specific opcodes.  Runs as a pre-pass before the main regalloc
+//! walk (invoked from `RegAlloc::_prepare`).
+//!
+//! The x86 file also carries binop-specific `try_use_same_register`
+//! hints for two-operand instructions (consider_int_add,
+//! consider_int_lshift, etc.).  Those are currently unimplemented in
+//! pyre; the pass here covers the arg-placement + `_block_non_caller_save`
+//! side of upstream.  The missing hints are tracked as an
+//! implementation gap, not as a structural deviation.
+
 use crate::regalloc::LifetimeManager;
 use crate::regloc::RegLoc;
 use majit_ir::{Op, OpCode, OpRef, Type};
 
-/// reghint.py:13 SAVE_DEFAULT_REGS, SAVE_GCREF_REGS, SAVE_ALL_REGS.
+/// reghint.py:13
 pub const SAVE_DEFAULT_REGS: u8 = 0;
 pub const SAVE_GCREF_REGS: u8 = 1;
 pub const SAVE_ALL_REGS: u8 = 2;
 
-// ── ABI argument registers (ARGUMENTS_GPR/ARGUMENTS_XMM) ─────────────
-
-/// aarch64/callbuilder.py:21 argument_regs = [x0..x7].
-#[cfg(target_arch = "aarch64")]
+/// x86/callbuilder.py:83 `CallBuilder64.ARGUMENTS_GPR` on Linux/macOS.
 const ARGUMENTS_GPR: &[RegLoc] = &[
-    RegLoc {
-        value: 0,
-        is_xmm: false,
-    },
-    RegLoc {
-        value: 1,
-        is_xmm: false,
-    },
-    RegLoc {
-        value: 2,
-        is_xmm: false,
-    },
-    RegLoc {
-        value: 3,
-        is_xmm: false,
-    },
-    RegLoc {
-        value: 4,
-        is_xmm: false,
-    },
-    RegLoc {
-        value: 5,
-        is_xmm: false,
-    },
-    RegLoc {
-        value: 6,
-        is_xmm: false,
-    },
-    RegLoc {
-        value: 7,
-        is_xmm: false,
-    },
-];
-
-/// aarch64/registers.py: vfp_argument_regs = vfpregisters[:8].
-#[cfg(target_arch = "aarch64")]
-const ARGUMENTS_XMM: &[RegLoc] = &[
-    RegLoc {
-        value: 0,
-        is_xmm: true,
-    },
-    RegLoc {
-        value: 1,
-        is_xmm: true,
-    },
-    RegLoc {
-        value: 2,
-        is_xmm: true,
-    },
-    RegLoc {
-        value: 3,
-        is_xmm: true,
-    },
-    RegLoc {
-        value: 4,
-        is_xmm: true,
-    },
-    RegLoc {
-        value: 5,
-        is_xmm: true,
-    },
-    RegLoc {
-        value: 6,
-        is_xmm: true,
-    },
-    RegLoc {
-        value: 7,
-        is_xmm: true,
-    },
-];
-
-/// x86/callbuilder.py:83 CallBuilder64.ARGUMENTS_GPR on Linux/macOS.
-#[cfg(target_arch = "x86_64")]
-const ARGUMENTS_GPR: &[RegLoc] = &[
-    // rdi, rsi, rdx, rcx, r8, r9 — encoded the same way regalloc.rs uses.
     RegLoc {
         value: 7,
         is_xmm: false,
@@ -130,7 +48,6 @@ const ARGUMENTS_GPR: &[RegLoc] = &[
     }, // r9
 ];
 
-#[cfg(target_arch = "x86_64")]
 const ARGUMENTS_XMM: &[RegLoc] = &[
     RegLoc {
         value: 0,
@@ -166,13 +83,9 @@ const ARGUMENTS_XMM: &[RegLoc] = &[
     },
 ];
 
-// ── reghint.py:29 X86RegisterHints / RegisterHints ──────────────────
-
-/// Entry point: iterate operations once and call per-opcode `consider_*`
-/// hint methods.  Mirrors x86/reghint.py:30 X86RegisterHints.add_hints.
+/// reghint.py:29 X86RegisterHints.
 pub struct RegisterHints {
     save_around_call_regs_gpr: Vec<RegLoc>,
-    save_around_call_regs_xmm: Vec<RegLoc>,
     all_regs_gpr: Vec<RegLoc>,
     all_regs_xmm: Vec<RegLoc>,
 }
@@ -180,19 +93,19 @@ pub struct RegisterHints {
 impl RegisterHints {
     pub fn new(
         save_around_call_regs_gpr: Vec<RegLoc>,
-        save_around_call_regs_xmm: Vec<RegLoc>,
+        _save_around_call_regs_xmm: Vec<RegLoc>,
         all_regs_gpr: Vec<RegLoc>,
         all_regs_xmm: Vec<RegLoc>,
     ) -> Self {
         RegisterHints {
             save_around_call_regs_gpr,
-            save_around_call_regs_xmm,
             all_regs_gpr,
             all_regs_xmm,
         }
     }
 
-    /// reghint.py:30 add_hints — main entry point called from _prepare.
+    /// reghint.py:30 `X86RegisterHints.add_hints` — main entry called
+    /// from `RegAlloc::_prepare`.
     pub fn add_hints(
         &self,
         longevity: &mut LifetimeManager,
@@ -202,31 +115,32 @@ impl RegisterHints {
         for (i, op) in operations.iter().enumerate() {
             let position = i as i32;
             match op.opcode {
-                // reghint.py:147-150 consider_call_{i,r,f,n}
-                // reghint.py:138-145 _consider_real_call — only plain calls get hinted.
+                // reghint.py:147-150 `consider_call_{i,r,f,n}` →
+                // reghint.py:138-145 `_consider_real_call` — only plain
+                // calls get hinted (oopspec helpers skipped).
                 OpCode::CallI | OpCode::CallR | OpCode::CallF | OpCode::CallN => {
                     self.consider_real_call(longevity, op, position);
                 }
-                // reghint.py:154-157 consider_call_may_force_*
+                // reghint.py:154-157 `consider_call_may_force_*`
                 OpCode::CallMayForceI
                 | OpCode::CallMayForceR
                 | OpCode::CallMayForceF
                 | OpCode::CallMayForceN => {
                     self.consider_call(longevity, op, position, true, 1);
                 }
-                // reghint.py:162-164 consider_call_release_gil_*
+                // reghint.py:162-164 `consider_call_release_gil_*`
                 OpCode::CallReleaseGilI | OpCode::CallReleaseGilF | OpCode::CallReleaseGilN => {
                     self.consider_call(longevity, op, position, true, 2);
                 }
-                // reghint.py:123-127 consider_call_malloc_nursery — x86-only reg
-                // pins (ecx, edx). aarch64 malloc nursery uses a different
-                // calling convention in opassembler; skip here for now.
+                // reghint.py:123-127 `consider_call_malloc_nursery` —
+                // pins ecx/edx.  Skipped here pending pyre's matching
+                // malloc-nursery lowering; currently unobserved.
                 _ => {}
             }
         }
     }
 
-    /// reghint.py:138 _consider_real_call — plain calls without special effect.
+    /// reghint.py:138 `_consider_real_call`.
     fn consider_real_call(&self, longevity: &mut LifetimeManager, op: &Op, position: i32) {
         let Some(descr) = op.descr.as_ref() else {
             return;
@@ -234,15 +148,14 @@ impl RegisterHints {
         let Some(calldescr) = descr.as_call_descr() else {
             return;
         };
-        // reghint.py:142-144 — skip oopspec helpers; they are hinted
-        // by their op-specific consider_* methods (math_sqrt etc.).
+        // reghint.py:142-144 skip oopspec helpers.
         if calldescr.get_extra_info().has_oopspec() {
             return;
         }
         self.consider_call(longevity, op, position, false, 1);
     }
 
-    /// reghint.py:130 _consider_call(op, position, guard_not_forced, first_arg_index).
+    /// reghint.py:130 `_consider_call`.
     fn consider_call(
         &self,
         longevity: &mut LifetimeManager,
@@ -263,8 +176,7 @@ impl RegisterHints {
         self.hint(longevity, position, args, argtypes, gc_level);
     }
 
-    /// reghint.py:207 CallHints64.hint — hint args into ABI arg regs, then
-    /// _block_non_caller_save for all other call-clobbered regs.
+    /// reghint.py:207 `CallHints64.hint`.
     fn hint(
         &self,
         longevity: &mut LifetimeManager,
@@ -304,11 +216,7 @@ impl RegisterHints {
         self.block_non_caller_save(longevity, position, save_all_regs, &hinted_gpr, &hinted_xmm);
     }
 
-    /// reghint.py:176 _block_non_caller_save.
-    ///
-    /// Reserve every caller-save GPR (and every call-clobbered XMM) at the
-    /// call position so that `free_reg_whole_lifetime` excludes them for
-    /// variables whose lifetime spans the call.
+    /// reghint.py:176 `_block_non_caller_save`.
     fn block_non_caller_save(
         &self,
         longevity: &mut LifetimeManager,
@@ -328,8 +236,7 @@ impl RegisterHints {
                 longevity.fixed_register(position, reg, None);
             }
         }
-        // reghint.py:192-194 XMM always uses all_regs (every XMM reg is
-        // caller-save on both x86-64 SysV and aarch64 AAPCS64 in pyre).
+        // reghint.py:192-194 XMM: every x86-64 XMM reg is caller-save.
         for &reg in &self.all_regs_xmm {
             if !hinted_xmm.contains(&reg) {
                 longevity.fixed_register(position, reg, None);
@@ -338,7 +245,7 @@ impl RegisterHints {
     }
 }
 
-/// x86/regalloc.py:35 compute_gc_level.
+/// x86/regalloc.py:35 `compute_gc_level`.
 fn compute_gc_level(calldescr: &dyn majit_ir::descr::CallDescr, guard_not_forced: bool) -> u8 {
     if guard_not_forced {
         return SAVE_ALL_REGS;
