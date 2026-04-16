@@ -1628,6 +1628,7 @@ impl RegAlloc {
                 self.xrm.save_around_call_regs.clone(),
                 self.rm.all_regs.clone(),
                 self.xrm.all_regs.clone(),
+                self.constants.clone(),
             );
             hints.add_hints(&mut self.longevity, inputargs, operations);
         }
