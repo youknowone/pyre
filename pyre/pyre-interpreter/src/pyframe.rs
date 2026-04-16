@@ -447,16 +447,11 @@ impl PyFrame {
             .map_or(std::ptr::null_mut(), |data| data.w_locals)
     }
 
-    /// pyframe.py:540-545 getdictscope
+    /// pyframe.py:583-588 getdictscope
     #[inline]
     pub fn getdictscope(&mut self) -> *mut PyNamespace {
-        let w_locals = self.get_w_locals();
-        if w_locals.is_null() {
-            self.getorcreate_debug_data(-1).w_locals = self.get_w_globals();
-            self.get_w_globals()
-        } else {
-            w_locals
-        }
+        self.fast2locals();
+        self.get_w_locals()
     }
 
     /// PyPy-compatible `__init__` hook.
