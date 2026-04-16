@@ -700,8 +700,8 @@ use crate::aarch64::regalloc as arch_regalloc;
 use crate::x86::regalloc as arch_regalloc;
 
 use arch_regalloc::{
-    IP1, all_core_regs, all_float_regs, call_result_fpr, call_result_gpr, core_reg_index,
-    frame_reg, save_around_call_core_regs,
+    IP1, MALLOC_NURSERY_CLOBBER, MALLOC_NURSERY_RESULT, all_core_regs, all_float_regs,
+    call_result_fpr, call_result_gpr, core_reg_index, frame_reg, save_around_call_core_regs,
 };
 
 // ── RegisterManager ────────────────────────────────────────────────
@@ -3249,12 +3249,8 @@ impl RegAlloc {
     /// aarch64/regalloc.py:958 prepare_op_call_malloc_nursery parity.
     fn consider_call_malloc_nursery(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         // aarch64/regalloc.py:962: spill_or_move_registers_before_call([r.x0, r.x1])
-        #[cfg(target_arch = "aarch64")]
-        let (r_result, r_temp) = (RegLoc::new(0, false), RegLoc::new(1, false));
-        #[cfg(target_arch = "x86_64")]
-        let (r_result, r_temp) = (RegLoc::new(0, false), RegLoc::new(1, false)); // rax, rcx
         self.rm.spill_or_move_registers_before_call(
-            &[r_result, r_temp],
+            &MALLOC_NURSERY_CLOBBER,
             &[],
             SAVE_ALL_REGS,
             &mut self.longevity,
@@ -3266,7 +3262,7 @@ impl RegAlloc {
         let result_reg = self.rm.force_allocate_reg(
             op.pos,
             &[],
-            Some(r_result),
+            Some(MALLOC_NURSERY_RESULT),
             false,
             &mut self.longevity,
             &mut self.fm,
@@ -3289,13 +3285,9 @@ impl RegAlloc {
     ) {
         // aarch64/regalloc.py:984: sizeloc = make_sure_var_in_reg(size_box)
         let sizeloc = self.make_sure_var_in_reg(op.args[0], Type::Int, &[], None, false);
-        #[cfg(target_arch = "aarch64")]
-        let (r_result, r_temp) = (RegLoc::new(0, false), RegLoc::new(1, false));
-        #[cfg(target_arch = "x86_64")]
-        let (r_result, r_temp) = (RegLoc::new(0, false), RegLoc::new(1, false));
         // aarch64/regalloc.py:985
         self.rm.spill_or_move_registers_before_call(
-            &[r_result, r_temp],
+            &MALLOC_NURSERY_CLOBBER,
             &[],
             SAVE_ALL_REGS,
             &mut self.longevity,
@@ -3307,7 +3299,7 @@ impl RegAlloc {
         let result_reg = self.rm.force_allocate_reg(
             op.pos,
             &[],
-            Some(r_result),
+            Some(MALLOC_NURSERY_RESULT),
             false,
             &mut self.longevity,
             &mut self.fm,
@@ -3322,13 +3314,9 @@ impl RegAlloc {
         i: usize,
         output: &mut Vec<RegAllocOp>,
     ) {
-        #[cfg(target_arch = "aarch64")]
-        let (r_result, r_temp) = (RegLoc::new(0, false), RegLoc::new(1, false));
-        #[cfg(target_arch = "x86_64")]
-        let (r_result, r_temp) = (RegLoc::new(0, false), RegLoc::new(1, false));
         // aarch64/regalloc.py:1016
         self.rm.spill_or_move_registers_before_call(
-            &[r_result, r_temp],
+            &MALLOC_NURSERY_CLOBBER,
             &[],
             SAVE_ALL_REGS,
             &mut self.longevity,
@@ -3340,7 +3328,7 @@ impl RegAlloc {
         let result_reg = self.rm.force_allocate_reg(
             op.pos,
             &[],
-            Some(r_result),
+            Some(MALLOC_NURSERY_RESULT),
             false,
             &mut self.longevity,
             &mut self.fm,

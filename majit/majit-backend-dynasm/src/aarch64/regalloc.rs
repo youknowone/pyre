@@ -125,3 +125,25 @@ pub const IP1: RegLoc = RegLoc {
     value: 17,
     is_xmm: false,
 };
+
+/// aarch64/regalloc.py:962 nursery-bump path clobbers `[r.x0, r.x1]`.
+/// Exported as a per-arch pair so the shared regalloc base can spill
+/// the clobbered set without branching on `cfg!`.
+pub const MALLOC_NURSERY_CLOBBER: [RegLoc; 2] = [
+    RegLoc {
+        value: 0,
+        is_xmm: false,
+    },
+    RegLoc {
+        value: 1,
+        is_xmm: false,
+    },
+];
+
+/// aarch64: result register after the nursery bump (x0).  Identical
+/// value to MALLOC_NURSERY_CLOBBER[0] but separated to document
+/// intent.
+pub const MALLOC_NURSERY_RESULT: RegLoc = RegLoc {
+    value: 0,
+    is_xmm: false,
+};
