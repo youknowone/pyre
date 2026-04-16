@@ -93,11 +93,7 @@ static EVAL_OVERRIDE: OnceLock<EvalFn> = OnceLock::new();
 type DepthBumpFn = fn() -> Option<Box<dyn std::any::Any>>;
 static DEPTH_BUMP_OVERRIDE: OnceLock<DepthBumpFn> = OnceLock::new();
 
-type InlineCallOverrideFn = fn(&PyFrame, PyObjectRef, &[PyObjectRef]) -> Option<PyResult>;
-static INLINE_CALL_OVERRIDE: OnceLock<InlineCallOverrideFn> = OnceLock::new();
-
 thread_local! {
-    static INLINE_CALL_OVERRIDE_DEPTH: Cell<u32> = const { Cell::new(0) };
     /// Call depth counter — incremented on every user function call,
     /// decremented on return. Replaces the Box<dyn Any> depth bump
     /// callback with a zero-allocation TLS increment.
@@ -162,76 +158,6 @@ pub fn force_plain_eval() -> ForcePlainEvalGuard {
 /// Register the JIT call-depth bump function. Called by pyre-jit at startup.
 pub fn register_depth_bump(f: DepthBumpFn) {
     let _ = DEPTH_BUMP_OVERRIDE.set(f);
-}
-
-/// Register an inline-only concrete call override. Called by pyre-jit at startup.
-pub fn register_inline_call_override(f: InlineCallOverrideFn) {
-    let _ = INLINE_CALL_OVERRIDE.set(f);
-}
-
-pub struct InlineCallOverrideGuard;
-
-impl Drop for InlineCallOverrideGuard {
-    fn drop(&mut self) {
-        INLINE_CALL_OVERRIDE_DEPTH.with(|d| d.set(d.get() - 1));
-    }
-}
-
-/// Enable the inline concrete-call override for the current thread.
-pub fn inline_call_override_guard() -> InlineCallOverrideGuard {
-    INLINE_CALL_OVERRIDE_DEPTH.with(|d| d.set(d.get() + 1));
-    InlineCallOverrideGuard
-}
-
-pub struct SuspendInlineCallOverrideGuard {
-    previous_depth: u32,
-}
-
-impl Drop for SuspendInlineCallOverrideGuard {
-    fn drop(&mut self) {
-        INLINE_CALL_OVERRIDE_DEPTH.with(|d| d.set(self.previous_depth));
-    }
-}
-
-/// Temporarily disable the inline concrete-call override for the current
-/// thread. Helper-boundary fallback execution must not accidentally reuse
-/// the outer inline trace's concrete-call interception seam.
-pub fn suspend_inline_call_override() -> SuspendInlineCallOverrideGuard {
-    let previous_depth = INLINE_CALL_OVERRIDE_DEPTH.with(|d| {
-        let previous = d.get();
-        d.set(0);
-        previous
-    });
-    SuspendInlineCallOverrideGuard { previous_depth }
-}
-
-pub struct SuspendInlineHandledResultGuard;
-
-impl Drop for SuspendInlineHandledResultGuard {
-    fn drop(&mut self) {}
-}
-
-/// Temporarily isolate inline-result replay from helper-boundary execution.
-///
-/// Results are now owned by the concrete caller frame, so helper-boundary
-/// interpreters no longer share a thread-global result channel. The guard
-/// remains as an explicit protocol marker for residual-call slow paths.
-pub fn suspend_inline_handled_result() -> SuspendInlineHandledResultGuard {
-    SuspendInlineHandledResultGuard
-}
-
-fn try_inline_call_override(
-    frame: &PyFrame,
-    callable: PyObjectRef,
-    args: &[PyObjectRef],
-) -> Option<PyResult> {
-    let enabled = INLINE_CALL_OVERRIDE_DEPTH.with(|d| d.get() > 0);
-    if !enabled {
-        return None;
-    }
-    INLINE_CALL_OVERRIDE
-        .get()
-        .and_then(|override_fn| override_fn(frame, callable, args))
 }
 
 fn call_user_function_with_eval(
@@ -449,10 +375,6 @@ pub fn call_user_function(
     callable: PyObjectRef,
     args: &[PyObjectRef],
 ) -> PyResult {
-    if let Some(result) = try_inline_call_override(frame, callable, args) {
-        return result;
-    }
-
     // Direct TLS increment — no Box allocation. Replaces DEPTH_BUMP_OVERRIDE callback.
     CALL_DEPTH.with(|d| d.set(d.get() + 1));
     let _depth_guard = CallDepthGuard;
@@ -506,7 +428,6 @@ pub fn call_callable_inline_residual(
     callable: PyObjectRef,
     args: &[PyObjectRef],
 ) -> PyResult {
-    let _suspend_inline_result = suspend_inline_handled_result();
     if unsafe { pyre_object::is_method(callable) } {
         let func = unsafe { pyre_object::w_method_get_func(callable) };
         let receiver = unsafe {

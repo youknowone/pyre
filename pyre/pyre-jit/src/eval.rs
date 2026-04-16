@@ -962,9 +962,6 @@ fn eval_with_jit_inner(frame: &mut PyFrame) -> PyResult {
         return pyre_interpreter::eval::eval_frame_plain(frame);
     }
     pyre_interpreter::call::register_eval_override(eval_with_jit);
-    pyre_interpreter::call::register_inline_call_override(
-        crate::call_jit::maybe_handle_inline_concrete_call,
-    );
     #[cfg(not(target_arch = "wasm32"))]
     crate::call_jit::install_jit_call_bridge();
     init_callbacks();

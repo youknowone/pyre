@@ -118,96 +118,6 @@ pub(crate) fn recursive_force_cache_safe(callable: PyObjectRef) -> bool {
     true
 }
 
-/// Whether this concrete frame is a good candidate for immediate
-/// function-entry tracing as a self-recursive pure function.
-///
-/// We reuse the same closure-free / globals-only recursive check as the
-/// raw recursive helper path, but discover the function object from the
-/// frame's shared globals namespace. This lets eval-time function-entry
-/// tracing converge earlier, closer to PyPy's recursive functrace path.
-pub(crate) fn self_recursive_function_entry_candidate(frame: &PyFrame) -> bool {
-    if frame.next_instr() != 0 {
-        return false;
-    }
-    let namespace_ptr = frame.w_globals;
-    let Some(namespace) = (!namespace_ptr.is_null()).then_some(unsafe { &*namespace_ptr }) else {
-        return false;
-    };
-    let w_code = frame.pycode;
-
-    for idx in 0..namespace.len() {
-        let Some(value) = namespace.get_slot(idx) else {
-            continue;
-        };
-        if value.is_null() {
-            continue;
-        }
-        let is_candidate = unsafe {
-            is_function(value)
-                && pyre_interpreter::getcode(value) == w_code
-                && function_get_globals(value) == namespace_ptr
-                && function_get_closure(value).is_null()
-        };
-        if is_candidate && recursive_force_cache_safe(value) {
-            return true;
-        }
-    }
-
-    false
-}
-
-/// Whether calling this function should prefer its own function-entry portal
-/// over caller-side trace-through.
-///
-/// This mirrors `self_recursive_function_entry_candidate(frame)` but starts
-/// Inline concrete-call override used only while `inline_trace_and_execute`
-/// is running. This avoids recursing back through `call_user_function()` for
-/// closure-free recursive calls and keeps concrete execution closer to
-/// PyPy's frame-switch behavior.
-pub fn maybe_handle_inline_concrete_call(
-    frame: &PyFrame,
-    callable: PyObjectRef,
-    args: &[PyObjectRef],
-) -> Option<PyResult> {
-    if args.len() != 1 || !unsafe { is_function(callable) } {
-        return None;
-    }
-    let arg0 = args[0];
-    if arg0.is_null() || !unsafe { is_int(arg0) } {
-        return None;
-    }
-    if !recursive_force_cache_safe(callable) {
-        return None;
-    }
-    let callable_globals = unsafe { function_get_globals(callable) };
-    if callable_globals != frame.w_globals || !unsafe { function_get_closure(callable) }.is_null() {
-        return None;
-    }
-
-    let raw_arg = unsafe { w_int_get_value(arg0) };
-    let w_code = unsafe { pyre_interpreter::getcode(callable) };
-    let green_key = crate::eval::make_green_key(w_code, 0);
-    // Inline concrete execution sometimes falls back to a helper-boundary
-    // recursive call instead of a real frame switch. That helper must run as
-    // plain concrete execution: if it reuses the outer inline override or the
-    // outer trace's merge-point path, it will keep tracing against the wrong
-    // symbolic frame and corrupt concrete stack reads.
-    let _suspend_inline_override = pyre_interpreter::call::suspend_inline_call_override();
-    let _suspend_inline_result = pyre_interpreter::call::suspend_inline_handled_result();
-    // Depth tracked by pyre_interpreter::call::CALL_DEPTH (call_user_function path).
-    // RPython blackhole.py:1095: bhimpl_recursive_call → portal_runner
-    // CAN enter JIT. JIT_TRACING_DEPTH prevents re-entrant tracing,
-    // so nested calls safely enter compiled code without force_plain_eval.
-    let forced = if w_code == frame.pycode {
-        jit_force_self_recursive_call_raw_1(frame as *const PyFrame as i64, raw_arg)
-    } else {
-        jit_force_recursive_call_raw_1(frame as *const PyFrame as i64, callable as i64, raw_arg)
-    };
-    // warmspot.py:449 result_type=REF: force always returns boxed Ref
-    let result = forced as PyObjectRef;
-    Some(Ok(result))
-}
-
 fn recursive_dispatch(callable: PyObjectRef, green_key: u64) -> (Option<u64>, bool) {
     RECURSIVE_DISPATCH_CACHE.with(|cell| unsafe {
         let slot = &mut *cell.get();
@@ -432,7 +342,6 @@ extern "C" fn jit_call_user_function_from_frame(
     let frame = unsafe { &*(frame_ptr as *const PyFrame) };
     let args =
         unsafe { std::slice::from_raw_parts(args_ptr as *const PyObjectRef, nargs as usize) };
-    let _suspend_inline_override = pyre_interpreter::call::suspend_inline_call_override();
     // Depth tracked by pyre_interpreter::call::CALL_DEPTH (call_user_function path).
     match pyre_interpreter::call::call_user_function(frame, callable as PyObjectRef, args) {
         Ok(result) => result as i64,
@@ -442,7 +351,6 @@ extern "C" fn jit_call_user_function_from_frame(
 
 #[majit_macros::jit_may_force]
 pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
-    let _suspend_inline_result = pyre_interpreter::call::suspend_inline_handled_result();
     #[cfg(feature = "cranelift")]
     let _ = majit_backend_cranelift::take_pending_frame_restore();
     #[cfg(feature = "cranelift")]
@@ -535,7 +443,6 @@ pub extern "C" fn assembler_call_helper(jitframe_ptr: i64, _virtualizable_ref: i
 }
 
 fn jit_force_callee_frame_raw(frame_ptr: i64) -> i64 {
-    let _suspend_inline_result = pyre_interpreter::call::suspend_inline_handled_result();
     let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
 
     let green_key = crate::eval::make_green_key(frame.pycode, frame.next_instr());
@@ -587,7 +494,6 @@ fn jit_force_callee_frame_raw(frame_ptr: i64) -> i64 {
 /// Interpreter-only force: used by execute_call_assembler_direct
 /// to handle guard failures without recursive compiled dispatch.
 extern "C" fn jit_force_callee_frame_interp(frame_ptr: i64) -> i64 {
-    let _suspend_inline_result = pyre_interpreter::call::suspend_inline_handled_result();
     // RPython: blackhole interp — no blackhole_entry_bump needed.
     let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
 
@@ -1468,7 +1374,6 @@ pub extern "C" fn jit_force_recursive_call_argraw_boxed_1(
     callable: i64,
     raw_int_arg: i64,
 ) -> i64 {
-    let _suspend_inline_result = pyre_interpreter::call::suspend_inline_handled_result();
     let callable_ref = callable as PyObjectRef;
     let w_code = unsafe { pyre_interpreter::getcode(callable_ref) };
     let green_key = crate::eval::make_green_key(w_code, 0);
@@ -1486,7 +1391,6 @@ pub extern "C" fn jit_force_recursive_call_argraw_boxed_1(
 ///
 #[majit_macros::dont_look_inside]
 pub extern "C" fn jit_force_self_recursive_call_1(caller_frame: i64, boxed_arg: i64) -> i64 {
-    let _suspend_inline_result = pyre_interpreter::call::suspend_inline_handled_result();
     let boxed_arg_ref = boxed_arg as PyObjectRef;
     if caller_frame == 0 {
         return boxed_arg;
@@ -1516,7 +1420,6 @@ pub extern "C" fn jit_force_self_recursive_call_argraw_boxed_1(
     caller_frame: i64,
     raw_int_arg: i64,
 ) -> i64 {
-    let _suspend_inline_result = pyre_interpreter::call::suspend_inline_handled_result();
     let caller = unsafe { &*(caller_frame as *const PyFrame) };
     let green_key = crate::eval::make_green_key(caller.pycode, 0);
     // result_type=REF: box the int arg, dispatch as boxed Ref
@@ -1537,7 +1440,6 @@ pub extern "C" fn jit_force_recursive_call_raw_1(
     callable: i64,
     raw_int_arg: i64,
 ) -> i64 {
-    let _suspend_inline_result = pyre_interpreter::call::suspend_inline_handled_result();
     let callable_ref = callable as PyObjectRef;
     let w_code = unsafe { pyre_interpreter::getcode(callable_ref) };
     let green_key = crate::eval::make_green_key(w_code, 0);
@@ -1577,7 +1479,6 @@ pub extern "C" fn jit_force_recursive_call_raw_1(
 /// calls re-enter compiled code through the normal portal runner path.
 #[majit_macros::dont_look_inside]
 pub extern "C" fn jit_force_self_recursive_call_raw_1(caller_frame: i64, raw_int_arg: i64) -> i64 {
-    let _suspend_inline_result = pyre_interpreter::call::suspend_inline_handled_result();
     if majit_metainterp::majit_log_enabled() && raw_int_arg <= 4 {
         eprintln!("[jit][force-self-recursive] enter arg={}", raw_int_arg);
     }

@@ -53,7 +53,6 @@ pub struct PyreMetaInterp {
     pub portal_call_depth: i32,
     pub jitcode: *const (),
     pub namespace: *mut pyre_interpreter::PyNamespace,
-    inline_call_guard: Option<pyre_interpreter::call::InlineCallOverrideGuard>,
     inline_trace_base: usize,
 }
 
@@ -64,7 +63,6 @@ impl PyreMetaInterp {
             portal_call_depth: -1,
             jitcode,
             namespace,
-            inline_call_guard: None,
             inline_trace_base: 0,
         }
     }
@@ -333,10 +331,6 @@ impl PyreMetaInterp {
         pending: PendingInlineFrame,
         caller_result_idx: Option<usize>,
     ) {
-        if self.inline_call_guard.is_none() {
-            self.inline_call_guard = Some(pyre_interpreter::call::inline_call_override_guard());
-        }
-
         let (driver, _) = crate::driver::driver_pair();
         driver.enter_inline_frame(pending.green_key);
         ctx.push_inline_trace_position(pending.green_key);
@@ -409,11 +403,6 @@ impl PyreMetaInterp {
 
         let (driver, _) = crate::driver::driver_pair();
         driver.leave_inline_frame();
-
-        // Release inline call guard when all inline frames are gone
-        if !self.framestack.iter().any(|f| f.is_inline()) {
-            self.inline_call_guard = None;
-        }
 
         if self.framestack.is_empty() {
             return; // shouldn't happen: root never produces Finish
@@ -654,10 +643,6 @@ impl PyreMetaInterp {
                     parent_sym.class_of_last_exc_is_const = exc_const;
                 }
 
-                // Release inline call guard when all inline frames gone
-                if !self.framestack.iter().any(|f| f.is_inline()) {
-                    self.inline_call_guard = None;
-                }
                 continue; // check parent frame
             }
 
