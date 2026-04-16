@@ -5047,22 +5047,13 @@ fn generator_send_ex(gen_obj: PyObjectRef, w_arg: PyObjectRef, operr: Option<PyE
 
         match result {
             Ok(value) => {
-                // Distinguish yield vs return
-                let code = &*crate::pyframe_get_pycode(&*frame);
-                let pc = frame.next_instr();
-                let is_yield = if pc < code.instructions.len() {
-                    matches!(
-                        code.instructions[pc].op,
-                        crate::Instruction::YieldValue { .. }
-                    )
-                } else {
-                    false
-                };
-                if is_yield {
-                    Ok(value)
-                } else {
+                // generator.py:109-114 — if the frame marked itself finished,
+                // it was RETURNed from; otherwise it YIELDed.
+                if frame.frame_finished_execution {
                     w_generator_set_exhausted(gen_obj);
                     Err(PyError::stop_iteration())
+                } else {
+                    Ok(value)
                 }
             }
             Err(e) => {
