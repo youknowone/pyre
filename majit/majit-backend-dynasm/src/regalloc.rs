@@ -727,20 +727,14 @@ fn all_core_regs() -> Vec<RegLoc> {
     // aarch64/registers.py:14
     //   all_regs = registers[:14] + [x19, x20] #, x21, x22]
     //
-    // Upstream leaves `, x21, x22` commented out, which caps the
-    // callee-save pool at two.  Two is enough for RPython's typical
-    // trace shape but too small on pyre traces where several
-    // simultaneously-live loop-carried values cross an inner call
-    // (fib_loop: n, a, b, i are all live across the int_add helper).
-    // In that situation free_reg_whole_lifetime finds no fitting
-    // callee-save and try_pick_free_reg falls back to
-    // longest_free_reg, which picks a caller-save that the call
-    // immediately clobbers.  We activate upstream's own commented
-    // suggestion with x21, x22 to grow the pool to four while
-    // staying a strict subset of AAPCS64 x19..x28.  The
-    // prologue/epilogue stp/ldp pairs in aarch64/assembler.rs
-    // _call_header/_call_footer and JITFRAME_FIXED_SIZE in arch.rs
-    // are updated in lockstep.
+    // Activates upstream's commented-out `, x21, x22` extension.
+    // Empirically required (parity audit follow-up): with only x19/x20
+    // the four loop-carried values in fib_loop (n, a, b, i) cannot fit
+    // in callee-save and longest_free_reg's caller-save fallback then
+    // selects an x-reg the inner int_add helper clobbers.  Stays a
+    // strict subset of AAPCS64 x19..x28 and matches the size in
+    // arch.rs `JITFRAME_FIXED_SIZE` plus the prologue/epilogue stp/ldp
+    // pairs in aarch64/assembler.rs `_call_header` / `_call_footer`.
     vec![
         RegLoc::new(0, false),
         RegLoc::new(1, false),
@@ -1745,15 +1739,15 @@ impl RegAlloc {
         }
         // x86/regalloc.py:191 X86RegisterHints().add_hints(longevity, inputargs, operations)
         //
-        // Verified empirically (parity audit follow-up): gating this
-        // to #[cfg(target_arch = "x86_64")] regresses dynasm fib_loop
-        // even after the callee-save pool was grown to four with
-        // x21, x22.  longest_free_reg's caller-save fallback still
-        // fires when free_reg_whole_lifetime sees no qualifying
-        // callee-save, so the hints are load-bearing on aarch64 too.
-        // Upstream aarch64 ships no reghint.py — this is a documented
-        // deviation: the call-hint mechanism is ABI-driven and the
-        // same shape on aarch64.  See reghint.rs module docs.
+        // Upstream `rpython/jit/backend/x86/reghint.py` is x86-only.  pyre
+        // also runs reghint on aarch64 because — even after the
+        // arch-aligned LABEL hint code (frame-only) and the callee-save
+        // pool extension — without call-position fixed_register entries,
+        // free_reg_whole_lifetime sees caller-save regs as "always free"
+        // and longest_free_reg picks them for loop-invariants that span
+        // calls.  The mechanism is ABI-driven so it applies on aarch64
+        // identically; this remains a documented NEW-DEVIATION pending
+        // an upstream port of reghint.py to aarch64.
         let hints = crate::reghint::RegisterHints::new(
             self.rm.save_around_call_regs.clone(),
             self.xrm.save_around_call_regs.clone(),
@@ -1816,7 +1810,11 @@ impl RegAlloc {
         }
     }
 
-    /// x86/regalloc.py:1284 _compute_hint_locations_from_descr.
+    /// x86/regalloc.py:1284 _compute_hint_locations_from_descr /
+    /// aarch64/regalloc.py:286 _compute_hint_frame_locations_from_descr.
+    ///
+    /// x86 hints both Frame and Reg targets; aarch64 only hints Frame.
+    /// Mirror per-arch via #[cfg].
     fn _compute_hint_locations_from_descr(&mut self, descr: &dyn majit_ir::descr::LoopTargetDescr) {
         use majit_ir::descr::TargetArgLoc;
         let Some((_, jump_args)) = self.final_jump_args.clone() else {
@@ -1826,7 +1824,9 @@ impl RegAlloc {
         if target_arglocs.len() != jump_args.len() {
             return;
         }
+        #[cfg(target_arch = "x86_64")]
         let position = self.final_jump_op_position;
+        #[cfg(target_arch = "x86_64")]
         let mut hinted: Vec<OpRef> = Vec::new();
         for (arg, target) in jump_args.iter().zip(target_arglocs.iter()) {
             if arg.is_constant() {
@@ -1841,6 +1841,7 @@ impl RegAlloc {
                     let f = crate::regloc::FrameLoc::new(pos, ebp_offset, is_float);
                     self.fm.add_frame_pos_hint(*arg, f, &mut self.longevity);
                 }
+                #[cfg(target_arch = "x86_64")]
                 TargetArgLoc::Reg { regnum, is_xmm } => {
                     if !hinted.contains(arg) {
                         hinted.push(*arg);
@@ -3531,15 +3532,24 @@ impl RegAlloc {
             locs.push(loc);
         }
 
-        // x86/regalloc.py:1407-1409: if final_jump_op.getdescr() is descr
-        //   → _compute_hint_locations_from_descr(descr).
+        // x86/regalloc.py:1407-1409 / aarch64/regalloc.py:712-715
+        //   if final_jump_op.getdescr() is descr →
+        //     _compute_hint_{frame_,}locations_from_descr(descr)
         //
-        // Same-loop case: the closing JUMP targets this very Label and was
-        // pre-scanned by `compute_hint_frame_locations` into
-        // `final_jump_args` / `final_jump_op_position`. At this point the
-        // Label's target_arglocs are known (just built into `locs`), so we
-        // can now emit frame hints AND pin reg hints via `fixed_register`
-        // exactly like _compute_hint_locations_from_descr does.
+        // Same-loop case: the closing JUMP targets this very Label.
+        // Hints come from the Label's target_arglocs (just built into
+        // `locs`) — what each inputarg's *desired* location at the
+        // back-edge is.
+        //
+        // The two upstream backends differ on what is hinted:
+        //   x86/regalloc.py:1284-1301 _compute_hint_locations_from_descr
+        //     hints BOTH FrameLoc → add_frame_pos_hint AND
+        //     RegLoc → longevity.fixed_register
+        //   aarch64/regalloc.py:286-295 _compute_hint_frame_locations_from_descr
+        //     hints ONLY FrameLoc (`if loc.is_stack()`); reg hints are
+        //     intentionally not emitted on aarch64
+        //
+        // Mirror the per-arch difference exactly via #[cfg].
         if let Some(label_id) = op.descr.as_ref().map(descr_identity) {
             if self
                 .final_jump_args
@@ -3547,7 +3557,9 @@ impl RegAlloc {
                 .is_some_and(|(jump_id, _)| *jump_id == label_id)
             {
                 let jump_args = self.final_jump_args.as_ref().unwrap().1.clone();
+                #[cfg(target_arch = "x86_64")]
                 let position = self.final_jump_op_position;
+                #[cfg(target_arch = "x86_64")]
                 let mut hinted: Vec<OpRef> = Vec::new();
                 for (iarg, target_loc) in jump_args.iter().zip(locs.iter()) {
                     if iarg.is_constant() {
@@ -3558,6 +3570,7 @@ impl RegAlloc {
                             self.fm
                                 .add_frame_pos_hint(*iarg, frame_loc, &mut self.longevity);
                         }
+                        #[cfg(target_arch = "x86_64")]
                         Loc::Reg(r) => {
                             if !hinted.contains(iarg) {
                                 hinted.push(*iarg);

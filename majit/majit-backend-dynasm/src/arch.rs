@@ -42,9 +42,9 @@ pub const PASS_ON_MY_FRAME: usize = 0;
 pub const JITFRAME_FIXED_SIZE: usize = 28;
 /// aarch64/arch.py:13 — NUM_MANAGED_REGS + NUM_VFP_REGS
 ///
-/// pyre grows NUM_MANAGED_REGS from upstream's 16 to 18 to uncomment
-/// aarch64/registers.py:14's `#, x21, x22]` hint (see regalloc.rs
-/// `all_core_regs`).  Values: 18 GPR + 8 VFP = 26.
+/// pyre grows NUM_MANAGED_REGS from upstream's 16 to 18 to activate
+/// aarch64/registers.py:14's commented `, x21, x22]` extension (see
+/// regalloc.rs `all_core_regs`).  Values: 18 GPR + 8 VFP = 26.
 #[cfg(target_arch = "aarch64")]
 pub const JITFRAME_FIXED_SIZE: usize = 26;
 
