@@ -295,6 +295,13 @@ fn dispatch_op(
             let reds_r = expect_list_regs(&args[2], Kind::Ref);
             state.builder.jit_merge_point(&greens_i, &greens_r, &reds_r);
         }
+        "jump_target" => {
+            // pyre-only marker: loop-header entry point that isn't a
+            // jit_merge_point. RPython uses plain `Label` entries; pyre
+            // emits a dedicated BC_JUMP_TARGET so the runtime dispatch
+            // loop can recognise loop heads cheaply.
+            state.builder.jump_target();
+        }
         "ref_return" => {
             let src = expect_result_or_first_reg(args, result, Kind::Ref);
             state.builder.ref_return(src);
@@ -401,35 +408,39 @@ fn dispatch_op(
                 expect_reg(&args[2], Kind::Int),
             );
         }
-        "vable_getfield_i" => {
+        // RPython opname parity (jtransform.py:765-927, blackhole.py:1374-1493):
+        // SpaceOperation names use `*_vable_*` infix. pyre's JitCodeBuilder
+        // methods retain `vable_*` prefix as a PRE-EXISTING-ADAPTATION so
+        // the rename is scoped to the Insn::Op key.
+        "getfield_vable_i" => {
             let dst = expect_result_or_first_reg(args, result, Kind::Int);
             state
                 .builder
                 .vable_getfield_int(dst, expect_small_u16(&args[0]));
         }
-        "vable_getfield_r" => {
+        "getfield_vable_r" => {
             let dst = expect_result_or_first_reg(args, result, Kind::Ref);
             state
                 .builder
                 .vable_getfield_ref(dst, expect_small_u16(&args[0]));
         }
-        "vable_getfield_f" => {
+        "getfield_vable_f" => {
             let dst = expect_result_or_first_reg(args, result, Kind::Float);
             state
                 .builder
                 .vable_getfield_float(dst, expect_small_u16(&args[0]));
         }
-        "vable_setfield_i" => state
+        "setfield_vable_i" => state
             .builder
             .vable_setfield_int(expect_small_u16(&args[0]), expect_reg(&args[1], Kind::Int)),
-        "vable_setfield_r" => state
+        "setfield_vable_r" => state
             .builder
             .vable_setfield_ref(expect_small_u16(&args[0]), expect_reg(&args[1], Kind::Ref)),
-        "vable_setfield_f" => state.builder.vable_setfield_float(
+        "setfield_vable_f" => state.builder.vable_setfield_float(
             expect_small_u16(&args[0]),
             expect_reg(&args[1], Kind::Float),
         ),
-        "vable_getarrayitem_i" => {
+        "getarrayitem_vable_i" => {
             let dst = expect_result_or_first_reg(args, result, Kind::Int);
             state.builder.vable_getarrayitem_int(
                 dst,
@@ -437,7 +448,7 @@ fn dispatch_op(
                 expect_reg(&args[1], Kind::Int),
             );
         }
-        "vable_getarrayitem_r" => {
+        "getarrayitem_vable_r" => {
             let dst = expect_result_or_first_reg(args, result, Kind::Ref);
             state.builder.vable_getarrayitem_ref(
                 dst,
@@ -445,7 +456,7 @@ fn dispatch_op(
                 expect_reg(&args[1], Kind::Int),
             );
         }
-        "vable_getarrayitem_f" => {
+        "getarrayitem_vable_f" => {
             let dst = expect_result_or_first_reg(args, result, Kind::Float);
             state.builder.vable_getarrayitem_float(
                 dst,
@@ -453,17 +464,17 @@ fn dispatch_op(
                 expect_reg(&args[1], Kind::Int),
             );
         }
-        "vable_setarrayitem_i" => state.builder.vable_setarrayitem_int(
+        "setarrayitem_vable_i" => state.builder.vable_setarrayitem_int(
             expect_small_u16(&args[0]),
             expect_reg(&args[1], Kind::Int),
             expect_reg(&args[2], Kind::Int),
         ),
-        "vable_setarrayitem_r" => state.builder.vable_setarrayitem_ref(
+        "setarrayitem_vable_r" => state.builder.vable_setarrayitem_ref(
             expect_small_u16(&args[0]),
             expect_reg(&args[1], Kind::Int),
             expect_reg(&args[2], Kind::Ref),
         ),
-        "vable_setarrayitem_f" => state.builder.vable_setarrayitem_float(
+        "setarrayitem_vable_f" => state.builder.vable_setarrayitem_float(
             expect_small_u16(&args[0]),
             expect_reg(&args[1], Kind::Int),
             expect_reg(&args[2], Kind::Float),

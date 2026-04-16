@@ -204,14 +204,27 @@ compute_liveness에서 나옵니다.
 - **Phase 3a ✓** — `assembler.rs` skeleton 완료. `assemble(ssarepr, ...)` +
   `write_insn` + `dispatch_op` 프레임워크. 현재 dispatch 테이블은 비어있고,
   unknown opname에 panic — 회귀 방지용 가드.
-- **Phase 3b (진행 중)** — pyre의 bytecode walker (`codewriter.rs` 약 700줄)를
-  `assembler.xxx()` 직접 호출에서 `Insn::Op` 생성으로 전환. 각 핸들러마다:
-  1. `Insn::Op { opname, args, result }` 를 `SSARepr.insns` 에 push
-  2. `assembler.rs`의 `dispatch_op` 에 `opname` match arm 추가
-  3. 출력 `JitCode` bit-identical 검증
-- **Phase 3c (예정)** — Phase 3b 완료 후 `transform_graph_to_jitcode` 의 최종
-  형태: `flatten(code) -> SSARepr` + `assemble(ssarepr, ...)`. 중간 단계에서는
-  SSARepr 생성과 assembler 직접 호출을 병행할 수 있음.
+- **Phase 3b ✓ (2026-04-16)** — pyre의 bytecode walker
+  (`codewriter.rs` 약 700줄) 가 `Insn::Op` / `Insn::Label` /
+  `Insn::Live` / `Insn::Unreachable` 을 매 byte 단위로 dual-emit.
+  10개 commit 으로 분할됨:
+  1. 스캐폴드 + `abort_permanent`
+  2. `vable_*` → `*_vable_*` opname rename (assembler.rs)
+  3. `ref_return` / `goto` / `raise` / `reraise`
+  4. `LoadFast` / `StoreFast` / `PushNull`
+  5. super-instructions + `Copy(d=1)` + `PushExcInfo`
+  6. `LoadSmallInt` / `LoadConst` / `BinaryOp` / `CompareOp` / `StoreSubscr`
+  7. `PopJumpIfFalse`/`True` + `UnaryNegative`
+  8. `LoadGlobal` / `Call` / `BuildList` / `CheckExcMatch`
+  9. `emit_vsd` 내부 전환 + catch landing pads
+  10. `Insn::Label` per-pc + `Insn::Live` per-pc + `jit_merge_point` +
+      `jump_target` (pyre-only)
+  `pyre/check.sh` 14/14 + 14/14 bit-identical throughout every commit.
+- **Phase 3c (진행 예정)** — direct-builder call 제거. `transform_graph_to_jitcode`
+  의 최종 형태: `flatten(code) -> SSARepr` + `Assembler::assemble(&mut ssarepr, ...)`.
+  dual-emit 의 JitCodeBuilder 호출을 매크로에서 걷어내고, 함수 말미의
+  `assembler.finish()` 를 `assembler.rs::Assembler::assemble` 로 교체. bit-identical
+  출력을 재확인하면 완료.
 - **Phase 4 (예정)** — `compute_liveness(ssarepr)` 을 pyre의 기존 `LiveVars`
   기반 liveness 경로와 교체. `-live-` emit 위치를 모든 Python PC에서
   guard/residual-call/exception-edge 로 한정. B3 해소.
