@@ -1,65 +1,19 @@
-//! Line-by-line port of `rpython/jit/codewriter/assembler.py` — the
-//! `Assembler.assemble(ssarepr, jitcode, num_regs)` driver.
+//! Line-by-line port of `rpython/jit/codewriter/assembler.py`.
 //!
-//! Consumes an `SSARepr` (see `super::flatten`) and produces a finished
-//! `JitCode`. The bytecode-emission primitives (`emit_reg`, `emit_const`,
-//! label fixup) still live on `majit_metainterp::jitcode::JitCodeBuilder`
-//! — this module is the high-level dispatcher that walks
-//! `ssarepr.insns` and forwards each `Insn` to the correct builder call,
-//! mirroring `assembler.py:34-54`.
-//!
-//! Status — Phase 3a: framework + a subset of the opname dispatch table.
-//! The pyre bytecode walker currently emits directly into
-//! `JitCodeBuilder`; the migration strategy is:
-//!   1. Extend this dispatch table until every opcode pyre emits has a
-//!      `(opname, argcodes) -> builder call` mapping.
-//!   2. Refactor `codewriter.rs::transform_graph_to_jitcode` to build an
-//!      `SSARepr` (Phase 3b) instead of driving `JitCodeBuilder` directly.
-//!   3. Route both paths through `assemble()` here (Phase 3c).
-//!
-//! Phases 3b/3c are tracked in `B6_CODEWRITER_PIPELINE_PLAN.md`. The
-//! current implementation only builds the dispatch skeleton; calling
-//! `assemble` on a non-empty `SSARepr` with an unported opname panics so
-//! the gap is visible rather than silent.
+//! This module mirrors the high-level `Assembler` flow from RPython:
+//! `setup()` → `write_insn()` → `fix_labels()` → `check_result()` →
+//! `make_jitcode()`. pyre still targets `majit_metainterp::jitcode::JitCode`
+//! and its fixed `BC_*` builder API, so regular-op dispatch lowers the
+//! textual `SSARepr` opnames into `JitCodeBuilder` calls instead of growing
+//! `self.insns` into a runtime opcode table.
 
-use majit_metainterp::jitcode::{JitCode, JitCodeBuilder};
+use std::collections::HashMap;
 
-use super::flatten::{Insn, Kind, Operand, Register, SSARepr};
+use majit_codewriter::jitcode::BhDescr;
+use majit_metainterp::jitcode::{JitCallArg, JitCode, JitCodeBuilder};
 
-/// `assembler.py:34-54` `Assembler.assemble(self, ssarepr, jitcode=None, num_regs=None)`.
-///
-/// Walks `ssarepr.insns`, dispatches each `Insn` to the matching builder
-/// call, fixes up labels, and returns the finished `JitCode`. The
-/// `num_regs` overrides are applied before emission so the per-kind
-/// register-file sizes match the caller's regalloc output.
-///
-/// The `assembler` argument is pre-populated by the caller with the
-/// pyre-specific helper-function table (fn_ptrs) and any other
-/// builder-state that doesn't come from the SSARepr. This mirrors
-/// RPython where the `CodeWriter` holds a reusable `Assembler` instance
-/// across multiple `assemble` calls.
-pub fn assemble(
-    ssarepr: &SSARepr,
-    mut assembler: JitCodeBuilder,
-    num_regs: Option<NumRegs>,
-) -> JitCode {
-    if let Some(nr) = num_regs {
-        assembler.ensure_i_regs(nr.int);
-        assembler.ensure_r_regs(nr.ref_);
-        assembler.ensure_f_regs(nr.float);
-    }
-    assembler.set_name(ssarepr.name.clone());
-
-    for insn in &ssarepr.insns {
-        write_insn(&mut assembler, insn);
-    }
-
-    // Label fixup + finalisation. `JitCodeBuilder::finish` already performs
-    // label patching internally, so the explicit `fix_labels` /
-    // `check_result` calls from `assembler.py:45-46` are folded into
-    // `finish`.
-    assembler.finish()
-}
+use super::flatten::{DescrOperand, Insn, Kind, ListOfKind, Operand, Register, SSARepr, TLabel};
+use super::liveness::encode_liveness;
 
 /// `assembler.py:65` `count_regs = dict.fromkeys(KINDS, 0)` override.
 #[derive(Debug, Clone, Copy, Default)]
@@ -69,91 +23,858 @@ pub struct NumRegs {
     pub float: u16,
 }
 
-/// `assembler.py:140-158,215-223` `write_insn(insn)`.
+/// `assembler.py:19-32` `class Assembler(object)`.
 ///
-/// Dispatches on the tuple shape. RPython's path looks up
-/// `opname+argcodes` in `self.insns` and auto-assigns an opcode number;
-/// pyre uses a fixed `BC_*` opcode table, so the dispatch is a match on
-/// `opname + collected argcodes`.
+/// The persistent state kept across multiple `assemble()` calls matches the
+/// RPython fields that are semantically shared across jitcodes: the deduped
+/// `all_liveness` table and liveness statistics.
+#[derive(Debug, Default)]
+pub struct Assembler {
+    /// `assembler.py:29` `self.all_liveness = []`.
+    all_liveness: Vec<u8>,
+    /// `assembler.py:30` `self.all_liveness_length = 0`.
+    pub all_liveness_length: usize,
+    /// `assembler.py:31` `self.all_liveness_positions = {}`.
+    all_liveness_positions: HashMap<(Vec<u8>, Vec<u8>, Vec<u8>), usize>,
+    /// `assembler.py:32` `self.num_liveness_ops = 0`.
+    pub num_liveness_ops: usize,
+}
+
+/// Builder-local state created by `setup()` for one `assemble()` call.
 ///
-/// Unknown opnames panic — the migration is incomplete until every
-/// pyre bytecode walker call has a matching arm here.
-fn write_insn(_assembler: &mut JitCodeBuilder, insn: &Insn) {
-    match insn {
-        // `assembler.py:141` `if isinstance(insn[0], Label): ... return`.
-        Insn::Label(_label) => {
-            // TODO(phase-3b): call assembler.mark_label(label_id) once the
-            // Insn::Label carries the builder-side u16 id (or pyre's
-            // flatten step maps name → id before calling here).
+/// RPython keeps most of these on `self`; pyre keeps them in a per-call
+/// struct because the runtime `JitCodeBuilder` is consumed by `finish()`.
+struct AssemblyState {
+    builder: JitCodeBuilder,
+    /// `assembler.py:59` `self.label_positions = {}`.
+    label_positions: HashMap<String, usize>,
+    /// Builder adapter for `Label/TLabel` name → builder label id.
+    /// RPython stores bytecode positions directly in `label_positions`; this
+    /// extra vector exists only because `JitCodeBuilder` patches jumps by
+    /// symbolic label id rather than by rewriting raw bytes in `fix_labels()`.
+    builder_labels: Vec<(String, u16)>,
+    /// SSARepr-side switch descrs that must be attached after all labels have
+    /// final positions (`assembler.py:258-263`).
+    switch_descrs: Vec<(usize, Vec<(i64, TLabel)>)>,
+    /// Runtime descr table for this jitcode.
+    descrs: Vec<BhDescr>,
+}
+
+impl Assembler {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn all_liveness(&self) -> &[u8] {
+        &self.all_liveness
+    }
+
+    /// `assembler.py:34-54` `assemble(self, ssarepr, jitcode=None, num_regs=None)`.
+    pub fn assemble(
+        &mut self,
+        ssarepr: &mut SSARepr,
+        mut builder: JitCodeBuilder,
+        num_regs: Option<NumRegs>,
+    ) -> JitCode {
+        if let Some(nr) = num_regs {
+            builder.ensure_i_regs(nr.int);
+            builder.ensure_r_regs(nr.ref_);
+            builder.ensure_f_regs(nr.float);
         }
-        // `assembler.py:146-158` `if insn[0] == '-live-'`.
-        Insn::Live(_args) => {
-            // TODO(phase-3b): emit BC_LIVE + inline 2-byte offset, then
-            // intern the liveness bitset via ASSEMBLER_STATE.
+        builder.set_name(ssarepr.name.clone());
+
+        let mut state = AssemblyState {
+            builder,
+            label_positions: HashMap::new(),
+            builder_labels: Vec::new(),
+            switch_descrs: Vec::new(),
+            descrs: Vec::new(),
+        };
+
+        ssarepr.insns_pos = Some(Vec::with_capacity(ssarepr.insns.len()));
+        for insn in &ssarepr.insns {
+            ssarepr
+                .insns_pos
+                .as_mut()
+                .expect("insns_pos initialized")
+                .push(state.builder.current_pos());
+            self.write_insn(&mut state, insn);
         }
-        // `assembler.py` has no `---` branch; the unreachable marker is
-        // consumed by `liveness.py` and stripped before the assembler
-        // sees the SSARepr. Keep the arm for parity-audit clarity.
-        Insn::Unreachable => {}
-        // `assembler.py:159-223` regular-op dispatch.
-        Insn::Op {
-            opname,
-            args,
-            result,
-        } => {
-            dispatch_op(_assembler, opname, args, result.as_ref());
+
+        self.fix_labels(&mut state);
+
+        let mut jitcode = state.builder.finish();
+        jitcode.descrs = state.descrs;
+        self.check_result(&jitcode);
+        jitcode
+    }
+
+    /// `assembler.py:140-223` `write_insn(insn)`.
+    fn write_insn(&mut self, state: &mut AssemblyState, insn: &Insn) {
+        match insn {
+            Insn::Unreachable => {}
+            Insn::Label(label) => {
+                let label_id = builder_label(state, &label.name);
+                state
+                    .label_positions
+                    .insert(label.name.clone(), state.builder.current_pos());
+                state.builder.mark_label(label_id);
+            }
+            Insn::Live(args) => {
+                self.num_liveness_ops += 1;
+                let live_i = get_liveness_info(args, Kind::Int);
+                let live_r = get_liveness_info(args, Kind::Ref);
+                let live_f = get_liveness_info(args, Kind::Float);
+                let patch_offset = state.builder.live_placeholder();
+                let offset = self.encode_liveness_info(&live_i, &live_r, &live_f);
+                state.builder.patch_live_offset(patch_offset, offset);
+            }
+            Insn::Op {
+                opname,
+                args,
+                result,
+            } => {
+                scan_descr_operands(state, args);
+                dispatch_op(state, opname, args, result.as_ref());
+            }
         }
+    }
+
+    /// `assembler.py:250-263` `fix_labels()`.
+    fn fix_labels(&mut self, state: &mut AssemblyState) {
+        for (descr_index, labels) in &state.switch_descrs {
+            let mut dict = HashMap::new();
+            for (key, label) in labels {
+                let target = *state
+                    .label_positions
+                    .get(&label.name)
+                    .unwrap_or_else(|| panic!("missing switch target label {:?}", label.name));
+                dict.insert(*key, target);
+            }
+            state.descrs[*descr_index] = BhDescr::Switch { dict };
+        }
+    }
+
+    /// `assembler.py:265-269` `check_result()`.
+    fn check_result(&self, jitcode: &JitCode) {
+        assert!(
+            (jitcode.num_regs_i() as usize) + jitcode.constants_i.len() <= 256,
+            "too many int registers/constants"
+        );
+        assert!(
+            (jitcode.num_regs_r() as usize) + jitcode.constants_r.len() <= 256,
+            "too many ref registers/constants"
+        );
+        assert!(
+            (jitcode.num_regs_f() as usize) + jitcode.constants_f.len() <= 256,
+            "too many float registers/constants"
+        );
+    }
+
+    /// `assembler.py:234-248` `_encode_liveness(...)`.
+    fn encode_liveness_info(&mut self, live_i: &[u8], live_r: &[u8], live_f: &[u8]) -> u16 {
+        let key = (live_i.to_vec(), live_r.to_vec(), live_f.to_vec());
+        let pos = if let Some(&pos) = self.all_liveness_positions.get(&key) {
+            pos
+        } else {
+            let pos = self.all_liveness_length;
+            self.all_liveness_positions.insert(key, pos);
+            self.all_liveness.push(live_i.len() as u8);
+            self.all_liveness.push(live_r.len() as u8);
+            self.all_liveness.push(live_f.len() as u8);
+            for live in [live_i, live_r, live_f] {
+                let encoded = encode_liveness(live);
+                self.all_liveness.extend_from_slice(&encoded);
+            }
+            self.all_liveness_length = self.all_liveness.len();
+            pos
+        };
+        u16::try_from(pos).expect("all_liveness offset overflow")
     }
 }
 
-/// Per-opname dispatch — phase-3a stub covering only the trivial cases
-/// so the framework compiles; the full mapping is populated as
-/// `codewriter.rs` is migrated.
+/// Back-compat wrapper matching the original phase-3a skeleton API.
+pub fn assemble(
+    ssarepr: &mut SSARepr,
+    builder: JitCodeBuilder,
+    num_regs: Option<NumRegs>,
+) -> JitCode {
+    let mut assembler = Assembler::new();
+    assembler.assemble(ssarepr, builder, num_regs)
+}
+
+fn builder_label(state: &mut AssemblyState, name: &str) -> u16 {
+    if let Some((_, label)) = state
+        .builder_labels
+        .iter()
+        .find(|(existing, _)| existing == name)
+    {
+        return *label;
+    }
+    let label = state.builder.new_label();
+    state.builder_labels.push((name.to_owned(), label));
+    label
+}
+
+fn get_liveness_info(args: &[Operand], kind: Kind) -> Vec<u8> {
+    let mut lives = Vec::new();
+    for arg in args {
+        if let Operand::Register(Register {
+            kind: reg_kind,
+            index,
+        }) = arg
+        {
+            if *reg_kind == kind {
+                lives.push(u8::try_from(*index).expect("liveness register index exceeds u8"));
+            }
+        }
+    }
+    lives.sort_unstable();
+    lives.dedup();
+    lives
+}
+
 fn dispatch_op(
-    _assembler: &mut JitCodeBuilder,
+    state: &mut AssemblyState,
     opname: &str,
-    _args: &[Operand],
-    _result: Option<&Register>,
+    args: &[Operand],
+    result: Option<&Register>,
 ) {
     match opname {
-        // The remaining mappings are added as each bytecode handler in
-        // `codewriter.rs` is converted from "call assembler directly" to
-        // "emit Insn::Op". Until the handler is migrated, its path still
-        // uses `JitCodeBuilder` directly, so the dispatch table here is
-        // intentionally empty.
-        _ => panic!(
-            "assemble(): unimplemented opname {:?} — pyre bytecode walker \
-             has not yet been ported to SSARepr emission for this op",
-            opname
+        "goto" | "jump" => {
+            let label = expect_tlabel(&args[0]);
+            let label_id = builder_label(state, &label.name);
+            state.builder.jump(label_id);
+        }
+        "goto_if_not" | "branch_reg_zero" => {
+            let cond = expect_reg(&args[0], Kind::Int);
+            let label = expect_tlabel(&args[1]);
+            let label_id = builder_label(state, &label.name);
+            state.builder.branch_reg_zero(cond, label_id);
+        }
+        "catch_exception" => {
+            let label = expect_tlabel(&args[0]);
+            let label_id = builder_label(state, &label.name);
+            state.builder.catch_exception(label_id);
+        }
+        "jit_merge_point" => {
+            let greens_i = expect_list_regs(&args[0], Kind::Int);
+            let greens_r = expect_list_regs(&args[1], Kind::Ref);
+            let reds_r = expect_list_regs(&args[2], Kind::Ref);
+            state.builder.jit_merge_point(&greens_i, &greens_r, &reds_r);
+        }
+        "ref_return" => {
+            let src = expect_result_or_first_reg(args, result, Kind::Ref);
+            state.builder.ref_return(src);
+        }
+        "raise" => {
+            let src = expect_reg(&args[0], Kind::Ref);
+            state.builder.emit_raise(src);
+        }
+        "reraise" => state.builder.emit_reraise(),
+        "last_exc_value" => {
+            let dst = expect_result_or_first_reg(args, result, Kind::Ref);
+            state.builder.last_exc_value(dst);
+        }
+        "abort" => state.builder.abort(),
+        "abort_permanent" => state.builder.abort_permanent(),
+        "move_i" | "int_copy" => {
+            let (dst, src) = expect_move(args, result, Kind::Int);
+            state.builder.move_i(dst, src);
+        }
+        "move_r" | "ref_copy" => {
+            let (dst, src) = expect_move(args, result, Kind::Ref);
+            state.builder.move_r(dst, src);
+        }
+        "move_f" | "float_copy" => {
+            let (dst, src) = expect_move(args, result, Kind::Float);
+            state.builder.move_f(dst, src);
+        }
+        "load_const_i" => {
+            let (dst, value) = expect_load_const_i(args, result);
+            state.builder.load_const_i_value(dst, value);
+        }
+        "load_const_r" => {
+            let (dst, value) = expect_load_const_r(args, result);
+            state.builder.load_const_r_value(dst, value);
+        }
+        "load_const_f" => {
+            let (dst, value) = expect_load_const_f(args, result);
+            state.builder.load_const_f_value(dst, value);
+        }
+        "push_i" => state.builder.push_i(expect_reg(&args[0], Kind::Int)),
+        "push_r" => state.builder.push_r(expect_reg(&args[0], Kind::Ref)),
+        "push_f" => state.builder.push_f(expect_reg(&args[0], Kind::Float)),
+        "pop_i" => state
+            .builder
+            .pop_i(expect_result_or_first_reg(args, result, Kind::Int)),
+        "pop_r" => state
+            .builder
+            .pop_r(expect_result_or_first_reg(args, result, Kind::Ref)),
+        "pop_f" => state
+            .builder
+            .pop_f(expect_result_or_first_reg(args, result, Kind::Float)),
+        "peek_i" => state
+            .builder
+            .peek_i(expect_result_or_first_reg(args, result, Kind::Int)),
+        "dup_stack" => state.builder.dup_stack(),
+        "swap_stack" => state.builder.swap_stack(),
+        "require_stack" => state.builder.require_stack(expect_small_u16(&args[0])),
+        "set_selected" => state.builder.set_selected(expect_small_u16(&args[0])),
+        "push_to" => state
+            .builder
+            .push_to(expect_reg(&args[0], Kind::Int), expect_small_u16(&args[1])),
+        "copy_from_bottom" => state
+            .builder
+            .copy_from_bottom(expect_reg(&args[0], Kind::Int)),
+        "store_down" => state.builder.store_down(expect_reg(&args[0], Kind::Int)),
+        "load_state_field" => {
+            let dst = expect_result_or_first_reg(args, result, Kind::Int);
+            state
+                .builder
+                .load_state_field(expect_small_u16(&args[0]), dst);
+        }
+        "store_state_field" => {
+            state
+                .builder
+                .store_state_field(expect_small_u16(&args[0]), expect_reg(&args[1], Kind::Int));
+        }
+        "load_state_array" => {
+            let dst = expect_result_or_first_reg(args, result, Kind::Int);
+            state.builder.load_state_array(
+                expect_small_u16(&args[0]),
+                expect_reg(&args[1], Kind::Int),
+                dst,
+            );
+        }
+        "store_state_array" => {
+            state.builder.store_state_array(
+                expect_small_u16(&args[0]),
+                expect_reg(&args[1], Kind::Int),
+                expect_reg(&args[2], Kind::Int),
+            );
+        }
+        "load_state_varray" => {
+            let dst = expect_result_or_first_reg(args, result, Kind::Int);
+            state.builder.load_state_varray(
+                expect_small_u16(&args[0]),
+                expect_reg(&args[1], Kind::Int),
+                dst,
+            );
+        }
+        "store_state_varray" => {
+            state.builder.store_state_varray(
+                expect_small_u16(&args[0]),
+                expect_reg(&args[1], Kind::Int),
+                expect_reg(&args[2], Kind::Int),
+            );
+        }
+        "vable_getfield_i" => {
+            let dst = expect_result_or_first_reg(args, result, Kind::Int);
+            state
+                .builder
+                .vable_getfield_int(dst, expect_small_u16(&args[0]));
+        }
+        "vable_getfield_r" => {
+            let dst = expect_result_or_first_reg(args, result, Kind::Ref);
+            state
+                .builder
+                .vable_getfield_ref(dst, expect_small_u16(&args[0]));
+        }
+        "vable_getfield_f" => {
+            let dst = expect_result_or_first_reg(args, result, Kind::Float);
+            state
+                .builder
+                .vable_getfield_float(dst, expect_small_u16(&args[0]));
+        }
+        "vable_setfield_i" => state
+            .builder
+            .vable_setfield_int(expect_small_u16(&args[0]), expect_reg(&args[1], Kind::Int)),
+        "vable_setfield_r" => state
+            .builder
+            .vable_setfield_ref(expect_small_u16(&args[0]), expect_reg(&args[1], Kind::Ref)),
+        "vable_setfield_f" => state.builder.vable_setfield_float(
+            expect_small_u16(&args[0]),
+            expect_reg(&args[1], Kind::Float),
+        ),
+        "vable_getarrayitem_i" => {
+            let dst = expect_result_or_first_reg(args, result, Kind::Int);
+            state.builder.vable_getarrayitem_int(
+                dst,
+                expect_small_u16(&args[0]),
+                expect_reg(&args[1], Kind::Int),
+            );
+        }
+        "vable_getarrayitem_r" => {
+            let dst = expect_result_or_first_reg(args, result, Kind::Ref);
+            state.builder.vable_getarrayitem_ref(
+                dst,
+                expect_small_u16(&args[0]),
+                expect_reg(&args[1], Kind::Int),
+            );
+        }
+        "vable_getarrayitem_f" => {
+            let dst = expect_result_or_first_reg(args, result, Kind::Float);
+            state.builder.vable_getarrayitem_float(
+                dst,
+                expect_small_u16(&args[0]),
+                expect_reg(&args[1], Kind::Int),
+            );
+        }
+        "vable_setarrayitem_i" => state.builder.vable_setarrayitem_int(
+            expect_small_u16(&args[0]),
+            expect_reg(&args[1], Kind::Int),
+            expect_reg(&args[2], Kind::Int),
+        ),
+        "vable_setarrayitem_r" => state.builder.vable_setarrayitem_ref(
+            expect_small_u16(&args[0]),
+            expect_reg(&args[1], Kind::Int),
+            expect_reg(&args[2], Kind::Ref),
+        ),
+        "vable_setarrayitem_f" => state.builder.vable_setarrayitem_float(
+            expect_small_u16(&args[0]),
+            expect_reg(&args[1], Kind::Int),
+            expect_reg(&args[2], Kind::Float),
+        ),
+        "arraylen_vable" => {
+            let dst = expect_result_or_first_reg(args, result, Kind::Int);
+            state
+                .builder
+                .vable_arraylen(dst, expect_small_u16(&args[0]));
+        }
+        "hint_force_virtualizable" => state.builder.vable_force(),
+        "record_binop_i" => {
+            let dst = expect_result_reg(result, Kind::Int, "record_binop_i needs result");
+            state.builder.record_binop_i(
+                dst,
+                expect_opcode(&args[0]),
+                expect_reg(&args[1], Kind::Int),
+                expect_reg(&args[2], Kind::Int),
+            );
+        }
+        "record_binop_f" => {
+            let dst = expect_result_reg(result, Kind::Float, "record_binop_f needs result");
+            state.builder.record_binop_f(
+                dst,
+                expect_opcode(&args[0]),
+                expect_reg(&args[1], Kind::Float),
+                expect_reg(&args[2], Kind::Float),
+            );
+        }
+        "record_unary_i" => {
+            let dst = expect_result_reg(result, Kind::Int, "record_unary_i needs result");
+            state.builder.record_unary_i(
+                dst,
+                expect_opcode(&args[0]),
+                expect_reg(&args[1], Kind::Int),
+            );
+        }
+        "record_unary_f" => {
+            let dst = expect_result_reg(result, Kind::Float, "record_unary_f needs result");
+            state.builder.record_unary_f(
+                dst,
+                expect_opcode(&args[0]),
+                expect_reg(&args[1], Kind::Float),
+            );
+        }
+        "call_void" | "residual_call_void" => {
+            let fn_idx = expect_small_u16(&args[0]);
+            let call_args = expect_call_args(&args[1..]);
+            state
+                .builder
+                .residual_call_void_typed_args(fn_idx, &call_args);
+        }
+        "call_may_force_void" => {
+            let fn_idx = expect_small_u16(&args[0]);
+            let call_args = expect_call_args(&args[1..]);
+            state
+                .builder
+                .call_may_force_void_typed_args(fn_idx, &call_args);
+        }
+        "call_release_gil_void" => {
+            let fn_idx = expect_small_u16(&args[0]);
+            let call_args = expect_call_args(&args[1..]);
+            state
+                .builder
+                .call_release_gil_void_typed_args(fn_idx, &call_args);
+        }
+        "call_loopinvariant_void" => {
+            let fn_idx = expect_small_u16(&args[0]);
+            let call_args = expect_call_args(&args[1..]);
+            state
+                .builder
+                .call_loopinvariant_void_typed_args(fn_idx, &call_args);
+        }
+        "call_assembler_void" => {
+            let target_idx = expect_small_u16(&args[0]);
+            let call_args = expect_call_args(&args[1..]);
+            state
+                .builder
+                .call_assembler_void_typed_args(target_idx, &call_args);
+        }
+        "call_int"
+        | "call_pure_int"
+        | "call_may_force_int"
+        | "call_release_gil_int"
+        | "call_loopinvariant_int"
+        | "call_assembler_int" => {
+            let fn_idx = expect_small_u16(&args[0]);
+            let dst = expect_result_reg(result, Kind::Int, "int call needs result");
+            let call_args = expect_call_args(&args[1..]);
+            match opname {
+                "call_int" => state.builder.call_int_typed(fn_idx, &call_args, dst),
+                "call_pure_int" => state.builder.call_pure_int_typed(fn_idx, &call_args, dst),
+                "call_may_force_int" => state
+                    .builder
+                    .call_may_force_int_typed(fn_idx, &call_args, dst),
+                "call_release_gil_int" => state
+                    .builder
+                    .call_release_gil_int_typed(fn_idx, &call_args, dst),
+                "call_loopinvariant_int" => state
+                    .builder
+                    .call_loopinvariant_int_typed(fn_idx, &call_args, dst),
+                _ => state
+                    .builder
+                    .call_assembler_int_typed(fn_idx, &call_args, dst),
+            }
+        }
+        "call_ref"
+        | "call_pure_ref"
+        | "call_may_force_ref"
+        | "call_release_gil_ref"
+        | "call_loopinvariant_ref"
+        | "call_assembler_ref" => {
+            let fn_idx = expect_small_u16(&args[0]);
+            let dst = expect_result_reg(result, Kind::Ref, "ref call needs result");
+            let call_args = expect_call_args(&args[1..]);
+            match opname {
+                "call_ref" => state.builder.call_ref_typed(fn_idx, &call_args, dst),
+                "call_pure_ref" => state.builder.call_pure_ref_typed(fn_idx, &call_args, dst),
+                "call_may_force_ref" => state
+                    .builder
+                    .call_may_force_ref_typed(fn_idx, &call_args, dst),
+                "call_release_gil_ref" => state
+                    .builder
+                    .call_release_gil_ref_typed(fn_idx, &call_args, dst),
+                "call_loopinvariant_ref" => state
+                    .builder
+                    .call_loopinvariant_ref_typed(fn_idx, &call_args, dst),
+                _ => state
+                    .builder
+                    .call_assembler_ref_typed(fn_idx, &call_args, dst),
+            }
+        }
+        "call_float"
+        | "call_pure_float"
+        | "call_may_force_float"
+        | "call_release_gil_float"
+        | "call_loopinvariant_float"
+        | "call_assembler_float" => {
+            let fn_idx = expect_small_u16(&args[0]);
+            let dst = expect_result_reg(result, Kind::Float, "float call needs result");
+            let call_args = expect_call_args(&args[1..]);
+            match opname {
+                "call_float" => state.builder.call_float_typed(fn_idx, &call_args, dst),
+                "call_pure_float" => state.builder.call_pure_float_typed(fn_idx, &call_args, dst),
+                "call_may_force_float" => state
+                    .builder
+                    .call_may_force_float_typed(fn_idx, &call_args, dst),
+                "call_release_gil_float" => state
+                    .builder
+                    .call_release_gil_float_typed(fn_idx, &call_args, dst),
+                "call_loopinvariant_float" => state
+                    .builder
+                    .call_loopinvariant_float_typed(fn_idx, &call_args, dst),
+                _ => state
+                    .builder
+                    .call_assembler_float_typed(fn_idx, &call_args, dst),
+            }
+        }
+        "conditional_call_void" => {
+            let fn_idx = expect_small_u16(&args[0]);
+            let cond_reg = expect_reg(&args[1], Kind::Int);
+            let call_args = expect_call_args(&args[2..]);
+            state
+                .builder
+                .conditional_call_void_typed_args(fn_idx, cond_reg, &call_args);
+        }
+        "conditional_call_value_int" => {
+            let fn_idx = expect_small_u16(&args[0]);
+            let value_reg = expect_reg(&args[1], Kind::Int);
+            let dst =
+                expect_result_reg(result, Kind::Int, "conditional_call_value_int needs result");
+            let call_args = expect_call_args(&args[2..]);
+            state
+                .builder
+                .conditional_call_value_int_typed_args(fn_idx, value_reg, &call_args, dst);
+        }
+        "conditional_call_value_ref" => {
+            let fn_idx = expect_small_u16(&args[0]);
+            let value_reg = expect_reg(&args[1], Kind::Int);
+            let dst =
+                expect_result_reg(result, Kind::Ref, "conditional_call_value_ref needs result");
+            let call_args = expect_call_args(&args[2..]);
+            state
+                .builder
+                .conditional_call_value_ref_typed_args(fn_idx, value_reg, &call_args, dst);
+        }
+        "record_known_result_int" => {
+            let fn_idx = expect_small_u16(&args[0]);
+            let result_reg = expect_reg(&args[1], Kind::Int);
+            let call_args = expect_call_args(&args[2..]);
+            state
+                .builder
+                .record_known_result_int_typed_args(fn_idx, result_reg, &call_args);
+        }
+        "record_known_result_ref" => {
+            let fn_idx = expect_small_u16(&args[0]);
+            let result_reg = expect_reg(&args[1], Kind::Ref);
+            let call_args = expect_call_args(&args[2..]);
+            state
+                .builder
+                .record_known_result_ref_typed_args(fn_idx, result_reg, &call_args);
+        }
+        other => panic!(
+            "assemble(): unimplemented opname {:?} — add a builder mapping in jit/assembler.rs",
+            other
         ),
     }
 }
 
-/// Small helper used by the dispatcher to validate that an operand is a
-/// register of the expected kind — matches `assembler.emit_reg`'s
-/// internal `assert reg.kind == expected`.
-#[inline]
-#[allow(dead_code)]
+fn scan_descr_operands(state: &mut AssemblyState, args: &[Operand]) {
+    for arg in args {
+        if let Operand::Descr(descr) = arg {
+            record_descr_operand(state, descr);
+        }
+    }
+}
+
+fn record_descr_operand(state: &mut AssemblyState, descr: &DescrOperand) -> usize {
+    let index = state.descrs.len();
+    match descr {
+        DescrOperand::Bh(descr) => state.descrs.push(descr.clone()),
+        DescrOperand::SwitchDict(descr) => {
+            state.descrs.push(BhDescr::Switch {
+                dict: HashMap::new(),
+            });
+            state.switch_descrs.push((index, descr.labels.clone()));
+        }
+    }
+    index
+}
+
+fn expect_result_or_first_reg(args: &[Operand], result: Option<&Register>, kind: Kind) -> u16 {
+    match result {
+        Some(reg) if reg.kind == kind => reg.index,
+        Some(reg) => panic!("expected result register of kind {:?}, got {:?}", kind, reg),
+        None => expect_reg(&args[0], kind),
+    }
+}
+
+fn expect_result_reg(result: Option<&Register>, kind: Kind, msg: &str) -> u16 {
+    match result {
+        Some(reg) if reg.kind == kind => reg.index,
+        Some(reg) => panic!("expected result register of kind {:?}, got {:?}", kind, reg),
+        None => panic!("{}", msg),
+    }
+}
+
 fn expect_reg(op: &Operand, expected: Kind) -> u16 {
     match op {
         Operand::Register(Register { kind, index }) if *kind == expected => *index,
-        _ => panic!(
-            "expect_reg: expected Register({:?}, _), got {:?}",
-            expected, op
-        ),
+        _ => panic!("expected Register({:?}, _), got {:?}", expected, op),
     }
+}
+
+fn expect_tlabel(op: &Operand) -> &TLabel {
+    match op {
+        Operand::TLabel(label) => label,
+        _ => panic!("expected TLabel, got {:?}", op),
+    }
+}
+
+fn expect_small_u16(op: &Operand) -> u16 {
+    match op {
+        Operand::ConstInt(value) => u16::try_from(*value).expect("expected u16-sized ConstInt"),
+        _ => panic!("expected ConstInt(u16), got {:?}", op),
+    }
+}
+
+fn expect_opcode(op: &Operand) -> majit_ir::OpCode {
+    match op {
+        Operand::ConstInt(value) => match *value {
+            0 => majit_ir::OpCode::IntEq,
+            1 => majit_ir::OpCode::IntNe,
+            2 => majit_ir::OpCode::IntLt,
+            3 => majit_ir::OpCode::IntLe,
+            4 => majit_ir::OpCode::IntGt,
+            5 => majit_ir::OpCode::IntGe,
+            other => panic!("unknown OpCode tag {}", other),
+        },
+        _ => panic!("expected ConstInt(opcode_tag), got {:?}", op),
+    }
+}
+
+fn expect_list_regs(op: &Operand, expected: Kind) -> Vec<u8> {
+    match op {
+        Operand::ListOfKind(ListOfKind { kind, content }) if *kind == expected => content
+            .iter()
+            .map(|item| {
+                u8::try_from(expect_reg(item, expected)).expect("register index exceeds u8")
+            })
+            .collect(),
+        _ => panic!("expected ListOfKind({:?}), got {:?}", expected, op),
+    }
+}
+
+fn expect_call_args(args: &[Operand]) -> Vec<JitCallArg> {
+    args.iter().map(expect_call_arg).collect()
+}
+
+fn expect_call_arg(op: &Operand) -> JitCallArg {
+    match op {
+        Operand::Register(Register { kind, index }) => match kind {
+            Kind::Int => JitCallArg::int(*index),
+            Kind::Ref => JitCallArg::reference(*index),
+            Kind::Float => JitCallArg::float(*index),
+        },
+        _ => panic!("expected typed call register, got {:?}", op),
+    }
+}
+
+fn expect_move(args: &[Operand], result: Option<&Register>, kind: Kind) -> (u16, u16) {
+    if let Some(dst) = result {
+        return (dst.index, expect_reg(&args[0], kind));
+    }
+    (expect_reg(&args[0], kind), expect_reg(&args[1], kind))
+}
+
+fn expect_load_const_i(args: &[Operand], result: Option<&Register>) -> (u16, i64) {
+    if let Some(dst) = result {
+        let Operand::ConstInt(value) = &args[0] else {
+            panic!("load_const_i expects ConstInt, got {:?}", args[0]);
+        };
+        return (dst.index, *value);
+    }
+    let Operand::ConstInt(value) = &args[1] else {
+        panic!("load_const_i expects ConstInt, got {:?}", args[1]);
+    };
+    (expect_reg(&args[0], Kind::Int), *value)
+}
+
+fn expect_load_const_r(args: &[Operand], result: Option<&Register>) -> (u16, i64) {
+    if let Some(dst) = result {
+        let Operand::ConstRef(value) = &args[0] else {
+            panic!("load_const_r expects ConstRef, got {:?}", args[0]);
+        };
+        return (dst.index, *value);
+    }
+    let Operand::ConstRef(value) = &args[1] else {
+        panic!("load_const_r expects ConstRef, got {:?}", args[1]);
+    };
+    (expect_reg(&args[0], Kind::Ref), *value)
+}
+
+fn expect_load_const_f(args: &[Operand], result: Option<&Register>) -> (u16, i64) {
+    if let Some(dst) = result {
+        let Operand::ConstFloat(value) = &args[0] else {
+            panic!("load_const_f expects ConstFloat, got {:?}", args[0]);
+        };
+        return (dst.index, *value);
+    }
+    let Operand::ConstFloat(value) = &args[1] else {
+        panic!("load_const_f expects ConstFloat, got {:?}", args[1]);
+    };
+    (expect_reg(&args[0], Kind::Float), *value)
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::flatten::{DescrOperand, Label, SwitchDictDescr};
     use super::*;
+
+    fn r(kind: Kind, index: u16) -> Register {
+        Register::new(kind, index)
+    }
 
     #[test]
     fn assemble_empty_ssarepr_produces_valid_jitcode() {
-        let ssarepr = SSARepr::new("empty");
-        let assembler = JitCodeBuilder::default();
-        let jitcode = assemble(&ssarepr, assembler, None);
+        let mut ssarepr = SSARepr::new("empty");
+        let jitcode = assemble(&mut ssarepr, JitCodeBuilder::default(), None);
         assert_eq!(jitcode.name, "empty");
-        assert!(jitcode.code.is_empty(), "empty SSARepr → empty code");
+        assert!(jitcode.code.is_empty(), "empty SSARepr -> empty code");
+        assert_eq!(ssarepr.insns_pos, Some(Vec::new()));
+    }
+
+    #[test]
+    fn assemble_records_insn_positions_and_liveness() {
+        let mut ssarepr = SSARepr::new("live");
+        ssarepr
+            .insns
+            .push(Insn::Live(vec![Operand::Register(r(Kind::Ref, 0))]));
+        ssarepr.insns.push(Insn::op(
+            "ref_return",
+            vec![Operand::Register(r(Kind::Ref, 0))],
+        ));
+
+        let mut assembler = Assembler::new();
+        let jitcode = assembler.assemble(
+            &mut ssarepr,
+            JitCodeBuilder::default(),
+            Some(NumRegs {
+                ref_: 1,
+                ..NumRegs::default()
+            }),
+        );
+
+        assert_eq!(assembler.num_liveness_ops, 1);
+        assert!(!assembler.all_liveness().is_empty());
+        assert_eq!(ssarepr.insns_pos.as_ref().map(Vec::len), Some(2));
+        assert!(!jitcode.code.is_empty());
+    }
+
+    #[test]
+    fn assemble_patches_jumps_through_labels() {
+        let mut ssarepr = SSARepr::new("jump");
+        ssarepr
+            .insns
+            .push(Insn::op("goto", vec![Operand::TLabel(TLabel::new("L1"))]));
+        ssarepr.insns.push(Insn::Label(Label::new("L1")));
+        ssarepr.insns.push(Insn::op(
+            "ref_return",
+            vec![Operand::Register(r(Kind::Ref, 0))],
+        ));
+
+        let jitcode = assemble(
+            &mut ssarepr,
+            JitCodeBuilder::default(),
+            Some(NumRegs {
+                ref_: 1,
+                ..NumRegs::default()
+            }),
+        );
+
+        assert_eq!(jitcode.follow_jump(3), 3);
+    }
+
+    #[test]
+    fn assemble_attaches_switch_descr_after_fix_labels() {
+        let mut switch = SwitchDictDescr::new();
+        switch.labels.push((4, TLabel::new("L2")));
+
+        let mut ssarepr = SSARepr::new("switch");
+        ssarepr.insns.push(Insn::Label(Label::new("L2")));
+        ssarepr.insns.push(Insn::op(
+            "abort_permanent",
+            vec![Operand::Descr(DescrOperand::SwitchDict(switch))],
+        ));
+
+        let jitcode = assemble(&mut ssarepr, JitCodeBuilder::default(), None);
+
+        assert_eq!(jitcode.descrs.len(), 1);
+        match &jitcode.descrs[0] {
+            BhDescr::Switch { dict } => assert_eq!(dict.get(&4), Some(&0)),
+            other => panic!("expected switch descr, got {:?}", other),
+        }
     }
 }
