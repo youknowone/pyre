@@ -6865,10 +6865,8 @@ fn handler_raw_store_i(
     let value = bh.registers_i[code[p + 2] as usize];
     let (descr, p) = read_descr(bh, code, p + 3);
     // blackhole.py:1505-1506: cpu.bh_raw_store_i(addr, offset, newvalue, arraydescr)
-    // llmodel.py:740: ofs, size, _ = self.unpack_arraydescr_size(descr)
-    let size = descr.as_itemsize();
     let cpu = bh.cpu.expect("cpu not set");
-    cpu.bh_raw_store_i(addr, offset, value, size);
+    cpu.bh_raw_store_i(addr, offset, value, descr);
     Ok(p)
 }
 fn handler_raw_store_f(
@@ -6880,9 +6878,10 @@ fn handler_raw_store_f(
     let addr = bh.registers_i[code[p] as usize];
     let offset = bh.registers_i[code[p + 1] as usize];
     let value = f64::from_bits(bh.registers_f[code[p + 2] as usize] as u64);
-    let (_, p) = read_descr(bh, code, p + 3);
+    let (descr, p) = read_descr(bh, code, p + 3);
+    // blackhole.py:1510-1511: cpu.bh_raw_store_f(addr, offset, newvalue, arraydescr)
     let cpu = bh.cpu.expect("cpu not set");
-    cpu.bh_raw_store_f(addr, offset, value);
+    cpu.bh_raw_store_f(addr, offset, value, descr);
     Ok(p)
 }
 fn handler_raw_load_i(
@@ -6892,9 +6891,10 @@ fn handler_raw_load_i(
 ) -> Result<usize, DispatchError> {
     let addr = bh.registers_i[code[p] as usize];
     let offset = bh.registers_i[code[p + 1] as usize];
-    let (_, p) = read_descr(bh, code, p + 2);
+    let (descr, p) = read_descr(bh, code, p + 2);
+    // blackhole.py:1500-1501: cpu.bh_raw_load_i(addr, offset, arraydescr)
     let cpu = bh.cpu.expect("cpu not set");
-    bh.registers_i[code[p] as usize] = cpu.bh_raw_load_i(addr, offset);
+    bh.registers_i[code[p] as usize] = cpu.bh_raw_load_i(addr, offset, descr);
     Ok(p + 1)
 }
 fn handler_raw_load_f(
@@ -6904,9 +6904,10 @@ fn handler_raw_load_f(
 ) -> Result<usize, DispatchError> {
     let addr = bh.registers_i[code[p] as usize];
     let offset = bh.registers_i[code[p + 1] as usize];
-    let (_, p) = read_descr(bh, code, p + 2);
+    let (descr, p) = read_descr(bh, code, p + 2);
+    // blackhole.py:1503-1504: cpu.bh_raw_load_f(addr, offset, arraydescr)
     let cpu = bh.cpu.expect("cpu not set");
-    bh.registers_f[code[p] as usize] = cpu.bh_raw_load_f(addr, offset).to_bits() as i64;
+    bh.registers_f[code[p] as usize] = cpu.bh_raw_load_f(addr, offset, descr).to_bits() as i64;
     Ok(p + 1)
 }
 // newlist / newlist_clear / newlist_hint (blackhole.py:1160-1193)

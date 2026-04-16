@@ -832,19 +832,14 @@ impl OptVirtualize {
             };
             if let Some(PtrInfo::VirtualRawBuffer(vinfo)) = ctx.get_ptr_info(parent) {
                 let lookup_offset = base_offset + offset as usize;
+                let Some(descr) = op.descr.as_ref() else {
+                    return OptimizationResult::PassOn;
+                };
+                let Some(ad) = descr.as_array_descr() else {
+                    return OptimizationResult::PassOn;
+                };
                 // rawbuffer.py:120: read_value(offset, length, descr)
-                let (item_len, descr) = op
-                    .descr
-                    .as_ref()
-                    .and_then(|d| d.as_array_descr())
-                    .map(|ad| (ad.item_size(), op.descr.clone().unwrap()))
-                    .unwrap_or_else(|| {
-                        (
-                            8,
-                            majit_ir::descr::make_array_descr(0, 8, majit_ir::Type::Int),
-                        )
-                    });
-                if let Ok(val_ref) = vinfo.read_value(lookup_offset, item_len, &descr) {
+                if let Ok(val_ref) = vinfo.read_value(lookup_offset, ad.item_size(), descr) {
                     ctx.replace_op(op.pos, val_ref);
                     return OptimizationResult::Remove;
                 }
@@ -873,23 +868,16 @@ impl OptVirtualize {
             };
             if let Some(PtrInfo::VirtualRawBuffer(vinfo)) = ctx.get_ptr_info_mut(parent) {
                 let store_offset = base_offset + offset as usize;
-                // rawbuffer.py:89: write_value(offset, length, descr, value).
-                // Pass op.descr directly — RPython passes the actual arraydescr.
-                let (item_len, descr) = op
-                    .descr
-                    .as_ref()
-                    .and_then(|d| d.as_array_descr())
-                    .map(|ad| (ad.item_size(), op.descr.clone().unwrap()))
-                    .unwrap_or_else(|| {
-                        (
-                            8,
-                            majit_ir::descr::make_array_descr(0, 8, majit_ir::Type::Int),
-                        )
-                    });
+                let Some(descr) = op.descr.clone() else {
+                    return OptimizationResult::PassOn;
+                };
+                let Some(ad) = descr.as_array_descr() else {
+                    return OptimizationResult::PassOn;
+                };
                 // virtualize.py:374-381: try setitem_raw → return (remove);
                 // except InvalidRawOperation → pass → emit(op)
                 if vinfo
-                    .write_value(store_offset, item_len, descr, value_ref)
+                    .write_value(store_offset, ad.item_size(), descr, value_ref)
                     .is_ok()
                 {
                     return OptimizationResult::Remove;
@@ -2954,6 +2942,11 @@ mod tests {
 
     // ── VirtualRawBuffer optimization tests (RPython: test_rawmem.py parity) ──
 
+    /// cpu.arraydescrof(rffi.CArray(lltype.Signed)) — 8-byte signed int array.
+    fn raw_arraydescr() -> majit_ir::DescrRef {
+        majit_ir::descr::make_array_descr(0, 8, majit_ir::Type::Int)
+    }
+
     fn run_pass_with_raw_buffer(
         ops: &[Op],
         constants: &[(OpRef, Value)],
@@ -3015,12 +3008,17 @@ mod tests {
     fn test_raw_store_then_load_same_offset_forwarded() {
         // Mirrors RPython's test_raw_storage_int: store a value, then
         // load from the same offset on a virtual buffer.
-        // raw_store(buf, offset=0, val)
-        // i1 = raw_load_i(buf, offset=0)
+        // raw_store(buf, offset=0, val, descr=arraydescr)
+        // i1 = raw_load_i(buf, offset=0, descr=arraydescr)
         // -> i1 should be forwarded to val, both ops removed.
+        let ad = raw_arraydescr();
         let mut ops = vec![
-            Op::new(OpCode::RawStore, &[OpRef(0), OpRef(100), OpRef(200)]), // pos=0
-            Op::new(OpCode::RawLoadI, &[OpRef(0), OpRef(100)]),             // pos=1
+            Op::with_descr(
+                OpCode::RawStore,
+                &[OpRef(0), OpRef(100), OpRef(200)],
+                ad.clone(),
+            ),
+            Op::with_descr(OpCode::RawLoadI, &[OpRef(0), OpRef(100)], ad),
         ];
         assign_positions(&mut ops);
 
@@ -3040,15 +3038,24 @@ mod tests {
     fn test_raw_ops_different_offsets_no_interference() {
         // Store two values at different offsets on a virtual raw buffer.
         // Load from each offset separately: each should get its own value.
-        // raw_store(buf, offset=0, val_a)
-        // raw_store(buf, offset=8, val_b)
-        // i1 = raw_load_i(buf, offset=0)  -> val_a
-        // i2 = raw_load_i(buf, offset=8)  -> val_b
+        // raw_store(buf, offset=0, val_a, descr=arraydescr)
+        // raw_store(buf, offset=8, val_b, descr=arraydescr)
+        // i1 = raw_load_i(buf, offset=0, descr=arraydescr)  -> val_a
+        // i2 = raw_load_i(buf, offset=8, descr=arraydescr)  -> val_b
+        let ad = raw_arraydescr();
         let mut ops = vec![
-            Op::new(OpCode::RawStore, &[OpRef(0), OpRef(100), OpRef(200)]), // pos=0
-            Op::new(OpCode::RawStore, &[OpRef(0), OpRef(101), OpRef(201)]), // pos=1
-            Op::new(OpCode::RawLoadI, &[OpRef(0), OpRef(100)]),             // pos=2
-            Op::new(OpCode::RawLoadI, &[OpRef(0), OpRef(101)]),             // pos=3
+            Op::with_descr(
+                OpCode::RawStore,
+                &[OpRef(0), OpRef(100), OpRef(200)],
+                ad.clone(),
+            ),
+            Op::with_descr(
+                OpCode::RawStore,
+                &[OpRef(0), OpRef(101), OpRef(201)],
+                ad.clone(),
+            ),
+            Op::with_descr(OpCode::RawLoadI, &[OpRef(0), OpRef(100)], ad.clone()),
+            Op::with_descr(OpCode::RawLoadI, &[OpRef(0), OpRef(101)], ad),
         ];
         assign_positions(&mut ops);
 
@@ -3067,14 +3074,22 @@ mod tests {
     #[test]
     fn test_raw_store_overwrite_same_offset() {
         // Store twice at the same offset, then load.
-        // raw_store(buf, 0, val_a)
-        // raw_store(buf, 0, val_b)   <- overwrites
-        // i1 = raw_load_i(buf, 0)    -> val_b
-        // call_n(buf)                <- force
+        // raw_store(buf, 0, val_a, descr=arraydescr)
+        // raw_store(buf, 0, val_b, descr=arraydescr)   <- overwrites
+        // i1 = raw_load_i(buf, 0, descr=arraydescr)    -> val_b
+        let ad = raw_arraydescr();
         let mut ops = vec![
-            Op::new(OpCode::RawStore, &[OpRef(0), OpRef(100), OpRef(200)]), // pos=0
-            Op::new(OpCode::RawStore, &[OpRef(0), OpRef(100), OpRef(201)]), // pos=1
-            Op::new(OpCode::RawLoadI, &[OpRef(0), OpRef(100)]),             // pos=2
+            Op::with_descr(
+                OpCode::RawStore,
+                &[OpRef(0), OpRef(100), OpRef(200)],
+                ad.clone(),
+            ),
+            Op::with_descr(
+                OpCode::RawStore,
+                &[OpRef(0), OpRef(100), OpRef(201)],
+                ad.clone(),
+            ),
+            Op::with_descr(OpCode::RawLoadI, &[OpRef(0), OpRef(100)], ad),
         ];
         assign_positions(&mut ops);
 
@@ -3094,9 +3109,14 @@ mod tests {
     #[test]
     fn test_raw_load_on_non_virtual_passes_through() {
         // When the buffer is NOT virtual, raw_load should pass through unchanged.
+        let ad = raw_arraydescr();
         let mut ops = vec![
-            Op::new(OpCode::RawStore, &[OpRef(50), OpRef(100), OpRef(200)]),
-            Op::new(OpCode::RawLoadI, &[OpRef(50), OpRef(100)]),
+            Op::with_descr(
+                OpCode::RawStore,
+                &[OpRef(50), OpRef(100), OpRef(200)],
+                ad.clone(),
+            ),
+            Op::with_descr(OpCode::RawLoadI, &[OpRef(50), OpRef(100)], ad),
         ];
         assign_positions(&mut ops);
 

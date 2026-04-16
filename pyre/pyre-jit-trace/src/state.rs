@@ -1330,6 +1330,43 @@ pub(crate) fn namespace_value_direct(ns: *mut PyNamespace, idx: usize) -> Option
     unsafe { &*ns }.get_slot(idx)
 }
 
+pub(crate) fn record_current_state_guard(
+    ctx: &mut TraceCtx,
+    frame: OpRef,
+    next_instr: OpRef,
+    code: OpRef,
+    stack_depth: OpRef,
+    namespace: OpRef,
+    locals: &[OpRef],
+    stack: &[OpRef],
+    opcode: OpCode,
+    args: &[OpRef],
+) {
+    let mut fail_args = vec![frame, next_instr, code, stack_depth, namespace];
+    fail_args.extend_from_slice(locals);
+    fail_args.extend_from_slice(stack);
+    let num_slots = fail_args.len() - crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
+    let fail_arg_types = crate::virtualizable_gen::virt_live_value_types(num_slots);
+    ctx.record_guard_typed_with_fail_args(opcode, args, fail_arg_types, &fail_args);
+}
+
+pub(crate) fn concrete_value_type(value: PyObjectRef) -> Type {
+    if value.is_null() {
+        return Type::Ref;
+    }
+    if !looks_like_heap_ref(value) {
+        // Non-heap value (e.g. PY_NULL sentinel or leaked raw int)
+        return Type::Int;
+    }
+    if unsafe { is_int(value) } {
+        return Type::Int;
+    }
+    if unsafe { is_float(value) } {
+        return Type::Float;
+    }
+    Type::Ref
+}
+
 /// pyre slots are always GCREF (Ref) at the concrete frame level.
 /// Even W_IntObject values are stored as Ref pointers — the trace
 /// unboxes via GetfieldGcPureI.
@@ -1372,19 +1409,26 @@ pub(crate) fn concrete_slot_types(
     num_locals: usize,
     valuestackdepth: usize,
 ) -> Vec<Type> {
+    // virtualizable.py:44: declared type of locals_cells_stack_w is
+    // always Ref (W_Root pointer array). However, pyre's trace opcode
+    // handlers currently produce Int/Float OpRefs for LOAD_FAST when the
+    // concrete value is W_IntObject/W_FloatObject — they don't emit the
+    // RPython guard_class + getfield_gc_i unboxing sequence yet.
+    // Until vable-locals lowering (Phase 4/5) lands, trace-time slot
+    // types must match what the handlers actually produce.
     let stack_only = valuestackdepth.saturating_sub(num_locals);
     let mut types = Vec::with_capacity(num_locals + stack_only);
     for idx in 0..num_locals {
         types.push(
             concrete_stack_value(frame, idx)
-                .map(concrete_virtualizable_slot_type)
+                .map(concrete_value_type)
                 .unwrap_or(Type::Ref),
         );
     }
     for stack_idx in 0..stack_only {
         types.push(
             concrete_stack_value(frame, num_locals + stack_idx)
-                .map(concrete_virtualizable_slot_type)
+                .map(concrete_value_type)
                 .unwrap_or(Type::Ref),
         );
     }
@@ -2652,10 +2696,16 @@ impl JitState for PyreJitState {
         sym.init_vable_indices();
         sym.nlocals = _meta.num_locals;
         sym.valuestackdepth = _meta.valuestackdepth;
-        // RPython parity: all Python locals/stack are Ref (PyObjectRef).
-        sym.symbolic_local_types = vec![Type::Ref; _meta.num_locals.min(_meta.slot_types.len())];
-        sym.symbolic_stack_types =
-            vec![Type::Ref; _meta.slot_types.len().saturating_sub(_meta.num_locals)];
+        // RPython parity: slot types from meta reflect actual value types
+        // (Int for W_IntObject, Float for W_FloatObject, Ref otherwise).
+        let n = _meta.num_locals.min(_meta.slot_types.len());
+        sym.symbolic_local_types = _meta.slot_types[..n].to_vec();
+        let stack_n = _meta.slot_types.len().saturating_sub(_meta.num_locals);
+        sym.symbolic_stack_types = if _meta.slot_types.len() > _meta.num_locals {
+            _meta.slot_types[_meta.num_locals..].to_vec()
+        } else {
+            vec![Type::Ref; stack_n]
+        };
         let stack_only = _meta.vable_stack_only_depth();
         sym.symbolic_stack = vec![OpRef::NONE; stack_only];
         sym.concrete_stack = vec![ConcreteValue::Null; stack_only];
@@ -3543,18 +3593,19 @@ fn materialize_virtual_raw_buffer(
     for i in 0..offsets.len() {
         let concrete = values[i].resolve_with_refs(materialized_refs)?;
         let di = &descrs[i];
+        let bh_descr = majit_codewriter::jitcode::BhDescr::from_array_descr_info(di);
         // resume.py:1544: assert not descr.is_array_of_pointers()
         assert!(
-            di.item_type != 0,
+            !bh_descr.is_array_of_pointers(),
             "raw buffer entry must not be pointer type"
         );
         let offset = offsets[i] as i64;
         if di.item_type == 2 {
             // resume.py:1545-1547: descr.is_array_of_floats() → bh_raw_store_f
-            backend.bh_raw_store_f(buffer, offset, f64::from_bits(concrete as u64));
+            backend.bh_raw_store_f(buffer, offset, f64::from_bits(concrete as u64), &bh_descr);
         } else {
             // resume.py:1548-1550: else → bh_raw_store_i
-            backend.bh_raw_store_i(buffer, offset, concrete, di.item_size);
+            backend.bh_raw_store_i(buffer, offset, concrete, &bh_descr);
         }
     }
 

@@ -1616,13 +1616,24 @@ pub trait Backend: Send {
         _length: i64,
     ) {
     }
-    /// model.py: bh_raw_load_i(ptr, offset, descr)
-    fn bh_raw_load_i(&self, _ptr: i64, _offset: i64) -> i64 {
+    /// llmodel.py:747-750 bh_raw_load_i(addr, offset, descr).
+    fn bh_raw_load_i(
+        &self,
+        _addr: i64,
+        _offset: i64,
+        _descr: &majit_codewriter::jitcode::BhDescr,
+    ) -> i64 {
         0
     }
-    /// model.py: bh_raw_store_i(ptr, offset, value, descr)
-    /// llmodel.py:739-742: unpack_arraydescr_size(descr) → write_int_at_mem(addr, offset, size, newvalue)
-    fn bh_raw_store_i(&self, _ptr: i64, _offset: i64, _value: i64, _size: usize) {}
+    /// llmodel.py:739-742 bh_raw_store_i(addr, offset, newvalue, descr).
+    fn bh_raw_store_i(
+        &self,
+        _addr: i64,
+        _offset: i64,
+        _newvalue: i64,
+        _descr: &majit_codewriter::jitcode::BhDescr,
+    ) {
+    }
     // ── model.py: interior field access ──
     /// model.py: bh_getinteriorfield_gc_i(array, index, descr)
     fn bh_getinteriorfield_gc_i(
@@ -1720,10 +1731,24 @@ pub trait Backend: Send {
         _bytes: i64,
     ) {
     }
-    fn bh_raw_load_f(&self, _ptr: i64, _offset: i64) -> f64 {
+    /// llmodel.py:752-753 bh_raw_load_f(addr, offset, descr).
+    fn bh_raw_load_f(
+        &self,
+        _addr: i64,
+        _offset: i64,
+        _descr: &majit_codewriter::jitcode::BhDescr,
+    ) -> f64 {
         0.0
     }
-    fn bh_raw_store_f(&self, _ptr: i64, _offset: i64, _value: f64) {}
+    /// llmodel.py:744-745 bh_raw_store_f(addr, offset, newvalue, descr).
+    fn bh_raw_store_f(
+        &self,
+        _addr: i64,
+        _offset: i64,
+        _newvalue: f64,
+        _descr: &majit_codewriter::jitcode::BhDescr,
+    ) {
+    }
     // ── model.py: raw field access ──
     fn bh_getfield_raw_i(
         &self,

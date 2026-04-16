@@ -545,7 +545,7 @@ impl Assembler {
                 base,
                 index,
                 item_ty,
-                ..
+                array_type_id,
             } => {
                 let (reg, kc) = self.lookup_reg_with_kind(*base, regallocs);
                 state.code.push(reg);
@@ -553,11 +553,13 @@ impl Assembler {
                 let (reg, kc) = self.lookup_reg_with_kind(*index, regallocs);
                 state.code.push(reg);
                 argcodes.push(kc);
+                let (itemsize, is_item_signed) = arraydescrof(item_ty, array_type_id.as_deref());
                 let descr_idx = self.descrs.len();
                 self.descrs.push(crate::jitcode::BhDescr::Array {
-                    itemsize: value_type_to_itemsize(item_ty),
+                    itemsize,
                     is_array_of_pointers: matches!(item_ty, crate::model::ValueType::Ref),
                     is_array_of_structs: false,
+                    is_item_signed,
                 });
                 state.code.push((descr_idx & 0xFF) as u8);
                 state.code.push((descr_idx >> 8) as u8);
@@ -578,7 +580,7 @@ impl Assembler {
                 index,
                 value,
                 item_ty,
-                ..
+                array_type_id,
             } => {
                 let (reg, kc) = self.lookup_reg_with_kind(*base, regallocs);
                 state.code.push(reg);
@@ -589,11 +591,13 @@ impl Assembler {
                 let (reg, kc) = self.lookup_reg_with_kind(*value, regallocs);
                 state.code.push(reg);
                 argcodes.push(kc);
+                let (itemsize, is_item_signed) = arraydescrof(item_ty, array_type_id.as_deref());
                 let descr_idx = self.descrs.len();
                 self.descrs.push(crate::jitcode::BhDescr::Array {
-                    itemsize: value_type_to_itemsize(item_ty),
+                    itemsize,
                     is_array_of_pointers: matches!(item_ty, crate::model::ValueType::Ref),
                     is_array_of_structs: false,
+                    is_item_signed,
                 });
                 state.code.push((descr_idx & 0xFF) as u8);
                 state.code.push((descr_idx >> 8) as u8);
@@ -647,7 +651,8 @@ impl Assembler {
                 array_index,
                 elem_index,
                 item_ty,
-                ..
+                array_itemsize,
+                array_is_signed,
             } => {
                 let (reg, kc) = self.lookup_reg_with_kind(*elem_index, regallocs);
                 state.code.push(reg);
@@ -660,12 +665,13 @@ impl Assembler {
                 state.code.push((descr_idx & 0xFF) as u8);
                 state.code.push((descr_idx >> 8) as u8);
                 argcodes.push('d');
-                // Second descriptor: array items descriptor (placeholder).
+                // Second descriptor: arraydescr from VirtualizableInfo.array_descrs.
                 let descr_idx2 = self.descrs.len();
                 self.descrs.push(crate::jitcode::BhDescr::Array {
-                    itemsize: value_type_to_itemsize(item_ty),
+                    itemsize: *array_itemsize,
                     is_array_of_pointers: matches!(item_ty, crate::model::ValueType::Ref),
                     is_array_of_structs: false,
+                    is_item_signed: *array_is_signed,
                 });
                 state.code.push((descr_idx2 & 0xFF) as u8);
                 state.code.push((descr_idx2 >> 8) as u8);
@@ -686,7 +692,8 @@ impl Assembler {
                 elem_index,
                 value,
                 item_ty,
-                ..
+                array_itemsize,
+                array_is_signed,
             } => {
                 let (reg, kc) = self.lookup_reg_with_kind(*elem_index, regallocs);
                 state.code.push(reg);
@@ -702,12 +709,13 @@ impl Assembler {
                 state.code.push((descr_idx & 0xFF) as u8);
                 state.code.push((descr_idx >> 8) as u8);
                 argcodes.push('d');
-                // Second descriptor: array items descriptor (placeholder).
+                // Second descriptor: arraydescr from VirtualizableInfo.array_descrs.
                 let descr_idx2 = self.descrs.len();
                 self.descrs.push(crate::jitcode::BhDescr::Array {
-                    itemsize: value_type_to_itemsize(item_ty),
+                    itemsize: *array_itemsize,
                     is_array_of_pointers: matches!(item_ty, crate::model::ValueType::Ref),
                     is_array_of_structs: false,
+                    is_item_signed: *array_is_signed,
                 });
                 state.code.push((descr_idx2 & 0xFF) as u8);
                 state.code.push((descr_idx2 >> 8) as u8);
@@ -883,6 +891,62 @@ fn value_type_to_itemsize(ty: &crate::model::ValueType) -> usize {
         ValueType::Float => 8,
         _ => 8,
     }
+}
+
+/// jtransform.py:773,802 cpu.arraydescrof(ARRAY) equivalent.
+///
+/// Determines (itemsize, is_item_signed) from the array element type.
+/// When `array_type_id` is available (e.g. `Vec<i32>` → element `i32`),
+/// the result is exact. Fallback uses descr.py:241-254 get_type_flag()
+/// semantics: Int → FLAG_SIGNED, Float/Ref → FLAG_UNSIGNED/FLAG_FLOAT.
+fn arraydescrof(ty: &crate::model::ValueType, array_type_id: Option<&str>) -> (usize, bool) {
+    // Primary path: extract element type from the array type identity
+    // (our equivalent of `ARRAY.OF` in RPython).
+    if let Some(elem) = array_type_id.and_then(extract_element_type_from_str) {
+        return match elem.as_str() {
+            "i8" => (1, true),
+            "i16" => (2, true),
+            "i32" => (4, true),
+            "i64" | "isize" => (8, true),
+            "u8" | "bool" => (1, false),
+            "u16" => (2, false),
+            "u32" => (4, false),
+            "u64" | "usize" => (8, false),
+            "f32" => (4, false),
+            "f64" => (8, false),
+            _ => (value_type_to_itemsize(ty), false),
+        };
+    }
+    // Fallback: descr.py:241-254 get_type_flag(ARRAY.OF).
+    // Int (lltype.Signed) → FLAG_SIGNED, Float → FLAG_FLOAT,
+    // Ref (gc pointer) → FLAG_POINTER. Only FLAG_SIGNED → is_item_signed=true.
+    match ty {
+        crate::model::ValueType::Int => (8, true),
+        crate::model::ValueType::Float => (8, false),
+        crate::model::ValueType::Ref => (8, false),
+        _ => (8, false),
+    }
+}
+
+fn extract_element_type_from_str(type_str: &str) -> Option<String> {
+    let s = type_str.trim();
+    if let (Some(start), Some(end)) = (s.find('<'), s.rfind('>')) {
+        if start < end {
+            return Some(s[start + 1..end].trim().to_string());
+        }
+    }
+    if s.starts_with('[') && s.ends_with(']') {
+        let inner = &s[1..s.len() - 1];
+        let elem = if let Some(semi) = inner.find(';') {
+            inner[..semi].trim()
+        } else {
+            inner.trim()
+        };
+        if !elem.is_empty() {
+            return Some(elem.to_string());
+        }
+    }
+    None
 }
 
 /// RPython liveness.py:147-166: encode_liveness.

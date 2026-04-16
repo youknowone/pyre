@@ -22,6 +22,11 @@ pub struct VirtualizableFieldDescriptor {
     pub name: String,
     pub owner_root: Option<String>,
     pub index: usize,
+    /// RPython: cpu.arraydescrof(ARRAY.TO).itemsize — item byte size for
+    /// vable arrays. None for scalar fields.
+    pub array_itemsize: Option<usize>,
+    /// RPython: arraydescr.is_item_signed() — FLAG_SIGNED for vable arrays.
+    pub array_is_signed: Option<bool>,
 }
 
 impl VirtualizableFieldDescriptor {
@@ -30,6 +35,26 @@ impl VirtualizableFieldDescriptor {
             name: name.into(),
             owner_root,
             index,
+            array_itemsize: None,
+            array_is_signed: None,
+        }
+    }
+
+    /// Create a descriptor with arraydescr info (for vable array fields).
+    /// RPython: `VirtualizableInfo.__init__` stores `cpu.arraydescrof(ARRAY.TO)`.
+    pub fn new_with_arraydescr(
+        name: impl Into<String>,
+        owner_root: Option<String>,
+        index: usize,
+        itemsize: usize,
+        is_signed: bool,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            owner_root,
+            index,
+            array_itemsize: Some(itemsize),
+            array_is_signed: Some(is_signed),
         }
     }
 
@@ -158,7 +183,8 @@ pub struct Transformer<'a> {
     /// RPython: types are on `Variable.concretetype` — we pass them explicitly.
     type_state: Option<&'a crate::translator::rtyper::rtyper::TypeResolutionState>,
     /// RPython: `Transformer.vable_array_vars`.
-    vable_array_vars: std::collections::HashMap<ValueId, usize>,
+    /// Stores (array_index, itemsize, is_signed) per vable array variable.
+    vable_array_vars: std::collections::HashMap<ValueId, (usize, usize, bool)>,
     /// RPython: `Transformer.vable_flags`.
     #[allow(dead_code)]
     vable_flags: std::collections::HashMap<ValueId, VableFlag>,
@@ -432,7 +458,12 @@ impl<'a> Transformer<'a> {
         // Track virtualizable array field reads
         if let Some(array_field) = self.config.vable_arrays.iter().find(|c| c.matches(field)) {
             if let Some(result) = op.result {
-                self.vable_array_vars.insert(result, array_field.index);
+                // RPython: vable_array_vars[result] = (v_base, arrayfielddescr, arraydescr)
+                // We store (index, itemsize, is_signed) — the arraydescr properties.
+                let itemsize = array_field.array_itemsize.unwrap_or(8);
+                let is_signed = array_field.array_is_signed.unwrap_or(false);
+                self.vable_array_vars
+                    .insert(result, (array_field.index, itemsize, is_signed));
             }
         }
         // Virtualizable scalar field → VableFieldRead
@@ -495,7 +526,7 @@ impl<'a> Transformer<'a> {
         item_ty: &ValueType,
         graph_name: &str,
     ) -> RewriteResult {
-        if let Some(&arr_idx) = self.vable_array_vars.get(&base) {
+        if let Some(&(arr_idx, itemsize, is_signed)) = self.vable_array_vars.get(&base) {
             self.notes.push(GraphTransformNote {
                 function: graph_name.to_string(),
                 detail: format!("rewrite: array[idx] → VableArrayRead[{arr_idx}]"),
@@ -507,6 +538,8 @@ impl<'a> Transformer<'a> {
                     array_index: arr_idx,
                     elem_index: index,
                     item_ty: item_ty.clone(),
+                    array_itemsize: itemsize,
+                    array_is_signed: is_signed,
                 },
             }]);
         }
@@ -523,7 +556,7 @@ impl<'a> Transformer<'a> {
         item_ty: &ValueType,
         graph_name: &str,
     ) -> RewriteResult {
-        if let Some(&arr_idx) = self.vable_array_vars.get(&base) {
+        if let Some(&(arr_idx, itemsize, is_signed)) = self.vable_array_vars.get(&base) {
             self.notes.push(GraphTransformNote {
                 function: graph_name.to_string(),
                 detail: format!("rewrite: array[idx] = v → VableArrayWrite[{arr_idx}]"),
@@ -536,6 +569,8 @@ impl<'a> Transformer<'a> {
                     elem_index: index,
                     value,
                     item_ty: item_ty.clone(),
+                    array_itemsize: itemsize,
+                    array_is_signed: is_signed,
                 },
             }]);
         }
@@ -1626,21 +1661,29 @@ fn remap_op(
             array_index,
             elem_index,
             item_ty,
+            array_itemsize,
+            array_is_signed,
         } => OpKind::VableArrayRead {
             array_index: *array_index,
             elem_index: remap_value(*elem_index, aliases),
             item_ty: item_ty.clone(),
+            array_itemsize: *array_itemsize,
+            array_is_signed: *array_is_signed,
         },
         OpKind::VableArrayWrite {
             array_index,
             elem_index,
             value,
             item_ty,
+            array_itemsize,
+            array_is_signed,
         } => OpKind::VableArrayWrite {
             array_index: *array_index,
             elem_index: remap_value(*elem_index, aliases),
             value: remap_value(*value, aliases),
             item_ty: item_ty.clone(),
+            array_itemsize: *array_itemsize,
+            array_is_signed: *array_is_signed,
         },
         OpKind::BinOp {
             op,

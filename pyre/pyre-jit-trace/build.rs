@@ -59,10 +59,15 @@ fn main() {
                 vable_arrays: virtualizable_spec::PYFRAME_VABLE_ARRAYS
                     .iter()
                     .map(|(name, idx)| {
-                        majit_codewriter::VirtualizableFieldDescriptor::new(
+                        // virtualizable.py:58 — VirtualizableInfo.array_descrs[i] =
+                        // cpu.arraydescrof(getattr(VTYPE, name).TO). Python frame
+                        // locals are PyObjectRef pointers: itemsize=8, is_signed=false.
+                        majit_codewriter::VirtualizableFieldDescriptor::new_with_arraydescr(
                             *name,
                             Some(virtualizable_spec::PYFRAME_VABLE_OWNER_ROOT.to_string()),
                             *idx,
+                            8,     // itemsize: PyObjectRef is a pointer
+                            false, // is_signed: pointers are unsigned
                         )
                     })
                     .collect(),

@@ -607,9 +607,7 @@ impl MIFrame {
     ) -> Result<(), PyError> {
         // RPython pyjitpl.py opimpl_setlocal: stores the box directly.
         // Unboxing happens at operation time (binary_float_value, etc.),
-        // not at store time. concrete_virtualizable_slot_type always
-        // returns Type::Ref (pyre slots are GCREFs), so any
-        // concrete-type-based unboxing here was dead code.
+        // not at store time.
         let stored_type = self.value_type(value);
         let s = self.sym_mut();
         if idx >= s.symbolic_locals.len() {
@@ -1046,15 +1044,15 @@ impl MIFrame {
             s.nlocals = concrete_nlocals;
             s.valuestackdepth = concrete_vsd;
             let stack_only = s.stack_only_depth();
-            // RPython pyjitpl.py:2955-2965: loop-carried types come from
+            // pyjitpl.py:2955-2965: loop-carried types come from
             // the actual tracked symbolic types (INT/REF/FLOAT). Only
             // reset to Ref when the type vector drifted in length
             // (e.g. inline tracing changed nlocals).
             if s.symbolic_local_types.len() != concrete_nlocals {
-                s.symbolic_local_types = vec![Type::Ref; concrete_nlocals];
+                s.symbolic_local_types.resize(concrete_nlocals, Type::Ref);
             }
             if s.symbolic_stack_types.len() != stack_only {
-                s.symbolic_stack_types = vec![Type::Ref; stack_only];
+                s.symbolic_stack_types.resize(stack_only, Type::Ref);
             }
             if s.symbolic_stack.len() < stack_only {
                 s.symbolic_stack.resize(stack_only, OpRef::NONE);

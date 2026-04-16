@@ -205,6 +205,10 @@ pub enum OpKind {
         array_index: usize,
         elem_index: ValueId,
         item_ty: ValueType,
+        /// RPython: arraydescr.itemsize from VirtualizableInfo.array_descrs.
+        array_itemsize: usize,
+        /// RPython: arraydescr.is_item_signed() from VirtualizableInfo.array_descrs.
+        array_is_signed: bool,
     },
     /// Virtualizable array write → writes to boxes.
     /// RPython: `setarrayitem_vable_i/r/f`
@@ -213,6 +217,10 @@ pub enum OpKind {
         elem_index: ValueId,
         value: ValueId,
         item_ty: ValueType,
+        /// RPython: arraydescr.itemsize from VirtualizableInfo.array_descrs.
+        array_itemsize: usize,
+        /// RPython: arraydescr.is_item_signed() from VirtualizableInfo.array_descrs.
+        array_is_signed: bool,
     },
     /// Binary arithmetic/comparison operation.
     /// RPython: `int_add`, `int_lt`, etc.

@@ -105,6 +105,18 @@ impl LiveVars {
         // Temporary per-PC bitvector for the inner loop.
         let mut live = vec![0u64; words_per_pc];
 
+        // Exception table: (start, end, target) ranges for implicit
+        // control flow. Any instruction in [start, end) can jump to
+        // target on exception — the target's live set must be unioned
+        // into every PC in the range.
+        let exc_handlers: Vec<(usize, usize, usize)> = {
+            let entries = pyre_interpreter::bytecode::decode_exception_table(&code.exceptiontable);
+            entries
+                .iter()
+                .map(|e| (e.start as usize, e.end as usize, e.target as usize))
+                .collect()
+        };
+
         // Fixed-point backward analysis for local liveness.
         let mut changed = true;
         while changed {
@@ -149,8 +161,9 @@ impl LiveVars {
                         }
                     }
                 }
-                // GEN/KILL for locals.
-                // GEN (use) and KILL (def) for locals.
+                // liveness.py:59-78 GEN/KILL for locals.
+                // GEN: register is read (add to alive).
+                // KILL: register is written (remove from alive).
                 match instr {
                     Instruction::LoadFast { var_num }
                     | Instruction::LoadFastBorrow { var_num }
@@ -247,6 +260,20 @@ impl LiveVars {
                         }
                     }
                     other => warn_unhandled_opcode("gen_kill", &other),
+                }
+                // Exception handlers: union with handler target's live set.
+                // This handles implicit control flow edges from try blocks
+                // to except handlers (not covered by explicit jump targets).
+                for entry in &exc_handlers {
+                    if pc >= entry.0 && pc < entry.1 {
+                        let tgt = entry.2;
+                        let tgt_base = tgt * words_per_pc;
+                        if tgt_base + words_per_pc <= live_bits.len() {
+                            for w in 0..words_per_pc {
+                                live[w] |= live_bits[tgt_base + w];
+                            }
+                        }
+                    }
                 }
                 let base = pc * words_per_pc;
                 if (0..words_per_pc).any(|w| live_bits[base + w] != live[w]) {

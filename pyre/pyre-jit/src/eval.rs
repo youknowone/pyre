@@ -2439,9 +2439,10 @@ fn materialize_virtual_from_rd(
             //     decoder.setrawbuffer_item(buffer, fieldnums[i], offset, descr)
             for (i, &fnum) in fieldnums.iter().enumerate() {
                 let di = &descrs[i];
+                let bh_descr = majit_codewriter::jitcode::BhDescr::from_array_descr_info(di);
                 // resume.py:1544: assert not descr.is_array_of_pointers()
                 assert!(
-                    di.item_type != 0,
+                    !bh_descr.is_array_of_pointers(),
                     "raw buffer entry must not be pointer type"
                 );
                 let offset = offsets[i] as i64;
@@ -2457,7 +2458,7 @@ fn materialize_virtual_from_rd(
                         virtuals_cache,
                     );
                     // resume.py:1547: self.cpu.bh_raw_store_f(buffer, offset, newvalue, descr)
-                    backend.bh_raw_store_f(buffer, offset, fval);
+                    backend.bh_raw_store_f(buffer, offset, fval, &bh_descr);
                 } else {
                     // resume.py:1549: newvalue = self.decode_int(fieldnum)
                     let ival = decode_tagged_fieldnum_int(
@@ -2469,7 +2470,7 @@ fn materialize_virtual_from_rd(
                         virtuals_cache,
                     );
                     // resume.py:1550: self.cpu.bh_raw_store_i(buffer, offset, newvalue, descr)
-                    backend.bh_raw_store_i(buffer, offset, ival, di.item_size);
+                    backend.bh_raw_store_i(buffer, offset, ival, &bh_descr);
                 }
             }
             return result;
@@ -3994,15 +3995,22 @@ fn rebuild_state_after_failure_from_recovery_layout(
                 for (i, src) in values.iter().enumerate() {
                     if let Some(val) = resolve_value(src, &materialized) {
                         let di = &descrs[i];
+                        let bh_descr =
+                            majit_codewriter::jitcode::BhDescr::from_array_descr_info(di);
                         assert!(
-                            di.item_type != 0,
+                            !bh_descr.is_array_of_pointers(),
                             "raw buffer entry must not be pointer type"
                         );
                         let offset = offsets[i] as i64;
                         if di.item_type == 2 {
-                            backend.bh_raw_store_f(buffer, offset, f64::from_bits(val as u64));
+                            backend.bh_raw_store_f(
+                                buffer,
+                                offset,
+                                f64::from_bits(val as u64),
+                                &bh_descr,
+                            );
                         } else {
-                            backend.bh_raw_store_i(buffer, offset, val, di.item_size);
+                            backend.bh_raw_store_i(buffer, offset, val, &bh_descr);
                         }
                     }
                 }
@@ -4343,9 +4351,10 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
         value: i64,
         descr: &majit_ir::ArrayDescrInfo,
     ) {
+        let bh_descr = majit_codewriter::jitcode::BhDescr::from_array_descr_info(descr);
         // resume.py:1544: assert not descr.is_array_of_pointers()
         assert!(
-            descr.item_type != 0,
+            !bh_descr.is_array_of_pointers(),
             "raw buffer entry must not be pointer type"
         );
         let (driver, _) = driver_pair();
@@ -4354,12 +4363,17 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
             // resume.py:1545-1547: descr.is_array_of_floats()
             //   newvalue = self.decode_float(fieldnum)
             //   self.cpu.bh_raw_store_f(buffer, offset, newvalue, descr)
-            backend.bh_raw_store_f(buffer, offset as i64, f64::from_bits(value as u64));
+            backend.bh_raw_store_f(
+                buffer,
+                offset as i64,
+                f64::from_bits(value as u64),
+                &bh_descr,
+            );
         } else {
             // resume.py:1548-1550: else (int)
             //   newvalue = self.decode_int(fieldnum)
             //   self.cpu.bh_raw_store_i(buffer, offset, newvalue, descr)
-            backend.bh_raw_store_i(buffer, offset as i64, value, descr.item_size);
+            backend.bh_raw_store_i(buffer, offset as i64, value, &bh_descr);
         }
     }
 

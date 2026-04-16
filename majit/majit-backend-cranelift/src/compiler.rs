@@ -5148,6 +5148,59 @@ pub struct CraneliftBackend {
 }
 
 impl CraneliftBackend {
+    /// llmodel.py:467-478 read_int_at_mem(gcref, ofs, size, sign).
+    fn read_int_at_mem(&self, addr: i64, offset: i64, size: usize, sign: bool) -> i64 {
+        if addr == 0 {
+            return 0;
+        }
+        let ptr = (addr as usize).wrapping_add(offset as usize);
+        unsafe {
+            match (size, sign) {
+                (1, true) => (ptr as *const i8).read_unaligned() as i64,
+                (1, false) => (ptr as *const u8).read_unaligned() as i64,
+                (2, true) => (ptr as *const i16).read_unaligned() as i64,
+                (2, false) => (ptr as *const u16).read_unaligned() as i64,
+                (4, true) => (ptr as *const i32).read_unaligned() as i64,
+                (4, false) => (ptr as *const u32).read_unaligned() as i64,
+                _ => (ptr as *const i64).read_unaligned(),
+            }
+        }
+    }
+
+    /// llmodel.py:481-488 write_int_at_mem(gcref, ofs, size, newvalue).
+    fn write_int_at_mem(&self, addr: i64, offset: i64, size: usize, newvalue: i64) {
+        if addr == 0 {
+            return;
+        }
+        let ptr = (addr as usize).wrapping_add(offset as usize);
+        unsafe {
+            match size {
+                1 => (ptr as *mut u8).write_unaligned(newvalue as u8),
+                2 => (ptr as *mut u16).write_unaligned(newvalue as u16),
+                4 => (ptr as *mut u32).write_unaligned(newvalue as u32),
+                _ => (ptr as *mut i64).write_unaligned(newvalue),
+            }
+        }
+    }
+
+    /// llmodel.py:490-491 read_float_at_mem(gcref, ofs).
+    fn read_float_at_mem(&self, addr: i64, offset: i64) -> f64 {
+        if addr == 0 {
+            return 0.0;
+        }
+        let ptr = (addr as usize).wrapping_add(offset as usize);
+        unsafe { (ptr as *const f64).read_unaligned() }
+    }
+
+    /// llmodel.py:493-494 write_float_at_mem(gcref, ofs, newvalue).
+    fn write_float_at_mem(&self, addr: i64, offset: i64, newvalue: f64) {
+        if addr == 0 {
+            return;
+        }
+        let ptr = (addr as usize).wrapping_add(offset as usize);
+        unsafe { (ptr as *mut f64).write_unaligned(newvalue) }
+    }
+
     /// Propagate bridges from previous tokens' fail_descrs to the current
     /// token's fail_descrs. Called after finish_and_compile replaces the
     /// token — bridges compiled during main loop tracing were attached to
@@ -11808,34 +11861,57 @@ impl majit_backend::Backend for CraneliftBackend {
         unsafe { bh_call_i_dispatch(func as usize, &int_args, &float_args) }
     }
 
-    /// llmodel.py:739-742 bh_raw_store_i(addr, offset, newvalue, descr)
-    /// llmodel.py:481-488 write_int_at_mem(addr, offset, size, newvalue)
-    fn bh_raw_store_i(&self, addr: i64, offset: i64, value: i64, size: usize) {
-        if addr == 0 {
-            return;
-        }
-        unsafe {
-            let ptr = (addr as *mut u8).offset(offset as isize);
-            // llmodel.py:482-488: cast by itemsize
-            match size {
-                1 => *(ptr as *mut u8) = value as u8,
-                2 => (ptr as *mut u16).write_unaligned(value as u16),
-                4 => (ptr as *mut u32).write_unaligned(value as u32),
-                _ => (ptr as *mut i64).write_unaligned(value),
-            }
-        }
+    /// llmodel.py:747-750 bh_raw_load_i(addr, offset, descr).
+    fn bh_raw_load_i(
+        &self,
+        addr: i64,
+        offset: i64,
+        descr: &majit_codewriter::jitcode::BhDescr,
+    ) -> i64 {
+        // llmodel.py:748-749: ofs, size, sign = self.unpack_arraydescr_size(descr)
+        // ofs == 0 always for raw lengthless arrays (llmodel.py:749 assert)
+        let size = descr.as_itemsize();
+        let sign = descr.is_item_signed();
+        // llmodel.py:750: return self.read_int_at_mem(addr, offset, size, sign)
+        self.read_int_at_mem(addr, offset, size, sign)
     }
 
-    /// llmodel.py:744 bh_raw_store_f(addr, offset, newvalue, descr)
-    /// llmodel.py:504 write_float_at_mem: raw_store float.
-    fn bh_raw_store_f(&self, addr: i64, offset: i64, value: f64) {
-        if addr == 0 {
-            return;
-        }
-        unsafe {
-            let ptr = (addr as *mut u8).offset(offset as isize);
-            (ptr as *mut f64).write_unaligned(value);
-        }
+    /// llmodel.py:739-742 bh_raw_store_i(addr, offset, newvalue, descr).
+    fn bh_raw_store_i(
+        &self,
+        addr: i64,
+        offset: i64,
+        newvalue: i64,
+        descr: &majit_codewriter::jitcode::BhDescr,
+    ) {
+        // llmodel.py:740-741: ofs, size, _ = self.unpack_arraydescr_size(descr)
+        // ofs == 0 always for raw lengthless arrays (llmodel.py:741 assert)
+        let size = descr.as_itemsize();
+        // llmodel.py:742: self.write_int_at_mem(addr, offset, size, newvalue)
+        self.write_int_at_mem(addr, offset, size, newvalue);
+    }
+
+    /// llmodel.py:752-753 bh_raw_load_f(addr, offset, descr).
+    fn bh_raw_load_f(
+        &self,
+        addr: i64,
+        offset: i64,
+        _descr: &majit_codewriter::jitcode::BhDescr,
+    ) -> f64 {
+        // llmodel.py:753: return self.read_float_at_mem(addr, offset)
+        self.read_float_at_mem(addr, offset)
+    }
+
+    /// llmodel.py:744-745 bh_raw_store_f(addr, offset, newvalue, descr).
+    fn bh_raw_store_f(
+        &self,
+        addr: i64,
+        offset: i64,
+        newvalue: f64,
+        _descr: &majit_codewriter::jitcode::BhDescr,
+    ) {
+        // llmodel.py:745: self.write_float_at_mem(addr, offset, newvalue)
+        self.write_float_at_mem(addr, offset, newvalue);
     }
 
     /// llsupport/gc.py:563 GcLLDescr_framework

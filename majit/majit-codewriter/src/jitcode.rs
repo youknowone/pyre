@@ -427,6 +427,8 @@ pub enum BhDescr {
         itemsize: usize,
         is_array_of_pointers: bool,
         is_array_of_structs: bool,
+        /// descr.py ArrayDescr.is_item_signed() — FLAG_SIGNED vs FLAG_UNSIGNED.
+        is_item_signed: bool,
     },
     Size {
         size: usize,
@@ -510,6 +512,27 @@ impl BhDescr {
         }
     }
 
+    /// descr.py ArrayDescr.is_item_signed() — signed integer items.
+    pub fn is_item_signed(&self) -> bool {
+        match self {
+            BhDescr::Array { is_item_signed, .. } => *is_item_signed,
+            _ => false,
+        }
+    }
+
+    /// Reconstruct BhDescr::Array from serialized ArrayDescrInfo.
+    /// Used at resume/materialization boundaries where only the summary is available.
+    pub fn from_array_descr_info(info: &majit_ir::ArrayDescrInfo) -> Self {
+        BhDescr::Array {
+            itemsize: info.item_size,
+            is_array_of_pointers: info.item_type == 0,
+            is_array_of_structs: false,
+            is_item_signed: info.is_signed,
+        }
+    }
+
+    /// ArrayDescr: true when the array items are structs (GC objects).
+    /// RPython: `arraydescr.is_array_of_structs()` in blackhole.py:1165.
     pub fn is_array_of_structs(&self) -> bool {
         match self {
             BhDescr::Array {

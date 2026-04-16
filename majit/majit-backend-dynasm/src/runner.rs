@@ -165,6 +165,59 @@ pub struct DynasmBackend {
 }
 
 impl DynasmBackend {
+    /// llmodel.py:467-478 read_int_at_mem(gcref, ofs, size, sign).
+    fn read_int_at_mem(&self, addr: i64, offset: i64, size: usize, sign: bool) -> i64 {
+        if addr == 0 {
+            return 0;
+        }
+        let ptr = (addr as usize).wrapping_add(offset as usize);
+        unsafe {
+            match (size, sign) {
+                (1, true) => (ptr as *const i8).read_unaligned() as i64,
+                (1, false) => (ptr as *const u8).read_unaligned() as i64,
+                (2, true) => (ptr as *const i16).read_unaligned() as i64,
+                (2, false) => (ptr as *const u16).read_unaligned() as i64,
+                (4, true) => (ptr as *const i32).read_unaligned() as i64,
+                (4, false) => (ptr as *const u32).read_unaligned() as i64,
+                _ => (ptr as *const i64).read_unaligned(),
+            }
+        }
+    }
+
+    /// llmodel.py:481-488 write_int_at_mem(gcref, ofs, size, newvalue).
+    fn write_int_at_mem(&self, addr: i64, offset: i64, size: usize, newvalue: i64) {
+        if addr == 0 {
+            return;
+        }
+        let ptr = (addr as usize).wrapping_add(offset as usize);
+        unsafe {
+            match size {
+                1 => (ptr as *mut u8).write_unaligned(newvalue as u8),
+                2 => (ptr as *mut u16).write_unaligned(newvalue as u16),
+                4 => (ptr as *mut u32).write_unaligned(newvalue as u32),
+                _ => (ptr as *mut i64).write_unaligned(newvalue),
+            }
+        }
+    }
+
+    /// llmodel.py:490-491 read_float_at_mem(gcref, ofs).
+    fn read_float_at_mem(&self, addr: i64, offset: i64) -> f64 {
+        if addr == 0 {
+            return 0.0;
+        }
+        let ptr = (addr as usize).wrapping_add(offset as usize);
+        unsafe { (ptr as *const f64).read_unaligned() }
+    }
+
+    /// llmodel.py:493-494 write_float_at_mem(gcref, ofs, newvalue).
+    fn write_float_at_mem(&self, addr: i64, offset: i64, newvalue: f64) {
+        if addr == 0 {
+            return;
+        }
+        let ptr = (addr as usize).wrapping_add(offset as usize);
+        unsafe { (ptr as *mut f64).write_unaligned(newvalue) }
+    }
+
     pub fn new() -> Self {
         DynasmBackend {
             next_trace_id: 1,
@@ -1022,6 +1075,59 @@ impl Backend for DynasmBackend {
     /// Resolves a vtable pointer through the installed gc_ll_descr.
     fn get_typeid_from_classptr_if_gcremovetypeptr(&self, classptr: usize) -> Option<u32> {
         self.lookup_typeid_from_classptr(classptr)
+    }
+
+    /// llmodel.py:747-750 bh_raw_load_i(addr, offset, descr).
+    fn bh_raw_load_i(
+        &self,
+        addr: i64,
+        offset: i64,
+        descr: &majit_codewriter::jitcode::BhDescr,
+    ) -> i64 {
+        // llmodel.py:748-749: ofs, size, sign = self.unpack_arraydescr_size(descr)
+        // ofs == 0 always for raw lengthless arrays (llmodel.py:749 assert)
+        let size = descr.as_itemsize();
+        let sign = descr.is_item_signed();
+        // llmodel.py:750: return self.read_int_at_mem(addr, offset, size, sign)
+        self.read_int_at_mem(addr, offset, size, sign)
+    }
+
+    /// llmodel.py:739-742 bh_raw_store_i(addr, offset, newvalue, descr).
+    fn bh_raw_store_i(
+        &self,
+        addr: i64,
+        offset: i64,
+        newvalue: i64,
+        descr: &majit_codewriter::jitcode::BhDescr,
+    ) {
+        // llmodel.py:740-741: ofs, size, _ = self.unpack_arraydescr_size(descr)
+        // ofs == 0 always for raw lengthless arrays (llmodel.py:741 assert)
+        let size = descr.as_itemsize();
+        // llmodel.py:742: self.write_int_at_mem(addr, offset, size, newvalue)
+        self.write_int_at_mem(addr, offset, size, newvalue);
+    }
+
+    /// llmodel.py:752-753 bh_raw_load_f(addr, offset, descr).
+    fn bh_raw_load_f(
+        &self,
+        addr: i64,
+        offset: i64,
+        _descr: &majit_codewriter::jitcode::BhDescr,
+    ) -> f64 {
+        // llmodel.py:753: return self.read_float_at_mem(addr, offset)
+        self.read_float_at_mem(addr, offset)
+    }
+
+    /// llmodel.py:744-745 bh_raw_store_f(addr, offset, newvalue, descr).
+    fn bh_raw_store_f(
+        &self,
+        addr: i64,
+        offset: i64,
+        newvalue: f64,
+        _descr: &majit_codewriter::jitcode::BhDescr,
+    ) {
+        // llmodel.py:745: self.write_float_at_mem(addr, offset, newvalue)
+        self.write_float_at_mem(addr, offset, newvalue);
     }
 
     fn bh_getfield_gc_i(
