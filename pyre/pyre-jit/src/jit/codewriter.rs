@@ -68,7 +68,7 @@ pub struct PyJitCodeMetadata {
 
 /// Compiled JitCode plus pyre-only metadata.
 pub struct PyJitCode {
-    pub jitcode: JitCode,
+    pub jitcode: std::sync::Arc<JitCode>,
     pub metadata: PyJitCodeMetadata,
     /// True if the jitcode contains BC_ABORT opcodes (unsupported bytecodes).
     /// Precomputed at compile time to avoid repeated bytecode scanning.
@@ -1235,7 +1235,7 @@ impl CodeWriter {
         };
 
         PyJitCode {
-            jitcode,
+            jitcode: std::sync::Arc::new(jitcode),
             metadata,
             has_abort,
         }

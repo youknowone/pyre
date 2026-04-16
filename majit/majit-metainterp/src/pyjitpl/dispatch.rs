@@ -3,6 +3,7 @@
 /// RPython pyjitpl.py: MIFrame._interpret equivalent.
 use std::collections::HashMap;
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 use majit_backend::JitCellToken;
 use majit_ir::{OpCode, OpRef};
@@ -406,10 +407,42 @@ where
     }
 }
 
-pub struct JitCodeMachine<'a, S, R> {
-    frames: MIFrameStack<'a>,
+/// JitCode bytecode interpreter for tracing.
+///
+/// Borrows `frames: &'mi mut MIFrameStack` from the owning
+/// `MetaInterp<M>` so that pyre's runtime keeps a single canonical
+/// framestack — matching `pyjitpl.py`'s `self.framestack` invariant
+/// where MIFrame.run_one_step and the metainterp share one stack.
+///
+/// Trace-side helpers that have no MetaInterp handy can wrap an
+/// interim stack via [`StandaloneFrameStack`] — the legacy entry
+/// points (`trace_jitcode`, test fixtures) take that path.
+pub struct JitCodeMachine<'mi, S, R> {
+    frames: &'mi mut MIFrameStack,
     runtime_stacks: HashMap<usize, Vec<i64>>,
     marker: PhantomData<(S, R)>,
+}
+
+/// Owns an [`MIFrameStack`] for legacy `trace_jitcode` callers that
+/// do not (yet) hand a `MetaInterp::framestack` borrow into the
+/// jitcode interpreter.  Drops back to RPython parity once those
+/// call sites migrate.
+pub struct StandaloneFrameStack {
+    pub frames: MIFrameStack,
+}
+
+impl StandaloneFrameStack {
+    pub fn new() -> Self {
+        Self {
+            frames: MIFrameStack::empty(),
+        }
+    }
+}
+
+impl Default for StandaloneFrameStack {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Clone)]
@@ -419,7 +452,7 @@ struct ActiveStandardVirtualizable {
     obj_ptr: *mut u8,
 }
 
-impl<'a, S, R> JitCodeMachine<'a, S, R>
+impl<'mi, S, R> JitCodeMachine<'mi, S, R>
 where
     S: JitCodeSym,
     R: JitCodeRuntime,
@@ -950,13 +983,18 @@ where
         Ok(())
     }
 
-    pub fn new(
-        root: MIFrame<'a>,
-        _sub_jitcodes: &'a [JitCode],
-        _fn_ptrs: &'a [JitCallTarget],
+    /// Construct a `JitCodeMachine` over an existing framestack borrow.
+    ///
+    /// The caller — typically `MetaInterp::trace_jitcode_with_framestack`
+    /// or a [`StandaloneFrameStack`] wrapper — pushes the root MIFrame
+    /// before calling and pops it after the machine returns.
+    pub fn with_framestack(
+        frames: &'mi mut MIFrameStack,
+        _sub_jitcodes: &[Arc<JitCode>],
+        _fn_ptrs: &[JitCallTarget],
     ) -> Self {
         Self {
-            frames: MIFrameStack::new(root),
+            frames,
             runtime_stacks: HashMap::new(),
             marker: PhantomData,
         }
@@ -1828,7 +1866,7 @@ where
                     (sub_idx, arg_triples, return_i, return_r, return_f)
                 };
                 let pc = self.frames.current_mut().pc;
-                let sub_jitcode = &self.frames.current_mut().jitcode.sub_jitcodes[sub_idx];
+                let sub_jitcode = self.frames.current_mut().jitcode.sub_jitcodes[sub_idx].clone();
                 let mut sub_frame = MIFrame::new(sub_jitcode, pc);
                 ctx.push_inline_frame(((pc as u64) << 32) | sub_idx as u64, u32::MAX);
                 sub_frame.inline_frame = true;
@@ -2648,6 +2686,11 @@ where
     }
 }
 
+/// Legacy entry point used by tests and integrations that still hold
+/// `JitCode` by reference and do not pass a `MetaInterp` framestack
+/// borrow.  Allocates a [`StandaloneFrameStack`], pushes the root
+/// frame, runs the machine, and discards the stack — preserving
+/// pre-unification semantics for callers that have not yet migrated.
 pub fn trace_jitcode<S, FLen, FPeek, FLabel>(
     ctx: &mut TraceCtx,
     sym: &mut S,
@@ -2664,8 +2707,13 @@ where
     FLabel: Fn(usize) -> usize,
 {
     let runtime = ClosureRuntime::new(runtime_stack_len, runtime_stack_peek, label_at);
-    let root = MIFrame::new(jitcode, pc);
-    let mut machine = JitCodeMachine::<S, _>::new(root, &jitcode.sub_jitcodes, &jitcode.fn_ptrs);
+    let jitcode_arc = Arc::new(jitcode.clone());
+    let sub_jitcodes = jitcode_arc.sub_jitcodes.clone();
+    let fn_ptrs = jitcode_arc.fn_ptrs.clone();
+    let mut standalone = StandaloneFrameStack::new();
+    standalone.frames.push(MIFrame::new(jitcode_arc, pc));
+    let mut machine =
+        JitCodeMachine::<S, _>::with_framestack(&mut standalone.frames, &sub_jitcodes, &fn_ptrs);
     machine.run_to_end(ctx, sym, &runtime)
 }
 
@@ -2680,8 +2728,13 @@ where
     S: JitCodeSym,
     R: JitCodeRuntime,
 {
-    let root = MIFrame::new(jitcode, pc);
-    let mut machine = JitCodeMachine::<S, _>::new(root, &jitcode.sub_jitcodes, &jitcode.fn_ptrs);
+    let jitcode_arc = Arc::new(jitcode.clone());
+    let sub_jitcodes = jitcode_arc.sub_jitcodes.clone();
+    let fn_ptrs = jitcode_arc.fn_ptrs.clone();
+    let mut standalone = StandaloneFrameStack::new();
+    standalone.frames.push(MIFrame::new(jitcode_arc, pc));
+    let mut machine =
+        JitCodeMachine::<S, _>::with_framestack(&mut standalone.frames, &sub_jitcodes, &fn_ptrs);
     machine.run_to_end(ctx, sym, runtime)
 }
 

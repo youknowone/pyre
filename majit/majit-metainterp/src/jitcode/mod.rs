@@ -236,7 +236,7 @@ pub struct JitCode {
     /// Pool of majit IR opcodes referenced from the bytecode stream.
     pub opcodes: Vec<OpCode>,
     /// Sub-JitCodes for `inline_call` targets (compound methods).
-    pub sub_jitcodes: Vec<JitCode>,
+    pub sub_jitcodes: Vec<std::sync::Arc<JitCode>>,
     /// Function pointers for `residual_call` targets (I/O shims, external calls).
     pub fn_ptrs: Vec<JitCallTarget>,
     /// CALL_ASSEMBLER targets keyed by loop token number plus a concrete hook.

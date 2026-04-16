@@ -1100,7 +1100,10 @@ pub fn resume_in_blackhole(
         // RPython warmspot.py: jitcode.fnaddr = getfunctionptr(graph).
         // pyre: all Python functions go through the single portal runner.
         // Set per-jitcode fnaddr on both the jitcode itself and its descrs.
-        bh.jitcode.fnaddr = bh_portal_runner as usize as i64;
+        // After Phase A's `Arc<JitCode>` migration `bh.jitcode` is shared
+        // with the originating `PyJitCode`; `Arc::make_mut` clones-on-write
+        // so the fnaddr override does not leak back into the cached entry.
+        std::sync::Arc::make_mut(&mut bh.jitcode).fnaddr = bh_portal_runner as usize as i64;
         // RPython: descrs carry FieldDescr.offset (byte offset from rtyper).
         // pyre: field offsets are resolved from Rust struct layout at runtime.
         bh.resolve_field_offsets(resolve_field_offset);

@@ -49,7 +49,7 @@ pub(crate) struct JitCode {
     /// Set by codewriter via set_majit_jitcode(). Owned here (inside
     /// Box<JitCode> in MetaInterpStaticData.jitcodes) so the address is
     /// stable — matches RPython's GC-heap JitCode.
-    pub majit_jitcode: Option<majit_metainterp::jitcode::JitCode>,
+    pub majit_jitcode: Option<std::sync::Arc<majit_metainterp::jitcode::JitCode>>,
     /// Pyre translation metadata: py_pc -> jitcode byte offset.
     /// RPython does not need this because frame.pc is already a JitCode PC.
     pub py_to_jit_pc: Vec<usize>,
@@ -298,7 +298,7 @@ pub(crate) fn jitcode_for(code: *const ()) -> *const JitCode {
 /// MetaInterpStaticData.jitcodes.
 pub fn set_majit_jitcode(
     code: *const (),
-    majit_jitcode: majit_metainterp::jitcode::JitCode,
+    majit_jitcode: std::sync::Arc<majit_metainterp::jitcode::JitCode>,
     py_to_jit_pc: Vec<usize>,
     liveness: Vec<majit_metainterp::jitcode::LivenessInfo>,
 ) {

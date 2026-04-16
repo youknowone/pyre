@@ -64,7 +64,7 @@ pub use pyjitpl::{
     CompiledExitLayout, CompiledTerminalExitLayout, CompiledTraceLayout, DeadFrameArtifacts,
     DetailedDriverRunOutcome, DriverRunOutcome, InlineDecision, JitCodeMachine, JitCodeRuntime,
     JitCodeSym, JitHooks, JitStats, MIFrame, MIFrameStack, MetaInterp, RawCompileResult,
-    trace_jitcode, trace_jitcode_with_runtime,
+    StandaloneFrameStack, trace_jitcode, trace_jitcode_with_runtime,
 };
 pub use quasiimmut::QuasiImmut;
 pub use symbolic_stack::SymbolicStack;

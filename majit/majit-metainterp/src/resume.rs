@@ -5735,14 +5735,14 @@ impl<'a> ResumeDataDirectReader<'a> {
 /// `resolve_jitcode` corresponds to RPython's `jitcodes[jitcode_pos]` lookup
 /// (`resume.py:1339`). Matches upstream's `(jitcode, pc)` tuple result.
 pub struct ResolvedJitCode {
-    pub jitcode: crate::jitcode::JitCode,
+    pub jitcode: std::sync::Arc<crate::jitcode::JitCode>,
     pub pc: usize,
     pub virtualizable_stack_base: Option<usize>,
     pub liveness_info: Vec<u8>,
 }
 
 impl ResolvedJitCode {
-    pub fn new(jitcode: crate::jitcode::JitCode, pc: usize) -> Self {
+    pub fn new(jitcode: std::sync::Arc<crate::jitcode::JitCode>, pc: usize) -> Self {
         Self {
             jitcode,
             pc,

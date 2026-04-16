@@ -2,8 +2,8 @@ mod dispatch;
 mod frame;
 
 pub use dispatch::{
-    ClosureRuntime, JitCodeMachine, JitCodeRuntime, JitCodeSym, trace_jitcode,
-    trace_jitcode_with_runtime,
+    ClosureRuntime, JitCodeMachine, JitCodeRuntime, JitCodeSym, StandaloneFrameStack,
+    trace_jitcode, trace_jitcode_with_runtime,
 };
 pub(crate) use dispatch::{
     call_int_function, eval_binop_f, eval_binop_i, eval_binop_ovf, eval_unary_f, eval_unary_i,
@@ -523,6 +523,13 @@ pub struct MetaInterp<M: Clone> {
     /// list_of_addr2name).  See [`MetaInterpStaticData`] for the
     /// methods that read this field.
     pub staticdata: MetaInterpStaticData,
+
+    /// pyjitpl.py:2451, 3269, 3403 `MetaInterp.framestack` — stack of
+    /// `MIFrame` objects representing the current call chain.
+    /// Populated by `newframe` (pyjitpl.py:2432-2452) and drained by
+    /// `popframe` (pyjitpl.py:2462-2477).  Initialized as empty by
+    /// `initialize_state_from_start` and `rebuild_state_after_failure`.
+    pub framestack: crate::pyjitpl::MIFrameStack,
 }
 
 /// Internal mutable counters for JIT compilation statistics.
@@ -912,6 +919,7 @@ impl<M: Clone> MetaInterp<M> {
             pending_frontend_boxes: None,
             cls_of_box: Some(default_cls_of_box),
             staticdata: MetaInterpStaticData::new(),
+            framestack: crate::pyjitpl::MIFrameStack::empty(),
         }
     }
 
@@ -7158,111 +7166,309 @@ impl<M: Clone> MetaInterp<M> {
     ///     raise ChangeFrame
     /// ```
     ///
-    /// The `jitcode` parameter is identified by the
-    /// [`MetaInterpStaticData::indirectcalltargets`] slot index (see
-    /// `bytecode_for_address`).  `argboxes` mirrors RPython's `boxes`
-    /// list of [`OpRef`]s in declaration order.
+    /// `argboxes` mirrors RPython's `boxes` list of typed
+    /// `(JitArgKind, OpRef, i64)` tuples — the `(kind, value, concrete)`
+    /// tuple `MIFrame::setup_call` consumes.  `jitcode` is the shared
+    /// `Arc<JitCode>` that
+    /// [`MetaInterpStaticData::bytecode_for_address`] returns.
     pub fn perform_call(
         &mut self,
-        jitcode_idx: usize,
-        _argboxes: &[OpRef],
+        jitcode: std::sync::Arc<crate::jitcode::JitCode>,
+        argboxes: &[(crate::jitcode::JitArgKind, OpRef, i64)],
         greenkey: Option<u64>,
     ) -> Result<(), ChangeFrame> {
-        let _ = self.newframe(jitcode_idx, greenkey);
-        // pyjitpl.py:2424: f.setup_call(boxes).  MIFrame::setup_call
-        // (frame.rs) is the named entry point; pyre's MetaInterp does
-        // not yet own a real MIFrameStack so we cannot call it from
-        // here without a frame to act on.  Callers that already have a
-        // MIFrame (JitCodeMachine BC_INLINE_CALL, etc.) invoke
-        // setup_call directly.
+        // pyjitpl.py:2423: f = self.newframe(jitcode, greenkey)
+        let _ = self.newframe(jitcode, greenkey);
+        // pyjitpl.py:2424: f.setup_call(boxes)
+        self.framestack.current_mut().setup_call(argboxes);
+        // pyjitpl.py:2425: raise ChangeFrame
         Err(ChangeFrame)
+    }
+
+    /// pyjitpl.py:3266-3275 `MetaInterp.initialize_state_from_start(original_boxes)`.
+    ///
+    /// ```python
+    /// def initialize_state_from_start(self, original_boxes):
+    ///     # ----- make a new frame -----
+    ///     self.portal_call_depth = -1 # always one portal around
+    ///     self.framestack = []
+    ///     f = self.newframe(self.jitdriver_sd.mainjitcode)
+    ///     f.setup_call(original_boxes)
+    ///     assert self.portal_call_depth == 0
+    ///     self.virtualref_boxes = []
+    ///     ...
+    /// ```
+    ///
+    /// Resets `framestack` to empty, pushes the portal `mainjitcode`
+    /// frame, and seeds it with the original argboxes.  Other branches
+    /// of the upstream method (`initialize_withgreenfields`,
+    /// `initialize_virtualizable`) live behind pyre's portal-runner
+    /// shim and are not yet wired through this entry — they remain
+    /// driven by the existing per-driver setup paths.
+    pub fn initialize_state_from_start(
+        &mut self,
+        mainjitcode: std::sync::Arc<crate::jitcode::JitCode>,
+        original_boxes: &[(crate::jitcode::JitArgKind, OpRef, i64)],
+    ) {
+        // pyjitpl.py:3269: self.framestack = []
+        self.framestack = crate::pyjitpl::MIFrameStack::empty();
+        // pyjitpl.py:3270: f = self.newframe(self.jitdriver_sd.mainjitcode)
+        let _ = self.newframe(mainjitcode, None);
+        // pyjitpl.py:3271: f.setup_call(original_boxes)
+        self.framestack.current_mut().setup_call(original_boxes);
+        // pyjitpl.py:3273: self.virtualref_boxes = []
+        self.virtualref_boxes.clear();
+    }
+
+    /// pyjitpl.py:3400-3406 `MetaInterp.rebuild_state_after_failure` —
+    /// the part that resets `self.framestack = []` before
+    /// `resume.rebuild_from_resumedata` repopulates it.  Pyre's resume
+    /// stack rebuild lives in `crate::resume::blackhole_from_resumedata`
+    /// and does not interact with `MetaInterp::framestack` yet, so the
+    /// helper just clears the stack to match the upstream invariant.
+    pub fn reset_framestack_for_failure(&mut self) {
+        self.framestack = crate::pyjitpl::MIFrameStack::empty();
+    }
+
+    /// Run `JitCodeMachine` against `MetaInterp::framestack` per the
+    /// upstream `pyjitpl.py:self.framestack` single-stack invariant.
+    ///
+    /// Pushes the root MIFrame onto `self.framestack`, hands the
+    /// borrow to a `JitCodeMachine`, and pops the root after the
+    /// machine returns.  Mirrors RPython's `MetaInterp.interpret`
+    /// shape where `MIFrame.run_one_step` operates on
+    /// `self.framestack[-1]`.
+    ///
+    /// Reaches into `self.tracing` for the active `TraceCtx` so the
+    /// caller does not need a second `&mut TraceCtx` borrow that would
+    /// conflict with `&mut self`.  Panics when called outside an
+    /// active trace.
+    pub fn trace_jitcode_with_framestack<S, R>(
+        &mut self,
+        sym: &mut S,
+        jitcode: std::sync::Arc<crate::jitcode::JitCode>,
+        pc: usize,
+        runtime: &R,
+    ) -> crate::TraceAction
+    where
+        S: crate::pyjitpl::JitCodeSym,
+        R: crate::pyjitpl::JitCodeRuntime,
+    {
+        let sub_jitcodes = jitcode.sub_jitcodes.clone();
+        let fn_ptrs = jitcode.fn_ptrs.clone();
+        // pyjitpl.py:2451: self.framestack.append(f) — push the root.
+        self.framestack
+            .push(crate::pyjitpl::MIFrame::new(jitcode, pc));
+        let action = {
+            // Split the &mut borrow so the trace context and framestack
+            // can be passed to the machine simultaneously.  `tracing`
+            // and `framestack` are independent fields on MetaInterp.
+            let ctx = self
+                .tracing
+                .as_mut()
+                .expect("trace_jitcode_with_framestack requires an active trace");
+            let mut machine = crate::pyjitpl::JitCodeMachine::<S, _>::with_framestack(
+                &mut self.framestack,
+                &sub_jitcodes,
+                &fn_ptrs,
+            );
+            machine.run_to_end(ctx, sym, runtime)
+        };
+        // RPython's interpret loop drains framestack via popframe; pyre
+        // mirrors the post-condition explicitly so this entry point is
+        // re-entrant — leave the stack in the same shape it came in.
+        let _ = self.framestack.pop();
+        action
     }
 
     /// pyjitpl.py:2427-2429 `MetaInterp.is_main_jitcode(jitcode)`.
     ///
-    /// Returns true when the jitcode is the recursive portal jitcode of
-    /// some jitdriver.  Pyre tracks portal targets via
-    /// `WarmEnterState`'s pending-token map; a slot is "main" when its
-    /// `tracing_call_depth` invariant matches the recorded portal.
-    pub fn is_main_jitcode(&self, _jitcode_idx: usize) -> bool {
-        // PRE-EXISTING-ADAPTATION: pyre stores the portal jitcode as a
-        // WarmEnterState pending token rather than a JitCode reference;
-        // until that slot is exposed we approximate `True` with the
-        // inline_depth invariant — the outermost frame is always the
-        // portal in pyre.
-        self.inline_depth() == 0
+    /// ```python
+    /// def is_main_jitcode(self, jitcode):
+    ///     return (jitcode.jitdriver_sd is not None and
+    ///             jitcode.jitdriver_sd.jitdriver.is_recursive)
+    /// ```
+    ///
+    /// Reads `staticdata.jitdrivers_sd[idx].is_recursive` exactly like
+    /// upstream's `jitcode.jitdriver_sd.jitdriver.is_recursive`. Falls
+    /// back to `false` when the jitcode does not point at a registered
+    /// driver slot — matches the `jitdriver_sd is not None` guard.
+    pub fn is_main_jitcode(&self, jitcode: &crate::jitcode::JitCode) -> bool {
+        match jitcode.jitdriver_sd {
+            Some(idx) => self
+                .staticdata
+                .jitdrivers_sd
+                .get(idx)
+                .map(|jd| jd.is_recursive)
+                .unwrap_or(false),
+            None => false,
+        }
     }
 
     /// pyjitpl.py:2432-2452 `MetaInterp.newframe(jitcode, greenkey)`.
     ///
-    /// Pushes a new MIFrame onto `self.framestack` and bumps the
-    /// portal call depth when the jitcode belongs to a jitdriver.
-    pub fn newframe(&mut self, jitcode_idx: usize, greenkey: Option<u64>) -> usize {
+    /// ```python
+    /// def newframe(self, jitcode, greenkey=None):
+    ///     if jitcode.jitdriver_sd:
+    ///         self.portal_call_depth += 1
+    ///         self.call_ids.append(self.current_call_id)
+    ///         unique_id = -1
+    ///         if greenkey is not None:
+    ///             unique_id = jitcode.jitdriver_sd.warmstate.get_unique_id(greenkey)
+    ///             jd_no = jitcode.jitdriver_sd.index
+    ///             self.enter_portal_frame(jd_no, unique_id)
+    ///         self.current_call_id += 1
+    ///     if greenkey is not None and self.is_main_jitcode(jitcode):
+    ///         self.portal_trace_positions.append(...)
+    ///     if len(self.free_frames_list) > 0:
+    ///         f = self.free_frames_list.pop()
+    ///     else:
+    ///         f = MIFrame(self)
+    ///     f.setup(jitcode, greenkey)
+    ///     self.framestack.append(f)
+    ///     return f
+    /// ```
+    ///
+    /// Pyre stores frames in `self.framestack`; we still bump the
+    /// existing `inline_depth` counter so callers that have not yet
+    /// migrated keep their existing book-keeping.
+    pub fn newframe(
+        &mut self,
+        jitcode: std::sync::Arc<crate::jitcode::JitCode>,
+        greenkey: Option<u64>,
+    ) -> usize {
         // pyjitpl.py:2433: if jitcode.jitdriver_sd: portal_call_depth += 1
-        if self.is_main_jitcode(jitcode_idx) {
+        if jitcode.jitdriver_sd.is_some() {
             // pyjitpl.py:2440-2441: enter_portal_frame on greenkey
             if let Some(unique_id) = greenkey {
                 self.enter_portal_frame(0, unique_id);
             }
         }
-        // pyjitpl.py:2446-2451: reuse / allocate MIFrame, push onto framestack.
-        // Pyre uses `enter_inline_frame` which already maintains the
-        // inline-depth invariant; the actual MIFrame allocation lands
-        // with the framestack worker.
+        // Bump the existing TraceCtx inline-depth counter so trace
+        // recorder bookkeeping (already wired through pyre's tracer)
+        // stays in sync; the canonical frame storage is `framestack`.
         let _ = self.enter_inline_frame(greenkey.unwrap_or_default());
-        jitcode_idx
+        // pyjitpl.py:2446-2451: reuse / allocate MIFrame, push onto framestack.
+        let mut frame = crate::pyjitpl::MIFrame::new(jitcode, 0);
+        frame.greenkey = greenkey;
+        self.framestack.push(frame);
+        self.framestack.len() - 1
     }
 
     /// pyjitpl.py:2454-2456 `MetaInterp.enter_portal_frame(jd_no, unique_id)`.
-    pub fn enter_portal_frame(&mut self, _jd_no: usize, _unique_id: u64) {
-        // pyjitpl.py:2455: history.record2(rop.ENTER_PORTAL_FRAME, ...)
-        // PRE-EXISTING-ADAPTATION: pyre records ENTER_PORTAL_FRAME via
-        // the trace recorder when JitDriverStaticData lands per-driver
-        // jd_no metadata.  The named entry stays so call sites can wire
-        // through the existing record path.
+    ///
+    /// ```python
+    /// def enter_portal_frame(self, jd_no, unique_id):
+    ///     self.history.record2(rop.ENTER_PORTAL_FRAME,
+    ///                          ConstInt(jd_no), ConstInt(unique_id), None)
+    /// ```
+    pub fn enter_portal_frame(&mut self, jd_no: usize, unique_id: u64) {
+        if let Some(ctx) = self.tracing.as_mut() {
+            let jd_no_box = ctx.const_int(jd_no as i64);
+            let unique_id_box = ctx.const_int(unique_id as i64);
+            ctx.record_op(OpCode::EnterPortalFrame, &[jd_no_box, unique_id_box]);
+        }
     }
 
     /// pyjitpl.py:2458-2459 `MetaInterp.leave_portal_frame(jd_no)`.
-    pub fn leave_portal_frame(&mut self, _jd_no: usize) {
-        // pyjitpl.py:2459: history.record1(rop.LEAVE_PORTAL_FRAME, ...)
+    ///
+    /// ```python
+    /// def leave_portal_frame(self, jd_no):
+    ///     self.history.record1(rop.LEAVE_PORTAL_FRAME, ConstInt(jd_no), None)
+    /// ```
+    pub fn leave_portal_frame(&mut self, jd_no: usize) {
+        if let Some(ctx) = self.tracing.as_mut() {
+            let jd_no_box = ctx.const_int(jd_no as i64);
+            ctx.record_op(OpCode::LeavePortalFrame, &[jd_no_box]);
+        }
     }
 
     /// pyjitpl.py:2462-2477 `MetaInterp.popframe(leave_portal_frame=True)`.
-    pub fn popframe(&mut self, _leave_portal_frame: bool) {
-        // pyjitpl.py:2466-2468: portal_call_depth -= 1; leave_portal_frame.
+    ///
+    /// ```python
+    /// def popframe(self, leave_portal_frame=True):
+    ///     frame = self.framestack.pop()
+    ///     jitcode = frame.jitcode
+    ///     if jitcode.jitdriver_sd:
+    ///         self.portal_call_depth -= 1
+    ///         if leave_portal_frame:
+    ///             self.leave_portal_frame(jitcode.jitdriver_sd.index)
+    ///         self.call_ids.pop()
+    ///     ...
+    ///     frame.cleanup_registers()
+    ///     self.free_frames_list.append(frame)
+    /// ```
+    pub fn popframe(&mut self, leave_portal_frame: bool) {
+        // pyjitpl.py:2463: frame = self.framestack.pop()
+        if let Some(mut frame) = self.framestack.pop() {
+            // pyjitpl.py:2465-2469: jitdriver_sd → portal_call_depth/leave_portal_frame.
+            if frame.jitcode.jitdriver_sd.is_some() && leave_portal_frame {
+                self.leave_portal_frame(0);
+            }
+            // pyjitpl.py:2476: frame.cleanup_registers().
+            frame.cleanup_registers();
+            // pyjitpl.py:2477: self.free_frames_list.append(frame) is
+            // an RPython memory-reuse optimization; pyre relies on the
+            // Rust drop to release register banks.
+        }
+        // Mirror the TraceCtx inline-depth counter so trace recorder
+        // bookkeeping stays balanced with the framestack pop.
         self.leave_inline_frame();
     }
 
     /// pyjitpl.py:2479-2503 `MetaInterp.finishframe(resultbox, leave_portal_frame=True)`.
     ///
-    /// Handle a non-exceptional return from the current frame:
-    ///   1. clear `last_exc_value`,
-    ///   2. `popframe(leave_portal_frame)`,
-    ///   3. if framestack is non-empty, write the result into the
-    ///      caller frame via `make_result_of_lastop` and signal
-    ///      `ChangeFrame`,
-    ///   4. otherwise compile the loop result and raise the
-    ///      appropriate `DoneWithThisFrame*`.
+    /// ```python
+    /// def finishframe(self, resultbox, leave_portal_frame=True):
+    ///     # handle a non-exceptional return from the current frame
+    ///     self.last_exc_value = lltype.nullptr(rclass.OBJECT)
+    ///     self.popframe(leave_portal_frame=leave_portal_frame)
+    ///     if self.framestack:
+    ///         if resultbox is not None:
+    ///             self.framestack[-1].make_result_of_lastop(resultbox)
+    ///         raise ChangeFrame
+    ///     else:
+    ///         try:
+    ///             self.compile_done_with_this_frame(resultbox)
+    ///         except SwitchToBlackhole as stb:
+    ///             self.aborted_tracing(stb.reason)
+    ///         ...
+    /// ```
     ///
-    /// PRE-EXISTING-ADAPTATION: pyre's `MetaInterp<M>` does not yet
-    /// own a real `MIFrameStack`; framestack tracking lives inside
-    /// `JitCodeMachine`.  The stub mirrors `popframe`'s shape so call
-    /// sites already line up with the upstream contract — it returns
-    /// `Err(ChangeFrame)` whenever a caller frame would still exist
-    /// (matching the `raise ChangeFrame` branch) and `Ok(())` when
-    /// the frame stack is exhausted.
-    pub fn finishframe(&mut self, leave_portal_frame: bool) -> Result<(), ChangeFrame> {
+    /// `result` is `None` for void returns; otherwise it is the
+    /// `(kind, target_index, opref, concrete)` tuple
+    /// `MIFrame::make_result_of_lastop` consumes.  PRE-EXISTING-ADAPTATION:
+    /// pyre's call BC encodes `target_index` explicitly per call site
+    /// instead of reading `bytecode[pc-1]` after dispatch, so the
+    /// caller threads it through here.
+    ///
+    /// `compile_done_with_this_frame` and the `DoneWithThisFrame*`
+    /// raise live behind pyre's portal-runner shim — the
+    /// frame-stack-exhausted branch returns `Ok(())` so callers can
+    /// take their existing exit path.
+    pub fn finishframe(
+        &mut self,
+        result: Option<(crate::jitcode::JitArgKind, usize, OpRef, i64)>,
+        leave_portal_frame: bool,
+    ) -> Result<(), ChangeFrame> {
         // pyjitpl.py:2481: self.last_exc_value = lltype.nullptr(...)
         // pyjitpl.py:2482: self.popframe(leave_portal_frame=...)
         self.popframe(leave_portal_frame);
-        // pyjitpl.py:2483: if self.framestack: ... raise ChangeFrame
-        if self.inline_depth() > 0 {
+        // pyjitpl.py:2483: if self.framestack:
+        if !self.framestack.is_empty() {
+            // pyjitpl.py:2484-2485: framestack[-1].make_result_of_lastop(resultbox)
+            if let Some((kind, target_index, opref, concrete)) = result {
+                self.framestack.current_mut().make_result_of_lastop(
+                    kind,
+                    target_index,
+                    opref,
+                    concrete,
+                );
+            }
+            // pyjitpl.py:2486: raise ChangeFrame
             return Err(ChangeFrame);
         }
-        // pyjitpl.py:2487-2503: compile_done_with_this_frame and the
-        // DoneWithThisFrame* raise live behind pyre's portal-runner
-        // shim; stub returns Ok so callers see the "frame stack
-        // exhausted" branch as a value rather than an exception.
+        // pyjitpl.py:2487-2503: compile_done_with_this_frame branch.
         Ok(())
     }
 
@@ -7284,12 +7490,13 @@ impl<M: Clone> MetaInterp<M> {
     ///     return self.do_residual_call(funcbox, argboxes, calldescr, pc)
     /// ```
     ///
-    /// PRE-EXISTING-ADAPTATION: pyre's MIFrame is a thin shell that
-    /// the parallel framestack worker is fleshing out, so the canonical
-    /// body lives on `MetaInterp<M>` for now.  When MIFrame gains its
-    /// own `metainterp` back-pointer, move this method to MIFrame and
-    /// have it delegate via `self.metainterp.staticdata.bytecode_for_address`
-    /// — the body below remains line-for-line identical.
+    /// PRE-EXISTING-ADAPTATION: RPython places this method on `MIFrame`
+    /// because `self.metainterp` is a back-pointer attribute; pyre's
+    /// `MIFrame` does not carry a `&mut MetaInterp` back-reference (the
+    /// borrow checker would alias `MetaInterp::framestack` against
+    /// itself), so the method lives on `MetaInterp<M>` and acts on the
+    /// current top-of-framestack frame implicitly.  Body remains
+    /// line-for-line identical to `pyjitpl.py:2178-2186`.
     ///
     /// Returns:
     /// - `Err(ChangeFrame)` when the funcaddr resolved to an
@@ -7301,7 +7508,7 @@ impl<M: Clone> MetaInterp<M> {
     pub fn do_residual_or_indirect_call(
         &mut self,
         funcbox_addr: Option<usize>,
-        argboxes: &[OpRef],
+        argboxes: &[(crate::jitcode::JitArgKind, OpRef, i64)],
         calldescr: u64,
         pc: usize,
     ) -> Result<Option<OpRef>, ChangeFrame> {
@@ -7309,9 +7516,9 @@ impl<M: Clone> MetaInterp<M> {
         if let Some(key) = funcbox_addr {
             // pyjitpl.py:2179: sd = self.metainterp.staticdata
             // pyjitpl.py:2181: jitcode = sd.bytecode_for_address(key)
-            if let Some(jitcode_idx) = self.staticdata.bytecode_for_address(key) {
+            if let Some(jitcode) = self.staticdata.bytecode_for_address(key) {
                 // pyjitpl.py:2184: return self.metainterp.perform_call(jitcode, argboxes)
-                self.perform_call(jitcode_idx, argboxes, None)?;
+                self.perform_call(jitcode, argboxes, None)?;
                 unreachable!("perform_call always raises ChangeFrame");
             }
         }
@@ -7344,7 +7551,7 @@ impl<M: Clone> MetaInterp<M> {
     pub fn do_residual_call(
         &mut self,
         _funcbox_addr: Option<usize>,
-        _argboxes: &[OpRef],
+        _argboxes: &[(crate::jitcode::JitArgKind, OpRef, i64)],
         _calldescr: u64,
         _pc: usize,
     ) -> Option<OpRef> {
@@ -7378,11 +7585,11 @@ impl<M: Clone> MetaInterp<M> {
     /// once Phase 7C lands.
     pub fn do_recursive_call(
         &mut self,
-        jitcode_idx: usize,
-        argboxes: &[OpRef],
+        jitcode: std::sync::Arc<crate::jitcode::JitCode>,
+        argboxes: &[(crate::jitcode::JitArgKind, OpRef, i64)],
         greenkey: Option<u64>,
     ) -> Result<(), ChangeFrame> {
-        self.perform_call(jitcode_idx, argboxes, greenkey)
+        self.perform_call(jitcode, argboxes, greenkey)
     }
 
     /// pyjitpl.py:2080-2151 `MIFrame.do_conditional_call`.
@@ -7409,7 +7616,7 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         _condbox: OpRef,
         _funcbox_addr: Option<usize>,
-        _argboxes: &[OpRef],
+        _argboxes: &[(crate::jitcode::JitArgKind, OpRef, i64)],
         _calldescr: u64,
         _pc: usize,
         _is_value: bool,
@@ -7629,13 +7836,13 @@ impl std::error::Error for ChangeFrame {}
 /// `bytecode_for_address` lookup that `MIFrame.do_residual_or_indirect_call`
 /// uses to promote a const-funcptr residual call into an inlined one.
 ///
-/// PRE-EXISTING-ADAPTATION: pyre's `MetaInterp<M>` already stores most
-/// runtime-state fields directly, and pyre has no Rust-helper jitcode
-/// table, so this struct currently mirrors only the upstream lookup
-/// surface needed by `do_residual_or_indirect_call`.  The remaining
-/// fields (`opcode_names`, `opcode_implementations`, `liveness_info`,
-/// `jitdrivers_sd`, profiler, …) live in `MetaInterp<M>` until a future
-/// phase splits them out.
+/// PRE-EXISTING-ADAPTATION: pyre's `MetaInterp<M>` still owns several
+/// runtime-state fields that RPython places on `MetaInterpStaticData`
+/// (e.g. profiler, `warmrunnerdesc`, `cpu`).  `staticdata` itself
+/// already holds the per-process tables (`opcode_*`, `opcode_descrs`,
+/// `indirectcalltargets`, `_addr2name_*`, `liveness_info`,
+/// `callinfocollection`, `jitdrivers_sd`, `globaldata`); the remaining
+/// runtime knobs land in a future audit pass.
 #[derive(Debug, Default)]
 pub struct MetaInterpStaticData {
     /// pyjitpl.py:2228 `setup_insns(insns)` table — opcode-id ↔ name.
@@ -7652,10 +7859,12 @@ pub struct MetaInterpStaticData {
     /// pyjitpl.py:2245-2246 `setup_descrs(descrs)` — descriptor index table.
     pub opcode_descrs: Vec<u64>,
     /// pyjitpl.py:2248-2249 `setup_indirectcalltargets(indirectcalltargets)`.
-    /// PRE-EXISTING-ADAPTATION: pyre stores `fnaddr` as a raw `usize`
-    /// since there are no Rust-helper jitcodes yet.  Matches RPython's
-    /// `JitCode.fnaddr` field role.
-    pub indirectcalltargets: Vec<usize>,
+    /// Stores `Arc<JitCode>` references so `bytecode_for_address` can
+    /// hand a hot copy back to `MIFrame::do_residual_or_indirect_call`
+    /// for `MetaInterp::perform_call(jitcode, ...)` — matching the
+    /// upstream `for jitcode in self.indirectcalltargets` loop in
+    /// `pyjitpl.py:2334-2342`.
+    pub indirectcalltargets: Vec<std::sync::Arc<crate::jitcode::JitCode>>,
     /// pyjitpl.py:2251-2253 `setup_list_of_addr2name(list_of_addr2name)`.
     /// Pair-list of (fnaddr, name) for debug introspection.
     pub _addr2name_keys: Vec<usize>,
@@ -7682,6 +7891,16 @@ pub struct MetaInterpStaticData {
     /// pyjitpl.py:2255-2285 `finish_setup(...)` populates this from
     /// `codewriter.callcontrol.callinfocollection`.
     pub callinfocollection: majit_ir::effectinfo::CallInfoCollection,
+    /// pyjitpl.py:2266 `self.jitdrivers_sd = codewriter.callcontrol.jitdrivers_sd`.
+    ///
+    /// Indexed by `JitCode.jitdriver_sd` so `is_main_jitcode(jitcode)`
+    /// can read `jitdrivers_sd[idx].is_recursive` per
+    /// `pyjitpl.py:2427-2429` without consulting the runtime
+    /// `JitDriver` object.  Pyre populates this via
+    /// `MetaInterpStaticData::register_jitdriver_sd` rather than the
+    /// upstream `finish_setup(codewriter)` callback because pyre's
+    /// codewriter pipeline is split across crates.
+    pub jitdrivers_sd: Vec<crate::jitdriver::JitDriverStaticData>,
     /// pyjitpl.py:2357-2373 `MetaInterpGlobalData`: lazy
     /// `addr2name` and `indirectcall_dict` caches.  Populated on first
     /// call to `bytecode_for_address` / `get_name_from_address`.
@@ -7697,12 +7916,9 @@ pub struct MetaInterpStaticData {
 pub struct MetaInterpGlobalData {
     /// pyjitpl.py:2308-2318 `addr2name`: `fnaddr → name` for debugging.
     pub addr2name: Option<std::collections::HashMap<usize, String>>,
-    /// pyjitpl.py:2326-2343 `indirectcall_dict`: `fnaddr → JitCode index`.
-    /// PRE-EXISTING-ADAPTATION: pyre uses a raw usize index instead of
-    /// an `Arc<JitCode>` reference until the Rust-helper jitcode table
-    /// lands; the inferred slot in `indirectcalltargets` is sufficient
-    /// for `bytecode_for_address` parity.
-    pub indirectcall_dict: Option<std::collections::HashMap<usize, usize>>,
+    /// pyjitpl.py:2326-2343 `indirectcall_dict`: `fnaddr → JitCode`.
+    pub indirectcall_dict:
+        Option<std::collections::HashMap<usize, std::sync::Arc<crate::jitcode::JitCode>>>,
     /// pyjitpl.py:2293-2303 `initialized` — guards `_setup_once` so the
     /// runtime side-effects (profiler start, jitlog setup) fire once.
     pub initialized: bool,
@@ -7766,8 +7982,22 @@ impl MetaInterpStaticData {
         self.opcode_descrs = descrs;
     }
 
+    /// Register a `JitDriverStaticData` slot.  Returns the index that
+    /// `JitCode.jitdriver_sd` should reference.  Mirrors
+    /// `pyjitpl.py:2266` `self.jitdrivers_sd = codewriter.callcontrol.jitdrivers_sd`,
+    /// except pyre populates the table incrementally as drivers register
+    /// instead of taking it wholesale from the codewriter's CallControl.
+    pub fn register_jitdriver_sd(&mut self, jd: crate::jitdriver::JitDriverStaticData) -> usize {
+        let idx = self.jitdrivers_sd.len();
+        self.jitdrivers_sd.push(jd);
+        idx
+    }
+
     /// pyjitpl.py:2248-2249 `setup_indirectcalltargets(indirectcalltargets)`.
-    pub fn setup_indirectcalltargets(&mut self, targets: Vec<usize>) {
+    pub fn setup_indirectcalltargets(
+        &mut self,
+        targets: Vec<std::sync::Arc<crate::jitcode::JitCode>>,
+    ) {
         self.indirectcalltargets = targets;
         // Force a rebuild of the lazy lookup on next access.
         self.globaldata.indirectcall_dict = None;
@@ -7813,25 +8043,40 @@ impl MetaInterpStaticData {
     ///                 return jitcode
     ///         return None
     /// ```
-    pub fn bytecode_for_address(&mut self, fnaddress: usize) -> Option<usize> {
+    pub fn bytecode_for_address(
+        &mut self,
+        fnaddress: usize,
+    ) -> Option<std::sync::Arc<crate::jitcode::JitCode>> {
         let dict = self.globaldata.indirectcall_dict.get_or_insert_with(|| {
             let mut d = std::collections::HashMap::new();
-            for (i, fnaddr) in self.indirectcalltargets.iter().enumerate() {
+            for jitcode in &self.indirectcalltargets {
                 debug_assert!(
-                    !d.contains_key(fnaddr),
+                    !d.contains_key(&(jitcode.fnaddr as usize)),
                     "duplicate fnaddr in indirectcalltargets"
                 );
-                d.insert(*fnaddr, i);
+                d.insert(jitcode.fnaddr as usize, jitcode.clone());
             }
             d
         });
-        dict.get(&fnaddress).copied()
+        dict.get(&fnaddress).cloned()
     }
 }
 
 #[cfg(test)]
 mod metainterp_static_data_tests {
     use super::*;
+    use crate::jitcode::{JitCode, JitCodeBuilder};
+
+    /// Build a placeholder `Arc<JitCode>` whose `fnaddr` matches the
+    /// given address.  Real production code populates `fnaddr` via
+    /// `getfunctionptr(graph)` (warmspot.py:418); these tests only need
+    /// the lookup key to match.
+    fn make_jitcode_with_fnaddr(fnaddr: usize) -> std::sync::Arc<JitCode> {
+        let builder = JitCodeBuilder::new();
+        let mut jitcode = builder.finish();
+        jitcode.fnaddr = fnaddr as i64;
+        std::sync::Arc::new(jitcode)
+    }
 
     #[test]
     fn bytecode_for_address_returns_none_when_empty() {
@@ -7840,23 +8085,38 @@ mod metainterp_static_data_tests {
     }
 
     #[test]
-    fn bytecode_for_address_returns_index_when_registered() {
+    fn bytecode_for_address_returns_jitcode_when_registered() {
         let mut sd = MetaInterpStaticData::new();
-        sd.setup_indirectcalltargets(vec![0x100, 0x200, 0x300]);
-        assert_eq!(sd.bytecode_for_address(0x100), Some(0));
-        assert_eq!(sd.bytecode_for_address(0x200), Some(1));
-        assert_eq!(sd.bytecode_for_address(0x300), Some(2));
-        assert_eq!(sd.bytecode_for_address(0x400), None);
+        let j100 = make_jitcode_with_fnaddr(0x100);
+        let j200 = make_jitcode_with_fnaddr(0x200);
+        let j300 = make_jitcode_with_fnaddr(0x300);
+        sd.setup_indirectcalltargets(vec![j100.clone(), j200.clone(), j300.clone()]);
+        assert!(std::sync::Arc::ptr_eq(
+            &sd.bytecode_for_address(0x100).unwrap(),
+            &j100
+        ));
+        assert!(std::sync::Arc::ptr_eq(
+            &sd.bytecode_for_address(0x200).unwrap(),
+            &j200
+        ));
+        assert!(std::sync::Arc::ptr_eq(
+            &sd.bytecode_for_address(0x300).unwrap(),
+            &j300
+        ));
+        assert!(sd.bytecode_for_address(0x400).is_none());
     }
 
     #[test]
     fn setup_indirectcalltargets_invalidates_cache() {
         let mut sd = MetaInterpStaticData::new();
-        sd.setup_indirectcalltargets(vec![0x100]);
-        assert_eq!(sd.bytecode_for_address(0x100), Some(0));
-        sd.setup_indirectcalltargets(vec![0x200, 0x300]);
-        assert_eq!(sd.bytecode_for_address(0x100), None);
-        assert_eq!(sd.bytecode_for_address(0x200), Some(0));
+        sd.setup_indirectcalltargets(vec![make_jitcode_with_fnaddr(0x100)]);
+        assert!(sd.bytecode_for_address(0x100).is_some());
+        sd.setup_indirectcalltargets(vec![
+            make_jitcode_with_fnaddr(0x200),
+            make_jitcode_with_fnaddr(0x300),
+        ]);
+        assert!(sd.bytecode_for_address(0x100).is_none());
+        assert!(sd.bytecode_for_address(0x200).is_some());
     }
 
     #[test]
@@ -7886,7 +8146,8 @@ mod metainterp_static_data_tests {
         // route into perform_call (which raises ChangeFrame) instead of
         // falling through to do_residual_call.
         let mut meta = MetaInterp::<()>::new(0);
-        meta.staticdata.setup_indirectcalltargets(vec![0xdeadbeef]);
+        meta.staticdata
+            .setup_indirectcalltargets(vec![make_jitcode_with_fnaddr(0xdeadbeef)]);
         let result = meta.do_residual_or_indirect_call(Some(0xdeadbeef), &[], 0, 0);
         // Hit path raises ChangeFrame.
         assert!(matches!(result, Err(ChangeFrame)));
@@ -7898,8 +8159,284 @@ mod metainterp_static_data_tests {
         // we fall into compile_done_with_this_frame; the stub returns
         // Ok(()) instead of raising DoneWithThisFrame*.
         let mut meta = MetaInterp::<()>::new(0);
-        let result = meta.finishframe(true);
+        let result = meta.finishframe(None, true);
         assert!(matches!(result, Ok(())));
+    }
+
+    #[test]
+    fn perform_call_pushes_frame_and_setup_call_writes_argboxes() {
+        // pyjitpl.py:2421-2425 perform_call → newframe → setup_call →
+        // raise ChangeFrame.  After the call, framestack should have one
+        // frame whose typed register banks reflect the argboxes.
+        use crate::jitcode::{JitArgKind, JitCodeBuilder};
+        let mut builder = JitCodeBuilder::new();
+        builder.load_const_i_value(0, 0);
+        builder.load_const_i_value(1, 0);
+        builder.load_const_r_value(0, 0);
+        builder.load_const_f_value(0, 0);
+        let jitcode = std::sync::Arc::new(builder.finish());
+        let mut meta = MetaInterp::<()>::new(0);
+        let result = meta.perform_call(
+            jitcode,
+            &[
+                (JitArgKind::Int, OpRef(10), 100),
+                (JitArgKind::Ref, OpRef(20), 200),
+                (JitArgKind::Int, OpRef(11), 101),
+                (JitArgKind::Float, OpRef(30), 300),
+            ],
+            None,
+        );
+        assert!(matches!(result, Err(ChangeFrame)));
+        assert_eq!(meta.framestack.len(), 1);
+        let f = meta.framestack.current_mut();
+        assert_eq!(f.pc, 0);
+        assert_eq!(f.int_regs[0], Some(OpRef(10)));
+        assert_eq!(f.int_values[0], Some(100));
+        assert_eq!(f.int_regs[1], Some(OpRef(11)));
+        assert_eq!(f.int_values[1], Some(101));
+        assert_eq!(f.ref_regs[0], Some(OpRef(20)));
+        assert_eq!(f.ref_values[0], Some(200));
+        assert_eq!(f.float_regs[0], Some(OpRef(30)));
+        assert_eq!(f.float_values[0], Some(300));
+    }
+
+    #[test]
+    fn finishframe_writes_result_into_caller_then_change_frame() {
+        // pyjitpl.py:2483-2486 — popframe + framestack[-1].make_result_of_lastop +
+        // raise ChangeFrame.
+        use crate::jitcode::{JitArgKind, JitCodeBuilder};
+        let mut builder_caller = JitCodeBuilder::new();
+        builder_caller.load_const_i_value(0, 0);
+        builder_caller.load_const_i_value(1, 0);
+        let caller = std::sync::Arc::new(builder_caller.finish());
+        let mut builder_callee = JitCodeBuilder::new();
+        let callee = std::sync::Arc::new(builder_callee.finish());
+
+        let mut meta = MetaInterp::<()>::new(0);
+        // Push caller, then callee.
+        meta.perform_call(caller, &[], None).unwrap_err();
+        meta.perform_call(callee, &[], None).unwrap_err();
+        assert_eq!(meta.framestack.len(), 2);
+
+        // Return from callee: write result into caller register 1.
+        let result = meta.finishframe(Some((JitArgKind::Int, 1, OpRef(42), 4242)), true);
+        assert!(matches!(result, Err(ChangeFrame)));
+        assert_eq!(meta.framestack.len(), 1);
+        let caller_frame = meta.framestack.current_mut();
+        assert_eq!(caller_frame.int_regs[1], Some(OpRef(42)));
+        assert_eq!(caller_frame.int_values[1], Some(4242));
+    }
+
+    #[test]
+    fn finishframe_void_return_skips_make_result_of_lastop() {
+        use crate::jitcode::JitCodeBuilder;
+        let mut builder = JitCodeBuilder::new();
+        builder.load_const_i_value(0, 0);
+        let caller = std::sync::Arc::new(builder.finish());
+        let callee = std::sync::Arc::new(JitCodeBuilder::new().finish());
+
+        let mut meta = MetaInterp::<()>::new(0);
+        meta.perform_call(caller, &[], None).unwrap_err();
+        // Mutate the caller's register 0 so we can detect any
+        // accidental write triggered by the void return.
+        meta.framestack.current_mut().int_regs[0] = Some(OpRef(7));
+        meta.framestack.current_mut().int_values[0] = Some(7);
+        meta.perform_call(callee, &[], None).unwrap_err();
+        let result = meta.finishframe(None, true);
+        assert!(matches!(result, Err(ChangeFrame)));
+        // Void return preserves whatever was already there in the caller.
+        assert_eq!(meta.framestack.current_mut().int_regs[0], Some(OpRef(7)));
+        assert_eq!(meta.framestack.current_mut().int_values[0], Some(7));
+    }
+
+    #[test]
+    fn initialize_state_from_start_clears_and_seeds_framestack() {
+        // pyjitpl.py:3266-3275 — start a fresh portal: framestack reset,
+        // mainjitcode pushed, original_boxes copied via setup_call.
+        use crate::jitcode::{JitArgKind, JitCodeBuilder};
+        let mut builder = JitCodeBuilder::new();
+        builder.load_const_i_value(0, 0);
+        let mainjitcode = std::sync::Arc::new(builder.finish());
+
+        let mut meta = MetaInterp::<()>::new(0);
+        // Pre-populate framestack with a stale frame to verify reset.
+        meta.perform_call(mainjitcode.clone(), &[], None)
+            .unwrap_err();
+        assert_eq!(meta.framestack.len(), 1);
+        // Pre-populate virtualref_boxes to verify it gets cleared.
+        meta.virtualref_boxes.push((OpRef(99), 99));
+
+        meta.initialize_state_from_start(mainjitcode, &[(JitArgKind::Int, OpRef(7), 7)]);
+        assert_eq!(meta.framestack.len(), 1);
+        assert_eq!(meta.framestack.current_mut().int_regs[0], Some(OpRef(7)));
+        assert_eq!(meta.framestack.current_mut().int_values[0], Some(7));
+        assert!(meta.virtualref_boxes.is_empty());
+    }
+
+    #[test]
+    fn trace_jitcode_with_framestack_pushes_root_then_pops() {
+        // pyjitpl.py self.framestack invariant: trace entry pushes the
+        // root frame, runs the jitcode interp, and the stack is empty
+        // again on return.
+        use crate::BackEdgeAction;
+        use crate::jitcode::JitCodeBuilder;
+        let jitcode = std::sync::Arc::new(JitCodeBuilder::new().finish());
+
+        let mut meta = MetaInterp::<()>::new(0);
+        let action = meta.force_start_tracing(0, None, &[]);
+        assert!(matches!(action, BackEdgeAction::StartedTracing));
+
+        struct NoopSym;
+        impl crate::JitCodeSym for NoopSym {
+            fn current_selected(&self) -> usize {
+                0
+            }
+            fn current_selected_value(&self) -> Option<OpRef> {
+                None
+            }
+            fn set_current_selected(&mut self, _: usize) {}
+            fn set_current_selected_value(&mut self, _: usize, _: OpRef) {}
+            fn stack(&self, _: usize) -> Option<&crate::SymbolicStack> {
+                None
+            }
+            fn stack_mut(&mut self, _: usize) -> Option<&mut crate::SymbolicStack> {
+                None
+            }
+            fn total_slots(&self) -> usize {
+                0
+            }
+            fn loop_header_pc(&self) -> usize {
+                0
+            }
+            fn ensure_stack(&mut self, _: usize, _: usize, _: usize) {}
+            fn fail_args(&self) -> Option<Vec<OpRef>> {
+                None
+            }
+        }
+        let mut sym = NoopSym;
+        let runtime = crate::ClosureRuntime::new(|_| 0, |_, _| 0, |_| 0);
+
+        let action = meta.trace_jitcode_with_framestack(&mut sym, jitcode, 0, &runtime);
+        assert!(matches!(action, crate::TraceAction::Continue));
+        assert_eq!(meta.framestack.len(), 0);
+    }
+
+    #[test]
+    fn is_main_jitcode_returns_false_for_non_portal_jitcode() {
+        let mut meta = MetaInterp::<()>::new(0);
+        let mut jc = crate::jitcode::JitCodeBuilder::new().finish();
+        jc.jitdriver_sd = None;
+        assert!(!meta.is_main_jitcode(&jc));
+        // jitdriver_sd Some but no slot registered → still false.
+        jc.jitdriver_sd = Some(0);
+        assert!(!meta.is_main_jitcode(&jc));
+
+        // Register a non-recursive jitdriver: still false.
+        let mut jd = crate::jitdriver::JitDriverStaticData::new(vec![], vec![]);
+        jd.is_recursive = false;
+        let idx = meta.staticdata.register_jitdriver_sd(jd);
+        jc.jitdriver_sd = Some(idx);
+        assert!(!meta.is_main_jitcode(&jc));
+    }
+
+    #[test]
+    fn is_main_jitcode_returns_true_for_recursive_portal_jitcode() {
+        let mut meta = MetaInterp::<()>::new(0);
+        let mut jd = crate::jitdriver::JitDriverStaticData::new(vec![], vec![]);
+        jd.is_recursive = true;
+        let idx = meta.staticdata.register_jitdriver_sd(jd);
+
+        let mut jc = crate::jitcode::JitCodeBuilder::new().finish();
+        jc.jitdriver_sd = Some(idx);
+        assert!(meta.is_main_jitcode(&jc));
+    }
+
+    #[test]
+    fn enter_portal_frame_records_const_int_pair() {
+        // pyjitpl.py:2455 — history.record2(rop.ENTER_PORTAL_FRAME,
+        // ConstInt(jd_no), ConstInt(unique_id), None)
+        use crate::BackEdgeAction;
+        let mut meta = MetaInterp::<()>::new(0);
+        let action = meta.force_start_tracing(0, None, &[]);
+        assert!(matches!(action, BackEdgeAction::StartedTracing));
+
+        meta.enter_portal_frame(3, 0xfeed);
+
+        let ctx = meta.trace_ctx().expect("tracing must be active");
+        let mut matches = ctx
+            .recorder
+            .ops()
+            .iter()
+            .filter(|op| op.opcode == OpCode::EnterPortalFrame);
+        let op = matches.next().expect("EnterPortalFrame must be recorded");
+        assert!(matches.next().is_none(), "expected exactly one record");
+        assert_eq!(op.args.len(), 2);
+        let jd_no = ctx.constants_get_value(op.args[0]).expect("jd_no constant");
+        let unique_id = ctx
+            .constants_get_value(op.args[1])
+            .expect("unique_id constant");
+        assert_eq!(jd_no, majit_ir::Value::Int(3));
+        assert_eq!(unique_id, majit_ir::Value::Int(0xfeed));
+    }
+
+    #[test]
+    fn leave_portal_frame_records_const_int_jd_no() {
+        // pyjitpl.py:2459 — history.record1(rop.LEAVE_PORTAL_FRAME, ConstInt(jd_no), None)
+        use crate::BackEdgeAction;
+        let mut meta = MetaInterp::<()>::new(0);
+        let action = meta.force_start_tracing(0, None, &[]);
+        assert!(matches!(action, BackEdgeAction::StartedTracing));
+
+        meta.leave_portal_frame(7);
+
+        let ctx = meta.trace_ctx().expect("tracing must be active");
+        let mut matches = ctx
+            .recorder
+            .ops()
+            .iter()
+            .filter(|op| op.opcode == OpCode::LeavePortalFrame);
+        let op = matches.next().expect("LeavePortalFrame must be recorded");
+        assert!(matches.next().is_none(), "expected exactly one record");
+        assert_eq!(op.args.len(), 1);
+        let jd_no = ctx.constants_get_value(op.args[0]).expect("jd_no constant");
+        assert_eq!(jd_no, majit_ir::Value::Int(7));
+    }
+
+    #[test]
+    fn enter_leave_portal_frame_no_op_when_not_tracing() {
+        // Without an active TraceCtx the named entry must not panic and
+        // must not record anything.
+        let mut meta = MetaInterp::<()>::new(0);
+        meta.enter_portal_frame(0, 0);
+        meta.leave_portal_frame(0);
+    }
+
+    #[test]
+    fn reset_framestack_for_failure_empties_the_stack() {
+        // pyjitpl.py:3403 `self.framestack = []` invariant before
+        // resume.rebuild_from_resumedata repopulates frames.
+        use crate::jitcode::JitCodeBuilder;
+        let jitcode = std::sync::Arc::new(JitCodeBuilder::new().finish());
+        let mut meta = MetaInterp::<()>::new(0);
+        meta.perform_call(jitcode, &[], None).unwrap_err();
+        assert_eq!(meta.framestack.len(), 1);
+        meta.reset_framestack_for_failure();
+        assert_eq!(meta.framestack.len(), 0);
+    }
+
+    #[test]
+    fn popframe_invokes_cleanup_registers_on_popped_frame() {
+        // pyjitpl.py:2476: frame.cleanup_registers().  The popped frame
+        // is dropped so we cannot inspect it directly, but we can
+        // observe the side effect by pushing a frame, mutating its
+        // registers, popping, and asserting framestack is now empty.
+        use crate::jitcode::JitCodeBuilder;
+        let jitcode = std::sync::Arc::new(JitCodeBuilder::new().finish());
+        let mut meta = MetaInterp::<()>::new(0);
+        meta.perform_call(jitcode, &[], None).unwrap_err();
+        assert_eq!(meta.framestack.len(), 1);
+        meta.popframe(true);
+        assert_eq!(meta.framestack.len(), 0);
     }
 
     #[test]

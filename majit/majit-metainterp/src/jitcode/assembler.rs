@@ -48,7 +48,7 @@ pub struct JitCodeBuilder {
     opcodes: Vec<OpCode>,
     labels: Vec<Option<usize>>,
     patches: Vec<(usize, usize)>,
-    sub_jitcodes: Vec<JitCode>,
+    sub_jitcodes: Vec<std::sync::Arc<JitCode>>,
     fn_ptrs: Vec<JitCallTarget>,
     assembler_targets: Vec<JitCallAssemblerTarget>,
     has_abort: bool,
@@ -1149,6 +1149,15 @@ impl JitCodeBuilder {
     }
 
     pub fn add_sub_jitcode(&mut self, jitcode: JitCode) -> u16 {
+        let idx = self.sub_jitcodes.len() as u16;
+        self.sub_jitcodes.push(std::sync::Arc::new(jitcode));
+        idx
+    }
+
+    /// Variant accepting an already-shared `Arc<JitCode>` for callers
+    /// that already hold a shared handle (e.g. a re-export from
+    /// `MetaInterpStaticData::indirectcalltargets`).
+    pub fn add_sub_jitcode_arc(&mut self, jitcode: std::sync::Arc<JitCode>) -> u16 {
         let idx = self.sub_jitcodes.len() as u16;
         self.sub_jitcodes.push(jitcode);
         idx

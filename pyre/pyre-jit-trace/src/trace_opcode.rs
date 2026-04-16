@@ -229,7 +229,7 @@ impl MIFrame {
         ) = unsafe {
             let jc = &*jitcode_ptr_pre;
             match jc.majit_jitcode.as_ref() {
-                Some(m) => (m as *const _, &jc.py_to_jit_pc),
+                Some(m) => (std::sync::Arc::as_ptr(m), &jc.py_to_jit_pc),
                 None => (std::ptr::null(), std::ptr::null()),
             }
         };

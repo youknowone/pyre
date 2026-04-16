@@ -214,9 +214,16 @@ fn jitcode_inline_call_updates_trace_ctx_inline_depth() {
     let mut interp = start_trace(&[5]);
     let mut sym = TestSym::new(1);
     let initial = [5_i64];
-    let root = MIFrame::new(&jitcode, 0);
-    let mut machine =
-        JitCodeMachine::<TestSym, _>::new(root, &jitcode.sub_jitcodes, &jitcode.fn_ptrs);
+    let jitcode_arc = std::sync::Arc::new(jitcode);
+    let sub_jitcodes = jitcode_arc.sub_jitcodes.clone();
+    let fn_ptrs = jitcode_arc.fn_ptrs.clone();
+    let mut standalone = majit_metainterp::StandaloneFrameStack::new();
+    standalone.frames.push(MIFrame::new(jitcode_arc, 0));
+    let mut machine = JitCodeMachine::<TestSym, _>::with_framestack(
+        &mut standalone.frames,
+        &sub_jitcodes,
+        &fn_ptrs,
+    );
     let runtime =
         majit_metainterp::ClosureRuntime::new(|_| initial.len(), |_, pos| initial[pos], |_| 0);
 

@@ -921,7 +921,7 @@ pub struct BlackholeInterpreter {
     /// Temporary register for float return value.
     pub tmpreg_f: i64,
     /// Current jitcode being executed.
-    pub jitcode: JitCode,
+    pub jitcode: std::sync::Arc<JitCode>,
     /// Current bytecode position (program counter).
     pub position: usize,
     /// Caller frame in the blackhole frame chain.
@@ -1025,7 +1025,7 @@ impl BlackholeInterpreter {
             tmpreg_i: 0,
             tmpreg_r: 0,
             tmpreg_f: 0,
-            jitcode: JitCode::default(),
+            jitcode: std::sync::Arc::new(JitCode::default()),
             position: 0,
             nextblackholeinterp: None,
             return_type: BhReturnType::Void,
@@ -1049,7 +1049,7 @@ impl BlackholeInterpreter {
     /// Initialize register arrays for a jitcode and set the position.
     /// Allocates registers sized to hold both working regs and constants,
     /// then copies constants into the upper portion of each register array.
-    pub fn setposition(&mut self, jitcode: JitCode, position: usize) {
+    pub fn setposition(&mut self, jitcode: std::sync::Arc<JitCode>, position: usize) {
         // blackhole.py:313-315
         let num_regs_and_consts_i = jitcode.num_regs_and_consts_i();
         let num_regs_and_consts_r = jitcode.num_regs_and_consts_r();
@@ -4194,7 +4194,7 @@ mod tests {
             let jitcode = b.finish();
 
             let mut bh = BlackholeInterpreter::new();
-            bh.setposition(jitcode, 0);
+            bh.setposition(std::sync::Arc::new(jitcode), 0);
             let _ = bh.run();
 
             assert_eq!(bh.registers_i[2], 30);
@@ -4213,7 +4213,7 @@ mod tests {
             let jitcode = b.finish();
 
             let mut bh = BlackholeInterpreter::new();
-            bh.setposition(jitcode, 0);
+            bh.setposition(std::sync::Arc::new(jitcode), 0);
             let _ = bh.run();
 
             assert_eq!(bh.registers_i[1], 0); // skipped, still 0
@@ -4232,7 +4232,7 @@ mod tests {
             let jitcode = b.finish();
 
             let mut bh = BlackholeInterpreter::new();
-            bh.setposition(jitcode, 0);
+            bh.setposition(std::sync::Arc::new(jitcode), 0);
             let _ = bh.run();
 
             assert_eq!(bh.registers_i[1], 42);
@@ -4250,7 +4250,7 @@ mod tests {
             let jitcode = b.finish();
 
             let mut bh = BlackholeInterpreter::new();
-            bh.setposition(jitcode, 0);
+            bh.setposition(std::sync::Arc::new(jitcode), 0);
             let _ = bh.run();
 
             assert_eq!(bh.registers_i[0], 0); // skipped
@@ -4265,7 +4265,7 @@ mod tests {
             let jitcode = b.finish();
 
             let mut bh = BlackholeInterpreter::new();
-            bh.setposition(jitcode, 0);
+            bh.setposition(std::sync::Arc::new(jitcode), 0);
             let _ = bh.run();
 
             assert_eq!(bh.registers_i[1], 42);
@@ -4279,7 +4279,7 @@ mod tests {
             let jitcode = b.finish();
 
             let mut bh = BlackholeInterpreter::new();
-            bh.setposition(jitcode, 0);
+            bh.setposition(std::sync::Arc::new(jitcode), 0);
             let _ = bh.run();
 
             assert_eq!(bh.registers_i[1], -42);
@@ -4293,7 +4293,7 @@ mod tests {
             let jitcode = b.finish();
 
             let mut bh = BlackholeInterpreter::new();
-            bh.setposition(jitcode, 0);
+            bh.setposition(std::sync::Arc::new(jitcode), 0);
             bh.setarg_i(0, 7);
             bh.setarg_i(1, 6);
             let _ = bh.run();
@@ -4329,7 +4329,7 @@ mod tests {
             let jitcode = b.finish();
 
             let mut bh = BlackholeInterpreter::new();
-            bh.setposition(jitcode, 0);
+            bh.setposition(std::sync::Arc::new(jitcode), 0);
             let _ = bh.run();
 
             assert_eq!(bh.registers_i[1], 42);

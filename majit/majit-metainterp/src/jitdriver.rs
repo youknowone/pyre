@@ -74,6 +74,12 @@ pub struct JitDriverStaticData {
     /// warmspot.py:449 jd.result_type — portal function return type.
     /// Determined once at driver setup from the portal's return signature.
     pub result_type: Type,
+    /// rpython/rlib/jit.py JitDriver(is_recursive=True) parity.
+    /// Mirrors RPython's `jitcode.jitdriver_sd.jitdriver.is_recursive`
+    /// access — see pyjitpl.py:2427-2429 `is_main_jitcode`.  Pyre stores
+    /// the flag directly on the static data so MetaInterp can decide
+    /// without touching the runtime `JitDriver` object.
+    pub is_recursive: bool,
 }
 
 impl JitDriverStaticData {
@@ -99,6 +105,7 @@ impl JitDriverStaticData {
             vars,
             virtualizable: virtualizable.map(str::to_string),
             result_type: Type::Ref,
+            is_recursive: false,
         }
     }
 
@@ -430,7 +437,7 @@ impl<S: JitState> JitDriver<S> {
         let jitcode = factory(env, resume_pc, resume_op)?;
 
         let mut bh = crate::blackhole::BlackholeInterpreter::new();
-        bh.setposition(jitcode, 0);
+        bh.setposition(std::sync::Arc::new(jitcode), 0);
 
         // Set inputarg register values from fail_values
         for (i, &val) in fail_values.iter().take(inputarg_count).enumerate() {
@@ -1344,7 +1351,10 @@ impl<S: JitState> JitDriver<S> {
                     |_pos: i32, pc: i32| -> Option<crate::resume::ResolvedJitCode> {
                         let factory = self.jitcode_factory.as_ref()?;
                         let jitcode = factory(env, pc as usize, 0)?;
-                        Some(crate::resume::ResolvedJitCode::new(jitcode, pc as usize))
+                        Some(crate::resume::ResolvedJitCode::new(
+                            std::sync::Arc::new(jitcode),
+                            pc as usize,
+                        ))
                     };
 
                 let fallback_alloc = crate::resume::NullAllocator;
@@ -2904,7 +2914,10 @@ impl<S: JitState> JitDriver<S> {
                     |_pos: i32, pc: i32| -> Option<crate::resume::ResolvedJitCode> {
                         let factory = jitcode_factory_ref?;
                         let jitcode = factory(env, pc as usize, 0)?;
-                        Some(crate::resume::ResolvedJitCode::new(jitcode, pc as usize))
+                        Some(crate::resume::ResolvedJitCode::new(
+                            std::sync::Arc::new(jitcode),
+                            pc as usize,
+                        ))
                     };
 
                 let fallback_alloc = crate::resume::NullAllocator;
