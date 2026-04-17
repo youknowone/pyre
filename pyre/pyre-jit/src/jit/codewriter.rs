@@ -330,10 +330,14 @@ impl CodeWriter {
             });
         }
 
-        // RPython jtransform.py:1714-1718 handle_jit_marker__loop_header:
-        // Pre-scan JUMP_BACKWARD targets to identify loop headers.
-        // RPython emits jit_merge_point + loop_header opcodes at these
-        // positions.
+        // interp_jit.py:118 `pypyjitdriver.can_enter_jit(...)` is called in
+        // `jump_absolute` (`jumpto < next_instr` branch), i.e. at each
+        // Python backward jump.  jtransform.py:1714-1723
+        // `handle_jit_marker__can_enter_jit = handle_jit_marker__loop_header`
+        // lowers each one to a `loop_header` jitcode op.  Pyre has no
+        // `jump_absolute` Python wrapper — the equivalent is to pre-scan
+        // `JumpBackward` opcodes and record their targets; each target PC
+        // becomes a `loop_header` site.
         let mut loop_header_pcs: std::collections::HashSet<usize> =
             std::collections::HashSet::new();
         {
@@ -349,7 +353,6 @@ impl CodeWriter {
                 }
             }
         }
-
         // Exception table: handler target PC → handler stack depth.
         // Python sets the stack depth to handler.depth (+1 if push_lasti)
         // at exception handler entry. Used to correct current_depth at
