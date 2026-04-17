@@ -641,7 +641,7 @@ impl pyre_interpreter::NamespaceOpcodeHandler for crate::state::MIFrame {
                 //    lookup result (call_pure_results).
                 // 3. CALL_PURE_R(ns, slot) — elidable lookup; record_result_of_call_pure
                 //    folds via OptPure lookup_known_result.
-                let opref = self.with_ctx(|this, ctx| {
+                let opref = self.with_ctx(|_this, ctx| {
                     let ns_const = ctx.const_ref(ns as i64);
                     let slot_const = ctx.const_int(slot as i64);
                     ctx.record_op(majit_ir::OpCode::QuasiimmutField, &[ns_const, slot_const]);
@@ -652,9 +652,6 @@ impl pyre_interpreter::NamespaceOpcodeHandler for crate::state::MIFrame {
                     );
                     let call_result =
                         ctx.record_op(majit_ir::OpCode::CallPureR, &[ns_const, slot_const]);
-                    this.sym_mut()
-                        .symbolic_namespace_slots
-                        .insert(slot, call_result);
                     Ok::<_, pyre_interpreter::PyError>(call_result)
                 })?;
                 return Ok(crate::state::FrontendOp::new(opref, result_concrete));

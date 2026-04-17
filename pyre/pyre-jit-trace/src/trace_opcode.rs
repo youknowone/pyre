@@ -650,9 +650,6 @@ impl MIFrame {
         ctx: &mut TraceCtx,
         idx: usize,
     ) -> Result<OpRef, PyError> {
-        if let Some(value) = self.sym().symbolic_namespace_slots.get(&idx).copied() {
-            return Ok(value);
-        }
         // pyjitpl.py:1075-1089: quasi-immutable field pattern.
         // Module globals are effectively quasi-immutable — they rarely change
         // during hot loops. Emit GUARD_NOT_INVALIDATED on first global access
@@ -674,9 +671,7 @@ impl MIFrame {
             namespace_values_ptr_descr(),
         );
         let idx_const = ctx.const_int(idx as i64);
-        let value = trace_raw_array_getitem_value(ctx, values, idx_const);
-        self.sym_mut().symbolic_namespace_slots.insert(idx, value);
-        Ok(value)
+        Ok(trace_raw_array_getitem_value(ctx, values, idx_const))
     }
 
     pub(crate) fn store_namespace_value(
@@ -700,7 +695,6 @@ impl MIFrame {
         );
         let idx_const = ctx.const_int(idx as i64);
         trace_raw_array_setitem_value(ctx, values, idx_const, value);
-        self.sym_mut().symbolic_namespace_slots.insert(idx, value);
         Ok(())
     }
 

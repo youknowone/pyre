@@ -662,7 +662,6 @@ pub struct PyreSym {
     pub(crate) vable_lastblock: OpRef,
     #[vable(inputarg)]
     pub(crate) vable_w_globals: OpRef,
-    pub(crate) symbolic_namespace_slots: std::collections::HashMap<usize, OpRef>,
     #[vable(array_base)]
     pub(crate) vable_array_base: Option<u32>,
     /// RPython goto_if_not fusion: cached raw truth OpRef from the
@@ -1725,7 +1724,6 @@ impl PyreSym {
             vable_debugdata: OpRef::NONE,
             vable_lastblock: OpRef::NONE,
             vable_w_globals: OpRef::NONE,
-            symbolic_namespace_slots: std::collections::HashMap::new(),
             vable_array_base: None,
             last_comparison_truth: None,
             last_comparison_concrete_truth: None,
