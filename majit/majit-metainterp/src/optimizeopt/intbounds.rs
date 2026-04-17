@@ -1246,6 +1246,54 @@ impl OptIntBounds {
                     self.make_ne(op.arg(0), op.arg(1), ctx);
                 }
             }
+            // intbounds.py:379-386 propagate_bounds_UINT_LT
+            OpCode::UintLt => {
+                let r = self.getintbound(op.pos, ctx);
+                if r.is_constant() {
+                    if r.lower == 1 {
+                        self.make_unsigned_lt(op.arg(0), op.arg(1), ctx);
+                    } else {
+                        debug_assert_eq!(r.lower, 0);
+                        self.make_unsigned_ge(op.arg(0), op.arg(1), ctx);
+                    }
+                }
+            }
+            // intbounds.py:400-407 propagate_bounds_UINT_GT
+            OpCode::UintGt => {
+                let r = self.getintbound(op.pos, ctx);
+                if r.is_constant() {
+                    if r.lower == 1 {
+                        self.make_unsigned_gt(op.arg(0), op.arg(1), ctx);
+                    } else {
+                        debug_assert_eq!(r.lower, 0);
+                        self.make_unsigned_le(op.arg(0), op.arg(1), ctx);
+                    }
+                }
+            }
+            // intbounds.py:421-428 propagate_bounds_UINT_LE
+            OpCode::UintLe => {
+                let r = self.getintbound(op.pos, ctx);
+                if r.is_constant() {
+                    if r.lower == 1 {
+                        self.make_unsigned_le(op.arg(0), op.arg(1), ctx);
+                    } else {
+                        debug_assert_eq!(r.lower, 0);
+                        self.make_unsigned_gt(op.arg(0), op.arg(1), ctx);
+                    }
+                }
+            }
+            // intbounds.py:442-449 propagate_bounds_UINT_GE
+            OpCode::UintGe => {
+                let r = self.getintbound(op.pos, ctx);
+                if r.is_constant() {
+                    if r.lower == 1 {
+                        self.make_unsigned_ge(op.arg(0), op.arg(1), ctx);
+                    } else {
+                        debug_assert_eq!(r.lower, 0);
+                        self.make_unsigned_lt(op.arg(0), op.arg(1), ctx);
+                    }
+                }
+            }
             // intbounds.py:678-693 _propagate_int_is_true_or_zero +
             // propagate_bounds_INT_IS_TRUE / IS_ZERO.
             //
