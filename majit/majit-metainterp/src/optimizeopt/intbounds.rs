@@ -833,10 +833,12 @@ impl OptIntBounds {
         }
     }
 
+    /// intbounds.py:602-603 make_unsigned_gt
     fn make_unsigned_gt(&mut self, box1: OpRef, box2: OpRef, ctx: &mut OptContext) {
         self.make_unsigned_lt(box2, box1, ctx);
     }
 
+    /// intbounds.py:605-606 make_unsigned_ge
     fn make_unsigned_ge(&mut self, box1: OpRef, box2: OpRef, ctx: &mut OptContext) {
         self.make_unsigned_le(box2, box1, ctx);
     }

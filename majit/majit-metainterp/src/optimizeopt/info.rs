@@ -1746,11 +1746,10 @@ impl PtrInfo {
     ///
     /// pyre's enum flattens the class hierarchy, so the `True` list matches
     /// AbstractVirtualPtrInfo's subclasses directly.  `PtrInfo::Constant`
-    /// was previously (incorrectly) in the True list — RPython's
-    /// `ConstPtrInfo` inherits from `PtrInfo` (not AbstractVirtualPtrInfo)
-    /// so it gets the False default.  The `Str` variant maps to
-    /// `StrPtrInfo` (vstring.py:50) which likewise inherits from
-    /// `PtrInfo` without override and should stay False.
+    /// maps to `ConstPtrInfo` which inherits from `PtrInfo` (not
+    /// AbstractVirtualPtrInfo), so it gets the False default.  The `Str`
+    /// variant maps to `StrPtrInfo(AbstractVirtualPtrInfo)` (vstring.py:50),
+    /// so it inherits `is_precise=True`.
     pub fn is_precise(&self) -> bool {
         matches!(
             self,
@@ -1763,6 +1762,7 @@ impl PtrInfo {
                 | PtrInfo::VirtualArrayStruct(_)
                 | PtrInfo::VirtualRawBuffer(_)
                 | PtrInfo::VirtualRawSlice(_)
+                | PtrInfo::Str(_)
         )
     }
 

@@ -1442,7 +1442,7 @@ impl OptRewrite {
     /// + emit) is the call-time half. The `make_constant(box, CONST_1)` half
     /// of the upstream `optimize_guard` is split into
     /// `propagate_postprocess` (rewrite.py:352-371) per RPython's
-    /// `has_postprocess` model — see the bottom of this file.
+    /// `have_postprocess` model — see the bottom of this file.
     fn optimize_guard_true(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = op.arg(0);
 
@@ -2958,7 +2958,7 @@ impl Optimization for OptRewrite {
         "rewrite"
     }
 
-    fn has_postprocess(&self) -> bool {
+    fn have_postprocess(&self) -> bool {
         true
     }
 
@@ -2968,7 +2968,7 @@ impl Optimization for OptRewrite {
     /// The `make_constant(box, CONST_*)` call is the second half of PyPy's
     /// `optimize_guard` (rewrite.py:163-184). PyPy emits the guard, then
     /// records that the guard's input box is now known constant. The Rust
-    /// port keeps the same split that `has_postprocess` requires — the
+    /// port keeps the same split that `have_postprocess` requires — the
     /// emit happens via `optimize_guard_true/false/value` and the
     /// `make_constant` happens here.
     ///
