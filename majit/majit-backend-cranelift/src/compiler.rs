@@ -418,12 +418,6 @@ struct RegisteredLoopTarget {
     num_inputs: usize,
     num_ref_roots: usize,
     max_output_slots: usize,
-    /// Total jitframe depth = max_output_slots + num_ref_roots.
-    /// RPython: regalloc.py JITFRAME_FIXED_SIZE + depth. Used by
-    /// CallAssemblerI to allocate a large enough callee jitframe
-    /// that ref root spill slots (after max_output_slots) don't
-    /// overflow the allocation.
-    frame_depth: usize,
     inputarg_types: Vec<Type>,
     /// virtualizable.py:86 read_boxes: number of scalar inputargs
     /// (frame + static fields). First local is at this index.
@@ -2080,7 +2074,6 @@ fn register_call_assembler_target(
         num_inputs: compiled.num_inputs,
         num_ref_roots: compiled.num_ref_roots,
         max_output_slots: compiled.max_output_slots,
-        frame_depth: compiled.max_output_slots + compiled.num_ref_roots,
         inputarg_types: token.inputarg_types.clone(),
         // virtualizable.py:86 read_boxes: header = frame + static fields.
         num_scalar_inputargs,
@@ -2153,7 +2146,6 @@ pub fn register_pending_call_assembler_target(
         num_inputs,
         num_ref_roots: 0,
         max_output_slots: 1,
-        frame_depth: 1,
         inputarg_types,
         num_scalar_inputargs,
         index_of_virtualizable,
@@ -5467,7 +5459,7 @@ impl CraneliftBackend {
                     let ll_initial_locs = clt._ll_initial_locs.lock().clone();
                     majit_gc::rewrite::CallAssemblerCalleeLocs {
                         _ll_initial_locs: ll_initial_locs,
-                        frame_depth: t.frame_depth,
+                        frame_depth: t.max_output_slots + t.num_ref_roots,
                         frame_info_ptr,
                         // pyjitpl.py:3605 — outermost_jitdriver_sd.index_of_virtualizable,
                         // propagated from JitCellToken at registration time.
@@ -7446,9 +7438,13 @@ impl CraneliftBackend {
                     // The callee's prologue pushes jf_ptr onto shadow stack,
                     // so GC tracks it during callee execution. After return,
                     // we use result_jf (not args_ptr) for all reads.
+                    // `frame_depth = max_output_slots + num_ref_roots` by
+                    // construction; the `.max(t.max_output_slots)` in the
+                    // original formulation is redundant because
+                    // `num_ref_roots >= 0`.
                     let callee_depth = resolved_target
                         .as_ref()
-                        .map_or(16, |t| t.frame_depth.max(t.max_output_slots).max(1));
+                        .map_or(16, |t| (t.max_output_slots + t.num_ref_roots).max(1));
                     let num_expanded_items = if let Some(exp) = call_descr.vable_expansion() {
                         1 + exp.scalar_fields.len() + exp.num_array_items
                     } else {
