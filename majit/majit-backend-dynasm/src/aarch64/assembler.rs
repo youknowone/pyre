@@ -870,6 +870,7 @@ impl AssemblerARM64 {
             ; stp x19, x20, [sp, #16]   // save callee-saved regs
             ; mov x29, x0
         );
+        self.gen_shadowstack_header();
         self.setup_input_state(inputargs);
     }
 
@@ -879,11 +880,63 @@ impl AssemblerARM64 {
 
     /// Emit the function epilogue: return jf_ptr in RAX/X0.
     fn _call_footer(&mut self) {
+        self.gen_footer_shadowstack();
         dynasm!(self.mc ; .arch aarch64
             ; mov x0, x29
             ; ldp x19, x20, [sp, #16]   // restore callee-saved regs
             ; ldp x29, x30, [sp], #32
             ; ret
+        );
+    }
+
+    /// aarch64/assembler.py:1422 `gen_shadowstack_header` parity:
+    ///
+    /// ```python
+    ///   rst = gcrootmap.get_root_stack_top_addr()
+    ///   mc.gen_load_int(r.ip1.value, rst)
+    ///   self.load_reg(mc, r.x8, r.ip1)   # x8 = *rst = root_stack_top
+    ///   mc.gen_load_int(r.ip0.value, 1)
+    ///   self.store_reg(mc, r.ip0, r.x8)  # x8[0] = 1 (is_minor marker)
+    ///   self.store_reg(mc, r.fp, r.x8, WORD) # x8[WORD] = fp (jf_ptr)
+    ///   mc.ADD_ri(r.x8.value, r.x8.value, 2 * WORD)
+    ///   self.store_reg(mc, r.x8, r.ip1)  # *rst = x8
+    /// ```
+    ///
+    /// Pushes two words onto the jf shadow stack: the `is_minor` marker
+    /// (1) and the current jitframe pointer. Done inline on every JIT
+    /// function entry so the collector can walk jf roots without ever
+    /// calling into Rust.
+    fn gen_shadowstack_header(&mut self) {
+        let rst = majit_gc::shadow_stack::get_root_stack_top_addr() as i64;
+        // RPython uses x8 as scratch here (r.ip1 for rst_addr, r.x8 for
+        // the loaded top). We mirror that: x16 = rst_addr, x8 = top.
+        self.emit_mov_imm64(16, rst);
+        dynasm!(self.mc ; .arch aarch64
+            ; ldr x8, [x16]             // x8 = *rst = root_stack_top
+            ; mov x17, 1                 // is_minor marker
+            ; str x17, [x8]             // [x8] = 1
+            ; str x29, [x8, 8]          // [x8 + WORD] = fp (jf_ptr)
+            ; add x8, x8, 16            // x8 += 2*WORD
+            ; str x8, [x16]             // *rst = x8
+        );
+    }
+
+    /// aarch64/assembler.py:1438 `gen_footer_shadowstack` parity:
+    ///
+    /// ```python
+    ///   rst = gcrootmap.get_root_stack_top_addr()
+    ///   mc.gen_load_int(r.ip0.value, rst)
+    ///   self.load_reg(mc, r.ip1, r.ip0)  # ip1 = *rst = top
+    ///   mc.SUB_ri(r.ip1.value, r.ip1.value, 2 * WORD)
+    ///   self.store_reg(mc, r.ip1, r.ip0) # *rst = ip1
+    /// ```
+    fn gen_footer_shadowstack(&mut self) {
+        let rst = majit_gc::shadow_stack::get_root_stack_top_addr() as i64;
+        self.emit_mov_imm64(16, rst);
+        dynasm!(self.mc ; .arch aarch64
+            ; ldr x17, [x16]            // x17 = *rst = top
+            ; sub x17, x17, 16          // top -= 2*WORD
+            ; str x17, [x16]            // *rst = top
         );
     }
 
@@ -903,19 +956,27 @@ impl AssemblerARM64 {
         );
     }
 
-    /// assembler.py:405-412 _reload_frame_if_necessary parity:
-    /// after a helper or collecting call, follow jf_forward so rbp/x29
-    /// points at the current jitframe location.
+    /// aarch64/assembler.py:967 `_reload_frame_if_necessary` parity:
+    ///
+    /// ```python
+    ///   rst = gcrootmap.get_root_stack_top_addr()
+    ///   mc.gen_load_int(r.ip0.value, rst)
+    ///   self.load_reg(mc, r.ip0, r.ip0)       # ip0 = *rst = root_stack_top
+    ///   mc.SUB_ri(r.ip0.value, r.ip0.value, WORD)
+    ///   mc.LDR_ri(r.fp.value, r.ip0.value, 0) # fp = *(top - WORD) = jf_ptr
+    /// ```
+    ///
+    /// After a collecting helper call the GC may have moved the
+    /// jitframe; the visitor rewrites the shadow-stack top entry in
+    /// place during copy, so the current pointer lives at
+    /// `*(root_stack_top - WORD)`. Reload fp/x29 from there.
     fn reload_frame_if_necessary(&mut self) {
-        let loop_label = self.mc.new_dynamic_label();
-        let done_label = self.mc.new_dynamic_label();
+        let rst_addr = majit_gc::shadow_stack::get_root_stack_top_addr() as i64;
+        self.emit_mov_imm64(16, rst_addr);
         dynasm!(self.mc ; .arch aarch64
-            ; =>loop_label
-            ; ldr x16, [x29, JF_FORWARD_OFS as u32]
-            ; cbz x16, =>done_label
-            ; mov x29, x16
-            ; b =>loop_label
-            ; =>done_label
+            ; ldr x16, [x16]            // ip0 = *rst_addr = root_stack_top
+            ; sub x16, x16, 8           // ip0 -= WORD
+            ; ldr x29, [x16]            // fp = *(top - WORD) = jf_ptr
         );
     }
 

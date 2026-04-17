@@ -695,7 +695,11 @@ impl Backend for DynasmBackend {
             }
         }
 
-        // llmodel.py:323: ll_frame = func(ll_frame)
+        // llmodel.py:323: ll_frame = func(ll_frame). The compiled
+        // prologue (gen_shadowstack_header) / epilogue
+        // (gen_footer_shadowstack) push/pop the jf_ptr onto the shadow
+        // stack inline, matching aarch64/assembler.py:1422/1438 — no
+        // manual push_jf/pop_jf_to around the call.
         let func: unsafe extern "C" fn(*mut JitFrame) -> *mut JitFrame =
             unsafe { std::mem::transmute(entry) };
         let result_jf = unsafe { func(jf_ptr) };
