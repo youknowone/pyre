@@ -47,6 +47,7 @@ pub(crate) fn pyre_pipeline_config() -> crate::PipelineConfig {
                 .collect(),
             ..Default::default()
         },
+        portal: None,
     }
 }
 

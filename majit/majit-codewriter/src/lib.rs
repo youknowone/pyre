@@ -236,10 +236,16 @@ fn analyze_pipeline_from_parsed(
             heuristic = layout::HeuristicLayoutProvider::from_struct_fields(
                 &program.struct_fields.fields,
                 &program.known_struct_names,
+                &program.immutable_fields,
             );
             &heuristic
         }
     };
+    // RPython: per-class `_immutable_fields_` declaration. Drives
+    // `FieldDescr.is_pure` for the heuristic-fallback path inside
+    // `all_interiorfielddescrs` (the layout-provider path already carries
+    // `is_immutable` on `StructFieldLayout`).
+    call_control.immutable_fields_by_struct = program.immutable_fields.clone();
     // Populate CallControl with layouts from the provider.
     for struct_name in program.struct_fields.fields.keys() {
         if let Some(layout) = provider.get_struct_layout(struct_name) {

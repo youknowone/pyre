@@ -825,6 +825,57 @@ pub fn loop_invariant(_attr: TokenStream, item: TokenStream) -> TokenStream {
     expand_call_surface_attr("jit_loop_invariant", "_MAJIT_LOOP_INVARIANT", item)
 }
 
+/// Mark struct fields whose value never mutates after construction.
+///
+/// RPython parity: `_immutable_fields_ = ['field_a', 'field_b']` on the
+/// class body (`rpython/rlib/jit.py` -> `rpython/rtyper/lltypesystem/rclass.py`).
+/// The annotator pipes the list through to `cpu.fielddescrof()` which
+/// stores `is_pure=True` on the field descr, allowing the JIT to fold
+/// reads of those fields into constants once the receiver is known.
+///
+/// Usage:
+/// ```ignore
+/// #[majit_macros::jit_immutable_fields(pools)]
+/// pub struct Storage {
+///     pub pools: [*mut Stack; STORAGE_COUNT],
+///     ...
+/// }
+/// ```
+///
+/// The proc-macro is a pass-through: it leaves the struct definition
+/// untouched and exists solely so `rustc` accepts the attribute. The
+/// codewriter front-end (`majit-codewriter::front::ast`) reads the
+/// attribute directly from the parsed source via `syn` and feeds the
+/// field list into the struct layout / descr pipeline.
+#[proc_macro_attribute]
+pub fn jit_immutable_fields(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    item
+}
+
+/// Mark a method (or free function) as elidable / pure.
+///
+/// RPython parity: `@jit.elidable` (`rpython/rlib/jit.py:13`). The JIT
+/// can fold calls to this function once all arguments are constant.
+///
+/// Companion to the existing `#[elidable]` attribute, with two
+/// differences:
+///   1. Works on `ImplItemFn` as well as free functions — the existing
+///      `#[elidable]` parses as `ItemFn` and rejects `impl` methods.
+///   2. Pure pass-through, so it does not synthesize trampolines /
+///      helper policy tokens. Methods on `&self` / `&mut self` are
+///      called by the codewriter via `CallTarget::method` path
+///      resolution, which doesn't need the trampoline that free
+///      functions get.
+///
+/// The codewriter front-end (`majit-codewriter::front::ast::collect_jit_hints`)
+/// already recognises the bare attribute name `jit_elidable` and
+/// flips the function hint to `"elidable"`, which `mark_elidable`
+/// consumes downstream.
+#[proc_macro_attribute]
+pub fn jit_elidable(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    item
+}
+
 /// JIT can safely unroll loops in this function and this will
 /// not lead to code explosion.
 ///

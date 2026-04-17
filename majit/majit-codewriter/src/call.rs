@@ -355,6 +355,12 @@ pub struct CallControl {
     /// Maps call target → oopspec string (e.g. "jit.isconstant(value)").
     /// codewriter/jtransform reads this to route calls through OopSpecIndex.
     pub oopspec_targets: HashMap<CallPath, String>,
+
+    /// RPython: `_immutable_fields_` per class. Maps struct_name → field names
+    /// declared immutable. Consulted by the heuristic fallback in
+    /// `all_interiorfielddescrs` when a struct has no registered StructLayout
+    /// (Path 1 already carries `is_immutable` on `StructFieldLayout`).
+    pub immutable_fields_by_struct: HashMap<String, Vec<String>>,
 }
 
 /// Heuristic struct layout — NOT equivalent to RPython's `symbolic.get_field_token()`.
@@ -386,16 +392,26 @@ pub struct StructFieldLayout {
     pub flag: majit_ir::descr::ArrayFlag,
     /// IR type classification.
     pub field_type: majit_ir::value::Type,
+    /// RPython: `STRUCT._immutable_field(fieldname)` —
+    /// True iff fieldname appears in the owning class's
+    /// `_immutable_fields_` declaration. Drives
+    /// `FieldDescr.is_pure` / `is_always_pure()`.
+    pub is_immutable: bool,
 }
 
 impl StructLayout {
     /// Build a StructLayout from type-string heuristic.
     /// Used at pipeline init to populate struct_layouts from struct_fields.
     /// The runtime can later override with actual layout via set_struct_layout().
+    ///
+    /// `immutable_field_names`: subset of field names declared as
+    /// `_immutable_fields_` on the owning class — RPython
+    /// `STRUCT._immutable_field(fieldname)` returns True for these.
     pub fn from_type_strings(
         fields: &[(String, String)],
         known_structs: &std::collections::HashSet<String>,
         known_struct_sizes: &std::collections::HashMap<String, usize>,
+        immutable_field_names: &std::collections::HashSet<String>,
     ) -> Self {
         // RPython: symbolic.get_array_token() computes itemsize for ANY struct,
         // even those with nested structs. UnsupportedFieldExc only affects
@@ -449,12 +465,14 @@ impl StructLayout {
             // RPython: alignment is typically min(field_size, WORD).
             let align = field_size.min(std::mem::size_of::<usize>());
             offset = (offset + align - 1) & !(align - 1);
+            let is_immutable = immutable_field_names.contains(name);
             layout_fields.push(StructFieldLayout {
                 name: name.clone(),
                 offset,
                 size: field_size,
                 flag,
                 field_type,
+                is_immutable,
             });
             offset += field_size;
         }
@@ -602,6 +620,7 @@ impl CallControl {
             close_stack_targets: HashSet::new(),
             external_gc_effects: HashSet::new(),
             oopspec_targets: HashMap::new(),
+            immutable_fields_by_struct: HashMap::new(),
         }
     }
 
@@ -2715,7 +2734,7 @@ fn all_interiorfielddescrs(
                 offset: fl.offset,
                 field_size: fl.size,
                 field_type: fl.field_type,
-                is_immutable: false,
+                is_immutable: fl.is_immutable,
                 flag: fl.flag,
                 virtualizable: false,
                 index_in_parent,
@@ -2745,6 +2764,13 @@ fn all_interiorfielddescrs(
             return (Vec::new(), 0);
         }
     }
+    // RPython: STRUCT._immutable_field(fieldname) — class-level
+    // `_immutable_fields_` declaration. Honored by all_fielddescrs.
+    let immutable_set: std::collections::HashSet<&str> = cc
+        .immutable_fields_by_struct
+        .get(struct_name)
+        .map(|v| v.iter().map(|s| s.as_str()).collect())
+        .unwrap_or_default();
     let mut offset: usize = 0;
     let mut field_specs = Vec::new();
     for (_i, (field_name, field_type_str)) in fields.iter().enumerate() {
@@ -2769,7 +2795,7 @@ fn all_interiorfielddescrs(
             offset,
             field_size,
             field_type,
-            is_immutable: false,
+            is_immutable: immutable_set.contains(field_name.as_str()),
             flag,
             virtualizable: false,
             index_in_parent,
@@ -3886,7 +3912,12 @@ mod tests {
         loop {
             let mut changed = false;
             for (name, fields) in &all_fields {
-                let layout = StructLayout::from_type_strings(fields, &known_structs, &known_sizes);
+                let layout = StructLayout::from_type_strings(
+                    fields,
+                    &known_structs,
+                    &known_sizes,
+                    &HashSet::new(),
+                );
                 if known_sizes.get(*name) != Some(&layout.size) {
                     known_sizes.insert(name.to_string(), layout.size);
                     changed = true;

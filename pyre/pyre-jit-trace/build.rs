@@ -69,6 +69,7 @@ fn main() {
                 call_effects: build_call_effect_overrides(),
                 ..Default::default()
             },
+            portal: None,
         },
     };
     // warmspot.py:516 `vinfos[VTYPEPTR] = VirtualizableInfo(self, VTYPEPTR)` —

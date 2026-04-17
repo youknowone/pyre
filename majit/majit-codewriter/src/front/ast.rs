@@ -76,6 +76,13 @@ pub struct SemanticProgram {
     /// can use them for array type identity resolution.
     #[serde(default)]
     pub fn_return_types: HashMap<String, String>,
+    /// RPython: `_immutable_fields_ = [...]` declared on a class body.
+    /// Maps struct name → list of field names whose value never mutates
+    /// after construction. Both bare and qualified struct keys are
+    /// inserted (mirroring `struct_fields`) so the same lookup logic
+    /// works across module-prefix variants.
+    #[serde(default)]
+    pub immutable_fields: HashMap<String, Vec<String>>,
 }
 
 pub fn build_semantic_program(parsed: &ParsedInterpreter) -> SemanticProgram {
@@ -110,6 +117,7 @@ fn collect_types_from_items(
     known_struct_names: &mut std::collections::HashSet<String>,
     struct_fields: &mut StructFieldRegistry,
     fn_return_types: &mut HashMap<String, String>,
+    immutable_fields: &mut HashMap<String, Vec<String>>,
 ) {
     // RPython: annotator/rtyper resolves all types in a whole-program pass.
     // Two-pass: first collect ALL struct names, then field types + return types.
@@ -122,7 +130,33 @@ fn collect_types_from_items(
         known_struct_names,
         struct_fields,
         fn_return_types,
+        immutable_fields,
     );
+}
+
+/// Read `#[jit_immutable_fields(a, b, c)]` attributes off a struct
+/// declaration and return the union of declared field names. Multiple
+/// attributes accumulate; non-ident tokens inside the parens are
+/// silently skipped (matching `syn::Meta::parse` looseness).
+fn collect_immutable_field_attrs(attrs: &[syn::Attribute]) -> Vec<String> {
+    let mut names = Vec::new();
+    for attr in attrs {
+        let Some(ident) = attr.path().get_ident() else {
+            continue;
+        };
+        if ident != "jit_immutable_fields" {
+            continue;
+        }
+        // Accept both `path::Type::ident` and bare `ident` style attribute
+        // paths (the front-end may see either depending on `use` glob).
+        let _ = attr.parse_nested_meta(|meta| {
+            if let Some(field_ident) = meta.path.get_ident() {
+                names.push(field_ident.to_string());
+            }
+            Ok(())
+        });
+    }
+    names
 }
 
 /// Pass 1a: collect all struct names (bare + qualified) recursively.
@@ -162,6 +196,7 @@ fn collect_fields_and_returns(
     known_struct_names: &std::collections::HashSet<String>,
     struct_fields: &mut StructFieldRegistry,
     fn_return_types: &mut HashMap<String, String>,
+    immutable_fields: &mut HashMap<String, Vec<String>>,
 ) {
     for item in items {
         match item {
@@ -180,6 +215,30 @@ fn collect_fields_and_returns(
                         Some((field_name, field_type))
                     })
                     .collect();
+                // RPython: `_immutable_fields_ = ['a', 'b']` on the class
+                // body. We accept `#[jit_immutable_fields(a, b)]` on the
+                // struct declaration (proc-macro pass-through in
+                // `majit_macros::jit_immutable_fields`). Multiple
+                // attributes accumulate.
+                let immutables = collect_immutable_field_attrs(&s.attrs);
+                if !immutables.is_empty() {
+                    if prefix.is_empty() {
+                        immutable_fields
+                            .entry(bare_name.clone())
+                            .or_default()
+                            .extend(immutables.iter().cloned());
+                    } else {
+                        let qualified = format!("{}::{}", prefix, bare_name);
+                        immutable_fields
+                            .entry(qualified)
+                            .or_default()
+                            .extend(immutables.iter().cloned());
+                        immutable_fields
+                            .entry(bare_name.clone())
+                            .or_default()
+                            .extend(immutables.iter().cloned());
+                    }
+                }
                 if prefix.is_empty() {
                     struct_fields.fields.insert(bare_name, fields);
                 } else {
@@ -240,6 +299,7 @@ fn collect_fields_and_returns(
                         known_struct_names,
                         struct_fields,
                         fn_return_types,
+                        immutable_fields,
                     );
                 }
             }
@@ -338,12 +398,14 @@ pub fn build_semantic_program_with_options(
     // We recursively traverse Item::Mod to register module-qualified paths
     // matching the exact callee identity that canonical_call_target produces.
     let mut fn_return_types: HashMap<String, String> = HashMap::new();
+    let mut immutable_fields: HashMap<String, Vec<String>> = HashMap::new();
     collect_types_from_items(
         &parsed.file.items,
         "",
         &mut known_struct_names,
         &mut struct_fields,
         &mut fn_return_types,
+        &mut immutable_fields,
     );
 
     // Pass 2: build function graphs with struct_fields + fn_return_types.
@@ -364,6 +426,7 @@ pub fn build_semantic_program_with_options(
         known_struct_names,
         struct_fields,
         fn_return_types,
+        immutable_fields,
     }
 }
 
@@ -379,6 +442,7 @@ pub fn build_semantic_program_from_parsed_files_with_options(
     let mut known_struct_names = std::collections::HashSet::new();
     let mut struct_fields = StructFieldRegistry::default();
     let mut fn_return_types: HashMap<String, String> = HashMap::new();
+    let mut immutable_fields: HashMap<String, Vec<String>> = HashMap::new();
     // RPython: whole-program — ALL types visible everywhere.
     // Collect struct names from ALL files first, then fields+returns.
     for parsed in parsed_files {
@@ -391,6 +455,7 @@ pub fn build_semantic_program_from_parsed_files_with_options(
             &known_struct_names,
             &mut struct_fields,
             &mut fn_return_types,
+            &mut immutable_fields,
         );
     }
     // Pass 2: build function graphs with merged struct_fields + fn_return_types visible.
@@ -412,6 +477,7 @@ pub fn build_semantic_program_from_parsed_files_with_options(
         known_struct_names,
         struct_fields,
         fn_return_types,
+        immutable_fields,
     }
 }
 
