@@ -453,12 +453,24 @@ static W_LIST_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
             ),
             (
+                // `W_ListObject.strategy` is MUTABLE: `switch_to_object_strategy`
+                // (listobject.rs:99-113) flips it from Integer/Float to Object
+                // when an incompatible item is stored.  A trace that folded
+                // strategy == Float at trace-time into a constant would then
+                // read from `float_items.ptr` (now empty after the switch)
+                // and dereference garbage — this is the spectral_norm n=10
+                // SIGSEGV root cause diagnosed in
+                // memory/spectral_norm_small_n_crash_2026_04_17.md.
+                //
+                // Upstream PyPy handles this with a quasi-immutable flag +
+                // invalidate_compiled_code hook on strategy change; pyre
+                // has no such hook yet, so strategy stays plain-mutable.
                 "W_ListObject.strategy",
                 std::mem::offset_of!(W_ListObject, strategy),
                 1,
                 Type::Int,
                 false,
-                true,
+                false,
                 false,
             ),
             (
