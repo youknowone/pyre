@@ -168,21 +168,6 @@ pub struct Optimizer {
     pub original_trace_op_types: std::collections::HashMap<u32, majit_ir::Type>,
 }
 
-fn value_from_backend_constant_bits(opref: OpRef, raw: i64, ops: &[Op]) -> majit_ir::Value {
-    // First check ops for result type (for inline constants),
-    // then fall back to Int.
-    let result_type = ops
-        .iter()
-        .find(|op| op.pos == opref)
-        .map(|op| op.result_type())
-        .unwrap_or(Type::Int);
-    match result_type {
-        Type::Ref => majit_ir::Value::Ref(majit_ir::GcRef(raw as usize)),
-        Type::Float => majit_ir::Value::Float(f64::from_bits(raw as u64)),
-        Type::Int | Type::Void => majit_ir::Value::Int(raw),
-    }
-}
-
 fn value_from_backend_constant_bits_typed(
     opref: OpRef,
     raw: i64,
