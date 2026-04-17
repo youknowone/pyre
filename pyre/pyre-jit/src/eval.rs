@@ -1344,6 +1344,15 @@ fn jit_merge_point_hook(
         // compile.py:269: cross-loop cut stores under inner key.
         // Use the actual compiled key for post-compilation steps.
         let compiled_key = driver.last_compiled_key().unwrap_or(green_key);
+        // Cross-loop cut: clear TRACING on the original key so it
+        // can be retraced instead of stuck in AlreadyTracing.
+        // Already inside `!driver.is_tracing()` guard above.
+        if compiled_key != green_key && driver.has_compiled_loop(compiled_key) {
+            driver
+                .meta_interp_mut()
+                .warm_state_mut()
+                .abort_tracing(green_key, false);
+        }
         register_quasi_immutable_deps(compiled_key);
         // RPython pyjitpl.py:3048-3061 raise_continue_running_normally:
         // after trace compilation, restart so maybe_compile_and_run
@@ -1816,6 +1825,21 @@ fn bound_reached(
             // pyjitpl.py:3048-3061 raise_continue_running_normally:
             // after compilation, restart so execute_assembler runs.
             if !driver.is_tracing() {
+                // compile.py:269 cross-loop cut: inner loop compiled under
+                // compiled_key ≠ green_key. Clear the TRACING flag on the
+                // ORIGINAL key so it can be retraced later instead of being
+                // stuck in AlreadyTracing forever. Gate on !is_tracing +
+                // actually-just-compiled to avoid clearing on stale
+                // last_compiled_key (fannkuch infinite loop otherwise).
+                if !had_compiled
+                    && driver.has_compiled_loop(compiled_key)
+                    && compiled_key != green_key
+                {
+                    driver
+                        .meta_interp_mut()
+                        .warm_state_mut()
+                        .abort_tracing(green_key, false);
+                }
                 return Some(LoopResult::ContinueRunningNormally);
             }
             outcome

@@ -1,5 +1,6 @@
 ---
 source: pyre/pyre-jit-trace/tests/trait_impls_snapshot.rs
+assertion_line: 48
 expression: assembled
 ---
 // `OpcodeHandler` trait impls for `MIFrame` — variant section, part 1.
@@ -469,6 +470,7 @@ impl pyre_interpreter::ControlFlowOpcodeHandler for crate::state::MIFrame {
         })
     }
 
+    #[inline(never)]
     fn close_loop_args(
         &mut self,
         target: usize,
@@ -500,7 +502,8 @@ impl pyre_interpreter::ControlFlowOpcodeHandler for crate::state::MIFrame {
                 let (driver, _) = crate::driver::driver_pair();
                 let has_partial = driver.meta_interp().has_partial_trace();
                 let bridge_origin = driver.bridge_origin();
-                if !has_partial && driver.meta_interp().has_compiled_targets(back_edge_key) {
+                let has_targets = driver.meta_interp().has_compiled_targets(back_edge_key);
+                if !has_partial && has_targets {
                     let outcome = driver.meta_interp_mut().compile_trace(
                         back_edge_key,
                         &live_args,
@@ -513,9 +516,12 @@ impl pyre_interpreter::ControlFlowOpcodeHandler for crate::state::MIFrame {
                                 back_edge_key, target, bridge_origin
                             );
                         }
-                        // pyjitpl.py:3191 raise_if_successful() — successful
-                        // compile_trace stops tracing immediately instead of
-                        // falling through to the loop-closing path.
+                        // pyjitpl.py:3095 raise_if_successful() — successful
+                        // compile_trace raises ContinueRunningNormally and
+                        // unwinds; no value propagates to the caller. Pyre
+                        // ports that as an early `return Ok(None)` so the
+                        // tracer stops at this point rather than falling
+                        // through to the loop-close path.
                         driver.note_compile_trace_success();
                         return Ok(None);
                     }
