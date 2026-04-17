@@ -3286,8 +3286,7 @@ impl OptUnroll {
                     // Register type for the new OpRef (RPython Box.type parity).
                     ctx.value_types.insert(value.0, result_type);
                     ctx.replace_op(source, value);
-                    // RPython: opinfo.setfield(descr, ...) uses descr as key.
-                    // majit keying: descr.index() (global unique index).
+                    // shortpreamble.py:75-78: fielddescr.get_index()
                     let descr_idx = descr.index();
                     let obj_resolved = ctx.get_box_replacement(obj);
                     // shortpreamble.py:66-68: HeapOp.produce_op
@@ -3330,14 +3329,14 @@ impl OptUnroll {
                     }
                     // shortpreamble.py:72-74:
                     //   opinfo = opt.optimizer.ensure_ptr_info_arg0(g)
-                    //   pop = PreambleOp(self.res, preamble_op, invented_name)
                     //   assert not opinfo.is_virtual()
-                    //   opinfo.setfield(descr, struct, pop, optheap, cf)
                     let mut struct_info = ctx.ensure_ptr_info_arg0(&getfield_op);
                     if let Some(info) = struct_info.as_mut() {
-                        if !info.is_virtual() {
-                            info.set_preamble_field(descr_idx, pop.clone());
-                        }
+                        debug_assert!(
+                            !info.is_virtual(),
+                            "shortpreamble.py:74: imported heap field on virtual"
+                        );
+                        info.set_preamble_field(descr_idx, pop.clone());
                     }
                     if crate::optimizeopt::majit_log_enabled() {
                         eprintln!(
