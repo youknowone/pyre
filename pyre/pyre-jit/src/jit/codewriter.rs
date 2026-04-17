@@ -344,9 +344,7 @@ impl CodeWriter {
             let mut scan_state = OpArgState::default();
             for scan_pc in 0..num_instrs {
                 let (scan_instr, scan_arg) = scan_state.get(code.instructions[scan_pc]);
-                if let Instruction::JumpBackward { delta } = scan_instr {
-                    let target = skip_caches(code, scan_pc + 1)
-                        .saturating_sub(delta.get(scan_arg).as_usize());
+                if let Some(target) = backward_jump_target(code, scan_pc, scan_instr, scan_arg) {
                     if target < num_instrs {
                         loop_header_pcs.insert(target);
                     }
@@ -734,11 +732,11 @@ impl CodeWriter {
                     }
                 }
 
-                Instruction::JumpBackward { delta } => {
-                    let target_py_pc =
-                        skip_caches(code, py_pc + 1).saturating_sub(delta.get(op_arg).as_usize());
-                    if target_py_pc < num_instrs {
-                        assembler.jump(labels[target_py_pc]);
+                instr @ Instruction::JumpBackward { .. } => {
+                    if let Some(target_py_pc) = backward_jump_target(code, py_pc, instr, op_arg) {
+                        if target_py_pc < num_instrs {
+                            assembler.jump(labels[target_py_pc]);
+                        }
                     }
                 }
 
@@ -873,14 +871,16 @@ impl CodeWriter {
                     emit_vsd!(assembler, current_depth);
                 }
 
-                // Match the interpreter's direct PC arithmetic for
-                // JumpBackwardNoInterrupt. Unlike JumpBackward, the
-                // bytecode target is encoded from the post-dispatch PC
-                // without an extra cache skip.
-                Instruction::JumpBackwardNoInterrupt { delta } => {
-                    let target_py_pc = (py_pc + 1).saturating_sub(delta.get(op_arg).as_usize());
-                    if target_py_pc < num_instrs {
-                        assembler.jump(labels[target_py_pc]);
+                // JumpBackwardNoInterrupt reuses `backward_jump_target`:
+                // the encoding differs from JumpBackward (no skip_caches
+                // on the next-PC base) but the helper routes each variant
+                // to its correct arithmetic so pre-scan and emit stay in
+                // lockstep.  interp_jit.py:103 + jtransform.py:1714.
+                instr @ Instruction::JumpBackwardNoInterrupt { .. } => {
+                    if let Some(target_py_pc) = backward_jump_target(code, py_pc, instr, op_arg) {
+                        if target_py_pc < num_instrs {
+                            assembler.jump(labels[target_py_pc]);
+                        }
                     }
                 }
 
@@ -1287,6 +1287,31 @@ fn jump_target_forward(
 ) -> usize {
     let target = skip_caches(code, next_instr) + delta;
     target.min(num_instrs)
+}
+
+/// Single-source-of-truth backward-jump target calculation used by both
+/// the loop-header pre-scan (pypy/module/pypyjit/interp_jit.py:103) and
+/// the emitter (jtransform.py:1714 `handle_jit_marker__loop_header`).
+///
+/// Returns the target PC for `JumpBackward` (with `skip_caches` on the
+/// next-PC base) and `JumpBackwardNoInterrupt` (direct `py_pc + 1 - delta`
+/// arithmetic to match the interpreter's dispatch in pyopcode.rs).
+/// Returns `None` for any non-backward-jump opcode.
+fn backward_jump_target(
+    code: &CodeObject,
+    py_pc: usize,
+    instr: Instruction,
+    op_arg: pyre_interpreter::OpArg,
+) -> Option<usize> {
+    match instr {
+        Instruction::JumpBackward { delta } => {
+            Some(skip_caches(code, py_pc + 1).saturating_sub(delta.get(op_arg).as_usize()))
+        }
+        Instruction::JumpBackwardNoInterrupt { delta } => {
+            Some((py_pc + 1).saturating_sub(delta.get(op_arg).as_usize()))
+        }
+        _ => None,
+    }
 }
 
 /// Match pyre-interpreter/pyopcode.rs:skip_caches.
