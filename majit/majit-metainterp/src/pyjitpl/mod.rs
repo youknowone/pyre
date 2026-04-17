@@ -7760,12 +7760,9 @@ impl<M: Clone> MetaInterp<M> {
     ) -> Option<(OpRef, i64)> {
         let ctx = self.tracing.as_mut()?;
         // pyjitpl.py:2659: self.heapcache.invalidate_caches_varargs(opnum, descr, argboxes)
-        // PRE-EXISTING-ADAPTATION: pyre's heap cache takes the descr
-        // as Option<()> until EffectInfo plumbing lands; the upstream
-        // descr is consulted via descr.get_extra_info() inside
-        // invalidate_caches_varargs once that path is wired.
+        let effectinfo = descr.as_call_descr().map(|cd| cd.get_extra_info());
         ctx.heap_cache_mut()
-            .invalidate_caches_varargs(opnum, None, argboxes);
+            .invalidate_caches_varargs(opnum, effectinfo, argboxes);
         // pyjitpl.py:2660: op = self.history.record(opnum, argboxes, resvalue, descr)
         let op = ctx.recorder.record_op_with_descr(opnum, argboxes, descr);
         // pyjitpl.py:2661: self.attach_debug_info(op)
@@ -9411,8 +9408,11 @@ impl<M: Clone> MetaInterp<M> {
             };
             // pyjitpl.py:2072: heapcache.invalidate_caches_varargs(opnum1, descr, allboxes)
             if let Some(ctx) = self.tracing.as_mut() {
-                ctx.heap_cache_mut()
-                    .invalidate_caches_varargs(opnum1, None, &opref_args);
+                ctx.heap_cache_mut().invalidate_caches_varargs(
+                    opnum1,
+                    Some(effectinfo),
+                    &opref_args,
+                );
             }
             // pyjitpl.py:2074-2077: handle resbox void / make_result_of_lastop
             // — make_result_of_lastop's target_index plumbing is not

@@ -34,7 +34,7 @@ fn vb_remove(v: &mut Vec<bool>, opref: &OpRef) -> bool {
     }
 }
 
-use majit_ir::{GcRef, OpCode, OpRef};
+use majit_ir::{EffectInfo, ExtraEffect, GcRef, OpCode, OpRef};
 
 // heapcache.py: HF_* flags stored per-box on RefFrontendOp.
 // In majit these are tracked via separate HashSets (is_unescaped,
@@ -992,19 +992,23 @@ impl HeapCache {
         }
     }
 
-    /// heapcache.py: invalidate_caches_varargs(descrs, args)
-    /// Selectively invalidate caches based on effect info.
+    /// heapcache.py:211-216 invalidate_caches_varargs.
+    ///
+    /// `effectinfo` mirrors upstream `descr.get_extra_info()` consulted
+    /// inside `clear_caches_varargs`; pyre threads the
+    /// already-extracted EffectInfo through to avoid an extra
+    /// `&dyn CallDescr` pass.
     pub fn invalidate_caches_varargs(
         &mut self,
         opnum: OpCode,
-        descr: Option<()>,
+        effectinfo: Option<&EffectInfo>,
         argboxes: &[OpRef],
     ) {
         self.mark_escaped_varargs(opnum, None, argboxes);
-        if Self::_clear_caches_not_necessary(opnum, descr) {
+        if Self::_clear_caches_not_necessary(opnum) {
             return;
         }
-        self.clear_caches_varargs(opnum, descr, argboxes);
+        self.clear_caches_varargs(opnum, effectinfo, argboxes);
     }
 
     /// heapcache.py:312-336
@@ -1040,8 +1044,7 @@ impl HeapCache {
     /// CALL_* opcodes are deliberately NOT in this set — RPython invalidates
     /// caches whenever a residual call runs, since the callee could mutate
     /// fields the optimizer thinks are still cached.
-    fn _clear_caches_not_necessary(opnum: OpCode, _descr: Option<()>) -> bool {
-        let _ = _descr;
+    fn _clear_caches_not_necessary(opnum: OpCode) -> bool {
         matches!(
             opnum,
             OpCode::SetfieldGc
@@ -1065,27 +1068,58 @@ impl HeapCache {
     }
 
     /// RPython-compatible alias.
-    pub fn clear_caches_not_necessary(&self, opnum: OpCode, _descr: Option<()>) -> bool {
-        let _ = _descr;
-        Self::_clear_caches_not_necessary(opnum, None)
+    pub fn clear_caches_not_necessary(&self, opnum: OpCode) -> bool {
+        Self::_clear_caches_not_necessary(opnum)
     }
 
     /// RPython-compatible alias.
-    pub fn clear_caches(&mut self, opnum: OpCode, _descr: Option<()>, argboxes: &[OpRef]) {
-        self.clear_caches_varargs(opnum, _descr, argboxes)
+    pub fn clear_caches(
+        &mut self,
+        opnum: OpCode,
+        effectinfo: Option<&EffectInfo>,
+        argboxes: &[OpRef],
+    ) {
+        self.clear_caches_varargs(opnum, effectinfo, argboxes)
     }
 
-    /// RPython-compatible alias.
-    pub fn clear_caches_varargs(&mut self, opnum: OpCode, _descr: Option<()>, _argboxes: &[OpRef]) {
+    /// heapcache.py:341-376 clear_caches_varargs.
+    pub fn clear_caches_varargs(
+        &mut self,
+        opnum: OpCode,
+        effectinfo: Option<&EffectInfo>,
+        argboxes: &[OpRef],
+    ) {
         self.need_guard_not_invalidated = true;
-        if Self::_clear_caches_not_necessary(opnum, _descr) {
-            return;
-        }
         if opnum.is_call()
             || opnum.is_call_loopinvariant()
             || opnum.is_cond_call_value()
             || opnum == OpCode::CondCallN
         {
+            if let Some(ei) = effectinfo {
+                // heapcache.py:347-353 — elidable / loopinvariant calls
+                // are pure (or already cached) and never invalidate the
+                // heap.
+                if matches!(
+                    ei.extraeffect,
+                    ExtraEffect::LoopInvariant
+                        | ExtraEffect::ElidableCannotRaise
+                        | ExtraEffect::ElidableOrMemoryError
+                        | ExtraEffect::ElidableCanRaise,
+                ) {
+                    return;
+                }
+                // heapcache.py:355-361 — well-defined oopspec dispatch.
+                let single_descr_idx = ei.single_write_descr_array.as_ref().map(|d| d.index());
+                if ei.oopspecindex == majit_ir::OopSpecIndex::Arraycopy {
+                    self._clear_caches_arraycopy(opnum, None, argboxes, single_descr_idx);
+                    return;
+                }
+                if ei.oopspecindex == majit_ir::OopSpecIndex::Arraymove {
+                    self._clear_caches_arraymove(opnum, None, argboxes, single_descr_idx);
+                    return;
+                }
+            }
+            // heapcache.py:362-369 — only invalidate things that escaped.
             let unescaped = self.is_unescaped.clone();
             for cache in self.heap_cache.values_mut() {
                 cache.invalidate_unescaped(&unescaped);
@@ -1097,16 +1131,23 @@ impl HeapCache {
             }
             return;
         }
+        // heapcache.py:372-376 — fallback: reset state for non-CALL ops
+        // (release-GIL etc.) that we can't selectively invalidate.
         self.reset_keep_likely_virtuals();
     }
 
     /// Parity alias for RPython cache invalidation entrypoint.
-    pub fn invalidate_caches(&mut self, opnum: OpCode, _descr: Option<()>, argboxes: &[OpRef]) {
+    pub fn invalidate_caches(
+        &mut self,
+        opnum: OpCode,
+        effectinfo: Option<&EffectInfo>,
+        argboxes: &[OpRef],
+    ) {
         self.mark_escaped(opnum, None, argboxes);
-        if Self::_clear_caches_not_necessary(opnum, _descr) {
+        if Self::_clear_caches_not_necessary(opnum) {
             return;
         }
-        self.invalidate_caches_varargs(opnum, _descr, argboxes);
+        self.invalidate_caches_varargs(opnum, effectinfo, argboxes);
     }
 
     /// heapcache.py:378-381 _clear_caches_arraycopy
@@ -1120,7 +1161,7 @@ impl HeapCache {
     pub fn _clear_caches_arraycopy(
         &mut self,
         _opnum: OpCode,
-        _descr: Option<()>,
+        _descr: Option<&EffectInfo>,
         argboxes: &[OpRef],
         single_write_descr_array: Option<u32>,
     ) {
@@ -1151,7 +1192,7 @@ impl HeapCache {
     pub fn _clear_caches_arraymove(
         &mut self,
         _opnum: OpCode,
-        _descr: Option<()>,
+        _descr: Option<&EffectInfo>,
         argboxes: &[OpRef],
         single_write_descr_array: Option<u32>,
     ) {
@@ -1309,10 +1350,10 @@ impl HeapCache {
     pub fn invalidate_caches_varargs_alias(
         &mut self,
         opnum: OpCode,
-        descr: Option<()>,
+        effectinfo: Option<&EffectInfo>,
         argboxes: &[OpRef],
     ) {
-        self.invalidate_caches_varargs(opnum, descr, argboxes)
+        self.invalidate_caches_varargs(opnum, effectinfo, argboxes)
     }
 
     /// RPython: get_field_updater(box, descr)
