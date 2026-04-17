@@ -1749,7 +1749,7 @@ impl OptContext {
         &mut self,
         op: OpRef,
         preamble_info: &PtrInfo,
-        exported_infos: Option<&HashMap<OpRef, crate::optimizeopt::unroll::ExportedValueInfo>>,
+        exported_infos: Option<&HashMap<OpRef, crate::optimizeopt::info::OpInfo>>,
     ) {
         let op = self.get_box_replacement(op);
         // unroll.py:55: if op.get_forwarded() is not None: return
@@ -1844,38 +1844,114 @@ impl OptContext {
         }
     }
 
-    /// unroll.py:41-51: setinfo_from_preamble_list(lst, infos)
-    /// Recursively propagate PtrInfo for virtual field items using
-    /// exported_infos as source of truth (not current OptContext).
+    /// unroll.py:41-51 setinfo_from_preamble_list(lst, infos):
+    ///
+    /// ```python
+    /// def setinfo_from_preamble_list(self, lst, infos):
+    ///     for item in lst:
+    ///         if item is None:
+    ///             continue
+    ///         i = infos.get(item, None)
+    ///         if i is not None:
+    ///             self.setinfo_from_preamble(item, i, infos)
+    ///         else:
+    ///             item.set_forwarded(None)
+    ///             # let's not inherit stuff we don't
+    ///             # know anything about
+    /// ```
+    ///
+    /// Every `infos.get(item) is not None` branch funnels through
+    /// `setinfo_from_preamble`, which starts with the early-return checks
+    /// at unroll.py:54-58 (`get_box_replacement` + `get_forwarded` +
+    /// `is_constant`). A shortcut that applies IntBound / FloatConst /
+    /// Constant without those checks overwrites already-forwarded boxes.
+    /// `setinfo_from_preamble_item` below is the shared dispatcher: it
+    /// does the checks once and then routes to the variant-specific
+    /// logic, so this method becomes the literal unroll.py loop body.
     fn setinfo_from_preamble_list(
         &mut self,
         items: &[OpRef],
-        exported_infos: &HashMap<OpRef, crate::optimizeopt::unroll::ExportedValueInfo>,
+        exported_infos: &HashMap<OpRef, crate::optimizeopt::info::OpInfo>,
     ) {
         for &item in items {
             if item.is_none() {
                 continue;
             }
             // unroll.py:45-46: i = infos.get(item, None)
-            if let Some(info) = exported_infos.get(&item) {
-                // unroll.py:47: self.setinfo_from_preamble(item, i, infos)
-                if let Some(ref ptr_info) = info.ptr_info {
-                    self.setinfo_from_preamble(item, ptr_info, Some(exported_infos));
+            match exported_infos.get(&item).cloned() {
+                Some(info) => {
+                    // unroll.py:47: self.setinfo_from_preamble(item, i, infos)
+                    self.setinfo_from_preamble_item(item, &info, exported_infos);
                 }
-                // unroll.py:93-96: IntBound import with widen()
-                if let Some(ref bound) = info.int_bound {
-                    let widened = bound.widen();
-                    if widened.lower != i64::MIN || widened.upper != i64::MAX {
-                        self.with_intbound_mut(item, |bm| {
-                            let _ = bm.intersect(&widened);
-                        });
-                    }
+                None => {
+                    // unroll.py:49: item.set_forwarded(None)
+                    // "let's not inherit stuff we don't know anything about"
+                    self.clear_forwarded(item);
                 }
-            } else {
-                // unroll.py:49: item.set_forwarded(None)
-                // "let's not inherit stuff we don't know anything about"
-                self.clear_forwarded(item);
             }
+        }
+    }
+
+    /// unroll.py:53-98 `setinfo_from_preamble(op, preamble_info, exported_infos)`.
+    ///
+    /// Shared dispatcher covering the `isinstance(preamble_info, ...)` chain
+    /// at unroll.py:59, 93, 97 — used by both `setinfo_from_preamble_list`
+    /// (mod.rs recursive virtual field walker) and `OptUnroll::import_state`
+    /// (unroll.rs top-level import). Centralising the dispatch avoids
+    /// diverging shortcuts that skip the early-return checks.
+    fn setinfo_from_preamble_item(
+        &mut self,
+        op: OpRef,
+        preamble_info: &crate::optimizeopt::info::OpInfo,
+        exported_infos: &HashMap<OpRef, crate::optimizeopt::info::OpInfo>,
+    ) {
+        use crate::optimizeopt::info::OpInfo;
+        // unroll.py:53-54 `op = get_box_replacement(op)`
+        let target = self.get_box_replacement(op);
+        // unroll.py:55-56 `if op.get_forwarded() is not None: return`
+        if self.has_forwarding(target) {
+            return;
+        }
+        // unroll.py:57-58 `if op.is_constant(): return`
+        if self.is_constant(target) {
+            return;
+        }
+        match preamble_info {
+            // unroll.py:65-68 ConstPtrInfo: set_forwarded(preamble_info.getconst())
+            OpInfo::Ptr(crate::optimizeopt::info::PtrInfo::Constant(gcref)) => {
+                self.make_constant(target, Value::Ref(*gcref));
+            }
+            // unroll.py:59-92 general PtrInfo dispatch.
+            OpInfo::Ptr(ptr_info) => {
+                self.setinfo_from_preamble(target, ptr_info, Some(exported_infos));
+            }
+            // unroll.py:93-96 IntBound with widen().
+            OpInfo::IntBound(bound) => {
+                let widened = bound.widen();
+                if widened.lower != i64::MIN || widened.upper != i64::MAX {
+                    self.with_intbound_mut(target, |bm| {
+                        let _ = bm.intersect(&widened);
+                    });
+                }
+            }
+            // unroll.py:97-98 FloatConstInfo: op.set_forwarded(preamble_info._const)
+            OpInfo::FloatConst(f) => {
+                self.make_constant(target, Value::Float(*f));
+            }
+            // Direct `OpInfo::Constant(Value)` — covers Int/other constant
+            // forwarding exported for constant OpRefs without a dedicated
+            // IntBound/FloatConst entry.
+            OpInfo::Constant(value) => {
+                self.make_constant(target, value.clone());
+            }
+            // unroll.py:53-98 has no dispatch arm for "no info" — the
+            // caller never stores an `Unknown` entry in `exported_infos`
+            // (see `collect_exported_info`'s `None` return at
+            // unroll.rs:2889 mirroring unroll.py:440 `if info:`).
+            OpInfo::Unknown => unreachable!(
+                "exported_infos must never contain OpInfo::Unknown; \
+                 the absent-entry branch (clear_forwarded) handles that case"
+            ),
         }
     }
 

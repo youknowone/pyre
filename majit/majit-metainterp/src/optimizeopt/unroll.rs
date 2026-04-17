@@ -1294,9 +1294,14 @@ pub struct ExportedState {
     pub end_arg_types: Vec<Type>,
     /// Virtual state at the loop boundary.
     pub virtual_state: crate::optimizeopt::virtualstate::VirtualState,
-    /// unroll.py: exported_infos — optimizer knowledge from preamble.
+    /// unroll.py:548 ExportedState.exported_infos — optimizer knowledge from preamble.
     /// Maps OpRef → info for all args including virtual field contents.
-    pub exported_infos: HashMap<OpRef, ExportedValueInfo>,
+    ///
+    /// RPython stores one of `PtrInfo` / `IntBound` / `FloatConstInfo` per box,
+    /// dispatched via `isinstance` in `setinfo_from_preamble` (unroll.py:53-98).
+    /// Majit uses the existing `OpInfo` enum (info.rs:137) as the discriminated
+    /// union of these three cases.
+    pub exported_infos: HashMap<OpRef, crate::optimizeopt::info::OpInfo>,
     /// RPython unroll.py: short_boxes exported from the preamble.
     /// Kept in a compact form that phase 2 can translate back into imported
     /// heap cache facts.
@@ -1325,23 +1330,12 @@ pub struct ExportedState {
     shadow_stack_base: usize,
 }
 
-/// majit's serialized form of RPython's per-Box `_forwarded` /
-/// `PtrInfo`. RPython's `_expand_info` (unroll.py:432-450) builds a
-/// `dict[Box -> info.PtrInfo]` directly because Python keeps the
-/// PtrInfo alive across phases via Box identity. majit must serialize
-/// because Phase 1's `OptContext` is dropped before Phase 2 starts.
-///
-/// Holds:
-/// - `constant` — the side `Value` RPython carries on the box itself
-/// - `ptr_info` — a clone of the live `PtrInfo` from Phase 1
-/// - `int_bound` — full IntBound captured at export time, imported with
-///   widen() in setinfo_from_preamble (unroll.py:93-96)
-#[derive(Clone, Debug, Default)]
-pub struct ExportedValueInfo {
-    pub constant: Option<Value>,
-    pub ptr_info: Option<crate::optimizeopt::info::PtrInfo>,
-    pub int_bound: Option<crate::optimizeopt::intutils::IntBound>,
-}
+// unroll.py:529 `exported_infos - a mapping from ops to infos, including inputargs`
+// The per-entry info type is now `OpInfo` (info.rs:137), the discriminated
+// union matching RPython's `PtrInfo | IntBound | FloatConstInfo` dispatched
+// via `isinstance` in `setinfo_from_preamble` (unroll.py:53-98). The earlier
+// majit-only bundle `ExportedValueInfo { constant, ptr_info, int_bound }`
+// is removed as part of the Box identity plan Phase D.
 
 /// Identifies which GcRef-bearing field inside an ExportedState
 /// is rooted at a particular shadow stack slot.
@@ -1425,7 +1419,7 @@ impl ExportedState {
         end_args: Vec<OpRef>,
         next_iteration_args: Vec<OpRef>,
         virtual_state: crate::optimizeopt::virtualstate::VirtualState,
-        exported_infos: HashMap<OpRef, ExportedValueInfo>,
+        exported_infos: HashMap<OpRef, crate::optimizeopt::info::OpInfo>,
         exported_short_ops: Vec<ExportedShortOp>,
         exported_short_boxes: Vec<crate::optimizeopt::shortpreamble::PreambleOp>,
         renamed_inputargs: Vec<OpRef>,
@@ -1464,45 +1458,42 @@ impl ExportedState {
     /// new(). This enables LIFO-correct rooting: root the longer-lived
     /// copy first (lower shadow stack depth), then the shorter-lived copy.
     pub fn root_all_gcrefs(&mut self) {
-        use crate::optimizeopt::info::PtrInfo;
+        use crate::optimizeopt::info::{OpInfo, PtrInfo};
         use crate::optimizeopt::virtualstate::VirtualStateInfo;
         self.shadow_stack_base = majit_gc::shadow_stack::depth();
         // ── exported_infos GcRef fields ──
         let mut keys: Vec<OpRef> = self.exported_infos.keys().copied().collect();
         keys.sort_by_key(|k| k.0);
         for key in keys {
-            let info = &self.exported_infos[&key];
-            if let Some(Value::Ref(gcref)) = info.constant {
-                if !gcref.is_null() {
-                    let ss_idx = majit_gc::shadow_stack::push(gcref);
+            match &self.exported_infos[&key] {
+                // RPython ConstPtrInfo: GcRef constant stored directly in
+                // PtrInfo. Root the GcRef so GC keeps it alive.
+                OpInfo::Ptr(PtrInfo::Constant(gcref)) if !gcref.is_null() => {
+                    let ss_idx = majit_gc::shadow_stack::push(*gcref);
+                    self.rooted_refs
+                        .push((key, ExportedGcRefField::InfoPtrInfoConstant, ss_idx));
+                }
+                // InstancePtrInfo.known_class: GcRef for the class pointer.
+                OpInfo::Ptr(PtrInfo::Instance(iinfo)) => {
+                    if let Some(gcref) = iinfo.known_class {
+                        if !gcref.is_null() {
+                            let ss_idx = majit_gc::shadow_stack::push(gcref);
+                            self.rooted_refs.push((
+                                key,
+                                ExportedGcRefField::InfoPtrInfoKnownClass,
+                                ss_idx,
+                            ));
+                        }
+                    }
+                }
+                // Direct `OpInfo::Constant(Value::Ref(...))` — rare Int-typed
+                // constant forward that carries a Ref payload.
+                OpInfo::Constant(Value::Ref(gcref)) if !gcref.is_null() => {
+                    let ss_idx = majit_gc::shadow_stack::push(*gcref);
                     self.rooted_refs
                         .push((key, ExportedGcRefField::InfoConstantRef, ss_idx));
                 }
-            }
-            if let Some(ref pi) = info.ptr_info {
-                match pi {
-                    PtrInfo::Constant(gcref) if !gcref.is_null() => {
-                        let ss_idx = majit_gc::shadow_stack::push(*gcref);
-                        self.rooted_refs.push((
-                            key,
-                            ExportedGcRefField::InfoPtrInfoConstant,
-                            ss_idx,
-                        ));
-                    }
-                    PtrInfo::Instance(iinfo) => {
-                        if let Some(gcref) = iinfo.known_class {
-                            if !gcref.is_null() {
-                                let ss_idx = majit_gc::shadow_stack::push(gcref);
-                                self.rooted_refs.push((
-                                    key,
-                                    ExportedGcRefField::InfoPtrInfoKnownClass,
-                                    ss_idx,
-                                ));
-                            }
-                        }
-                    }
-                    _ => {}
-                }
+                _ => {}
             }
         }
         // ── virtual_state GcRef fields ──
@@ -1578,17 +1569,19 @@ impl ExportedState {
             match field {
                 ExportedGcRefField::InfoConstantRef => {
                     if let Some(info) = self.exported_infos.get_mut(&key) {
-                        info.constant = Some(Value::Ref(updated));
+                        *info = crate::optimizeopt::info::OpInfo::Constant(Value::Ref(updated));
                     }
                 }
                 ExportedGcRefField::InfoPtrInfoConstant => {
                     if let Some(info) = self.exported_infos.get_mut(&key) {
-                        info.ptr_info = Some(PtrInfo::Constant(updated));
+                        *info = crate::optimizeopt::info::OpInfo::Ptr(PtrInfo::Constant(updated));
                     }
                 }
                 ExportedGcRefField::InfoPtrInfoKnownClass => {
                     if let Some(info) = self.exported_infos.get_mut(&key) {
-                        if let Some(PtrInfo::Instance(iinfo)) = &mut info.ptr_info {
+                        if let crate::optimizeopt::info::OpInfo::Ptr(PtrInfo::Instance(iinfo)) =
+                            info
+                        {
                             iinfo.known_class = Some(updated);
                         }
                     }
@@ -2014,7 +2007,7 @@ impl OptUnroll {
         let virtual_state =
             crate::optimizeopt::virtualstate::export_state(&end_args, ctx, &ctx.forwarded);
         // unroll.py:459-461: infos = {}; for arg in end_args: _expand_info(arg, infos)
-        let mut infos: HashMap<OpRef, ExportedValueInfo> = HashMap::new();
+        let mut infos: HashMap<OpRef, crate::optimizeopt::info::OpInfo> = HashMap::new();
         for &arg in &end_args {
             self.expand_info(arg, ctx, exported_int_bounds, &mut infos);
         }
@@ -2056,7 +2049,7 @@ impl OptUnroll {
         arg: OpRef,
         ctx: &OptContext,
         exported_int_bounds: Option<&HashMap<OpRef, crate::optimizeopt::intutils::IntBound>>,
-        infos: &mut HashMap<OpRef, ExportedValueInfo>,
+        infos: &mut HashMap<OpRef, crate::optimizeopt::info::OpInfo>,
     ) {
         let resolved = ctx.get_box_replacement(arg);
         if infos.contains_key(&resolved) {
@@ -2069,7 +2062,21 @@ impl OptUnroll {
             }
             return;
         }
-        let info = self.collect_exported_info(resolved, ctx, exported_int_bounds);
+        // unroll.py:438-443 `_expand_info`:
+        //     if arg in infos:
+        //         return
+        //     if info:
+        //         infos[arg] = info
+        //         if info.is_virtual():
+        //             self._expand_infos_from_virtual(info, infos)
+        //
+        // RPython stores the entry only when `info` is truthy — a falsy
+        // `info` (None) simply skips the insert, so downstream
+        // `setinfo_from_preamble_list` at unroll.py:45-51 sees "no entry"
+        // and drops any inherited forwarded via `item.set_forwarded(None)`.
+        let Some(info) = self.collect_exported_info(resolved, ctx, exported_int_bounds) else {
+            return;
+        };
         let has_fields = matches!(ctx.get_ptr_info(resolved), Some(pi) if pi.is_virtual() || !pi.all_items().is_empty());
         infos.insert(resolved, info.clone());
         // Also store under the original (unresolved) key.
@@ -2087,7 +2094,7 @@ impl OptUnroll {
         opref: OpRef,
         ctx: &OptContext,
         exported_int_bounds: Option<&HashMap<OpRef, crate::optimizeopt::intutils::IntBound>>,
-        infos: &mut HashMap<OpRef, ExportedValueInfo>,
+        infos: &mut HashMap<OpRef, crate::optimizeopt::info::OpInfo>,
     ) {
         let fields: Vec<OpRef> = match ctx.get_ptr_info(opref) {
             Some(crate::optimizeopt::info::PtrInfo::Virtual(v)) => {
@@ -2817,12 +2824,31 @@ impl OptUnroll {
         label_args
     }
 
+    /// unroll.py:432-443 `_expand_info` + `unroll.py:548`
+    /// `ExportedState.exported_infos` entry producer. Returns the single
+    /// `OpInfo` variant RPython's dict would hold for this box, or `None`
+    /// for the RPython `if info:` falsy fall-through at unroll.py:440 — the
+    /// caller must treat `None` as "no entry in the dict" so downstream
+    /// `setinfo_from_preamble_list` takes the `item.set_forwarded(None)`
+    /// branch at unroll.py:49.
+    ///
+    ///   - Ref-typed live box with PtrInfo → `Some(OpInfo::Ptr(...))`.
+    ///   - Constant OpRef (value-carrying) → `Some(OpInfo::Ptr(PtrInfo::Constant))`
+    ///     for Refs, `Some(OpInfo::FloatConst(f))` for floats,
+    ///     `Some(OpInfo::IntBound(IntBound::from_constant(v)))` for ints
+    ///     (mirroring RPython's `ConstPtrInfo` / `FloatConstInfo` /
+    ///     `IntBound` dispatch).
+    ///   - Int-typed box with a preamble-exported `IntBound` →
+    ///     `Some(OpInfo::IntBound(...))`.
+    ///   - No info → `None`. `OpInfo::Unknown` must not appear in
+    ///     `ExportedState.exported_infos`.
     fn collect_exported_info(
         &self,
         opref: OpRef,
         ctx: &OptContext,
         exported_int_bounds: Option<&HashMap<OpRef, crate::optimizeopt::intutils::IntBound>>,
-    ) -> ExportedValueInfo {
+    ) -> Option<crate::optimizeopt::info::OpInfo> {
+        use crate::optimizeopt::info::{OpInfo, PtrInfo};
         let resolved = ctx.get_box_replacement(opref);
         // RPython export_state/_expand_info records properties on the Box
         // objects that survive to the next iteration. In majit, a loop box may
@@ -2831,93 +2857,63 @@ impl OptUnroll {
         // true Const objects here; forwarded-to-Const metadata would otherwise
         // over-specialize the imported targetarg and leak one iteration's
         // guard knowledge into the next.
-        let constant = if opref.is_constant() {
-            ctx.get_constant(resolved).cloned()
-        } else {
-            None
-        };
-        let ptr_info = match ctx.get_ptr_info(resolved).cloned() {
-            Some(crate::optimizeopt::info::PtrInfo::Constant(_)) if !opref.is_constant() => None,
-            other => other,
-        };
+        if opref.is_constant() {
+            if let Some(value) = ctx.get_constant(resolved) {
+                return match value {
+                    // ConstPtrInfo parity: RPython stores Ref constants as
+                    // ConstPtrInfo (a `PtrInfo` subclass). `setinfo_from_preamble`
+                    // at unroll.py:65-68 dispatches through `is_constant()`.
+                    Value::Ref(gcref) => Some(OpInfo::Ptr(PtrInfo::Constant(*gcref))),
+                    // FloatConstInfo parity: unroll.py:97-98 handles
+                    // `isinstance(preamble_info, info.FloatConstInfo)` with
+                    // `op.set_forwarded(preamble_info._const)`.
+                    Value::Float(f) => Some(OpInfo::FloatConst(*f)),
+                    // Int constants: RPython uses IntBound with lower==upper.
+                    Value::Int(v) => Some(OpInfo::IntBound(
+                        crate::optimizeopt::intutils::IntBound::from_constant(*v),
+                    )),
+                    Value::Void => None,
+                };
+            }
+        }
         // unroll.py:432-443 _expand_info uses self.optimizer.getinfo(arg) which
         // dispatches by op.type ('r' → getptrinfo, 'i' → getintbound). The Rust
-        // port stores int bounds in a separate `int_bound` field populated
-        // earlier by `OptIntBounds::export_arg_int_bounds`, which already
-        // filters by `opref_type(resolved) == Some(Int)`. We rely on that
-        // filter so the lookup here cannot pull a bound for a ref/float box.
-        let int_bound = exported_int_bounds.and_then(|bounds| bounds.get(&resolved).cloned());
-        ExportedValueInfo {
-            constant,
-            ptr_info,
-            int_bound,
+        // port stores int bounds in a separate table populated earlier by
+        // `OptIntBounds::export_arg_int_bounds`, which already filters by
+        // `opref_type(resolved) == Some(Int)`. We rely on that filter so the
+        // lookup here cannot pull a bound for a ref/float box.
+        if let Some(ptr_info) = ctx.get_ptr_info(resolved).cloned() {
+            // Drop `PtrInfo::Constant` synthesized for non-constant OpRefs —
+            // the per-iteration constant-forwarding shouldn't leak into the
+            // next iteration's imported state (see `get_box_replacement` note).
+            let is_const_shadow = matches!(ptr_info, PtrInfo::Constant(_)) && !opref.is_constant();
+            if !is_const_shadow {
+                return Some(OpInfo::Ptr(ptr_info));
+            }
         }
+        if let Some(bound) = exported_int_bounds.and_then(|bounds| bounds.get(&resolved).cloned()) {
+            return Some(OpInfo::IntBound(bound));
+        }
+        None
     }
 
-    /// unroll.py:53-98 setinfo_from_preamble(op, preamble_info, exported_infos)
+    /// unroll.py:53-98 `setinfo_from_preamble(op, preamble_info, exported_infos)`.
     ///
-    /// majit thin wrapper that resolves the box, unpacks the `PtrInfo`
-    /// out of `ExportedValueInfo`, and delegates to the canonical
-    /// `OptContext::setinfo_from_preamble` (mod.rs), which is the
-    /// line-by-line port of unroll.py:59-92.
-    ///
-    /// `ExportedValueInfo` is majit's serialized container around the
-    /// PtrInfo plus a few side fields (constant, int_bound) that
-    /// RPython carries on the box itself. This wrapper is the only
-    /// place that needs to know the serialization details.
+    /// Thin forwarding wrapper onto `OptContext::setinfo_from_preamble_item`
+    /// (mod.rs), which is the shared RPython-literal dispatcher used both by
+    /// this top-level import and by the recursive virtual-field walker at
+    /// `setinfo_from_preamble_list`. Keeping a single implementation prevents
+    /// the two call sites from drifting: any shortcut in one must also apply
+    /// to the other or the early-return semantics at unroll.py:54-58 are
+    /// bypassed for part of the import path.
     fn setinfo_from_preamble(
         &self,
         opref: OpRef,
-        info: &ExportedValueInfo,
-        exported_infos: &HashMap<OpRef, ExportedValueInfo>,
+        info: &crate::optimizeopt::info::OpInfo,
+        exported_infos: &HashMap<OpRef, crate::optimizeopt::info::OpInfo>,
         ctx: &mut OptContext,
     ) {
-        use crate::optimizeopt::info::PtrInfo;
-
-        // unroll.py:53-54: op = get_box_replacement(op)
-        let target = ctx.get_box_replacement(opref);
-        // unroll.py:55-56: if op.get_forwarded() is not None: return
-        if ctx.has_forwarding(target) {
-            return;
-        }
-        // unroll.py:57-58: if op.is_constant(): return  # nothing we can learn
-        if ctx.is_constant(target) {
-            return;
-        }
-        // unroll.py:59-92: isinstance(preamble_info, info.PtrInfo)
-        if let Some(ptr_info) = info.ptr_info.clone() {
-            if ptr_info.is_constant() {
-                if let Some(value) = &info.constant {
-                    ctx.make_constant(target, value.clone());
-                    if let Value::Ref(ptr) = value {
-                        ctx.set_ptr_info(target, crate::optimizeopt::info::PtrInfo::Constant(*ptr));
-                    }
-                }
-                return;
-            }
-            // Delegate the non-constant PtrInfo cases to the canonical
-            // line-by-line port in OptContext.
-            ctx.setinfo_from_preamble(target, &ptr_info, Some(exported_infos));
-        }
-        // unroll.py:93-96: IntBound import with widen().
-        //
-        //     elif isinstance(preamble_info, intutils.IntBound):
-        //         loop_info = preamble_info.widen()
-        //         intbound = self.getintbound(op)
-        //         intbound.intersect(loop_info)
-        //
-        // widen() relaxes exact bounds to avoid over-specialization:
-        //   lower < MININT/2 → MININT
-        //   upper > MAXINT/2 → MAXINT
-        //   tvalue/tmask → UNKNOWN
-        // This ensures Phase 2 gets safe bounds (e.g., [0, MAXINT] for
-        // a loop counter) without the exact preamble values.
-        // RPython parity: imported preamble bounds become the box's
-        // forwarded IntBound directly (optimizer.py:115-125 setintbound).
-        if let Some(bound) = &info.int_bound {
-            let widened = bound.widen();
-            ctx.setintbound(target, &widened);
-        }
+        ctx.setinfo_from_preamble_item(opref, info, exported_infos);
     }
 
     fn collect_exported_short_ops(
@@ -3290,14 +3286,14 @@ impl OptUnroll {
                     // shortpreamble.py:66-68: HeapOp.produce_op
                     // if g.getarg(0) in exported_infos:
                     //     setinfo_from_preamble(g.getarg(0), exported_infos[...])
-                    if let Some(einfo) = exported_state.exported_infos.get(&obj) {
-                        if let Some(ref pinfo) = einfo.ptr_info {
-                            ctx.setinfo_from_preamble(
-                                obj_resolved,
-                                pinfo,
-                                Some(&exported_state.exported_infos),
-                            );
-                        }
+                    if let Some(crate::optimizeopt::info::OpInfo::Ptr(pinfo)) =
+                        exported_state.exported_infos.get(&obj)
+                    {
+                        ctx.setinfo_from_preamble(
+                            obj_resolved,
+                            pinfo,
+                            Some(&exported_state.exported_infos),
+                        );
                     }
                     let mut getfield_op =
                         majit_ir::Op::new(OpCode::getfield_for_type(result_type), &[obj_resolved]);
@@ -5213,10 +5209,10 @@ mod tests {
         );
 
         assert_eq!(
-            exported.exported_infos[&OpRef(21)]
-                .int_bound
-                .as_ref()
-                .map(|b| (b.lower, b.upper)),
+            match &exported.exported_infos[&OpRef(21)] {
+                crate::optimizeopt::info::OpInfo::IntBound(b) => Some((b.lower, b.upper)),
+                _ => None,
+            },
             Some((10, 20))
         );
 
