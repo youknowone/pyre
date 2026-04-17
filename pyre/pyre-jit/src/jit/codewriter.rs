@@ -249,22 +249,47 @@ fn fill_assembler_liveness(
     }
 }
 
-/// RPython: `liveness.py` `compute_liveness(ssarepr)` — backward
-/// dataflow over the (here, linear) bytecode that produces the
+/// RPython: `liveness.py:19-80` `compute_liveness(ssarepr)` —
+/// backward dataflow over the populated `SSARepr` that produces the
 /// per-PC `LivenessInfo` triple consumed by both
 /// `get_list_of_active_boxes` (pyjitpl.py:177) and
 /// `consume_one_section` (resume.py:1381).
 ///
-/// pyre runs the dataflow upstream in `pyre_jit_trace::state::liveness_for`
-/// and consumes its `LiveVars` here to materialise one
-/// `LivenessInfo` per Python PC. Unreachable PCs (the dataflow
-/// leaves `usize::MAX` sentinel from `liveness.rs:150`) get an
-/// empty entry so the downstream `liveness.zip(live_patches)`
-/// alignment in the dispatch finalisation stays one-to-one.
+/// Phase 4: the dataflow now runs on the walker's SSARepr via
+/// `liveness::compute_liveness_preserve_positions`, which skips
+/// `remove_repeated_live` so `live_patches` insn indices stay valid
+/// offsets into `ssarepr.insns`.
 ///
-/// Pure function — reads only the precomputed `LiveVars` table and
-/// the depth-at-pc array; does not touch the assembler.
+/// Post-filters on the SSA output:
+///   - Only Ref-kind registers: pyre Int/Float regs are scratch
+///     tmps (int_tmp0/1, op_code_reg) or constant-as-reg encodings
+///     inside `jit_merge_point`; they never carry a Python box
+///     across py_pc boundaries. Leaving live_i / live_f empty keeps
+///     the tracer / blackhole (which index box arrays by raw
+///     register index at `trace_opcode.rs:229-263` /
+///     `call_jit.rs:965-982`) from pulling a Ref box through an
+///     Int/Float slot.
+///   - Only indices inside the Python-frame range: locals
+///     `0..nlocals` or in-depth stack slots
+///     `stack_base..stack_base+depth`. Helper Ref regs above that
+///     range (obj_tmp0/1, arg_regs_start, null_ref_reg,
+///     portal_{frame,ec}_reg) are correctly dead across py_pcs and
+///     would desynchronise box layout if leaked.
+///
+/// Intersecting with LiveVars narrows SSA's superset back to the
+/// live set pyre's runtime contract currently assumes: symbolic
+/// locals / blackhole resume are built on LiveVars' answer, which
+/// omits function parameters at pc=0. Making SSA authoritative
+/// requires teaching the runtime to handle SSA-extra live params —
+/// see `phase4_ssa_liveness_blocker_2026_04_18.md`.
+///
+/// Unreachable PCs (the `LiveVars` dataflow leaves `usize::MAX`
+/// sentinels from `liveness.rs:150`) get an empty entry so the
+/// downstream `liveness.zip(live_patches)` alignment in dispatch
+/// finalisation stays one-to-one.
 fn compute_liveness_table(
+    assembler: &mut SSAReprEmitter,
+    live_patches: &[(usize, usize)],
     code: &CodeObject,
     num_instrs: usize,
     nlocals: usize,
@@ -272,30 +297,62 @@ fn compute_liveness_table(
     depth_at_pc: &[u16],
     pc_map: &[usize],
 ) -> Vec<LivenessInfo> {
+    use super::flatten::{Insn, Kind as SsaKind, Operand as SsaOperand};
+    super::liveness::compute_liveness_preserve_positions(&mut assembler.ssarepr);
     let live_vars = pyre_jit_trace::state::liveness_for(code as *const _);
     let mut liveness = Vec::with_capacity(num_instrs);
-    for py_pc in 0..num_instrs {
+    for &(py_pc, insn_idx) in live_patches.iter() {
         let jit_pc = pc_map[py_pc];
-        let (live_r, live_i, live_f) = if live_vars.is_reachable(py_pc) {
-            let depth = depth_at_pc[py_pc];
-            // liveness.py: only live locals are included.
-            let mut live_r: Vec<u16> = (0..nlocals)
+        if !live_vars.is_reachable(py_pc) {
+            liveness.push(LivenessInfo {
+                pc: jit_pc as u16,
+                live_i_regs: Vec::new(),
+                live_r_regs: Vec::new(),
+                live_f_regs: Vec::new(),
+            });
+            continue;
+        }
+        let depth = depth_at_pc[py_pc];
+        let stack_limit = stack_base as usize + depth as usize;
+        let mut seen: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
+        let mut live_r: Vec<u16> = Vec::new();
+        if let Some(Insn::Live(args)) = assembler.ssarepr.insns.get(insn_idx) {
+            for op in args {
+                if let SsaOperand::Register(reg) = op {
+                    if reg.kind != SsaKind::Ref {
+                        continue;
+                    }
+                    let idx = reg.index as usize;
+                    let in_locals = idx < nlocals;
+                    let in_stack = idx >= stack_base as usize && idx < stack_limit;
+                    if (in_locals || in_stack) && seen.insert(reg.index) {
+                        live_r.push(reg.index);
+                    }
+                }
+            }
+        }
+        for d in 0..depth {
+            let idx = stack_base + d;
+            if seen.insert(idx) {
+                live_r.push(idx);
+            }
+        }
+        let lv_live: std::collections::BTreeSet<u16> = {
+            let mut s: std::collections::BTreeSet<u16> = (0..nlocals)
                 .filter(|&idx| live_vars.is_local_live(py_pc, idx))
                 .map(|idx| idx as u16)
                 .collect();
-            // Stack slots: live if index < depth at this PC.
             for d in 0..depth {
-                live_r.push(stack_base + d);
+                s.insert(stack_base + d);
             }
-            (live_r, vec![], vec![])
-        } else {
-            (vec![], vec![], vec![])
+            s
         };
+        live_r.retain(|idx| lv_live.contains(idx));
         liveness.push(LivenessInfo {
             pc: jit_pc as u16,
-            live_i_regs: live_i,
+            live_i_regs: Vec::new(),
             live_r_regs: live_r,
-            live_f_regs: live_f,
+            live_f_regs: Vec::new(),
         });
     }
     liveness
@@ -1825,11 +1882,20 @@ impl CodeWriter {
         // a front-end gate.
         let mut has_abort = assembler.has_abort_flag();
 
-        // liveness.py parity: generate LivenessInfo at each bytecode PC.
-        // See `compute_liveness_table` for the per-pc reachable / live
-        // local + stack-depth derivation.
-        let liveness =
-            compute_liveness_table(code, num_instrs, nlocals, stack_base, &depth_at_pc, &pc_map);
+        // liveness.py:19-80 parity: generate LivenessInfo at each
+        // bytecode PC via SSA backward dataflow over the populated
+        // SSARepr, with a LiveVars intersection at each pc to match
+        // the runtime contract. See `compute_liveness_table`.
+        let liveness = compute_liveness_table(
+            &mut assembler,
+            &live_patches,
+            code,
+            num_instrs,
+            nlocals,
+            stack_base,
+            &depth_at_pc,
+            &pc_map,
+        );
 
         // liveness.py:19-23 parity: patch each SSARepr `-live-` slot
         // with the per-PC register triple. The post-pass register

@@ -35,6 +35,14 @@ pub fn compute_liveness(ssarepr: &mut SSARepr) {
     remove_repeated_live(ssarepr);
 }
 
+/// Fixpoint dataflow only, skipping `remove_repeated_live` so external
+/// `Insn::Live` indices stay stable. Used by the codewriter's Phase 4
+/// migration where `live_patches` caches insn indices.
+pub fn compute_liveness_preserve_positions(ssarepr: &mut SSARepr) {
+    let mut label2alive: HashMap<String, HashSet<Register>> = HashMap::new();
+    while _compute_liveness_must_continue(ssarepr, &mut label2alive) {}
+}
+
 /// `liveness.py:25-80` `_compute_liveness_must_continue(ssarepr, label2alive)`.
 ///
 /// Walks the instruction list backwards, maintaining the set of live
