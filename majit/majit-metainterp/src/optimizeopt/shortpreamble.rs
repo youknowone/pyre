@@ -1138,27 +1138,26 @@ impl AbstractShortPreambleBuilderState {
     /// + guards to short), then appends preamble_op + result guards.
     /// Called by force_op_from_preamble (unroll.py:32).
     ///
-    /// `arg_guards`: guards collected from PtrInfo::make_guards for each arg
-    /// `result_guards`: guards from PtrInfo::make_guards for the result
-    /// These are pre-collected by the caller (force_op_from_preamble) which
-    /// has access to PtrInfo via OptContext.
+    /// RPython passes `preamble_op` directly (there is no lookup miss).
+    /// `all_produced` + `pos_to_key` are still needed to resolve dependency
+    /// args whose Phase-2 OpRefs differ from `produced_short_boxes` keys.
     fn use_box(
         &mut self,
-        produced: &ProducedShortOp,
+        preamble_op: &Op,
         already_in_short: &HashSet<OpRef>,
         all_produced: &HashMap<OpRef, ProducedShortOp>,
         pos_to_key: &HashMap<OpRef, OpRef>,
         arg_guards: &[Op],
         result_guards: &[Op],
     ) -> Op {
-        let canonical_result = produced.preamble_op.pos;
+        let canonical_result = preamble_op.pos;
         if self.short_results.contains(&canonical_result)
             || already_in_short.contains(&canonical_result)
         {
-            return produced.preamble_op.clone();
+            return preamble_op.clone();
         }
         // shortpreamble.py:383-396: iterate preamble_op args
-        for &arg in &produced.preamble_op.args {
+        for &arg in &preamble_op.args {
             if self.short_results.contains(&arg)
                 || already_in_short.contains(&arg)
                 || self.short_inputargs.contains(&arg)
@@ -1190,7 +1189,6 @@ impl AbstractShortPreambleBuilderState {
         // shortpreamble.py:389,396: info.make_guards(arg, self.short, optimizer)
         self.short.extend_from_slice(arg_guards);
         // shortpreamble.py:398: self.short.append(preamble_op)
-        let preamble_op = produced.preamble_op.clone();
         self.short_results.insert(canonical_result);
         self.short.push(preamble_op.clone());
         if preamble_op.opcode.is_ovf() {
@@ -1198,7 +1196,7 @@ impl AbstractShortPreambleBuilderState {
         }
         // shortpreamble.py:405-406: info.make_guards(preamble_op, self.short, optimizer)
         self.short.extend_from_slice(result_guards);
-        preamble_op
+        preamble_op.clone()
     }
 }
 
@@ -1394,70 +1392,38 @@ impl ShortPreambleBuilder {
 
     /// shortpreamble.py:382-407: use_box(box, preamble_op, optimizer)
     /// Non-recursive. Called by force_op_from_preamble (unroll.py:32).
+    ///
+    /// RPython passes `preamble_op.preamble_op` directly — no lookup miss
+    /// possible. majit prefers the produced_short_boxes lookup (which may
+    /// carry a Phase-2 remapped pos), and falls back to `fallback_op` from
+    /// info::PreambleOp when absent.
     pub fn use_box(
         &mut self,
-        result: OpRef,
+        source: OpRef,
+        fallback_op: &Op,
         arg_guards: &[Op],
         result_guards: &[Op],
-    ) -> Option<Op> {
-        let produced = self.produced_short_boxes.get(&result)?.clone();
+    ) {
+        let preamble_op = match self.produced_short_boxes.get(&source) {
+            Some(produced) => &produced.preamble_op,
+            None => {
+                if crate::optimizeopt::majit_log_enabled() {
+                    eprintln!(
+                        "[jit][use_box] produced_short_boxes miss for {source:?}, using fallback"
+                    );
+                }
+                fallback_op
+            }
+        };
         let pos_to_key = build_pos_to_key(&self.produced_short_boxes);
-        Some(self.state.use_box(
-            &produced,
+        self.state.use_box(
+            preamble_op,
             &HashSet::new(),
             &self.produced_short_boxes,
             &pos_to_key,
             arg_guards,
             result_guards,
-        ))
-    }
-
-    /// RPython shortpreamble.py:382-407: use_box(box, preamble_op, optimizer)
-    /// fallback when the builder does not have a tracked ProducedShortOp for
-    /// `result`. This replays the passed-in preamble op directly instead of
-    /// dropping the short fact on the floor.
-    pub fn use_box_from_preamble_op(
-        &mut self,
-        pop: &crate::optimizeopt::info::PreambleOp,
-        arg_guards: &[Op],
-        result_guards: &[Op],
-    ) -> Op {
-        let replay_op = pop.preamble_op.clone();
-        let canonical = replay_op.pos;
-        if !self.state.short_results.contains(&canonical) {
-            let pos_to_key = build_pos_to_key(&self.produced_short_boxes);
-            for &arg in &replay_op.args {
-                if self.state.short_results.contains(&arg)
-                    || self.state.short_inputargs.contains(&arg)
-                    || self.state.known_constants.contains(&arg)
-                {
-                    continue;
-                }
-                let dep = self.produced_short_boxes.get(&arg).or_else(|| {
-                    pos_to_key
-                        .get(&arg)
-                        .and_then(|key| self.produced_short_boxes.get(key))
-                });
-                if let Some(dep) = dep {
-                    let dep_pos = dep.preamble_op.pos;
-                    if !self.state.short_results.contains(&dep_pos) {
-                        self.state.short_results.insert(dep_pos);
-                        self.state.short.push(dep.preamble_op.clone());
-                        if dep.preamble_op.opcode.is_ovf() {
-                            self.state.short.push(Op::new(OpCode::GuardNoOverflow, &[]));
-                        }
-                    }
-                }
-            }
-            self.state.short.extend_from_slice(arg_guards);
-            self.state.short_results.insert(canonical);
-            self.state.short.push(replay_op.clone());
-            if replay_op.opcode.is_ovf() {
-                self.state.short.push(Op::new(OpCode::GuardNoOverflow, &[]));
-            }
-            self.state.short.extend_from_slice(result_guards);
-        }
-        replay_op
+        );
     }
 
     pub fn produced_short_op(&self, result: OpRef) -> Option<ProducedShortOp> {
@@ -1866,14 +1832,29 @@ impl ExtendedShortPreambleBuilder {
 
     /// shortpreamble.py:478-481: use_box — pop JUMP, add deps, re-append JUMP.
     /// Called by force_op_from_preamble (unroll.py:32).
+    ///
+    /// RPython passes `preamble_op.preamble_op` directly. majit uses the
+    /// produced_short_boxes lookup for the Phase-2 remapped op, with
+    /// `fallback_op` from info::PreambleOp as the safety net.
     pub fn use_box(
         &mut self,
-        result: OpRef,
+        source: OpRef,
+        fallback_op: &Op,
         arg_guards: &[Op],
         result_guards: &[Op],
-    ) -> Option<Op> {
-        let produced = self.produced_short_boxes.get(&result)?.clone();
-        let preamble_op = self.remap_op(&produced.preamble_op);
+    ) {
+        let raw_op = match self.produced_short_boxes.get(&source) {
+            Some(produced) => produced.preamble_op.clone(),
+            None => {
+                if crate::optimizeopt::majit_log_enabled() {
+                    eprintln!(
+                        "[jit][use_box ext] produced_short_boxes miss for {source:?}, using fallback"
+                    );
+                }
+                fallback_op.clone()
+            }
+        };
+        let preamble_op = self.remap_op(&raw_op);
         let canonical = preamble_op.pos;
         // shortpreamble.py:479: jump_op = self.short.pop()
         let jump_op = self.short.pop();
@@ -1916,57 +1897,6 @@ impl ExtendedShortPreambleBuilder {
         if let Some(jump) = jump_op {
             self.short.push(jump);
         }
-        Some(preamble_op)
-    }
-
-    /// RPython shortpreamble.py:478-481: use_box fallback for imported
-    /// PreambleOp replay when there is no ProducedShortOp entry to look up.
-    pub fn use_box_from_preamble_op(
-        &mut self,
-        pop: &crate::optimizeopt::info::PreambleOp,
-        arg_guards: &[Op],
-        result_guards: &[Op],
-    ) -> Op {
-        let preamble_op = self.remap_op(&pop.preamble_op);
-        let canonical = preamble_op.pos;
-        let jump_op = self.short.pop();
-        if !self.short_results.contains(&canonical) {
-            let pos_to_key = build_pos_to_key(&self.produced_short_boxes);
-            for &arg in &preamble_op.args {
-                if self.short_results.contains(&arg)
-                    || self.short_inputargs.contains(&arg)
-                    || self.known_constants.contains(&arg)
-                {
-                    continue;
-                }
-                let dep = self.produced_short_boxes.get(&arg).or_else(|| {
-                    pos_to_key
-                        .get(&arg)
-                        .and_then(|key| self.produced_short_boxes.get(key))
-                });
-                if let Some(dep) = dep {
-                    let dep_pos = dep.preamble_op.pos;
-                    if !self.short_results.contains(&dep_pos) {
-                        self.short_results.insert(dep_pos);
-                        self.short.push(self.remap_op(&dep.preamble_op));
-                        if dep.preamble_op.opcode.is_ovf() {
-                            self.short.push(Op::new(OpCode::GuardNoOverflow, &[]));
-                        }
-                    }
-                }
-            }
-            self.short.extend_from_slice(arg_guards);
-            self.short_results.insert(canonical);
-            self.short.push(preamble_op.clone());
-            if preamble_op.opcode.is_ovf() {
-                self.short.push(Op::new(OpCode::GuardNoOverflow, &[]));
-            }
-            self.short.extend_from_slice(result_guards);
-        }
-        if let Some(jump) = jump_op {
-            self.short.push(jump);
-        }
-        preamble_op
     }
 
     pub fn produced_short_op(&self, result: OpRef) -> Option<ProducedShortOp> {

@@ -1632,28 +1632,30 @@ impl OptContext {
         let result_type = preamble_op.preamble_op.result_type();
         let is_constant = self.get_constant(preamble_source).is_some();
         if self.imported_short_preamble_used.insert(preamble_source) {
-            // unroll.py:28: assert short_preamble_producer is not None
-            // unroll.py:32: use_box(op, preamble_op.preamble_op, self)
+            // unroll.py:32: use_box(op, preamble_op.preamble_op, self).
+            // RPython passes the preamble_op directly — no lookup miss possible.
+            // majit prefers the produced_short_boxes lookup (Phase-2 remapped pos)
+            // with fallback to info::PreambleOp.preamble_op.
             let (arg_guards, result_guards) = self.collect_use_box_guards(&preamble_op.preamble_op);
+            // unroll.py:28: assert self.short_preamble_producer is not None
             if let Some(mut builder) = self.active_short_preamble_producer.take() {
-                if builder.produced_short_op(preamble_source).is_some() {
-                    builder.use_box(preamble_source, &arg_guards, &result_guards);
-                } else {
-                    builder.use_box_from_preamble_op(preamble_op, &arg_guards, &result_guards);
-                }
+                builder.use_box(
+                    preamble_source,
+                    &preamble_op.preamble_op,
+                    &arg_guards,
+                    &result_guards,
+                );
                 self.active_short_preamble_producer = Some(builder);
             } else if let Some(mut builder) = self.imported_short_preamble_builder.take() {
-                if builder.produced_short_op(preamble_source).is_some() {
-                    builder.use_box(preamble_source, &arg_guards, &result_guards);
-                } else {
-                    builder.use_box_from_preamble_op(preamble_op, &arg_guards, &result_guards);
-                }
+                builder.use_box(
+                    preamble_source,
+                    &preamble_op.preamble_op,
+                    &arg_guards,
+                    &result_guards,
+                );
                 self.imported_short_preamble_builder = Some(builder);
             } else {
-                unreachable!(
-                    "force_op_from_preamble_op: short preamble builder missing \
-                     (RPython unroll.py:28: assert False # unreachable code)"
-                );
+                unreachable!("force_op_from_preamble_op: no short_preamble_producer");
             }
             // shortpreamble.py:404: optimizer.setinfo_from_preamble(box, info, None)
             if let Some(info) = self.get_ptr_info(preamble_source).cloned() {
