@@ -178,37 +178,6 @@ pub fn make_fail_descr_typed_with_index(fail_index: u32, types: Vec<Type>) -> De
     })
 }
 
-/// Create a ResumeGuardDescr — a FailDescr that carries resume data
-/// for reconstructing interpreter state on guard failure.
-///
-/// Mirrors RPython's ResumeGuardDescr which attaches snapshot data
-/// to each guard so the meta-interpreter can reconstruct the full
-/// interpreter state (including virtual objects) when deoptimizing.
-#[allow(dead_code)]
-pub fn make_resume_guard_descr(num_live: usize, resume_data: ResumeData) -> DescrRef {
-    Arc::new(ResumeGuardDescr {
-        fail_index: alloc_fail_index(),
-        types: vec![Type::Int; num_live],
-        resume_data,
-        vector_info: UnsafeCell::new(Vec::new()),
-    })
-}
-
-/// Create a ResumeGuardDescr with an explicit fail_index.
-#[allow(dead_code)]
-pub fn make_resume_guard_descr_with_index(
-    fail_index: u32,
-    num_live: usize,
-    resume_data: ResumeData,
-) -> DescrRef {
-    Arc::new(ResumeGuardDescr {
-        fail_index,
-        types: vec![Type::Int; num_live],
-        resume_data,
-        vector_info: UnsafeCell::new(Vec::new()),
-    })
-}
-
 /// compile.py:892: ResumeAtPositionDescr(ResumeGuardDescr) — subclass
 /// with no additional fields or method overrides. Type tag only.
 ///
@@ -449,25 +418,5 @@ mod tests {
         let types = vec![Type::Int, Type::Ref, Type::Float];
         let d = make_fail_descr_typed(types.clone());
         assert_eq!(d.as_fail_descr().unwrap().fail_arg_types(), &types);
-    }
-
-    #[test]
-    fn test_resume_guard_descr() {
-        let rd = ResumeData::simple(42, 3);
-        let d = make_resume_guard_descr(3, rd);
-
-        let fd = d.as_fail_descr().unwrap();
-        assert!(fd.fail_index() > 0);
-        assert_eq!(fd.fail_arg_types().len(), 3);
-    }
-
-    #[test]
-    fn test_resume_guard_descr_with_explicit_index() {
-        let rd = ResumeData::simple(99, 2);
-        let d = make_resume_guard_descr_with_index(7, 2, rd);
-
-        let fd = d.as_fail_descr().unwrap();
-        assert_eq!(fd.fail_index(), 7);
-        assert_eq!(fd.fail_arg_types().len(), 2);
     }
 }

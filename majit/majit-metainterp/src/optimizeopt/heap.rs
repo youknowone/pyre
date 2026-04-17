@@ -652,12 +652,6 @@ impl ArrayCacheSubMap {
         }
         self.clear_varindex();
     }
-
-    /// True when no const-index entries and no varindex triples remain.
-    #[allow(dead_code)]
-    fn is_empty(&self) -> bool {
-        self.const_indexes.is_empty() && self.cached_varindex_triples.is_none()
-    }
 }
 
 /// Heap optimization pass.

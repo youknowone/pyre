@@ -456,11 +456,6 @@ impl OptVirtualize {
         OptimizationResult::PassOn
     }
 
-    #[allow(dead_code)]
-    fn optimize_new_array_clear(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        self.optimize_new_array(op, ctx)
-    }
-
     fn optimize_setfield_gc(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let struct_ref = ctx.get_box_replacement(op.arg(0));
         let value_ref = ctx.get_box_replacement(op.arg(1));

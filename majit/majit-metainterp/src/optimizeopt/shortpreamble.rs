@@ -1979,21 +1979,6 @@ impl ExtendedShortPreambleBuilder {
         &self.short_inputargs
     }
 
-    /// Debug: check for key/pos mismatches in produced_short_boxes.
-    #[allow(dead_code)]
-    pub fn debug_check_produced_parity(&self) {
-        for (&key, produced) in &self.produced_short_boxes {
-            if key != produced.preamble_op.pos {
-                eprintln!(
-                    "[debug] produced_short_boxes key={} != preamble_op.pos={} ({})",
-                    key.0,
-                    produced.preamble_op.pos.0,
-                    produced.preamble_op.opcode.name(),
-                );
-            }
-        }
-    }
-
     pub fn build_short_preamble_struct(
         &self,
         loop_constants: &HashMap<u32, i64>,
