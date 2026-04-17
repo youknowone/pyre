@@ -1591,32 +1591,20 @@ pub fn take_pending_frame_restore() -> Option<FrameRestore> {
     PENDING_FRAME_RESTORE.with(|c| c.take())
 }
 
-// ── Inline frame arena for self-recursive CallAssemblerI ────────────
+// ── JitFrame layout registration for the GC rewriter ────────────────
 
-/// Stable addresses for inline arena take/put in Cranelift IR.
+/// JitFrame field descriptors supplied by the interpreter crate so the
+/// GC rewriter's `handle_call_assembler` pass (rewrite.py:665-695) can
+/// emit the correct GC_LOAD / GC_STORE sequence for callee jitframes.
 #[derive(Clone)]
-pub struct InlineFrameArenaInfo {
-    pub buf_base_addr: usize,
-    pub top_addr: usize,
-    pub initialized_addr: usize,
-    pub frame_size: usize,
-    /// GcHeader size prepended before each PyFrame in the arena slot.
-    /// PyPy layout: [GcHeader (8 bytes)][PyFrame fields].
-    pub gc_header_size: usize,
-    pub frame_pycode_offset: usize,
-    pub frame_last_instr_offset: usize,
-    pub frame_vable_token_offset: usize,
-    pub create_fn_addr: usize,
-    pub drop_fn_addr: usize,
-    pub arena_cap: usize,
-    /// JitFrame field descriptors for GC rewriter handle_call_assembler.
+pub struct JitFrameLayoutInfo {
     pub jitframe_descrs: Option<majit_gc::rewrite::JitFrameDescrs>,
 }
 
-static INLINE_ARENA: OnceLock<InlineFrameArenaInfo> = OnceLock::new();
+static JITFRAME_LAYOUT: OnceLock<JitFrameLayoutInfo> = OnceLock::new();
 
-pub fn register_inline_frame_arena(info: InlineFrameArenaInfo) {
-    let _ = INLINE_ARENA.set(info);
+pub fn register_jitframe_layout(info: JitFrameLayoutInfo) {
+    let _ = JITFRAME_LAYOUT.set(info);
 }
 
 // ── Call-assembler dispatch table ──
@@ -5450,9 +5438,9 @@ impl CraneliftBackend {
                 }
                 descr
             },
-            jitframe_info: INLINE_ARENA
+            jitframe_info: JITFRAME_LAYOUT
                 .get()
-                .and_then(|arena| arena.jitframe_descrs.clone()),
+                .and_then(|info| info.jitframe_descrs.clone()),
             constant_types: ct,
             // rewrite.py:673 — lookup compiled_loop_token._ll_initial_locs
             call_assembler_callee_locs: Some(Box::new(|token_number| {

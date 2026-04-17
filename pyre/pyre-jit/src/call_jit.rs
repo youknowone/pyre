@@ -167,23 +167,13 @@ static mut ARENA_BUF_BASE: *mut u8 = std::ptr::null_mut();
 static mut ARENA_TOP: usize = 0;
 static mut ARENA_INITIALIZED: usize = 0;
 
-/// Returns addresses of the global arena state variables and frame
-/// layout constants needed by Cranelift to inline arena take/put.
+/// Returns the jitframe layout descriptors needed by the GC rewriter's
+/// `handle_call_assembler` pass to emit the correct GC_LOAD / GC_STORE /
+/// CallMallocNurseryVarsizeFrame sequence for callee jitframes.
 #[cfg(feature = "cranelift")]
-pub fn arena_global_info() -> majit_backend_cranelift::InlineFrameArenaInfo {
+pub fn arena_global_info() -> majit_backend_cranelift::JitFrameLayoutInfo {
     use majit_metainterp::jitframe::*;
-    majit_backend_cranelift::InlineFrameArenaInfo {
-        buf_base_addr: unsafe { std::ptr::addr_of!(ARENA_BUF_BASE) as usize },
-        top_addr: unsafe { std::ptr::addr_of!(ARENA_TOP) as usize },
-        initialized_addr: unsafe { std::ptr::addr_of!(ARENA_INITIALIZED) as usize },
-        frame_size: std::mem::size_of::<GcFrameSlot>(),
-        gc_header_size: GC_HEADER_SIZE,
-        frame_pycode_offset: pyre_interpreter::pyframe::PYFRAME_PYCODE_OFFSET,
-        frame_last_instr_offset: pyre_interpreter::pyframe::PYFRAME_LAST_INSTR_OFFSET,
-        frame_vable_token_offset: pyre_interpreter::pyframe::PYFRAME_VABLE_TOKEN_OFFSET,
-        create_fn_addr: jit_create_self_recursive_callee_frame_1_raw_int as *const () as usize,
-        drop_fn_addr: jit_drop_callee_frame as *const () as usize,
-        arena_cap: ARENA_CAP,
+    majit_backend_cranelift::JitFrameLayoutInfo {
         jitframe_descrs: Some(majit_gc::rewrite::JitFrameDescrs {
             jitframe_tid: crate::jit::descr::JITFRAME_GC_TYPE_ID,
             jitframe_fixed_size: JITFRAME_FIXED_SIZE,
@@ -1531,7 +1521,7 @@ pub fn install_jit_call_bridge() {
             majit_backend_cranelift::register_call_assembler_blackhole(
                 jit_blackhole_resume_from_guard,
             );
-            majit_backend_cranelift::register_inline_frame_arena(arena_global_info());
+            majit_backend_cranelift::register_jitframe_layout(arena_global_info());
         }
         #[cfg(feature = "dynasm")]
         {

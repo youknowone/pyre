@@ -5,20 +5,6 @@
 
 pub const PYFRAME_VABLE_OWNER_ROOT: &str = "PyFrame";
 
-#[derive(Clone, Copy)]
-pub enum FieldPatternRole {
-    LocalArray,
-    InstructionPosition,
-    ConstantPool,
-}
-
-#[derive(Clone, Copy)]
-pub struct FieldRoleSpec {
-    pub name: &'static str,
-    pub owner_root: &'static str,
-    pub role: FieldPatternRole,
-}
-
 /// Virtualizable scalar fields in canonical PyPy index order.
 /// interp_jit.py:25-31: last_instr, pycode, valuestackdepth,
 /// debugdata, lastblock, w_globals
@@ -73,27 +59,3 @@ const _: () = {
         i += 1;
     }
 };
-
-/// Canonical field-role descriptors used by trace-pattern classification.
-pub const PYFRAME_FIELD_ROLES: &[FieldRoleSpec] = &[
-    FieldRoleSpec {
-        name: "locals_cells_stack_w",
-        owner_root: PYFRAME_VABLE_OWNER_ROOT,
-        role: FieldPatternRole::LocalArray,
-    },
-    FieldRoleSpec {
-        name: "last_instr",
-        owner_root: PYFRAME_VABLE_OWNER_ROOT,
-        role: FieldPatternRole::InstructionPosition,
-    },
-    FieldRoleSpec {
-        name: "pycode",
-        owner_root: PYFRAME_VABLE_OWNER_ROOT,
-        role: FieldPatternRole::ConstantPool,
-    },
-    FieldRoleSpec {
-        name: "co_consts",
-        owner_root: "PyCode",
-        role: FieldPatternRole::ConstantPool,
-    },
-];
