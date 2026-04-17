@@ -481,6 +481,15 @@ impl DynasmBackend {
             .entry(token_number)
             .or_insert(0);
     }
+
+    /// `rpython/jit/backend/llsupport/llmodel.py:534-537`
+    /// `get_baseofs_of_frame_field(self)` — offset from a `JITFRAME` base
+    /// to the first frame-array item. Used by `_set_initial_bindings`
+    /// (regalloc.py:865) and `update_frame_info` (model.py:316) for
+    /// `jfi_frame_size` accounting (jitframe.py:19-22).
+    fn get_baseofs_of_frame_field() -> i64 {
+        crate::jitframe::FIRST_ITEM_OFFSET as i64
+    }
 }
 
 impl Backend for DynasmBackend {
@@ -510,7 +519,38 @@ impl Backend for DynasmBackend {
 
         let code_addr = codebuf::buffer_ptr(&compiled.buffer) as usize;
         let code_size = compiled.buffer.len();
+        let frame_depth = compiled.frame_depth.load(Ordering::Acquire) as i64;
         Self::register_call_assembler_target(token.number, code_addr);
+
+        // `rpython/jit/backend/x86/assembler.py:513-526` initializes the
+        // per-loop `CompiledLoopToken` fields at assemble_loop entry:
+        //   * frame_info is allocated and assigned (line 526-530)
+        //   * looptoken.compiled_loop_token = clt (line 514)
+        // pyre eagerly creates the CLT in `JitCellToken::new`, so the
+        // equivalent here is populating its fields with the real values
+        // computed during assembly.
+        let baseofs = Self::get_baseofs_of_frame_field();
+        if let Some(clt) = token.compiled_loop_token.as_ref() {
+            // `x86/assembler.py:526-530` frame_info = malloc_aligned + set
+            // jfi_frame_depth/jfi_frame_size. pyre's frame_info lives on
+            // the CLT already; just populate via update_frame_depth.
+            clt.frame_info
+                .lock()
+                .update_frame_depth(baseofs, frame_depth);
+            // `llsupport/regalloc.py:861-871` `_set_initial_bindings` —
+            // pyre lays inputargs at contiguous word slots in the frame
+            // array, so loc.value - base_ofs = i * SIZEOFSIGNED for
+            // inputarg i. The list length must match `inputargs.len()`
+            // so `handle_call_assembler` (rewrite.py:673) can index it.
+            let locs: Vec<i32> = (0..inputargs.len())
+                .map(|i| (i as i32) * (crate::jitframe::SIZEOFSIGNED as i32))
+                .collect();
+            *clt._ll_initial_locs.lock() = locs;
+        }
+        // `x86/assembler.py:599` `looptoken._ll_function_addr =
+        // rawstart + functionpos`. pyre stores the single entry point
+        // so `_ll_function_addr` = compiled-code base.
+        token._ll_function_addr = code_addr;
         token.compiled = Some(Box::new(compiled));
 
         Ok(AsmInfo {
@@ -817,12 +857,12 @@ impl Backend for DynasmBackend {
     ) -> Result<(), BackendError> {
         let old_compiled = Self::get_compiled(old);
         let new_compiled = Self::get_compiled(new);
-        // x86/assembler.py:1148-1151 update_frame_info parity: propagate
+        // x86/assembler.py:1146-1151 update_frame_info parity: propagate
         // new loop's frame depth onto the old token and every token in
-        // its existing redirect chain. `baseofs = 0` for pyre — we do
-        // not track `get_baseofs_of_frame_field()` on the dynasm path
-        // (backends that need a non-zero base should pass it through
-        // their `self.cpu` equivalent).
+        // its existing redirect chain, using the `baseofs` obtained from
+        // `cpu.get_baseofs_of_frame_field()` so `jfi_frame_size` follows
+        // jitframe.py:19-22 `base_ofs + new_depth * SIZEOFSIGNED`.
+        let baseofs = Self::get_baseofs_of_frame_field();
         if let (Some(new_clt), Some(old_clt)) = (
             new.compiled_loop_token.as_ref(),
             old.compiled_loop_token.as_ref(),
@@ -834,12 +874,12 @@ impl Backend for DynasmBackend {
             new_clt
                 .frame_info
                 .lock()
-                .update_frame_depth(0, new_depth as i64);
+                .update_frame_depth(baseofs, new_depth as i64);
             // model.py:316-329 update_frame_info — pass old CLT with a
             // weak ref for the "append self to chain" step (line 328
             // `new_loop_tokens.append(weakref.ref(oldlooptoken))`).
             let old_weak = Arc::downgrade(old_clt);
-            new_clt.update_frame_info(old_clt, old_weak, 0);
+            new_clt.update_frame_info(old_clt, old_weak, baseofs);
             // Keep the backend-specific frame_depth in lockstep so bridge
             // codegen's existing readers (CompiledCode.frame_depth) also
             // see the propagated value. PRE-EXISTING-ADAPTATION: RPython
