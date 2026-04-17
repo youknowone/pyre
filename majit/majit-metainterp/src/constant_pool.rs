@@ -55,15 +55,17 @@ impl ConstantPool {
     }
 
     /// Get or create a constant OpRef for a given i64 value.
-    /// Only matches Int-typed or untyped entries (not Ref/Float).
+    /// Only matches Int-typed entries (not Ref/Float).
     /// Returns the same OpRef for the same value (deduplication).
     ///
     /// RPython parity: equivalent to constructing `ConstInt(value)` and
     /// relying on memo-deduping via `ResumeDataLoopMemo.large_ints`. The
-    /// `constant_types` slot is intentionally left absent so that
-    /// resume-data-only overrides stored in `numbering_type_overrides`
-    /// (see `mark_type`) can reinterpret the same i64 as a Ref pointer
-    /// without triggering GC root tracking in the constant pool.
+    /// `constant_types` slot is always set to `Type::Int` — RPython Box
+    /// subclasses pin the type at creation (history.py:361 ConstInt),
+    /// so our constant pool must do the same. Resume-data-only Ref
+    /// overrides for raw-pointer ConstInts go through `mark_type` →
+    /// `numbering_type_overrides`, which is a separate channel that does
+    /// not disturb the intrinsic `op.type == 'i'` invariant.
     pub fn get_or_insert(&mut self, value: i64) -> OpRef {
         for (&idx, &v) in &self.constants {
             if v == value {
@@ -88,6 +90,15 @@ impl ConstantPool {
         let opref = OpRef::from_const(self.next_const_idx);
         self.next_const_idx += 1;
         self.constants.insert(opref.0, value);
+        // Box.type immutability (history.py:361 ConstInt): a ConstInt Box
+        // always reports `op.type == 'i'`. Record the type explicitly so
+        // `constant_type(opref)` returns `Some(Int)` instead of `None`;
+        // otherwise callers that fall back on a slot-layout declared type
+        // (pyre-jit-trace/trace_opcode.rs `opref_to_snapshot_tagged_for_slot`)
+        // retag this ConstInt as Ref when it lands in a Ref-declared array
+        // slot, and the bridge optimizer then panics in `getintbound` once
+        // the bridge reseeds `const_pool` with `Value::Ref(GcRef(small_int))`.
+        self.constant_types.insert(opref.0, Type::Int);
         opref
     }
 
