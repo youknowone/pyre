@@ -411,7 +411,6 @@ struct RegisteredLoopTarget {
     header_pc: u64,
     /// RPython greenkey hash: function identifier for guard lookup.
     green_key: u64,
-    source_guard: Option<(u64, u32)>,
     caller_prefix_layout: Option<ExitRecoveryLayout>,
     code_ptr: *const u8,
     fail_descrs: Vec<Arc<CraneliftFailDescr>>,
@@ -2074,7 +2073,6 @@ fn register_call_assembler_target(
         trace_id: compiled.trace_id,
         header_pc: compiled.header_pc,
         green_key: token.green_key,
-        source_guard: None,
         caller_prefix_layout: compiled.caller_prefix_layout.clone(),
         code_ptr: compiled.code_ptr,
         fail_descrs: compiled.fail_descrs.clone(),
@@ -2148,7 +2146,6 @@ pub fn register_pending_call_assembler_target(
         trace_id: 0,
         header_pc: 0,
         green_key: 0,
-        source_guard: None,
         caller_prefix_layout: None,
         code_ptr: std::ptr::null(),
         fail_descrs: Vec::new(),
@@ -2415,11 +2412,15 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
         let outputs = exec.extract_outputs(cur_max_output_slots.max(1));
 
         if let Some(frame) = maybe_take_call_assembler_deadframe(fail_index, &outputs) {
+            // `RegisteredLoopTarget` is always a root-loop entry; root
+            // registers never set `source_guard`, so pass `None` directly.
+            // Bridges carry their own `BridgeData.source_guard` and never
+            // reach this `execute_registered_loop_target` path.
             return wrap_call_assembler_deadframe_with_caller_prefix(
                 frame,
                 target.trace_id,
                 target.header_pc,
-                target.source_guard,
+                None,
                 &target.inputarg_types,
                 &current_inputs,
                 target.caller_prefix_layout.as_ref(),
