@@ -5749,6 +5749,15 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
         "record_quasiimmut_field/rdd",
         handler_record_quasiimmut_field,
     );
+    // Synthetic op for Rust fat-pointer dispatch — see
+    // `majit/majit-codewriter/src/model.rs OpKind::FuncptrFromVtable`.
+    // No runtime consumer ships yet; the handler panics on dispatch so a
+    // future regression that triggers this path in pyre fails loudly
+    // instead of silently miscompiling.
+    builder.wire_handler(
+        "funcptr_from_vtable/rd>i",
+        handler_funcptr_from_vtable_unimplemented,
+    );
     builder.wire_handler(
         "jit_force_quasi_immutable/rd",
         handler_jit_force_quasi_immutable,
@@ -6038,6 +6047,21 @@ fn handler_guard_class(
 ) -> Result<usize, DispatchError> {
     Ok(p + 2)
 }
+/// `funcptr_from_vtable` reaches the blackhole only when a `dyn Trait`
+/// indirect call survives unfrozen into a metainterp resume.  pyre's hot
+/// path does not currently emit this pattern; intentionally panic so any
+/// future regression is loud rather than silent.  The codewriter still
+/// emits the op + descriptor (`rpython/jit/codewriter/jtransform.py:546`
+/// counterpart) so the IR survives serialization for the next
+/// integration step.
+fn handler_funcptr_from_vtable_unimplemented(
+    _bh: &mut BlackholeInterpreter,
+    _code: &[u8],
+    _p: usize,
+) -> Result<usize, DispatchError> {
+    unimplemented!("funcptr_from_vtable blackhole consumer (Phase B2)");
+}
+
 fn handler_record_quasiimmut_field(
     bh: &mut BlackholeInterpreter,
     code: &[u8],

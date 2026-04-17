@@ -536,6 +536,42 @@ impl Assembler {
                 let opnum = self.get_opnum(&key);
                 state.code[startposition] = opnum;
             }
+            // RPython `rpython/jit/codewriter/jtransform.py:546` emits
+            // `int_guard_value(op.args[0])` where `op.args[0]` is already a
+            // `Ptr(FuncType)` integer after rtype.  Rust `&dyn Trait` is a
+            // fat pointer so we synthesize `funcptr_from_vtable(receiver)`
+            // and carry the `(trait_root, method_name)` pair via a
+            // `BhDescr::VtableMethod` descriptor.  The result register is
+            // the integer function address that `int_guard_value` and the
+            // subsequent `residual_call_*` consume — runtime lowering is
+            // deferred (B2/B3 in the indirect_call epic).
+            OpKind::FuncptrFromVtable {
+                receiver,
+                trait_root,
+                method_name,
+            } => {
+                let (reg, kc) = self.lookup_reg_with_kind(*receiver, regallocs);
+                state.code.push(reg);
+                argcodes.push(kc);
+                let descr_idx = self.descrs.len();
+                self.descrs.push(crate::jitcode::BhDescr::VtableMethod {
+                    trait_root: trait_root.clone(),
+                    method_name: method_name.clone(),
+                });
+                state.code.push((descr_idx & 0xFF) as u8);
+                state.code.push((descr_idx >> 8) as u8);
+                argcodes.push('d');
+                if let Some(result) = op.result {
+                    argcodes.push('>');
+                    let (reg, kc) = self.lookup_reg_with_kind(result, regallocs);
+                    argcodes.push(kc);
+                    state.code.push(reg);
+                }
+                let opname = op_kind_to_opname(&op.kind);
+                let key = format!("{opname}/{argcodes}");
+                let opnum = self.get_opnum(&key);
+                state.code[startposition] = opnum;
+            }
             // RPython `rpython/jit/codewriter/jtransform.py:901-903` emits
             // `record_quasiimmut_field(v_inst, fielddescr, mutatefielddescr)`
             // — a register followed by two descrs.  The blackhole counterpart
@@ -1369,6 +1405,72 @@ mod tests {
             field_descr_names.contains(&"value") && field_descr_names.contains(&"mutate_value"),
             "expected Field descrs for `value` + `mutate_value`, got {:?}",
             field_descr_names
+        );
+    }
+
+    /// `OpKind::FuncptrFromVtable` must survive assembly with its
+    /// `(trait_root, method_name)` pair carried in a
+    /// `BhDescr::VtableMethod` so the runtime can resolve the receiver
+    /// fat pointer's vtable slot to a function address.  Counterpart of
+    /// the `op.args[0]` Variable RPython produces in
+    /// `rpython/jit/codewriter/jtransform.py:546`.
+    #[test]
+    fn assembles_funcptr_from_vtable_with_vtable_method_descr() {
+        use crate::flatten::flatten as flatten_graph;
+        use crate::model::{FunctionGraph, OpKind, Terminator, ValueType};
+
+        let mut graph = FunctionGraph::new("vtable_lookup");
+        let receiver = graph
+            .push_op(
+                graph.startblock,
+                OpKind::Input {
+                    name: "h".to_string(),
+                    ty: ValueType::Ref,
+                },
+                true,
+            )
+            .unwrap();
+        let funcptr = graph
+            .push_op(
+                graph.startblock,
+                OpKind::FuncptrFromVtable {
+                    receiver,
+                    trait_root: "Handler".to_string(),
+                    method_name: "run".to_string(),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_terminator(graph.startblock, Terminator::Return(Some(funcptr)));
+
+        let mut value_kinds = HashMap::new();
+        value_kinds.insert(receiver, RegKind::Ref);
+        value_kinds.insert(funcptr, RegKind::Int);
+        let regallocs = regalloc::perform_all_register_allocations(&graph, &value_kinds);
+        let mut flat = crate::flatten::flatten(&graph);
+        let mut asm = Assembler::new();
+        let _ = asm.assemble(&mut flat, &regallocs);
+
+        assert!(
+            asm.insns.contains_key("funcptr_from_vtable/rd>i"),
+            "expected key funcptr_from_vtable/rd>i, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        let vtable_descrs: Vec<(&str, &str)> = asm
+            .descrs
+            .iter()
+            .filter_map(|d| match d {
+                crate::jitcode::BhDescr::VtableMethod {
+                    trait_root,
+                    method_name,
+                } => Some((trait_root.as_str(), method_name.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            vtable_descrs,
+            vec![("Handler", "run")],
+            "expected exactly one VtableMethod descr for (Handler, run)"
         );
     }
 }
