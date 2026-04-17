@@ -91,6 +91,309 @@ struct ExceptionCatchSite {
     lasti_py_pc: usize,
 }
 
+/// RPython: per-graph output of `perform_register_allocation` over the
+/// three register kinds (codewriter.py:46-48). pyre's regalloc is
+/// trivial — fast locals occupy the bottom of the ref register file
+/// and the value stack stacks above them — so the "allocation" reduces
+/// to a handful of constant offsets derived from `code.varnames` /
+/// `code.max_stackdepth`. `RegisterLayout::compute` runs the same
+/// arithmetic the inline section of `transform_graph_to_jitcode` used
+/// to do directly; its only purpose is to give the layout a name and
+/// pull the calculation out of the 1400-line dispatch loop.
+#[derive(Clone, Copy, Debug)]
+struct RegisterLayout {
+    /// `code.varnames.len()` — number of fast locals.
+    nlocals: usize,
+    /// pyre-only: number of cell + free vars (`pyframe::ncells`).
+    ncells: usize,
+    /// Absolute index where the operand stack begins in
+    /// `PyFrame.locals_cells_stack_w` — `nlocals + ncells`.
+    stack_base_absolute: usize,
+    /// Compile-time depth bound from `code.max_stackdepth` (clamped to ≥ 1).
+    max_stackdepth: usize,
+    /// Ref register index where the operand stack begins
+    /// (`stack_base = nlocals` since locals occupy the first registers).
+    stack_base: u16,
+    /// Scratch ref register #0 — sits at `nlocals + max_stackdepth`.
+    obj_tmp0: u16,
+    /// Scratch ref register #1.
+    obj_tmp1: u16,
+    /// First ref register reserved for portal red-arg shuffling.
+    arg_regs_start: u16,
+    /// Ref register holding the `NULL` sentinel value.
+    null_ref_reg: u16,
+    /// `interp_jit.py:64` portal red `frame` register.
+    portal_frame_reg: u16,
+    /// `interp_jit.py:64` portal red `ec` register.
+    portal_ec_reg: u16,
+    /// Scratch int register #0.
+    int_tmp0: u16,
+    /// Scratch int register #1.
+    int_tmp1: u16,
+    /// Int register holding the current opcode value during dispatch.
+    op_code_reg: u16,
+}
+
+impl RegisterLayout {
+    /// Pure arithmetic over `code` — no allocation, no side effects.
+    /// Mirrors the constant block at the top of
+    /// `transform_graph_to_jitcode`.
+    fn compute(code: &CodeObject) -> Self {
+        let nlocals = code.varnames.len();
+        let ncells = pyre_interpreter::pyframe::ncells(code);
+        let stack_base_absolute = nlocals + ncells;
+        let max_stackdepth = code.max_stackdepth.max(1) as usize;
+        let stack_base = nlocals as u16;
+        let obj_tmp0 = (nlocals + max_stackdepth) as u16;
+        let obj_tmp1 = (nlocals + max_stackdepth + 1) as u16;
+        let arg_regs_start = (nlocals + max_stackdepth + 2) as u16;
+        let null_ref_reg = (nlocals + max_stackdepth + 10) as u16;
+        let portal_frame_reg = null_ref_reg + 1;
+        let portal_ec_reg = null_ref_reg + 2;
+        Self {
+            nlocals,
+            ncells,
+            stack_base_absolute,
+            max_stackdepth,
+            stack_base,
+            obj_tmp0,
+            obj_tmp1,
+            arg_regs_start,
+            null_ref_reg,
+            portal_frame_reg,
+            portal_ec_reg,
+            int_tmp0: 0,
+            int_tmp1: 1,
+            op_code_reg: 2,
+        }
+    }
+}
+
+/// Indices returned by `assembler.add_fn_ptr` for every blackhole
+/// helper fn pointer the dispatch loop references. Mirrors the slot
+/// shape of RPython's `_callinfo_for_oopspec`-derived index table —
+/// the helpers are interned in a fixed order so the dispatch handlers
+/// can capture the indices once and reuse them across emit sites.
+///
+/// PRE-EXISTING-ADAPTATION: the order matches the historical
+/// inline sequence (`call_fn`, then the per-opcode helpers, then the
+/// per-arity `call_fn_n`). Changing the order would shift every
+/// `assembler.add_fn_ptr` index — RPython's `assembler.see_raw_object`
+/// path has the same constraint.
+#[derive(Clone, Copy, Debug)]
+struct FnPtrIndices {
+    call_fn: u16,
+    load_global_fn: u16,
+    compare_fn: u16,
+    binary_op_fn: u16,
+    box_int_fn: u16,
+    truth_fn: u16,
+    load_const_fn: u16,
+    store_subscr_fn: u16,
+    build_list_fn: u16,
+    call_fn_0: u16,
+    call_fn_2: u16,
+    call_fn_3: u16,
+    call_fn_4: u16,
+    call_fn_5: u16,
+    call_fn_6: u16,
+    call_fn_7: u16,
+    call_fn_8: u16,
+}
+
+/// Register every blackhole helper fn pointer with the assembler in
+/// the canonical order. Returns the per-helper index table used by
+/// the dispatch loop.
+fn register_helper_fn_pointers(
+    assembler: &mut SSAReprEmitter,
+    cpu: &super::cpu::Cpu,
+) -> FnPtrIndices {
+    // RPython: CallControl manages fn addresses; assembler.finished()
+    // writes them into callinfocollection. pyre adds them inline so
+    // each handler can capture the index it needs.
+    let call_fn = assembler.add_fn_ptr(cpu.call_fn as *const ());
+    let load_global_fn = assembler.add_fn_ptr(cpu.load_global_fn as *const ());
+    let compare_fn = assembler.add_fn_ptr(cpu.compare_fn as *const ());
+    let binary_op_fn = assembler.add_fn_ptr(cpu.binary_op_fn as *const ());
+    let box_int_fn = assembler.add_fn_ptr(cpu.box_int_fn as *const ());
+    let truth_fn = assembler.add_fn_ptr(cpu.truth_fn as *const ());
+    let load_const_fn = assembler.add_fn_ptr(cpu.load_const_fn as *const ());
+    let store_subscr_fn = assembler.add_fn_ptr(cpu.store_subscr_fn as *const ());
+    let build_list_fn = assembler.add_fn_ptr(cpu.build_list_fn as *const ());
+    // Per-arity call helpers (appended AFTER existing fn_ptrs to preserve indices).
+    let call_fn_0 = assembler.add_fn_ptr(cpu.call_fn_0 as *const ());
+    let call_fn_2 = assembler.add_fn_ptr(cpu.call_fn_2 as *const ());
+    let call_fn_3 = assembler.add_fn_ptr(cpu.call_fn_3 as *const ());
+    let call_fn_4 = assembler.add_fn_ptr(cpu.call_fn_4 as *const ());
+    let call_fn_5 = assembler.add_fn_ptr(cpu.call_fn_5 as *const ());
+    let call_fn_6 = assembler.add_fn_ptr(cpu.call_fn_6 as *const ());
+    let call_fn_7 = assembler.add_fn_ptr(cpu.call_fn_7 as *const ());
+    let call_fn_8 = assembler.add_fn_ptr(cpu.call_fn_8 as *const ());
+    FnPtrIndices {
+        call_fn,
+        load_global_fn,
+        compare_fn,
+        binary_op_fn,
+        box_int_fn,
+        truth_fn,
+        load_const_fn,
+        store_subscr_fn,
+        build_list_fn,
+        call_fn_0,
+        call_fn_2,
+        call_fn_3,
+        call_fn_4,
+        call_fn_5,
+        call_fn_6,
+        call_fn_7,
+        call_fn_8,
+    }
+}
+
+/// Patch the per-`-live-` slots in `assembler` with the
+/// register-byte vectors derived from `liveness`. Returns `true` if
+/// any vector failed the 8-bit packing precondition (i.e. a register
+/// index ≥ 256), in which case the caller sets `has_abort` so the
+/// blackhole falls back to the interpreter.
+///
+/// RPython: `assembler.py:fill_live_args` is called inline by
+/// `assembler.assemble`'s `Insn::Live` branch; the overflow fallback
+/// is pyre-only (see `liveness_regs_to_u8_sorted`'s docs).
+fn fill_assembler_liveness(
+    assembler: &mut SSAReprEmitter,
+    liveness: &[LivenessInfo],
+    live_patches: &[(usize, usize)],
+) -> bool {
+    for (entry, &(_, patch_offset)) in liveness.iter().zip(live_patches.iter()) {
+        let live_i_bytes = liveness_regs_to_u8_sorted(&entry.live_i_regs);
+        let live_r_bytes = liveness_regs_to_u8_sorted(&entry.live_r_regs);
+        let live_f_bytes = liveness_regs_to_u8_sorted(&entry.live_f_regs);
+        if live_i_bytes.is_none() || live_r_bytes.is_none() || live_f_bytes.is_none() {
+            return true;
+        }
+        assembler.fill_live_args(
+            patch_offset,
+            &entry.live_i_regs,
+            &entry.live_r_regs,
+            &entry.live_f_regs,
+        );
+    }
+    false
+}
+
+/// RPython: `liveness.py` `compute_liveness(ssarepr)` — backward
+/// dataflow over the (here, linear) bytecode that produces the
+/// per-PC `LivenessInfo` triple consumed by both
+/// `get_list_of_active_boxes` (pyjitpl.py:177) and
+/// `consume_one_section` (resume.py:1381).
+///
+/// pyre runs the dataflow upstream in `pyre_jit_trace::state::liveness_for`
+/// and consumes its `LiveVars` here to materialise one
+/// `LivenessInfo` per Python PC. Unreachable PCs (the dataflow
+/// leaves `usize::MAX` sentinel from `liveness.rs:150`) get an
+/// empty entry so the downstream `liveness.zip(live_patches)`
+/// alignment in the dispatch finalisation stays one-to-one.
+///
+/// Pure function — reads only the precomputed `LiveVars` table and
+/// the depth-at-pc array; does not touch the assembler.
+fn compute_liveness_table(
+    code: &CodeObject,
+    num_instrs: usize,
+    nlocals: usize,
+    stack_base: u16,
+    depth_at_pc: &[u16],
+    pc_map: &[usize],
+) -> Vec<LivenessInfo> {
+    let live_vars = pyre_jit_trace::state::liveness_for(code as *const _);
+    let mut liveness = Vec::with_capacity(num_instrs);
+    for py_pc in 0..num_instrs {
+        let jit_pc = pc_map[py_pc];
+        let (live_r, live_i, live_f) = if live_vars.is_reachable(py_pc) {
+            let depth = depth_at_pc[py_pc];
+            // liveness.py: only live locals are included.
+            let mut live_r: Vec<u16> = (0..nlocals)
+                .filter(|&idx| live_vars.is_local_live(py_pc, idx))
+                .map(|idx| idx as u16)
+                .collect();
+            // Stack slots: live if index < depth at this PC.
+            for d in 0..depth {
+                live_r.push(stack_base + d);
+            }
+            (live_r, vec![], vec![])
+        } else {
+            (vec![], vec![], vec![])
+        };
+        liveness.push(LivenessInfo {
+            pc: jit_pc as u16,
+            live_i_regs: live_i,
+            live_r_regs: live_r,
+            live_f_regs: live_f,
+        });
+    }
+    liveness
+}
+
+/// Decode `code.exceptiontable` into the structures the dispatch loop
+/// consumes:
+/// - `catch_for_pc[py_pc]` — `Some(landing_label)` for every PC that
+///   falls inside an exception range, mapping to the landing label
+///   the dispatch loop will branch to on raise.
+/// - `catch_sites` — one entry per active range, holding the handler
+///   PC, the saved stack depth, and the `push_lasti` flag. The
+///   dispatch loop emits a landing block per entry at the end.
+/// - `handler_depth_at[handler_pc]` — the stack depth Python sets on
+///   exception-handler entry (`entry.depth + 1` plus another `+1`
+///   when `push_lasti`); used by the dispatch loop to fix
+///   `current_depth` at the handler's first instruction.
+///
+/// PRE-EXISTING-ADAPTATION: RPython has no analog because RPython
+/// flow graphs already carry exception-handling links; pyre's input
+/// is raw CPython bytecode + the packed exception table, so this
+/// preprocessing step is pyre-specific.
+fn decode_exception_catch_sites(
+    assembler: &mut SSAReprEmitter,
+    code: &CodeObject,
+    num_instrs: usize,
+) -> (
+    Vec<Option<u16>>,
+    Vec<ExceptionCatchSite>,
+    std::collections::HashMap<usize, u16>,
+) {
+    let exception_entries =
+        pyre_interpreter::bytecode::decode_exception_table(&code.exceptiontable);
+    let mut catch_for_pc: Vec<Option<u16>> = vec![None; num_instrs];
+    let mut catch_sites: Vec<ExceptionCatchSite> = Vec::new();
+    for py_pc in 0..num_instrs {
+        let Some(entry) = exception_entries
+            .iter()
+            .find(|entry| py_pc >= entry.start as usize && py_pc < entry.end as usize)
+        else {
+            continue;
+        };
+        let handler_py_pc = entry.target as usize;
+        if handler_py_pc >= num_instrs {
+            continue;
+        }
+        let landing_label = assembler.new_label();
+        catch_for_pc[py_pc] = Some(landing_label);
+        catch_sites.push(ExceptionCatchSite {
+            landing_label,
+            handler_py_pc,
+            stack_depth: entry.depth,
+            push_lasti: entry.push_lasti,
+            lasti_py_pc: py_pc,
+        });
+    }
+    let handler_depth_at: std::collections::HashMap<usize, u16> = exception_entries
+        .iter()
+        .map(|e| {
+            let extra = if e.push_lasti { 1u16 } else { 0 };
+            (e.target as usize, e.depth as u16 + extra + 1)
+        })
+        .collect();
+    (catch_for_pc, catch_sites, handler_depth_at)
+}
+
 /// rpython/jit/codewriter/liveness.py:139 "we encode the bitsets of which of
 /// the 256 registers are live" — PyPy's compact liveness encoding treats a
 /// register index as a single byte and assumes the precondition holds. PyPy
@@ -300,31 +603,28 @@ impl CodeWriter {
         w_code: *const (),
         merge_point_pc: Option<usize>,
     ) -> PyJitCode {
-        let nlocals = code.varnames.len();
-        // pyframe.py:111 `self.valuestackdepth = code.co_nlocals + ncellvars
-        // + nfreevars`. pyre's `PyFrame.locals_cells_stack_w` uses the same
-        // layout: [locals(nlocals), cells(ncells), stack(grows upward)].
-        // `stack_base_absolute` is the array index where the operand stack
-        // begins — the baseline for `frame.valuestackdepth`.
-        let ncells = pyre_interpreter::pyframe::ncells(code);
-        let stack_base_absolute = nlocals + ncells;
-        // regalloc.py parity: all values (locals + stack temporaries) live in
-        // typed register files. The value stack is mapped to ref registers
-        // starting at `stack_base`.
-        let max_stackdepth = code.max_stackdepth.max(1) as usize;
-        let stack_base = nlocals as u16;
-        let obj_tmp0 = (nlocals + max_stackdepth) as u16;
-        let obj_tmp1 = (nlocals + max_stackdepth + 1) as u16;
-        let arg_regs_start = (nlocals + max_stackdepth + 2) as u16;
-        let null_ref_reg = (nlocals + max_stackdepth + 10) as u16;
-        // interp_jit.py:64 parity: dedicated ref registers for portal reds.
-        // reds = ['frame', 'ec'] → two registers beyond null_ref_reg.
-        let portal_frame_reg = null_ref_reg + 1;
-        let portal_ec_reg = null_ref_reg + 2;
-
-        let int_tmp0 = 0u16;
-        let int_tmp1 = 1u16;
-        let op_code_reg = 2u16;
+        // RPython codewriter.py:46-48 `regallocs[kind] = perform_register_allocation(graph, kind)`.
+        // pyre's regalloc is trivial — fast locals occupy the bottom of
+        // the ref register file and the operand stack stacks above
+        // them — so the "allocation" reduces to a `RegisterLayout`
+        // computed from `code.varnames` / `code.max_stackdepth`.
+        let layout = RegisterLayout::compute(code);
+        let RegisterLayout {
+            nlocals,
+            ncells: _,
+            stack_base_absolute,
+            max_stackdepth,
+            stack_base,
+            obj_tmp0,
+            obj_tmp1,
+            arg_regs_start,
+            null_ref_reg,
+            portal_frame_reg,
+            portal_ec_reg,
+            int_tmp0,
+            int_tmp1,
+            op_code_reg,
+        } = layout;
         // jtransform.py: virtualizable field indices for getfield_vable_*
         // interp_jit.py:25-31 / virtualizable_spec.rs parity:
         //   0=last_instr, 1=code, 2=vsd, 3=debugdata, 4=lastblock, 5=namespace
@@ -355,28 +655,28 @@ impl CodeWriter {
         assembler.ensure_r_regs(portal_ec_reg + 1);
         assembler.ensure_i_regs(op_code_reg + 1);
 
-        // Register helper function pointers
-        // RPython: CallControl manages fn addresses; assembler.finished()
-        // writes them into callinfocollection.
-        let cpu = self.cpu();
-        let call_fn_idx = assembler.add_fn_ptr(cpu.call_fn as *const ());
-        let load_global_fn_idx = assembler.add_fn_ptr(cpu.load_global_fn as *const ());
-        let compare_fn_idx = assembler.add_fn_ptr(cpu.compare_fn as *const ());
-        let binary_op_fn_idx = assembler.add_fn_ptr(cpu.binary_op_fn as *const ());
-        let box_int_fn_idx = assembler.add_fn_ptr(cpu.box_int_fn as *const ());
-        let truth_fn_idx = assembler.add_fn_ptr(cpu.truth_fn as *const ());
-        let load_const_fn_idx = assembler.add_fn_ptr(cpu.load_const_fn as *const ());
-        let store_subscr_fn_idx = assembler.add_fn_ptr(cpu.store_subscr_fn as *const ());
-        let build_list_fn_idx = assembler.add_fn_ptr(cpu.build_list_fn as *const ());
-        // Per-arity call helpers (appended AFTER existing fn_ptrs to preserve indices).
-        let call_fn_0_idx = assembler.add_fn_ptr(cpu.call_fn_0 as *const ());
-        let call_fn_2_idx = assembler.add_fn_ptr(cpu.call_fn_2 as *const ());
-        let call_fn_3_idx = assembler.add_fn_ptr(cpu.call_fn_3 as *const ());
-        let call_fn_4_idx = assembler.add_fn_ptr(cpu.call_fn_4 as *const ());
-        let call_fn_5_idx = assembler.add_fn_ptr(cpu.call_fn_5 as *const ());
-        let call_fn_6_idx = assembler.add_fn_ptr(cpu.call_fn_6 as *const ());
-        let call_fn_7_idx = assembler.add_fn_ptr(cpu.call_fn_7 as *const ());
-        let call_fn_8_idx = assembler.add_fn_ptr(cpu.call_fn_8 as *const ());
+        // Register helper fn pointers in the canonical order; the
+        // returned struct names every index so the dispatch handlers
+        // below can reference them by field instead of an opaque local.
+        let FnPtrIndices {
+            call_fn: call_fn_idx,
+            load_global_fn: load_global_fn_idx,
+            compare_fn: compare_fn_idx,
+            binary_op_fn: binary_op_fn_idx,
+            box_int_fn: box_int_fn_idx,
+            truth_fn: truth_fn_idx,
+            load_const_fn: load_const_fn_idx,
+            store_subscr_fn: store_subscr_fn_idx,
+            build_list_fn: build_list_fn_idx,
+            call_fn_0: call_fn_0_idx,
+            call_fn_2: call_fn_2_idx,
+            call_fn_3: call_fn_3_idx,
+            call_fn_4: call_fn_4_idx,
+            call_fn_5: call_fn_5_idx,
+            call_fn_6: call_fn_6_idx,
+            call_fn_7: call_fn_7_idx,
+            call_fn_8: call_fn_8_idx,
+        } = register_helper_fn_pointers(&mut assembler, self.cpu());
 
         // RPython flatten.py: pre-create labels for each block.
         // Python bytecodes are linear, so each instruction index gets a label.
@@ -386,31 +686,8 @@ impl CodeWriter {
             labels.push(assembler.new_label());
         }
 
-        let exception_entries =
-            pyre_interpreter::bytecode::decode_exception_table(&code.exceptiontable);
-        let mut catch_for_pc: Vec<Option<u16>> = vec![None; num_instrs];
-        let mut catch_sites: Vec<ExceptionCatchSite> = Vec::new();
-        for py_pc in 0..num_instrs {
-            let Some(entry) = exception_entries
-                .iter()
-                .find(|entry| py_pc >= entry.start as usize && py_pc < entry.end as usize)
-            else {
-                continue;
-            };
-            let handler_py_pc = entry.target as usize;
-            if handler_py_pc >= num_instrs {
-                continue;
-            }
-            let landing_label = assembler.new_label();
-            catch_for_pc[py_pc] = Some(landing_label);
-            catch_sites.push(ExceptionCatchSite {
-                landing_label,
-                handler_py_pc,
-                stack_depth: entry.depth,
-                push_lasti: entry.push_lasti,
-                lasti_py_pc: py_pc,
-            });
-        }
+        let (catch_for_pc, catch_sites, handler_depth_at) =
+            decode_exception_catch_sites(&mut assembler, code, num_instrs);
 
         // interp_jit.py:118 `pypyjitdriver.can_enter_jit(...)` is called in
         // `jump_absolute` (`jumpto < next_instr` branch), i.e. at each
@@ -421,20 +698,6 @@ impl CodeWriter {
         // `JumpBackward` opcodes and record their targets; each target PC
         // becomes a `loop_header` site.
         let loop_header_pcs = find_loop_header_pcs(code);
-
-        // Exception table: handler target PC → handler stack depth.
-        // Python sets the stack depth to handler.depth (+1 if push_lasti)
-        // at exception handler entry. Used to correct current_depth at
-        // non-linear control flow points.
-        let handler_depth_at: std::collections::HashMap<usize, u16> = {
-            exception_entries
-                .iter()
-                .map(|e| {
-                    let extra = if e.push_lasti { 1u16 } else { 0 };
-                    (e.target as usize, e.depth as u16 + extra + 1)
-                })
-                .collect()
-        };
 
         // pc_map: Python PC → JitCode byte offset
         let mut pc_map = vec![0usize; num_instrs];
@@ -1610,87 +1873,23 @@ impl CodeWriter {
         let mut has_abort = assembler.has_abort_flag();
 
         // liveness.py parity: generate LivenessInfo at each bytecode PC.
-        // RPython: compute_liveness() runs backward dataflow on SSARepr,
-        // marking only actually-live registers. Both get_list_of_active_boxes
-        // (pyjitpl.py:177) and consume_one_section (resume.py:1381) use the
-        // same all_liveness data. In pyre, LiveVars::compute provides the
-        // equivalent backward analysis on Python bytecodes.
-        let liveness: Vec<LivenessInfo> = {
-            let live_vars = pyre_jit_trace::state::liveness_for(code as *const _);
-            let mut liveness = Vec::with_capacity(num_instrs);
-            for py_pc in 0..num_instrs {
-                let jit_pc = pc_map[py_pc];
-                // RPython flatten_graph() emits blocks only for reachable
-                // control-flow targets. Pyre's codewriter iterates every
-                // py_pc linearly for layout (so `live_patches` has one
-                // entry per pc), but must not generate liveness for
-                // bytecodes the dataflow analysis never reached — those
-                // pcs carry the `usize::MAX` sentinel from
-                // liveness.rs:150 and would truncate into a 65535 stack
-                // depth, blowing past the 256-register limit and
-                // poisoning the entire jitcode with `liveness_overflow`.
-                // Emit an empty LivenessInfo for unreachable pcs to keep
-                // the `liveness.zip(live_patches)` alignment intact.
-                let (live_r, live_i, live_f) = if live_vars.is_reachable(py_pc) {
-                    let depth = depth_at_pc[py_pc];
-                    // liveness.py: only live locals are included.
-                    let mut live_r: Vec<u16> = (0..nlocals)
-                        .filter(|&idx| live_vars.is_local_live(py_pc, idx))
-                        .map(|idx| idx as u16)
-                        .collect();
-                    // Stack slots: live if index < depth at this PC.
-                    for d in 0..depth {
-                        live_r.push(stack_base + d);
-                    }
-                    (live_r, vec![], vec![])
-                } else {
-                    (vec![], vec![], vec![])
-                };
-                liveness.push(LivenessInfo {
-                    pc: jit_pc as u16,
-                    live_i_regs: live_i,
-                    live_r_regs: live_r,
-                    live_f_regs: live_f,
-                });
-            }
-            liveness
-        };
+        // See `compute_liveness_table` for the per-pc reachable / live
+        // local + stack-depth derivation.
+        let liveness =
+            compute_liveness_table(code, num_instrs, nlocals, stack_base, &depth_at_pc, &pc_map);
 
-        // liveness.py:19-23 parity: fill each SSARepr Insn::Live with the
-        // live register triple computed above. Assembler::assemble's
-        // encode_liveness_info (routed through
-        // pyre_jit_trace::state::intern_liveness) interns the bytes and
-        // emits the BC_LIVE opcode plus 2-byte global offset.
-        //
-        // Overflow detection matches the earlier direct-builder loop:
-        // if liveness_regs_to_u8_sorted rejects a register >= 256 or
-        // intern_liveness runs out of u16 offset space, mark the jitcode
-        // unexecutable (has_abort = true) so the caller falls back to
-        // the interpreter. See liveness_regs_to_u8_sorted's doc comment.
-        {
-            let mut liveness_overflow = false;
-            for (entry, &(_, patch_offset)) in liveness.iter().zip(live_patches.iter()) {
-                let live_i_bytes = liveness_regs_to_u8_sorted(&entry.live_i_regs);
-                let live_r_bytes = liveness_regs_to_u8_sorted(&entry.live_r_regs);
-                let live_f_bytes = liveness_regs_to_u8_sorted(&entry.live_f_regs);
-                if live_i_bytes.is_none() || live_r_bytes.is_none() || live_f_bytes.is_none() {
-                    liveness_overflow = true;
-                    break;
-                }
-                assembler.fill_live_args(
-                    patch_offset,
-                    &entry.live_i_regs,
-                    &entry.live_r_regs,
-                    &entry.live_f_regs,
-                );
-            }
-            if liveness_overflow {
-                // Propagate to the builder so Assembler::assemble can
-                // skip its check_result assertion — the JitCode produced
-                // here will never reach the blackhole anyway.
-                assembler.set_abort_flag(true);
-                has_abort = true;
-            }
+        // liveness.py:19-23 parity: patch each SSARepr `-live-` slot
+        // with the per-PC register triple. See
+        // `fill_assembler_liveness` for the 8-bit overflow fallback —
+        // a register index ≥ 256 marks the jitcode unexecutable
+        // (has_abort = true) so the blackhole falls back to the
+        // interpreter.
+        if fill_assembler_liveness(&mut assembler, &liveness, &live_patches) {
+            // Propagate to the builder so Assembler::assemble can
+            // skip its check_result assertion — the JitCode produced
+            // here will never reach the blackhole anyway.
+            assembler.set_abort_flag(true);
+            has_abort = true;
         }
 
         for site in catch_sites {
@@ -1710,6 +1909,56 @@ impl CodeWriter {
             emit_goto!(ssarepr, assembler, labels, site.handler_py_pc);
         }
 
+        // codewriter.py:62-72 step 4 — assemble the SSARepr into an
+        // owned JitCode, translate pc_map insn indices to byte offsets,
+        // and stamp the per-graph metadata. See `Self::finalize_jitcode`.
+        self.finalize_jitcode(
+            assembler,
+            code,
+            pc_map,
+            depth_at_pc,
+            liveness,
+            portal_frame_reg,
+            portal_ec_reg,
+            is_portal,
+            has_abort,
+            merge_point_pc,
+        )
+    }
+
+    /// RPython: `codewriter.py:62-72` step 4 — produce the
+    /// owned `JitCode` from the populated `SSARepr` and stamp the
+    /// per-graph metadata.
+    ///
+    /// ```python
+    /// num_regs = {kind: ... for kind in KINDS}
+    /// self.assembler.assemble(ssarepr, jitcode, num_regs)
+    /// jitcode.index = index
+    /// ```
+    ///
+    /// pyre's combined step:
+    ///   - `SSAReprEmitter::finish_with_positions` runs the
+    ///     `assembler.py:assemble` analog through the shared
+    ///     `self.assembler`, returning the owned `JitCode` plus the
+    ///     translated `pc_map` byte offsets.
+    ///   - jitdriver_sd / calldescr / fnaddr are stamped onto the
+    ///     `JitCode` (call.py:148, call.py:174-187, call.py:167).
+    ///   - `PyJitCodeMetadata` is bundled with the ref-count-stable
+    ///     `Arc<JitCode>` plus the pyre-only `has_abort` /
+    ///     `merge_point_pc` fields into the returned `PyJitCode`.
+    fn finalize_jitcode(
+        &self,
+        assembler: SSAReprEmitter,
+        code: &CodeObject,
+        pc_map: Vec<usize>,
+        depth_at_pc: Vec<u16>,
+        liveness: Vec<LivenessInfo>,
+        portal_frame_reg: u16,
+        portal_ec_reg: u16,
+        is_portal: bool,
+        has_abort: bool,
+        merge_point_pc: Option<usize>,
+    ) -> PyJitCode {
         // pc_map[py_pc] currently holds SSARepr insn indices (returned by
         // SSAReprEmitter::current_pos()). Translate them to JitCode byte
         // offsets via ssarepr.insns_pos, populated during
@@ -1719,14 +1968,11 @@ impl CodeWriter {
         // `codewriter.py:67` `self.assembler.assemble(ssarepr, jitcode, num_regs)`
         // parity: borrow the CodeWriter's single Assembler so
         // `all_liveness` / `num_liveness_ops` continue to accumulate
-        // across every jitcode compiled on this thread. The throwaway
-        // `SSAReprEmitter::finish_and_translate_positions()` path is
-        // retained only for unit tests.
+        // across every jitcode compiled on this thread.
         let (mut jitcode, pc_map_bytes) = {
             let mut asm = self.assembler.borrow_mut();
             assembler.finish_with_positions(&mut *asm, &pc_map)
         };
-        let pc_map = pc_map_bytes;
 
         // call.py:148 grab_initial_jitcodes: jd.mainjitcode.jitdriver_sd = jd
         // pyre uses index 0 (single jitdriver) for portal jitcodes.
@@ -1742,13 +1988,12 @@ impl CodeWriter {
         // does not carry PyFrame layout data; keep it in PyJitCodeMetadata
         // and attach it to BlackholeInterpreter setup when pyre needs it.
         let frame_stack_base = code.varnames.len() + pyre_interpreter::pyframe::ncells(code);
-
         // call.py:167-169 jitcode.fnaddr = getfunctionptr(graph).
         // pyre: all Python functions go through the single portal runner.
         jitcode.fnaddr = crate::call_jit::bh_portal_runner as *const () as usize as i64;
 
         let metadata = PyJitCodeMetadata {
-            pc_map,
+            pc_map: pc_map_bytes,
             depth_at_py_pc: depth_at_pc,
             portal_frame_reg,
             portal_ec_reg,

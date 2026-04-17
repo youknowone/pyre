@@ -1150,16 +1150,26 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
     let (driver, info) = driver_pair();
     // jitcode.py:18: `jitcode.jitdriver_sd is not None` for portals.
     //
-    // PRE-EXISTING-ADAPTATION: the obvious port is
-    // `codewriter::is_portal(code)` which tests whether the CodeObject
-    // has any `JUMP_BACKWARD` targets — the exact condition that
-    // `transform_graph_to_jitcode` uses to set `jitdriver_sd`. Routing
-    // through that helper here, however, makes module-level code
-    // (`<module>`) with a hot top-level loop qualify as a portal, which
-    // regresses `fib_recursive`/`nbody`/`list_*` benchmarks through
-    // jit_merge_point_keyed paths that expect function-scope frames.
-    // Until the portal/interpreter split is ported to pyre's dispatch,
-    // the module-level code is excluded by name.
+    // pyre's eval-side `is_portal` is BROADER than the codewriter-side
+    // `codewriter::is_portal` (JUMP_BACKWARD scan): pyre routes every
+    // function-scope CodeObject through `jit_merge_point_hook` and
+    // `can_enter_jit` so that recursive calls into a previously-traced
+    // function reach `maybe_compile_and_run` even before the function's
+    // own loop runs. RPython does not need this because portals are an
+    // explicit registry (`jitdrivers_sd`), not an inferred property.
+    //
+    // The two narrowing alternatives both regress benchmarks:
+    //   - `codewriter::is_portal(code)` alone makes module-level
+    //     `<module>` with a top-level loop into a portal, breaking
+    //     `fib_recursive`/`nbody`/`list_*` jit_merge_point_keyed paths
+    //     (frames are not function-scope).
+    //   - `codewriter::is_portal(code) && name != "<module>"` skips
+    //     non-loop function frames and drops the recursive-call entry
+    //     point, surfacing as a TLS-drop panic in
+    //     `test_inline_residual_user_call_with_many_args_stays_correct`.
+    //
+    // Until pyre's portal/interpreter split is ported, the eval-side
+    // check stays pyre-specific: every non-module CodeObject is a portal.
     let is_portal: bool = &*code.obj_name != "<module>";
     // interp_jit.py:66 — next_instr, pycode are greens (managed by jit_merge_point).
     // No explicit promote needed; the JitDriver green-key mechanism handles this.
