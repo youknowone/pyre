@@ -2895,6 +2895,19 @@ impl JitState for PyreJitState {
     }
 
     fn driver_descriptor(&self, _meta: &Self::Meta) -> Option<JitDriverStaticData> {
+        // pypy/module/pypyjit/interp_jit.py:67-70 PyPyJitDriver:
+        //   reds = ['frame', 'ec']
+        //   greens = ['next_instr', 'is_being_profiled', 'pycode']
+        //   virtualizables = ['frame']
+        //
+        // Returns None until the CA emission path is migrated to the
+        // reds-only shape. Activating this triggers
+        // `patch_new_loop_to_load_virtualizable_fields` (compile.py:504-511),
+        // which reduces the compiled callee loop's inputargs to
+        // `[frame]`. That breaks the caller-side `CallAssemblerR` whose
+        // `VableExpansion` still passes the 8-arg expanded shape to the
+        // callee (rewrite.py:672-683 contract: CA arg count must match
+        // target num_red_args). Both ends must flip together.
         None
     }
 

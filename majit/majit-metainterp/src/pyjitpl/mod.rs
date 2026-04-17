@@ -1928,6 +1928,110 @@ impl<M: Clone> MetaInterp<M> {
         self.compile_loop(jump_args, meta)
     }
 
+    /// compile.py:504-511 `send_loop_to_backend()` virtualizable hook:
+    ///
+    /// ```python
+    /// vinfo = jitdriver_sd.virtualizable_info
+    /// if vinfo is not None:
+    ///     vable = orig_inpargs[jitdriver_sd.index_of_virtualizable].getref_base()
+    ///     patch_new_loop_to_load_virtualizable_fields(loop, jitdriver_sd, vable)
+    /// ```
+    ///
+    /// RPython runs this unconditionally for every loop (both JUMP-terminated
+    /// and FINISH-terminated) before the loop goes into `cpu.compile_loop`.
+    /// Per-array lengths come from `vinfo.get_array_length(vable, arrayindex)`
+    /// at compile.py:443 — a direct read of the concrete virtualizable heap
+    /// object, not a synthesis from `len(inputargs)`.
+    ///
+    /// `self.vable_ptr` holds the same pointer RPython's
+    /// `orig_inpargs[...].getref_base()` produces: it is set at trace-start
+    /// by `JitDriverDispatch::sync_before` (jitdriver.rs:1693) from the live
+    /// virtualizable reachable on the interpreter state, and
+    /// `trace_entry_vable_lengths(info)` reads the lengths back out via
+    /// `VirtualizableInfo::get_array_length(vable, i)` in
+    /// virtualizable.rs:695-711.
+    ///
+    /// Helper name matches compile.py so audits can grep the same symbol on
+    /// both sides.
+    ///
+    /// **Parity gap — JUMP-terminated paths**: RPython's `loop.inputargs` is
+    /// the preamble-entry contract; the closing JUMP targets the
+    /// TargetToken's internal LABEL whose arity is independent. In pyre the
+    /// simple-loop / retry-without-unroll paths inline
+    /// `LABEL(inputargs)` at `compiled_ops[0]` and close with `JUMP(inputargs)`;
+    /// truncating `inputargs` in those paths would desync LABEL/JUMP arity
+    /// until the tracer stops threading expanded vable fields through the
+    /// back-edge JUMP (separate pyre-tracer epic). For now this helper is
+    /// only invoked from `finish_and_compile`, where no JUMP exists.
+    pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
+        &self,
+        inputargs: &mut Vec<InputArg>,
+        ops: &mut Vec<Op>,
+        constants: &mut HashMap<u32, i64>,
+        constant_types: &mut HashMap<u32, Type>,
+        driver_descriptor: Option<&crate::jitdriver::JitDriverStaticData>,
+    ) {
+        let Some(vinfo) = self.virtualizable_info.as_ref() else {
+            return;
+        };
+        let Some(driver) = driver_descriptor else {
+            return;
+        };
+        let Some(index_of_vable) = driver.virtualizable_arg_index() else {
+            return;
+        };
+        let num_red_args = driver.num_reds();
+        if inputargs.len() <= num_red_args {
+            // Trace was never expanded (no virtualizable fields live at entry).
+            return;
+        }
+        // compile.py:443 `vinfo.get_array_length(vable, arrayindex)` — the
+        // concrete virtualizable heap object is the sole source of truth
+        // for every array length. Read each array field directly via
+        // `VirtualizableInfo::get_array_length(obj_ptr, i)`
+        // (virtualizable.rs:695-711). RPython never consults a trace-entry
+        // cache here; any layout that cannot expose its length on the heap
+        // object must be fixed inside `VirtualizableInfo` itself (to match
+        // `vinfo.get_array_length`'s universal contract), not worked around
+        // in this helper.
+        //
+        // Safety: `self.vable_ptr` is seeded at trace-start by
+        // `JitDriverDispatch::sync_before` from the live virtualizable
+        // reachable on the interpreter state (jitdriver.rs:1693). RPython's
+        // counterpart `orig_inpargs[jitdriver_sd.index_of_virtualizable]
+        // .getref_base()` (compile.py:510) also demands a valid pointer at
+        // this point, so bail early for a null pointer rather than silently
+        // dropping the reload prolog.
+        if self.vable_ptr.is_null() {
+            return;
+        }
+        let array_lengths: Vec<usize> = (0..vinfo.array_fields.len())
+            .map(|i| unsafe { vinfo.get_array_length(self.vable_ptr, i) })
+            .collect();
+        compile::patch_new_loop_to_load_virtualizable_fields(
+            ops,
+            inputargs,
+            vinfo,
+            &array_lengths,
+            num_red_args,
+            index_of_vable,
+            constants,
+            constant_types,
+        );
+        // compile.py:425-461 `patch_new_loop_to_load_virtualizable_fields`
+        // only touches `loop.inputargs`; it does not rewrite any LABEL/JUMP
+        // inside `loop.operations`. RPython keeps those arities independent
+        // because the entry LABEL is synthesized by the backend from
+        // `loop.inputargs` and the closing JUMP targets a separate
+        // TargetToken. pyre's JUMP-terminated paths currently couple them
+        // (see `MetaInterp::compile_loop` simple-loop path that inlines
+        // `LABEL(inputargs)` at `compiled_ops[0]`), which is a separate
+        // pyre-tracer divergence resolved by threading only red_args across
+        // the back-edge — not by this helper. Until that tracer work lands
+        // the only supported caller is the finish-terminated path, which
+        // has neither LABEL nor JUMP in `optimized_ops`.
+    }
+
     /// Close the current trace, optimize, and compile.
     ///
     /// `jump_args` are the symbolic values (OpRefs) at the end of the loop,
@@ -2015,6 +2119,14 @@ impl<M: Clone> MetaInterp<M> {
         }
 
         let vable_config = self.current_virtualizable_optimizer_config();
+        // compile.py:504-511 `send_loop_to_backend` needs the driver descriptor
+        // to call `patch_new_loop_to_load_virtualizable_fields` below. Capture
+        // it before the `self.tracing.take()` consumes the context.
+        let driver_descriptor = self
+            .tracing
+            .as_ref()
+            .and_then(|ctx| ctx.driver_descriptor())
+            .cloned();
         self.force_finish_trace = false;
         let mut ctx = self.tracing.take().unwrap();
         ctx.apply_replacements();
@@ -2308,7 +2420,7 @@ impl<M: Clone> MetaInterp<M> {
         // the traced virtualizable values in the live-input layout, and
         // `vable_*` operations keep the hot path on boxes instead of
         // re-materializing `GetfieldRaw*`/`GetarrayitemRaw*` entry ops.
-        let (inputargs, optimized_ops) = (inputargs, optimized_ops);
+        let (mut inputargs, optimized_ops) = (inputargs, optimized_ops);
         let mut compiled_ops =
             compile::normalize_closing_jump_args(optimized_ops, &constants, final_num_inputs);
 
@@ -2338,11 +2450,6 @@ impl<M: Clone> MetaInterp<M> {
 
         // resume.py parity: rd_numb is now produced inline during optimization
         // (ctx.emit → store_final_boxes_in_guard) rather than post-assembly.
-
-        let compiled_constants = constants.clone();
-        let compiled_constant_types = constant_types.clone();
-        self.backend.set_constants(constants);
-        self.backend.set_constant_types(constant_types.clone());
 
         // Use pre-allocated token number if available (for self-recursion
         // support), otherwise allocate a fresh one.
@@ -2389,6 +2496,23 @@ impl<M: Clone> MetaInterp<M> {
         // virtualizable.py:86 read_boxes: set num_scalar_inputargs on token
         // so the backend can find the first local in force_fn paths.
         token.num_scalar_inputargs = self.num_scalar_inputargs;
+        // compile.py:504-511 `send_loop_to_backend` invokes
+        // `patch_new_loop_to_load_virtualizable_fields` for every loop — the
+        // JUMP-terminated unroll/retry paths run the same hook as the
+        // FINISH-terminated `finish_and_compile`. Apply before the backend
+        // takes ownership of `constants` / `constant_types` so the reload
+        // prolog's ConstInt subscripts land in the same pool.
+        self.patch_new_loop_to_load_virtualizable_fields(
+            &mut inputargs,
+            &mut compiled_ops,
+            &mut constants,
+            &mut constant_types,
+            driver_descriptor.as_ref(),
+        );
+        let compiled_constants = constants.clone();
+        let compiled_constant_types = constant_types.clone();
+        self.backend.set_constants(constants);
+        self.backend.set_constant_types(constant_types.clone());
         let compile_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.backend
                 .compile_loop(&inputargs, &compiled_ops, &mut token)
@@ -2935,6 +3059,14 @@ impl<M: Clone> MetaInterp<M> {
             Some(ctx) => ctx.green_key,
             None => return false,
         };
+        // compile.py:504-511 `send_loop_to_backend` needs the driver
+        // descriptor to call `patch_new_loop_to_load_virtualizable_fields`.
+        // Capture it before `self.tracing.take()` consumes the context.
+        let driver_descriptor = self
+            .tracing
+            .as_ref()
+            .and_then(|ctx| ctx.driver_descriptor())
+            .cloned();
 
         let vable_config = self.current_virtualizable_optimizer_config();
         self.force_finish_trace = false;
@@ -3046,7 +3178,7 @@ impl<M: Clone> MetaInterp<M> {
 
         let root_inputargs =
             root_loop_inputargs_from_optimizer(&partial.inputargs, final_num_inputs);
-        let (inputargs, combined_ops) =
+        let (mut inputargs, combined_ops) =
             match normalize_root_loop_entry_contract(root_inputargs, combined_ops) {
                 Ok(normalized) => normalized,
                 Err((expected, actual)) => {
@@ -3060,7 +3192,7 @@ impl<M: Clone> MetaInterp<M> {
                 }
             };
 
-        let combined_ops =
+        let mut combined_ops =
             compile::normalize_closing_jump_args(combined_ops, &constants, final_num_inputs);
 
         if crate::majit_log_enabled() {
@@ -3077,6 +3209,15 @@ impl<M: Clone> MetaInterp<M> {
             return false;
         }
 
+        // compile.py:504-511 `send_loop_to_backend` — apply the virtualizable
+        // reload prolog and truncate LABEL/JUMP before the backend snapshot.
+        self.patch_new_loop_to_load_virtualizable_fields(
+            &mut inputargs,
+            &mut combined_ops,
+            &mut constants,
+            &mut constant_types,
+            driver_descriptor.as_ref(),
+        );
         let compiled_constants = constants.clone();
         let compiled_constant_types = constant_types.clone();
         self.backend.set_constants(constants);
@@ -3260,6 +3401,12 @@ impl<M: Clone> MetaInterp<M> {
     ) {
         // Cache vable_config before take() clears self.tracing.
         let vable_config = self.current_virtualizable_optimizer_config();
+        // Cache driver descriptor before ctx is partially consumed below.
+        let driver_descriptor = self
+            .tracing
+            .as_ref()
+            .and_then(|ctx| ctx.driver_descriptor())
+            .cloned();
         self.force_finish_trace = false;
         let mut ctx = self.tracing.take().unwrap();
         ctx.apply_replacements();
@@ -3411,7 +3558,7 @@ impl<M: Clone> MetaInterp<M> {
         self.backend.set_next_trace_id(trace_id);
         self.backend.set_next_header_pc(green_key);
 
-        let final_num_inputs = optimizer.final_num_inputs();
+        let mut final_num_inputs = optimizer.final_num_inputs();
         let mut inputargs = trace.inputargs.clone();
         while inputargs.len() < final_num_inputs {
             inputargs.push(majit_ir::InputArg {
@@ -3447,6 +3594,20 @@ impl<M: Clone> MetaInterp<M> {
         // callee without adapt-live, so the runtime types at guard failure
         // are the original Ref types. The no-snapshot fallback handles
         // types correctly via MetaFailDescr.
+
+        // compile.py:504-511 send_loop_to_backend — unconditional virtualizable
+        // field reload for every loop. See
+        // `MetaInterp::patch_new_loop_to_load_virtualizable_fields` above; the
+        // helper is shared with the JUMP-terminated `compile_loop` path so both
+        // paths reduce `loop.inputargs` to `num_red_args` identically.
+        self.patch_new_loop_to_load_virtualizable_fields(
+            &mut inputargs,
+            &mut optimized_ops,
+            &mut constants,
+            &mut constant_types,
+            driver_descriptor.as_ref(),
+        );
+        let _ = final_num_inputs;
 
         let compiled_constants = constants.clone();
         let compiled_constant_types = constant_types.clone();
@@ -3593,6 +3754,13 @@ impl<M: Clone> MetaInterp<M> {
     /// attach_procedure_to_interp), None on failure.
     pub fn compile_simple_loop(&mut self, meta: M) -> Option<u64> {
         let vable_config = self.current_virtualizable_optimizer_config();
+        // compile.py:504-511 `send_loop_to_backend` needs the driver
+        // descriptor. Capture it before `self.tracing.take()` consumes ctx.
+        let driver_descriptor = self
+            .tracing
+            .as_ref()
+            .and_then(|ctx| ctx.driver_descriptor())
+            .cloned();
         self.force_finish_trace = false;
         let mut ctx = match self.tracing.take() {
             Some(ctx) => ctx,
@@ -3732,6 +3900,15 @@ impl<M: Clone> MetaInterp<M> {
         label_op.descr = Some(target_token.as_jump_target_descr());
         compiled_ops.insert(0, label_op);
 
+        // compile.py:504-511 `send_loop_to_backend` — virtualizable reload
+        // prolog and LABEL/JUMP truncation before the backend snapshot.
+        self.patch_new_loop_to_load_virtualizable_fields(
+            &mut inputargs,
+            &mut compiled_ops,
+            &mut constants,
+            &mut constant_types,
+            driver_descriptor.as_ref(),
+        );
         let compiled_constants = constants.clone();
         let compiled_constant_types = constant_types.clone();
         self.backend.set_constants(constants);

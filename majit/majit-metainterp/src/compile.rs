@@ -1195,6 +1195,224 @@ pub(crate) fn normalize_closing_jump_args(
     ops
 }
 
+/// `rpython/jit/metainterp/compile.py:425-461`
+/// `patch_new_loop_to_load_virtualizable_fields`.
+///
+/// ```python
+/// def patch_new_loop_to_load_virtualizable_fields(loop, jitdriver_sd, vable):
+///     vinfo = jitdriver_sd.virtualizable_info
+///     extra_ops = []
+///     inputargs = loop.inputargs
+///     vable_box = inputargs[jitdriver_sd.index_of_virtualizable]
+///     i = jitdriver_sd.num_red_args
+///     loop.inputargs = inputargs[:i]
+///     for descr in vinfo.static_field_descrs:
+///         assert i < len(inputargs)
+///         box = inputargs[i]
+///         opnum = OpHelpers.getfield_for_descr(descr)
+///         emit_op(extra_ops,
+///                 ResOperation(opnum, [vable_box], descr=descr))
+///         box.set_forwarded(extra_ops[-1])
+///         i += 1
+///     arrayindex = 0
+///     for descr in vinfo.array_field_descrs:
+///         arraylen = vinfo.get_array_length(vable, arrayindex)
+///         arrayop = ResOperation(rop.GETFIELD_GC_R, [vable_box], descr=descr)
+///         emit_op(extra_ops, arrayop)
+///         arraydescr = vinfo.array_descrs[arrayindex]
+///         assert i + arraylen <= len(inputargs)
+///         for index in range(arraylen):
+///             opnum = OpHelpers.getarrayitem_for_descr(arraydescr)
+///             box = inputargs[i]
+///             emit_op(extra_ops,
+///                 ResOperation(opnum,
+///                              [arrayop, ConstInt(index)],
+///                              descr=arraydescr))
+///             i += 1
+///             box.set_forwarded(extra_ops[-1])
+///         arrayindex += 1
+///     assert i == len(inputargs)
+///     for op in loop.operations:
+///         emit_op(extra_ops, op)
+///     loop.operations = extra_ops
+/// ```
+///
+/// Called from `send_loop_to_backend` (compile.py:504-511) after the loop
+/// has been optimized but before it is handed to the CPU backend. The
+/// virtualizable's static and array fields ride through the optimizer as
+/// expanded trace inputargs; this function strips them and reconstructs
+/// each field at loop entry with a `GETFIELD_GC` / `GETARRAYITEM_GC` op
+/// so the compiled loop's `len(inputargs) == num_red_args` matches
+/// `execute_token`'s `clt._debug_nbargs` and CA's `op.args.len()`.
+///
+/// `vable_array_lengths` mirrors RPython's `vinfo.get_array_length(vable, i)`
+/// reads: one length per array field (in `vinfo.array_fields` order), taken
+/// from the concrete virtualizable at trace-start time.
+pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
+    ops: &mut Vec<Op>,
+    inputargs: &mut Vec<InputArg>,
+    vinfo: &crate::virtualizable::VirtualizableInfo,
+    vable_array_lengths: &[usize],
+    num_red_args: usize,
+    index_of_virtualizable: usize,
+    constants: &mut HashMap<u32, i64>,
+    constant_types: &mut HashMap<u32, Type>,
+) {
+    use majit_ir::{Op, OpCode, OpRef};
+
+    assert!(
+        index_of_virtualizable < num_red_args,
+        "virtualizable must live inside the red args (pyjitpl.py:3589 index_of_virtualizable < num_red_args)"
+    );
+    if inputargs.len() <= num_red_args {
+        // Already reduced or no virtualizable expansion in the trace.
+        return;
+    }
+
+    // compile.py:429-430 — vable_box = inputargs[index_of_virtualizable].
+    let vable_box = OpRef(inputargs[index_of_virtualizable].index);
+
+    // Allocate fresh OpRefs above existing op positions AND inputarg indices.
+    let max_op_pos = ops
+        .iter()
+        .filter_map(|op| (!op.pos.is_none()).then_some(op.pos.0))
+        .max()
+        .unwrap_or(0);
+    let max_inputarg = inputargs.iter().map(|ia| ia.index).max().unwrap_or(0);
+    let mut next_opref = max_op_pos.max(max_inputarg) + 1;
+
+    // Allocate fresh const indices above the existing max.
+    let mut next_const_idx = constants
+        .keys()
+        .map(|&k| OpRef(k).const_index())
+        .max()
+        .map(|m| m + 1)
+        .unwrap_or(0);
+
+    let mut forwarding: HashMap<OpRef, OpRef> = HashMap::new();
+    let mut extra_ops: Vec<Op> = Vec::new();
+    let mut i = num_red_args;
+
+    // compile.py:433-440 — GETFIELD_GC per static field.
+    let static_descrs = vinfo.static_field_descrs();
+    for (fi, field) in vinfo.static_fields.iter().enumerate() {
+        assert!(
+            i < inputargs.len(),
+            "static field {fi} exceeds inputargs ({} <= {})",
+            i,
+            inputargs.len()
+        );
+        let descr = static_descrs
+            .get(fi)
+            .cloned()
+            .expect("static_field_descrs must be populated by set_parent_descr");
+        let opcode = match field.field_type {
+            Type::Int => OpCode::GetfieldGcI,
+            Type::Ref => OpCode::GetfieldGcR,
+            Type::Float => OpCode::GetfieldGcF,
+            Type::Void => panic!("virtualizable static field {fi} has Void type"),
+        };
+        let old_opref = OpRef(inputargs[i].index);
+        let new_opref = OpRef(next_opref);
+        next_opref += 1;
+        let mut op = Op::new(opcode, &[vable_box]);
+        op.pos = new_opref;
+        op.descr = Some(descr);
+        extra_ops.push(op);
+        forwarding.insert(old_opref, new_opref);
+        i += 1;
+    }
+
+    // compile.py:441-457 — GETFIELD_GC_R (array ptr) + GETARRAYITEM_GC per element.
+    let array_descrs_list = vinfo.array_field_descrs();
+    for (ai, array_field_descr) in array_descrs_list.iter().enumerate() {
+        let array_len = vable_array_lengths.get(ai).copied().unwrap_or(0);
+        assert!(
+            i + array_len <= inputargs.len(),
+            "array {ai} length {array_len} would overrun inputargs (i={i}, len={})",
+            inputargs.len()
+        );
+        // GETFIELD_GC_R(vable_box, array_field_descr) → array pointer.
+        let array_opref = OpRef(next_opref);
+        next_opref += 1;
+        let mut arr_load = Op::new(OpCode::GetfieldGcR, &[vable_box]);
+        arr_load.pos = array_opref;
+        arr_load.descr = Some(array_field_descr.clone());
+        extra_ops.push(arr_load);
+
+        let array_descr = vinfo
+            .array_descrs
+            .get(ai)
+            .cloned()
+            .expect("VirtualizableInfo.array_descrs must cover every array_field");
+        let item_opcode = match vinfo.array_fields[ai].item_type {
+            Type::Int => OpCode::GetarrayitemGcI,
+            Type::Ref => OpCode::GetarrayitemGcR,
+            Type::Float => OpCode::GetarrayitemGcF,
+            Type::Void => panic!("virtualizable array {ai} has Void item_type"),
+        };
+        for index in 0..array_len {
+            // compile.py:453 — ConstInt(index) for the array subscript.
+            let const_opref = OpRef::from_const(next_const_idx);
+            next_const_idx += 1;
+            constants.insert(const_opref.0, index as i64);
+            constant_types.insert(const_opref.0, Type::Int);
+
+            let old_opref = OpRef(inputargs[i].index);
+            let new_opref = OpRef(next_opref);
+            next_opref += 1;
+            let mut elem_op = Op::new(item_opcode, &[array_opref, const_opref]);
+            elem_op.pos = new_opref;
+            elem_op.descr = Some(array_descr.clone());
+            extra_ops.push(elem_op);
+            forwarding.insert(old_opref, new_opref);
+            i += 1;
+        }
+    }
+
+    assert!(
+        i == inputargs.len(),
+        "compile.py:458 assert i == len(inputargs) failed ({i} != {})",
+        inputargs.len()
+    );
+
+    // compile.py:432 — loop.inputargs = inputargs[:num_red_args].
+    inputargs.truncate(num_red_args);
+
+    // compile.py:459-461 — emit_op walks existing ops through
+    // get_box_replacement; in pyre we apply the forwarding map directly.
+    for op in ops.iter_mut() {
+        for arg in op.args.iter_mut() {
+            if let Some(&new_ref) = forwarding.get(arg) {
+                *arg = new_ref;
+            }
+        }
+        if let Some(fa) = op.fail_args.as_mut() {
+            for arg in fa.iter_mut() {
+                if let Some(&new_ref) = forwarding.get(arg) {
+                    *arg = new_ref;
+                }
+            }
+        }
+    }
+
+    // Prepend extra_ops to loop operations (compile.py:459-461 reconstructs
+    // loop.operations in the same order).
+    //
+    // In RPython the closing `JUMP` targets the `TargetToken`'s internal
+    // `LABEL`, whose arity is SEPARATE from `loop.inputargs`; truncating
+    // inputargs therefore never touches JUMP/LABEL inside operations. pyre's
+    // current JUMP-terminated paths (compile_loop at pyjitpl/mod.rs:1936,
+    // retry-without-unroll at 3094, simple-loop at 3803) inline a
+    // `LABEL(inputargs)` whose arity is coupled to the inputargs array, so
+    // this helper is not yet wired into those paths — see
+    // `MetaInterp::patch_new_loop_to_load_virtualizable_fields` for the
+    // finish-only call site and the JUMP-path TODO.
+    let mut combined = extra_ops;
+    combined.append(ops);
+    *ops = combined;
+}
+
 /// RPython dependency.py requires GUARD_(NO_)OVERFLOW to be scheduled only
 /// when there is a live preceding INT_*_OVF operation to consume.
 /// intbounds.py:231-242: optimizer raises InvalidLoop for stray overflow
