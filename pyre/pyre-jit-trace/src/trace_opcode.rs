@@ -116,26 +116,6 @@ impl MIFrame {
         }
     }
 
-    /// Drop the cached COMPARE_OP → POP_JUMP_IF truth values when the
-    /// upcoming instruction is neither the expected consumer nor the
-    /// trivia (EXTENDED_ARG / NOT_TAKEN / CACHE / TO_BOOL) that RPython's
-    /// codewriter folds through.  Called at the top of each dispatch
-    /// step so the cache's lifetime matches one opcode boundary.
-    fn invalidate_comparison_truth_cache_if_not_consumer(&mut self, instruction: Instruction) {
-        if instruction_consumes_comparison_truth(instruction)
-            || instruction_is_trivia_between_compare_and_branch(instruction)
-        {
-            return;
-        }
-        let s = self.sym_mut();
-        s.last_comparison_truth = None;
-        s.last_comparison_concrete_truth = None;
-        s.last_comparison_orgpc = None;
-        s.last_comparison_pre_vsd = None;
-        s.last_comparison_pre_stack = None;
-        s.last_comparison_pre_stack_types = None;
-    }
-
     pub fn from_sym(
         ctx: &mut TraceCtx,
         sym: &mut PyreSym,
@@ -3805,10 +3785,22 @@ impl MIFrame {
             return TraceAction::Abort;
         };
 
-        // RPython goto_if_not fusion: invalidate the COMPARE_OP truth
-        // cache when the upcoming instruction isn't the POP_JUMP_IF*
-        // consumer (or skipped trivia).
-        self.invalidate_comparison_truth_cache_if_not_consumer(instruction);
+        // RPython goto_if_not fusion: invalidate comparison truth cache
+        // unless this instruction is POP_JUMP_IF_FALSE/TRUE (the consumer).
+        // RPython's codewriter fuses COMPARE+BRANCH into one op, so there's
+        // no intermediate instruction. In pyre they're separate bytecodes,
+        // so we keep the cache alive only for the immediately following jump.
+        if !instruction_consumes_comparison_truth(instruction)
+            && !instruction_is_trivia_between_compare_and_branch(instruction)
+        {
+            let s = self.sym_mut();
+            s.last_comparison_truth = None;
+            s.last_comparison_concrete_truth = None;
+            s.last_comparison_orgpc = None;
+            s.last_comparison_pre_vsd = None;
+            s.last_comparison_pre_stack = None;
+            s.last_comparison_pre_stack_types = None;
+        }
 
         self.set_orgpc(pc);
         self.prepare_fallthrough();
@@ -4116,7 +4108,18 @@ impl MIFrame {
             return InlineTraceStepAction::Trace(TraceAction::Abort);
         };
 
-        self.invalidate_comparison_truth_cache_if_not_consumer(instruction);
+        // RPython goto_if_not: invalidate truth cache for non-jump instructions.
+        if !instruction_consumes_comparison_truth(instruction)
+            && !instruction_is_trivia_between_compare_and_branch(instruction)
+        {
+            let s = self.sym_mut();
+            s.last_comparison_truth = None;
+            s.last_comparison_concrete_truth = None;
+            s.last_comparison_orgpc = None;
+            s.last_comparison_pre_vsd = None;
+            s.last_comparison_pre_stack = None;
+            s.last_comparison_pre_stack_types = None;
+        }
 
         self.prepare_fallthrough();
         let step_result = execute_opcode_step(self, code, instruction, op_arg, pc + 1);

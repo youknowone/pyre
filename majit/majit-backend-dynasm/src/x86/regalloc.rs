@@ -32,8 +32,8 @@ pub fn save_around_call_core_regs() -> Vec<RegLoc> {
 }
 #[cfg(target_os = "windows")]
 pub fn save_around_call_core_regs() -> Vec<RegLoc> {
-    // x86/regalloc.py:73-74 `if WIN64: save_around_call_regs.remove(esi)`
-    vec![EAX, ECX, EDX, EDI, R8, R9, R10]
+    // x86/regalloc.py:73-75 `if WIN64: remove(esi); remove(edi)`
+    vec![EAX, ECX, EDX, R8, R9, R10]
 }
 
 /// x86/regalloc.py X86_64_XMMRegisterManager.all_regs — XMM allocation
