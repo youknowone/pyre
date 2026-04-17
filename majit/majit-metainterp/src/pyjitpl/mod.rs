@@ -5424,12 +5424,15 @@ impl<M: Clone> MetaInterp<M> {
     /// compile.py:826-830 store_hash for bridge guards.
     fn assign_bridge_guard_hashes(
         &mut self,
-        token: &JitCellToken,
+        green_key: u64,
         source_trace_id: u64,
         source_fail_index: u32,
     ) {
+        let Some(compiled) = self.compiled_loops.get(&green_key) else {
+            return;
+        };
         let layouts = self.backend.compiled_bridge_fail_descr_layouts(
-            token,
+            &compiled.token,
             source_trace_id,
             source_fail_index,
         );
@@ -5444,8 +5447,15 @@ impl<M: Clone> MetaInterp<M> {
                 }
             })
             .collect();
-        self.backend
-            .store_bridge_guard_hashes(token, source_trace_id, source_fail_index, &hashes);
+        let Some(compiled) = self.compiled_loops.get(&green_key) else {
+            return;
+        };
+        self.backend.store_bridge_guard_hashes(
+            &compiled.token,
+            source_trace_id,
+            source_fail_index,
+            &hashes,
+        );
     }
 
     /// compile.py:741-745: look up (status, descr_addr) for a guard.
@@ -6303,38 +6313,18 @@ impl<M: Clone> MetaInterp<M> {
                     );
                 }
                 // compile.py:826-830 store_hash for bridge guards.
-                if let Some(compiled) = self.compiled_loops.get(&green_key) {
-                    let source_trace_id = {
-                        let tid = fail_descr.trace_id();
-                        if tid == 0 {
-                            compiled.root_trace_id
-                        } else {
-                            tid
-                        }
-                    };
-                    let layouts = self.backend.compiled_bridge_fail_descr_layouts(
-                        &compiled.token,
-                        source_trace_id,
-                        fail_index,
-                    );
-                    let hashes: Vec<u64> = layouts
-                        .iter()
-                        .flatten()
-                        .map(|layout| {
-                            if layout.is_finish {
-                                0
-                            } else {
-                                self.warm_state.fetch_next_hash()
-                            }
-                        })
-                        .collect();
-                    self.backend.store_bridge_guard_hashes(
-                        &compiled.token,
-                        source_trace_id,
-                        fail_index,
-                        &hashes,
-                    );
-                }
+                let source_trace_id = {
+                    let tid = fail_descr.trace_id();
+                    if tid == 0 {
+                        self.compiled_loops
+                            .get(&green_key)
+                            .map(|c| c.root_trace_id)
+                            .unwrap_or(tid)
+                    } else {
+                        tid
+                    }
+                };
+                self.assign_bridge_guard_hashes(green_key, source_trace_id, fail_index);
                 // Mark the bridge as compiled
                 if let Some(compiled) = self.compiled_loops.get_mut(&green_key) {
                     let source_trace_id = {
