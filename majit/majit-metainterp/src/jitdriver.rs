@@ -2423,6 +2423,13 @@ impl<S: JitState> JitDriver<S> {
         self.meta.last_compiled_key()
     }
 
+    /// warmstate.py:437-444 starting cell's green_key (the cell on which
+    /// TRACING must be cleared in the finally block). Returns None when
+    /// no trace is in progress.
+    pub fn starting_green_key(&self) -> Option<u64> {
+        self.meta.starting_green_key()
+    }
+
     /// Check if any guard in the compiled trace has Float-typed fail_args.
     pub fn compiled_trace_has_float_guards(&self, green_key: u64) -> bool {
         self.meta.compiled_trace_has_float_guards(green_key)

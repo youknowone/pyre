@@ -4289,6 +4289,15 @@ impl<M: Clone> MetaInterp<M> {
         self.last_compiled_key
     }
 
+    /// warmstate.py:437-444 `cell.flags |= JC_TRACING ... try ... finally:
+    /// cell.flags &= ~JC_TRACING` parity — the green_key that was entered
+    /// into `bound_reached` and on which TRACING must be cleared unconditionally
+    /// once tracing ends. Pulled from the active TraceCtx; returns None when
+    /// no trace is in progress.
+    pub fn starting_green_key(&self) -> Option<u64> {
+        self.tracing.as_ref().map(|ctx| ctx.green_key)
+    }
+
     /// Get num_inputs of the compiled loop.
     pub fn get_compiled_num_inputs(&self, green_key: u64) -> Option<usize> {
         self.compiled_loops.get(&green_key).map(|e| e.num_inputs)

@@ -165,12 +165,18 @@ pub struct DynasmBackend {
 }
 
 impl DynasmBackend {
+    #[inline]
+    fn raw_mem_ptr(addr: i64, offset: i64) -> usize {
+        assert_ne!(
+            addr, 0,
+            "llmodel.py parity: raw memory helpers must not silently accept NULL addresses"
+        );
+        (addr as usize).wrapping_add(offset as usize)
+    }
+
     /// llmodel.py:467-478 read_int_at_mem(gcref, ofs, size, sign).
     fn read_int_at_mem(&self, addr: i64, offset: i64, size: usize, sign: bool) -> i64 {
-        if addr == 0 {
-            return 0;
-        }
-        let ptr = (addr as usize).wrapping_add(offset as usize);
+        let ptr = Self::raw_mem_ptr(addr, offset);
         unsafe {
             match (size, sign) {
                 (1, true) => (ptr as *const i8).read_unaligned() as i64,
@@ -186,10 +192,7 @@ impl DynasmBackend {
 
     /// llmodel.py:481-488 write_int_at_mem(gcref, ofs, size, newvalue).
     fn write_int_at_mem(&self, addr: i64, offset: i64, size: usize, newvalue: i64) {
-        if addr == 0 {
-            return;
-        }
-        let ptr = (addr as usize).wrapping_add(offset as usize);
+        let ptr = Self::raw_mem_ptr(addr, offset);
         unsafe {
             match size {
                 1 => (ptr as *mut u8).write_unaligned(newvalue as u8),
@@ -202,19 +205,13 @@ impl DynasmBackend {
 
     /// llmodel.py:490-491 read_float_at_mem(gcref, ofs).
     fn read_float_at_mem(&self, addr: i64, offset: i64) -> f64 {
-        if addr == 0 {
-            return 0.0;
-        }
-        let ptr = (addr as usize).wrapping_add(offset as usize);
+        let ptr = Self::raw_mem_ptr(addr, offset);
         unsafe { (ptr as *const f64).read_unaligned() }
     }
 
     /// llmodel.py:493-494 write_float_at_mem(gcref, ofs, newvalue).
     fn write_float_at_mem(&self, addr: i64, offset: i64, newvalue: f64) {
-        if addr == 0 {
-            return;
-        }
-        let ptr = (addr as usize).wrapping_add(offset as usize);
+        let ptr = Self::raw_mem_ptr(addr, offset);
         unsafe { (ptr as *mut f64).write_unaligned(newvalue) }
     }
 

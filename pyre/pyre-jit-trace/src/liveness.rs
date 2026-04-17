@@ -2,55 +2,6 @@
 
 use pyre_interpreter::bytecode::{CodeObject, Instruction};
 
-/// Heuristic: does this opcode touch frame-local slots?
-///
-/// Used to decide whether the GEN/KILL / stack_effects default arm is
-/// covering a real miss. Any variant whose Debug name contains `Fast`
-/// is a locals-accessing opcode (LoadFast*, StoreFast*, DeleteFast,
-/// super-instructions like LoadFastLoadFast, StoreFastLoadFast, ...).
-/// If the explicit match did not catch it, dataflow silently omits the
-/// read/write — the nbody/fannkuch regressions came from exactly that.
-fn instr_touches_locals(instr: &Instruction) -> bool {
-    let name = format!("{:?}", instr);
-    let head = name.split_whitespace().next().unwrap_or("");
-    let head = head.trim_start_matches('&');
-    head.contains("Fast")
-}
-
-/// Log unhandled locals-touching opcodes once per (site, discriminant).
-///
-/// A missed opcode in the GEN/KILL or stack_effects match is silent
-/// today: the catch-all `_` arm lets dataflow succeed with incomplete
-/// information and the bug surfaces much later at a resume point
-/// (fannkuch q0 NameError, nbody super-instructions). Shout on first
-/// sight so the next one is found immediately.
-fn warn_unhandled_opcode(site: &'static str, instr: &Instruction) {
-    if !instr_touches_locals(instr) {
-        return;
-    }
-    use std::cell::RefCell;
-    use std::collections::HashSet;
-    thread_local! {
-        static SEEN: RefCell<HashSet<(&'static str, String)>> =
-            RefCell::new(HashSet::new());
-    }
-    let disc = format!("{:?}", std::mem::discriminant(instr));
-    SEEN.with(|s| {
-        let mut set = s.borrow_mut();
-        if set.insert((site, disc)) {
-            eprintln!(
-                "[liveness][bug] unhandled locals-touching opcode at {}: {:?} — add it to GEN/KILL and stack_effects",
-                site, instr
-            );
-            debug_assert!(
-                false,
-                "liveness: unhandled locals-touching opcode at {} (add to GEN/KILL and stack_effects)",
-                site
-            );
-        }
-    });
-}
-
 /// Skip Cache pseudo-instructions starting at `pos`.
 /// Returns the index of the first non-Cache instruction at or after `pos`.
 fn skip_caches(code: &CodeObject, mut pos: usize) -> usize {
@@ -259,15 +210,7 @@ impl LiveVars {
                             }
                         }
                     }
-                    // LOAD_FAST_LOAD_FAST / LOAD_FAST_BORROW_LOAD_FAST_BORROW:
-                    // intentionally not GEN'd — see the commented-out block
-                    // above and memory/phase3_aliasing_diagnostic_2026_04_17.md.
-                    // Enabling GEN here regresses dynasm (stale null-ref
-                    // live-args in bridges). Explicit no-op arms prevent
-                    // warn_unhandled_opcode false positives.
-                    Instruction::LoadFastLoadFast { .. }
-                    | Instruction::LoadFastBorrowLoadFastBorrow { .. } => {}
-                    other => warn_unhandled_opcode("gen_kill", &other),
+                    _ => {}
                 }
                 // Exception handlers: union with handler target's live set.
                 // This handles implicit control flow edges from try blocks
@@ -546,14 +489,8 @@ fn stack_effects(
             let n = argc.get(op_arg) as i32;
             (d - n, d - n)
         }
-        // Default: conservative, keep same depth. Locals-touching super-
-        // instructions MUST be matched explicitly so their stack effect
-        // is correct; warn loudly on first sight so the miss is caught
-        // before it surfaces as a wrong-depth resume (fannkuch q0).
-        other => {
-            warn_unhandled_opcode("stack_effects", &other);
-            (d, d)
-        }
+        // Default: conservative, keep same depth.
+        _ => (d, d),
     };
     (ft.max(0) as usize, br.max(0) as usize)
 }

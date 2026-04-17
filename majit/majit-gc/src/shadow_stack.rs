@@ -176,9 +176,13 @@ pub fn push(gcref: GcRef) -> usize {
 
 /// Pop entries from the shadow stack back to the given depth.
 ///
-/// Returns an empty Vec when called after SHADOW_STACK's TLS destructor
-/// has fired (thread teardown); the thread is exiting, so no roots need
-/// to be reclaimed.
+/// PRE-EXISTING-ADAPTATION: Rust drops thread-locals in reverse order on
+/// thread exit, and `ConstantPool::Drop` (metainterp/pyjitpl.py
+/// constants side) calls this during its own TLS-owned teardown. If
+/// `SHADOW_STACK`'s destructor has already fired, `.with()` panics with
+/// `AccessError`. RPython has no analogous hazard — the GIL thread does
+/// not tear down TLS mid-run. Silently return an empty Vec so the
+/// exiting thread proceeds.
 pub fn pop_to(depth: usize) -> Vec<GcRef> {
     SHADOW_STACK
         .try_with(|ss| {
@@ -210,9 +214,10 @@ pub fn walk_roots(mut visitor: impl FnMut(&mut GcRef)) {
 
 /// Current depth of the GcRef shadow stack.
 ///
-/// Returns 0 when called after SHADOW_STACK's TLS destructor has fired
-/// (thread teardown); callers running under Drop (ConstantPool) see an
-/// empty stack instead of panicking on the destroyed key.
+/// PRE-EXISTING-ADAPTATION: see `pop_to` for the TLS-teardown rationale.
+/// Returns 0 when the TLS has been destroyed; callers running under
+/// Drop (e.g. `ConstantPool::Drop::release_roots`) observe an empty
+/// stack instead of panicking on the destroyed key.
 pub fn depth() -> usize {
     SHADOW_STACK
         .try_with(|ss| ss.borrow().entries.len())

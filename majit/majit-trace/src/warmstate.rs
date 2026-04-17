@@ -623,7 +623,12 @@ impl WarmEnterState {
     /// Install a compiled loop token for a green key.
     ///
     /// The cell transitions to Compiled state and takes ownership of
-    /// the procedure token.
+    /// the procedure token. Also clears TRACING on the cell the token
+    /// is attached to — this covers the same-key compile path, while
+    /// cross-loop cut (compile.py:269) compiles under an inner cell
+    /// and the outer (starting) cell's TRACING is cleared separately
+    /// by the `clear_tracing_flag` call in the tracing entry point's
+    /// finally block (warmstate.py:444 parity).
     pub fn attach_procedure_to_interp(
         &mut self,
         green_key_hash: u64,
@@ -636,6 +641,19 @@ impl WarmEnterState {
             .or_insert_with(BaseJitCell::new);
         cell.flags &= !jc_flags::TRACING;
         cell.set_procedure_token(token, false);
+    }
+
+    /// warmstate.py:444 `finally: cell.flags &= ~JC_TRACING` parity —
+    /// unconditional flag clear on the starting cell after tracing ends.
+    /// Called from the tracing entry point (bound_reached / jit_merge_point_hook)
+    /// regardless of whether tracing succeeded, aborted, or cross-loop-cut
+    /// installed under a different inner cell. Does not alter state: the
+    /// companion `attach_procedure_to_interp` / `abort_tracing` calls own
+    /// the state transition for whichever cell they touch.
+    pub fn clear_tracing_flag(&mut self, green_key_hash: u64) {
+        if let Some(cell) = self.cells.get_mut(&green_key_hash) {
+            cell.flags &= !jc_flags::TRACING;
+        }
     }
 
     pub fn take_procedure_token(&mut self, green_key_hash: u64) -> Option<Arc<JitCellToken>> {

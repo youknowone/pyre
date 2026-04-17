@@ -1312,6 +1312,12 @@ fn jit_merge_point_hook(
     let mut jit_state = build_jit_state(frame, info);
     let current_depth = call_depth();
     let was_tracing = driver.is_tracing();
+    // warmstate.py:437-444: capture the starting cell's key before
+    // entering the trace body so we can unconditionally clear its
+    // TRACING flag in the post-trace finally block. May differ from
+    // `green_key` when we are mid-trace and the current merge point's
+    // key is not the tracing origin.
+    let starting_tracing_key = driver.starting_green_key();
     if let Some(outcome) = driver.jit_merge_point_keyed(
         green_key,
         pc,
@@ -1344,14 +1350,15 @@ fn jit_merge_point_hook(
         // compile.py:269: cross-loop cut stores under inner key.
         // Use the actual compiled key for post-compilation steps.
         let compiled_key = driver.last_compiled_key().unwrap_or(green_key);
-        // Cross-loop cut: clear TRACING on the original key so it
-        // can be retraced instead of stuck in AlreadyTracing.
-        // Already inside `!driver.is_tracing()` guard above.
-        if compiled_key != green_key && driver.has_compiled_loop(compiled_key) {
+        // warmstate.py:444 `finally: cell.flags &= ~JC_TRACING` parity.
+        // `starting_tracing_key` was captured before jit_merge_point_keyed;
+        // its TRACING must be cleared unconditionally — even if cross-loop
+        // cut compiled under a different key, or if the trace aborted.
+        if let Some(k) = starting_tracing_key {
             driver
                 .meta_interp_mut()
                 .warm_state_mut()
-                .abort_tracing(green_key, false);
+                .clear_tracing_flag(k);
         }
         register_quasi_immutable_deps(compiled_key);
         // RPython pyjitpl.py:3048-3061 raise_continue_running_normally:
@@ -1825,12 +1832,18 @@ fn bound_reached(
             // pyjitpl.py:3048-3061 raise_continue_running_normally:
             // after compilation, restart so execute_assembler runs.
             if !driver.is_tracing() {
-                // compile.py:269 cross-loop cut: inner loop compiled under
-                // compiled_key ≠ green_key. Clear the TRACING flag on the
-                // ORIGINAL key so it can be retraced later instead of being
-                // stuck in AlreadyTracing forever. Gate on !is_tracing +
-                // actually-just-compiled to avoid clearing on stale
-                // last_compiled_key (fannkuch infinite loop otherwise).
+                // warmstate.py:444 `finally: cell.flags &= ~JC_TRACING`
+                // — green_key is the starting cell. Cross-loop cut
+                // (compile.py:269) installs the token on an inner cell,
+                // so attach_procedure_to_interp does not clear TRACING
+                // on green_key. Restore the clear here. The full
+                // gate `!had_compiled && has_compiled_loop(compiled_key)
+                // && compiled_key != green_key` narrows to "this round
+                // cross-loop-compiled under a different inner key";
+                // without it stale `last_compiled_key` values from
+                // prior iterations trigger spurious clears that can
+                // destabilize active traces (cranelift fannkuch regresses
+                // without this gate).
                 if !had_compiled
                     && driver.has_compiled_loop(compiled_key)
                     && compiled_key != green_key
@@ -1838,7 +1851,7 @@ fn bound_reached(
                     driver
                         .meta_interp_mut()
                         .warm_state_mut()
-                        .abort_tracing(green_key, false);
+                        .clear_tracing_flag(green_key);
                 }
                 return Some(LoopResult::ContinueRunningNormally);
             }
