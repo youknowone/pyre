@@ -1062,6 +1062,113 @@ impl<'a> Transformer<'a> {
     // not expand macro_rules!, so these macros never reach jtransform.
     // See jitcode_lower.rs: lower_conditional_call, lower_conditional_call_elidable,
     // lower_record_known_result.
+    //
+    // `_rewrite_op_cond_call` below is a structural mirror of
+    // `rpython/jit/codewriter/jtransform.py:1665-1683`. pyre dispatches
+    // conditional_call via the proc-macro path (see above), so this
+    // function is never reached at runtime; the Rust #[allow(dead_code)]
+    // is a deliberate PRE-EXISTING-ADAPTATION marker. Keeping the body
+    // here lets future porters cross-reference our conditional_call
+    // lowering against the upstream flow line-by-line.
+
+    /// RPython: `Transformer._rewrite_op_cond_call(op, rewritten_opname)`
+    /// (jtransform.py:1665-1683).
+    ///
+    /// Called by upstream `rewrite_op_jit_conditional_call` and
+    /// `rewrite_op_jit_conditional_call_value`; in pyre those two
+    /// lower through `jitcode_lower::lower_conditional_call` /
+    /// `lower_conditional_call_elidable` instead. This body is kept as
+    /// structural documentation so the two code paths stay aligned.
+    #[allow(dead_code)]
+    fn _rewrite_op_cond_call(
+        &mut self,
+        op: &SpaceOperation,
+        target: &CallTarget,
+        args: &[ValueId],
+        result_ty: &ValueType,
+        graph_name: &str,
+        is_value: bool,
+    ) -> RewriteResult {
+        // jtransform.py:1666-1672: validate no floats, ≤4+2 args
+        for &arg in args {
+            if self.get_value_kind(arg) == 'f' {
+                panic!("Conditional call does not support floats");
+            }
+        }
+        if args.len() > 4 + 2 {
+            panic!("Conditional call does not support more than 4 arguments");
+        }
+        // jtransform.py:1673-1676: calldescr from function call (args[1:] → result)
+        let condition_or_value = args[0];
+        let func_args = if args.len() > 1 { &args[1..] } else { &[] };
+        let non_void_args = resolve_non_void_arg_types(func_args, self.type_state);
+        let result_ir_type = value_type_to_ir_type(result_ty);
+        let descriptor = {
+            let cc_ref: &crate::call::CallControl = self.callcontrol.as_deref().unwrap();
+            cc_ref.getcalldescr(
+                target,
+                non_void_args,
+                result_ir_type,
+                OopSpecIndex::None,
+                None,
+                &mut self.analysis_cache,
+            )
+        };
+        // jtransform.py:1677: assert not forces_virtual_or_virtualizable
+        assert!(
+            !descriptor
+                .extra_info
+                .check_forces_virtual_or_virtualizable(),
+            "conditional_call target must not force virtualizable"
+        );
+        // jtransform.py:1678-1680: rewrite_call with force_ir=True
+        let (args_i, args_r, args_f) = self.make_three_lists(func_args);
+        assert!(
+            args_f.is_empty(),
+            "force_ir: no float args in conditional_call"
+        );
+        let result_kind = value_type_to_kind(result_ty);
+        let rewritten_opname = if is_value {
+            "conditional_call_value"
+        } else {
+            "conditional_call"
+        };
+        self.notes.push(GraphTransformNote {
+            function: graph_name.to_string(),
+            detail: format!("{rewritten_opname} → {rewritten_opname}_ir_{result_kind}"),
+        });
+        self.calls_classified += 1;
+        let call_kind = if is_value {
+            OpKind::ConditionalCallValue {
+                value: condition_or_value,
+                descriptor: descriptor.clone(),
+                args_i,
+                args_r,
+                args_f,
+                result_kind,
+            }
+        } else {
+            OpKind::ConditionalCall {
+                condition: condition_or_value,
+                descriptor: descriptor.clone(),
+                args_i,
+                args_r,
+                args_f,
+            }
+        };
+        // jtransform.py:1681-1682: -live- if calldescr_canraise
+        let mut ops = vec![SpaceOperation {
+            result: op.result,
+            kind: call_kind,
+        }];
+        if descriptor.extra_info.check_can_raise(false) {
+            ops.push(SpaceOperation {
+                result: None,
+                kind: OpKind::Live,
+            });
+        }
+        RewriteResult::Replace(ops)
+    }
 
     /// RPython: `Transformer.rewrite_op_jit_record_known_result(op)`
     /// (jtransform.py:292-313).

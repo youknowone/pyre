@@ -456,6 +456,17 @@ impl OptVirtualize {
         OptimizationResult::PassOn
     }
 
+    /// virtualize.py:223-224 optimize_NEW_ARRAY_CLEAR.
+    /// RPython forwards to `optimize_NEW_ARRAY(op, clear=True)`; the
+    /// OpCode discriminator in majit already encodes `clear` semantics
+    /// (optimize_new_array consults `OpCode::NewArrayClear` at line 424),
+    /// so this wrapper has no behavioral effect. Kept as a structural
+    /// mirror of the upstream dispatch table.
+    #[allow(dead_code)]
+    fn optimize_new_array_clear(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+        self.optimize_new_array(op, ctx)
+    }
+
     fn optimize_setfield_gc(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let struct_ref = ctx.get_box_replacement(op.arg(0));
         let value_ref = ctx.get_box_replacement(op.arg(1));
