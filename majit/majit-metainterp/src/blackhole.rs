@@ -804,9 +804,9 @@ use crate::jitcode::{
     BC_CALL_RELEASE_GIL_INT, BC_CALL_RELEASE_GIL_REF, BC_CALL_RELEASE_GIL_VOID, BC_CATCH_EXCEPTION,
     BC_GETARRAYITEM_VABLE_F, BC_GETARRAYITEM_VABLE_I, BC_GETARRAYITEM_VABLE_R, BC_GETFIELD_VABLE_F,
     BC_GETFIELD_VABLE_I, BC_GETFIELD_VABLE_R, BC_HINT_FORCE_VIRTUALIZABLE, BC_INLINE_CALL,
-    BC_JIT_MERGE_POINT, BC_JUMP, BC_JUMP_TARGET, BC_LAST_EXC_VALUE, BC_LIVE, BC_LOAD_CONST_F,
-    BC_LOAD_CONST_I, BC_LOAD_CONST_R, BC_LOAD_STATE_ARRAY, BC_LOAD_STATE_FIELD,
-    BC_LOAD_STATE_VARRAY, BC_MOVE_F, BC_MOVE_I, BC_MOVE_R, BC_RAISE, BC_RECORD_BINOP_F,
+    BC_JIT_MERGE_POINT, BC_JUMP, BC_LAST_EXC_VALUE, BC_LIVE, BC_LOAD_CONST_F, BC_LOAD_CONST_I,
+    BC_LOAD_CONST_R, BC_LOAD_STATE_ARRAY, BC_LOAD_STATE_FIELD, BC_LOAD_STATE_VARRAY,
+    BC_LOOP_HEADER, BC_MOVE_F, BC_MOVE_I, BC_MOVE_R, BC_RAISE, BC_RECORD_BINOP_F,
     BC_RECORD_BINOP_I, BC_RECORD_UNARY_F, BC_RECORD_UNARY_I, BC_REF_RETURN, BC_RERAISE,
     BC_RESIDUAL_CALL_VOID, BC_RVMPROF_CODE, BC_SETARRAYITEM_VABLE_F, BC_SETARRAYITEM_VABLE_I,
     BC_SETARRAYITEM_VABLE_R, BC_SETFIELD_VABLE_F, BC_SETFIELD_VABLE_I, BC_SETFIELD_VABLE_R,
@@ -1820,8 +1820,10 @@ impl BlackholeInterpreter {
                 }
                 return Err(DispatchError::LeaveFrame);
             }
-            BC_JUMP_TARGET => {
-                // Non-portal loop header marker (helper jitcodes only).
+            BC_LOOP_HEADER => {
+                // blackhole.py:1062-1064 bhimpl_loop_header(jdindex): no-op.
+                // Argument byte is the jitdriver index (unused in blackhole).
+                let _jdindex = self.next_u8();
             }
             BC_REF_RETURN => {
                 // RPython bhimpl_ref_return: return ref value to caller.
@@ -4777,6 +4779,8 @@ fn handler_loop_header(
     _code: &[u8],
     position: usize,
 ) -> Result<usize, DispatchError> {
+    // blackhole.py:1062-1064 bhimpl_loop_header(jdindex): no-op.
+    // Advance past the 1-byte jdindex operand.
     Ok(position + 1)
 }
 fn handler_ref_isconstant(

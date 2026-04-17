@@ -16,9 +16,9 @@ use crate::jitcode::{
     BC_COND_CALL_VALUE_REF, BC_COND_CALL_VOID, BC_FLOAT_GUARD_VALUE, BC_GETARRAYITEM_VABLE_F,
     BC_GETARRAYITEM_VABLE_I, BC_GETARRAYITEM_VABLE_R, BC_GETFIELD_VABLE_F, BC_GETFIELD_VABLE_I,
     BC_GETFIELD_VABLE_R, BC_HINT_FORCE_VIRTUALIZABLE, BC_INLINE_CALL, BC_INT_GUARD_VALUE,
-    BC_JIT_MERGE_POINT, BC_JUMP, BC_JUMP_TARGET, BC_LOAD_CONST_F, BC_LOAD_CONST_I, BC_LOAD_CONST_R,
-    BC_LOAD_STATE_ARRAY, BC_LOAD_STATE_FIELD, BC_LOAD_STATE_VARRAY, BC_MOVE_F, BC_MOVE_I,
-    BC_MOVE_R, BC_RECORD_BINOP_F, BC_RECORD_BINOP_I, BC_RECORD_KNOWN_RESULT_INT,
+    BC_JIT_MERGE_POINT, BC_JUMP, BC_LOAD_CONST_F, BC_LOAD_CONST_I, BC_LOAD_CONST_R,
+    BC_LOAD_STATE_ARRAY, BC_LOAD_STATE_FIELD, BC_LOAD_STATE_VARRAY, BC_LOOP_HEADER, BC_MOVE_F,
+    BC_MOVE_I, BC_MOVE_R, BC_RECORD_BINOP_F, BC_RECORD_BINOP_I, BC_RECORD_KNOWN_RESULT_INT,
     BC_RECORD_KNOWN_RESULT_REF, BC_RECORD_UNARY_F, BC_RECORD_UNARY_I, BC_REF_GUARD_VALUE,
     BC_RESIDUAL_CALL_VOID, BC_SETARRAYITEM_VABLE_F, BC_SETARRAYITEM_VABLE_I,
     BC_SETARRAYITEM_VABLE_R, BC_SETFIELD_VABLE_F, BC_SETFIELD_VABLE_I, BC_SETFIELD_VABLE_R,
@@ -747,8 +747,13 @@ where
                     return TraceAction::CloseLoop;
                 }
             }
-            BC_JUMP_TARGET => {
-                // Non-portal loop header marker (helper jitcodes only).
+            BC_LOOP_HEADER => {
+                // pyjitpl.py:1527-1573 opimpl_loop_header. The 1-byte jdindex
+                // operand is the jitdriver index; pyre has a single jitdriver
+                // so we read and ignore it. Non-portal loop header marker
+                // (helper jitcodes only) — portal merge points go through
+                // BC_JIT_MERGE_POINT above.
+                let _jdindex = self.frames.current_mut().next_u8();
                 let pc = self.frames.current_mut().pc;
                 if runtime.label_at(pc) == sym.loop_header_pc() {
                     return TraceAction::CloseLoop;

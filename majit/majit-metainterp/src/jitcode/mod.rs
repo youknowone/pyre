@@ -7,7 +7,7 @@ use majit_ir::OpCode;
 pub(crate) const BC_LOAD_CONST_I: u8 = 1;
 pub(crate) const BC_RECORD_BINOP_I: u8 = 8;
 pub(crate) const BC_RECORD_UNARY_I: u8 = 9;
-pub(crate) const BC_JUMP_TARGET: u8 = 12;
+pub(crate) const BC_LOOP_HEADER: u8 = 12;
 pub(crate) const BC_ABORT: u8 = 13;
 pub(crate) const BC_ABORT_PERMANENT: u8 = 14;
 pub(crate) const BC_BRANCH_REG_ZERO: u8 = 15;
@@ -123,7 +123,11 @@ pub fn wellknown_bh_insns() -> std::collections::HashMap<&'static str, u8> {
 
     // Control flow / structural markers that actually emit.
     m.insert("jump/L", BC_JUMP);
-    m.insert("jump_target/L", BC_JUMP_TARGET);
+    // loop_header takes a single int constant operand (the jitdriver index).
+    // RPython jtransform.py:1714-1718 handle_jit_marker__loop_header emits
+    // SpaceOperation('loop_header', [c_index], None); blackhole.py:1063
+    // bhimpl_loop_header(jdindex) is @arguments("i").
+    m.insert("loop_header/i", BC_LOOP_HEADER);
     m.insert("raise/r", BC_RAISE);
     m.insert("reraise/", BC_RERAISE);
     m.insert("last_exc_value/", BC_LAST_EXC_VALUE);

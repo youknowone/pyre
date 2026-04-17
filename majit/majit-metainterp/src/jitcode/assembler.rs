@@ -19,9 +19,9 @@ use super::{
     BC_COND_CALL_VALUE_REF, BC_COND_CALL_VOID, BC_FLOAT_GUARD_VALUE, BC_GETARRAYITEM_VABLE_F,
     BC_GETARRAYITEM_VABLE_I, BC_GETARRAYITEM_VABLE_R, BC_GETFIELD_VABLE_F, BC_GETFIELD_VABLE_I,
     BC_GETFIELD_VABLE_R, BC_HINT_FORCE_VIRTUALIZABLE, BC_INLINE_CALL, BC_INT_GUARD_VALUE,
-    BC_JIT_MERGE_POINT, BC_JUMP, BC_JUMP_TARGET, BC_LAST_EXC_VALUE, BC_LIVE, BC_LOAD_CONST_F,
-    BC_LOAD_CONST_I, BC_LOAD_CONST_R, BC_LOAD_STATE_ARRAY, BC_LOAD_STATE_FIELD,
-    BC_LOAD_STATE_VARRAY, BC_MOVE_F, BC_MOVE_I, BC_MOVE_R, BC_RAISE, BC_RECORD_BINOP_F,
+    BC_JIT_MERGE_POINT, BC_JUMP, BC_LAST_EXC_VALUE, BC_LIVE, BC_LOAD_CONST_F, BC_LOAD_CONST_I,
+    BC_LOAD_CONST_R, BC_LOAD_STATE_ARRAY, BC_LOAD_STATE_FIELD, BC_LOAD_STATE_VARRAY,
+    BC_LOOP_HEADER, BC_MOVE_F, BC_MOVE_I, BC_MOVE_R, BC_RAISE, BC_RECORD_BINOP_F,
     BC_RECORD_BINOP_I, BC_RECORD_KNOWN_RESULT_INT, BC_RECORD_KNOWN_RESULT_REF, BC_RECORD_UNARY_F,
     BC_RECORD_UNARY_I, BC_REF_GUARD_VALUE, BC_REF_RETURN, BC_RERAISE, BC_RESIDUAL_CALL_VOID,
     BC_SETARRAYITEM_VABLE_F, BC_SETARRAYITEM_VABLE_I, BC_SETARRAYITEM_VABLE_R, BC_SETFIELD_VABLE_F,
@@ -387,8 +387,13 @@ impl JitCodeBuilder {
         self.push_label_ref(label);
     }
 
-    pub fn jump_target(&mut self) {
-        self.push_u8(BC_JUMP_TARGET);
+    /// RPython jtransform.py:1714-1718 handle_jit_marker__loop_header emits
+    /// SpaceOperation('loop_header', [c_index], None). blackhole.py:1063
+    /// bhimpl_loop_header(jdindex) is a no-op; pyjitpl.py:1527
+    /// opimpl_loop_header records the jitdriver index for the trace.
+    pub fn loop_header(&mut self, jdindex: u8) {
+        self.push_u8(BC_LOOP_HEADER);
+        self.push_u8(jdindex);
     }
 
     /// RPython assembler.py: emit `live/` followed by a 2-byte offset into

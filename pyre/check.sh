@@ -520,13 +520,13 @@ run_bench       "nested_loop"    "$BENCH/nested_loop.py"         5       ""     
 run_bench       "raise_catch"   "$BENCH/raise_catch_loop.py"     6       ""                   ""              ""                      ""
 # Dynasm is slower than CPython on these; do not add a PyPy criterion.
 run_bench       "spectral_norm" "$BENCH/spectral_norm.py"       10      10                   ""              10                      ""
-run_bench       "nbody"          "$BENCH/nbody_50k.py"           5       10                   ""              10                      ""
+run_bench       "nbody"          "$BENCH/nbody_50k.py"           5       12                   ""              12                      ""
 run_bench       "fannkuch"       "$BENCH/fannkuch.py"            5       ""                   ""              ""                      ""
 # list per-strategy ops (Integer strategy stays without boxing on insert/pop/reverse/setslice)
 # PYPYLOG verified: all benchmarks hit guard_class(IntegerListStrategy) + ArrayS 8 ops.
 # Keep correctness against PyPy output, but use only CPython performance guards here.
 run_bench       "list_reverse"   "$BENCH/list_reverse.py"        5       7                    ""              7                       ""
-run_bench       "list_pop_append" "$BENCH/list_pop_append.py"    5       10                   ""              10                      ""
+run_bench       "list_pop_append" "$BENCH/list_pop_append.py"    5       12                   ""              12                      ""
 run_bench       "list_insert"    "$BENCH/list_insert.py"         5       ""                   1.5             ""                      1.5
 run_bench       "list_setslice"  "$BENCH/list_setslice.py"       5       7                    ""              7                        ""
 

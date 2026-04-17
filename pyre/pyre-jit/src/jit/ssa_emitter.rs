@@ -31,7 +31,7 @@ use super::flatten::{Insn, Kind, Label, ListOfKind, Operand, Register, SSARepr, 
 /// Walker-visible builder that is a `JitCodeBuilder` look-alike. Every
 /// per-op method appends an `Insn::Op` to an internal `SSARepr` and
 /// every setup call is forwarded to a real `JitCodeBuilder`.
-pub struct SSAReprEmitter {
+pub(super) struct SSAReprEmitter {
     /// Setup-state builder — carries `fn_ptrs`, constant pools,
     /// register-file sizing, and the jitcode name. `Assembler::assemble`
     /// consumes this builder after the walker is done; the finished
@@ -106,11 +106,11 @@ impl SSAReprEmitter {
         self.builder.num_consts_f()
     }
 
-    pub fn add_const_i(&mut self, value: i64) -> u16 {
+    fn add_const_i(&mut self, value: i64) -> u16 {
         self.builder.add_const_i(value)
     }
 
-    pub fn add_const_r(&mut self, value: i64) -> u16 {
+    fn add_const_r(&mut self, value: i64) -> u16 {
         self.builder.add_const_r(value)
     }
 
@@ -304,8 +304,12 @@ impl SSAReprEmitter {
         self.push_op("jump", vec![self.tlabel(label)]);
     }
 
-    pub fn jump_target(&mut self) {
-        self.push_op("jump_target", Vec::new());
+    /// RPython jtransform.py:1714-1718 handle_jit_marker__loop_header.
+    /// Emits `SpaceOperation('loop_header', [c_index], None)` where c_index
+    /// is the jitdriver index. pyre has a single jitdriver (PyPyJitDriver),
+    /// so callers pass 0.
+    pub fn loop_header(&mut self, jdindex: u16) {
+        self.push_op("loop_header", vec![Operand::ConstInt(jdindex as i64)]);
     }
 
     pub fn branch_reg_zero(&mut self, cond: u16, label: u16) {
@@ -319,7 +323,7 @@ impl SSAReprEmitter {
         self.push_op("catch_exception", vec![self.tlabel(label)]);
     }
 
-    pub fn jit_merge_point(&mut self, greens_i: &[u8], greens_r: &[u8], reds_r: &[u8]) {
+    fn jit_merge_point(&mut self, greens_i: &[u8], greens_r: &[u8], reds_r: &[u8]) {
         self.push_op(
             "jit_merge_point",
             vec![
@@ -327,6 +331,41 @@ impl SSAReprEmitter {
                 list_of_regs(Kind::Ref, greens_r),
                 list_of_regs(Kind::Ref, reds_r),
             ],
+        );
+    }
+
+    /// Portal-only lowering for interp_jit.py's merge point arguments.
+    /// Keeping the constant-pool/register arithmetic here matches the
+    /// upstream shape more closely than open-coding it in the bytecode
+    /// walker and preserves the u8 operand invariant at the point where
+    /// the indices are formed.
+    pub fn emit_portal_jit_merge_point(
+        &mut self,
+        next_instr: usize,
+        w_code: i64,
+        frame_reg: u16,
+        ec_reg: u16,
+    ) {
+        let next_instr_const_idx = self.add_const_i(next_instr as i64);
+        let is_being_profiled_const_idx = self.add_const_i(0);
+        let pycode_const_idx = self.add_const_r(w_code);
+        let num_regs_i = self.builder.num_regs_i();
+        let num_regs_r = self.builder.num_regs_r();
+        let gi_next_instr_reg =
+            u8::try_from(u32::from(num_regs_i) + u32::from(next_instr_const_idx))
+                .expect("jit_merge_point next_instr arg exceeds u8 encoding");
+        let gi_is_profiled_reg =
+            u8::try_from(u32::from(num_regs_i) + u32::from(is_being_profiled_const_idx))
+                .expect("jit_merge_point is_being_profiled arg exceeds u8 encoding");
+        let gr_pycode_reg = u8::try_from(u32::from(num_regs_r) + u32::from(pycode_const_idx))
+            .expect("jit_merge_point pycode arg exceeds u8 encoding");
+        let frame_reg =
+            u8::try_from(frame_reg).expect("jit_merge_point frame reg exceeds u8 encoding");
+        let ec_reg = u8::try_from(ec_reg).expect("jit_merge_point ec reg exceeds u8 encoding");
+        self.jit_merge_point(
+            &[gi_next_instr_reg, gi_is_profiled_reg],
+            &[gr_pycode_reg],
+            &[frame_reg, ec_reg],
         );
     }
 

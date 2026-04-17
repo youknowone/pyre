@@ -255,8 +255,7 @@ impl CodeWriter {
         let op_code_reg = 2u16;
         // jtransform.py: virtualizable field indices for getfield_vable_*
         // interp_jit.py:25-31 / virtualizable_spec.rs parity:
-        //   0=next_instr, 1=code, 2=vsd, 3=debugdata, 4=lastblock, 5=namespace
-        const VABLE_NEXT_INSTR_FIELD_IDX: u16 = 0;
+        //   0=last_instr, 1=code, 2=vsd, 3=debugdata, 4=lastblock, 5=namespace
         const VABLE_CODE_FIELD_IDX: u16 = 1;
         const VABLE_VALUESTACKDEPTH_FIELD_IDX: u16 = 2;
         const VABLE_NAMESPACE_FIELD_IDX: u16 = 5;
@@ -334,7 +333,7 @@ impl CodeWriter {
         // RPython jtransform.py:1714-1718 handle_jit_marker__loop_header:
         // Pre-scan JUMP_BACKWARD targets to identify loop headers.
         // RPython emits jit_merge_point + loop_header opcodes at these
-        // positions; pyre emits BC_JUMP_TARGET as equivalent marker.
+        // positions.
         let mut loop_header_pcs: std::collections::HashSet<usize> =
             std::collections::HashSet::new();
         {
@@ -397,7 +396,7 @@ impl CodeWriter {
         // first loop header is a merge point.
         // RPython jtransform.py:1690: jit_merge_point only in the portal
         // graph. merge_point_pc is the trace entry PC (from bound_reached).
-        // Other loop headers use jump_target (no-op in the blackhole).
+        // Other loop headers use loop_header (no-op in the blackhole).
         let merge_point_pc = merge_point_pc.or_else(|| loop_header_pcs.iter().copied().min());
 
         // pyframe.py:379-417 pushvalue/popvalue_maybe_none parity:
@@ -437,45 +436,21 @@ impl CodeWriter {
                     // interp_jit.py:64 portal contract:
                     //   greens = ['next_instr', 'is_being_profiled', 'pycode']
                     //   reds = ['frame', 'ec']
-                    let next_instr_const_idx = assembler.add_const_i(py_pc as i64);
-                    let is_being_profiled_const_idx = assembler.add_const_i(0);
-                    let num_regs_i = assembler.num_regs_i();
-                    let gi_next_instr_reg = (num_regs_i + next_instr_const_idx) as u8;
-                    let gi_is_profiled_reg = (num_regs_i + is_being_profiled_const_idx) as u8;
-
-                    let pycode_const_idx = assembler.add_const_r(w_code as i64);
-                    let num_regs_r = assembler.num_regs_r();
-                    let gr_pycode_reg = (num_regs_r + pycode_const_idx) as u8;
-
-                    let frame_reg = portal_frame_reg as u8;
-                    let ec_reg = portal_ec_reg as u8;
-
-                    assembler.jit_merge_point(
-                        &[gi_next_instr_reg, gi_is_profiled_reg],
-                        &[gr_pycode_reg],
-                        &[frame_reg, ec_reg],
+                    assembler.emit_portal_jit_merge_point(
+                        py_pc,
+                        w_code as i64,
+                        portal_frame_reg,
+                        portal_ec_reg,
                     );
                 } else {
-                    assembler.jump_target();
+                    // pyre has a single jitdriver (PyPyJitDriver), index 0.
+                    assembler.loop_header(0);
                 }
             }
 
             let code_unit = code.instructions[py_pc];
             let (instruction, op_arg) = arg_state.get(code_unit);
 
-            // pyopcode.py:172 `self.last_instr = intmask(next_instr)` parity,
-            // adapted to pyre's `frame.next_instr` semantics:
-            //   - RPython keeps `last_instr` (current PC) and advances
-            //     `next_instr` past the decoded opcode.
-            //   - pyre folds both into `frame.next_instr`: the interpreter
-            //     increments it to `py_pc + 1` before executing the opcode,
-            //     and `handle_exception` (eval.rs:87) recovers `py_pc` via
-            //     `frame.next_instr.saturating_sub(1)`.
-            // Mirror that invariant in blackhole jitcode so that an
-            // `ExitFrameWithExceptionRef` leaves the frame at the raising
-            // opcode's PC + 1 — matching what the interpreter would observe
-            // if it had executed the same opcode natively.
-            //
             // pyframe.py:379-417 pushvalue/popvalue_maybe_none parity:
             // RPython's push/pop each write `self.valuestackdepth = depth +/- 1`.
             // On the JIT, these map to per-push `setfield_vable_i`. pyre's
@@ -488,24 +463,14 @@ impl CodeWriter {
             // frame.ncells() + entry.depth`) uses when an exception handler
             // unwinds the frame.
             //
-            // pyopcode.py:172 `self.last_instr = intmask(next_instr)` —
-            // virtualizable contract from pypy/module/pypyjit/interp_jit.py:25
-            // (`PyFrame._virtualizable_ = ['last_instr', ...]`). Emitted per
-            // Python bytecode instruction so `frame.f_lasti` /
-            // `PyFrame.get_last_lineno` observe the correct PC even inside
-            // a JIT-compiled frame, matching the interpreter exactly.
-            //
-            // Each py_pc+1 is distinct, so the int constant pool grows with
-            // the function size. Pyre's BC_LOAD_CONST_I encodes the pool
-            // index as u16 (see jitcode/assembler.rs:load_const_i), so the
-            // pool can hold up to 65536 distinct values — unlike RPython's
-            // 1-byte `chr(val)` encoding (assembler.py:132-137) that caps
-            // at 256. The widened cap is a PRE-EXISTING-ADAPTATION of
-            // pyre's chosen BC encoding, not a semantic change.
-            if is_portal {
-                assembler.load_const_i_value(int_tmp0, (py_pc + 1) as i64);
-                assembler.vable_setfield_int(VABLE_NEXT_INSTR_FIELD_IDX, int_tmp0);
-            }
+            // RPython interp_jit.py keeps `next_instr` as a green portal
+            // argument and updates `last_instr` in the interpreter loop; it
+            // does not lower a per-bytecode virtualizable write here. pyre's
+            // portal entry / guard-resume paths already restore
+            // `frame.next_instr`, and the interpreter updates `last_instr`
+            // once execution returns there. Emitting `py_pc + 1` here only
+            // grows the int constant pool linearly with function size and
+            // trips assembler.py's 256-entry cap.
             // pyframe.py:379-417: valuestackdepth is written per-push/per-pop
             // via setfield_vable_i (jtransform.py:923-928), NOT once at opcode
             // entry. The per-push/per-pop emit_vsd! calls below mirror that.

@@ -280,29 +280,23 @@ impl Assembler {
 
     /// `assembler.py:265-269` `check_result()`.
     ///
-    /// Upstream's cap is 256 because `_emit_constant` encodes the
-    /// register-or-constant index as a single `chr(val)` byte
-    /// (assembler.py:132-137: `assert 0 <= val < 256, "too many
-    /// constants"` followed by `self.code.append(chr(val))`). Pyre's
-    /// `JitCodeBuilder` uses `BC_LOAD_CONST_I(dst: u16, const_idx: u16)`
-    /// (see `majit_metainterp::jitcode::assembler::load_const_i`), so
-    /// the encoding supports indices up to 65535. The parity-correct cap
-    /// for pyre's encoding is therefore 65536 per kind — a
-    /// PRE-EXISTING-ADAPTATION of pyre's wider `const_idx` field, not a
-    /// semantic relaxation. Runs unconditionally inside `assemble()`
-    /// after `fix_labels()` (identical cadence to RPython).
+    /// RPython enforces a 256-entry cap per kind because the assembled
+    /// bytecode stream treats register-or-constant operands as one-byte
+    /// indices. The surrounding pyre pipeline still relies on the same
+    /// invariant for liveness and jit-merge-point operand encoding, so we
+    /// keep the orthodox translator-time assertion here instead of
+    /// widening the limit to match internal `u16` builder fields.
     fn check_result(&self, jitcode: &JitCode) {
-        const CAP: usize = 1 << 16;
         assert!(
-            (jitcode.num_regs_i() as usize) + jitcode.constants_i.len() <= CAP,
+            (jitcode.num_regs_i() as usize) + jitcode.constants_i.len() <= 256,
             "too many int registers/constants"
         );
         assert!(
-            (jitcode.num_regs_r() as usize) + jitcode.constants_r.len() <= CAP,
+            (jitcode.num_regs_r() as usize) + jitcode.constants_r.len() <= 256,
             "too many ref registers/constants"
         );
         assert!(
-            (jitcode.num_regs_f() as usize) + jitcode.constants_f.len() <= CAP,
+            (jitcode.num_regs_f() as usize) + jitcode.constants_f.len() <= 256,
             "too many float registers/constants"
         );
     }
@@ -424,14 +418,6 @@ fn dispatch_op(
             let label_id = builder_label(state, &label.name);
             state.builder.jump(label_id);
         }
-        "jump_target" => {
-            // BC_JUMP_TARGET marker — no args. RPython has no equivalent
-            // opcode; pyre emits it at Python PCs that are the target of
-            // a loop-backward jump and are not already `jit_merge_point`s,
-            // matching the jtransform.py:1714 handle_jit_marker__loop_header
-            // role (see codewriter.rs around the loop_header branch).
-            state.builder.jump_target();
-        }
         "goto_if_not" | "branch_reg_zero" => {
             let cond = expect_reg(&args[0], Kind::Int);
             let label = expect_tlabel(&args[1]);
@@ -449,12 +435,18 @@ fn dispatch_op(
             let reds_r = expect_list_regs(&args[2], Kind::Ref);
             state.builder.jit_merge_point(&greens_i, &greens_r, &reds_r);
         }
-        "jump_target" => {
-            // pyre-only marker: loop-header entry point that isn't a
-            // jit_merge_point. RPython uses plain `Label` entries; pyre
-            // emits a dedicated BC_JUMP_TARGET so the runtime dispatch
-            // loop can recognise loop heads cheaply.
-            state.builder.jump_target();
+        "loop_header" => {
+            // RPython jtransform.py:1714-1718 handle_jit_marker__loop_header
+            // emits SpaceOperation('loop_header', [c_index], None). Arg is
+            // the jitdriver index as a Signed constant (pyre has a single
+            // jitdriver, so jdindex is always 0).
+            let jdindex = match &args[0] {
+                Operand::ConstInt(v) => *v,
+                other => panic!("loop_header expects ConstInt jdindex, got {:?}", other),
+            };
+            let jdindex: u8 = u8::try_from(jdindex)
+                .unwrap_or_else(|_| panic!("loop_header jdindex {jdindex} out of u8 range"));
+            state.builder.loop_header(jdindex);
         }
         "ref_return" => {
             let src = expect_result_or_first_reg(args, result, Kind::Ref);
@@ -1067,7 +1059,7 @@ mod tests {
         // Descr operand is ignored by the assembler.
         ssarepr.insns.push(Insn::op(
             "abort_permanent",
-            vec![Operand::Descr(DescrOperand::SwitchDict(switch))],
+            vec![Operand::descr(DescrOperand::SwitchDict(switch))],
         ));
 
         let jitcode = assemble(&mut ssarepr, JitCodeBuilder::default(), None);
