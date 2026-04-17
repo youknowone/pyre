@@ -1700,34 +1700,6 @@ fn extract_field_offset(descr_idx: u32) -> Option<usize> {
     Some(((descr_idx >> 4) & 0x000f_ffff) as usize)
 }
 
-/// Helper for virtualizable array element tracking.
-fn get_array_element(arrays: &[(u32, Vec<OpRef>)], arr_idx: u32, elem_idx: usize) -> Option<OpRef> {
-    arrays
-        .iter()
-        .find(|(i, _)| *i == arr_idx)
-        .and_then(|(_, e)| e.get(elem_idx).copied())
-        .filter(|r| !r.is_none())
-}
-
-/// Helper for virtualizable array element tracking.
-fn set_array_element(
-    arrays: &mut Vec<(u32, Vec<OpRef>)>,
-    arr_idx: u32,
-    elem_idx: usize,
-    value: OpRef,
-) {
-    if let Some((_, elems)) = arrays.iter_mut().find(|(i, _)| *i == arr_idx) {
-        if elem_idx >= elems.len() {
-            elems.resize(elem_idx + 1, OpRef::NONE);
-        }
-        elems[elem_idx] = value;
-    } else {
-        let mut elems = vec![OpRef::NONE; elem_idx + 1];
-        elems[elem_idx] = value;
-        arrays.push((arr_idx, elems));
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
