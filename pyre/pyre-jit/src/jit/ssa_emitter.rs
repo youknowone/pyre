@@ -232,52 +232,62 @@ impl SSAReprEmitter {
     // ---- per-op emission: every method below is an `Insn::Op` push ----
 
     pub fn move_r(&mut self, dst: u16, src: u16) {
-        self.push_op(
+        // flatten.py `'->', reg` parity: destination in the result slot,
+        // not in args. Keeps `compute_liveness` `alive.discard(result)`
+        // at liveness.rs:148 correct for register-copy semantics.
+        self.push_op_with_result(
             "move_r",
-            vec![Operand::reg(Kind::Ref, dst), Operand::reg(Kind::Ref, src)],
+            vec![Operand::reg(Kind::Ref, src)],
+            Register::new(Kind::Ref, dst),
         );
     }
 
     pub fn move_i(&mut self, dst: u16, src: u16) {
-        self.push_op(
+        self.push_op_with_result(
             "move_i",
-            vec![Operand::reg(Kind::Int, dst), Operand::reg(Kind::Int, src)],
+            vec![Operand::reg(Kind::Int, src)],
+            Register::new(Kind::Int, dst),
         );
     }
 
     pub fn move_f(&mut self, dst: u16, src: u16) {
-        self.push_op(
+        self.push_op_with_result(
             "move_f",
-            vec![
-                Operand::reg(Kind::Float, dst),
-                Operand::reg(Kind::Float, src),
-            ],
+            vec![Operand::reg(Kind::Float, src)],
+            Register::new(Kind::Float, dst),
         );
     }
 
     pub fn load_const_i_value(&mut self, dst: u16, value: i64) {
-        self.push_op(
+        self.push_op_with_result(
             "load_const_i",
-            vec![Operand::reg(Kind::Int, dst), Operand::ConstInt(value)],
+            vec![Operand::ConstInt(value)],
+            Register::new(Kind::Int, dst),
         );
     }
 
     pub fn load_const_r_value(&mut self, dst: u16, value: i64) {
-        self.push_op(
+        self.push_op_with_result(
             "load_const_r",
-            vec![Operand::reg(Kind::Ref, dst), Operand::ConstRef(value)],
+            vec![Operand::ConstRef(value)],
+            Register::new(Kind::Ref, dst),
         );
     }
 
     pub fn load_const_f_value(&mut self, dst: u16, value: i64) {
-        self.push_op(
+        self.push_op_with_result(
             "load_const_f",
-            vec![Operand::reg(Kind::Float, dst), Operand::ConstFloat(value)],
+            vec![Operand::ConstFloat(value)],
+            Register::new(Kind::Float, dst),
         );
     }
 
     pub fn ref_return(&mut self, src: u16) {
         self.push_op("ref_return", vec![Operand::reg(Kind::Ref, src)]);
+        // flatten.py:144-146 parity: terminator emits `('---',)` so the
+        // backward liveness pass clears its alive set at block boundaries
+        // and does not propagate through dead fall-through regions.
+        self.ssarepr.insns.push(Insn::Unreachable);
     }
 
     pub fn abort(&mut self) {
@@ -297,11 +307,14 @@ impl SSAReprEmitter {
     }
 
     pub fn last_exc_value(&mut self, dst: u16) {
-        self.push_op("last_exc_value", vec![Operand::reg(Kind::Ref, dst)]);
+        // Destination in result slot so backward liveness sees the define.
+        self.push_op_with_result("last_exc_value", Vec::new(), Register::new(Kind::Ref, dst));
     }
 
     pub fn jump(&mut self, label: u16) {
         self.push_op("jump", vec![self.tlabel(label)]);
+        // flatten.py:111-112 parity: unconditional goto emits `('---',)`.
+        self.ssarepr.insns.push(Insn::Unreachable);
     }
 
     /// RPython jtransform.py:1714-1718 handle_jit_marker__loop_header.
@@ -651,18 +664,26 @@ mod tests {
 
     #[test]
     fn emitter_builds_simple_return_sequence() {
-        // Build: move_r r0 <- r1 ; ref_return r0
+        // Build: move_r r0 <- r1 ; ref_return r0 ; '---'
         let mut em = SSAReprEmitter::new();
         em.set_name("trivial");
         em.ensure_r_regs(2);
         em.move_r(0, 1);
         em.ref_return(0);
 
-        assert_eq!(em.ssarepr.insns.len(), 2);
+        assert_eq!(em.ssarepr.insns.len(), 3);
         match &em.ssarepr.insns[0] {
-            Insn::Op { opname, args, .. } => {
+            Insn::Op {
+                opname,
+                args,
+                result,
+            } => {
                 assert_eq!(opname, "move_r");
-                assert_eq!(args.len(), 2);
+                // After the push_op_with_result conversion, the
+                // destination lives in `result`, leaving `args = [src]`.
+                assert_eq!(args.len(), 1);
+                let dst = result.expect("move_r must set a result register");
+                assert_eq!(dst.index, 0);
             }
             other => panic!("expected Op, got {:?}", other),
         }
@@ -673,6 +694,7 @@ mod tests {
             }
             other => panic!("expected Op, got {:?}", other),
         }
+        assert!(matches!(em.ssarepr.insns[2], Insn::Unreachable));
 
         let mut assembler = Assembler::new();
         let jitcode = em.finish_with(&mut assembler);
@@ -682,7 +704,7 @@ mod tests {
 
     #[test]
     fn emitter_labels_bridge_u16_ids_to_tlabel_names() {
-        // Build: L0 ; ... ; jump L0
+        // Build: L0 ; ref_return r0 ; '---' ; jump L0 ; '---'
         let mut em = SSAReprEmitter::new();
         em.set_name("loop");
         em.ensure_r_regs(1);
@@ -692,7 +714,8 @@ mod tests {
         em.jump(loop_label);
 
         assert!(matches!(&em.ssarepr.insns[0], Insn::Label(l) if l.name == "L0"));
-        match &em.ssarepr.insns[2] {
+        // Index 1: ref_return, 2: '---', 3: jump, 4: '---'
+        match &em.ssarepr.insns[3] {
             Insn::Op { opname, args, .. } => {
                 assert_eq!(opname, "jump");
                 match &args[0] {
@@ -702,6 +725,7 @@ mod tests {
             }
             other => panic!("expected Op, got {:?}", other),
         }
+        assert!(matches!(em.ssarepr.insns[4], Insn::Unreachable));
 
         let mut assembler = Assembler::new();
         let _jitcode = em.finish_with(&mut assembler);
@@ -715,9 +739,10 @@ mod tests {
         let a = em.live_placeholder();
         em.ref_return(0);
         let b = em.live_placeholder();
+        // After the Live at 0 and ref_return + '---' (indices 1 and 2),
+        // the next Live lands at index 3.
         assert_eq!(a, 0);
-        assert_eq!(b, 2);
-        // Live indices tracked for later patching logic.
-        assert_eq!(em.pending_live_positions, vec![0, 2]);
+        assert_eq!(b, 3);
+        assert_eq!(em.pending_live_positions, vec![0, 3]);
     }
 }
